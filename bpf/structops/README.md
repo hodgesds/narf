@@ -6,7 +6,8 @@ subsystem to expose a pluggable set of operations — a trait's worth of methods
 crate carries the `struct_ops!` extension macro, the descriptors that macro
 emits describing each pluggable trait and its methods, and the
 capability-gated registry that validates and installs a verified set of
-programs against one of those traits.
+programs against one of those traits. Installation returns a generation-tagged
+owning link; dropping it detaches the corresponding live implementation.
 
 ## Why it is its own crate
 
@@ -26,14 +27,13 @@ A `struct_ops` trait declaration produces descriptors into a dedicated link
 section, and because this crate holds the only writers of that section, a
 force-link anchor keeps the descriptor table from being dropped at link time so
 the set of compiled-in traits is actually present in the image. When a
-userspace loader submits an implementation, each method's program is verified
-through the BPF verifier against the method's expected context and return
-types, and installation is gated on a capability grant before the registry
-records the verified program set as live. The macro derives each method's
-context tuple and return type from the parent runtime's Rust type descriptors,
-so the method signatures a subsystem declares in Rust are what the verifier
-checks the supplied programs against — the same Rust-types-carry-semantics
-principle the rest of NARF's BPF uses in place of BTF.
+userspace loader submits an implementation, the generated method-specific
+builder verifies it against the method's expected context, result, kfunc
+allowlist, and fuel budget. Installation is gated on a capability grant before
+the adapter reaches the live slot. The macro derives scalar context fields
+through `BpfCtxArg` and results through `BpfRet`, so the Rust signature is the
+verifier contract without admitting raw kernel pointers or a generic physical
+memory translation surface.
 
 ## Relationships and no_std
 
@@ -44,3 +44,6 @@ offer `struct_ops` policies depend on it rather than on `narf-bpf`. It is
 `no_std`. The `kernel-test` feature gates in-kernel smoke tests registered
 through `narf-kernel-test`; because those smokes must assemble the BPF programs
 they load, the feature also pulls in the ISA assembly helpers from `bpf/isa`.
+
+The hardening contract and the separate requirements for future sleepable
+targets are recorded in [`DESIGN.md`](DESIGN.md).

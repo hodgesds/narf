@@ -182,7 +182,7 @@ impl KfuncEntry {
 /// `call` immediate without consulting the registry.
 #[inline]
 #[must_use]
-pub fn id_for(name: &str) -> i32 {
+pub const fn id_for(name: &str) -> i32 {
     fnv1a32_nonzero(name) as i32
 }
 

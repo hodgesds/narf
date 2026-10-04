@@ -105,6 +105,16 @@ pub enum LoadError {
     TypedProbeTooLarge,
     /// XDP frames are borrowed only for an atomic classifier callback.
     XdpRequiresAtomic,
+    /// Synchronous struct-ops adapters currently provide only atomic hooks.
+    StructOpsRequiresAtomic,
+    /// A struct-ops contract was malformed or exposed a non-scalar context.
+    BadStructOpsContract,
+    /// A struct-ops contract named a kfunc that is not registered.
+    StructOpsUnknownKfunc(i32),
+    /// A struct-ops contract listed the same kfunc more than once.
+    StructOpsDuplicateKfunc(i32),
+    /// A struct-ops hook requested no fuel or more than the global ceiling.
+    BadStructOpsFuel(u64),
 }
 
 impl From<CapError> for LoadError {
@@ -173,6 +183,9 @@ pub struct BpfProg {
     insns: Vec<Insn>,
     /// The execution context this program was verified for.
     context: Context,
+    /// Exact struct-ops method contract used at verification, if this is a
+    /// struct-ops program. Generic, tracing, and XDP loads leave this absent.
+    struct_ops: Option<StructOpsContract>,
     /// Whether the program calls `bpf_xdp_adjust_head`/`_tail`.
     ///
     /// Set at load from the verifier's resolved kfunc-call sites. When true the
@@ -337,6 +350,33 @@ pub struct LoadRequest {
     pub load_references: Vec<Arc<dyn LoadReference>>,
 }
 
+/// Complete verifier and dispatch contract for one struct-ops method.
+///
+/// This is carried by the loaded program rather than reconstructed at attach
+/// time. A program verified through any other loader has no contract and
+/// therefore cannot be installed into a struct-ops slot.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StructOpsContract {
+    /// Stable id of the target trait.
+    pub target_id: u64,
+    /// Stable id of the method within the target.
+    pub method_id: u32,
+    /// Hash of the target version and Rust method ABI.
+    pub abi_hash: u64,
+    /// Exact context fields exposed through R1.
+    pub ctx: &'static [narf_bpf_verifier::ArgDesc],
+    /// Expected scalar/void result descriptor.
+    pub ret: narf_bpf_verifier::ArgDesc,
+    /// The complete kfunc allowlist for this method.
+    pub allowed_kfuncs: &'static [i32],
+    /// Execution context supplied by the hook.
+    pub context: Context,
+    /// Per-invocation instruction budget.
+    pub fuel: u64,
+    /// Stable name of the native fallback used on absence, rejection, or trap.
+    pub fallback: &'static str,
+}
+
 impl BpfProg {
     /// Verify and load.
     ///
@@ -344,7 +384,7 @@ impl BpfProg {
     ///
     /// See [`LoadError`].
     pub fn load(cap: &Cap<BpfProgLoad, Grant>, req: LoadRequest) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, None, LoadMetadata::default(), None)
+        Self::load_with_options(cap, req, None, LoadMetadata::default(), None, None)
     }
 
     /// Verify and load with the compatibility classification of the license
@@ -386,7 +426,7 @@ impl BpfProg {
         req: LoadRequest,
         metadata: LoadMetadata,
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, None, metadata, None)
+        Self::load_with_options(cap, req, None, metadata, None, None)
     }
 
     /// Verify and load against the XDP `data` / `data_end` context.
@@ -408,6 +448,7 @@ impl BpfProg {
                 linux_prog_type: Some(BPF_PROG_TYPE_XDP),
                 ..LoadMetadata::default()
             },
+            None,
             None,
         )
     }
@@ -444,7 +485,7 @@ impl BpfProg {
         req: LoadRequest,
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, arenas, LoadMetadata::default(), None)
+        Self::load_with_options(cap, req, arenas, LoadMetadata::default(), None, None)
     }
 
     /// Verify and load for one Rust-described typed tracing object.
@@ -479,6 +520,49 @@ impl BpfProg {
                 size,
                 fields,
             }),
+            None,
+        )
+    }
+
+    /// Verify and load for one exact struct-ops method contract.
+    ///
+    /// Unlike [`Self::load`], this exposes only the method's scalar context and
+    /// kfunc allowlist. The immutable contract is retained in the resulting
+    /// program and must match again at install and dispatch.
+    pub fn load_for_struct_ops(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+        contract: StructOpsContract,
+    ) -> Result<Arc<Self>, LoadError> {
+        if req.context != contract.context || contract.context != Context::Atomic {
+            return Err(LoadError::StructOpsRequiresAtomic);
+        }
+        if contract.target_id == 0
+            || contract.method_id == 0
+            || contract.abi_hash == 0
+            || contract.fallback.is_empty()
+            || contract.ctx.len() > MAX_CTX_WORDS
+            || !contract
+                .ctx
+                .iter()
+                .all(|arg| matches!(arg.kind, narf_bpf_verifier::TypeKind::Scalar { .. }))
+            || !matches!(
+                contract.ret.kind,
+                narf_bpf_verifier::TypeKind::Scalar { .. } | narf_bpf_verifier::TypeKind::Void
+            )
+        {
+            return Err(LoadError::BadStructOpsContract);
+        }
+        if contract.fuel == 0 || contract.fuel > DEFAULT_FUEL {
+            return Err(LoadError::BadStructOpsFuel(contract.fuel));
+        }
+        Self::load_with_options(
+            cap,
+            req,
+            None,
+            LoadMetadata::default(),
+            None,
+            Some(contract),
         )
     }
 
@@ -488,6 +572,7 @@ impl BpfProg {
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
         metadata: LoadMetadata,
         typed_probe: Option<TypedProbeLayout>,
+        struct_ops: Option<StructOpsContract>,
     ) -> Result<Arc<Self>, LoadError> {
         cap.check_live()?;
         let xdp = metadata.linux_prog_type == Some(BPF_PROG_TYPE_XDP);
@@ -501,10 +586,26 @@ impl BpfProg {
         reject_unrunnable(&req.insns)?;
         let tag = calculate_tag(&req.insns);
 
-        // Descriptors for every kfunc the program may call. The whole
-        // registry, because NARF has one call ABI and one closed kfunc set —
-        // there is no per-program-type helper allowlist to intersect with.
-        let descs: Vec<_> = registry.all().iter().map(|e| e.desc()).collect();
+        // Generic programs retain the global registry. A struct-ops method is
+        // a least-authority hook and sees only its declared allowlist.
+        let descs: Vec<_> = if let Some(contract) = struct_ops {
+            for (i, id) in contract.allowed_kfuncs.iter().enumerate() {
+                if contract.allowed_kfuncs[..i].contains(id) {
+                    return Err(LoadError::StructOpsDuplicateKfunc(*id));
+                }
+                if registry.by_id(*id).is_none() {
+                    return Err(LoadError::StructOpsUnknownKfunc(*id));
+                }
+            }
+            contract
+                .allowed_kfuncs
+                .iter()
+                .filter_map(|id| registry.by_id(*id))
+                .map(|entry| entry.desc())
+                .collect()
+        } else {
+            registry.all().iter().map(|e| e.desc()).collect()
+        };
         // The verifier's view of the map set: an fd, and the three widths that
         // bound an access. Built here rather than by the caller so the
         // descriptor cannot disagree with the map it describes.
@@ -557,7 +658,9 @@ impl BpfProg {
             // The probe ABI's `[u64; 4]` is already the ctx tuple, so there is
             // no ctx-rewriting layer and nothing to describe beyond four
             // scalars.
-            ctx_fields: if typed_probe.is_some() {
+            ctx_fields: if let Some(contract) = struct_ops {
+                contract.ctx
+            } else if typed_probe.is_some() {
                 &typed_ctx_storage
             } else if xdp {
                 &XDP_CTX
@@ -631,6 +734,11 @@ impl BpfProg {
             // admitted by it, and the difference is the whole of why this is
             // not fail-open.
             Err(VerifyError::NotImplemented(_)) => {
+                if struct_ops.is_some() {
+                    return Err(LoadError::Rejected(VerifyError::NotImplemented(
+                        "struct_ops programs require complete verification",
+                    )));
+                }
                 crate::provisional::accept(&req.insns, req.context, registry)
                     .map_err(LoadError::Rejected)?;
                 STUB_STACK_BYTES as u32
@@ -648,10 +756,11 @@ impl BpfProg {
             linux_prog_type: metadata.linux_prog_type,
             insns: req.insns,
             context: req.context,
+            struct_ops,
             uses_xdp_adjust,
             typed_probe,
             typed_load_sites,
-            initial_fuel: DEFAULT_FUEL,
+            initial_fuel: struct_ops.map_or(DEFAULT_FUEL, |contract| contract.fuel),
             stack_bytes,
             subprogs,
             jit,
@@ -688,6 +797,13 @@ impl BpfProg {
     #[must_use]
     pub const fn context(&self) -> Context {
         self.context
+    }
+
+    /// Exact struct-ops contract used to verify this program, if any.
+    #[inline]
+    #[must_use]
+    pub const fn struct_ops_contract(&self) -> Option<StructOpsContract> {
+        self.struct_ops
     }
 
     /// Stable type key of this program's typed tracing context, if any.
@@ -988,7 +1104,27 @@ impl BpfProg {
         // Only `run_typed_probe` may construct that context; admitting a raw
         // caller here would let it forge the wrapper pointer before the
         // runtime mediator had a chance to validate anything.
-        if self.typed_probe.is_some() || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP) {
+        if self.typed_probe.is_some()
+            || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP)
+            || self.struct_ops.is_some()
+        {
+            return None;
+        }
+        self.run_atomic_inner(ctx, ctx_len)
+    }
+
+    /// Run through the exact struct-ops method this program was verified for.
+    pub fn run_struct_ops_atomic(
+        &self,
+        contract: StructOpsContract,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
+        if self.struct_ops != Some(contract)
+            || contract.context != Context::Atomic
+            || ctx_len != contract.ctx.len()
+            || ctx_len > MAX_CTX_WORDS
+        {
             return None;
         }
         self.run_atomic_inner(ctx, ctx_len)
@@ -1233,7 +1369,10 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
     ) -> Option<Outcome> {
-        if self.typed_probe.is_some() || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP) {
+        if self.typed_probe.is_some()
+            || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP)
+            || self.struct_ops.is_some()
+        {
             return None;
         }
         // This public differential-test entry point is still an execution
@@ -1515,6 +1654,13 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
     ) -> Option<Outcome> {
+        // Contract-bound programs have a distinct exact-contract dispatcher.
+        // Sleepable struct-ops will gain an equivalent async dispatcher when
+        // its future-returning hook ABI lands; generic execution cannot bypass
+        // that attachment boundary in the meantime.
+        if self.struct_ops.is_some() {
+            return None;
+        }
         let stack = HeapStack::new(self.stack_bytes as usize);
         let frame = stack.acquire(self.stack_bytes as usize)?;
         let registry = crate::kfunc::registry()?;

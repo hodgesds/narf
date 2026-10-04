@@ -1,58 +1,46 @@
-//! In-kernel smokes for the `struct_ops!` mechanism.
-//!
-//! Migrated with the framework out of `narf-bpf`. They register under the
-//! `bpf/structops` subsystem, so `xtask test --subsystem bpf` (prefix match)
-//! still runs them while `--subsystem bpf/structops` runs just these.
-//!
-//! Positive *and* negative per behaviour, per `feedback_tests_are_the_value`.
+//! In-kernel smokes for contract-bound atomic struct-ops.
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadRequest};
+use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadError, LoadMetadata, LoadRequest};
 use narf_bpf_isa::encode::encode;
-use narf_bpf_isa::{AluOp, Decoded, Insn, Reg, Size, Source};
+use narf_bpf_isa::{AluOp, CallTarget, Decoded, Insn, Reg, Size, Source};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, CapKind, CapType, Grant};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-// ── program-building helpers ─────────────────────────────────────────
-//
-// A minimal slice of `narf-bpf`'s own test helpers — enough to assemble and
-// load the tiny programs these smokes bind into a struct_ops set.
-
-// Minted once and cached: `Cap::bootstrap()` allocates an object-table slot per
-// call, so calling it per test would leak a slot per smoke run.
 fn load_cap() -> &'static Cap<BpfProgLoad, Grant> {
     use narf_lib::sync::IrqSafeSpinLock;
     static SLOT: IrqSafeSpinLock<Option<&'static Cap<BpfProgLoad, Grant>>> =
         IrqSafeSpinLock::new(None);
-    let mut g = SLOT.lock();
-    if g.is_none() {
-        let c: &'static _ = Box::leak(Box::new(Cap::<BpfProgLoad, Grant>::bootstrap()));
-        *g = Some(c);
+    let mut slot = SLOT.lock();
+    if slot.is_none() {
+        *slot = Some(Box::leak(Box::new(Cap::bootstrap())));
     }
-    g.expect("just installed")
+    slot.expect("just installed")
 }
 
-fn r(n: u8) -> Reg {
-    Reg::new(n).expect("register in range")
+fn r(number: u8) -> Reg {
+    Reg::new(number).expect("register in range")
 }
 
 fn asm(items: &[Decoded]) -> Vec<Insn> {
     let mut out = Vec::new();
-    for d in items {
-        out.extend_from_slice(encode(*d).slots());
+    for item in items {
+        out.extend_from_slice(encode(*item).slots());
     }
     out
 }
 
-fn mov_imm(dst: u8, v: i32) -> Decoded {
+fn mov_imm(dst: u8, value: i32) -> Decoded {
     Decoded::Mov {
         wide: true,
         dst: r(dst),
-        src: Source::Imm(v),
+        src: Source::Imm(value),
         sign_extend: None,
     }
 }
@@ -78,45 +66,62 @@ fn alu_reg(op: AluOp, dst: u8, src: u8) -> Decoded {
 
 const EXIT: Decoded = Decoded::Exit;
 
-fn load(name: &str, insns: Vec<Insn>, ctx: Context) -> Result<Arc<BpfProg>, &'static str> {
-    BpfProg::load(
-        load_cap(),
-        LoadRequest {
-            name: alloc::string::String::from(name),
-            insns,
-            context: ctx,
-            maps: Vec::new(),
-            map_indices: Vec::new(),
-            load_references: Vec::new(),
-        },
-    )
-    .map_err(|_| "load rejected")
+fn request(name: &str, insns: Vec<Insn>, context: Context) -> LoadRequest {
+    LoadRequest {
+        name: String::from(name),
+        insns,
+        context,
+        maps: Vec::new(),
+        map_indices: Vec::new(),
+        load_references: Vec::new(),
+    }
 }
 
-// ── the demo trait: macro, adapter, cap-gated record ─────────────────
+fn fallback_select(_expected_idle_ns: u64) -> u32 {
+    11
+}
+
+fn validate_select(raw: u64) -> Option<u32> {
+    u32::try_from(raw).ok()
+}
+
+fn fallback_init() -> i32 {
+    -7
+}
+
+fn validate_init(raw: u64) -> Option<i32> {
+    i32::try_from(raw).ok()
+}
 
 crate::struct_ops! {
-    /// A minimal pluggable trait, exercising the `struct_ops!` macro, the
-    /// `narf.structops` section, the cap-gated install path, and the generated
-    /// adapter that dispatches through BPF programs.
+    /// Test target covering typed construction, lifecycle, and fallback.
+    #[target("narf.test.DemoGovernor")]
+    #[version(1)]
     #[cap(IdleGovernor)]
     #[install(install_bpf_demo_governor)]
     #[desc(DEMO_GOVERNOR_OPS)]
     #[adapter(BpfDemoGovernor)]
+    #[builder(BpfDemoGovernorPrograms)]
+    #[commit(commit_demo_governor)]
+    #[detach(detach_demo_governor)]
     #[optional(init)]
     pub trait DemoGovernor {
-        /// Pick an idle state for an expected idle duration.
+        /// Pick an idle state.
+        #[fallback(fallback_select)]
+        #[validate(validate_select)]
+        #[fuel(32)]
+        #[kfuncs()]
         fn select_state(&self, expected_idle_ns: u64) -> u32;
-        /// Optional one-time setup.
+
+        /// Optional setup operation.
+        #[fallback(fallback_init)]
+        #[validate(validate_init)]
+        #[fuel(16)]
+        #[kfuncs()]
         fn init(&self) -> i32;
     }
 }
 
-/// A native in-tree implementation.
-///
-/// The point of the whole `struct_ops!` design is that the trait comes out of
-/// the macro *unchanged*, so a Rust impl needs to know nothing about BPF. This
-/// is that claim, compiled.
 struct NativeDemoGovernor;
 
 impl DemoGovernor for NativeDemoGovernor {
@@ -127,261 +132,432 @@ impl DemoGovernor for NativeDemoGovernor {
             0
         }
     }
+
     fn init(&self) -> i32 {
         0
     }
 }
 
+struct LiveEntry {
+    generation: u64,
+    governor: Arc<dyn DemoGovernor>,
+}
+
+static LIVE_GOVERNOR: narf_lib::sync::IrqSafeSpinLock<Option<LiveEntry>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn commit_demo_governor<M: CapType>(
+    cap: &Cap<M, Grant>,
+    generation: u64,
+    governor: Arc<BpfDemoGovernor>,
+) -> Result<(), crate::structops::StructOpsError> {
+    cap.check_live()?;
+    let next = LiveEntry {
+        generation,
+        governor,
+    };
+    let old = {
+        let mut slot = LIVE_GOVERNOR.lock();
+        slot.replace(next)
+    };
+    drop(old);
+    Ok(())
+}
+
+fn detach_demo_governor(generation: u64) -> bool {
+    let old = {
+        let mut slot = LIVE_GOVERNOR.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            slot.take()
+        } else {
+            return false;
+        }
+    };
+    drop(old);
+    true
+}
+
+fn live_select(expected_idle_ns: u64) -> Option<u32> {
+    let governor = LIVE_GOVERNOR
+        .lock()
+        .as_ref()
+        .map(|entry| entry.governor.clone());
+    governor.map(|governor| governor.select_state(expected_idle_ns))
+}
+
+struct LockObservingGovernor {
+    dropped_outside_lock: Arc<AtomicBool>,
+}
+
+impl DemoGovernor for LockObservingGovernor {
+    fn select_state(&self, _expected_idle_ns: u64) -> u32 {
+        if LIVE_GOVERNOR.try_lock().is_some() {
+            77
+        } else {
+            0
+        }
+    }
+
+    fn init(&self) -> i32 {
+        0
+    }
+}
+
+impl Drop for LockObservingGovernor {
+    fn drop(&mut self) {
+        self.dropped_outside_lock
+            .store(LIVE_GOVERNOR.try_lock().is_some(), Ordering::Release);
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct IdleGovInstall;
+
+impl CapType for IdleGovInstall {
+    const KIND: CapKind = CapKind::IdleGovernor;
+}
+
 fn smoke_bpf_structops_native_impl_still_works() -> TestResult {
-    let g = NativeDemoGovernor;
-    if g.select_state(10) != 0 || g.select_state(2_000_000) != 2 || g.init() != 0 {
+    let governor = NativeDemoGovernor;
+    if governor.select_state(10) != 0
+        || governor.select_state(2_000_000) != 2
+        || governor.init() != 0
+    {
         return TestResult::Fail("native impl of a struct_ops trait misbehaved");
     }
     TestResult::Pass
 }
 kernel_test_in!("bpf/structops", smoke_bpf_structops_native_impl_still_works);
 
-fn smoke_bpf_structops_descriptor_registered() -> TestResult {
-    let all = crate::structops::descriptors();
-    let Some(d) = all.iter().find(|d| d.name == "DemoGovernor") else {
-        return TestResult::Fail("narf.structops section did not carry DemoGovernor");
+fn smoke_bpf_structops_descriptor_is_complete() -> TestResult {
+    let Some(desc) = crate::structops::descriptors()
+        .iter()
+        .find(|desc| desc.target == "narf.test.DemoGovernor")
+    else {
+        return TestResult::Fail("descriptor was not linked");
     };
-    if d.cap != CapKind::IdleGovernor {
-        return TestResult::Fail("struct_ops descriptor carried the wrong CapKind");
+    if desc.version != 1 || desc.cap != CapKind::IdleGovernor || desc.methods.len() != 2 {
+        return TestResult::Fail("target metadata is incomplete");
     }
-    if d.methods.len() != 2 {
-        return TestResult::Fail("struct_ops descriptor has the wrong method count");
-    }
-    // `#[optional(init)]` must reach the descriptor, or a program set could
-    // omit a required method and be installed anyway.
-    if d.methods[0].optional || !d.methods[1].optional {
-        return TestResult::Fail("#[optional] did not reach the method descriptors");
-    }
-    // The ctx tuple is the method's real argument list — one u64 here.
-    if d.methods[0].ctx.len() != 1 {
-        return TestResult::Fail("method ctx tuple was not derived from the signature");
+    let method = &desc.methods[0];
+    if method.ctx.len() != 1
+        || !method.allowed_kfuncs.is_empty()
+        || method.context != Context::Atomic
+        || method.fuel != 32
+        || method.fallback != "fallback_select"
+        || method.optional
+        || !desc.methods[1].optional
+    {
+        return TestResult::Fail("method contract metadata is incomplete");
     }
     TestResult::Pass
 }
-kernel_test_in!("bpf/structops", smoke_bpf_structops_descriptor_registered);
+kernel_test_in!("bpf/structops", smoke_bpf_structops_descriptor_is_complete);
 
-/// The install authority for the demo trait.
-///
-/// `power::IdleGov` is the real marker for `CapKind::IdleGovernor`; declaring a
-/// local one keeps this crate off a `narf-power` dependency it otherwise has no
-/// use for. `CapType::KIND` is what `structops::install` compares, and both
-/// markers name the same kind.
-#[derive(Copy, Clone, Debug)]
-struct IdleGovInstall;
-impl CapType for IdleGovInstall {
-    const KIND: CapKind = CapKind::IdleGovernor;
-}
-
-fn smoke_bpf_structops_install_requires_matching_cap() -> TestResult {
-    use crate::structops::{ProgSet, StructOpsError};
-
-    let insns = asm(&[mov_imm(0, 1), EXIT]);
-    let Ok(prog) = load("gov", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the governor program");
+fn smoke_bpf_structops_builder_and_link_lifetime() -> TestResult {
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let programs = match BpfDemoGovernorPrograms::new().select_state(
+        load_cap(),
+        request(
+            "demo_double",
+            asm(&[ldx(0, 1, 0), alu_reg(AluOp::Add, 0, 0), EXIT]),
+            Context::Atomic,
+        ),
+    ) {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("method-specific load was rejected"),
     };
-
-    // Negative: the right shape, the wrong authority.
-    let wrong = Cap::<BpfProgLoad, Grant>::bootstrap();
-    let set = ProgSet::new().with("select_state", prog.clone());
-    match crate::structops::install(&DEMO_GOVERNOR_OPS, &wrong, set) {
-        Err(StructOpsError::WrongCapability { .. }) => {}
-        _ => return TestResult::Fail("install accepted a capability of the wrong kind"),
+    let link = match install_bpf_demo_governor(&cap, programs) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("complete typed builder was rejected"),
+    };
+    if live_select(21) != Some(42) || !crate::structops::is_installed("DemoGovernor") {
+        return TestResult::Fail("installed program did not reach the live slot");
     }
-
-    // Negative: right authority, missing a required method.
-    let right = Cap::<IdleGovInstall, Grant>::bootstrap();
-    match install_bpf_demo_governor(&right, ProgSet::new()) {
-        Err(StructOpsError::MissingMethod("select_state")) => {}
-        _ => return TestResult::Fail("install accepted a set missing a required method"),
-    }
-
-    // Positive: the optional method may be omitted.
-    let set = ProgSet::new().with("select_state", prog);
-    if install_bpf_demo_governor(&right, set).is_err() {
-        return TestResult::Fail("install rejected a complete program set");
-    }
-    if !crate::structops::is_installed("DemoGovernor") {
-        return TestResult::Fail("installed set was not recorded");
+    link.close();
+    if live_select(21).is_some() || crate::structops::is_installed("DemoGovernor") {
+        return TestResult::Fail("dropping the owning link did not detach");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "bpf/structops",
-    smoke_bpf_structops_install_requires_matching_cap
+    smoke_bpf_structops_builder_and_link_lifetime
 );
 
-// ── reaching a live slot via `#[commit(...)]` ────────────────────────
-//
-// `DemoGovernor` proves the macro, the adapter, and the cap-gated record. What
-// it does *not* prove is the last seam: an installed program set becoming the
-// implementation the subsystem's own hot path dispatches through. `LiveGovernor`
-// closes that gap — it owns the exact `IrqSafeSpinLock<Option<Box<dyn Trait>>>`
-// slot every pluggable subsystem owns (standing in for `power::IDLE_GOVERNOR` so
-// the seam is exercised without a cross-crate dep), and `#[commit(...)]` names
-// the committer that moves the verified adapter into it.
-
-crate::struct_ops! {
-    /// A pluggable trait that owns a live slot, exercising the `#[commit(...)]`
-    /// seam end to end.
-    #[cap(IdleGovernor)]
-    #[install(install_bpf_live_governor)]
-    #[desc(LIVE_GOVERNOR_OPS)]
-    #[adapter(BpfLiveGovernor)]
-    #[commit(commit_live_governor)]
-    pub trait LiveGovernor {
-        /// Pick an idle state for an expected idle duration.
-        fn select_state(&self, expected_idle_ns: u64) -> u32;
+fn smoke_bpf_structops_generation_prevents_stale_detach() -> TestResult {
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let first = BpfDemoGovernorPrograms::new()
+        .select_state(
+            load_cap(),
+            request("demo_one", asm(&[mov_imm(0, 1), EXIT]), Context::Atomic),
+        )
+        .and_then(|programs| {
+            install_bpf_demo_governor(&cap, programs).map_err(|_| LoadError::BadStructOpsContract)
+        });
+    let Ok(first) = first else {
+        return TestResult::Fail("first generation failed to install");
+    };
+    let second_programs = match BpfDemoGovernorPrograms::new().select_state(
+        load_cap(),
+        request("demo_two", asm(&[mov_imm(0, 2), EXIT]), Context::Atomic),
+    ) {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("second generation failed to load"),
+    };
+    let second = match install_bpf_demo_governor(&cap, second_programs) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("second generation failed to install"),
+    };
+    drop(first);
+    if live_select(0) != Some(2) {
+        return TestResult::Fail("stale link detached its replacement");
     }
+    drop(second);
+    TestResult::Pass
 }
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_structops_generation_prevents_stale_detach
+);
 
-/// The live slot. The same shape `power::IDLE_GOVERNOR` has; `init()` or a
-/// native impl could occupy it just as well as a BPF program set.
-static LIVE_GOVERNOR: narf_lib::sync::IrqSafeSpinLock<Option<Box<dyn LiveGovernor>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-
-/// The committer named by `#[commit(commit_live_governor)]`. Moves the verified
-/// adapter into the live slot, exactly as `power::install_idle_governor_boxed`
-/// moves a governor into its slot. Generic over the cap marker so any authority
-/// of the right kind works, which is what lets the generated install fn stay
-/// generic.
-fn commit_live_governor<M: CapType>(
-    cap: &Cap<M, Grant>,
-    adapter: BpfLiveGovernor,
-) -> Result<(), crate::structops::StructOpsError> {
-    // The set was validated before the adapter was built; this is the same
-    // last-moment liveness re-check the native install points perform.
-    cap.check_live()?;
-    *LIVE_GOVERNOR.lock() = Some(Box::new(adapter));
-    Ok(())
+fn smoke_bpf_structops_live_slot_releases_lock() -> TestResult {
+    let dropped_outside_lock = Arc::new(AtomicBool::new(false));
+    let entry = LiveEntry {
+        generation: u64::MAX,
+        governor: Arc::new(LockObservingGovernor {
+            dropped_outside_lock: dropped_outside_lock.clone(),
+        }),
+    };
+    let previous = LIVE_GOVERNOR.lock().replace(entry);
+    drop(previous);
+    if live_select(0) != Some(77) {
+        return TestResult::Fail("callback ran while the live-slot lock was held");
+    }
+    let removed = LIVE_GOVERNOR.lock().take();
+    drop(removed);
+    if !dropped_outside_lock.load(Ordering::Acquire) {
+        return TestResult::Fail("displaced adapter was destroyed under the live-slot lock");
+    }
+    TestResult::Pass
 }
+kernel_test_in!("bpf/structops", smoke_bpf_structops_live_slot_releases_lock);
 
-/// The subsystem's hot-path query, dispatching through whatever is installed.
-fn live_governor_select_state(expected_idle_ns: u64) -> Option<u32> {
-    LIVE_GOVERNOR
+fn smoke_bpf_structops_rejects_wrong_cap_and_missing_method() -> TestResult {
+    let right = Cap::<IdleGovInstall, Grant>::bootstrap();
+    match install_bpf_demo_governor(&right, BpfDemoGovernorPrograms::new()) {
+        Err(crate::structops::StructOpsError::MissingMethod("select_state")) => {}
+        _ => return TestResult::Fail("missing required method was accepted"),
+    }
+
+    let programs = match BpfDemoGovernorPrograms::new().select_state(
+        load_cap(),
+        request("demo_cap", asm(&[mov_imm(0, 1), EXIT]), Context::Atomic),
+    ) {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("valid program failed to load"),
+    };
+    let wrong = Cap::<BpfProgLoad, Grant>::bootstrap();
+    match install_bpf_demo_governor(&wrong, programs) {
+        Err(crate::structops::StructOpsError::WrongCapability { .. }) => {}
+        _ => return TestResult::Fail("wrong capability kind was accepted"),
+    }
+    if live_select(0).is_some() {
+        return TestResult::Fail("rejected install touched the live slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_structops_rejects_wrong_cap_and_missing_method
+);
+
+fn smoke_bpf_structops_rejects_generic_and_sleepable_programs() -> TestResult {
+    let generic = match BpfProg::load(
+        load_cap(),
+        request("generic", asm(&[mov_imm(0, 1), EXIT]), Context::Atomic),
+    ) {
+        Ok(program) => program,
+        Err(_) => return TestResult::Fail("generic control program failed to load"),
+    };
+    let method = &DEMO_GOVERNOR_OPS.methods[0];
+    let mut set = crate::structops::ProgSet::default();
+    set.bind(method.id, generic);
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    match crate::structops::validate(&DEMO_GOVERNOR_OPS, &cap, &set) {
+        Err(crate::structops::StructOpsError::WrongProgram("select_state")) => {}
+        _ => return TestResult::Fail("generic program matched a method contract"),
+    }
+
+    let xdp = match BpfProg::load_for_xdp(
+        load_cap(),
+        request("xdp", asm(&[mov_imm(0, 1), EXIT]), Context::Atomic),
+    ) {
+        Ok(program) => program,
+        Err(_) => return TestResult::Fail("XDP control program failed to load"),
+    };
+    let mut set = crate::structops::ProgSet::default();
+    set.bind(method.id, xdp);
+    if !matches!(
+        crate::structops::validate(&DEMO_GOVERNOR_OPS, &cap, &set),
+        Err(crate::structops::StructOpsError::WrongProgram(
+            "select_state"
+        ))
+    ) {
+        return TestResult::Fail("XDP program matched a method contract");
+    }
+
+    let tracing = match BpfProg::load_with_metadata(
+        load_cap(),
+        request("tracing", asm(&[mov_imm(0, 1), EXIT]), Context::Atomic),
+        LoadMetadata {
+            linux_prog_type: Some(17),
+            ..LoadMetadata::default()
+        },
+    ) {
+        Ok(program) => program,
+        Err(_) => return TestResult::Fail("tracing control program failed to load"),
+    };
+    let mut set = crate::structops::ProgSet::default();
+    set.bind(method.id, tracing);
+    if !matches!(
+        crate::structops::validate(&DEMO_GOVERNOR_OPS, &cap, &set),
+        Err(crate::structops::StructOpsError::WrongProgram(
+            "select_state"
+        ))
+    ) {
+        return TestResult::Fail("tracing program matched a method contract");
+    }
+
+    let init = &DEMO_GOVERNOR_OPS.methods[1];
+    let wrong_method = match BpfProg::load_for_struct_ops(
+        load_cap(),
+        request("wrong_method", asm(&[mov_imm(0, 1), EXIT]), Context::Atomic),
+        init.contract(DEMO_GOVERNOR_OPS.target_id),
+    ) {
+        Ok(program) => program,
+        Err(_) => return TestResult::Fail("second method contract failed to load"),
+    };
+    let mut set = crate::structops::ProgSet::default();
+    set.bind(method.id, wrong_method);
+    if !matches!(
+        crate::structops::validate(&DEMO_GOVERNOR_OPS, &cap, &set),
+        Err(crate::structops::StructOpsError::WrongProgram(
+            "select_state"
+        ))
+    ) {
+        return TestResult::Fail("program loaded for another method was accepted");
+    }
+
+    match BpfDemoGovernorPrograms::new().select_state(
+        load_cap(),
+        request("sleepable", asm(&[mov_imm(0, 1), EXIT]), Context::Sleepable),
+    ) {
+        Err(LoadError::StructOpsRequiresAtomic) => {}
+        _ => return TestResult::Fail("sleepable program loaded for an atomic target"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_structops_rejects_generic_and_sleepable_programs
+);
+
+fn smoke_bpf_structops_kfunc_allowlist_is_closed() -> TestResult {
+    let call = Decoded::Call(CallTarget::Kfunc(narf_bpf::kfunc::id_for(
+        "narf_counter_add",
+    )));
+    if BpfDemoGovernorPrograms::new()
+        .select_state(
+            load_cap(),
+            request("forbidden_call", asm(&[call, EXIT]), Context::Atomic),
+        )
+        .is_ok()
+    {
+        return TestResult::Fail("method loaded a kfunc outside its allowlist");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_structops_kfunc_allowlist_is_closed
+);
+
+fn smoke_bpf_structops_invalid_result_and_fuel_use_fallback() -> TestResult {
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let invalid = match BpfDemoGovernorPrograms::new().select_state(
+        load_cap(),
+        request(
+            "invalid_result",
+            asm(&[mov_imm(0, -1), EXIT]),
+            Context::Atomic,
+        ),
+    ) {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("invalid-result program failed to load"),
+    };
+    let invalid_link = match install_bpf_demo_governor(&cap, invalid) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("invalid-result program failed to install"),
+    };
+    if live_select(1) != Some(11) {
+        return TestResult::Fail("invalid raw result did not use the fallback");
+    }
+    drop(invalid_link);
+
+    let mut long = Vec::new();
+    for value in 0..40 {
+        long.push(mov_imm(0, value));
+    }
+    long.push(EXIT);
+    let fuel = match BpfDemoGovernorPrograms::new()
+        .select_state(load_cap(), request("fuel", asm(&long), Context::Atomic))
+    {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("fuel test program failed to load"),
+    };
+    let fuel_link = match install_bpf_demo_governor(&cap, fuel) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("fuel test program failed to install"),
+    };
+    if live_select(1) != Some(11) {
+        return TestResult::Fail("fuel exhaustion did not use the fallback");
+    }
+    drop(fuel_link);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_structops_invalid_result_and_fuel_use_fallback
+);
+
+fn smoke_bpf_structops_optional_method_uses_declared_fallback() -> TestResult {
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let programs = match BpfDemoGovernorPrograms::new().select_state(
+        load_cap(),
+        request("optional", asm(&[mov_imm(0, 3), EXIT]), Context::Atomic),
+    ) {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("program failed to load"),
+    };
+    let link = match install_bpf_demo_governor(&cap, programs) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("program failed to install"),
+    };
+    let governor = LIVE_GOVERNOR
         .lock()
         .as_ref()
-        .map(|g| g.select_state(expected_idle_ns))
-}
-
-fn smoke_bpf_structops_commit_reaches_live_slot() -> TestResult {
-    // r0 = ctx[0] * 2. A value the program computes, so the answer proves the
-    // installed program — not a native default or a stale slot — served the
-    // query, and that the argument reached it as ctx[0].
-    let insns = asm(&[ldx(0, 1, 0), alu_reg(AluOp::Add, 0, 0), EXIT]);
-    let Ok(prog) = load("livegov", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the governor program");
-    };
-
-    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
-    let set = crate::structops::ProgSet::new().with("select_state", prog);
-    if install_bpf_live_governor(&cap, set).is_err() {
-        return TestResult::Fail("commit install rejected a complete program set");
+        .map(|entry| entry.governor.clone());
+    if governor.as_ref().map(|governor| governor.init()) != Some(-7) {
+        return TestResult::Fail("optional method did not use its declared fallback");
     }
-
-    // The record still happens — a committed trait is `is_installed` too.
-    if !crate::structops::is_installed("LiveGovernor") {
-        return TestResult::Fail("committed install did not record the set");
-    }
-
-    // The whole point: the subsystem's own query now dispatches through the
-    // installed program.
-    match live_governor_select_state(21) {
-        Some(42) => {}
-        Some(_) => return TestResult::Fail("live slot returned the wrong value"),
-        None => return TestResult::Fail("commit did not populate the live slot"),
-    }
-    // A second call proves the slot stays populated and re-dispatches per call
-    // rather than caching the first answer.
-    if live_governor_select_state(50) != Some(100) {
-        return TestResult::Fail("live slot did not re-dispatch on a second call");
-    }
+    drop(link);
     TestResult::Pass
 }
 kernel_test_in!(
     "bpf/structops",
-    smoke_bpf_structops_commit_reaches_live_slot
+    smoke_bpf_structops_optional_method_uses_declared_fallback
 );
-
-fn smoke_bpf_structops_commit_rejects_before_touching_slot() -> TestResult {
-    // The negative: a set that fails validation must never reach the live slot.
-    // Empty the slot first so a leftover install from another test can't make
-    // this pass for the wrong reason.
-    *LIVE_GOVERNOR.lock() = None;
-
-    // Wrong authority kind — validated and rejected before any adapter is
-    // built, so the committer never runs.
-    let wrong = Cap::<BpfProgLoad, Grant>::bootstrap();
-    let insns = asm(&[mov_imm(0, 1), EXIT]);
-    let Ok(prog) = load("livegov_bad", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the governor program");
-    };
-    let set = crate::structops::ProgSet::new().with("select_state", prog);
-    match install_bpf_live_governor(&wrong, set) {
-        Err(crate::structops::StructOpsError::WrongCapability { .. }) => {}
-        _ => return TestResult::Fail("committed install accepted the wrong cap kind"),
-    }
-    if live_governor_select_state(1).is_some() {
-        return TestResult::Fail("a rejected install still reached the live slot");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "bpf/structops",
-    smoke_bpf_structops_commit_rejects_before_touching_slot
-);
-
-// ── the generated adapter ────────────────────────────────────────────
-
-fn smoke_bpf_structops_adapter_dispatches() -> TestResult {
-    // The generated adapter is what Linux spends a code generator on. NARF's
-    // struct_ops targets are trait slots with a Rust-level install point, so the
-    // adapter is an ordinary `impl` — this test is that claim, executed.
-    //
-    // The program returns its first context word doubled, so the result proves
-    // the argument reached it as ctx[0] rather than being zero or stale.
-    let insns = asm(&[ldx(0, 1, 0), alu_reg(AluOp::Add, 0, 0), EXIT]);
-    let Ok(prog) = load("gov", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected the governor program");
-    };
-    let set = crate::structops::ProgSet::new().with("select_state", prog);
-    let gov = BpfDemoGovernor::new(set);
-
-    if gov.select_state(21) != 42 {
-        return TestResult::Fail("adapter did not pass the argument as ctx[0]");
-    }
-    if gov.select_state(0) != 0 {
-        return TestResult::Fail("adapter returned a stale value");
-    }
-    // `init` is `#[optional]` and unbound, so it must fall back rather than
-    // fabricate. Returning nonsense from a policy hook is worse than the default.
-    if gov.init() != 0 {
-        return TestResult::Fail("unbound optional method did not fall back");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("bpf/structops", smoke_bpf_structops_adapter_dispatches);
-
-fn smoke_bpf_structops_adapter_is_the_trait() -> TestResult {
-    // The adapter must be usable anywhere the trait is — that is the whole point
-    // of the trait coming out of the macro unchanged. Exercised through a `&dyn`
-    // so nothing can be specialised away.
-    let insns = asm(&[mov_imm(0, 7), EXIT]);
-    let Ok(prog) = load("gov7", insns, Context::Atomic) else {
-        return TestResult::Fail("load rejected");
-    };
-    let bpf = BpfDemoGovernor::new(crate::structops::ProgSet::new().with("select_state", prog));
-    let native = NativeDemoGovernor;
-    let both: [&dyn DemoGovernor; 2] = [&bpf, &native];
-    if both[0].select_state(1) != 7 {
-        return TestResult::Fail("BPF impl did not dispatch through &dyn");
-    }
-    // The native impl still works and still has no idea BPF exists.
-    let _ = both[1].select_state(1);
-    TestResult::Pass
-}
-kernel_test_in!("bpf/structops", smoke_bpf_structops_adapter_is_the_trait);

@@ -19,7 +19,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use narf_capabilities::{Cap, CapType, Grant};
 
@@ -29,26 +29,42 @@ narf_bpf_structops::struct_ops! {
     /// Dispatched as [`narf_power::IdleGovernor`] through the bridge below, so
     /// `power`'s existing selection path resolves whatever C-state index the
     /// program returns against the live C-state table.
+    #[target("narf.power.IdleGovernor")]
+    #[version(1)]
     #[cap(IdleGovernor)]
     #[install(install_bpf_idle_governor)]
     #[desc(BPF_IDLE_GOVERNOR_OPS)]
     #[adapter(BpfIdleGovernorOps)]
+    #[builder(BpfIdleGovernorPrograms)]
     #[commit(commit_bpf_idle_governor)]
+    #[detach(detach_bpf_idle_governor)]
     pub trait BpfIdleGovernor {
         /// Pick a C-state index for the given latency budget and predicted idle
         /// duration (both microseconds), exactly the arguments
         /// [`narf_power::IdleGovernor::select_idle_state`] receives.
+        #[fallback(fallback_select_state)]
+        #[validate(validate_select_state)]
+        #[fuel(4096)]
+        #[kfuncs()]
         fn select_state(&self, latency_budget_us: u64, predicted_idle_us: u64) -> u32;
     }
+}
+
+fn fallback_select_state(_latency_budget_us: u64, _predicted_idle_us: u64) -> u32 {
+    0
+}
+
+fn validate_select_state(raw: u64) -> Option<u32> {
+    u8::try_from(raw).ok().map(u32::from)
 }
 
 /// Bridge the generated adapter onto `power`'s hand-written trait.
 ///
 /// This is the whole point of the struct_ops shape: `power` dispatches through
-/// `Box<dyn narf_power::IdleGovernor>` and cannot tell a BPF program set from a
-/// native `LinearScan`. The C-state id fits a `u8`; a program returning a wider
-/// value is truncated by the cast, and `power::select_idle_state` already
-/// handles an index that names no registered state.
+/// `Arc<dyn narf_power::IdleGovernor>` and cannot tell a BPF program set from a
+/// native `LinearScan`. The method validator rejects a value wider than `u8`,
+/// and `power::select_idle_state` rechecks the selected state's live latency
+/// and residency constraints.
 impl narf_power::IdleGovernor for BpfIdleGovernorOps {
     fn name(&self) -> &'static str {
         "bpf"
@@ -71,17 +87,22 @@ impl narf_power::IdleGovernor for BpfIdleGovernorOps {
 ///
 /// Generic over the cap marker because the generated install fn is; the
 /// struct_ops layer has already proved the cap's kind is `IdleGovernor` before
-/// this runs, and [`narf_power::install_idle_governor_boxed`] re-checks it. A
+/// this runs, and [`narf_power::install_idle_governor_struct_ops`] re-checks it. A
 /// `power` refusal maps to [`StructOpsError::CommitFailed`], which the framework
 /// only ever surfaces after the set is validated — so a malformed set never
 /// reaches the slot.
 fn commit_bpf_idle_governor<M: CapType>(
     cap: &Cap<M, Grant>,
-    adapter: BpfIdleGovernorOps,
+    generation: u64,
+    adapter: Arc<BpfIdleGovernorOps>,
 ) -> Result<(), narf_bpf_structops::StructOpsError> {
-    narf_power::install_idle_governor_boxed(cap, Box::new(adapter)).map_err(|_| {
+    narf_power::install_idle_governor_struct_ops(cap, generation, adapter).map_err(|_| {
         narf_bpf_structops::StructOpsError::CommitFailed("power rejected the governor")
     })
+}
+
+fn detach_bpf_idle_governor(generation: u64) -> bool {
+    narf_power::detach_idle_governor_struct_ops(generation)
 }
 
 /// Force-link anchor.

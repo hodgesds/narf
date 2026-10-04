@@ -608,27 +608,44 @@ impl IdleGovernor for MenuGovernor {
     }
 }
 
-/// `Box<dyn IdleGovernor>` slot. Mirrors `GOVERNOR`; `init()` installs
-/// `LinearScan` and `install_idle_governor` swaps it.
-static IDLE_GOVERNOR: IrqSafeSpinLock<Option<Box<dyn IdleGovernor>>> = IrqSafeSpinLock::new(None);
+struct IdleGovernorEntry {
+    generation: Option<u64>,
+    governor: Arc<dyn IdleGovernor>,
+}
+
+/// Arc-backed live slot. A query clones the active governor under this short
+/// lock and invokes it only after releasing the lock.
+static IDLE_GOVERNOR: IrqSafeSpinLock<Option<IdleGovernorEntry>> = IrqSafeSpinLock::new(None);
 
 /// Idle-governor selection. Asks the installed `IdleGovernor` for an
 /// index and resolves it against the live C-state table. C0 always
 /// satisfies the constraint (latency = 0) and is the fallback if the
 /// returned index doesn't match a registered state.
 pub fn select_idle_state() -> Result<CState, PowerError> {
-    let idx = {
+    let governor = {
         let slot = IDLE_GOVERNOR.lock();
         slot.as_ref()
             .ok_or(PowerError::GovernorMissing)?
-            .select_idle_state(
-                STAGE3_DEADLINE_BUDGET_US as u64,
-                STAGE3_DEADLINE_BUDGET_US as u64,
-            )
+            .governor
+            .clone()
     };
+    let latency_budget_us = STAGE3_DEADLINE_BUDGET_US as u64;
+    let predicted_idle_us = STAGE3_DEADLINE_BUDGET_US as u64;
+    let idx = governor.select_idle_state(latency_budget_us, predicted_idle_us);
     let t = CSTATES.lock();
     t.iter()
-        .find(|s| s.id == idx.0)
+        .find(|state| {
+            state.id == idx.0
+                && u64::from(state.exit_latency_us) <= latency_budget_us
+                && u64::from(state.target_residency_us) <= predicted_idle_us
+        })
+        .or_else(|| {
+            t.iter().find(|state| {
+                state.id == 0
+                    && u64::from(state.exit_latency_us) <= latency_budget_us
+                    && u64::from(state.target_residency_us) <= predicted_idle_us
+            })
+        })
         .copied()
         .ok_or(PowerError::NoMatchingState)
 }
@@ -772,46 +789,87 @@ pub fn select_freq(load_permille: u16) -> Result<FreqHint, PowerError> {
 }
 
 /// Install an idle governor. Cap-gated on `Cap<IdleGov, Grant>`.
-/// Replaces the previous active idle governor; the displaced `Box` is
-/// dropped. Mirrors `install_governor` exactly.
+/// Replaces the previous active idle governor; the displaced `Arc` is dropped
+/// after releasing the live-slot lock. Mirrors `install_governor` exactly.
 pub fn install_idle_governor<G: IdleGovernor>(
     cap: &Cap<IdleGov, Grant>,
     g: G,
 ) -> Result<(), PowerError> {
     cap.check_live()?;
-    let mut slot = IDLE_GOVERNOR.lock();
-    *slot = Some(Box::new(g));
+    let next = IdleGovernorEntry {
+        generation: None,
+        governor: Arc::new(g),
+    };
+    let old = {
+        let mut slot = IDLE_GOVERNOR.lock();
+        slot.replace(next)
+    };
+    drop(old);
     Ok(())
 }
 
-/// Install an already-boxed idle governor under any authority of the
-/// idle-governor kind.
+/// Commit an Arc-backed struct-ops idle governor generation.
 ///
 /// This is the entry a `struct_ops!` committer uses. The committer is generic
 /// over the cap marker (the macro makes it so), so it cannot present the
 /// concrete `Cap<IdleGov, Grant>` that [`install_idle_governor`] wants; the
 /// struct_ops layer has already proved the cap's kind matches the trait's
 /// declared `CapKind::IdleGovernor` before the committer runs. The runtime
-/// kind re-check here is the same belt-and-braces `structops::install` applies,
-/// so a caller reaching this directly still cannot install under the wrong
-/// authority.
-pub fn install_idle_governor_boxed<M: CapType>(
+/// kind re-check here is the same belt-and-braces validation the generated
+/// installer applies, so a caller reaching this directly still cannot install
+/// under the wrong authority.
+pub fn install_idle_governor_struct_ops<M: CapType>(
     cap: &Cap<M, Grant>,
-    g: Box<dyn IdleGovernor>,
+    generation: u64,
+    governor: Arc<dyn IdleGovernor>,
 ) -> Result<(), PowerError> {
-    if M::KIND != CapKind::IdleGovernor {
+    if M::KIND != CapKind::IdleGovernor || generation == 0 {
         return Err(PowerError::AuthorityRevoked);
     }
     cap.check_live()?;
-    *IDLE_GOVERNOR.lock() = Some(g);
+    let next = IdleGovernorEntry {
+        generation: Some(generation),
+        governor,
+    };
+    let old = {
+        let mut slot = IDLE_GOVERNOR.lock();
+        slot.replace(next)
+    };
+    drop(old);
     Ok(())
+}
+
+/// Detach `generation` if it is still live and restore the native default.
+/// A displaced older generation is a no-op.
+#[must_use]
+pub fn detach_idle_governor_struct_ops(generation: u64) -> bool {
+    let fallback = IdleGovernorEntry {
+        generation: None,
+        governor: Arc::new(LinearScan),
+    };
+    let (detached, old) = {
+        let mut slot = IDLE_GOVERNOR.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|entry| entry.generation == Some(generation))
+        {
+            (true, slot.replace(fallback))
+        } else {
+            (false, None)
+        }
+    };
+    drop(old);
+    detached
 }
 
 /// Snapshot the active idle governor's name. Returns `None` if `init()`
 /// hasn't run yet. Mirrors `current_governor_name`.
 pub fn current_idle_governor_name() -> Option<&'static str> {
-    let slot = IDLE_GOVERNOR.lock();
-    slot.as_ref().map(|g| g.name())
+    let governor = IDLE_GOVERNOR
+        .lock()
+        .as_ref()
+        .map(|entry| entry.governor.clone());
+    governor.map(|governor| governor.name())
 }
 
 // ── D-states (PCIe Power Management Capability §7.5.2) ─────────────
