@@ -167,15 +167,95 @@ fn install_proc_ext_hooks() {
     narf_filesystem::install_net_snapshot_hook(|| {
         narf_net::iface::snapshot_all()
             .into_iter()
-            .map(|nic| narf_filesystem::sysfs::NetIfaceInfo {
-                loopback: nic.name == "lo",
-                name: nic.name,
-                mac: nic.mac,
-                mtu: nic.mtu,
-                link_up: nic.link_up,
-                ifindex: nic.ifindex,
-                promisc: nic.promisc,
-                allmulti: nic.allmulti,
+            .map(|nic| {
+                let pci_parent = narf_net::iface::driver_info(&nic.name).and_then(
+                    |(driver, _version, bus_info)| {
+                        narf_bus::devices().into_iter().find_map(|device| {
+                            let narf_bus::BusAddr::Pcie(address) = device.addr else {
+                                return None;
+                            };
+                            if alloc::format!("{address:?}") != bus_info {
+                                return None;
+                            }
+                            Some(narf_filesystem::sysfs::NetPciParent {
+                                segment: address.segment,
+                                bus: address.bus,
+                                device: address.device,
+                                function: address.function,
+                                vendor_id: device.id.vendor,
+                                device_id: device.id.device,
+                                subsystem_vendor_id: device.id.subsystem_vendor,
+                                subsystem_device_id: device.id.subsystem_id,
+                                class: device.id.class,
+                                driver: alloc::string::String::from(driver),
+                            })
+                        })
+                    },
+                );
+                narf_filesystem::sysfs::NetIfaceInfo {
+                    loopback: nic.name == "lo",
+                    name: nic.name,
+                    mac: nic.mac,
+                    mtu: nic.mtu,
+                    link_up: nic.link_up,
+                    carrier: nic.carrier,
+                    ifindex: nic.ifindex,
+                    promisc: nic.promisc,
+                    allmulti: nic.allmulti,
+                    name_assign_type: nic.name_assign_type,
+                    addr_assign_type: nic.addr_assign_type,
+                    dev_id: nic.dev_id,
+                    dev_port: nic.dev_port,
+                    link_mode: nic.link_mode,
+                    netdev_group: nic.netdev_group,
+                    dormant: nic.dormant,
+                    testing: nic.testing,
+                    carrier_changes: nic.carrier_changes,
+                    carrier_up_count: nic.carrier_up_count,
+                    carrier_down_count: nic.carrier_down_count,
+                    speed_mbps: nic.speed_mbps,
+                    duplex: nic.duplex.map(|duplex| match duplex {
+                        narf_net::iface::LinkDuplex::Half => {
+                            narf_filesystem::sysfs::NetDuplex::Half
+                        }
+                        narf_net::iface::LinkDuplex::Full => {
+                            narf_filesystem::sysfs::NetDuplex::Full
+                        }
+                    }),
+                    ifalias: nic.ifalias,
+                    tx_queue_len: nic.tx_queue_len,
+                    gro_flush_timeout_ns: nic.gro_flush_timeout_ns,
+                    napi_defer_hard_irqs: nic.napi_defer_hard_irqs,
+                    proto_down: nic.proto_down,
+                    threaded: nic.threaded,
+                    stats: narf_filesystem::sysfs::NetIfaceStats {
+                        rx_packets: nic.stats.rx_packets,
+                        tx_packets: nic.stats.tx_packets,
+                        rx_bytes: nic.stats.rx_bytes,
+                        tx_bytes: nic.stats.tx_bytes,
+                        rx_errors: nic.stats.rx_errs,
+                        tx_errors: nic.stats.tx_errs,
+                        rx_dropped: nic.stats.rx_drop,
+                        tx_dropped: nic.stats.tx_drop,
+                        multicast: nic.stats.rx_multicast,
+                        collisions: nic.stats.tx_colls,
+                        rx_length_errors: nic.stats.rx_length_errors,
+                        rx_over_errors: nic.stats.rx_over_errors,
+                        rx_crc_errors: nic.stats.rx_crc_errors,
+                        rx_frame_errors: nic.stats.rx_frame,
+                        rx_fifo_errors: nic.stats.rx_fifo,
+                        rx_missed_errors: nic.stats.rx_missed_errors,
+                        tx_aborted_errors: nic.stats.tx_aborted_errors,
+                        tx_carrier_errors: nic.stats.tx_carrier,
+                        tx_fifo_errors: nic.stats.tx_fifo,
+                        tx_heartbeat_errors: nic.stats.tx_heartbeat_errors,
+                        tx_window_errors: nic.stats.tx_window_errors,
+                        rx_compressed: nic.stats.rx_compressed,
+                        tx_compressed: nic.stats.tx_compressed,
+                        rx_nohandler: nic.stats.rx_nohandler,
+                    },
+                    pci_parent,
+                }
             })
             .collect()
     });
@@ -257,6 +337,20 @@ fn install_net_stack() {
         console::Writer,
         "  net: tcp_stack init; iface count = {}",
         narf_net::iface::count()
+    );
+
+    // Driver probing happened during the initcall stages, but the snapshot
+    // hook and the real loopback interface are installed here. Build sysfs
+    // only now, when the complete interface inventory exists, and place its
+    // ADD events in the bounded replay window before PID 1 starts udevd.
+    // Doing this from Stage::Late ran too early and queued zero devices.
+    narf_filesystem::sysfs::populate_net_class();
+    narf_filesystem::uevent::begin_boot_udevd_replay();
+    let events = narf_filesystem::sysfs::emit_net_device_add_events();
+    let _ = writeln!(
+        console::Writer,
+        "  net: queued {} canonical sysfs ADD event(s)",
+        events,
     );
     // QEMU SLIRP static config: the user-mode network backend always
     // hands the guest 10.0.2.15/24 with the gateway + DNS at 10.0.2.2.

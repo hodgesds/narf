@@ -107,6 +107,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             let fail = |ctx: &mut dyn TrapContext, errno: i64| {
                 drop(sock.unix_take_recv_fds());
                 let _ = sock.recvmsg_cred();
+                let _ = sock.take_netlink_user_recv_cred();
                 let _ = sock.take_packet_recv_ancillary();
                 ctx.set_return(errno_ret(errno));
             };
@@ -137,12 +138,24 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             }
 
             if sock.domain == crate::socket::AF_NETLINK {
-                // Netlink uevent: attach SCM_CREDENTIALS naming the KERNEL as
-                // sender (pid/uid/gid = 0). systemd's libudev sets SO_PASSCRED
-                // and silently drops any uevent whose recvmsg carries no
-                // sender credentials with uid 0 — so this is required for
-                // udevd / `udevadm monitor` to accept our broadcasts.
-                install_netlink_ancillary(msg_ptr, sock.netlink_pktinfo());
+                // Kernel-originated netlink messages report zero credentials
+                // only when the receiver enabled SO_PASSCRED. systemd's
+                // libudev does so; sd-netlink's rtnetlink users do not and
+                // reserve their control buffer for NETLINK_PKTINFO alone.
+                // A userspace netlink datagram carries its sender's real
+                // send-time identity; only kernel-originated queues use the
+                // synthetic kernel credential. Consume the per-record stash
+                // even when SO_PASSCRED is disabled so it cannot leak into a
+                // later recvmsg on the same socket.
+                let user_cred = sock.take_netlink_user_recv_cred();
+                let cred = sock.passcred().then(|| {
+                    report_ucred_to(current_task_id(), user_cred.unwrap_or_default())
+                });
+                let ancillary_truncated =
+                    install_netlink_ancillary(msg_ptr, cred, sock.netlink_pktinfo());
+                if ancillary_truncated {
+                    write_user_u32(msg_ptr + 48, 0x8); // MSG_CTRUNC
+                }
             } else if sock.domain == crate::socket::AF_PACKET {
                 let ancillary_truncated = install_packet_ancillary(
                     msg_ptr,

@@ -38,6 +38,12 @@ a raw-frame Narf-Ring and nothing higher.
 - Outbound: per-queue frame Narf-Rings (RSS / multi-queue), plus a
   control plane (link up/down, stats).
 
+Physical drivers publish link metadata separately from administrative
+`IFF_UP`. E1000 samples `STATUS.LU`, `STATUS.SPEED`, and `STATUS.FD` after
+bring-up and passes carrier, negotiated Mbps, and duplex to the central net
+registry; sysfs and rtnetlink do not infer those values from the fact that an
+administrator opened the interface.
+
 ### 3.1 i40e runtime profile
 
 Each X710/XL710/XXV710/X722 PF negotiates 1–8 64-entry TX/RX pairs.

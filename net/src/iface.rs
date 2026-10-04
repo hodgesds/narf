@@ -16,7 +16,15 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// frame. Returns Ok on enqueue, Err on driver failure.
 pub type SendFn = fn(&[u8]) -> Result<(), ()>;
 
-#[derive(Debug)]
+/// Duplex state reported by a physical driver. `None` in snapshots means the
+/// driver has no authoritative link-mode sample.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LinkDuplex {
+    Half,
+    Full,
+}
+
+#[derive(Clone, Debug)]
 pub struct NetIfaceEntry {
     pub name: String,
     pub mac: [u8; 6],
@@ -28,8 +36,7 @@ pub struct NetIfaceEntry {
     /// Default gateway recorded by the in-kernel DHCP client / static config.
     pub gateway: [u8; 4],
     pub mtu: u32,
-    /// Administratively up (IFF_UP). NARF devices report carrier whenever
-    /// they are up, so this is also IFF_RUNNING / IFF_LOWER_UP.
+    /// Administratively up (IFF_UP). Physical carrier is tracked separately.
     pub link_up: bool,
     /// Owning network namespace. Zero is the initial namespace.
     pub net_ns_id: u64,
@@ -51,6 +58,35 @@ pub struct NetIfaceEntry {
     /// `dev->mc` / `dev->uc`: hardware addresses added by `dev_mc_add` /
     /// `dev_uc_add`, each with its reference count.
     pub hw_addrs: Vec<HwAddr>,
+    /// Linux net-device metadata owned by the control plane rather than by
+    /// sysfs.  Values are initialized with `register_netdevice` semantics and
+    /// snapshots render this state verbatim.
+    pub name_assign_type: u8,
+    pub addr_assign_type: u8,
+    pub dev_id: u32,
+    pub dev_port: u32,
+    pub link_mode: u8,
+    pub netdev_group: u32,
+    pub dormant: bool,
+    pub testing: bool,
+    pub ifalias: String,
+    pub tx_queue_len: u32,
+    pub gro_flush_timeout_ns: u64,
+    pub napi_defer_hard_irqs: u32,
+    pub proto_down: bool,
+    pub threaded: bool,
+    /// Physical carrier/link-mode state, distinct from administrative
+    /// `link_up` (IFF_UP). Drivers update it from hardware observations.
+    pub carrier: bool,
+    pub carrier_changes: u32,
+    pub carrier_up_count: u32,
+    pub carrier_down_count: u32,
+    pub speed_mbps: Option<u32>,
+    pub duplex: Option<LinkDuplex>,
+    /// Authoritative software-path counters shared by sysfs, procfs, and
+    /// rtnetlink. Driver-specific error paths can add to these through the
+    /// accounting helpers below as they gain detailed hardware reporting.
+    pub stats: IfaceCounterSnapshot,
 }
 
 /// One `netdev_hw_addr` on a device's multicast or unicast list.
@@ -215,6 +251,7 @@ fn lo_send_fn(frame: &[u8]) -> Result<(), ()> {
         return Err(());
     }
     let mut buf = frame.to_vec();
+    record_rx_frame("lo", &buf);
     crate::tcp_stack::rx_handler("lo", &mut buf);
     IN_LOOPBACK[cpu].store(false, Ordering::Release);
     Ok(())
@@ -241,6 +278,7 @@ pub fn register_loopback_iface() {
 /// pattern the name `dev_alloc_name` chose. Drivers address their device by
 /// the returned name afterwards.
 pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
+    let enumerated_name = name.contains("%d");
     let mut g = IFACES.lock();
     let v = g.get_or_insert_with(Vec::new);
     let name = {
@@ -252,10 +290,10 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
     };
     // De-dup: a same-named iface is replaced, keeping its ifindex and the
     // configuration userspace gave it (admin state, addresses).
-    let old = v.iter().find(|i| i.name == name);
+    let old = v.iter().find(|i| i.name == name).cloned();
     let ifindex = if name == "lo" {
         1
-    } else if let Some(old) = old {
+    } else if let Some(old) = old.as_ref() {
         old.ifindex
     } else {
         NEXT_IFINDEX.fetch_add(1, Ordering::Relaxed)
@@ -264,10 +302,54 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
     // address; userspace (NetworkManager, `ip`) or the boot-time IP
     // autoconfiguration brings it up and configures it. NARF's `lo` is the
     // exception: its datapath is permanently up (see `AdminHandle::set_link`).
-    let (ipv4, gateway, link_up) = match old {
+    let (ipv4, gateway, link_up) = match old.as_ref() {
         Some(old) => (old.ipv4, old.gateway, old.link_up),
         None => ([0; 4], [0; 4], name == "lo"),
     };
+    let mtu = old.as_ref().map_or(1500, |old| old.mtu);
+    let net_ns_id = old.as_ref().map_or(0, |old| old.net_ns_id);
+    let name_assign_type = old.as_ref().map_or_else(
+        || {
+            if name == "lo" {
+                2 // NET_NAME_PREDICTABLE
+            } else if enumerated_name {
+                1 // NET_NAME_ENUM
+            } else {
+                0 // NET_NAME_UNKNOWN
+            }
+        },
+        |old| old.name_assign_type,
+    );
+    let addr_assign_type = old.as_ref().map_or(0, |old| old.addr_assign_type);
+    let dev_id = old.as_ref().map_or(0, |old| old.dev_id);
+    let dev_port = old.as_ref().map_or(0, |old| old.dev_port);
+    let link_mode = old.as_ref().map_or(0, |old| old.link_mode);
+    let netdev_group = old.as_ref().map_or(0, |old| old.netdev_group);
+    let dormant = old.as_ref().is_some_and(|old| old.dormant);
+    let testing = old.as_ref().is_some_and(|old| old.testing);
+    let ifalias = old
+        .as_ref()
+        .map_or_else(String::new, |old| old.ifalias.clone());
+    let tx_queue_len = old.as_ref().map_or(1000, |old| old.tx_queue_len);
+    let gro_flush_timeout_ns = old.as_ref().map_or(0, |old| old.gro_flush_timeout_ns);
+    let napi_defer_hard_irqs = old.as_ref().map_or(0, |old| old.napi_defer_hard_irqs);
+    let proto_down = old.as_ref().is_some_and(|old| old.proto_down);
+    let threaded = old.as_ref().is_some_and(|old| old.threaded);
+    let carrier = old.as_ref().is_some_and(|old| old.carrier) || name == "lo";
+    let carrier_changes = old.as_ref().map_or(0, |old| old.carrier_changes);
+    let carrier_up_count = old.as_ref().map_or(0, |old| old.carrier_up_count);
+    let carrier_down_count = old.as_ref().map_or(0, |old| old.carrier_down_count);
+    let speed_mbps = old.as_ref().and_then(|old| old.speed_mbps);
+    let duplex = old.as_ref().and_then(|old| old.duplex);
+    let stats = old.as_ref().map_or_else(
+        || IfaceCounterSnapshot::empty(&name),
+        |old| old.stats.clone(),
+    );
+    let promiscuity = old.as_ref().map_or(0, |old| old.promiscuity);
+    let allmulti = old.as_ref().map_or(0, |old| old.allmulti);
+    let hw_addrs = old
+        .as_ref()
+        .map_or_else(Vec::new, |old| old.hw_addrs.clone());
     v.retain(|i| i.name != name);
     v.push(NetIfaceEntry {
         name: name.clone(),
@@ -275,16 +357,37 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
         send,
         ipv4,
         gateway,
-        mtu: 1500,
+        mtu,
         link_up,
-        net_ns_id: 0,
+        net_ns_id,
         ifindex,
         driver: "",
         driver_version: None,
         bus_info: String::new(),
-        promiscuity: 0,
-        allmulti: 0,
-        hw_addrs: Vec::new(),
+        promiscuity,
+        allmulti,
+        hw_addrs,
+        name_assign_type,
+        addr_assign_type,
+        dev_id,
+        dev_port,
+        link_mode,
+        netdev_group,
+        dormant,
+        testing,
+        ifalias,
+        tx_queue_len,
+        gro_flush_timeout_ns,
+        napi_defer_hard_irqs,
+        proto_down,
+        threaded,
+        carrier,
+        carrier_changes,
+        carrier_up_count,
+        carrier_down_count,
+        speed_mbps,
+        duplex,
+        stats,
     });
     drop(g);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
@@ -300,11 +403,10 @@ pub fn count() -> usize {
     IFACES.lock().as_ref().map(|v| v.len()).unwrap_or(0)
 }
 
-/// Per-interface counter snapshot for `/proc/net/dev`. NARF
-/// drivers don't yet report their RX/TX statistics into a central
-/// counter table — when they do, this snapshot will pick them up.
-/// Until then we emit zeros for every counter so unmodified
-/// `ifconfig` / `ip -s link` parsers still print a coherent row.
+/// Per-interface counter snapshot shared by `/proc/net/dev`, net sysfs, and
+/// rtnetlink. The common ingress/egress paths update packet and byte totals;
+/// detailed driver error counters remain zero until an actual error is
+/// reported, rather than being synthesized by a compatibility renderer.
 #[derive(Clone, Debug)]
 pub struct IfaceCounterSnapshot {
     pub name: String,
@@ -324,23 +426,21 @@ pub struct IfaceCounterSnapshot {
     pub tx_colls: u64,
     pub tx_carrier: u64,
     pub tx_compressed: u64,
+    pub rx_length_errors: u64,
+    pub rx_over_errors: u64,
+    pub rx_crc_errors: u64,
+    pub rx_missed_errors: u64,
+    pub tx_aborted_errors: u64,
+    pub tx_heartbeat_errors: u64,
+    pub tx_window_errors: u64,
+    pub rx_nohandler: u64,
+    pub rx_otherhost_dropped: u64,
 }
 
-/// Snapshot every registered interface's name + counters.
-pub fn snapshot_counters() -> Vec<IfaceCounterSnapshot> {
-    snapshot_counters_in(0)
-}
-
-pub fn snapshot_counters_in(net_ns_id: u64) -> Vec<IfaceCounterSnapshot> {
-    let g = IFACES.lock();
-    let v = match g.as_ref() {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    v.iter()
-        .filter(|e| e.net_ns_id == net_ns_id)
-        .map(|e| IfaceCounterSnapshot {
-            name: e.name.clone(),
+impl IfaceCounterSnapshot {
+    fn empty(name: &str) -> Self {
+        Self {
+            name: String::from(name),
             rx_bytes: 0,
             rx_packets: 0,
             rx_errs: 0,
@@ -357,7 +457,33 @@ pub fn snapshot_counters_in(net_ns_id: u64) -> Vec<IfaceCounterSnapshot> {
             tx_colls: 0,
             tx_carrier: 0,
             tx_compressed: 0,
-        })
+            rx_length_errors: 0,
+            rx_over_errors: 0,
+            rx_crc_errors: 0,
+            rx_missed_errors: 0,
+            tx_aborted_errors: 0,
+            tx_heartbeat_errors: 0,
+            tx_window_errors: 0,
+            rx_nohandler: 0,
+            rx_otherhost_dropped: 0,
+        }
+    }
+}
+
+/// Snapshot every registered interface's name + counters.
+pub fn snapshot_counters() -> Vec<IfaceCounterSnapshot> {
+    snapshot_counters_in(0)
+}
+
+pub fn snapshot_counters_in(net_ns_id: u64) -> Vec<IfaceCounterSnapshot> {
+    let g = IFACES.lock();
+    let v = match g.as_ref() {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    v.iter()
+        .filter(|e| e.net_ns_id == net_ns_id)
+        .map(|e| e.stats.clone())
         .collect()
 }
 
@@ -428,6 +554,45 @@ pub fn send(frame: &[u8]) -> Result<(), ()> {
     primary().ok_or(())?.xmit(frame)
 }
 
+fn with_stats_mut(name: &str, update: impl FnOnce(&mut IfaceCounterSnapshot)) {
+    let mut guard = IFACES.lock();
+    if let Some(entry) = guard
+        .as_mut()
+        .and_then(|entries| entries.iter_mut().find(|entry| entry.name == name))
+    {
+        update(&mut entry.stats);
+    }
+}
+
+fn record_tx_result(name: &str, bytes: usize, success: bool) {
+    with_stats_mut(name, |stats| {
+        if success {
+            stats.tx_packets = stats.tx_packets.saturating_add(1);
+            stats.tx_bytes = stats.tx_bytes.saturating_add(bytes as u64);
+        } else {
+            stats.tx_errs = stats.tx_errs.saturating_add(1);
+            stats.tx_drop = stats.tx_drop.saturating_add(1);
+        }
+    });
+}
+
+fn record_rx_frame(name: &str, frame: &[u8]) {
+    with_stats_mut(name, |stats| {
+        stats.rx_packets = stats.rx_packets.saturating_add(1);
+        stats.rx_bytes = stats.rx_bytes.saturating_add(frame.len() as u64);
+        // Linux's multicast counter excludes the all-ones broadcast address.
+        if frame.len() >= 6 && frame[0] & 1 != 0 && frame[..6] != [0xff; 6] {
+            stats.rx_multicast = stats.rx_multicast.saturating_add(1);
+        }
+    });
+}
+
+fn record_rx_nohandler(name: &str) {
+    with_stats_mut(name, |stats| {
+        stats.rx_nohandler = stats.rx_nohandler.saturating_add(1);
+    });
+}
+
 /// Send a complete Ethernet frame out the interface named `iface_name`.
 /// Returns `Err` if no such iface is registered or the driver failed.
 ///
@@ -438,13 +603,15 @@ pub fn send(frame: &[u8]) -> Result<(), ()> {
 /// deadlock. The classifier is the sole XDP caller and invokes this only after
 /// its own `XDP_PROGS` lock is released, so no BPF-side lock is held here.
 pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
-    let send_fn = {
+    let (send_fn, name) = {
         let g = IFACES.lock();
         let v = g.as_ref().ok_or(())?;
         let e = v.iter().find(|e| e.name == iface_name).ok_or(())?;
-        e.send
+        (e.send, e.name.clone())
     };
-    send_fn(frame)
+    let result = send_fn(frame);
+    record_tx_result(&name, frame.len(), result.is_ok());
+    result
 }
 
 /// Send a frame out the interface at synthetic `ifindex`.
@@ -456,12 +623,15 @@ pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
 /// turn a program's `bpf_redirect(ifindex)` into an egress NIC. Returns `Err`
 /// if the ifindex names no registered iface or the driver failed.
 pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
-    let send_fn = {
+    let (send_fn, name) = {
         let g = IFACES.lock();
         let v = g.as_ref().ok_or(())?;
-        v.iter().find(|e| e.ifindex == ifindex).ok_or(())?.send
+        let entry = v.iter().find(|e| e.ifindex == ifindex).ok_or(())?;
+        (entry.send, entry.name.clone())
     };
-    send_fn(frame)
+    let result = send_fn(frame);
+    record_tx_result(&name, frame.len(), result.is_ok());
+    result
 }
 
 /// The synthetic ifindex of `iface_name`, in the same space
@@ -588,6 +758,27 @@ pub struct NetIfaceSnapshot {
     pub promisc: bool,
     /// `dev->allmulti != 0` (`IFF_ALLMULTI` in `dev->flags`).
     pub allmulti: bool,
+    pub name_assign_type: u8,
+    pub addr_assign_type: u8,
+    pub dev_id: u32,
+    pub dev_port: u32,
+    pub link_mode: u8,
+    pub netdev_group: u32,
+    pub dormant: bool,
+    pub testing: bool,
+    pub ifalias: String,
+    pub tx_queue_len: u32,
+    pub gro_flush_timeout_ns: u64,
+    pub napi_defer_hard_irqs: u32,
+    pub proto_down: bool,
+    pub threaded: bool,
+    pub carrier: bool,
+    pub carrier_changes: u32,
+    pub carrier_up_count: u32,
+    pub carrier_down_count: u32,
+    pub speed_mbps: Option<u32>,
+    pub duplex: Option<LinkDuplex>,
+    pub stats: IfaceCounterSnapshot,
 }
 
 impl NetIfaceSnapshot {
@@ -606,7 +797,9 @@ impl NetIfaceSnapshot {
     /// (`dev_queue_xmit_nit`, `PACKET_OUTGOING`), then the driver sends it.
     pub fn xmit(&self, frame: &[u8]) -> Result<(), ()> {
         crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
-        (self.driver_send)(frame)
+        let result = (self.driver_send)(frame);
+        record_tx_result(&self.name, frame.len(), result.is_ok());
+        result
     }
 
     /// `dev_queue_xmit` for a frame a packet socket built: `protocol` is
@@ -620,13 +813,17 @@ impl NetIfaceSnapshot {
         origin: Option<&crate::raw_sock::PacketSock>,
     ) -> Result<(), ()> {
         crate::raw_sock::dev_queue_xmit_nit(self, frame, protocol, origin);
-        (self.driver_send)(frame)
+        let result = (self.driver_send)(frame);
+        record_tx_result(&self.name, frame.len(), result.is_ok());
+        result
     }
 
     /// `dev_direct_xmit`: hand the frame straight to the driver, with no
     /// packet taps (`PACKET_QDISC_BYPASS`).
     pub fn xmit_direct(&self, frame: &[u8]) -> Result<(), ()> {
-        (self.driver_send)(frame)
+        let result = (self.driver_send)(frame);
+        record_tx_result(&self.name, frame.len(), result.is_ok());
+        result
     }
 }
 
@@ -643,6 +840,27 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         ifindex: entry.ifindex,
         promisc: entry.promiscuity != 0,
         allmulti: entry.allmulti != 0,
+        name_assign_type: entry.name_assign_type,
+        addr_assign_type: entry.addr_assign_type,
+        dev_id: entry.dev_id,
+        dev_port: entry.dev_port,
+        link_mode: entry.link_mode,
+        netdev_group: entry.netdev_group,
+        dormant: entry.dormant,
+        testing: entry.testing,
+        ifalias: entry.ifalias.clone(),
+        tx_queue_len: entry.tx_queue_len,
+        gro_flush_timeout_ns: entry.gro_flush_timeout_ns,
+        napi_defer_hard_irqs: entry.napi_defer_hard_irqs,
+        proto_down: entry.proto_down,
+        threaded: entry.threaded,
+        carrier: entry.carrier,
+        carrier_changes: entry.carrier_changes,
+        carrier_up_count: entry.carrier_up_count,
+        carrier_down_count: entry.carrier_down_count,
+        speed_mbps: entry.speed_mbps,
+        duplex: entry.duplex,
+        stats: entry.stats.clone(),
     }
 }
 
@@ -787,6 +1005,36 @@ pub fn set_link_state(name: &str, up: bool) -> bool {
     true
 }
 
+/// Publish a driver's latest physical-link sample. Administrative IFF_UP is
+/// deliberately independent: NetworkManager may open/close a device without
+/// changing whether the PHY has carrier.
+pub fn set_link_metadata(
+    name: &str,
+    carrier: bool,
+    speed_mbps: Option<u32>,
+    duplex: Option<LinkDuplex>,
+) -> bool {
+    let mut guard = IFACES.lock();
+    let Some(entry) = guard
+        .as_mut()
+        .and_then(|entries| entries.iter_mut().find(|entry| entry.name == name))
+    else {
+        return false;
+    };
+    if entry.carrier != carrier {
+        entry.carrier = carrier;
+        entry.carrier_changes = entry.carrier_changes.saturating_add(1);
+        if carrier {
+            entry.carrier_up_count = entry.carrier_up_count.saturating_add(1);
+        } else {
+            entry.carrier_down_count = entry.carrier_down_count.saturating_add(1);
+        }
+    }
+    entry.speed_mbps = carrier.then_some(speed_mbps).flatten();
+    entry.duplex = carrier.then_some(duplex).flatten();
+    true
+}
+
 pub fn set_mtu(name: &str, mtu: u32) -> bool {
     let mut g = IFACES.lock();
     let Some(entry) = g
@@ -808,6 +1056,7 @@ pub fn set_mac(name: &str, mac: [u8; 6]) -> bool {
         return false;
     };
     entry.mac = mac;
+    entry.addr_assign_type = 3; // NET_ADDR_SET
     true
 }
 
@@ -1032,8 +1281,14 @@ pub fn install_rx_handler(h: RxHandler) {
 /// (or the driver reflects it for `XDP_TX`) is the whole point of a writable
 /// XDP surface.
 pub fn on_rx_frame_from(iface_name: &str, frame: &mut [u8]) {
+    if !iface_name.is_empty() {
+        record_rx_frame(iface_name, frame);
+    }
     let v = RX_HANDLER.load(Ordering::Acquire);
     if v == 0 {
+        if !iface_name.is_empty() {
+            record_rx_nohandler(iface_name);
+        }
         return;
     }
     // SAFETY: `v` is non-zero (checked above) and was produced by

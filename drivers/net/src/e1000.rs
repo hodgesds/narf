@@ -274,6 +274,11 @@ pub const E1000_DEV_I350_COPPER: u16 = 0x1521;
 
 const REG_CTRL: u64 = 0x0000;
 const REG_STATUS: u64 = 0x0008;
+const STATUS_FD: u32 = 1 << 0;
+const STATUS_LU: u32 = 1 << 1;
+const STATUS_SPEED_MASK: u32 = 0b11 << 6;
+const STATUS_SPEED_100: u32 = 0b01 << 6;
+const STATUS_SPEED_1000: u32 = 0b10 << 6;
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const REG_EERD: u64 = 0x0014;
 /// Interrupt Cause Read — reading this register returns the set of
@@ -1028,7 +1033,7 @@ impl E1000 {
         // immediately on user-mode net.
         // SAFETY: same.
         let status = unsafe { mmio.read32(REG_STATUS) };
-        let link_up = status & (1 << 1) != 0;
+        let link_up = status & STATUS_LU != 0;
 
         // 7. Try to attach an IRQ delivery path. Mirror the
         //    `xhci.rs` MSI-X → INTx → polled fallback chain.
@@ -1463,6 +1468,19 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
     };
     narf_net::iface::set_driver_info(&name, "e1000", None, bus_info);
+    let status = dev.read_status();
+    let carrier = status & STATUS_LU != 0;
+    let speed_mbps = carrier.then_some(match status & STATUS_SPEED_MASK {
+        STATUS_SPEED_1000 => 1000,
+        STATUS_SPEED_100 => 100,
+        _ => 10,
+    });
+    let duplex = carrier.then_some(if status & STATUS_FD != 0 {
+        narf_net::iface::LinkDuplex::Full
+    } else {
+        narf_net::iface::LinkDuplex::Half
+    });
+    narf_net::iface::set_link_metadata(&name, carrier, speed_mbps, duplex);
     *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
     narf_net::iface::install_rx_drain(rx_pump_step);
 

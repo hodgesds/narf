@@ -44,6 +44,17 @@ route/generic `socket()` calls automatically receive the grant. Fork/clone
 inherit it (including supplicant daemonization), and exec retains it.
 Revocation and interface/namespace authorization are checked at delegation
 and every control request. A namespace move cannot transfer authority.
+Netlink receive metadata keeps Linux's two multicast representations distinct:
+`NETLINK_PKTINFO` carries the numeric group id, while the returned
+`sockaddr_nl.nl_groups` carries the corresponding legacy 32-bit group mask
+(zero for unicast and numeric groups above 32).
+Netlink datagrams attach authenticated `SCM_CREDENTIALS` only when the receiver
+enabled `SO_PASSCRED`: kernel-originated records use the kernel identity
+(translated into the receiver's namespaces), while user-originated records
+retain the sender's real uid/gid and pid captured at send time. This is
+independent of `NETLINK_PKTINFO`, so a caller requesting only packet info needs
+room for only that control record. Packet info precedes credentials, matching
+Linux netlink ancillary ordering; truncation follows normal `MSG_CTRUNC` rules.
 Other tasks, including UID 0, acquire none. The caller remains responsible
 for selecting/loading the service executable and presenting stack authority;
 these APIs never infer a grant from a process name or UID.
@@ -333,6 +344,11 @@ implemented. Interface promiscuity/all-multicast memberships are
 reference-counted and visible through both `SIOCGIFFLAGS` and net sysfs.
 AF_UNIX stream clients may bind a local pathname or abstract address before
 `connect(2)`; binding does not put the socket into listening state. Connected
+pathname binds materialize their socket inode before publishing the endpoint
+and emit `IN_CREATE` on the containing directory. Inotify watches are keyed by
+the resolved filesystem path after applying the task root, so a mutation made
+through a chroot reaches a watch established through that same chroot.
+Connected
 stream receive operations honor `MSG_PEEK` without consuming queued bytes.
 Connected AF_UNIX `SOCK_SEQPACKET` and datagram socketpairs retain one record
 per send; receive consumes at most one record and reports truncation through

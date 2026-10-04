@@ -864,6 +864,13 @@ pub struct SocketFile {
     /// NETLINK_PKTINFO can report the group of the datagram actually read.
     netlink_reply_groups: IrqSafeSpinLock<VecDeque<u32>>,
     netlink_last_recv_group: AtomicU32,
+    /// Send-time credentials for a userspace-originated netlink datagram,
+    /// held between dequeue and recvmsg ancillary construction. Kernel
+    /// replies/notifications deliberately have no entry and therefore use
+    /// the kernel credential after the receive path clears any stale value.
+    /// Keyed by receiving task for the same dequeue/interleaving reason as
+    /// `dgram_recv_ancillary`.
+    netlink_user_recv_creds: IrqSafeSpinLock<BTreeMap<u64, Ucred>>,
     /// Explicitly delegated NARF network-control authority. Never inferred
     /// from uid or Linux ambient capability bits.
     netlink_admin: IrqSafeSpinLock<Option<narf_net::AdminHandle>>,
@@ -1525,6 +1532,10 @@ impl core::fmt::Debug for DgramPacket {
 struct NetlinkUserPacket {
     payload: Vec<u8>,
     sender_portid: u32,
+    /// Sender's real uid/gid and visible pid, captured at send time.
+    sender_cred: Ucred,
+    /// One-based numeric multicast group for NETLINK_PKTINFO (0 for unicast).
+    group: u32,
     /// Destination multicast group as a `sockaddr_nl.nl_groups` MASK
     /// (0 for unicast). Linux reports this to the receiver via
     /// `netlink_group_mask(NETLINK_CB(skb).dst_group)` in `netlink_recvmsg`,
@@ -1533,7 +1544,7 @@ struct NetlinkUserPacket {
     /// `nl_groups == 0` is treated as unicast and DISCARDED unless it comes
     /// from the monitor's trusted sender. Dropping this field would make
     /// every udev broadcast silently ignored by its listeners.
-    group: u32,
+    group_mask: u32,
 }
 
 impl SocketFile {
@@ -1736,6 +1747,7 @@ impl SocketFile {
             netlink_strict_check: AtomicBool::new(false),
             netlink_reply_groups: IrqSafeSpinLock::new(VecDeque::new()),
             netlink_last_recv_group: AtomicU32::new(0),
+            netlink_user_recv_creds: IrqSafeSpinLock::new(BTreeMap::new()),
             netlink_admin: IrqSafeSpinLock::new(None),
             opener_net_admin: AtomicBool::new(false),
             netfilter_admin: IrqSafeSpinLock::new(None),
@@ -2176,6 +2188,7 @@ impl SocketFile {
             return Some(self.broadcast_netlink_user(buf, destination.1));
         }
         let sender = self.ensure_netlink_portid();
+        let sender_cred = crate::handlers::current_scm_ucred();
         let mut sockets = NETLINK_SOCKETS.lock();
         sockets.retain(|weak| weak.strong_count() != 0);
         let target = sockets.iter().filter_map(Weak::upgrade).find(|socket| {
@@ -2191,7 +2204,9 @@ impl SocketFile {
             .push_back(NetlinkUserPacket {
                 payload: buf.to_vec(),
                 sender_portid: sender,
+                sender_cred,
                 group: 0,
+                group_mask: 0,
             });
         // Durable targeted wake: fire BOTH the target's `uevent_readiness` cell
         // (a NetlinkUevent monitor arms this one — the load-bearing logind
@@ -2223,6 +2238,7 @@ impl SocketFile {
         // Linux `ffs(addr->nl_groups)`.
         let group = group_mask.trailing_zeros() + 1;
         let sender = self.ensure_netlink_portid();
+        let sender_cred = crate::handlers::current_scm_ucred();
         let targets: Vec<Arc<SocketFile>> = {
             let mut sockets = NETLINK_SOCKETS.lock();
             sockets.retain(|weak| weak.strong_count() != 0);
@@ -2247,7 +2263,9 @@ impl SocketFile {
                 .push_back(NetlinkUserPacket {
                     payload: buf.to_vec(),
                     sender_portid: sender,
-                    group: group_mask,
+                    sender_cred,
+                    group,
+                    group_mask,
                 });
             // Durable, targeted, lost-wake-proof wake on ARRIVAL. Fire BOTH the
             // target's `uevent_readiness` cell — armed by a NetlinkUevent
@@ -2279,7 +2297,9 @@ impl SocketFile {
                 inbox.front().map(|packet| NetlinkUserPacket {
                     payload: packet.payload.clone(),
                     sender_portid: packet.sender_portid,
+                    sender_cred: packet.sender_cred,
                     group: packet.group,
+                    group_mask: packet.group_mask,
                 })
             } else {
                 inbox.pop_front()
@@ -2295,7 +2315,13 @@ impl SocketFile {
         // untrusted unicast and dropped on the floor.
         self.netlink_last_recv_group
             .store(packet.group, Ordering::Release);
-        let peer = Some(Self::netlink_sockaddr(packet.sender_portid, packet.group));
+        self.netlink_user_recv_creds
+            .lock()
+            .insert(crate::handlers::current_task_id(), packet.sender_cred);
+        let peer = Some(Self::netlink_sockaddr(
+            packet.sender_portid,
+            packet.group_mask,
+        ));
         Some(if n < packet.payload.len() {
             SocketOpResult::ReceivedTruncated {
                 copied: n,
@@ -2326,7 +2352,7 @@ impl SocketFile {
         self.netlink_readiness.notify(narf_filesystem::POLL_IN);
     }
 
-    fn record_queued_netlink_group(&self, flags: u32) {
+    fn record_queued_netlink_group(&self, flags: u32) -> u32 {
         let group = {
             let mut groups = self.netlink_reply_groups.lock();
             if flags & MSG_PEEK != 0 {
@@ -2336,7 +2362,38 @@ impl SocketFile {
             }
         }
         .unwrap_or(0);
+        self.netlink_user_recv_creds
+            .lock()
+            .remove(&crate::handlers::current_task_id());
         self.netlink_last_recv_group.store(group, Ordering::Release);
+        group
+    }
+
+    fn record_kernel_netlink_group(&self, group: u32) {
+        self.netlink_user_recv_creds
+            .lock()
+            .remove(&crate::handlers::current_task_id());
+        self.netlink_last_recv_group.store(group, Ordering::Release);
+    }
+
+    /// Consume the send-time credential associated with the user netlink
+    /// datagram just dequeued by this task. `None` means the datagram came
+    /// from a kernel queue and must use the kernel credential.
+    pub fn take_netlink_user_recv_cred(&self) -> Option<Ucred> {
+        self.netlink_user_recv_creds
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    /// `nl_pktinfo.group` is a numeric multicast group, while
+    /// `sockaddr_nl.nl_groups` is the legacy 32-bit membership mask. Keep the
+    /// queued numeric identity for ancillary data and translate it only when
+    /// constructing the source address returned by recvmsg.
+    fn netlink_group_mask(group: u32) -> u32 {
+        group
+            .checked_sub(1)
+            .filter(|bit| *bit < u32::BITS)
+            .map_or(0, |bit| 1u32 << bit)
     }
 
     pub fn netlink_pktinfo(&self) -> Option<u32> {
@@ -3079,6 +3136,7 @@ impl FileOps for SocketFile {
                     // read(2) reports no credentials either, so clear the
                     // whole per-record entry rather than leaving a cred behind.
                     self.discard_dgram_recv_ancillary();
+                    let _ = self.take_netlink_user_recv_cred();
                     let _ = self.take_packet_recv_ancillary();
                     Ok(n)
                 }
@@ -3087,6 +3145,7 @@ impl FileOps for SocketFile {
                 SocketOpResult::ReceivedTruncated { copied, .. } => {
                     drop(self.unix_take_recv_fds());
                     self.discard_dgram_recv_ancillary();
+                    let _ = self.take_netlink_user_recv_cred();
                     let _ = self.take_packet_recv_ancillary();
                     Ok(copied)
                 }
@@ -4030,8 +4089,11 @@ impl SocketFile {
                     Ok(msgs) => msgs,
                     Err(()) => return SocketOpResult::Err(SockError::InvalidArg),
                 };
-                let notifications =
-                    narf_net::netlink_route::successful_mutation_notifications(buf, &msgs);
+                let notifications = narf_net::netlink_route::successful_mutation_notifications_in(
+                    self.net_ns_id(),
+                    buf,
+                    &msgs,
+                );
                 Self::stamp_netlink_reply_portid(&mut msgs, dest_portid);
                 let reply_count = msgs.len();
                 {
@@ -4068,14 +4130,12 @@ impl SocketFile {
                 };
                 match msg {
                     Some(bytes) => {
-                        self.record_queued_netlink_group(flags);
+                        let group = self.record_queued_netlink_group(flags);
                         let n = core::cmp::min(buf.len(), bytes.len());
                         buf[..n].copy_from_slice(&bytes[..n]);
-                        // Sender is the kernel: sockaddr_nl{family, pid=0, groups=0}.
-                        let peer = SockAddr {
-                            family: AF_NETLINK,
-                            body: alloc::vec![0u8; 10],
-                        };
+                        // Kernel unicast replies use groups=0; multicast
+                        // notifications expose their legacy membership mask.
+                        let peer = Self::netlink_sockaddr(0, Self::netlink_group_mask(group));
                         if n < bytes.len() {
                             SocketOpResult::ReceivedTruncated {
                                 copied: n,
@@ -4187,10 +4247,10 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
-                        self.record_queued_netlink_group(flags);
+                        let group = self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
-                        let peer = Some(Self::netlink_sockaddr(0, 0));
+                        let peer = Some(Self::netlink_sockaddr(0, Self::netlink_group_mask(group)));
                         if n < message.len() {
                             SocketOpResult::ReceivedTruncated {
                                 copied: n,
@@ -4269,10 +4329,10 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
-                        self.record_queued_netlink_group(flags);
+                        let group = self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
-                        let peer = Some(Self::netlink_sockaddr(0, 0));
+                        let peer = Some(Self::netlink_sockaddr(0, Self::netlink_group_mask(group)));
                         if n < message.len() {
                             SocketOpResult::ReceivedTruncated {
                                 copied: n,
@@ -4340,10 +4400,10 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
-                        self.record_queued_netlink_group(flags);
+                        let group = self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
-                        let peer = Some(Self::netlink_sockaddr(0, 0));
+                        let peer = Some(Self::netlink_sockaddr(0, Self::netlink_group_mask(group)));
                         if n < message.len() {
                             SocketOpResult::ReceivedTruncated {
                                 copied: n,
@@ -4406,10 +4466,10 @@ impl SocketFile {
                 };
                 match message {
                     Some(message) => {
-                        self.record_queued_netlink_group(flags);
+                        let group = self.record_queued_netlink_group(flags);
                         let n = buf.len().min(message.len());
                         buf[..n].copy_from_slice(&message[..n]);
-                        let peer = Some(Self::netlink_sockaddr(0, 0));
+                        let peer = Some(Self::netlink_sockaddr(0, Self::netlink_group_mask(group)));
                         if n < message.len() {
                             SocketOpResult::ReceivedTruncated {
                                 copied: n,
@@ -4526,7 +4586,7 @@ impl SocketFile {
                                 );
                             }
                         }
-                        self.netlink_last_recv_group.store(1, Ordering::Release);
+                        self.record_kernel_netlink_group(1);
                         // Kernel netlink uevent wire format (NUL-separated,
                         // `action@devpath` header) so libudev/udevd parse it.
                         let bytes = env.to_netlink_bytes();
@@ -9434,17 +9494,24 @@ fn smoke_netlink_pktinfo_tracks_received_multicast_group() -> TestResult {
     }
     SocketFile::broadcast_netlink_route(1 << (group - 1), b"route-event");
     let mut buf = [0u8; 32];
-    if !matches!(
-        sock.dispatch_op(SocketOp::Recv {
-            buf: &mut buf,
-            flags: 0
-        }),
-        SocketOpResult::Received { n: 11, .. }
-    ) {
-        return TestResult::Fail("route multicast datagram was not received");
-    }
+    let peer = match sock.dispatch_op(SocketOp::Recv {
+        buf: &mut buf,
+        flags: 0,
+    }) {
+        SocketOpResult::Received {
+            n: 11,
+            peer: Some(peer),
+        } => peer,
+        _ => return TestResult::Fail("route multicast datagram was not received"),
+    };
     if sock.netlink_pktinfo() != Some(group) {
         return TestResult::Fail("NETLINK_PKTINFO did not report received multicast group");
+    }
+    if peer.family != AF_NETLINK
+        || peer.body.len() < 10
+        || u32::from_ne_bytes(peer.body[6..10].try_into().unwrap_or([0; 4])) != 1u32 << (group - 1)
+    {
+        return TestResult::Fail("sockaddr_nl did not report the multicast group mask");
     }
     TestResult::Pass
 }
