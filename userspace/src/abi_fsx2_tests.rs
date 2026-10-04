@@ -52,7 +52,9 @@ fn smoke_abi_fsx2_proc_self_mountinfo_reads_content() -> TestResult {
         const TARGET: &[u8] = b"/abi-mountinfo-live\0";
         let path = b"/proc/self/mountinfo\0";
         let fstype = b"tmpfs\0";
-        narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+        let _mountinfo_hook = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
         narf_filesystem::procfs::install_mountinfo_generation_hook(
             crate::handlers::proc_ns_mountinfo_generation,
         );
@@ -109,7 +111,9 @@ fn smoke_abi_fsx2_proc_mountinfo_pollpri_after_mount_change() -> TestResult {
         let path = b"/proc/self/mountinfo\0";
         let fstype = b"tmpfs\0";
         let target = b"/abi-mountinfo-poll-edge\0";
-        narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+        let _mountinfo_hook = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
         narf_filesystem::procfs::install_mountinfo_generation_hook(
             crate::handlers::proc_ns_mountinfo_generation,
         );
@@ -157,7 +161,9 @@ fn smoke_abi_fsx2_proc_mountinfo_libmount_epollet_after_mount_change() -> TestRe
         let path = b"/proc/self/mountinfo\0";
         let fstype = b"tmpfs\0";
         let target = b"/abi-mountinfo-epoll-edge\0";
-        narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+        let _mountinfo_hook = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
         narf_filesystem::procfs::install_mountinfo_generation_hook(
             crate::handlers::proc_ns_mountinfo_generation,
         );
@@ -252,7 +258,9 @@ fn smoke_abi_fsx2_proc_mountinfo_nested_epoll_preserves_change() -> TestResult {
         let path = b"/proc/self/mountinfo\0";
         let fstype = b"tmpfs\0";
         let target = b"/abi-mountinfo-nested-epoll-edge\0";
-        narf_filesystem::procfs::install_mountinfo_hook(crate::handlers::proc_ns_mountinfo);
+        let _mountinfo_hook = narf_filesystem::procfs::MountinfoHookGuard::install(
+            crate::handlers::proc_ns_mountinfo,
+        );
         narf_filesystem::procfs::install_mountinfo_generation_hook(
             crate::handlers::proc_ns_mountinfo_generation,
         );
