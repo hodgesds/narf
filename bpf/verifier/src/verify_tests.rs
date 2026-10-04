@@ -604,7 +604,7 @@ fn release_kfunc() -> KfuncDesc {
     kfunc("release", OWNED_ARG, ArgDesc::VOID, Context::Atomic)
 }
 
-/// `fn lock() -> Option<Guard<'_>>`.
+/// `fn lock() -> Option<Guard<'_, Lock>>`.
 fn lock_kfunc() -> KfuncDesc {
     kfunc(
         "lock",
@@ -618,9 +618,27 @@ fn lock_kfunc() -> KfuncDesc {
     )
 }
 
-/// `fn unlock(Guard<'_>)`.
+/// `fn unlock(Guard<'_, Lock>)`.
 fn unlock_kfunc() -> KfuncDesc {
     kfunc("unlock", GUARD_ARG, ArgDesc::VOID, Context::Atomic)
+}
+
+/// `fn unlock_other(Guard<'_, OtherLock>)`.
+fn unlock_other_kfunc() -> KfuncDesc {
+    static OTHER_GUARD_ARG: &[ArgDesc] = &[ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::LockGuard,
+            key: TypeKey(2),
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NONE,
+    }];
+    kfunc(
+        "unlock_other",
+        OTHER_GUARD_ARG,
+        ArgDesc::VOID,
+        Context::Atomic,
+    )
 }
 
 /// A kfunc that may sleep. Calling it is an await point.
@@ -1855,6 +1873,29 @@ fn a_lock_must_be_released_before_exit() {
         Context::Atomic,
     )
     .expect("lock, test, unlock");
+}
+
+#[test]
+fn a_guard_cannot_be_released_as_a_different_lock_class() {
+    let k = [lock_kfunc(), unlock_other_kfunc()];
+    let e = check_full(
+        &[
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 2),
+            movr(1, 0),
+            call(1),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Atomic,
+    )
+    .expect_err("a guard must not be accepted by another lock class's release kfunc");
+    assert!(
+        matches!(e, VerifyError::KfuncSignature { at: 3, arg: 0, .. }),
+        "{e:?}"
+    );
 }
 
 #[test]
@@ -3522,7 +3563,7 @@ fn a_32bit_null_test_does_not_release_the_reference() {
     // low 32 bits happen to be zero (page-aligned, or any handle-shaped
     // return) takes the branch and leaks the refcount permanently.
     //
-    // The sharper form is locks: Option<Guard<'_>> acquires a lock reference
+    // The sharper form is locks: Option<Guard<'_, L>> acquires a lock reference
     // the same way, so the same substitution makes the verifier believe the
     // lock was dropped, and `kill_at_await` then finds nothing to kill. That
     // is spec §4.4 — the one rule covering sleep safety, lock discipline and

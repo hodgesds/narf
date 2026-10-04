@@ -111,7 +111,7 @@ fn a_lock_guard_is_linear_and_sleep_unsafe_at_the_same_time() {
         Ok(()),
         "…and the same descriptor must be declarable"
     );
-    // Return position too: `lock() -> Option<Guard<'_>>`.
+    // Return position too: `lock() -> Option<Guard<'_, L>>`.
     assert_eq!(
         desc(
             &[],
@@ -177,6 +177,48 @@ fn a_sleep_safe_lock_guard_argument_is_rejected() {
     assert_eq!(
         desc(STATIC_GUARD, ArgDesc::VOID, Context::Atomic).validate(),
         Err(KfuncError::SleepableLockGuardArg(0))
+    );
+}
+
+#[test]
+fn a_lock_guard_must_name_its_lock_class() {
+    static UNTYPED_GUARD: &[ArgDesc] = &[ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::LockGuard,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NONE,
+    }];
+    assert_eq!(
+        desc(UNTYPED_GUARD, ArgDesc::VOID, Context::Atomic).validate(),
+        Err(KfuncError::UntypedLockGuardArg(0))
+    );
+
+    let untyped_return = ArgDesc {
+        kind: TypeKind::Ptr {
+            kind: PtrKind::LockGuard,
+            key: TypeKey::NONE,
+        },
+        domain: ValidityDomain::NonPreemptible,
+        flags: ArgFlags::NULLABLE,
+    };
+    assert_eq!(
+        desc(&[], untyped_return, Context::Atomic).validate(),
+        Err(KfuncError::UntypedLockGuard)
+    );
+}
+
+#[test]
+fn lock_acquisition_must_be_fallible() {
+    let non_nullable = ptr(
+        PtrKind::LockGuard,
+        ValidityDomain::NonPreemptible,
+        ArgFlags::NONE,
+    );
+    assert_eq!(
+        desc(&[], non_nullable, Context::Atomic).validate(),
+        Err(KfuncError::NonNullableLockGuard)
     );
 }
 
@@ -349,7 +391,7 @@ fn rejects_a_sleep_safe_lock_guard() {
                 key: TypeKey(1),
             },
             domain: ValidityDomain::Owned,
-            flags: ArgFlags::NONE,
+            flags: ArgFlags::NULLABLE,
         },
         Context::Atomic,
     );

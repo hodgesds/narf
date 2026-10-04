@@ -59,6 +59,9 @@ pub struct Confined {
     /// between capture and restore. Sleepable execution drops this at each
     /// poll boundary, so it remains fully schedulable while parked.
     _preempt: narf_scheduler::PreemptGuard,
+    /// Releases a BPF-transferred lock guard if this run/poll terminates
+    /// abnormally before the program reaches its typed release kfunc.
+    guard_cleanup: Option<crate::types::GuardCleanupScope>,
 }
 
 /// Enter the BPF domain for the lifetime of the returned guard.
@@ -73,6 +76,7 @@ pub fn enter() -> Confined {
     // which domain it is running in should get BPF here, not FRAME.
     let prev_domain = narf_arch::enter_domain_scope(narf_lib::id::DomainId::BPF.raw());
     let preempt = narf_scheduler::preempt_disable();
+    let guard_cleanup = Some(crate::types::GuardCleanupScope::enter());
     #[cfg(target_arch = "x86_64")]
     {
         use narf_arch::x86_64::{pcid, pks, Pks};
@@ -93,6 +97,7 @@ pub fn enter() -> Confined {
                 saved: Some(saved),
                 _not_send: core::marker::PhantomData,
                 _preempt: preempt,
+                guard_cleanup,
             };
         }
         Confined {
@@ -100,6 +105,7 @@ pub fn enter() -> Confined {
             saved: None,
             _not_send: core::marker::PhantomData,
             _preempt: preempt,
+            guard_cleanup,
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -118,6 +124,7 @@ pub fn enter() -> Confined {
                 saved: Some(saved),
                 _not_send: core::marker::PhantomData,
                 _preempt: preempt,
+                guard_cleanup,
             };
         }
         Confined {
@@ -125,6 +132,7 @@ pub fn enter() -> Confined {
             saved: None,
             _not_send: core::marker::PhantomData,
             _preempt: preempt,
+            guard_cleanup,
         }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -133,6 +141,7 @@ pub fn enter() -> Confined {
         Confined {
             _not_send: core::marker::PhantomData,
             _preempt: preempt,
+            guard_cleanup,
         }
     }
 }
@@ -156,6 +165,10 @@ pub async fn run_sleepable<F: Future>(future: F) -> F::Output {
 impl Drop for Confined {
     #[inline]
     fn drop(&mut self) {
+        // Run typed guard cleanup while the BPF domain and preemption guard are
+        // still active. Normal release disarmed the slot; an abnormal program
+        // termination leaves it armed and releases here.
+        drop(self.guard_cleanup.take());
         narf_arch::exit_domain_scope(self.prev_domain);
         #[cfg(target_arch = "x86_64")]
         if let Some(saved) = self.saved {

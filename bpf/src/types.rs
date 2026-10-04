@@ -25,7 +25,7 @@
 //! | [`SleepableRcu<'g, T>`] | `SleepableRcuRead` | yes |
 //! | [`Owned<T>`] | `Owned` | yes; must be released |
 //! | [`ArenaPtr<T>`] | `Static` | yes — arena pages are pinned |
-//! | [`Guard<'_>`] | `NonPreemptible` | no — by construction |
+//! | [`Guard`] | `NonPreemptible` | no — by construction |
 //!
 //! ## Raw representation
 //!
@@ -38,9 +38,12 @@
 //! is exactly the [`ArgFlags::SIZED_BY_NEXT`] contract, so the ABI and the
 //! verifier's model agree by construction rather than by convention.
 
+use core::fmt;
 use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
 use core::mem::MaybeUninit;
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use narf_bpf_verifier::kfunc::{ArgDesc, ArgFlags, PtrKind, TypeKey, TypeKind, ValidityDomain};
 
@@ -606,7 +609,201 @@ unsafe impl<T: 'static> BpfType for ArenaPtr<T> {
     }
 }
 
-/// A critical-section guard. Linear, and never sleep-safe.
+/// A lock class whose guards may be transferred through BPF.
+///
+/// `TYPE_NAME` gives the verifier a stable identity, so a guard returned by an
+/// acquire kfunc can only be consumed by a release kfunc naming the same `L`.
+/// Dropping a [`Guard`] delegates the actual unlock to [`Self::release`], coupling
+/// the verifier's linear consume operation to the kernel-side release instead
+/// of relying on the release kfunc body to remember it.
+///
+/// # Safety
+///
+/// Implementations must ensure the `TYPE_KEY` derived from `TYPE_NAME` is
+/// kernel-wide unique among lock classes. For every token handed to
+/// [`Guard::from_acquired_token`], `release` must safely release exactly that
+/// held lock once, without sleeping, allocating, or panicking. It must accept
+/// the call in the atomic context and BPF hardware domain in which a
+/// synchronous kfunc argument is dropped; in particular, every datum touched
+/// by `release` must remain accessible from that domain.
+pub unsafe trait BpfLock: Send + Sync + 'static {
+    /// Stable, kernel-wide identity of this lock class.
+    const TYPE_NAME: &'static str;
+
+    /// Stable verifier key derived from [`Self::TYPE_NAME`].
+    const TYPE_KEY: TypeKey = TypeKey(fnv1a32_nonzero(Self::TYPE_NAME));
+
+    /// Release one held lock represented by `token`.
+    ///
+    /// # Safety
+    ///
+    /// `token` must have come from one successful acquisition of this lock
+    /// class, and ownership of that acquisition must not already have been
+    /// released or transferred.
+    unsafe fn release(token: u64);
+}
+
+// The verifier permits one live guard per invocation. Runtime cleanup keeps a
+// small stack because BPF itself may nest (for example, an IRQ-side probe
+// interrupting a process-side probe). Atomic stack execution currently admits
+// four levels; eight leaves room for non-stack domain scopes without putting an
+// allocator or lock on the program path.
+const MAX_GUARD_CLEANUP_SCOPES: usize = 8;
+
+struct GuardCleanupSlot {
+    token: AtomicU64,
+    release: AtomicUsize,
+}
+
+impl GuardCleanupSlot {
+    const fn new() -> Self {
+        Self {
+            token: AtomicU64::new(0),
+            release: AtomicUsize::new(0),
+        }
+    }
+
+    fn cleanup(&self) {
+        let release = self.release.swap(0, Ordering::AcqRel);
+        let token = self.token.swap(0, Ordering::AcqRel);
+        if release == 0 || token == 0 {
+            return;
+        }
+        // SAFETY: `register_guard_transfer` stores only monomorphised
+        // `release_erased::<L>` function pointers in this word, and the slot
+        // retains that exact value until it is disarmed or cleaned here.
+        let release = unsafe { core::mem::transmute::<usize, unsafe fn(u64)>(release) };
+        // SAFETY: registration transferred unique ownership of this token to
+        // the active BPF invocation, which is now terminating without a normal
+        // `Guard::drop` having disarmed the slot.
+        unsafe { release(token) };
+    }
+}
+
+#[repr(align(64))]
+struct GuardCleanupCpu {
+    depth: AtomicU32,
+    slots: [GuardCleanupSlot; MAX_GUARD_CLEANUP_SCOPES],
+}
+
+static GUARD_CLEANUP: [GuardCleanupCpu; narf_lib::percpu::MAX_CPUS] = [const {
+    GuardCleanupCpu {
+        depth: AtomicU32::new(0),
+        slots: [const { GuardCleanupSlot::new() }; MAX_GUARD_CLEANUP_SCOPES],
+    }
+};
+    narf_lib::percpu::MAX_CPUS];
+
+/// One run/poll boundary for fail-safe guard cleanup.
+///
+/// Entered by the BPF domain scope after preemption is disabled. If execution
+/// traps, exhausts fuel, or otherwise returns without reconstructing and
+/// dropping a transferred guard, dropping this scope invokes its typed release
+/// hook. Normal guard drop disarms the slot first.
+#[derive(Debug)]
+pub(crate) struct GuardCleanupScope {
+    cpu: usize,
+    index: usize,
+    tracked: bool,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl GuardCleanupScope {
+    pub(crate) fn enter() -> Self {
+        let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+        let index = GUARD_CLEANUP[cpu].depth.fetch_add(1, Ordering::AcqRel) as usize;
+        let tracked = index < MAX_GUARD_CLEANUP_SCOPES;
+        if tracked {
+            // A stale entry would mean a prior scope did not unwind cleanly.
+            // Release it before reusing the slot rather than losing a lock.
+            GUARD_CLEANUP[cpu].slots[index].cleanup();
+        }
+        Self {
+            cpu,
+            index,
+            tracked,
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl Drop for GuardCleanupScope {
+    fn drop(&mut self) {
+        if self.tracked {
+            GUARD_CLEANUP[self.cpu].slots[self.index].cleanup();
+        }
+        let depth = GUARD_CLEANUP[self.cpu].depth.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_eq!(depth as usize, self.index + 1);
+    }
+}
+
+enum GuardTransfer {
+    /// Called outside a BPF execution scope (kernel-side tests or direct use).
+    Unscoped,
+    /// Newly registered, or the same guard was passed through a typed kfunc.
+    Registered,
+    /// A different live guard already occupies this invocation's one slot.
+    Conflict,
+}
+
+unsafe fn release_erased<L: BpfLock>(token: u64) {
+    // SAFETY: forwarded from the cleanup slot, which owns the acquisition
+    // registered by `Guard<L>::into_raw`.
+    unsafe { L::release(token) };
+}
+
+fn current_guard_cleanup_slot() -> Option<&'static GuardCleanupSlot> {
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let depth = GUARD_CLEANUP[cpu].depth.load(Ordering::Acquire) as usize;
+    if depth == 0 || depth > MAX_GUARD_CLEANUP_SCOPES {
+        return None;
+    }
+    Some(&GUARD_CLEANUP[cpu].slots[depth - 1])
+}
+
+fn register_guard_transfer<L: BpfLock>(token: u64) -> GuardTransfer {
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    let depth = GUARD_CLEANUP[cpu].depth.load(Ordering::Acquire) as usize;
+    if depth == 0 {
+        return GuardTransfer::Unscoped;
+    }
+    if depth > MAX_GUARD_CLEANUP_SCOPES {
+        return GuardTransfer::Conflict;
+    }
+    let Some(slot) = current_guard_cleanup_slot() else {
+        return GuardTransfer::Conflict;
+    };
+    let release = release_erased::<L> as unsafe fn(u64) as usize;
+    let current_release = slot.release.load(Ordering::Acquire);
+    let current_token = slot.token.load(Ordering::Acquire);
+    if current_release == 0 {
+        slot.token.store(token, Ordering::Release);
+        slot.release.store(release, Ordering::Release);
+        GuardTransfer::Registered
+    } else if current_release == release && current_token == token {
+        // A typed kfunc may consume and return the same guard. The verifier
+        // models that as release plus acquire; runtime ownership never left
+        // this invocation, so its existing cleanup registration is exact.
+        GuardTransfer::Registered
+    } else {
+        GuardTransfer::Conflict
+    }
+}
+
+fn disarm_guard_transfer<L: BpfLock>(token: u64) {
+    let Some(slot) = current_guard_cleanup_slot() else {
+        return;
+    };
+    let release = release_erased::<L> as unsafe fn(u64) as usize;
+    if slot.release.load(Ordering::Acquire) == release
+        && slot.token.load(Ordering::Acquire) == token
+    {
+        slot.release.store(0, Ordering::Release);
+        slot.token.store(0, Ordering::Release);
+    }
+}
+
+/// A critical-section guard for lock class `L`. Linear, and never sleep-safe.
 ///
 /// Three properties Linux implements as three mechanisms
 /// (`REF_TYPE_LOCK`, `active_lock_id`, `process_spin_lock()`, plus
@@ -628,21 +825,43 @@ unsafe impl<T: 'static> BpfType for ArenaPtr<T> {
 /// the BPF program.
 ///
 /// ```compile_fail
+/// use narf_bpf::{BpfLock, Guard};
+/// struct Lock;
+/// unsafe impl BpfLock for Lock {
+///     const TYPE_NAME: &'static str = "doc_lock";
+///     unsafe fn release(_token: u64) {}
+/// }
 /// fn needs_send<T: Send>() {}
-/// needs_send::<narf_bpf::Guard<'static>>();
+/// needs_send::<Guard<'static, Lock>>();
 /// ```
 #[must_use = "a BPF lock guard must be returned to its release kfunc"]
-#[derive(Debug)]
-pub struct Guard<'a> {
+pub struct Guard<'a, L: BpfLock> {
     token: u64,
-    _lock: PhantomData<&'a ()>,
+    _lock: PhantomData<&'a L>,
     // As for `IrqSafeSpinLockGuard`, a raw-pointer marker makes the wrapper
     // `!Send` and `!Sync` without adding storage. This prevents a kernel Rust
     // future from carrying the guard between polls or CPUs.
     _not_send: PhantomData<*const ()>,
 }
 
-impl Guard<'_> {
+impl<L: BpfLock> Guard<'_, L> {
+    /// Transfer one successfully acquired lock into a BPF-visible guard.
+    ///
+    /// # Safety
+    ///
+    /// `token` must be non-zero and must represent one live acquisition of
+    /// lock class `L`. The caller transfers ownership of that acquisition to
+    /// the returned guard and must not release it by any other path.
+    #[inline]
+    pub unsafe fn from_acquired_token(token: u64) -> Self {
+        debug_assert_ne!(token, 0, "a BPF guard token must be non-zero");
+        Self {
+            token,
+            _lock: PhantomData,
+            _not_send: PhantomData,
+        }
+    }
+
     /// The opaque lock token this guard holds.
     #[inline]
     #[must_use]
@@ -651,12 +870,31 @@ impl Guard<'_> {
     }
 }
 
+impl<L: BpfLock> fmt::Debug for Guard<'_, L> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Guard")
+            .field("lock", &L::TYPE_NAME)
+            .field("token", &self.token)
+            .finish()
+    }
+}
+
+impl<L: BpfLock> Drop for Guard<'_, L> {
+    fn drop(&mut self) {
+        disarm_guard_transfer::<L>(self.token);
+        // SAFETY: both constructors require that this guard uniquely owns one
+        // live acquisition. `into_raw` suppresses this destructor while
+        // transferring that ownership to BPF; every other path releases here.
+        unsafe { L::release(self.token) };
+    }
+}
+
 // SAFETY: an opaque token, never dereferenced.
-unsafe impl BpfType for Guard<'_> {
+unsafe impl<L: BpfLock> BpfType for Guard<'_, L> {
     const DESC: ArgDesc = ArgDesc {
         kind: TypeKind::Ptr {
             kind: PtrKind::LockGuard,
-            key: TypeKey::NONE,
+            key: L::TYPE_KEY,
         },
         // `NonPreemptible`, not `Owned`: a guard must be released before the
         // program exits *and* may not cross an await. `Owned` would satisfy
@@ -666,15 +904,29 @@ unsafe impl BpfType for Guard<'_> {
     };
     #[inline]
     unsafe fn from_raw(raw: u64, _next: u64) -> Self {
-        Self {
-            token: raw,
-            _lock: PhantomData,
-            _not_send: PhantomData,
-        }
+        // SAFETY: the verifier proved this is a non-null, live guard of the
+        // exact lock key `L::TYPE_KEY` and transfers it into this argument.
+        unsafe { Self::from_acquired_token(raw) }
     }
     #[inline]
     fn into_raw(self) -> u64 {
-        self.token
+        // Returning a guard transfers the acquisition to the BPF program. Do
+        // not run `Drop` here; the matching release shim reconstructs the
+        // guard and its ordinary Rust drop performs the unlock.
+        let this = ManuallyDrop::new(self);
+        match register_guard_transfer::<L>(this.token) {
+            GuardTransfer::Unscoped | GuardTransfer::Registered => this.token,
+            GuardTransfer::Conflict => {
+                // Descriptor validation requires a nullable guard return, so
+                // fail the second acquisition as null while releasing the lock
+                // it already took. A sound verifier never reaches this arm;
+                // it is the runtime backstop for the one-live-guard rule.
+                // SAFETY: `this` still uniquely owns this acquisition and it
+                // was not installed in the cleanup slot.
+                unsafe { L::release(this.token) };
+                0
+            }
+        }
     }
 }
 

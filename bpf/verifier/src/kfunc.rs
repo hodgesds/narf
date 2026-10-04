@@ -326,7 +326,7 @@ impl ArgDesc {
     /// and the same type in return position acquires. The verifier reads it
     /// both ways round.
     ///
-    /// A `Guard<'_>` is linear **structurally**, from its [`PtrKind`], not from
+    /// A `Guard<'_, L>` is linear **structurally**, from its [`PtrKind`], not from
     /// its [`ValidityDomain`]. Keying it on the domain made "linear" and "not
     /// sleep-safe" mutually exclusive, which is exactly backwards for a lock:
     /// [`ValidityDomain::Owned`] is the only domain
@@ -477,6 +477,28 @@ impl KfuncDesc {
         ) {
             return Err(KfuncError::TraceObjectReturn);
         }
+        // A guard's type key is its lock identity. Without one every acquire
+        // and release kfunc would share the same undifferentiated guard class,
+        // allowing a token from lock A to reach lock B's release routine.
+        if matches!(
+            self.ret.kind,
+            TypeKind::Ptr {
+                kind: PtrKind::LockGuard,
+                key: TypeKey::NONE,
+            }
+        ) {
+            return Err(KfuncError::UntypedLockGuard);
+        }
+        if matches!(
+            self.ret.kind,
+            TypeKind::Ptr {
+                kind: PtrKind::LockGuard,
+                ..
+            }
+        ) && !self.ret.flags.contains(ArgFlags::NULLABLE)
+        {
+            return Err(KfuncError::NonNullableLockGuard);
+        }
         for (i, a) in self.args.iter().enumerate() {
             validate_type(*a, i)?;
             // A sized region needs a following argument to be its length.
@@ -492,6 +514,15 @@ impl KfuncDesc {
             }
             if matches!(a.kind, TypeKind::Void) {
                 return Err(KfuncError::VoidArgument(i));
+            }
+            if matches!(
+                a.kind,
+                TypeKind::Ptr {
+                    kind: PtrKind::LockGuard,
+                    key: TypeKey::NONE,
+                }
+            ) {
+                return Err(KfuncError::UntypedLockGuardArg(i));
             }
             // `CONST` means "the verifier proved a single value", which only
             // has a meaning for a scalar. On a pointer it was silently
@@ -649,12 +680,19 @@ pub enum KfuncError {
     VoidArgument(usize),
     /// A lock guard was declared sleep-safe in return position.
     SleepableLockGuard,
+    /// A lock guard return had no type key identifying its lock class.
+    UntypedLockGuard,
+    /// Lock acquisition must be fallible so the runtime can fail closed when
+    /// its one-live-guard cleanup slot is already occupied.
+    NonNullableLockGuard,
     /// A kfunc attempted to manufacture typed-tracing provenance.
     TraceObjectReturn,
     /// A lock guard argument was declared sleep-safe. Separate from
     /// [`SleepableLockGuard`](Self::SleepableLockGuard) so the diagnostic can
     /// name which parameter.
     SleepableLockGuardArg(usize),
+    /// A lock guard argument had no type key identifying its lock class.
+    UntypedLockGuardArg(usize),
     /// A scalar declared a width no access has. `bits` must be 8, 16, 32 or 64.
     ///
     /// Worth a distinct variant because the failure it prevents was a *panic*,

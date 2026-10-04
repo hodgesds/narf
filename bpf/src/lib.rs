@@ -75,8 +75,8 @@ pub use link::{BpfLink, LinkCaps, LinkError, LinkFile, LinkTarget};
 pub use map::{ArrayMap, BpfMap, BpfMapCap, BpfMapOps, HashMap, MapAttr, MapError, MapKind};
 pub use prog::{BpfAttach, BpfProg, BpfProgLoad, LoadError, LoadMetadata, LoadRequest};
 pub use types::{
-    ArenaPtr, BpfObject, BpfType, Const, Guard, Owned, Rcu, SleepableRcu, TraceFieldOffset,
-    TraceSource, Trusted,
+    ArenaPtr, BpfLock, BpfObject, BpfType, Const, Guard, Owned, Rcu, SleepableRcu,
+    TraceFieldOffset, TraceSource, Trusted,
 };
 
 /// Boot-time bring-up.

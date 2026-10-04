@@ -10,8 +10,9 @@
 //!
 //!   1. **descriptors** — the `kfunc!` macro derived the acquire/release shape
 //!      from the signature (`derives_*`);
-//!   2. **the kernel side** — `Owned<BpfMap>` is linear: dropping one releases
-//!      a refcount, and handing one to a program does not (`owned_*`);
+//!   2. **the kernel side** — `Owned<BpfMap>` and `Guard<'_, L>` are RAII
+//!      linear: dropping releases, while handing one to a program transfers
+//!      ownership without releasing (`owned_*`, `guard_transfer_*`);
 //!   3. **the verifier side** — a real program calling the real kfuncs is
 //!      accepted or rejected by each reference rule (`prog_*`).
 //!
@@ -22,6 +23,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_bpf_isa::encode::encode;
 use narf_bpf_isa::{CallTarget, CondOp, Decoded, Imm64, Insn, Reg, Source};
@@ -32,7 +34,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::map::{BpfMap, BpfMapCap, MapAttr, MapKind, MAX_BPF_PINS};
 use crate::prog::{BpfProg, BpfProgLoad, LoadError, LoadRequest};
-use crate::types::{BpfObject, BpfType, Guard, Owned, Trusted};
+use crate::types::{BpfLock, BpfObject, BpfType, Guard, Owned, Trusted};
 
 /// Bodies return `Result` so they read as a list of assertions.
 type R = Result<(), &'static str>;
@@ -144,6 +146,10 @@ fn jeq_imm(dst: u8, v: i32, off: i16) -> Decoded {
     }
 }
 
+fn ja(off: i32) -> Decoded {
+    Decoded::Jump { off }
+}
+
 fn call(name: &str) -> Decoded {
     Decoded::Call(CallTarget::Kfunc(crate::kfunc::id_for(name)))
 }
@@ -154,20 +160,64 @@ const ACQUIRE: &str = "narf_map_acquire";
 const RELEASE: &str = "narf_map_release";
 const GUARD_ACQUIRE: &str = "narf_test_guard_acquire";
 const GUARD_RELEASE: &str = "narf_test_guard_release";
+const OTHER_GUARD_RELEASE: &str = "narf_test_other_guard_release";
+
+struct TestLock;
+
+static TEST_LOCK_RELEASES: AtomicU64 = AtomicU64::new(0);
+static TEST_LOCK_LAST_TOKEN: AtomicU64 = AtomicU64::new(0);
+static TEST_LOCK_NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+// SAFETY: `acquire_test_guard` is the only token source and mints a fresh
+// conceptual TestLock acquisition each time. Tokens are uniquely transferred
+// through `Guard::into_raw`/`from_raw`; release is bounded atomic bookkeeping
+// and cannot sleep or panic.
+unsafe impl BpfLock for TestLock {
+    const TYPE_NAME: &'static str = "narf_bpf_test_lock";
+
+    unsafe fn release(token: u64) {
+        TEST_LOCK_LAST_TOKEN.store(token, Ordering::SeqCst);
+        TEST_LOCK_RELEASES.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn acquire_test_guard() -> Option<Guard<'static, TestLock>> {
+    let token = TEST_LOCK_NEXT_TOKEN.fetch_add(1, Ordering::SeqCst);
+    if token == 0 {
+        return None;
+    }
+    // SAFETY: minting a fresh token is the TestLock fixture's acquisition
+    // operation. The returned guard uniquely owns it until transfer or drop.
+    Some(unsafe { Guard::from_acquired_token(token) })
+}
+
+struct OtherTestLock;
+
+// SAFETY: no test constructs a live `OtherTestLock` token. The implementation
+// remains a valid bounded, non-sleeping release operation if one is added.
+unsafe impl BpfLock for OtherTestLock {
+    const TYPE_NAME: &'static str = "narf_bpf_other_test_lock";
+
+    unsafe fn release(_token: u64) {}
+}
 
 // Test-only kfuncs that pin the public `Guard` type through the macro and the
-// real registry. The acquiring body deliberately returns `None`: these smokes
-// verify the signature contract, not a particular lock implementation.
+// real registry. `TestLock` models acquisition/release with unique tokens and
+// atomic counters so the smokes can observe the RAII path without depending on
+// a production lock implementation.
 crate::kfunc! {
     #[context(Atomic)]
-    fn narf_test_guard_acquire() -> Option<Guard<'static>> {
-        None
+    fn narf_test_guard_acquire() -> Option<Guard<'static, TestLock>> {
+        acquire_test_guard()
     }
 
     #[context(Atomic)]
-    fn narf_test_guard_release(guard: Guard<'static>) -> () {
+    fn narf_test_guard_release(guard: Guard<'static, TestLock>) -> () {
         let _ = guard.token();
     }
+
+    #[context(Atomic)]
+    fn narf_test_other_guard_release(_guard: Guard<'static, OtherTestLock>) -> () {}
 }
 
 /// Load a program that names `map` as fd [`MAP_FD`], through the real
@@ -311,7 +361,7 @@ fn smoke_bpf_kfunc_derives_release_descriptor_pos() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_kfunc_derives_release_descriptor_pos);
 
-/// `Guard<'_>` derives both halves of its contract through the real macro:
+/// `Guard<'_, L>` derives both halves of its contract through the real macro:
 /// structural linearity from `PtrKind::LockGuard`, and sleep unsafety from
 /// `ValidityDomain::NonPreemptible`.
 fn body_derives_guard_descriptors() -> R {
@@ -323,10 +373,10 @@ fn body_derives_guard_descriptors() -> R {
         .by_name(GUARD_RELEASE)
         .ok_or("narf_test_guard_release not registered")?;
 
-    if acquire.ret != <Option<Guard<'static>> as BpfType>::DESC {
+    if acquire.ret != <Option<Guard<'static, TestLock>> as BpfType>::DESC {
         return Err("the guard acquire descriptor was not derived from its Rust return type");
     }
-    if release.args != [<Guard<'static> as BpfType>::DESC] {
+    if release.args != [<Guard<'static, TestLock> as BpfType>::DESC] {
         return Err("the guard release descriptor was not derived from its Rust argument type");
     }
     if !acquire.ret.flags.contains(ArgFlags::NULLABLE) {
@@ -341,12 +391,121 @@ fn body_derives_guard_descriptors() -> R {
     if acquire.ret.kind != release.args[0].kind || acquire.ret.domain != release.args[0].domain {
         return Err("the guard acquire and release descriptors disagree");
     }
+    match acquire.ret.kind {
+        TypeKind::Ptr {
+            kind: PtrKind::LockGuard,
+            key,
+        } if key == TestLock::TYPE_KEY && key.is_some() => {}
+        _ => return Err("the guard descriptor does not carry its lock class identity"),
+    }
     Ok(())
 }
 fn smoke_bpf_kfunc_derives_guard_descriptors_pos() -> TestResult {
     wrap(body_derives_guard_descriptors())
 }
 kernel_test_in!("bpf", smoke_bpf_kfunc_derives_guard_descriptors_pos);
+
+/// Ownership crosses the raw BPF ABI without unlocking, then reconstructing
+/// and dropping the release argument unlocks exactly once.
+fn body_guard_transfer_releases_once() -> R {
+    let before = TEST_LOCK_RELEASES.load(Ordering::SeqCst);
+
+    let guard = acquire_test_guard().ok_or("test lock token space exhausted")?;
+    let token = guard.token();
+    let raw = guard.into_raw();
+    if raw != token || TEST_LOCK_RELEASES.load(Ordering::SeqCst) != before {
+        return Err("transferring a Guard into BPF released it prematurely");
+    }
+
+    // SAFETY: `raw` owns exactly the acquisition transferred above, matching
+    // the obligation the verifier discharges for a release-kfunc argument.
+    let guard = unsafe { <Guard<'static, TestLock> as BpfType>::from_raw(raw, 0) };
+    drop(guard);
+    if TEST_LOCK_RELEASES.load(Ordering::SeqCst) != before + 1 {
+        return Err("dropping the reconstructed Guard did not release exactly once");
+    }
+    if TEST_LOCK_LAST_TOKEN.load(Ordering::SeqCst) != token {
+        return Err("Guard::drop released the wrong lock token");
+    }
+    Ok(())
+}
+fn smoke_bpf_kfunc_guard_transfer_releases_once_pos() -> TestResult {
+    wrap(body_guard_transfer_releases_once())
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_guard_transfer_releases_once_pos);
+
+/// Nested BPF invocations use distinct cleanup slots. The test enters the
+/// cleanup scopes directly because a real nested invocation reaches FRAME in
+/// the trap prologue before re-entering BPF; directly nesting the same hardware
+/// domain scope would violate the framekernel's domain-entry invariant.
+fn body_guard_cleanup_scopes_nest() -> R {
+    let before = TEST_LOCK_RELEASES.load(Ordering::SeqCst);
+    let _preempt = narf_scheduler::preempt_disable();
+    let outer_scope = crate::types::GuardCleanupScope::enter();
+    let outer = acquire_test_guard().ok_or("test lock token space exhausted")?;
+    let outer_raw = outer.into_raw();
+
+    {
+        let _inner_scope = crate::types::GuardCleanupScope::enter();
+        let inner = acquire_test_guard().ok_or("test lock token space exhausted")?;
+        let inner_token = inner.token();
+        let inner_raw = inner.into_raw();
+        if inner_raw != inner_token {
+            return Err("the nested cleanup slot rejected its first Guard");
+        }
+        // `_inner_scope` drops here with its slot armed.
+    }
+    if TEST_LOCK_RELEASES.load(Ordering::SeqCst) != before + 1 {
+        return Err("dropping the inner BPF scope did not release only its Guard");
+    }
+
+    // SAFETY: the outer cleanup slot still owns this exact acquisition after
+    // the nested scope restored it as the current slot.
+    let outer = unsafe { <Guard<'static, TestLock> as BpfType>::from_raw(outer_raw, 0) };
+    drop(outer);
+    drop(outer_scope);
+    if TEST_LOCK_RELEASES.load(Ordering::SeqCst) != before + 2 {
+        return Err("the outer Guard was lost or released more than once");
+    }
+    Ok(())
+}
+fn smoke_bpf_kfunc_guard_cleanup_scopes_nest_pos() -> TestResult {
+    wrap(body_guard_cleanup_scopes_nest())
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_guard_cleanup_scopes_nest_pos);
+
+/// The runtime backstop for a verifier failure: a second distinct guard cannot
+/// overwrite the cleanup record for the first. Its acquisition is released
+/// immediately and converted to the nullable failure value.
+fn body_guard_cleanup_conflict_fails_closed() -> R {
+    let before = TEST_LOCK_RELEASES.load(Ordering::SeqCst);
+    let scope = crate::domain::enter();
+    let first = acquire_test_guard().ok_or("test lock token space exhausted")?;
+    let first_raw = first.into_raw();
+    let second = acquire_test_guard().ok_or("test lock token space exhausted")?;
+    if second.into_raw() != 0 {
+        return Err("a second live Guard overwrote the cleanup slot");
+    }
+    if TEST_LOCK_RELEASES.load(Ordering::SeqCst) != before + 1 {
+        return Err("the rejected second Guard was not released immediately");
+    }
+
+    // SAFETY: conflict handling preserved the first slot and its token.
+    let first = unsafe { <Guard<'static, TestLock> as BpfType>::from_raw(first_raw, 0) };
+    drop(first);
+    drop(scope);
+    if TEST_LOCK_RELEASES.load(Ordering::SeqCst) != before + 2 {
+        return Err("cleanup conflict handling lost or double-released a Guard");
+    }
+    Ok(())
+}
+fn smoke_bpf_kfunc_guard_cleanup_conflict_fails_closed_neg() -> TestResult {
+    wrap(body_guard_cleanup_conflict_fails_closed())
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_kfunc_guard_cleanup_conflict_fails_closed_neg
+);
 
 /// Every registered kfunc that *takes* an `Owned` pointer must be reachable
 /// from something that *returns* one, or the release is unreachable and the
@@ -827,7 +986,8 @@ kernel_test_in!(
 
 /// A guard acquired and released through macro-derived descriptors verifies.
 fn body_prog_guard_release_verifies() -> R {
-    load_no_maps(
+    let before = TEST_LOCK_RELEASES.load(Ordering::SeqCst);
+    let prog = load_no_maps(
         "guard_rel",
         &[
             call(GUARD_ACQUIRE),
@@ -840,6 +1000,15 @@ fn body_prog_guard_release_verifies() -> R {
         Context::Atomic,
     )
     .map_err(|_| "a balanced Guard acquire/release did not verify")?;
+    let out = prog
+        .run_atomic([0; crate::interp::MAX_CTX_WORDS], 0)
+        .ok_or("the per-CPU stack provider declined the guard run")?;
+    if out.value() != 1 {
+        return Err("the guard program did not take its acquired path");
+    }
+    if TEST_LOCK_RELEASES.load(Ordering::SeqCst) != before + 1 {
+        return Err("the macro-generated release shim did not drop the Guard exactly once");
+    }
     Ok(())
 }
 fn smoke_bpf_kfunc_prog_guard_release_verifies_pos() -> TestResult {
@@ -866,6 +1035,32 @@ fn smoke_bpf_kfunc_prog_guard_leak_rejected_neg() -> TestResult {
     wrap(body_prog_guard_leak_rejected())
 }
 kernel_test_in!("bpf", smoke_bpf_kfunc_prog_guard_leak_rejected_neg);
+
+/// A guard is consumable only by a release kfunc for the same lock class.
+fn body_prog_guard_wrong_release_rejected() -> R {
+    let e = load_no_maps(
+        "guard_wrong_rel",
+        &[
+            call(GUARD_ACQUIRE),
+            jeq_imm(0, 0, 3),
+            mov_reg(1, 0),
+            call(OTHER_GUARD_RELEASE),
+            mov_imm(0, 1),
+            EXIT,
+        ],
+        Context::Atomic,
+    )
+    .err()
+    .ok_or("a Guard was accepted by the wrong lock class's release kfunc")?;
+    match verify_error(&e) {
+        Some(VerifyError::KfuncSignature { arg: 0, .. }) => Ok(()),
+        _ => Err("a mismatched Guard release was rejected for an unrelated reason"),
+    }
+}
+fn smoke_bpf_kfunc_prog_guard_wrong_release_rejected_neg() -> TestResult {
+    wrap(body_prog_guard_wrong_release_rejected())
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_prog_guard_wrong_release_rejected_neg);
 
 /// Guard sleep safety is independent of its release obligation: even a path
 /// that releases after the await is invalid.
@@ -898,6 +1093,42 @@ fn smoke_bpf_kfunc_prog_guard_across_await_rejected_neg() -> TestResult {
     wrap(body_prog_guard_across_await_rejected())
 }
 kernel_test_in!("bpf", smoke_bpf_kfunc_prog_guard_across_await_rejected_neg);
+
+/// Runtime termination is an implicit control-flow exit. A guard held by a
+/// path that exhausts fuel must be released even though the program never
+/// reaches its explicit release kfunc.
+fn body_prog_guard_out_of_fuel_releases() -> R {
+    let before = TEST_LOCK_RELEASES.load(Ordering::SeqCst);
+    let prog = load_no_maps(
+        "guard_fuel",
+        &[
+            call(GUARD_ACQUIRE),
+            jeq_imm(0, 0, 2),
+            ja(-1),
+            mov_imm(0, 0),
+            EXIT,
+        ],
+        Context::Atomic,
+    )
+    .map_err(|_| "the guard/fuel cleanup program did not verify")?;
+    let out = prog
+        .run_atomic([0; crate::interp::MAX_CTX_WORDS], 0)
+        .ok_or("the per-CPU stack provider declined the guard/fuel run")?;
+    if !matches!(
+        out,
+        crate::interp::Outcome::Trapped(crate::interp::Trap::OutOfFuel { .. })
+    ) {
+        return Err("the guard/fuel program did not terminate by fuel exhaustion");
+    }
+    if TEST_LOCK_RELEASES.load(Ordering::SeqCst) != before + 1 {
+        return Err("abnormal BPF termination did not release the live Guard");
+    }
+    Ok(())
+}
+fn smoke_bpf_kfunc_prog_guard_out_of_fuel_releases_pos() -> TestResult {
+    wrap(body_prog_guard_out_of_fuel_releases())
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_prog_guard_out_of_fuel_releases_pos);
 
 // ── the JIT covers the acquire/release path too ─────────────────────
 

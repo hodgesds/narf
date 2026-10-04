@@ -1714,9 +1714,13 @@ impl Analysis<'_, '_> {
                         // slice, a map value, an arena range.
                         self.check_mem_arg(st, at, k, desc, &p)?;
                     } else if p.class != want
-                        || (matches!(kind, PtrKind::Object | PtrKind::TraceObject)
-                            && !arg.flags.contains(ArgFlags::ANY_TRACE_OBJECT)
-                            && p.key != key)
+                        || match kind {
+                            PtrKind::Object | PtrKind::LockGuard => p.key != key,
+                            PtrKind::TraceObject => {
+                                !arg.flags.contains(ArgFlags::ANY_TRACE_OBJECT) && p.key != key
+                            }
+                            _ => false,
+                        }
                     {
                         return Err(bad);
                     } else if p.off.as_const() != Some(0) {
