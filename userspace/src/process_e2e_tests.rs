@@ -3377,83 +3377,103 @@ kernel_test_in!(
 );
 // ── Wave-61 smokes: PID recycling ──────────────────────────────────
 //
-// Smoke 27: PID pool — released ids are recycled (lowest-free policy).
+// Smoke 27: PID pool — released ids return to the pool, but allocation is
+//           cyclic (Linux `idr_alloc_cyclic`), not lowest-free.
 // Smoke 28: PID pool — release of unallocated id (0 / out-of-range) is a no-op.
 // Smoke 29: PID pool — exhaustion returns ProcessId::KERNEL (sentinel).
 // Smoke 30: PID recycling through full fork+reap lifecycle.
+//
+// These run in the shared kernel-test image, so they assert relationships
+// between the pids they allocate rather than absolute numbers, and they
+// never reset the live allocator.
 
-/// Smoke 27: spawn N pids, release them, then alloc again. The recycled
-/// pids must come back in lowest-free order.
+/// Smoke 27: consecutive allocations are consecutive pids; a released pid is
+/// back in the pool (an exact set_tid request can take it) but is NOT the
+/// next one the cyclic search hands out.
 fn smoke_wave61_pid_pool_recycles() -> TestResult {
-    crate::__test_reset_pid_pool();
-
     let a = crate::alloc_pid();
     let b = crate::alloc_pid();
     let c = crate::alloc_pid();
-    if a.raw() != 1 || b.raw() != 2 || c.raw() != 3 {
-        crate::__test_reset_pid_pool();
-        return TestResult::Fail("initial alloc did not produce 1,2,3");
-    }
-
-    crate::release_pid(b);
-    let reused = crate::alloc_pid();
-    if reused.raw() != 2 {
-        crate::__test_reset_pid_pool();
-        return TestResult::Fail("released pid 2 not reused");
-    }
-
+    let verdict = (|| {
+        if b.raw() != a.raw() + 1 || c.raw() != b.raw() + 1 {
+            return Err("consecutive allocations were not consecutive pids");
+        }
+        crate::release_pid(b);
+        let next = crate::alloc_pid();
+        crate::release_pid(next);
+        if next == b {
+            return Err("released pid was handed straight back (lowest-free)");
+        }
+        if next.raw() != c.raw() + 1 {
+            return Err("allocation after a release was not last+1");
+        }
+        // The released pid really is free again.
+        match crate::alloc_pid_specific(b.raw()) {
+            Ok(_) => Ok(()),
+            Err(_) => Err("released pid did not return to the pool"),
+        }
+    })();
     crate::release_pid(a);
+    crate::release_pid(b);
     crate::release_pid(c);
-    let r1 = crate::alloc_pid();
-    let r2 = crate::alloc_pid();
-    if r1.raw() != 1 || r2.raw() != 3 {
-        crate::__test_reset_pid_pool();
-        return TestResult::Fail("recycled pids out of order");
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
     }
-
-    crate::__test_reset_pid_pool();
-    TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_wave61_pid_pool_recycles);
 
-/// Smoke 28: release of 0 / >PID_MAX is a structural no-op that does
-/// not poison the pool.
+/// Smoke 28: release of 0 / never-allocated / out-of-range ids is a
+/// structural no-op: nothing leaves the in-use set and the cyclic cursor
+/// does not move.
 fn smoke_wave61_pid_pool_release_bounds() -> TestResult {
-    crate::__test_reset_pid_pool();
+    let in_use = crate::pid_pool_in_use_count();
+    let last = crate::root_ns_last_pid();
 
     crate::release_pid(crate::ProcessId(0));
     crate::release_pid(crate::ProcessId(crate::PID_MAX + 1));
+    crate::release_pid(crate::ProcessId(crate::PID_MAX_LIMIT));
     crate::release_pid(crate::ProcessId(u64::MAX));
 
-    if crate::pid_pool_free_count() != 0 {
-        crate::__test_reset_pid_pool();
-        return TestResult::Fail("out-of-range release inserted into pool");
+    if crate::pid_pool_in_use_count() != in_use {
+        return TestResult::Fail("out-of-range release changed the in-use set");
     }
-    if crate::pid_pool_watermark() != 1 {
-        crate::__test_reset_pid_pool();
-        return TestResult::Fail("watermark drifted on no-op release");
+    if crate::root_ns_last_pid() != last {
+        return TestResult::Fail("cursor drifted on no-op release");
     }
-
-    crate::__test_reset_pid_pool();
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_wave61_pid_pool_release_bounds);
 
 /// Smoke 29: exhausting the pool returns ProcessId::KERNEL (0) as the
-/// sentinel. Jams the watermark to avoid 32k iterations.
+/// sentinel (fork reports -EAGAIN). Lowers `kernel.pid_max` to its minimum
+/// (301) with the cursor past RESERVED_PIDS, so `[300, 301)` is the whole
+/// allocatable space — no 32k allocations needed.
 fn smoke_wave61_pid_pool_exhaustion() -> TestResult {
-    crate::__test_reset_pid_pool();
+    use narf_filesystem::procfs::sys_kernel::{pid_max, set_pid_max, PID_MAX_MIN};
 
-    crate::__test_set_pid_watermark(crate::PID_MAX + 1);
-
-    let exhausted = crate::alloc_pid();
-    let ok = exhausted == crate::ProcessId::KERNEL;
-
-    crate::__test_reset_pid_pool();
-    if !ok {
-        return TestResult::Fail("exhausted pool did not return KERNEL sentinel");
+    let saved_max = pid_max();
+    let saved_last = crate::root_ns_last_pid();
+    let held = crate::alloc_pid_specific(crate::RESERVED_PIDS).ok();
+    let verdict = (|| {
+        set_pid_max(PID_MAX_MIN).map_err(|_| "could not lower pid_max")?;
+        crate::set_root_ns_last_pid(crate::RESERVED_PIDS);
+        let exhausted = crate::alloc_pid();
+        if exhausted != crate::ProcessId::KERNEL {
+            crate::release_pid(exhausted);
+            return Err("exhausted pool did not return KERNEL sentinel");
+        }
+        Ok(())
+    })();
+    let _ = set_pid_max(saved_max);
+    crate::set_root_ns_last_pid(saved_last.max(0) as u64);
+    if let Some(pid) = held {
+        crate::release_pid(pid);
     }
-    TestResult::Pass
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
 }
 kernel_test_in!("userspace/process", smoke_wave61_pid_pool_exhaustion);
 
@@ -3468,27 +3488,30 @@ fn smoke_wave61_pid_recycled_after_reap() -> TestResult {
     crate::user_task::__test_clear_exit_observers();
     __test_wait_reset();
     wait_init();
-    crate::__test_reset_pid_pool();
 
     const PARENT: u64 = 0xC0FE;
 
     let c1 = crate::alloc_pid();
     let c2 = crate::alloc_pid();
     let c3 = crate::alloc_pid();
+    let allocated = crate::pid_pool_in_use_count();
     __test_inject_parent_of(c1.raw(), PARENT);
     __test_inject_parent_of(c2.raw(), PARENT);
     __test_inject_parent_of(c3.raw(), PARENT);
+
+    let cleanup = || {
+        __test_wait_reset();
+        crate::syscall::__test_clear_global();
+        crate::user_task::__test_clear_exit_observers();
+    };
 
     // Children exit — pids are NOT released yet (held until reap).
     notify_task_exited(c1.raw(), c1.raw());
     notify_task_exited(c2.raw(), c2.raw());
     notify_task_exited(c3.raw(), c3.raw());
 
-    if crate::pid_pool_free_count() != 0 {
-        crate::__test_reset_pid_pool();
-        __test_wait_reset();
-        crate::syscall::__test_clear_global();
-        crate::user_task::__test_clear_exit_observers();
+    if crate::pid_pool_in_use_count() != allocated {
+        cleanup();
         return TestResult::Fail("pids released on exit, before reap");
     }
 
@@ -3506,37 +3529,81 @@ fn smoke_wave61_pid_recycled_after_reap() -> TestResult {
     let _ = crate::handlers::finish_wait_child(0, false, 0, r3, 0);
 
     if r1 as u64 != c1.raw() || r2 as u64 != c2.raw() || r3 as u64 != c3.raw() {
-        crate::__test_reset_pid_pool();
-        __test_wait_reset();
-        crate::syscall::__test_clear_global();
-        crate::user_task::__test_clear_exit_observers();
+        cleanup();
         return TestResult::Fail("reap did not return the expected child pids");
     }
 
-    if crate::pid_pool_free_count() != 3 {
-        crate::__test_reset_pid_pool();
-        __test_wait_reset();
-        crate::syscall::__test_clear_global();
-        crate::user_task::__test_clear_exit_observers();
+    if crate::pid_pool_in_use_count() != allocated - 3 {
+        cleanup();
         return TestResult::Fail("reaped pids not returned to pool");
     }
 
-    let recycled = crate::alloc_pid();
-    if recycled != c1 {
-        crate::__test_reset_pid_pool();
-        __test_wait_reset();
-        crate::syscall::__test_clear_global();
-        crate::user_task::__test_clear_exit_observers();
-        return TestResult::Fail("recycled pid was not the smallest");
+    let next = crate::alloc_pid();
+    crate::release_pid(next);
+    cleanup();
+    if next == c1 || next == c2 || next == c3 {
+        return TestResult::Fail("a reaped pid was reused by the next allocation");
     }
-
-    crate::__test_reset_pid_pool();
-    __test_wait_reset();
-    crate::syscall::__test_clear_global();
-    crate::user_task::__test_clear_exit_observers();
+    if next.raw() != c3.raw() + 1 {
+        return TestResult::Fail("next allocation after the reap was not last+1");
+    }
     TestResult::Pass
 }
 kernel_test_in!("userspace/process", smoke_wave61_pid_recycled_after_reap);
+
+/// A reaped child's pid is NOT the next one handed out: Linux allocates
+/// cyclically (`kernel/pid.c::alloc_pid` → `idr_alloc_cyclic`), so the next
+/// fork after a child is reaped gets last+1. Lowest-free reuse handed a
+/// restarted avahi-daemon its predecessor's pid, which its stale PID file
+/// then named as "already running".
+fn smoke_pid_after_reap_is_cyclic_not_lowest_free() -> TestResult {
+    use crate::handlers::{__test_inject_parent_of, __test_wait_reset, wait_init};
+    use crate::user_task::notify_task_exited;
+
+    crate::syscall::__test_clear_global();
+    crate::user_task::__test_clear_exit_observers();
+    __test_wait_reset();
+    wait_init();
+
+    const PARENT: u64 = 0xC0FF;
+
+    let c1 = crate::alloc_pid();
+    let c2 = crate::alloc_pid();
+    __test_inject_parent_of(c1.raw(), PARENT);
+    __test_inject_parent_of(c2.raw(), PARENT);
+    notify_task_exited(c1.raw(), c1.raw());
+    notify_task_exited(c2.raw(), c2.raw());
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    install_task_id_lookup(lookup_task_shim);
+    let r1 =
+        crate::user_task::call_wait_child_check(PARENT, c1.raw() as i64, 0, core::ptr::null_mut());
+    let _ = crate::handlers::finish_wait_child(0, false, 0, r1, 0);
+    let r2 =
+        crate::user_task::call_wait_child_check(PARENT, c2.raw() as i64, 0, core::ptr::null_mut());
+    let _ = crate::handlers::finish_wait_child(0, false, 0, r2, 0);
+
+    let next = crate::alloc_pid();
+    crate::release_pid(next);
+    __test_wait_reset();
+    crate::syscall::__test_clear_global();
+    crate::user_task::__test_clear_exit_observers();
+
+    if r1 as u64 != c1.raw() || r2 as u64 != c2.raw() {
+        return TestResult::Fail("reap did not return the expected child pids");
+    }
+    if next == c1 || next == c2 {
+        return TestResult::Fail("the next fork reused a just-reaped child's pid");
+    }
+    if next.raw() != c2.raw() + 1 {
+        return TestResult::Fail("the next fork after a reap was not last+1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/process/pid_alloc",
+    smoke_pid_after_reap_is_cyclic_not_lowest_free
+);
 
 // ── Wave-61 smokes: pidfd_open ─────────────────────────────────────
 //
@@ -3762,10 +3829,9 @@ kernel_test_in!("userspace/process", smoke_wave61_pidfd_shared_state);
 /// A pidfd minted for a RECYCLED pid must not inherit the previous
 /// occupant's exit state.
 ///
-/// The pidfd table is keyed by pid, and pids are reusable — NARF hands
-/// out the lowest free one, so the number a process gets is typically the
-/// one most recently freed. Without invalidation at `release_pid` the new
-/// process's pidfd is born POLLIN-readable, and a watcher that treats
+/// The pidfd table is keyed by pid, and pids remain reusable once the cyclic
+/// allocator wraps. Without invalidation at `release_pid` the new process's
+/// pidfd is born POLLIN-readable, and a watcher that treats
 /// readable as "it exited" then calls `waitid(P_PIDFD, ., WEXITED)` with
 /// no WNOHANG — which blocks forever on a process that is very much
 /// alive. That is Qt's `forkfd` shape, and it is what left kwin's main
@@ -3779,7 +3845,7 @@ fn smoke_pidfd_recycled_pid_does_not_inherit_exit() -> TestResult {
     use narf_filesystem::POLL_IN;
 
     crate::pidfd::__test_reset();
-    // Must be inside 1..=PID_MAX: `release_pid` rejects anything outside
+    // Must be below PID_MAX_LIMIT: `release_pid` rejects anything outside
     // that range, so an out-of-range constant silently skips the very
     // invalidation under test. (The neighbouring pidfd smokes use
     // 0xA110/0xDEAD/0xB055 — all above PID_MAX — because they never

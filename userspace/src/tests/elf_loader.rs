@@ -3328,11 +3328,10 @@ kernel_test_in!("userspace", smoke_unshare_pid_ns_sees_self_as_pid_one);
 //      kept the whole post-exec AS alive FOREVER, surviving process exit),
 //      the ELF buffer, and the argv/envp copies all leaked per exec.
 
-/// Net pids currently allocated: ids minted past the watermark minus
-/// ids sitting in the free pool.
+/// Net pids currently allocated in the root pid namespace.
 #[cfg(target_arch = "x86_64")]
 fn net_allocated_pids() -> u64 {
-    (crate::pid_pool_watermark() - 1) - crate::pid_pool_free_count() as u64
+    crate::pid_pool_in_use_count() as u64
 }
 
 #[cfg(target_arch = "x86_64")]

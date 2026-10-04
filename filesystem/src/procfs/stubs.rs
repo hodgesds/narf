@@ -12,7 +12,6 @@
 //! | /proc/cgroups                      | hdr/live  | controller list when enabled |
 //! | /proc/keys                         | ""        | no keyring subsystem |
 //! | /proc/key-users                    | ""        | no keyring subsystem |
-//! | /proc/sys/kernel/ns_last_pid       | "0\n"     | namespace support disabled in this build |
 //! | /proc/sys/kernel/keys/maxkeys      | "200\n"   | no keyring subsystem |
 //! | /proc/sys/user/max_*_namespaces    | "0\n"     | namespace support disabled in this build |
 //!
@@ -22,6 +21,10 @@
 //!
 //! NOTE: `/proc/sys/kernel/modprobe` is implemented in `sys_kernel.rs`
 //! and is intentionally NOT duplicated here.
+//!
+//! NOTE: `/proc/sys/kernel/ns_last_pid` is NOT a stub: it is the pid
+//! allocator's cursor, served from `sys_kernel.rs` through hooks
+//! narf-userspace installs.
 
 extern crate alloc;
 
@@ -97,22 +100,6 @@ impl ProcFile for KeyUsersFile {
     }
 }
 
-// ── /proc/sys/kernel/ns_last_pid ────────────────────────────────
-//
-// Linux: last PID allocated in the current PID namespace. Used by
-// tools that tune PID recycling (e.g. sysbox-runc). In a build without
-// the `container` feature NARF has a flat pid space, so "0\n" is a safe
-// disabled sentinel. Container-enabled builds omit this sysctl until the
-// PID namespace exports its authoritative high-water mark.
-
-#[cfg(not(feature = "container"))]
-fn read_ns_last_pid() -> String {
-    // Namespace support is disabled in this build; 0 is the sentinel for
-    // "not yet allocated in any namespace". Linux ref: kernel/pid.c::
-    // proc_sys_last_pid (sysctl handler).
-    String::from("0\n")
-}
-
 // ── /proc/sys/kernel/keys/maxkeys ───────────────────────────────
 //
 // Linux: per-uid limit on the number of keys that can be held in a
@@ -153,20 +140,6 @@ pub fn register_all() {
     register_proc("cgroups", Arc::new(CgroupsFile));
     register_proc("keys", Arc::new(KeysFile));
     register_proc("key-users", Arc::new(KeyUsersFile));
-
-    // Do not publish zero namespace values in a container-enabled build:
-    // zero means "disabled" to Linux userspace, while namespaces are usable.
-    // Until userspace exposes authoritative limits/high-water marks, absence
-    // is the honest older-kernel shape.
-    #[cfg(not(feature = "container"))]
-    {
-        register_sysctl(SysctlEntry {
-            path: "kernel/ns_last_pid",
-            read: read_ns_last_pid,
-            write: None,
-            perms: 0o444,
-        });
-    }
 
     // /proc/sys/kernel/keys/maxkeys — no keyring subsystem.
     register_sysctl(SysctlEntry {
@@ -268,8 +241,7 @@ kernel_test_in!(
 fn smoke_namespace_limits_absent_when_enabled() -> TestResult {
     register_all();
     let user_limit = lookup_registry(&["sys", "user", "max_user_namespaces"]);
-    let last_pid = lookup_registry(&["sys", "kernel", "ns_last_pid"]);
-    if user_limit.is_none() && last_pid.is_none() {
+    if user_limit.is_none() {
         TestResult::Pass
     } else {
         TestResult::Fail("container build published a false zero namespace limit")
@@ -292,20 +264,6 @@ fn smoke_proc_keys_empty() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/stubs", smoke_proc_keys_empty);
-
-#[cfg(not(feature = "container"))]
-fn smoke_sys_kernel_ns_last_pid_zero() -> TestResult {
-    register_all();
-    let snap = lookup_registry(&["sys", "kernel", "ns_last_pid"]);
-    let ok = matches!(snap, Some(ProcNodeSnapshot::File(ref f)) if f.read() == b"0\n");
-    if ok {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("ns_last_pid did not return '0\\n'")
-    }
-}
-#[cfg(not(feature = "container"))]
-kernel_test_in!("filesystem/procfs/stubs", smoke_sys_kernel_ns_last_pid_zero);
 
 fn smoke_sys_kernel_keys_maxkeys_200() -> TestResult {
     register_all();

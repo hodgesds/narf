@@ -69,6 +69,7 @@ pub mod namespaces;
 pub mod network_daemon;
 pub mod oom;
 pub mod perf_event;
+pub mod pid_idr;
 #[cfg(feature = "container")]
 pub mod pid_ns;
 pub mod pidfd;
@@ -110,6 +111,7 @@ mod abi_packet_tests;
 mod abi_path_tests;
 mod abi_pathx_tests;
 mod abi_perf_tests;
+mod abi_pid_alloc_tests;
 mod abi_pidns_tests;
 mod abi_proc2_tests;
 mod abi_proc_tests;
@@ -196,10 +198,8 @@ pub use user_task::{
     EXIT_REASON_YIELDED,
 };
 
-use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_capabilities::{CapKind, CapType};
 
@@ -207,7 +207,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Identifiers ─────────────────────────────────────────────────────
 
-/// Monotonic process id. `0` is reserved (kernel itself).
+/// Linux-visible process id. Allocated cyclically and reused after wrap;
+/// `0` is reserved for the kernel.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessId(pub u64);
 
@@ -230,103 +231,81 @@ impl ThreadId {
     }
 }
 
-// ── PID pool (Wave-61) ──────────────────────────────────────────────
+// ── PID allocation (root pid namespace) ─────────────────────────────
 //
-// Linux maintains a bounded PID space: `kernel.pid_max` defaults to
-// 32768 on 32-bit systems and is the floor on x86_64 (raising it past
-// 4M needs a sysctl write). NARF uses the same default upper bound
-// here. ProcessIds 1..=PID_MAX are mintable; 0 is reserved for the
-// kernel. On `release_pid` the id returns to the pool — wired by
-// `on_child_exit` in handlers.rs so a `wait4`-reaped child's PID can
-// be reused by the next `fork`.
+// Linux allocates pids cyclically per namespace (`kernel/pid.c::alloc_pid`
+// → `idr_alloc_cyclic`), see [`pid_idr`]. This is the root namespace's
+// number space — the outer `ProcessId` every task has. Child pid namespaces
+// (`pid_ns`, `container` feature) each keep their own [`pid_idr::PidIdr`].
 //
-// Lowest-free policy: BTreeSet's first() is O(log n), and pid 1
-// stays sticky to init across its lifetime (it never exits). Linux
-// switched away from lowest-free in 2.4 for security-noise reasons
-// but the kernel-test surface here benefits from the predictability.
+// On `release_pid` the id leaves the in-use set — wired by `on_child_exit`
+// in handlers.rs so a `wait4`-reaped child's pid becomes allocatable again,
+// but only once the cyclic search comes back round to it.
 
-/// Upper bound on mintable PIDs. Matches Linux's 32-bit-default
-/// `pid_max`. Promotion to a larger ceiling needs no ABI change —
-/// just bump this and the existing pool re-fills lazily.
+/// Linux `PID_MAX_DEFAULT` (`include/linux/threads.h`): the boot value of
+/// `/proc/sys/kernel/pid_max`. The live bound is [`pid_max`].
 pub const PID_MAX: u64 = 32768;
 
-/// Free-PID set. Lazily initialised on first `alloc_pid` /
-/// `release_pid` call so static-init ordering doesn't matter.
-static PID_POOL: IrqSafeSpinLock<Option<BTreeSet<u64>>> = IrqSafeSpinLock::new(None);
+/// Linux `PID_MAX_LIMIT` on 64-bit: the ceiling `pid_max` may be raised to.
+pub const PID_MAX_LIMIT: u64 = 4 * 1024 * 1024;
 
-/// Watermark for lazy initialisation — the smallest id NOT yet pulled
-/// into `PID_POOL` from the implicit 1..=PID_MAX universe. On alloc
-/// we either consume from the pool (a released id) or take the
-/// watermark and advance it.
-static PID_WATERMARK: AtomicU64 = AtomicU64::new(1);
+pub use pid_idr::RESERVED_PIDS;
 
-fn pid_pool_init_if_needed(g: &mut Option<BTreeSet<u64>>) {
-    if g.is_none() {
-        *g = Some(BTreeSet::new());
-    }
+/// The live `pid_max` — `/proc/sys/kernel/pid_max`, an EXCLUSIVE bound: the
+/// largest allocatable pid is `pid_max() - 1`, as on Linux.
+///
+/// LINUX-GAP: Linux (6.14+) keeps `pid_max` per pid namespace
+/// (`pidns->pid_max`, inherited from the parent at creation, and the sysctl
+/// resolves the caller's namespace). NARF's sysctl is a single global, so
+/// every namespace allocates against it. Linux also scales the boot default
+/// to `max(PID_MAX_DEFAULT, PIDS_PER_CPU_DEFAULT * num_possible_cpus())`;
+/// NARF keeps PID_MAX_DEFAULT, which is the same value up to 32 CPUs.
+#[inline]
+pub fn pid_max() -> u64 {
+    u64::from(narf_filesystem::procfs::sys_kernel::pid_max())
 }
 
-/// Allocate a fresh `ProcessId` — lowest free id in 1..=PID_MAX.
-/// Returns `ProcessId(0)` (kernel reserved) when the pool is fully
-/// exhausted — callers should treat that as ENOSPC-shaped failure.
+/// The root namespace's pid numbers.
+static PID_IDR: IrqSafeSpinLock<pid_idr::PidIdr> = IrqSafeSpinLock::new(pid_idr::PidIdr::new());
+
+/// Allocate a fresh `ProcessId` — `alloc_pid`'s cyclic search in the root
+/// namespace. Returns `ProcessId(0)` (kernel reserved) when every pid in
+/// `[pid_min, pid_max)` is in use — callers report that as -EAGAIN, which is
+/// what Linux's `alloc_pid` returns for `idr_alloc_cyclic`'s -ENOSPC.
 #[inline]
 pub fn alloc_pid() -> ProcessId {
-    let mut g = PID_POOL.lock();
-    pid_pool_init_if_needed(&mut g);
-    let pool = g.as_mut().expect("pool inited");
-    // Prefer a released id (smallest).
-    if let Some(&pid) = pool.iter().next() {
-        pool.remove(&pid);
-        return ProcessId(pid);
+    let pid_max = pid_max();
+    match PID_IDR.lock().alloc_cyclic(pid_max) {
+        Some(nr) => ProcessId(nr),
+        None => ProcessId::KERNEL,
     }
-    // Otherwise advance the watermark.
-    let next = PID_WATERMARK.fetch_add(1, Ordering::Relaxed);
-    if next == 0 || next > PID_MAX {
-        // Exhausted: roll back the watermark and report kernel-PID.
-        PID_WATERMARK.fetch_sub(1, Ordering::Relaxed);
-        return ProcessId::KERNEL;
-    }
-    ProcessId(next)
 }
 
-/// Return `pid` to the free pool. Idempotent: a double-release is a
-/// silent no-op (the BTreeSet absorbs duplicate inserts). `0`
-/// (kernel) is rejected — it was never allocated.
 /// Reserve a caller-selected PID for clone3(2) `set_tid`.
 ///
-/// Linux reports EINVAL for an out-of-range requested PID and EEXIST when
-/// that number is already allocated. Skipping the watermark publishes every
-/// intervening never-used PID into the free set so later ordinary allocations
-/// still choose the lowest available number.
+/// Linux (`alloc_pid`): `if (tid < 1 || tid >= pid_max) -EINVAL`, then an
+/// exact `idr_alloc(tid, tid + 1)` whose -ENOSPC is reported as -EEXIST. The
+/// exact allocation does not move the cyclic cursor.
 pub(crate) fn alloc_pid_specific(raw: u64) -> Result<ProcessId, u64> {
     const EEXIST: u64 = 17;
     const EINVAL: u64 = 22;
-    if raw == 0 || raw > PID_MAX {
+    if raw == 0 || raw >= pid_max() {
         return Err(EINVAL);
     }
-
-    let mut guard = PID_POOL.lock();
-    pid_pool_init_if_needed(&mut guard);
-    let pool = guard.as_mut().expect("pool inited");
-    let watermark = PID_WATERMARK.load(Ordering::Relaxed);
-    if raw < watermark {
-        return if pool.remove(&raw) {
-            Ok(ProcessId(raw))
-        } else {
-            Err(EEXIST)
-        };
+    if PID_IDR.lock().alloc_exact(raw) {
+        Ok(ProcessId(raw))
+    } else {
+        Err(EEXIST)
     }
-
-    for skipped in watermark..raw {
-        pool.insert(skipped);
-    }
-    PID_WATERMARK.store(raw + 1, Ordering::Relaxed);
-    Ok(ProcessId(raw))
 }
+
+/// Return `pid` to the root namespace (`free_pid` → `idr_remove`).
+/// Releasing an id that is not allocated is a no-op; `0` (kernel) and ids
+/// beyond `PID_MAX_LIMIT` were never allocatable.
 #[inline]
 pub fn release_pid(pid: ProcessId) {
     let raw = pid.raw();
-    if raw == 0 || raw > PID_MAX {
+    if raw == 0 || raw >= PID_MAX_LIMIT {
         return;
     }
     // Invalidate every pid-KEYED cache before the number becomes
@@ -334,35 +313,77 @@ pub fn release_pid(pid: ProcessId) {
     // state, and a row left behind hands the next occupant of this pid a
     // state that already says `exited`. See `pidfd::forget_pid`.
     pidfd::forget_pid(raw);
-    let mut g = PID_POOL.lock();
-    pid_pool_init_if_needed(&mut g);
-    g.as_mut().expect("pool inited").insert(raw);
+    PID_IDR.lock().remove(raw);
 }
 
-/// Test/reset hook — wipe the pool back to fresh-boot state. Lets
-/// independent kernel_test cases share state cleanly without leaking
-/// pids across runs.
-#[doc(hidden)]
-pub fn __test_reset_pid_pool() {
-    *PID_POOL.lock() = Some(BTreeSet::new());
-    PID_WATERMARK.store(1, Ordering::Relaxed);
+/// `/proc/sys/kernel/ns_last_pid` for the root namespace:
+/// `idr_get_cursor() - 1`.
+pub fn root_ns_last_pid() -> i64 {
+    PID_IDR.lock().last_pid()
 }
 
-/// Test-only: force the watermark to a specific value. Used by
-/// exhaustion smokes to skip 32k useless allocations.
-#[doc(hidden)]
-pub fn __test_set_pid_watermark(v: u64) {
-    PID_WATERMARK.store(v, Ordering::Relaxed);
+/// `ns_last_pid` write for the root namespace: `idr_set_cursor(last + 1)`.
+pub fn set_root_ns_last_pid(last: u64) {
+    PID_IDR.lock().set_cursor(last + 1);
 }
 
-/// Diagnostic: count of released-but-not-yet-reallocated pids.
-pub fn pid_pool_free_count() -> usize {
-    PID_POOL.lock().as_ref().map(|s| s.len()).unwrap_or(0)
+/// Diagnostic: number of root-namespace pids currently allocated.
+pub fn pid_pool_in_use_count() -> usize {
+    PID_IDR.lock().in_use()
 }
 
-/// Diagnostic: current watermark (smallest id never minted).
-pub fn pid_pool_watermark() -> u64 {
-    PID_WATERMARK.load(Ordering::Relaxed)
+/// `/proc/sys/kernel/ns_last_pid` read, resolved in the caller's ACTIVE pid
+/// namespace (`task_active_pid_ns(current)` in `pid_ns_ctl_handler`).
+pub fn ns_last_pid_for_current() -> i64 {
+    #[cfg(feature = "container")]
+    {
+        let task = handlers::current_task_id();
+        if let Some(ns) = pid_ns::ns_of(task) {
+            return ns.last_pid();
+        }
+    }
+    root_ns_last_pid()
+}
+
+/// `/proc/sys/kernel/ns_last_pid` write — `pid_ns_ctl_handler`:
+///
+/// ```c
+/// if (write && !checkpoint_restore_ns_capable(pid_ns->user_ns))
+///         return -EPERM;
+/// next = idr_get_cursor(&pid_ns->idr) - 1;
+/// tmp.data = &next;
+/// tmp.extra2 = &pid_ns->pid_max;
+/// ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
+/// if (!ret && write)
+///         idr_set_cursor(&pid_ns->idr, next + 1);
+/// ```
+///
+/// The capability check comes first, so an unprivileged write is EPERM
+/// whatever it says; the value is then `proc_dointvec_minmax` over
+/// `[0, pid_max]` (EINVAL outside it).
+pub fn set_ns_last_pid_for_current(v: &str) -> Result<(), narf_filesystem::FsError> {
+    let task = handlers::current_task_id();
+    #[cfg(feature = "container")]
+    let ns = pid_ns::current_pid_ns(task);
+    #[cfg(feature = "container")]
+    let allowed = {
+        let owner = ns.owner_user_ns();
+        handlers::task_ns_capable(task, &owner, handlers::CAP_SYS_ADMIN)
+            || handlers::task_ns_capable(task, &owner, handlers::CAP_CHECKPOINT_RESTORE)
+    };
+    #[cfg(not(feature = "container"))]
+    let allowed = handlers::task_capable(task, handlers::CAP_SYS_ADMIN)
+        || handlers::task_capable(task, handlers::CAP_CHECKPOINT_RESTORE);
+    if !allowed {
+        return Err(narf_filesystem::FsError::OperationNotPermitted);
+    }
+    let last =
+        narf_filesystem::procfs::sys_kernel::parse_dointvec_minmax(v, 0, pid_max() as i64)? as u64;
+    #[cfg(feature = "container")]
+    ns.set_last_pid(last);
+    #[cfg(not(feature = "container"))]
+    set_root_ns_last_pid(last);
+    Ok(())
 }
 
 // ── Cap types ───────────────────────────────────────────────────────

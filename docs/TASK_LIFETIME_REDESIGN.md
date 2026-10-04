@@ -31,7 +31,8 @@ pointers or ids into that box:
 | futex/io/signal/wait-child/timer-wheel tables | `Waker` = `Arc<WakeCell>` | safe (Arc), but entries go stale/leak |
 
 Key facts: scheduler TaskIds (tids) are monotonic and NEVER reused;
-PIDs are lowest-free and REUSED. Wakers are `Arc<WakeCell>` — firing a
+PIDs are allocated cyclically (Linux `idr_alloc_cyclic`) and REUSED
+after the pid space wraps. Wakers are `Arc<WakeCell>` — firing a
 dead task's waker is memory-safe. Signal sends never write target
 memory (bit-set + wake; victim self-delivers on its own trap return).
 

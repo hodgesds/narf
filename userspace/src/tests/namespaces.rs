@@ -877,9 +877,16 @@ fn smoke_pid_ns_release_frees_inner_slot() -> TestResult {
     if ns.outer_to_inner(101).is_some() {
         return TestResult::Fail("release_outer did not drop the binding");
     }
-    // The freed inner 2 is reused by the next bind (lowest-free).
-    if ns.bind_outer(102) != 2 {
-        return TestResult::Fail("released inner slot 2 was not reused");
+    // Allocation is cyclic (Linux `idr_alloc_cyclic`): the next bind moves on
+    // to 3 rather than handing the just-freed 2 straight back...
+    if ns.bind_outer(102) != 3 {
+        return TestResult::Fail("next bind after a release was not last+1");
+    }
+    // ...but 2 IS free again: pointing the cursor back at it (what an
+    // `ns_last_pid` write of 1 does) hands it out.
+    ns.set_last_pid(1);
+    if ns.bind_outer(103) != 2 {
+        return TestResult::Fail("released inner slot 2 was not reusable");
     }
     crate::pid_ns::__test_reset();
     TestResult::Pass

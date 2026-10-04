@@ -1384,6 +1384,47 @@ size and average duration, and returns `ENOSPC` after copying a short output
 prefix. Packet reads and their verifier/runtime contract are owned by
 `bpf/specification/spec.md` §3.15.
 
+### 3.4 PID allocation
+
+Pids are allocated per pid namespace exactly as Linux `kernel/pid.c::alloc_pid`
+does: `pid_idr::PidIdr` is one namespace's number space with Linux's
+`idr_alloc_cyclic` cursor. The automatic allocation searches
+`[pid_min, pid_max)` starting one past the last pid handed out, wrapping to
+`pid_min`; `pid_min` is 1 until the cursor has passed `RESERVED_PIDS` (300)
+and 300 afterwards. A released pid is therefore not reused until the space has
+been cycled — a restarted daemon never inherits its predecessor's pid. A full
+space is `EAGAIN` (`alloc_pid` returns `ProcessId::KERNEL`, which fork/clone
+report as `-EAGAIN`).
+
+```rust
+pub const PID_MAX: u64;            // PID_MAX_DEFAULT, the boot pid_max
+pub const PID_MAX_LIMIT: u64;      // 4 Mi
+pub use pid_idr::RESERVED_PIDS;    // 300
+pub fn pid_max() -> u64;           // live /proc/sys/kernel/pid_max (exclusive)
+pub fn alloc_pid() -> ProcessId;   // root-namespace cyclic allocation
+pub(crate) fn alloc_pid_specific(raw: u64) -> Result<ProcessId, u64>;
+pub fn release_pid(pid: ProcessId);
+pub fn root_ns_last_pid() -> i64;
+pub fn set_root_ns_last_pid(last: u64);
+pub fn ns_last_pid_for_current() -> i64;
+pub fn set_ns_last_pid_for_current(v: &str) -> Result<(), FsError>;
+pub fn pid_pool_in_use_count() -> usize;
+// container: PidNamespace::{last_pid, set_last_pid}
+```
+
+clone3 `set_tid` is an exact allocation (`idr_alloc`): `EINVAL` when the
+value is `< 1` or `>= pid_max`, `EEXIST` when it is in use; it does not move
+the cyclic cursor. In a child pid namespace whose init has exited, allocation
+is `ENOMEM` after the per-level `EINVAL`/`EEXIST`/`EAGAIN` checks, as Linux's
+`PIDNS_ADDING` test is.
+
+`/proc/sys/kernel/ns_last_pid` (mode 0666) reads `cursor - 1` of the caller's
+active pid namespace; a write requires `CAP_SYS_ADMIN` or
+`CAP_CHECKPOINT_RESTORE` in that namespace's owning user namespace (`EPERM`,
+checked before parsing) and a value in `[0, pid_max]` (`EINVAL`), and sets the
+cursor to `value + 1`. It is published in every build. `pid_max` is one global
+value shared by all namespaces (Linux 6.14+ keeps it per namespace).
+
 ## 4. Invariants & safety properties
 
 - No ambient authority: a new process has only the caps explicitly granted.

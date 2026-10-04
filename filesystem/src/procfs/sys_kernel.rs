@@ -245,23 +245,92 @@ fn write_domainname(v: &str) -> Result<(), FsError> {
     }
 }
 
-fn read_pid_max() -> String {
-    format!("{}\n", PID_MAX.load(Ordering::Relaxed))
+// ── kernel.pid_max ───────────────────────────────────────────────
+//
+// `kernel/pid.c::pid_table`: `proc_dointvec_minmax` over
+// [pid_max_min = RESERVED_PIDS + 1, pid_max_max = PID_MAX_LIMIT]. The value
+// is an EXCLUSIVE bound on allocated pids, and narf-userspace's pid
+// allocator reads it live through [`pid_max`] — the file and the allocator
+// are one number.
+//
+// LINUX-GAP: Linux raises pid_max_min to `PIDS_PER_CPU_MIN *
+// num_possible_cpus()` on machines with more than 37 CPUs and keeps pid_max
+// per pid namespace (6.14+); NARF has one global value.
+
+/// `pid_max_min` (`RESERVED_PIDS + 1`).
+pub const PID_MAX_MIN: u32 = 301;
+/// `pid_max_max` (`PID_MAX_LIMIT` on 64-bit).
+pub const PID_MAX_LIMIT: u32 = 4 * 1024 * 1024;
+
+/// The live `kernel.pid_max`.
+pub fn pid_max() -> u32 {
+    PID_MAX.load(Ordering::Relaxed)
 }
-fn write_pid_max(v: &str) -> Result<(), FsError> {
-    let n: u32 = v.parse().map_err(|_| FsError::InvalidData)?;
-    if n == 0 || n > 4194304 {
+
+/// Set `kernel.pid_max`, with the sysctl's `[PID_MAX_MIN, PID_MAX_LIMIT]`
+/// range check.
+pub fn set_pid_max(n: u32) -> Result<(), FsError> {
+    if !(PID_MAX_MIN..=PID_MAX_LIMIT).contains(&n) {
         return Err(FsError::InvalidData);
     }
     PID_MAX.store(n, Ordering::Relaxed);
     Ok(())
 }
 
+fn read_pid_max() -> String {
+    format!("{}\n", pid_max())
+}
+fn write_pid_max(v: &str) -> Result<(), FsError> {
+    let n = parse_dointvec_minmax(v, i64::from(PID_MAX_MIN), i64::from(PID_MAX_LIMIT))?;
+    set_pid_max(n as u32)
+}
+
+// ── kernel.ns_last_pid ───────────────────────────────────────────
+//
+// `kernel/pid_namespace.c::pid_ns_ctl_handler`: mode 0666, the last pid
+// allocated in the CALLER's active pid namespace (`idr_get_cursor - 1`);
+// a write sets that namespace's cyclic cursor, gated on
+// `checkpoint_restore_ns_capable` (EPERM). CRIU drives pid selection with
+// it. The namespace state lives in narf-userspace, which installs the
+// hooks; before that (early boot, filesystem-only tests) reads are "0" and
+// writes are refused.
+type NsLastPidReadFn = fn() -> i64;
+type NsLastPidWriteFn = fn(&str) -> Result<(), FsError>;
+static NS_LAST_PID_READ: AtomicUsize = AtomicUsize::new(0);
+static NS_LAST_PID_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+/// Route `/proc/sys/kernel/ns_last_pid` at the pid allocator. Idempotent.
+pub fn install_ns_last_pid_hooks(read: NsLastPidReadFn, write: NsLastPidWriteFn) {
+    NS_LAST_PID_READ.store(read as usize, Ordering::Release);
+    NS_LAST_PID_WRITE.store(write as usize, Ordering::Release);
+}
+
+fn read_ns_last_pid() -> String {
+    let v = NS_LAST_PID_READ.load(Ordering::Acquire);
+    if v == 0 {
+        return String::from("0\n");
+    }
+    // SAFETY: v was stored by install_ns_last_pid_hooks as a
+    // NsLastPidReadFn fn-pointer; non-zero confirms it.
+    let f: NsLastPidReadFn = unsafe { core::mem::transmute(v) };
+    format!("{}\n", f())
+}
+fn write_ns_last_pid(v: &str) -> Result<(), FsError> {
+    let p = NS_LAST_PID_WRITE.load(Ordering::Acquire);
+    if p == 0 {
+        return Err(FsError::OperationNotPermitted);
+    }
+    // SAFETY: p was stored by install_ns_last_pid_hooks as a
+    // NsLastPidWriteFn fn-pointer; non-zero confirms it.
+    let f: NsLastPidWriteFn = unsafe { core::mem::transmute(p) };
+    f(v)
+}
+
 /// `proc_dointvec_minmax` input: `proc_get_long` skips surrounding
 /// whitespace, takes an optional `-` and a base-0 number (`strtoul_lenient`:
 /// `0x` hex, leading `0` octal), and anything else is EINVAL; a value outside
 /// `[min, max]` is EINVAL too.
-fn parse_dointvec_minmax(v: &str, min: i64, max: i64) -> Result<i64, FsError> {
+pub fn parse_dointvec_minmax(v: &str, min: i64, max: i64) -> Result<i64, FsError> {
     let t = v.trim();
     let (neg, digits) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -533,6 +602,13 @@ pub fn register_all() {
         perms: 0o644,
     });
     register_sysctl(SysctlEntry {
+        path: "kernel/ns_last_pid",
+        read: read_ns_last_pid,
+        write: Some(write_ns_last_pid),
+        // Linux: 0666, "permissions are checked in the handler".
+        perms: 0o666,
+    });
+    register_sysctl(SysctlEntry {
         path: "kernel/pty/max",
         read: read_pty_max,
         write: Some(write_pty_max),
@@ -764,6 +840,49 @@ fn smoke_kernel_pid_max_parse() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_pid_max_parse);
+
+/// pid_max is `proc_dointvec_minmax` over [RESERVED_PIDS + 1, PID_MAX_LIMIT]:
+/// 300 and PID_MAX_LIMIT + 1 are EINVAL, both ends of the range are accepted.
+fn smoke_kernel_pid_max_range() -> TestResult {
+    register_all();
+    let before = pid_max();
+    let verdict = (|| {
+        if !matches!(write_pid_max("300"), Err(FsError::InvalidData)) {
+            return Err("pid_max 300 (below RESERVED_PIDS + 1) was accepted");
+        }
+        if !matches!(write_pid_max("4194305"), Err(FsError::InvalidData)) {
+            return Err("pid_max above PID_MAX_LIMIT was accepted");
+        }
+        if write_pid_max("301").is_err() || pid_max() != 301 {
+            return Err("pid_max 301 was refused");
+        }
+        if write_pid_max("4194304").is_err() || pid_max() != 4_194_304 {
+            return Err("pid_max PID_MAX_LIMIT was refused");
+        }
+        Ok(())
+    })();
+    PID_MAX.store(before, Ordering::Relaxed);
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_pid_max_range);
+
+/// ns_last_pid exists in every build and is 0666 as on Linux: the
+/// capability check is the handler's, not the file mode's.
+fn smoke_kernel_ns_last_pid_registered_0666() -> TestResult {
+    register_all();
+    match lookup_registry(&["sys", "kernel", "ns_last_pid"]) {
+        Some(ProcNodeSnapshot::File(f)) if f.perms() == 0o666 && f.writable() => TestResult::Pass,
+        Some(_) => TestResult::Fail("kernel/ns_last_pid is not a writable 0666 file"),
+        None => TestResult::Fail("kernel/ns_last_pid not registered"),
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/sys_kernel",
+    smoke_kernel_ns_last_pid_registered_0666
+);
 
 /// randomize_va_space writable 0/1/2, rejects 3.
 fn smoke_kernel_randomize_va_space_validation() -> TestResult {
