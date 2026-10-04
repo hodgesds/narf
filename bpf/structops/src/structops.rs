@@ -116,6 +116,8 @@ pub struct StructOpsDesc {
     pub version: u32,
     /// Capability required to install this target.
     pub cap: CapKind,
+    /// Execution context shared by every method in this target.
+    pub context: Context,
     /// Methods in declaration order.
     pub methods: &'static [MethodDesc],
 }
@@ -251,7 +253,7 @@ pub fn validate<M: CapType>(
             || method.abi_hash == 0
             || method.fallback.is_empty()
             || method.fuel == 0
-            || method.context != Context::Atomic
+            || method.context != desc.context
             || desc.methods[..index]
                 .iter()
                 .any(|earlier| earlier.id == method.id)
@@ -273,16 +275,56 @@ pub fn validate<M: CapType>(
     Ok(())
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct InstalledRecord {
     target_id: u64,
     name: &'static str,
     generation: u64,
+    state: Arc<AttachmentState>,
 }
 
 static INSTALLED: IrqSafeSpinLock<Option<Arc<Vec<InstalledRecord>>>> = IrqSafeSpinLock::new(None);
 static INSTALL_BUSY: AtomicBool = AtomicBool::new(false);
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Admission gate shared by one generated adapter and its owning link.
+///
+/// A caller that observes `true` has created an in-flight invocation and may
+/// finish after detach. Once the link stores `false`, later adapter calls take
+/// their native fallback without entering BPF, even if a caller retained an
+/// old `Arc` to the displaced adapter.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AttachmentState {
+    active: AtomicBool,
+}
+
+impl AttachmentState {
+    /// Construct an unpublished live gate.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+
+    /// Admit one invocation.
+    #[inline]
+    #[must_use]
+    pub fn admit(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl Default for AttachmentState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug)]
 struct InstallPermit;
@@ -319,6 +361,7 @@ pub struct PreparedInstall {
     desc: &'static StructOpsDesc,
     generation: u64,
     set: ProgSet,
+    state: Arc<AttachmentState>,
     next: Arc<Vec<InstalledRecord>>,
 }
 
@@ -336,6 +379,7 @@ pub fn prepare_install<M: CapType>(
     desc: &'static StructOpsDesc,
     cap: &Cap<M, Grant>,
     set: ProgSet,
+    state: Arc<AttachmentState>,
 ) -> Result<PreparedInstall, StructOpsError> {
     validate(desc, cap, &set)?;
     let permit = InstallPermit::try_acquire()?;
@@ -353,20 +397,22 @@ pub fn prepare_install<M: CapType>(
         records.extend(
             snapshot
                 .iter()
-                .copied()
-                .filter(|record| record.target_id != desc.target_id),
+                .filter(|record| record.target_id != desc.target_id)
+                .cloned(),
         );
     }
     records.push(InstalledRecord {
         target_id: desc.target_id,
         name: desc.name,
         generation,
+        state: state.clone(),
     });
     Ok(PreparedInstall {
         _permit: permit,
         desc,
         generation,
         set,
+        state,
         next: Arc::new(records),
     })
 }
@@ -382,12 +428,21 @@ pub fn finish_install(prepared: PreparedInstall, detach: DetachFn) -> StructOpsL
         desc,
         generation,
         set,
+        state,
         next,
     } = prepared;
     let old = {
         let mut installed = INSTALLED.lock();
         installed.replace(next)
     };
+    if let Some(old) = &old {
+        for record in old
+            .iter()
+            .filter(|record| record.target_id == desc.target_id && record.generation != generation)
+        {
+            record.state.close();
+        }
+    }
     drop(old);
     drop(_permit);
     StructOpsLink {
@@ -395,6 +450,7 @@ pub fn finish_install(prepared: PreparedInstall, detach: DetachFn) -> StructOpsL
         target_name: desc.name,
         generation,
         detach,
+        state,
         attached: true,
         _programs: set,
     }
@@ -407,6 +463,7 @@ pub struct StructOpsLink {
     target_name: &'static str,
     generation: u64,
     detach: DetachFn,
+    state: Arc<AttachmentState>,
     attached: bool,
     _programs: ProgSet,
 }
@@ -434,6 +491,10 @@ impl StructOpsLink {
             return;
         }
         self.attached = false;
+        // Linearization point for invocation admission. Calls admitted before
+        // this store are in flight and retain their adapter; calls after it
+        // take the generated fallback without touching BPF.
+        self.state.close();
         let _permit = InstallPermit::acquire_for_drop();
 
         // Prepare the diagnostic-registry replacement outside its IRQ-masking
@@ -442,9 +503,14 @@ impl StructOpsLink {
         let snapshot = INSTALLED.lock().clone();
         let mut records = Vec::with_capacity(snapshot.as_ref().map_or(0, |r| r.len()));
         if let Some(snapshot) = snapshot {
-            records.extend(snapshot.iter().copied().filter(|record| {
-                record.target_id != self.target_id || record.generation != self.generation
-            }));
+            records.extend(
+                snapshot
+                    .iter()
+                    .filter(|record| {
+                        record.target_id != self.target_id || record.generation != self.generation
+                    })
+                    .cloned(),
+            );
         }
         let replacement = if records.is_empty() {
             None
@@ -547,9 +613,62 @@ pub const fn is_optional(name: &str, list: &[&str]) -> bool {
     false
 }
 
-/// Declare a contract-bound atomic BPF implementation of a pluggable trait.
+/// Declare a contract-bound BPF implementation of a pluggable trait.
+///
+/// Atomic targets use ordinary methods. A target marked
+/// `#[context(Sleepable)]` uses `async fn` declarations; the generated trait
+/// lowers them to the object-safe [`crate::StructOpsFuture`] ABI.
 #[macro_export]
 macro_rules! struct_ops {
+    ($(
+        $(#[doc = $tdoc:literal])*
+        #[target($target:literal)]
+        #[version($version:literal)]
+        #[context(Sleepable)]
+        #[cap($cap:ident)]
+        #[install($install:ident)]
+        #[desc($descname:ident)]
+        #[adapter($adapter:ident)]
+        #[builder($builder:ident)]
+        #[commit($commit:path)]
+        #[detach($detach:path)]
+        $(#[optional($($optm:ident),* $(,)?)])?
+        $vis:vis trait $trait_name:ident {
+            $(
+                $(#[doc = $mdoc:literal])*
+                #[fallback($fallback:path)]
+                #[validate($result:path)]
+                #[fuel($fuel:expr)]
+                #[kfuncs($($kfunc:expr),* $(,)?) ]
+                async fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
+            )*
+        }
+    )*) => {
+        $crate::__sleepable_struct_ops_impl! {$(
+            $(#[doc = $tdoc])*
+            #[target($target)]
+            #[version($version)]
+            #[cap($cap)]
+            #[install($install)]
+            #[desc($descname)]
+            #[adapter($adapter)]
+            #[builder($builder)]
+            #[commit($commit)]
+            #[detach($detach)]
+            $(#[optional($($optm),*)])?
+            $vis trait $trait_name {
+                $(
+                    $(#[doc = $mdoc])*
+                    #[fallback($fallback)]
+                    #[validate($result)]
+                    #[fuel($fuel)]
+                    #[kfuncs($($kfunc),*)]
+                    async fn $method(&self $(, $pname : $pty)*) -> $mret;
+                )*
+            }
+        )*}
+    };
+
     ($(
         $(#[doc = $tdoc:literal])*
         #[target($target:literal)]
@@ -589,6 +708,7 @@ macro_rules! struct_ops {
                 target_id: $crate::structops::fnv1a64($target),
                 version: $version,
                 cap: $crate::reexport::CapKind::$cap,
+                context: $crate::verifier::Context::Atomic,
                 methods: &[$(
                     $crate::structops::MethodDesc {
                         name: stringify!($method),
@@ -692,17 +812,24 @@ macro_rules! struct_ops {
         #[derive(Debug)]
         $vis struct $adapter {
             progs: $crate::structops::ProgSet,
+            state: $crate::runtime::Arc<$crate::structops::AttachmentState>,
         }
 
         impl $adapter {
-            fn new(progs: $crate::structops::ProgSet) -> Self {
-                Self { progs }
+            fn new(
+                progs: $crate::structops::ProgSet,
+                state: $crate::runtime::Arc<$crate::structops::AttachmentState>,
+            ) -> Self {
+                Self { progs, state }
             }
         }
 
         impl $trait_name for $adapter {
             $(
                 fn $method(&self $(, $pname: $pty)*) -> $mret {
+                    if !self.state.admit() {
+                        return $fallback($($pname),*);
+                    }
                     const _: () = {
                         let arity = 0usize $(+ { let _ = stringify!($pname); 1 })*;
                         assert!(arity <= $crate::interp::MAX_CTX_WORDS);
@@ -752,8 +879,267 @@ macro_rules! struct_ops {
             let set = builder.into_set();
             // Complete every allocation before the transaction permit is
             // acquired and before the subsystem publishes anything.
-            let adapter = $crate::runtime::Arc::new($adapter::new(set.clone()));
-            let prepared = $crate::structops::prepare_install(&$descname, cap, set)?;
+            let state = $crate::runtime::Arc::new(
+                $crate::structops::AttachmentState::new(),
+            );
+            let adapter = $crate::runtime::Arc::new(
+                $adapter::new(set.clone(), state.clone()),
+            );
+            let prepared = $crate::structops::prepare_install(
+                &$descname,
+                cap,
+                set,
+                state.clone(),
+            )?;
+            let generation = prepared.generation();
+            $commit(cap, generation, adapter)?;
+            ::core::result::Result::Ok($crate::structops::finish_install(
+                prepared,
+                $detach,
+            ))
+        }
+    )*};
+}
+
+/// Implementation arm for sleepable `struct_ops!` targets.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __sleepable_struct_ops_impl {
+    ($(
+        $(#[doc = $tdoc:literal])*
+        #[target($target:literal)]
+        #[version($version:literal)]
+        #[cap($cap:ident)]
+        #[install($install:ident)]
+        #[desc($descname:ident)]
+        #[adapter($adapter:ident)]
+        #[builder($builder:ident)]
+        #[commit($commit:path)]
+        #[detach($detach:path)]
+        $(#[optional($($optm:ident),* $(,)?)])?
+        $vis:vis trait $trait_name:ident {
+            $(
+                $(#[doc = $mdoc:literal])*
+                #[fallback($fallback:path)]
+                #[validate($result:path)]
+                #[fuel($fuel:expr)]
+                #[kfuncs($($kfunc:expr),* $(,)?) ]
+                async fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
+            )*
+        }
+    )*) => {$ (
+        $(#[doc = $tdoc])*
+        $vis trait $trait_name: Send + Sync + 'static {
+            $(
+                $(#[doc = $mdoc])*
+                fn $method<'a>(
+                    &'a self,
+                    $($pname: $pty),*
+                ) -> $crate::StructOpsFuture<'a, $mret>;
+            )*
+        }
+
+        $vis const $descname: $crate::structops::StructOpsDesc = {
+            const OPTIONAL: &[&str] = &[$($(stringify!($optm)),*)?];
+            $crate::structops::StructOpsDesc {
+                name: stringify!($trait_name),
+                target: $target,
+                target_id: $crate::structops::fnv1a64($target),
+                version: $version,
+                cap: $crate::reexport::CapKind::$cap,
+                context: $crate::verifier::Context::Sleepable,
+                methods: &[$(
+                    $crate::structops::MethodDesc {
+                        name: stringify!($method),
+                        id: $crate::structops::fnv1a32(concat!(
+                            $target,
+                            "::",
+                            stringify!($method),
+                        )),
+                        abi_hash: $crate::structops::fnv1a64(concat!(
+                            $target,
+                            "@",
+                            stringify!($version),
+                            "::async::",
+                            stringify!($method),
+                            "::",
+                            stringify!(fn($($pty),*) -> $mret),
+                        )),
+                        ctx: &[$(<$pty as $crate::structops::BpfCtxArg>::DESC),*],
+                        ret: <$mret as $crate::types::BpfRet>::DESC,
+                        allowed_kfuncs: &[$($kfunc),*],
+                        context: $crate::verifier::Context::Sleepable,
+                        fuel: $fuel,
+                        fallback: stringify!($fallback),
+                        optional: $crate::structops::is_optional(
+                            stringify!($method),
+                            OPTIONAL,
+                        ),
+                    },
+                )*],
+            }
+        };
+
+        const _: () = {
+            #[used]
+            #[link_section = "narf.structops"]
+            static ENTRY: $crate::structops::StructOpsDesc = $descname;
+        };
+
+        /// Target-specific, method-safe program builder.
+        #[derive(Debug, Default)]
+        $vis struct $builder {
+            $($method: ::core::option::Option<$crate::runtime::Arc<$crate::runtime::BpfProg>> ,)*
+        }
+
+        #[allow(dead_code)]
+        impl $builder {
+            /// Start an empty target-specific program set.
+            #[must_use]
+            $vis fn new() -> Self {
+                Self::default()
+            }
+
+            $(
+                #[doc = concat!("Verify and bind `", stringify!($method), "`.")]
+                $vis fn $method(
+                    mut self,
+                    cap: &$crate::reexport::Cap<
+                        $crate::runtime::BpfProgLoad,
+                        $crate::reexport::Grant,
+                    >,
+                    req: $crate::runtime::LoadRequest,
+                ) -> ::core::result::Result<Self, $crate::runtime::LoadError> {
+                    let id = $crate::structops::fnv1a32(concat!(
+                        $target,
+                        "::",
+                        stringify!($method),
+                    ));
+                    let method = $descname
+                        .method(id)
+                        .expect("generated struct_ops method missing from descriptor");
+                    self.$method = ::core::option::Option::Some(
+                        $crate::runtime::BpfProg::load_for_struct_ops(
+                            cap,
+                            req,
+                            method.contract($descname.target_id),
+                        )?,
+                    );
+                    ::core::result::Result::Ok(self)
+                }
+            )*
+
+            fn into_set(self) -> $crate::structops::ProgSet {
+                let mut set = $crate::structops::ProgSet::default();
+                $(
+                    if let ::core::option::Option::Some(prog) = self.$method {
+                        set.bind(
+                            $crate::structops::fnv1a32(concat!(
+                                $target,
+                                "::",
+                                stringify!($method),
+                            )),
+                            prog,
+                        );
+                    }
+                )*
+                set
+            }
+        }
+
+        /// Generated asynchronous Rust adapter used by a subsystem live slot.
+        #[derive(Debug)]
+        $vis struct $adapter {
+            progs: $crate::structops::ProgSet,
+            state: $crate::runtime::Arc<$crate::structops::AttachmentState>,
+        }
+
+        impl $adapter {
+            fn new(
+                progs: $crate::structops::ProgSet,
+                state: $crate::runtime::Arc<$crate::structops::AttachmentState>,
+            ) -> Self {
+                Self { progs, state }
+            }
+        }
+
+        impl $trait_name for $adapter {
+            $(
+                fn $method<'a>(
+                    &'a self,
+                    $($pname: $pty),*
+                ) -> $crate::StructOpsFuture<'a, $mret> {
+                    let admitted = self.state.admit();
+                    const _: () = {
+                        let arity = 0usize $(+ { let _ = stringify!($pname); 1 })*;
+                        assert!(arity <= $crate::interp::MAX_CTX_WORDS);
+                    };
+                    $crate::runtime::Box::pin(async move {
+                        if !admitted {
+                            return $fallback($($pname),*).await;
+                        }
+                        let id = $crate::structops::fnv1a32(concat!(
+                            $target,
+                            "::",
+                            stringify!($method),
+                        ));
+                        let method = $descname
+                            .method(id)
+                            .expect("generated struct_ops method missing from descriptor");
+                        let contract = method.contract($descname.target_id);
+                        #[allow(unused_mut)]
+                        let mut ctx = [0u64; $crate::interp::MAX_CTX_WORDS];
+                        #[allow(unused_mut)]
+                        let mut len = 0usize;
+                        $(
+                            ctx[len] = <$pty as $crate::structops::BpfCtxArg>::encode($pname);
+                            len += 1;
+                        )*
+                        match self.progs.get(id) {
+                            ::core::option::Option::Some(prog) => {
+                                match prog
+                                    .run_struct_ops_sleepable(contract, ctx, len)
+                                    .await
+                                {
+                                    ::core::option::Option::Some(
+                                        $crate::interp::Outcome::Returned(raw),
+                                    ) => match $result(raw) {
+                                        ::core::option::Option::Some(value) => value,
+                                        ::core::option::Option::None => $fallback($($pname),*).await,
+                                    },
+                                    ::core::option::Option::Some(
+                                        $crate::interp::Outcome::Trapped(_),
+                                    ) | ::core::option::Option::None => $fallback($($pname),*).await,
+                                }
+                            }
+                            ::core::option::Option::None => $fallback($($pname),*).await,
+                        }
+                    })
+                }
+            )*
+        }
+
+        #[doc = concat!("Install a contract-bound `", stringify!($trait_name), "` set.")]
+        $vis fn $install<M: $crate::reexport::CapType>(
+            cap: &$crate::reexport::Cap<M, $crate::reexport::Grant>,
+            builder: $builder,
+        ) -> ::core::result::Result<
+            $crate::structops::StructOpsLink,
+            $crate::structops::StructOpsError,
+        > {
+            let set = builder.into_set();
+            let state = $crate::runtime::Arc::new(
+                $crate::structops::AttachmentState::new(),
+            );
+            let adapter = $crate::runtime::Arc::new(
+                $adapter::new(set.clone(), state.clone()),
+            );
+            let prepared = $crate::structops::prepare_install(
+                &$descname,
+                cap,
+                set,
+                state.clone(),
+            )?;
             let generation = prepared.generation();
             $commit(cap, generation, adapter)?;
             ::core::result::Result::Ok($crate::structops::finish_install(

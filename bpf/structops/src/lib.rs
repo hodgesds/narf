@@ -20,6 +20,10 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
+use core::future::Future;
+use core::pin::Pin;
+
 pub mod structops;
 
 /// The `narf-bpf` runtime pieces the `struct_ops!` adapter runs a program
@@ -37,9 +41,16 @@ pub mod types {
 /// Program-loading types used by generated target-specific builders.
 #[doc(hidden)]
 pub mod runtime {
-    pub use alloc::sync::Arc;
+    pub use alloc::{boxed::Box, sync::Arc};
     pub use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadError, LoadRequest};
 }
+
+/// Object-safe return type for a sleepable struct-ops method.
+///
+/// `Send` is load-bearing: NARF's executor may resume the caller on another
+/// CPU after any await. Generated sleepable adapters return this type rather
+/// than hiding an async program behind a synchronous `block_on` bridge.
+pub type StructOpsFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Verifier enums used in generated descriptors.
 #[doc(hidden)]

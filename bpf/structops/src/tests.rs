@@ -4,7 +4,8 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::task::{Context as TaskContext, Poll, Waker};
 
 use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadError, LoadMetadata, LoadRequest};
 use narf_bpf_isa::encode::encode;
@@ -93,6 +94,53 @@ fn validate_init(raw: u64) -> Option<i32> {
     i32::try_from(raw).ok()
 }
 
+static SLEEPABLE_GUARDS_DROPPED: AtomicUsize = AtomicUsize::new(0);
+static SLEEPABLE_ENTERED_BPF: AtomicBool = AtomicBool::new(false);
+static SLEEPABLE_RESUMED_BPF: AtomicBool = AtomicBool::new(false);
+
+struct SleepableCallGuard;
+
+impl Drop for SleepableCallGuard {
+    fn drop(&mut self) {
+        SLEEPABLE_GUARDS_DROPPED.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+narf_bpf::kfunc! {
+    /// Multi-poll kfunc used to prove struct-ops cancellation and confinement.
+    pub async fn narf_structops_test_suspend(n: u32) -> u64 {
+        let _guard = SleepableCallGuard;
+        SLEEPABLE_ENTERED_BPF.store(
+            narf_lib::assert::current_domain() == narf_lib::id::DomainId::BPF,
+            Ordering::Release,
+        );
+        narf_bpf::interp::yield_now().await;
+        SLEEPABLE_RESUMED_BPF.store(
+            narf_lib::assert::current_domain() == narf_lib::id::DomainId::BPF,
+            Ordering::Release,
+        );
+        narf_bpf::interp::yield_now().await;
+        u64::from(n)
+    }
+}
+
+async fn fallback_sleepable(value: u64) -> u32 {
+    value as u32 + 40
+}
+
+fn validate_sleepable(raw: u64) -> Option<u32> {
+    let value = u32::try_from(raw).ok()?;
+    (value <= 10).then_some(value)
+}
+
+async fn fallback_sleepable_optional() -> u32 {
+    55
+}
+
+fn validate_sleepable_optional(raw: u64) -> Option<u32> {
+    u32::try_from(raw).ok()
+}
+
 crate::struct_ops! {
     /// Test target covering typed construction, lifecycle, and fallback.
     #[target("narf.test.DemoGovernor")]
@@ -122,6 +170,36 @@ crate::struct_ops! {
     }
 }
 
+crate::struct_ops! {
+    /// Test target for future-returning, process-context struct ops.
+    #[target("narf.test.SleepableDemo")]
+    #[version(1)]
+    #[context(Sleepable)]
+    #[cap(IdleGovernor)]
+    #[install(install_bpf_sleepable_demo)]
+    #[desc(SLEEPABLE_DEMO_OPS)]
+    #[adapter(BpfSleepableDemo)]
+    #[builder(BpfSleepableDemoPrograms)]
+    #[commit(commit_sleepable_demo)]
+    #[detach(detach_sleepable_demo)]
+    #[optional(optional_value)]
+    pub trait SleepableDemo {
+        /// Suspend twice and return a validated value.
+        #[fallback(fallback_sleepable)]
+        #[validate(validate_sleepable)]
+        #[fuel(32)]
+        #[kfuncs(narf_bpf::kfunc::id_for("narf_structops_test_suspend"))]
+        async fn compute(&self, value: u64) -> u32;
+
+        /// Exercise an asynchronous native fallback for an omitted method.
+        #[fallback(fallback_sleepable_optional)]
+        #[validate(validate_sleepable_optional)]
+        #[fuel(16)]
+        #[kfuncs()]
+        async fn optional_value(&self) -> u32;
+    }
+}
+
 struct NativeDemoGovernor;
 
 impl DemoGovernor for NativeDemoGovernor {
@@ -144,6 +222,14 @@ struct LiveEntry {
 }
 
 static LIVE_GOVERNOR: narf_lib::sync::IrqSafeSpinLock<Option<LiveEntry>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+struct SleepableLiveEntry {
+    generation: u64,
+    ops: Arc<dyn SleepableDemo>,
+}
+
+static LIVE_SLEEPABLE: narf_lib::sync::IrqSafeSpinLock<Option<SleepableLiveEntry>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn commit_demo_governor<M: CapType>(
@@ -178,6 +264,42 @@ fn detach_demo_governor(generation: u64) -> bool {
     };
     drop(old);
     true
+}
+
+fn commit_sleepable_demo<M: CapType>(
+    cap: &Cap<M, Grant>,
+    generation: u64,
+    ops: Arc<BpfSleepableDemo>,
+) -> Result<(), crate::structops::StructOpsError> {
+    cap.check_live()?;
+    let old = LIVE_SLEEPABLE
+        .lock()
+        .replace(SleepableLiveEntry { generation, ops });
+    drop(old);
+    Ok(())
+}
+
+fn detach_sleepable_demo(generation: u64) -> bool {
+    let old = {
+        let mut slot = LIVE_SLEEPABLE.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            slot.take()
+        } else {
+            return false;
+        }
+    };
+    drop(old);
+    true
+}
+
+fn live_sleepable() -> Option<Arc<dyn SleepableDemo>> {
+    LIVE_SLEEPABLE
+        .lock()
+        .as_ref()
+        .map(|entry| entry.ops.clone())
 }
 
 fn live_select(expected_idle_ns: u64) -> Option<u32> {
@@ -301,6 +423,11 @@ fn smoke_bpf_structops_generation_prevents_stale_detach() -> TestResult {
     let Ok(first) = first else {
         return TestResult::Fail("first generation failed to install");
     };
+    let stale = LIVE_GOVERNOR
+        .lock()
+        .as_ref()
+        .map(|entry| entry.governor.clone())
+        .expect("first generation was published");
     let second_programs = match BpfDemoGovernorPrograms::new().select_state(
         load_cap(),
         request("demo_two", asm(&[mov_imm(0, 2), EXIT]), Context::Atomic),
@@ -312,6 +439,9 @@ fn smoke_bpf_structops_generation_prevents_stale_detach() -> TestResult {
         Ok(link) => link,
         Err(_) => return TestResult::Fail("second generation failed to install"),
     };
+    if stale.select_state(0) != 11 {
+        return TestResult::Fail("replaced adapter admitted new BPF work");
+    }
     drop(first);
     if live_select(0) != Some(2) {
         return TestResult::Fail("stale link detached its replacement");
@@ -456,7 +586,7 @@ fn smoke_bpf_structops_rejects_generic_and_sleepable_programs() -> TestResult {
         load_cap(),
         request("sleepable", asm(&[mov_imm(0, 1), EXIT]), Context::Sleepable),
     ) {
-        Err(LoadError::StructOpsRequiresAtomic) => {}
+        Err(LoadError::StructOpsContextMismatch) => {}
         _ => return TestResult::Fail("sleepable program loaded for an atomic target"),
     }
     TestResult::Pass
@@ -560,4 +690,150 @@ fn smoke_bpf_structops_optional_method_uses_declared_fallback() -> TestResult {
 kernel_test_in!(
     "bpf/structops",
     smoke_bpf_structops_optional_method_uses_declared_fallback
+);
+
+fn sleepable_program(name: &str, value: i32) -> LoadRequest {
+    request(
+        name,
+        asm(&[
+            mov_imm(1, value),
+            Decoded::Call(CallTarget::Kfunc(narf_bpf::kfunc::id_for(
+                "narf_structops_test_suspend",
+            ))),
+            EXIT,
+        ]),
+        Context::Sleepable,
+    )
+}
+
+fn assert_send<T: Send>(_: &T) {}
+
+fn smoke_bpf_sleepable_structops_detach_preserves_inflight() -> TestResult {
+    SLEEPABLE_ENTERED_BPF.store(false, Ordering::Release);
+    SLEEPABLE_RESUMED_BPF.store(false, Ordering::Release);
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let programs = match BpfSleepableDemoPrograms::new()
+        .compute(load_cap(), sleepable_program("sleepable_detach", 2))
+    {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("sleepable method-specific load was rejected"),
+    };
+    let link = match install_bpf_sleepable_demo(&cap, programs) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("sleepable target failed to install"),
+    };
+    if SLEEPABLE_DEMO_OPS.context != Context::Sleepable
+        || SLEEPABLE_DEMO_OPS
+            .methods
+            .iter()
+            .any(|method| method.context != Context::Sleepable)
+    {
+        return TestResult::Fail("sleepable target descriptor lost its context");
+    }
+
+    let Some(ops) = live_sleepable() else {
+        return TestResult::Fail("sleepable adapter was not published");
+    };
+    if narf_bpf::interp::drive(ops.optional_value()) != 55 {
+        return TestResult::Fail("sleepable optional fallback was not awaited");
+    }
+
+    let mut future: crate::StructOpsFuture<'_, u32> = ops.compute(99);
+    assert_send(&future);
+    let neutral = narf_lib::assert::current_domain();
+    let mut cx = TaskContext::from_waker(Waker::noop());
+    if future.as_mut().poll(&mut cx) != Poll::Pending {
+        return TestResult::Fail("multi-poll struct op completed on its first poll");
+    }
+    if narf_lib::assert::current_domain() != neutral
+        || !SLEEPABLE_ENTERED_BPF.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("first pending leaked or skipped BPF confinement");
+    }
+
+    link.close();
+    if live_sleepable().is_some() || crate::structops::is_installed("SleepableDemo") {
+        return TestResult::Fail("closed sleepable link still admitted new live calls");
+    }
+    if narf_bpf::interp::drive(ops.compute(99)) != 139 {
+        return TestResult::Fail("retained adapter admitted a new call after link close");
+    }
+    if future.as_mut().poll(&mut cx) != Poll::Pending {
+        return TestResult::Fail("in-flight invocation did not reach its second suspension");
+    }
+    if narf_lib::assert::current_domain() != neutral
+        || !SLEEPABLE_RESUMED_BPF.load(Ordering::Acquire)
+    {
+        return TestResult::Fail("resume leaked or skipped BPF confinement");
+    }
+    if future.as_mut().poll(&mut cx) != Poll::Ready(2) {
+        return TestResult::Fail("detached in-flight invocation did not finish normally");
+    }
+    if narf_lib::assert::current_domain() != neutral {
+        return TestResult::Fail("completed invocation leaked BPF confinement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_sleepable_structops_detach_preserves_inflight
+);
+
+fn smoke_bpf_sleepable_structops_drop_cancels_invocation() -> TestResult {
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let programs = match BpfSleepableDemoPrograms::new()
+        .compute(load_cap(), sleepable_program("sleepable_cancel", 7))
+    {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("cancellation program failed to load"),
+    };
+    let link = match install_bpf_sleepable_demo(&cap, programs) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("cancellation program failed to install"),
+    };
+    let Some(ops) = live_sleepable() else {
+        return TestResult::Fail("cancellation adapter was not published");
+    };
+    let before = SLEEPABLE_GUARDS_DROPPED.load(Ordering::Acquire);
+    let mut future = ops.compute(0);
+    let mut cx = TaskContext::from_waker(Waker::noop());
+    if future.as_mut().poll(&mut cx) != Poll::Pending {
+        return TestResult::Fail("cancellation target did not suspend");
+    }
+    drop(future);
+    if SLEEPABLE_GUARDS_DROPPED.load(Ordering::Acquire) != before + 1 {
+        return TestResult::Fail("dropping the invocation did not cancel its kfunc future");
+    }
+    drop(link);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_sleepable_structops_drop_cancels_invocation
+);
+
+fn smoke_bpf_sleepable_structops_validates_before_return() -> TestResult {
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let programs = match BpfSleepableDemoPrograms::new()
+        .compute(load_cap(), sleepable_program("sleepable_invalid", 12))
+    {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("invalid-result program failed to load"),
+    };
+    let link = match install_bpf_sleepable_demo(&cap, programs) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("invalid-result program failed to install"),
+    };
+    let Some(ops) = live_sleepable() else {
+        return TestResult::Fail("invalid-result adapter was not published");
+    };
+    if narf_bpf::interp::drive(ops.compute(3)) != 43 {
+        return TestResult::Fail("invalid sleepable result bypassed its async fallback");
+    }
+    drop(link);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_sleepable_structops_validates_before_return
 );

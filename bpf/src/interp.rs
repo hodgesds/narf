@@ -82,7 +82,7 @@ use narf_bpf_verifier::kfunc::Context;
 use narf_bpf_verifier::{SubprogInfo, TypedLoadSite};
 
 use crate::kfunc::{KfuncShim, Registry};
-use crate::mem::StackFrame;
+use crate::mem::{HeapStack, StackFrame, VmStack};
 
 /// A typed-probe program's authoritative field source.
 ///
@@ -334,13 +334,16 @@ pub struct VmProgram<'a> {
 }
 
 /// The virtual machine.
-pub struct Vm<'a> {
+pub struct Vm<'a, S = StackFrame<'a>>
+where
+    S: VmStack,
+{
     regs: [u64; 11],
     fuel: u64,
     insns: &'a [Insn],
     ctx: [u64; MAX_CTX_WORDS],
     ctx_len: usize,
-    stack: StackFrame<'a>,
+    stack: S,
     /// Active subprogram frames, innermost last.
     ///
     /// A fixed array, not a `Vec`: [`MAX_CALL_FRAMES`] is a compile-time
@@ -423,7 +426,14 @@ pub struct Vm<'a> {
     steps: u64,
 }
 
-impl core::fmt::Debug for Vm<'_> {
+// SAFETY: a `Vm<HeapStack>` owns its movable stack, and every borrowed program
+// input is immutable or uniquely borrowed and Send. The sole non-Send field
+// shape is `typed_probe`; it is always `None` for this specialization because
+// `with_typed_probe` exists only for `Vm<StackFrame>`. Fields are private, so
+// no caller can violate that construction invariant.
+unsafe impl Send for Vm<'_, HeapStack> {}
+
+impl<S: VmStack> core::fmt::Debug for Vm<'_, S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Vm")
             .field("fuel", &self.fuel)
@@ -434,14 +444,14 @@ impl core::fmt::Debug for Vm<'_> {
     }
 }
 
-impl<'a> Vm<'a> {
+impl<'a, S: VmStack> Vm<'a, S> {
     /// Build a VM over a verified instruction image.
     #[must_use]
     pub fn new(
         prog: VmProgram<'a>,
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
-        stack: StackFrame<'a>,
+        stack: S,
         registry: &'static Registry,
     ) -> Self {
         let VmProgram {
@@ -508,23 +518,6 @@ impl<'a> Vm<'a> {
     #[must_use]
     pub fn with_packet_region(mut self, bytes: &'a mut [u8]) -> Self {
         self.packet_region = Some(bytes);
-        self
-    }
-
-    /// Bind the live tracing wrapper and the certified typed-load sites a
-    /// typed-probe program reads its declared fields from.
-    ///
-    /// Without this a certified typed load has no wrapper to read through and
-    /// traps — fail-closed, the same shape as an unbound arena. The sites are
-    /// the verifier's, so the interpreter services exactly the loads the
-    /// verifier admitted and no others.
-    #[must_use]
-    pub fn with_typed_probe(
-        mut self,
-        wrapper: &'a narf_tracing::TypedProbeRef,
-        sites: &'a [TypedLoadSite],
-    ) -> Self {
-        self.typed_probe = Some(TypedProbe { wrapper, sites });
         self
     }
 
@@ -1739,6 +1732,25 @@ impl<'a> Vm<'a> {
     }
 }
 
+impl<'a> Vm<'a, StackFrame<'a>> {
+    /// Bind the live tracing wrapper and the certified typed-load sites a
+    /// typed-probe program reads its declared fields from.
+    ///
+    /// This method deliberately exists only on the CPU-local stack
+    /// specialization. A typed probe borrows an atomic callback object that is
+    /// not `Sync`; preventing it from entering `Vm<HeapStack>` is the invariant
+    /// that makes the sleepable VM future safely `Send`.
+    #[must_use]
+    pub fn with_typed_probe(
+        mut self,
+        wrapper: &'a narf_tracing::TypedProbeRef,
+        sites: &'a [TypedLoadSite],
+    ) -> Self {
+        self.typed_probe = Some(TypedProbe { wrapper, sites });
+        self
+    }
+}
+
 // ── pure ALU helpers ────────────────────────────────────────────────
 
 #[inline]
@@ -1924,12 +1936,11 @@ fn byteswap(v: u64, order: ByteOrder, width: u8) -> u64 {
 
 /// Drive a future to completion on the current thread with a no-op waker.
 ///
-/// Legal here — and only here — because the interpreter's *only* await point
-/// is [`YieldNow`], which wakes itself before returning `Pending`. There is no
-/// external event to wait on, so this loop always terminates and never blocks
-/// a CPU on something that will not happen. A real sleepable kfunc that parks
-/// on I/O would need a real executor task instead; that is the Phase-2
-/// question recorded in `bpf/specification/spec.md` §8.
+/// Legal only for a future whose await points are known to self-wake, such as
+/// the built-in yield kfuncs and their kernel tests. A sleepable kfunc that
+/// parks on I/O must run through the executor; spinning it here would prevent
+/// the completion event from making progress. Generated sleepable struct-ops
+/// adapters expose a future and never call this helper.
 pub fn drive<F: Future>(fut: F) -> F::Output {
     use core::task::{RawWaker, RawWakerVTable, Waker};
 

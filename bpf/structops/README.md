@@ -7,7 +7,8 @@ crate carries the `struct_ops!` extension macro, the descriptors that macro
 emits describing each pluggable trait and its methods, and the
 capability-gated registry that validates and installs a verified set of
 programs against one of those traits. Installation returns a generation-tagged
-owning link; dropping it detaches the corresponding live implementation.
+owning link; dropping it detaches the corresponding live implementation and
+closes its invocation-admission gate.
 
 ## Why it is its own crate
 
@@ -35,6 +36,13 @@ through `BpfCtxArg` and results through `BpfRet`, so the Rust signature is the
 verifier contract without admitting raw kernel pointers or a generic physical
 memory translation surface.
 
+Atomic targets declare ordinary trait methods. A whole target can instead add
+`#[context(Sleepable)]` and declare `async fn` methods. Those declarations are
+lowered to the object-safe `StructOpsFuture<'a, T>` ABI, and the adapter awaits
+an interpreted, heap-stack-backed BPF invocation. The future is `Send`, retains
+its VM state and fuel across polls, and restores BPF domain rights before every
+`Pending`. There is intentionally no generated synchronous wrapper.
+
 ## Relationships and no_std
 
 This crate depends on the parent `narf-bpf` runtime (for the interpreter entry
@@ -45,5 +53,5 @@ offer `struct_ops` policies depend on it rather than on `narf-bpf`. It is
 through `narf-kernel-test`; because those smokes must assemble the BPF programs
 they load, the feature also pulls in the ISA assembly helpers from `bpf/isa`.
 
-The hardening contract and the separate requirements for future sleepable
-targets are recorded in [`DESIGN.md`](DESIGN.md).
+The hardening contract and the requirements enforced by sleepable targets are
+recorded in [`DESIGN.md`](DESIGN.md).
