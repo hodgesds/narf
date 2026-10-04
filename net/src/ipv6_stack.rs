@@ -715,7 +715,17 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
             Some(t) => t,
             None => return true, // got the fragment, waiting for more
         };
-        return dispatch_l4(iface, ip.src_ip, ip.dst_ip, ip.hop_limit, next_nh, &body);
+        return dispatch_l4(
+            iface,
+            ip.src_ip,
+            ip.dst_ip,
+            crate::udp_sock::RxIpMeta {
+                ttl: ip.hop_limit,
+                tos: ip.traffic_class,
+            },
+            next_nh,
+            &body,
+        );
     }
     let l4 = match skip_extension_headers(nh, payload) {
         Some(l) => l,
@@ -725,7 +735,10 @@ pub fn rx_frame(iface: &str, frame_after_eth: &[u8]) -> bool {
         iface,
         ip.src_ip,
         ip.dst_ip,
-        ip.hop_limit,
+        crate::udp_sock::RxIpMeta {
+            ttl: ip.hop_limit,
+            tos: ip.traffic_class,
+        },
         l4.proto,
         &payload[l4.offset..],
     )
@@ -735,13 +748,13 @@ fn dispatch_l4(
     iface: &str,
     src_ip: [u8; 16],
     dst_ip: [u8; 16],
-    hop_limit: u8,
+    meta: crate::udp_sock::RxIpMeta,
     proto: u8,
     l4: &[u8],
 ) -> bool {
     match proto {
         NEXT_HEADER_ICMPV6 => handle_icmp6(iface, src_ip, dst_ip, l4),
-        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, hop_limit, l4),
+        NEXT_HEADER_UDP => handle_udp6(iface, src_ip, dst_ip, meta, l4),
         NEXT_HEADER_TCP => handle_tcp6(iface, src_ip, dst_ip, l4),
         _ => false,
     }
@@ -765,7 +778,7 @@ fn handle_udp6(
     iface: &str,
     src_ip: [u8; 16],
     dst_ip: [u8; 16],
-    hop_limit: u8,
+    meta: crate::udp_sock::RxIpMeta,
     datagram: &[u8],
 ) -> bool {
     const UDP_HDR_LEN: usize = 8;
@@ -794,7 +807,7 @@ fn handle_udp6(
             )
         })
         .unwrap_or((0, 0));
-    crate::udp_sock::user_deliver_with_hop_limit(
+    crate::udp_sock::user_deliver(
         net_ns_id,
         &src_ip,
         src_port,
@@ -802,7 +815,7 @@ fn handle_udp6(
         dst_port,
         &datagram[UDP_HDR_LEN..],
         ifindex,
-        hop_limit,
+        meta,
     );
     true
 }

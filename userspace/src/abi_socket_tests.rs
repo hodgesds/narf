@@ -10677,3 +10677,187 @@ fn check_newaddr_flags(msg: &[u8]) -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+/// IPv4 receive control messages, `ip_cmsg_recv_offset`
+/// (net/ipv4/ip_sockglue.c): with IP_PKTINFO, IP_RECVTTL, IP_RECVTOS and
+/// IP_RECVORIGDSTADDR set, recvmsg on a UDP socket returns, in this order,
+/// `IP_PKTINFO` (struct in_pktinfo: arrival ifindex, `fib_compute_spec_dst`,
+/// header daddr), `IP_TTL` (int), `IP_TOS` (one byte) and `IP_ORIGDSTADDR`
+/// (sockaddr_in of daddr:dport) — for unicast loopback and for the
+/// IP_MULTICAST_LOOP copy of a multicast send alike. With none of them set
+/// there is no control data. avahi-daemon asserts it got IP_PKTINFO on every
+/// packet (`avahi_recv_dns_packet_ipv4`); NARF returned no IPv4 control data
+/// at all, so avahi aborted on its first mDNS packet.
+fn smoke_abi_inet_dgram_recvmsg_ip_cmsgs() -> TestResult {
+    const IP_TOS: u64 = 1;
+    const IP_RECVTOS: u64 = 13;
+    const IP_RECVORIGDSTADDR: u64 = 20;
+    const IP_ORIGDSTADDR: i32 = 20;
+    const SOL_IP: i32 = 0;
+    /// `(cmsg_level, cmsg_type, data)` of each received control message.
+    type Cmsgs = alloc::vec::Vec<(i32, i32, alloc::vec::Vec<u8>)>;
+    fn sin(ip: [u8; 4], port: u16) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+        buf[2..4].copy_from_slice(&port.to_be_bytes());
+        buf[4..8].copy_from_slice(&ip);
+        buf
+    }
+    fn udp_bound(ip: [u8; 4], port: u16) -> Result<u64, &'static str> {
+        let fd = match call(Syscall::SocketOpen.raw(), a2(AF_INET, SOCK_DGRAM, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_INET, SOCK_DGRAM) failed"),
+        };
+        let addr = sin(ip, port);
+        if call(Syscall::SocketBind.raw(), a2(fd, addr.as_ptr() as u64, 16)) != Some(0) {
+            return Err("bind() of a UDP socket failed");
+        }
+        Ok(fd)
+    }
+    fn send_to(fd: u64, payload: &[u8], to: &[u8; 16]) -> Result<(), &'static str> {
+        let sent = call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: to.as_ptr() as u64,
+                arg5: 16,
+                ..SyscallArgs::default()
+            },
+        );
+        if sent != Some(payload.len() as i64) {
+            return Err("sendto of a UDP datagram failed");
+        }
+        Ok(())
+    }
+    /// recvmsg one datagram; returns `(level, type, data)` per cmsg.
+    fn recv_cmsgs(fd: u64) -> Result<Cmsgs, &'static str> {
+        let mut data = [0u8; 64];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 256];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        const MSG_DONTWAIT: u64 = 0x40;
+        match call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd, msg.as_ptr() as u64, MSG_DONTWAIT),
+        ) {
+            Some(n) if n >= 0 => {}
+            _ => return Err("recvmsg of the datagram failed"),
+        }
+        let controllen = u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize;
+        if u32::from_ne_bytes(msg[48..52].try_into().unwrap()) & 0x8 != 0 {
+            return Err("recvmsg set MSG_CTRUNC with a 256-byte control buffer");
+        }
+        let mut out = alloc::vec::Vec::new();
+        let mut at = 0usize;
+        while at + 16 <= controllen {
+            let len = u64::from_ne_bytes(ctrl[at..at + 8].try_into().unwrap()) as usize;
+            let level = i32::from_ne_bytes(ctrl[at + 8..at + 12].try_into().unwrap());
+            let kind = i32::from_ne_bytes(ctrl[at + 12..at + 16].try_into().unwrap());
+            if len < 16 || at + len > controllen {
+                return Err("recvmsg returned a malformed cmsghdr");
+            }
+            out.push((level, kind, ctrl[at + 16..at + len].to_vec()));
+            at += (len + 7) & !7;
+        }
+        Ok(out)
+    }
+    fn expect(
+        got: &[(i32, i32, alloc::vec::Vec<u8>)],
+        ifindex: i32,
+        spec_dst: [u8; 4],
+        daddr: [u8; 4],
+        ttl: i32,
+        tos: u8,
+        dport: u16,
+    ) -> Result<(), &'static str> {
+        let mut pktinfo = alloc::vec::Vec::new();
+        pktinfo.extend_from_slice(&ifindex.to_ne_bytes());
+        pktinfo.extend_from_slice(&spec_dst);
+        pktinfo.extend_from_slice(&daddr);
+        let want: [(i32, i32, alloc::vec::Vec<u8>); 4] = [
+            (SOL_IP, so::IP_PKTINFO as i32, pktinfo),
+            (SOL_IP, so::IP_TTL as i32, ttl.to_ne_bytes().to_vec()),
+            (SOL_IP, IP_TOS as i32, alloc::vec![tos]),
+            (SOL_IP, IP_ORIGDSTADDR, sin(daddr, dport).to_vec()),
+        ];
+        if got.len() != want.len() {
+            return Err(
+                "recvmsg did not return exactly IP_PKTINFO, IP_TTL, IP_TOS, IP_ORIGDSTADDR",
+            );
+        }
+        for (g, w) in got.iter().zip(want.iter()) {
+            if g.0 != w.0 || g.1 != w.1 {
+                return Err("IPv4 control messages are not in ip_cmsg_recv_offset's order");
+            }
+            if g.2 != w.2 {
+                return Err("an IPv4 control message's payload differs from Linux's");
+            }
+        }
+        Ok(())
+    }
+    with_setup(|| {
+        narf_net::iface::register_loopback_iface();
+        let lo = [127, 0, 0, 1];
+        let rx = udp_bound([0, 0, 0, 0], 47331)?;
+        let tx = udp_bound(lo, 47332)?;
+        // Closing both drops the 224.0.0.251 membership on lo, as on
+        // Linux; later tests expect that group unjoined.
+        let result = (|| -> Result<(), &'static str> {
+            // No receive option set: no control data at all.
+            send_to(tx, b"plain", &sin(lo, 47331))?;
+            if !recv_cmsgs(rx)?.is_empty() {
+                return Err("recvmsg returned IPv4 control data nobody asked for");
+            }
+
+            for opt in [
+                so::IP_PKTINFO,
+                so::IP_RECVTTL,
+                IP_RECVTOS,
+                IP_RECVORIGDSTADDR,
+            ] {
+                if sockopt_set_int(rx, so::IPPROTO_IP, opt, 1)? != 0 {
+                    return Err("enabling an IPv4 receive option failed");
+                }
+            }
+            if sockopt_set_int(tx, so::IPPROTO_IP, so::IP_TTL, 37)? != 0
+                || sockopt_set_int(tx, so::IPPROTO_IP, IP_TOS, 0x10)? != 0
+            {
+                return Err("setting the sender's IP_TTL / IP_TOS failed");
+            }
+
+            // Unicast over loopback: ifindex 1, spec_dst = daddr (RTCF_LOCAL).
+            send_to(tx, b"unicast", &sin(lo, 47331))?;
+            expect(&recv_cmsgs(rx)?, 1, lo, lo, 37, 0x10, 47331)?;
+
+            // The IP_MULTICAST_LOOP copy of an mDNS send on lo: ifindex 1,
+            // daddr the group, TTL the multicast TTL.
+            let group = so::MDNS_V4.to_be_bytes();
+            let mut mreqn = [0u8; 12];
+            mreqn[0..4].copy_from_slice(&group);
+            mreqn[8..12].copy_from_slice(&1i32.to_ne_bytes());
+            if sockopt_set(rx, so::IPPROTO_IP, so::IP_ADD_MEMBERSHIP, &mreqn)? != 0 {
+                return Err("IP_ADD_MEMBERSHIP for 224.0.0.251 on lo failed");
+            }
+            if sockopt_set(tx, so::IPPROTO_IP, so::IP_MULTICAST_IF, &mreqn)? != 0
+                || sockopt_set_int(tx, so::IPPROTO_IP, so::IP_MULTICAST_TTL, 255)? != 0
+            {
+                return Err("setting the sender's IP_MULTICAST_IF / IP_MULTICAST_TTL failed");
+            }
+            send_to(tx, b"mdns", &sin(group, 47331))?;
+            expect(&recv_cmsgs(rx)?, 1, lo, group, 255, 0x10, 47331)?;
+            Ok(())
+        })();
+        let _ = call(Syscall::Close.raw(), a0(rx));
+        let _ = call(Syscall::Close.raw(), a0(tx));
+        result
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_inet_dgram_recvmsg_ip_cmsgs);
