@@ -4155,23 +4155,6 @@ impl MountNamespace {
             .collect()
     }
 
-    /// `(path, fs name, mount options, super options)` for every mount —
-    /// the two option fields `/proc/mounts` concatenates into its fourth
-    /// column.
-    pub fn list_with_options(&self) -> Vec<(String, String, String, String)> {
-        let q = self.store().inner.lock();
-        q.iter()
-            .map(|m| {
-                (
-                    m.path.clone(),
-                    String::from(m.fs.name()),
-                    mnt_flags::render(m.effective_flags()),
-                    m.fs.show_options(),
-                )
-            })
-            .collect()
-    }
-
     /// The `MNT_*` flags of the mount covering `abs`, by the same
     /// longest-prefix rule resolution uses, or `None` when no mount covers
     /// it.
@@ -4859,30 +4842,6 @@ impl VfsRegistry {
         let q = self.inner.lock();
         q.iter()
             .map(|m| (m.path.clone(), alloc::string::String::from(m.fs.name())))
-            .collect()
-    }
-
-    /// `(path, fs name, mount options, super options)` for every mount in
-    /// this namespace.
-    #[allow(clippy::type_complexity)]
-    pub fn list_with_options(
-        &self,
-    ) -> alloc::vec::Vec<(
-        alloc::string::String,
-        alloc::string::String,
-        alloc::string::String,
-        alloc::string::String,
-    )> {
-        let q = self.inner.lock();
-        q.iter()
-            .map(|m| {
-                (
-                    m.path.clone(),
-                    alloc::string::String::from(m.fs.name()),
-                    mnt_flags::render(m.effective_flags()),
-                    m.fs.show_options(),
-                )
-            })
             .collect()
     }
 

@@ -631,10 +631,15 @@ fn render_mountinfo(pid: u64) -> String {
             let mnt_opts = it.next().unwrap_or("rw");
             let sb_opts = it.next().unwrap_or("");
             let super_flags = it.next().unwrap_or("rw");
-            let _ = writeln!(
-                s,
-                "{} {} 0:1 / {} {} - {} {} {}{}",
-                id, parent, path, mnt_opts, fs_name, fs_name, super_flags, sb_opts
+            push_mountinfo_row(
+                &mut s,
+                id,
+                parent,
+                path,
+                mnt_opts,
+                fs_name,
+                super_flags,
+                sb_opts,
             );
         }
         if s.is_empty() {
@@ -646,10 +651,15 @@ fn render_mountinfo(pid: u64) -> String {
     for (id, parent, path, fs_name, mnt_opts, sb_opts, super_flags) in
         crate::registry().list_mountinfo()
     {
-        let _ = writeln!(
-            s,
-            "{} {} 0:1 / {} {} - {} {} {}{}",
-            id, parent, path, mnt_opts, fs_name, fs_name, super_flags, sb_opts
+        push_mountinfo_row(
+            &mut s,
+            &id.to_string(),
+            &parent.to_string(),
+            &path,
+            &mnt_opts,
+            &fs_name,
+            &super_flags,
+            &sb_opts,
         );
     }
     if s.is_empty() {
@@ -657,6 +667,32 @@ fn render_mountinfo(pid: u64) -> String {
         let _ = writeln!(s, "1 0 0:1 / / rw - rootfs rootfs rw");
     }
     s
+}
+
+/// One `show_mountinfo` row. The mount point is escaped with
+/// `seq_path_root`'s set and the fstype / source with `mangle()`'s
+/// (`fs/proc_namespace.c`); the filesystem name stands in for the source
+/// (`none` when absent, as for a NULL `mnt_devname`).
+#[allow(clippy::too_many_arguments)]
+fn push_mountinfo_row(
+    s: &mut String,
+    id: &str,
+    parent: &str,
+    path: &str,
+    mnt_opts: &str,
+    fs_name: &str,
+    super_flags: &str,
+    sb_opts: &str,
+) {
+    use super::{mangle_into, MANGLE_NAME, MANGLE_PATH};
+    let _ = write!(s, "{} {} 0:1 / ", id, parent);
+    mangle_into(s, path, MANGLE_PATH);
+    let _ = write!(s, " {} - ", mnt_opts);
+    mangle_into(s, fs_name, MANGLE_NAME);
+    s.push(' ');
+    let source = if fs_name.is_empty() { "none" } else { fs_name };
+    mangle_into(s, source, MANGLE_NAME);
+    let _ = writeln!(s, " {}{}", super_flags, sb_opts);
 }
 
 /// `/proc/<pid>/mountstats` — per-task mount stats.
@@ -681,18 +717,13 @@ fn render_mountstats(_pid: u64) -> String {
 
 /// `/proc/<pid>/mounts` — the task's mount table (fstab-style rows).
 ///
-/// Linux ref: `fs/proc_namespace.c:show_vfsmnt`. Same content as the
-/// global /proc/mounts; each row is
+/// Linux ref: `fs/proc_namespace.c:show_vfsmnt`. Same rows as
+/// /proc/mounts, for this task's namespace; each row is
 ///   `device mountpoint fstype options 0 0`.
-fn render_mounts(_pid: u64) -> String {
-    let mut s = String::new();
-    for (path, fs_name, mnt_opts, sb_opts) in crate::registry().list_with_options() {
-        let _ = writeln!(
-            s,
-            "{} {} {} {}{} 0 0",
-            fs_name, path, fs_name, mnt_opts, sb_opts
-        );
-    }
+fn render_mounts(pid: u64) -> String {
+    // `mounts_open` binds the file to the TASK's mount namespace; the rows
+    // are `show_vfsmnt`'s, shared with `/proc/mounts`.
+    let mut s = super::render_proc_mounts(pid);
     if s.is_empty() {
         let _ = writeln!(s, "rootfs / rootfs rw,relatime 0 0");
     }
@@ -1241,7 +1272,7 @@ fn mountinfo_hook_for_stacked_file_test(pid: u64) -> Option<String> {
 }
 
 fn smoke_mountinfo_uses_installed_namespace_hook() -> TestResult {
-    super::install_mountinfo_hook(mountinfo_hook_for_stacked_file_test);
+    let _hook = super::MountinfoHookGuard::install(mountinfo_hook_for_stacked_file_test);
     let out = render_mountinfo(0x4d49);
     if out.lines().any(|line| {
         line.split_whitespace().nth(4) == Some("/proc/sys/kernel/domainname")
@@ -1255,6 +1286,46 @@ fn smoke_mountinfo_uses_installed_namespace_hook() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs/pid_ext",
     smoke_mountinfo_uses_installed_namespace_hook
+);
+
+/// `/proc/<pid>/mountinfo` mangles the mount point (`seq_path_root(..,
+/// " \t\n\\")`) and the fstype / source (`mangle()`, which also escapes `#`),
+/// exactly as `fs/proc_namespace.c::show_mountinfo` does.
+fn mountinfo_hook_needs_mangling(pid: u64) -> Option<String> {
+    (pid == 0x4d51).then(|| String::from("9\t1\t/mnt/a b\\c#d\tfuse.my fs#1\trw\t\trw"))
+}
+
+fn smoke_mountinfo_mangles_like_show_mountinfo() -> TestResult {
+    let _hook = super::MountinfoHookGuard::install(mountinfo_hook_needs_mangling);
+    let out = render_mountinfo(0x4d51);
+    let want = "9 1 0:1 / /mnt/a\\040b\\134c#d rw - fuse.my\\040fs\\0431 fuse.my\\040fs\\0431 rw\n";
+    if out != want {
+        return TestResult::Fail("/proc/<pid>/mountinfo fields are not octal-escaped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_mountinfo_mangles_like_show_mountinfo
+);
+
+/// `/proc/<pid>/mounts` is `mounts_open` on THAT task's mount namespace
+/// (`fs/proc_namespace.c`), the same view `/proc/<pid>/mountinfo` renders —
+/// not the global table regardless of pid.
+fn mounts_hook_private_namespace(pid: u64) -> Option<String> {
+    (pid == 0x4d52).then(|| String::from("5\t1\t/private-ns-only\ttmpfs\trw\t\trw"))
+}
+
+fn smoke_pid_mounts_renders_the_tasks_namespace() -> TestResult {
+    let _hook = super::MountinfoHookGuard::install(mounts_hook_private_namespace);
+    if render_mounts(0x4d52) != "tmpfs /private-ns-only tmpfs rw 0 0\n" {
+        return TestResult::Fail("/proc/<pid>/mounts ignored the task's mount namespace");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_pid_mounts_renders_the_tasks_namespace
 );
 
 /// Smoke: `render_wchan` for an unknown pid (no task-info hook)
