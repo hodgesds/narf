@@ -39,6 +39,8 @@ pub mod metadata_csum;
 pub mod mount_opts;
 pub mod node;
 pub mod superblock;
+#[doc(hidden)]
+pub mod testing;
 pub mod volume;
 
 mod tests;

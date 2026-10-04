@@ -288,7 +288,7 @@ pub(super) fn __test_scratch_waitqueue_wakes_and_handoffs() -> bool {
 
 /// One mounted ext2 volume.
 #[derive(Debug)]
-pub struct Ext2Volume<B: BlockDevice> {
+pub struct Ext2Volume<B: BlockDevice + 'static> {
     pub device: Arc<B>,
     pub superblock: Superblock,
     pub group_descs: Vec<GroupDesc>,
@@ -317,10 +317,16 @@ pub struct Ext2Volume<B: BlockDevice> {
     /// Linux's `bdev` inode mapping over `page_cache`. Device writes
     /// (`write_byte_range`) invalidate exactly the device pages they cover.
     bdev_mapping: BlockMapping,
-    /// Serializes whole-inode read/modify/write sequences across distinct
-    /// `Ext2Node` handles. Linux has one in-memory inode per on-disk inode;
-    /// this volume-wide async mutex provides the same lost-update guarantee
-    /// until NARF grows a keyed inode cache.
+    /// The inode cache (Linux `fs/inode.c` icache): at most one live
+    /// `Ext2Node` per on-disk inode, so every lookup, open, hard link and
+    /// `FsInstance::root` of one inode shares one in-memory inode — and,
+    /// through it, one page-cache mapping. Weak, so an unreferenced node is
+    /// evicted when its last `Arc` drops (`Ext2Node::drop` removes its own
+    /// entry). Never held while a node is dropped or across an `.await`.
+    icache: IrqSafeSpinLock<BTreeMap<u32, Weak<super::node::Ext2Node<B>>>>,
+    /// Serializes whole-inode read/modify/write sequences. Directory
+    /// mutations rewrite inodes (parent, target) that have no node in hand,
+    /// so this stays volume-wide rather than per node.
     pub(crate) inode_update_lock: Mutex<()>,
     /// Serializes bitmap + group-descriptor + superblock counter updates.
     /// These three writes form one allocation transaction; allowing two
@@ -664,6 +670,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             journal_overrides,
             page_cache: page_cache.clone(),
             bdev_mapping: BlockMapping::new(page_cache, 0),
+            icache: IrqSafeSpinLock::new(BTreeMap::new()),
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
@@ -1267,7 +1274,58 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if inode_no == super::EXT2_ROOT_INO {
             *self.root_inode.lock() = Some(*inode);
         }
+        // The cached in-memory inode is the one every holder of this inode
+        // reads; keep it identical to what was just written. The upgrade's
+        // icache guard is released before the node is touched or dropped.
+        let live = self.icache_get(inode_no);
+        if let Some(node) = live {
+            node.set_cached_inode(*inode);
+        }
         Ok(())
+    }
+
+    /// The live node of `inode_no`, if any (no I/O).
+    pub(crate) fn icache_get(&self, inode_no: u32) -> Option<Arc<super::node::Ext2Node<B>>> {
+        self.icache.lock().get(&inode_no).and_then(Weak::upgrade)
+    }
+
+    /// Linux `iget_locked`: the one in-memory inode for `inode_no`, reading
+    /// it from disk only when no node is live.
+    pub async fn iget(&self, inode_no: u32) -> Result<Arc<super::node::Ext2Node<B>>, FsError> {
+        if let Some(node) = self.icache_get(inode_no) {
+            return Ok(node);
+        }
+        let inode = self.read_inode(inode_no).await?;
+        Ok(self.iget_with(inode_no, inode))
+    }
+
+    /// [`Self::iget`] when the caller has just read or written `inode`. A
+    /// node that became live meanwhile wins (its cached inode was refreshed
+    /// by the write funnel), so two racing lookups still share one node.
+    pub(crate) fn iget_with(&self, inode_no: u32, inode: Inode) -> Arc<super::node::Ext2Node<B>> {
+        let volume = self
+            .self_weak
+            .upgrade()
+            .expect("ext2 iget on a volume being dropped");
+        let mut icache = self.icache.lock();
+        if let Some(node) = icache.get(&inode_no).and_then(Weak::upgrade) {
+            return node;
+        }
+        let node = super::node::Ext2Node::new_cached(volume, inode_no, inode);
+        icache.insert(inode_no, Arc::downgrade(&node));
+        node
+    }
+
+    /// `evict`: forget the icache entry of `inode_no` if it still names the
+    /// node at `node` (a racing `iget` may already have replaced it).
+    pub(crate) fn icache_evict(&self, inode_no: u32, node: *const super::node::Ext2Node<B>) {
+        let mut icache = self.icache.lock();
+        if icache
+            .get(&inode_no)
+            .is_some_and(|weak| core::ptr::eq(weak.as_ptr(), node))
+        {
+            icache.remove(&inode_no);
+        }
     }
 
     // ── Bitmap allocator (Linux fs/ext2/balloc.c + ialloc.c) ─────
@@ -1601,6 +1659,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // Before the allocation lock — releasing frees a block, which takes
         // it too.
         self.xattr_release_on_free(inode_no).await?;
+        // The number is about to become reusable: a node still held for the
+        // freed inode must not be what a later `iget` of a NEW inode with the
+        // same number returns. Unhash it (Linux `remove_inode_hash`).
+        let unhashed = self.icache.lock().remove(&inode_no);
+        drop(unhashed);
         let _allocation = self.allocation_lock.lock().await;
         let (group, index) = self
             .inode_group_and_index(inode_no)
@@ -2055,13 +2118,7 @@ impl<B: BlockDevice + 'static> FsInstance for Ext2Volume<B> {
     fn root(&self) -> Arc<dyn DirOps> {
         let inode =
             (*self.root_inode.lock()).expect("mounted ext2 volume lost root inode metadata");
-        Arc::new(super::node::Ext2Node::from_inode(
-            self.self_weak
-                .upgrade()
-                .expect("Ext2Volume root called after drop"),
-            super::EXT2_ROOT_INO,
-            inode,
-        ))
+        self.iget_with(super::EXT2_ROOT_INO, inode)
     }
 
     fn name(&self) -> &str {

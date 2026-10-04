@@ -42,6 +42,11 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 ### Key Structs
 
 - `Ext2Volume<B: BlockDevice>`: Root structure for a mounted volume.
+  `Ext2Volume::iget(ino)` (Linux `iget_locked`) returns the one live
+  `Arc<Ext2Node>` of an inode, reading it from disk only on an inode-cache
+  miss; lookups, `create`/`mkdir`/`symlink`, `as_dir` and `root()` all go
+  through it. `testing::hard_link_image` (doc-hidden) builds byte-level test
+  volumes for this crate and the syscall layer.
 - `Ext2Node<B: BlockDevice>`: Inode-backed node providing `read`,
   `write`, `truncate`, persistent `set_perms`/`set_owners`, directory
   metadata mutation, `lookup_async`, `lookup_dir_async`, and
@@ -67,6 +72,14 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
 - **Whole-inode mutations are serialized per volume.** Every data or metadata
   read/modify/write starts from the current on-disk inode, so independent open
   handles cannot restore stale mode or owner fields.
+- **One in-memory inode per on-disk inode.** The volume's icache maps an
+  inode number to a `Weak<Ext2Node>`; at most one node per inode is live, so
+  every name (hard links included) and every open of a file share one node.
+  Every inode write goes through `write_inode_slot`, which refreshes the live
+  node's cached inode, so the cached copy never trails the disk. A node
+  removes its own entry when its last `Arc` drops (only if the entry still
+  names it); `free_inode` unhashes the number first so a reused number never
+  resolves to the freed inode's node.
 - **Root metadata is real inode metadata.** Mount loads inode 2 and every
   successful inode-2 write refreshes the synchronous `FsInstance::root()`
   snapshot.

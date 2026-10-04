@@ -30,7 +30,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -53,36 +53,48 @@ pub struct Ext2NodeState {
     pub inode: Option<Inode>,
 }
 
+/// The in-memory inode of one ext2 inode. Only ever constructed by the
+/// volume's inode cache (`Ext2Volume::iget`), so there is at most one live
+/// node per on-disk inode and every path to the file shares it.
 #[derive(Debug)]
-pub struct Ext2Node<B: BlockDevice> {
+pub struct Ext2Node<B: BlockDevice + 'static> {
     pub volume: Arc<Ext2Volume<B>>,
     inode_no: u32,
+    /// This node's own `Arc`, for handing out `Arc<dyn …>` views of it
+    /// (`as_dir`) without minting a second node.
+    self_weak: Weak<Ext2Node<B>>,
     pub state: IrqSafeSpinLock<Ext2NodeState>,
 }
 
-impl<B: BlockDevice + 'static> Ext2Node<B> {
-    pub fn new(volume: Arc<Ext2Volume<B>>, inode_no: u32, stat: Stat) -> Self {
-        Self {
-            volume,
-            inode_no,
-            state: IrqSafeSpinLock::new(Ext2NodeState {
-                inode_no,
-                stat,
-                inode: None,
-            }),
-        }
+impl<B: BlockDevice + 'static> Drop for Ext2Node<B> {
+    fn drop(&mut self) {
+        self.volume.icache_evict(self.inode_no, self as *const Self);
     }
+}
 
-    pub(crate) fn from_inode(volume: Arc<Ext2Volume<B>>, inode_no: u32, inode: Inode) -> Self {
-        Self {
+impl<B: BlockDevice + 'static> Ext2Node<B> {
+    /// Build the cache's node for `inode_no`. Called by `Ext2Volume` under
+    /// its icache lock; nothing else may construct a node.
+    pub(crate) fn new_cached(volume: Arc<Ext2Volume<B>>, inode_no: u32, inode: Inode) -> Arc<Self> {
+        Arc::new_cyclic(|self_weak| Self {
             inode_no,
+            self_weak: self_weak.clone(),
             state: IrqSafeSpinLock::new(Ext2NodeState {
                 inode_no,
                 stat: Self::stat_from_inode(&volume, &inode),
                 inode: Some(inode),
             }),
             volume,
-        }
+        })
+    }
+
+    /// Replace the cached inode with what was just written to disk. Called
+    /// by the volume's inode write funnel for every inode write.
+    pub(crate) fn set_cached_inode(&self, inode: Inode) {
+        let stat = Self::stat_from_inode(&self.volume, &inode);
+        let mut state = self.state.lock();
+        state.inode = Some(inode);
+        state.stat = stat;
     }
 
     /// Translate an on-disk inode into a VFS `Stat`. Block count is
@@ -388,18 +400,13 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
     /// `lookup_async`), so `open(dir, O_DIRECTORY)` installs that
     /// FileOps in the fd table; `sys_getdents64` then needs `as_dir()`
     /// to recover the `DirOps` view. Returns `None` for non-directories
-    /// so `getdents64` on a regular-file fd is ENOTDIR. The fresh node
-    /// shares the same volume + inode number.
+    /// so `getdents64` on a regular-file fd is ENOTDIR. The view is this
+    /// same node: one in-memory inode per on-disk inode.
     fn as_dir(&self) -> Option<Arc<dyn DirOps>> {
-        let st = self.state.lock();
-        if st.stat.mode.file_type != FileType::Dir {
+        if self.state.lock().stat.mode.file_type != FileType::Dir {
             return None;
         }
-        Some(Arc::new(Ext2Node {
-            volume: self.volume.clone(),
-            inode_no: st.inode_no,
-            state: IrqSafeSpinLock::new(*st),
-        }) as Arc<dyn DirOps>)
+        self.self_weak.upgrade().map(|node| node as Arc<dyn DirOps>)
     }
 }
 
@@ -444,11 +451,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         Box::pin(async move {
             let inode = self.load_inode().await?;
             let (found_ino, _) = self.volume.dir_lookup(&inode, name.as_bytes()).await?;
-            let target = self.volume.read_inode(found_ino).await?;
-            Ok(
-                Arc::new(Ext2Node::from_inode(self.volume.clone(), found_ino, target))
-                    as Arc<dyn FileOps>,
-            )
+            Ok(self.volume.iget(found_ino).await? as Arc<dyn FileOps>)
         })
     }
 
@@ -462,17 +465,14 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         Box::pin(async move {
             let inode = self.load_inode().await?;
             let (found_ino, found_type) = self.volume.dir_lookup(&inode, name.as_bytes()).await?;
-            let target = self.volume.read_inode(found_ino).await?;
+            let node = self.volume.iget(found_ino).await?;
             // Honour the on-disk inode mode rather than the rev-0
             // dirent type byte, which is unreliable on rev-0 volumes
             // (overlap with the high byte of `name_len`).
-            if !target.is_dir() && found_type != ftype::DIR {
+            if !node.load_inode().await?.is_dir() && found_type != ftype::DIR {
                 return Err(FsError::NotFound);
             }
-            Ok(
-                Arc::new(Ext2Node::from_inode(self.volume.clone(), found_ino, target))
-                    as Arc<dyn DirOps>,
-            )
+            Ok(node as Arc<dyn DirOps>)
         })
     }
 
@@ -576,11 +576,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .volume
                 .dir_create_regular(parent_ino, name.as_bytes(), 0o644)
                 .await?;
-            let target = self.volume.read_inode(new_ino).await?;
-            Ok(
-                Arc::new(Ext2Node::from_inode(self.volume.clone(), new_ino, target))
-                    as Arc<dyn FileOps>,
-            )
+            Ok(self.volume.iget(new_ino).await? as Arc<dyn FileOps>)
         })
     }
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
@@ -591,11 +587,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .volume
                 .dir_create_directory(parent_ino, name.as_bytes(), 0o755)
                 .await?;
-            let target = self.volume.read_inode(new_ino).await?;
-            Ok(
-                Arc::new(Ext2Node::from_inode(self.volume.clone(), new_ino, target))
-                    as Arc<dyn DirOps>,
-            )
+            Ok(self.volume.iget(new_ino).await? as Arc<dyn DirOps>)
         })
     }
     fn unlink<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
@@ -634,12 +626,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
                 .volume
                 .dir_create_symlink(parent_ino, name.as_bytes(), target.as_bytes())
                 .await?;
-            let target_inode = self.volume.read_inode(new_ino).await?;
-            Ok(Arc::new(Ext2Node::from_inode(
-                self.volume.clone(),
-                new_ino,
-                target_inode,
-            )) as Arc<dyn FileOps>)
+            Ok(self.volume.iget(new_ino).await? as Arc<dyn FileOps>)
         })
     }
 

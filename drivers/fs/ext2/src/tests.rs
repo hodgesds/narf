@@ -4866,3 +4866,63 @@ kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_rename_replaces_existing_destination
 );
+
+/// Linux keeps one in-memory inode per on-disk inode (`fs/inode.c`,
+/// `iget_locked`): every lookup of every name of a file — including a hard
+/// link — and every `root()` returns the same inode, which is what lets the
+/// inode's page cache be shared. ext2 used to build a fresh node per
+/// lookup, so two names of one file were two unrelated in-memory inodes.
+fn smoke_ext2_icache_one_node_per_inode() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let device = RamBlockDevice::from_image(512, testing::hard_link_image(b"one inode"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let (data, link) = match (
+        poll_once(root.lookup_async("data")),
+        poll_once(root.lookup_async("link")),
+    ) {
+        (Some(Ok(data)), Some(Ok(link))) => (data, link),
+        _ => return TestResult::Fail("lookup of the two names failed"),
+    };
+    if !Arc::ptr_eq(&data, &link) {
+        return TestResult::Fail("two names of one inode resolved to two in-memory inodes");
+    }
+    let again = match poll_once(root.lookup_async("data")) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("second lookup failed"),
+    };
+    if !Arc::ptr_eq(&data, &again) {
+        return TestResult::Fail("a repeated lookup built a second in-memory inode");
+    }
+    let root_again = volume.root();
+    if !core::ptr::eq(
+        Arc::as_ptr(&root) as *const (),
+        Arc::as_ptr(&root_again) as *const (),
+    ) {
+        return TestResult::Fail("root() built a second in-memory root inode");
+    }
+    // A change made through one holder is the inode every holder sees.
+    if poll_once(link.set_perms(0o600)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("chmod through the hard link failed");
+    }
+    if data.stat().mode.perms != 0o600 {
+        return TestResult::Fail("chmod through one name is invisible through the other");
+    }
+    // Once nothing holds it, the inode leaves the cache (Linux evict).
+    drop((data, link, again));
+    if volume.icache_get(testing::FILE_INO).is_some() {
+        return TestResult::Fail("an unreferenced inode stayed pinned in the inode cache");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_icache_one_node_per_inode);
