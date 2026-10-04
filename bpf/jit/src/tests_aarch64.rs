@@ -1462,6 +1462,8 @@ const SP_INIT: u64 = MEM_BASE + 0x3000;
 const FRAME_TOP: u64 = MEM_BASE + 0x1000;
 /// What the runtime passes as the context pointer.
 const CTX_ADDR: u64 = MEM_BASE + 0x2000;
+/// Future-owned native continuation storage for checkpoint/resume tests.
+const CONT_ADDR: u64 = MEM_BASE + 0x2800;
 
 /// How a run ended. The variant *is* the trap kind, which is what makes
 /// comparing two of these worth doing.
@@ -1888,8 +1890,18 @@ fn sext(v: u32, bits: u32) -> i64 {
 /// Execute an emitted image, returning the machine state and the `(x0, x1)`
 /// pair AAPCS64 defines as the 128-bit result — `(value, exhausted)`.
 fn a64_execute(code: &[u8], fuel: u64, mem: Mem) -> Result<(Cpu, u64, u64), Run> {
+    a64_execute_with_continuation(code, fuel, mem, 0)
+}
+
+fn a64_execute_with_continuation(
+    code: &[u8],
+    fuel: u64,
+    mem: Mem,
+    continuation: u64,
+) -> Result<(Cpu, u64, u64), Run> {
     let words = a64_words(code);
     let mut cpu = Cpu::new(fuel, mem);
+    cpu.x[4] = continuation;
     let mut pc = 0usize;
     // Generous but finite: a dropped fuel burn turns a BPF loop into a
     // non-terminating one, and "the emulator ran forever" has to be a test
@@ -2844,10 +2856,136 @@ fn a64_a_call_site_that_names_a_different_kfunc_is_refused() {
 #[test]
 fn a64_a_sleepable_kfuncs_shim_is_never_entered_from_native_code() {
     let mut prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, A64_SHIM)]);
+    prog.context = Context::Sleepable;
     prog.kfunc_calls[0].context = Context::Sleepable;
+    prog.kfunc_calls[0].may_suspend = true;
+    let compiled = aarch64::compile(&prog).expect("root sleepable call must checkpoint");
+    assert_eq!(compiled.suspend_points.len(), 1);
+    assert_eq!(compiled.suspend_points[0].insn_index, 0);
+    assert!(!a64_words(&compiled.code)
+        .into_iter()
+        .any(|word| word == 0xd63f_0200));
+}
+
+#[test]
+fn a64_a_sync_shim_that_requires_sleepable_context_remains_a_direct_call() {
+    let mut prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, A64_SHIM)]);
+    prog.context = Context::Sleepable;
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    let compiled =
+        aarch64::compile(&prog).expect("a synchronous process-context call must compile");
+    assert!(
+        compiled.suspend_points.is_empty(),
+        "context alone must not select the boxed-future ABI"
+    );
+    assert!(
+        a64_words(&compiled.code)
+            .into_iter()
+            .any(|word| word == 0xd63f_0200),
+        "the synchronous shim must be reached through BLR x16"
+    );
+}
+
+#[test]
+fn a64_sleepable_checkpoint_saves_and_resumes_in_the_emulator() {
+    let add_five = Decoded::Alu {
+        wide: true,
+        op: AluOp::Add,
+        dst: r(0),
+        src: Source::Imm(5),
+    };
+    let mut prog = verified_calling(&[kcall(7), add_five, EXIT], &[(0, 7, A64_SHIM)]);
+    prog.context = Context::Sleepable;
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    prog.kfunc_calls[0].may_suspend = true;
+    let compiled = aarch64::compile(&prog).expect("sleepable root call must compile");
+
+    let first = a64_execute_with_continuation(&compiled.code, 1024, Mem::new(), CONT_ADDR)
+        .expect("initial native slice must return its checkpoint");
+    let (cpu, resume_id, status) = first;
+    assert_eq!(status, crate::status::SUSPEND);
+    assert_eq!(resume_id, 1);
+    assert_eq!(
+        cpu.mem.load64(CONT_ADDR + crate::CONT_RESUME_ID_OFF as u64),
+        Some(1)
+    );
+    assert_eq!(
+        cpu.mem.load64(CONT_ADDR + crate::CONT_FUEL_OFF as u64),
+        Some(1021),
+        "the one three-instruction block must be charged exactly once"
+    );
+    assert_eq!(
+        cpu.mem.load64(CONT_ADDR + 10 * 8),
+        Some(FRAME_TOP),
+        "saved R10 must remain the future-owned stack top"
+    );
+
+    // Model the Rust driver completing the boxed kfunc future: result in R0,
+    // caller-saved R1..R5 cleared, resume id retained for the image dispatcher.
+    let mut mem = cpu.mem;
+    mem.store64(CONT_ADDR, 7)
+        .expect("continuation R0 in bounds");
+    for reg in 1..=5u64 {
+        mem.store64(CONT_ADDR + reg * 8, 0)
+            .expect("continuation caller-saved register in bounds");
+    }
+    let (cpu, value, status) = a64_execute_with_continuation(&compiled.code, 1024, mem, CONT_ADDR)
+        .expect("resumed native slice must finish");
+    assert_eq!(status, crate::status::OK);
+    assert_eq!(
+        value, 12,
+        "resume must continue after, not before, the call"
+    );
+    // The dispatcher clears the id before entering BPF code.
+    assert_eq!(
+        cpu.mem.load64(CONT_ADDR + crate::CONT_RESUME_ID_OFF as u64),
+        Some(0)
+    );
+}
+
+#[test]
+fn a64_sleepable_dispatch_rejects_an_unknown_resume_id() {
+    let mut prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, A64_SHIM)]);
+    prog.context = Context::Sleepable;
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    prog.kfunc_calls[0].may_suspend = true;
+    let compiled = aarch64::compile(&prog).expect("sleepable root call must compile");
+    let mut mem = Mem::new();
+    mem.store64(CONT_ADDR + crate::CONT_RESUME_ID_OFF as u64, 99)
+        .expect("continuation resume id in bounds");
+    let (_, value, status) = a64_execute_with_continuation(&compiled.code, 1024, mem, CONT_ADDR)
+        .expect("unknown id must return a status rather than branch indirectly");
+    assert_eq!(value, 99);
+    assert_eq!(status, crate::status::BAD_RESUME);
+}
+
+#[test]
+fn a64_a_sleepable_call_in_a_subprogram_is_refused_without_call_state_lowering() {
+    let mut prog = verified_calling(
+        &[
+            Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
+            EXIT,
+            kcall(7),
+            EXIT,
+        ],
+        &[(2, 7, A64_SHIM)],
+    );
+    prog.context = Context::Sleepable;
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    prog.kfunc_calls[0].may_suspend = true;
+    prog.subprogs = alloc::vec![
+        narf_bpf_verifier::SubprogInfo {
+            start: 0,
+            stack_bytes: 0,
+        },
+        narf_bpf_verifier::SubprogInfo {
+            start: 2,
+            stack_bytes: 0,
+        },
+    ];
     assert!(matches!(
         aarch64::compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
+        Err(JitError::Unsupported { at: 2, .. })
     ));
 }
 

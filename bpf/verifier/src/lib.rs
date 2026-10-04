@@ -258,13 +258,14 @@ pub struct KfuncCallSite {
     /// Address of the `extern "C"` shim — [`KfuncDesc::addr`], copied so the
     /// JIT needs no descriptor lifetime.
     pub addr: usize,
+    /// Whether this exact shim returns a boxed future. A synchronous shim may
+    /// still have [`Context::Sleepable`] requirements, so context alone cannot
+    /// select the machine-code ABI.
+    pub may_suspend: bool,
     /// The weakest context this kfunc may be entered from.
     ///
-    /// Carried because it is what distinguishes the two shim ABIs: a
-    /// [`Context::Sleepable`] kfunc's shim returns a boxed future, not a `u64`,
-    /// so native code must not call it through the uniform ABI. Recording the
-    /// context rather than a "callable" boolean keeps the decision with the
-    /// backend that has to make it.
+    /// Used for the verifier's context and await rules; [`Self::may_suspend`]
+    /// separately records the actual calling convention.
     pub context: Context,
 }
 

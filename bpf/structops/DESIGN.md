@@ -10,9 +10,9 @@ does not grant ambient kernel access, and a struct-ops attachment does not make
 the program equivalent to a trusted kernel module.
 
 Current status: the atomic requirements, the sleepable ABI, mixed
-atomic/sleepable targets, and run-to-completion native execution for
-non-suspending sleepable programs are implemented. Native checkpoint/resume
-lowering across an actual sleepable kfunc remains deferred.
+atomic/sleepable targets, and native checkpoint/resume execution for
+root-program `may_suspend` kfunc calls are implemented. Such a call inside a
+BPF subprogram remains interpreted until explicit call-state lowering lands.
 
 ## Shared method contract
 
@@ -132,41 +132,35 @@ the subsystem.
 
 ### Native execution stages
 
-A sleepable context does not imply that a particular program will suspend. If
-the JIT compiles the whole program, its existing fail-closed call resolution
-proves that every emitted kfunc call has the synchronous `u64` ABI; it refuses
-every verifier-resolved `Context::Sleepable` call site. Such an image runs to
-completion inside one poll, using the invocation's owned heap stack rather
-than an atomic per-CPU stack. The native call itself is polled through the BPF
-domain wrapper, so it never executes before confinement is entered. If any
-sleepable call site exists, compilation produces no image and execution starts
-in the interpreter; there is no partially executed native-to-interpreter
-fallback.
+A sleepable context does not imply that a particular program will suspend. An
+image with only synchronous calls runs to completion inside one poll on the
+invocation's owned heap stack, including synchronous kfuncs that themselves
+require sleepable context. At each verifier-resolved root-program call marked
+`may_suspend`, emitted code checkpoints to Rust instead of calling
+`KfuncShim::Sleepable` through the synchronous machine-code ABI. The
+implemented checkpoint/resume contract:
 
-The remaining continuation JIT must use a distinct checkpoint/resume ABI. It
-must not call `KfuncShim::Sleepable` through the synchronous machine-code ABI.
-At minimum that design must:
-
-- save R0-R10, remaining fuel, a compiler-issued resume id, the BPF stack, and
-  any explicit subprogram-call state in future-owned memory;
-- return a dedicated suspend status to Rust, which resolves the verifier-bound
+- saves R0-R10, remaining fuel, a compiler-issued resume id, and the BPF stack
+  in future-owned memory;
+- returns a dedicated suspend status to Rust, which resolves the verifier-bound
   kfunc site and invokes its typed sleepable shim with the saved R1-R5 values;
-- keep the boxed kfunc future in the invocation until it completes or the
+- keeps the boxed kfunc future in the invocation until it completes or the
   invocation is cancelled by drop;
-- write the completed kfunc result to saved R0 and resume only through a
+- writes the completed kfunc result to saved R0 and resumes only through a
   compiler-emitted target table—never a program-controlled native address;
-- preserve the one total fuel tank across every resume;
-- enter the BPF hardware domain around every native or kfunc-future poll and
-  restore neutral rights before returning `Pending`;
-- carry no per-CPU stack lease, host call stack, lock guard, or hardware-rights
+- preserves the one total fuel tank across every resume;
+- enters the BPF hardware domain around every native or kfunc-future poll and
+  restores neutral rights before returning `Pending`;
+- carries no per-CPU stack lease, host call stack, lock guard, or hardware-rights
   snapshot across suspension; and
-- retain the existing exact method contract, arena ownership, map lifetime,
+- retains the existing exact method contract, arena ownership, map lifetime,
   trap mapping, cancellation, and attachment admission semantics.
 
-Suspending from a BPF subprogram requires explicit call-state lowering; the
-host return-address stack cannot be captured and migrated. An initial
-continuation backend may therefore reject sleepable call sites reached below
-the root subprogram, but it may not resume them with a fabricated call chain.
+Suspending from a BPF subprogram still requires explicit call-state lowering;
+the host return-address stack cannot be captured and migrated. The current
+backend rejects such an image before execution and runs the complete
+interpreter instead; it never falls back after partially executing native code
+or resumes with a fabricated call chain.
 
 ## Mixed-context targets
 
@@ -231,7 +225,11 @@ on every `Pending`, detachment with an in-flight future, rejection of calls
 created after detach, async fallback validation, and a `Send` future-only API.
 It also compares native and interpreted execution of a non-suspending
 sleepable stack program, requires the native form to complete in one poll, and
-checks that it restores domain rights.
+checks that it restores domain rights. Native continuation coverage uses two
+distinct resume sites, retains callee-saved and heap-stack state, lets a boxed
+kfunc future retain a bounded stack slice across `Pending`, preserves fuel,
+exercises cancellation and detach through struct ops, and requires a nested
+sleep site to select the interpreter before execution.
 
 Mixed-target coverage additionally includes exact-context load rejection for
 both method kinds, immediate atomic dispatch, multi-poll sleepable dispatch,

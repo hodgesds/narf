@@ -825,8 +825,7 @@ fn smoke_bpf_sleepable_run_to_completion_uses_native_heap_stack() -> TestResult 
 
     // A Sleepable *program* may still call an Atomic kfunc. That call has the
     // synchronous ABI and therefore remains eligible for run-to-completion
-    // codegen; only a verifier-resolved Sleepable call site forces the async
-    // interpreter today.
+    // codegen.
     let Ok(sync_call) = load(
         "sleepable_native_sync_kfunc",
         asm(&arg_mix_prog([1, 2, 3, 4, 5])),
@@ -841,6 +840,35 @@ fn smoke_bpf_sleepable_run_to_completion_uses_native_heap_stack() -> TestResult 
     let interpreted = crate::interp::drive(sync_call.run_sleepable_interpreted([0; 4], 4));
     if native != interpreted || !matches!(native, Some(Outcome::Returned(_))) {
         return TestResult::Fail("sleepable sync-kfunc native result diverged from interpreter");
+    }
+
+    // Context and ABI are independent: this ordinary function requires
+    // process context but cannot suspend. It must be refused for an Atomic
+    // program, then compile as a direct synchronous call in a Sleepable one.
+    let process_sync_insns = asm(&[mov_imm(1, 41), call("narf_test_process_context_sync"), EXIT]);
+    if load(
+        "atomic_process_context_sync_kfunc",
+        process_sync_insns.clone(),
+        Context::Atomic,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("atomic program accepted a process-context-only sync kfunc");
+    }
+    let Ok(process_sync) = load(
+        "sleepable_process_context_sync_kfunc",
+        process_sync_insns,
+        Context::Sleepable,
+    ) else {
+        return TestResult::Fail("sleepable program rejected a process-context-only sync kfunc");
+    };
+    if !process_sync.is_jited() {
+        return TestResult::Fail("process-context-only sync kfunc did not compile natively");
+    }
+    let native = crate::interp::drive(process_sync.run_sleepable([0; 4], 4));
+    let interpreted = crate::interp::drive(process_sync.run_sleepable_interpreted([0; 4], 4));
+    if native != Some(Outcome::Returned(42)) || native != interpreted {
+        return TestResult::Fail("process-context sync ABI diverged from interpreter");
     }
     TestResult::Pass
 }
@@ -866,7 +894,7 @@ kernel_test_in!("bpf", smoke_bpf_sleepable_dispatch_rejects_atomic_program);
 
 fn smoke_bpf_sleepable_yield_completes() -> TestResult {
     // call narf_yield; r0 = 5; exit. The yield parks the future once, so this
-    // exercises the async interpreter's resume path — not just its fast path.
+    // exercises the async execution resume path — not just its fast path.
     let insns = asm(&[call("narf_yield"), mov_imm(0, 5), EXIT]);
     let Ok(p) = load("yield", insns, Context::Sleepable) else {
         return TestResult::Fail("load rejected a sleepable program");
@@ -1913,6 +1941,9 @@ fn smoke_bpf_sleepable_kfunc_suspends_and_resumes() -> TestResult {
     let Ok(p) = load("sleepy", insns, Context::Sleepable) else {
         return TestResult::Fail("load rejected a sleepable program");
     };
+    if narf_bpf_jit::has_backend() && !p.is_jited() {
+        return TestResult::Fail("root sleepable kfunc call did not compile to a checkpoint");
+    }
     match crate::interp::drive(p.run_sleepable([0; 4], 4)) {
         Some(Outcome::Returned(5)) => TestResult::Pass,
         Some(Outcome::Returned(_)) => TestResult::Fail("wrong yield count"),
@@ -1921,6 +1952,77 @@ fn smoke_bpf_sleepable_kfunc_suspends_and_resumes() -> TestResult {
     }
 }
 kernel_test_in!("bpf", smoke_bpf_sleepable_kfunc_suspends_and_resumes);
+
+fn smoke_bpf_native_sleepable_multiple_checkpoints_preserve_state() -> TestResult {
+    // Save 40 on the future-owned BPF stack, suspend twice at distinct sites,
+    // and carry both the stack and callee-saved R6 across those suspensions.
+    // The first kfunc returns 2, producing 42; the second call must not destroy
+    // it. Comparing with the forced interpreter covers resume target and fuel
+    // accounting in addition to the hand-computed result.
+    let insns = asm(&[
+        st_imm(10, -8, 40),
+        mov_imm(1, 2),
+        call("narf_yield_n"),
+        ldx(6, 10, -8),
+        alu_reg(AluOp::Add, 6, 0),
+        mov_imm(1, 1),
+        call("narf_yield_n"),
+        mov_reg(0, 6),
+        EXIT,
+    ]);
+    let Ok(p) = load("sleepy_multi_checkpoint", insns, Context::Sleepable) else {
+        return TestResult::Fail("load rejected the multi-checkpoint program");
+    };
+    if !p.is_jited() {
+        return if narf_bpf_jit::has_backend() {
+            TestResult::Fail("multi-checkpoint sleepable program did not compile")
+        } else {
+            TestResult::Skip(NO_BACKEND)
+        };
+    }
+    let native = crate::interp::drive(p.run_sleepable([0; 4], 4));
+    let interpreted = crate::interp::drive(p.run_sleepable_interpreted([0; 4], 4));
+    if native != Some(Outcome::Returned(42)) || native != interpreted {
+        return TestResult::Fail("native continuation state diverged from the interpreter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_native_sleepable_multiple_checkpoints_preserve_state
+);
+
+fn smoke_bpf_native_sleepable_kfunc_retains_stack_region() -> TestResult {
+    // Pass eight verifier-bounded stack bytes to a kfunc that deliberately
+    // reads them only after yielding. The native path uses real heap-stack
+    // addresses; the interpreter translates its synthetic address. Both must
+    // keep the same allocation alive and return 1+2+3+4.
+    let insns = asm(&[
+        st_imm(10, -8, 0x0403_0201),
+        mov_reg(1, 10),
+        alu_imm(AluOp::Add, 1, -8),
+        mov_imm(2, 8),
+        call("narf_test_sleepable_sum"),
+        EXIT,
+    ]);
+    let Ok(p) = load("sleepy_stack_region", insns, Context::Sleepable) else {
+        return TestResult::Fail("load rejected a sleepable stack-region argument");
+    };
+    if !p.is_jited() {
+        return if narf_bpf_jit::has_backend() {
+            TestResult::Fail("sleepable stack-region program did not compile")
+        } else {
+            TestResult::Skip(NO_BACKEND)
+        };
+    }
+    let native = crate::interp::drive(p.run_sleepable([0; 4], 4));
+    let interpreted = crate::interp::drive(p.run_sleepable_interpreted([0; 4], 4));
+    if native != Some(Outcome::Returned(10)) || native != interpreted {
+        return TestResult::Fail("sleepable kfunc did not retain its bounded stack region");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_native_sleepable_kfunc_retains_stack_region);
 
 fn smoke_bpf_atomic_program_cannot_call_a_sleepable_kfunc() -> TestResult {
     // The context rule, enforced by type rather than by a flag: an `async fn`
@@ -3788,25 +3890,36 @@ kernel_test_in!(
 
 // ── negatives: what must *not* be compiled ──────────────────────────
 
-fn smoke_bpf_jit_refuses_a_sleepable_kfunc_call() -> TestResult {
-    // `narf_yield`'s shim is `fn(..) -> Pin<Box<dyn Future>>`, not
-    // `extern "C" fn(..) -> u64`. Entering it through the uniform ABI would
-    // reinterpret a boxed future as R0 and leak it, so the emitter must refuse
-    // on the *callee's* context — not on the program's, which here is
-    // `Sleepable` and permits the call perfectly legally.
+fn smoke_bpf_jit_refuses_sleepable_call_inside_subprogram() -> TestResult {
+    // The first continuation backend deliberately supports only root-program
+    // suspension. Capturing a host return-address stack would be unsound, so a
+    // sleepable call reached inside a BPF subprogram must keep the whole image
+    // interpreted until explicit call-state lowering exists.
     let Ok(p) = load(
-        "sleepy_call",
-        asm(&[call("narf_yield"), EXIT]),
+        "sleepy_subprog_call",
+        asm(&[
+            subprog_call(1),
+            EXIT,
+            mov_imm(1, 2),
+            call("narf_yield_n"),
+            EXIT,
+        ]),
         Context::Sleepable,
     ) else {
         return TestResult::Fail("load rejected");
     };
     if p.is_jited() {
-        return TestResult::Fail("a sleepable kfunc's shim was compiled into native code");
+        return TestResult::Fail("a nested sleepable call compiled without call-state lowering");
+    }
+    if crate::interp::drive(p.run_sleepable([0; 4], 4)) != Some(Outcome::Returned(2)) {
+        return TestResult::Fail("the interpreted nested sleepable call did not complete");
     }
     TestResult::Pass
 }
-kernel_test_in!("bpf", smoke_bpf_jit_refuses_a_sleepable_kfunc_call);
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_jit_refuses_sleepable_call_inside_subprogram
+);
 
 fn smoke_bpf_jit_certifies_context_dereferences_across_calls() -> TestResult {
     // Gate 5 is flow-sensitive now: the verifier publishes this load as a

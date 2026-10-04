@@ -377,6 +377,32 @@ crate::kfunc! {
         let probe: u64 = 0;
         (core::ptr::addr_of!(probe) as u64) & 0xF
     }
+
+    /// A synchronous ABI that still requires sleepable process context.
+    ///
+    /// This distinguishes admission context from suspension: the verifier
+    /// excludes atomic programs, but native code must call this shim directly
+    /// rather than treating its `u64` return as a boxed future.
+    #[context(Sleepable)]
+    pub fn narf_test_process_context_sync(value: u64) -> u64 {
+        value.wrapping_add(1)
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+crate::kfunc! {
+    /// Read a verifier-bounded BPF-stack slice after a real suspension.
+    ///
+    /// This pins the native continuation's pointer-lifetime contract: the
+    /// sleepable heap stack must remain at the same address until the boxed
+    /// shim completes, rather than being copied into a transient native-call
+    /// frame or borrowed from an atomic per-CPU slot.
+    pub async fn narf_test_sleepable_sum(bytes: &[u8], _len: u64) -> u64 {
+        crate::interp::yield_now().await;
+        bytes
+            .iter()
+            .fold(0u64, |sum, byte| sum.wrapping_add(u64::from(*byte)))
+    }
 }
 
 // A separate `kfunc!` invocation: every item in one invocation must match the

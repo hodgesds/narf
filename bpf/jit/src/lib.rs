@@ -164,6 +164,107 @@ pub mod status {
     /// An arena atomic's effective address was not naturally aligned. The low
     /// half carries the offending handle, as it does for [`ARENA_FAULT`].
     pub const ARENA_UNALIGNED: u64 = 3;
+    /// Native execution reached a verifier-resolved `may_suspend` kfunc. The
+    /// low half carries a compiler-issued resume id, never a program-supplied
+    /// PC.
+    pub const SUSPEND: u64 = 4;
+    /// A continuation asked for an id not present in this image's compiler-
+    /// emitted dispatch table. The low half carries the rejected id.
+    pub const BAD_RESUME: u64 = 5;
+}
+
+/// Register and fuel state retained by a sleepable native invocation.
+///
+/// This is hidden runtime state, not BPF-addressable memory. Native code only
+/// receives its address through the fifth entry argument, parks that address
+/// outside the BPF register map, and writes this fixed layout when it reaches
+/// a suspending call. Rust owns the value in the invocation future across
+/// every suspension.
+#[repr(C)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NativeContinuation {
+    /// BPF R0..R10. R0 is replaced with the completed kfunc result before
+    /// resume, and R1..R5 are cleared according to the BPF call ABI.
+    pub regs: [u64; 11],
+    /// The one whole-program fuel tank, carried across every resume.
+    pub fuel: u64,
+    /// Zero for initial entry, otherwise a compiler-issued [`SuspendPoint`] id.
+    pub resume_id: u64,
+}
+
+pub(crate) const CONT_REGS_OFF: i32 = 0;
+pub(crate) const CONT_FUEL_OFF: i32 = 11 * 8;
+pub(crate) const CONT_RESUME_ID_OFF: i32 = 12 * 8;
+
+const _: () = assert!(
+    core::mem::offset_of!(NativeContinuation, regs) == CONT_REGS_OFF as usize
+        && core::mem::offset_of!(NativeContinuation, fuel) == CONT_FUEL_OFF as usize
+        && core::mem::offset_of!(NativeContinuation, resume_id) == CONT_RESUME_ID_OFF as usize
+        && core::mem::size_of::<NativeContinuation>() == 13 * core::mem::size_of::<u64>()
+        && core::mem::align_of::<NativeContinuation>() == core::mem::align_of::<u64>(),
+    "native continuation layout must match both emitters"
+);
+
+/// One verifier-resolved `may_suspend` call and its compiler-owned resume id.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SuspendPoint {
+    /// One-based id embedded by codegen and accepted by its resume dispatcher.
+    pub resume_id: u32,
+    /// BPF instruction containing the suspending call.
+    pub insn_index: u32,
+    /// Exact kfunc id resolved by the verifier.
+    pub kfunc_id: i32,
+}
+
+/// Build the continuation table shared by both backends.
+///
+/// Suspension is initially supported only from the root BPF subprogram. A
+/// native host return-address stack cannot be retained across an executor
+/// suspension, so a suspending call in a subprogram falls back to the complete
+/// interpreter until explicit BPF call-state lowering is implemented.
+pub(crate) fn suspend_points(prog: &VerifiedProgram) -> Result<Vec<SuspendPoint>, JitError> {
+    let root_end = prog
+        .subprogs
+        .iter()
+        .filter_map(|s| (s.start != 0).then_some(s.start))
+        .min()
+        .unwrap_or(prog.insns.len() as u32);
+    let mut points = Vec::new();
+    for call in &prog.kfunc_calls {
+        if !call.may_suspend {
+            continue;
+        }
+        if call.context != narf_bpf_verifier::Context::Sleepable
+            || prog.context != narf_bpf_verifier::Context::Sleepable
+        {
+            return Err(JitError::Unsupported {
+                at: call.insn_index,
+                what: "an atomic image cannot contain a suspending call site",
+            });
+        }
+        if call.insn_index >= root_end {
+            return Err(JitError::Unsupported {
+                at: call.insn_index,
+                what: "suspending call inside a BPF subprogram needs explicit call-state lowering",
+            });
+        }
+        let resume_id = u32::try_from(points.len() + 1).map_err(|_| JitError::Unsupported {
+            at: call.insn_index,
+            what: "too many sleepable continuation sites",
+        })?;
+        if resume_id > i32::MAX as u32 {
+            return Err(JitError::Unsupported {
+                at: call.insn_index,
+                what: "continuation id exceeds the portable emitter range",
+            });
+        }
+        points.push(SuspendPoint {
+            resume_id,
+            insn_index: call.insn_index,
+            kfunc_id: call.id,
+        });
+    }
+    Ok(points)
 }
 
 /// Which instructions are arena accesses, indexed by instruction.
@@ -211,6 +312,9 @@ pub struct Compiled {
     /// broke when FineIBT started placing its hash *before* the entry
     /// (`bpf_jit_comp.c:3902`).
     pub entry_off: u32,
+    /// Compiler-issued suspension ids accepted by this image's entry
+    /// dispatcher. Empty for an image that always runs to completion.
+    pub suspend_points: Vec<SuspendPoint>,
 }
 
 /// Why compilation failed.

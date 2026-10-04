@@ -77,6 +77,7 @@ pub(crate) fn verified_calling(items: &[Decoded], sites: &[(u32, i32, usize)]) -
             insn_index,
             id,
             addr,
+            may_suspend: false,
             context: Context::Atomic,
         })
         .collect();
@@ -1527,10 +1528,63 @@ fn a_sleepable_kfuncs_shim_is_never_entered_from_native_code() {
     // reinterpret a boxed future as the program's R0 and leak it, and no
     // amount of correct register shuffling would help.
     let mut prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, SHIM)]);
+    prog.context = Context::Sleepable;
     prog.kfunc_calls[0].context = Context::Sleepable;
+    prog.kfunc_calls[0].may_suspend = true;
+    let compiled = compile(&prog).expect("root sleepable call must compile as a checkpoint");
+    assert_eq!(compiled.suspend_points.len(), 1);
+    assert_eq!(compiled.suspend_points[0].insn_index, 0);
+    assert_eq!(compiled.suspend_points[0].kfunc_id, 7);
+    assert!(
+        !compiled
+            .code
+            .windows(8)
+            .any(|window| window == SHIM.to_le_bytes()),
+        "a sleepable shim address must not be materialised into native code"
+    );
+}
+
+#[test]
+fn a_sync_shim_that_requires_sleepable_context_remains_a_direct_call() {
+    let mut prog = verified_calling(&[kcall(7), EXIT], &[(0, 7, SHIM)]);
+    prog.context = Context::Sleepable;
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    let compiled = compile(&prog).expect("a synchronous process-context call must compile");
+    assert!(
+        compiled.suspend_points.is_empty(),
+        "context alone must not select the boxed-future ABI"
+    );
+    assert!(
+        compiled
+            .code
+            .windows(8)
+            .any(|window| window == SHIM.to_le_bytes()),
+        "the synchronous shim address must be materialised for a direct call"
+    );
+}
+
+#[test]
+fn a_sleepable_call_in_a_subprogram_is_refused_without_call_state_lowering() {
+    let mut prog = verified_calling(
+        &[Decoded::Call(CallTarget::Subprog(1)), EXIT, kcall(7), EXIT],
+        &[(2, 7, SHIM)],
+    );
+    prog.context = Context::Sleepable;
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    prog.kfunc_calls[0].may_suspend = true;
+    prog.subprogs = alloc::vec![
+        narf_bpf_verifier::SubprogInfo {
+            start: 0,
+            stack_bytes: 0,
+        },
+        narf_bpf_verifier::SubprogInfo {
+            start: 2,
+            stack_bytes: 0,
+        },
+    ];
     assert!(matches!(
         compile(&prog),
-        Err(JitError::Unsupported { at: 0, .. })
+        Err(JitError::Unsupported { at: 2, .. })
     ));
 }
 

@@ -38,11 +38,26 @@ fn desc(args: &'static [ArgDesc], ret: ArgDesc, context: Context) -> KfuncDesc {
         addr: 0x1000,
         args,
         ret,
+        may_suspend: false,
         context,
     }
 }
 
 // ─── The sleep-safety rule ──────────────────────────────────────────
+
+#[test]
+fn a_suspending_shim_cannot_claim_atomic_context() {
+    let mut d = desc(&[], ArgDesc::SCALAR64, Context::Atomic);
+    d.may_suspend = true;
+    assert_eq!(d.validate(), Err(KfuncError::SuspendingAtomicShim));
+}
+
+#[test]
+fn a_synchronous_shim_may_still_require_sleepable_context() {
+    let d = desc(&[], ArgDesc::SCALAR64, Context::Sleepable);
+    assert!(!d.may_suspend, "premise: this is the synchronous ABI");
+    assert_eq!(d.validate(), Ok(()));
+}
 
 #[test]
 fn only_owned_and_sleepable_rcu_survive_await() {

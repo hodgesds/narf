@@ -221,6 +221,7 @@ fn kfunc(
         addr: 0x1000,
         args,
         ret,
+        may_suspend: false,
         context,
     }
 }
@@ -624,7 +625,9 @@ fn unlock_kfunc() -> KfuncDesc {
 
 /// A kfunc that may sleep. Calling it is an await point.
 fn sleepy_kfunc() -> KfuncDesc {
-    kfunc("narf_yield", NO_ARGS, ArgDesc::VOID, Context::Sleepable)
+    let mut desc = kfunc("narf_yield", NO_ARGS, ArgDesc::VOID, Context::Sleepable);
+    desc.may_suspend = true;
+    desc
 }
 
 // ── ALU ─────────────────────────────────────────────────────────────
@@ -1094,6 +1097,7 @@ fn a_variable_stack_offset_kfunc_region_is_still_rejected() {
             ArgDesc::SCALAR64,
         ],
         ret: ArgDesc::SCALAR64,
+        may_suspend: false,
         context: Context::Atomic,
     }];
     let mut p = vec![st(Size::Dw, 10, -8, 0), st(Size::Dw, 10, -16, 0)];
@@ -1695,6 +1699,76 @@ fn a_trusted_pointer_cannot_cross_an_await() {
             domain: ValidityDomain::NonPreemptible,
         }
     );
+}
+
+#[test]
+fn a_non_sleep_safe_pointer_cannot_be_captured_by_a_suspending_kfunc() {
+    // R1 is dead after the call, but the boxed shim future owns the `Trusted`
+    // wrapper while it is Pending. Post-call liveness alone cannot catch this.
+    let mut takes_trusted = kfunc(
+        "sleepy_takes_trusted",
+        TRUSTED_ARG,
+        ArgDesc::VOID,
+        Context::Sleepable,
+    );
+    takes_trusted.may_suspend = true;
+    let k = [
+        kfunc(
+            "get_trusted",
+            NO_ARGS,
+            ptr_desc(
+                PtrKind::Object,
+                ValidityDomain::NonPreemptible,
+                ArgFlags::NONE,
+            ),
+            Context::Atomic,
+        ),
+        takes_trusted,
+    ];
+    let e = check_full(
+        &[call(0), movr(1, 0), call(1), mov(0, 0), EXIT],
+        &[],
+        &k,
+        Context::Sleepable,
+    )
+    .unwrap_err();
+    assert_eq!(
+        e,
+        VerifyError::PointerCrossesAwait {
+            at: 2,
+            reg: 1,
+            domain: ValidityDomain::NonPreemptible,
+        }
+    );
+}
+
+#[test]
+fn an_owned_pointer_may_be_borrowed_by_a_suspending_kfunc() {
+    let mut borrows_trusted = kfunc(
+        "sleepy_borrows_trusted",
+        TRUSTED_ARG,
+        ArgDesc::VOID,
+        Context::Sleepable,
+    );
+    borrows_trusted.may_suspend = true;
+    let k = [acquire_kfunc(), borrows_trusted, release_kfunc()];
+    check_full(
+        &[
+            call(0),
+            jmp(CondOp::Eq, 0, 0, 6),
+            movr(6, 0),
+            movr(1, 6),
+            call(1),
+            movr(1, 6),
+            call(2),
+            mov(0, 0),
+            EXIT,
+        ],
+        &[],
+        &k,
+        Context::Sleepable,
+    )
+    .expect("a refcounted object stays alive while the boxed shim is pending");
 }
 
 #[test]
@@ -2616,6 +2690,7 @@ fn a_map_value_pointer_may_be_passed_as_a_byte_region() {
             ArgDesc::SCALAR64,
         ],
         ret: ArgDesc::SCALAR64,
+        may_suspend: false,
         context: Context::Atomic,
     };
     // The whole 8-byte value: in bounds.
@@ -2658,6 +2733,7 @@ fn a_map_handle_satisfies_a_trusted_object_parameter() {
             flags: ArgFlags::NONE,
         }],
         ret: ArgDesc::SCALAR64,
+        may_suspend: false,
         context: Context::Atomic,
     };
     let ok = check_all(
@@ -2714,6 +2790,7 @@ fn a_shifted_map_handle_is_not_a_map_handle() {
             flags: ArgFlags::NONE,
         }],
         ret: ArgDesc::SCALAR64,
+        may_suspend: false,
         context: Context::Atomic,
     };
     let e = check_all(
@@ -3270,6 +3347,7 @@ fn verify_typed_field_with_context(
         addr: 0x1000,
         args,
         ret: ArgDesc::SCALAR64,
+        may_suspend: false,
         context: Context::Atomic,
     }];
     let fields = [ObjectField { offset: 8, size: 8 }];
@@ -3831,6 +3909,7 @@ fn a_resolved_kfunc_call_records_the_site_the_emitter_will_ask_about() {
             insn_index: 0,
             id: 0,
             addr: 0xDEAD_0000,
+            may_suspend: false,
             context: Context::Atomic,
         }],
     );
@@ -3885,20 +3964,23 @@ fn a_call_inside_a_loop_is_recorded_once_however_often_the_block_is_reanalysed()
 }
 
 #[test]
-fn the_recorded_context_is_the_kfuncs_and_not_the_programs() {
-    // A sleepable kfunc's shim returns a boxed future rather than a `u64`, so
-    // native code must not enter it through the uniform ABI. The emitter's only
-    // evidence for that is this field, and it must describe the *callee* — a
-    // sleepable program calling an atomic kfunc is legal, and recording the
-    // program's context would make that call look uncallable.
-    let k = [
+fn the_recorded_context_and_abi_are_the_kfuncs_and_not_the_programs() {
+    // The emitter must learn both independent callee properties. Context is
+    // the verifier's admission/await rule; `may_suspend` selects between the
+    // direct `u64` ABI and the boxed-future checkpoint ABI. A sleepable program
+    // calling an atomic synchronous kfunc is legal, so neither property may be
+    // inferred from the program context.
+    let mut k = [
         kfunc_at("atomic_one", 0x4444_0000),
         kfunc("sleepy", NO_ARGS, ArgDesc::SCALAR64, Context::Sleepable),
     ];
+    k[1].may_suspend = true;
     let v = check_full(&[call(0), call(1), EXIT], &[], &k, Context::Sleepable)
         .expect("a sleepable program may call either");
     assert_eq!(v.kfunc_calls[0].context, Context::Atomic);
+    assert!(!v.kfunc_calls[0].may_suspend);
     assert_eq!(v.kfunc_calls[1].context, Context::Sleepable);
+    assert!(v.kfunc_calls[1].may_suspend);
 }
 
 #[test]

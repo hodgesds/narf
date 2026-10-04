@@ -216,7 +216,8 @@ use narf_memory::bpf_text::{self, Jit, TextAlloc};
 
 /// The ABI of a compiled program.
 ///
-/// `(frame_top, ctx_ptr, fuel, arena_slot_base) -> (value, status)`.
+/// `(frame_top, ctx_ptr, fuel, arena_slot_base, continuation_ptr) ->
+/// (value, status)`.
 ///
 /// The prologue moves `frame_top` into the host register R10 maps to and
 /// `ctx_ptr` into R1's, so the same image runs on the per-CPU region and on a
@@ -227,6 +228,12 @@ use narf_memory::bpf_text::{self, Jit, TextAlloc};
 /// access; a program with no arena access never reads it, and passing zero for
 /// one is harmless.
 ///
+/// `continuation_ptr` names future-owned [`narf_bpf_jit::NativeContinuation`]
+/// storage. An image with no `may_suspend` call ignores it. A continuation-enabled
+/// image parks it outside the BPF register map, checkpoints into it on
+/// `status::SUSPEND`, and accepts only compiler-issued ids in its entry
+/// dispatcher.
+///
 /// The `u128` return is SysV's `rax:rdx` pair: the low half is R0, the high half
 /// is a [`narf_bpf_jit::status`] code. Out of band deliberately — an in-band
 /// sentinel was tried and removed, because the obvious choice (`u64::MAX`) is
@@ -234,7 +241,7 @@ use narf_memory::bpf_text::{self, Jit, TextAlloc};
 /// have been the same answer. A code rather than a boolean since the arena
 /// lowering landed: on `ARENA_FAULT` the low half carries the offending handle,
 /// which is the one case where it means something other than R0.
-pub type JitEntry = unsafe extern "C" fn(u64, u64, u64, u64) -> u128;
+pub type JitEntry = unsafe extern "C" fn(u64, u64, u64, u64, u64) -> u128;
 
 /// A compiled program's text, freed on drop.
 #[derive(Debug)]
@@ -249,6 +256,9 @@ pub struct JitImage {
     /// from `VerifiedProgram::uses_arena`, because it is the *emitted code* that
     /// will do the dereferencing.
     arena: bool,
+    /// Exact suspension sites and compiler-issued ids accepted by the image's
+    /// entry dispatcher.
+    suspend_points: alloc::vec::Vec<narf_bpf_jit::SuspendPoint>,
 }
 
 impl JitImage {
@@ -296,6 +306,17 @@ impl JitImage {
     #[must_use]
     pub fn uses_arena(&self) -> bool {
         self.arena
+    }
+
+    /// Resolve a status-returned continuation id against immutable compiler
+    /// metadata. Native code never supplies a resume address directly.
+    #[inline]
+    #[must_use]
+    pub fn suspend_point(&self, resume_id: u32) -> Option<narf_bpf_jit::SuspendPoint> {
+        self.suspend_points
+            .iter()
+            .copied()
+            .find(|point| point.resume_id == resume_id)
     }
 }
 
@@ -595,5 +616,6 @@ pub fn try_compile(
         alloc: Some(a),
         entry,
         arena,
+        suspend_points: compiled.suspend_points,
     })
 }

@@ -1317,7 +1317,7 @@ argument = "The async extension remains inside the existing untrusted BPF runtim
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "A sleepable program is loaded and dispatched only through an exact immutable method contract with a closed kfunc allowlist, scalar-only context, bounded fuel, and Context::Sleepable. NonPreemptible and RcuRead values remain verifier errors across every sleepable kfunc call. The future owns its heap stack; BPF domain rights are entered for each poll and restored before Pending, so no CPU-local stack lease or hardware-rights snapshot migrates."
+argument = "A sleepable program is loaded and dispatched only through an exact immutable method contract with a closed kfunc allowlist, scalar-only context, bounded fuel, and Context::Sleepable. NonPreemptible and RcuRead values remain verifier errors across every sleepable kfunc call; a may-suspend shim also rejects them in its arguments even when the BPF register is dead after the call, because the boxed future can retain the converted Rust value while pending. The future owns its heap stack; BPF domain rights are entered for each poll and restored before Pending, so no CPU-local stack lease or hardware-rights snapshot migrates."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
@@ -1337,17 +1337,25 @@ argument = "Each mixed-target method retains its own immutable context, scalar A
 ref = "security-model/specification/spec.md#L42"
 argument = "Atomic and sleepable methods share only the existing Arc-owned adapter, program set, generation, and release/acquire admission gate. They do not share VM stacks or domain guards. Link close and replacement stop new calls of both kinds; previously admitted sleepable futures retain their existing owned-state completion and cancellation rules. No pointer-bearing context or physical-to-frame translation API is added."
 
-# Run-to-completion native sleepable execution. The dedicated security-review
-# skill was not available in this session; human security review remains
-# mandatory.
+# Native sleepable execution and checkpoint/resume. The dedicated
+# security-review skill was not available in this session; human security
+# review remains mandatory.
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "The native sleepable fast path remains inside the existing untrusted BPF runtime and JIT. It changes no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model implementation and adds no trusted subsystem or authority."
+argument = "Native sleepable execution remains inside the existing untrusted BPF runtime and JIT. It changes no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model implementation and adds no trusted subsystem or authority."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "A sleepable program enters native code only when the existing fail-closed emitters compiled its entire verified image; those emitters reject every resolved Context::Sleepable kfunc call rather than calling an async shim through the synchronous ABI. The invocation uses an owned heap stack and executes inside the per-poll BPF domain wrapper. Images that can suspend start in the interpreter, so no partially executed native state is translated or resumed."
+argument = "A sleepable program enters native code only when a fail-closed emitter compiled its entire verified image. At a root-program call whose verifier metadata says the shim may suspend, emitted code saves R0-R10 and remaining fuel into hidden future-owned state and returns a compiler-issued id; a synchronous shim that merely requires Sleepable context remains a direct call. Rust resolves the id against immutable image metadata and invokes the registry's typed Sleepable shim. Native code never calls the boxed-future shim through the synchronous ABI and never accepts a continuation-provided address. Unknown ids trap, while a suspending call inside a BPF subprogram rejects compilation before execution and selects the complete interpreter."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The generic sleepable dispatcher now rejects Context::Atomic programs explicitly, while contract-bound programs retain exact StructOpsContract checks before reaching the shared inner path. Native and interpreted sleepable paths use the same scalar context, map and arena ownership, fuel budget, result validation, accounting, and domain-restoration rules; no pointer, frame handle, or physical-memory translation surface is introduced."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The invocation future owns the heap stack, normalized context tuple, register/fuel checkpoint, and boxed kfunc future. Every native slice and every kfunc-future poll enters a fresh BPF hardware-domain scope and restores neutral rights before Pending; no per-CPU lease, lock guard, host return-address stack, or hardware-rights snapshot crosses suspension. Dropping the invocation cancels by dropping the typed future and all continuation storage."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Resume validation requires the status id and saved id to agree, the saved R10 to equal the owned heap-stack top, and remaining fuel not to exceed the original tank. The compiler-emitted dispatcher clears the id, restores registers and fuel, and branches only to its fixed post-call target. Tests cover multiple distinct resume sites, callee-saved and heap-stack state, a bounded stack slice retained by an async shim, rejection of a dead-after-call non-sleep-safe argument, native/interpreter parity, domain restoration, cancellation, detach, and nested-call fallback."
