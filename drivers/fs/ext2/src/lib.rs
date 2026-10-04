@@ -71,6 +71,7 @@ pub fn register_initcalls() {
             narf_block::fs_detect::FsType::Ext,
             ext_factory,
         );
+        register_fstypes();
         InitResult::Ok
     });
 }
@@ -93,4 +94,21 @@ fn ext_factory(
     let volume =
         narf_scheduler::block_on(volume::Ext2Volume::mount(async_dev, DomainId::DRIVER_0))?;
     Ok(volume as Arc<dyn narf_filesystem::FsInstance>)
+}
+
+/// Register named mount constructors without mounting a volume.
+pub fn register_fstypes() {
+    narf_filesystem::register_block_fstype("ext2", build_named);
+    narf_filesystem::register_block_fstype("ext3", build_named);
+    narf_filesystem::register_block_fstype("ext4", build_named);
+}
+
+fn build_named(
+    source: &str,
+    options: &str,
+) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
+    mount_opts::validate_remount(options)?;
+    let name = source.strip_prefix("/dev/").unwrap_or(source);
+    let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
+    ext_factory(dev)
 }

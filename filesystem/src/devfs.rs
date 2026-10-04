@@ -26,7 +26,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::devfs_vt::{
@@ -594,136 +594,45 @@ pub fn register_fb0(node: Arc<dyn FileOps>) {
     *FB0_NODE.lock() = Some(node);
 }
 
-// ── /dev/rfcomm<N> hook ───────────────────────────────────────────────────
-// Linux ref: `net/bluetooth/rfcomm/tty.c:318` — rfcomm_dev_add.
-
-static RFCOMM_LOOKUP_HOOK: AtomicUsize = AtomicUsize::new(0);
-static RFCOMM_ENUM_HOOK: AtomicUsize = AtomicUsize::new(0);
+// Driver families share one typed registry; these wrappers preserve the
+// existing driver-facing API while new drivers register a DeviceProvider.
+mod providers;
+pub use providers::{register_provider, unregister_provider, DeviceProvider};
 
 pub fn install_rfcomm_hooks(
-    lookup: fn(&str) -> Option<Arc<dyn FileOps>>,
-    enumerate: fn() -> Vec<(String, FileType)>,
+    lookup: providers::DeviceLookup,
+    enumerate: providers::DeviceEnumeration,
 ) {
-    RFCOMM_LOOKUP_HOOK.store(lookup as usize, Ordering::Release);
-    RFCOMM_ENUM_HOOK.store(enumerate as usize, Ordering::Release);
+    register_provider(DeviceProvider {
+        name: "rfcomm",
+        lookup,
+        lookup_dir: |_| None,
+        enumerate,
+    });
 }
-
-fn rfcomm_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
-    let ptr = RFCOMM_LOOKUP_HOOK.load(Ordering::Acquire);
-    if ptr == 0 {
-        return None;
-    }
-    // SAFETY: `ptr` is non-zero (checked above) and was produced by
-    // `install_rfcomm_hooks` storing a `fn(&str) -> Option<Arc<dyn FileOps>>`
-    // via `as usize`. A function-pointer round-trip through `usize` is valid
-    // because they have identical size/alignment, and we transmute back to the
-    // exact same signature, so the resulting `f` points at a live function.
-    // SAFETY: Valid memory or trusted environment
-    let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
-    f(name)
-}
-
-fn rfcomm_enumerate() -> Vec<(String, FileType)> {
-    let ptr = RFCOMM_ENUM_HOOK.load(Ordering::Acquire);
-    if ptr == 0 {
-        return Vec::new();
-    }
-    // SAFETY: `ptr` is non-zero (checked above) and was produced by
-    // `install_rfcomm_hooks` storing a `fn() -> Vec<(String, FileType)>` via
-    // `as usize`. The transmute back to the identical signature is valid: a
-    // `fn` pointer and `usize` share size/alignment and the value names a live
-    // function.
-    // SAFETY: Valid memory or trusted environment
-    let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
-    f()
-}
-
-// ── /dev/ttyUSB<N> hook ───────────────────────────────────────────────────
-// Linux ref: `drivers/usb/serial/usb-serial.c:tty_port_register_device`.
-
-static TTY_USB_LOOKUP_HOOK: AtomicUsize = AtomicUsize::new(0);
-static TTY_USB_ENUM_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 pub fn install_tty_usb_hooks(
-    lookup: fn(&str) -> Option<Arc<dyn FileOps>>,
-    enumerate: fn() -> Vec<(String, FileType)>,
+    lookup: providers::DeviceLookup,
+    enumerate: providers::DeviceEnumeration,
 ) {
-    TTY_USB_LOOKUP_HOOK.store(lookup as usize, Ordering::Release);
-    TTY_USB_ENUM_HOOK.store(enumerate as usize, Ordering::Release);
+    register_provider(DeviceProvider {
+        name: "tty_usb",
+        lookup,
+        lookup_dir: |_| None,
+        enumerate,
+    });
 }
-
-fn tty_usb_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
-    let ptr = TTY_USB_LOOKUP_HOOK.load(Ordering::Acquire);
-    if ptr == 0 {
-        return None;
-    }
-    // SAFETY: `ptr` is non-zero (checked above) and was produced by
-    // `install_tty_usb_hooks` storing a `fn(&str) -> Option<Arc<dyn FileOps>>`
-    // via `as usize`. Transmuting back to the identical signature is valid
-    // because `fn` pointers and `usize` share size/alignment and the value
-    // names a live function.
-    // SAFETY: Valid memory or trusted environment
-    let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
-    f(name)
-}
-
-fn tty_usb_enumerate() -> Vec<(String, FileType)> {
-    let ptr = TTY_USB_ENUM_HOOK.load(Ordering::Acquire);
-    if ptr == 0 {
-        return Vec::new();
-    }
-    // SAFETY: `ptr` is non-zero (checked above) and was produced by
-    // `install_tty_usb_hooks` storing a `fn() -> Vec<(String, FileType)>` via
-    // `as usize`. Transmuting back to the identical signature is valid because
-    // `fn` pointers and `usize` share size/alignment and the value names a live
-    // function.
-    // SAFETY: Valid memory or trusted environment
-    let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
-    f()
-}
-
-// ── /dev/video<N> hook ────────────────────────────────────────────────────
-// Linux ref: `drivers/media/v4l2-core/v4l2-dev.c:__video_register_device`.
-
-static VIDEO_LOOKUP_HOOK: AtomicUsize = AtomicUsize::new(0);
-static VIDEO_ENUM_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 pub fn install_video_hooks(
-    lookup: fn(&str) -> Option<Arc<dyn FileOps>>,
-    enumerate: fn() -> Vec<(String, FileType)>,
+    lookup: providers::DeviceLookup,
+    enumerate: providers::DeviceEnumeration,
 ) {
-    VIDEO_LOOKUP_HOOK.store(lookup as usize, Ordering::Release);
-    VIDEO_ENUM_HOOK.store(enumerate as usize, Ordering::Release);
-}
-
-fn video_lookup(name: &str) -> Option<Arc<dyn FileOps>> {
-    let ptr = VIDEO_LOOKUP_HOOK.load(Ordering::Acquire);
-    if ptr == 0 {
-        return None;
-    }
-    // SAFETY: `ptr` is non-zero (checked above) and was produced by
-    // `install_video_hooks` storing a `fn(&str) -> Option<Arc<dyn FileOps>>`
-    // via `as usize`. Transmuting back to the identical signature is valid
-    // because `fn` pointers and `usize` share size/alignment and the value
-    // names a live function.
-    // SAFETY: Valid memory or trusted environment
-    let f: fn(&str) -> Option<Arc<dyn FileOps>> = unsafe { core::mem::transmute(ptr) };
-    f(name)
-}
-
-fn video_enumerate() -> Vec<(String, FileType)> {
-    let ptr = VIDEO_ENUM_HOOK.load(Ordering::Acquire);
-    if ptr == 0 {
-        return Vec::new();
-    }
-    // SAFETY: `ptr` is non-zero (checked above) and was produced by
-    // `install_video_hooks` storing a `fn() -> Vec<(String, FileType)>` via
-    // `as usize`. Transmuting back to the identical signature is valid because
-    // `fn` pointers and `usize` share size/alignment and the value names a live
-    // function.
-    // SAFETY: Valid memory or trusted environment
-    let f: fn() -> Vec<(String, FileType)> = unsafe { core::mem::transmute(ptr) };
-    f()
+    register_provider(DeviceProvider {
+        name: "video",
+        lookup,
+        lookup_dir: |_| None,
+        enumerate,
+    });
 }
 
 // ── /dev/dri/ delegate ────────────────────────────────────────────────
@@ -1764,7 +1673,14 @@ impl DirOps for DynamicDirectory {
     }
 
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        Box::new(core::iter::empty())
+        Box::new(
+            self.enumerate(0, usize::MAX)
+                .into_iter()
+                .map(|(name, file_type)| DirEntry {
+                    name: alloc::borrow::Cow::Owned(name),
+                    file_type,
+                }),
+        )
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
@@ -1816,31 +1732,31 @@ impl DirOps for DynamicDirectory {
     }
 }
 
+// A static node has one descriptor for lookup, visibility, type and readdir.
+// Device-family extensions live in the provider registry.
+mod entries;
+
 fn static_entry_type(name: &str) -> Option<FileType> {
-    match name {
-        "fd" | "stdin" | "stdout" | "stderr" | "rtc" => Some(FileType::Symlink),
-        "ptmx" | "null" | "zero" | "full" | "random" | "urandom" | "kmsg" | "console" | "tty"
-        | "tty0" | "tty1" | "uinput" | "fuse" | "fp0" | "fb0" | "tpm0" | "tpmrm0" | "rtc0" => {
-            Some(FileType::Special)
-        }
-        "pts" | "shm" | "mqueue" | "hugepages" | "disk" | "input" | "snd" | "dri" => {
-            Some(FileType::Dir)
-        }
-        n if crate::devfs_vt::parse_vcs(n).is_some() => Some(FileType::Special),
-        _ => None,
-    }
+    entries::find(name)
+        .map(|entry| entry.file_type)
+        .or_else(|| {
+            if crate::devfs_vt::parse_vcs(name).is_some() || vt_number(name).is_some() {
+                Some(FileType::Special)
+            } else {
+                None
+            }
+        })
 }
 
-fn static_entry_visible(name: &str) -> bool {
-    match name {
-        "fp0" => FP_NODE.lock().is_some(),
-        "fb0" => FB0_NODE.lock().is_some(),
-        "tpm0" => TPM0_NODE.lock().is_some(),
-        "tpmrm0" => TPMRM0_NODE.lock().is_some(),
-        "snd" => SND_DIR.lock().is_some(),
-        "dri" => DRI_DIR.lock().is_some(),
-        _ => true,
+fn vt_number(name: &str) -> Option<u32> {
+    let value = name.strip_prefix("tty")?;
+    if !value.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
     }
+    value
+        .parse()
+        .ok()
+        .filter(|v| (2..=crate::vt::MAX_VT).contains(v))
 }
 
 /// `DevFs` root directory. Static device paths have precedence, while the
@@ -1890,143 +1806,27 @@ impl DirOps for DevDir {
     }
 
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-        match name {
-            // Static symlinks [[devfs-symlinks]].
-            "fd" => Some(Arc::new(DevSymlink {
-                target: "/proc/self/fd".into(),
-                inode: named_inode("fd", 2),
-            }) as Arc<dyn FileOps>),
-            "stdin" => Some(Arc::new(DevSymlink {
-                target: "/proc/self/fd/0".into(),
-                inode: named_inode("stdin", 2),
-            }) as Arc<dyn FileOps>),
-            "stdout" => Some(Arc::new(DevSymlink {
-                target: "/proc/self/fd/1".into(),
-                inode: named_inode("stdout", 2),
-            }) as Arc<dyn FileOps>),
-            "stderr" => Some(Arc::new(DevSymlink {
-                target: "/proc/self/fd/2".into(),
-                inode: named_inode("stderr", 2),
-            }) as Arc<dyn FileOps>),
-            "null" => Some(Arc::new(DevNull) as Arc<dyn FileOps>),
-            "zero" => Some(Arc::new(DevZero) as Arc<dyn FileOps>),
-            "full" => Some(Arc::new(crate::devfs_misc::DevFull) as Arc<dyn FileOps>),
-            "random" => Some(Arc::new(DevBlockingRandom) as Arc<dyn FileOps>),
-            "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
-            "kmsg" => Some(Arc::new(DevKmsg::default()) as Arc<dyn FileOps>),
-            // `tty1` is the conventional first VT node — `getty@tty1.service`
-            // (and login on it) opens it. NARF has one console, so it and the
-            // `tty0`/`console` aliases all resolve to the same singleton tty.
-            "console" => Some(Arc::new(DevConsole {
-                kind: ConsoleNodeKind::Console,
-            }) as Arc<dyn FileOps>),
-            "tty" => Some(Arc::new(DevConsole {
-                kind: ConsoleNodeKind::CurrentTty,
-            }) as Arc<dyn FileOps>),
-            "tty0" => Some(Arc::new(DevConsole {
-                kind: ConsoleNodeKind::Virtual(0),
-            }) as Arc<dyn FileOps>),
-            "tty1" => Some(Arc::new(DevConsole {
-                kind: ConsoleNodeKind::Virtual(1),
-            }) as Arc<dyn FileOps>),
-            // /dev/ttyN for N in 2..=MAX_VT — the VTs a display manager allocates
-            // via VT_OPENQRY and runs a session on. tty0/tty1 are handled above;
-            // NARF has one physical console, so every VT node maps to the same
-            // singleton tty and differs only in its VT number (for VT ioctls).
-            n if n.starts_with("tty")
-                && n.len() > 3
-                && n[3..].bytes().all(|c| c.is_ascii_digit())
-                && n[3..]
-                    .parse::<u32>()
-                    .map(|v| (2..=crate::vt::MAX_VT).contains(&v))
-                    .unwrap_or(false) =>
-            {
-                let v = n[3..].parse::<u32>().unwrap_or(0);
-                Some(Arc::new(DevConsole {
-                    kind: ConsoleNodeKind::Virtual(v),
-                }) as Arc<dyn FileOps>)
-            }
-            // /dev/vcs, /dev/vcsu, /dev/vcsa and their per-VT forms for every
-            // allocated VT (`vc_screen.c`) — systemd-vconsole-setup's test
-            // for "is VT N allocated".
-            n if crate::devfs_vt::parse_vcs(n).is_some() => {
-                let (kind, vt) = crate::devfs_vt::parse_vcs(n)?;
-                Some(Arc::new(crate::devfs_vt::DevVcs { kind, vt }) as Arc<dyn FileOps>)
-            }
-            // devtmpfs's `c 5:2` (`tty_devnode`: 0666). Opening it finds the
-            // devpts mounted at `pts` beside it (`devpts_acquire`).
-            "ptmx" => Some(Arc::new(crate::devfs_pty::DevTmpfsPtmx) as Arc<dyn FileOps>),
-            "fb0" if FB0_NODE.lock().is_some() => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
-            // Userspace input-injection control device.
-            // Linux ref: `drivers/input/misc/uinput.c`.
-            "uinput" => {
-                Some(Arc::new(crate::devfs_input::UinputControlFile::new()) as Arc<dyn FileOps>)
-            }
-            // FUSE control device: each open mints a fresh connection.
-            // Linux ref: `fs/fuse/dev.c` — /dev/fuse (misc char, minor 229).
-            "fuse" => Some(Arc::new(DevFuseNode) as Arc<dyn FileOps>),
-            "fp0" if FP_NODE.lock().is_some() => Some(Arc::new(DevFp) as Arc<dyn FileOps>),
-            "tpm0" if TPM0_NODE.lock().is_some() => {
-                Some(Arc::new(DevTpm0Proxy) as Arc<dyn FileOps>)
-            }
-            "tpmrm0" if TPMRM0_NODE.lock().is_some() => {
-                Some(Arc::new(DevTpmRm0Proxy) as Arc<dyn FileOps>)
-            }
-            // Real-time clock char device. `hwclock --show` reads it via
-            // ioctl(RTC_RD_TIME). Linux ref: `drivers/rtc/dev.c`. `/dev/rtc`
-            // is the conventional first-RTC alias — a symlink to rtc0 (this
-            // devfs has a DevSymlink node type [[devfs-symlinks]]).
-            "rtc0" => Some(Arc::new(crate::devfs_rtc::DevRtc) as Arc<dyn FileOps>),
-            "rtc" => Some(Arc::new(DevSymlink {
-                target: "/dev/rtc0".into(),
-                inode: named_inode("rtc", 2),
-            }) as Arc<dyn FileOps>),
-            // Dynamic: ttyUSB<N> USB-to-serial ports.
-            // Linux ref: `drivers/usb/serial/usb-serial.c:tty_port_register_device`.
-            name if name.starts_with("ttyUSB") && name[6..].chars().all(|c| c.is_ascii_digit()) => {
-                tty_usb_lookup(name)
-            }
-            // Dynamic: video<N> V4L2 camera nodes.
-            // Linux ref: `drivers/media/v4l2-core/v4l2-dev.c:__video_register_device`.
-            name if name.starts_with("video") && name[5..].chars().all(|c| c.is_ascii_digit()) => {
-                video_lookup(name)
-            }
-            // Dynamic: rfcomm<N> Bluetooth serial ports.
-            // Linux ref: `net/bluetooth/rfcomm/tty.c:318` — rfcomm_dev_add.
-            name if name.starts_with("rfcomm") && name[6..].chars().all(|c| c.is_ascii_digit()) => {
-                rfcomm_lookup(name)
-            }
-            // Dynamic: query the block-device registry after static names miss.
-            // Covers registered names like "nvme0", "sata0p1", "vblk0", etc.
-            _ => crate::devfs_block::lookup_block_file(name)
-                // Then any node or symlink created in the writable devtmpfs.
-                .or_else(|| dynamic_lookup_file(&DYNAMIC_NODES, name)),
+        if let Some(entry) = entries::find(name) {
+            return (entry.file)();
         }
+        if let Some(vt) = vt_number(name) {
+            return Some(Arc::new(DevConsole {
+                kind: ConsoleNodeKind::Virtual(vt),
+            }));
+        }
+        if let Some((kind, vt)) = crate::devfs_vt::parse_vcs(name) {
+            return Some(Arc::new(crate::devfs_vt::DevVcs { kind, vt }));
+        }
+        providers::lookup(name)
+            .or_else(|| crate::devfs_block::lookup_block_file(name))
+            .or_else(|| dynamic_lookup_file(&DYNAMIC_NODES, name))
     }
 
-    /// Look up a subdirectory.
-    /// - `/dev/pts`   → an empty mountpoint; boot mounts devpts over it
-    /// - `/dev/disk`  → `DevDiskDir` (by-label / by-partuuid lookups)
-    /// - `/dev/input` → `DevInputDir` (evdev event nodes, Wave 12 bridge)
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
-        match name {
-            // devtmpfs has an empty `pts`; the devpts instance is mounted on
-            // it (boot init: `mount_default`, then systemd's own mount).
-            "pts" => Some(Arc::new(DevEmptyDir { inode: 3 }) as Arc<dyn DirOps>),
-            // Mountpoint stubs: an init mounts tmpfs/mqueue/hugetlbfs over
-            // these; they only need to exist so the O_PATH target open works.
-            "shm" => Some(Arc::new(DevEmptyDir { inode: 4 }) as Arc<dyn DirOps>),
-            "mqueue" => Some(Arc::new(DevEmptyDir { inode: 5 }) as Arc<dyn DirOps>),
-            "hugepages" => Some(Arc::new(DevEmptyDir { inode: 6 }) as Arc<dyn DirOps>),
-            "disk" => Some(Arc::new(crate::devfs_block::DevDiskDir) as Arc<dyn DirOps>),
-            "input" => Some(Arc::new(crate::devfs_input::DevInputDir) as Arc<dyn DirOps>),
-            // Sound subsystem — delegate installed by narf-drivers-sound.
-            "snd" => SND_DIR.lock().clone(),
-            // DRM/DRI subsystem — delegate installed by narf-drivers-gpu.
-            // Linux ref: `drivers/gpu/drm/drm_drv.c::drm_dev_register`.
-            "dri" => DRI_DIR.lock().clone(),
-            _ => dynamic_lookup_dir(&DYNAMIC_NODES, name),
+        if let Some(entry) = entries::find(name) {
+            return (entry.directory)();
         }
+        providers::lookup_dir(name).or_else(|| dynamic_lookup_dir(&DYNAMIC_NODES, name))
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
@@ -2065,191 +1865,21 @@ impl DirOps for DevDir {
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        // Static entries only — dynamic block-device names don't
-        // satisfy `&'static str` so they don't appear here; use
-        // `enumerate()` for a full readdir listing.
-        const ENTRIES: &[DirEntry] = &[
-            // Symlinks [[devfs-symlinks]].
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("fd"),
-                file_type: FileType::Symlink,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("stdin"),
-                file_type: FileType::Symlink,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("stdout"),
-                file_type: FileType::Symlink,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("stderr"),
-                file_type: FileType::Symlink,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("null"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("zero"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("full"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("random"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("urandom"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("kmsg"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("console"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("tty"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("tty0"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("tty1"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("ptmx"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("fb0"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("uinput"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("fuse"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("fp0"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("tpm0"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("tpmrm0"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("rtc0"),
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("rtc"),
-                file_type: FileType::Symlink,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("pts"),
-                file_type: FileType::Dir,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("shm"),
-                file_type: FileType::Dir,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("mqueue"),
-                file_type: FileType::Dir,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("hugepages"),
-                file_type: FileType::Dir,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("disk"),
-                file_type: FileType::Dir,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("input"),
-                file_type: FileType::Dir,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("snd"),
-                file_type: FileType::Dir,
-            },
-            DirEntry {
-                name: alloc::borrow::Cow::Borrowed("dri"),
-                file_type: FileType::Dir,
-            },
-        ];
         Box::new(
-            ENTRIES
-                .iter()
-                .filter(|entry| static_entry_visible(&entry.name))
-                .cloned(),
+            self.enumerate(0, usize::MAX)
+                .into_iter()
+                .map(|(name, file_type)| DirEntry {
+                    name: alloc::borrow::Cow::Owned(name),
+                    file_type,
+                }),
         )
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
-        // Static entries plus all registered block devices. Block
-        // devices that share a name with a static entry are skipped
-        // (static entry wins, matching Linux's static-node precedence).
-        let static_entries: &[(&str, FileType)] = &[
-            // Symlinks [[devfs-symlinks]].
-            ("fd", FileType::Symlink),
-            ("stdin", FileType::Symlink),
-            ("stdout", FileType::Symlink),
-            ("stderr", FileType::Symlink),
-            ("null", FileType::Special),
-            ("zero", FileType::Special),
-            ("full", FileType::Special),
-            ("random", FileType::Special),
-            ("urandom", FileType::Special),
-            ("kmsg", FileType::Special),
-            ("console", FileType::Special),
-            ("tty", FileType::Special),
-            ("tty0", FileType::Special),
-            ("tty1", FileType::Special),
-            ("ptmx", FileType::Special),
-            ("fb0", FileType::Special),
-            ("uinput", FileType::Special),
-            ("fuse", FileType::Special),
-            ("fp0", FileType::Special),
-            ("tpm0", FileType::Special),
-            ("tpmrm0", FileType::Special),
-            ("rtc0", FileType::Special),
-            ("rtc", FileType::Symlink),
-            ("pts", FileType::Dir),
-            ("shm", FileType::Dir),
-            ("mqueue", FileType::Dir),
-            ("hugepages", FileType::Dir),
-            ("disk", FileType::Dir),
-            ("input", FileType::Dir),
-            ("snd", FileType::Dir),
-            ("dri", FileType::Dir),
-        ];
-        let static_names: Vec<String> = static_entries.iter().map(|(n, _)| (*n).into()).collect();
-        let block_extras: Vec<(String, FileType)> = crate::devfs_block::enumerate_block_devices()
+        let block_extras = crate::devfs_block::enumerate_block_devices()
             .into_iter()
-            .filter(|(name, _)| !static_names.iter().any(|s| s == name))
-            .collect();
-
-        let rfcomm_extras = rfcomm_enumerate();
-        let tty_usb_extras = tty_usb_enumerate();
-        let video_extras = video_enumerate();
+            .filter(|(name, _)| static_entry_type(name).is_none());
+        let provider_extras = providers::enumerate();
         let vcs_extras: Vec<(String, FileType)> = crate::devfs_vt::vcs_names()
             .into_iter()
             .map(|name| (name, FileType::Special))
@@ -2258,19 +1888,26 @@ impl DirOps for DevDir {
         // with a static name.
         let dynamic_extras: Vec<(String, FileType)> = dynamic_enumerate(&DYNAMIC_NODES)
             .into_iter()
-            .filter(|(name, _)| !static_names.iter().any(|s| s == name))
+            .filter(|(name, _)| static_entry_type(name).is_none())
             .collect();
 
-        static_entries
+        let tty_extras =
+            (2..=crate::vt::MAX_VT).map(|v| (alloc::format!("tty{v}"), FileType::Special));
+        let mut seen = alloc::collections::BTreeSet::new();
+        entries::ENTRIES
             .iter()
-            .filter(|(name, _)| static_entry_visible(name))
-            .map(|(n, t)| ((*n).into(), *t))
+            .filter(|entry| (entry.visible)())
+            .map(|entry| (entry.name.into(), entry.file_type))
+            .chain(
+                provider_extras
+                    .into_iter()
+                    .filter(|(name, _)| static_entry_type(name).is_none()),
+            )
             .chain(block_extras)
-            .chain(rfcomm_extras)
-            .chain(tty_usb_extras)
-            .chain(video_extras)
             .chain(vcs_extras)
+            .chain(tty_extras)
             .chain(dynamic_extras)
+            .filter(|(name, _)| seen.insert(name.clone()))
             .skip(cursor)
             .take(max)
             .collect()

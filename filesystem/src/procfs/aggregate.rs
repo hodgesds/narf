@@ -1386,3 +1386,27 @@ kernel_test_in!(
     "filesystem/procfs/aggregate",
     smoke_crypto_returns_algorithms
 );
+
+fn smoke_filesystems_lists_unmounted_registered_types() -> TestResult {
+    use crate::FsError;
+    fn unused_builder(_: &str, _: &str) -> Result<Arc<dyn crate::FsInstance>, FsError> {
+        Err(FsError::InvalidData)
+    }
+    crate::register_fstype("unmounted-nodev-fixture", unused_builder);
+    crate::register_block_fstype("unmounted-block-fixture", unused_builder);
+    let text = super::gen_filesystems();
+    if text
+        .lines()
+        .any(|line| line == "nodev\tunmounted-nodev-fixture")
+        && text.lines().any(|line| line == "\tunmounted-block-fixture")
+        && !text.lines().any(|line| line == "nodev\t9p")
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("proc filesystems disagrees with type registry")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_filesystems_lists_unmounted_registered_types
+);

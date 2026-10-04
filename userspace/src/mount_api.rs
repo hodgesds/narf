@@ -28,7 +28,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use narf_filesystem::{FileOps, FsError, FsFuture, FsInstance, MemFs, Mode, RamFs, Stat, TmpFs};
+use narf_filesystem::{FileOps, FsError, FsFuture, FsInstance, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
@@ -130,6 +130,8 @@ struct FsContext {
 enum CtxPhase {
     /// fsopen: parameters accepted, CMD_CREATE pending.
     CreateParams,
+    /// A constructor is running with the context lock released.
+    Creating,
     /// CMD_CREATE succeeded; only fsmount is legal.
     AwaitingMount,
     /// fspick, or after fsmount (`vfs_clean_context`): parameters and
@@ -246,119 +248,55 @@ fn mount_of(task: u64, fd_no: u32) -> Option<u64> {
     fd::with_table(task, |t| t.get(fd_no).and_then(|e| e.ops.mount_object_id())).flatten()
 }
 
-// procfs / sysfs / cgroupfs backends are compiled only when their crate
-// feature is enabled. When it isn't, `mount -t proc|sysfs|cgroup2` still
-// succeeds against an empty in-memory directory so systemd's mount unit
-// passes (it degrades gracefully when the contents are absent).
-fn real_procfs() -> Option<Arc<dyn FsInstance>> {
-    Some(Arc::new(narf_filesystem::procfs::ProcFs))
-}
-
-fn real_sysfs() -> Option<Arc<dyn FsInstance>> {
-    Some(Arc::new(narf_filesystem::SysFs::new()))
-}
-
-#[cfg(feature = "cgroup")]
-fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
-    Some(Arc::new(narf_filesystem::CgroupFs::new()))
-}
-#[cfg(not(feature = "cgroup"))]
-fn real_cgroupfs() -> Option<Arc<dyn FsInstance>> {
-    Some(Arc::new(MemFs::new("cgroup2")))
-}
-
-/// Build an `FsInstance` for a known filesystem type, or return `None` for a
-/// genuinely unsupported / garbage fstype (the caller maps `None` to
-/// `-ENODEV`, matching Linux).
-///
-/// The dispatch is shared by both the classic `mount(2)` path and the new
-/// mount API (fsopen → fsconfig(CMD_CREATE) → fsmount → move_mount) so the two
-/// entry points recognize exactly the same set of filesystems.
-///
-/// Three classes of fstype are handled:
-///   * real NARF backends — tmpfs → `TmpFs`, ramfs → `RamFs`, proc → `ProcFs`,
-///     sysfs → `SysFs`, devtmpfs → `DevFs`, cgroup2 → `CgroupFs`,
-///     devpts → `DevPtsFs`, bpf → `BpfFs`.
-///   * pseudo-filesystems systemd mounts during early boot for which NARF has
-///     no real semantics (securityfs, debugfs, tracefs, configfs, fusectl,
-///     pstore, hugetlbfs, …). These get a
-///     minimal empty in-memory directory so the mountpoint exists and is
-///     statable/traversable; systemd degrades gracefully when the contents
-///     are absent.
-///   * everything else — `None` → `-ENODEV`.
+/// Convenience wrapper for filesystem consumers without mount options.
 pub fn build_fs(fsname: &str) -> Option<Arc<dyn FsInstance>> {
     build_fs_with_options(fsname, "", 0, 0).ok().flatten()
 }
 
-/// Build a filesystem while applying its Linux filesystem-specific mount
-/// options and mount-creator ownership.
+/// Construct from the shared type registry, outside all mount/context locks.
 pub fn build_fs_with_options(
     fsname: &str,
     options: &str,
     uid: u32,
     gid: u32,
 ) -> Result<Option<Arc<dyn FsInstance>>, FsError> {
-    // Map a known pseudo-fstype to a stable &'static str name so `MemFs::new`
-    // (which takes &'static str) reflects the requested type in listings.
-    let empty =
-        |name: &'static str| -> Option<Arc<dyn FsInstance>> { Some(Arc::new(MemFs::new(name))) };
-    Ok(match fsname {
-        // In-memory data filesystems.
-        "tmpfs" => Some(Arc::new(TmpFs::from_options(options, uid, gid)?)),
-        "ramfs" => Some(Arc::new(RamFs::from_options(options, uid, gid)?)),
-        "memfs" => empty("memfs"),
-        "shmfs" | "shm" => Some(Arc::new(TmpFs::from_options(options, uid, gid)?)),
+    build_fs_from_source(fsname, "", options, uid, gid)
+}
 
-        // Real synthetic backends. procfs/sysfs/cgroupfs are compiled only
-        // with their respective features; without them the mount still
-        // succeeds against an empty directory so systemd's mount unit passes.
-        "proc" | "procfs" => real_procfs(),
-        "sysfs" => real_sysfs(),
-        "devtmpfs" | "devfs" => Some(Arc::new(narf_filesystem::DevFs::new())),
-        "cgroup2" | "cgroup" => real_cgroupfs(),
-        // bpffs: a real filesystem, not an empty directory. `BPF_OBJ_PIN`
-        // refuses any parent that is not one, so mounting a `MemFs` here would
-        // make `mount -t bpf` succeed and every pin into it fail with EPERM.
-        "bpf" | "bpffs" => Some(Arc::new(narf_filesystem::bpffs::BpfFs::new())),
+fn build_fs_from_source(
+    fsname: &str,
+    source: &str,
+    options: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<Option<Arc<dyn FsInstance>>, FsError> {
+    crate::handlers::mount_types::register_mount_types();
+    let Some(fs_type) = narf_filesystem::lookup_fstype(fsname) else {
+        return Ok(None);
+    };
+    let source = apply_chroot(source);
+    fs_type
+        .init(&narf_filesystem::MountRequest {
+            fs_type: fsname,
+            source: &source,
+            options,
+            uid,
+            gid,
+            initial_namespace: crate::handlers::current_mount_namespace().is_none(),
+        })
+        .map(Some)
+}
 
-        // devpts: every mount is a new instance (Linux 4.7+) with its own
-        // index space and uid=/gid=/mode=/ptmxmode=/max= options. The
-        // mounter owns its ptmx node; `reserve` is set only for a mount made
-        // in the initial mount namespace (`devpts_init_fs_context`).
-        "devpts" => Some(Arc::new(
-            narf_filesystem::devfs_pty::DevPtsFs::from_options(
-                options,
-                uid,
-                gid,
-                crate::handlers::current_mount_namespace().is_none(),
-            )?,
-        )),
-
-        // POSIX message queues: the mount and mq_* syscalls share the calling
-        // task's IPC-namespace registry, as Linux mqueue_get_tree does.
-        "mqueue" => Some(crate::mqueue::mount_current_namespace()),
-
-        // Pseudo-filesystems with no NARF semantics: an empty, statable,
-        // writable directory is enough for systemd's mount unit to succeed.
-        "securityfs" => empty("securityfs"),
-        // Real debugfs: a small synthetic tree of runtime kernel-debug knobs
-        // (sched/wake_next, …). Linux mounts debugfs at /sys/kernel/debug.
-        "debugfs" => Some(Arc::new(narf_filesystem::debugfs::DebugFs::new())),
-        "tracefs" => empty("tracefs"),
-        "configfs" => empty("configfs"),
-        "fusectl" => empty("fusectl"),
-        "pstore" => empty("pstore"),
-        // Do not fake EFI persistence: Linux rejects this mount when no EFI
-        // variable backend is available, and so does NARF.
-        "efivarfs" => Some(Arc::new(narf_filesystem::EfivarFs::from_options(
-            options, uid, gid,
-        )?)),
-        "hugetlbfs" => empty("hugetlbfs"),
-        "binfmt_misc" => empty("binfmt_misc"),
-        "autofs" => empty("autofs"),
-
-        _ => None,
-    })
+/// Errors from filesystem construction/attachment are independent of the ABI.
+pub(crate) fn mount_error_errno(error: FsError) -> i64 {
+    match error {
+        FsError::NotFound => ENOENT,
+        FsError::Busy => EBUSY,
+        FsError::PermissionDenied | FsError::OperationNotPermitted => EPERM,
+        FsError::NoSpace => ENOSPC,
+        FsError::Unsupported => EOPNOTSUPP,
+        _ => EINVAL,
+    }
 }
 
 fn context_options(context: &FsContext) -> String {
@@ -806,7 +744,8 @@ pub fn sys_fsopen(ctx: &mut dyn TrapContext) {
     // `get_fs_type`: the same dispatch CMD_CREATE builds from, so the two
     // agree on which names exist ("" included — it names no filesystem).
     let (uid, gid) = crate::handlers::current_fs_ids();
-    if matches!(build_fs_with_options(&fsname, "", uid, gid), Ok(None)) {
+    crate::handlers::mount_types::register_mount_types();
+    if narf_filesystem::lookup_fstype(&fsname).is_none() {
         ctx.set_return(err(ENODEV));
         return;
     }
@@ -960,22 +899,46 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
             // Materialize the filesystem named by fsopen. `vfs_cmd_create`:
             // `if (fc->phase != FS_CONTEXT_CREATE_PARAMS) return -EBUSY;`,
             // and a failed `vfs_get_tree` leaves the context FAILED.
-            let r = with_contexts(|m| {
+            // Claim the context, then release its IRQ-safe lock before the
+            // constructor can wait for I/O or consult task namespace state.
+            let inputs = with_contexts(|m| {
                 let c = m.get_mut(&id)?;
                 if c.phase != CtxPhase::CreateParams {
-                    return Some(Err(None));
+                    return Some(Err(()));
                 }
-                let options = context_options(c);
-                let built = build_fs_with_options(&c.fsname, &options, c.uid, c.gid);
-                c.phase = match built {
-                    Ok(Some(_)) => CtxPhase::AwaitingMount,
-                    _ => CtxPhase::Failed,
+                c.phase = CtxPhase::Creating;
+                Some(Ok((
+                    c.fsname.clone(),
+                    c.options
+                        .get("source")
+                        .and_then(Clone::clone)
+                        .unwrap_or_default(),
+                    context_options(c),
+                    c.uid,
+                    c.gid,
+                )))
+            });
+            let (name, source, options, uid, gid) = match inputs {
+                Some(Ok(inputs)) => inputs,
+                Some(Err(())) => {
+                    ctx.set_return(err(EBUSY));
+                    return;
+                }
+                None => {
+                    ctx.set_return(err(EBADF));
+                    return;
+                }
+            };
+            let built = build_fs_from_source(&name, &source, &options, uid, gid);
+            let r = with_contexts(|m| {
+                let c = m.get_mut(&id)?;
+                c.phase = if matches!(built, Ok(Some(_))) {
+                    CtxPhase::AwaitingMount
+                } else {
+                    CtxPhase::Failed
                 };
                 match built {
                     Ok(Some(fs)) => {
-                        // `vfs_get_tree` builds the superblock with
-                        // `fc->sb_flags` — `fsconfig(SET_FLAG, "ro")` before
-                        // CMD_CREATE is a read-only filesystem from birth.
                         if c.sb_mask != 0 {
                             narf_filesystem::sb_flags::update(&fs, c.sb_flags, c.sb_mask);
                         }
@@ -983,16 +946,13 @@ pub fn sys_fsconfig(ctx: &mut dyn TrapContext) {
                         Some(Ok(true))
                     }
                     Ok(None) => Some(Ok(false)),
-                    Err(error) => Some(Err(Some(error))),
+                    Err(error) => Some(Err(error)),
                 }
             });
             match r {
                 Some(Ok(true)) => ctx.set_return(ok(0)),
                 Some(Ok(false)) => ctx.set_return(err(ENODEV)),
-                Some(Err(None)) => ctx.set_return(err(EBUSY)),
-                Some(Err(Some(FsError::NoSpace))) => ctx.set_return(err(ENOSPC)),
-                Some(Err(Some(FsError::Unsupported))) => ctx.set_return(err(EOPNOTSUPP)),
-                Some(Err(Some(_))) => ctx.set_return(err(EINVAL)),
+                Some(Err(error)) => ctx.set_return(err(mount_error_errno(error))),
                 None => ctx.set_return(err(EBADF)),
             }
         }

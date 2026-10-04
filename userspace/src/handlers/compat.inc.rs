@@ -11975,6 +11975,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Wait4, "wait4", RawFnHandler(sys_wait4));
     table.install_raw(Syscall::Waitid, "waitid", RawFnHandler(sys_waitid));
+    mount_types::register_mount_types();
     table.install_raw(Syscall::Mount, "mount", RawFnHandler(sys_mount));
     table.install_raw(Syscall::Umount2, "umount2", RawFnHandler(sys_umount2));
     table.install_raw(Syscall::Quotactl, "quotactl", RawFnHandler(sys_quotactl));

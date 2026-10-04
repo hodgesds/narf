@@ -1036,6 +1036,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1109,6 +1110,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1125,6 +1127,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -1158,6 +1161,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-scheduler",
 ]
 
 [[package]]
@@ -2263,7 +2267,14 @@ dependencies = [
  "narf-bpf-verifier",
  "narf-capabilities",
  "narf-console",
+ "narf-drivers-fs-btrfs",
+ "narf-drivers-fs-exfat",
+ "narf-drivers-fs-ext2",
  "narf-drivers-fs-fat",
+ "narf-drivers-fs-iso9660",
+ "narf-drivers-fs-minix",
+ "narf-drivers-fs-squashfs",
+ "narf-drivers-fs-udf",
  "narf-filesystem",
  "narf-firmware",
  "narf-initramfs",

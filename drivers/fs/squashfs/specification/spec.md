@@ -22,6 +22,11 @@ are out of scope because SquashFS is an offline-authored read-only format.
 
 ## 3. Public interface
 
+`register_fstypes()` installs `squashfs` in the shared named-mount
+registry without constructing a volume. Both mount syscall APIs invoke the
+registered constructor with a block source and options, then attach its returned
+`Arc<dyn FsInstance>` in the caller's namespace.
+
 - `SquashfsVolume<B: BlockDevice>::mount(device, domain)` validates and mounts
   one volume and implements `narf_filesystem::FsInstance`.
 - `SquashfsNode<B>` implements both `FileOps` and `DirOps` for decoded inodes.

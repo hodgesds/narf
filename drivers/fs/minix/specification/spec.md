@@ -30,7 +30,13 @@ The superblock starts at byte offset **1024** (so on a 512-byte
 device it is sector 2; on a 1024-byte/4096-byte device, block 1).
 Root inode is **inode #1** (NOT 2 — that's ext2; MINIX uses 1).
 
-## 3. Superblock fields
+## 3. Public interface and superblock fields
+
+`register_fstypes()` registers `minix` in the shared named-mount registry.
+The constructor resolves a registered block source, rejects unsupported options,
+and returns an unattached `Arc<dyn FsInstance>` through `MinixVolume::mount`.
+
+### Superblock fields
 
 V1 layout (32 bytes, bytes 0..32 of the on-disk superblock):
 

@@ -43,7 +43,7 @@ pub fn register_initcalls() {
             narf_block::fs_detect::FsType::SquashFs,
             squashfs_factory,
         );
-        narf_filesystem::register_fstype("squashfs", squashfs_fstype_builder);
+        register_fstypes();
         InitResult::Ok
     });
 }
@@ -69,4 +69,9 @@ fn squashfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInst
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(FsError::NotFound)?;
     squashfs_factory(dev)
+}
+
+/// Register the named mount constructor without building a volume.
+pub fn register_fstypes() {
+    narf_filesystem::register_block_fstype("squashfs", squashfs_fstype_builder);
 }

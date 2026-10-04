@@ -28,8 +28,8 @@
 - Block layer — `block/`.
 - Process-scoped "current directory" — that's a `userspace/` concept
   (a task holds a cap to its working directory).
-- POSIX namespace (`/proc`, `/sys`, `/dev`) — NARF does not replicate
-  those; diagnostics come from `observability/` peek API.
+- Process namespace selection and syscall argument copying — these belong to
+  `userspace/`. This crate supplies the shared procfs/sysfs/devtmpfs backends.
 
 ## 2. Assumptions
 
@@ -42,6 +42,44 @@
   (`Cap<FileNode, Traverse>`) that defines what it can reach.
 
 ## 3. Public interface
+
+### 3.0a Filesystem type and device registration
+
+`FileSystemType` describes a mountable type, separately from an instantiated
+`FsInstance`. `lookup_fstype(name) -> Option<FileSystemType>` returns a copy
+without calling filesystem code. `FileSystemType::init(&MountRequest)` builds
+an instance; the caller attaches it with its namespace and mount flags.
+`MountRequest` carries the requested type/subtype, resolved source, filesystem
+options, creator uid/gid and whether this is the initial mount namespace.
+
+- `register_fs_type(FileSystemType)` registers a contextual constructor.
+- `register_fstype(name, FsBuilder)` adapts the existing source/options
+  callback; `register_block_fstype` also records the block-device requirement.
+- Duplicate registration replaces the descriptor. Exact names precede
+  explicitly enabled `name.subtype` matches. Aliases are separate entries.
+- `registered_fstypes()` snapshots this same catalog for `/proc/filesystems`,
+  including unmounted types and the correct `nodev` classification.
+- Registration and lookup never probe devices or construct instances. Callback
+  execution must occur outside registry and syscall context locks. Builtin
+  descriptors are installed lazily; driver registration happens at boot or
+  Linux ABI installation before those syscalls are exposed.
+- Root-device format detection retains its separate `FsType` factory map;
+  that map chooses a driver from on-disk signatures, not a userspace type name.
+
+`devfs::register_provider(DeviceProvider)` registers a named device family with
+file lookup, directory lookup and enumeration callbacks. Replacement is
+idempotent; `unregister_provider` removes the family from every devtmpfs view.
+Callbacks run outside the provider lock. Builtin nodes have one descriptor
+for type, construction and visibility; `iter` and `enumerate` expose the same
+live entries, with duplicate names suppressed. Static names precede providers,
+then the block registry, then udev-created runtime nodes. Existing USB serial,
+video and RFCOMM installation wrappers adapt to this provider API.
+
+`sysfs::register_provider(SysfsProvider)` registers a named boot population
+callback. `populate_all()` snapshots callbacks and invokes them without its
+lock. Providers support explicit refresh after probes and use the existing
+kobject/class registration API. Every sysfs mount shares that live graph;
+mounting a new view never repopulates it or emits device ADD events.
 
 ### 3.0 Root-device orchestration
 

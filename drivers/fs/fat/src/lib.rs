@@ -111,6 +111,7 @@ pub fn register_initcalls() {
             narf_block::fs_detect::FsType::Fat,
             fat_factory,
         );
+        register_fstypes();
         InitResult::Ok
     });
 }
@@ -128,4 +129,24 @@ fn fat_factory(dev: Arc<dyn narf_block::BlockDeviceSync>) -> Result<Arc<dyn FsIn
     let async_dev = SyncBlock::new(dev);
     let vol = narf_scheduler::block_on(volume::FatVolume::mount(async_dev, DomainId::DRIVER_0))?;
     Ok(vol as Arc<dyn FsInstance>)
+}
+
+/// Register named mount constructors without mounting a volume.
+pub fn register_fstypes() {
+    narf_filesystem::register_block_fstype("fat", build_named);
+    narf_filesystem::register_block_fstype("vfat", build_named);
+    narf_filesystem::register_block_fstype("fat16", build_named);
+    narf_filesystem::register_block_fstype("fat32", build_named);
+}
+
+fn build_named(
+    source: &str,
+    options: &str,
+) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
+    if !options.is_empty() {
+        return Err(narf_filesystem::FsError::Unsupported);
+    }
+    let name = source.strip_prefix("/dev/").unwrap_or(source);
+    let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
+    fat_factory(dev)
 }

@@ -2344,25 +2344,100 @@ pub fn populate_rtc_class() {
     kobject_emit_uevent(&rtc0, crate::uevent::UeventAction::Add);
 }
 
-/// Call all `populate_*` functions.  Invoked from the sysfs initcall.
+/// A boot-time projection into the shared kobject registry. Providers must
+/// tolerate refresh after devices probe; mounting sysfs only attaches a view
+/// and never invokes these callbacks or recreates device state.
+#[derive(Clone, Copy, Debug)]
+pub struct SysfsProvider {
+    pub name: &'static str,
+    pub populate: fn(),
+}
+
+static PROVIDERS: IrqSafeSpinLock<Option<Vec<SysfsProvider>>> = IrqSafeSpinLock::new(None);
+
+fn builtin_providers() -> Vec<SysfsProvider> {
+    alloc::vec![
+        SysfsProvider {
+            name: "block",
+            populate: populate_block_class
+        },
+        SysfsProvider {
+            name: "net",
+            populate: populate_net_class
+        },
+        SysfsProvider {
+            name: "input",
+            populate: populate_input_class
+        },
+        SysfsProvider {
+            name: "tty",
+            populate: populate_tty_class
+        },
+        SysfsProvider {
+            name: "kernel",
+            populate: populate_kernel_dir
+        },
+        SysfsProvider {
+            name: "numa",
+            populate: populate_numa_nodes
+        },
+        SysfsProvider {
+            name: "weighted-interleave",
+            populate: populate_weighted_interleave
+        },
+        SysfsProvider {
+            name: "cpu",
+            populate: populate_cpu_devices
+        },
+        SysfsProvider {
+            name: "perf",
+            populate: populate_perf_event_sources
+        },
+        SysfsProvider {
+            name: "leds",
+            populate: populate_leds
+        },
+        SysfsProvider {
+            name: "power-supply",
+            populate: populate_power_supply
+        },
+        SysfsProvider {
+            name: "thermal",
+            populate: populate_thermal
+        },
+        SysfsProvider {
+            name: "hwmon",
+            populate: populate_hwmon
+        },
+        SysfsProvider {
+            name: "rtc",
+            populate: populate_rtc_class
+        },
+    ]
+}
+
+/// Register or replace a population callback, without running it. Device
+/// bridges may also register kobjects directly when handling probe/hotplug.
+pub fn register_provider(provider: SysfsProvider) {
+    let mut guard = PROVIDERS.lock();
+    let providers = guard.get_or_insert_with(builtin_providers);
+    if let Some(old) = providers.iter_mut().find(|old| old.name == provider.name) {
+        *old = provider;
+    } else {
+        providers.push(provider);
+    }
+}
+
+/// Populate registered projections at boot or an explicit refresh point.
+/// Callbacks execute without the provider registry lock held.
 pub fn populate_all() {
-    populate_block_class();
-    populate_net_class();
-    populate_input_class();
-    populate_kernel_dir();
-    populate_numa_nodes();
-    populate_weighted_interleave();
-    populate_cpu_devices();
-    populate_perf_event_sources();
-    // ── Desktop/laptop device classes (single merge-friendly block) ──
-    // /sys/class/{leds,power_supply,thermal,hwmon,rtc} for udev / upower /
-    // lm-sensors / GNOME / KDE enumeration and util-linux / hwclock /
-    // systemd-timesyncd. The RTC's backing chardev is /dev/rtc0.
-    populate_leds();
-    populate_power_supply();
-    populate_thermal();
-    populate_hwmon();
-    populate_rtc_class();
+    let providers = PROVIDERS
+        .lock()
+        .get_or_insert_with(builtin_providers)
+        .clone();
+    for provider in providers {
+        (provider.populate)();
+    }
     // Stub class directories expected by userspace tooling.
     let root = get_root();
     let class_dir = get_or_create_child(&root, "class");
@@ -3017,4 +3092,5 @@ kernel_test_in!(
 #[doc(hidden)]
 pub fn __reset_for_test() {
     *SYSFS_ROOT.lock() = None;
+    *PROVIDERS.lock() = None;
 }

@@ -3352,3 +3352,223 @@ fn _unused_vec_witness() -> Vec<u8> {
 fn _unused_arc_witness() -> Arc<u8> {
     Arc::new(0)
 }
+
+// Both mount ABIs must discover extensions without a syscall-specific arm.
+// The constructor also re-enters fsopen: this would deadlock if fsconfig
+// called it while holding its context lock, and proves fsopen does no init.
+fn smoke_mount_registry_shared_by_legacy_and_fsopen() -> TestResult {
+    use narf_filesystem::{FsError, FsInstance, MemFs};
+    static BUILDS: AtomicU64 = AtomicU64::new(0);
+    fn build(source: &str, options: &str) -> Result<Arc<dyn FsInstance>, FsError> {
+        if source != "registry-source" || options != "token=ok" {
+            return Err(FsError::InvalidData);
+        }
+        // Re-enter the registry and fs-context table from the callback.
+        let mut nested = StubCtx {
+            args: SyscallArgs {
+                arg0: c"tmpfs".as_ptr() as u64,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        crate::mount_api::sys_fsopen(&mut nested);
+        if !matches!(nested.ret, Some(r) if (r.value as i64) >= 0) {
+            return Err(FsError::InvalidData);
+        }
+        BUILDS.fetch_add(1, Ordering::Relaxed);
+        Ok(Arc::new(MemFs::with_seeds(
+            "registry-fixture",
+            &[("marker", b"registered")],
+        )))
+    }
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_ee);
+    crate::fd::__test_reset();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    crate::handlers::mount_types::register_mount_types();
+    narf_filesystem::register_fstype("registry-fixture", build);
+    BUILDS.store(0, Ordering::Relaxed);
+    let result = (|| {
+        let mut open = StubCtx {
+            args: SyscallArgs {
+                arg0: c"registry-fixture".as_ptr() as u64,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        crate::mount_api::sys_fsopen(&mut open);
+        let fd = match open.ret {
+            Some(r) if (r.value as i64) >= 0 => r.value,
+            _ => return TestResult::Fail("fsopen did not discover registered extension"),
+        };
+        if BUILDS.load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("fsopen ran a filesystem constructor");
+        }
+        for (key, value) in [
+            (b"source\0".as_slice(), b"registry-source\0".as_slice()),
+            (b"token\0", b"ok\0"),
+        ] {
+            let mut cfg = StubCtx {
+                args: SyscallArgs {
+                    arg0: fd,
+                    arg1: 1,
+                    arg2: key.as_ptr() as u64,
+                    arg3: value.as_ptr() as u64,
+                    ..Default::default()
+                },
+                ret: None,
+            };
+            crate::mount_api::sys_fsconfig(&mut cfg);
+            if !matches!(cfg.ret, Some(r) if r.value == 0) {
+                return TestResult::Fail("fsconfig SET_STRING failed");
+            }
+        }
+        let mut cfg = StubCtx {
+            args: SyscallArgs {
+                arg0: fd,
+                arg1: 6,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        crate::mount_api::sys_fsconfig(&mut cfg);
+        if !matches!(cfg.ret, Some(r) if r.value == 0) {
+            return TestResult::Fail("registered constructor failed through fsconfig");
+        }
+        let mut mounted = StubCtx {
+            args: SyscallArgs {
+                arg0: fd,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        crate::mount_api::sys_fsmount(&mut mounted);
+        let mfd = match mounted.ret {
+            Some(r) if (r.value as i64) >= 0 => r.value,
+            _ => return TestResult::Fail("fsmount failed"),
+        };
+        ensure_target(b"/registry-new\0");
+        let mut moved = StubCtx {
+            args: move_mount_args(mfd, b"\0", 0, b"/registry-new\0"),
+            ret: None,
+        };
+        crate::mount_api::sys_move_mount(&mut moved);
+        if !matches!(moved.ret, Some(r) if r.value == 0) {
+            return TestResult::Fail("registered detached mount could not attach");
+        }
+        let mut legacy = StubCtx {
+            args: mount_args_with_data(
+                b"registry-source\0",
+                b"/registry-old\0",
+                b"registry-fixture\0",
+                1,
+                b"token=ok\0",
+            ),
+            ret: None,
+        };
+        crate::handlers::sys_mount_for_test(&mut legacy);
+        if !matches!(legacy.ret, Some(r) if r.value == 0) || BUILDS.load(Ordering::Relaxed) != 2 {
+            return TestResult::Fail("legacy and new mount did not use the same constructor");
+        }
+        for path in ["/registry-old", "/registry-new"] {
+            if narf_filesystem::registry()
+                .with_mount(path, |fs| fs.root().lookup("marker").is_some())
+                != Some(true)
+            {
+                return TestResult::Fail("registered filesystem contents missing");
+            }
+        }
+        if narf_filesystem::registry()
+            .mount_flags_exact("/registry-old")
+            .unwrap_or(0)
+            & narf_filesystem::mnt_flags::READONLY
+            == 0
+        {
+            return TestResult::Fail("registered mount lost its readonly flag");
+        }
+        TestResult::Pass
+    })();
+    let _ = unmount_for_test("/registry-old");
+    let _ = unmount_for_test("/registry-new");
+    crate::fd::detach(0x71_ee);
+    result
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_registry_shared_by_legacy_and_fsopen
+);
+
+fn smoke_mount_registry_storage_discovery_and_missing_source() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    set_task(0x71_ef);
+    crate::fd::__test_reset();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    let result = (|| {
+        for name in [
+            "fat", "vfat", "fat16", "fat32", "ext2", "ext3", "ext4", "btrfs", "squashfs", "exfat",
+            "minix", "iso9660", "udf",
+        ] {
+            let c_name = alloc::format!("{name}\0");
+            let mut open = StubCtx {
+                args: SyscallArgs {
+                    arg0: c_name.as_ptr() as u64,
+                    ..Default::default()
+                },
+                ret: None,
+            };
+            crate::mount_api::sys_fsopen(&mut open);
+            let fd = match open.ret {
+                Some(r) if (r.value as i64) >= 0 => r.value,
+                _ => return TestResult::Fail("storage type missing from fsopen registry"),
+            };
+            let mut create = StubCtx {
+                args: SyscallArgs {
+                    arg0: fd,
+                    arg1: 6,
+                    ..Default::default()
+                },
+                ret: None,
+            };
+            crate::mount_api::sys_fsconfig(&mut create);
+            if !matches!(create.ret, Some(r) if r.value as i64 == -crate::errno::ENOENT) {
+                return TestResult::Fail("fsconfig lost missing-device errno");
+            }
+            let mut legacy = StubCtx {
+                args: mount_args(
+                    b"/dev/no-registry-device\0",
+                    b"/registry-missing\0",
+                    c_name.as_bytes(),
+                    0,
+                ),
+                ret: None,
+            };
+            crate::handlers::sys_mount_for_test(&mut legacy);
+            if !matches!(legacy.ret, Some(r) if r.value as i64 == -crate::errno::ENOENT) {
+                return TestResult::Fail("legacy mount disagrees on registered storage type");
+            }
+        }
+        for name in ["not-a-filesystem", "9p", "virtiofs", "xfs"] {
+            let c_name = alloc::format!("{name}\0");
+            let mut open = StubCtx {
+                args: SyscallArgs {
+                    arg0: c_name.as_ptr() as u64,
+                    ..Default::default()
+                },
+                ret: None,
+            };
+            crate::mount_api::sys_fsopen(&mut open);
+            if !matches!(open.ret, Some(r) if r.value as i64 == -crate::errno::ENODEV) {
+                return TestResult::Fail("unregistered filesystem advertised by fsopen");
+            }
+        }
+        TestResult::Pass
+    })();
+    crate::fd::detach(0x71_ef);
+    result
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_registry_storage_discovery_and_missing_source
+);
