@@ -6,7 +6,7 @@
 //!   (GPL-2.0-or-later, kernel.org).
 
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
@@ -169,6 +169,14 @@ pub struct EpollInstance {
     has_nested_parent: core::sync::atomic::AtomicBool,
 }
 
+impl EpollInner {
+    /// (Re)list `fd` on the ready list under a fresh listing number.
+    fn list_ready(&mut self, fd: i32) {
+        self.ready_seq = self.ready_seq.wrapping_add(1);
+        self.ready.insert(fd, self.ready_seq);
+    }
+}
+
 #[derive(Debug)]
 struct EpollInner {
     /// fd → interest record.
@@ -182,7 +190,14 @@ struct EpollInner {
     /// The fast path polls these (plus non-cell-backed fds); a full O(n) scan is
     /// the fallback whenever the fast pass delivers nothing, so an incomplete
     /// list is only ever a missed optimization, never a stranded wake.
-    ready: BTreeSet<i32>,
+    ///
+    /// Each listing carries the `ready_seq` value it was (re)listed under, so
+    /// a scan's write-back drops only a listing it actually consumed: an event
+    /// that arrives during the scan re-lists the fd under a newer number and
+    /// survives to the next wait (Linux's `ovflist`).
+    ready: BTreeMap<i32, u64>,
+    /// Source of `ready` listing numbers; bumped on every (re)listing.
+    ready_seq: u64,
     /// The currently-parked poller's waker, woken when a per-fd waker lists a
     /// ready fd. Set at park, cleared on return.
     parked_waker: Option<core::task::Waker>,
@@ -286,7 +301,7 @@ impl EpollInstance {
             if !g.interest.contains_key(&fd) {
                 return;
             }
-            g.ready.insert(fd);
+            g.list_ready(fd);
             g.parked_waker.clone()
         };
         // Chain the wake UP to a parent epoll / poll(2) that watches THIS
@@ -317,7 +332,8 @@ impl EpollInstance {
             inner: IrqSafeSpinLock::new(EpollInner {
                 interest: BTreeMap::new(),
                 scan_after: None,
-                ready: BTreeSet::new(),
+                ready: BTreeMap::new(),
+                ready_seq: 0,
                 parked_waker: None,
                 scan_ctr: 0,
             }),
@@ -405,7 +421,7 @@ impl EpollInstance {
             }
         }
         if seed {
-            g.ready.insert(fd);
+            g.list_ready(fd);
         }
         let ready_now = !g.ready.is_empty();
         drop(g);
@@ -503,7 +519,7 @@ impl EpollInstance {
             let g = self.inner.lock();
             (
                 g.interest.iter().map(|(k, v)| (*k, v.clone())).collect(),
-                g.ready.clone(),
+                g.ready.keys().copied().collect(),
             )
         };
         snapshot
@@ -595,19 +611,19 @@ impl EpollInstance {
         // must not re-report it. Captured per-entry UNDER the lock (a single
         // `contains` while cloning the item) so the hot path never clones the
         // whole ready set.
-        let snapshot: Vec<(i32, EpollItem, bool)> = {
+        let snapshot: Vec<(i32, EpollItem, Option<u64>)> = {
             let g = self.inner.lock();
             let any_cell = g.interest.values().any(|it| it.cell_backed);
             let mut entries: Vec<_> = if full || !any_cell {
                 g.interest
                     .iter()
-                    .map(|(k, v)| (*k, v.clone(), g.ready.contains(k)))
+                    .map(|(k, v)| (*k, v.clone(), g.ready.get(k).copied()))
                     .collect()
             } else {
                 g.interest
                     .iter()
-                    .filter(|(fd, it)| g.ready.contains(fd) || !it.cell_backed)
-                    .map(|(k, v)| (*k, v.clone(), g.ready.contains(k)))
+                    .filter(|(fd, it)| g.ready.contains_key(fd) || !it.cell_backed)
+                    .map(|(k, v)| (*k, v.clone(), g.ready.get(k).copied()))
                     .collect()
             };
             if let Some(after) = g.scan_after {
@@ -628,7 +644,8 @@ impl EpollInstance {
         // inversions under concurrent event-loop updates.
         let mut observed = Vec::new();
         let mut delivered_fds = Vec::new();
-        for (fd, item, in_ready) in &snapshot {
+        for (fd, item, listing) in &snapshot {
+            let in_ready = &listing.is_some();
             // `maxevents` limits acceptance, not merely userspace copying.
             // Do not poll, acknowledge, advance edge state, take an exclusive
             // claim, or disarm a one-shot entry that this wait cannot return.
@@ -660,7 +677,7 @@ impl EpollInstance {
                     // Backing open file dropped → not ready; record a zero
                     // observation so the write-back clears any stale readiness,
                     // exactly as the previous per-call upgrades did.
-                    observed.push((*fd, 0, *in_ready));
+                    observed.push((*fd, 0, *listing));
                     continue;
                 }
             };
@@ -670,7 +687,7 @@ impl EpollInstance {
             // above (Linux ep_send_events drains the rdllist; ep_item_poll only
             // re-confirms the mask).
             let cur_mask = file.poll_readiness_at(item.offset);
-            observed.push((*fd, cur_mask, *in_ready));
+            observed.push((*fd, cur_mask, *listing));
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
             // Linux always reports ERR/HUP even when the caller omitted them
@@ -720,7 +737,8 @@ impl EpollInstance {
         // while holding this instance's non-reentrant spin lock.
         {
             let mut g = self.inner.lock();
-            for (fd, cur_mask, in_ready) in observed {
+            for (fd, cur_mask, listing) in observed {
+                let in_ready = listing.is_some();
                 // Ready-list bookkeeping (Linux rdllist): a level-triggered fd
                 // that was delivered stays a candidate so the next wait
                 // re-reports it until the app drains (its next poll then shows
@@ -756,8 +774,14 @@ impl EpollInstance {
                     }
                 }
                 if keep_ready {
-                    g.ready.insert(fd);
-                } else {
+                    if !g.ready.contains_key(&fd) {
+                        g.list_ready(fd);
+                    }
+                } else if g.ready.get(&fd).copied() == listing {
+                    // Drop only the listing this scan saw. A listing made or
+                    // renewed after the snapshot is an event that arrived
+                    // during the scan: it stays for the next wait, or the
+                    // edge would be lost (Linux keeps those on `ovflist`).
                     g.ready.remove(&fd);
                 }
             }
@@ -807,7 +831,7 @@ impl EpollInstance {
             let g = self.inner.lock();
             g.interest
                 .iter()
-                .map(|(k, v)| (*k, v.clone(), g.ready.contains(k)))
+                .map(|(k, v)| (*k, v.clone(), g.ready.contains_key(k)))
                 .collect()
         };
         for (fd, item, in_ready) in snapshot {
@@ -917,7 +941,7 @@ impl FileOps for EpollInstance {
             let g = self.inner.lock();
             g.interest
                 .values()
-                .map(|v| (v.clone(), g.ready.contains(&v.fd)))
+                .map(|v| (v.clone(), g.ready.contains_key(&v.fd)))
                 .collect()
         };
         for (item, in_ready) in snapshot {
@@ -2010,7 +2034,7 @@ mod tests {
                 },
             );
             if in_ready {
-                g.ready.insert(FD);
+                g.list_ready(FD);
             }
         }
         (ep, file)

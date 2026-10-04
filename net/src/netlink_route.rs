@@ -152,6 +152,9 @@ pub const IFF_BROADCAST: u32 = 0x2;
 pub const IFF_LOOPBACK: u32 = 0x8;
 pub const IFF_RUNNING: u32 = 0x40;
 pub const IFF_MULTICAST: u32 = 0x1000;
+/// Driver signals L1 up (carrier). `dev_get_flags` reports it for a running
+/// device with carrier; NetworkManager reads carrier from it.
+pub const IFF_LOWER_UP: u32 = 0x1_0000;
 
 // ── ARP hardware types (ARPHRD_*, if_arp.h) ─────────────────────────────
 
@@ -274,7 +277,15 @@ fn build_newlink(link: &LinkInfo, seq: u32, pid: u32) -> Vec<u8> {
     body.push(0u8); // __ifi_pad
     body.extend_from_slice(&link.arphrd.to_le_bytes()); // ifi_type
     body.extend_from_slice(&(link.ifindex as i32).to_le_bytes()); // ifi_index
-    body.extend_from_slice(&link.flags.to_le_bytes()); // ifi_flags
+
+    // `dev_get_flags`: a running device with carrier also reports
+    // IFF_LOWER_UP (NARF links that run have carrier).
+    let flags = if link.flags & IFF_RUNNING != 0 {
+        link.flags | IFF_LOWER_UP
+    } else {
+        link.flags
+    };
+    body.extend_from_slice(&flags.to_le_bytes()); // ifi_flags
     body.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // ifi_change = ~0
 
     // IFLA_IFNAME is a NUL-terminated string.
@@ -585,18 +596,26 @@ fn build_ack(seq: u32, req: &[u8]) -> Vec<u8> {
 // ── dump entry point ────────────────────────────────────────────────────
 
 /// Enumerate the interfaces the dump should describe. Loopback is synthetic
-/// (ifindex 1); registered NICs follow at ifindex 2, 3, … in registration
-/// order. Returned as `(link, addrs)` so both dumps share one enumeration.
+/// (ifindex 1); every other device reports the ifindex it was given when it
+/// registered (`dev_new_index`). Returned as `(link, addrs)` so both dumps
+/// share one enumeration.
 fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     enumerate_in(0)
 }
 
-fn is_builtin_loopback_ipv4(addr: [u8; 4], prefix_len: u8) -> bool {
-    addr == [127, 0, 0, 1] && prefix_len == 8
-}
-
-fn is_builtin_loopback_ipv6(addr: [u8; 16], prefix_len: u8) -> bool {
-    addr == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] && prefix_len == 128
+/// Interface `iface`'s IPv4 addresses in list order, `lo`'s built-in
+/// 127.0.0.1/8 first — the `in_dev->ifa_list` the address handlers walk.
+fn ipv4_addrs_of(iface: &str) -> Vec<([u8; 4], u8)> {
+    let mut addrs: Vec<([u8; 4], u8)> = Vec::new();
+    if iface == "lo" {
+        addrs.push(([127, 0, 0, 1], 8));
+    }
+    for (addr, prefix_len) in crate::iface::get_addrs(iface) {
+        if !addrs.contains(&(addr.0, prefix_len)) {
+            addrs.push((addr.0, prefix_len));
+        }
+    }
+    addrs
 }
 
 fn builtin_loopback_ipv6() -> crate::ipv6::addrs::Ipv6IfAddr {
@@ -633,14 +652,15 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
         label: alloc::string::String::from("lo"),
     });
 
-    // Legacy L3 interfaces come first because their registration order already
-    // defines the Linux-visible ifindex used by the IPv4 stack.
-    for (i, nic) in crate::iface::snapshot_all()
+    // Legacy L3 interfaces first, each under the ifindex it registered with —
+    // the same number the IPv4 stack, SIOCGIFINDEX and sysfs report.
+    for nic in crate::iface::snapshot_all()
         .into_iter()
-        .filter(|nic| nic.net_ns_id == net_ns_id)
-        .enumerate()
+        // `lo` is the synthetic ifindex-1 entry above; its legacy L3
+        // registration must not appear a second time as an Ethernet device.
+        .filter(|nic| nic.net_ns_id == net_ns_id && nic.name != "lo")
     {
-        let ifindex = (i as u32) + 2;
+        let ifindex = nic.ifindex;
         links.push(LinkInfo {
             ifindex,
             flags: IFF_BROADCAST
@@ -680,17 +700,18 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     // registry. Include names not represented by the legacy L3 registry so
     // every probed NIC is visible to the control plane exactly once. Physical
     // NICs live in the root namespace; a child netns must not see them in its
-    // RTM_GETLINK dump (Linux: devices appear in exactly one netns).
+    // RTM_GETLINK dump (Linux: devices appear in exactly one netns). The
+    // frame-ring loopback is the synthetic `lo` above, not a second device.
     let frame_ring_nics = if net_ns_id == 0 {
         crate::registry().snapshots()
     } else {
         Vec::new()
     };
     for nic in frame_ring_nics {
-        if links.iter().any(|link| link.name == nic.name) {
+        if nic.is_loopback || links.iter().any(|link| link.name == nic.name) {
             continue;
         }
-        let ifindex = links.len() as u32 + 1;
+        let ifindex = crate::iface::stable_ifindex(&nic.name);
         links.push(LinkInfo {
             ifindex,
             flags: IFF_BROADCAST
@@ -1122,18 +1143,61 @@ fn resolve_link(request: &[u8], msg_type: u16, flags: u16) -> Result<alloc::stri
     }
 }
 
-fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<(), i32> {
+/// Who may change interface `iface` with this request. Linux
+/// `rtnetlink_rcv_msg` refuses every non-GET request with -EPERM unless the
+/// sender is `netlink_net_capable(skb, CAP_NET_ADMIN)` in the socket's network
+/// namespace, and then lets it change any device of that namespace. NARF also
+/// honours a delegated per-interface handle (a stack daemon's grant), which
+/// covers exactly its one interface.
+struct MutationAuthority<'a> {
+    delegated: Option<&'a crate::AdminHandle>,
+    net_admin: bool,
+    net_ns_id: u64,
+}
+
+impl MutationAuthority<'_> {
+    fn any(&self) -> bool {
+        self.delegated.is_some() || self.net_admin
+    }
+
+    /// The handle that changes `iface`, or the errno refusing it.
+    fn for_iface(&self, iface: &str) -> Result<crate::AdminHandle, i32> {
+        if let Some(admin) = self.delegated {
+            if admin.iface_name() == iface {
+                return Ok(admin.clone());
+            }
+        }
+        if self.net_admin {
+            // A CAP_NET_ADMIN sender reaches only its own namespace's devices
+            // (`__dev_get_by_index(sock_net(skb->sk), ...)` -> -ENODEV).
+            if iface != "lo" && crate::iface::lookup_in(self.net_ns_id, iface).is_none() {
+                return Err(ENODEV);
+            }
+            return crate::stack::kernel_admin(iface).ok_or(ENODEV);
+        }
+        Err(EPERM)
+    }
+}
+
+/// Apply one rtnetlink change. On failure `msg` may hold the extended-ACK
+/// text the Linux handler sets for that error (`NL_SET_ERR_MSG`); most Linux
+/// failures set none, and neither does this.
+fn apply_mutation(
+    request: &[u8],
+    authority: &MutationAuthority<'_>,
+    msg: &mut Option<&'static str>,
+) -> Result<(), i32> {
     let hdr = parse_hdr(request).ok_or(EINVAL)?;
-    let admin = admin.ok_or(EPERM)?;
+    if !authority.any() {
+        return Err(EPERM);
+    }
     match hdr.msg_type {
         RTM_NEWLINK | RTM_SETLINK => {
             if request.len() < NLMSG_HDRLEN + 16 {
                 return Err(EINVAL);
             }
             let iface_name = resolve_link(request, hdr.msg_type, hdr.flags)?;
-            if iface_name != admin.iface_name() {
-                return Err(EPERM);
-            }
+            let admin = authority.for_iface(&iface_name)?;
             let flags = u32::from_ne_bytes(request[24..28].try_into().map_err(|_| EINVAL)?);
             let change = u32::from_ne_bytes(request[28..32].try_into().map_err(|_| EINVAL)?);
             if change & IFF_UP != 0 {
@@ -1170,52 +1234,149 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 return Err(EOPNOTSUPP);
             }
             let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
-            let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
-            if iface_name != admin.iface_name() {
-                return Err(EPERM);
-            }
-            let addr = find_attr(request, 8, IFA_LOCAL)
-                .or_else(|| find_attr(request, 8, IFA_ADDRESS))
-                .ok_or(EINVAL)?;
-            match family {
-                AF_INET if addr.len() == 4 => {
-                    let addr: [u8; 4] = addr.try_into().map_err(|_| EINVAL)?;
-                    let exists = (admin.iface_name() == "lo"
-                        && is_builtin_loopback_ipv4(addr, prefix_len))
-                        || crate::iface::get_addrs(admin.iface_name())
-                            .iter()
-                            .any(|(existing, prefix)| existing.0 == addr && *prefix == prefix_len);
-                    if hdr.msg_type == RTM_NEWADDR {
-                        validate_new_addr_flags(exists, hdr.flags)?;
-                        admin.add_ipv4(addr, prefix_len).map_err(admin_errno)
-                    } else if !exists {
-                        // `inet_rtm_deladdr`: "ipv4: Address not found".
-                        Err(EADDRNOTAVAIL)
-                    } else {
-                        admin.del_ipv4(addr, prefix_len).map_err(admin_errno)
+            let local = find_attr(request, 8, IFA_LOCAL);
+            let address = find_attr(request, 8, IFA_ADDRESS);
+            if family == AF_INET {
+                if hdr.msg_type == RTM_NEWADDR {
+                    // `inet_rtm_newaddr` -> `inet_validate_rtm`: the prefix
+                    // and IFA_LOCAL are checked before the device is looked up.
+                    if prefix_len > 32 {
+                        *msg = Some("ipv4: Invalid prefix length");
+                        return Err(EINVAL);
                     }
-                }
-                AF_INET6 if addr.len() == 16 => {
-                    let addr: [u8; 16] = addr.try_into().map_err(|_| EINVAL)?;
-                    let exists = (admin.iface_name() == "lo"
-                        && is_builtin_loopback_ipv6(addr, prefix_len))
-                        || crate::ipv6::addrs::list_iface(admin.iface_name())
-                            .iter()
-                            .any(|existing| {
-                                existing.addr == addr && existing.prefix_len == prefix_len
-                            });
-                    if hdr.msg_type == RTM_NEWADDR {
-                        validate_new_addr_flags(exists, hdr.flags)?;
-                        admin.add_ipv6(addr, prefix_len).map_err(admin_errno)
-                    } else if !exists {
-                        // `inet6_addr_del`: "address not found".
-                        Err(EADDRNOTAVAIL)
-                    } else {
-                        admin.del_ipv6(addr, prefix_len).map_err(admin_errno)
+                    let Some(local) = local else {
+                        *msg = Some("ipv4: Local address is not supplied");
+                        return Err(EINVAL);
+                    };
+                    let addr: [u8; 4] = local
+                        .get(..4)
+                        .ok_or(EINVAL)?
+                        .try_into()
+                        .map_err(|_| EINVAL)?;
+                    // `if (!nla_get_in_addr(tb[IFA_LOCAL])) return 0;`
+                    if addr == [0; 4] {
+                        return Ok(());
                     }
+                    // `inet_rtm_to_ifa`.
+                    let Some(iface_name) = iface_name_for_index(ifindex) else {
+                        *msg = Some("ipv4: Device not found");
+                        return Err(ENODEV);
+                    };
+                    let admin = authority.for_iface(&iface_name)?;
+                    let exists = ipv4_addrs_of(admin.iface_name())
+                        .iter()
+                        .any(|(existing, prefix)| *existing == addr && *prefix == prefix_len);
+                    if let Err(errno) = validate_new_addr_flags(exists, hdr.flags) {
+                        *msg = Some("ipv4: Address already assigned");
+                        return Err(errno);
+                    }
+                    return admin.add_ipv4(addr, prefix_len).map_err(admin_errno);
                 }
-                _ => Err(EINVAL),
+                // `inet_rtm_deladdr`: find the device, then delete the first
+                // address every supplied selector matches.
+                let Some(iface_name) = iface_name_for_index(ifindex) else {
+                    *msg = Some("ipv4: Device not found");
+                    return Err(ENODEV);
+                };
+                let admin = authority.for_iface(&iface_name)?;
+                let local = match local {
+                    Some(raw) => {
+                        Some(<[u8; 4]>::try_from(raw.get(..4).ok_or(EINVAL)?).map_err(|_| EINVAL)?)
+                    }
+                    None => None,
+                };
+                let address = match address {
+                    Some(raw) => {
+                        Some(<[u8; 4]>::try_from(raw.get(..4).ok_or(EINVAL)?).map_err(|_| EINVAL)?)
+                    }
+                    None => None,
+                };
+                let label = find_attr(request, 8, IFA_LABEL).map(|raw| {
+                    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
+                    &raw[..end]
+                });
+                let victim =
+                    ipv4_addrs_of(admin.iface_name())
+                        .into_iter()
+                        .find(|(addr, prefix)| {
+                            local.is_none_or(|local| local == *addr)
+                                && label.is_none_or(|label| label == admin.iface_name().as_bytes())
+                                && address.is_none_or(|address| {
+                                    // `inet_ifa_match`: same subnet under the address's mask.
+                                    let mask = if *prefix == 0 {
+                                        0
+                                    } else {
+                                        u32::MAX << (32 - u32::from(*prefix))
+                                    };
+                                    prefix_len == *prefix
+                                        && (u32::from_be_bytes(address) ^ u32::from_be_bytes(*addr))
+                                            & mask
+                                            == 0
+                                })
+                        });
+                let Some((addr, prefix)) = victim else {
+                    *msg = Some("ipv4: Address not found");
+                    return Err(EADDRNOTAVAIL);
+                };
+                return admin.del_ipv4(addr, prefix).map_err(admin_errno);
             }
+            // IPv6 (`inet6_rtm_newaddr` / `inet6_rtm_deladdr`): `extract_addr`
+            // prefers IFA_LOCAL; with neither attribute the request is a bare
+            // -EINVAL before any device lookup.
+            let addr: [u8; 16] = local
+                .or(address)
+                .ok_or(EINVAL)?
+                .get(..16)
+                .ok_or(EINVAL)?
+                .try_into()
+                .map_err(|_| EINVAL)?;
+            if hdr.msg_type == RTM_DELADDR && prefix_len > 128 {
+                // `inet6_addr_del`.
+                *msg = Some("ipv6: Invalid prefix length");
+                return Err(EINVAL);
+            }
+            let Some(iface_name) = iface_name_for_index(ifindex) else {
+                *msg = Some("ipv6: Unable to find the interface");
+                return Err(ENODEV);
+            };
+            let admin = authority.for_iface(&iface_name)?;
+            let configured = |iface: &str| {
+                let mut addrs: Vec<([u8; 16], u8)> = crate::ipv6::addrs::list_iface(iface)
+                    .iter()
+                    .map(|existing| (existing.addr, existing.prefix_len))
+                    .collect();
+                if iface == "lo" {
+                    let builtin = builtin_loopback_ipv6();
+                    addrs.push((builtin.addr, builtin.prefix_len));
+                }
+                addrs
+            };
+            if hdr.msg_type == RTM_NEWADDR {
+                // `ipv6_get_ifaddr` matches the address alone.
+                let exists = configured(admin.iface_name())
+                    .iter()
+                    .any(|(existing, _)| *existing == addr);
+                if exists {
+                    if let Err(errno) = validate_new_addr_flags(true, hdr.flags) {
+                        *msg = Some("ipv6: address already assigned");
+                        return Err(errno);
+                    }
+                } else if prefix_len > 128 {
+                    // `inet6_addr_add`.
+                    *msg = Some("ipv6: Invalid prefix length");
+                    return Err(EINVAL);
+                }
+                return admin.add_ipv6(addr, prefix_len).map_err(admin_errno);
+            }
+            // `inet6_addr_del` matches prefix length and address.
+            if !configured(admin.iface_name())
+                .iter()
+                .any(|(existing, prefix)| *existing == addr && *prefix == prefix_len)
+            {
+                *msg = Some("ipv6: address not found");
+                return Err(EADDRNOTAVAIL);
+            }
+            admin.del_ipv6(addr, prefix_len).map_err(admin_errno)
         }
         RTM_NEWROUTE | RTM_DELROUTE => {
             if request.len() < NLMSG_HDRLEN + 12 {
@@ -1229,6 +1390,10 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                 return Err(EOPNOTSUPP);
             }
             if (family == AF_INET && prefix_len > 32) || (family == AF_INET6 && prefix_len > 128) {
+                if family == AF_INET {
+                    // `rtm_to_fib_config`.
+                    *msg = Some("Invalid prefix length");
+                }
                 return Err(EINVAL);
             }
             let scope = match request[NLMSG_HDRLEN + 6] {
@@ -1253,9 +1418,7 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             }
             let ifindex = u32::from_ne_bytes(oif.try_into().map_err(|_| EINVAL)?);
             let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
-            if iface_name != admin.iface_name() {
-                return Err(EPERM);
-            }
+            let admin = authority.for_iface(&iface_name)?;
             if family == AF_INET6 {
                 if table != crate::route::TABLE_MAIN {
                     return Err(EOPNOTSUPP);
@@ -1358,12 +1521,14 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
             let family = request[NLMSG_HDRLEN];
             let ifindex = u32::from_ne_bytes(request[20..24].try_into().map_err(|_| EINVAL)?);
             let iface_name = iface_name_for_index(ifindex).ok_or(ENODEV)?;
-            if iface_name != admin.iface_name() {
-                return Err(EPERM);
-            }
+            let admin = authority.for_iface(&iface_name)?;
             let state = u16::from_ne_bytes(request[24..26].try_into().map_err(|_| EINVAL)?);
             let flags = request[26];
-            let dst = find_attr(request, 12, NDA_DST).ok_or(EINVAL)?;
+            let Some(dst) = find_attr(request, 12, NDA_DST) else {
+                // `neigh_add` / `neigh_delete`.
+                *msg = Some("Network address not specified");
+                return Err(EINVAL);
+            };
             let mac = match find_attr(request, 12, NDA_LLADDR) {
                 Some(raw) if raw.len() == 6 => Some(raw.try_into().map_err(|_| EINVAL)?),
                 Some(_) => return Err(EINVAL),
@@ -1379,7 +1544,10 @@ fn apply_mutation(request: &[u8], admin: Option<&crate::AdminHandle>) -> Result<
                         .any(|entry| entry.iface == admin.iface_name() && entry.ip == dst)
                 }
                 // Short NDA_DST for a known table: "Invalid network address".
-                AF_INET | AF_INET6 => return Err(EINVAL),
+                AF_INET | AF_INET6 => {
+                    *msg = Some("Invalid network address");
+                    return Err(EINVAL);
+                }
                 // `neigh_find_table()` found no table for this family.
                 _ => return Err(EAFNOSUPPORT),
             };
@@ -1465,6 +1633,9 @@ pub struct ReplyOptions {
     pub ext_ack: bool,
     pub cap_ack: bool,
     pub strict_check: bool,
+    /// The sender is `netlink_net_capable(CAP_NET_ADMIN)` in the socket's
+    /// network namespace: it may change any of that namespace's devices.
+    pub net_admin: bool,
 }
 
 pub fn build_replies_with_options(
@@ -1484,6 +1655,9 @@ pub fn build_replies_with_options_in(
     let admin = admin.filter(|admin| admin.net_ns_id() == Ok(net_ns_id));
     let mut offset = 0usize;
     let mut replies = Vec::new();
+    // Mutation failures whose Linux handler sets an extended-ACK message:
+    // `(index into replies, text)`.
+    let mut ext_ack_msgs: Vec<(usize, &'static str)> = Vec::new();
 
     // Linux `netlink_rcv_skb`: walk while a whole header remains, and stop
     // (silently — sendmsg still returns the full length) at a header whose
@@ -1527,13 +1701,24 @@ pub fn build_replies_with_options_in(
             continue;
         }
         if is_mutation(hdr.msg_type) {
-            match apply_mutation(request, admin) {
+            let authority = MutationAuthority {
+                delegated: admin,
+                net_admin: options.net_admin,
+                net_ns_id,
+            };
+            let mut msg = None;
+            match apply_mutation(request, &authority, &mut msg) {
                 Ok(()) => {
                     if wants_ack {
                         replies.push(build_ack(hdr.seq, request));
                     }
                 }
-                Err(errno) => replies.push(build_error(errno, hdr.seq, 0, request)),
+                Err(errno) => {
+                    if let Some(text) = msg {
+                        ext_ack_msgs.push((replies.len(), text));
+                    }
+                    replies.push(build_error(errno, hdr.seq, 0, request));
+                }
             }
             continue;
         }
@@ -1560,12 +1745,14 @@ pub fn build_replies_with_options_in(
             replies.push(build_ack(hdr.seq, request));
         }
     }
-    for reply in &mut replies {
+    for (index, reply) in replies.iter_mut().enumerate() {
         if options.cap_ack {
             cap_acknowledgement(reply);
         }
         if options.ext_ack {
-            append_extended_ack(reply);
+            if let Some((_, text)) = ext_ack_msgs.iter().find(|(at, _)| *at == index) {
+                append_extended_ack(reply, text);
+            }
         }
     }
     Ok(replies)
@@ -1584,39 +1771,24 @@ fn cap_acknowledgement(message: &mut Vec<u8>) {
     message[6..8].copy_from_slice(&(hdr.flags | NLM_F_CAPPED).to_ne_bytes());
 }
 
-fn append_extended_ack(message: &mut Vec<u8>) {
+/// `netlink_ack` with an extended-ACK message: attach the handler's
+/// `NL_SET_ERR_MSG` text as NLMSGERR_ATTR_MSG and flag NLM_F_ACK_TLVS. Linux
+/// sends a message only where the handler set one.
+fn append_extended_ack(message: &mut Vec<u8>, text: &str) {
     let Some(hdr) = parse_hdr(message) else {
         return;
     };
     if hdr.msg_type != NLMSG_ERROR || message.len() < NLMSG_HDRLEN + 4 {
         return;
     }
-    let errno = i32::from_ne_bytes(
-        message[NLMSG_HDRLEN..NLMSG_HDRLEN + 4]
-            .try_into()
-            .unwrap_or([0; 4]),
-    );
-    if errno >= 0 {
-        return;
-    }
-    let text: &[u8] = match -errno {
-        EPERM => b"interface admin capability required\0",
-        ENOENT => b"requested network object does not exist\0",
-        EEXIST => b"network object already exists\0",
-        ESRCH => b"no such route\0",
-        EADDRNOTAVAIL => b"address not available\0",
-        EAFNOSUPPORT => b"address family not supported\0",
-        ENODEV => b"network interface does not exist\0",
-        EINVAL => b"invalid rtnetlink request\0",
-        EOPNOTSUPP => b"rtnetlink operation not supported\0",
-        _ => b"rtnetlink operation failed\0",
-    };
     let declared_len = hdr.len as usize;
     if declared_len > message.len() {
         return;
     }
     message.truncate(declared_len);
-    push_rtattr(message, NLMSGERR_ATTR_MSG, text);
+    let mut text = text.as_bytes().to_vec();
+    text.push(0);
+    push_rtattr(message, NLMSGERR_ATTR_MSG, &text);
     let new_len = message.len() as u32;
     message[0..4].copy_from_slice(&new_len.to_ne_bytes());
     let flags = hdr.flags | NLM_F_ACK_TLVS;

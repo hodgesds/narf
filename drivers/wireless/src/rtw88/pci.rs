@@ -52,9 +52,13 @@ pub struct Rtw88Device {
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+/// This device's interface name, `wlan%d` as Linux `dev_alloc_name` picks
+/// it; set when the interface registers.
+static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
+
 impl Interface for Rtw88Device {
     fn name(&self) -> &str {
-        "wlan2"
+        *IFNAME.lock()
     }
     fn mac(&self) -> [u8; 6] {
         self.mac
@@ -194,7 +198,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Register the iface with `narf-net` so the kernel-side TCP
     // stack sees the MAC. send_frame returns Err for now — this
     // commit only delivers "chip detected + MAC readable."
-    narf_net::iface::register("wlan0", mac, send_frame_unimpl);
+    *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
     Ok(())
 }
 

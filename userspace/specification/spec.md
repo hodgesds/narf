@@ -1338,10 +1338,23 @@ Internet sockets implement the legacy network-device ioctl ABI for
 namespace, returns `ENODEV` for an unknown name and `EFAULT` for an invalid
 ifreq pointer, and reports the same registry fields used by rtnetlink.
 `SIOCSIFFLAGS`, `SIOCSIFMTU`, and `SIOCSIFHWADDR` invoke the same typed
-interface-control operations as rtnetlink. They require a live, namespace-
-and-interface-matched `AdminHandle`; no uid or Linux capability bit supplies
-ambient authority. Missing or mismatched authority returns `EPERM`, while
-invalid MTU, hardware type, or address values return `EINVAL`.
+interface-control operations as rtnetlink. As in Linux `dev_ioctl`, they
+require `ns_capable(net->user_ns, CAP_NET_ADMIN)` for the caller, checked
+before the device lookup (a refused caller gets `EPERM` even for an unknown
+name); a live, namespace-and-interface-matched delegated `AdminHandle` also
+authorizes its one device. Invalid MTU, hardware type, or address values
+return `EINVAL`.
+
+`SIOCETHTOOL` implements Linux `dev_ethtool` for `ETHTOOL_GDRVINFO` and
+`ETHTOOL_GLINK`, in its check order: copying the ifreq and the command word
+(`EFAULT`); the device in the socket's namespace, the name cut at
+`IFNAMSIZ-1` and at an alias colon (`ENODEV`; every namespace has `lo`); an
+`ETHTOOL_PERQUEUE` sub-command (`EFAULT`); `CAP_NET_ADMIN` for any
+(sub-)command outside `__dev_ethtool`'s unprivileged list (`EPERM`). A device
+without driver information (`lo`) and every other command return
+`EOPNOTSUPP`. `GDRVINFO` reports the driver's name, its version or else the
+kernel release, and its bus name (`e1000`: PCI name; `virtio_net` `1.0.0`:
+`virtio_bus_name()`); `GLINK` reports `netif_running` and carrier.
 
 ### 3.3 BPF XDP program compatibility
 

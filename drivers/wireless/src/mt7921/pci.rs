@@ -184,7 +184,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 
     // Register the iface stub so the kernel-side TCP stack can see
     // the MAC. send_frame returns Err until the DMA-ring path lands.
-    narf_net::iface::register("wlan0", mac, send_frame_unimpl);
+    narf_net::iface::register("wlan%d", mac, send_frame_unimpl);
     Ok(())
 }
 

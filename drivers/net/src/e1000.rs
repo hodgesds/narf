@@ -1455,7 +1455,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // frames off the NIC ring directly while spinning, since the
     // spawned RX-pump task can't run while a syscall is parked
     // in `responsive_spin_until`.
-    narf_net::iface::register("eth0", dev.mac, e1000_send_frame);
+    let name = narf_net::iface::register("eth%d", dev.mac, e1000_send_frame);
+    // `e1000_get_drvinfo`: driver "e1000", no version (the core reports the
+    // kernel release), bus_info = pci_name().
+    let bus_info = match device.addr {
+        narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
+        narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
+    };
+    narf_net::iface::set_driver_info(&name, "e1000", None, bus_info);
+    *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
     narf_net::iface::install_rx_drain(rx_pump_step);
 
     // Stage-4 registry (cap-gated)
@@ -1567,7 +1575,7 @@ pub fn rx_pump_step() -> bool {
     // is this function's own stack scratch buffer holding a copy of the RX
     // descriptor's payload, so mutating it before the stack parses it out is
     // sound and never touches the live DMA ring.
-    narf_net::iface::on_rx_frame_from("eth0", &mut buf[..n]);
+    narf_net::iface::on_rx_frame_from(e1000_ifname(), &mut buf[..n]);
     true
 }
 
@@ -1772,12 +1780,23 @@ fn name_for(did: u16) -> &'static str {
     }
 }
 
+/// The interface name `iface::register` gave this NIC (`eth%d`, Linux
+/// `dev_alloc_name`). Set once at probe; the device lives as long as the
+/// kernel, so the name is leaked into a `&'static str`.
+static E1000_IFNAME: narf_lib::sync::IrqSafeSpinLock<Option<&'static str>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// This NIC's interface name; empty until it has registered.
+pub fn e1000_ifname() -> &'static str {
+    E1000_IFNAME.lock().unwrap_or("")
+}
+
 #[derive(Debug)]
 pub struct E1000Nic;
 
 impl narf_net::Interface for E1000Nic {
     fn name(&self) -> &str {
-        "eth0"
+        e1000_ifname()
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])
@@ -1814,7 +1833,7 @@ impl narf_net::Interface for E1000Nic {
 
 impl crate::HwNic for E1000Nic {
     fn name(&self) -> &'static str {
-        "eth0"
+        e1000_ifname()
     }
     fn mac(&self) -> [u8; 6] {
         with_controller(|c| c.mac).unwrap_or([0; 6])

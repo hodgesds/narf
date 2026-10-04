@@ -5297,16 +5297,13 @@ fn smoke_bpf_syscall_link_close_detaches_xdp() -> TestResult {
         }
         narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0xB9, 1], discard);
 
-        // The ifindex NARF's rtnetlink dump would report for it: 1 is the
-        // synthetic loopback, registered NICs follow at 2, 3, … in registration
-        // order. Deriving it here from the same public source the handler uses
+        // The ifindex NARF's rtnetlink dump would report for it: the one the
+        // device was given when it registered (`dev_new_index`). Deriving it
+        // here from the same public source the handler uses
         // is what pins the two together — if the handler resolved a different
         // interface, the classify() below would not see the program at all.
-        let ifindex = narf_net::iface::snapshot_all()
-            .iter()
-            .position(|nic| nic.name == IFACE)
-            .map(|i| i as u32 + 2)
-            .ok_or("the registered interface is not in the snapshot")?;
+        let ifindex =
+            narf_net::iface::ifindex_of(IFACE).ok_or("the registered interface has no ifindex")?;
 
         let fd = load_prog(BPF_PROG_TYPE_XDP, &xdp_bounded_byte_program()).ok_or("bpf() not Ok")?;
         if fd < 0 {
@@ -6192,11 +6189,8 @@ fn smoke_bpf_syscall_link_info_xdp() -> TestResult {
             Ok(())
         }
         narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0xB9, 2], discard);
-        let ifindex = narf_net::iface::snapshot_all()
-            .iter()
-            .position(|nic| nic.name == IFACE)
-            .map(|i| i as u32 + 2)
-            .ok_or("the registered interface is not in the snapshot")?;
+        let ifindex =
+            narf_net::iface::ifindex_of(IFACE).ok_or("the registered interface has no ifindex")?;
 
         let fd = load_prog(BPF_PROG_TYPE_XDP, &ret_imm(1)).ok_or("bpf() not Ok")?;
         if fd < 0 {

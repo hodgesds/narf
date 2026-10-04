@@ -339,6 +339,75 @@ fn smoke_sysfs_enumerate_class_net() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_sysfs_enumerate_class_net);
 
+// ── Test 5b: /sys/class/net/<dev> attributes are Linux's ──────────────
+
+/// `populate_net_class` publishes Linux's `net/core/net-sysfs.c` attributes
+/// under the ifindex rtnetlink reports: udev keys its database on `ifindex`
+/// (`n<ifindex>`) and reads INTERFACE/IFINDEX from `uevent`; NetworkManager
+/// and udev's net_id builtin classify the link by `type`. `flags` is
+/// `dev->flags` — never the volatile IFF_RUNNING — exactly as on Linux
+/// (`0x1003` for an up Ethernet NIC, `0x9` for `lo`).
+fn smoke_sysfs_class_net_attrs_are_linuxs() -> TestResult {
+    use crate::sysfs::NetIfaceInfo;
+    crate::sysfs::__reset_for_test();
+    fn two_devices() -> Vec<NetIfaceInfo> {
+        alloc::vec![
+            NetIfaceInfo {
+                name: "lo".to_string(),
+                mac: [0; 6],
+                mtu: 65536,
+                link_up: true,
+                ifindex: 1,
+                loopback: true,
+            },
+            NetIfaceInfo {
+                name: "eth0".to_string(),
+                mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+                mtu: 1500,
+                link_up: true,
+                ifindex: 7,
+                loopback: false,
+            },
+        ]
+    }
+    crate::sysfs::install_net_snapshot_hook(two_devices);
+    crate::sysfs::populate_net_class();
+    let attr = |dev: &str, name: &str| -> Option<String> {
+        crate::sysfs::get_root()
+            .get_child("class")?
+            .get_child("net")?
+            .get_child(dev)?
+            .attr_show(name)
+    };
+    let expect: [(&str, &str, &str); 14] = [
+        ("eth0", "ifindex", "7\n"),
+        ("eth0", "iflink", "7\n"),
+        ("eth0", "type", "1\n"),
+        ("eth0", "addr_len", "6\n"),
+        ("eth0", "address", "52:54:00:12:34:56\n"),
+        ("eth0", "broadcast", "ff:ff:ff:ff:ff:ff\n"),
+        ("eth0", "operstate", "up\n"),
+        ("eth0", "flags", "0x1003\n"),
+        ("eth0", "mtu", "1500\n"),
+        ("eth0", "uevent", "INTERFACE=eth0\nIFINDEX=7\n"),
+        ("lo", "ifindex", "1\n"),
+        ("lo", "type", "772\n"),
+        ("lo", "operstate", "unknown\n"),
+        ("lo", "flags", "0x9\n"),
+    ];
+    let mut verdict = TestResult::Pass;
+    for (dev, name, want) in expect {
+        if attr(dev, name).as_deref() != Some(want) {
+            verdict = TestResult::Fail("a /sys/class/net attribute differs from Linux's");
+            break;
+        }
+    }
+    crate::sysfs::install_net_snapshot_hook(Vec::new);
+    crate::sysfs::__reset_for_test();
+    verdict
+}
+kernel_test_in!("filesystem", smoke_sysfs_class_net_attrs_are_linuxs);
+
 // ── Test 6: Uevent ring FIFO order ────────────────────────────────────
 
 fn smoke_uevent_ring_fifo() -> TestResult {

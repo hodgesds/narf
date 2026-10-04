@@ -234,12 +234,33 @@ fn smoke_net_loopback_register() -> TestResult {
                 1, 0, 0, 0, // sequence
                 0, 0, 0, 0, // port id
             ];
+            // A driver-backed (frame-ring only) NIC is listed; a frame-ring
+            // loopback is not — Linux has exactly one loopback, `lo`.
+            let (tx_prod, _tx_cons) = narf_ipc::channel::<crate::Frame, { crate::TX_RING_N }>();
+            let (_rx_prod, rx_cons) = narf_ipc::channel::<crate::Frame, { crate::RX_RING_N }>();
+            let nic = crate::virtio_net::VirtioNet::new(
+                alloc::string::String::from("fr.smoke-register"),
+                [0x02, 0, 0, 0, 0x5e, 1],
+                1500,
+                true,
+                tx_prod,
+                rx_cons,
+            );
+            if registry().register(&authority, nic).is_err() {
+                return TestResult::Fail("frame-ring NIC registration failed");
+            }
             let replies = crate::netlink_route::build_dump(&request);
             if !replies
                 .iter()
-                .any(|reply| reply.windows(18).any(|w| w == b"lo.smoke-register\0"))
+                .any(|reply| reply.windows(18).any(|w| w == b"fr.smoke-register\0"))
             {
                 return TestResult::Fail("rtnetlink omitted driver-backed interface");
+            }
+            if replies
+                .iter()
+                .any(|reply| reply.windows(18).any(|w| w == b"lo.smoke-register\0"))
+            {
+                return TestResult::Fail("rtnetlink listed a second loopback device");
             }
             TestResult::Pass
         }
@@ -8408,3 +8429,329 @@ kernel_test_in!(
     "net/control_grant",
     smoke_control_grant_keeps_frame_owner_and_revokes
 );
+
+/// `iface::register` is Linux `register_netdev`: a `%d` name takes the lowest
+/// unused number (`dev_alloc_name`), and each device keeps the ifindex it was
+/// given (`dev_new_index`) — re-registering a name keeps its ifindex, and
+/// later devices never reuse it.
+fn smoke_iface_register_allocates_name_and_stable_ifindex() -> TestResult {
+    let a = crate::iface::register("nrfa%d", [0x02, 0, 0, 0, 0xa1, 0], |_| Ok(()));
+    let b = crate::iface::register("nrfa%d", [0x02, 0, 0, 0, 0xa1, 1], |_| Ok(()));
+    if a != "nrfa0" || b != "nrfa1" {
+        return TestResult::Fail("eth%d-style names must take the lowest free number");
+    }
+    let (Some(ia), Some(ib)) = (crate::iface::ifindex_of(&a), crate::iface::ifindex_of(&b)) else {
+        return TestResult::Fail("registered devices must have an ifindex");
+    };
+    if ia == ib || ia < 2 || ib < 2 {
+        return TestResult::Fail("ifindexes must be distinct and leave 1 for lo");
+    }
+    let again = crate::iface::register(&a, [0x02, 0, 0, 0, 0xa1, 2], |_| Ok(()));
+    if again != a || crate::iface::ifindex_of(&a) != Some(ia) {
+        return TestResult::Fail("re-registering a device must keep its ifindex");
+    }
+    if crate::iface::ifindex_of("lo") != Some(1) {
+        return TestResult::Fail("lo must be ifindex 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net",
+    smoke_iface_register_allocates_name_and_stable_ifindex
+);
+
+/// A NIC registers like Linux `register_netdevice`: down (no IFF_UP in the
+/// link dump) and with no IPv4 address, so NetworkManager finds it
+/// unconfigured and manages it (DHCP) instead of adopting a pre-set address
+/// as an "external" connection. The first address configured on it becomes
+/// the address the stack sends from; removing it leaves none.
+fn smoke_iface_registers_down_and_unconfigured() -> TestResult {
+    const IFF_UP: u32 = 0x1;
+    const IFF_RUNNING: u32 = 0x40;
+    const IFF_LOWER_UP: u32 = 0x1_0000;
+    let name = crate::iface::register("nrfd%d", [0x02, 0, 0, 0, 0xd0, 0], |_| Ok(()));
+    let Some(nic) = crate::iface::lookup(&name) else {
+        return TestResult::Fail("registered device not found");
+    };
+    if nic.link_up || nic.ipv4 != [0; 4] || !crate::iface::get_addrs(&name).is_empty() {
+        return TestResult::Fail("a new device must be down with no IPv4 address");
+    }
+    // ifi_flags of `name`'s RTM_NEWLINK in a link dump.
+    let link_flags = |name: &str| -> Option<u32> {
+        let request = [
+            16, 0, 0, 0, // nlmsg_len
+            18, 0, // RTM_GETLINK
+            1, 3, // NLM_F_REQUEST | NLM_F_DUMP
+            1, 0, 0, 0, // sequence
+            0, 0, 0, 0, // port id
+        ];
+        let mut needle = alloc::vec::Vec::from(name.as_bytes());
+        needle.push(0);
+        crate::netlink_route::build_dump(&request)
+            .iter()
+            .find(|reply| reply.windows(needle.len()).any(|w| w == needle.as_slice()))
+            .map(|reply| u32::from_ne_bytes(reply[24..28].try_into().unwrap()))
+    };
+    match link_flags(&name) {
+        Some(flags) if flags & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP) == 0 => {}
+        Some(_) => return TestResult::Fail("a new device must not report IFF_UP/RUNNING"),
+        None => return TestResult::Fail("the new device is missing from the link dump"),
+    }
+    if !crate::iface::set_link_state(&name, true) {
+        return TestResult::Fail("could not bring the device up");
+    }
+    if link_flags(&name).map(|f| f & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP))
+        != Some(IFF_UP | IFF_RUNNING | IFF_LOWER_UP)
+    {
+        return TestResult::Fail("an up device reports IFF_UP | IFF_RUNNING | IFF_LOWER_UP");
+    }
+    crate::iface::add_addr(&name, [192, 0, 2, 9], 24);
+    if crate::iface::lookup(&name).map(|nic| nic.ipv4) != Some([192, 0, 2, 9]) {
+        return TestResult::Fail("the first address must become the stack's source address");
+    }
+    crate::iface::del_addr(&name, [192, 0, 2, 9], 24);
+    if crate::iface::lookup(&name).map(|nic| nic.ipv4) != Some([0; 4]) {
+        return TestResult::Fail("removing the only address must leave the device without one");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_iface_registers_down_and_unconfigured);
+
+/// rtnetlink sends an extended-ACK message only where the Linux handler sets
+/// one (`NL_SET_ERR_MSG`), with Linux's text, and the address handlers fail
+/// in Linux's order: `inet_rtm_newaddr` checks the prefix and IFA_LOCAL
+/// before it looks the device up, `inet_rtm_deladdr` looks the device up
+/// first, and an IPv6 request with no address is a bare -EINVAL before any
+/// lookup. A -EPERM for a sender without CAP_NET_ADMIN carries no message.
+/// NARF used to attach invented text to every error ("interface admin
+/// capability required") and looked the device up first.
+fn smoke_rtnetlink_extack_messages_are_linuxs() -> TestResult {
+    use crate::netlink_route::{build_replies_with_options, ReplyOptions};
+    const NLMSG_HDRLEN: usize = 16;
+    const RTM_NEWADDR: u16 = 20;
+    const RTM_DELADDR: u16 = 21;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_ACK: u16 = 4;
+    const NLM_F_EXCL: u16 = 0x200;
+    const NLM_F_CREATE: u16 = 0x400;
+    const NLM_F_ACK_TLVS: u16 = 0x200;
+    const NLMSGERR_ATTR_MSG: u16 = 1;
+    const IFA_ADDRESS: u16 = 1;
+    const IFA_LOCAL: u16 = 2;
+    const AF_INET: u8 = 2;
+    const AF_INET6: u8 = 10;
+    const EPERM: i32 = 1;
+    const ENODEV: i32 = 19;
+    const EINVAL: i32 = 22;
+    const EEXIST: i32 = 17;
+    const EADDRNOTAVAIL: i32 = 99;
+    let name = crate::iface::register("nrfx%d", [0x02, 0, 0, 0, 0xe7, 0], |_| Ok(()));
+    let Some(ifindex) = crate::iface::ifindex_of(&name) else {
+        return TestResult::Fail("test interface has no ifindex");
+    };
+    // An ifindex no device has.
+    let absent = u32::MAX - 7;
+    // nlmsghdr + ifaddrmsg{family, prefix, 0, 0, ifindex} + attributes.
+    let addr_req =
+        |msg_type: u16, flags: u16, family: u8, prefix: u8, index: u32, attrs: &[(u16, &[u8])]| {
+            let mut req = alloc::vec::Vec::new();
+            req.extend_from_slice(&0u32.to_ne_bytes());
+            req.extend_from_slice(&msg_type.to_ne_bytes());
+            req.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK | flags).to_ne_bytes());
+            req.extend_from_slice(&7u32.to_ne_bytes());
+            req.extend_from_slice(&42u32.to_ne_bytes());
+            req.extend_from_slice(&[family, prefix, 0, 0]);
+            req.extend_from_slice(&index.to_ne_bytes());
+            for (kind, payload) in attrs {
+                req.extend_from_slice(&((4 + payload.len()) as u16).to_ne_bytes());
+                req.extend_from_slice(&kind.to_ne_bytes());
+                req.extend_from_slice(payload);
+                while req.len() % 4 != 0 {
+                    req.push(0);
+                }
+            }
+            let len = req.len() as u32;
+            req[0..4].copy_from_slice(&len.to_ne_bytes());
+            req
+        };
+    // NLMSG_ERROR: header, error, the echoed request (not capped → whole),
+    // then TLVs.
+    let msg_of = |reply: &[u8], req_len: usize| -> Option<alloc::vec::Vec<u8>> {
+        let mut at = NLMSG_HDRLEN + 4 + req_len;
+        let end = u32::from_ne_bytes(reply[0..4].try_into().ok()?) as usize;
+        while at + 4 <= end {
+            let len = u16::from_ne_bytes([reply[at], reply[at + 1]]) as usize;
+            let kind = u16::from_ne_bytes([reply[at + 2], reply[at + 3]]);
+            if len < 4 {
+                return None;
+            }
+            if kind == NLMSGERR_ATTR_MSG {
+                return Some(reply[at + 4..at + len].to_vec());
+            }
+            at += (len + 3) & !3;
+        }
+        None
+    };
+    // Send `req`; the reply must be `-errno` carrying exactly `text` (or no
+    // message and no NLM_F_ACK_TLVS when `text` is None).
+    let expect = |req: &[u8], net_admin: bool, errno: i32, text: Option<&str>| -> bool {
+        let opts = ReplyOptions {
+            ext_ack: true,
+            net_admin,
+            ..ReplyOptions::default()
+        };
+        let Ok(replies) = build_replies_with_options(req, None, opts) else {
+            return false;
+        };
+        let Some(reply) = replies.first() else {
+            return false;
+        };
+        let got_errno = i32::from_ne_bytes(reply[16..20].try_into().unwrap());
+        let tlvs = u16::from_ne_bytes([reply[6], reply[7]]) & NLM_F_ACK_TLVS != 0;
+        let got = msg_of(reply, req.len());
+        let want = text.map(|text| {
+            let mut bytes = alloc::vec::Vec::from(text.as_bytes());
+            bytes.push(0);
+            bytes
+        });
+        got_errno == -errno && tlvs == want.is_some() && got == want
+    };
+    let local77: &[u8] = &[192, 0, 2, 77];
+    let v6: &[u8] = &[
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x77,
+    ];
+
+    // No authority: a bare -EPERM, no message.
+    let del = addr_req(
+        RTM_DELADDR,
+        0,
+        AF_INET,
+        24,
+        ifindex,
+        &[(IFA_LOCAL, local77)],
+    );
+    if !expect(&del, false, EPERM, None) {
+        return TestResult::Fail("an EPERM refusal must carry no extended-ACK message");
+    }
+    // `inet_rtm_deladdr`: the device lacks the address.
+    if !expect(&del, true, EADDRNOTAVAIL, Some("ipv4: Address not found")) {
+        return TestResult::Fail("deladdr must carry Linux's \"ipv4: Address not found\"");
+    }
+    let del = addr_req(RTM_DELADDR, 0, AF_INET, 24, absent, &[(IFA_LOCAL, local77)]);
+    if !expect(&del, true, ENODEV, Some("ipv4: Device not found")) {
+        return TestResult::Fail("deladdr on a missing device must be \"ipv4: Device not found\"");
+    }
+    // `inet_validate_rtm` runs before the device lookup.
+    let new = addr_req(RTM_NEWADDR, 0, AF_INET, 33, absent, &[(IFA_LOCAL, local77)]);
+    if !expect(&new, true, EINVAL, Some("ipv4: Invalid prefix length")) {
+        return TestResult::Fail("newaddr /33 must be \"ipv4: Invalid prefix length\" first");
+    }
+    let new = addr_req(
+        RTM_NEWADDR,
+        0,
+        AF_INET,
+        24,
+        absent,
+        &[(IFA_ADDRESS, local77)],
+    );
+    if !expect(
+        &new,
+        true,
+        EINVAL,
+        Some("ipv4: Local address is not supplied"),
+    ) {
+        return TestResult::Fail("newaddr without IFA_LOCAL must say so before the lookup");
+    }
+    let new = addr_req(RTM_NEWADDR, 0, AF_INET, 24, absent, &[(IFA_LOCAL, local77)]);
+    if !expect(&new, true, ENODEV, Some("ipv4: Device not found")) {
+        return TestResult::Fail("newaddr on a missing device must be \"ipv4: Device not found\"");
+    }
+    let new = addr_req(
+        RTM_NEWADDR,
+        NLM_F_CREATE | NLM_F_EXCL,
+        AF_INET,
+        24,
+        ifindex,
+        &[(IFA_LOCAL, local77)],
+    );
+    if !expect(&new, true, 0, None) {
+        return TestResult::Fail("a CAP_NET_ADMIN sender could not add an address");
+    }
+    if !expect(&new, true, EEXIST, Some("ipv4: Address already assigned")) {
+        return TestResult::Fail("re-adding must be \"ipv4: Address already assigned\"");
+    }
+    // `ip addr del 192.0.2.77/24`: IFA_LOCAL plus a matching IFA_ADDRESS.
+    let del = addr_req(
+        RTM_DELADDR,
+        0,
+        AF_INET,
+        24,
+        ifindex,
+        &[(IFA_LOCAL, local77), (IFA_ADDRESS, local77)],
+    );
+    if !expect(&del, true, 0, None) {
+        return TestResult::Fail("deleting the added address failed");
+    }
+    // IPv6: no address at all is a bare -EINVAL, before the device lookup.
+    let new = addr_req(RTM_NEWADDR, 0, AF_INET6, 64, absent, &[]);
+    if !expect(&new, true, EINVAL, None) {
+        return TestResult::Fail("an IPv6 newaddr without an address must be a bare EINVAL");
+    }
+    let new = addr_req(RTM_NEWADDR, 0, AF_INET6, 64, absent, &[(IFA_LOCAL, v6)]);
+    if !expect(
+        &new,
+        true,
+        ENODEV,
+        Some("ipv6: Unable to find the interface"),
+    ) {
+        return TestResult::Fail("IPv6 newaddr on a missing device has Linux's message");
+    }
+    let del = addr_req(RTM_DELADDR, 0, AF_INET6, 129, absent, &[(IFA_LOCAL, v6)]);
+    if !expect(&del, true, EINVAL, Some("ipv6: Invalid prefix length")) {
+        return TestResult::Fail("IPv6 deladdr /129 must fail on the prefix before the lookup");
+    }
+    let del = addr_req(RTM_DELADDR, 0, AF_INET6, 64, ifindex, &[(IFA_LOCAL, v6)]);
+    if !expect(&del, true, EADDRNOTAVAIL, Some("ipv6: address not found")) {
+        return TestResult::Fail("IPv6 deladdr of an absent address has Linux's message");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_rtnetlink_extack_messages_are_linuxs);
+
+/// A packet socket bound to a device receives the frames that device
+/// receives, each tagged with that device's ifindex (`packet_rcv`:
+/// `sll_ifindex = skb->dev->ifindex`); a socket bound to `lo` does not see
+/// them. NARF tagged every received frame as ifindex 1 (`lo`), so a socket
+/// bound to a NIC — what a DHCP client opens — never received anything.
+fn smoke_raw_packet_frames_carry_the_ingress_ifindex() -> TestResult {
+    let name = crate::iface::register("nrfp%d", [0x02, 0, 0, 0, 0xbe, 0], |_| Ok(()));
+    let Some(ifindex) = crate::iface::ifindex_of(&name) else {
+        return TestResult::Fail("test interface has no ifindex");
+    };
+    let bound = crate::raw_sock::raw_packet_open(crate::raw_sock::ETH_P_ALL, ifindex);
+    let on_lo = crate::raw_sock::raw_packet_open(crate::raw_sock::ETH_P_ALL, 1);
+    // An ARP request from 198.51.100.2 for 198.51.100.1, broadcast.
+    let mut frame = [0u8; 60];
+    frame[0..6].copy_from_slice(&[0xff; 6]);
+    frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0xbe, 9]);
+    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    frame[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    frame[22..28].copy_from_slice(&[0x02, 0, 0, 0, 0xbe, 9]);
+    frame[28..32].copy_from_slice(&[198, 51, 100, 2]);
+    frame[38..42].copy_from_slice(&[198, 51, 100, 1]);
+    crate::tcp_stack::rx_handler(&name, &mut frame);
+    let got = crate::raw_sock::raw_packet_recv(&bound);
+    let leaked = crate::raw_sock::raw_packet_recv(&on_lo);
+    crate::raw_sock::raw_packet_close(&bound);
+    crate::raw_sock::raw_packet_close(&on_lo);
+    match got {
+        Some(raw) if raw.ifindex == ifindex => {}
+        Some(_) => return TestResult::Fail("the frame carried another device's ifindex"),
+        None => return TestResult::Fail("a socket bound to the ingress device received nothing"),
+    }
+    if leaked.is_some() {
+        return TestResult::Fail("a socket bound to lo received a frame from another device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/raw", smoke_raw_packet_frames_carry_the_ingress_ifindex);

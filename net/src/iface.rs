@@ -21,16 +21,113 @@ pub struct NetIfaceEntry {
     pub name: String,
     pub mac: [u8; 6],
     pub send: SendFn,
-    /// IPv4 address assigned to the interface (host byte order in
-    /// [u8; 4]). Populated by the static config at boot — no DHCP
-    /// today.
+    /// The interface's primary IPv4 address (the stack's source address),
+    /// `0.0.0.0` while it has none. [`add_addr`] / [`del_addr`] keep it on
+    /// the first address configured, as Linux's primary `ifa_list` entry.
     pub ipv4: [u8; 4],
-    /// Default gateway. Used for any non-on-link destination.
+    /// Default gateway recorded by the in-kernel DHCP client / static config.
     pub gateway: [u8; 4],
     pub mtu: u32,
+    /// Administratively up (IFF_UP). NARF devices report carrier whenever
+    /// they are up, so this is also IFF_RUNNING / IFF_LOWER_UP.
     pub link_up: bool,
     /// Owning network namespace. Zero is the initial namespace.
     pub net_ns_id: u64,
+    /// Linux ifindex, fixed at registration (`dev_new_index`): `lo` is 1, the
+    /// rest take the next unused number and keep it for their lifetime, so
+    /// unregistering one device never renumbers another.
+    pub ifindex: u32,
+    /// What `ETHTOOL_GDRVINFO` reports: the driver's Linux name (`e1000`,
+    /// `virtio_net`), its version string if it sets one (else the kernel
+    /// release is reported), and the parent device's name (the PCI address).
+    /// Empty `driver` = no driver info (Linux answers -EOPNOTSUPP).
+    pub driver: &'static str,
+    pub driver_version: Option<&'static str>,
+    pub bus_info: String,
+}
+
+/// Record `ETHTOOL_GDRVINFO` data for interface `name` (see
+/// [`NetIfaceEntry::driver`]). Drivers call this right after [`register`].
+pub fn set_driver_info(
+    name: &str,
+    driver: &'static str,
+    driver_version: Option<&'static str>,
+    bus_info: String,
+) {
+    if let Some(entry) = IFACES
+        .lock()
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+    {
+        entry.driver = driver;
+        entry.driver_version = driver_version;
+        entry.bus_info = bus_info;
+    }
+}
+
+/// `ETHTOOL_GDRVINFO` data for `name`: `(driver, version, bus_info)`, or
+/// `None` when the device has none (`lo`).
+pub fn driver_info(name: &str) -> Option<(&'static str, Option<&'static str>, String)> {
+    let g = IFACES.lock();
+    let entry = g.as_ref()?.iter().find(|entry| entry.name == name)?;
+    (!entry.driver.is_empty()).then(|| (entry.driver, entry.driver_version, entry.bus_info.clone()))
+}
+
+/// Next ifindex to hand out (`dev_new_index`). 1 is reserved for `lo`.
+static NEXT_IFINDEX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+
+/// Ifindexes of devices that exist only in the frame-ring registry (they
+/// never call [`register`]), allocated from the same counter on first sight.
+static REGISTRY_IFINDEX: IrqSafeSpinLock<alloc::collections::BTreeMap<String, u32>> =
+    IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// The ifindex of a device known only by name to the frame-ring registry:
+/// its registered ifindex if it has one, else one allocated once and kept.
+pub fn stable_ifindex(name: &str) -> u32 {
+    if let Some(ifindex) = ifindex_of(name) {
+        return ifindex;
+    }
+    *REGISTRY_IFINDEX
+        .lock()
+        .entry(String::from(name))
+        .or_insert_with(|| NEXT_IFINDEX.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Names handed out by [`reserve_name`] that are not registered yet. They
+/// count as taken for [`alloc_name`].
+static RESERVED: IrqSafeSpinLock<Vec<String>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Linux `dev_alloc_name`: a name containing `%d` takes the lowest number not
+/// already used by a registered or reserved device; any other name is used
+/// as-is.
+fn alloc_name(ifaces: &[NetIfaceEntry], reserved: &[String], pattern: &str) -> String {
+    let Some((prefix, suffix)) = pattern.split_once("%d") else {
+        return String::from(pattern);
+    };
+    (0u32..)
+        .map(|n| alloc::format!("{prefix}{n}{suffix}"))
+        .find(|candidate| {
+            ifaces.iter().all(|entry| entry.name != *candidate)
+                && reserved.iter().all(|name| name != candidate)
+        })
+        .unwrap_or_default()
+}
+
+/// Allocate a device name (`dev_alloc_name`) for a driver that needs it
+/// before it calls [`register`] — Linux names a `net_device` when it is set
+/// up, before `register_netdevice`. The name is held until registered.
+pub fn reserve_name(pattern: &str) -> &'static str {
+    let g = IFACES.lock();
+    let mut reserved = RESERVED.lock();
+    let name = alloc_name(g.as_deref().unwrap_or(&[]), &reserved, pattern);
+    reserved.push(name.clone());
+    alloc::boxed::Box::leak(name.into_boxed_str())
+}
+
+/// [`register`] for a driver that keeps its device name for the kernel's
+/// lifetime: returns it as a `&'static str`.
+pub fn register_static(pattern: &str, mac: [u8; 6], send: SendFn) -> &'static str {
+    alloc::boxed::Box::leak(register(pattern, mac, send).into_boxed_str())
 }
 
 /// Hook into procfs for publishing an interface's `net.ipv4.conf.<dev>.*`
@@ -70,13 +167,6 @@ fn dev_conf_register(iface_name: &str) {
 }
 
 static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::new(None);
-
-/// Default IP / gateway for the QEMU user-net topology — Stage-1
-/// hard-codes these so a freshly-booted NARF can talk out without
-/// DHCP. Override at boot via `set_default_ipv4` if the actual
-/// network differs.
-pub const QEMU_DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
-pub const QEMU_DEFAULT_GW: [u8; 4] = [10, 0, 2, 2];
 
 /// Loopback transmit: a frame sent on "lo" is immediately received on
 /// "lo". Linux does the same thing — `loopback_xmit` hands the skb straight
@@ -132,27 +222,59 @@ pub fn register_loopback_iface() {
 
 /// Register a NIC driver as a network interface. Called from the
 /// driver's probe path.
-pub fn register(name: &str, mac: [u8; 6], send: SendFn) {
+/// Returns the registered name: `name` itself, or for an `eth%d`-style
+/// pattern the name `dev_alloc_name` chose. Drivers address their device by
+/// the returned name afterwards.
+pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
     let mut g = IFACES.lock();
     let v = g.get_or_insert_with(Vec::new);
-    // De-dup: if a same-named iface exists, replace it.
+    let name = {
+        let mut reserved = RESERVED.lock();
+        let name = alloc_name(v, &reserved, name);
+        // Registering a reserved name consumes the reservation.
+        reserved.retain(|held| *held != name);
+        name
+    };
+    // De-dup: a same-named iface is replaced, keeping its ifindex and the
+    // configuration userspace gave it (admin state, addresses).
+    let old = v.iter().find(|i| i.name == name);
+    let ifindex = if name == "lo" {
+        1
+    } else if let Some(old) = old {
+        old.ifindex
+    } else {
+        NEXT_IFINDEX.fetch_add(1, Ordering::Relaxed)
+    };
+    // `register_netdevice`: a new device is down (no IFF_UP) and has no
+    // address; userspace (NetworkManager, `ip`) or the boot-time IP
+    // autoconfiguration brings it up and configures it. NARF's `lo` is the
+    // exception: its datapath is permanently up (see `AdminHandle::set_link`).
+    let (ipv4, gateway, link_up) = match old {
+        Some(old) => (old.ipv4, old.gateway, old.link_up),
+        None => ([0; 4], [0; 4], name == "lo"),
+    };
     v.retain(|i| i.name != name);
     v.push(NetIfaceEntry {
-        name: alloc::string::String::from(name),
+        name: name.clone(),
         mac,
         send,
-        ipv4: QEMU_DEFAULT_IP,
-        gateway: QEMU_DEFAULT_GW,
+        ipv4,
+        gateway,
         mtu: 1500,
-        link_up: true,
+        link_up,
         net_ns_id: 0,
+        ifindex,
+        driver: "",
+        driver_version: None,
+        bus_info: String::new(),
     });
     drop(g);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
     // forwarding value from `conf.default`. Done with IFACES released: the
     // hook reaches into the procfs registry, which must not be entered under
     // this lock.
-    dev_conf_register(name);
+    dev_conf_register(&name);
+    name
 }
 
 /// Number of registered interfaces.
@@ -247,6 +369,7 @@ pub fn snapshot_all_in(net_ns_id: u64) -> Vec<NetIfaceSnapshot> {
             mtu: e.mtu,
             link_up: e.link_up,
             net_ns_id: e.net_ns_id,
+            ifindex: e.ifindex,
         })
         .collect()
 }
@@ -266,6 +389,7 @@ pub fn primary() -> Option<NetIfaceSnapshot> {
         mtu: e.mtu,
         link_up: e.link_up,
         net_ns_id: e.net_ns_id,
+        ifindex: e.ifindex,
     })
 }
 
@@ -286,6 +410,7 @@ pub fn lookup(name: &str) -> Option<NetIfaceSnapshot> {
         mtu: e.mtu,
         link_up: e.link_up,
         net_ns_id: e.net_ns_id,
+        ifindex: e.ifindex,
     })
 }
 
@@ -315,6 +440,7 @@ pub fn for_local_addr_in(net_ns_id: u64, ip: [u8; 4]) -> Option<NetIfaceSnapshot
         mtu: e.mtu,
         link_up: e.link_up,
         net_ns_id: e.net_ns_id,
+        ifindex: e.ifindex,
     })
 }
 
@@ -358,14 +484,10 @@ pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
 /// turn a program's `bpf_redirect(ifindex)` into an egress NIC. Returns `Err`
 /// if the ifindex names no registered iface or the driver failed.
 pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
-    // 0 and 1 are reserved (0 = "none", 1 = loopback); registered NICs start
-    // at 2, so subtract the two reserved slots to index the registry.
-    let pos = (ifindex as usize).checked_sub(2).ok_or(())?;
     let send_fn = {
         let g = IFACES.lock();
         let v = g.as_ref().ok_or(())?;
-        let e = v.get(pos).ok_or(())?;
-        e.send
+        v.iter().find(|e| e.ifindex == ifindex).ok_or(())?.send
     };
     send_fn(frame)
 }
@@ -377,12 +499,14 @@ pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
 /// broadcast fan-out.
 #[must_use]
 pub fn ifindex_of(iface_name: &str) -> Option<u32> {
+    if iface_name == "lo" {
+        return Some(1);
+    }
     let g = IFACES.lock();
-    let v = g.as_ref()?;
-    let pos = v.iter().position(|e| e.name == iface_name)?;
-    // 0 = "none", 1 = loopback, registered NICs start at 2 — mirror
-    // `send_on_ifindex`'s `pos + 2`.
-    Some((pos + 2) as u32)
+    g.as_ref()?
+        .iter()
+        .find(|e| e.name == iface_name)
+        .map(|e| e.ifindex)
 }
 
 /// First interface visible in `net_ns_id`.
@@ -478,6 +602,7 @@ pub struct NetIfaceSnapshot {
     pub mtu: u32,
     pub link_up: bool,
     pub net_ns_id: u64,
+    pub ifindex: u32,
 }
 
 fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
@@ -490,6 +615,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         mtu: entry.mtu,
         link_up: entry.link_up,
         net_ns_id: entry.net_ns_id,
+        ifindex: entry.ifindex,
     }
 }
 
@@ -596,11 +722,34 @@ pub fn set_iface_ipv4(name: &str, ipv4: [u8; 4], gateway: [u8; 4]) {
 /// Automatically installs a connected subnet route. Idempotent.
 pub fn add_addr(iface_name: &str, addr: [u8; 4], prefix_len: u8) {
     crate::ifaddr::iface_add_addr(iface_name, crate::ipv4::Ipv4Addr(addr), prefix_len);
+    // The first address a device gets is its primary: the source address
+    // the stack sends from (Linux `inet_select_addr` picks the primary).
+    let mut g = IFACES.lock();
+    if let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == iface_name))
+    {
+        if entry.ipv4 == [0; 4] {
+            entry.ipv4 = addr;
+        }
+    }
 }
 
-/// Remove an IPv4 address from the named interface.
+/// Remove an IPv4 address from the named interface. Removing the address
+/// the stack sends from moves it to the next remaining address, or leaves
+/// the device with none.
 pub fn del_addr(iface_name: &str, addr: [u8; 4], prefix_len: u8) {
     crate::ifaddr::iface_del_addr(iface_name, crate::ipv4::Ipv4Addr(addr), prefix_len);
+    let next = crate::ifaddr::iface_primary_addr(iface_name).map_or([0; 4], |next| next.addr.0);
+    let mut g = IFACES.lock();
+    if let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == iface_name))
+    {
+        if entry.ipv4 == addr {
+            entry.ipv4 = next;
+        }
+    }
 }
 
 /// Return all IPv4 addresses assigned to the named interface as a

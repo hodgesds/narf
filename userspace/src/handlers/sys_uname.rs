@@ -3,6 +3,10 @@ use super::*;
 
 /// `uname(struct utsname*)` — Linux `SYSCALL_DEFINE1(newuname)`: the sole error
 /// is a faulting (or NULL) destination, `copy_to_user(...) → -EFAULT`.
+/// `uname -r`: also what `ETHTOOL_GDRVINFO` reports as a driver's version
+/// when the driver sets none (`ethtool_get_drvinfo` uses `init_uts_ns`).
+pub(crate) const UTS_RELEASE: &str = "6.1.0-narf";
+
 pub(crate) fn sys_uname(ctx: &mut dyn TrapContext) {
     let buf = ctx.args().arg0;
     if buf == 0 {
@@ -30,7 +34,7 @@ pub(crate) fn sys_uname(ctx: &mut dyn TrapContext) {
     // `release` must parse as a modern kernel version: software (systemd,
     // glibc, ...) gates features on `uname -r >= X.Y`. systemd warns and
     // disables features below 5.4. Report a 6.x base with a narf suffix.
-    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "6.1.0-narf");
+    pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], UTS_RELEASE);
     off += UTSNAME_FIELD_LEN;
     pack_utsname_field(&mut kbuf[off..off + UTSNAME_FIELD_LEN], "#1 SMP NARF");
     off += UTSNAME_FIELD_LEN;

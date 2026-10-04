@@ -64,25 +64,9 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
         if let Some(owner) = crate::task::task_get(task) {
             crate::network_daemon::delegate_socket(&owner, &sock);
         }
-    }
-    // PID 1 configures only the initial namespace's synthetic loopback during
-    // early systemd boot. Keep the authority kernel-held and interface-bound:
-    // no other route socket receives an ambient administrative capability.
-    if domain == crate::socket::AF_NETLINK
-        && proto == crate::socket::NETLINK_ROUTE
-        && sock.net_ns_id() == 0
-        && task_to_pid_raw(task) == Some(1)
-        && sock
-            .delegate_netlink_admin(narf_net::initial_loopback_admin())
-            .is_err()
-    {
-        // Deliberate denial: PID 1's initial-ns route socket could not be
-        // granted the kernel-held loopback admin authority. -1 folds to EPERM,
-        // the errno Linux uses when a NETLINK_ROUTE admin operation is refused
-        // for lack of CAP_NET_ADMIN — the right verdict for a denied privileged
-        // capability. Verified correct as EPERM (kept explicit).
-        ctx.set_return(errno_ret(EPERM));
-        return;
+        // The socket's `f_cred` half of `netlink_net_capable`: rtnetlink
+        // changes need CAP_NET_ADMIN from the opener as well as the sender.
+        sock.record_opener_net_admin(task);
     }
     let new_fd = match fd::install(task, crate::fd::FdEntry {
             ops: sock.clone(),

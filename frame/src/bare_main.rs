@@ -3946,6 +3946,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::Ok
             });
 
+            // Same for /sys/class/net: the NICs register while drivers probe,
+            // after the early populate_all(). udev coldplug and
+            // NetworkManager find network devices here.
+            narf_init::register(narf_init::Stage::Late, "sysfs-net-class", || {
+                narf_filesystem::sysfs::populate_net_class();
+                narf_init::InitResult::Ok
+            });
+
             // /sys/class/tty/tty0/active — logind reads this to learn the active
             // VT on seat0 and thereby which session is active. Without it logind
             // "cannot determine the active graphical session", refuses
@@ -6075,7 +6083,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
 
     // Off-box network serving smoke (opt-in `qemu-net`): auto-spawn the
     // TCP echo server alongside getty. The kernel statically configured
-    // vnet0 with the SLIRP lease (cross_crate_init), and QEMU forwards a
+    // the virtio NIC with the SLIRP lease (cross_crate_init), and QEMU forwards a
     // host port to guest :7777, so the host-side `cargo xtask net-smoke`
     // harness can connect and round-trip without driving the console.
     #[cfg(feature = "qemu-net")]

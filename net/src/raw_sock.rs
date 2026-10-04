@@ -15,8 +15,8 @@
 //! Frames are delivered via `raw_pkt_deliver`, called from the top
 //! of `tcp_stack::rx_handler` before any L3 dispatch.
 //!
-//! Optional `ifindex` filter: 0 = accept from any interface (the only
-//! real iface in Stage-1 is always index 1; 0 or 1 both match).
+//! Optional `ifindex` filter: 0 = accept from any interface, otherwise only
+//! frames that arrived on the device with that ifindex.
 
 extern crate alloc;
 
@@ -34,8 +34,7 @@ pub const ETH_P_ALL: u16 = 0x0003;
 /// A single captured Ethernet frame.
 #[derive(Clone, Debug)]
 pub struct RawFrame {
-    /// Interface index the frame arrived on (1-based; 1 for the
-    /// primary interface, matching Linux ARPHRD_ETHER convention).
+    /// Ifindex of the device the frame arrived on (`sll_ifindex`).
     pub ifindex: u32,
     /// Full Ethernet frame bytes (including 14-byte header).
     pub frame: Vec<u8>,
@@ -178,7 +177,7 @@ pub fn raw_packet_set_depth(sock: &Arc<RawPacketSocket>, depth: usize) {
 // ones.
 
 /// Deliver a raw Ethernet frame to all matching raw packet sockets.
-/// `ifindex` is the receiving interface's index (1 for primary).
+/// `ifindex` is the receiving device's ifindex (`skb->dev->ifindex`).
 pub fn raw_pkt_deliver(frame: &[u8], ifindex: u32) {
     raw_pkt_deliver_in(0, frame, ifindex);
 }

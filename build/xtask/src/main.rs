@@ -94,12 +94,13 @@ enum Cmd {
     /// Cross-compile and boot the mounted /mnt rootfs's
     /// `/lib/systemd/systemd` as REAL PID 1 (sets the `systemd_pid1`
     /// kernel cmdline flag, which makes boot-init spawn the chroot
-    /// launcher as the first user task instead of NARF init/getty). Enables
-    /// the QEMU user-network configuration so the distro sees vnet0 at
-    /// 10.0.2.15/24 with the SLIRP gateway at 10.0.2.2.
-    /// XTASK_SYSTEMD_PID1_NET_CHECK=1 additionally asserts the network
-    /// WORKS: a host-side listener answers the rootfs's narf-net-check
-    /// gate through SLIRP and the gate's verdict line is the run's
+    /// launcher as the first user task instead of NARF init/getty). The NICs
+    /// come up down and unconfigured, as on Linux, for the distro's network
+    /// manager to bring up and DHCP from QEMU's user-mode network.
+    /// XTASK_SYSTEMD_PID1_NET_CHECK=1 instead builds with the static
+    /// `qemu-net` configuration (eth0 = 10.0.2.15/24, gateway 10.0.2.2) and
+    /// asserts the network WORKS: a host-side listener answers the rootfs's
+    /// narf-net-check gate through SLIRP and the gate's verdict line is the run's
     /// success/failure marker.
     /// Streams + captures serial for a timeout, then kills QEMU and
     /// prints a digest of systemd's output. Requires a systemd rootfs
@@ -117,7 +118,7 @@ enum Cmd {
     /// shell parser → echo built-in → sys_write fd 1 → UART.
     RunInteractive(RunInteractiveArgs),
     /// Off-box network serving smoke. Boot with `qemu-net` (statically
-    /// configures vnet0 with the SLIRP lease) + a QEMU `hostfwd`, wait
+    /// configures the virtio NIC with the SLIRP lease) + a QEMU `hostfwd`, wait
     /// for the auto-spawned `netserve` echo server to print
     /// `netserve: listening`, then open a real TCP socket FROM THE HOST
     /// to the forwarded port, round-trip a line, and assert the echo +
@@ -729,26 +730,44 @@ fn emit_serial_line(writer: &mut impl Write, line: &str) {
 mod systemd_marker_tests {
     use super::*;
 
-    #[test]
-    fn systemd_pid1_build_enables_qemu_network() {
+    fn systemd_pid1_features(net_check: bool) -> Vec<String> {
         let cli = Cli::try_parse_from(["xtask", "systemd-pid1", "--features", "user-requested"])
             .expect("systemd-pid1 CLI must parse");
         let Cmd::SystemdPid1(mut args) = cli.cmd else {
             panic!("systemd-pid1 subcommand parsed as another variant");
         };
+        configure_systemd_pid1_build(&mut args, net_check);
+        args.features.split(',').map(str::to_string).collect()
+    }
 
-        configure_systemd_pid1_build(&mut args);
-        let features: Vec<&str> = args.features.split(',').collect();
+    #[test]
+    fn systemd_pid1_build_leaves_network_to_the_distro() {
+        let features = systemd_pid1_features(false);
         for expected in [
             "user-requested",
             "boot-init",
             "cgroup-all",
             "firmware-allow-unsigned",
-            "qemu-net",
             "container",
         ] {
-            assert!(features.contains(&expected), "missing feature {expected}");
+            assert!(
+                features.iter().any(|f| f == expected),
+                "missing feature {expected}"
+            );
         }
+        // NetworkManager must find eth0 down and unconfigured, as on Linux
+        // booted without `ip=`; a statically configured interface is adopted
+        // as external and never DHCP'd.
+        assert!(
+            !features.iter().any(|f| f == "qemu-net"),
+            "a distro boot must not statically configure the NIC"
+        );
+    }
+
+    #[test]
+    fn systemd_pid1_net_check_enables_qemu_network() {
+        let features = systemd_pid1_features(true);
+        assert!(features.iter().any(|f| f == "qemu-net"));
     }
 
     #[test]
@@ -3425,8 +3444,15 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
     if !matches!(args.arch, Arch::X86_64) {
         bail!("xtask systemd-pid1: only x86_64 is wired (aarch64 boot-init is a stub)");
     }
+    // XTASK_SYSTEMD_PID1_NET_CHECK=1 turns the boot into a network
+    // acceptance run: a host-side listener answers the in-guest
+    // `narf-net-check` gate through the SLIRP gateway, and the gate's
+    // single verdict line becomes the run's success/failure contract.
+    let net_check = std::env::var("XTASK_SYSTEMD_PID1_NET_CHECK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let mut args = args.clone();
-    configure_systemd_pid1_build(&mut args);
+    configure_systemd_pid1_build(&mut args, net_check);
 
     let root = workspace_root()?;
     let disk = virtio_blk_image_path();
@@ -3437,13 +3463,6 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
         );
     }
 
-    // XTASK_SYSTEMD_PID1_NET_CHECK=1 turns the boot into a network
-    // acceptance run: a host-side listener answers the in-guest
-    // `narf-net-check` gate through the SLIRP gateway, and the gate's
-    // single verdict line becomes the run's success/failure contract.
-    let net_check = std::env::var("XTASK_SYSTEMD_PID1_NET_CHECK")
-        .map(|v| v == "1")
-        .unwrap_or(false);
     let net_check_port = if net_check {
         let port = spawn_net_check_listener()?;
         println!(
@@ -3644,11 +3663,14 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
 
 /// Add the kernel features required by a distro PID-1 boot under QEMU.
 ///
-/// `qemu-net` publishes the static address and default route matching QEMU's
-/// user-mode network.  Without it the virtio NIC exists, but the distro boot
-/// has no usable off-box route unless a privileged network daemon happens to
-/// configure one.
-fn configure_systemd_pid1_build(args: &mut BuildArgs) {
+/// A distro boots like Linux without `ip=`: its NICs come up down and
+/// unconfigured, and the distro's network manager (NetworkManager on
+/// CachyOS) brings them up and runs DHCP against QEMU's user-mode network.
+/// The kernel's static `qemu-net` autoconfiguration must stay off for that —
+/// NetworkManager adopts an already-configured interface as "external" and
+/// never manages it. Only the `narf-net-check` acceptance run (`net_check`)
+/// keeps `qemu-net`, the gate that proves that static bring-up works.
+fn configure_systemd_pid1_build(args: &mut BuildArgs, net_check: bool) {
     // boot-init compiles boot_userspace_init (which honours systemd_pid1);
     // cgroup-all makes /sys/fs/cgroup a real cgroup2fs (systemd's hard
     // gate); firmware-allow-unsigned mirrors the run-interactive boot;
@@ -3658,7 +3680,9 @@ fn configure_systemd_pid1_build(args: &mut BuildArgs) {
     ensure_feature(&mut args.features, "boot-init");
     ensure_feature(&mut args.features, "cgroup-all");
     ensure_feature(&mut args.features, "firmware-allow-unsigned");
-    ensure_feature(&mut args.features, "qemu-net");
+    if net_check {
+        ensure_feature(&mut args.features, "qemu-net");
+    }
     ensure_feature(&mut args.features, "container");
 }
 

@@ -170,7 +170,7 @@ qemu-net = []
 # mt-echo benchmark workload: at boot, spawn the multithreaded
 # SO_REUSEPORT echo server (one Listen TCB per worker thread) instead of
 # redis, so a multi-queue/RSS NIC can be driven in parallel across cores.
-# Implies qemu-net (needs the off-box vnet0 config). Thread count comes
+# Implies qemu-net (needs the off-box virtio NIC config). Thread count comes
 # from the kernel cmdline `mt_echo_threads=N` (default = CPU count).
 mt-echo = ["qemu-net"]
 

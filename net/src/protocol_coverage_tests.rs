@@ -77,6 +77,9 @@ fn cov_reset_iface(iface: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
     COV_TX.lock().clear();
 
     crate::iface::register(iface, COV_MAC, cov_send);
+    // Devices register down (Linux `register_netdevice`); bring it up as
+    // `ip link set dev <iface> up` would — a down egress forwards nothing.
+    crate::iface::set_link_state(iface, true);
     crate::iface::set_iface_ipv4_fields(iface, local_ip, gateway);
     crate::iface::add_addr(iface, local_ip, 24);
     crate::tcp_stack::__arp_insert_legacy(gateway, COV_PEER_MAC);

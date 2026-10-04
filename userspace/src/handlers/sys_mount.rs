@@ -539,12 +539,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         } else {
             source_resolved.trim_end_matches('/')
         };
-        let target_base = if target == "/" {
-            "/"
-        } else {
-            target.trim_end_matches('/')
-        };
-        let descendants = if flags & MS_REC != 0 && source_base != target_base {
+        // `__do_loopback`: a recursive bind is `copy_tree` of the source mount
+        // and every mount below it, grafted at the target — a self-bind
+        // (`mount --rbind /x /x`) included, which stacks a copy of `/x` and of
+        // each submount, exactly as mountinfo shows on Linux.
+        let descendants = if flags & MS_REC != 0 {
             current_clone_mount_subtree(source_base)
                 .map(|(_, descendants)| descendants)
                 .unwrap_or_default()

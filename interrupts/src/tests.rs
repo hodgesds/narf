@@ -91,6 +91,72 @@ fn smoke_vector_alloc_unique() -> TestResult {
 }
 kernel_test_in!("interrupts", smoke_vector_alloc_unique);
 
+/// A vector handed out by the allocator starts enabled, whatever its previous
+/// owner left behind. Linux's `irq_startup` resets `desc->depth` to 0 when a
+/// new owner requests the line, so a driver that `disable_irq`s before
+/// `free_irq` cannot leak the disable to the next one. NARF's teardowns
+/// (iwlwifi, i40e) `disable_irq` then free the vector, and the soft mask
+/// survived the free: the next owner — virtio-blk in the full suite — got a
+/// pre-masked vector and `on_irq` dropped every interrupt it raised.
+fn smoke_vector_alloc_starts_unmasked_after_masked_free() -> TestResult {
+    use crate::vector::{alloc, alloc_block, free};
+    let v = match alloc() {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("alloc failed"),
+    };
+    crate::dispatch::disable_irq(v);
+    let _ = free(v);
+    // alloc() returns the lowest free vector, which is `v` again.
+    let again = match alloc() {
+        Ok(again) => again,
+        Err(_) => return TestResult::Fail("re-alloc failed"),
+    };
+    let masked = crate::dispatch::is_masked(again);
+    let before = crate::dispatch::fire_count(again);
+    crate::dispatch::on_irq(again);
+    let counted = crate::dispatch::fire_count(again) == before + 1;
+    let _ = free(again);
+    if again != v {
+        crate::dispatch::enable_irq(v);
+        return TestResult::Fail("re-alloc did not return the freed vector");
+    }
+    if masked || !counted {
+        crate::dispatch::enable_irq(v);
+        return TestResult::Fail("alloc() handed out a vector still masked by its previous owner");
+    }
+
+    // The same through alloc_block.
+    let base = match alloc_block(2) {
+        Ok(base) => base,
+        Err(_) => return TestResult::Fail("alloc_block failed"),
+    };
+    crate::dispatch::disable_irq(base + 1);
+    let _ = free(base);
+    let _ = free(base + 1);
+    let again = match alloc_block(2) {
+        Ok(again) => again,
+        Err(_) => return TestResult::Fail("re-alloc_block failed"),
+    };
+    let masked = crate::dispatch::is_masked(again + 1);
+    let _ = free(again);
+    let _ = free(again + 1);
+    if again != base {
+        crate::dispatch::enable_irq(base + 1);
+        return TestResult::Fail("re-alloc_block did not return the freed block");
+    }
+    if masked {
+        crate::dispatch::enable_irq(base + 1);
+        return TestResult::Fail(
+            "alloc_block() handed out a vector still masked by its previous owner",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "interrupts",
+    smoke_vector_alloc_starts_unmasked_after_masked_free
+);
+
 fn smoke_wait_for_irq_resolves_after_on_irq() -> TestResult {
     // wait_for_irq on a never-fired vector polls Pending; firing the
     // vector wakes the future and the next poll returns Ready.

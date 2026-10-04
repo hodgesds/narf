@@ -14369,6 +14369,7 @@ mod handler_sys_umount2;
 mod handler_sys_umount2_for_test;
 #[path = "sys_uname.rs"]
 mod handler_sys_uname;
+pub(crate) use handler_sys_uname::UTS_RELEASE;
 #[path = "sys_unlink.rs"]
 mod handler_sys_unlink;
 #[path = "sys_unlinkat.rs"]

@@ -158,21 +158,23 @@ caches, the canonical local/main/default IPv4 policy rules, and each
 interface's direct-ring `noqueue` discipline respectively,
 echo the request sequence, identify the kernel sender with port ID zero, carry
 `NLM_F_MULTI`, and terminate with `NLMSG_DONE`. Unsupported request types return
-`NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests are not an ambient
-administration path. A route socket must first be explicitly delegated an
-interface-bound `AdminHandle`; undelegated or cross-interface writes return
-`NLMSG_ERROR(-EPERM)`. `RTM_NEWLINK`/`RTM_SETLINK` and IPv4 or IPv6
+`NLMSG_ERROR(-EOPNOTSUPP)`. Rtnetlink mutation requests follow
+`rtnetlink_rcv_msg`: a non-GET request needs
+`netlink_net_capable(skb, CAP_NET_ADMIN)` — CAP_NET_ADMIN over the socket's
+network namespace (its owning user namespace), held both by the socket's
+opener (recorded at `socket()`, the `file_ns_capable` half) and by the sending
+task — or the reply is `NLMSG_ERROR(-EPERM)`. A capable sender may change any
+device of that namespace (another namespace's device is `-ENODEV`) through
+kernel-held interface handles minted once per interface
+(`stack::kernel_admin`). A route socket may also be delegated an
+interface-bound `AdminHandle`, which authorizes exactly that interface.
+`RTM_NEWLINK`/`RTM_SETLINK` and IPv4 or IPv6
 `RTM_NEWADDR`/`RTM_DELADDR` plus `RTM_NEWROUTE`/`RTM_DELROUTE` invoke the
 typed operations in §3.3. `RTM_NEWNEIGH`/`RTM_DELNEIGH` update IPv4 ARP or
 IPv6 NDP state through the same interface-bound authority.
 The stack-daemon launcher performs delegation as a kernel-held transfer from a
 successful `StackAttachReply` to a route socket in the attaching task's fd
-table. During bootstrap, when outer PID 1 opens a `NETLINK_ROUTE` socket in
-the initial network namespace, the kernel attaches a separate `lo`-only
-handle so systemd can issue its idempotent `RTM_SETLINK(IFF_UP)` loopback
-request. This handle cannot administer another interface or namespace, and
-all other route sockets remain undelegated. The Linux syscall surface never
-accepts raw admin-handle bytes.
+table. The Linux syscall surface never accepts raw admin-handle bytes.
 
 Successful mutations emit kernel-originated sequence-zero notifications to
 the Linux rtnetlink multicast group for the changed object (link, neighbor,
@@ -199,9 +201,33 @@ existing device returns `EEXIST` under `NLM_F_EXCL` and `EOPNOTSUPP` under
 `NLM_F_CREATE` and `EOPNOTSUPP` with it (no link kinds are registered). An
 invalid (multicast or all-zero) `IFLA_ADDRESS` returns `EADDRNOTAVAIL`.
 
-When `NETLINK_EXT_ACK` is enabled, failed requests carry
-`NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` diagnostic describing the rejected
-authority, object-state, interface, validation, or support condition.
+Interface identity follows Linux `register_netdevice`. `lo` is ifindex 1;
+every other device takes the next unused ifindex when it registers
+(`dev_new_index`) and keeps it for its lifetime, including across a
+re-registration under the same name; a device known only to the frame-ring
+registry gets one from the same counter on first sight. The link dump,
+`SIOCGIFINDEX`, `/sys/class/net/<dev>/ifindex`, the BPF XDP attach path and
+`iface::send_on_ifindex` all use that one number. A name containing `%d` takes
+the lowest unused number (`dev_alloc_name`): e1000 and virtio-net register as
+`eth%d` and wireless drivers as `wlan%d`, each device under one name in both
+registries (a driver needing its name before registering reserves it). The link dump lists
+exactly one loopback, `lo`, and a running device reports `IFF_LOWER_UP`
+(`dev_get_flags`). A device registers down (no `IFF_UP`) and with no
+address, as `register_netdevice` leaves it, so a distro network manager finds
+it unconfigured; NARF's `lo` stays permanently up. The first IPv4 address
+configured on a device becomes the address the stack sends from; removing it
+moves that to the next address, or none. The opt-in `qemu-net` feature is the
+equivalent of Linux kernel IP autoconfiguration
+(`ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off`): it brings the primary
+virtio NIC up and configures that address and default route.
+
+When `NETLINK_EXT_ACK` is enabled, a failed mutation carries
+`NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` only where the Linux handler calls
+`NL_SET_ERR_MSG`, with the handler's text (for example `inet_rtm_deladdr`'s
+"ipv4: Address not found"); the bare `-EPERM` of the capability check carries
+none. Address requests fail in the handlers' order: `inet_validate_rtm`
+(prefix, then `IFA_LOCAL`) before the IPv4 device lookup, and IPv6 address
+extraction before any lookup.
 Without `NETLINK_CAP_ACK`, `nlmsgerr` echoes the complete offending request.
 With CAP_ACK enabled the echo is header-only and marked `NLM_F_CAPPED`; any
 extended-ACK attributes follow the capped request header.

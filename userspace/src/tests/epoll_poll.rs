@@ -4686,3 +4686,191 @@ kernel_test_in!(
     "userspace",
     smoke_epoll_nested_child_ready_wakes_parent_cell
 );
+
+/// An EPOLLET event that arrives while `epoll_wait` is scanning is not lost.
+///
+/// Xwayland waits in an edge-triggered epoll on its client sockets. A client
+/// request that landed while a wait was mid-scan re-listed the socket on the
+/// ready list, and the scan's write-back then removed that listing because
+/// its snapshot (taken before the event) had the socket unlisted and the
+/// socket's recorded mask was already readable. Nothing re-reported it:
+/// `xprop` waited forever for a reply to a request Xwayland never saw, and
+/// fish (whose `done` plugin runs xprop around every command) hung until
+/// Ctrl-C. Linux's ep_send_events keeps events that arrive during the scan
+/// (the ovflist) and delivers them.
+///
+/// `A` (no readiness cell, so every pass polls it, and with a lower fd than
+/// `B`) fires a fresh event on the cell-backed `B` from inside the second scan
+/// of a wait — after that scan's snapshot, before `B` is polled.
+fn smoke_epoll_et_event_during_scan_is_not_lost() -> TestResult {
+    use core::sync::atomic::AtomicBool;
+    use narf_filesystem::{FileOps, FsFuture, Mode, Stat, POLL_IN};
+    use narf_lib::readiness::Readiness;
+
+    struct CellFile(Readiness);
+    impl core::fmt::Debug for CellFile {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("CellFile")
+        }
+    }
+    impl FileOps for CellFile {
+        fn read<'a>(&'a self, _off: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+        fn poll_readiness(&self) -> u32 {
+            self.0.mask()
+        }
+        fn readiness(&self) -> Option<&Readiness> {
+            Some(&self.0)
+        }
+    }
+
+    struct TriggerFile {
+        target: Arc<CellFile>,
+        armed: AtomicBool,
+        polls: AtomicU32,
+    }
+    impl core::fmt::Debug for TriggerFile {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("TriggerFile")
+        }
+    }
+    impl FileOps for TriggerFile {
+        fn read<'a>(&'a self, _off: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+        fn poll_readiness(&self) -> u32 {
+            // The second poll after arming is the fallback full scan of the
+            // armed wait (the first is its fast pass): new data on `B` now.
+            if self.armed.load(AtomicOrd::Acquire)
+                && self.polls.fetch_add(1, AtomicOrd::AcqRel) == 1
+            {
+                self.target.0.set(POLL_IN, 0);
+                self.target.0.notify(POLL_IN);
+            }
+            0
+        }
+    }
+
+    // Kernel-test fixture: see `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+    let epfd_r = call(
+        Syscall::EpollCreate,
+        SyscallArgs {
+            arg0: 0,
+            ..SyscallArgs::default()
+        },
+    );
+    if epfd_r.status != SyscallReturn::OK {
+        return TestResult::Fail("create failed");
+    }
+    let epfd = epfd_r.value as u32;
+
+    let b = Arc::new(CellFile(Readiness::new(0)));
+    let a = Arc::new(TriggerFile {
+        target: Arc::clone(&b),
+        armed: AtomicBool::new(false),
+        polls: AtomicU32::new(0),
+    });
+    let install = |ops: Arc<dyn FileOps>| {
+        crate::fd::install(
+            task,
+            crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        )
+        .unwrap()
+    };
+    let fd_a = install(a.clone());
+    let fd_b = install(b.clone());
+    let add = |fd: u32, flags: u32, data: u64| {
+        let mut ev = [0u8; 12];
+        ev[..4].copy_from_slice(&flags.to_ne_bytes());
+        ev[4..12].copy_from_slice(&data.to_ne_bytes());
+        call(
+            Syscall::EpollCtl,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+                arg2: fd as u64,
+                arg3: ev.as_ptr() as u64,
+                ..SyscallArgs::default()
+            },
+        )
+        .status
+            == SyscallReturn::OK
+    };
+    if !add(fd_a, crate::epoll::EPOLLIN, 0xa)
+        || !add(fd_b, crate::epoll::EPOLLIN | crate::epoll::EPOLLET, 0xb)
+    {
+        return TestResult::Fail("epoll_ctl add failed");
+    }
+    let wait = |out: &mut [u8; 12]| {
+        call(
+            Syscall::EpollWait,
+            SyscallArgs {
+                arg0: epfd as u64,
+                arg1: out.as_mut_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                ..SyscallArgs::default()
+            },
+        )
+    };
+    let data_of = |out: &[u8; 12]| u64::from_ne_bytes(out[4..12].try_into().unwrap());
+
+    // B becomes readable and is delivered once; then the reader drains it
+    // without epoll looking (B's recorded mask stays readable).
+    b.0.set(POLL_IN, 0);
+    let mut out = [0u8; 12];
+    let r1 = wait(&mut out);
+    if r1.status != SyscallReturn::OK || r1.value != 1 || data_of(&out) != 0xb {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("B's first edge was not delivered");
+    }
+    b.0.set(0, POLL_IN);
+
+    // New data on B lands in the middle of the next wait's scan.
+    a.armed.store(true, AtomicOrd::Release);
+    let mut out2 = [0u8; 12];
+    let r2 = wait(&mut out2);
+    let mut out3 = [0u8; 12];
+    let r3 = wait(&mut out3);
+    crate::syscall::__test_clear_global();
+
+    let delivered = (r2.status == SyscallReturn::OK && r2.value == 1 && data_of(&out2) == 0xb)
+        || (r3.status == SyscallReturn::OK && r3.value == 1 && data_of(&out3) == 0xb);
+    if !delivered {
+        return TestResult::Fail("an EPOLLET event that arrived during a scan was lost");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_epoll_et_event_during_scan_is_not_lost);

@@ -42,9 +42,13 @@ pub struct RtlwifiDevice {
     pub tx_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
+/// This device's interface name, `wlan%d` as Linux `dev_alloc_name` picks
+/// it; set when the interface registers.
+static IFNAME: IrqSafeSpinLock<&'static str> = IrqSafeSpinLock::new("");
+
 impl Interface for RtlwifiDevice {
     fn name(&self) -> &str {
-        "wlan3"
+        *IFNAME.lock()
     }
     fn mac(&self) -> [u8; 6] {
         self.mac
@@ -178,7 +182,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         domain: narf_drivers::BoundKind::Net.default_domain(),
     });
 
-    narf_net::iface::register("wlan1", mac, send_frame_unimpl);
+    *IFNAME.lock() = narf_net::iface::register_static("wlan%d", mac, send_frame_unimpl);
     Ok(())
 }
 

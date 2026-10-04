@@ -161,6 +161,22 @@ fn install_proc_ext_hooks() {
     );
     // /proc/<pid>/fd enumeration: the exact open fd set from the fd table.
     narf_filesystem::procfs::set_fd_list_hook(narf_userspace::handlers::proc_fd_list);
+    // /sys/class/net/<dev>: every interface the network stack has, under the
+    // name and ifindex rtnetlink reports, so udev's database (keyed on
+    // ifindex) and NetworkManager agree about which device is which.
+    narf_filesystem::install_net_snapshot_hook(|| {
+        narf_net::iface::snapshot_all()
+            .into_iter()
+            .map(|nic| narf_filesystem::sysfs::NetIfaceInfo {
+                loopback: nic.name == "lo",
+                name: nic.name,
+                mac: nic.mac,
+                mtu: nic.mtu,
+                link_up: nic.link_up,
+                ifindex: nic.ifindex,
+            })
+            .collect()
+    });
     // /proc/<pid>/fdinfo/<n> "Pid:"/"NSpid:" lines for pidfd fds —
     // systemd's pidfd_get_pid() fallback parses these after pidfd_spawn.
     narf_filesystem::procfs::set_fd_pidfd_pid_hook(narf_userspace::handlers::proc_fd_pidfd_pid);
@@ -244,15 +260,23 @@ fn install_net_stack() {
     // hands the guest 10.0.2.15/24 with the gateway + DNS at 10.0.2.2.
     // Assign it statically to the virtio-net iface so a guest server is
     // reachable from the host through `-netdev user,hostfwd=...` (the
-    // off-box serving smoke). Opt-in feature: real hardware should run
-    // the DHCP client instead of hardcoding the SLIRP lease.
+    // off-box serving smoke). This is Linux's kernel-level IP
+    // autoconfiguration (`ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off`,
+    // net/ipv4/ipconfig.c): `ic_open_devs` brings the device up, then the
+    // address and default route are set. Without it a NIC is born down and
+    // unconfigured and userspace (NetworkManager) configures it — a
+    // configured interface would be adopted as "externally" managed and
+    // never DHCP'd. Opt-in feature: distro boots leave it off.
     #[cfg(feature = "qemu-net")]
     {
-        narf_net::iface::add_addr("vnet0", [10, 0, 2, 15], 24);
-        narf_net::iface::set_iface_ipv4("vnet0", [10, 0, 2, 15], [10, 0, 2, 2]);
+        let vnet = narf_drivers_virtio::net_pci::primary_iface_name();
+        narf_net::iface::set_link_state(vnet, true);
+        narf_net::iface::add_addr(vnet, [10, 0, 2, 15], 24);
+        narf_net::iface::set_iface_ipv4(vnet, [10, 0, 2, 15], [10, 0, 2, 2]);
         let _ = writeln!(
             console::Writer,
-            "  net: qemu-net static config — vnet0 = 10.0.2.15/24 gw 10.0.2.2 ({} virtio-net queue pair(s))",
+            "  net: qemu-net static config — {} = 10.0.2.15/24 gw 10.0.2.2 ({} virtio-net queue pair(s))",
+            vnet,
             narf_drivers_virtio::net_pci::primary_num_pairs()
         );
     }
