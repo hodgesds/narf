@@ -1456,6 +1456,13 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // spawned RX-pump task can't run while a syscall is parked
     // in `responsive_spin_until`.
     let name = narf_net::iface::register("eth%d", dev.mac, e1000_send_frame);
+    // `e1000_get_drvinfo`: driver "e1000", no version (the core reports the
+    // kernel release), bus_info = pci_name().
+    let bus_info = match device.addr {
+        narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
+        narf_bus::BusAddr::Mmio(_) => alloc::string::String::new(),
+    };
+    narf_net::iface::set_driver_info(&name, "e1000", None, bus_info);
     *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
     narf_net::iface::install_rx_drain(rx_pump_step);
 

@@ -1732,6 +1732,141 @@ impl SocketFile {
             .store(self.task_net_admin(task), Ordering::Release);
     }
 
+    /// `ioctl(fd, SIOCETHTOOL, &ifreq)` — Linux `dev_ioctl` + `dev_ethtool`.
+    /// The ifreq names the device (cut at IFNAMSIZ-1 and at an alias `:`);
+    /// `ifr_data` points at the command struct, whose first word is the
+    /// ETHTOOL_* command. Order is Linux's: copy the ifreq and read the
+    /// command (-EFAULT), find the device in this socket's namespace
+    /// (-ENODEV), read an ETHTOOL_PERQUEUE sub-command (-EFAULT), require
+    /// CAP_NET_ADMIN for everything outside `__dev_ethtool`'s "anyone" list
+    /// (-EPERM), then a command the driver lacks is -EOPNOTSUPP. NARF drivers
+    /// implement GDRVINFO and GLINK.
+    fn ethtool_ioctl(&self, arg: usize) -> Result<u64, FsError> {
+        const ETHTOOL_GDRVINFO: u32 = 0x03;
+        const ETHTOOL_GLINK: u32 = 0x0a;
+        const ETHTOOL_PERQUEUE: u32 = 0x4b;
+        // `__dev_ethtool`: the commands anyone may issue, in Linux's order.
+        const ANYONE: [u32; 36] = [
+            0x01, // ETHTOOL_GSET
+            0x03, // ETHTOOL_GDRVINFO
+            0x07, // ETHTOOL_GMSGLVL
+            0x0a, // ETHTOOL_GLINK
+            0x0e, // ETHTOOL_GCOALESCE
+            0x10, // ETHTOOL_GRINGPARAM
+            0x12, // ETHTOOL_GPAUSEPARAM
+            0x14, // ETHTOOL_GRXCSUM
+            0x16, // ETHTOOL_GTXCSUM
+            0x18, // ETHTOOL_GSG
+            0x37, // ETHTOOL_GSSET_INFO
+            0x1b, // ETHTOOL_GSTRINGS
+            0x1d, // ETHTOOL_GSTATS
+            0x4a, // ETHTOOL_GPHYSTATS
+            0x1e, // ETHTOOL_GTSO
+            0x20, // ETHTOOL_GPERMADDR
+            0x21, // ETHTOOL_GUFO
+            0x23, // ETHTOOL_GGSO
+            0x2b, // ETHTOOL_GGRO
+            0x25, // ETHTOOL_GFLAGS
+            0x27, // ETHTOOL_GPFLAGS
+            0x29, // ETHTOOL_GRXFH
+            0x2d, // ETHTOOL_GRXRINGS
+            0x2e, // ETHTOOL_GRXCLSRLCNT
+            0x2f, // ETHTOOL_GRXCLSRULE
+            0x30, // ETHTOOL_GRXCLSRLALL
+            0x38, // ETHTOOL_GRXFHINDIR
+            0x46, // ETHTOOL_GRSSH
+            0x3a, // ETHTOOL_GFEATURES
+            0x3c, // ETHTOOL_GCHANNELS
+            0x41, // ETHTOOL_GET_TS_INFO
+            0x44, // ETHTOOL_GEEE
+            0x48, // ETHTOOL_GTUNABLE
+            0x4e, // ETHTOOL_PHY_GTUNABLE
+            0x4c, // ETHTOOL_GLINKSETTINGS
+            0x50, // ETHTOOL_GFECPARAM
+        ];
+        let mut ifreq = [0u8; 40];
+        // SAFETY: a 64-bit `struct ifreq` is 40 bytes; the guarded copy
+        // validates the user range.
+        if unsafe { crate::handlers::copy_from_user(&mut ifreq, arg as u64) }.is_err() {
+            return Err(FsError::BadAddress);
+        }
+        let data = u64::from_ne_bytes(ifreq[16..24].try_into().unwrap());
+        let mut word = [0u8; 4];
+        // SAFETY: as above; `ifr_data` is a user pointer to the command.
+        if unsafe { crate::handlers::copy_from_user(&mut word, data) }.is_err() {
+            return Err(FsError::BadAddress);
+        }
+        let ethcmd = u32::from_ne_bytes(word);
+        // `dev_ioctl`: `ifr_name[IFNAMSIZ-1] = 0`, then an alias suffix
+        // (`eth0:1`) is cut at the colon.
+        let name_len = ifreq[..15]
+            .iter()
+            .position(|byte| *byte == 0 || *byte == b':')
+            .unwrap_or(15);
+        let name = core::str::from_utf8(&ifreq[..name_len]).map_err(|_| FsError::NotFound)?;
+        // Every network namespace has its own `lo`.
+        let iface = narf_net::iface::lookup_in(self.net_ns_id(), name);
+        if iface.is_none() && name != "lo" {
+            return Err(FsError::NotFound);
+        }
+        let sub_cmd = if ethcmd == ETHTOOL_PERQUEUE {
+            let mut sub = [0u8; 4];
+            // SAFETY: as above; the sub-command follows the command word.
+            if unsafe { crate::handlers::copy_from_user(&mut sub, data.wrapping_add(4)) }.is_err() {
+                return Err(FsError::BadAddress);
+            }
+            u32::from_ne_bytes(sub)
+        } else {
+            ethcmd
+        };
+        if !ANYONE.contains(&sub_cmd) && !self.task_net_admin(crate::handlers::current_task_id()) {
+            return Err(FsError::OperationNotPermitted);
+        }
+        match ethcmd {
+            ETHTOOL_GDRVINFO => {
+                // struct ethtool_drvinfo: cmd, driver[32], version[32],
+                // fw_version[32], bus_info[32], erom_version[32],
+                // reserved2[12], then five u32 counts — 196 bytes.
+                let (driver, version, bus_info) =
+                    narf_net::iface::driver_info(name).ok_or(FsError::Unsupported)?;
+                let mut info = [0u8; 196];
+                info[0..4].copy_from_slice(&ETHTOOL_GDRVINFO.to_ne_bytes());
+                let put = |info: &mut [u8; 196], at: usize, text: &str| {
+                    let bytes = text.as_bytes();
+                    let n = bytes.len().min(31);
+                    info[at..at + n].copy_from_slice(&bytes[..n]);
+                };
+                put(&mut info, 4, driver);
+                put(
+                    &mut info,
+                    36,
+                    version.unwrap_or(crate::handlers::UTS_RELEASE),
+                );
+                put(&mut info, 100, &bus_info);
+                // SAFETY: `data` was readable above; the guarded copy
+                // validates the whole struct.
+                if unsafe { crate::handlers::copy_to_user(data, &info) }.is_err() {
+                    return Err(FsError::BadAddress);
+                }
+                Ok(0)
+            }
+            ETHTOOL_GLINK => {
+                // `ethtool_get_link`: netif_running && the driver's carrier;
+                // `lo` is always on.
+                let link = u32::from(name == "lo" || iface.is_some_and(|nic| nic.link_up));
+                let mut value = [0u8; 8];
+                value[0..4].copy_from_slice(&ETHTOOL_GLINK.to_ne_bytes());
+                value[4..8].copy_from_slice(&link.to_ne_bytes());
+                // SAFETY: as above.
+                if unsafe { crate::handlers::copy_to_user(data, &value) }.is_err() {
+                    return Err(FsError::BadAddress);
+                }
+                Ok(0)
+            }
+            _ => Err(FsError::Unsupported),
+        }
+    }
+
     /// Linux `netlink_net_capable(skb, CAP_NET_ADMIN)`: both the socket's
     /// opener and the sending task are capable in its network namespace.
     fn netlink_net_admin(&self) -> bool {
@@ -2947,6 +3082,10 @@ impl FileOps for SocketFile {
     /// `$NOTIFY_SOCKET` AF_UNIX/SOCK_DGRAM socket; SIOCOUTQ must likewise
     /// succeed or dbus-broker treats the ENOTTY as fatal.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
+        const SIOCETHTOOL: u32 = 0x8946;
+        if cmd == SIOCETHTOOL {
+            return self.ethtool_ioctl(arg);
+        }
         const SIOCGIFFLAGS: u32 = 0x8913;
         const SIOCSIFFLAGS: u32 = 0x8914;
         const SIOCGIFADDR: u32 = 0x8915;

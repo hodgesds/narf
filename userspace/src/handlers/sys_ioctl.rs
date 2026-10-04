@@ -1096,7 +1096,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // the generic unknown-ioctl ENOTTY translation.
             const DRM_IOCTL_SET_CLIENT_CAP: u32 = 0x4010_640d;
             const DRM_IOCTL_MODE_ATOMIC: u32 = 0xc038_64bc;
-            if cmd == DRM_IOCTL_SET_CLIENT_CAP || cmd == DRM_IOCTL_MODE_ATOMIC {
+            // SIOCETHTOOL: a command the device's driver does not implement
+            // is `__dev_ethtool`'s -EOPNOTSUPP, not an unknown ioctl.
+            const SIOCETHTOOL: u32 = 0x8946;
+            if cmd == DRM_IOCTL_SET_CLIENT_CAP || cmd == DRM_IOCTL_MODE_ATOMIC || cmd == SIOCETHTOOL
+            {
                 ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
@@ -1280,6 +1284,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     | 0x8924
                     | 0x8927
                     | 0x8933
+                    | 0x8946
             ) =>
         {
             // `dev_ioctl` resolves the ifreq name with `__dev_get_by_name`;

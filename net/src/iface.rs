@@ -35,6 +35,40 @@ pub struct NetIfaceEntry {
     /// rest take the next unused number and keep it for their lifetime, so
     /// unregistering one device never renumbers another.
     pub ifindex: u32,
+    /// What `ETHTOOL_GDRVINFO` reports: the driver's Linux name (`e1000`,
+    /// `virtio_net`), its version string if it sets one (else the kernel
+    /// release is reported), and the parent device's name (the PCI address).
+    /// Empty `driver` = no driver info (Linux answers -EOPNOTSUPP).
+    pub driver: &'static str,
+    pub driver_version: Option<&'static str>,
+    pub bus_info: String,
+}
+
+/// Record `ETHTOOL_GDRVINFO` data for interface `name` (see
+/// [`NetIfaceEntry::driver`]). Drivers call this right after [`register`].
+pub fn set_driver_info(
+    name: &str,
+    driver: &'static str,
+    driver_version: Option<&'static str>,
+    bus_info: String,
+) {
+    if let Some(entry) = IFACES
+        .lock()
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+    {
+        entry.driver = driver;
+        entry.driver_version = driver_version;
+        entry.bus_info = bus_info;
+    }
+}
+
+/// `ETHTOOL_GDRVINFO` data for `name`: `(driver, version, bus_info)`, or
+/// `None` when the device has none (`lo`).
+pub fn driver_info(name: &str) -> Option<(&'static str, Option<&'static str>, String)> {
+    let g = IFACES.lock();
+    let entry = g.as_ref()?.iter().find(|entry| entry.name == name)?;
+    (!entry.driver.is_empty()).then(|| (entry.driver, entry.driver_version, entry.bus_info.clone()))
 }
 
 /// Next ifindex to hand out (`dev_new_index`). 1 is reserved for `lo`.
@@ -225,6 +259,9 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
         link_up: true,
         net_ns_id: 0,
         ifindex,
+        driver: "",
+        driver_version: None,
+        bus_info: String::new(),
     });
     drop(g);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its

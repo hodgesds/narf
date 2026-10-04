@@ -5913,6 +5913,98 @@ kernel_test_in!(
     smoke_abi_netlink_link_list_matches_linux
 );
 
+/// `ioctl(SIOCETHTOOL)` is Linux `dev_ethtool`: NetworkManager reads each
+/// device's driver (ETHTOOL_GDRVINFO) and link (ETHTOOL_GLINK) with it, and
+/// reported `driver '(null)'` for every NARF device because the ioctl was
+/// unknown. `lo` has no driver info (-EOPNOTSUPP) and an always-on link; an
+/// unknown device is -ENODEV; both queries are on `__dev_ethtool`'s "anyone"
+/// list, every command off it needs CAP_NET_ADMIN (-EPERM).
+fn smoke_abi_siocethtool_drvinfo_and_link() -> TestResult {
+    with_setup(|| {
+        const SIOCETHTOOL: u64 = 0x8946;
+        const ETHTOOL_GDRVINFO: u32 = 0x03;
+        const ETHTOOL_GLINK: u32 = 0x0a;
+        const ETHTOOL_GREGS: u32 = 0x04;
+        const ETHTOOL_GCOALESCE: u32 = 0x0e;
+        const ETHTOOL_SCOALESCE: u32 = 0x0f;
+        const ETHTOOL_PERQUEUE: u32 = 0x4b;
+        let sock = call(Syscall::SocketOpen.raw(), a2(2, 2, 0)).ok_or("socket status")? as u64;
+        let ethtool = |dev: &str, cmd: &mut [u8]| {
+            let mut ifreq = [0u8; 40];
+            ifreq[..dev.len()].copy_from_slice(dev.as_bytes());
+            ifreq[16..24].copy_from_slice(&(cmd.as_mut_ptr() as u64).to_ne_bytes());
+            call(
+                Syscall::Ioctl.raw(),
+                a2(sock, SIOCETHTOOL, ifreq.as_mut_ptr() as u64),
+            )
+        };
+        let result = (|| {
+            let mut link = [0u8; 8];
+            link[..4].copy_from_slice(&ETHTOOL_GLINK.to_ne_bytes());
+            if ethtool("lo", &mut link) != Some(0)
+                || u32::from_ne_bytes(link[4..8].try_into().unwrap()) != 1
+            {
+                return Err("ETHTOOL_GLINK on lo must succeed and report the link up");
+            }
+            let mut info = [0u8; 196];
+            info[..4].copy_from_slice(&ETHTOOL_GDRVINFO.to_ne_bytes());
+            if ethtool("lo", &mut info) != Some(EOPNOTSUPP) {
+                return Err("ETHTOOL_GDRVINFO on lo must be EOPNOTSUPP");
+            }
+            if ethtool("nosuchdev0", &mut link) != Some(ENODEV) {
+                return Err("SIOCETHTOOL on a missing device must be ENODEV");
+            }
+            // `dev_ioctl` cuts the name at an alias colon.
+            link[..4].copy_from_slice(&ETHTOOL_GLINK.to_ne_bytes());
+            if ethtool("lo:1", &mut link) != Some(0) {
+                return Err("SIOCETHTOOL on an alias name must reach the device");
+            }
+            // Without CAP_NET_ADMIN: the "anyone" queries still work, the
+            // rest are EPERM — after the device lookup, which stays ENODEV.
+            crate::handlers::__test_set_caps(
+                FAKE_TASK,
+                crate::handlers::CAP_FULL_SET & !(1 << 12),
+                crate::handlers::CAP_FULL_SET,
+            );
+            let unprivileged = (|| {
+                link[..4].copy_from_slice(&ETHTOOL_GLINK.to_ne_bytes());
+                if ethtool("lo", &mut link) != Some(0) {
+                    return Err("ETHTOOL_GLINK needs no CAP_NET_ADMIN");
+                }
+                info[..4].copy_from_slice(&ETHTOOL_GDRVINFO.to_ne_bytes());
+                if ethtool("lo", &mut info) != Some(EOPNOTSUPP) {
+                    return Err("ETHTOOL_GDRVINFO needs no CAP_NET_ADMIN");
+                }
+                let mut regs = [0u8; 12];
+                regs[..4].copy_from_slice(&ETHTOOL_GREGS.to_ne_bytes());
+                if ethtool("lo", &mut regs) != Some(EPERM) {
+                    return Err("ETHTOOL_GREGS without CAP_NET_ADMIN must be EPERM");
+                }
+                if ethtool("nosuchdev0", &mut regs) != Some(ENODEV) {
+                    return Err("the device lookup precedes the capability check");
+                }
+                // ETHTOOL_PERQUEUE is judged by its sub-command.
+                let mut perqueue = [0u8; 16];
+                perqueue[..4].copy_from_slice(&ETHTOOL_PERQUEUE.to_ne_bytes());
+                perqueue[4..8].copy_from_slice(&ETHTOOL_GCOALESCE.to_ne_bytes());
+                if ethtool("lo", &mut perqueue) != Some(EOPNOTSUPP) {
+                    return Err("PERQUEUE(GCOALESCE) needs no CAP_NET_ADMIN");
+                }
+                perqueue[4..8].copy_from_slice(&ETHTOOL_SCOALESCE.to_ne_bytes());
+                if ethtool("lo", &mut perqueue) != Some(EPERM) {
+                    return Err("PERQUEUE(SCOALESCE) without CAP_NET_ADMIN must be EPERM");
+                }
+                Ok(())
+            })();
+            crate::handlers::__test_caps_reset();
+            unprivileged
+        })();
+        let _ = call(Syscall::Close.raw(), a0(sock));
+        result
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_siocethtool_drvinfo_and_link);
+
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;

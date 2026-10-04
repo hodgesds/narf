@@ -1345,6 +1345,17 @@ name); a live, namespace-and-interface-matched delegated `AdminHandle` also
 authorizes its one device. Invalid MTU, hardware type, or address values
 return `EINVAL`.
 
+`SIOCETHTOOL` implements Linux `dev_ethtool` for `ETHTOOL_GDRVINFO` and
+`ETHTOOL_GLINK`, in its check order: copying the ifreq and the command word
+(`EFAULT`); the device in the socket's namespace, the name cut at
+`IFNAMSIZ-1` and at an alias colon (`ENODEV`; every namespace has `lo`); an
+`ETHTOOL_PERQUEUE` sub-command (`EFAULT`); `CAP_NET_ADMIN` for any
+(sub-)command outside `__dev_ethtool`'s unprivileged list (`EPERM`). A device
+without driver information (`lo`) and every other command return
+`EOPNOTSUPP`. `GDRVINFO` reports the driver's name, its version or else the
+kernel release, and its bus name (`e1000`: PCI name; `virtio_net` `1.0.0`:
+`virtio_bus_name()`); `GLINK` reports `netif_running` and carrier.
+
 ### 3.3 BPF XDP program compatibility
 
 `BPF_PROG_LOAD` accepts Linux program type 6 (`BPF_PROG_TYPE_XDP`) and records

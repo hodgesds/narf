@@ -1543,7 +1543,14 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
     // Register this specific controller's interface and spawn its
     // forwarder pair.
-    register_net_interface(idx);
+    // `virtnet_get_drvinfo` reports `virtio_bus_name()`: virtio-pci's
+    // `vp_bus_name` is the PCI function's name; a transport without a
+    // `bus_name` op (virtio-mmio) reports "virtio".
+    let bus_info = match device.addr {
+        narf_bus::BusAddr::Pcie(pci) => alloc::format!("{:?}", pci),
+        narf_bus::BusAddr::Mmio(_) => alloc::string::String::from("virtio"),
+    };
+    register_net_interface(idx, bus_info);
     Ok(())
 }
 
@@ -1566,7 +1573,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 ///   low (one short critical section per frame, no awaits held
 ///   under the lock) so contention is bounded even on a 4-pair
 ///   line-rate workload.
-fn register_net_interface(idx: usize) {
+fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
     let (mac, mtu, link_up, rx_irq_vectors, num_pairs) = match with_at(idx, |c| {
@@ -1587,6 +1594,8 @@ fn register_net_interface(idx: usize) {
     // others are frame-ring devices only and reserve their name.
     let name: alloc::string::String = if idx == 0 {
         let name = narf_net::iface::register_static("eth%d", mac, vnet0_send_fn);
+        // `virtnet_get_drvinfo`: driver "virtio_net", VIRTNET_DRIVER_VERSION.
+        narf_net::iface::set_driver_info(name, "virtio_net", Some("1.0.0"), bus_info);
         *PRIMARY_IFNAME.lock() = Some(name);
         name.into()
     } else {
