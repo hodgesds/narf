@@ -39,9 +39,12 @@ memory translation surface.
 Atomic targets declare ordinary trait methods. A whole target can instead add
 `#[context(Sleepable)]` and declare `async fn` methods. Those declarations are
 lowered to the object-safe `StructOpsFuture<'a, T>` ABI, and the adapter awaits
-an interpreted, heap-stack-backed BPF invocation. The future is `Send`, retains
-its VM state and fuel across polls, and restores BPF domain rights before every
-`Pending`. There is intentionally no generated synchronous wrapper.
+a heap-stack-backed BPF invocation. A program with no actual sleepable kfunc
+call may run to completion natively in one poll; a program that can suspend
+runs through the async interpreter until the checkpoint/resume JIT ABI lands.
+The future is `Send`, retains its VM state and fuel across polls, and restores
+BPF domain rights before every `Pending`. There is intentionally no generated
+synchronous wrapper.
 
 A `#[context(Mixed)]` target can combine both call surfaces. Its ordinary
 methods are marked `#[context(Atomic)]`; its `async fn` methods are marked

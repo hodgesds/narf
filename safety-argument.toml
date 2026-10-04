@@ -1336,3 +1336,18 @@ argument = "Each mixed-target method retains its own immutable context, scalar A
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Atomic and sleepable methods share only the existing Arc-owned adapter, program set, generation, and release/acquire admission gate. They do not share VM stacks or domain guards. Link close and replacement stop new calls of both kinds; previously admitted sleepable futures retain their existing owned-state completion and cancellation rules. No pointer-bearing context or physical-to-frame translation API is added."
+
+# Run-to-completion native sleepable execution. The dedicated security-review
+# skill was not available in this session; human security review remains
+# mandatory.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The native sleepable fast path remains inside the existing untrusted BPF runtime and JIT. It changes no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model implementation and adds no trusted subsystem or authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A sleepable program enters native code only when the existing fail-closed emitters compiled its entire verified image; those emitters reject every resolved Context::Sleepable kfunc call rather than calling an async shim through the synchronous ABI. The invocation uses an owned heap stack and executes inside the per-poll BPF domain wrapper. Images that can suspend start in the interpreter, so no partially executed native state is translated or resumed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The generic sleepable dispatcher now rejects Context::Atomic programs explicitly, while contract-bound programs retain exact StructOpsContract checks before reaching the shared inner path. Native and interpreted sleepable paths use the same scalar context, map and arena ownership, fuel budget, result validation, accounting, and domain-restoration rules; no pointer, frame handle, or physical-memory translation surface is introduced."

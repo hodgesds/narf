@@ -25,8 +25,9 @@ net classifier, perf).
 kinds in §3.4.
 
 **Out of scope, for now:** offloaded programs, CO-RE relocation in-kernel (it
-is a userspace concern), and continuation-style JIT lowering of sleepable
-programs (§8.5).
+is a userspace concern), and checkpoint/resume JIT lowering across an actual
+sleepable kfunc call (§8.5). Sleepable programs with no such call can already
+run to completion natively on their future-owned stack.
 
 ## 2. Assumptions
 
@@ -517,7 +518,10 @@ Atomic methods use an ordinary trait call. A target marked
 those to the object-safe `StructOpsFuture<'a, T>` ABI and dispatches through
 `BpfProg::run_struct_ops_sleepable`. The future is `Send`, owns its heap stack,
 and may be cancelled by drop. A synchronous adapter may not conceal it with
-`block_on`.
+`block_on`. A fully compiled sleepable program with no sleepable kfunc call
+sites runs to completion natively inside one poll on that owned heap stack. A
+program with an actual await site starts in the interpreter; native execution
+never falls back after partially executing the program.
 
 A target marked `#[context(Mixed)]` marks each ordinary method
 `#[context(Atomic)]` and each `async fn` method `#[context(Sleepable)]`. The
@@ -603,7 +607,10 @@ slot across a yield. Atomic execution holds a `!Send`, preemption-disabled
 domain guard for the whole non-sleeping run. Sleepable execution re-enters
 `DomainId::BPF` for every
 poll and drops the guard before returning `Pending`, so suspension always hands
-neutral rights back to the scheduler and migration is safe.
+neutral rights back to the scheduler and migration is safe. A sleepable native
+image that contains only synchronous calls uses the same future-owned heap
+stack and executes inside this per-poll domain wrapper; it does not borrow the
+atomic per-CPU region merely because it completes on the first poll.
 
 **4.9 — Fuel bounds total work and is never refilled.** `narf_yield()` lets a
 sleepable program cooperate; it does not restore fuel. Exhaustion terminates
@@ -743,8 +750,12 @@ and the perf event layer, all of which are closed.
 4. **`struct_ops!` form (resolved).** The macro re-declares the target trait so
    the Rust signature is also the verifier contract. Sleepable declarations
    use `async fn` syntax and lower to the object-safe `StructOpsFuture` return.
-5. **Continuation-style JIT lowering for sleepable programs**, replacing "
-   sleepable ⇒ interpreted".
+5. **Checkpoint/resume JIT lowering across sleepable kfunc calls.**
+   Run-to-completion native execution is implemented for sleepable programs
+   whose emitted call sites are all synchronous. A suspending image still
+   needs compiler-issued resume ids plus future-owned register, fuel, stack,
+   and explicit subprogram-call state; native code must never call an async
+   shim through the synchronous `u64` ABI.
 6. **Making JIT text unwritable, not merely un-aliased-executable.** The first
    half of this is **done**: `mmu::init_mmu` and `frame/src/aarch64/boot.S`
    build every kernel window NX/`PXN|UXN` except `[__kernel_start,

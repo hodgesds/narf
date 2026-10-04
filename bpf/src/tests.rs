@@ -789,6 +789,81 @@ kernel_test_in!("bpf", smoke_bpf_load_rejects_empty_program);
 
 // ── sleepable path ──────────────────────────────────────────────────
 
+fn smoke_bpf_sleepable_run_to_completion_uses_native_heap_stack() -> TestResult {
+    use core::future::Future;
+    use core::task::{Context as TaskContext, Poll, Waker};
+
+    // The stack round-trip makes this exercise the fourth native-entry
+    // argument set on a future-owned heap frame, rather than merely returning
+    // an immediate without touching the sleepable stack contract.
+    let insns = asm(&[st_imm(10, -8, 0x5eed), ldx(0, 10, -8), EXIT]);
+    let Ok(p) = load("sleepable_native_stack", insns, Context::Sleepable) else {
+        return TestResult::Fail("load rejected a non-suspending sleepable program");
+    };
+    if !p.is_jited() {
+        return if narf_bpf_jit::has_backend() {
+            TestResult::Fail("non-suspending sleepable program did not compile")
+        } else {
+            TestResult::Skip(NO_BACKEND)
+        };
+    }
+
+    let neutral = narf_lib::assert::current_domain();
+    let mut native = alloc::boxed::Box::pin(p.run_sleepable([0; 4], 4));
+    let mut cx = TaskContext::from_waker(Waker::noop());
+    if native.as_mut().poll(&mut cx) != Poll::Ready(Some(Outcome::Returned(0x5eed))) {
+        return TestResult::Fail("run-to-completion native image suspended or returned wrongly");
+    }
+    if narf_lib::assert::current_domain() != neutral {
+        return TestResult::Fail("native sleepable completion leaked BPF domain rights");
+    }
+    if crate::interp::drive(p.run_sleepable_interpreted([0; 4], 4))
+        != Some(Outcome::Returned(0x5eed))
+    {
+        return TestResult::Fail("native and interpreted sleepable results differ");
+    }
+
+    // A Sleepable *program* may still call an Atomic kfunc. That call has the
+    // synchronous ABI and therefore remains eligible for run-to-completion
+    // codegen; only a verifier-resolved Sleepable call site forces the async
+    // interpreter today.
+    let Ok(sync_call) = load(
+        "sleepable_native_sync_kfunc",
+        asm(&arg_mix_prog([1, 2, 3, 4, 5])),
+        Context::Sleepable,
+    ) else {
+        return TestResult::Fail("load rejected a sleepable program with a sync kfunc");
+    };
+    if !sync_call.is_jited() {
+        return TestResult::Fail("sleepable program with only a sync kfunc did not compile");
+    }
+    let native = crate::interp::drive(sync_call.run_sleepable([0; 4], 4));
+    let interpreted = crate::interp::drive(sync_call.run_sleepable_interpreted([0; 4], 4));
+    if native != interpreted || !matches!(native, Some(Outcome::Returned(_))) {
+        return TestResult::Fail("sleepable sync-kfunc native result diverged from interpreter");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf",
+    smoke_bpf_sleepable_run_to_completion_uses_native_heap_stack
+);
+
+fn smoke_bpf_sleepable_dispatch_rejects_atomic_program() -> TestResult {
+    let Ok(p) = load(
+        "atomic_through_sleepable",
+        asm(&[mov_imm(0, 1), EXIT]),
+        Context::Atomic,
+    ) else {
+        return TestResult::Fail("load rejected the atomic premise");
+    };
+    if crate::interp::drive(p.run_sleepable([0; 4], 4)).is_some() {
+        return TestResult::Fail("sleepable dispatcher accepted an atomic program");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_sleepable_dispatch_rejects_atomic_program);
+
 fn smoke_bpf_sleepable_yield_completes() -> TestResult {
     // call narf_yield; r0 = 5; exit. The yield parks the future once, so this
     // exercises the async interpreter's resume path — not just its fast path.

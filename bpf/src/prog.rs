@@ -15,7 +15,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::interp::{Outcome, Vm, MAX_CTX_WORDS};
 use crate::mem::{
-    BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, StackFrame, STUB_STACK_BYTES,
+    BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, StackFrame, VmStack, STUB_STACK_BYTES,
 };
 use crate::xdp_stage::{XDP_HEADROOM, XDP_STAGE_LEN, XDP_STAGE_PACKET_MAX};
 
@@ -1456,9 +1456,9 @@ impl BpfProg {
     /// carries the arena's MTE tag in bits 59:56 on a machine with MTE — see
     /// [`crate::arena::ArenaGroup::slot_base_tagged`]. The caller establishes
     /// that an image containing arena accesses is never entered with a zero —
-    /// see [`BpfProg::run_atomic`]. The tag does not disturb that check: it
-    /// occupies bits no VA in the slot uses, and is applied only to a base
-    /// that was already non-zero.
+    /// see the atomic and sleepable dispatchers. The tag does not disturb that
+    /// check: it occupies bits no VA in the slot uses, and is applied only to
+    /// a base that was already non-zero.
     fn run_atomic_native(
         &self,
         ctx: [u64; MAX_CTX_WORDS],
@@ -1468,14 +1468,34 @@ impl BpfProg {
         if self.context != Context::Atomic {
             return None;
         }
-        let image = self.jit.as_ref()?;
         let mut frame = self.acquire_atomic_frame()?;
+        let stats_start = crate::stats::run_start();
+        let outcome = self.run_native_on_stack(ctx, ctx_len, slot_base, &mut frame)?;
+        self.record(outcome, stats_start);
+        Some(outcome)
+    }
+
+    /// Enter a run-to-completion native image on caller-owned stack storage.
+    ///
+    /// The JIT currently refuses every sleepable kfunc call site, so an image
+    /// attached to a sleepable program cannot return `Pending`: it is safe to
+    /// use this same entry ABI with either an atomic per-CPU frame or a
+    /// sleepable invocation's owned heap stack. Continuation images will need
+    /// a distinct checkpoint/resume ABI rather than weakening that refusal.
+    fn run_native_on_stack<S: VmStack>(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+        slot_base: u64,
+        stack: &mut S,
+    ) -> Option<Outcome> {
+        let image = self.jit.as_ref()?;
         // The frame is already zeroed by the provider, which native code relies
         // on exactly as the interpreter does: the verifier permits reading a
         // widened stack slot before any concrete write, so the bytes must not be
         // a previous program's.
-        let top = frame.top_addr();
-        let _ = frame.bytes_mut();
+        let bytes = stack.bytes_mut();
+        let top = bytes.as_ptr() as u64 + bytes.len() as u64;
         // The verifier types every program's context as four scalars
         // (`CTX_SCALARS`), so it proves all four readable — but the interpreter
         // additionally bounds reads at the *runtime* `ctx_len`, while native
@@ -1496,14 +1516,13 @@ impl BpfProg {
             *w = 0;
         }
         let entry = image.entry();
-        let stats_start = crate::stats::run_start();
         // SAFETY: `entry` points at sealed, executable text emitted for this
         // program, entered with the ABI its prologue expects — `top` is the
         // frame's highest address (R10), `ctx.as_ptr()` a live `[u64; 4]` (R1),
         // and `slot_base` this program's own arena slot, which the caller has
         // established is non-zero whenever the image dereferences it. `ctx`
         // outlives the call; `frame` is held across it so the memory R10
-        // addresses stays leased. The gates above are what make the absence of
+        // addresses stays owned. The gates above are what make the absence of
         // runtime bounds checks sound; for arena accesses specifically it is the
         // slot's guards plus the exception table registered before the text was
         // sealed.
@@ -1556,7 +1575,6 @@ impl BpfProg {
                 what: "compiled program returned an unknown status",
             }),
         };
-        self.record(outcome, stats_start);
         Some(outcome)
     }
 
@@ -1597,14 +1615,15 @@ impl BpfProg {
         }
     }
 
-    /// Whether `run_atomic` would actually enter native code.
+    /// Whether an eligible atomic or sleepable dispatcher would actually enter
+    /// native code.
     ///
     /// Holding a `JitImage` is necessary but **not** sufficient: the run path
     /// also re-checks, per invocation, that an image whose emitted code
     /// dereferences the arena slot base is only ever entered with a non-zero
     /// base and exactly one arena.
     ///
-    /// This exists as one predicate, consulted by both the run path and
+    /// This exists as one predicate, consulted by every native run path and
     /// [`Self::is_jited`], because they were two. `is_jited` answered
     /// `self.jit.is_some()` while the run path applied the extra clause — so
     /// breaking that clause would have sent every arena program down the
@@ -1656,7 +1675,7 @@ impl BpfProg {
     ) -> Option<Outcome> {
         // Contract-bound programs have a distinct exact-contract dispatcher;
         // generic execution cannot bypass that attachment boundary.
-        if self.struct_ops.is_some() {
+        if self.struct_ops.is_some() || self.context != Context::Sleepable {
             return None;
         }
         self.run_sleepable_inner(ctx, ctx_len).await
@@ -1685,6 +1704,35 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
     ) -> Option<Outcome> {
+        if self.context != Context::Sleepable {
+            return None;
+        }
+        if let Some(image) = self.jit.as_ref() {
+            let slot_base = self.arenas.as_ref().map_or(0, |g| g.slot_base());
+            if self.native_path_admits(image, slot_base) {
+                let entry_base = self.arenas.as_ref().map_or(0, |g| g.slot_base_tagged());
+                let mut stack = HeapStack::new(self.stack_bytes as usize);
+                let stats_start = crate::stats::run_start();
+                // The async block is deliberate even though this phase's image
+                // runs to completion: `run_sleepable` enters the BPF hardware
+                // domain around the block's poll. Calling native code while
+                // constructing a ready future would run it outside that fence.
+                let outcome = crate::domain::run_sleepable(async {
+                    self.run_native_on_stack(ctx, ctx_len, entry_base, &mut stack)
+                })
+                .await?;
+                self.record(outcome, stats_start);
+                return Some(outcome);
+            }
+        }
+        self.run_sleepable_interpreted_inner(ctx, ctx_len).await
+    }
+
+    async fn run_sleepable_interpreted_inner(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
         let stack = HeapStack::new(self.stack_bytes as usize);
         let registry = crate::kfunc::registry()?;
         let mut vm = Vm::new(
@@ -1706,6 +1754,21 @@ impl BpfProg {
         let outcome = crate::domain::run_sleepable(vm.run()).await;
         self.record(outcome, stats_start);
         Some(outcome)
+    }
+
+    /// Force the sleepable interpreter for native/interpreter differential
+    /// kernel tests without exposing a production bypass around exact
+    /// struct-ops dispatch.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) async fn run_sleepable_interpreted(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
+        if self.context != Context::Sleepable || self.struct_ops.is_some() {
+            return None;
+        }
+        self.run_sleepable_interpreted_inner(ctx, ctx_len).await
     }
 
     fn record(&self, outcome: Outcome, stats_start: Option<u64>) {
