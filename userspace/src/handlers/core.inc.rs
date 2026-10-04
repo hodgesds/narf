@@ -920,6 +920,12 @@ pub fn init_per_task_state() {
         uts_domainname_for_current,
         uts_set_domainname_for_current,
     );
+    // `/proc/sys/kernel/ns_last_pid` is the caller's pid-namespace cursor,
+    // which lives here; same reasoning as the UTS hooks above.
+    narf_filesystem::procfs::sys_kernel::install_ns_last_pid_hooks(
+        crate::ns_last_pid_for_current,
+        crate::set_ns_last_pid_for_current,
+    );
     rlimit_init();
     nice_init();
     umask_init();

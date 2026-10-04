@@ -3,9 +3,9 @@
 //! Linux semantics replicated here (only the load-bearing slice):
 //!
 //! - A `PidNamespace` is a translation table between an "outer" PID
-//!   (globally unique, allocated from the root [`crate::PID_POOL`])
-//!   and an "inner" PID (per-namespace, starts at 1 for the
-//!   namespace's init task).
+//!   (globally unique, allocated by [`crate::alloc_pid`]) and an "inner"
+//!   PID (per-namespace, starts at 1 for the namespace's init task, then
+//!   allocated cyclically like every Linux pid namespace).
 //! - A task that calls `unshare(CLONE_NEWPID)` (or, in the future, a
 //!   `clone3` with `CLONE_NEWPID`) becomes pid 1 inside the freshly
 //!   minted child namespace; its outer PID is unchanged.
@@ -19,10 +19,12 @@
 //! Everything here is gated `#[cfg(feature = "container")]` — a
 //! kernel built without containers pays zero runtime cost.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::pid_idr::PidIdr;
 
 use crate::errno::*;
 
@@ -32,22 +34,26 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// partially prepared clone is never visible in only some ancestors.
 static PID_NS_ALLOC: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
-/// Per-namespace bounded inner-PID pool. Mirrors the root [`crate::PID_POOL`]
-/// design (Wave-61): lowest-free allocation, lazy watermark, BTreeSet
-/// of released ids.
+/// A pid namespace: its own pid numbers, allocated cyclically exactly like
+/// the root namespace's (`kernel/pid.c::alloc_pid` runs `idr_alloc_cyclic`
+/// on each level's `ns->idr`) — see [`crate::pid_idr`].
 #[derive(Debug)]
 pub struct PidNamespace {
     /// Stable namespace id (nsfs inode in Linux). Shared monotonic
     /// counter across all namespace flavours.
     id: crate::namespaces::NsId,
-    /// Lowest inner id not yet minted.
-    watermark: AtomicU64,
+    /// This namespace's pid numbers and cyclic cursor (`ns->idr`). Unused
+    /// in the identity (initial) namespace, whose numbers are the root
+    /// allocator's.
+    idr: IrqSafeSpinLock<PidIdr>,
+    /// Some pid was ever allocated here. Once the namespace's init (pid 1)
+    /// is gone, Linux clears `PIDNS_ADDING` and `alloc_pid` fails with
+    /// ENOMEM.
+    had_pids: AtomicBool,
     /// Inner → outer translation.
     inner_to_outer: IrqSafeSpinLock<BTreeMap<u64, u64>>,
     /// Outer → inner translation.
     outer_to_inner: IrqSafeSpinLock<BTreeMap<u64, u64>>,
-    /// Released inner ids available for re-use.
-    free: IrqSafeSpinLock<BTreeSet<u64>>,
     /// The user namespace of the task that created this one — Linux's
     /// `pid_ns->user_ns`. `setns` into it is gated on CAP_SYS_ADMIN here as
     /// well as in the caller's own namespace. `None` is the initial user
@@ -103,10 +109,10 @@ impl PidNamespace {
         let ns = Arc::new(Self {
             id: crate::namespaces::alloc_ns_id(),
             identity: false,
-            watermark: AtomicU64::new(1),
+            idr: IrqSafeSpinLock::new(PidIdr::new()),
+            had_pids: AtomicBool::new(false),
             inner_to_outer: IrqSafeSpinLock::new(BTreeMap::new()),
             outer_to_inner: IrqSafeSpinLock::new(BTreeMap::new()),
-            free: IrqSafeSpinLock::new(BTreeSet::new()),
             owner: IrqSafeSpinLock::new(owner),
             parent,
         });
@@ -161,8 +167,8 @@ impl PidNamespace {
         false
     }
 
-    /// Register `outer` in this namespace, allocating the lowest free
-    /// inner id (starting at 1). Returns the inner id. If the outer
+    /// Register `outer` in this namespace, allocating the next inner id
+    /// cyclically (the first one is 1). Returns the inner id. If the outer
     /// is already registered, returns its existing inner id —
     /// idempotent so an unshare followed by a fork doesn't double-
     /// bind the parent.
@@ -191,50 +197,38 @@ impl PidNamespace {
             };
         }
 
-        let watermark = self.watermark.load(Ordering::Relaxed);
         let init_alive = self.inner_to_outer.lock().contains_key(&1);
-        if watermark > 1 && !init_alive {
-            return Err(ENOMEM as u64);
-        }
 
+        let pid_max = crate::pid_max();
         let inner = match requested {
+            // clone3 set_tid: `tid < 1 || tid >= pid_max` and "a pid other
+            // than 1 with no child reaper" are EINVAL; an exact
+            // `idr_alloc` collision is EEXIST. The cursor does not move.
             Some(want) => {
-                if want == 0 || want > crate::PID_MAX {
+                if want == 0 || want >= pid_max {
                     return Err(EINVAL as u64);
                 }
                 if want != 1 && !init_alive {
                     return Err(EINVAL as u64);
                 }
-                let mut free = self.free.lock();
-                if want < watermark {
-                    if !free.remove(&want) {
-                        return Err(EEXIST as u64);
-                    }
-                } else {
-                    for skipped in watermark..want {
-                        free.insert(skipped);
-                    }
-                    self.watermark.store(want + 1, Ordering::Relaxed);
+                if !self.idr.lock().alloc_exact(want) {
+                    return Err(EEXIST as u64);
                 }
                 want
             }
-            None => {
-                let mut free = self.free.lock();
-                if let Some(&candidate) = free.iter().next() {
-                    free.remove(&candidate);
-                    candidate
-                } else {
-                    if watermark == 0 || watermark > crate::PID_MAX {
-                        return Err(EAGAIN as u64);
-                    }
-                    self.watermark.store(watermark + 1, Ordering::Relaxed);
-                    watermark
-                }
-            }
+            // `idr_alloc_cyclic`'s -ENOSPC is -EAGAIN.
+            None => self.idr.lock().alloc_cyclic(pid_max).ok_or(EAGAIN as u64)?,
         };
-        if self.inner_to_outer.lock().contains_key(&inner) {
-            return Err(EEXIST as u64);
+        // `alloc_pid` checks `PIDNS_ADDING` only AFTER the ids are
+        // allocated, so set_tid's EINVAL/EEXIST and the cyclic EAGAIN take
+        // precedence: once the namespace's init has exited (Linux
+        // `disable_pid_allocation`) the allocation is undone and the answer
+        // is ENOMEM.
+        if self.had_pids.load(Ordering::Relaxed) && !init_alive {
+            self.idr.lock().remove(inner);
+            return Err(ENOMEM as u64);
         }
+        self.had_pids.store(true, Ordering::Relaxed);
         self.inner_to_outer.lock().insert(inner, outer);
         self.outer_to_inner.lock().insert(outer, inner);
         Ok(inner)
@@ -244,9 +238,7 @@ impl PidNamespace {
         let inner = self.outer_to_inner.lock().remove(&outer);
         if let Some(inner) = inner {
             self.inner_to_outer.lock().remove(&inner);
-            if inner > 1 {
-                self.free.lock().insert(inner);
-            }
+            self.idr.lock().remove(inner);
         }
     }
 
@@ -324,6 +316,24 @@ impl PidNamespace {
     pub fn live_count(&self) -> usize {
         self.outer_to_inner.lock().len()
     }
+
+    /// `/proc/sys/kernel/ns_last_pid` read for a task in this namespace:
+    /// `idr_get_cursor(&ns->idr) - 1`.
+    pub fn last_pid(&self) -> i64 {
+        if self.identity {
+            return crate::root_ns_last_pid();
+        }
+        self.idr.lock().last_pid()
+    }
+
+    /// `ns_last_pid` write: `idr_set_cursor(&ns->idr, last + 1)`.
+    pub fn set_last_pid(&self, last: u64) {
+        if self.identity {
+            crate::set_root_ns_last_pid(last);
+            return;
+        }
+        self.idr.lock().set_cursor(last + 1);
+    }
 }
 
 /// The INITIAL pid namespace — a real object, as `init_pid_ns` is in Linux.
@@ -352,10 +362,10 @@ pub fn initial_pid_ns() -> &'static Arc<PidNamespace> {
         let ns = Arc::new(PidNamespace {
             id: crate::namespaces::initial_pid_ns_id(),
             identity: true,
-            watermark: AtomicU64::new(1),
+            idr: IrqSafeSpinLock::new(PidIdr::new()),
+            had_pids: AtomicBool::new(false),
             inner_to_outer: IrqSafeSpinLock::new(BTreeMap::new()),
             outer_to_inner: IrqSafeSpinLock::new(BTreeMap::new()),
-            free: IrqSafeSpinLock::new(BTreeSet::new()),
             owner: IrqSafeSpinLock::new(None),
             parent: None,
         });
@@ -556,7 +566,7 @@ pub fn prepare_clone(
     }
     if requested
         .iter()
-        .any(|&tid| tid <= 0 || tid as u64 > crate::PID_MAX)
+        .any(|&tid| tid <= 0 || tid as u64 >= crate::pid_max())
     {
         return Err(EINVAL as u64);
     }
