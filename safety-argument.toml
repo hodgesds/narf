@@ -1317,8 +1317,45 @@ argument = "The async extension remains inside the existing untrusted BPF runtim
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "A sleepable program is loaded and dispatched only through an exact immutable method contract with a closed kfunc allowlist, scalar-only context, bounded fuel, and Context::Sleepable. NonPreemptible and RcuRead values remain verifier errors across every sleepable kfunc call. The future owns its heap stack; BPF domain rights are entered for each poll and restored before Pending, so no CPU-local stack lease or hardware-rights snapshot migrates."
+argument = "A sleepable program is loaded and dispatched only through an exact immutable method contract with a closed kfunc allowlist, scalar-only context, bounded fuel, and Context::Sleepable. NonPreemptible and RcuRead values remain verifier errors across every sleepable kfunc call; a may-suspend shim also rejects them in its arguments even when the BPF register is dead after the call, because the boxed future can retain the converted Rust value while pending. The future owns its heap stack; BPF domain rights are entered for each poll and restored before Pending, so no CPU-local stack lease or hardware-rights snapshot migrates."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The object-safe hook exposes only a boxed Send future and generates no synchronous block_on path. Dropping it cancels the VM and nested kfunc future by ownership. Link close and replacement release-store a shared admission gate: calls admitted earlier may finish from retained Arc state, while later calls take the declared async fallback without entering BPF. No pointer-bearing context or physical-to-frame translation API is introduced."
+
+# Mixed-context struct-ops. The dedicated security-review skill was not
+# available in this session; human security review remains mandatory.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Mixed targets remain inside the existing untrusted BPF runtime and struct-ops seam. They modify no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model implementation and add no subsystem or execution primitive to the TCB."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Each mixed-target method retains its own immutable context, scalar ABI, closed kfunc allowlist, fuel budget, and fallback contract. The macro accepts only ordinary fn for Atomic and async fn for Sleepable, method-specific loading checks the exact context, and dispatch selects the corresponding exact-contract entry point. The target-level Mixed marker grants no permission and validation requires both method kinds."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Atomic and sleepable methods share only the existing Arc-owned adapter, program set, generation, and release/acquire admission gate. They do not share VM stacks or domain guards. Link close and replacement stop new calls of both kinds; previously admitted sleepable futures retain their existing owned-state completion and cancellation rules. No pointer-bearing context or physical-to-frame translation API is added."
+
+# Native sleepable execution and checkpoint/resume. The dedicated
+# security-review skill was not available in this session; human security
+# review remains mandatory.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Native sleepable execution remains inside the existing untrusted BPF runtime and JIT. It changes no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model implementation and adds no trusted subsystem or authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A sleepable program enters native code only when a fail-closed emitter compiled its entire verified image. At any call whose verifier metadata says the shim may suspend, emitted code saves R0-R10 and remaining fuel into hidden future-owned state and returns a compiler-issued id; a synchronous shim that merely requires Sleepable context remains a direct call. Continuation-enabled BPF-to-BPF calls use verifier-bounded frames containing only R6-R10 and a compiler-issued return id, and subprogram exits branch through the sealed image's immutable return table rather than a host return-address chain. Rust validates the full saved frame chain, resolves the suspend id against immutable image metadata, and invokes the registry's typed Sleepable shim. Native code never calls the boxed-future shim through the synchronous ABI and never accepts a continuation-provided address. Unknown resume or return ids and malformed call depth trap."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The generic sleepable dispatcher now rejects Context::Atomic programs explicitly, while contract-bound programs retain exact StructOpsContract checks before reaching the shared inner path. Native and interpreted sleepable paths use the same scalar context, map and arena ownership, fuel budget, result validation, accounting, and domain-restoration rules; no pointer, frame handle, or physical-memory translation surface is introduced."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The invocation future owns the heap stack, normalized context tuple, register/fuel checkpoint, and boxed kfunc future. Every native slice and every kfunc-future poll enters a fresh BPF hardware-domain scope and restores neutral rights before Pending; no per-CPU lease, lock guard, host return-address stack, or hardware-rights snapshot crosses suspension. Dropping the invocation cancels by dropping the typed future and all continuation storage."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Resume validation requires the status id and saved id to agree, remaining fuel not to exceed the original tank, call depth to fit the fixed frame array, every saved return id to belong to the sealed image, each saved caller R10 to match the expected frame, every verifier-computed descent to remain in the owned heap stack, and live R10 to name the resulting current frame. Compiler-emitted resume and return dispatchers accept only fixed ids, restore BPF registers and fuel, and branch only to fixed post-call targets. Tests cover multiple resume sites, callee-saved and heap-stack state, a bounded stack slice retained by an async shim, rejection of a dead-after-call non-sleep-safe argument, native/interpreter parity through three BPF frames, rejection of a corrupted return id, domain restoration, cancellation, and detach."

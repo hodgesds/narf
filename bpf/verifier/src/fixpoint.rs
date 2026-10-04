@@ -1497,6 +1497,7 @@ impl Analysis<'_, '_> {
             insn_index: at,
             id: desc.id,
             addr: desc.addr,
+            may_suspend: desc.may_suspend,
             context: desc.context,
         });
 
@@ -1665,6 +1666,21 @@ impl Analysis<'_, '_> {
                 (TypeKind::Ptr { kind, key }, AbsValue::Ptr(p)) => {
                     if p.nullable && !arg.flags.contains(ArgFlags::NULLABLE) {
                         return Err(VerifyError::PossiblyNull { at, reg: r.index() });
+                    }
+                    // A boxed-future shim owns its converted Rust arguments
+                    // until that future completes. It can therefore retain a
+                    // pointer while Pending even when the BPF program never
+                    // reads the argument register after the call. Check the
+                    // source value here, before the ordinary post-call
+                    // liveness kill: future-owned stack/map/context regions
+                    // and refcounted objects survive, while CPU-local, QSBR,
+                    // and lock-guard values do not.
+                    if desc.may_suspend && !p.domain.survives_await() {
+                        return Err(VerifyError::PointerCrossesAwait {
+                            at,
+                            reg: r.index(),
+                            domain: p.domain,
+                        });
                     }
                     // A pointer may be *stronger* than asked for — an
                     // `Owned<T>` satisfies a `Trusted<T>` parameter — but

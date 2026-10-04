@@ -9,9 +9,10 @@ The design treats every BPF program as hostile. A successful verifier verdict
 does not grant ambient kernel access, and a struct-ops attachment does not make
 the program equivalent to a trusted kernel module.
 
-Current status: the atomic requirements and the initial interpreted sleepable
-ABI below are implemented. Mixed-context targets and native continuation-style
-lowering remain deferred.
+Current status: the atomic requirements, the sleepable ABI, mixed
+atomic/sleepable targets, and native checkpoint/resume execution for
+`may_suspend` kfunc calls are implemented, including calls reached through BPF
+subprograms with explicit verifier-bounded caller frames.
 
 ## Shared method contract
 
@@ -86,9 +87,7 @@ Sleepable methods require an asynchronous call surface. A verifier can prove
 that bytecode is safe across suspension, but it cannot make a synchronous Rust
 caller drive a future that returned `Pending`.
 
-The initial sleepable design classifies an entire target as sleepable;
-mixed atomic and sleepable methods in one trait are deferred. A dynamically
-replaceable target uses NARF's existing object-safe future convention:
+An all-sleepable target uses NARF's existing object-safe future convention:
 
 ```rust
 pub type StructOpsFuture<'a, T> =
@@ -131,6 +130,73 @@ Sleepable fallbacks must themselves have an async-compatible interface. Result
 validation occurs after the BPF future completes and before its value reaches
 the subsystem.
 
+### Native execution stages
+
+A sleepable context does not imply that a particular program will suspend. An
+image with only synchronous calls runs to completion inside one poll on the
+invocation's owned heap stack, including synchronous kfuncs that themselves
+require sleepable context. At each verifier-resolved call marked `may_suspend`,
+emitted code checkpoints to Rust instead of calling
+`KfuncShim::Sleepable` through the synchronous machine-code ABI. The
+implemented checkpoint/resume contract:
+
+- saves R0-R10, remaining fuel, a compiler-issued resume id, and the BPF stack
+  in future-owned memory;
+- represents every live BPF caller with a fixed-depth frame containing only
+  R6-R10 and a compiler-issued return id, never a host return address;
+- returns a dedicated suspend status to Rust, which resolves the verifier-bound
+  kfunc site and invokes its typed sleepable shim with the saved R1-R5 values;
+- keeps the boxed kfunc future in the invocation until it completes or the
+  invocation is cancelled by drop;
+- writes the completed kfunc result to saved R0 and resumes only through a
+  compiler-emitted target table—never a program-controlled native address;
+- preserves the one total fuel tank across every resume;
+- validates caller depth, every return id, the saved R10 chain, and every stack
+  descent against the invocation-owned heap stack before polling the kfunc;
+- enters the BPF hardware domain around every native or kfunc-future poll and
+  restores neutral rights before returning `Pending`;
+- carries no per-CPU stack lease, host call stack, lock guard, or hardware-rights
+  snapshot across suspension; and
+- retains the existing exact method contract, arena ownership, map lifetime,
+  trap mapping, cancellation, and attachment admission semantics.
+
+Continuation-enabled images lower BPF-to-BPF calls to those explicit frames
+and return through a compiler-emitted fixed-id table. Overflow, underflow, an
+unknown id, or an invalid frame-pointer chain stops the invocation. The host
+return-address stack is neither captured nor reconstructed, and native
+execution never falls back after partially executing the program.
+
+## Mixed-context targets
+
+A target that genuinely owns both immediate and suspending hooks declares
+`#[context(Mixed)]`. Every method then states its context explicitly:
+
+```rust
+#[context(Atomic)]
+fn select(&self, value: u64) -> u32;
+
+#[context(Sleepable)]
+async fn prepare(&self, value: u64) -> u32;
+```
+
+The spelling is intentionally redundant: an atomic method must be an ordinary
+`fn`, while a sleepable method must be `async fn`. A mismatched annotation and
+signature does not match the macro grammar and fails compilation. The emitted
+object-safe trait lowers only sleepable methods to `StructOpsFuture`; atomic
+methods remain ordinary calls and can never reach the sleepable dispatcher.
+
+`StructOpsDesc::context` records `Atomic`, `Sleepable`, or `Mixed` target shape,
+but it grants no execution permission. Each `MethodDesc::context` remains the
+authoritative value retained in `StructOpsContract`, checked during load, and
+checked again by the exact atomic or sleepable dispatcher. Descriptor
+validation rejects a `Mixed` target unless it contains at least one method of
+each kind.
+
+Atomic and sleepable methods in one adapter share the same generation and
+admission gate. Replacement or link close therefore prevents new invocations
+of both kinds together; an already-created sleepable future keeps the existing
+in-flight completion rule.
+
 ## Verifier and runtime responsibilities
 
 The verifier is responsible for bytecode-level safety: context compatibility,
@@ -161,6 +227,18 @@ Sleepable coverage includes a genuine multi-poll kfunc, verifier rejection of
 references across await, cancellation by future drop, domain-state restoration
 on every `Pending`, detachment with an in-flight future, rejection of calls
 created after detach, async fallback validation, and a `Send` future-only API.
+It also compares native and interpreted execution of a non-suspending
+sleepable stack program, requires the native form to complete in one poll, and
+checks that it restores domain rights. Native continuation coverage uses two
+distinct resume sites, retains callee-saved and heap-stack state, lets a boxed
+kfunc future retain a bounded stack slice across `Pending`, preserves fuel,
+exercises cancellation and detach through struct ops, executes a three-frame
+nested sleep site natively against the interpreter, and rejects an unknown
+compiler-managed return id without an indirect branch.
+
+Mixed-target coverage additionally includes exact-context load rejection for
+both method kinds, immediate atomic dispatch, multi-poll sleepable dispatch,
+and shared post-detach fallback admission.
 
 ## Deferred choices
 

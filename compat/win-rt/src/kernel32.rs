@@ -70,7 +70,10 @@ pub extern "C" fn GetStdHandle(handle_id: i32) -> u64 {
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 /// # Safety
-/// Caller must ensure pointers are valid.
+///
+/// `lp_buffer` must point to `n_bytes` initialized bytes that remain readable
+/// for the duration of this call. If `written_out` is non-null, it must be
+/// properly aligned, writable, and valid for one `u32`.
 pub unsafe extern "win64" fn WriteConsoleA(
     h_console: u64,
     lp_buffer: *const u8,
@@ -104,6 +107,11 @@ pub unsafe extern "win64" fn WriteConsoleA(
 
 #[cfg(target_arch = "aarch64")]
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// `lp_buffer` must point to `n_bytes` initialized bytes that remain readable
+/// for the duration of this call. If `written_out` is non-null, it must be
+/// properly aligned, writable, and valid for one `u32`.
 pub unsafe extern "C" fn WriteConsoleA(
     h_console: u64,
     lp_buffer: *const u8,

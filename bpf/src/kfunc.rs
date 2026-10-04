@@ -173,6 +173,7 @@ impl KfuncEntry {
             addr: self.shim.addr(),
             args: self.args,
             ret: self.ret,
+            may_suspend: self.shim.is_sleepable(),
             context: self.effective_context(),
         }
     }

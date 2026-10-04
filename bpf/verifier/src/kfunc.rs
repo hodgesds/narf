@@ -426,6 +426,10 @@ pub struct KfuncDesc {
     pub args: &'static [ArgDesc],
     /// Return type.
     pub ret: ArgDesc,
+    /// Whether the shim returns a boxed future rather than a synchronous
+    /// `u64`. Independent of [`Self::context`]: a synchronous shim may still
+    /// require sleepable process context for locking or allocation reasons.
+    pub may_suspend: bool,
     /// The weakest context this may be called from. A kfunc that can sleep
     /// declares [`Context::Sleepable`] and is then unreachable from atomic
     /// programs — enforced by type, not by a runtime check.
@@ -456,6 +460,9 @@ impl KfuncDesc {
         }
         if self.addr == 0 {
             return Err(KfuncError::NullAddress);
+        }
+        if self.may_suspend && self.context != Context::Sleepable {
+            return Err(KfuncError::SuspendingAtomicShim);
         }
         validate_type(self.ret, usize::MAX)?;
         // Trace-object provenance comes only from a typed tracing context.
@@ -618,6 +625,8 @@ pub enum KfuncError {
     TooManyArgs(usize),
     /// The shim address was null.
     NullAddress,
+    /// A boxed-future shim claimed it was callable from atomic context.
+    SuspendingAtomicShim,
     /// An argument is flagged [`ArgFlags::SIZED_BY_NEXT`] but the following
     /// argument is missing or is not a scalar.
     MissingSizeArg(usize),

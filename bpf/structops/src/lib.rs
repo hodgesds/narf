@@ -66,7 +66,7 @@ pub mod reexport {
 
 pub use structops::{
     descriptors, installed_count, is_installed, validate, Binding, BpfCtxArg, MethodDesc, ProgSet,
-    StructOpsDesc, StructOpsError, StructOpsLink,
+    StructOpsContext, StructOpsDesc, StructOpsError, StructOpsLink,
 };
 
 /// Force-link anchor + boot-log stat: how many `struct_ops!` traits are

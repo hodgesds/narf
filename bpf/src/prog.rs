@@ -15,7 +15,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::interp::{Outcome, Vm, MAX_CTX_WORDS};
 use crate::mem::{
-    BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, StackFrame, STUB_STACK_BYTES,
+    BpfStack, HeapStack, PerCpuRegion, PerCpuStackStub, StackFrame, VmStack, STUB_STACK_BYTES,
 };
 use crate::xdp_stage::{XDP_HEADROOM, XDP_STAGE_LEN, XDP_STAGE_PACKET_MAX};
 
@@ -1456,9 +1456,9 @@ impl BpfProg {
     /// carries the arena's MTE tag in bits 59:56 on a machine with MTE — see
     /// [`crate::arena::ArenaGroup::slot_base_tagged`]. The caller establishes
     /// that an image containing arena accesses is never entered with a zero —
-    /// see [`BpfProg::run_atomic`]. The tag does not disturb that check: it
-    /// occupies bits no VA in the slot uses, and is applied only to a base
-    /// that was already non-zero.
+    /// see the atomic and sleepable dispatchers. The tag does not disturb that
+    /// check: it occupies bits no VA in the slot uses, and is applied only to
+    /// a base that was already non-zero.
     fn run_atomic_native(
         &self,
         ctx: [u64; MAX_CTX_WORDS],
@@ -1468,14 +1468,54 @@ impl BpfProg {
         if self.context != Context::Atomic {
             return None;
         }
-        let image = self.jit.as_ref()?;
         let mut frame = self.acquire_atomic_frame()?;
+        let stats_start = crate::stats::run_start();
+        let outcome = self.run_native_on_stack(ctx, ctx_len, slot_base, &mut frame)?;
+        self.record(outcome, stats_start);
+        Some(outcome)
+    }
+
+    /// Enter a native image that is not allowed to suspend on caller-owned
+    /// stack storage. Atomic dispatch and the test-only run-to-completion path
+    /// use this wrapper; a `SUSPEND` status is mapped to a fail-closed trap.
+    fn run_native_on_stack<S: VmStack>(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+        slot_base: u64,
+        stack: &mut S,
+    ) -> Option<Outcome> {
+        let ctx = Self::native_context(ctx, ctx_len);
+        let mut continuation = narf_bpf_jit::NativeContinuation::default();
+        let (value, status) =
+            self.invoke_native_on_stack(&ctx, slot_base, stack, &mut continuation)?;
+        Some(Self::native_terminal_outcome(value, status))
+    }
+
+    fn native_context(mut ctx: [u64; MAX_CTX_WORDS], ctx_len: usize) -> [u64; MAX_CTX_WORDS] {
+        for word in ctx.iter_mut().skip(ctx_len.min(MAX_CTX_WORDS)) {
+            *word = 0;
+        }
+        ctx
+    }
+
+    /// Invoke one native slice. A sleepable image can return `SUSPEND`; its
+    /// caller owns the continuation state and decides which typed future to
+    /// poll before re-entering this same compiler-emitted entry dispatcher.
+    fn invoke_native_on_stack<S: VmStack>(
+        &self,
+        ctx: &[u64; MAX_CTX_WORDS],
+        slot_base: u64,
+        stack: &mut S,
+        continuation: &mut narf_bpf_jit::NativeContinuation,
+    ) -> Option<(u64, u64)> {
+        let image = self.jit.as_ref()?;
         // The frame is already zeroed by the provider, which native code relies
         // on exactly as the interpreter does: the verifier permits reading a
         // widened stack slot before any concrete write, so the bytes must not be
         // a previous program's.
-        let top = frame.top_addr();
-        let _ = frame.bytes_mut();
+        let bytes = stack.bytes_mut();
+        let top = bytes.as_ptr() as u64 + bytes.len() as u64;
         // The verifier types every program's context as four scalars
         // (`CTX_SCALARS`), so it proves all four readable — but the interpreter
         // additionally bounds reads at the *runtime* `ctx_len`, while native
@@ -1491,29 +1531,37 @@ impl BpfProg {
         // Per-attach-point context typing is the real fix and is spec §8's
         // remaining ctx item; this makes the two execution paths agree in the
         // meantime, which is the property that cannot be allowed to differ.
-        let mut ctx = ctx;
-        for w in ctx.iter_mut().skip(ctx_len.min(MAX_CTX_WORDS)) {
-            *w = 0;
-        }
         let entry = image.entry();
-        let stats_start = crate::stats::run_start();
         // SAFETY: `entry` points at sealed, executable text emitted for this
         // program, entered with the ABI its prologue expects — `top` is the
         // frame's highest address (R10), `ctx.as_ptr()` a live `[u64; 4]` (R1),
         // and `slot_base` this program's own arena slot, which the caller has
         // established is non-zero whenever the image dereferences it. `ctx`
-        // outlives the call; `frame` is held across it so the memory R10
-        // addresses stays leased. The gates above are what make the absence of
+        // outlives the call; `stack` is held across it so the memory R10
+        // addresses stays owned. The hidden continuation pointer names the
+        // caller's live `NativeContinuation` and is never exposed in a BPF
+        // register. The gates above are what make the absence of
         // runtime bounds checks sound; for arena accesses specifically it is the
         // slot's guards plus the exception table registered before the text was
         // sealed.
-        let packed = unsafe { entry(top, ctx.as_ptr() as u64, self.initial_fuel, slot_base) };
+        let packed = unsafe {
+            entry(
+                top,
+                ctx.as_ptr() as u64,
+                self.initial_fuel,
+                slot_base,
+                continuation as *mut narf_bpf_jit::NativeContinuation as u64,
+            )
+        };
         // SysV's rax:rdx pair: low half is R0 (or, on an arena fault, the
         // offending handle), high half a status code. Reported out of band
         // because no in-band sentinel works — the obvious one, u64::MAX, is
         // exactly what `r0 = -1; exit` returns.
-        let value = packed as u64;
-        let outcome = match (packed >> 64) as u64 {
+        Some((packed as u64, (packed >> 64) as u64))
+    }
+
+    fn native_terminal_outcome(value: u64, status: u64) -> Outcome {
+        match status {
             narf_bpf_jit::status::OK => Outcome::Returned(value),
             // Matches the interpreter: exhaustion stops the program with a
             // diagnostic rather than a fault, and the return value is
@@ -1547,7 +1595,23 @@ impl BpfProg {
                     len: 0,
                 })
             }
-            // Unreachable: the emitters return one of the four above and
+            narf_bpf_jit::status::SUSPEND => Outcome::Trapped(crate::interp::Trap::Unsupported {
+                at: 0,
+                what: "native suspension reached a non-sleepable dispatcher",
+            }),
+            narf_bpf_jit::status::BAD_RESUME => {
+                Outcome::Trapped(crate::interp::Trap::Unsupported {
+                    at: 0,
+                    what: "native continuation id was not emitted by this image",
+                })
+            }
+            narf_bpf_jit::status::BAD_CALL_STATE => {
+                Outcome::Trapped(crate::interp::Trap::Unsupported {
+                    at: 0,
+                    what: "native BPF subprogram call state was invalid",
+                })
+            }
+            // Unreachable: the emitters return one of the known statuses and
             // nothing else. Treated as a stop rather than a value, because the
             // one thing that must not happen is a status nobody understands
             // being read as a successful return.
@@ -1555,9 +1619,7 @@ impl BpfProg {
                 at: 0,
                 what: "compiled program returned an unknown status",
             }),
-        };
-        self.record(outcome, stats_start);
-        Some(outcome)
+        }
     }
 
     /// Claim the stack for one atomic invocation and classify a refusal.
@@ -1597,14 +1659,15 @@ impl BpfProg {
         }
     }
 
-    /// Whether `run_atomic` would actually enter native code.
+    /// Whether an eligible atomic or sleepable dispatcher would actually enter
+    /// native code.
     ///
     /// Holding a `JitImage` is necessary but **not** sufficient: the run path
     /// also re-checks, per invocation, that an image whose emitted code
     /// dereferences the arena slot base is only ever entered with a non-zero
     /// base and exactly one arena.
     ///
-    /// This exists as one predicate, consulted by both the run path and
+    /// This exists as one predicate, consulted by every native run path and
     /// [`Self::is_jited`], because they were two. `is_jited` answered
     /// `self.jit.is_some()` while the run path applied the extra clause — so
     /// breaking that clause would have sent every arena program down the
@@ -1654,11 +1717,9 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
     ) -> Option<Outcome> {
-        // Contract-bound programs have a distinct exact-contract dispatcher.
-        // Sleepable struct-ops will gain an equivalent async dispatcher when
-        // its future-returning hook ABI lands; generic execution cannot bypass
-        // that attachment boundary in the meantime.
-        if self.struct_ops.is_some() {
+        // Contract-bound programs have a distinct exact-contract dispatcher;
+        // generic execution cannot bypass that attachment boundary.
+        if self.struct_ops.is_some() || self.context != Context::Sleepable {
             return None;
         }
         self.run_sleepable_inner(ctx, ctx_len).await
@@ -1687,6 +1748,148 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
     ) -> Option<Outcome> {
+        if self.context != Context::Sleepable {
+            return None;
+        }
+        if let Some(image) = self.jit.as_ref() {
+            let slot_base = self.arenas.as_ref().map_or(0, |g| g.slot_base());
+            if self.native_path_admits(image, slot_base) {
+                let entry_base = self.arenas.as_ref().map_or(0, |g| g.slot_base_tagged());
+                let mut stack = HeapStack::new(self.stack_bytes as usize);
+                let stats_start = crate::stats::run_start();
+                let outcome = self
+                    .run_sleepable_native_inner(ctx, ctx_len, entry_base, &mut stack)
+                    .await?;
+                self.record(outcome, stats_start);
+                return Some(outcome);
+            }
+        }
+        self.run_sleepable_interpreted_inner(ctx, ctx_len).await
+    }
+
+    async fn run_sleepable_native_inner(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+        slot_base: u64,
+        stack: &mut HeapStack,
+    ) -> Option<Outcome> {
+        let image = self.jit.as_ref()?;
+        let registry = crate::kfunc::registry()?;
+        // Kept in this pinned invocation future, rather than copied into one
+        // native-call stack frame: a sleepable shim may retain a verifier-
+        // approved context-derived pointer until it completes.
+        let ctx = Self::native_context(ctx, ctx_len);
+        let (stack_base, expected_top) = {
+            let bytes = stack.bytes_mut();
+            let base = bytes.as_ptr() as u64;
+            (base, base + bytes.len() as u64)
+        };
+        let mut continuation = narf_bpf_jit::NativeContinuation::default();
+
+        loop {
+            // Every native slice gets a fresh CPU-local domain scope. The
+            // continuation itself contains no hardware-rights snapshot and can
+            // migrate freely while the kfunc future is parked.
+            let (value, status) = crate::domain::run_sleepable(async {
+                self.invoke_native_on_stack(&ctx, slot_base, stack, &mut continuation)
+            })
+            .await?;
+
+            if status != narf_bpf_jit::status::SUSPEND {
+                return Some(Self::native_terminal_outcome(value, status));
+            }
+
+            let Ok(resume_id) = u32::try_from(value) else {
+                return Some(Outcome::Trapped(crate::interp::Trap::Unsupported {
+                    at: 0,
+                    what: "native suspension returned an oversized continuation id",
+                }));
+            };
+            let Some(point) = image.suspend_point(resume_id) else {
+                return Some(Outcome::Trapped(crate::interp::Trap::Unsupported {
+                    at: 0,
+                    what: "native suspension id was not emitted by this image",
+                }));
+            };
+            if continuation.resume_id != u64::from(resume_id)
+                || continuation.fuel > self.initial_fuel
+                || !Self::native_call_state_is_valid(image, &continuation, stack_base, expected_top)
+            {
+                return Some(Outcome::Trapped(crate::interp::Trap::Unsupported {
+                    at: point.insn_index,
+                    what: "native continuation state failed validation",
+                }));
+            }
+            let Some(entry) = registry.by_id(point.kfunc_id) else {
+                return Some(Outcome::Trapped(crate::interp::Trap::Unsupported {
+                    at: point.insn_index,
+                    what: "native continuation kfunc disappeared from the registry",
+                }));
+            };
+            let crate::kfunc::KfuncShim::Sleepable(shim) = entry.shim else {
+                return Some(Outcome::Trapped(crate::interp::Trap::Unsupported {
+                    at: point.insn_index,
+                    what: "native continuation resolved a synchronous kfunc",
+                }));
+            };
+            let args = [
+                continuation.regs[1],
+                continuation.regs[2],
+                continuation.regs[3],
+                continuation.regs[4],
+                continuation.regs[5],
+            ];
+            let future = shim(args[0], args[1], args[2], args[3], args[4]);
+            // The typed shim is polled inside BPF confinement just like the
+            // interpreter's `.await`. Returning Pending drops the guard before
+            // the executor can migrate this invocation.
+            let result = crate::domain::run_sleepable(future).await;
+            continuation.regs[0] = result;
+            continuation.regs[1..6].fill(0);
+        }
+    }
+
+    fn native_call_state_is_valid(
+        image: &crate::jit_glue::JitImage,
+        continuation: &narf_bpf_jit::NativeContinuation,
+        stack_base: u64,
+        stack_top: u64,
+    ) -> bool {
+        let Ok(depth) = usize::try_from(continuation.call_depth) else {
+            return false;
+        };
+        if depth > continuation.call_frames.len() {
+            return false;
+        }
+        let mut expected_frame = stack_top;
+        for frame in &continuation.call_frames[..depth] {
+            if frame.saved[4] != expected_frame {
+                return false;
+            }
+            let Ok(return_id) = u32::try_from(frame.return_id) else {
+                return false;
+            };
+            let Some(point) = image.return_point(return_id) else {
+                return false;
+            };
+            let Some(next_frame) = expected_frame.checked_sub(u64::from(point.caller_stack_bytes))
+            else {
+                return false;
+            };
+            if next_frame < stack_base {
+                return false;
+            }
+            expected_frame = next_frame;
+        }
+        continuation.regs[10] == expected_frame
+    }
+
+    async fn run_sleepable_interpreted_inner(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
         let stack = HeapStack::new(self.stack_bytes as usize);
         let registry = crate::kfunc::registry()?;
         let mut vm = Vm::new(
@@ -1708,6 +1911,21 @@ impl BpfProg {
         let outcome = crate::domain::run_sleepable(vm.run()).await;
         self.record(outcome, stats_start);
         Some(outcome)
+    }
+
+    /// Force the sleepable interpreter for native/interpreter differential
+    /// kernel tests without exposing a production bypass around exact
+    /// struct-ops dispatch.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) async fn run_sleepable_interpreted(
+        &self,
+        ctx: [u64; MAX_CTX_WORDS],
+        ctx_len: usize,
+    ) -> Option<Outcome> {
+        if self.context != Context::Sleepable || self.struct_ops.is_some() {
+            return None;
+        }
+        self.run_sleepable_interpreted_inner(ctx, ctx_len).await
     }
 
     fn record(&self, outcome: Outcome, stats_start: Option<u64>) {
