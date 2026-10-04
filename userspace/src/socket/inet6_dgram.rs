@@ -771,6 +771,7 @@ pub(super) fn deliver_wire_v4_mapped(
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
+    meta: narf_net::udp_sock::RxIpMeta,
 ) -> bool {
     let mut src = [0u8; 16];
     let mut dst = [0u8; 16];
@@ -778,8 +779,10 @@ pub(super) fn deliver_wire_v4_mapped(
     dst[10..12].copy_from_slice(&[0xff, 0xff]);
     src[12..].copy_from_slice(&src_ip);
     dst[12..].copy_from_slice(&dst_ip);
+    // A v4-mapped datagram's IPV6_HOPLIMIT is the IPv4 TTL
+    // (`ip6_datagram_recv_common_ctl`).
     deliver_wire(
-        net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, 0,
+        net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, meta.ttl,
     )
 }
 

@@ -11162,6 +11162,90 @@ fn install_ipv6_ancillary(
     truncated
 }
 
+/// Write `records` (`(level, type, data)`) into the caller's `msg_control`
+/// the way Linux's `put_cmsg` (net/core/scm.c) does, one after another: no
+/// control buffer, or less room than a `cmsghdr`, sets MSG_CTRUNC and writes
+/// nothing; a record that does not fit is cut to the room left (its
+/// `cmsg_len` says so) with MSG_CTRUNC; each record then consumes
+/// `min(CMSG_SPACE(len), room)`. `msg_controllen` becomes the bytes consumed
+/// (`____sys_recvmsg`). Returns whether MSG_CTRUNC applies.
+fn put_cmsgs(msg_ptr: u64, records: &[(i32, i32, alloc::vec::Vec<u8>)]) -> bool {
+    const CMSG_HDR: usize = 16;
+    let ctrl_ptr = read_user_u64(msg_ptr + 32);
+    let mut room = read_user_u64(msg_ptr + 40) as usize;
+    let mut ctrl = alloc::vec::Vec::new();
+    let mut truncated = false;
+    for (level, kind, data) in records {
+        if ctrl_ptr == 0 || room < CMSG_HDR {
+            truncated = true;
+            continue;
+        }
+        let mut cmlen = CMSG_HDR + data.len();
+        if room < cmlen {
+            truncated = true;
+            cmlen = room;
+        }
+        let start = ctrl.len();
+        ctrl.extend_from_slice(&(cmlen as u64).to_ne_bytes());
+        ctrl.extend_from_slice(&level.to_ne_bytes());
+        ctrl.extend_from_slice(&kind.to_ne_bytes());
+        ctrl.extend_from_slice(&data[..cmlen - CMSG_HDR]);
+        let consumed = (CMSG_HDR + data.len()).next_multiple_of(8).min(room);
+        ctrl.resize(start + consumed, 0);
+        room -= consumed;
+    }
+    if ctrl_ptr != 0 && !ctrl.is_empty() {
+        // SAFETY: copy_to_user validates the user control-buffer range.
+        let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
+    }
+    // SAFETY: copy_to_user validates the msghdr field before writing it.
+    let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_ne_bytes()) };
+    truncated
+}
+
+/// IPv4 receive control messages, `ip_cmsg_recv_offset`
+/// (net/ipv4/ip_sockglue.c), in its order: IP_PKTINFO (struct in_pktinfo),
+/// IP_TTL (int), IP_TOS (one byte), IP_ORIGDSTADDR (sockaddr_in). Linux
+/// writes IP_RECVOPTS/IP_RETOPTS only for a packet with IP options, PASSSEC
+/// only with an LSM peer label, IP_CHECKSUM only for CHECKSUM_COMPLETE and
+/// IP_RECVFRAGSIZE only for a reassembled packet; none of those arise here,
+/// so — as on Linux for such a packet — they produce nothing.
+fn install_ipv4_ancillary(
+    msg_ptr: u64,
+    rx: Option<crate::socket::Inet4RxInfo>,
+    opts: crate::socket::Inet4CmsgOptions,
+) -> bool {
+    const SOL_IP: i32 = 0;
+    const IP_TOS: i32 = 1;
+    const IP_TTL: i32 = 2;
+    const IP_PKTINFO: i32 = 8;
+    const IP_ORIGDSTADDR: i32 = 20;
+    let mut records = alloc::vec::Vec::new();
+    if let Some(rx) = rx {
+        if opts.pktinfo {
+            let mut info = alloc::vec::Vec::with_capacity(12);
+            info.extend_from_slice(&(rx.ifindex as i32).to_ne_bytes());
+            info.extend_from_slice(&rx.spec_dst.to_be_bytes());
+            info.extend_from_slice(&rx.dst.to_be_bytes());
+            records.push((SOL_IP, IP_PKTINFO, info));
+        }
+        if opts.recvttl {
+            records.push((SOL_IP, IP_TTL, i32::from(rx.ttl).to_ne_bytes().to_vec()));
+        }
+        if opts.recvtos {
+            records.push((SOL_IP, IP_TOS, alloc::vec![rx.tos]));
+        }
+        if opts.origdstaddr {
+            let mut sin = alloc::vec![0u8; 16];
+            sin[0..2].copy_from_slice(&2u16.to_ne_bytes());
+            sin[2..4].copy_from_slice(&rx.dport.to_be_bytes());
+            sin[4..8].copy_from_slice(&rx.dst.to_be_bytes());
+            records.push((SOL_IP, IP_ORIGDSTADDR, sin));
+        }
+    }
+    put_cmsgs(msg_ptr, &records)
+}
+
 /// Install received AF_UNIX ancillary data into the calling task's
 /// `msg_control` buffer: an `SCM_RIGHTS` control message (any passed fds,
 /// each dup'd into a fresh fd in this task's table) and, when

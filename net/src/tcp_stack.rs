@@ -433,8 +433,9 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
         Some(t) => t,
         None => return,
     };
-    // TTL is at byte offset 8 in the raw IPv4 header.
+    // TTL is at byte offset 8 in the raw IPv4 header, TOS at offset 1.
     let ttl = if body.len() >= 9 { body[8] } else { 64 };
+    let tos = if body.len() >= 2 { body[1] } else { 0 };
     match ip.protocol {
         IP_PROTO_TCP => {
             crate::tcp::core::handle_segment_in(net_ns_id, ip.src_ip, ip.dst_ip, payload)
@@ -444,7 +445,7 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
             ip.src_ip,
             ip.dst_ip,
             payload,
-            ttl,
+            crate::udp_sock::RxIpMeta { ttl, tos },
             // The arrival interface, Linux's `dif`. `handle_ipv4` has
             // carried the NAME all along; only the index was missing, which
             // is why SO_BINDTODEVICE could not be checked on receive.
@@ -460,7 +461,7 @@ fn handle_udp(
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
     datagram: &[u8],
-    ttl: u8,
+    meta: crate::udp_sock::RxIpMeta,
     in_ifindex: u32,
 ) {
     if datagram.len() < 8 {
@@ -477,7 +478,7 @@ fn handle_udp(
     // Deliver to registered UDP sockets (udp_sock layer).
     // `in_ifindex` is Linux's `dif`: SO_BINDTODEVICE is enforced against
     // the interface the datagram ARRIVED on.
-    crate::udp_sock::deliver_in(net_ns_id, src_ip, dst_ip, datagram, ttl, in_ifindex);
+    crate::udp_sock::deliver_in(net_ns_id, src_ip, dst_ip, datagram, meta, in_ifindex);
     // Legacy per-protocol consumers.
     if dst_port == 68 {
         crate::dhcp::on_udp_in_in(net_ns_id, src_ip, dst_ip, src_port, dst_port, payload);

@@ -1186,14 +1186,16 @@ impl SocketFile {
                 return Some(OK);
             }
             IP_RECVTOS => {
-                // LINUX-GAP: do_ip_setsockopt IP_RECVTOS — stored and
-                // reported; no IP_TOS cmsg is generated.
+                // recvmsg returns an IP_TOS cmsg (`ip_cmsg_recv_tos`).
                 o.ext.ip_recvtos = on;
                 OK
             }
             IP_RECVOPTS | IP_RETOPTS | IP_PASSSEC | IP_RECVORIGDSTADDR => {
-                // LINUX-GAP: do_ip_setsockopt receive-ancillary flags —
-                // stored and reported; the cmsgs are not generated.
+                // recvmsg returns IP_ORIGDSTADDR for every datagram. Linux
+                // writes IP_RECVOPTS / IP_RETOPTS only for a packet carrying
+                // IP options and IP_PASSSEC only with an LSM peer label —
+                // neither of which NARF's IPv4 receive path produces — so
+                // like Linux for such packets they yield no cmsg.
                 match name {
                     IP_RECVOPTS => o.ext.ip_recvopts = on,
                     IP_RETOPTS => o.ext.ip_retopts = on,

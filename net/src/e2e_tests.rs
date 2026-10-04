@@ -465,7 +465,7 @@ fn smoke_e2e_udp_send_recv_loopback() -> TestResult {
         [127, 0, 0, 1], // src IP
         SERVER_IP,
         &seg,
-        64,
+        crate::udp_sock::RxIpMeta { ttl: 64, tos: 0 },
     );
 
     let mut buf = vec![0u8; 64];
@@ -1124,7 +1124,12 @@ fn smoke_e2e_udp_reuseport_load_balance() -> TestResult {
         seg[2..4].copy_from_slice(&PORT.to_be_bytes());
         seg[4..6].copy_from_slice(&((UDP_HDR_LEN + 1) as u16).to_be_bytes());
         seg[UDP_HDR_LEN] = i;
-        udp_deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg, 64);
+        udp_deliver(
+            [10, 0, 0, 1],
+            [0, 0, 0, 0],
+            &seg,
+            crate::udp_sock::RxIpMeta { ttl: 64, tos: 0 },
+        );
     }
 
     let q1 = s1.rx_queue.lock().len();

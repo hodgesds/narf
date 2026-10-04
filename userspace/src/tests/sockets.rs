@@ -993,6 +993,7 @@ fn smoke_socket_dual_stack_udp_receives_v4_as_mapped() -> TestResult {
         PORT,
         b"mapped",
         1,
+        narf_net::udp_sock::RxIpMeta::default(),
     ) {
         sock.unregister();
         return TestResult::Fail("IPv4 datagram did not enter dual-stack UDP6 socket");
@@ -1546,6 +1547,7 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
         LOCAL_PORT,
         b"pong",
         0, // arrival interface unknown: matches any binding
+        narf_net::udp_sock::RxIpMeta::default(),
     ) {
         return TestResult::Fail("a wire datagram was not delivered to the bound socket");
     }
@@ -1568,6 +1570,7 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
         LOCAL_PORT + 1,
         b"nobody",
         0,
+        narf_net::udp_sock::RxIpMeta::default(),
     ) {
         return TestResult::Fail("an unbound port must not accept a wire datagram");
     }
@@ -1639,15 +1642,42 @@ fn smoke_socket_bindtodevice_filters_receive() -> TestResult {
 
     let ns = sock.net_ns_id();
     // Arriving on the WRONG interface: refused.
-    if crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"wrong", idx_b) {
+    if crate::socket::deliver_wire_datagram(
+        ns,
+        &PEER,
+        9,
+        &LOCAL,
+        PORT,
+        b"wrong",
+        idx_b,
+        narf_net::udp_sock::RxIpMeta::default(),
+    ) {
         return TestResult::Fail("a datagram from another interface must not be delivered");
     }
     // Arriving on the RIGHT interface: delivered.
-    if !crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"right", idx_a) {
+    if !crate::socket::deliver_wire_datagram(
+        ns,
+        &PEER,
+        9,
+        &LOCAL,
+        PORT,
+        b"right",
+        idx_a,
+        narf_net::udp_sock::RxIpMeta::default(),
+    ) {
         return TestResult::Fail("a datagram from the bound interface must be delivered");
     }
     // An unknown arrival interface cannot contradict the binding.
-    if !crate::socket::deliver_wire_datagram(ns, &PEER, 9, &LOCAL, PORT, b"any", 0) {
+    if !crate::socket::deliver_wire_datagram(
+        ns,
+        &PEER,
+        9,
+        &LOCAL,
+        PORT,
+        b"any",
+        0,
+        narf_net::udp_sock::RxIpMeta::default(),
+    ) {
         return TestResult::Fail("an unknown arrival interface must still be delivered");
     }
 

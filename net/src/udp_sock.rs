@@ -601,10 +601,22 @@ pub(crate) fn remove_namespace(net_ns_id: u64) {
 
 static RR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// The IP-header fields a received datagram carries up to its socket: what
+/// Linux's receive control messages read from `ip_hdr(skb)` /
+/// `ipv6_hdr(skb)`. IPv4: TTL and TOS (`IP_TTL`, `IP_TOS`). IPv6: hop limit
+/// and traffic class (`IPV6_HOPLIMIT`, `IPV6_TCLASS`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RxIpMeta {
+    /// IPv4 TTL, or IPv6 hop limit.
+    pub ttl: u8,
+    /// IPv4 TOS byte, or IPv6 traffic class.
+    pub tos: u8,
+}
+
 /// Deliver a received UDP datagram to matching socket(s).
 /// `datagram` is the raw UDP segment (header + payload, 8+ bytes).
-pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
-    deliver_in(0, src_ip, dst_ip, datagram, ttl, 0);
+pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], meta: RxIpMeta) {
+    deliver_in(0, src_ip, dst_ip, datagram, meta, 0);
 }
 
 /// `fn(net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex)
@@ -614,11 +626,12 @@ pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
 /// `in_ifindex` is the arrival interface, so that layer can apply the same
 /// SO_BINDTODEVICE rule; without it the check would hold for in-kernel
 /// sockets and silently not for userspace ones.
-type UserDeliverHook = fn(u64, &[u8], u16, &[u8], u16, &[u8], u32) -> bool;
+///
+/// `RxIpMeta` carries the IP header's TTL/hop limit and TOS/traffic class for
+/// the socket's receive control messages.
+type UserDeliverHook = fn(u64, &[u8], u16, &[u8], u16, &[u8], u32, RxIpMeta) -> bool;
 
 static USER_DELIVER_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static USER_DELIVER_CONTEXT: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
-static USER_DELIVER_HOP_LIMIT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// Install the userspace-socket delivery hook.
 ///
@@ -638,22 +651,7 @@ pub(crate) fn user_deliver(
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
-) -> bool {
-    user_deliver_with_hop_limit(
-        net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex, 0,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn user_deliver_with_hop_limit(
-    net_ns_id: u64,
-    src_ip: &[u8],
-    src_port: u16,
-    dst_ip: &[u8],
-    dst_port: u16,
-    payload: &[u8],
-    in_ifindex: u32,
-    hop_limit: u8,
+    meta: RxIpMeta,
 ) -> bool {
     let raw = USER_DELIVER_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if raw == 0 {
@@ -663,18 +661,9 @@ pub(crate) fn user_deliver_with_hop_limit(
     // `UserDeliverHook`, the only writer of this slot, and function
     // pointers are never unmapped.
     let hook: UserDeliverHook = unsafe { core::mem::transmute(raw) };
-    let _context = USER_DELIVER_CONTEXT.lock();
-    USER_DELIVER_HOP_LIMIT.store(hop_limit, core::sync::atomic::Ordering::Release);
-    let consumed = hook(
-        net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
-    );
-    USER_DELIVER_HOP_LIMIT.store(0, core::sync::atomic::Ordering::Release);
-    consumed
-}
-
-/// Hop limit attached to the synchronous userspace-delivery callback.
-pub fn current_user_delivery_hop_limit() -> u8 {
-    USER_DELIVER_HOP_LIMIT.load(core::sync::atomic::Ordering::Acquire)
+    hook(
+        net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex, meta,
+    )
 }
 
 /// Demultiplex a received UDP datagram to the sockets bound for it.
@@ -688,7 +677,7 @@ pub fn deliver_in(
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
     datagram: &[u8],
-    ttl: u8,
+    meta: RxIpMeta,
     in_ifindex: u32,
 ) {
     if datagram.len() < UDP_HDR_LEN {
@@ -754,7 +743,7 @@ pub fn deliver_in(
         // before the datagram is dropped — that table is the only place a
         // userspace `bind()` is recorded.
         user_deliver(
-            net_ns_id, &src_ip, src_port, &dst_ip, dst_port, payload, in_ifindex,
+            net_ns_id, &src_ip, src_port, &dst_ip, dst_port, payload, in_ifindex, meta,
         );
         return;
     }
@@ -777,7 +766,7 @@ pub fn deliver_in(
         src: src_addr,
         dst_ip,
         payload: payload.to_vec(),
-        ttl,
+        ttl: meta.ttl,
     };
 
     // A full queue drops the ARRIVING datagram and keeps what is already
@@ -955,7 +944,12 @@ fn smoke_udp_recv_loopback_inject() -> TestResult {
     seg[6..8].copy_from_slice(&[0, 0]); // checksum disabled
     seg[8..17].copy_from_slice(payload);
 
-    deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg, 64);
+    deliver(
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &seg,
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
 
     let mut buf = [0u8; 64];
     let result = udp_recv(&sock, &mut buf);
@@ -989,7 +983,12 @@ fn smoke_udp_connected_mode_filters_peer() -> TestResult {
     seg[2..4].copy_from_slice(&port.to_be_bytes());
     seg[4..6].copy_from_slice(&(12u16).to_be_bytes());
     seg[8..12].copy_from_slice(b"drop");
-    deliver([10, 0, 0, 99], [0, 0, 0, 0], &seg, 64);
+    deliver(
+        [10, 0, 0, 99],
+        [0, 0, 0, 0],
+        &seg,
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
 
     let mut buf = [0u8; 64];
     let result = udp_recv(&sock, &mut buf);
@@ -1033,7 +1032,12 @@ fn smoke_udp_rcvbuf_full_drops_newest() -> TestResult {
     };
     // Inject 3 datagrams: A, B, C. C arrives at a full queue and is dropped.
     for b in [b'A', b'B', b'C'] {
-        deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg(9001, port, &[b]), 64);
+        deliver(
+            [10, 0, 0, 1],
+            [0, 0, 0, 0],
+            &seg(9001, port, &[b]),
+            RxIpMeta { ttl: 64, tos: 0 },
+        );
     }
     let mut got = alloc::vec::Vec::new();
     let mut buf = [0u8; 8];
@@ -1062,7 +1066,12 @@ fn smoke_udp_large_datagram_under_mtu() -> TestResult {
     seg[4..6].copy_from_slice(&((UDP_HDR_LEN + 1400) as u16).to_be_bytes());
     seg[UDP_HDR_LEN..].copy_from_slice(&big_payload);
 
-    deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg, 64);
+    deliver(
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &seg,
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
 
     let mut buf = alloc::vec![0u8; 1500];
     let result = udp_recv(&sock, &mut buf);
@@ -1101,7 +1110,12 @@ fn smoke_udp_reuseport_load_balance() -> TestResult {
         seg[2..4].copy_from_slice(&port.to_be_bytes());
         seg[4..6].copy_from_slice(&(9u16).to_be_bytes());
         seg[8] = i;
-        deliver([10, 0, 0, 1], [0, 0, 0, 0], &seg, 64);
+        deliver(
+            [10, 0, 0, 1],
+            [0, 0, 0, 0],
+            &seg,
+            RxIpMeta { ttl: 64, tos: 0 },
+        );
     }
 
     let q1 = s1.rx_queue.lock().len();
@@ -1148,7 +1162,12 @@ fn smoke_udp_fragment_reassembly_via_deliver() -> TestResult {
     seg[6..8].copy_from_slice(&[0, 0]); // checksum (optional)
     seg[UDP_HDR_LEN..].copy_from_slice(&payload);
 
-    deliver([10, 0, 0, 5], [0, 0, 0, 0], &seg, 64);
+    deliver(
+        [10, 0, 0, 5],
+        [0, 0, 0, 0],
+        &seg,
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
 
     let mut buf = alloc::vec![0u8; 1100];
     let result = udp_recv(&sock, &mut buf);
@@ -1213,15 +1232,30 @@ fn smoke_udp_deliver_validates_length_field() -> TestResult {
     };
     let mut buf = [0u8; 64];
     // Shorter than a header: ignored.
-    deliver([10, 0, 0, 1], [0, 0, 0, 0], &[0u8; 7], 64);
+    deliver(
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &[0u8; 7],
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
     // Length field bigger than the segment: short packet, dropped.
     let mut long = seg(9001, port, b"data");
     long[4..6].copy_from_slice(&100u16.to_be_bytes());
-    deliver([10, 0, 0, 1], [0, 0, 0, 0], &long, 64);
+    deliver(
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &long,
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
     // Length field smaller than the header: dropped.
     let mut tiny = seg(9001, port, b"data");
     tiny[4..6].copy_from_slice(&4u16.to_be_bytes());
-    deliver([10, 0, 0, 1], [0, 0, 0, 0], &tiny, 64);
+    deliver(
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &tiny,
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
     if udp_recv(&sock, &mut buf) != Err(UdpError::WouldBlock) {
         udp_close(&sock);
         return TestResult::Fail("a malformed datagram was queued");
@@ -1229,7 +1263,12 @@ fn smoke_udp_deliver_validates_length_field() -> TestResult {
     // Link-layer padding after the datagram: trimmed to the length field.
     let mut padded = seg(9001, port, b"abc");
     padded.extend_from_slice(&[0xEE; 5]);
-    deliver([10, 0, 0, 1], [0, 0, 0, 0], &padded, 64);
+    deliver(
+        [10, 0, 0, 1],
+        [0, 0, 0, 0],
+        &padded,
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
     let r = udp_recv(&sock, &mut buf);
     udp_close(&sock);
     match r {
@@ -1250,7 +1289,7 @@ fn smoke_udp_recv_truncates_to_buffer() -> TestResult {
         [10, 0, 0, 1],
         [0, 0, 0, 0],
         &seg(9001, port, b"0123456789"),
-        64,
+        RxIpMeta { ttl: 64, tos: 0 },
     );
     let mut small = [0u8; 4];
     let first = udp_recv(&sock, &mut small);
@@ -1274,13 +1313,28 @@ fn smoke_udp_disconnect_accepts_any_peer() -> TestResult {
         Err(_) => return TestResult::Fail("bind failed"),
     };
     udp_connect(&sock, SocketAddrV4::new([10, 0, 0, 2], 9002));
-    deliver([10, 0, 0, 2], [0, 0, 0, 0], &seg(9002, port, b"p"), 64);
-    deliver([10, 0, 0, 3], [0, 0, 0, 0], &seg(9003, port, b"x"), 64);
+    deliver(
+        [10, 0, 0, 2],
+        [0, 0, 0, 0],
+        &seg(9002, port, b"p"),
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
+    deliver(
+        [10, 0, 0, 3],
+        [0, 0, 0, 0],
+        &seg(9003, port, b"x"),
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
     let mut buf = [0u8; 4];
     let peer_ok = udp_recv(&sock, &mut buf) == Ok((1, SocketAddrV4::new([10, 0, 0, 2], 9002)));
     let filtered = udp_recv(&sock, &mut buf) == Err(UdpError::WouldBlock);
     udp_disconnect(&sock);
-    deliver([10, 0, 0, 3], [0, 0, 0, 0], &seg(9003, port, b"y"), 64);
+    deliver(
+        [10, 0, 0, 3],
+        [0, 0, 0, 0],
+        &seg(9003, port, b"y"),
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
     let after = udp_recv(&sock, &mut buf);
     udp_close(&sock);
     if !peer_ok {
@@ -1387,7 +1441,12 @@ fn smoke_udp_snapshot_rows() -> TestResult {
     let row = |p: u16| snapshot().into_iter().find(|r| r.local_port == p);
     let unconnected = row(port);
     udp_connect(&sock, SocketAddrV4::new([10, 0, 0, 2], 9002));
-    deliver([10, 0, 0, 2], [0, 0, 0, 0], &seg(9002, port, b"q"), 64);
+    deliver(
+        [10, 0, 0, 2],
+        [0, 0, 0, 0],
+        &seg(9002, port, b"q"),
+        RxIpMeta { ttl: 64, tos: 0 },
+    );
     let connected = row(port);
     udp_close(&sock);
     let gone = row(port).is_none();
@@ -1435,7 +1494,7 @@ fn smoke_udp_namespace_isolation() -> TestResult {
         [10, 0, 0, 1],
         [0, 0, 0, 0],
         &seg(9001, port, b"g"),
-        64,
+        RxIpMeta { ttl: 64, tos: 0 },
         0,
     );
     let mut buf = [0u8; 4];
@@ -1480,7 +1539,7 @@ fn smoke_udp_bindtodevice_rx_scoring() -> TestResult {
             [10, 0, 0, 1],
             [0, 0, 0, 0],
             &seg(9001, port, b"5"),
-            64,
+            RxIpMeta { ttl: 64, tos: 0 },
             5,
         );
     }
@@ -1491,7 +1550,7 @@ fn smoke_udp_bindtodevice_rx_scoring() -> TestResult {
         [10, 0, 0, 1],
         [0, 0, 0, 0],
         &seg(9001, port, b"6"),
-        64,
+        RxIpMeta { ttl: 64, tos: 0 },
         6,
     );
     let unbound_got = take(&unbound) && !take(&pinned);

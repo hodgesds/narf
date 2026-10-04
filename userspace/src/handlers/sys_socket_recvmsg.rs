@@ -167,7 +167,13 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                     None
                 };
                 const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
-                let ancillary_truncated = if sock.domain == crate::socket::AF_INET6 {
+                let ancillary_truncated = if sock.domain == crate::socket::AF_INET {
+                    install_ipv4_ancillary(
+                        msg_ptr,
+                        sock.take_inet4_recv_ancillary(),
+                        sock.inet4_cmsg_options(),
+                    )
+                } else if sock.domain == crate::socket::AF_INET6 {
                     let (pktinfo, hoplimit) = sock.inet6_ancillary_options();
                     install_ipv6_ancillary(
                         msg_ptr,

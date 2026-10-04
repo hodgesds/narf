@@ -799,6 +799,9 @@ pub struct SocketFile {
     /// calls `discard_dgram_recv_ancillary`.
     dgram_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, DgramRecvAncillary>>,
     inet6_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, Inet6RecvAncillary>>,
+    /// The IPv4 receive info of the datagram each task last received, for
+    /// its recvmsg's control messages. Keyed like `inet6_recv_ancillary`.
+    inet4_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, Inet4RxInfo>>,
     /// Durable per-fd readiness cell for a connectionless datagram inbox
     /// (AF_UNIX/AF_INET SOCK_DGRAM). The inbox lives INSIDE the `state` enum
     /// behind the lock, so — unlike a `RingBuf` Arc — the cell can't be a field
@@ -1373,13 +1376,15 @@ pub fn deliver_wire_datagram(
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
+    meta: narf_net::udp_sock::RxIpMeta,
 ) -> bool {
     match (src_ip.try_into(), dst_ip.try_into()) {
         (Ok(src), Ok(dst)) => {
-            inet_dgram::deliver_wire(net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex)
-                || inet6_dgram::deliver_wire_v4_mapped(
-                    net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex,
-                )
+            inet_dgram::deliver_wire(
+                net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, meta,
+            ) || inet6_dgram::deliver_wire_v4_mapped(
+                net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, meta,
+            )
         }
         _ if src_ip.len() == 16 && dst_ip.len() == 16 => {
             let mut src = [0u8; 16];
@@ -1387,14 +1392,7 @@ pub fn deliver_wire_datagram(
             src.copy_from_slice(src_ip);
             dst.copy_from_slice(dst_ip);
             inet6_dgram::deliver_wire(
-                net_ns_id,
-                src,
-                src_port,
-                dst,
-                dst_port,
-                payload,
-                in_ifindex,
-                narf_net::udp_sock::current_user_delivery_hop_limit(),
+                net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, meta.ttl,
             )
         }
         _ => false,
@@ -1429,6 +1427,32 @@ pub struct DgramPacket {
     /// Per-datagram SCM_RIGHTS payload. AF_UNIX datagrams preserve message
     /// boundaries, so these descriptors must not share the stream ring.
     pub(crate) fds: Vec<ScmRightsFile>,
+    /// What an AF_INET datagram's IPv4 receive control messages report.
+    /// `None` for AF_UNIX.
+    pub(crate) inet4_rx: Option<Inet4RxInfo>,
+}
+
+/// The per-packet facts Linux's IPv4 receive control messages carry
+/// (`ip_cmsg_recv_offset`): `ip_hdr(skb)->daddr/ttl/tos`, the UDP
+/// destination port, and the `PKTINFO_SKB_CB` `ipv4_pktinfo_prepare` fills
+/// (arrival ifindex, `fib_compute_spec_dst`). Addresses in host order.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Inet4RxInfo {
+    pub dst: u32,
+    pub dport: u16,
+    pub ifindex: u32,
+    pub spec_dst: u32,
+    pub ttl: u8,
+    pub tos: u8,
+}
+
+/// Which IPv4 receive control messages a socket asked for.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct Inet4CmsgOptions {
+    pub pktinfo: bool,
+    pub recvttl: bool,
+    pub recvtos: bool,
+    pub origdstaddr: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1675,6 +1699,7 @@ impl SocketFile {
             passcred: AtomicBool::new(false),
             dgram_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             inet6_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
+            inet4_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             // A fresh dgram socket is always sendable, not yet readable; a fresh
             // listener has no pending connection; a fresh netlink queue is empty
             // (readable only once a reply/monitor message is enqueued) but always
@@ -2394,6 +2419,37 @@ impl SocketFile {
         self.inet6_recv_ancillary
             .lock()
             .remove(&crate::handlers::current_task_id())
+    }
+
+    /// Record (or, for `None`, forget) the receive info of the datagram the
+    /// current task is receiving, for its recvmsg's control messages.
+    pub(crate) fn stash_inet4_recv_ancillary(&self, rx: Option<Inet4RxInfo>) {
+        let task = crate::handlers::current_task_id();
+        let mut map = self.inet4_recv_ancillary.lock();
+        match rx {
+            Some(rx) => {
+                map.insert(task, rx);
+            }
+            None => {
+                map.remove(&task);
+            }
+        }
+    }
+
+    pub(crate) fn take_inet4_recv_ancillary(&self) -> Option<Inet4RxInfo> {
+        self.inet4_recv_ancillary
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    pub(crate) fn inet4_cmsg_options(&self) -> Inet4CmsgOptions {
+        let o = self.options.lock();
+        Inet4CmsgOptions {
+            pktinfo: o.ip_pktinfo,
+            recvttl: o.ip_recvttl,
+            recvtos: o.ext.ip_recvtos,
+            origdstaddr: o.ext.ip_origdstaddr,
+        }
     }
 
     pub(crate) fn inet6_ancillary_options(&self) -> (bool, bool) {
@@ -5634,6 +5690,7 @@ impl SocketFile {
                 peer_port: dest.1,
                 payload: buf.to_vec(),
                 fds: Vec::new(),
+                inet4_rx: None,
             });
             return SocketOpResult::Ok(buf.len() as u64);
         }
@@ -6931,6 +6988,7 @@ impl SocketFile {
                     peer_port: 0,
                     payload: buf.to_vec(),
                     fds,
+                    inet4_rx: None,
                 };
                 let mut ds = dest_sock.state.lock();
                 if let SocketState::UnixDgram { inbox, .. } = &mut *ds {
@@ -8513,6 +8571,7 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
         peer_port: 0,
         payload: alloc::vec![0u8; 7], // head datagram: 7 bytes
         fds: Vec::new(),
+        inet4_rx: None,
     });
     inbox.push_back(DgramPacket {
         peer_unix: None,
@@ -8521,6 +8580,7 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
         peer_port: 0,
         payload: alloc::vec![0u8; 3], // second datagram: ignored by SIOCINQ
         fds: Vec::new(),
+        inet4_rx: None,
     });
     *sock.state.lock() = SocketState::UnixDgram {
         addr: None,

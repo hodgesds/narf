@@ -373,6 +373,7 @@ fn enqueue(sock: &SocketFile, pkt: DgramPacket) -> bool {
 
 /// Deliver a datagram that arrived from the wire. See
 /// [`super::deliver_wire_datagram`].
+#[allow(clippy::too_many_arguments)]
 pub(super) fn deliver_wire(
     ns: u64,
     src: [u8; 4],
@@ -381,9 +382,27 @@ pub(super) fn deliver_wire(
     dport: u16,
     payload: &[u8],
     in_ifindex: u32,
+    meta: narf_net::udp_sock::RxIpMeta,
 ) -> bool {
     let saddr = u32::from_be_bytes(src);
     let daddr = u32::from_be_bytes(dst);
+    // `fib_compute_spec_dst`: a plain local destination is its own spec_dst;
+    // for a broadcast or multicast one it is the preferred source for
+    // replying to the sender.
+    let spec_dst =
+        if super::sockopt::is_multicast_v4(daddr) || narf_net::iface::is_broadcast_in(ns, dst) {
+            select_source(ns, saddr, in_ifindex).unwrap_or(0)
+        } else {
+            daddr
+        };
+    let rx = super::Inet4RxInfo {
+        dst: daddr,
+        dport,
+        ifindex: in_ifindex,
+        spec_dst,
+        ttl: meta.ttl,
+        tos: meta.tos,
+    };
     if super::sockopt::is_multicast_v4(daddr) {
         // `ip_route_input_mc` accepts a group only when the arrival device
         // joined it (`ip_check_mc_rcv`); `__udp4_lib_mcast_deliver` then
@@ -408,6 +427,7 @@ pub(super) fn deliver_wire(
                     peer_port: sport,
                     payload: payload.to_vec(),
                     fds: Vec::new(),
+                    inet4_rx: Some(rx),
                 },
             );
         }
@@ -439,6 +459,7 @@ pub(super) fn deliver_wire(
             peer_port: sport,
             payload: payload.to_vec(),
             fds: Vec::new(),
+            inet4_rx: Some(rx),
         },
     );
     // Consumed even when the receive buffer dropped it: a socket owns the
@@ -800,6 +821,23 @@ impl SocketFile {
         let dest_local = dest.0.to_be_bytes()[0] == 127
             || narf_net::iface::is_local_addr_in(ns, dest.0.to_be_bytes());
         if dest_is_broadcast {
+            // The looped copy arrives on the output device carrying the
+            // sent header; its spec_dst is the route back to the sender,
+            // i.e. the sender's own address.
+            let rx = super::Inet4RxInfo {
+                dst: dest.0,
+                dport: dest.1,
+                ifindex: if dev != 0 {
+                    dev
+                } else {
+                    narf_net::iface::for_dst_in(ns, dest.0.to_be_bytes())
+                        .map(|i| i.ifindex)
+                        .unwrap_or(0)
+                },
+                spec_dst: from,
+                ttl: ip_ttl.min(255) as u8,
+                tos: ip_tos.min(255) as u8,
+            };
             // A broadcast route's output (`ip_mc_output`,
             // `net/ipv4/ip_output.c:413`) loops a clone back to this host,
             // where every matching socket on the port gets a copy.
@@ -820,6 +858,7 @@ impl SocketFile {
                         peer_port: local_port,
                         payload: buf.to_vec(),
                         fds: Vec::new(),
+                        inet4_rx: Some(rx),
                     },
                 );
             }
@@ -863,6 +902,21 @@ impl SocketFile {
         };
         match dest_sock {
             Some(d) => {
+                // Local delivery goes through lo: `ipv4_pktinfo_prepare`
+                // reports the output route's `rt_iif` (the sender's bound
+                // device) or else lo, and spec_dst is the local daddr.
+                let rx = super::Inet4RxInfo {
+                    dst: dest.0,
+                    dport: dest.1,
+                    ifindex: if dev != 0 {
+                        dev
+                    } else {
+                        super::sockopt::LOOPBACK_IFINDEX
+                    },
+                    spec_dst: dest.0,
+                    ttl: ip_ttl.min(255) as u8,
+                    tos: ip_tos.min(255) as u8,
+                };
                 enqueue(
                     &d,
                     DgramPacket {
@@ -872,6 +926,7 @@ impl SocketFile {
                         peer_port: local_port,
                         payload: buf.to_vec(),
                         fds: Vec::new(),
+                        inet4_rx: Some(rx),
                     },
                 );
             }
@@ -933,6 +988,16 @@ impl SocketFile {
             local_addr
         };
         let via_lo = egress == super::sockopt::LOOPBACK_IFINDEX;
+        // `ip_mc_output`'s looped copy arrives on the egress device with the
+        // multicast TTL; spec_dst routes back to the sender's own address.
+        let rx = super::Inet4RxInfo {
+            dst: dest.0,
+            dport: dest.1,
+            ifindex: egress,
+            spec_dst: from,
+            ttl: mc_ttl.min(255) as u8,
+            tos: ip_tos.min(255) as u8,
+        };
         if (via_lo || mc_loop) && super::sockopt::host_joined_v4(ns, egress, dest.0) {
             let targets = {
                 let bound = INET_DGRAM_BOUND.lock();
@@ -951,6 +1016,7 @@ impl SocketFile {
                         peer_port: local_port,
                         payload: buf.to_vec(),
                         fds: Vec::new(),
+                        inet4_rx: Some(rx),
                     },
                 );
             }
@@ -1003,6 +1069,7 @@ impl SocketFile {
                     let n = core::cmp::min(buf.len(), full_len);
                     buf[..n].copy_from_slice(&front.payload[..n]);
                     let peer = Some(make_sockaddr_in(front.peer_addr, front.peer_port));
+                    self.stash_inet4_recv_ancillary(front.inet4_rx);
                     if !peek {
                         inbox.pop_front();
                         *rmem = rmem.saturating_sub(full_len + DGRAM_TRUESIZE_OVERHEAD);
