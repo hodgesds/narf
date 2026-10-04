@@ -8717,3 +8717,41 @@ fn smoke_rtnetlink_extack_messages_are_linuxs() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net", smoke_rtnetlink_extack_messages_are_linuxs);
+
+/// A packet socket bound to a device receives the frames that device
+/// receives, each tagged with that device's ifindex (`packet_rcv`:
+/// `sll_ifindex = skb->dev->ifindex`); a socket bound to `lo` does not see
+/// them. NARF tagged every received frame as ifindex 1 (`lo`), so a socket
+/// bound to a NIC — what a DHCP client opens — never received anything.
+fn smoke_raw_packet_frames_carry_the_ingress_ifindex() -> TestResult {
+    let name = crate::iface::register("nrfp%d", [0x02, 0, 0, 0, 0xbe, 0], |_| Ok(()));
+    let Some(ifindex) = crate::iface::ifindex_of(&name) else {
+        return TestResult::Fail("test interface has no ifindex");
+    };
+    let bound = crate::raw_sock::raw_packet_open(crate::raw_sock::ETH_P_ALL, ifindex);
+    let on_lo = crate::raw_sock::raw_packet_open(crate::raw_sock::ETH_P_ALL, 1);
+    // An ARP request from 198.51.100.2 for 198.51.100.1, broadcast.
+    let mut frame = [0u8; 60];
+    frame[0..6].copy_from_slice(&[0xff; 6]);
+    frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0xbe, 9]);
+    frame[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    frame[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    frame[22..28].copy_from_slice(&[0x02, 0, 0, 0, 0xbe, 9]);
+    frame[28..32].copy_from_slice(&[198, 51, 100, 2]);
+    frame[38..42].copy_from_slice(&[198, 51, 100, 1]);
+    crate::tcp_stack::rx_handler(&name, &mut frame);
+    let got = crate::raw_sock::raw_packet_recv(&bound);
+    let leaked = crate::raw_sock::raw_packet_recv(&on_lo);
+    crate::raw_sock::raw_packet_close(&bound);
+    crate::raw_sock::raw_packet_close(&on_lo);
+    match got {
+        Some(raw) if raw.ifindex == ifindex => {}
+        Some(_) => return TestResult::Fail("the frame carried another device's ifindex"),
+        None => return TestResult::Fail("a socket bound to the ingress device received nothing"),
+    }
+    if leaked.is_some() {
+        return TestResult::Fail("a socket bound to lo received a frame from another device");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/raw", smoke_raw_packet_frames_carry_the_ingress_ifindex);

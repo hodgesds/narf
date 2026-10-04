@@ -272,8 +272,11 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
     // resizing program's `[data, data_end)` is `frame[..len]`.
     let frame = &mut frame[..len];
 
-    // AF_PACKET raw sockets see every frame before L3 dispatch.
-    crate::raw_sock::raw_pkt_deliver_in(net_ns_id, frame, 1);
+    // AF_PACKET raw sockets see every frame before L3 dispatch, tagged with
+    // the device it arrived on (`packet_rcv`: `sll_ifindex =
+    // skb->dev->ifindex`), so a socket bound to that device receives it.
+    let ingress_ifindex = iface::ifindex_of(&bypass_iface).unwrap_or(0);
+    crate::raw_sock::raw_pkt_deliver_in(net_ns_id, frame, ingress_ifindex);
     let (eth, body) = match parse_eth_header(frame) {
         Some(t) => t,
         None => return,
