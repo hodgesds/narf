@@ -93,7 +93,7 @@ bpf-bench`.
 | `&mut MaybeUninit<T>` | callee initialises | `__uninit` |
 | `ArenaPtr<T>` | arena-space pointer | `KF_ARENA_ARG*` |
 | `Const<N>` | verified constant | `__k` |
-| `Guard<'_>` | critical-section guard; linear, never sleep-safe | `bpf_spin_lock` |
+| `Guard<'_>` | critical-section guard; structurally linear through `PtrKind::LockGuard`, and independently sleep-unsafe through `NonPreemptible` | `bpf_spin_lock` |
 
 Descriptors go into a `narf.kfuncs` link section, collected at boot exactly as
 `narf-kernel-test` collects `narf.tests`.
@@ -971,14 +971,16 @@ and the perf event layer, all of which are closed.
    `interp::drive` remains a test/benchmark helper only for self-waking futures;
    real I/O waits run on the executor through a future-returning hook such as
    sleepable struct ops.
-10. **A `Guard` cannot be both linear and sleep-unsafe under the Phase-0
-    contract.** `ArgDesc::consumes_in_arg_position` requires
-    `domain.requires_release()`, which only `ValidityDomain::Owned` satisfies —
-    but `KfuncDesc::validate` rejects a `PtrKind::LockGuard` return whose
-    domain survives an await, and `Owned` does. §1.11's three properties want
-    both. The fix is probably for linearity to key on `PtrKind::LockGuard`
-    directly rather than on the validity domain; it should land with the
-    abstract interpreter, which is the first consumer that cares.
+10. **Guard linearity and sleep safety (resolved).** These are orthogonal
+    properties. `ArgDesc::consumes_in_arg_position` keys guard linearity on
+    `PtrKind::LockGuard`, while the guard's `ValidityDomain::NonPreemptible`
+    makes it die at every await. Acquisition therefore creates a tracked
+    reference that must be consumed before exit, without falsely granting the
+    await survival of `ValidityDomain::Owned`. `KfuncDesc::validate` rejects a
+    lock-guard argument or return whose domain survives an await. Macro/registry
+    smokes derive both descriptors from the public `Guard<'_>` Rust type and
+    exercise balanced release, leak rejection, and await rejection through a
+    real program load; verifier host tests separately pin the structural rule.
 11. **`bpf(2)` load latency has no yield point, and verification dominates
     it.** Measured by `cargo xtask bpf-bench` (N = 60, same runner caveat as
     item 7), for one `BpfProg::load` of a 64-instruction straight-line

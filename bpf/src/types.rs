@@ -615,14 +615,11 @@ unsafe impl<T: 'static> BpfType for ArenaPtr<T> {
 /// release is mandatory because `PtrKind::LockGuard` is linear; and sleeping
 /// while held is rejected because `survives_await()` is `false`.
 ///
-/// Contract note for the verifier: `ArgDesc::consumes_in_arg_position`
-/// currently requires `domain.requires_release()`, which only
-/// `ValidityDomain::Owned` satisfies — but `KfuncDesc::validate` rejects a
-/// `LockGuard` return whose domain survives an await, and `Owned` does. A
-/// guard therefore cannot be both linear and sleep-unsafe under the Phase-0
-/// contract. `NonPreemptible` is the domain that satisfies `validate()`, and
-/// linearity for `PtrKind::LockGuard` needs to come from the pointer kind
-/// rather than the domain when the abstract interpreter lands.
+/// The two properties are intentionally orthogonal in the verifier:
+/// `ArgDesc::consumes_in_arg_position` recognises `PtrKind::LockGuard`
+/// structurally, while `ValidityDomain::NonPreemptible` makes the value die at
+/// an await. Do not replace the domain with `Owned`: that would retain the
+/// release obligation but incorrectly make a guard sleep-safe.
 #[derive(Debug)]
 pub struct Guard<'a> {
     token: u64,

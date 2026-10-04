@@ -1,10 +1,10 @@
-//! In-kernel smokes for the acquire/release kfunc surface.
+//! In-kernel smokes for the linear acquire/release kfunc surface.
 //!
-//! Separate from [`crate::tests`] because what these pin is one property:
-//! that `Owned<T>`'s two halves — the verifier's reference bookkeeping and the
-//! kernel's refcount — are derived from the *same* Rust type and therefore
-//! cannot drift. Everything here goes through the real registry and the real
-//! verifier; nothing hand-builds an `ArgDesc`.
+//! Separate from [`crate::tests`] because what these pin is one property: that
+//! linear Rust wrappers and the verifier's reference bookkeeping are derived
+//! from the *same* Rust type and therefore cannot drift. `Owned<T>` additionally
+//! pins the kernel refcount. Everything here goes through the real registry
+//! and the real verifier; nothing hand-builds an `ArgDesc`.
 //!
 //! Three layers, deliberately:
 //!
@@ -32,7 +32,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::map::{BpfMap, BpfMapCap, MapAttr, MapKind, MAX_BPF_PINS};
 use crate::prog::{BpfProg, BpfProgLoad, LoadError, LoadRequest};
-use crate::types::{BpfObject, BpfType, Owned, Trusted};
+use crate::types::{BpfObject, BpfType, Guard, Owned, Trusted};
 
 /// Bodies return `Result` so they read as a list of assertions.
 type R = Result<(), &'static str>;
@@ -152,6 +152,23 @@ const EXIT: Decoded = Decoded::Exit;
 
 const ACQUIRE: &str = "narf_map_acquire";
 const RELEASE: &str = "narf_map_release";
+const GUARD_ACQUIRE: &str = "narf_test_guard_acquire";
+const GUARD_RELEASE: &str = "narf_test_guard_release";
+
+// Test-only kfuncs that pin the public `Guard` type through the macro and the
+// real registry. The acquiring body deliberately returns `None`: these smokes
+// verify the signature contract, not a particular lock implementation.
+crate::kfunc! {
+    #[context(Atomic)]
+    fn narf_test_guard_acquire() -> Option<Guard<'static>> {
+        None
+    }
+
+    #[context(Atomic)]
+    fn narf_test_guard_release(guard: Guard<'static>) -> () {
+        let _ = guard.token();
+    }
+}
 
 /// Load a program that names `map` as fd [`MAP_FD`], through the real
 /// verifier and the real kfunc registry.
@@ -168,6 +185,21 @@ fn load(
             insns: asm(items),
             context: ctx,
             maps: alloc::vec![(MAP_FD, Arc::clone(map))],
+            map_indices: alloc::vec::Vec::new(),
+            load_references: alloc::vec::Vec::new(),
+        },
+    )
+}
+
+/// Load a program with no map operands through the real verifier and registry.
+fn load_no_maps(name: &str, items: &[Decoded], ctx: Context) -> Result<Arc<BpfProg>, LoadError> {
+    BpfProg::load(
+        load_cap(),
+        LoadRequest {
+            name: alloc::string::String::from(name),
+            insns: asm(items),
+            context: ctx,
+            maps: alloc::vec::Vec::new(),
             map_indices: alloc::vec::Vec::new(),
             load_references: alloc::vec::Vec::new(),
         },
@@ -278,6 +310,43 @@ fn smoke_bpf_kfunc_derives_release_descriptor_pos() -> TestResult {
     wrap(body_derives_release_descriptor())
 }
 kernel_test_in!("bpf", smoke_bpf_kfunc_derives_release_descriptor_pos);
+
+/// `Guard<'_>` derives both halves of its contract through the real macro:
+/// structural linearity from `PtrKind::LockGuard`, and sleep unsafety from
+/// `ValidityDomain::NonPreemptible`.
+fn body_derives_guard_descriptors() -> R {
+    let reg = crate::kfunc::registry().ok_or("kfunc registry not installed")?;
+    let acquire = reg
+        .by_name(GUARD_ACQUIRE)
+        .ok_or("narf_test_guard_acquire not registered")?;
+    let release = reg
+        .by_name(GUARD_RELEASE)
+        .ok_or("narf_test_guard_release not registered")?;
+
+    if acquire.ret != <Option<Guard<'static>> as BpfType>::DESC {
+        return Err("the guard acquire descriptor was not derived from its Rust return type");
+    }
+    if release.args != [<Guard<'static> as BpfType>::DESC] {
+        return Err("the guard release descriptor was not derived from its Rust argument type");
+    }
+    if !acquire.ret.flags.contains(ArgFlags::NULLABLE) {
+        return Err("the fallible guard acquire is not nullable");
+    }
+    if !acquire.ret.consumes_in_arg_position() || !release.args[0].consumes_in_arg_position() {
+        return Err("LockGuard is not structurally linear in both descriptor positions");
+    }
+    if acquire.ret.domain != ValidityDomain::NonPreemptible || acquire.ret.domain.survives_await() {
+        return Err("LockGuard is not independently marked sleep-unsafe");
+    }
+    if acquire.ret.kind != release.args[0].kind || acquire.ret.domain != release.args[0].domain {
+        return Err("the guard acquire and release descriptors disagree");
+    }
+    Ok(())
+}
+fn smoke_bpf_kfunc_derives_guard_descriptors_pos() -> TestResult {
+    wrap(body_derives_guard_descriptors())
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_derives_guard_descriptors_pos);
 
 /// Every registered kfunc that *takes* an `Owned` pointer must be reachable
 /// from something that *returns* one, or the release is unreachable and the
@@ -755,6 +824,80 @@ kernel_test_in!(
     "bpf",
     smoke_bpf_kfunc_prog_owned_across_await_still_leaks_neg
 );
+
+/// A guard acquired and released through macro-derived descriptors verifies.
+fn body_prog_guard_release_verifies() -> R {
+    load_no_maps(
+        "guard_rel",
+        &[
+            call(GUARD_ACQUIRE),
+            jeq_imm(0, 0, 3),
+            mov_reg(1, 0),
+            call(GUARD_RELEASE),
+            mov_imm(0, 1),
+            EXIT,
+        ],
+        Context::Atomic,
+    )
+    .map_err(|_| "a balanced Guard acquire/release did not verify")?;
+    Ok(())
+}
+fn smoke_bpf_kfunc_prog_guard_release_verifies_pos() -> TestResult {
+    wrap(body_prog_guard_release_verifies())
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_prog_guard_release_verifies_pos);
+
+/// Guard linearity is structural even though its domain does not itself
+/// require release.
+fn body_prog_guard_leak_rejected() -> R {
+    let e = load_no_maps(
+        "guard_leak",
+        &[call(GUARD_ACQUIRE), jeq_imm(0, 0, 1), mov_imm(0, 1), EXIT],
+        Context::Atomic,
+    )
+    .err()
+    .ok_or("a program that leaked a Guard verified")?;
+    match verify_error(&e) {
+        Some(VerifyError::LeakedReference { .. }) => Ok(()),
+        _ => Err("an unreleased Guard was rejected, but not as LeakedReference"),
+    }
+}
+fn smoke_bpf_kfunc_prog_guard_leak_rejected_neg() -> TestResult {
+    wrap(body_prog_guard_leak_rejected())
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_prog_guard_leak_rejected_neg);
+
+/// Guard sleep safety is independent of its release obligation: even a path
+/// that releases after the await is invalid.
+fn body_prog_guard_across_await_rejected() -> R {
+    let e = load_no_maps(
+        "guard_await",
+        &[
+            call(GUARD_ACQUIRE),
+            jeq_imm(0, 0, 4),
+            mov_reg(6, 0),
+            call("narf_yield"),
+            mov_reg(1, 6),
+            call(GUARD_RELEASE),
+            mov_imm(0, 0),
+            EXIT,
+        ],
+        Context::Sleepable,
+    )
+    .err()
+    .ok_or("a program held a Guard across an await and verified")?;
+    match verify_error(&e) {
+        Some(VerifyError::PointerCrossesAwait {
+            domain: ValidityDomain::NonPreemptible,
+            ..
+        }) => Ok(()),
+        _ => Err("a Guard crossing an await was rejected for an unrelated reason"),
+    }
+}
+fn smoke_bpf_kfunc_prog_guard_across_await_rejected_neg() -> TestResult {
+    wrap(body_prog_guard_across_await_rejected())
+}
+kernel_test_in!("bpf", smoke_bpf_kfunc_prog_guard_across_await_rejected_neg);
 
 // ── the JIT covers the acquire/release path too ─────────────────────
 
