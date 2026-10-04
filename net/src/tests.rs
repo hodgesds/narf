@@ -8460,6 +8460,63 @@ kernel_test_in!(
     smoke_iface_register_allocates_name_and_stable_ifindex
 );
 
+/// A NIC registers like Linux `register_netdevice`: down (no IFF_UP in the
+/// link dump) and with no IPv4 address, so NetworkManager finds it
+/// unconfigured and manages it (DHCP) instead of adopting a pre-set address
+/// as an "external" connection. The first address configured on it becomes
+/// the address the stack sends from; removing it leaves none.
+fn smoke_iface_registers_down_and_unconfigured() -> TestResult {
+    const IFF_UP: u32 = 0x1;
+    const IFF_RUNNING: u32 = 0x40;
+    const IFF_LOWER_UP: u32 = 0x1_0000;
+    let name = crate::iface::register("nrfd%d", [0x02, 0, 0, 0, 0xd0, 0], |_| Ok(()));
+    let Some(nic) = crate::iface::lookup(&name) else {
+        return TestResult::Fail("registered device not found");
+    };
+    if nic.link_up || nic.ipv4 != [0; 4] || !crate::iface::get_addrs(&name).is_empty() {
+        return TestResult::Fail("a new device must be down with no IPv4 address");
+    }
+    // ifi_flags of `name`'s RTM_NEWLINK in a link dump.
+    let link_flags = |name: &str| -> Option<u32> {
+        let request = [
+            16, 0, 0, 0, // nlmsg_len
+            18, 0, // RTM_GETLINK
+            1, 3, // NLM_F_REQUEST | NLM_F_DUMP
+            1, 0, 0, 0, // sequence
+            0, 0, 0, 0, // port id
+        ];
+        let mut needle = alloc::vec::Vec::from(name.as_bytes());
+        needle.push(0);
+        crate::netlink_route::build_dump(&request)
+            .iter()
+            .find(|reply| reply.windows(needle.len()).any(|w| w == needle.as_slice()))
+            .map(|reply| u32::from_ne_bytes(reply[24..28].try_into().unwrap()))
+    };
+    match link_flags(&name) {
+        Some(flags) if flags & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP) == 0 => {}
+        Some(_) => return TestResult::Fail("a new device must not report IFF_UP/RUNNING"),
+        None => return TestResult::Fail("the new device is missing from the link dump"),
+    }
+    if !crate::iface::set_link_state(&name, true) {
+        return TestResult::Fail("could not bring the device up");
+    }
+    if link_flags(&name).map(|f| f & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP))
+        != Some(IFF_UP | IFF_RUNNING | IFF_LOWER_UP)
+    {
+        return TestResult::Fail("an up device reports IFF_UP | IFF_RUNNING | IFF_LOWER_UP");
+    }
+    crate::iface::add_addr(&name, [192, 0, 2, 9], 24);
+    if crate::iface::lookup(&name).map(|nic| nic.ipv4) != Some([192, 0, 2, 9]) {
+        return TestResult::Fail("the first address must become the stack's source address");
+    }
+    crate::iface::del_addr(&name, [192, 0, 2, 9], 24);
+    if crate::iface::lookup(&name).map(|nic| nic.ipv4) != Some([0; 4]) {
+        return TestResult::Fail("removing the only address must leave the device without one");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_iface_registers_down_and_unconfigured);
+
 /// rtnetlink sends an extended-ACK message only where the Linux handler sets
 /// one (`NL_SET_ERR_MSG`), with Linux's text, and the address handlers fail
 /// in Linux's order: `inet_rtm_newaddr` checks the prefix and IFA_LOCAL

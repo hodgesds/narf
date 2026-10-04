@@ -260,11 +260,17 @@ fn install_net_stack() {
     // hands the guest 10.0.2.15/24 with the gateway + DNS at 10.0.2.2.
     // Assign it statically to the virtio-net iface so a guest server is
     // reachable from the host through `-netdev user,hostfwd=...` (the
-    // off-box serving smoke). Opt-in feature: real hardware should run
-    // the DHCP client instead of hardcoding the SLIRP lease.
+    // off-box serving smoke). This is Linux's kernel-level IP
+    // autoconfiguration (`ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off`,
+    // net/ipv4/ipconfig.c): `ic_open_devs` brings the device up, then the
+    // address and default route are set. Without it a NIC is born down and
+    // unconfigured and userspace (NetworkManager) configures it — a
+    // configured interface would be adopted as "externally" managed and
+    // never DHCP'd. Opt-in feature: distro boots leave it off.
     #[cfg(feature = "qemu-net")]
     {
         let vnet = narf_drivers_virtio::net_pci::primary_iface_name();
+        narf_net::iface::set_link_state(vnet, true);
         narf_net::iface::add_addr(vnet, [10, 0, 2, 15], 24);
         narf_net::iface::set_iface_ipv4(vnet, [10, 0, 2, 15], [10, 0, 2, 2]);
         let _ = writeln!(

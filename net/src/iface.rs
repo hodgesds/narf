@@ -21,13 +21,15 @@ pub struct NetIfaceEntry {
     pub name: String,
     pub mac: [u8; 6],
     pub send: SendFn,
-    /// IPv4 address assigned to the interface (host byte order in
-    /// [u8; 4]). Populated by the static config at boot — no DHCP
-    /// today.
+    /// The interface's primary IPv4 address (the stack's source address),
+    /// `0.0.0.0` while it has none. [`add_addr`] / [`del_addr`] keep it on
+    /// the first address configured, as Linux's primary `ifa_list` entry.
     pub ipv4: [u8; 4],
-    /// Default gateway. Used for any non-on-link destination.
+    /// Default gateway recorded by the in-kernel DHCP client / static config.
     pub gateway: [u8; 4],
     pub mtu: u32,
+    /// Administratively up (IFF_UP). NARF devices report carrier whenever
+    /// they are up, so this is also IFF_RUNNING / IFF_LOWER_UP.
     pub link_up: bool,
     /// Owning network namespace. Zero is the initial namespace.
     pub net_ns_id: u64,
@@ -166,13 +168,6 @@ fn dev_conf_register(iface_name: &str) {
 
 static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::new(None);
 
-/// Default IP / gateway for the QEMU user-net topology — Stage-1
-/// hard-codes these so a freshly-booted NARF can talk out without
-/// DHCP. Override at boot via `set_default_ipv4` if the actual
-/// network differs.
-pub const QEMU_DEFAULT_IP: [u8; 4] = [10, 0, 2, 15];
-pub const QEMU_DEFAULT_GW: [u8; 4] = [10, 0, 2, 2];
-
 /// Loopback transmit: a frame sent on "lo" is immediately received on
 /// "lo". Linux does the same thing — `loopback_xmit` hands the skb straight
 /// to `netif_rx` rather than to any hardware.
@@ -240,23 +235,33 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
         reserved.retain(|held| *held != name);
         name
     };
-    // De-dup: a same-named iface is replaced, keeping its ifindex.
+    // De-dup: a same-named iface is replaced, keeping its ifindex and the
+    // configuration userspace gave it (admin state, addresses).
+    let old = v.iter().find(|i| i.name == name);
     let ifindex = if name == "lo" {
         1
-    } else if let Some(old) = v.iter().find(|i| i.name == name) {
+    } else if let Some(old) = old {
         old.ifindex
     } else {
         NEXT_IFINDEX.fetch_add(1, Ordering::Relaxed)
+    };
+    // `register_netdevice`: a new device is down (no IFF_UP) and has no
+    // address; userspace (NetworkManager, `ip`) or the boot-time IP
+    // autoconfiguration brings it up and configures it. NARF's `lo` is the
+    // exception: its datapath is permanently up (see `AdminHandle::set_link`).
+    let (ipv4, gateway, link_up) = match old {
+        Some(old) => (old.ipv4, old.gateway, old.link_up),
+        None => ([0; 4], [0; 4], name == "lo"),
     };
     v.retain(|i| i.name != name);
     v.push(NetIfaceEntry {
         name: name.clone(),
         mac,
         send,
-        ipv4: QEMU_DEFAULT_IP,
-        gateway: QEMU_DEFAULT_GW,
+        ipv4,
+        gateway,
         mtu: 1500,
-        link_up: true,
+        link_up,
         net_ns_id: 0,
         ifindex,
         driver: "",
@@ -717,11 +722,34 @@ pub fn set_iface_ipv4(name: &str, ipv4: [u8; 4], gateway: [u8; 4]) {
 /// Automatically installs a connected subnet route. Idempotent.
 pub fn add_addr(iface_name: &str, addr: [u8; 4], prefix_len: u8) {
     crate::ifaddr::iface_add_addr(iface_name, crate::ipv4::Ipv4Addr(addr), prefix_len);
+    // The first address a device gets is its primary: the source address
+    // the stack sends from (Linux `inet_select_addr` picks the primary).
+    let mut g = IFACES.lock();
+    if let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == iface_name))
+    {
+        if entry.ipv4 == [0; 4] {
+            entry.ipv4 = addr;
+        }
+    }
 }
 
-/// Remove an IPv4 address from the named interface.
+/// Remove an IPv4 address from the named interface. Removing the address
+/// the stack sends from moves it to the next remaining address, or leaves
+/// the device with none.
 pub fn del_addr(iface_name: &str, addr: [u8; 4], prefix_len: u8) {
     crate::ifaddr::iface_del_addr(iface_name, crate::ipv4::Ipv4Addr(addr), prefix_len);
+    let next = crate::ifaddr::iface_primary_addr(iface_name).map_or([0; 4], |next| next.addr.0);
+    let mut g = IFACES.lock();
+    if let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == iface_name))
+    {
+        if entry.ipv4 == addr {
+            entry.ipv4 = next;
+        }
+    }
 }
 
 /// Return all IPv4 addresses assigned to the named interface as a

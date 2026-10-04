@@ -115,10 +115,13 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
         [0x02, 0x00, 0x00, 0x00, 0x00, 0x05],
         capture_send,
     );
+    // A device registers down (Linux `register_netdevice`); bring it up
+    // as `ip link set dev <iface> up` would — a down egress forwards nothing.
+    iface::set_link_state(iface_name, true);
     // Configure THIS iface by name, not `set_default_ipv4`, which stamps
     // whatever is FIRST in the (process-global, never-cleared) registry. With
-    // other tests' ifaces ahead of ours, `set_default_ipv4` left this NIC on its
-    // register defaults (10.0.2.15 / gw 10.0.2.2) instead of the caller's
+    // other tests' ifaces ahead of ours, `set_default_ipv4` left this NIC on
+    // whatever it last held instead of the caller's
     // local_ip/gateway — so `connect` sourced the wrong IP and arp-resolved the
     // wrong gateway (unseeded → no SYN emitted). Deterministic on aarch64, where
     // the smaller test set puts these cases first, before anything seeds the

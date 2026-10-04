@@ -212,7 +212,14 @@ the lowest unused number (`dev_alloc_name`): e1000 and virtio-net register as
 `eth%d` and wireless drivers as `wlan%d`, each device under one name in both
 registries (a driver needing its name before registering reserves it). The link dump lists
 exactly one loopback, `lo`, and a running device reports `IFF_LOWER_UP`
-(`dev_get_flags`).
+(`dev_get_flags`). A device registers down (no `IFF_UP`) and with no
+address, as `register_netdevice` leaves it, so a distro network manager finds
+it unconfigured; NARF's `lo` stays permanently up. The first IPv4 address
+configured on a device becomes the address the stack sends from; removing it
+moves that to the next address, or none. The opt-in `qemu-net` feature is the
+equivalent of Linux kernel IP autoconfiguration
+(`ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off`): it brings the primary
+virtio NIC up and configures that address and default route.
 
 When `NETLINK_EXT_ACK` is enabled, a failed mutation carries
 `NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` only where the Linux handler calls
