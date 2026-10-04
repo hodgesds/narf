@@ -901,10 +901,19 @@ impl PageCache {
         }
     }
 
-    /// Whether a slot may be evicted by reclaim at all.
+    /// Whether a slot may be evicted by reclaim at all: a clean folio that
+    /// nobody but the cache references. An extra reference means someone is
+    /// using the folio *as the cache's copy* — a writer updating it in place,
+    /// a reader copying out, a user mapping holding it — and evicting it then
+    /// would let the next lookup refill a second, divergent copy of the same
+    /// file page (Linux reclaim likewise skips folios whose refcount it
+    /// cannot freeze). The count is stable here: every new reference to a
+    /// resident folio is cloned out of the index under this same lock.
     fn evictable(slot: &Slot, max_pages: usize) -> bool {
         match &slot.state {
-            SlotState::Resident { folio, dirty } => !*dirty && folio.page_count() <= max_pages,
+            SlotState::Resident { folio, dirty } => {
+                !*dirty && folio.page_count() <= max_pages && Arc::strong_count(folio) == 1
+            }
             SlotState::Filling { .. } => false,
         }
     }
@@ -1116,6 +1125,59 @@ impl PageCache {
         dropped
     }
 
+    /// Remove EVERY folio (dirty or not) and in-flight fill of
+    /// `(fs_id, inode)` overlapping pages `[first_page, end_page)` — Linux
+    /// `truncate_inode_pages_range`, for truncation and inode eviction where
+    /// the bytes cease to exist. Unlike [`Self::invalidate_range`] nothing is
+    /// kept. Callers that may have the pages mapped into userspace must
+    /// unmap them first; a removed folio stays alive for whoever still holds
+    /// a reference to it. Returns the number of resident base pages dropped.
+    pub fn remove_range(&self, fs_id: u32, inode: u64, first_page: u64, end_page: u64) -> usize {
+        if first_page >= end_page {
+            return 0;
+        }
+        let lo = PageKey {
+            fs_id,
+            inode,
+            page_off: first_page,
+        };
+        let hi = PageKey {
+            fs_id,
+            inode,
+            page_off: end_page,
+        };
+        let mut wake: Vec<Waker> = Vec::new();
+        let mut dropped = 0;
+        let mut removed: Vec<Arc<CacheFolio>> = Vec::new();
+        {
+            let mut g = self.inner.lock();
+            let mut victims: Vec<PageKey> = g.folios.range(lo..hi).map(|(k, _)| *k).collect();
+            if let Some(head) = Self::containing_key(&g, lo) {
+                if head != lo {
+                    victims.push(head);
+                }
+            }
+            for key in victims {
+                match g.folios.remove(&key).map(|slot| slot.state) {
+                    Some(SlotState::Resident { folio, .. }) => {
+                        let pages = folio.page_count();
+                        g.resident_pages = g.resident_pages.saturating_sub(pages);
+                        dropped += pages;
+                        removed.push(folio);
+                    }
+                    Some(SlotState::Filling { waiters, .. }) => wake.extend(waiters),
+                    None => {}
+                }
+            }
+        }
+        // Frames return to the buddy (when last referenced) outside the lock.
+        drop(removed);
+        for w in wake {
+            w.wake();
+        }
+        dropped
+    }
+
     /// Invalidate every resident page and in-flight fill.
     pub fn clear(&self) {
         let wake: Vec<Waker> = {
@@ -1225,6 +1287,164 @@ impl Future for WaitForFill<'_> {
             }
             _ => Poll::Ready(()),
         }
+    }
+}
+
+/// One inode's page cache — Linux `struct address_space`: the single set of
+/// folios through which `read(2)`, `write(2)` and every `MAP_SHARED` mapping
+/// of the inode see its bytes. The filesystem keeps exactly one per
+/// in-memory inode.
+///
+/// Folios here are updated in place (a `write(2)` copies into the cached
+/// folio; a user mapping stores into it directly), so this facade never hands
+/// out `&[u8]` views: bytes move only by copy through [`FileFolio`].
+#[derive(Clone, Debug)]
+pub struct FileMapping {
+    cache: Arc<PageCache>,
+    fs_id: u32,
+    inode: u64,
+}
+
+impl FileMapping {
+    /// A mapping over `cache` for `inode`, which must not be 0 (the block
+    /// device mapping's key).
+    pub fn new(cache: Arc<PageCache>, fs_id: u32, inode: u64) -> Self {
+        assert!(inode != 0, "inode 0 is the block-device mapping");
+        Self {
+            cache,
+            fs_id,
+            inode,
+        }
+    }
+
+    pub fn cache(&self) -> &Arc<PageCache> {
+        &self.cache
+    }
+
+    fn key(&self, page: u64) -> PageKey {
+        PageKey {
+            fs_id: self.fs_id,
+            inode: self.inode,
+            page_off: page,
+        }
+    }
+
+    fn wrap(folio: FolioRef, published: bool) -> FileFolio {
+        FileFolio {
+            page: folio.base.page_off + folio.page_index as u64,
+            data: folio.data,
+            offset: folio.page_index * PAGE_SIZE,
+            published,
+        }
+    }
+
+    /// File page `page`, read by `fill` on a miss (Linux `filemap_read_folio`
+    /// with the filesystem's `->read_folio` as `fill`). See
+    /// [`PageCache::get_or_fill`] for the protocol and errors.
+    pub async fn get_or_fill<F, Fut>(&self, page: u64, fill: F) -> Result<FileFolio, FsError>
+    where
+        F: FnOnce(CacheFolio) -> Fut,
+        Fut: Future<Output = Result<CacheFolio, FsError>>,
+    {
+        let filled = self.cache.get_or_fill(self.key(page), 0, fill).await?;
+        let published = filled.published();
+        Ok(Self::wrap(filled.into_folio(), published))
+    }
+
+    /// The resident page `page`, without filling.
+    pub fn lookup(&self, page: u64) -> Option<FileFolio> {
+        self.cache
+            .lookup_folio(self.key(page))
+            .map(|folio| Self::wrap(folio, true))
+    }
+
+    /// Mark the resident page `page` dirty (it owes a writeback and must
+    /// not be reclaimed). `false` when the page is not resident.
+    pub fn mark_dirty(&self, page: u64) -> bool {
+        self.cache.mark_dirty(self.key(page))
+    }
+
+    /// Hand the dirty pages in `[first_page, end_page)` to writeback,
+    /// clearing their dirty bits (re-mark on failure).
+    pub fn take_dirty(&self, first_page: u64, end_page: u64) -> Vec<FileFolio> {
+        self.cache
+            .take_dirty(self.fs_id, self.inode, first_page, end_page)
+            .into_iter()
+            .map(|(_, folio)| Self::wrap(folio, true))
+            .collect()
+    }
+
+    /// Drop every page from `first_page` on, dirty or not, and void fills of
+    /// them — Linux `truncate_inode_pages`. Returns the pages dropped.
+    pub fn remove_from(&self, first_page: u64) -> usize {
+        self.cache
+            .remove_range(self.fs_id, self.inode, first_page, u64::MAX)
+    }
+}
+
+/// A retained page of a [`FileMapping`]. The bytes are shared with every
+/// other reader, writer and mapping of the file and may change at any time,
+/// so they are only ever copied: there is no `&[u8]` view of them.
+#[derive(Clone, Debug)]
+pub struct FileFolio {
+    page: u64,
+    data: Arc<CacheFolio>,
+    /// Byte offset of this page within `data`.
+    offset: usize,
+    published: bool,
+}
+
+impl FileFolio {
+    /// The file page index.
+    pub const fn page(&self) -> u64 {
+        self.page
+    }
+
+    /// See [`Filled::published`]: `false` means this caller's own fill was
+    /// invalidated while it read, so these bytes are a private, uncached
+    /// snapshot — fine to return from one `read(2)`, never to update in
+    /// place or to map.
+    pub const fn published(&self) -> bool {
+        self.published
+    }
+
+    fn ptr(&self, offset: usize, len: usize) -> *mut u8 {
+        let end = offset.checked_add(len).expect("file folio range overflow");
+        assert!(end <= PAGE_SIZE, "file folio access past its page");
+        // SAFETY: `data` keeps the frame run alive; `self.offset + end` is
+        // within it (one page at a page-aligned offset of the folio).
+        unsafe {
+            self.data
+                .frame
+                .start_address()
+                .kernel_mut_ptr::<u8>()
+                .add(self.offset + offset)
+        }
+    }
+
+    /// Copy `dst.len()` bytes at `offset` within the page out.
+    pub fn read(&self, offset: usize, dst: &mut [u8]) {
+        let src = self.ptr(offset, dst.len());
+        // SAFETY: `ptr` bounds-checked the range inside the retained frame.
+        // The bytes are shared memory (other writers, user mappings): no
+        // Rust reference to them exists, and a racing store yields some mix
+        // of old and new bytes exactly as on Linux.
+        unsafe { core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), dst.len()) }
+    }
+
+    /// Copy `src` into the page at `offset` — the in-place update `write(2)`
+    /// makes to the cache's copy. Only meaningful on a published folio.
+    pub fn write(&self, offset: usize, src: &[u8]) {
+        let dst = self.ptr(offset, src.len());
+        // SAFETY: as `read`; the caller serialises writers of the file.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
+    }
+
+    /// Zero `len` bytes at `offset` (Linux `folio_zero_range`).
+    pub fn zero(&self, offset: usize, len: usize) {
+        let dst = self.ptr(offset, len);
+        // SAFETY: as `write`.
+        unsafe { core::ptr::write_bytes(dst, 0, len) }
     }
 }
 

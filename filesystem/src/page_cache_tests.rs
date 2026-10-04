@@ -270,6 +270,13 @@ fn smoke_page_cache_ordered_folio_lookup_accounting_and_reclaim() -> TestResult 
     if dirty.len() != 1 || dirty[0].0 != key(8) || dirty[0].1.order() != 1 {
         return TestResult::Fail("writeback did not receive the complete folio at its head");
     }
+    // A folio someone still references (the lookup and the writeback batch)
+    // is in use as the cache's copy and is not reclaimable.
+    if cache.reclaimable() != 0 || cache.shrink(2) != 0 {
+        return TestResult::Fail("reclaim evicted a folio that was still referenced");
+    }
+    drop(tail);
+    drop(dirty);
     if cache.shrink(1) != 0 || cache.len() != 2 {
         return TestResult::Fail("reclaim split a folio to satisfy a one-page request");
     }

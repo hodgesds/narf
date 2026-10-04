@@ -80,6 +80,24 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
   removes its own entry when its last `Arc` drops (only if the entry still
   names it); `free_inode` unhashes the number first so a reused number never
   resolves to the freed inode's node.
+- **File data lives in the inode's page cache.** Each node owns a
+  `FileMapping` keyed by `(incarnation << 32) | ino`; the incarnation makes a
+  freed-but-open inode's pages unreachable from a new inode reusing the
+  number. Regular-file `read` copies out of it (`->read_folio` =
+  `read_file_page`, straight from the blocks, never through the block-device
+  mapping, holes and post-EOF bytes zero); `write` is write-through
+  (`generic_perform_write` copying into the cached folio, then
+  `write_file_page` writing the touched blocks from it before returning), so
+  readers and mappings see the bytes at once and the disk has them when
+  `write` returns. Write-through rather than Linux's dirty-and-writeback
+  keeps every POSIX/Linux-observable result (read-after-write, mmap
+  coherence, durability after `fsync`) while needing no writeback for
+  `write(2)`; only stores through mappings dirty pages. A failed block write
+  leaves the page dirty for writeback. `fsync` writes back dirty pages and
+  flushes the device cache. `truncate` zeroes the new last block's tail in
+  the cache and on disk (`block_truncate_page`) and drops every page past the
+  new EOF (`truncate_inode_pages`); directories are read through the
+  block-device mapping, where `dir_mut` maintains them.
 - **Root metadata is real inode metadata.** Mount loads inode 2 and every
   successful inode-2 write refreshes the synchronous `FsInstance::root()`
   snapshot.

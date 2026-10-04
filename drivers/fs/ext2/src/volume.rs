@@ -38,6 +38,7 @@ use super::metadata_csum;
 use super::superblock::{ExtFlavour, Superblock};
 
 mod extent_write;
+mod file_data;
 pub(crate) mod xattr;
 
 /// Cap → DmaBuffer pair owned by an Ext2Volume. The cap is minted
@@ -324,6 +325,8 @@ pub struct Ext2Volume<B: BlockDevice + 'static> {
     /// evicted when its last `Arc` drops (`Ext2Node::drop` removes its own
     /// entry). Never held while a node is dropped or across an `.await`.
     icache: IrqSafeSpinLock<BTreeMap<u32, Weak<super::node::Ext2Node<B>>>>,
+    /// Source of node incarnations; see [`Self::new_file_mapping`].
+    incarnations: core::sync::atomic::AtomicU32,
     /// Serializes whole-inode read/modify/write sequences. Directory
     /// mutations rewrite inodes (parent, target) that have no node in hand,
     /// so this stays volume-wide rather than per node.
@@ -671,6 +674,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             page_cache: page_cache.clone(),
             bdev_mapping: BlockMapping::new(page_cache, 0),
             icache: IrqSafeSpinLock::new(BTreeMap::new()),
+            incarnations: core::sync::atomic::AtomicU32::new(1),
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
             root_inode: IrqSafeSpinLock::new(None),
@@ -1316,6 +1320,22 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         node
     }
 
+    /// A fresh page-cache mapping for a new in-memory inode of `inode_no`.
+    /// The key carries a per-node incarnation in its high half, so the pages
+    /// of a node that outlived its on-disk inode (freed while still open)
+    /// can never be found through the node of a NEW inode that reuses the
+    /// number, and vice versa.
+    pub(crate) fn new_file_mapping(&self, inode_no: u32) -> narf_filesystem::FileMapping {
+        let incarnation = self
+            .incarnations
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        narf_filesystem::FileMapping::new(
+            self.page_cache.clone(),
+            0,
+            (u64::from(incarnation) << 32) | u64::from(inode_no),
+        )
+    }
+
     /// `evict`: forget the icache entry of `inode_no` if it still names the
     /// node at `node` (a racing `iget` may already have replaced it).
     pub(crate) fn icache_evict(&self, inode_no: u32, node: *const super::node::Ext2Node<B>) {
@@ -1916,41 +1936,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
         }
         Ok(())
-    }
-
-    /// Write `src` to `inode` starting at `offset`. Allocates blocks
-    /// as needed via `map_block_alloc`. Extends `inode.size`.
-    pub async fn write_inode_data(
-        &self,
-        inode_no: u32,
-        inode: &mut Inode,
-        offset: u64,
-        src: &[u8],
-    ) -> Result<usize, FsError> {
-        let bs = self.block_size() as u64;
-        let mut total = 0usize;
-        let mut remaining = src.len();
-        let mut cur_off = offset;
-        while remaining > 0 {
-            let logical = cur_off / bs;
-            let in_block = (cur_off % bs) as usize;
-            let n = core::cmp::min(remaining, bs as usize - in_block);
-            let phys = self.map_block_alloc(inode_no, inode, logical).await?;
-            // RMW the block.
-            let mut bbuf = vec![0u8; bs as usize];
-            if in_block != 0 || n != bs as usize {
-                self.read_block(phys, &mut bbuf).await?;
-            }
-            bbuf[in_block..in_block + n].copy_from_slice(&src[total..total + n]);
-            self.write_block(phys, &bbuf).await?;
-            total += n;
-            remaining -= n;
-            cur_off += n as u64;
-        }
-        if cur_off > inode.size as u64 {
-            inode.size = cur_off as u32;
-        }
-        Ok(total)
     }
 
     /// Read the on-disk inode `inode_no`.

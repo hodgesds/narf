@@ -825,6 +825,20 @@ consumer can recognise aliases of the same `(filesystem, inode)` pair.
   zero-copy `&[u8]` views of them sound. Raw insertion
   (`__insert_folio_for_test`) is test-only; production publication goes
   through `get_or_fill`.
+- `FileMapping` is one inode's page cache (Linux `struct address_space`):
+  the single set of folios through which `read(2)`, `write(2)` and every
+  `MAP_SHARED` mapping of the inode see its bytes; a filesystem keeps one per
+  in-memory inode. Its folios are updated in place, so it never hands out
+  `&[u8]`: `FileFolio::read`/`write`/`zero` copy. `get_or_fill` is the same
+  protocol as above (the filesystem's `->read_folio` is the `fill`);
+  `mark_dirty`/`take_dirty` drive writeback; `remove_from(page)` is
+  `truncate_inode_pages` (`PageCache::remove_range`: removes dirty folios and
+  voids fills too — the bytes cease to exist).
+- Reclaim evicts only clean folios whose sole reference is the cache's own.
+  A folio someone holds is in use *as the cache's copy* (a writer updating
+  it, a reader copying out, a user mapping) — evicting it would let the next
+  lookup refill a second, divergent copy (Linux reclaim likewise fails to
+  freeze such a folio's refcount).
 - Lock order / reclaim: the cache lock is an `IrqSafeSpinLock` never held
   across `.await` or while waking; allocation under it relies on
   `narf_memory::reclaim::GLOBAL_ALLOC_RUNS_SHRINKERS == false`, which the
