@@ -213,9 +213,13 @@ the lowest unused number (`dev_alloc_name`): e1000 and virtio-net register as
 exactly one loopback, `lo`, and a running device reports `IFF_LOWER_UP`
 (`dev_get_flags`).
 
-When `NETLINK_EXT_ACK` is enabled, failed requests carry
-`NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` diagnostic describing the rejected
-authority, object-state, interface, validation, or support condition.
+When `NETLINK_EXT_ACK` is enabled, a failed mutation carries
+`NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` only where the Linux handler calls
+`NL_SET_ERR_MSG`, with the handler's text (for example `inet_rtm_deladdr`'s
+"ipv4: Address not found"); the bare `-EPERM` of the capability check carries
+none. Address requests fail in the handlers' order: `inet_validate_rtm`
+(prefix, then `IFA_LOCAL`) before the IPv4 device lookup, and IPv6 address
+extraction before any lookup.
 Without `NETLINK_CAP_ACK`, `nlmsgerr` echoes the complete offending request.
 With CAP_ACK enabled the echo is header-only and marked `NLM_F_CAPPED`; any
 extended-ACK attributes follow the capped request header.

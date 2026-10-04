@@ -681,17 +681,19 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
         },
     )
     .unwrap();
+    // `rtnetlink_rcv_msg` refuses a sender without CAP_NET_ADMIN with a bare
+    // -EPERM: no NL_SET_ERR_MSG, so no extended-ACK message and no
+    // NLM_F_ACK_TLVS.
     let ext_hdr = parse_hdr(&ext_denied[0]).unwrap();
-    assert_ne!(ext_hdr.flags & NLM_F_ACK_TLVS, 0);
+    assert_eq!(ext_hdr.flags & NLM_F_ACK_TLVS, 0);
     let echoed_len = parse_hdr(&request).unwrap().len as usize;
     assert_eq!(
         find_rtattr(
             &ext_denied[0],
             4 + nlmsg_align(echoed_len),
             NLMSGERR_ATTR_MSG
-        )
-        .as_deref(),
-        Some(&b"interface admin capability required\0"[..])
+        ),
+        None
     );
     let capped = build_replies_with_options(
         &request,
@@ -706,11 +708,8 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
     .unwrap();
     let capped_hdr = parse_hdr(&capped[0]).unwrap();
     assert_ne!(capped_hdr.flags & NLM_F_CAPPED, 0);
-    assert_ne!(capped_hdr.flags & NLM_F_ACK_TLVS, 0);
-    assert_eq!(
-        find_rtattr(&capped[0], 20, NLMSGERR_ATTR_MSG).as_deref(),
-        Some(&b"interface admin capability required\0"[..])
-    );
+    assert_eq!(capped_hdr.flags & NLM_F_ACK_TLVS, 0);
+    assert_eq!(find_rtattr(&capped[0], 20, NLMSGERR_ATTR_MSG), None);
 
     let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
     let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
