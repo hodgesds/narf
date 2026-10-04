@@ -620,10 +620,26 @@ unsafe impl<T: 'static> BpfType for ArenaPtr<T> {
 /// structurally, while `ValidityDomain::NonPreemptible` makes the value die at
 /// an await. Do not replace the domain with `Owned`: that would retain the
 /// release obligation but incorrectly make a guard sleep-safe.
+///
+/// The Rust wrapper is also `!Send`. That is a kernel-side backstop rather
+/// than a substitute for verification: a `kfunc!` async shim must produce a
+/// `Send` future, so an implementation cannot capture a guard across its own
+/// `.await`, while the verifier applies the equivalent rule to values held by
+/// the BPF program.
+///
+/// ```compile_fail
+/// fn needs_send<T: Send>() {}
+/// needs_send::<narf_bpf::Guard<'static>>();
+/// ```
+#[must_use = "a BPF lock guard must be returned to its release kfunc"]
 #[derive(Debug)]
 pub struct Guard<'a> {
     token: u64,
     _lock: PhantomData<&'a ()>,
+    // As for `IrqSafeSpinLockGuard`, a raw-pointer marker makes the wrapper
+    // `!Send` and `!Sync` without adding storage. This prevents a kernel Rust
+    // future from carrying the guard between polls or CPUs.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Guard<'_> {
@@ -653,6 +669,7 @@ unsafe impl BpfType for Guard<'_> {
         Self {
             token: raw,
             _lock: PhantomData,
+            _not_send: PhantomData,
         }
     }
     #[inline]

@@ -93,7 +93,7 @@ bpf-bench`.
 | `&mut MaybeUninit<T>` | callee initialises | `__uninit` |
 | `ArenaPtr<T>` | arena-space pointer | `KF_ARENA_ARG*` |
 | `Const<N>` | verified constant | `__k` |
-| `Guard<'_>` | critical-section guard; structurally linear through `PtrKind::LockGuard`, and independently sleep-unsafe through `NonPreemptible` | `bpf_spin_lock` |
+| `Guard<'_>` | critical-section guard; structurally linear through `PtrKind::LockGuard`, independently sleep-unsafe through `NonPreemptible`, and `!Send` in kernel Rust | `bpf_spin_lock` |
 
 Descriptors go into a `narf.kfuncs` link section, collected at boot exactly as
 `narf-kernel-test` collects `narf.tests`.
@@ -629,7 +629,11 @@ At an await point, every live register whose `ValidityDomain` fails
 `survives_await()` is killed. A `may_suspend` kfunc also rejects such a pointer
 in its argument registers even when the register is dead after the call,
 because the boxed shim future can retain its converted Rust argument while
-pending. No separate lock-held check, no `bpf_rcu_read_lock` equivalent.
+pending. `Guard<'_>` is additionally `!Send`, so the macro's `Send` future
+bound prevents a kernel-side async kfunc implementation from carrying one
+across its own `.await`. This is a backstop for Rust code, not a replacement
+for verifying hostile BPF. No separate lock-held check, no
+`bpf_rcu_read_lock` equivalent.
 
 **4.5 — Sleepability is declared by the hook, not by the program.** A program
 verified for `Context::Atomic` cannot attach to a sleepable hook or vice
@@ -981,6 +985,8 @@ and the perf event layer, all of which are closed.
     smokes derive both descriptors from the public `Guard<'_>` Rust type and
     exercise balanced release, leak rejection, and await rejection through a
     real program load; verifier host tests separately pin the structural rule.
+    The Rust wrapper is also `!Send`, making an async kfunc that captures it
+    across `.await` fail the macro's `Send` future bound at compile time.
 11. **`bpf(2)` load latency has no yield point, and verification dominates
     it.** Measured by `cargo xtask bpf-bench` (N = 60, same runner caveat as
     item 7), for one `BpfProg::load` of a 64-instruction straight-line
