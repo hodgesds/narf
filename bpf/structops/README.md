@@ -43,6 +43,12 @@ an interpreted, heap-stack-backed BPF invocation. The future is `Send`, retains
 its VM state and fuel across polls, and restores BPF domain rights before every
 `Pending`. There is intentionally no generated synchronous wrapper.
 
+A `#[context(Mixed)]` target can combine both call surfaces. Its ordinary
+methods are marked `#[context(Atomic)]`; its `async fn` methods are marked
+`#[context(Sleepable)]`. Each generated builder and dispatcher uses the
+method-level context, so placing both kinds in one trait does not let an atomic
+hook call a sleepable program.
+
 ## Relationships and no_std
 
 This crate depends on the parent `narf-bpf` runtime (for the interpreter entry

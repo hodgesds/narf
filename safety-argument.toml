@@ -1322,3 +1322,17 @@ argument = "A sleepable program is loaded and dispatched only through an exact i
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The object-safe hook exposes only a boxed Send future and generates no synchronous block_on path. Dropping it cancels the VM and nested kfunc future by ownership. Link close and replacement release-store a shared admission gate: calls admitted earlier may finish from retained Arc state, while later calls take the declared async fallback without entering BPF. No pointer-bearing context or physical-to-frame translation API is introduced."
+
+# Mixed-context struct-ops. The dedicated security-review skill was not
+# available in this session; human security review remains mandatory.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Mixed targets remain inside the existing untrusted BPF runtime and struct-ops seam. They modify no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model implementation and add no subsystem or execution primitive to the TCB."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Each mixed-target method retains its own immutable context, scalar ABI, closed kfunc allowlist, fuel budget, and fallback contract. The macro accepts only ordinary fn for Atomic and async fn for Sleepable, method-specific loading checks the exact context, and dispatch selects the corresponding exact-contract entry point. The target-level Mixed marker grants no permission and validation requires both method kinds."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Atomic and sleepable methods share only the existing Arc-owned adapter, program set, generation, and release/acquire admission gate. They do not share VM stacks or domain guards. Link close and replacement stop new calls of both kinds; previously admitted sleepable futures retain their existing owned-state completion and cancellation rules. No pointer-bearing context or physical-to-frame translation API is added."

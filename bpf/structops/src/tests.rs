@@ -171,6 +171,37 @@ crate::struct_ops! {
 }
 
 crate::struct_ops! {
+    /// Test target combining immediate and future-returning operations.
+    #[target("narf.test.MixedDemo")]
+    #[version(1)]
+    #[context(Mixed)]
+    #[cap(IdleGovernor)]
+    #[install(install_bpf_mixed_demo)]
+    #[desc(MIXED_DEMO_OPS)]
+    #[adapter(BpfMixedDemo)]
+    #[builder(BpfMixedDemoPrograms)]
+    #[commit(commit_mixed_demo)]
+    #[detach(detach_mixed_demo)]
+    pub trait MixedDemo {
+        /// Execute without suspension.
+        #[context(Atomic)]
+        #[fallback(fallback_select)]
+        #[validate(validate_select)]
+        #[fuel(32)]
+        #[kfuncs()]
+        fn immediate(&self, value: u64) -> u32;
+
+        /// Execute through the sleepable interpreter.
+        #[context(Sleepable)]
+        #[fallback(fallback_sleepable)]
+        #[validate(validate_sleepable)]
+        #[fuel(32)]
+        #[kfuncs(narf_bpf::kfunc::id_for("narf_structops_test_suspend"))]
+        async fn deferred(&self, value: u64) -> u32;
+    }
+}
+
+crate::struct_ops! {
     /// Test target for future-returning, process-context struct ops.
     #[target("narf.test.SleepableDemo")]
     #[version(1)]
@@ -230,6 +261,14 @@ struct SleepableLiveEntry {
 }
 
 static LIVE_SLEEPABLE: narf_lib::sync::IrqSafeSpinLock<Option<SleepableLiveEntry>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+struct MixedLiveEntry {
+    generation: u64,
+    ops: Arc<dyn MixedDemo>,
+}
+
+static LIVE_MIXED: narf_lib::sync::IrqSafeSpinLock<Option<MixedLiveEntry>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 fn commit_demo_governor<M: CapType>(
@@ -302,6 +341,39 @@ fn live_sleepable() -> Option<Arc<dyn SleepableDemo>> {
         .map(|entry| entry.ops.clone())
 }
 
+fn commit_mixed_demo<M: CapType>(
+    cap: &Cap<M, Grant>,
+    generation: u64,
+    ops: Arc<BpfMixedDemo>,
+) -> Result<(), crate::structops::StructOpsError> {
+    cap.check_live()?;
+    let old = LIVE_MIXED
+        .lock()
+        .replace(MixedLiveEntry { generation, ops });
+    drop(old);
+    Ok(())
+}
+
+fn detach_mixed_demo(generation: u64) -> bool {
+    let old = {
+        let mut slot = LIVE_MIXED.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            slot.take()
+        } else {
+            return false;
+        }
+    };
+    drop(old);
+    true
+}
+
+fn live_mixed() -> Option<Arc<dyn MixedDemo>> {
+    LIVE_MIXED.lock().as_ref().map(|entry| entry.ops.clone())
+}
+
 fn live_select(expected_idle_ns: u64) -> Option<u32> {
     let governor = LIVE_GOVERNOR
         .lock()
@@ -361,7 +433,11 @@ fn smoke_bpf_structops_descriptor_is_complete() -> TestResult {
     else {
         return TestResult::Fail("descriptor was not linked");
     };
-    if desc.version != 1 || desc.cap != CapKind::IdleGovernor || desc.methods.len() != 2 {
+    if desc.version != 1
+        || desc.cap != CapKind::IdleGovernor
+        || desc.context != crate::StructOpsContext::Atomic
+        || desc.methods.len() != 2
+    {
         return TestResult::Fail("target metadata is incomplete");
     }
     let method = &desc.methods[0];
@@ -378,6 +454,38 @@ fn smoke_bpf_structops_descriptor_is_complete() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("bpf/structops", smoke_bpf_structops_descriptor_is_complete);
+
+fn smoke_bpf_structops_rejects_inconsistent_target_context() -> TestResult {
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let empty = crate::structops::ProgSet::default();
+
+    let mut false_mixed = DEMO_GOVERNOR_OPS;
+    false_mixed.context = crate::StructOpsContext::Mixed;
+    if !matches!(
+        crate::structops::validate(&false_mixed, &cap, &empty),
+        Err(crate::structops::StructOpsError::MalformedDescriptor(
+            "DemoGovernor"
+        ))
+    ) {
+        return TestResult::Fail("mixed target without both contexts was accepted");
+    }
+
+    let mut false_atomic = MIXED_DEMO_OPS;
+    false_atomic.context = crate::StructOpsContext::Atomic;
+    if !matches!(
+        crate::structops::validate(&false_atomic, &cap, &empty),
+        Err(crate::structops::StructOpsError::MalformedDescriptor(
+            "deferred"
+        ))
+    ) {
+        return TestResult::Fail("atomic target containing a sleepable method was accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_structops_rejects_inconsistent_target_context
+);
 
 fn smoke_bpf_structops_builder_and_link_lifetime() -> TestResult {
     let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
@@ -722,7 +830,7 @@ fn smoke_bpf_sleepable_structops_detach_preserves_inflight() -> TestResult {
         Ok(link) => link,
         Err(_) => return TestResult::Fail("sleepable target failed to install"),
     };
-    if SLEEPABLE_DEMO_OPS.context != Context::Sleepable
+    if SLEEPABLE_DEMO_OPS.context != crate::StructOpsContext::Sleepable
         || SLEEPABLE_DEMO_OPS
             .methods
             .iter()
@@ -836,4 +944,93 @@ fn smoke_bpf_sleepable_structops_validates_before_return() -> TestResult {
 kernel_test_in!(
     "bpf/structops",
     smoke_bpf_sleepable_structops_validates_before_return
+);
+
+fn smoke_bpf_mixed_structops_dispatches_each_context() -> TestResult {
+    let atomic = MIXED_DEMO_OPS
+        .methods
+        .iter()
+        .find(|method| method.name == "immediate");
+    let sleepable = MIXED_DEMO_OPS
+        .methods
+        .iter()
+        .find(|method| method.name == "deferred");
+    if MIXED_DEMO_OPS.context != crate::StructOpsContext::Mixed
+        || atomic.map(|method| method.context) != Some(Context::Atomic)
+        || sleepable.map(|method| method.context) != Some(Context::Sleepable)
+    {
+        return TestResult::Fail("mixed descriptor lost a method execution context");
+    }
+
+    if !matches!(
+        BpfMixedDemoPrograms::new().immediate(
+            load_cap(),
+            request(
+                "mixed_atomic_wrong_context",
+                asm(&[mov_imm(0, 1), EXIT]),
+                Context::Sleepable,
+            ),
+        ),
+        Err(LoadError::StructOpsContextMismatch)
+    ) {
+        return TestResult::Fail("mixed atomic method accepted a sleepable program");
+    }
+    if !matches!(
+        BpfMixedDemoPrograms::new().deferred(
+            load_cap(),
+            request(
+                "mixed_sleepable_wrong_context",
+                asm(&[mov_imm(0, 1), EXIT]),
+                Context::Atomic,
+            ),
+        ),
+        Err(LoadError::StructOpsContextMismatch)
+    ) {
+        return TestResult::Fail("mixed sleepable method accepted an atomic program");
+    }
+
+    let programs = match BpfMixedDemoPrograms::new().immediate(
+        load_cap(),
+        request(
+            "mixed_immediate",
+            asm(&[ldx(0, 1, 0), alu_reg(AluOp::Add, 0, 0), EXIT]),
+            Context::Atomic,
+        ),
+    ) {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("mixed atomic method-specific load was rejected"),
+    };
+    let programs = match programs.deferred(load_cap(), sleepable_program("mixed_deferred", 7)) {
+        Ok(programs) => programs,
+        Err(_) => return TestResult::Fail("mixed sleepable method-specific load was rejected"),
+    };
+    let cap = Cap::<IdleGovInstall, Grant>::bootstrap();
+    let link = match install_bpf_mixed_demo(&cap, programs) {
+        Ok(link) => link,
+        Err(_) => return TestResult::Fail("mixed target failed to install"),
+    };
+    let Some(ops) = live_mixed() else {
+        return TestResult::Fail("mixed adapter was not published");
+    };
+    if ops.immediate(21) != 42 {
+        return TestResult::Fail("mixed atomic method did not use atomic dispatch");
+    }
+    let future: crate::StructOpsFuture<'_, u32> = ops.deferred(99);
+    assert_send(&future);
+    if narf_bpf::interp::drive(future) != 7 {
+        return TestResult::Fail("mixed sleepable method did not use async dispatch");
+    }
+
+    link.close();
+    if live_mixed().is_some() || crate::structops::is_installed("MixedDemo") {
+        return TestResult::Fail("mixed link close did not detach the live adapter");
+    }
+    if ops.immediate(1) != 11 || narf_bpf::interp::drive(ops.deferred(3)) != 43 {
+        return TestResult::Fail("mixed retained adapter bypassed fallback after detach");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "bpf/structops",
+    smoke_bpf_mixed_structops_dispatches_each_context
 );

@@ -1654,10 +1654,8 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
     ) -> Option<Outcome> {
-        // Contract-bound programs have a distinct exact-contract dispatcher.
-        // Sleepable struct-ops will gain an equivalent async dispatcher when
-        // its future-returning hook ABI lands; generic execution cannot bypass
-        // that attachment boundary in the meantime.
+        // Contract-bound programs have a distinct exact-contract dispatcher;
+        // generic execution cannot bypass that attachment boundary.
         if self.struct_ops.is_some() {
             return None;
         }

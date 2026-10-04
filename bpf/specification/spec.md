@@ -498,8 +498,12 @@ impl BpfProg {
 }
 ```
 
-`StructOpsDesc::context` classifies the whole target. Every method descriptor
-must carry the same context; mixed atomic/sleepable targets are rejected.
+`StructOpsDesc::context` is a `StructOpsContext` target-shape descriptor:
+`Atomic`, `Sleepable`, or `Mixed`. It does not authorize execution. Every
+method's `MethodDesc::context` is retained in the immutable
+`StructOpsContract`, checked during load, and checked again by the exact
+dispatcher. Descriptor validation rejects a `Mixed` target unless it contains
+at least one method of each kind.
 
 The macro emits a target-specific program builder and installation returns an
 owning, generation-tagged `StructOpsLink`. Closing or dropping the link detaches
@@ -514,6 +518,13 @@ those to the object-safe `StructOpsFuture<'a, T>` ABI and dispatches through
 `BpfProg::run_struct_ops_sleepable`. The future is `Send`, owns its heap stack,
 and may be cancelled by drop. A synchronous adapter may not conceal it with
 `block_on`.
+
+A target marked `#[context(Mixed)]` marks each ordinary method
+`#[context(Atomic)]` and each `async fn` method `#[context(Sleepable)]`. The
+macro grammar rejects the inverse pairings. Only the sleepable declarations
+lower to `StructOpsFuture`; atomic declarations retain the ordinary call ABI.
+Both kinds share one attachment generation and admission gate, while their
+load and dispatch contracts remain method-specific.
 
 The owning link and adapter share an invocation-admission gate. Close or
 replacement prevents a retained adapter from starting another BPF invocation,

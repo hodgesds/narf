@@ -116,10 +116,36 @@ pub struct StructOpsDesc {
     pub version: u32,
     /// Capability required to install this target.
     pub cap: CapKind,
-    /// Execution context shared by every method in this target.
-    pub context: Context,
+    /// Execution-context shape of the target.
+    pub context: StructOpsContext,
     /// Methods in declaration order.
     pub methods: &'static [MethodDesc],
+}
+
+/// Execution-context shape exposed by one struct-ops target.
+///
+/// The method descriptor remains authoritative for verification and dispatch;
+/// this target-level value describes whether one Rust trait contains atomic
+/// methods, sleepable methods, or both kinds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StructOpsContext {
+    /// Every method is an ordinary non-suspending call.
+    Atomic,
+    /// Every method returns a [`crate::StructOpsFuture`].
+    Sleepable,
+    /// Ordinary atomic and future-returning sleepable methods coexist.
+    Mixed,
+}
+
+impl StructOpsContext {
+    const fn permits(self, context: Context) -> bool {
+        matches!(
+            (self, context),
+            (Self::Atomic, Context::Atomic)
+                | (Self::Sleepable, Context::Sleepable)
+                | (Self::Mixed, Context::Atomic | Context::Sleepable)
+        )
+    }
 }
 
 impl StructOpsDesc {
@@ -248,18 +274,27 @@ pub fn validate<M: CapType>(
     {
         return Err(StructOpsError::MalformedDescriptor(desc.name));
     }
+    let mut has_atomic = false;
+    let mut has_sleepable = false;
     for (index, method) in desc.methods.iter().enumerate() {
+        has_atomic |= method.context == Context::Atomic;
+        has_sleepable |= method.context == Context::Sleepable;
         if method.id == 0
             || method.abi_hash == 0
             || method.fallback.is_empty()
             || method.fuel == 0
-            || method.context != desc.context
+            || !desc.context.permits(method.context)
             || desc.methods[..index]
                 .iter()
                 .any(|earlier| earlier.id == method.id)
         {
             return Err(StructOpsError::MalformedDescriptor(method.name));
         }
+    }
+    if desc.context == StructOpsContext::Mixed && !(has_atomic && has_sleepable) {
+        return Err(StructOpsError::MalformedDescriptor(desc.name));
+    }
+    for method in desc.methods {
         if !method.optional && !set.binds(method.id) {
             return Err(StructOpsError::MissingMethod(method.name));
         }
@@ -613,368 +648,311 @@ pub const fn is_optional(name: &str, list: &[&str]) -> bool {
     false
 }
 
-/// Declare a contract-bound BPF implementation of a pluggable trait.
-///
-/// Atomic targets use ordinary methods. A target marked
-/// `#[context(Sleepable)]` uses `async fn` declarations; the generated trait
-/// lowers them to the object-safe [`crate::StructOpsFuture`] ABI.
-#[macro_export]
-macro_rules! struct_ops {
-    ($(
-        $(#[doc = $tdoc:literal])*
-        #[target($target:literal)]
-        #[version($version:literal)]
-        #[context(Sleepable)]
-        #[cap($cap:ident)]
-        #[install($install:ident)]
-        #[desc($descname:ident)]
-        #[adapter($adapter:ident)]
-        #[builder($builder:ident)]
-        #[commit($commit:path)]
-        #[detach($detach:path)]
-        $(#[optional($($optm:ident),* $(,)?)])?
-        $vis:vis trait $trait_name:ident {
-            $(
-                $(#[doc = $mdoc:literal])*
-                #[fallback($fallback:path)]
-                #[validate($result:path)]
-                #[fuel($fuel:expr)]
-                #[kfuncs($($kfunc:expr),* $(,)?) ]
-                async fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
-            )*
-        }
-    )*) => {
-        $crate::__sleepable_struct_ops_impl! {$(
-            $(#[doc = $tdoc])*
-            #[target($target)]
-            #[version($version)]
-            #[cap($cap)]
-            #[install($install)]
-            #[desc($descname)]
-            #[adapter($adapter)]
-            #[builder($builder)]
-            #[commit($commit)]
-            #[detach($detach)]
-            $(#[optional($($optm),*)])?
-            $vis trait $trait_name {
-                $(
-                    $(#[doc = $mdoc])*
-                    #[fallback($fallback)]
-                    #[validate($result)]
-                    #[fuel($fuel)]
-                    #[kfuncs($($kfunc),*)]
-                    async fn $method(&self $(, $pname : $pty)*) -> $mret;
-                )*
-            }
-        )*}
-    };
-
-    ($(
-        $(#[doc = $tdoc:literal])*
-        #[target($target:literal)]
-        #[version($version:literal)]
-        #[cap($cap:ident)]
-        #[install($install:ident)]
-        #[desc($descname:ident)]
-        #[adapter($adapter:ident)]
-        #[builder($builder:ident)]
-        #[commit($commit:path)]
-        #[detach($detach:path)]
-        $(#[optional($($optm:ident),* $(,)?)])?
-        $vis:vis trait $trait_name:ident {
-            $(
-                $(#[doc = $mdoc:literal])*
-                #[fallback($fallback:path)]
-                #[validate($result:path)]
-                #[fuel($fuel:expr)]
-                #[kfuncs($($kfunc:expr),* $(,)?) ]
-                fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
-            )*
-        }
-    )*) => {$(
-        $(#[doc = $tdoc])*
-        $vis trait $trait_name: Send + Sync + 'static {
-            $(
-                $(#[doc = $mdoc])*
-                fn $method(&self $(, $pname: $pty)*) -> $mret;
-            )*
-        }
-
-        $vis const $descname: $crate::structops::StructOpsDesc = {
-            const OPTIONAL: &[&str] = &[$($(stringify!($optm)),*)?];
-            $crate::structops::StructOpsDesc {
-                name: stringify!($trait_name),
-                target: $target,
-                target_id: $crate::structops::fnv1a64($target),
-                version: $version,
-                cap: $crate::reexport::CapKind::$cap,
-                context: $crate::verifier::Context::Atomic,
-                methods: &[$(
-                    $crate::structops::MethodDesc {
-                        name: stringify!($method),
-                        id: $crate::structops::fnv1a32(concat!(
-                            $target,
-                            "::",
-                            stringify!($method),
-                        )),
-                        abi_hash: $crate::structops::fnv1a64(concat!(
-                            $target,
-                            "@",
-                            stringify!($version),
-                            "::",
-                            stringify!($method),
-                            "::",
-                            stringify!(fn($($pty),*) -> $mret),
-                        )),
-                        ctx: &[$(<$pty as $crate::structops::BpfCtxArg>::DESC),*],
-                        ret: <$mret as $crate::types::BpfRet>::DESC,
-                        allowed_kfuncs: &[$($kfunc),*],
-                        context: $crate::verifier::Context::Atomic,
-                        fuel: $fuel,
-                        fallback: stringify!($fallback),
-                        optional: $crate::structops::is_optional(
-                            stringify!($method),
-                            OPTIONAL,
-                        ),
-                    },
-                )*],
-            }
-        };
-
-        const _: () = {
-            #[used]
-            #[link_section = "narf.structops"]
-            static ENTRY: $crate::structops::StructOpsDesc = $descname;
-        };
-
-        /// Target-specific, method-safe program builder.
-        #[derive(Debug, Default)]
-        $vis struct $builder {
-            $($method: ::core::option::Option<$crate::runtime::Arc<$crate::runtime::BpfProg>>,)*
-        }
-
-        #[allow(dead_code)]
-        impl $builder {
-            /// Start an empty target-specific program set.
-            #[must_use]
-            $vis fn new() -> Self {
-                Self::default()
-            }
-
-            $(
-                #[doc = concat!("Verify and bind `", stringify!($method), "`.")]
-                $vis fn $method(
-                    mut self,
-                    cap: &$crate::reexport::Cap<
-                        $crate::runtime::BpfProgLoad,
-                        $crate::reexport::Grant,
-                    >,
-                    req: $crate::runtime::LoadRequest,
-                ) -> ::core::result::Result<Self, $crate::runtime::LoadError> {
-                    let id = $crate::structops::fnv1a32(concat!(
-                        $target,
-                        "::",
-                        stringify!($method),
-                    ));
-                    let method = $descname
-                        .method(id)
-                        .expect("generated struct_ops method missing from descriptor");
-                    self.$method = ::core::option::Option::Some(
-                        $crate::runtime::BpfProg::load_for_struct_ops(
-                            cap,
-                            req,
-                            method.contract($descname.target_id),
-                        )?,
-                    );
-                    ::core::result::Result::Ok(self)
-                }
-            )*
-
-            fn into_set(self) -> $crate::structops::ProgSet {
-                let mut set = $crate::structops::ProgSet::default();
-                $(
-                    if let ::core::option::Option::Some(prog) = self.$method {
-                        set.bind(
-                            $crate::structops::fnv1a32(concat!(
-                                $target,
-                                "::",
-                                stringify!($method),
-                            )),
-                            prog,
-                        );
-                    }
-                )*
-                set
-            }
-        }
-
-        /// Generated Rust adapter used by the subsystem's live slot.
-        #[derive(Debug)]
-        $vis struct $adapter {
-            progs: $crate::structops::ProgSet,
-            state: $crate::runtime::Arc<$crate::structops::AttachmentState>,
-        }
-
-        impl $adapter {
-            fn new(
-                progs: $crate::structops::ProgSet,
-                state: $crate::runtime::Arc<$crate::structops::AttachmentState>,
-            ) -> Self {
-                Self { progs, state }
-            }
-        }
-
-        impl $trait_name for $adapter {
-            $(
-                fn $method(&self $(, $pname: $pty)*) -> $mret {
-                    if !self.state.admit() {
-                        return $fallback($($pname),*);
-                    }
-                    const _: () = {
-                        let arity = 0usize $(+ { let _ = stringify!($pname); 1 })*;
-                        assert!(arity <= $crate::interp::MAX_CTX_WORDS);
-                    };
-                    let id = $crate::structops::fnv1a32(concat!(
-                        $target,
-                        "::",
-                        stringify!($method),
-                    ));
-                    let method = $descname
-                        .method(id)
-                        .expect("generated struct_ops method missing from descriptor");
-                    let contract = method.contract($descname.target_id);
-                    #[allow(unused_mut)]
-                    let mut ctx = [0u64; $crate::interp::MAX_CTX_WORDS];
-                    #[allow(unused_mut)]
-                    let mut len = 0usize;
-                    $(
-                        ctx[len] = <$pty as $crate::structops::BpfCtxArg>::encode($pname);
-                        len += 1;
-                    )*
-                    match self.progs.get(id) {
-                        ::core::option::Option::Some(prog) => {
-                            match prog.run_struct_ops_atomic(contract, ctx, len) {
-                                ::core::option::Option::Some(
-                                    $crate::interp::Outcome::Returned(raw),
-                                ) => $result(raw).unwrap_or_else(|| $fallback($($pname),*)),
-                                ::core::option::Option::Some(
-                                    $crate::interp::Outcome::Trapped(_),
-                                ) | ::core::option::Option::None => $fallback($($pname),*),
-                            }
-                        }
-                        ::core::option::Option::None => $fallback($($pname),*),
-                    }
-                }
-            )*
-        }
-
-        #[doc = concat!("Install a contract-bound `", stringify!($trait_name), "` set.")]
-        $vis fn $install<M: $crate::reexport::CapType>(
-            cap: &$crate::reexport::Cap<M, $crate::reexport::Grant>,
-            builder: $builder,
-        ) -> ::core::result::Result<
-            $crate::structops::StructOpsLink,
-            $crate::structops::StructOpsError,
-        > {
-            let set = builder.into_set();
-            // Complete every allocation before the transaction permit is
-            // acquired and before the subsystem publishes anything.
-            let state = $crate::runtime::Arc::new(
-                $crate::structops::AttachmentState::new(),
-            );
-            let adapter = $crate::runtime::Arc::new(
-                $adapter::new(set.clone(), state.clone()),
-            );
-            let prepared = $crate::structops::prepare_install(
-                &$descname,
-                cap,
-                set,
-                state.clone(),
-            )?;
-            let generation = prepared.generation();
-            $commit(cap, generation, adapter)?;
-            ::core::result::Result::Ok($crate::structops::finish_install(
-                prepared,
-                $detach,
-            ))
-        }
-    )*};
-}
-
-/// Implementation arm for sleepable `struct_ops!` targets.
+/// Parse a mixed-context target into one canonical method list.
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __sleepable_struct_ops_impl {
-    ($(
-        $(#[doc = $tdoc:literal])*
-        #[target($target:literal)]
-        #[version($version:literal)]
-        #[cap($cap:ident)]
-        #[install($install:ident)]
-        #[desc($descname:ident)]
-        #[adapter($adapter:ident)]
-        #[builder($builder:ident)]
-        #[commit($commit:path)]
-        #[detach($detach:path)]
-        $(#[optional($($optm:ident),* $(,)?)])?
-        $vis:vis trait $trait_name:ident {
-            $(
-                $(#[doc = $mdoc:literal])*
-                #[fallback($fallback:path)]
-                #[validate($result:path)]
-                #[fuel($fuel:expr)]
-                #[kfuncs($($kfunc:expr),* $(,)?) ]
-                async fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
-            )*
+macro_rules! __mixed_struct_ops_parse {
+    (
+        @parse
+        [$($header:tt)*]
+        [$($methods:tt)*]
+    ) => {
+        $crate::__struct_ops_emit! {
+            [$($header)*]
+            [$($methods)*]
         }
-    )*) => {$ (
+    };
+
+    (
+        @parse
+        [$($header:tt)*]
+        [$($methods:tt)*]
+        $(#[doc = $mdoc:literal])*
+        #[context(Atomic)]
+        #[fallback($fallback:path)]
+        #[validate($result:path)]
+        #[fuel($fuel:expr)]
+        #[kfuncs($($kfunc:expr),* $(,)?) ]
+        fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
+        $($rest:tt)*
+    ) => {
+        $crate::__mixed_struct_ops_parse! {
+            @parse
+            [$($header)*]
+            [
+                $($methods)*
+                (
+                    Atomic
+                    [$(#[doc = $mdoc])*]
+                    [$fallback]
+                    [$result]
+                    [$fuel]
+                    [$($kfunc),*]
+                    [$method]
+                    [$($pname : $pty),*]
+                    [$mret]
+                )
+            ]
+            $($rest)*
+        }
+    };
+
+    (
+        @parse
+        [$($header:tt)*]
+        [$($methods:tt)*]
+        $(#[doc = $mdoc:literal])*
+        #[context(Sleepable)]
+        #[fallback($fallback:path)]
+        #[validate($result:path)]
+        #[fuel($fuel:expr)]
+        #[kfuncs($($kfunc:expr),* $(,)?) ]
+        async fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
+        $($rest:tt)*
+    ) => {
+        $crate::__mixed_struct_ops_parse! {
+            @parse
+            [$($header)*]
+            [
+                $($methods)*
+                (
+                    Sleepable
+                    [$(#[doc = $mdoc])*]
+                    [$fallback]
+                    [$result]
+                    [$fuel]
+                    [$($kfunc),*]
+                    [$method]
+                    [$($pname : $pty),*]
+                    [$mret]
+                )
+            ]
+            $($rest)*
+        }
+    };
+}
+
+/// Emit one Rust trait method from a mixed-context declaration.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __struct_ops_trait_method {
+    (Atomic [$(#[doc = $mdoc:literal])*] [$method:ident] [$($pname:ident : $pty:ty),*] [$mret:ty]) => {
+        $(#[doc = $mdoc])*
+        fn $method(&self $(, $pname: $pty)*) -> $mret;
+    };
+    (Sleepable [$(#[doc = $mdoc:literal])*] [$method:ident] [$($pname:ident : $pty:ty),*] [$mret:ty]) => {
+        $(#[doc = $mdoc])*
+        fn $method<'a>(&'a self, $($pname: $pty),*) -> $crate::StructOpsFuture<'a, $mret>;
+    };
+}
+
+/// Emit one method descriptor from a mixed-context declaration.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __struct_ops_method_desc {
+    (
+        Atomic [$target:literal] [$version:literal] [$optional:ident]
+        [$fallback:path] [$result:path] [$fuel:expr] [$($kfunc:expr),*]
+        [$method:ident] [$($pname:ident : $pty:ty),*] [$mret:ty]
+    ) => {
+        $crate::structops::MethodDesc {
+            name: stringify!($method),
+            id: $crate::structops::fnv1a32(concat!($target, "::", stringify!($method))),
+            abi_hash: $crate::structops::fnv1a64(concat!(
+                $target,
+                "@",
+                stringify!($version),
+                "::",
+                stringify!($method),
+                "::",
+                stringify!(fn($($pty),*) -> $mret),
+            )),
+            ctx: &[$(<$pty as $crate::structops::BpfCtxArg>::DESC),*],
+            ret: <$mret as $crate::types::BpfRet>::DESC,
+            allowed_kfuncs: &[$($kfunc),*],
+            context: $crate::verifier::Context::Atomic,
+            fuel: $fuel,
+            fallback: stringify!($fallback),
+            optional: $crate::structops::is_optional(stringify!($method), $optional),
+        }
+    };
+    (
+        Sleepable [$target:literal] [$version:literal] [$optional:ident]
+        [$fallback:path] [$result:path] [$fuel:expr] [$($kfunc:expr),*]
+        [$method:ident] [$($pname:ident : $pty:ty),*] [$mret:ty]
+    ) => {
+        $crate::structops::MethodDesc {
+            name: stringify!($method),
+            id: $crate::structops::fnv1a32(concat!($target, "::", stringify!($method))),
+            abi_hash: $crate::structops::fnv1a64(concat!(
+                $target,
+                "@",
+                stringify!($version),
+                "::async::",
+                stringify!($method),
+                "::",
+                stringify!(fn($($pty),*) -> $mret),
+            )),
+            ctx: &[$(<$pty as $crate::structops::BpfCtxArg>::DESC),*],
+            ret: <$mret as $crate::types::BpfRet>::DESC,
+            allowed_kfuncs: &[$($kfunc),*],
+            context: $crate::verifier::Context::Sleepable,
+            fuel: $fuel,
+            fallback: stringify!($fallback),
+            optional: $crate::structops::is_optional(stringify!($method), $optional),
+        }
+    };
+}
+
+/// Emit one adapter method from a mixed-context declaration.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __struct_ops_adapter_method {
+    (
+        Atomic [$target:literal] [$descname:ident]
+        [$fallback:path] [$result:path]
+        [$method:ident] [$($pname:ident : $pty:ty),*] [$mret:ty]
+    ) => {
+        fn $method(&self $(, $pname: $pty)*) -> $mret {
+            if !self.state.admit() {
+                return $fallback($($pname),*);
+            }
+            const _: () = {
+                let arity = 0usize $(+ { let _ = stringify!($pname); 1 })*;
+                assert!(arity <= $crate::interp::MAX_CTX_WORDS);
+            };
+            let id = $crate::structops::fnv1a32(concat!(
+                $target,
+                "::",
+                stringify!($method),
+            ));
+            let method = $descname
+                .method(id)
+                .expect("generated struct_ops method missing from descriptor");
+            let contract = method.contract($descname.target_id);
+            #[allow(unused_mut)]
+            let mut ctx = [0u64; $crate::interp::MAX_CTX_WORDS];
+            #[allow(unused_mut)]
+            let mut len = 0usize;
+            $(
+                ctx[len] = <$pty as $crate::structops::BpfCtxArg>::encode($pname);
+                len += 1;
+            )*
+            match self.progs.get(id) {
+                ::core::option::Option::Some(prog) => {
+                    match prog.run_struct_ops_atomic(contract, ctx, len) {
+                        ::core::option::Option::Some(
+                            $crate::interp::Outcome::Returned(raw),
+                        ) => $result(raw).unwrap_or_else(|| $fallback($($pname),*)),
+                        ::core::option::Option::Some(
+                            $crate::interp::Outcome::Trapped(_),
+                        ) | ::core::option::Option::None => $fallback($($pname),*),
+                    }
+                }
+                ::core::option::Option::None => $fallback($($pname),*),
+            }
+        }
+    };
+    (
+        Sleepable [$target:literal] [$descname:ident]
+        [$fallback:path] [$result:path]
+        [$method:ident] [$($pname:ident : $pty:ty),*] [$mret:ty]
+    ) => {
+        fn $method<'a>(
+            &'a self,
+            $($pname: $pty),*
+        ) -> $crate::StructOpsFuture<'a, $mret> {
+            let admitted = self.state.admit();
+            const _: () = {
+                let arity = 0usize $(+ { let _ = stringify!($pname); 1 })*;
+                assert!(arity <= $crate::interp::MAX_CTX_WORDS);
+            };
+            $crate::runtime::Box::pin(async move {
+                if !admitted {
+                    return $fallback($($pname),*).await;
+                }
+                let id = $crate::structops::fnv1a32(concat!(
+                    $target,
+                    "::",
+                    stringify!($method),
+                ));
+                let method = $descname
+                    .method(id)
+                    .expect("generated struct_ops method missing from descriptor");
+                let contract = method.contract($descname.target_id);
+                #[allow(unused_mut)]
+                let mut ctx = [0u64; $crate::interp::MAX_CTX_WORDS];
+                #[allow(unused_mut)]
+                let mut len = 0usize;
+                $(
+                    ctx[len] = <$pty as $crate::structops::BpfCtxArg>::encode($pname);
+                    len += 1;
+                )*
+                match self.progs.get(id) {
+                    ::core::option::Option::Some(prog) => {
+                        match prog.run_struct_ops_sleepable(contract, ctx, len).await {
+                            ::core::option::Option::Some(
+                                $crate::interp::Outcome::Returned(raw),
+                            ) => match $result(raw) {
+                                ::core::option::Option::Some(value) => value,
+                                ::core::option::Option::None => $fallback($($pname),*).await,
+                            },
+                            ::core::option::Option::Some(
+                                $crate::interp::Outcome::Trapped(_),
+                            ) | ::core::option::Option::None => $fallback($($pname),*).await,
+                        }
+                    }
+                    ::core::option::Option::None => $fallback($($pname),*).await,
+                }
+            })
+        }
+    };
+}
+
+/// Emit a target after its methods have been normalized by context.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __struct_ops_emit {
+    (
+        [
+            $(#[doc = $tdoc:literal])*
+            [$target:literal] [$version:literal] [$cap:ident]
+            [$install:ident] [$descname:ident] [$adapter:ident] [$builder:ident]
+            [$commit:path] [$detach:path] [$($optm:ident),*]
+            [$vis:vis] [$trait_name:ident] [$target_context:ident]
+        ]
+        [$(
+            (
+                $kind:ident
+                [$(#[doc = $mdoc:literal])*]
+                [$fallback:path] [$result:path] [$fuel:expr] [$($kfunc:expr),*]
+                [$method:ident] [$($pname:ident : $pty:ty),*] [$mret:ty]
+            )
+        )*]
+    ) => {
         $(#[doc = $tdoc])*
         $vis trait $trait_name: Send + Sync + 'static {
             $(
-                $(#[doc = $mdoc])*
-                fn $method<'a>(
-                    &'a self,
-                    $($pname: $pty),*
-                ) -> $crate::StructOpsFuture<'a, $mret>;
+                $crate::__struct_ops_trait_method! {
+                    $kind [$(#[doc = $mdoc])*] [$method] [$($pname : $pty),*] [$mret]
+                }
             )*
         }
 
         $vis const $descname: $crate::structops::StructOpsDesc = {
-            const OPTIONAL: &[&str] = &[$($(stringify!($optm)),*)?];
+            const OPTIONAL: &[&str] = &[$(stringify!($optm)),*];
             $crate::structops::StructOpsDesc {
                 name: stringify!($trait_name),
                 target: $target,
                 target_id: $crate::structops::fnv1a64($target),
                 version: $version,
                 cap: $crate::reexport::CapKind::$cap,
-                context: $crate::verifier::Context::Sleepable,
+                context: $crate::structops::StructOpsContext::$target_context,
                 methods: &[$(
-                    $crate::structops::MethodDesc {
-                        name: stringify!($method),
-                        id: $crate::structops::fnv1a32(concat!(
-                            $target,
-                            "::",
-                            stringify!($method),
-                        )),
-                        abi_hash: $crate::structops::fnv1a64(concat!(
-                            $target,
-                            "@",
-                            stringify!($version),
-                            "::async::",
-                            stringify!($method),
-                            "::",
-                            stringify!(fn($($pty),*) -> $mret),
-                        )),
-                        ctx: &[$(<$pty as $crate::structops::BpfCtxArg>::DESC),*],
-                        ret: <$mret as $crate::types::BpfRet>::DESC,
-                        allowed_kfuncs: &[$($kfunc),*],
-                        context: $crate::verifier::Context::Sleepable,
-                        fuel: $fuel,
-                        fallback: stringify!($fallback),
-                        optional: $crate::structops::is_optional(
-                            stringify!($method),
-                            OPTIONAL,
-                        ),
+                    $crate::__struct_ops_method_desc! {
+                        $kind [$target] [$version] [OPTIONAL]
+                        [$fallback] [$result] [$fuel] [$($kfunc),*]
+                        [$method] [$($pname : $pty),*] [$mret]
                     },
                 )*],
             }
@@ -1047,7 +1025,7 @@ macro_rules! __sleepable_struct_ops_impl {
             }
         }
 
-        /// Generated asynchronous Rust adapter used by a subsystem live slot.
+        /// Generated Rust adapter used by a subsystem live slot.
         #[derive(Debug)]
         $vis struct $adapter {
             progs: $crate::structops::ProgSet,
@@ -1065,56 +1043,10 @@ macro_rules! __sleepable_struct_ops_impl {
 
         impl $trait_name for $adapter {
             $(
-                fn $method<'a>(
-                    &'a self,
-                    $($pname: $pty),*
-                ) -> $crate::StructOpsFuture<'a, $mret> {
-                    let admitted = self.state.admit();
-                    const _: () = {
-                        let arity = 0usize $(+ { let _ = stringify!($pname); 1 })*;
-                        assert!(arity <= $crate::interp::MAX_CTX_WORDS);
-                    };
-                    $crate::runtime::Box::pin(async move {
-                        if !admitted {
-                            return $fallback($($pname),*).await;
-                        }
-                        let id = $crate::structops::fnv1a32(concat!(
-                            $target,
-                            "::",
-                            stringify!($method),
-                        ));
-                        let method = $descname
-                            .method(id)
-                            .expect("generated struct_ops method missing from descriptor");
-                        let contract = method.contract($descname.target_id);
-                        #[allow(unused_mut)]
-                        let mut ctx = [0u64; $crate::interp::MAX_CTX_WORDS];
-                        #[allow(unused_mut)]
-                        let mut len = 0usize;
-                        $(
-                            ctx[len] = <$pty as $crate::structops::BpfCtxArg>::encode($pname);
-                            len += 1;
-                        )*
-                        match self.progs.get(id) {
-                            ::core::option::Option::Some(prog) => {
-                                match prog
-                                    .run_struct_ops_sleepable(contract, ctx, len)
-                                    .await
-                                {
-                                    ::core::option::Option::Some(
-                                        $crate::interp::Outcome::Returned(raw),
-                                    ) => match $result(raw) {
-                                        ::core::option::Option::Some(value) => value,
-                                        ::core::option::Option::None => $fallback($($pname),*).await,
-                                    },
-                                    ::core::option::Option::Some(
-                                        $crate::interp::Outcome::Trapped(_),
-                                    ) | ::core::option::Option::None => $fallback($($pname),*).await,
-                                }
-                            }
-                            ::core::option::Option::None => $fallback($($pname),*).await,
-                        }
-                    })
+                $crate::__struct_ops_adapter_method! {
+                    $kind [$target] [$descname]
+                    [$fallback] [$result]
+                    [$method] [$($pname : $pty),*] [$mret]
                 }
             )*
         }
@@ -1146,6 +1078,132 @@ macro_rules! __sleepable_struct_ops_impl {
                 prepared,
                 $detach,
             ))
+        }
+    };
+}
+
+/// Declare a contract-bound BPF implementation of a pluggable trait.
+///
+/// Atomic targets use ordinary methods. A target marked
+/// `#[context(Sleepable)]` uses `async fn` declarations; the generated trait
+/// lowers them to the object-safe [`crate::StructOpsFuture`] ABI. A
+/// `#[context(Mixed)]` target marks each method `Atomic` or `Sleepable`; the
+/// latter must use `async fn` syntax.
+#[macro_export]
+macro_rules! struct_ops {
+    ($(
+        $(#[doc = $tdoc:literal])*
+        #[target($target:literal)]
+        #[version($version:literal)]
+        #[context(Mixed)]
+        #[cap($cap:ident)]
+        #[install($install:ident)]
+        #[desc($descname:ident)]
+        #[adapter($adapter:ident)]
+        #[builder($builder:ident)]
+        #[commit($commit:path)]
+        #[detach($detach:path)]
+        $(#[optional($($optm:ident),* $(,)?)])?
+        $vis:vis trait $trait_name:ident {
+            $($methods:tt)*
+        }
+    )*) => {$(
+        $crate::__mixed_struct_ops_parse! {
+            @parse
+            [
+                $(#[doc = $tdoc])*
+                [$target] [$version] [$cap]
+                [$install] [$descname] [$adapter] [$builder]
+                [$commit] [$detach] [$($($optm),*)?]
+                [$vis] [$trait_name] [Mixed]
+            ]
+            []
+            $($methods)*
+        }
+    )*};
+
+    ($(
+        $(#[doc = $tdoc:literal])*
+        #[target($target:literal)]
+        #[version($version:literal)]
+        #[context(Sleepable)]
+        #[cap($cap:ident)]
+        #[install($install:ident)]
+        #[desc($descname:ident)]
+        #[adapter($adapter:ident)]
+        #[builder($builder:ident)]
+        #[commit($commit:path)]
+        #[detach($detach:path)]
+        $(#[optional($($optm:ident),* $(,)?)])?
+        $vis:vis trait $trait_name:ident {
+            $(
+                $(#[doc = $mdoc:literal])*
+                #[fallback($fallback:path)]
+                #[validate($result:path)]
+                #[fuel($fuel:expr)]
+                #[kfuncs($($kfunc:expr),* $(,)?) ]
+                async fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
+            )*
+        }
+    )*) => {$(
+        $crate::__struct_ops_emit! {
+            [
+                $(#[doc = $tdoc])*
+                [$target] [$version] [$cap]
+                [$install] [$descname] [$adapter] [$builder]
+                [$commit] [$detach] [$($($optm),*)?]
+                [$vis] [$trait_name] [Sleepable]
+            ]
+            [$(
+                (
+                    Sleepable
+                    [$(#[doc = $mdoc])*]
+                    [$fallback] [$result] [$fuel] [$($kfunc),*]
+                    [$method] [$($pname : $pty),*] [$mret]
+                )
+            )*]
+        }
+    )*};
+
+    ($(
+        $(#[doc = $tdoc:literal])*
+        #[target($target:literal)]
+        #[version($version:literal)]
+        #[cap($cap:ident)]
+        #[install($install:ident)]
+        #[desc($descname:ident)]
+        #[adapter($adapter:ident)]
+        #[builder($builder:ident)]
+        #[commit($commit:path)]
+        #[detach($detach:path)]
+        $(#[optional($($optm:ident),* $(,)?)])?
+        $vis:vis trait $trait_name:ident {
+            $(
+                $(#[doc = $mdoc:literal])*
+                #[fallback($fallback:path)]
+                #[validate($result:path)]
+                #[fuel($fuel:expr)]
+                #[kfuncs($($kfunc:expr),* $(,)?) ]
+                fn $method:ident (&self $(, $pname:ident : $pty:ty)* $(,)?) -> $mret:ty;
+            )*
+        }
+    )*) => {$(
+        $crate::__struct_ops_emit! {
+            [
+                $(#[doc = $tdoc])*
+                [$target] [$version] [$cap]
+                [$install] [$descname] [$adapter] [$builder]
+                [$commit] [$detach] [$($($optm),*)?]
+                [$vis] [$trait_name] [Atomic]
+            ]
+            [$(
+                (
+                    Atomic
+                    [$(#[doc = $mdoc])*]
+                    [$fallback] [$result] [$fuel] [$($kfunc),*]
+                    [$method] [$($pname : $pty),*] [$mret]
+                )
+            )*]
         }
     )*};
 }
