@@ -2089,8 +2089,25 @@ fn smoke_abi_fsx2_recursive_bind_preserves_descendant_mounts_pos() -> TestResult
             {
                 return Err("recursive-bind mount setup failed");
             }
+            // The mountpoint must exist (`do_mount`'s `user_path_at` is
+            // -ENOENT otherwise) and `/` is read-only here, so create it in a
+            // tmpfs. This test used to bind onto a path it never created and
+            // passed only when an earlier test had left a filesystem stacked
+            // on `/` that answered for any name — it failed or passed with the
+            // link order of the test registry.
+            let scratch: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+                match narf_filesystem::TmpFs::from_options("mode=0755", 0, 0) {
+                    Ok(fs) => alloc::sync::Arc::new(fs),
+                    Err(_) => return Err("tmpfs for the bind target failed"),
+                };
+            if ns.mount_arc(&auth, "/abi-rbind-dst", scratch).is_err() {
+                return Err("tmpfs for the bind target did not mount");
+            }
             let source = b"/abi-rbind-source\0";
-            let target = b"/abi-rbind-target\0";
+            let target = b"/abi-rbind-dst/target\0";
+            if call(Syscall::Mkdir.raw(), a2(target.as_ptr() as u64, 0o755, 0)) != Some(0) {
+                return Err("recursive bind target mkdir failed");
+            }
             let bind = SyscallArgs {
                 arg0: source.as_ptr() as u64,
                 arg1: target.as_ptr() as u64,
@@ -2101,14 +2118,19 @@ fn smoke_abi_fsx2_recursive_bind_preserves_descendant_mounts_pos() -> TestResult
             if call(Syscall::Mount.raw(), bind) != Some(0) {
                 return Err("recursive bind mount failed");
             }
-            match ns.resolve_absolute("/abi-rbind-target/sys/fs/cgroup", |fs, rel| {
-                rel.is_empty() && fs.name() == "rbind-child"
-            }) {
-                Some(true) => {}
-                _ => return Err("recursive bind must rebase descendant mounts"),
+            let child_visible = || {
+                ns.resolve_absolute("/abi-rbind-dst/target/sys/fs/cgroup", |fs, rel| {
+                    rel.is_empty() && fs.name() == "rbind-child"
+                }) == Some(true)
+            };
+            if !child_visible() {
+                return Err("recursive bind must rebase descendant mounts");
             }
+            // A recursive self-bind is still `copy_tree` + `graft_tree`
+            // (`__do_loopback`): it stacks a copy of the mount AND of each
+            // mount below it — here the top and its one descendant.
             let before_self_bind = ns.list().len();
-            let self_source = b"/abi-rbind-target/\0";
+            let self_source = b"/abi-rbind-dst/target/\0";
             let self_bind = SyscallArgs {
                 arg0: self_source.as_ptr() as u64,
                 arg1: target.as_ptr() as u64,
@@ -2119,8 +2141,11 @@ fn smoke_abi_fsx2_recursive_bind_preserves_descendant_mounts_pos() -> TestResult
             if call(Syscall::Mount.raw(), self_bind) != Some(0) {
                 return Err("recursive self-bind failed");
             }
-            if ns.list().len() != before_self_bind + 1 {
-                return Err("recursive self-bind must not duplicate existing descendants");
+            if ns.list().len() != before_self_bind + 2 {
+                return Err("recursive self-bind must copy the mount and its descendant");
+            }
+            if !child_visible() {
+                return Err("recursive self-bind must keep the descendant visible");
             }
             Ok(())
         })();
