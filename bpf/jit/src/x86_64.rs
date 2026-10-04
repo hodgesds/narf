@@ -53,10 +53,11 @@
 //! conditional and unconditional jumps, exit, **kfunc calls**, and **BPF-to-BPF
 //! calls** — the last being [`emit_subprog_call`]'s frame push, the JIT twin of
 //! the interpreter's `push_frame`. A verifier-resolved `may_suspend` call in the
-//! root program checkpoints through [`emit_suspend_checkpoint`] and returns to
-//! Rust; it is never entered through [`emit_kfunc_call`]'s synchronous ABI.
-//! A suspending call inside a BPF subprogram is refused until its call stack has
-//! an explicit continuation representation.
+//! program checkpoints through [`emit_suspend_checkpoint`] and returns to Rust;
+//! it is never entered through [`emit_kfunc_call`]'s synchronous ABI. In those
+//! continuation-enabled images, BPF-to-BPF calls use bounded caller frames in
+//! future-owned state and fixed return ids rather than a host return-address
+//! stack, so a subprogram may suspend safely.
 //!
 //! What is left interpreted: the subprogram-address and BTF-id pseudo-forms of
 //! `LD_IMM64` (the map forms are emitted over the loader-resolved address; these
@@ -111,8 +112,10 @@ use narf_bpf_verifier::{KfuncCallSite, VerifiedProgram};
 
 use crate::blocks::{block_len, block_starts};
 use crate::{
-    status, suspend_points, Compiled, FaultEntry, FaultTable, JitError, SuspendPoint,
-    CONT_FUEL_OFF, CONT_REGS_OFF, CONT_RESUME_ID_OFF,
+    return_points, status, suspend_points, Compiled, FaultEntry, FaultTable, JitError, ReturnPoint,
+    SuspendPoint, CALL_FRAME_BYTES, CALL_FRAME_RETURN_ID_OFF, CALL_FRAME_SAVED_OFF,
+    CONT_CALL_DEPTH_OFF, CONT_CALL_FRAMES_OFF, CONT_FUEL_OFF, CONT_REGS_OFF, CONT_RESUME_ID_OFF,
+    MAX_NATIVE_CALL_FRAMES,
 };
 
 /// Host register numbers, in ModRM/REX encoding order.
@@ -805,6 +808,12 @@ const ARENA_UNALIGNED_EPILOGUE: u32 = u32::MAX - 2;
 /// Reloc target for returning a native continuation checkpoint to Rust.
 const SUSPEND_EPILOGUE: u32 = u32::MAX - 3;
 
+/// Reloc target for the shared explicit BPF subprogram-return dispatcher.
+const SUBPROG_RETURN: u32 = u32::MAX - 4;
+
+/// Reloc target for malformed or overflowing explicit call state.
+const BAD_CALL_STATE_EPILOGUE: u32 = u32::MAX - 5;
+
 /// Where the prologue parks the arena slot base, relative to the entry `rsp`
 /// (which [`hr::R10`] anchors). Reuses the [`STACK_ALIGN_PAD`] word the frame
 /// already claims; an arena access reloads it into `r11` through `r10`, so the
@@ -898,7 +907,12 @@ pub fn compile_resolved(
     map_imm64: &[(u32, u64)],
 ) -> Result<Compiled, JitError> {
     let suspend_points = suspend_points(prog)?;
-    let (e, _) = emit_pass(prog, map_imm64, &suspend_points)?;
+    let return_points = if suspend_points.is_empty() {
+        Vec::new()
+    } else {
+        return_points(prog)?
+    };
+    let (e, _) = emit_pass(prog, map_imm64, &suspend_points, &return_points)?;
     Ok(Compiled {
         code: e.buf,
         faults: {
@@ -908,6 +922,7 @@ pub fn compile_resolved(
         },
         entry_off: 0,
         suspend_points,
+        return_points,
     })
 }
 
@@ -917,6 +932,7 @@ fn emit_pass(
     prog: &VerifiedProgram,
     map_imm64: &[(u32, u64)],
     suspend_points: &[SuspendPoint],
+    return_points: &[ReturnPoint],
 ) -> Result<(Emit, Vec<u32>), JitError> {
     let mut e = Emit::default();
     let mut relocs: Vec<Reloc> = Vec::new();
@@ -994,6 +1010,7 @@ fn emit_pass(
             &mut relocs,
             &prog.kfunc_calls,
             suspend_points,
+            return_points,
             state_slot,
             arena[i],
             needs_anchor,
@@ -1025,6 +1042,19 @@ fn emit_pass(
     if !suspend_points.is_empty() {
         emit_suspend_epilogue(&mut e, reserve, needs_anchor);
     }
+    let subprog_return_at = e.len();
+    if !return_points.is_empty() {
+        emit_subprog_return(
+            &mut e,
+            state_slot.expect("return points require continuation state"),
+            return_points,
+            &mut relocs,
+        );
+    }
+    let bad_call_state_at = e.len();
+    if !return_points.is_empty() {
+        emit_bad_call_state_epilogue(&mut e, reserve, needs_anchor);
+    }
 
     // An arena fault site resumes at the arena epilogue, never at the next
     // instruction. Patched here, unconditionally, rather than recorded at the
@@ -1047,6 +1077,10 @@ fn emit_pass(
             arena_unaligned_at
         } else if r.target == SUSPEND_EPILOGUE {
             suspend_at
+        } else if r.target == SUBPROG_RETURN {
+            subprog_return_at
+        } else if r.target == BAD_CALL_STATE_EPILOGUE {
+            bad_call_state_at
         } else if r.target == EPILOGUE {
             // The last offset recorded is one past the body — the epilogue.
             *out.last()
@@ -1144,6 +1178,25 @@ fn load_reg(e: &mut Emit, dst: u8, base: u8, disp: i32) {
     e.modrm_mem(dst, base, disp);
 }
 
+fn imul_reg_imm8(e: &mut Emit, reg: u8, imm: u8) {
+    e.rex(true, reg, reg);
+    e.b(0x6B);
+    e.modrm_rr(reg, reg);
+    e.b(imm);
+}
+
+fn emit_rel32_jump(e: &mut Emit, target: u32, relocs: &mut Vec<Reloc>) {
+    e.b(0xE9);
+    let at = e.len();
+    e.d32(0);
+    relocs.push(Reloc {
+        at,
+        next: e.len(),
+        target,
+        width: 4,
+    });
+}
+
 /// Restore one future-owned checkpoint and jump to the instruction following
 /// its suspending call. The target is a BPF instruction index resolved by the
 /// ordinary relocation pass, never an address read from continuation memory.
@@ -1165,6 +1218,108 @@ fn emit_resume_stub(e: &mut Emit, point: SuspendPoint, relocs: &mut Vec<Reloc>) 
         target: point.insn_index + 1,
         width: 4,
     });
+}
+
+/// Push one BPF caller frame into hidden continuation memory and branch to the
+/// callee without putting a native return address on the host stack.
+fn emit_explicit_subprog_call(
+    e: &mut Emit,
+    point: ReturnPoint,
+    rel: i32,
+    cur_stack: u32,
+    state_slot: i32,
+    relocs: &mut Vec<Reloc>,
+) {
+    load_reg(e, hr::R11, hr::R10, state_slot);
+    load_reg(e, hr::RCX, hr::R11, CONT_CALL_DEPTH_OFF);
+    alu_ri(e, true, 7, hr::RCX, MAX_NATIVE_CALL_FRAMES as i32);
+    // `jb valid`; the failure path reports the rejected depth without
+    // clobbering R0 on the valid path.
+    let valid = e.jcc_rel32(0x2);
+    mov_rr(e, true, hr::RAX, hr::RCX);
+    emit_rel32_jump(e, BAD_CALL_STATE_EPILOGUE, relocs);
+    e.patch_rel32_to_here(valid.0, valid.1);
+
+    // r11 := state + call_frames + depth * sizeof(NativeCallFrame).
+    imul_reg_imm8(e, hr::RCX, CALL_FRAME_BYTES as u8);
+    alu_rr(e, true, 0x01, hr::R11, hr::RCX);
+    for (idx, reg) in REGS[6..11].iter().copied().enumerate() {
+        store_reg(
+            e,
+            hr::R11,
+            CONT_CALL_FRAMES_OFF + CALL_FRAME_SAVED_OFF + idx as i32 * 8,
+            reg,
+        );
+    }
+    mov_reg_imm64(e, hr::RCX, i64::from(point.return_id));
+    store_reg(
+        e,
+        hr::R11,
+        CONT_CALL_FRAMES_OFF + CALL_FRAME_RETURN_ID_OFF,
+        hr::RCX,
+    );
+
+    // Publish the frame only after all of its contents are installed.
+    load_reg(e, hr::R11, hr::R10, state_slot);
+    load_reg(e, hr::RCX, hr::R11, CONT_CALL_DEPTH_OFF);
+    alu_ri(e, true, 0, hr::RCX, 1);
+    store_reg(e, hr::R11, CONT_CALL_DEPTH_OFF, hr::RCX);
+    alu_ri(e, true, 5, hr::RBP, cur_stack as i32);
+    emit_rel32_jump(
+        e,
+        (point.insn_index as i64 + 1 + i64::from(rel)) as u32,
+        relocs,
+    );
+}
+
+/// Pop the innermost explicit BPF caller frame and dispatch its compiler-issued
+/// return id through fixed branches.
+fn emit_subprog_return(
+    e: &mut Emit,
+    state_slot: i32,
+    points: &[ReturnPoint],
+    relocs: &mut Vec<Reloc>,
+) {
+    load_reg(e, hr::R11, hr::R10, state_slot);
+    load_reg(e, hr::RCX, hr::R11, CONT_CALL_DEPTH_OFF);
+    alu_ri(e, true, 7, hr::RCX, 0);
+    let valid = e.jcc_rel32(0x5); // jne valid
+    mov_rr(e, true, hr::RAX, hr::RCX);
+    emit_rel32_jump(e, BAD_CALL_STATE_EPILOGUE, relocs);
+    e.patch_rel32_to_here(valid.0, valid.1);
+
+    alu_ri(e, true, 5, hr::RCX, 1);
+    store_reg(e, hr::R11, CONT_CALL_DEPTH_OFF, hr::RCX);
+    imul_reg_imm8(e, hr::RCX, CALL_FRAME_BYTES as u8);
+    alu_rr(e, true, 0x01, hr::R11, hr::RCX);
+    load_reg(
+        e,
+        hr::RCX,
+        hr::R11,
+        CONT_CALL_FRAMES_OFF + CALL_FRAME_RETURN_ID_OFF,
+    );
+    for (idx, reg) in REGS[6..11].iter().copied().enumerate() {
+        load_reg(
+            e,
+            reg,
+            hr::R11,
+            CONT_CALL_FRAMES_OFF + CALL_FRAME_SAVED_OFF + idx as i32 * 8,
+        );
+    }
+    for point in points {
+        alu_ri(e, true, 7, hr::RCX, point.return_id as i32);
+        e.bs(&[0x0F, 0x84]); // je rel32
+        let at = e.len();
+        e.d32(0);
+        relocs.push(Reloc {
+            at,
+            next: e.len(),
+            target: point.insn_index + 1,
+            width: 4,
+        });
+    }
+    mov_rr(e, true, hr::RAX, hr::RCX);
+    emit_rel32_jump(e, BAD_CALL_STATE_EPILOGUE, relocs);
 }
 
 /// Save all BPF-visible registers and the single fuel tank, then return the
@@ -1272,6 +1427,11 @@ fn emit_prologue(
             emit_resume_stub(e, point, relocs);
         }
         e.patch_rel32_to_here(initial.0, initial.1);
+        // Initial entry owns a fresh logical BPF call stack. Resume stubs jump
+        // over this reset and retain the frames captured before suspension.
+        load_reg(e, hr::R11, hr::R10, slot);
+        mov_reg_imm64(e, hr::RCX, 0);
+        store_reg(e, hr::R11, CONT_CALL_DEPTH_OFF, hr::RCX);
     }
 
     // Initial entry only. Resume stubs restore these values from the owned
@@ -1345,6 +1505,12 @@ fn emit_arena_unaligned_epilogue(e: &mut Emit, reserve: i32, needs_anchor: bool)
 fn emit_suspend_epilogue(e: &mut Emit, reserve: i32, needs_anchor: bool) {
     emit_reset_rsp_to_anchor(e, needs_anchor);
     mov_reg_imm64(e, hr::RDX, status::SUSPEND as i64);
+    emit_restore(e, reserve);
+}
+
+fn emit_bad_call_state_epilogue(e: &mut Emit, reserve: i32, needs_anchor: bool) {
+    emit_reset_rsp_to_anchor(e, needs_anchor);
+    mov_reg_imm64(e, hr::RDX, status::BAD_CALL_STATE as i64);
     emit_restore(e, reserve);
 }
 
@@ -1770,6 +1936,7 @@ fn emit_insn(
     relocs: &mut Vec<Reloc>,
     calls: &[KfuncCallSite],
     suspend_points: &[SuspendPoint],
+    return_points: &[ReturnPoint],
     state_slot: Option<i32>,
     arena: bool,
     needs_anchor: bool,
@@ -1891,12 +2058,6 @@ fn emit_insn(
                     at,
                     what: "suspending call has no hidden continuation slot",
                 })?;
-                if !in_main {
-                    return Err(JitError::Unsupported {
-                        at,
-                        what: "suspending call inside a BPF subprogram needs explicit call-state lowering",
-                    });
-                }
                 emit_suspend_checkpoint(e, point, slot, relocs);
                 return Ok(());
             }
@@ -1924,7 +2085,19 @@ fn emit_insn(
         }
 
         Decoded::Call(CallTarget::Subprog(rel)) => {
-            emit_subprog_call(e, at, rel, cur_stack, relocs);
+            if let Some(slot) = state_slot {
+                let point = return_points
+                    .iter()
+                    .copied()
+                    .find(|point| point.insn_index == at)
+                    .ok_or(JitError::Unsupported {
+                        at,
+                        what: "subprogram call has no compiler-issued return id",
+                    })?;
+                emit_explicit_subprog_call(e, point, rel, cur_stack, slot, relocs);
+            } else {
+                emit_subprog_call(e, at, rel, cur_stack, relocs);
+            }
         }
 
         Decoded::Mov {
@@ -2123,10 +2296,15 @@ fn emit_insn(
         }
 
         Decoded::Exit if !in_main => {
-            // A subprogram `exit` returns to its caller — the `ret` matching the
-            // `call` that `emit_subprog_call` emitted. R0 (rax) is already the
-            // return value.
-            e.b(0xC3);
+            if return_points.is_empty() {
+                // A run-to-completion subprogram returns through the native
+                // host call stack.
+                e.b(0xC3);
+            } else {
+                // A continuation-enabled image owns no host return address for
+                // this call. Dispatch through its hidden fixed-id frame.
+                emit_rel32_jump(e, SUBPROG_RETURN, relocs);
+            }
         }
 
         Decoded::Exit => {

@@ -232,7 +232,9 @@ use narf_memory::bpf_text::{self, Jit, TextAlloc};
 /// storage. An image with no `may_suspend` call ignores it. A continuation-enabled
 /// image parks it outside the BPF register map, checkpoints into it on
 /// `status::SUSPEND`, and accepts only compiler-issued ids in its entry
-/// dispatcher.
+/// dispatcher. Its BPF-to-BPF calls also keep bounded R6-R10 caller frames
+/// there and return through compiler-issued ids, never continuation-provided
+/// native addresses.
 ///
 /// The `u128` return is SysV's `rax:rdx` pair: the low half is R0, the high half
 /// is a [`narf_bpf_jit::status`] code. Out of band deliberately — an in-band
@@ -259,6 +261,8 @@ pub struct JitImage {
     /// Exact suspension sites and compiler-issued ids accepted by the image's
     /// entry dispatcher.
     suspend_points: alloc::vec::Vec<narf_bpf_jit::SuspendPoint>,
+    /// Fixed BPF-to-BPF return ids accepted by continuation call frames.
+    return_points: alloc::vec::Vec<narf_bpf_jit::ReturnPoint>,
 }
 
 impl JitImage {
@@ -317,6 +321,17 @@ impl JitImage {
             .iter()
             .copied()
             .find(|point| point.resume_id == resume_id)
+    }
+
+    /// Resolve a compiler-managed BPF caller frame without accepting a native
+    /// address from continuation memory.
+    #[inline]
+    #[must_use]
+    pub fn return_point(&self, return_id: u32) -> Option<narf_bpf_jit::ReturnPoint> {
+        self.return_points
+            .iter()
+            .copied()
+            .find(|point| point.return_id == return_id)
     }
 }
 
@@ -617,5 +632,6 @@ pub fn try_compile(
         entry,
         arena,
         suspend_points: compiled.suspend_points,
+        return_points: compiled.return_points,
     })
 }

@@ -3888,37 +3888,51 @@ kernel_test_in!(
     smoke_bpf_jit_diff_kfunc_call_in_a_loop_agrees_on_fuel
 );
 
-// ── negatives: what must *not* be compiled ──────────────────────────
+// ── nested sleepable continuations ──────────────────────────────────
 
-fn smoke_bpf_jit_refuses_sleepable_call_inside_subprogram() -> TestResult {
-    // The first continuation backend deliberately supports only root-program
-    // suspension. Capturing a host return-address stack would be unsound, so a
-    // sleepable call reached inside a BPF subprogram must keep the whole image
-    // interpreted until explicit call-state lowering exists.
+fn smoke_bpf_jit_resumes_sleepable_call_inside_subprogram() -> TestResult {
+    // Three BPF frames each keep a distinct R6 value. The innermost frame
+    // suspends twice, then each return must restore its caller's R6 through
+    // compiler-managed continuation frames rather than a native return-address
+    // stack: (yield_n(2) + 3) + 2 + 40 = 47.
     let Ok(p) = load(
         "sleepy_subprog_call",
         asm(&[
-            subprog_call(1),
+            mov_imm(6, 40),
+            subprog_call(2),
+            alu_reg(AluOp::Add, 0, 6),
             EXIT,
+            mov_imm(6, 2),
+            subprog_call(2),
+            alu_reg(AluOp::Add, 0, 6),
+            EXIT,
+            mov_imm(6, 3),
             mov_imm(1, 2),
             call("narf_yield_n"),
+            alu_reg(AluOp::Add, 0, 6),
             EXIT,
         ]),
         Context::Sleepable,
     ) else {
         return TestResult::Fail("load rejected");
     };
-    if p.is_jited() {
-        return TestResult::Fail("a nested sleepable call compiled without call-state lowering");
+    if !p.is_jited() {
+        return if narf_bpf_jit::has_backend() {
+            TestResult::Fail("nested sleepable call did not compile with explicit call state")
+        } else {
+            TestResult::Skip(NO_BACKEND)
+        };
     }
-    if crate::interp::drive(p.run_sleepable([0; 4], 4)) != Some(Outcome::Returned(2)) {
-        return TestResult::Fail("the interpreted nested sleepable call did not complete");
+    let native = crate::interp::drive(p.run_sleepable([0; 4], 4));
+    let interpreted = crate::interp::drive(p.run_sleepable_interpreted([0; 4], 4));
+    if native != Some(Outcome::Returned(47)) || native != interpreted {
+        return TestResult::Fail("nested native continuation diverged from the interpreter");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "bpf",
-    smoke_bpf_jit_refuses_sleepable_call_inside_subprogram
+    smoke_bpf_jit_resumes_sleepable_call_inside_subprogram
 );
 
 fn smoke_bpf_jit_certifies_context_dereferences_across_calls() -> TestResult {

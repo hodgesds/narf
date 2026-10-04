@@ -171,6 +171,27 @@ pub mod status {
     /// A continuation asked for an id not present in this image's compiler-
     /// emitted dispatch table. The low half carries the rejected id.
     pub const BAD_RESUME: u64 = 5;
+    /// Compiler-managed BPF call state was inconsistent or exceeded its fixed
+    /// bound. The low half carries the rejected depth or return id.
+    pub const BAD_CALL_STATE: u64 = 6;
+}
+
+/// Maximum number of caller frames retained by a native continuation.
+///
+/// The verifier's call-depth bound includes the root program, so a verified
+/// image uses at most one fewer entries. Keeping the full bound here leaves a
+/// fail-closed spare slot and makes malformed `VerifiedProgram` inputs trap
+/// before writing outside this array.
+pub const MAX_NATIVE_CALL_FRAMES: usize = narf_bpf_verifier::MAX_CALL_DEPTH as usize;
+
+/// One compiler-managed BPF-to-BPF caller frame.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NativeCallFrame {
+    /// BPF R6..R10, the callee-saved register set.
+    pub saved: [u64; 5],
+    /// Compiler-issued id for the instruction after this call.
+    pub return_id: u64,
 }
 
 /// Register and fuel state retained by a sleepable native invocation.
@@ -190,17 +211,34 @@ pub struct NativeContinuation {
     pub fuel: u64,
     /// Zero for initial entry, otherwise a compiler-issued [`SuspendPoint`] id.
     pub resume_id: u64,
+    /// Number of live entries in [`Self::call_frames`].
+    pub call_depth: u64,
+    /// Explicit BPF caller state. Native host return addresses never cross a
+    /// suspension.
+    pub call_frames: [NativeCallFrame; MAX_NATIVE_CALL_FRAMES],
 }
 
 pub(crate) const CONT_REGS_OFF: i32 = 0;
 pub(crate) const CONT_FUEL_OFF: i32 = 11 * 8;
 pub(crate) const CONT_RESUME_ID_OFF: i32 = 12 * 8;
+pub(crate) const CONT_CALL_DEPTH_OFF: i32 = 13 * 8;
+pub(crate) const CONT_CALL_FRAMES_OFF: i32 = 14 * 8;
+pub(crate) const CALL_FRAME_SAVED_OFF: i32 = 0;
+pub(crate) const CALL_FRAME_RETURN_ID_OFF: i32 = 5 * 8;
+pub(crate) const CALL_FRAME_BYTES: i32 = 6 * 8;
 
 const _: () = assert!(
     core::mem::offset_of!(NativeContinuation, regs) == CONT_REGS_OFF as usize
         && core::mem::offset_of!(NativeContinuation, fuel) == CONT_FUEL_OFF as usize
         && core::mem::offset_of!(NativeContinuation, resume_id) == CONT_RESUME_ID_OFF as usize
-        && core::mem::size_of::<NativeContinuation>() == 13 * core::mem::size_of::<u64>()
+        && core::mem::offset_of!(NativeContinuation, call_depth) == CONT_CALL_DEPTH_OFF as usize
+        && core::mem::offset_of!(NativeContinuation, call_frames) == CONT_CALL_FRAMES_OFF as usize
+        && core::mem::offset_of!(NativeCallFrame, saved) == CALL_FRAME_SAVED_OFF as usize
+        && core::mem::offset_of!(NativeCallFrame, return_id) == CALL_FRAME_RETURN_ID_OFF as usize
+        && core::mem::size_of::<NativeCallFrame>() == CALL_FRAME_BYTES as usize
+        && core::mem::size_of::<NativeContinuation>()
+            == CONT_CALL_FRAMES_OFF as usize
+                + MAX_NATIVE_CALL_FRAMES * core::mem::size_of::<NativeCallFrame>()
         && core::mem::align_of::<NativeContinuation>() == core::mem::align_of::<u64>(),
     "native continuation layout must match both emitters"
 );
@@ -216,19 +254,21 @@ pub struct SuspendPoint {
     pub kfunc_id: i32,
 }
 
+/// One BPF-to-BPF call and its compiler-owned return id.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReturnPoint {
+    /// One-based id written into the explicit caller frame.
+    pub return_id: u32,
+    /// BPF instruction containing the call.
+    pub insn_index: u32,
+    /// Bytes by which this caller descends R10 for its callee.
+    pub caller_stack_bytes: u32,
+}
+
 /// Build the continuation table shared by both backends.
 ///
-/// Suspension is initially supported only from the root BPF subprogram. A
-/// native host return-address stack cannot be retained across an executor
-/// suspension, so a suspending call in a subprogram falls back to the complete
-/// interpreter until explicit BPF call-state lowering is implemented.
+/// Every verifier-resolved asynchronous call receives a portable one-based id.
 pub(crate) fn suspend_points(prog: &VerifiedProgram) -> Result<Vec<SuspendPoint>, JitError> {
-    let root_end = prog
-        .subprogs
-        .iter()
-        .filter_map(|s| (s.start != 0).then_some(s.start))
-        .min()
-        .unwrap_or(prog.insns.len() as u32);
     let mut points = Vec::new();
     for call in &prog.kfunc_calls {
         if !call.may_suspend {
@@ -240,12 +280,6 @@ pub(crate) fn suspend_points(prog: &VerifiedProgram) -> Result<Vec<SuspendPoint>
             return Err(JitError::Unsupported {
                 at: call.insn_index,
                 what: "an atomic image cannot contain a suspending call site",
-            });
-        }
-        if call.insn_index >= root_end {
-            return Err(JitError::Unsupported {
-                at: call.insn_index,
-                what: "suspending call inside a BPF subprogram needs explicit call-state lowering",
             });
         }
         let resume_id = u32::try_from(points.len() + 1).map_err(|_| JitError::Unsupported {
@@ -263,6 +297,59 @@ pub(crate) fn suspend_points(prog: &VerifiedProgram) -> Result<Vec<SuspendPoint>
             insn_index: call.insn_index,
             kfunc_id: call.id,
         });
+    }
+    Ok(points)
+}
+
+/// Build the fixed return-id table used by continuation-enabled images.
+pub(crate) fn return_points(prog: &VerifiedProgram) -> Result<Vec<ReturnPoint>, JitError> {
+    let mut points = Vec::new();
+    let mut i = 0usize;
+    while i < prog.insns.len() {
+        let (insn, width) =
+            narf_bpf_isa::decode(&prog.insns, i).map_err(|_| JitError::Unsupported {
+                at: i as u32,
+                what: "undecodable instruction while building return ids",
+            })?;
+        if let narf_bpf_isa::Decoded::Call(narf_bpf_isa::CallTarget::Subprog(rel)) = insn {
+            let at = i as u32;
+            let target = i as i64 + width as i64 + i64::from(rel);
+            if target < 0
+                || !prog
+                    .subprogs
+                    .iter()
+                    .any(|subprog| i64::from(subprog.start) == target)
+            {
+                return Err(JitError::BadTarget { at });
+            }
+            let Some(caller) = prog
+                .subprogs
+                .iter()
+                .filter(|subprog| subprog.start <= at)
+                .max_by_key(|subprog| subprog.start)
+            else {
+                return Err(JitError::Unsupported {
+                    at,
+                    what: "subprogram call has no containing caller",
+                });
+            };
+            let return_id = u32::try_from(points.len() + 1).map_err(|_| JitError::Unsupported {
+                at,
+                what: "too many native subprogram return sites",
+            })?;
+            if return_id > i32::MAX as u32 {
+                return Err(JitError::Unsupported {
+                    at,
+                    what: "subprogram return id exceeds the portable emitter range",
+                });
+            }
+            points.push(ReturnPoint {
+                return_id,
+                insn_index: at,
+                caller_stack_bytes: caller.stack_bytes,
+            });
+        }
+        i += width;
     }
     Ok(points)
 }
@@ -315,6 +402,9 @@ pub struct Compiled {
     /// Compiler-issued suspension ids accepted by this image's entry
     /// dispatcher. Empty for an image that always runs to completion.
     pub suspend_points: Vec<SuspendPoint>,
+    /// Compiler-issued BPF-to-BPF return ids. Present only when the image uses
+    /// explicit continuation call frames.
+    pub return_points: Vec<ReturnPoint>,
 }
 
 /// Why compilation failed.

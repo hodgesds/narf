@@ -28,7 +28,7 @@
 
 use narf_bpf_isa::{AluOp, AtomicOp, ByteOrder, CondOp, Decoded, Imm64, Size, Source};
 
-use narf_bpf_verifier::Context;
+use narf_bpf_verifier::{Context, KfuncCallSite};
 
 use crate::aarch64;
 use crate::tests::{kcall, mov, r, verified, verified_calling, verified_subprogs, EXIT};
@@ -1192,6 +1192,57 @@ fn a64_arena_words(
 }
 
 #[test]
+fn a64_an_arena_access_inside_a_suspendable_subprogram_keeps_entry_sp() {
+    let arena_store = Decoded::Store {
+        size: Size::Dw,
+        dst: r(1),
+        off: 0,
+        src: Source::Imm(1),
+    };
+    let mut prog = crate::tests::verified_arena(
+        &[
+            Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
+            EXIT,
+            arena_store,
+            kcall(7),
+            EXIT,
+        ],
+        2,
+        None,
+    );
+    prog.context = Context::Sleepable;
+    prog.kfunc_calls = alloc::vec![KfuncCallSite {
+        insn_index: 3,
+        id: 7,
+        addr: A64_SHIM,
+        may_suspend: true,
+        context: Context::Sleepable,
+    }];
+    prog.subprogs = alloc::vec![
+        narf_bpf_verifier::SubprogInfo {
+            start: 0,
+            stack_bytes: 0,
+        },
+        narf_bpf_verifier::SubprogInfo {
+            start: 2,
+            stack_bytes: 0,
+        },
+    ];
+
+    let compiled = aarch64::compile(&prog)
+        .expect("explicit continuation calls keep the entry-relative arena slot valid");
+    assert_eq!(compiled.return_points.len(), 1);
+    assert_eq!(compiled.faults.0.len(), 1);
+    assert!(compiled.faults.0[0].arena);
+    assert!(
+        !a64_words(&compiled.code)
+            .into_iter()
+            .any(|word| word & 0xfc00_0000 == 0x9400_0000),
+        "a continuation-enabled BPF call must not create a link-register chain"
+    );
+}
+
+#[test]
 fn a64_an_arena_store_takes_the_slot_relative_shape() {
     // The aarch64 half of `an_arena_access_lowers_to_the_slot_relative_shape`.
     // Stated per backend because the lowering is written per backend, so one of
@@ -1953,6 +2004,18 @@ fn a64_execute_with_continuation(
             let a = cpu.read(rn, wide);
             let res = cpu.set_sub_flags(a, imm, wide);
             cpu.write(rd, wide, res);
+        } else if w & 0x7f80_0000 == 0x1100_0000 {
+            // ADD (immediate)
+            let sh = (w >> 22) & 1;
+            let imm = u64::from((w >> 10) & 0xfff) << (12 * sh);
+            let v = cpu.read(rn, wide).wrapping_add(imm);
+            cpu.write(rd, wide, v);
+        } else if w & 0x7f80_0000 == 0x5100_0000 {
+            // SUB (immediate)
+            let sh = (w >> 22) & 1;
+            let imm = u64::from((w >> 10) & 0xfff) << (12 * sh);
+            let v = cpu.read(rn, wide).wrapping_sub(imm);
+            cpu.write(rd, wide, v);
         } else if w & 0x7fe0_8000 == 0x1b00_0000 {
             // MADD Rd, Rn, Rm, Ra
             let ra = (w >> 10) & 31;
@@ -2960,7 +3023,126 @@ fn a64_sleepable_dispatch_rejects_an_unknown_resume_id() {
 }
 
 #[test]
-fn a64_a_sleepable_call_in_a_subprogram_is_refused_without_call_state_lowering() {
+fn a64_sleepable_call_in_a_subprogram_checkpoints_and_returns() {
+    let add_r6 = Decoded::Alu {
+        wide: true,
+        op: AluOp::Add,
+        dst: r(0),
+        src: Source::Reg(r(6)),
+    };
+    let mut prog = verified_calling(
+        &[
+            mov(6, 40),
+            Decoded::Call(narf_bpf_isa::CallTarget::Subprog(2)),
+            add_r6,
+            EXIT,
+            mov(6, 2),
+            Decoded::Call(narf_bpf_isa::CallTarget::Subprog(2)),
+            add_r6,
+            EXIT,
+            mov(6, 3),
+            kcall(7),
+            add_r6,
+            EXIT,
+        ],
+        &[(9, 7, A64_SHIM)],
+    );
+    prog.context = Context::Sleepable;
+    prog.kfunc_calls[0].context = Context::Sleepable;
+    prog.kfunc_calls[0].may_suspend = true;
+    prog.subprogs = alloc::vec![
+        narf_bpf_verifier::SubprogInfo {
+            start: 0,
+            stack_bytes: 8,
+        },
+        narf_bpf_verifier::SubprogInfo {
+            start: 4,
+            stack_bytes: 16,
+        },
+        narf_bpf_verifier::SubprogInfo {
+            start: 8,
+            stack_bytes: 24,
+        },
+    ];
+    let compiled = aarch64::compile(&prog).expect("nested suspension must compile");
+    assert_eq!(compiled.suspend_points[0].insn_index, 9);
+    assert_eq!(compiled.return_points.len(), 2);
+    assert_eq!(compiled.return_points[0].insn_index, 1);
+    assert_eq!(compiled.return_points[0].caller_stack_bytes, 8);
+    assert_eq!(compiled.return_points[1].insn_index, 5);
+    assert_eq!(compiled.return_points[1].caller_stack_bytes, 16);
+
+    let (cpu, resume_id, status) =
+        a64_execute_with_continuation(&compiled.code, 1024, Mem::new(), CONT_ADDR)
+            .expect("the callee must checkpoint");
+    assert_eq!(status, crate::status::SUSPEND);
+    assert_eq!(resume_id, 1);
+    assert_eq!(
+        cpu.mem
+            .load64(CONT_ADDR + crate::CONT_CALL_DEPTH_OFF as u64),
+        Some(2)
+    );
+    let frame = CONT_ADDR + crate::CONT_CALL_FRAMES_OFF as u64;
+    assert_eq!(
+        cpu.mem.load64(frame + crate::CALL_FRAME_SAVED_OFF as u64),
+        Some(40),
+        "the caller's R6 must survive the suspended callee"
+    );
+    assert_eq!(
+        cpu.mem
+            .load64(frame + crate::CALL_FRAME_SAVED_OFF as u64 + 4 * 8),
+        Some(FRAME_TOP),
+        "the caller frame must retain its own R10"
+    );
+    assert_eq!(
+        cpu.mem
+            .load64(frame + crate::CALL_FRAME_RETURN_ID_OFF as u64),
+        Some(1)
+    );
+    let inner = frame + crate::CALL_FRAME_BYTES as u64;
+    assert_eq!(
+        cpu.mem.load64(inner + crate::CALL_FRAME_SAVED_OFF as u64),
+        Some(2),
+        "the intermediate caller's R6 must survive the suspended callee"
+    );
+    assert_eq!(
+        cpu.mem
+            .load64(inner + crate::CALL_FRAME_SAVED_OFF as u64 + 4 * 8),
+        Some(FRAME_TOP - 8),
+        "the intermediate caller frame must retain its own R10"
+    );
+    assert_eq!(
+        cpu.mem
+            .load64(inner + crate::CALL_FRAME_RETURN_ID_OFF as u64),
+        Some(2)
+    );
+    assert_eq!(
+        cpu.mem.load64(CONT_ADDR + 10 * 8),
+        Some(FRAME_TOP - 24),
+        "the suspended callee must retain its descended R10"
+    );
+
+    let mut mem = cpu.mem;
+    mem.store64(CONT_ADDR, 7)
+        .expect("continuation R0 in bounds");
+    for reg in 1..=5u64 {
+        mem.store64(CONT_ADDR + reg * 8, 0)
+            .expect("continuation caller-saved register in bounds");
+    }
+    let (cpu, value, status) = a64_execute_with_continuation(&compiled.code, 1024, mem, CONT_ADDR)
+        .expect("the resumed callee must return through explicit state");
+    assert_eq!(status, crate::status::OK);
+    assert_eq!(value, 52);
+    assert_eq!(
+        cpu.mem
+            .load64(CONT_ADDR + crate::CONT_CALL_DEPTH_OFF as u64),
+        Some(0),
+        "the explicit caller frame must be popped"
+    );
+}
+
+#[test]
+fn a64_sleepable_subprogram_rejects_an_unknown_return_id() {
     let mut prog = verified_calling(
         &[
             Decoded::Call(narf_bpf_isa::CallTarget::Subprog(1)),
@@ -2983,10 +3165,27 @@ fn a64_a_sleepable_call_in_a_subprogram_is_refused_without_call_state_lowering()
             stack_bytes: 0,
         },
     ];
-    assert!(matches!(
-        aarch64::compile(&prog),
-        Err(JitError::Unsupported { at: 2, .. })
-    ));
+    let compiled = aarch64::compile(&prog).expect("nested suspension must compile");
+    let (cpu, _, status) =
+        a64_execute_with_continuation(&compiled.code, 1024, Mem::new(), CONT_ADDR)
+            .expect("the callee must checkpoint");
+    assert_eq!(status, crate::status::SUSPEND);
+
+    let mut mem = cpu.mem;
+    let return_id =
+        CONT_ADDR + crate::CONT_CALL_FRAMES_OFF as u64 + crate::CALL_FRAME_RETURN_ID_OFF as u64;
+    mem.store64(return_id, 99)
+        .expect("active return id in bounds");
+    mem.store64(CONT_ADDR, 7)
+        .expect("continuation R0 in bounds");
+    for reg in 1..=5u64 {
+        mem.store64(CONT_ADDR + reg * 8, 0)
+            .expect("continuation caller-saved register in bounds");
+    }
+    let (_, value, status) = a64_execute_with_continuation(&compiled.code, 1024, mem, CONT_ADDR)
+        .expect("an unknown id must fail closed without an indirect branch");
+    assert_eq!(value, 99);
+    assert_eq!(status, crate::status::BAD_CALL_STATE);
 }
 
 #[test]

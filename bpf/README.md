@@ -117,10 +117,11 @@ via a `cmpxchg` loop that preserves R0 in a reserved frame word, aarch64 via its
 LSE fetch. **Arena access under a BPF-to-BPF call**: x86_64 anchors the entry
 `rsp` in a spare register, so an arena access reaches its base at any call depth
 and an arena fault or out-of-fuel exit resets `rsp` to that anchor before
-unwinding — an arena access inside a subprogram now JITs. aarch64 has no equally
-free register, so it composes arena with calls for accesses in the *main*
-program and leaves an access inside a subprogram interpreted (correct, not
-native).
+unwinding — an arena access inside a subprogram now JITs. For run-to-completion
+images, aarch64 has no equally free register, so it composes arena with calls
+only for accesses in the *main* program. A continuation-enabled image keeps
+`sp` fixed while its explicit BPF caller frames live in future-owned memory, so
+an aarch64 arena access inside a suspendable subprogram also JITs.
 
 The JIT is enabled **behind the verifier**: the interpreter's safety came from
 never dereferencing a program-supplied address, and native code trades that for

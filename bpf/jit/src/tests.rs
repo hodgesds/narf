@@ -1564,7 +1564,7 @@ fn a_sync_shim_that_requires_sleepable_context_remains_a_direct_call() {
 }
 
 #[test]
-fn a_sleepable_call_in_a_subprogram_is_refused_without_call_state_lowering() {
+fn a_sleepable_call_in_a_subprogram_uses_explicit_return_state() {
     let mut prog = verified_calling(
         &[Decoded::Call(CallTarget::Subprog(1)), EXIT, kcall(7), EXIT],
         &[(2, 7, SHIM)],
@@ -1582,10 +1582,20 @@ fn a_sleepable_call_in_a_subprogram_is_refused_without_call_state_lowering() {
             stack_bytes: 0,
         },
     ];
-    assert!(matches!(
-        compile(&prog),
-        Err(JitError::Unsupported { at: 2, .. })
-    ));
+    let compiled = compile(&prog).expect("a nested sleepable call must compile");
+    assert_eq!(compiled.suspend_points.len(), 1);
+    assert_eq!(compiled.suspend_points[0].insn_index, 2);
+    assert_eq!(compiled.return_points.len(), 1);
+    assert_eq!(compiled.return_points[0].return_id, 1);
+    assert_eq!(compiled.return_points[0].insn_index, 0);
+    assert_eq!(compiled.return_points[0].caller_stack_bytes, 0);
+    assert!(
+        !compiled
+            .code
+            .windows(8)
+            .any(|window| window == SHIM.to_le_bytes()),
+        "a nested sleepable shim address must not be materialised into native code"
+    );
 }
 
 #[test]

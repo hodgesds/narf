@@ -24,12 +24,10 @@ net classifier, perf).
 `LD_IND`, unprivileged BPF, and Linux's map-type zoo beyond the five native
 kinds in §3.4.
 
-**Out of scope, for now:** offloaded programs, CO-RE relocation in-kernel (it
-is a userspace concern), and native suspension from inside a BPF subprogram
-call chain (§8.5). Root-program kfunc calls whose verifier metadata says the
-shim may suspend use the checkpoint/resume ABI in §3.18; a nested suspension
-site keeps the whole image interpreted until the JIT has explicit BPF
-call-state lowering.
+**Out of scope, for now:** offloaded programs and CO-RE relocation in-kernel
+(it is a userspace concern). Kfunc calls whose verifier metadata says the shim
+may suspend use the checkpoint/resume ABI in §3.18, including calls reached
+through a verified BPF subprogram call chain.
 
 ## 2. Assumptions
 
@@ -526,9 +524,9 @@ those to the object-safe `StructOpsFuture<'a, T>` ABI and dispatches through
 `BpfProg::run_struct_ops_sleepable`. The future is `Send`, owns its heap stack,
 and may be cancelled by drop. A synchronous adapter may not conceal it with
 `block_on`. A compiled sleepable program runs on that owned heap stack and may
-checkpoint at a root-program `may_suspend` kfunc call as specified in §3.18.
-A program with a nested suspension site starts in the interpreter; native
-execution never falls back after partially executing the program.
+checkpoint at any `may_suspend` kfunc call as specified in §3.18, including a
+site inside a BPF subprogram. Native execution never falls back after partially
+executing the program.
 
 A target marked `#[context(Mixed)]` marks each ordinary method
 `#[context(Atomic)]` and each `async fn` method `#[context(Sleepable)]`. The
@@ -548,18 +546,33 @@ The full atomic and sleepable requirements and acceptance tests are in
 The native entry ABI is
 `(frame_top, ctx_ptr, fuel, arena_slot_base, continuation_ptr) -> (value,
 status)`. The fifth argument addresses a future-owned `NativeContinuation`
-containing R0-R10, remaining fuel, and a compiler-issued resume id. It is
-parked outside the BPF register map and is never exposed to the program.
+containing R0-R10, remaining fuel, a compiler-issued resume id, and a bounded
+array of compiler-managed BPF caller frames. Each caller frame contains only
+R6-R10 and a compiler-issued return id. The continuation is parked outside the
+BPF register map and is never exposed to the program.
 
-At a verifier-resolved root-program call whose `KfuncCallSite::may_suspend` is
-true, emitted code saves the register image and fuel, writes that site's
-one-based id, and returns `status::SUSPEND`. A synchronous call that merely
-requires `Context::Sleepable` remains a direct native call. Rust resolves the
-id against the immutable `SuspendPoint` table carried by the sealed image,
-looks up the same kfunc id in the boot-time registry, and polls only its
-`KfuncShim::Sleepable` future. Completion writes the result to saved R0,
-clears R1-R5, and re-enters the image. The entry dispatcher accepts only its
-embedded ids, restores the saved state, clears the id, and branches to the
+In a continuation-enabled image, every BPF-to-BPF call saves R6-R10 and its
+one-based return id in the next fixed caller-frame slot, publishes the bounded
+depth, descends R10 by the verifier-computed caller stack size, and branches to
+the fixed callee target without creating a native return-address chain. A
+subprogram `exit` pops that state, restores R6-R10, and returns only through the
+compiler-emitted return-id table. Depth overflow, underflow, or an unknown
+return id returns `BAD_CALL_STATE`; continuation memory is never interpreted as
+a native address.
+
+At any verifier-resolved call whose `KfuncCallSite::may_suspend` is true,
+emitted code saves the register image and fuel, writes that site's one-based
+id, and returns `status::SUSPEND`. A synchronous call that merely requires
+`Context::Sleepable` remains a direct native call. Rust resolves the id against
+the immutable `SuspendPoint` table carried by the sealed image and validates
+the complete caller chain before invoking the kfunc: the depth fits the fixed
+array, every return id belongs to the image, each saved R10 matches the expected
+caller frame, every verifier-computed stack descent stays in the future-owned
+stack, and the live R10 names the resulting current frame. It then looks up the
+same kfunc id in the boot-time registry and polls only its
+`KfuncShim::Sleepable` future. Completion writes the result to saved R0, clears
+R1-R5, and re-enters the image. The entry dispatcher accepts only its embedded
+ids, restores the saved state, clears the id, and branches to the
 compiler-selected instruction after the call. An id is never interpreted as
 an address; an unknown id returns `BAD_RESUME`.
 
@@ -568,13 +581,9 @@ are all owned by the pinned invocation future. Remaining fuel is restored, not
 refilled. Every native slice and every kfunc-future poll receives a separate
 `DomainId::BPF` scope, so no domain-rights snapshot, per-CPU lease, lock guard,
 or host return-address stack crosses `Pending`. Dropping the invocation drops
-the boxed kfunc future and all continuation storage.
-
-Calls marked `may_suspend` inside a BPF subprogram currently make compilation
-return `Unsupported`, selecting the interpreter before the first instruction
-runs. Supporting those sites requires explicit BPF subprogram frames and
-return indices in continuation memory; capturing or reconstructing the host
-call stack is forbidden.
+the boxed kfunc future and all continuation storage. The caller-frame array is
+bounded by the verifier's `MAX_CALL_DEPTH`; capturing or reconstructing a host
+return-address stack is forbidden.
 
 ## 4. Invariants
 
@@ -678,6 +687,14 @@ its callers may supply only a Rust slice, and raw execution cannot forge the
 context. The interpreter checks the borrowed slice again, while native code is
 admitted only at a verifier-certified access site. The borrow ends synchronously
 before the RX caller may recycle the DMA buffer or the test-run syscall returns.
+
+**4.14 — A native sleepable continuation contains no native control-flow
+address.** Resume and subprogram return state use one-based compiler-issued ids
+resolved only through immutable tables embedded in the sealed image. Explicit
+caller frames are bounded by `MAX_CALL_DEPTH`, retain only BPF R6-R10 plus the
+return id, and are validated against the invocation's owned stack before Rust
+polls a suspending kfunc. Malformed depth, frame-pointer progression, resume id,
+or return id stops the invocation; it cannot select an indirect branch target.
 
 ## 5. Architecture notes
 
@@ -792,12 +809,12 @@ and the perf event layer, all of which are closed.
 4. **`struct_ops!` form (resolved).** The macro re-declares the target trait so
    the Rust signature is also the verifier contract. Sleepable declarations
    use `async fn` syntax and lower to the object-safe `StructOpsFuture` return.
-5. **Native sleep inside BPF subprograms.** Root-program `may_suspend` calls
-   now checkpoint through compiler-issued ids and future-owned register, fuel,
-   and stack state. Such a call below a BPF-to-BPF call still selects the
-   interpreter because the native host return-address stack cannot cross an
-   await. Native support requires explicit BPF subprogram frames and return
-   indices in the continuation.
+5. **Native sleep inside BPF subprograms (resolved).** Continuation-enabled
+   images lower every BPF-to-BPF call to a fixed, verifier-bounded caller frame
+   containing R6-R10 and a compiler-issued return id. A subprogram `exit`
+   restores that frame and dispatches through an immutable return table, so no
+   host return-address stack crosses an await. Rust validates the saved R10
+   chain, stack bounds, depth, and ids before polling the nested kfunc future.
 6. **Making JIT text unwritable, not merely un-aliased-executable.** The first
    half of this is **done**: `mmu::init_mmu` and `frame/src/aarch64/boot.S`
    build every kernel window NX/`PXN|UXN` except `[__kernel_start,
@@ -947,9 +964,10 @@ and the perf event layer, all of which are closed.
    future, sets `KfuncDesc::may_suspend`, and is always described as
    `Context::Sleepable`. A synchronous shim may independently require that
    context without setting `may_suspend`. The interpreter awaits boxed-future
-   shims directly; native root-program sites checkpoint to Rust, which polls
-   the same typed future and resumes through a compiler-issued id. Native code
-   never calls the boxed-future shim through the synchronous ABI.
+   shims directly; native sites checkpoint to Rust, which polls the same typed
+   future and resumes through a compiler-issued id. This includes sites inside
+   BPF subprograms, whose caller chain uses §3.18's explicit fixed-id frames.
+   Native code never calls the boxed-future shim through the synchronous ABI.
    `interp::drive` remains a test/benchmark helper only for self-waking futures;
    real I/O waits run on the executor through a future-returning hook such as
    sleepable struct ops.

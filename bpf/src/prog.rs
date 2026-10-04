@@ -1605,6 +1605,12 @@ impl BpfProg {
                     what: "native continuation id was not emitted by this image",
                 })
             }
+            narf_bpf_jit::status::BAD_CALL_STATE => {
+                Outcome::Trapped(crate::interp::Trap::Unsupported {
+                    at: 0,
+                    what: "native BPF subprogram call state was invalid",
+                })
+            }
             // Unreachable: the emitters return one of the known statuses and
             // nothing else. Treated as a stop rather than a value, because the
             // one thing that must not happen is a status nobody understands
@@ -1774,9 +1780,10 @@ impl BpfProg {
         // native-call stack frame: a sleepable shim may retain a verifier-
         // approved context-derived pointer until it completes.
         let ctx = Self::native_context(ctx, ctx_len);
-        let expected_top = {
+        let (stack_base, expected_top) = {
             let bytes = stack.bytes_mut();
-            bytes.as_ptr() as u64 + bytes.len() as u64
+            let base = bytes.as_ptr() as u64;
+            (base, base + bytes.len() as u64)
         };
         let mut continuation = narf_bpf_jit::NativeContinuation::default();
 
@@ -1806,8 +1813,8 @@ impl BpfProg {
                 }));
             };
             if continuation.resume_id != u64::from(resume_id)
-                || continuation.regs[10] != expected_top
                 || continuation.fuel > self.initial_fuel
+                || !Self::native_call_state_is_valid(image, &continuation, stack_base, expected_top)
             {
                 return Some(Outcome::Trapped(crate::interp::Trap::Unsupported {
                     at: point.insn_index,
@@ -1841,6 +1848,41 @@ impl BpfProg {
             continuation.regs[0] = result;
             continuation.regs[1..6].fill(0);
         }
+    }
+
+    fn native_call_state_is_valid(
+        image: &crate::jit_glue::JitImage,
+        continuation: &narf_bpf_jit::NativeContinuation,
+        stack_base: u64,
+        stack_top: u64,
+    ) -> bool {
+        let Ok(depth) = usize::try_from(continuation.call_depth) else {
+            return false;
+        };
+        if depth > continuation.call_frames.len() {
+            return false;
+        }
+        let mut expected_frame = stack_top;
+        for frame in &continuation.call_frames[..depth] {
+            if frame.saved[4] != expected_frame {
+                return false;
+            }
+            let Ok(return_id) = u32::try_from(frame.return_id) else {
+                return false;
+            };
+            let Some(point) = image.return_point(return_id) else {
+                return false;
+            };
+            let Some(next_frame) = expected_frame.checked_sub(u64::from(point.caller_stack_bytes))
+            else {
+                return false;
+            };
+            if next_frame < stack_base {
+                return false;
+            }
+            expected_frame = next_frame;
+        }
+        continuation.regs[10] == expected_frame
     }
 
     async fn run_sleepable_interpreted_inner(

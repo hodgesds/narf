@@ -11,8 +11,8 @@ the program equivalent to a trusted kernel module.
 
 Current status: the atomic requirements, the sleepable ABI, mixed
 atomic/sleepable targets, and native checkpoint/resume execution for
-root-program `may_suspend` kfunc calls are implemented. Such a call inside a
-BPF subprogram remains interpreted until explicit call-state lowering lands.
+`may_suspend` kfunc calls are implemented, including calls reached through BPF
+subprograms with explicit verifier-bounded caller frames.
 
 ## Shared method contract
 
@@ -135,13 +135,15 @@ the subsystem.
 A sleepable context does not imply that a particular program will suspend. An
 image with only synchronous calls runs to completion inside one poll on the
 invocation's owned heap stack, including synchronous kfuncs that themselves
-require sleepable context. At each verifier-resolved root-program call marked
-`may_suspend`, emitted code checkpoints to Rust instead of calling
+require sleepable context. At each verifier-resolved call marked `may_suspend`,
+emitted code checkpoints to Rust instead of calling
 `KfuncShim::Sleepable` through the synchronous machine-code ABI. The
 implemented checkpoint/resume contract:
 
 - saves R0-R10, remaining fuel, a compiler-issued resume id, and the BPF stack
   in future-owned memory;
+- represents every live BPF caller with a fixed-depth frame containing only
+  R6-R10 and a compiler-issued return id, never a host return address;
 - returns a dedicated suspend status to Rust, which resolves the verifier-bound
   kfunc site and invokes its typed sleepable shim with the saved R1-R5 values;
 - keeps the boxed kfunc future in the invocation until it completes or the
@@ -149,6 +151,8 @@ implemented checkpoint/resume contract:
 - writes the completed kfunc result to saved R0 and resumes only through a
   compiler-emitted target table—never a program-controlled native address;
 - preserves the one total fuel tank across every resume;
+- validates caller depth, every return id, the saved R10 chain, and every stack
+  descent against the invocation-owned heap stack before polling the kfunc;
 - enters the BPF hardware domain around every native or kfunc-future poll and
   restores neutral rights before returning `Pending`;
 - carries no per-CPU stack lease, host call stack, lock guard, or hardware-rights
@@ -156,11 +160,11 @@ implemented checkpoint/resume contract:
 - retains the existing exact method contract, arena ownership, map lifetime,
   trap mapping, cancellation, and attachment admission semantics.
 
-Suspending from a BPF subprogram still requires explicit call-state lowering;
-the host return-address stack cannot be captured and migrated. The current
-backend rejects such an image before execution and runs the complete
-interpreter instead; it never falls back after partially executing native code
-or resumes with a fabricated call chain.
+Continuation-enabled images lower BPF-to-BPF calls to those explicit frames
+and return through a compiler-emitted fixed-id table. Overflow, underflow, an
+unknown id, or an invalid frame-pointer chain stops the invocation. The host
+return-address stack is neither captured nor reconstructed, and native
+execution never falls back after partially executing the program.
 
 ## Mixed-context targets
 
@@ -228,8 +232,9 @@ sleepable stack program, requires the native form to complete in one poll, and
 checks that it restores domain rights. Native continuation coverage uses two
 distinct resume sites, retains callee-saved and heap-stack state, lets a boxed
 kfunc future retain a bounded stack slice across `Pending`, preserves fuel,
-exercises cancellation and detach through struct ops, and requires a nested
-sleep site to select the interpreter before execution.
+exercises cancellation and detach through struct ops, executes a three-frame
+nested sleep site natively against the interpreter, and rejects an unknown
+compiler-managed return id without an indirect branch.
 
 Mixed-target coverage additionally includes exact-context load rejection for
 both method kinds, immediate atomic dispatch, multi-poll sleepable dispatch,
