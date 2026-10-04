@@ -92,12 +92,16 @@ Per-node ops live on `Ext2Node`, which implements both `FileOps` and
   `write` returns. Write-through rather than Linux's dirty-and-writeback
   keeps every POSIX/Linux-observable result (read-after-write, mmap
   coherence, durability after `fsync`) while needing no writeback for
-  `write(2)`; only stores through mappings dirty pages. A failed block write
-  leaves the page dirty for writeback. `fsync` writes back dirty pages and
-  flushes the device cache. `truncate` zeroes the new last block's tail in
-  the cache and on disk (`block_truncate_page`) and drops every page past the
-  new EOF (`truncate_inode_pages`); directories are read through the
-  block-device mapping, where `dir_mut` maintains them.
+  `write(2)`; only stores through mappings dirty pages. `mmap_fault` returns
+  that exact `FileMapping` folio (and conservatively marks it dirty because
+  hardware PTE dirty-bit harvesting is not yet wired), so hard-link aliases,
+  `read(2)`, and `write(2)` all observe one physical page. A failed block
+  write leaves the page dirty for writeback. `fsync` writes back dirty pages
+  and flushes the device cache. `truncate` first publishes the smaller size
+  and revokes every mapped page wholly beyond it, then zeroes the new last
+  block's tail in the cache and on disk (`block_truncate_page`) and drops
+  every page past the new EOF (`truncate_inode_pages`); directories are read
+  through the block-device mapping, where `dir_mut` maintains them.
 - **Root metadata is real inode metadata.** Mount loads inode 2 and every
   successful inode-2 write refreshes the synchronous `FsInstance::root()`
   snapshot.

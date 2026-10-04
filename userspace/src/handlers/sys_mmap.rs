@@ -657,24 +657,27 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(base));
                 return;
             }
-            // Demand-paged device mapping. `mmap_frames` is answered once, so
+            // Demand-paged device/file mapping. `mmap_frames` is answered once, so
             // a file that can grow behind a live mapping cannot use it — a page
             // backed after this call would never appear. Such files implement
             // `mmap_fault` instead and are mapped with every slot unbacked;
             // each page's first touch routes through `mapped_file::demand_frame`
             // to the file. A BPF arena is the first of these.
             //
-            // The probe *is* the first fault: `mmap_fault` is idempotent per
-            // offset, so asking here costs nothing beyond backing a page the
-            // caller is about to touch anyway, and it means no second trait
-            // method exists purely to answer "do you support this?".
-            if ops.mmap_fault(offset).is_ok() {
+            // Capability discovery must be side-effect free. A valid direct
+            // file mapping can begin beyond today's EOF and fault with SIGBUS
+            // until the file grows; probing that offset here would wrongly
+            // route the whole VMA through the generic-copy fallback.
+            if ops.supports_mmap_fault() {
                 // Installed here rather than at boot: a FILE_DEMAND region
                 // cannot exist before this line has run, so there is no window
                 // in which a fault could find the hook missing, and no
                 // boot-order constraint of the kind §4.1 imposes on the BPF
                 // page-table slots.
                 narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+                narf_filesystem::install_mmap_truncate_hook(
+                    crate::mapped_file::truncate_file_mappings,
+                );
                 let region = Region {
                     base: VirtAddr::new(base),
                     len,
@@ -2333,16 +2336,16 @@ mod tests {
                     == 0,
             )
         };
-        // `sys_mmap` probes support by faulting the first page, so page 0 is
-        // backed in the *arena* — but nothing is backed in the *region*, which
-        // is the point: the region is entirely demand-paged.
+        // Capability discovery is side-effect free: neither the arena nor
+        // the Region is backed until an actual fault. This matters for files
+        // whose first mapped offset is temporarily beyond EOF.
         if unbacked(0) != Some(true) || unbacked(2) != Some(true) {
             arena_test_teardown();
             return TestResult::Fail("the arena mapping was eagerly backed");
         }
-        if arena.len_bytes() != 4096 {
+        if arena.len_bytes() != 0 {
             arena_test_teardown();
-            return TestResult::Fail("the mmap probe did not back exactly the first page");
+            return TestResult::Fail("mmap populated the arena before a page fault");
         }
 
         // ── direction 1: the kernel grows the arena under the live mapping ──

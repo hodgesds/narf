@@ -494,6 +494,37 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         self.state.lock().stat
     }
 
+    fn mmap_is_ram(&self) -> bool {
+        true
+    }
+
+    fn supports_mmap_fault(&self) -> bool {
+        true
+    }
+
+    /// `filemap_fault`: expose the same canonical folio used by read/write.
+    /// The mapping is conservatively dirty from its first fault because NARF
+    /// does not yet collect hardware PTE dirty bits for filesystem writeback.
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {
+        if offset % PAGE_SIZE as u64 != 0 || offset >= self.stat().size {
+            return Err(FsError::InvalidData);
+        }
+        let page = offset / PAGE_SIZE as u64;
+        loop {
+            let folio = narf_scheduler::block_on_spin(self.file_page(page))?;
+            // A concurrent shrink publishes its new i_size before removing
+            // folios. Never install a newly-obsolete page after that point.
+            if offset >= self.stat().size {
+                return Err(FsError::InvalidData);
+            }
+            if !folio.published() {
+                continue;
+            }
+            assert!(self.mapping.mark_dirty(page));
+            return Ok(folio.mmap_frame());
+        }
+    }
+
     fn ino(&self) -> u64 {
         // Real on-disk inode number — distinct per file, so musl's
         // DSO dedup by (st_dev, st_ino) never collapses two libraries.
@@ -516,6 +547,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            let new_size = u32::try_from(len).map_err(|_| FsError::InvalidData)?;
             let _update = self.volume.inode_update_lock.lock().await;
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
@@ -523,12 +555,27 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
                 return Err(FsError::InvalidPath);
             }
             let old_size = u64::from(inode.size);
+            if len < old_size {
+                // Publish i_size first so a racing fault at/after the new EOF
+                // fails. Then revoke every existing borrowed PTE before cache
+                // folios are removed or block ownership changes.
+                let mut visible = inode;
+                visible.size = new_size;
+                self.set_cached_inode(visible);
+                if let Err(error) = narf_filesystem::unmap_mapping_range(self, len) {
+                    self.set_cached_inode(inode);
+                    return Err(error);
+                }
+            }
             if len == 0 {
-                self.volume.truncate_inode(&mut inode).await?;
+                if let Err(error) = self.volume.truncate_inode(&mut inode).await {
+                    self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
+                    return Err(error);
+                }
             } else {
                 // Shrinking keeps the blocks past the new end allocated (no
                 // partial block-tree truncation yet); growing is size only.
-                inode.size = len as u32;
+                inode.size = new_size;
             }
             if len < old_size {
                 // `ext2_setsize` -> `block_truncate_page`: zero the rest of
@@ -536,9 +583,15 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
                 // so a later extension reads zeros there rather than the old
                 // bytes. Done before the size shrinks in the cached inode so
                 // the page still fills with the pre-truncate contents.
-                self.zero_tail_after(&mut inode, len).await?;
+                if let Err(error) = self.zero_tail_after(&mut inode, len).await {
+                    self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
+                    return Err(error);
+                }
             }
-            self.volume.write_inode(inode_no, &inode).await?;
+            if let Err(error) = self.volume.write_inode(inode_no, &inode).await {
+                self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
+                return Err(error);
+            }
             if len < old_size {
                 // `truncate_pagecache`: drop every page wholly past the new
                 // EOF, so nothing beyond it can be read back from the cache.

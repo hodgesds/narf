@@ -254,6 +254,10 @@ pub trait FileOps {
     fn acknowledge_poll_readiness(&self, readiness: u32);
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError>;
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
+    fn mmap_is_ram(&self) -> bool;
+    fn supports_mmap_fault(&self) -> bool;
+    fn mmap_backing_identity(&self) -> usize;
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError>;
     fn mmap_cache_generation(&self) -> Option<u64>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
     fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError>;
@@ -290,6 +294,8 @@ pub enum FileType {
     Socket,
     Fifo,
 }
+pub fn install_mmap_truncate_hook(hook: fn(&dyn FileOps, u64) -> Result<(), FsError>);
+pub fn unmap_mapping_range(file: &dyn FileOps, new_len: u64) -> Result<(), FsError>;
 ```
 
 `DirOps::create_with_attrs` publishes a new inode with the requested owner and
@@ -782,6 +788,17 @@ only while its recorded generation matches. The cache keeps only a weak file
 reference, never discards a dirty page, and files returning `None` retain the
 conservative final-unmap reclamation behavior.
 
+`supports_mmap_fault` is the side-effect-free capability check for direct
+demand backing. It is deliberately separate from `mmap_fault`: a refusal at
+an offset beyond the current EOF must not make `mmap(2)` select the generic
+copy fallback for the whole VMA. A filesystem shrinking such a direct-mapped
+file calls `unmap_mapping_range` before retiring its cache folios; userspace
+installs the VMA-owning hook during common boot, while standalone filesystem
+tests with no userspace mappings safely observe a no-op.
+`mmap_backing_identity` identifies the live object owning those pages;
+forwarding wrappers preserve the underlying value so a truncate issued by the
+backing filesystem still finds and revokes VMAs owned by the wrapper.
+
 Ordinary unlocked generic shared mappings are demand-backed: VMA publication
 records absent page slots and first access resolves the canonical cache page.
 `MAP_LOCKED` and blocking `MAP_POPULATE` retain eager materialization; combining
@@ -833,7 +850,11 @@ consumer can recognise aliases of the same `(filesystem, inode)` pair.
   protocol as above (the filesystem's `->read_folio` is the `fill`);
   `mark_dirty`/`take_dirty` drive writeback; `remove_from(page)` is
   `truncate_inode_pages` (`PageCache::remove_range`: removes dirty folios and
-  voids fills too — the bytes cease to exist).
+  voids fills too — the bytes cease to exist). `FileFolio::mmap_frame`
+  returns the physical cache page and acquires one external alias reference;
+  failed PTE publication or later unmap releases it through the shared-frame
+  hook. One strong folio hold spans all aliases, so a borrowed user PTE can
+  never outlive or race reclaim of its cache frame.
 - Reclaim evicts only clean folios whose sole reference is the cache's own.
   A folio someone holds is in use *as the cache's copy* (a writer updating
   it, a reader copying out, a user mapping) — evicting it would let the next
@@ -846,7 +867,8 @@ consumer can recognise aliases of the same `(filesystem, inode)` pair.
   `smoke_global_alloc_failure_has_no_inline_reclaim_or_retry` pins. The
   shrinker entry points (`shrink`, `reclaimable`) only `try_lock` the cache,
   so reclaim can never deadlock against it. Registry order is
-  `PAGE_CACHE_REGISTRY` → cache lock.
+  `PAGE_CACHE_REGISTRY` → cache lock. The mapped-folio physical registry
+  does not nest with either and drops its last strong hold after unlocking.
 - Capacity, watermark reclaim, and shrinker counts are expressed in base
   pages, not folio heads. CLOCK recency and dirty/writeback state are per
   folio; reclaim never splits a folio and never evicts a dirty folio or a

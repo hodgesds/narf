@@ -569,6 +569,10 @@ impl narf_filesystem::FileOps for ArenaFile {
     /// The frame is mapped borrowed: the arena keeps owning it, and the
     /// mapping's `Arc<dyn FileOps>` is what keeps the arena alive for at least
     /// as long as the mapping (see `Arena::drop`).
+    fn supports_mmap_fault(&self) -> bool {
+        true
+    }
+
     fn mmap_fault(&self, offset: u64) -> Result<u64, narf_filesystem::FsError> {
         // The syscall layer page-aligns this, but it is a trust boundary for
         // the page index below, so it is checked rather than assumed.

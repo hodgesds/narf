@@ -51,6 +51,12 @@
 //! * Folio frames are allocated *outside* the lock (`CacheFolio::alloc_*`),
 //!   by the filler, after it owns the ticket.
 //! * Registry order is `PAGE_CACHE_REGISTRY` → `Inner`.
+//! * `MAPPED_FILE_FOLIOS` never nests with either registry or `Inner`.
+//!   A demand-fault answer registers the physical-page identity and acquires
+//!   one alias count before returning it to memory; failed publication and
+//!   the eventual unmap both use the memory shared-frame release hook. One
+//!   strong folio hold spans all aliases, making mapped folios ineligible for
+//!   reclaim without putting filesystem types in the memory TCB.
 //!
 //! # Reclaim
 //!
@@ -175,6 +181,60 @@ fn free_pages_available() -> Option<usize> {
 static PAGE_CACHE_REGISTRY: IrqSafeSpinLock<Vec<Weak<PageCache>>> =
     IrqSafeSpinLock::new(Vec::new());
 static SHRINKER_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+/// Physical pages which have been offered by [`FileFolio::mmap_frame`]. A
+/// weak identity recognizes the address at the cross-layer retain/release
+/// hooks; the first offered alias takes the strong `hold`, and the last PTE
+/// release drops it.
+struct MappedFileFolio {
+    folio: Weak<CacheFolio>,
+    hold: Option<Arc<CacheFolio>>,
+    aliases: usize,
+}
+
+static MAPPED_FILE_FOLIOS: IrqSafeSpinLock<BTreeMap<u64, MappedFileFolio>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Retain a page-cache folio for one shared PTE alias. Returns false when
+/// `phys` does not identify a page offered by [`FileFolio::mmap_frame`].
+pub fn retain_mapped_folio(phys: u64) -> bool {
+    let mut mapped = MAPPED_FILE_FOLIOS.lock();
+    let Some(entry) = mapped.get_mut(&phys) else {
+        return false;
+    };
+    let Some(folio) = entry.folio.upgrade() else {
+        mapped.remove(&phys);
+        return false;
+    };
+    entry.aliases = entry
+        .aliases
+        .checked_add(1)
+        .expect("mapped file-folio alias count overflowed");
+    if entry.hold.is_none() {
+        entry.hold = Some(folio);
+    }
+    true
+}
+
+/// Release one shared PTE alias acquired by [`retain_mapped_folio`].
+pub fn release_mapped_folio(phys: u64) -> bool {
+    let retired = {
+        let mut mapped = MAPPED_FILE_FOLIOS.lock();
+        let Some(entry) = mapped.get_mut(&phys) else {
+            return false;
+        };
+        assert!(entry.aliases != 0, "mapped file-folio alias underflow");
+        entry.aliases -= 1;
+        (entry.aliases == 0).then(|| {
+            mapped
+                .remove(&phys)
+                .expect("mapped file-folio entry disappeared")
+        })
+    };
+    // A last Arc may return buddy frames; never do that under this registry.
+    drop(retired);
+    true
+}
 
 /// Register `cache` with the central memory reclaimer so its clean pages
 /// can be shed under pressure. Call once per cache after it is wrapped in
@@ -332,6 +392,19 @@ impl core::ops::DerefMut for CacheFolio {
 
 impl Drop for CacheFolio {
     fn drop(&mut self) {
+        // A mapping hold makes final drop impossible while aliases remain.
+        // Remove weak registrations left by a fault whose PTE publication
+        // failed, so repeated failed faults cannot grow the registry forever.
+        {
+            let mut mapped = MAPPED_FILE_FOLIOS.lock();
+            let base = self.frame.start_address().raw();
+            for page in 0..self.page_count() {
+                let phys = base + (page * PAGE_SIZE) as u64;
+                if mapped.get(&phys).is_some_and(|entry| entry.aliases == 0) {
+                    mapped.remove(&phys);
+                }
+            }
+        }
         if self.order == 0 {
             narf_memory::free_frame(self.frame);
         } else {
@@ -1406,6 +1479,45 @@ impl FileFolio {
     /// place or to map.
     pub const fn published(&self) -> bool {
         self.published
+    }
+
+    /// Offer this published cache page as borrowed `MAP_SHARED` backing,
+    /// acquire the alias reference consumed by the demand-fault path, and
+    /// return its physical address. Memory calls [`release_mapped_folio`] if
+    /// publication fails and again when a published PTE is unmapped, keeping
+    /// the canonical cache folio alive and unreclaimable for exactly the PTE
+    /// lifetime.
+    pub fn mmap_frame(&self) -> u64 {
+        assert!(self.published, "cannot map an unpublished file folio");
+        let phys = self.data.frame.start_address().raw() + self.offset as u64;
+        let weak = Arc::downgrade(&self.data);
+        let mut mapped = MAPPED_FILE_FOLIOS.lock();
+        match mapped.get_mut(&phys) {
+            Some(entry) => {
+                assert!(
+                    entry.folio.ptr_eq(&weak),
+                    "two live file folios claim one physical page"
+                );
+                entry.aliases = entry
+                    .aliases
+                    .checked_add(1)
+                    .expect("mapped file-folio alias count overflowed");
+                if entry.hold.is_none() {
+                    entry.hold = Some(self.data.clone());
+                }
+            }
+            None => {
+                mapped.insert(
+                    phys,
+                    MappedFileFolio {
+                        folio: weak,
+                        hold: Some(self.data.clone()),
+                        aliases: 1,
+                    },
+                );
+            }
+        }
+        phys
     }
 
     fn ptr(&self, offset: usize, len: usize) -> *mut u8 {

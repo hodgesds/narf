@@ -1365,6 +1365,22 @@ pub trait FileOps: Send + Sync {
         false
     }
 
+    /// Whether [`FileOps::mmap_fault`] is a supported backing path.
+    ///
+    /// This is an explicit capability rather than a speculative call to
+    /// `mmap_fault`: a fault outside the current EOF is a valid refusal, not
+    /// evidence that the file cannot supply cache folios for other offsets.
+    fn supports_mmap_fault(&self) -> bool {
+        false
+    }
+
+    /// Stable identity of the object whose direct mmap pages this operation
+    /// exposes. Wrappers which forward `mmap_fault` and `truncate` to another
+    /// file must forward this too, so truncation can find their VMA owners.
+    fn mmap_backing_identity(&self) -> usize {
+        self as *const Self as *const () as usize
+    }
+
     /// Retain at most max bytes from the file page containing offset.
     /// None is EOF. Unsupported selects copy_splice_read-style buffered I/O.
     /// Providers acquire the physical retain while their backing lock excludes
@@ -1421,9 +1437,10 @@ pub trait FileOps: Send + Sync {
     /// and the address space keeps whichever answer it records first — a
     /// second, different frame would simply be dropped on the floor.
     ///
-    /// The default returns [`FsError::Unsupported`], which is also how the
-    /// syscall layer probes: a file that supports neither `mmap_frames` nor
-    /// this falls through to the private-copy file-mapping path.
+    /// The default returns [`FsError::Unsupported`]. Implementations must
+    /// also return `true` from [`FileOps::supports_mmap_fault`]; the syscall
+    /// layer uses that side-effect-free capability check when creating the
+    /// initially unbacked VMA.
     fn mmap_fault(&self, _offset: u64) -> Result<u64, FsError> {
         Err(FsError::Unsupported)
     }
@@ -1762,6 +1779,36 @@ pub trait FileOps: Send + Sync {
     fn can_poll(&self) -> bool {
         true
     }
+}
+
+/// Userspace-owned invalidation hook for shrinking a file which exposes its
+/// page-cache folios through [`FileOps::mmap_fault`]. Filesystems call
+/// [`unmap_mapping_range`] before removing those folios from their cache, so
+/// no borrowed user PTE can outlive the frame it names.
+type MmapTruncateHook = fn(&dyn FileOps, u64) -> Result<(), FsError>;
+
+static MMAP_TRUNCATE_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the cross-layer `unmap_mapping_range` bridge. The userspace layer
+/// owns VMA metadata and installs this once during common boot initialization.
+pub fn install_mmap_truncate_hook(hook: MmapTruncateHook) {
+    MMAP_TRUNCATE_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Remove every mapped page wholly beyond `new_len` before a filesystem
+/// retires the corresponding cache folios. With no userspace layer installed
+/// (standalone filesystem tests), there cannot be a live userspace mapping,
+/// so the operation is a no-op.
+pub fn unmap_mapping_range(file: &dyn FileOps, new_len: u64) -> Result<(), FsError> {
+    let raw = MMAP_TRUNCATE_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return Ok(());
+    }
+    // SAFETY: the only writer is `install_mmap_truncate_hook`, which stores
+    // exactly an `MmapTruncateHook` function pointer.
+    let hook: MmapTruncateHook = unsafe { core::mem::transmute(raw) };
+    hook(file, new_len)
 }
 
 /// [`FileOps::can_poll`] for an inode belonging to a REAL filesystem — one

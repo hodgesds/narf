@@ -1643,19 +1643,93 @@ pub(crate) fn flush_current_range(base: u64, len: u64) -> Result<(), ()> {
     let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
         return Ok(());
     };
-    let mappings: Vec<(Arc<dyn FileOps>, FileWriteback)> = owner_bucket
-        .lock()
-        .iter()
-        .filter(|mapping| mapping.base < end && base < mapping.base.saturating_add(mapping.len))
-        .filter_map(|mapping| {
-            mapping
-                .writeback
-                .clone()
-                .map(|wb| (Arc::clone(&mapping.ops), wb))
-        })
-        .collect();
+    let (mappings, files) = {
+        let owners = owner_bucket.lock();
+        let mut mappings = Vec::new();
+        let mut files: Vec<Arc<dyn FileOps>> = Vec::new();
+        for mapping in owners
+            .iter()
+            .filter(|mapping| mapping.base < end && base < mapping.base.saturating_add(mapping.len))
+        {
+            if let Some(writeback) = mapping.writeback.clone() {
+                mappings.push((Arc::clone(&mapping.ops), writeback));
+            }
+            if !mapping.private_copy && !files.iter().any(|file| Arc::ptr_eq(file, &mapping.ops)) {
+                files.push(Arc::clone(&mapping.ops));
+            }
+        }
+        (mappings, files)
+    };
     for (ops, mapping) in mappings {
         flush_mappings(&ops, alloc::vec![mapping])?;
+    }
+    // Direct page-cache mappings have no fallback frames to copy. Their
+    // filesystem marks faulted folios dirty, so msync completes by driving
+    // that inode's ordinary writeback path after all fallback copies.
+    for ops in files {
+        match crate::handlers::poll_blocking(ops.fsync(false)) {
+            Some(Ok(())) => {}
+            _ => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+/// Linux `unmap_mapping_range` for a shrinking direct-mapped file. Remove the
+/// page-aligned suffix of every VMA whose file offsets are wholly beyond the
+/// new EOF. This runs before the filesystem removes cache folios, balancing
+/// their external mapping holds while the frames are still owned.
+pub fn truncate_file_mappings(
+    file: &dyn FileOps,
+    new_len: u64,
+) -> Result<(), narf_filesystem::FsError> {
+    let first_invalid = new_len
+        .checked_add(4095)
+        .ok_or(narf_filesystem::FsError::InvalidData)?
+        & !4095;
+    let mut spaces = crate::handlers::all_address_spaces();
+    if let Some(current) = crate::handlers::active_user_as() {
+        if !spaces.iter().any(|space| Arc::ptr_eq(space, &current)) {
+            spaces.push(current);
+        }
+    }
+
+    for address_space in spaces {
+        let id = address_space.identity();
+        let Some(owner_bucket) = existing_mapping_owners(id) else {
+            continue;
+        };
+        let ranges: Vec<(u64, u64)> = owner_bucket
+            .lock()
+            .iter()
+            .filter(|mapping| mapping.ops.mmap_backing_identity() == file.mmap_backing_identity())
+            .filter_map(|mapping| {
+                let file_end = mapping.file_offset.checked_add(mapping.len)?;
+                let invalid_offset = first_invalid.max(mapping.file_offset);
+                (invalid_offset < file_end).then(|| {
+                    let base = mapping.base + (invalid_offset - mapping.file_offset);
+                    (base, file_end - invalid_offset)
+                })
+            })
+            .collect();
+        for (base, len) in ranges {
+            let result = address_space.with_vma_transaction(|| {
+                narf_memory::with_address_space_shared_mapping_transaction(id, || {
+                    publish_current_punch(id, base, len, || {
+                        // SAFETY: the enclosing closures hold this address
+                        // space's VMA and shared-owner transactions in order.
+                        unsafe {
+                            address_space.punch_fixed_locked_for_syscall_with_shared(
+                                narf_memory::VirtAddr::new(base),
+                                len,
+                                true,
+                            )
+                        }
+                    })
+                })
+            });
+            result.map_err(|_| narf_filesystem::FsError::OutOfMemory)?;
+        }
     }
     Ok(())
 }

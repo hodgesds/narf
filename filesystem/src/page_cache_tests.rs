@@ -11,7 +11,7 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::page_cache::{
     default_capacity_pages, set_default_capacity_pages, set_free_pages_hook,
-    set_low_watermark_pages, CacheFolio, PageCache, PageKey,
+    set_low_watermark_pages, CacheFolio, FileMapping, PageCache, PageKey,
 };
 
 fn key(page_off: u64) -> PageKey {
@@ -119,6 +119,39 @@ fn smoke_page_cache_never_evicts_dirty() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/page_cache", smoke_page_cache_never_evicts_dirty);
+
+/// A page installed in a borrowed user PTE carries an external folio hold.
+/// Reclaim may evict it only after the last PTE releases that hold.
+fn smoke_page_cache_mapped_folio_is_pinned_until_unmap() -> TestResult {
+    reset_globals();
+    let cache = alloc::sync::Arc::new(PageCache::with_capacity(0));
+    let mapping = FileMapping::new(cache.clone(), 7, 42);
+    cache.__insert_folio_for_test(
+        PageKey {
+            fs_id: 7,
+            inode: 42,
+            page_off: 0,
+        },
+        clean_folio(0x5a),
+    );
+    let folio = mapping.lookup(0).expect("inserted file folio");
+    let phys = folio.mmap_frame();
+    drop(folio);
+    if cache.shrink(1) != 0 || cache.is_empty() {
+        return TestResult::Fail("reclaim evicted a user-mapped cache folio");
+    }
+    if !crate::page_cache::release_mapped_folio(phys) {
+        return TestResult::Fail("unmap did not release the mapped folio");
+    }
+    if cache.shrink(1) != 1 || !cache.is_empty() {
+        return TestResult::Fail("unmapped clean folio did not become reclaimable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/page_cache",
+    smoke_page_cache_mapped_folio_is_pinned_until_unmap
+);
 
 /// Free-memory watermark: with no hard cap, a cache under the free
 /// watermark sheds clean pages toward the reclaim floor; the same
