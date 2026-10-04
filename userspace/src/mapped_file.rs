@@ -1699,22 +1699,28 @@ pub fn truncate_file_mappings(
         let Some(owner_bucket) = existing_mapping_owners(id) else {
             continue;
         };
-        let ranges: Vec<(u64, u64)> = owner_bucket
-            .lock()
-            .iter()
-            .filter(|mapping| mapping.ops.mmap_backing_identity() == file.mmap_backing_identity())
-            .filter_map(|mapping| {
-                let file_end = mapping.file_offset.checked_add(mapping.len)?;
-                let invalid_offset = first_invalid.max(mapping.file_offset);
-                (invalid_offset < file_end).then(|| {
-                    let base = mapping.base + (invalid_offset - mapping.file_offset);
-                    (base, file_end - invalid_offset)
-                })
-            })
-            .collect();
-        for (base, len) in ranges {
-            let result = address_space.with_vma_transaction(|| {
-                narf_memory::with_address_space_shared_mapping_transaction(id, || {
+        let result = address_space.with_vma_transaction(|| {
+            narf_memory::with_address_space_shared_mapping_transaction(id, || {
+                // Snapshot only after both transactions are held. Otherwise a
+                // concurrent unmap/remap could replace one of these virtual
+                // ranges between the identity check and the punch, and a file
+                // truncation would tear down the unrelated replacement VMA.
+                let ranges: Vec<(u64, u64)> = owner_bucket
+                    .lock()
+                    .iter()
+                    .filter(|mapping| {
+                        mapping.ops.mmap_backing_identity() == file.mmap_backing_identity()
+                    })
+                    .filter_map(|mapping| {
+                        let file_end = mapping.file_offset.checked_add(mapping.len)?;
+                        let invalid_offset = first_invalid.max(mapping.file_offset);
+                        (invalid_offset < file_end).then(|| {
+                            let base = mapping.base + (invalid_offset - mapping.file_offset);
+                            (base, file_end - invalid_offset)
+                        })
+                    })
+                    .collect();
+                for (base, len) in ranges {
                     publish_current_punch(id, base, len, || {
                         // SAFETY: the enclosing closures hold this address
                         // space's VMA and shared-owner transactions in order.
@@ -1725,11 +1731,12 @@ pub fn truncate_file_mappings(
                                 true,
                             )
                         }
-                    })
-                })
-            });
-            result.map_err(|_| narf_filesystem::FsError::OutOfMemory)?;
-        }
+                    })?;
+                }
+                Ok::<(), AddressSpaceError>(())
+            })
+        });
+        result.map_err(|_| narf_filesystem::FsError::OutOfMemory)?;
     }
     Ok(())
 }
