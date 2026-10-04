@@ -466,6 +466,30 @@ the operation. A mapped but inaccessible address instead follows the registered
 arena exception-table entry and returns `ARENA_FAULT`. Both outcomes stop the
 program, and unsupported lowering fails closed to the interpreter.
 
+### 3.17 Contract-bound struct ops
+
+Each struct-ops method is identified by a versioned target id, method id, and
+ABI hash and declares its exact context tuple, result descriptor, kfunc
+allowlist, execution context, fuel budget, and native fallback. Programs are
+loaded through `BpfProg::load_for_struct_ops`; programs loaded through generic,
+tracing, XDP, or another method's loader cannot attach or dispatch. Context
+arguments initially implement the scalar-only `BpfCtxArg` interface, so this
+surface carries no raw kernel or physical pointer and provides no generic
+physical-to-frame translation API.
+
+The macro emits a target-specific program builder and installation returns an
+owning, generation-tagged `StructOpsLink`. Closing or dropping the link detaches
+only its generation. Live slots use `Arc` snapshots so the subsystem lock is
+released before a callback runs and displaced values are destroyed outside the
+lock. Every method has an explicit fallback and validates raw results before
+conversion.
+
+Atomic methods are the only implemented form. Sleepable methods require an
+object-safe future-returning hook and must await `BpfProg::run_sleepable`; a
+synchronous adapter may not conceal that requirement with `block_on`. The full
+atomic and sleepable requirements, cancellation semantics, and acceptance
+tests are in [`bpf/structops/DESIGN.md`](../structops/DESIGN.md).
+
 ## 4. Invariants
 
 Numbered for `safety-argument.toml` references. **This subsystem touches

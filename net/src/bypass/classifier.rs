@@ -177,7 +177,7 @@ pub enum ClassifyError {
 ///
 /// This check was missing entirely: both entry points were generic over
 /// `M: CapType` and only called `check_live()`, so **any** live grant of **any**
-/// kind authorised replacing an interface's XDP program. `structops::install`
+/// kind authorised replacing an interface's XDP program. The generated struct-ops installer
 /// gets this right (`M::KIND != desc.cap`), one module over.
 fn require_attach_cap<M: CapType>() -> Result<(), ClassifyError> {
     if M::KIND != narf_capabilities::CapKind::BpfAttach {

@@ -1293,3 +1293,18 @@ argument = "The raw-module path minimally identifies a NARF ELF and validates it
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L44"
 argument = "The real rustc-built module smoke proves the image executes init and exit only inside its declared SCRATCH domain and that the registry/image are torn down afterward. It does not broaden the documented kernel-core exception or claim stronger aarch64 protection than MTE-tagged module allocations provide."
+
+# Contract-bound atomic struct-ops hardening. The dedicated security-review
+# skill was not available in this session; human security review remains
+# mandatory before merge.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The struct-ops hardening changes only the existing untrusted BPF runtime, its struct-ops seam, the BPF idle consumer, and the power policy slot. It modifies no frame, memory-domain-manager, capability-table, scheduler-executor, or security-model implementation and adds no trusted subsystem to the documented TCB."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A struct-ops program is verified against one immutable versioned method contract: scalar-only context fields, an exact return descriptor, a closed kfunc allowlist, atomic execution context, bounded fuel, and a declared native fallback. Generic, tracing, XDP, sleepable, and wrong-method programs retain a different or absent contract and are refused at install and dispatch. No raw pointer, physical address, frame handle, or physical-to-frame translation API crosses the hook boundary; execution remains inside the existing BPF hardware-domain scope."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Installation requires the existing live policy capability and publishes only after validation and fallible preparation. The owning link is generation-tagged, so a displaced link cannot detach its replacement. Arc-backed live slots release their IRQ-masking lock before invoking BPF and move displaced objects out before destruction. Idle results are width-validated and rechecked against the live latency and residency constraints before power enters a state."

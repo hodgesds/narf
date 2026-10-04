@@ -49,6 +49,18 @@
 pub fn idle_enter() -> !;                   // called by scheduler at empty runq
 pub fn register_cstate(info: CstateInfo);   // arch backend populates at boot
 
+pub trait IdleGovernor: Send + Sync + 'static {
+    fn name(&self) -> &'static str;
+    fn select_idle_state(&self, latency_budget_us: u64,
+                         predicted_idle_us: u64) -> CStateIdx;
+}
+pub fn install_idle_governor<G: IdleGovernor>(
+    cap: &Cap<IdleGov, Grant>, g: G) -> Result<(), PowerError>;
+pub fn install_idle_governor_struct_ops<M: CapType>(
+    cap: &Cap<M, Grant>, generation: u64,
+    g: Arc<dyn IdleGovernor>) -> Result<(), PowerError>;
+pub fn detach_idle_governor_struct_ops(generation: u64) -> bool;
+
 pub struct CstateInfo {
     pub depth:         u8,                  // 0 = C0 (running); higher = deeper
     pub exit_latency:  Duration,            // worst-case
@@ -70,6 +82,15 @@ than the shortest C-state's `enter` cost; the spec is enforced in
 `timer_oneshot` / `timer_cancel`. A regression in that contract
 flips us into spending more time picking a C-state than we save by
 entering one.
+
+The live idle-governor slot is Arc-backed. Selection clones the active Arc
+under the slot lock and invokes it after releasing that lock; install and
+detach drop displaced implementations after releasing it. Struct-ops installs
+carry a generation, and detach succeeds only for the currently live generation.
+After any native or BPF policy returns, `select_idle_state` rechecks the live
+state's exit latency and target residency against the supplied budgets and
+falls back to a valid C0. Policy output is therefore a recommendation rather
+than authority to enter a stale or unsafe state.
 
 ### 3.2 DVFS
 

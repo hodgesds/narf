@@ -2,8 +2,9 @@
 //!
 //! Runtime-supplied implementations of pluggable traits: the `struct_ops!`
 //! macro, the [`StructOpsDesc`] descriptors it emits into the `narf.structops`
-//! link section, and the cap-gated [`install`]/[`validate`] registry that
-//! records verified program sets.
+//! link section, generated target-specific builders, and owning
+//! [`StructOpsLink`] attachments. Programs are loaded against one exact method
+//! contract rather than attached from the generic BPF program pool.
 //!
 //! This lives in its own crate — separate from `narf-bpf` — so a subsystem that
 //! wants a BPF-supplied policy (e.g. `narf-power`'s idle governor via
@@ -28,10 +29,22 @@ pub mod interp {
     pub use narf_bpf::interp::{Outcome, MAX_CTX_WORDS};
 }
 
-/// The `narf-bpf` type-descriptor traits the macro derives a method's context
-/// tuple and return type from. Re-exported so `$crate::types::…` resolves here.
+/// The return descriptor trait used by generated method contracts.
 pub mod types {
-    pub use narf_bpf::types::{BpfRet, BpfType};
+    pub use narf_bpf::types::BpfRet;
+}
+
+/// Program-loading types used by generated target-specific builders.
+#[doc(hidden)]
+pub mod runtime {
+    pub use alloc::sync::Arc;
+    pub use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadError, LoadRequest};
+}
+
+/// Verifier enums used in generated descriptors.
+#[doc(hidden)]
+pub mod verifier {
+    pub use narf_bpf_verifier::kfunc::Context;
 }
 
 /// The capability primitives the generated install fn is cap-gated on.
@@ -41,8 +54,8 @@ pub mod reexport {
 }
 
 pub use structops::{
-    descriptors, install, installed_count, is_installed, validate, Binding, MethodDesc, ProgSet,
-    StructOpsDesc, StructOpsError,
+    descriptors, installed_count, is_installed, validate, Binding, BpfCtxArg, MethodDesc, ProgSet,
+    StructOpsDesc, StructOpsError, StructOpsLink,
 };
 
 /// Force-link anchor + boot-log stat: how many `struct_ops!` traits are

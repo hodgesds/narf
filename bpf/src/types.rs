@@ -911,6 +911,9 @@ unsafe impl<T: 'static> BpfType for &mut MaybeUninit<T> {
 /// them in a separate trait means `BpfType` does not grow a `from_raw` that is
 /// nonsense for most of its implementors.
 pub trait BpfRet: Sized {
+    /// Verifier-visible result descriptor.
+    const DESC: ArgDesc;
+
     /// The value used when no program is bound to the method, or when a run is
     /// declined or traps.
     ///
@@ -925,6 +928,7 @@ pub trait BpfRet: Sized {
 macro_rules! impl_bpf_ret {
     ($($t:ty),*) => {$(
         impl BpfRet for $t {
+            const DESC: ArgDesc = <$t as BpfType>::DESC;
             const DEFAULT_RET: Self = 0;
             #[inline]
             fn from_ret(raw: u64) -> Self {
@@ -938,12 +942,14 @@ macro_rules! impl_bpf_ret {
 impl_bpf_ret!(u8, u16, u32, u64, i8, i16, i32, i64);
 
 impl BpfRet for () {
+    const DESC: ArgDesc = <() as BpfType>::DESC;
     const DEFAULT_RET: Self = ();
     #[inline]
     fn from_ret(_raw: u64) -> Self {}
 }
 
 impl BpfRet for bool {
+    const DESC: ArgDesc = <u8 as BpfType>::DESC;
     const DEFAULT_RET: Self = false;
     #[inline]
     fn from_ret(raw: u64) -> Self {
