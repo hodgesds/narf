@@ -537,6 +537,7 @@ pub fn sys_mq_getsetattr(ctx: &mut dyn TrapContext) {
 pub(crate) const IN_MODIFY: u32 = 0x0000_0002;
 pub(crate) const IN_ATTRIB: u32 = 0x0000_0004;
 pub(crate) const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+pub(crate) const IN_CLOSE_NOWRITE: u32 = 0x0000_0010;
 pub(crate) const IN_OPEN: u32 = 0x0000_0020;
 pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
 pub(crate) const IN_MOVED_TO: u32 = 0x0000_0080;
@@ -701,6 +702,15 @@ pub(crate) fn register_fd_path(task: u64, fd: u32, path: &str, mount_id: Option<
 /// Owned counterpart for open paths that no longer need their normalized
 /// pathname after registration.
 pub(crate) fn register_fd_path_owned(task: u64, fd: u32, path: String, mount_id: Option<u64>) {
+    // The description's close event names this path (`fsnotify_close`).
+    let opened = crate::fd::with_table(task, |t| {
+        t.get(fd).map(|e| e.ops.clone()).zip(t.description(fd))
+    })
+    .flatten();
+    if let Some((ops, description)) = opened {
+        let is_dir = matches!(ops.stat().mode.file_type, narf_filesystem::FileType::Dir);
+        description.set_close_notify(&path, is_dir);
+    }
     with_fd_paths(task, |m| {
         let slots = m.entry(task).or_default();
         let index = fd as usize;
@@ -970,22 +980,31 @@ pub(crate) fn notify_modify_fd(task: u64, fd: u32) {
     }
 }
 
-/// Release an mqueue notification and emit IN_CLOSE_WRITE for `fd`.
+/// Release the mqueue notification `fd` registered, on its close.
 ///
 /// `sys_close` removes the descriptor before running close hooks, matching
 /// Linux's close ordering.  Carry the mqueue handle from the retained file
-/// object instead of looking the now-closed descriptor up again.
-pub(crate) fn notify_close_fd(task: u64, fd: u32, queue_id: Option<u64>) {
+/// object instead of looking the now-closed descriptor up again. The
+/// inotify close event is not sent here: Linux sends it from `__fput`, when
+/// the last reference to the description goes (`OpenFileDescription`'s
+/// `Drop`, via [`notify_close`]).
+pub(crate) fn notify_close_fd(task: u64, _fd: u32, queue_id: Option<u64>) {
     if let Some(handle_id) = queue_id {
         mqueuefs::close_notification(handle_id, task);
     }
+}
+
+/// `fsnotify_close` for a description opened on `path`.
+pub(crate) fn notify_close(path: &str, writable: bool, is_dir: bool) {
     if !fs_notify_active() {
         return;
     }
-    let path = fd_path(task, fd);
-    if let Some(p) = path {
-        fs_notify(&p, IN_CLOSE_WRITE, false);
-    }
+    let mask = if writable {
+        IN_CLOSE_WRITE
+    } else {
+        IN_CLOSE_NOWRITE
+    };
+    fs_notify(path, mask, is_dir);
 }
 
 /// Paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie, for a rename.

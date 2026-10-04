@@ -1392,7 +1392,7 @@ pub fn deliver_wire_datagram(
             src.copy_from_slice(src_ip);
             dst.copy_from_slice(dst_ip);
             inet6_dgram::deliver_wire(
-                net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, meta.ttl,
+                net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, meta,
             )
         }
         _ => false,
@@ -1487,6 +1487,7 @@ struct DgramPacket6 {
     scope_id: u32,
     destination: [u8; 16],
     hop_limit: i32,
+    traffic_class: u8,
     payload: Vec<u8>,
 }
 
@@ -1495,6 +1496,7 @@ pub(crate) struct Inet6RecvAncillary {
     pub destination: [u8; 16],
     pub ifindex: u32,
     pub hop_limit: i32,
+    pub traffic_class: u8,
 }
 
 impl core::fmt::Debug for DgramPacket {
@@ -2452,9 +2454,13 @@ impl SocketFile {
         }
     }
 
-    pub(crate) fn inet6_ancillary_options(&self) -> (bool, bool) {
+    pub(crate) fn inet6_ancillary_options(&self) -> (bool, bool, bool) {
         let options = self.options.lock();
-        (options.ipv6_recvpktinfo, options.ipv6_recvhoplimit)
+        (
+            options.ipv6_recvpktinfo,
+            options.ipv6_recvhoplimit,
+            options.ext.ipv6_recvtclass,
+        )
     }
 
     /// Credentials to attach to the current recvmsg's `SCM_CREDENTIALS`
@@ -9517,6 +9523,7 @@ fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {
     for (name, value) in [
         (IPV6_RECVPKTINFO, 1u32),
         (IPV6_RECVHOPLIMIT, 1),
+        (sockopt::IPV6_RECVTCLASS, 1),
         (IPV6_RECVERR, 1),
         (IPV6_DONTFRAG, 1),
         (IPV6_UNICAST_HOPS, 37),
@@ -9530,19 +9537,22 @@ fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {
             return TestResult::Fail("IPv6 socket option rejected a valid value");
         }
     }
-    let (pktinfo, hoplimit) = socket.inet6_ancillary_options();
+    let (pktinfo, hoplimit, tclass) = socket.inet6_ancillary_options();
     let ancillary = Inet6RecvAncillary {
         destination: [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
         ifindex: 9,
         hop_limit: 37,
+        traffic_class: 0x2e,
     };
     socket.stash_inet6_recv_ancillary(ancillary);
     if pktinfo
         && hoplimit
+        && tclass
         && socket.take_inet6_recv_ancillary().is_some_and(|value| {
             value.destination == ancillary.destination
                 && value.ifindex == 9
                 && value.hop_limit == 37
+                && value.traffic_class == 0x2e
         })
         && socket.take_inet6_recv_ancillary().is_none()
     {

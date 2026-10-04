@@ -890,12 +890,15 @@ References (public-only, all IETF documents):
   endpoints for `getsockname`, `getpeername`, and accept.
 - AF_INET6 sockets implement `IPV6_UNICAST_HOPS`, `IPV6_MTU_DISCOVER`,
   `IPV6_MTU`, `IPV6_RECVERR`, `IPV6_RECVPKTINFO`, `IPV6_RECVHOPLIMIT`,
+  `IPV6_RECVTCLASS`,
   `IPV6_DONTFRAG`, and `IPV6_V6ONLY` with Linux argument validation and
   `ENOTCONN` for an unconnected `IPV6_MTU` query. UDP6 receive records retain
-  destination address, ingress ifindex, and received hop limit per datagram;
-  `recvmsg` emits `IPV6_PKTINFO` and `IPV6_HOPLIMIT` control messages when the
-  corresponding receive options are enabled and reports `MSG_CTRUNC` when a
-  complete requested record does not fit.
+  destination address, ingress ifindex, received hop limit, and traffic class
+  per datagram; `recvmsg` emits `IPV6_PKTINFO`, `IPV6_HOPLIMIT`, and
+  `IPV6_TCLASS` control messages when the corresponding receive options are
+  enabled. Control records use Linux `put_cmsg` truncation: a record prefix is
+  copied when its header fits, `msg_controllen` reports consumed bytes, and
+  `MSG_CTRUNC` reports omitted data.
 - IPv6 address and route registries are keyed by immutable network-namespace
   ID internally. Source selection, local-address tests, route lookup,
   rtnetlink/proc snapshots, and final namespace teardown use the caller's
