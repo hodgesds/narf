@@ -17,7 +17,7 @@
 //!    the subsystems that call it).
 //! 4. Trip `full = true` (run everything, exactly like today) when the
 //!    change touches build infrastructure, a hub crate, an unrecognized
-//!    path, or when the CI event is a push-to-main / nightly / manual run.
+//!    path, or when the CI event is a nightly / manual run.
 //!
 //! The policy (which crates are hubs, which crates map to which job) lives
 //! in this one file so there is a single place to reason about correctness.
@@ -40,6 +40,8 @@ const HUB_CRATES: &[&str] = &[
     "narf-capabilities",
     "narf-memory",
     "narf-abi",
+    // Owns the runner and cross-cutting integration harnesses.
+    "narf-verification",
 ];
 
 /// A change reaching any of these (in the reverse closure) exercises the
@@ -89,21 +91,6 @@ fn is_ignorable_path(rel: &str) -> bool {
         base,
         "LICENSE" | "README.md" | "ROADMAP.md" | "STATUS.md" | "AGENTS.md"
     ) || base.ends_with(".md")
-        || base.ends_with(".txt")
-        || base.ends_with(".png")
-        || base.ends_with(".jpg")
-        || base.ends_with(".svg")
-}
-
-/// A path that is neither infra nor mapped to a crate but must still force
-/// a full run only if it isn't ignorable. Split out for the unit tests.
-fn is_arch_sensitive(rel: &str) -> bool {
-    rel.starts_with("arch/")
-        || rel.starts_with("drivers/")
-        || rel.starts_with("userspace/")
-        || rel.contains("aarch64")
-        || rel.ends_with(".S")
-        || rel.ends_with(".s")
 }
 
 /// One workspace crate: its cargo package name, its directory relative to
@@ -130,8 +117,8 @@ pub enum OutputFormat {
 
 #[derive(Parser, Clone)]
 pub struct AffectedArgs {
-    /// Base git ref to diff against. The diff uses the merge-base of this
-    /// ref with `--head`, so a stale base branch does not over-report.
+    /// Base git ref. PRs diff from its merge-base with --head; pushes diff
+    /// the two refs directly so force-push removals are included.
     #[arg(long, default_value = "origin/main")]
     base: String,
 
@@ -140,8 +127,8 @@ pub struct AffectedArgs {
     head: String,
 
     /// CI event name. Defaults to `$GITHUB_EVENT_NAME`, else
-    /// `pull_request`. `push`/`schedule`/`workflow_dispatch` force a full
-    /// run (post-merge + nightly always run the complete matrix).
+    /// `pull_request`. Nightly/manual runs force the complete matrix.
+    /// For pushes, pass the event's before SHA as --base.
     #[arg(long)]
     event: Option<String>,
 
@@ -171,6 +158,14 @@ pub struct Plan {
     pub full: bool,
     pub reasons: Vec<String>,
     pub crates: BTreeSet<String>,
+    pub changed_crates: BTreeSet<String>,
+    pub clippy_crates: BTreeSet<String>,
+    pub host_clippy_crates: BTreeSet<String>,
+    pub run_uefi: bool,
+    pub run_large_memory: bool,
+    pub run_xapic: bool,
+    pub run_virtio_mmio: bool,
+    pub run_user_mode: bool,
     pub subsystems: BTreeSet<String>,
     pub run_clippy: bool,
     pub clippy_arches: Vec<String>,
@@ -192,6 +187,8 @@ impl Plan {
             }
         };
         push(self.run_clippy, "clippy-kernel");
+        push(!self.host_clippy_crates.is_empty(), "clippy-host");
+        push(self.run_uefi, "uefi-loader");
         push(self.run_boot_smoke, "boot-smoke");
         push(self.run_kernel_test, "kernel-test");
         push(self.run_musl_demo, "musl-demo");
@@ -207,10 +204,7 @@ impl Plan {
 pub fn file_to_crate<'a>(rel: &str, crates: &'a [CrateInfo]) -> Option<&'a str> {
     let mut best: Option<&CrateInfo> = None;
     for c in crates {
-        if c.dir.is_empty() {
-            continue;
-        }
-        let under = rel == c.dir || rel.starts_with(&format!("{}/", c.dir));
+        let under = c.dir.is_empty() || rel == c.dir || rel.starts_with(&format!("{}/", c.dir));
         if !under {
             continue;
         }
@@ -280,7 +274,7 @@ pub fn plan(
         p.reasons
             .push("forced (--force-full / ci-full label)".into());
     }
-    if matches!(event, "push" | "schedule" | "workflow_dispatch") {
+    if matches!(event, "schedule" | "workflow_dispatch") {
         p.full = true;
         p.reasons
             .push(format!("event `{event}` always runs the full matrix"));
@@ -295,36 +289,55 @@ pub fn plan(
 
     // Classify each changed file.
     let mut seeds: BTreeSet<String> = BTreeSet::new();
+    let mut embedded = false;
     let mut cargo_toml_touched = false;
-    let mut arch_sensitive = false;
-    let mut any_code = false;
+    let mut lint_all =
+        force_full || matches!(event, "schedule" | "workflow_dispatch") || changed_files.is_empty();
     for f in changed_files {
         let base = f.rsplit('/').next().unwrap_or(f);
         if base == "Cargo.toml" && f != "Cargo.toml" {
             cargo_toml_touched = true;
         }
-        if is_arch_sensitive(f) {
-            arch_sensitive = true;
-        }
         if is_infra_path(f) {
             p.full = true;
             p.reasons.push(format!("infra path `{f}`"));
-            any_code = true;
-            continue;
+            lint_all |= !f.starts_with("build/xtask/");
         }
         if is_ignorable_path(f) {
             continue;
         }
+        // These separately built images are embedded by verification/build.rs;
+        // Cargo's workspace graph cannot describe those build-script edges.
+        if embedded_input(f) {
+            embedded = true;
+            // Isolated images are not members of their enclosing userspace
+            // crate. Their consumer is recorded below as a build dependency.
+            if !f.starts_with("user-runtime/") {
+                continue;
+            }
+        }
+        if f.starts_with("build/uefi-loader/") {
+            p.run_uefi = true;
+            continue;
+        }
+        if f.ends_with("/Cargo.toml")
+            && !crates.iter().any(|c| f == &format!("{}/Cargo.toml", c.dir))
+            && !embedded_input(f)
+        {
+            p.full = true;
+            lint_all = true;
+            p.reasons.push(format!("removed or unknown manifest `{f}`"));
+        }
         match file_to_crate(f, crates) {
             Some(name) => {
-                any_code = true;
                 seeds.insert(name.to_string());
             }
+            None if embedded_input(f) => {}
             None => {
                 // Unrecognized, non-doc path: be safe.
                 p.full = true;
                 p.reasons.push(format!("unmapped path `{f}` ⇒ full"));
-                any_code = true;
+                lint_all = true;
             }
         }
     }
@@ -337,45 +350,72 @@ pub fn plan(
         }
     }
 
+    p.changed_crates = seeds.clone();
+    if embedded {
+        seeds.insert(VERIFICATION.into());
+    }
     let closure = reverse_closure(&seeds, crates);
     let has = |n: &str| closure.contains(n);
     let has_any = |set: &[&str]| set.iter().any(|n| closure.contains(*n));
 
+    let lint = if lint_all {
+        crates.iter().map(|c| c.name.clone()).collect()
+    } else {
+        p.changed_crates.clone()
+    };
+    // Host tools are the only std binaries in this workspace. Unlinked
+    // driver/module crates still need bare-metal linting when they change.
+    p.host_clippy_crates = lint
+        .iter()
+        .filter(|c| matches!(c.as_str(), "xtask" | "cargo-narf"))
+        .cloned()
+        .collect();
+    p.clippy_crates = lint.difference(&p.host_clippy_crates).cloned().collect();
+    p.run_clippy = !p.clippy_crates.is_empty();
+    // Any kernel crate can contain architecture-specific code. Keep both
+    // targets; package selection, rather than path guesses, reduces lint work.
+    p.clippy_arches = vec!["x86_64".into(), "aarch64".into()];
+    p.run_uefi |= lint_all;
+    p.run_large_memory =
+        p.full || has_any(&["narf-memory", "narf-boot", "narf-arch"]) || seeds.contains(KERNEL_BIN);
+    p.run_xapic = p.full
+        || has_any(&[
+            "narf-interrupts",
+            "narf-memory",
+            "narf-scheduler",
+            "narf-arch",
+        ])
+        || seeds.contains(KERNEL_BIN);
+    p.run_virtio_mmio = p.full
+        || has_any(&["narf-drivers-virtio", "narf-bus", "narf-io", "narf-arch"])
+        || seeds.contains(KERNEL_BIN)
+        || seeds.contains(VERIFICATION);
+    p.run_user_mode = p.full
+        || has_any(MUSL_CRATES)
+        || seeds.contains(KERNEL_BIN)
+        || seeds.contains(VERIFICATION);
+
     if p.full {
-        // Full: report the whole picture but let the workflow run all jobs.
         p.crates = crates.iter().map(|c| c.name.clone()).collect();
-        p.run_clippy = true;
-        p.clippy_arches = vec!["x86_64".into(), "aarch64".into()];
         p.run_boot_smoke = true;
         p.run_kernel_test = true;
         p.run_musl_demo = true;
         p.run_net_smoke = true;
         p.run_feature_matrix = true;
-        // No subsystem filter on a full run (execute every kernel test).
         return p;
     }
-
     p.crates = closure.clone();
-
-    // clippy is the compile gate: run it for any code change. Prune the
-    // aarch64 arch unless an arch-sensitive file was touched.
-    p.run_clippy = any_code;
-    p.clippy_arches = if arch_sensitive {
-        vec!["x86_64".into(), "aarch64".into()]
-    } else {
-        vec!["x86_64".into()]
-    };
 
     // Boot-based gates: only when a real kernel crate is in the closure
     // (frame links ~everything, so frame ∈ closure ⟺ a kernel crate
     // changed; xtask/doc-only changes never pull it in).
-    p.run_boot_smoke = has(KERNEL_BIN);
+    p.run_boot_smoke = has(KERNEL_BIN) || p.run_uefi;
     p.run_kernel_test = has(KERNEL_BIN) || has(VERIFICATION);
 
     // musl-demo: linux-compat userspace execution path, plus the C libc
     // dir (not a cargo member, so keyed by path).
     let libc_touched = changed_files.iter().any(|f| f.starts_with("narf-libc/"));
-    p.run_musl_demo = has_any(MUSL_CRATES) || libc_touched;
+    p.run_musl_demo = has_any(MUSL_CRATES) || libc_touched || embedded;
 
     // net-smoke: off-box networking path.
     p.run_net_smoke = has_any(NET_CRATES);
@@ -383,12 +423,8 @@ pub fn plan(
     // feature-matrix: feature forwarding lives in member Cargo.toml files.
     p.run_feature_matrix = cargo_toml_touched;
 
-    // Kernel-test subsystem filter: the tags owned by the affected crates.
-    // A very broad closure (e.g. a change to a widely-depended-on crate
-    // like the VFS, which ~20 driver crates use for devfs/sysfs) would
-    // produce a filter of hundreds of tags — long enough to overflow the
-    // kernel cmdline and pointless besides. Above the cap, drop the filter
-    // and run the whole suite (a safe superset of the intended set).
+    // Preserve all dependent test tags, then compact equivalent prefixes.
+    // Fall back to the whole suite only if the byte budget is exceeded.
     if p.run_kernel_test {
         let mut tags: BTreeSet<String> = BTreeSet::new();
         for c in &closure {
@@ -396,12 +432,13 @@ pub fn plan(
                 tags.extend(t.iter().cloned());
             }
         }
-        let collapsed = collapse_tags(tags);
-        if collapsed.len() > MAX_SUBSYSTEM_FILTER {
+        let universe = tag_map.values().flatten().cloned().collect();
+        let collapsed = compact_tags(tags, &universe);
+        let filter_bytes = collapsed.iter().map(|t| t.len() + 1).sum::<usize>();
+        if filter_bytes > MAX_SUBSYSTEM_FILTER_BYTES {
             p.reasons.push(format!(
-                "{} affected subsystems > cap {} — running the full kernel-test suite",
-                collapsed.len(),
-                MAX_SUBSYSTEM_FILTER
+                "subsystem filter needs {} bytes > budget {} — running the full kernel-test suite",
+                filter_bytes, MAX_SUBSYSTEM_FILTER_BYTES
             ));
         } else {
             p.subsystems = collapsed;
@@ -411,10 +448,51 @@ pub fn plan(
     p
 }
 
-/// Beyond this many distinct subsystem tags, the kernel-test filter is
-/// dropped (run everything) rather than passed as an unwieldy — and
-/// possibly cmdline-overflowing — `test_subsystem=` list.
-const MAX_SUBSYSTEM_FILTER: usize = 32;
+// Leave room for the rest of the kernel command line on both boot paths.
+const MAX_SUBSYSTEM_FILTER_BYTES: usize = 1024;
+
+/// Collapse a common prefix only if it admits no test outside the selected
+/// set. A crate with 40 USB tags becomes `drivers/usb`, even when there is
+/// no test registered at that exact parent. Never invent a broad `drivers`
+/// filter that would also run unrelated drivers.
+fn compact_tags(tags: BTreeSet<String>, universe: &BTreeSet<String>) -> BTreeSet<String> {
+    let selected = |tag: &str| {
+        tags.iter()
+            .any(|t| tag == t || tag.starts_with(&format!("{t}/")))
+    };
+    let mut compacted = BTreeSet::new();
+    for tag in &tags {
+        let mut chosen = tag.as_str();
+        for (i, _) in tag.match_indices('/') {
+            let prefix = &tag[..i];
+            if universe
+                .iter()
+                .filter(|t| *t == prefix || t.starts_with(&format!("{prefix}/")))
+                .all(|t| selected(t))
+            {
+                chosen = prefix;
+                break;
+            }
+        }
+        compacted.insert(chosen.to_string());
+    }
+    collapse_tags(compacted)
+}
+
+fn embedded_input(path: &str) -> bool {
+    [
+        "user-runtime/",
+        "narf-libc/",
+        "userspace/init/",
+        "userspace/shell/",
+        "userspace/testbin/",
+        "userspace/getty/",
+        "userspace/login-core/",
+        "userspace/coreutils/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+}
 
 // ---------------------------------------------------------------------------
 // I/O layer: git, cargo metadata, source scan, and output.
@@ -435,6 +513,10 @@ fn load_workspace(root: &Path) -> Result<Vec<CrateInfo>> {
     }
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).context("parsing cargo metadata JSON")?;
+    workspace_crates(&json)
+}
+
+fn workspace_crates(json: &serde_json::Value) -> Result<Vec<CrateInfo>> {
     let ws_root = json
         .get("workspace_root")
         .and_then(|v| v.as_str())
@@ -470,11 +552,13 @@ fn load_workspace(root: &Path) -> Result<Vec<CrateInfo>> {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         // Directory relative to the workspace root, no trailing slash.
-        let dir = manifest
-            .strip_suffix("/Cargo.toml")
-            .unwrap_or(manifest)
-            .strip_prefix(&format!("{ws_root}/"))
-            .unwrap_or(manifest)
+        let dir = Path::new(manifest)
+            .parent()
+            .context("manifest parent")?
+            .strip_prefix(&ws_root)
+            .context("workspace member outside root")?
+            .to_str()
+            .context("non-UTF-8 crate directory")?
             .to_string();
         let deps = pkg
             .get("dependencies")
@@ -492,23 +576,26 @@ fn load_workspace(root: &Path) -> Result<Vec<CrateInfo>> {
 }
 
 /// The changed files between the merge-base of `base` and `head`.
-fn git_changed_files(root: &Path, base: &str, head: &str) -> Result<Vec<String>> {
-    // Resolve the merge-base; if it fails (shallow clone missing the base),
-    // the caller falls back to a full run.
-    let mb = Command::new("git")
-        .args(["merge-base", base, head])
-        .current_dir(root)
-        .output()
-        .context("git merge-base")?;
-    let range = if mb.status.success() {
-        let base_sha = String::from_utf8_lossy(&mb.stdout).trim().to_string();
-        format!("{base_sha}...{head}")
+fn git_changed_files(root: &Path, base: &str, head: &str, event: &str) -> Result<Vec<String>> {
+    let range = if event == "push" {
+        format!("{base}..{head}")
     } else {
-        // No common ancestor found — diff against the base ref directly.
-        format!("{base}...{head}")
+        let mb = Command::new("git")
+            .args(["merge-base", base, head])
+            .current_dir(root)
+            .output()
+            .context("git merge-base")?;
+        if !mb.status.success() {
+            bail!(
+                "git merge-base failed: {}",
+                String::from_utf8_lossy(&mb.stderr)
+            );
+        }
+        let base_sha = String::from_utf8_lossy(&mb.stdout).trim().to_string();
+        format!("{base_sha}..{head}")
     };
     let out = Command::new("git")
-        .args(["diff", "--name-only", &range])
+        .args(["diff", "--no-renames", "--name-only", "-z", &range])
         .current_dir(root)
         .output()
         .context("git diff --name-only")?;
@@ -516,8 +603,7 @@ fn git_changed_files(root: &Path, base: &str, head: &str) -> Result<Vec<String>>
         bail!("git diff failed: {}", String::from_utf8_lossy(&out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
+        .split('\0')
         .filter(|l| !l.is_empty())
         .map(String::from)
         .collect())
@@ -527,17 +613,17 @@ fn git_changed_files(root: &Path, base: &str, head: &str) -> Result<Vec<String>>
 /// `verification`) and attribute each tag to its owning crate. This is the
 /// zero-maintenance crate→subsystem map: it reads the same call sites the
 /// kernel test registry does.
-fn scan_test_tags(root: &Path, crates: &[CrateInfo]) -> BTreeMap<String, BTreeSet<String>> {
+fn scan_test_tags(root: &Path, crates: &[CrateInfo]) -> Result<BTreeMap<String, BTreeSet<String>>> {
     let mut map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for c in crates {
         let dir = root.join(&c.dir);
         let mut tags: BTreeSet<String> = BTreeSet::new();
-        collect_tags_in_dir(&dir, crates, &c.dir, &mut tags);
+        collect_tags_in_dir(&dir, crates, &c.dir, &mut tags)?;
         if !tags.is_empty() {
             map.entry(c.name.clone()).or_default().extend(tags);
         }
     }
-    map
+    Ok(map)
 }
 
 /// Walk `.rs` files under `dir`, but do not descend into a nested crate's
@@ -547,12 +633,9 @@ fn collect_tags_in_dir(
     crates: &[CrateInfo],
     owner_dir: &str,
     out: &mut BTreeSet<String>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("scan {}", dir.display()))? {
+        let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
             if path.file_name().and_then(|n| n.to_str()) == Some("target") {
@@ -563,13 +646,13 @@ fn collect_tags_in_dir(
             if is_other_crate_dir(&path, crates, owner_dir) {
                 continue;
             }
-            collect_tags_in_dir(&path, crates, owner_dir, out);
+            collect_tags_in_dir(&path, crates, owner_dir, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                extract_tags(&text, out);
-            }
+            let text = std::fs::read_to_string(&path)?;
+            extract_tags(&text, out).with_context(|| format!("scan {}", path.display()))?;
         }
     }
+    Ok(())
 }
 
 /// True if `path` is the root directory of a workspace crate other than the
@@ -580,110 +663,107 @@ fn is_other_crate_dir(path: &Path, crates: &[CrateInfo], owner_dir: &str) -> boo
         .any(|c| c.dir != owner_dir && path.ends_with(&c.dir) && path.join("Cargo.toml").is_file())
 }
 
-/// Pull every `kernel_test_in!("tag", …)` first-argument string literal,
-/// plus a `verification` tag for any bare `kernel_test!(…)`.
-///
-/// Only an *invocation* counts: after the macro name there must be a `(`
-/// (whitespace/newlines allowed) — this rejects the many prose mentions of
-/// `kernel_test_in!` in doc comments, which would otherwise capture the
-/// next unrelated string literal in the file.
-fn extract_tags(text: &str, out: &mut BTreeSet<String>) {
-    let bytes = text.as_bytes();
-    // `kernel_test_in!(  "<tag>"` — the tag is the first string literal.
-    let mut from = 0usize;
-    while let Some(pos) = text[from..].find("kernel_test_in!") {
-        let after = from + pos + "kernel_test_in!".len();
-        from = after;
-        // Require `(` (skipping whitespace) then `"` (skipping whitespace).
-        let mut i = after;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+/// Scan Rust tokens, including registrations nested in macro bodies. Comments
+/// and string literals are opaque; raw strings and every macro delimiter work.
+fn extract_tags(text: &str, out: &mut BTreeSet<String>) -> Result<()> {
+    use proc_macro2::{TokenStream, TokenTree};
+    fn visit(tokens: TokenStream, out: &mut BTreeSet<String>) -> Result<()> {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        for (i, token) in tokens.iter().enumerate() {
+            if let TokenTree::Ident(name) = token {
+                if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Group(args))) =
+                    (tokens.get(i + 1), tokens.get(i + 2))
+                {
+                    if bang.as_char() == '!' {
+                        if name == "kernel_test" {
+                            out.insert("verification".into());
+                        } else if name == "kernel_test_in" {
+                            if let Some(TokenTree::Literal(literal)) =
+                                args.stream().into_iter().next()
+                            {
+                                let literal = literal.to_string();
+                                let tag: String = if literal.starts_with('r') {
+                                    let start = literal.find('"').context("raw tag start")? + 1;
+                                    let end = literal.rfind('"').context("raw tag end")?;
+                                    literal[start..end].into()
+                                } else {
+                                    serde_json::from_str(&literal)
+                                        .context("kernel-test tag literal")?
+                                };
+                                crate::validate_test_subsystems(&tag)?;
+                                out.insert(tag);
+                            }
+                        }
+                    }
+                }
+            }
+            if let TokenTree::Group(group) = token {
+                visit(group.stream(), out)?;
+            }
         }
-        if i >= bytes.len() || bytes[i] != b'(' {
-            continue;
-        }
-        i += 1;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'"' {
-            continue;
-        }
-        i += 1;
-        if let Some(q2) = text[i..].find('"') {
-            out.insert(text[i..i + q2].to_string());
-        }
+        Ok(())
     }
-    // Bare `kernel_test!(…)` ⇒ the implicit `verification` subsystem.
-    let mut from = 0usize;
-    while let Some(pos) = text[from..].find("kernel_test!") {
-        let after = from + pos + "kernel_test!".len();
-        from = after;
-        let mut i = after;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i < bytes.len() && bytes[i] == b'(' {
-            out.insert("verification".to_string());
-        }
-    }
+    let tokens = text
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid Rust source: {e}"))?;
+    visit(tokens, out)
 }
 
-/// Serialize a plan to compact JSON without pulling in serde derive.
+/// One schema for human-readable JSON and Actions outputs.
+fn plan_value(p: &Plan) -> serde_json::Value {
+    serde_json::json!({
+        "full": p.full, "reasons": p.reasons, "jobs": p.jobs(),
+        "crates": p.crates, "changed_crates": p.changed_crates,
+        "clippy_crates": p.clippy_crates, "host_clippy_crates": p.host_clippy_crates,
+        "subsystems": p.subsystems, "clippy_arches": p.clippy_arches,
+        "run_clippy": p.run_clippy, "run_boot_smoke": p.run_boot_smoke,
+        "run_kernel_test": p.run_kernel_test, "run_musl_demo": p.run_musl_demo,
+        "run_net_smoke": p.run_net_smoke, "run_feature_matrix": p.run_feature_matrix,
+        "run_uefi": p.run_uefi, "run_large_memory": p.run_large_memory,
+        "run_xapic": p.run_xapic, "run_virtio_mmio": p.run_virtio_mmio,
+        "run_user_mode": p.run_user_mode,
+    })
+}
+
 fn plan_to_json(p: &Plan) -> String {
-    let arr = |v: &BTreeSet<String>| {
-        let items: Vec<String> = v.iter().map(|s| format!("{s:?}")).collect();
-        format!("[{}]", items.join(","))
-    };
-    let arr_vec = |v: &[String]| {
-        let items: Vec<String> = v.iter().map(|s| format!("{s:?}")).collect();
-        format!("[{}]", items.join(","))
-    };
-    let jobs = p.jobs();
-    format!(
-        "{{\n  \"full\": {},\n  \"reasons\": {},\n  \"jobs\": {},\n  \"crates\": {},\n  \"subsystems\": {},\n  \"clippy_arches\": {},\n  \"run_clippy\": {},\n  \"run_boot_smoke\": {},\n  \"run_kernel_test\": {},\n  \"run_musl_demo\": {},\n  \"run_net_smoke\": {},\n  \"run_feature_matrix\": {}\n}}",
-        p.full,
-        arr_vec(&p.reasons),
-        arr_vec(&jobs),
-        arr(&p.crates),
-        arr(&p.subsystems),
-        arr_vec(&p.clippy_arches),
-        p.run_clippy,
-        p.run_boot_smoke,
-        p.run_kernel_test,
-        p.run_musl_demo,
-        p.run_net_smoke,
-        p.run_feature_matrix,
-    )
+    serde_json::to_string_pretty(&plan_value(p)).expect("serializable plan")
 }
 
-/// Serialize to GitHub Actions `name=value` output lines.
 fn plan_to_github(p: &Plan) -> String {
-    let json_arr = |v: &[String]| {
-        let items: Vec<String> = v.iter().map(|s| format!("{s:?}")).collect();
-        format!("[{}]", items.join(","))
-    };
-    let jobs = p.jobs().join(" ");
-    let subs = p.subsystems.iter().cloned().collect::<Vec<_>>().join(",");
-    format!(
-        "full={}\njobs={}\nsubsystems={}\nclippy_arches={}\nrun_clippy={}\nrun_boot_smoke={}\nrun_kernel_test={}\nrun_musl_demo={}\nrun_net_smoke={}\nrun_feature_matrix={}\n",
-        p.full,
-        jobs,
-        subs,
-        json_arr(&p.clippy_arches),
-        p.run_clippy,
-        p.run_boot_smoke,
-        p.run_kernel_test,
-        p.run_musl_demo,
-        p.run_net_smoke,
-        p.run_feature_matrix,
-    )
+    let mut fields = plan_value(p);
+    fields["subsystems"] = p
+        .subsystems
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",")
+        .into();
+    fields["jobs"] = p.jobs().join(" ").into();
+    fields
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{k}={}\n",
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string())
+            )
+        })
+        .collect()
 }
 
 /// `cargo xtask affected` entry point.
 pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
     let crates = load_workspace(root)?;
-    let tag_map = scan_test_tags(root, &crates);
+    let (tag_map, scan_failed) = match scan_test_tags(root, &crates) {
+        Ok(tags) => (tags, false),
+        Err(e) => {
+            eprintln!("xtask affected: test inventory failed ({e:#}); using full matrix");
+            (BTreeMap::new(), true)
+        }
+    };
 
     let event = args
         .event
@@ -694,7 +774,7 @@ pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
     let (changed, diff_failed) = if !args.changed_files.is_empty() {
         (args.changed_files.clone(), false)
     } else {
-        match git_changed_files(root, &args.base, &args.head) {
+        match git_changed_files(root, &args.base, &args.head, &event) {
             Ok(f) => (f, false),
             Err(e) => {
                 eprintln!("xtask affected: git diff failed ({e}); defaulting to a full run");
@@ -703,7 +783,7 @@ pub fn affected_cmd(args: &AffectedArgs, root: &Path) -> Result<()> {
         }
     };
 
-    let force_full = args.force_full || diff_failed;
+    let force_full = args.force_full || diff_failed || scan_failed;
     let p = plan(&changed, &crates, &tag_map, &event, force_full);
 
     let github = args.github || matches!(args.format, OutputFormat::Github);
@@ -834,8 +914,11 @@ mod tests {
         assert!(p.subsystems.contains("filesystem"));
         assert!(!p.subsystems.contains("filesystem/page_cache"));
         assert!(p.subsystems.contains("syscall_abi"));
-        // Only x86_64 clippy (no arch-sensitive file).
-        assert_eq!(p.clippy_arches, vec!["x86_64".to_string()]);
+        // Kernel linting retains both architectures for every package.
+        assert_eq!(
+            p.clippy_arches,
+            vec!["x86_64".to_string(), "aarch64".to_string()]
+        );
     }
 
     #[test]
@@ -852,8 +935,8 @@ mod tests {
         assert!(p.run_boot_smoke && p.run_kernel_test);
         assert!(!p.run_musl_demo, "gpu change must skip musl-demo");
         assert!(!p.run_net_smoke, "gpu change must skip net-smoke");
-        assert!(p.subsystems.contains("drivers/gpu"));
-        // drivers/ is arch-sensitive ⇒ both clippy arches.
+        assert!(p.subsystems.contains("drivers"));
+        // Both kernel architectures remain covered.
         assert_eq!(
             p.clippy_arches,
             vec!["x86_64".to_string(), "aarch64".to_string()]
@@ -932,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn push_event_forces_full() {
+    fn push_event_uses_changed_crates() {
         let cr = fixture();
         let p = plan(
             &["filesystem/src/page_cache.rs".to_string()],
@@ -941,7 +1024,7 @@ mod tests {
             "push",
             false,
         );
-        assert!(p.full, "push-to-main always runs the full matrix");
+        assert!(!p.full, "push-to-main diffs against the event before SHA");
     }
 
     #[test]
@@ -979,8 +1062,8 @@ mod tests {
         // Give filesystem more tags than the cap so the filter is dropped.
         let mut tm = tags();
         let mut many = BTreeSet::new();
-        for i in 0..MAX_SUBSYSTEM_FILTER + 5 {
-            many.insert(format!("filesystem/area{i}"));
+        for i in 0..MAX_SUBSYSTEM_FILTER_BYTES / 10 {
+            many.insert(format!("subsystem{i}"));
         }
         tm.insert("narf-filesystem".to_string(), many);
         let p = plan(
@@ -1009,9 +1092,253 @@ mod tests {
             kernel_test!(smoke_z);
         "#;
         let mut out = BTreeSet::new();
-        extract_tags(src, &mut out);
+        extract_tags(src, &mut out).unwrap();
         assert!(out.contains("filesystem/page_cache"));
         assert!(out.contains("memory"));
         assert!(out.contains("verification"));
+    }
+    fn strings(values: &[&str]) -> BTreeSet<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn lint_only_direct_changes_even_when_tests_are_full() {
+        for (file, package) in [
+            ("filesystem/src/lib.rs", "narf-filesystem"),
+            ("lib/src/lib.rs", "narf-lib"),
+        ] {
+            let p = plan(&[file.into()], &fixture(), &tags(), "pull_request", false);
+            assert_eq!(p.clippy_crates, strings(&[package]));
+            assert_eq!(p.changed_crates, strings(&[package]));
+            assert!(p.crates.contains("narf-frame"));
+        }
+    }
+
+    #[test]
+    fn scoped_shards_follow_dependencies_not_kernel_linkage() {
+        let p = plan(
+            &["drivers/gpu/src/lib.rs".into()],
+            &fixture(),
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(p.run_kernel_test);
+        assert!(!p.run_large_memory && !p.run_xapic && !p.run_virtio_mmio && !p.run_user_mode);
+        let p = plan(
+            &["filesystem/src/lib.rs".into()],
+            &fixture(),
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(p.run_user_mode);
+        assert!(!p.run_large_memory && !p.run_xapic && !p.run_virtio_mmio);
+    }
+
+    #[test]
+    fn full_matrix_escape_hatches() {
+        for event in ["schedule", "workflow_dispatch"] {
+            let p = plan(&["README.md".into()], &fixture(), &tags(), event, false);
+            assert!(
+                p.full && p.run_large_memory && p.run_xapic && p.run_user_mode && p.run_virtio_mmio
+            );
+            assert_eq!(p.clippy_crates.len(), fixture().len());
+        }
+        let p = plan(&[], &fixture(), &tags(), "pull_request", false);
+        assert!(p.full);
+        let p = plan(
+            &["README.md".into()],
+            &fixture(),
+            &tags(),
+            "pull_request",
+            true,
+        );
+        assert!(p.full);
+    }
+
+    #[test]
+    fn embedded_images_select_consumer_without_linting_enclosing_crate() {
+        for path in [
+            "userspace/shell/src/main.rs",
+            "userspace/login-core/src/lib.rs",
+            "narf-libc/src/lib.rs",
+        ] {
+            let p = plan(&[path.into()], &fixture(), &tags(), "pull_request", false);
+            assert!(!p.full, "{path}");
+            assert!(p.crates.contains(VERIFICATION));
+            assert!(p.run_kernel_test && p.run_musl_demo && p.run_user_mode);
+            assert!(p.clippy_crates.is_empty());
+        }
+    }
+
+    #[test]
+    fn runtime_build_script_edge_is_not_a_lint_target() {
+        let mut crates = fixture();
+        crates.push(ci("narf-user-runtime", "user-runtime", &[]));
+        let p = plan(
+            &["user-runtime/src/lib.rs".into()],
+            &crates,
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(p.crates.contains(VERIFICATION));
+        assert_eq!(p.clippy_crates, strings(&["narf-user-runtime"]));
+        assert!(p.run_musl_demo);
+    }
+
+    #[test]
+    fn assets_are_build_inputs_and_deleted_manifests_force_full() {
+        for path in ["filesystem/fixture.txt", "drivers/gpu/cursor.png"] {
+            let p = plan(&[path.into()], &fixture(), &tags(), "pull_request", false);
+            assert!(p.run_kernel_test && p.run_clippy);
+        }
+        let p = plan(
+            &["drivers/gpu/deleted/Cargo.toml".into()],
+            &fixture(),
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(p.full);
+    }
+
+    #[test]
+    fn host_and_loader_changes_have_separate_lint_gates() {
+        let mut crates = fixture();
+        crates.push(ci("xtask", "build/xtask", &[]));
+        crates.push(ci("cargo-narf", "build/cargo-narf", &[]));
+        let p = plan(
+            &["build/xtask/src/main.rs".into()],
+            &crates,
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(p.full);
+        assert_eq!(p.host_clippy_crates, strings(&["xtask"]));
+        assert!(p.clippy_crates.is_empty());
+        let p = plan(
+            &["build/uefi-loader/src/main.rs".into()],
+            &crates,
+            &tags(),
+            "pull_request",
+            false,
+        );
+        assert!(p.run_uefi && !p.full && !p.run_clippy);
+    }
+
+    #[test]
+    fn compact_prefixes_preserve_exact_test_membership() {
+        let selected = strings(&["drivers/usb/hid", "drivers/usb/uac", "audio/hda"]);
+        let universe = strings(&[
+            "drivers/usb/hid",
+            "drivers/usb/uac",
+            "audio/hda",
+            "audio/sbc",
+            "drivers/gpu",
+        ]);
+        let compact = compact_tags(selected.clone(), &universe);
+        assert_eq!(compact, strings(&["drivers/usb", "audio/hda"]));
+        for tag in universe {
+            assert_eq!(
+                selected.contains(&tag),
+                compact
+                    .iter()
+                    .any(|t| tag == *t || tag.starts_with(&format!("{t}/")))
+            );
+        }
+    }
+
+    #[test]
+    fn many_child_tags_fit_without_disabling_test_selection() {
+        let cr = fixture();
+        let mut tm = tags();
+        tm.insert(
+            "narf-filesystem".into(),
+            (0..100).map(|i| format!("filesystem/area{i}")).collect(),
+        );
+        let p = plan(
+            &["filesystem/src/lib.rs".into()],
+            &cr,
+            &tm,
+            "pull_request",
+            false,
+        );
+        assert!(p.subsystems.contains("filesystem"));
+        assert!(!p.full && !p.subsystems.is_empty());
+    }
+
+    #[test]
+    fn registration_scan_ignores_examples_and_accepts_rust_macro_syntax() {
+        let mut out = BTreeSet::new();
+        extract_tags(
+            r##"
+            // kernel_test_in!("wrong/comment", test);
+            /// kernel_test!(wrong);
+            const EXAMPLE: &str = "kernel_test_in!(\"wrong/string\", test)";
+            kernel_test_in ! { r#"audio/hda"#, test }
+            fn nested() { narf_kernel_test::kernel_test_in!["filesystem", test]; }
+            macro_rules! register { () => { kernel_test_in!("drivers/usb", test); } }
+        "##,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, strings(&["audio/hda", "filesystem", "drivers/usb"]));
+        assert!(extract_tags("fn broken(", &mut out).is_err());
+    }
+
+    #[test]
+    fn github_outputs_are_consistent_json() {
+        let p = plan(
+            &["filesystem/src/lib.rs".into()],
+            &fixture(),
+            &tags(),
+            "pull_request",
+            false,
+        );
+        let json: serde_json::Value = serde_json::from_str(&plan_to_json(&p)).unwrap();
+        let github = plan_to_github(&p);
+        let outputs: BTreeMap<_, _> = github.lines().filter_map(|l| l.split_once('=')).collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(outputs["clippy_crates"]).unwrap(),
+            json["clippy_crates"]
+        );
+        assert_eq!(outputs["run_user_mode"], "true");
+        assert_eq!(outputs["subsystems"], "filesystem,syscall_abi");
+    }
+    #[test]
+    fn metadata_keeps_renamed_optional_build_and_target_edges() {
+        let metadata = serde_json::json!({
+            "workspace_root": "/workspace",
+            "workspace_members": ["root", "child", "leaf"],
+            "packages": [
+                {"id": "root", "name": "root", "manifest_path": "/workspace/Cargo.toml",
+                 "dependencies": [
+                    {"name": "child", "rename": "renamed", "path": "/workspace/nested", "kind": "build", "optional": true, "target": "cfg(target_arch = \"aarch64\")"},
+                    {"name": "external", "path": null}
+                 ]},
+                {"id": "child", "name": "child", "manifest_path": "/workspace/nested/Cargo.toml",
+                 "dependencies": [{"name": "leaf", "path": "/workspace/nested/leaf", "kind": "dev"}]},
+                {"id": "leaf", "name": "leaf", "manifest_path": "/workspace/nested/leaf/Cargo.toml", "dependencies": []},
+                {"id": "external", "name": "external", "manifest_path": "/external/Cargo.toml"}
+            ]
+        });
+        let crates = workspace_crates(&metadata).unwrap();
+        assert_eq!(file_to_crate("src/lib.rs", &crates), Some("root"));
+        assert_eq!(
+            file_to_crate("nested/leaf/src/lib.rs", &crates),
+            Some("leaf")
+        );
+        assert_eq!(
+            file_to_crate("nested-extra/src/lib.rs", &crates),
+            Some("root")
+        );
+        assert_eq!(
+            reverse_closure(&strings(&["leaf"]), &crates),
+            strings(&["root", "child", "leaf"])
+        );
+        assert!(!crates[0].deps.contains(&"external".into()));
     }
 }

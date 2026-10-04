@@ -12,6 +12,11 @@ on:
     - cron: "0 6 * * *"
   workflow_dispatch: {}
 
+# A newer PR revision supersedes queued/running work for the old revision.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: ""
@@ -32,7 +37,7 @@ jobs:
   # Change-based CI gate. Computes which jobs + kernel-test subsystems the
   # diff can affect (crate reverse-dependency closure, see
   # `cargo xtask affected`) and exports the decision as job outputs the
-  # downstream jobs gate on. On push-to-main / nightly / manual (and on a
+  # downstream jobs gate on. On nightly / manual (and on a
   # hub-crate / build-infra / unknown-path change), `full` is true and every
   # job runs exactly as it did before this gate existed — the safety net.
   # A `ci-full` PR label forces a full run.
@@ -43,6 +48,13 @@ jobs:
       full: ${{ steps.affected.outputs.full }}
       run_clippy: ${{ steps.affected.outputs.run_clippy }}
       clippy_arches: ${{ steps.affected.outputs.clippy_arches }}
+      clippy_crates: ${{ steps.affected.outputs.clippy_crates }}
+      host_clippy_crates: ${{ steps.affected.outputs.host_clippy_crates }}
+      run_uefi: ${{ steps.affected.outputs.run_uefi }}
+      run_large_memory: ${{ steps.affected.outputs.run_large_memory }}
+      run_xapic: ${{ steps.affected.outputs.run_xapic }}
+      run_virtio_mmio: ${{ steps.affected.outputs.run_virtio_mmio }}
+      run_user_mode: ${{ steps.affected.outputs.run_user_mode }}
       run_boot_smoke: ${{ steps.affected.outputs.run_boot_smoke }}
       run_kernel_test: ${{ steps.affected.outputs.run_kernel_test }}
       run_musl_demo: ${{ steps.affected.outputs.run_musl_demo }}
@@ -61,23 +73,22 @@ jobs:
 
       - name: Compute affected jobs + subsystems
         id: affected
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_FORCE_FULL: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}
         run: |
-          set -eu
-          # For a pull_request, `base_ref` is the target branch; for
-          # push/schedule/dispatch it is empty and `affected` forces a full
-          # run via --event regardless of --base.
-          BASE_REF="${{ github.base_ref }}"
-          BASE_REF="${BASE_REF:-main}"
-          git fetch --no-tags origin "$BASE_REF" || true
-          FORCE=""
-          if [ "${{ contains(github.event.pull_request.labels.*.name, 'ci-full') }}" = "true" ]; then
-            FORCE="--force-full"
+          set -euo pipefail
+          args=()
+          if [ "$CI_FORCE_FULL" = "true" ]; then
+            args+=(--force-full)
           fi
-          # shellcheck disable=SC2086
-          cargo xtask affected --github \
-            --event "${{ github.event_name }}" \
-            --base "origin/$BASE_REF" \
-            $FORCE
+          # PRs use their actual head, not GitHub's synthetic merge commit.
+          # Pushes diff against the before SHA; diffing origin/main after
+          # checkout would compare main with itself and force a full run.
+          cargo xtask affected --github --event "$CI_EVENT" \
+            --base "${CI_BASE:-origin/main}" --head "$CI_HEAD" "${args[@]}"
 
   fmt:
     name: cargo fmt --check
@@ -114,9 +125,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # x86_64 always; aarch64 only when the diff touches arch-sensitive
-        # paths (arch/**, drivers/**, userspace/**, *aarch64*, asm) — see
-        # `xtask affected`.
+        # Selected packages are checked on both supported kernel targets.
         arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     steps:
       - uses: actions/checkout@v4
@@ -126,95 +135,48 @@ jobs:
         with:
           components: rust-src llvm-tools-preview clippy
 
-      # Lint the kernel binary on the bare-metal target, matching the build-std
-      # invocation `cargo xtask boot-smoke` uses. This is the only pass that
-      # type-checks (and clippy-lints) the arch-gated `cfg(target_arch = ...)`
-      # code the host workspace pass never compiles. Build warnings in the
-      # kernel crate tree surface here too and are denied.
-      #
-      # `cgroup-all` is enabled so every cgroup-v2 controller (pids, memory,
-      # cpu, cpuset, io, misc, psi) and its cross-crate seams (the memory
-      # charge-PID provider in narf-scheduler, the affinity/priority hooks,
-      # the block io accounting) are compiled and linted on BOTH arches —
-      # otherwise the cgroup-gated code is never built in CI.
-      #
-      # `bpf-idle` and `bpf-leds` are enabled for the same reason: the BPF
-      # consumer crates live behind those features, so without them the
-      # kernel-target lint never compiles their production paths on either arch.
-      - name: cargo clippy (kernel / ${{ matrix.arch }})
-        run: |
-          cargo clippy -p narf-frame \
-            --target ${{ matrix.arch }}-unknown-none \
-            -Zbuild-std=core,compiler_builtins,alloc \
-            -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 \
-            --features boot-smoke,cgroup-all,bpf-idle,bpf-leds \
-            -- -D warnings
+      # Cargo resolves the frame's production/container/e2e feature contexts.
+      # Only changed packages are primary lint targets; --no-deps prevents
+      # linting dependency crates. Identical feature contexts are deduplicated.
+      - name: Clippy on changed kernel crates
+        env:
+          CI_CLIPPY_CRATES: ${{ needs.changes.outputs.clippy_crates }}
+        run: cargo xtask clippy-changed --arch=${{ matrix.arch }} --packages "$CI_CLIPPY_CRATES"
 
-      # Second pass with `container`. It is a SEPARATE pass, not another
-      # feature on the one above, because ~50 sites are
-      # `cfg(not(feature = "container"))` — folding it in would simply move
-      # the blind spot to those. Features are additive, so only two passes
-      # cover both sides of the switch.
-      #
-      # This exists because the gap was real, not theoretical. The
-      # container-gated arms include namespaces, pid_ns, and the sysvipc
-      # namespace paths, and nothing in CI compiled them: a call to
-      # `invalidate_sem_lookup_cache` — a function defined NOWHERE in the
-      # tree — reached main through review and CI, because its only call
-      # site is `#[cfg(feature = "container")]`. `main` did not build with
-      # the feature, and once it did, 27 sysvipc tests failed.
-      #
-      # The kernel-test suite does run `--features cgroup-all,container`,
-      # so this pass is about catching it at lint time on both arches
-      # rather than at the point someone runs the tests.
-      - name: cargo clippy (kernel / container / ${{ matrix.arch }})
-        run: |
-          cargo clippy -p narf-frame \
-            --target ${{ matrix.arch }}-unknown-none \
-            -Zbuild-std=core,compiler_builtins,alloc \
-            -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 \
-            --features boot-smoke,cgroup-all,bpf-idle,bpf-leds,container \
-            -- -D warnings
+  clippy-host:
+    name: clippy / changed host crates
+    needs: changes
+    if: needs.changes.outputs.host_clippy_crates != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          components: clippy
+      - name: Clippy on changed host crates
+        env:
+          CI_CLIPPY_CRATES: ${{ needs.changes.outputs.host_clippy_crates }}
+        run: cargo xtask clippy-changed --arch=host --packages "$CI_CLIPPY_CRATES"
 
-      # Third pass with `user-mode-e2e`. Same reasoning as the container pass
-      # and the same history: the feature gates real code that NOTHING in CI
-      # compiled. `UserProcess` gained a `program_bias` field; every call site
-      # the default feature set compiles was updated, but two builders inside
-      # `cfg(feature = "user-mode-e2e")` in narf-verification were not, and
-      # `cargo xtask test --features user-mode-e2e` stopped compiling for four
-      # merges before anyone ran it.
-      #
-      # The feature chains `kernel-test` (frame/Cargo.toml), so this pass also
-      # lints the in-kernel test code on the bare-metal target, which the
-      # default passes above do not. It is the only CI coverage of the
-      # user-mode e2e harnesses — the suites that enter ring 3 / EL0 for real.
-      - name: cargo clippy (kernel / user-mode-e2e / ${{ matrix.arch }})
-        run: |
-          cargo clippy -p narf-frame \
-            --target ${{ matrix.arch }}-unknown-none \
-            -Zbuild-std=core,compiler_builtins,alloc \
-            -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 \
-            --features user-mode-e2e \
-            -- -D warnings
-
-      # The functional jobs build optimized kernels. Link a real debug kernel
-      # too so the documented dual-profile merge gate covers debug-only cfgs,
-      # assertions, and linker layout on both architectures. On warm runs,
-      # shared sccache can reuse matching library objects; the final link
-      # remains fresh.
-      - name: cargo xtask build (debug / ${{ matrix.arch }})
-        run: cargo xtask build --arch=${{ matrix.arch }} --debug
-
-      - name: aarch64 UEFI loader tests + clippy
-        if: matrix.arch == 'aarch64'
+  uefi-loader:
+    name: aarch64 UEFI loader
+    needs: changes
+    if: needs.changes.outputs.run_uefi == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src clippy
+      - name: Loader tests and Clippy
         run: |
           cargo test --manifest-path build/uefi-loader/Cargo.toml
           cargo clippy --manifest-path build/uefi-loader/Cargo.toml \
-            --tests -- -D warnings
+            --no-deps --tests -- -D warnings
           cargo clippy --manifest-path build/uefi-loader/Cargo.toml \
-            --target aarch64-unknown-uefi --release \
+            --no-deps --target aarch64-unknown-uefi --release \
             -Zbuild-std=core,compiler_builtins,alloc \
-            -Zbuild-std-features=compiler-builtins-mem \
+            -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128 \
             -- -D warnings
 
   boot-smoke:
@@ -225,8 +187,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Same arch pruning as clippy: aarch64 boot only when the change is
-        # arch-sensitive; otherwise x86_64 alone.
+        # Boot selected kernel changes on both supported architectures.
         arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     steps:
       - uses: actions/checkout@v4
@@ -261,6 +222,10 @@ jobs:
       - name: Install Limine
         uses: ./.github/actions/setup-limine
 
+      # Keep the debug link gate separate from which packages need linting.
+      - name: cargo xtask build (debug / ${{ matrix.arch }})
+        run: cargo xtask build --arch=${{ matrix.arch }} --debug
+
       - name: cargo xtask boot-smoke
         run: cargo xtask boot-smoke --arch=${{ matrix.arch }}
 
@@ -275,7 +240,7 @@ jobs:
       # #PF'd on 0xFEE0_0020, which only the nightly OCI job (the one other
       # place `-x2apic` is set) ever hit. This boot is the cheap guard.
       - name: cargo xtask boot-smoke (xAPIC fallback, no x2APIC)
-        if: matrix.arch == 'x86_64'
+        if: matrix.arch == 'x86_64' && needs.changes.outputs.run_xapic == 'true'
         env:
           NARF_QEMU_CPU: "max,-x2apic"
         run: cargo xtask boot-smoke --arch=x86_64
@@ -608,9 +573,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Same arch pruning as clippy/boot-smoke. The build can't be pruned
-        # (frame links ~everything) but the SUBSYSTEM EXECUTION is filtered
-        # to the affected subsystems below.
+        # The image still links the kernel; execution uses the affected
+        # subsystem filter on both architectures.
         arch: ${{ fromJSON(needs.changes.outputs.clippy_arches) }}
     # The full in-kernel smoke suite (~5100 tests) runs in one QEMU boot
     # under TCG (no KVM on GHA), plus the primary invocation's production
@@ -697,7 +661,7 @@ jobs:
       # regression, not a second full run. aarch64 only: x86_64's q35 has no
       # virtio-mmio bus to populate.
       - name: cargo xtask test — virtio-mmio transport populated
-        if: matrix.arch == 'aarch64'
+        if: matrix.arch == 'aarch64' && needs.changes.outputs.run_virtio_mmio == 'true'
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           NARF_QEMU_EXTRA: "-device virtio-rng-device -global virtio-mmio.force-legacy=false"
@@ -721,6 +685,7 @@ jobs:
       # reach-ceiling assertions are about. Scoped to the two subsystems that
       # own this code, so it is a guard rather than a second full run.
       - name: cargo xtask test — large-memory frame placement
+        if: needs.changes.outputs.run_large_memory == 'true'
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           NARF_QEMU_MEM_MB: "8192"
@@ -752,7 +717,7 @@ jobs:
       # while still failing fast. `timeout-minutes` is a second backstop in
       # case the hang is upstream of xtask's own cap.
       - name: cargo xtask test — xAPIC fallback, SMP shootdown
-        if: matrix.arch == 'x86_64'
+        if: matrix.arch == 'x86_64' && needs.changes.outputs.run_xapic == 'true'
         timeout-minutes: 15
         env:
           XTASK_QEMU_TIMEOUT_SECS: "600"
@@ -786,6 +751,7 @@ jobs:
       # Widening the scope means fixing those first; leaving them outside it
       # keeps this step honest instead of red-by-default.
       - name: cargo xtask test — user-mode e2e harnesses
+        if: needs.changes.outputs.run_user_mode == 'true'
         timeout-minutes: 20
         env:
           XTASK_QEMU_TIMEOUT_SECS: "1200"

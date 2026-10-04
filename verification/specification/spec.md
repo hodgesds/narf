@@ -20,8 +20,12 @@ build orchestration (`build/`), release sign-off (`process/`).
 
 - `build/`'s `cargo xtask test` can boot the kernel in QEMU and collect
   structured exit codes + instrumentation output.
-- `cargo xtask test --subsystem NAME` selects one exact registered subsystem
-  for fast local iteration; the unfiltered command remains the merge gate.
+- `cargo xtask test --subsystem NAME` selects that registered subsystem and
+  its `/`-delimited children; comma-separated names select their union.
+  PR and push CI select all tests owned by changed crates and their reverse
+  dependents. Equivalent prefixes compact large inventories without widening
+  the selected set. Nightly/manual runs and conservative fallback cases retain
+  the unfiltered suite; `ci-full` explicitly requests it for a PR.
 - `cargo xtask test --kernel-tests-only` is restricted to secondary CI
   configuration shards after that architecture's primary invocation has run
   the production boot and host interoperability postflight. It does not
@@ -31,6 +35,12 @@ build orchestration (`build/`), release sign-off (`process/`).
   and turbo disabled for perf jobs.
 
 ## 3. Test taxonomy
+
+The affected-plan outputs and full-run fallback rules are specified in
+`build/specification/spec.md` §3. Secondary large-memory, xAPIC, virtio-mmio,
+and user-mode configurations run when their inputs are affected or the plan
+requires full coverage. The primary selected run still performs the normal
+production boot and host interoperability postflight.
 
 | Category        | Runs on       | Who gates | What it protects against                     |
 | --------------- | ------------- | --------- | -------------------------------------------- |
