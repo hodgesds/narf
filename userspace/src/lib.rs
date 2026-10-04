@@ -206,7 +206,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Identifiers ─────────────────────────────────────────────────────
 
-/// Monotonic process id. `0` is reserved (kernel itself).
+/// Linux-visible process id. Allocated cyclically and reused after wrap;
+/// `0` is reserved for the kernel.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessId(pub u64);
 

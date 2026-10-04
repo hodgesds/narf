@@ -324,6 +324,32 @@ fn smoke_abi_pid_alloc_set_tid_bounds_and_collision() -> TestResult {
                 return Err("set_tid of an in-use pid must be EEXIST");
             }
 
+            // clone3's early argument validation must use the LIVE exclusive
+            // pid_max too, not the PID_MAX_DEFAULT boot constant. With no
+            // address space installed, a valid high set_tid reaches copy_mm's
+            // ENOMEM; the stale constant check returned EINVAL before it.
+            let raised_max = crate::PID_MAX + 2;
+            let raised = format!("{raised_max}\n");
+            if proc_write(PID_MAX_PATH, raised.as_bytes()) != raised.len() as i64 {
+                return Err("could not raise pid_max for clone3 set_tid validation");
+            }
+            let requested_high = (crate::PID_MAX + 1) as i32;
+            let mut high_args = [0u8; 80];
+            high_args[64..72]
+                .copy_from_slice(&(core::ptr::addr_of!(requested_high) as u64).to_ne_bytes());
+            high_args[72..80].copy_from_slice(&1u64.to_ne_bytes());
+            let high_result = call(
+                Syscall::Clone3.raw(),
+                a1(high_args.as_ptr() as u64, high_args.len() as u64),
+            );
+            let restored = format!("{pid_max}\n");
+            if proc_write(PID_MAX_PATH, restored.as_bytes()) != restored.len() as i64 {
+                return Err("could not restore pid_max after clone3 set_tid validation");
+            }
+            if high_result != Some(ENOMEM) {
+                return Err("clone3 rejected a set_tid below the raised live pid_max");
+            }
+
             let a = crate::alloc_pid();
             owned.push(a);
             if let Ok(pid) = crate::alloc_pid_specific(a.raw() + 5) {

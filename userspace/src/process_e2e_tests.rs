@@ -3829,10 +3829,9 @@ kernel_test_in!("userspace/process", smoke_wave61_pidfd_shared_state);
 /// A pidfd minted for a RECYCLED pid must not inherit the previous
 /// occupant's exit state.
 ///
-/// The pidfd table is keyed by pid, and pids are reusable — NARF hands
-/// out the lowest free one, so the number a process gets is typically the
-/// one most recently freed. Without invalidation at `release_pid` the new
-/// process's pidfd is born POLLIN-readable, and a watcher that treats
+/// The pidfd table is keyed by pid, and pids remain reusable once the cyclic
+/// allocator wraps. Without invalidation at `release_pid` the new process's
+/// pidfd is born POLLIN-readable, and a watcher that treats
 /// readable as "it exited" then calls `waitid(P_PIDFD, ., WEXITED)` with
 /// no WNOHANG — which blocks forever on a process that is very much
 /// alive. That is Qt's `forkfd` shape, and it is what left kwin's main
@@ -3846,7 +3845,7 @@ fn smoke_pidfd_recycled_pid_does_not_inherit_exit() -> TestResult {
     use narf_filesystem::POLL_IN;
 
     crate::pidfd::__test_reset();
-    // Must be inside 1..=PID_MAX: `release_pid` rejects anything outside
+    // Must be below PID_MAX_LIMIT: `release_pid` rejects anything outside
     // that range, so an out-of-range constant silently skips the very
     // invalidation under test. (The neighbouring pidfd smokes use
     // 0xA110/0xDEAD/0xB055 — all above PID_MAX — because they never

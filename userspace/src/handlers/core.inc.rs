@@ -10811,7 +10811,7 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool, requested_tids: &[i32]) -> 
     }
     if requested_tids
         .iter()
-        .any(|&tid| tid <= 0 || tid as u64 > crate::PID_MAX)
+        .any(|&tid| tid <= 0 || tid as u64 >= crate::pid_max())
     {
         return Err(EINVAL);
     }
@@ -13714,8 +13714,8 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                     }
                     crate::task::release_task(tid);
                 }
-                // Reap-time pid↔tid unbinding. PIDs are recycled
-                // (lowest-free), so a surviving PID_TO_TASK row would
+                // Reap-time pid↔tid unbinding. PIDs are recycled after the
+                // cyclic allocator wraps, so a surviving PID_TO_TASK row would
                 // point the pid's NEXT owner-lookup at this dead tid —
                 // signals/waits misrouted to a corpse — and the stale
                 // TASK_TO_PID row would translate this dead tid to a
