@@ -174,12 +174,13 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                         sock.inet4_cmsg_options(),
                     )
                 } else if sock.domain == crate::socket::AF_INET6 {
-                    let (pktinfo, hoplimit) = sock.inet6_ancillary_options();
+                    let (pktinfo, hoplimit, tclass) = sock.inet6_ancillary_options();
                     install_ipv6_ancillary(
                         msg_ptr,
                         sock.take_inet6_recv_ancillary(),
                         pktinfo,
                         hoplimit,
+                        tclass,
                     )
                 } else {
                     install_recv_ancillary(

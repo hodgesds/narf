@@ -1734,8 +1734,8 @@ impl SocketFile {
                     return Some(EINVAL_R);
                 }
                 // LINUX-GAP: do_ipv6_setsockopt rxopt bits — stored and
-                // reported; only IPV6_PKTINFO / IPV6_HOPLIMIT cmsgs are
-                // generated on receive.
+                // reported; only IPV6_PKTINFO / IPV6_HOPLIMIT / IPV6_TCLASS
+                // cmsgs are generated on receive.
                 match name {
                     super::IPV6_RECVPKTINFO => o.ipv6_recvpktinfo = on,
                     super::IPV6_RECVHOPLIMIT => o.ipv6_recvhoplimit = on,

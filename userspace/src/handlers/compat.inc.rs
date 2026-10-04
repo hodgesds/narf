@@ -11118,48 +11118,38 @@ fn install_ipv6_ancillary(
     ancillary: Option<crate::socket::Inet6RecvAncillary>,
     pktinfo: bool,
     hoplimit: bool,
+    tclass: bool,
 ) -> bool {
-    const IPPROTO_IPV6: i32 = 41;
+    const SOL_IPV6: i32 = 41;
     const IPV6_PKTINFO: i32 = 50;
     const IPV6_HOPLIMIT: i32 = 52;
-    let ctrl_ptr = read_user_u64(msg_ptr + 32);
-    let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
-    let Some(ancillary) = ancillary else {
-        // SAFETY: copy_to_user validates the user range and brackets SMAP.
-        let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_ne_bytes()) };
-        return false;
-    };
+    const IPV6_TCLASS: i32 = 67;
     let mut records = alloc::vec::Vec::new();
-    if pktinfo {
-        let mut payload = [0u8; 20];
-        payload[..16].copy_from_slice(&ancillary.destination);
-        payload[16..20].copy_from_slice(&ancillary.ifindex.to_ne_bytes());
-        records.push((IPV6_PKTINFO, payload.to_vec()));
-    }
-    if hoplimit {
-        records.push((IPV6_HOPLIMIT, ancillary.hop_limit.to_ne_bytes().to_vec()));
-    }
-    let mut ctrl = alloc::vec::Vec::new();
-    let mut truncated = false;
-    for (kind, payload) in records {
-        let record_len = (16 + payload.len() + 7) & !7;
-        if ctrl_ptr == 0 || ctrl.len().saturating_add(record_len) > ctrl_len {
-            truncated = true;
-            continue;
+    if let Some(ancillary) = ancillary {
+        // `ip6_datagram_recv_common_ctl` emits PKTINFO first, followed by
+        // `ip6_datagram_recv_specific_ctl`'s HOPLIMIT and TCLASS records.
+        if pktinfo {
+            let mut payload = [0u8; 20];
+            payload[..16].copy_from_slice(&ancillary.destination);
+            payload[16..20].copy_from_slice(&ancillary.ifindex.to_ne_bytes());
+            records.push((SOL_IPV6, IPV6_PKTINFO, payload.to_vec()));
         }
-        ctrl.extend_from_slice(&((16 + payload.len()) as u64).to_ne_bytes());
-        ctrl.extend_from_slice(&IPPROTO_IPV6.to_ne_bytes());
-        ctrl.extend_from_slice(&kind.to_ne_bytes());
-        ctrl.extend_from_slice(&payload);
-        ctrl.resize(ctrl.len().next_multiple_of(8), 0);
+        if hoplimit {
+            records.push((
+                SOL_IPV6,
+                IPV6_HOPLIMIT,
+                ancillary.hop_limit.to_ne_bytes().to_vec(),
+            ));
+        }
+        if tclass {
+            records.push((
+                SOL_IPV6,
+                IPV6_TCLASS,
+                i32::from(ancillary.traffic_class).to_ne_bytes().to_vec(),
+            ));
+        }
     }
-    if ctrl_ptr != 0 && !ctrl.is_empty() {
-        // SAFETY: copy_to_user validates the user control-buffer range.
-        let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
-    }
-    // SAFETY: copy_to_user validates the msghdr field before writing it.
-    let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_ne_bytes()) };
-    truncated
+    put_cmsgs(msg_ptr, &records)
 }
 
 /// Write `records` (`(level, type, data)`) into the caller's `msg_control`

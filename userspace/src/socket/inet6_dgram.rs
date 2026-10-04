@@ -532,6 +532,7 @@ impl SocketFile {
                         scope_id: dest.2,
                         destination: dest.0,
                         hop_limit: if hop_limit < 0 { 64 } else { hop_limit },
+                        traffic_class: options.ext.ipv6_tclass as u8,
                         payload: buf.to_vec(),
                     });
                     *rmem += charge;
@@ -588,6 +589,7 @@ impl SocketFile {
                         scope_id: egress,
                         destination: dest.0,
                         hop_limit: hops,
+                        traffic_class: options.ext.ipv6_tclass as u8,
                         payload: buf.to_vec(),
                     },
                 );
@@ -649,6 +651,7 @@ impl SocketFile {
                     destination: packet.destination,
                     ifindex: packet.scope_id,
                     hop_limit: packet.hop_limit,
+                    traffic_class: packet.traffic_class,
                 });
                 if !peek {
                     inbox.pop_front();
@@ -698,7 +701,7 @@ pub(super) fn deliver_wire(
     dst_port: u16,
     payload: &[u8],
     in_ifindex: u32,
-    hop_limit: u8,
+    meta: narf_net::udp_sock::RxIpMeta,
 ) -> bool {
     if super::sockopt::is_multicast_v6(&dst_ip) {
         // `ip6_mc_input`: only groups the arrival device joined.
@@ -722,7 +725,8 @@ pub(super) fn deliver_wire(
                     peer_port: src_port,
                     scope_id: in_ifindex,
                     destination: dst_ip,
-                    hop_limit: hop_limit as i32,
+                    hop_limit: i32::from(meta.ttl),
+                    traffic_class: meta.tos,
                     payload: payload.to_vec(),
                 },
             );
@@ -753,7 +757,8 @@ pub(super) fn deliver_wire(
         peer_port: src_port,
         scope_id: in_ifindex,
         destination: dst_ip,
-        hop_limit: hop_limit as i32,
+        hop_limit: i32::from(meta.ttl),
+        traffic_class: meta.tos,
         payload: payload.to_vec(),
     });
     *rmem += charge;
@@ -779,10 +784,10 @@ pub(super) fn deliver_wire_v4_mapped(
     dst[10..12].copy_from_slice(&[0xff, 0xff]);
     src[12..].copy_from_slice(&src_ip);
     dst[12..].copy_from_slice(&dst_ip);
-    // A v4-mapped datagram's IPV6_HOPLIMIT is the IPv4 TTL
-    // (`ip6_datagram_recv_common_ctl`).
+    // A v4-mapped datagram's IPV6_HOPLIMIT/IPV6_TCLASS are the IPv4
+    // TTL/TOS (`ip6_datagram_recv_{common,specific}_ctl`).
     deliver_wire(
-        net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, meta.ttl,
+        net_ns_id, src, src_port, dst, dst_port, payload, in_ifindex, meta,
     )
 }
 

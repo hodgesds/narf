@@ -9548,6 +9548,7 @@ mod sockopt_parity {
     pub const IPV6_MULTICAST_ALL: u64 = 29;
     pub const IPV6_RECVPKTINFO: u64 = 49;
     pub const IPV6_RECVHOPLIMIT: u64 = 51;
+    pub const IPV6_RECVTCLASS: u64 = 66;
     pub const IPV6_TCLASS: u64 = 67;
     pub const IPV6_UNICAST_IF: u64 = 76;
     pub const IPV6_RECVFRAGSIZE: u64 = 77;
@@ -10861,3 +10862,121 @@ fn smoke_abi_inet_dgram_recvmsg_ip_cmsgs() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_inet_dgram_recvmsg_ip_cmsgs);
+
+/// IPv6 receive control messages follow `ip6_datagram_recv_{common,specific}_ctl`:
+/// `IPV6_RECVTCLASS` emits the received header's traffic class as an `int`
+/// `IPV6_TCLASS` cmsg, after any requested PKTINFO and HOPLIMIT records. Linux's
+/// `put_cmsg` also copies the prefix of a record when at least a cmsghdr fits,
+/// reports those consumed bytes in `msg_controllen`, and sets `MSG_CTRUNC`.
+fn smoke_abi_inet6_dgram_recvmsg_tclass_cmsg() -> TestResult {
+    const PORT: u16 = 47_334;
+    const SOL_IPV6: i32 = 41;
+    const IPV6_PKTINFO: i32 = 50;
+    const IPV6_HOPLIMIT: i32 = 52;
+    const IPV6_TCLASS: i32 = 67;
+    const MSG_DONTWAIT: u64 = 0x40;
+    const MSG_CTRUNC: u32 = 0x8;
+    const SRC: [u8; 16] = [0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    const DST: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+
+    fn deliver(payload: &[u8]) -> Result<(), &'static str> {
+        if crate::socket::deliver_wire_datagram(
+            0,
+            &SRC,
+            47_335,
+            &DST,
+            PORT,
+            payload,
+            1,
+            narf_net::udp_sock::RxIpMeta { ttl: 37, tos: 0x2e },
+        ) {
+            Ok(())
+        } else {
+            Err("IPv6 wire datagram did not reach the bound socket")
+        }
+    }
+
+    /// Receive into `ctrl[..room]`; returns `(bytes consumed, msg_flags)`.
+    fn recvmsg(
+        fd: u64,
+        data: &mut [u8],
+        ctrl: &mut [u8],
+        room: usize,
+    ) -> Result<(usize, u32), &'static str> {
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(room as u64).to_ne_bytes());
+        match call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(fd, msg.as_mut_ptr() as u64, MSG_DONTWAIT),
+        ) {
+            Some(n) if n >= 0 => Ok((
+                u64::from_ne_bytes(msg[40..48].try_into().unwrap()) as usize,
+                u32::from_ne_bytes(msg[48..52].try_into().unwrap()),
+            )),
+            _ => Err("recvmsg of the IPv6 datagram failed"),
+        }
+    }
+
+    with_setup(|| {
+        narf_net::iface::register_loopback_iface();
+        let rx = sockopt_socket(so::AF_INET6, SOCK_DGRAM)?;
+        sockopt_bind(rx, &sockaddr_in6([0; 16], PORT, 0))?;
+        let result = (|| -> Result<(), &'static str> {
+            if sockopt_set_int(rx, so::IPPROTO_IPV6, so::IPV6_RECVTCLASS, 1)? != 0 {
+                return Err("IPV6_RECVTCLASS failed");
+            }
+            deliver(b"full")?;
+            let mut data = [0u8; 16];
+            let mut ctrl = [0u8; 128];
+            let room = ctrl.len();
+            let (used, flags) = recvmsg(rx, &mut data, &mut ctrl, room)?;
+            if flags & MSG_CTRUNC != 0 || used != 24 {
+                return Err("the full IPV6_TCLASS cmsg had the wrong length or MSG_CTRUNC");
+            }
+            let cmsg_len = u64::from_ne_bytes(ctrl[0..8].try_into().unwrap()) as usize;
+            let level = i32::from_ne_bytes(ctrl[8..12].try_into().unwrap());
+            let kind = i32::from_ne_bytes(ctrl[12..16].try_into().unwrap());
+            let tclass = i32::from_ne_bytes(ctrl[16..20].try_into().unwrap());
+            if cmsg_len != 20 || level != SOL_IPV6 || kind != IPV6_TCLASS || tclass != 0x2e {
+                return Err("IPV6_RECVTCLASS did not return the received traffic class");
+            }
+
+            if sockopt_set_int(rx, so::IPPROTO_IPV6, so::IPV6_RECVPKTINFO, 1)? != 0
+                || sockopt_set_int(rx, so::IPPROTO_IPV6, so::IPV6_RECVHOPLIMIT, 1)? != 0
+            {
+                return Err("enabling IPv6 PKTINFO/HOPLIMIT receive options failed");
+            }
+            deliver(b"partial")?;
+            ctrl.fill(0xa5);
+            let (used, flags) = recvmsg(rx, &mut data, &mut ctrl, 58)?;
+            if used != 58 || flags & MSG_CTRUNC == 0 {
+                return Err("a partial IPv6 cmsg did not consume the room and set MSG_CTRUNC");
+            }
+            let first_len = u64::from_ne_bytes(ctrl[0..8].try_into().unwrap()) as usize;
+            let first_level = i32::from_ne_bytes(ctrl[8..12].try_into().unwrap());
+            let first_kind = i32::from_ne_bytes(ctrl[12..16].try_into().unwrap());
+            let second_len = u64::from_ne_bytes(ctrl[40..48].try_into().unwrap()) as usize;
+            let second_level = i32::from_ne_bytes(ctrl[48..52].try_into().unwrap());
+            let second_kind = i32::from_ne_bytes(ctrl[52..56].try_into().unwrap());
+            if (first_len, first_level, first_kind) != (36, SOL_IPV6, IPV6_PKTINFO)
+                || (second_len, second_level, second_kind) != (18, SOL_IPV6, IPV6_HOPLIMIT)
+                || ctrl[56..58] != 37i32.to_ne_bytes()[..2]
+            {
+                return Err("IPv6 cmsgs did not follow Linux order/partial-copy semantics");
+            }
+            Ok(())
+        })();
+        sockopt_close(&[rx]);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_inet6_dgram_recvmsg_tclass_cmsg
+);
