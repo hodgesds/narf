@@ -265,7 +265,7 @@ fn send_dns_query(
         DNS_PORT,
         &dns_payload,
     );
-    (snap.send)(&frame).map_err(|_| ResolveError::SendFailed)?;
+    snap.xmit(&frame).map_err(|_| ResolveError::SendFailed)?;
     Ok(qid)
 }
 

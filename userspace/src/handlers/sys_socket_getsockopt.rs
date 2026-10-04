@@ -106,6 +106,21 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         core::cmp::min(in_len, GETSOCKOPT_MAX_STAGE)
     };
     let mut buf = alloc::vec![0u8; stage_len];
+    // PACKET_HDRLEN is Linux's unusual read-modify-write getsockopt: the
+    // caller places a TPACKET_V* selector in optval and packet_getsockopt
+    // replaces it with sizeof(the selected header).  Preserve Linux's order:
+    // a short length is EINVAL in the protocol handler without touching the
+    // pointer, while a full-sized bad pointer is EFAULT here.
+    if sock.domain == crate::socket::AF_PACKET
+        && level == crate::socket::SOL_PACKET
+        && name == crate::socket::packet::PACKET_HDRLEN
+        && stage_len >= 4
+        // SAFETY: copy_from_user validates optval and brackets SMAP.
+        && unsafe { copy_from_user(&mut buf[..4], val_ptr) }.is_err()
+    {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
     let result = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
         level,
         name,

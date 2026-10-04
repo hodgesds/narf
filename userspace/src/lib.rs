@@ -106,6 +106,7 @@ mod abi_ipc_tests;
 mod abi_mem2_tests;
 mod abi_mem_tests;
 mod abi_misc_tests;
+mod abi_packet_tests;
 mod abi_path_tests;
 mod abi_pathx_tests;
 mod abi_perf_tests;

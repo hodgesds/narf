@@ -539,7 +539,7 @@ fn emit_udp6(
                 body: udp,
             },
         );
-        return (iface.send)(&frame).map_err(|_| Udp6SendError::DeviceFailure);
+        return iface.xmit(&frame).map_err(|_| Udp6SendError::DeviceFailure);
     }
     if !may_fragment || mtu as usize <= IPV6_HDR_LEN + 8 {
         return Err(Udp6SendError::MessageTooLong);
@@ -559,7 +559,9 @@ fn emit_udp6(
                 body: &fragment,
             },
         );
-        (iface.send)(&frame).map_err(|_| Udp6SendError::DeviceFailure)?;
+        iface
+            .xmit(&frame)
+            .map_err(|_| Udp6SendError::DeviceFailure)?;
     }
     Ok(())
 }
@@ -643,7 +645,7 @@ fn start_neighbor_resolution(
             body: &body,
         },
     );
-    let _ = (iface.send)(&frame);
+    let _ = iface.xmit(&frame);
 }
 
 /// Build an ICMPv6 Echo Request, set the checksum, return the body.

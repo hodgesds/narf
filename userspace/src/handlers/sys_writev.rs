@@ -30,6 +30,29 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // A socket writev is one sendmsg with one iterator, not one send per
+    // generic filesystem chunk.  Preserve AF_PACKET's frame atomicity and
+    // protocol errnos (ENXIO, ENETDOWN, EMSGSIZE, ...).
+    if let Some(packet) = crate::socket::packet::packet_socket_of(endpoint.ops.as_ref()) {
+        let mut payload = alloc::vec::Vec::with_capacity(count);
+        for iov in &iovecs {
+            // SAFETY: import_rw_iovecs validated each complete source range;
+            // the guarded copy catches a racing unmap before transmission.
+            match unsafe { copy_from_user_vec(iov.base, iov.len) } {
+                Ok(bytes) => payload.extend_from_slice(&bytes),
+                Err(errno) => {
+                    ctx.set_return(errno_ret(errno as i64));
+                    return;
+                }
+            }
+        }
+        match packet.packet_write(&payload) {
+            Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            Err(errno) => ctx.set_return(errno_ret(errno)),
+        }
+        return;
+    }
+
     if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
         write_pipe_user(ctx, &endpoint, count, |mut offset, mut bytes| {
             for iov in &iovecs {

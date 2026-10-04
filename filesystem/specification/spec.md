@@ -1059,7 +1059,9 @@ the NIC drivers have probed. Each device carries Linux's net-sysfs attributes â€
 `ifindex` and `iflink` (the rtnetlink ifindex udev keys its database on),
 `type` (`ARPHRD_ETHER`/`ARPHRD_LOOPBACK`), `addr_len`, `dev_id`, `address`,
 `broadcast`, `operstate` (`unknown` for `lo`), `mtu`, `flags` (`dev->flags`,
-never the volatile `IFF_RUNNING`), a writable `uevent` with `INTERFACE` and
+never the volatile `IFF_RUNNING`; `IFF_PROMISC`/`IFF_ALLMULTI` while the
+snapshot's `NetIfaceInfo::promisc`/`allmulti` report a non-zero
+`dev->promiscuity`/`dev->allmulti`), a writable `uevent` with `INTERFACE` and
 `IFINDEX` â€” and the `subsystem` link; `mtu`, `operstate` and `flags` read live
 state.
 The bounded boot udev replay begins at the first completed late device

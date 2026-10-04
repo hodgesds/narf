@@ -317,9 +317,20 @@ receive timestamping. `SO_SNDBUFFORCE` and `SO_RCVBUFFORCE` require
 `CAP_NET_ADMIN` (`EPERM` otherwise), bypass normal maxima, and use Linux's
 signed, doubled buffer accounting. `SO_ATTACH_FILTER` requires the native
 16-byte `sock_fprog` shape and returns Linux-compatible `EINVAL`/`EFAULT` for
-invalid descriptors or instruction images; NARF validates and retains the
-classic-BPF image while its synthetic uevent delivery remains independently
-restricted to kernel-originated group-1 records.
+invalid descriptors or instruction images. On `AF_PACKET`, the checked image
+is installed in the packet hook and its return value drops or snaplen-trims
+each frame; synthetic uevent delivery remains independently restricted to
+kernel-originated group-1 records.
+`socket(AF_PACKET, SOCK_DGRAM|SOCK_RAW|SOCK_PACKET, protocol)` requires
+`CAP_NET_RAW` over the creator's network namespace owning user namespace and
+retains that network namespace. `sockaddr_ll` bind/send/getname, packet receive addresses,
+plain and vectored socket I/O, polling, device events, `SOL_PACKET`
+membership/options/statistics and `PACKET_AUXDATA` follow Linux
+`net/packet/af_packet.c`; generic receive timestamps precede packet auxdata in
+`recvmsg` control output. `PACKET_RX_RING`/`PACKET_TX_RING`, fanout and
+non-zero virtio-net headers fail explicitly because packet mmap/GSO is not
+implemented. Interface promiscuity/all-multicast memberships are
+reference-counted and visible through both `SIOCGIFFLAGS` and net sysfs.
 AF_UNIX stream clients may bind a local pathname or abstract address before
 `connect(2)`; binding does not put the socket into listening state. Connected
 stream receive operations honor `MSG_PEEK` without consuming queued bytes.

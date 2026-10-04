@@ -68,6 +68,7 @@ pub fn release_network_namespace(net_ns_id: u64) {
 pub mod arp;
 pub mod arp_cache;
 pub mod bypass;
+pub mod cbpf;
 pub mod dhcp;
 pub mod dns;
 pub mod http;

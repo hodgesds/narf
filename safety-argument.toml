@@ -1359,3 +1359,12 @@ argument = "The invocation future owns the heap stack, normalized context tuple,
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Resume validation requires the status id and saved id to agree, remaining fuel not to exceed the original tank, call depth to fit the fixed frame array, every saved return id to belong to the sealed image, each saved caller R10 to match the expected frame, every verifier-computed descent to remain in the owned heap stack, and live R10 to name the resulting current frame. Compiler-emitted resume and return dispatchers accept only fixed ids, restore BPF registers and fuel, and branch only to fixed post-call targets. Tests cover multiple resume sites, callee-saved and heap-stack state, a bounded stack slice retained by an async shim, rejection of a dead-after-call non-sleep-safe argument, native/interpreter parity through three BPF frames, rejection of a corrupted return id, domain restoration, cancellation, and detach."
+# AF_PACKET net-device sysfs projection. Human security review remains
+# mandatory for the frame wiring before merge.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame edit copies two boolean link-state attributes from the existing net interface snapshot into the filesystem's read-only sysfs projection. It adds no trusted subsystem, capability, mapping, domain transition, scheduler state, packet access, or userspace pointer; all AF_PACKET authority checks and frame processing remain in the existing userspace/net compatibility path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The new fields expose only whether reference-counted promiscuity and all-multicast state is non-zero, matching the same public device flags returned by ioctl. The cross-crate hook transfers neither the counts nor mutation authority, and does not alter domain save/restore, guarded user access, capability invocation, or physical-frame ownership."

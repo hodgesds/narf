@@ -81,6 +81,32 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
+
+    // A socket readv is one recvmsg into one iterator.  Dequeue exactly one
+    // AF_PACKET record, scatter it once, and keep packet-specific pending
+    // errors intact instead of translating them through FsError.
+    if let Some(packet) = crate::socket::packet::packet_socket_of(endpoint.ops.as_ref()) {
+        let mut staging = alloc::vec![0u8; count];
+        match packet.packet_read(&mut staging) {
+            Ok(n) => match scatter_to_iovecs(&iovecs, 0, &staging[..n]) {
+                Ok(()) => ctx.set_return(SyscallReturn::ok(n as u64)),
+                Err(errno) => ctx.set_return(errno_ret(errno as i64)),
+            },
+            Err(errno) if errno == EAGAIN => {
+                if endpoint.nonblocking() {
+                    ctx.set_return(errno_ret(EAGAIN));
+                } else if has_interrupting_signal(task) {
+                    ctx.set_return(errno_ret(EINTR));
+                } else if handler_sys_read::park_blocking_read(ctx, endpoint.ops.as_ref()) {
+                    return;
+                } else {
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+            }
+            Err(errno) => ctx.set_return(errno_ret(errno)),
+        }
+        return;
+    }
     if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
         read_pipe_user(ctx, &endpoint, count, |mut offset, mut src, mut len| {
             for iov in &iovecs {

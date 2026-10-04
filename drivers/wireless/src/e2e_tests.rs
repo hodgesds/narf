@@ -628,7 +628,7 @@ fn smoke_e2e_iface_registry_wlan0_visible() -> TestResult {
         return TestResult::Fail("interface name did not round-trip");
     }
     // The send-fn must drive an actual call without panicking.
-    match (snap.send)(&[0u8; 64]) {
+    match snap.xmit(&[0u8; 64]) {
         Ok(()) => {}
         Err(()) => return TestResult::Fail("synthetic send returned Err"),
     }

@@ -223,7 +223,7 @@ pub fn icmp_echo_send(
     {
         return Ok(());
     }
-    (iface.send)(&frame).map_err(|_| IcmpError2::NoInterface)?;
+    iface.xmit(&frame).map_err(|_| IcmpError2::NoInterface)?;
 
     // Record the pending echo.
     sock.pending.lock().push_back(PendingEcho {
@@ -414,7 +414,7 @@ fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_bo
     if nf_tx_filter_in(net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
         == crate::netfilter::Verdict::Accept
     {
-        let _ = (iface.send)(&frame);
+        let _ = iface.xmit(&frame);
     }
 }
 

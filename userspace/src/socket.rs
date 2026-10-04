@@ -36,8 +36,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 mod inet6_dgram;
 mod inet_dgram;
 mod inet_port;
+pub(crate) mod packet;
 mod sockopt;
 pub use inet_dgram::{MSG_ERRQUEUE, SOCKADDR_IN_BODY_LEN};
+pub use packet::{AF_PACKET, SOCK_PACKET, SOL_PACKET};
 pub use sockopt::{timeo_ns, SockOptExt};
 
 // ── POSIX-numbered constants ────────────────────────────────────
@@ -802,6 +804,9 @@ pub struct SocketFile {
     /// The IPv4 receive info of the datagram each task last received, for
     /// its recvmsg's control messages. Keyed like `inet6_recv_ancillary`.
     inet4_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, Inet4RxInfo>>,
+    /// AF_PACKET ancillary state belongs to the dequeued frame and is keyed
+    /// by receiver task for the same reason as datagram credentials above.
+    packet_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, packet::PacketRecvAncillary>>,
     /// Durable per-fd readiness cell for a connectionless datagram inbox
     /// (AF_UNIX/AF_INET SOCK_DGRAM). The inbox lives INSIDE the `state` enum
     /// behind the lock, so — unlike a `RingBuf` Arc — the cell can't be a field
@@ -1319,6 +1324,10 @@ enum SocketState {
         peer: Option<(u32, u16)>,
         inbox: VecDeque<DgramPacket>,
     },
+    /// AF_PACKET socket state, registered with the net-side protocol hooks.
+    Packet {
+        sock: Arc<narf_net::raw_sock::PacketSock>,
+    },
     /// AF_BYPASS / AF_XDP-equivalent socket. Carries an Arc to a
     /// kernel-bypass state struct so `dispatch_op` can route into
     /// `crate::xdp_socket` for the four-ring setup, bind, and
@@ -1702,6 +1711,7 @@ impl SocketFile {
             dgram_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             inet6_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             inet4_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
+            packet_recv_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
             // A fresh dgram socket is always sendable, not yet readable; a fresh
             // listener has no pending connection; a fresh netlink queue is empty
             // (readable only once a reply/monitor message is enqueued) but always
@@ -3069,6 +3079,7 @@ impl FileOps for SocketFile {
                     // read(2) reports no credentials either, so clear the
                     // whole per-record entry rather than leaving a cred behind.
                     self.discard_dgram_recv_ancillary();
+                    let _ = self.take_packet_recv_ancillary();
                     Ok(n)
                 }
                 // A datagram longer than the buffer truncates silently on
@@ -3076,6 +3087,7 @@ impl FileOps for SocketFile {
                 SocketOpResult::ReceivedTruncated { copied, .. } => {
                     drop(self.unix_take_recv_fds());
                     self.discard_dgram_recv_ancillary();
+                    let _ = self.take_packet_recv_ancillary();
                     Ok(copied)
                 }
                 // The dispatchers distinguish empty-but-open from EOF; pass
@@ -3204,6 +3216,8 @@ impl FileOps for SocketFile {
                     const IFF_BROADCAST: i16 = 0x2;
                     const IFF_LOOPBACK: i16 = 0x8;
                     const IFF_RUNNING: i16 = 0x40;
+                    const IFF_PROMISC: i16 = 0x100;
+                    const IFF_ALLMULTI: i16 = 0x200;
                     const IFF_MULTICAST: i16 = 0x1000;
                     let mut flags = IFF_MULTICAST;
                     if iface.link_up {
@@ -3214,6 +3228,12 @@ impl FileOps for SocketFile {
                     } else {
                         IFF_BROADCAST
                     };
+                    if iface.promisc {
+                        flags |= IFF_PROMISC;
+                    }
+                    if iface.allmulti {
+                        flags |= IFF_ALLMULTI;
+                    }
                     ifreq[16..18].copy_from_slice(&flags.to_ne_bytes());
                 }
                 SIOCGIFADDR | SIOCGIFNETMASK => {
@@ -3365,6 +3385,7 @@ impl FileOps for SocketFile {
             Listener,
             Uevent,
             Netlink,
+            Packet(Arc<narf_net::raw_sock::PacketSock>),
             Legacy,
         }
         let d = match &*self.state.lock() {
@@ -3384,6 +3405,7 @@ impl FileOps for SocketFile {
             | SocketState::NetlinkSockDiag { .. }
             | SocketState::NetlinkNetfilter { .. }
             | SocketState::NetlinkAudit { .. } => D::Netlink,
+            SocketState::Packet { sock } => D::Packet(sock.clone()),
             _ => D::Legacy,
         };
         match d {
@@ -3411,6 +3433,10 @@ impl FileOps for SocketFile {
             }
             D::Netlink => {
                 self.netlink_readiness.disarm(task_id);
+                true
+            }
+            D::Packet(sock) => {
+                sock.readiness().disarm(task_id);
                 true
             }
         }
@@ -3453,6 +3479,7 @@ impl SocketFile {
             // durable cell reconciled to whether the socket is readable (a kernel
             // reply queued OR a userspace unicast/broadcast in the inbox).
             Netlink(bool),
+            Packet(Arc<narf_net::raw_sock::PacketSock>),
             Legacy,
         }
         // A userspace message in the inbox makes ANY netlink socket readable
@@ -3484,6 +3511,7 @@ impl SocketFile {
             | SocketState::NetlinkAudit { replies } => {
                 Arm::Netlink(!replies.is_empty() || nl_inbox_nonempty)
             }
+            SocketState::Packet { sock } => Arm::Packet(sock.clone()),
             _ => Arm::Legacy,
         };
         match arm {
@@ -3583,6 +3611,13 @@ impl SocketFile {
                     interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
                 ))
             }
+            Arm::Packet(sock) => Some(arm_one(
+                sock.readiness(),
+                interest
+                    & (narf_filesystem::POLL_IN
+                        | narf_filesystem::POLL_OUT
+                        | narf_filesystem::POLL_ERR),
+            )),
         }
     }
 
@@ -3733,6 +3768,7 @@ impl SocketFile {
                 }
                 bits
             }
+            SocketState::Packet { sock } => sock.poll_mask(),
             SocketState::Bypass { .. } => {
                 // Kernel-bypass path: readiness is managed by the XDP
                 // layer directly; report both directions so callers can
@@ -3829,6 +3865,7 @@ impl SocketFile {
             | SocketState::NetlinkSockDiag { replies }
             | SocketState::NetlinkNetfilter { replies }
             | SocketState::NetlinkAudit { replies } => replies.front().map(Vec::len).unwrap_or(0),
+            SocketState::Packet { sock } => sock.inq(),
             // A non-member of the kernel uevent group has nothing queued to
             // report, so SIOCINQ is 0 — matching the EAGAIN its recv gives.
             SocketState::NetlinkUevent { reader }
@@ -3849,6 +3886,11 @@ impl SocketFile {
     /// shape; the per-family branch executes it. POSIX syscall
     /// shims and ring opcodes both call this.
     pub fn dispatch_op(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        // AF_PACKET supplies its own getname and socket-option operations;
+        // route it before the cross-family defaults consume those ops.
+        if self.domain == AF_PACKET {
+            return self.dispatch_packet(op);
+        }
         let op = match op {
             SocketOp::Recv { buf, flags }
                 if self.domain == AF_NETLINK && !self.netlink_user_inbox.lock().is_empty() =>
@@ -7754,6 +7796,9 @@ const RING_CAP: usize = 64 * 1024;
 impl Drop for SocketFile {
     fn drop(&mut self) {
         self.release_multicast();
+        if let SocketState::Packet { sock } = &*self.state.lock() {
+            sock.release();
+        }
         // Closing this endpoint deads BOTH directions of the connection:
         // - `tx` (this end writes, the PEER reads) → close surfaces EOF to the
         //   peer's read (any buffered bytes still drain first, then EOF).

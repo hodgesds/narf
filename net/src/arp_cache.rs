@@ -428,7 +428,7 @@ pub fn send_gratuitous_arp(iface_name: &str, addr: [u8; 4]) {
     // A GARP is an ARP request with TPA == SPA (sender answers for itself).
     let mut frame = [0u8; 60];
     if let Some(n) = pkt::build_arp_request(&mut frame, snap.mac, addr, addr) {
-        let _ = (snap.send)(&frame[..n]);
+        let _ = snap.xmit(&frame[..n]);
     }
 }
 

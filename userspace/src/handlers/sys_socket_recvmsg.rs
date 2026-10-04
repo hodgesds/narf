@@ -107,6 +107,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
             let fail = |ctx: &mut dyn TrapContext, errno: i64| {
                 drop(sock.unix_take_recv_fds());
                 let _ = sock.recvmsg_cred();
+                let _ = sock.take_packet_recv_ancillary();
                 ctx.set_return(errno_ret(errno));
             };
             // Scatter into iovec destinations under SMAP bracket.
@@ -142,6 +143,15 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 // sender credentials with uid 0 — so this is required for
                 // udevd / `udevadm monitor` to accept our broadcasts.
                 install_netlink_ancillary(msg_ptr, sock.netlink_pktinfo());
+            } else if sock.domain == crate::socket::AF_PACKET {
+                let ancillary_truncated = install_packet_ancillary(
+                    msg_ptr,
+                    sock.take_packet_recv_ancillary(),
+                    sock.rcv_timestamp_mode(),
+                );
+                if ancillary_truncated {
+                    write_user_u32(msg_ptr + 48, 0x8); // MSG_CTRUNC
+                }
             } else {
                 // SCM_RIGHTS: install any passed file objects into this task's
                 // fd table and report the new fd numbers in an SOL_SOCKET/

@@ -44,6 +44,21 @@ pub struct NetIfaceEntry {
     pub driver: &'static str,
     pub driver_version: Option<&'static str>,
     pub bus_info: String,
+    /// `dev->promiscuity`: references taken by `dev_set_promiscuity`.
+    pub promiscuity: u32,
+    /// `dev->allmulti`: references taken by `dev_set_allmulti`.
+    pub allmulti: u32,
+    /// `dev->mc` / `dev->uc`: hardware addresses added by `dev_mc_add` /
+    /// `dev_uc_add`, each with its reference count.
+    pub hw_addrs: Vec<HwAddr>,
+}
+
+/// One `netdev_hw_addr` on a device's multicast or unicast list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HwAddr {
+    pub addr: [u8; 6],
+    pub unicast: bool,
+    pub refcount: u32,
 }
 
 /// Record `ETHTOOL_GDRVINFO` data for interface `name` (see
@@ -267,6 +282,9 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
         driver: "",
         driver_version: None,
         bus_info: String::new(),
+        promiscuity: 0,
+        allmulti: 0,
+        hw_addrs: Vec::new(),
     });
     drop(g);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
@@ -360,17 +378,7 @@ pub fn snapshot_all_in(net_ns_id: u64) -> Vec<NetIfaceSnapshot> {
     };
     v.iter()
         .filter(|e| e.net_ns_id == net_ns_id)
-        .map(|e| NetIfaceSnapshot {
-            name: e.name.clone(),
-            mac: e.mac,
-            send: e.send,
-            ipv4: e.ipv4,
-            gateway: e.gateway,
-            mtu: e.mtu,
-            link_up: e.link_up,
-            net_ns_id: e.net_ns_id,
-            ifindex: e.ifindex,
-        })
+        .map(snapshot)
         .collect()
 }
 
@@ -380,17 +388,7 @@ pub fn primary() -> Option<NetIfaceSnapshot> {
     let g = IFACES.lock();
     let v = g.as_ref()?;
     let e = v.first()?;
-    Some(NetIfaceSnapshot {
-        name: e.name.clone(),
-        mac: e.mac,
-        send: e.send,
-        ipv4: e.ipv4,
-        gateway: e.gateway,
-        mtu: e.mtu,
-        link_up: e.link_up,
-        net_ns_id: e.net_ns_id,
-        ifindex: e.ifindex,
-    })
+    Some(snapshot(e))
 }
 
 /// Look up a registered interface by name. Returns `None` if the
@@ -401,17 +399,7 @@ pub fn lookup(name: &str) -> Option<NetIfaceSnapshot> {
     let g = IFACES.lock();
     let v = g.as_ref()?;
     let e = v.iter().find(|e| e.name == name)?;
-    Some(NetIfaceSnapshot {
-        name: e.name.clone(),
-        mac: e.mac,
-        send: e.send,
-        ipv4: e.ipv4,
-        gateway: e.gateway,
-        mtu: e.mtu,
-        link_up: e.link_up,
-        net_ns_id: e.net_ns_id,
-        ifindex: e.ifindex,
-    })
+    Some(snapshot(e))
 }
 
 /// Find the registered interface that OWNS the given IPv4 address (its
@@ -431,29 +419,13 @@ pub fn for_local_addr_in(net_ns_id: u64, ip: [u8; 4]) -> Option<NetIfaceSnapshot
     let e = v
         .iter()
         .find(|e| e.net_ns_id == net_ns_id && e.ipv4 == ip)?;
-    Some(NetIfaceSnapshot {
-        name: e.name.clone(),
-        mac: e.mac,
-        send: e.send,
-        ipv4: e.ipv4,
-        gateway: e.gateway,
-        mtu: e.mtu,
-        link_up: e.link_up,
-        net_ns_id: e.net_ns_id,
-        ifindex: e.ifindex,
-    })
+    Some(snapshot(e))
 }
 
 /// Send a complete Ethernet frame through the primary iface.
 /// Returns Err if no iface is registered or the driver failed.
 pub fn send(frame: &[u8]) -> Result<(), ()> {
-    let send_fn = {
-        let g = IFACES.lock();
-        let v = g.as_ref().ok_or(())?;
-        let e = v.first().ok_or(())?;
-        e.send
-    };
-    send_fn(frame)
+    primary().ok_or(())?.xmit(frame)
 }
 
 /// Send a complete Ethernet frame out the interface named `iface_name`.
@@ -539,8 +511,16 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
     else {
         return false;
     };
+    let old_ns = entry.net_ns_id;
     entry.net_ns_id = net_ns_id;
+    let moved = snapshot(entry);
+    drop(g);
     crate::route::move_iface_routes(name, net_ns_id);
+    // `dev_change_net_namespace` unregisters the device from its old
+    // namespace (NETDEV_UNREGISTER there).
+    if old_ns != net_ns_id {
+        crate::raw_sock::netdev_unregister_moved(old_ns, &moved);
+    }
     true
 }
 
@@ -586,8 +566,7 @@ pub fn for_dst_in(net_ns_id: u64, dst: [u8; 4]) -> Option<NetIfaceSnapshot> {
 /// `for_dst(dst_ip)`. Returns Err if no iface is registered or the
 /// driver failed.
 pub fn send_for_dst(dst: [u8; 4], frame: &[u8]) -> Result<(), ()> {
-    let send_fn = for_dst(dst).ok_or(())?.send;
-    send_fn(frame)
+    for_dst(dst).ok_or(())?.xmit(frame)
 }
 
 /// Owned-by-value snapshot of a NetIfaceEntry. Used to avoid
@@ -596,27 +575,188 @@ pub fn send_for_dst(dst: [u8; 4], frame: &[u8]) -> Result<(), ()> {
 pub struct NetIfaceSnapshot {
     pub name: String,
     pub mac: [u8; 6],
-    pub send: SendFn,
+    /// The driver's transmit hook. Private: every kernel transmit goes
+    /// through [`NetIfaceSnapshot::xmit`] so packet taps see it.
+    driver_send: SendFn,
     pub ipv4: [u8; 4],
     pub gateway: [u8; 4],
     pub mtu: u32,
     pub link_up: bool,
     pub net_ns_id: u64,
     pub ifindex: u32,
+    /// `dev->promiscuity != 0` (`IFF_PROMISC` in `dev->flags`).
+    pub promisc: bool,
+    /// `dev->allmulti != 0` (`IFF_ALLMULTI` in `dev->flags`).
+    pub allmulti: bool,
+}
+
+impl NetIfaceSnapshot {
+    /// `dev->type`: `ARPHRD_LOOPBACK` for `lo`, `ARPHRD_ETHER` otherwise.
+    #[must_use]
+    pub fn hatype(&self) -> u16 {
+        if self.ifindex == 1 || self.name == "lo" {
+            crate::raw_sock::ARPHRD_LOOPBACK
+        } else {
+            crate::raw_sock::ARPHRD_ETHER
+        }
+    }
+
+    /// `dev_queue_xmit`: transmit a complete Ethernet frame the kernel
+    /// stack built. `ETH_P_ALL` packet sockets see it first
+    /// (`dev_queue_xmit_nit`, `PACKET_OUTGOING`), then the driver sends it.
+    pub fn xmit(&self, frame: &[u8]) -> Result<(), ()> {
+        crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
+        (self.driver_send)(frame)
+    }
+
+    /// `dev_queue_xmit` for a frame a packet socket built: `protocol` is
+    /// the `skb->protocol` it set and `origin` the sender, which its own
+    /// tap skips (`skb_loop_sk`). A driver refusal models `NET_XMIT_DROP`;
+    /// packet_snd translates it to ENOBUFS.
+    pub fn xmit_from(
+        &self,
+        frame: &[u8],
+        protocol: u16,
+        origin: Option<&crate::raw_sock::PacketSock>,
+    ) -> Result<(), ()> {
+        crate::raw_sock::dev_queue_xmit_nit(self, frame, protocol, origin);
+        (self.driver_send)(frame)
+    }
+
+    /// `dev_direct_xmit`: hand the frame straight to the driver, with no
+    /// packet taps (`PACKET_QDISC_BYPASS`).
+    pub fn xmit_direct(&self, frame: &[u8]) -> Result<(), ()> {
+        (self.driver_send)(frame)
+    }
 }
 
 fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
     NetIfaceSnapshot {
         name: entry.name.clone(),
         mac: entry.mac,
-        send: entry.send,
+        driver_send: entry.send,
         ipv4: entry.ipv4,
         gateway: entry.gateway,
         mtu: entry.mtu,
         link_up: entry.link_up,
         net_ns_id: entry.net_ns_id,
         ifindex: entry.ifindex,
+        promisc: entry.promiscuity != 0,
+        allmulti: entry.allmulti != 0,
     }
+}
+
+/// The interface with `ifindex` in `net_ns_id` (`dev_get_by_index`).
+#[must_use]
+pub fn by_index_in(net_ns_id: u64, ifindex: u32) -> Option<NetIfaceSnapshot> {
+    let g = IFACES.lock();
+    let entry = g
+        .as_ref()?
+        .iter()
+        .find(|entry| entry.net_ns_id == net_ns_id && entry.ifindex == ifindex)?;
+    Some(snapshot(entry))
+}
+
+fn with_dev<R>(net_ns_id: u64, ifindex: u32, f: impl FnOnce(&mut NetIfaceEntry) -> R) -> Option<R> {
+    let mut g = IFACES.lock();
+    let entry = g
+        .as_mut()?
+        .iter_mut()
+        .find(|entry| entry.net_ns_id == net_ns_id && entry.ifindex == ifindex)?;
+    Some(f(entry))
+}
+
+/// `dev_set_promiscuity(dev, inc)`. Errors are Linux errnos (positive).
+///
+/// LINUX-GAP: `__dev_set_rx_mode` / `ndo_set_rx_mode` — NARF NIC drivers do
+/// not reprogram their receive filters from this count; only the reference
+/// count and `IFF_PROMISC` in `dev->flags` (sysfs `flags`) change.
+pub fn dev_set_promiscuity(net_ns_id: u64, ifindex: u32, inc: i32) -> Result<(), i32> {
+    with_dev(net_ns_id, ifindex, |e| {
+        let next = e.promiscuity.wrapping_add_signed(inc);
+        if next == 0 && inc > 0 {
+            // "promiscuity touches roof".
+            return Err(crate::raw_sock::errno::EOVERFLOW);
+        }
+        e.promiscuity = next;
+        Ok(())
+    })
+    .unwrap_or(Err(crate::raw_sock::errno::ENODEV))
+}
+
+/// `dev_set_allmulti(dev, inc)`; see [`dev_set_promiscuity`] for the
+/// driver-programming gap.
+pub fn dev_set_allmulti(net_ns_id: u64, ifindex: u32, inc: i32) -> Result<(), i32> {
+    with_dev(net_ns_id, ifindex, |e| {
+        let next = e.allmulti.wrapping_add_signed(inc);
+        if next == 0 && inc > 0 {
+            return Err(crate::raw_sock::errno::EOVERFLOW);
+        }
+        e.allmulti = next;
+        Ok(())
+    })
+    .unwrap_or(Err(crate::raw_sock::errno::ENODEV))
+}
+
+/// `dev_mc_add` / `dev_uc_add`: take a reference on a hardware address.
+pub fn dev_hw_addr_add(
+    net_ns_id: u64,
+    ifindex: u32,
+    addr: [u8; 6],
+    unicast: bool,
+) -> Result<(), i32> {
+    with_dev(net_ns_id, ifindex, |e| {
+        match e
+            .hw_addrs
+            .iter_mut()
+            .find(|h| h.addr == addr && h.unicast == unicast)
+        {
+            Some(h) => h.refcount += 1,
+            None => e.hw_addrs.push(HwAddr {
+                addr,
+                unicast,
+                refcount: 1,
+            }),
+        }
+        Ok(())
+    })
+    .unwrap_or(Err(crate::raw_sock::errno::ENODEV))
+}
+
+/// `dev_mc_del` / `dev_uc_del`: drop a reference; `-ENOENT` when absent.
+pub fn dev_hw_addr_del(
+    net_ns_id: u64,
+    ifindex: u32,
+    addr: [u8; 6],
+    unicast: bool,
+) -> Result<(), i32> {
+    with_dev(net_ns_id, ifindex, |e| {
+        let Some(pos) = e
+            .hw_addrs
+            .iter()
+            .position(|h| h.addr == addr && h.unicast == unicast)
+        else {
+            return Err(crate::raw_sock::errno::ENOENT);
+        };
+        e.hw_addrs[pos].refcount -= 1;
+        if e.hw_addrs[pos].refcount == 0 {
+            e.hw_addrs.remove(pos);
+        }
+        Ok(())
+    })
+    .unwrap_or(Err(crate::raw_sock::errno::ENODEV))
+}
+
+/// The hardware addresses on a device's lists (tests and diagnostics).
+#[must_use]
+pub fn dev_hw_addrs(net_ns_id: u64, ifindex: u32) -> Vec<HwAddr> {
+    with_dev(net_ns_id, ifindex, |e| e.hw_addrs.clone()).unwrap_or_default()
+}
+
+/// `dev->promiscuity` / `dev->allmulti` reference counts.
+#[must_use]
+pub fn dev_promisc_counts(net_ns_id: u64, ifindex: u32) -> Option<(u32, u32)> {
+    with_dev(net_ns_id, ifindex, |e| (e.promiscuity, e.allmulti))
 }
 
 pub fn set_link_state(name: &str, up: bool) -> bool {
@@ -627,7 +767,23 @@ pub fn set_link_state(name: &str, up: bool) -> bool {
     else {
         return false;
     };
+    let changed = entry.link_up != up;
     entry.link_up = up;
+    let (net_ns_id, ifindex) = (entry.net_ns_id, entry.ifindex);
+    drop(g);
+    // `dev_open` / `dev_close` raise NETDEV_UP / NETDEV_DOWN only on a real
+    // transition. Delivered with IFACES released: the notifier reads it.
+    if changed {
+        crate::raw_sock::netdev_event(
+            net_ns_id,
+            ifindex,
+            if up {
+                crate::raw_sock::NetdevEvent::Up
+            } else {
+                crate::raw_sock::NetdevEvent::Down
+            },
+        );
+    }
     true
 }
 

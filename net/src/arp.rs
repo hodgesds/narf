@@ -259,7 +259,7 @@ pub fn resolve_blocking(
         let mut frame = [0u8; 60];
         let n = pkt::build_arp_request(&mut frame, snap.mac, snap.ipv4, target_ip)
             .ok_or(ArpError::NoIface)?;
-        let _ = (snap.send)(&frame[..n]);
+        let _ = snap.xmit(&frame[..n]);
     }
 
     // Busy-wait for the reply to land.

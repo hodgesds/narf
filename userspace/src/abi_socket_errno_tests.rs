@@ -253,15 +253,16 @@ fn tcp_listener(port: u16) -> Result<u64, &'static str> {
 // ───────────────────────────── socket(2) ─────────────────────────────
 
 /// `net/socket.c::__sock_create`: PF_INET + SOCK_PACKET is redirected to
-/// PF_PACKET before the family lookup, so without PF_PACKET it is
-/// EAFNOSUPPORT, not `inet_create`'s ESOCKTNOSUPPORT. The family is checked
-/// as the full `int`: a value that merely truncates to AF_INET in 16 bits is
-/// outside [0, NPROTO).
+/// PF_PACKET before the family lookup. The family is checked as the full
+/// `int`: a value that merely truncates to AF_INET in 16 bits is outside
+/// [0, NPROTO).
 fn smoke_abi_socket_errno_socket_family_type_order() -> TestResult {
     with_setup(|| {
-        if sys(Syscall::SocketOpen, a2(AF_INET, SOCK_PACKET, 0)) != Some(EAFNOSUPPORT) {
-            return Err("AF_INET/SOCK_PACKET must be EAFNOSUPPORT without PF_PACKET");
+        let packet = sys(Syscall::SocketOpen, a2(AF_INET, SOCK_PACKET, 0));
+        if packet.is_none_or(|fd| fd < 0) {
+            return Err("AF_INET/SOCK_PACKET must redirect to the registered PF_PACKET family");
         }
+        close(packet.unwrap_or_default() as u64);
         if sys(Syscall::SocketOpen, a2(0x1_0002, SOCK_STREAM, 0)) != Some(EAFNOSUPPORT) {
             return Err("a family that only truncates to AF_INET must be EAFNOSUPPORT");
         }

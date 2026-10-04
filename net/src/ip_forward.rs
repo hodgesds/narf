@@ -351,7 +351,7 @@ fn emit(egress: &iface::NetIfaceSnapshot, dst_mac: [u8; 6], packet: &[u8]) {
     let mut frame = alloc::vec![0u8; ETH_HDR_LEN + packet.len()];
     write_eth_header(&mut frame, dst_mac, egress.mac, ETHERTYPE_IPV4);
     frame[ETH_HDR_LEN..].copy_from_slice(packet);
-    let _ = (egress.send)(&frame);
+    let _ = egress.xmit(&frame);
 }
 
 /// Send an ICMP error built by `pkt_icmp_extra` back to `dst`.
@@ -400,7 +400,7 @@ fn send_icmp_error(net_ns_id: u64, dst: Ipv4Addr, icmp_body: Vec<u8>) {
     );
     crate::pkt::set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + MIN_HDR]);
     frame[ETH_HDR_LEN + MIN_HDR..].copy_from_slice(&icmp_body);
-    let _ = (egress.send)(&frame);
+    let _ = egress.xmit(&frame);
 }
 
 // ── ICMP Redirect ───────────────────────────────────────────────────────────

@@ -168,14 +168,24 @@ fn smoke_network_namespace_transport_tables_are_isolated() -> TestResult {
     {
         return TestResult::Fail("UDP namespace snapshots are not isolated");
     }
-    let raw_a = crate::raw_sock::raw_packet_open_in(601, crate::raw_sock::ETH_P_ALL, 0);
-    let raw_b = crate::raw_sock::raw_packet_open_in(602, crate::raw_sock::ETH_P_ALL, 0);
+    let raw_a = crate::raw_sock::PacketSock::create(
+        601,
+        crate::raw_sock::SOCK_RAW,
+        crate::raw_sock::ETH_P_ALL.to_be(),
+        212_992,
+    );
+    let raw_b = crate::raw_sock::PacketSock::create(
+        602,
+        crate::raw_sock::SOCK_RAW,
+        crate::raw_sock::ETH_P_ALL.to_be(),
+        212_992,
+    );
     if crate::raw_sock::snapshot_in(601).len() != 1 || crate::raw_sock::snapshot_in(602).len() != 1
     {
         return TestResult::Fail("raw socket namespace snapshots are not isolated");
     }
-    crate::raw_sock::raw_packet_close(&raw_a);
-    crate::raw_sock::raw_packet_close(&raw_b);
+    raw_a.release();
+    raw_b.release();
     crate::udp_sock::udp_close(&udp_a);
     crate::udp_sock::udp_close(&udp_b);
     crate::tcp::core::remove_tcb(tcp_id);
@@ -8728,8 +8738,16 @@ fn smoke_raw_packet_frames_carry_the_ingress_ifindex() -> TestResult {
     let Some(ifindex) = crate::iface::ifindex_of(&name) else {
         return TestResult::Fail("test interface has no ifindex");
     };
-    let bound = crate::raw_sock::raw_packet_open(crate::raw_sock::ETH_P_ALL, ifindex);
-    let on_lo = crate::raw_sock::raw_packet_open(crate::raw_sock::ETH_P_ALL, 1);
+    // A device receives only while it is up (`enqueue_to_backlog` drops
+    // frames for a device that is not running).
+    crate::iface::set_link_state(&name, true);
+    let open_on = |ifindex: u32| {
+        let sock = crate::raw_sock::PacketSock::create(0, crate::raw_sock::SOCK_RAW, 0, 212_992);
+        let _ = sock.bind(None, ifindex as i32, crate::raw_sock::ETH_P_ALL.to_be());
+        sock
+    };
+    let bound = open_on(ifindex);
+    let on_lo = open_on(1);
     // An ARP request from 198.51.100.2 for 198.51.100.1, broadcast.
     let mut frame = [0u8; 60];
     frame[0..6].copy_from_slice(&[0xff; 6]);
@@ -8740,18 +8758,441 @@ fn smoke_raw_packet_frames_carry_the_ingress_ifindex() -> TestResult {
     frame[28..32].copy_from_slice(&[198, 51, 100, 2]);
     frame[38..42].copy_from_slice(&[198, 51, 100, 1]);
     crate::tcp_stack::rx_handler(&name, &mut frame);
-    let got = crate::raw_sock::raw_packet_recv(&bound);
-    let leaked = crate::raw_sock::raw_packet_recv(&on_lo);
-    crate::raw_sock::raw_packet_close(&bound);
-    crate::raw_sock::raw_packet_close(&on_lo);
+    let got = bound.recv(false).ok();
+    // lo carries its own traffic (every lo transmit is now also tapped), so
+    // look for THIS frame among whatever the lo socket queued.
+    let mut leaked = false;
+    while let Ok(raw) = on_lo.recv(false) {
+        leaked |= raw.data.get(..frame.len()) == Some(&frame[..]);
+    }
+    bound.release();
+    on_lo.release();
+    crate::iface::set_link_state(&name, false);
     match got {
         Some(raw) if raw.ifindex == ifindex => {}
         Some(_) => return TestResult::Fail("the frame carried another device's ifindex"),
         None => return TestResult::Fail("a socket bound to the ingress device received nothing"),
     }
-    if leaked.is_some() {
+    if leaked {
         return TestResult::Fail("a socket bound to lo received a frame from another device");
     }
     TestResult::Pass
 }
 kernel_test_in!("net/raw", smoke_raw_packet_frames_carry_the_ingress_ifindex);
+
+// ── AF_PACKET kernel half (`raw_sock`) and classic BPF (`cbpf`) ──────────
+
+fn packet_open(sock_type: u32, proto: u16) -> alloc::sync::Arc<crate::raw_sock::PacketSock> {
+    crate::raw_sock::PacketSock::create(0, sock_type, proto.to_be(), 212_992)
+}
+
+/// An ETH_P_ALL socket receives every frame of the device it is bound to;
+/// a socket bound to one ethertype only that ethertype (`ptype_all` vs
+/// `ptype_base`). Ported from the receive smokes of the old raw-socket table.
+fn smoke_packet_eth_p_all_and_ethertype_hooks() -> TestResult {
+    use crate::raw_sock::{ETH_P_ALL, SOCK_RAW};
+    let name = crate::iface::register("nrfh%d", [0x02, 0, 0, 0, 0xbf, 0], |_| Ok(()));
+    crate::iface::set_link_state(&name, true);
+    let Some(ifindex) = crate::iface::ifindex_of(&name) else {
+        return TestResult::Fail("test interface has no ifindex");
+    };
+    // Protocol 0 at creation: no hook until bind, so frames other devices
+    // carry meanwhile cannot be queued.
+    let all = packet_open(SOCK_RAW, 0);
+    let ipv4 = packet_open(SOCK_RAW, 0);
+    let _ = all.bind(None, ifindex as i32, ETH_P_ALL.to_be());
+    let _ = ipv4.bind(None, ifindex as i32, 0x0800u16.to_be());
+    let mut arp = [0u8; 60];
+    arp[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+    let mut ip = [0u8; 60];
+    ip[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    crate::tcp_stack::rx_handler(&name, &mut arp);
+    crate::tcp_stack::rx_handler(&name, &mut ip);
+    let a1 = all.recv(false).ok();
+    let a2 = all.recv(false).ok();
+    let i1 = ipv4.recv(false).ok();
+    let i2 = ipv4.recv(false).ok();
+    all.release();
+    ipv4.release();
+    crate::iface::set_link_state(&name, false);
+    if a1.is_none() || a2.is_none() {
+        return TestResult::Fail("ETH_P_ALL did not receive every frame");
+    }
+    match i1 {
+        Some(r) if r.data[12..14] == [8, 0] => {}
+        _ => return TestResult::Fail("the IPv4 hook did not receive the IPv4 frame"),
+    }
+    if i2.is_some() {
+        return TestResult::Fail("the IPv4 hook received the ARP frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/raw", smoke_packet_eth_p_all_and_ethertype_hooks);
+
+/// A frame may advertise 802.1Q in the Ethernet type field but end before
+/// the four-byte VLAN header. Linux leaves that malformed skb deliverable to
+/// an ETH_P_ALL packet hook; a SOCK_DGRAM receiver must not index beyond the
+/// linear data while deriving auxdata for it.
+fn smoke_packet_short_vlan_frame_is_bounded() -> TestResult {
+    use crate::raw_sock::{ETH_P_8021Q, ETH_P_ALL, SOCK_DGRAM};
+    let name = crate::iface::register("nrfv%d", [0x02, 0, 0, 0, 0xbf, 1], |_| Ok(()));
+    crate::iface::set_link_state(&name, true);
+    let Some(dev) = crate::iface::lookup(&name) else {
+        return TestResult::Fail("test interface missing");
+    };
+    let tap = packet_open(SOCK_DGRAM, ETH_P_ALL);
+    let _ = tap.bind(None, dev.ifindex as i32, 0);
+    let mut frame = [0u8; 14];
+    frame[12..14].copy_from_slice(&ETH_P_8021Q.to_be_bytes());
+    crate::raw_sock::netif_receive(&dev, &frame);
+    let got = tap.recv(false);
+    tap.release();
+    crate::iface::set_link_state(&name, false);
+    match got {
+        Ok(record) if record.data.is_empty() && record.vlan == Some((0, ETH_P_8021Q)) => {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("short VLAN frame must be delivered with a bounded zero TCI"),
+    }
+}
+kernel_test_in!("net/raw", smoke_packet_short_vlan_frame_is_bounded);
+
+/// Every frame the stack transmits passes `NetIfaceSnapshot::xmit`, whose
+/// `dev_queue_xmit_nit` shows it to ETH_P_ALL sockets as PACKET_OUTGOING
+/// before the driver runs; on lo the driver's receive then delivers it again
+/// as PACKET_HOST.
+fn smoke_packet_stack_xmit_is_tapped_outgoing() -> TestResult {
+    use crate::raw_sock::{ETH_P_ALL, PACKET_HOST, PACKET_OUTGOING, SOCK_RAW};
+    crate::iface::register_loopback_iface();
+    let tap = packet_open(SOCK_RAW, ETH_P_ALL);
+    let _ = tap.bind(None, 1, 0);
+    let Some(lo) = crate::iface::lookup("lo") else {
+        tap.release();
+        return TestResult::Fail("no lo");
+    };
+    let mut frame = [0u8; 40];
+    frame[12..14].copy_from_slice(&0x88b5u16.to_be_bytes());
+    frame[20..28].copy_from_slice(b"xmit-tap");
+    let _ = lo.xmit(&frame);
+    let mut seen = alloc::vec::Vec::new();
+    while let Ok(r) = tap.recv(false) {
+        if r.data.windows(8).any(|w| w == b"xmit-tap") {
+            seen.push(r.pkttype);
+        }
+    }
+    tap.release();
+    if seen != [PACKET_OUTGOING, PACKET_HOST] {
+        return TestResult::Fail("lo xmit must be tapped OUTGOING, then received HOST");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/raw", smoke_packet_stack_xmit_is_tapped_outgoing);
+
+/// `packet_mc_add` / `packet_flush_mclist`: PACKET_MR_PROMISC and
+/// PACKET_MR_ALLMULTI take references on `dev->promiscuity` /
+/// `dev->allmulti` (IFF_PROMISC / IFF_ALLMULTI in the snapshot), a repeated
+/// identical membership only counts on the socket, PACKET_MR_MULTICAST adds
+/// the address to the device's list, and closing the socket drops all of it.
+fn smoke_packet_memberships_reference_the_device() -> TestResult {
+    use crate::raw_sock::{
+        PacketMreq, ETH_P_ALL, MAX_ADDR_LEN, PACKET_MR_ALLMULTI, PACKET_MR_MULTICAST,
+        PACKET_MR_PROMISC, SOCK_RAW,
+    };
+    let name = crate::iface::register("nrfm%d", [0x02, 0, 0, 0, 0xbe, 1], |_| Ok(()));
+    let Some(ifindex) = crate::iface::ifindex_of(&name) else {
+        return TestResult::Fail("test interface has no ifindex");
+    };
+    let mreq = |ty: u16, alen: u16, addr: &[u8]| {
+        let mut a = [0u8; MAX_ADDR_LEN];
+        a[..addr.len()].copy_from_slice(addr);
+        PacketMreq {
+            ifindex: ifindex as i32,
+            mr_type: ty,
+            alen,
+            addr: a,
+        }
+    };
+    let group = [0x01, 0x80, 0xc2, 0, 0, 0x0e];
+    let sock = packet_open(SOCK_RAW, ETH_P_ALL);
+    let ok = sock.mc_add(&mreq(PACKET_MR_PROMISC, 0, &[])).is_ok()
+        && sock.mc_add(&mreq(PACKET_MR_PROMISC, 0, &[])).is_ok()
+        && sock.mc_add(&mreq(PACKET_MR_ALLMULTI, 0, &[])).is_ok()
+        && sock.mc_add(&mreq(PACKET_MR_MULTICAST, 6, &group)).is_ok();
+    let counts = crate::iface::dev_promisc_counts(0, ifindex);
+    let snap = crate::iface::lookup(&name);
+    let listed = crate::iface::dev_hw_addrs(0, ifindex);
+    sock.release();
+    let after = crate::iface::dev_promisc_counts(0, ifindex);
+    let listed_after = crate::iface::dev_hw_addrs(0, ifindex);
+    if !ok {
+        return TestResult::Fail("memberships must be accepted");
+    }
+    if counts != Some((1, 1)) {
+        return TestResult::Fail("a repeated membership takes one device reference");
+    }
+    if !snap.is_some_and(|s| s.promisc && s.allmulti) {
+        return TestResult::Fail("the device must report IFF_PROMISC and IFF_ALLMULTI");
+    }
+    if listed.len() != 1 || listed[0].addr != group || listed[0].unicast {
+        return TestResult::Fail("the multicast address must be on the device list");
+    }
+    if after != Some((0, 0)) || !listed_after.is_empty() {
+        return TestResult::Fail("closing the socket must drop every membership");
+    }
+
+    // NETDEV_UNREGISTER during a namespace move flushes memberships from the
+    // socket and from the moved device before invalidating the binding.
+    let moved = packet_open(SOCK_RAW, ETH_P_ALL);
+    if moved.bind(None, ifindex as i32, ETH_P_ALL.to_be()).is_err()
+        || moved.mc_add(&mreq(PACKET_MR_PROMISC, 0, &[])).is_err()
+        || !crate::iface::set_net_ns(&name, 0xfeed)
+    {
+        moved.release();
+        return TestResult::Fail("prepare namespace-move membership");
+    }
+    let moved_counts = crate::iface::dev_promisc_counts(0xfeed, ifindex);
+    let moved_error = moved.take_error();
+    moved.release();
+    let _ = crate::iface::set_net_ns(&name, 0);
+    if moved_counts != Some((0, 0)) || moved_error != crate::raw_sock::errno::ENETDOWN {
+        return TestResult::Fail("namespace move must flush membership and report ENETDOWN");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/raw", smoke_packet_memberships_reference_the_device);
+
+type CbpfInsn = (u16, u8, u8, u32);
+
+fn cbpf_prog(insns: &[CbpfInsn]) -> Option<crate::cbpf::Program> {
+    let mut image = alloc::vec::Vec::new();
+    for &(code, jt, jf, k) in insns {
+        image.extend_from_slice(&code.to_ne_bytes());
+        image.push(jt);
+        image.push(jf);
+        image.extend_from_slice(&k.to_ne_bytes());
+    }
+    crate::cbpf::Program::from_bytes(&image)
+}
+
+fn cbpf_view(frame: &[u8], data_off: usize) -> crate::cbpf::SkbView<'_> {
+    crate::cbpf::SkbView {
+        frame,
+        data_off,
+        len: frame.len() - data_off,
+        mac_off: 0,
+        net_off: 14,
+        protocol: 0x0800,
+        pkt_type: 1,
+        ifindex: 7,
+        hatype: 1,
+        vlan: Some((0x2005, 0x8100)),
+    }
+}
+
+/// `bpf_check_classic` + `check_load_and_stores`: the last instruction must
+/// return, jumps stay in the program, scratch slots are written before they
+/// are read, immediate division by zero and shifts >= 32 are refused, and
+/// only defined ancillary offsets are accepted.
+fn smoke_cbpf_checker_matches_bpf_check_classic() -> TestResult {
+    let ret: CbpfInsn = (0x06, 0, 0, 0xffff);
+    let cases: [(&[CbpfInsn], bool, &str); 9] = [
+        (&[ret], true, "a lone RET"),
+        (&[(0x00, 0, 0, 1)], false, "no final RET"),
+        (&[(0x05, 0, 0, 1), ret], false, "JA past the end"),
+        (
+            &[(0x15, 2, 0, 0), ret],
+            false,
+            "conditional target past the end",
+        ),
+        (&[(0x60, 0, 0, 3), ret], false, "M[3] read before written"),
+        (
+            &[(0x02, 0, 0, 3), (0x60, 0, 0, 3), ret],
+            true,
+            "M[3] written then read",
+        ),
+        (&[(0x34, 0, 0, 0), ret], false, "DIV by immediate zero"),
+        (&[(0x64, 0, 0, 32), ret], false, "LSH by an immediate >= 32"),
+        (
+            &[(0x20, 0, 0, 0xffff_f000 + 64), ret],
+            false,
+            "undefined ancillary offset",
+        ),
+    ];
+    for (insns, valid, what) in cases {
+        if cbpf_prog(insns).is_some() != valid {
+            return TestResult::Fail(what);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/cbpf", smoke_cbpf_checker_matches_bpf_check_classic);
+
+/// The interpreter follows the classic program's eBPF translation: 32-bit
+/// wrapping ALU, X shifts masked to 31, DIV/MOD by a zero X returns 0, an
+/// out-of-bounds load returns 0, BPF_IND / BPF_MSH / BPF_LEN, SKF_NET_OFF and
+/// SKF_LL_OFF relative loads, and the ancillary loads.
+fn smoke_cbpf_interpreter_semantics() -> TestResult {
+    use crate::cbpf::run;
+    let mut frame = [0u8; 64];
+    frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 0x42]);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    frame[14] = 0x46; // ihl 6 → 24-byte header
+    frame[14 + 24 + 2..14 + 24 + 4].copy_from_slice(&68u16.to_be_bytes());
+    let raw = cbpf_view(&frame, 0);
+    let dgram = cbpf_view(&frame, 14);
+    let ret_a: CbpfInsn = (0x16, 0, 0, 0);
+    let check = |insns: &[CbpfInsn], skb: &crate::cbpf::SkbView<'_>, want: u32| {
+        cbpf_prog(insns).is_some_and(|p| run(&p, skb) == want)
+    };
+    let cases: [(&[CbpfInsn], bool, u32, &str); 13] = [
+        // A = 0xffffffff + 2 wraps to 1.
+        (
+            &[(0x00, 0, 0, u32::MAX), (0x04, 0, 0, 2), ret_a],
+            true,
+            1,
+            "ADD wraps",
+        ),
+        // X = 33: A << (33 & 31) = A << 1.
+        (
+            &[(0x00, 0, 0, 3), (0x01, 0, 0, 33), (0x6c, 0, 0, 0), ret_a],
+            true,
+            6,
+            "LSH X masks",
+        ),
+        (
+            &[(0x00, 0, 0, 3), (0x3c, 0, 0, 0), (0x06, 0, 0, 9)],
+            true,
+            0,
+            "DIV by zero X",
+        ),
+        (
+            &[
+                (0x00, 0, 0, 7),
+                (0x01, 0, 0, 0),
+                (0x9c, 0, 0, 0),
+                (0x06, 0, 0, 9),
+            ],
+            true,
+            0,
+            "MOD by zero X",
+        ),
+        (
+            &[(0x00, 0, 0, 5), (0x84, 0, 0, 0), ret_a],
+            true,
+            5u32.wrapping_neg(),
+            "NEG",
+        ),
+        (
+            &[(0x20, 0, 0, 62), (0x06, 0, 0, 9)],
+            true,
+            0,
+            "out-of-bounds word load",
+        ),
+        (&[(0x80, 0, 0, 0), ret_a], true, 64, "LEN on SOCK_RAW"),
+        (&[(0x80, 0, 0, 0), ret_a], false, 50, "LEN on SOCK_DGRAM"),
+        // X = 4 * (P[14] & 0xf) = 24; A = P[X + 14 + 2] (UDP dport).
+        (
+            &[(0xb1, 0, 0, 14), (0x48, 0, 0, 16), ret_a],
+            true,
+            68,
+            "MSH + IND",
+        ),
+        // From SOCK_DGRAM: SKF_LL_OFF + 11 is the source MAC's last byte.
+        (
+            &[(0x30, 0, 0, 0xffe0_000b), ret_a],
+            false,
+            0x42,
+            "SKF_LL_OFF from the network header",
+        ),
+        // SKF_NET_OFF + 0 is the IP version/ihl byte from SOCK_RAW.
+        (
+            &[(0x30, 0, 0, 0xfff0_0000), ret_a],
+            true,
+            0x46,
+            "SKF_NET_OFF",
+        ),
+        (
+            &[(0x28, 0, 0, 0xffff_f02c), ret_a],
+            true,
+            0x2005,
+            "SKF_AD_VLAN_TAG",
+        ),
+        (
+            &[(0x45, 1, 0, 0x8000), (0x06, 0, 0, 1), (0x06, 0, 0, 2)],
+            true,
+            1,
+            "JSET false",
+        ),
+    ];
+    for (insns, on_raw, want, what) in cases {
+        let skb = if on_raw { &raw } else { &dgram };
+        if !check(insns, skb, want) {
+            return TestResult::Fail(what);
+        }
+    }
+    // SKF_AD_PROTOCOL / PKTTYPE / IFINDEX / HATYPE / VLAN_TAG_PRESENT /
+    // VLAN_TPID.
+    let anc: [(u32, u32); 6] = [(0, 0x0800), (4, 1), (8, 7), (28, 1), (48, 1), (60, 0x8100)];
+    for (off, want) in anc {
+        if !check(&[(0x20, 0, 0, 0xffff_f000 + off), ret_a], &raw, want) {
+            return TestResult::Fail("ancillary load");
+        }
+    }
+    if !check(
+        &[
+            (0x00, 0, 0, 0xf0),
+            (0x01, 0, 0, 0x0f),
+            (0x20, 0, 0, 0xffff_f028),
+            ret_a,
+        ],
+        &raw,
+        0xff,
+    ) {
+        return TestResult::Fail("SKF_AD_ALU_XOR_X");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/cbpf", smoke_cbpf_interpreter_semantics);
+
+/// `SKF_AD_NLATTR`: `nla_find` over the packet from offset A for attribute
+/// type X returns the attribute's offset (0 when absent).
+fn smoke_cbpf_nlattr_lookup() -> TestResult {
+    let mut buf = [0u8; 24];
+    // nlattr { len 8, type 1 } + 4 bytes, nlattr { len 8, type 0x4005 } + 4.
+    buf[4..6].copy_from_slice(&8u16.to_ne_bytes());
+    buf[6..8].copy_from_slice(&1u16.to_ne_bytes());
+    buf[12..14].copy_from_slice(&8u16.to_ne_bytes());
+    buf[14..16].copy_from_slice(&0x4005u16.to_ne_bytes());
+    let skb = crate::cbpf::SkbView {
+        frame: &buf,
+        data_off: 0,
+        len: buf.len(),
+        mac_off: 0,
+        net_off: 0,
+        protocol: 0,
+        pkt_type: 0,
+        ifindex: 0,
+        hatype: 0,
+        vlan: None,
+    };
+    let find = |ty: u32| {
+        cbpf_prog(&[
+            (0x00, 0, 0, 4),
+            (0x01, 0, 0, ty),
+            (0x20, 0, 0, 0xffff_f00c),
+            (0x16, 0, 0, 0),
+        ])
+        .map(|p| crate::cbpf::run(&p, &skb))
+    };
+    if find(1) != Some(4) {
+        return TestResult::Fail("the first attribute");
+    }
+    if find(5) != Some(12) {
+        return TestResult::Fail("nla_type masks NLA_F_NET_BYTEORDER");
+    }
+    if find(9) != Some(0) {
+        return TestResult::Fail("an absent attribute is 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/cbpf", smoke_cbpf_nlattr_lookup);

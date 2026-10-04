@@ -11236,6 +11236,49 @@ fn install_ipv4_ancillary(
     put_cmsgs(msg_ptr, &records)
 }
 
+/// Install the control records produced by `packet_recvmsg`: generic receive
+/// timestamp first (`sock_recv_cmsgs`), then `PACKET_AUXDATA` (`put_cmsg`).
+/// Returns whether any requested record was truncated.
+fn install_packet_ancillary(
+    msg_ptr: u64,
+    ancillary: Option<crate::socket::packet::PacketRecvAncillary>,
+    timestamp_mode: (bool, bool, bool),
+) -> bool {
+    const SOL_SOCKET: i32 = 1;
+    const SOL_PACKET: i32 = 263;
+    const PACKET_AUXDATA: i32 = 8;
+    const SCM_TIMESTAMP_OLD: i32 = 29;
+    const SCM_TIMESTAMPNS_OLD: i32 = 35;
+    const SCM_TIMESTAMP_NEW: i32 = 63;
+    const SCM_TIMESTAMPNS_NEW: i32 = 64;
+
+    let mut records = alloc::vec::Vec::new();
+    if let Some(ancillary) = ancillary {
+        let (timestamp, nanos, new_abi) = timestamp_mode;
+        if timestamp {
+            let mut value = alloc::vec::Vec::with_capacity(16);
+            value.extend_from_slice(&ancillary.tstamp_secs.to_ne_bytes());
+            let fraction = if nanos {
+                i64::from(ancillary.tstamp_nanos)
+            } else {
+                i64::from(ancillary.tstamp_nanos / 1_000)
+            };
+            value.extend_from_slice(&fraction.to_ne_bytes());
+            let kind = match (nanos, new_abi) {
+                (false, false) => SCM_TIMESTAMP_OLD,
+                (true, false) => SCM_TIMESTAMPNS_OLD,
+                (false, true) => SCM_TIMESTAMP_NEW,
+                (true, true) => SCM_TIMESTAMPNS_NEW,
+            };
+            records.push((SOL_SOCKET, kind, value));
+        }
+        if let Some(auxdata) = ancillary.auxdata {
+            records.push((SOL_PACKET, PACKET_AUXDATA, auxdata.to_vec()));
+        }
+    }
+    put_cmsgs(msg_ptr, &records)
+}
+
 /// Install received AF_UNIX ancillary data into the calling task's
 /// `msg_control` buffer: an `SCM_RIGHTS` control message (any passed fds,
 /// each dup'd into a fresh fd in this task's table) and, when
