@@ -234,6 +234,16 @@ pub struct NetIfaceInfo {
     pub mac: [u8; 6],
     pub mtu: u32,
     pub link_up: bool,
+    /// The ifindex rtnetlink reports for this device (`lo` is 1).
+    pub ifindex: u32,
+    /// Loopback (`ARPHRD_LOOPBACK`) rather than Ethernet (`ARPHRD_ETHER`).
+    pub loopback: bool,
+}
+
+/// The current snapshot of interface `name`, so attributes read live state
+/// (link up/down, MTU) rather than whatever held when sysfs was populated.
+fn net_snapshot(name: &str) -> Option<NetIfaceInfo> {
+    net_snapshots().into_iter().find(|info| info.name == name)
 }
 
 /// Hook type: returns a Vec of `NetIfaceInfo` for all registered interfaces.
@@ -990,30 +1000,59 @@ pub fn populate_net_class() {
         get_or_create_child(&class_dir, "net")
     };
 
-    for (idx, info) in net_snapshots().into_iter().enumerate() {
+    for info in net_snapshots() {
         let name_owned = info.name.clone();
         let kobj = class_device_register(class_net.clone(), &name_owned);
-        let mtu = info.mtu;
+        let ifindex = info.ifindex;
         let mac = info.mac;
-        let link_up = info.link_up;
-        // ifindex: lo is 1 by convention; the rest follow in enumeration
-        // order. udev reads `ifindex` to key the interface. Linux ref:
-        // `net/core/net-sysfs.c` (netdev_group_show et al.).
-        let ifindex = idx + 1;
-        kobject_add_attr(&kobj, "mtu", move || format!("{}\n", mtu));
+        let loopback = info.loopback;
+        // Linux `net/core/net-sysfs.c`. udev keys the device on `ifindex`
+        // (its database file is `n<ifindex>`), so it must be the same number
+        // rtnetlink reports; `type` is the ARPHRD_* NetworkManager and udev's
+        // net_id builtin classify the link by.
+        let live = name_owned.clone();
+        kobject_add_attr(&kobj, "mtu", move || {
+            format!("{}\n", net_snapshot(&live).map_or(0, |i| i.mtu))
+        });
         kobject_add_attr(&kobj, "ifindex", move || format!("{}\n", ifindex));
+        kobject_add_attr(&kobj, "iflink", move || format!("{}\n", ifindex));
+        kobject_add_attr(&kobj, "type", move || {
+            format!("{}\n", if loopback { 772 } else { 1 })
+        });
+        kobject_add_attr(&kobj, "addr_len", || "6\n".to_string());
+        kobject_add_attr(&kobj, "dev_id", || "0x0\n".to_string());
         kobject_add_attr(&kobj, "address", move || {
             format!(
                 "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
             )
         });
-        kobject_add_attr(&kobj, "operstate", move || {
-            if link_up {
-                "up\n".to_string()
+        kobject_add_attr(&kobj, "broadcast", move || {
+            if loopback {
+                "00:00:00:00:00:00\n".to_string()
             } else {
-                "down\n".to_string()
+                "ff:ff:ff:ff:ff:ff\n".to_string()
             }
+        });
+        let live = name_owned.clone();
+        kobject_add_attr(&kobj, "operstate", move || match net_snapshot(&live) {
+            Some(i) if i.loopback => "unknown\n".to_string(),
+            Some(i) if i.link_up => "up\n".to_string(),
+            _ => "down\n".to_string(),
+        });
+        let live = name_owned.clone();
+        kobject_add_attr(&kobj, "flags", move || {
+            // `dev->flags`: IFF_BROADCAST | IFF_MULTICAST (+ IFF_UP once
+            // up), or IFF_UP | IFF_LOOPBACK for `lo`. The volatile
+            // IFF_RUNNING / IFF_LOWER_UP are never stored there — only
+            // `dev_get_flags` (rtnetlink, SIOCGIFFLAGS) adds them.
+            let up = net_snapshot(&live).is_some_and(|i| i.link_up);
+            let flags: u32 = if loopback {
+                0x1 | 0x8
+            } else {
+                0x2 | 0x1000 | if up { 0x1 } else { 0 }
+            };
+            format!("{:#x}\n", flags)
         });
         // A net interface is not a char/block device (no MAJOR/MINOR), but
         // udev still needs a walkable `uevent` file + a `subsystem` symlink so

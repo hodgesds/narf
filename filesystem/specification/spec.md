@@ -1045,6 +1045,15 @@ mount dependencies. Partition events with a discovered filesystem UUID carry
 both the existing `DEVLINKS=/dev/disk/by-uuid/<uuid>` path and the matching
 `SYSTEMD_ALIAS`; systemd device units are driven by the udev database rather
 than by probing whether the devfs symlink resolves.
+`/sys/class/net/<dev>` is populated from the network stack's interface list
+(installed net snapshot hook) and refreshed from a `Stage::Late` initcall, after
+the NIC drivers have probed. Each device carries Linux's net-sysfs attributes —
+`ifindex` and `iflink` (the rtnetlink ifindex udev keys its database on),
+`type` (`ARPHRD_ETHER`/`ARPHRD_LOOPBACK`), `addr_len`, `dev_id`, `address`,
+`broadcast`, `operstate` (`unknown` for `lo`), `mtu`, `flags` (`dev->flags`,
+never the volatile `IFF_RUNNING`), a writable `uevent` with `INTERFACE` and
+`IFINDEX` — and the `subsystem` link; `mtu`, `operstate` and `flags` read live
+state.
 The bounded boot udev replay begins at the first completed late device
 projection and never advances past already-queued ADD events when another
 projection completes. This lets independently registered DRM and block
