@@ -548,7 +548,7 @@ fn udp_send_inner(
     {
         return Ok(payload.len());
     }
-    (iface.send)(&frame).map_err(|_| UdpError::NoInterface)?;
+    iface.xmit(&frame).map_err(|_| UdpError::NoInterface)?;
     Ok(payload.len())
 }
 

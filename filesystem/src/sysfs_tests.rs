@@ -346,7 +346,8 @@ kernel_test_in!("filesystem", smoke_sysfs_enumerate_class_net);
 /// (`n<ifindex>`) and reads INTERFACE/IFINDEX from `uevent`; NetworkManager
 /// and udev's net_id builtin classify the link by `type`. `flags` is
 /// `dev->flags` — never the volatile IFF_RUNNING — exactly as on Linux
-/// (`0x1003` for an up Ethernet NIC, `0x9` for `lo`).
+/// (`0x1303` here for an up Ethernet NIC with packet-socket promisc and
+/// all-multicast references, `0x9` for `lo`).
 fn smoke_sysfs_class_net_attrs_are_linuxs() -> TestResult {
     use crate::sysfs::NetIfaceInfo;
     crate::sysfs::__reset_for_test();
@@ -359,6 +360,8 @@ fn smoke_sysfs_class_net_attrs_are_linuxs() -> TestResult {
                 link_up: true,
                 ifindex: 1,
                 loopback: true,
+                promisc: false,
+                allmulti: false,
             },
             NetIfaceInfo {
                 name: "eth0".to_string(),
@@ -367,6 +370,8 @@ fn smoke_sysfs_class_net_attrs_are_linuxs() -> TestResult {
                 link_up: true,
                 ifindex: 7,
                 loopback: false,
+                promisc: true,
+                allmulti: true,
             },
         ]
     }
@@ -387,7 +392,7 @@ fn smoke_sysfs_class_net_attrs_are_linuxs() -> TestResult {
         ("eth0", "address", "52:54:00:12:34:56\n"),
         ("eth0", "broadcast", "ff:ff:ff:ff:ff:ff\n"),
         ("eth0", "operstate", "up\n"),
-        ("eth0", "flags", "0x1003\n"),
+        ("eth0", "flags", "0x1303\n"),
         ("eth0", "mtu", "1500\n"),
         ("eth0", "uevent", "INTERFACE=eth0\nIFINDEX=7\n"),
         ("lo", "ifindex", "1\n"),

@@ -117,6 +117,34 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // AF_PACKET's read path can return protocol-specific errnos such as a
+    // pending ENETDOWN. FileOps::read has no errno-preserving error carrier,
+    // so run packet_recvmsg directly, as sock_read_iter does in Linux.
+    if let Some(packet) = crate::socket::packet::packet_socket_of(endpoint.ops.as_ref()) {
+        let mut staging = alloc::vec![0u8; count];
+        match packet.packet_read(&mut staging) {
+            Ok(n) => {
+                // SAFETY: the complete destination range was validated above.
+                if unsafe { copy_to_user(user_ptr, &staging[..n]) }.is_err() {
+                    ctx.set_return(errno_ret(EFAULT));
+                } else {
+                    ctx.set_return(SyscallReturn::ok(n as u64));
+                }
+            }
+            Err(e) if e == EAGAIN => {
+                if endpoint.nonblocking() {
+                    ctx.set_return(errno_ret(EAGAIN));
+                } else if has_interrupting_signal(task) {
+                    ctx.set_return(errno_ret(EINTR));
+                } else if !park_blocking_read(ctx, endpoint.ops.as_ref()) {
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+            }
+            Err(e) => ctx.set_return(errno_ret(e)),
+        }
+        return;
+    }
+
     if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
         read_pipe_user(ctx, &endpoint, count, |offset, src, len| {
             // SAFETY: the queue retains this raw source and the scalar

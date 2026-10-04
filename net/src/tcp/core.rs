@@ -340,15 +340,15 @@ pub struct Tcb {
 pub struct CachedEgress {
     pub name: Arc<str>,
     pub mac: [u8; 6],
-    pub send: iface::SendFn,
+    pub dev: iface::NetIfaceSnapshot,
 }
 
 fn emit_tcb_frame(
     arc: &Arc<IrqSafeSpinLock<Tcb>>,
-    iface_name: &str,
-    send: iface::SendFn,
+    dev: &iface::NetIfaceSnapshot,
     mut frame: Vec<u8>,
 ) {
+    let iface_name = dev.name.as_str();
     let (net_ns_id, is_ipv6) = {
         let tcb = arc.lock();
         (tcb.net_ns_id, tcb.is_ipv6)
@@ -363,7 +363,7 @@ fn emit_tcb_frame(
             &mut frame[crate::pkt::ETH_HDR_LEN..],
         ) == crate::netfilter::Verdict::Accept
     {
-        let _ = send(&frame);
+        let _ = dev.xmit(&frame);
     }
 }
 
@@ -2147,7 +2147,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         opts,
         &[],
     );
-    emit_tcb_frame(arc, &iface.name, iface.send, frame);
+    emit_tcb_frame(arc, &iface, frame);
     // Track SYN in the retransmit queue so a missed SYN-ACK
     // re-triggers retransmit.
     let mut t = arc.lock();
@@ -2182,7 +2182,7 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         opt_bytes,
         &[],
     );
-    emit_tcb_frame(arc, &iface.name, iface.send, frame);
+    emit_tcb_frame(arc, &iface, frame);
 }
 
 fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool) {
@@ -2196,7 +2196,7 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
         FLAG_RST
     };
     let frame = build_tcb_frame(&arc.lock(), iface.mac, seq, ack, flags, 0, Vec::new(), &[]);
-    emit_tcb_frame(arc, &iface.name, iface.send, frame);
+    emit_tcb_frame(arc, &iface, frame);
 }
 
 /// Build & send one data segment carrying `payload` from sequence
@@ -2225,9 +2225,9 @@ fn send_data(
                     None => return,
                 };
                 let e = CachedEgress {
-                    name: Arc::from(snap.name),
+                    name: Arc::from(snap.name.as_str()),
                     mac: snap.mac,
-                    send: snap.send,
+                    dev: snap.clone(),
                 };
                 arc.lock().egress = Some(e.clone());
                 e
@@ -2253,7 +2253,7 @@ fn send_data(
         opt_bytes,
         payload,
     );
-    emit_tcb_frame(arc, egress.name.as_ref(), egress.send, frame);
+    emit_tcb_frame(arc, &egress.dev, frame);
     if record_retx {
         let mut t = arc.lock();
         let payload_len = payload.len() as u32;
@@ -2479,7 +2479,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &payload,
     );
-    emit_tcb_frame(arc, &iface.name, iface.send, frame);
+    emit_tcb_frame(arc, &iface, frame);
     {
         let mut t = arc.lock();
         // The buffer was rewound to snd_una: advance past what we resent so
@@ -2547,7 +2547,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &[],
     );
-    emit_tcb_frame(arc, &iface.name, iface.send, frame);
+    emit_tcb_frame(arc, &iface, frame);
 }
 
 fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -2608,7 +2608,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &[],
     );
-    emit_tcb_frame(arc, &iface.name, iface.send, frame);
+    emit_tcb_frame(arc, &iface, frame);
 }
 
 fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -2832,7 +2832,7 @@ fn send_stateless_rst6(
         Vec::new(),
         &[],
     );
-    let _ = (iface.send)(&frame);
+    let _ = iface.xmit(&frame);
 }
 
 /// Answer a segment that matches no connection with a reset, per RFC 9293
@@ -2898,7 +2898,7 @@ fn send_stateless_rst(
         &mut frame[crate::pkt::ETH_HDR_LEN..],
     ) == crate::netfilter::Verdict::Accept
     {
-        let _ = (iface.send)(&frame);
+        let _ = iface.xmit(&frame);
     }
 }
 
@@ -3669,7 +3669,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         opt_bytes,
         &payload,
     );
-    emit_tcb_frame(arc, &iface.name, iface.send, frame);
+    emit_tcb_frame(arc, &iface, frame);
     let mut t = arc.lock();
     // Karn: no RTT sample from any record covering the resent range.
     let end = seq.wrapping_add(payload.len() as u32);

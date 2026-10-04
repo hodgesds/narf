@@ -263,7 +263,8 @@ pub fn ipv4_send(
         .copy_from_slice(payload);
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
 
-    (snap.send)(&frame[..total]).map_err(|_| SendError::DriverError)
+    snap.xmit(&frame[..total])
+        .map_err(|_| SendError::DriverError)
 }
 
 /// Clear all bindings. For testing and interface reset.

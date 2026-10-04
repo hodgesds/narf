@@ -62,6 +62,7 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
             // recvmsg cannot steal them from the wrong message.
             drop(sock.unix_take_recv_fds());
             let _ = sock.recvmsg_cred();
+            let _ = sock.take_packet_recv_ancillary();
             // Copy received bytes back to user under SMAP bracket.
             // SAFETY: ptr validated above; AS still active.
             // Linux permits recv(fd, NULL, 0, MSG_PEEK|MSG_TRUNC) as a

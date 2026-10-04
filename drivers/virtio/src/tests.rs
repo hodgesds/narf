@@ -869,7 +869,7 @@ fn smoke_virtio_net_pci_send_fn_dispatches() -> TestResult {
     frame[39] = 0;
     frame[40] = 2;
     frame[41] = 2;
-    match (vnet.send)(&frame) {
+    match vnet.xmit(&frame) {
         Ok(()) => TestResult::Pass,
         Err(()) => {
             TestResult::Fail("primary virtio-net iface SendFn returned Err — tx_dma path broken")

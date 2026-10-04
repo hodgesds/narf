@@ -453,6 +453,49 @@ When a receive buffer is short, only its capacity is copied. `MSG_TRUNC`
 returns the complete datagram length; `recvmsg` also sets its output
 `msg_flags` to `MSG_TRUNC`.
 
+### 3.6a AF_PACKET (`raw_sock`) and classic BPF (`cbpf`)
+
+`raw_sock` is the kernel half of Linux `net/packet/af_packet.c`.
+`PacketSock::create(ns, type, protocol_be, rcvbuf)` registers the protocol
+hook for a non-zero protocol (`packet_create`); `bind(name, ifindex,
+protocol_be)` is `packet_do_bind` (`ENODEV`; a down device leaves the hook
+off with `sk_err = ENETDOWN`); `recv(peek)` reports a pending `sk_err` first,
+then the head `PacketRecord` (`EAGAIN` when empty); `sendmsg(data, sockaddr)`
+is `packet_snd` / `packet_sendmsg_spkt` with Linux's errno order;
+`mc_add`/`mc_drop` are `packet_mc_add`/`packet_mc_drop`;
+`take_statistics`, `take_error`, `inq`, `poll_mask`, `readiness` (a durable
+cell set on every enqueue, error and device event), `set_filter`,
+`set_rcvbuf`, `with_opts` and `release` complete the surface.
+
+Delivery: `tcp_stack::rx_handler` calls `netif_receive(dev, frame)` after any
+XDP program and before L3 (`__netif_receive_skb_core`): frames of a device
+that is not up are not delivered; `eth_type_trans` sets the packet type and
+protocol; a VLAN tag is split off before the `ETH_P_ALL` taps (reported in
+auxdata) and, unclaimed, makes the frame `PACKET_OTHERHOST` for the
+protocol's own hooks. Every kernel transmit goes through
+`NetIfaceSnapshot::xmit(frame)` (the driver hook is private), which first
+runs `dev_queue_xmit_nit`: `ETH_P_ALL` hooks on the device see the frame as
+`PACKET_OUTGOING`, except hooks with `PACKET_IGNORE_OUTGOING` and the sending
+packet socket itself (`xmit_from(frame, protocol, origin)`). `xmit_direct`
+is `dev_direct_xmit` (`PACKET_QDISC_BYPASS`, no taps); modern `packet_snd`
+maps a driver/qdisc drop to packet-socket `ENOBUFS`, while legacy
+`packet_sendmsg_spkt` ignores it as Linux does. XDP `XDP_TX`/redirect
+(`send_on`, `send_on_ifindex`) bypass the taps as in Linux. `set_link_state`
+and `set_net_ns` raise `netdev_event` (`NETDEV_UP`/`DOWN`/`UNREGISTER`).
+`iface::by_index_in`, `dev_set_promiscuity`, `dev_set_allmulti`,
+`dev_hw_addr_add`/`del` model `dev_get_by_index`, the promiscuity/allmulti
+reference counts (`NetIfaceSnapshot::promisc`/`allmulti`) and the device
+address lists. LINUX-GAP: NIC drivers do not reprogram their receive filters
+from those counts (`ndo_set_rx_mode`).
+
+`cbpf::Program::from_bytes` is `bpf_check_classic` + `check_load_and_stores`
+(`None` = `EINVAL`); `cbpf::run(prog, skb)` interprets the program with the
+semantics of its eBPF translation: 32-bit ALU, shifts masked to 31, division
+or modulo by a zero X returns 0, a failed packet load returns 0, `SKF_NET_OFF`
+/ `SKF_LL_OFF` relative loads, and every `SKF_AD_*` ancillary load
+(`SKF_AD_PAY_OFFSET` dissects Ethernet IPv4/IPv6 only — LINUX-GAP for other
+encapsulations).
+
 ### 3.7 In-kernel TCP socket calls and errno (`tcp_stack`)
 
 The kernel-TCP socket paths (`SocketState::InetWired` and

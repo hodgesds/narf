@@ -29,6 +29,24 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Preserve AF_PACKET's packet_snd errnos and datagram atomicity instead
+    // of translating them through the narrower FileOps error enum/chunk loop.
+    if let Some(packet) = crate::socket::packet::packet_socket_of(endpoint.ops.as_ref()) {
+        // SAFETY: the complete source range was validated above.
+        let payload = match unsafe { copy_from_user_vec(user_ptr, count) } {
+            Ok(payload) => payload,
+            Err(e) => {
+                ctx.set_return(errno_ret(e as i64));
+                return;
+            }
+        };
+        match packet.packet_write(&payload) {
+            Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            Err(e) => ctx.set_return(errno_ret(e)),
+        }
+        return;
+    }
+
     if crate::pipe::is_pipe(endpoint.ops.as_ref()) {
         write_pipe_user(ctx, &endpoint, count, |offset, bytes| {
             // SAFETY: validated scalar range; copy commits one page at a time.

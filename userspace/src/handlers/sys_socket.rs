@@ -60,6 +60,12 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
             sock.set_net_namespace(ns);
         }
     }
+    if domain == crate::socket::AF_PACKET {
+        // packet_create registers its protocol hook in the creator's network
+        // namespace, so initialise only after the namespace object/id above
+        // has been attached to the socket.
+        sock.init_packet(proto);
+    }
     if domain == crate::socket::AF_NETLINK {
         if let Some(owner) = crate::task::task_get(task) {
             crate::network_daemon::delegate_socket(&owner, &sock);
@@ -94,6 +100,21 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
 
+/// Linux raw-socket creation asks `ns_capable(net->user_ns, CAP_NET_RAW)`,
+/// not whether the caller has CAP_NET_RAW in its own user namespace.  A task
+/// that unshared only CLONE_NEWUSER must not gain raw access to the initial
+/// network namespace; once it also creates a network namespace, that new
+/// namespace is owned by its current user namespace and the same check passes.
+fn task_net_raw_capable(task: u64) -> bool {
+    #[cfg(feature = "container")]
+    {
+        if let Some(net) = crate::namespaces::current_net_ns(task) {
+            return task_ns_capable(task, &net.owner_user_ns(), CAP_NET_RAW);
+        }
+    }
+    task_capable(task, CAP_NET_RAW)
+}
+
 /// `sock_create` validation shared by `socket(2)` and `socketpair(2)`, in the
 /// order Linux applies it. `kind` has already had SOCK_CLOEXEC/SOCK_NONBLOCK
 /// stripped. Returns the (family, type, protocol) the socket is built with:
@@ -125,8 +146,9 @@ pub(super) fn validate_socket_create(
     task: u64,
 ) -> Result<(u16, u32, u32), i64> {
     use crate::socket::{
-        AF_BYPASS, AF_INET, AF_INET6, AF_NETLINK, AF_UNIX, IPPROTO_ICMP, IPPROTO_TCP,
-        IPPROTO_UDP, SOCK_DGRAM, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM,
+        AF_BYPASS, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, IPPROTO_ICMP,
+        IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_PACKET, SOCK_RAW, SOCK_SEQPACKET,
+        SOCK_STREAM,
     };
     const NPROTO: i32 = 46; // AF_MAX, include/linux/socket.h
     const SOCK_MAX: u32 = 11; // SOCK_PACKET + 1, include/linux/net.h
@@ -141,13 +163,13 @@ pub(super) fn validate_socket_create(
     }
     let domain = family as u16;
     let protocol = raw_proto as i32;
-    // `__sock_create`: PF_INET + SOCK_PACKET is redirected to PF_PACKET, which
-    // is not registered here → EAFNOSUPPORT (not inet_create's
-    // ESOCKTNOSUPPORT).
-    const SOCK_PACKET: u32 = 10;
-    if domain == AF_INET && kind == SOCK_PACKET {
-        return Err(EAFNOSUPPORT);
-    }
+    // `__sock_create`: PF_INET + SOCK_PACKET is redirected to PF_PACKET
+    // before the family lookup.
+    let domain = if domain == AF_INET && kind == SOCK_PACKET {
+        AF_PACKET
+    } else {
+        domain
+    };
     match domain {
         AF_UNIX => {
             if protocol != 0 && protocol != AF_UNIX as i32 {
@@ -184,7 +206,7 @@ pub(super) fn validate_socket_create(
                     if protocol == 0 {
                         return Err(EPROTONOSUPPORT);
                     }
-                    if !task_capable_in_own_ns(task, CAP_NET_RAW) {
+                    if !task_net_raw_capable(task) {
                         return Err(EPERM);
                     }
                     Ok((domain, kind, protocol))
@@ -200,6 +222,17 @@ pub(super) fn validate_socket_create(
                 return Err(EPROTONOSUPPORT);
             }
             Ok((domain, kind, protocol as u32))
+        }
+        AF_PACKET => {
+            // packet_create checks authority before type, and treats protocol
+            // as an opaque truncated __be16 rather than validating its range.
+            if !task_net_raw_capable(task) {
+                return Err(EPERM);
+            }
+            if !matches!(kind, SOCK_DGRAM | SOCK_RAW | SOCK_PACKET) {
+                return Err(ESOCKTNOSUPPORT);
+            }
+            Ok((domain, kind, raw_proto as u32))
         }
         AF_BYPASS => Ok((domain, kind, raw_proto as u32)),
         _ => Err(EAFNOSUPPORT),

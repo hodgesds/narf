@@ -238,6 +238,10 @@ pub struct NetIfaceInfo {
     pub ifindex: u32,
     /// Loopback (`ARPHRD_LOOPBACK`) rather than Ethernet (`ARPHRD_ETHER`).
     pub loopback: bool,
+    /// `dev->promiscuity != 0`: `IFF_PROMISC` is set in `dev->flags`.
+    pub promisc: bool,
+    /// `dev->allmulti != 0`: `IFF_ALLMULTI` is set in `dev->flags`.
+    pub allmulti: bool,
 }
 
 /// The current snapshot of interface `name`, so attributes read live state
@@ -1046,12 +1050,22 @@ pub fn populate_net_class() {
             // up), or IFF_UP | IFF_LOOPBACK for `lo`. The volatile
             // IFF_RUNNING / IFF_LOWER_UP are never stored there — only
             // `dev_get_flags` (rtnetlink, SIOCGIFFLAGS) adds them.
-            let up = net_snapshot(&live).is_some_and(|i| i.link_up);
-            let flags: u32 = if loopback {
+            let snap = net_snapshot(&live);
+            let up = snap.as_ref().is_some_and(|i| i.link_up);
+            let mut flags: u32 = if loopback {
                 0x1 | 0x8
             } else {
                 0x2 | 0x1000 | if up { 0x1 } else { 0 }
             };
+            // `__dev_set_promiscuity` / `__dev_set_allmulti` keep IFF_PROMISC
+            // (0x100) / IFF_ALLMULTI (0x200) in `dev->flags` while their
+            // reference counts (packet-socket memberships) are non-zero.
+            if snap.as_ref().is_some_and(|i| i.promisc) {
+                flags |= 0x100;
+            }
+            if snap.as_ref().is_some_and(|i| i.allmulti) {
+                flags |= 0x200;
+            }
             format!("{:#x}\n", flags)
         });
         // A net interface is not a char/block device (no MAJOR/MINOR), but

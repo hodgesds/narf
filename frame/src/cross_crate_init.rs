@@ -174,6 +174,8 @@ fn install_proc_ext_hooks() {
                 mtu: nic.mtu,
                 link_up: nic.link_up,
                 ifindex: nic.ifindex,
+                promisc: nic.promisc,
+                allmulti: nic.allmulti,
             })
             .collect()
     });

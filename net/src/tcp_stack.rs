@@ -89,7 +89,7 @@ pub fn send_arp_request_in(net_ns_id: u64, target_ip: [u8; 4]) -> Result<(), ()>
     let iface = iface::for_dst_in(net_ns_id, target_ip).ok_or(())?;
     let mut frame = [0u8; 60];
     let n = pkt::build_arp_request(&mut frame, iface.mac, iface.ipv4, target_ip).ok_or(())?;
-    (iface.send)(&frame[..n])
+    iface.xmit(&frame[..n])
 }
 
 /// Resolve `ip` to a MAC: cache → ARP-request → busy-wait for reply.
@@ -272,11 +272,15 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
     // resizing program's `[data, data_end)` is `frame[..len]`.
     let frame = &mut frame[..len];
 
-    // AF_PACKET raw sockets see every frame before L3 dispatch, tagged with
-    // the device it arrived on (`packet_rcv`: `sll_ifindex =
-    // skb->dev->ifindex`), so a socket bound to that device receives it.
-    let ingress_ifindex = iface::ifindex_of(&bypass_iface).unwrap_or(0);
-    crate::raw_sock::raw_pkt_deliver_in(net_ns_id, frame, ingress_ifindex);
+    // AF_PACKET sockets see every frame before L3 dispatch, tagged with the
+    // device it arrived on (`__netif_receive_skb_core` → `packet_rcv`:
+    // `sll_ifindex = skb->dev->ifindex`).
+    if let Some(dev) = ingress
+        .clone()
+        .or_else(|| iface::lookup_in(net_ns_id, &bypass_iface))
+    {
+        crate::raw_sock::netif_receive(&dev, frame);
+    }
     let (eth, body) = match parse_eth_header(frame) {
         Some(t) => t,
         None => return,
@@ -337,7 +341,7 @@ pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
         if arp.tpa == iface.ipv4 {
             let mut frame = [0u8; 60];
             if let Some(n) = pkt::build_arp_reply(&mut frame, iface.mac, iface.ipv4, &arp) {
-                let _ = (iface.send)(&frame[..n]);
+                let _ = iface.xmit(&frame[..n]);
             }
         }
     }

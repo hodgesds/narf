@@ -260,7 +260,7 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
     // ── DISCOVER ─────────────────────────────────────────────────
     let discover_dhcp = build_discover(xid, snap.mac);
     let discover_frame = wrap_broadcast_frame(snap.mac, [0, 0, 0, 0], &discover_dhcp);
-    (snap.send)(&discover_frame)?;
+    snap.xmit(&discover_frame)?;
 
     // Half the budget for OFFER, half for ACK.
     let half = timeout_ms / 2;
@@ -282,7 +282,7 @@ pub fn acquire(iface_name: &str, timeout_ms: u64) -> Result<DhcpLease, ()> {
     // ── REQUEST ─────────────────────────────────────────────────
     let request_dhcp = build_request(xid, snap.mac, offer.yiaddr, offer.server);
     let request_frame = wrap_broadcast_frame(snap.mac, [0, 0, 0, 0], &request_dhcp);
-    (snap.send)(&request_frame)?;
+    snap.xmit(&request_frame)?;
 
     let deadline = narf_time::Deadline::after_ns(half.saturating_mul(1_000_000));
     let mut ack: Option<ParsedReply> = None;
