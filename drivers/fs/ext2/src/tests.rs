@@ -1092,6 +1092,165 @@ kernel_test_in!(
     smoke_ext2_page_cache_reuses_1k_data_block
 );
 
+/// A block device that counts reads and can hold every read at the device
+/// (`held`). Shared by the page-cache concurrency smokes below.
+pub(crate) struct GatedCountingBlock {
+    pub(crate) inner: alloc::sync::Arc<narf_block::ram::RamBlockDevice>,
+    pub(crate) held: core::sync::atomic::AtomicBool,
+    pub(crate) reads: core::sync::atomic::AtomicUsize,
+}
+
+impl GatedCountingBlock {
+    pub(crate) fn new(image: Vec<u8>) -> alloc::sync::Arc<Self> {
+        alloc::sync::Arc::new(Self {
+            inner: narf_block::ram::RamBlockDevice::from_image(512, image),
+            held: core::sync::atomic::AtomicBool::new(false),
+            reads: core::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+}
+
+impl narf_block::BlockDevice for GatedCountingBlock {
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
+    fn physical_block_size(&self) -> u32 {
+        self.inner.physical_block_size()
+    }
+    fn capacity_blocks(&self) -> u64 {
+        self.inner.capacity_blocks()
+    }
+    fn supports(&self, feature: narf_block::BlockFeature) -> bool {
+        self.inner.supports(feature)
+    }
+    fn submit(
+        &self,
+        request: narf_block::BlockRequest,
+    ) -> impl core::future::Future<Output = narf_block::BlockCompletion> + Send {
+        use core::sync::atomic::Ordering;
+        let gated = matches!(request.op, narf_block::BlockOp::Read);
+        if gated {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        async move {
+            if gated {
+                core::future::poll_fn(|_| {
+                    if self.held.load(Ordering::Acquire) {
+                        core::task::Poll::Pending
+                    } else {
+                        core::task::Poll::Ready(())
+                    }
+                })
+                .await;
+            }
+            self.inner.submit(request).await
+        }
+    }
+    fn flush(&self) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.flush()
+    }
+    fn discard(
+        &self,
+        range: narf_block::LbaRange,
+    ) -> impl core::future::Future<Output = ()> + Send {
+        self.inner.discard(range)
+    }
+    fn cancel(
+        &self,
+        tag: u64,
+    ) -> impl core::future::Future<Output = narf_block::CancelResult> + Send {
+        self.inner.cancel(tag)
+    }
+}
+
+/// A waker whose wake is a no-op, for hand-polling futures in smokes.
+pub(crate) fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    fn raw() -> RawWaker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        unsafe fn noop(_: *const ()) {}
+        const VTAB: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        RawWaker::new(core::ptr::null(), &VTAB)
+    }
+    // SAFETY: every vtable function is a no-op or rebuilds the same RawWaker;
+    // the null data pointer is never dereferenced.
+    unsafe { Waker::from_raw(raw()) }
+}
+
+/// A write to one page does not void a concurrent fill of a DIFFERENT page.
+/// Linux invalidates exactly the written range (`invalidate_mapping_pages`,
+/// the locked folio being filled); a fill whose own page was not written
+/// publishes normally. The volume used to snapshot one volume-global
+/// generation before every fill and refuse to publish if ANY write landed
+/// meanwhile, so on a busy volume a fill's work was thrown away and the very
+/// next read of that page went back to the device.
+fn smoke_ext2_write_elsewhere_does_not_void_a_concurrent_fill() -> TestResult {
+    use alloc::boxed::Box;
+    use core::future::Future;
+    use core::sync::atomic::Ordering;
+    use core::task::{Context, Poll};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const BS: u64 = 1024;
+    let device = GatedCountingBlock::new(build_ext2_image(b"page cache"));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    // Stall a miss on block 40 (page 10) at the device.
+    device.held.store(true, Ordering::Release);
+    let mut buf = [0u8; BS as usize];
+    let mut fill = Box::pin(volume.read_block(40, &mut buf));
+    if fill.as_mut().poll(&mut cx).is_ready() {
+        return TestResult::Fail("the gated read completed without the device");
+    }
+    // A whole-sector write to block 20 (page 5): no read-modify-write read.
+    let sector = [0x5au8; 512];
+    let mut other = Box::pin(volume.write_byte_range(20 * BS, &sector));
+    if !matches!(other.as_mut().poll(&mut cx), Poll::Ready(Ok(()))) {
+        return TestResult::Fail("write to another page did not complete");
+    }
+    drop(other);
+    device.held.store(false, Ordering::Release);
+    let mut finished = false;
+    for _ in 0..16 {
+        if let Poll::Ready(r) = fill.as_mut().poll(&mut cx) {
+            if r.is_err() {
+                return TestResult::Fail("the stalled read failed");
+            }
+            finished = true;
+            break;
+        }
+    }
+    drop(fill);
+    if !finished {
+        return TestResult::Fail("the stalled read never finished after release");
+    }
+
+    // Page 10 was never written, so the fill must have been cached.
+    let reads_before = device.reads.load(Ordering::Relaxed);
+    let mut again = [0u8; BS as usize];
+    if !matches!(poll_once(volume.read_block(40, &mut again)), Some(Ok(()))) {
+        return TestResult::Fail("re-read of the filled block failed");
+    }
+    if device.reads.load(Ordering::Relaxed) != reads_before {
+        return TestResult::Fail(
+            "a write to another page voided the concurrent fill: the re-read went to the device",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_write_elsewhere_does_not_void_a_concurrent_fill
+);
 fn smoke_ext2_directory_lookup_stops_at_matching_folio() -> TestResult {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};

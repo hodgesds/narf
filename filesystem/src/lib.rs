@@ -139,7 +139,9 @@ pub use memfs::{
 };
 pub use mqueuefs::{MqueueAttr, MqueueError, MqueueFs, MqueueNotification, MqueueOpenOptions};
 pub use overlayfs::{OverlayFs, OPAQUE_MARKER, WHITEOUT_PREFIX};
-pub use page_cache::{CacheFolio, Folio, FolioRef, FolioSlice, PageCache, PageKey, PAGE_SIZE};
+pub use page_cache::{
+    BlockMapping, CacheFolio, Filled, FolioRef, FolioSlice, PageCache, PageKey, PAGE_SIZE,
+};
 pub use pathwalk::{begin_path_mutation, Dentry, PathMutationGuard};
 pub use posix_acl::{
     posix_acl_create, posix_acl_permission, posix_acl_update_mode, AclCreate, AclDecision,
