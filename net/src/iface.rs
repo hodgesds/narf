@@ -31,6 +31,67 @@ pub struct NetIfaceEntry {
     pub link_up: bool,
     /// Owning network namespace. Zero is the initial namespace.
     pub net_ns_id: u64,
+    /// Linux ifindex, fixed at registration (`dev_new_index`): `lo` is 1, the
+    /// rest take the next unused number and keep it for their lifetime, so
+    /// unregistering one device never renumbers another.
+    pub ifindex: u32,
+}
+
+/// Next ifindex to hand out (`dev_new_index`). 1 is reserved for `lo`.
+static NEXT_IFINDEX: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(2);
+
+/// Ifindexes of devices that exist only in the frame-ring registry (they
+/// never call [`register`]), allocated from the same counter on first sight.
+static REGISTRY_IFINDEX: IrqSafeSpinLock<alloc::collections::BTreeMap<String, u32>> =
+    IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// The ifindex of a device known only by name to the frame-ring registry:
+/// its registered ifindex if it has one, else one allocated once and kept.
+pub fn stable_ifindex(name: &str) -> u32 {
+    if let Some(ifindex) = ifindex_of(name) {
+        return ifindex;
+    }
+    *REGISTRY_IFINDEX
+        .lock()
+        .entry(String::from(name))
+        .or_insert_with(|| NEXT_IFINDEX.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Names handed out by [`reserve_name`] that are not registered yet. They
+/// count as taken for [`alloc_name`].
+static RESERVED: IrqSafeSpinLock<Vec<String>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Linux `dev_alloc_name`: a name containing `%d` takes the lowest number not
+/// already used by a registered or reserved device; any other name is used
+/// as-is.
+fn alloc_name(ifaces: &[NetIfaceEntry], reserved: &[String], pattern: &str) -> String {
+    let Some((prefix, suffix)) = pattern.split_once("%d") else {
+        return String::from(pattern);
+    };
+    (0u32..)
+        .map(|n| alloc::format!("{prefix}{n}{suffix}"))
+        .find(|candidate| {
+            ifaces.iter().all(|entry| entry.name != *candidate)
+                && reserved.iter().all(|name| name != candidate)
+        })
+        .unwrap_or_default()
+}
+
+/// Allocate a device name (`dev_alloc_name`) for a driver that needs it
+/// before it calls [`register`] — Linux names a `net_device` when it is set
+/// up, before `register_netdevice`. The name is held until registered.
+pub fn reserve_name(pattern: &str) -> &'static str {
+    let g = IFACES.lock();
+    let mut reserved = RESERVED.lock();
+    let name = alloc_name(g.as_deref().unwrap_or(&[]), &reserved, pattern);
+    reserved.push(name.clone());
+    alloc::boxed::Box::leak(name.into_boxed_str())
+}
+
+/// [`register`] for a driver that keeps its device name for the kernel's
+/// lifetime: returns it as a `&'static str`.
+pub fn register_static(pattern: &str, mac: [u8; 6], send: SendFn) -> &'static str {
+    alloc::boxed::Box::leak(register(pattern, mac, send).into_boxed_str())
 }
 
 /// Hook into procfs for publishing an interface's `net.ipv4.conf.<dev>.*`
@@ -132,13 +193,30 @@ pub fn register_loopback_iface() {
 
 /// Register a NIC driver as a network interface. Called from the
 /// driver's probe path.
-pub fn register(name: &str, mac: [u8; 6], send: SendFn) {
+/// Returns the registered name: `name` itself, or for an `eth%d`-style
+/// pattern the name `dev_alloc_name` chose. Drivers address their device by
+/// the returned name afterwards.
+pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
     let mut g = IFACES.lock();
     let v = g.get_or_insert_with(Vec::new);
-    // De-dup: if a same-named iface exists, replace it.
+    let name = {
+        let mut reserved = RESERVED.lock();
+        let name = alloc_name(v, &reserved, name);
+        // Registering a reserved name consumes the reservation.
+        reserved.retain(|held| *held != name);
+        name
+    };
+    // De-dup: a same-named iface is replaced, keeping its ifindex.
+    let ifindex = if name == "lo" {
+        1
+    } else if let Some(old) = v.iter().find(|i| i.name == name) {
+        old.ifindex
+    } else {
+        NEXT_IFINDEX.fetch_add(1, Ordering::Relaxed)
+    };
     v.retain(|i| i.name != name);
     v.push(NetIfaceEntry {
-        name: alloc::string::String::from(name),
+        name: name.clone(),
         mac,
         send,
         ipv4: QEMU_DEFAULT_IP,
@@ -146,13 +224,15 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) {
         mtu: 1500,
         link_up: true,
         net_ns_id: 0,
+        ifindex,
     });
     drop(g);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
     // forwarding value from `conf.default`. Done with IFACES released: the
     // hook reaches into the procfs registry, which must not be entered under
     // this lock.
-    dev_conf_register(name);
+    dev_conf_register(&name);
+    name
 }
 
 /// Number of registered interfaces.
@@ -247,6 +327,7 @@ pub fn snapshot_all_in(net_ns_id: u64) -> Vec<NetIfaceSnapshot> {
             mtu: e.mtu,
             link_up: e.link_up,
             net_ns_id: e.net_ns_id,
+            ifindex: e.ifindex,
         })
         .collect()
 }
@@ -266,6 +347,7 @@ pub fn primary() -> Option<NetIfaceSnapshot> {
         mtu: e.mtu,
         link_up: e.link_up,
         net_ns_id: e.net_ns_id,
+        ifindex: e.ifindex,
     })
 }
 
@@ -286,6 +368,7 @@ pub fn lookup(name: &str) -> Option<NetIfaceSnapshot> {
         mtu: e.mtu,
         link_up: e.link_up,
         net_ns_id: e.net_ns_id,
+        ifindex: e.ifindex,
     })
 }
 
@@ -315,6 +398,7 @@ pub fn for_local_addr_in(net_ns_id: u64, ip: [u8; 4]) -> Option<NetIfaceSnapshot
         mtu: e.mtu,
         link_up: e.link_up,
         net_ns_id: e.net_ns_id,
+        ifindex: e.ifindex,
     })
 }
 
@@ -358,14 +442,10 @@ pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
 /// turn a program's `bpf_redirect(ifindex)` into an egress NIC. Returns `Err`
 /// if the ifindex names no registered iface or the driver failed.
 pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
-    // 0 and 1 are reserved (0 = "none", 1 = loopback); registered NICs start
-    // at 2, so subtract the two reserved slots to index the registry.
-    let pos = (ifindex as usize).checked_sub(2).ok_or(())?;
     let send_fn = {
         let g = IFACES.lock();
         let v = g.as_ref().ok_or(())?;
-        let e = v.get(pos).ok_or(())?;
-        e.send
+        v.iter().find(|e| e.ifindex == ifindex).ok_or(())?.send
     };
     send_fn(frame)
 }
@@ -377,12 +457,14 @@ pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
 /// broadcast fan-out.
 #[must_use]
 pub fn ifindex_of(iface_name: &str) -> Option<u32> {
+    if iface_name == "lo" {
+        return Some(1);
+    }
     let g = IFACES.lock();
-    let v = g.as_ref()?;
-    let pos = v.iter().position(|e| e.name == iface_name)?;
-    // 0 = "none", 1 = loopback, registered NICs start at 2 — mirror
-    // `send_on_ifindex`'s `pos + 2`.
-    Some((pos + 2) as u32)
+    g.as_ref()?
+        .iter()
+        .find(|e| e.name == iface_name)
+        .map(|e| e.ifindex)
 }
 
 /// First interface visible in `net_ns_id`.
@@ -478,6 +560,7 @@ pub struct NetIfaceSnapshot {
     pub mtu: u32,
     pub link_up: bool,
     pub net_ns_id: u64,
+    pub ifindex: u32,
 }
 
 fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
@@ -490,6 +573,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         mtu: entry.mtu,
         link_up: entry.link_up,
         net_ns_id: entry.net_ns_id,
+        ifindex: entry.ifindex,
     }
 }
 

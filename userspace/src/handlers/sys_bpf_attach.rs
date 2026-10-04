@@ -203,18 +203,11 @@ fn link_from_fd(fd: u32) -> Result<Arc<BpfLink>, i64> {
         .ok_or(-EINVAL)
 }
 
-/// The interface name NARF's rtnetlink dump reports for `ifindex`.
-///
-/// Reproduces `net/src/netlink_route.rs::enumerate_in`'s numbering from the
-/// same public source it uses (`iface::snapshot_all`, which is already
-/// namespace-0-filtered): index 1 is the synthetic loopback the dump always
-/// prepends, and registered NICs follow at 2, 3, … in registration order.
-/// `smoke_bpf_syscall_link_close_detaches_xdp` pins it: it registers an
-/// interface, derives the index from `snapshot_all` the way this function
-/// consumes it, and then checks that traffic *on that interface's name* is what
-/// the attached program sees. This is exactly the kind of cross-crate
-/// convention that stays correct-looking after the other side changes, so the
-/// pin is an end-to-end one rather than a restatement of the arithmetic.
+/// The interface that has `ifindex` — the number rtnetlink, SIOCGIFINDEX and
+/// sysfs report for it, fixed when the device registered (`dev_new_index`).
+/// `smoke_bpf_syscall_link_close_detaches_xdp` pins it end to end: it attaches
+/// to the ifindex `iface::ifindex_of` reports for an interface and checks that
+/// traffic *on that interface's name* is what the attached program sees.
 ///
 /// `None` for an ifindex that names no *classifier-reachable* interface —
 /// including ifindex 1. The loopback is synthetic: `bypass::classifier::classify`
@@ -227,23 +220,19 @@ fn iface_for_ifindex(ifindex: u32) -> Option<String> {
         return None;
     }
     narf_net::iface::snapshot_all()
-        .get((ifindex - 2) as usize)
-        .map(|nic| nic.name.clone())
+        .into_iter()
+        .find(|nic| nic.ifindex == ifindex)
+        .map(|nic| nic.name)
 }
 
 /// The inverse of [`iface_for_ifindex`], for `bpf_link_info.xdp.ifindex`.
 ///
-/// Kept beside its inverse deliberately: the numbering convention is a
-/// cross-crate one (`netlink_route`'s dump order), and two independent
-/// derivations of it in two files is how one of them silently stops agreeing.
-/// `None` for a name no longer registered — an interface can be removed while a
-/// link on it is still held, and reporting a stale index would be worse than
-/// reporting none.
+/// Kept beside its inverse deliberately: both read the one per-device ifindex
+/// `narf_net::iface` assigns. `None` for a name no longer registered — an
+/// interface can be removed while a link on it is still held, and reporting a
+/// stale index would be worse than reporting none.
 pub(crate) fn ifindex_for_iface(name: &str) -> Option<u32> {
-    narf_net::iface::snapshot_all()
-        .iter()
-        .position(|nic| nic.name == name)
-        .and_then(|pos| u32::try_from(pos + 2).ok())
+    narf_net::iface::ifindex_of(name)
 }
 
 /// Translate `(attach_type, target)` into the hook it names.

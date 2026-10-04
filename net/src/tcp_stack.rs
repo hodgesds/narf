@@ -200,7 +200,15 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
     let bypass_iface = ingress
         .as_ref()
         .map(|entry| entry.name.clone())
-        .unwrap_or_else(|| alloc::string::String::from("eth0"));
+        // A frame handed in without its device (the legacy single-NIC RX
+        // path) arrived on the primary NIC: the first non-loopback device.
+        .or_else(|| {
+            iface::snapshot_all()
+                .into_iter()
+                .find(|nic| nic.name != "lo")
+                .map(|nic| nic.name)
+        })
+        .unwrap_or_default();
     // `classify` runs any attached XDP program, which may resize the frame
     // (`bpf_xdp_adjust_head`/`_tail`). The effective packet is `frame[..len]`;
     // everything below transmits or delivers that window rather than the

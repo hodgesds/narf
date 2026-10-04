@@ -152,6 +152,9 @@ pub const IFF_BROADCAST: u32 = 0x2;
 pub const IFF_LOOPBACK: u32 = 0x8;
 pub const IFF_RUNNING: u32 = 0x40;
 pub const IFF_MULTICAST: u32 = 0x1000;
+/// Driver signals L1 up (carrier). `dev_get_flags` reports it for a running
+/// device with carrier; NetworkManager reads carrier from it.
+pub const IFF_LOWER_UP: u32 = 0x1_0000;
 
 // ── ARP hardware types (ARPHRD_*, if_arp.h) ─────────────────────────────
 
@@ -274,7 +277,15 @@ fn build_newlink(link: &LinkInfo, seq: u32, pid: u32) -> Vec<u8> {
     body.push(0u8); // __ifi_pad
     body.extend_from_slice(&link.arphrd.to_le_bytes()); // ifi_type
     body.extend_from_slice(&(link.ifindex as i32).to_le_bytes()); // ifi_index
-    body.extend_from_slice(&link.flags.to_le_bytes()); // ifi_flags
+
+    // `dev_get_flags`: a running device with carrier also reports
+    // IFF_LOWER_UP (NARF links that run have carrier).
+    let flags = if link.flags & IFF_RUNNING != 0 {
+        link.flags | IFF_LOWER_UP
+    } else {
+        link.flags
+    };
+    body.extend_from_slice(&flags.to_le_bytes()); // ifi_flags
     body.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // ifi_change = ~0
 
     // IFLA_IFNAME is a NUL-terminated string.
@@ -585,8 +596,9 @@ fn build_ack(seq: u32, req: &[u8]) -> Vec<u8> {
 // ── dump entry point ────────────────────────────────────────────────────
 
 /// Enumerate the interfaces the dump should describe. Loopback is synthetic
-/// (ifindex 1); registered NICs follow at ifindex 2, 3, … in registration
-/// order. Returned as `(link, addrs)` so both dumps share one enumeration.
+/// (ifindex 1); every other device reports the ifindex it was given when it
+/// registered (`dev_new_index`). Returned as `(link, addrs)` so both dumps
+/// share one enumeration.
 fn enumerate() -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     enumerate_in(0)
 }
@@ -633,14 +645,15 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
         label: alloc::string::String::from("lo"),
     });
 
-    // Legacy L3 interfaces come first because their registration order already
-    // defines the Linux-visible ifindex used by the IPv4 stack.
-    for (i, nic) in crate::iface::snapshot_all()
+    // Legacy L3 interfaces first, each under the ifindex it registered with —
+    // the same number the IPv4 stack, SIOCGIFINDEX and sysfs report.
+    for nic in crate::iface::snapshot_all()
         .into_iter()
-        .filter(|nic| nic.net_ns_id == net_ns_id)
-        .enumerate()
+        // `lo` is the synthetic ifindex-1 entry above; its legacy L3
+        // registration must not appear a second time as an Ethernet device.
+        .filter(|nic| nic.net_ns_id == net_ns_id && nic.name != "lo")
     {
-        let ifindex = (i as u32) + 2;
+        let ifindex = nic.ifindex;
         links.push(LinkInfo {
             ifindex,
             flags: IFF_BROADCAST
@@ -680,17 +693,18 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
     // registry. Include names not represented by the legacy L3 registry so
     // every probed NIC is visible to the control plane exactly once. Physical
     // NICs live in the root namespace; a child netns must not see them in its
-    // RTM_GETLINK dump (Linux: devices appear in exactly one netns).
+    // RTM_GETLINK dump (Linux: devices appear in exactly one netns). The
+    // frame-ring loopback is the synthetic `lo` above, not a second device.
     let frame_ring_nics = if net_ns_id == 0 {
         crate::registry().snapshots()
     } else {
         Vec::new()
     };
     for nic in frame_ring_nics {
-        if links.iter().any(|link| link.name == nic.name) {
+        if nic.is_loopback || links.iter().any(|link| link.name == nic.name) {
             continue;
         }
-        let ifindex = links.len() as u32 + 1;
+        let ifindex = crate::iface::stable_ifindex(&nic.name);
         links.push(LinkInfo {
             ifindex,
             flags: IFF_BROADCAST

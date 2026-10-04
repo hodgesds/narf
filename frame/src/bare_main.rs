@@ -6075,7 +6075,7 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
 
     // Off-box network serving smoke (opt-in `qemu-net`): auto-spawn the
     // TCP echo server alongside getty. The kernel statically configured
-    // vnet0 with the SLIRP lease (cross_crate_init), and QEMU forwards a
+    // the virtio NIC with the SLIRP lease (cross_crate_init), and QEMU forwards a
     // host port to guest :7777, so the host-side `cargo xtask net-smoke`
     // harness can connect and round-trip without driving the console.
     #[cfg(feature = "qemu-net")]

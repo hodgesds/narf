@@ -248,11 +248,13 @@ fn install_net_stack() {
     // the DHCP client instead of hardcoding the SLIRP lease.
     #[cfg(feature = "qemu-net")]
     {
-        narf_net::iface::add_addr("vnet0", [10, 0, 2, 15], 24);
-        narf_net::iface::set_iface_ipv4("vnet0", [10, 0, 2, 15], [10, 0, 2, 2]);
+        let vnet = narf_drivers_virtio::net_pci::primary_iface_name();
+        narf_net::iface::add_addr(vnet, [10, 0, 2, 15], 24);
+        narf_net::iface::set_iface_ipv4(vnet, [10, 0, 2, 15], [10, 0, 2, 2]);
         let _ = writeln!(
             console::Writer,
-            "  net: qemu-net static config — vnet0 = 10.0.2.15/24 gw 10.0.2.2 ({} virtio-net queue pair(s))",
+            "  net: qemu-net static config — {} = 10.0.2.15/24 gw 10.0.2.2 ({} virtio-net queue pair(s))",
+            vnet,
             narf_drivers_virtio::net_pci::primary_num_pairs()
         );
     }

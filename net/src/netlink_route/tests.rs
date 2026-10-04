@@ -213,11 +213,7 @@ fn getroute_point_query_uses_longest_prefix_match() {
 
     let name = "rtnl-route-query0";
     crate::iface::register(name, [0x02, 0, 0, 0, 4, 1], discard);
-    let ifindex = crate::iface::snapshot_all()
-        .iter()
-        .position(|iface| iface.name == name)
-        .unwrap() as u32
-        + 2;
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
     for (network, prefix, gateway) in [
         ([198, 18, 0, 0], 16, [192, 0, 2, 16]),
         ([198, 18, 7, 0], 24, [192, 0, 2, 24]),
@@ -655,11 +651,7 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
 
     let name = "rtnl-admin-test0";
     crate::iface::register(name, [0x02, 0, 0, 0, 1, 1], discard);
-    let ifindex = crate::iface::snapshot_all()
-        .iter()
-        .position(|iface| iface.name == name)
-        .unwrap() as u32
-        + 2;
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
 
     let mut body = Vec::new();
     body.push(0);
@@ -787,11 +779,7 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
 
     let name = "rtnl-route-admin0";
     crate::iface::register(name, [0x02, 0, 0, 0, 2, 1], discard);
-    let ifindex = crate::iface::snapshot_all()
-        .iter()
-        .position(|iface| iface.name == name)
-        .unwrap() as u32
-        + 2;
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
     let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
     let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
 
@@ -869,11 +857,7 @@ fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
 
     let name = "rtnl-v6-admin0";
     crate::iface::register(name, [0x02, 0, 0, 0, 6, 1], discard);
-    let ifindex = crate::iface::snapshot_all()
-        .iter()
-        .position(|iface| iface.name == name)
-        .unwrap() as u32
-        + 2;
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
     let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
     let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
     let addr = [0x20, 1, 0x0d, 0xb8, 0, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
@@ -974,11 +958,7 @@ fn delegated_admin_can_add_and_delete_ipv4_neighbor() {
 
     let name = "rtnl-neigh-admin0";
     crate::iface::register(name, [0x02, 0, 0, 0, 3, 1], discard);
-    let ifindex = crate::iface::snapshot_all()
-        .iter()
-        .position(|iface| iface.name == name)
-        .unwrap() as u32
-        + 2;
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
     let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
     let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
 

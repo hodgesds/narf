@@ -199,6 +199,18 @@ existing device returns `EEXIST` under `NLM_F_EXCL` and `EOPNOTSUPP` under
 `NLM_F_CREATE` and `EOPNOTSUPP` with it (no link kinds are registered). An
 invalid (multicast or all-zero) `IFLA_ADDRESS` returns `EADDRNOTAVAIL`.
 
+Interface identity follows Linux `register_netdevice`. `lo` is ifindex 1;
+every other device takes the next unused ifindex when it registers
+(`dev_new_index`) and keeps it for its lifetime, including across a
+re-registration under the same name; a device known only to the frame-ring
+registry gets one from the same counter on first sight. The link dump,
+`SIOCGIFINDEX`, `/sys/class/net/<dev>/ifindex`, the BPF XDP attach path and
+`iface::send_on_ifindex` all use that one number. A name containing `%d` takes
+the lowest unused number (`dev_alloc_name`): e1000 and virtio-net register as
+`eth%d`, each device under one name in both registries. The link dump lists
+exactly one loopback, `lo`, and a running device reports `IFF_LOWER_UP`
+(`dev_get_flags`).
+
 When `NETLINK_EXT_ACK` is enabled, failed requests carry
 `NLM_F_ACK_TLVS` and a `NLMSGERR_ATTR_MSG` diagnostic describing the rejected
 authority, object-state, interface, validation, or support condition.

@@ -756,24 +756,28 @@ fn smoke_virtio_net_pci_registers_iface() -> TestResult {
     if !net_pci::is_probed() {
         return TestResult::Skip("virtio-net-pci not present in this QEMU config");
     }
-    // probe() registers a "vnet0" Interface with narf_net::registry().
+    // probe() registers the primary controller's `eth%d` Interface with
+    // narf_net::registry(), under the same name as its legacy iface.
     // Confirm it's there and reports a non-default MAC + standard MTU.
-    let found = narf_net::registry().with_interface("vnet0", |iface| {
-        let mac = iface.mac();
-        let mtu = iface.mtu();
-        let link = iface.link_up();
-        // mtu defaults to 1500 when F_MTU isn't negotiated — that's
-        // still a valid pass. The MAC ought to be non-zero on QEMU
-        // (QEMU advertises a 52:54:00:XX:XX:XX vendor default).
-        let mac_ok = mac.iter().any(|&b| b != 0);
-        let mtu_ok = (64..=65535).contains(&mtu);
-        (mac_ok, mtu_ok, link)
-    });
+    let found =
+        narf_net::registry().with_interface(crate::net_pci::primary_iface_name(), |iface| {
+            let mac = iface.mac();
+            let mtu = iface.mtu();
+            let link = iface.link_up();
+            // mtu defaults to 1500 when F_MTU isn't negotiated — that's
+            // still a valid pass. The MAC ought to be non-zero on QEMU
+            // (QEMU advertises a 52:54:00:XX:XX:XX vendor default).
+            let mac_ok = mac.iter().any(|&b| b != 0);
+            let mtu_ok = (64..=65535).contains(&mtu);
+            (mac_ok, mtu_ok, link)
+        });
     match found {
         Some((true, true, _link)) => TestResult::Pass,
         Some((false, _, _)) => TestResult::Fail("MAC is all-zero — F_MAC negotiation broken"),
         Some((_, false, _)) => TestResult::Fail("MTU out of expected range"),
-        None => TestResult::Fail("vnet0 not registered with narf_net::registry()"),
+        None => {
+            TestResult::Fail("primary virtio-net iface not registered with narf_net::registry()")
+        }
     }
 }
 kernel_test_in!(
@@ -790,9 +794,11 @@ fn smoke_virtio_net_pci_legacy_iface_registered() -> TestResult {
     if !net_pci::is_probed() {
         return TestResult::Skip("virtio-net-pci not present in this QEMU config");
     }
-    let vnet = match narf_net::iface::lookup("vnet0") {
+    let vnet = match narf_net::iface::lookup(crate::net_pci::primary_iface_name()) {
         Some(i) => i,
-        None => return TestResult::Fail("vnet0 not registered with narf_net::iface"),
+        None => {
+            return TestResult::Fail("primary virtio-net iface not registered with narf_net::iface")
+        }
     };
     // Same MAC the controller reports — confirms the probe path
     // copied it through (not a hardcoded placeholder).
@@ -808,7 +814,7 @@ kernel_test_in!(
 );
 
 fn smoke_virtio_net_pci_send_fn_dispatches() -> TestResult {
-    // Direct smoke: call vnet0's SendFn with a hand-built broadcast
+    // Direct smoke: call the primary virtio-net iface's SendFn with a hand-built broadcast
     // ARP frame and confirm the send returns Ok. This validates the
     // legacy iface registration → DmaBuffer alloc → tx_dma path
     // end-to-end without depending on which iface `primary()` picks
@@ -817,9 +823,11 @@ fn smoke_virtio_net_pci_send_fn_dispatches() -> TestResult {
     if !net_pci::is_probed() {
         return TestResult::Skip("virtio-net-pci not present in this QEMU config");
     }
-    let vnet = match narf_net::iface::lookup("vnet0") {
+    let vnet = match narf_net::iface::lookup(crate::net_pci::primary_iface_name()) {
         Some(i) => i,
-        None => return TestResult::Skip("vnet0 not registered with legacy iface"),
+        None => {
+            return TestResult::Skip("primary virtio-net iface not registered with legacy iface")
+        }
     };
     let src_mac = vnet.mac;
     // 42-byte ARP-over-Ethernet broadcast for 10.0.2.2. Bytes
@@ -863,7 +871,9 @@ fn smoke_virtio_net_pci_send_fn_dispatches() -> TestResult {
     frame[41] = 2;
     match (vnet.send)(&frame) {
         Ok(()) => TestResult::Pass,
-        Err(()) => TestResult::Fail("vnet0 SendFn returned Err — tx_dma path broken"),
+        Err(()) => {
+            TestResult::Fail("primary virtio-net iface SendFn returned Err — tx_dma path broken")
+        }
     }
 }
 kernel_test_in!(
@@ -880,7 +890,7 @@ fn smoke_virtio_net_pci_set_mac_round_trip() -> TestResult {
     // (other tests may depend on a stable MAC across runs).
     let original = match net_pci::with_controller(|c| c.mac()) {
         Some(m) => m,
-        None => return TestResult::Skip("vnet0 controller missing"),
+        None => return TestResult::Skip("primary virtio-net iface controller missing"),
     };
     // Locally-administered, unicast — guaranteed not to collide
     // with a vendor-assigned address. Bit 1 of the first octet
@@ -892,7 +902,7 @@ fn smoke_virtio_net_pci_set_mac_round_trip() -> TestResult {
         Some(Err(_)) => {
             return TestResult::Skip("device didn't negotiate F_CTRL_MAC_ADDR");
         }
-        None => return TestResult::Skip("vnet0 controller vanished"),
+        None => return TestResult::Skip("primary virtio-net iface controller vanished"),
     }
     let observed = net_pci::with_controller(|c| c.mac()).unwrap_or([0; 6]);
     if observed != new_mac {
@@ -914,14 +924,14 @@ fn smoke_virtio_net_pci_dhcp_acquire() -> TestResult {
     // End-to-end DHCP exchange against QEMU's built-in user-mode
     // SLIRP server, which always offers `10.0.2.15` as the lease.
     // Drives the full DISCOVER → OFFER → REQUEST → ACK flow through
-    // vnet0 — exercises the new tcp_stack UDP dispatch + dhcp client
+    // the primary virtio-net iface — exercises the new tcp_stack UDP dispatch + dhcp client
     // + frame-build wrappers.
     use crate::net_pci;
     if !net_pci::is_probed() {
         return TestResult::Skip("virtio-net-pci not present in this QEMU config");
     }
-    if narf_net::iface::lookup("vnet0").is_none() {
-        return TestResult::Skip("vnet0 not registered with legacy iface");
+    if narf_net::iface::lookup(crate::net_pci::primary_iface_name()).is_none() {
+        return TestResult::Skip("primary virtio-net iface not registered with legacy iface");
     }
     // kernel-test builds don't run `boot_userspace_init`, so the
     // `tcp_stack::init()` that normally wires
@@ -931,12 +941,12 @@ fn smoke_virtio_net_pci_dhcp_acquire() -> TestResult {
     // inside `acquire` times out. Idempotent — production builds
     // already called it via `cross_crate_init::install_all_hooks`.
     narf_net::tcp_stack::init();
-    // acquire() sends through vnet0's send_fn (looked up by name,
-    // not by primary()). The reply comes back on vnet0's RX
+    // acquire() sends through the primary iface's send_fn (looked up by name,
+    // not by primary()). The reply comes back on its RX
     // virtqueue; the busy-wait in `acquire` drains the ring via
     // `iface::drain_pump`, which routes through tcp_stack
     // → dhcp::on_udp_in, populating LATEST_REPLY.
-    match narf_net::dhcp::acquire("vnet0", 5000) {
+    match narf_net::dhcp::acquire(crate::net_pci::primary_iface_name(), 5000) {
         Ok(lease) => {
             // QEMU SLIRP hands out 10.0.2.15 by default.
             if lease.ip != [10, 0, 2, 15] {

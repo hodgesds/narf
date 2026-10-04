@@ -1543,7 +1543,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     });
     // Register this specific controller's interface and spawn its
     // forwarder pair.
-    register_net_interface(idx, bound_name);
+    register_net_interface(idx);
     Ok(())
 }
 
@@ -1566,7 +1566,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
 ///   low (one short critical section per frame, no awaits held
 ///   under the lock) so contention is bounded even on a 4-pair
 ///   line-rate workload.
-fn register_net_interface(idx: usize, name: alloc::string::String) {
+fn register_net_interface(idx: usize) {
     use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
     let (mac, mtu, link_up, rx_irq_vectors, num_pairs) = match with_at(idx, |c| {
@@ -1580,6 +1580,17 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
     }) {
         Some(t) => t,
         None => return,
+    };
+    // One device name for both registries, `eth%d` as Linux
+    // `dev_alloc_name` picks it. The primary controller is the legacy L3
+    // registry's device (the TCP stack sends through `vnet0_send_fn`); the
+    // others are frame-ring devices only and reserve their name.
+    let name: alloc::string::String = if idx == 0 {
+        let name = narf_net::iface::register_static("eth%d", mac, vnet0_send_fn);
+        *PRIMARY_IFNAME.lock() = Some(name);
+        name.into()
+    } else {
+        narf_net::iface::reserve_name("eth%d").into()
     };
     let (tx_prod, mut tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
     let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
@@ -1728,7 +1739,7 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                             // next take); the device is not reading it back, so an
                             // in-place write before dispatch is sound.
                             narf_net::iface::on_rx_frame_from(
-                                "vnet0",
+                                primary_iface_name(),
                                 &mut buf.as_mut_slice()[12..end],
                             );
                             // The tap consumed the frame synchronously + completely.
@@ -1909,14 +1920,10 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
         }
     });
 
-    // Wire the controller into the legacy `narf_net::iface` registry
-    // (fn-pointer-based) that the TCP stack consumes via
-    // `iface::send` / `iface::on_rx_frame` / `iface::drain_pump`.
-    // Only the primary controller (idx 0) registers here — the
-    // legacy registry has one "primary iface" slot; multi-NIC
-    // routing is a Stage-2 concern.
+    // The primary controller (registered in the legacy `narf_net::iface`
+    // registry above, which the TCP stack consumes via `iface::send` /
+    // `iface::on_rx_frame`) also feeds the stack's RX drain hook.
     if idx == 0 {
-        narf_net::iface::register("vnet0", mac, vnet0_send_fn);
         narf_net::iface::install_rx_drain(vnet0_drain_fn);
     }
 }
@@ -1974,7 +1981,7 @@ fn vnet0_drain_fn() -> bool {
     if payload_len != 0 {
         // `&mut`: as in the async pump, the program may rewrite header bytes in
         // place. `buf` is owned here until it is recycled below.
-        narf_net::iface::on_rx_frame_from("vnet0", &mut buf.as_mut_slice()[12..end]);
+        narf_net::iface::on_rx_frame_from(primary_iface_name(), &mut buf.as_mut_slice()[12..end]);
     }
     // Recycle the consumed buffer into the RX frame pool instead of freeing.
     with_controller(|c| {
@@ -2006,6 +2013,17 @@ pub fn count() -> usize {
 
 /// Active virtio-net queue-pair count on the primary device (1 unless
 /// VIRTIO_NET_F_MQ was negotiated and `VQ_PAIRS_SET` accepted N>1).
+/// The interface name `iface::register` gave the primary controller
+/// (`eth%d`, Linux `dev_alloc_name`). Set once at probe and leaked: the
+/// device lives as long as the kernel.
+static PRIMARY_IFNAME: narf_lib::sync::IrqSafeSpinLock<Option<&'static str>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The primary controller's interface name; empty until it has registered.
+pub fn primary_iface_name() -> &'static str {
+    PRIMARY_IFNAME.lock().unwrap_or("")
+}
+
 pub fn primary_num_pairs() -> usize {
     CONTROLLERS
         .lock()

@@ -356,6 +356,12 @@ pub trait Interface: Send + Sync {
     fn mtu(&self) -> u32;
     /// Link state. Loopback is always up; physical NICs sample PHY.
     fn link_up(&self) -> bool;
+    /// This is a loopback device. The Linux-visible loopback is the single
+    /// `lo` at ifindex 1, so the control plane does not list it a second
+    /// time under its frame-ring name.
+    fn is_loopback(&self) -> bool {
+        false
+    }
     /// Offloads supported through the frame rings. Producers must negotiate
     /// before setting TX metadata; the default accepts plain frames only.
     fn offloads(&self) -> OffloadCapabilities {
@@ -405,6 +411,7 @@ pub struct InterfaceSnapshot {
     pub mac: [u8; 6],
     pub mtu: u32,
     pub link_up: bool,
+    pub is_loopback: bool,
 }
 
 impl fmt::Debug for Entry {
@@ -514,6 +521,7 @@ impl Registry {
                 mac: entry.iface.mac(),
                 mtu: entry.iface.mtu(),
                 link_up: entry.iface.link_up(),
+                is_loopback: entry.iface.is_loopback(),
             })
             .collect()
     }
@@ -625,6 +633,9 @@ impl Interface for Loopback {
         self.mtu
     }
     fn link_up(&self) -> bool {
+        true
+    }
+    fn is_loopback(&self) -> bool {
         true
     }
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {

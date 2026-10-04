@@ -391,7 +391,7 @@ ln -sfn ../narf-plasma.service \
 # LAN resolvers the guest can never reach. Point glibc at the SLIRP DNS
 # proxy instead — 10.0.2.3 forwards queries to whatever the host resolves
 # with, matching the static 10.0.2.15/24 the kernel's qemu-net feature
-# assigns to vnet0.
+# assigns to the virtio NIC.
 printf 'nameserver 10.0.2.3\n' > "$WORK/root/etc/resolv.conf"
 
 install -m 0755 \
@@ -399,7 +399,7 @@ install -m 0755 \
   "$WORK/root/usr/local/libexec/narf-net-check"
 
 # Network acceptance gate: prove the distro has a WORKING off-box path
-# (vnet0 visible, TCP round-trip to the host across SLIRP, DNS through
+# (the virtio NIC visible, TCP round-trip to the host across SLIRP, DNS through
 # 10.0.2.3). Opt-in via the narf_net_check kernel cmdline flag — xtask
 # systemd-pid1 sets it for XTASK_SYSTEMD_PID1_NET_CHECK=1 runs — so
 # ordinary graphical boots never run it.

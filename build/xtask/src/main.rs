@@ -113,7 +113,7 @@ enum Cmd {
     /// shell parser → echo built-in → sys_write fd 1 → UART.
     RunInteractive(RunInteractiveArgs),
     /// Off-box network serving smoke. Boot with `qemu-net` (statically
-    /// configures vnet0 with the SLIRP lease) + a QEMU `hostfwd`, wait
+    /// configures the virtio NIC with the SLIRP lease) + a QEMU `hostfwd`, wait
     /// for the auto-spawned `netserve` echo server to print
     /// `netserve: listening`, then open a real TCP socket FROM THE HOST
     /// to the forwarded port, round-trip a line, and assert the echo +

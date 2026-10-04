@@ -5706,6 +5706,110 @@ kernel_test_in!(
     smoke_abi_netlink_pid1_can_start_loopback
 );
 
+/// Every RTM_NEWLINK of a link dump: `(ifindex, ifi_type, ifi_flags, name)`.
+fn rtnl_links(
+    fd: u64,
+) -> Result<alloc::vec::Vec<(i32, u16, u32, alloc::string::String)>, &'static str> {
+    const IFLA_IFNAME: u16 = 3;
+    let req = rtnl_dump_request(RTM_GETLINK, 401);
+    if netlink_send(fd, &req).ok_or("dump send")? != req.len() as i64 {
+        return Err("RTM_GETLINK send failed");
+    }
+    let mut links = alloc::vec::Vec::new();
+    for _ in 0..64 {
+        let mut msg = [0u8; 2048];
+        let n = netlink_recv(fd, &mut msg).ok_or("dump recv")? as usize;
+        if n < NLMSG_HDRLEN {
+            return Err("short dump message");
+        }
+        match nlmsg_type_of(&msg) {
+            NLMSG_DONE => return Ok(links),
+            RTM_NEWLINK => {}
+            _ => return Err("unexpected message in a link dump"),
+        }
+        let ifi_type = u16::from_ne_bytes([msg[18], msg[19]]);
+        let index = i32::from_ne_bytes(msg[20..24].try_into().unwrap());
+        let flags = u32::from_ne_bytes(msg[24..28].try_into().unwrap());
+        let mut name = alloc::string::String::new();
+        let mut at = 32;
+        while at + 4 <= n {
+            let len = u16::from_ne_bytes([msg[at], msg[at + 1]]) as usize;
+            let kind = u16::from_ne_bytes([msg[at + 2], msg[at + 3]]);
+            if len < 4 || at + len > n {
+                break;
+            }
+            if kind == IFLA_IFNAME {
+                let raw = &msg[at + 4..at + len];
+                let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+                name = alloc::string::String::from_utf8_lossy(&raw[..end]).into_owned();
+            }
+            at += (len + 3) & !3;
+        }
+        links.push((index, ifi_type, flags, name));
+    }
+    Err("link dump did not end")
+}
+
+/// The link list is Linux's: one `lo` (ifindex 1, ARPHRD_LOOPBACK, up with
+/// carrier), no second loopback under another name, and every device's
+/// ifindex the same in RTM_GETLINK and SIOCGIFINDEX. NARF listed `lo` twice
+/// (once as Ethernet) plus its frame-ring loopback `lo0`, and derived each
+/// ifindex from list position differently in each interface.
+fn smoke_abi_netlink_link_list_matches_linux() -> TestResult {
+    with_setup(|| {
+        const ARPHRD_LOOPBACK: u16 = 772;
+        const IFF_UP: u32 = 0x1;
+        const IFF_LOOPBACK: u32 = 0x8;
+        const IFF_RUNNING: u32 = 0x40;
+        const IFF_LOWER_UP: u32 = 0x1_0000;
+        const SIOCGIFINDEX: u64 = 0x8933;
+        // Boot registers `lo` with the stack (`install_net_stack`); the
+        // kernel-test boot does not run that path, so do it here.
+        narf_net::iface::register_loopback_iface();
+        let fd = open_netlink(NETLINK_ROUTE)?;
+        let links = rtnl_links(fd);
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let links = links?;
+        let loopbacks: alloc::vec::Vec<_> = links
+            .iter()
+            .filter(|(_, ty, flags, _)| *ty == ARPHRD_LOOPBACK || flags & IFF_LOOPBACK != 0)
+            .collect();
+        if loopbacks.len() != 1 {
+            return Err("the link list must hold exactly one loopback device");
+        }
+        let (index, _, flags, name) = loopbacks[0];
+        if *index != 1 || name != "lo" {
+            return Err("the loopback device must be `lo` at ifindex 1");
+        }
+        if flags & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP) != IFF_UP | IFF_RUNNING | IFF_LOWER_UP {
+            return Err("`lo` must report IFF_UP | IFF_RUNNING | IFF_LOWER_UP");
+        }
+        if links.iter().filter(|(_, _, _, n)| n == "lo").count() != 1 {
+            return Err("`lo` is listed more than once");
+        }
+        let sock = call(Syscall::SocketOpen.raw(), a2(2, 2, 0)).ok_or("socket status")? as u64;
+        for (index, _, _, name) in &links {
+            let mut ifreq = [0u8; 40];
+            ifreq[..name.len()].copy_from_slice(name.as_bytes());
+            let rc = call(
+                Syscall::Ioctl.raw(),
+                a2(sock, SIOCGIFINDEX, ifreq.as_mut_ptr() as u64),
+            );
+            let got = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
+            if rc != Some(0) || got != *index {
+                let _ = call(Syscall::Close.raw(), a0(sock));
+                return Err("SIOCGIFINDEX disagrees with RTM_GETLINK about a device's ifindex");
+            }
+        }
+        let _ = call(Syscall::Close.raw(), a0(sock));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_link_list_matches_linux
+);
+
 fn smoke_abi_netlink_address_and_options_roundtrip() -> TestResult {
     with_setup(|| {
         let fd = open_netlink(NETLINK_ROUTE)?;

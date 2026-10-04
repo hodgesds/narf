@@ -234,12 +234,33 @@ fn smoke_net_loopback_register() -> TestResult {
                 1, 0, 0, 0, // sequence
                 0, 0, 0, 0, // port id
             ];
+            // A driver-backed (frame-ring only) NIC is listed; a frame-ring
+            // loopback is not — Linux has exactly one loopback, `lo`.
+            let (tx_prod, _tx_cons) = narf_ipc::channel::<crate::Frame, { crate::TX_RING_N }>();
+            let (_rx_prod, rx_cons) = narf_ipc::channel::<crate::Frame, { crate::RX_RING_N }>();
+            let nic = crate::virtio_net::VirtioNet::new(
+                alloc::string::String::from("fr.smoke-register"),
+                [0x02, 0, 0, 0, 0x5e, 1],
+                1500,
+                true,
+                tx_prod,
+                rx_cons,
+            );
+            if registry().register(&authority, nic).is_err() {
+                return TestResult::Fail("frame-ring NIC registration failed");
+            }
             let replies = crate::netlink_route::build_dump(&request);
             if !replies
                 .iter()
-                .any(|reply| reply.windows(18).any(|w| w == b"lo.smoke-register\0"))
+                .any(|reply| reply.windows(18).any(|w| w == b"fr.smoke-register\0"))
             {
                 return TestResult::Fail("rtnetlink omitted driver-backed interface");
+            }
+            if replies
+                .iter()
+                .any(|reply| reply.windows(18).any(|w| w == b"lo.smoke-register\0"))
+            {
+                return TestResult::Fail("rtnetlink listed a second loopback device");
             }
             TestResult::Pass
         }
@@ -8407,4 +8428,34 @@ fn smoke_control_grant_keeps_frame_owner_and_revokes() -> TestResult {
 kernel_test_in!(
     "net/control_grant",
     smoke_control_grant_keeps_frame_owner_and_revokes
+);
+
+/// `iface::register` is Linux `register_netdev`: a `%d` name takes the lowest
+/// unused number (`dev_alloc_name`), and each device keeps the ifindex it was
+/// given (`dev_new_index`) — re-registering a name keeps its ifindex, and
+/// later devices never reuse it.
+fn smoke_iface_register_allocates_name_and_stable_ifindex() -> TestResult {
+    let a = crate::iface::register("nrfa%d", [0x02, 0, 0, 0, 0xa1, 0], |_| Ok(()));
+    let b = crate::iface::register("nrfa%d", [0x02, 0, 0, 0, 0xa1, 1], |_| Ok(()));
+    if a != "nrfa0" || b != "nrfa1" {
+        return TestResult::Fail("eth%d-style names must take the lowest free number");
+    }
+    let (Some(ia), Some(ib)) = (crate::iface::ifindex_of(&a), crate::iface::ifindex_of(&b)) else {
+        return TestResult::Fail("registered devices must have an ifindex");
+    };
+    if ia == ib || ia < 2 || ib < 2 {
+        return TestResult::Fail("ifindexes must be distinct and leave 1 for lo");
+    }
+    let again = crate::iface::register(&a, [0x02, 0, 0, 0, 0xa1, 2], |_| Ok(()));
+    if again != a || crate::iface::ifindex_of(&a) != Some(ia) {
+        return TestResult::Fail("re-registering a device must keep its ifindex");
+    }
+    if crate::iface::ifindex_of("lo") != Some(1) {
+        return TestResult::Fail("lo must be ifindex 1");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net",
+    smoke_iface_register_allocates_name_and_stable_ifindex
 );

@@ -3,7 +3,7 @@
 # stock Fedora userspace a WORKING off-box network, not just a configured
 # one. Three independent probes, strongest last:
 #
-#   iface — the virtio NIC registered as vnet0 and is visible through the
+#   iface — the NICs registered under Linux `eth%d` names and are visible through the
 #           Linux-compat /proc/net/dev surface the distro reads.
 #   tcp   — curl fetches a token from the host across the SLIRP gateway
 #           (guest 10.0.2.2:<port> lands on host 127.0.0.1:<port>). This is
@@ -32,8 +32,8 @@ fail() {
     exit 1
 }
 
-# --- iface: vnet0 registered and exported via /proc/net/dev ---------------
-grep -q 'vnet0' /proc/net/dev 2>/dev/null || fail "iface vnet0 missing from /proc/net/dev"
+# --- iface: an eth%d device registered and exported via /proc/net/dev -----
+grep -Eq "^ *eth[0-9]+:" /proc/net/dev 2>/dev/null || fail "no eth%d iface in /proc/net/dev"
 
 # --- tcp: round-trip a token from the xtask listener on the host ----------
 # A few retries cover the boot-time window where the first ARP/route use
