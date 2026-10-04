@@ -266,6 +266,49 @@ struct LinkInfo {
     /// carries no IFLA_ADDRESS).
     mac: Vec<u8>,
     mtu: u32,
+    carrier: bool,
+    tx_queue_len: u32,
+    link_mode: u8,
+    netdev_group: u32,
+    stats: Option<crate::iface::IfaceCounterSnapshot>,
+}
+
+fn link_stats64(stats: Option<&crate::iface::IfaceCounterSnapshot>) -> Vec<u8> {
+    let values = match stats {
+        Some(stats) => [
+            stats.rx_packets,
+            stats.tx_packets,
+            stats.rx_bytes,
+            stats.tx_bytes,
+            stats.rx_errs,
+            stats.tx_errs,
+            stats.rx_drop,
+            stats.tx_drop,
+            stats.rx_multicast,
+            stats.tx_colls,
+            stats.rx_length_errors,
+            stats.rx_over_errors,
+            stats.rx_crc_errors,
+            stats.rx_frame,
+            stats.rx_fifo,
+            stats.rx_missed_errors,
+            stats.tx_aborted_errors,
+            stats.tx_carrier,
+            stats.tx_fifo,
+            stats.tx_heartbeat_errors,
+            stats.tx_window_errors,
+            stats.rx_compressed,
+            stats.tx_compressed,
+            stats.rx_nohandler,
+            stats.rx_otherhost_dropped,
+        ],
+        None => [0; 25],
+    };
+    let mut bytes = Vec::with_capacity(values.len() * core::mem::size_of::<u64>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_ne_bytes());
+    }
+    bytes
 }
 
 /// Build one `RTM_NEWLINK` message. Payload is `struct ifinfomsg` +
@@ -298,20 +341,17 @@ fn build_newlink(link: &LinkInfo, seq: u32, pid: u32) -> Vec<u8> {
     }
     push_rtattr(&mut body, IFLA_MTU, &link.mtu.to_le_bytes());
     push_rtattr(&mut body, IFLA_QDISC, b"noqueue\0");
-    push_rtattr(&mut body, IFLA_TXQLEN, &1000u32.to_ne_bytes());
-    let running = link.flags & IFF_RUNNING != 0;
+    push_rtattr(&mut body, IFLA_TXQLEN, &link.tx_queue_len.to_ne_bytes());
+    let running = link.flags & IFF_UP != 0 && link.carrier;
     push_rtattr(
         &mut body,
         IFLA_OPERSTATE,
         &[if running { IF_OPER_UP } else { IF_OPER_DOWN }],
     );
-    push_rtattr(&mut body, IFLA_LINKMODE, &[0]);
-    push_rtattr(&mut body, IFLA_GROUP, &0u32.to_ne_bytes());
-    push_rtattr(&mut body, IFLA_CARRIER, &[u8::from(running)]);
-    // struct rtnl_link_stats64. Centralized driver counters currently report
-    // zero, but supplying the complete native-endian shape lets Linux parsers
-    // consume `ip -s link` without treating the attribute as malformed.
-    push_rtattr(&mut body, IFLA_STATS64, &[0u8; 25 * 8]);
+    push_rtattr(&mut body, IFLA_LINKMODE, &[link.link_mode]);
+    push_rtattr(&mut body, IFLA_GROUP, &link.netdev_group.to_ne_bytes());
+    push_rtattr(&mut body, IFLA_CARRIER, &[u8::from(link.carrier)]);
+    push_rtattr(&mut body, IFLA_STATS64, &link_stats64(link.stats.as_ref()));
 
     frame_message(RTM_NEWLINK, NLM_F_MULTI, seq, pid, &body)
 }
@@ -644,6 +684,13 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
         name: alloc::string::String::from("lo"),
         mac: Vec::new(),
         mtu: 65536,
+        carrier: true,
+        tx_queue_len: crate::iface::lookup_in(net_ns_id, "lo").map_or(1000, |lo| lo.tx_queue_len),
+        link_mode: crate::iface::lookup_in(net_ns_id, "lo").map_or(0, |lo| lo.link_mode),
+        netdev_group: crate::iface::lookup_in(net_ns_id, "lo").map_or(0, |lo| lo.netdev_group),
+        stats: crate::iface::snapshot_counters_in(net_ns_id)
+            .into_iter()
+            .find(|stats| stats.name == "lo"),
     });
     addrs.push(AddrInfo {
         ifindex: 1,
@@ -665,11 +712,21 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
             ifindex,
             flags: IFF_BROADCAST
                 | IFF_MULTICAST
-                | if nic.link_up { IFF_UP | IFF_RUNNING } else { 0 },
+                | if nic.link_up { IFF_UP } else { 0 }
+                | if nic.link_up && nic.carrier {
+                    IFF_RUNNING
+                } else {
+                    0
+                },
             arphrd: ARPHRD_ETHER,
             name: nic.name.clone(),
             mac: nic.mac.to_vec(),
             mtu: nic.mtu,
+            carrier: nic.carrier,
+            tx_queue_len: nic.tx_queue_len,
+            link_mode: nic.link_mode,
+            netdev_group: nic.netdev_group,
+            stats: Some(nic.stats.clone()),
         });
         let configured = crate::iface::get_addrs(&nic.name);
         for (address, prefix_len) in &configured {
@@ -721,6 +778,11 @@ fn enumerate_in(net_ns_id: u64) -> (Vec<LinkInfo>, Vec<AddrInfo>) {
             name: nic.name,
             mac: nic.mac.to_vec(),
             mtu: nic.mtu,
+            carrier: nic.link_up,
+            tx_queue_len: 1000,
+            link_mode: 0,
+            netdev_group: 0,
+            stats: None,
         });
     }
 
@@ -1802,6 +1864,19 @@ pub fn successful_mutation_notifications(
     datagram: &[u8],
     replies: &[Vec<u8>],
 ) -> Vec<(u32, Vec<u8>)> {
+    successful_mutation_notifications_in(0, datagram, replies)
+}
+
+/// Namespace-aware form of [`successful_mutation_notifications`]. Link
+/// notifications are rebuilt from the post-mutation interface state, just as
+/// Linux's `rtmsg_ifinfo()` snapshots `struct net_device`; a userspace
+/// `RTM_SETLINK` request normally contains only the fields being changed and
+/// is not itself a complete `RTM_NEWLINK` notification.
+pub fn successful_mutation_notifications_in(
+    net_ns_id: u64,
+    datagram: &[u8],
+    replies: &[Vec<u8>],
+) -> Vec<(u32, Vec<u8>)> {
     let mut out = Vec::new();
     let mut offset = 0;
     while offset + NLMSG_HDRLEN <= datagram.len() {
@@ -1850,12 +1925,42 @@ pub fn successful_mutation_notifications(
                     continue;
                 }
             };
-            let mut message = datagram[offset..offset + len].to_vec();
+            let request = &datagram[offset..offset + len];
+            let mut message = if matches!(hdr.msg_type, RTM_NEWLINK | RTM_SETLINK) {
+                let requested_ifindex = request
+                    .get(20..24)
+                    .and_then(|raw| raw.try_into().ok())
+                    .map(i32::from_ne_bytes)
+                    .filter(|index| *index > 0)
+                    .map(|index| index as u32);
+                let requested_name = find_attr(request, 16, IFLA_IFNAME).and_then(|raw| {
+                    core::str::from_utf8(raw.strip_suffix(&[0]).unwrap_or(raw)).ok()
+                });
+                enumerate_in(net_ns_id)
+                    .0
+                    .into_iter()
+                    .find(|link| {
+                        requested_ifindex == Some(link.ifindex)
+                            || requested_name.is_some_and(|name| name == link.name)
+                    })
+                    .map(|link| {
+                        let mut message = build_newlink(&link, 0, 0);
+                        clear_multipart(&mut message);
+                        message
+                    })
+                    // A successful link mutation names an existing device, so
+                    // this is only a defensive fallback for inconsistent
+                    // internal state. Never panic the kernel on user input.
+                    .unwrap_or_else(|| request.to_vec())
+            } else {
+                request.to_vec()
+            };
             message[4..6].copy_from_slice(&msg_type.to_ne_bytes());
             message[6..8].copy_from_slice(&0u16.to_ne_bytes());
             message[8..12].copy_from_slice(&0u32.to_ne_bytes());
             message[12..16].copy_from_slice(&0u32.to_ne_bytes());
-            message.resize(nlmsg_align(len), 0);
+            let declared_len = u32::from_ne_bytes(message[0..4].try_into().unwrap()) as usize;
+            message.resize(nlmsg_align(declared_len), 0);
             if matches!(msg_type, RTM_NEWADDR | RTM_DELADDR) {
                 complete_addr_notification(&mut message);
             }

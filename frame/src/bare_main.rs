@@ -3946,14 +3946,6 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::Ok
             });
 
-            // Same for /sys/class/net: the NICs register while drivers probe,
-            // after the early populate_all(). udev coldplug and
-            // NetworkManager find network devices here.
-            narf_init::register(narf_init::Stage::Late, "sysfs-net-class", || {
-                narf_filesystem::sysfs::populate_net_class();
-                narf_init::InitResult::Ok
-            });
-
             // /sys/class/tty/tty0/active — logind reads this to learn the active
             // VT on seat0 and thereby which session is active. Without it logind
             // "cannot determine the active graphical session", refuses

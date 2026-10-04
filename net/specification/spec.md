@@ -119,6 +119,17 @@ Admin is deliberately separate from Rx/Tx: a stack daemon needs Rx+Tx but
 usually not Admin. `AdminHandle` binds the revocable authority to exactly one
 interface; every operation checks current cap validity before mutation.
 
+The legacy Linux-compatibility registry retains the `register_netdevice`
+metadata that sysfs and rtnetlink expose: name/address assignment types,
+queue length, group/link mode, protocol/dormant/testing state, alias, physical
+carrier, driver-reported speed/duplex, carrier transition counts, and the
+complete `rtnl_link_stats64` counter set. `set_link_state` changes only
+administrative `IFF_UP`; a driver publishes an authoritative PHY sample with
+`set_link_metadata(name, carrier, speed_mbps, duplex)`. Common ingress and
+egress paths update packet/byte/multicast/drop counters once, and procfs,
+sysfs, and rtnetlink consume the same snapshots rather than constructing
+compatibility-only values.
+
 `stack::control_registered(&StackAttach)` validates the registered interface
 handle and daemon identity through `Cap::invoke`, returning an interface-bound
 `StackAttachReply` without changing frame routing. This supports a wireless
@@ -179,8 +190,11 @@ table. The Linux syscall surface never accepts raw admin-handle bytes.
 Successful mutations emit kernel-originated sequence-zero notifications to
 the Linux rtnetlink multicast group for the changed object (link, neighbor,
 IPv4/IPv6 address, or IPv4/IPv6 route). Address and route notifications use
-the family-specific IPv4 or IPv6 group. Only sockets subscribed through
-`nl_groups` or `NETLINK_ADD_MEMBERSHIP` receive them.
+the family-specific IPv4 or IPv6 group. Link notifications contain the
+complete post-mutation interface snapshot (flags including `IFF_LOWER_UP`,
+operstate, carrier, address, MTU, queue metadata, and statistics), rather than
+echoing the caller's partial `RTM_SETLINK` request. Only sockets subscribed
+through `nl_groups` or `NETLINK_ADD_MEMBERSHIP` receive them.
 
 Creation and replacement honor Linux `NLM_F_CREATE`, `NLM_F_EXCL`, and
 `NLM_F_REPLACE` semantics per object, with the errnos of the Linux handler:
@@ -212,9 +226,11 @@ the lowest unused number (`dev_alloc_name`): e1000 and virtio-net register as
 `eth%d` and wireless drivers as `wlan%d`, each device under one name in both
 registries (a driver needing its name before registering reserves it). The link dump lists
 exactly one loopback, `lo`, and a running device reports `IFF_LOWER_UP`
-(`dev_get_flags`). A device registers down (no `IFF_UP`) and with no
-address, as `register_netdevice` leaves it, so a distro network manager finds
-it unconfigured; NARF's `lo` stays permanently up. The first IPv4 address
+(`dev_get_flags`). A device registers administratively down (no `IFF_UP`) and
+with no address, as `register_netdevice` leaves it, while its driver reports
+physical carrier independently; a distro network manager therefore finds it
+unconfigured and may open it for DHCP. NARF's `lo` stays permanently up with
+carrier. The first IPv4 address
 configured on a device becomes the address the stack sends from; removing it
 moves that to the next address, or none. The opt-in `qemu-net` feature is the
 equivalent of Linux kernel IP autoconfiguration
@@ -267,9 +283,11 @@ by `NDA_IFINDEX` / `NDA_MASTER`; qdisc dumps cover every device. A valid
 filter with no matching objects returns an empty dump terminated by
 `NLMSG_DONE`.
 
-Link dumps include Linux operational-state, carrier, qdisc, queue-length,
-broadcast, group, and `rtnl_link_stats64` attributes. Counters remain zero
-until a driver publishes them through the central interface registry.
+Link dumps include Linux operational-state, physical carrier, qdisc,
+queue-length, broadcast, group, and `rtnl_link_stats64` attributes. Their
+metadata and counters come from the central interface registry shared with
+`/proc/net/dev` and `/sys/class/net/<dev>`; unavailable hardware error fields
+remain at their authoritative initial value until a driver reports an event.
 
 Collection queries for absent optional state—traffic classes, filters,
 actions, address labels, multicast database entries, and nexthops—return an

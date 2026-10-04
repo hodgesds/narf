@@ -349,7 +349,7 @@ kernel_test_in!("filesystem", smoke_sysfs_enumerate_class_net);
 /// (`0x1303` here for an up Ethernet NIC with packet-socket promisc and
 /// all-multicast references, `0x9` for `lo`).
 fn smoke_sysfs_class_net_attrs_are_linuxs() -> TestResult {
-    use crate::sysfs::NetIfaceInfo;
+    use crate::sysfs::{NetDuplex, NetIfaceInfo, NetIfaceStats};
     crate::sysfs::__reset_for_test();
     fn two_devices() -> Vec<NetIfaceInfo> {
         alloc::vec![
@@ -358,45 +358,110 @@ fn smoke_sysfs_class_net_attrs_are_linuxs() -> TestResult {
                 mac: [0; 6],
                 mtu: 65536,
                 link_up: true,
+                carrier: true,
                 ifindex: 1,
                 loopback: true,
                 promisc: false,
                 allmulti: false,
+                name_assign_type: 2,
+                tx_queue_len: 1000,
+                ..NetIfaceInfo::default()
             },
             NetIfaceInfo {
                 name: "eth0".to_string(),
                 mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
                 mtu: 1500,
                 link_up: true,
+                carrier: true,
                 ifindex: 7,
                 loopback: false,
                 promisc: true,
                 allmulti: true,
+                name_assign_type: 1,
+                carrier_changes: 3,
+                carrier_up_count: 2,
+                carrier_down_count: 1,
+                speed_mbps: Some(2500),
+                duplex: Some(NetDuplex::Full),
+                tx_queue_len: 1000,
+                stats: NetIfaceStats {
+                    rx_packets: 1,
+                    tx_packets: 2,
+                    rx_bytes: 3,
+                    tx_bytes: 4,
+                    rx_errors: 5,
+                    tx_errors: 6,
+                    rx_dropped: 7,
+                    tx_dropped: 8,
+                    multicast: 9,
+                    collisions: 10,
+                    rx_length_errors: 11,
+                    rx_over_errors: 12,
+                    rx_crc_errors: 13,
+                    rx_frame_errors: 14,
+                    rx_fifo_errors: 15,
+                    rx_missed_errors: 16,
+                    tx_aborted_errors: 17,
+                    tx_carrier_errors: 18,
+                    tx_fifo_errors: 19,
+                    tx_heartbeat_errors: 20,
+                    tx_window_errors: 21,
+                    rx_compressed: 22,
+                    tx_compressed: 23,
+                    rx_nohandler: 24,
+                },
+                ..NetIfaceInfo::default()
             },
         ]
     }
     crate::sysfs::install_net_snapshot_hook(two_devices);
     crate::sysfs::populate_net_class();
+    let root = crate::sysfs::get_root();
+    let class_net = root
+        .get_child("class")
+        .and_then(|class| class.get_child("net"));
     let attr = |dev: &str, name: &str| -> Option<String> {
         crate::sysfs::get_root()
-            .get_child("class")?
+            .get_child("devices")?
+            .get_child("virtual")?
             .get_child("net")?
             .get_child(dev)?
             .attr_show(name)
     };
-    let expect: [(&str, &str, &str); 14] = [
+    let expect: [(&str, &str, &str); 35] = [
         ("eth0", "ifindex", "7\n"),
         ("eth0", "iflink", "7\n"),
         ("eth0", "type", "1\n"),
+        ("eth0", "name_assign_type", "1\n"),
+        ("eth0", "addr_assign_type", "0\n"),
         ("eth0", "addr_len", "6\n"),
+        ("eth0", "dev_id", "0x0\n"),
+        ("eth0", "dev_port", "0\n"),
+        ("eth0", "link_mode", "0\n"),
+        ("eth0", "netdev_group", "0\n"),
         ("eth0", "address", "52:54:00:12:34:56\n"),
         ("eth0", "broadcast", "ff:ff:ff:ff:ff:ff\n"),
         ("eth0", "operstate", "up\n"),
+        ("eth0", "carrier", "1\n"),
+        ("eth0", "speed", "2500\n"),
+        ("eth0", "duplex", "full\n"),
+        ("eth0", "dormant", "0\n"),
+        ("eth0", "testing", "0\n"),
+        ("eth0", "carrier_changes", "3\n"),
+        ("eth0", "carrier_up_count", "2\n"),
+        ("eth0", "carrier_down_count", "1\n"),
+        ("eth0", "ifalias", ""),
+        ("eth0", "tx_queue_len", "1000\n"),
+        ("eth0", "gro_flush_timeout", "0\n"),
+        ("eth0", "napi_defer_hard_irqs", "0\n"),
+        ("eth0", "proto_down", "0\n"),
+        ("eth0", "threaded", "0\n"),
         ("eth0", "flags", "0x1303\n"),
         ("eth0", "mtu", "1500\n"),
         ("eth0", "uevent", "INTERFACE=eth0\nIFINDEX=7\n"),
         ("lo", "ifindex", "1\n"),
         ("lo", "type", "772\n"),
+        ("lo", "name_assign_type", "2\n"),
         ("lo", "operstate", "unknown\n"),
         ("lo", "flags", "0x9\n"),
     ];
@@ -407,11 +472,205 @@ fn smoke_sysfs_class_net_attrs_are_linuxs() -> TestResult {
             break;
         }
     }
+    if class_net
+        .as_ref()
+        .and_then(|net| net.get_child("eth0"))
+        .is_some()
+        || class_net
+            .as_ref()
+            .and_then(|net| net.get_symlink("eth0"))
+            .as_deref()
+            != Some("../../devices/virtual/net/eth0")
+    {
+        verdict = TestResult::Fail("/sys/class/net/eth0 is not a canonical device symlink");
+    }
+    let stats = crate::sysfs::get_root()
+        .get_child("devices")
+        .and_then(|devices| devices.get_child("virtual"))
+        .and_then(|virtual_devices| virtual_devices.get_child("net"))
+        .and_then(|net| net.get_child("eth0"))
+        .and_then(|eth0| eth0.get_child("statistics"));
+    let required_stats = [
+        ("rx_packets", "1\n"),
+        ("tx_packets", "2\n"),
+        ("rx_bytes", "3\n"),
+        ("tx_bytes", "4\n"),
+        ("rx_errors", "5\n"),
+        ("tx_errors", "6\n"),
+        ("rx_dropped", "7\n"),
+        ("tx_dropped", "8\n"),
+        ("multicast", "9\n"),
+        ("collisions", "10\n"),
+        ("rx_length_errors", "11\n"),
+        ("rx_over_errors", "12\n"),
+        ("rx_crc_errors", "13\n"),
+        ("rx_frame_errors", "14\n"),
+        ("rx_fifo_errors", "15\n"),
+        ("rx_missed_errors", "16\n"),
+        ("tx_aborted_errors", "17\n"),
+        ("tx_carrier_errors", "18\n"),
+        ("tx_fifo_errors", "19\n"),
+        ("tx_heartbeat_errors", "20\n"),
+        ("tx_window_errors", "21\n"),
+        ("rx_compressed", "22\n"),
+        ("tx_compressed", "23\n"),
+        ("rx_nohandler", "24\n"),
+    ];
+    if stats.as_ref().is_none_or(|stats| {
+        required_stats
+            .iter()
+            .any(|(name, value)| stats.attr_show(name).as_deref() != Some(value))
+    }) {
+        verdict = TestResult::Fail("/sys/class/net/eth0/statistics is incomplete");
+    }
     crate::sysfs::install_net_snapshot_hook(Vec::new);
     crate::sysfs::__reset_for_test();
     verdict
 }
 kernel_test_in!("filesystem", smoke_sysfs_class_net_attrs_are_linuxs);
+
+/// Network devices must be real kobjects below `/sys/devices`, with the
+/// `/sys/class/net` entries acting only as discovery symlinks. systemd-udevd
+/// rejects a class-only `DEVPATH`; NetworkManager then reports reason 71
+/// ("link is not initialized by udev") and never starts DHCP.
+fn smoke_sysfs_net_boot_add_uses_canonical_device_paths() -> TestResult {
+    use crate::sysfs::{NetIfaceInfo, NetPciParent};
+
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    fn two_devices() -> Vec<NetIfaceInfo> {
+        alloc::vec![
+            NetIfaceInfo {
+                name: "lo".to_string(),
+                mac: [0; 6],
+                mtu: 65536,
+                link_up: true,
+                carrier: true,
+                ifindex: 1,
+                loopback: true,
+                promisc: false,
+                allmulti: false,
+                name_assign_type: 2,
+                tx_queue_len: 1000,
+                ..NetIfaceInfo::default()
+            },
+            NetIfaceInfo {
+                name: "eth0".to_string(),
+                mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+                mtu: 1500,
+                link_up: false,
+                carrier: true,
+                ifindex: 2,
+                loopback: false,
+                promisc: false,
+                allmulti: false,
+                name_assign_type: 1,
+                tx_queue_len: 1000,
+                pci_parent: Some(NetPciParent {
+                    segment: 0,
+                    bus: 0,
+                    device: 3,
+                    function: 0,
+                    vendor_id: 0x8086,
+                    device_id: 0x100e,
+                    subsystem_vendor_id: 0x1af4,
+                    subsystem_device_id: 0x1100,
+                    class: 0x020000,
+                    driver: "e1000".to_string(),
+                }),
+                ..NetIfaceInfo::default()
+            },
+        ]
+    }
+
+    crate::sysfs::install_net_snapshot_hook(two_devices);
+    crate::sysfs::populate_net_class();
+    crate::uevent::begin_boot_udevd_replay();
+    let emitted = crate::sysfs::emit_net_device_add_events();
+    let events = crate::uevent::boot_udevd_replay_reader().drain(16);
+
+    let result = (|| {
+        let root = crate::sysfs::get_root();
+        let class_net = root
+            .get_child("class")
+            .and_then(|class| class.get_child("net"))
+            .ok_or("/sys/class/net missing")?;
+        if class_net.get_child("eth0").is_some()
+            || class_net.get_symlink("eth0").as_deref()
+                != Some("../../devices/pci0000:00/0000:00:03.0/net/eth0")
+        {
+            return Err("/sys/class/net/eth0 is not the canonical device symlink");
+        }
+        let pci_device = root
+            .get_child("devices")
+            .and_then(|devices| devices.get_child("pci0000:00"))
+            .and_then(|host| host.get_child("0000:00:03.0"))
+            .ok_or("canonical PCI parent missing")?;
+        if pci_device.attr_show("vendor").as_deref() != Some("0x8086\n")
+            || pci_device.attr_show("device").as_deref() != Some("0x100e\n")
+            || pci_device.attr_show("class").as_deref() != Some("0x020000\n")
+            || pci_device.get_symlink("subsystem").as_deref() != Some("../../../bus/pci")
+            || pci_device.get_symlink("driver").as_deref() != Some("../../../bus/pci/drivers/e1000")
+        {
+            return Err("PCI parent identity or links are incomplete");
+        }
+        let canonical = pci_device
+            .get_child("net")
+            .and_then(|net| net.get_child("eth0"))
+            .ok_or("canonical PCI-backed eth0 device missing")?;
+        if canonical.attr_show("uevent").as_deref() != Some("INTERFACE=eth0\nIFINDEX=2\n") {
+            return Err("canonical net uevent attributes are incomplete");
+        }
+        if canonical.get_symlink("device").as_deref() != Some("../..")
+            || canonical.get_symlink("subsystem").as_deref() != Some("../../../../../class/net")
+        {
+            return Err("PCI-backed net device parent/subsystem links are incomplete");
+        }
+        let pci_bus_device = root
+            .get_child("bus")
+            .and_then(|bus| bus.get_child("pci"))
+            .and_then(|pci| pci.get_child("devices"))
+            .and_then(|devices| devices.get_symlink("0000:00:03.0"));
+        if pci_bus_device.as_deref() != Some("../../../devices/pci0000:00/0000:00:03.0") {
+            return Err("/sys/bus/pci/devices is missing the network parent");
+        }
+        let net_adds: Vec<_> = events
+            .iter()
+            .filter(|event| event.action == UeventAction::Add && event.subsystem == "net")
+            .collect();
+        if emitted != 2 || net_adds.len() != 2 {
+            return Err("boot replay did not emit one ADD per network device");
+        }
+        let eth0 = net_adds
+            .into_iter()
+            .find(|event| event.devpath == "/devices/pci0000:00/0000:00:03.0/net/eth0")
+            .ok_or("eth0 ADD did not use its canonical device path")?;
+        if !eth0
+            .extras
+            .iter()
+            .any(|(key, value)| key == "INTERFACE" && value == "eth0")
+            || !eth0
+                .extras
+                .iter()
+                .any(|(key, value)| key == "IFINDEX" && value == "2")
+        {
+            return Err("eth0 ADD omitted INTERFACE or IFINDEX");
+        }
+        Ok(())
+    })();
+
+    crate::sysfs::install_net_snapshot_hook(Vec::new);
+    crate::sysfs::__reset_for_test();
+    crate::uevent::__reset_for_test();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_net_boot_add_uses_canonical_device_paths
+);
 
 // ── Test 6: Uevent ring FIFO order ────────────────────────────────────
 

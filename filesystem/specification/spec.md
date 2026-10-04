@@ -1123,9 +1123,17 @@ mount dependencies. Partition events with a discovered filesystem UUID carry
 both the existing `DEVLINKS=/dev/disk/by-uuid/<uuid>` path and the matching
 `SYSTEMD_ALIAS`; systemd device units are driven by the udev database rather
 than by probing whether the devfs symlink resolves.
-`/sys/class/net/<dev>` is populated from the network stack's interface list
-(installed net snapshot hook) and refreshed from a `Stage::Late` initcall, after
-the NIC drivers have probed. Each device carries Linux's net-sysfs attributes —
+Network devices have canonical kobjects below `/sys/devices`: a PCI-backed
+interface lives at `/sys/devices/pci<segment>:<bus>/<BDF>/net/<dev>`, with
+matching PCI identity, driver, and `/sys/bus/pci/devices` links, while only a
+parentless interface such as `lo` lives below `/sys/devices/virtual/net`.
+`/sys/class/net/<dev>` is a discovery symlink. They are populated from the network stack's interface list after the
+NIC drivers have probed and the cross-crate snapshot hook plus loopback device
+are installed. That completed projection begins or extends the bounded udev
+replay window and queues one canonical `add` uevent per interface before PID 1,
+so a later systemd-udevd initializes every link before NetworkManager evaluates
+it.
+Each device carries Linux's net-sysfs attributes —
 `ifindex` and `iflink` (the rtnetlink ifindex udev keys its database on),
 `type` (`ARPHRD_ETHER`/`ARPHRD_LOOPBACK`), `addr_len`, `dev_id`, `address`,
 `broadcast`, `operstate` (`unknown` for `lo`), `mtu`, `flags` (`dev->flags`,
@@ -1133,7 +1141,14 @@ never the volatile `IFF_RUNNING`; `IFF_PROMISC`/`IFF_ALLMULTI` while the
 snapshot's `NetIfaceInfo::promisc`/`allmulti` report a non-zero
 `dev->promiscuity`/`dev->allmulti`), a writable `uevent` with `INTERFACE` and
 `IFINDEX` — and the `subsystem` link; `mtu`, `operstate` and `flags` read live
-state.
+state. The remaining standard `net_class_attrs` identity/state files and the
+complete `statistics/` group read the central interface registry's live
+metadata and counters; no compatibility-only speed, duplex, carrier, or
+zero-filled statistics snapshot is synthesized. Ethernet
+interfaces have no `dev_t` and therefore no per-interface devfs node (Linux
+also controls them through sockets, ioctl, and rtnetlink); `/dev/net/tun` is
+reserved for a future implemented TUN/TAP backend and is not synthesized as an
+inert device.
 The bounded boot udev replay begins at the first completed late device
 projection and never advances past already-queued ADD events when another
 projection completes. This lets independently registered DRM and block

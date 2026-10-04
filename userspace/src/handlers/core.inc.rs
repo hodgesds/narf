@@ -2999,7 +2999,12 @@ pub(crate) fn create_unix_socket_node(path: &str) {
         // stale node already occupies the name the app should have
         // unlink'd it first — ignore the collision (bind already vetted
         // the address via LISTENERS).
-        let _ = poll_blocking(parent.create_socket(&leaf, 0o755));
+        if matches!(
+            poll_blocking(parent.create_socket(&leaf, 0o755)),
+            Some(Ok(_))
+        ) {
+            crate::mqueue::notify_create(&abs, false);
+        }
     }
 }
 
@@ -15789,6 +15794,19 @@ pub fn current_ucred() -> crate::socket::Ucred {
         pid: pid as u32,
         uid,
         gid,
+    }
+}
+
+/// Credentials stamped on an automatically authenticated socket message.
+/// Linux SCM credentials use the sender's real uid/gid, unlike SO_PEERCRED,
+/// which snapshots effective ids at connect time.
+pub fn current_scm_ucred() -> crate::socket::Ucred {
+    let task = current_task_id();
+    let ids = read_uidgid(task);
+    crate::socket::Ucred {
+        pid: task_to_pid_raw(task).unwrap_or(task) as u32,
+        uid: ids.uid,
+        gid: ids.gid,
     }
 }
 

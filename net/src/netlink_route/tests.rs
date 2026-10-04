@@ -734,6 +734,58 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
 }
 
 #[test]
+fn setlink_notification_reports_complete_post_mutation_link_state() {
+    fn discard(_: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    let name = "rtnl-link-event0";
+    crate::iface::register(name, [0x02, 0, 0, 0, 1, 2], discard);
+    assert!(crate::iface::set_link_metadata(name, true, None, None));
+    let ifindex = crate::iface::ifindex_of(name).unwrap();
+
+    // NetworkManager changes only IFF_UP. The multicast RTM_NEWLINK must be
+    // the kernel's full resulting view, not this intentionally sparse request.
+    let mut body = vec![0, 0];
+    body.extend_from_slice(&0u16.to_ne_bytes());
+    body.extend_from_slice(&(ifindex as i32).to_ne_bytes());
+    body.extend_from_slice(&IFF_UP.to_ne_bytes());
+    body.extend_from_slice(&IFF_UP.to_ne_bytes());
+    let request = frame_message(RTM_SETLINK, NLM_F_REQUEST | NLM_F_ACK, 100, 42, &body);
+
+    let cap = narf_capabilities::Cap::<crate::AdminCap, narf_capabilities::Invoke>::bootstrap();
+    let admin = crate::AdminHandle::new(cap, alloc::string::String::from(name));
+    let replies = build_replies_authorized(&request, Some(&admin)).unwrap();
+    let notifications = successful_mutation_notifications_in(0, &request, &replies);
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0].0, 1);
+
+    let message = &notifications[0].1;
+    let event = parse_hdr(message).unwrap();
+    assert_eq!(event.msg_type, RTM_NEWLINK);
+    assert_eq!(event.flags, 0);
+    assert_eq!(event.seq, 0);
+    assert_eq!(event.pid, 0);
+    let flags = u32::from_ne_bytes(message[24..28].try_into().unwrap());
+    assert_eq!(
+        flags & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP),
+        IFF_UP | IFF_RUNNING | IFF_LOWER_UP
+    );
+    assert_eq!(
+        find_rtattr(message, 16, IFLA_OPERSTATE).as_deref(),
+        Some(&[IF_OPER_UP][..])
+    );
+    assert_eq!(
+        find_rtattr(message, 16, IFLA_CARRIER).as_deref(),
+        Some(&[1][..])
+    );
+    assert_eq!(
+        find_rtattr(message, 16, IFLA_IFNAME).as_deref(),
+        Some(&b"rtnl-link-event0\0"[..])
+    );
+}
+
+#[test]
 fn strict_check_rejects_short_dump_and_accepts_typed_request() {
     // A strict dump's validation error is the NLMSG_DONE payload
     // (`netlink_dump_done`), not an NLMSG_ERROR.

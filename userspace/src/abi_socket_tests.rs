@@ -5281,6 +5281,7 @@ const NETLINK_ROUTE: u64 = 0;
 const NETLINK_KOBJECT_UEVENT: u64 = 15;
 const SOL_NETLINK: u64 = 270;
 const NETLINK_ADD_MEMBERSHIP: u64 = 1;
+const NETLINK_PKTINFO: u64 = 3;
 const NETLINK_EXT_ACK: u64 = 11;
 const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
 const SIOCINQ: u64 = 0x541B;
@@ -5610,6 +5611,102 @@ fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_netlink_reply_pid_matches_bound_port
+);
+
+/// sd-netlink enables NETLINK_PKTINFO without SO_PASSCRED and supplies exactly
+/// CMSG_SPACE(sizeof(struct nl_pktinfo)) = 24 bytes. Kernel credentials must
+/// not be inserted unconditionally ahead of packet info: doing so exhausts
+/// this buffer, erases the multicast group, and makes systemd-resolved discard
+/// every sequence-zero RTM_NEWLINK/RTM_NEWADDR notification as stray unicast.
+fn smoke_abi_netlink_pktinfo_without_passcred_fits_systemd_buffer() -> TestResult {
+    with_setup(|| {
+        const RTNLGRP_LINK: u32 = 1;
+        const IFF_UP: u32 = 1;
+        const MSG_CTRUNC: u32 = 0x8;
+
+        let monitor = open_netlink(NETLINK_ROUTE)?;
+        for (option, value) in [(NETLINK_ADD_MEMBERSHIP, RTNLGRP_LINK), (NETLINK_PKTINFO, 1)] {
+            let value = value.to_ne_bytes();
+            if call(
+                Syscall::SocketSetSockOpt.raw(),
+                SyscallArgs {
+                    arg0: monitor,
+                    arg1: SOL_NETLINK,
+                    arg2: option,
+                    arg3: value.as_ptr() as u64,
+                    arg4: value.len() as u64,
+                    arg5: 0,
+                },
+            ) != Some(0)
+            {
+                return Err("could not configure rtnetlink monitor");
+            }
+        }
+
+        let sender = open_netlink(NETLINK_ROUTE)?;
+        let mut set_link = [0u8; 32];
+        set_link[0..4].copy_from_slice(&32u32.to_ne_bytes());
+        set_link[4..6].copy_from_slice(&RTM_SETLINK.to_ne_bytes());
+        set_link[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+        set_link[8..12].copy_from_slice(&92u32.to_ne_bytes());
+        set_link[20..24].copy_from_slice(&1i32.to_ne_bytes()); // lo
+        set_link[24..28].copy_from_slice(&IFF_UP.to_ne_bytes());
+        set_link[28..32].copy_from_slice(&IFF_UP.to_ne_bytes());
+        if netlink_send(sender, &set_link) != Some(set_link.len() as i64) {
+            return Err("RTM_SETLINK did not send");
+        }
+
+        let mut name = [0u8; 12];
+        let mut payload = [0u8; 512];
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        // This is the exact buffer size in systemd's socket_recv_message().
+        let mut control = [0u8; 24];
+        let mut msg = [0u8; 56];
+        msg[..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(control.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(control.len() as u64).to_ne_bytes());
+
+        let n = call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(monitor, msg.as_mut_ptr() as u64, 0),
+        )
+        .ok_or("rtnetlink monitor recvmsg status")?;
+        if n < NLMSG_HDRLEN as i64 || nlmsg_type_of(&payload) != RTM_NEWLINK {
+            return Err("rtnetlink monitor did not receive RTM_NEWLINK");
+        }
+        if u32::from_ne_bytes(payload[8..12].try_into().unwrap()) != 0
+            || u32::from_ne_bytes(payload[12..16].try_into().unwrap()) != 0
+        {
+            return Err("multicast notification was not kernel-originated sequence zero");
+        }
+        if u32::from_ne_bytes(name[8..12].try_into().unwrap()) != 1 {
+            return Err("sockaddr_nl did not carry the link-group mask");
+        }
+        if u32::from_ne_bytes(msg[48..52].try_into().unwrap()) & MSG_CTRUNC != 0 {
+            return Err("24-byte nl_pktinfo buffer was spuriously truncated");
+        }
+        if u64::from_ne_bytes(msg[40..48].try_into().unwrap()) != 24
+            || u64::from_ne_bytes(control[..8].try_into().unwrap()) != 20
+            || i32::from_ne_bytes(control[8..12].try_into().unwrap()) != SOL_NETLINK as i32
+            || i32::from_ne_bytes(control[12..16].try_into().unwrap()) != NETLINK_PKTINFO as i32
+            || u32::from_ne_bytes(control[16..20].try_into().unwrap()) != RTNLGRP_LINK
+        {
+            return Err("recvmsg did not return the requested NETLINK_PKTINFO record");
+        }
+
+        let _ = call(Syscall::Close.raw(), a0(sender));
+        let _ = call(Syscall::Close.raw(), a0(monitor));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_pktinfo_without_passcred_fits_systemd_buffer
 );
 
 /// systemd PID 1 creates a route socket during early boot and sends this
@@ -8298,6 +8395,21 @@ fn smoke_abi_netlink_uevent_recvmsg_sender_and_creds() -> TestResult {
         {
             return Err("bind(NETLINK_KOBJECT_UEVENT) failed");
         }
+        let enabled = 1u32.to_ne_bytes();
+        if call(
+            Syscall::SocketSetSockOpt.raw(),
+            SyscallArgs {
+                arg0: fd,
+                arg1: SOL_SOCKET,
+                arg2: SO_PASSCRED,
+                arg3: enabled.as_ptr() as u64,
+                arg4: enabled.len() as u64,
+                arg5: 0,
+            },
+        ) != Some(0)
+        {
+            return Err("uevent monitor could not enable SO_PASSCRED");
+        }
         narf_filesystem::uevent::emit(
             narf_filesystem::uevent::UeventAction::Add,
             alloc::string::String::from("/devices/platform/narf-drm/card0"),
@@ -8530,6 +8642,127 @@ const NETLINK_AUDIT: u64 = 9;
 const NETLINK_SOCK_DIAG: u64 = 4;
 const NETLINK_NETFILTER: u64 = 12;
 const NETLINK_GENERIC: u64 = 16;
+
+/// A userspace netlink multicast must never acquire the kernel's uid-0
+/// identity merely because the receiver enabled SO_PASSCRED. Exercise group 5
+/// as well: sockaddr_nl reports its legacy mask (1 << 4), while
+/// NETLINK_PKTINFO reports the numeric group (5).
+fn smoke_abi_netlink_user_cred_and_group_metadata() -> TestResult {
+    with_setup(|| {
+        const GROUP: u32 = 5;
+        const GROUP_MASK: u32 = 1 << (GROUP - 1);
+        const UID: u64 = 1200;
+        const GID: u64 = 1300;
+
+        let sender = open_netlink(NETLINK_GENERIC)?;
+        let receiver = open_netlink(NETLINK_GENERIC)?;
+        let (listen_addr, listen_len) = netlink_sockaddr(GROUP_MASK);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(receiver, listen_addr.as_ptr() as u64, listen_len),
+        ) != Some(0)
+        {
+            return Err("netlink group-5 receiver bind failed");
+        }
+        let enabled = 1u32.to_ne_bytes();
+        for (level, option) in [(SOL_SOCKET, SO_PASSCRED), (SOL_NETLINK, NETLINK_PKTINFO)] {
+            if call(
+                Syscall::SocketSetSockOpt.raw(),
+                SyscallArgs {
+                    arg0: receiver,
+                    arg1: level,
+                    arg2: option,
+                    arg3: enabled.as_ptr() as u64,
+                    arg4: enabled.len() as u64,
+                    ..SyscallArgs::default()
+                },
+            ) != Some(0)
+            {
+                return Err("netlink receiver ancillary option failed");
+            }
+        }
+
+        // Automatic SCM credentials use REAL ids. Drop all three ids so the
+        // test also proves a user packet is not mislabeled as kernel/root.
+        if call(Syscall::Setresgid.raw(), a2(GID, GID, GID)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(UID, UID, UID)) != Some(0)
+        {
+            return Err("could not establish non-root netlink sender identity");
+        }
+        let payload = b"user-netlink";
+        let (destination, destination_len) = netlink_sockaddr(GROUP_MASK);
+        if call(
+            Syscall::SocketSend.raw(),
+            SyscallArgs {
+                arg0: sender,
+                arg1: payload.as_ptr() as u64,
+                arg2: payload.len() as u64,
+                arg4: destination.as_ptr() as u64,
+                arg5: destination_len,
+                ..SyscallArgs::default()
+            },
+        ) != Some(payload.len() as i64)
+        {
+            return Err("userspace netlink multicast send failed");
+        }
+
+        let mut name = [0u8; 12];
+        let mut data = [0u8; 32];
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(data.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..].copy_from_slice(&(data.len() as u64).to_ne_bytes());
+        let mut control = [0u8; 64];
+        let mut msg = [0u8; 56];
+        msg[..8].copy_from_slice(&(name.as_mut_ptr() as u64).to_ne_bytes());
+        msg[8..12].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(control.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(control.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(receiver, msg.as_mut_ptr() as u64, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("userspace netlink recvmsg failed");
+        }
+        if &data[..payload.len()] != payload
+            || u32::from_ne_bytes(name[8..12].try_into().unwrap()) != GROUP_MASK
+        {
+            return Err("userspace netlink payload/source group mask was wrong");
+        }
+        if u32::from_ne_bytes(msg[48..52].try_into().unwrap()) != 0
+            || u64::from_ne_bytes(msg[40..48].try_into().unwrap()) != 56
+        {
+            return Err("userspace netlink ancillary data was truncated");
+        }
+
+        // Linux order: NETLINK_PKTINFO (24 bytes) then SCM_CREDENTIALS
+        // (32 bytes). pktinfo.group is numeric, not the sockaddr mask.
+        if i32::from_ne_bytes(control[8..12].try_into().unwrap()) != SOL_NETLINK as i32
+            || i32::from_ne_bytes(control[12..16].try_into().unwrap()) != NETLINK_PKTINFO as i32
+            || u32::from_ne_bytes(control[16..20].try_into().unwrap()) != GROUP
+        {
+            return Err("NETLINK_PKTINFO did not report numeric group 5 first");
+        }
+        if i32::from_ne_bytes(control[32..36].try_into().unwrap()) != SOL_SOCKET as i32
+            || i32::from_ne_bytes(control[36..40].try_into().unwrap()) != SCM_CREDENTIALS
+        {
+            return Err("userspace netlink did not attach SCM_CREDENTIALS second");
+        }
+        let cred_pid = u32::from_ne_bytes(control[40..44].try_into().unwrap());
+        let cred_uid = u32::from_ne_bytes(control[44..48].try_into().unwrap());
+        let cred_gid = u32::from_ne_bytes(control[48..52].try_into().unwrap());
+        if cred_pid == 0 || cred_uid != UID as u32 || cred_gid != GID as u32 {
+            return Err("userspace netlink credentials were replaced with kernel/root identity");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_user_cred_and_group_metadata
+);
 
 fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {
     with_setup(|| {

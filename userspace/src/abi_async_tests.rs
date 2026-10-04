@@ -1627,6 +1627,76 @@ fn smoke_abi_async_inotify_fire_create() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fire_create);
 
+/// A pathname AF_UNIX bind creates an S_IFSOCK inode and must deliver the
+/// same IN_CREATE event as every other filesystem-node creation.  systemd's
+/// `sd_bus_set_watch_bind()` relies on this edge while waiting for
+/// `/run/dbus/system_bus_socket` to appear.
+fn smoke_abi_async_inotify_fire_unix_socket_bind() -> TestResult {
+    with_memfs("/ino", "ino", &[], || {
+        let (ifd, wd) = watch(b"/ino\0", IN_CREATE)?;
+        let fd = match call(Syscall::SocketOpen.raw(), a2(1, 1, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_UNIX, SOCK_STREAM) failed"),
+        };
+        let path = b"/ino/system_bus_socket";
+        let mut addr = [0u8; 128];
+        addr[..2].copy_from_slice(&1u16.to_le_bytes());
+        addr[2..2 + path.len()].copy_from_slice(path);
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(fd, addr.as_ptr() as u64, (2 + path.len()) as u64),
+        ) != Some(0)
+        {
+            return Err("pathname AF_UNIX bind failed");
+        }
+        let evs = read_events(ifd);
+        match evs.first() {
+            Some(e)
+                if e.wd == wd
+                    && e.mask & IN_CREATE as u32 != 0
+                    && e.name == "system_bus_socket" =>
+            {
+                Ok(())
+            }
+            _ => Err("AF_UNIX bind did not deliver IN_CREATE"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_fire_unix_socket_bind
+);
+
+/// Watch identity follows the resolved filesystem node, not the spelling the
+/// caller used.  A chrooted task names `/`, while mutation notifiers name that
+/// same directory by its host-view path.
+fn smoke_abi_async_inotify_chroot_resolved_identity() -> TestResult {
+    with_memfs("/ino-root", "ino-root", &[], || {
+        if !crate::handlers::install_root_dir(FAKE_TASK, "/ino-root") {
+            return Err("chroot fixture setup failed");
+        }
+        let result = (|| {
+            let (ifd, wd) = watch(b"/\0", IN_CREATE)?;
+            if call_open(c"/child".as_ptr() as u64, O_CREAT | O_WRONLY).is_none() {
+                return Err("chrooted create open failed");
+            }
+            let evs = read_events(ifd);
+            match evs.first() {
+                Some(e) if e.wd == wd && e.mask & IN_CREATE as u32 != 0 && e.name == "child" => {
+                    Ok(())
+                }
+                _ => Err("chrooted mutation did not reach its inotify watch"),
+            }
+        })();
+        crate::handlers::__test_root_dir_reset();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_inotify_chroot_resolved_identity
+);
+
 // (b) modify a watched file → IN_MODIFY on the watched file (no name).
 fn smoke_abi_async_inotify_fire_modify() -> TestResult {
     with_memfs("/ino", "ino", &[("f", b"....")], || {

@@ -11073,44 +11073,42 @@ fn parse_scm_rights_fds(
     Ok(out)
 }
 
-/// Install kernel-sender credentials and, when requested through
-/// `NETLINK_PKTINFO`, the multicast group associated with this datagram.
-fn install_netlink_ancillary(msg_ptr: u64, pktinfo_group: Option<u32>) {
+/// Install the netlink receive control messages the socket requested.
+/// Netlink datagrams carry their authenticated sender credential only when
+/// `SO_PASSCRED` is enabled: kernel-originated records use the translated
+/// kernel identity, while user-originated records use their queued send-time
+/// identity. `NETLINK_PKTINFO` independently carries the numeric multicast
+/// group. Keeping those options independent is load-bearing for sd-netlink,
+/// which allocates room for only `nl_pktinfo` when it did not request
+/// credentials.
+fn install_netlink_ancillary(
+    msg_ptr: u64,
+    cred: Option<crate::socket::Ucred>,
+    pktinfo_group: Option<u32>,
+) -> bool {
     const SOL_SOCKET: i32 = 1;
     const SCM_CREDENTIALS: i32 = 2;
     const SOL_NETLINK: i32 = 270;
     const NETLINK_PKTINFO: i32 = 3;
-    let ctrl_ptr = read_user_u64(msg_ptr + 32);
-    let ctrl_len = read_user_u64(msg_ptr + 40) as usize;
-    let mut ctrl = alloc::vec::Vec::new();
-    let push_cmsg = |ctrl: &mut alloc::vec::Vec<u8>, level: i32, kind: i32, payload: &[u8]| {
-        let len = 16 + payload.len();
-        ctrl.extend_from_slice(&(len as u64).to_le_bytes());
-        ctrl.extend_from_slice(&level.to_le_bytes());
-        ctrl.extend_from_slice(&kind.to_le_bytes());
-        ctrl.extend_from_slice(payload);
-        while ctrl.len() % 8 != 0 {
-            ctrl.push(0);
-        }
-    };
-    push_cmsg(&mut ctrl, SOL_SOCKET, SCM_CREDENTIALS, &[0u8; 12]);
+    let mut records = alloc::vec::Vec::new();
+    // Linux netlink_recvmsg emits protocol-specific NETLINK_PKTINFO before
+    // the common SCM credential record. The order determines which record a
+    // short control buffer preserves.
     if let Some(group) = pktinfo_group {
-        push_cmsg(
-            &mut ctrl,
+        records.push((
             SOL_NETLINK,
             NETLINK_PKTINFO,
-            &group.to_ne_bytes(),
-        );
+            group.to_ne_bytes().to_vec(),
+        ));
     }
-    if ctrl_ptr == 0 || ctrl_len < ctrl.len() {
-        // SAFETY: 8-byte write to msg_controllen; copy_to_user range-checks + SMAP.
-        let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
-        return;
+    if let Some(cred) = cred {
+        let mut data = alloc::vec::Vec::with_capacity(12);
+        data.extend_from_slice(&cred.pid.to_ne_bytes());
+        data.extend_from_slice(&cred.uid.to_ne_bytes());
+        data.extend_from_slice(&cred.gid.to_ne_bytes());
+        records.push((SOL_SOCKET, SCM_CREDENTIALS, data));
     }
-    // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
-    let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
-    // SAFETY: 8-byte write to msg_controllen at msg_ptr+40.
-    let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
+    put_cmsgs(msg_ptr, &records)
 }
 
 fn install_ipv6_ancillary(

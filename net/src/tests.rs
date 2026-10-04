@@ -8470,6 +8470,40 @@ kernel_test_in!(
     smoke_iface_register_allocates_name_and_stable_ifindex
 );
 
+/// The compatibility views must consume real interface accounting rather
+/// than rendering zero-filled stand-ins. Exercise the common RX/TX paths and
+/// confirm the registry snapshot observes the exact traffic.
+fn smoke_iface_counters_follow_live_traffic() -> TestResult {
+    let name = crate::iface::register("nrfstats%d", [0x02, 0, 0, 0, 0x5a, 1], |_| Ok(()));
+    let Some(iface) = crate::iface::lookup(&name) else {
+        return TestResult::Fail("registered statistics device not found");
+    };
+    let tx = [0xabu8; 64];
+    if iface.xmit(&tx).is_err() {
+        return TestResult::Fail("statistics-device transmit failed");
+    }
+    let mut rx = [0u8; 72];
+    rx[..6].copy_from_slice(&[0x01, 0x00, 0x5e, 0, 0, 1]);
+    crate::iface::on_rx_frame_from(&name, &mut rx);
+
+    let Some(stats) = crate::iface::snapshot_counters()
+        .into_iter()
+        .find(|stats| stats.name == name)
+    else {
+        return TestResult::Fail("statistics snapshot omitted the device");
+    };
+    if stats.tx_packets != 1
+        || stats.tx_bytes != tx.len() as u64
+        || stats.rx_packets != 1
+        || stats.rx_bytes != rx.len() as u64
+        || stats.rx_multicast != 1
+    {
+        return TestResult::Fail("interface counters did not follow RX/TX traffic");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_iface_counters_follow_live_traffic);
+
 /// A NIC registers like Linux `register_netdevice`: down (no IFF_UP in the
 /// link dump) and with no IPv4 address, so NetworkManager finds it
 /// unconfigured and manages it (DHCP) instead of adopting a pre-set address
@@ -8509,6 +8543,17 @@ fn smoke_iface_registers_down_and_unconfigured() -> TestResult {
     }
     if !crate::iface::set_link_state(&name, true) {
         return TestResult::Fail("could not bring the device up");
+    }
+    if link_flags(&name).map(|f| f & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP)) != Some(IFF_UP) {
+        return TestResult::Fail("admin-up without carrier must report only IFF_UP");
+    }
+    if !crate::iface::set_link_metadata(
+        &name,
+        true,
+        Some(1000),
+        Some(crate::iface::LinkDuplex::Full),
+    ) {
+        return TestResult::Fail("could not publish physical link metadata");
     }
     if link_flags(&name).map(|f| f & (IFF_UP | IFF_RUNNING | IFF_LOWER_UP))
         != Some(IFF_UP | IFF_RUNNING | IFF_LOWER_UP)

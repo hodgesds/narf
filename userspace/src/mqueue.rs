@@ -1396,10 +1396,15 @@ pub fn sys_inotify_add_watch(ctx: &mut dyn TrapContext) {
         ctx.set_return(err(errno));
         return;
     }
-    // Watches are keyed by the caller-view absolute path (events are
-    // dispatched by absolute path), so `f`, `./f` and `/cwd/f` name one
-    // watch the way they name one inode on Linux.
-    let path = found.user_path;
+    // Mutation hooks dispatch host-view absolute paths after applying the
+    // caller's chroot. Key the watch by that same resolved identity so a task
+    // watching `/run` inside a chroot receives changes published as
+    // `<root>/run/...`. Relative and absolute spellings still collapse to the
+    // same key through `user_path_lookup`.
+    let mut path = found.path;
+    while path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
     let wd = with_inotify(|m| {
         let st = m.get_mut(&id)?;
         // Re-adding an already-watched path returns the existing wd and

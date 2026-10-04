@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "bd432d66ea10cb07244d67fb76feb9e03d378a3ccaaedca52ef97e8da0f99c8a"
+prompt_hash = "c11541a900954ca689c6153a21d1be15c789edc0f5d84425a61565ee5ef29fb1"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -218,6 +218,10 @@ argument = "The placement helper selects only already-online scheduler CPUs and 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Runtime affinity changes remain inside the existing scheduler TCB and change only a live task's allowed online CPU set. The task retains its TaskId, address space, domain, capabilities, saved protection-key state, and dedicated kernel stack across the cooperative requeue."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The frame networking bridge copies only driver-published scalar interface, counter, and PCI identity metadata into read-only sysfs nodes, then emits canonical device-add notifications before PID 1 starts. It transfers no packet payload, userspace pointer, physical address, frame ownership, capability, domain right, or scheduling authority; removing the earlier Stage::Late registration only delays publication until the authoritative interface inventory and hooks exist."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
