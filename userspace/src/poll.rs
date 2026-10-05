@@ -539,33 +539,63 @@ pub(crate) fn install_poll_files(task_id: u64, fds: &[PollFd]) {
     }
 }
 
+/// Result of arming a poll set's durable readiness cells.
+///
+/// `all_armed` is true only when every live descriptor is protected by a
+/// cell's arm-vs-set lock. In that case the generic I/O waiter is redundant
+/// and harmful: its broadcast wake re-executes this poll on every unrelated
+/// readiness transition. A set containing even one legacy descriptor keeps
+/// the generic waiter so that descriptor cannot strand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadinessArms {
+    pub(crate) any_ready: bool,
+    pub(crate) all_armed: bool,
+}
+
+impl ReadinessArms {
+    const NONE: Self = Self {
+        any_ready: false,
+        all_armed: false,
+    };
+}
+
 /// Arm every polled fd that owns a durable [`Readiness`](narf_lib::readiness::Readiness)
 /// cell (`FileOps::readiness()`), keyed by this task id, so a readiness edge on
-/// it wakes THIS poll directly via the cell's `set` instead of the coarse
-/// backstop. Returns `true` if any such fd was ALREADY ready at arm time — the
-/// register-then-recheck that closes the `poll_scan` → arm lost-wake window; the
-/// caller must then NOT park. A no-op returning `false` for descriptors still on
-/// the legacy path (`readiness() == None`), so a partially-migrated tree parks
-/// exactly as before.
-fn arm_readiness_cells(task_id: u64, fds: &[PollFd], waker: &core::task::Waker) -> bool {
+/// it wakes THIS poll directly via the cell's `set` instead of the generic I/O
+/// waiter. `any_ready` is the register-then-recheck result: the caller must not
+/// park when it is true. `all_armed` distinguishes a fully durable set from a
+/// mixed set that still needs the legacy wake path.
+pub(crate) fn arm_readiness_cells(
+    task_id: u64,
+    fds: &[PollFd],
+    waker: &core::task::Waker,
+) -> ReadinessArms {
     fd::with_table(task_id, |t| {
         let mut any_ready = false;
+        let mut all_armed = true;
         for pfd in fds {
             if pfd.fd < 0 {
                 continue;
             }
-            if let Some(e) = t.get(pfd.fd as u32) {
+            let armed = t.get(pfd.fd as u32).and_then(|e| {
                 let interest = (pfd.events as u32) | POLL_ERR | POLL_HUP | POLL_NVAL;
-                if let Some(poll) = e.ops.arm_readiness(task_id, interest, waker) {
+                e.ops.arm_readiness(task_id, interest, waker)
+            });
+            match armed {
+                Some(poll) => {
                     if poll.is_ready() {
                         any_ready = true;
                     }
                 }
+                None => all_armed = false,
             }
         }
-        any_ready
+        ReadinessArms {
+            any_ready,
+            all_armed,
+        }
     })
-    .unwrap_or(false)
+    .unwrap_or(ReadinessArms::NONE)
 }
 
 /// Remove this task's registration from every polled fd's Readiness cell.
@@ -696,6 +726,7 @@ pub(crate) fn poll_wait_kernel(
     // SAFETY: current_user_task returned this live context for the trap.
     let uctx = unsafe { &*uctx_ptr };
     uctx.net_io_wait.store(false, Ordering::Release);
+    uctx.durable_io_wait.store(false, Ordering::Release);
     uctx.epoll_park_gen
         .store(narf_net::readiness::generation(), Ordering::Release);
     uctx.signal_park_gen.store(
@@ -766,18 +797,27 @@ pub(crate) fn poll_wait_kernel(
         }
     };
 
-    if let Some(waker) = narf_scheduler::stackful::current_stackful_waker() {
-        if arm_readiness_cells(task_id, fds, &waker) {
-            disarm_readiness_cells(task_id, fds);
-            let ready = poll_scan(task_id, fds);
-            if ready != 0 {
-                finish_kernel_poll_wait(task_id, fds, uctx);
-                return KernelPollWait::Ready { deadline_ns };
-            }
+    let mut arms = if let Some(waker) = narf_scheduler::stackful::current_stackful_waker() {
+        arm_readiness_cells(task_id, fds, &waker)
+    } else {
+        ReadinessArms::NONE
+    };
+    if arms.any_ready {
+        disarm_readiness_cells(task_id, fds);
+        let ready = poll_scan(task_id, fds);
+        if ready != 0 {
+            finish_kernel_poll_wait(task_id, fds, uctx);
+            return KernelPollWait::Ready { deadline_ns };
         }
+        // The recheck consumed no event, and we just disarmed every cell.
+        // Fall back to the legacy wake source for this cycle; advertising a
+        // durable wait here would let park sleep with no cell registration.
+        arms = ReadinessArms::NONE;
     }
 
     uctx.net_io_wait.store(true, Ordering::Release);
+    uctx.durable_io_wait
+        .store(arms.all_armed, Ordering::Release);
     record_poll_wait(uctx, fds);
     if let Some(timer_deadline) = poll_nearest_deadline(task_id, fds) {
         let current = uctx.sleep_deadline_ns.load(Ordering::Acquire);
@@ -901,6 +941,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     // SAFETY: in-flight task's UserTaskCtx, live for this trap; atomics.
     unsafe {
         (*uctx_ptr).net_io_wait.store(false, Ordering::Release);
+        (*uctx_ptr).durable_io_wait.store(false, Ordering::Release);
         (*uctx_ptr)
             .epoll_park_gen
             .store(narf_net::readiness::generation(), Ordering::Release);
@@ -1034,26 +1075,30 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         // park — disarm, re-scan, and return, exactly like the epoll
         // ready-after-registration path. No-op while no fd has migrated
         // (`readiness()` still `None` everywhere → `any_ready == false`).
-        if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
-            if arm_readiness_cells(task, &fds, &w) {
-                disarm_readiness_cells(task, &fds);
-                // SAFETY: clearing this task's own park deadlines.
-                unsafe {
-                    (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
-                    (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
-                    clear_poll_wait_record(task, &*uctx_ptr);
-                }
-                let n = poll_scan(task, &mut fds);
-                // SAFETY: same pointer/length as the parse step.
-                unsafe { write_pollfds(ptr, &fds) };
-                ctx.set_return(SyscallReturn::ok(n as u64));
-                return;
+        let arms = if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
+            arm_readiness_cells(task, &fds, &w)
+        } else {
+            ReadinessArms::NONE
+        };
+        if arms.any_ready {
+            disarm_readiness_cells(task, &fds);
+            // SAFETY: clearing this task's own park deadlines.
+            unsafe {
+                (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                clear_poll_wait_record(task, &*uctx_ptr);
             }
+            let n = poll_scan(task, &mut fds);
+            // SAFETY: same pointer/length as the parse step.
+            unsafe { write_pollfds(ptr, &fds) };
+            ctx.set_return(SyscallReturn::ok(n as u64));
+            return;
         }
         // SAFETY: in-flight task's UserTaskCtx; we park exactly this task.
         unsafe {
             let uc = &*uctx_ptr;
             uc.net_io_wait.store(true, Ordering::Release);
+            uc.durable_io_wait.store(arms.all_armed, Ordering::Release);
             // Record the parked fd set for the stall watchdog (the poll twin
             // of `epoll_wait_fd`) so a wedged poller's readiness can be
             // re-evaluated from the watchdog tick. Refreshed on every

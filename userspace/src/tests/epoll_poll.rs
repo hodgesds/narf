@@ -4418,6 +4418,150 @@ fn smoke_poll_holds_files_across_sibling_close() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_poll_holds_files_across_sibling_close);
 
+/// A fully cell-backed poll set must be identifiable as durable so the park
+/// path can avoid joining the global I/O-waker herd. A mixed set must not take
+/// that fast path: its legacy descriptor still needs the generic wake channel.
+///
+/// Regression for the CachyOS KWin loop, where cell arms were installed but
+/// their coverage was discarded. The resulting poll registered both the cells
+/// and the broadcast I/O waiter, so unrelated readiness activity re-executed a
+/// zero-ready poll millions of times per second.
+fn smoke_poll_readiness_arm_coverage_preserves_legacy_wakes() -> TestResult {
+    use alloc::sync::Arc;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    #[derive(Debug)]
+    struct LegacyFile;
+    impl narf_filesystem::FileOps for LegacyFile {
+        fn read<'a>(
+            &'a self,
+            _off: u64,
+            _buf: &'a mut [u8],
+        ) -> narf_filesystem::FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> narf_filesystem::Stat {
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    struct CellBackedFile {
+        readiness: narf_lib::readiness::Readiness,
+    }
+    impl core::fmt::Debug for CellBackedFile {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("CellBackedFile")
+        }
+    }
+    impl narf_filesystem::FileOps for CellBackedFile {
+        fn read<'a>(
+            &'a self,
+            _off: u64,
+            _buf: &'a mut [u8],
+        ) -> narf_filesystem::FsFuture<'a, usize> {
+            alloc::boxed::Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _off: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
+            let n = buf.len();
+            alloc::boxed::Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> narf_filesystem::Stat {
+            narf_filesystem::Stat {
+                size: 0,
+                blocks: 0,
+                mode: narf_filesystem::Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+        fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+            Some(&self.readiness)
+        }
+    }
+
+    unsafe fn clone_noop(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)
+    }
+    unsafe fn noop(_: *const ()) {}
+    static NOOP_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(clone_noop, noop, noop, noop);
+    // SAFETY: NOOP_WAKER_VTABLE's clone/drop callbacks never dereference its
+    // null data pointer, and the owned Waker is dropped before this test exits.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_WAKER_VTABLE)) };
+
+    crate::fd::__test_reset();
+    const TID: u64 = 0xFACE_A004;
+    let _task = crate::task::Task::new_registered(TID, TID);
+    let Some(cell_fd) = crate::fd::install(
+        TID,
+        crate::fd::FdEntry {
+            ops: Arc::new(CellBackedFile {
+                readiness: narf_lib::readiness::Readiness::new(0),
+            }),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        },
+    ) else {
+        crate::task::release_task(TID);
+        crate::fd::__test_reset();
+        return TestResult::Fail("could not install the cell-backed poll fd");
+    };
+    let Some(legacy_fd) = crate::fd::install(
+        TID,
+        crate::fd::FdEntry {
+            ops: Arc::new(LegacyFile),
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        },
+    ) else {
+        crate::task::release_task(TID);
+        crate::fd::__test_reset();
+        return TestResult::Fail("could not install the legacy poll fd");
+    };
+
+    let durable = [crate::poll::PollFd {
+        fd: cell_fd as i32,
+        events: narf_filesystem::POLL_IN as u16,
+        revents: 0,
+    }];
+    let durable_arms = crate::poll::arm_readiness_cells(TID, &durable, &waker);
+
+    let mixed = [
+        durable[0],
+        crate::poll::PollFd {
+            fd: legacy_fd as i32,
+            events: narf_filesystem::POLL_IN as u16,
+            revents: 0,
+        },
+    ];
+    let mixed_arms = crate::poll::arm_readiness_cells(TID, &mixed, &waker);
+
+    crate::task::release_task(TID);
+    crate::fd::__test_reset();
+    if durable_arms.any_ready || !durable_arms.all_armed {
+        return TestResult::Fail("a pending cell-backed poll set was not recognized as durable");
+    }
+    if mixed_arms.any_ready || mixed_arms.all_armed {
+        return TestResult::Fail(
+            "a poll set with a legacy fd incorrectly skipped the generic wake path",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_poll_readiness_arm_coverage_preserves_legacy_wakes
+);
+
 /// `poll::installed_poll_files_ready` is the authoritative park re-check that
 /// REPLACED the coarse global readiness-generation compare for a non-epoll
 /// `poll(2)`/`select` waiter. It must be EXACT per-fd: report ready iff one of
