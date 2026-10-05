@@ -812,3 +812,127 @@ fn smoke_nl80211_wpa3_sae_connect() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("wireless/nl80211", smoke_nl80211_wpa3_sae_connect);
+
+// A CONNECT targeting a different BSS of the current ESS must route through
+// roam() and surface an NL80211_CMD_ROAM (47) event, not CONNECT (46).
+const ROAM_NAME: &str = "wlan-roam";
+const ROAM_NEW_BSSID: [u8; 6] = [2, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb];
+struct RoamStub {
+    rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+}
+impl Interface for RoamStub {
+    fn name(&self) -> &str {
+        ROAM_NAME
+    }
+    fn mac(&self) -> [u8; 6] {
+        [2, 0, 0, 0, 0, 2]
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        true
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx
+    }
+}
+#[async_trait::async_trait]
+impl crate::WirelessNetIface for RoamStub {
+    fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
+        crate::WirelessIfaceInfo {
+            base_name: ROAM_NAME.into(),
+            base_mac: self.mac(),
+            bands: Vec::new(),
+            modes: crate::iface::WirelessModes::STATION,
+            hw_caps: crate::iface::HwCaps {
+                ht_supported: false,
+                vht_supported: false,
+                he_supported: false,
+                eht_supported: false,
+            },
+        }
+    }
+    // Already associated to another BSS of this ESS.
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        Some([2, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa])
+    }
+    async fn scan(
+        &self,
+        _: crate::ScanRequest,
+    ) -> Result<Vec<crate::BssInfo>, crate::WirelessError> {
+        Ok(alloc::vec![crate::BssInfo {
+            bssid: ROAM_NEW_BSSID,
+            ssid: b"roam-net".to_vec(),
+            channel: 36,
+            rssi: -40,
+            security: crate::scan::BssSecurity::Open,
+        }])
+    }
+    // associate() must NOT be used for a roam; fail loudly if it is.
+    async fn associate(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::HardwareError)
+    }
+    async fn roam(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    async fn disassociate(&self) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    async fn set_config(&self, _: crate::WirelessConfig) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+}
+
+fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
+    use narf_net::netlink_generic::install_event_sink;
+    super::register();
+    let _restore = SinkRestore(install_event_sink(interop_sink));
+    let iface: Arc<dyn crate::WirelessNetIface> = Arc::new(RoamStub {
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    });
+    narf_net::iface::register(ROAM_NAME, iface.mac(), |_| Ok(()));
+    crate::registry::register(iface.clone());
+    let ifindex = match narf_net::netlink_route::ifindex_for_name(ROAM_NAME) {
+        Some(index) => index,
+        None => return TestResult::Fail("roam iface has no ifindex"),
+    };
+    CACHE.lock().retain(|c| c.name != ROAM_NAME);
+    CACHE.lock().push(Cache {
+        name: ROAM_NAME.into(),
+        namespace: 0,
+        busy: true,
+        results: Vec::new(),
+    });
+    INTEROP_EVENTS.lock().clear();
+    narf_scheduler::block_on_spin(execute(
+        iface.clone(),
+        narf_net::kernel_admin(ROAM_NAME).unwrap(),
+        0,
+        ifindex,
+        Operation::Connect {
+            ssid: b"roam-net".to_vec(),
+            bssid: None,
+            channel: None,
+            cred: Credential::Open,
+        },
+    ));
+    let roamed = INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {
+        *ns == 0
+            && *group == 19
+            && msg.get(16) == Some(&47) // NL80211_CMD_ROAM
+            && find_attr(&msg[20..], 72) == Some(&0u16.to_ne_bytes()[..])
+            && find_attr(&msg[20..], 6) == Some(&ROAM_NEW_BSSID[..])
+    });
+    CACHE.lock().retain(|c| c.name != ROAM_NAME);
+    if !roamed {
+        return TestResult::Fail("CONNECT to a new BSS did not emit a ROAM event");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("wireless/nl80211", smoke_nl80211_connect_to_new_bss_roams);
