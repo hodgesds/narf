@@ -4,7 +4,7 @@
 use super::connection::{Beacon, Connection};
 use super::{runtime::Hardware, scan_api, station_api};
 use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_ipc::{Consumer, Producer};
 use narf_lib::{mutex::Mutex, sync::IrqSafeSpinLock};
 use narf_net::{Frame, Interface, RX_RING_N, TX_RING_N};
@@ -23,6 +23,10 @@ pub struct Device {
     firmware: Vec<u8>,
     pnvm: Option<Vec<u8>>,
     up: AtomicBool,
+    /// Current association BSSID, cached for a lock-free sync read by the
+    /// control plane (bit 63 = associated, low 48 bits = BSSID LE). Lets a
+    /// CONNECT to a different BSS of the same ESS be routed as a roam.
+    bssid: AtomicU64,
     rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
     tx: [IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>; 4],
 }
@@ -85,6 +89,7 @@ impl Device {
             firmware: firmware.to_vec(),
             pnvm: parsed.api.pnvm.map(|bytes| bytes.to_vec()),
             up: AtomicBool::new(false),
+            bssid: AtomicU64::new(0),
             rx: IrqSafeSpinLock::new(None),
             tx: core::array::from_fn(|_| IrqSafeSpinLock::new(None)),
         }))
@@ -186,9 +191,26 @@ impl Device {
     fn set_link(&self, up: bool) {
         let was_up = self.up.swap(up, Ordering::AcqRel);
         narf_net::iface::set_link_state(self.name(), up);
+        if !up {
+            self.bssid.store(0, Ordering::Release);
+        }
         if was_up && !up {
             narf_wireless::nl80211::notify_disconnect(self.name(), 1);
         }
+    }
+
+    /// Cache the associated BSSID for a lock-free `connected_bssid` read.
+    fn store_bssid(&self, bssid: [u8; 6]) {
+        let mut packed = 1u64 << 63;
+        for (i, byte) in bssid.iter().enumerate() {
+            packed |= (*byte as u64) << (8 * i);
+        }
+        self.bssid.store(packed, Ordering::Release);
+    }
+
+    fn cached_bssid(&self) -> Option<[u8; 6]> {
+        let packed = self.bssid.load(Ordering::Acquire);
+        (packed & (1 << 63) != 0).then(|| core::array::from_fn(|i| (packed >> (8 * i)) as u8))
     }
 
     /// Nonblocking drain used both by the executor and synchronous IP
@@ -655,6 +677,7 @@ impl WirelessNetIface for Device {
         // Cancellation leaves this set. The pump fails closed rather
         // than driving partially configured station/queue state.
         state.needs_reset = true;
+        let bssid = request.bssid;
         match Connection::associate(
             &mut state.hardware,
             self.mac,
@@ -662,12 +685,14 @@ impl WirelessNetIface for Device {
             auth,
             self.tx_chains,
             self.phy,
+            None,
         )
         .await
         {
             Ok(connection) => {
                 state.connection = Some(connection);
                 state.needs_reset = false;
+                self.store_bssid(bssid);
                 self.set_link(true);
                 Ok(())
             }
@@ -696,6 +721,77 @@ impl WirelessNetIface for Device {
             state.needs_reset = false;
         }
         Ok(())
+    }
+
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        self.cached_bssid()
+    }
+
+    async fn roam(&self, request: AssociateRequest) -> Result<(), WirelessError> {
+        use super::connection::AuthMethod;
+        if request.ssid.len() > 32 || request.bssid[0] & 1 != 0 {
+            return Err(WirelessError::InvalidArgs);
+        }
+        let auth = match request.security {
+            narf_wireless::SecurityConfig::Open => AuthMethod::Open,
+            narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
+            narf_wireless::SecurityConfig::Wpa3 { password } => AuthMethod::Wpa3Sae { password },
+        };
+        let mut state = self.state.lock().await;
+        // Roaming requires an existing association to reassociate away from.
+        let Some(old) = state.connection.take() else {
+            return Err(WirelessError::InvalidArgs);
+        };
+        let current_ap = old.beacon.bssid;
+        if current_ap == request.bssid {
+            // Already on the requested BSS — restore and report success.
+            state.connection = Some(old);
+            return Ok(());
+        }
+        let beacon = match state.beacons.iter().find(|b| {
+            b.bssid == request.bssid
+                && b.ssid == request.ssid
+                && b.channel as u32 == request.channel
+        }) {
+            Some(beacon) => beacon.clone(),
+            None => {
+                // Target not in the scan cache: keep the current link.
+                state.connection = Some(old);
+                return Err(WirelessError::InvalidArgs);
+            }
+        };
+        // Tear down the old firmware state/keys, then reassociate to the new
+        // BSS (Reassociation Request carries the previous AP address). The
+        // netdev link stays up across the transition — no disconnect event.
+        state.needs_reset = true;
+        let _ = old.disconnect(&mut state.hardware).await;
+        let bssid = request.bssid;
+        match Connection::associate(
+            &mut state.hardware,
+            self.mac,
+            beacon,
+            auth,
+            self.tx_chains,
+            self.phy,
+            Some(current_ap),
+        )
+        .await
+        {
+            Ok(connection) => {
+                state.connection = Some(connection);
+                state.needs_reset = false;
+                self.store_bssid(bssid);
+                self.set_link(true);
+                Ok(())
+            }
+            Err(error) => {
+                use core::fmt::Write;
+                let _ = writeln!(narf_console::Writer, "iwlwifi: roam failed: {}", error);
+                state.hardware.fail();
+                self.set_link(false);
+                Err(WirelessError::HardwareError)
+            }
+        }
     }
 
     async fn set_config(&self, config: WirelessConfig) -> Result<(), WirelessError> {

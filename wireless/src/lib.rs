@@ -90,6 +90,19 @@ pub trait WirelessNetIface: Interface {
     /// Disconnects from the current Access Point.
     async fn disassociate(&self) -> Result<(), WirelessError>;
 
+    /// BSSID of the current association, if any. Lets the control plane route
+    /// a connect request targeting a different BSS of the same ESS as a roam.
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        None
+    }
+
+    /// Reassociate (roam) to a new BSS of the current ESS, preserving the
+    /// interface. Defaults to unsupported; drivers that can reassociate
+    /// override this.
+    async fn roam(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
     /// Configures PHY-level parameters.
     async fn set_config(&self, cfg: WirelessConfig) -> Result<(), WirelessError>;
 }

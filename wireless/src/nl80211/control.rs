@@ -17,6 +17,7 @@ const EBUSY: i32 = 16;
 const SCAN: u8 = 33;
 const GET_SCAN: u8 = 32;
 const CONNECT: u8 = 46;
+const ROAM: u8 = 47;
 const DISCONNECT: u8 = 48;
 
 struct Cache {
@@ -398,6 +399,7 @@ async fn execute(
         } => {
             let akm = cred.akm();
             let mut selected = None;
+            let mut roaming = false;
             let result = async {
                 if !live {
                     return Err(crate::WirelessError::Denied);
@@ -448,14 +450,22 @@ async fn execute(
                         password: (**password).clone(),
                     },
                 };
-                iface
-                    .associate(crate::AssociateRequest {
-                        ssid,
-                        bssid: bss.bssid,
-                        channel: bss.channel,
-                        security,
-                    })
-                    .await
+                let request = crate::AssociateRequest {
+                    ssid,
+                    bssid: bss.bssid,
+                    channel: bss.channel,
+                    security,
+                };
+                // Already associated to a different BSS of this ESS → roam
+                // (reassociate) rather than a fresh connect.
+                roaming = iface
+                    .connected_bssid()
+                    .is_some_and(|current| current != bss.bssid);
+                if roaming {
+                    iface.roam(request).await
+                } else {
+                    iface.associate(request).await
+                }
             }
             .await;
             let still_live = authorized(&admin, iface.as_ref(), ns);
@@ -467,7 +477,14 @@ async fn execute(
                 push_attr(&mut attrs, 6, &address);
             }
             push_attr(&mut attrs, 72, &status.to_ne_bytes());
-            (CONNECT, 19)
+            // A successful move to a new BSS is a ROAM event; a fresh
+            // association is a CONNECT. Failures report as CONNECT(status!=0).
+            let command = if roaming && result.is_ok() {
+                ROAM
+            } else {
+                CONNECT
+            };
+            (command, 19)
         }
         Operation::Disconnect => {
             if !live || iface.disassociate().await.is_err() {

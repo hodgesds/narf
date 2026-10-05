@@ -95,6 +95,7 @@ impl Connection {
         auth: AuthMethod,
         tx_chains: u32,
         local_phy: super::ht_vht::Local,
+        roam_from: Option<[u8; 6]>,
     ) -> Result<Self, &'static str> {
         let secure = !matches!(auth, AuthMethod::Open);
         let akm = match &auth {
@@ -272,7 +273,7 @@ impl Connection {
             security::Akm::Wpa3Sae => narf_wireless::rsn::RsnIe::wpa3_sae_ccmp().encode_body(),
         });
         let rates = this.rates.elements();
-        let mut request = mlme::build_assoc_request_rsn(&mlme::AssocParamsRsn {
+        let params = mlme::AssocParamsRsn {
             base: mlme::AssocParams {
                 sta_addr: local,
                 ap_bssid: this.beacon.bssid,
@@ -286,7 +287,13 @@ impl Connection {
             },
             rsn_ie_body: rsn,
             ext_rates: rates.get(8..).unwrap_or(&[]).to_vec(),
-        });
+        };
+        // Roaming sends a Reassociation Request carrying the current AP
+        // address and expects a Reassociation Response (subtype 0x30).
+        let (mut request, response_subtype) = match roam_from {
+            Some(current_ap) => (mlme::build_reassoc_request_rsn(&params, current_ap), 0x30),
+            None => (mlme::build_assoc_request_rsn(&params), 0x10),
+        };
         if this.qos.is_some() {
             request.extend_from_slice(&super::qos::INFORMATION_IE);
         }
@@ -294,7 +301,7 @@ impl Connection {
         this.sequence = this.sequence.wrapping_add(1);
         hw.transmit(management_queue, &request, 24, this.rate())
             .await?;
-        let reply = this.wait_management(hw, 0x10).await?;
+        let reply = this.wait_management(hw, response_subtype).await?;
         let response =
             mlme::AssocResponseFields::decode(&reply).ok_or("invalid association response")?;
         if !response.is_success() || !(1..=2007).contains(&response.aid) {

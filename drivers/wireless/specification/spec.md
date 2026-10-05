@@ -254,10 +254,16 @@ protection is enforced on the management RX/TX paths via `wireless::mfp`
 (BIP-CMAC-128 MMIE verification of group-addressed robust frames, dropping
 forged/unprotected deauth/disassoc). The SAE exchange honors an AP's
 anti-clogging-token request (status 76), echoing the token in an H2E
-Anti-Clogging Token Container element on a bounded Commit retry. MMIE
-*emission* for AP/group-addressed TX, SAE-PK (public-key validation), and
-roaming/reassociation remain follow-up work; as with the rest of this
-profile, the exchange is validated by software contract tests, not against
+Anti-Clogging Token Container element on a bounded Commit retry.
+
+Roaming is supported: a connect request targeting a different BSS of the
+current ESS (`WirelessNetIface::connected_bssid` differs from the target) is
+routed through `WirelessNetIface::roam`, which reassociates — a Reassociation
+Request carrying the previous AP address, re-auth, and a fresh 4-way handshake
+with the new AP — and the control plane publishes an `NL80211_CMD_ROAM` event
+rather than `CONNECT`. MMIE *emission* for AP/group-addressed TX and SAE-PK
+(public-key validation) remain follow-up work; as with the rest of this
+profile, these paths are validated by software contract tests, not against
 target silicon.
 
 ## 5. Buffer Management
