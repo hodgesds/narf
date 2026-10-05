@@ -41,6 +41,10 @@ pub struct Connection {
     local_phy: super::ht_vht::Local,
     rx_ba: [Option<super::aggregation::Window>; super::aggregation::MAX_TIDS],
     actions: VecDeque<Vec<u8>>,
+    /// 802.11w IGTK store (BIP-CMAC-128), populated from message 3 on
+    /// WPA3. `mfp_active` gates management-frame protection enforcement.
+    mfp: narf_wireless::mfp::MfpKeyStore,
+    mfp_active: bool,
 }
 
 impl core::fmt::Debug for Connection {
@@ -62,16 +66,42 @@ impl Drop for Connection {
     }
 }
 
+/// Authentication / key-management the station drives for this
+/// association. WPA2-PSK supplies a 32-byte PMK directly; WPA3-SAE
+/// supplies the password and derives the PMK via the SAE exchange.
+pub enum AuthMethod {
+    Open,
+    Wpa2Psk([u8; 32]),
+    Wpa3Sae { password: Vec<u8> },
+}
+
+impl core::fmt::Debug for AuthMethod {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Never render the PMK / password.
+        let kind = match self {
+            AuthMethod::Open => "Open",
+            AuthMethod::Wpa2Psk(_) => "Wpa2Psk",
+            AuthMethod::Wpa3Sae { .. } => "Wpa3Sae",
+        };
+        f.debug_struct("AuthMethod").field("kind", &kind).finish()
+    }
+}
+
 impl Connection {
     pub async fn associate(
         hw: &mut Hardware,
         local: [u8; 6],
         beacon: Beacon,
-        psk: Option<[u8; 32]>,
+        auth: AuthMethod,
         tx_chains: u32,
         local_phy: super::ht_vht::Local,
     ) -> Result<Self, &'static str> {
-        let secure = psk.is_some();
+        let secure = !matches!(auth, AuthMethod::Open);
+        let akm = match &auth {
+            AuthMethod::Open => None,
+            AuthMethod::Wpa2Psk(_) => Some(security::Akm::Wpa2Psk),
+            AuthMethod::Wpa3Sae { .. } => Some(security::Akm::Wpa3Sae),
+        };
         if secure {
             let rsn = narf_wireless::rsn::RsnIe::decode_body(
                 beacon.rsn.as_ref().ok_or("AP has no RSN IE")?,
@@ -79,13 +109,28 @@ impl Connection {
             .ok_or("invalid AP RSN")?;
             use narf_wireless::rsn::*;
             let ccmp = Suite::standard(CIPHER_CCMP_128);
-            let psk = Suite::standard(AKM_PSK);
-            if rsn.group_cipher != ccmp
-                || !rsn.pairwise_ciphers.contains(&ccmp)
-                || !rsn.akms.contains(&psk)
-                || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0
-            {
-                return Err("AP does not support WPA2-PSK/CCMP without required MFP");
+            let ciphers_ok = rsn.group_cipher == ccmp && rsn.pairwise_ciphers.contains(&ccmp);
+            match akm {
+                Some(security::Akm::Wpa3Sae) => {
+                    // WPA3-Personal: AKM-SAE and mandatory management-frame
+                    // protection (the AP must at least be MFP-capable).
+                    if !ciphers_ok
+                        || !rsn.akms.contains(&Suite::standard(AKM_SAE))
+                        || rsn.rsn_capabilities & RSN_CAP_MFP_CAPABLE == 0
+                    {
+                        return Err("AP does not support WPA3-SAE/CCMP with MFP");
+                    }
+                }
+                _ => {
+                    // WPA2-PSK: AKM-PSK, CCMP, and the AP must not require MFP
+                    // (this profile's WPA2 path does not protect mgmt frames).
+                    if !ciphers_ok
+                        || !rsn.akms.contains(&Suite::standard(AKM_PSK))
+                        || rsn.rsn_capabilities & RSN_CAP_MFP_REQUIRED != 0
+                    {
+                        return Err("AP does not support WPA2-PSK/CCMP without required MFP");
+                    }
+                }
             }
         } else if beacon.privacy {
             return Err("secured AP requested as open");
@@ -168,11 +213,6 @@ impl Connection {
         if started.payload.len() != 16 || started.payload[4..12] != [1, 0, 0, 0, 1, 0, 0, 0] {
             return Err("association channel residency rejected");
         }
-        let mut nonce = [0; 32];
-        let security = psk.map(|psk| {
-            narf_crypto::fill_random_bytes(&mut nonce);
-            security::Session::new(psk, beacon.bssid, local, nonce, beacon.rsn.clone().unwrap())
-        });
         let mut this = Self {
             beacon,
             local,
@@ -180,7 +220,8 @@ impl Connection {
             data_queues,
             qos,
             sequence: 0,
-            security,
+            // Set once the PMK is known (after SAE for WPA3).
+            security: None,
             replay: frame_api::Replay::default(),
             authorized: false,
             last_beacon: narf_time::now_cycles(),
@@ -192,19 +233,44 @@ impl Connection {
             local_phy,
             rx_ba: core::array::from_fn(|_| None),
             actions: VecDeque::new(),
+            mfp: narf_wireless::mfp::MfpKeyStore::new(),
+            mfp_active: false,
         };
-        let auth = this.management(0xb0, &mlme::build_open_auth_body());
-        hw.transmit(management_queue, &auth, 24, this.rate())
-            .await?;
-        let auth = this.wait_management(hw, 0xb0).await?;
-        if !mlme::AuthResponse::decode(&auth).is_some_and(|reply| reply.is_success()) {
-            return Err("AP rejected authentication");
+        // Authenticate: open-system auth for Open/WPA2-PSK; the SAE
+        // commit/confirm exchange for WPA3, which also yields the PMK.
+        let pmk: Option<[u8; 32]> = match &auth {
+            AuthMethod::Open | AuthMethod::Wpa2Psk(_) => {
+                let frame = this.management(0xb0, &mlme::build_open_auth_body());
+                hw.transmit(management_queue, &frame, 24, this.rate())
+                    .await?;
+                let reply = this.wait_management(hw, 0xb0).await?;
+                if !mlme::AuthResponse::decode(&reply).is_some_and(|reply| reply.is_success()) {
+                    return Err("AP rejected authentication");
+                }
+                match &auth {
+                    AuthMethod::Wpa2Psk(psk) => Some(*psk),
+                    _ => None,
+                }
+            }
+            AuthMethod::Wpa3Sae { password } => Some(this.sae_authenticate(hw, password).await?),
+        };
+        // With the PMK in hand, arm the 4-way handshake session.
+        if let (Some(pmk), Some(akm)) = (pmk, akm) {
+            let mut nonce = [0; 32];
+            narf_crypto::fill_random_bytes(&mut nonce);
+            this.security = Some(security::Session::new(
+                akm,
+                pmk,
+                this.beacon.bssid,
+                local,
+                nonce,
+                this.beacon.rsn.clone().ok_or("AP has no RSN IE")?,
+            ));
         }
-        let rsn = if secure {
-            Some(narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body())
-        } else {
-            None
-        };
+        let rsn = akm.map(|akm| match akm {
+            security::Akm::Wpa2Psk => narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body(),
+            security::Akm::Wpa3Sae => narf_wireless::rsn::RsnIe::wpa3_sae_ccmp().encode_body(),
+        });
         let rates = this.rates.elements();
         let mut request = mlme::build_assoc_request_rsn(&mlme::AssocParamsRsn {
             base: mlme::AssocParams {
@@ -386,6 +452,94 @@ impl Connection {
             }
             activity.await;
         }
+    }
+
+    /// Drive the WPA3-SAE (H2E) commit/confirm exchange over the
+    /// management path and return the derived 32-byte PMK. Authentication
+    /// frames use algorithm 3 (SAE); the SAE variable body carries the
+    /// commit scalar/element and the confirm transcript MAC.
+    async fn sae_authenticate(
+        &mut self,
+        hw: &mut Hardware,
+        password: &[u8],
+    ) -> Result<[u8; 32], &'static str> {
+        use narf_wireless::sae::{SaeSession, SaeState, SAE_STATUS_HASH_TO_ELEMENT};
+        let ssid =
+            core::str::from_utf8(&self.beacon.ssid).map_err(|_| "SSID is not valid UTF-8")?;
+        let password =
+            core::str::from_utf8(password).map_err(|_| "SAE password is not valid UTF-8")?;
+        let mut sae = SaeSession::new(ssid, password, self.local, self.beacon.bssid);
+
+        // Commit (seq 1). H2E signals via status SAE_STATUS_HASH_TO_ELEMENT.
+        // `build_commit` is called once: an anti-clogging retry must resend the
+        // same scalar/element, adding only the AP-supplied token (§12.4.7.4).
+        const SAE_STATUS_ANTI_CLOGGING: u16 = 76; // §9.4.1.9
+        let commit = sae.build_commit();
+        let mut token: Vec<u8> = Vec::new();
+        let mut commit_reply = Vec::new();
+        let mut accepted = false;
+        // Initial commit plus up to two anti-clogging retries.
+        for _ in 0..3 {
+            // SAE Commit body: group(2) || scalar || element, plus the
+            // Anti-Clogging Token Container element (ID 255, ext 93) on the
+            // H2E retry (§9.4.2.199).
+            let mut body = Vec::with_capacity(commit.len() + token.len() + 3);
+            body.extend_from_slice(&commit);
+            if !token.is_empty() {
+                body.push(0xff);
+                body.push((token.len() + 1) as u8);
+                body.push(93);
+                body.extend_from_slice(&token);
+            }
+            let frame = self.management(
+                0xb0,
+                &mlme::build_sae_auth_body(1, SAE_STATUS_HASH_TO_ELEMENT, &body),
+            );
+            hw.transmit(self.management_queue, &frame, 24, self.rate())
+                .await?;
+            commit_reply = self.wait_management(hw, 0xb0).await?;
+            let header =
+                mlme::AuthResponse::decode(&commit_reply).ok_or("invalid SAE commit response")?;
+            if header.algorithm != mlme::auth_algorithm::SAE || header.seq != 1 {
+                return Err("AP did not answer SAE commit");
+            }
+            match header.status {
+                0 | SAE_STATUS_HASH_TO_ELEMENT => {
+                    accepted = true;
+                    break;
+                }
+                SAE_STATUS_ANTI_CLOGGING => {
+                    token = extract_anti_clogging_token(commit_reply.get(6..).unwrap_or(&[]))
+                        .ok_or("SAE anti-clogging token missing")?;
+                }
+                _ => return Err("AP rejected SAE commit"),
+            }
+        }
+        if !accepted {
+            return Err("SAE anti-clogging retries exhausted");
+        }
+        // The AP commit's fixed fields are group(2)+scalar(32)+element(64);
+        // ignore any trailing H2E elements (rejected groups, token container).
+        let commit_body = &commit_reply[6..];
+        sae.on_commit(commit_body.get(..98).unwrap_or(commit_body))
+            .map_err(|_| "SAE commit processing failed")?;
+
+        // Confirm (seq 2, status 0).
+        let confirm = sae.build_confirm();
+        let frame = self.management(0xb0, &mlme::build_sae_auth_body(2, 0, &confirm));
+        hw.transmit(self.management_queue, &frame, 24, self.rate())
+            .await?;
+        let reply = self.wait_management(hw, 0xb0).await?;
+        let header = mlme::AuthResponse::decode(&reply).ok_or("invalid SAE confirm response")?;
+        if header.algorithm != mlme::auth_algorithm::SAE || header.seq != 2 || header.status != 0 {
+            return Err("AP rejected SAE confirm");
+        }
+        sae.on_confirm(&reply[6..])
+            .map_err(|_| "SAE confirm verification failed")?;
+        if sae.state() != SaeState::Accepted {
+            return Err("SAE did not reach Accepted");
+        }
+        sae.pmk().copied().ok_or("SAE produced no PMK")
     }
 
     pub async fn send(&mut self, hw: &mut Hardware, ethernet: &[u8]) -> Result<(), &'static str> {
@@ -764,6 +918,27 @@ impl Connection {
             if matches!(frame[0], 0xa0 | 0xc0)
                 && (frame[4..10] == self.local || frame[4..10] == [0xff; 6])
             {
+                // 802.11w: once MFP is active a deauth/disassoc must be
+                // authentic, else it is dropped instead of tearing the link
+                // down — this is the forged-broadcast-deauth DoS defense.
+                if self.mfp_active {
+                    if frame[4] & 1 == 1 {
+                        // Group-addressed robust mgmt frame: require a valid
+                        // BIP MMIE signed by the AP's IGTK.
+                        let Some(body) = mpdu.body(24, 0) else {
+                            return Ok(None);
+                        };
+                        if narf_wireless::mfp::verify_inbound(&mut self.mfp, &frame[..24], body)
+                            .is_err()
+                        {
+                            return Ok(None);
+                        }
+                    } else if frame[1] & 0x40 == 0 {
+                        // Individually-addressed robust mgmt frame must be
+                        // CCMP-protected (Protected bit set); drop the forgery.
+                        return Ok(None);
+                    }
+                }
                 self.authorized = false;
                 return Err("AP disconnected");
             }
@@ -836,6 +1011,15 @@ impl Connection {
                 self.replay.reset_subframes();
                 self.discard_reorder();
             }
+            // 802.11w: install the IGTK and arm management-frame protection.
+            // The host verifies group-addressed robust mgmt frames (BIP) and
+            // drops unprotected ones; per-frame BIP math lives in `mfp`.
+            if let Some((igtk, key_id)) = keys.igtk {
+                self.mfp
+                    .install_active(igtk, key_id)
+                    .map_err(|_| "invalid IGTK key index")?;
+                self.mfp_active = true;
+            }
         }
         let mut reply = Vec::new();
         reply.extend_from_slice(&self.beacon.bssid);
@@ -853,7 +1037,14 @@ impl Connection {
             self.stop_rx_ba(hw, tid as u8).await?;
         }
         hw.drain_transmits().await?;
-        let frame = self.management(0xa0, &3u16.to_le_bytes());
+        let mfp_active = self.mfp_active;
+        let mut frame = self.management(0xa0, &3u16.to_le_bytes());
+        if mfp_active {
+            // 802.11w: the individually-addressed disassoc is a robust mgmt
+            // frame — set the Protected bit so firmware CCMP-encrypts it
+            // under the installed pairwise key before transmit.
+            frame[1] |= 0x40;
+        }
         let _ = hw
             .transmit(self.management_queue, &frame, 24, self.rate())
             .await;
@@ -883,6 +1074,21 @@ impl Connection {
             .await?;
         Ok(())
     }
+}
+
+/// Extract the opaque anti-clogging token from an AP's SAE Commit rejection
+/// (status 76). H2E carries it in an Anti-Clogging Token Container element
+/// (ID 255, ext 93); legacy SAE used a bare inline field. Returns the token
+/// value to echo back on the retry.
+fn extract_anti_clogging_token(body: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    if body.len() >= 3 && body[0] == 0xff && body[2] == 93 {
+        let len = body[1] as usize;
+        if len >= 1 && body.len() >= 2 + len {
+            return Some(body[3..2 + len].to_vec());
+        }
+        return None;
+    }
+    (!body.is_empty()).then(|| body.to_vec())
 }
 
 async fn remove_key(hw: &mut Hardware, id: u8, group: bool) -> Result<(), &'static str> {

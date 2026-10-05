@@ -21,6 +21,7 @@ fn connection() -> Connection {
         qos: None,
         sequence: 0,
         security: Some(security::Session::new(
+            security::Akm::Wpa2Psk,
             [0; 32],
             [4; 6],
             [2; 6],
@@ -44,7 +45,19 @@ fn connection() -> Connection {
             (tid == 0).then(|| Window::new(3, 0, 1, 100, 64, 0, 0).unwrap())
         }),
         actions: VecDeque::new(),
+        mfp: narf_wireless::mfp::MfpKeyStore::new(),
+        mfp_active: false,
     }
+}
+
+/// Wrap a raw 802.11 frame in the AX210 v3 MPDU envelope the RX parser
+/// expects (status = RX-OK, no padding/trailer).
+fn mgmt_mpdu_payload(frame: &[u8]) -> Vec<u8> {
+    let mut p = alloc::vec![0u8; 64 + frame.len()];
+    put16(&mut p, 0, frame.len() as u16);
+    put32(&mut p, 12, 3); // status: CRC/overrun OK
+    p[64..].copy_from_slice(frame);
+    p
 }
 
 fn notification(cmd: u8, payload: Vec<u8>) -> Packet {
@@ -183,4 +196,103 @@ fn smoke_connection_stops_tx_when_ap_changes_ht_operation() -> TestResult {
 kernel_test_in!(
     "drivers/wireless/iwlwifi/ht_vht",
     smoke_connection_stops_tx_when_ap_changes_ht_operation
+);
+
+// 802.11w: with MFP active, a group-addressed deauth is honored only when
+// its BIP-CMAC MMIE verifies; a forged one is dropped (not a link teardown).
+// An unprotected individually-addressed robust mgmt frame is also dropped.
+fn smoke_connection_mfp_drops_forged_deauth() -> TestResult {
+    let key = [0x5c; 16];
+    // Build a BIP-signed broadcast deauth (A1 broadcast, A2/A3 = BSSID).
+    let mut hdr = [0u8; 24];
+    hdr[0] = 0xc0; // deauthentication
+    hdr[4..10].copy_from_slice(&[0xff; 6]);
+    hdr[10..16].copy_from_slice(&[4; 6]);
+    hdr[16..22].copy_from_slice(&[4; 6]);
+    let mut body = alloc::vec![3u8, 0]; // reason code 3
+    let mut tx = narf_crypto::bip_cmac::Igtk::install(key, 4).unwrap();
+    narf_wireless::mfp::protect_outbound(&mut tx, &hdr, &mut body).unwrap();
+    let mut signed = hdr.to_vec();
+    signed.extend_from_slice(&body);
+
+    // Valid MMIE → honored (link torn down).
+    let mut c = connection();
+    c.mfp.install_active(key, 4).unwrap();
+    c.mfp_active = true;
+    let payload = mgmt_mpdu_payload(&signed);
+    let mpdu = scan_api::mpdu(&payload).unwrap();
+    match c.receive_frame(&mpdu) {
+        Err("AP disconnected") if !c.authorized => {}
+        _ => return TestResult::Fail("valid BIP-signed broadcast deauth was not honored"),
+    }
+
+    // Tampered MIC → dropped, link preserved.
+    let mut c = connection();
+    c.mfp.install_active(key, 4).unwrap();
+    c.mfp_active = true;
+    let mut forged = signed.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 0x01;
+    let payload = mgmt_mpdu_payload(&forged);
+    let mpdu = scan_api::mpdu(&payload).unwrap();
+    match c.receive_frame(&mpdu) {
+        Ok(None) if c.authorized => {}
+        _ => return TestResult::Fail("forged broadcast deauth tore down the link"),
+    }
+
+    // Unprotected unicast deauth under MFP → dropped.
+    let mut c = connection();
+    c.mfp_active = true;
+    let mut uni = [0u8; 26];
+    uni[0] = 0xc0;
+    uni[4..10].copy_from_slice(&[2; 6]); // A1 = our MAC
+    uni[10..16].copy_from_slice(&[4; 6]);
+    uni[16..22].copy_from_slice(&[4; 6]);
+    let payload = mgmt_mpdu_payload(&uni);
+    let mpdu = scan_api::mpdu(&payload).unwrap();
+    match c.receive_frame(&mpdu) {
+        Ok(None) if c.authorized => {}
+        _ => return TestResult::Fail("unprotected unicast deauth honored under MFP"),
+    }
+
+    // Control: without MFP (WPA2), the same unicast deauth still disconnects.
+    let mut c = connection();
+    let payload = mgmt_mpdu_payload(&uni);
+    let mpdu = scan_api::mpdu(&payload).unwrap();
+    if c.receive_frame(&mpdu).is_ok() || c.authorized {
+        return TestResult::Fail("non-MFP deauth should still tear down the link");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/security",
+    smoke_connection_mfp_drops_forged_deauth
+);
+
+// SAE anti-clogging (status 76): the STA echoes the AP-supplied token on the
+// Commit retry. Cover both the H2E container element and the legacy inline form.
+fn smoke_sae_anti_clogging_token_extract() -> TestResult {
+    let token = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02];
+    // H2E: ElementID 255 | len | ext 93 | token.
+    let mut h2e = alloc::vec![0xff, (token.len() + 1) as u8, 93];
+    h2e.extend_from_slice(&token);
+    if extract_anti_clogging_token(&h2e).as_deref() != Some(&token[..]) {
+        return TestResult::Fail("H2E container token not extracted");
+    }
+    // Legacy: the whole remaining body is the token.
+    if extract_anti_clogging_token(&[1, 2, 3]).as_deref() != Some(&[1, 2, 3][..]) {
+        return TestResult::Fail("legacy inline token not extracted");
+    }
+    if extract_anti_clogging_token(&[]).is_some() {
+        return TestResult::Fail("empty body yielded a token");
+    }
+    // Container whose declared length overruns the buffer is rejected.
+    if extract_anti_clogging_token(&[0xff, 0x40, 93, 1, 2]).is_some() {
+        return TestResult::Fail("overrunning container accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/security",
+    smoke_sae_anti_clogging_token_extract
 );

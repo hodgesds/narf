@@ -43,9 +43,35 @@ enum Operation {
         ssid: Vec<u8>,
         bssid: Option<[u8; 6]>,
         channel: Option<u32>,
-        pmk: Option<Zeroizing<[u8; 32]>>,
+        cred: Credential,
     },
     Disconnect,
+}
+
+/// The authentication/key-management method and its secret, decoded from the
+/// nl80211 CONNECT attributes. WPA2-PSK and WPA3-SAE are both firmware/driver
+/// offload paths (PMK and password respectively).
+enum Credential {
+    Open,
+    Psk(Zeroizing<[u8; 32]>),
+    Sae(Zeroizing<Vec<u8>>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Akm {
+    Open,
+    Psk,
+    Sae,
+}
+
+impl Credential {
+    fn akm(&self) -> Akm {
+        match self {
+            Credential::Open => Akm::Open,
+            Credential::Psk(_) => Akm::Psk,
+            Credential::Sae(_) => Akm::Sae,
+        }
+    }
 }
 
 /// Reject malformed tails and duplicate attributes, including unknown
@@ -105,10 +131,16 @@ fn authorized(admin: &narf_net::AdminHandle, iface: &dyn crate::WirelessNetIface
     admin.authorize_interface(iface.name(), ns).is_ok()
 }
 
-fn parse_operation(command: u8, attrs: &[(u16, &[u8])], offload: bool) -> Result<Operation, i32> {
+fn parse_operation(
+    command: u8,
+    attrs: &[(u16, &[u8])],
+    psk_offload: bool,
+    sae_offload: bool,
+) -> Result<Operation, i32> {
     let allowed: &[u16] = match command {
         SCAN => &[3, 44, 45],
-        CONNECT => &[3, 6, 38, 42, 52, 53, 66, 70, 73, 74, 75, 76, 254],
+        // 254 = NL80211_ATTR_PMK (PSK offload), 277 = NL80211_ATTR_SAE_PASSWORD.
+        CONNECT => &[3, 6, 38, 42, 52, 53, 66, 70, 73, 74, 75, 76, 254, 277],
         DISCONNECT => &[3, 54],
         _ => return Err(EOPNOTSUPP),
     };
@@ -151,21 +183,6 @@ fn parse_operation(command: u8, attrs: &[(u16, &[u8])], offload: bool) -> Result
             }))
         }
         CONNECT => {
-            // This station profile does not negotiate protected management
-            // frames or arbitrary extra association IEs.
-            if u32_attr(attrs, 66)?.unwrap_or(0) != 0 {
-                return Err(EOPNOTSUPP);
-            }
-            if let Some(ie) = attr(attrs, 42) {
-                let rsn = crate::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
-                if !ie.is_empty()
-                    && (ie.len() != rsn.len() + 2
-                        || ie[..2] != [48, rsn.len() as u8]
-                        || ie[2..] != rsn)
-                {
-                    return Err(EOPNOTSUPP);
-                }
-            }
             let ssid = attr(attrs, 52).ok_or(EINVAL)?;
             if ssid.is_empty() || ssid.len() > 32 {
                 return Err(EINVAL);
@@ -177,38 +194,73 @@ fn parse_operation(command: u8, attrs: &[(u16, &[u8])], offload: bool) -> Result
                 return Err(EINVAL);
             }
             let channel = u32_attr(attrs, 38)?.map(channel).transpose()?;
-            if u32_attr(attrs, 53)?.is_some_and(|auth| auth != 0) {
-                return Err(EOPNOTSUPP);
-            }
-            let pmk = match attr(attrs, 254) {
-                Some(pmk) => {
-                    if !offload
-                        || u32_attr(attrs, 75)? != Some(2)
-                        || u32_attr(attrs, 76)? != Some(0x000fac02)
-                        || u32_attr(attrs, 73)? != Some(0x000fac04)
-                        || u32_attr(attrs, 74)? != Some(0x000fac04)
+            // 53 = NL80211_ATTR_AUTH_TYPE (0 = OPEN_SYSTEM, 4 = SAE),
+            // 66 = NL80211_ATTR_USE_MFP (2 = REQUIRED).
+            let auth = u32_attr(attrs, 53)?.unwrap_or(0);
+            let mfp = u32_attr(attrs, 66)?.unwrap_or(0);
+            // CCMP (00-0F-AC:4) pairwise+group are required for every offload
+            // suite this profile accepts.
+            let ccmp = u32_attr(attrs, 73)? == Some(0x000fac04)
+                && u32_attr(attrs, 74)? == Some(0x000fac04);
+            let cred = if let Some(password) = attr(attrs, 277) {
+                // WPA3-SAE offload: SAE auth, RSN (WPA2 versions), AKM SAE
+                // (00-0F-AC:8), CCMP, and mandatory management-frame protection.
+                if !sae_offload
+                    || auth != 4
+                    || mfp != 2
+                    || !ccmp
+                    || u32_attr(attrs, 75)? != Some(2)
+                    || u32_attr(attrs, 76)? != Some(0x000fac08)
+                    || attr(attrs, 254).is_some()
+                {
+                    return Err(EOPNOTSUPP);
+                }
+                if password.is_empty() || password.len() > 128 {
+                    return Err(EINVAL);
+                }
+                Credential::Sae(Zeroizing::new(password.to_vec()))
+            } else if let Some(pmk) = attr(attrs, 254) {
+                // WPA2-PSK offload: OPEN auth, no MFP, AKM PSK (00-0F-AC:2), CCMP.
+                if !psk_offload
+                    || auth != 0
+                    || mfp != 0
+                    || !ccmp
+                    || u32_attr(attrs, 75)? != Some(2)
+                    || u32_attr(attrs, 76)? != Some(0x000fac02)
+                {
+                    return Err(EOPNOTSUPP);
+                }
+                if let Some(ie) = attr(attrs, 42) {
+                    let rsn = crate::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
+                    if !ie.is_empty()
+                        && (ie.len() != rsn.len() + 2
+                            || ie[..2] != [48, rsn.len() as u8]
+                            || ie[2..] != rsn)
                     {
                         return Err(EOPNOTSUPP);
                     }
-                    Some(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
                 }
-                None => {
-                    if attr(attrs, 70).is_some()
-                        || u32_attr(attrs, 75)?.unwrap_or(0) != 0
-                        || attr(attrs, 76).is_some()
-                        || attr(attrs, 73).is_some()
-                        || attr(attrs, 74).is_some()
-                    {
-                        return Err(EOPNOTSUPP);
-                    }
-                    None
+                Credential::Psk(Zeroizing::new(pmk.try_into().map_err(|_| EINVAL)?))
+            } else {
+                // Open: no security negotiation, no MFP, no extra RSN IE.
+                if auth != 0
+                    || mfp != 0
+                    || attr(attrs, 70).is_some()
+                    || u32_attr(attrs, 75)?.unwrap_or(0) != 0
+                    || attr(attrs, 76).is_some()
+                    || attr(attrs, 73).is_some()
+                    || attr(attrs, 74).is_some()
+                    || attr(attrs, 42).is_some_and(|ie| !ie.is_empty())
+                {
+                    return Err(EOPNOTSUPP);
                 }
+                Credential::Open
             };
             Ok(Operation::Connect {
                 ssid: ssid.to_vec(),
                 bssid,
                 channel,
-                pmk,
+                cred,
             })
         }
         DISCONNECT => {
@@ -262,7 +314,12 @@ pub(super) fn handle(
         .filter(|admin| authorized(admin, iface.as_ref(), context.net_ns_id))
         .ok_or(EPERM)?
         .clone();
-    let operation = parse_operation(command, &attrs, iface.supports_handshake_offload())?;
+    let operation = parse_operation(
+        command,
+        &attrs,
+        iface.supports_handshake_offload(),
+        iface.supports_sae_offload(),
+    )?;
     let name = String::from(iface.name());
     {
         let mut caches = CACHE.lock();
@@ -337,8 +394,9 @@ async fn execute(
             ssid,
             bssid,
             channel,
-            pmk,
+            cred,
         } => {
+            let akm = cred.akm();
             let mut selected = None;
             let result = async {
                 if !live {
@@ -350,13 +408,7 @@ async fn execute(
                         .iter()
                         .find(|c| c.name == iface.name() && c.namespace == ns);
                     results.and_then(|c| {
-                        select_bss(
-                            c.results.iter().map(|(b, _)| b),
-                            &ssid,
-                            bssid,
-                            channel,
-                            pmk.is_some(),
-                        )
+                        select_bss(c.results.iter().map(|(b, _)| b), &ssid, bssid, channel, akm)
                     })
                 };
                 if selected.is_none() {
@@ -368,7 +420,7 @@ async fn execute(
                         })
                         .await?;
                     results.truncate(256);
-                    selected = select_bss(results.iter(), &ssid, bssid, channel, pmk.is_some());
+                    selected = select_bss(results.iter(), &ssid, bssid, channel, akm);
                     if !authorized(&admin, iface.as_ref(), ns) {
                         return Err(crate::WirelessError::Denied);
                     }
@@ -389,10 +441,13 @@ async fn execute(
                 if !authorized(&admin, iface.as_ref(), ns) {
                     return Err(crate::WirelessError::Denied);
                 }
-                let security = pmk
-                    .as_ref()
-                    .map(|key| crate::SecurityConfig::Wpa2 { psk: **key })
-                    .unwrap_or(crate::SecurityConfig::Open);
+                let security = match &cred {
+                    Credential::Open => crate::SecurityConfig::Open,
+                    Credential::Psk(psk) => crate::SecurityConfig::Wpa2 { psk: **psk },
+                    Credential::Sae(password) => crate::SecurityConfig::Wpa3 {
+                        password: (**password).clone(),
+                    },
+                };
                 iface
                     .associate(crate::AssociateRequest {
                         ssid,
@@ -437,17 +492,17 @@ fn select_bss<'a>(
     ssid: &[u8],
     bssid: Option<[u8; 6]>,
     channel: Option<u32>,
-    secured: bool,
+    akm: Akm,
 ) -> Option<crate::BssInfo> {
     results
         .filter(|b| {
             b.ssid == ssid
                 && bssid.is_none_or(|address| address == b.bssid)
                 && channel.is_none_or(|ch| ch == b.channel)
-                && if secured {
-                    matches!(b.security, crate::scan::BssSecurity::Wpa2)
-                } else {
-                    matches!(b.security, crate::scan::BssSecurity::Open)
+                && match akm {
+                    Akm::Open => matches!(b.security, crate::scan::BssSecurity::Open),
+                    Akm::Psk => matches!(b.security, crate::scan::BssSecurity::Wpa2),
+                    Akm::Sae => matches!(b.security, crate::scan::BssSecurity::Wpa3),
                 }
         })
         .max_by_key(|b| b.rssi)

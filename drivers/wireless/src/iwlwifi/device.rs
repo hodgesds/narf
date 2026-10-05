@@ -390,6 +390,11 @@ impl WirelessNetIface for Device {
     fn supports_handshake_offload(&self) -> bool {
         true
     }
+    fn supports_sae_offload(&self) -> bool {
+        // The driver runs the SAE exchange and the AKM-SAE 4-way handshake
+        // in-kernel (WPA3-Personal), so nl80211 advertises SAE_OFFLOAD.
+        true
+    }
     fn reports_disconnect_events(&self) -> bool {
         true
     }
@@ -615,10 +620,11 @@ impl WirelessNetIface for Device {
     }
 
     async fn associate(&self, request: AssociateRequest) -> Result<(), WirelessError> {
-        let psk = match request.security {
-            narf_wireless::SecurityConfig::Open => None,
-            narf_wireless::SecurityConfig::Wpa2 { psk } => Some(psk),
-            narf_wireless::SecurityConfig::Wpa3 { .. } => return Err(WirelessError::NotSupported),
+        use super::connection::AuthMethod;
+        let auth = match request.security {
+            narf_wireless::SecurityConfig::Open => AuthMethod::Open,
+            narf_wireless::SecurityConfig::Wpa2 { psk } => AuthMethod::Wpa2Psk(psk),
+            narf_wireless::SecurityConfig::Wpa3 { password } => AuthMethod::Wpa3Sae { password },
         };
         if request.ssid.len() > 32 || request.bssid[0] & 1 != 0 {
             return Err(WirelessError::InvalidArgs);
@@ -653,7 +659,7 @@ impl WirelessNetIface for Device {
             &mut state.hardware,
             self.mac,
             beacon,
-            psk,
+            auth,
             self.tx_chains,
             self.phy,
         )

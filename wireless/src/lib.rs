@@ -61,6 +61,14 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// The driver performs the WPA3-Personal SAE exchange and key setup from a
+    /// supplied password (NL80211_EXT_FEATURE_SAE_OFFLOAD). Distinct from
+    /// [`supports_handshake_offload`](Self::supports_handshake_offload): a
+    /// driver may offload the PSK 4-way handshake without doing SAE.
+    fn supports_sae_offload(&self) -> bool {
+        false
+    }
+
     /// Driver emits nl80211 link-loss notifications, including local teardown.
     fn reports_disconnect_events(&self) -> bool {
         false

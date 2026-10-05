@@ -399,6 +399,21 @@ pub fn build_open_auth_body() -> [u8; 6] {
     body
 }
 
+/// Build the body of an 802.11 SAE Authentication frame (algorithm 3):
+/// the 6-byte fixed header (algorithm / sequence / status) followed by
+/// the SAE variable payload — the Commit (scalar+element) for seq 1 or
+/// the Confirm (send-confirm+MAC) for seq 2.
+///
+/// Reference: IEEE 802.11-2020 §9.3.3.12 + §12.4.7 (SAE frame bodies).
+pub fn build_sae_auth_body(seq: u16, status: u16, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(6 + payload.len());
+    body.extend_from_slice(&auth_algorithm::SAE.to_le_bytes());
+    body.extend_from_slice(&seq.to_le_bytes());
+    body.extend_from_slice(&status.to_le_bytes());
+    body.extend_from_slice(payload);
+    body
+}
+
 /// Decoded authentication fixed-fields (algorithm, seq, status).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AuthResponse {
