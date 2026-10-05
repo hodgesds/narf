@@ -261,10 +261,14 @@ current ESS (`WirelessNetIface::connected_bssid` differs from the target) is
 routed through `WirelessNetIface::roam`, which reassociates — a Reassociation
 Request carrying the previous AP address, re-auth, and a fresh 4-way handshake
 with the new AP — and the control plane publishes an `NL80211_CMD_ROAM` event
-rather than `CONNECT`. MMIE *emission* for AP/group-addressed TX and SAE-PK
-(public-key validation) remain follow-up work; as with the rest of this
-profile, these paths are validated by software contract tests, not against
-target silicon.
+rather than `CONNECT`. `Connection::protect_group_mgmt` provides the
+BIP-CMAC-128 MMIE *emission* counterpart to inbound verification (the
+transmit hook an AP/mesh send path would use); station mode never emits
+group-addressed robust management frames, so it is exercised by a
+protect/verify round-trip test. A full AP-mode send path (`START_AP`,
+beaconing, client management) and SAE-PK public-key validation remain
+follow-up work; as with the rest of this profile, these paths are validated
+by software contract tests, not against target silicon.
 
 ## 5. Buffer Management
 

@@ -296,3 +296,44 @@ kernel_test_in!(
     "drivers/wireless/iwlwifi/security",
     smoke_sae_anti_clogging_token_extract
 );
+
+// 802.11w TX: protect_group_mgmt appends a BIP-CMAC-128 MMIE under the
+// active IGTK; an independent key store verifies and strips it. Refused
+// when MFP is inactive. (AP/mesh-side emission; station mode never calls it.)
+fn smoke_connection_protect_group_mgmt_roundtrips() -> TestResult {
+    let key = [0x3c; 16];
+    let mut c = connection();
+    c.mfp.install_active(key, 4).unwrap();
+    c.mfp_active = true;
+    // Group-addressed deauth we (as an AP) would emit: A1 broadcast.
+    let mut hdr = [0u8; 24];
+    hdr[0] = 0xc0;
+    hdr[4..10].copy_from_slice(&[0xff; 6]);
+    hdr[10..16].copy_from_slice(&c.local);
+    hdr[16..22].copy_from_slice(&c.local);
+    let mut body = alloc::vec![3u8, 0];
+    let ipn = match c.protect_group_mgmt(&hdr, &mut body) {
+        Ok(ipn) => ipn,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if ipn == 0 {
+        return TestResult::Fail("IPN must be stamped nonzero");
+    }
+    let mut rx = narf_wireless::mfp::MfpKeyStore::new();
+    rx.install_active(key, 4).unwrap();
+    match narf_wireless::mfp::verify_inbound(&mut rx, &hdr, &body) {
+        Ok(stripped) if stripped == [3u8, 0] => {}
+        _ => return TestResult::Fail("protected group mgmt frame did not verify"),
+    }
+    // Refused without MFP active.
+    let mut plain = connection();
+    let mut body2 = alloc::vec![3u8, 0];
+    if plain.protect_group_mgmt(&hdr, &mut body2).is_ok() {
+        return TestResult::Fail("protect_group_mgmt succeeded without MFP active");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/wireless/iwlwifi/security",
+    smoke_connection_protect_group_mgmt_roundtrips
+);

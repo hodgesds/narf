@@ -1038,6 +1038,25 @@ impl Connection {
         Ok(())
     }
 
+    /// Append a BIP-CMAC-128 MMIE to a group-addressed robust management
+    /// frame body and stamp its MIC/IPN under the active IGTK (802.11w TX,
+    /// §12.5.4). This is the transmit counterpart to the inbound MMIE
+    /// verification in `receive_frame`. A station never emits group-addressed
+    /// robust management frames, so this is exercised by tests and is the
+    /// hook an AP/mesh-mode send path would call; `hdr_24` is the frame's
+    /// 24-byte management header, `body` its in-progress body.
+    pub fn protect_group_mgmt(
+        &mut self,
+        hdr_24: &[u8],
+        body: &mut Vec<u8>,
+    ) -> Result<u64, &'static str> {
+        if !self.mfp_active {
+            return Err("management-frame protection is not active");
+        }
+        let igtk = self.mfp.active.as_mut().ok_or("no active IGTK installed")?;
+        narf_wireless::mfp::protect_outbound(igtk, hdr_24, body).map_err(|_| "BIP protect failed")
+    }
+
     pub async fn disconnect(mut self, hw: &mut Hardware) -> Result<(), &'static str> {
         self.authorized = false;
         for tid in 0..self.rx_ba.len() {
