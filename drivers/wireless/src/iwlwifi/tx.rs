@@ -210,6 +210,7 @@ pub mod fc {
     pub const SUBTYPE_PROBE_REQ: u16 = 0x40;
     pub const SUBTYPE_AUTH: u16 = 0xB0;
     pub const SUBTYPE_ASSOC_REQ: u16 = 0x00; // subtype 0 = assoc req
+    pub const SUBTYPE_REASSOC_REQ: u16 = 0x20; // subtype 2 = reassoc req
     pub const SUBTYPE_DEAUTH: u16 = 0xC0;
     pub const SUBTYPE_DISASSOC: u16 = 0xA0;
 

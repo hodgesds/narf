@@ -330,6 +330,43 @@ pub fn parse_gtk_kde(kde_data: &[u8]) -> Option<GtkKde> {
     None
 }
 
+/// KDE type = IGTK (802.11w Integrity Group Temporal Key).
+const KDE_TYPE_IGTK: u8 = 9;
+
+/// Parsed IGTK KDE: key_id + IPN + 16-byte IGTK (BIP-CMAC-128).
+#[derive(Clone, Debug)]
+pub struct IgtkKde {
+    /// IGTK key index (4 or 5 for 802.11w).
+    pub key_id: u16,
+    /// IGTK material (16 bytes for BIP-CMAC-128).
+    pub igtk: [u8; 16],
+}
+
+/// Parse the IGTK KDE (§12.7.2, Figure 12-43) from a plaintext KDE
+/// stream: `DD len 00:0F:AC:09 | KeyID(2 LE) | IPN(6) | IGTK(16)`.
+/// Present in M3 only when management-frame protection is negotiated.
+pub fn parse_igtk_kde(kde_data: &[u8]) -> Option<IgtkKde> {
+    let mut pos = 0usize;
+    while pos + 2 <= kde_data.len() {
+        let tag = kde_data[pos];
+        let len = kde_data[pos + 1] as usize;
+        pos += 2;
+        if pos + len > kde_data.len() {
+            break;
+        }
+        let data = &kde_data[pos..pos + len];
+        // OUI(3) | type(1) | KeyID(2) | IPN(6) | IGTK(16) = 28 bytes.
+        if tag == KDE_DDH && len >= 28 && data[0..3] == RSN_OUI && data[3] == KDE_TYPE_IGTK {
+            let key_id = u16::from_le_bytes([data[4], data[5]]);
+            let mut igtk = [0u8; 16];
+            igtk.copy_from_slice(&data[12..28]);
+            return Some(IgtkKde { key_id, igtk });
+        }
+        pos += len;
+    }
+    None
+}
+
 // ── Group rekey state machine ─────────────────────────────────────
 
 /// Reason a group-rekey decode failed.
@@ -634,6 +671,29 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/rekey",
         smoke_iwlwifi_rekey_aes_key_unwrap_bad_integrity
+    );
+    // 802.11w IGTK KDE: DD 1C 00:0F:AC:09 | KeyID(2 LE) | IPN(6) | IGTK(16).
+    fn smoke_iwlwifi_rekey_igtk_kde_parse() -> TestResult {
+        let igtk = [0xABu8; 16];
+        let mut kde = alloc::vec![
+            0xDD, 0x1C, 0x00, 0x0F, 0xAC, 0x09, // RSN OUI + IGTK type
+            0x04, 0x00, // KeyID = 4 (LE)
+            1, 2, 3, 4, 5, 6, // IPN
+        ];
+        kde.extend_from_slice(&igtk);
+        match parse_igtk_kde(&kde) {
+            Some(parsed) if parsed.key_id == 4 && parsed.igtk == igtk => {}
+            _ => return TestResult::Fail("IGTK KDE not parsed correctly"),
+        }
+        // A GTK-only key-data stream yields no IGTK.
+        if parse_igtk_kde(&[0xDD, 0x06, 0x00, 0x0F, 0xAC, 0x01, 0x00, 0x00]).is_some() {
+            return TestResult::Fail("IGTK parser matched a GTK KDE");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/rekey",
+        smoke_iwlwifi_rekey_igtk_kde_parse
     );
     kernel_test_in!(
         "drivers/wireless/iwlwifi/rekey",

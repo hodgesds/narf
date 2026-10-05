@@ -12,12 +12,16 @@ pub struct KeyUpdate {
     pub group: [u8; 16],
     pub group_id: u8,
     pub group_rx_pn: u64,
+    /// 802.11w Integrity GTK (BIP-CMAC-128) + its key index, present only
+    /// when management-frame protection was negotiated (WPA3-SAE).
+    pub igtk: Option<([u8; 16], u16)>,
 }
 
 impl core::fmt::Debug for KeyUpdate {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("KeyUpdate")
             .field("group_id", &self.group_id)
+            .field("mfp", &self.igtk.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -28,6 +32,61 @@ impl Drop for KeyUpdate {
             key.zeroize();
         }
         self.group.zeroize();
+        if let Some((igtk, _)) = &mut self.igtk {
+            igtk.zeroize();
+        }
+    }
+}
+
+/// Authentication/key-management suite selecting the 4-way handshake
+/// crypto: EAPOL-Key descriptor version, PTK KDF, and MIC algorithm.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Akm {
+    /// WPA2-Personal (00-0F-AC:2): HMAC-SHA1 PRF + HMAC-SHA1-128 MIC,
+    /// Key Descriptor Version 2.
+    Wpa2Psk,
+    /// WPA3-Personal SAE (00-0F-AC:8): SHA-256 KDF + AES-128-CMAC MIC,
+    /// Key Descriptor Version 0, management-frame protection required.
+    Wpa3Sae,
+}
+
+impl Akm {
+    /// Low 3 bits of the Key Information field (Key Descriptor Version).
+    fn ki_version(self) -> u16 {
+        match self {
+            Akm::Wpa2Psk => KI_VERSION_HMAC_SHA1_AES,
+            Akm::Wpa3Sae => 0,
+        }
+    }
+
+    fn derive_ptk(
+        self,
+        pmk: &[u8],
+        aa: &[u8; 6],
+        sa: &[u8; 6],
+        anonce: &[u8; 32],
+        snonce: &[u8; 32],
+        tk_len: usize,
+    ) -> Ptk {
+        match self {
+            Akm::Wpa2Psk => wpa::derive_ptk_sha1(pmk, aa, sa, anonce, snonce, tk_len),
+            Akm::Wpa3Sae => wpa::derive_ptk_sha256(pmk, aa, sa, anonce, snonce, tk_len),
+        }
+    }
+
+    fn mic(self, kck: &[u8], eapol_with_zero_mic: &[u8]) -> [u8; 16] {
+        match self {
+            Akm::Wpa2Psk => handshake::compute_mic(kck, eapol_with_zero_mic),
+            Akm::Wpa3Sae => wpa::compute_mic_cmac(kck, eapol_with_zero_mic),
+        }
+    }
+
+    /// The STA's own RSN IE body, echoed in M2 and checked by the AP.
+    fn sta_rsn_ie(self) -> Vec<u8> {
+        match self {
+            Akm::Wpa2Psk => narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body(),
+            Akm::Wpa3Sae => narf_wireless::rsn::RsnIe::wpa3_sae_ccmp().encode_body(),
+        }
     }
 }
 
@@ -62,6 +121,7 @@ mod tests {
     fn fixture() -> (Session, Vec<u8>, Vec<u8>) {
         let rsn = hex("0100000fac040100000fac040100000fac020000");
         let session = Session::new(
+            Akm::Wpa2Psk,
             [0x11; 32],
             [2, 1, 2, 3, 4, 5],
             [2, 6, 7, 8, 9, 10],
@@ -196,9 +256,66 @@ mod tests {
         "drivers/wireless/iwlwifi/security",
         smoke_wpa2_pairwise_rekey_preserves_active_key_until_mic
     );
+
+    // WPA3-SAE 4-way: the M2 reply must use Key Descriptor Version 0, an
+    // AES-128-CMAC MIC over the SHA-256-derived PTK KCK, and echo the
+    // WPA3 (AKM-SAE, MFP) RSN IE — not the WPA2/SHA-1/HMAC profile.
+    fn smoke_wpa3_sae_m1_m2_descriptor_and_cmac_mic() -> TestResult {
+        let rsn = narf_wireless::rsn::RsnIe::wpa3_sae_ccmp().encode_body();
+        let mut session = Session::new(
+            Akm::Wpa3Sae,
+            [0x11; 32],
+            [2, 1, 2, 3, 4, 5],
+            [2, 6, 7, 8, 9, 10],
+            [0x33; 32],
+            rsn.clone(),
+        );
+        // WPA2 M1 with the Key Information descriptor version flipped 2→0
+        // (0x008a → 0x0088): ACK | Pairwise, version 0.
+        let m1 = hex("0203005f0200880010000000000000000122222222222222222222222222222222222222222222222222222222222222220000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        let reply = match session.process(&m1) {
+            Ok(reply) => reply,
+            Err(error) => return TestResult::Fail(error),
+        };
+        if reply.keys.is_some() || session.complete() {
+            return TestResult::Fail("WPA3 M1 opened controlled port");
+        }
+        let m2 = KeyFrame::decode(&reply.bytes[4..], 16).unwrap();
+        if m2.key_information != (KI_KEY_MIC | KI_KEY_TYPE_PAIRWISE) {
+            return TestResult::Fail("WPA3 M2 not Key Descriptor Version 0");
+        }
+        let mut expected_kd = alloc::vec![48u8, rsn.len() as u8];
+        expected_kd.extend_from_slice(&rsn);
+        if m2.key_data != expected_kd {
+            return TestResult::Fail("WPA3 M2 did not echo the SAE RSN IE");
+        }
+        // Independently recompute the MIC: AES-128-CMAC(KCK, M2|mic=0),
+        // KCK from the SHA-256 KDF-Length PTK.
+        let kck = wpa::derive_ptk_sha256(
+            &[0x11; 32],
+            &[2, 1, 2, 3, 4, 5],
+            &[2, 6, 7, 8, 9, 10],
+            &[0x22; 32],
+            &[0x33; 32],
+            16,
+        )
+        .kck;
+        let mut zeroed = reply.bytes.clone();
+        zeroed[81..97].fill(0);
+        let expected = wpa::compute_mic_cmac(&kck, &zeroed);
+        if reply.bytes[81..97] != expected {
+            return TestResult::Fail("WPA3 M2 MIC is not AES-128-CMAC over the SHA-256 KCK");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/security",
+        smoke_wpa3_sae_m1_m2_descriptor_and_cmac_mic
+    );
 }
 
 pub struct Session {
+    akm: Akm,
     pmk: [u8; 32],
     ap: [u8; 6],
     local: [u8; 6],
@@ -236,6 +353,7 @@ impl Drop for Session {
 
 impl Session {
     pub fn new(
+        akm: Akm,
         pmk: [u8; 32],
         ap: [u8; 6],
         local: [u8; 6],
@@ -243,6 +361,7 @@ impl Session {
         ap_rsn: Vec<u8>,
     ) -> Self {
         Self {
+            akm,
             pmk,
             ap,
             local,
@@ -285,8 +404,7 @@ impl Session {
             && u16::from_be_bytes([pdu[2], pdu[3]]) as usize == pdu.len() - 4
         {
             let key = KeyFrame::decode(&pdu[4..], 16).ok_or("invalid EAPOL key")?;
-            if key.key_information == (KI_VERSION_HMAC_SHA1_AES | KI_KEY_ACK | KI_KEY_TYPE_PAIRWISE)
-            {
+            if key.key_information == (self.akm.ki_version() | KI_KEY_ACK | KI_KEY_TYPE_PAIRWISE) {
                 if let Some(pending) = &mut self.pending_rekey {
                     if pdu == pending.last_request {
                         return pending.process_inner(pdu);
@@ -299,6 +417,7 @@ impl Session {
                     return Err("stale pairwise rekey challenge");
                 }
                 let mut candidate = Box::new(Session::new(
+                    self.akm,
                     self.pmk,
                     self.ap,
                     self.local,
@@ -341,7 +460,7 @@ impl Session {
         let key = KeyFrame::decode(&pdu[4..], 16).ok_or("invalid EAPOL key")?;
         if pdu.len() != 99 + key.key_data.len()
             || key.descriptor_type != KEY_DESCRIPTOR_RSN
-            || key.key_information & 7 != KI_VERSION_HMAC_SHA1_AES
+            || key.key_information & 7 != self.akm.ki_version()
             || key.key_length != 16
         {
             return Err("unsupported EAPOL key format");
@@ -353,12 +472,12 @@ impl Session {
             });
         }
         let (mut reply, update) = if self.ptk.is_none() {
-            if key.key_information != (KI_VERSION_HMAC_SHA1_AES | KI_KEY_ACK | KI_KEY_TYPE_PAIRWISE)
+            if key.key_information != (self.akm.ki_version() | KI_KEY_ACK | KI_KEY_TYPE_PAIRWISE)
                 || key.key_nonce == [0; 32]
             {
-                return Err("invalid WPA2 message 1");
+                return Err("invalid message 1");
             }
-            let ptk = wpa::derive_ptk_sha1(
+            let ptk = self.akm.derive_ptk(
                 &self.pmk,
                 &self.ap,
                 &self.local,
@@ -367,10 +486,10 @@ impl Session {
                 16,
             );
             let mut reply = KeyFrame::empty(16);
-            reply.key_information = KI_VERSION_HMAC_SHA1_AES | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
+            reply.key_information = self.akm.ki_version() | KI_KEY_TYPE_PAIRWISE | KI_KEY_MIC;
             reply.replay_counter = key.replay_counter;
             reply.key_nonce = self.snonce;
-            let rsn = narf_wireless::rsn::RsnIe::wpa2_psk_ccmp().encode_body();
+            let rsn = self.akm.sta_rsn_ie();
             reply.key_data.extend_from_slice(&[48, rsn.len() as u8]);
             reply.key_data.extend_from_slice(&rsn);
             self.ptk = Some(ptk);
@@ -383,7 +502,7 @@ impl Session {
             let ptk = self.ptk.as_ref().unwrap();
             let mut authenticated = pdu.to_vec();
             authenticated[81..97].fill(0);
-            let expected = handshake::compute_mic(&ptk.kck, &authenticated);
+            let expected = self.akm.mic(&ptk.kck, &authenticated);
             if expected
                 .iter()
                 .zip(&pdu[81..97])
@@ -392,11 +511,8 @@ impl Session {
             {
                 return Err("EAPOL MIC mismatch");
             }
-            let common = KI_VERSION_HMAC_SHA1_AES
-                | KI_KEY_ACK
-                | KI_KEY_MIC
-                | KI_SECURE
-                | KI_ENCRYPTED_KEY_DATA;
+            let common =
+                self.akm.ki_version() | KI_KEY_ACK | KI_KEY_MIC | KI_SECURE | KI_ENCRYPTED_KEY_DATA;
             let pairwise_message = key.pairwise();
             let expected_flags = common
                 | if pairwise_message {
@@ -446,8 +562,22 @@ impl Session {
             if pn >> 48 != 0 {
                 return Err("invalid GTK replay counter");
             }
+            // WPA3 negotiates management-frame protection, so the initial
+            // M3 must carry the IGTK (BIP-CMAC-128). Group rekeys may omit
+            // it. WPA2 never installs an IGTK.
+            let igtk = if self.akm == Akm::Wpa3Sae {
+                match rekey::parse_igtk_kde(&clear) {
+                    Some(kde) => Some((kde.igtk, kde.key_id)),
+                    None if pairwise_message && !self.complete => {
+                        return Err("WPA3 message 3 lacks IGTK")
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             let mut reply = KeyFrame::empty(16);
-            reply.key_information = KI_VERSION_HMAC_SHA1_AES
+            reply.key_information = self.akm.ki_version()
                 | KI_KEY_MIC
                 | KI_SECURE
                 | if pairwise_message {
@@ -464,6 +594,7 @@ impl Session {
                     group,
                     group_id,
                     group_rx_pn: pn,
+                    igtk,
                 })
             };
             if pairwise_message && !self.complete {
@@ -474,7 +605,7 @@ impl Session {
         reply.key_mic.fill(0);
         let mut bytes = reply.into_eapol();
         bytes[0] = pdu[0];
-        let mic = handshake::compute_mic(&self.ptk.as_ref().unwrap().kck, &bytes);
+        let mic = self.akm.mic(&self.ptk.as_ref().unwrap().kck, &bytes);
         bytes[81..97].copy_from_slice(&mic);
         self.replay = key.replay_counter;
         self.complete |= update.is_some();

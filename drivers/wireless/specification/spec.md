@@ -108,8 +108,16 @@ used. The Sc/BE211 profile implements `WirelessNetIface` as follows:
   enables BK/BE/VI/VO hardware queues with AP EDCA parameters and QoS headers.
   DSCP classifies kernel traffic; explicit AC rings preserve daemon priorities.
   Categories requiring admission control downgrade to an admitted category.
-  Association supports Open and WPA2-PSK with CCMP-128; WPA3, WEP, TKIP and
-  required management-frame protection are unsupported. A configured host regulatory domain and
+  Association supports Open, WPA2-PSK, and WPA3-Personal (SAE) with
+  CCMP-128. WPA3 runs the SAE (H2E, group 19) commit/confirm exchange in
+  the driver, derives the PMK, and completes the AKM-SAE 4-way handshake
+  (SHA-256 KDF-Length PTK, AES-128-CMAC EAPOL-Key MIC, Key Descriptor
+  Version 0). The IGTK from message 3 is installed into a BIP-CMAC-128 key
+  store (`wireless::mfp`): group-addressed robust management frames are
+  MMIE-verified on receive and a forged or unprotected deauthentication /
+  disassociation is dropped instead of tearing down the link (the 802.11w
+  forged-broadcast-deauth defense), and the station's own disassociation is
+  sent with the Protected bit set. WEP and TKIP remain unsupported. A configured host regulatory domain and
   firmware MCC permission are required before transmission. The selected
   rule's power ceiling is applied through the firmware power command.
 - WPA2 authenticates the original EAPOL PDU before changing key/replay
@@ -218,6 +226,49 @@ netlink sockets without attaching the L3 frame path to XDP. Executable
 selection and boot service policy belong to the launcher. Actual supplicant
 interoperability, provisioned policy and target hardware still require an
 end-to-end integration run.
+
+A `wireless/nl80211` regression test (`smoke_nl80211_supplicant_interop`)
+replays the exact exchange `wpa_supplicant` drives through libnl —
+`CTRL_CMD_GETFAMILY("nl80211")`, `GET_WIPHY`, `GET_INTERFACE`,
+`TRIGGER_SCAN`/`NEW_SCAN_RESULTS`, `GET_SCAN`, `CONNECT`, `DISCONNECT` —
+through the production generic-netlink dispatcher and multicast event sink
+against a mock offload station, asserting the family id, the scan/mlme group
+ids (18/19), the advertised commands/cipher/ext-features, and the connect and
+disconnect event payloads. All command, attribute, nested sub-attribute,
+cipher/AKM suite, ext-feature and errno values are validated against
+`/usr/src/linux` `include/uapi/linux/nl80211.h` (6.17-rc2). This proves the
+software contract a supplicant depends on; it is not a silicon test.
+
+WPA3-Personal (SAE) is wired through the same control plane. A driver that
+sets `WirelessNetIface::supports_sae_offload()` advertises
+`NL80211_EXT_FEATURE_SAE_OFFLOAD`, and `CONNECT` decodes the SAE attribute set
+(`NL80211_ATTR_SAE_PASSWORD`, AKM `00-0F-AC:8`, SAE auth, required MFP, CCMP)
+into `SecurityConfig::Wpa3`, selecting a WPA3 BSS and emitting the connect
+event (`smoke_nl80211_wpa3_sae_connect`). The iwlwifi station profile
+implements this end to end: it advertises SAE offload, runs the SAE
+commit/confirm exchange (`wireless::sae`, H2E group 19) as algorithm-3
+Authentication frames, and completes the AKM-SAE 4-way handshake
+(`security::Akm::Wpa3Sae`: SHA-256 KDF-Length PTK, AES-128-CMAC MIC, Key
+Descriptor Version 0). The IGTK is installed and 802.11w management-frame
+protection is enforced on the management RX/TX paths via `wireless::mfp`
+(BIP-CMAC-128 MMIE verification of group-addressed robust frames, dropping
+forged/unprotected deauth/disassoc). The SAE exchange honors an AP's
+anti-clogging-token request (status 76), echoing the token in an H2E
+Anti-Clogging Token Container element on a bounded Commit retry.
+
+Roaming is supported: a connect request targeting a different BSS of the
+current ESS (`WirelessNetIface::connected_bssid` differs from the target) is
+routed through `WirelessNetIface::roam`, which reassociates — a Reassociation
+Request carrying the previous AP address, re-auth, and a fresh 4-way handshake
+with the new AP — and the control plane publishes an `NL80211_CMD_ROAM` event
+rather than `CONNECT`. `Connection::protect_group_mgmt` provides the
+BIP-CMAC-128 MMIE *emission* counterpart to inbound verification (the
+transmit hook an AP/mesh send path would use); station mode never emits
+group-addressed robust management frames, so it is exercised by a
+protect/verify round-trip test. A full AP-mode send path (`START_AP`,
+beaconing, client management) and SAE-PK public-key validation remain
+follow-up work; as with the rest of this profile, these paths are validated
+by software contract tests, not against target silicon.
 
 ## 5. Buffer Management
 

@@ -61,6 +61,14 @@ pub trait WirelessNetIface: Interface {
         false
     }
 
+    /// The driver performs the WPA3-Personal SAE exchange and key setup from a
+    /// supplied password (NL80211_EXT_FEATURE_SAE_OFFLOAD). Distinct from
+    /// [`supports_handshake_offload`](Self::supports_handshake_offload): a
+    /// driver may offload the PSK 4-way handshake without doing SAE.
+    fn supports_sae_offload(&self) -> bool {
+        false
+    }
+
     /// Driver emits nl80211 link-loss notifications, including local teardown.
     fn reports_disconnect_events(&self) -> bool {
         false
@@ -81,6 +89,19 @@ pub trait WirelessNetIface: Interface {
 
     /// Disconnects from the current Access Point.
     async fn disassociate(&self) -> Result<(), WirelessError>;
+
+    /// BSSID of the current association, if any. Lets the control plane route
+    /// a connect request targeting a different BSS of the same ESS as a roam.
+    fn connected_bssid(&self) -> Option<[u8; 6]> {
+        None
+    }
+
+    /// Reassociate (roam) to a new BSS of the current ESS, preserving the
+    /// interface. Defaults to unsupported; drivers that can reassociate
+    /// override this.
+    async fn roam(&self, _req: AssociateRequest) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
 
     /// Configures PHY-level parameters.
     async fn set_config(&self, cfg: WirelessConfig) -> Result<(), WirelessError>;

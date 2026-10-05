@@ -97,8 +97,12 @@ pub fn register_context_handler(id: u16, handler: ContextHandler) -> bool {
     true
 }
 
-pub fn install_event_sink(sink: EventSink) {
-    *EVENT_SINK.lock() = Some(sink);
+/// Install the multicast delivery sink, returning the previously installed
+/// one (if any). Returning the prior sink lets a caller restore it afterward,
+/// which an in-kernel test that temporarily captures events relies on so the
+/// production socket sink keeps delivering once the test finishes.
+pub fn install_event_sink(sink: EventSink) -> Option<EventSink> {
+    EVENT_SINK.lock().replace(sink)
 }
 
 /// Deliver a kernel notification to a registered multicast group.

@@ -250,9 +250,22 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
                     &iface.get_wireless_info(),
                     Some(iface.as_ref()),
                 );
-                if iface.supports_handshake_offload() {
-                    push_attr(&mut attrs, 217, &[0, 0x80]); // EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK
+                let psk = iface.supports_handshake_offload();
+                let sae = iface.supports_sae_offload();
+                if psk || sae {
+                    // CCMP (00-0F-AC:4) is the pairwise cipher for both
+                    // WPA2-PSK and WPA3-SAE Personal.
                     push_attr(&mut attrs, 57, &0x000fac04u32.to_ne_bytes());
+                    // NL80211_ATTR_EXT_FEATURES is a little-endian bitmap:
+                    // bit 15 = 4WAY_HANDSHAKE_STA_PSK, bit 38 = SAE_OFFLOAD.
+                    let mut ext = alloc::vec![0u8; if sae { 5 } else { 2 }];
+                    if psk {
+                        ext[1] |= 0x80; // bit 15
+                    }
+                    if sae {
+                        ext[4] |= 0x40; // bit 38
+                    }
+                    push_attr(&mut attrs, 217, &ext);
                 }
                 GenlReply {
                     command: NL80211_CMD_NEW_WIPHY,

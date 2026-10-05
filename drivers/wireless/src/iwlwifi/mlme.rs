@@ -399,6 +399,21 @@ pub fn build_open_auth_body() -> [u8; 6] {
     body
 }
 
+/// Build the body of an 802.11 SAE Authentication frame (algorithm 3):
+/// the 6-byte fixed header (algorithm / sequence / status) followed by
+/// the SAE variable payload — the Commit (scalar+element) for seq 1 or
+/// the Confirm (send-confirm+MAC) for seq 2.
+///
+/// Reference: IEEE 802.11-2020 §9.3.3.12 + §12.4.7 (SAE frame bodies).
+pub fn build_sae_auth_body(seq: u16, status: u16, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(6 + payload.len());
+    body.extend_from_slice(&auth_algorithm::SAE.to_le_bytes());
+    body.extend_from_slice(&seq.to_le_bytes());
+    body.extend_from_slice(&status.to_le_bytes());
+    body.extend_from_slice(payload);
+    body
+}
+
 /// Decoded authentication fixed-fields (algorithm, seq, status).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct AuthResponse {
@@ -481,6 +496,52 @@ pub fn build_assoc_request_rsn(params: &AssocParamsRsn) -> Vec<u8> {
         frame.extend_from_slice(&rsn_body[..rsn_len]);
     }
 
+    frame
+}
+
+/// Build an 802.11 Reassociation Request frame (§9.3.3.8). Identical to the
+/// Association Request except the management subtype is Reassociation and a
+/// 6-byte Current AP Address immediately follows the Listen Interval.
+///
+/// Reference: `net/mac80211/mlme.c::ieee80211_send_assoc` (reassoc branch).
+pub fn build_reassoc_request_rsn(params: &AssocParamsRsn, current_ap: [u8; 6]) -> Vec<u8> {
+    use super::tx::{fc, MacHeader};
+    let base = &params.base;
+    let mac_hdr = MacHeader::management(
+        fc::SUBTYPE_REASSOC_REQ,
+        base.ap_bssid,
+        base.sta_addr,
+        base.ap_bssid,
+        base.seq_num,
+    );
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&mac_hdr.to_bytes());
+    frame.extend_from_slice(&base.capability_info.to_le_bytes());
+    frame.extend_from_slice(&base.listen_interval.to_le_bytes());
+    frame.extend_from_slice(&current_ap); // Current AP Address (reassoc only)
+
+    let ssid_len = base.ssid.len().min(32);
+    frame.push(0x00);
+    frame.push(ssid_len as u8);
+    frame.extend_from_slice(&base.ssid[..ssid_len]);
+
+    let rates_len = base.supported_rates.len().min(8);
+    frame.push(0x01);
+    frame.push(rates_len as u8);
+    frame.extend_from_slice(&base.supported_rates[..rates_len]);
+
+    if !params.ext_rates.is_empty() {
+        let ext_len = params.ext_rates.len().min(255);
+        frame.push(0x32);
+        frame.push(ext_len as u8);
+        frame.extend_from_slice(&params.ext_rates[..ext_len]);
+    }
+    if let Some(rsn_body) = &params.rsn_ie_body {
+        let rsn_len = rsn_body.len().min(255);
+        frame.push(0x30);
+        frame.push(rsn_len as u8);
+        frame.extend_from_slice(&rsn_body[..rsn_len]);
+    }
     frame
 }
 
@@ -991,6 +1052,43 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/mlme",
         smoke_iwlwifi_mlme_assoc_request_with_rsn_ie
+    );
+
+    // A Reassociation Request uses mgmt subtype 0x20 and inserts a 6-byte
+    // Current AP Address between the Listen Interval and the first IE.
+    fn smoke_iwlwifi_mlme_reassoc_request_current_ap() -> TestResult {
+        let current_ap = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        let params = AssocParamsRsn {
+            base: AssocParams {
+                sta_addr: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                ap_bssid: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+                ssid: b"narf-net".to_vec(),
+                supported_rates: alloc::vec![0x82, 0x84, 0x8B, 0x96],
+                capability_info: 0x0411,
+                listen_interval: 10,
+                seq_num: 2,
+            },
+            rsn_ie_body: None,
+            ext_rates: alloc::vec![],
+        };
+        let frame = build_reassoc_request_rsn(&params, current_ap);
+        // Frame Control subtype must be Reassociation Request (0x20).
+        if frame[0] & 0xf0 != 0x20 {
+            return TestResult::Fail("reassoc frame is not subtype 0x20");
+        }
+        // body = cap(2) | listen(2) | current AP(6) | SSID IE ...
+        let body = &frame[24..];
+        if body[4..10] != current_ap {
+            return TestResult::Fail("Current AP Address missing/misplaced");
+        }
+        if body[10] != 0x00 || body[11] as usize != "narf-net".len() {
+            return TestResult::Fail("SSID IE must follow the Current AP Address");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/mlme",
+        smoke_iwlwifi_mlme_reassoc_request_current_ap
     );
     kernel_test_in!(
         "drivers/wireless/iwlwifi/mlme",

@@ -224,6 +224,75 @@ pub fn derive_ptk_sha1(
     derive_ptk(&HmacSha1, pmk, aa, sa, anonce, snonce, tk_len)
 }
 
+/// IEEE 802.11-2020 §12.7.1.6.2 `KDF-Hash-Length` instantiated with
+/// HMAC-SHA256. Unlike the AKM-1/2 PRF (which appends a single counter
+/// byte), this prepends a little-endian 16-bit iteration counter and
+/// appends the little-endian 16-bit output length in bits — the
+/// construction AKM-SAE (and the other SHA-256 AKMs) require.
+fn kdf_sha256_length(key: &[u8], label: &[u8], context: &[u8], length_bits: u16) -> Vec<u8> {
+    let out_bytes = (length_bits as usize).div_ceil(8);
+    let mut out = Vec::with_capacity(out_bytes + 32);
+    let mut i: u16 = 1;
+    while out.len() < out_bytes {
+        let mut data = Vec::with_capacity(2 + label.len() + context.len() + 2);
+        data.extend_from_slice(&i.to_le_bytes());
+        data.extend_from_slice(label);
+        data.extend_from_slice(context);
+        data.extend_from_slice(&length_bits.to_le_bytes());
+        out.extend_from_slice(&narf_crypto::hkdf::hmac_sha256(key, &data));
+        i = i.wrapping_add(1);
+    }
+    out.truncate(out_bytes);
+    out
+}
+
+/// Derive the PTK for a SHA-256 AKM (e.g. AKM-SAE, 00-0F-AC:8). Same
+/// nonce/MAC canonical ordering as [`derive_ptk_sha1`], but the KDF is
+/// `KDF-Hash-Length` over HMAC-SHA256 (§12.7.1.3 + §12.7.1.6.2). The
+/// EAPOL-Key MIC for these AKMs is AES-128-CMAC, not HMAC-SHA1.
+pub fn derive_ptk_sha256(
+    pmk: &[u8],
+    aa: &[u8; 6],
+    sa: &[u8; 6],
+    anonce: &[u8; 32],
+    snonce: &[u8; 32],
+    tk_len: usize,
+) -> Ptk {
+    let mut context = Vec::with_capacity(12 + 64);
+    if aa <= sa {
+        context.extend_from_slice(aa);
+        context.extend_from_slice(sa);
+    } else {
+        context.extend_from_slice(sa);
+        context.extend_from_slice(aa);
+    }
+    if anonce <= snonce {
+        context.extend_from_slice(anonce);
+        context.extend_from_slice(snonce);
+    } else {
+        context.extend_from_slice(snonce);
+        context.extend_from_slice(anonce);
+    }
+    let total_bits = ((16 + 16 + tk_len) * 8) as u16;
+    let bytes = kdf_sha256_length(pmk, b"Pairwise key expansion", &context, total_bits);
+    Ptk {
+        kck: bytes[0..16].to_vec(),
+        kek: bytes[16..32].to_vec(),
+        tk: bytes[32..32 + tk_len].to_vec(),
+    }
+}
+
+/// EAPOL-Key MIC for the SHA-256 AKMs: AES-128-CMAC over the EAPOL PDU
+/// (with the MIC field zeroed), keyed by the 16-byte KCK, truncated to
+/// 16 bytes (§12.7.2, Key Descriptor Version 0 / AKM-SAE).
+pub fn compute_mic_cmac(kck: &[u8], eapol_bytes_with_zero_mic: &[u8]) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&kck[..16]);
+    let mic = narf_crypto::cmac_aes128::cmac_aes128(&key, eapol_bytes_with_zero_mic);
+    key.iter_mut().for_each(|b| *b = 0);
+    mic
+}
+
 /// Result of a completed 4-way handshake on the supplicant side.
 #[allow(missing_debug_implementations)] // TODO(narf): no Debug impl yet
 pub struct HandshakeResult {
@@ -471,5 +540,44 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/wpa",
         smoke_wpa_assoc_response_decode
+    );
+
+    // AKM-SAE PTK uses the SHA-256 KDF-Length, which must be deterministic
+    // and distinct from the AKM-1/2 SHA-1 PRF for the same inputs.
+    fn smoke_wpa_ptk_sha256_distinct_from_sha1() -> TestResult {
+        let (pmk, aa, sa, an, sn) = ([0x5a; 32], [0xAA; 6], [0x11; 6], [0x22; 32], [0x33; 32]);
+        let a = derive_ptk_sha256(&pmk, &aa, &sa, &an, &sn, 16);
+        let b = derive_ptk_sha256(&pmk, &aa, &sa, &an, &sn, 16);
+        let legacy = derive_ptk_sha1(&pmk, &aa, &sa, &an, &sn, 16);
+        if a.kck != b.kck || a.kek != b.kek || a.tk != b.tk {
+            return TestResult::Fail("SHA-256 PTK not deterministic");
+        }
+        if a.kck.len() != 16 || a.kek.len() != 16 || a.tk.len() != 16 {
+            return TestResult::Fail("SHA-256 PTK field lengths wrong");
+        }
+        if a.kck == legacy.kck {
+            return TestResult::Fail("SHA-256 PTK must differ from SHA-1 PRF output");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/wpa",
+        smoke_wpa_ptk_sha256_distinct_from_sha1
+    );
+
+    // The AKM-SAE EAPOL-Key MIC is AES-128-CMAC truncated to 16 bytes.
+    fn smoke_wpa_cmac_mic_matches_primitive() -> TestResult {
+        let kck = [0x07u8; 16];
+        let data = b"eapol-key-message-2";
+        let mic = compute_mic_cmac(&kck, data);
+        let expected = narf_crypto::cmac_aes128::cmac_aes128(&kck, data);
+        if mic != expected {
+            return TestResult::Fail("CMAC MIC does not match the CMAC-AES128 primitive");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/wpa",
+        smoke_wpa_cmac_mic_matches_primitive
     );
 }
