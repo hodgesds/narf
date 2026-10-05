@@ -120,13 +120,21 @@ struct MknodFile {
 }
 
 impl FileOps for MknodFile {
+    fn open_instance_checked(&self, _write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        // `mknod` records a dev_t before a driver has necessarily bound it.
+        // Preserve that node for stat, udev ownership rules and O_PATH, but
+        // never turn an unclaimed char/block number into a fake EOF or
+        // write-discard device. Linux rejects an ordinary open of a node
+        // with no bound implementation as ENXIO
+        // (`fs/char_dev.c::chrdev_open`, `block/bdev.c`).
+        Err(FsError::NoDeviceAddress)
+    }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        // No backing driver: read returns EOF (like an unclaimed node).
-        Box::pin(async move { Ok(0) })
+        Box::pin(async move { Err(FsError::NoDeviceAddress) })
     }
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let len = buf.len();
-        Box::pin(async move { Ok(len) })
+        let _ = buf;
+        Box::pin(async move { Err(FsError::NoDeviceAddress) })
     }
     fn stat(&self) -> Stat {
         let metadata = *self.node.metadata.lock();
@@ -2133,8 +2141,9 @@ kernel_test_in!("filesystem/devfs", smoke_dev_mountpoint_stub_dirs);
 
 /// Smoke: `mknod` of a char node on devfs succeeds and the node then stats
 /// as a char device (`FileType::Special`) with the requested `st_rdev`, and is
-/// enumerated. This is the udev-coldplug `/dev/<name>` creation path. Never a
-/// bare -1: `mknod` returns a usable FileOps.
+/// enumerated. This is the udev-coldplug `/dev/<name>` creation path. It is a
+/// metadata node until a provider binds its dev_t, so an ordinary open returns
+/// ENXIO instead of providing fabricated I/O.
 fn smoke_dev_mknod_char_node() -> TestResult {
     __reset_mknod_for_test();
     let dir = DevDir;
@@ -2151,6 +2160,9 @@ fn smoke_dev_mknod_char_node() -> TestResult {
     }
     if node.rdev() != rdev {
         return TestResult::Fail("mknod char node st_rdev != requested dev_t");
+    }
+    if !matches!(node.open_instance_checked(false), Err(FsError::NoDeviceAddress)) {
+        return TestResult::Fail("unclaimed mknod node did not reject ordinary open with ENXIO");
     }
     // It is now discoverable via lookup and enumerate.
     match dir.lookup("coldplug-char0") {

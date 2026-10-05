@@ -407,7 +407,10 @@ distinct through VFS stat and readdir translation, carry Linux `st_rdev`
 values, and expose stable non-zero inode identities. The root accepts runtime
 device-node, directory, and symlink creation plus rename/removal. Dynamic
 device nodes preserve type, mode, uid/gid, rdev, and inode across lookups;
-dynamic directories preserve mode and inode identity. This covers
+dynamic directories preserve mode and inode identity. An unclaimed dynamic
+character or block dev_t remains stat-able and available to `O_PATH`, but an
+ordinary open returns `ENXIO`; it never exposes fabricated EOF or
+write-discard I/O. This covers
 udev coldplug nodes, `/dev/{char,block}/MAJOR:MINOR`, and journald's
 `/dev/log -> /run/systemd/journal/dev-log`; static device aliases retain
 precedence over dynamic names and absent optional hardware nodes are not
