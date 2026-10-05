@@ -46,6 +46,9 @@ pub mod intel_ipu6;
 // ── devfs / sysfs bridge ────────────────────────────────────────────
 pub mod devfs_bridge;
 
+// ── V4L2 VIDIOC_* ioctl surface + MMAP streaming ────────────────────
+pub mod v4l2_ioctl;
+
 // ── MIPI-CSI sensor interface ───────────────────────────────────────
 pub mod sensor;
 
