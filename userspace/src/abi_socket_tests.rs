@@ -6,6 +6,7 @@ const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
+const SOCK_SEQPACKET: u64 = 5;
 const SOL_SOCKET: u64 = 1;
 const SO_REUSEADDR: u64 = 2;
 const SO_TYPE: u64 = 3;
@@ -36,6 +37,50 @@ fn open_unix_stream() -> Result<u64, &'static str> {
         Some(fd) if fd >= 0 => Ok(fd as u64),
         _ => Err("socket(AF_UNIX, SOCK_STREAM) did not return a valid fd"),
     }
+}
+
+fn open_unix_pair(kind: u64) -> Result<(u64, u64), &'static str> {
+    let mut sv = [0u8; 8];
+    if call(
+        Syscall::SocketPair.raw(),
+        a3(AF_UNIX, kind, 0, sv.as_mut_ptr() as u64),
+    ) != Some(0)
+    {
+        return Err("socketpair setup failed");
+    }
+    Ok((
+        i32::from_ne_bytes(sv[0..4].try_into().unwrap()) as u64,
+        i32::from_ne_bytes(sv[4..8].try_into().unwrap()) as u64,
+    ))
+}
+
+fn enable_passcred(fd: u64) -> Result<(), &'static str> {
+    let on = 1u32.to_ne_bytes();
+    match call(
+        Syscall::SocketSetSockOpt.raw(),
+        SyscallArgs {
+            arg0: fd,
+            arg1: SOL_SOCKET,
+            arg2: SO_PASSCRED,
+            arg3: on.as_ptr() as u64,
+            arg4: on.len() as u64,
+            arg5: 0,
+        },
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("setsockopt(SO_PASSCRED) failed"),
+    }
+}
+
+fn scm_credentials_control(pid: u32, uid: u32, gid: u32) -> [u8; 32] {
+    let mut ctrl = [0u8; 32];
+    ctrl[0..8].copy_from_slice(&28u64.to_ne_bytes());
+    ctrl[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+    ctrl[12..16].copy_from_slice(&SCM_CREDENTIALS.to_ne_bytes());
+    ctrl[16..20].copy_from_slice(&pid.to_ne_bytes());
+    ctrl[20..24].copy_from_slice(&uid.to_ne_bytes());
+    ctrl[24..28].copy_from_slice(&gid.to_ne_bytes());
+    ctrl
 }
 
 /// Build a NARF/Linux `sockaddr_un`-ish buffer: family(u16 LE) + path bytes.
@@ -4181,6 +4226,301 @@ kernel_test_in!(
     smoke_abi_socket_recvmsg_scm_credentials
 );
 
+/// Explicit SCM_CREDENTIALS may select any of the caller's real/effective/
+/// saved IDs. The queued identity is the selected one, not an automatically
+/// substituted current credential, and CMSG_LEN(12)=28 bytes is enough to
+/// receive it without MSG_CTRUNC.
+fn smoke_abi_socket_explicit_scm_credentials_saved_ids_exact_buffer() -> TestResult {
+    with_setup(|| {
+        let (tx, rx) = open_unix_pair(SOCK_DGRAM)?;
+        enable_passcred(rx)?;
+
+        // Establish distinct real/effective/saved IDs while the fixture still
+        // holds CAP_SET{G,U}ID. Explicit SCM credentials may name any member of
+        // each triplet.
+        if call(Syscall::Setresgid.raw(), a2(4001, 4002, 4003)) != Some(0) {
+            return Err("setresgid credential setup failed");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1001, 1002, 1003)) != Some(0) {
+            return Err("setresuid credential setup failed");
+        }
+        let pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid failed")? as u32;
+        let ctrl = scm_credentials_control(pid, 1003, 4003);
+        let mut smsg = [0u8; 56];
+        smsg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        // Only CMSG_LEN is meaningful input; the trailing alignment bytes are
+        // deliberately excluded.
+        smsg[40..48].copy_from_slice(&28u64.to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(tx, smsg.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("zero-length sendmsg with explicit credentials failed");
+        }
+
+        let mut rctrl = [0u8; 28];
+        let mut rmsg = [0u8; 56];
+        rmsg[32..40].copy_from_slice(&(rctrl.as_mut_ptr() as u64).to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&(rctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx, rmsg.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("zero-length recvmsg did not dequeue explicit credentials");
+        }
+        if u64::from_ne_bytes(rmsg[40..48].try_into().unwrap()) != 28 {
+            return Err("exact CMSG_LEN credential buffer was not fully used");
+        }
+        if u32::from_ne_bytes(rmsg[48..52].try_into().unwrap()) & 0x8 != 0 {
+            return Err("exact CMSG_LEN credential buffer incorrectly set MSG_CTRUNC");
+        }
+        if u64::from_ne_bytes(rctrl[0..8].try_into().unwrap()) != 28
+            || i32::from_ne_bytes(rctrl[8..12].try_into().unwrap()) != SOL_SOCKET as i32
+            || i32::from_ne_bytes(rctrl[12..16].try_into().unwrap()) != SCM_CREDENTIALS
+            || u32::from_ne_bytes(rctrl[16..20].try_into().unwrap()) != pid
+            || u32::from_ne_bytes(rctrl[20..24].try_into().unwrap()) != 1003
+            || u32::from_ne_bytes(rctrl[24..28].try_into().unwrap()) != 4003
+        {
+            return Err("explicit SCM_CREDENTIALS were altered or malformed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_explicit_scm_credentials_saved_ids_exact_buffer
+);
+
+/// Automatic SCM credentials use real IDs, while SO_PEERCRED snapshots the
+/// effective IDs at connection creation.
+fn smoke_abi_socket_automatic_scm_uses_real_ids_peercred_uses_effective() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Setresgid.raw(), a2(4101, 4102, 4103)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(1101, 1102, 1103)) != Some(0)
+        {
+            return Err("divergent credential setup failed");
+        }
+        let (tx, rx) = open_unix_pair(SOCK_STREAM)?;
+        enable_passcred(rx)?;
+
+        let mut peer = [0u8; 12];
+        let mut peer_len = 12u32.to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: rx,
+                arg1: SOL_SOCKET,
+                arg2: SO_PEERCRED,
+                arg3: peer.as_mut_ptr() as u64,
+                arg4: peer_len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        ) != Some(0)
+        {
+            return Err("getsockopt(SO_PEERCRED) failed");
+        }
+        if u32::from_ne_bytes(peer[4..8].try_into().unwrap()) != 1102
+            || u32::from_ne_bytes(peer[8..12].try_into().unwrap()) != 4102
+        {
+            return Err("SO_PEERCRED did not snapshot effective IDs");
+        }
+
+        let payload = [0x5au8];
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(tx, payload.as_ptr() as u64, 1, 0),
+        ) != Some(1)
+        {
+            return Err("automatic-credential stream send failed");
+        }
+        let mut byte = [0u8; 1];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(byte.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        let mut ctrl = [0u8; 32];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        if call(Syscall::SocketRecvMsg.raw(), a2(rx, msg.as_ptr() as u64, 0)) != Some(1) {
+            return Err("automatic-credential stream receive failed");
+        }
+        if u32::from_ne_bytes(ctrl[20..24].try_into().unwrap()) != 1101
+            || u32::from_ne_bytes(ctrl[24..28].try_into().unwrap()) != 4101
+        {
+            return Err("automatic SCM_CREDENTIALS did not report real IDs");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_automatic_scm_uses_real_ids_peercred_uses_effective
+);
+
+fn smoke_abi_socket_explicit_scm_credentials_rejects_bad_inputs() -> TestResult {
+    with_setup(|| {
+        let (tx, _rx) = open_unix_pair(SOCK_DGRAM)?;
+        let pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid failed")? as u32;
+
+        let malformed = scm_credentials_control(pid, 0, 0);
+        let mut malformed_msg = [0u8; 56];
+        malformed_msg[32..40].copy_from_slice(&(malformed.as_ptr() as u64).to_ne_bytes());
+        malformed_msg[40..48].copy_from_slice(&27u64.to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(tx, malformed_msg.as_ptr() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("malformed SCM_CREDENTIALS length was not EINVAL");
+        }
+
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        let unauthorized = scm_credentials_control(pid, 1, 0);
+        let mut unauthorized_msg = [0u8; 56];
+        unauthorized_msg[32..40].copy_from_slice(&(unauthorized.as_ptr() as u64).to_ne_bytes());
+        unauthorized_msg[40..48].copy_from_slice(&28u64.to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(tx, unauthorized_msg.as_ptr() as u64, 0),
+        ) != Some(EPERM)
+        {
+            return Err("unauthorized explicit uid was not EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_explicit_scm_credentials_rejects_bad_inputs
+);
+
+fn smoke_abi_socket_explicit_scm_credentials_missing_pid_is_esrch() -> TestResult {
+    with_setup(|| {
+        let (tx, _rx) = open_unix_pair(SOCK_DGRAM)?;
+        let ctrl = scm_credentials_control(0x7fff_ff00, 0, 0);
+        let mut msg = [0u8; 56];
+        msg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&28u64.to_ne_bytes());
+        if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0)) != Some(ESRCH) {
+            return Err("authorized nonexistent credential pid was not ESRCH");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_explicit_scm_credentials_missing_pid_is_esrch
+);
+
+/// `accept()` inherits SO_PASSCRED from the listener (`sk_scm_recv_flags`).
+fn smoke_abi_socket_accepted_unix_socket_inherits_passcred() -> TestResult {
+    with_setup(|| {
+        let listener = open_unix_stream()?;
+        let (addr, addr_len) = unix_sockaddr(b"/abi-passcred-inherit");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(listener, addr.as_ptr() as u64, addr_len),
+        ) != Some(0)
+            || call(Syscall::SocketListen.raw(), a1(listener, 4)) != Some(0)
+        {
+            return Err("listener setup failed");
+        }
+        enable_passcred(listener)?;
+        let client = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(client, addr.as_ptr() as u64, addr_len),
+        ) != Some(0)
+        {
+            return Err("client connect failed");
+        }
+        let accepted =
+            call(Syscall::SocketAccept.raw(), a0(listener)).ok_or("accept failed")? as u64;
+        let payload = [1u8];
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(client, payload.as_ptr() as u64, 1, 0),
+        ) != Some(1)
+        {
+            return Err("client send failed");
+        }
+        let mut byte = [0u8; 1];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(byte.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        let mut ctrl = [0u8; 32];
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        msg[32..40].copy_from_slice(&(ctrl.as_mut_ptr() as u64).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(accepted, msg.as_ptr() as u64, 0),
+        ) != Some(1)
+            || i32::from_ne_bytes(ctrl[12..16].try_into().unwrap()) != SCM_CREDENTIALS
+        {
+            return Err("accepted socket did not inherit SO_PASSCRED");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_accepted_unix_socket_inherits_passcred
+);
+
+fn smoke_abi_socket_accept_preserves_seqpacket_type() -> TestResult {
+    with_setup(|| {
+        let listener = open_unix(SOCK_SEQPACKET)?;
+        let (addr, addr_len) = unix_sockaddr(b"/abi-seqpacket-accept-type");
+        if call(
+            Syscall::SocketBind.raw(),
+            a2(listener, addr.as_ptr() as u64, addr_len),
+        ) != Some(0)
+            || call(Syscall::SocketListen.raw(), a1(listener, 4)) != Some(0)
+        {
+            return Err("seqpacket listener setup failed");
+        }
+        let client = open_unix(SOCK_SEQPACKET)?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(client, addr.as_ptr() as u64, addr_len),
+        ) != Some(0)
+        {
+            return Err("seqpacket connect failed");
+        }
+        let accepted = call(Syscall::SocketAccept.raw(), a0(listener))
+            .ok_or("seqpacket accept failed")? as u64;
+        let mut kind = [0u8; 4];
+        let mut len = 4u32.to_ne_bytes();
+        if call(
+            Syscall::SocketGetSockOpt.raw(),
+            SyscallArgs {
+                arg0: accepted,
+                arg1: SOL_SOCKET,
+                arg2: SO_TYPE,
+                arg3: kind.as_mut_ptr() as u64,
+                arg4: len.as_mut_ptr() as u64,
+                arg5: 0,
+            },
+        ) != Some(0)
+            || u32::from_ne_bytes(kind) != SOCK_SEQPACKET as u32
+        {
+            return Err("accepted seqpacket socket was mislabeled as stream");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_accept_preserves_seqpacket_type
+);
+
 /// The exact shape of PID 1's `$NOTIFY_SOCKET`: a bound PATH AF_UNIX/SOCK_DGRAM
 /// socket with SO_PASSCRED, watched via LEVEL-TRIGGERED EPOLLIN
 /// (`sd_event_add_io(..., EPOLLIN, manager_dispatch_notify_fd)`). A datagram
@@ -5062,23 +5402,24 @@ fn smoke_abi_socket_dgram_scm_rights_fd_passing() -> TestResult {
         if ctrllen < 56 {
             return Err("dgram recvmsg did not return rights and credentials");
         }
-        let level = i32::from_ne_bytes(rctrl[8..12].try_into().unwrap());
-        let ctype = i32::from_ne_bytes(rctrl[12..16].try_into().unwrap());
-        if level != SOL_SOCKET as i32 || ctype != SCM_RIGHTS {
-            return Err("dgram recvmsg returned the wrong ancillary record");
-        }
-        let received_fd = i32::from_ne_bytes(rctrl[16..20].try_into().unwrap());
-        if received_fd < 0 || received_fd as u64 == rx {
-            return Err("dgram recvmsg did not install a distinct receiver fd");
-        }
-        // The rights cmsg is padded to 24 bytes; SCM_CREDENTIALS follows it.
-        let cred_level = i32::from_ne_bytes(rctrl[32..36].try_into().unwrap());
-        let cred_type = i32::from_ne_bytes(rctrl[36..40].try_into().unwrap());
-        let cred_pid = u32::from_ne_bytes(rctrl[40..44].try_into().unwrap());
+        // Linux's common SCM receive path emits credentials before rights.
+        let cred_level = i32::from_ne_bytes(rctrl[8..12].try_into().unwrap());
+        let cred_type = i32::from_ne_bytes(rctrl[12..16].try_into().unwrap());
+        let cred_pid = u32::from_ne_bytes(rctrl[16..20].try_into().unwrap());
         let sender_pid = call(Syscall::GetPid.raw(), a0(0)).ok_or("getpid")? as u32;
         if cred_level != SOL_SOCKET as i32 || cred_type != SCM_CREDENTIALS || cred_pid != sender_pid
         {
             return Err("dgram SCM_CREDENTIALS did not name the sender");
+        }
+        // Credentials consume CMSG_SPACE(12)=32 bytes; the rights record follows.
+        let level = i32::from_ne_bytes(rctrl[40..44].try_into().unwrap());
+        let ctype = i32::from_ne_bytes(rctrl[44..48].try_into().unwrap());
+        if level != SOL_SOCKET as i32 || ctype != SCM_RIGHTS {
+            return Err("dgram recvmsg returned the wrong ancillary record");
+        }
+        let received_fd = i32::from_ne_bytes(rctrl[48..52].try_into().unwrap());
+        if received_fd < 0 || received_fd as u64 == rx {
+            return Err("dgram recvmsg did not install a distinct receiver fd");
         }
         if call(Syscall::Close.raw(), a0(received_fd as u64)) != Some(0) {
             return Err("dgram SCM_RIGHTS fd was not usable by the receiver");
@@ -5089,6 +5430,66 @@ fn smoke_abi_socket_dgram_scm_rights_fd_passing() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_dgram_scm_rights_fd_passing
+);
+
+/// A faulting receive control buffer must not leak the descriptor slot that
+/// SCM_RIGHTS tentatively allocated before copying the integer to userspace.
+fn smoke_abi_socket_recvmsg_bad_control_rolls_back_rights_fd() -> TestResult {
+    with_setup(|| {
+        let (tx, rx) = open_unix_pair(SOCK_DGRAM)?;
+        let (passed_fd, hole_fd) = open_unix_pair(SOCK_STREAM)?;
+        if call(Syscall::Close.raw(), a0(hole_fd)) != Some(0) {
+            return Err("failed to prepare receiver fd-table hole");
+        }
+
+        let payload = [0x33u8];
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        let mut control = [0u8; 24];
+        control[0..8].copy_from_slice(&20u64.to_ne_bytes());
+        control[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+        control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        control[16..20].copy_from_slice(&(passed_fd as i32).to_ne_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        smsg[32..40].copy_from_slice(&(control.as_ptr() as u64).to_ne_bytes());
+        smsg[40..48].copy_from_slice(&(control.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(tx, smsg.as_ptr() as u64, 0),
+        ) != Some(1)
+        {
+            return Err("SCM_RIGHTS setup send failed");
+        }
+
+        let mut byte = [0u8; 1];
+        let mut riov = [0u8; 16];
+        riov[0..8].copy_from_slice(&(byte.as_mut_ptr() as u64).to_ne_bytes());
+        riov[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        let mut rmsg = [0u8; 56];
+        rmsg[16..24].copy_from_slice(&(riov.as_ptr() as u64).to_ne_bytes());
+        rmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        rmsg[32..40].copy_from_slice(&BAD_USER_PTR.to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&24u64.to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx, rmsg.as_mut_ptr() as u64, 0),
+        ) != Some(1)
+        {
+            return Err("recvmsg with bad control pointer lost the payload");
+        }
+        let replacement = open_unix_stream()?;
+        if replacement != hole_fd {
+            return Err("bad control pointer leaked the installed SCM_RIGHTS fd slot");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_recvmsg_bad_control_rolls_back_rights_fd
 );
 
 /// A CONNECTED AF_UNIX `SOCK_DGRAM` socketpair must carry SCM_RIGHTS on a
@@ -8150,6 +8551,17 @@ fn smoke_abi_socket_unix_dgram_ancillary_is_per_record() -> TestResult {
         ) {
             return Err("bind of the shared datagram receiver failed");
         }
+        let passcred = 1u32.to_ne_bytes();
+        if !matches!(
+            rx.dispatch_op(SocketOp::SetSockOpt {
+                level: SOL_SOCKET as u32,
+                name: SO_PASSCRED as u32,
+                value: &passcred,
+            }),
+            SocketOpResult::Ok(0)
+        ) {
+            return Err("enabling SO_PASSCRED on shared datagram receiver failed");
+        }
 
         // Two senders with distinct identities, exactly like two udev workers.
         for (task, pid, payload) in [
@@ -8196,9 +8608,13 @@ fn smoke_abi_socket_unix_dgram_ancillary_is_per_record() -> TestResult {
 
         // Now each extracts. Each must see ITS OWN record's sender.
         set_task(RECEIVER_1);
-        let cred1 = rx.recvmsg_cred();
+        let cred1 = rx
+            .recvmsg_cred()
+            .ok_or("first receiver had no credentials")?;
         set_task(RECEIVER_2);
-        let cred2 = rx.recvmsg_cred();
+        let cred2 = rx
+            .recvmsg_cred()
+            .ok_or("second receiver had no credentials")?;
 
         if cred1.pid as u64 != SENDER_A_PID {
             return Err(
@@ -8214,6 +8630,90 @@ fn smoke_abi_socket_unix_dgram_ancillary_is_per_record() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_unix_dgram_ancillary_is_per_record
+);
+
+/// Connected DGRAM/SEQPACKET rings need the same per-receiving-task stash as
+/// named datagram inboxes. Two readers may dequeue before either syscall has
+/// copied ancillary output back to userspace.
+fn smoke_abi_socket_connected_dgram_ancillary_is_per_record() -> TestResult {
+    use crate::socket::{SocketFile, SocketOp, SocketOpResult, SOCK_DGRAM};
+    with_setup(|| {
+        const SENDER_A: u64 = FAKE_TASK + 20;
+        const SENDER_A_PID: u64 = 7201;
+        const SENDER_B: u64 = FAKE_TASK + 21;
+        const SENDER_B_PID: u64 = 7202;
+        const RECEIVER_A: u64 = FAKE_TASK + 22;
+        const RECEIVER_B: u64 = FAKE_TASK + 23;
+        let (tx, rx) = SocketFile::unix_pair(SOCK_DGRAM);
+        let on = 1u32.to_ne_bytes();
+        if !matches!(
+            rx.dispatch_op(SocketOp::SetSockOpt {
+                level: SOL_SOCKET as u32,
+                name: SO_PASSCRED as u32,
+                value: &on,
+            }),
+            SocketOpResult::Ok(0)
+        ) {
+            return Err("enabling SO_PASSCRED on connected receiver failed");
+        }
+        for (task, pid, payload) in [
+            (SENDER_A, SENDER_A_PID, b"packet-a".as_ref()),
+            (SENDER_B, SENDER_B_PID, b"packet-b".as_ref()),
+        ] {
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+            set_task(task);
+            if !matches!(
+                tx.dispatch_op(SocketOp::Send {
+                    buf: payload,
+                    flags: 0,
+                    addr: None,
+                }),
+                SocketOpResult::Ok(8)
+            ) {
+                return Err("connected datagram send failed");
+            }
+        }
+
+        let mut first = [0u8; 8];
+        let mut second = [0u8; 8];
+        set_task(RECEIVER_A);
+        if !matches!(
+            rx.dispatch_op(SocketOp::Recv {
+                buf: &mut first,
+                flags: 0,
+            }),
+            SocketOpResult::Received { n: 8, .. }
+        ) {
+            return Err("first connected receiver failed");
+        }
+        set_task(RECEIVER_B);
+        if !matches!(
+            rx.dispatch_op(SocketOp::Recv {
+                buf: &mut second,
+                flags: 0,
+            }),
+            SocketOpResult::Received { n: 8, .. }
+        ) {
+            return Err("second connected receiver failed");
+        }
+        set_task(RECEIVER_A);
+        let cred_a = rx
+            .recvmsg_cred()
+            .ok_or("first connected credential missing")?;
+        set_task(RECEIVER_B);
+        let cred_b = rx
+            .recvmsg_cred()
+            .ok_or("second connected credential missing")?;
+        if u64::from(cred_a.pid) != SENDER_A_PID || u64::from(cred_b.pid) != SENDER_B_PID {
+            return Err("connected record credentials crossed between receiving tasks");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connected_dgram_ancillary_is_per_record
 );
 
 /// Datagram ORDER on a bound AF_UNIX receiver is global, not per-sender-
@@ -8684,8 +9184,8 @@ fn smoke_abi_netlink_user_cred_and_group_metadata() -> TestResult {
 
         // Automatic SCM credentials use REAL ids. Drop all three ids so the
         // test also proves a user packet is not mislabeled as kernel/root.
-        if call(Syscall::Setresgid.raw(), a2(GID, GID, GID)) != Some(0)
-            || call(Syscall::Setresuid.raw(), a2(UID, UID, UID)) != Some(0)
+        if call(Syscall::Setresgid.raw(), a2(GID, GID + 1, GID + 2)) != Some(0)
+            || call(Syscall::Setresuid.raw(), a2(UID, UID + 1, UID + 2)) != Some(0)
         {
             return Err("could not establish non-root netlink sender identity");
         }
@@ -8756,12 +9256,136 @@ fn smoke_abi_netlink_user_cred_and_group_metadata() -> TestResult {
         if cred_pid == 0 || cred_uid != UID as u32 || cred_gid != GID as u32 {
             return Err("userspace netlink credentials were replaced with kernel/root identity");
         }
+
+        // Explicit credentials override netlink's force-creds default too.
+        // Saved IDs are authorised even after the setresuid transition cleared
+        // ambient set-id capabilities.
+        let explicit_payload = b"explicit-netlink";
+        let explicit = scm_credentials_control(cred_pid, (UID + 2) as u32, (GID + 2) as u32);
+        let mut siov = [0u8; 16];
+        siov[..8].copy_from_slice(&(explicit_payload.as_ptr() as u64).to_ne_bytes());
+        siov[8..].copy_from_slice(&(explicit_payload.len() as u64).to_ne_bytes());
+        let mut smsg = [0u8; 56];
+        smsg[..8].copy_from_slice(&(destination.as_ptr() as u64).to_ne_bytes());
+        smsg[8..12].copy_from_slice(&(destination_len as u32).to_ne_bytes());
+        smsg[16..24].copy_from_slice(&(siov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        smsg[32..40].copy_from_slice(&(explicit.as_ptr() as u64).to_ne_bytes());
+        smsg[40..48].copy_from_slice(&28u64.to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(sender, smsg.as_ptr() as u64, 0),
+        ) != Some(explicit_payload.len() as i64)
+        {
+            return Err("explicit-credential netlink sendmsg failed");
+        }
+        data.fill(0);
+        control.fill(0);
+        msg[8..12].copy_from_slice(&(name.len() as u32).to_ne_bytes());
+        msg[40..48].copy_from_slice(&(control.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(receiver, msg.as_mut_ptr() as u64, 0),
+        ) != Some(explicit_payload.len() as i64)
+        {
+            return Err("explicit-credential netlink recvmsg failed");
+        }
+        if &data[..explicit_payload.len()] != explicit_payload
+            || u32::from_ne_bytes(control[44..48].try_into().unwrap()) != (UID + 2) as u32
+            || u32::from_ne_bytes(control[48..52].try_into().unwrap()) != (GID + 2) as u32
+        {
+            return Err("explicit netlink SCM_CREDENTIALS were not preserved");
+        }
         Ok(())
     })
 }
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_netlink_user_cred_and_group_metadata
+);
+
+fn smoke_abi_netlink_group_metadata_is_per_receiving_task() -> TestResult {
+    use crate::socket::{SockAddr, SocketFile, SocketOp, SocketOpResult, AF_NETLINK, SOCK_RAW};
+    with_setup(|| {
+        const GROUP_A: u32 = 5;
+        const GROUP_B: u32 = 6;
+        const RECEIVER_A: u64 = FAKE_TASK + 24;
+        const RECEIVER_B: u64 = FAKE_TASK + 25;
+        let sender = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, 31);
+        let receiver = SocketFile::with_protocol(AF_NETLINK, SOCK_RAW, 31);
+        let addr = |groups: u32| {
+            let mut body = alloc::vec![0u8; 10];
+            body[6..10].copy_from_slice(&groups.to_ne_bytes());
+            SockAddr {
+                family: AF_NETLINK,
+                body,
+            }
+        };
+        let both = (1u32 << (GROUP_A - 1)) | (1u32 << (GROUP_B - 1));
+        if !matches!(
+            receiver.dispatch_op(SocketOp::Bind { addr: addr(both) }),
+            SocketOpResult::Ok(0)
+        ) {
+            return Err("multi-group netlink bind failed");
+        }
+        let on = 1u32.to_ne_bytes();
+        if !matches!(
+            receiver.dispatch_op(SocketOp::SetSockOpt {
+                level: SOL_NETLINK as u32,
+                name: NETLINK_PKTINFO as u32,
+                value: &on,
+            }),
+            SocketOpResult::Ok(0)
+        ) {
+            return Err("NETLINK_PKTINFO setup failed");
+        }
+        for (group, payload) in [(GROUP_A, b'a'), (GROUP_B, b'b')] {
+            if !matches!(
+                sender.dispatch_op(SocketOp::Send {
+                    buf: &[payload],
+                    flags: 0,
+                    addr: Some(addr(1u32 << (group - 1))),
+                }),
+                SocketOpResult::Ok(1)
+            ) {
+                return Err("netlink multicast enqueue failed");
+            }
+        }
+        let mut first = [0u8; 1];
+        let mut second = [0u8; 1];
+        set_task(RECEIVER_A);
+        if !matches!(
+            receiver.dispatch_op(SocketOp::Recv {
+                buf: &mut first,
+                flags: 0,
+            }),
+            SocketOpResult::Received { n: 1, .. }
+        ) {
+            return Err("first shared netlink receive failed");
+        }
+        set_task(RECEIVER_B);
+        if !matches!(
+            receiver.dispatch_op(SocketOp::Recv {
+                buf: &mut second,
+                flags: 0,
+            }),
+            SocketOpResult::Received { n: 1, .. }
+        ) {
+            return Err("second shared netlink receive failed");
+        }
+        set_task(RECEIVER_A);
+        let group_a = receiver.netlink_pktinfo();
+        set_task(RECEIVER_B);
+        let group_b = receiver.netlink_pktinfo();
+        if group_a != Some(GROUP_A) || group_b != Some(GROUP_B) {
+            return Err("netlink group metadata crossed between receiving tasks");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_netlink_group_metadata_is_per_receiving_task
 );
 
 fn smoke_abi_netlink_audit_socket_open_bind_send() -> TestResult {

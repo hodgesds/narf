@@ -58,6 +58,17 @@ Linux netlink ancillary ordering; truncation follows normal `MSG_CTRUNC` rules.
 Other tasks, including UID 0, acquire none. The caller remains responsible
 for selecting/loading the service executable and presenting stack authority;
 these APIs never infer a grant from a process name or UID.
+AF_UNIX ancillary credentials follow Linux's common-SCM contract. Automatic
+credentials capture the sender's real uid/gid and send-time pid when either
+endpoint requests credential passing; an explicit `SCM_CREDENTIALS` record is
+accepted only for the caller's real/effective/saved IDs and own pid, unless the
+corresponding namespace capability authorizes an override. Accepted sockets
+inherit the listener's `SO_PASSCRED` state. Datagram, seqpacket, stream-range,
+and netlink receive metadata stays associated with the dequeuing task, and a
+stream receive does not combine ranges from different credential identities.
+On AF_UNIX receive, credentials precede rights; an exact `CMSG_LEN` buffer is
+sufficient and a failed user control copy cannot leave an unreachable installed
+descriptor.
 
 ```rust
 pub struct Process { /* cap table root, VM root, threads */ }

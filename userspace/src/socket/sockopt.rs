@@ -938,7 +938,7 @@ impl SocketFile {
                 if !self.may_scm_recv() {
                     return Some(EOPNOTSUPP_R);
                 }
-                self.passcred.store(on, Ordering::Release);
+                self.set_passcred(on);
                 OK
             }
             SO_PASSSEC => {

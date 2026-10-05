@@ -15777,7 +15777,8 @@ pub fn pty_jobctl_sessions(pgrp: u64) -> (u64, u64) {
 
 /// The calling task's socket credentials (`struct ucred` shape): its
 /// visible pid plus effective uid/gid. Stamped onto every socket end at
-/// creation so `SO_PEERCRED` / `SCM_CREDENTIALS` report a real identity.
+/// creation so `SO_PEERCRED` reports the connect-time identity. Automatic
+/// message credentials use [`current_scm_ucred`] instead.
 pub fn current_ucred() -> crate::socket::Ucred {
     let task = current_task_id();
     let cached = crate::task::current_cached_identity(task);
@@ -15808,6 +15809,79 @@ pub fn current_scm_ucred() -> crate::socket::Ucred {
         uid: ids.uid,
         gid: ids.gid,
     }
+}
+
+/// Validate an explicit `SCM_CREDENTIALS` record and translate it into the
+/// kernel-global identity stored on the queued message.
+///
+/// This is Linux `scm_check_creds` + the following `find_get_pid`/`make_k*id`
+/// conversion in one boundary helper.  The supplied pid/uid/gid are in the
+/// caller's namespace views; socket queues retain outer pid and host-absolute
+/// ids so a receiver can translate them into its own views at delivery time.
+pub(crate) fn validate_scm_ucred(
+    supplied: crate::socket::Ucred,
+) -> Result<crate::socket::Ucred, i64> {
+    let task = current_task_id();
+    let ids = read_uidgid(task);
+
+    #[cfg(feature = "container")]
+    let (uid, gid) = {
+        let user_ns = crate::namespaces::current_user_ns(task);
+        let uid = if user_ns.is_initial() {
+            Some(supplied.uid)
+        } else {
+            user_ns.translate_uid_range_to_host(supplied.uid, 1)
+        };
+        let gid = if user_ns.is_initial() {
+            Some(supplied.gid)
+        } else {
+            user_ns.translate_gid_range_to_host(supplied.gid, 1)
+        };
+        (uid.ok_or(EINVAL)?, gid.ok_or(EINVAL)?)
+    };
+    #[cfg(not(feature = "container"))]
+    let (uid, gid) = (supplied.uid, supplied.gid);
+
+    let own_outer_pid = task_to_pid_raw(task).unwrap_or(task);
+    let own_visible_pid = report_pid_to(task, own_outer_pid) as u32;
+    #[cfg(feature = "container")]
+    let may_forge_pid = task_ns_capable(
+        task,
+        &crate::pid_ns::current_pid_ns(task).owner_user_ns(),
+        CAP_SYS_ADMIN,
+    );
+    #[cfg(not(feature = "container"))]
+    let may_forge_pid = task_capable_in_own_ns(task, CAP_SYS_ADMIN);
+
+    let pid_allowed = supplied.pid == own_visible_pid || may_forge_pid;
+    let uid_allowed = uid == ids.uid
+        || uid == ids.euid
+        || uid == ids.suid
+        || task_capable_in_own_ns(task, CAP_SETUID);
+    let gid_allowed = gid == ids.gid
+        || gid == ids.egid
+        || gid == ids.sgid
+        || task_capable_in_own_ns(task, CAP_SETGID);
+    if !pid_allowed || !uid_allowed || !gid_allowed {
+        return Err(EPERM);
+    }
+
+    let outer_pid = if supplied.pid == own_visible_pid {
+        own_outer_pid
+    } else {
+        accept_pid_from(task, u64::from(supplied.pid)).ok_or(ESRCH)?
+    };
+    // Linux's `find_get_pid` rejects an authorised but nonexistent pid.  The
+    // caller's own pre-registration boot task is the sole useful fallback.
+    if outer_pid != own_outer_pid && pid_to_task_raw(outer_pid).is_none() {
+        return Err(ESRCH);
+    }
+
+    Ok(crate::socket::Ucred {
+        pid: outer_pid as u32,
+        uid,
+        gid,
+    })
 }
 
 /// Calling task's supplementary groups in host-absolute form, suitable for

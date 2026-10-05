@@ -11010,24 +11010,35 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     }
 }
 
-/// Parse a `msg_control` buffer for an `SOL_SOCKET` / `SCM_RIGHTS` cmsg and
-/// resolve each passed int fd to its file object in the *sender's* fd table.
-/// Returns an empty vec when there's no fd ancillary data.
-fn parse_scm_rights_fds(
+/// Send-time `SOL_SOCKET` ancillary state imported from one `msghdr`.
+struct ScmSendAncillary {
+    fds: alloc::vec::Vec<crate::socket::ScmRightsFile>,
+    cred: Option<crate::socket::Ucred>,
+}
+
+/// Parse Linux `SOL_SOCKET` send control messages. `SCM_RIGHTS` descriptors
+/// are resolved in the sender's table and explicit `SCM_CREDENTIALS` are
+/// authenticated before any payload is published.
+fn parse_scm_send_ancillary(
     ctrl_ptr: u64,
     ctrl_len: usize,
-) -> Result<alloc::vec::Vec<crate::socket::ScmRightsFile>, i64> {
+) -> Result<ScmSendAncillary, i64> {
     const SOL_SOCKET: i32 = 1;
     const SCM_RIGHTS: i32 = 1;
+    const SCM_CREDENTIALS: i32 = 2;
+    const SCM_MAX_FD: usize = 253;
     // struct cmsghdr { u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; } = 16 B.
-    let mut out = alloc::vec::Vec::new();
+    let mut out = ScmSendAncillary {
+        fds: alloc::vec::Vec::new(),
+        cred: None,
+    };
     if ctrl_len == 0 {
         return Ok(out);
     }
     if ctrl_ptr == 0 {
         return Err(EFAULT);
     }
-    if !(16..=MAX_USER_COPY).contains(&ctrl_len) {
+    if ctrl_len > MAX_USER_COPY {
         return Err(EINVAL);
     }
     let mut ctrl = alloc::vec![0u8; ctrl_len];
@@ -11042,29 +11053,55 @@ fn parse_scm_rights_fds(
         let cmsg_len = u64::from_le_bytes(ctrl[off..off + 8].try_into().unwrap()) as usize;
         let level = i32::from_le_bytes(ctrl[off + 8..off + 12].try_into().unwrap());
         let ctype = i32::from_le_bytes(ctrl[off + 12..off + 16].try_into().unwrap());
-        if cmsg_len < 16 || off + cmsg_len > ctrl_len {
+        let Some(end) = off.checked_add(cmsg_len) else {
+            return Err(EINVAL);
+        };
+        if cmsg_len < 16 || end > ctrl_len {
             return Err(EINVAL);
         }
-        if level == SOL_SOCKET && ctype == SCM_RIGHTS {
-            let nfds = (cmsg_len - 16) / 4;
-            for i in 0..nfds {
-                let fpos = off + 16 + i * 4;
-                let fd = i32::from_le_bytes(ctrl[fpos..fpos + 4].try_into().unwrap());
-                if fd < 0 {
-                    return Err(EBADF);
+        if level == SOL_SOCKET {
+            match ctype {
+                SCM_RIGHTS => {
+                    let nfds = (cmsg_len - 16) / 4;
+                    if out.fds.len().saturating_add(nfds) > SCM_MAX_FD {
+                        return Err(EINVAL);
+                    }
+                    for i in 0..nfds {
+                        let fpos = off + 16 + i * 4;
+                        let fd =
+                            i32::from_ne_bytes(ctrl[fpos..fpos + 4].try_into().unwrap());
+                        if fd < 0 {
+                            return Err(EBADF);
+                        }
+                        let Some(passed) = fd::with_table(task, |t| {
+                            let (ops, description, status_flags) =
+                                t.export_description(fd as u32)?;
+                            Some(crate::socket::ScmRightsFile {
+                                ops,
+                                status_flags,
+                                description: Some(description),
+                            })
+                        })
+                        .flatten()
+                        else {
+                            return Err(EBADF);
+                        };
+                        out.fds.push(passed);
+                    }
                 }
-                let Some(passed) = fd::with_table(task, |t| {
-                    let (ops, description, status_flags) = t.export_description(fd as u32)?;
-                    Some(crate::socket::ScmRightsFile {
-                        ops,
-                        status_flags,
-                        description: Some(description),
-                    })
-                })
-                .flatten() else {
-                    return Err(EBADF); // send no payload or partial rights
-                };
-                out.push(passed);
+                SCM_CREDENTIALS => {
+                    // Linux requires exactly CMSG_LEN(sizeof(struct ucred)).
+                    if cmsg_len != 28 {
+                        return Err(EINVAL);
+                    }
+                    let supplied = crate::socket::Ucred {
+                        pid: u32::from_ne_bytes(ctrl[off + 16..off + 20].try_into().unwrap()),
+                        uid: u32::from_ne_bytes(ctrl[off + 20..off + 24].try_into().unwrap()),
+                        gid: u32::from_ne_bytes(ctrl[off + 24..off + 28].try_into().unwrap()),
+                    };
+                    out.cred = Some(validate_scm_ucred(supplied)?);
+                }
+                _ => return Err(EINVAL),
             }
         }
         // Advance to the next cmsg (CMSG_ALIGN to 8 bytes).
@@ -11277,12 +11314,9 @@ fn install_packet_ancillary(
     put_cmsgs(msg_ptr, &records)
 }
 
-/// Install received AF_UNIX ancillary data into the calling task's
-/// `msg_control` buffer: an `SCM_RIGHTS` control message (any passed fds,
-/// each dup'd into a fresh fd in this task's table) and, when
-/// `cred` is `Some` (SO_PASSCRED set), an `SCM_CREDENTIALS` control message
-/// naming the message sender. Sets `msg_controllen` to the bytes written
-/// (0 when there's no ancillary data or the user control buffer is absent).
+/// Install AF_UNIX ancillary data in Linux's common-SCM order: credentials
+/// first, then descriptor rights. Exact `CMSG_LEN` capacity is sufficient;
+/// trailing `CMSG_SPACE` padding is consumed only when the caller supplied it.
 fn install_recv_ancillary(
     msg_ptr: u64,
     fds: alloc::vec::Vec<crate::socket::ScmRightsFile>,
@@ -11302,24 +11336,49 @@ fn install_recv_ancillary(
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
         return false;
     }
-    // Only install descriptors that fit in the caller's control buffer.
-    // Installing an fd whose number cannot be reported leaks an unreachable
-    // slot in the receiver. Linux instead closes truncated SCM_RIGHTS entries.
     let control_capacity = if ctrl_ptr == 0 { 0 } else { ctrl_len };
-    let mut max_rights = control_capacity.saturating_sub(16) / 4;
-    while max_rights > 0 && ((16 + max_rights * 4 + 7) & !7) > control_capacity {
-        max_rights -= 1;
+    let mut ctrl: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    let mut truncated = false;
+    let push_cmsg = |ctrl: &mut alloc::vec::Vec<u8>, ctype: i32, data: &[u8]| -> bool {
+        let room = control_capacity.saturating_sub(ctrl.len());
+        if room < 16 {
+            return false;
+        }
+        let full_len = 16 + data.len();
+        let cmsg_len = core::cmp::min(full_len, room);
+        let mut hdr = [0u8; 16];
+        hdr[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+        hdr[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+        hdr[12..16].copy_from_slice(&ctype.to_le_bytes());
+        ctrl.extend_from_slice(&hdr);
+        ctrl.extend_from_slice(&data[..cmsg_len - 16]);
+        let consumed = core::cmp::min((full_len + 7) & !7, room);
+        ctrl.resize(ctrl.len() + consumed.saturating_sub(cmsg_len), 0);
+        cmsg_len == full_len
+    };
+
+    // `__scm_recv_common`: SCM_CREDENTIALS precedes SCM_RIGHTS. This order is
+    // observable when the control buffer is short.
+    if let Some(c) = cred {
+        let mut data = [0u8; 12];
+        data[0..4].copy_from_slice(&c.pid.to_le_bytes());
+        data[4..8].copy_from_slice(&c.uid.to_le_bytes());
+        data[8..12].copy_from_slice(&c.gid.to_le_bytes());
+        if !push_cmsg(&mut ctrl, SCM_CREDENTIALS, &data) {
+            truncated = true;
+        }
     }
+
+    // Install only descriptors whose integer values can be reported. Linux's
+    // `scm_max_fds` needs `CMSG_LEN`, not full aligned `CMSG_SPACE`, so a
+    // 20-byte buffer can carry exactly one descriptor.
+    let rights_room = control_capacity.saturating_sub(ctrl.len());
+    let max_rights = rights_room.saturating_sub(16) / 4;
     let rights_to_install = core::cmp::min(fds.len(), max_rights);
-    let mut truncated = rights_to_install < fds.len();
+    truncated |= rights_to_install < fds.len();
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
     for passed in fds.into_iter().take(rights_to_install) {
-        // `scm_detach_fds` stops installing once `get_unused_fd_flags` fails
-        // and reports the shortfall as MSG_CTRUNC rather than failing the
-        // whole recvmsg — the payload was already delivered. A receiver at
-        // its RLIMIT_NOFILE therefore sees a truncated control message, which
-        // is the documented signal to close descriptors and retry.
         if let Some(newfd) = fd::with_table_alloc(task, |t| {
             t.open_transferred(
                 passed.ops,
@@ -11333,41 +11392,15 @@ fn install_recv_ancillary(
             new_fds.push(newfd as i32);
         } else {
             truncated = true;
+            break;
         }
     }
-    // Build the control buffer: each cmsg is cmsghdr(16) + data, padded to
-    // an 8-byte (CMSG_ALIGN) boundary before the next record.
-    let mut ctrl: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let push_cmsg = |ctrl: &mut alloc::vec::Vec<u8>, ctype: i32, data: &[u8]| {
-        let cmsg_len = 16 + data.len();
-        let mut hdr = [0u8; 16];
-        hdr[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
-        hdr[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
-        hdr[12..16].copy_from_slice(&ctype.to_le_bytes());
-        ctrl.extend_from_slice(&hdr);
-        ctrl.extend_from_slice(data);
-        // CMSG_ALIGN the running length to the next 8-byte boundary.
-        while ctrl.len() % 8 != 0 {
-            ctrl.push(0);
-        }
-    };
     if !new_fds.is_empty() {
         let mut data = alloc::vec::Vec::with_capacity(new_fds.len() * 4);
         for &nfd in &new_fds {
             data.extend_from_slice(&nfd.to_le_bytes());
         }
-        push_cmsg(&mut ctrl, SCM_RIGHTS, &data);
-    }
-    if let Some(c) = cred {
-        let mut data = [0u8; 12];
-        data[0..4].copy_from_slice(&c.pid.to_le_bytes());
-        data[4..8].copy_from_slice(&c.uid.to_le_bytes());
-        data[8..12].copy_from_slice(&c.gid.to_le_bytes());
-        // SCM_RIGHTS precedes SCM_CREDENTIALS. If the latter does not fit,
-        // omit it and report MSG_CTRUNC while retaining any rights that did.
-        if ctrl.len().saturating_add(32) <= control_capacity {
-            push_cmsg(&mut ctrl, SCM_CREDENTIALS, &data);
-        } else {
+        if !push_cmsg(&mut ctrl, SCM_RIGHTS, &data) {
             truncated = true;
         }
     }
@@ -11376,8 +11409,19 @@ fn install_recv_ancillary(
         let _ = unsafe { copy_to_user(msg_ptr + 40, &0u64.to_le_bytes()) };
         return true;
     }
-    // SAFETY: ctrl_ptr is the user msg_control buffer, len-checked above.
-    let _ = unsafe { copy_to_user(ctrl_ptr, &ctrl) };
+    // Do not leave installed but unreachable fds behind if the user control
+    // range was bad or raced with an unmap. Linux's `receive_fd` publishes the
+    // integer before `fd_install`; NARF installs first, so it must roll back.
+    // SAFETY: `ctrl_ptr` is the caller's msg_control address; copy_to_user
+    // validates the complete emitted range and SMAP-brackets the write.
+    let copied = ctrl.is_empty() || unsafe { copy_to_user(ctrl_ptr, &ctrl) }.is_ok();
+    if !copied {
+        for newfd in &new_fds {
+            let _ = fd::with_table(task, |table| table.close(*newfd as u32));
+        }
+        ctrl.clear();
+        truncated = true;
+    }
     // SAFETY: 8-byte write to `msg_controllen` at `msg_ptr + 40`.
     let _ = unsafe { copy_to_user(msg_ptr + 40, &(ctrl.len() as u64).to_le_bytes()) };
     truncated
