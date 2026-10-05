@@ -1348,6 +1348,7 @@ const CAP_SETGID_BIT: u64 = 1 << 6;
 const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
 const CAP_SYS_CHROOT_BIT: u64 = 1 << 18;
 const CAP_SYS_TIME_BIT: u64 = 1 << 25;
+const CAP_SYS_TTY_CONFIG_BIT: u64 = 1 << 26;
 
 fn drop_all_caps() {
     crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
@@ -1774,6 +1775,33 @@ fn smoke_abi_caps_sethostname_requires_sys_admin() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_caps_sethostname_requires_sys_admin);
+
+fn smoke_abi_caps_vhangup_requires_sys_tty_config() -> TestResult {
+    with_setup(|| {
+        // Privileged task with default full capabilities succeeds -> 0.
+        match call(Syscall::Vhangup.raw(), a0(0)) {
+            Some(0) => {}
+            _ => return Err("vhangup with default root capabilities should return 0"),
+        }
+        // Unprivileged task with all caps dropped fails with -EPERM (-1).
+        drop_all_caps();
+        match call(Syscall::Vhangup.raw(), a0(0)) {
+            Some(-1) => {}
+            Some(0) => return Err("unprivileged vhangup without CAP_SYS_TTY_CONFIG succeeded"),
+            _ => return Err("unprivileged vhangup: want -EPERM"),
+        }
+        // Task with CAP_SYS_TTY_CONFIG specifically granted succeeds -> 0.
+        set_caps(CAP_SYS_TTY_CONFIG_BIT, CAP_SYS_TTY_CONFIG_BIT);
+        match call(Syscall::Vhangup.raw(), a0(0)) {
+            Some(0) => Ok(()),
+            _ => Err("vhangup with CAP_SYS_TTY_CONFIG should return 0"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_vhangup_requires_sys_tty_config
+);
 
 fn smoke_abi_caps_sethostname_eperm_precedes_einval_and_efault() -> TestResult {
     with_setup(|| {

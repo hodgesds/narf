@@ -8,6 +8,8 @@
 
 use crate::abi_test_support::*;
 
+const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+
 // EOPNOTSUPP is not in the harness errno set; LSM/keyctl use it.
 
 // Open a MemFs-backed file via the Linux open(2) ABI (arg0 = NUL-term
@@ -327,6 +329,66 @@ fn smoke_abi_misc_process_vm_writev_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_process_vm_writev_neg);
+
+fn smoke_abi_misc_process_vm_errnos() -> TestResult {
+    with_setup(|| {
+        // 1. liovcnt > 1024 -> -EINVAL.
+        let args = SyscallArgs {
+            arg0: FAKE_TASK,
+            arg2: 1025,
+            ..Default::default()
+        };
+        if call(Syscall::ProcessVmReadv.raw(), args) != Some(EINVAL) {
+            return Err("process_vm_readv with liovcnt > 1024 must return -EINVAL");
+        }
+        if call(Syscall::ProcessVmWritev.raw(), args) != Some(EINVAL) {
+            return Err("process_vm_writev with liovcnt > 1024 must return -EINVAL");
+        }
+
+        // 2. riovcnt > 1024 -> -EINVAL.
+        let args = SyscallArgs {
+            arg0: FAKE_TASK,
+            arg4: 1025,
+            ..Default::default()
+        };
+        if call(Syscall::ProcessVmReadv.raw(), args) != Some(EINVAL) {
+            return Err("process_vm_readv with riovcnt > 1024 must return -EINVAL");
+        }
+        if call(Syscall::ProcessVmWritev.raw(), args) != Some(EINVAL) {
+            return Err("process_vm_writev with riovcnt > 1024 must return -EINVAL");
+        }
+
+        // 3. Nonexistent pid -> -ESRCH.
+        let args = SyscallArgs {
+            arg0: 999_999,
+            ..Default::default()
+        };
+        if call(Syscall::ProcessVmReadv.raw(), args) != Some(ESRCH) {
+            return Err("process_vm_readv with nonexistent pid must return -ESRCH");
+        }
+        if call(Syscall::ProcessVmWritev.raw(), args) != Some(ESRCH) {
+            return Err("process_vm_writev with nonexistent pid must return -ESRCH");
+        }
+
+        // 4. Bad local iovec pointer with active address space -> -EFAULT.
+        install_test_address_space().map_err(|_| "install_test_address_space failed")?;
+        let args = SyscallArgs {
+            arg0: FAKE_TASK,
+            arg1: BAD_PTR,
+            arg2: 1,
+            ..Default::default()
+        };
+        if call(Syscall::ProcessVmReadv.raw(), args) != Some(EFAULT) {
+            return Err("process_vm_readv with BAD_PTR local iovec must return -EFAULT");
+        }
+        if call(Syscall::ProcessVmWritev.raw(), args) != Some(EFAULT) {
+            return Err("process_vm_writev with BAD_PTR local iovec must return -EFAULT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_process_vm_errnos);
 
 // ── Ptrace — implemented: returns -EINVAL when TRACEME has no parent. ──
 

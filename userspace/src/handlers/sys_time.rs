@@ -11,7 +11,10 @@ pub(crate) fn sys_time(ctx: &mut dyn TrapContext) {
     if time_ptr != 0 {
         // SAFETY: `time_ptr` is the user time_t* pointer (non-zero, checked above);
         // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
-        let _ = unsafe { copy_to_user(time_ptr, &sec.to_ne_bytes()) };
+        if unsafe { copy_to_user(time_ptr, &sec.to_ne_bytes()) }.is_err() {
+            ctx.set_return(errno_ret(EFAULT));
+            return;
+        }
     }
     ctx.set_return(SyscallReturn::ok(sec as u64));
 }

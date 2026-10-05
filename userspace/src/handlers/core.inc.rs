@@ -5219,6 +5219,9 @@ pub(crate) const CAP_SYS_ADMIN: u32 = 21;
 /// be given the whole of it.
 pub(crate) const CAP_SYSLOG: u32 = 34;
 pub(crate) const CAP_SYS_TIME: u32 = 25;
+/// `CAP_SYS_TTY_CONFIG` (`include/uapi/linux/capability.h`: 26) — configure tty devices,
+/// call vhangup(2), and set keyboard modes.
+pub(crate) const CAP_SYS_TTY_CONFIG: u32 = 26;
 pub(crate) const CAP_WAKE_ALARM: u32 = 35;
 /// Linux checkpoint/restore authority accepted by clone3(set_tid), alongside
 /// CAP_SYS_ADMIN.
@@ -8290,20 +8293,6 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
         return;
     }
 
-    // Require the target to resolve to the caller's own address space
-    // (cross-AS copy is not yet supported). The running task's AS is the
-    // active one — `current_address_space()` — but it is not necessarily
-    // registered under its tid in `address_space_of`, so resolve self
-    // directly rather than via the registry. getpid() returns the raw
-    // task id in a non-container build; pid_to_task_raw only tracks
-    // forked tasks, so a self target compares against current_task_id().
-    let cur_as = match current_address_space() {
-        Some(c) => c,
-        None => {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        }
-    };
     // Detect a self-target across BOTH id spaces: `pid` here is whatever the
     // caller passed, and getpid() returns the VISIBLE ProcessId
     // (task_to_pid_raw), not the raw scheduler TaskId. Comparing only against
@@ -8312,23 +8301,25 @@ fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     // returning None → ESRCH (observed as pvm_smoke `pvm-fail: readv`).
     let self_pid = task_to_pid_raw(current_task_id()).unwrap_or_else(current_task_id);
     if pid != current_task_id() && pid != self_pid {
-        match pid_to_task_raw(pid) {
-            Some(tid) => match narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)) {
-                Some(r) if Arc::ptr_eq(&r, &cur_as) => {}
-                Some(_) => {
-                    ctx.set_return(errno_ret(EPERM)); // EPERM (cross-AS)
-                    return;
-                }
-                None => {
-                    ctx.set_return(errno_ret(ESRCH)); // ESRCH
-                    return;
-                }
-            },
-            None => {
-                ctx.set_return(errno_ret(ESRCH)); // ESRCH
-                return;
-            }
+        let Some(tid) = pid_to_task_raw(pid) else {
+            ctx.set_return(errno_ret(ESRCH)); // ESRCH
+            return;
+        };
+        let Some(target_as) = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)) else {
+            ctx.set_return(errno_ret(ESRCH)); // ESRCH
+            return;
+        };
+        let Some(cur_as) = current_address_space() else {
+            ctx.set_return(errno_ret(EFAULT)); // EFAULT
+            return;
+        };
+        if !Arc::ptr_eq(&target_as, &cur_as) {
+            ctx.set_return(errno_ret(EPERM)); // EPERM (cross-AS)
+            return;
         }
+    } else if current_address_space().is_none() {
+        ctx.set_return(errno_ret(EFAULT)); // EFAULT
+        return;
     }
 
     let local = match read_iovecs(local_ptr, liovcnt) {
