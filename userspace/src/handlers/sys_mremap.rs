@@ -228,16 +228,13 @@ fn mremap_core(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn mremap_core_limited(
-    as_ref: &AddressSpace,
+fn check_mremap_params(
     old_addr: u64,
     old_len_requested: u64,
     new_len_requested: u64,
     flags: u64,
     new_addr: u64,
-    limits: narf_memory::MremapLimits,
-) -> Result<u64, i64> {
+) -> Result<(u64, u64), i64> {
     // Match Linux check_mremap_params() ordering before looking up the VMA.
     // In particular, a request with both a bad target and an unmapped source
     // is EINVAL, not EFAULT. PAGE_ALIGN overflow wraps to zero in Linux and is
@@ -259,7 +256,7 @@ fn mremap_core_limited(
         if new_addr & 0xFFF != 0
             || new_end > AddressSpace::USER_HALF_END
             || flags & MREMAP_MAYMOVE == 0
-            || flags & MREMAP_DONTUNMAP != 0 && old_len != new_len
+            || (flags & MREMAP_DONTUNMAP != 0 && old_len != new_len)
         {
             return Err(EINVAL);
         }
@@ -268,6 +265,26 @@ fn mremap_core_limited(
             return Err(EINVAL);
         }
     }
+    Ok((old_len, new_len))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mremap_core_limited(
+    as_ref: &AddressSpace,
+    old_addr: u64,
+    old_len_requested: u64,
+    new_len_requested: u64,
+    flags: u64,
+    new_addr: u64,
+    limits: narf_memory::MremapLimits,
+) -> Result<u64, i64> {
+    let (old_len, new_len) = check_mremap_params(
+        old_addr,
+        old_len_requested,
+        new_len_requested,
+        flags,
+        new_addr,
+    )?;
     if flags & MREMAP_FIXED != 0 {
         // SysV uses its own per-AS owner table. Only a fixed move can retire a
         // SysV target, so keep its global registry entirely off the common
@@ -764,6 +781,19 @@ fn mremap_core_limited(
 /// complete private mapping while preserving its resident backing.
 pub(crate) fn sys_mremap(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+    // `mm/mremap.c`: `check_mremap_params` runs before any VMA lookup or
+    // lock. In particular, an unaligned source, invalid flags, or bad length
+    // combination reports -EINVAL rather than reaching the sealed-range check
+    // (-EPERM) or address space checks.
+    let (old_len, _) = match check_mremap_params(
+        args.arg0, args.arg1, args.arg2, args.arg3, args.arg4,
+    ) {
+        Ok(lens) => lens,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
@@ -774,7 +804,7 @@ pub(crate) fn sys_mremap(ctx: &mut dyn TrapContext) {
     // `mm/mremap.c`: `if (vma_is_sealed(vma)) return -EPERM;`. Moving,
     // shrinking or expanding a sealed range all leave an address whose
     // contents can be replaced, which is what sealing forbids.
-    if handler_sys_mseal::range_is_sealed(as_ref.identity(), args.arg0, args.arg1) {
+    if handler_sys_mseal::range_is_sealed(as_ref.identity(), args.arg0, old_len) {
         ctx.set_return(errno_ret(EPERM));
         return;
     }

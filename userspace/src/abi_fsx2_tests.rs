@@ -3852,3 +3852,155 @@ fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_file_getattr_empty_path);
+
+// ── Extended attribute exact error precedence ────────────────────────
+fn smoke_abi_fsx2_xattr_exact_errnos() -> TestResult {
+    with_memfs("/xat_exact", "xat_exact", &[("f", b"hello")], || {
+        let path = b"/xat_exact/f\0";
+        let empty_name = b"\0";
+        let valid_name = b"user.testattr\0";
+        let unsupported_prefix = b"foo.bar\0";
+        let val = b"attrvalue";
+        let mut out = [0u8; 32];
+
+        // 1. Empty name returns -ERANGE (not -EINVAL, not -ENOENT)
+        let set_empty = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: empty_name.as_ptr() as u64,
+            arg2: val.as_ptr() as u64,
+            arg3: val.len() as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Setxattr.raw(), set_empty) != Some(ERANGE) {
+            return Err("setxattr with empty name must return -ERANGE");
+        }
+
+        let get_empty = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: empty_name.as_ptr() as u64,
+            arg2: out.as_mut_ptr() as u64,
+            arg3: out.len() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Getxattr.raw(), get_empty) != Some(ERANGE) {
+            return Err("getxattr with empty name must return -ERANGE");
+        }
+
+        let remove_empty = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: empty_name.as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Removexattr.raw(), remove_empty) != Some(ERANGE) {
+            return Err("removexattr with empty name must return -ERANGE");
+        }
+
+        // fgetxattr with empty name on a bad fd reports -ERANGE before -EBADF
+        let fget_empty = SyscallArgs {
+            arg0: 9999,
+            arg1: empty_name.as_ptr() as u64,
+            arg2: out.as_mut_ptr() as u64,
+            arg3: out.len() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Fgetxattr.raw(), fget_empty) != Some(ERANGE) {
+            return Err("fgetxattr(bad_fd, \"\") must return -ERANGE");
+        }
+
+        // 2. Unknown flags to setxattr returns -EINVAL
+        let set_bad_flags = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: valid_name.as_ptr() as u64,
+            arg2: val.as_ptr() as u64,
+            arg3: val.len() as u64,
+            arg4: 0x80,
+            ..Default::default()
+        };
+        if call(Syscall::Setxattr.raw(), set_bad_flags) != Some(EINVAL) {
+            return Err("setxattr with unknown flags must return -EINVAL");
+        }
+
+        // 3. XATTR_REPLACE on missing attribute returns -ENODATA
+        let set_replace_missing = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: valid_name.as_ptr() as u64,
+            arg2: val.as_ptr() as u64,
+            arg3: val.len() as u64,
+            arg4: XATTR_REPLACE,
+            ..Default::default()
+        };
+        if call(Syscall::Setxattr.raw(), set_replace_missing) != Some(ENODATA) {
+            return Err("setxattr XATTR_REPLACE on missing attr must return -ENODATA");
+        }
+
+        // 4. Create attribute with XATTR_CREATE (succeeds)
+        let set_create = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: valid_name.as_ptr() as u64,
+            arg2: val.as_ptr() as u64,
+            arg3: val.len() as u64,
+            arg4: XATTR_CREATE,
+            ..Default::default()
+        };
+        if call(Syscall::Setxattr.raw(), set_create) != Some(0) {
+            return Err("setxattr XATTR_CREATE on missing attr should return 0");
+        }
+
+        // 5. XATTR_CREATE on existing attribute returns -EEXIST
+        if call(Syscall::Setxattr.raw(), set_create) != Some(EEXIST) {
+            return Err("setxattr XATTR_CREATE on existing attr must return -EEXIST");
+        }
+
+        // 6. Unsupported namespace prefix returns -EOPNOTSUPP
+        let set_unsupported = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: unsupported_prefix.as_ptr() as u64,
+            arg2: val.as_ptr() as u64,
+            arg3: val.len() as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Setxattr.raw(), set_unsupported) != Some(EOPNOTSUPP) {
+            return Err("setxattr with unsupported namespace must return -EOPNOTSUPP");
+        }
+
+        let get_unsupported = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: unsupported_prefix.as_ptr() as u64,
+            arg2: out.as_mut_ptr() as u64,
+            arg3: out.len() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Getxattr.raw(), get_unsupported) != Some(EOPNOTSUPP) {
+            return Err("getxattr with unsupported namespace must return -EOPNOTSUPP");
+        }
+
+        // 7. getxattr with size == 0 returns the attribute value length without writing buffer
+        let get_size_zero = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: valid_name.as_ptr() as u64,
+            arg2: 0,
+            arg3: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Getxattr.raw(), get_size_zero) != Some(val.len() as i64) {
+            return Err("getxattr with size==0 should return the value length");
+        }
+
+        // 8. getxattr with undersized buffer (size > 0 && size < value_len) returns -ERANGE
+        let get_undersized = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: valid_name.as_ptr() as u64,
+            arg2: out.as_mut_ptr() as u64,
+            arg3: 2, // val is 9 bytes
+            ..Default::default()
+        };
+        if call(Syscall::Getxattr.raw(), get_undersized) != Some(ERANGE) {
+            return Err("getxattr with undersized buffer must return -ERANGE");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_xattr_exact_errnos);

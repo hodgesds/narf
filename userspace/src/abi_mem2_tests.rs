@@ -594,3 +594,265 @@ fn smoke_abi_mem2_mseal_argument_rules() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem2_mseal_argument_rules);
+
+// ── mremap exact error precedence ────────────────────────────────────
+fn smoke_abi_mem2_mremap_exact_errnos() -> TestResult {
+    const PAGE: u64 = 0x1000;
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_FIXED: u64 = 2;
+    with_setup(|| {
+        // Parameter checks run first, even without an address space:
+        // 1. Unaligned old_addr -> EINVAL
+        if call(
+            Syscall::Mremap.raw(),
+            SyscallArgs {
+                arg0: 0x1001,
+                arg1: PAGE,
+                arg2: PAGE,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+        ) != Some(EINVAL)
+        {
+            return Err("mremap with unaligned old_addr must be -EINVAL");
+        }
+        // 2. Unknown flags -> EINVAL
+        if call(
+            Syscall::Mremap.raw(),
+            SyscallArgs {
+                arg0: 0x2000,
+                arg1: PAGE,
+                arg2: PAGE,
+                arg3: 0x80,
+                arg4: 0,
+                arg5: 0,
+            },
+        ) != Some(EINVAL)
+        {
+            return Err("mremap with unknown flags must be -EINVAL");
+        }
+        // 3. new_len == 0 -> EINVAL
+        if call(
+            Syscall::Mremap.raw(),
+            SyscallArgs {
+                arg0: 0x2000,
+                arg1: PAGE,
+                arg2: 0,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+        ) != Some(EINVAL)
+        {
+            return Err("mremap with new_len == 0 must be -EINVAL");
+        }
+        // 4. MREMAP_FIXED without MREMAP_MAYMOVE -> EINVAL
+        if call(
+            Syscall::Mremap.raw(),
+            SyscallArgs {
+                arg0: 0x2000,
+                arg1: PAGE,
+                arg2: PAGE,
+                arg3: MREMAP_FIXED,
+                arg4: 0x4000,
+                arg5: 0,
+            },
+        ) != Some(EINVAL)
+        {
+            return Err("mremap with MREMAP_FIXED without MREMAP_MAYMOVE must be -EINVAL");
+        }
+        // 5. MREMAP_FIXED with unaligned new_addr -> EINVAL
+        if call(
+            Syscall::Mremap.raw(),
+            SyscallArgs {
+                arg0: 0x2000,
+                arg1: PAGE,
+                arg2: PAGE,
+                arg3: MREMAP_FIXED | MREMAP_MAYMOVE,
+                arg4: 0x4001,
+                arg5: 0,
+            },
+        ) != Some(EINVAL)
+        {
+            return Err("mremap with unaligned new_addr must be -EINVAL");
+        }
+        // 6. Overlapping source and destination under FIXED -> EINVAL
+        if call(
+            Syscall::Mremap.raw(),
+            SyscallArgs {
+                arg0: 0x2000,
+                arg1: PAGE,
+                arg2: PAGE,
+                arg3: MREMAP_FIXED | MREMAP_MAYMOVE,
+                arg4: 0x2000,
+                arg5: 0,
+            },
+        ) != Some(EINVAL)
+        {
+            return Err("mremap with overlapping target must be -EINVAL");
+        }
+
+        // Test with a real address space and sealed range:
+        with_mseal_as(|base, len| {
+            if call(Syscall::Mseal.raw(), a2(base, len, 0)) != Some(0) {
+                return Err("sealing the test range failed");
+            }
+            // Invalid parameters over a sealed range must return -EINVAL, NOT -EPERM!
+            if call(
+                Syscall::Mremap.raw(),
+                SyscallArgs {
+                    arg0: base + 1,
+                    arg1: PAGE,
+                    arg2: PAGE,
+                    arg3: 0,
+                    arg4: 0,
+                    arg5: 0,
+                },
+            ) != Some(EINVAL)
+            {
+                return Err("unaligned mremap on sealed range must be -EINVAL, not -EPERM");
+            }
+            if call(
+                Syscall::Mremap.raw(),
+                SyscallArgs {
+                    arg0: base,
+                    arg1: PAGE,
+                    arg2: 0,
+                    arg3: 0,
+                    arg4: 0,
+                    arg5: 0,
+                },
+            ) != Some(EINVAL)
+            {
+                return Err("zero new_len mremap on sealed range must be -EINVAL, not -EPERM");
+            }
+            // Valid mremap parameters over a sealed range must return -EPERM
+            if call(
+                Syscall::Mremap.raw(),
+                SyscallArgs {
+                    arg0: base,
+                    arg1: PAGE,
+                    arg2: PAGE,
+                    arg3: MREMAP_MAYMOVE,
+                    arg4: 0,
+                    arg5: 0,
+                },
+            ) != Some(EPERM)
+            {
+                return Err("valid mremap on sealed range must be -EPERM");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_mremap_exact_errnos);
+
+// ── msync exact error precedence ─────────────────────────────────────
+fn smoke_abi_mem2_msync_exact_errnos() -> TestResult {
+    const PAGE: u64 = 0x1000;
+    const MS_ASYNC: u64 = 1;
+    const MS_SYNC: u64 = 4;
+    with_setup(|| {
+        // Unaligned addr -> EINVAL
+        if call(Syscall::Msync.raw(), a2(0x1001, PAGE, MS_SYNC)) != Some(EINVAL) {
+            return Err("msync with unaligned addr must be -EINVAL");
+        }
+        // Both MS_ASYNC and MS_SYNC -> EINVAL
+        if call(Syscall::Msync.raw(), a2(0x2000, PAGE, MS_ASYNC | MS_SYNC)) != Some(EINVAL) {
+            return Err("msync with both MS_ASYNC and MS_SYNC must be -EINVAL");
+        }
+        // Unknown flags -> EINVAL
+        if call(Syscall::Msync.raw(), a2(0x2000, PAGE, 0x80)) != Some(EINVAL) {
+            return Err("msync with unknown flags must be -EINVAL");
+        }
+        // Zero length -> 0 (success)
+        if call(Syscall::Msync.raw(), a2(0x2000, 0, MS_SYNC)) != Some(0) {
+            return Err("msync with len == 0 must return 0");
+        }
+        // Length in the last page wraps to 0 in PAGE_ALIGN, folding to end == start success (0)
+        if call(Syscall::Msync.raw(), a2(0x2000, u64::MAX - 0x100, MS_SYNC)) != Some(0) {
+            return Err("msync with last-page length must fold to end == start success (0)");
+        }
+        // Wrapped range where end < start -> ENOMEM
+        if call(
+            Syscall::Msync.raw(),
+            a2(0x2000, 0xFFFF_FFFF_FFFF_0000, MS_SYNC),
+        ) != Some(ENOMEM)
+        {
+            return Err("msync with wrapped range (end < start) must be -ENOMEM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_msync_exact_errnos);
+
+// ── mprotect exact error precedence ──────────────────────────────────
+fn smoke_abi_mem2_mprotect_exact_errnos() -> TestResult {
+    const PAGE: u64 = 0x1000;
+    const PROT_READ: u64 = 1;
+    const PROT_GROWSDOWN: u64 = 0x0100_0000;
+    const PROT_GROWSUP: u64 = 0x0200_0000;
+    with_setup(|| {
+        // Contradictory growsdown + growsup -> EINVAL
+        if call(
+            Syscall::MProtect.raw(),
+            a2(0x2000, PAGE, PROT_GROWSDOWN | PROT_GROWSUP),
+        ) != Some(EINVAL)
+        {
+            return Err("mprotect with growsdown and growsup must be -EINVAL");
+        }
+        // Unaligned addr -> EINVAL
+        if call(Syscall::MProtect.raw(), a2(0x1001, PAGE, PROT_READ)) != Some(EINVAL) {
+            return Err("mprotect with unaligned addr must be -EINVAL");
+        }
+        // Zero length -> 0 (success)
+        if call(Syscall::MProtect.raw(), a2(0x2000, 0, PROT_READ)) != Some(0) {
+            return Err("mprotect with len == 0 must return 0");
+        }
+        // Unknown prot bits -> EINVAL
+        if call(Syscall::MProtect.raw(), a2(0x2000, PAGE, 0x100)) != Some(EINVAL) {
+            return Err("mprotect with unknown prot bits must be -EINVAL");
+        }
+        // Wrapped range (end <= start) -> ENOMEM
+        if call(
+            Syscall::MProtect.raw(),
+            a2(0x2000, u64::MAX - 0x100, PROT_READ),
+        ) != Some(ENOMEM)
+        {
+            return Err("mprotect with wrapped range must be -ENOMEM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_mprotect_exact_errnos);
+
+// ── madvise exact error precedence ───────────────────────────────────
+fn smoke_abi_mem2_madvise_exact_errnos() -> TestResult {
+    const PAGE: u64 = 0x1000;
+    const MADV_DONTNEED: u64 = 4;
+    with_setup(|| {
+        // Unknown advice -> EINVAL
+        if call(Syscall::Madvise.raw(), a2(0x2000, PAGE, 9999)) != Some(EINVAL) {
+            return Err("madvise with unknown advice must be -EINVAL");
+        }
+        // Unaligned addr -> EINVAL
+        if call(Syscall::Madvise.raw(), a2(0x1001, PAGE, MADV_DONTNEED)) != Some(EINVAL) {
+            return Err("madvise with unaligned addr must be -EINVAL");
+        }
+        // Zero length -> 0 (success)
+        if call(Syscall::Madvise.raw(), a2(0x2000, 0, MADV_DONTNEED)) != Some(0) {
+            return Err("madvise with len == 0 must return 0");
+        }
+        // Wrapped range (start + len < start) -> EINVAL
+        if call(
+            Syscall::Madvise.raw(),
+            a2(0x2000, u64::MAX - 0x100, MADV_DONTNEED),
+        ) != Some(EINVAL)
+        {
+            return Err("madvise with wrapped range must be -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_madvise_exact_errnos);
