@@ -1457,6 +1457,12 @@ pub fn sys_epoll_pwait2(ctx: &mut dyn TrapContext) {
                 let secs = u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
                 let nsec =
                     u64::from_ne_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+                // poll_select_set_timeout(): a negative field or tv_nsec
+                // outside [0, 1e9) is -EINVAL, not a clamped timeout.
+                if (secs as i64) < 0 || nsec >= 1_000_000_000 {
+                    ctx.set_return(to_ret(EINVAL));
+                    return;
+                }
                 // sec*1000 + ceil(nsec / 1e6): round the sub-ms remainder UP so a
                 // 1 ns timeout stays a (tiny) blocking wait, not a 0-ms poll.
                 let sub_ms = nsec / 1_000_000;

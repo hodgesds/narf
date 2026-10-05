@@ -5143,6 +5143,150 @@ fn smoke_abi_socket_sendmmsg_exact_errors() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sendmmsg_exact_errors);
 
+fn smoke_abi_socket_recvmmsg_exact_errors() -> TestResult {
+    with_setup(|| {
+        // Native-only flag validation and timeout resolution occur before
+        // descriptor lookup, and descriptor lookup occurs before touching the
+        // message vector.
+        if call(
+            Syscall::Recvmmsg.raw(),
+            a4(BAD_FD, BAD_USER_PTR, 0, MSG_CMSG_COMPAT, BAD_USER_PTR),
+        ) != Some(EINVAL)
+        {
+            return Err("recvmmsg compat flag did not precede timeout and fd lookup");
+        }
+
+        // A faulting timeout returns -EFAULT before descriptor resolution.
+        if call(
+            Syscall::Recvmmsg.raw(),
+            a4(BAD_FD, BAD_USER_PTR, 0, 0, BAD_USER_PTR),
+        ) != Some(EFAULT)
+        {
+            return Err("recvmmsg faulting timeout did not return EFAULT before fd lookup");
+        }
+
+        // An invalid timespec (tv_nsec < 0 or >= 1e9, or tv_sec < 0) returns -EINVAL before fd lookup.
+        let bad_nsec: [i64; 2] = [0, 1_000_000_000];
+        if call(
+            Syscall::Recvmmsg.raw(),
+            a4(BAD_FD, BAD_USER_PTR, 0, 0, bad_nsec.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("recvmmsg invalid tv_nsec did not return EINVAL before fd lookup");
+        }
+        let bad_sec: [i64; 2] = [-1, 0];
+        if call(
+            Syscall::Recvmmsg.raw(),
+            a4(BAD_FD, BAD_USER_PTR, 0, 0, bad_sec.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("recvmmsg negative tv_sec did not return EINVAL before fd lookup");
+        }
+
+        // Descriptor lookup occurs after timeout checks: bad fd -> EBADF, non-socket -> ENOTSOCK.
+        if call(Syscall::Recvmmsg.raw(), a4(BAD_FD, BAD_USER_PTR, 0, 0, 0)) != Some(EBADF) {
+            return Err("recvmmsg vlen=0 on a bad fd did not return EBADF");
+        }
+
+        let mut pipefd = [0u8; 8];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 setup failed");
+        }
+        let non_socket = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        if call(
+            Syscall::Recvmmsg.raw(),
+            a4(non_socket, BAD_USER_PTR, 0, 0, 0),
+        ) != Some(ENOTSOCK_ERR)
+        {
+            return Err("recvmmsg vlen=0 on a pipe did not return ENOTSOCK");
+        }
+
+        // On a valid non-blocking socket:
+        let (_tx, rx) = make_pair(SOCK_DGRAM | SOCK_NONBLOCK)?;
+        // vlen=0 returns 0 without touching mmsg_ptr:
+        if call(Syscall::Recvmmsg.raw(), a4(rx, BAD_USER_PTR, 0, 0, 0)) != Some(0) {
+            return Err("recvmmsg vlen=0 on a valid socket touched mmsg_ptr");
+        }
+
+        // vlen=1 with bad mmsg_ptr returns EFAULT:
+        if call(Syscall::Recvmmsg.raw(), a4(rx, BAD_USER_PTR, 1, 0, 0)) != Some(EFAULT) {
+            return Err("recvmmsg with bad mmsg_ptr did not return EFAULT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recvmmsg_exact_errors);
+
+fn smoke_abi_socket_recvmmsg_batched_roundtrip() -> TestResult {
+    with_setup(|| {
+        let (tx, rx) = make_pair(SOCK_DGRAM | SOCK_NONBLOCK)?;
+        let first = b"first datagram";
+        let second = b"second datagram payload";
+
+        // Send two datagrams via sendmmsg
+        let mut send_iov = [0u8; 32];
+        send_iov[0..8].copy_from_slice(&(first.as_ptr() as u64).to_ne_bytes());
+        send_iov[8..16].copy_from_slice(&(first.len() as u64).to_ne_bytes());
+        send_iov[16..24].copy_from_slice(&(second.as_ptr() as u64).to_ne_bytes());
+        send_iov[24..32].copy_from_slice(&(second.len() as u64).to_ne_bytes());
+
+        let mut send_batch = [0u8; 128];
+        send_batch[16..24].copy_from_slice(&(send_iov.as_ptr() as u64).to_ne_bytes());
+        send_batch[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        send_batch[64 + 16..64 + 24]
+            .copy_from_slice(&(send_iov.as_ptr() as u64 + 16).to_ne_bytes());
+        send_batch[64 + 24..64 + 32].copy_from_slice(&1u64.to_ne_bytes());
+
+        if call(
+            Syscall::Sendmmsg.raw(),
+            a3(tx, send_batch.as_mut_ptr() as u64, 2, 0),
+        ) != Some(2)
+        {
+            return Err("sendmmsg failed to send 2 datagrams");
+        }
+
+        // Now receive both datagrams via recvmmsg
+        let mut recv_buf1 = [0u8; 32];
+        let mut recv_buf2 = [0u8; 32];
+        let mut recv_iov = [0u8; 32];
+        recv_iov[0..8].copy_from_slice(&(recv_buf1.as_mut_ptr() as u64).to_ne_bytes());
+        recv_iov[8..16].copy_from_slice(&(recv_buf1.len() as u64).to_ne_bytes());
+        recv_iov[16..24].copy_from_slice(&(recv_buf2.as_mut_ptr() as u64).to_ne_bytes());
+        recv_iov[24..32].copy_from_slice(&(recv_buf2.len() as u64).to_ne_bytes());
+
+        let mut recv_batch = [0u8; 128];
+        recv_batch[16..24].copy_from_slice(&(recv_iov.as_ptr() as u64).to_ne_bytes());
+        recv_batch[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        recv_batch[64 + 16..64 + 24]
+            .copy_from_slice(&(recv_iov.as_ptr() as u64 + 16).to_ne_bytes());
+        recv_batch[64 + 24..64 + 32].copy_from_slice(&1u64.to_ne_bytes());
+
+        if call(
+            Syscall::Recvmmsg.raw(),
+            a4(rx, recv_batch.as_mut_ptr() as u64, 2, 0, 0),
+        ) != Some(2)
+        {
+            return Err("recvmmsg failed to receive 2 datagrams");
+        }
+
+        let first_len = u32::from_ne_bytes(recv_batch[56..60].try_into().unwrap());
+        let second_len = u32::from_ne_bytes(recv_batch[64 + 56..64 + 60].try_into().unwrap());
+        if first_len as usize != first.len() || &recv_buf1[..first.len()] != first {
+            return Err("recvmmsg first message payload or msg_len mismatch");
+        }
+        if second_len as usize != second.len() || &recv_buf2[..second.len()] != second {
+            return Err("recvmmsg second message payload or msg_len mismatch");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_recvmmsg_batched_roundtrip
+);
+
 fn smoke_abi_socket_sendmmsg_partial_prefix() -> TestResult {
     with_setup(|| {
         let (tx, rx) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;

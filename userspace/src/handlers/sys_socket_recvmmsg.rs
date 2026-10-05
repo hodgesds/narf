@@ -4,9 +4,10 @@ use super::*;
 /// `recvmmsg(fd, mmsghdr*, vlen, flags, timeout)` — receive up to
 /// `vlen` messages, writing each received length into its `msg_len`.
 ///
-/// Mirrors `net/socket.c::do_recvmmsg`:
-///   - `sockfd_lookup_light` first → -EBADF / -ENOTSOCK (even for vlen 0);
+/// Mirrors `net/socket.c:SYSCALL_DEFINE5(recvmmsg)` + `__sys_recvmmsg`:
+///   - `flags & MSG_CMSG_COMPAT` → -EINVAL;
 ///   - a faulting timeout → -EFAULT, an invalid one → -EINVAL;
+///   - `sockfd_lookup_light` next → -EBADF / -ENOTSOCK (even for vlen 0);
 ///   - `vlen` is clamped to UIO_MAXIOV;
 ///   - an error on the FIRST message is returned as-is; once any datagram
 ///     was received the count is returned instead.
@@ -19,13 +20,11 @@ pub(crate) fn sys_socket_recvmmsg(ctx: &mut dyn TrapContext) {
     let mmsg_ptr = a.arg1;
     let flags = a.arg3;
     let timeout_ptr = a.arg4;
-    let sock = match current_socket_result(fd as u32) {
-        Ok(s) => s,
-        Err(errno) => {
-            ctx.set_return(errno_ret(errno));
-            return;
-        }
-    };
+    const MSG_CMSG_COMPAT: u32 = 0x8000_0000;
+    if (flags as u32) & MSG_CMSG_COMPAT != 0 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
     if timeout_ptr != 0 {
         let mut ts = [0u8; 16];
         // SAFETY: copy_from_user range-validates the timespec and
@@ -42,12 +41,25 @@ pub(crate) fn sys_socket_recvmmsg(ctx: &mut dyn TrapContext) {
             return;
         }
     }
+    let sock = match current_socket_result(fd as u32) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
     const UIO_MAXIOV: usize = 1024;
     let vlen = core::cmp::min(a.arg2 as u32 as usize, UIO_MAXIOV);
     let mut recvd = 0usize;
     let mut first_err: Option<u64> = None;
     for i in 0..vlen {
-        let hdr_ptr = mmsg_ptr + (i as u64) * MMSGHDR_SZ;
+        let Some(hdr_ptr) = (i as u64)
+            .checked_mul(MMSGHDR_SZ)
+            .and_then(|offset| mmsg_ptr.checked_add(offset))
+        else {
+            first_err = Some((-EFAULT) as u64);
+            break;
+        };
         let mut cap = CaptureCtx {
             inner: ctx,
             args: SyscallArgs {

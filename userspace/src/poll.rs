@@ -284,7 +284,11 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
         }
     };
     let mut old_mask = None;
-    if args.arg3 != 0 && args.arg4 == 8 {
+    if args.arg3 != 0 {
+        if args.arg4 != 8 {
+            ctx.set_return(to_ret(EINVAL));
+            return;
+        }
         let mut buf = [0u8; 8];
         // SAFETY: arg4 (sigsetsize) == 8 checked above; copy_from_user
         // range-validates `args.arg3` and SMAP-brackets the read into `buf`.
