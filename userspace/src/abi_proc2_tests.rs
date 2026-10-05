@@ -2576,3 +2576,42 @@ fn smoke_abi_proc2_exec_resets_dumpable() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_exec_resets_dumpable);
+
+fn smoke_abi_proc2_prctl_name_faults() -> TestResult {
+    with_setup(|| {
+        const PR_SET_NAME: u64 = 15;
+        const PR_GET_NAME: u64 = 16;
+        const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+
+        // PR_SET_NAME: passing an unmapped or bad pointer must return -EFAULT,
+        // matching Linux kernel/sys.c:
+        //     if (strncpy_from_user(comm, (char __user *)arg2, sizeof(me->comm) - 1) < 0)
+        //         return -EFAULT;
+        if call(Syscall::Prctl.raw(), a1(PR_SET_NAME, BAD_PTR)) != Some(EFAULT) {
+            return Err("PR_SET_NAME(BAD_PTR) must return -EFAULT");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_NAME, u64::MAX)) != Some(EFAULT) {
+            return Err("PR_SET_NAME(u64::MAX) must return -EFAULT");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_NAME, 0)) != Some(EFAULT) {
+            return Err("PR_SET_NAME(0) must return -EFAULT");
+        }
+
+        // PR_GET_NAME: passing an unmapped or bad pointer must return -EFAULT,
+        // matching Linux kernel/sys.c:
+        //     if (copy_to_user((char __user *)arg2, comm, sizeof(comm)))
+        //         return -EFAULT;
+        if call(Syscall::Prctl.raw(), a1(PR_GET_NAME, BAD_PTR)) != Some(EFAULT) {
+            return Err("PR_GET_NAME(BAD_PTR) must return -EFAULT");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_GET_NAME, u64::MAX)) != Some(EFAULT) {
+            return Err("PR_GET_NAME(u64::MAX) must return -EFAULT");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_GET_NAME, 0)) != Some(EFAULT) {
+            return Err("PR_GET_NAME(0) must return -EFAULT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_name_faults);

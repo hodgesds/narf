@@ -46,14 +46,21 @@ pub(crate) fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
 
         // (2) Validate before any state change. `ss_mode` is the flag word
         // minus SS_FLAG_BITS; it must be exactly SS_DISABLE, SS_ONSTACK, or 0.
-        if (flags & !(SS_DISABLE | SS_ONSTACK)) != 0 {
+        const SS_AUTODISARM: u32 = 1 << 31;
+        let ss_mode = flags & !SS_AUTODISARM;
+        if ss_mode != 0 && ss_mode != SS_DISABLE && ss_mode != SS_ONSTACK {
             ctx.set_return(errno_ret(EINVAL));
             return;
         }
-        if (flags & SS_DISABLE) == 0 && size < MIN_SIGSTKSZ {
-            ctx.set_return(errno_ret(ENOMEM));
-            return;
-        }
+        let (sp, size) = if ss_mode == SS_DISABLE {
+            (0, 0)
+        } else {
+            if size < MIN_SIGSTKSZ {
+                ctx.set_return(errno_ret(ENOMEM));
+                return;
+            }
+            (sp, size)
+        };
         Some(SigAltStack { sp, flags, size })
     } else {
         None

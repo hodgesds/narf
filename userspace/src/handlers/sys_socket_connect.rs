@@ -6,13 +6,14 @@ pub(crate) fn sys_socket_connect(ctx: &mut dyn TrapContext) {
     let fd = args.arg0 as u32;
     let addr_ptr = args.arg1;
     let addr_len = args.arg2;
-    // Linux __sys_connect: sockfd_lookup_light gives -EBADF / -ENOTSOCK, then
-    // move_addr_to_kernel gives -EINVAL / -EFAULT, then the family's connect op
-    // (-ECONNREFUSED / -EINPROGRESS / -EISCONN / -EADDRNOTAVAIL / …).
-    let sock = match current_socket_result(fd) {
-        Ok(s) => s,
-        Err(errno) => {
-            ctx.set_return(errno_ret(errno));
+    // Linux __sys_connect: fdget gives -EBADF, then move_addr_to_kernel gives
+    // -EINVAL / -EFAULT, then __sys_connect_file checks sock_from_file (-ENOTSOCK),
+    // and finally the family's connect op (-ECONNREFUSED / -EINPROGRESS / …).
+    let task = current_task_id();
+    let ops = match fd::with_table(task, |table| table.get(fd).map(|e| e.ops.clone())).flatten() {
+        Some(ops) => ops,
+        None => {
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
@@ -20,6 +21,13 @@ pub(crate) fn sys_socket_connect(ctx: &mut dyn TrapContext) {
         Ok(a) => a,
         Err(errno) => {
             ctx.set_return(errno_ret(errno));
+            return;
+        }
+    };
+    let sock = match socket_from_file_ops(ops) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(errno_ret(ENOTSOCK));
             return;
         }
     };

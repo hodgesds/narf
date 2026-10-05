@@ -1322,3 +1322,319 @@ kernel_test_in!(
     "syscall_abi/socket_errno",
     smoke_abi_socket_errno_netlink_rebind
 );
+
+/// Descriptor, socket type, and argument precedence for shutdown(2).
+/// Linux net/socket.c::__sys_shutdown:
+/// 1. fd_empty(f) -> -EBADF
+/// 2. !sock -> -ENOTSOCK
+/// 3. how > SHUT_RDWR -> -EINVAL
+/// 4. unconnected stream -> -ENOTCONN
+fn smoke_abi_socket_errno_shutdown_precedence() -> TestResult {
+    with_setup(|| {
+        const BAD_FD: u64 = 4096;
+        let mut pipefd = [0u8; 8];
+        if sys(Syscall::Pipe2, a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 failed");
+        }
+        let pipe = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+
+        // 1. Bad fd beats invalid how:
+        if sys(Syscall::SocketShutdown, a1(BAD_FD, 99)) != Some(EBADF) {
+            return Err("shutdown(BAD_FD, 99) must return -EBADF");
+        }
+
+        // 2. Non-socket fd beats invalid how:
+        if sys(Syscall::SocketShutdown, a1(pipe, 99)) != Some(ENOTSOCK) {
+            return Err("shutdown(pipe, 99) must return -ENOTSOCK");
+        }
+
+        // 3. Socket with invalid how returns -EINVAL:
+        let sock = open(AF_INET, SOCK_STREAM, 0)?;
+        if sys(Syscall::SocketShutdown, a1(sock, 99)) != Some(EINVAL) {
+            return Err("shutdown(sock, 99) must return -EINVAL");
+        }
+
+        // 4. Unconnected TCP socket with valid how returns -ENOTCONN:
+        if sys(Syscall::SocketShutdown, a1(sock, SHUT_RDWR)) != Some(ENOTCONN_ERR) {
+            return Err("shutdown(unconnected, SHUT_RDWR) must return -ENOTCONN");
+        }
+
+        close(pipe);
+        close(sock);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_shutdown_precedence
+);
+
+/// Descriptor and buffer validation precedence for setsockopt(2) and getsockopt(2).
+/// Linux net/socket.c:
+/// __sys_setsockopt:
+///   1. EBADF (bad fd)
+///   2. ENOTSOCK (non-socket file)
+///   3. EINVAL (optlen < 0)
+///   4. EFAULT (optval pointer copy fails)
+///   5. ENOPROTOOPT (unknown option)
+///
+/// __sys_getsockopt:
+///   1. EBADF (bad fd)
+///   2. ENOTSOCK (non-socket file)
+///   3. EFAULT (optlen pointer read fails)
+///   4. EINVAL (*optlen < 0)
+///   5. ENOPROTOOPT (unknown option)
+fn smoke_abi_socket_errno_sockopt_precedence() -> TestResult {
+    with_setup(|| {
+        const BAD_FD: u64 = 4096;
+        let mut pipefd = [0u8; 8];
+        if sys(Syscall::Pipe2, a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 failed");
+        }
+        let pipe = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        let sock = open(AF_INET, SOCK_STREAM, 0)?;
+
+        // --- setsockopt precedence ---
+        // 1. EBADF beats negative optlen and bad pointer:
+        if sys(
+            Syscall::SocketSetSockOpt,
+            a4(
+                BAD_FD,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                BAD_USER_PTR,
+                (-1i32) as u64,
+            ),
+        ) != Some(EBADF)
+        {
+            return Err("setsockopt(BAD_FD) must return -EBADF");
+        }
+
+        // 2. ENOTSOCK beats negative optlen and bad pointer:
+        if sys(
+            Syscall::SocketSetSockOpt,
+            a4(pipe, SOL_SOCKET, SO_REUSEADDR, BAD_USER_PTR, (-1i32) as u64),
+        ) != Some(ENOTSOCK)
+        {
+            return Err("setsockopt(pipe) must return -ENOTSOCK");
+        }
+
+        // 3. Negative optlen beats bad optval pointer:
+        if sys(
+            Syscall::SocketSetSockOpt,
+            a4(sock, SOL_SOCKET, SO_REUSEADDR, BAD_USER_PTR, (-1i32) as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("setsockopt(negative optlen) must return -EINVAL");
+        }
+
+        // 4. Bad optval pointer with valid optlen gives -EFAULT:
+        if sys(
+            Syscall::SocketSetSockOpt,
+            a4(sock, SOL_SOCKET, SO_REUSEADDR, BAD_USER_PTR, 4),
+        ) != Some(EFAULT)
+        {
+            return Err("setsockopt(BAD_USER_PTR, 4) must return -EFAULT");
+        }
+
+        // 5. Unknown option with valid value gives -ENOPROTOOPT:
+        let one = 1i32.to_ne_bytes();
+        if sys(
+            Syscall::SocketSetSockOpt,
+            a4(sock, SOL_SOCKET, 0x7FFF, one.as_ptr() as u64, 4),
+        ) != Some(ENOPROTOOPT_ERR)
+        {
+            return Err("setsockopt(unknown option) must return -ENOPROTOOPT");
+        }
+
+        // --- getsockopt precedence ---
+        // 1. EBADF beats bad len_ptr:
+        if sys(
+            Syscall::SocketGetSockOpt,
+            a4(BAD_FD, SOL_SOCKET, SO_REUSEADDR, BAD_USER_PTR, BAD_USER_PTR),
+        ) != Some(EBADF)
+        {
+            return Err("getsockopt(BAD_FD) must return -EBADF");
+        }
+
+        // 2. ENOTSOCK beats bad len_ptr:
+        if sys(
+            Syscall::SocketGetSockOpt,
+            a4(pipe, SOL_SOCKET, SO_REUSEADDR, BAD_USER_PTR, BAD_USER_PTR),
+        ) != Some(ENOTSOCK)
+        {
+            return Err("getsockopt(pipe) must return -ENOTSOCK");
+        }
+
+        // 3. Bad len_ptr on socket gives -EFAULT:
+        if sys(
+            Syscall::SocketGetSockOpt,
+            a4(sock, SOL_SOCKET, SO_REUSEADDR, BAD_USER_PTR, BAD_USER_PTR),
+        ) != Some(EFAULT)
+        {
+            return Err("getsockopt(BAD_USER_PTR len) must return -EFAULT");
+        }
+
+        // 4. Negative *len_ptr gives -EINVAL:
+        let mut neg_len = (-1i32).to_ne_bytes();
+        let mut out_val = [0u8; 4];
+        if sys(
+            Syscall::SocketGetSockOpt,
+            a4(
+                sock,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                out_val.as_mut_ptr() as u64,
+                neg_len.as_mut_ptr() as u64,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("getsockopt(negative *len) must return -EINVAL");
+        }
+
+        // 5. Unknown option gives -ENOPROTOOPT:
+        let mut four = 4i32.to_ne_bytes();
+        if sys(
+            Syscall::SocketGetSockOpt,
+            a4(
+                sock,
+                SOL_SOCKET,
+                0x7FFF,
+                out_val.as_mut_ptr() as u64,
+                four.as_mut_ptr() as u64,
+            ),
+        ) != Some(ENOPROTOOPT_ERR)
+        {
+            return Err("getsockopt(unknown option) must return -ENOPROTOOPT");
+        }
+
+        close(pipe);
+        close(sock);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_sockopt_precedence
+);
+
+/// Descriptor and address-validation precedence for bind(2) and connect(2).
+/// Linux net/socket.c:
+/// __sys_bind:
+///   1. EBADF (bad fd)
+///   2. ENOTSOCK (non-socket file)
+///   3. move_addr_to_kernel: ulen < 0 || ulen > 128 -> -EINVAL
+///   4. move_addr_to_kernel: copy_from_user -> -EFAULT
+///   5. ulen < 2 -> -EINVAL
+///
+/// __sys_connect:
+///   1. EBADF (bad fd)
+///   2. move_addr_to_kernel: ulen < 0 || ulen > 128 -> -EINVAL
+///   3. move_addr_to_kernel: copy_from_user -> -EFAULT
+///   4. ENOTSOCK (non-socket file checked in __sys_connect_file)
+///   5. ulen < 2 -> -EINVAL
+fn smoke_abi_socket_errno_bind_connect_precedence() -> TestResult {
+    with_setup(|| {
+        const BAD_FD: u64 = 4096;
+        let mut pipefd = [0u8; 8];
+        if sys(Syscall::Pipe2, a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 failed");
+        }
+        let pipe = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        let sock = open(AF_INET, SOCK_STREAM, 0)?;
+        let valid_sin = sin(AF_INET, LOOPBACK, 31099);
+
+        // --- bind precedence ---
+        // 1. EBADF beats bad addrlen and bad pointer:
+        if sys(Syscall::SocketBind, a2(BAD_FD, BAD_USER_PTR, 1000)) != Some(EBADF) {
+            return Err("bind(BAD_FD) must return -EBADF");
+        }
+
+        // 2. In bind, ENOTSOCK precedes move_addr_to_kernel:
+        if sys(Syscall::SocketBind, a2(pipe, BAD_USER_PTR, 1000)) != Some(ENOTSOCK) {
+            return Err("bind(pipe) must return -ENOTSOCK before address checks");
+        }
+
+        // 3. Addrlen > 128 beats bad address pointer:
+        if sys(Syscall::SocketBind, a2(sock, BAD_USER_PTR, 1000)) != Some(EINVAL) {
+            return Err("bind(addrlen > 128) must return -EINVAL");
+        }
+
+        // 4. Negative addrlen beats bad address pointer:
+        if sys(Syscall::SocketBind, a2(sock, BAD_USER_PTR, (-1i32) as u64)) != Some(EINVAL) {
+            return Err("bind(addrlen < 0) must return -EINVAL");
+        }
+
+        // 5. Valid length with bad pointer gives -EFAULT:
+        if sys(Syscall::SocketBind, a2(sock, BAD_USER_PTR, 16)) != Some(EFAULT) {
+            return Err("bind(BAD_USER_PTR, 16) must return -EFAULT");
+        }
+
+        // 6. Addrlen < 2 gives -EINVAL:
+        if sys(Syscall::SocketBind, a2(sock, valid_sin.as_ptr() as u64, 1)) != Some(EINVAL) {
+            return Err("bind(addrlen < 2) must return -EINVAL");
+        }
+
+        // --- connect precedence ---
+        // 1. EBADF beats bad addrlen and bad pointer:
+        if sys(Syscall::SocketConnect, a2(BAD_FD, BAD_USER_PTR, 1000)) != Some(EBADF) {
+            return Err("connect(BAD_FD) must return -EBADF");
+        }
+
+        // 2. In connect, move_addr_to_kernel precedes ENOTSOCK:
+        // Addrlen > 128 returns -EINVAL even on a non-socket file:
+        if sys(Syscall::SocketConnect, a2(pipe, BAD_USER_PTR, 1000)) != Some(EINVAL) {
+            return Err("connect(pipe, len=1000) must return -EINVAL before ENOTSOCK");
+        }
+
+        // 3. Bad pointer returns -EFAULT even on a non-socket file:
+        if sys(Syscall::SocketConnect, a2(pipe, BAD_USER_PTR, 16)) != Some(EFAULT) {
+            return Err("connect(pipe, BAD_USER_PTR) must return -EFAULT before ENOTSOCK");
+        }
+
+        // 4. Only after valid address copy does a non-socket file return -ENOTSOCK:
+        if sys(
+            Syscall::SocketConnect,
+            a2(pipe, valid_sin.as_ptr() as u64, 16),
+        ) != Some(ENOTSOCK)
+        {
+            return Err("connect(pipe, valid_addr) must return -ENOTSOCK");
+        }
+
+        // 5. On a socket: addrlen > 128 gives -EINVAL:
+        if sys(Syscall::SocketConnect, a2(sock, BAD_USER_PTR, 1000)) != Some(EINVAL) {
+            return Err("connect(sock, len=1000) must return -EINVAL");
+        }
+
+        // 6. On a socket: addrlen < 0 gives -EINVAL:
+        if sys(
+            Syscall::SocketConnect,
+            a2(sock, BAD_USER_PTR, (-1i32) as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("connect(sock, len < 0) must return -EINVAL");
+        }
+
+        // 7. On a socket: bad pointer gives -EFAULT:
+        if sys(Syscall::SocketConnect, a2(sock, BAD_USER_PTR, 16)) != Some(EFAULT) {
+            return Err("connect(sock, BAD_USER_PTR) must return -EFAULT");
+        }
+
+        // 8. On a socket: addrlen < 2 gives -EINVAL:
+        if sys(
+            Syscall::SocketConnect,
+            a2(sock, valid_sin.as_ptr() as u64, 1),
+        ) != Some(EINVAL)
+        {
+            return Err("connect(sock, len < 2) must return -EINVAL");
+        }
+
+        close(pipe);
+        close(sock);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_bind_connect_precedence
+);
