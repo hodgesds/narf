@@ -390,7 +390,11 @@ dynamic directories preserve mode and inode identity. This covers
 udev coldplug nodes, `/dev/{char,block}/MAJOR:MINOR`, and journald's
 `/dev/log -> /run/systemd/journal/dev-log`; static device aliases retain
 precedence over dynamic names and absent optional hardware nodes are not
-advertised by readdir.
+advertised by readdir. Static aliases include `/dev/fd -> /proc/self/fd` and
+`/dev/{stdin,stdout,stderr}` to the corresponding proc-fd entries. They are
+ordinary devtmpfs symlinks; their targets may cross from devtmpfs to procfs,
+so the VFS-level resolver, rather than a filesystem-local walk, owns the
+cross-mount transition.
 
 devtmpfs's `/dev/ptmx` is `DevTmpfsPtmx`, a `c 5:2` node (0666, root-owned,
 chown/chmod persist) beside an empty `/dev/pts` mountpoint. Every devpts mount

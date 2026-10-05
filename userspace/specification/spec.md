@@ -956,6 +956,12 @@ Linux `readlink(2)` and `readlinkat(2)` size their kernel staging read from
 the caller's `bufsiz`; they never treat `st_size` as the target length.
 This is required for procfs magic links, whose Linux-compatible stat metadata
 has a zero size even when `readlink` returns a non-empty target.
+`/dev/fd` and `/dev/{stdin,stdout,stderr}` are devtmpfs symlinks into procfs.
+When a followed `open(2)` reaches `/proc/self/fd/N` (including through those
+aliases), it reopens descriptor `N`; path-backed descriptors restart normal
+open permission and flag handling, while anonymous descriptors retain a live
+reference to their object. `O_NOFOLLOW` preserves the final devtmpfs link and
+`RESOLVE_NO_MAGICLINKS` rejects the proc-fd jump with `ELOOP`.
 The `container` Cargo feature enables namespace support in both userspace and
 `narf-filesystem`; procfs must therefore never publish zero namespace limits
 in a build where the namespace syscalls are enabled.

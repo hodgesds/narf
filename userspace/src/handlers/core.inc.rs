@@ -1252,11 +1252,6 @@ fn open_impl(
         ctx.set_return(errno_ret(ENOENT)); // -ENOENT
         return;
     }
-    // A trailing slash makes the final component a directory lookup
-    // (`open_last_lookups`: `if (nd->last.name[nd->last.len]) nd->flags |=
-    // LOOKUP_FOLLOW | LOOKUP_DIRECTORY;`), and on the create side it is
-    // -EISDIR outright. Captured before normalization strips it.
-    let trailing_slash = mnt_len == 0 && path_owned_raw.len() > 1 && path_owned_raw.ends_with('/');
     // Linux's `FD_ADD(flags, do_file_open(...))` reserves the lowest-free fd
     // before evaluating path lookup or O_CREAT. Apart from preserving exact
     // EMFILE precedence, that ordering is transactional: descriptor exhaustion
@@ -1268,6 +1263,35 @@ fn open_impl(
             return;
         }
     };
+    open_impl_reserved(
+        ctx,
+        path_owned_raw,
+        flags,
+        mnt_ptr,
+        mnt_len,
+        create_mode,
+        reservation,
+    );
+}
+
+/// Continue an `open(2)` transaction after its descriptor number has been
+/// reserved. A proc-fd magic link may re-enter this path with its target;
+/// carrying the reservation prevents a concurrent `CLONE_FILES` sibling from
+/// taking the descriptor number Linux allocated before pathname resolution.
+fn open_impl_reserved(
+    ctx: &mut dyn TrapContext,
+    path_owned_raw: alloc::string::String,
+    flags: u64,
+    mnt_ptr: u64,
+    mnt_len: usize,
+    create_mode: u32,
+    reservation: fd::FdReservation,
+) {
+    // A trailing slash makes the final component a directory lookup
+    // (`open_last_lookups`: `if (nd->last.name[nd->last.len]) nd->flags |=
+    // LOOKUP_FOLLOW | LOOKUP_DIRECTORY;`), and on the create side it is
+    // -EISDIR outright. Captured before normalization strips it.
+    let trailing_slash = mnt_len == 0 && path_owned_raw.len() > 1 && path_owned_raw.ends_with('/');
     // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR), O_PATH identity, and
     // the settable status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
     // `fcntl(F_GETFL)` reports both. glibc's `fdopen(fd, "w")` reads the
@@ -1308,6 +1332,8 @@ fn open_impl(
     // those links through the current mount table before the final lookup.
     // O_NOFOLLOW still preserves a final link, while intermediate links must
     // always be traversed.
+    const O_NOFOLLOW: u64 = 0o400000;
+    let follow_final = flags & O_NOFOLLOW == 0 && !excl_create;
     let proc_magic_path = chroot_path_matches(task, &path_owned, "/proc", true);
     // `RESOLVE_NO_MAGICLINKS`: `nd_jump_link` refuses with -ELOOP before it
     // jumps. NARF's magic links are the procfs ones — `/proc/self/fd/N` and
@@ -1316,7 +1342,10 @@ fn open_impl(
     // target, so the refusal belongs here rather than in the resolver.
     // ELOOP, matching the flag's sibling `RESOLVE_NO_SYMLINKS`: what the
     // caller hit was a link it asked not to traverse.
-    if proc_magic_path && current_resolve_scope().is_some_and(|s| s.no_magiclinks) {
+    if proc_magic_path
+        && follow_final
+        && current_resolve_scope().is_some_and(|s| s.no_magiclinks)
+    {
         ctx.set_return(errno_ret(ELOOP)); // -ELOOP
         return;
     }
@@ -1340,7 +1369,7 @@ fn open_impl(
         // lookup fail" behaviour, which is what the other callers rely on.
         match resolve_vfs_symlink_path_scoped(
             &path_owned,
-            flags & 0o400000 == 0 && !excl_create,
+            follow_final,
         ) {
             Ok(resolved) => resolved,
             Err(errno) if current_resolve_scope().is_some() => {
@@ -1353,6 +1382,61 @@ fn open_impl(
         path_owned
     };
     let path: &str = &path_owned;
+
+    // `/dev/fd/N` is the ordinary devtmpfs symlink `/proc/self/fd/N`. The
+    // VFS resolver above correctly crosses that mount boundary, but proc fd
+    // links are magic links rather than filesystem-local symlinks: following
+    // one reopens the descriptor, it does not look up a literal procfs node.
+    // Check *after* VFS resolution as well as the direct `/proc/...` case, so
+    // Bash process substitution (`< <(command)`) can open `/dev/fd/N`.
+    //
+    // Keep the pre-reserved descriptor through a path-backed reopen. Dropping
+    // it and calling `open_impl` again would let a CLONE_FILES sibling steal
+    // the lowest free number while this task is resolving the target.
+    let proc_fd_magic = if mnt_len == 0 && follow_final {
+        parse_proc_fd_magic_path(task, path)
+    } else {
+        None
+    };
+    if proc_fd_magic.is_some() && current_resolve_scope().is_some_and(|s| s.no_magiclinks) {
+        ctx.set_return(errno_ret(ELOOP)); // -ELOOP
+        return;
+    }
+    if let Some(n) = proc_fd_magic {
+        if let Some(target) = fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
+            open_impl_reserved(ctx, target, flags, 0, 0, create_mode, reservation);
+            return;
+        }
+
+        // Anonymous descriptors (pipes, sockets, memfds, eventfds) have no
+        // filesystem pathname to walk. The proc magic link therefore obtains
+        // another reference to the same object, with a fresh per-open
+        // description and the caller's requested status/fd flags.
+        let ops = fd::with_table(task, |table| table.get(n).map(|entry| entry.ops.clone()))
+            .flatten();
+        let Some(ops) = ops else {
+            // A stale proc fd link is a dangling link, not EBADF from an
+            // operation on a caller-supplied descriptor.
+            ctx.set_return(errno_ret(ENOENT));
+            return;
+        };
+        let fd_flags = if flags & crate::fd::O_CLOEXEC as u64 != 0 {
+            crate::fd::FD_CLOEXEC
+        } else {
+            0
+        };
+        let new_fd = reservation.install(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: fd_flags,
+            status_flags: open_status_flags,
+        });
+        match new_fd {
+            Some(fd) => ctx.set_return(SyscallReturn::ok(fd as u64)),
+            None => ctx.set_return(errno_ret(EMFILE)), // -EMFILE
+        }
+        return;
+    }
 
     // `open_last_lookups`, create side: once the parent has been walked,
     // `if (unlikely(nd->last.name[nd->last.len])) return ERR_PTR(-EISDIR);`
@@ -1523,7 +1607,6 @@ fn open_impl(
     // here instead reported the pre-resolution path (`/sys/dev/char/226:0`),
     // which sd-device then rejects as "outside of sysfs". Resolve the parent
     // (following symlinks) and look the leaf up WITHOUT following it.
-    const O_NOFOLLOW: u64 = 0o400000;
     const O_PATH: u64 = 0o10000000;
     if flags & O_NOFOLLOW != 0 && mnt_len == 0 {
         // Look the leaf up WITHOUT following a trailing symlink, driving the
