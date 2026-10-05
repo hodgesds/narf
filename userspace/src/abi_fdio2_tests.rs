@@ -35,6 +35,70 @@ fn make_pipe2() -> Result<(u32, u32), &'static str> {
     Ok((rd, wr))
 }
 
+/// Bash process substitution opens the pipe from `/dev/fd/N`, not by calling
+/// dup(2). This goes through the actual devtmpfs symlink, crosses to procfs,
+/// and then follows proc's fd magic link to the live pipe endpoint.
+fn smoke_abi_fdio2_dev_fd_reopens_pipe() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe2()?;
+        // `with_setup` gives this case a fresh fd table, but preceding ABI
+        // cases may have retained test-only fd-path bookkeeping at a reused
+        // number. A pipe is anonymous, so remove any such stale identity
+        // before exercising the same path a shell-created pipe uses.
+        crate::mqueue::forget_fd_path(FAKE_TASK, rd);
+        let payload = *b"psub";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("writing process-substitution pipe failed");
+        }
+
+        // First prove the proc-fd magic link itself. The following devtmpfs
+        // path then verifies the cross-mount symlink expansion reaches this
+        // same open transaction.
+        let proc_path = alloc::format!("/proc/self/fd/{rd}\0");
+        let direct = match call(
+            Syscall::Openat.raw(),
+            a3((-100_i64) as u64, proc_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("openat(/proc/self/fd/N) did not reopen the pipe"),
+        };
+        if call(Syscall::Close.raw(), a0(direct as u64)) != Some(0) {
+            return Err("closing direct proc-fd reopen failed");
+        }
+
+        // The source fd is deliberately formatted at runtime: shell-created
+        // descriptors are not fixed to any particular number such as 63.
+        let path = alloc::format!("/dev/fd/{rd}\0");
+        let reopened = match call(
+            Syscall::Openat.raw(),
+            a3((-100_i64) as u64, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("openat(/dev/fd/N) did not reopen the pipe"),
+        };
+        if call(Syscall::Close.raw(), a0(rd as u64)) != Some(0) {
+            return Err("closing original pipe reader failed");
+        }
+
+        let mut got = [0u8; 4];
+        if call(
+            Syscall::Read.raw(),
+            a2(reopened as u64, got.as_mut_ptr() as u64, got.len() as u64),
+        ) == Some(got.len() as i64)
+            && got == payload
+        {
+            Ok(())
+        } else {
+            Err("/dev/fd reopened descriptor did not retain the pipe endpoint")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio2_dev_fd_reopens_pipe);
+
 /// A non-canonical x86_64 user VA: bit 48 set, bits 49..=62 clear. The
 /// kernel's `validate_user_range` rejects it with EFAULT before any
 /// dereference, so it is a deterministic "bad pointer" in this harness.

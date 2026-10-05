@@ -27,11 +27,12 @@
 
 extern crate alloc;
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
+use narf_lib::readiness::Readiness;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_lib::sysctl::ipv4 as sysctl;
 
@@ -75,6 +76,10 @@ pub(crate) struct PendingEcho {
     #[allow(dead_code)]
     pub(crate) identifier: u16,
     pub(crate) seq: u16,
+    /// Destination recorded at transmit time. An Echo Reply is sourced by
+    /// that destination, so this is the peer address returned by the
+    /// userspace datagram socket without retaining a borrowed RX frame.
+    pub(crate) target: [u8; 4],
     /// Echo Reply received (payload).
     pub(crate) reply: Option<Vec<u8>>,
     /// Transmit timestamp in nanoseconds (for RTT).
@@ -89,6 +94,11 @@ pub struct IcmpEchoSocket {
     pub identifier: u16,
     pub net_ns_id: u64,
     pending: IrqSafeSpinLock<VecDeque<PendingEcho>>,
+    /// `ping_poll`: writable while the socket is live and readable once any
+    /// matching Echo Reply is queued. This is intentionally a per-socket cell
+    /// rather than the old global re-poll fallback so an ICMP reply wakes only
+    /// the task that owns its echo socket.
+    readiness: Readiness,
 }
 
 impl IcmpEchoSocket {
@@ -97,7 +107,42 @@ impl IcmpEchoSocket {
             identifier: id,
             net_ns_id,
             pending: IrqSafeSpinLock::new(VecDeque::new()),
+            readiness: Readiness::new(crate::raw_sock::POLL_OUT),
         }
+    }
+
+    fn sync_readiness(&self, pending: &VecDeque<PendingEcho>) {
+        let readable = pending.iter().any(|entry| entry.reply.is_some());
+        self.readiness.set(
+            crate::raw_sock::POLL_OUT
+                | if readable {
+                    crate::raw_sock::POLL_IN
+                } else {
+                    0
+                },
+            if readable {
+                0
+            } else {
+                crate::raw_sock::POLL_IN
+            },
+        );
+    }
+
+    /// Durable readiness source for a Linux-compatible ICMP ping socket.
+    #[must_use]
+    pub fn readiness(&self) -> &Readiness {
+        &self.readiness
+    }
+
+    /// `ping_poll`'s live readiness mask.
+    #[must_use]
+    pub fn poll_mask(&self) -> u32 {
+        let pending = self.pending.lock();
+        let mut mask = crate::raw_sock::POLL_OUT;
+        if pending.iter().any(|entry| entry.reply.is_some()) {
+            mask |= crate::raw_sock::POLL_IN;
+        }
+        mask
     }
 }
 
@@ -132,9 +177,68 @@ impl IcmpRawSocket {
 
 // ── Global socket tables ───────────────────────────────────────────
 
-static ECHO_SOCKETS: IrqSafeSpinLock<Vec<Arc<IcmpEchoSocket>>> = IrqSafeSpinLock::new(Vec::new());
+// Echo replies are looked up on every ICMP RX packet.  A single registry lock
+// here would serialize unrelated pings (and their completion wakeups) across
+// every CPU.  The exact `(net_ns_id, identifier)` tuple selects one of these
+// cache-line-isolated shards, then one map entry.  RX can arrive on any CPU,
+// so ownership is intentionally by stable socket identity rather than the CPU
+// which happened to process a packet.
+const ECHO_SOCKET_SHARDS: usize = 64;
 
-static RAW_SOCKETS: IrqSafeSpinLock<Vec<Arc<IcmpRawSocket>>> = IrqSafeSpinLock::new(Vec::new());
+type EchoSocketKey = (u64, u16);
+
+#[repr(align(64))]
+struct EchoSocketShard {
+    sockets: IrqSafeSpinLock<BTreeMap<EchoSocketKey, Arc<IcmpEchoSocket>>>,
+}
+
+impl EchoSocketShard {
+    const fn new() -> Self {
+        Self {
+            sockets: IrqSafeSpinLock::new(BTreeMap::new()),
+        }
+    }
+}
+
+static ECHO_SOCKETS: [EchoSocketShard; ECHO_SOCKET_SHARDS] =
+    [const { EchoSocketShard::new() }; ECHO_SOCKET_SHARDS];
+
+#[inline]
+fn echo_socket_shard(net_ns_id: u64, identifier: u16) -> &'static EchoSocketShard {
+    // Fold both parts of the key before masking so separate namespaces with
+    // the same ping identifier do not systematically share a lock.
+    let mixed = net_ns_id
+        ^ net_ns_id.rotate_right(29)
+        ^ u64::from(identifier).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    &ECHO_SOCKETS[mixed as usize & (ECHO_SOCKET_SHARDS - 1)]
+}
+
+// Raw ICMP delivery intentionally fans out to every matching raw listener in
+// one namespace, but unrelated network namespaces must not serialize their
+// fanouts behind one global list lock.
+const RAW_SOCKET_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct RawSocketShard {
+    sockets: IrqSafeSpinLock<Vec<Arc<IcmpRawSocket>>>,
+}
+
+impl RawSocketShard {
+    const fn new() -> Self {
+        Self {
+            sockets: IrqSafeSpinLock::new(Vec::new()),
+        }
+    }
+}
+
+static RAW_SOCKETS: [RawSocketShard; RAW_SOCKET_SHARDS] =
+    [const { RawSocketShard::new() }; RAW_SOCKET_SHARDS];
+
+#[inline]
+fn raw_socket_shard(net_ns_id: u64) -> &'static RawSocketShard {
+    let mixed = net_ns_id ^ net_ns_id.rotate_right(29);
+    &RAW_SOCKETS[mixed as usize & (RAW_SOCKET_SHARDS - 1)]
+}
 
 // ── Public API ─────────────────────────────────────────────────────
 
@@ -146,15 +250,36 @@ pub fn icmp_echo_open() -> Arc<IcmpEchoSocket> {
 }
 
 pub fn icmp_echo_open_in(net_ns_id: u64) -> Arc<IcmpEchoSocket> {
-    let id = NEXT_ECHO_ID.fetch_add(1, Ordering::Relaxed);
-    let sock = Arc::new(IcmpEchoSocket::new(net_ns_id, id));
-    ECHO_SOCKETS.lock().push(sock.clone());
-    sock
+    // The u16 identifier eventually wraps.  Probe the owning shard until a
+    // free `(namespace, identifier)` slot is found instead of letting an old
+    // live socket steal another socket's Echo Reply.
+    for _ in 0..=u16::MAX {
+        let id = NEXT_ECHO_ID.fetch_add(1, Ordering::Relaxed);
+        let key = (net_ns_id, id);
+        let mut sockets = echo_socket_shard(net_ns_id, id).sockets.lock();
+        if sockets.contains_key(&key) {
+            continue;
+        }
+        let sock = Arc::new(IcmpEchoSocket::new(net_ns_id, id));
+        sockets.insert(key, sock.clone());
+        return sock;
+    }
+
+    panic!("ICMP echo identifier space exhausted for network namespace");
 }
 
 /// Close an echo socket.
 pub fn icmp_echo_close(sock: &Arc<IcmpEchoSocket>) {
-    ECHO_SOCKETS.lock().retain(|s| !Arc::ptr_eq(s, sock));
+    let key = (sock.net_ns_id, sock.identifier);
+    let mut sockets = echo_socket_shard(sock.net_ns_id, sock.identifier)
+        .sockets
+        .lock();
+    if sockets
+        .get(&key)
+        .is_some_and(|registered| Arc::ptr_eq(registered, sock))
+    {
+        sockets.remove(&key);
+    }
 }
 
 /// Send an ICMP Echo Request to `target` and record it as pending.
@@ -216,23 +341,43 @@ pub fn icmp_echo_send(
     let cs = ip_checksum(&frame[icmp_off..icmp_off + icmp_len]);
     frame[icmp_off + 2..icmp_off + 4].copy_from_slice(&cs.to_be_bytes());
 
-    let sent_ns = narf_scheduler::narf_time::monotonic_ns();
-
     if nf_tx_filter_in(sock.net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
         != crate::netfilter::Verdict::Accept
     {
         return Ok(());
     }
-    iface.xmit(&frame).map_err(|_| IcmpError2::NoInterface)?;
 
-    // Record the pending echo.
-    sock.pending.lock().push_back(PendingEcho {
-        identifier: sock.identifier,
-        seq,
-        reply: None,
-        sent_ns,
-        recv_ns: 0,
-    });
+    // Publish the pending slot before submitting the frame.  A local peer or
+    // a fast virtio RX completion can otherwise deliver the Echo Reply before
+    // the old post-transmit insertion had a record to match.
+    let sent_ns = narf_scheduler::narf_time::monotonic_ns();
+    {
+        let mut pending = sock.pending.lock();
+        pending.push_back(PendingEcho {
+            identifier: sock.identifier,
+            seq,
+            target,
+            reply: None,
+            sent_ns,
+            recv_ns: 0,
+        });
+        sock.sync_readiness(&pending);
+    }
+
+    if iface.xmit(&frame).is_err() {
+        // Keep a reply if hardware reported failure after transmitting; only
+        // retract this still-pending request.  We do not hold this queue lock
+        // across the driver call above.
+        let mut pending = sock.pending.lock();
+        if let Some(index) = pending
+            .iter()
+            .position(|entry| entry.seq == seq && entry.sent_ns == sent_ns && entry.reply.is_none())
+        {
+            pending.remove(index);
+            sock.sync_readiness(&pending);
+        }
+        return Err(IcmpError2::NoInterface);
+    }
 
     Ok(())
 }
@@ -241,15 +386,52 @@ pub fn icmp_echo_send(
 /// `Some((payload, rtt_ns))` if the reply has arrived, `None` otherwise.
 pub fn icmp_echo_poll_reply(sock: &Arc<IcmpEchoSocket>, seq: u16) -> Option<(Vec<u8>, u64)> {
     let mut q = sock.pending.lock();
-    for entry in q.iter_mut() {
-        if entry.seq == seq {
-            if let Some(payload) = entry.reply.take() {
-                let rtt = entry.recv_ns.saturating_sub(entry.sent_ns);
-                return Some((payload, rtt));
-            }
-        }
+    let index = q
+        .iter()
+        .position(|entry| entry.seq == seq && entry.reply.is_some())?;
+    let entry = q.get_mut(index)?;
+    let payload = entry.reply.take()?;
+    let rtt = entry.recv_ns.saturating_sub(entry.sent_ns);
+    sock.sync_readiness(&q);
+    Some((payload, rtt))
+}
+
+/// Receive the next completed Echo Reply. The result has the original
+/// sequence number, peer address, payload and round-trip time. `peek` leaves
+/// the reply queued, as `recvmsg(MSG_PEEK)` requires.
+pub fn icmp_echo_recv_reply(
+    sock: &Arc<IcmpEchoSocket>,
+    peek: bool,
+) -> Option<(u16, [u8; 4], Vec<u8>, u64)> {
+    let mut q = sock.pending.lock();
+    let index = q.iter().position(|entry| entry.reply.is_some())?;
+    let entry = q.get_mut(index)?;
+    let payload = if peek {
+        entry.reply.clone()?
+    } else {
+        entry.reply.take()?
+    };
+    let result = (
+        entry.seq,
+        entry.target,
+        payload,
+        entry.recv_ns.saturating_sub(entry.sent_ns),
+    );
+    if !peek {
+        sock.sync_readiness(&q);
     }
-    None
+    Some(result)
+}
+
+/// Size of the next completed Echo Reply as exposed by a datagram socket:
+/// the rebuilt 8-byte ICMP echo header followed by its payload. This is the
+/// `SIOCINQ`/`FIONREAD` probe and does not consume the reply.
+#[must_use]
+pub fn icmp_echo_next_reply_len(sock: &Arc<IcmpEchoSocket>) -> Option<usize> {
+    sock.pending
+        .lock()
+        .iter()
+        .find_map(|entry| entry.reply.as_ref().map(|payload| 8 + payload.len()))
 }
 
 /// Remove all completed and timed-out pending echoes.
@@ -265,20 +447,30 @@ pub fn icmp_raw_open(filter: IcmpFilter) -> Arc<IcmpRawSocket> {
 
 pub fn icmp_raw_open_in(net_ns_id: u64, filter: IcmpFilter) -> Arc<IcmpRawSocket> {
     let sock = Arc::new(IcmpRawSocket::new(net_ns_id, filter));
-    RAW_SOCKETS.lock().push(sock.clone());
+    raw_socket_shard(net_ns_id)
+        .sockets
+        .lock()
+        .push(sock.clone());
     sock
 }
 
 /// Close a raw ICMP socket.
 pub fn icmp_raw_close(sock: &Arc<IcmpRawSocket>) {
-    RAW_SOCKETS.lock().retain(|s| !Arc::ptr_eq(s, sock));
+    raw_socket_shard(sock.net_ns_id)
+        .sockets
+        .lock()
+        .retain(|registered| !Arc::ptr_eq(registered, sock));
 }
 
 pub(crate) fn remove_namespace(net_ns_id: u64) {
-    ECHO_SOCKETS
-        .lock()
-        .retain(|socket| socket.net_ns_id != net_ns_id);
-    RAW_SOCKETS
+    for shard in &ECHO_SOCKETS {
+        shard
+            .sockets
+            .lock()
+            .retain(|(socket_ns_id, _), _| *socket_ns_id != net_ns_id);
+    }
+    raw_socket_shard(net_ns_id)
+        .sockets
         .lock()
         .retain(|socket| socket.net_ns_id != net_ns_id);
 }
@@ -427,18 +619,38 @@ fn handle_echo_reply(net_ns_id: u64, _src_ip: [u8; 4], icmp_body: &[u8]) {
     let payload = icmp_body[8..].to_vec();
     let recv_ns = narf_scheduler::narf_time::monotonic_ns();
 
-    let sockets = ECHO_SOCKETS.lock().clone();
-    for sock in sockets {
-        if sock.net_ns_id == net_ns_id && sock.identifier == identifier {
-            let mut q = sock.pending.lock();
-            for entry in q.iter_mut() {
-                if entry.seq == seq && entry.reply.is_none() {
-                    entry.reply = Some(payload.clone());
-                    entry.recv_ns = recv_ns;
-                    break;
-                }
+    // The registry guard only protects the map lookup.  Drop it before taking
+    // the socket's queue lock so close/open and unrelated identifiers proceed
+    // independently, and never hold a registry lock while waking a task.
+    let sock = echo_socket_shard(net_ns_id, identifier)
+        .sockets
+        .lock()
+        .get(&(net_ns_id, identifier))
+        .cloned();
+    let Some(sock) = sock else {
+        return;
+    };
+
+    let delivered = {
+        let mut q = sock.pending.lock();
+        let mut payload = Some(payload);
+        let mut delivered = false;
+        for entry in q.iter_mut() {
+            if entry.seq == seq && entry.reply.is_none() {
+                entry.reply = payload.take();
+                entry.recv_ns = recv_ns;
+                delivered = true;
+                break;
             }
         }
+        if delivered {
+            sock.sync_readiness(&q);
+        }
+        delivered
+    };
+    if delivered {
+        sock.readiness.notify(crate::raw_sock::POLL_IN);
+        crate::readiness::notify(0);
     }
 }
 
@@ -533,8 +745,11 @@ fn deliver_to_raw(net_ns_id: u64, src_ip: [u8; 4], icmp_type: u8, icmp_code: u8,
         icmp_code,
         payload: icmp_body[4..].to_vec(), // skip type/code/checksum/rest
     };
-    let sockets = RAW_SOCKETS.lock().clone();
-    for sock in sockets.into_iter().filter(|s| s.net_ns_id == net_ns_id) {
+    let sockets = raw_socket_shard(net_ns_id).sockets.lock().clone();
+    for sock in sockets
+        .into_iter()
+        .filter(|socket| socket.net_ns_id == net_ns_id)
+    {
         let matches = match sock.filter {
             IcmpFilter::Any => true,
             IcmpFilter::SrcIp(ip) => ip == src_ip,
@@ -563,6 +778,7 @@ fn smoke_icmp_echo_send_recv_reply() -> TestResult {
         .push_back(crate::icmp_sock::PendingEcho {
             identifier: id,
             seq,
+            target: [127, 0, 0, 1],
             reply: None,
             sent_ns: 1_000_000,
             recv_ns: 0,
@@ -599,6 +815,25 @@ fn smoke_icmp_echo_send_recv_reply() -> TestResult {
     }
 }
 kernel_test_in!("net/icmp", smoke_icmp_echo_send_recv_reply);
+
+fn smoke_icmp_echo_registry_shards_independent_identifiers() -> TestResult {
+    let first = icmp_echo_open_in(0xCAFE);
+    let second = icmp_echo_open_in(0xCAFE);
+    let first_shard = echo_socket_shard(first.net_ns_id, first.identifier) as *const _;
+    let second_shard = echo_socket_shard(second.net_ns_id, second.identifier) as *const _;
+    icmp_echo_close(&first);
+    icmp_echo_close(&second);
+
+    if core::ptr::eq(first_shard, second_shard) {
+        TestResult::Fail("distinct echo identifiers shared a registry shard")
+    } else {
+        TestResult::Pass
+    }
+}
+kernel_test_in!(
+    "net/icmp",
+    smoke_icmp_echo_registry_shards_independent_identifiers
+);
 
 fn smoke_icmp_raw_receives_any() -> TestResult {
     let sock = icmp_raw_open(IcmpFilter::Any);

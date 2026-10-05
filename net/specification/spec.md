@@ -380,6 +380,13 @@ is namespace-scoped. ICMP echo and raw delivery, plus ICMP-originated TCP/UDP
 errors, are restricted to the receiving namespace. TCP, UDP, and ICMP output resolves only namespace-owned
 interfaces and routes and traverses that namespace's `LOCAL_OUT` and
 `POST_ROUTING` netfilter hooks.
+ICMP echo-reply demultiplexing indexes each live socket by
+`(network-namespace id, echo identifier)` in cache-line-isolated shards. RX
+holds a registry shard only to obtain its socket reference, then modifies that
+socket's pending-reply queue and readiness state under its own lock; it never
+holds a registry lock while waking a waiter. This permits unrelated echo flows
+to complete concurrently on distinct RX CPUs while retaining namespace-safe
+lookup when a flow moves between NIC queues.
 `iface::is_local_addr_in(ns, ip)` reports whether `ip` is one of the
 namespace's addresses (or in 127.0.0.0/8); `iface::is_broadcast_in(ns, ip)`
 reports the limited broadcast or a local subnet's `prefix | ~mask` for

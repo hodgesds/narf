@@ -91,42 +91,9 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // Resolve the `/proc/self/fd/N` (and `/proc/<pid>/fd/N`) magic symlink:
-    // opening it reopens the target of fd N. systemd's `fd_reopen` opens an
-    // O_PATH handle through `/proc/self/fd/N` to obtain a *readable* fd — and
-    // sd-device (libudev) does exactly this for every sysfs `uevent` file: it
-    // opens `uevent` O_PATH, verifies the filesystem, then reopens via
-    // `/proc/self/fd/N` to read it. Without this the reopen ENOENTs, the uevent
-    // read fails EBADF, libudev resolves no devices, and a chrooted compositor
-    // (kwin) never finds `/dev/dri/card0`. Linux ref: procfs fd magic symlinks
-    // (fs/proc/fd.c) + `fd_reopen` (systemd src/basic/fd-util.c).
-    if let Some(n) = parse_proc_self_fd(&effective) {
-        let task = current_task_id();
-        // Prefer reopening the fd's real backing path with the caller's flags.
-        if let Some(p) = fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
-            open_impl(ctx, p, flags, 0, 0, mode);
-            return;
-        }
-        // Pathless fd (memfd, pipe, socket, eventfd) → share its FileOps in a
-        // fresh fd, mirroring Linux reopening the same inode/description.
-        let dup = fd::with_table(task, |t| t.get(n).map(|e| e.ops.clone())).flatten();
-        if let Some(ops) = dup {
-            let sf = (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
-            let new_fd = fd::install(task, crate::fd::FdEntry {
-                    ops,
-                    offset: 0,
-                    flags: 0,
-                    status_flags: sf,
-                });
-            ctx.set_return(SyscallReturn::ok(
-                new_fd.map(|nf| nf as u64).unwrap_or((-EMFILE) as u64),
-            ));
-            return;
-        }
-        // Stale/unknown fd → ENOENT, as Linux does for a dangling fd symlink.
-        ctx.set_return(errno_ret(ENOENT));
-        return;
-    }
+    // `open_impl` handles proc-fd magic links after its VFS-wide symlink
+    // expansion, not only when callers spell `/proc/self/fd/N` directly.
+    // That is also what makes devtmpfs's `/dev/fd/N -> /proc/self/fd/N` work.
     open_impl(ctx, effective, flags, 0, 0, mode);
 }
 

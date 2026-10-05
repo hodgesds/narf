@@ -956,6 +956,12 @@ Linux `readlink(2)` and `readlinkat(2)` size their kernel staging read from
 the caller's `bufsiz`; they never treat `st_size` as the target length.
 This is required for procfs magic links, whose Linux-compatible stat metadata
 has a zero size even when `readlink` returns a non-empty target.
+`/dev/fd` and `/dev/{stdin,stdout,stderr}` are devtmpfs symlinks into procfs.
+When a followed `open(2)` reaches `/proc/self/fd/N` (including through those
+aliases), it reopens descriptor `N`; path-backed descriptors restart normal
+open permission and flag handling, while anonymous descriptors retain a live
+reference to their object. `O_NOFOLLOW` preserves the final devtmpfs link and
+`RESOLVE_NO_MAGICLINKS` rejects the proc-fd jump with `ELOOP`.
 The `container` Cargo feature enables namespace support in both userspace and
 `narf-filesystem`; procfs must therefore never publish zero namespace limits
 in a build where the namespace syscalls are enabled.
@@ -1311,6 +1317,16 @@ The TCP socket-option compatibility surface validates and round-trips Linux
 `TCP_NOTSENT_LOWAT`, `TCP_INQ`, and `TCP_TX_DELAY`; ordinary TCP sockets report
 zero for `TCP_IS_MPTCP`. Unsupported options return Linux's option-specific
 errno rather than succeeding silently.
+
+AF_INET `SOCK_DGRAM` with `IPPROTO_ICMP` is a distinct unprivileged echo
+endpoint rather than a UDP or raw-ICMP alias. Socket creation assigns a
+namespace-scoped echo identifier, returned in the `sin_port` field of local
+addresses. `sendto` accepts Echo Request datagrams, derives the wire
+identifier and checksum from that socket, and routes through the ICMP echo
+path; completed Echo Replies are returned as datagrams with their peer
+address. `MSG_PEEK`, readiness (`POLLIN` once a reply is queued and `POLLOUT`
+while live), `FIONREAD`, connect/disconnect, and shutdown use the same durable
+per-socket state. Other ICMP types and `listen`/`accept` are unsupported.
 
 AF_INET `SOCK_DGRAM` (UDP) follows Linux `net/ipv4/{af_inet,udp,
 datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):

@@ -1359,7 +1359,11 @@ fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathSta
             // `open`/`execve` of the same path succeeded. That made every
             // PATH probe (busybox/ash search applets via stat) report
             // "not found" inside a mounted distro rootfs.
-            poll_blocking(narf_filesystem::resolve_async_dentry_ext(
+            // Metadata probes are disk I/O too. A heavily queued ext2 lookup
+            // may legitimately remain pending beyond poll_blocking's short
+            // fallback budget; treating that as "not found" makes statx
+            // callers such as eza render every inode as unknown.
+            poll_io_to_completion(narf_filesystem::resolve_async_dentry_ext(
                 root,
                 rel,
                 follow_final,
@@ -2553,6 +2557,29 @@ pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
         return None;
     }
     rest.parse::<u32>().ok()
+}
+
+/// Parse a proc-fd magic-link path after pathname resolution has applied the
+/// caller's chroot. The VFS resolver uses host-view paths so it can cross
+/// mounts; proc magic-link syntax is defined in the task's visible namespace.
+///
+/// This is deliberately a boundary-aware prefix strip: a chroot at `/srv/a`
+/// must not make `/srv/another/proc/self/fd/3` look like a proc magic link.
+pub(crate) fn parse_proc_fd_magic_path(task: u64, host_path: &str) -> Option<u32> {
+    let visible = match root_dir_prefix(task).as_deref() {
+        Some(prefix) if prefix != "/" => {
+            let rest = host_path.strip_prefix(prefix)?;
+            if rest.is_empty() {
+                "/"
+            } else if rest.starts_with('/') {
+                rest
+            } else {
+                return None;
+            }
+        }
+        _ => host_path,
+    };
+    parse_proc_self_fd(visible)
 }
 
 /// Read an entire open fd's contents into a Vec (for `execveat(fd,"",
