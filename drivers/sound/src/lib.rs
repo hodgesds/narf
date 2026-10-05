@@ -291,6 +291,7 @@ pub fn unregister_hardware_card(index: u32) {
 fn unpublish_card(info: &CardInfo) {
     alsa::remove_card(info.index);
     sysfs_bridge::unregister_card_sysfs(info);
+    devfs_bridge::remove_card_node_metadata(info);
     narf_filesystem::procfs::unregister_proc(&alloc::format!("asound/card{}", info.index));
 }
 

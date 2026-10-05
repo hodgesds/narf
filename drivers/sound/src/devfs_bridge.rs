@@ -24,16 +24,98 @@
 //! (< 0xFFFF_0000) is treated as sample data.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::format::{ChannelCount, HwParams, SampleFormat, SampleRate};
 use crate::mixer::ControlValue;
 use crate::{list_cards, open_playback, SoundError};
+
+// ── Persistent devtmpfs inode metadata ────────────────────────────────
+
+// A /dev/snd lookup deliberately creates a new FileOps wrapper, just as
+// devtmpfs resolves a name to its device inode before ALSA opens a fresh file
+// description.  The node's ownership and mode, however, belong to that
+// devtmpfs inode—not to the transient wrapper.  Keep one ref-counted metadata
+// record per ALSA dev_t so udev's chown/chmod is visible to later lookups and
+// remains visible on an already-open description after hot-unplug removes the
+// name.  This mirrors the persistent block-device overlay without choosing a
+// distribution-specific audio group: udev supplies that policy from the live
+// card uevent.
+const DEFAULT_NODE_UID: u32 = 0;
+const DEFAULT_NODE_GID: u32 = 0;
+const DEFAULT_NODE_PERMS: u16 = 0o660;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SoundNodeAttrs {
+    uid: u32,
+    gid: u32,
+    perms: u16,
+}
+
+#[derive(Debug)]
+struct SoundNodeMetadata {
+    attrs: IrqSafeSpinLock<SoundNodeAttrs>,
+}
+
+static SOUND_NODE_METADATA: IrqSafeSpinLock<BTreeMap<u64, Arc<SoundNodeMetadata>>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+fn node_metadata(rdev: u64) -> Arc<SoundNodeMetadata> {
+    let mut nodes = SOUND_NODE_METADATA.lock();
+    nodes
+        .entry(rdev)
+        .or_insert_with(|| {
+            Arc::new(SoundNodeMetadata {
+                attrs: IrqSafeSpinLock::new(SoundNodeAttrs {
+                    uid: DEFAULT_NODE_UID,
+                    gid: DEFAULT_NODE_GID,
+                    perms: DEFAULT_NODE_PERMS,
+                }),
+            })
+        })
+        .clone()
+}
+
+fn node_attrs(metadata: &SoundNodeMetadata) -> SoundNodeAttrs {
+    *metadata.attrs.lock()
+}
+
+fn pcm_rdev(card_index: u32, device: u32, capture: bool) -> u64 {
+    let minor = if capture {
+        crate::sysfs_bridge::pcm_capture_minor(card_index, device)
+    } else {
+        crate::sysfs_bridge::pcm_playback_minor(card_index, device)
+    };
+    narf_filesystem::devfs::linux_makedev(crate::sysfs_bridge::SNDRV_MAJOR, minor)
+}
+
+fn control_rdev(card_index: u32) -> u64 {
+    narf_filesystem::devfs::linux_makedev(
+        crate::sysfs_bridge::SNDRV_MAJOR,
+        crate::sysfs_bridge::control_minor(card_index),
+    )
+}
+
+/// Remove the namespace's reference to every node of an unplugged card.
+/// Open device files retain their `Arc<SoundNodeMetadata>` and therefore keep
+/// their inode ownership/mode until the final description is closed.
+pub(crate) fn remove_card_node_metadata(info: &crate::CardInfo) {
+    let mut nodes = SOUND_NODE_METADATA.lock();
+    nodes.remove(&control_rdev(info.index));
+    for device in 0..info.playback_count {
+        nodes.remove(&pcm_rdev(info.index, device, false));
+    }
+    for device in 0..info.capture_count {
+        nodes.remove(&pcm_rdev(info.index, device, true));
+    }
+}
 
 // ── Offset sentinel for hw_params writes ─────────────────────────────
 
@@ -119,6 +201,7 @@ pub(crate) fn decode_hw_params(buf: &[u8]) -> Option<HwParams> {
 pub struct SoundControlFile {
     card_index: u32,
     alsa: Arc<crate::alsa::Control>,
+    metadata: Arc<SoundNodeMetadata>,
 }
 
 impl SoundControlFile {
@@ -126,6 +209,7 @@ impl SoundControlFile {
         Self {
             card_index,
             alsa: crate::alsa::Control::new(card_index),
+            metadata: node_metadata(control_rdev(card_index)),
         }
     }
 
@@ -190,10 +274,7 @@ impl FileOps for SoundControlFile {
     /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
     /// the inode is devfs's node for that device.
     fn rdev(&self) -> u64 {
-        narf_filesystem::devfs::linux_makedev(
-            crate::sysfs_bridge::SNDRV_MAJOR,
-            crate::sysfs_bridge::control_minor(self.card_index),
-        )
+        control_rdev(self.card_index)
     }
 
     fn ino(&self) -> u64 {
@@ -273,15 +354,32 @@ impl FileOps for SoundControlFile {
     }
 
     fn stat(&self) -> Stat {
+        let attrs = node_attrs(&self.metadata);
         Stat {
             size: 0,
             blocks: 0,
             mode: Mode {
                 file_type: FileType::Special,
-                perms: 0o660,
+                perms: attrs.perms,
             },
             mtime_cycles: 0,
         }
+    }
+    fn owners(&self) -> (u32, u32) {
+        let attrs = node_attrs(&self.metadata);
+        (attrs.uid, attrs.gid)
+    }
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        {
+            let mut attrs = self.metadata.attrs.lock();
+            attrs.uid = uid;
+            attrs.gid = gid;
+        }
+        Box::pin(async { Ok(()) })
+    }
+    fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+        self.metadata.attrs.lock().perms = perms & 0o7777;
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -294,6 +392,7 @@ macro_rules! pcm_file {
             card_index: u32,
             device: u32,
             pcm: Arc<crate::alsa::Pcm>,
+            metadata: Arc<SoundNodeMetadata>,
         }
         impl $name {
             pub fn new(card_index: u32, device: u32) -> Self {
@@ -301,6 +400,7 @@ macro_rules! pcm_file {
                     card_index,
                     device,
                     pcm: crate::alsa::Pcm::new(card_index, device, $capture),
+                    metadata: node_metadata(pcm_rdev(card_index, device, $capture)),
                 }
             }
         }
@@ -318,29 +418,42 @@ macro_rules! pcm_file {
                     card_index: self.card_index,
                     device: self.device,
                     pcm: crate::alsa::Pcm::opened(self.card_index, self.device, $capture)?,
+                    metadata: self.metadata.clone(),
                 })))
             }
             fn rdev(&self) -> u64 {
-                let minor = if $capture {
-                    crate::sysfs_bridge::pcm_capture_minor(self.card_index, self.device)
-                } else {
-                    crate::sysfs_bridge::pcm_playback_minor(self.card_index, self.device)
-                };
-                narf_filesystem::devfs::linux_makedev(crate::sysfs_bridge::SNDRV_MAJOR, minor)
+                pcm_rdev(self.card_index, self.device, $capture)
             }
             fn ino(&self) -> u64 {
                 narf_filesystem::devfs::char_device_inode(self.rdev())
             }
             fn stat(&self) -> Stat {
+                let attrs = node_attrs(&self.metadata);
                 Stat {
                     size: 0,
                     blocks: 0,
                     mode: Mode {
                         file_type: FileType::Special,
-                        perms: 0o660,
+                        perms: attrs.perms,
                     },
                     mtime_cycles: 0,
                 }
+            }
+            fn owners(&self) -> (u32, u32) {
+                let attrs = node_attrs(&self.metadata);
+                (attrs.uid, attrs.gid)
+            }
+            fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+                {
+                    let mut attrs = self.metadata.attrs.lock();
+                    attrs.uid = uid;
+                    attrs.gid = gid;
+                }
+                Box::pin(async { Ok(()) })
+            }
+            fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
+                self.metadata.attrs.lock().perms = perms & 0o7777;
+                Box::pin(async { Ok(()) })
             }
             fn is_stream(&self) -> bool {
                 true
