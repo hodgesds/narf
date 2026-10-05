@@ -57,7 +57,10 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // SAFETY: `arg_a` is the user name pointer (non-zero, checked above);
             // copy_from_user range-validates it and SMAP-brackets the read into `raw`.
             // SAFETY: Valid memory or trusted environment
-            let _ = unsafe { copy_from_user(&mut raw, arg_a) };
+            if unsafe { copy_from_user(&mut raw, arg_a) }.is_err() {
+                ctx.set_return(fail);
+                return;
+            }
             // Trim at first NUL.
             let nul_pos = raw.iter().position(|&b| b == 0).unwrap_or(TASK_COMM_LEN);
             let mut name = [0u8; TASK_COMM_LEN];

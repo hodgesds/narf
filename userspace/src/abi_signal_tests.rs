@@ -1720,3 +1720,207 @@ fn smoke_abi_signal_rt_sigtimedwait_std_payload() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigtimedwait_std_payload);
+
+fn smoke_abi_signal_sigaltstack_exact_errnos() -> TestResult {
+    with_setup(|| {
+        const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+        const SS_ONSTACK: u32 = 1;
+        const SS_DISABLE: u32 = 2;
+
+        // 1. Both SS_DISABLE and SS_ONSTACK specified simultaneously:
+        // Linux kernel/signal.c:
+        //     ss_mode = ss_flags & ~SS_FLAG_BITS;
+        //     if (unlikely(ss_mode != SS_DISABLE && ss_mode != SS_ONSTACK && ss_mode != 0))
+        //         return -EINVAL;
+        let mut ss = [0u8; 24];
+        ss[8..12].copy_from_slice(&(SS_DISABLE | SS_ONSTACK).to_ne_bytes());
+        ss[16..24].copy_from_slice(&(8192u64).to_ne_bytes());
+        if call(Syscall::Sigaltstack.raw(), a1(ss.as_ptr() as u64, 0)) != Some(EINVAL) {
+            return Err("sigaltstack with both SS_DISABLE and SS_ONSTACK must return -EINVAL");
+        }
+
+        // 2. Out-parameter is checked after validation: an invalid flag with BAD_PTR out
+        // must return -EINVAL, not -EFAULT.
+        if call(Syscall::Sigaltstack.raw(), a1(ss.as_ptr() as u64, BAD_PTR)) != Some(EINVAL) {
+            return Err("sigaltstack with invalid flag and BAD_PTR out must return -EINVAL");
+        }
+
+        // 3. Query-only (ss_in = 0) with BAD_PTR out must return -EFAULT.
+        if call(Syscall::Sigaltstack.raw(), a1(0, BAD_PTR)) != Some(EFAULT) {
+            return Err("sigaltstack(0, BAD_PTR) must return -EFAULT");
+        }
+
+        // 4. Valid install with BAD_PTR out must return -EFAULT.
+        let mut valid = [0u8; 24];
+        valid[0..8].copy_from_slice(&(0x1234_0000u64).to_ne_bytes());
+        valid[8..12].copy_from_slice(&0u32.to_ne_bytes());
+        valid[16..24].copy_from_slice(&(8192u64).to_ne_bytes());
+        if call(
+            Syscall::Sigaltstack.raw(),
+            a1(valid.as_ptr() as u64, BAD_PTR),
+        ) != Some(EFAULT)
+        {
+            return Err("sigaltstack(&valid, BAD_PTR) must return -EFAULT");
+        }
+
+        // 5. Installing SS_DISABLE with size=0 and sp=0xABCD must succeed, and
+        // Linux do_sigaltstack explicitly clears ss_sp=NULL and ss_size=0:
+        //     if (ss_mode == SS_DISABLE) { ss_size = 0; ss_sp = NULL; }
+        let mut dis = [0u8; 24];
+        dis[0..8].copy_from_slice(&(0xABCD_0000u64).to_ne_bytes());
+        dis[8..12].copy_from_slice(&SS_DISABLE.to_ne_bytes());
+        dis[16..24].copy_from_slice(&0u64.to_ne_bytes());
+        if call(Syscall::Sigaltstack.raw(), a1(dis.as_ptr() as u64, 0)) != Some(0) {
+            return Err("sigaltstack(SS_DISABLE, 0) must return 0");
+        }
+
+        // 6. Query back old stack: sp and size must both be 0, and flags SS_DISABLE.
+        let mut out = [0u8; 24];
+        if call(Syscall::Sigaltstack.raw(), a1(0, out.as_mut_ptr() as u64)) != Some(0) {
+            return Err("sigaltstack(0, &out) must return 0");
+        }
+        let out_sp = u64::from_ne_bytes(out[0..8].try_into().unwrap());
+        let out_flags = u32::from_ne_bytes(out[8..12].try_into().unwrap());
+        let out_size = u64::from_ne_bytes(out[16..24].try_into().unwrap());
+        if out_flags != SS_DISABLE || out_sp != 0 || out_size != 0 {
+            return Err(
+                "sigaltstack after SS_DISABLE did not report sp=0, size=0, flags=SS_DISABLE",
+            );
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_sigaltstack_exact_errnos);
+
+fn smoke_abi_signal_rt_sigqueueinfo_exact_errnos() -> TestResult {
+    with_setup(|| {
+        let si_user = sigqueue_siginfo(10, 0, FAKE_TASK as u32, 0); // si_code = 0 (SI_USER)
+        let si_queue = sigqueue_siginfo(10, -1, FAKE_TASK as u32, 42); // si_code = -1 (SI_QUEUE)
+        const MISSING_PID: u64 = 0x3EAD_BEEF;
+
+        // 1. pid == 0: Linux do_rt_sigqueueinfo calls kill_proc_info(sig, info, 0) -> find_vpid(0) is NULL -> -ESRCH.
+        // It must NOT return -EINVAL (tkill returns -EINVAL for pid <= 0, but rt_sigqueueinfo returns -ESRCH).
+        if call(
+            Syscall::RtSigqueueinfo.raw(),
+            a2(0, 10, si_queue.as_ptr() as u64),
+        ) != Some(ESRCH)
+        {
+            return Err("rt_sigqueueinfo(0, ...) must return -ESRCH");
+        }
+
+        // 2. pid < 0 (negative pid_t): find_vpid returns NULL -> -ESRCH.
+        if call(
+            Syscall::RtSigqueueinfo.raw(),
+            a2((-1i32) as u64, 10, si_queue.as_ptr() as u64),
+        ) != Some(ESRCH)
+        {
+            return Err("rt_sigqueueinfo(-1, ...) must return -ESRCH");
+        }
+
+        // 3. User sends si_code >= 0 (SI_USER) to another task:
+        // Linux do_rt_sigqueueinfo:
+        //     if ((info->si_code >= 0 || info->si_code == SI_TKILL) &&
+        //         (task_pid_vnr(current) != pid))
+        //         return -EPERM;
+        if call(
+            Syscall::RtSigqueueinfo.raw(),
+            a2(MISSING_PID, 10, si_user.as_ptr() as u64),
+        ) != Some(EPERM)
+        {
+            return Err("rt_sigqueueinfo with si_code >= 0 to foreign task must return -EPERM");
+        }
+
+        // 4. sig == 0 (null signal existence probe) to self must succeed with 0.
+        if call(
+            Syscall::RtSigqueueinfo.raw(),
+            a2(FAKE_TASK, 0, si_queue.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("rt_sigqueueinfo(self, sig=0) must return 0");
+        }
+
+        // 5. sig == 0 to nonexistent target must return -ESRCH.
+        if call(
+            Syscall::RtSigqueueinfo.raw(),
+            a2(MISSING_PID, 0, si_queue.as_ptr() as u64),
+        ) != Some(ESRCH)
+        {
+            return Err("rt_sigqueueinfo(missing, sig=0) must return -ESRCH");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigqueueinfo_exact_errnos);
+
+fn smoke_abi_signal_rt_tgsigqueueinfo_exact_errnos() -> TestResult {
+    with_setup(|| {
+        let si_user = sigqueue_siginfo(10, 0, FAKE_TASK as u32, 0); // si_code = 0 (SI_USER)
+        let si_queue = sigqueue_siginfo(10, -1, FAKE_TASK as u32, 42); // si_code = -1 (SI_QUEUE)
+        const MISSING_PID: u64 = 0x3EAD_BEEF;
+
+        // 1. tgid <= 0 or tid <= 0: Linux do_rt_tgsigqueueinfo returns -EINVAL.
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(0, FAKE_TASK, 10, si_queue.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("rt_tgsigqueueinfo(tgid=0) must return -EINVAL");
+        }
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(FAKE_TASK, 0, 10, si_queue.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("rt_tgsigqueueinfo(tid=0) must return -EINVAL");
+        }
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3((-1i32) as u64, FAKE_TASK, 10, si_queue.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("rt_tgsigqueueinfo(tgid=-1) must return -EINVAL");
+        }
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(FAKE_TASK, (-1i32) as u64, 10, si_queue.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("rt_tgsigqueueinfo(tid=-1) must return -EINVAL");
+        }
+
+        // 2. si_code >= 0 targeting another task returns -EPERM.
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(MISSING_PID, MISSING_PID, 10, si_user.as_ptr() as u64),
+        ) != Some(EPERM)
+        {
+            return Err("rt_tgsigqueueinfo with si_code >= 0 to foreign task must return -EPERM");
+        }
+
+        // 3. sig == 0 to self returns 0.
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(FAKE_TASK, FAKE_TASK, 0, si_queue.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("rt_tgsigqueueinfo(self, self, sig=0) must return 0");
+        }
+
+        // 4. sig == 0 to nonexistent target returns -ESRCH.
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(MISSING_PID, MISSING_PID, 0, si_queue.as_ptr() as u64),
+        ) != Some(ESRCH)
+        {
+            return Err("rt_tgsigqueueinfo(missing, missing, sig=0) must return -ESRCH");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_rt_tgsigqueueinfo_exact_errnos
+);
