@@ -2116,6 +2116,100 @@ kernel_test_in!(
     smoke_dev_input_chown_persists_across_reopen
 );
 
+// ── Evdev durable readiness ─────────────────────────────────────────────────
+
+static DEV_INPUT_READINESS_WAKE_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// A waker that records an IRQ-safe readiness wake without allocating.
+fn dev_input_counting_waker() -> core::task::Waker {
+    unsafe fn clone(_: *const ()) -> core::task::RawWaker {
+        raw()
+    }
+    unsafe fn wake(_: *const ()) {
+        DEV_INPUT_READINESS_WAKE_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe fn wake_by_ref(_: *const ()) {
+        DEV_INPUT_READINESS_WAKE_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe fn drop(_: *const ()) {}
+    fn raw() -> core::task::RawWaker {
+        const VTABLE: core::task::RawWakerVTable =
+            core::task::RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+        core::task::RawWaker::new(core::ptr::null(), &VTABLE)
+    }
+    // SAFETY: the vtable never dereferences its null data pointer, and clone
+    // produces an equivalent valid RawWaker.
+    unsafe { core::task::Waker::from_raw(raw()) }
+}
+
+/// A `/dev/input/eventN` poller must use the router's durable per-device cell:
+/// dispatch wakes this poller directly, and draining the final event clears the
+/// level before the next arm. This prevents input activity from waking every
+/// unrelated desktop I/O waiter through the old global notify bridge.
+fn smoke_dev_input_dispatch_wakes_only_its_durable_poller() -> TestResult {
+    use crate::devfs_input::{DeviceKind, InputEventFile, LINUX_INPUT_EVENT_SIZE};
+    use crate::{FileOps, POLL_IN};
+    use narf_input::evdev::{DeviceCaps, EvdevEvent, EventType, ROUTER};
+
+    let (id, node) = ROUTER.register_device(DeviceCaps::new());
+    let file = match InputEventFile::open(id, DeviceKind::Hardware) {
+        Some(file) => file,
+        None => {
+            ROUTER.unregister_device(id);
+            return TestResult::Fail("could not open the newly registered evdev node");
+        }
+    };
+    let waker = dev_input_counting_waker();
+    DEV_INPUT_READINESS_WAKE_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+
+    let failure = match file.arm_readiness(0xE0D0, POLL_IN, &waker) {
+        Some(core::task::Poll::Pending) => {
+            node.dispatch(EvdevEvent {
+                time: 1,
+                type_: EventType::Key,
+                code: 30,
+                value: 1,
+            });
+            if DEV_INPUT_READINESS_WAKE_COUNT.load(core::sync::atomic::Ordering::SeqCst) == 0 {
+                Some("evdev dispatch did not wake its armed poller")
+            } else if file.poll_readiness() & POLL_IN == 0 {
+                Some("evdev dispatch did not publish POLLIN")
+            } else if !matches!(
+                file.arm_readiness(0xE0D0, POLL_IN, &waker),
+                Some(core::task::Poll::Ready(mask)) if mask & POLL_IN != 0
+            ) {
+                Some("armed evdev poller did not observe the dispatched event")
+            } else {
+                let mut buf = [0u8; LINUX_INPUT_EVENT_SIZE];
+                match poll_once_devfs_input(file.read(0, &mut buf)) {
+                    Some(Ok(n)) if n == LINUX_INPUT_EVENT_SIZE => {
+                        match file.arm_readiness(0xE0D1, POLL_IN, &waker) {
+                            Some(core::task::Poll::Pending) => {
+                                file.disarm_readiness(0xE0D1);
+                                None
+                            }
+                            _ => Some("evdev readiness remained set after its ring was drained"),
+                        }
+                    }
+                    _ => Some("could not drain the dispatched evdev event"),
+                }
+            }
+        }
+        _ => Some("empty evdev node did not expose a pending durable readiness arm"),
+    };
+
+    ROUTER.unregister_device(id);
+    match failure {
+        Some(reason) => TestResult::Fail(reason),
+        None => TestResult::Pass,
+    }
+}
+kernel_test_in!(
+    "filesystem/devfs_input",
+    smoke_dev_input_dispatch_wakes_only_its_durable_poller
+);
+
 /// `EVDEV_NODE_META` keys ownership by event number and never removes
 /// entries. That is only safe because `ROUTER.register_device` allocates ids
 /// monotonically (`next_id += 1`) and never recycles them after an

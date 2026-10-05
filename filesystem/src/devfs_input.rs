@@ -533,18 +533,40 @@ impl FileOps for InputEventFile {
         0
     }
 
-    /// The evdev node is a PARKABLE readiness source: a poll/epoll set
-    /// containing it may block instead of busy-spinning. Event dispatch
-    /// wakes syscall-layer waiters (`evdev` calls `fire_dispatch_wake` →
-    /// `narf_net::readiness::notify`), so a parked poll resumes promptly.
-    /// Without this the node defaulted "silent" (false), poisoning the
-    /// whole poll set — a compositor polling {wayland, DRM, dbus, and the
-    /// four /dev/input/event* nodes via libinput} then busy-polls at 100%
-    /// CPU and, under the cooperative own-stack scheduler, starves every
-    /// same-CPU peer (the residual launcher/plasmashell starvation after
-    /// the eventfd + DRM-fd fixes). Same bug class.
-    fn readiness_notifies(&self) -> bool {
-        true
+    /// The router owns the device cell, while this file owns its Reader
+    /// behind a lock. Delegate through the Reader rather than returning a
+    /// borrowed cell so the FileOps reference never outlives that lock.
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.reader
+            .lock()
+            .as_ref()
+            .map(|reader| reader.arm_readiness(task_id, interest, waker))
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.reader
+            .lock()
+            .as_ref()
+            .map(|reader| reader.arm_readiness_persistent(id, interest, waker))
+    }
+
+    fn disarm_readiness(&self, task_id: u64) -> bool {
+        if let Some(reader) = self.reader.lock().as_ref() {
+            reader.disarm_readiness(task_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// evdev's `read()` blocks internally on an empty ring (matching Linux
