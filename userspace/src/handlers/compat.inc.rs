@@ -1383,6 +1383,24 @@ fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathSta
     if file.is_some() {
         return file;
     }
+    // A FOLLOWED `/proc/<pid>/{root,cwd,exe}` resolves to its target, exactly
+    // as `open(2)` does — `stat("/proc/self/root")` must describe the task's
+    // root directory, not fail. The walk above cannot reach an absolute target
+    // that leaves procfs (see `proc_task_link_target`), so retry at the task's
+    // root. Failure path only: a path that already resolved never reaches here.
+    if follow_final {
+        let probe = if path.len() > 1 {
+            path.trim_end_matches('/')
+        } else {
+            path
+        };
+        if let Some(target) = proc_task_link_target(current_task_id(), probe) {
+            let host = apply_chroot(&target);
+            if host != probe {
+                return stat_ino_path_dir_aware_ext(&host, true);
+            }
+        }
+    }
     if let Some(dir) = resolve_dir_absolute(path) {
         let (uid, gid) = dir.dir_owners();
         let attrs = dir.inode_attrs();
@@ -2588,6 +2606,82 @@ pub(crate) fn parse_proc_fd_magic_path(task: u64, host_path: &str) -> Option<u32
         _ => host_path,
     };
     parse_proc_self_fd(visible)
+}
+
+/// `/proc/{self,thread-self,<pid>}/{root,cwd,exe}` — the per-task magic links
+/// whose target is an ordinary pathname — as named in the task's VISIBLE
+/// namespace. Boundary-aware chroot strip, like [`parse_proc_fd_magic_path`]:
+/// a chroot at `/srv/a` must not make `/srv/another/proc/self/root` match.
+fn proc_task_link_path(task: u64, host_path: &str) -> bool {
+    let visible = match root_dir_prefix(task).as_deref() {
+        Some(prefix) if prefix != "/" => match host_path.strip_prefix(prefix) {
+            Some("") => "/",
+            Some(rest) if rest.starts_with('/') => rest,
+            _ => return false,
+        },
+        _ => host_path,
+    };
+    let Some(rest) = visible.strip_prefix("/proc/") else {
+        return false;
+    };
+    let Some((who, leaf)) = rest.split_once('/') else {
+        return false;
+    };
+    if !matches!(leaf, "root" | "cwd" | "exe") {
+        return false;
+    }
+    who == "self" || who == "thread-self" || who.parse::<u64>().is_ok()
+}
+
+/// The pathname a `/proc/<pid>/{root,cwd,exe}` magic link points at, for a
+/// caller that wants to FOLLOW it rather than read it.
+///
+/// Linux follows these with `nd_jump_link` (`fs/proc/base.c`), which installs
+/// the target `path` directly and therefore crosses mounts by construction.
+/// NARF resolves a symlink inside the filesystem that owns it, and
+/// `resolve_async_dentry_ext` restarts an ABSOLUTE target at that
+/// filesystem's own mount root — so `/proc/<pid>/root`, whose target is `/`,
+/// runs out of components inside procfs and the walk reports ENOENT. Callers
+/// use this to restart the walk at the task's root instead.
+///
+/// The target comes from the procfs node itself (resolved NOFOLLOW and read),
+/// so procfs keeps ownership of pid-namespace translation and of rendering the
+/// path in the reader's root frame — see `proc_root_path`. The returned string
+/// is therefore a VISIBLE pathname, suitable for handing back to an entry
+/// point that applies the caller's chroot.
+///
+/// This is load-bearing for the desktop audio stack: PipeWire's access module
+/// opens `/proc/<peer-pid>/root` to look for `.flatpak-info`, and reads a
+/// failed open as "this client is sandboxed", parking the connection until it
+/// is disconnected (`src/modules/flatpak-utils.h`, `module-access.c`). Every
+/// PipeWire client in a container hangs at connect without it.
+pub(crate) fn proc_task_link_target(
+    task: u64,
+    host_path: &str,
+) -> Option<alloc::string::String> {
+    if !proc_task_link_path(task, host_path) {
+        return None;
+    }
+    let node = current_resolve_absolute(host_path, |_fs, root, rel| {
+        if rel.is_empty() {
+            return None;
+        }
+        poll_io_to_completion(narf_filesystem::resolve_async_dentry_ext(root, rel, false))
+            .and_then(|r| r.ok())
+    })
+    .flatten()?;
+    if node.stat().mode.file_type != narf_filesystem::FileType::Symlink {
+        return None;
+    }
+    let mut buf = [0u8; 4096];
+    let n = poll_io_to_completion(node.read(0, &mut buf)).and_then(|r| r.ok())?;
+    let target = core::str::from_utf8(&buf[..n]).ok()?;
+    // A relative target needs no help: the filesystem-local resolver reaches
+    // it already. Only an absolute one escapes the mount.
+    if !target.starts_with('/') {
+        return None;
+    }
+    Some(alloc::string::String::from(target))
 }
 
 /// Read an entire open fd's contents into a Vec (for `execveat(fd,"",
@@ -4515,6 +4609,13 @@ pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
 #[doc(hidden)]
 pub fn apply_chroot_for_test(p: &str) -> alloc::string::String {
     apply_chroot(p)
+}
+
+/// Test hook for [`d_path_from_root`] — the `d_path()` rendering rule behind
+/// `/proc/[pid]/root`.
+#[doc(hidden)]
+pub fn d_path_from_root_for_test(target: &str, reader_root: &str) -> alloc::string::String {
+    d_path_from_root(target, reader_root)
 }
 
 // ── ClockGetTime — write timespec to user buffer ──────────────────
@@ -6590,14 +6691,54 @@ pub fn proc_cwd_path(pid: u64) -> Option<alloc::string::String> {
     Some(cwd_of(proc_pid_to_tid(pid)))
 }
 
-/// `/proc/[pid]/root` hook — the chroot prefix, or None (procfs falls
-/// back to `/`) when the task never chroot'd or the build has no
-/// linux-compat chroot support.
-pub fn proc_root_path(pid: u64) -> Option<alloc::string::String> {
-    {
-        let tid = proc_pid_to_tid(pid);
-        task_map_get(&ROOT_DIR_TABLE, tid)
+/// Render `target` (a host-view absolute path) the way Linux's `d_path()`
+/// would for a reader whose root is `reader_root`.
+///
+/// `d_path` (fs/d_path.c:265) walks to `current->fs->root` — the READER's
+/// root, not the global one — so a path that IS the reader's root renders as
+/// `/`, and one below it renders as the remainder. When the target is not
+/// reachable from the reader's root, `prepend_path` fails and `d_path` leaves
+/// the global path in the buffer: it does NOT add the `(unreachable)` marker,
+/// which only `getcwd` prepends (fs/d_path.c:435).
+fn d_path_from_root(target: &str, reader_root: &str) -> alloc::string::String {
+    if reader_root.is_empty() || reader_root == "/" {
+        return alloc::string::String::from(target);
     }
+    if target == reader_root {
+        return alloc::string::String::from("/");
+    }
+    if let Some(rest) = target.strip_prefix(reader_root) {
+        if rest.starts_with('/') {
+            return alloc::string::String::from(rest);
+        }
+    }
+    alloc::string::String::from(target)
+}
+
+/// `/proc/[pid]/root` hook — the task's root directory, rendered in the
+/// READER's root frame.
+///
+/// The stored prefix is host-view (`apply_chroot` composes paths with it), so
+/// handing it back verbatim leaks a name that means nothing to a chrooted
+/// reader. Linux never does that: `proc_pid_readlink` renders the target with
+/// `d_path()` against the reader's own root (fs/proc/base.c:1815), so the
+/// overwhelmingly common case — reader and target share a root, as every
+/// process inside one container does — reads back as plain `/`.
+///
+/// This is load-bearing rather than cosmetic. A reader does not only
+/// `readlink` this node, it OPENS it: PipeWire's access module opens
+/// `/proc/<peer-pid>/root` to look for `.flatpak-info` and treats a failure as
+/// "client is sandboxed", parking the connection until it is disconnected
+/// (`src/modules/flatpak-utils.h`, `module-access.c`). With the host-view name
+/// the open resolves inside the reader's chroot, finds nothing, and every
+/// PipeWire client in the container hangs at connect.
+pub fn proc_root_path(pid: u64) -> Option<alloc::string::String> {
+    let tid = proc_pid_to_tid(pid);
+    let target = task_map_get(&ROOT_DIR_TABLE, tid)
+        .unwrap_or_else(|| alloc::string::String::from("/"));
+    let reader =
+        root_dir_prefix(current_task_id()).unwrap_or_else(|| alloc::string::String::from("/"));
+    Some(d_path_from_root(&target, &reader))
 }
 
 /// Store NUL-separated argv bytes for a task. /proc/[pid]/cmdline

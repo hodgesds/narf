@@ -976,6 +976,23 @@ aliases), it reopens descriptor `N`; path-backed descriptors restart normal
 open permission and flag handling, while anonymous descriptors retain a live
 reference to their object. `O_NOFOLLOW` preserves the final devtmpfs link and
 `RESOLVE_NO_MAGICLINKS` rejects the proc-fd jump with `ELOOP`.
+`/proc/{self,thread-self,<pid>}/{root,cwd,exe}` are magic links whose target
+is an ordinary pathname. Following one — through `open(2)` or a path `stat`
+— restarts the walk at that pathname, so `open("/proc/<pid>/root",
+O_DIRECTORY)` yields the task's root directory and `stat("/proc/self/cwd")`
+describes a directory. The filesystem-local resolver cannot do this on its
+own: it restarts an absolute symlink target at the owning filesystem's mount
+root, and procfs has no `/`, so the walk runs out of components and reports
+ENOENT. The target is read from the procfs node itself, which keeps
+pid-namespace translation and reader-root rendering in procfs (see
+`filesystem/` §3.9). `RESOLVE_NO_MAGICLINKS` rejects the jump with `ELOOP`,
+`O_NOFOLLOW` and a trailing slash keep their existing meanings, and a target
+that would re-enter as the same path is `ELOOP` rather than a loop.
+This is load-bearing for the desktop audio stack: PipeWire's access module
+opens `/proc/<peer-pid>/root` to look for `.flatpak-info` and treats a failed
+open as "this client is sandboxed", parking the connection until it is
+disconnected, so without it no PipeWire client inside a container can
+connect.
 The `container` Cargo feature enables namespace support in both userspace and
 `narf-filesystem`; procfs must therefore never publish zero namespace limits
 in a build where the namespace syscalls are enabled.

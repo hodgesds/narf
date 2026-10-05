@@ -1447,6 +1447,45 @@ fn open_impl_reserved(
         return;
     }
 
+    // `/proc/<pid>/{root,cwd,exe}` are magic links too, and following one has
+    // to restart the walk at the TASK's root rather than inside procfs — see
+    // `proc_task_link_target`. Checked after the fd links (whose targets may
+    // be anonymous and have no pathname at all) and only when the final
+    // component is actually being followed.
+    if mnt_len == 0 && follow_final {
+        // A trailing slash does NOT exempt the link: `open_last_lookups` adds
+        // LOOKUP_FOLLOW | LOOKUP_DIRECTORY for one, so `open("…/root/")`
+        // follows the link and then demands a directory. Match on the path
+        // without it and put it back on the target, which is what carries the
+        // directory requirement into the restarted walk.
+        let probe = if path.len() > 1 {
+            path.trim_end_matches('/')
+        } else {
+            path
+        };
+        if let Some(target) = proc_task_link_target(task, probe) {
+            if current_resolve_scope().is_some_and(|s| s.no_magiclinks) {
+                ctx.set_return(errno_ret(ELOOP)); // -ELOOP
+                return;
+            }
+            // A target that re-enters as the same host path would recurse
+            // forever. No current link can produce one (a root, cwd or exe is
+            // never itself a `/proc/<pid>/{root,cwd,exe}` path), so this is a
+            // guard against a future one, not a live case.
+            if apply_chroot(&target) == probe {
+                ctx.set_return(errno_ret(ELOOP)); // -ELOOP
+                return;
+            }
+            let target = if trailing_slash {
+                alloc::format!("{}/", target.trim_end_matches('/'))
+            } else {
+                target
+            };
+            open_impl_reserved(ctx, target, flags, 0, 0, create_mode, reservation);
+            return;
+        }
+    }
+
     // `open_last_lookups`, create side: once the parent has been walked,
     // `if (unlikely(nd->last.name[nd->last.len])) return ERR_PTR(-EISDIR);`
     // — `open("x/", O_CREAT)` is EISDIR whether `x` is missing, a file or a
