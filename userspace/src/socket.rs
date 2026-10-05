@@ -577,7 +577,7 @@ pub enum SocketOp<'a> {
 /// Keyed per receiving task — see `SocketFile::dgram_recv_ancillary`.
 #[derive(Default)]
 struct DgramRecvAncillary {
-    cred: Ucred,
+    cred: Option<Ucred>,
     fds: Vec<ScmRightsFile>,
 }
 
@@ -798,7 +798,7 @@ pub struct SocketFile {
     /// ORDER MATTERS for consumers: `unix_take_recv_fds` takes the rights and
     /// leaves the entry; `recvmsg_cred` REMOVES it. Take the fds first, or
     /// they are dropped with the entry. A plain `read(2)` wants neither and
-    /// calls `discard_dgram_recv_ancillary`.
+    /// calls `recvmsg_cred` after dropping any rights.
     dgram_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, DgramRecvAncillary>>,
     inet6_recv_ancillary: IrqSafeSpinLock<BTreeMap<u64, Inet6RecvAncillary>>,
     /// The IPv4 receive info of the datagram each task last received, for
@@ -863,7 +863,9 @@ pub struct SocketFile {
     /// datagram. Kept parallel to the protocol-specific reply queue so
     /// NETLINK_PKTINFO can report the group of the datagram actually read.
     netlink_reply_groups: IrqSafeSpinLock<VecDeque<u32>>,
-    netlink_last_recv_group: AtomicU32,
+    /// Numeric multicast group for the record each task most recently
+    /// dequeued. recvmsg consumes its own entry when constructing pktinfo.
+    netlink_recv_groups: IrqSafeSpinLock<BTreeMap<u64, u32>>,
     /// Send-time credentials for a userspace-originated netlink datagram,
     /// held between dequeue and recvmsg ancillary construction. Kernel
     /// replies/notifications deliberately have no entry and therefore use
@@ -1434,9 +1436,9 @@ pub struct DgramPacket {
     /// Source AF_UNIX address (pathname or abstract), if the sender was
     /// bound. `None` for an unbound sender or an AF_INET datagram.
     pub peer_unix: Option<UnixAddr>,
-    /// Sender credentials, attached to recvmsg as SCM_CREDENTIALS when the
-    /// receiver set SO_PASSCRED. Enables sd_notify's per-message identity.
-    pub sender_cred: Ucred,
+    /// Sender credentials captured when either endpoint requested them, or
+    /// supplied explicitly. `None` means no credential existed at send time.
+    pub sender_cred: Option<Ucred>,
     pub peer_addr: u32,
     pub peer_port: u16,
     pub payload: Vec<u8>,
@@ -1746,7 +1748,7 @@ impl SocketFile {
             netlink_ext_ack: AtomicBool::new(false),
             netlink_strict_check: AtomicBool::new(false),
             netlink_reply_groups: IrqSafeSpinLock::new(VecDeque::new()),
-            netlink_last_recv_group: AtomicU32::new(0),
+            netlink_recv_groups: IrqSafeSpinLock::new(BTreeMap::new()),
             netlink_user_recv_creds: IrqSafeSpinLock::new(BTreeMap::new()),
             netlink_admin: IrqSafeSpinLock::new(None),
             opener_net_admin: AtomicBool::new(false),
@@ -2122,7 +2124,12 @@ impl SocketFile {
 
     /// Deliver a send addressed to a userspace netlink port. `None` means the
     /// destination is the kernel endpoint and protocol dispatch should proceed.
-    fn send_netlink_user(&self, buf: &[u8], explicit: Option<&SockAddr>) -> Option<SocketOpResult> {
+    fn send_netlink_user(
+        &self,
+        buf: &[u8],
+        explicit: Option<&SockAddr>,
+        explicit_cred: Option<Ucred>,
+    ) -> Option<SocketOpResult> {
         let destination = explicit.and_then(Self::netlink_addr).unwrap_or_else(|| {
             (
                 self.netlink_peer_portid.load(Ordering::Acquire),
@@ -2159,6 +2166,7 @@ impl SocketFile {
         if destination == (0, 0) {
             return None;
         }
+        let sender_cred = explicit_cred.unwrap_or_else(crate::handlers::current_scm_ucred);
         // Multicast: deliver to every socket subscribed to the group.
         //
         // This used to return NotSupported outright, on the reasoning that
@@ -2185,10 +2193,9 @@ impl SocketFile {
         // follow-up; refusing every sender was both the wrong errno and the
         // wrong answer for the one sender that matters.
         if destination.1 != 0 {
-            return Some(self.broadcast_netlink_user(buf, destination.1));
+            return Some(self.broadcast_netlink_user(buf, destination.1, sender_cred));
         }
         let sender = self.ensure_netlink_portid();
-        let sender_cred = crate::handlers::current_scm_ucred();
         let mut sockets = NETLINK_SOCKETS.lock();
         sockets.retain(|weak| weak.strong_count() != 0);
         let target = sockets.iter().filter_map(Weak::upgrade).find(|socket| {
@@ -2223,6 +2230,23 @@ impl SocketFile {
         Some(SocketOpResult::Ok(buf.len() as u64))
     }
 
+    /// Netlink sendmsg path when userspace supplied an authenticated
+    /// `SCM_CREDENTIALS` record. User-to-user delivery retains that identity;
+    /// a request addressed to the kernel follows the normal protocol handler.
+    pub(crate) fn netlink_sendmsg_with_cred(
+        self: &Arc<Self>,
+        buf: &[u8],
+        flags: u32,
+        addr: Option<SockAddr>,
+        cred: Ucred,
+    ) -> SocketOpResult {
+        if let Some(result) = self.send_netlink_user(buf, addr.as_ref(), Some(cred)) {
+            result
+        } else {
+            self.dispatch_op(SocketOp::Send { buf, flags, addr })
+        }
+    }
+
     /// `sockaddr_nl.nl_groups` multicast send — Linux `netlink_broadcast`.
     ///
     /// `group_mask` is the raw `nl_groups` bitmask the sender supplied. Linux
@@ -2234,11 +2258,15 @@ impl SocketFile {
     /// `netlink_broadcast`'s return value, so a broadcast with no subscribers
     /// still succeeds. Returning an error for an empty listener set would
     /// make udevd fail whenever nothing happened to be listening yet.
-    fn broadcast_netlink_user(&self, buf: &[u8], group_mask: u32) -> SocketOpResult {
+    fn broadcast_netlink_user(
+        &self,
+        buf: &[u8],
+        group_mask: u32,
+        sender_cred: Ucred,
+    ) -> SocketOpResult {
         // Linux `ffs(addr->nl_groups)`.
         let group = group_mask.trailing_zeros() + 1;
         let sender = self.ensure_netlink_portid();
-        let sender_cred = crate::handlers::current_scm_ucred();
         let targets: Vec<Arc<SocketFile>> = {
             let mut sockets = NETLINK_SOCKETS.lock();
             sockets.retain(|weak| weak.strong_count() != 0);
@@ -2313,8 +2341,9 @@ impl SocketFile {
         // its unicast-vs-multicast trust decision on exactly this field: a
         // broadcast that arrives claiming nl_groups==0 is treated as an
         // untrusted unicast and dropped on the floor.
-        self.netlink_last_recv_group
-            .store(packet.group, Ordering::Release);
+        self.netlink_recv_groups
+            .lock()
+            .insert(crate::handlers::current_task_id(), packet.group);
         self.netlink_user_recv_creds
             .lock()
             .insert(crate::handlers::current_task_id(), packet.sender_cred);
@@ -2365,7 +2394,9 @@ impl SocketFile {
         self.netlink_user_recv_creds
             .lock()
             .remove(&crate::handlers::current_task_id());
-        self.netlink_last_recv_group.store(group, Ordering::Release);
+        self.netlink_recv_groups
+            .lock()
+            .insert(crate::handlers::current_task_id(), group);
         group
     }
 
@@ -2373,7 +2404,9 @@ impl SocketFile {
         self.netlink_user_recv_creds
             .lock()
             .remove(&crate::handlers::current_task_id());
-        self.netlink_last_recv_group.store(group, Ordering::Release);
+        self.netlink_recv_groups
+            .lock()
+            .insert(crate::handlers::current_task_id(), group);
     }
 
     /// Consume the send-time credential associated with the user netlink
@@ -2397,11 +2430,12 @@ impl SocketFile {
     }
 
     pub fn netlink_pktinfo(&self) -> Option<u32> {
-        if self.domain == AF_NETLINK && self.netlink_pktinfo.load(Ordering::Acquire) {
-            Some(self.netlink_last_recv_group.load(Ordering::Acquire))
-        } else {
-            None
-        }
+        let group = self
+            .netlink_recv_groups
+            .lock()
+            .remove(&crate::handlers::current_task_id());
+        (self.domain == AF_NETLINK && self.netlink_pktinfo.load(Ordering::Acquire))
+            .then(|| group.unwrap_or(0))
     }
 
     /// Byte length of the `NETLINK_LIST_MEMBERSHIPS` bitmap this socket would
@@ -2478,6 +2512,13 @@ impl SocketFile {
         self.passcred.load(Ordering::Acquire)
     }
 
+    fn set_passcred(&self, enabled: bool) {
+        self.passcred.store(enabled, Ordering::Release);
+        if let SocketState::UnixConnected { rx, .. } = &*self.state.lock() {
+            rx.set_capture_credentials(enabled);
+        }
+    }
+
     pub(crate) fn stash_inet6_recv_ancillary(&self, ancillary: Inet6RecvAncillary) {
         self.inet6_recv_ancillary
             .lock()
@@ -2531,10 +2572,9 @@ impl SocketFile {
     }
 
     /// Credentials to attach to the current recvmsg's `SCM_CREDENTIALS`
-    /// ancillary message. DGRAM sockets report the sender of the most
-    /// recently received datagram; connected (stream) sockets report the
-    /// fixed peer credentials.
-    pub fn recvmsg_cred(&self) -> Ucred {
+    /// ancillary message. Packet and stream sockets report the send-time
+    /// identity attached to the record/range just consumed.
+    pub fn recvmsg_cred(&self) -> Option<Ucred> {
         if self.kind == SOCK_DGRAM || self.kind == SOCK_SEQPACKET {
             let rx = match &*self.state.lock() {
                 SocketState::UnixConnected { rx, .. } => Some(rx.clone()),
@@ -2546,7 +2586,7 @@ impl SocketFile {
         }
         if self.kind == SOCK_DGRAM {
             if matches!(&*self.state.lock(), SocketState::UnixConnected { .. }) {
-                *self.peer_cred.lock()
+                None
             } else {
                 // Per-RECORD, keyed by the receiving task. Removing the entry
                 // here is what bounds the map; any rights still attached were
@@ -2555,11 +2595,14 @@ impl SocketFile {
                 self.dgram_recv_ancillary
                     .lock()
                     .remove(&crate::handlers::current_task_id())
-                    .map(|a| a.cred)
-                    .unwrap_or_default()
+                    .and_then(|a| a.cred)
             }
         } else {
-            *self.peer_cred.lock()
+            let state = self.state.lock();
+            match &*state {
+                SocketState::UnixConnected { rx, .. } => rx.take_delivered_packet_cred().flatten(),
+                _ => Some(*self.peer_cred.lock()),
+            }
         }
     }
 
@@ -3133,10 +3176,12 @@ impl FileOps for SocketFile {
                     // discard those rights now so a later recvmsg(2) cannot
                     // receive descriptors attached to already-consumed bytes.
                     drop(self.unix_take_recv_fds());
-                    // read(2) reports no credentials either, so clear the
-                    // whole per-record entry rather than leaving a cred behind.
-                    self.discard_dgram_recv_ancillary();
+                    // read(2) reports no credentials either. Consume the
+                    // matching per-task entry from a stream ring or datagram
+                    // inbox so a later recvmsg cannot inherit it.
+                    let _ = self.recvmsg_cred();
                     let _ = self.take_netlink_user_recv_cred();
+                    let _ = self.netlink_pktinfo();
                     let _ = self.take_packet_recv_ancillary();
                     Ok(n)
                 }
@@ -3144,8 +3189,9 @@ impl FileOps for SocketFile {
                 // read(2) (no MSG_TRUNC reporting without recvmsg flags).
                 SocketOpResult::ReceivedTruncated { copied, .. } => {
                     drop(self.unix_take_recv_fds());
-                    self.discard_dgram_recv_ancillary();
+                    let _ = self.recvmsg_cred();
                     let _ = self.take_netlink_user_recv_cred();
+                    let _ = self.netlink_pktinfo();
                     let _ = self.take_packet_recv_ancillary();
                     Ok(copied)
                 }
@@ -4069,7 +4115,7 @@ impl SocketFile {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
             SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, addr, .. } => {
-                if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
+                if let Some(result) = self.send_netlink_user(buf, addr.as_ref(), None) {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
@@ -4196,7 +4242,7 @@ impl SocketFile {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
             SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, addr, .. } => {
-                if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
+                if let Some(result) = self.send_netlink_user(buf, addr.as_ref(), None) {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
@@ -4274,7 +4320,7 @@ impl SocketFile {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
             SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, addr, .. } => {
-                if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
+                if let Some(result) = self.send_netlink_user(buf, addr.as_ref(), None) {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
@@ -4356,7 +4402,7 @@ impl SocketFile {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
             SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, addr, .. } => {
-                if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
+                if let Some(result) = self.send_netlink_user(buf, addr.as_ref(), None) {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
@@ -4427,7 +4473,7 @@ impl SocketFile {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
             SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, addr, .. } => {
-                if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
+                if let Some(result) = self.send_netlink_user(buf, addr.as_ref(), None) {
                     return result;
                 }
                 let dest_portid = self.ensure_netlink_portid();
@@ -4500,7 +4546,7 @@ impl SocketFile {
             SocketOp::Connect { addr } => self.connect_netlink(&addr),
             // udev clients never send on the monitor; accept + discard.
             SocketOp::Send { buf, addr, .. } => {
-                if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
+                if let Some(result) = self.send_netlink_user(buf, addr.as_ref(), None) {
                     return result;
                 }
                 self.ensure_netlink_portid();
@@ -4629,7 +4675,7 @@ impl SocketFile {
             SocketOp::Bind { addr } => self.bind_netlink(&addr),
             SocketOp::Connect { addr } => self.connect_netlink(&addr),
             SocketOp::Send { buf, addr, .. } => {
-                if let Some(result) = self.send_netlink_user(buf, addr.as_ref()) {
+                if let Some(result) = self.send_netlink_user(buf, addr.as_ref(), None) {
                     return result;
                 }
                 self.ensure_netlink_portid();
@@ -5793,7 +5839,7 @@ impl SocketFile {
         if let SocketState::InetRaw { inbox, .. } = &mut *state {
             inbox.push_back(DgramPacket {
                 peer_unix: None,
-                sender_cred: Ucred::default(),
+                sender_cred: None,
                 peer_addr: dest.0,
                 peer_port: dest.1,
                 payload: buf.to_vec(),
@@ -6042,7 +6088,7 @@ impl SocketFile {
                 // Give the new accepted endpoint to the listener's
                 // pending queue; configure our local state with
                 // the matching pair.
-                let server_end = SocketFile::new(AF_UNIX, SOCK_STREAM);
+                let server_end = SocketFile::new(AF_UNIX, self.kind);
                 {
                     let mut srv_state = server_end.state.lock();
                     *srv_state = SocketState::UnixConnected {
@@ -6051,6 +6097,10 @@ impl SocketFile {
                         local_addr: None,
                     };
                 }
+                // `sk_clone_lock` copies the listener's receive flags to the
+                // accepted socket. This also marks the accepted endpoint's rx
+                // ring so its peer captures automatic credentials at send time.
+                server_end.set_passcred(listener.passcred());
                 // Credentials: the accepted server end owns the listener's
                 // identity, and each end's SO_PEERCRED reports the other's.
                 // (The listener process typically inherits/re-owns the
@@ -6149,6 +6199,9 @@ impl SocketFile {
                     rx: b_to_a,
                     local_addr,
                 };
+                // SO_PASSCRED may have been enabled before connect(). Publish
+                // it to the newly installed receive ring.
+                self.set_passcred(self.passcred());
                 self.set_peer_cred(listener_cred);
                 self.set_peer_groups(listener_groups);
                 SocketOpResult::Ok(0)
@@ -6865,14 +6918,61 @@ impl SocketFile {
     /// AF_UNIX SOCK_DGRAM. Same shape as InetDgram but keyed by unix
     /// address (pathname or abstract name — sd_notify's $NOTIFY_SOCKET
     /// is an abstract datagram socket).
+    fn autobind_unix_dgram_for_passcred(self: &Arc<Self>) {
+        if !self.passcred() {
+            return;
+        }
+        loop {
+            let name = autobind_name(false);
+            // Keep the same state -> registry lock order as bind(2). Holding
+            // state across the registry insertion also makes a concurrent
+            // explicit bind and this implicit bind mutually exclusive.
+            let mut state = self.state.lock();
+            if !matches!(
+                &*state,
+                SocketState::Fresh | SocketState::UnixDgram { addr: None, .. }
+            ) {
+                return;
+            }
+            let mut registry = ABSTRACT_DGRAM.lock();
+            let map = registry.get_or_insert_with(BTreeMap::new);
+            let key = (self.net_ns_id(), name.clone());
+            if map.contains_key(&key) {
+                drop(registry);
+                drop(state);
+                continue;
+            }
+            let installed = match &mut *state {
+                SocketState::Fresh => {
+                    *state = SocketState::UnixDgram {
+                        addr: Some(UnixAddr::Abstract(name)),
+                        inbox: VecDeque::new(),
+                        peer: None,
+                    };
+                    true
+                }
+                SocketState::UnixDgram { addr, .. } if addr.is_none() => {
+                    *addr = Some(UnixAddr::Abstract(name));
+                    true
+                }
+                _ => false,
+            };
+            if installed {
+                map.insert(key, self.clone());
+            }
+            return;
+        }
+    }
+
     fn dispatch_unix_dgram(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
-        self.dispatch_unix_dgram_with_fds(op, Vec::new())
+        self.dispatch_unix_dgram_with_fds(op, Vec::new(), None)
     }
 
     fn dispatch_unix_dgram_with_fds(
         self: &Arc<Self>,
         op: SocketOp<'_>,
         fds: Vec<ScmRightsFile>,
+        explicit_cred: Option<Ucred>,
     ) -> SocketOpResult {
         match op {
             SocketOp::Bind { addr } => {
@@ -6993,6 +7093,9 @@ impl SocketFile {
                 if buf.len() > UNIX_DGRAM_SNDBUF - 32 {
                     return SocketOpResult::Err(SockError::MsgSize);
                 }
+                // Linux autobinds an unbound AF_UNIX datagram sender when it
+                // enabled SO_PASSCRED, before resolving the destination.
+                self.autobind_unix_dgram_for_passcred();
                 let explicit_dest = addr.is_some();
                 let state = self.state.lock();
                 let (local_addr, dest_addr, connected_path) = match &*state {
@@ -7039,9 +7142,6 @@ impl SocketFile {
                     }
                     _ => return SocketOpResult::Err(SockError::NotConnected),
                 };
-                // SCM_CREDENTIALS names the sender's effective identity at
-                // send time, not the identity it had when socket() ran.
-                let sender_cred = crate::handlers::current_ucred();
                 drop(state);
                 let dest_sock = match &dest_addr {
                     UnixAddr::Path(p) => {
@@ -7089,6 +7189,10 @@ impl SocketFile {
                         };
                     }
                 };
+                let sender_cred = explicit_cred.or_else(|| {
+                    (self.passcred() || dest_sock.passcred())
+                        .then(crate::handlers::current_scm_ucred)
+                });
                 let pkt = DgramPacket {
                     peer_unix: local_addr,
                     sender_cred,
@@ -7151,7 +7255,7 @@ impl SocketFile {
                         static SHOWN: core::sync::atomic::AtomicU32 =
                             core::sync::atomic::AtomicU32::new(0);
                         if SHOWN.fetch_add(1, Ordering::Relaxed) < 4000 {
-                            let outer = front.sender_cred.pid;
+                            let outer = front.sender_cred.map_or(0, |cred| cred.pid);
                             let inner = crate::handlers::report_pid_to(receiver, outer as u64);
                             let mut txt = alloc::string::String::new();
                             for &b in front.payload.iter().take(40) {
@@ -7631,8 +7735,13 @@ impl SocketFile {
         if tx.is_closed() {
             return Err(SockError::Pipe);
         }
+        let automatic_cred = (self.domain == AF_UNIX
+            && (self.passcred() || tx.captures_credentials()))
+        .then(crate::handlers::current_scm_ucred);
         let n = if self.kind == SOCK_SEQPACKET || self.kind == SOCK_DGRAM {
-            tx.write_packet(buf, crate::handlers::current_ucred())
+            tx.write_packet(buf, automatic_cred)
+        } else if self.domain == AF_UNIX {
+            tx.write_stream(buf, automatic_cred)
         } else {
             tx.write(buf)
         }?;
@@ -7701,10 +7810,11 @@ impl SocketFile {
         // a reader that parks BEFORE data arrives is still recorded), so the
         // peer's next send targets ONLY this task instead of waking the herd.
         rx.set_owner(crate::handlers::current_task_id());
+        let preserve_cred_boundary = self.domain == AF_UNIX && self.passcred();
         let n = if flags & MSG_PEEK != 0 {
-            rx.peek(buf)
+            rx.peek(buf, preserve_cred_boundary)
         } else {
-            rx.read(buf)
+            rx.read(buf, preserve_cred_boundary)
         };
         if n == 0 && !buf.is_empty() && !rx.is_closed() {
             Err(SockError::WouldBlock)
@@ -7720,6 +7830,7 @@ impl SocketFile {
         &self,
         buf: &[u8],
         fds: Vec<ScmRightsFile>,
+        explicit_cred: Option<Ucred>,
     ) -> Result<usize, SockError> {
         let state = self.state.lock();
         let tx = match &*state {
@@ -7729,11 +7840,14 @@ impl SocketFile {
         if tx.is_closed() {
             return Err(SockError::Pipe);
         }
+        let cred = explicit_cred.or_else(|| {
+            (self.passcred() || tx.captures_credentials()).then(crate::handlers::current_scm_ucred)
+        });
         let packet = self.kind == SOCK_SEQPACKET || self.kind == SOCK_DGRAM;
         let n = if packet {
-            tx.write_packet_with_fds(buf, fds, crate::handlers::current_ucred())
+            tx.write_packet_with_fds(buf, fds, cred)
         } else {
-            tx.write_stream_with_fds(buf, fds)
+            tx.write_stream_with_fds(buf, fds, cred)
         }?;
         drop(state);
         // Ring full (nothing fit) but there WAS data to send: the fd batch was
@@ -7784,26 +7898,20 @@ impl SocketFile {
         flags: u32,
         addr: Option<SockAddr>,
         fds: Vec<ScmRightsFile>,
+        explicit_cred: Option<Ucred>,
     ) -> Result<usize, SockError> {
         if self.domain != AF_UNIX || self.kind != SOCK_DGRAM {
             return Err(SockError::InvalidArg);
         }
-        match self.dispatch_unix_dgram_with_fds(SocketOp::Send { buf, flags, addr }, fds) {
+        match self.dispatch_unix_dgram_with_fds(
+            SocketOp::Send { buf, flags, addr },
+            fds,
+            explicit_cred,
+        ) {
             SocketOpResult::Ok(n) => Ok(n as usize),
             SocketOpResult::Err(e) => Err(e),
             _ => Err(SockError::InvalidArg),
         }
-    }
-
-    /// Drop this task's pending datagram ancillary entry outright.
-    ///
-    /// `read(2)` has no ancillary output, so it wants neither the rights nor
-    /// the credentials; without this the entry would linger until the task's
-    /// next datagram receive overwrote it.
-    pub(crate) fn discard_dgram_recv_ancillary(&self) {
-        self.dgram_recv_ancillary
-            .lock()
-            .remove(&crate::handlers::current_task_id());
     }
 
     /// Pop the next received SCM_RIGHTS fd batch from an AF_UNIX stream
@@ -7892,6 +8000,10 @@ impl Drop for SocketFile {
 pub struct RingBuf {
     inner: IrqSafeSpinLock<RingInner>,
     closed: AtomicBool,
+    /// Whether the endpoint receiving from this ring currently requests
+    /// automatic Unix credentials. The sender samples it at send time, just
+    /// like Linux's `unix_maybe_add_creds(sk, other)`.
+    capture_credentials: AtomicBool,
     /// Task that READS this ring (the endpoint holding it as `rx`), for a
     /// TARGETED readiness wake. AF_UNIX is point-to-point, so a send that fills
     /// this ring should wake ONLY this reader — not every parked poller. The
@@ -7920,27 +8032,39 @@ struct RingInner {
     /// Record queue for connected SOCK_SEQPACKET/SOCK_DGRAM pairs.
     packets: VecDeque<PacketRecord>,
     packet_bytes: usize,
-    /// Ancillary batch attached to the record most recently consumed by
-    /// recv/recvmsg. `recvmsg` takes it immediately after the data read.
-    delivered_packet_fds: Option<Vec<ScmRightsFile>>,
-    delivered_packet_cred: Option<Ucred>,
+    /// Ancillary batch attached to each receiving task's most recent read.
+    /// A shared socket may have concurrent readers; a socket-global slot lets
+    /// the second dequeue overwrite the first record before recvmsg builds its
+    /// control messages.
+    delivered_ancillary: BTreeMap<u64, DgramRecvAncillary>,
     /// Monotonic byte positions for stream ancillary association.
     stream_read_seq: u64,
     stream_write_seq: u64,
     /// AF_UNIX stream SCM_RIGHTS is attached to the first byte written by
     /// sendmsg, rather than queued independently of the byte stream.
     stream_controls: VecDeque<StreamControl>,
+    /// Credential changes along the stream. Adjacent writes from the same
+    /// identity coalesce; recvmsg stops before a different identity so bytes
+    /// from two writers are never attributed to one credential record.
+    stream_cred_markers: VecDeque<StreamCredMarker>,
+    stream_read_cred: Option<Ucred>,
+    stream_tail_cred: Option<Ucred>,
 }
 
 struct PacketRecord {
     data: Vec<u8>,
     fds: Vec<ScmRightsFile>,
-    cred: Ucred,
+    cred: Option<Ucred>,
 }
 
 struct StreamControl {
     offset: u64,
     fds: Vec<ScmRightsFile>,
+}
+
+struct StreamCredMarker {
+    offset: u64,
+    cred: Option<Ucred>,
 }
 
 impl core::fmt::Debug for RingInner {
@@ -7959,13 +8083,16 @@ impl RingBuf {
                 buf: VecDeque::new(),
                 packets: VecDeque::new(),
                 packet_bytes: 0,
-                delivered_packet_fds: None,
-                delivered_packet_cred: None,
+                delivered_ancillary: BTreeMap::new(),
                 stream_read_seq: 0,
                 stream_write_seq: 0,
                 stream_controls: VecDeque::new(),
+                stream_cred_markers: VecDeque::new(),
+                stream_read_cred: None,
+                stream_tail_cred: None,
             }),
             closed: AtomicBool::new(false),
+            capture_credentials: AtomicBool::new(false),
             owner_task: AtomicU64::new(0),
             // A fresh ring is empty: writable (has space), not readable, not
             // closed.
@@ -8052,13 +8179,35 @@ impl RingBuf {
         &self.readiness
     }
 
-    /// Take ancillary rights associated with the most recent receive.
-    fn take_fds(&self) -> Option<Vec<ScmRightsFile>> {
-        self.inner.lock().delivered_packet_fds.take()
+    #[inline]
+    fn set_capture_credentials(&self, enabled: bool) {
+        self.capture_credentials.store(enabled, Ordering::Release);
     }
 
-    fn take_delivered_packet_cred(&self) -> Option<Ucred> {
-        self.inner.lock().delivered_packet_cred.take()
+    #[inline]
+    fn captures_credentials(&self) -> bool {
+        self.capture_credentials.load(Ordering::Acquire)
+    }
+
+    /// Take ancillary rights associated with the most recent receive.
+    fn take_fds(&self) -> Option<Vec<ScmRightsFile>> {
+        let mut inner = self.inner.lock();
+        let ancillary = inner
+            .delivered_ancillary
+            .get_mut(&crate::handlers::current_task_id())?;
+        if ancillary.fds.is_empty() {
+            None
+        } else {
+            Some(core::mem::take(&mut ancillary.fds))
+        }
+    }
+
+    fn take_delivered_packet_cred(&self) -> Option<Option<Ucred>> {
+        self.inner
+            .lock()
+            .delivered_ancillary
+            .remove(&crate::handlers::current_task_id())
+            .map(|ancillary| ancillary.cred)
     }
 
     fn write(&self, src: &[u8]) -> Result<usize, SockError> {
@@ -8089,6 +8238,7 @@ impl RingBuf {
         &self,
         src: &[u8],
         fds: Vec<ScmRightsFile>,
+        cred: Option<Ucred>,
     ) -> Result<usize, SockError> {
         let mut g = self.inner.lock();
         let avail = RING_CAP - g.buf.len();
@@ -8102,6 +8252,12 @@ impl RingBuf {
                 .try_reserve(1)
                 .map_err(|_| SockError::NoMemory)?;
         }
+        let cred_changed = g.stream_tail_cred != cred;
+        if cred_changed {
+            g.stream_cred_markers
+                .try_reserve(1)
+                .map_err(|_| SockError::NoMemory)?;
+        }
         let marker = g.stream_write_seq;
         g.buf.extend(src[..n].iter().copied());
         g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
@@ -8111,6 +8267,13 @@ impl RingBuf {
                 fds,
             });
         }
+        if cred_changed {
+            g.stream_cred_markers.push_back(StreamCredMarker {
+                offset: marker,
+                cred,
+            });
+            g.stream_tail_cred = cred;
+        }
         drop(g);
         // See RingBuf::write: fire the readable wait-queue on every data-bearing
         // write so an EPOLLET reader re-fires on bytes appended before it
@@ -8119,7 +8282,11 @@ impl RingBuf {
         Ok(n)
     }
 
-    fn write_packet(&self, src: &[u8], cred: Ucred) -> Result<usize, SockError> {
+    fn write_stream(&self, src: &[u8], cred: Option<Ucred>) -> Result<usize, SockError> {
+        self.write_stream_with_fds(src, Vec::new(), cred)
+    }
+
+    fn write_packet(&self, src: &[u8], cred: Option<Ucred>) -> Result<usize, SockError> {
         self.write_packet_with_fds(src, Vec::new(), cred)
     }
 
@@ -8127,7 +8294,7 @@ impl RingBuf {
         &self,
         src: &[u8],
         fds: Vec<ScmRightsFile>,
-        cred: Ucred,
+        cred: Option<Ucred>,
     ) -> Result<usize, SockError> {
         // A record larger than the whole ring can never be queued; reporting
         // "no room yet" would park a blocking sender forever and spin a
@@ -8152,17 +8319,47 @@ impl RingBuf {
         Ok(src.len())
     }
 
-    fn read(&self, dst: &mut [u8]) -> usize {
+    fn read(&self, dst: &mut [u8], preserve_cred_boundary: bool) -> usize {
         let mut g = self.inner.lock();
-        g.delivered_packet_fds = None;
-        let n = core::cmp::min(dst.len(), g.buf.len());
+        let task = crate::handlers::current_task_id();
+        g.delivered_ancillary.remove(&task);
+        let start = g.stream_read_seq;
+        let mut active_cred = g.stream_read_cred;
+        while g
+            .stream_cred_markers
+            .front()
+            .is_some_and(|marker| marker.offset <= start)
+        {
+            active_cred = g
+                .stream_cred_markers
+                .pop_front()
+                .and_then(|marker| marker.cred);
+        }
+        let mut n = core::cmp::min(dst.len(), g.buf.len());
+        if preserve_cred_boundary {
+            if let Some(next) = g.stream_cred_markers.front() {
+                n = n.min(next.offset.saturating_sub(start) as usize);
+            }
+        }
         let (front, back) = g.buf.as_slices();
         let first = n.min(front.len());
         dst[..first].copy_from_slice(&front[..first]);
         let second = n - first;
         dst[first..n].copy_from_slice(&back[..second]);
         drop(g.buf.drain(..n));
-        let end = g.stream_read_seq.saturating_add(n as u64);
+        let end = start.saturating_add(n as u64);
+        if !preserve_cred_boundary {
+            while g
+                .stream_cred_markers
+                .front()
+                .is_some_and(|marker| marker.offset < end)
+            {
+                active_cred = g
+                    .stream_cred_markers
+                    .pop_front()
+                    .and_then(|marker| marker.cred);
+            }
+        }
         let mut delivered = Vec::new();
         while g
             .stream_controls
@@ -8174,8 +8371,15 @@ impl RingBuf {
             }
         }
         g.stream_read_seq = end;
-        if !delivered.is_empty() {
-            g.delivered_packet_fds = Some(delivered);
+        g.stream_read_cred = active_cred;
+        if n != 0 && (active_cred.is_some() || !delivered.is_empty()) {
+            g.delivered_ancillary.insert(
+                task,
+                DgramRecvAncillary {
+                    cred: active_cred,
+                    fds: delivered,
+                },
+            );
         }
         drop(g);
         if n != 0 {
@@ -8187,24 +8391,47 @@ impl RingBuf {
     }
 
     /// Copy immediately readable bytes without advancing the stream head.
-    fn peek(&self, dst: &mut [u8]) -> usize {
+    fn peek(&self, dst: &mut [u8], preserve_cred_boundary: bool) -> usize {
         let mut g = self.inner.lock();
-        g.delivered_packet_fds = None;
-        let n = core::cmp::min(dst.len(), g.buf.len());
+        let task = crate::handlers::current_task_id();
+        g.delivered_ancillary.remove(&task);
+        let start = g.stream_read_seq;
+        let mut active_cred = g.stream_read_cred;
+        let mut next_boundary = None;
+        for marker in &g.stream_cred_markers {
+            if marker.offset <= start {
+                active_cred = marker.cred;
+            } else {
+                next_boundary = Some(marker.offset);
+                break;
+            }
+        }
+        let mut n = core::cmp::min(dst.len(), g.buf.len());
+        if preserve_cred_boundary {
+            if let Some(boundary) = next_boundary {
+                n = n.min(boundary.saturating_sub(start) as usize);
+            }
+        }
         let (front, back) = g.buf.as_slices();
         let first = n.min(front.len());
         dst[..first].copy_from_slice(&front[..first]);
         let second = n - first;
         dst[first..n].copy_from_slice(&back[..second]);
-        let end = g.stream_read_seq.saturating_add(n as u64);
+        let end = start.saturating_add(n as u64);
         let delivered: Vec<_> = g
             .stream_controls
             .iter()
             .take_while(|control| control.offset < end)
             .flat_map(|control| control.fds.iter().cloned())
             .collect();
-        if !delivered.is_empty() {
-            g.delivered_packet_fds = Some(delivered);
+        if n != 0 && (active_cred.is_some() || !delivered.is_empty()) {
+            g.delivered_ancillary.insert(
+                task,
+                DgramRecvAncillary {
+                    cred: active_cred,
+                    fds: delivered,
+                },
+            );
         }
         n
     }
@@ -8213,15 +8440,24 @@ impl RingBuf {
     /// Returns `(copied, full_record_len)`.
     fn read_packet(&self, dst: &mut [u8], peek: bool) -> Option<(usize, usize)> {
         let mut g = self.inner.lock();
+        let task = crate::handlers::current_task_id();
+        g.delivered_ancillary.remove(&task);
         let packet = g.packets.front()?;
         let full = packet.data.len();
         let copied = dst.len().min(full);
         dst[..copied].copy_from_slice(&packet.data[..copied]);
-        g.delivered_packet_cred = Some(packet.cred);
-        if !peek {
+        let (cred, fds) = if peek {
+            (packet.cred, packet.fds.clone())
+        } else {
             let packet = g.packets.pop_front().unwrap();
             g.packet_bytes = g.packet_bytes.saturating_sub(full);
-            g.delivered_packet_fds = Some(packet.fds);
+            (packet.cred, packet.fds)
+        };
+        if cred.is_some() || !fds.is_empty() {
+            g.delivered_ancillary
+                .insert(task, DgramRecvAncillary { cred, fds });
+        }
+        if !peek {
             drop(g);
             // A record was consumed: POLL_IN may fall (queue now empty) and
             // POLL_OUT may rise; republish for a writer parked on this ring.
@@ -8677,7 +8913,7 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
     let mut inbox = VecDeque::new();
     inbox.push_back(DgramPacket {
         peer_unix: None,
-        sender_cred: Ucred::default(),
+        sender_cred: None,
         peer_addr: 0,
         peer_port: 0,
         payload: alloc::vec![0u8; 7], // head datagram: 7 bytes
@@ -8686,7 +8922,7 @@ fn smoke_siocinq_unix_dgram_reports_head_len() -> TestResult {
     });
     inbox.push_back(DgramPacket {
         peer_unix: None,
-        sender_cred: Ucred::default(),
+        sender_cred: None,
         peer_addr: 0,
         peer_port: 0,
         payload: alloc::vec![0u8; 3], // second datagram: ignored by SIOCINQ
@@ -8731,7 +8967,7 @@ fn smoke_unix_dgram_scm_rights_delivers_per_datagram() -> TestResult {
         status_flags: 0,
         description: None,
     };
-    match sender.unix_dgram_sendmsg(b"FDSTORE=1", 0, Some(addr), alloc::vec![passed_right]) {
+    match sender.unix_dgram_sendmsg(b"FDSTORE=1", 0, Some(addr), alloc::vec![passed_right], None) {
         Ok(n) if n == b"FDSTORE=1".len() => {}
         _ => return TestResult::Fail("SCM_RIGHTS AF_UNIX datagram send failed"),
     }
@@ -9533,7 +9769,7 @@ fn smoke_unix_ring_storage_is_demand_grown() -> TestResult {
         return TestResult::Fail("first-byte write eagerly allocated the full ring");
     }
     let mut byte = [0u8; 1];
-    if ring.read(&mut byte) != 1 || byte != *b"x" {
+    if ring.read(&mut byte, false) != 1 || byte != *b"x" {
         return TestResult::Fail("demand-grown ring did not preserve its first byte");
     }
     TestResult::Pass
@@ -9550,18 +9786,18 @@ fn smoke_unix_stream_rights_follow_byte_boundaries() -> TestResult {
     };
 
     if ring.write(b"plain") != Ok(5)
-        || ring.write_stream_with_fds(b"fd", alloc::vec![passed_right]) != Ok(2)
+        || ring.write_stream_with_fds(b"fd", alloc::vec![passed_right], None) != Ok(2)
     {
         return TestResult::Fail("failed to seed stream control boundary");
     }
 
     let mut prefix = [0u8; 5];
-    if ring.read(&mut prefix) != 5 || &prefix != b"plain" || ring.take_fds().is_some() {
+    if ring.read(&mut prefix, false) != 5 || &prefix != b"plain" || ring.take_fds().is_some() {
         return TestResult::Fail("rights escaped before their marker byte");
     }
 
     let mut first = [0u8; 1];
-    if ring.read(&mut first) != 1 || first[0] != b'f' {
+    if ring.read(&mut first, false) != 1 || first[0] != b'f' {
         return TestResult::Fail("failed to cross stream control marker");
     }
     let Some(fds) = ring.take_fds() else {
@@ -9595,15 +9831,15 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
         description: None,
     };
 
-    if ring.write_stream_with_fds(b"a", alloc::vec![first_right]) != Ok(1)
+    if ring.write_stream_with_fds(b"a", alloc::vec![first_right], None) != Ok(1)
         || ring.write(b"-") != Ok(1)
-        || ring.write_stream_with_fds(b"b", alloc::vec![second_right]) != Ok(1)
+        || ring.write_stream_with_fds(b"b", alloc::vec![second_right], None) != Ok(1)
     {
         return TestResult::Fail("failed to seed multiple stream control batches");
     }
 
     let mut one = [0u8; 1];
-    if ring.read(&mut one) != 1 || one[0] != b'a' {
+    if ring.read(&mut one, false) != 1 || one[0] != b'a' {
         return TestResult::Fail("failed to consume first marker byte");
     }
     let Some(first_batch) = ring.take_fds() else {
@@ -9614,7 +9850,7 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
     }
 
     let mut tail = [0u8; 2];
-    if ring.read(&mut tail) != 2 || &tail != b"-b" {
+    if ring.read(&mut tail, false) != 2 || &tail != b"-b" {
         return TestResult::Fail("failed to consume second marker range");
     }
     let Some(second_batch) = ring.take_fds() else {
@@ -9628,6 +9864,43 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_unix_stream_multiple_rights_batches_preserve_order
+);
+
+fn smoke_unix_stream_credentials_stop_at_identity_boundaries() -> TestResult {
+    let ring = RingBuf::new();
+    let first_cred = Ucred {
+        pid: 101,
+        uid: 1001,
+        gid: 1002,
+    };
+    let second_cred = Ucred {
+        pid: 202,
+        uid: 2001,
+        gid: 2002,
+    };
+    if ring.write_stream(b"first", Some(first_cred)) != Ok(5)
+        || ring.write_stream(b"second", Some(second_cred)) != Ok(6)
+    {
+        return TestResult::Fail("failed to seed stream credential ranges");
+    }
+    let mut buf = [0u8; 16];
+    if ring.read(&mut buf, true) != 5 || &buf[..5] != b"first" {
+        return TestResult::Fail("stream recv crossed into a different credential range");
+    }
+    if ring.take_delivered_packet_cred() != Some(Some(first_cred)) {
+        return TestResult::Fail("first stream range reported the wrong credentials");
+    }
+    if ring.read(&mut buf, true) != 6 || &buf[..6] != b"second" {
+        return TestResult::Fail("second stream credential range was not readable");
+    }
+    if ring.take_delivered_packet_cred() != Some(Some(second_cred)) {
+        return TestResult::Fail("second stream range reported the wrong credentials");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_unix_stream_credentials_stop_at_identity_boundaries
 );
 
 fn smoke_ipv6_socket_options_and_ancillary_are_per_datagram() -> TestResult {

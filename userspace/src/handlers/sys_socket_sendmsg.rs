@@ -133,8 +133,8 @@ pub(super) fn sendmsg_on_socket(
     if ctrl_len_u64 > i32::MAX as u64 || ctrl_len_u64 > MAX_USER_COPY as u64 {
         return SendMsgResult::Error(105); // ENOBUFS
     }
-    let passed_fds = match parse_scm_rights_fds(ctrl_ptr, ctrl_len_u64 as usize) {
-        Ok(fds) => fds,
+    let ancillary = match parse_scm_send_ancillary(ctrl_ptr, ctrl_len_u64 as usize) {
+        Ok(ancillary) => ancillary,
         Err(errno) => return SendMsgResult::Error(errno),
     };
 
@@ -164,10 +164,12 @@ pub(super) fn sendmsg_on_socket(
     // SCM_RIGHTS is an AF_UNIX facility. `__scm_send` rejects it for any
     // other family and `ip_cmsg_send` / `sock_cmsg_send` (TCP, UDP) fall to
     // their default arm: -EINVAL, not the -ENOTCONN of the unix send path.
-    if !passed_fds.is_empty() && sock.domain != crate::socket::AF_UNIX {
+    if !ancillary.fds.is_empty() && sock.domain != crate::socket::AF_UNIX {
         return SendMsgResult::Error(EINVAL);
     }
-    if !passed_fds.is_empty() {
+    if !ancillary.fds.is_empty()
+        || (ancillary.cred.is_some() && sock.domain == crate::socket::AF_UNIX)
+    {
         // A *connected* AF_UNIX datagram socketpair delivers over its crossed
         // rings, not the address registry — so its SCM_RIGHTS send goes through
         // `unix_sendmsg` (which frames a datagram record + fds for SOCK_DGRAM),
@@ -181,9 +183,9 @@ pub(super) fn sendmsg_on_socket(
             && sock.kind == crate::socket::SOCK_DGRAM
             && !sock.is_unix_connected()
         {
-            sock.unix_dgram_sendmsg(&total, flags, dest, passed_fds)
+            sock.unix_dgram_sendmsg(&total, flags, dest, ancillary.fds, ancillary.cred)
         } else {
-            sock.unix_sendmsg(&total, passed_fds)
+            sock.unix_sendmsg(&total, ancillary.fds, ancillary.cred)
         };
         return match result {
             Ok(n) => SendMsgResult::Sent {
@@ -193,6 +195,25 @@ pub(super) fn sendmsg_on_socket(
             Err(crate::socket::SockError::WouldBlock) => SendMsgResult::WouldBlock,
             Err(error) => SendMsgResult::Error(error.errno() as i64),
         };
+    }
+
+    if let Some(cred) = ancillary.cred {
+        if sock.domain == crate::socket::AF_NETLINK {
+            let result = sock.netlink_sendmsg_with_cred(&total, flags, dest, cred);
+            return match result {
+                crate::socket::SocketOpResult::Ok(n) => SendMsgResult::Sent {
+                    written: n as usize,
+                    complete: n as usize >= total_len,
+                },
+                crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
+                    SendMsgResult::WouldBlock
+                }
+                crate::socket::SocketOpResult::Err(error) => {
+                    SendMsgResult::Error(error.errno() as i64)
+                }
+                _ => SendMsgResult::Error(EINVAL),
+            };
+        }
     }
 
     match sock.dispatch_op(crate::socket::SocketOp::Send {

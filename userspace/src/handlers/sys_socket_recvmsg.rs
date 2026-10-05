@@ -108,6 +108,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                 drop(sock.unix_take_recv_fds());
                 let _ = sock.recvmsg_cred();
                 let _ = sock.take_netlink_user_recv_cred();
+                let _ = sock.netlink_pktinfo();
                 let _ = sock.take_packet_recv_ancillary();
                 ctx.set_return(errno_ret(errno));
             };
@@ -185,7 +186,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                     // datagram whose SCM_CREDENTIALS pid != the service MainPID,
                     // and MainPID is now the child's in-namespace pid (see the
                     // clone-return translation). Identity in the root namespace.
-                    Some(report_ucred_to(current_task_id(), message_cred))
+                    message_cred.map(|cred| report_ucred_to(current_task_id(), cred))
                 } else {
                     None
                 };

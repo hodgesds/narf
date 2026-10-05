@@ -422,7 +422,7 @@ pub(super) fn deliver_wire(
                 t,
                 DgramPacket {
                     peer_unix: None,
-                    sender_cred: Ucred::default(),
+                    sender_cred: None,
                     peer_addr: saddr,
                     peer_port: sport,
                     payload: payload.to_vec(),
@@ -454,7 +454,7 @@ pub(super) fn deliver_wire(
         &sock,
         DgramPacket {
             peer_unix: None,
-            sender_cred: Ucred::default(),
+            sender_cred: None,
             peer_addr: saddr,
             peer_port: sport,
             payload: payload.to_vec(),
@@ -853,7 +853,7 @@ impl SocketFile {
                     &t,
                     DgramPacket {
                         peer_unix: None,
-                        sender_cred: Ucred::default(),
+                        sender_cred: None,
                         peer_addr: from,
                         peer_port: local_port,
                         payload: buf.to_vec(),
@@ -921,7 +921,7 @@ impl SocketFile {
                     &d,
                     DgramPacket {
                         peer_unix: None,
-                        sender_cred: Ucred::default(),
+                        sender_cred: None,
                         peer_addr: from,
                         peer_port: local_port,
                         payload: buf.to_vec(),
@@ -1011,7 +1011,7 @@ impl SocketFile {
                     &t,
                     DgramPacket {
                         peer_unix: None,
-                        sender_cred: Ucred::default(),
+                        sender_cred: None,
                         peer_addr: from,
                         peer_port: local_port,
                         payload: buf.to_vec(),
