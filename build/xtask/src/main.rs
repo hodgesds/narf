@@ -2903,10 +2903,71 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Canonical kernel rustflags per arch, mirroring `.cargo/config.toml`.
+///
+/// We set these explicitly through `CARGO_ENCODED_RUSTFLAGS` instead of letting
+/// cargo read them from `.cargo/config.toml`, because cargo CONCATENATES the
+/// `rustflags` arrays of every config file it finds walking up from the cwd. A
+/// git worktree created under the main checkout (e.g. `.claude/worktrees/<name>`)
+/// therefore sees the worktree's config AND the parent checkout's identical
+/// config, doubling every flag — including `-Tbuild/linker/<arch>.ld`. A linker
+/// script applied twice re-runs its `SECTIONS` block, which re-runs
+/// `. = KERNEL_LOAD_BASE` and slams `.kaslr_relocs` / `.kernel_bounds` back onto
+/// `.boot`, failing the link with section-overlap errors. An explicit
+/// `CARGO_ENCODED_RUSTFLAGS` REPLACES (never merges) config rustflags, so the
+/// build is identical from the main checkout or any nested worktree.
+///
+/// Keep this in sync with `[build]` + `[target.<triple>]` in
+/// `.cargo/config.toml`.
+fn kernel_rustflags(arch: Arch) -> Vec<&'static str> {
+    let mut f = vec![
+        "--remap-path-prefix",
+        ".=.",
+        "-C",
+        "relocation-model=static",
+        "-C",
+        "link-arg=--emit-relocs",
+    ];
+    match arch {
+        Arch::X86_64 => f.extend_from_slice(&[
+            "-C",
+            "code-model=kernel",
+            "-C",
+            "link-arg=-Tbuild/linker/x86_64.ld",
+            "-C",
+            "link-arg=--gc-sections",
+            "-C",
+            "link-arg=--build-id=sha1",
+            "-Z",
+            "plt=no",
+            "--cfg",
+            "curve25519_dalek_backend=\"serial\"",
+            "--cfg",
+            "poly1305_force_soft",
+            "--cfg",
+            "aes_force_soft",
+            "--cfg",
+            "polyval_force_soft",
+        ]),
+        Arch::Aarch64 => f.extend_from_slice(&[
+            "-C",
+            "code-model=small",
+            "-C",
+            "target-feature=+lse",
+            "-C",
+            "link-arg=-Tbuild/linker/aarch64.ld",
+            "-C",
+            "link-arg=--gc-sections",
+            "-C",
+            "link-arg=--build-id=sha1",
+        ]),
+    }
+    f
+}
+
 fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.current_dir(root)
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS")
         .arg("build")
         .arg("-p")
@@ -2971,6 +3032,16 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         ]
         .join("\u{1f}");
         cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
+    } else {
+        // Set the kernel rustflags explicitly rather than inheriting them from
+        // `.cargo/config.toml`: cargo merges (concatenates) the config
+        // `rustflags` arrays across every config file it finds walking up from
+        // the cwd, so a worktree nested under the main checkout would double
+        // `-Tbuild/linker/<arch>.ld` and fail the link. See `kernel_rustflags`.
+        cmd.env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            kernel_rustflags(args.arch).join("\u{1f}"),
+        );
     }
     if !args.debug {
         cmd.arg("--release");
