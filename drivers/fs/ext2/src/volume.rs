@@ -1679,6 +1679,30 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // Before the allocation lock — releasing frees a block, which takes
         // it too.
         self.xattr_release_on_free(inode_no).await?;
+        self.clear_inode_for_free(inode_no).await?;
+        self.release_inode_allocation(inode_no).await
+    }
+
+    /// Roll back an inode-bit allocation that failed before a valid inode was
+    /// published.  Such a slot can carry arbitrary old bytes and therefore
+    /// cannot be fed through xattr teardown or checksum validation first.
+    pub(crate) async fn abort_inode_allocation(&self, inode_no: u32) -> Result<(), FsError> {
+        if inode_no == 0 {
+            return Ok(());
+        }
+        self.clear_inode_for_free(inode_no).await?;
+        self.release_inode_allocation(inode_no).await
+    }
+
+    /// Replace an inode slot with a checksummed deleted record before making
+    /// its bitmap bit reusable.  Clearing the bit alone leaves a live-looking
+    /// inode with zero `i_dtime`, which e2fsck reports as filesystem damage.
+    async fn clear_inode_for_free(&self, inode_no: u32) -> Result<(), FsError> {
+        let deleted = Inode::deleted(Self::now_secs());
+        self.write_new_inode(inode_no, &deleted).await
+    }
+
+    async fn release_inode_allocation(&self, inode_no: u32) -> Result<(), FsError> {
         // The number is about to become reusable: a node still held for the
         // freed inode must not be what a later `iget` of a NEW inode with the
         // same number returns. Unhash it (Linux `remove_inode_hash`).

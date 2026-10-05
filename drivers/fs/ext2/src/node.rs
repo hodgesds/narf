@@ -843,6 +843,24 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
             Ok(self.volume.iget(new_ino).await? as Arc<dyn FileOps>)
         })
     }
+
+    fn create_with_attrs<'a>(
+        &'a self,
+        name: &'a str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
+            let parent_ino = self.state.lock().inode_no;
+            let new_ino = self
+                .volume
+                .dir_create_regular_with_attrs(parent_ino, name.as_bytes(), perms, uid, gid)
+                .await?;
+            Ok(self.volume.iget(new_ino).await? as Arc<dyn FileOps>)
+        })
+    }
     fn mkdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
         Box::pin(async move {
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
