@@ -3194,6 +3194,85 @@ fn smoke_abi_fsx_mount_accepted_flags_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_accepted_flags_pos);
 
+fn smoke_abi_fsx_mount_negative_errnos() -> TestResult {
+    with_setup(|| {
+        const MS_SHARED: u64 = 1 << 20;
+        const MS_PRIVATE: u64 = 1 << 18;
+        const MS_BIND: u64 = 1 << 12;
+        const MS_MOVE: u64 = 1 << 13;
+
+        // 1. Conflicting propagation flags -> -EINVAL
+        let conflict_prop = SyscallArgs {
+            arg0: 0,
+            arg1: c"/abi-mnt-flags".as_ptr() as u64,
+            arg2: 0,
+            arg3: MS_SHARED | MS_PRIVATE,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), conflict_prop) != Some(EINVAL) {
+            return Err(
+                "mount with conflicting propagation flags (SHARED|PRIVATE) must return -EINVAL",
+            );
+        }
+
+        // 2. MS_BIND with empty source -> -EINVAL
+        let empty_bind = SyscallArgs {
+            arg0: c"".as_ptr() as u64,
+            arg1: c"/abi-mnt-flags".as_ptr() as u64,
+            arg2: c"none".as_ptr() as u64,
+            arg3: MS_BIND,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), empty_bind) != Some(EINVAL) {
+            return Err("mount(MS_BIND) with empty source must return -EINVAL");
+        }
+
+        // 3. MS_MOVE with empty source -> -EINVAL
+        let empty_move = SyscallArgs {
+            arg0: c"".as_ptr() as u64,
+            arg1: c"/abi-mnt-flags".as_ptr() as u64,
+            arg2: c"none".as_ptr() as u64,
+            arg3: MS_MOVE,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), empty_move) != Some(EINVAL) {
+            return Err("mount(MS_MOVE) with empty source must return -EINVAL");
+        }
+
+        // 4. Empty target string -> -ENOENT
+        let empty_target = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: c"".as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), empty_target) != Some(ENOENT) {
+            return Err("mount with empty target string must return -ENOENT");
+        }
+
+        // 5. Unprivileged caller -> -EPERM
+        drop_to_unprivileged_uid()?;
+        let unpriv_mount = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: c"/abi-mnt-flags".as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), unpriv_mount) != Some(EPERM) {
+            return Err("unprivileged mount must return -EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_negative_errnos);
+
 // ── mount(2) FUSE options live in `data`, not `source` ────────────────
 //
 // Linux `fuse_fill_super` reads `fd=`/`rootmode=`/`user_id=`/`group_id=`
@@ -3427,6 +3506,51 @@ fn smoke_abi_fsx_umount2_flags_and_fault_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_flags_and_fault_neg);
+
+fn smoke_abi_fsx_umount2_negative_errnos() -> TestResult {
+    with_setup(|| {
+        const MNT_FORCE: u64 = 1;
+        const MNT_EXPIRE: u64 = 1 << 2;
+
+        // 1. Empty target string -> -ENOENT
+        if call(Syscall::Umount2.raw(), a1(c"".as_ptr() as u64, 0)) != Some(ENOENT) {
+            return Err("umount2 with empty target path must return -ENOENT");
+        }
+
+        // 2. Existing mountpoint with conflicting MNT_EXPIRE | MNT_FORCE -> -EINVAL
+        let target = b"/abi-umnt-conflicts\0";
+        let margs = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("setup mount for umount2 conflict test failed");
+        }
+
+        // MNT_EXPIRE is mutually exclusive with MNT_FORCE on an existing mount -> -EINVAL
+        let conf_r = call(
+            Syscall::Umount2.raw(),
+            a1(target.as_ptr() as u64, MNT_EXPIRE | MNT_FORCE),
+        );
+        if conf_r != Some(EINVAL) {
+            let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+            return Err("umount2(MNT_EXPIRE | MNT_FORCE) on mounted path must return -EINVAL");
+        }
+
+        // 3. Unprivileged caller attempting to umount real mount -> -EPERM
+        drop_to_unprivileged_uid()?;
+        let unpriv_r = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+        if unpriv_r != Some(EPERM) {
+            return Err("unprivileged umount2 on valid mount must return -EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_negative_errnos);
 
 // Positive pin so a later tightening cannot turn a working teardown into an
 // error: every flag umount2(2) accepts must still unmount a real mount.

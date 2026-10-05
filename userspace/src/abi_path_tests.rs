@@ -1361,6 +1361,65 @@ fn smoke_abi_path_utimes_sets_mtime() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_utimes_sets_mtime);
 
+fn smoke_abi_path_utimes_negative_and_null_tv() -> TestResult {
+    with_memfs("/p-utimes", "p-utimes", &[("f", b"hello")], || {
+        if !wired(Syscall::Utimes) {
+            return Ok(());
+        }
+        let path = c"/p-utimes/f";
+        const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+
+        // 1. NULL tv pointer sets current time and returns 0
+        if call(Syscall::Utimes.raw(), a1(path.as_ptr() as u64, 0)) != Some(0) {
+            return Err("utimes with null tv_ptr must succeed (set current time)");
+        }
+
+        // 2. Nonexistent file returns -ENOENT
+        let bad_path = c"/p-utimes/no_such_file";
+        let valid_tv: [i64; 4] = [100, 0, 200, 0];
+        if call(
+            Syscall::Utimes.raw(),
+            a1(bad_path.as_ptr() as u64, valid_tv.as_ptr() as u64),
+        ) != Some(ENOENT)
+        {
+            return Err("utimes on nonexistent path must return -ENOENT");
+        }
+
+        // 3. NULL path pointer returns -EFAULT
+        if call(Syscall::Utimes.raw(), a1(0, valid_tv.as_ptr() as u64)) != Some(EFAULT) {
+            return Err("utimes with NULL path pointer must return -EFAULT");
+        }
+
+        // 4. Faulting tv pointer returns -EFAULT
+        if call(Syscall::Utimes.raw(), a1(path.as_ptr() as u64, BAD_PTR)) != Some(EFAULT) {
+            return Err("utimes with faulting tv pointer must return -EFAULT");
+        }
+
+        // 5. Invalid usec (>= 1_000_000) returns -EINVAL
+        let invalid_tv_high: [i64; 4] = [100, 1_000_000, 200, 0];
+        if call(
+            Syscall::Utimes.raw(),
+            a1(path.as_ptr() as u64, invalid_tv_high.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("utimes with tv_usec >= 1_000_000 must return -EINVAL");
+        }
+
+        // 6. Negative usec returns -EINVAL
+        let invalid_tv_neg: [i64; 4] = [100, 0, 200, -1];
+        if call(
+            Syscall::Utimes.raw(),
+            a1(path.as_ptr() as u64, invalid_tv_neg.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("utimes with negative tv_usec must return -EINVAL");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_utimes_negative_and_null_tv);
+
 fn smoke_abi_path_utime_sets_mtime_seconds() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/f\0";

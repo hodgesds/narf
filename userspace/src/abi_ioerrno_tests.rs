@@ -3200,3 +3200,149 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_ioerrno_epoll_ctl_pollability_follows_the_inode
 );
+
+// ── creat(2) ────────────────────────────────────────────────────────
+//
+// Linux `fs/open.c::creat`:
+//   do_sys_open(AT_FDCWD, pathname, O_CREAT | O_WRONLY | O_TRUNC, mode);
+fn smoke_abi_ioerrno_creat_pos() -> TestResult {
+    with_memfs("/abi-creat", "abi-creat", &[], || {
+        if !wired(Syscall::Creat) {
+            return Ok(());
+        }
+        let path = c"/abi-creat/new_file";
+        let fd = match call(Syscall::Creat.raw(), a1(path.as_ptr() as u64, 0o644)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("creat on valid path should return a non-negative fd"),
+        };
+        // creat opens O_WRONLY: writes succeed
+        let data = b"hello";
+        let wr = call(
+            Syscall::Write.raw(),
+            a2(fd, data.as_ptr() as u64, data.len() as u64),
+        );
+        if wr != Some(5) {
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            return Err("write to creat-opened descriptor should succeed");
+        }
+        // creat is O_WRONLY: read must fail with -EBADF
+        let mut rdbuf = [0u8; 16];
+        let rd = call(
+            Syscall::Read.raw(),
+            a2(fd, rdbuf.as_mut_ptr() as u64, rdbuf.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if rd != Some(EBADF) {
+            return Err("read from creat(O_WRONLY) descriptor must return -EBADF");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_creat_pos);
+
+fn smoke_abi_ioerrno_creat_truncates_existing() -> TestResult {
+    with_memfs(
+        "/abi-creat-trunc",
+        "abi-creat-trunc",
+        &[("existing", b"0123456789")],
+        || {
+            if !wired(Syscall::Creat) {
+                return Ok(());
+            }
+            let path = c"/abi-creat-trunc/existing";
+            let fd = match call(Syscall::Creat.raw(), a1(path.as_ptr() as u64, 0o644)) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("creat on existing file should succeed"),
+            };
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            // Verify truncation to 0 bytes (O_TRUNC)
+            let mut sb = [0u8; 144];
+            if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+                return Err("stat on truncated file failed");
+            }
+            let size = i64::from_ne_bytes(sb[48..56].try_into().unwrap());
+            if size != 0 {
+                return Err("creat must truncate existing file to 0 bytes");
+            }
+            Ok(())
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_creat_truncates_existing);
+
+fn smoke_abi_ioerrno_creat_negative_errnos() -> TestResult {
+    with_setup(|| {
+        if !wired(Syscall::Creat) {
+            return Ok(());
+        }
+        // Faulting pointer -> -EFAULT
+        if call(Syscall::Creat.raw(), a1(BAD_PTR, 0o644)) != Some(EFAULT) {
+            return Err("creat with faulting path pointer must return -EFAULT");
+        }
+        // Empty path -> -ENOENT
+        if call(Syscall::Creat.raw(), a1(c"".as_ptr() as u64, 0o644)) != Some(ENOENT) {
+            return Err("creat with empty path must return -ENOENT");
+        }
+        // Nonexistent directory path -> -ENOENT
+        let bad_path = c"/abi-nonexistent-dir-creat/f";
+        if call(Syscall::Creat.raw(), a1(bad_path.as_ptr() as u64, 0o644)) != Some(ENOENT) {
+            return Err("creat with nonexistent parent directory must return -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_creat_negative_errnos);
+
+// ── fsync / fdatasync pipe/fifo EINVAL ──────────────────────────────
+//
+// Linux `fs/sync.c::vfs_fsync_range`:
+//   `if (!file->f_op->fsync) return -EINVAL;`
+// Pipes and FIFOs do not define `fsync`, so fsync and fdatasync return -EINVAL.
+fn smoke_abi_ioerrno_fdatasync_pipe_einval() -> TestResult {
+    with_setup(|| {
+        let (rfd, wfd) = make_pipe()?;
+        let r_fsync = call(Syscall::Fsync.raw(), a0(rfd as u64));
+        let w_fsync = call(Syscall::Fsync.raw(), a0(wfd as u64));
+        let r_fdatasync = call(Syscall::Fdatasync.raw(), a0(rfd as u64));
+        let w_fdatasync = call(Syscall::Fdatasync.raw(), a0(wfd as u64));
+        let _ = call(Syscall::Close.raw(), a0(rfd as u64));
+        let _ = call(Syscall::Close.raw(), a0(wfd as u64));
+
+        if r_fsync != Some(EINVAL) || w_fsync != Some(EINVAL) {
+            return Err("fsync on pipe descriptor must return -EINVAL");
+        }
+        if r_fdatasync != Some(EINVAL) || w_fdatasync != Some(EINVAL) {
+            return Err("fdatasync on pipe descriptor must return -EINVAL");
+        }
+        // Closed / bad fds must be -EBADF
+        if call(Syscall::Fsync.raw(), a0(9999)) != Some(EBADF) {
+            return Err("fsync on bad fd must return -EBADF");
+        }
+        if call(Syscall::Fdatasync.raw(), a0(9999)) != Some(EBADF) {
+            return Err("fdatasync on bad fd must return -EBADF");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fdatasync_pipe_einval);
+
+// ── syncfs(2) descriptor error validation ───────────────────────────
+fn smoke_abi_ioerrno_syncfs_errno_and_valid() -> TestResult {
+    with_memfs("/abi-syncfs", "abi-syncfs", &[("f", b"data")], || {
+        let fd = open_fd_flags(b"/abi-syncfs/f\0", crate::fd::O_RDONLY as u64)?;
+        if call(Syscall::Syncfs.raw(), a0(fd as u64)) != Some(0) {
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            return Err("syncfs on valid open fd must return 0");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        // Closed / out-of-range fds must return -EBADF
+        if call(Syscall::Syncfs.raw(), a0(9999)) != Some(EBADF) {
+            return Err("syncfs on closed fd 9999 must return -EBADF");
+        }
+        if call(Syscall::Syncfs.raw(), a0((-1i64) as u64)) != Some(EBADF) {
+            return Err("syncfs on fd -1 must return -EBADF");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_syncfs_errno_and_valid);
