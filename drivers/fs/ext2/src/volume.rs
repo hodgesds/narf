@@ -1862,6 +1862,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// triple-indirect), zeroing the inode's `block[]` field. Caller persists
     /// the inode.
     pub async fn truncate_inode(&self, inode: &mut Inode) -> Result<(), FsError> {
+        // A fast symlink's `i_block` is the link text, not block pointers:
+        // walking it frees whatever blocks the text bytes happen to name
+        // (or fails with EIO when they are out of range, which made
+        // `unlink` of Firefox's `lock -> IP:+PID` profile symlink fail).
+        // Linux never truncates one (`ext4_can_truncate`).
+        if inode.is_fast_symlink(self.block_size() as u32) {
+            return Ok(());
+        }
         if self.superblock.uses_extents() && inode.uses_extents() {
             // `ext4_ext_remove_space` over the whole file; this answered
             // `Unsupported` (-EINVAL), so O_TRUNC and unlink failed for every

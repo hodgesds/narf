@@ -905,7 +905,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        if len <= 60 && inode.blocks == 0 {
+        if len <= 60 && inode.is_fast_symlink(self.block_size() as u32) {
             // Fast — pull from block[] serialised as 60 bytes.
             let mut bytes = [0u8; 60];
             for i in 0..super::inode::I_BLOCK_LEN {

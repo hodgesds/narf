@@ -37,6 +37,10 @@ pub const I_FLAGS_INDEX: u32 = 0x0000_1000;
 /// `EXT4_EXTENTS_FL`.
 pub const I_FLAGS_EXTENTS: u32 = 0x0008_0000;
 
+/// `i_flags` bit: the inode's data lives inline in `i_block` / the in-inode
+/// xattr area. Matches `EXT4_INLINE_DATA_FL`.
+pub const I_FLAGS_INLINE_DATA: u32 = 0x1000_0000;
+
 /// Decoded subset of an on-disk inode.
 ///
 /// On-disk layout (rev-0, 128 bytes):
@@ -90,6 +94,10 @@ pub struct Inode {
     pub generation: u32,
     /// `i_block[15]` — block pointers (12 direct + 3 indirect tiers).
     pub block: [u32; I_BLOCK_LEN],
+    /// `i_file_acl` (offset 104) plus `l_i_file_acl_high` (offset 118): the
+    /// external xattr block, whose sectors `i_blocks` includes. Decoded,
+    /// never encoded.
+    pub file_acl: u64,
     /// Whether the slot carries any extended attribute: an `i_file_acl`
     /// block, or the in-inode `EXT4_XATTR_MAGIC`. Decoded, never encoded —
     /// a hint that lets a lookup skip the xattr read for the (common)
@@ -120,8 +128,8 @@ impl Inode {
         let blocks = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
         let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
         let generation = u32::from_le_bytes([buf[100], buf[101], buf[102], buf[103]]);
-        let file_acl = u32::from_le_bytes([buf[104], buf[105], buf[106], buf[107]]) != 0
-            || u16::from_le_bytes([buf[118], buf[119]]) != 0;
+        let file_acl = u64::from(u32::from_le_bytes([buf[104], buf[105], buf[106], buf[107]]))
+            | (u64::from(u16::from_le_bytes([buf[118], buf[119]])) << 32);
         let ibody = buf.len() > 130 && {
             let magic_at = 128 + u16::from_le_bytes([buf[128], buf[129]]) as usize;
             magic_at + 4 <= buf.len()
@@ -151,7 +159,8 @@ impl Inode {
             flags,
             generation,
             block,
-            has_xattrs: file_acl || ibody,
+            file_acl,
+            has_xattrs: file_acl != 0 || ibody,
         })
     }
 
@@ -170,6 +179,24 @@ impl Inode {
     /// `true` when the directory uses HTREE indexing (`EXT4_INDEX_FL`).
     pub fn is_htree(&self) -> bool {
         self.flags & I_FLAGS_INDEX != 0
+    }
+
+    /// `true` when `i_block` holds the symlink target text rather than block
+    /// pointers or an extent root. Mirrors `fs/ext4/inode.c::
+    /// ext4_inode_is_fast_symlink` (non-`ea_inode` arm): an inline-data
+    /// inode is never fast, and the external xattr block is excluded from
+    /// `i_blocks` before the zero test. `block_size` is the volume block
+    /// size, which is the cluster size without bigalloc.
+    pub fn is_fast_symlink(&self, block_size: u32) -> bool {
+        if !self.is_symlink() || self.flags & I_FLAGS_INLINE_DATA != 0 {
+            return false;
+        }
+        let ea_sectors = if self.file_acl != 0 {
+            block_size >> 9
+        } else {
+            0
+        };
+        self.blocks.wrapping_sub(ea_sectors) == 0
     }
 
     /// `true` when this inode's `i_block` stores an ext4 extent root.
@@ -223,6 +250,7 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            file_acl: 0,
             has_xattrs: false,
         }
     }
@@ -245,6 +273,7 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            file_acl: 0,
             has_xattrs: false,
         }
     }
@@ -267,6 +296,7 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            file_acl: 0,
             has_xattrs: false,
         }
     }
@@ -289,6 +319,7 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            file_acl: 0,
             has_xattrs: false,
         }
     }

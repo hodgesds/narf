@@ -4010,6 +4010,59 @@ fn smoke_ext2_symlink_slow_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_slow_round_trip);
 
+/// Unlinking the last link of a fast symlink must not walk `i_block` as block
+/// pointers: it holds the link text. Firefox's profile `lock -> IP:+PID`
+/// symlink decoded to an out-of-range block number and `unlink` failed with
+/// EIO, wedging every later launch on "profile in use". Linux never truncates
+/// a fast symlink (`fs/ext4/inode.c::ext4_can_truncate`).
+fn smoke_ext2_unlink_fast_symlink_skips_block_walk() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let target = b"10.0.2.15:+772";
+    let sym_ino = match poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"lock", target))
+    {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("fast symlink create failed"),
+    };
+    let inode = match poll_once(volume.read_inode(sym_ino)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read symlink inode failed"),
+    };
+    if !inode.is_fast_symlink(volume.block_size() as u32) {
+        return TestResult::Fail("short symlink was not classified as fast");
+    }
+    if !matches!(
+        poll_once(volume.dir_unlink(crate::EXT2_ROOT_INO, b"lock")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("unlink of a fast symlink failed");
+    }
+    let root_inode = match poll_once(volume.read_inode(crate::EXT2_ROOT_INO)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("root inode read failed"),
+    };
+    if !matches!(
+        poll_once(volume.dir_lookup(&root_inode, b"lock")),
+        Some(Err(_))
+    ) {
+        return TestResult::Fail("unlinked fast symlink still resolves");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_unlink_fast_symlink_skips_block_walk
+);
+
 // ── VFS-layer symlink hardening ────────────────────────────────────────
 // The fast/slow round-trip tests above call `read_symlink_target` directly on
 // the volume. These exercise the FileOps/VFS surface every real path walk and
