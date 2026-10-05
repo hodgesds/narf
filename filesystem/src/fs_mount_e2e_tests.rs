@@ -325,6 +325,18 @@ fn smoke_vfs_mount_overlay_lower_visible_and_writable() -> TestResult {
 
     // Lower: a populated dir standing in for a read-only home's ~/.config.
     let lower = MemFs::with_seeds("ovmnt-lower", &[("kdeglobals", b"REAL-CONFIG")]);
+    let lower_root = lower.root();
+    lower_root.set_dir_mode(0o700);
+    lower_root.set_dir_owners(1000, 1000);
+    let lower_file = match lower_root.lookup("kdeglobals") {
+        Some(file) => file,
+        None => return TestResult::Fail("lower metadata setup could not find seeded file"),
+    };
+    if !matches!(poll_once(lower_file.set_owners(1000, 1000)), Some(Ok(())))
+        || !matches!(poll_once(lower_file.set_perms(0o640)), Some(Ok(())))
+    {
+        return TestResult::Fail("lower metadata setup failed");
+    }
     let auth = bootstrap_mount_authority();
     let base_handle = match registry().mount(&auth, BASE, lower) {
         Ok(h) => h,
@@ -332,7 +344,7 @@ fn smoke_vfs_mount_overlay_lower_visible_and_writable() -> TestResult {
     };
 
     // Overlay a fresh writable tmpfs upper over the populated dir.
-    let upper = match TmpFs::from_options("mode=0700", 0, 0) {
+    let upper = match TmpFs::from_options("mode=0700", 1000, 1000) {
         Ok(fs) => fs,
         Err(_) => return TestResult::Fail("tmpfs upper build failed"),
     };
@@ -348,6 +360,16 @@ fn smoke_vfs_mount_overlay_lower_visible_and_writable() -> TestResult {
         Some(Ok(f)) => f,
         _ => return TestResult::Fail("lower file hidden by the overlay (regression)"),
     };
+    if f.owners() != (1000, 1000) || f.stat().mode.perms != 0o640 {
+        return TestResult::Fail("overlay lost lower file ownership or mode metadata");
+    }
+    let overlay_root = match registry().with_mount(BASE, |fs| fs.root()) {
+        Some(root) => root,
+        None => return TestResult::Fail("overlay root disappeared before metadata check"),
+    };
+    if overlay_root.dir_owners() != (1000, 1000) || overlay_root.dir_mode() != 0o700 {
+        return TestResult::Fail("overlay mount root lost ownership or mode metadata");
+    }
     let mut buf = vec![0u8; 32];
     match poll_once(f.read(0, &mut buf)) {
         Some(Ok(n)) if &buf[..n] == b"REAL-CONFIG" => {}
