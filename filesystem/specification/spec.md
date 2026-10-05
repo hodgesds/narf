@@ -247,12 +247,16 @@ pub trait DirOps {
     ) -> FsFuture<'_, Arc<dyn FileOps>>;
 }
 pub trait FileOps {
+    fn ioctl_user(&self, cmd: u32, arg: u64, ctx: &dyn IoctlContext) -> FsFuture<'_, u64>;
     fn has_flush(&self) -> bool;
     fn poll_readiness(&self) -> u32;
     fn poll_readiness_at(&self, offset: u64) -> u32;
     fn poll_edge_token(&self) -> (u64, u64);
     fn acknowledge_poll_readiness(&self, readiness: u32);
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError>;
+    fn mmap_backing(&self, offset: u64, len: usize) -> Result<MmapBacking, FsError>;
+    fn validate_mmap(&self, offset: u64, len: usize, prot: u32, flags: u32) -> Result<u32, FsError>;
+    fn mmap_max_prot(&self, offset: u64) -> u32;
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
     fn mmap_is_ram(&self) -> bool;
     fn supports_mmap_fault(&self) -> bool;
@@ -374,6 +378,23 @@ every affected blocker.
 (`Ok(None)`), or an error. `Unsupported` selects buffered I/O directly into
 nonmergeable pipe pages. Memfd and tmpfs retain their actual RAM pages under
 the backing object's lock; overlay forwards the operation to its active file.
+`IoctlContext: Sync` supplies guarded `read(address, bytes)`,
+`write(address, bytes)`, `nonblocking()`, `file(fd)` and `process_id()` to
+device-specific ioctl handlers. Descriptor lookup returns a retained open file
+from the caller's table; process_id supplies its Linux thread-group ID.
+Its default FileOps implementation delegates to the existing ioctl hook;
+overlay forwards it to the active file. Drivers never dereference process
+addresses themselves. `BadFileState` maps to EBADFD (77), `NoDeviceAddress`
+to ENXIO (6), `StreamSuspended` to ESTRPIPE (86), and `StreamXrun` to EPIPE
+(32) without generating SIGPIPE.
+
+`mmap_backing` returns physical frames and an optional `Arc<dyn MmapLifetime>`
+together. Providers with replaceable storage must acquire both under the same
+lock. `validate_mmap` runs before VMA mutation and returns effective protections
+or a device error; only Unsupported from mmap_backing selects generic file
+fallback. `mmap_max_prot` defaults to RWX and constrains later mprotect calls,
+including after fd close, fork and mapping splits. Overlay forwards these hooks.
+
 `FileOps::mmap_is_ram()` defaults to false. A true implementation promises
 that both mmap backing methods expose ordinary allocator frames retired via
 `free_frame`, permitting independent page pins. Device/PFN providers must
@@ -1118,6 +1139,11 @@ request cancellation removes the slot and its registration.
 ### 3.9 Linux synthetic filesystem projections
 
 With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
+Sound cards and PCM/control endpoints are projected by the sound-card registry
+under `/sys/devices`, with class and character-device discovery symlinks,
+writable uevents, and physical PCI parent links where applicable. Registry
+teardown removes these links and the canonical card subtree; `Kobject::remove_symlink`
+supports discovery-link removal alongside `remove_child`.
 Block devices have canonical kobjects at
 `/sys/devices/virtual/block/<name>`; `/sys/class/block` and `/sys/block` are
 discovery views. Block `add` uevents and `/sys/dev/block/<major>:<minor>`

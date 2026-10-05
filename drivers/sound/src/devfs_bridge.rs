@@ -1,14 +1,12 @@
 //! `/dev/snd/*` bridge — one character-device node per ALSA-surface object.
 //!
-//! Exposes four node shapes for each registered sound card (card index N,
+//! Exposes three node shapes for each registered sound card (card index N,
 //! PCM device M):
 //!
 //! ```text
 //! /dev/snd/controlC<N>        — mixer control (read=control-list, write=set)
 //! /dev/snd/pcmC<N>D<M>p       — PCM playback  (write=feed samples, read rejected)
 //! /dev/snd/pcmC<N>D<M>c       — PCM capture   (read=drain samples, write rejected)
-//! /dev/snd/timer              — global timer stub (one per system)
-//! /dev/snd/seq                — sequencer stub   (one per system)
 //! ```
 //!
 //! Linux references:
@@ -18,7 +16,7 @@
 //!
 //! # hw_params setsockopt-style helper
 //!
-//! This bridge does not implement the Linux ALSA ioctl ABI. PCM callers
+//! Linux ALSA ioctl/mmap/poll is implemented by `alsa`. Legacy PCM callers
 //! configure hw_params by writing a 20-byte packed little-endian record into the PCM file
 //! at offset `HW_PARAMS_MAGIC_OFFSET` (0xFFFF_0000).  Layout matches
 //! `HwParams` field order: `[format:u32][rate:u32][channels:u32]
@@ -32,11 +30,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
-use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::format::{ChannelCount, HwParams, SampleFormat, SampleRate};
 use crate::mixer::ControlValue;
-use crate::{list_cards, open_capture, open_playback, CaptureStream, PlaybackStream, SoundError};
+use crate::{list_cards, open_playback, SoundError};
 
 // ── Offset sentinel for hw_params writes ─────────────────────────────
 
@@ -52,9 +49,20 @@ pub const HW_PARAMS_MAGIC_OFFSET: u64 = 0xFFFF_0000;
 /// Packed size of hw_params: 5 × u32 = 20 bytes.
 const HW_PARAMS_BYTES: usize = 20;
 
+fn fs_error(error: SoundError) -> FsError {
+    match error {
+        SoundError::NoSuchCard | SoundError::NoSuchDevice => FsError::NoDevice,
+        SoundError::DeviceBusy => FsError::Busy,
+        SoundError::NoMemory => FsError::OutOfMemory,
+        SoundError::NoSuchControl => FsError::NotFound,
+        SoundError::InvalidParams | SoundError::OutOfRange => FsError::InvalidData,
+        SoundError::BadState => FsError::Unsupported,
+    }
+}
+
 /// Decode 20 raw bytes → `HwParams`. Little-endian, fields in struct order:
 /// `format(u32) | rate(u32) | channels(u32) | period_size(u32) | periods(u32)`.
-fn decode_hw_params(buf: &[u8]) -> Option<HwParams> {
+pub(crate) fn decode_hw_params(buf: &[u8]) -> Option<HwParams> {
     if buf.len() < HW_PARAMS_BYTES {
         return None;
     }
@@ -103,19 +111,22 @@ fn decode_hw_params(buf: &[u8]) -> Option<HwParams> {
 ///   Mirrors the shape of `SNDRV_CTL_IOCTL_ELEM_LIST` output in
 ///   Linux's `sound/core/control.c::snd_ctl_ioctl`.
 /// - `write` at offset `HW_PARAMS_MAGIC_OFFSET` → parse 20-byte
-///   `HwParams` record and apply it to playback device 0 on the card.
-///   (Full per-device dispatch is a follow-up; the setsockopt path
-///   is sufficient for a boot smoke.)
+///   `HwParams` record and validate it against a temporary playback lease.
+///   Configure a persistent PCM lease through that PCM file itself.
 /// - `write` at other offsets → parse `"<index> <value>"` ASCII pair
 ///   and call `mixer::set`.
 #[derive(Debug)]
 pub struct SoundControlFile {
     card_index: u32,
+    alsa: Arc<crate::alsa::Control>,
 }
 
 impl SoundControlFile {
     pub fn new(card_index: u32) -> Self {
-        Self { card_index }
+        Self {
+            card_index,
+            alsa: crate::alsa::Control::new(card_index),
+        }
     }
 
     fn render_controls(&self) -> String {
@@ -151,6 +162,31 @@ impl SoundControlFile {
 }
 
 impl FileOps for SoundControlFile {
+    fn open_instance_checked(&self, _write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        crate::mixer(self.card_index).map_err(fs_error)?;
+        Ok(Some(Arc::new(Self::new(self.card_index))))
+    }
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        ctx: &'a dyn narf_filesystem::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        self.alsa.ioctl(cmd, arg, ctx)
+    }
+    fn poll_readiness(&self) -> u32 {
+        self.alsa.readiness().mask()
+    }
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(self.alsa.readiness())
+    }
+    fn is_stream(&self) -> bool {
+        true
+    }
+    fn nonblock_read_eagain(&self) -> bool {
+        true
+    }
+
     /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
     /// the inode is devfs's node for that device.
     fn rdev(&self) -> u64 {
@@ -165,6 +201,9 @@ impl FileOps for SoundControlFile {
     }
 
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        if self.alsa.active() {
+            return self.alsa.read(buf);
+        }
         let content = self.render_controls();
         Box::pin(async move {
             let bytes = content.as_bytes();
@@ -179,6 +218,10 @@ impl FileOps for SoundControlFile {
     }
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        if self.alsa.active() {
+            // Linux control_fops has no write method (FMODE_CAN_WRITE).
+            return Box::pin(async { Err(FsError::InvalidData) });
+        }
         let card_index = self.card_index;
         Box::pin(async move {
             if offset == HW_PARAMS_MAGIC_OFFSET {
@@ -204,7 +247,11 @@ impl FileOps for SoundControlFile {
                 .find(|c| c.index == idx)
                 .ok_or(FsError::NotFound)?;
             let value = if id.kind.is_boolean() {
-                ControlValue::Boolean(matches!(val_str, "1" | "on" | "true"))
+                ControlValue::Boolean(match val_str {
+                    "1" | "on" | "true" => true,
+                    "0" | "off" | "false" => false,
+                    _ => return Err(FsError::InvalidPath),
+                })
             } else {
                 // Accept "left/right" or single integer for both channels.
                 let (l, r) = if let Some(pos) = val_str.find('/') {
@@ -238,300 +285,151 @@ impl FileOps for SoundControlFile {
     }
 }
 
-// ── SoundPcmFile — /dev/snd/pcmC<N>D<M>p and pcmC<N>D<M>c ──────────
-
-/// Playback PCM file: `write` feeds audio samples into the cyclic ring.
-///
-/// On first write the substream is lazily opened and hw_params are set
-/// to a safe default (48 kHz stereo S16).  Callers that need a different
-/// format must send a hw_params record to this PCM file first.
-///
-/// Linux ref: `sound/core/pcm_native.c::snd_pcm_write` — user-space
-/// writes land in the DMA cyclic buffer via `snd_pcm_lib_write`.
-#[derive(Debug)]
-pub struct SoundPcmPlaybackFile {
-    card_index: u32,
-    device: u32,
-    stream: IrqSafeSpinLock<Option<(PlaybackStream, bool)>>,
-}
-
-impl SoundPcmPlaybackFile {
-    pub fn new(card_index: u32, device: u32) -> Self {
-        Self {
-            card_index,
-            device,
-            stream: IrqSafeSpinLock::new(None),
+// PCM file descriptions share the ALSA state machine with the legacy packed
+// parameter interface; one open always owns exactly one hardware lease.
+macro_rules! pcm_file {
+    ($name:ident, $capture:expr) => {
+        #[derive(Debug)]
+        pub struct $name {
+            card_index: u32,
+            device: u32,
+            pcm: Arc<crate::alsa::Pcm>,
         }
-    }
-
-    fn ensure_open(&self) -> Result<(), SoundError> {
-        let mut g = self.stream.lock();
-        if g.is_none() {
-            let mut s = open_playback(self.card_index, self.device)?;
-            s.hw_params(crate::default_hw_params(self.card_index, false)?)?;
-            s.prepare()?;
-            *g = Some((s, false));
+        impl $name {
+            pub fn new(card_index: u32, device: u32) -> Self {
+                Self {
+                    card_index,
+                    device,
+                    pcm: crate::alsa::Pcm::new(card_index, device, $capture),
+                }
+            }
         }
-        Ok(())
-    }
+        impl Drop for $name {
+            fn drop(&mut self) {
+                self.pcm.close();
+            }
+        }
+        impl FileOps for $name {
+            fn open_instance_checked(
+                &self,
+                _write: bool,
+            ) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+                Ok(Some(Arc::new(Self {
+                    card_index: self.card_index,
+                    device: self.device,
+                    pcm: crate::alsa::Pcm::opened(self.card_index, self.device, $capture)?,
+                })))
+            }
+            fn rdev(&self) -> u64 {
+                let minor = if $capture {
+                    crate::sysfs_bridge::pcm_capture_minor(self.card_index, self.device)
+                } else {
+                    crate::sysfs_bridge::pcm_playback_minor(self.card_index, self.device)
+                };
+                narf_filesystem::devfs::linux_makedev(crate::sysfs_bridge::SNDRV_MAJOR, minor)
+            }
+            fn ino(&self) -> u64 {
+                narf_filesystem::devfs::char_device_inode(self.rdev())
+            }
+            fn stat(&self) -> Stat {
+                Stat {
+                    size: 0,
+                    blocks: 0,
+                    mode: Mode {
+                        file_type: FileType::Special,
+                        perms: 0o660,
+                    },
+                    mtime_cycles: 0,
+                }
+            }
+            fn is_stream(&self) -> bool {
+                true
+            }
+            fn nonblock_read_eagain(&self) -> bool {
+                true
+            }
+            fn read<'a>(&'a self, _offset: u64, out: &'a mut [u8]) -> FsFuture<'a, usize> {
+                self.pcm.read(out)
+            }
+            fn write<'a>(&'a self, offset: u64, data: &'a [u8]) -> FsFuture<'a, usize> {
+                self.pcm.write(offset, data)
+            }
+            fn has_flush(&self) -> bool {
+                !$capture
+            }
+            fn flush<'a>(&'a self) -> FsFuture<'a, ()> {
+                self.pcm.flush()
+            }
+            fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
+                self.pcm.flush()
+            }
+            fn ioctl_user<'a>(
+                &'a self,
+                cmd: u32,
+                arg: u64,
+                ctx: &'a dyn narf_filesystem::IoctlContext,
+            ) -> FsFuture<'a, u64> {
+                self.pcm.ioctl(cmd, arg, ctx)
+            }
+            fn as_any(&self) -> Option<&dyn core::any::Any> {
+                Some(self)
+            }
+            fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
+                self.pcm.mmap(offset, len)
+            }
+            fn mmap_max_prot(&self, offset: u64) -> u32 {
+                if matches!(offset, 0x8000_0000 | 0x8200_0000) {
+                    1
+                } else {
+                    3
+                }
+            }
+            fn mmap_backing(
+                &self,
+                offset: u64,
+                len: usize,
+            ) -> Result<narf_filesystem::MmapBacking, FsError> {
+                self.pcm.mmap_backing(offset, len)
+            }
+            fn mmap_lifetime(
+                &self,
+                offset: u64,
+                len: usize,
+            ) -> Option<Arc<dyn narf_filesystem::MmapLifetime>> {
+                self.pcm.mmap_owner(offset, len)
+            }
+            fn validate_mmap(
+                &self,
+                offset: u64,
+                len: usize,
+                prot: u32,
+                flags: u32,
+            ) -> Result<u32, FsError> {
+                self.pcm.validate_mmap(offset, len, prot, flags)
+            }
+            fn poll_readiness(&self) -> u32 {
+                self.pcm.poll()
+            }
+            fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+                Some(self.pcm.readiness())
+            }
+            fn poll_deadline(&self) -> Option<u64> {
+                Some(narf_time::wall::monotonic_ns().saturating_add(1_000_000))
+            }
+        }
+    };
 }
+pcm_file!(SoundPcmPlaybackFile, false);
+pcm_file!(SoundPcmCaptureFile, true);
 
-impl FileOps for SoundPcmPlaybackFile {
-    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
-    /// the inode is devfs's node for that device.
-    fn rdev(&self) -> u64 {
-        narf_filesystem::devfs::linux_makedev(
-            crate::sysfs_bridge::SNDRV_MAJOR,
-            crate::sysfs_bridge::pcm_playback_minor(self.card_index, self.device),
-        )
-    }
-
-    fn ino(&self) -> u64 {
-        narf_filesystem::devfs::char_device_inode(self.rdev())
-    }
-
-    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        // Playback file: reads are not meaningful (no capture data).
-        // Return 0 (EOF) so a cat /dev/snd/pcmC0D0p exits cleanly.
-        Box::pin(async move { Ok(0) })
-    }
-
-    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move {
-            if offset == HW_PARAMS_MAGIC_OFFSET {
-                let params = decode_hw_params(buf).ok_or(FsError::InvalidPath)?;
-                let mut guard = self.stream.lock();
-                guard.take();
-                let mut s =
-                    open_playback(self.card_index, self.device).map_err(|_| FsError::Busy)?;
-                s.hw_params(params).map_err(|_| FsError::InvalidPath)?;
-                s.prepare().map_err(|_| FsError::Unsupported)?;
-                *guard = Some((s, false));
-                return Ok(buf.len());
-            }
-            self.ensure_open().map_err(|_| FsError::Unsupported)?;
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            let deadline = narf_time::Deadline::after_ms(1000);
-            loop {
-                {
-                    let mut guard = self.stream.lock();
-                    let (stream, started) = guard.as_mut().ok_or(FsError::Busy)?;
-                    let n = match stream.write(buf) {
-                        Err(SoundError::BadState) if *started => {
-                            stream.stop().map_err(|_| FsError::Unsupported)?;
-                            stream.prepare().map_err(|_| FsError::Unsupported)?;
-                            *started = false;
-                            stream.write(buf).map_err(|_| FsError::Unsupported)?
-                        }
-                        result => result.map_err(|_| FsError::Unsupported)?,
-                    };
-                    if n != 0 {
-                        if !*started {
-                            stream.start().map_err(|_| FsError::Unsupported)?;
-                            *started = true;
-                        }
-                        return Ok(n);
-                    }
-                }
-                if deadline.expired() {
-                    return Err(FsError::Busy);
-                }
-                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(2).as_instant()).await;
-            }
+pub(crate) fn pcm_from_file(file: &dyn FileOps) -> Option<Arc<crate::alsa::Pcm>> {
+    let any = file.as_any()?;
+    any.downcast_ref::<SoundPcmPlaybackFile>()
+        .map(|f| f.pcm.clone())
+        .or_else(|| {
+            any.downcast_ref::<SoundPcmCaptureFile>()
+                .map(|f| f.pcm.clone())
         })
-    }
-
-    fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: FileType::Special,
-                perms: 0o660,
-            },
-            mtime_cycles: 0,
-        }
-    }
-}
-
-/// Capture PCM file: `read` drains audio samples from the cyclic ring.
-///
-/// Linux ref: `sound/core/pcm_native.c::snd_pcm_read` — user-space
-/// reads are serviced by `snd_pcm_lib_read`.
-#[derive(Debug)]
-pub struct SoundPcmCaptureFile {
-    card_index: u32,
-    device: u32,
-    stream: IrqSafeSpinLock<Option<CaptureStream>>,
-}
-
-impl SoundPcmCaptureFile {
-    pub fn new(card_index: u32, device: u32) -> Self {
-        Self {
-            card_index,
-            device,
-            stream: IrqSafeSpinLock::new(None),
-        }
-    }
-}
-
-impl FileOps for SoundPcmCaptureFile {
-    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
-    /// the inode is devfs's node for that device.
-    fn rdev(&self) -> u64 {
-        narf_filesystem::devfs::linux_makedev(
-            crate::sysfs_bridge::SNDRV_MAJOR,
-            crate::sysfs_bridge::pcm_capture_minor(self.card_index, self.device),
-        )
-    }
-
-    fn ino(&self) -> u64 {
-        narf_filesystem::devfs::char_device_inode(self.rdev())
-    }
-
-    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            let deadline = narf_time::Deadline::after_ms(500);
-            loop {
-                {
-                    let mut guard = self.stream.lock();
-                    if guard.is_none() {
-                        let mut stream = open_capture(self.card_index, self.device)
-                            .map_err(|_| FsError::Busy)?;
-                        stream
-                            .hw_params(
-                                crate::default_hw_params(self.card_index, true)
-                                    .map_err(|_| FsError::Unsupported)?,
-                            )
-                            .map_err(|_| FsError::Unsupported)?;
-                        stream.prepare().map_err(|_| FsError::Unsupported)?;
-                        stream.start().map_err(|_| FsError::Unsupported)?;
-                        *guard = Some(stream);
-                    }
-                    let n = guard
-                        .as_mut()
-                        .unwrap()
-                        .read(buf)
-                        .map_err(|_| FsError::Unsupported)?;
-                    if n != 0 {
-                        return Ok(n);
-                    }
-                }
-                if deadline.expired() {
-                    return Err(FsError::Busy);
-                }
-                narf_time::SleepUntil::new(narf_time::Deadline::after_ms(2).as_instant()).await;
-            }
-        })
-    }
-
-    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        // Capture file: writes not meaningful.
-        Box::pin(async move { Err(FsError::ReadOnly) })
-    }
-
-    fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: FileType::Special,
-                perms: 0o660,
-            },
-            mtime_cycles: 0,
-        }
-    }
-}
-
-// ── Timer / Sequencer stubs ───────────────────────────────────────────
-
-/// `/dev/snd/timer` — global ALSA timer stub.
-///
-/// ALSA timer ioctls (`SNDRV_TIMER_IOCTL_*`) are deferred.  This stub
-/// exists so `open("/dev/snd/timer")` succeeds.
-/// Linux ref: `sound/core/timer.c::snd_timer_user_open`.
-#[derive(Debug)]
-pub struct SoundTimerFile;
-
-impl FileOps for SoundTimerFile {
-    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
-    /// the inode is devfs's node for that device.
-    fn rdev(&self) -> u64 {
-        narf_filesystem::devfs::linux_makedev(
-            crate::sysfs_bridge::SNDRV_MAJOR,
-            33, /* SNDRV_MINOR_TIMER */
-        )
-    }
-
-    fn ino(&self) -> u64 {
-        narf_filesystem::devfs::char_device_inode(self.rdev())
-    }
-
-    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Ok(0) })
-    }
-    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let n = buf.len();
-        Box::pin(async move { Ok(n) })
-    }
-    fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: FileType::Special,
-                perms: 0o660,
-            },
-            mtime_cycles: 0,
-        }
-    }
-}
-
-/// `/dev/snd/seq` — ALSA sequencer stub.
-///
-/// ALSA MIDI sequencer (`SNDRV_SEQ_IOCTL_*`) is deferred.  This stub
-/// exists so `open("/dev/snd/seq")` succeeds.
-/// Linux ref: `sound/core/seq/seq_clientmgr.c::snd_seq_open`.
-#[derive(Debug)]
-pub struct SoundSeqFile;
-
-impl FileOps for SoundSeqFile {
-    /// `st_rdev` = ALSA major 116 with the `include/sound/minors.h` minor;
-    /// the inode is devfs's node for that device.
-    fn rdev(&self) -> u64 {
-        narf_filesystem::devfs::linux_makedev(
-            crate::sysfs_bridge::SNDRV_MAJOR,
-            1, /* SNDRV_MINOR_SEQUENCER */
-        )
-    }
-
-    fn ino(&self) -> u64 {
-        narf_filesystem::devfs::char_device_inode(self.rdev())
-    }
-
-    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Ok(0) })
-    }
-    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let n = buf.len();
-        Box::pin(async move { Ok(n) })
-    }
-    fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: FileType::Special,
-                perms: 0o660,
-            },
-            mtime_cycles: 0,
-        }
-    }
 }
 
 // ── DevSndDir — /dev/snd/ subdirectory ───────────────────────────────
@@ -549,13 +447,6 @@ pub struct DevSndDir;
 
 impl DirOps for DevSndDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-        // Static global devices.
-        match name {
-            "timer" => return Some(Arc::new(SoundTimerFile) as Arc<dyn FileOps>),
-            "seq" => return Some(Arc::new(SoundSeqFile) as Arc<dyn FileOps>),
-            _ => {}
-        }
-
         // controlC<N>
         if let Some(rest) = name.strip_prefix("controlC") {
             let n: u32 = rest.parse().ok()?;
@@ -571,28 +462,28 @@ impl DirOps for DevSndDir {
             let d_pos = rest.find('D')?;
             let n: u32 = rest[..d_pos].parse().ok()?;
             let after_d = &rest[d_pos + 1..];
-            // last char is direction, everything before it is M
-            if after_d.is_empty() {
-                return None;
-            }
-            let dir = after_d.as_bytes()[after_d.len() - 1];
-            let m: u32 = after_d[..after_d.len() - 1].parse().ok()?;
+            // Strip an ASCII suffix before slicing, including for invalid
+            // UTF-8-width suffixes supplied through a userspace pathname.
+            let (number, capture) = after_d
+                .strip_suffix('p')
+                .map(|s| (s, false))
+                .or_else(|| after_d.strip_suffix('c').map(|s| (s, true)))?;
+            let m: u32 = number.parse().ok()?;
             let cards = list_cards();
             let card = cards.iter().find(|c| c.index == n)?;
-            match dir {
-                b'p' => {
+            match capture {
+                false => {
                     if m >= card.playback_count {
                         return None;
                     }
                     return Some(Arc::new(SoundPcmPlaybackFile::new(n, m)) as Arc<dyn FileOps>);
                 }
-                b'c' => {
+                true => {
                     if m >= card.capture_count {
                         return None;
                     }
                     return Some(Arc::new(SoundPcmCaptureFile::new(n, m)) as Arc<dyn FileOps>);
                 }
-                _ => return None,
             }
         }
 
@@ -626,10 +517,7 @@ impl DirOps for DevSndDir {
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {
-        let mut entries: Vec<(String, FileType)> = alloc::vec![
-            ("timer".into(), FileType::Special),
-            ("seq".into(), FileType::Special),
-        ];
+        let mut entries: Vec<(String, FileType)> = Vec::new();
         for card in list_cards() {
             let n = card.index;
             entries.push((format!("controlC{}", n), FileType::Special));
@@ -736,20 +624,20 @@ mod devfs_bridge_tests {
         assert_eq!(n, 4096, "expected 4096 bytes written, got {}", n);
     }
 
-    // Smoke #5: timer node exists.
+    // Unsupported timer devices are not advertised.
     #[test]
-    fn timer_node_exists() {
+    fn timer_node_is_not_advertised() {
         let dir = DevSndDir;
         let node = dir.lookup("timer");
-        assert!(node.is_some(), "timer node missing");
+        assert!(node.is_none(), "unsupported timer node advertised");
     }
 
-    // Smoke #6: seq node exists.
+    // Unsupported MIDI sequencers are not advertised.
     #[test]
-    fn seq_node_exists() {
+    fn seq_node_is_not_advertised() {
         let dir = DevSndDir;
         let node = dir.lookup("seq");
-        assert!(node.is_some(), "seq node missing");
+        assert!(node.is_none(), "unsupported sequencer node advertised");
     }
 
     // Smoke #7: Multi-card — 2 cards → card0 + card1 entries.

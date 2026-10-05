@@ -65,6 +65,7 @@
 
 extern crate alloc;
 
+mod alsa;
 pub mod codec;
 pub mod devfs_bridge;
 pub mod format;
@@ -83,6 +84,9 @@ mod tests;
 
 #[cfg(feature = "kernel-test")]
 mod e2e_tests;
+
+#[cfg(feature = "kernel-test")]
+mod namespace_tests;
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -164,6 +168,7 @@ pub struct SoundCard {
     /// card entry is `Copy`-safe (it doesn't own MMIO state).
     controller_index: usize,
     hardware: Option<alloc::sync::Arc<dyn hardware::PcmDevice>>,
+    parent: Option<narf_bus::BusAddr>,
 }
 
 impl SoundCard {
@@ -181,6 +186,13 @@ static CARD_REGISTRY: narf_lib::sync::IrqSafeSpinLock<Vec<SoundCard>> =
 
 static NEXT_CARD_INDEX: AtomicUsize = AtomicUsize::new(0);
 
+// Serialize publication with teardown and bridge initialization. Never invoke
+// a PCM backend while holding this lock or CARD_REGISTRY.
+static CARD_PUBLICATION: narf_lib::sync::IrqSafeSpinLock<()> =
+    narf_lib::sync::IrqSafeSpinLock::new(());
+static FILESYSTEM_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Register a probed controller as a card. Called from
 /// `hda::controller::probe` after the controller is brought out of
 /// reset and its codecs enumerated.
@@ -192,6 +204,11 @@ pub fn register_card(
     playback_count: u32,
     capture_count: u32,
 ) -> u32 {
+    let _publication = CARD_PUBLICATION.lock();
+    assert!(
+        playback_count <= 8 && capture_count <= 8,
+        "ALSA static PCM minor limit"
+    );
     let index = NEXT_CARD_INDEX.fetch_add(1, Ordering::AcqRel) as u32;
     let info = CardInfo {
         index,
@@ -202,35 +219,79 @@ pub fn register_card(
         capture_count,
     };
     let card = SoundCard {
-        info,
+        info: info.clone(),
         controller_index,
         hardware: None,
+        parent: None,
     };
     CARD_REGISTRY.lock().push(card);
+    publish_card(&info, None);
     index
 }
 
 /// Publish a physical card whose PCM operations reach owned DMA and MMIO.
 pub fn register_hardware_card(
-    mut info: CardInfo,
+    info: CardInfo,
     hardware: alloc::sync::Arc<dyn hardware::PcmDevice>,
 ) -> u32 {
+    register_hardware_card_at(info, hardware, None)
+}
+
+/// Register a hardware card beneath its actual bus device in sysfs.
+pub fn register_hardware_card_at(
+    mut info: CardInfo,
+    hardware: alloc::sync::Arc<dyn hardware::PcmDevice>,
+    parent: Option<narf_bus::BusAddr>,
+) -> u32 {
+    let _publication = CARD_PUBLICATION.lock();
+    assert!(
+        info.playback_count <= 8 && info.capture_count <= 8,
+        "ALSA static PCM minor limit"
+    );
     let index = NEXT_CARD_INDEX.fetch_add(1, Ordering::AcqRel) as u32;
     info.index = index;
     CARD_REGISTRY.lock().push(SoundCard {
-        info,
+        info: info.clone(),
         controller_index: index as usize,
         hardware: Some(hardware),
+        parent,
     });
+    publish_card(&info, parent);
     index
+}
+
+fn publish_card(info: &CardInfo, parent: Option<narf_bus::BusAddr>) {
+    if !FILESYSTEM_READY.load(Ordering::Acquire) {
+        return;
+    }
+    procfs_bridge::register_card_procfs(info);
+    sysfs_bridge::register_card_sysfs_at(info, parent);
 }
 
 /// Remove a native card during driver teardown. Existing stream leases keep
 /// their hardware alive until they have stopped DMA.
 pub fn unregister_hardware_card(index: u32) {
-    CARD_REGISTRY
-        .lock()
-        .retain(|c| c.info.index != index || c.hardware.is_none());
+    let _publication = CARD_PUBLICATION.lock();
+    let removed = {
+        let mut cards = CARD_REGISTRY.lock();
+        cards
+            .iter()
+            .position(|c| c.info.index == index && c.hardware.is_some())
+            .map(|pos| cards.remove(pos))
+    };
+    if let Some(card) = removed {
+        unpublish_card(&card.info);
+        // A backend's Drop can quiesce hardware. Release the publication lock
+        // before letting the last registry-owned reference go.
+        drop(_publication);
+        drop(card);
+    }
+}
+
+fn unpublish_card(info: &CardInfo) {
+    alsa::remove_card(info.index);
+    sysfs_bridge::unregister_card_sysfs(info);
+    narf_filesystem::procfs::unregister_proc(&alloc::format!("asound/card{}", info.index));
 }
 
 /// List every probed sound card. Mirrors `cat /proc/asound/cards`.
@@ -249,8 +310,14 @@ pub fn card_count() -> usize {
 
 /// Reset registry for tests.
 pub fn __reset_for_test() {
-    CARD_REGISTRY.lock().clear();
+    let _publication = CARD_PUBLICATION.lock();
+    let cards = core::mem::take(&mut *CARD_REGISTRY.lock());
+    for card in &cards {
+        unpublish_card(&card.info);
+    }
     NEXT_CARD_INDEX.store(0, Ordering::SeqCst);
+    drop(_publication);
+    drop(cards);
 }
 
 // ── Public stream API ───────────────────────────────────────────────
@@ -447,6 +514,12 @@ pub struct Mixer {
 }
 
 impl Mixer {
+    pub fn control_info(&self, id: ControlId) -> Result<crate::mixer::ControlInfo, SoundError> {
+        if let Some(hardware) = &self.hardware {
+            return hardware.control_info(id);
+        }
+        crate::mixer::info(self.controller_index, id).map_err(SoundError::from)
+    }
     pub fn card(&self) -> u32 {
         self.card
     }
@@ -471,16 +544,49 @@ impl Mixer {
     /// Write a control. Range-checks against the control's
     /// `info.value_max` and emits the underlying codec verb.
     pub fn set_control_value(&self, id: ControlId, val: ControlValue) -> Result<(), SoundError> {
+        let previous = self.get_control_value(id)?;
         if let Some(hardware) = &self.hardware {
-            return hardware.set_control(id, val);
+            hardware.set_control(id, val)?;
+        } else {
+            crate::mixer::set(self.controller_index, id, val).map_err(SoundError::from)?;
         }
-        crate::mixer::set(self.controller_index, id, val).map_err(SoundError::from)
+        if previous != val {
+            crate::alsa::control_changed(self.card, id);
+        }
+        Ok(())
     }
 }
 
 /// Format helper re-export so callers don't have to import the
 /// `format` submodule directly for the common case.
 pub use crate::format::{ChannelCount, SampleRate};
+
+/// Query constraints without claiming or reprogramming an endpoint.
+pub fn pcm_capabilities(card: u32, capture: bool) -> Result<hardware::PcmCapabilities, SoundError> {
+    let hardware = CARD_REGISTRY
+        .lock()
+        .iter()
+        .find(|c| c.info.index == card)
+        .ok_or(SoundError::NoSuchCard)?
+        .hardware
+        .clone();
+    if let Some(hardware) = hardware {
+        return Ok(hardware.capabilities(capture));
+    }
+    Ok(hardware::PcmCapabilities {
+        formats: alloc::vec![
+            SampleFormat::S16LE,
+            SampleFormat::S24LE,
+            SampleFormat::S32LE
+        ],
+        rates: alloc::vec![SampleRate::R44100, SampleRate::R48000, SampleRate::R96000],
+        channels: alloc::vec![ChannelCount::Mono, ChannelCount::Stereo],
+        period_frames: (32, 8192),
+        periods: (2, 32),
+        buffer_bytes: (256, 256 * 1024),
+        period_byte_alignment: 1,
+    })
+}
 
 /// Probe-time entry point. Called by `hda::controller::probe` once
 /// the controller is fully brought up.
@@ -516,14 +622,21 @@ pub fn supported_format(fmt: SampleFormat, rate: SampleRate, channels: ChannelCo
 /// (replaces the existing delegates with fresh instances that still read
 /// from the same live `CARD_REGISTRY`).
 ///
-/// Order:
-///   1. sysfs  — `/sys/class/sound/*` kobjects  (no ordering dep on devfs)
-///   2. devfs  — `/dev/snd/*` character nodes
-///   3. procfs — `/proc/asound/*` generators (stub until Wave-19 API lands)
+/// Install devfs/procfs before announcing complete sysfs card graphs to udev.
 pub fn sound_fs_initcall() {
-    crate::sysfs_bridge::register_all_cards_sysfs();
+    let _publication = CARD_PUBLICATION.lock();
+    narf_filesystem::uevent::begin_boot_udevd_replay();
+    FILESYSTEM_READY.store(true, Ordering::Release);
     crate::devfs_bridge::register_devfs_snd();
     crate::procfs_bridge::register_procfs_asound();
+    let cards: Vec<_> = CARD_REGISTRY
+        .lock()
+        .iter()
+        .map(|card| (card.info.clone(), card.parent))
+        .collect();
+    for (info, parent) in cards {
+        crate::sysfs_bridge::register_card_sysfs_at(&info, parent);
+    }
 }
 
 pub fn register_initcalls() {
@@ -567,4 +680,10 @@ pub mod tests_support {
             Poll::Pending => panic!("poll_once: future is pending"),
         }
     }
+}
+
+/// Quiesce open ALSA streams before a native card enters a power transition.
+/// RESUME restores their previous state after the driver restores the device.
+pub async fn suspend_hardware_card(card: u32) -> Result<(), narf_filesystem::FsError> {
+    alsa::suspend_card(card).await
 }

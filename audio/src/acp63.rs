@@ -218,6 +218,14 @@ impl Drop for Controller {
 #[derive(Debug)]
 struct Card(Arc<Controller>);
 impl PcmDevice for Card {
+    fn capabilities(&self, capture: bool) -> narf_drivers_sound::hardware::PcmCapabilities {
+        let mut caps =
+            narf_drivers_sound::hardware::PcmCapabilities::fixed(self.default_params(capture));
+        caps.period_frames = (512, 1024);
+        caps.buffer_bytes = (16384, 32768);
+        caps.period_byte_alignment = 128;
+        caps
+    }
     fn default_params(&self, _: bool) -> HwParams {
         HwParams {
             format: SampleFormat::S32LE,
@@ -301,7 +309,12 @@ impl PcmHardware for Pcm {
         {
             return Err(SoundError::BadState);
         }
-        state.baseline = self.0.count()?;
+        // Preserve the logical position across PAUSE/RESUME; PREPARE resets
+        // hardware to zero, while a paused stream retains its completed bytes.
+        state.baseline = self
+            .0
+            .count()?
+            .wrapping_sub(state.ring.as_ref().unwrap().hardware);
         let mmio = self.0.mmio;
         // SAFETY: Stream lock serializes access; fixed registers lie within the controller's validated mapping.
         unsafe {
@@ -325,6 +338,23 @@ impl PcmHardware for Pcm {
     }
     fn stop(&mut self) -> Result<(), SoundError> {
         self.0.stop(&mut self.0.capture.lock())
+    }
+    fn reset(&mut self) -> Result<(), SoundError> {
+        let mut state = self.0.capture.lock();
+        self.0.update(&mut state);
+        let ring = state.ring.as_mut().ok_or(SoundError::BadState)?;
+        ring.application = ring.hardware;
+        Ok(())
+    }
+    fn pause(&mut self, paused: bool) -> Result<(), SoundError> {
+        if !paused {
+            return self.start();
+        }
+        let mut state = self.0.capture.lock();
+        self.0.update(&mut state);
+        self.0.stop(&mut state)?;
+        state.ring.as_mut().ok_or(SoundError::BadState)?.prepared = true;
+        Ok(())
     }
     fn pointer(&self) -> u64 {
         let mut state = self.0.capture.lock();
@@ -413,7 +443,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         playback_count: 0,
         capture_count: 1,
     };
-    let card = narf_drivers_sound::register_hardware_card(info, Arc::new(Card(dev.clone())));
+    let card = narf_drivers_sound::register_hardware_card_at(
+        info,
+        Arc::new(Card(dev.clone())),
+        Some(device.addr),
+    );
     *CONTROLLER.lock() = Some((dev.clone(), card));
     let weak = Arc::downgrade(&dev);
     narf_scheduler::spawn(async move {
@@ -585,6 +619,24 @@ mod tests {
             || pcm.read(&mut output) != Ok(0)
         {
             return TestResult::Fail("ACP completed capture data");
+        }
+        if pcm.pause(true).is_err() || pcm.pointer() != 512 {
+            return TestResult::Fail("ACP pause preserves position");
+        }
+        // SAFETY: this fixture owns the fake counter register window. Model a
+        // changed physical count across the stopped interval, then fresh DMA.
+        unsafe {
+            dev.mmio.write32(COUNT_LOW, 0x1ff0);
+        }
+        if pcm.pointer() != 512 || pcm.pause(false).is_err() || pcm.pointer() != 512 {
+            return TestResult::Fail("ACP resume preserves logical baseline");
+        }
+        // SAFETY: same live fake counter registers as above.
+        unsafe {
+            dev.mmio.write32(COUNT_LOW, 0x2ff0);
+        }
+        if pcm.pointer() != 1024 || pcm.reset().is_err() || pcm.read(&mut output) != Ok(0) {
+            return TestResult::Fail("ACP resumed progress and application reset");
         }
         fixture.model.stall_stop = true;
         if pcm.stop().is_ok() {

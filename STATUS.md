@@ -40,8 +40,14 @@ speaker automute. Timeout paths retain DMA until the hardware is quiescent.
 Fake-device tests cover command transport, DMA accounting, capture overrun
 and failed-stop retention. QEMU HDA exercises playback across buffer wrap,
 capture and capability revocation. Physical Lenovo 50ee validation is pending.
-SoundWire, HDMI/DP audio, vendor smart-amplifier quirks, suspend/resume and
-Linux ALSA ioctl/mmap compatibility remain open. See
+The shared sound bridge implements Linux ALSA PCM/control ioctls, mmap data
+and pointer synchronization, poll readiness and Linux errno translation.
+An unmodified alsa-lib probe exercises HDA/VirtIO playback and HDA capture
+through those syscalls, including linked pause, boundary-mode playback and
+user controls with TLV/events. The implemented ALSA contract is listed in
+[sound §3.1](drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi).
+SoundWire, HDMI/DP audio, vendor smart-amplifier quirks and system power-transition
+reinitialization remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
 ## USB-C and Phoenix USB4

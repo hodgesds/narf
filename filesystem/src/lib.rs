@@ -797,12 +797,23 @@ pub enum FsError {
     /// remaining readers. Maps to POSIX `EPIPE`; the syscall layer also
     /// raises SIGPIPE on the writer.
     BrokenPipe,
+    /// PCM underrun or overrun (EPIPE), without the SIGPIPE side effect of
+    /// writing to a pipe or socket whose peer closed.
+    StreamXrun,
+    /// A suspended PCM stream needs RESUME or PREPARE (ESTRPIPE).
+    StreamSuspended,
     /// The operation ran against a descriptor whose open mode forbids it —
     /// reading a write-only pipe end, writing a read-only one. Linux fails
     /// these with `EBADF` from the `f_mode` checks in
     /// `fs/read_write.c::vfs_read` / `vfs_write` (FMODE_READ/FMODE_WRITE),
     /// before the file op is ever called. Maps to `EBADF`.
     BadFd,
+    /// Descriptor exists, but its device state forbids the operation
+    /// (Linux EBADFD, distinct from EBADF). ALSA uses this for unconfigured,
+    /// disconnected, or otherwise incorrectly sequenced PCM operations.
+    BadFileState,
+    /// Device has no implementation for this addressed facility (ENXIO).
+    NoDeviceAddress,
     /// The file is open and healthy but has nothing to give right now — an
     /// eventfd whose counter is 0, an unexpired timerfd, an empty pipe with a
     /// live writer, an empty socket with a live peer.
@@ -831,6 +842,23 @@ pub enum FsError {
 pub trait MmapLifetime: Send + Sync {}
 
 impl<T: Send + Sync> MmapLifetime for T {}
+
+/// Frames paired with their owner. Devices with replaceable storage acquire
+/// both under one lock, preventing reconfiguration between an ownership
+/// lookup and a frame lookup.
+pub struct MmapBacking {
+    pub frames: Vec<u64>,
+    pub lifetime: Option<Arc<dyn MmapLifetime>>,
+}
+
+impl core::fmt::Debug for MmapBacking {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MmapBacking")
+            .field("frames", &self.frames)
+            .field("has_lifetime", &self.lifetime.is_some())
+            .finish()
+    }
+}
 
 impl From<CapError> for FsError {
     /// Cap-side errors collapse to `PermissionDenied` at the FS layer.
@@ -862,6 +890,23 @@ pub type FsFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, FsError>> + Sen
 pub struct FsIoctlReply {
     pub result: i32,
     pub output: Vec<u8>,
+}
+
+/// Fault-contained userspace access for device ioctls, including nested
+/// pointers. Implemented by the syscall boundary; devices never dereference
+/// process addresses. The context is valid only during the calling syscall.
+pub trait IoctlContext: Sync {
+    fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), FsError>;
+    fn write(&self, address: u64, source: &[u8]) -> Result<(), FsError>;
+    fn nonblocking(&self) -> bool;
+    /// Resolve a descriptor in the calling process without exposing its table
+    /// to a driver. The retained open description also handles dup/fork.
+    fn file(&self, _fd: i32) -> Result<Arc<dyn FileOps>, FsError> {
+        Err(FsError::BadFd)
+    }
+    fn process_id(&self) -> u32 {
+        0
+    }
 }
 
 /// Filesystem-native quota inheritance requested while creating a snapshot.
@@ -1319,6 +1364,17 @@ pub trait FileOps: Send + Sync {
         Err(FsError::Unsupported)
     }
 
+    /// Device ioctl with guarded pointer access and the open description's
+    /// current O_NONBLOCK flag. Legacy implementations retain their dispatch.
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        _context: &'a dyn IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move { self.ioctl(cmd, arg as usize) })
+    }
+
     /// Asynchronous ioctl transport for remote filesystems such as FUSE.
     ///
     /// `input` and `out_size` are derived from Linux `_IOC_DIR/_IOC_SIZE`;
@@ -1356,6 +1412,30 @@ pub trait FileOps: Send + Sync {
     /// override this.
     fn mmap_frames(&self, _offset: u64, _len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
         Err(FsError::Unsupported)
+    }
+
+    /// Device-specific mapping checks before any VMA replacement or backing
+    /// allocation. `len` is page-rounded; prot/flags are Linux mmap bits.
+    fn validate_mmap(
+        &self,
+        _offset: u64,
+        _len: usize,
+        _prot: u32,
+        _flags: u32,
+    ) -> Result<u32, FsError> {
+        Ok(_prot)
+    }
+
+    /// Maximum PROT_READ/WRITE/EXEC bits for this device offset. The mapping
+    /// owner enforces this on later mprotect calls as well as initial mmap.
+    fn mmap_max_prot(&self, _offset: u64) -> u32 {
+        7
+    }
+
+    fn mmap_backing(&self, offset: u64, len: usize) -> Result<MmapBacking, FsError> {
+        let lifetime = self.mmap_lifetime(offset, len);
+        let frames = self.mmap_frames(offset, len)?;
+        Ok(MmapBacking { frames, lifetime })
     }
 
     /// True only when mmap_frames/mmap_fault return ordinary allocator RAM

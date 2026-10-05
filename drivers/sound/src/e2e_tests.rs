@@ -269,7 +269,7 @@ fn e2e_smoke_pcm_prepare_bdl_programmed() -> TestResult {
     }
 
     // Each BDL entry has IOC=1, length=period_bytes, and a non-null addr.
-    let period_bytes = (period_size * bytes_per_frame) as u32;
+    let period_bytes = period_size * bytes_per_frame;
     for (i, entry) in s.bdl.iter().enumerate() {
         if entry.length != period_bytes {
             return TestResult::Fail("BDL entry length wrong");
@@ -383,9 +383,7 @@ fn e2e_smoke_pcm_write_4096_bytes_visible_in_dma() -> TestResult {
     }
 
     // Build 4096 bytes of recognisable test data.
-    let samples: alloc::vec::Vec<u8> = (0u16..2048u16)
-        .flat_map(|i| (i as u16).to_le_bytes())
-        .collect();
+    let samples: alloc::vec::Vec<u8> = (0u16..2048u16).flat_map(|i| i.to_le_bytes()).collect();
     assert_eq!(samples.len(), 4096);
 
     let written = match s.write(&samples) {

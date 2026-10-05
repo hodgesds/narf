@@ -30,8 +30,11 @@ jack-sense. A sound-card registry assigns card indices and keeps a card
 alive while a stream lease is outstanding; one hardware lease owns a
 direction/device pair. Three bridges publish this to the filesystem —
 `/dev/snd` via devfs, plus sysfs and procfs card information — through an
-init call. These are ALSA-style interfaces; binary Linux ALSA ioctl/mmap
-compatibility and USB Audio Class are separate work.
+init call. The file bridge implements Linux ALSA PCM/control ioctls, shared
+sample mappings, pointer synchronization and poll readiness. See the
+[specification](specification/spec.md#31-linux-alsa-pcm-and-control-abi) for
+supported requests and hardware capability limits. USB Audio Class is
+separate work.
 
 Native HDA and ACP engines live in `narf-audio` and register their
 hardware PCM/mixer backends here; this crate's older software

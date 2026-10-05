@@ -1889,7 +1889,10 @@ fn open_impl_reserved(
                         // `lookup_open`'s `if (!dir_inode->i_op->create)
                         // { error = -EACCES; ... }` — sysfs answers EACCES.
                         narf_filesystem::FsError::Unsupported => 13,      // EACCES
-                        narf_filesystem::FsError::BrokenPipe => 32,       // EPIPE
+                        narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun => 32,       // EPIPE
+                        narf_filesystem::FsError::BadFileState => 77,
+                        narf_filesystem::FsError::StreamSuspended => 86,
+                        narf_filesystem::FsError::NoDeviceAddress => 6,
                         narf_filesystem::FsError::BadFd => 9,             // EBADF
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
                         narf_filesystem::FsError::NoSpace => 28,
@@ -4706,8 +4709,11 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::QuotaExceeded => 122,
         // ENOTCONN — see `FsError::NotConnected`.
         narf_filesystem::FsError::NotConnected => 107,
-        narf_filesystem::FsError::BrokenPipe => 32,
+        narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun => 32,
         narf_filesystem::FsError::BadFd => 9,
+        narf_filesystem::FsError::BadFileState => 77,
+        narf_filesystem::FsError::StreamSuspended => 86,
+        narf_filesystem::FsError::NoDeviceAddress => 6,
         narf_filesystem::FsError::WouldBlock => EAGAIN,
     }
 }
@@ -9979,6 +9985,9 @@ fn mprotect_core(
     len: u64,
     prot: u32,
 ) -> Result<(), i64> {
+    if !crate::mapped_file::protection_allowed(as_ref.identity(), base.as_u64(), len, prot) {
+        return Err(EACCES);
+    }
     let mut perms = RegionPerms(0);
     if prot & 0b001 != 0 {
         perms = perms | RegionPerms::READ;

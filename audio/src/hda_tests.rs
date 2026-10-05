@@ -290,6 +290,45 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
     if reader.read(&mut captured) != Err(crate::AudioReadError::StreamClosed) {
         return TestResult::Fail("capture revocation must stop DMA");
     }
+    drop(reader);
+
+    // Exercise the same hardware through actual per-open devfs instances.
+    use narf_filesystem::FsInstance;
+    narf_drivers_sound::sound_fs_initcall();
+    let Some(card) = narf_drivers_sound::list_cards()
+        .into_iter()
+        .find(|card| card.driver == "hda")
+    else {
+        return TestResult::Fail("HDA missing from sound registry");
+    };
+    let snd = narf_filesystem::devfs::DevFs::new()
+        .root()
+        .lookup_dir("snd")
+        .unwrap();
+    let playback_node = snd
+        .lookup(&alloc::format!("pcmC{}D0p", card.index))
+        .unwrap();
+    let playback = match playback_node.open_instance_checked(true) {
+        Ok(Some(file)) => file,
+        _ => return TestResult::Fail("HDA devfs playback open"),
+    };
+    if narf_scheduler::block_on(playback.write(0, &silence)) != Ok(silence.len())
+        || narf_scheduler::block_on(playback.flush()).is_err()
+    {
+        return TestResult::Fail("HDA devfs playback/drain");
+    }
+    drop(playback);
+    let capture_node = snd
+        .lookup(&alloc::format!("pcmC{}D0c", card.index))
+        .unwrap();
+    let capture = match capture_node.open_instance_checked(false) {
+        Ok(Some(file)) => file,
+        _ => return TestResult::Fail("HDA devfs capture open"),
+    };
+    if !matches!(narf_scheduler::block_on(capture.read(0, &mut captured)), Ok(n) if n > 0 && n % 4 == 0)
+    {
+        return TestResult::Fail("HDA devfs capture DMA progress");
+    }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]

@@ -606,9 +606,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         playback_count: u32::from(!dev.outputs.is_empty()),
         capture_count: u32::from(dev.input.is_some()),
     };
-    let card = narf_drivers_sound::register_hardware_card(
+    let card = narf_drivers_sound::register_hardware_card_at(
         info,
         Arc::new(super::stream::Card(dev.clone())),
+        Some(device.addr),
     );
     CONTROLLERS.lock().push((device.addr, dev.clone(), card));
     let weak = Arc::downgrade(&dev);

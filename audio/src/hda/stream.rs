@@ -161,20 +161,29 @@ impl Stream {
         let now = narf_time::now_cycles();
         let wrap_ns = ring.bytes as u64 * 1_000_000_000 / (48_000 * ring.frame_bytes as u64);
         if position >= ring.bytes as u32
-            || now.wrapping_sub(self.last_sample) >= narf_time::wall::ns_to_cycles(wrap_ns)
+            || (!ring.free_running
+                && now.wrapping_sub(self.last_sample) >= narf_time::wall::ns_to_cycles(wrap_ns))
             || dev.irq.failed.load(Ordering::Acquire)
         {
             ring.xrun = true;
             let _ = self.stop(dev);
             return;
         }
-        let delta = (position + ring.bytes as u32 - self.last_position) % ring.bytes as u32;
+        let mut delta =
+            ((position + ring.bytes as u32 - self.last_position) % ring.bytes as u32) as u64;
+        if ring.free_running {
+            let elapsed = now.wrapping_sub(self.last_sample);
+            let wrap_cycles = narf_time::wall::ns_to_cycles(wrap_ns).max(1);
+            let expected = (elapsed as u128 * ring.bytes as u128 / wrap_cycles as u128) as u64;
+            delta += (expected.saturating_sub(delta) + ring.bytes as u64 / 2) / ring.bytes as u64
+                * ring.bytes as u64;
+        }
         self.last_position = position;
         self.last_sample = now;
-        ring.hardware += delta as u64;
+        ring.hardware += delta;
         // Clear retired playback samples before the controller can wrap over them.
-        if !self.capture {
-            for byte in ring.hardware.saturating_sub(delta as u64)..ring.hardware {
+        if !self.capture && !ring.free_running {
+            for byte in ring.hardware.saturating_sub(delta)..ring.hardware {
                 // SAFETY: Only retired playback bytes are cleared; modulo bounds every DMA-buffer offset.
                 unsafe {
                     ring.data
@@ -185,7 +194,7 @@ impl Stream {
             }
         }
         if (self.capture && ring.hardware.saturating_sub(ring.application) > ring.bytes as u64)
-            || (!self.capture && ring.hardware >= ring.application)
+            || (!self.capture && !ring.free_running && ring.hardware >= ring.application)
         {
             // Playback at the queued end is stopped; drain can report completion.
             // A subsequent write requires prepare, avoiding stale cyclic replay.
@@ -198,6 +207,18 @@ impl Stream {
 #[derive(Debug)]
 pub(super) struct Card(pub Arc<IntelHda>);
 impl PcmDevice for Card {
+    fn capabilities(&self, _: bool) -> narf_drivers_sound::hardware::PcmCapabilities {
+        use narf_drivers_sound::hardware::PcmCapabilities;
+        PcmCapabilities {
+            formats: alloc::vec![SampleFormat::S16LE, SampleFormat::S32LE],
+            rates: alloc::vec![SampleRate::R48000],
+            channels: alloc::vec![ChannelCount::Stereo],
+            period_frames: (16, 32768),
+            periods: (2, 256),
+            buffer_bytes: (4096, 256 * 1024),
+            period_byte_alignment: 128,
+        }
+    }
     fn controls(&self) -> alloc::vec::Vec<narf_drivers_sound::mixer::ControlId> {
         self.0.mixer_controls()
     }
@@ -273,6 +294,58 @@ impl PcmHardware for Pcm {
         self.dev.streams[usize::from(self.capture)]
             .lock()
             .stop(&self.dev)
+    }
+    fn pause(&mut self, paused: bool) -> Result<(), SoundError> {
+        let mut state = self.dev.streams[usize::from(self.capture)].lock();
+        if !paused {
+            return state.start(&self.dev);
+        }
+        state.update(&self.dev);
+        let index = state.index;
+        // SAFETY: the stream lock owns this validated descriptor. Only RUN
+        // is cleared; BDL, position and all buffered samples remain intact.
+        unsafe {
+            self.dev
+                .bar0
+                .write8(sd_base(index), self.dev.bar0.read8(sd_base(index)) & !2);
+        }
+        // SAFETY: same descriptor range and serialization as above.
+        if !super::runtime::wait(
+            // SAFETY: the validated controller mapping and stream lock remain live.
+            || unsafe { self.dev.bar0.read8(sd_base(index)) } & 2 == 0,
+            100,
+        ) {
+            return Err(SoundError::BadState);
+        }
+        state.ring.as_mut().ok_or(SoundError::BadState)?.running = false;
+        Ok(())
+    }
+    fn reset(&mut self) -> Result<(), SoundError> {
+        let mut state = self.dev.streams[usize::from(self.capture)].lock();
+        state.update(&self.dev);
+        let ring = state.ring.as_mut().ok_or(SoundError::BadState)?;
+        ring.application = ring.hardware;
+        Ok(())
+    }
+    fn free_running(&mut self, enabled: bool) -> Result<(), SoundError> {
+        self.dev.streams[usize::from(self.capture)]
+            .lock()
+            .ring
+            .as_mut()
+            .ok_or(SoundError::BadState)?
+            .free_running = enabled;
+        Ok(())
+    }
+    fn overwrite(&mut self, frame: u64, data: &[u8]) -> Result<(), SoundError> {
+        if self.capture {
+            return Err(SoundError::BadState);
+        }
+        self.dev.streams[0]
+            .lock()
+            .ring
+            .as_mut()
+            .ok_or(SoundError::BadState)?
+            .overwrite(frame, data)
     }
     fn pointer(&self) -> u64 {
         let mut state = self.dev.streams[usize::from(self.capture)].lock();

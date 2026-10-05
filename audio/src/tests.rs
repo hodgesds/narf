@@ -76,6 +76,100 @@ pub(crate) fn restore_audio_probe_state() {
 /// the boot.
 pub(crate) struct AudioProbeRestore;
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_virtio_sound_devfs_pcm_and_sysfs() -> TestResult {
+    use narf_drivers_sound::tests_support::poll_once;
+    use narf_drivers_virtio::snd_pci;
+    use narf_filesystem::FsInstance;
+
+    if !narf_bus::devices().iter().any(|d| {
+        d.id.vendor == snd_pci::VIRTIO_SND_PCI_VENDOR
+            && d.id.device == snd_pci::VIRTIO_SND_PCI_DEVICE
+    }) {
+        return TestResult::Skip("no virtio-snd-pci");
+    }
+    snd_pci::__reset_for_test();
+    let _restore = AudioProbeRestore;
+    restore_audio_probe_state();
+    narf_drivers_sound::sound_fs_initcall();
+    let result = (|| -> Result<(), &'static str> {
+        let card = narf_drivers_sound::list_cards()
+            .into_iter()
+            .find(|card| card.driver == "virtio-sound")
+            .ok_or("VirtIO is absent from sound registry")?;
+        let root = narf_filesystem::sysfs::SysFs::new().root();
+        let vendor = poll_once(narf_filesystem::resolve_async(
+            root,
+            &alloc::format!("class/sound/card{}/device/vendor", card.index),
+        ))
+        .map_err(|_| "VirtIO sound has no physical PCI parent")?;
+        let mut buf = [0; 32];
+        let count = poll_once(vendor.read(0, &mut buf)).map_err(|_| "PCI vendor read failed")?;
+        if &buf[..count] != b"0x1af4\n" {
+            return Err("VirtIO sound has the wrong PCI parent");
+        }
+        let snd = narf_filesystem::devfs::DevFs::new()
+            .root()
+            .lookup_dir("snd")
+            .ok_or("/dev/snd missing")?;
+        let name = alloc::format!("pcmC{}D0p", card.index);
+        let file = snd.lookup(&name).ok_or("VirtIO playback node missing")?;
+        // Cross the old scratch-buffer limit and the request/status boundary.
+        if poll_once(file.write(0, &[0x42; 8192])).map_err(|_| "VirtIO devfs playback failed")?
+            != 8192
+        {
+            return Err("VirtIO devfs playback returned the wrong byte count");
+        }
+        if narf_drivers_sound::open_playback(card.index, 0).is_ok() {
+            return Err("VirtIO PCM lease was not exclusive");
+        }
+        if snd_pci::play_buffer(snd_pci::PcmParams::default_playback(), &[0; 16]).is_ok() {
+            return Err("kernel submit bypassed the PCM lease");
+        }
+        poll_once(file.flush()).map_err(|_| "VirtIO drain/stop failed")?;
+        drop(file);
+        let file = snd
+            .lookup(&name)
+            .ok_or("VirtIO playback disappeared after close")?;
+        let mut params = [0; 20];
+        for (slot, value) in params.chunks_exact_mut(4).zip([0u32, 44100, 1, 1024, 4]) {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        poll_once(file.write(
+            narf_drivers_sound::devfs_bridge::HW_PARAMS_MAGIC_OFFSET,
+            &params,
+        ))
+        .map_err(|_| "VirtIO PCM reconfiguration failed")?;
+        if poll_once(file.write(0, &[0; 1024]))
+            .map_err(|_| "reconfigured VirtIO playback failed")?
+            != 1024
+        {
+            return Err("reconfigured VirtIO byte count mismatch");
+        }
+        poll_once(file.flush()).map_err(|_| "reconfigured PCM drain failed")?;
+        // QEMU 10.2 derives PCM_INFO.channels_max from the last prepared
+        // voice (hw/audio/virtio-snd.c::virtio_snd_pcm_prepare). Restore the
+        // stereo fixture before a later test resets and queries the device.
+        for (slot, value) in params.chunks_exact_mut(4).zip([0u32, 48000, 2, 1024, 4]) {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
+        poll_once(file.write(
+            narf_drivers_sound::devfs_bridge::HW_PARAMS_MAGIC_OFFSET,
+            &params,
+        ))
+        .map_err(|_| "restoring VirtIO stereo configuration failed")?;
+        poll_once(file.write(0, &[0; 16])).map_err(|_| "restoring VirtIO stereo voice failed")?;
+        poll_once(file.flush()).map_err(|_| "restored VirtIO PCM drain failed")?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("audio/virtio-snd", smoke_virtio_sound_devfs_pcm_and_sysfs);
+
 impl Drop for AudioProbeRestore {
     fn drop(&mut self) {
         restore_audio_probe_state();
@@ -173,7 +267,10 @@ fn smoke_audio_submit_shmem_zero_copy() -> TestResult {
 
     let h = shmem_create(0, 4096).expect("shmem_create");
     let cap = bootstrap_writer();
-    let writer = AudioWriter::open(cap, AudioFormat::default_playback()).expect("open");
+    let writer = match AudioWriter::open(cap, AudioFormat::default_playback()) {
+        Ok(writer) => writer,
+        Err(_) => return TestResult::Fail("AudioWriter shmem open"),
+    };
 
     // Valid zero-copy submit.
     if writer.submit_shmem(h, 0, 1024).is_err() {

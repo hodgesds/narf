@@ -17,6 +17,7 @@ pub(crate) struct Ring {
     pub running: bool,
     pub prepared: bool,
     pub xrun: bool,
+    pub free_running: bool,
 }
 
 impl Ring {
@@ -59,6 +60,7 @@ impl Ring {
             running: false,
             prepared: false,
             xrun: false,
+            free_running: false,
         })
     }
 
@@ -83,6 +85,9 @@ impl Ring {
         if input.len() % self.frame_bytes != 0 {
             return Err(SoundError::InvalidParams);
         }
+        if self.free_running && self.application < self.hardware {
+            self.application = self.hardware;
+        }
         let queued = self
             .application
             .saturating_sub(self.hardware)
@@ -101,6 +106,25 @@ impl Ring {
         fence(Ordering::Release);
         self.application += n as u64;
         Ok(n)
+    }
+
+    pub fn overwrite(&mut self, frame: u64, input: &[u8]) -> Result<(), SoundError> {
+        if !self.prepared || input.len() > self.bytes || input.len() % self.frame_bytes != 0 {
+            return Err(SoundError::InvalidParams);
+        }
+        let offset = (frame % (self.bytes / self.frame_bytes) as u64) as usize * self.frame_bytes;
+        for (i, byte) in input.iter().enumerate() {
+            // SAFETY: owned DMA buffer; every offset is bounded by the ring.
+            // As for ALSA mmap, DMA may read samples concurrently with stores.
+            unsafe {
+                self.data
+                    .cpu_mut_ptr::<u8>()
+                    .add((offset + i) % self.bytes)
+                    .write_volatile(*byte);
+            }
+        }
+        fence(Ordering::Release);
+        Ok(())
     }
 
     pub fn read(&mut self, output: &mut [u8]) -> Result<usize, SoundError> {
