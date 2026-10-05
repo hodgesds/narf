@@ -230,8 +230,18 @@ pub const F_SEAL_SHRINK: u32 = 0x0002;
 pub const F_SEAL_GROW: u32 = 0x0004;
 /// `F_SEAL_WRITE` — no writes at all.
 pub const F_SEAL_WRITE: u32 = 0x0008;
-/// Mask of all valid seal bits.
-pub const F_SEAL_ALL: u32 = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+/// `F_SEAL_FUTURE_WRITE` — no new write access (write(2), new shared
+/// writable mmap) while mappings that already exist stay writable. Firefox
+/// seals its IPC shared memory this way before handing a read-only view to
+/// child processes.
+pub const F_SEAL_FUTURE_WRITE: u32 = 0x0010;
+/// `F_SEAL_EXEC` — the file's exec mode bits may no longer change.
+pub const F_SEAL_EXEC: u32 = 0x0020;
+/// Mask of all valid seal bits: Linux `mm/memfd.c::F_ALL_SEALS`.
+pub const F_SEAL_ALL: u32 =
+    F_SEAL_SEAL | F_SEAL_EXEC | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
+/// Seals that forbid new write access: Linux `mm/memfd.c::is_write_sealed`.
+const F_SEAL_ANY_WRITE: u32 = F_SEAL_WRITE | F_SEAL_FUTURE_WRITE;
 
 /// Why `MemFdFile::add_seals` refused. `fcntl(F_ADD_SEALS)` reports the two
 /// cases with different errnos — an undefined seal bit is -EINVAL, while a
@@ -376,12 +386,22 @@ impl MemFdFile {
         if (new_seals & !F_SEAL_ALL) != 0 {
             return Err(SealError::Invalid);
         }
-        let cur = self.seals.load(Ordering::Acquire);
-        if (cur & F_SEAL_SEAL) != 0 {
-            return Err(SealError::Denied);
-        }
-        self.seals.store(cur | new_seals, Ordering::Release);
-        Ok(())
+        // LINUX-GAP: `F_SEAL_EXEC` on a file with exec bits also implies
+        // SHRINK|GROW|WRITE|FUTURE_WRITE, but a NARF memfd's mode never
+        // carries exec bits (`stat` reports `Mode::FILE_RW`), so the
+        // implication cannot apply yet. Linux's `F_SEAL_WRITE` additionally
+        // fails with EBUSY while writable shared mappings exist; NARF does
+        // not track them per memfd.
+        //
+        // A CAS loop rather than load-then-store, so two concurrent sealers
+        // cannot drop each other's bits or slip past a racing F_SEAL_SEAL
+        // (Linux serialises this under `inode_lock`).
+        self.seals
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                ((cur & F_SEAL_SEAL) == 0).then_some(cur | new_seals)
+            })
+            .map(|_| ())
+            .map_err(|_| SealError::Denied)
     }
 }
 
@@ -454,7 +474,8 @@ impl FileOps for MemFdFile {
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let seals = self.seals.load(Ordering::Acquire);
-            if (seals & F_SEAL_WRITE) != 0 {
+            // `mm/shmem.c::shmem_write_begin`: either write seal is EPERM.
+            if (seals & F_SEAL_ANY_WRITE) != 0 {
                 return Err(FsError::OperationNotPermitted);
             }
             let mut g = self.store.lock();
@@ -521,6 +542,31 @@ impl FileOps for MemFdFile {
     /// what makes wl_shm work: the compositor sees the client's pixels.
     fn mmap_is_ram(&self) -> bool {
         true
+    }
+
+    /// `mm/memfd.c::check_write_seal`, reached from `do_mmap` after the
+    /// file-mode checks: under either write seal a new `MAP_SHARED` mapping
+    /// with `PROT_WRITE` is EPERM. Private mappings are copy-on-write, so
+    /// their writability is irrelevant to the seal.
+    ///
+    /// LINUX-GAP: Linux also clears `VM_MAYWRITE` on a read-only shared
+    /// mapping created under the seal, so a later `mprotect(PROT_WRITE)` is
+    /// EACCES. NARF has no per-mapping may-write bit to record that in.
+    fn validate_mmap(
+        &self,
+        _offset: u64,
+        _len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<u32, FsError> {
+        const PROT_WRITE: u32 = 0x2;
+        const MAP_TYPE: u32 = 0x0f;
+        const MAP_PRIVATE: u32 = 0x02;
+        let shared = flags & MAP_TYPE != MAP_PRIVATE;
+        if shared && prot & PROT_WRITE != 0 && self.seals() & F_SEAL_ANY_WRITE != 0 {
+            return Err(FsError::OperationNotPermitted);
+        }
+        Ok(prot)
     }
 
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<alloc::vec::Vec<u64>, FsError> {
