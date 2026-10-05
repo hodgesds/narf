@@ -753,6 +753,10 @@ pub struct SocketFile {
     /// socket() time. Keys AF_INET bind tables and selects namespace-scoped
     /// netlink, routing, interface, and netfilter views.
     net_ns_id: core::sync::atomic::AtomicU64,
+    /// `AF_INET` `SOCK_DGRAM` / `IPPROTO_ICMP` state. It is deliberately
+    /// separate from the UDP endpoint state: ICMP echo identifiers are not
+    /// UDP ports, and the packet/RX queues live in `narf_net::icmp_sock`.
+    icmp_echo: IrqSafeSpinLock<IcmpEchoState>,
     /// Filesystem identity of this socket's bound pathname, if any.  Keep it
     /// with the endpoint so close/listen unregister the same inode even if an
     /// fd crossed into a different mount namespace.
@@ -930,6 +934,17 @@ pub struct SocketFile {
     /// poll_readiness reconciles it against `subscribed && reader.has_pending()`.
     /// notify(0) stays belt-and-suspenders during the migration.
     uevent_readiness: Arc<narf_lib::readiness::Readiness>,
+}
+
+/// Per-open ICMP echo compatibility state. The net socket is allocated on
+/// first use, after `sys_socket` has installed the creator's network
+/// namespace; it therefore cannot accidentally join the initial namespace.
+#[derive(Default)]
+struct IcmpEchoState {
+    socket: Option<Arc<narf_net::icmp_sock::IcmpEchoSocket>>,
+    local_addr: u32,
+    peer: Option<u32>,
+    bound: bool,
 }
 
 static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
@@ -1712,6 +1727,7 @@ impl SocketFile {
             pending_error: IrqSafeSpinLock::new(None),
             sk_shutdown: AtomicU8::new(0),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
+            icmp_echo: IrqSafeSpinLock::new(IcmpEchoState::default()),
             bound_unix_path: IrqSafeSpinLock::new(None),
             connected_unix_path: IrqSafeSpinLock::new(None),
             #[cfg(feature = "container")]
@@ -2623,6 +2639,24 @@ impl SocketFile {
         self.net_ns_id.load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    #[inline]
+    fn is_inet_icmp_echo(&self) -> bool {
+        self.domain == AF_INET && self.kind == SOCK_DGRAM && self.protocol == IPPROTO_ICMP
+    }
+
+    /// `ping_init_sock`: create the net-layer socket only after the creator's
+    /// namespace has been stamped on this file description.
+    fn ensure_icmp_echo_socket(&self) -> Arc<narf_net::icmp_sock::IcmpEchoSocket> {
+        let mut echo = self.icmp_echo.lock();
+        echo.socket
+            .get_or_insert_with(|| narf_net::icmp_sock::icmp_echo_open_in(self.net_ns_id()))
+            .clone()
+    }
+
+    fn icmp_echo_socket(&self) -> Option<Arc<narf_net::icmp_sock::IcmpEchoSocket>> {
+        self.icmp_echo.lock().socket.clone()
+    }
+
     /// Create a pre-connected AF_UNIX SOCK_STREAM pair for
     /// `socketpair(2)`. Mints two ring buffers and crosses tx/rx so
     /// each end's `tx` is the other end's `rx` — the same wiring the
@@ -2677,7 +2711,7 @@ impl SocketFile {
         self.nonblock.store(on, Ordering::Release);
     }
 
-    /// An Internet-family `SOCK_DGRAM` (UDP) socket.
+    /// An Internet-family datagram socket.
     pub fn is_inet_dgram(&self) -> bool {
         matches!(self.domain, AF_INET | AF_INET6) && self.kind == SOCK_DGRAM
     }
@@ -2708,6 +2742,13 @@ impl SocketFile {
     /// Encode the socket's locally-bound address (if any). Honors
     /// the same shape as `copy_user_addr`'s input.
     pub fn local_addr(&self) -> Option<SockAddr> {
+        if self.is_inet_icmp_echo() {
+            let echo_socket = self.ensure_icmp_echo_socket();
+            let local_addr = self.icmp_echo.lock().local_addr;
+            // `ping_get_port` stores the allocated echo identifier in
+            // inet_sport, so `getsockname` exposes it in sin_port.
+            return Some(make_sockaddr_in(local_addr, echo_socket.identifier));
+        }
         let state = self.state.lock();
         match &*state {
             // An unbound AF_INET socket of any type reports 0.0.0.0:0
@@ -2782,6 +2823,13 @@ impl SocketFile {
 
     /// Encode the socket's connected peer address (if any).
     pub fn peer_addr(&self) -> Option<SockAddr> {
+        if self.is_inet_icmp_echo() {
+            return self
+                .icmp_echo
+                .lock()
+                .peer
+                .map(|peer| make_sockaddr_in(peer, 0));
+        }
         let state = self.state.lock();
         match &*state {
             SocketState::InetConnected {
@@ -3433,6 +3481,11 @@ impl FileOps for SocketFile {
     }
 
     fn poll_readiness(&self) -> u32 {
+        if self.is_inet_icmp_echo() {
+            return self
+                .icmp_echo_socket()
+                .map_or(narf_filesystem::POLL_OUT, |echo| echo.poll_mask());
+        }
         if self.domain == AF_NETLINK && !self.netlink_user_inbox.lock().is_empty() {
             return narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT;
         }
@@ -3483,6 +3536,13 @@ impl FileOps for SocketFile {
     /// no-op). Returns `false` for unmigrated states so the caller runs its
     /// legacy disarm path.
     fn disarm_readiness(&self, task_id: u64) -> bool {
+        if self.is_inet_icmp_echo() {
+            if let Some(echo) = self.icmp_echo_socket() {
+                echo.readiness().disarm(task_id);
+                return true;
+            }
+            return false;
+        }
         enum D {
             Connected(Arc<RingBuf>, Arc<RingBuf>),
             Wired(u32),
@@ -3572,6 +3632,14 @@ impl SocketFile {
         let want_out = interest & narf_filesystem::POLL_OUT != 0;
         if !want_in && !want_out {
             return None;
+        }
+        if self.is_inet_icmp_echo() {
+            return self.icmp_echo_socket().map(|echo| {
+                arm_one(
+                    echo.readiness(),
+                    interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
+                )
+            });
         }
         // Classify the socket under one short lock, cloning any rings needed.
         enum Arm {
@@ -3730,6 +3798,11 @@ impl SocketFile {
     /// factored out so `poll_readiness` computes the mask under a single `state`
     /// lock.
     fn readiness_bits_for_state(&self, state: &SocketState) -> u32 {
+        if self.is_inet_icmp_echo() {
+            return self
+                .icmp_echo_socket()
+                .map_or(narf_filesystem::POLL_OUT, |echo| echo.poll_mask());
+        }
         match state {
             // A fresh UDP socket is already writable (`datagram_poll`,
             // `net/core/datagram.c:919-921`).
@@ -3950,6 +4023,12 @@ impl SocketFile {
     /// off-box kernel-TCP, bypass, uevent) yields 0 — no local byte count is
     /// tracked and a consumer reads 0 as "fall back to recv/MSG_PEEK".
     pub(crate) fn inq_bytes(&self) -> usize {
+        if self.is_inet_icmp_echo() {
+            return self
+                .icmp_echo_socket()
+                .and_then(|echo| narf_net::icmp_sock::icmp_echo_next_reply_len(&echo))
+                .unwrap_or(0);
+        }
         if self.domain == AF_NETLINK {
             if let Some(packet) = self.netlink_user_inbox.lock().front() {
                 return packet.payload.len();
@@ -4077,6 +4156,9 @@ impl SocketFile {
         match (self.domain, self.kind) {
             (AF_UNIX, SOCK_STREAM) | (AF_UNIX, SOCK_SEQPACKET) => self.dispatch_unix_stream(op),
             (AF_INET, SOCK_STREAM) => self.dispatch_inet_stream(op),
+            (AF_INET, SOCK_DGRAM) if self.protocol == IPPROTO_ICMP => {
+                self.dispatch_inet_icmp_echo(op)
+            }
             (AF_INET, SOCK_DGRAM) => self.dispatch_inet_dgram(op),
             (AF_INET, SOCK_RAW) => self.dispatch_inet_raw(op),
             (AF_UNIX, SOCK_DGRAM) => self.dispatch_unix_dgram(op),
@@ -5689,6 +5771,175 @@ impl SocketFile {
             // `do_tcp_getsockopt` and `netlink_getsockopt` all return
             // -ENOPROTOOPT.
             _ => SocketOpResult::Err(SockError::NoProtoOpt),
+        }
+    }
+
+    /// Linux `ping.c`'s unprivileged `AF_INET` `SOCK_DGRAM` / `IPPROTO_ICMP`
+    /// endpoint. The net layer owns the real L2/L3/ICMP packet path; this
+    /// adapter owns POSIX sockaddr parsing, open-file socket state and the
+    /// userspace ICMP echo datagram shape.
+    fn dispatch_inet_icmp_echo(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { addr } => {
+                if addr.body.len() < SOCKADDR_IN_BODY_LEN {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let (ip, _port) = match parse_sockaddr_in(&addr) {
+                    Some(value) => value,
+                    None => return SocketOpResult::Err(SockError::AfNoSupport),
+                };
+                if addr.family != AF_INET && (addr.family != AF_UNSPEC || ip != 0) {
+                    return SocketOpResult::Err(SockError::AfNoSupport);
+                }
+                if let Err(error) = self.inet4_bind_precheck(ip, None) {
+                    return SocketOpResult::Err(error);
+                }
+                let mut echo = self.icmp_echo.lock();
+                if echo.bound || echo.peer.is_some() {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                echo.local_addr = ip;
+                echo.bound = true;
+                SocketOpResult::Ok(0)
+            }
+            SocketOp::Connect { addr } => {
+                if addr.family == AF_UNSPEC {
+                    self.icmp_echo.lock().peer = None;
+                    return SocketOpResult::Ok(0);
+                }
+                if addr.body.len() < SOCKADDR_IN_BODY_LEN {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let (ip, _port) = match parse_sockaddr_in(&addr) {
+                    Some(value) => value,
+                    None => return SocketOpResult::Err(SockError::AfNoSupport),
+                };
+                if addr.family != AF_INET {
+                    return SocketOpResult::Err(SockError::AfNoSupport);
+                }
+                if ip == u32::MAX && !self.options.lock().broadcast {
+                    return SocketOpResult::Err(SockError::Access);
+                }
+                self.icmp_echo.lock().peer = Some(ip);
+                SocketOpResult::Ok(0)
+            }
+            SocketOp::Send { buf, flags, addr } => {
+                // `ping_sendmsg` accepts an ICMP Echo Request including its
+                // eight-byte header. The kernel owns the checksum and echo
+                // identifier; userspace supplies the sequence and payload.
+                if buf.len() < 8 || buf[0] != narf_net::pkt::ICMP_ECHO_REQUEST || buf[1] != 0 {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                if flags & MSG_OOB != 0 {
+                    return SocketOpResult::Err(SockError::NotSupported);
+                }
+                let explicit = match addr {
+                    Some(a) if a.body.len() < SOCKADDR_IN_BODY_LEN => {
+                        return SocketOpResult::Err(SockError::InvalidArg)
+                    }
+                    Some(a) if a.family != AF_INET && a.family != AF_UNSPEC => {
+                        return SocketOpResult::Err(SockError::AfNoSupport)
+                    }
+                    Some(a) => parse_sockaddr_in(&a).map(|(ip, _port)| ip),
+                    None => None,
+                };
+                let target = match explicit.or_else(|| self.icmp_echo.lock().peer) {
+                    Some(target) => target,
+                    None => return SocketOpResult::Err(SockError::DestAddrReq),
+                };
+                if target == u32::MAX && !self.options.lock().broadcast {
+                    return SocketOpResult::Err(SockError::Access);
+                }
+                if let Some(error) = self.take_pending_error() {
+                    return SocketOpResult::Err(error);
+                }
+                if self.sk_shutdown() & 0b10 != 0 {
+                    return SocketOpResult::Err(SockError::Pipe);
+                }
+                let sequence = u16::from_be_bytes([buf[6], buf[7]]);
+                let echo = self.ensure_icmp_echo_socket();
+                match narf_net::icmp_sock::icmp_echo_send(
+                    &echo,
+                    target.to_be_bytes(),
+                    sequence,
+                    &buf[8..],
+                ) {
+                    Ok(()) => SocketOpResult::Ok(buf.len() as u64),
+                    Err(narf_net::icmp_sock::IcmpError2::MsgTooLong)
+                    | Err(narf_net::icmp_sock::IcmpError2::BufferTooSmall) => {
+                        SocketOpResult::Err(SockError::MsgSize)
+                    }
+                    Err(narf_net::icmp_sock::IcmpError2::NoInterface)
+                    | Err(narf_net::icmp_sock::IcmpError2::NetworkUnreachable) => {
+                        SocketOpResult::Err(SockError::NetUnreach)
+                    }
+                }
+            }
+            SocketOp::Recv { buf, flags } => {
+                if flags & MSG_ERRQUEUE != 0 {
+                    return SocketOpResult::Err(SockError::WouldBlock);
+                }
+                let peek = flags & MSG_PEEK != 0;
+                if let Some(echo) = self.icmp_echo_socket() {
+                    if let Some((sequence, peer_ip, payload, _rtt_ns)) =
+                        narf_net::icmp_sock::icmp_echo_recv_reply(&echo, peek)
+                    {
+                        let full_len = 8 + payload.len();
+                        let mut reply = Vec::with_capacity(full_len);
+                        reply.extend_from_slice(&[
+                            narf_net::pkt::ICMP_ECHO_REPLY,
+                            0,
+                            0,
+                            0,
+                            (echo.identifier >> 8) as u8,
+                            echo.identifier as u8,
+                            (sequence >> 8) as u8,
+                            sequence as u8,
+                        ]);
+                        reply.extend_from_slice(&payload);
+                        let checksum = narf_net::pkt::ip_checksum(&reply);
+                        reply[2..4].copy_from_slice(&checksum.to_be_bytes());
+                        let copied = buf.len().min(full_len);
+                        buf[..copied].copy_from_slice(&reply[..copied]);
+                        let peer = Some(make_sockaddr_in(u32::from_be_bytes(peer_ip), 0));
+                        return if copied < full_len {
+                            SocketOpResult::ReceivedTruncated {
+                                copied,
+                                full_len,
+                                peer,
+                            }
+                        } else {
+                            SocketOpResult::Received { n: copied, peer }
+                        };
+                    }
+                }
+                if self.sk_shutdown() & 0b01 != 0 {
+                    SocketOpResult::Received { n: 0, peer: None }
+                } else {
+                    SocketOpResult::Err(SockError::WouldBlock)
+                }
+            }
+            SocketOp::Shutdown { how } => {
+                if how > SHUT_RDWR {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                self.sk_shutdown
+                    .fetch_or(((how + 1) as u8) & 0b11, Ordering::AcqRel);
+                if let Some(echo) = self.icmp_echo_socket() {
+                    echo.readiness().set(narf_filesystem::POLL_IN, 0);
+                    echo.readiness().notify(narf_filesystem::POLL_IN);
+                }
+                narf_net::readiness::notify(0);
+                if self.icmp_echo.lock().peer.is_some() {
+                    SocketOpResult::Ok(0)
+                } else {
+                    SocketOpResult::Err(SockError::NotConnected)
+                }
+            }
+            SocketOp::Listen { .. } | SocketOp::Accept => {
+                SocketOpResult::Err(SockError::NotSupported)
+            }
+            _ => SocketOpResult::Err(SockError::NotSupported),
         }
     }
 
@@ -7964,6 +8215,9 @@ const RING_CAP: usize = 64 * 1024;
 impl Drop for SocketFile {
     fn drop(&mut self) {
         self.release_multicast();
+        if let Some(echo) = self.icmp_echo.lock().socket.take() {
+            narf_net::icmp_sock::icmp_echo_close(&echo);
+        }
         if let SocketState::Packet { sock } = &*self.state.lock() {
             sock.release();
         }

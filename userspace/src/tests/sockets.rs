@@ -398,6 +398,105 @@ fn smoke_socket_inet_raw_icmp_loopback() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_inet_raw_icmp_loopback);
 
+// ── AF_INET ICMP echo sockets ──────────────────────────────────────────────
+
+static ICMP_TX_CAPTURE: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn icmp_capture_send(frame: &[u8]) -> Result<(), ()> {
+    ICMP_TX_CAPTURE.lock().push(frame.to_vec());
+    Ok(())
+}
+
+/// The unprivileged ping socket must take the real ICMP path, rather than the
+/// UDP dispatcher that happens to share `SOCK_DGRAM`.
+fn smoke_socket_inet_dgram_icmp_reaches_wire_and_receives_echo() -> TestResult {
+    use narf_filesystem::FileOps;
+
+    const IFACE: &str = "icmp-ping-test0";
+    const LOCAL: [u8; 4] = [10, 77, 0, 2];
+    const PEER: [u8; 4] = [10, 77, 0, 9];
+    const SEQUENCE: u16 = 0x1234;
+    const PAYLOAD: &[u8] = b"narf-ping";
+
+    narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0, 0x77], icmp_capture_send);
+    narf_net::iface::set_default_ipv4(LOCAL, LOCAL);
+    narf_net::iface::add_addr(IFACE, LOCAL, 24);
+    narf_net::arp_cache::insert(IFACE, PEER, [0x02, 0, 0, 0, 0, 0x79]);
+    narf_net::tcp_stack::__arp_insert_legacy(PEER, [0x02, 0, 0, 0, 0, 0x79]);
+    ICMP_TX_CAPTURE.lock().clear();
+
+    let sock = crate::socket::SocketFile::with_protocol(
+        crate::socket::AF_INET,
+        crate::socket::SOCK_DGRAM,
+        crate::socket::IPPROTO_ICMP,
+    );
+    let local = match sock.local_addr() {
+        Some(local) => local,
+        None => return TestResult::Fail("ICMP echo socket has no local address"),
+    };
+    let identifier = match crate::socket::parse_sockaddr_in(&local) {
+        Some((_addr, id)) if id != 0 => id,
+        _ => return TestResult::Fail("ICMP echo socket did not allocate an identifier"),
+    };
+
+    let mut request = alloc::vec![narf_net::pkt::ICMP_ECHO_REQUEST, 0, 0, 0, 0, 0];
+    request.extend_from_slice(&SEQUENCE.to_be_bytes());
+    request.extend_from_slice(PAYLOAD);
+    let sent = sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf: &request,
+        flags: 0,
+        addr: Some(build_sockaddr_in(u32::from_be_bytes(PEER), 0)),
+    });
+    if !matches!(sent, crate::socket::SocketOpResult::Ok(n) if n == request.len() as u64) {
+        return TestResult::Fail("ICMP echo request did not reach the net socket");
+    }
+    let frames = ICMP_TX_CAPTURE.lock().clone();
+    let Some(frame) = frames.first() else {
+        return TestResult::Fail("ICMP echo request emitted no Ethernet frame");
+    };
+    if frame.len() < 14 + 20 + 8 || frame[14 + 9] != narf_net::pkt::IP_PROTO_ICMP {
+        return TestResult::Fail("ping socket emitted a non-ICMP frame");
+    }
+    if u16::from_be_bytes([frame[14 + 20 + 4], frame[14 + 20 + 5]]) != identifier {
+        return TestResult::Fail("kernel did not stamp the echo-socket identifier");
+    }
+
+    // Model the reply at the network RX boundary, as a virtio-net receive
+    // would. This exercises net's ICMP demux and SocketFile's datagram bridge.
+    let mut reply = alloc::vec![narf_net::pkt::ICMP_ECHO_REPLY, 0, 0, 0];
+    reply.extend_from_slice(&identifier.to_be_bytes());
+    reply.extend_from_slice(&SEQUENCE.to_be_bytes());
+    reply.extend_from_slice(PAYLOAD);
+    let checksum = narf_net::pkt::ip_checksum(&reply);
+    reply[2..4].copy_from_slice(&checksum.to_be_bytes());
+    narf_net::icmp_sock::on_icmp_rx(PEER, LOCAL, &reply);
+
+    if sock.poll_readiness() & narf_filesystem::POLL_IN == 0 {
+        return TestResult::Fail("ICMP echo reply did not publish POLL_IN");
+    }
+    let mut received = [0u8; 64];
+    match sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut received,
+        flags: 0,
+    }) {
+        crate::socket::SocketOpResult::Received {
+            n,
+            peer: Some(peer),
+        } if n == reply.len()
+            && received[..n] == reply
+            && crate::socket::parse_sockaddr_in(&peer) == Some((u32::from_be_bytes(PEER), 0)) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("ICMP echo reply did not reach the ping socket"),
+    }
+}
+kernel_test_in!(
+    "userspace/net",
+    smoke_socket_inet_dgram_icmp_reaches_wire_and_receives_echo
+);
+
 /// SO_REUSEADDR: stored value round-trips through get/setsockopt.
 fn smoke_socket_so_reuseaddr_round_trip() -> TestResult {
     let sock = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_STREAM);

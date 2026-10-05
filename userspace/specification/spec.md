@@ -1312,6 +1312,16 @@ The TCP socket-option compatibility surface validates and round-trips Linux
 zero for `TCP_IS_MPTCP`. Unsupported options return Linux's option-specific
 errno rather than succeeding silently.
 
+AF_INET `SOCK_DGRAM` with `IPPROTO_ICMP` is a distinct unprivileged echo
+endpoint rather than a UDP or raw-ICMP alias. Socket creation assigns a
+namespace-scoped echo identifier, returned in the `sin_port` field of local
+addresses. `sendto` accepts Echo Request datagrams, derives the wire
+identifier and checksum from that socket, and routes through the ICMP echo
+path; completed Echo Replies are returned as datagrams with their peer
+address. `MSG_PEEK`, readiness (`POLLIN` once a reply is queued and `POLLOUT`
+while live), `FIONREAD`, connect/disconnect, and shutdown use the same durable
+per-socket state. Other ICMP types and `listen`/`accept` are unsupported.
+
 AF_INET `SOCK_DGRAM` (UDP) follows Linux `net/ipv4/{af_inet,udp,
 datagram}.c` (`userspace/src/socket/inet_dgram.rs` cites each errno):
 - `bind` requires a 16-byte `sockaddr_in` (`EINVAL`), `AF_INET` or
