@@ -18,11 +18,11 @@
 //!     input/<eventN>/ ← one per registered input device
 //!     net/<iface>/  ← one per registered net interface
 //!     tty/          ← stub
-//!   devices/        ← stub (PCI topology: Stage 4+)
+//!   devices/        ← canonical hardware and virtual device kobjects
 //!   block/          ← flat view of block devices
 //!   bus/
 //!     pci/
-//!       devices/    ← stub
+//!       devices/    ← every enumerated PCIe function
 //!   firmware/
 //!     acpi/         ← stub (ACPI tables: Stage 4+)
 //!   kernel/
@@ -1066,6 +1066,128 @@ pub fn populate_block_class() {
             format!("{}\n", capacity * (lba_size as u64))
         });
         kobject_add_attr(&flat, "removable", || "0\n".to_string());
+    }
+}
+
+/// Size of one PCIe function's config-space file.
+///
+/// PCIe defines a 4 KiB extended configuration space per function. Unlike the
+/// old DRM-only projection, this reader accesses the function's ECAM window on
+/// every read, just like Linux's `pci_read_config_*()` path behind
+/// `/sys/bus/pci/devices/*/config`.
+const PCI_CONFIG_SPACE_BYTES: usize = narf_bus::pci::CFG_WINDOW_BYTES as usize;
+
+fn pci_slot_name(addr: narf_bus::PcieAddr) -> String {
+    format!(
+        "{:04x}:{:02x}:{:02x}.{}",
+        addr.segment, addr.bus, addr.device, addr.function
+    )
+}
+
+fn pci_host_name(addr: narf_bus::PcieAddr) -> String {
+    format!("pci{:04x}:{:02x}", addr.segment, addr.bus)
+}
+
+/// Render Linux's PCI modalias from the discovery-time authoritative device
+/// identity. The bus registry reads these fields from the real type-0 header
+/// during ECAM enumeration; this function does not assign compatibility IDs.
+fn pci_uevent_body(device: &narf_bus::BusDevice, slot_name: &str) -> String {
+    let class = device.id.class;
+    let base = (class >> 16) & 0xff;
+    let subclass = (class >> 8) & 0xff;
+    let prog_if = class & 0xff;
+    format!(
+        "PCI_CLASS={class:06X}\nPCI_ID={:04X}:{:04X}\nPCI_SUBSYS_ID={:04X}:{:04X}\nPCI_SLOT_NAME={slot_name}\nMODALIAS=pci:v{:08X}d{:08X}sv{:08X}sd{:08X}bc{base:02X}sc{subclass:02X}i{prog_if:02X}\n",
+        device.id.vendor,
+        device.id.device,
+        device.id.subsystem_vendor,
+        device.id.subsystem_id,
+        device.id.vendor as u32,
+        device.id.device as u32,
+        device.id.subsystem_vendor as u32,
+        device.id.subsystem_id as u32,
+    )
+}
+
+/// Read an actual PCIe ECAM config window through the mapping owned by
+/// `narf_bus`. A missing mapping is an I/O absence, not a source of invented
+/// zero bytes: returning EOF leaves the binary attr present while preventing a
+/// stale physical-address dereference after removal.
+fn pci_config_read(cfg_phys: narf_memory::PhysAddr, offset: usize, buf: &mut [u8]) -> usize {
+    if offset >= PCI_CONFIG_SPACE_BYTES || buf.is_empty() {
+        return 0;
+    }
+    let count = (PCI_CONFIG_SPACE_BYTES - offset).min(buf.len());
+    let Some(base) = narf_bus::ecam::ptr_for(cfg_phys, offset as u64) else {
+        return 0;
+    };
+
+    // ECAM is device memory. Keep all volatile loads bracketed exactly as the
+    // bus config accessors do, so the compiler cannot fold or reorder a
+    // userspace config read around another MMIO operation.
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    for (index, byte) in buf[..count].iter_mut().enumerate() {
+        // SAFETY: `offset + count <= 4096`, `base` is the mapped ECAM pointer
+        // at `offset`, and each byte remains within this function's window.
+        *byte = unsafe { core::ptr::read_volatile(base.add(index)) };
+    }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    count
+}
+
+/// Populate the canonical PCIe sysfs projection from the bus registry.
+///
+/// Every discovered function gets one real kobject beneath
+/// `/sys/devices/pci<segment>:<bus>/<BDF>/`, a discovery link in
+/// `/sys/bus/pci/devices/`, and a read-only `config` binary attribute backed
+/// by the function's mapped ECAM page. Device-class bridges (DRM, net, …)
+/// extend these exact kobjects with their class-specific children; they must
+/// not create synthetic PCI identities or config data.
+pub fn populate_pci_devices() {
+    let root = get_root();
+    let devices = get_or_create_child(&root, "devices");
+    let bus = get_or_create_child(&root, "bus");
+    let pci_bus = get_or_create_child(&bus, "pci");
+    let pci_devices = get_or_create_child(&pci_bus, "devices");
+
+    for device in narf_bus::snapshot() {
+        let narf_bus::BusKind::Pcie { addr, cfg_phys } = device.kind else {
+            continue;
+        };
+
+        let host_name = pci_host_name(addr);
+        let slot_name = pci_slot_name(addr);
+        let pci_host = get_or_create_child(&devices, &host_name);
+        let pci_device = get_or_create_child(&pci_host, &slot_name);
+
+        let vendor = device.id.vendor;
+        kobject_add_attr(&pci_device, "vendor", move || format!("0x{vendor:04x}\n"));
+        let device_id = device.id.device;
+        kobject_add_attr(&pci_device, "device", move || {
+            format!("0x{device_id:04x}\n")
+        });
+        let subsystem_vendor = device.id.subsystem_vendor;
+        kobject_add_attr(&pci_device, "subsystem_vendor", move || {
+            format!("0x{subsystem_vendor:04x}\n")
+        });
+        let subsystem_device = device.id.subsystem_id;
+        kobject_add_attr(&pci_device, "subsystem_device", move || {
+            format!("0x{subsystem_device:04x}\n")
+        });
+        let class = device.id.class;
+        kobject_add_attr(&pci_device, "class", move || format!("0x{class:06x}\n"));
+        add_writable_uevent(&pci_device, pci_uevent_body(&device, &slot_name));
+        pci_device.add_symlink("subsystem", "../../../bus/pci");
+
+        kobject_add_bin_attr(
+            &pci_device,
+            "config",
+            Arc::new(move |offset, buf| pci_config_read(cfg_phys, offset, buf)),
+        );
+        pci_devices.add_symlink(
+            slot_name,
+            format!("../../../devices/{host_name}/{}", pci_slot_name(addr)),
+        );
     }
 }
 
@@ -2896,6 +3018,11 @@ pub fn populate_all() {
     for provider in providers {
         (provider.populate)();
     }
+    // PCI enumeration precedes the filesystem initcall. Build the canonical
+    // hardware topology before class-specific late bridges attach net/DRM
+    // children, so every PCI function—not only a driver-selected subset—has
+    // its real `config` endpoint for lspci and libdrm.
+    populate_pci_devices();
     // Stub class directories expected by userspace tooling.
     let root = get_root();
     let class_dir = get_or_create_child(&root, "class");

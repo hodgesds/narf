@@ -52,8 +52,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 
 use narf_filesystem::sysfs::{
-    class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_bin_attr,
-    kobject_add_uevent_attr, kobject_add_writable_attr, kobject_emit_uevent, Kobject,
+    class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_uevent_attr,
+    kobject_add_writable_attr, kobject_emit_uevent, Kobject,
 };
 use narf_filesystem::uevent::UeventAction;
 
@@ -70,6 +70,11 @@ const DRM_MAJOR: u32 = 226;
 /// Linux ref: `drm_sysfs_connector_add` / `drm_dev_register`
 /// (drivers/gpu/drm/drm_sysfs.c, drm_drv.c).
 pub fn populate_drm_class() {
+    // PCI is a bus-owned projection.  Publish it before attaching DRM minors,
+    // so card<N>/device always names the function that was actually
+    // enumerated rather than a driver-invented location.
+    narf_filesystem::sysfs::populate_pci_devices();
+
     let class_drm = class_register("drm");
     let cards = crate::drm_registry::cards();
 
@@ -133,12 +138,84 @@ fn char_dev_link(minor: u32, target: &str) {
     dev_char.add_symlink(format!("{}:{}", DRM_MAJOR, minor), String::from(target));
 }
 
+/// Resolve a DRM card to the PCI function discovered by the bus layer.
+///
+/// The DRM registry currently records PCI IDs but not a `PcieAddr`.  IDs are
+/// sufficient for the present drivers; when identical adapters exist, retain
+/// registration/enumeration order as the discriminator.  Crucially this
+/// returns an address only when the bus layer has actually enumerated one.
+fn enumerated_pci_addr_for_card(
+    card: &dyn crate::drm_registry::DrmCard,
+    idx: u32,
+) -> Option<narf_bus::PcieAddr> {
+    let ordinal = crate::drm_registry::cards()
+        .iter()
+        .take(idx as usize)
+        .filter(|prior| {
+            prior.vendor_id() == card.vendor_id() && prior.device_id() == card.device_id()
+        })
+        .count();
+
+    narf_bus::snapshot()
+        .into_iter()
+        .filter_map(|device| match device.kind {
+            narf_bus::BusKind::Pcie { addr, .. }
+                if device.id.vendor == card.vendor_id() && device.id.device == card.device_id() =>
+            {
+                Some(addr)
+            }
+            _ => None,
+        })
+        .nth(ordinal)
+}
+
+/// Resolve a PCI parent for a DRM card.
+///
+/// Production never fabricates a PCI address or configuration header.  The
+/// test-only fallback exists solely because isolated DRM sysfs tests register
+/// fake cards without running PCI enumeration; it deliberately has no
+/// `config` file and therefore cannot mask a missing live ECAM projection.
+fn pci_addr_for_card(
+    card: &dyn crate::drm_registry::DrmCard,
+    idx: u32,
+) -> Option<narf_bus::PcieAddr> {
+    let discovered = enumerated_pci_addr_for_card(card, idx);
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    {
+        discovered.or_else(|| {
+            // Reserve an otherwise-unused test slot.  The kernel's QEMU
+            // profile uses slots 00..0c and 1f, so this cannot overwrite an
+            // enumerated fixture's generic PCI kobject.
+            Some(narf_bus::PcieAddr::new(
+                0,
+                0,
+                0x10u8.saturating_add(idx as u8).min(0x1e),
+                0,
+            ))
+        })
+    }
+
+    #[cfg(not(any(test, feature = "kernel-test")))]
+    {
+        discovered
+    }
+}
+
 /// Build the kobject subtree for one DRM card.
 fn populate_card_node(
     class_drm: Arc<Kobject>,
     card: Arc<dyn crate::drm_registry::DrmCard>,
     idx: u32,
 ) {
+    // A PCI DRM node without an enumerated PCI parent is worse than absent:
+    // libdrm would read a made-up identity/configuration and bind the wrong
+    // userspace driver.  Driver registration must be wired to the bus
+    // registry before it can expose a PCI-backed card.
+    let Some(pci_bdf) = pci_addr_for_card(card.as_ref(), idx) else {
+        return;
+    };
+
     let root = get_root();
     // `/sys/devices/platform/narf-drm/` — the real device parent. Mirrors the
     // input class's `/sys/devices/platform/narf-input/` container.
@@ -201,171 +278,46 @@ fn populate_card_node(
     // EGL's "failed to get compatible render device" — falls over regardless
     // of how correct the attributes are.
     //
-    // Each DRM card needs its OWN PCI parent.  Reusing bochs' 00:02.0 for
-    // every card made the second registration overwrite card0's uevent and
-    // config: libdrm then identified the virtio GPU as 1234:1111 with no
-    // usable driver, and Mesa/KWin rejected the render node.  These are the
-    // stable synthetic addresses used by NARF's QEMU profile; the important
-    // contract is a one-to-one card ↔ PCI kobject mapping, not a particular
-    // host slot number.
-    let pci_addr = match (card.vendor_id(), card.device_id()) {
-        // QEMU bochs-display.
-        (0x1234, 0x1111) => String::from("0000:00:02.0"),
-        // Modern virtio-gpu PCI transport.
-        (0x1af4, 0x1050) => String::from("0000:00:03.0"),
-        // Keep all other registered cards disjoint as well.
-        _ => format!("0000:00:{:02x}.0", 4u32.saturating_add(idx)),
-    };
-    let pci_root = get_or_create_child(&devices, "pci0000:00");
+    let pci_addr = format!(
+        "{:04x}:{:02x}:{:02x}.{}",
+        pci_bdf.segment, pci_bdf.bus, pci_bdf.device, pci_bdf.function
+    );
+    let pci_host_name = format!("pci{:04x}:{:02x}", pci_bdf.segment, pci_bdf.bus);
+    let pci_root = get_or_create_child(&devices, &pci_host_name);
     let dev_kobj = get_or_create_child(&pci_root, &pci_addr);
     // From /sys/devices/platform/narf-drm/card<N>, three levels up is
     // /sys/devices.
-    kobj.add_symlink("device", format!("../../../pci0000:00/{}", pci_addr));
+    kobj.add_symlink("device", format!("../../../{pci_host_name}/{pci_addr}"));
     // From /sys/devices/pci0000:00/<addr>/, three levels up is /sys.
     dev_kobj.add_symlink("subsystem", "../../../bus/pci");
-
-    // `device/uevent` — the ONLY thing that gives libdrm the bus address.
+    // The PCI parent is already complete: uevent, IDs and `config` are owned
+    // by `filesystem::sysfs::populate_pci_devices`, which reads the live ECAM
+    // page.  Do not replace any of them with driver-provided values.
     //
-    // This is not parity garnish; it decides whether any DRM node enumerates
-    // at all. `drmParsePciBusInfo()` does NOT parse the `device` symlink
-    // target (the assumption behind several earlier attempts here):
-    //
-    //     get_pci_path(maj, min, pci_path);        // realpath of .../device
-    //     value = sysfs_uevent_get(pci_path, "PCI_SLOT_NAME");
-    //     if (!value) return -ENOENT;
-    //
-    // and `sysfs_uevent_get` simply fopen()s `<pci_path>/uevent` and scans
-    // for a `KEY=` line. The card and render kobjects each had a uevent, but
-    // the PCI PARENT never did — so this returned -ENOENT,
-    // `drmProcessPciDevice()` failed, and `process_device()` dropped every
-    // node in /dev/dri.
-    //
-    // Measured in-guest with a probe linked against the guest's own libdrm,
-    // after the render-node `device` link went in:
-    //
-    //     DRMC: drmGetDevices2 count=0
-    //     DRMC: /dev/dri/card0      drmGetDevice2=-19   (-ENODEV)
-    //     DRMC: /dev/dri/renderD128 drmGetDevice2=-19
-    //
-    // while drmNodeIsDRM and both readlinks reported success — which is why
-    // reading the sysfs tree by hand kept suggesting nothing was wrong.
-    //
-    // No enumerated device means no `available_nodes`, so no render bit, so
-    // Mesa's loader_is_device_render_capable() is false and EGL dies with
-    // "DRI2: failed to get compatible render device".
-    //
-    // Format mirrors a real Linux PCI uevent, verified against
-    // /sys/dev/char/226:128/device/uevent on an amdgpu host. Only
-    // PCI_SLOT_NAME is load-bearing for libdrm; the rest is there because
-    // udev and modalias consumers read them. Linux writes the id fields in
-    // upper-case hex and the slot name in lower-case — match that exactly
-    // rather than normalizing, since MODALIAS is string-matched.
-    {
+    // Isolated DRM tests intentionally omit bus enumeration.  They retain the
+    // text IDs needed to exercise the symlink topology, but still never gain
+    // a fake config binary attribute.
+    if !dev_kobj.has_attr("config") {
         let vendor = card.vendor_id();
+        kobject_add_attr(&dev_kobj, "vendor", move || format!("0x{vendor:04x}\n"));
         let device = card.device_id();
-        let sub_vendor = card.subsystem_vendor();
-        let sub_device = card.subsystem_device();
-        let drv = driver.clone();
-        let addr = pci_addr.clone();
+        kobject_add_attr(&dev_kobj, "device", move || format!("0x{device:04x}\n"));
+        let subsystem_vendor = card.subsystem_vendor();
+        kobject_add_attr(&dev_kobj, "subsystem_vendor", move || {
+            format!("0x{subsystem_vendor:04x}\n")
+        });
+        let subsystem_device = card.subsystem_device();
+        kobject_add_attr(&dev_kobj, "subsystem_device", move || {
+            format!("0x{subsystem_device:04x}\n")
+        });
         kobject_add_uevent_attr(
             &dev_kobj,
             format!(
-                "DRIVER={}\n\
-                 PCI_CLASS=30000\n\
-                 PCI_ID={:04X}:{:04X}\n\
-                 PCI_SUBSYS_ID={:04X}:{:04X}\n\
-                 PCI_SLOT_NAME={}\n\
-                 MODALIAS=pci:v{:08X}d{:08X}sv{:08X}sd{:08X}bc03sc00i00\n",
-                drv,
-                vendor,
-                device,
-                sub_vendor,
-                sub_device,
-                addr,
-                vendor as u32,
-                device as u32,
-                sub_vendor as u32,
-                sub_device as u32,
+                "DRIVER={driver}\nPCI_SLOT_NAME={pci_addr}\nPCI_ID={:04X}:{:04X}\n",
+                card.vendor_id(),
+                card.device_id(),
             ),
         );
-    }
-
-    // `device/config` — raw PCI configuration space.
-    //
-    // THIS is what libdrm actually reads. `drmParsePciDeviceInfo` opens
-    // `/sys/dev/char/<maj>:<min>/device/config` and pulls the ids straight out
-    // of the binary header; it does NOT parse the text vendor/device attrs
-    // below (those exist for other consumers). With no `config` file the read
-    // fails, `drmGetDevices2` cannot describe the device, and Mesa reports
-    // "MESA-LOADER: failed to retrieve device information" — the failure that
-    // makes kwin give up and take the Plasma session down with it.
-    //
-    // Measured, not assumed: a guest probe of `card0/device/` listed only
-    // device, subsystem, subsystem_device, subsystem_vendor, vendor. The
-    // subsystem symlink added earlier was present and resolving, and the error
-    // persisted at 18 per session attempt — so the symlink was necessary but
-    // never sufficient, and the missing blob is the real gap.
-    //
-    // Only the 64-byte type-0 header is synthesized, which is all
-    // drmParsePciDeviceInfo touches. Little-endian, offsets per PCI 3.0 §6.1:
-    //   0x00 vendor   0x02 device   0x08 revision   0x0a subclass  0x0b class
-    //   0x2c subsystem_vendor       0x2e subsystem_device
-    {
-        let vendor = card.vendor_id();
-        let device = card.device_id();
-        let sub_vendor = card.subsystem_vendor();
-        let sub_device = card.subsystem_device();
-        kobject_add_bin_attr(
-            &dev_kobj,
-            "config",
-            Arc::new(move |offset: usize, buf: &mut [u8]| -> usize {
-                let mut cfg = [0u8; 64];
-                cfg[0x00..0x02].copy_from_slice(&vendor.to_le_bytes());
-                cfg[0x02..0x04].copy_from_slice(&device.to_le_bytes());
-                // Command: I/O + memory + bus-master enabled.
-                cfg[0x04..0x06].copy_from_slice(&0x0007u16.to_le_bytes());
-                // Revision 0; class 0x030000 = Display / VGA compatible.
-                cfg[0x08] = 0x00;
-                cfg[0x09] = 0x00;
-                cfg[0x0a] = 0x00;
-                cfg[0x0b] = 0x03;
-                // Header type 0 (normal device) — libdrm relies on this to
-                // read the subsystem ids from 0x2c, which only exist in the
-                // type-0 layout.
-                cfg[0x0e] = 0x00;
-                cfg[0x2c..0x2e].copy_from_slice(&sub_vendor.to_le_bytes());
-                cfg[0x2e..0x30].copy_from_slice(&sub_device.to_le_bytes());
-                if offset >= cfg.len() {
-                    return 0;
-                }
-                let n = (cfg.len() - offset).min(buf.len());
-                buf[..n].copy_from_slice(&cfg[offset..offset + n]);
-                n
-            }),
-        );
-    }
-    // `revision` as text too — some consumers read it directly rather than
-    // going through the config blob, and it was absent entirely.
-    kobject_add_attr(&dev_kobj, "revision", || "0x00\n".into());
-    {
-        let v = card.vendor_id();
-        kobject_add_attr(&dev_kobj, "vendor", move || format!("0x{:04x}\n", v));
-    }
-    {
-        let d = card.device_id();
-        kobject_add_attr(&dev_kobj, "device", move || format!("0x{:04x}\n", d));
-    }
-    {
-        let sv = card.subsystem_vendor();
-        kobject_add_attr(&dev_kobj, "subsystem_vendor", move || {
-            format!("0x{:04x}\n", sv)
-        });
-    }
-    {
-        let sd = card.subsystem_device();
-        kobject_add_attr(&dev_kobj, "subsystem_device", move || {
-            format!("0x{:04x}\n", sd)
-        });
     }
 
     // ── Optional AMDGPU-specific attrs ───────────────────────────────────
@@ -435,7 +387,7 @@ fn populate_card_node(
     // equal, so two different addresses would stay two one-node devices and
     // the render bit would still be absent. Same depth
     // (devices/platform/narf-drm/<node>), so the same relative path.
-    render_kobj.add_symlink("device", format!("../../../pci0000:00/{}", pci_addr));
+    render_kobj.add_symlink("device", format!("../../../{pci_host_name}/{pci_addr}"));
 
     // `card<N>/device/drm/{card<N>,renderD<M>}` — how a consumer walks from a
     // card to its RENDER node.

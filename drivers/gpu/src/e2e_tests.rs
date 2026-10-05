@@ -1373,6 +1373,23 @@ fn smoke_drm_sysfs_adds_enter_boot_udev_replay() -> TestResult {
     }));
     crate::drm_sysfs_bridge::populate_drm_class();
 
+    // The bridge must use the PCI parent selected by the registry, rather
+    // than an address baked into the DRM card ID. Isolated tests use a
+    // fixture-only parent, so derive the expected event path from the same
+    // card/device link userspace follows.
+    let pci_slot = match drm_device_node("card0")
+        .and_then(|card| card.get_symlink("device"))
+        .and_then(|target| target.rsplit('/').next().map(alloc::string::String::from))
+    {
+        Some(slot) => slot,
+        None => {
+            drm_registry::__reset_for_test();
+            sysfs::__reset_for_test();
+            uevent::__reset_for_test();
+            return TestResult::Fail("card0 has no PCI device link");
+        }
+    };
+
     let events = uevent::boot_udevd_replay_reader().drain(8);
     let card = events
         .iter()
@@ -1382,7 +1399,7 @@ fn smoke_drm_sysfs_adds_enter_boot_udev_replay() -> TestResult {
         .position(|event| event.devpath.ends_with("/renderD128"));
     let pci = events
         .iter()
-        .position(|event| event.devpath.ends_with("/0000:00:04.0"));
+        .position(|event| event.devpath.ends_with(&pci_slot));
 
     let ok = matches!((pci, card, render), (Some(p), Some(c), Some(r)) if p < c && c < r)
         && events
