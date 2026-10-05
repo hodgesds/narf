@@ -1582,7 +1582,9 @@ dependencies = [
  "narf-init",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]

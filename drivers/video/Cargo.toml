@@ -23,6 +23,8 @@ narf-filesystem      = { path = "../../filesystem" }
 narf-drivers-i2c     = { path = "../i2c" }
 narf-console         = { path = "../../console" }
 narf-scheduler       = { path = "../../scheduler" }
+narf-memory          = { path = "../../memory" }
+narf-time            = { path = "../../time" }
 
 [features]
 # The sysfs `/sys/class/video4linux/video<N>/` registration is always
