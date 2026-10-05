@@ -12,6 +12,33 @@ use narf_drivers_sound::{
 pub(super) struct Card(pub Arc<VirtioSoundPci>);
 
 impl PcmDevice for Card {
+    fn capabilities(&self, capture: bool) -> narf_drivers_sound::hardware::PcmCapabilities {
+        let mut caps =
+            narf_drivers_sound::hardware::PcmCapabilities::fixed(self.default_params(capture));
+        let Some(info) = self.0.playback_info else {
+            return caps;
+        };
+        caps.rates = [SampleRate::R44100, SampleRate::R48000]
+            .into_iter()
+            .filter(|rate| {
+                info.rates
+                    & (1 << if *rate == SampleRate::R48000 {
+                        super::VIRTIO_SND_PCM_RATE_48000
+                    } else {
+                        super::VIRTIO_SND_PCM_RATE_44100
+                    })
+                    != 0
+            })
+            .collect();
+        caps.channels = [ChannelCount::Mono, ChannelCount::Stereo]
+            .into_iter()
+            .filter(|channels| (info.channels_min..=info.channels_max).contains(&channels.count()))
+            .collect();
+        caps.period_frames = (32, 32768);
+        caps.periods = (2, 256);
+        caps.buffer_bytes = (128, 256 * 1024);
+        caps
+    }
     fn default_params(&self, _capture: bool) -> HwParams {
         let info = self
             .0
@@ -155,8 +182,41 @@ impl PcmHardware for Playback {
         self.pending.clear();
         Ok(())
     }
+    fn reset(&mut self) -> Result<(), SoundError> {
+        self.pending.clear();
+        Ok(())
+    }
+    fn pause(&mut self, paused: bool) -> Result<(), SoundError> {
+        if !paused {
+            return self.start();
+        }
+        let _gate = ReqGate::acquire(&self.device.req_gate);
+        self.device
+            .stop_pcm_locked()
+            .map_err(|_| SoundError::BadState)?;
+        self.running = false;
+        Ok(())
+    }
     fn pointer(&self) -> u64 {
         self.frames
+    }
+    fn overwrite(&mut self, frame: u64, samples: &[u8]) -> Result<(), SoundError> {
+        let width = usize::from(self.params.ok_or(SoundError::BadState)?.channels) * 2;
+        if samples.len() % width != 0 {
+            return Err(SoundError::InvalidParams);
+        }
+        // Completed VirtIO packets are already played. Only the unsubmitted
+        // suffix is mutable; future packets will be read from the shared ring.
+        for (i, chunk) in samples.chunks_exact(width).enumerate() {
+            let at = frame + i as u64;
+            if at >= self.frames {
+                let off = (at - self.frames) as usize * width;
+                if let Some(dst) = self.pending.get_mut(off..off + width) {
+                    dst.copy_from_slice(chunk);
+                }
+            }
+        }
+        Ok(())
     }
     fn write(&mut self, samples: &[u8]) -> Result<usize, SoundError> {
         if !self.prepared {

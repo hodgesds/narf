@@ -145,7 +145,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // Standard 6-arg mmap ABI: arg2 prot, arg3 flags, arg4 fd, arg5 offset.
     // narf_user_runtime::mmap issues this same shape for NARF-native
     // anonymous maps (prot=RW, fd=-1), so the kernel decodes one layout.
-    let prot = args.arg2 as u32;
+    let mut prot = args.arg2 as u32;
     let flags = args.arg3 as u32;
     let fd = args.arg4 as i64 as i32;
     let offset = args.arg5;
@@ -274,6 +274,25 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+
+    if !anonymous {
+        let ops = fd::with_table(current_task_id(), |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
+        if let Some(ops) = ops {
+            match ops.validate_mmap(offset, len as usize, prot, flags) {
+                Ok(adjusted) => {
+                    if adjusted & 7 & !ops.mmap_max_prot(offset) != 0 {
+                        ctx.set_return(errno_ret(EACCES));
+                        return;
+                    }
+                    prot = adjusted;
+                }
+                Err(error) => {
+                    ctx.set_return(errno_ret(copy_fs_errno(error)));
+                    return;
+                }
+            }
+        }
+    }
 
     // do_mmap's `if ((pgoff + (len >> PAGE_SHIFT)) < pgoff) return -EOVERFLOW;`
     // has no reachable counterpart on this entry point: both x86_64 and
@@ -559,10 +578,15 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             // concurrent handle close may remove the lookup-table entry after
             // this point, but it cannot recycle the backing while this Arc is
             // held and then transferred into the mapping-owner table.
-            let mmap_lifetime = ops.mmap_lifetime(offset, len as usize);
-            // On Err (unsupported, or any device error) we fall through to the
-            // regular file-backed path below, unchanged from before.
-            if let Ok(frames) = ops.mmap_frames(offset, len as usize) {
+            let backing = match ops.mmap_backing(offset, len as usize) {
+                Ok(backing) => Some(backing),
+                Err(narf_filesystem::FsError::Unsupported) => None,
+                Err(error) => {
+                    ctx.set_return(errno_ret(copy_fs_errno(error)));
+                    return;
+                }
+            };
+            if let Some(narf_filesystem::MmapBacking { frames, lifetime: mmap_lifetime }) = backing {
                 if frames.len() != pages {
                     ctx.set_return(errno_ret(EINVAL));
                     return;

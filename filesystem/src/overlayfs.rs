@@ -1267,6 +1267,15 @@ impl FileOps for OverlayFile {
         self.active().ioctl(cmd, arg)
     }
 
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn crate::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move { self.active().ioctl_user(cmd, arg, context).await })
+    }
+
     fn ioctl_async<'a>(
         &'a self,
         cmd: u32,
@@ -1299,6 +1308,27 @@ impl FileOps for OverlayFile {
 
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {
         self.active().mmap_frames(offset, len)
+    }
+
+    fn validate_mmap(
+        &self,
+        offset: u64,
+        len: usize,
+        prot: u32,
+        flags: u32,
+    ) -> Result<u32, FsError> {
+        self.active().validate_mmap(offset, len, prot, flags)
+    }
+
+    fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn crate::MmapLifetime>> {
+        self.active().mmap_lifetime(offset, len)
+    }
+
+    fn mmap_backing(&self, offset: u64, len: usize) -> Result<crate::MmapBacking, FsError> {
+        self.active().mmap_backing(offset, len)
+    }
+    fn mmap_max_prot(&self, offset: u64) -> u32 {
+        self.active().mmap_max_prot(offset)
     }
 
     fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {

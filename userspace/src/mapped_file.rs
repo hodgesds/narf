@@ -145,6 +145,24 @@ pub(crate) fn drop_address_space(address_space_id: u64) {
     drop(retired);
 }
 
+/// Device page restrictions survive fd close and VMA splitting. Resolve the
+/// file offsets under the table lock, then call FileOps after releasing it.
+pub(crate) fn protection_allowed(address_space_id: u64, base: u64, len: u64, prot: u32) -> bool {
+    let Some(bucket) = existing_mapping_owners(address_space_id) else {
+        return true;
+    };
+    let end = base.saturating_add(len);
+    let files: Vec<_> = bucket
+        .lock()
+        .iter()
+        .filter(|m| m.base < end && base < m.base.saturating_add(m.len))
+        .map(|m| (m.ops.clone(), m.file_offset + base.saturating_sub(m.base)))
+        .collect();
+    files
+        .into_iter()
+        .all(|(ops, offset)| prot & 7 & !ops.mmap_max_prot(offset) == 0)
+}
+
 /// Publish a memory VMA and its external file owner as one transaction.
 ///
 /// The caller holds the address space's VMA transaction (and, for SHARED

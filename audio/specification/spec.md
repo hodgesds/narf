@@ -91,6 +91,12 @@ and firmware methods return UnsupportedDevice without touching hardware.
 
 ### 3.3 Registration and service
 
+The registered `PcmDevice::capabilities` supplies ALSA negotiation constraints.
+HDA exposes S16LE/S32LE, 48 kHz stereo, 128-byte period alignment and a
+4–256 KiB buffer. ACP 6.3 exposes its implemented S32LE, 48 kHz stereo,
+512–1024 frame periods, four periods and 16–32 KiB buffer. Refine queries
+are side-effect-free; actual configuration still validates in the engine.
+
 Subsystem initcalls register PCI probes; late init publishes native cards
 through the sound file bridge. Capture is never started by enumeration.
 HDA and ACP register their actual bus address with the sound registry, so
@@ -103,6 +109,14 @@ Owned MSI-X/MSI routing is used for HDA when available. ACP uses firmware
 INTx. A direct _PRT GSI can join an existing compatible shared vector;
 named interrupt-link routes fall back to polling. A 2 ms service timer
 handles DMA accounting even without IRQ routing; jack refresh runs at 100 ms.
+
+ALSA stream hooks preserve DMA position and storage across pause/resume. HDA
+supports rewriting queued cyclic slots and delegates stop-threshold/silence
+policy to ALSA in free-running mode; raw native clients retain underrun checks.
+ACP restarts its physical counter baseline while retaining logical position.
+RESET discards application ownership without stopping the controller.
+Platform power callers use `suspend_hardware_card` before powering down and
+must restore controller programming before ALSA RESUME.
 
 ## 4. Invariants
 
@@ -159,5 +173,7 @@ proofs, not evidence of audible playback or microphone quality on Lenovo 50ee.
 
 Physical validation must establish the actual HDA codec, BIOS route quality,
 jack behavior and whether speaker amplifiers need a model-specific quirk.
-SoundWire, HDMI/DP, suspend/resume and a Linux ALSA ioctl/mmap ABI remain
-separate implementation work. The current file bridge is NARF's PCM protocol.
+SoundWire, HDMI/DP and system power-transition reinitialization remain separate
+implementation work. PCM pause/resume preserves DMA buffers and position.
+The shared sound bridge supplies Linux ALSA ioctl/mmap/poll for the registered
+native endpoints, subject to its documented feature limits.

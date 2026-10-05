@@ -65,6 +65,7 @@
 
 extern crate alloc;
 
+mod alsa;
 pub mod codec;
 pub mod devfs_bridge;
 pub mod format;
@@ -288,6 +289,7 @@ pub fn unregister_hardware_card(index: u32) {
 }
 
 fn unpublish_card(info: &CardInfo) {
+    alsa::remove_card(info.index);
     sysfs_bridge::unregister_card_sysfs(info);
     narf_filesystem::procfs::unregister_proc(&alloc::format!("asound/card{}", info.index));
 }
@@ -512,6 +514,12 @@ pub struct Mixer {
 }
 
 impl Mixer {
+    pub fn control_info(&self, id: ControlId) -> Result<crate::mixer::ControlInfo, SoundError> {
+        if let Some(hardware) = &self.hardware {
+            return hardware.control_info(id);
+        }
+        crate::mixer::info(self.controller_index, id).map_err(SoundError::from)
+    }
     pub fn card(&self) -> u32 {
         self.card
     }
@@ -536,16 +544,49 @@ impl Mixer {
     /// Write a control. Range-checks against the control's
     /// `info.value_max` and emits the underlying codec verb.
     pub fn set_control_value(&self, id: ControlId, val: ControlValue) -> Result<(), SoundError> {
+        let previous = self.get_control_value(id)?;
         if let Some(hardware) = &self.hardware {
-            return hardware.set_control(id, val);
+            hardware.set_control(id, val)?;
+        } else {
+            crate::mixer::set(self.controller_index, id, val).map_err(SoundError::from)?;
         }
-        crate::mixer::set(self.controller_index, id, val).map_err(SoundError::from)
+        if previous != val {
+            crate::alsa::control_changed(self.card, id);
+        }
+        Ok(())
     }
 }
 
 /// Format helper re-export so callers don't have to import the
 /// `format` submodule directly for the common case.
 pub use crate::format::{ChannelCount, SampleRate};
+
+/// Query constraints without claiming or reprogramming an endpoint.
+pub fn pcm_capabilities(card: u32, capture: bool) -> Result<hardware::PcmCapabilities, SoundError> {
+    let hardware = CARD_REGISTRY
+        .lock()
+        .iter()
+        .find(|c| c.info.index == card)
+        .ok_or(SoundError::NoSuchCard)?
+        .hardware
+        .clone();
+    if let Some(hardware) = hardware {
+        return Ok(hardware.capabilities(capture));
+    }
+    Ok(hardware::PcmCapabilities {
+        formats: alloc::vec![
+            SampleFormat::S16LE,
+            SampleFormat::S24LE,
+            SampleFormat::S32LE
+        ],
+        rates: alloc::vec![SampleRate::R44100, SampleRate::R48000, SampleRate::R96000],
+        channels: alloc::vec![ChannelCount::Mono, ChannelCount::Stereo],
+        period_frames: (32, 8192),
+        periods: (2, 32),
+        buffer_bytes: (256, 256 * 1024),
+        period_byte_alignment: 1,
+    })
+}
 
 /// Probe-time entry point. Called by `hda::controller::probe` once
 /// the controller is fully brought up.
@@ -639,4 +680,10 @@ pub mod tests_support {
             Poll::Pending => panic!("poll_once: future is pending"),
         }
     }
+}
+
+/// Quiesce open ALSA streams before a native card enters a power transition.
+/// RESUME restores their previous state after the driver restores the device.
+pub async fn suspend_hardware_card(card: u32) -> Result<(), narf_filesystem::FsError> {
+    alsa::suspend_card(card).await
 }

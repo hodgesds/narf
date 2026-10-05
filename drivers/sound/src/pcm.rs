@@ -35,6 +35,8 @@ pub enum SubstreamState {
     Prepared,
     /// `trigger(START)` issued — DMA shifting samples.
     Running,
+    /// DMA paused with its position and queued data retained.
+    Paused,
     /// `trigger(STOP)` issued.
     Stopped,
 }
@@ -194,13 +196,69 @@ impl PcmSubstream {
 
     /// Clear SDxCTL.RUN.
     pub fn trigger_stop(&mut self) -> Result<(), SoundError> {
-        if !matches!(self.state, SubstreamState::Running) {
+        if !matches!(self.state, SubstreamState::Running | SubstreamState::Paused) {
             return Err(SoundError::BadState);
         }
         if let Some(hardware) = &mut self.hardware {
             hardware.stop()?;
         }
         self.state = SubstreamState::Stopped;
+        Ok(())
+    }
+
+    pub fn pause(&mut self, paused: bool) -> Result<(), SoundError> {
+        let expected = if paused {
+            SubstreamState::Running
+        } else {
+            SubstreamState::Paused
+        };
+        if self.state != expected {
+            return Err(SoundError::BadState);
+        }
+        if let Some(hardware) = &mut self.hardware {
+            hardware.pause(paused)?;
+        }
+        self.state = if paused {
+            SubstreamState::Paused
+        } else {
+            SubstreamState::Running
+        };
+        Ok(())
+    }
+    /// Reset application ownership while retaining the hardware state.
+    pub fn reset(&mut self) -> Result<(), SoundError> {
+        if let Some(hardware) = self.hardware.as_mut() {
+            hardware.reset()?;
+        } else if let Some(params) = self.params {
+            let width = params.channels.count() as usize * params.format.bytes_per_sample();
+            self.write_cursor =
+                (self.pointer() % (self.buffer.len() / width) as u64) as usize * width;
+        }
+        Ok(())
+    }
+    pub fn free_running(&mut self, enabled: bool) -> Result<(), SoundError> {
+        if let Some(hardware) = &mut self.hardware {
+            hardware.free_running(enabled)?;
+        }
+        Ok(())
+    }
+    pub fn overwrite(&mut self, frame: u64, samples: &[u8]) -> Result<(), SoundError> {
+        if self.is_capture {
+            return Err(SoundError::BadState);
+        }
+        if let Some(hardware) = &mut self.hardware {
+            return hardware.overwrite(frame, samples);
+        }
+        let params = self.params.ok_or(SoundError::BadState)?;
+        let frame_bytes = params.channels.count() as usize * params.format.bytes_per_sample();
+        if samples.len() > self.buffer.len() || samples.len() % frame_bytes != 0 {
+            return Err(SoundError::InvalidParams);
+        }
+        let offset = (frame % (self.buffer.len() / frame_bytes) as u64) as usize * frame_bytes;
+        for (i, byte) in samples.iter().enumerate() {
+            let at = (offset + i) % self.buffer.len();
+            self.buffer[at] = *byte;
+        }
         Ok(())
     }
 
@@ -222,7 +280,7 @@ impl PcmSubstream {
     pub fn write(&mut self, samples: &[u8]) -> Result<usize, SoundError> {
         if !matches!(
             self.state,
-            SubstreamState::Running | SubstreamState::Prepared
+            SubstreamState::Running | SubstreamState::Paused | SubstreamState::Prepared
         ) || self.is_capture
         {
             return Err(SoundError::BadState);
@@ -247,7 +305,7 @@ impl PcmSubstream {
     pub fn read(&mut self, out: &mut [u8]) -> Result<usize, SoundError> {
         if !matches!(
             self.state,
-            SubstreamState::Running | SubstreamState::Prepared
+            SubstreamState::Running | SubstreamState::Paused | SubstreamState::Prepared
         ) || !self.is_capture
         {
             return Err(SoundError::BadState);

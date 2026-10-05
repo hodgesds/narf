@@ -25,6 +25,20 @@ applications above NARF.
 
 ## 3. Public interface
 
+Device ioctl dispatch passes an `IoctlContext` with guarded process-memory
+copies, the open description's O_NONBLOCK state, retained descriptor lookup
+and the caller's thread-group ID to FileOps. The shared sound
+registry's PCM/control files implement the ALSA ABI; syscall handlers contain
+no sound-card lookup or driver-specific request branches. Device mmap validation
+runs before VMA replacement, and direct mappings atomically retain their backing
+allocation and frames. Device errors propagate instead of selecting a copied
+file fallback. Mapped-file owners enforce device protection limits on mprotect.
+ALSA's EBADFD (77), ENXIO (6), EPIPE (32), ESTRPIPE (86), ENOSPC (28),
+EAGAIN (11), ENOTTY (25) and EFAULT
+(14) remain distinct. PCM EPIPE does not raise the pipe/socket SIGPIPE signal.
+See [sound §3.1](../../drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi)
+for implemented requests and compatibility limits.
+
 `SocketFile::delegate_netlink_admin` accepts route and generic netlink
 sockets in the delegated interface's namespace. Generic-family requests
 receive that stored handle through `net::netlink_generic::RequestContext`;

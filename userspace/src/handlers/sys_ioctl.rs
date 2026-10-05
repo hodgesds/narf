@@ -2,6 +2,40 @@
 use super::*;
 use alloc::boxed::Box;
 
+struct DeviceIoctlContext {
+    nonblocking: bool,
+}
+
+impl narf_filesystem::IoctlContext for DeviceIoctlContext {
+    fn read(&self, address: u64, destination: &mut [u8]) -> Result<(), narf_filesystem::FsError> {
+        // SAFETY: this context is used only inside the calling syscall while
+        // its address space is active. The helper validates and guards faults.
+        unsafe { copy_from_user(destination, address) }
+            .map_err(|_| narf_filesystem::FsError::BadAddress)
+    }
+
+    fn write(&self, address: u64, source: &[u8]) -> Result<(), narf_filesystem::FsError> {
+        // SAFETY: same syscall/address-space contract as read; racing unmaps
+        // are caught by the guarded copy rather than faulting the kernel.
+        unsafe { copy_to_user(address, source) }
+            .map_err(|_| narf_filesystem::FsError::BadAddress)
+    }
+
+    fn nonblocking(&self) -> bool {
+        self.nonblocking
+    }
+    fn file(&self, number: i32) -> Result<Arc<dyn narf_filesystem::FileOps>, narf_filesystem::FsError> {
+        crate::fd::with_table(current_task_id(), |t| {
+            t.get(number as u32).map(|entry| entry.ops.clone())
+        })
+        .flatten()
+        .ok_or(narf_filesystem::FsError::BadFd)
+    }
+    fn process_id(&self) -> u32 {
+        task_to_pid_raw(current_task_id()).unwrap_or(current_task_id()) as u32
+    }
+}
+
 /// A dma-fence exposed through Linux's `sync_file` fd ABI.
 ///
 /// Two producers exist today. `VIRTGPU_EXECBUF_FENCE_FD_OUT` fences are
@@ -1021,7 +1055,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         }
     }
 
-    let ioctl_result = ops.ioctl(cmd, arg);
+    let ioctl_context = DeviceIoctlContext {
+        nonblocking: status_flags & crate::fd::O_NONBLOCK != 0,
+    };
+    let ioctl_result = poll_blocking(ops.ioctl_user(cmd, arg as u64, &ioctl_context))
+        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
     if ioctl_result.is_ok() {
         // Atomic OUT_FENCE_PTR: the DRM bridge recorded one (user pointer,
         // vblank deadline) pair per requesting CRTC; mint the sync_file fds
@@ -1260,6 +1298,12 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::BadAddress) => {
             ctx.set_return(errno_ret(EFAULT));
         }
+        Err(narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun) => ctx.set_return(errno_ret(EPIPE)),
+        Err(narf_filesystem::FsError::NoDevice) => ctx.set_return(errno_ret(ENODEV)),
+        Err(narf_filesystem::FsError::BadFileState) => ctx.set_return(errno_ret(77)),
+        Err(narf_filesystem::FsError::StreamSuspended) => ctx.set_return(errno_ret(86)),
+        Err(narf_filesystem::FsError::NoSpace) => ctx.set_return(errno_ret(28)),
+        Err(narf_filesystem::FsError::NoDeviceAddress) => ctx.set_return(errno_ret(6)),
         Err(narf_filesystem::FsError::OutOfMemory) => {
             ctx.set_return(errno_ret(ENOMEM));
         }
@@ -1336,6 +1380,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // not the EAGAIN used by nonblocking file readiness.
             ctx.set_return(errno_ret(62)); // ETIME
         }
+        Err(narf_filesystem::FsError::WouldBlock) => ctx.set_return(errno_ret(EAGAIN)),
         Err(_) => {
             ctx.set_return(errno_ret(EINVAL));
         }

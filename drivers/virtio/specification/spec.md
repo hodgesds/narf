@@ -65,6 +65,8 @@ blk/net/console/rng.
   immediately rather than returning a permanently pending future.
 - VirtIO sound PCI queries PCM_INFO and registers its implemented stream-0
   playback endpoint with `drivers/sound`, including the actual PCI parent.
+  `PcmDevice::capabilities` derives its format/rate/channel sets from PCM_INFO
+  and supplies period/buffer bounds to side-effect-free ALSA negotiation.
   The PCM lease supports the advertised subset of S16LE mono/stereo at
   44.1/48 kHz, configuration, prepare/start/stop, cumulative frame position,
   writes and drain. Other opens and kernel convenience submits
@@ -78,6 +80,11 @@ blk/net/console/rng.
 
 Internal modules: `transport_pci`, `transport_mmio`, `queue_split`,
 `queue_packed`, `class_blk`, `class_net`, `class_console`.
+
+The native sound lease preserves pending packets and completed frame count
+across pause/resume, clears pending application data on RESET, and permits
+ALSA silence/boundary playback through the common PCM bridge. Rewrites affect
+unsubmitted packets; completed packets retain their completed ownership.
 
 ## 4. Invariants & safety properties
 
