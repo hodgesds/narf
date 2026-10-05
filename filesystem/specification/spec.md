@@ -1131,6 +1131,13 @@ Network devices have canonical kobjects below `/sys/devices`: a PCI-backed
 interface lives at `/sys/devices/pci<segment>:<bus>/<BDF>/net/<dev>`, with
 matching PCI identity, driver, and `/sys/bus/pci/devices` links, while only a
 parentless interface such as `lo` lives below `/sys/devices/virtual/net`.
+Every PCIe function in the authoritative `bus` registry has that canonical
+PCI parent regardless of whether a network, graphics, or storage driver binds
+it. Its `/sys/bus/pci/devices/<BDF>` discovery link resolves to the same
+kobject, and its read-only `config` binary attribute reads the live 4 KiB ECAM
+window at the caller's offset. The projection never invents a config header or
+a PCI location: a missing ECAM mapping yields no bytes rather than fabricated
+values.
 `/sys/class/net/<dev>` is a discovery symlink. They are populated from the network stack's interface list after the
 NIC drivers have probed and the cross-crate snapshot hook plus loopback device
 are installed. That completed projection begins or extends the bounded udev

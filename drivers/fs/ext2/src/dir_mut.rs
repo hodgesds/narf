@@ -404,13 +404,35 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         name: &[u8],
         mode: u16,
     ) -> Result<u32, FsError> {
+        self.dir_create_regular_with_attrs(parent_inode_no, name, mode, 0, 0)
+            .await
+    }
+
+    /// Create a regular file with its final mode and owner before publishing
+    /// the name in its parent directory.  Files opened through `O_CREAT` must
+    /// never be observable as a root-owned `0644` placeholder while a later
+    /// chmod/chown catches up.
+    pub(crate) async fn dir_create_regular_with_attrs(
+        &self,
+        parent_inode_no: u32,
+        name: &[u8],
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<u32, FsError> {
+        let _update = self.inode_update_lock.lock().await;
         let now = Ext2Volume::<B>::now_secs();
         // Allocate inode + initialise with timestamps.
         let new_ino = self.alloc_inode().await?;
         let mut new_inode = Inode::new_regular(mode);
+        new_inode.uid = uid;
+        new_inode.gid = gid;
         new_inode.atime = now;
         new_inode.touch_ctime_mtime(now);
-        self.write_new_inode(new_ino, &new_inode).await?;
+        if let Err(error) = self.write_new_inode(new_ino, &new_inode).await {
+            let _ = self.abort_inode_allocation(new_ino).await;
+            return Err(error);
+        }
         // Splice the dirent into the parent.
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -447,6 +469,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         name: &[u8],
         mode: u16,
     ) -> Result<u32, FsError> {
+        let _update = self.inode_update_lock.lock().await;
         let now = Ext2Volume::<B>::now_secs();
         let bs = self.block_size();
         // Allocate the inode + a data block.
@@ -458,7 +481,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let data_block = match self.alloc_block().await {
             Ok(b) => b,
             Err(e) => {
-                let _ = self.free_inode(new_ino).await;
+                let _ = self.abort_inode_allocation(new_ino).await;
                 return Err(e);
             }
         };
@@ -479,11 +502,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             .await
         {
             let _ = self.free_block(data_block).await;
-            let _ = self.free_inode(new_ino).await;
+            let _ = self.abort_inode_allocation(new_ino).await;
             return Err(e);
         }
         // Persist the new dir inode.
-        self.write_new_inode(new_ino, &new_inode).await?;
+        if let Err(error) = self.write_new_inode(new_ino, &new_inode).await {
+            let _ = self.free_block(data_block).await;
+            let _ = self.abort_inode_allocation(new_ino).await;
+            return Err(error);
+        }
         // Splice into the parent.
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -516,6 +543,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Remove a file dirent. Decrements the target's link count; if
     /// it drops to zero, frees its blocks + inode slot.
     pub async fn dir_unlink(&self, parent_inode_no: u32, name: &[u8]) -> Result<(), FsError> {
+        let _update = self.inode_update_lock.lock().await;
         let now = Ext2Volume::<B>::now_secs();
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -560,6 +588,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// (rmdir invalidates the slot — `.` and `..` are removed
     /// implicitly when the block is freed).
     pub async fn dir_rmdir(&self, parent_inode_no: u32, name: &[u8]) -> Result<(), FsError> {
+        let _update = self.inode_update_lock.lock().await;
         let now = Ext2Volume::<B>::now_secs();
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -603,6 +632,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         name: &[u8],
         target_ino: u32,
     ) -> Result<(), FsError> {
+        let _update = self.inode_update_lock.lock().await;
         let now = Ext2Volume::<B>::now_secs();
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -645,6 +675,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         new_parent_inode_no: u32,
         new_name: &[u8],
     ) -> Result<(), FsError> {
+        let _update = self.inode_update_lock.lock().await;
         let now = Ext2Volume::<B>::now_secs();
         // Look up the source so we know what to splice into the dest.
         let old_parent = self.read_inode(old_parent_inode_no).await?;
@@ -781,6 +812,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         name: &[u8],
         target: &[u8],
     ) -> Result<u32, FsError> {
+        let _update = self.inode_update_lock.lock().await;
         let now = Ext2Volume::<B>::now_secs();
         if target.is_empty() {
             return Err(FsError::InvalidPath);
@@ -810,23 +842,33 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             // Slow symlink — store target in a data block.
             let bs = self.block_size();
             if target.len() > bs {
-                let _ = self.free_inode(new_ino).await;
+                let _ = self.abort_inode_allocation(new_ino).await;
                 return Err(FsError::InvalidPath);
             }
             let data_block = match self.alloc_block().await {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = self.free_inode(new_ino).await;
+                    let _ = self.abort_inode_allocation(new_ino).await;
                     return Err(e);
                 }
             };
             let mut buf = vec![0u8; bs];
             buf[..target.len()].copy_from_slice(target);
-            self.write_block(data_block, &buf).await?;
+            if let Err(error) = self.write_block(data_block, &buf).await {
+                let _ = self.free_block(data_block).await;
+                let _ = self.abort_inode_allocation(new_ino).await;
+                return Err(error);
+            }
             new_inode.block[0] = data_block as u32;
             new_inode.blocks = bs as u32 / 512;
         }
-        self.write_new_inode(new_ino, &new_inode).await?;
+        if let Err(error) = self.write_new_inode(new_ino, &new_inode).await {
+            if new_inode.blocks != 0 {
+                let _ = self.free_block(new_inode.block[0] as u64).await;
+            }
+            let _ = self.abort_inode_allocation(new_ino).await;
+            return Err(error);
+        }
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
             let _ = self.free_inode(new_ino).await;

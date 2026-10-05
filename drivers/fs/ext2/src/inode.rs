@@ -73,6 +73,9 @@ pub struct Inode {
     pub ctime: u32,
     /// `i_mtime` — last data-content modification time.
     pub mtime: u32,
+    /// `i_dtime` — deletion time. A non-zero value marks an unlinked inode
+    /// slot as deleted until the allocator reuses it.
+    pub dtime: u32,
     /// POSIX group owner id (`i_gid` plus Linux `l_i_gid_high`).
     pub gid: u32,
     /// `i_blocks` — count of 512-byte sectors held by the file.
@@ -110,6 +113,7 @@ impl Inode {
         let atime = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let ctime = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
         let mtime = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let dtime = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
         let gid = u16::from_le_bytes([buf[24], buf[25]]) as u32
             | ((u16::from_le_bytes([buf[122], buf[123]]) as u32) << 16);
         let links_count = u16::from_le_bytes([buf[26], buf[27]]);
@@ -140,6 +144,7 @@ impl Inode {
             atime,
             ctime,
             mtime,
+            dtime,
             gid,
             blocks,
             links_count,
@@ -188,6 +193,7 @@ impl Inode {
         buf[8..12].copy_from_slice(&self.atime.to_le_bytes());
         buf[12..16].copy_from_slice(&self.ctime.to_le_bytes());
         buf[16..20].copy_from_slice(&self.mtime.to_le_bytes());
+        buf[20..24].copy_from_slice(&self.dtime.to_le_bytes());
         buf[24..26].copy_from_slice(&(self.gid as u16).to_le_bytes());
         buf[26..28].copy_from_slice(&self.links_count.to_le_bytes());
         buf[28..32].copy_from_slice(&self.blocks.to_le_bytes());
@@ -204,12 +210,13 @@ impl Inode {
     /// Build a fresh regular-file inode.
     pub fn new_regular(perms: u16) -> Self {
         Self {
-            mode: S_IFREG | (perms & 0o777),
+            mode: S_IFREG | (perms & 0o7777),
             uid: 0,
             size: 0,
             atime: 0,
             ctime: 0,
             mtime: 0,
+            dtime: 0,
             gid: 0,
             blocks: 0,
             links_count: 1,
@@ -229,6 +236,7 @@ impl Inode {
             atime: 0,
             ctime: 0,
             mtime: 0,
+            dtime: 0,
             gid: 0,
             blocks: 0,
             // Fresh dir has links_count = 2 ("." back-link + parent's
@@ -252,9 +260,32 @@ impl Inode {
             atime: 0,
             ctime: 0,
             mtime: 0,
+            dtime: 0,
             gid: 0,
             blocks: 0,
             links_count: 1,
+            flags: 0,
+            generation: 0,
+            block: [0; I_BLOCK_LEN],
+            has_xattrs: false,
+        }
+    }
+
+    /// Build a cleared inode-table slot for an inode that has been unlinked.
+    /// `i_dtime` remains non-zero after the allocation bit is released so
+    /// ext4 tooling never mistakes stale metadata for a live orphan.
+    pub fn deleted(now: u32) -> Self {
+        Self {
+            mode: 0,
+            uid: 0,
+            size: 0,
+            atime: 0,
+            ctime: 0,
+            mtime: 0,
+            dtime: now.max(1),
+            gid: 0,
+            blocks: 0,
+            links_count: 0,
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],

@@ -1683,6 +1683,99 @@ kernel_test_in!(
     smoke_ext4_metadata_csum_writable_mkdir_survives_remount
 );
 
+/// `open(O_CREAT)` on a real ext4 root must persist the creator's ownership
+/// and final mode, including special mode bits, through a remount.  Desktop
+/// lock files use this path; publishing a root-owned `0644` placeholder and
+/// correcting it afterward is neither atomic nor crash-safe.
+fn smoke_ext4_metadata_csum_create_persists_initial_attrs() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let mut image = build_ext4_extent_image(b"checksummed extent data");
+    if sign_ext4_metadata_csum_fixture(&mut image).is_err() {
+        return TestResult::Fail("could not sign metadata-csum fixture");
+    }
+    let device = RamBlockDevice::from_image(512, image);
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("metadata-csum fixture did not mount"),
+    };
+    let file = match poll_once(
+        volume
+            .root()
+            .create_with_attrs("narf-lock", 0o6754, 1000, 1001),
+    ) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("create_with_attrs failed on metadata-csum ext4"),
+    };
+    if file.owners() != (1000, 1001) || file.stat().mode.perms != 0o6754 {
+        return TestResult::Fail("created inode did not retain its requested owner or mode");
+    }
+    drop(file);
+    drop(volume);
+
+    let remounted = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("metadata-csum volume failed to remount after create"),
+    };
+    let file = match poll_once(remounted.root().lookup_async("narf-lock")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("created inode disappeared after remount"),
+    };
+    if file.owners() != (1000, 1001) || file.stat().mode.perms != 0o6754 {
+        return TestResult::Fail("remounted created inode lost owner or mode metadata");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_metadata_csum_create_persists_initial_attrs
+);
+
+/// Rolling back a created inode must leave a valid deleted on-disk record.
+/// Clearing only its bitmap bit leaves a zero deletion time and stale mode,
+/// which e2fsck reports as a corrupt free inode.
+fn smoke_ext2_free_inode_clears_deleted_slot() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    use crate::inode::Inode;
+    use crate::volume::Ext2Volume;
+
+    let volume = match poll_once(Ext2Volume::mount(
+        RamBlockDevice::from_image(512, build_ext2_image(b"data")),
+        DomainId::DRIVER_0,
+    )) {
+        Some(Ok(volume)) => volume,
+        _ => return TestResult::Fail("ext2 fixture did not mount"),
+    };
+    let ino = match poll_once(volume.alloc_inode()) {
+        Some(Ok(ino)) => ino,
+        _ => return TestResult::Fail("inode allocation failed"),
+    };
+    if !matches!(
+        poll_once(volume.write_new_inode(ino, &Inode::new_regular(0o600))),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("could not initialise test inode");
+    }
+    if !matches!(poll_once(volume.free_inode(ino)), Some(Ok(()))) {
+        return TestResult::Fail("free_inode failed");
+    }
+    let deleted = match poll_once(volume.read_inode(ino)) {
+        Some(Ok(inode)) => inode,
+        _ => return TestResult::Fail("deleted inode no longer decodes"),
+    };
+    if deleted.mode != 0 || deleted.links_count != 0 || deleted.dtime == 0 {
+        return TestResult::Fail("freed inode retained live metadata or lacked deletion time");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_free_inode_clears_deleted_slot);
+
 /// `ExtentLeaf::parse`: an extent is uninitialized only when `ee_len > 32768`
 /// (real length `ee_len - 32768`); `ee_len == 32768` is a MAX-LENGTH
 /// INITIALIZED extent, not a hole. Masking bit 15 wrongly zeroed a 128 MiB

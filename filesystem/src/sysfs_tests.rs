@@ -1612,6 +1612,111 @@ fn smoke_sysfs_power_supply_vfs_read() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_sysfs_power_supply_vfs_read);
 
+/// Every PCIe function the bus layer discovers must have one canonical sysfs
+/// parent and a visible `config` endpoint.  Driver classes are deliberately
+/// absent from this fixture: storage, display, and unbound functions need the
+/// same base projection as a network device.
+fn smoke_sysfs_pci_registry_projection_is_complete() -> TestResult {
+    use narf_bus::addr::{BusAddr, PcieAddr};
+    use narf_bus::device::{BusDevice, BusKind, DeviceId};
+    use narf_bus::registry as bus_registry;
+    use narf_memory::PhysAddr;
+
+    let saved_registry = narf_bus::snapshot();
+    let fixture = alloc::vec![
+        BusDevice {
+            addr: BusAddr::Pcie(PcieAddr::new(0, 0x02, 0x03, 1)),
+            id: DeviceId {
+                vendor: 0x1af4,
+                device: 0x1050,
+                class: 0x038000,
+                subsystem_vendor: 0x1af4,
+                subsystem_id: 0x1050,
+            },
+            kind: BusKind::Pcie {
+                addr: PcieAddr::new(0, 0x02, 0x03, 1),
+                // The fixture intentionally has no mapped ECAM. The test
+                // checks that sysfs creates an endpoint, not a fake header.
+                cfg_phys: PhysAddr::new(0),
+            },
+        },
+        BusDevice {
+            addr: BusAddr::Pcie(PcieAddr::new(0x1234, 0x04, 0x05, 0)),
+            id: DeviceId {
+                vendor: 0x8086,
+                device: 0x2922,
+                class: 0x010601,
+                subsystem_vendor: 0x1028,
+                subsystem_id: 0x1f2d,
+            },
+            kind: BusKind::Pcie {
+                addr: PcieAddr::new(0x1234, 0x04, 0x05, 0),
+                cfg_phys: PhysAddr::new(0),
+            },
+        },
+    ];
+    bus_registry::install(fixture);
+    crate::sysfs::__reset_for_test();
+    crate::sysfs::populate_pci_devices();
+
+    let result = (|| {
+        let root = crate::sysfs::get_root();
+        for (host, slot, vendor, device, class) in [
+            (
+                "pci0000:02",
+                "0000:02:03.1",
+                "0x1af4\n",
+                "0x1050\n",
+                "0x038000\n",
+            ),
+            (
+                "pci1234:04",
+                "1234:04:05.0",
+                "0x8086\n",
+                "0x2922\n",
+                "0x010601\n",
+            ),
+        ] {
+            let node = root
+                .get_child("devices")
+                .and_then(|devices| devices.get_child(host))
+                .and_then(|pci_host| pci_host.get_child(slot))
+                .ok_or("registry PCI function has no canonical sysfs node")?;
+            if node.attr_show("vendor").as_deref() != Some(vendor)
+                || node.attr_show("device").as_deref() != Some(device)
+                || node.attr_show("class").as_deref() != Some(class)
+                || !node.has_attr("config")
+            {
+                return Err("registry PCI node has incomplete identity or config endpoint");
+            }
+            if node.get_symlink("subsystem").as_deref() != Some("../../../bus/pci") {
+                return Err("registry PCI node has no /sys/bus/pci subsystem link");
+            }
+            let discover = root
+                .get_child("bus")
+                .and_then(|bus| bus.get_child("pci"))
+                .and_then(|pci| pci.get_child("devices"))
+                .and_then(|devices| devices.get_symlink(slot));
+            let expected = alloc::format!("../../../devices/{host}/{slot}");
+            if discover.as_deref() != Some(expected.as_str()) {
+                return Err("registry PCI function has no /sys/bus/pci/devices link");
+            }
+        }
+        Ok(())
+    })();
+
+    bus_registry::install(saved_registry);
+    crate::sysfs::__reset_for_test();
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_sysfs_pci_registry_projection_is_complete
+);
+
 // A registered BINARY attribute must be reachable from the VFS — both
 // openable by name and present in readdir.
 //
