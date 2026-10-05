@@ -3346,3 +3346,257 @@ fn smoke_abi_ioerrno_syncfs_errno_and_valid() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ioerrno_syncfs_errno_and_valid);
+
+// ── splice advanced precedence ───────────────────────────────────────
+fn smoke_abi_ioerrno_splice_advanced_precedence() -> TestResult {
+    with_memfs(
+        "/abi-splice",
+        "abi-splice",
+        &[("src", b"test_source"), ("dst", b"test_dest")],
+        || {
+            let mk = |in_fd, off_in, out_fd, off_out, len, flags| SyscallArgs {
+                arg0: in_fd,
+                arg1: off_in,
+                arg2: out_fd,
+                arg3: off_out,
+                arg4: len,
+                arg5: flags,
+            };
+
+            // 1. requested == 0 fast path returns 0 before checking flags or fds
+            if call(
+                Syscall::Splice.raw(),
+                mk(9999, BAD_PTR, 9998, BAD_PTR, 0, 0x80),
+            ) != Some(0)
+            {
+                return Err("splice with len == 0 must return 0 before flags/fds");
+            }
+
+            // 2. flags & !SPLICE_F_ALL returns -EINVAL before fd lookup
+            if call(Syscall::Splice.raw(), mk(9999, 0, 9998, 0, 10, 0x80)) != Some(EINVAL) {
+                return Err("splice with invalid flags must return -EINVAL before fd lookup");
+            }
+
+            let (rd, wr) = make_pipe()?;
+            let file_src = open_fd_flags(b"/abi-splice/src\0", crate::fd::O_RDONLY as u64)?;
+            let file_dst = open_fd_flags(b"/abi-splice/dst\0", crate::fd::O_WRONLY as u64)?;
+
+            // 3. Offset pointer on a pipe side returns -ESPIPE without dereferencing pointer
+            if call(
+                Syscall::Splice.raw(),
+                mk(rd as u64, BAD_PTR, file_dst as u64, 0, 10, 0),
+            ) != Some(ESPIPE)
+            {
+                return Err("splice with offset on pipe input must be -ESPIPE");
+            }
+            if call(
+                Syscall::Splice.raw(),
+                mk(file_src as u64, 0, wr as u64, BAD_PTR, 10, 0),
+            ) != Some(ESPIPE)
+            {
+                return Err("splice with offset on pipe output must be -ESPIPE");
+            }
+
+            // 4. Neither descriptor is a pipe returns -EINVAL
+            if call(
+                Syscall::Splice.raw(),
+                mk(file_src as u64, 0, file_dst as u64, 0, 10, 0),
+            ) != Some(EINVAL)
+            {
+                return Err("splice without pipe descriptor must return -EINVAL");
+            }
+
+            // 5. Pipe read end passed as output (not writable) returns -EBADF
+            if call(
+                Syscall::Splice.raw(),
+                mk(file_src as u64, 0, rd as u64, 0, 10, 0),
+            ) != Some(EBADF)
+            {
+                return Err("splice with read-only pipe as output must return -EBADF");
+            }
+
+            let _ = call(Syscall::Close.raw(), a0(rd as u64));
+            let _ = call(Syscall::Close.raw(), a0(wr as u64));
+            let _ = call(Syscall::Close.raw(), a0(file_src as u64));
+            let _ = call(Syscall::Close.raw(), a0(file_dst as u64));
+            Ok(())
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_splice_advanced_precedence);
+
+// ── tee advanced precedence ──────────────────────────────────────────
+fn smoke_abi_ioerrno_tee_advanced_precedence() -> TestResult {
+    with_memfs(
+        "/abi-tee",
+        "abi-tee",
+        &[("dst", b"destination_file")],
+        || {
+            // 1. Invalid flags returns -EINVAL before fds
+            if call(Syscall::Tee.raw(), a3(9999, 9998, 10, 0x80)) != Some(EINVAL) {
+                return Err("tee with invalid flags must return -EINVAL before fds");
+            }
+
+            // 2. len == 0 returns 0 before fds
+            if call(Syscall::Tee.raw(), a3(9999, 9998, 0, 0)) != Some(0) {
+                return Err("tee with len == 0 must return 0 before fds");
+            }
+
+            let (rd1, wr1) = make_pipe()?;
+            let (rd2, wr2) = make_pipe()?;
+            let file_dst = open_fd_flags(b"/abi-tee/dst\0", crate::fd::O_WRONLY as u64)?;
+
+            // 3. Non-pipe destination returns -EINVAL
+            if call(Syscall::Tee.raw(), a3(rd1 as u64, file_dst as u64, 10, 0)) != Some(EINVAL) {
+                return Err("tee to non-pipe must return -EINVAL");
+            }
+
+            // 4. Same pipe input and output returns -EINVAL
+            if call(Syscall::Tee.raw(), a3(rd1 as u64, wr1 as u64, 10, 0)) != Some(EINVAL) {
+                return Err("tee to same pipe must return -EINVAL");
+            }
+
+            let _ = call(Syscall::Close.raw(), a0(rd1 as u64));
+            let _ = call(Syscall::Close.raw(), a0(wr1 as u64));
+            let _ = call(Syscall::Close.raw(), a0(rd2 as u64));
+            let _ = call(Syscall::Close.raw(), a0(wr2 as u64));
+            let _ = call(Syscall::Close.raw(), a0(file_dst as u64));
+            Ok(())
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_tee_advanced_precedence);
+
+// ── vmsplice advanced precedence ─────────────────────────────────────
+fn smoke_abi_ioerrno_vmsplice_advanced_precedence() -> TestResult {
+    with_memfs(
+        "/abi-vmsplice",
+        "abi-vmsplice",
+        &[("f", b"test_target")],
+        || {
+            // 1. Invalid flags returns -EINVAL before fds
+            if call(Syscall::Vmsplice.raw(), a3(9999, 0, 0, 0x80)) != Some(EINVAL) {
+                return Err("vmsplice with invalid flags must return -EINVAL before fds");
+            }
+
+            let file_fd = open_fd_flags(b"/abi-vmsplice/f\0", crate::fd::O_WRONLY as u64)?;
+            let (_rd, wr) = make_pipe()?;
+            let mut buf = [0u8; 16];
+            let iov = iovec(buf.as_mut_ptr() as u64, 16);
+
+            // 2. total_len == 0 returns 0 even on a non-pipe fd
+            if call(Syscall::Vmsplice.raw(), a3(file_fd as u64, 0, 0, 0)) != Some(0) {
+                return Err("vmsplice with total_len == 0 on non-pipe must return 0");
+            }
+
+            // 3. total_len > 0 on a non-pipe returns -EBADF
+            if call(
+                Syscall::Vmsplice.raw(),
+                a3(file_fd as u64, iov.as_ptr() as u64, 1, 0),
+            ) != Some(EBADF)
+            {
+                return Err("vmsplice with total_len > 0 on non-pipe must return -EBADF");
+            }
+
+            // 4. nr_segs > 1024 returns -EINVAL
+            if call(
+                Syscall::Vmsplice.raw(),
+                a3(wr as u64, iov.as_ptr() as u64, 1025, 0),
+            ) != Some(EINVAL)
+            {
+                return Err("vmsplice with nr_segs > 1024 must return -EINVAL");
+            }
+
+            let _ = call(Syscall::Close.raw(), a0(file_fd as u64));
+            let _ = call(Syscall::Close.raw(), a0(_rd as u64));
+            let _ = call(Syscall::Close.raw(), a0(wr as u64));
+            Ok(())
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_vmsplice_advanced_precedence
+);
+
+// ── epoll_ctl precedence and DEL with NULL event ─────────────────────
+fn smoke_abi_ioerrno_epoll_ctl_precedence_and_del() -> TestResult {
+    with_memfs(
+        "/abi-epoll",
+        "abi-epoll",
+        &[("target", b"regular_content")],
+        || {
+            let ep = make_epoll()?;
+            let (rd, wr) = make_pipe()?;
+            let file_fd = open_fd_flags(b"/abi-epoll/target\0", crate::fd::O_RDONLY as u64)?;
+            let ev = epoll_event(1, 42);
+
+            // 1. Faulting event pointer on ADD/MOD returns -EFAULT, outranking closed epfd 9999
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(9999, EPOLL_CTL_ADD, rd as u64, BAD_PTR),
+            ) != Some(EFAULT)
+            {
+                return Err(
+                    "epoll_ctl(ADD) with faulting event must return -EFAULT outranking closed epfd",
+                );
+            }
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(9999, EPOLL_CTL_MOD, rd as u64, BAD_PTR),
+            ) != Some(EFAULT)
+            {
+                return Err(
+                    "epoll_ctl(MOD) with faulting event must return -EFAULT outranking closed epfd",
+                );
+            }
+
+            // 2. EPOLL_CTL_ADD of a valid target succeeds
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(ep as u64, EPOLL_CTL_ADD, rd as u64, ev.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("epoll_ctl(ADD) should succeed");
+            }
+
+            // 3. EPOLL_CTL_DEL allows NULL event pointer and succeeds
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(ep as u64, EPOLL_CTL_DEL, rd as u64, 0),
+            ) != Some(0)
+            {
+                return Err("epoll_ctl(DEL) with NULL event pointer should return 0");
+            }
+
+            // 4. Target that cannot be polled (regular file) on non-epoll controller (pipe rd)
+            // returns -EPERM (unpollable target check precedes epfd is-epoll check -EINVAL)
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(rd as u64, EPOLL_CTL_ADD, file_fd as u64, ev.as_ptr() as u64),
+            ) != Some(EPERM)
+            {
+                return Err("epoll_ctl on unpollable target with non-epoll controller must return -EPERM ahead of -EINVAL");
+            }
+
+            // 5. Adding epfd to itself returns -EINVAL
+            if call(
+                Syscall::EpollCtl.raw(),
+                a3(ep as u64, EPOLL_CTL_ADD, ep as u64, ev.as_ptr() as u64),
+            ) != Some(EINVAL)
+            {
+                return Err("epoll_ctl adding epfd to itself must return -EINVAL");
+            }
+
+            let _ = call(Syscall::Close.raw(), a0(ep as u64));
+            let _ = call(Syscall::Close.raw(), a0(rd as u64));
+            let _ = call(Syscall::Close.raw(), a0(wr as u64));
+            let _ = call(Syscall::Close.raw(), a0(file_fd as u64));
+            Ok(())
+        },
+    )
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_epoll_ctl_precedence_and_del
+);
