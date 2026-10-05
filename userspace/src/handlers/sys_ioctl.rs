@@ -34,6 +34,24 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
     fn process_id(&self) -> u32 {
         task_to_pid_raw(current_task_id()).unwrap_or(current_task_id()) as u32
     }
+    fn install_file(
+        &self,
+        file: Arc<dyn narf_filesystem::FileOps>,
+        cloexec: bool,
+    ) -> Result<i32, narf_filesystem::FsError> {
+        let flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
+        crate::fd::install(
+            current_task_id(),
+            crate::fd::FdEntry {
+                ops: file,
+                offset: 0,
+                flags,
+                status_flags: 0,
+            },
+        )
+        .map(|n| n as i32)
+        .ok_or(narf_filesystem::FsError::OutOfMemory)
+    }
 }
 
 /// A dma-fence exposed through Linux's `sync_file` fd ABI.
