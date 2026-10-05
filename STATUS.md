@@ -50,6 +50,64 @@ SoundWire, HDMI/DP audio, vendor smart-amplifier quirks and system power-transit
 reinitialization remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
+## Desktop audio: stock PipeWire and WirePlumber
+
+Unmodified Fedora 43 PipeWire 1.4 and WirePlumber 0.5 run on the Fedora KDE
+image and get as far as a complete audio graph. The gate that drives them,
+what each of its stages establishes, and how to run it are in
+[verification/data/pipewire-compat](verification/data/pipewire-compat/README.md).
+
+Working and asserted end to end: both QEMU cards reach systemd-udevd's
+database with the properties `spa_alsa_udev` requires (`SOUND_INITIALIZED`,
+`ID_PATH`, PCI identity from hwdb); the desktop user opens the nodes;
+WirePlumber attaches as a second process over the PipeWire protocol and builds
+ACP card profiles (five on HDA, three on VirtIO), selects a best profile,
+finds HDA's hardware volume control, activates analog input and output routes,
+exports a sink per card plus a source, and sets the default sink and source.
+`wpctl status` lists them as a desktop would see them.
+
+Three Linux-ABI defects found by that path are fixed:
+
+- `/dev/snd/*` owner, mode and ACL now live on the devtmpfs NODE rather than
+  the per-lookup `FileOps`, and the nodes are published root-owned at 0600 as
+  `sound/sound_core.c` plus `drivers/base/devtmpfs.c` do. udev's `GROUP="audio"`
+  chown was previously discarded, so every non-root ALSA client reported "no
+  soundcards found" and no desktop session could play a sound.
+- `/proc/<pid>/root` is rendered in the READER's root frame, as Linux
+  `d_path()` does. The stored prefix is host-view, so a chrooted reader —
+  which is every process in this image — was handed a name that resolved to
+  nothing.
+- `/proc/{self,<pid>}/{root,cwd,exe}` are now FOLLOWABLE at `open` and at a
+  path `stat`, trailing slash included. An absolute magic-link target leaves
+  procfs, and the filesystem-local resolver restarted it at procfs's own mount
+  root. PipeWire's access module opens `/proc/<peer-pid>/root` to look for
+  `.flatpak-info` and reads a failed open as "this client is sandboxed", so
+  every client hung at connect.
+
+`/proc/<pid>/task/` is also now named by thread id instead of repeating the
+group's pid once per thread, which is what made procps abort with "fatal
+library error, reap" and `pthread_setname_np` return ENOENT.
+
+Open, with the failure localized:
+
+- **PCM streaming does not sustain.** Playback reaches `streaming` and falls
+  back to `paused`; capture oscillates `streaming`/`paused` and never writes a
+  frame. Both point at the ALSA node's driver role under PipeWire's
+  mmap + `avail_min` + period-event usage rather than at negotiation, which
+  completes. This is the remaining work for audible desktop audio.
+- **WirePlumber spins at 100% of one CPU** once the graph is built, where on
+  Linux it idles. The daemon stays idle, so the spin is local to the session
+  manager's own loop.
+- `/dev/fd/<n>` does not resolve, so bash process substitution (`cmd < <(…)`)
+  fails — the same absolute-symlink-across-mounts shape as the procfs links
+  above, through devtmpfs instead.
+- `ps -L` aborts with procps's "fatal library error, reap", and `strace -p`
+  cannot attach (`wait4(__WALL): No child processes`).
+- The realtime data loop is not exercised: `pam_limits` resets
+  `RLIMIT_RTPRIO` for a PAM login, so the gate drops privileges with
+  `setpriv`; a real seat session would inherit the limit from its user
+  manager.
+
 ## USB-C and Phoenix USB4
 
 UCSI ACPI connector discovery, firmware state notifications, per-NHI native
