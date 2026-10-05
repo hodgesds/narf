@@ -146,6 +146,31 @@ impl Scalar {
     pub fn sub(&self, other: &Self) -> Self {
         self.sub_unchecked(other)
     }
+
+    /// `(self * other) mod n`. Variable-time — ECDSA verification operands
+    /// are public, so no constant-time guarantee is made or needed. (SAE's
+    /// secret scalar work uses point multiplication and `add`, never this.)
+    pub fn mul(&self, other: &Self) -> Self {
+        Self(reduce512(mul_wide(self.0, other.0)))
+    }
+
+    /// Modular inverse `self^{-1} mod n` via Fermat's little theorem
+    /// (`self^(n-2) mod n`). Returns `ZERO` for a zero input. Variable-time.
+    pub fn invert(&self) -> Self {
+        if self.is_zero() {
+            return Self::ZERO;
+        }
+        let (exp, _) = sub4(ORDER_N, [2, 0, 0, 0]); // n - 2
+        let mut result = Self::ONE;
+        let base = *self;
+        for i in (0..256).rev() {
+            result = result.mul(&result);
+            if (exp[i / 64] >> (i % 64)) & 1 == 1 {
+                result = result.mul(&base);
+            }
+        }
+        result
+    }
 }
 
 // ── 4×u64 helpers (private to this module) ──────────────────────────
@@ -170,6 +195,53 @@ fn sub4(a: [u64; 4], b: [u64; 4]) -> ([u64; 4], bool) {
         borrow = if d < 0 { 1 } else { 0 };
     }
     (out, borrow != 0)
+}
+
+/// `a >= b` for 4-limb little-endian values.
+fn cmp_ge(a: [u64; 4], b: [u64; 4]) -> bool {
+    for i in (0..4).rev() {
+        if a[i] != b[i] {
+            return a[i] > b[i];
+        }
+    }
+    true
+}
+
+/// 256×256 → 512-bit schoolbook product (little-endian limbs).
+fn mul_wide(a: [u64; 4], b: [u64; 4]) -> [u64; 8] {
+    let mut out = [0u64; 8];
+    for i in 0..4 {
+        let mut carry: u128 = 0;
+        for j in 0..4 {
+            let t = out[i + j] as u128 + (a[i] as u128) * (b[j] as u128) + carry;
+            out[i + j] = t as u64;
+            carry = t >> 64;
+        }
+        out[i + 4] = carry as u64;
+    }
+    out
+}
+
+/// Reduce a 512-bit little-endian value mod n by binary long division.
+/// Variable-time; used only on public ECDSA operands.
+fn reduce512(x: [u64; 8]) -> [u64; 4] {
+    let mut r = [0u64; 4];
+    for i in (0..512).rev() {
+        let bit = (x[i / 64] >> (i % 64)) & 1;
+        // r = (r << 1) | bit, capturing the shifted-out 257th bit.
+        let top = r[3] >> 63;
+        r[3] = (r[3] << 1) | (r[2] >> 63);
+        r[2] = (r[2] << 1) | (r[1] >> 63);
+        r[1] = (r[1] << 1) | (r[0] >> 63);
+        r[0] = (r[0] << 1) | bit;
+        // Value is top·2^256 + r ∈ [0, 2n); one conditional subtract of n
+        // (when top set, sub4's borrow represents the 2^256 term).
+        if top == 1 || cmp_ge(r, ORDER_N) {
+            let (res, _) = sub4(r, ORDER_N);
+            r = res;
+        }
+    }
+    r
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -217,4 +289,28 @@ pub mod scalar_tests {
         TestResult::Pass
     }
     kernel_test_in!("crypto/p256", smoke_p256_scalar_bytes_roundtrip);
+
+    fn smoke_p256_scalar_mul_invert() -> TestResult {
+        // Known small product.
+        let three = Scalar::from_limbs([3, 0, 0, 0]);
+        let five = Scalar::from_limbs([5, 0, 0, 0]);
+        if three.mul(&five) != Scalar::from_limbs([15, 0, 0, 0]) {
+            return TestResult::Fail("3 * 5 != 15 mod n");
+        }
+        // a · a^{-1} ≡ 1 mod n validates mul + invert + the 512-bit reduce
+        // against the correct order n.
+        for seed in [0x02u8, 0x7f, 0xa3, 0xfe] {
+            let mut bytes = [seed; 32];
+            bytes[0] &= 0x7f; // keep the probe below n
+            let a = Scalar::from_bytes_be_reduce(&bytes);
+            if a.is_zero() {
+                continue;
+            }
+            if a.mul(&a.invert()) != Scalar::ONE {
+                return TestResult::Fail("a * a^-1 != 1 mod n");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("crypto/p256", smoke_p256_scalar_mul_invert);
 }

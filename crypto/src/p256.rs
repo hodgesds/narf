@@ -38,6 +38,7 @@
 
 #![allow(dead_code)]
 
+pub mod ecdsa;
 pub mod field;
 pub mod hash_to_curve;
 pub mod point;
