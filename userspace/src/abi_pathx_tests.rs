@@ -3559,6 +3559,157 @@ fn call_statx(dirfd: u64, path: u64, flags: u64, mask: u64, buf: u64) -> Option<
     call(Syscall::Statx.raw(), a4(dirfd, path, flags, mask, buf))
 }
 
+// A `statx` request is a metadata read, but on ext2 its path walk can still
+// queue block I/O.  The generic `poll_blocking` fallback gives up after four
+// million polls; that used to turn a healthy, slow lookup into ENOENT.  eza
+// then prints its error fallback (`.--------- 0 root -`) for every entry.
+//
+// Match eza's real request shape: an absolute path, AT_SYMLINK_NOFOLLOW, and
+// STATX_BASIC_STATS | STATX_BTIME.  The lookup completes one poll after the
+// short budget, so this pins the stat path to the I/O completion driver.
+fn smoke_abi_pathx_statx_slow_lookup_preserves_metadata() -> TestResult {
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use narf_filesystem::{
+        DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat,
+    };
+
+    struct PendN(u64);
+    impl core::future::Future for PendN {
+        type Output = ();
+
+        fn poll(
+            mut self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<()> {
+            if self.0 == 0 {
+                core::task::Poll::Ready(())
+            } else {
+                self.0 -= 1;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        }
+    }
+
+    const SLOW_LOOKUP_PENDS: u64 = 4_000_001;
+
+    struct SlowStatFile;
+    impl FileOps for SlowStatFile {
+        fn ino(&self) -> u64 {
+            0x5354_4154_0001
+        }
+
+        fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Err(FsError::ReadOnly) })
+        }
+
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 123,
+                blocks: 1,
+                mode: Mode {
+                    file_type: FileType::File,
+                    perms: 0o640,
+                },
+                mtime_cycles: 0,
+            }
+        }
+
+        fn owners(&self) -> (u32, u32) {
+            (1000, 1000)
+        }
+    }
+
+    struct SlowStatDir {
+        file: Arc<SlowStatFile>,
+    }
+    impl DirOps for SlowStatDir {
+        fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
+            // This is intentionally async-only, like the on-disk ext2
+            // directory implementation.  A sync fallback would hide the
+            // regression in the stat path.
+            None
+        }
+
+        fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
+            let result = (name == "probe").then(|| self.file.clone() as Arc<dyn FileOps>);
+            Box::pin(async move {
+                PendN(SLOW_LOOKUP_PENDS).await;
+                result.ok_or(FsError::NotFound)
+            })
+        }
+
+        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
+            Box::new(core::iter::empty())
+        }
+    }
+
+    struct SlowStatFs {
+        root: Arc<SlowStatDir>,
+    }
+    impl FsInstance for SlowStatFs {
+        fn root(&self) -> Arc<dyn DirOps> {
+            self.root.clone()
+        }
+
+        fn name(&self) -> &str {
+            "slow-statx"
+        }
+    }
+
+    with_setup(|| {
+        const MOUNT: &str = "/statx-slow";
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let handle = registry()
+            .mount(
+                &auth,
+                MOUNT,
+                SlowStatFs {
+                    root: Arc::new(SlowStatDir {
+                        file: Arc::new(SlowStatFile),
+                    }),
+                },
+            )
+            .map_err(|_| "slow statx filesystem mount failed")?;
+
+        let outcome = (|| {
+            let path = b"/statx-slow/probe\0";
+            let mut out = crate::handlers::linux_compat::Statx::default();
+            let result = call_statx(
+                AT_FDCWD,
+                path.as_ptr() as u64,
+                AT_SYMLINK_NOFOLLOW,
+                STATX_BASIC_STATS | 0x0800,
+                &mut out as *mut _ as u64,
+            );
+            if result != Some(0) {
+                return Err("statx gave up on a slow but successful lookup");
+            }
+            if out.stx_mode != 0o100640 {
+                return Err("statx lost the slow file's type or permissions");
+            }
+            if (out.stx_uid, out.stx_gid) != (1000, 1000) {
+                return Err("statx lost the slow file's ownership metadata");
+            }
+            if out.stx_size != 123 {
+                return Err("statx lost the slow file's size metadata");
+            }
+            Ok(())
+        })();
+        let _ = registry().unmount(&handle, MOUNT);
+        outcome
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_statx_slow_lookup_preserves_metadata
+);
+
 // `fs/stat.c::SYSCALL_DEFINE2(newstat)` → vfs_stat → cp_new_stat.
 fn smoke_abi_pathx_stat_errnos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {

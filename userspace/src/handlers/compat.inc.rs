@@ -1359,7 +1359,11 @@ fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathSta
             // `open`/`execve` of the same path succeeded. That made every
             // PATH probe (busybox/ash search applets via stat) report
             // "not found" inside a mounted distro rootfs.
-            poll_blocking(narf_filesystem::resolve_async_dentry_ext(
+            // Metadata probes are disk I/O too. A heavily queued ext2 lookup
+            // may legitimately remain pending beyond poll_blocking's short
+            // fallback budget; treating that as "not found" makes statx
+            // callers such as eza render every inode as unknown.
+            poll_io_to_completion(narf_filesystem::resolve_async_dentry_ext(
                 root,
                 rel,
                 follow_final,
