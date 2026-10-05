@@ -8,6 +8,7 @@ use crate::abi_test_support::*;
 
 const AT_FDCWD: u64 = (-100i64) as u64;
 const O_RDONLY: u64 = 0;
+const BAD_PTR: u64 = 0x0001_0000_0000_0000;
 
 // ── openat: Linux (dirfd, path_ptr NUL-term, flags) ──
 
@@ -1361,6 +1362,65 @@ fn smoke_abi_path_utimes_sets_mtime() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_utimes_sets_mtime);
 
+fn smoke_abi_path_utimes_negative_and_null_tv() -> TestResult {
+    with_memfs("/p-utimes", "p-utimes", &[("f", b"hello")], || {
+        if !wired(Syscall::Utimes) {
+            return Ok(());
+        }
+        let path = c"/p-utimes/f";
+        const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+
+        // 1. NULL tv pointer sets current time and returns 0
+        if call(Syscall::Utimes.raw(), a1(path.as_ptr() as u64, 0)) != Some(0) {
+            return Err("utimes with null tv_ptr must succeed (set current time)");
+        }
+
+        // 2. Nonexistent file returns -ENOENT
+        let bad_path = c"/p-utimes/no_such_file";
+        let valid_tv: [i64; 4] = [100, 0, 200, 0];
+        if call(
+            Syscall::Utimes.raw(),
+            a1(bad_path.as_ptr() as u64, valid_tv.as_ptr() as u64),
+        ) != Some(ENOENT)
+        {
+            return Err("utimes on nonexistent path must return -ENOENT");
+        }
+
+        // 3. NULL path pointer returns -EFAULT
+        if call(Syscall::Utimes.raw(), a1(0, valid_tv.as_ptr() as u64)) != Some(EFAULT) {
+            return Err("utimes with NULL path pointer must return -EFAULT");
+        }
+
+        // 4. Faulting tv pointer returns -EFAULT
+        if call(Syscall::Utimes.raw(), a1(path.as_ptr() as u64, BAD_PTR)) != Some(EFAULT) {
+            return Err("utimes with faulting tv pointer must return -EFAULT");
+        }
+
+        // 5. Invalid usec (>= 1_000_000) returns -EINVAL
+        let invalid_tv_high: [i64; 4] = [100, 1_000_000, 200, 0];
+        if call(
+            Syscall::Utimes.raw(),
+            a1(path.as_ptr() as u64, invalid_tv_high.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("utimes with tv_usec >= 1_000_000 must return -EINVAL");
+        }
+
+        // 6. Negative usec returns -EINVAL
+        let invalid_tv_neg: [i64; 4] = [100, 0, 200, -1];
+        if call(
+            Syscall::Utimes.raw(),
+            a1(path.as_ptr() as u64, invalid_tv_neg.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("utimes with negative tv_usec must return -EINVAL");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_utimes_negative_and_null_tv);
+
 fn smoke_abi_path_utime_sets_mtime_seconds() -> TestResult {
     with_memfs("/p", "p", &[("f", b"hi")], || {
         let path = b"/p/f\0";
@@ -2353,3 +2413,190 @@ fn smoke_abi_path_getcwd_errno() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_getcwd_errno);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_path_utime_negative_errnos() -> TestResult {
+    with_memfs("/p_utime", "p_utime", &[("f", b"hello")], || {
+        let path = c"/p_utime/f";
+        let ghost = c"/p_utime/nonexistent";
+
+        // 1. NULL times pointer sets times to now (success -> 0).
+        if call(Syscall::Utime.raw(), a1(path.as_ptr() as u64, 0)) != Some(0) {
+            return Err("utime(path, NULL) should return 0");
+        }
+
+        // 2. Nonexistent path with NULL times -> -ENOENT.
+        if call(Syscall::Utime.raw(), a1(ghost.as_ptr() as u64, 0)) != Some(ENOENT) {
+            return Err("utime(ghost, NULL) must return -ENOENT");
+        }
+
+        // 3. Bad path pointer -> -EFAULT.
+        if call(Syscall::Utime.raw(), a1(BAD_PTR, 0)) != Some(EFAULT) {
+            return Err("utime(BAD_PTR, NULL) must return -EFAULT");
+        }
+
+        // 4. Bad times pointer -> -EFAULT.
+        if call(Syscall::Utime.raw(), a1(path.as_ptr() as u64, BAD_PTR)) != Some(EFAULT) {
+            return Err("utime(path, BAD_PTR) must return -EFAULT");
+        }
+
+        // 5. Times buffer is read BEFORE the path, so BAD_PTR times with BAD_PTR path is EFAULT.
+        if call(Syscall::Utime.raw(), a1(BAD_PTR, BAD_PTR)) != Some(EFAULT) {
+            return Err("utime(BAD_PTR, BAD_PTR) must return -EFAULT");
+        }
+
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_path_utime_negative_errnos);
+
+fn smoke_abi_path_symlink_exact_errnos() -> TestResult {
+    with_memfs("/p_sym", "p_sym", &[("target_file", b"hello")], || {
+        let target = c"target_file";
+        let linkpath = c"/p_sym/new_link";
+        let existing = c"/p_sym/target_file";
+        let empty = c"";
+
+        // 1. Empty target string -> -ENOENT.
+        if call(
+            Syscall::Symlink.raw(),
+            a1(empty.as_ptr() as u64, linkpath.as_ptr() as u64),
+        ) != Some(ENOENT)
+        {
+            return Err("symlink with empty target must return -ENOENT");
+        }
+
+        // 2. Empty linkpath -> -ENOENT.
+        if call(
+            Syscall::Symlink.raw(),
+            a1(target.as_ptr() as u64, empty.as_ptr() as u64),
+        ) != Some(ENOENT)
+        {
+            return Err("symlink with empty linkpath must return -ENOENT");
+        }
+
+        // 3. Bad target pointer -> -EFAULT.
+        if call(
+            Syscall::Symlink.raw(),
+            a1(BAD_PTR, linkpath.as_ptr() as u64),
+        ) != Some(EFAULT)
+        {
+            return Err("symlink with BAD_PTR target must return -EFAULT");
+        }
+
+        // 4. Bad linkpath pointer -> -EFAULT.
+        if call(Syscall::Symlink.raw(), a1(target.as_ptr() as u64, BAD_PTR)) != Some(EFAULT) {
+            return Err("symlink with BAD_PTR linkpath must return -EFAULT");
+        }
+
+        // 5. Existing link destination -> -EEXIST.
+        if call(
+            Syscall::Symlink.raw(),
+            a1(target.as_ptr() as u64, existing.as_ptr() as u64),
+        ) != Some(EEXIST)
+        {
+            return Err("symlink to existing destination must return -EEXIST");
+        }
+
+        // 6. Valid link creation -> 0.
+        if call(
+            Syscall::Symlink.raw(),
+            a1(target.as_ptr() as u64, linkpath.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("symlink with valid target and linkpath should return 0");
+        }
+
+        // 7. Verify link resolution via readlinkat.
+        let mut buf = [0u8; 32];
+        let r = call(
+            Syscall::Readlinkat.raw(),
+            a3(
+                AT_FDCWD,
+                linkpath.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ),
+        );
+        if r != Some(target.to_bytes().len() as i64)
+            || &buf[..target.to_bytes().len()] != target.to_bytes()
+        {
+            return Err("readlinkat did not read back the symlink target");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_symlink_exact_errnos);
+
+fn smoke_abi_path_unlink_exact_errnos() -> TestResult {
+    with_memfs("/p_unl", "p_unl", &[("victim", b"data")], || {
+        let victim = c"/p_unl/victim";
+        let ghost = c"/p_unl/ghost";
+        let dot = c"/p_unl/.";
+        let dotdot = c"/p_unl/..";
+        let dir = c"/p_unl/sub";
+        let trailing_slash_file = c"/p_unl/victim/";
+        let empty = c"";
+
+        // Create a real directory to test directory unlink refusal.
+        if call(
+            Syscall::Mkdirat.raw(),
+            a2(AT_FDCWD, dir.as_ptr() as u64, 0o755),
+        ) != Some(0)
+        {
+            return Err("mkdirat for dir test failed");
+        }
+
+        // 1. Empty path -> -ENOENT.
+        if call(Syscall::Unlink.raw(), a0(empty.as_ptr() as u64)) != Some(ENOENT) {
+            return Err("unlink empty path must return -ENOENT");
+        }
+
+        // 2. Bad path pointer -> -EFAULT.
+        if call(Syscall::Unlink.raw(), a0(BAD_PTR)) != Some(EFAULT) {
+            return Err("unlink BAD_PTR must return -EFAULT");
+        }
+
+        // 3. '.' or '..' -> -EISDIR.
+        if call(Syscall::Unlink.raw(), a0(dot.as_ptr() as u64)) != Some(EISDIR) {
+            return Err("unlink('.') must return -EISDIR");
+        }
+        if call(Syscall::Unlink.raw(), a0(dotdot.as_ptr() as u64)) != Some(EISDIR) {
+            return Err("unlink('..') must return -EISDIR");
+        }
+
+        // 4. Directory -> -EISDIR.
+        if call(Syscall::Unlink.raw(), a0(dir.as_ptr() as u64)) != Some(EISDIR) {
+            return Err("unlink(dir) must return -EISDIR");
+        }
+
+        // 5. Trailing slash on regular file -> -ENOTDIR.
+        if call(
+            Syscall::Unlink.raw(),
+            a0(trailing_slash_file.as_ptr() as u64),
+        ) != Some(ENOTDIR)
+        {
+            return Err("unlink(file/) must return -ENOTDIR");
+        }
+
+        // 6. Nonexistent file -> -ENOENT.
+        if call(Syscall::Unlink.raw(), a0(ghost.as_ptr() as u64)) != Some(ENOENT) {
+            return Err("unlink(nonexistent) must return -ENOENT");
+        }
+
+        // 7. Successful unlink -> 0.
+        if call(Syscall::Unlink.raw(), a0(victim.as_ptr() as u64)) != Some(0) {
+            return Err("unlink(victim) should return 0");
+        }
+
+        // 8. Second unlink of same file -> -ENOENT.
+        if call(Syscall::Unlink.raw(), a0(victim.as_ptr() as u64)) != Some(ENOENT) {
+            return Err("second unlink of unlinked file must return -ENOENT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_path_unlink_exact_errnos);

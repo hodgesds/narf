@@ -4952,6 +4952,99 @@ fn smoke_abi_pathx_openat2_struct_rules() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_struct_rules);
 
+fn smoke_abi_pathx_openat2_negative_errnos() -> TestResult {
+    with_memfs("/o2-neg", "o2-neg", &[("f", b"hello")], || {
+        let path = b"/o2-neg/f\0";
+        let how = openat2_how(0, 0, 0);
+
+        // 1. NULL how pointer -> -EFAULT
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 24),
+        ) != Some(EFAULT)
+        {
+            return Err("openat2 with NULL how pointer must return -EFAULT");
+        }
+
+        // 2. NULL path pointer -> -EFAULT
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, 0, how.as_ptr() as u64, 24),
+        ) != Some(EFAULT)
+        {
+            return Err("openat2 with NULL path pointer must return -EFAULT");
+        }
+
+        // 3. Empty path string -> -ENOENT
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, c"".as_ptr() as u64, how.as_ptr() as u64, 24),
+        ) != Some(ENOENT)
+        {
+            return Err("openat2 with empty path string must return -ENOENT");
+        }
+
+        // 4. O_PATH with O_RDWR -> -EINVAL
+        const O_PATH: u64 = 0o10000000;
+        const O_RDWR: u64 = 2;
+        let bad_opath = openat2_how(O_PATH | O_RDWR, 0, 0);
+        if openat2_at(AT_FDCWD, path, &bad_opath) != Some(EINVAL) {
+            return Err("openat2(O_PATH | O_RDWR) must return -EINVAL");
+        }
+
+        // 5. Mode with bits outside 0o7777 (S_IALLUGO) -> -EINVAL
+        const O_CREAT: u64 = 0o100;
+        let bad_mode = openat2_how(O_CREAT, 0o100644, 0);
+        let new_path = c"/o2-neg/new";
+        if call(
+            Syscall::Openat2.raw(),
+            a3(
+                AT_FDCWD,
+                new_path.as_ptr() as u64,
+                bad_mode.as_ptr() as u64,
+                24,
+            ),
+        ) != Some(EINVAL)
+        {
+            return Err("openat2 with mode outside 0o7777 must return -EINVAL");
+        }
+
+        // 6. RESOLVE_BENEATH with absolute path -> -EXDEV
+        let beneath_abs = openat2_how(0, 0, RESOLVE_BENEATH);
+        if openat2_at(AT_FDCWD, path, &beneath_abs) != Some(EXDEV) {
+            return Err("openat2 with RESOLVE_BENEATH on absolute path must return -EXDEV");
+        }
+
+        // 7. Relative path with bad dirfd -> -EBADF
+        if call(
+            Syscall::Openat2.raw(),
+            a3(9999, c"relative".as_ptr() as u64, how.as_ptr() as u64, 24),
+        ) != Some(EBADF)
+        {
+            return Err("openat2 with bad dirfd on relative path must return -EBADF");
+        }
+
+        // 8. Relative path with non-directory dirfd -> -ENOTDIR
+        let file_fd = open_fd(path)?;
+        let notdir_r = call(
+            Syscall::Openat2.raw(),
+            a3(
+                file_fd as u64,
+                c"relative".as_ptr() as u64,
+                how.as_ptr() as u64,
+                24,
+            ),
+        );
+        let _ = call(Syscall::Close.raw(), a0(file_fd as u64));
+        if notdir_r != Some(ENOTDIR) {
+            return Err("openat2 with regular-file dirfd on relative path must return -ENOTDIR");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_negative_errnos);
+
 /// `RESOLVE_NO_SYMLINKS` refuses a symlink anywhere in the path.
 ///
 /// -ELOOP, the same answer as running out of link budget: the caller asked

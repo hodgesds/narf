@@ -1804,6 +1804,16 @@ fn smoke_abi_time_time_null() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_time_time_null);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_time_time_bad_ptr_efault() -> TestResult {
+    with_setup(|| match call(Syscall::Time.raw(), a0(BAD_PTR)) {
+        Some(v) if v == EFAULT => Ok(()),
+        _ => Err("time(BAD_PTR) must return -EFAULT"),
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_time_time_bad_ptr_efault);
+
 // ── ioprio_set / ioprio_get ──────────────────────────────────────────────
 // ioprio_set stores a value; ioprio_get retrieves it or returns the default.
 

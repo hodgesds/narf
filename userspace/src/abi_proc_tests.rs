@@ -116,6 +116,42 @@ fn smoke_abi_proc_getpgid_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_getpgid_pos);
 
+fn smoke_abi_proc_getpgrp_matches_getpgid() -> TestResult {
+    with_setup(|| {
+        if !wired(Syscall::Getpgrp) {
+            return Ok(());
+        }
+        // Linux getpgrp(2) returns sys_getpgid(0) (kernel/sys.c).
+        let pgid0 = match call(Syscall::Getpgid.raw(), a0(0)) {
+            Some(v) if v >= 0 => v,
+            _ => return Err("getpgid(0) failed"),
+        };
+        let pgrp0 = match call(Syscall::Getpgrp.raw(), SyscallArgs::default()) {
+            Some(v) if v >= 0 => v,
+            _ => return Err("getpgrp() failed"),
+        };
+        if pgid0 != pgrp0 {
+            return Err("getpgrp() did not match getpgid(0)");
+        }
+        // After setpgid(0, 0), caller is group leader; getpgrp must match.
+        let _ = call(Syscall::Setpgid.raw(), a1(0, 0));
+        let pgid1 = match call(Syscall::Getpgid.raw(), a0(0)) {
+            Some(v) if v >= 0 => v,
+            _ => return Err("getpgid(0) failed after setpgid"),
+        };
+        // getpgrp takes no arguments; any passed registers must be ignored.
+        let pgrp1 = match call(Syscall::Getpgrp.raw(), a3(0x1234, 0x5678, 0x9abc, 0xdef0)) {
+            Some(v) if v >= 0 => v,
+            _ => return Err("getpgrp() failed with non-zero args"),
+        };
+        if pgid1 != pgrp1 {
+            return Err("getpgrp() did not match getpgid(0) after setpgid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_getpgrp_matches_getpgid);
+
 fn smoke_abi_proc_pgid_cache_tracks_outer_id() -> TestResult {
     with_setup(|| {
         const LEADER_TASK: u64 = 0x6A10_0001;
