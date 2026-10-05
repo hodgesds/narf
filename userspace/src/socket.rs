@@ -826,7 +826,7 @@ pub struct SocketFile {
     /// that enqueues a pending server end sets it; an `accept` that drains to
     /// empty clears it. A `connect` also `notify`s POLL_IN so a same-level accept
     /// refill is still an epoll ready-list edge.
-    listener_readiness: narf_lib::readiness::Readiness,
+    listener_readiness: Arc<narf_lib::readiness::Readiness>,
     /// `unix-latency-trace` only: tid that called `listen()` on this socket.
     /// The starved-accept sweep runs inside the watchdog's timer trap, where
     /// walking every task's fd table to find the acceptor would take the fd
@@ -1746,7 +1746,7 @@ impl SocketFile {
             // (readable only once a reply/monitor message is enqueued) but always
             // sendable.
             dgram_readiness: narf_lib::readiness::Readiness::new(narf_filesystem::POLL_OUT),
-            listener_readiness: narf_lib::readiness::Readiness::new(0),
+            listener_readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
             #[cfg(feature = "unix-latency-trace")]
             listen_owner_tid: AtomicU64::new(0),
             #[cfg(feature = "unix-latency-trace")]
@@ -3794,6 +3794,18 @@ impl SocketFile {
         }
     }
 
+    /// Publish the current accept readiness level while the caller holds the
+    /// listener's state lock. Keeping the state sample and the readiness
+    /// update in that order prevents a connect that enqueues after an accept
+    /// from being overwritten by a stale clear.
+    #[inline]
+    fn set_listener_readiness(&self, ready: bool) {
+        self.listener_readiness.set(
+            if ready { narf_filesystem::POLL_IN } else { 0 },
+            if ready { 0 } else { narf_filesystem::POLL_IN },
+        );
+    }
+
     /// Per-state readiness bits (with durable-cell reconcile side-effects),
     /// factored out so `poll_readiness` computes the mask under a single `state`
     /// lock.
@@ -3828,10 +3840,7 @@ impl SocketFile {
                 // clears once accept drains the queue (else a re-arm spuriously
                 // returns Ready and a timed poll spins). The connect enqueue set
                 // the rising POLL_IN edge that fired the parked acceptor.
-                self.listener_readiness.set(
-                    if ready { narf_filesystem::POLL_IN } else { 0 },
-                    if ready { 0 } else { narf_filesystem::POLL_IN },
-                );
+                self.set_listener_readiness(ready);
                 if ready {
                     narf_filesystem::POLL_IN
                 } else {
@@ -3845,10 +3854,7 @@ impl SocketFile {
                     || listen_id
                         .map(narf_net::tcp_stack::listen_has_pending)
                         .unwrap_or(false);
-                self.listener_readiness.set(
-                    if ready { narf_filesystem::POLL_IN } else { 0 },
-                    if ready { 0 } else { narf_filesystem::POLL_IN },
-                );
+                self.set_listener_readiness(ready);
                 if ready {
                     narf_filesystem::POLL_IN
                 } else {
@@ -3857,10 +3863,7 @@ impl SocketFile {
             }
             SocketState::UnixListener { pending, .. } => {
                 let ready = !pending.is_empty();
-                self.listener_readiness.set(
-                    if ready { narf_filesystem::POLL_IN } else { 0 },
-                    if ready { 0 } else { narf_filesystem::POLL_IN },
-                );
+                self.set_listener_readiness(ready);
                 if ready {
                     narf_filesystem::POLL_IN
                 } else {
@@ -6249,12 +6252,14 @@ impl SocketFile {
                 SocketOpResult::Ok(0)
             }
             SocketOp::Accept => {
-                // Pop from the pending queue. Caller (sys_accept)
-                // wraps this in a yield-loop until something arrives.
+                // Pop from the pending queue and reconcile the durable level
+                // before releasing `state`: a subsequent blocking accept must
+                // park, rather than treating the drained queue as still ready.
                 let mut state = self.state.lock();
                 match &mut *state {
                     SocketState::UnixListener { pending, .. } => {
                         if let Some(s) = pending.pop_front() {
+                            self.set_listener_readiness(!pending.is_empty());
                             SocketOpResult::Accepted {
                                 socket: s,
                                 peer: None,
@@ -6638,6 +6643,15 @@ impl SocketFile {
                             ) {
                                 self.apply_tcp_options_to_tcb(id);
                                 *listen_id = Some(id);
+                                // The TCP stack publishes accept-ready events
+                                // by listener TCB id. Bridge that key directly
+                                // to this fd's durable accept cell before
+                                // publishing the owner, so an incoming SYN/ACK
+                                // cannot be lost between those registrations.
+                                crate::handlers::register_tcb_readiness(
+                                    id,
+                                    self.listener_readiness.clone(),
+                                );
                                 // This task owns the listener — targeted
                                 // accept-ready wakes go only to it.
                                 crate::handlers::set_tcb_owner(
@@ -6700,6 +6714,20 @@ impl SocketFile {
                             child_id,
                             crate::handlers::current_task_id(),
                         );
+                        let state = self.state.lock();
+                        if let SocketState::InetListener {
+                            listening: true,
+                            pending,
+                            listen_id,
+                            ..
+                        } = &*state
+                        {
+                            let ready = !pending.is_empty()
+                                || listen_id
+                                    .map(narf_net::tcp_stack::listen_has_pending)
+                                    .unwrap_or(false);
+                            self.set_listener_readiness(ready);
+                        }
                         return SocketOpResult::Accepted {
                             socket: child,
                             peer: None,
@@ -6712,9 +6740,15 @@ impl SocketFile {
                     SocketState::InetListener {
                         listening: true,
                         pending,
+                        listen_id,
                         ..
                     } => {
                         if let Some(s) = pending.pop_front() {
+                            let ready = !pending.is_empty()
+                                || listen_id
+                                    .map(narf_net::tcp_stack::listen_has_pending)
+                                    .unwrap_or(false);
+                            self.set_listener_readiness(ready);
                             SocketOpResult::Accepted {
                                 socket: s,
                                 peer: None,
@@ -7659,6 +7693,13 @@ impl SocketFile {
                         ) {
                             self.apply_tcp_options_to_tcb(id);
                             *listen_id = Some(id);
+                            // See the IPv4 listen path: wire the TCP
+                            // listener-id wake directly to this fd's durable
+                            // accept cell before publishing its owner.
+                            crate::handlers::register_tcb_readiness(
+                                id,
+                                self.listener_readiness.clone(),
+                            );
                             crate::handlers::set_tcb_owner(id, crate::handlers::current_task_id());
                         }
                     }
@@ -7700,6 +7741,20 @@ impl SocketFile {
                             child_id,
                             crate::handlers::current_task_id(),
                         );
+                        let state = self.state.lock();
+                        if let SocketState::Inet6Listener {
+                            listening: true,
+                            pending,
+                            listen_id,
+                            ..
+                        } = &*state
+                        {
+                            let ready = !pending.is_empty()
+                                || listen_id
+                                    .map(narf_net::tcp_stack::listen_has_pending)
+                                    .unwrap_or(false);
+                            self.set_listener_readiness(ready);
+                        }
                         return SocketOpResult::Accepted {
                             socket: child,
                             peer: None,
@@ -7711,10 +7766,16 @@ impl SocketFile {
                 if let SocketState::Inet6Listener {
                     listening: true,
                     pending,
+                    listen_id,
                     ..
                 } = &mut *state
                 {
                     if let Some(s) = pending.pop_front() {
+                        let ready = !pending.is_empty()
+                            || listen_id
+                                .map(narf_net::tcp_stack::listen_has_pending)
+                                .unwrap_or(false);
+                        self.set_listener_readiness(ready);
                         SocketOpResult::Accepted {
                             socket: s,
                             peer: None,
@@ -9762,6 +9823,98 @@ fn counting_waker(counter: &alloc::sync::Arc<core::sync::atomic::AtomicU32>) -> 
     // SAFETY: `raw` + VTABLE form a valid RawWaker per the fns above.
     unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
 }
+
+/// A listener's durable readiness level must fall when the final queued
+/// connection is accepted. A stale POLL_IN makes the next blocking `accept()`
+/// re-execute immediately instead of arming its waiter; desktop services then
+/// turn unrelated network readiness events into a CPU spin loop.
+fn smoke_listener_accept_draining_queue_clears_durable_readiness() -> TestResult {
+    use core::task::Poll;
+
+    let listener = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    let accepted = SocketFile::new(AF_UNIX, SOCK_STREAM);
+    let mut pending = VecDeque::new();
+    pending.push_back(accepted);
+    *listener.state.lock() = SocketState::UnixListener {
+        addr: UnixAddr::Abstract(b"accept-readiness".to_vec()),
+        pending,
+    };
+    listener.set_listener_readiness(true);
+
+    if !matches!(
+        listener.dispatch_op(SocketOp::Accept),
+        SocketOpResult::Accepted { .. }
+    ) {
+        return TestResult::Fail("setup listener did not accept its queued connection");
+    }
+    if listener.listener_readiness.mask() & narf_filesystem::POLL_IN != 0 {
+        return TestResult::Fail("accept left POLL_IN latched after draining the queue");
+    }
+
+    let wakes = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let waker = counting_waker(&wakes);
+    match listener.arm_readiness(0xacce_0001, narf_filesystem::POLL_IN, &waker) {
+        Some(Poll::Pending) => {
+            listener.disarm_readiness(0xacce_0001);
+            TestResult::Pass
+        }
+        Some(Poll::Ready(_)) => TestResult::Fail("drained listener immediately re-armed as ready"),
+        None => TestResult::Fail("listener did not expose a durable readiness cell"),
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_listener_accept_draining_queue_clears_durable_readiness
+);
+
+/// A wired TCP listener receives its accept-ready event by kernel TCB id. That
+/// id must resolve to the same durable cell a blocking `accept()` arms; a
+/// private replacement cell would leave the acceptor asleep until a timer or
+/// unrelated network event happened to run it again.
+fn smoke_wired_listener_readiness_shares_accept_cell() -> TestResult {
+    use core::task::Poll;
+
+    const LISTEN_ID: u32 = 0xacce_0002;
+    let listener = SocketFile::new(AF_INET, SOCK_STREAM);
+    *listener.state.lock() = SocketState::InetListener {
+        addr: u32::from_be_bytes([10, 0, 2, 15]),
+        port: 31_123,
+        backlog: 1,
+        pending: VecDeque::new(),
+        listen_id: Some(LISTEN_ID),
+        listening: true,
+    };
+    let wakes = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0));
+    let waker = counting_waker(&wakes);
+    if !matches!(
+        listener.arm_readiness(0xacce_0002, narf_filesystem::POLL_IN, &waker),
+        Some(Poll::Pending)
+    ) {
+        return TestResult::Fail("idle wired listener was not pending before its readiness event");
+    }
+
+    crate::handlers::register_tcb_readiness(LISTEN_ID, listener.listener_readiness.clone());
+    let Some(cell) = crate::handlers::tcb_cell_lookup(LISTEN_ID) else {
+        return TestResult::Fail("wired listener did not register its accept readiness cell");
+    };
+    if !alloc::sync::Arc::ptr_eq(&cell, &listener.listener_readiness) {
+        crate::handlers::clear_tcb_owner(LISTEN_ID);
+        return TestResult::Fail("wired listener wake key resolved to a private readiness cell");
+    }
+    cell.set(narf_filesystem::POLL_IN, 0);
+    let woke = wakes.load(core::sync::atomic::Ordering::Acquire) != 0;
+    listener.disarm_readiness(0xacce_0002);
+    crate::handlers::clear_tcb_owner(LISTEN_ID);
+    if woke {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("wired accept readiness event did not wake its blocker")
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_wired_listener_readiness_shares_accept_cell
+);
 
 /// The durable-wake migration: a group-2 broadcast must fire the subscriber's
 /// ARMED `uevent_readiness` cell directly (Readiness::set -> wake_by_ref), not

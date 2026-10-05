@@ -235,6 +235,24 @@ pub fn tcb_cell(tcb_id: u32) -> alloc::sync::Arc<narf_lib::readiness::Readiness>
         .clone()
 }
 
+/// Associate an existing file-owned readiness cell with a kernel TCP key.
+///
+/// Connected `InetWired` sockets use [`tcb_cell`] lazily. A listening socket
+/// instead owns a `SocketFile::listener_readiness` cell because that same cell
+/// also represents loopback connections. Registering the existing cell under
+/// the listener TCB id lets `narf_net::readiness::notify(listener_id)` wake
+/// blocking `accept()` and epoll waiters through the identical durable path.
+/// The caller registers this before publishing the TCB owner; removal is
+/// paired with [`clear_tcb_owner`].
+pub fn register_tcb_readiness(
+    tcb_id: u32,
+    cell: alloc::sync::Arc<narf_lib::readiness::Readiness>,
+) {
+    let mut g = TCB_CELL[tcb_owner_shard(tcb_id)].lock();
+    g.get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(tcb_id, cell);
+}
+
 /// Look up an existing cell without creating one (the wake / poll hot path).
 pub fn tcb_cell_lookup(tcb_id: u32) -> Option<alloc::sync::Arc<narf_lib::readiness::Readiness>> {
     let g = TCB_CELL[tcb_owner_shard(tcb_id)].lock();

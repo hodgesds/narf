@@ -10873,8 +10873,10 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
     // `unix_accept` wait `sock_rcvtimeo`); pick up this call's deadline if
     // it is re-executing.
     let resumed = handler_sys_socket_recv::sock_timeo_take(ctx, &sock);
-    // Single-shot: pop pending if any, else WouldBlock-style yield
-    // mirroring sys_futex. Caller (libc accept) loops.
+    // One dispatch attempt: pop a pending connection if present. `WouldBlock`
+    // below selects the Linux result for nonblocking fds or parks and
+    // re-executes this syscall for blocking fds; libc must never receive a
+    // transient EAGAIN from a blocking accept.
     match sock.dispatch_op(crate::socket::SocketOp::Accept) {
         crate::socket::SocketOpResult::Accepted { socket, peer } => {
             // `__sys_accept4_file`: when `upeer_sockaddr` is non-NULL the peer
@@ -10957,78 +10959,27 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             // a peer connects — musl's `accept()` does NOT retry -EAGAIN
             // on a blocking fd, so returning it here would make every
             // real server fail its first accept (only a loopback client
-            // that races in before the syscall wins). Block the same way
-            // blocking console/pipe reads do: park ~1 ms and REWIND RIP
-            // so the `syscall` instruction re-executes on resume (no
-            // return value set), looping in-kernel until `Accepted`.
+            // that races in before the syscall wins). Arm its durable
+            // readiness cell and REWIND RIP so the `syscall` instruction
+            // re-executes on a real event (no return value set), looping
+            // in-kernel until `Accepted`.
             let task = current_task_id();
             let listen_nonblock = socket_listener_nonblock(task, fd, sock.as_ref());
             if listen_nonblock {
                 ctx.set_return(errno_ret(EAGAIN)); // -EAGAIN
                 return;
             }
-            // SO_RCVTIMEO: a finite timeout parks until readiness or the
-            // deadline, then reports -EAGAIN (`inet_csk_wait_for_connect`
-            // / `unix_accept`'s `skb_recv_datagram`).
-            if sock.rcvtimeo().is_some() {
-                handler_sys_socket_recv::socket_block(
-                    ctx,
-                    sock.as_ref(),
-                    narf_filesystem::POLL_IN,
-                    sock.rcvtimeo(),
-                    resumed,
-                );
-                return;
-            }
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                // Rewind past the syscall instruction (`syscall` / `svc`) so the
-                // resumed task re-issues accept; do NOT set a return value.
-                #[cfg(target_arch = "x86_64")]
-                const SYSCALL_INSN_LEN: u64 = 2;
-                #[cfg(target_arch = "aarch64")]
-                const SYSCALL_INSN_LEN: u64 = 4;
-                let resume_rip = ctx.rip().wrapping_sub(SYSCALL_INSN_LEN);
-                ctx.set_rip(resume_rip);
-                let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-                // SAFETY: `uctx` is the live per-task UserTaskCtx from current_user_task();
-                // we hold the only reference while setting the deadline and saving the
-                // RIP-rewound CPU state into `uc.state` before the yield hook hands the
-                // task to the executor.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    let uc = &*uctx;
-                    uc.sleep_deadline_ns.store(deadline, Ordering::Release);
-                    // Park on NET-I/O READINESS (the TCP stack `readiness::notify`s
-                    // the listener when a connection becomes accept-ready, and a
-                    // socket when data arrives) with the ~1ms deadline as a mere
-                    // backstop. Without net_io_wait the park only re-polled every
-                    // ~1ms off the timer wheel — and under own-stack cooperative
-                    // scheduling with other busy tasks (redis bg threads) that
-                    // wheel service is delayed enough that the connection/data
-                    // sits ACK'd-but-unread past the client's deadline (net-smoke
-                    // echo flake). Snapshot the readiness generation for the
-                    // check→park lost-wake guard (park_should_block re-executes if
-                    // it moved). Clear a stale `futex_uaddr` so this can't be
-                    // mis-routed into the futex branch.
-                    uc.futex_uaddr.store(0, Ordering::Release);
-                    uc.net_io_wait.store(true, Ordering::Release);
-                    uc.epoll_park_gen
-                        .store(narf_net::readiness::generation(), Ordering::Release);
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
-                    }
-                    hook(uctx);
-                }
-                // unreachable — hook() longjmps to the executor
-            }
-            // No executor (kernel-test context): surface EAGAIN.
-            ctx.set_return(errno_ret(EAGAIN));
+            // Both finite and infinite waits use the listener's durable
+            // readiness cell. The former hand-written infinite path retried
+            // on every global network-generation change, so idle desktop
+            // acceptors could spin during session startup instead of sleeping.
+            handler_sys_socket_recv::socket_block(
+                ctx,
+                sock.as_ref(),
+                narf_filesystem::POLL_IN,
+                sock.rcvtimeo(),
+                resumed,
+            );
         }
         crate::socket::SocketOpResult::Err(e) => {
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
