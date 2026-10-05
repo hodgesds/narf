@@ -1118,6 +1118,11 @@ request cancellation removes the slot and its registration.
 ### 3.9 Linux synthetic filesystem projections
 
 With `linux-compat`, sysfs exposes only interfaces backed by a NARF authority.
+Sound cards and PCM/control endpoints are projected by the sound-card registry
+under `/sys/devices`, with class and character-device discovery symlinks,
+writable uevents, and physical PCI parent links where applicable. Registry
+teardown removes these links and the canonical card subtree; `Kobject::remove_symlink`
+supports discovery-link removal alongside `remove_child`.
 Block devices have canonical kobjects at
 `/sys/devices/virtual/block/<name>`; `/sys/class/block` and `/sys/block` are
 discovery views. Block `add` uevents and `/sys/dev/block/<major>:<minor>`

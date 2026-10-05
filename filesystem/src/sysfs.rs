@@ -543,6 +543,11 @@ impl Kobject {
         self.symlinks.lock().insert(name.into(), target.into());
     }
 
+    /// Remove a discovery link when its backing device is unregistered.
+    pub fn remove_symlink(&self, name: &str) -> bool {
+        self.symlinks.lock().remove(name).is_some()
+    }
+
     /// Symlink target for `name`, if any.
     pub fn get_symlink(&self, name: &str) -> Option<String> {
         self.symlinks.lock().get(name).cloned()

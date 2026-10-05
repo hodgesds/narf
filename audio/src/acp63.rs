@@ -413,7 +413,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         playback_count: 0,
         capture_count: 1,
     };
-    let card = narf_drivers_sound::register_hardware_card(info, Arc::new(Card(dev.clone())));
+    let card = narf_drivers_sound::register_hardware_card_at(
+        info,
+        Arc::new(Card(dev.clone())),
+        Some(device.addr),
+    );
     *CONTROLLER.lock() = Some((dev.clone(), card));
     let weak = Arc::downgrade(&dev);
     narf_scheduler::spawn(async move {

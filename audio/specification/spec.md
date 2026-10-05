@@ -93,6 +93,12 @@ and firmware methods return UnsupportedDevice without touching hardware.
 
 Subsystem initcalls register PCI probes; late init publishes native cards
 through the sound file bridge. Capture is never started by enumeration.
+HDA and ACP register their actual bus address with the sound registry, so
+their sysfs card parent resolves to the same PCI device as bus enumeration.
+VirtIO sound also registers through that registry from its probe; its
+implemented playback stream is accessible through `/dev/snd` as well as the
+kernel convenience API. An exclusive file PCM lease prevents concurrent
+kernel convenience submissions from changing that stream's configuration.
 Owned MSI-X/MSI routing is used for HDA when available. ACP uses firmware
 INTx. A direct _PRT GSI can join an existing compatible shared vector;
 named interrupt-link routes fall back to polling. A 2 ms service timer

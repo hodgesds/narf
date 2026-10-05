@@ -144,19 +144,22 @@ struct VirtioSoundPlayback;
 
 impl AudioStream for VirtioSoundPlayback {
     fn current_format(&self) -> Option<AudioFormat> {
-        // Stage-4: hardcoded default until snd_pci negotiates.
-        if narf_drivers_virtio::snd_pci::is_probed() {
-            Some(AudioFormat::default_playback())
-        } else {
-            None
+        for sample_rate_hz in [48_000, 44_100] {
+            for channels in [ChannelLayout::Stereo, ChannelLayout::Mono] {
+                let format = AudioFormat {
+                    sample_rate_hz,
+                    channels,
+                    format: SampleFormat::S16Le,
+                };
+                if self.supports(format) {
+                    return Some(format);
+                }
+            }
         }
+        None
     }
     fn supports(&self, fmt: AudioFormat) -> bool {
-        // QEMU virtio-sound supports S16LE @ {44.1, 48} kHz × {mono,
-        // stereo}; F32LE only with the `format=f32` audiodev hint.
-        // Stage-4 advertises only the baseline triple.
-        fmt.format == SampleFormat::S16Le
-            && (fmt.sample_rate_hz == 48_000 || fmt.sample_rate_hz == 44_100)
+        virtio_params(fmt).is_some_and(narf_drivers_virtio::snd_pci::supports_playback)
     }
     fn name(&self) -> &'static str {
         "virtio-sound"
@@ -167,6 +170,24 @@ impl AudioStream for VirtioSoundPlayback {
 }
 
 static PLAYBACK: VirtioSoundPlayback = VirtioSoundPlayback;
+
+fn virtio_params(format: AudioFormat) -> Option<narf_drivers_virtio::snd_pci::PcmParams> {
+    use narf_drivers_virtio::snd_pci;
+    if format.format != SampleFormat::S16Le
+        || !matches!(format.channels, ChannelLayout::Mono | ChannelLayout::Stereo)
+    {
+        return None;
+    }
+    Some(snd_pci::PcmParams {
+        channels: format.channels as u8,
+        rate: match format.sample_rate_hz {
+            44_100 => snd_pci::VIRTIO_SND_PCM_RATE_44100,
+            48_000 => snd_pci::VIRTIO_SND_PCM_RATE_48000,
+            _ => return None,
+        },
+        ..snd_pci::PcmParams::default_playback()
+    })
+}
 
 // ── Intel HDA backend ───────────────────────────────────────────────
 //
@@ -299,33 +320,8 @@ impl AudioWriter {
 
     fn submit_virtio_sound(&self, pcm: &[u8]) -> Result<u64, AudioWriteError> {
         let bpf = self.format.bytes_per_frame() as usize;
-        // Translate AudioFormat → virtio-sound spec codes. Stage-4
-        // baseline only knows about S16LE @ 44.1/48 kHz; supports()
-        // already gated on these.
-        use narf_drivers_virtio::snd_pci::{
-            self, PcmParams, VIRTIO_SND_PCM_FMT_S16, VIRTIO_SND_PCM_RATE_44100,
-            VIRTIO_SND_PCM_RATE_48000,
-        };
-        let rate_code = match self.format.sample_rate_hz {
-            44_100 => VIRTIO_SND_PCM_RATE_44100,
-            48_000 => VIRTIO_SND_PCM_RATE_48000,
-            _ => return Err(AudioWriteError::UnsupportedFormat),
-        };
-        let format_code = match self.format.format {
-            SampleFormat::S16Le => VIRTIO_SND_PCM_FMT_S16,
-            // F32Le not on the supports() list yet; rejecting here
-            // so a fmt that snuck past becomes a clean error.
-            SampleFormat::F32Le | SampleFormat::S32Le => {
-                return Err(AudioWriteError::UnsupportedFormat)
-            }
-        };
-        let params = PcmParams {
-            buffer_bytes: 8192,
-            period_bytes: 2048,
-            channels: self.format.channels as u8,
-            format: format_code,
-            rate: rate_code,
-        };
+        use narf_drivers_virtio::snd_pci;
+        let params = virtio_params(self.format).ok_or(AudioWriteError::UnsupportedFormat)?;
         snd_pci::play_buffer(params, pcm).map_err(|_| AudioWriteError::StreamClosed)?;
         Ok((pcm.len() / bpf) as u64)
     }

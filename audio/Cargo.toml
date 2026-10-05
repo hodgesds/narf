@@ -26,6 +26,7 @@ narf-console      = { path = "../console" }
 narf-io           = { path = "../io" }
 narf-drivers      = { path = "../drivers" }
 narf-drivers-sound = { path = "../drivers/sound" }
+narf-filesystem   = { path = "../filesystem" }
 narf-interrupts   = { path = "../interrupts" }
 narf-acpi         = { path = "../acpi" }
 narf-aml          = { path = "../aml" }
@@ -34,7 +35,7 @@ narf-time         = { path = "../time" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
 [features]
-kernel-test = []
+kernel-test = ["narf-drivers-sound/kernel-test"]
 
 [lints]
 workspace = true

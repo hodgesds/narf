@@ -1,125 +1,193 @@
-//! `/sys/class/sound/*` kobject attributes — card + device nodes.
-//!
-//! Populates the following sysfs subtree for each registered sound card:
-//!
-//! ```text
-//! /sys/class/sound/
-//!   card<N>/
-//!     id          — codec short name (e.g. "HDA Intel PCH")
-//!     number      — decimal card index
-//!     longname    — long human-readable name
-//!   controlC<N>/
-//!     dev         — "116:<minor>" (ALSA sound-class major 116)
-//!   pcmC<N>D<M>p/
-//!     dev         — "116:<minor>"
-//!     pcm_class   — "generic"
-//!   pcmC<N>D<M>c/
-//!     dev         — "116:<minor>"
-//!     pcm_class   — "generic"
-//! ```
-//!
-//! Linux references:
-//! - `sound/core/init.c::snd_card_register` — registers kobjects
-//! - `sound/core/sound.c::snd_register_device` — fills dev attribute
-//! - `include/sound/core.h::SNDRV_MAJOR` = 116 (sound class major)
-//! - `Documentation/ABI/testing/sysfs-class-sound`
-
-use alloc::format;
-use alloc::string::String;
-
-use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
+//! Sound devices have canonical nodes below `/sys/devices`; class and
+//! device-number entries are discovery links to those same nodes.
 
 use crate::CardInfo;
+use alloc::{format, string::String, sync::Arc, vec::Vec};
+use narf_filesystem::sysfs::{
+    class_register, get_or_create_child, get_root, kobject_add_attr, kobject_add_uevent_attr,
+    kobject_emit_uevent, Kobject,
+};
+use narf_filesystem::uevent::UeventAction;
 
-// ── ALSA major number ─────────────────────────────────────────────────
-
-/// ALSA sound class major number.
-///
-/// Linux assigns major 116 to the ALSA sound device class.
-/// `include/sound/core.h:#define SNDRV_MAJOR 116`.
 pub const SNDRV_MAJOR: u32 = 116;
 
-/// Compute the ALSA minor number for a given card + device + type.
-///
-/// Linux's minor-number scheme for the sound class:
-/// ```text
-///   minor = (card << 5) | type_offset
-/// ```
-/// Type offsets (from `include/sound/minors.h`):
-///   - control: 0
-///   - pcm playback:  card * 32 + 16 + device * 2
-///   - pcm capture:   card * 32 + 16 + device * 2 + 1
-///
-/// Linux ref: `sound/core/sound.c::snd_alloc_minor_range`.
+/// Linux static ALSA layout: 32 minors/card, eight PCMs per direction.
 pub fn control_minor(card: u32) -> u32 {
     card * 32
 }
-
 pub fn pcm_playback_minor(card: u32, device: u32) -> u32 {
-    card * 32 + 16 + device * 2
+    card * 32 + 16 + device
 }
-
 pub fn pcm_capture_minor(card: u32, device: u32) -> u32 {
-    card * 32 + 16 + device * 2 + 1
+    card * 32 + 24 + device
 }
 
-// ── Populate one card ─────────────────────────────────────────────────
+fn virtual_sound() -> Arc<Kobject> {
+    let devices = get_or_create_child(&get_root(), "devices");
+    let virtual_dir = get_or_create_child(&devices, "virtual");
+    get_or_create_child(&virtual_dir, "sound")
+}
 
-/// Register all sysfs nodes for a single sound card.
-///
-/// Called once per card from the sound-driver initcall (or lazily on
-/// first access — the kobject graph is idempotent).
-///
-/// Linux ref: `sound/core/init.c::snd_card_register` +
-///            `sound/core/sound.c::snd_register_device`.
+fn lookup(path: &str) -> Option<Arc<Kobject>> {
+    let mut node = get_root();
+    for part in path.trim_start_matches("/sys/").split('/') {
+        node = node.get_child(part)?;
+    }
+    Some(node)
+}
+
+fn relative_target(from: &Kobject, to: &Kobject) -> String {
+    let from_path = from.path();
+    let levels = from_path.trim_start_matches("/sys/").split('/').count();
+    format!(
+        "{}{}",
+        "../".repeat(levels),
+        to.path().trim_start_matches("/sys/")
+    )
+}
+
+fn link(class: &Arc<Kobject>, node: &Arc<Kobject>, minor: Option<u32>) {
+    class.remove_child(node.name());
+    class.add_symlink(node.name(), relative_target(class, node));
+    node.add_symlink("subsystem", relative_target(node, class));
+    if let Some(minor) = minor {
+        let dev = get_or_create_child(&get_root(), "dev");
+        let chars = get_or_create_child(&dev, "char");
+        get_or_create_child(&dev, "block");
+        chars.add_symlink(
+            format!("{SNDRV_MAJOR}:{minor}"),
+            relative_target(&chars, node),
+        );
+        kobject_add_attr(node, "dev", move || format!("{SNDRV_MAJOR}:{minor}\n"));
+        kobject_add_uevent_attr(
+            node,
+            format!(
+                "MAJOR={SNDRV_MAJOR}\nMINOR={minor}\nDEVNAME=snd/{}\n",
+                node.name()
+            ),
+        );
+    }
+}
+
+fn endpoints(info: &CardInfo) -> Vec<(String, u32)> {
+    let mut nodes = alloc::vec![(format!("controlC{}", info.index), control_minor(info.index))];
+    for device in 0..info.playback_count {
+        nodes.push((
+            format!("pcmC{}D{device}p", info.index),
+            pcm_playback_minor(info.index, device),
+        ));
+    }
+    for device in 0..info.capture_count {
+        nodes.push((
+            format!("pcmC{}D{device}c", info.index),
+            pcm_capture_minor(info.index, device),
+        ));
+    }
+    nodes
+}
+
+/// Republish a registry card, preserving its physical parent when available.
 pub fn register_card_sysfs(info: &CardInfo) {
-    let sound_class = class_register("sound");
-    let n = info.index;
+    let parent = crate::CARD_REGISTRY
+        .lock()
+        .iter()
+        .find(|card| card.info.index == info.index)
+        .and_then(|card| card.parent);
+    register_card_sysfs_at(info, parent);
+}
 
-    // /sys/class/sound/card<N>/
-    let card_kobj = class_device_register(sound_class.clone(), &format!("card{}", n));
-    {
-        let id_str = info.id;
-        let longname = info.name;
-        kobject_add_attr(&card_kobj, "id", move || format!("{}\n", id_str));
-        let num = n;
-        kobject_add_attr(&card_kobj, "number", move || format!("{}\n", num));
-        kobject_add_attr(&card_kobj, "longname", move || format!("{}\n", longname));
+pub(crate) fn register_card_sysfs_at(info: &CardInfo, parent: Option<narf_bus::BusAddr>) {
+    let physical = match parent {
+        Some(narf_bus::BusAddr::Pcie(addr)) => {
+            narf_filesystem::sysfs::populate_pci_devices();
+            lookup(&format!(
+                "devices/pci{:04x}:{:02x}/{addr:?}",
+                addr.segment, addr.bus
+            ))
+        }
+        _ => None,
+    };
+    let container = physical
+        .as_ref()
+        .map(|parent| get_or_create_child(parent, "sound"))
+        .unwrap_or_else(virtual_sound);
+    let class = class_register("sound");
+    let name = format!("card{}", info.index);
+    let added = container.get_child(&name).is_none();
+    let card = get_or_create_child(&container, &name);
+    let id = info.id;
+    let index = info.index;
+    let longname = info.name;
+    kobject_add_attr(&card, "id", move || format!("{id}\n"));
+    kobject_add_attr(&card, "number", move || format!("{index}\n"));
+    kobject_add_attr(&card, "longname", move || format!("{longname}\n"));
+    kobject_add_uevent_attr(&card, String::new());
+    link(&class, &card, None);
+    if let Some(parent) = physical {
+        card.add_symlink("device", relative_target(&card, &parent));
     }
-
-    // /sys/class/sound/controlC<N>/
-    let ctrl_kobj = class_device_register(sound_class.clone(), &format!("controlC{}", n));
-    {
-        let minor = control_minor(n);
-        kobject_add_attr(&ctrl_kobj, "dev", move || {
-            format!("{}:{}\n", SNDRV_MAJOR, minor)
-        });
+    let mut added_nodes = Vec::new();
+    for (name, minor) in endpoints(info) {
+        let new = card.get_child(&name).is_none();
+        let node = get_or_create_child(&card, &name);
+        link(&class, &node, Some(minor));
+        node.add_symlink("device", "..");
+        if name.starts_with("pcm") {
+            kobject_add_attr(&node, "pcm_class", || "generic\n".into());
+        }
+        if new {
+            added_nodes.push(node);
+        }
     }
-
-    // /sys/class/sound/pcmC<N>D<M>p/ and pcmC<N>D<M>c/ per device.
-    for m in 0..info.playback_count {
-        let pb_kobj = class_device_register(sound_class.clone(), &format!("pcmC{}D{}p", n, m));
-        let minor = pcm_playback_minor(n, m);
-        kobject_add_attr(&pb_kobj, "dev", move || {
-            format!("{}:{}\n", SNDRV_MAJOR, minor)
-        });
-        kobject_add_attr(&pb_kobj, "pcm_class", || "generic\n".into());
+    // Publish events only after the complete card graph is reachable.
+    if added {
+        kobject_emit_uevent(&card, UeventAction::Add);
     }
-
-    for m in 0..info.capture_count {
-        let cap_kobj = class_device_register(sound_class.clone(), &format!("pcmC{}D{}c", n, m));
-        let minor = pcm_capture_minor(n, m);
-        kobject_add_attr(&cap_kobj, "dev", move || {
-            format!("{}:{}\n", SNDRV_MAJOR, minor)
-        });
-        kobject_add_attr(&cap_kobj, "pcm_class", || "generic\n".into());
+    for node in added_nodes {
+        kobject_emit_uevent(&node, UeventAction::Add);
+    }
+    // 78-sound-card.rules marks the card SOUND_INITIALIZED on CHANGE, after
+    // its PCM/control children have appeared. ADD alone leaves it unusable to
+    // udev sound consumers even when every individual path resolves.
+    if added {
+        kobject_emit_uevent(&card, UeventAction::Change);
     }
 }
 
-/// Register sysfs nodes for every currently-registered card.
-///
-/// Called from the sound-driver initcall.  New cards registered after
-/// boot must call `register_card_sysfs` directly.
+pub(crate) fn unregister_card_sysfs(info: &CardInfo) {
+    let class = class_register("sound");
+    let name = format!("card{}", info.index);
+    let target = class.get_symlink(&name);
+    let card = target
+        .as_deref()
+        .and_then(|path| lookup(path.trim_start_matches("../../")));
+    for (name, minor) in endpoints(info) {
+        if let Some(node) = card.as_ref().and_then(|card| card.get_child(&name)) {
+            kobject_emit_uevent(&node, UeventAction::Remove);
+        }
+        if let Some(card) = &card {
+            card.remove_child(&name);
+        }
+        class.remove_symlink(&name);
+        class.remove_child(&name);
+        if let Some(chars) = lookup("dev/char") {
+            chars.remove_symlink(&format!("{SNDRV_MAJOR}:{minor}"));
+        }
+    }
+    if let Some(card) = card {
+        kobject_emit_uevent(&card, UeventAction::Remove);
+    }
+    class.remove_symlink(&name);
+    class.remove_child(&name);
+    if let Some(target) = target {
+        if let Some((parent, leaf)) = target.trim_start_matches("../../").rsplit_once('/') {
+            if let Some(parent) = lookup(parent) {
+                parent.remove_child(leaf);
+            }
+        }
+    }
+}
+
 pub fn register_all_cards_sysfs() {
     for card in crate::list_cards() {
         register_card_sysfs(&card);
@@ -169,8 +237,7 @@ mod sysfs_bridge_tests {
     #[test]
     fn card0_id_attr() {
         setup();
-        let root = sysfs::class_register("sound");
-        let card0 = root.get_child("card0").expect("card0 kobject missing");
+        let card0 = lookup("devices/virtual/sound/card0").expect("card0 kobject missing");
         let id_val = card0.attr_show("id").expect("id attr missing");
         assert!(
             id_val.contains("HDA Intel PCH"),
@@ -183,10 +250,8 @@ mod sysfs_bridge_tests {
     #[test]
     fn pcm_playback_dev_attr_format() {
         setup();
-        let root = sysfs::class_register("sound");
-        let pcm_kobj = root
-            .get_child("pcmC0D0p")
-            .expect("pcmC0D0p kobject missing");
+        let pcm_kobj =
+            lookup("devices/virtual/sound/card0/pcmC0D0p").expect("pcmC0D0p kobject missing");
         let dev_val = pcm_kobj.attr_show("dev").expect("dev attr missing");
         assert!(
             dev_val.starts_with("116:"),
@@ -199,10 +264,8 @@ mod sysfs_bridge_tests {
     #[test]
     fn pcm_class_attr_is_generic() {
         setup();
-        let root = sysfs::class_register("sound");
-        let pcm_kobj = root
-            .get_child("pcmC0D0p")
-            .expect("pcmC0D0p kobject missing");
+        let pcm_kobj =
+            lookup("devices/virtual/sound/card0/pcmC0D0p").expect("pcmC0D0p kobject missing");
         let cls_val = pcm_kobj
             .attr_show("pcm_class")
             .expect("pcm_class attr missing");
@@ -219,9 +282,9 @@ mod sysfs_bridge_tests {
         assert_eq!(control_minor(0), 0);
         assert_eq!(control_minor(1), 32);
         assert_eq!(pcm_playback_minor(0, 0), 16);
-        assert_eq!(pcm_capture_minor(0, 0), 17);
+        assert_eq!(pcm_capture_minor(0, 0), 24);
         assert_eq!(pcm_playback_minor(1, 0), 48);
-        assert_eq!(pcm_capture_minor(1, 0), 49);
+        assert_eq!(pcm_capture_minor(1, 0), 56);
     }
 
     // Smoke: multi-card — 2 cards → card0 + card1 entries.
@@ -234,9 +297,9 @@ mod sysfs_bridge_tests {
         crate::register_card("hda-amd", "HDA AMD", "HDA AMD", 1, 1, 1);
         register_all_cards_sysfs();
         let root = sysfs::class_register("sound");
-        assert!(root.get_child("card0").is_some(), "card0 missing");
-        assert!(root.get_child("card1").is_some(), "card1 missing");
-        assert!(root.get_child("controlC0").is_some(), "controlC0 missing");
-        assert!(root.get_child("controlC1").is_some(), "controlC1 missing");
+        assert!(root.get_symlink("card0").is_some(), "card0 missing");
+        assert!(root.get_symlink("card1").is_some(), "card1 missing");
+        assert!(root.get_symlink("controlC0").is_some(), "controlC0 missing");
+        assert!(root.get_symlink("controlC1").is_some(), "controlC1 missing");
     }
 }

@@ -63,6 +63,18 @@ blk/net/console/rng.
   request slot and completion wakes it after removing the request from the
   used ring. Unsupported/no-op flush, discard, and cancel paths resolve
   immediately rather than returning a permanently pending future.
+- VirtIO sound PCI queries PCM_INFO and registers its implemented stream-0
+  playback endpoint with `drivers/sound`, including the actual PCI parent.
+  The PCM lease supports the advertised subset of S16LE mono/stereo at
+  44.1/48 kHz, configuration, prepare/start/stop, cumulative frame position,
+  writes and drain. Other opens and kernel convenience submits
+  cannot bypass an active lease. Capture, MIDI and mixer controls are not
+  advertised without a backend. Playback copies into coherent controller-owned
+  scratch and splits long writes at whole-frame boundaries; the 4024-byte
+  payload area ends before the completion status. Configuration changes issue
+  STOP/RELEASE before SET_PARAMS/PREPARE/START. Timeout poisons the controller
+  and requires acknowledged reset before caller-owned DMA storage can be freed;
+  unacknowledged reset is fatal rather than returning live DMA to an allocator.
 
 Internal modules: `transport_pci`, `transport_mmio`, `queue_split`,
 `queue_packed`, `class_blk`, `class_net`, `class_console`.
