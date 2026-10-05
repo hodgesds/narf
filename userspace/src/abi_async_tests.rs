@@ -107,6 +107,96 @@ fn smoke_abi_async_ppoll_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_ppoll_neg);
 
+fn smoke_abi_async_ppoll_exact_errnos() -> TestResult {
+    with_setup(|| {
+        const BAD_USER_PTR: u64 = 1 << 47;
+
+        // 1. Timespec validation outranks fds buffer check:
+        // Faulting timespec pointer returns -EFAULT even with bad fds pointer.
+        let args = SyscallArgs {
+            arg0: BAD_USER_PTR,
+            arg1: 1,
+            arg2: BAD_USER_PTR,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::Ppoll.raw(), args) != Some(EFAULT) {
+            return Err("ppoll faulting timespec pointer did not return EFAULT");
+        }
+
+        // Invalid timespec returns -EINVAL before fds buffer check.
+        let bad_nsec: [i64; 2] = [0, 1_000_000_000];
+        let args = SyscallArgs {
+            arg0: BAD_USER_PTR,
+            arg1: 1,
+            arg2: bad_nsec.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::Ppoll.raw(), args) != Some(EINVAL) {
+            return Err("ppoll invalid tv_nsec did not return EINVAL before fds check");
+        }
+
+        let bad_sec: [i64; 2] = [-1, 0];
+        let args = SyscallArgs {
+            arg0: BAD_USER_PTR,
+            arg1: 1,
+            arg2: bad_sec.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::Ppoll.raw(), args) != Some(EINVAL) {
+            return Err("ppoll negative tv_sec did not return EINVAL before fds check");
+        }
+
+        // 2. Sigmask validation outranks fds buffer check:
+        // Non-null sigmask pointer with sigsetsize != 8 returns -EINVAL.
+        let args = SyscallArgs {
+            arg0: BAD_USER_PTR,
+            arg1: 1,
+            arg2: 0,
+            arg3: 0x1000,
+            arg4: 4, // size != 8
+            arg5: 0,
+        };
+        if call(Syscall::Ppoll.raw(), args) != Some(EINVAL) {
+            return Err("ppoll sigsetsize != 8 did not return EINVAL");
+        }
+
+        // Faulting sigmask pointer returns -EFAULT.
+        let args = SyscallArgs {
+            arg0: BAD_USER_PTR,
+            arg1: 1,
+            arg2: 0,
+            arg3: BAD_USER_PTR,
+            arg4: 8,
+            arg5: 0,
+        };
+        if call(Syscall::Ppoll.raw(), args) != Some(EFAULT) {
+            return Err("ppoll faulting sigmask pointer did not return EFAULT");
+        }
+
+        // 3. When timeout and sigmask are valid, bad fds buffer with nfds > 0 returns -EFAULT.
+        let args = SyscallArgs {
+            arg0: BAD_USER_PTR,
+            arg1: 1,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::Ppoll.raw(), args) != Some(EFAULT) {
+            return Err("ppoll bad fds pointer did not return EFAULT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_ppoll_exact_errnos);
+
 // ════════════════════════════════════════════════════════════════════
 // select(2) — sys_select(nfds, rfds, wfds, efds, timeval*)
 //
@@ -167,6 +257,116 @@ fn smoke_abi_async_pselect6_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_pselect6_neg);
+
+fn smoke_abi_async_pselect6_exact_errnos() -> TestResult {
+    with_setup(|| {
+        const BAD_USER_PTR: u64 = 1 << 47;
+
+        // 1. Sigmask argpack pointer copy outranks timespec read and nfds check:
+        // A faulting argpack pointer returns -EFAULT immediately.
+        let args = SyscallArgs {
+            arg0: u64::from(u32::MAX), // nfds = -1
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: BAD_USER_PTR,
+        };
+        if call(Syscall::Pselect6.raw(), args) != Some(EFAULT) {
+            return Err(
+                "pselect6 faulting sigmask argpack did not return EFAULT before nfds check",
+            );
+        }
+
+        // 2. Timespec pointer copy and validation outrank the nfds check:
+        // A faulting timespec pointer returns -EFAULT before nfds < 0 is checked.
+        let args = SyscallArgs {
+            arg0: u64::from(u32::MAX),
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: BAD_USER_PTR,
+            arg5: 0,
+        };
+        if call(Syscall::Pselect6.raw(), args) != Some(EFAULT) {
+            return Err(
+                "pselect6 faulting timespec pointer did not return EFAULT before nfds check",
+            );
+        }
+
+        // Invalid timespec (tv_nsec >= 1e9 or tv_sec < 0) returns -EINVAL before nfds check.
+        let bad_nsec: [i64; 2] = [0, 1_000_000_000];
+        let args = SyscallArgs {
+            arg0: u64::from(u32::MAX),
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: bad_nsec.as_ptr() as u64,
+            arg5: 0,
+        };
+        if call(Syscall::Pselect6.raw(), args) != Some(EINVAL) {
+            return Err("pselect6 invalid tv_nsec did not return EINVAL before nfds check");
+        }
+
+        let bad_sec: [i64; 2] = [-1, 0];
+        let args = SyscallArgs {
+            arg0: u64::from(u32::MAX),
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: bad_sec.as_ptr() as u64,
+            arg5: 0,
+        };
+        if call(Syscall::Pselect6.raw(), args) != Some(EINVAL) {
+            return Err("pselect6 negative tv_sec did not return EINVAL before nfds check");
+        }
+
+        // 3. Sigmask validation:
+        // Non-null sigmask pointer with sigsetsize != 8 returns -EINVAL.
+        let bad_size_pack: [u64; 2] = [0x1000, 4]; // size != 8
+        let args = SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: bad_size_pack.as_ptr() as u64,
+        };
+        if call(Syscall::Pselect6.raw(), args) != Some(EINVAL) {
+            return Err("pselect6 sigsetsize != 8 did not return EINVAL");
+        }
+
+        // Non-null sigmask pointer with faulting sigset pointer returns -EFAULT.
+        let bad_mask_pack: [u64; 2] = [BAD_USER_PTR, 8];
+        let args = SyscallArgs {
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: bad_mask_pack.as_ptr() as u64,
+        };
+        if call(Syscall::Pselect6.raw(), args) != Some(EFAULT) {
+            return Err("pselect6 faulting sigmask pointer did not return EFAULT");
+        }
+
+        // 4. Finally, nfds < 0 returns -EINVAL when all earlier checks pass.
+        let args = SyscallArgs {
+            arg0: u64::from(u32::MAX),
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::Pselect6.raw(), args) != Some(EINVAL) {
+            return Err("pselect6 negative nfds did not return EINVAL");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_pselect6_exact_errnos);
 
 // ════════════════════════════════════════════════════════════════════
 // epoll_create1(2) — sys_epoll_create1(flags)
@@ -490,6 +690,148 @@ fn smoke_abi_async_epoll_pwait2_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait2_neg);
+
+fn smoke_abi_async_epoll_pwait2_exact_errnos() -> TestResult {
+    with_setup(|| {
+        const BAD_USER_PTR: u64 = 1 << 47;
+        let mut evbuf = [0u8; 12];
+
+        // 1. Timeout pointer copy and validation outrank the descriptor lookup:
+        // Faulting timeout pointer returns -EFAULT even with bad epfd.
+        let args = SyscallArgs {
+            arg0: 9999, // bad epfd
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: BAD_USER_PTR,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EFAULT) {
+            return Err("epoll_pwait2 faulting timeout did not return EFAULT before epfd check");
+        }
+
+        // Invalid timespec returns -EINVAL before epfd check.
+        let bad_nsec: [i64; 2] = [0, 1_000_000_000];
+        let args = SyscallArgs {
+            arg0: 9999,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: bad_nsec.as_ptr() as u64,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EINVAL) {
+            return Err("epoll_pwait2 invalid tv_nsec did not return EINVAL before epfd check");
+        }
+
+        let bad_sec: [i64; 2] = [-1, 0];
+        let args = SyscallArgs {
+            arg0: 9999,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: bad_sec.as_ptr() as u64,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EINVAL) {
+            return Err("epoll_pwait2 negative tv_sec did not return EINVAL before epfd check");
+        }
+
+        // 2. Sigmask validation outranks descriptor lookup:
+        // Non-null sigmask pointer with sigsetsize != 8 returns -EINVAL.
+        let args = SyscallArgs {
+            arg0: 9999,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0x1000,
+            arg5: 4, // size != 8
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EINVAL) {
+            return Err("epoll_pwait2 sigsetsize != 8 did not return EINVAL before epfd check");
+        }
+
+        // Faulting sigmask pointer returns -EFAULT before epfd check.
+        let args = SyscallArgs {
+            arg0: 9999,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: BAD_USER_PTR,
+            arg5: 8,
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EFAULT) {
+            return Err("epoll_pwait2 faulting sigmask did not return EFAULT before epfd check");
+        }
+
+        // 3. Descriptor lookup occurs next: bad epfd returns -EBADF.
+        let args = SyscallArgs {
+            arg0: 9999,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EBADF) {
+            return Err("epoll_pwait2 bad epfd did not return EBADF");
+        }
+
+        // Non-epoll descriptor returns -EINVAL (from ep_check_params).
+        let mut pipefd = [0u8; 8];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 setup failed");
+        }
+        let pipe_fd = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        let args = SyscallArgs {
+            arg0: pipe_fd,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EINVAL) {
+            return Err("epoll_pwait2 on non-epoll fd did not return EINVAL");
+        }
+
+        // 4. On a valid epfd: maxevents <= 0 returns -EINVAL.
+        let epfd = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create failed"),
+        };
+        let args = SyscallArgs {
+            arg0: epfd,
+            arg1: evbuf.as_mut_ptr() as u64,
+            arg2: 0, // maxevents = 0
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EINVAL) {
+            return Err("epoll_pwait2 maxevents=0 did not return EINVAL");
+        }
+
+        // Faulting events buffer returns -EFAULT.
+        let args = SyscallArgs {
+            arg0: epfd,
+            arg1: BAD_USER_PTR,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::EpollPwait2.raw(), args) != Some(EFAULT) {
+            return Err("epoll_pwait2 faulting events buffer did not return EFAULT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_epoll_pwait2_exact_errnos
+);
 
 // ════════════════════════════════════════════════════════════════════
 // futex(2) — sys_futex(uaddr, op, val, timeout, uaddr2, val3)

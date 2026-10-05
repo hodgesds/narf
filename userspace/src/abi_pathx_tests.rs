@@ -629,6 +629,140 @@ kernel_test_in!(
     smoke_abi_pathx_fchownat_empty_path_requires_flag
 );
 
+fn smoke_abi_pathx_fchmod_fchown_opath_and_symlink() -> TestResult {
+    with_memfs("/p2", "p2", &[("target_file", b"hello attribute")], || {
+        const BAD_USER_PTR: u64 = 1 << 47;
+        const O_PATH: u64 = 0o10000000;
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        const AT_EMPTY_PATH: u64 = 0x1000;
+
+        let target_path = b"/p2/target_file\0";
+        let symlink_path = b"/p2/symlink_file\0";
+        if call_symlink(target_path.as_ptr() as u64, symlink_path.as_ptr() as u64) != Some(0) {
+            return Err("symlink setup failed");
+        }
+
+        // 1. fchmod and fchown use fdget which refuses O_PATH descriptors (-EBADF).
+        let opath_fd = match call_open(target_path.as_ptr() as u64, O_PATH) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(O_PATH) failed"),
+        };
+        if call(Syscall::Fchmod.raw(), a1(opath_fd, 0o644)) != Some(EBADF) {
+            return Err("fchmod on O_PATH descriptor must return EBADF");
+        }
+        if call(Syscall::Fchown.raw(), a2(opath_fd, 1000, 1000)) != Some(EBADF) {
+            return Err("fchown on O_PATH descriptor must return EBADF");
+        }
+
+        // 2. In contrast, fchmodat2 and fchownat with AT_EMPTY_PATH resolve the
+        // descriptor as a path and permit O_PATH descriptors.
+        let empty = b"\0";
+        if call(
+            Syscall::Fchmodat2.raw(),
+            a3(opath_fd, empty.as_ptr() as u64, 0o644, AT_EMPTY_PATH),
+        ) != Some(0)
+            || file_perms("/p2/target_file") != Some(0o644)
+        {
+            return Err("fchmodat2(opath, \"\", mode, AT_EMPTY_PATH) failed");
+        }
+
+        let chown_args = SyscallArgs {
+            arg0: opath_fd,
+            arg1: empty.as_ptr() as u64,
+            arg2: 1234,
+            arg3: 5678,
+            arg4: AT_EMPTY_PATH,
+            arg5: 0,
+        };
+        if call(Syscall::Fchownat.raw(), chown_args) != Some(0)
+            || file_owners("/p2/target_file") != Some((1234, 5678))
+        {
+            return Err("fchownat(opath, \"\", uid, gid, AT_EMPTY_PATH) failed");
+        }
+
+        // 3. fchmodat2 with AT_SYMLINK_NOFOLLOW on a symlink returns -EOPNOTSUPP
+        // (Linux fs/attr.c rejects chmod on symlinks).
+        if call(
+            Syscall::Fchmodat2.raw(),
+            a3(
+                AT_FDCWD,
+                symlink_path.as_ptr() as u64,
+                0o644,
+                AT_SYMLINK_NOFOLLOW,
+            ),
+        ) != Some(EOPNOTSUPP)
+        {
+            return Err("fchmodat2(AT_SYMLINK_NOFOLLOW) on symlink did not return EOPNOTSUPP");
+        }
+
+        // 4. Invalid flags rejected with -EINVAL before path resolution.
+        if call(
+            Syscall::Fchmodat2.raw(),
+            a3(AT_FDCWD, target_path.as_ptr() as u64, 0o644, 0x4000_0000),
+        ) != Some(EINVAL)
+        {
+            return Err("fchmodat2 with invalid flags did not return EINVAL");
+        }
+        let invalid_flag_chown = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: target_path.as_ptr() as u64,
+            arg2: 1000,
+            arg3: 1000,
+            arg4: 0x4000_0000,
+            arg5: 0,
+        };
+        if call(Syscall::Fchownat.raw(), invalid_flag_chown) != Some(EINVAL) {
+            return Err("fchownat with invalid flags did not return EINVAL");
+        }
+
+        // 5. Empty path without AT_EMPTY_PATH returns -ENOENT.
+        if call(
+            Syscall::Fchmodat2.raw(),
+            a3(opath_fd, empty.as_ptr() as u64, 0o644, 0),
+        ) != Some(ENOENT)
+        {
+            return Err("fchmodat2 with empty path and flags=0 did not return ENOENT");
+        }
+        let empty_path_no_flag_chown = SyscallArgs {
+            arg0: opath_fd,
+            arg1: empty.as_ptr() as u64,
+            arg2: 1000,
+            arg3: 1000,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::Fchownat.raw(), empty_path_no_flag_chown) != Some(ENOENT) {
+            return Err("fchownat with empty path and flags=0 did not return ENOENT");
+        }
+
+        // 6. Bad path pointer returns -EFAULT.
+        if call(
+            Syscall::Fchmodat2.raw(),
+            a3(AT_FDCWD, BAD_USER_PTR, 0o644, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("fchmodat2 with BAD_USER_PTR did not return EFAULT");
+        }
+        let bad_ptr_chown = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: BAD_USER_PTR,
+            arg2: 1000,
+            arg3: 1000,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::Fchownat.raw(), bad_ptr_chown) != Some(EFAULT) {
+            return Err("fchownat with BAD_USER_PTR did not return EFAULT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_fchmod_fchown_opath_and_symlink
+);
+
 fn smoke_abi_pathx_fchownat_directory_persists() -> TestResult {
     with_memfs("/p2", "p2", &[], || {
         let dir = b"/p2/runtime-dir\0";
