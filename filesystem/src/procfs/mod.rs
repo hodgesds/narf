@@ -374,6 +374,9 @@ type PidResolveFn = fn(u64) -> Option<u64>;
 /// `None` when the process is not visible in the reader's namespace (used to
 /// filter + translate cgroup.procs listings). Identity in the root namespace.
 type PidReportFn = fn(u64) -> Option<u64>;
+/// The calling THREAD's tid as the caller itself names it (`gettid()`):
+/// the `<tid>` half of the `/proc/thread-self` -> `<tgid>/task/<tid>` link.
+type CurrentTidFn = fn() -> u64;
 
 static CURRENT_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
 static LIST_PIDS_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -381,6 +384,7 @@ static TASK_INFO_HOOK: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_OUTER_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
 static PID_RESOLVE_HOOK: AtomicUsize = AtomicUsize::new(0);
 static PID_REPORT_HOOK: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_TID_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Wire the kernel-side accessors. Called once from boot init.
 pub fn install_proc_hooks(current: CurrentPidFn, list: ListPidsFn, info: TaskInfoFn) {
@@ -397,31 +401,35 @@ pub fn install_proc_pidns_hooks(
     current_outer: CurrentOuterPidFn,
     resolve: PidResolveFn,
     report: PidReportFn,
+    current_tid: CurrentTidFn,
 ) {
     CURRENT_OUTER_PID_HOOK.store(current_outer as usize, Ordering::Release);
     PID_RESOLVE_HOOK.store(resolve as usize, Ordering::Release);
     PID_REPORT_HOOK.store(report as usize, Ordering::Release);
+    CURRENT_TID_HOOK.store(current_tid as usize, Ordering::Release);
 }
 
 /// Test-only: snapshot the three pid-namespace hook pointers so a test that
 /// installs stubs can restore the real hooks afterward (the procfs tests run in
 /// the same boot where userspace already installed them). Order matches
-/// `install_proc_pidns_hooks`: (current_outer, resolve, report).
+/// `install_proc_pidns_hooks`: (current_outer, resolve, report, current_tid).
 #[doc(hidden)]
-pub fn __test_pidns_hooks_snapshot() -> (usize, usize, usize) {
+pub fn __test_pidns_hooks_snapshot() -> (usize, usize, usize, usize) {
     (
         CURRENT_OUTER_PID_HOOK.load(Ordering::Acquire),
         PID_RESOLVE_HOOK.load(Ordering::Acquire),
         PID_REPORT_HOOK.load(Ordering::Acquire),
+        CURRENT_TID_HOOK.load(Ordering::Acquire),
     )
 }
 
 /// Test-only: restore hook pointers captured by `__test_pidns_hooks_snapshot`.
 #[doc(hidden)]
-pub fn __test_pidns_hooks_restore(snap: (usize, usize, usize)) {
+pub fn __test_pidns_hooks_restore(snap: (usize, usize, usize, usize)) {
     CURRENT_OUTER_PID_HOOK.store(snap.0, Ordering::Release);
     PID_RESOLVE_HOOK.store(snap.1, Ordering::Release);
     PID_REPORT_HOOK.store(snap.2, Ordering::Release);
+    CURRENT_TID_HOOK.store(snap.3, Ordering::Release);
 }
 
 pub(crate) fn current_pid() -> u64 {
@@ -444,6 +452,27 @@ pub(crate) fn current_outer_pid() -> u64 {
     // SAFETY: v was stored by install_proc_pidns_hooks as a CurrentOuterPidFn fn-pointer.
     let f: CurrentOuterPidFn = unsafe { core::mem::transmute(v) };
     f()
+}
+
+/// The calling thread's tid in its own pid-namespace view. Falls back to
+/// `current_pid()` when the hook isn't installed (the leader's tid IS its
+/// tgid, which is all a hook-less build can name).
+pub(crate) fn current_tid() -> u64 {
+    let v = CURRENT_TID_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return current_pid();
+    }
+    // SAFETY: v was stored by install_proc_pidns_hooks as a CurrentTidFn fn-pointer.
+    let f: CurrentTidFn = unsafe { core::mem::transmute(v) };
+    f()
+}
+
+/// The outer ProcessId `/proc/self` (and the `<tgid>` half of
+/// `/proc/thread-self`) resolves to: the caller's reader-view tgid
+/// translated back through the reader's namespace, falling back to the
+/// caller's outer pid.
+fn self_outer_pid() -> u64 {
+    pid_resolve(current_pid()).unwrap_or_else(current_outer_pid)
 }
 
 /// Resolve a `/proc/<N>` path number (reader-namespace) to the outer ProcessId,
@@ -1233,12 +1262,12 @@ fn snapshot_dir(m: &BTreeMap<String, ProcNode>) -> Vec<(String, ProcNodeKind)> {
 
 // ── /proc/thread-self ────────────────────────────────────────────
 //
-// Magic symlink whose readlink text is `<pid>/task/<tid>`.  In NARF
-// tid == pid for every task (no separate pthread_t kernel thread IDs
-// yet), so the target is always `<pid>/task/<pid>`.  The node stats as
-// Symlink so `readlink(2)` / `lstat(2)` treat it correctly, and
-// `lookup_dir("thread-self")` in ProcRoot descends into the task/<tid>
-// directory via ProcTaskDir for path-resolution.
+// Magic symlink whose readlink text is `<tgid>/task/<tid>`, both in the
+// caller's pid-namespace view. A CLONE_THREAD sibling's tid differs from
+// its tgid, so the two halves come from different hooks (`current_pid`,
+// `current_tid`). The node stats as Symlink so `readlink(2)` / `lstat(2)`
+// treat it correctly, and `lookup_dir("thread-self")` in ProcRoot descends
+// into the CALLING thread's task/<tid> directory for path-resolution.
 //
 // Linux ref: `fs/proc/self.c` `proc_thread_self_get_link` (6.9) — the
 // kernel constructs `<tgid>/task/<tid>` as the link target.
@@ -1257,10 +1286,12 @@ impl FileOps for ProcThreadSelf {
     }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = current_pid();
+        let tid = current_tid();
         Box::pin(async move {
-            // readlink returns e.g. "7/task/7" — relative, no leading slash,
+            // readlink returns e.g. "7/task/9" — relative, no leading slash,
             // same shape as /proc/self which readlinks to "7".
-            let target = format!("{}/task/{}", pid, pid);
+            // fs/proc/thread_self.c: sprintf(name, "%u/task/%u", tgid, pid).
+            let target = format!("{}/task/{}", pid, tid);
             slice_read(target.as_bytes(), offset, buf)
         })
     }
@@ -2138,10 +2169,9 @@ impl DirOps for ProcRoot {
             })),
             "self" => Some(Arc::new(ProcSelfSymlink)),
             // /proc/thread-self is a magic symlink (like /proc/self) that
-            // resolves to `<pid>/task/<tid>`.  In NARF tid == the per-task
-            // pid for procfs purposes, so the target is `<pid>/task/<pid>`.
+            // resolves to `<tgid>/task/<tid>` of the CALLING thread.
             // The symlink stat is Symlink; readlink returns the formatted
-            // string; descending into it resolves via ProcPidDir → task/.
+            // string; descending into it resolves via ProcTaskDir.
             // Linux ref: `fs/proc/self.c` `proc_thread_self_get_link` (6.9).
             // [[proc-magic-links]]
             "thread-self" => Some(Arc::new(ProcThreadSelf)),
@@ -2186,23 +2216,19 @@ impl DirOps for ProcRoot {
         }
         if name == "self" {
             // /proc/self resolves to the calling task's in-namespace pid translated to outer pid.
-            let inner_pid = current_pid();
-            if let Some(pid) = pid_resolve(inner_pid) {
-                return Some(Arc::new(ProcPidDir { pid }));
-            }
-            let pid = current_outer_pid();
-            return Some(Arc::new(ProcPidDir { pid }));
+            return Some(Arc::new(ProcPidDir {
+                pid: self_outer_pid(),
+            }));
         }
         if name == "thread-self" {
-            // /proc/thread-self → <pid>/task/<tid>; tid == pid in NARF.
-            // Descending gives a ProcTaskTidDir that exposes `comm` etc.
-            // Linux ref: `proc_thread_self_get_link` (fs/proc/self.c:80).
-            // Look up by the reader-visible tid (inner in a namespace), not the
-            // outer pid — ProcTaskDir::lookup_dir now matches on visible_tid. (#16)
-            let pid = current_outer_pid();
-            let dir = pid_ext::ProcTaskDir { pid };
-            let tid = dir.visible_tid();
-            return dir.lookup_dir(&tid.to_string());
+            // /proc/thread-self → <tgid>/task/<tid> of the CALLING thread
+            // (fs/proc/thread_self.c). The tid is looked up in the reader-ns
+            // view ProcTaskDir lists, so a sibling thread lands on its own
+            // entry rather than the leader's.
+            let dir = pid_ext::ProcTaskDir {
+                pid: self_outer_pid(),
+            };
+            return dir.lookup_dir(&current_tid().to_string());
         }
         // Registry-backed subdirectory (e.g. "net").
         let snap = lookup_registry(&[name]);

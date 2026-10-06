@@ -6703,6 +6703,14 @@ pub fn proc_current_outer_pid() -> u64 {
     task_to_pid_raw(task).unwrap_or(task)
 }
 
+/// /proc/thread-self hook — the calling THREAD's tid in its own pid-namespace
+/// view (== `gettid()`), the `<tid>` half of `<tgid>/task/<tid>`
+/// (fs/proc/thread_self.c: `task_pid_nr_ns(current, ns)`). Differs from
+/// [`proc_current_pid`] for every CLONE_THREAD sibling.
+pub fn proc_current_tid() -> u64 {
+    linux_tid_for_task(current_task_id())
+}
+
 /// `/proc/<N>` numeric-resolution hook. `N` is a pid in the READER's PID
 /// namespace; return the outer ProcessId the kernel keys on, or `None` when
 /// the reader is namespaced and `N` names no process in its namespace (so

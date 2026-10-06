@@ -1099,12 +1099,12 @@ impl DirOps for ProcTaskTidDir {
 }
 
 impl ProcTaskDir {
-    /// The single thread's tid AS SEEN BY THE READER. `self.pid` is the outer
-    /// ProcessId; a namespaced reader must see its inner tid, not the host
-    /// number (Linux `fs/proc/array.c` renders task/<tid> via the reader's ns).
-    /// NARF is single-thread-per-process, so tid == the reader's view of pid.
-    /// Identity in the root namespace / when no pid-ns hook is installed. (#16)
-    pub(crate) fn visible_tid(&self) -> u64 {
+    /// The LEADER's tid as seen by the reader. `self.pid` is the outer
+    /// ProcessId, which is also the leader's tid; a namespaced reader must
+    /// see its inner number, not the host one (Linux renders task/<tid> via
+    /// the reader's ns). Identity in the root namespace / when no pid-ns hook
+    /// is installed. (#16)
+    fn visible_tid(&self) -> u64 {
         crate::procfs::pid_report(self.pid).unwrap_or(self.pid)
     }
 }
@@ -1427,7 +1427,15 @@ fn smoke_task_dir_renders_reader_ns_tid() -> TestResult {
     }
 
     let snap = crate::procfs::__test_pidns_hooks_snapshot();
-    crate::procfs::install_proc_pidns_hooks(stub_current_outer, stub_resolve, stub_report);
+    fn stub_current_tid() -> u64 {
+        7
+    }
+    crate::procfs::install_proc_pidns_hooks(
+        stub_current_outer,
+        stub_resolve,
+        stub_report,
+        stub_current_tid,
+    );
 
     let dir = ProcTaskDir { pid: 0x5150 };
     let names: alloc::vec::Vec<alloc::string::String> =
