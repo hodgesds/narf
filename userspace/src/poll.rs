@@ -855,52 +855,58 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
 
     let task = current_task_id();
 
-    if nfds == 0 {
-        // poll({}, 0, timeout_ms) is legal; it just sleeps for timeout_ms.
-        if timeout > 0 {
-            let deadline = narf_scheduler::narf_time::monotonic_ns()
-                .saturating_add((timeout as u64) * 1_000_000);
-            while narf_scheduler::narf_time::monotonic_ns() < deadline {
-                narf_scheduler::sleep_pumps::run();
-                core::hint::spin_loop();
-            }
-        }
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
-    // Validate the whole `struct pollfd[nfds]` before touching a byte of it.
+    // `poll(NULL, 0, timeout)` is legal, and its WAIT is real: `do_sys_poll`
+    // has no fds to watch, so it simply sleeps on the timeout and returns 0
+    // when that expires — or blocks until a signal when the timeout is
+    // indefinite. Returning 0 at once for `timeout < 0` is wrong twice over:
+    // poll(2) returns 0 only when a timeout has expired, and there is no
+    // timeout here to expire. Busy-spinning a whole core for a finite one is
+    // not wrong, but it is a core.
     //
-    // This is the one thing `parse_pollfds` / `write_pollfds` cannot do for
-    // themselves: both open a SMAP bracket and then `read_unaligned` /
-    // `write_unaligned`, so with `EFLAGS.AC` set a `CPL=0` access to a kernel
-    // page succeeds silently. The old comment here asserted "user pointer in
-    // the active AS" and nothing checked it, which made `revents` — two bytes
-    // written at `ptr + i*8 + 6` for every `i` — an arbitrary kernel write, and
-    // the parse an arbitrary kernel read. `poll(2)` and `ppoll(2)` take no
-    // credential, so unlike the `bpf(2)` gadget of the same class this was
-    // reachable by any task.
-    //
-    // One check covers both directions: the parse reads `[ptr, ptr + nfds*8)`
-    // and every write lands inside it. `nfds` is already bounded above, so the
-    // multiply cannot wrap, and `validate_user_range` rejects the kernel half,
-    // the canonical hole, a null base, and an end-overflow.
-    let Some(bytes) = nfds.checked_mul(8) else {
-        ctx.set_return(to_ret(EINVAL));
-        return;
-    };
-    if crate::handlers::validate_user_range(ptr as u64, bytes).is_err() {
-        ctx.set_return(to_ret(EFAULT));
-        return;
-    }
-
-    // SAFETY: the range was just validated as `nfds * 8` bytes wholly inside
-    // the user half, which is exactly the contract `parse_pollfds` documents.
-    let mut fds = match unsafe { parse_pollfds(ptr, nfds) } {
-        Some(v) => v,
-        None => {
+    // Both are avoided by taking the ordinary park below with an empty set.
+    // The only thing nfds == 0 must still skip is the pointer work: the
+    // caller typically passes NULL, which `validate_user_range` rightly
+    // rejects, and there is nothing to parse or write back either way
+    // (`write_pollfds` over an empty slice writes nothing).
+    let mut fds = if nfds == 0 {
+        Vec::new()
+    } else {
+        // Validate the whole `struct pollfd[nfds]` before touching a byte of
+        // it.
+        //
+        // This is the one thing `parse_pollfds` / `write_pollfds` cannot do
+        // for themselves: both open a SMAP bracket and then `read_unaligned`
+        // / `write_unaligned`, so with `EFLAGS.AC` set a `CPL=0` access to a
+        // kernel page succeeds silently. The old comment here asserted "user
+        // pointer in the active AS" and nothing checked it, which made
+        // `revents` — two bytes written at `ptr + i*8 + 6` for every `i` — an
+        // arbitrary kernel write, and the parse an arbitrary kernel read.
+        // `poll(2)` and `ppoll(2)` take no credential, so unlike the `bpf(2)`
+        // gadget of the same class this was reachable by any task.
+        //
+        // One check covers both directions: the parse reads
+        // `[ptr, ptr + nfds*8)` and every write lands inside it. `nfds` is
+        // already bounded above, so the multiply cannot wrap, and
+        // `validate_user_range` rejects the kernel half, the canonical hole, a
+        // null base, and an end-overflow.
+        let Some(bytes) = nfds.checked_mul(8) else {
+            ctx.set_return(to_ret(EINVAL));
+            return;
+        };
+        if crate::handlers::validate_user_range(ptr as u64, bytes).is_err() {
             ctx.set_return(to_ret(EFAULT));
             return;
+        }
+
+        // SAFETY: the range was just validated as `nfds * 8` bytes wholly
+        // inside the user half, which is exactly the contract
+        // `parse_pollfds` documents.
+        match unsafe { parse_pollfds(ptr, nfds) } {
+            Some(v) => v,
+            None => {
+                ctx.set_return(to_ret(EFAULT));
+                return;
+            }
         }
     };
 

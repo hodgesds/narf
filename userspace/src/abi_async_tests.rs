@@ -4,9 +4,11 @@ use crate::abi_test_support::*;
 // ════════════════════════════════════════════════════════════════════
 // poll(2) — sys_poll(pollfds_ptr, nfds, timeout_ms)
 //
-// Handler: crate::poll::sys_poll. nfds==0 is legal (sleep-for-timeout),
-// returns 0 immediately when timeout<=0. A null pollfd ptr with nfds>0
-// fails through parse_pollfds → the -1 sentinel.
+// Handler: crate::poll::sys_poll. nfds==0 is legal — there is simply nothing
+// to watch, so the call waits out its timeout and returns 0. Only timeout==0
+// returns immediately: `do_sys_poll` answers 0 when a timeout EXPIRED, and an
+// indefinite wait has none to expire, so it blocks until a signal. A null
+// pollfd ptr with nfds>0 is -EFAULT from the import.
 // ════════════════════════════════════════════════════════════════════
 
 fn smoke_abi_async_poll_pos() -> TestResult {
@@ -80,16 +82,32 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_poll_kernel_ptr_neg);
 // ════════════════════════════════════════════════════════════════════
 // ppoll(2) — sys_ppoll(fds, nfds, timespec*, sigmask, sigsetsize)
 //
-// timespec NULL (arg2==0) → block-forever timeout, but nfds==0 returns 0
-// at once (poll_common's empty-set fast path).
+// A NULL timespec (arg2==0) means wait forever, so only a ZERO timespec
+// returns at once — with nfds==0 just as with any other set.
 // ════════════════════════════════════════════════════════════════════
 
 fn smoke_abi_async_ppoll_pos() -> TestResult {
     with_setup(|| {
-        // ppoll(NULL, 0, NULL, NULL, 0): empty set → 0.
-        match call(Syscall::Ppoll.raw(), a3(0, 0, 0, 0)) {
+        // ppoll(NULL, 0, {0,0}, NULL, 0): empty set, already-expired timeout
+        // → 0 at once.
+        //
+        // This asked with a NULL timespec and expected 0, which encoded the
+        // defect it should have caught: a NULL timespec means WAIT FOREVER, so
+        // on Linux that call blocks until a signal and can never return 0.
+        // When the kernel was corrected to wait, this test hung the whole
+        // suite — the harness has no per-test timeout — which is the shape to
+        // remember: a test that asserts a blocking call returns immediately
+        // keeps passing for exactly as long as the bug survives.
+        //
+        // A ZERO timespec is the way to ask for the non-blocking answer, and
+        // it still covers what this test is for: nfds==0 is legal and reports
+        // nothing ready. The blocking half is covered end-to-end by
+        // `fedora-poll-probe.py` (`ppoll-empty-null`), which bounds it with
+        // SIGALRM instead of trusting it to return.
+        let ts: [u64; 2] = [0, 0];
+        match call(Syscall::Ppoll.raw(), a3(0, 0, ts.as_ptr() as u64, 0)) {
             Some(0) => Ok(()),
-            _ => Err("ppoll(NULL,0,NULL,..) should return 0"),
+            _ => Err("ppoll(NULL,0,{0,0},..) should return 0"),
         }
     })
 }

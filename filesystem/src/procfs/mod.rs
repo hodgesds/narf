@@ -544,6 +544,24 @@ type OomAdjSetFn = fn(u64, i16) -> Result<(), FsError>;
 type CoredumpGetFn = fn(u64) -> u32;
 type CoredumpSetFn = fn(u64, u32) -> Result<(), FsError>;
 type OomScoreFn = fn(u64) -> i32;
+/// `/proc/<pid>/task/<tid>/comm` read and write, by the tid the READER sees.
+type ThreadCommGetFn = fn(u64) -> Option<String>;
+type ThreadCommSetFn = fn(u64, &str) -> Result<(), FsError>;
+
+/// The fields `/proc/<pid>/task/<tid>/stat` reports about the THREAD rather
+/// than about its group.
+///
+/// Linux renders that file with the same 52-field layout as the process one
+/// (`do_task_stat` with `whole = 0`, fs/proc/array.c): the thread's own id,
+/// name and CPU times, and the thread group's values for everything that
+/// genuinely describes the group — parentage, session, address-space size.
+#[derive(Debug, Clone)]
+pub struct ThreadStat {
+    pub comm: String,
+    pub utime_ticks: u64,
+    pub stime_ticks: u64,
+}
+type ThreadStatFn = fn(u64) -> Option<ThreadStat>;
 
 // ── /proc/<pid>/exe + cwd + root path hooks ─────────────────────
 //
@@ -632,6 +650,65 @@ static OOM_ADJ_SET_HOOK: AtomicUsize = AtomicUsize::new(0);
 static COREDUMP_GET_HOOK: AtomicUsize = AtomicUsize::new(0);
 static COREDUMP_SET_HOOK: AtomicUsize = AtomicUsize::new(0);
 static OOM_SCORE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static THREAD_COMM_GET_HOOK: AtomicUsize = AtomicUsize::new(0);
+static THREAD_COMM_SET_HOOK: AtomicUsize = AtomicUsize::new(0);
+static THREAD_STAT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Wire `/proc/<pid>/task/<tid>/stat` to per-THREAD identity and CPU time.
+///
+/// This is the file `ps -L` and `top -H` read for every thread they list, and
+/// procps aborts the whole listing ("fatal library error, reap") when it is
+/// missing — so without it a threaded process has no per-thread view at all,
+/// and a spinning thread cannot be told from a busy process.
+pub fn set_thread_stat_hook(f: ThreadStatFn) {
+    THREAD_STAT_HOOK.store(f as usize, Ordering::Release);
+}
+
+pub(crate) fn hook_thread_stat(tid: u64) -> Option<ThreadStat> {
+    let v = THREAD_STAT_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: only `set_thread_stat_hook` writes this cell, always from a
+    // `ThreadStatFn` fn-pointer; non-zero confirms it was stored.
+    let f: ThreadStatFn = unsafe { core::mem::transmute(v) };
+    f(tid)
+}
+
+/// Wire `/proc/<pid>/task/<tid>/comm` to the per-THREAD name.
+///
+/// Linux publishes a thread's own name there, writable by its owner
+/// (`tid_base_stuff`'s `NOD("comm", S_IFREG|S_IRUGO|S_IWUSR, ...)`), and that
+/// file is how glibc's `pthread_setname_np` sets one — it opens
+/// `/proc/self/task/<tid>/comm` O_RDWR and writes. Without the hooks the node
+/// reports the thread GROUP's name and refuses writes, so every threaded
+/// program's names collapse into one and `pthread_setname_np` fails.
+pub fn install_thread_comm_hooks(get: ThreadCommGetFn, set: ThreadCommSetFn) {
+    THREAD_COMM_GET_HOOK.store(get as usize, Ordering::Release);
+    THREAD_COMM_SET_HOOK.store(set as usize, Ordering::Release);
+}
+
+pub(crate) fn hook_thread_comm(tid: u64) -> Option<String> {
+    let v = THREAD_COMM_GET_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return None;
+    }
+    // SAFETY: only `install_thread_comm_hooks` writes this cell, always from a
+    // `ThreadCommGetFn` fn-pointer; non-zero confirms it was stored.
+    let f: ThreadCommGetFn = unsafe { core::mem::transmute(v) };
+    f(tid)
+}
+
+pub(crate) fn hook_set_thread_comm(tid: u64, name: &str) -> Result<(), FsError> {
+    let v = THREAD_COMM_SET_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return Err(FsError::Unsupported);
+    }
+    // SAFETY: only `install_thread_comm_hooks` writes this cell, always from a
+    // `ThreadCommSetFn` fn-pointer; non-zero confirms it was stored.
+    let f: ThreadCommSetFn = unsafe { core::mem::transmute(v) };
+    f(tid, name)
+}
 
 /// Wire the extended /proc/[pid]/* read hooks. Called once at boot.
 pub fn install_proc_ext_hooks(

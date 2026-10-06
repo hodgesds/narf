@@ -51,6 +51,11 @@ pub struct IntelHda {
     pub(super) streams: [IrqSafeSpinLock<super::stream::Stream>; 2],
     pub(super) irq_control: IrqSafeSpinLock<()>,
     pub(super) volume: IrqSafeSpinLock<super::routing::Volume>,
+    /// Formats the routed converters can actually configure, indexed by
+    /// `capture as usize`. Queried once at probe from the codec's
+    /// `AC_PAR_PCM` word — the same word `configure_paths` enforces — so
+    /// `capabilities()` stays a pure read on a path alsa-lib walks repeatedly.
+    pub(super) supported_formats: [Vec<narf_drivers_sound::format::SampleFormat>; 2],
     pub ready: bool,
 }
 impl core::fmt::Debug for IntelHda {
@@ -169,6 +174,7 @@ impl IntelHda {
             graphs: Vec::new(),
             outputs: Vec::new(),
             input: None,
+            supported_formats: [Vec::new(), Vec::new()],
             streams: [
                 IrqSafeSpinLock::new(super::stream::Stream::new(counts.0, false)),
                 IrqSafeSpinLock::new(super::stream::Stream::new(0, true)),
@@ -263,6 +269,10 @@ impl IntelHda {
             return Err(HdaError::NoCodecs);
         }
         dev.discover_paths();
+        dev.supported_formats = [
+            dev.query_supported_formats(false),
+            dev.query_supported_formats(true),
+        ];
         dev.ready = !dev.outputs.is_empty() || dev.input.is_some();
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         unsafe {

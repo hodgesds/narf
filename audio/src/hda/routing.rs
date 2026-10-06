@@ -43,6 +43,73 @@ impl IntelHda {
             }
         }
     }
+    /// The `AC_PAR_PCM` (parameter 0x0a) size bit for `format`.
+    ///
+    /// Linux reads the same word in `snd_hda_query_supported_pcm`
+    /// (sound/pci/hda/hda_codec.c) to build a PCM's format constraint. Shared
+    /// by the capability query and by `configure_paths`'s enforcement so the
+    /// set a card ADVERTISES and the set it ACCEPTS are the same set.
+    fn pcm_size_bit(format: SampleFormat) -> Option<u32> {
+        match format {
+            SampleFormat::S16LE => Some(1 << 17),
+            SampleFormat::S32LE => Some(1 << 20),
+            _ => None,
+        }
+    }
+
+    /// Formats every routed converter in `capture`'s direction can configure.
+    ///
+    /// Empty when the direction has no usable path, or when the codec query
+    /// itself fails; the caller falls back to the driver's own default format
+    /// rather than offering nothing.
+    ///
+    /// This must be answered from the codec, not from a fixed list. Advertising
+    /// S32_LE on a codec whose `AC_PAR_PCM` word lacks bit 20 made `HW_REFINE`
+    /// offer a point `HW_PARAMS` then rejected, and alsa-lib cannot recover
+    /// from that: PipeWire negotiates the widest format on offer and its ALSA
+    /// node dies with `set_hw_params: Invalid argument`, leaving the graph with
+    /// a sink that never takes a quantum. QEMU's hda-duplex codec is exactly
+    /// such a codec.
+    pub(super) fn query_supported_formats(&self, capture: bool) -> Vec<SampleFormat> {
+        let paths: Vec<&Path> = if capture {
+            self.input.iter().collect()
+        } else {
+            self.outputs.iter().collect()
+        };
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let mut supported = alloc::vec![SampleFormat::S16LE, SampleFormat::S32LE];
+        for path in paths {
+            let Some(graph) = self.graphs.get(path.codec) else {
+                return Vec::new();
+            };
+            let Some(converter) = graph.widget(path.nodes.converter_nid) else {
+                return Vec::new();
+            };
+            let caps_nid = if converter.caps.format_override() {
+                converter.nid
+            } else {
+                graph.afg_nid
+            };
+            let (Ok(pcm), Ok(formats)) = (
+                self.verb(graph.addr, caps_nid, VERB_GET_PARAMETER | 0x0a),
+                self.verb(graph.addr, caps_nid, VERB_GET_PARAMETER | 0x0b),
+            ) else {
+                return Vec::new();
+            };
+            // Bit 6 is the 48 kHz rate, bit 0 of the stream-formats word is
+            // PCM — the same two gates `configure_paths` applies before it
+            // looks at the size bits.
+            if pcm & (1 << 6) == 0 || formats & 1 == 0 {
+                return Vec::new();
+            }
+            supported
+                .retain(|format| Self::pcm_size_bit(*format).is_some_and(|bit| pcm & bit != 0));
+        }
+        supported
+    }
+
     fn verb(&self, cad: u8, nid: u8, verb: u32) -> Result<u32, HdaError> {
         // SAFETY: this object's lifetime owns the controller and command ring.
         unsafe { self.send_verb(make_verb(cad, nid, verb)) }
@@ -72,10 +139,8 @@ impl IntelHda {
             };
             let pcm = self.verb(cad, caps_nid, VERB_GET_PARAMETER | 0x0a)?;
             let formats = self.verb(cad, caps_nid, VERB_GET_PARAMETER | 0x0b)?;
-            let bits = match params.format {
-                SampleFormat::S16LE => 1 << 17,
-                SampleFormat::S32LE => 1 << 20,
-                _ => return Err(HdaError::NoOutputStream),
+            let Some(bits) = Self::pcm_size_bit(params.format) else {
+                return Err(HdaError::NoOutputStream);
             };
             if pcm & (1 << 6) == 0 || pcm & bits == 0 || formats & 1 == 0 {
                 return Err(HdaError::NoOutputStream);

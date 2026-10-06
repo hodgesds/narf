@@ -91,7 +91,9 @@ ENTEREOF
       bash coreutils util-linux procps-ng strace file less findutils \
       dejavu-sans-fonts kde-cli-tools konsole foot \
       kactivitymanagerd kglobalacceld kscreen \
-      xdg-desktop-portal xdg-desktop-portal-kde plasma-polkit-agent'
+      xdg-desktop-portal xdg-desktop-portal-kde plasma-polkit-agent \
+      pipewire pipewire-alsa pipewire-libs pipewire-utils wireplumber \
+      alsa-utils alsa-ucm python3'
   "$WORK/enter.sh" 'dnf clean all'
 fi
 
@@ -123,6 +125,30 @@ if [ ! -x "$WORK/root/usr/bin/kactivitymanagerd" ] ||
    [ ! -x "$WORK/root/usr/bin/kscreen_backend_launcher" ]; then
   "$WORK/enter.sh" 'dnf -y --setopt=install_weak_deps=False install \
       kactivitymanagerd kglobalacceld kscreen'
+  "$WORK/enter.sh" 'dnf clean all'
+fi
+
+# The desktop audio stack. Guarded per-binary so older incremental work trees
+# top up without a full rootfs rebuild.
+#   pipewire / wireplumber — the stock daemon + session manager the audio gate
+#                            runs; wireplumber is what exercises udev discovery
+#                            and ALSA card profiles.
+#   pipewire-utils         — pw-dump / pw-play / pw-record / wpctl drive and
+#                            inspect the graph from the gate.
+#   alsa-utils             — aplay -l / arecord -l are the pre-PipeWire
+#                            enumeration check; they fail with a clearer error
+#                            than the daemon does.
+#   alsa-ucm               — use-case configs alsa-lib looks for while opening
+#                            a card; absent, every open logs a UCM miss.
+#   python3                — the gate parses pw-dump's JSON graph with it.
+if [ ! -x "$WORK/root/usr/bin/pipewire" ] ||
+   [ ! -x "$WORK/root/usr/bin/wireplumber" ] ||
+   [ ! -x "$WORK/root/usr/bin/pw-dump" ] ||
+   [ ! -x "$WORK/root/usr/bin/aplay" ] ||
+   [ ! -x "$WORK/root/usr/bin/python3" ]; then
+  "$WORK/enter.sh" 'dnf -y --setopt=install_weak_deps=False install \
+      pipewire pipewire-alsa pipewire-libs pipewire-utils wireplumber \
+      alsa-utils alsa-ucm python3'
   "$WORK/enter.sh" 'dnf clean all'
 fi
 
@@ -174,6 +200,11 @@ rm -f "$WORK/root/usr/share/dbus-1/services/org.freedesktop.systemd1.service"
 rm -f "$WORK/root/usr/share/dbus-1/system-services/org.freedesktop.locale1.service"
 # ld.so.cache: the image is built offline, so make sure it matches the tree.
 "$WORK/enter.sh" 'ldconfig' || true
+# hwdb.bin: 78-sound-card.rules does IMPORT{builtin}="hwdb", so without a
+# prebuilt index systemd-hwdb-update.service compiles the whole text database
+# during every boot — minutes of CPU before udevd can finish a single sound
+# card, long enough for the audio gate to time out waiting on the database.
+"$WORK/enter.sh" 'systemd-hwdb update' || true
 
 # Plasma must run as an ordinary desktop user. The image is a container base
 # and therefore has no login user by default; create the deterministic test
@@ -182,9 +213,10 @@ if ! grep -q '^narf:' "$WORK/root/etc/passwd"; then
   "$WORK/enter.sh" 'useradd --create-home --uid 1000 --shell /bin/bash narf'
 fi
 # Fedora assigns primary DRM nodes to `video` (normally 0660) and render nodes
-# to `render` at 0666. Keep both memberships for incremental work trees too;
+# to `render` at 0666, and `50-udev-default.rules` assigns /dev/snd/* to
+# `audio` at 0660. Keep all three memberships for incremental work trees too;
 # this image has no logind seat manager to install per-user device ACLs.
-"$WORK/enter.sh" 'usermod --append --groups video,render narf'
+"$WORK/enter.sh" 'usermod --append --groups video,render,audio narf'
 install -d -m 0755 "$WORK/root/etc/systemd/system/graphical.target.wants"
 # Serial is already the acceptance console. Fedora's tty getty units cannot
 # own these synthetic terminals correctly yet and crash/restart throughout a
@@ -316,6 +348,14 @@ if [ -e "$WORK/root/usr/bin/plasma_session.narf-real" ]; then
     "$WORK/root/usr/bin/plasma_session"
 fi
 
+# Not on an audio-check boot. The audio gate deliberately does not want a
+# compositor: the graph has to stand up on its own, and a Plasma failure must
+# not read as an audio failure. Leaving the session to start anyway is worse
+# than noise — a Plasma process taking a fatal fault has twice left the guest
+# spinning on a dozen vCPUs with the serial stream dead, so the gate's own
+# result was lost to an unrelated crash. `ConditionKernelCommandLine` is the
+# narrowest way to say it: ordinary graphical boots are untouched.
+#
 # The session service starts after its two real prerequisites: the user
 # manager/session bus and DRM ownership policy.  They have no ordering edge
 # between them, so PID 1 starts both jobs in parallel.
@@ -353,6 +393,9 @@ fi
 printf '%s\n' \
   '[Unit]' \
   'Description=NARF Plasma Wayland Session' \
+  'ConditionKernelCommandLine=!narf_audio_check' \
+  'ConditionKernelCommandLine=!narf_ptrace_check' \
+  'ConditionKernelCommandLine=!narf_poll_check' \
   'Wants=dbus-broker.service' \
   'Wants=user@1000.service' \
   'After=user@1000.service' \
@@ -398,6 +441,95 @@ install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-net-check.sh" \
   "$WORK/root/usr/local/libexec/narf-net-check"
 
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-audio-gate.sh" \
+  "$WORK/root/usr/local/libexec/narf-audio-gate"
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-poll-probe.py" \
+  "$WORK/root/usr/local/libexec/narf-poll-probe"
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-ptrace-probe.py" \
+  "$WORK/root/usr/local/libexec/narf-ptrace-probe"
+
+# Desktop audio acceptance gate: prove stock PipeWire + WirePlumber discover
+# the cards through udev, build ACP card profiles, route a sink and a source,
+# run playback and capture simultaneously, and recover from a profile cycle
+# and a session restart. Opt-in via the narf_audio_check kernel cmdline flag
+# so ordinary graphical boots never run it.
+#
+# It is ordered after udevd because the whole contract starts in udev's
+# database, and it deliberately does NOT want the Plasma session: the audio
+# graph must stand up on its own, and pulling a compositor in would make a
+# compositor failure read as an audio failure.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify PipeWire/WirePlumber desktop audio on NARF' \
+  'ConditionKernelCommandLine=narf_audio_check' \
+  'Wants=systemd-udevd.service dbus-broker.service' \
+  'After=systemd-udevd.service dbus-broker.service' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'ExecStart=/usr/local/libexec/narf-audio-gate' \
+  'TimeoutStartSec=1800' \
+  'LimitRTPRIO=95' \
+  'LimitMEMLOCK=infinity' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  '' \
+  '[Install]' \
+  'WantedBy=multi-user.target' \
+  > "$WORK/root/etc/systemd/system/narf-audio-gate.service"
+install -d -m 0755 "$WORK/root/etc/systemd/system/multi-user.target.wants"
+ln -sfn ../narf-audio-gate.service \
+  "$WORK/root/etc/systemd/system/multi-user.target.wants/narf-audio-gate.service"
+
+# Blocking-wait acceptance gate: prove a wait that should block does block.
+# The audio gate runs this probe too, but as one stage of a twenty-minute run;
+# its own flag makes a single iteration a bare multi-user boot, which is what
+# you want while chasing a spin.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify blocking-wait semantics on NARF' \
+  'ConditionKernelCommandLine=narf_poll_check' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'ExecStart=/usr/local/libexec/narf-poll-probe' \
+  'TimeoutStartSec=300' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  '' \
+  '[Install]' \
+  'WantedBy=multi-user.target' \
+  > "$WORK/root/etc/systemd/system/narf-poll-check.service"
+ln -sfn ../narf-poll-check.service \
+  "$WORK/root/etc/systemd/system/multi-user.target.wants/narf-poll-check.service"
+
+# ptrace attach acceptance gate: prove PTRACE_ATTACH reports its stop to a
+# tracer that did not fork the tracee. That is the door `strace -p` uses, and
+# it is distinct from the TRACEME+exec path the musl strace smoke covers — a
+# tracer whose attach-stop is never reported blocks forever in wait4, which is
+# exactly how it presents. Opt-in via narf_ptrace_check so the probe costs a
+# bare multi-user boot rather than a run of the audio gate.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify PTRACE_ATTACH stop reporting on NARF' \
+  'ConditionKernelCommandLine=narf_ptrace_check' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'ExecStart=/usr/local/libexec/narf-ptrace-probe' \
+  'TimeoutStartSec=300' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  '' \
+  '[Install]' \
+  'WantedBy=multi-user.target' \
+  > "$WORK/root/etc/systemd/system/narf-ptrace-check.service"
+ln -sfn ../narf-ptrace-check.service \
+  "$WORK/root/etc/systemd/system/multi-user.target.wants/narf-ptrace-check.service"
+
 # Network acceptance gate: prove the distro has a WORKING off-box path
 # (the virtio NIC visible, TCP round-trip to the host across SLIRP, DNS through
 # 10.0.2.3). Opt-in via the narf_net_check kernel cmdline flag — xtask
@@ -424,6 +556,13 @@ ln -sfn ../narf-net-check.service \
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-systemd-start.sh" \
   "$WORK/root/narf-start.sh"
+
+# `systemd-hwdb-update.service` is gated on ConditionNeedsUpdate=/etc, which
+# compares /usr's mtime against /etc/.updated. The staging above rewrites /usr,
+# so without this stamp every boot recompiles the 14 MB hwdb index that was
+# just built offline — around 90 s before udevd can finish its first device.
+# Written last, after the final /usr write, so the stamp is genuinely newer.
+touch "$WORK/root/etc/.updated"
 
 # ------------------------------------------------------------------ pack ---
 chmod u-w "$WORK/root/usr/bin"

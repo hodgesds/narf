@@ -1234,8 +1234,18 @@ Procfs advertises the Linux filesystem type `proc`. Its magic links
 (`/proc/self`, `/proc/thread-self`, and per-task `exe`, `cwd`, `root`, `fd`,
 and namespace links) report symlink mode with `st_size == 0`, matching Linux;
 callers must use `readlink(2)` rather than infer a target length from stat
-metadata. In a container-enabled build, following a per-task namespace magic
-link through `open(2)` produces an nsfs-like descriptor that retains the
+metadata. A magic link's target is rendered in the READER's root
+frame, as Linux `d_path()` does (`fs/d_path.c`, reached from
+`proc_pid_readlink`): `/proc/<pid>/root` reads back as `/` whenever the target
+task's root is the reader's own — the case for every process inside one
+chroot or container — as the remainder when the target is below the reader's
+root, and as the global path when it is unreachable from it (`d_path` leaves
+the global path in the buffer; only `getcwd` prepends `(unreachable)`). The
+stored root prefix is host-view, so returning it verbatim would name a path
+that does not exist inside the reader's tree, and the link would fail to open
+rather than merely read oddly.
+In a container-enabled build, following a per-task namespace magic link
+through `open(2)` produces an nsfs-like descriptor that retains the
 namespace object for `setns(2)`; `O_PATH|O_NOFOLLOW` instead opens the symlink
 node itself. The proc fd provider returns one `ProcFdSnapshot` containing the
 link target plus live offset, status flags, mount ID, and inode identity, so

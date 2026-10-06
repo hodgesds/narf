@@ -150,6 +150,11 @@ fn install_proc_hooks() {
     // /proc/<pid>/task/ — the group's threads. Without this the directory
     // lists the leader alone, which is wrong for anything using CLONE_THREAD.
     narf_filesystem::procfs::set_thread_list_hook(narf_userspace::handlers::proc_thread_list);
+    narf_filesystem::procfs::install_thread_comm_hooks(
+        narf_userspace::handlers::proc_thread_comm,
+        narf_userspace::handlers::proc_set_thread_comm,
+    );
+    narf_filesystem::procfs::set_thread_stat_hook(narf_userspace::handlers::proc_thread_stat);
 }
 
 fn install_proc_ext_hooks() {

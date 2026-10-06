@@ -3604,3 +3604,261 @@ fn smoke_abi_proc_hwcap2_fsgsbase_matches_cr4() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_hwcap2_fsgsbase_matches_cr4);
+
+// ── /proc/[pid]/root rendering (Linux `d_path`) ──────────────────────
+//
+// `proc_pid_readlink` renders a magic link's target with `d_path()`
+// (fs/proc/base.c:1815), which walks to `current->fs->root` — the READER's
+// root (fs/d_path.c:265). The stored root prefix is host-view, so a chrooted
+// reader must never be handed it verbatim: it names nothing inside that
+// reader's own tree. A reader whose root equals the target's therefore has to
+// read back exactly "/".
+//
+// This is not cosmetic. PipeWire's access module OPENS `/proc/<peer>/root`
+// looking for `.flatpak-info`; the open resolving to a nonexistent path makes
+// it classify the peer as sandboxed and park the connection until it times
+// out, so every client inside a container hangs at connect.
+fn smoke_abi_proc_root_link_renders_in_the_readers_root() -> TestResult {
+    use crate::handlers::d_path_from_root_for_test as render;
+
+    // Same root: the overwhelmingly common case (every process in one
+    // container) and the one PipeWire's peer check depends on.
+    if render("/mnt", "/mnt") != "/" {
+        return TestResult::Fail("a target equal to the reader's root must render as /");
+    }
+    // A target below the reader's root renders as the remainder, with the
+    // leading slash the remainder already carries.
+    if render("/mnt/srv/chroot", "/mnt") != "/srv/chroot" {
+        return TestResult::Fail("a target below the reader's root must render relative to it");
+    }
+    // A shared PREFIX is not a shared root: "/mnt2" is not inside "/mnt".
+    if render("/mnt2", "/mnt") != "/mnt2" {
+        return TestResult::Fail("a sibling path must not be mistaken for a child");
+    }
+    // Unreachable from the reader's root: `prepend_path` fails and `d_path`
+    // leaves the global path in the buffer. It does NOT add the
+    // "(unreachable)" marker — only getcwd prepends that (fs/d_path.c:435).
+    if render("/other", "/mnt") != "/other" {
+        return TestResult::Fail("an unreachable target must render as its global path");
+    }
+    // An unchrooted reader sees global paths unchanged.
+    if render("/mnt", "/") != "/mnt" || render("/", "/") != "/" {
+        return TestResult::Fail("an unchrooted reader must see the global path");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_root_link_renders_in_the_readers_root
+);
+
+// ── /proc/<pid>/{root,cwd,exe} must be FOLLOWABLE, not just readable ──
+//
+// Linux follows these with `nd_jump_link` (fs/proc/base.c), which installs the
+// target `path` directly and so crosses mounts by construction. NARF resolves
+// a symlink inside the filesystem that owns it, and an ABSOLUTE target
+// restarts at that filesystem's own mount root — procfs has no `/`, so the
+// walk ran out of components and reported ENOENT. `readlink` worked the whole
+// time, which is exactly why this went unnoticed: the links LOOK fine and only
+// following them fails.
+//
+// A trailing slash is covered because `open_last_lookups` adds
+// LOOKUP_FOLLOW | LOOKUP_DIRECTORY for one, so `open(".../root/")` follows the
+// link and then requires a directory.
+//
+// PipeWire's access module opens `/proc/<peer-pid>/root` looking for
+// `.flatpak-info` and treats a failed open as "this client is sandboxed",
+// parking the connection until it is disconnected — so every PipeWire client
+// hung at connect while this was broken.
+fn smoke_abi_proc_task_magic_links_are_followable() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const O_RDONLY: u64 = 0;
+    const O_DIRECTORY: u64 = 0o200000;
+    const S_IFMT: u32 = 0o170000;
+    const S_IFDIR: u32 = 0o040000;
+
+    // `/proc/self` resolves through the calling task's pid. The synthetic
+    // AbiCtx harness has no pid registration, so there is no `/proc/<pid>` to
+    // reach and nothing here to assert; the distro audio gate covers the live
+    // path. Probe an ordinary per-pid file rather than guessing.
+    match call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, c"/proc/self/stat".as_ptr() as u64, O_RDONLY, 0),
+    ) {
+        Some(fd) if fd >= 0 => {
+            call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        _ => return TestResult::Skip("/proc/self is not reachable in this harness"),
+    }
+
+    // Both directory links, with and without the trailing slash.
+    for path in [
+        b"/proc/self/root\0".as_slice(),
+        b"/proc/self/root/\0".as_slice(),
+        b"/proc/self/cwd\0".as_slice(),
+        b"/proc/self/cwd/\0".as_slice(),
+    ] {
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
+        ) {
+            Some(fd) if fd >= 0 => {
+                call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return TestResult::Fail("a proc task magic link did not open as a directory"),
+        }
+    }
+
+    // A path stat follows it too: `stat("/proc/self/root")` describes the
+    // task's root DIRECTORY, not the link (that is what `lstat` is for).
+    let mut st = [0u8; 256];
+    if call(
+        Syscall::Newfstatat.raw(),
+        a3(
+            AT_FDCWD,
+            c"/proc/self/root".as_ptr() as u64,
+            st.as_mut_ptr() as u64,
+            0,
+        ),
+    ) != Some(0)
+    {
+        return TestResult::Fail("stat(/proc/self/root) must succeed");
+    }
+    // x86_64 struct stat: st_mode is the u32 at offset 24.
+    let mode = u32::from_ne_bytes([st[24], st[25], st[26], st[27]]);
+    if mode & S_IFMT != S_IFDIR {
+        return TestResult::Fail("stat(/proc/self/root) must report S_IFDIR");
+    }
+
+    // AT_SYMLINK_NOFOLLOW still describes the link itself.
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const S_IFLNK: u32 = 0o120000;
+    let mut lst = [0u8; 256];
+    if call(
+        Syscall::Newfstatat.raw(),
+        a3(
+            AT_FDCWD,
+            c"/proc/self/root".as_ptr() as u64,
+            lst.as_mut_ptr() as u64,
+            AT_SYMLINK_NOFOLLOW,
+        ),
+    ) != Some(0)
+    {
+        return TestResult::Fail("lstat(/proc/self/root) must succeed");
+    }
+    let lmode = u32::from_ne_bytes([lst[24], lst[25], lst[26], lst[27]]);
+    if lmode & S_IFMT != S_IFLNK {
+        return TestResult::Fail("lstat(/proc/self/root) must still report S_IFLNK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_task_magic_links_are_followable
+);
+
+// ── /proc/<pid>/task/ lists THREAD ids ───────────────────────────────
+//
+// `proc_task_readdir` (fs/proc/base.c) names one entry per thread, and the
+// name is the thread's tid. Reporting the group's pid for every member gave
+// the directory one name repeated once per thread. Duplicate readdir names
+// are not something consumers tolerate: procps aborts with "fatal library
+// error, reap", and glibc's `pthread_setname_np` — which opens
+// `/proc/self/task/<tid>/comm` — gets ENOENT for every thread but the leader,
+// which is how PipeWire reports "pthread_setname error: No such file or
+// directory" for each of its loops.
+//
+// The harness runs one task, so this pins the LEADER case: its tid is its pid,
+// and `/proc/self/task/<gettid()>` must resolve. The multi-thread shape is
+// covered by the distro audio gate, where `ps -L` and `pthread_setname_np`
+// exercise it against real threads.
+fn smoke_abi_proc_task_dir_is_named_by_tid() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const O_DIRECTORY: u64 = 0o200000;
+
+    // Same harness caveat as above: with no pid registration `gettid` has no
+    // task to name, and `/proc/self/task` cannot be reached either.
+    let tid = match call(Syscall::Gettid.raw(), a0(0)) {
+        Some(v) if v > 0 => v as u64,
+        _ => return TestResult::Skip("gettid has no registered task in this harness"),
+    };
+    let path = alloc::format!("/proc/self/task/{tid}\0");
+    match call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, path.as_ptr() as u64, O_DIRECTORY, 0),
+    ) {
+        Some(fd) if fd >= 0 => {
+            call(Syscall::Close.raw(), a0(fd as u64));
+        }
+        _ => return TestResult::Fail("/proc/self/task/<gettid()> must be a directory"),
+    }
+    // The comm file beneath it is what pthread_setname_np opens.
+    let comm = alloc::format!("/proc/self/task/{tid}/comm\0");
+    match call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, comm.as_ptr() as u64, 0, 0),
+    ) {
+        Some(fd) if fd >= 0 => {
+            call(Syscall::Close.raw(), a0(fd as u64));
+            TestResult::Pass
+        }
+        _ => TestResult::Fail("/proc/self/task/<tid>/comm must be readable"),
+    }
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_task_dir_is_named_by_tid);
+
+// ── A tracer must be able to wait for a tracee it did not fork ───
+//
+// Linux's `do_wait` walks `tsk->ptraced` alongside `tsk->children`
+// (kernel/exit.c), so after PTRACE_ATTACH a tracer can `wait4` a task that is
+// not its child. NARF's wait-eligibility check does consult the tracee
+// registry — but that registry is keyed in the ptrace ABI's pid space, while
+// the wait path carries scheduler TaskIds. The two are identical until a task
+// forks and different for every real tracer, so the comparison never matched:
+// `has_living_child` saw no candidate and `wait4(-1, …, __WALL)` answered
+// ECHILD.
+//
+// That is the first thing `strace -p` does after attaching, so it could not
+// trace any process it had not forked itself: "strace: wait4(__WALL): No child
+// processes".
+//
+// Asserted on the predicate rather than through `wait4`, so the test pins the
+// id-space conversion itself instead of the whole wait state machine. The two
+// spaces are made to DIFFER here, or it would be vacuous: a TaskId with no pid
+// mapping converts to itself and an unconverted comparison matches by accident.
+fn smoke_abi_proc_tracer_of_any_takes_a_task_id() -> TestResult {
+    const TRACEE_TASK: u64 = 0x7000_3001;
+    const TRACEE_PID: u64 = 0x7000_30A1;
+    const TRACER_TASK: u64 = 0x7000_3002;
+    const TRACER_PID: u64 = 0x7000_30A2;
+
+    crate::handlers::register_task_to_pid(TRACEE_TASK, TRACEE_PID);
+    crate::handlers::register_task_to_pid(TRACER_TASK, TRACER_PID);
+    crate::ptrace::__test_set_tracer(TRACEE_TASK, Some(TRACER_TASK));
+
+    let any = crate::ptrace::is_tracer_of_any(TRACER_TASK, -1);
+    let specific = crate::ptrace::is_tracer_of_any(TRACER_TASK, TRACEE_PID as i64);
+    let wrong_tracer = crate::ptrace::is_tracer_of_any(TRACEE_TASK, -1);
+
+    crate::ptrace::__test_set_tracer(TRACEE_TASK, None);
+    let after_detach = crate::ptrace::is_tracer_of_any(TRACER_TASK, -1);
+    crate::handlers::__test_forget_task_pid(TRACEE_TASK);
+    crate::handlers::__test_forget_task_pid(TRACER_TASK);
+
+    if !any {
+        return TestResult::Fail(
+            "a tracer named by its TaskId did not match its own tracee (the wait path's ECHILD)",
+        );
+    }
+    if !specific {
+        return TestResult::Fail("a tracer named by its TaskId did not match its tracee by pid");
+    }
+    if wrong_tracer {
+        return TestResult::Fail("a task that traces nothing matched as a tracer");
+    }
+    if after_detach {
+        return TestResult::Fail("a detached tracer still matched its former tracee");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_tracer_of_any_takes_a_task_id);

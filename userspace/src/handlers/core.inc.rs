@@ -1447,6 +1447,45 @@ fn open_impl_reserved(
         return;
     }
 
+    // `/proc/<pid>/{root,cwd,exe}` are magic links too, and following one has
+    // to restart the walk at the TASK's root rather than inside procfs — see
+    // `proc_task_link_target`. Checked after the fd links (whose targets may
+    // be anonymous and have no pathname at all) and only when the final
+    // component is actually being followed.
+    if mnt_len == 0 && follow_final {
+        // A trailing slash does NOT exempt the link: `open_last_lookups` adds
+        // LOOKUP_FOLLOW | LOOKUP_DIRECTORY for one, so `open("…/root/")`
+        // follows the link and then demands a directory. Match on the path
+        // without it and put it back on the target, which is what carries the
+        // directory requirement into the restarted walk.
+        let probe = if path.len() > 1 {
+            path.trim_end_matches('/')
+        } else {
+            path
+        };
+        if let Some(target) = proc_task_link_target(task, probe) {
+            if current_resolve_scope().is_some_and(|s| s.no_magiclinks) {
+                ctx.set_return(errno_ret(ELOOP)); // -ELOOP
+                return;
+            }
+            // A target that re-enters as the same host path would recurse
+            // forever. No current link can produce one (a root, cwd or exe is
+            // never itself a `/proc/<pid>/{root,cwd,exe}` path), so this is a
+            // guard against a future one, not a live case.
+            if apply_chroot(&target) == probe {
+                ctx.set_return(errno_ret(ELOOP)); // -ELOOP
+                return;
+            }
+            let target = if trailing_slash {
+                alloc::format!("{}/", target.trim_end_matches('/'))
+            } else {
+                target
+            };
+            open_impl_reserved(ctx, target, flags, 0, 0, create_mode, reservation);
+            return;
+        }
+    }
+
     // `open_last_lookups`, create side: once the parent has been walked,
     // `if (unlikely(nd->last.name[nd->last.len])) return ERR_PTR(-EISDIR);`
     // — `open("x/", O_CREAT)` is EISDIR whether `x` is missing, a file or a
@@ -12376,7 +12415,33 @@ fn get_wait_recipient(child_pid: u64) -> Option<(u64, bool, u8)> {
 /// nudge it: stage SIGCHLD and wake any blocking wait4. Does NOT
 /// release the child PID — the child is still alive.
 pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: bool) {
-    let child_pid = task_to_pid_raw(child_task).unwrap_or(child_task);
+    // WHICH pid the report names depends on who receives it —
+    // `do_notify_parent_cldstop` (kernel/signal.c):
+    //
+    //     if (for_ptracer) {
+    //             parent = tsk->parent;
+    //     } else {
+    //             tsk = tsk->group_leader;
+    //             parent = tsk->real_parent;
+    //     }
+    //     ...
+    //     info.si_pid = task_pid_nr_ns(tsk, task_active_pid_ns(parent));
+    //
+    // A report to the TRACER names the stopping THREAD; only a report to the
+    // real parent is rewritten to the group leader. Naming the leader
+    // unconditionally collapsed every thread of a group into one slot (the
+    // pending map is keyed parent -> child_pid), so attaching to an N-thread
+    // process produced exactly ONE stop report, filed under the leader's pid:
+    // the tracer's `waitpid(<worker tid>)` matched nothing and a
+    // `waitpid(-1)` loop got one report instead of N. `strace -p` attaches to
+    // every tid under /proc/<pid>/task and then waits for one stop each, so
+    // it hung in wait4 against any multithreaded process.
+    let tid = task_to_linux_tid_raw(child_task).unwrap_or(child_task);
+    let child_pid = if crate::ptrace::is_task_traced(tid) {
+        tid
+    } else {
+        task_to_pid_raw(child_task).unwrap_or(child_task)
+    };
     push_stopcont_report_as(child_pid, wstatus, is_continued);
 }
 

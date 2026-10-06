@@ -50,6 +50,75 @@ SoundWire, HDMI/DP audio, vendor smart-amplifier quirks and system power-transit
 reinitialization remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
+## Desktop audio: stock PipeWire and WirePlumber
+
+Unmodified Fedora 43 PipeWire 1.4 and WirePlumber 0.5 run on the Fedora KDE
+image and get as far as a complete audio graph. The gate that drives them,
+what each of its stages establishes, and how to run it are in
+[verification/data/pipewire-compat](verification/data/pipewire-compat/README.md).
+
+Working and asserted end to end: both QEMU cards reach systemd-udevd's
+database with the properties `spa_alsa_udev` requires (`SOUND_INITIALIZED`,
+`ID_PATH`, PCI identity from hwdb); the desktop user opens the nodes;
+WirePlumber attaches as a second process over the PipeWire protocol and builds
+ACP card profiles (five on HDA, three on VirtIO), selects a best profile,
+finds HDA's hardware volume control, activates analog input and output routes,
+exports a sink per card plus a source, and sets the default sink and source.
+`wpctl status` lists them as a desktop would see them.
+
+Five Linux-ABI defects found by that path are fixed:
+
+- `/dev/snd/*` owner, mode and ACL now live on the devtmpfs NODE rather than
+  the per-lookup `FileOps`, and the nodes are published root-owned at 0600 as
+  `sound/sound_core.c` plus `drivers/base/devtmpfs.c` do. udev's `GROUP="audio"`
+  chown was previously discarded, so every non-root ALSA client reported "no
+  soundcards found" and no desktop session could play a sound.
+- `/proc/<pid>/root` is rendered in the READER's root frame, as Linux
+  `d_path()` does. The stored prefix is host-view, so a chrooted reader —
+  which is every process in this image — was handed a name that resolved to
+  nothing.
+- `/proc/{self,<pid>}/{root,cwd,exe}` are FOLLOWABLE at `open` and at a path
+  `stat`, trailing slash included, and a `stat` whose symlink target leaves
+  its own filesystem now crosses the mount the way `open` already did. An
+  absolute magic-link target restarts at the owning filesystem's mount root,
+  so the walk never left procfs. PipeWire's access module opens
+  `/proc/<peer-pid>/root` to look for `.flatpak-info` and reads a failed open
+  as "this client is sandboxed", so every client hung at connect. The same
+  shape through devtmpfs also made `/dev/fd/<n>` unresolvable, which is how
+  bash implements process substitution (`cmd < <(other)`); the VFS expansion
+  now stops at a proc-fd magic link instead of expanding its readlink TEXT,
+  which for an anonymous descriptor is `pipe:[12345]` and names nothing.
+- `/proc/<pid>/task/` is named by thread id instead of repeating the group's
+  pid once per thread, and each thread directory now carries a per-thread
+  `stat` and a per-thread, writable `comm` (0644, as `tid_base_stuff` has it).
+  Together that is what `ps -L` and `top -H` read, and what glibc's
+  `pthread_setname_np` writes: the gate sees seven distinctly named
+  WirePlumber threads where before procps aborted with "fatal library error,
+  reap".
+- HDA advertises only the formats its codec reports. `capabilities()` returned
+  a fixed `S16_LE | S32_LE` while `configure_paths` enforced the converter's
+  `AC_PAR_PCM` word, so on a 16-bit-only codec — QEMU's hda-duplex among them
+  — `HW_REFINE` offered S32_LE and `HW_PARAMS` then rejected it. alsa-lib
+  cannot recover from that: PipeWire negotiates the widest format on offer and
+  its ALSA node dies with `set_hw_params: Invalid argument`, leaving a sink
+  that never takes a quantum. The format set is now queried once at probe,
+  from the same word the enforcement reads.
+
+One defect remains open, and the gate reports it on every run rather than
+failing on it: **WirePlumber's main thread burns ~100% of one CPU once the
+graph is built**, while the PipeWire daemon stays at 0% and every functional
+stage passes. The vDSO monotonic clock, `poll`/`epoll` blocking semantics,
+`POLLERR`/`POLLHUP` handling, poll-over-epoll with GLib's exact mask,
+level-not-cleared-on-consume for eventfd/socketpair/timerfd, ALSA control-fd
+readiness, and GLib itself (a bare `gdbus monitor` idles at 0%) have all been
+measured in-guest and ruled out; it produces no log output at trace level, so
+it is a silent dispatch loop. Narrowing it further wants a tracer. A tracer is
+now eligible to wait for a tracee it did not fork, but the tracee's attach-stop
+is never reported to it, so `strace -p` blocks in `wait4` instead of answering
+`No child processes` — reporting that stop is the next step. Details and the
+full elimination list are in
+[verification/data/pipewire-compat](verification/data/pipewire-compat/README.md).
+
 ## USB-C and Phoenix USB4
 
 UCSI ACPI connector discovery, firmware state notifications, per-NHI native
