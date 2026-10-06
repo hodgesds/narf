@@ -10007,6 +10007,19 @@ pub fn release_external_shared_frame(phys: u64) {
 
 // ── Batch 18: address-space-wide locking, secret memory, NUMA ────────
 
+/// Linux errno for an address-space refusal inside `mprotect(2)`'s VMA walk
+/// (`mm/mprotect.c::do_mprotect_pkey` / `mprotect_fixup`):
+/// - a hugetlb VMA split off its huge-page boundary is -EINVAL
+///   (`hugetlb_vm_op_split`, mm/hugetlb.c);
+/// - everything else is -ENOMEM: a hole in the range, the map-count limit on
+///   a split (`split_vma`, mm/vma.c), or an allocation failure.
+fn mprotect_errno(error: narf_memory::AddressSpaceError) -> i64 {
+    match error {
+        narf_memory::AddressSpaceError::AlignmentMismatch => EINVAL,
+        _ => ENOMEM,
+    }
+}
+
 /// Shared core for `mprotect(2)` and `pkey_mprotect(2)`: translate the
 /// POSIX `prot` bits to `RegionPerms` and apply them to `[base, base+len)`.
 ///
@@ -10023,6 +10036,8 @@ pub fn release_external_shared_frame(phys: u64) {
 ///     (`mprotect_range`/`jit_mprotect`/`change_perms_range`'s error).
 ///   - **EACCES (13)** — a W^X denial (`DenyWX`/`DenyXtoWX`) or a
 ///     JIT-gated RW→RX flip the caller has no JIT capability for.
+///   - **EINVAL (22)** — a split off a huge-page boundary
+///     (`mprotect_errno`).
 fn mprotect_core(
     as_ref: &Arc<AddressSpace>,
     base: VirtAddr,
@@ -10116,12 +10131,18 @@ fn mprotect_core(
                     // No JIT capability for the RW→RX flip → EACCES.
                     return Err(EACCES);
                 };
-                // Underlying range error (empty/gapped) → ENOMEM.
-                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ENOMEM)
+                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|e| match e {
+                    // W^X / revoked capability: a policy denial, as MDWE's
+                    // `error = -EACCES` (mm/mprotect.c).
+                    narf_memory::wx::WxError::DenyWX
+                    | narf_memory::wx::WxError::DenyXtoWX
+                    | narf_memory::wx::WxError::CapRevoked => EACCES,
+                    narf_memory::wx::WxError::Unmapped => ENOMEM,
+                    narf_memory::wx::WxError::AddressSpace(e) => mprotect_errno(e),
+                })
             }
             narf_memory::wx::WxTransition::Allow => {
-                // Empty/gapped range → ENOMEM.
-                as_ref.mprotect_range(base, len, perms).map_err(|_| ENOMEM)
+                as_ref.mprotect_range(base, len, perms).map_err(mprotect_errno)
             }
         }
     }
