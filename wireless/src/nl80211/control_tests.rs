@@ -1276,6 +1276,265 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
 }
 kernel_test_in!("wireless/nl80211", smoke_nl80211_userspace_sme_mlme);
 
+// ── Access-Point mode ─────────────────────────────────────────────
+//
+// hostapd brings up an AP with START_AP (beacon template + channel), manages
+// the station table with NEW_STATION/DEL_STATION, and tears down with STOP_AP.
+// Command/attribute ids and errnos are validated against /usr/src/linux
+// include/uapi/linux/nl80211.h; the AP interface reports iftype AP(3).
+
+const AP_NAME: &str = "wlan-ap";
+const AP_MAC: [u8; 6] = [2, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
+const AP_STA: [u8; 6] = [2, 0x51, 0x52, 0x53, 0x54, 0x55];
+
+struct ApStub {
+    rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    started: core::sync::atomic::AtomicBool,
+    stopped: core::sync::atomic::AtomicBool,
+    channel: core::sync::atomic::AtomicU32,
+    sta_added: core::sync::atomic::AtomicU32,
+    sta_deleted: core::sync::atomic::AtomicU32,
+}
+impl Interface for ApStub {
+    fn name(&self) -> &str {
+        AP_NAME
+    }
+    fn mac(&self) -> [u8; 6] {
+        AP_MAC
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        true
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx
+    }
+}
+#[async_trait::async_trait]
+impl crate::WirelessNetIface for ApStub {
+    fn supports_ap(&self) -> bool {
+        true
+    }
+    fn current_iftype(&self) -> u32 {
+        3 // NL80211_IFTYPE_AP
+    }
+    fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
+        crate::WirelessIfaceInfo {
+            base_name: AP_NAME.into(),
+            base_mac: AP_MAC,
+            bands: Vec::new(),
+            modes: crate::iface::WirelessModes::STATION | crate::iface::WirelessModes::AP,
+            hw_caps: crate::iface::HwCaps {
+                ht_supported: true,
+                vht_supported: false,
+                he_supported: false,
+                eht_supported: false,
+            },
+        }
+    }
+    async fn scan(
+        &self,
+        _: crate::ScanRequest,
+    ) -> Result<Vec<crate::BssInfo>, crate::WirelessError> {
+        Ok(Vec::new())
+    }
+    async fn associate(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    async fn disassociate(&self) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    async fn set_config(&self, _: crate::WirelessConfig) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+    fn start_ap(&self, cfg: crate::ApConfig) -> Result<(), crate::WirelessError> {
+        self.channel
+            .store(cfg.channel, core::sync::atomic::Ordering::SeqCst);
+        self.started
+            .store(true, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn stop_ap(&self) -> Result<(), crate::WirelessError> {
+        self.stopped
+            .store(true, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn set_beacon(&self, _: Vec<u8>, _: Vec<u8>) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    fn add_station(&self, _: crate::StationConfig) -> Result<(), crate::WirelessError> {
+        self.sta_added
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    fn set_station(&self, _: crate::StationConfig) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    fn del_station(&self, _: Option<[u8; 6]>, _: u16) -> Result<(), crate::WirelessError> {
+        self.sta_deleted
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn smoke_nl80211_ap_mode() -> TestResult {
+    use core::sync::atomic::Ordering;
+    super::register();
+    let stub = Arc::new(ApStub {
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+        started: core::sync::atomic::AtomicBool::new(false),
+        stopped: core::sync::atomic::AtomicBool::new(false),
+        channel: core::sync::atomic::AtomicU32::new(0),
+        sta_added: core::sync::atomic::AtomicU32::new(0),
+        sta_deleted: core::sync::atomic::AtomicU32::new(0),
+    });
+    let iface: Arc<dyn crate::WirelessNetIface> = stub.clone();
+    narf_net::iface::register(AP_NAME, AP_MAC, |_| Ok(()));
+    crate::registry::register(iface.clone());
+    let ifindex = match narf_net::netlink_route::ifindex_for_name(AP_NAME) {
+        Some(index) => index,
+        None => return TestResult::Fail("ap iface has no ifindex"),
+    };
+    let admin = match narf_net::kernel_admin(AP_NAME) {
+        Some(admin) => admin,
+        None => return TestResult::Fail("no kernel admin for ap iface"),
+    };
+    let ctx = RequestContext {
+        net_ns_id: 0,
+        admin: Some(&admin),
+    };
+
+    // GET_WIPHY advertises AP iftype and the AP commands; GET_INTERFACE reports
+    // iftype AP(3).
+    let info = iface.get_wireless_info();
+    let wattrs = wiphy_attrs(0, &info, Some(iface.as_ref()));
+    let iftypes = find_attr(&wattrs, NL80211_ATTR_SUPPORTED_IFTYPES | NLA_F_NESTED);
+    if iftypes
+        .and_then(|t| find_attr(t, NL80211_IFTYPE_AP as u16))
+        .is_none()
+    {
+        return TestResult::Fail("wiphy does not advertise AP iftype");
+    }
+    let commands = match find_attr(&wattrs, NL80211_ATTR_SUPPORTED_COMMANDS | NLA_F_NESTED) {
+        Some(commands) => nested_u32s(commands),
+        None => return TestResult::Fail("GET_WIPHY lacks SUPPORTED_COMMANDS"),
+    };
+    for needed in [14u32, 15, 16, 18, 19, 20] {
+        if !commands.contains(&needed) {
+            return TestResult::Fail("AP iface did not advertise an AP command");
+        }
+    }
+    let iattrs = interface_attrs(0, &info, iface.current_iftype());
+    if find_attr(&iattrs, NL80211_ATTR_IFTYPE) != Some(&3u32.to_ne_bytes()[..]) {
+        return TestResult::Fail("GET_INTERFACE did not report iftype AP");
+    }
+
+    // START_AP: a complete request starts beaconing on channel 1 (2412 MHz).
+    let beacon_head = alloc::vec![0x80u8; 36];
+    let mut start = Vec::new();
+    push_attr(&mut start, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut start, 52, b"narf-ap"); // SSID
+    push_attr(&mut start, 14, &beacon_head); // BEACON_HEAD
+    push_attr(&mut start, 12, &100u32.to_ne_bytes()); // BEACON_INTERVAL
+    push_attr(&mut start, 13, &2u32.to_ne_bytes()); // DTIM_PERIOD
+    push_attr(&mut start, 38, &2412u32.to_ne_bytes()); // WIPHY_FREQ
+    if handle(START_AP, &start, false, ctx).is_err()
+        || !stub.started.load(Ordering::SeqCst)
+        || stub.channel.load(Ordering::SeqCst) != 1
+    {
+        return TestResult::Fail("valid START_AP did not start the AP on channel 1");
+    }
+    // Missing beacon head, zero interval, and missing channel are each EINVAL.
+    let mut no_head = Vec::new();
+    push_attr(&mut no_head, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut no_head, 52, b"narf-ap");
+    push_attr(&mut no_head, 12, &100u32.to_ne_bytes());
+    push_attr(&mut no_head, 38, &2412u32.to_ne_bytes());
+    if !matches!(handle(START_AP, &no_head, false, ctx), Err(EINVAL)) {
+        return TestResult::Fail("START_AP without a beacon head not EINVAL");
+    }
+    let mut no_chan = Vec::new();
+    push_attr(&mut no_chan, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut no_chan, 52, b"narf-ap");
+    push_attr(&mut no_chan, 14, &beacon_head);
+    push_attr(&mut no_chan, 12, &100u32.to_ne_bytes());
+    if !matches!(handle(START_AP, &no_chan, false, ctx), Err(EINVAL)) {
+        return TestResult::Fail("START_AP without a channel not EINVAL");
+    }
+
+    // NEW_STATION: a valid AID adds a station; AID 0 is EINVAL.
+    let mut sta = Vec::new();
+    push_attr(&mut sta, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut sta, 6, &AP_STA);
+    push_attr(&mut sta, 16, &1u16.to_ne_bytes()); // STA_AID
+    push_attr(&mut sta, 18, &5u16.to_ne_bytes()); // STA_LISTEN_INTERVAL
+    push_attr(&mut sta, 19, &[0x82, 0x84, 0x8b, 0x96]); // STA_SUPPORTED_RATES
+    if handle(NEW_STATION, &sta, false, ctx).is_err() || stub.sta_added.load(Ordering::SeqCst) != 1
+    {
+        return TestResult::Fail("valid NEW_STATION did not add a station");
+    }
+    let mut sta_no_aid = Vec::new();
+    push_attr(&mut sta_no_aid, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut sta_no_aid, 6, &AP_STA);
+    if !matches!(handle(NEW_STATION, &sta_no_aid, false, ctx), Err(EINVAL)) {
+        return TestResult::Fail("NEW_STATION without an AID not EINVAL");
+    }
+
+    // DEL_STATION removes the station; SET_BEACON needs a head/tail; STOP_AP
+    // tears down.
+    let mut del = Vec::new();
+    push_attr(&mut del, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut del, 6, &AP_STA);
+    push_attr(&mut del, 54, &2u16.to_ne_bytes()); // REASON_CODE
+    if handle(DEL_STATION, &del, false, ctx).is_err()
+        || stub.sta_deleted.load(Ordering::SeqCst) != 1
+    {
+        return TestResult::Fail("DEL_STATION did not remove the station");
+    }
+    let mut empty_beacon = Vec::new();
+    push_attr(&mut empty_beacon, 3, &ifindex.to_ne_bytes());
+    if !matches!(handle(SET_BEACON, &empty_beacon, false, ctx), Err(EINVAL)) {
+        return TestResult::Fail("SET_BEACON with no head/tail not EINVAL");
+    }
+    let mut stop = Vec::new();
+    push_attr(&mut stop, 3, &ifindex.to_ne_bytes());
+    if handle(STOP_AP, &stop, false, ctx).is_err() || !stub.stopped.load(Ordering::SeqCst) {
+        return TestResult::Fail("STOP_AP did not stop the AP");
+    }
+
+    // A non-AP driver rejects the AP path with EOPNOTSUPP.
+    let plain: Arc<dyn crate::WirelessNetIface> = Arc::new(InterfaceStub {
+        name: "wlan-noap",
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    });
+    narf_net::iface::register("wlan-noap", plain.mac(), |_| Ok(()));
+    crate::registry::register(plain.clone());
+    if let (Some(pidx), Some(padmin)) = (
+        narf_net::netlink_route::ifindex_for_name("wlan-noap"),
+        narf_net::kernel_admin("wlan-noap"),
+    ) {
+        let pctx = RequestContext {
+            net_ns_id: 0,
+            admin: Some(&padmin),
+        };
+        let mut a = Vec::new();
+        push_attr(&mut a, 3, &pidx.to_ne_bytes());
+        if !matches!(handle(STOP_AP, &a, false, pctx), Err(EOPNOTSUPP)) {
+            return TestResult::Fail("non-AP driver STOP_AP not EOPNOTSUPP");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("wireless/nl80211", smoke_nl80211_ap_mode);
+
 fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
     use narf_net::netlink_generic::install_event_sink;
     super::register();

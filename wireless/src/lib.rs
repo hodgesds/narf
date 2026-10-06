@@ -181,6 +181,56 @@ pub trait WirelessNetIface: Interface {
     ) -> Result<(), WirelessError> {
         Err(WirelessError::NotSupported)
     }
+
+    // ── Access-Point mode (NL80211_CMD_START_AP etc.) ─────────────────
+    //
+    // Beacon generation and the station table are configured synchronously:
+    // the netlink reply is the result hostapd waits on, so these return a
+    // Result directly rather than deferring to an event. All default to
+    // unsupported; an AP-capable driver overrides them and advertises AP in
+    // its [`WirelessIfaceInfo::modes`].
+
+    /// The driver can operate as an Access Point (beaconing + a station table).
+    fn supports_ap(&self) -> bool {
+        false
+    }
+
+    /// The interface's current operating type as an `NL80211_IFTYPE_*` value
+    /// (default `NL80211_IFTYPE_STATION` = 2), reported by GET_INTERFACE.
+    fn current_iftype(&self) -> u32 {
+        2
+    }
+
+    /// Begin AP operation: upload the beacon template and start beaconing.
+    fn start_ap(&self, _cfg: ApConfig) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Stop AP operation and beaconing.
+    fn stop_ap(&self) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Replace the beacon head/tail of a running AP (NL80211_CMD_SET_BEACON).
+    fn set_beacon(&self, _head: Vec<u8>, _tail: Vec<u8>) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Add an associated station to the AP's table (NL80211_CMD_NEW_STATION).
+    fn add_station(&self, _sta: StationConfig) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Update an existing station's parameters (NL80211_CMD_SET_STATION).
+    fn set_station(&self, _sta: StationConfig) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Remove a station (or all, when `mac` is None) with the given 802.11
+    /// reason code (NL80211_CMD_DEL_STATION).
+    fn del_station(&self, _mac: Option<[u8; 6]>, _reason: u16) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
 }
 
 pub struct AssociateRequest {
@@ -230,6 +280,28 @@ pub struct MgmtTxRequest {
     pub frame: Vec<u8>,
     pub offchannel_ok: bool,
     pub duration: u32,
+}
+
+/// Access-Point configuration for NL80211_CMD_START_AP. `beacon_head` is the
+/// beacon frame up to (and including) the TIM, `beacon_tail` the remainder;
+/// `hidden_ssid` is an `NL80211_HIDDEN_SSID_*` value.
+pub struct ApConfig {
+    pub ssid: Vec<u8>,
+    pub beacon_head: Vec<u8>,
+    pub beacon_tail: Vec<u8>,
+    pub beacon_interval: u32,
+    pub dtim_period: u32,
+    pub channel: u32,
+    pub hidden_ssid: u32,
+    pub privacy: bool,
+}
+
+/// A station-table entry for NL80211_CMD_NEW_STATION / SET_STATION.
+pub struct StationConfig {
+    pub mac: [u8; 6],
+    pub aid: u16,
+    pub listen_interval: u16,
+    pub supported_rates: Vec<u8>,
 }
 
 pub mod registry {

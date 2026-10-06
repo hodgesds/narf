@@ -28,6 +28,13 @@ const REGISTER_FRAME: u8 = 58;
 const FRAME: u8 = 59;
 const FRAME_TX_STATUS: u8 = 60;
 const EXTERNAL_AUTH: u8 = 127;
+// Access-Point command numbers (nl80211_commands).
+const SET_BEACON: u8 = 14;
+const START_AP: u8 = 15;
+const STOP_AP: u8 = 16;
+const SET_STATION: u8 = 18;
+const NEW_STATION: u8 = 19;
+const DEL_STATION: u8 = 20;
 
 /// Monotonic cookie source for NL80211_CMD_FRAME transmissions. The cookie
 /// returned in the FRAME reply is echoed back in the matching
@@ -315,6 +322,12 @@ pub(super) fn handle(
             | EXTERNAL_AUTH
     ) {
         return mlme_handle(command, bytes, context);
+    }
+    if matches!(
+        command,
+        START_AP | STOP_AP | SET_BEACON | NEW_STATION | SET_STATION | DEL_STATION
+    ) {
+        return ap_handle(command, bytes, context);
     }
     if !matches!(command, SCAN | GET_SCAN | CONNECT | DISCONNECT) {
         return super::handle_in(command, bytes, dump, context.net_ns_id);
@@ -650,6 +663,127 @@ fn mlme_handle(
                 MlmeExec::Disassociate { peer, reason }
             };
             narf_scheduler::spawn(run_mlme(iface, ns, index, exec));
+            Ok(Vec::new())
+        }
+        _ => Err(EOPNOTSUPP),
+    }
+}
+
+/// Access-Point configuration path: START_AP / STOP_AP / SET_BEACON and the
+/// NEW/SET/DEL_STATION table operations. Beacon and station setup are
+/// synchronous — the netlink reply is the result hostapd waits on — so these
+/// return the driver's errno directly rather than deferring to an event.
+fn ap_handle(
+    command: u8,
+    bytes: &[u8],
+    context: RequestContext<'_>,
+) -> Result<Vec<GenlReply>, i32> {
+    let attrs = attributes(bytes)?;
+    let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
+    let iface = crate::registry::list()
+        .into_iter()
+        .find(|iface| {
+            narf_net::netlink_route::ifindex_for_name(iface.name()) == Some(index)
+                && super::in_namespace(iface.as_ref(), context.net_ns_id)
+        })
+        .ok_or(ENODEV)?;
+    let _admin = context
+        .admin
+        .filter(|admin| authorized(admin, iface.as_ref(), context.net_ns_id))
+        .ok_or(EPERM)?;
+    if !iface.supports_ap() {
+        return Err(EOPNOTSUPP);
+    }
+    match command {
+        START_AP => {
+            reject_unknown(&attrs, &[3, 12, 13, 14, 15, 38, 39, 52, 53, 70, 126, 159])?;
+            let ssid = attr(&attrs, 52).ok_or(EINVAL)?;
+            if ssid.is_empty() || ssid.len() > 32 {
+                return Err(EINVAL);
+            }
+            // The beacon head carries the 802.11 header + fixed beacon fields.
+            let beacon_head = attr(&attrs, 14).ok_or(EINVAL)?;
+            if beacon_head.len() < 24 {
+                return Err(EINVAL);
+            }
+            let beacon_interval = u32_attr(&attrs, 12)?.ok_or(EINVAL)?;
+            if beacon_interval == 0 {
+                return Err(EINVAL);
+            }
+            let dtim_period = u32_attr(&attrs, 13)?.unwrap_or(1);
+            if dtim_period == 0 {
+                return Err(EINVAL);
+            }
+            // An AP must be given an operating channel.
+            let channel = u32_attr(&attrs, 38)?
+                .map(channel)
+                .transpose()?
+                .ok_or(EINVAL)?;
+            let cfg = crate::ApConfig {
+                ssid: ssid.to_vec(),
+                beacon_head: beacon_head.to_vec(),
+                beacon_tail: attr(&attrs, 15).unwrap_or(&[]).to_vec(),
+                beacon_interval,
+                dtim_period,
+                channel,
+                hidden_ssid: u32_attr(&attrs, 126)?.unwrap_or(0),
+                privacy: attr(&attrs, 70).is_some(),
+            };
+            iface.start_ap(cfg).map_err(mlme_errno)?;
+            Ok(Vec::new())
+        }
+        STOP_AP => {
+            reject_unknown(&attrs, &[3])?;
+            iface.stop_ap().map_err(mlme_errno)?;
+            Ok(Vec::new())
+        }
+        SET_BEACON => {
+            reject_unknown(&attrs, &[3, 14, 15])?;
+            let head = attr(&attrs, 14);
+            let tail = attr(&attrs, 15);
+            // At least one of head/tail must be present to change anything.
+            if head.is_none() && tail.is_none() {
+                return Err(EINVAL);
+            }
+            if head.is_some_and(|h| h.len() < 24) {
+                return Err(EINVAL);
+            }
+            iface
+                .set_beacon(head.unwrap_or(&[]).to_vec(), tail.unwrap_or(&[]).to_vec())
+                .map_err(mlme_errno)?;
+            Ok(Vec::new())
+        }
+        NEW_STATION | SET_STATION => {
+            reject_unknown(&attrs, &[3, 6, 16, 17, 18, 19, 67])?;
+            let mac = require_peer(&attrs)?;
+            // A fully-associated station needs an AID (1..=2007) and the rates
+            // it negotiated; NL80211_CMD_NEW_STATION requires both.
+            let aid = u16_attr(&attrs, 16)?.unwrap_or(0);
+            if command == NEW_STATION && !(1..=2007).contains(&aid) {
+                return Err(EINVAL);
+            }
+            let sta = crate::StationConfig {
+                mac,
+                aid,
+                listen_interval: u16_attr(&attrs, 18)?.unwrap_or(0),
+                supported_rates: attr(&attrs, 19).unwrap_or(&[]).to_vec(),
+            };
+            if command == NEW_STATION {
+                iface.add_station(sta).map_err(mlme_errno)?;
+            } else {
+                iface.set_station(sta).map_err(mlme_errno)?;
+            }
+            Ok(Vec::new())
+        }
+        DEL_STATION => {
+            reject_unknown(&attrs, &[3, 6, 54])?;
+            // MAC is optional: its absence removes every station.
+            let mac = mac_attr(&attrs, 6)?;
+            if mac.is_some_and(|m| m[0] & 1 != 0 && m != [0xff; 6]) {
+                return Err(EINVAL);
+            }
+            let reason = u16_attr(&attrs, 54)?.unwrap_or(2);
+            iface.del_station(mac, reason).map_err(mlme_errno)?;
             Ok(Vec::new())
         }
         _ => Err(EOPNOTSUPP),
