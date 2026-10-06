@@ -978,3 +978,125 @@ fn smoke_abi_tid_ptrace_attach_same_group() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_tid_ptrace_attach_same_group);
+
+// ── CPU clocks — kernel/time/posix-cpu-timers.c:57 pid_for_clock ─────────
+fn thread_cpuclock(tid: u64) -> u64 {
+    // MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)
+    ((!(tid as i64)) << 3 | 4 | 2) as u64
+}
+fn process_cpuclock(pid: u64) -> u64 {
+    // MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)
+    ((!(pid as i64)) << 3 | 2) as u64
+}
+
+fn smoke_abi_tid_cpu_clocks_non_leader() -> TestResult {
+    with_groups(|| {
+        let mut ts = [0u64; 2];
+        let t = ts.as_mut_ptr() as u64;
+        set_task(LEADER_TASK);
+        expect(
+            call(Syscall::ClockGetTime.raw(), a1(thread_cpuclock(SIB_TID), t)),
+            0,
+            "thread CPU clock of a sibling must be readable",
+        )?;
+        expect(
+            call(Syscall::ClockGetTime.raw(), a1(thread_cpuclock(0), t)),
+            0,
+            "thread CPU clock 0 (self) must be readable",
+        )?;
+        expect(
+            call(
+                Syscall::ClockGetTime.raw(),
+                a1(process_cpuclock(GROUP_PID), t),
+            ),
+            0,
+            "process CPU clock of own process must be readable",
+        )?;
+        expect(
+            call(
+                Syscall::ClockGetTime.raw(),
+                a1(process_cpuclock(OTHER_PID), t),
+            ),
+            0,
+            "process CPU clock of another process must be readable",
+        )?;
+        expect(
+            call(Syscall::ClockGetTime.raw(), a1(process_cpuclock(0), t)),
+            0,
+            "process CPU clock 0 (self) must be readable",
+        )?;
+        expect(
+            call(
+                Syscall::ClockGetTime.raw(),
+                a1(thread_cpuclock(OTHER_SIB_TID), t),
+            ),
+            EINVAL,
+            "thread CPU clock of another process's thread must be EINVAL",
+        )?;
+        expect(
+            call(
+                Syscall::ClockGetTime.raw(),
+                a1(process_cpuclock(SIB_TID), t),
+            ),
+            EINVAL,
+            "process CPU clock named by a sibling's tid must be EINVAL",
+        )?;
+        expect(
+            call(Syscall::ClockGetTime.raw(), a1(process_cpuclock(ABSENT), t)),
+            EINVAL,
+            "unused pid CPU clock must be EINVAL",
+        )?;
+        expect(
+            call(
+                Syscall::ClockGetTime.raw(),
+                a1(thread_cpuclock(SIB_TASK), t),
+            ),
+            EINVAL,
+            "CPU clock accepted a raw TaskId",
+        )?;
+        set_task(SIB_TASK);
+        expect(
+            call(Syscall::ClockGetTime.raw(), a1(process_cpuclock(SIB_TID), t)),
+            0,
+            "clock_gettime(process clock of own non-leader tid) is allowed (pid == task_pid(current))",
+        )?;
+        expect(
+            call(Syscall::ClockGetres.raw(), a1(process_cpuclock(SIB_TID), t)),
+            EINVAL,
+            "clock_getres(process clock of own non-leader tid) must be EINVAL (gettime=false)",
+        )?;
+        expect(
+            call(Syscall::ClockGetres.raw(), a1(thread_cpuclock(SIB_TID), t)),
+            0,
+            "clock_getres(own thread clock) must succeed",
+        )?;
+        // CPUCLOCK_WHICH >= CPUCLOCK_MAX (3) is EINVAL (the PERTHREAD bit keeps
+        // this from being a CLOCKFD id).
+        expect(
+            call(
+                Syscall::ClockGetTime.raw(),
+                a1(((!(0i64)) << 3 | 4 | 3) as u64, t),
+            ),
+            EINVAL,
+            "CPU clock with which == CPUCLOCK_MAX must be EINVAL",
+        )?;
+        // clock_settime: a valid CPU clock can never be set (-EPERM); an
+        // invalid one is -EINVAL (posix-cpu-timers.c:180-188).
+        let zero = [0u64; 2];
+        let z = zero.as_ptr() as u64;
+        expect(
+            call(Syscall::ClockSetTime.raw(), a1(thread_cpuclock(SIB_TID), z)),
+            EPERM,
+            "clock_settime(own thread CPU clock) must be EPERM",
+        )?;
+        expect(
+            call(
+                Syscall::ClockSetTime.raw(),
+                a1(thread_cpuclock(OTHER_SIB_TID), z),
+            ),
+            EINVAL,
+            "clock_settime(foreign thread CPU clock) must be EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_cpu_clocks_non_leader);

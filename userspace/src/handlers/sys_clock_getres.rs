@@ -27,6 +27,28 @@ pub(crate) fn sys_clock_getres(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
     let buf = args.arg1;
+    // A POSIX CPU clock: `posix_cpu_clock_getres` → `validate_clock_permissions`
+    // → `pid_for_clock(clock, false)` (-EINVAL; kernel/time/posix-cpu-timers.c
+    // :102), then the resolution; the copy-out (-EFAULT) comes last.
+    let cpu_clock = id as i32;
+    if is_cpu_clock(cpu_clock) {
+        if cpu_clock_target(current_task_id(), cpu_clock, false).is_none() {
+            ctx.set_return(errno_ret(EINVAL));
+            return;
+        }
+        if buf != 0 {
+            let mut kbuf = [0u8; 16];
+            kbuf[8..16].copy_from_slice(&(cpu_clock_res_ns(cpu_clock) as i64).to_ne_bytes());
+            // SAFETY: copy_to_user range-validates and fault-brackets the
+            // caller's timespec.
+            if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
     if !clock_id_supported(id) {
         ctx.set_return(errno_ret(EINVAL));
         return;

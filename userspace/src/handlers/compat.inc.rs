@@ -4568,6 +4568,105 @@ fn clock_id_supported(id: u64) -> bool {
     )
 }
 
+// ── POSIX CPU clocks encoded in a negative clockid_t ─────────────────
+//
+// `include/linux/posix-timers_types.h`: `CPUCLOCK_PID(c) = ~(c >> 3)`,
+// `CPUCLOCK_PERTHREAD_MASK = 4`, `CPUCLOCK_WHICH(c) = c & 3` with PROF = 0,
+// VIRT = 1, SCHED = 2 (`CPUCLOCK_MAX` = 3). A negative id whose low three
+// bits are `CLOCKFD` (3) is a dynamic (PTP/fd) clock instead
+// (`clockid_to_kclock`). glibc's `clock_getcpuclockid` /
+// `pthread_getcpuclockid` hand these to clock_gettime.
+const CPUCLOCK_PERTHREAD_MASK: i32 = 4;
+const CPUCLOCK_CLOCK_MASK: i32 = 3;
+const CPUCLOCK_VIRT: i32 = 1;
+const CPUCLOCK_SCHED: i32 = 2;
+const CPUCLOCK_MAX: i32 = 3;
+const CLOCKFD: i32 = 3;
+const CLOCKFD_MASK: i32 = CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_CLOCK_MASK;
+
+/// Is `id` (a `clockid_t`) a POSIX CPU clock? `clockid_to_kclock`:
+/// `id < 0 && (id & CLOCKFD_MASK) != CLOCKFD`.
+pub(crate) fn is_cpu_clock(id: i32) -> bool {
+    id < 0 && (id & CLOCKFD_MASK) != CLOCKFD
+}
+
+/// The task a CPU clock samples, after `pid_for_clock`.
+#[derive(Clone, Copy)]
+pub(crate) enum CpuClockTarget {
+    /// One thread (`CPUCLOCK_PERTHREAD`).
+    Thread(u64),
+    /// A whole process; the task is a member of it.
+    Process(u64),
+}
+
+/// `pid_for_clock(clock, gettime)` (kernel/time/posix-cpu-timers.c:57) for a
+/// clock id `is_cpu_clock` accepted. `None` is -EINVAL at every call site.
+///
+/// * `CPUCLOCK_WHICH >= CPUCLOCK_MAX` names no clock.
+/// * pid 0 is the caller's thread / the caller's process.
+/// * Otherwise `find_vpid(pid)`: a thread clock needs `pid_task(PIDTYPE_PID)`
+///   in the caller's own thread group — a sibling's tid is fine, another
+///   process's thread is not. A process clock needs a thread-group leader's
+///   pid (`pid_has_task(PIDTYPE_TGID)`), except that clock_gettime (only)
+///   accepts the caller's own tid for its own process.
+pub(crate) fn cpu_clock_target(caller: u64, clock: i32, gettime: bool) -> Option<CpuClockTarget> {
+    if clock & CPUCLOCK_CLOCK_MASK >= CPUCLOCK_MAX {
+        return None;
+    }
+    let thread = clock & CPUCLOCK_PERTHREAD_MASK != 0;
+    let upid = !(clock >> 3);
+    if upid == 0 {
+        return Some(if thread {
+            CpuClockTarget::Thread(caller)
+        } else {
+            CpuClockTarget::Process(caller)
+        });
+    }
+    let task = find_task_by_vpid(caller, upid)?;
+    if thread {
+        return same_thread_group(task, caller).then_some(CpuClockTarget::Thread(task));
+    }
+    if gettime && task == caller {
+        return Some(CpuClockTarget::Process(caller));
+    }
+    (process_state_key(task) == task).then_some(CpuClockTarget::Process(task))
+}
+
+/// Sample a CPU clock (`cpu_clock_sample` / `cpu_clock_sample_group`) in ns.
+///
+/// LINUX-GAP: NARF accounts CPU time per task only, with no thread-group
+/// aggregate (getrusage(RUSAGE_SELF) and CLOCK_PROCESS_CPUTIME_ID share the
+/// gap). A process clock therefore samples one member: the caller itself
+/// when it is a member — exactly what CLOCK_PROCESS_CPUTIME_ID reports —
+/// otherwise the group leader.
+pub(crate) fn cpu_clock_sample_ns(caller: u64, target: CpuClockTarget, which: i32) -> u64 {
+    let task = match target {
+        CpuClockTarget::Thread(t) => t,
+        CpuClockTarget::Process(t) if same_thread_group(t, caller) => caller,
+        CpuClockTarget::Process(t) => process_state_key(t),
+    };
+    let mut user = cpu_time_ns_of(task);
+    if task == caller {
+        // The active slice has not yet been folded into TASK_CPU_NS.
+        user = user.saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
+    }
+    if which == CPUCLOCK_VIRT {
+        user
+    } else {
+        user.saturating_add(kern_time_ns_of(task))
+    }
+}
+
+/// `posix_cpu_clock_getres`: `(NSEC_PER_SEC + HZ - 1) / HZ`, or 1 ns for
+/// CPUCLOCK_SCHED.
+pub(crate) fn cpu_clock_res_ns(clock: i32) -> u64 {
+    if clock & CPUCLOCK_CLOCK_MASK == CPUCLOCK_SCHED {
+        1
+    } else {
+        1_000_000_000_u64.div_ceil(CLK_TCK_HZ)
+    }
+}
+
 // ── I/O Priority (ioprio_set / ioprio_get) ─────────────────────────
 //
 // Keyed PER TASK, as in Linux, where `ioprio` lives in `task_struct->

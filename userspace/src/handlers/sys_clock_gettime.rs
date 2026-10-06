@@ -5,6 +5,31 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
     let buf = args.arg1;
+    // `clockid_t` is an `int`. A negative id that is not CLOCKFD is a POSIX
+    // CPU clock (`clockid_to_kclock`): `posix_cpu_clock_get` resolves its
+    // target with `pid_for_clock(clock, true)` and answers -EINVAL — never
+    // -ESRCH — when there is none (kernel/time/posix-cpu-timers.c:365-369);
+    // the timespec copy-out (-EFAULT) comes last.
+    let cpu_clock = id as i32;
+    if is_cpu_clock(cpu_clock) {
+        let task = current_task_id();
+        let Some(target) = cpu_clock_target(task, cpu_clock, true) else {
+            ctx.set_return(errno_ret(EINVAL));
+            return;
+        };
+        let ns = cpu_clock_sample_ns(task, target, cpu_clock & 3);
+        let mut kbuf = [0u8; 16];
+        kbuf[..8].copy_from_slice(&((ns / 1_000_000_000) as i64).to_ne_bytes());
+        kbuf[8..].copy_from_slice(&((ns % 1_000_000_000) as i64).to_ne_bytes());
+        // SAFETY: copy_to_user range-validates and fault-brackets the
+        // caller's timespec.
+        if buf == 0 || unsafe { copy_to_user(buf, &kbuf) }.is_err() {
+            ctx.set_return(errno_ret(EFAULT));
+            return;
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
     let (sec, nsec) = match id {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
             let w = narf_scheduler::narf_time::now_wall();
