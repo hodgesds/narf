@@ -38,11 +38,15 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // SIGNAL_PENDING is keyed by TaskId; translate pid → tid.
-    let mut target = pid;
-    if let Some(tid) = pid_to_task_raw(target) {
-        target = tid;
-    }
+    // SIGNAL_PENDING is keyed by TaskId; translate the pidfd's outer id to
+    // its task. A process pidfd names a leader (PIDTYPE_TGID scope); a
+    // PIDFD_THREAD pidfd opened on a non-leader is keyed by that thread's tid
+    // and is thread-scoped (PIDTYPE_PID, `SI_TKILL`). An id that names no
+    // task any more is -ESRCH below, never a raw scheduler TaskId.
+    let (target, thread_scope) = match pid_to_task_raw(pid) {
+        Some(leader) => (Some(leader), false),
+        None => (linux_tid_to_task_raw(pid), true),
+    };
     let imported = if a.arg2 == 0 {
         None
     } else {
@@ -57,7 +61,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EINVAL));
             return;
         }
-        if siginfo_requires_self_target(info) && target != task {
+        if siginfo_requires_self_target(info) && target != Some(task) {
             ctx.set_return(errno_ret(EPERM));
             return;
         }
@@ -65,10 +69,10 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     };
     // A pidfd keeps its numeric identity after exit; signal delivery must still
     // resolve a live task. This also precedes signal-number validation in Linux.
-    if !signal_target_exists(target) {
+    let Some(target) = target.filter(|&t| t == task || crate::task::task_get(t).is_some()) else {
         ctx.set_return(errno_ret(ESRCH));
         return;
-    }
+    };
     if signum > 64 {
         ctx.set_return(errno_ret(EINVAL));
         return;
@@ -78,7 +82,17 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    if let Some(info) = imported {
+    if thread_scope {
+        // `do_send_sig_info(sig, info, p, PIDTYPE_PID)`: thread-directed.
+        if let Some(info) = imported {
+            if sigqueue_deliver_imported(target, signum, info).is_none() {
+                ctx.set_return(errno_ret(EAGAIN));
+                return;
+            }
+        } else {
+            raise_tkill_signal_pending(target, signum);
+        }
+    } else if let Some(info) = imported {
         // Store the payload and set the pending bit atomically so a racing
         // sigwait consumer can't strand the bit over an emptied queue (the sigq
         // spurious-sival=0 bug). A full queue is EAGAIN with nothing delivered.

@@ -484,6 +484,83 @@ fn smoke_abi_tid_process_vm_readv_non_leader() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_tid_process_vm_readv_non_leader);
 
+// ── pidfd_open — kernel/pid.c:699 ESRCH; kernel/fork.c:1890 ENOENT for a
+// non-leader without PIDFD_THREAD ─────────────────────────────────────────
+fn smoke_abi_tid_pidfd_open_rejects_non_leader() -> TestResult {
+    with_groups(|| {
+        set_task(LEADER_TASK);
+        expect(
+            call(Syscall::PidfdOpen.raw(), a1(SIB_TID, 0)),
+            ENOENT,
+            "pidfd_open(non-leader tid, 0) must be ENOENT",
+        )?;
+        expect(
+            call(Syscall::PidfdOpen.raw(), a1(ABSENT, 0)),
+            ESRCH,
+            "pidfd_open(unused pid) must be ESRCH, not a dead pidfd",
+        )?;
+        match call(Syscall::PidfdOpen.raw(), a1(GROUP_PID, 0)) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("pidfd_open(leader pid) must succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_pidfd_open_rejects_non_leader);
+
+// ── pidfd_open(PIDFD_THREAD) on a non-leader → a live, thread-scoped pidfd:
+// pidfd_send_signal infers PIDTYPE_PID from it (kernel/signal.c:4101-4104).
+fn smoke_abi_tid_pidfd_thread_non_leader() -> TestResult {
+    const PIDFD_THREAD: u64 = 0o200;
+    const POLLIN: i16 = 1;
+    with_groups(|| {
+        set_task(LEADER_TASK);
+        let fd = match call(Syscall::PidfdOpen.raw(), a1(SIB_TID, PIDFD_THREAD)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("pidfd_open(non-leader tid, PIDFD_THREAD) must succeed"),
+        };
+        // The thread is alive: the pidfd must not poll readable.
+        let mut pfd = [0u8; 8];
+        pfd[..4].copy_from_slice(&(fd as i32).to_ne_bytes());
+        pfd[4..6].copy_from_slice(&POLLIN.to_ne_bytes());
+        let ts = [0u64; 2];
+        expect(
+            call(
+                Syscall::Ppoll.raw(),
+                a4(pfd.as_mut_ptr() as u64, 1, ts.as_ptr() as u64, 0, 8),
+            ),
+            0,
+            "a PIDFD_THREAD pidfd on a live thread must not read as exited",
+        )?;
+        expect(
+            call(Syscall::PidfdSendSignal.raw(), a3(fd, 0, 0, 0)),
+            0,
+            "pidfd_send_signal(thread pidfd, 0) must find the live thread",
+        )?;
+        let bit = 1u64 << (SIGUSR1 - 1);
+        expect(
+            call(Syscall::PidfdSendSignal.raw(), a3(fd, SIGUSR1, 0, 0)),
+            0,
+            "pidfd_send_signal(thread pidfd, SIGUSR1) failed",
+        )?;
+        if crate::handlers::signal_pending_of(SIB_TASK) & bit == 0 {
+            return Err("a thread pidfd's signal must be pending on that thread (PIDTYPE_PID)");
+        }
+        // `pidfd_get_task` resolves PIDTYPE_TGID: a thread pidfd naming a
+        // non-leader is -ESRCH (kernel/pid.c:640).
+        expect(
+            call(Syscall::ProcessMadvise.raw(), a4(fd, 0, 0, 4, 0)),
+            ESRCH,
+            "process_madvise(thread pidfd of a non-leader) must be ESRCH",
+        )?;
+        expect(
+            call(Syscall::ProcessMrelease.raw(), a1(fd, 0)),
+            ESRCH,
+            "process_mrelease(thread pidfd of a non-leader) must be ESRCH",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_pidfd_thread_non_leader);
+
 // ── tkill / tgkill / rt_tgsigqueueinfo — kernel/signal.c:4168, :4184, :4231:
 // `pid <= 0 (|| tgid <= 0)` is EINVAL; then do_send_specific's
 // find_task_by_vpid (ESRCH) precedes check_kill_permission (EINVAL sig).

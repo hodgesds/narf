@@ -14866,6 +14866,8 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
         .as_mut()
         .and_then(|m| m.remove(&tid));
     if let Some(linux_tid) = linux_tid {
+        // A PIDFD_THREAD pidfd on this thread now reports its exit.
+        crate::pidfd::notify_thread_exit(linux_tid);
         #[cfg(feature = "cgroup")]
         narf_filesystem::cgroupfs::thread_exited(linux_tid);
         if let Some(m) = LINUX_TID_TO_TASK[pid_task_shard(linux_tid)].map.lock().as_mut() {

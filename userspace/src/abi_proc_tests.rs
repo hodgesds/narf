@@ -1030,11 +1030,16 @@ fn smoke_abi_proc_pidfd_open_translates_inner_pid() -> TestResult {
         let inner =
             crate::pid_ns::inherit_into_child(FAKE_TASK, CHILD_TASK, CHILD_OUTER).unwrap_or(0);
         crate::handlers::register_pid_task_mapping(CHILD_OUTER, CHILD_TASK);
+        // A live task behind the pid: pidfd_open refuses a pid with no task
+        // (-ESRCH, kernel/fork.c:1883), exactly as Linux does.
+        crate::task::release_task(CHILD_TASK);
+        let _ = crate::task::Task::new_registered(CHILD_TASK, CHILD_OUTER);
 
         let fd = match call(Syscall::PidfdOpen.raw(), a1(inner, 0)) {
             Some(fd) if fd >= 0 => fd as u32,
             _ => {
                 crate::pid_ns::__test_reset();
+                crate::task::release_task(CHILD_TASK);
                 return Err("pidfd_open(inner pid) did not return a valid fd");
             }
         };
@@ -1043,6 +1048,7 @@ fn smoke_abi_proc_pidfd_open_translates_inner_pid() -> TestResult {
         })
         .flatten();
         crate::pid_ns::__test_reset();
+        crate::task::release_task(CHILD_TASK);
 
         if target == Some(CHILD_OUTER) {
             Ok(())
