@@ -171,6 +171,58 @@ if [ "$mode" = root ]; then
     grep -q '^card 0:' "$LOG/arecord-l" || fail "arecord -l: no card 0 capture device"
     note "access: ${U} enumerates playback on both cards and capture on card 0"
 
+    # Plain ALSA, BEFORE PipeWire takes the cards: does a direct `hw:` transfer
+    # sustain at the rate and period PipeWire will ask for? This splits the
+    # problem space in half. `aplay` without -M uses the read/write path;
+    # `aplay -M` uses mmap + `snd_pcm_mmap_begin/commit`, which is the access
+    # mode PipeWire's ALSA sink uses. One second of silence should take about
+    # one second; anything much longer means the stream is not clocking.
+    dd if=/dev/zero of="$WORK/second.raw" bs=4 count=48000 status=none
+    chmod 0644 "$WORK/second.raw"
+    for mode in rw mmap; do
+        case "$mode" in
+        mmap) flag=-M ;;
+        *) flag= ;;
+        esac
+        for dev in hw:0,0 hw:1,0; do
+            t0=$(date +%s)
+            timeout 40 runuser -u "$U" -- aplay -q $flag -D "$dev" -t raw \
+                -f S16_LE -r 48000 -c 2 "$WORK/second.raw" \
+                >"$LOG/aplay-${mode}-${dev#hw:}" 2>&1
+            rc=$?
+            note "alsa: ${mode} playback ${dev} rc=${rc} elapsed=$(( $(date +%s) - t0 ))s (expect ~1s)"
+            [ "$rc" -eq 0 ] || sed -n '1,6p' "$LOG/aplay-${mode}-${dev#hw:}" 2>&1
+        done
+    done
+    # The SAME request in the format PipeWire actually negotiates. A format a
+    # card ADVERTISES but cannot configure is the whole failure: HW_REFINE
+    # offers the point, HW_PARAMS rejects it, and alsa-lib has no way back.
+    # Either outcome here is informative — a clean "Sample format non
+    # available" means the refine no longer offers what it cannot deliver,
+    # while EINVAL from hw_params means it still does.
+    for fmt in S16_LE S32_LE; do
+        t0=$(date +%s)
+        timeout 40 runuser -u "$U" -- aplay -q -D hw:0,0 -t raw \
+            -f "$fmt" -r 48000 -c 2 --period-size=1024 --buffer-size=32768 \
+            "$WORK/second.raw" >"$LOG/aplay-${fmt}" 2>&1
+        rc=$?
+        note "alsa: ${fmt} 1024/32768 hw:0,0 rc=${rc} elapsed=$(( $(date +%s) - t0 ))s: $(head -c 120 "$LOG/aplay-${fmt}" 2>&1 | tr -s ' \n' ' ')"
+    done
+
+    for mode in rw mmap; do
+        case "$mode" in
+        mmap) flag=-M ;;
+        *) flag= ;;
+        esac
+        t0=$(date +%s)
+        timeout 40 runuser -u "$U" -- arecord -q $flag -D hw:0,0 -t raw \
+            -f S16_LE -r 48000 -c 2 -d 1 "$WORK/cap-${mode}.raw" \
+            >"$LOG/arecord-${mode}" 2>&1
+        rc=$?
+        note "alsa: ${mode} capture hw:0,0 rc=${rc} elapsed=$(( $(date +%s) - t0 ))s bytes=$(stat -c %s "$WORK/cap-${mode}.raw" 2>/dev/null) (expect ~1s, 192000)"
+        [ "$rc" -eq 0 ] || sed -n '1,6p' "$LOG/arecord-${mode}" 2>&1
+    done
+
     # Not a pass condition: PipeWire falls back to a non-realtime data loop and
     # says so. Recorded because "set realtime policy: Operation not permitted"
     # in the daemon log has two very different causes, and only the soft/hard
@@ -208,6 +260,24 @@ if [ "$mode" = root ]; then
     # how bash implements process substitution (`cmd < <(other)`). Recorded,
     # not asserted: the audio contract does not depend on it, but a shell idiom
     # this common failing is worth knowing from a run that otherwise passes.
+    # GLib's main loop computes every timeout from `g_get_monotonic_time()`,
+    # i.e. `clock_gettime(CLOCK_MONOTONIC)` through the vDSO. A clock that does
+    # not advance there makes every timeout read as already expired, so the
+    # loop polls with a zero timeout forever and burns a core while still
+    # working correctly - which is exactly the shape of the session manager's
+    # spin. `sleep` cannot see this: it uses the clock_nanosleep SYSCALL.
+    # Python's time.monotonic() is the vDSO path and is already in the image.
+    note "clock: $(python3 -c 'import time
+for name, fn in (("monotonic", time.monotonic), ("perf", time.perf_counter), ("realtime", time.time)):
+    a = fn(); time.sleep(0.5); b = fn()
+    print(f"{name}+{b - a:.3f}s", end=" ")' 2>&1)"
+
+    # Does a blocking wait block? A `poll(2)` that returns immediately makes
+    # any GLib main loop spin at 100% of a CPU while still working correctly,
+    # and the shape that matters here is `poll` over an EPOLL fd - GLib
+    # polling PipeWire's loop.
+    note "$(timeout 60 runuser -u "$U" -- /usr/local/libexec/narf-poll-probe 2>&1 | tr '\n' ' ')"
+
     note "devfd: readlink=$(readlink /dev/fd 2>&1) fd0=$(ls -l /dev/fd/0 2>&1 | tail -1)"
     if printf 'devfd-ok\n' | { read -r _probe < /dev/fd/0 && echo "$_probe"; } 2>/dev/null |
         grep -q devfd-ok; then
@@ -284,6 +354,9 @@ trap cleanup EXIT
 # the same variables bury `wpctl status`'s table under WirePlumber's own
 # startup log on the very stdout this gate parses.
 PW_LOG_LEVEL=${NARF_AUDIO_DEBUG:-3}
+# Per-topic level: the ALSA node's timing trace, without turning on trace for
+# every other topic in the daemon.
+PW_DAEMON_DEBUG="${PW_LOG_LEVEL},spa.alsa:5"
 
 # `ps` line for a daemon we started. STAT and TIME together separate the two
 # ways a daemon fails to come up on a one-vCPU guest: a blocked process sits in
@@ -323,7 +396,7 @@ early_log() {
 
 start_pipewire() {
     note "starting pipewire"
-    PIPEWIRE_DEBUG="$PW_LOG_LEVEL" pipewire >"$LOG/pipewire" 2>&1 &
+    PIPEWIRE_DEBUG="$PW_DAEMON_DEBUG" pipewire >"$LOG/pipewire" 2>&1 &
     PW_PID=$!
     sleep 5
     early_log pipewire "$LOG/pipewire" "$PW_PID"
@@ -355,9 +428,12 @@ snapshot() {
     mv -f "$GRAPH.new" "$GRAPH"
 }
 
-# Node ids of the ALSA-backed sink and source WirePlumber exported, one per
-# line as "<media.class> <id> <node.name>". Driven off the snapshot so the
-# assertion sees exactly the graph a client would connect to.
+# The ALSA-backed sink and source nodes WirePlumber exported, one per line as
+# "<media.class> <id> <device.id> <node.name>". Driven off the snapshot so the
+# assertion sees exactly the graph a client would connect to. The device id is
+# what makes a PER-CARD assertion possible: with two cards present, switching
+# one card off leaves the other card's sink standing, so "no sink anywhere" is
+# a condition a correct profile switch can never satisfy.
 graph_nodes() {
     python3 - "$GRAPH" <<'PY'
 import json, sys
@@ -375,7 +451,7 @@ for o in objs:
         continue
     if "api.alsa.path" not in p and p.get("device.api") != "alsa":
         continue
-    print(cls, o["id"], p.get("node.name", "?"))
+    print(cls, o["id"], p.get("device.id", "-"), p.get("node.name", "?"))
 PY
 }
 
@@ -399,6 +475,11 @@ for o in objs:
     profiles = (info.get("params") or {}).get("EnumProfile") or []
     print(o["id"], len(profiles), p.get("device.name", "?"))
 PY
+}
+
+# Does `$1` (a device id) currently have a sink in the graph?
+device_sink_present() {
+    graph_nodes | awk -v dev="$1" '$1 == "Audio/Sink" && $3 == dev' | grep -q .
 }
 
 # "<index> <name>" for the device's CURRENT profile.
@@ -532,41 +613,72 @@ note "stream: $(graph_nodes | tr '\n' '|')"
 dd if=/dev/zero of="$WORK/tone.raw" bs=4 count=96000 status=none ||
     fail "could not stage the playback buffer"
 
-PIPEWIRE_DEBUG="$PW_LOG_LEVEL" timeout 180 pw-record --verbose \
-    --rate 48000 --channels 2 --format s16 --raw "$WORK/cap.raw" \
-    >"$LOG/pw-record" 2>&1 &
+# Capture first, and WAIT for it to deliver its first frames before playback
+# starts. Starting both at once and measuring afterwards cannot tell "capture
+# is broken" from "capture needed longer than the two seconds playback lasts to
+# negotiate", and under emulation that start-up latency is real.
+stream_fail() {
+    note "pw-play bytes=$(stat -c %s "$LOG/pw-play" 2>&1) state/param/error lines:"
+    grep -aE 'stream_state|state changed|param_changed|EnumFormat|Format|\[W\]|\[E\]|error' \
+        "$LOG/pw-play" 2>&1 | tail -n 15
+    note "pw-record bytes=$(stat -c %s "$LOG/pw-record" 2>&1) state/param/error lines:"
+    grep -aE 'stream_state|state changed|param_changed|EnumFormat|Format|\[W\]|\[E\]|error' \
+        "$LOG/pw-record" 2>&1 | tail -n 15
+    note "alsa node warnings/errors:"
+    grep -aE 'spa.alsa.*(resync|xrun|underrun|overrun|clock|snd_pcm|rror|timeout|not available)' \
+        "$LOG/pipewire" 2>/dev/null | tail -n 15
+    note "pw-top:"
+    timeout 90 pw-top -b -n 2 2>&1 | tail -n 12
+    note "work dir: $(ls -l "$WORK" 2>&1 | tr -s ' \n' ' ')"
+    fail "$1"
+}
+
+# `--raw` makes pw-cat ignore the filename entirely: `setup_pipe` installs
+# `stdout_record` / `stdin_play`, which `fwrite` to stdout and `fread` from
+# stdin (src/tools/pw-cat.c). Passing a path alongside `--raw` sent the captured
+# samples to this shell's redirect and left the named file untouched - 23 MB of
+# real audio sitting in what looked like a log file next to an empty capture -
+# and made playback read the service's stdin, so it "succeeded" having played
+# nothing. The `-` is required: pw-cat still demands a positional argument.
+timeout 240 pw-record --rate 48000 --channels 2 --format s16 --raw - \
+    >"$WORK/cap.raw" 2>"$LOG/pw-record" &
 rec_pid=$!
-PIPEWIRE_DEBUG="$PW_LOG_LEVEL" timeout 180 pw-play --verbose \
-    --rate 48000 --channels 2 --format s16 --volume 0.2 --raw \
-    "$WORK/tone.raw" >"$LOG/pw-play" 2>&1
+wait_for 120 "[ -s '$WORK/cap.raw' ]" ||
+    stream_fail "capture delivered no frames at all"
+cap_before=$(stat -c %s "$WORK/cap.raw" 2>/dev/null || echo 0)
+note "stream: capture started (${cap_before} bytes before playback)"
+
+play_t0=$(date +%s)
+timeout 180 pw-play --rate 48000 --channels 2 --format s16 --volume 0.2 --raw - \
+    <"$WORK/tone.raw" >"$LOG/pw-play" 2>&1
 play_rc=$?
+play_s=$(( $(date +%s) - play_t0 ))
 # `$!` is the `timeout` wrapper, not pw-record: signal the child as well, or
 # the capture is orphaned mid-write instead of closing its file on SIGINT.
 pkill -INT -P "$rec_pid" 2>/dev/null
 kill -INT "$rec_pid" 2>/dev/null
 wait "$rec_pid" 2>/dev/null
-if [ "$play_rc" -ne 0 ]; then
-    # Inline, like the other stages: the generic diagnostics loop runs over
-    # every log and the console drops its tail under load, so the one log that
-    # explains a stalled transfer never arrives.
-    note "pw-play bytes=$(stat -c %s "$LOG/pw-play" 2>&1) state/param/error lines:"
-    grep -aE 'stream_state|state changed|param_changed|EnumFormat|Format|\[W\]|\[E\]|error' \
-        "$LOG/pw-play" 2>&1 | tail -n 20
-    note "pw-record bytes=$(stat -c %s "$LOG/pw-record" 2>&1) state/param/error lines:"
-    grep -aE 'stream_state|state changed|param_changed|EnumFormat|Format|\[W\]|\[E\]|error' \
-        "$LOG/pw-record" 2>&1 | tail -n 12
-    note "daemon client-node lines:"
-    grep -aE 'client-node|impl-node.*(running|suspended|idle|error)|activate|\[E\]' \
-        "$LOG/pipewire" 2>&1 | tail -n 20
-    note "capture bytes: $(stat -c %s "$WORK/cap.raw" 2>&1)"
-    fail "pw-play exited ${play_rc} (124 = the transfer never finished)"
-fi
-cap_bytes=$(stat -c %s "$WORK/cap.raw" 2>/dev/null || echo 0)
+cap_after=$(stat -c %s "$WORK/cap.raw" 2>/dev/null || echo 0)
+# `$!` is the `timeout` wrapper, not pw-record: signal the child as well, or
+# the capture is orphaned mid-write instead of closing its file on SIGINT.
+pkill -INT -P "$rec_pid" 2>/dev/null
+kill -INT "$rec_pid" 2>/dev/null
+wait "$rec_pid" 2>/dev/null
+[ "$play_rc" -eq 0 ] ||
+    stream_fail "pw-play exited ${play_rc} (124 = the transfer never finished)"
+# Two seconds of audio cannot clock out in under one. An instant exit means
+# pw-play played nothing at all, which is exactly what it does when its input
+# is empty - and that read as a pass until the `--raw` stdin contract above was
+# understood.
+[ "$play_s" -ge 1 ] ||
+    stream_fail "pw-play returned after ${play_s}s for 2s of audio (it played nothing)"
 # One 1024-frame period of 48 kHz stereo s16 is 4096 bytes; require four
-# periods so a single lucky buffer cannot pass for a running capture stream.
-[ "$cap_bytes" -ge 16384 ] ||
-    fail "capture produced ${cap_bytes} bytes during playback, expected >= 16384"
-note "stream: simultaneous playback ok and ${cap_bytes} bytes captured"
+# periods of GROWTH across the playback, so neither a single lucky buffer nor a
+# capture that stopped before playback began can pass for a running duplex.
+grew=$((cap_after - cap_before))
+[ "$grew" -ge 16384 ] ||
+    stream_fail "capture grew ${grew} bytes during playback, expected >= 16384"
+note "stream: ${play_s}s playback ok with the capture running, ${grew} bytes captured alongside it"
 
 # ── stage recover ─────────────────────────────────────────────────────────
 # A profile cycle tears the ACP mappings down and reopens every PCM, which is
@@ -580,12 +692,12 @@ off=$(awk '$2 == "off" { print $1; exit }' "$LOG/profiles")
 [ -n "$off" ] || fail "device ${dev_id} enumerates no 'off' profile"
 timeout 180 wpctl set-profile "$dev_id" "$off" >"$LOG/wpctl-off" 2>&1 ||
     fail "wpctl set-profile ${dev_id} ${off} failed"
-wait_for 180 "snapshot && ! graph_nodes | grep -q '^Audio/Sink '" ||
-    fail "sink survived the profile switch to off (${off})"
+wait_for 180 "snapshot && ! device_sink_present ${dev_id}" ||
+    fail "device ${dev_id}'s sink survived the profile switch to off (${off})"
 timeout 180 wpctl set-profile "$dev_id" "$before" >"$LOG/wpctl-back" 2>&1 ||
     fail "wpctl set-profile ${dev_id} ${before} failed"
-wait_for 300 "snapshot && graph_nodes | grep -q '^Audio/Sink '" ||
-    fail "sink did not return after restoring profile ${before}"
+wait_for 300 "snapshot && device_sink_present ${dev_id}" ||
+    fail "device ${dev_id}'s sink did not return after restoring profile ${before}"
 note "recover: profile ${before} -> off(${off}) -> ${before} rebuilt the sink"
 
 # A full session restart re-runs discovery from scratch against cards that
@@ -601,5 +713,70 @@ wait_for 300 "snapshot && graph_nodes | grep -q '^Audio/Source '" ||
     fail "source did not return after a full session restart"
 note "recover: a cold session restart rediscovered the sink and source"
 
-echo "NARF-AUDIO-CHECK: OK cards=2 device=${dev_id} profiles=${dev_profiles} captured=${cap_bytes}"
+# ── stage steady ────────────────────────────────────────────
+#
+# A session manager that WORKS but never stops burning a core is a defect the
+# functional stages cannot see: every assertion above passes while one CPU
+# spins. Measured straight from utime+stime in /proc/<pid>/stat, per THREAD,
+# so "something in this process spins" and "the main loop spins" are
+# distinguishable - which needs /proc/<pid>/task/<tid>/{stat,comm} to be
+# per-thread.
+cpu_ticks() {
+    awk '{ print $14 + $15 }' "/proc/$1/stat" 2>/dev/null || echo 0
+}
+hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+window=10
+
+declare -A tick_before tick_name
+for t in /proc/"$WP_PID"/task/*; do
+    [ -r "$t/stat" ] || continue
+    tid=${t##*/}
+    tick_before[$tid]=$(awk '{ print $14 + $15 }' "$t/stat" 2>/dev/null || echo 0)
+    tick_name[$tid]=$(cat "$t/comm" 2>/dev/null || echo '?')
+done
+
+wp_before=$(cpu_ticks "$WP_PID")
+pw_before=$(cpu_ticks "$PW_PID")
+sleep "$window"
+wp_pct=$(( ($(cpu_ticks "$WP_PID") - wp_before) * 100 / (hz * window) ))
+pw_pct=$(( ($(cpu_ticks "$PW_PID") - pw_before) * 100 / (hz * window) ))
+note "steady: idle CPU over ${window}s — wireplumber ${wp_pct}%, pipewire ${pw_pct}%"
+for t in /proc/"$WP_PID"/task/*; do
+    [ -r "$t/stat" ] || continue
+    tid=${t##*/}
+    delta=$(( $(awk '{ print $14 + $15 }' "$t/stat" 2>/dev/null || echo 0) - ${tick_before[$tid]:-0} ))
+    [ "$delta" -gt 0 ] || continue
+    note "steady:   tid ${tid} '${tick_name[$tid]:-?}' used $(( delta * 100 / (hz * window) ))%"
+done
+
+# RECORDED, not asserted. WirePlumber's main loop spins here while the daemon
+# stays idle and every functional stage passes; see the README for what that
+# has been narrowed to and what has been ruled out. Failing the gate on it
+# would hide the contract this gate exists to prove, so it is reported on
+# every run — including in the verdict line — and tracked as an open defect.
+if [ "$wp_pct" -ge 50 ] || [ "$pw_pct" -ge 50 ]; then
+    note "steady: WARNING known open defect — an idle session should be near 0%"
+fi
+
+# `ps -L` reads /proc/<pid>/task/<tid>/stat for every thread. It aborted with
+# procps's "fatal library error, reap" while that directory named every thread
+# after the group's pid and had no per-thread stat at all.
+ps -L -o pid=,tid=,comm= -p "$WP_PID" >"$LOG/ps-L" 2>&1 ||
+    fail "ps -L failed on the session manager: $(tr -s ' \n' ' ' <"$LOG/ps-L")"
+threads=$(grep -c . "$LOG/ps-L")
+[ "${threads:-0}" -ge 2 ] ||
+    fail "ps -L listed ${threads} thread(s) for a multi-threaded session manager"
+note "steady: ps -L lists ${threads} threads: $(awk '{print $3}' "$LOG/ps-L" | sort -u | tr '\n' ' ')"
+
+# glibc's pthread_setname_np writes /proc/self/task/<tid>/comm. Every PipeWire
+# loop names itself that way, and each failure is one log line.
+if grep -aq "pthread_setname error" "$LOG/pipewire" "$LOG/wireplumber" 2>/dev/null; then
+    fail "pthread_setname_np still fails: $(grep -ahm1 'pthread_setname error' "$LOG/pipewire" "$LOG/wireplumber")"
+fi
+# ... and a name that took must be visible, or the write silently went nowhere.
+awk '{print $3}' "$LOG/ps-L" | grep -qv '^wireplumber$' ||
+    fail "every thread is still named after the process; pthread_setname_np had no effect"
+note "steady: thread names are distinct, so pthread_setname_np takes effect"
+
+echo "NARF-AUDIO-CHECK: OK cards=2 device=${dev_id} profiles=${dev_profiles} playback=${play_s}s captured=${grew} idle-cpu=${wp_pct}%/${pw_pct}% threads=${threads}"
 exit 0

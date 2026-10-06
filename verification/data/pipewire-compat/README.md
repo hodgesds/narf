@@ -16,7 +16,15 @@ parts ALSA validation cannot establish:
 | `daemon` | the daemon serves a client over its protocol socket (SCM_RIGHTS + sealed memfd transport) |
 | `session` | WirePlumber attaches as a **second process** and exports an ALSA device with ACP card profiles |
 | `stream` | a sink and a source node exist and playback and capture run **at the same time** through them |
-| `recover` | a profile cycle and a cold session restart both rebuild the sink |
+| `recover` | a profile cycle and a cold session restart both rebuild that device's sink |
+| `steady` | the idle session does not burn a CPU, `ps -L` lists its threads, and `pthread_setname_np` takes effect |
+
+Before PipeWire starts, the `access` stage also drives plain ALSA directly:
+`aplay`/`arecord` in both read/write and `-M` (mmap) modes on both cards, and
+an `-f S32_LE` request at PipeWire's own period and buffer size. That last one
+splits the problem space in half whenever the graph misbehaves — it separates
+"the PCM driver cannot sustain a transfer" from "the format PipeWire
+negotiated is one the card advertises but cannot configure".
 
 One verdict line reaches the console, `NARF-AUDIO-CHECK: OK` or
 `... FAIL <reason>`, and `cargo xtask systemd-pid1` keys its success and
@@ -69,10 +77,17 @@ harness silently measured the wrong thing, each of which cost a boot:
 - **`dbus-run-session` is not used.** It hands the bus address back over a pipe
   and then execs the payload; the gate starts `dbus-daemon --fork
   --print-address` itself, bounded.
-- **`ps -L` is unusable here** — it aborts with `fatal library error, reap`
-  against this procfs — and `strace -p` cannot attach (`wait4(__WALL): No child
-  processes`). Thread state is sampled from `/proc/<pid>/task/<tid>/stat`
-  instead.
+- **`pw-cat`'s `--raw` mode ignores the filename.** `setup_pipe` installs
+  `stdout_record`/`stdin_play`, so `pw-record --raw FILE` writes the samples to
+  STDOUT and leaves `FILE` untouched, and `pw-play --raw FILE` reads STDIN and
+  plays nothing while exiting 0. Redirect instead, and assert that playback
+  took about as long as the audio is.
+- **Assert per DEVICE, not globally.** With two cards present, switching one
+  card's profile to `off` cannot make "no sink anywhere" true, so that
+  condition can never be satisfied by a correct profile switch.
+- **`strace -p` cannot attach** (`wait4(__WALL): No child processes`). Thread
+  state is sampled from `/proc/<pid>/task/<tid>/stat` instead, which is what
+  `ps -L` reads too.
 
 ## Oracles
 
@@ -82,6 +97,8 @@ Contracts are checked against the local Linux 7.3-rc4 sources under
 | Contract | Linux source |
 | --- | --- |
 | Device-node default owner and mode (root:root 0600) | `drivers/base/devtmpfs.c`, `sound/sound_core.c` |
+| A card's PCM formats come from the codec, not a fixed list | `sound/pci/hda/hda_codec.c` (`snd_hda_query_supported_pcm`) |
+| `poll(2)` reports `POLLERR`/`POLLHUP` without being asked | `fs/select.c` |
 | `GROUP="audio"`, `0660`, `uaccess` tagging | `/usr/lib/udev/rules.d/50-udev-default.rules`, `70-uaccess.rules` |
 | `SOUND_INITIALIZED` on the card `change` event | `/usr/lib/udev/rules.d/78-sound-card.rules` |
 | Magic-link target rendered in the reader's root | `fs/proc/base.c` (`proc_pid_readlink`), `fs/d_path.c` |
@@ -92,5 +109,39 @@ PipeWire's own requirements are read from its sources: `spa/plugins/alsa/
 alsa-udev.c` (which card properties are mandatory), `src/modules/
 flatpak-utils.h` and `src/modules/module-access.c` (the `/proc/<pid>/root`
 check), and `src/modules/module-rt.c` (the realtime policy path).
+
+`fedora-poll-probe.py` runs alongside the gate. It asserts that a blocking
+wait actually blocks — `poll` with no fds, on an eventfd, on an epoll fd, with
+GLib's exact `POLLIN|POLLERR|POLLHUP` mask, on each primitive after its level
+has been consumed, and on an ALSA control fd with mixer events subscribed.
+A kernel that returns from any of those early makes every GLib main loop spin
+at 100% of a CPU while still behaving correctly, which is invisible to a
+functional test.
+
+## Known open defect: the session manager spins
+
+WirePlumber's MAIN thread uses ~100% of one CPU once the graph is built, while
+the PipeWire daemon sits at 0% and every functional stage passes. The gate
+reports it on every run (including in the verdict line) but does not fail on
+it: failing would hide the contract this gate exists to prove.
+
+Ruled out so far, all measured in-guest:
+
+- the vDSO `CLOCK_MONOTONIC` (advances correctly, so GLib's timeouts are sane);
+- `poll`/`ppoll`/`epoll_wait` blocking semantics, with and without fds;
+- `POLLERR`/`POLLHUP` being treated as requested rather than output-only
+  (`do_poll` gets this right, and the probe confirms it);
+- `poll` over an epoll fd using GLib's exact mask — the shape
+  `wp_loop_source_new` creates (lib/wp/core.c);
+- a level not cleared on consume, for eventfd, Unix socketpair and timerfd,
+  individually and inside an epoll;
+- ALSA control-fd readiness, idle and with events subscribed;
+- GLib itself: a bare `gdbus monitor` main loop idles at 0%.
+
+It emits no log output at `WIREPLUMBER_DEBUG=4`, so it is a silent dispatch
+loop rather than repeated work. Narrowing it further wants a tracer, and
+`strace -p` cannot attach here: `wait4(__WALL)` does not consider a ptrace
+tracee that is not a child, so the tracer sees `No child processes`. Those two
+are coupled — the ptrace/wait4 gap is the next step.
 
 Audible quality and physical power transitions still require hardware tests.

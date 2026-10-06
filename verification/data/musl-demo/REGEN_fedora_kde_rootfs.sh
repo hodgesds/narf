@@ -433,6 +433,9 @@ install -m 0755 \
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-audio-gate.sh" \
   "$WORK/root/usr/local/libexec/narf-audio-gate"
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-poll-probe.py" \
+  "$WORK/root/usr/local/libexec/narf-poll-probe"
 
 # Desktop audio acceptance gate: prove stock PipeWire + WirePlumber discover
 # the cards through udev, build ACP card profiles, route a sink and a source,

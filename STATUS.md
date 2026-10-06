@@ -66,7 +66,7 @@ finds HDA's hardware volume control, activates analog input and output routes,
 exports a sink per card plus a source, and sets the default sink and source.
 `wpctl status` lists them as a desktop would see them.
 
-Three Linux-ABI defects found by that path are fixed:
+Five Linux-ABI defects found by that path are fixed:
 
 - `/dev/snd/*` owner, mode and ACL now live on the devtmpfs NODE rather than
   the per-lookup `FileOps`, and the nodes are published root-owned at 0600 as
@@ -77,36 +77,46 @@ Three Linux-ABI defects found by that path are fixed:
   `d_path()` does. The stored prefix is host-view, so a chrooted reader —
   which is every process in this image — was handed a name that resolved to
   nothing.
-- `/proc/{self,<pid>}/{root,cwd,exe}` are now FOLLOWABLE at `open` and at a
-  path `stat`, trailing slash included. An absolute magic-link target leaves
-  procfs, and the filesystem-local resolver restarted it at procfs's own mount
-  root. PipeWire's access module opens `/proc/<peer-pid>/root` to look for
-  `.flatpak-info` and reads a failed open as "this client is sandboxed", so
-  every client hung at connect.
+- `/proc/{self,<pid>}/{root,cwd,exe}` are FOLLOWABLE at `open` and at a path
+  `stat`, trailing slash included, and a `stat` whose symlink target leaves
+  its own filesystem now crosses the mount the way `open` already did. An
+  absolute magic-link target restarts at the owning filesystem's mount root,
+  so the walk never left procfs. PipeWire's access module opens
+  `/proc/<peer-pid>/root` to look for `.flatpak-info` and reads a failed open
+  as "this client is sandboxed", so every client hung at connect. The same
+  shape through devtmpfs also made `/dev/fd/<n>` unresolvable, which is how
+  bash implements process substitution (`cmd < <(other)`); the VFS expansion
+  now stops at a proc-fd magic link instead of expanding its readlink TEXT,
+  which for an anonymous descriptor is `pipe:[12345]` and names nothing.
+- `/proc/<pid>/task/` is named by thread id instead of repeating the group's
+  pid once per thread, and each thread directory now carries a per-thread
+  `stat` and a per-thread, writable `comm` (0644, as `tid_base_stuff` has it).
+  Together that is what `ps -L` and `top -H` read, and what glibc's
+  `pthread_setname_np` writes: the gate sees seven distinctly named
+  WirePlumber threads where before procps aborted with "fatal library error,
+  reap".
+- HDA advertises only the formats its codec reports. `capabilities()` returned
+  a fixed `S16_LE | S32_LE` while `configure_paths` enforced the converter's
+  `AC_PAR_PCM` word, so on a 16-bit-only codec — QEMU's hda-duplex among them
+  — `HW_REFINE` offered S32_LE and `HW_PARAMS` then rejected it. alsa-lib
+  cannot recover from that: PipeWire negotiates the widest format on offer and
+  its ALSA node dies with `set_hw_params: Invalid argument`, leaving a sink
+  that never takes a quantum. The format set is now queried once at probe,
+  from the same word the enforcement reads.
 
-`/proc/<pid>/task/` is also now named by thread id instead of repeating the
-group's pid once per thread, which is what made procps abort with "fatal
-library error, reap" and `pthread_setname_np` return ENOENT.
-
-Open, with the failure localized:
-
-- **PCM streaming does not sustain.** Playback reaches `streaming` and falls
-  back to `paused`; capture oscillates `streaming`/`paused` and never writes a
-  frame. Both point at the ALSA node's driver role under PipeWire's
-  mmap + `avail_min` + period-event usage rather than at negotiation, which
-  completes. This is the remaining work for audible desktop audio.
-- **WirePlumber spins at 100% of one CPU** once the graph is built, where on
-  Linux it idles. The daemon stays idle, so the spin is local to the session
-  manager's own loop.
-- `/dev/fd/<n>` does not resolve, so bash process substitution (`cmd < <(…)`)
-  fails — the same absolute-symlink-across-mounts shape as the procfs links
-  above, through devtmpfs instead.
-- `ps -L` aborts with procps's "fatal library error, reap", and `strace -p`
-  cannot attach (`wait4(__WALL): No child processes`).
-- The realtime data loop is not exercised: `pam_limits` resets
-  `RLIMIT_RTPRIO` for a PAM login, so the gate drops privileges with
-  `setpriv`; a real seat session would inherit the limit from its user
-  manager.
+One defect remains open, and the gate reports it on every run rather than
+failing on it: **WirePlumber's main thread burns ~100% of one CPU once the
+graph is built**, while the PipeWire daemon stays at 0% and every functional
+stage passes. The vDSO monotonic clock, `poll`/`epoll` blocking semantics,
+`POLLERR`/`POLLHUP` handling, poll-over-epoll with GLib's exact mask,
+level-not-cleared-on-consume for eventfd/socketpair/timerfd, ALSA control-fd
+readiness, and GLib itself (a bare `gdbus monitor` idles at 0%) have all been
+measured in-guest and ruled out; it produces no log output at trace level, so
+it is a silent dispatch loop. Narrowing it further wants a tracer, and
+`strace -p` cannot attach because `wait4(__WALL)` does not consider a ptrace
+tracee that is not a child. Those two are coupled and the ptrace/wait4 gap is
+the next step. Details and the full elimination list are in
+[verification/data/pipewire-compat](verification/data/pipewire-compat/README.md).
 
 ## USB-C and Phoenix USB4
 
