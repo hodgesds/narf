@@ -76,6 +76,12 @@ pub struct MinixVolume<B: BlockDevice> {
     io: IrqSafeSpinLock<VolumeIo>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
+    /// The root directory's inode, read at mount (Linux `minix_fill_super`
+    /// does `minix_iget(s, MINIX_ROOT_INO)` and fails the mount without
+    /// it) and refreshed by every `write_inode(1, ..)`. `root()` hands it
+    /// to the new node so a sync `stat` of the mount root reports the
+    /// on-disk mtime instead of an uncached zero.
+    root_inode: IrqSafeSpinLock<Option<super::inode::Inode>>,
 }
 
 impl<B: BlockDevice + 'static> MinixVolume<B> {
@@ -125,14 +131,18 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
             }
         };
 
-        Ok(Arc::new_cyclic(|self_weak| MinixVolume {
+        let volume = Arc::new_cyclic(|self_weak| MinixVolume {
             device,
             sb,
             domain,
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
-        }))
+            root_inode: IrqSafeSpinLock::new(None),
+        });
+        let root = volume.read_inode(super::MINIX_ROOT_INO).await?;
+        *volume.root_inode.lock() = Some(root);
+        Ok(volume)
     }
 
     /// Read one device sector (LBS bytes) into `dst`. `dst.len()`
@@ -465,7 +475,11 @@ impl<B: BlockDevice + 'static> MinixVolume<B> {
         let mut buf = vec![0u8; bs];
         self.read_block(block, &mut buf).await?;
         inode.encode(self.sb.version, &mut buf, off_in_block as usize);
-        self.write_block(block, &buf).await
+        self.write_block(block, &buf).await?;
+        if ino == super::MINIX_ROOT_INO {
+            *self.root_inode.lock() = Some(*inode);
+        }
+        Ok(())
     }
 
     /// Bitmap-allocator helper (Linux `fs/minix/bitmap.c`
@@ -869,12 +883,18 @@ impl<B: BlockDevice + 'static> FsInstance for MinixVolume<B> {
         // Root inode in MINIX is #1 — NOT 2 (that's ext2). Tanenbaum
         // §5: inode 0 is reserved (always-free in the bitmap), inode
         // 1 is the root directory.
-        Arc::new(super::node::MinixNode::new(
-            self.self_weak
-                .upgrade()
-                .expect("MinixVolume root called after drop"),
-            1,
-        ))
+        let volume = self
+            .self_weak
+            .upgrade()
+            .expect("MinixVolume root called after drop");
+        match *self.root_inode.lock() {
+            Some(inode) => Arc::new(super::node::MinixNode::new_with_inode(
+                volume,
+                super::MINIX_ROOT_INO,
+                inode,
+            )),
+            None => Arc::new(super::node::MinixNode::new(volume, super::MINIX_ROOT_INO)),
+        }
     }
 
     fn name(&self) -> &str {

@@ -80,7 +80,24 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
                 },
                 perms: inode.mode & 0o777,
             },
-            mtime_cycles: inode.mtime as u64,
+            // `Stat` carries monotonic cycles; encode the wall-clock ns
+            // (the raw on-disk SECONDS used to go in unconverted). The
+            // exact value travels in `InodeAttrs::mtime_ns`.
+            mtime_cycles: narf_time::ns_to_cycles(inode.mtime_ns()),
+        }
+    }
+
+    /// Device plus exact atime/ctime/mtime from the cached inode. Every
+    /// node except a not-yet-read one carries its inode; an uncached node
+    /// reports device only and the stat path falls back to `Stat`.
+    fn attrs(&self) -> narf_filesystem::InodeAttrs {
+        let inode = *self.inode.lock();
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            atime_ns: inode.map_or(0, |i| i.atime_ns()),
+            ctime_ns: inode.map_or(0, |i| i.ctime_ns()),
+            mtime_ns: inode.map_or(0, |i| i.mtime_ns()),
+            ..Default::default()
         }
     }
 
@@ -156,10 +173,7 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
     }
 
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
@@ -251,10 +265,13 @@ impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
+    }
+
+    /// The directory's on-disk `i_mtime` (V1: `i_time`), whole seconds.
+    /// Without it every MINIX directory stat'd as the epoch.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.inode.lock().map_or(0, |i| i.mtime_ns())
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {
