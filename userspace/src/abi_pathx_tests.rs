@@ -4036,6 +4036,113 @@ kernel_test_in!(
     smoke_abi_pathx_newfstatat_proc_self_fd_magic_symlink
 );
 
+/// `"/proc/self/fd/<fd>\0"`, NUL-padded.
+fn proc_self_fd_path(fd: u64) -> [u8; 32] {
+    let mut pbuf = [0u8; 32];
+    let prefix = b"/proc/self/fd/";
+    pbuf[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 20];
+    let (mut v, mut d) = (fd, 0usize);
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        d += 1;
+        if v == 0 {
+            break;
+        }
+    }
+    for (i, k) in (0..d).rev().enumerate() {
+        pbuf[prefix.len() + i] = digits[k];
+    }
+    pbuf
+}
+
+// Every path-taking syscall that runs the VFS symlink walk must JUMP through a
+// followed `/proc/self/fd/N` to the descriptor's own file (`nd_jump_link`),
+// not stop on the procfs link. The udev `uaccess` builtin opens
+// `/dev/dri/card0` O_PATH and applies the seat ACL with libacl's
+// `acl_get_file`/`acl_set_file("/proc/self/fd/N")` (`getxattr`/`setxattr`).
+// When the walk stopped on the link, the ACL landed on procfs instead of
+// card0, so card0 never got the greeter's `user:<uid>:rw` ACL and kwin's open of card0 was -EACCES.
+//
+// The walk recognises the magic link by its place (`/proc/<pid|self>/fd/N`)
+// and jumps through the caller's real fd table, so a MemFs at `/proc` with a
+// symlink there stands in for procfs. Its text is `pipe:[1]` — what an
+// anonymous descriptor reads back, naming nothing — so reaching the file
+// proves the walk jumped rather than following the text.
+fn smoke_abi_pathx_proc_self_fd_jump_reaches_the_file() -> TestResult {
+    const O_PATH: u64 = 0o10000000;
+    with_memfs("/proc", "proc", &[("data", b"hello")], || {
+        let path = b"/proc/data\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not O_PATH-open the seeded file"),
+        };
+        for dir in [&b"/proc/self\0"[..], &b"/proc/self/fd\0"[..]] {
+            if call(
+                Syscall::Mkdirat.raw(),
+                a3(AT_FDCWD, dir.as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+            {
+                return Err("could not build /proc/self/fd");
+            }
+        }
+        let magic = proc_self_fd_path(fd);
+        let text = b"pipe:[1]\0";
+        if call(
+            Syscall::Symlinkat.raw(),
+            a3(text.as_ptr() as u64, AT_FDCWD, magic.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("could not create the fd link");
+        }
+        let name = b"user.k\0";
+        let val = b"v";
+        let set = SyscallArgs {
+            arg0: magic.as_ptr() as u64,
+            arg1: name.as_ptr() as u64,
+            arg2: val.as_ptr() as u64,
+            arg3: val.len() as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Setxattr.raw(), set) != Some(0) {
+            return Err("setxattr(/proc/self/fd/N) should return 0");
+        }
+        let mut buf = [0u8; 8];
+        let get = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: name.as_ptr() as u64,
+            arg2: buf.as_mut_ptr() as u64,
+            arg3: buf.len() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Getxattr.raw(), get) != Some(1) || buf[0] != b'v' {
+            return Err("setxattr(/proc/self/fd/N) did not reach the descriptor's file");
+        }
+        // And the read side, which `acl_get_file` runs first.
+        let mut back = [0u8; 8];
+        let get_magic = SyscallArgs {
+            arg0: magic.as_ptr() as u64,
+            arg1: name.as_ptr() as u64,
+            arg2: back.as_mut_ptr() as u64,
+            arg3: back.len() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::Getxattr.raw(), get_magic) {
+            Some(1) if back[0] == b'v' => Ok(()),
+            _ => Err("getxattr(/proc/self/fd/N) did not read the descriptor's file"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_proc_self_fd_jump_reaches_the_file
+);
+
 // `fs/stat.c::SYSCALL_DEFINE5(statx)` → do_statx → vfs_statx → cp_statx.
 // The mask and sync-type checks precede path resolution; vfs_statx's flag
 // gate precedes the walk; cp_statx's copy comes last.
