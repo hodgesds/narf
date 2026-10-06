@@ -525,3 +525,159 @@ fn smoke_minix_mkdir_then_rmdir() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/minix", smoke_minix_mkdir_then_rmdir);
+
+// ── Timestamps ──────────────────────────────────────────────────────
+//
+// Linux `minix_V2_iget` sets atime/mtime/ctime from the inode's three
+// unsigned 32-bit seconds fields with 0 nanoseconds; `minix_V1_iget`
+// reports V1's single `i_time` as all three. Before this, the driver fed
+// the raw SECONDS into `Stat::mtime_cycles` (a monotonic-cycle count) and
+// reported every directory as the epoch.
+
+/// Write `atime`/`mtime`/`ctime` into the V3 inode `ino` of an image from
+/// [`build_minix3_image`] (inode table at block 4, 64-byte inodes).
+fn put_minix3_times(img: &mut [u8], ino: usize, atime: u32, mtime: u32, ctime: u32) {
+    let off = 1024 * 4 + (ino - 1) * 64;
+    img[off + 12..off + 16].copy_from_slice(&atime.to_le_bytes());
+    img[off + 16..off + 20].copy_from_slice(&mtime.to_le_bytes());
+    img[off + 20..off + 24].copy_from_slice(&ctime.to_le_bytes());
+}
+
+const NS: u64 = 1_000_000_000;
+
+/// A file's stat times are its on-disk seconds, exactly, each from its own
+/// field; `Stat::mtime_cycles` encodes the wall-clock ns, not raw seconds.
+fn smoke_minix_file_reports_exact_times() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    const ATIME: u32 = 1_600_000_001;
+    const MTIME: u32 = 1_700_000_002;
+    const CTIME: u32 = 1_650_000_003;
+    let mut img = build_minix3_image(b"payload");
+    put_minix3_times(&mut img, 2, ATIME, MTIME, CTIME);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("hi.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hi.txt failed"),
+    };
+    let attrs = file.inode_attrs();
+    if attrs.mtime_ns != u64::from(MTIME) * NS {
+        return TestResult::Fail("file mtime_ns is not the on-disk i_mtime");
+    }
+    if attrs.atime_ns != u64::from(ATIME) * NS {
+        return TestResult::Fail("file atime_ns is not the on-disk i_atime");
+    }
+    if attrs.ctime_ns != u64::from(CTIME) * NS {
+        return TestResult::Fail("file ctime_ns is not the on-disk i_ctime");
+    }
+    let stat = file.stat();
+    if stat.mtime_cycles != narf_time::ns_to_cycles(u64::from(MTIME) * NS) {
+        return TestResult::Fail("Stat::mtime_cycles does not encode the wall-clock mtime");
+    }
+    // Negative: the old encoding stuffed raw seconds into the cycle count.
+    if stat.mtime_cycles == u64::from(MTIME) {
+        return TestResult::Fail("Stat::mtime_cycles still holds raw seconds");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_file_reports_exact_times);
+
+/// The mount root and a looked-up subdirectory report their on-disk
+/// `i_mtime` through both `dir_mtime_ns` and `inode_attrs`, not the
+/// epoch — including a fresh `root()` after a write to the root inode.
+fn smoke_minix_dir_reports_mtime() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use super::volume::MinixVolume;
+
+    const ROOT_MTIME: u32 = 1_650_000_123;
+    const ROOT_CTIME: u32 = 1_650_000_456;
+    let mut img = build_minix3_image(b"");
+    put_minix3_times(&mut img, 1, ROOT_MTIME, ROOT_MTIME, ROOT_CTIME);
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(MinixVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let want = u64::from(ROOT_MTIME) * NS;
+    if root.dir_mtime_ns() != want {
+        return TestResult::Fail("root dir_mtime_ns is not the on-disk i_mtime");
+    }
+    let attrs = root.inode_attrs();
+    if attrs.mtime_ns != want || attrs.ctime_ns != u64::from(ROOT_CTIME) * NS {
+        return TestResult::Fail("root InodeAttrs times are not exact");
+    }
+    // mkdir rewrites the root inode; a fresh root() must still carry real
+    // times, and the new subdirectory reports the same mtime however it is
+    // reached.
+    let sub = match poll_once(root.mkdir("sub")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    if sub.dir_mtime_ns() == 0 || sub.dir_mtime_ns() != sub.inode_attrs().mtime_ns {
+        return TestResult::Fail("new subdirectory reports no mtime");
+    }
+    let looked_up = match poll_once(root.lookup_dir_async("sub")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup_dir sub failed"),
+    };
+    if looked_up.dir_mtime_ns() != sub.dir_mtime_ns() {
+        return TestResult::Fail("looked-up subdirectory mtime differs from created");
+    }
+    if volume.root().dir_mtime_ns() != want {
+        return TestResult::Fail("root() after a root-inode write lost its mtime");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_dir_reports_mtime);
+
+/// Format edges: V1's single `i_time` is atime, mtime and ctime alike;
+/// the seconds are UNSIGNED (`s_time_max = U32_MAX`), so a value past
+/// 2038 is not a negative time; and a V2 write-back keeps atime and ctime
+/// instead of zeroing / clobbering them.
+fn smoke_minix_time_format_edges() -> TestResult {
+    const LATE: u32 = 0xF000_0000; // year 2097, > i32::MAX
+    let mut v1 = vec![0u8; 32];
+    v1[0..2].copy_from_slice(&(super::inode::mode::IFREG | 0o644).to_le_bytes());
+    v1[8..12].copy_from_slice(&LATE.to_le_bytes());
+    let Some(i) = Inode::decode(MinixVersion::V1, &v1, 0) else {
+        return TestResult::Fail("V1 decode failed");
+    };
+    let want = u64::from(LATE) * NS;
+    if i.mtime_ns() != want || i.atime_ns() != want || i.ctime_ns() != want {
+        return TestResult::Fail("V1 i_time is not reported as atime/mtime/ctime");
+    }
+    if i.mtime_ns() <= (i32::MAX as u64) * NS {
+        return TestResult::Fail("post-2038 seconds decoded as signed");
+    }
+
+    let mut v2 = vec![0u8; 64];
+    v2[0..2].copy_from_slice(&(super::inode::mode::IFREG | 0o644).to_le_bytes());
+    v2[12..16].copy_from_slice(&11u32.to_le_bytes()); // i_atime
+    v2[16..20].copy_from_slice(&22u32.to_le_bytes()); // i_mtime
+    v2[20..24].copy_from_slice(&33u32.to_le_bytes()); // i_ctime
+    let Some(j) = Inode::decode(MinixVersion::V2, &v2, 0) else {
+        return TestResult::Fail("V2 decode failed");
+    };
+    if j.atime_ns() != 11 * NS || j.mtime_ns() != 22 * NS || j.ctime_ns() != 33 * NS {
+        return TestResult::Fail("V2 times not decoded from their own fields");
+    }
+    let mut out = vec![0u8; 64];
+    j.encode(MinixVersion::V2, &mut out, 0);
+    if out[12..24] != v2[12..24] {
+        return TestResult::Fail("V2 encode did not write back atime/mtime/ctime");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/minix", smoke_minix_time_format_edges);

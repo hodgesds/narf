@@ -49,6 +49,10 @@ pub mod volume;
 
 mod tests;
 
+/// The root directory's inode number (`MINIX_ROOT_INO`). Inode 0 is
+/// reserved, so MINIX roots at 1 — not ext2's 2.
+pub const MINIX_ROOT_INO: u32 = 1;
+
 /// MINIX on-disk version. Determined by the superblock magic and
 /// directly drives the on-disk-record codec selection (V1 = 32-byte
 /// inodes + u16 zone pointers; V2/V3 = 64-byte inodes + u32 zone

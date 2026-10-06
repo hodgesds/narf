@@ -12,6 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mode, Stat};
+use narf_lib::sync::IrqSafeSpinLock;
 
 use super::message::{
     decode_header, decode_rerror, decode_rread, decode_rwalk, decode_rwrite, encode_tclunk,
@@ -20,12 +21,43 @@ use super::message::{
 };
 use super::session::{frame_message, P9Session, Transport};
 
+/// A file's timestamps as the stat path reports them, in wall-clock
+/// nanoseconds since the epoch.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct P9Times {
+    pub atime_ns: u64,
+    pub mtime_ns: u64,
+    pub ctime_ns: u64,
+}
+
+impl P9Times {
+    /// Linux `v9fs_stat2inode` for legacy 9P2000 (`fs/9p/vfs_inode.c`):
+    /// `atime = stat->atime`, `mtime = stat->mtime` and — 9P2000 has no
+    /// change time — `ctime = stat->mtime`, all with 0 nanoseconds. The
+    /// wire fields are unsigned 32-bit seconds (stat(5)), so a value past
+    /// 2038 is not negative. Only 9P2000.L's `Rgetattr` carries
+    /// nanoseconds; NARF negotiates plain "9P2000".
+    pub fn from_stat(st: &P9Stat) -> Self {
+        const NS: u64 = 1_000_000_000;
+        Self {
+            atime_ns: u64::from(st.atime) * NS,
+            mtime_ns: u64::from(st.mtime) * NS,
+            ctime_ns: u64::from(st.mtime) * NS,
+        }
+    }
+}
+
 /// One fid into the remote tree.
 pub struct NinepNode {
     transport: Arc<dyn Transport>,
     session: Arc<P9Session>,
     fid: u32,
     qid: Qid,
+    /// Times from the last `Rstat` of this fid: taken at lookup (Linux's
+    /// `v9fs_vfs_lookup` stats the new fid to build the inode) and
+    /// refreshed by every `stat_async`. The sync `inode_attrs` /
+    /// `dir_mtime_ns` report them; `None` only if never stat'd.
+    times: IrqSafeSpinLock<Option<P9Times>>,
 }
 
 impl core::fmt::Debug for NinepNode {
@@ -43,12 +75,43 @@ impl NinepNode {
         session: Arc<P9Session>,
         fid: u32,
         qid: Qid,
+        times: Option<P9Times>,
     ) -> Self {
         Self {
             transport,
             session,
             fid,
             qid,
+            times: IrqSafeSpinLock::new(times),
+        }
+    }
+
+    /// Device plus the cached stat times.
+    fn attrs(&self) -> narf_filesystem::InodeAttrs {
+        let t = (*self.times.lock()).unwrap_or_default();
+        narf_filesystem::InodeAttrs {
+            dev: self.session.dev(),
+            atime_ns: t.atime_ns,
+            ctime_ns: t.ctime_ns,
+            mtime_ns: t.mtime_ns,
+            ..Default::default()
+        }
+    }
+
+    /// Stat a freshly walked fid and build its node. Like Linux's lookup
+    /// (`v9fs_get_new_inode_from_fid` → `p9_client_stat`), a failed stat
+    /// fails the lookup; the fid is clunked so it does not leak.
+    async fn stat_child(&self, fid: u32, qid: Qid) -> Result<NinepNode, FsError> {
+        match self.tstat(fid).await {
+            Ok(st) => {
+                let node = self.child_node(fid, qid);
+                *node.times.lock() = Some(P9Times::from_stat(&st));
+                Ok(node)
+            }
+            Err(e) => {
+                let _ = self.tclunk(fid).await;
+                Err(e)
+            }
         }
     }
 
@@ -61,6 +124,12 @@ impl NinepNode {
 
     fn map_err<E: core::fmt::Debug>(_e: E) -> FsError {
         FsError::Io(narf_block::BlockError::IOError)
+    }
+
+    /// Tstat `fid` (stat(5)). Public to the crate so `NinepVolume::mount`
+    /// can stat the attached root the way Linux's `v9fs_mount` does.
+    pub(crate) async fn stat_fid(&self, fid: u32) -> Result<P9Stat, FsError> {
+        self.tstat(fid).await
     }
 
     /// Issue a Twalk that clones `self.fid` into a fresh fid (no
@@ -226,6 +295,7 @@ impl NinepNode {
             session: self.session.clone(),
             fid,
             qid,
+            times: IrqSafeSpinLock::new(None),
         }
     }
 
@@ -288,10 +358,7 @@ impl FileOps for NinepNode {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.session.dev(),
-            ..Default::default()
-        }
+        self.attrs()
     }
 
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
@@ -356,13 +423,18 @@ impl FileOps for NinepNode {
             } else {
                 Mode::FILE_RO
             },
-            mtime_cycles: 0,
+            mtime_cycles: self
+                .times
+                .lock()
+                .map_or(0, |t| narf_time::ns_to_cycles(t.mtime_ns)),
         }
     }
 
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
         Box::pin(async move {
             let st = self.tstat(self.fid).await?;
+            let times = P9Times::from_stat(&st);
+            *self.times.lock() = Some(times);
             let ft = if (st.mode & super::message::statmode::DIR) != 0 {
                 FileType::Dir
             } else {
@@ -375,7 +447,10 @@ impl FileOps for NinepNode {
                     file_type: ft,
                     perms: (st.mode & 0o777) as u16,
                 },
-                mtime_cycles: st.mtime as u64,
+                // Monotonic cycles: encode the wall-clock ns (raw SECONDS
+                // used to go in unconverted). The exact value travels in
+                // `InodeAttrs::mtime_ns`.
+                mtime_cycles: narf_time::ns_to_cycles(times.mtime_ns),
             })
         })
     }
@@ -387,10 +462,12 @@ impl DirOps for NinepNode {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.session.dev(),
-            ..Default::default()
-        }
+        self.attrs()
+    }
+
+    /// The directory's mtime from its last `Rstat`, not the epoch.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.times.lock().map_or(0, |t| t.mtime_ns)
     }
 
     fn lookup(&self, _name: &str) -> Option<Arc<dyn FileOps>> {
@@ -401,7 +478,7 @@ impl DirOps for NinepNode {
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move {
             let (newfid, qid) = self.walk_one(name).await?;
-            Ok(Arc::new(self.child_node(newfid, qid)) as Arc<dyn FileOps>)
+            Ok(Arc::new(self.stat_child(newfid, qid).await?) as Arc<dyn FileOps>)
         })
     }
 
@@ -416,7 +493,7 @@ impl DirOps for NinepNode {
                 let _ = self.tclunk(newfid).await;
                 return Err(FsError::InvalidPath);
             }
-            Ok(Arc::new(self.child_node(newfid, qid)) as Arc<dyn DirOps>)
+            Ok(Arc::new(self.stat_child(newfid, qid).await?) as Arc<dyn DirOps>)
         })
     }
 

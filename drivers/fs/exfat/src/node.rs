@@ -35,7 +35,7 @@ use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mo
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::dir::{
-    entry_type, file_attr, name_hash, stream_flags, FileDirectoryEntry, FileNameEntry,
+    entry_type, file_attr, name_hash, stream_flags, ExfatTimes, FileDirectoryEntry, FileNameEntry,
     StreamExtensionEntry, DIR_ENTRY_SIZE,
 };
 use super::fat::FatEntry;
@@ -66,6 +66,9 @@ pub struct ExfatNodeState {
     pub data_length: u64,
     pub no_fat_chain: bool,
     pub stat: Stat,
+    /// Exact atime/mtime (ctime = mtime) from the file entry, or the
+    /// mount time for the root.
+    pub times: ExfatTimes,
 }
 
 /// One node in the exFAT VFS surface — either the root directory
@@ -92,6 +95,7 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
     /// `first_cluster_of_root_directory`. The root has no
     /// containing dirent, so its size/attributes are synthetic.
     pub fn new_root(volume: Arc<ExfatVolume<B>>, first_cluster: u32) -> Self {
+        let times = volume.root_times;
         Self {
             volume,
             ino: EXFAT_ROOT_INO,
@@ -103,8 +107,9 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
                     size: 0,
                     blocks: 0,
                     mode: Mode::DIR_RO,
-                    mtime_cycles: 0,
+                    mtime_cycles: narf_time::ns_to_cycles(times.mtime_ns),
                 },
+                times,
             }),
         }
     }
@@ -113,6 +118,7 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
     pub fn from_dirent(volume: Arc<ExfatVolume<B>>, dirent: &ExfatDirent) -> Self {
         let bps = volume.bytes_per_sector as u64;
         let stream = dirent.stream;
+        let times = ExfatTimes::from_entry(&dirent.file, volume.tz_offset_min);
         let stat = Stat {
             size: stream.data_length,
             blocks: stream.data_length.div_ceil(bps),
@@ -128,7 +134,7 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
                     0o666
                 },
             },
-            mtime_cycles: 0,
+            mtime_cycles: narf_time::ns_to_cycles(times.mtime_ns),
         };
         Self {
             volume,
@@ -138,7 +144,22 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
                 data_length: stream.data_length,
                 no_fat_chain: (stream.general_secondary_flags & stream_flags::NO_FAT_CHAIN) != 0,
                 stat,
+                times,
             }),
+        }
+    }
+}
+
+impl<B: BlockDevice + 'static> ExfatNode<B> {
+    /// Device plus exact times; ctime is mtime, as `exfat_fill_inode` sets.
+    fn attrs(&self) -> narf_filesystem::InodeAttrs {
+        let t = self.state.lock().times;
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            atime_ns: t.atime_ns,
+            ctime_ns: t.mtime_ns,
+            mtime_ns: t.mtime_ns,
+            ..Default::default()
         }
     }
 }
@@ -395,10 +416,7 @@ impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
     }
 
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
@@ -449,10 +467,13 @@ impl<B: BlockDevice + 'static> DirOps for ExfatNode<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
+    }
+
+    /// The file entry's LastModified time, exactly (10 ms resolution,
+    /// UTC-offset applied); the root reports its mount time, as on Linux.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.state.lock().times.mtime_ns
     }
 
     fn rcu_walkable(&self) -> bool {

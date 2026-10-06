@@ -67,13 +67,81 @@ impl DirEntry {
 
 pub const LFN_ENTRY_LAST_MASK: u8 = 0x40;
 
-/// MS-DOS Date (bits 0-4: day, 5-8: month, 9-15: year offset from 1980)
-/// MS-DOS Time (bits 0-4: 2-second increments, 5-10: minutes, 11-15: hours)
-pub fn to_dos_time(_cycles: u64) -> (u16, u16) {
-    // NARF monotonic cycles to UTC/Local time is Stage 4 'time' crate scope.
-    // For now, return a fixed value or simple placeholder.
-    // Base: 1980-01-01 00:00:00 -> (0x0021, 0x0000)
-    (0x0021, 0x0000)
+/// Cumulative days before each month (index = month 1..12; 0 and 13..15
+/// are 0), Linux `fs/fat/misc.c::days_in_year`.
+const DAYS_IN_YEAR: [i64; 16] = [
+    0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 0, 0, 0,
+];
+const SECS_PER_MIN: i64 = 60;
+const SECS_PER_HOUR: i64 = 60 * 60;
+const SECS_PER_DAY: i64 = SECS_PER_HOUR * 24;
+/// Days from 1970-01-01 to 1980-01-01 (`DAYS_DELTA`).
+const DAYS_DELTA: i64 = 365 * 10 + 2;
+/// Year field value of 2100 (`YEAR_2100`), which is not a leap year.
+const YEAR_2100: i64 = 120;
+
+/// MS-DOS date (bits 0-4 day, 5-8 month, 9-15 years since 1980) and time
+/// (bits 0-4 two-second units, 5-10 minutes, 11-15 hours), plus the
+/// optional 10 ms create-time byte, to wall-clock nanoseconds since the
+/// epoch. Exactly Linux's `fat_time_fat2unix`: month 0 reads as January,
+/// day 0 as the 1st, out-of-range fields are not rejected, and
+/// `tz_offset_secs` (`fat_tz_offset`) is ADDED to the local time the
+/// fields hold. A result before the epoch (only reachable through a
+/// negative offset on 1980-01-01) clamps to 0, the stat layer's floor.
+pub fn fat_time_to_unix_ns(time: u16, date: u16, time_cs: u8, tz_offset_secs: i64) -> u64 {
+    let year = i64::from(date >> 9);
+    let month = core::cmp::max(1, (date >> 5) & 0xf) as usize;
+    let day = i64::from(core::cmp::max(1, date & 0x1f)) - 1;
+
+    let mut leap_day = (year + 3) / 4;
+    if year > YEAR_2100 {
+        // 2100 isn't a leap year.
+        leap_day -= 1;
+    }
+    let is_leap = (year & 3) == 0 && year != YEAR_2100;
+    if is_leap && month > 2 {
+        leap_day += 1;
+    }
+
+    let mut second = i64::from(time & 0x1f) << 1;
+    second += i64::from((time >> 5) & 0x3f) * SECS_PER_MIN;
+    second += i64::from(time >> 11) * SECS_PER_HOUR;
+    second += (year * 365 + leap_day + DAYS_IN_YEAR[month] + day + DAYS_DELTA) * SECS_PER_DAY;
+    second += tz_offset_secs;
+
+    let (sec, nsec) = if time_cs != 0 {
+        (
+            second + i64::from(time_cs / 100),
+            u64::from(time_cs % 100) * 10_000_000,
+        )
+    } else {
+        (second, 0)
+    };
+    if sec < 0 {
+        return 0;
+    }
+    sec as u64 * 1_000_000_000 + nsec
+}
+
+/// A FAT inode's times as Linux's `fat_fill_inode` builds them for vfat
+/// (NARF's driver always handles long names, so it is vfat): mtime from
+/// the write date/time with NO 10 ms field (that byte belongs to the
+/// creation time), ctime = mtime (they share one on-disk field), atime =
+/// the access DATE at local midnight. Nanoseconds since the epoch.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct FatTimes {
+    pub atime_ns: u64,
+    pub mtime_ns: u64,
+}
+
+impl FatTimes {
+    pub fn from_entry(entry: &DirEntry, tz_offset_secs: i64) -> Self {
+        let (wrt_time, wrt_date, acc_date) = (entry.wrt_time, entry.wrt_date, entry.lst_acc_date);
+        Self {
+            atime_ns: fat_time_to_unix_ns(0, acc_date, 0, tz_offset_secs),
+            mtime_ns: fat_time_to_unix_ns(wrt_time, wrt_date, 0, tz_offset_secs),
+        }
+    }
 }
 
 pub fn calculate_checksum(name: &[u8; 11]) -> u8 {

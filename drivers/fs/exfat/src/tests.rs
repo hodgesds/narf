@@ -777,3 +777,187 @@ fn smoke_exfat_set_checksum_5entry_set() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/exfat", smoke_exfat_set_checksum_5entry_set);
+
+// ── Timestamps ──────────────────────────────────────────────────────
+//
+// Linux `exfat_find` decodes each file entry time with
+// `exfat_get_entry_time` (mktime64 of the DOS-style fields, + the 10 ms
+// increment, UTC-offset byte applied when its VALID bit is set) and
+// `exfat_fill_inode` reports mtime = ctime = LastModified, atime =
+// LastAccessed. The root (`exfat_read_root`) is the mount time. The
+// driver used to report mtime 0 for every file and directory.
+
+const NS: u64 = 1_000_000_000;
+
+/// Pack an exFAT §7.4.8 timestamp: date in the high 16 bits, time low.
+const fn exfat_ts(y: u32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> u32 {
+    let date = ((y - 1980) << 9) | (mo << 5) | d;
+    let time = (h << 11) | (mi << 5) | (s / 2);
+    (date << 16) | time
+}
+
+/// The image's single §7.4 file entry (root directory cluster, slot 2).
+fn exfat_file_entry(img: &mut [u8]) -> &mut [u8] {
+    let root_lba =
+        (CLUSTER_HEAP_OFFSET + (ROOT_DIRECTORY_CLUSTER - 2) * SECTORS_PER_CLUSTER) as u64;
+    &mut lba_off(img, root_lba)[64..96]
+}
+
+/// Write create / modified / accessed timestamp, 10 ms and UTC-offset
+/// fields (§7.4.4-§7.4.10: offsets 8, 12, 16, 20, 21, 22, 23, 24).
+fn put_exfat_times(fe: &mut [u8], crt: (u32, u8, u8), modif: (u32, u8, u8), acc: (u32, u8)) {
+    write_le_u32(fe, 8, crt.0);
+    write_le_u32(fe, 12, modif.0);
+    write_le_u32(fe, 16, acc.0);
+    fe[20] = crt.1;
+    fe[21] = modif.1;
+    fe[22] = crt.2;
+    fe[23] = modif.2;
+    fe[24] = acc.1;
+}
+
+/// A file reports LastModified exactly — 10 ms increment and UTC offset
+/// applied — as mtime and ctime, and LastAccessed as atime; the create
+/// fields never leak into either.
+fn smoke_exfat_file_reports_exact_times() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::ExfatVolume;
+
+    let mut img = build_exfat_image("HELLO.TXT", b"hi\n");
+    put_exfat_times(
+        exfat_file_entry(&mut img),
+        (exfat_ts(2000, 2, 29, 12, 34, 56), 199, 0x80 | 0x3F),
+        // 2023-11-14 22:13:20 at UTC+2 (0x08 × 15 min) + 570 ms.
+        (exfat_ts(2023, 11, 14, 22, 13, 20), 57, 0x80 | 0x08),
+        // Offset byte without the VALID bit: decoded as UTC.
+        (exfat_ts(2023, 11, 15, 0, 0, 0), 0x08),
+    );
+    let device = RamBlockDevice::from_image(LBS as u32, img);
+    let volume = match poll_once(ExfatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let want_m = (1_700_000_000 - 7200) * NS + 570_000_000;
+    let attrs = file.inode_attrs();
+    if attrs.mtime_ns != want_m {
+        return TestResult::Fail("file mtime_ns is not LastModified in UTC with 10 ms");
+    }
+    if attrs.ctime_ns != want_m {
+        return TestResult::Fail("exFAT ctime must equal mtime (exfat_fill_inode)");
+    }
+    if attrs.atime_ns != 1_700_006_400 * NS {
+        return TestResult::Fail("file atime_ns is not LastAccessed");
+    }
+    if file.stat().mtime_cycles != narf_time::ns_to_cycles(want_m) {
+        return TestResult::Fail("Stat::mtime_cycles does not encode the mtime");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/exfat", smoke_exfat_file_reports_exact_times);
+
+/// A subdirectory reports its LastModified time through `dir_mtime_ns` and
+/// `inode_attrs`; the root, which has no file entry, reports the mount
+/// time (10 ms granularity, atime rounded down to 2 s) as Linux does.
+fn smoke_exfat_dir_reports_mtime() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::ExfatVolume;
+
+    let mut img = build_exfat_image("SUB", b"");
+    {
+        let fe = exfat_file_entry(&mut img);
+        write_le_u16(fe, 4, file_attr::DIRECTORY);
+        put_exfat_times(
+            fe,
+            (0, 0, 0),
+            (exfat_ts(2000, 2, 29, 12, 34, 56), 0, 0x80),
+            (exfat_ts(2000, 2, 29, 0, 0, 0), 0x80),
+        );
+    }
+    let device = RamBlockDevice::from_image(LBS as u32, img);
+    let before = narf_time::now_wall().as_nanos().max(0) as u64;
+    let volume = match poll_once(ExfatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let after = narf_time::now_wall().as_nanos().max(0) as u64;
+    let root = volume.root();
+    let sub = match poll_once(root.lookup_dir_async("sub")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup_dir sub failed"),
+    };
+    if sub.dir_mtime_ns() != 951_827_696 * NS {
+        return TestResult::Fail("subdirectory dir_mtime_ns is not LastModified");
+    }
+    let attrs = sub.inode_attrs();
+    if attrs.mtime_ns != 951_827_696 * NS || attrs.atime_ns != 951_782_400 * NS {
+        return TestResult::Fail("subdirectory InodeAttrs times are not exact");
+    }
+    let rm = root.dir_mtime_ns();
+    if rm < before - before % 10_000_000 || rm > after {
+        return TestResult::Fail("root mtime is not the mount time");
+    }
+    if rm % 10_000_000 != 0 || root.inode_attrs().mtime_ns != rm {
+        return TestResult::Fail("root mtime not truncated to the 10 ms granularity");
+    }
+    let rs = rm / NS;
+    if root.inode_attrs().atime_ns != (rs - rs % 2) * NS {
+        return TestResult::Fail("root atime not rounded down to 2 seconds");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/exfat", smoke_exfat_dir_reports_mtime);
+
+/// `exfat_get_entry_time` edges: the UTC-offset byte is a signed 7-bit
+/// count of 15-minute steps honoured only with bit 7 set; the mount's
+/// `time_offset` applies only without it; the 10 ms field spans 0-1.99 s;
+/// and out-of-range month/day go through `mktime64` (month 0 = previous
+/// December, day 0 = previous month's last day) rather than clamping.
+fn smoke_exfat_time_decode_edges() -> TestResult {
+    use crate::dir::exfat_time_to_unix_ns as get;
+
+    let ts = exfat_ts(2023, 11, 14, 22, 13, 20);
+    let base = 1_700_000_000u64;
+    let cases: [(u8, i64, u64); 6] = [
+        (0x00, 0, base),                   // no offset recorded
+        (0x08, 0, base),                   // low bits without VALID: ignored
+        (0x80 | 0x3F, 0, base - 63 * 900), // UTC+15:45 → subtract
+        (0x80 | 0x40, 0, base + 64 * 900), // UTC-16:00 → add
+        (0x80 | 0x7F, 0, base + 900),      // UTC-00:15
+        (0x00, 60, base - 3600),           // time_offset=60, no VALID
+    ];
+    for (tz, opt, want) in cases {
+        if get(tz, ts, 0, opt) != want * NS {
+            return TestResult::Fail("UTC-offset byte decoded wrong");
+        }
+    }
+    if get(0x80, ts, 0, 60) != base * NS {
+        return TestResult::Fail("time_offset applied despite a VALID offset byte");
+    }
+    if get(0x80, ts, 199, 0) != (base + 1) * NS + 990_000_000 {
+        return TestResult::Fail("10 ms increment of 199 decoded wrong");
+    }
+    if get(0x80, ts, 0, 0) % NS != 0 {
+        return TestResult::Fail("a zero 10 ms increment produced a fraction");
+    }
+    // 2001-00-01 → 2000-12-01; 2000-03-00 → 2000-02-29.
+    let month0 = ((2001 - 1980) << 9) | 1; // month field 0
+    if get(0x80, month0 << 16, 0, 0) != 975_628_800 * NS {
+        return TestResult::Fail("month 0 did not decode as the previous December");
+    }
+    let day0 = ((2000 - 1980) << 9) | (3 << 5);
+    if get(0x80, day0 << 16, 0, 0) != 951_782_400 * NS {
+        return TestResult::Fail("day 0 did not decode as the previous month's last day");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/exfat", smoke_exfat_time_decode_edges);

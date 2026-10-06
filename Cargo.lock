@@ -1000,6 +1000,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-time",
 ]
 
 [[package]]
@@ -1038,6 +1039,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1095,6 +1097,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1129,6 +1132,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
