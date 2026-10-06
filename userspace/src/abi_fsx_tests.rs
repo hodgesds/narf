@@ -5645,3 +5645,49 @@ fn smoke_abi_fsx_stat_reports_exact_mtime_ns() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_stat_reports_exact_mtime_ns);
+
+/// `link(2)` on a filesystem with no hard-link operation is EPERM
+/// (`fs/namei.c::vfs_link`: `if (!dir->i_op->link) return -EPERM;`), as on
+/// Linux's kernfs-backed sysfs. NARF answered EINVAL (the generic
+/// `Unsupported` mapping), which fontconfig's `FcAtomicLock` does not treat
+/// as "no hard links here", so it never fell back to its mkdir lock.
+fn smoke_abi_fsx_link_without_link_op_is_eperm() -> TestResult {
+    setup();
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let mnt = match registry().mount(&auth, "/abisys-link", narf_filesystem::SysFs::new()) {
+        Ok(h) => h,
+        Err(_) => {
+            teardown();
+            return TestResult::Fail("sysfs mount failed");
+        }
+    };
+    let old = b"/abisys-link/kernel/uevent_seqnum\0";
+    let new = b"/abisys-link/kernel/seqnum-alias\0";
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+    // aarch64 has linkat only; `vfs_link` is the same check either way.
+    let rc = if wired(Syscall::Link) {
+        call(
+            Syscall::Link.raw(),
+            a1(old.as_ptr() as u64, new.as_ptr() as u64),
+        )
+    } else {
+        call(
+            Syscall::Linkat.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                0,
+            ),
+        )
+    };
+    let _ = registry().unmount(&mnt, "/abisys-link");
+    teardown();
+    if rc != Some(EPERM) {
+        return TestResult::Fail("link on a filesystem without a link op was not EPERM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_link_without_link_op_is_eperm);

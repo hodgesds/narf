@@ -642,6 +642,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if target.is_dir() {
             return Err(FsError::InvalidPath);
         }
+        // `link(2)` onto an existing name is EEXIST (`filename_create`);
+        // `dir_insert` itself would add a duplicate dirent.
+        match self.dir_lookup(&parent_inode, name).await {
+            Ok(_) => return Err(FsError::Busy),
+            Err(FsError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
         self.dir_insert(
             parent_inode_no,
             &mut parent_inode,

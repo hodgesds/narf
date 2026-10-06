@@ -4283,6 +4283,12 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
             Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
                 ctx.set_return(errno_ret(EDQUOT))
             }
+            // Same filesystem, no hard-link support: `vfs_link`'s
+            // `if (!dir->i_op->link) return -EPERM;`. EXDEV is only for
+            // names on different mounts (checked before the link op).
+            Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
+                ctx.set_return(errno_ret(EPERM))
+            }
             _ => ctx.set_return(errno_ret(EXDEV)),
         }
         return;
@@ -4307,6 +4313,13 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         }
         Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
             ctx.set_return(errno_ret(EDQUOT))
+        }
+        // `vfs_link`: `if (!dir->i_op->link) return -EPERM;`. The generic
+        // `Unsupported` -> EINVAL mapping told fontconfig's FcAtomicLock its
+        // link(tmp, .LCK) was malformed instead of "no hard links here",
+        // which is the errno its mkdir-lock fallback keys on.
+        Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
+            ctx.set_return(errno_ret(EPERM))
         }
         // `fs/namei.c::vfs_link` surfaces the filesystem's own error rather
         // than a blanket one; the `-1` sentinel here reached userspace as

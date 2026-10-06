@@ -5275,3 +5275,58 @@ fn smoke_ext2_dir_reports_mtime() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_dir_reports_mtime);
+
+/// `link(2)` on ext2/ext4 gives the existing inode a second name and bumps
+/// `i_links_count` (`ext4_link`); a name that already exists is refused
+/// (EEXIST at the syscall layer). fontconfig's `FcAtomicLock` takes its
+/// cache lock with `link(tmp, .LCK)`, so an unsupported link broke locking.
+fn smoke_ext2_hardlink() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"x"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    // The fixture leaves i_links_count unset; compare against the starting
+    // value rather than assume 1.
+    let links_before = match poll_once(volume.read_inode(12)) {
+        Some(Ok(inode)) => inode.links_count,
+        _ => return TestResult::Fail("read of the data inode failed"),
+    };
+    if !matches!(poll_once(root.link("data", "alias")), Some(Ok(()))) {
+        return TestResult::Fail("link of an existing file failed");
+    }
+    let (Some(Ok(data)), Some(Ok(alias))) = (
+        poll_once(root.lookup_async("data")),
+        poll_once(root.lookup_async("alias")),
+    ) else {
+        return TestResult::Fail("a linked name did not resolve");
+    };
+    if data.ino() != alias.ino() {
+        return TestResult::Fail("the new link names a different inode");
+    }
+    match poll_once(volume.read_inode(data.ino() as u32)) {
+        Some(Ok(inode)) if inode.links_count == links_before + 1 => {}
+        _ => return TestResult::Fail("link did not raise i_links_count by one"),
+    }
+    if !matches!(
+        poll_once(root.link("data", "alias")),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("link onto an existing name was not refused");
+    }
+    if !matches!(
+        poll_once(root.link("missing", "x")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("link of a missing name did not report NotFound");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_hardlink);

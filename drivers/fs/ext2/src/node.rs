@@ -137,6 +137,28 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         }
     }
 
+    /// Give the inode named `old_name` in directory `old_parent` a second
+    /// name `new_name` in directory `new_parent` (same volume).
+    async fn hardlink_into(
+        &self,
+        old_parent: u32,
+        old_name: &str,
+        new_parent: u32,
+        new_name: &str,
+    ) -> Result<(), FsError> {
+        let parent_inode = self.volume.read_inode(old_parent).await?;
+        let (target, _) = self
+            .volume
+            .dir_lookup(&parent_inode, old_name.as_bytes())
+            .await?;
+        if target == 0 {
+            return Err(FsError::NotFound);
+        }
+        self.volume
+            .dir_hardlink(new_parent, new_name.as_bytes(), target)
+            .await
+    }
+
     /// `InodeAttrs` for this node from the cached on-disk inode: device plus
     /// exact atime/ctime/mtime, nanoseconds included. Nodes come out of
     /// `iget` with their inode cached; an uncached one reports device only
@@ -896,6 +918,40 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
             self.volume.dir_unlink(parent_ino, name.as_bytes()).await
         })
     }
+    /// `link(2)` within this directory: ext2/ext4 `ext4_link` adds a dirent
+    /// for the existing inode and bumps `i_links_count`.
+    fn link<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let _path_mutation = narf_filesystem::begin_path_mutation(self, &[new_name]);
+            let parent_ino = self.state.lock().inode_no;
+            self.hardlink_into(parent_ino, old_name, parent_ino, new_name)
+                .await
+        })
+    }
+
+    /// `link(2)` into another directory of the SAME volume. A directory of a
+    /// different filesystem is EXDEV territory, which the syscall resolves
+    /// before it gets here; refuse it rather than write a foreign inode
+    /// number into this volume.
+    fn link_to<'a>(
+        &'a self,
+        old_name: &'a str,
+        new_dir: &'a dyn DirOps,
+        new_name: &'a str,
+    ) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let (volume_id, _, new_parent) = new_dir.dcache_identity();
+            if volume_id != Arc::as_ptr(&self.volume) as *const () as usize {
+                return Err(FsError::Unsupported);
+            }
+            let new_parent = u32::try_from(new_parent).map_err(|_| FsError::InvalidData)?;
+            let _path_mutation = narf_filesystem::begin_path_mutation(new_dir, &[new_name]);
+            let old_parent = self.state.lock().inode_no;
+            self.hardlink_into(old_parent, old_name, new_parent, new_name)
+                .await
+        })
+    }
+
     fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);
