@@ -520,3 +520,191 @@ kernel_test_in!(
     "drivers/fs/fat",
     smoke_fat_create_write_read_unlink_round_trip
 );
+
+// ── Timestamps ──────────────────────────────────────────────────────
+//
+// Linux `fat_fill_inode` (vfat): mtime = ctime = `fat_time_fat2unix`
+// of the write date/time with no 10 ms part; atime = the access date at
+// local midnight; the root (`fat_read_root`) is all zero. NARF decodes
+// with `fat_tz_offset` = 0 (no `tz=`/`time_offset=`, no kernel timezone).
+// The driver used to report mtime 0 for everything and stamp 1980-01-01
+// on every metadata flush.
+
+const NS: u64 = 1_000_000_000;
+/// 2023-11-14 22:13:20 UTC (1_700_000_000) as a DOS date / time.
+const DOS_DATE_2023: u16 = (43 << 9) | (11 << 5) | 14;
+const DOS_TIME_2023: u16 = (22 << 11) | (13 << 5) | (20 / 2);
+const UNIX_2023: u64 = 1_700_000_000;
+/// 2000-02-29 12:34:56 UTC (951_827_696): a leap day.
+const DOS_DATE_LEAP: u16 = (20 << 9) | (2 << 5) | 29;
+const DOS_TIME_LEAP: u16 = (12 << 11) | (34 << 5) | (56 / 2);
+const UNIX_LEAP: u64 = 951_827_696;
+
+/// Root-directory slot `idx` of a [`build_fat12_image`] image.
+fn fat12_root_slot(img: &mut [u8], idx: usize) -> &mut [u8] {
+    let off = 3 * 512 + idx * 32;
+    &mut img[off..off + 32]
+}
+
+/// Set an SFN entry's create tenth/time/date, access date and write
+/// time/date (FATGEN §6 offsets 13, 14, 16, 18, 22, 24).
+fn put_fat_times(e: &mut [u8], crt: (u8, u16, u16), adate: u16, wrt: (u16, u16)) {
+    e[13] = crt.0;
+    e[14..16].copy_from_slice(&crt.1.to_le_bytes());
+    e[16..18].copy_from_slice(&crt.2.to_le_bytes());
+    e[18..20].copy_from_slice(&adate.to_le_bytes());
+    e[22..24].copy_from_slice(&wrt.0.to_le_bytes());
+    e[24..26].copy_from_slice(&wrt.1.to_le_bytes());
+}
+
+/// A file reports its write date/time exactly as mtime and ctime, its
+/// access date at midnight as atime; the create-time 10 ms byte does NOT
+/// leak into mtime; and a write's metadata flush leaves the on-disk write
+/// time alone instead of stamping a placeholder.
+fn smoke_fat_file_reports_exact_times() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    let mut img = build_fat12_image(128, b"narf\n");
+    let adate = (43 << 9) | (11 << 5) | 15; // 2023-11-15
+    put_fat_times(
+        fat12_root_slot(&mut img, 0),
+        (199, DOS_TIME_LEAP, DOS_DATE_LEAP),
+        adate,
+        (DOS_TIME_2023, DOS_DATE_2023),
+    );
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup NARF.TXT failed"),
+    };
+    let attrs = file.inode_attrs();
+    if attrs.mtime_ns != UNIX_2023 * NS {
+        return TestResult::Fail("file mtime_ns is not the DOS write date/time");
+    }
+    if attrs.ctime_ns != attrs.mtime_ns {
+        return TestResult::Fail("FAT ctime must equal mtime (one on-disk field)");
+    }
+    if attrs.atime_ns != 1_700_006_400 * NS {
+        return TestResult::Fail("file atime_ns is not the access date at midnight");
+    }
+    if file.stat().mtime_cycles != narf_time::ns_to_cycles(UNIX_2023 * NS) {
+        return TestResult::Fail("Stat::mtime_cycles does not encode the mtime");
+    }
+    // A write flushes the entry (size, cluster); the write time must survive.
+    if !matches!(poll_once(file.write(0, b"NARF\n")), Some(Ok(5))) {
+        return TestResult::Fail("write failed");
+    }
+    let again = match poll_once(root.lookup_async("NARF.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("re-lookup failed"),
+    };
+    if again.inode_attrs().mtime_ns != UNIX_2023 * NS {
+        return TestResult::Fail("metadata flush overwrote the on-disk write time");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_file_reports_exact_times);
+
+/// A subdirectory reports its entry's write time through `dir_mtime_ns`
+/// and `inode_attrs`; the root, which has no entry, is the epoch exactly
+/// as Linux's `fat_read_root` reports it.
+fn smoke_fat_dir_reports_mtime() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::FatVolume;
+
+    let mut img = build_fat12_image(128, b"narf\n");
+    // SUB → cluster 3 (sector 5), with "." and "..".
+    {
+        let e = fat12_root_slot(&mut img, 1);
+        e[0..11].copy_from_slice(b"SUB        ");
+        e[11] = 0x10; // DIRECTORY
+        e[26..28].copy_from_slice(&3u16.to_le_bytes());
+        put_fat_times(e, (0, 0, 0), 0, (DOS_TIME_LEAP, DOS_DATE_LEAP));
+    }
+    for &lba in &[1usize, 2usize] {
+        fat12_set(&mut img[lba * 512..lba * 512 + 512], 3, 0xFFF);
+    }
+    let sub_sec = 5 * 512;
+    img[sub_sec..sub_sec + 11].copy_from_slice(b".          ");
+    img[sub_sec + 11] = 0x10;
+    img[sub_sec + 26..sub_sec + 28].copy_from_slice(&3u16.to_le_bytes());
+    img[sub_sec + 32..sub_sec + 43].copy_from_slice(b"..         ");
+    img[sub_sec + 43] = 0x10;
+
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(FatVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    if root.dir_mtime_ns() != 0 || root.inode_attrs().mtime_ns != 0 {
+        return TestResult::Fail("FAT root must report the epoch, as Linux does");
+    }
+    let sub = match poll_once(root.lookup_dir_async("SUB")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup_dir SUB failed"),
+    };
+    if sub.dir_mtime_ns() != UNIX_LEAP * NS {
+        return TestResult::Fail("subdirectory dir_mtime_ns is not its write time");
+    }
+    let attrs = sub.inode_attrs();
+    if attrs.mtime_ns != UNIX_LEAP * NS || attrs.ctime_ns != UNIX_LEAP * NS {
+        return TestResult::Fail("subdirectory InodeAttrs times are not exact");
+    }
+    // An access date of 0 decodes like Linux: 1980-01-01 (month/day 0 → 1).
+    if attrs.atime_ns != 315_532_800 * NS {
+        return TestResult::Fail("zero access date did not decode as 1980-01-01");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_dir_reports_mtime);
+
+/// `fat_time_fat2unix` edges: 2-second resolution, the 10 ms field adds
+/// whole seconds plus centiseconds, 2000 is a leap year but 2100 is not,
+/// and the timezone offset is added to the local fields.
+fn smoke_fat_time_decode_edges() -> TestResult {
+    use crate::dir::fat_time_to_unix_ns as fat2unix;
+
+    // The seconds field counts 2-second units: 29 → :58, never :59.
+    let t = (23 << 11) | (59 << 5) | 29;
+    let d = (120 << 9) | (2 << 5) | 28; // 2100-02-28
+    if fat2unix(t, d, 0, 0) != 4_107_542_398 * NS {
+        return TestResult::Fail("2-second field not doubled");
+    }
+    // 2100 is not a leap year: Mar 1 follows Feb 28 directly.
+    if fat2unix(0, (120 << 9) | (3 << 5) | 1, 0, 0) != 4_107_542_400 * NS {
+        return TestResult::Fail("2100 treated as a leap year");
+    }
+    if fat2unix(DOS_TIME_LEAP, DOS_DATE_LEAP, 0, 0) != UNIX_LEAP * NS {
+        return TestResult::Fail("2000-02-29 decoded wrong");
+    }
+    // 10 ms units: 199 = +1 s +990 ms; 0 = no fraction.
+    if fat2unix(DOS_TIME_2023, DOS_DATE_2023, 199, 0) != (UNIX_2023 + 1) * NS + 990_000_000 {
+        return TestResult::Fail("10 ms create-time field decoded wrong");
+    }
+    if fat2unix(DOS_TIME_2023, DOS_DATE_2023, 0, 0) % NS != 0 {
+        return TestResult::Fail("a zero 10 ms field produced a fraction");
+    }
+    // time_offset=120 (local = UTC+2) → fat_tz_offset = -7200 s.
+    if fat2unix(DOS_TIME_2023, DOS_DATE_2023, 0, -7200) != (UNIX_2023 - 7200) * NS {
+        return TestResult::Fail("timezone offset not applied");
+    }
+    // Month 0 / day 0 clamp to January 1st, not to the previous month.
+    if fat2unix(0, 0, 0, 0) != 315_532_800 * NS {
+        return TestResult::Fail("zero date did not decode as 1980-01-01");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/fat", smoke_fat_time_decode_edges);

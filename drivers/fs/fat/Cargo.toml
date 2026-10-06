@@ -21,6 +21,7 @@ narf-memory       = { path = "../../../memory" }
 narf-block        = { path = "../../../block" }
 narf-filesystem   = { path = "../../../filesystem" }
 narf-io           = { path = "../../../io" }
+narf-time         = { path = "../../../time" }
 narf-init         = { path = "../../../init" }
 narf-scheduler    = { path = "../../../scheduler" }
 narf-kernel-test  = { path = "../../../verification/kernel-test" }
