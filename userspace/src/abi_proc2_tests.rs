@@ -304,11 +304,18 @@ fn smoke_abi_proc2_kcmp_distinct_order() -> TestResult {
         // handler returns the pointer-ordering 1 or 2 — the distinct-task arm
         // the base file (which only checks the equal-self → 0 path) misses.
         const KCMP_FILE: u64 = 0;
-        crate::handlers::register_pid_task_mapping(200, 200);
-        match call(Syscall::Kcmp.raw(), a3(FAKE_TASK, 200, KCMP_FILE, 0)) {
+        // A real (registered, live) second process at a synthetic id that
+        // cannot alias a boot task: kcmp's find_task_by_vpid needs a task.
+        const OTHER: u64 = 0xC9C9;
+        crate::task::release_task(OTHER);
+        let _ = crate::task::Task::new_registered(OTHER, OTHER);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        let r = match call(Syscall::Kcmp.raw(), a3(FAKE_TASK, OTHER, KCMP_FILE, 0)) {
             Some(1) | Some(2) => Ok(()),
             _ => Err("kcmp on distinct tasks did not return an ordering (1/2)"),
-        }
+        };
+        crate::task::release_task(OTHER);
+        r
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_kcmp_distinct_order);

@@ -153,6 +153,80 @@ fn smoke_abi_tid_setpgid_non_leader_einval() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_tid_setpgid_non_leader_einval);
 
+// ── kcmp — kernel/kcmp.c:146-149 lookups (ESRCH) precede the type switch ──
+fn smoke_abi_tid_kcmp_non_leader() -> TestResult {
+    const KCMP_VM: u64 = 1;
+    with_groups(|| {
+        set_task(LEADER_TASK);
+        // Threads of one group share one mm.
+        expect(
+            call(Syscall::Kcmp.raw(), a2(SIB_TID, GROUP_PID, KCMP_VM)),
+            0,
+            "kcmp(non-leader tid, its leader, KCMP_VM) must resolve both and report the shared mm",
+        )?;
+        expect(
+            call(Syscall::Kcmp.raw(), a2(ABSENT, GROUP_PID, 99)),
+            ESRCH,
+            "kcmp: ESRCH from the task lookup must precede the EINVAL type check",
+        )?;
+        expect(
+            call(Syscall::Kcmp.raw(), a2(SIB_TASK, GROUP_PID, KCMP_VM)),
+            ESRCH,
+            "kcmp accepted a raw TaskId",
+        )?;
+        expect(
+            call(Syscall::Kcmp.raw(), a2(GROUP_PID, GROUP_PID, 99)),
+            EINVAL,
+            "kcmp(valid, valid, bad type) must be EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_kcmp_non_leader);
+
+// ── get_robust_list — kernel/futex/syscalls.c:59 `find_task_by_vpid` ──────
+fn smoke_abi_tid_get_robust_list_non_leader() -> TestResult {
+    const HEAD: u64 = 0x7000_1000;
+    with_groups(|| {
+        set_task(SIB_TASK);
+        expect(
+            call(Syscall::SetRobustList.raw(), a1(HEAD, 24)),
+            0,
+            "set_robust_list on the sibling failed",
+        )?;
+        set_task(LEADER_TASK);
+        let mut head = 0u64;
+        let mut len = 0u64;
+        expect(
+            call(
+                Syscall::GetRobustList.raw(),
+                a2(
+                    SIB_TID,
+                    &mut head as *mut u64 as u64,
+                    &mut len as *mut u64 as u64,
+                ),
+            ),
+            0,
+            "get_robust_list(non-leader tid) failed",
+        )?;
+        if head != HEAD {
+            return Err("get_robust_list(non-leader tid) read the wrong task's list head");
+        }
+        expect(
+            call(
+                Syscall::GetRobustList.raw(),
+                a2(
+                    ABSENT,
+                    &mut head as *mut u64 as u64,
+                    &mut len as *mut u64 as u64,
+                ),
+            ),
+            ESRCH,
+            "get_robust_list(unused pid) must be ESRCH",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_get_robust_list_non_leader);
+
 // ── prlimit64 — kernel/sys.c:1751 `pid ? find_task_by_vpid(pid) : current` ─
 fn smoke_abi_tid_prlimit64_non_leader() -> TestResult {
     const RLIMIT_NOFILE: u64 = 7;
@@ -488,3 +562,39 @@ fn smoke_abi_tid_sched_priority_number_space() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_tid_sched_priority_number_space);
+
+// ── ptrace — kernel/ptrace.c:1398 find_get_task_by_vpid; ptrace_attach
+// `same_thread_group(task, current)` → EPERM ───────────────────────────────
+fn smoke_abi_tid_ptrace_attach_same_group() -> TestResult {
+    const PTRACE_ATTACH: u64 = 16;
+    with_groups(|| {
+        crate::ptrace::ptrace_init();
+        let r = (|| {
+            set_task(SIB_TASK);
+            expect(
+                call(Syscall::Ptrace.raw(), a2(PTRACE_ATTACH, GROUP_PID, 0)),
+                EPERM,
+                "PTRACE_ATTACH to the caller's own group leader must be EPERM",
+            )?;
+            set_task(LEADER_TASK);
+            expect(
+                call(Syscall::Ptrace.raw(), a2(PTRACE_ATTACH, SIB_TID, 0)),
+                EPERM,
+                "PTRACE_ATTACH to a sibling thread must be EPERM",
+            )?;
+            expect(
+                call(Syscall::Ptrace.raw(), a2(PTRACE_ATTACH, OTHER_SIB_TASK, 0)),
+                ESRCH,
+                "PTRACE_ATTACH accepted a raw TaskId",
+            )?;
+            expect(
+                call(Syscall::Ptrace.raw(), a2(PTRACE_ATTACH, ABSENT, 0)),
+                ESRCH,
+                "PTRACE_ATTACH(unused pid) must be ESRCH",
+            )
+        })();
+        crate::ptrace::ptrace_init();
+        r
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_ptrace_attach_same_group);

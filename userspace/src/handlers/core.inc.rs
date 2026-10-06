@@ -15823,7 +15823,9 @@ pub(crate) const CAP_SYS_PTRACE: u32 = 19;
 /// can restore it, so treating it as the caller's peer would hand over a
 /// process that is one `setuid` away from being root.
 pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
-    if caller == target {
+    // `kernel/ptrace.c:298`: `if (same_thread_group(task, current)) return 0;`
+    // — a thread may always inspect its own process, sibling threads included.
+    if same_thread_group(caller, target) {
         return true;
     }
     // `ptrace_has_cap`, consulted twice below. Capability over the whole
