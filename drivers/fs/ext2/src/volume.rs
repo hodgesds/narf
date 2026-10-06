@@ -525,6 +525,12 @@ async fn read_byte_range_into_static<B: BlockDevice>(
     device_read_into(device, io.lbs, io.scratch_bytes, &io.pool[0], byte_off, dst).await
 }
 
+/// A boxed future for the recursive block-tree walks (an `async fn` cannot
+/// recurse directly).
+pub(crate) type TreeFuture<'a, T> = core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<T, FsError>> + Send + 'a>,
+>;
+
 impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Mount an ext2 volume. Reads the superblock at byte offset
     /// 1024 (in 512-byte sectors that's LBA 2), validates the
@@ -2036,6 +2042,128 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode.size = 0;
         inode.blocks = 0;
         Ok(())
+    }
+
+    /// `ext4_truncate` for a shrink to a nonzero size: free every block
+    /// mapped at logical block `first` or beyond (`first` is the first block
+    /// wholly past the new EOF), with any tree block left mapping nothing.
+    /// `i_blocks` drops by what was released; `i_size` and the inode write
+    /// are the caller's.
+    pub(crate) async fn truncate_inode_from(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        first: u64,
+    ) -> Result<(), FsError> {
+        if inode.is_fast_symlink(self.block_size() as u32) {
+            return Ok(());
+        }
+        let freed = if self.superblock.uses_extents() && inode.uses_extents() {
+            // Logical block numbers are 32-bit in an extent tree.
+            let first = u32::try_from(first).unwrap_or(u32::MAX);
+            self.extent_free_from(inode_no, inode, first).await?
+        } else {
+            self.blockmap_free_from(inode, first).await?
+        };
+        inode.blocks = inode.blocks.saturating_sub(freed);
+        Ok(())
+    }
+
+    /// The block-map half of [`Self::truncate_inode_from`]
+    /// (`ext4_ind_truncate`). Returns the 512-byte sectors released.
+    async fn blockmap_free_from(&self, inode: &mut Inode, first: u64) -> Result<u32, FsError> {
+        use super::inode::{DOUBLE_IND_IDX, N_DIRECT, SINGLE_IND_IDX, TRIPLE_IND_IDX};
+        let spb = (self.block_size() / 512) as u32;
+        let p = self.pointers_per_block() as u64;
+        let mut freed = 0u32;
+        for slot in first.min(N_DIRECT as u64) as usize..N_DIRECT {
+            if inode.block[slot] != 0 {
+                self.free_block(u64::from(inode.block[slot])).await?;
+                inode.block[slot] = 0;
+                freed = freed.saturating_add(spb);
+            }
+        }
+        // Each indirect tree maps `span` logical blocks starting at `base`.
+        let mut base = N_DIRECT as u64;
+        let mut span = p;
+        for (slot, level) in [
+            (SINGLE_IND_IDX, 1u32),
+            (DOUBLE_IND_IDX, 2),
+            (TRIPLE_IND_IDX, 3),
+        ] {
+            let root = u64::from(inode.block[slot]);
+            if root != 0 && first < base.saturating_add(span) {
+                let (empty, sub) = self
+                    .blockmap_free_branch(root, level, first.saturating_sub(base))
+                    .await?;
+                freed = freed.saturating_add(sub);
+                if empty {
+                    self.free_block(root).await?;
+                    inode.block[slot] = 0;
+                    freed = freed.saturating_add(spb);
+                }
+            }
+            base = base.saturating_add(span);
+            span = span.saturating_mul(p);
+        }
+        Ok(freed)
+    }
+
+    /// Free the entries of the `level`-deep indirect block `block` that map
+    /// relative logical blocks `start` and beyond. Returns whether the block
+    /// now maps nothing (the caller frees it) and the sectors released below
+    /// it; a block that keeps entries is written back.
+    fn blockmap_free_branch<'a>(
+        &'a self,
+        block: u64,
+        level: u32,
+        start: u64,
+    ) -> TreeFuture<'a, (bool, u32)> {
+        alloc::boxed::Box::pin(async move {
+            let spb = (self.block_size() / 512) as u32;
+            let p = self.pointers_per_block() as u64;
+            let child_span = p.saturating_pow(level - 1);
+            let mut buf = vec![0u8; self.block_size()];
+            self.read_block(block, &mut buf).await?;
+            let mut freed = 0u32;
+            let mut changed = false;
+            let mut live = false;
+            for j in 0..p {
+                let off = j as usize * 4;
+                let ptr = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+                if ptr == 0 {
+                    continue;
+                }
+                let child_first = j.saturating_mul(child_span);
+                if child_first.saturating_add(child_span) <= start {
+                    // Wholly before the cut.
+                    live = true;
+                    continue;
+                }
+                let child = u64::from(ptr);
+                let empty = if level == 1 {
+                    true
+                } else {
+                    let (empty, sub) = self
+                        .blockmap_free_branch(child, level - 1, start.saturating_sub(child_first))
+                        .await?;
+                    freed = freed.saturating_add(sub);
+                    empty
+                };
+                if empty {
+                    self.free_block(child).await?;
+                    freed = freed.saturating_add(spb);
+                    buf[off..off + 4].fill(0);
+                    changed = true;
+                } else {
+                    live = true;
+                }
+            }
+            if live && changed {
+                self.write_block(block, &buf).await?;
+            }
+            Ok((!live, freed))
+        })
     }
 
     /// Free every pointer in a single-indirect block.

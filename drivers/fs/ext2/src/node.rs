@@ -624,8 +624,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
                     return Err(error);
                 }
             } else {
-                // Shrinking keeps the blocks past the new end allocated (no
-                // partial block-tree truncation yet); growing is size only.
+                // Growing is size only: the new range reads as a hole.
                 inode.size = new_size;
             }
             if len < old_size {
@@ -638,15 +637,31 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
                     self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
                     return Err(error);
                 }
+                // `truncate_pagecache`: drop every page wholly past the new
+                // EOF — BEFORE its blocks are freed, so no cached page can
+                // be written back into a block another file now owns.
+                self.mapping.remove_from(len.div_ceil(PAGE_SIZE as u64));
+                // `ext4_truncate`: release every block wholly past the new
+                // EOF. Keeping them mapped let the next extension read the
+                // pre-truncate bytes back (fsx: truncate down, then write
+                // past a hole or fallocate, then read).
+                if len != 0 {
+                    let first = len.div_ceil(self.volume.block_size() as u64);
+                    if let Err(error) = self
+                        .volume
+                        .truncate_inode_from(inode_no, &mut inode, first)
+                        .await
+                    {
+                        self.set_cached_inode(
+                            self.volume.read_inode(inode_no).await.unwrap_or(inode),
+                        );
+                        return Err(error);
+                    }
+                }
             }
             if let Err(error) = self.volume.write_inode(inode_no, &inode).await {
                 self.set_cached_inode(self.volume.read_inode(inode_no).await.unwrap_or(inode));
                 return Err(error);
-            }
-            if len < old_size {
-                // `truncate_pagecache`: drop every page wholly past the new
-                // EOF, so nothing beyond it can be read back from the cache.
-                self.mapping.remove_from(len.div_ceil(PAGE_SIZE as u64));
             }
             Ok(())
         })
