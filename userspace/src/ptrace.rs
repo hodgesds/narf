@@ -66,6 +66,16 @@ pub const NT_PRSTATUS: u64 = 1;
 /// SIGTRAP.
 pub const PTRACE_O_TRACESYSGOOD: u64 = 1;
 
+/// PTRACE_O_TRACEEXEC: report a successful execve as a PTRACE_EVENT_EXEC stop
+/// instead of the legacy SIGTRAP. The two are not interchangeable and they do
+/// not even arrive at the same point — see [`ptrace_report_exec`].
+pub const PTRACE_O_TRACEEXEC: u64 = 0x10;
+
+/// `PTRACE_EVENT_EXEC`, as it appears in a wait status: the stop signal is
+/// `SIGTRAP | (PTRACE_EVENT_EXEC << 8)`, so a tracer reads the event back as
+/// `status >> 16`.
+pub const PTRACE_EVENT_EXEC: u32 = 4;
+
 /// The set of PTRACE_SETOPTIONS bits Linux will accept, from
 /// `include/uapi/linux/ptrace.h`:
 ///
@@ -545,7 +555,7 @@ fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_ra
         // NUMBER here instead made strace pair the stops off by one and print
         // the number where the return value belongs — a traced `ppoll` read
         // `= 271`, which is `__NR_ppoll`.
-        pin_stop_rax(pid, (-(ENOSYS as i64)) as u64);
+        pin_stop_rax(pid, wire::ENOSYS as u64);
         // Advance to the exit phase; PTRACE_SYSCALL from the tracer
         // re-arms whichever phase comes next when it resumes us.
         set_syscall_stop_phase(pid, SyscallStopPhase::Exit);
@@ -619,8 +629,20 @@ pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
             return false;
         }
 
-        // Clear the pending bit so we don't process it again (it's intercepted)
+        // Dequeue the signal so it is not processed again — from BOTH sets,
+        // the way `dequeue_signal` does, because a signal sent to the PROCESS
+        // lives in the thread group's shared set and not in this thread's
+        // private one. Clearing only the private bit left a process-directed
+        // signal pending forever: it was re-delivered at every signal-delivery
+        // point, so a tracer stepping a tracee saw a signal-stop for it after
+        // every single syscall. `kill(getpid(), SIGSTOP)` is the ordinary way
+        // to raise one — it is how strace's own startup handshake works — so
+        // this hit the most common case there is.
         clear_pending_signal_bits(task, crate::handlers::sig_bit(signum));
+        clear_pending_signal_bits(
+            crate::handlers::shared_pending_key(task),
+            crate::handlers::sig_bit(signum),
+        );
 
         let tracer_tid = pid_to_tid(tracer_pid);
         // Put the task into ptrace stop!
@@ -628,6 +650,65 @@ pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
         true
     } else {
         false
+    }
+}
+
+/// Report a successful `execve` to the tracer, in the order Linux reports it.
+///
+/// There are TWO reports here, not one, and which comes first depends on
+/// `PTRACE_O_TRACEEXEC`. Measured on Linux 7.3 with a tracer stepping
+/// `PTRACE_SYSCALL` across `execve("/bin/true")` (`fedora-ptrace-probe.py`,
+/// case `execseq-*`), where `sys:N` is a syscall-stop for syscall N:
+///
+/// ```text
+/// without TRACEEXEC:  sys:59, sys:59, sig:5,  <new image's syscalls>
+/// with    TRACEEXEC:  sys:59, ev:4,   sys:59, <new image's syscalls>
+/// ```
+///
+/// So the execve syscall-EXIT stop happens either way — it is what prints
+/// `execve(...) = 0` — and the exec report is an event stop BEFORE it, or a
+/// SIGTRAP AFTER it. The difference in position is not arbitrary:
+/// `ptrace_event(PTRACE_EVENT_EXEC)` stops inside `begin_new_exec`, while the
+/// legacy `send_sig(SIGTRAP, current, 0)` merely queues a signal that is
+/// delivered later, in the exit-to-user loop that runs after the syscall-exit
+/// work.
+///
+/// NARF emitted only the first stop of either sequence: the exec path DIVERGES
+/// into the new image instead of returning through the syscall exit, so no
+/// exit stop was ever taken, and no exec report was sent at all. A tracer was
+/// left waiting for a stop that never came — `strace <cmd>` hung with its
+/// trace ending at the startup `--- stopped by SIGSTOP ---`.
+///
+/// Both halves must land together. Sending only the SIGTRAP was measured too:
+/// strace, still waiting for the exit stop, took the report for an ordinary
+/// signal and injected it, killing `/bin/true` with SIGTRAP. Half of this
+/// contract is worse than none of it.
+///
+/// Called after the point of no return and before the jump into the new image,
+/// which is where Linux's reports sit relative to the exec. Each stop parks
+/// and returns here when the tracer resumes, so the jump still happens.
+pub fn ptrace_report_exec(ctx: &mut dyn TrapContext) {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let task = current_task_id();
+    let pid = tid_to_pid(task);
+    let Some(tracer_pid) = get_task_tracer(pid) else {
+        return;
+    };
+    let tracer_tid = pid_to_tid(tracer_pid);
+    let trace_exec = ptrace_options(pid) & PTRACE_O_TRACEEXEC != 0;
+
+    const SIGTRAP: u32 = 5;
+    if trace_exec {
+        enter_ptrace_stopped(ctx, task, tracer_tid, SIGTRAP | (PTRACE_EVENT_EXEC << 8));
+    }
+    // The exec succeeded, so the syscall-exit stop must report 0 — the value
+    // userspace would have seen had this syscall returned normally.
+    ctx.set_return(SyscallReturn::ok(0));
+    ptrace_syscall_stop(ctx, false, u64::from(crate::syscall::Syscall::Execve.raw()));
+    if !trace_exec {
+        enter_ptrace_stopped(ctx, task, tracer_tid, SIGTRAP);
     }
 }
 
@@ -664,7 +745,14 @@ fn enter_ptrace_stopped_inner(
     // to the park leaves a zeroed deadline behind, and `park_should_block`
     // declines to block instead of stranding the tracee on u64::MAX. Setting it
     // afterwards would overwrite the resume's clear and lose the wake.
-    if let Some(uctx) = crate::user_task::current_user_task() {
+    //
+    // Gated on the YIELD HOOK as well as the task ctx, which is the same pair
+    // the park below requires: with no executor wired (the kernel-test
+    // context) this function returns WITHOUT parking, and arming a deadline
+    // that nothing will ever consume leaves the harness task asleep-forever
+    // from the next test onward.
+    let parking = crate::user_task::current_user_task().zip(crate::user_task::yield_hook());
+    if let Some((uctx, _)) = parking {
         // SAFETY: uctx is the current task's live ctx; this is an atomic store.
         unsafe {
             (*uctx).sleep_deadline_ns.store(u64::MAX, Ordering::Release);
@@ -675,10 +763,7 @@ fn enter_ptrace_stopped_inner(
     let wstatus = ((signum as i32) << 8) | 0x7f;
     push_stopcont_report(task, wstatus, false);
 
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
+    if let Some((uctx, hook)) = parking {
         // SAFETY: uctx is current task, yield hook never returns
         unsafe {
             let uc = &*uctx;

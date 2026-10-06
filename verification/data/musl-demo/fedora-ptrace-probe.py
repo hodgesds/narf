@@ -23,6 +23,12 @@ PTRACE_SYSCALL = 24
 REG_RAX = 10
 REG_ORIG_RAX = 15
 SYS_GETPID = 39
+SYS_EXECVE = 59
+PTRACE_SETOPTIONS = 0x4200
+PTRACE_O_TRACESYSGOOD = 0x01
+PTRACE_O_TRACEEXEC = 0x10
+PTRACE_EVENT_EXEC = 4
+SIGTRAP = 5
 ENOSYS = 38
 PTRACE_DETACH = 17
 PTRACE_ATTACH = 16
@@ -459,6 +465,67 @@ def strace_return_case(name, flags=(), budget=60):
     return f"{name}={verdict} write={asked}->{got} rc={proc.returncode}"
 
 
+def exec_stop_sequence(name, options):
+    """The exact sequence of stops a tracer sees across a traced execve.
+
+    This is the shape `strace <cmd>` drives, and the only way to implement it
+    correctly is to know precisely what Linux emits — so this case is written
+    to REPORT the sequence rather than to assert a guess, and the build host
+    answers it as the oracle.
+
+    Each stop is rendered as what a tracer can actually discriminate on:
+    `sys:<nr>` for a syscall-stop (SIGTRAP|0x80 under TRACESYSGOOD, with the
+    syscall number from orig_rax), `ev:<n>` for a PTRACE_EVENT_* stop, and
+    `sig:<n>` for an ordinary signal-stop.
+    """
+    regs = (ctypes.c_ulong * 27)()
+    child = os.fork()
+    if child == 0:
+        try:
+            ptrace(PTRACE_TRACEME, 0)
+            os.kill(os.getpid(), signal.SIGSTOP)
+            os.execv("/bin/true", ["/bin/true"])
+        finally:
+            os._exit(127)
+
+    seq = []
+    try:
+        _, status = os.waitpid(child, 0)
+        if not os.WIFSTOPPED(status):
+            return f"{name}=tracee never stopped"
+        if ptrace(PTRACE_SETOPTIONS, child, 0, options)[0] != 0:
+            return f"{name}=PTRACE_SETOPTIONS rejected"
+        for _ in range(40):
+            if ptrace(PTRACE_SYSCALL, child)[0] != 0:
+                seq.append("resume-rejected")
+                break
+            _, status = os.waitpid(child, 0)
+            if os.WIFEXITED(status):
+                seq.append(f"exit:{os.WEXITSTATUS(status)}")
+                break
+            if os.WIFSIGNALED(status):
+                seq.append(f"killed:{os.WTERMSIG(status)}")
+                break
+            sig = os.WSTOPSIG(status)
+            event = status >> 16
+            if event:
+                seq.append(f"ev:{event}")
+            elif sig == (SIGTRAP | 0x80):
+                nr = "?"
+                if ptrace(PTRACE_GETREGS, child, 0, ctypes.addressof(regs))[0] == 0:
+                    nr = regs[REG_ORIG_RAX]
+                seq.append(f"sys:{nr}")
+            else:
+                seq.append(f"sig:{sig}")
+    finally:
+        try:
+            os.kill(child, signal.SIGKILL)
+            os.waitpid(child, __WALL)
+        except OSError:
+            pass
+    return f"{name}=" + ",".join(seq)
+
+
 def proc_state(path):
     """The state letter from a /proc stat line (the field after `(comm)`)."""
     try:
@@ -488,6 +555,12 @@ def main():
     # PTRACE_O_TRACECLONE/TRACEFORK/TRACEVFORK, a different path from a bare
     # TRACEME+exec, so both are run.
     observations = [
+        exec_stop_sequence(
+            "execseq-sysgood", PTRACE_O_TRACESYSGOOD
+        ),
+        exec_stop_sequence(
+            "execseq-traceexec", PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEEXEC
+        ),
         strace_return_case("strace-plain"),
         strace_return_case("strace-follow", flags=("-f",)),
     ]

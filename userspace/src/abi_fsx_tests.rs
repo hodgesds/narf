@@ -5686,7 +5686,23 @@ fn smoke_abi_fsx_link_without_link_op_is_eperm() -> TestResult {
     let _ = registry().unmount(&mnt, "/abisys-link");
     teardown();
     if rc != Some(EPERM) {
-        return TestResult::Fail("link on a filesystem without a link op was not EPERM");
+        // Name the answer we DID get. "not EPERM" alone cannot tell a
+        // wrong-but-plausible errno from the path never resolving, and the
+        // message has to be a `&'static str` to reach the run summary — the
+        // mid-test console write that would carry a formatted value lands in
+        // the part of the serial log the harness truncates.
+        return TestResult::Fail(match rc {
+            Some(v) if v == EINVAL => "link without a link op: EINVAL, not EPERM",
+            Some(v) if v == ENOENT => "link without a link op: ENOENT, not EPERM",
+            Some(v) if v == EACCES => "link without a link op: EACCES, not EPERM",
+            Some(v) if v == ENOMEM => "link without a link op: ENOMEM, not EPERM",
+            Some(v) if v == EROFS => "link without a link op: EROFS, not EPERM",
+            Some(v) if v == EEXIST => "link without a link op: EEXIST, not EPERM",
+            Some(v) if v == ENOSYS => "link without a link op: ENOSYS, not EPERM",
+            Some(0) => "link without a link op SUCCEEDED",
+            Some(_) => "link without a link op: another errno, not EPERM",
+            None => "link without a link op returned nothing",
+        });
     }
     TestResult::Pass
 }

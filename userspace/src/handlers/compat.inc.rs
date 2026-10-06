@@ -2440,6 +2440,12 @@ fn do_execve_resolved(
     // the binary actually being mapped (the interpreter for scripts).
     set_proc_exe(task, &cur_path);
 
+    // Tell the tracer the exec happened — the exec report AND the execve
+    // syscall-exit stop, in whichever order this tracer's options ask for.
+    // Placed after the point of no return and before the jump into the new
+    // image, matching where Linux's own reports sit. See `ptrace_report_exec`.
+    crate::ptrace::ptrace_report_exec(ctx);
+
 
     // Step 5: swap the scheduler slot's AS Arc. Without this the
     // poll path's later activate() would still target the old AS
