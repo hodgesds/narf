@@ -99,6 +99,70 @@ fn smoke_abi_fdio2_dev_fd_reopens_pipe() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_dev_fd_reopens_pipe);
 
+/// bash's process substitution exactly: `pipe`, move the read end to fd 63
+/// with `fcntl(F_DUPFD, 63)`, close the original, then the redirect opens
+/// `/dev/fd/63`. CachyOS's `paccache` (`mapfile < <(pacman-conf CacheDir)`)
+/// failed here with "/dev/fd/63: No such file or directory". `chrooted`
+/// repeats it under `chroot("/")`, which is how pacman runs its hooks.
+fn dev_fd_reopens_dupfd_pipe(chrooted: bool) -> Result<(), &'static str> {
+    const F_DUPFD: u64 = 0;
+    let (rd, wr) = make_pipe2()?;
+    crate::mqueue::forget_fd_path(FAKE_TASK, rd);
+    let moved = match call(Syscall::Fcntl.raw(), a2(rd as u64, F_DUPFD, 63)) {
+        Some(fd) if fd >= 63 => fd as u32,
+        _ => return Err("fcntl(F_DUPFD, 63) on the pipe reader failed"),
+    };
+    if call(Syscall::Close.raw(), a0(rd as u64)) != Some(0) {
+        return Err("closing the original pipe reader failed");
+    }
+    let payload = *b"pacman-conf";
+    if call(
+        Syscall::Write.raw(),
+        a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+    ) != Some(payload.len() as i64)
+    {
+        return Err("writing the process-substitution pipe failed");
+    }
+    if chrooted {
+        let root = b"/\0";
+        if call(Syscall::Chroot.raw(), a0(root.as_ptr() as u64)) != Some(0) {
+            return Err("chroot(\"/\") failed");
+        }
+    }
+    let path = alloc::format!("/dev/fd/{moved}\0");
+    let reopened = match call(
+        Syscall::Openat.raw(),
+        a3((-100_i64) as u64, path.as_ptr() as u64, 0, 0),
+    ) {
+        Some(fd) if fd >= 0 => fd as u32,
+        _ => return Err("openat(/dev/fd/<F_DUPFD'd pipe>) did not reopen the pipe"),
+    };
+    let mut got = [0u8; 11];
+    if call(
+        Syscall::Read.raw(),
+        a2(reopened as u64, got.as_mut_ptr() as u64, got.len() as u64),
+    ) == Some(got.len() as i64)
+        && got == payload
+    {
+        Ok(())
+    } else {
+        Err("/dev/fd reopen of an F_DUPFD'd pipe did not read the pipe")
+    }
+}
+
+fn smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe() -> TestResult {
+    with_setup(|| dev_fd_reopens_dupfd_pipe(false))
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe);
+
+fn smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe_in_chroot() -> TestResult {
+    with_setup(|| dev_fd_reopens_dupfd_pipe(true))
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio2_dev_fd_reopens_dupfd_pipe_in_chroot
+);
+
 /// A non-canonical x86_64 user VA: bit 48 set, bits 49..=62 clear. The
 /// kernel's `validate_user_range` rejects it with EFAULT before any
 /// dereference, so it is a deterministic "bad pointer" in this harness.
