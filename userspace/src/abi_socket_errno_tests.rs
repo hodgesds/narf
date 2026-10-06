@@ -467,6 +467,44 @@ kernel_test_in!(
     smoke_abi_socket_bluetooth_monitor
 );
 
+/// L2CAP/RFCOMM/SCO protocol-family surface: per-protocol socket-type rules
+/// (ESOCKTNOSUPPORT), sockaddr bind, and a hardware-gated connect that fails.
+fn smoke_abi_socket_bluetooth_conn_family() -> TestResult {
+    with_setup(|| {
+        // L2CAP (proto 0) accepts SOCK_SEQPACKET.
+        let l2 = open(AF_BLUETOOTH, SOCK_SEQPACKET, 0)?;
+        // RFCOMM (proto 3) requires SOCK_STREAM.
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_SEQPACKET, 3)) != Some(ESOCKTNOSUPPORT) {
+            return Err("RFCOMM non-STREAM must be ESOCKTNOSUPPORT");
+        }
+        let rc = open(AF_BLUETOOTH, SOCK_STREAM, 3)?;
+        // SCO (proto 2) requires SOCK_SEQPACKET.
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_STREAM, 2)) != Some(ESOCKTNOSUPPORT) {
+            return Err("SCO non-SEQPACKET must be ESOCKTNOSUPPORT");
+        }
+        let sco = open(AF_BLUETOOTH, SOCK_SEQPACKET, 2)?;
+        // bind a sockaddr_l2 (family + psm + bdaddr + cid + bdaddr_type = 13).
+        let mut addr = [0u8; 13];
+        addr[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        addr[2..4].copy_from_slice(&0x1001u16.to_le_bytes()); // l2_psm
+        if bind(l2, &addr) != Some(0) {
+            return Err("L2CAP bind failed");
+        }
+        // connect needs a controller + reachable peer: it must fail here.
+        if connect(l2, &addr).is_none_or(|r| r >= 0) {
+            return Err("hardware-gated L2CAP connect should fail");
+        }
+        close(l2);
+        close(rc);
+        close(sco);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_conn_family
+);
+
 /// `inet_create`: SOCK_RAW without CAP_NET_RAW → EPERM (after the protocol
 /// lookup, so a bad protocol is still EPROTONOSUPPORT).
 /// `__inet_bind`: a port below 1024 without CAP_NET_BIND_SERVICE → EACCES.
