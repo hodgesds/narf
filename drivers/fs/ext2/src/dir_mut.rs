@@ -420,7 +420,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         uid: u32,
         gid: u32,
     ) -> Result<u32, FsError> {
-        let _update = self.inode_update_lock.lock().await;
+        let _update = self.lock_inode_updates().await;
         let now = Ext2Volume::<B>::now_secs();
         // Allocate inode + initialise with timestamps.
         let new_ino = self.alloc_inode().await?;
@@ -469,7 +469,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         name: &[u8],
         mode: u16,
     ) -> Result<u32, FsError> {
-        let _update = self.inode_update_lock.lock().await;
+        let _update = self.lock_inode_updates().await;
         let now = Ext2Volume::<B>::now_secs();
         let bs = self.block_size();
         // Allocate the inode + a data block.
@@ -543,7 +543,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Remove a file dirent. Decrements the target's link count; if
     /// it drops to zero, frees its blocks + inode slot.
     pub async fn dir_unlink(&self, parent_inode_no: u32, name: &[u8]) -> Result<(), FsError> {
-        let _update = self.inode_update_lock.lock().await;
+        let _update = self.lock_inode_updates().await;
         let now = Ext2Volume::<B>::now_secs();
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -574,9 +574,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         parent_inode.touch_ctime_mtime(now);
         self.write_inode(parent_inode_no, &parent_inode).await?;
         if target.links_count == 0 {
-            self.truncate_inode(&mut target).await?;
-            self.write_inode(target_ino, &target).await?;
-            self.free_inode(target_ino).await?;
+            self.release_unlinked(target_ino, &mut target).await?;
         } else {
             self.write_inode(target_ino, &target).await?;
         }
@@ -588,7 +586,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// (rmdir invalidates the slot — `.` and `..` are removed
     /// implicitly when the block is freed).
     pub async fn dir_rmdir(&self, parent_inode_no: u32, name: &[u8]) -> Result<(), FsError> {
-        let _update = self.inode_update_lock.lock().await;
+        let _update = self.lock_inode_updates().await;
         let now = Ext2Volume::<B>::now_secs();
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -632,7 +630,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         name: &[u8],
         target_ino: u32,
     ) -> Result<(), FsError> {
-        let _update = self.inode_update_lock.lock().await;
+        let _update = self.lock_inode_updates().await;
         let now = Ext2Volume::<B>::now_secs();
         let mut parent_inode = self.read_inode(parent_inode_no).await?;
         if !parent_inode.is_dir() {
@@ -682,7 +680,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         new_parent_inode_no: u32,
         new_name: &[u8],
     ) -> Result<(), FsError> {
-        let _update = self.inode_update_lock.lock().await;
+        let _update = self.lock_inode_updates().await;
         let now = Ext2Volume::<B>::now_secs();
         // Look up the source so we know what to splice into the dest.
         let old_parent = self.read_inode(old_parent_inode_no).await?;
@@ -756,9 +754,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 victim_inode.links_count = victim_inode.links_count.saturating_sub(1);
                 victim_inode.touch_ctime(now);
                 if victim_inode.links_count == 0 {
-                    self.truncate_inode(&mut victim_inode).await?;
-                    self.write_inode(victim_ino, &victim_inode).await?;
-                    self.free_inode(victim_ino).await?;
+                    self.release_unlinked(victim_ino, &mut victim_inode).await?;
                 } else {
                     self.write_inode(victim_ino, &victim_inode).await?;
                 }
@@ -840,7 +836,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         name: &[u8],
         target: &[u8],
     ) -> Result<u32, FsError> {
-        let _update = self.inode_update_lock.lock().await;
+        let _update = self.lock_inode_updates().await;
         let now = Ext2Volume::<B>::now_secs();
         if target.is_empty() {
             return Err(FsError::InvalidPath);

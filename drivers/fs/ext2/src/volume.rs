@@ -325,6 +325,10 @@ pub struct Ext2Volume<B: BlockDevice + 'static> {
     /// evicted when its last `Arc` drops (`Ext2Node::drop` removes its own
     /// entry). Never held while a node is dropped or across an `.await`.
     icache: IrqSafeSpinLock<BTreeMap<u32, Weak<super::node::Ext2Node<B>>>>,
+    /// Unlinked inodes whose last node has dropped and which are not yet
+    /// released (Linux's deferred `iput_final`). Drained by
+    /// [`Self::lock_inode_updates`].
+    orphans: IrqSafeSpinLock<Vec<u32>>,
     /// Source of node incarnations; see [`Self::new_file_mapping`].
     incarnations: core::sync::atomic::AtomicU32,
     /// Serializes whole-inode read/modify/write sequences. Directory
@@ -674,6 +678,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             page_cache: page_cache.clone(),
             bdev_mapping: BlockMapping::new(page_cache, 0),
             icache: IrqSafeSpinLock::new(BTreeMap::new()),
+            orphans: IrqSafeSpinLock::new(Vec::new()),
             incarnations: core::sync::atomic::AtomicU32::new(1),
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
@@ -1334,6 +1339,83 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             0,
             (u64::from(incarnation) << 32) | u64::from(inode_no),
         )
+    }
+
+    /// Queue an orphaned inode whose last node just dropped.
+    pub(crate) fn queue_orphan(&self, inode_no: u32) {
+        self.orphans.lock().push(inode_no);
+    }
+
+    /// Pop one queued orphan. A function of its own so the queue's guard is
+    /// gone before the caller's `.await` (a `while let` scrutinee would hold
+    /// it through the loop body).
+    fn pop_orphan(&self) -> Option<u32> {
+        self.orphans.lock().pop()
+    }
+
+    /// Take `inode_update_lock`, releasing any orphaned inodes first. Every
+    /// whole-inode update goes through here, so an inode unlinked while open
+    /// is released at the first update after its last reference drops.
+    pub(crate) async fn lock_inode_updates(&self) -> narf_lib::mutex::MutexGuard<'_, ()> {
+        let guard = self.inode_update_lock.lock().await;
+        while let Some(inode_no) = self.pop_orphan() {
+            if self.release_orphan(inode_no).await.is_err() {
+                // Keep it for the next update rather than leak it; the update
+                // the caller is about to make is unrelated and goes ahead.
+                self.queue_orphan(inode_no);
+                break;
+            }
+        }
+        guard
+    }
+
+    async fn release_orphan(&self, inode_no: u32) -> Result<(), FsError> {
+        // A node made live again since (by inode number) carries the release
+        // to its own drop.
+        if let Some(node) = self.icache_get(inode_no) {
+            node.mark_orphaned();
+            return Ok(());
+        }
+        let mut inode = self.read_inode(inode_no).await?;
+        // Linked again while open (`linkat` of an `O_TMPFILE`): it lives on.
+        if inode.links_count != 0 {
+            return Ok(());
+        }
+        self.truncate_inode(&mut inode).await?;
+        self.write_inode(inode_no, &inode).await?;
+        self.free_inode(inode_no).await
+    }
+
+    /// The inode's last link is gone (`links_count == 0`, not yet written).
+    /// Free it now when nothing holds it; otherwise persist the link count
+    /// and leave the inode, its size and its blocks to the last reference,
+    /// as Linux's `iput_final` does. Caller holds `inode_update_lock`.
+    ///
+    /// LINUX-GAP: ext4 also threads such an inode onto the on-disk orphan
+    /// list (`s_last_orphan`) so a crash before the release is recovered at
+    /// mount. NARF does not; e2fsck reclaims the inode instead.
+    pub(crate) async fn release_unlinked(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+    ) -> Result<(), FsError> {
+        debug_assert_eq!(inode.links_count, 0);
+        if let Some(node) = self.icache_get(inode_no) {
+            self.write_inode(inode_no, inode).await?;
+            node.mark_orphaned();
+            // Ours may have been the last reference; release it now if so.
+            drop(node);
+            while let Some(queued) = self.pop_orphan() {
+                if let Err(error) = self.release_orphan(queued).await {
+                    self.queue_orphan(queued);
+                    return Err(error);
+                }
+            }
+            return Ok(());
+        }
+        self.truncate_inode(inode).await?;
+        self.write_inode(inode_no, inode).await?;
+        self.free_inode(inode_no).await
     }
 
     /// `evict`: forget the icache entry of `inode_no` if it still names the

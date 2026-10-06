@@ -71,11 +71,21 @@ pub struct Ext2Node<B: BlockDevice + 'static> {
     /// incarnation as well as the inode number, so a freed-and-reused inode
     /// number can never alias a still-live node's pages.
     mapping: FileMapping,
+    /// Its last link went while this node was live (Linux: `i_nlink == 0`
+    /// with references outstanding). The inode and its blocks are released
+    /// when the node drops, not at unlink.
+    orphaned: core::sync::atomic::AtomicBool,
 }
 
 impl<B: BlockDevice + 'static> Drop for Ext2Node<B> {
     fn drop(&mut self) {
         self.volume.icache_evict(self.inode_no, self as *const Self);
+        // `iput_final` -> `ext2_evict_inode`: an unlinked inode is released
+        // with its last reference. Dropping cannot do I/O, so hand it to the
+        // volume, which releases it under the next inode update.
+        if self.orphaned.load(core::sync::atomic::Ordering::Acquire) {
+            self.volume.queue_orphan(self.inode_no);
+        }
         // `evict` -> `truncate_inode_pages_final`: the in-memory inode's
         // pages go with it.
         self.mapping.remove_from(0);
@@ -91,6 +101,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             inode_no,
             self_weak: self_weak.clone(),
             mapping,
+            orphaned: core::sync::atomic::AtomicBool::new(false),
             state: IrqSafeSpinLock::new(Ext2NodeState {
                 inode_no,
                 stat: Self::stat_from_inode(&volume, &inode),
@@ -98,6 +109,12 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             }),
             volume,
         })
+    }
+
+    /// Defer this inode's release to the drop of the node (see `orphaned`).
+    pub(crate) fn mark_orphaned(&self) {
+        self.orphaned
+            .store(true, core::sync::atomic::Ordering::Release);
     }
 
     /// Replace the cached inode with what was just written to disk. Called
@@ -385,7 +402,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         first_page: u64,
         end_page: u64,
     ) -> Result<(), FsError> {
-        let _update = self.volume.inode_update_lock.lock().await;
+        let _update = self.volume.lock_inode_updates().await;
         let dirty = self.mapping.take_dirty(first_page, end_page);
         if dirty.is_empty() {
             return Ok(());
@@ -492,7 +509,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 
     fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
-            let _update = self.volume.inode_update_lock.lock().await;
+            let _update = self.volume.lock_inode_updates().await;
             // Mutations start from the current on-disk inode.
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
@@ -582,7 +599,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let new_size = u32::try_from(len).map_err(|_| FsError::InvalidData)?;
-            let _update = self.volume.inode_update_lock.lock().await;
+            let _update = self.volume.lock_inode_updates().await;
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
             if inode.is_dir() {
@@ -644,7 +661,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 
     fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let _update = self.volume.inode_update_lock.lock().await;
+            let _update = self.volume.lock_inode_updates().await;
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
             inode.uid = uid;
@@ -666,7 +683,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let _update = self.volume.inode_update_lock.lock().await;
+            let _update = self.volume.lock_inode_updates().await;
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
             inode.mode = (inode.mode & S_IFMT) | (perms & 0o7777);
@@ -831,7 +848,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
 
     fn set_dir_mode_async<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let _update = self.volume.inode_update_lock.lock().await;
+            let _update = self.volume.lock_inode_updates().await;
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
             inode.mode = (inode.mode & S_IFMT) | (perms & 0o7777);
@@ -851,7 +868,7 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
 
     fn set_dir_owners_async<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let _update = self.volume.inode_update_lock.lock().await;
+            let _update = self.volume.lock_inode_updates().await;
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
             inode.uid = uid;
@@ -1110,7 +1127,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         use super::volume::xattr;
         use narf_filesystem::PosixAcl;
         let (index, suffix) = xattr::split_name(name).ok_or(FsError::Unsupported)?;
-        let _update = self.volume.inode_update_lock.lock().await;
+        let _update = self.volume.lock_inode_updates().await;
         let inode_no = self.state.lock().inode_no;
         let inode = self.volume.read_inode(inode_no).await?;
         let st = self.volume.xattr_load(inode_no).await?;

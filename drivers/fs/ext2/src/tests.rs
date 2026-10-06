@@ -5304,6 +5304,75 @@ kernel_test_in!(
     smoke_ext2_truncate_then_extend_reads_zeros
 );
 
+/// Removing the last link of an inode something still holds must not free it
+/// (`ext2_evict_inode` runs from `iput_final`, at the LAST reference). The
+/// unlinked inode keeps its size, data and inode number until then, so an
+/// open descriptor still reads it and a `MAP_SHARED` mapping still faults it
+/// in. KDE's KSharedDataCache depends on exactly this: it unlinks a corrupted
+/// cache while other processes have it mapped. Freeing at unlink zeroed the
+/// size under plasmashell's mapping (SIGBUS on its next write) and handed the
+/// inode number and blocks to the replacement file.
+fn smoke_ext2_unlink_keeps_an_open_inode_until_its_last_reference() -> TestResult {
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let content = [0x5au8; 6000];
+    let device = GatedCountingBlock::new(testing::hard_link_image(&content));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    // The fixture names the inode twice; drop both names.
+    if !matches!(poll_once(root.unlink("data")), Some(Ok(())))
+        || !matches!(poll_once(root.unlink("link")), Some(Ok(())))
+    {
+        return TestResult::Fail("unlink failed");
+    }
+    if file.stat().size != 6000 {
+        return TestResult::Fail("unlinking the last name zeroed an open inode's size");
+    }
+    let mut buf = [0u8; 6000];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000)))
+        || buf.iter().any(|&b| b != 0x5a)
+    {
+        return TestResult::Fail("an open, unlinked inode no longer reads its data");
+    }
+    if file.mmap_fault(4096).is_err() {
+        return TestResult::Fail("a mapping of an open, unlinked inode was refused");
+    }
+    // The inode number is still in use: a new file must get another one.
+    let fresh = match poll_once(root.create("fresh")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if fresh.ino() == u64::from(testing::FILE_INO) {
+        return TestResult::Fail("an open, unlinked inode number was reused");
+    }
+    // The last reference goes: the inode is released, so the next
+    // allocation can have its number again.
+    drop(file);
+    let again = match poll_once(root.create("again")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create after the last reference failed"),
+    };
+    if again.ino() != u64::from(testing::FILE_INO) {
+        return TestResult::Fail("dropping the last reference did not release the inode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_unlink_keeps_an_open_inode_until_its_last_reference
+);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font
