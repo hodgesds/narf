@@ -6821,18 +6821,44 @@ pub fn proc_task_info(
     if !live {
         return None;
     }
+    // The group's mm — Linux `proc_mem_open` -> `mm_access(task)` reads
+    // `task->mm`, which every CLONE_THREAD sibling shares. The run-queue scan
+    // misses a task while some CPU is polling it, so:
+    //   1. the leader's slot, when it is queued;
+    //   2. the READER's own mm when the reader belongs to this thread group
+    //      (CLONE_THREAD implies CLONE_VM, so it is the same AddressSpace).
+    //      Keying this on `tid == current` alone left a sibling thread reading
+    //      /proc/self/maps with NO mm whenever the leader was running on
+    //      another CPU — an empty maps file, which glibc's
+    //      pthread_getattr_np turns into ENOENT;
+    //   3. any other queued member of the group.
+    // An unrelated reader never falls back to its own mm.
+    let reader_in_group = tid == current || task_to_pid_raw(current) == Some(pid);
+    let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
+        .or_else(|| {
+            if reader_in_group {
+                current_address_space()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            crate::task::thread_group_tids(pid)
+                .into_iter()
+                .filter(|&member| member != tid)
+                .find_map(|member| narf_scheduler::address_space_of(narf_scheduler::TaskId(member)))
+        });
     // brk top — the break is ADDRESS-SPACE state now (not per-task), so read it
-    // off the task's AS. This also gives every CLONE_VM thread the same `[heap]`
+    // off the group's AS. This also gives every CLONE_VM thread the same `[heap]`
     // range in its /proc/<tid>/maps (per-task keying showed threads no heap).
-    let brk_top = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
-        .map(|as_arc| as_arc.brk_top())
-        .unwrap_or(0);
+    let brk_top = as_arc.as_ref().map(|as_arc| as_arc.brk_top()).unwrap_or(0);
     // Stack top — the exclusive high end of the user-stack region. Read
-    // it off the task's AS (like `brk_top` above): the loader jitters the
+    // it off the group's AS (like `brk_top` above): the loader jitters the
     // stack top per exec (`kaslr::user_stack_top`), so a fixed constant
     // here would report a startstack the process never had. Falls back to
     // the nominal top for a task whose AS predates a loader run.
-    let stack_top = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
+    let stack_top = as_arc
+        .as_ref()
         .map(|as_arc| as_arc.stack_top())
         .filter(|&t| t != 0)
         .unwrap_or(crate::process::DEFAULT_USER_STACK_TOP);
@@ -6849,15 +6875,6 @@ pub fn proc_task_info(
     // cmdline — argv preserved at exec time. Empty for bare-spawn
     // tasks (initramfs init / shell) until their argv is recorded.
     let cmdline = proc_argv_of(pid);
-    let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).or_else(|| {
-        // Currently-polling task isn't in the queue scan; fall back to the
-        // active-AS slot.
-        if tid == current_task_id() {
-            narf_scheduler::current_address_space()
-        } else {
-            None
-        }
-    });
     let memory_stats = as_arc
         .as_ref()
         .map(|as_arc| as_arc.memory_stats())
