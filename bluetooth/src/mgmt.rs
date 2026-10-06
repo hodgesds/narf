@@ -11,7 +11,10 @@
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+
+use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::controller;
 
@@ -25,12 +28,22 @@ const OP_READ_VERSION: u16 = 0x0001;
 const OP_READ_COMMANDS: u16 = 0x0002;
 const OP_READ_INDEX_LIST: u16 = 0x0003;
 const OP_READ_INFO: u16 = 0x0004;
+const OP_SET_POWERED: u16 = 0x0005;
+const OP_SET_DISCOVERABLE: u16 = 0x0006;
+const OP_SET_CONNECTABLE: u16 = 0x0007;
+const OP_SET_FAST_CONNECTABLE: u16 = 0x0008;
+const OP_SET_BONDABLE: u16 = 0x0009;
+const OP_SET_LINK_SECURITY: u16 = 0x000a;
+const OP_SET_SSP: u16 = 0x000b;
+const OP_SET_LE: u16 = 0x000d;
+const OP_SET_SECURE_CONN: u16 = 0x002d;
 
 // Events (mgmt.h MGMT_EV_*).
 const EV_CMD_COMPLETE: u16 = 0x0001;
 const EV_CMD_STATUS: u16 = 0x0002;
 const EV_INDEX_ADDED: u16 = 0x0004;
 const EV_INDEX_REMOVED: u16 = 0x0005;
+const EV_NEW_SETTINGS: u16 = 0x0006;
 
 // Status codes (mgmt.h MGMT_STATUS_*).
 const STATUS_SUCCESS: u8 = 0x00;
@@ -41,11 +54,35 @@ const STATUS_INVALID_INDEX: u8 = 0x11;
 // Controller settings bitmap (mgmt.h MGMT_SETTING_*).
 const SETTING_POWERED: u32 = 1 << 0;
 const SETTING_CONNECTABLE: u32 = 1 << 1;
+const SETTING_FAST_CONNECTABLE: u32 = 1 << 2;
+const SETTING_DISCOVERABLE: u32 = 1 << 3;
 const SETTING_BONDABLE: u32 = 1 << 4;
+const SETTING_LINK_SECURITY: u32 = 1 << 5;
 const SETTING_SSP: u32 = 1 << 6;
 const SETTING_BREDR: u32 = 1 << 7;
 const SETTING_LE: u32 = 1 << 9;
 const SETTING_SECURE_CONN: u32 = 1 << 11;
+
+/// Per-controller current settings bitmap, keyed by HCI index. A controller
+/// comes up configured (BR/EDR + LE capable) but not powered, matching how
+/// mgmt reports an adapter before SET_POWERED.
+static SETTINGS: IrqSafeSpinLock<BTreeMap<u16, u32>> = IrqSafeSpinLock::new(BTreeMap::new());
+const DEFAULT_SETTINGS: u32 = SETTING_BREDR | SETTING_LE;
+
+fn current_settings(index: u16) -> u32 {
+    *SETTINGS.lock().entry(index).or_insert(DEFAULT_SETTINGS)
+}
+
+fn set_setting_bit(index: u16, bit: u32, on: bool) -> u32 {
+    let mut table = SETTINGS.lock();
+    let settings = table.entry(index).or_insert(DEFAULT_SETTINGS);
+    if on {
+        *settings |= bit;
+    } else {
+        *settings &= !bit;
+    }
+    *settings
+}
 
 /// Advertised mgmt protocol version/revision (`MGMT_VERSION` / `MGMT_REVISION`).
 const MGMT_VERSION: u8 = 1;
@@ -86,28 +123,46 @@ fn cmd_status(index: u16, opcode: u16, status: u8) -> Vec<u8> {
 /// `mgmt_rp_read_info` for a controller: bdaddr(6) version(1) manufacturer(2)
 /// supported_settings(4) current_settings(4) dev_class(3) name(249)
 /// short_name(11).
-fn read_info_rp(info: &controller::ControllerInfo) -> Vec<u8> {
+/// Settings this profile lets userspace toggle (supported_settings).
+const SUPPORTED_SETTINGS: u32 = SETTING_POWERED
+    | SETTING_CONNECTABLE
+    | SETTING_FAST_CONNECTABLE
+    | SETTING_DISCOVERABLE
+    | SETTING_BONDABLE
+    | SETTING_LINK_SECURITY
+    | SETTING_SSP
+    | SETTING_BREDR
+    | SETTING_LE
+    | SETTING_SECURE_CONN;
+
+fn read_info_rp(info: &controller::ControllerInfo, current: u32) -> Vec<u8> {
     let mut d = Vec::with_capacity(
         6 + 1 + 2 + 4 + 4 + 3 + MGMT_MAX_NAME_LENGTH + MGMT_MAX_SHORT_NAME_LENGTH,
     );
     d.extend_from_slice(&info.bd_addr);
     d.push(info.hci_version);
     d.extend_from_slice(&info.manufacturer.to_le_bytes());
-    let supported = SETTING_POWERED
-        | SETTING_CONNECTABLE
-        | SETTING_BONDABLE
-        | SETTING_SSP
-        | SETTING_BREDR
-        | SETTING_LE
-        | SETTING_SECURE_CONN;
-    d.extend_from_slice(&supported.to_le_bytes());
-    // Not powered until SET_POWERED (wired in the next stage).
-    let current = SETTING_BREDR | SETTING_LE;
+    d.extend_from_slice(&SUPPORTED_SETTINGS.to_le_bytes());
     d.extend_from_slice(&current.to_le_bytes());
     d.extend_from_slice(&[0u8; 3]); // dev_class
     d.extend_from_slice(&[0u8; MGMT_MAX_NAME_LENGTH]);
     d.extend_from_slice(&[0u8; MGMT_MAX_SHORT_NAME_LENGTH]);
     d
+}
+
+/// A mode-setting command (`SET_POWERED`/`SET_CONNECTABLE`/…): validate the
+/// index + the `mgmt_mode` value, toggle `bit`, and reply with the new
+/// current-settings bitmap. `max_val` is 1 for on/off modes, 2 for the
+/// limited-discoverable case.
+fn set_mode(index: u16, opcode: u16, params: &[u8], bit: u32, max_val: u8) -> Vec<u8> {
+    if (index as usize) >= controller::controller_count() {
+        return cmd_status(index, opcode, STATUS_INVALID_INDEX);
+    }
+    if params.is_empty() || params[0] > max_val {
+        return cmd_status(index, opcode, STATUS_INVALID_PARAMS);
+    }
+    let settings = set_setting_bit(index, bit, params[0] != 0);
+    cmd_complete(index, opcode, STATUS_SUCCESS, &settings.to_le_bytes())
 }
 
 /// Handle one mgmt command frame (as received on an `HCI_CHANNEL_CONTROL`
@@ -124,6 +179,7 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
     if command.len() < MGMT_HDR_SIZE + len {
         return alloc::vec![cmd_status(index, opcode, STATUS_INVALID_PARAMS)];
     }
+    let params = &command[MGMT_HDR_SIZE..MGMT_HDR_SIZE + len];
 
     match opcode {
         OP_READ_VERSION => {
@@ -144,12 +200,22 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
                 OP_READ_COMMANDS,
                 OP_READ_INDEX_LIST,
                 OP_READ_INFO,
+                OP_SET_POWERED,
+                OP_SET_DISCOVERABLE,
+                OP_SET_CONNECTABLE,
+                OP_SET_FAST_CONNECTABLE,
+                OP_SET_BONDABLE,
+                OP_SET_LINK_SECURITY,
+                OP_SET_SSP,
+                OP_SET_LE,
+                OP_SET_SECURE_CONN,
             ];
             let events = [
                 EV_CMD_COMPLETE,
                 EV_CMD_STATUS,
                 EV_INDEX_ADDED,
                 EV_INDEX_REMOVED,
+                EV_NEW_SETTINGS,
             ];
             let mut data = Vec::new();
             data.extend_from_slice(&(ops.len() as u16).to_le_bytes());
@@ -178,11 +244,31 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
             let controllers = controller::controllers();
             match controllers.get(index as usize) {
                 Some(c) => {
-                    let data = read_info_rp(&c.info());
+                    let data = read_info_rp(&c.info(), current_settings(index));
                     alloc::vec![cmd_complete(index, opcode, STATUS_SUCCESS, &data)]
                 }
                 None => alloc::vec![cmd_status(index, opcode, STATUS_INVALID_INDEX)],
             }
+        }
+        OP_SET_POWERED => alloc::vec![set_mode(index, opcode, params, SETTING_POWERED, 1)],
+        OP_SET_CONNECTABLE => {
+            alloc::vec![set_mode(index, opcode, params, SETTING_CONNECTABLE, 1)]
+        }
+        OP_SET_FAST_CONNECTABLE => {
+            alloc::vec![set_mode(index, opcode, params, SETTING_FAST_CONNECTABLE, 1)]
+        }
+        OP_SET_BONDABLE => alloc::vec![set_mode(index, opcode, params, SETTING_BONDABLE, 1)],
+        OP_SET_LINK_SECURITY => {
+            alloc::vec![set_mode(index, opcode, params, SETTING_LINK_SECURITY, 1)]
+        }
+        OP_SET_SSP => alloc::vec![set_mode(index, opcode, params, SETTING_SSP, 1)],
+        OP_SET_LE => alloc::vec![set_mode(index, opcode, params, SETTING_LE, 1)],
+        OP_SET_SECURE_CONN => {
+            alloc::vec![set_mode(index, opcode, params, SETTING_SECURE_CONN, 1)]
+        }
+        // Limited discoverable (val 2) is accepted; the timeout field is ignored.
+        OP_SET_DISCOVERABLE => {
+            alloc::vec![set_mode(index, opcode, params, SETTING_DISCOVERABLE, 2)]
         }
         _ => alloc::vec![cmd_status(index, opcode, STATUS_UNKNOWN_COMMAND)],
     }
@@ -258,4 +344,67 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/mgmt", smoke_mgmt_unknown_command_and_index_list);
+
+    fn smoke_mgmt_set_powered_toggles_settings() -> TestResult {
+        use crate::transport::LoopbackTransport;
+        use alloc::sync::Arc;
+
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+        SETTINGS.lock().clear();
+
+        let transport: Arc<dyn crate::transport::HciTransport> =
+            Arc::new(LoopbackTransport::new("mgmt-set"));
+        crate::transport::register(transport.clone());
+        let index =
+            controller::register_ready_transport(transport, controller::ControllerInfo::default())
+                as u16;
+
+        let cleanup = || {
+            crate::transport::__test_reset();
+            controller::__test_reset_controllers();
+            SETTINGS.lock().clear();
+        };
+
+        // SET_POWERED(1) → CMD_COMPLETE carrying the new settings with POWERED.
+        let on = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
+        let r = &on[0];
+        let powered_on = u16::from_le_bytes([r[0], r[1]]) == EV_CMD_COMPLETE
+            && u16::from_le_bytes([r[6], r[7]]) == OP_SET_POWERED
+            && r[8] == STATUS_SUCCESS
+            && u32::from_le_bytes([r[9], r[10], r[11], r[12]]) & SETTING_POWERED != 0;
+
+        // READ_INFO current_settings (offset 22) reflects POWERED.
+        let info = handle(&mgmt_cmd(OP_READ_INFO, index, &[]));
+        let ib = &info[0];
+        let current = u32::from_le_bytes([ib[22], ib[23], ib[24], ib[25]]);
+        let info_powered = current & SETTING_POWERED != 0;
+
+        // SET_POWERED(0) clears it.
+        let off = handle(&mgmt_cmd(OP_SET_POWERED, index, &[0]));
+        let o = &off[0];
+        let powered_off = u32::from_le_bytes([o[9], o[10], o[11], o[12]]) & SETTING_POWERED == 0;
+
+        // An out-of-range mode value is INVALID_PARAMS.
+        let bad = handle(&mgmt_cmd(OP_SET_POWERED, index, &[5]));
+        let bad_params = u16::from_le_bytes([bad[0][0], bad[0][1]]) == EV_CMD_STATUS
+            && bad[0][8] == STATUS_INVALID_PARAMS;
+
+        cleanup();
+
+        if !powered_on {
+            return TestResult::Fail("SET_POWERED(1) did not set POWERED in the reply");
+        }
+        if !info_powered {
+            return TestResult::Fail("READ_INFO current_settings did not reflect POWERED");
+        }
+        if !powered_off {
+            return TestResult::Fail("SET_POWERED(0) did not clear POWERED");
+        }
+        if !bad_params {
+            return TestResult::Fail("SET_POWERED with a bad value was not INVALID_PARAMS");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_set_powered_toggles_settings);
 }
