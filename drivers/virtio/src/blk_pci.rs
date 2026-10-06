@@ -1397,6 +1397,9 @@ impl<'a> ReqGate<'a> {
             // when there is no stackful task to yield (e.g. early boot, or a
             // non-x86_64 build without the own-stack model).
             if !narf_scheduler::cooperative_yield() {
+                // Can't yield: drain pending TLB shootdowns while spinning
+                // (see `narf_lib::sync::service_masked_spin`).
+                narf_lib::sync::service_masked_spin();
                 core::hint::spin_loop();
             }
         }
