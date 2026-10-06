@@ -422,6 +422,26 @@ pub fn report_quiescent() {
     qsbr::report_quiescent();
 }
 
+/// Hand grace-period-expired destructors to a worker instead of running them
+/// inline at the quiescent point that found them (see
+/// [`qsbr::set_reclaim_offload`]).
+#[inline]
+pub fn set_reclaim_offload(wake: fn()) {
+    qsbr::set_reclaim_offload(wake);
+}
+
+/// Undo [`set_reclaim_offload`]: implicit drains run destructors inline.
+#[inline]
+pub fn clear_reclaim_offload() {
+    qsbr::clear_reclaim_offload();
+}
+
+/// Run every destructor handed to the reclaim worker; returns how many ran.
+#[inline]
+pub fn run_offloaded_reclaim() -> usize {
+    qsbr::run_offloaded_reclaim()
+}
+
 /// Lock-free watchdog snapshot of active CPUs that have not crossed a QSBR
 /// quiescent boundary within `threshold_ns`.
 #[inline]

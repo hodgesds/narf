@@ -89,6 +89,24 @@ fn kswapd_wake(node: usize) {
     }
 }
 
+/// RCU reclaim offload hook (`narf_rcu::set_reclaim_offload`). Called by the
+/// QSBR drain when it hands grace-period-expired destructors off, at most once
+/// per batch (the drain coalesces). It only spawns: the destructors then run
+/// in that task — interrupts enabled, no caller's driver gate or lock held,
+/// and with its own stack, so a destructor that finds a device gate busy can
+/// `cooperative_yield` until the holder finishes. Linux runs RCU callbacks
+/// from softirq / the rcuo kthreads for the same reason.
+#[cfg(not(any(
+    feature = "kernel-test",
+    feature = "boot-smoke",
+    feature = "idt-selftest"
+)))]
+fn rcu_reclaim_kick() {
+    let _ = narf_scheduler::spawn_stackful(async {
+        let _ = narf_rcu::run_offloaded_reclaim();
+    });
+}
+
 /// The per-node kswapd / OOM-reaper kthread (kswapd0, kswapd1, …) — the wakeable reclaimer NARF's watermarks
 /// launch. Linux's kswapd is event-driven: the allocator wakes it when a zone
 /// falls below its low watermark, and it reclaims until the zone is balanced at
@@ -4709,6 +4727,12 @@ fn run_async_demo() -> ! {
         "  scheduler: ready queues already live (no re-init)"
     );
 
+    // RCU reclaim offload: from here on, grace-period-expired destructors run
+    // in a task the drain spawns, never inline at the quiescent point that
+    // found them (which may sit inside a driver wait holding its gate). Before
+    // this point — early boot, before the ready queues — drains stay inline.
+    narf_rcu::set_reclaim_offload(rcu_reclaim_kick);
+
     // Spawn one wakeable kswapd/OOM-reaper kthread per online NUMA node
     // (`kswapd0`, `kswapd1`, … — matching Linux), now that the scheduler's
     // ready queues are live and BEFORE `run_until_empty` (with boot-init the
@@ -4988,7 +5012,7 @@ fn boot_userspace_init() {
         {
             return;
         }
-        let _ = narf_scheduler::poll_one_round();
+        let _ = narf_scheduler::poll_one_round_nested();
         IN_FLIGHT.store(false, Ordering::Release);
     }
     // Nested-only: the executor-step pump advances spawned tasks when a

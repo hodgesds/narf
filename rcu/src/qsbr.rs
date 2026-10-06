@@ -155,7 +155,7 @@ pub fn report_quiescent() {
     }
     cell.last_quiescent_ns
         .store(narf_time::monotonic_ns(), Ordering::Release);
-    drain_local_bucket(cell);
+    drain_local_bucket(cell, false);
 }
 
 /// Return a bitmask of active CPUs whose latest QSBR quiescent report is at
@@ -217,9 +217,119 @@ pub fn report_idle() {
     if cell.active_readers.load(Ordering::Acquire) != 0 {
         return;
     }
-    drain_local_bucket(cell);
+    drain_local_bucket(cell, false);
     cell.last_quiescent.store(u64::MAX, Ordering::Release);
     cell.last_quiescent_ns.store(0, Ordering::Release);
+}
+
+// ── Reclaim offload ─────────────────────────────────────────────────
+//
+// Linux runs RCU callbacks from softirq or the rcuo kthreads, never inline in
+// whatever code happened to pass a quiescent state. QSBR here used to run every
+// ready destructor inline from `report_quiescent`, which is reached from
+// frames that hold driver gates and locks; a freed VirGL buffer's `Drop`
+// re-took the GPU request gate its caller held and the CPU spun forever.
+//
+// With a wake hook installed, the implicit drains (`report_quiescent`,
+// `report_idle`) splice grace-period-expired nodes onto one global pending
+// list and call the hook, which runs `run_offloaded_reclaim` from a plain
+// task. `OFFLOAD_KICKED` coalesces: the hook fires only on the clear→set
+// transition, so one worker run covers any number of nodes. Without a hook
+// (early boot, kernel tests) drains stay inline. The explicit grace-period
+// waits (`sync_until`, `SyncFuture`) keep their "dropped on return" contract by
+// also running the pending list.
+
+/// Wake hook (`fn()`), or 0 when none is installed.
+static OFFLOAD_WAKE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Grace-period-expired nodes awaiting the worker (intrusive, via `next`).
+static OFFLOADED: core::sync::atomic::AtomicPtr<DeferHdr> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+/// Set when the worker has been woken and has not yet taken the list.
+static OFFLOAD_KICKED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Install the reclaim worker's wake hook. The hook must be cheap and must not
+/// run destructors itself: it is called from the drain, i.e. from whatever
+/// frame reported quiescence.
+pub fn set_reclaim_offload(wake: fn()) {
+    OFFLOAD_WAKE.store(wake as usize, Ordering::Release);
+}
+
+/// Remove the wake hook: implicit drains run destructors inline again.
+/// Already-offloaded nodes stay queued for `run_offloaded_reclaim`.
+pub fn clear_reclaim_offload() {
+    OFFLOAD_WAKE.store(0, Ordering::Release);
+}
+
+/// Run every offloaded destructor; returns how many ran. Called by the worker
+/// the hook woke, and by the explicit grace-period waits.
+pub fn run_offloaded_reclaim() -> usize {
+    // Clear the kick BEFORE taking the list: a push that lands after the take
+    // sees the flag clear and wakes a fresh run, so no node is stranded.
+    OFFLOAD_KICKED.store(false, Ordering::Release);
+    let list = OFFLOADED.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    // SAFETY: every node on the list was spliced on by `offload_or_run` after
+    // its grace period elapsed, and the swap above made this call its sole
+    // owner.
+    unsafe { run_droppers(list) }
+}
+
+/// Run each node's dropper; returns how many ran.
+///
+/// # Safety
+/// `list` is a chain of nodes whose grace period has elapsed and which the
+/// caller exclusively owns.
+unsafe fn run_droppers(mut list: *mut DeferHdr) -> usize {
+    let mut ran = 0usize;
+    while !list.is_null() {
+        // SAFETY: per the contract — an owned, reclaimable node. `dropper`
+        // was installed by `alloc_node` for this node's own `T`.
+        unsafe {
+            let next = (*list).next;
+            if let Some(f) = (*list).dropper {
+                f(list);
+            }
+            list = next;
+        }
+        ran += 1;
+    }
+    ran
+}
+
+/// Hand `ready` (owned, grace period elapsed) to the worker, or run it inline
+/// when no worker hook is installed.
+fn offload_or_run(ready: *mut DeferHdr) {
+    if ready.is_null() {
+        return;
+    }
+    let hook = OFFLOAD_WAKE.load(Ordering::Acquire);
+    if hook == 0 {
+        // SAFETY: `ready` is owned and reclaimable (caller contract).
+        unsafe { run_droppers(ready) };
+        return;
+    }
+    // SAFETY: the chain is exclusively owned; walking and relinking it races
+    // nothing until the publishing CAS below.
+    unsafe {
+        let mut tail = ready;
+        while !(*tail).next.is_null() {
+            tail = (*tail).next;
+        }
+        let mut head = OFFLOADED.load(Ordering::Relaxed);
+        loop {
+            (*tail).next = head;
+            match OFFLOADED.compare_exchange_weak(head, ready, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(current) => head = current,
+            }
+        }
+    }
+    if !OFFLOAD_KICKED.swap(true, Ordering::AcqRel) {
+        // SAFETY: only `set_reclaim_offload` stores this cell, always with a
+        // `fn()` cast to usize.
+        let wake: fn() = unsafe { core::mem::transmute::<usize, fn()>(hook) };
+        wake();
+    }
 }
 
 // ── Deferred-drop enqueue / drain ───────────────────────────────────
@@ -262,7 +372,9 @@ pub(crate) fn defer_node(node: *mut DeferHdr) {
     });
 }
 
-fn drain_local_bucket(cell: &CpuCell) {
+/// `inline`: run ready destructors here (the explicit grace-period waits) or
+/// hand them to the reclaim worker when one is installed (implicit drains).
+fn drain_local_bucket(cell: &CpuCell, inline: bool) {
     let min_q = min_last_quiescent();
     // Phase 1 — IRQ-masked: DETACH the whole list. Masking makes this CPU
     // the sole accessor of its own `UnsafeCell` bucket; without it an IRQ
@@ -329,22 +441,16 @@ fn drain_local_bucket(cell: &CpuCell) {
         });
     }
 
-    // Phase 4 — IRQs enabled: run the droppers. Deliberately NOT under the
-    // mask: a dropper is arbitrary `Drop` code that may be slow or re-enter
-    // `defer_node` (retiring something further), which must be free to take
-    // its own mask and splice.
-    while !ready.is_null() {
-        // SAFETY: the node's grace period has elapsed — every CPU reported
-        // quiescence past its retirement epoch — so no reader is viewing it.
-        // `dropper` was installed by `alloc_node` for this node's own `T`.
-        // SAFETY: Valid memory or trusted environment
-        unsafe {
-            let next = (*ready).next;
-            if let Some(f) = (*ready).dropper {
-                f(ready);
-            }
-            ready = next;
-        }
+    // Phase 4 — outside the mask: a dropper is arbitrary `Drop` code that may
+    // be slow or re-enter `defer_node` (retiring something further), which
+    // must be free to take its own mask and splice. Every node on `ready` has
+    // an elapsed grace period: every CPU reported quiescence past its
+    // retirement epoch, so no reader is viewing it.
+    if inline {
+        // SAFETY: `ready` is owned and reclaimable (above).
+        unsafe { run_droppers(ready) };
+    } else {
+        offload_or_run(ready);
     }
 }
 
@@ -472,8 +578,11 @@ pub fn sync_until(deadline_ns: u64) -> bool {
     }
 
     // Only this CPU's bucket: each CPU drains its own at its own quiescent
-    // points, and reaching in would race the owner's `UnsafeCell`.
-    drain_local_bucket(cell);
+    // points, and reaching in would race the owner's `UnsafeCell`. Then the
+    // offloaded list: the quiescent reports above may have handed this
+    // wait's nodes to the worker, and `sync` promises they are dropped.
+    drain_local_bucket(cell, true);
+    let _ = run_offloaded_reclaim();
     true
 }
 
@@ -519,7 +628,8 @@ impl Future for SyncFuture {
         // Outer poll itself is a quiescent moment on this CPU.
         report_quiescent();
         if all_cpus_past(this.target) {
-            drain_local_bucket(this_cpu());
+            drain_local_bucket(this_cpu(), true);
+            let _ = run_offloaded_reclaim();
             return Poll::Ready(());
         }
         // No poll cap. Completing after 64 polls regardless told the

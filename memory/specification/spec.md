@@ -515,6 +515,16 @@ impl AddressSpace {
     /// `AddressSpaceError::ReclaimPressure(ReclaimTicket)` only after its page
     /// claim and all address-space/allocator locks have been released;
     /// `Unmapped` and `OutOfRange` retain their non-reclaim meanings.
+    ///
+    /// A FILE_DEMAND page comes from the hook installed with
+    /// `install_file_fault_hook(fn(u64) -> Result<u64, FileFaultError>)`,
+    /// whose error keeps Linux's `vm_fault_t` meaning:
+    /// `FileFaultError::NoOwner` → `Unmapped` (SIGSEGV);
+    /// `FileFaultError::Bus` → `AddressSpaceError::Bus` — the file refused a
+    /// mapped page (past EOF, out of space, I/O error; `VM_FAULT_SIGBUS`),
+    /// delivered as SIGBUS/BUS_ADRERR; `FileFaultError::NoMemory` →
+    /// `ReclaimPressure` (`VM_FAULT_OOM`: wait for reclaim, retry), or
+    /// `OutOfRange` when no reclaim can be requested. No failure backs the page.
     pub unsafe fn demand_alloc_page(
         &self,
         vaddr: VirtAddr,

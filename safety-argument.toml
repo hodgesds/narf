@@ -1388,3 +1388,19 @@ argument = "Per-task user GS base (scheduler/src/stackful.rs): the executor save
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "frame/src/cross_crate_init.rs passes one more function pointer (narf_userspace::handlers::proc_current_tid) to narf_filesystem::procfs::install_proc_pidns_hooks, so /proc/thread-self can name the calling thread. The hook only reads the caller's own Linux tid. frame/ gains no authority, mapping, domain transition or capability, and the wiring runs once at boot, like the three hooks already installed beside it."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Executor core (scheduler/src/lib.rs): poll_one_round_nested wraps poll_one_round with a per-CPU depth counter, and the poll-boundary QSBR report is skipped while that depth is non-zero, the same way it is already skipped after a preempted return. This only removes quiescent reports. It can only make a grace period last longer, never end early, so no RCU reader can lose its object; deferred destructors run at the top-level round as before. No authority, mapping, domain transition or capability change."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame/src/bare_main.rs installs narf_rcu's reclaim-offload hook (rcu_reclaim_kick) in run_async_demo. The hook only calls narf_scheduler::spawn_stackful on a task that runs narf_rcu::run_offloaded_reclaim. Reclamation still frees only nodes whose QSBR grace period has elapsed, the same objects at the same safety point as before. Only the context changes: a spawned kernel task instead of whatever frame reported quiescence. Destructors run later, never earlier, so no reader can lose its object. No authority, mapping, domain transition or capability change."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame/src/x86_64/trap.rs: when demand paging of a user-half address returns AddressSpaceError::Bus (the backing file refused a mapped page), the #PF handler records it, skips the stack-growth attempt, and passes SyncFaultInfo { bus: true } to the existing user signal hook, which delivers SIGBUS/BUS_ADRERR instead of SIGSEGV. The user-mode gate is unchanged (CS RPL == 3, CR2 in the user half). Kernel-mode faults with a guarded uaccess armed still fall through to the probe fixup (EFAULT), as Linux returns -EFAULT from copy_*_user over a SIGBUS page. No page is mapped, no authority or domain changes, and the swapgs/entry paths are untouched."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame/src/aarch64/trap.rs: a synchronous exception taken from EL0 (SPSR_EL1.M == EL0t) that nothing healed is now handed to the existing user signal hook, the same one the x86 #PF/#UD/#AC path uses, mapped from the ESR exception class per Linux el0t_64_sync_handler, instead of the fatal path. The hook only rewrites this task's own trap frame to enter its handler, or terminates this task under the default action. The gate is EL0-only: EL1 exceptions and the guarded-uaccess fixup are unchanged, and a Bus outcome inside a guarded copy still becomes -EFAULT. try_heal_user_abort's healing behaviour is unchanged; it now also reports why it failed. No authority, mapping or domain transition is added."

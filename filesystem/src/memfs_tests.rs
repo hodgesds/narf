@@ -639,18 +639,28 @@ fn smoke_memfs_mmap_fault_aliases_the_file_page() -> TestResult {
     if file.mmap_fault(0) != Ok(phys) {
         return TestResult::Fail("mmap_fault is not idempotent for one offset");
     }
-    // A fault past the end grows the file — the mapping TRACKS the file
-    // rather than snapshotting it, which is the whole reason this is
-    // `mmap_fault` and not `mmap_frames`.
+    // `shmem_fault` refuses a page at or past i_size (mm/shmem.c:
+    // `index >= i_size` → error → `vmf_error` → VM_FAULT_SIGBUS); it never
+    // grows the file. This used to grow it — the same fault SIGBUSes on
+    // Linux, so nothing correct depends on that.
+    let size_before = file.stat().size;
+    if file.mmap_fault(8192).is_ok() {
+        return TestResult::Fail("a fault past end-of-file succeeded (Linux: SIGBUS)");
+    }
+    if file.stat().size != size_before {
+        return TestResult::Fail("a fault past end-of-file grew the file");
+    }
+    // A hole INSIDE i_size — ftruncate grew the file, nothing was written —
+    // faults in a fresh page: the Wayland `wl_shm` pool shape.
+    if poll_once(file.truncate(3 * 4096)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("growing ftruncate failed");
+    }
     let grown = match file.mmap_fault(8192) {
         Ok(phys) => phys,
-        Err(_) => return TestResult::Fail("mmap_fault of a hole failed"),
+        Err(_) => return TestResult::Fail("mmap_fault of a hole inside i_size failed"),
     };
     if grown == phys {
         return TestResult::Fail("two different offsets share one frame");
-    }
-    if file.stat().size < 8192 + 4096 {
-        return TestResult::Fail("a fault past the end did not grow the file");
     }
     // The page is real file content: readable, and charged.
     if file.stat().blocks != 2 * (4096 / 512) {
@@ -734,6 +744,59 @@ fn smoke_memfs_mapped_page_is_retired_not_freed() -> TestResult {
 kernel_test_in!(
     "filesystem/memfs",
     smoke_memfs_mapped_page_is_retired_not_freed
+);
+
+/// A retired page keeps its block charge only until the inode dies. Then
+/// it must be returned with the rest of the file. `MemFile::drop` released
+/// `pages.len()` and never the retired pages, so every page truncated or
+/// punched while mapped leaked a block of the mount's budget (and of its
+/// owner's quota) forever. A long-lived desktop churns exactly this:
+/// mapped shared buffers resized as windows change. With a finite `size=`
+/// the leak ends in an in-range fault that cannot reserve a block.
+fn smoke_memfs_retired_page_charge_released_when_inode_dies() -> TestResult {
+    const PUNCH_HOLE: u32 = 0x02;
+    const KEEP_SIZE: u32 = 0x01;
+    let fs = match TmpFs::from_options_with_total("size=64K,nr_inodes=8", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let used = |fs: &TmpFs| match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat.blocks - stat.blocks_free,
+        _ => u64::MAX,
+    };
+    {
+        let file = match poll_once(fs.root().create("doomed")) {
+            Some(Ok(file)) => file,
+            _ => return TestResult::Fail("tmpfs create failed"),
+        };
+        if poll_once(file.write(0, &[0x5Au8; 8192])).map(|r| r.is_ok()) != Some(true) {
+            return TestResult::Fail("seed write failed");
+        }
+        // Map page 0, then punch it: retired, still charged.
+        if file.mmap_fault(0).is_err() {
+            return TestResult::Fail("mmap_fault failed");
+        }
+        if poll_once(file.fallocate(PUNCH_HOLE | KEEP_SIZE, 0, 4096)).map(|r| r.is_ok())
+            != Some(true)
+        {
+            return TestResult::Fail("hole punch of the mapped page failed");
+        }
+        if used(&fs) != 2 {
+            return TestResult::Fail("retired + live page are not two charged blocks");
+        }
+        if poll_once(fs.root().unlink("doomed")).map(|r| r.is_ok()) != Some(true) {
+            return TestResult::Fail("unlink failed");
+        }
+        // `file` is the last reference; it drops at the end of this scope.
+    }
+    if used(&fs) != 0 {
+        return TestResult::Fail("inode death leaked the retired page's block charge");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/memfs",
+    smoke_memfs_retired_page_charge_released_when_inode_dies
 );
 // ── Smoke 9: distinct inodes (rm_rf / DSO-dedup hazard guard) ──────────
 //

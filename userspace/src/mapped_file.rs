@@ -18,9 +18,10 @@
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use narf_filesystem::FsError;
 use narf_filesystem::{FileOps, MmapLifetime};
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{AddressSpaceError, MappingReceipt, PhysAddr};
+use narf_memory::{AddressSpaceError, FileFaultError, MappingReceipt, PhysAddr};
 
 #[derive(Clone)]
 struct FileWriteback {
@@ -868,17 +869,21 @@ fn current_address_space_id() -> Option<u64> {
 /// entry inside it — and holding an owner bucket across that would put this
 /// lock beneath every lock any demand-pageable file might take, on a path
 /// entered from the page-fault handler.
-pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
+pub(crate) fn demand_frame(vaddr: u64) -> Result<u64, FileFaultError> {
     let page = vaddr & !0xFFFu64;
-    let address_space_id = current_address_space_id()?;
-    let owner_bucket = existing_mapping_owners(address_space_id)?;
+    let address_space_id = current_address_space_id().ok_or(FileFaultError::NoOwner)?;
+    let owner_bucket = existing_mapping_owners(address_space_id).ok_or(FileFaultError::NoOwner)?;
     let (offset, ops, generic_fallback, private_copy, zero_from) = {
         let owners = owner_bucket.lock();
-        let owner = owners.iter().find(|mapping| {
-            page >= mapping.base && page < mapping.base.saturating_add(mapping.len)
-        })?;
+        let owner = owners
+            .iter()
+            .find(|mapping| page >= mapping.base && page < mapping.base.saturating_add(mapping.len))
+            .ok_or(FileFaultError::NoOwner)?;
         (
-            owner.file_offset.checked_add(page - owner.base)?,
+            owner
+                .file_offset
+                .checked_add(page - owner.base)
+                .ok_or(FileFaultError::Bus)?,
             Arc::clone(&owner.ops),
             owner.writeback.is_some(),
             owner.private_copy,
@@ -886,7 +891,7 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
         )
     };
     if private_copy {
-        let phys = crate::handlers::load_file_demand_page(&ops, offset).ok()?;
+        let phys = crate::handlers::load_file_demand_page(&ops, offset).map_err(fault_error)?;
         // `padzero()`: the bytes from an ELF segment's `p_filesz` to the end of
         // that page are `.bss` and must read as zero, not as whatever the file
         // holds there. Only this private copy is touched.
@@ -907,37 +912,39 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
                 }
             }
         }
-        return Some(phys.raw());
+        return Ok(phys.raw());
     }
     if !generic_fallback {
-        return ops.mmap_fault(offset).ok();
+        return ops.mmap_fault(offset).map_err(fault_error);
     }
 
     // Linux filemap_fault first looks in the inode page cache, then reads a
     // missing folio. The pending publication pins this canonical fallback
     // page while the mapping owner is revalidated after filesystem I/O.
+    // `filemap_fault`: a page at or past i_size is SIGBUS, not unmapped.
     if offset >= ops.stat().size {
-        return None;
+        return Err(FileFaultError::Bus);
     }
     let expected_generation = ops.mmap_cache_generation();
     let (phys, publication) =
         if let Some((phys, publication)) = reserve_cached_shared_file_pages(&ops, offset, 1) {
-            (*phys.first()?, publication)
+            (*phys.first().ok_or(FileFaultError::NoMemory)?, publication)
         } else {
-            let candidate = crate::handlers::load_file_demand_page(&ops, offset).ok()?;
+            let candidate =
+                crate::handlers::load_file_demand_page(&ops, offset).map_err(fault_error)?;
             let mut candidates = Vec::new();
             if candidates.try_reserve_exact(1).is_err() {
                 narf_memory::free_frame(narf_memory::PhysFrame::new(candidate));
-                return None;
+                return Err(FileFaultError::NoMemory);
             }
             candidates.push(candidate);
             let (phys, publication) =
                 publish_shared_file_pages(&ops, offset, candidates, expected_generation);
-            (*phys.first()?, publication)
+            (*phys.first().ok_or(FileFaultError::NoMemory)?, publication)
         };
     if !retain_shared_file_page(phys.raw()) {
         drop(publication);
-        return None;
+        return Err(FileFaultError::NoOwner);
     }
     publication.commit();
 
@@ -974,9 +981,18 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
     if !registered {
         let released = release_shared_file_page(phys.raw());
         debug_assert!(released);
-        return None;
+        return Err(FileFaultError::NoOwner);
     }
-    Some(phys.raw())
+    Ok(phys.raw())
+}
+
+/// `vmf_error`: `-ENOMEM` waits for reclaim and retries (`VM_FAULT_OOM`);
+/// every other filesystem error is `VM_FAULT_SIGBUS`.
+fn fault_error(error: FsError) -> FileFaultError {
+    match error {
+        FsError::OutOfMemory => FileFaultError::NoMemory,
+        _ => FileFaultError::Bus,
+    }
 }
 
 /// Publish freshly loaded fallback pages into the process-independent file

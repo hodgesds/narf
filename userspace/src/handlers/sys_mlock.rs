@@ -7,7 +7,11 @@ pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
     match error {
         narf_memory::AddressSpaceError::OutOfRange
         | narf_memory::AddressSpaceError::AlignmentMismatch => EINVAL,
-        narf_memory::AddressSpaceError::Unmapped
+        // A refused file fault (VM_FAULT_SIGBUS) is -EFAULT from GUP
+        // (`vm_fault_to_errno`), which `__mlock_posix_error_return` reports
+        // as -ENOMEM — the same bucket as an unmapped page.
+        narf_memory::AddressSpaceError::Bus
+        | narf_memory::AddressSpaceError::Unmapped
         | narf_memory::AddressSpaceError::LockLimit
         | narf_memory::AddressSpaceError::MappingLimit
         | narf_memory::AddressSpaceError::StackLimit => ENOMEM,

@@ -66,6 +66,57 @@ fn smoke_scheduler_parked_idle_leaves_rcu_census() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_parked_idle_leaves_rcu_census);
 
+/// A round driven from inside another kernel frame (the sleep-pump scheduler
+/// step) is NOT a QSBR quiescent point: the outer frame is mid-execution and
+/// may hold driver gates, locks or raw RCU pointers. Reporting quiescence
+/// there drained deferred destructors inline — a freed VirGL buffer's `Drop`
+/// then re-took the GPU request gate the interrupted cursor flush already
+/// held, and the CPU spun forever with interrupts masked (every other CPU
+/// then stalled on its TLB-shootdown ack). The nested round must leave the
+/// CPU's quiescent state untouched; a top-level round must still report.
+fn smoke_scheduler_nested_round_is_not_quiescent() -> TestResult {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static POLLED: AtomicUsize = AtomicUsize::new(0);
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= 64 {
+        return TestResult::Skip("current CPU is outside watchdog mask");
+    }
+    let bit = 1u64 << cpu;
+    crate::__reset_queues_for_test();
+    POLLED.store(0, Ordering::Relaxed);
+
+    // Inactive: no published quiescent timestamp on this CPU.
+    crate::report_parked_queue_idle();
+    crate::spawn(async {
+        POLLED.fetch_add(1, Ordering::Relaxed);
+    });
+    let _ = crate::poll_one_round_nested();
+    let nested_reported = narf_rcu::stalled_cpu_mask(u64::MAX, 1) & bit != 0;
+    let nested_polled = POLLED.load(Ordering::Relaxed);
+
+    // A top-level round is a quiescent point and must still report one.
+    crate::report_parked_queue_idle();
+    crate::spawn(async {
+        POLLED.fetch_add(1, Ordering::Relaxed);
+    });
+    let _ = crate::poll_one_round();
+    let top_reported = narf_rcu::stalled_cpu_mask(u64::MAX, 1) & bit != 0;
+
+    crate::__reset_queues_for_test();
+    narf_rcu::report_quiescent();
+    if nested_polled != 1 {
+        return TestResult::Fail("nested round did not poll the ready task");
+    }
+    if nested_reported {
+        return TestResult::Fail("nested round reported an RCU quiescent state");
+    }
+    if !top_reported {
+        return TestResult::Fail("top-level round stopped reporting quiescence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_nested_round_is_not_quiescent);
+
 fn smoke_scheduler_drives_future() -> TestResult {
     use core::sync::atomic::{AtomicUsize, Ordering};
     static COUNT: AtomicUsize = AtomicUsize::new(0);

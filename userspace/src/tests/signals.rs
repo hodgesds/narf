@@ -773,8 +773,16 @@ fn smoke_userspace_signal_hook_slots_round_trip() -> TestResult {
     crate::install_sync_signal_hook(synchronous);
     let mut ctx = HookCtx { rip: 0 };
     let delivered = crate::signal_delivery_hook().is_some_and(|hook| hook(&mut ctx, 0x51A1));
-    let synchronized = crate::sync_signal_hook()
-        .is_some_and(|hook| hook(&mut ctx, 13, crate::SyncFaultInfo { addr: 0xBAD0 }));
+    let synchronized = crate::sync_signal_hook().is_some_and(|hook| {
+        hook(
+            &mut ctx,
+            13,
+            crate::SyncFaultInfo {
+                addr: 0xBAD0,
+                bus: false,
+            },
+        )
+    });
 
     crate::install_signal_delivery_hook(old_delivery);
     crate::install_sync_signal_hook(old_sync);
@@ -1319,7 +1327,14 @@ fn smoke_userspace_sync_signal_si_addr_from_payload() -> TestResult {
         last_si_addr: 0,
         last_si_code: 0,
     };
-    let rewrote = default_sync_signal_delivery(&mut ctx, 14, SyncFaultInfo { addr: fake_cr2 });
+    let rewrote = default_sync_signal_delivery(
+        &mut ctx,
+        14,
+        SyncFaultInfo {
+            addr: fake_cr2,
+            bus: false,
+        },
+    );
     let si_addr = ctx.last_si_addr;
     let si_code = ctx.last_si_code;
 
@@ -1342,6 +1357,139 @@ kernel_test_in!(
     "userspace",
     smoke_userspace_sync_signal_si_addr_from_payload
 );
+
+fn smoke_userspace_file_fault_bus_delivers_sigbus() -> TestResult {
+    // A page fault the BACKING FILE refused (`VM_FAULT_SIGBUS`: past EOF, out
+    // of space, I/O error) on a mapped address is SIGBUS / BUS_ADRERR with the
+    // faulting address, as Linux `do_sigbus` delivers it. It used to arrive as
+    // SIGSEGV, which a crash handler reads as a wild pointer.
+    // Wave-58: arch trap forwards CR2/FAR_EL1 via SyncFaultInfo.addr.
+    // Verify default_sync_signal_delivery stamps it into params.si_addr
+    // for #PF (vector 14) so userspace handlers see the real faulting
+    // address rather than hardcoded 0.
+    use crate::{
+        default_sync_signal_delivery, install_core_syscalls, install_global,
+        install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, SyncFaultInfo,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    static FAKE_TASK: AtomicU64 = AtomicU64::new(0x5E65);
+    fn task_lookup() -> u64 {
+        FAKE_TASK.load(Ordering::Relaxed)
+    }
+    install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
+
+    crate::handlers::__test_sigaction_reset();
+    crate::sigaction_init();
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+        last_si_addr: u64,
+        last_si_code: i32,
+        last_signum: u32,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
+            false
+        }
+        fn deliver_signal(&mut self, p: &crate::SigDeliveryParams) -> bool {
+            self.last_si_addr = p.si_addr;
+            self.last_si_code = p.si_code;
+            self.last_signum = p.signum;
+            true
+        }
+    }
+
+    let mut old: u64 = 0;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: 7, // SIGBUS
+            arg1: 0xC0DE_F00D,
+            arg2: &mut old as *mut u64 as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+        last_si_addr: 0,
+        last_si_code: 0,
+        last_signum: 0,
+    };
+    kernel_syscall_entry(Syscall::Sigaction.raw(), &mut ctx);
+    if !matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK) {
+        __test_clear_global();
+        crate::handlers::__test_sigaction_reset();
+        return TestResult::Fail("Sigaction registration did not Ok");
+    }
+
+    // Forward a fake CR2 for vector 14 — handler must see it.
+    let fake_cr2: u64 = 0xDEAD_BEEF_CAFE_0000;
+    let mut ctx = FakeCtx {
+        args: SyscallArgs::default(),
+        ret: None,
+        last_si_addr: 0,
+        last_si_code: 0,
+        last_signum: 0,
+    };
+    let rewrote = default_sync_signal_delivery(
+        &mut ctx,
+        14,
+        SyncFaultInfo {
+            addr: fake_cr2,
+            bus: true,
+        },
+    );
+    let si_addr = ctx.last_si_addr;
+    let si_code = ctx.last_si_code;
+    let signum = ctx.last_signum;
+
+    __test_clear_global();
+    crate::handlers::__test_sigaction_reset();
+
+    if !rewrote {
+        return TestResult::Fail("sync hook did not deliver the file fault");
+    }
+    if signum != 7 {
+        return TestResult::Fail("a refused file fault was not SIGBUS");
+    }
+    if si_code != 2 {
+        return TestResult::Fail("SIGBUS for a refused file fault was not BUS_ADRERR(2)");
+    }
+    if si_addr != fake_cr2 {
+        return TestResult::Fail("SIGBUS si_addr was not the faulting address");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_file_fault_bus_delivers_sigbus);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {

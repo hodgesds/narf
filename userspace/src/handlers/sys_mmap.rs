@@ -105,16 +105,20 @@ pub(crate) fn load_file_mapping_pages(
 /// I/O error into a readable zero page. Bytes after the current EOF within the
 /// final page remain zero, while an offset wholly beyond EOF or a failed read
 /// rejects the fault and returns the frame to the allocator.
+///
+/// The error says why, for `vmf_error`: `OutOfMemory` when no frame could be
+/// had (the fault waits for reclaim and retries), anything else — past EOF, a
+/// failed read — is SIGBUS.
 pub(crate) fn load_file_demand_page(
     ops: &Arc<dyn narf_filesystem::FileOps>,
     offset: u64,
-) -> Result<narf_memory::PhysAddr, ()> {
+) -> Result<narf_memory::PhysAddr, narf_filesystem::FsError> {
     let file_size = ops.stat().size;
     if offset >= file_size {
-        return Err(());
+        return Err(narf_filesystem::FsError::BadAddress);
     }
     let frame = narf_memory::alloc_frame()
-        .map_err(|_| ())?
+        .map_err(|_| narf_filesystem::FsError::OutOfMemory)?
         .start_address();
     // SAFETY: `frame` is a fresh exclusively-owned direct-mapped frame.
     unsafe {
@@ -128,9 +132,13 @@ pub(crate) fn load_file_demand_page(
         match poll_io_to_completion(ops.read(offset + done as u64, &mut dst[done..])) {
             Some(Ok(0)) => break,
             Some(Ok(n)) => done += n,
-            Some(Err(_)) | None => {
+            Some(Err(error)) => {
                 narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
-                return Err(());
+                return Err(error);
+            }
+            None => {
+                narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
+                return Err(narf_filesystem::FsError::Io(narf_block::BlockError::IOError));
             }
         }
     }

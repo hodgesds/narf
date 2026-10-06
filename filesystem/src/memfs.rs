@@ -1632,7 +1632,10 @@ impl FilePage {
     /// Allocate a zeroed page. `NoSpace` on allocator exhaustion, which is
     /// the same answer the heap path gave.
     fn new_zeroed() -> Result<Self, FsError> {
-        let frame = narf_memory::frame::alloc_frame().map_err(|_| FsError::NoSpace)?;
+        // No frame is -ENOMEM (`shmem_get_folio_gfp`), not -ENOSPC: a fault
+        // must wait for reclaim (`VM_FAULT_OOM`), not die of SIGBUS as it
+        // would for a full mount.
+        let frame = narf_memory::frame::alloc_frame().map_err(|_| FsError::OutOfMemory)?;
         let page = Self {
             frame,
             mapped: false,
@@ -2120,7 +2123,24 @@ impl MemFile {
 
 impl Drop for MemFile {
     fn drop(&mut self) {
-        let blocks = self.data.lock().pages.len() as u64;
+        let mut data = self.data.lock();
+        // Retired pages kept their block charge "until the inode dies"
+        // (`release_page`) — this is that point, so they are returned with
+        // the live pages. Releasing only `pages` leaked one block of the
+        // mount's budget (and the owner's quota) per page truncated or
+        // punched while mapped, until in-range faults could no longer
+        // reserve one.
+        let blocks = (data.pages.len() + data.retired.len()) as u64;
+        // No mapping can still reach a page: every mapping owner holds an
+        // `Arc` to this file, so the inode only dies after the last one is
+        // gone. The frames are free to return to the allocator.
+        for page in data.pages.values_mut() {
+            page.mapped = false;
+        }
+        for page in data.retired.iter_mut() {
+            page.mapped = false;
+        }
+        drop(data);
         self._inode_lease.superblock.release_blocks(
             self.uid.load(Ordering::Relaxed),
             self.gid.load(Ordering::Relaxed),
@@ -2589,6 +2609,12 @@ impl FileOps for MemFile {
         let uid = self.uid.load(Ordering::Relaxed);
         let gid = self.gid.load(Ordering::Relaxed);
         let mut data = self.data.lock();
+        // `shmem_get_folio_gfp(.., SGP_CACHE)`: a page at or past i_size is
+        // refused, and `vmf_error` turns that into VM_FAULT_SIGBUS. A fault
+        // never grows the file — only write/ftruncate/fallocate do.
+        if offset >= data.len {
+            return Err(FsError::BadAddress);
+        }
         if let Some(page) = data.pages.get_mut(&index) {
             page.mapped = true;
             return Ok(page.phys());
@@ -2605,9 +2631,6 @@ impl FileOps for MemFile {
         page.mapped = true;
         let phys = page.phys();
         data.pages.insert(index, page);
-        // A fault past the end grows the file the way a write would: the
-        // mapping tracks the file rather than snapshotting it.
-        data.len = core::cmp::max(data.len, offset + PAGE_SIZE);
         drop(data);
         self.touch_mtime_now();
         Ok(phys)
