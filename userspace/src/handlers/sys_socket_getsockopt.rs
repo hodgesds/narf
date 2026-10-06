@@ -86,13 +86,14 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     // Optional Unix-peer metadata needs a typed "protocol option unavailable"
     // result. The generic unknown-option sentinel is -1 (EPERM to libc) and is
     // treated as fatal.
-    if level == crate::socket::SOL_SOCKET
-        && matches!(
-            name,
-            crate::socket::SO_PEERSEC | crate::socket::SO_PEERPIDFD
-        )
-    {
+    if level == crate::socket::SOL_SOCKET && name == crate::socket::SO_PEERSEC {
         ctx.set_return(SyscallReturn::ok((-ENOPROTOOPT) as u64));
+        return;
+    }
+    if level == crate::socket::SOL_SOCKET && name == crate::socket::SO_PEERPIDFD {
+        ctx.set_return(SyscallReturn::ok(
+            peer_pidfd(&sock, val_ptr, len_ptr, in_len) as u64,
+        ));
         return;
     }
     // Every option handler copies at most `min(len, sizeof(value))` bytes, so
@@ -207,4 +208,55 @@ fn copy_sockopt_out(val_ptr: u64, len_ptr: u64, value: &[u8]) -> SyscallReturn {
         return errno_ret(EFAULT);
     }
     SyscallReturn::ok(0)
+}
+
+/// `sk_getsockopt(SO_PEERPIDFD)` (net/core/sock.c): a new pidfd for the peer
+/// that connected (`sk_peer_pid`, stamped at connect/accept — the same source
+/// as `SO_PEERCRED`). dbus-broker, systemd, polkit and zbus use it to name a
+/// D-Bus peer without the pid-reuse race of `SO_PEERCRED`'s pid.
+///
+/// - no peer pid → `-ENODATA`;
+/// - AF_UNIX passes `PIDFD_STALE`, so a peer that has already exited still
+///   gets a pidfd (it reads as exited); any other family is `pidfd_prepare`'s
+///   `-ESRCH` (kernel/fork.c);
+/// - the fd is close-on-exec (`pidfd_create`), `min(len, sizeof(int))` bytes
+///   of it are copied to `optval`, then that length to `optlen`; a fault in
+///   either releases the fd and is `-EFAULT`.
+fn peer_pidfd(sock: &crate::socket::SocketFile, val_ptr: u64, len_ptr: u64, in_len: usize) -> i64 {
+    let len = core::cmp::min(in_len, core::mem::size_of::<i32>());
+    let peer = u64::from(sock.peer_cred().pid);
+    if peer == 0 {
+        return -ENODATA;
+    }
+    let task = pid_to_task_raw(peer);
+    if task.is_none() && sock.domain != crate::socket::AF_UNIX {
+        return -ESRCH;
+    }
+    let state = crate::pidfd::mint_for(peer, task.unwrap_or(peer), task.is_some());
+    let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
+        alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(state));
+    let caller = current_task_id();
+    let Some(pidfd) = fd::install(
+        caller,
+        crate::fd::FdEntry {
+            ops: file,
+            offset: 0,
+            flags: crate::fd::FD_CLOEXEC,
+            status_flags: 0,
+        },
+    ) else {
+        // `get_unused_fd_flags` at RLIMIT_NOFILE.
+        return -EMFILE;
+    };
+    let value = (pidfd as i32).to_ne_bytes();
+    // SAFETY: copy_to_user range-validates both destinations and brackets
+    // SMAP; a fault is reported, never taken.
+    let copied = unsafe { copy_to_user(val_ptr, &value[..len]) }.is_ok()
+        && unsafe { copy_to_user(len_ptr, &(len as u32).to_ne_bytes()) }.is_ok();
+    if !copied {
+        // `put_unused_fd(pidfd); fput(pidfd_file);`
+        let _ = fd::with_table(caller, |table| table.close(pidfd));
+        return -EFAULT;
+    }
+    0
 }

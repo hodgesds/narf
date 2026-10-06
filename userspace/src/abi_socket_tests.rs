@@ -2190,12 +2190,65 @@ fn smoke_abi_socket_getsockopt_peerpidfd_unavailable() -> TestResult {
             arg4: optlen.as_mut_ptr() as u64,
             ..Default::default()
         };
+        // `sk_getsockopt`: an unconnected socket has no `sk_peer_pid` →
+        // -ENODATA. (This used to pin NARF's blanket -ENOPROTOOPT.)
         match call(Syscall::SocketGetSockOpt.raw(), args) {
-            Some(-92) => Ok(()),
-            _ => Err("SO_PEERPIDFD without retained pidfd did not return ENOPROTOOPT"),
+            Some(-61) => Ok(()),
+            _ => Err("SO_PEERPIDFD on an unconnected socket did not return ENODATA"),
         }
     })
 }
+
+/// `SO_PEERPIDFD` on a connected AF_UNIX socket returns a close-on-exec pidfd
+/// for the peer (both ends of this socketpair are ours, so it names us), with
+/// `optlen` clamped to `sizeof(int)`; a bad `optval` is -EFAULT.
+fn smoke_abi_socket_getsockopt_peerpidfd_connected() -> TestResult {
+    with_setup(|| {
+        const SO_PEERPIDFD: u64 = 77;
+        const F_GETFD: u64 = 1;
+        const FD_CLOEXEC: i64 = 1;
+        let (fd0, _fd1) = socketpair_fds()?;
+        let mut val = [0xFFu8; 8];
+        let mut optlen = (val.len() as u32).to_ne_bytes();
+        let args = SyscallArgs {
+            arg0: fd0,
+            arg1: SOL_SOCKET,
+            arg2: SO_PEERPIDFD,
+            arg3: val.as_mut_ptr() as u64,
+            arg4: optlen.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::SocketGetSockOpt.raw(), args) {
+            Some(0) => {}
+            Some(-92) => return Err("SO_PEERPIDFD is still ENOPROTOOPT"),
+            _ => return Err("SO_PEERPIDFD on a connected socket did not succeed"),
+        }
+        if u32::from_ne_bytes(optlen) != 4 {
+            return Err("SO_PEERPIDFD optlen was not sizeof(int)");
+        }
+        let pidfd = i32::from_ne_bytes([val[0], val[1], val[2], val[3]]);
+        if pidfd < 0 || val[4..] != [0xFF; 4] {
+            return Err("SO_PEERPIDFD did not write exactly one fd");
+        }
+        // It is a live pidfd naming this (the peer) process: signal 0 succeeds.
+        if call(Syscall::PidfdSendSignal.raw(), a3(pidfd as u64, 0, 0, 0)) != Some(0) {
+            return Err("the SO_PEERPIDFD fd is not a usable pidfd for the peer");
+        }
+        if call(Syscall::Fcntl.raw(), a1(pidfd as u64, F_GETFD)) != Some(FD_CLOEXEC) {
+            return Err("the SO_PEERPIDFD fd is not close-on-exec");
+        }
+        // A bad optval faults after the pidfd is made, and must not leak it.
+        let bad = SyscallArgs { arg3: 0x10, ..args };
+        match call(Syscall::SocketGetSockOpt.raw(), bad) {
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("SO_PEERPIDFD with a bad optval was not EFAULT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_getsockopt_peerpidfd_connected
+);
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_getsockopt_peerpidfd_unavailable
