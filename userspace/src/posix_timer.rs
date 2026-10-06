@@ -293,16 +293,11 @@ fn ns_to_timespec(ns: u64) -> (i64, i64) {
 /// `Task::pid` IS the thread-group id here, so "same thread group" is an
 /// equality on it — a timer may target a sibling thread, never a stranger.
 fn resolve_thread_in_group(caller: u64, tid: i32) -> Option<u64> {
-    if tid <= 0 {
-        return None;
-    }
-    let outer = crate::handlers::accept_pid_from(caller, tid as u64)?;
-    let thread = crate::handlers::proc_pid_to_tid(outer);
-    let group = crate::handlers::task_to_pid_raw(caller)?;
-    if crate::handlers::task_to_pid_raw(thread)? != group {
-        return None;
-    }
-    Some(thread)
+    // `find_vpid` + `pid_task(PIDTYPE_PID)` is `find_task_by_vpid`: a
+    // non-leader sibling's tid resolves as well as the leader's pid. glibc's
+    // SIGEV_THREAD timers target their helper thread exactly this way.
+    let thread = crate::handlers::find_task_by_vpid(caller, tid)?;
+    crate::handlers::same_thread_group(thread, caller).then_some(thread)
 }
 
 fn parse_sigevent(buf: &[u8; 64]) -> (i32, i32, i32) {

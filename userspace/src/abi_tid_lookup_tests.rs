@@ -846,6 +846,57 @@ fn smoke_abi_tid_fcntl_setown_non_leader() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_tid_fcntl_setown_non_leader);
 
+// ── timer_create SIGEV_THREAD_ID — kernel/time/posix-timers.c:398-399
+// find_vpid + pid_task(PIDTYPE_PID) + same_thread_group, else EINVAL ──────
+fn smoke_abi_tid_timer_create_thread_id_non_leader() -> TestResult {
+    const CLOCK_MONOTONIC: u64 = 1;
+    const SIGEV_THREAD_ID: i32 = 4;
+    fn sev(tid: u64) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[8..12].copy_from_slice(&(SIGUSR1 as i32).to_ne_bytes());
+        b[12..16].copy_from_slice(&SIGEV_THREAD_ID.to_ne_bytes());
+        b[16..20].copy_from_slice(&(tid as i32).to_ne_bytes());
+        b
+    }
+    with_groups(|| {
+        let mut id = 0u64;
+        let out = &mut id as *mut u64 as u64;
+        for (caller, tid) in [
+            (LEADER_TASK, SIB_TID),
+            (SIB_TASK, SIB_TID),
+            (SIB_TASK, GROUP_PID),
+        ] {
+            set_task(caller);
+            let s = sev(tid);
+            expect(
+                call(
+                    Syscall::TimerCreate.raw(),
+                    a2(CLOCK_MONOTONIC, s.as_ptr() as u64, out),
+                ),
+                0,
+                "timer_create(SIGEV_THREAD_ID, thread of own group) must succeed",
+            )?;
+        }
+        set_task(LEADER_TASK);
+        for tid in [OTHER_SIB_TID, OTHER_PID, ABSENT, SIB_TASK] {
+            let s = sev(tid);
+            expect(
+                call(
+                    Syscall::TimerCreate.raw(),
+                    a2(CLOCK_MONOTONIC, s.as_ptr() as u64, out),
+                ),
+                EINVAL,
+                "timer_create(SIGEV_THREAD_ID, not a thread of own group) must be EINVAL",
+            )?;
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_tid_timer_create_thread_id_non_leader
+);
+
 // ── ptrace — kernel/ptrace.c:1398 find_get_task_by_vpid; ptrace_attach
 // `same_thread_group(task, current)` → EPERM ───────────────────────────────
 fn smoke_abi_tid_ptrace_attach_same_group() -> TestResult {
