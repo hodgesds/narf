@@ -1506,6 +1506,33 @@ fn stat_ino_path_dir_aware_depth(
     if depth < MAX_STAT_RETRY {
         if let Ok(expanded) = resolve_vfs_symlink_path_scoped(path, follow_final) {
             if expanded != path {
+                // The expansion deliberately stops AT a proc-fd magic link
+                // rather than following its readlink text, because that text
+                // describes the object and for an anonymous descriptor names
+                // nothing. `open` performs the jump itself; a path `stat` has
+                // to do the same here, or a path that opens fine cannot be
+                // described — `/dev/fd/0` is a devtmpfs symlink into procfs,
+                // so `[ -e /dev/fd/0 ]` expanded to `/proc/self/fd/0` and then
+                // had nothing left to walk.
+                //
+                // `nd_jump_link` stops at the descriptor's own file, so the
+                // target is described directly and the walk does not continue
+                // into it (`follow_final` false) — the same shape the statx
+                // handler already uses for a literal `/proc/<pid>/fd/N`.
+                if follow_final {
+                    let task = current_task_id();
+                    if let Some(fd) = parse_proc_fd_magic_path(task, &expanded) {
+                        if let Some(target) =
+                            fd_path_for_task(task, fd).filter(|p| p.starts_with('/'))
+                        {
+                            return stat_ino_path_dir_aware_depth(
+                                &apply_chroot(&target),
+                                false,
+                                depth + 1,
+                            );
+                        }
+                    }
+                }
                 return stat_ino_path_dir_aware_depth(&expanded, follow_final, depth + 1);
             }
         }
