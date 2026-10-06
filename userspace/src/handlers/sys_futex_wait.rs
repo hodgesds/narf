@@ -158,10 +158,10 @@ pub(crate) fn sys_futex_wait(ctx: &mut dyn TrapContext) {
     };
     futex_wait_core(
         ctx,
-        futex_namespace((flags & FUTEX_PRIVATE) != 0),
         args.arg0,
         args.arg1 as u32,
         park_cap,
         flags,
+        FUTEX_BITSET_MATCH_ANY,
     );
 }

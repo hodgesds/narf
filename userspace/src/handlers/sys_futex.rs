@@ -38,7 +38,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     // caller that left junk in the upper half (a sign-extended `int` in a
     // hand-written stub is the usual source) into an unrecognised op.
     let raw_op = args.arg1 as u32 as u64;
-    let namespace = futex_namespace((raw_op & FUTEX_PRIVATE) != 0);
+    let private = (raw_op & FUTEX_PRIVATE) != 0;
     let cmd = raw_op & FUTEX_OP_MASK;
     let val = args.arg2 as u32;
     // Start each futex op from clean park state so a stale `futex_uaddr` left
@@ -112,7 +112,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     // address is fine" shortcuts grew in three different places. An arm now
     // receives a key it cannot have constructed from a bad address.
     // It follows the `!bitset` gate above because Linux checks that first.
-    let key = match get_futex_key(namespace, uaddr) {
+    let key = match get_futex_key(private, uaddr) {
         Ok(k) => k,
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));
@@ -124,12 +124,12 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     // safe and musl/glibc pass MATCH_ANY). Its timeout remains distinct:
     // WAIT_BITSET takes an absolute deadline while WAIT takes a relative
     // duration, as decoded above.
-    let op = if cmd == FUTEX_WAIT_BITSET {
-        FUTEX_WAIT
+    let (op, bitset) = if cmd == FUTEX_WAIT_BITSET {
+        (FUTEX_WAIT, FUTEX_BITSET_MATCH_ANY)
     } else if cmd == FUTEX_WAKE_BITSET {
-        FUTEX_WAKE
+        (FUTEX_WAKE, FUTEX_BITSET_MATCH_ANY)
     } else {
-        cmd
+        (cmd, FUTEX_BITSET_MATCH_ANY)
     };
     match op {
         FUTEX_WAKE_OP => {
@@ -137,8 +137,8 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // it touches either word, so a skewed or unmapped second
             // address is -EINVAL/-EFAULT before any of the RMW work.
             let r = futex_wake_op(
-                namespace,
-                uaddr,
+                private,
+                key,
                 val,
                 args.arg3 as u32,
                 args.arg4,
@@ -238,8 +238,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
                     // word rewritten WITHOUT a wake (requeue handoffs,
                     // robust-owner death) unparks instead of stranding.
                     uc.futex_val.store(val, Ordering::Release);
-                    uc.futex_uaddr.store(uaddr, Ordering::Release);
-                    uc.futex_namespace.store(namespace, Ordering::Release);
+                    futex_park_publish(uc, uaddr, key, bitset);
                     uc.sleep_deadline_ns.store(deadline, Ordering::Release);
                     ctx.save_user_state(uc.state.get() as *mut u8);
                     *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
@@ -261,7 +260,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // contract). A waiter not yet registered when we fire is caught
             // by the gen guard on its next poll.
             futex_bump_counter_key(key);
-            let woken = futex_wake_waiters_key(key, val);
+            let woken = futex_wake_waiters_key_bitset(key, val, bitset);
             ctx.set_return(SyscallReturn::ok(woken as u64));
         }
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
@@ -284,7 +283,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // `uaddr` came through the funnel above; the SECOND word needs
             // the same treatment, and gets it from the same function rather
             // than a hand-written pair of checks.
-            let key2 = match get_futex_key(namespace, uaddr2) {
+            let key2 = match get_futex_key(private, uaddr2) {
                 Ok(k) => k,
                 Err(errno) => {
                     ctx.set_return(SyscallReturn::ok((-errno) as u64));
@@ -314,14 +313,8 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // the movers' next backstop re-check then proceeds to
             // userspace and re-evaluates there (spurious, never lost).
             let new_val = futex_read_user_word(uaddr2).unwrap_or(0);
-            let (woken, moved) = futex_requeue_waiters_keyed(
-                key,
-                key2,
-                uaddr2,
-                val,
-                args.arg3 as u32,
-                new_val,
-            );
+            let (woken, moved) =
+                futex_requeue_waiters_keyed(key, key2, uaddr2, val, args.arg3 as u32, new_val);
             let r = if op == FUTEX_CMP_REQUEUE {
                 woken + moved
             } else {

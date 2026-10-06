@@ -1939,10 +1939,7 @@ kernel_test_in!(
 /// `futex_key(entry.futex_namespace, uaddr)`).
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_cleartid_exit_wake_reaches_shared_waiter() -> TestResult {
-    use crate::handlers::{
-        __test_futex_wake_counter, __test_set_clear_child_tid_scoped, futex_drop_waiter,
-        futex_register_waiter,
-    };
+    use crate::handlers::{__test_futex_wake_counter_scoped, __test_set_clear_child_tid_scoped};
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicU32, Ordering};
     use core::task::{RawWaker, RawWakerVTable, Waker};
@@ -1994,28 +1991,36 @@ fn smoke_userspace_cleartid_exit_wake_reaches_shared_waiter() -> TestResult {
     __test_set_clear_child_tid_scoped(TID, UADDR, PRIVATE_NS);
 
     // The glibc joiner: FUTEX_WAIT on the ctid word WITHOUT FUTEX_PRIVATE
-    // (LLL_SHARED) → registered in namespace 0.
+    // (LLL_SHARED). The ctid word lives in a private mapping, so
+    // `get_futex_key` keys that shared op (mm, address) + FUT_OFF_MMSHARED —
+    // a different futex from the private op on the same word.
+    let shared_ns = crate::handlers::__test_futex_mmshared_namespace(PRIVATE_NS);
     let woken = Arc::new(AtomicU32::new(0));
-    futex_register_waiter(UADDR, JOINER_TID, counting_waker(woken.clone()));
-    let shared_gen_before = __test_futex_wake_counter(UADDR);
+    crate::handlers::__test_futex_register_waiter_scoped(
+        shared_ns,
+        UADDR,
+        JOINER_TID,
+        counting_waker(woken.clone()),
+    );
+    let shared_gen_before = __test_futex_wake_counter_scoped(shared_ns, UADDR);
 
     // Thread exit → fire_clear_child_tid_on_exit.
     crate::task::mark_zombie(TID);
     crate::user_task::notify_task_exited(PID, TID);
 
     let fired = woken.load(Ordering::Acquire) == 1;
-    let shared_gen_bumped = __test_futex_wake_counter(UADDR) != shared_gen_before;
+    let shared_gen_bumped = __test_futex_wake_counter_scoped(shared_ns, UADDR) != shared_gen_before;
 
     // Cleanup regardless of outcome: drop an un-woken joiner entry and the
     // test observer wiring so later tests see clean global state.
-    futex_drop_waiter(UADDR, JOINER_TID);
+    let _ = crate::handlers::__test_futex_wake_scoped(shared_ns, UADDR, u32::MAX);
     crate::task::release_task(TID);
     let _ = task;
     crate::user_task::__test_clear_exit_observers();
 
     if !shared_gen_bumped {
         return TestResult::Fail(
-            "CLEARTID exit wake skipped the shared (namespace-0) gen — Linux's \
+            "CLEARTID exit wake skipped the shared-op key's gen — Linux's \
              mm_release wake carries no FUTEX_PRIVATE_FLAG (kernel/fork.c)",
         );
     }
