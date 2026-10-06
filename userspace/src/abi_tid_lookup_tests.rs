@@ -71,6 +71,194 @@ fn expect(got: Option<i64>, want: i64, msg: &'static str) -> Result<(), &'static
     }
 }
 
+// ── getsid / getpgid — kernel/sys.c:1240 / :1198 `find_task_by_vpid` ──────
+fn smoke_abi_tid_getsid_getpgid_non_leader() -> TestResult {
+    with_groups(|| {
+        for caller in [LEADER_TASK, SIB_TASK] {
+            set_task(caller);
+            let sid = call(Syscall::Getsid.raw(), a0(GROUP_PID));
+            if sid.is_none_or(|v| v <= 0) {
+                return Err("getsid(leader pid) failed");
+            }
+            if call(Syscall::Getsid.raw(), a0(SIB_TID)) != sid {
+                return Err("getsid(non-leader tid) did not report the thread's process session");
+            }
+            // `task_session(current)`: the session of the caller's process,
+            // whichever of its threads asks.
+            if call(Syscall::Getsid.raw(), a0(0)) != sid {
+                return Err("getsid(0) from a thread did not report its process session");
+            }
+            let pgid = call(Syscall::Getpgid.raw(), a0(GROUP_PID));
+            if pgid.is_none_or(|v| v <= 0) {
+                return Err("getpgid(leader pid) failed");
+            }
+            if call(Syscall::Getpgid.raw(), a0(SIB_TID)) != pgid {
+                return Err("getpgid(non-leader tid) did not report the thread's process group");
+            }
+        }
+        set_task(LEADER_TASK);
+        expect(
+            call(Syscall::Getsid.raw(), a0(ABSENT)),
+            ESRCH,
+            "getsid(unused pid) must be ESRCH",
+        )?;
+        expect(
+            call(Syscall::Getpgid.raw(), a0(ABSENT)),
+            ESRCH,
+            "getpgid(unused pid) must be ESRCH",
+        )?;
+        // A scheduler TaskId is not a pid.
+        expect(
+            call(Syscall::Getsid.raw(), a0(SIB_TASK)),
+            ESRCH,
+            "getsid accepted a raw TaskId",
+        )?;
+        expect(
+            call(Syscall::Getpgid.raw(), a0(SIB_TASK)),
+            ESRCH,
+            "getpgid accepted a raw TaskId",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_getsid_getpgid_non_leader);
+
+// ── setpgid — kernel/sys.c:1124-1142: pgid<0 EINVAL, ESRCH, !leader EINVAL ─
+fn smoke_abi_tid_setpgid_non_leader_einval() -> TestResult {
+    with_groups(|| {
+        set_task(LEADER_TASK);
+        expect(
+            call(Syscall::Setpgid.raw(), a1(SIB_TID, 0)),
+            EINVAL,
+            "setpgid(non-leader tid) must be EINVAL (thread_group_leader check)",
+        )?;
+        set_task(SIB_TASK);
+        expect(
+            call(Syscall::Setpgid.raw(), a1(SIB_TID, 0)),
+            EINVAL,
+            "setpgid(own non-leader tid) must be EINVAL",
+        )?;
+        // `if (!pgid) pgid = pid; if (pgid < 0) return -EINVAL;` precedes the
+        // lookup, so a negative pid with pgid 0 is EINVAL, not ESRCH.
+        expect(
+            call(Syscall::Setpgid.raw(), a1((-5i64) as u64, 0)),
+            EINVAL,
+            "setpgid(-5, 0) must be EINVAL (pgid takes the negative pid)",
+        )?;
+        expect(
+            call(Syscall::Setpgid.raw(), a1(ABSENT, 0)),
+            ESRCH,
+            "setpgid(unused pid) must be ESRCH",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_setpgid_non_leader_einval);
+
+// ── prlimit64 — kernel/sys.c:1751 `pid ? find_task_by_vpid(pid) : current` ─
+fn smoke_abi_tid_prlimit64_non_leader() -> TestResult {
+    const RLIMIT_NOFILE: u64 = 7;
+    with_groups(|| {
+        let mut old = [0u8; 16];
+        let out = old.as_mut_ptr() as u64;
+        set_task(LEADER_TASK);
+        expect(
+            call(Syscall::Prlimit64.raw(), a3(SIB_TID, RLIMIT_NOFILE, 0, out)),
+            0,
+            "prlimit64(non-leader tid) must find the thread",
+        )?;
+        set_task(SIB_TASK);
+        expect(
+            call(Syscall::Prlimit64.raw(), a3(SIB_TID, RLIMIT_NOFILE, 0, out)),
+            0,
+            "prlimit64(own non-leader tid) must find the caller",
+        )?;
+        set_task(LEADER_TASK);
+        expect(
+            call(
+                Syscall::Prlimit64.raw(),
+                a3(SIB_TASK, RLIMIT_NOFILE, 0, out),
+            ),
+            ESRCH,
+            "prlimit64 accepted a raw TaskId",
+        )?;
+        expect(
+            call(Syscall::Prlimit64.raw(), a3(ABSENT, RLIMIT_NOFILE, 0, out)),
+            ESRCH,
+            "prlimit64(unused pid) must be ESRCH",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_prlimit64_non_leader);
+
+// ── capget / capset — kernel/capability.c:115 / :233 ──────────────────────
+//
+// capget: `pid && pid != task_pid_vnr(current)` → `find_task_by_vpid(pid)`.
+// capset: only 0 or `task_pid_vnr(current)` — the caller's own TID — else EPERM.
+fn smoke_abi_tid_capget_capset_non_leader() -> TestResult {
+    const V3: u32 = 0x2008_0522;
+    fn hdr(pid: u64) -> [u8; 8] {
+        let mut h = [0u8; 8];
+        h[..4].copy_from_slice(&V3.to_ne_bytes());
+        h[4..].copy_from_slice(&(pid as i32).to_ne_bytes());
+        h
+    }
+    with_groups(|| {
+        set_task(LEADER_TASK);
+        let mut own = [0u8; 24];
+        let h = hdr(0);
+        expect(
+            call(
+                Syscall::Capget.raw(),
+                a1(h.as_ptr() as u64, own.as_mut_ptr() as u64),
+            ),
+            0,
+            "capget(0) failed",
+        )?;
+        let mut sib = [0u8; 24];
+        let h = hdr(SIB_TID);
+        expect(
+            call(
+                Syscall::Capget.raw(),
+                a1(h.as_ptr() as u64, sib.as_mut_ptr() as u64),
+            ),
+            0,
+            "capget(non-leader tid) must find the thread",
+        )?;
+        if sib != own {
+            return Err("capget(non-leader tid) read some other task's capabilities");
+        }
+        let h = hdr(ABSENT);
+        expect(
+            call(
+                Syscall::Capget.raw(),
+                a1(h.as_ptr() as u64, sib.as_mut_ptr() as u64),
+            ),
+            ESRCH,
+            "capget(unused pid) must be ESRCH",
+        )?;
+
+        set_task(SIB_TASK);
+        let h = hdr(SIB_TID);
+        expect(
+            call(
+                Syscall::Capset.raw(),
+                a1(h.as_ptr() as u64, own.as_ptr() as u64),
+            ),
+            0,
+            "capset(own tid) from a non-leader must be accepted (task_pid_vnr is the tid)",
+        )?;
+        let h = hdr(GROUP_PID);
+        expect(
+            call(
+                Syscall::Capset.raw(),
+                a1(h.as_ptr() as u64, own.as_ptr() as u64),
+            ),
+            EPERM,
+            "capset(leader pid) from a non-leader must be EPERM",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_capget_capset_non_leader);
+
 // ── kill / rt_sigqueueinfo — kernel/signal.c:1480 find_vpid + :1457
 // pid_task(PIDTYPE_PID): a thread tid is accepted and the signal is
 // process-directed (group_send_sig_info(..., PIDTYPE_TGID)).

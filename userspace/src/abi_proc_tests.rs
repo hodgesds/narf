@@ -394,9 +394,10 @@ fn smoke_abi_proc_getsid_neg() -> TestResult {
     with_setup(|| {
         // `sys_getsid` returns -ESRCH for a pid that names no live task,
         // as Linux does.
+        // (kernel/sys.c:1240 `find_task_by_vpid(pid)` → NULL → -ESRCH.)
         match call(Syscall::Getsid.raw(), a0(987654)) {
-            Some(v) if v >= 0 => Ok(()),
-            _ => Err("getsid on an unknown pid changed from the ok-default path"),
+            Some(v) if v == ESRCH => Ok(()),
+            _ => Err("getsid on an unknown pid must be -ESRCH"),
         }
     })
 }

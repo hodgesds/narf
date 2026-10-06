@@ -17227,8 +17227,10 @@ fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
             owner: crate::task::task_get(caller),
         });
     }
-    let outer = accept_pid_from(caller, pid)?;
-    let task = pid_to_task_raw(outer).or_else(|| task_to_pid_raw(outer).map(|_| outer))?;
+    // `kernel/sys.c:1751`: `find_task_by_vpid(pid)` — any thread in the
+    // caller's pid namespace, a non-leader's tid included (limits are shared
+    // thread-group state). Never a raw scheduler TaskId.
+    let task = find_task_by_vpid(caller, i32::try_from(pid).ok()?)?;
     Some(PrlimitTarget {
         tid: task,
         owner: Some(crate::task::task_get(task)?),
