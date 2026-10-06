@@ -119,15 +119,16 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // FUTEX_WAIT_BITSET behaves like FUTEX_WAIT for NARF's per-uaddr wait
-    // queue (the bitmask only narrows WHICH wakes match; a superset wake is
-    // safe and musl/glibc pass MATCH_ANY). Its timeout remains distinct:
-    // WAIT_BITSET takes an absolute deadline while WAIT takes a relative
-    // duration, as decoded above.
+    // `do_futex`: FUTEX_WAIT/FUTEX_WAKE are the _BITSET ops with
+    // `val3 = FUTEX_BITSET_MATCH_ANY`. The bitset is stored on the waiter
+    // and `futex_wake` takes only waiters whose bitset intersects the wake's
+    // (`kernel/futex/waitwake.c`). The timeouts stay distinct: WAIT_BITSET
+    // takes an absolute deadline while WAIT takes a relative duration, as
+    // decoded above.
     let (op, bitset) = if cmd == FUTEX_WAIT_BITSET {
-        (FUTEX_WAIT, FUTEX_BITSET_MATCH_ANY)
+        (FUTEX_WAIT, args.arg5 as u32)
     } else if cmd == FUTEX_WAKE_BITSET {
-        (FUTEX_WAKE, FUTEX_BITSET_MATCH_ANY)
+        (FUTEX_WAKE, args.arg5 as u32)
     } else {
         (cmd, FUTEX_BITSET_MATCH_ANY)
     };

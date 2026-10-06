@@ -1158,7 +1158,10 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_op_upper_bits_pos);
 fn smoke_abi_async_futex_wake_pos() -> TestResult {
     with_setup(|| {
         let word: u32 = 0;
-        // futex_wake(&word, mask=MATCH_ANY, nr=1, FUTEX2_SIZE_U32) → 1.
+        // futex_wake(&word, mask=MATCH_ANY, nr=1, FUTEX2_SIZE_U32) with
+        // nobody queued → 0. `futex_wake` returns `ret`, the number it
+        // actually woke (`kernel/futex/waitwake.c`), not the `nr` asked for;
+        // this used to assert 1, pinning NARF's echo of `nr`.
         let args = a3(
             &word as *const u32 as u64,
             FUTEX_BITSET_MATCH_ANY,
@@ -1166,8 +1169,8 @@ fn smoke_abi_async_futex_wake_pos() -> TestResult {
             FUTEX2_SIZE_U32,
         );
         match call(Syscall::FutexWake.raw(), args) {
-            Some(1) => Ok(()),
-            _ => Err("futex_wake(nr=1) should return 1"),
+            Some(0) => Ok(()),
+            _ => Err("futex_wake(nr=1) with no waiters should return 0"),
         }
     })
 }

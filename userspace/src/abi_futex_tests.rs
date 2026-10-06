@@ -13,8 +13,12 @@ use core::task::{RawWaker, RawWakerVTable, Waker};
 use narf_memory::AddressSpace;
 
 const FUTEX_WAKE: u64 = 1;
+const FUTEX_REQUEUE: u64 = 3;
+const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE_FLAG: u64 = 128;
 const MATCH_ANY: u32 = 0xffff_ffff;
+const FUTEX2_SIZE_U32: u64 = 0x02;
+const FUTEX2_PRIVATE: u64 = 128;
 
 const PROT_RW: u64 = 0x3;
 const MAP_SHARED: u64 = 0x01;
@@ -315,3 +319,121 @@ kernel_test_in!(
     "syscall_abi/futex",
     smoke_abi_futex_shared_anon_follows_fork_not_va
 );
+
+// ════════════════════════════════════════════════════════════════════
+// Bug: FUTEX_WAKE_BITSET ignored the waiters' bitsets.
+// ════════════════════════════════════════════════════════════════════
+
+/// `futex_wake`: `if (!(this->bitset & bitset)) continue;` — a waiter whose
+/// bitset does not intersect the wake's is skipped, stays queued, and does
+/// not count toward `nr_wake`. Waiter 1 (queued first, bitset 0x2) must be
+/// passed over by `FUTEX_WAKE_BITSET(nr=1, 0x1)` in favour of waiter 2
+/// (bitset 0x1); a disjoint bitset wakes nobody; `FUTEX_WAKE` (MATCH_ANY)
+/// then takes the remaining one.
+fn smoke_abi_futex_wake_bitset_filters_waiters() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let p = &word as *const u32 as u64;
+        const T1: u64 = 0x7e_0041;
+        const T2: u64 = 0x7e_0042;
+        let w1 = queue(true, p, 0x2, T1)?;
+        let w2 = queue(true, p, 0x1, T2)?;
+        let r = (|| {
+            if futex(p, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 1, 0x1) != Some(1) {
+                return Err("FUTEX_WAKE_BITSET(nr=1, 0x1) must wake one matching waiter");
+            }
+            if w1.load(Ordering::Acquire) != 0 || w2.load(Ordering::Acquire) != 1 {
+                return Err("FUTEX_WAKE_BITSET woke a waiter whose bitset does not match");
+            }
+            if futex(p, FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG, 8, 0x4) != Some(0) {
+                return Err("a disjoint bitset must wake (and count) nobody");
+            }
+            if futex(p, FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 8, 0) != Some(1)
+                || w1.load(Ordering::Acquire) != 1
+            {
+                return Err("FUTEX_WAKE (MATCH_ANY) must take the skipped waiter");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_futex_drop_current(true, p, T1);
+        crate::handlers::__test_futex_drop_current(true, p, T2);
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex_wake_bitset_filters_waiters
+);
+
+/// futex2 `futex_wake(uaddr, mask, nr, flags)` is `futex_wake(..., mask)`:
+/// the same bitset filter, and the return value is the number actually
+/// woken (`ret`), not the `nr` requested.
+fn smoke_abi_futex2_wake_mask_filters_and_counts() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let p = &word as *const u32 as u64;
+        const T1: u64 = 0x7e_0051;
+        const T2: u64 = 0x7e_0052;
+        let w1 = queue(true, p, 0x2, T1)?;
+        let w2 = queue(true, p, 0x1, T2)?;
+        let wake = |mask: u64, nr: u64| {
+            call(
+                Syscall::FutexWake.raw(),
+                a3(p, mask, nr, FUTEX2_SIZE_U32 | FUTEX2_PRIVATE),
+            )
+        };
+        let r = (|| {
+            if wake(0x1, 1) != Some(1) || w2.load(Ordering::Acquire) != 1 {
+                return Err("futex_wake(mask=0x1, nr=1) must wake the matching waiter");
+            }
+            if w1.load(Ordering::Acquire) != 0 {
+                return Err("futex_wake woke a waiter outside its mask");
+            }
+            if wake(0x4, 5) != Some(0) {
+                return Err("futex_wake must return the number woken, not nr");
+            }
+            if wake(MATCH_ANY as u64, 5) != Some(1) || w1.load(Ordering::Acquire) != 1 {
+                return Err("futex_wake(MATCH_ANY) must take the remaining waiter, return 1");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_futex_drop_current(true, p, T1);
+        crate::handlers::__test_futex_drop_current(true, p, T2);
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/futex",
+    smoke_abi_futex2_wake_mask_filters_and_counts
+);
+
+/// `futex_requeue` wakes and moves waiters WITHOUT consulting their bitsets
+/// (only `futex_wake` filters). A waiter that `FUTEX_WAKE_BITSET` skipped is
+/// still woken by `FUTEX_REQUEUE`'s wake half.
+fn smoke_abi_futex_requeue_ignores_bitset() -> TestResult {
+    with_setup(|| {
+        let word: u32 = 0;
+        let word2: u32 = 0;
+        let p = &word as *const u32 as u64;
+        let p2 = &word2 as *const u32 as u64;
+        const T1: u64 = 0x7e_0061;
+        let w1 = queue(true, p, 0x2, T1)?;
+        let r = call(
+            Syscall::Futex.raw(),
+            SyscallArgs {
+                arg0: p,
+                arg1: FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG,
+                arg2: 1,
+                arg3: 0,
+                arg4: p2,
+                arg5: 0,
+            },
+        );
+        crate::handlers::__test_futex_drop_current(true, p, T1);
+        if r != Some(1) || w1.load(Ordering::Acquire) != 1 {
+            return Err("FUTEX_REQUEUE must wake regardless of the waiter's bitset");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_requeue_ignores_bitset);
