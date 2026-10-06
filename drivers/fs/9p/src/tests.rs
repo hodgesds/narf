@@ -518,3 +518,125 @@ fn smoke_9p_write_count_matches_request() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/fs/9p", smoke_9p_write_count_matches_request);
+
+// ── Timestamps ────────────────────────────────────────────────────
+//
+// Linux `v9fs_stat2inode` (legacy 9P2000): atime = stat.atime,
+// mtime = stat.mtime, ctime = stat.mtime, 0 nanoseconds. The driver used
+// to stuff raw seconds into `Stat::mtime_cycles` and report every
+// directory as the epoch.
+
+const NS: u64 = 1_000_000_000;
+
+/// A looked-up file reports the server's stat times synchronously (the
+/// lookup stats the new fid, as Linux's does) and `stat_async` refreshes
+/// them; `Stat::mtime_cycles` encodes the wall-clock ns, not raw seconds.
+fn smoke_9p_file_reports_server_times() -> TestResult {
+    const ATIME: u32 = 1_600_000_011;
+    const MTIME: u32 = 1_700_000_022;
+    let transport = LoopbackTransport::new(&[("f", b"data")]);
+    if !transport.set_times(Some("f"), ATIME, MTIME) {
+        return TestResult::Fail("loopback set_times did not find the file");
+    }
+    let t: Arc<dyn crate::session::Transport> = transport.clone();
+    let vol = match poll_once(NinepVolume::mount(t, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(vol.root().lookup_async("f")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    let attrs = file.inode_attrs();
+    if attrs.mtime_ns != u64::from(MTIME) * NS || attrs.atime_ns != u64::from(ATIME) * NS {
+        return TestResult::Fail("lookup did not carry the server's atime/mtime");
+    }
+    if attrs.ctime_ns != u64::from(MTIME) * NS {
+        return TestResult::Fail("9P2000 ctime must mirror mtime (v9fs_stat2inode)");
+    }
+    if file.stat().mtime_cycles != narf_time::ns_to_cycles(u64::from(MTIME) * NS) {
+        return TestResult::Fail("sync Stat::mtime_cycles does not encode the mtime");
+    }
+    // The server's file changes: stat_async must pick the new time up.
+    const MTIME2: u32 = MTIME + 77;
+    transport.set_times(Some("f"), ATIME, MTIME2);
+    let st = match poll_once(file.stat_async()) {
+        Some(Ok(s)) => s,
+        _ => return TestResult::Fail("stat_async failed"),
+    };
+    if st.mtime_cycles != narf_time::ns_to_cycles(u64::from(MTIME2) * NS) {
+        return TestResult::Fail("stat_async mtime_cycles does not encode the new mtime");
+    }
+    // Negative: the old encoding put raw seconds in the cycle count.
+    if st.mtime_cycles == u64::from(MTIME2) {
+        return TestResult::Fail("stat_async still reports raw seconds as cycles");
+    }
+    if file.inode_attrs().mtime_ns != u64::from(MTIME2) * NS {
+        return TestResult::Fail("stat_async did not refresh the cached mtime");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/9p", smoke_9p_file_reports_server_times);
+
+/// The attached root directory reports its stat mtime through both
+/// `dir_mtime_ns` and `inode_attrs` — mount stats the root fid.
+fn smoke_9p_dir_reports_mtime() -> TestResult {
+    const ROOT_ATIME: u32 = 1_650_000_001;
+    const ROOT_MTIME: u32 = 1_650_000_123;
+    let transport = LoopbackTransport::new(&[("f", b"x")]);
+    transport.set_times(None, ROOT_ATIME, ROOT_MTIME);
+    let t: Arc<dyn crate::session::Transport> = transport.clone();
+    let vol = match poll_once(NinepVolume::mount(t, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = vol.root();
+    let want = u64::from(ROOT_MTIME) * NS;
+    if root.dir_mtime_ns() != want {
+        return TestResult::Fail("root dir_mtime_ns is not the server's mtime");
+    }
+    let attrs = root.inode_attrs();
+    if attrs.mtime_ns != want || attrs.atime_ns != u64::from(ROOT_ATIME) * NS {
+        return TestResult::Fail("root InodeAttrs times are not the server's");
+    }
+    // Negative: a server reporting the epoch is reported as the epoch, not
+    // some stale or synthesised value.
+    let transport0 = LoopbackTransport::new(&[]);
+    let t0: Arc<dyn crate::session::Transport> = transport0.clone();
+    let vol0 = match poll_once(NinepVolume::mount(t0, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("second mount failed"),
+    };
+    if vol0.root().dir_mtime_ns() != 0 {
+        return TestResult::Fail("an epoch root mtime was not reported as 0");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/9p", smoke_9p_dir_reports_mtime);
+
+/// stat(5) times are unsigned 32-bit whole seconds: no nanoseconds, a
+/// value past 2038 stays positive, and atime is NOT mirrored from mtime
+/// (only ctime is).
+fn smoke_9p_stat_time_conversion_edges() -> TestResult {
+    use crate::node::P9Times;
+    let st = P9Stat {
+        atime: 0xFFFF_FFFF,
+        mtime: 0x8000_0000,
+        ..Default::default()
+    };
+    let t = P9Times::from_stat(&st);
+    if t.atime_ns != 0xFFFF_FFFFu64 * NS || t.mtime_ns != 0x8000_0000u64 * NS {
+        return TestResult::Fail("stat seconds not widened unsigned");
+    }
+    if t.ctime_ns != t.mtime_ns {
+        return TestResult::Fail("ctime must equal mtime for 9P2000");
+    }
+    if t.atime_ns == t.mtime_ns {
+        return TestResult::Fail("atime was mirrored from mtime");
+    }
+    if t.mtime_ns % NS != 0 || t.atime_ns % NS != 0 {
+        return TestResult::Fail("9P2000 times grew a sub-second part");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/9p", smoke_9p_stat_time_conversion_edges);

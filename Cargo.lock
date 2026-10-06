@@ -1000,6 +1000,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-time",
 ]
 
 [[package]]

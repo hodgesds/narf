@@ -15,7 +15,7 @@ use super::message::{
     decode_header, decode_rerror, decode_rversion, encode_tattach, encode_tversion, qtype, MsgType,
     Qid, WireRead, NOFID, NOTAG,
 };
-use super::node::NinepNode;
+use super::node::{NinepNode, P9Times};
 use super::session::{frame_message, P9Session, Transport};
 
 /// 9P2000 base protocol version string (version(5)).
@@ -29,6 +29,9 @@ pub struct NinepVolume {
     pub root_fid: u32,
     pub root_qid: Qid,
     pub domain: DomainId,
+    /// The attached root's times, from the `Tstat` Linux's `v9fs_mount`
+    /// issues to build the root inode.
+    pub root_times: P9Times,
 }
 
 impl NinepVolume {
@@ -86,12 +89,18 @@ impl NinepVolume {
             return Err(FsError::Unsupported);
         }
 
+        // ── Tstat(root) ─────────────────────────────────────────
+        let probe =
+            NinepNode::new_root(transport.clone(), session.clone(), root_fid, root_qid, None);
+        let root_times = P9Times::from_stat(&probe.stat_fid(root_fid).await?);
+
         Ok(Arc::new(Self {
             transport,
             session,
             root_fid,
             root_qid,
             domain,
+            root_times,
         }))
     }
 }
@@ -111,6 +120,7 @@ impl FsInstance for NinepVolume {
             self.session.clone(),
             self.root_fid,
             self.root_qid,
+            Some(self.root_times),
         ))
     }
 }

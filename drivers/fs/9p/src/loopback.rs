@@ -15,7 +15,8 @@
 //! The synthetic server is intentionally minimal:
 //! - One root directory + N children. No nested directories.
 //! - Files are byte slices supplied at construction time.
-//! - `stat`'s mtime / atime / uid / gid / muid are constants.
+//! - `stat`'s uid / gid / muid are constants; atime / mtime are 0
+//!   unless a test sets them with [`LoopbackTransport::set_times`].
 //! - Supports only `READ` mode opens; rejects `WRITE`/`RDWR`.
 
 use alloc::boxed::Box;
@@ -42,6 +43,9 @@ pub struct LoopbackFile {
     pub data: Vec<u8>,
     /// Numeric path id used in the qid. Stable across a session.
     pub path_id: u64,
+    /// stat(5) `atime` / `mtime`, seconds since the epoch.
+    pub atime: u32,
+    pub mtime: u32,
 }
 
 /// Per-fid state kept by the synthetic server.
@@ -62,6 +66,8 @@ pub struct LoopbackTransport {
 
 struct Inner {
     files: Vec<LoopbackFile>,
+    /// The root directory's stat(5) `(atime, mtime)`.
+    root_times: (u32, u32),
     fids: BTreeMap<u32, FidState>,
     /// Negotiated msize after Tversion. Pre-handshake the server
     /// accepts up to this; the client's proposal is clamped.
@@ -92,17 +98,41 @@ impl LoopbackTransport {
                 // Path id 1 is reserved for the root directory; child
                 // ids start at 2.
                 path_id: 2 + i as u64,
+                atime: 0,
+                mtime: 0,
             });
         }
         Arc::new(Self {
             inner: IrqSafeSpinLock::new(Inner {
                 files: v,
+                root_times: (0, 0),
                 fids: BTreeMap::new(),
                 server_msize: 8192,
                 versioned: false,
             }),
             rpc_count: AtomicU64::new(0),
         })
+    }
+
+    /// Set the stat(5) `atime` / `mtime` the server reports for the child
+    /// `name`, or for the root directory when `name` is `None`. Returns
+    /// `false` if no such child exists.
+    pub fn set_times(&self, name: Option<&str>, atime: u32, mtime: u32) -> bool {
+        let mut inner = self.inner.lock();
+        match name {
+            None => {
+                inner.root_times = (atime, mtime);
+                true
+            }
+            Some(n) => match inner.files.iter_mut().find(|f| f.name == n) {
+                Some(f) => {
+                    f.atime = atime;
+                    f.mtime = mtime;
+                    true
+                }
+                None => false,
+            },
+        }
     }
 
     /// Number of RPCs the synthetic server has handled. Useful for
@@ -134,8 +164,8 @@ impl LoopbackTransport {
             kernel_dev: 0,
             qid: Self::file_qid(file),
             mode: 0o444,
-            atime: 0,
-            mtime: 0,
+            atime: file.atime,
+            mtime: file.mtime,
             length: file.data.len() as u64,
             name: file.name.clone(),
             uid: String::from("narf"),
@@ -144,14 +174,14 @@ impl LoopbackTransport {
         }
     }
 
-    fn root_stat() -> P9Stat {
+    fn root_stat(times: (u32, u32)) -> P9Stat {
         P9Stat {
             kernel_type: 0,
             kernel_dev: 0,
             qid: Self::root_qid(),
             mode: statmode::DIR | 0o555,
-            atime: 0,
-            mtime: 0,
+            atime: times.0,
+            mtime: times.1,
             length: 0,
             name: String::from("/"),
             uid: String::from("narf"),
@@ -434,7 +464,7 @@ impl LoopbackTransport {
                 };
                 let stat = match st.child {
                     Some(idx) => Self::file_stat(&inner.files[idx]),
-                    None => Self::root_stat(),
+                    None => Self::root_stat(inner.root_times),
                 };
                 drop(inner);
                 let stat_body = stat.body_len();
