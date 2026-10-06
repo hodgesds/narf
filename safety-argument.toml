@@ -1384,3 +1384,7 @@ argument = "All user-memory accesses in signal delivery and rt_sigreturn stay in
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Per-task user GS base (scheduler/src/stackful.rs): the executor saves IA32_KERNEL_GS_BASE (the user value while the kernel GS is live) into the outgoing task's slot at the existing switch-out point, and writes the incoming task's slot back at both switch-in points (poll_to_yield, prepare_direct_arch_state), next to the FS base. The kernel per-CPU GS (IA32_GS_BASE) is never read or written, and trap entry still decides swapgs by CS.RPL (trap_entry.S), so a user-chosen GS base cannot become the kernel's. Restoring unconditionally (zero is every task's initial value) closes the existing leak where a WRGSBASE value, possible since CR4.FSGSBASE was enabled, carried over into the next task on the CPU. No new authority, mapping or domain transition."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame/src/cross_crate_init.rs passes one more function pointer (narf_userspace::handlers::proc_current_tid) to narf_filesystem::procfs::install_proc_pidns_hooks, so /proc/thread-self can name the calling thread. The hook only reads the caller's own Linux tid. frame/ gains no authority, mapping, domain transition or capability, and the wiring runs once at boot, like the three hooks already installed beside it."
