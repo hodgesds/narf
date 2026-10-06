@@ -2531,6 +2531,10 @@ fn smoke_abi_path_symlink_exact_errnos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_path_symlink_exact_errnos);
 
 fn smoke_abi_path_unlink_exact_errnos() -> TestResult {
+    // `call_unlink` is unlink(2) on x86_64 and, on arm64 — whose syscall table
+    // (asm-generic/unistd.h) has no __NR_unlink — unlinkat(AT_FDCWD, path, 0),
+    // exactly what glibc's unlink() issues there. Both reach Linux's
+    // do_unlinkat(AT_FDCWD, name), so every errno below holds on both arches.
     with_memfs("/p_unl", "p_unl", &[("victim", b"data")], || {
         let victim = c"/p_unl/victim";
         let ghost = c"/p_unl/ghost";
@@ -2550,49 +2554,45 @@ fn smoke_abi_path_unlink_exact_errnos() -> TestResult {
         }
 
         // 1. Empty path -> -ENOENT.
-        if call(Syscall::Unlink.raw(), a0(empty.as_ptr() as u64)) != Some(ENOENT) {
+        if call_unlink(empty.as_ptr() as u64) != Some(ENOENT) {
             return Err("unlink empty path must return -ENOENT");
         }
 
         // 2. Bad path pointer -> -EFAULT.
-        if call(Syscall::Unlink.raw(), a0(BAD_PTR)) != Some(EFAULT) {
+        if call_unlink(BAD_PTR) != Some(EFAULT) {
             return Err("unlink BAD_PTR must return -EFAULT");
         }
 
         // 3. '.' or '..' -> -EISDIR.
-        if call(Syscall::Unlink.raw(), a0(dot.as_ptr() as u64)) != Some(EISDIR) {
+        if call_unlink(dot.as_ptr() as u64) != Some(EISDIR) {
             return Err("unlink('.') must return -EISDIR");
         }
-        if call(Syscall::Unlink.raw(), a0(dotdot.as_ptr() as u64)) != Some(EISDIR) {
+        if call_unlink(dotdot.as_ptr() as u64) != Some(EISDIR) {
             return Err("unlink('..') must return -EISDIR");
         }
 
         // 4. Directory -> -EISDIR.
-        if call(Syscall::Unlink.raw(), a0(dir.as_ptr() as u64)) != Some(EISDIR) {
+        if call_unlink(dir.as_ptr() as u64) != Some(EISDIR) {
             return Err("unlink(dir) must return -EISDIR");
         }
 
         // 5. Trailing slash on regular file -> -ENOTDIR.
-        if call(
-            Syscall::Unlink.raw(),
-            a0(trailing_slash_file.as_ptr() as u64),
-        ) != Some(ENOTDIR)
-        {
+        if call_unlink(trailing_slash_file.as_ptr() as u64) != Some(ENOTDIR) {
             return Err("unlink(file/) must return -ENOTDIR");
         }
 
         // 6. Nonexistent file -> -ENOENT.
-        if call(Syscall::Unlink.raw(), a0(ghost.as_ptr() as u64)) != Some(ENOENT) {
+        if call_unlink(ghost.as_ptr() as u64) != Some(ENOENT) {
             return Err("unlink(nonexistent) must return -ENOENT");
         }
 
         // 7. Successful unlink -> 0.
-        if call(Syscall::Unlink.raw(), a0(victim.as_ptr() as u64)) != Some(0) {
+        if call_unlink(victim.as_ptr() as u64) != Some(0) {
             return Err("unlink(victim) should return 0");
         }
 
         // 8. Second unlink of same file -> -ENOENT.
-        if call(Syscall::Unlink.raw(), a0(victim.as_ptr() as u64)) != Some(ENOENT) {
+        if call_unlink(victim.as_ptr() as u64) != Some(ENOENT) {
             return Err("second unlink of unlinked file must return -ENOENT");
         }
 

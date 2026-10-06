@@ -35,9 +35,14 @@ pub mod mode {
     pub const IFIFO: u16 = 0o010000;
 }
 
-/// Decoded inode (version-agnostic). Times collapse onto a single
-/// `mtime` field on V1 (V1 only stores one timestamp); V2/V3 carry
-/// atime/mtime/ctime separately and we surface mtime here.
+/// Decoded inode (version-agnostic).
+///
+/// Timestamps are unsigned 32-bit whole seconds since the epoch on every
+/// version (Linux `minix_fill_super`: `s_time_min = 0`,
+/// `s_time_max = U32_MAX`; no sub-second field exists). V1 stores a
+/// single `i_time` that Linux's `minix_V1_iget` reports as atime, mtime
+/// AND ctime; V2/V3 store `i_atime`/`i_mtime`/`i_ctime` separately
+/// (`minix_V2_iget`), each with 0 nanoseconds.
 #[derive(Debug, Copy, Clone)]
 pub struct Inode {
     pub mode: u16,
@@ -46,6 +51,10 @@ pub struct Inode {
     pub gid: u16,
     pub size: u32,
     pub mtime: u32,
+    /// `i_atime` (V2/V3); V1's single `i_time`.
+    pub atime: u32,
+    /// `i_ctime` (V2/V3); V1's single `i_time`.
+    pub ctime: u32,
     /// Up to 10 zone slots — V1 only fills the first 9, V2/V3 fill
     /// all 10. Unused slots are 0.
     pub zones: [u32; 10],
@@ -85,6 +94,8 @@ impl Inode {
             gid,
             size,
             mtime,
+            atime: mtime,
+            ctime: mtime,
             zones,
         })
     }
@@ -101,9 +112,9 @@ impl Inode {
         let uid = u16le(4);
         let gid = u16le(6);
         let size = u32le(8);
-        let _atime = u32le(12);
+        let atime = u32le(12);
         let mtime = u32le(16);
-        let _ctime = u32le(20);
+        let ctime = u32le(20);
         let mut zones = [0u32; 10];
         for (i, zone) in zones.iter_mut().enumerate() {
             *zone = u32le(24 + i * 4);
@@ -115,8 +126,25 @@ impl Inode {
             gid,
             size,
             mtime,
+            atime,
+            ctime,
             zones,
         })
+    }
+
+    /// `st_mtim` in nanoseconds: whole seconds, as `minix_V*_iget` sets it.
+    pub fn mtime_ns(&self) -> u64 {
+        secs_to_ns(self.mtime)
+    }
+
+    /// `st_atim` in nanoseconds.
+    pub fn atime_ns(&self) -> u64 {
+        secs_to_ns(self.atime)
+    }
+
+    /// `st_ctim` in nanoseconds.
+    pub fn ctime_ns(&self) -> u64 {
+        secs_to_ns(self.ctime)
     }
 
     pub fn is_dir(&self) -> bool {
@@ -167,12 +195,10 @@ impl Inode {
         s[4..6].copy_from_slice(&self.uid.to_le_bytes());
         s[6..8].copy_from_slice(&self.gid.to_le_bytes());
         s[8..12].copy_from_slice(&self.size.to_le_bytes());
-        // _atime (12..16) left zero — we don't track atime.
+        // `minix_V2_update_inode` writes all three seconds fields back.
+        s[12..16].copy_from_slice(&self.atime.to_le_bytes());
         s[16..20].copy_from_slice(&self.mtime.to_le_bytes());
-        // _ctime (20..24) — Linux mirrors mtime when ctime is not
-        // independently tracked. Matches mkfs.minix output on quiet
-        // mounts.
-        s[20..24].copy_from_slice(&self.mtime.to_le_bytes());
+        s[20..24].copy_from_slice(&self.ctime.to_le_bytes());
         for i in 0..10 {
             s[24 + i * 4..24 + i * 4 + 4].copy_from_slice(&self.zones[i].to_le_bytes());
         }
@@ -188,6 +214,8 @@ impl Inode {
             gid: 0,
             size: 0,
             mtime,
+            atime: mtime,
+            ctime: mtime,
             zones: [0; 10],
         }
     }
@@ -202,6 +230,8 @@ impl Inode {
             gid: 0,
             size: 0,
             mtime,
+            atime: mtime,
+            ctime: mtime,
             zones: [0; 10],
         }
     }
@@ -217,7 +247,15 @@ impl Inode {
             gid: 0,
             size: 0,
             mtime,
+            atime: mtime,
+            ctime: mtime,
             zones: [0; 10],
         }
     }
+}
+
+/// Whole on-disk seconds (unsigned, per `s_time_max = U32_MAX`) to
+/// nanoseconds since the epoch.
+fn secs_to_ns(secs: u32) -> u64 {
+    u64::from(secs) * 1_000_000_000
 }

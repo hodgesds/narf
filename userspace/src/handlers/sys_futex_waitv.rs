@@ -140,12 +140,14 @@ pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
         Some(d) => (d - now).min(FUTEX2_PARK_CAP_NS),
         None => FUTEX2_PARK_CAP_NS,
     };
+    // `futex_wait_multiple_setup` queues every entry with
+    // `FUTEX_BITSET_MATCH_ANY`.
     futex_wait_core(
         ctx,
-        futex_namespace((first.flags & FUTEX_PRIVATE) != 0),
         first.uaddr,
         first.val as u32,
         park_cap,
         first.flags,
+        FUTEX_BITSET_MATCH_ANY,
     );
 }

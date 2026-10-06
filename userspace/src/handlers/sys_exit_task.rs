@@ -11,7 +11,7 @@ pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
         use core::fmt::Write;
         let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
         let _ = writeln!(
-            narf_console::Writer,
+            narf_console::ConsoleOnlyWriter,
             "[process-exit] kind=exit tid={} pid={} comm={} code={} wstatus={}",
             tid,
             pid,

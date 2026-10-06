@@ -10,38 +10,43 @@ pub(crate) fn sys_kcmp(ctx: &mut dyn TrapContext) {
     const KCMP_TYPES: u64 = 8;
     let a = *ctx.args();
     let kind = a.arg2;
-    if kind >= KCMP_TYPES {
-        ctx.set_return(errno_ret(EINVAL));
-        return;
-    }
     let me = current_task_id();
-    // kcmp interprets pid1/pid2 in the CALLER's pid namespace (Linux
-    // kernel/kcmp.c:146 find_task_by_vpid). Translate each inner pid to its
-    // outer ProcessId first, then resolve to the scheduler TaskId the
-    // comparison keys on. Passing the raw inner pid ordered against whatever
-    // ROOT-namespace process owned the same small number. An inner pid not
-    // bound in the caller's namespace has no target -> ESRCH. Audit finding #12.
-    let resolve = |pid: u64| -> Option<u64> {
-        let outer = accept_pid_from(me, pid)?;
-        // A pid that translates but has no registered task does not exist ->
-        // ESRCH (Linux find_task_by_vpid returns NULL). The `.unwrap_or(outer)`
-        // that was here masked that, letting kcmp(unknown_pid) return an
-        // ordering instead of failing.
-        pid_to_task_raw(outer)
-    };
-    let (t1, t2) = match (resolve(a.arg0), resolve(a.arg1)) {
+    // `kernel/kcmp.c:146-149`: both pids are looked up FIRST, in the caller's
+    // pid namespace, with `find_task_by_vpid` — any thread, a non-leader's tid
+    // included; 0 or an unused pid is -ESRCH. Then (:163-167) the caller must
+    // pass `ptrace_may_access(PTRACE_MODE_READ_REALCREDS)` on both (-EPERM),
+    // and only then does the `switch (type)` reject an unknown type with
+    // -EINVAL. Validating the type first answered EINVAL for a missing task.
+    let (t1, t2) = match (
+        find_task_by_vpid(me, a.arg0 as i32),
+        find_task_by_vpid(me, a.arg1 as i32),
+    ) {
         (Some(x), Some(y)) => (x, y),
         _ => {
             ctx.set_return(errno_ret(ESRCH));
             return;
         }
     };
+    if !ptrace_may_access(me, t1) || !ptrace_may_access(me, t2) {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
+    if kind >= KCMP_TYPES {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
     if t1 == t2 {
         // The same task shares every resource with itself.
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
     let result: u64 = if kind == KCMP_VM {
+        // CLONE_THREAD requires CLONE_VM: two threads of one group share
+        // `task->mm` by construction.
+        if same_thread_group(t1, t2) {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
         let a1 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t1));
         let a2 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t2));
         match (a1, a2) {

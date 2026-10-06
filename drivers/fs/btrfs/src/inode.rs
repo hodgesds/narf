@@ -11,10 +11,15 @@ const OFF_UID: usize = 44;
 const OFF_GID: usize = 48;
 const OFF_MODE: usize = 52;
 const OFF_RDEV: usize = 56;
-const OFF_MTIME_SEC: usize = 136;
-const OFF_MTIME_NSEC: usize = 144;
-/// Minimum decodable inode-item length (through the mtime timespec).
-const INODE_ITEM_MIN: usize = OFF_MTIME_NSEC + 4;
+// `struct btrfs_timespec {__le64 sec; __le32 nsec}` (12 bytes, packed):
+// atime@112, ctime@124, mtime@136, otime@148.
+const OFF_ATIME: usize = 112;
+const OFF_CTIME: usize = 124;
+const OFF_MTIME: usize = 136;
+const OFF_OTIME: usize = 148;
+/// Minimum decodable inode-item length (the full 160-byte item, through the
+/// otime timespec).
+const INODE_ITEM_MIN: usize = OFF_OTIME + 12;
 
 // Linux `S_IFMT` file-type bits within the mode word.
 const S_IFMT: u32 = 0o170000;
@@ -37,8 +42,32 @@ pub struct InodeItem {
     pub nlink: u32,
     /// Device number for a char/block special file (`0` otherwise).
     pub rdev: u64,
+    pub atime_sec: i64,
+    pub atime_nsec: u32,
+    pub ctime_sec: i64,
+    pub ctime_nsec: u32,
     pub mtime_sec: i64,
     pub mtime_nsec: u32,
+    /// Creation time (`otime`), reported as statx `btime`.
+    pub otime_sec: i64,
+    pub otime_nsec: u32,
+}
+
+/// Wall-clock nanoseconds for one `btrfs_timespec`. Linux hands the on-disk
+/// `sec`/`nsec` pair to `inode_set_*time` verbatim (`btrfs_read_locked_inode`),
+/// so the value is exact to the nanosecond. A time before the epoch clamps to
+/// 0: [`narf_filesystem::InodeAttrs`] is unsigned.
+pub fn timespec_ns(sec: i64, nsec: u32) -> u64 {
+    if sec < 0 {
+        return 0;
+    }
+    (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(nsec))
+}
+
+fn timespec(body: &[u8], off: usize) -> Result<(i64, u32), FsError> {
+    Ok((le64(body, off)? as i64, le32(body, off + 8)?))
 }
 
 impl InodeItem {
@@ -47,6 +76,10 @@ impl InodeItem {
         if body.len() < INODE_ITEM_MIN {
             return Err(FsError::InvalidData);
         }
+        let (atime_sec, atime_nsec) = timespec(body, OFF_ATIME)?;
+        let (ctime_sec, ctime_nsec) = timespec(body, OFF_CTIME)?;
+        let (mtime_sec, mtime_nsec) = timespec(body, OFF_MTIME)?;
+        let (otime_sec, otime_nsec) = timespec(body, OFF_OTIME)?;
         Ok(InodeItem {
             size: le64(body, OFF_SIZE)?,
             mode: le32(body, OFF_MODE)?,
@@ -54,9 +87,32 @@ impl InodeItem {
             gid: le32(body, OFF_GID)?,
             nlink: le32(body, OFF_NLINK)?,
             rdev: le64(body, OFF_RDEV)?,
-            mtime_sec: le64(body, OFF_MTIME_SEC)? as i64,
-            mtime_nsec: le32(body, OFF_MTIME_NSEC)?,
+            atime_sec,
+            atime_nsec,
+            ctime_sec,
+            ctime_nsec,
+            mtime_sec,
+            mtime_nsec,
+            otime_sec,
+            otime_nsec,
         })
+    }
+
+    /// `st_atim` in wall-clock nanoseconds.
+    pub fn atime_ns(&self) -> u64 {
+        timespec_ns(self.atime_sec, self.atime_nsec)
+    }
+
+    /// `st_ctim` in wall-clock nanoseconds.
+    pub fn ctime_ns(&self) -> u64 {
+        timespec_ns(self.ctime_sec, self.ctime_nsec)
+    }
+
+    /// `st_mtim` in wall-clock nanoseconds. fontconfig validates its caches
+    /// against a font directory's exact `st_mtim`, so this must not lose the
+    /// on-disk nanoseconds.
+    pub fn mtime_ns(&self) -> u64 {
+        timespec_ns(self.mtime_sec, self.mtime_nsec)
     }
 
     /// Decompose `rdev` into `(major, minor)`. btrfs stores the **raw kernel

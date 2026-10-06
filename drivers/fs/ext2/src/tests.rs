@@ -4010,6 +4010,59 @@ fn smoke_ext2_symlink_slow_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_slow_round_trip);
 
+/// Unlinking the last link of a fast symlink must not walk `i_block` as block
+/// pointers: it holds the link text. Firefox's profile `lock -> IP:+PID`
+/// symlink decoded to an out-of-range block number and `unlink` failed with
+/// EIO, wedging every later launch on "profile in use". Linux never truncates
+/// a fast symlink (`fs/ext4/inode.c::ext4_can_truncate`).
+fn smoke_ext2_unlink_fast_symlink_skips_block_walk() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let target = b"10.0.2.15:+772";
+    let sym_ino = match poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"lock", target))
+    {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("fast symlink create failed"),
+    };
+    let inode = match poll_once(volume.read_inode(sym_ino)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("read symlink inode failed"),
+    };
+    if !inode.is_fast_symlink(volume.block_size() as u32) {
+        return TestResult::Fail("short symlink was not classified as fast");
+    }
+    if !matches!(
+        poll_once(volume.dir_unlink(crate::EXT2_ROOT_INO, b"lock")),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("unlink of a fast symlink failed");
+    }
+    let root_inode = match poll_once(volume.read_inode(crate::EXT2_ROOT_INO)) {
+        Some(Ok(i)) => i,
+        _ => return TestResult::Fail("root inode read failed"),
+    };
+    if !matches!(
+        poll_once(volume.dir_lookup(&root_inode, b"lock")),
+        Some(Err(_))
+    ) {
+        return TestResult::Fail("unlinked fast symlink still resolves");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_unlink_fast_symlink_skips_block_walk
+);
+
 // ── VFS-layer symlink hardening ────────────────────────────────────────
 // The fast/slow round-trip tests above call `read_symlink_target` directly on
 // the volume. These exercise the FileOps/VFS surface every real path walk and
@@ -5133,3 +5186,147 @@ kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_truncate_then_extend_reads_zeros
 );
+
+/// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
+/// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
+/// are nanoseconds). fontconfig validates its system caches against a font
+/// directory's exact `st_mtim`; reporting the seconds alone (or zero) made
+/// every cache look stale. The extra word must also survive a write-back
+/// of an unchanged timestamp and be dropped when NARF rewrites the seconds.
+fn smoke_ext2_extra_timestamps_round_trip() -> TestResult {
+    use crate::inode::Inode;
+    const MTIME: u32 = 1_700_000_000;
+    const NSEC: u32 = 123_456_789;
+    let mut buf = alloc::vec![0u8; 256];
+    put_u16(&mut buf, 0, 0x4000 | 0o755); // S_IFDIR
+    put_u32(&mut buf, 8, MTIME); // i_atime
+    put_u32(&mut buf, 12, MTIME); // i_ctime
+    put_u32(&mut buf, 16, MTIME); // i_mtime
+    put_u16(&mut buf, 128, 32); // i_extra_isize: covers 132..160
+    put_u32(&mut buf, 136, NSEC << 2); // i_mtime_extra, epoch 0
+    put_u32(&mut buf, 140, (7 << 2) | 1); // i_atime_extra: 7 ns, epoch 1
+    let Some(mut inode) = Inode::parse(&buf) else {
+        return TestResult::Fail("256-byte inode did not parse");
+    };
+    let want = u64::from(MTIME) * 1_000_000_000 + u64::from(NSEC);
+    if inode.mtime_ns() != want {
+        return TestResult::Fail("i_mtime_extra nanoseconds were not decoded");
+    }
+    if inode.atime_ns() != (u64::from(MTIME) + (1 << 32)) * 1_000_000_000 + 7 {
+        return TestResult::Fail("i_atime_extra epoch bits were not applied");
+    }
+    if inode.ctime_ns() != u64::from(MTIME) * 1_000_000_000 {
+        return TestResult::Fail("a zero i_ctime_extra did not decode as whole seconds");
+    }
+    // Unchanged seconds: the extra word is written back as-is.
+    let mut out = buf.clone();
+    put_u32(&mut out, 136, 0);
+    inode.encode_into(&mut out);
+    if u32::from_le_bytes([out[136], out[137], out[138], out[139]]) != NSEC << 2 {
+        return TestResult::Fail("encode_into dropped an unchanged i_mtime_extra");
+    }
+    // Rewritten at seconds precision: the old fraction must not survive.
+    inode.mtime = MTIME + 5;
+    if inode.mtime_ns() != u64::from(MTIME + 5) * 1_000_000_000 {
+        return TestResult::Fail("a rewritten i_mtime kept the old nanoseconds");
+    }
+    inode.encode_into(&mut out);
+    if u32::from_le_bytes([out[136], out[137], out[138], out[139]]) != 0 {
+        return TestResult::Fail("encode_into kept nanoseconds for rewritten seconds");
+    }
+    // A 128-byte inode has no extra fields: whole seconds, no out-of-bounds.
+    let Some(small) = Inode::parse(&buf[..128]) else {
+        return TestResult::Fail("128-byte inode did not parse");
+    };
+    if small.mtime_ns() != u64::from(MTIME) * 1_000_000_000 {
+        return TestResult::Fail("a 128-byte inode reported sub-second time");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_extra_timestamps_round_trip);
+
+/// A directory on ext2/ext4 stats with its on-disk `i_mtime`, not the epoch:
+/// `DirOps::dir_mtime_ns` is what the stat path reads for directories, and
+/// `inode_attrs().mtime_ns` carries the exact value past the lossy
+/// ns→cycles→ns round trip.
+fn smoke_ext2_dir_reports_mtime() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const ROOT_MTIME: u32 = 1_650_000_123;
+    let mut img = build_ext2_image(b"x");
+    put_u32(&mut img, 5 * 1024 + 128 + 16, ROOT_MTIME); // root i_mtime
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let want = u64::from(ROOT_MTIME) * 1_000_000_000;
+    if root.dir_mtime_ns() != want {
+        return TestResult::Fail("ext2 directory did not report its on-disk mtime");
+    }
+    if root.inode_attrs().mtime_ns != want {
+        return TestResult::Fail("ext2 directory InodeAttrs::mtime_ns is not exact");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_dir_reports_mtime);
+
+/// `link(2)` on ext2/ext4 gives the existing inode a second name and bumps
+/// `i_links_count` (`ext4_link`); a name that already exists is refused
+/// (EEXIST at the syscall layer). fontconfig's `FcAtomicLock` takes its
+/// cache lock with `link(tmp, .LCK)`, so an unsupported link broke locking.
+fn smoke_ext2_hardlink() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"x"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    // The fixture leaves i_links_count unset; compare against the starting
+    // value rather than assume 1.
+    let links_before = match poll_once(volume.read_inode(12)) {
+        Some(Ok(inode)) => inode.links_count,
+        _ => return TestResult::Fail("read of the data inode failed"),
+    };
+    if !matches!(poll_once(root.link("data", "alias")), Some(Ok(()))) {
+        return TestResult::Fail("link of an existing file failed");
+    }
+    let (Some(Ok(data)), Some(Ok(alias))) = (
+        poll_once(root.lookup_async("data")),
+        poll_once(root.lookup_async("alias")),
+    ) else {
+        return TestResult::Fail("a linked name did not resolve");
+    };
+    if data.ino() != alias.ino() {
+        return TestResult::Fail("the new link names a different inode");
+    }
+    match poll_once(volume.read_inode(data.ino() as u32)) {
+        Some(Ok(inode)) if inode.links_count == links_before + 1 => {}
+        _ => return TestResult::Fail("link did not raise i_links_count by one"),
+    }
+    if !matches!(
+        poll_once(root.link("data", "alias")),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("link onto an existing name was not refused");
+    }
+    if !matches!(
+        poll_once(root.link("missing", "x")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("link of a missing name did not report NotFound");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_hardlink);

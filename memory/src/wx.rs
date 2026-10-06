@@ -406,11 +406,16 @@ pub fn jit_mprotect(
     new_perms: RegionPerms,
 ) -> Result<(), WxError> {
     cap.check_live()?;
-    let old = space
-        .perms_covering(base, len)
-        .ok_or(WxError::Unmapped)?
-        .prot_only();
-    match classify_mprotect(old, new_perms.prot_only()) {
+    // Classify over EVERY region the request intersects, as `mprotect(2)`
+    // walks every VMA in `[start, end)`. Requiring one region to cover the
+    // whole request refused a JIT range an earlier `mprotect` had split
+    // (SpiderMonkey's pattern) with -ENOMEM. A hole between the regions is
+    // still refused: `mprotect_range_wx_checked` checks full coverage.
+    let olds = space.perms_intersecting(base, len);
+    if olds.is_empty() {
+        return Err(WxError::Unmapped);
+    }
+    match classify_mprotect_range(olds.into_iter(), new_perms.prot_only()) {
         WxTransition::DenyXtoWX => Err(WxError::DenyXtoWX),
         // No capability grants RWX.
         WxTransition::DenyWX => Err(WxError::DenyWX),

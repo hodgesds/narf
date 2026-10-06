@@ -197,6 +197,20 @@ pub unsafe fn set_user_gs_base(gs_base: u64) {
     compiler_fence(Ordering::SeqCst);
 }
 
+/// The current task's user GS base, read at CPL=0 while the kernel's GS is
+/// live: after the entry-side `swapgs` the user value sits in
+/// `IA32_KERNEL_GS_BASE`. This is what a switch-out must save — userspace may
+/// have changed it with `WRGSBASE` (CR4.FSGSBASE is on) without a syscall.
+///
+/// # Safety
+/// CPL=0 with the kernel's GS.base live (any trap/syscall/scheduler path).
+#[inline]
+pub unsafe fn user_gs_base() -> u64 {
+    // SAFETY: IA32_KERNEL_GS_BASE is architectural in long mode and readable
+    // at CPL=0; the caller guarantees the kernel GS is the live one.
+    unsafe { crate::x86_64::msr::rdmsr(IA32_KERNEL_GS_BASE) }
+}
+
 /// Snapshot of a user-mode task's CPU state at trap time. Field
 /// order is load-bearing — `enter_user_mode_resume`'s naked asm
 /// reads by byte offset.

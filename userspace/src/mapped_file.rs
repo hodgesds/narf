@@ -134,6 +134,19 @@ fn existing_mapping_owners(address_space_id: u64) -> Option<MappingOwners> {
         .map(Arc::clone)
 }
 
+/// The file object a `MAP_SHARED` mapping at `va` exposes, and the absolute
+/// file offset of `va` in it — the `(inode, pgoff)` half of a shared
+/// `get_futex_key`. `None` for an address no file owner covers, and for a
+/// `MAP_PRIVATE` file mapping (whose pages belong to the mm, not the file).
+pub(crate) fn shared_file_at(address_space_id: u64, va: u64) -> Option<(Arc<dyn FileOps>, u64)> {
+    let bucket = existing_mapping_owners(address_space_id)?;
+    let owners = bucket.lock();
+    owners
+        .iter()
+        .find(|m| m.base <= va && va - m.base < m.len && !m.private_copy)
+        .map(|m| (Arc::clone(&m.ops), m.file_offset + (va - m.base)))
+}
+
 pub(crate) fn drop_address_space(address_space_id: u64) {
     // Drop the bucket (and therefore FileOps/MmapLifetime references) after
     // releasing the global index: destructors may allocate or take arbitrary

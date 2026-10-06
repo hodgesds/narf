@@ -6429,7 +6429,7 @@ impl SocketFile {
                             UnixAddr::Unnamed => "<unnamed>",
                         };
                         let _ = writeln!(
-                            narf_console::Writer,
+                            narf_console::ConsoleOnlyWriter,
                             "UNIXENQ ms={} from={} path={}",
                             narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
                             comm,

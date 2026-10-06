@@ -65,6 +65,23 @@ options, creator uid/gid and whether this is the initial mount namespace.
   Linux ABI installation before those syscalls are exposed.
 - Root-device format detection retains its separate `FsType` factory map;
   that map chooses a driver from on-disk signatures, not a userspace type name.
+- `FsInstance::always_read_only()` (default `false`) declares that every mount
+  of the instance is read-only, as Linux `fill_super` setting `SB_RDONLY`
+  does (squashfs; iso9660, whose read-write mounts Linux refuses). Every
+  mount path ORs `mnt_flags::READONLY` into such a mount, so writes are EROFS
+  at `mnt_want_write`, before any filesystem operation.
+
+### 3.0b Inode timestamps
+
+`InodeAttrs` carries `atime_ns`, `ctime_ns` and `mtime_ns`: exact wall-clock
+nanoseconds as the filesystem stores them, 0 meaning "not tracked". `stat` and
+`statx` prefer `mtime_ns` over `Stat::mtime_cycles`, whose ns→cycles→ns
+round trip is not exact. A directory's mtime comes from
+`DirOps::dir_mtime_ns()`. Disk filesystems report their on-disk times exactly
+for files and directories, at the format's precision (ext4's `*_extra`
+nanoseconds, btrfs nanoseconds, FAT 2 s, exFAT 10 ms with UTC offset, udf
+microseconds with timezone, iso9660 recording date with GMT offset, whole
+seconds for minix/squashfs/9P2000). Times before the epoch clamp to 0.
 
 `devfs::register_provider(DeviceProvider)` registers a named device family with
 file lookup, directory lookup and enumeration callbacks. Replacement is
@@ -316,6 +333,14 @@ blocking read. File operations do not expose a separate readiness predicate
 for callers to re-classify a zero-byte result.
 `poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
 descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
+`llseek(offset, whence) -> Option<Result<u64, i64>>` defaults to `None`
+(generic byte-position `lseek`); a device whose position is not a byte offset
+returns `Some` and fully answers `lseek(2)` after the `SEEK_MAX` check — today
+only `/dev/kmsg` (`devkmsg_llseek`: SEEK_SET/END/DATA with offset 0, `ESPIPE`
+for a non-zero offset, `EINVAL` otherwise). `/dev/kmsg` is record-based: one
+record per `read`, a per-open sequence cursor (readiness keys off it, never off
+the file offset), `EINVAL` for a too-small buffer, `EPIPE` after overrun, and
+`<N>`-prefixed injection on `write`.
 `poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance
 one component whenever an edge-relevant source changes so `EPOLLET` cannot
 lose a drain/refill transition between readiness scans.
@@ -407,7 +432,10 @@ distinct through VFS stat and readdir translation, carry Linux `st_rdev`
 values, and expose stable non-zero inode identities. The root accepts runtime
 device-node, directory, and symlink creation plus rename/removal. Dynamic
 device nodes preserve type, mode, uid/gid, rdev, and inode across lookups;
-dynamic directories preserve mode and inode identity. This covers
+dynamic directories preserve mode and inode identity. An unclaimed dynamic
+character or block dev_t remains stat-able and available to `O_PATH`, but an
+ordinary open returns `ENXIO`; it never exposes fabricated EOF or
+write-discard I/O. This covers
 udev coldplug nodes, `/dev/{char,block}/MAJOR:MINOR`, and journald's
 `/dev/log -> /run/systemd/journal/dev-log`; static device aliases retain
 precedence over dynamic names and absent optional hardware nodes are not

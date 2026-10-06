@@ -157,11 +157,14 @@ test!(sound_namespace_metadata_and_links, {
         .ok_or("sound class is not a directory")?;
     let entries =
         poll_once(class.enumerate_async(0, usize::MAX)).map_err(|_| "class readdir failed")?;
-    for (name, minor) in [
+    for (node_index, (name, minor)) in [
         (format!("controlC{index}"), index * 32),
         (format!("pcmC{index}D0p"), index * 32 + 16),
         (format!("pcmC{index}D0c"), index * 32 + 24),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         if !entries
             .iter()
             .any(|(n, t)| n == &name && *t == FileType::Symlink)
@@ -174,6 +177,18 @@ test!(sound_namespace_metadata_and_links, {
             || file.stat().mode.perms != 0o660
         {
             return Err("sound device stat is incorrect");
+        }
+        // The devfs lookup wrapper is transient, but the device inode is not:
+        // udev's ownership/mode update must survive a new lookup without
+        // selecting a distribution-specific audio gid in the driver.
+        let uid = 1000 + node_index as u32;
+        let gid = 2000 + node_index as u32;
+        let mode = 0o620 + node_index as u16;
+        poll_once(file.set_owners(uid, gid)).map_err(|_| "sound node chown failed")?;
+        poll_once(file.set_perms(mode)).map_err(|_| "sound node chmod failed")?;
+        let reopened = dev(&name)?;
+        if reopened.owners() != (uid, gid) || reopened.stat().mode.perms != mode {
+            return Err("sound devfs metadata did not persist across lookup");
         }
         let path = format!("class/sound/{name}");
         if text(&format!("{path}/dev"))? != format!("116:{minor}\n")
@@ -202,6 +217,8 @@ test!(sound_namespace_removal_preserves_open_lease, {
     let fixture = Fixture::new();
     let index = fixture.index;
     let file = dev(&format!("pcmC{index}D0p"))?;
+    poll_once(file.set_owners(123, 456)).map_err(|_| "PCM chown failed")?;
+    poll_once(file.set_perms(0o620)).map_err(|_| "PCM chmod failed")?;
     poll_once(file.write(0, &[0; 16])).map_err(|_| "initial PCM write failed")?;
     crate::unregister_hardware_card(index);
     for path in [
@@ -220,6 +237,9 @@ test!(sound_namespace_removal_preserves_open_lease, {
     }
     if dev(&format!("controlC{index}")).is_ok() || crate::open_playback(index, 0).is_ok() {
         return Err("removed card still accepts opens");
+    }
+    if file.owners() != (123, 456) || file.stat().mode.perms != 0o620 {
+        return Err("unplug changed metadata on an open sound device inode");
     }
     let proc_root = narf_filesystem::procfs::ProcFs.root();
     if poll_once(narf_filesystem::resolve_async(

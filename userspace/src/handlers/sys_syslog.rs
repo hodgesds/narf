@@ -20,20 +20,9 @@ const ACTION_SIZE_BUFFER: i64 = 10;
 /// previous level under and `CONSOLE_ON` looks for.
 const LOGLEVEL_DEFAULT: u32 = u32::MAX;
 
-/// Where `SYSLOG_ACTION_READ` has consumed to, as an ABSOLUTE byte position
-/// in the log's history — Linux's `syslog_seq`.
-///
-/// Absolute rather than an offset into the live region: the ring wraps, so
-/// an offset silently comes to mean a different byte every time a record is
-/// written. An absolute position that falls off the back of the ring is
-/// detectable, which is what lets this do what Linux does when the messages
-/// a reader was waiting on are gone — "move to first one" rather than
-/// return something arbitrary.
-static SYSLOG_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Where `SYSLOG_ACTION_CLEAR` last cleared to. `READ_ALL` reports only
-/// what was written after it.
-static SYSLOG_CLEAR_SEQ: AtomicU64 = AtomicU64::new(0);
+// The READ cursor (`syslog_seq` / `syslog_partial`) and `clear_seq` live in
+// the kernel log store (`narf_console::klog`): `/dev/kmsg`'s SEEK_DATA reads
+// `clear_seq` too, and both must move under the store's lock.
 
 /// `saved_console_loglevel` — `CONSOLE_OFF` parks the current level here so
 /// `CONSOLE_ON` can put it back.
@@ -59,40 +48,15 @@ fn syslog_action_restricted(_action: i64) -> bool {
     true
 }
 
-/// Clamp an absolute position into the live region, returning the offset to
-/// read from and whether the position had fallen off the back.
-///
-/// `if (info.seq != syslog_seq) { syslog_seq = info.seq; syslog_partial = 0; }`
-/// — Linux's spelling of the same thing. A reader that was too slow does not
-/// get a short read of whatever happens to be there now; it gets moved to
-/// the oldest surviving byte.
-fn live_offset(abs: u64, written: u64, live: usize) -> (usize, u64) {
-    let oldest = written - live as u64;
-    if abs < oldest {
-        (0, oldest)
-    } else {
-        ((abs - oldest) as usize, abs)
-    }
-}
-
-/// Copy `[from, written)` — capped at `len` — to `buf`, returning bytes
-/// written or a negative errno.
-fn emit(buf: u64, len: usize, from: u64, written: u64, live: usize) -> i64 {
-    let (off, _) = live_offset(from, written, live);
-    let avail = live.saturating_sub(off);
-    let n = avail.min(len);
-    if n == 0 {
+/// Copy `text` to the user buffer, returning its length or `-EFAULT`.
+fn copy_out(buf: u64, text: &[u8]) -> i64 {
+    if text.is_empty() {
         return 0;
     }
-    let mut tmp = alloc::vec![0u8; n];
-    let got = narf_console::klog::read_at(off, &mut tmp);
-    if got == 0 {
-        return 0;
-    }
-    // SAFETY: copy_to_user range-validates the destination; `got <= len` is
-    // the caller-declared capacity.
-    match unsafe { copy_to_user(buf, &tmp[..got]) } {
-        Ok(_) => got as i64,
+    // SAFETY: copy_to_user range-validates the destination; `text.len()` is
+    // at most the caller-declared capacity.
+    match unsafe { copy_to_user(buf, text) } {
+        Ok(_) => text.len() as i64,
         Err(_) => -EFAULT,
     }
 }
@@ -138,41 +102,37 @@ pub(crate) fn sys_syslog(ctx: &mut dyn TrapContext) {
             } else if validate_user_range(buf, len as usize).is_err() {
                 // `if (!access_ok(buf, len)) return -EFAULT;`
                 -EFAULT
+            } else if action == ACTION_READ {
+                // `syslog_print`: whole records while they fit, the first
+                // one partially when not even it fits (the remainder comes
+                // on the next call), "<prio>[secs.usecs] text\n" per line.
+                //
+                // LINUX-GAP: Linux blocks (`wait_event_interruptible`) when
+                // nothing is unread; this returns 0 instead.
+                let cap = (len as usize).min(narf_console::klog::syslog_size_unread().max(1));
+                let mut tmp = alloc::vec![0u8; cap];
+                let n = narf_console::klog::syslog_read(&mut tmp);
+                copy_out(buf, &tmp[..n])
             } else {
-                let (written, live) = narf_console::klog::span();
-                if action == ACTION_READ {
-                    // Destructive read: advance the cursor past what was
-                    // returned, so a second call continues rather than
-                    // repeating. This is the `/proc/kmsg` drain shape.
-                    let from = SYSLOG_SEQ.load(Ordering::Acquire);
-                    let (_, from) = live_offset(from, written, live);
-                    let n = emit(buf, len as usize, from, written, live);
-                    if n > 0 {
-                        SYSLOG_SEQ.store(from + n as u64, Ordering::Release);
-                    }
-                    n
-                } else {
-                    // `syslog_print_all`: the LAST `len` bytes, not the
-                    // first — `dmesg` with a small buffer wants the most
-                    // recent output, and a head-first read would hand it
-                    // the boot banner forever.
-                    let clear = SYSLOG_CLEAR_SEQ.load(Ordering::Acquire);
-                    let (_, floor) = live_offset(clear, written, live);
-                    let start = core::cmp::max(floor, written.saturating_sub(len as u64));
-                    let n = emit(buf, len as usize, start, written, live);
-                    if action == ACTION_READ_CLEAR && n >= 0 {
-                        SYSLOG_CLEAR_SEQ.store(written, Ordering::Release);
-                    }
-                    n
-                }
+                // `syslog_print_all`: the NEWEST records that fit in `len`
+                // (not the first `len` bytes — `dmesg` with a small buffer
+                // wants what just happened), from `clear_seq` on; READ_CLEAR
+                // then moves `clear_seq` past what it returned. The kernel
+                // buffer is sized to the text available (plus slack for
+                // records racing in), not to an arbitrarily large `len`;
+                // when it is smaller than `len`, everything fits either way.
+                let want = narf_console::klog::syslog_all_size();
+                let cap = (len as usize).min(want + 4096);
+                let mut tmp = alloc::vec![0u8; cap];
+                let n = narf_console::klog::syslog_read_all(&mut tmp, action == ACTION_READ_CLEAR);
+                copy_out(buf, &tmp[..n])
             }
         }
 
-        // `syslog_clear()` — the bytes stay in the ring (Linux's is a
-        // sequence bump too); what changes is where READ_ALL starts.
+        // `syslog_clear()` — the records stay; what changes is where
+        // READ_ALL (and `/dev/kmsg` SEEK_DATA) starts.
         ACTION_CLEAR => {
-            let (written, _) = narf_console::klog::span();
-            SYSLOG_CLEAR_SEQ.store(written, Ordering::Release);
+            narf_console::klog::syslog_clear();
             0
         }
 
@@ -217,18 +177,12 @@ pub(crate) fn sys_syslog(ctx: &mut dyn TrapContext) {
             }
         }
 
-        // Bytes the READ cursor has not consumed. Linux reports the size of
-        // the formatted text; NARF's ring holds the text itself, so the
-        // count is exact rather than estimated.
-        ACTION_SIZE_UNREAD => {
-            let (written, live) = narf_console::klog::span();
-            let from = SYSLOG_SEQ.load(Ordering::Acquire);
-            let (off, _) = live_offset(from, written, live);
-            live.saturating_sub(off) as i64
-        }
+        // Formatted bytes the READ cursor has not consumed
+        // (`get_record_print_text_size` summed, minus `syslog_partial`).
+        ACTION_SIZE_UNREAD => narf_console::klog::syslog_size_unread() as i64,
 
         // `error = log_buf_len;`
-        ACTION_SIZE_BUFFER => narf_console::klog::RING_CAPACITY as i64,
+        ACTION_SIZE_BUFFER => narf_console::klog::log_buf_len() as i64,
 
         _ => -EINVAL,
     };
@@ -238,8 +192,7 @@ pub(crate) fn sys_syslog(ctx: &mut dyn TrapContext) {
 /// Test hook — put the syslog cursors back where a fresh boot has them.
 #[doc(hidden)]
 pub fn __test_syslog_reset() {
-    SYSLOG_SEQ.store(0, Ordering::Release);
-    SYSLOG_CLEAR_SEQ.store(0, Ordering::Release);
+    narf_console::klog::__reset_syslog_cursors();
     SAVED_CONSOLE_LOGLEVEL.store(LOGLEVEL_DEFAULT, Ordering::Release);
     narf_console::klog::set_console_loglevel(narf_console::klog::DEFAULT_CONSOLE_LOGLEVEL);
 }

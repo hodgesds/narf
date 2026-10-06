@@ -1924,3 +1924,61 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_signal_rt_tgsigqueueinfo_exact_errnos
 );
+
+/// A user page fault's SIGSEGV `si_code` says whether a VMA covered the
+/// address: `SEGV_MAPERR` (1) for none, `SEGV_ACCERR` (2) for a VMA whose
+/// permissions refused the access (Linux `do_user_addr_fault`:
+/// `bad_area_nosemaphore`/`bad_area` vs `bad_area_access_error`). Fault
+/// handlers branch on it — NARF answered ACCERR for every #PF, so a NULL
+/// deref read as a protection hit.
+fn smoke_abi_signal_page_fault_si_code_maperr_vs_accerr() -> TestResult {
+    const PROT_READ: u64 = 0x1;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const SEGV_MAPERR: i32 = 1;
+    const SEGV_ACCERR: i32 = 2;
+    with_setup(|| {
+        install_test_address_space()?;
+        let len = 2 * 4096;
+        let base = match call(
+            Syscall::Mmap.raw(),
+            SyscallArgs {
+                arg0: 0,
+                arg1: len,
+                arg2: PROT_READ,
+                arg3: MAP_PRIVATE | MAP_ANONYMOUS,
+                arg4: u64::MAX,
+                arg5: 0,
+            },
+        ) {
+            Some(v) if v > 0 => v as u64,
+            _ => return Err("mmap(PROT_READ, anonymous) failed"),
+        };
+        // A write into a PROT_READ VMA: the region exists, the access is
+        // refused.
+        if crate::handlers::page_fault_si_code(base + 8) != SEGV_ACCERR {
+            return Err("fault inside a mapped PROT_READ VMA was not SEGV_ACCERR");
+        }
+        if crate::handlers::page_fault_si_code(base + len - 1) != SEGV_ACCERR {
+            return Err("fault on the VMA's last byte was not SEGV_ACCERR");
+        }
+        // Unmap the tail page: the hole is no VMA at all.
+        if call(Syscall::Munmap.raw(), a1(base + 4096, 4096)) != Some(0) {
+            return Err("munmap of the tail page failed");
+        }
+        if crate::handlers::page_fault_si_code(base + 4096) != SEGV_MAPERR {
+            return Err("fault in an unmapped hole was not SEGV_MAPERR");
+        }
+        if crate::handlers::page_fault_si_code(0) != SEGV_MAPERR {
+            return Err("NULL deref was not SEGV_MAPERR");
+        }
+        if crate::handlers::page_fault_si_code(base) != SEGV_ACCERR {
+            return Err("surviving head page stopped reporting SEGV_ACCERR");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_page_fault_si_code_maperr_vs_accerr
+);

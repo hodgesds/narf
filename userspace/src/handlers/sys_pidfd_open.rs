@@ -30,30 +30,41 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
         return;
     }
     // `pidfd_open(2)` accepts a PID in the caller's namespace. Keep the
-    // pidfd itself keyed by the outer ProcessId, like pidfd exit notification
+    // pidfd itself keyed by the outer id, like pidfd exit notification
     // and signal delivery. Without this translation, systemd's executor in a
     // PID namespace opened inner PID 4 as outer PID 4, SIGKILLed an unrelated
     // stale process, then blocked forever in waitid(P_PIDFD) for its real
     // sandbox helper.
+    //
+    // `p = find_get_pid(pid); if (!p) return -ESRCH;` (kernel/pid.c:699),
+    // then `pidfd_prepare` (kernel/fork.c:1883-1891):
+    //
+    //     if (!pid_has_task(pid, PIDTYPE_PID))                 return -ESRCH;
+    //     if (!(flags & PIDFD_THREAD) && !pid_has_task(pid, PIDTYPE_TGID))
+    //                                                          return -ENOENT;
+    //
+    // A zombie keeps its pid binding until it is reaped, so "no task" here is
+    // a pid that was never used or has been reaped: -ESRCH, never a pidfd
+    // that reads as already exited. A non-leader thread's tid names a task
+    // but no thread group: -ENOENT unless the caller asked for PIDFD_THREAD.
     let task = current_task_id();
-    let pid_raw = match accept_pid_from(task, user_pid) {
-        Some(pid) => pid,
-        None => {
-            // `pid = find_get_pid(pid); if (!pid) return -ESRCH;` — the pid is
-            // well-formed but names no process, which is a different answer
-            // from the -EINVAL above and the -EMFILE below.
-            ctx.set_return(errno_ret(ESRCH));
-            return;
-        }
+    let Some(target) = find_task_by_vpid(task, user_pid as i32) else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
     };
-    // Pid is alive if it has a registered PID→TaskId mapping. A
-    // missing mapping means the pid was never minted or its task has
-    // already torn down — treat as zombie (immediately readable). The
-    // resolved TaskId (if any) is the authoritative, reuse-safe exit signal
-    // for `poll_readiness`.
-    let target_tid = pid_to_task_raw(pid_raw);
-    let alive = target_tid.is_some();
-    let state = crate::pidfd::mint_for(pid_raw, target_tid.unwrap_or(0), alive);
+    let is_leader = process_state_key(target) == target;
+    if !is_leader && flags & PIDFD_THREAD == 0 {
+        ctx.set_return(errno_ret(ENOENT));
+        return;
+    }
+    // The outer id the pidfd is keyed by: the process id for a leader, the
+    // thread's own tid for a PIDFD_THREAD pidfd on a non-leader.
+    let pid_raw = if is_leader {
+        task_to_pid_raw(target).unwrap_or(target)
+    } else {
+        task_to_linux_tid_raw(target).unwrap_or(target)
+    };
+    let state = crate::pidfd::mint_for(pid_raw, target, true);
     let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
         alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(state));
     let new_fd = match fd::install(task, crate::fd::FdEntry {

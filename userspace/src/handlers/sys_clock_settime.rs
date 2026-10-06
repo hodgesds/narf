@@ -25,6 +25,26 @@ pub(crate) fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
     let ts = args.arg1;
+    // POSIX CPU clocks DO have a `clock_set`: after the timespec copy
+    // (-EFAULT), `posix_cpu_clock_set` validates the target with
+    // `pid_for_clock(clock, false)` (-EINVAL) and otherwise refuses with
+    // -EPERM — a CPU clock can never be set (posix-cpu-timers.c:180-188).
+    let cpu_clock = id as i32;
+    if is_cpu_clock(cpu_clock) {
+        let mut kbuf = [0u8; 16];
+        // SAFETY: copy_from_user range-validates and fault-brackets the read.
+        if ts == 0 || unsafe { copy_from_user(&mut kbuf, ts) }.is_err() {
+            ctx.set_return(errno_ret(EFAULT));
+            return;
+        }
+        let errno = if cpu_clock_target(current_task_id(), cpu_clock, false).is_some() {
+            EPERM
+        } else {
+            EINVAL
+        };
+        ctx.set_return(errno_ret(errno));
+        return;
+    }
     // (1) Clock-id validation FIRST (Linux clockid_to_kclock / clock_set).
     if id != CLOCK_REALTIME {
         ctx.set_return(errno_ret(EINVAL));

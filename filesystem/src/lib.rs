@@ -303,6 +303,12 @@ pub struct InodeAttrs {
     /// `st_ctim` in wall-clock nanoseconds since the epoch. Distinct from
     /// mtime: a `chmod` moves ctime and leaves mtime alone.
     pub ctime_ns: u64,
+    /// `st_mtim` in wall-clock nanoseconds since the epoch, exactly as the
+    /// filesystem stores it. When non-zero it takes precedence over
+    /// [`Stat::mtime_cycles`], whose ns→cycles→ns round trip is not exact:
+    /// an on-disk whole second came back a few nanoseconds short, and
+    /// fontconfig's cache check compares `st_mtim` to the nanosecond.
+    pub mtime_ns: u64,
     /// Whether this filesystem fills the struct at all. Without it a real
     /// `nlink` of 0 (an unlinked `O_TMPFILE` inode) is indistinguishable
     /// from "not tracked".
@@ -1176,6 +1182,16 @@ pub trait FileOps: Send + Sync {
 
     fn seek<'a>(&'a self, _offset: u64, _whence: u32) -> FsFuture<'a, u64> {
         Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    /// A file-specific `llseek` (`file_operations.llseek`) that REPLACES the
+    /// generic byte-position arithmetic of `lseek(2)`. `None` (the default)
+    /// keeps the generic path; `Some(Ok(v))` is lseek's return value;
+    /// `Some(Err(e))` is a positive Linux errno. `lseek` validates `whence`
+    /// against `SEEK_MAX` before calling this. For devices whose position is
+    /// not a byte offset — `/dev/kmsg`'s record cursor (`devkmsg_llseek`).
+    fn llseek(&self, _offset: i64, _whence: u32) -> Option<Result<u64, i64>> {
+        None
     }
 
     fn copy_file_range_to<'a>(
@@ -2389,6 +2405,15 @@ pub trait FsInstance: Send + Sync + 'static {
     /// adapters that forward a source filesystem override it.
     fn backing_identity(&self) -> usize {
         self as *const Self as *const () as usize
+    }
+
+    /// Whether every mount of this filesystem is read-only regardless of the
+    /// requested flags — Linux filesystems whose `fill_super` sets
+    /// `SB_RDONLY` unconditionally (squashfs, isofs). The VFS then refuses
+    /// writes at the mount (`mnt_want_write` -> EROFS) before any filesystem
+    /// operation runs, so e.g. `link(2)` is EROFS, never EXDEV or EPERM.
+    fn always_read_only(&self) -> bool {
+        false
     }
 
     /// The single file this mount exposes, when the mount root is a FILE
@@ -4392,6 +4417,11 @@ impl MountNamespace {
         flags: u64,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
+        let flags = if fs.always_read_only() {
+            flags | mnt_flags::READONLY
+        } else {
+            flags
+        };
         let root = pathwalk::Dentry::root(fs.root());
         let handle = Cap::<MountPoint, Write>::bootstrap();
         let store = self.store();
@@ -4823,6 +4853,11 @@ impl VfsRegistry {
         authority.check_live()?;
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let arc: Arc<dyn FsInstance> = Arc::new(fs);
+        let flags = if arc.always_read_only() {
+            flags | mnt_flags::READONLY
+        } else {
+            flags
+        };
         let root = pathwalk::Dentry::root(arc.root());
         let mut q = self.inner.lock();
         q.push(Mount {
@@ -4869,6 +4904,11 @@ impl VfsRegistry {
         flags: u64,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
+        let flags = if fs.always_read_only() {
+            flags | mnt_flags::READONLY
+        } else {
+            flags
+        };
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let root = pathwalk::Dentry::root(fs.root());
         let mut q = self.inner.lock();

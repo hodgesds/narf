@@ -3881,45 +3881,41 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let count_kernel = attr.flags & PERF_ATTR_FLAG_EXCLUDE_KERNEL == 0;
     let count_user = attr.flags & PERF_ATTR_FLAG_EXCLUDE_USER == 0;
 
-    // A positive pid is in the CALLER's pid namespace (Linux
-    // kernel/events/core.c find_task_by_vpid). Translate inner -> outer once;
-    // the raw inner pid resolved to whatever ROOT-namespace task owned the
-    // same number, so `perf record -p <inner>` in a container profiled the
-    // wrong host task. An inner pid not bound in the caller's namespace is
-    // ESRCH. `target_outer` is the OUTER ProcessId, kept for the sample-record
-    // rendering below.
-    let target_outer = if pid > 0 {
-        match crate::handlers::accept_pid_from(task, pid as u64) {
-            Some(outer) => outer,
-            None => {
-                ctx.set_return(errno_ret(ESRCH));
-                return;
-            }
-        }
+    // `pid != -1` names a task (kernel/events/core.c:13910): 0 is current,
+    // anything else `find_task_by_vpid(pid)` in the CALLER's pid namespace
+    // (`find_lively_task_by_vpid`, :5082) — any thread, a non-leader's tid
+    // included, never a raw scheduler TaskId; a miss, including any negative
+    // pid other than -1, is -ESRCH. Linux validates `group_fd` (-EBADF, :13893)
+    // before this lookup, so a bad group fd outranks a missing task.
+    // `target_pid` is the target's OUTER thread-group id, kept for the
+    // sample-record rendering below.
+    let (target_task, target_pid) = if pid == -1 {
+        // A per-CPU event with no task target.
+        (u64::MAX, u64::MAX)
     } else {
-        0
-    };
-    let target_task = if pid == 0 {
-        task
-    } else if pid > 0 {
-        match crate::handlers::pid_to_task_raw(target_outer) {
-            Some(target) => target,
-            None if target_outer == task => task,
-            None => {
-                ctx.set_return(errno_ret(ESRCH));
-                return;
-            }
-        }
-    } else {
-        // pid == -1 denotes a per-CPU event with no task target.
-        u64::MAX
-    };
-    let target_pid = if pid == 0 {
-        crate::handlers::task_to_pid_raw(task).unwrap_or(task)
-    } else if pid > 0 {
-        target_outer
-    } else {
-        u64::MAX
+        let found = if pid == 0 {
+            Some(task)
+        } else {
+            crate::handlers::find_task_by_vpid(task, pid)
+        };
+        let Some(target) = found else {
+            let bad_group_fd = group_fd != -1
+                && fd::with_table(task, |t| {
+                    t.get(group_fd as u32).map(|e| {
+                        e.ops
+                            .as_any()
+                            .is_some_and(|any| any.downcast_ref::<PerfEventFile>().is_some())
+                    })
+                })
+                .flatten()
+                    != Some(true);
+            ctx.set_return(errno_ret(if bad_group_fd { EBADF } else { ESRCH }));
+            return;
+        };
+        (
+            target,
+            crate::handlers::task_to_pid_raw(target).unwrap_or(target),
+        )
     };
 
     if cpu != -1 && (cpu < 0 || !narf_lib::smp::is_online(cpu as u32)) {

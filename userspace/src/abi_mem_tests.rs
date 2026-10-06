@@ -517,8 +517,10 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_process_madvise_bad_iovcnt_pos);
 fn smoke_abi_mem_process_madvise_bad_pidfd_neg() -> TestResult {
     with_setup(|| {
         // pidfd 999 isn't an open fd → the pidfd_target_pid lookup fails →
-        // -EBADF (reached before the AS check).
-        let args = a3(999, 0, 1, 4);
+        // -EBADF (reached before the AS check). The iovec array is imported
+        // first (mm/madvise.c:2123), so it must be readable.
+        let iov = [0u64; 2];
+        let args = a3(999, iov.as_ptr() as u64, 1, 4);
         match call(Syscall::ProcessMadvise.raw(), args) {
             Some(v) if v == EBADF => Ok(()),
             Some(_) => Err("process_madvise with a bogus pidfd should be -EBADF"),
@@ -1996,3 +1998,83 @@ static VICTIM_AS: narf_lib::sync::IrqSafeSpinLock<
 fn victim_as_lookup(_task: u64) -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
     VICTIM_AS.lock().clone()
 }
+
+/// The RW → RX JIT flip over a range that spans several VMAs. Linux's
+/// `do_mprotect_pkey` walks every VMA in `[start, end)` and fails with
+/// -ENOMEM only on a hole (`if (!vma || vma->vm_start > nstart) goto out;`
+/// with `error = -ENOMEM`). NARF's `jit_mprotect` demanded ONE region
+/// covering the whole request (`perms_covering`), so a JIT range an earlier
+/// `mprotect` had split — SpiderMonkey's pattern — came back -ENOMEM and
+/// Firefox crashed on MOZ_CRASH().
+fn smoke_abi_mem_mprotect_jit_flip_spans_split_regions() -> TestResult {
+    const PROT_EXEC: u64 = 0x4;
+    with_setup(|| {
+        install_test_address_space()?;
+        narf_memory::wx::__reset_jit_grants_for_test();
+        let result = (|| {
+            let base = match call(
+                Syscall::Mmap.raw(),
+                mmap_args(
+                    0,
+                    0x3000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ),
+            ) {
+                Some(v) if v > 0 => v as u64,
+                _ => return Err("mmap of three RW pages failed"),
+            };
+            // Split it into three regions: RW | R | RW.
+            if call(
+                Syscall::MProtect.raw(),
+                a2(base + 0x1000, 0x1000, PROT_READ),
+            ) != Some(0)
+            {
+                return Err("mprotect(middle page, PROT_READ) failed");
+            }
+            match call(
+                Syscall::MProtect.raw(),
+                a2(base, 0x3000, PROT_READ | PROT_EXEC),
+            ) {
+                Some(0) => {}
+                Some(v) if v == ENOMEM => {
+                    return Err("RW->RX flip across split regions was -ENOMEM: JIT path demands one covering region")
+                }
+                _ => return Err("RW->RX flip across split regions did not return 0"),
+            }
+            // A hole in the range is still -ENOMEM, exactly.
+            let holed = match call(
+                Syscall::Mmap.raw(),
+                mmap_args(
+                    0,
+                    0x3000,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    u64::MAX,
+                    0,
+                ),
+            ) {
+                Some(v) if v > 0 => v as u64,
+                _ => return Err("second mmap failed"),
+            };
+            if call(Syscall::Munmap.raw(), a1(holed + 0x1000, 0x1000)) != Some(0) {
+                return Err("munmap of the middle page failed");
+            }
+            match call(
+                Syscall::MProtect.raw(),
+                a2(holed, 0x3000, PROT_READ | PROT_EXEC),
+            ) {
+                Some(v) if v == ENOMEM => Ok(()),
+                _ => Err("RW->RX flip over a range with a hole must be -ENOMEM"),
+            }
+        })();
+        narf_memory::wx::__reset_jit_grants_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mprotect_jit_flip_spans_split_regions
+);

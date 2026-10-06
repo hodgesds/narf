@@ -37,6 +37,62 @@ pub const I_FLAGS_INDEX: u32 = 0x0000_1000;
 /// `EXT4_EXTENTS_FL`.
 pub const I_FLAGS_EXTENTS: u32 = 0x0008_0000;
 
+/// `i_flags` bit: the inode's data lives inline in `i_block` / the in-inode
+/// xattr area. Matches `EXT4_INLINE_DATA_FL`.
+pub const I_FLAGS_INLINE_DATA: u32 = 0x1000_0000;
+
+/// One ext4 `*_extra` timestamp word as read from disk, kept with the
+/// 32-bit seconds it extends. `fs/ext4/ext4.h::ext4_decode_extra_time`: the
+/// low `EXT4_EPOCH_BITS` (2) widen the signed seconds by `<< 32`, the upper
+/// 30 bits are nanoseconds.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct TimeExtra {
+    /// `i_*time` as stored alongside `extra`.
+    pub seconds: u32,
+    /// The raw `i_*time_extra` word.
+    pub extra: u32,
+}
+
+const EXT4_EPOCH_MASK: u32 = 0b11;
+const EXT4_GOOD_OLD_INODE_SIZE: usize = 128;
+const I_CTIME_EXTRA_OFF: usize = 132;
+const I_MTIME_EXTRA_OFF: usize = 136;
+const I_ATIME_EXTRA_OFF: usize = 140;
+
+/// Whether a large inode's `i_extra_isize` covers the 4-byte field at
+/// `off` (Linux `EXT4_FITS_IN_INODE`).
+fn extra_field_fits(buf: &[u8], off: usize) -> bool {
+    if buf.len() < EXT4_GOOD_OLD_INODE_SIZE + 2 {
+        return false;
+    }
+    let extra_isize = usize::from(u16::from_le_bytes([buf[128], buf[129]]));
+    off + 4 <= EXT4_GOOD_OLD_INODE_SIZE + extra_isize && off + 4 <= buf.len()
+}
+
+fn read_time_extra(buf: &[u8], off: usize, seconds: u32) -> Option<TimeExtra> {
+    extra_field_fits(buf, off).then(|| TimeExtra {
+        seconds,
+        extra: u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]),
+    })
+}
+
+/// Wall-clock nanoseconds for an inode timestamp. The extra word only
+/// applies while the seconds are still the ones it was stored with: a
+/// timestamp NARF rewrote at seconds precision carries no nanoseconds.
+/// Times before the epoch clamp to 0 (`InodeAttrs` is unsigned).
+pub fn timestamp_ns(seconds: u32, extra: Option<TimeExtra>) -> u64 {
+    let mut secs = i64::from(seconds as i32);
+    let mut nsec = 0u64;
+    if let Some(e) = extra.filter(|e| e.seconds == seconds) {
+        secs += i64::from(e.extra & EXT4_EPOCH_MASK) << 32;
+        nsec = u64::from(e.extra >> 2);
+    }
+    if secs < 0 {
+        return 0;
+    }
+    (secs as u64) * 1_000_000_000 + nsec
+}
+
 /// Decoded subset of an on-disk inode.
 ///
 /// On-disk layout (rev-0, 128 bytes):
@@ -90,6 +146,16 @@ pub struct Inode {
     pub generation: u32,
     /// `i_block[15]` — block pointers (12 direct + 3 indirect tiers).
     pub block: [u32; I_BLOCK_LEN],
+    /// `i_file_acl` (offset 104) plus `l_i_file_acl_high` (offset 118): the
+    /// external xattr block, whose sectors `i_blocks` includes. Decoded,
+    /// never encoded.
+    pub file_acl: u64,
+    /// ext4 `i_atime_extra` / `i_ctime_extra` / `i_mtime_extra` (large-inode
+    /// offsets 140 / 132 / 136), each with the 32-bit seconds it was stored
+    /// next to. `None` when the inode has no room for the field.
+    pub atime_extra: Option<TimeExtra>,
+    pub ctime_extra: Option<TimeExtra>,
+    pub mtime_extra: Option<TimeExtra>,
     /// Whether the slot carries any extended attribute: an `i_file_acl`
     /// block, or the in-inode `EXT4_XATTR_MAGIC`. Decoded, never encoded —
     /// a hint that lets a lookup skip the xattr read for the (common)
@@ -120,8 +186,8 @@ impl Inode {
         let blocks = u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]);
         let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
         let generation = u32::from_le_bytes([buf[100], buf[101], buf[102], buf[103]]);
-        let file_acl = u32::from_le_bytes([buf[104], buf[105], buf[106], buf[107]]) != 0
-            || u16::from_le_bytes([buf[118], buf[119]]) != 0;
+        let file_acl = u64::from(u32::from_le_bytes([buf[104], buf[105], buf[106], buf[107]]))
+            | (u64::from(u16::from_le_bytes([buf[118], buf[119]])) << 32);
         let ibody = buf.len() > 130 && {
             let magic_at = 128 + u16::from_le_bytes([buf[128], buf[129]]) as usize;
             magic_at + 4 <= buf.len()
@@ -151,7 +217,11 @@ impl Inode {
             flags,
             generation,
             block,
-            has_xattrs: file_acl || ibody,
+            file_acl,
+            atime_extra: read_time_extra(buf, I_ATIME_EXTRA_OFF, atime),
+            ctime_extra: read_time_extra(buf, I_CTIME_EXTRA_OFF, ctime),
+            mtime_extra: read_time_extra(buf, I_MTIME_EXTRA_OFF, mtime),
+            has_xattrs: file_acl != 0 || ibody,
         })
     }
 
@@ -172,9 +242,44 @@ impl Inode {
         self.flags & I_FLAGS_INDEX != 0
     }
 
+    /// `true` when `i_block` holds the symlink target text rather than block
+    /// pointers or an extent root. Mirrors `fs/ext4/inode.c::
+    /// ext4_inode_is_fast_symlink` (non-`ea_inode` arm): an inline-data
+    /// inode is never fast, and the external xattr block is excluded from
+    /// `i_blocks` before the zero test. `block_size` is the volume block
+    /// size, which is the cluster size without bigalloc.
+    pub fn is_fast_symlink(&self, block_size: u32) -> bool {
+        if !self.is_symlink() || self.flags & I_FLAGS_INLINE_DATA != 0 {
+            return false;
+        }
+        let ea_sectors = if self.file_acl != 0 {
+            block_size >> 9
+        } else {
+            0
+        };
+        self.blocks.wrapping_sub(ea_sectors) == 0
+    }
+
     /// `true` when this inode's `i_block` stores an ext4 extent root.
     pub fn uses_extents(&self) -> bool {
         self.flags & I_FLAGS_EXTENTS != 0
+    }
+
+    /// `st_atim` in wall-clock nanoseconds, including ext4's extra field.
+    pub fn atime_ns(&self) -> u64 {
+        timestamp_ns(self.atime, self.atime_extra)
+    }
+
+    /// `st_ctim` in wall-clock nanoseconds, including ext4's extra field.
+    pub fn ctime_ns(&self) -> u64 {
+        timestamp_ns(self.ctime, self.ctime_extra)
+    }
+
+    /// `st_mtim` in wall-clock nanoseconds, including ext4's extra field.
+    /// fontconfig keys its cache validity on a font directory's exact
+    /// `st_mtim`, so the nanoseconds must round-trip from disk.
+    pub fn mtime_ns(&self) -> u64 {
+        timestamp_ns(self.mtime, self.mtime_extra)
     }
 
     /// Encode this inode into a 128-byte buffer. Only fields we
@@ -193,6 +298,22 @@ impl Inode {
         buf[8..12].copy_from_slice(&self.atime.to_le_bytes());
         buf[12..16].copy_from_slice(&self.ctime.to_le_bytes());
         buf[16..20].copy_from_slice(&self.mtime.to_le_bytes());
+        // A large inode's `*_extra` word belongs to the seconds it was stored
+        // with. Keep it while those seconds are unchanged; a timestamp NARF
+        // rewrote at seconds precision gets nanoseconds 0 and epoch 0 rather
+        // than the old timestamp's fraction.
+        for (off, seconds, extra) in [
+            (I_ATIME_EXTRA_OFF, self.atime, self.atime_extra),
+            (I_CTIME_EXTRA_OFF, self.ctime, self.ctime_extra),
+            (I_MTIME_EXTRA_OFF, self.mtime, self.mtime_extra),
+        ] {
+            if extra_field_fits(buf, off) {
+                let word = extra
+                    .filter(|e| e.seconds == seconds)
+                    .map_or(0, |e| e.extra);
+                buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
+            }
+        }
         buf[20..24].copy_from_slice(&self.dtime.to_le_bytes());
         buf[24..26].copy_from_slice(&(self.gid as u16).to_le_bytes());
         buf[26..28].copy_from_slice(&self.links_count.to_le_bytes());
@@ -223,6 +344,10 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            file_acl: 0,
+            atime_extra: None,
+            ctime_extra: None,
+            mtime_extra: None,
             has_xattrs: false,
         }
     }
@@ -245,6 +370,10 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            file_acl: 0,
+            atime_extra: None,
+            ctime_extra: None,
+            mtime_extra: None,
             has_xattrs: false,
         }
     }
@@ -267,6 +396,10 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            file_acl: 0,
+            atime_extra: None,
+            ctime_extra: None,
+            mtime_extra: None,
             has_xattrs: false,
         }
     }
@@ -289,6 +422,10 @@ impl Inode {
             flags: 0,
             generation: 0,
             block: [0; I_BLOCK_LEN],
+            file_acl: 0,
+            atime_extra: None,
+            ctime_extra: None,
+            mtime_extra: None,
             has_xattrs: false,
         }
     }

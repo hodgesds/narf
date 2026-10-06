@@ -132,12 +132,14 @@ fn install_proc_hooks() {
         narf_userspace::handlers::proc_task_info,
     );
     // PID-namespace translation for /proc: resolve reader-namespace path
-    // numbers to outer ProcessIds, and the caller's outer pid for /proc/self.
-    // Identity in the root namespace.
+    // numbers to outer ProcessIds, the caller's outer pid for /proc/self, and
+    // the calling thread's tid for /proc/thread-self. Identity in the root
+    // namespace.
     narf_filesystem::procfs::install_proc_pidns_hooks(
         narf_userspace::handlers::proc_current_outer_pid,
         narf_userspace::handlers::proc_pid_resolve,
         narf_userspace::handlers::proc_pid_report,
+        narf_userspace::handlers::proc_current_tid,
     );
     // /proc/locks — the advisory locks this kernel holds. The file existed
     // and was always empty, under a note deferring it "when POSIX locks

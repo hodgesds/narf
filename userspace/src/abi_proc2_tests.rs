@@ -173,20 +173,20 @@ fn smoke_abi_proc2_arch_prctl_get_fs_efault() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_proc2_arch_prctl_get_fs_efault);
 
 #[cfg(target_arch = "x86_64")]
-fn smoke_abi_proc2_arch_prctl_get_gs_einval() -> TestResult {
+fn smoke_abi_proc2_arch_prctl_get_gs_efault() -> TestResult {
     with_setup(|| {
-        // ARCH_GET_GS = 0x1004 shares the not-yet-wired `ARCH_SET_GS |
-        // ARCH_GET_GS` arm with SET_GS (which the base file covers); assert
-        // the GET_GS subcode also returns -EINVAL.
+        // ARCH_GET_GS = 0x1004 with a NULL destination is `put_user`'s
+        // -EFAULT (do_arch_prctl_64). This used to pin -EINVAL, the answer of
+        // NARF's unimplemented GS arm, not Linux's.
         const ARCH_GET_GS: u64 = 0x1004;
         match call(Syscall::ArchPrctl.raw(), a1(ARCH_GET_GS, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("arch_prctl ARCH_GET_GS did not return -EINVAL"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("arch_prctl ARCH_GET_GS(NULL) did not return -EFAULT"),
         }
     })
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("syscall_abi", smoke_abi_proc2_arch_prctl_get_gs_einval);
+kernel_test_in!("syscall_abi", smoke_abi_proc2_arch_prctl_get_gs_efault);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc2_arch_prctl_unknown_einval() -> TestResult {
@@ -304,11 +304,18 @@ fn smoke_abi_proc2_kcmp_distinct_order() -> TestResult {
         // handler returns the pointer-ordering 1 or 2 — the distinct-task arm
         // the base file (which only checks the equal-self → 0 path) misses.
         const KCMP_FILE: u64 = 0;
-        crate::handlers::register_pid_task_mapping(200, 200);
-        match call(Syscall::Kcmp.raw(), a3(FAKE_TASK, 200, KCMP_FILE, 0)) {
+        // A real (registered, live) second process at a synthetic id that
+        // cannot alias a boot task: kcmp's find_task_by_vpid needs a task.
+        const OTHER: u64 = 0xC9C9;
+        crate::task::release_task(OTHER);
+        let _ = crate::task::Task::new_registered(OTHER, OTHER);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        let r = match call(Syscall::Kcmp.raw(), a3(FAKE_TASK, OTHER, KCMP_FILE, 0)) {
             Some(1) | Some(2) => Ok(()),
             _ => Err("kcmp on distinct tasks did not return an ordering (1/2)"),
-        }
+        };
+        crate::task::release_task(OTHER);
+        r
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_kcmp_distinct_order);
@@ -1573,15 +1580,19 @@ fn smoke_abi_proc2_process_vm_rejects_unmapped_inner_pid() -> TestResult {
         crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
         set_task(MANAGER_TASK);
 
-        // Inner pid 999 is not bound in the manager's namespace.
+        // Inner pid 999 is not bound in the manager's namespace. Both iovecs
+        // are non-empty: with nothing to copy Linux returns 0 before it ever
+        // looks the task up (mm/process_vm_access.c:276, :182).
+        let mut byte = [0u8; 1];
+        let iov = [byte.as_mut_ptr() as u64, 1u64];
         let r = call_raw(
             Syscall::ProcessVmReadv.raw(),
             SyscallArgs {
                 arg0: 999,
-                arg1: 0,
-                arg2: 0,
-                arg3: 0,
-                arg4: 0,
+                arg1: iov.as_ptr() as u64,
+                arg2: 1,
+                arg3: iov.as_ptr() as u64,
+                arg4: 1,
                 arg5: 0,
             },
         );
@@ -2615,3 +2626,373 @@ fn smoke_abi_proc2_prctl_name_faults() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_prctl_name_faults);
+
+// ── /proc/self + /proc/thread-self from a NON-LEADER CLONE_THREAD thread ──
+//
+// Linux (fs/proc/self.c, fs/proc/thread_self.c) renders the magic links from
+// `current` in the proc mount's pid namespace:
+//
+//     /proc/self        -> "%u"          task_tgid_nr_ns(current, ns)
+//     /proc/thread-self -> "%u/task/%u"  tgid, task_pid_nr_ns(current, ns)
+//
+// and `/proc/<tgid>/maps` (fs/proc/task_mmu.c, proc_mem_open -> mm_access)
+// walks the GROUP's mm no matter which thread reads it. glibc's
+// `pthread_getattr_np` for the initial thread scans `/proc/self/maps` for the
+// VMA holding `__libc_stack_end` and returns ENOENT when it is missing — with
+// no failing syscall. These cases drive the real resolver (open/readlink/stat
+// through a mounted ProcFs with the production procfs hooks) for a reader
+// that is a sibling thread of the group leader, whose scheduler slot is NOT
+// on a run queue — exactly the leader-running-on-another-CPU window.
+
+const TG_GROUP: u64 = 0x7C10; // outer tgid (the leader's ProcessId)
+const TG_LEADER_TASK: u64 = 0x7C11;
+const TG_THREAD_TASK: u64 = 0x7C12;
+const TG_THREAD_TID: u64 = 0x7C13; // outer Linux tid of the sibling thread
+const TG_OTHER_TASK: u64 = 0x7C14; // an unrelated single-threaded process
+const TG_OTHER_PID: u64 = 0x7C15;
+const TG_REGION_LEN: u64 = 0x3000;
+
+/// What the fixture built, in the READER's pid-namespace view.
+struct TgView {
+    base: alloc::string::String,
+    /// The group's tgid as the group's own threads name it.
+    pid: u64,
+    /// The sibling thread's tid as the group's own threads name it.
+    tid: u64,
+    /// Start of a private anonymous VMA in the group's (shared) mm.
+    region: u64,
+}
+
+fn tg_install_pidns_hooks() {
+    narf_filesystem::procfs::install_proc_pidns_hooks(
+        crate::handlers::proc_current_outer_pid,
+        crate::handlers::proc_pid_resolve,
+        crate::handlers::proc_pid_report,
+        crate::handlers::proc_current_tid,
+    );
+}
+
+/// Build a two-thread group (leader + one CLONE_THREAD sibling sharing one
+/// mm) plus an unrelated process, wire the production procfs hooks, mount
+/// ProcFs at a private base, run `body`, and undo all of it.
+fn with_thread_group(
+    namespaced: bool,
+    body: impl FnOnce(&TgView) -> Result<(), &'static str>,
+) -> TestResult {
+    with_setup(|| {
+        install_test_address_space()?;
+        // The shared mm's VMA — the stand-in for the stack VMA glibc looks
+        // for. mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS).
+        let region = match call(
+            Syscall::Mmap.raw(),
+            SyscallArgs {
+                arg0: 0,
+                arg1: TG_REGION_LEN,
+                arg2: 3,
+                arg3: 0x22,
+                arg4: u64::MAX,
+                arg5: 0,
+            },
+        ) {
+            Some(a) if a > 0 => a as u64,
+            _ => return Err("fixture mmap failed"),
+        };
+
+        for (task, pid) in [
+            (TG_LEADER_TASK, TG_GROUP),
+            (TG_THREAD_TASK, TG_GROUP),
+            (TG_OTHER_TASK, TG_OTHER_PID),
+        ] {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+        }
+        crate::handlers::register_pid_task_mapping(TG_GROUP, TG_LEADER_TASK);
+        crate::handlers::register_pid_task_mapping(TG_OTHER_PID, TG_OTHER_TASK);
+        crate::handlers::__test_register_thread(TG_THREAD_TID, TG_THREAD_TASK, TG_GROUP);
+        crate::handlers::set_proc_comm(TG_LEADER_TASK, "tgleader");
+
+        let pidns_prev = narf_filesystem::procfs::__test_pidns_hooks_snapshot();
+        tg_install_pidns_hooks();
+        let threads_prev = narf_filesystem::procfs::__test_thread_list_hook_snapshot();
+        narf_filesystem::procfs::set_thread_list_hook(crate::handlers::proc_thread_list);
+
+        let (pid, tid) = if namespaced {
+            #[cfg(feature = "container")]
+            {
+                // The leader is pid 1 of a fresh namespace; its sibling thread
+                // takes the next number there, as `prepare_clone` would.
+                let ns = crate::pid_ns::unshare_pid_ns(TG_LEADER_TASK, TG_GROUP);
+                let inner_tid = ns.bind_outer(TG_THREAD_TID);
+                crate::pid_ns::set_ns(TG_THREAD_TASK, ns);
+                (1, inner_tid)
+            }
+            #[cfg(not(feature = "container"))]
+            {
+                (TG_GROUP, TG_THREAD_TID)
+            }
+        } else {
+            (TG_GROUP, TG_THREAD_TID)
+        };
+
+        let base = alloc::string::String::from(if namespaced {
+            "/proc_tg_ns"
+        } else {
+            "/proc_tg_root"
+        });
+        let auth = bootstrap_mount_authority();
+        let outcome = match registry().mount(&auth, &base, narf_filesystem::procfs::ProcFs) {
+            Ok(handle) => {
+                let view = TgView {
+                    base: base.clone(),
+                    pid,
+                    tid,
+                    region,
+                };
+                let r = body(&view);
+                let _ = registry().unmount(&handle, &base);
+                r
+            }
+            Err(_) => Err("procfs mount failed"),
+        };
+
+        set_task(FAKE_TASK);
+        narf_filesystem::procfs::__test_thread_list_hook_restore(threads_prev);
+        narf_filesystem::procfs::__test_pidns_hooks_restore(pidns_prev);
+        crate::handlers::__test_forget_thread(TG_THREAD_TASK);
+        crate::handlers::__test_forget_task_pid(TG_LEADER_TASK);
+        crate::handlers::__test_forget_task_pid(TG_OTHER_TASK);
+        for task in [TG_LEADER_TASK, TG_THREAD_TASK, TG_OTHER_TASK] {
+            crate::task::release_task(task);
+        }
+        outcome
+    })
+}
+
+fn tg_readlink(path: &str) -> Result<alloc::string::String, &'static str> {
+    let p = alloc::format!("{}\0", path);
+    let mut buf = [0u8; 64];
+    match call_readlink(p.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64) {
+        Some(n) if n > 0 => core::str::from_utf8(&buf[..n as usize])
+            .map(alloc::string::String::from)
+            .map_err(|_| "readlink target not utf-8"),
+        _ => Err("readlink failed"),
+    }
+}
+
+/// `stat(path)` → `Ok(st_ino)` or `Err(raw return)`. `st_ino` is the second
+/// u64 of `struct stat` on both x86_64 and the generic (aarch64) layout.
+fn tg_stat_ino(path: &str) -> Result<u64, Option<i64>> {
+    let p = alloc::format!("{}\0", path);
+    let mut sb = [0u64; 32];
+    match call_stat(p.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+        Some(0) => Ok(sb[1]),
+        other => Err(other),
+    }
+}
+
+fn tg_read(path: &str) -> Result<alloc::string::String, &'static str> {
+    let p = alloc::format!("{}\0", path);
+    let mut buf = [0u8; 2048];
+    let n = read_proc_file(p.as_bytes(), &mut buf)?;
+    core::str::from_utf8(&buf[..n])
+        .map(alloc::string::String::from)
+        .map_err(|_| "proc file not utf-8")
+}
+
+/// (a)+(d): readlink of both magic links from the sibling thread (and, as the
+/// contrast, from the leader).
+fn tg_check_links(v: &TgView) -> Result<(), &'static str> {
+    let self_link = alloc::format!("{}/self", v.base);
+    let thread_link = alloc::format!("{}/thread-self", v.base);
+
+    set_task(TG_THREAD_TASK);
+    if tg_readlink(&self_link)? != alloc::format!("{}", v.pid) {
+        return Err("sibling thread: /proc/self is not \"<tgid>\"");
+    }
+    let got = tg_readlink(&thread_link)?;
+    if got == alloc::format!("{}/task/{}", v.pid, v.pid) {
+        return Err("sibling thread: /proc/thread-self named the LEADER's task entry");
+    }
+    if got != alloc::format!("{}/task/{}", v.pid, v.tid) {
+        return Err("sibling thread: /proc/thread-self is not \"<tgid>/task/<tid>\"");
+    }
+
+    // Negative: the leader's thread-self names the leader, never the sibling.
+    set_task(TG_LEADER_TASK);
+    if tg_readlink(&self_link)? != alloc::format!("{}", v.pid) {
+        return Err("leader: /proc/self is not \"<tgid>\"");
+    }
+    if tg_readlink(&thread_link)? != alloc::format!("{}/task/{}", v.pid, v.pid) {
+        return Err("leader: /proc/thread-self is not \"<tgid>/task/<tgid>\"");
+    }
+    Ok(())
+}
+
+/// (e): `/proc/thread-self/...` resolves to the CALLING thread's task entry,
+/// and `/proc/<tgid>/task/` names every thread of the group.
+fn tg_check_task_entries(v: &TgView) -> Result<(), &'static str> {
+    let b = &v.base;
+    set_task(TG_THREAD_TASK);
+    let own = tg_stat_ino(&alloc::format!("{}/{}/task/{}/comm", b, v.pid, v.tid))
+        .map_err(|_| "/proc/<tgid>/task/<sibling tid> does not resolve")?;
+    let leader = tg_stat_ino(&alloc::format!("{}/{}/task/{}/comm", b, v.pid, v.pid))
+        .map_err(|_| "/proc/<tgid>/task/<tgid> does not resolve")?;
+    let via_self = tg_stat_ino(&alloc::format!("{}/thread-self/comm", b))
+        .map_err(|_| "sibling thread: /proc/thread-self/comm does not resolve")?;
+    if own == leader {
+        return Err("task/<sibling> and task/<leader> share an inode");
+    }
+    if via_self != own {
+        return Err(
+            "sibling thread: /proc/thread-self resolved to a task entry other than its own",
+        );
+    }
+    // The leader's /proc/thread-self is the leader's entry.
+    set_task(TG_LEADER_TASK);
+    if tg_stat_ino(&alloc::format!("{}/thread-self/comm", b)) != Ok(leader) {
+        return Err("leader: /proc/thread-self did not resolve to task/<tgid>");
+    }
+    // Negative: a pid that is not a thread of this group has no task entry
+    // (proc_task_lookup -> -ENOENT).
+    if tg_stat_ino(&alloc::format!(
+        "{}/{}/task/{}/comm",
+        b,
+        v.pid,
+        TG_OTHER_PID
+    )) != Err(Some(ENOENT))
+    {
+        return Err("/proc/<tgid>/task/<pid of another process> did not fail with ENOENT");
+    }
+    Ok(())
+}
+
+/// (c): `/proc/self/maps` read by the sibling thread shows the group's mm —
+/// byte-identical to what the leader reads.
+fn tg_check_maps(v: &TgView) -> Result<(), &'static str> {
+    let maps = alloc::format!("{}/self/maps", v.base);
+    let needle = alloc::format!("{:016x}-{:016x} rw-p", v.region, v.region + TG_REGION_LEN);
+    set_task(TG_THREAD_TASK);
+    let from_thread = tg_read(&maps)?;
+    set_task(TG_LEADER_TASK);
+    let from_leader = tg_read(&maps)?;
+    if !from_thread.contains(&needle) {
+        return Err("sibling thread: /proc/self/maps is missing the group's VMA (empty mm view)");
+    }
+    if !from_leader.contains(&needle) {
+        return Err("leader: /proc/self/maps is missing the group's VMA");
+    }
+    if from_thread != from_leader {
+        return Err("sibling thread and leader read different /proc/self/maps");
+    }
+    Ok(())
+}
+
+fn smoke_abi_proc2_self_links_from_sibling_thread() -> TestResult {
+    with_thread_group(false, tg_check_links)
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_self_links_from_sibling_thread
+);
+
+fn smoke_abi_proc2_thread_self_resolves_caller_task_entry() -> TestResult {
+    with_thread_group(false, tg_check_task_entries)
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_thread_self_resolves_caller_task_entry
+);
+
+fn smoke_abi_proc2_self_maps_from_sibling_thread() -> TestResult {
+    with_thread_group(false, |v| {
+        tg_check_maps(v)?;
+        // Negative: an UNRELATED process reading /proc/<tgid>/maps must see the
+        // group's mm or nothing — never its own. The fixture's single test mm
+        // is what every reader's "current mm" resolves to, so a fix that
+        // falls back to the reader's own mm would wrongly show the VMA here.
+        set_task(TG_OTHER_TASK);
+        let foreign = tg_read(&alloc::format!("{}/{}/maps", v.base, v.pid))?;
+        if foreign.contains(&alloc::format!("{:016x}-", v.region)) {
+            return Err("an unrelated reader's own mm was rendered as /proc/<tgid>/maps");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_self_maps_from_sibling_thread);
+
+/// A per-pid file opened while its process lived and read after the process
+/// is gone answers -ESRCH (fs/proc/task_mmu.c m_start: `if (!priv->task)
+/// return ERR_PTR(-ESRCH)`; fs/proc/base.c proc_single_show: `if (!task)
+/// return -ESRCH`), not an empty read: an empty maps file is exactly what
+/// glibc's pthread_getattr_np misreports as ENOENT.
+fn smoke_abi_proc2_pid_file_read_after_exit_is_esrch() -> TestResult {
+    with_thread_group(false, |v| {
+        set_task(FAKE_TASK);
+        let mut fds = [0u64; 2];
+        for (slot, name) in fds.iter_mut().zip(["maps", "stat"]) {
+            let p = alloc::format!("{}/{}/{}\0", v.base, TG_OTHER_PID, name);
+            *slot = match call_open(p.as_ptr() as u64, 0) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("open of a live process's /proc/<pid> file failed"),
+            };
+        }
+        // Positive: while the process lives, stat reads non-empty.
+        let mut buf = [0u8; 512];
+        let p = alloc::format!("{}/{}/stat\0", v.base, TG_OTHER_PID);
+        if read_proc_file(p.as_bytes(), &mut buf)? == 0 {
+            return Err("/proc/<pid>/stat of a live process read empty");
+        }
+        // The process goes away (reaped) with its files still open.
+        crate::task::release_task(TG_OTHER_TASK);
+        for fd in fds {
+            let r = call(
+                Syscall::Read.raw(),
+                a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+            );
+            if r != Some(ESRCH) {
+                return Err(
+                    "read of /proc/<pid>/{maps,stat} after the process went away was not -ESRCH",
+                );
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_pid_file_read_after_exit_is_esrch
+);
+
+/// (b): all of the above from inside a PID namespace, where the group's own
+/// numbers (inner) differ from the outer ProcessIds and from the TaskIds.
+#[cfg(feature = "container")]
+fn smoke_abi_proc2_self_links_from_sibling_thread_pidns() -> TestResult {
+    with_thread_group(true, |v| {
+        if v.pid != 1 || v.tid == TG_THREAD_TID {
+            return Err("fixture did not give the group namespace-local numbers");
+        }
+        tg_check_links(v)?;
+        tg_check_task_entries(v)?;
+        tg_check_maps(v)?;
+        // Negative: the OUTER numbers are not names in the reader's namespace.
+        set_task(TG_THREAD_TASK);
+        if tg_stat_ino(&alloc::format!(
+            "{}/{}/task/{}/comm",
+            v.base,
+            v.pid,
+            TG_THREAD_TID
+        )) != Err(Some(ENOENT))
+        {
+            return Err("pidns: the sibling's OUTER tid resolved under task/");
+        }
+        if tg_stat_ino(&alloc::format!("{}/{}/comm", v.base, TG_GROUP)) != Err(Some(ENOENT)) {
+            return Err("pidns: the group's OUTER tgid resolved in the reader's namespace");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_self_links_from_sibling_thread_pidns
+);

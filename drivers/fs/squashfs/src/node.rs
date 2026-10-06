@@ -34,9 +34,22 @@ impl<B: BlockDevice + 'static> SquashfsNode<B> {
                 file_type: self.inode.file_type(),
                 perms: self.inode.mode & 0o7777,
             },
-            // `Stat` currently stores scheduler cycles, not wall-clock
-            // seconds.  Preserve SquashFS's wall time through native statx.
-            mtime_cycles: 0,
+            // The on-disk mtime, not 0 (every SquashFS file claimed 1970).
+            // The exact value travels in `InodeAttrs::mtime_ns`.
+            mtime_cycles: narf_time::ns_to_cycles(self.inode.mtime_ns()),
+        }
+    }
+
+    /// Exact timestamps for the stat path, which prefers `mtime_ns` over the
+    /// lossy `Stat::mtime_cycles`. Linux's `squashfs_new_inode` sets atime
+    /// and ctime to the inode's mtime (SquashFS stores no other time).
+    fn attrs(&self) -> narf_filesystem::InodeAttrs {
+        let ns = self.inode.mtime_ns();
+        narf_filesystem::InodeAttrs {
+            atime_ns: ns,
+            ctime_ns: ns,
+            mtime_ns: ns,
+            ..Default::default()
         }
     }
 
@@ -93,6 +106,10 @@ impl<B: BlockDevice + 'static> FileOps for SquashfsNode<B> {
 
     fn owners(&self) -> (u32, u32) {
         (self.inode.uid, self.inode.gid)
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.attrs()
     }
 
     fn statx_async<'a>(&'a self, _flags: u32, _mask: u32) -> FsFuture<'a, FsStatx> {
@@ -248,6 +265,17 @@ impl<B: BlockDevice + 'static> DirOps for SquashfsNode<B> {
         (self.inode.uid, self.inode.gid)
     }
 
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.attrs()
+    }
+
+    /// The directory inode's on-disk mtime. Without it every SquashFS
+    /// directory stat'd as the epoch, so fontconfig judged every font cache
+    /// stale and rescanned all fonts on application start.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.inode.mtime_ns()
+    }
+
     fn unlink<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
         readonly()
     }
@@ -310,6 +338,12 @@ impl<B: BlockDevice + 'static> DirOps for SquashfsNode<B> {
 }
 
 impl<B: BlockDevice + 'static> FsInstance for SquashfsVolume<B> {
+    /// Linux `squashfs_fill_super` sets `SB_RDONLY` unconditionally: every mount is
+    /// read-only, so writes are EROFS at the mount, before the filesystem.
+    fn always_read_only(&self) -> bool {
+        true
+    }
+
     fn root(&self) -> Arc<dyn DirOps> {
         let volume = self
             .self_weak

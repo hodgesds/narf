@@ -884,6 +884,7 @@ name = "narf-console"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
 ]
@@ -1000,6 +1001,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-time",
 ]
 
 [[package]]
@@ -1038,6 +1040,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1095,6 +1098,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1112,6 +1116,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1129,6 +1134,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1146,6 +1152,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1163,6 +1170,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]

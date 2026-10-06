@@ -642,6 +642,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if target.is_dir() {
             return Err(FsError::InvalidPath);
         }
+        // `link(2)` onto an existing name is EEXIST (`filename_create`);
+        // `dir_insert` itself would add a duplicate dirent.
+        match self.dir_lookup(&parent_inode, name).await {
+            Ok(_) => return Err(FsError::Busy),
+            Err(FsError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
         self.dir_insert(
             parent_inode_no,
             &mut parent_inode,
@@ -905,7 +912,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         if len == 0 {
             return Ok(Vec::new());
         }
-        if len <= 60 && inode.blocks == 0 {
+        if len <= 60 && inode.is_fast_symlink(self.block_size() as u32) {
             // Fast — pull from block[] serialised as 60 bytes.
             let mut bytes = [0u8; 60];
             for i in 0..super::inode::I_BLOCK_LEN {

@@ -63,19 +63,6 @@ nestedstage="$(mktemp -d)"
 imgnested="$(mktemp)"
 trap 'umount "$quotamnt" 2>/dev/null || true; umount "$squotamnt" 2>/dev/null || true; rm -rf "$stage" "$img" "$imgz" "$imgzst" "$imglzo" "$imgxx" "$imgsha" "$imgblake" "$imgsector8k" "$imgquota" "$quotamnt" "$imgsquota" "$squotamnt" "$nestedstage" "$imgnested"' EXIT
 
-mkdir -p "$stage/subdir" "$stage/snap"
-printf 'narf\n' > "$stage/hello.txt"                               # tiny -> inline extent
-python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
-    > "$stage/big.dat"                                             # 12000 B -> regular extents
-printf 'nested file\n' > "$stage/subdir/note.txt"
-printf 'inside subvol\n' > "$stage/snap/inside.txt"               # file in the snap subvolume
-ln -s hello.txt "$stage/link.txt"                                  # symlink
-ln "$stage/hello.txt" "$stage/hardlink.txt"                        # hardlink (shares hello.txt's inode)
-mknod "$stage/nulldev" c 1 3                                       # char device 1:3
-mknod "$stage/blkdev" b 8 0                                        # block device 8:0
-mkfifo "$stage/fifo"                                               # FIFO
-setfattr -n user.narf -v hi "$stage/hello.txt"                     # xattr
-
 sparse_encode() { # <image> <dst.sparse>
     python3 - "$1" "$2" <<'PY'
 import sys
@@ -105,6 +92,99 @@ print("wrote %s: total=%d runs=%d payload=%d"
       % (dst, len(data), len(runs), sum(len(b) for _, b in runs)))
 PY
 }
+
+# fixture-times.img.sparse: exact inode timestamps. `mkfs.btrfs --rootdir`
+# copies only whole seconds (and stamps ctime with the host clock), so the
+# btrfs_timespec {__le64 sec; __le32 nsec} fields of every INODE_ITEM are
+# patched to fixed values with distinct nanoseconds, the leaf CRC32C is
+# recomputed, and `btrfs check` + `dump-tree` confirm the result. Tree:
+# /, fonts/, fonts/a.txt, fonts/b.txt.
+generate_times_fixture() {
+    local tstage timg
+    tstage="$(mktemp -d)"
+    timg="$(mktemp)"
+    mkdir -p "$tstage/fonts"
+    printf 'times\n' > "$tstage/fonts/a.txt"
+    printf 'whole\n' > "$tstage/fonts/b.txt"
+    truncate -s 16M "$timg"
+    mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \
+        -O ^free-space-tree,^no-holes --rootdir "$tstage" "$timg" >/dev/null
+    python3 - "$timg" <<'PY'
+import struct, sys
+path = sys.argv[1]
+img = bytearray(open(path, 'rb').read())
+# name (via the inode's INODE_REF; "/" = the root, 256) ->
+# (atime, ctime, mtime, otime) as (sec, nsec). mkfs's inode numbering
+# follows readdir order, so objectids are looked up, not assumed.
+TIMES = {
+    '/': ((1500000000, 750000000), (1500000001, 1), (1500000000, 250000000), (1499999999, 0)),
+    'fonts': ((1650000000, 500000000), (1650000200, 2), (1650000123, 987654321), (1649999999, 3)),
+    'a.txt': ((1600000000, 7), (1700000001, 111111111), (1700000000, 123456789), (1690000000, 4)),
+    'b.txt': ((1700000000, 999999999), (1700000000, 0), (1700000000, 0), (1700000000, 999999999)),
+}
+def crc32c(data):
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFF
+fsid = img[0x10000 + 32:0x10000 + 48]
+def fs_leaves():
+    for blk in range(0, len(img), 4096):
+        node = img[blk:blk + 4096]
+        owner = struct.unpack_from('<Q', node, 88)[0]
+        if node[32:48] == fsid and owner == 5 and node[100] == 0:
+            yield blk
+def items(blk):
+    for i in range(struct.unpack_from('<I', img, blk + 96)[0]):
+        p = blk + 101 + 25 * i
+        objectid, ktype = struct.unpack_from('<QB', img, p)
+        off, size = struct.unpack_from('<II', img, p + 17)
+        yield objectid, ktype, blk + 101 + off, size
+ino_times = {256: TIMES['/']}
+for blk in fs_leaves():
+    for objectid, ktype, body, size in items(blk):
+        if ktype == 12 and objectid != 256:  # INODE_REF {index; name_len; name}
+            nlen = struct.unpack_from('<H', img, body + 8)[0]
+            name = bytes(img[body + 10:body + 10 + nlen]).decode()
+            if name in TIMES:
+                ino_times[objectid] = TIMES[name]
+patched = set()
+for blk in fs_leaves():
+    for objectid, ktype, body, size in items(blk):
+        if ktype != 1 or objectid not in ino_times or size != 160:
+            continue
+        for j, (sec, nsec) in enumerate(ino_times[objectid]):
+            struct.pack_into('<QI', img, body + 112 + 12 * j, sec, nsec)
+        patched.add(objectid)
+    img[blk:blk + 4] = struct.pack('<I', crc32c(img[blk + 32:blk + 4096]))
+assert len(patched) == len(TIMES), patched
+open(path, 'wb').write(img)
+PY
+    btrfs check "$timg" >/dev/null
+    btrfs inspect-internal dump-tree -t fs "$timg" | grep -E 'INODE_ITEM 0|INODE_REF|name: |time '
+    sparse_encode "$timg" fixture-times.img.sparse
+    rm -rf "$tstage" "$timg"
+}
+
+if [[ "${NARF_BTRFS_TIMES_ONLY:-0}" == 1 ]]; then
+    generate_times_fixture
+    exit 0
+fi
+
+mkdir -p "$stage/subdir" "$stage/snap"
+printf 'narf\n' > "$stage/hello.txt"                               # tiny -> inline extent
+python3 -c "import sys;sys.stdout.write(''.join('L%04d\n'%i for i in range(2000)))" \
+    > "$stage/big.dat"                                             # 12000 B -> regular extents
+printf 'nested file\n' > "$stage/subdir/note.txt"
+printf 'inside subvol\n' > "$stage/snap/inside.txt"               # file in the snap subvolume
+ln -s hello.txt "$stage/link.txt"                                  # symlink
+ln "$stage/hello.txt" "$stage/hardlink.txt"                        # hardlink (shares hello.txt's inode)
+mknod "$stage/nulldev" c 1 3                                       # char device 1:3
+mknod "$stage/blkdev" b 8 0                                        # block device 8:0
+mkfifo "$stage/fifo"                                               # FIFO
+setfattr -n user.narf -v hi "$stage/hello.txt"                     # xattr
 
 generate_raid_fixture() (
     profile="$1"
@@ -284,6 +364,7 @@ rm -f "$imgsector8k"
 
 generate_quota_fixture
 generate_squota_fixture
+generate_times_fixture
 
 truncate -s 16M "$imgz"
 mkfs.btrfs --csum crc32c --sectorsize 4096 --nodesize 4096 -M \

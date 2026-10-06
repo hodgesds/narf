@@ -394,9 +394,10 @@ fn smoke_abi_proc_getsid_neg() -> TestResult {
     with_setup(|| {
         // `sys_getsid` returns -ESRCH for a pid that names no live task,
         // as Linux does.
+        // (kernel/sys.c:1240 `find_task_by_vpid(pid)` → NULL → -ESRCH.)
         match call(Syscall::Getsid.raw(), a0(987654)) {
-            Some(v) if v >= 0 => Ok(()),
-            _ => Err("getsid on an unknown pid changed from the ok-default path"),
+            Some(v) if v == ESRCH => Ok(()),
+            _ => Err("getsid on an unknown pid must be -ESRCH"),
         }
     })
 }
@@ -750,17 +751,91 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_arch_prctl_pos);
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc_arch_prctl_neg() -> TestResult {
     with_setup(|| {
-        // ARCH_SET_GS = 0x1001 is not yet wired; the handler returns
-        // -EINVAL. An unknown sub-code (0x9999) likewise returns -EINVAL.
+        // do_arch_prctl_64: ARCH_SET_GS and ARCH_SET_FS both refuse a base at
+        // or above TASK_SIZE_MAX with -EPERM, before changing anything. (This
+        // used to pin -EINVAL for SET_GS: NARF had no GS support at all.)
         const ARCH_SET_GS: u64 = 0x1001;
-        match call(Syscall::ArchPrctl.raw(), a1(ARCH_SET_GS, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("arch_prctl ARCH_SET_GS did not return -EINVAL"),
+        const ARCH_SET_FS: u64 = 0x1002;
+        const ARCH_GET_FS: u64 = 0x1003;
+        const ARCH_GET_GS: u64 = 0x1004;
+        const TASK_SIZE_MAX: u64 = (1 << 47) - 4096;
+        let mut before = [0u8; 8];
+        let mut after = [0u8; 8];
+        for (set, get, name) in [
+            (ARCH_SET_GS, ARCH_GET_GS, "ARCH_SET_GS"),
+            (ARCH_SET_FS, ARCH_GET_FS, "ARCH_SET_FS"),
+        ] {
+            if call(
+                Syscall::ArchPrctl.raw(),
+                a1(get, before.as_mut_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("arch_prctl GET before the EPERM probe failed");
+            }
+            for bad in [TASK_SIZE_MAX, u64::MAX] {
+                match call(Syscall::ArchPrctl.raw(), a1(set, bad)) {
+                    Some(v) if v == EPERM => {}
+                    _ => {
+                        return Err(if name == "ARCH_SET_GS" {
+                            "arch_prctl ARCH_SET_GS(>= TASK_SIZE_MAX) was not -EPERM"
+                        } else {
+                            "arch_prctl ARCH_SET_FS(>= TASK_SIZE_MAX) was not -EPERM"
+                        })
+                    }
+                }
+            }
+            if call(Syscall::ArchPrctl.raw(), a1(get, after.as_mut_ptr() as u64)) != Some(0)
+                || before != after
+            {
+                return Err("a refused arch_prctl SET still changed the base");
+            }
         }
+        Ok(())
     })
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_arch_prctl_neg);
+
+/// `arch_prctl(ARCH_SET_GS)` then `ARCH_GET_GS` round-trips the user GS base
+/// (Firefox's wasm2c sandboxes set it for "segue" memory access and abort when
+/// it fails), and the largest valid base, TASK_SIZE_MAX - 1, is accepted.
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc_arch_prctl_gs_round_trip() -> TestResult {
+    with_setup(|| {
+        const ARCH_SET_GS: u64 = 0x1001;
+        const ARCH_GET_GS: u64 = 0x1004;
+        const TASK_SIZE_MAX: u64 = (1 << 47) - 4096;
+        let result = (|| {
+            for base in [0x0000_7f12_3456_7000u64, TASK_SIZE_MAX - 1, 0] {
+                match call(Syscall::ArchPrctl.raw(), a1(ARCH_SET_GS, base)) {
+                    Some(0) => {}
+                    Some(v) if v == EINVAL => {
+                        return Err("arch_prctl ARCH_SET_GS is still -EINVAL (unimplemented)")
+                    }
+                    _ => return Err("arch_prctl ARCH_SET_GS(valid base) did not return 0"),
+                }
+                let mut out = [0u8; 8];
+                if call(
+                    Syscall::ArchPrctl.raw(),
+                    a1(ARCH_GET_GS, out.as_mut_ptr() as u64),
+                ) != Some(0)
+                {
+                    return Err("arch_prctl ARCH_GET_GS did not return 0");
+                }
+                if u64::from_le_bytes(out) != base {
+                    return Err("ARCH_GET_GS did not read back the ARCH_SET_GS base");
+                }
+            }
+            Ok(())
+        })();
+        // Leave the inactive GS slot as boot set it.
+        // SAFETY: CPL0 test context, kernel GS live.
+        unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(0) };
+        result
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_arch_prctl_gs_round_trip);
 
 // ── set_tid_address(2) — records clear_child_tid, returns caller TID ──
 
@@ -1029,11 +1104,16 @@ fn smoke_abi_proc_pidfd_open_translates_inner_pid() -> TestResult {
         let inner =
             crate::pid_ns::inherit_into_child(FAKE_TASK, CHILD_TASK, CHILD_OUTER).unwrap_or(0);
         crate::handlers::register_pid_task_mapping(CHILD_OUTER, CHILD_TASK);
+        // A live task behind the pid: pidfd_open refuses a pid with no task
+        // (-ESRCH, kernel/fork.c:1883), exactly as Linux does.
+        crate::task::release_task(CHILD_TASK);
+        let _ = crate::task::Task::new_registered(CHILD_TASK, CHILD_OUTER);
 
         let fd = match call(Syscall::PidfdOpen.raw(), a1(inner, 0)) {
             Some(fd) if fd >= 0 => fd as u32,
             _ => {
                 crate::pid_ns::__test_reset();
+                crate::task::release_task(CHILD_TASK);
                 return Err("pidfd_open(inner pid) did not return a valid fd");
             }
         };
@@ -1042,6 +1122,7 @@ fn smoke_abi_proc_pidfd_open_translates_inner_pid() -> TestResult {
         })
         .flatten();
         crate::pid_ns::__test_reset();
+        crate::task::release_task(CHILD_TASK);
 
         if target == Some(CHILD_OUTER) {
             Ok(())
@@ -3506,3 +3587,20 @@ fn smoke_abi_proc_thread_group_member_index() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_thread_group_member_index);
+
+/// Linux advertises `HWCAP2_FSGSBASE` (bit 1) in `AT_HWCAP2` whenever it turns
+/// CR4.FSGSBASE on (arch/x86/kernel/cpu/common.c); wasm2c and other runtimes
+/// read it to pick `WRGSBASE` over `arch_prctl`. NARF enables CR4.FSGSBASE, so
+/// the bit must be set — and must be clear if the CPU never enabled it.
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc_hwcap2_fsgsbase_matches_cr4() -> TestResult {
+    const HWCAP2_FSGSBASE: u64 = 1 << 1;
+    let enabled = narf_arch::x86_64::cr::cached_cr4() & narf_arch::x86_64::cr::CR4_FSGSBASE != 0;
+    let (_, hwcap2) = crate::hwcap::hwcaps();
+    if (hwcap2 & HWCAP2_FSGSBASE != 0) != enabled {
+        return TestResult::Fail("AT_HWCAP2 FSGSBASE bit does not match CR4.FSGSBASE");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_hwcap2_fsgsbase_matches_cr4);

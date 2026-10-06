@@ -76,10 +76,18 @@ pub fn hwcaps() -> (u64, u64) {
     // SAFETY: `CPUID` leaf 1 is architecturally present on every x86_64 CPU and
     // has no side effects.
     let (_, _, _, edx) = unsafe { narf_arch::x86_64::cpuid::cpuid(1, 0) };
-    // AT_HWCAP2 on x86 carries only bits this kernel does not implement
-    // (RING3MWAIT, FSGSBASE-for-userspace), so it stays zero rather than
-    // claiming them.
-    (u64::from(edx), 0)
+    // HWCAP2_FSGSBASE (bit 1, arch/x86/include/uapi/asm/hwcap2.h): Linux sets
+    // it when CR4.FSGSBASE is on (arch/x86/kernel/cpu/common.c), telling
+    // userspace it may use RD/WR{FS,GS}BASE directly. NARF enables CR4.FSGSBASE
+    // and saves/restores both bases per task across every switch. RING3MWAIT
+    // is not implemented and stays clear.
+    const HWCAP2_FSGSBASE: u64 = 1 << 1;
+    let hwcap2 = if narf_arch::x86_64::cr::cached_cr4() & narf_arch::x86_64::cr::CR4_FSGSBASE != 0 {
+        HWCAP2_FSGSBASE
+    } else {
+        0
+    };
+    (u64::from(edx), hwcap2)
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

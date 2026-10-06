@@ -49,28 +49,13 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // Linux's `task_pid_vnr(current)` comparison is against the caller's
-    // visible PID, not NARF's internal scheduler TaskId. A service launcher
-    // obtains that value from getpid(2) and supplies it here.
+    // kernel/capability.c:233: `if (pid != 0 && pid != task_pid_vnr(current))
+    // return -EPERM;`. `task_pid_vnr` is PIDTYPE_PID — the caller's own TID
+    // in its pid namespace, i.e. what gettid(2) returns. For a thread-group
+    // leader that equals getpid(); a non-leader thread must name itself by
+    // its tid, and its leader's pid is someone else (-EPERM).
     let task = current_task_id();
-    let self_pid = task_to_pid_raw(task).unwrap_or(task);
-    // The header pid is interpreted in the CALLER's pid namespace (Linux
-    // kernel/capability.c:115 compares task_pid_vnr(current)). Translate the
-    // inner pid to its outer ProcessId before comparing against the caller's
-    // own outer self pid — a container passing getpid() (an inner value) must
-    // not hit a spurious EPERM. Audit finding #19.
-    let target_pid = if pid != 0 {
-        match accept_pid_from(task, pid as u64) {
-            Some(outer) => outer,
-            None => {
-                ctx.set_return(errno_ret(EPERM));
-                return;
-            }
-        }
-    } else {
-        0
-    };
-    if target_pid != 0 && target_pid != self_pid {
+    if pid != 0 && i64::from(pid) != linux_tid_for_task(task) as i64 {
         ctx.set_return(errno_ret(EPERM));
         return;
     }

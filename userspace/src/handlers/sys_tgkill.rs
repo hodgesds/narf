@@ -1,52 +1,46 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Linux tgkill(2): like kill but with an explicit (tgid, tid)
-/// pair. NARF is single-threaded per process — we forward tid as
-/// the kill target and ignore tgid (the disambiguation it provides
-/// will matter once threading lands).
+/// `kernel/signal.c::SYSCALL_DEFINE3(tgkill, pid_t, tgid, pid_t, pid, int, sig)`:
+///
+/// ```text
+/// if (pid <= 0 || tgid <= 0) return -EINVAL;
+/// do_send_specific(tgid, pid, sig, info):
+///     p = find_task_by_vpid(pid);                        // any thread
+///     if (p && task_tgid_vnr(p) == tgid)                 // else -ESRCH
+///         check_kill_permission(sig, info, p);           // -EINVAL bad sig
+///         if (sig) do_send_sig_info(sig, info, p, PIDTYPE_PID);
+/// ```
+///
+/// Both ids are in the caller's pid namespace; the tgid check is what makes
+/// tgkill safe against tid reuse, so a thread that is not (or no longer) in
+/// `tgid` is -ESRCH.
 pub(crate) fn sys_tgkill(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let tgid = args.arg0;
-    let esrch = errno_ret(ESRCH);
-    let tid = match signal_tid_from_user(current_task_id(), args.arg1) {
-        Some(tid) => tid,
-        None => {
-            ctx.set_return(esrch);
-            return;
-        }
-    };
+    let tgid = args.arg0 as i32;
+    let pid = args.arg1 as i32;
     let signum = args.arg2 as u32;
+    if pid <= 0 || tgid <= 0 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    let caller = current_task_id();
+    let Some(tid) = find_task_by_vpid(caller, pid) else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
+    };
+    // `task_tgid_vnr(p) == tgid`: compare in the outer number space.
+    let in_group = accept_pid_from(caller, tgid as u64)
+        .is_some_and(|outer_tgid| task_to_pid_raw(tid).unwrap_or(tid) == outer_tgid);
+    if !in_group {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
+    }
     if signum > 64 {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    // ESRCH for a dead/never-existed tid — no more phantom pending
-    // bits on arbitrary numeric keys.
-    if !signal_target_exists(tid) {
-        ctx.set_return(esrch);
-        return;
-    }
-    // The (tgid, tid) consistency check is tgkill's whole point over
-    // tkill: it prevents a recycled tid in ANOTHER process from
-    // absorbing the signal. Our tids never recycle, but the check is
-    // still Linux-visible semantics (musl relies on ESRCH here).
-    let outer_tgid = if tgid == 0 {
-        0
-    } else {
-        match accept_pid_from(current_task_id(), tgid) {
-            Some(tgid) => tgid,
-            None => {
-                ctx.set_return(esrch);
-                return;
-            }
-        }
-    };
-    if outer_tgid != 0 && task_to_pid_raw(tid).unwrap_or(tid) != outer_tgid {
-        ctx.set_return(esrch);
-        return;
-    }
-    // Null signal: existence/permission probe only — queue nothing (see sys_kill).
+    // Null signal: existence/permission probe only — queue nothing.
     if signum == 0 {
         ctx.set_return(SyscallReturn::ok(0));
         return;

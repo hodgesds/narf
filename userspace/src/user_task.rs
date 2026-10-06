@@ -194,6 +194,19 @@ pub struct UserTaskCtx {
     /// the word in userspace, so a spurious return is always safe and a
     /// lost one never happens.
     pub futex_park_seq: AtomicU64,
+    /// The rest of the parked waiter's futex KEY, for keys whose address
+    /// component is not the user VA in `futex_uaddr` — a shared op on a
+    /// `MAP_SHARED` object is keyed by `(object, offset)`, not by address
+    /// (see `handlers::get_futex_key`). Ignored for mm-scoped namespaces.
+    /// Published with `handlers::futex_park_publish` and read back with
+    /// `handlers::futex_park_key`; retargeted inside the `futex_park_seq`
+    /// window by a requeue, like the fields above.
+    pub futex_key_object: [AtomicU64; 2],
+    pub futex_key_addr: AtomicU64,
+    /// `(bitset << 32) | (node + 1)` of the parked waiter: its
+    /// `FUTEX_WAIT_BITSET` / futex2 mask and its futex2 NUMA node. Zero
+    /// decodes as MATCH_ANY and `FUTEX_NO_NODE`.
+    pub futex_key_meta: AtomicU64,
     /// Set non-null by `sys_execve` to hand a freshly-built
     /// `ExecRequest` to the polling routine. The routine takes
     /// ownership via `Box::from_raw` after the EXECVE longjmp
@@ -667,6 +680,9 @@ impl UserTaskCtx {
             futex_park_gen: AtomicU64::new(0),
             futex_val: AtomicU32::new(0),
             futex_park_seq: AtomicU64::new(0),
+            futex_key_object: [AtomicU64::new(0), AtomicU64::new(0)],
+            futex_key_addr: AtomicU64::new(0),
+            futex_key_meta: AtomicU64::new(0),
             pending_exec: AtomicPtr::new(core::ptr::null_mut()),
             pending_fs_base: AtomicU64::new(u64::MAX),
             wait_child_pending: AtomicBool::new(false),
@@ -1360,9 +1376,7 @@ fn park_should_block(
         // genuine waiter then only recovers on the ~10 ms backstop. That was
         // the CachyOS greeter stall: Qt's timed condvar waits (pthread_cond_
         // timedwait) each left a ghost, so pthread_cond_signal woke ghosts.
-        let fu = uc.futex_uaddr.load(Ordering::Acquire);
-        if fu != 0 {
-            let key = crate::handlers::futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
+        if let Some(key) = crate::handlers::futex_park_key(uc) {
             crate::handlers::futex_drop_waiter_key(key, task_id);
         }
         uc.futex_uaddr.store(0, Ordering::Release);
@@ -2595,12 +2609,7 @@ impl core::future::Future for UserTaskFuture {
             // Unqueue the futex waiter this park registered (see the own-stack
             // twin above): Linux's futex_unqueue removes it on timeout/signal
             // too, so a later FUTEX_WAKE(1) can't pop a ghost.
-            let fu = this.task.uctx.futex_uaddr.load(Ordering::Acquire);
-            if fu != 0 {
-                let key = crate::handlers::futex_key(
-                    this.task.uctx.futex_namespace.load(Ordering::Acquire),
-                    fu,
-                );
+            if let Some(key) = crate::handlers::futex_park_key(&this.task.uctx) {
                 crate::handlers::futex_drop_waiter_key(key, crate::handlers::current_task_id());
             }
             this.task.uctx.futex_uaddr.store(0, Ordering::Release);
@@ -2870,6 +2879,16 @@ impl core::future::Future for UserTaskFuture {
             // task runs on another thread's TLS (SMP multithread TLS corruption).
             #[cfg(target_arch = "x86_64")]
             narf_scheduler::stackful::set_current_user_fs_base(fs_base);
+        }
+        // The task's initial user GS base: 0 for a fresh image, the parent's
+        // for a fork/clone child. Own-stack runs this poll once per task; from
+        // then on the scheduler's per-task slot carries it across switches.
+        #[cfg(target_arch = "x86_64")]
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            // SAFETY: CPL0 with the kernel GS live; the exit `swapgs` makes
+            // this the user's GS.base.
+            unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(this.process.gs_base) };
+            narf_scheduler::stackful::set_current_user_gs_base(this.process.gs_base);
         }
 
         // Interrupts off across the iretq. The trap handler

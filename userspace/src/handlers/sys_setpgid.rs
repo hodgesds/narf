@@ -61,38 +61,35 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
     // common form of this call — setpgid(0, 0) — down the `pid < 0` arm.
     let target_is_self = pid_arg == 0;
     let group_is_target = pgid_arg == 0 || pgid_arg == pid_arg;
-    // `if (pgid < 0) return -EINVAL;` — note this fires for a negative pgid
-    // even when `pid` also names no task.
-    if pgid_arg < 0 {
+    // `if (!pgid) pgid = pid; if (pgid < 0) return -EINVAL;` — note this
+    // fires for a negative pgid even when `pid` also names no task, and for
+    // `setpgid(-n, 0)`, where the pgid takes the negative pid. (`pid == 0`
+    // was already replaced by the caller's own, positive, pid.)
+    let effective_pgid = if pgid_arg == 0 { pid_arg } else { pgid_arg };
+    if effective_pgid < 0 {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    // A negative `pid` can never resolve; find_task_by_vpid gives -ESRCH.
-    if pid_arg < 0 {
-        ctx.set_return(errno_ret(ESRCH));
-        return;
-    }
 
-    // `find_task_by_vpid(pid)` — resolved in the caller's pid namespace.
-    // `pgid_from_user` performs exactly that inner -> outer -> TaskId hop.
+    // `p = find_task_by_vpid(pid); if (!p) return -ESRCH;` — ANY thread in
+    // the caller's pid namespace, a non-leader's tid included, so that the
+    // leader check below can reject it with EINVAL rather than ESRCH. The
+    // caller always resolves, even in syscall-unit fixtures that never
+    // populate the scheduler's task registry.
     let target = if target_is_self {
         me
     } else {
-        let t = pgid_from_user(pid_arg as u64);
-        if t == 0 { 0 } else { process_state_key(t) }
+        match find_task_by_vpid(current_task_id(), pid_arg) {
+            Some(task) => task,
+            None => {
+                ctx.set_return(errno_ret(ESRCH));
+                return;
+            }
+        }
     };
-    // The caller always resolves, even in syscall-unit fixtures that never
-    // populate the scheduler's task registry; any other target must be live.
-    let target_exists =
-        target != 0 && (target == me || crate::task::task_get(target).is_some());
-    if !target_exists {
-        ctx.set_return(errno_ret(ESRCH));
-        return;
-    }
 
     // `if (!thread_group_leader(p)) return -EINVAL;` — a bare thread cannot
-    // be moved between process groups. NARF marks a thread by mapping its
-    // TaskId onto a DIFFERENT process key; a group leader is its own key.
+    // be moved between process groups. A group leader is its own process key.
     if process_state_key(target) != target {
         ctx.set_return(errno_ret(EINVAL));
         return;

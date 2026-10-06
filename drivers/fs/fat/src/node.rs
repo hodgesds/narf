@@ -30,7 +30,7 @@ use narf_filesystem::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, Mo
 use narf_lib::sync::IrqSafeSpinLock;
 
 use super::dir::{
-    attr, calculate_checksum, to_dos_time, DirEntry as RawDirEntry, LfnEntry, LFN_ENTRY_LAST_MASK,
+    attr, calculate_checksum, DirEntry as RawDirEntry, FatTimes, LfnEntry, LFN_ENTRY_LAST_MASK,
 };
 use super::volume::FatVolume;
 
@@ -38,6 +38,9 @@ use super::volume::FatVolume;
 pub struct FatNodeState {
     pub first_cluster: u32,
     pub stat: Stat,
+    /// Exact atime/mtime decoded from the directory entry. The root has
+    /// no entry and, as on Linux (`fat_read_root`), reports the epoch.
+    pub times: FatTimes,
 }
 
 #[derive(Debug)]
@@ -277,6 +280,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         volume: Arc<FatVolume<B>>,
         first_cluster: u32,
         stat: Stat,
+        times: FatTimes,
         entry_location: Option<(u64, usize)>,
     ) -> Self {
         Self {
@@ -285,9 +289,26 @@ impl<B: BlockDevice + 'static> FatNode<B> {
             state: IrqSafeSpinLock::new(FatNodeState {
                 first_cluster,
                 stat,
+                times,
             }),
             entry_location,
         }
+    }
+
+    /// Device plus exact times; ctime is mtime (one shared on-disk field).
+    fn attrs(&self) -> narf_filesystem::InodeAttrs {
+        let t = self.state.lock().times;
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            atime_ns: t.atime_ns,
+            ctime_ns: t.mtime_ns,
+            mtime_ns: t.mtime_ns,
+            ..Default::default()
+        }
+    }
+
+    fn times_from_entry(&self, entry: &RawDirEntry) -> FatTimes {
+        FatTimes::from_entry(entry, self.volume.tz_offset_secs)
     }
 
     /// `st_ino`. Linux (fs/fat/inode.c) numbers the root
@@ -328,7 +349,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
                     0o666
                 },
             },
-            mtime_cycles: 0,
+            mtime_cycles: narf_time::ns_to_cycles(self.times_from_entry(entry).mtime_ns),
         }
     }
 
@@ -547,16 +568,19 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         self.volume.read_sector(lba, &mut sector).await?;
 
         let mut entry = read_dir_entry(&sector, offset);
-        let (size, first_cluster, mtime_cycles) = {
+        let (size, first_cluster) = {
             let g = self.state.lock();
-            (g.stat.size, g.first_cluster, g.stat.mtime_cycles)
+            (g.stat.size, g.first_cluster)
         };
         entry.file_size = size as u32;
         entry.fst_clus_lo = (first_cluster & 0xFFFF) as u16;
         entry.fst_clus_hi = (first_cluster >> 16) as u16;
-        let (dos_date, dos_time) = to_dos_time(mtime_cycles);
-        entry.wrt_date = dos_date;
-        entry.wrt_time = dos_time;
+        // The write date/time stay as read: this used to stamp a fixed
+        // 1980-01-01 placeholder on every metadata flush, so the on-disk
+        // mtime disagreed with the one just reported.
+        // LINUX-GAP: Linux's write path (`file_update_time` →
+        // `fat_update_time`) also moves mtime/ctime to "now" at 2 s
+        // granularity; NARF's FAT writes do not update mtime yet.
         write_dir_entry(&mut sector, offset, &entry);
         self.volume.write_sector(lba, &sector).await
     }
@@ -723,10 +747,7 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
     }
 
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
@@ -916,10 +937,13 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
+    }
+
+    /// The directory entry's write date/time, exactly (2 s resolution);
+    /// the root has no entry and is the epoch, as on Linux.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.state.lock().times.mtime_ns
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {
@@ -954,6 +978,7 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
                         self.volume.clone(),
                         entry.first_cluster(),
                         stat,
+                        self.times_from_entry(&entry),
                         Some((lba, offset)),
                     )) as Arc<dyn FileOps>);
                 }
@@ -979,6 +1004,7 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
                         self.volume.clone(),
                         entry.first_cluster(),
                         stat,
+                        self.times_from_entry(&entry),
                         Some((lba, offset)),
                     )) as Arc<dyn DirOps>);
                 }
@@ -1063,8 +1089,11 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
                     size: 0,
                     blocks: 0,
                     mode: Mode::FILE_RW,
-                    mtime_cycles: 0,
+                    mtime_cycles: narf_time::ns_to_cycles(
+                        self.times_from_entry(&template).mtime_ns,
+                    ),
                 },
+                self.times_from_entry(&template),
                 Some((sfn_lba, sfn_off_in_sector)),
             )) as Arc<dyn FileOps>)
         })
@@ -1154,8 +1183,11 @@ impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
                     size: 0,
                     blocks: self.volume.bpb.sec_per_clus as u64,
                     mode: Mode::DIR_RW,
-                    mtime_cycles: 0,
+                    mtime_cycles: narf_time::ns_to_cycles(
+                        self.times_from_entry(&template).mtime_ns,
+                    ),
                 },
+                self.times_from_entry(&template),
                 Some((sfn_lba, sfn_off_in_sector)),
             )) as Arc<dyn DirOps>)
         })

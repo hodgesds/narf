@@ -84,6 +84,65 @@ impl DirectoryRecord {
         let arr = self.data_length;
         arr[0]
     }
+
+    /// The recording date/time (§9.1.5) as wall-clock nanoseconds, decoded
+    /// as Linux reports it for `st_atim`/`st_ctim`/`st_mtim`
+    /// (`fs/isofs/inode.c::isofs_read_inode` → `iso_date`). See
+    /// [`recording_time_ns`].
+    pub fn recording_time_ns(&self) -> u64 {
+        recording_time_ns(&self.recording_date_time)
+    }
+}
+
+/// Linux `kernel/time/time.c::mktime64`, including its `unsigned int`
+/// arithmetic: a month of 0 or 1 wraps through `(int)(mon -= 2) <= 0` into
+/// the previous year exactly as the C does, so malformed dates decode to the
+/// same seconds Linux reports.
+fn mktime64(year0: u32, mon0: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+    let mut mon = mon0.wrapping_sub(2);
+    let mut year = year0;
+    // 1..12 -> 11,12,1..10: February last, for its leap day.
+    if mon as i32 <= 0 {
+        mon = mon.wrapping_add(12);
+        year = year.wrapping_sub(1);
+    }
+    let days = (year / 4)
+        .wrapping_sub(year / 100)
+        .wrapping_add(year / 400)
+        .wrapping_add(367u32.wrapping_mul(mon) / 12)
+        .wrapping_add(day);
+    let days = i64::from(days) + i64::from(year.wrapping_mul(365)) - 719_499;
+    ((days * 24 + i64::from(hour)) * 60 + i64::from(min)) * 60 + i64::from(sec)
+}
+
+/// Seconds since the epoch for a 7-byte §9.1.5 recording date, exactly as
+/// Linux `fs/isofs/util.c::iso_date` decodes the short form: years since
+/// 1900, month, day, hour, minute, second, then a signed GMT offset in
+/// 15-minute units. The fields are local time, so the offset is subtracted
+/// to reach GMT — but only when it is within ±52 (13 hours); Linux treats a
+/// larger offset as unreliable and ignores it. The short form has no
+/// sub-second part.
+pub fn iso_date_seconds(date: &[u8; 7]) -> i64 {
+    let year = u32::from(date[0]) + 1900;
+    let mut seconds = mktime64(
+        year,
+        u32::from(date[1]),
+        u32::from(date[2]),
+        u32::from(date[3]),
+        u32::from(date[4]),
+        u32::from(date[5]),
+    );
+    let tz = i64::from(date[6] as i8);
+    if (-52..=52).contains(&tz) {
+        seconds -= tz * 15 * 60;
+    }
+    seconds
+}
+
+/// [`iso_date_seconds`] as wall-clock nanoseconds. A date before the epoch
+/// clamps to 0, since `narf_filesystem::InodeAttrs` is unsigned.
+pub fn recording_time_ns(date: &[u8; 7]) -> u64 {
+    u64::try_from(iso_date_seconds(date)).map_or(0, |s| s * 1_000_000_000)
 }
 
 impl fmt::Debug for DirectoryRecord {

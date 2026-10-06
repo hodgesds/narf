@@ -93,6 +93,112 @@ pub struct FileDirectoryEntry {
     pub reserved2: [u8; 7],
 }
 
+/// Linux `mktime64` (kernel/time/time.c), Gauss's algorithm, including
+/// its handling of out-of-range fields: month 0 is the previous December,
+/// day 0 the last day of the previous month.
+fn mktime64(year0: i64, mon0: i64, day: i64, hour: i64, min: i64, sec: i64) -> i64 {
+    let (mut year, mut mon) = (year0, mon0 - 2);
+    // 1..12 -> 11,12,1..10: puts Feb last since it has the leap day.
+    if mon <= 0 {
+        mon += 12;
+        year -= 1;
+    }
+    (((year / 4 - year / 100 + year / 400 + 367 * mon / 12 + day) + year * 365 - 719_499) * 24
+        + hour)
+        * 60
+        * 60
+        + min * 60
+        + sec
+}
+
+/// §7.4.10 UtcOffset bit 7 (`EXFAT_TZ_VALID`): the low 7 bits hold a
+/// signed offset from UTC in 15-minute units.
+pub const EXFAT_TZ_VALID: u8 = 0x80;
+
+/// An exFAT timestamp (§7.4.8: time in the low 16 bits, date in the high
+/// 16), its 10 ms increment and its UTC-offset byte, to wall-clock
+/// nanoseconds since the epoch. Exactly Linux's `exfat_get_entry_time`:
+/// the date/time fields go through `mktime64` unvalidated, a 10 ms byte
+/// of 0..199 adds whole seconds plus centiseconds, and a VALID offset
+/// converts the local fields to UTC (`exfat_adjust_tz`: 0x00..0x3F is
+/// east of UTC and subtracted, 0x40..0x7F is west and added). Without
+/// the valid bit, `tz_offset_min` (`exfat_tz_offset`: the `time_offset=`
+/// option, or `-sys_tz.tz_minuteswest` with `sys_tz`) is subtracted.
+pub fn exfat_time_to_unix_ns(tz: u8, timestamp: u32, time_cs: u8, tz_offset_min: i64) -> u64 {
+    let t = i64::from(timestamp & 0xFFFF);
+    let d = i64::from(timestamp >> 16);
+    let mut sec = mktime64(
+        1980 + (d >> 9),
+        (d >> 5) & 0x000F,
+        d & 0x001F,
+        t >> 11,
+        (t >> 5) & 0x003F,
+        (t & 0x001F) << 1,
+    );
+    let mut nsec = 0u64;
+    if time_cs != 0 {
+        sec += i64::from(time_cs / 100);
+        nsec = u64::from(time_cs % 100) * 10_000_000;
+    }
+    if tz & EXFAT_TZ_VALID != 0 {
+        let off = i64::from(tz & !EXFAT_TZ_VALID);
+        if off <= 0x3F {
+            sec -= off * 15 * 60;
+        } else {
+            sec += (0x80 - off) * 15 * 60;
+        }
+    } else {
+        sec -= tz_offset_min * 60;
+    }
+    if sec < 0 {
+        return 0;
+    }
+    sec as u64 * 1_000_000_000 + nsec
+}
+
+/// An exFAT inode's times as Linux's `exfat_find` + `exfat_fill_inode`
+/// build them: mtime from LastModified (with its 10 ms increment and
+/// offset), ctime = mtime, atime from LastAccessed (no 10 ms field exists
+/// for it). Nanoseconds since the epoch.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct ExfatTimes {
+    pub atime_ns: u64,
+    pub mtime_ns: u64,
+}
+
+impl ExfatTimes {
+    pub fn from_entry(e: &FileDirectoryEntry, tz_offset_min: i64) -> Self {
+        Self {
+            mtime_ns: exfat_time_to_unix_ns(
+                e.last_modified_utc_offset,
+                e.last_modified_timestamp,
+                e.last_modified_10ms_increment,
+                tz_offset_min,
+            ),
+            atime_ns: exfat_time_to_unix_ns(
+                e.last_accessed_utc_offset,
+                e.last_accessed_timestamp,
+                0,
+                tz_offset_min,
+            ),
+        }
+    }
+
+    /// The root directory has no file entry; Linux's `exfat_read_root`
+    /// stamps the mount time (`simple_inode_init_ts`, truncated to the
+    /// 10 ms `s_time_gran`) and rounds atime down to 2 seconds
+    /// (`exfat_truncate_inode_atime`).
+    pub fn root_at(now_ns: u64) -> Self {
+        const NS: u64 = 1_000_000_000;
+        let mtime_ns = now_ns - now_ns % 10_000_000;
+        let secs = mtime_ns / NS;
+        Self {
+            mtime_ns,
+            atime_ns: (secs - secs % 2) * NS,
+        }
+    }
+}
+
 /// §7.6 Stream Extension Directory Entry (type 0xC0). Always
 /// follows the 0x85 primary; carries the name length, name hash,
 /// allocation flags, first cluster, and data length.

@@ -261,8 +261,11 @@ kernel_test_in!(
 
 fn smoke_abi_mem2_process_madvise_iovcnt_boundary_neg() -> TestResult {
     with_setup(|| {
-        // pidfd=999 (not open), iovcnt=1024 (== cap, allowed), advice=4.
-        let args = a3(999, 0, 1024, 4);
+        // pidfd=999 (not open), iovcnt=1024 (== cap, allowed), advice=4. The
+        // iovec array is imported before the pidfd (mm/madvise.c:2123), so it
+        // must be readable for the -EBADF to be reached.
+        let iov = alloc::vec![0u64; 2 * 1024];
+        let args = a3(999, iov.as_ptr() as u64, 1024, 4);
         match call(Syscall::ProcessMadvise.raw(), args) {
             Some(v) if v == EBADF => Ok(()),
             Some(v) if v == EINVAL => {

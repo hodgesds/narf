@@ -401,15 +401,6 @@ pub(crate) fn wake_io_owner(owner: u64) {
     }
 }
 
-/// Evdev dispatch wake bridge: bump the readiness generation + wake all
-/// io-waiters so a `read`/`poll`/`epoll` parked on /dev/input/event*
-/// resumes when an input driver dispatches an event. Installed into
-/// `narf_input::evdev` at boot. `notify(0)` = wake-all (input events
-/// aren't keyed by a TCB id).
-fn evdev_dispatch_wake() {
-    narf_net::readiness::notify(0);
-}
-
 /// Wake every task parked on net I/O readiness (the conservative
 /// fallback for untracked keys — loopback / unix / not-yet-owned).
 fn wake_all_io_waiters() {
@@ -3262,6 +3253,17 @@ pub mod linux_compat {
 // `attrs` is `Default` for a filesystem that models none of them, and each
 // field then falls back to what this reported before the attrs existed:
 // `st_nlink = 1`, `st_dev = 0`, and mtime standing in for atime and ctime.
+/// Test hook — the `st_mtim` (`tv_sec`, `tv_nsec`) [`linux_stat_from_fs`]
+/// reports for a filesystem `Stat` + `InodeAttrs`.
+#[doc(hidden)]
+pub fn __test_linux_stat_mtim(
+    s: narf_filesystem::Stat,
+    attrs: narf_filesystem::InodeAttrs,
+) -> (i64, i64) {
+    let out = linux_stat_from_fs(s, 0, 0, 0, 1, attrs);
+    (out.st_mtim.tv_sec, out.st_mtim.tv_nsec)
+}
+
 fn linux_stat_from_fs(
     s: narf_filesystem::Stat,
     uid: u32,
@@ -3280,7 +3282,11 @@ fn linux_stat_from_fs(
         narf_filesystem::FileType::Fifo => 0o010000,
     };
     let mode_word: u32 = ftype_bits | (s.mode.perms as u32 & 0o7777);
-    let mtime_ns = narf_time::cycles_to_ns(s.mtime_cycles);
+    let mtime_ns = if attrs.mtime_ns != 0 {
+        attrs.mtime_ns
+    } else {
+        narf_time::cycles_to_ns(s.mtime_cycles)
+    };
     let timespec = |ns: u64| linux_compat::Timespec {
         tv_sec: (ns / 1_000_000_000) as i64,
         tv_nsec: (ns % 1_000_000_000) as i64,
@@ -4277,6 +4283,17 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
             Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
                 ctx.set_return(errno_ret(EDQUOT))
             }
+            // Same filesystem, no hard-link support: `vfs_link`'s
+            // `if (!dir->i_op->link) return -EPERM;`. EXDEV is only for
+            // names on different mounts (checked before the link op).
+            Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
+                ctx.set_return(errno_ret(EPERM))
+            }
+            // A read-only filesystem refusing the new name is EROFS, never
+            // the EXDEV this branch's fallback reports.
+            Some(Some(Err(narf_filesystem::FsError::ReadOnly))) => {
+                ctx.set_return(errno_ret(EROFS))
+            }
             _ => ctx.set_return(errno_ret(EXDEV)),
         }
         return;
@@ -4301,6 +4318,13 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         }
         Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
             ctx.set_return(errno_ret(EDQUOT))
+        }
+        // `vfs_link`: `if (!dir->i_op->link) return -EPERM;`. The generic
+        // `Unsupported` -> EINVAL mapping told fontconfig's FcAtomicLock its
+        // link(tmp, .LCK) was malformed instead of "no hard links here",
+        // which is the errno its mkdir-lock fallback keys on.
+        Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
+            ctx.set_return(errno_ret(EPERM))
         }
         // `fs/namei.c::vfs_link` surfaces the filesystem's own error rather
         // than a blanket one; the `-1` sentinel here reached userspace as
@@ -5243,8 +5267,13 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
         let new = (word & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
         // SAFETY: copy_to_user range-validates + SMAP-brackets the write.
         let _ = unsafe { copy_to_user(uaddr, &new.to_le_bytes()) };
-        futex_bump_counter(uaddr);
-        futex_wake_waiters(uaddr, 1);
+        // `handle_futex_death`: `futex_wake(uaddr, FLAGS_SIZE_32 |
+        // FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY)` — a SHARED wake, keyed
+        // by `get_futex_key` in the dying task's (still current) mm.
+        if let Ok(key) = get_futex_key(false, uaddr) {
+            futex_bump_counter_key(key);
+            futex_wake_waiters_key(key, 1);
+        }
     };
 
     // Walk the list. Termination: `next == head` (the head's own list
@@ -6230,6 +6259,12 @@ pub fn __test_cap_effective(task: u64, cap: u32) -> bool {
     cap_effective(task, cap)
 }
 
+/// Test hook — `task`'s whole PERMITTED set, the word an exec must rebuild.
+#[doc(hidden)]
+pub fn __test_caps_permitted(task: u64) -> u64 {
+    read_caps(task).permitted
+}
+
 fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
     let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
     let mut caps = read_caps(task);
@@ -6447,6 +6482,15 @@ fn cap_bprm_creds_from_file(
 ) -> bool {
     let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
     let mut effective = false;
+    // `get_file_caps` opens with `cap_clear(bprm->cred->cap_permitted)`:
+    // the new image's permitted set is rebuilt from scratch on every exec
+    // (root's below, file capabilities, then ambient), never inherited.
+    // Carrying the caller's set over leaked a non-root task's leftover
+    // privilege into the new image AND tripped `__cap_grew(permitted,
+    // ambient)` below, so the exec published AT_SECURE=1 and glibc's
+    // `secure_getenv` hid the environment — `systemd --user` then exited
+    // "Failed to determine $XDG_RUNTIME_DIR path" (ENXIO) at every login.
+    caps.permitted = 0;
     // `handle_privileged_root`; `root_privileged()` is
     // `!issecure(SECURE_NOROOT)`, and `has_fcap` is false.
     if !issecure(task, SECURE_NOROOT) {
@@ -8367,82 +8411,100 @@ fn read_iovecs(arr_ptr: u64, count: usize) -> Option<alloc::vec::Vec<(u64, u64)>
     Some(out)
 }
 
+/// Do `a` and `b` share one `mm`? Always true within a thread group
+/// (CLONE_THREAD requires CLONE_VM); otherwise compare address spaces, which
+/// also covers CLONE_VM-without-CLONE_THREAD children.
+pub(crate) fn shares_mm(a: u64, b: u64) -> bool {
+    if same_thread_group(a, b) {
+        return true;
+    }
+    match (
+        narf_scheduler::address_space_of(narf_scheduler::TaskId(a)),
+        narf_scheduler::address_space_of(narf_scheduler::TaskId(b)),
+    ) {
+        (Some(x), Some(y)) => Arc::ptr_eq(&x, &y),
+        _ => false,
+    }
+}
+
+/// The `pid` → mm step of migrate_pages(2) / move_pages(2): `pid ?
+/// find_task_by_vpid(pid) : current` (-ESRCH), then
+/// `ptrace_may_access(PTRACE_MODE_READ_REALCREDS)` (-EPERM). A thread of the
+/// caller's own process (a non-leader's tid included) names the caller's mm.
+///
+/// LINUX-GAP: NARF cannot operate on a foreign mm here, so any task whose mm
+/// the caller does not share is refused with -EPERM even when Linux's
+/// credential check would let a privileged caller through.
+pub(crate) fn resolve_mm_target(caller: u64, pid: i32) -> Result<(), i64> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let target = find_task_by_vpid(caller, pid).ok_or(ESRCH)?;
+    if !ptrace_may_access(caller, target) || !shares_mm(caller, target) {
+        return Err(EPERM);
+    }
+    Ok(())
+}
+
 /// Shared core for process_vm_readv / process_vm_writev. `is_write`
 /// selects the direction: false copies remote→local (readv), true
 /// copies local→remote (writev). Both sides live in the same AS here.
 fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     let a = *ctx.args();
-    #[allow(unused_mut)]
-    let mut pid = a.arg0;
-    // The target pid is in the CALLER's pid namespace (Linux
-    // find_get_task_by_vpid, mm/process_vm_access.c). Translate inner ->
-    // outer before the self/AS checks below: untranslated, a containerized
-    // process probing its own inner pid took the cross-AS path and failed,
-    // and a foreign inner pid resolved to whatever host task owned the same
-    // number — a host address-space identity oracle. Unmapped inner -> ESRCH.
-    #[cfg(feature = "container")]
-    {
-        match accept_pid_from(current_task_id(), pid) {
-            Some(outer) => pid = outer,
-            None => {
-                ctx.set_return(errno_ret(ESRCH)); // ESRCH
-                return;
-            }
-        }
-    }
+    let pid = a.arg0 as i32;
     let local_ptr = a.arg1;
     let liovcnt = a.arg2 as usize;
     let remote_ptr = a.arg3;
     let riovcnt = a.arg4 as usize;
     let flags = a.arg5;
-    if flags != 0 || liovcnt > 1024 || riovcnt > 1024 {
-        ctx.set_return(errno_ret(EINVAL)); // EINVAL
+    // `process_vm_rw` (mm/process_vm_access.c:269-284): flags, then the local
+    // iovec import (more than UIO_MAXIOV segments is -EINVAL, a fault
+    // -EFAULT), an empty local iovec returns 0, then the remote iovec array.
+    if flags != 0 || liovcnt > 1024 {
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
-
-    // Detect a self-target across BOTH id spaces: `pid` here is whatever the
-    // caller passed, and getpid() returns the VISIBLE ProcessId
-    // (task_to_pid_raw), not the raw scheduler TaskId. Comparing only against
-    // current_task_id() misfires for any task whose visible pid differs from
-    // its tid — it then takes the cross-AS path and fails on address_space_of
-    // returning None → ESRCH (observed as pvm_smoke `pvm-fail: readv`).
-    let self_pid = task_to_pid_raw(current_task_id()).unwrap_or_else(current_task_id);
-    if pid != current_task_id() && pid != self_pid {
-        let Some(tid) = pid_to_task_raw(pid) else {
-            ctx.set_return(errno_ret(ESRCH)); // ESRCH
-            return;
-        };
-        let Some(target_as) = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)) else {
-            ctx.set_return(errno_ret(ESRCH)); // ESRCH
-            return;
-        };
-        let Some(cur_as) = current_address_space() else {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        };
-        if !Arc::ptr_eq(&target_as, &cur_as) {
-            ctx.set_return(errno_ret(EPERM)); // EPERM (cross-AS)
-            return;
-        }
-    } else if current_address_space().is_none() {
-        ctx.set_return(errno_ret(EFAULT)); // EFAULT
+    let Some(local) = read_iovecs(local_ptr, liovcnt) else {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    };
+    if local.iter().all(|&(_, len)| len == 0) {
+        ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-
-    let local = match read_iovecs(local_ptr, liovcnt) {
-        Some(v) => v,
-        None => {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        }
+    if riovcnt > 1024 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    let Some(remote) = read_iovecs(remote_ptr, riovcnt) else {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
     };
-    let remote = match read_iovecs(remote_ptr, riovcnt) {
-        Some(v) => v,
-        None => {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        }
+    // `process_vm_rw_core`: no remote pages → 0 before the task lookup.
+    if remote.iter().all(|&(_, len)| len == 0) {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // `find_get_task_by_vpid(pid)` (:197): any thread in the caller's pid
+    // namespace, a non-leader's tid included; 0 names no task here (there is
+    // no `current` shortcut) — -ESRCH. Then `mm_access`: a task sharing the
+    // caller's mm needs no credential check; otherwise ptrace_may_access, and
+    // the -EACCES it yields is reported as -EPERM.
+    let caller = current_task_id();
+    let Some(target) = find_task_by_vpid(caller, pid) else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
     };
+    // LINUX-GAP: both sides must live in the caller's address space; a
+    // foreign mm is refused with -EPERM even when ptrace_may_access allows it.
+    if !shares_mm(caller, target) {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
+    if current_address_space().is_none() {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
     let (src, dst) = if is_write {
         (&local, &remote)
     } else {
@@ -9963,6 +10025,19 @@ pub fn release_external_shared_frame(phys: u64) {
 
 // ── Batch 18: address-space-wide locking, secret memory, NUMA ────────
 
+/// Linux errno for an address-space refusal inside `mprotect(2)`'s VMA walk
+/// (`mm/mprotect.c::do_mprotect_pkey` / `mprotect_fixup`):
+/// - a hugetlb VMA split off its huge-page boundary is -EINVAL
+///   (`hugetlb_vm_op_split`, mm/hugetlb.c);
+/// - everything else is -ENOMEM: a hole in the range, the map-count limit on
+///   a split (`split_vma`, mm/vma.c), or an allocation failure.
+fn mprotect_errno(error: narf_memory::AddressSpaceError) -> i64 {
+    match error {
+        narf_memory::AddressSpaceError::AlignmentMismatch => EINVAL,
+        _ => ENOMEM,
+    }
+}
+
 /// Shared core for `mprotect(2)` and `pkey_mprotect(2)`: translate the
 /// POSIX `prot` bits to `RegionPerms` and apply them to `[base, base+len)`.
 ///
@@ -9979,6 +10054,8 @@ pub fn release_external_shared_frame(phys: u64) {
 ///     (`mprotect_range`/`jit_mprotect`/`change_perms_range`'s error).
 ///   - **EACCES (13)** — a W^X denial (`DenyWX`/`DenyXtoWX`) or a
 ///     JIT-gated RW→RX flip the caller has no JIT capability for.
+///   - **EINVAL (22)** — a split off a huge-page boundary
+///     (`mprotect_errno`).
 fn mprotect_core(
     as_ref: &Arc<AddressSpace>,
     base: VirtAddr,
@@ -10072,12 +10149,18 @@ fn mprotect_core(
                     // No JIT capability for the RW→RX flip → EACCES.
                     return Err(EACCES);
                 };
-                // Underlying range error (empty/gapped) → ENOMEM.
-                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|_| ENOMEM)
+                narf_memory::wx::jit_mprotect(&cap, as_ref, base, len, perms).map_err(|e| match e {
+                    // W^X / revoked capability: a policy denial, as MDWE's
+                    // `error = -EACCES` (mm/mprotect.c).
+                    narf_memory::wx::WxError::DenyWX
+                    | narf_memory::wx::WxError::DenyXtoWX
+                    | narf_memory::wx::WxError::CapRevoked => EACCES,
+                    narf_memory::wx::WxError::Unmapped => ENOMEM,
+                    narf_memory::wx::WxError::AddressSpace(e) => mprotect_errno(e),
+                })
             }
             narf_memory::wx::WxTransition::Allow => {
-                // Empty/gapped range → ENOMEM.
-                as_ref.mprotect_range(base, len, perms).map_err(|_| ENOMEM)
+                as_ref.mprotect_range(base, len, perms).map_err(mprotect_errno)
             }
         }
     }
@@ -10140,7 +10223,7 @@ pub(crate) fn terminate_current_task(
         use core::fmt::Write;
         let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
         let _ = writeln!(
-            narf_console::Writer,
+            narf_console::ConsoleOnlyWriter,
             "[process-exit] kind=signal tid={} pid={} comm={} signal={} core_dumped={} ip={:x}",
             task,
             pid,
@@ -10525,6 +10608,25 @@ struct ClearChildTidEntry {
     as_root: narf_memory::PhysAddr,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     futex_namespace: u64,
+    /// The key `mm_release`'s `do_futex(tidptr, FUTEX_WAKE, 1, ...)` — a
+    /// SHARED op — resolves to: `(mm, address)` + `FUT_OFF_MMSHARED` for the
+    /// usual private mapping, the object key for a `MAP_SHARED` one.
+    /// Resolved at registration, while the mm can still be consulted.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    shared_key: FutexKey,
+}
+
+/// The SHARED-op key of the ctid word `uaddr` in `space` (see
+/// [`ClearChildTidEntry::shared_key`]). Outside the owning task's syscall the
+/// page cannot be faulted in, so a non-resident or unmapped word falls back
+/// to the mm key — what Linux would compute for a private mapping.
+fn clear_child_tid_shared_key(space: &Arc<AddressSpace>, uaddr: u64) -> FutexKey {
+    futex_shared_key_in(space, uaddr, false).unwrap_or_else(|_| {
+        futex_key(
+            futex_namespace_for_address_space(space) | FUTEX_NS_MMSHARED,
+            uaddr,
+        )
+    })
 }
 
 static CLEAR_CHILD_TID: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, ClearChildTidEntry>>> =
@@ -10540,10 +10642,16 @@ pub fn clear_child_tid_init() {
 }
 
 fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
-    let (as_root, futex_namespace) = current_address_space()
-        .map(|space| (space.root, futex_namespace_for_address_space(&space)))
-        .unwrap_or((narf_memory::PhysAddr::new(0), 0));
-    set_clear_child_tid_with_as(task_id_raw, uaddr, as_root, futex_namespace);
+    let (as_root, futex_namespace, shared_key) = current_address_space()
+        .map(|space| {
+            (
+                space.root,
+                futex_namespace_for_address_space(&space),
+                clear_child_tid_shared_key(&space, uaddr),
+            )
+        })
+        .unwrap_or((narf_memory::PhysAddr::new(0), 0, futex_key(0, uaddr)));
+    set_clear_child_tid_with_as(task_id_raw, uaddr, as_root, futex_namespace, shared_key);
 }
 
 fn set_clear_child_tid_with_as(
@@ -10551,6 +10659,7 @@ fn set_clear_child_tid_with_as(
     uaddr: u64,
     as_root: narf_memory::PhysAddr,
     futex_namespace: u64,
+    shared_key: FutexKey,
 ) {
     let mut g = CLEAR_CHILD_TID.lock();
     if g.is_none() {
@@ -10566,6 +10675,7 @@ fn set_clear_child_tid_with_as(
                     uaddr,
                     as_root,
                     futex_namespace,
+                    shared_key,
                 },
             );
         }
@@ -10581,7 +10691,10 @@ fn take_clear_child_tid(task_id_raw: u64) -> Option<ClearChildTidEntry> {
 /// Test-only: install a clear_child_tid entry with an explicit private-futex
 /// namespace and no AS root (the exit path then skips the word write but still
 /// fires the wake), modelling a real thread whose private namespace is a live
-/// AddressSpace Arc pointer (always nonzero in production).
+/// AddressSpace Arc pointer (always nonzero in production). The word is taken
+/// to sit in a private mapping, so its SHARED-op key is the mm key
+/// (`futex_namespace | FUT_OFF_MMSHARED`, see
+/// [`__test_futex_mmshared_namespace`]).
 #[doc(hidden)]
 pub fn __test_set_clear_child_tid_scoped(task_id_raw: u64, uaddr: u64, futex_namespace: u64) {
     set_clear_child_tid_with_as(
@@ -10589,7 +10702,15 @@ pub fn __test_set_clear_child_tid_scoped(task_id_raw: u64, uaddr: u64, futex_nam
         uaddr,
         narf_memory::PhysAddr::new(0),
         futex_namespace,
+        futex_key(futex_namespace | FUTEX_NS_MMSHARED, uaddr),
     );
+}
+
+/// Test-only: the namespace a SHARED futex op on a PRIVATE mapping of the mm
+/// whose private namespace is `private_ns` is keyed under.
+#[doc(hidden)]
+pub fn __test_futex_mmshared_namespace(private_ns: u64) -> u64 {
+    private_ns | FUTEX_NS_MMSHARED
 }
 
 /// Diagnostic / test-only — inspect a task's clear_child_tid slot
@@ -10686,7 +10807,7 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     //
     // Wake BOTH namespaces. Linux's mm_release fires the exit wake as
     // `do_futex(tidptr, FUTEX_WAKE, 1, ...)` with NO FUTEX_PRIVATE_FLAG
-    // (kernel/fork.c) — i.e. SHARED (namespace 0) — and glibc's pthread_join
+    // (kernel/fork.c) — i.e. SHARED (`entry.shared_key`) — and glibc's pthread_join
     // (`lll_futex_wait` on `__default_pthread_attr`-cleared child_tid) and
     // musl's `__tl_lock` both wait SHARED on that word. Waking only the
     // recorded private namespace therefore missed every glibc/musl joiner and
@@ -10707,10 +10828,14 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     // thread; see `futex_wake_one_key_spread` for why a direct handoff
     // here re-serializes the whole exit storm.
     let _ = futex_wake_one_key_spread(key);
-    if entry.futex_namespace != 0 {
-        let shared_key = futex_key(0, uaddr);
-        futex_bump_counter_key(shared_key);
-        let _ = futex_wake_one_key_spread(shared_key);
+    // The Linux wake itself: SHARED, keyed the way `get_futex_key` keys the
+    // word for a shared op — per-mm (FUT_OFF_MMSHARED) for a private
+    // mapping, by object for a MAP_SHARED one. NOT a global by-address key:
+    // that let one process's thread exit consume a wake meant for another
+    // process's waiter at the same address.
+    if entry.shared_key != key {
+        futex_bump_counter_key(entry.shared_key);
+        let _ = futex_wake_one_key_spread(entry.shared_key);
     }
 }
 
@@ -11390,6 +11515,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(rsp),
         fs_base: child_tls_base(flags, ca.tls),
+        // Linux `copy_thread` copies the parent's GS base into the child (fork
+        // and threads alike); CLONE_SETTLS only replaces FS.
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: CPL0 syscall context, kernel GS live.
+        gs_base: unsafe { narf_arch::x86_64::user_mode::user_gs_base() },
+        #[cfg(not(target_arch = "x86_64"))]
+        gs_base: 0,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
         // Zero sentinel, like `entry` above: a cloned task resumes from
@@ -11405,6 +11537,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // clear_child_tid futex word after the slot is reaped.
     let child_as_root = child_as.root;
     let child_futex_namespace = futex_namespace_for_address_space(&child_as);
+    let child_ctid_shared_key = clear_child_tid_shared_key(&child_as, ca.child_tid);
     // A new thread joins the group — bump `signal->live` BEFORE the
     // child is spawned/enqueued. Under SMP another CPU can pick up and
     // EXIT the child the instant it's runnable; a not-yet-counted first
@@ -11709,6 +11842,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
             ca.child_tid,
             child_as_root,
             child_futex_namespace,
+            child_ctid_shared_key,
         );
     }
 
@@ -12898,11 +13032,6 @@ pub fn wait_init() {
     // rather than at their next wheel deadline. Latency-only; safe to
     // install unconditionally (no-op until a task parks on net I/O).
     narf_net::readiness::set_hook(wake_io_waiters);
-    // Same wake, for evdev: a `read`/`poll`/`epoll` on /dev/input/event*
-    // parks on the net readiness system, but an input driver dispatching an
-    // event only wakes its async `Reader` slots. Bridge the two so a
-    // compositor (weston/libinput) actually receives input it's parked on.
-    narf_input::evdev::set_dispatch_wake_hook(evdev_dispatch_wake);
     crate::pidfd::init();
     // Wave-65: clone3 CLONE_CHILD_CLEARTID + set_tid_address(2)
     // bookkeeping. The table holds per-task user-pointer slots;
@@ -14633,6 +14762,33 @@ pub fn __test_forget_task_pid(task: u64) {
     }
 }
 
+/// Test-only: register a synthetic `CLONE_THREAD` sibling exactly as the clone
+/// path does (`register_thread_task_mapping`): `task` joins thread group `tgid`
+/// under Linux tid `linux_tid`. Undo with [`__test_forget_thread`].
+#[doc(hidden)]
+pub fn __test_register_thread(linux_tid: u64, task: u64, tgid: u64) {
+    register_thread_task_mapping(linux_tid, task, tgid);
+}
+
+/// Test-only: drop every identity row [`__test_register_thread`] created.
+#[doc(hidden)]
+pub fn __test_forget_thread(task: u64) {
+    let linux_tid = {
+        let _mutation = PID_TASK_MUTATION.lock();
+        TASK_TO_LINUX_TID[pid_task_shard(task)]
+            .map
+            .lock()
+            .as_mut()
+            .and_then(|m| m.remove(&task))
+    };
+    if let Some(linux_tid) = linux_tid {
+        if let Some(m) = LINUX_TID_TO_TASK[pid_task_shard(linux_tid)].map.lock().as_mut() {
+            m.remove(&linux_tid);
+        }
+    }
+    __test_forget_task_pid(task);
+}
+
 #[inline]
 fn pid_task_shard(id: u64) -> usize {
     (id as usize) & (PID_TASK_SHARDS - 1)
@@ -14726,6 +14882,11 @@ fn register_thread_task_mapping(tid_raw: u64, task_raw: u64, tgid_raw: u64) {
         .insert(tid_raw, task_raw);
 }
 
+#[doc(hidden)]
+pub fn __test_register_thread_mapping(tid_raw: u64, task_raw: u64, tgid_raw: u64) {
+    register_thread_task_mapping(tid_raw, task_raw, tgid_raw);
+}
+
 pub(crate) fn task_to_linux_tid_raw(task_raw: u64) -> Option<u64> {
     TASK_TO_LINUX_TID[pid_task_shard(task_raw)]
         .map
@@ -14760,6 +14921,8 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
         .as_mut()
         .and_then(|m| m.remove(&tid));
     if let Some(linux_tid) = linux_tid {
+        // A PIDFD_THREAD pidfd on this thread now reports its exit.
+        crate::pidfd::notify_thread_exit(linux_tid);
         #[cfg(feature = "cgroup")]
         narf_filesystem::cgroupfs::thread_exited(linux_tid);
         if let Some(m) = LINUX_TID_TO_TASK[pid_task_shard(linux_tid)].map.lock().as_mut() {
@@ -15735,7 +15898,9 @@ pub(crate) const CAP_SYS_PTRACE: u32 = 19;
 /// can restore it, so treating it as the caller's peer would hand over a
 /// process that is one `setuid` away from being root.
 pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
-    if caller == target {
+    // `kernel/ptrace.c:298`: `if (same_thread_group(task, current)) return 0;`
+    // — a thread may always inspect its own process, sibling threads included.
+    if same_thread_group(caller, target) {
         return true;
     }
     // `ptrace_has_cap`, consulted twice below. Capability over the whole
@@ -17139,8 +17304,10 @@ fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
             owner: crate::task::task_get(caller),
         });
     }
-    let outer = accept_pid_from(caller, pid)?;
-    let task = pid_to_task_raw(outer).or_else(|| task_to_pid_raw(outer).map(|_| outer))?;
+    // `kernel/sys.c:1751`: `find_task_by_vpid(pid)` — any thread in the
+    // caller's pid namespace, a non-leader's tid included (limits are shared
+    // thread-group state). Never a raw scheduler TaskId.
+    let task = find_task_by_vpid(caller, i32::try_from(pid).ok()?)?;
     Some(PrlimitTarget {
         tid: task,
         owner: Some(crate::task::task_get(task)?),
@@ -17441,13 +17608,8 @@ pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> all
             // `find_task_by_vpid(who)`: any task in the caller's pid
             // namespace. Mesa's util_queue renices each worker with
             // `setpriority(PRIO_PROCESS, gettid(), 19)`.
-            let Some(task) = signal_tid_from_user(caller, who as u64) else {
-                return out;
-            };
-            // `find_task_by_vpid` returning NULL is the empty set —
-            // `signal_tid_from_user` falls back to identity for an
-            // unregistered id, so an existence check implements that.
-            if task == caller || crate::task::task_get(task).is_some() {
+            // `find_task_by_vpid` returning NULL is the empty set.
+            if let Some(task) = find_task_by_vpid(caller, who) {
                 out.push(task);
             }
         }

@@ -1745,6 +1745,107 @@ kernel_test_in!(
     smoke_abi_ioerrno_memfd_add_seal_already_sealed
 );
 
+// `F_SEAL_FUTURE_WRITE` (Linux 5.1) and `F_SEAL_EXEC` (6.3) are members of
+// `F_ALL_SEALS`. Firefox seals its IPC shared memory with
+// SEAL|SHRINK|GROW|FUTURE_WRITE; rejecting that set as EINVAL left the
+// launch hung.
+const F_SEAL_SHRINK: u64 = 0x0002;
+const F_SEAL_GROW: u64 = 0x0004;
+const F_SEAL_FUTURE_WRITE: u64 = 0x0010;
+const F_SEAL_EXEC: u64 = 0x0020;
+
+fn smoke_abi_ioerrno_memfd_add_seal_future_write_and_exec() -> TestResult {
+    with_setup(|| {
+        let fd = make_memfd(MFD_ALLOW_SEALING)?;
+        let firefox = F_SEAL_SEAL as u64 | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE;
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(fd as u64, F_ADD_SEALS, firefox | F_SEAL_EXEC),
+        ) != Some(0)
+        {
+            return Err("F_ADD_SEALS with FUTURE_WRITE|EXEC (members of F_ALL_SEALS) must succeed");
+        }
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GET_SEALS, 0)) {
+            Some(seals) if seals as u64 == firefox | F_SEAL_EXEC => Ok(()),
+            _ => Err("F_GET_SEALS did not report exactly the seals just added"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_memfd_add_seal_future_write_and_exec
+);
+
+fn smoke_abi_ioerrno_memfd_future_write_seal_refuses_new_writes() -> TestResult {
+    with_setup(|| {
+        let fd = make_memfd(MFD_ALLOW_SEALING)? as u64;
+        let data = b"pre-seal";
+        if call(
+            Syscall::Write.raw(),
+            a2(fd, data.as_ptr() as u64, data.len() as u64),
+        ) != Some(data.len() as i64)
+        {
+            return Err("write before the seal should succeed");
+        }
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(fd, F_ADD_SEALS, F_SEAL_FUTURE_WRITE),
+        ) != Some(0)
+        {
+            return Err("F_ADD_SEALS(F_SEAL_FUTURE_WRITE) should succeed");
+        }
+        // `mm/shmem.c::shmem_write_begin`: a write seal of either kind is
+        // -EPERM for write(2).
+        expect(
+            call(
+                Syscall::Write.raw(),
+                a2(fd, data.as_ptr() as u64, data.len() as u64),
+            ),
+            EPERM,
+            "write after F_SEAL_FUTURE_WRITE must be -EPERM",
+        )?;
+        // mmap's seal check runs after the address-space lookup.
+        install_test_address_space()?;
+        const PROT_READ: u64 = 0x1;
+        const PROT_WRITE: u64 = 0x2;
+        const MAP_SHARED: u64 = 0x1;
+        const MAP_PRIVATE: u64 = 0x2;
+        let map = |prot: u64, flags: u64| {
+            call(
+                Syscall::Mmap.raw(),
+                SyscallArgs {
+                    arg0: 0,
+                    arg1: 4096,
+                    arg2: prot,
+                    arg3: flags,
+                    arg4: fd,
+                    arg5: 0,
+                },
+            )
+        };
+        // `mm/memfd.c::check_write_seal`: a new MAP_SHARED|PROT_WRITE
+        // mapping under a write seal is -EPERM.
+        expect(
+            map(PROT_READ | PROT_WRITE, MAP_SHARED),
+            EPERM,
+            "shared writable mmap after F_SEAL_FUTURE_WRITE must be -EPERM",
+        )?;
+        // The seal leaves read-only shared and copy-on-write private mappings
+        // alone — that is how Firefox hands the sealed region to children.
+        if !matches!(map(PROT_READ, MAP_SHARED), Some(addr) if addr > 0) {
+            return Err("read-only shared mmap of a write-sealed memfd must succeed");
+        }
+        if !matches!(map(PROT_READ | PROT_WRITE, MAP_PRIVATE), Some(addr) if addr > 0) {
+            return Err("private writable mmap of a write-sealed memfd must succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_memfd_future_write_seal_refuses_new_writes
+);
+
 fn smoke_abi_ioerrno_memfd_without_allow_sealing() -> TestResult {
     with_setup(|| {
         // Without MFD_ALLOW_SEALING the file starts F_SEAL_SEAL'd, so it is

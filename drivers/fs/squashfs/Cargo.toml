@@ -23,6 +23,7 @@ narf-kernel-test = { path = "../../../verification/kernel-test" }
 narf-lib = { path = "../../../lib" }
 narf-memory = { path = "../../../memory" }
 narf-scheduler = { path = "../../../scheduler" }
+narf-time = { path = "../../../time" }
 
 [lints]
 workspace = true

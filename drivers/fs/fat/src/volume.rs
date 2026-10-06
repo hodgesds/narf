@@ -80,6 +80,13 @@ pub struct FatVolume<B: BlockDevice> {
     io: IrqSafeSpinLock<VolumeIo>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
+    /// Seconds ADDED to the local time a FAT timestamp holds to get UTC:
+    /// Linux `fat_tz_offset` is `-time_offset` minutes with `tz=UTC` /
+    /// `time_offset=`, else `sys_tz.tz_minuteswest`. NARF accepts neither
+    /// mount option and keeps no kernel timezone (`settimeofday` ignores
+    /// its `timezone*`, leaving Linux's default `tz_minuteswest = 0`), so
+    /// this is 0: the fields decode as UTC.
+    pub tz_offset_secs: i64,
 }
 
 impl<B: BlockDevice + 'static> FatVolume<B> {
@@ -156,6 +163,7 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
+            tz_offset_secs: 0,
         }))
     }
 
@@ -431,6 +439,8 @@ impl<B: BlockDevice + 'static> FsInstance for FatVolume<B> {
                 mode: narf_filesystem::Mode::DIR_RO,
                 mtime_cycles: 0,
             },
+            // Linux `fat_read_root`: every root timestamp is 0.
+            super::dir::FatTimes::default(),
             None,
         ))
     }

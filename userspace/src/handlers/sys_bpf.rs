@@ -432,11 +432,12 @@ fn task_fd_prog_id(fd: u32) -> Option<(u32, u32)> {
 /// `BPF_TASK_FD_QUERY` — given a task's fd that carries a BPF program, report
 /// which program and what kind of fd it is.
 ///
-/// NARF answers for the *calling* task's fds: `pid` must be zero or the caller's
-/// own pid. The one fd kind that carries a program is a perf event with one
-/// attached through `PERF_EVENT_IOC_SET_BPF`, which is tracepoint-shaped; the
-/// name buffer comes back empty, because NARF names its probes by id rather than
-/// by string. // LINUX-GAP: no cross-task query and no tracepoint-name string.
+/// NARF answers for the *calling* process's fds: `pid` must name the caller or
+/// another thread of its process. The one fd kind that carries a program is a
+/// perf event with one attached through `PERF_EVENT_IOC_SET_BPF`, which is
+/// tracepoint-shaped; the name buffer comes back empty, because NARF names its
+/// probes by id rather than by string. // LINUX-GAP: no cross-process query
+/// and no tracepoint-name string.
 fn task_fd_query(attr_uptr: u64, size: usize) -> i64 {
     let attr = match read_attr(attr_uptr, size) {
         Ok(a) => a,
@@ -448,21 +449,16 @@ fn task_fd_query(attr_uptr: u64, size: usize) -> i64 {
     if u32_at(&attr, TFQ_FLAGS) != 0 {
         return -EINVAL;
     }
-    let pid = u32_at(&attr, TFQ_PID);
-    let me = task_to_pid_raw(current_task_id()).unwrap_or(0) as u32;
-    // `pid` is interpreted in the CALLER's pid namespace (Linux
-    // kernel/bpf/syscall.c uses the thread's virtual pid). Translate the inner
-    // pid to its outer ProcessId before the self-comparison, so a container
-    // querying its own fds by getpid() is not rejected. Audit finding #27.
-    let translated = if pid != 0 {
-        match accept_pid_from(current_task_id(), pid as u64) {
-            Some(outer) => outer as u32,
-            None => return -ENOTSUP,
-        }
-    } else {
-        0
+    // `get_pid_task(find_vpid(pid), PIDTYPE_PID)` (kernel/bpf/syscall.c:5572):
+    // any thread in the CALLER's pid namespace, a non-leader's tid included;
+    // 0 or an unused pid names no task and is -ENOENT (not -ESRCH).
+    let caller = current_task_id();
+    let Some(target) = find_task_by_vpid(caller, u32_at(&attr, TFQ_PID) as i32) else {
+        return -ENOENT;
     };
-    if translated != 0 && translated != me {
+    // LINUX-GAP: only the caller's own fd table (shared by its thread group)
+    // can be queried; another process's fds are refused with ENOTSUPP.
+    if !same_thread_group(target, caller) {
         return -ENOTSUP;
     }
     let (prog_id, fd_type) = match task_fd_prog_id(u32_at(&attr, TFQ_FD)) {

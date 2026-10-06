@@ -1821,14 +1821,23 @@ fn smoke_abi_fsx_exec_secureexec_decision() -> TestResult {
                 return Err(msg);
             }
         }
-        // A non-root uid still holding a permitted set: `__cap_grew(permitted,
-        // ambient)` — the new image holds privilege its uid does not imply.
+        // A non-root uid still holding a permitted set (here root's full set,
+        // as after PR_SET_KEEPCAPS + setresuid) execs an ordinary binary.
+        // `get_file_caps` clears the new permitted set before anything else,
+        // so the image keeps no capability its uid does not imply, and with
+        // permitted == ambient == 0 `__cap_grew(permitted, ambient)` is false:
+        // NOT secureexec. Answering AT_SECURE here made glibc's
+        // `secure_getenv` hide $XDG_RUNTIME_DIR from `systemd --user`.
         stage_root_owned(cpath, 0o755)?;
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
         let secure = crate::handlers::__test_exec_credentials(task, path);
+        let permitted = crate::handlers::__test_caps_permitted(task);
         creds_reset();
-        if !secure {
-            return Err("a non-root exec that keeps permitted capabilities did not set AT_SECURE");
+        if secure {
+            return Err("a non-root exec of an ordinary binary set AT_SECURE");
+        }
+        if permitted != 0 {
+            return Err("a non-root exec kept the caller's permitted capabilities");
         }
         Ok(())
     })
@@ -5598,3 +5607,180 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx_mount_missing_target_beats_einval
 );
+
+/// `stat` reports a filesystem's exact `st_mtim` when it supplies
+/// `InodeAttrs::mtime_ns`. The legacy path round-trips the time through a
+/// TSC cycle count (`ns_to_cycles` / `cycles_to_ns`, fixed-point and not an
+/// exact inverse), which could turn an on-disk whole second into
+/// `sec - 1 . 999999xxx`. fontconfig compares a font directory's `st_mtim`
+/// to the nanosecond against its cache, so an inexact value made every
+/// system font cache stale.
+fn smoke_abi_fsx_stat_reports_exact_mtime_ns() -> TestResult {
+    let stat = narf_filesystem::Stat {
+        size: 0,
+        blocks: 0,
+        mode: narf_filesystem::Mode {
+            file_type: narf_filesystem::FileType::Dir,
+            perms: 0o755,
+        },
+        // Deliberately unrelated: the exact attrs value must win.
+        mtime_cycles: 12_345,
+    };
+    for (ns, sec, nsec) in [
+        (
+            1_700_000_000_123_456_789u64,
+            1_700_000_000i64,
+            123_456_789i64,
+        ),
+        (1_650_000_123_000_000_000, 1_650_000_123, 0),
+    ] {
+        let attrs = narf_filesystem::InodeAttrs {
+            mtime_ns: ns,
+            ..Default::default()
+        };
+        if crate::handlers::__test_linux_stat_mtim(stat, attrs) != (sec, nsec) {
+            return TestResult::Fail("stat did not report InodeAttrs::mtime_ns exactly");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_stat_reports_exact_mtime_ns);
+
+/// `link(2)` on a filesystem with no hard-link operation is EPERM
+/// (`fs/namei.c::vfs_link`: `if (!dir->i_op->link) return -EPERM;`), as on
+/// Linux's kernfs-backed sysfs. NARF answered EINVAL (the generic
+/// `Unsupported` mapping), which fontconfig's `FcAtomicLock` does not treat
+/// as "no hard links here", so it never fell back to its mkdir lock.
+fn smoke_abi_fsx_link_without_link_op_is_eperm() -> TestResult {
+    setup();
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let mnt = match registry().mount(&auth, "/abisys-link", narf_filesystem::SysFs::new()) {
+        Ok(h) => h,
+        Err(_) => {
+            teardown();
+            return TestResult::Fail("sysfs mount failed");
+        }
+    };
+    let old = b"/abisys-link/kernel/uevent_seqnum\0";
+    let new = b"/abisys-link/kernel/seqnum-alias\0";
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+    // aarch64 has linkat only; `vfs_link` is the same check either way.
+    let rc = if wired(Syscall::Link) {
+        call(
+            Syscall::Link.raw(),
+            a1(old.as_ptr() as u64, new.as_ptr() as u64),
+        )
+    } else {
+        call(
+            Syscall::Linkat.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                0,
+            ),
+        )
+    };
+    let _ = registry().unmount(&mnt, "/abisys-link");
+    teardown();
+    if rc != Some(EPERM) {
+        return TestResult::Fail("link on a filesystem without a link op was not EPERM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_link_without_link_op_is_eperm);
+
+/// A filesystem whose every mount is read-only (Linux `fill_super` setting
+/// `SB_RDONLY`, as squashfs does) refuses writes at the mount even when
+/// `mount` was not asked for `ro`: `mnt_want_write` is EROFS before any
+/// filesystem operation. Before `FsInstance::always_read_only`, a squashfs
+/// mounted without `-o ro` let `link(2)` reach the driver, and the
+/// cross-directory branch reported EXDEV.
+struct AlwaysReadOnlyFs(narf_filesystem::MemFs);
+
+impl narf_filesystem::FsInstance for AlwaysReadOnlyFs {
+    fn root(&self) -> alloc::sync::Arc<dyn narf_filesystem::DirOps> {
+        self.0.root()
+    }
+    fn name(&self) -> &str {
+        "always-ro"
+    }
+    fn always_read_only(&self) -> bool {
+        true
+    }
+}
+
+fn smoke_abi_fsx_always_read_only_fs_is_erofs() -> TestResult {
+    setup();
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = AlwaysReadOnlyFs(narf_filesystem::MemFs::with_seeds(
+        "always-ro",
+        &[("f", b"data")],
+    ));
+    let mnt = match registry().mount(&auth, "/abi-always-ro", fs) {
+        Ok(h) => h,
+        Err(_) => {
+            teardown();
+            return TestResult::Fail("mount of the always-read-only filesystem failed");
+        }
+    };
+    let outcome = (|| -> Result<(), &'static str> {
+        const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+        let old = b"/abi-always-ro/f\0";
+        let new = b"/abi-always-ro/g\0";
+        let rc = if wired(Syscall::Link) {
+            call(
+                Syscall::Link.raw(),
+                a1(old.as_ptr() as u64, new.as_ptr() as u64),
+            )
+        } else {
+            call(
+                Syscall::Linkat.raw(),
+                a4(
+                    AT_FDCWD,
+                    old.as_ptr() as u64,
+                    AT_FDCWD,
+                    new.as_ptr() as u64,
+                    0,
+                ),
+            )
+        };
+        if rc != Some(EROFS) {
+            return Err("link on an always-read-only mount was not EROFS");
+        }
+        const O_WRONLY: u64 = 1;
+        const O_CREAT: u64 = 0o100;
+        if call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, new.as_ptr() as u64, O_WRONLY | O_CREAT, 0o644),
+        ) != Some(EROFS)
+        {
+            return Err("O_CREAT on an always-read-only mount was not EROFS");
+        }
+        let dir = b"/abi-always-ro/d\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(EROFS) {
+            return Err("mkdir on an always-read-only mount was not EROFS");
+        }
+        // Reading is unaffected.
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, old.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                Ok(())
+            }
+            _ => Err("a read-only open on an always-read-only mount failed"),
+        }
+    })();
+    let _ = registry().unmount(&mnt, "/abi-always-ro");
+    teardown();
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_always_read_only_fs_is_erofs);

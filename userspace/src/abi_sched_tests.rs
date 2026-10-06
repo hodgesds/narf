@@ -2813,3 +2813,83 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_sched_ioprio_set_foreign_task_is_eperm
 );
+
+/// `sched_getaffinity` / `sched_setaffinity` resolve their pid with
+/// `find_task_by_vpid` (kernel/sched/syscalls.c), which names ANY task —
+/// a CLONE_THREAD sibling's tid as well as a leader's pid. glibc's
+/// `pthread_getattr_np(pthread_self())` ends in `sched_getaffinity(pd->tid)`
+/// on every thread; NARF resolved through the process registry only and
+/// answered ESRCH for each non-leader thread, which Firefox's
+/// `nsThread::InitCommon` turns into a release-assert crash.
+fn smoke_abi_sched_affinity_resolves_non_leader_tid() -> TestResult {
+    with_setup(|| {
+        narf_scheduler::__reset_queues_for_test();
+        let spec = narf_scheduler::TaskSpec {
+            affinity: narf_scheduler::Affinity::any(),
+            ..narf_scheduler::TaskSpec::unthrottled()
+        };
+        let thread = narf_scheduler::spawn_with_spec(core::future::pending::<()>(), spec);
+        let tgid = crate::handlers::task_to_pid_raw(FAKE_TASK).unwrap_or(FAKE_TASK);
+        let tid = crate::alloc_pid().raw();
+        // A real CLONE_THREAD child is in the task registry and the tid maps.
+        let _ = crate::task::Task::new_registered(thread.raw(), tgid);
+        crate::handlers::__test_register_thread_mapping(tid, thread.raw(), tgid);
+        let result = (|| {
+            let mut mask = [0u8; 32];
+            // The leader names its sibling thread by tid.
+            match call(
+                Syscall::SchedGetaffinity.raw(),
+                a2(tid, mask.len() as u64, mask.as_mut_ptr() as u64),
+            ) {
+                Some(8) => {}
+                Some(v) if v == ESRCH => {
+                    return Err(
+                        "sched_getaffinity(sibling tid) was -ESRCH: non-leader tid not resolved",
+                    )
+                }
+                _ => return Err("sched_getaffinity(sibling tid) did not return the mask width"),
+            }
+            if u64::from_ne_bytes(mask[..8].try_into().unwrap_or([0; 8]))
+                != narf_lib::smp::online_bitmap()
+            {
+                return Err("sched_getaffinity(sibling tid) returned the wrong mask");
+            }
+            let any = narf_lib::smp::online_bitmap().to_ne_bytes();
+            if call(
+                Syscall::SchedSetaffinity.raw(),
+                a2(tid, 8, any.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("sched_setaffinity(sibling tid) did not succeed");
+            }
+            // The thread names itself by its own tid — glibc's exact call.
+            set_task(thread.raw());
+            let own = call(
+                Syscall::SchedGetaffinity.raw(),
+                a2(tid, mask.len() as u64, mask.as_mut_ptr() as u64),
+            );
+            set_task(FAKE_TASK);
+            if own != Some(8) {
+                return Err("sched_getaffinity(own non-leader tid) did not return the mask width");
+            }
+            // A tid that names no task is still -ESRCH.
+            let unused = crate::alloc_pid().raw();
+            crate::release_pid(crate::ProcessId(unused));
+            match call(
+                Syscall::SchedGetaffinity.raw(),
+                a2(unused, mask.len() as u64, mask.as_mut_ptr() as u64),
+            ) {
+                Some(v) if v == ESRCH => Ok(()),
+                _ => Err("sched_getaffinity(unused tid) was not -ESRCH"),
+            }
+        })();
+        set_task(FAKE_TASK);
+        crate::handlers::release_exited_thread_task(tgid, thread.raw());
+        narf_scheduler::__reset_queues_for_test();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_affinity_resolves_non_leader_tid
+);

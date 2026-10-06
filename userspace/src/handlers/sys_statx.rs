@@ -259,7 +259,11 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     let mode_word: u16 = ftype_bits | (s.mode.perms & 0o7777);
 
     // mtime: monotonic cycles → ns via the wall-clock calibration.
-    let mtime_ns = narf_time::cycles_to_ns(s.mtime_cycles);
+    let mtime_ns = if attrs.mtime_ns != 0 {
+        attrs.mtime_ns
+    } else {
+        narf_time::cycles_to_ns(s.mtime_cycles)
+    };
     let stamp = |ns: u64| StatxTimestamp {
         tv_sec: (ns / 1_000_000_000) as i64,
         tv_nsec: (ns % 1_000_000_000) as u32,

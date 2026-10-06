@@ -24,6 +24,11 @@ use crate::volume::BtrfsVolume;
 /// `mkfs.btrfs` image with hello.txt / big.dat / subdir/note.txt).
 const FIXTURE_SPARSE: &[u8] = include_bytes!("../testdata/fixture.img.sparse");
 
+/// Exact-timestamp fixture: `/`, `fonts/`, `fonts/a.txt`, `fonts/b.txt`, whose
+/// `btrfs_timespec`s were patched to fixed values with distinct nanoseconds
+/// (`regen_fixture.sh::generate_times_fixture`; `btrfs check`-clean).
+const FIXTURE_TIMES_SPARSE: &[u8] = include_bytes!("../testdata/fixture-times.img.sparse");
+
 /// Same layout with 8 KiB data sectors and metadata nodes.
 const FIXTURE_SECTOR8K_SPARSE: &[u8] = include_bytes!("../testdata/fixture-sector8k.img.sparse");
 
@@ -5418,10 +5423,11 @@ fn smoke_btrfs_link_cross_dir_and_reject_dir() -> TestResult {
     {
         return TestResult::Fail("setup failed");
     }
-    // Hard-linking a directory is EPERM.
+    // Hard-linking a directory is EPERM (`OperationNotPermitted`; the
+    // `PermissionDenied` it used to return is EACCES).
     if !matches!(
         poll_once(root.link("d", "d2")),
-        Some(Err(FsError::PermissionDenied))
+        Some(Err(FsError::OperationNotPermitted))
     ) {
         return TestResult::Fail("hard link to directory was not refused");
     }
@@ -9079,8 +9085,14 @@ fn smoke_btrfs_rdev_decode() -> TestResult {
             gid: 0,
             nlink: 1,
             rdev,
+            atime_sec: 0,
+            atime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
             mtime_sec: 0,
             mtime_nsec: 0,
+            otime_sec: 0,
+            otime_nsec: 0,
         };
         inode.rdev_major_minor()
     };
@@ -10169,3 +10181,204 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_quota_override_needs_flag_and_capability
 );
+
+// ── Exact timestamps ───────────────────────────────────────────────
+
+/// `sec * 10^9 + nsec`, the wall-clock nanoseconds a `btrfs_timespec` means.
+const fn ts_ns(sec: u64, nsec: u64) -> u64 {
+    sec * 1_000_000_000 + nsec
+}
+
+/// A file reports each on-disk `btrfs_timespec` exactly: `InodeAttrs` carries
+/// atime/ctime/mtime to the nanosecond (Linux `btrfs_read_locked_inode` hands
+/// sec/nsec to `inode_set_*time` verbatim), `statx` reports otime as btime,
+/// and `Stat::mtime_cycles` derives from the exact mtime. The three times are
+/// distinct on disk, so a driver that copied mtime into atime/ctime (as the
+/// old `statx_async` did) or reported 0 (as the old `stat` did) fails.
+fn smoke_btrfs_file_exact_timestamps() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_TIMES_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("times fixture failed to mount"),
+    };
+    let fonts = match poll_once(vol.root().lookup_dir_async("fonts")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup fonts/ failed"),
+    };
+    let file = match poll_once(fonts.lookup_async("a.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup fonts/a.txt failed"),
+    };
+    let attrs = file.inode_attrs();
+    if attrs.mtime_ns != ts_ns(1_700_000_000, 123_456_789) {
+        return TestResult::Fail("file mtime_ns is not the on-disk timespec");
+    }
+    if attrs.atime_ns != ts_ns(1_600_000_000, 7) {
+        return TestResult::Fail("file atime_ns is not the on-disk timespec");
+    }
+    if attrs.ctime_ns != ts_ns(1_700_000_001, 111_111_111) {
+        return TestResult::Fail("file ctime_ns is not the on-disk timespec");
+    }
+    if file.stat().mtime_cycles != narf_time::ns_to_cycles(attrs.mtime_ns) {
+        return TestResult::Fail("Stat::mtime_cycles does not derive from the exact mtime");
+    }
+    let sx = match poll_once(file.statx_async(0, 0xfff)) {
+        Some(Ok(sx)) => sx,
+        _ => return TestResult::Fail("statx failed"),
+    };
+    let pair = |t: narf_filesystem::FsStatxTimestamp| (t.seconds, t.nanoseconds);
+    if pair(sx.mtime) != (1_700_000_000, 123_456_789)
+        || pair(sx.atime) != (1_600_000_000, 7)
+        || pair(sx.ctime) != (1_700_000_001, 111_111_111)
+    {
+        return TestResult::Fail("statx a/c/mtime are not the on-disk timespecs");
+    }
+    // `btrfs_getattr`: STATX_BTIME with the inode's otime.
+    if sx.mask & 0x800 == 0 || pair(sx.btime) != (1_690_000_000, 4) {
+        return TestResult::Fail("statx btime is not the on-disk otime");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_file_exact_timestamps);
+
+/// A directory's mtime reaches the stat path through `DirOps::dir_mtime_ns`
+/// and `inode_attrs().mtime_ns`, exactly. fontconfig validates a font cache
+/// against its directory's `st_mtim` to the nanosecond; the epoch (what every
+/// btrfs directory used to report) made every cache stale.
+fn smoke_btrfs_dir_exact_mtime() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_TIMES_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("times fixture failed to mount"),
+    };
+    let root = vol.root();
+    let root_mtime = ts_ns(1_500_000_000, 250_000_000);
+    if root.dir_mtime_ns() != root_mtime || root.inode_attrs().mtime_ns != root_mtime {
+        return TestResult::Fail("root dir mtime is not the on-disk timespec");
+    }
+    let fonts = match poll_once(root.lookup_dir_async("fonts")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup fonts/ failed"),
+    };
+    let want = ts_ns(1_650_000_123, 987_654_321);
+    if fonts.dir_mtime_ns() != want {
+        return TestResult::Fail("fonts/ dir_mtime_ns is not the on-disk mtime");
+    }
+    let attrs = fonts.inode_attrs();
+    if attrs.mtime_ns != want {
+        return TestResult::Fail("fonts/ inode_attrs().mtime_ns is not the on-disk mtime");
+    }
+    if attrs.atime_ns != ts_ns(1_650_000_000, 500_000_000)
+        || attrs.ctime_ns != ts_ns(1_650_000_200, 2)
+    {
+        return TestResult::Fail("fonts/ atime/ctime are not the on-disk timespecs");
+    }
+    // Each directory reports its own inode, not its parent's.
+    if fonts.dir_mtime_ns() == root.dir_mtime_ns() {
+        return TestResult::Fail("fonts/ reported the root directory's mtime");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_dir_exact_mtime);
+
+/// Nanosecond edges: `nsec = 999_999_999` stays inside its second, and a
+/// whole-second timespec (`nsec = 0`) reports exactly `sec * 10^9` — the lossy
+/// ns→cycles→ns round trip could hand back `sec - 1 . 999999xxx`. Negative:
+/// an inode item shorter than `sizeof(struct btrfs_inode_item)` (160) is
+/// refused, as Linux's tree-checker `check_inode_item` does (-EUCLEAN), rather
+/// than decoded with garbage times.
+fn smoke_btrfs_timestamp_nsec_edges() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_TIMES_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("times fixture failed to mount"),
+    };
+    let fonts = match poll_once(vol.root().lookup_dir_async("fonts")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup fonts/ failed"),
+    };
+    let file = match poll_once(fonts.lookup_async("b.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup fonts/b.txt failed"),
+    };
+    let attrs = file.inode_attrs();
+    if attrs.atime_ns != ts_ns(1_700_000_000, 999_999_999) {
+        return TestResult::Fail("nsec 999999999 did not stay within its second");
+    }
+    if attrs.mtime_ns != ts_ns(1_700_000_000, 0) || attrs.ctime_ns != ts_ns(1_700_000_000, 0) {
+        return TestResult::Fail("a whole-second timespec was not reported exactly");
+    }
+    let mut body = alloc::vec![0u8; 160];
+    body[136..144].copy_from_slice(&1_700_000_000u64.to_le_bytes());
+    body[144..148].copy_from_slice(&5u32.to_le_bytes());
+    match crate::inode::InodeItem::decode(&body) {
+        Ok(i) if i.mtime_ns() == ts_ns(1_700_000_000, 5) => {}
+        _ => return TestResult::Fail("a 160-byte inode item did not decode its mtime"),
+    }
+    if crate::inode::InodeItem::decode(&body[..159]).is_ok() {
+        return TestResult::Fail("a truncated inode item was decoded");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_timestamp_nsec_edges);
+
+/// `link(2)` on btrfs, per Linux `btrfs_link`: the second name resolves to the
+/// same inode and `nlink` rises by one; an existing name is refused with
+/// EEXIST (`Busy`, as `filename_create` answers — this used to be EINVAL), and
+/// a missing source is ENOENT. Refused attempts leave `nlink` alone.
+fn smoke_btrfs_link_new_name() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    let nlink = |f: &Arc<dyn narf_filesystem::FileOps>| {
+        poll_once(f.statx_async(0, 0x7ff))
+            .and_then(|r| r.ok())
+            .map(|sx| sx.nlink)
+    };
+    let before = match poll_once(root.lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup hello.txt failed"),
+    };
+    let Some(links_before) = nlink(&before) else {
+        return TestResult::Fail("statx of hello.txt failed");
+    };
+    if !matches!(poll_once(root.link("hello.txt", "alias")), Some(Ok(()))) {
+        return TestResult::Fail("link of an existing file failed");
+    }
+    let (Some(Ok(orig)), Some(Ok(alias))) = (
+        poll_once(root.lookup_async("hello.txt")),
+        poll_once(root.lookup_async("alias")),
+    ) else {
+        return TestResult::Fail("a linked name did not resolve");
+    };
+    if orig.ino() != alias.ino() {
+        return TestResult::Fail("the new link names a different inode");
+    }
+    if nlink(&alias) != Some(links_before + 1) {
+        return TestResult::Fail("link did not raise nlink by one");
+    }
+    if !matches!(
+        poll_once(root.link("hello.txt", "alias")),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("link onto an existing name was not refused with EEXIST");
+    }
+    if !matches!(
+        poll_once(root.link("missing", "x")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("link of a missing name did not report NotFound");
+    }
+    match poll_once(root.lookup_async("alias")) {
+        Some(Ok(f)) if nlink(&f) == Some(links_before + 1) => TestResult::Pass,
+        _ => TestResult::Fail("a refused link changed nlink"),
+    }
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_link_new_name);

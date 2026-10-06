@@ -25,16 +25,16 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let target_tid = if target_pid == task {
-        task
-    } else {
-        match pid_to_task_raw(target_pid) {
-            Some(t) => t,
-            None => {
-                ctx.set_return(errno_ret(ESRCH));
-                return;
-            }
-        }
+    // `get_pid_task(pid, PIDTYPE_PID)` (kernel/pid.c:916): the pidfd's own
+    // task — a process pidfd's leader, or the thread a PIDFD_THREAD pidfd was
+    // opened on. The pidfd holds an outer id, never a scheduler TaskId; one
+    // that names no live task any more is -ESRCH.
+    let Some(target_tid) = pid_to_task_raw(target_pid)
+        .or_else(|| linux_tid_to_task_raw(target_pid))
+        .filter(|&t| t == task || crate::task::task_get(t).is_some())
+    else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
     };
     if !ptrace_may_access(task, target_tid) {
         ctx.set_return(errno_ret(EPERM));

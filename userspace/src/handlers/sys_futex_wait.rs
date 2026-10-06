@@ -156,12 +156,14 @@ pub(crate) fn sys_futex_wait(ctx: &mut dyn TrapContext) {
         Some(d) => (d - now).min(FUTEX2_PARK_CAP_NS),
         None => FUTEX2_PARK_CAP_NS,
     };
+    // `__futex_wait(uaddr, flags, val, to, mask)`: the mask is the waiter's
+    // bitset, matched by `futex_wake`.
     futex_wait_core(
         ctx,
-        futex_namespace((flags & FUTEX_PRIVATE) != 0),
         args.arg0,
         args.arg1 as u32,
         park_cap,
         flags,
+        args.arg2 as u32,
     );
 }

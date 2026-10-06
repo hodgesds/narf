@@ -8,7 +8,7 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     let size = args.arg1 as usize;
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
-        narf_console::write_str(&alloc::format!(
+        narf_console::write_str_console_only(&alloc::format!(
             "[CLONE3 uargs={:#x} size={}]\n",
             uargs,
             size
@@ -113,7 +113,7 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
     }
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
-        narf_console::write_str(&alloc::format!(
+        narf_console::write_str_console_only(&alloc::format!(
             "[CLONE3 flags={:#x} pidfd_ptr={:#x} cgroup_fd={} stack={:#x}+{:#x}]\n",
             ca.flags,
             ca.pidfd,

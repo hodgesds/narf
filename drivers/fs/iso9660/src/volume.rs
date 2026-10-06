@@ -72,6 +72,11 @@ pub struct Iso9660Volume<B: BlockDevice> {
     io: IrqSafeSpinLock<VolumeIo>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
+    /// Recording date of the root directory's own "." record, read at mount.
+    /// Linux reads every directory inode from its "." record
+    /// (`isofs_normalize_block_and_offset`), the root included
+    /// (`isofs_iget(s, sbi->s_firstdatazone, 0)`), not from the PVD copy.
+    pub root_date: [u8; 7],
 }
 
 impl<B: BlockDevice + 'static> Iso9660Volume<B> {
@@ -161,6 +166,12 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
             return Err(FsError::Unsupported);
         }
 
+        let root = read_directory_record(&pvd.root_directory_record, 0);
+        let root_dot =
+            u64::from(root.extent_lba_le()) + u64::from(root.extended_attribute_record_length);
+        Self::read_sector_into(&*device, &io, root_dot, &mut sector_buf).await?;
+        let root_date = crate::node::dot_record_date(&sector_buf)?;
+
         Ok(Arc::new_cyclic(|self_weak| Iso9660Volume {
             device,
             pvd,
@@ -168,6 +179,7 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
+            root_date,
         }))
     }
 
@@ -257,6 +269,17 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
 }
 
 impl<B: BlockDevice + 'static> FsInstance for Iso9660Volume<B> {
+    /// Every isofs mount that Linux accepts is read-only: `isofs_fill_super`
+    /// ("We don't support read-write mounts") refuses anything else. Writes
+    /// are therefore EROFS at the mount, before the filesystem.
+    ///
+    /// LINUX-GAP: Linux rejects a read-WRITE isofs `mount(2)` with EACCES
+    /// (util-linux then retries read-only); NARF has no `mount(2)` path for
+    /// iso9660 yet and forces its internal mounts read-only instead.
+    fn always_read_only(&self) -> bool {
+        true
+    }
+
     fn root(&self) -> Arc<dyn DirOps> {
         let record = self.root_record();
         let volume = self
@@ -265,11 +288,10 @@ impl<B: BlockDevice + 'static> FsInstance for Iso9660Volume<B> {
             .expect("Iso9660Volume::root called after drop");
         // The root is a directory, whose inode number comes from its own
         // extent, so it needs no record position.
-        Arc::new(super::node::Iso9660Node::from_record(
-            volume,
-            &record,
-            (0, 0),
-        ))
+        Arc::new(
+            super::node::Iso9660Node::from_record(volume, &record, (0, 0))
+                .with_date(&self.root_date),
+        )
     }
 
     fn name(&self) -> &str {

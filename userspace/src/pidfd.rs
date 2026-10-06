@@ -190,6 +190,23 @@ pub fn forget_pid(pid: u64) {
 /// Linux: `kernel/fork.c::do_notify_pidfd` walks the pid's waiter
 /// list. Our table is shallow: every pidfd for the pid shares one
 /// `PidFdState`, so a single store is sufficient.
+/// A non-leader thread whose outer tid is `tid` exited: a `PIDFD_THREAD`
+/// pidfd opened on it becomes readable, and the tid is dropped from the table
+/// so a later process or thread reusing the number gets a fresh state. A
+/// no-op (no global wake) when nobody holds a pidfd on the thread, which is
+/// the common case on every thread exit.
+pub fn notify_thread_exit(tid: u64) {
+    let st = {
+        let mut g = PIDFD_TABLE.lock();
+        g.as_mut().and_then(|m| m.remove(&tid))
+    };
+    if let Some(st) = st {
+        st.exited.store(true, Ordering::Release);
+        st.readiness.set(POLL_IN, 0);
+        narf_net::readiness::notify(0);
+    }
+}
+
 pub fn notify_exit(pid: u64) -> bool {
     let st = {
         let g = PIDFD_TABLE.lock();

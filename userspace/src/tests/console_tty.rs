@@ -583,7 +583,7 @@ kernel_test_in!("userspace", smoke_tty_background_read_raises_sigttin);
 //      echo (write rest, write NEWLINE).
 //   4. sys_write each segment on fd 1 — routes through ConsoleFile::write
 //      → narf_console::Writer → write_str → klog::record.
-//   5. klog::snapshot must contain "hello world\n" as a contiguous run.
+//   5. the kernel log must hold a "hello world" record logged after step 4.
 //
 // We can't observe the real UART backend in a kernel-test (no QEMU stdio
 // hooked to the SUT's COM1 in test mode), but klog is fed unconditionally
@@ -707,8 +707,9 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
         return TestResult::Fail("parse: cmd != echo");
     }
 
-    // Snapshot klog *before* we write so we can find the new region after.
-    let pre_len = narf_console::klog::snapshot().len();
+    // Note the log's next record *before* we write so we can find the new
+    // records after (sequence numbers survive eviction; byte offsets don't).
+    let pre_seq = narf_console::klog::next_seq();
 
     // Step 4: sys_write on fd 1 — the body, then a newline. Two calls
     // mirror the shell's `write_all(fd, rest); write_all(fd, NEWLINE);`.
@@ -751,15 +752,11 @@ fn smoke_echo_hello_world_end_to_end() -> TestResult {
         }
     }
 
-    // Step 5: pull a fresh klog snapshot and look for "hello world\n"
-    // anywhere in the post-write tail. The pre/post split is just a
-    // performance hint — if the ring has wrapped, search the whole
-    // window.
-    let post = narf_console::klog::snapshot();
+    // Step 5: the two writes must have produced ONE "hello world" record
+    // (the fragment waits for its newline) among the records logged since.
+    let post = narf_console::klog::text_since(pre_seq);
     let needle: &[u8] = b"hello world\n";
-    let tail_start = pre_len.min(post.len().saturating_sub(needle.len()));
-    let haystack = &post[tail_start..];
-    let found = haystack.windows(needle.len()).any(|w| w == needle);
+    let found = post.windows(needle.len()).any(|w| w == needle);
 
     fd::__test_reset();
     __test_clear_global();

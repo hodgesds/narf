@@ -345,9 +345,15 @@ fn smoke_abi_misc_process_vm_errnos() -> TestResult {
             return Err("process_vm_writev with liovcnt > 1024 must return -EINVAL");
         }
 
-        // 2. riovcnt > 1024 -> -EINVAL.
+        // 2. riovcnt > 1024 -> -EINVAL. The remote iovec array is imported
+        // only after a non-empty local one: an empty local iovec returns 0
+        // first (mm/process_vm_access.c:276), so give it one byte.
+        let mut byte = [0u8; 1];
+        let iov = [byte.as_mut_ptr() as u64, 1u64];
         let args = SyscallArgs {
             arg0: FAKE_TASK,
+            arg1: iov.as_ptr() as u64,
+            arg2: 1,
             arg4: 1025,
             ..Default::default()
         };
@@ -358,9 +364,15 @@ fn smoke_abi_misc_process_vm_errnos() -> TestResult {
             return Err("process_vm_writev with riovcnt > 1024 must return -EINVAL");
         }
 
-        // 3. Nonexistent pid -> -ESRCH.
+        // 3. Nonexistent pid -> -ESRCH. The task lookup comes after both
+        // iovec imports and only when there is something to copy (:276,
+        // :182), so both iovecs are non-empty.
         let args = SyscallArgs {
             arg0: 999_999,
+            arg1: iov.as_ptr() as u64,
+            arg2: 1,
+            arg3: iov.as_ptr() as u64,
+            arg4: 1,
             ..Default::default()
         };
         if call(Syscall::ProcessVmReadv.raw(), args) != Some(ESRCH) {
@@ -1481,7 +1493,7 @@ fn smoke_abi_syslog_read() -> TestResult {
     with_setup(|| {
         crate::handlers::__test_syslog_reset();
         if call(Syscall::Syslog.raw(), a2(SYSLOG_SIZE_BUFFER, 0, 0))
-            != Some(narf_console::klog::RING_CAPACITY as i64)
+            != Some(narf_console::klog::log_buf_len() as i64)
         {
             return Err("SIZE_BUFFER must report the ring capacity");
         }
@@ -1574,6 +1586,67 @@ fn smoke_abi_syslog_clear() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_syslog_clear);
 
+/// READ_ALL renders records the way Linux's `syslog_print_all` does with
+/// printk.time on: `"<prio>[%5lu.%06lu] message\n"` per record
+/// (`record_print_text` / `info_print_prefix`), and SIZE_BUFFER reports the
+/// power-of-two `log_buf_len`, at least `1 << CONFIG_LOG_BUF_SHIFT`.
+fn smoke_abi_syslog_read_all_linux_format() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_syslog_reset();
+        let size = call(Syscall::Syslog.raw(), a2(SYSLOG_SIZE_BUFFER, 0, 0)).unwrap_or(-1);
+        if size < narf_console::klog::DEFAULT_LOG_BUF_LEN as i64 || (size as u64).count_ones() != 1
+        {
+            return Err("SIZE_BUFFER must be a power of two >= 128 KiB");
+        }
+        narf_console::klog::record_level(3, "narf-syslog-fmt-");
+        narf_console::klog::record_level(3, "probe\n");
+        let mut buf = alloc::vec![0u8; 64 * 1024];
+        let p = buf.as_mut_ptr() as u64;
+        let n = match call(
+            Syscall::Syslog.raw(),
+            a2(SYSLOG_READ_ALL, p, buf.len() as u64),
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("READ_ALL returned nothing"),
+        };
+        let text = &buf[..n];
+        let line = match text
+            .split(|&b| b == b'\n')
+            .find(|l| l.ends_with(b"] narf-syslog-fmt-probe"))
+        {
+            Some(l) => l,
+            None => return Err("the two fragments must be one line in READ_ALL"),
+        };
+        // "<3>[" + >=5-char right-aligned seconds + "." + 6 digits + "] ".
+        let ok = line.starts_with(b"<3>[") && {
+            let inner = &line[4..line.len() - b"] narf-syslog-fmt-probe".len()];
+            match inner.iter().position(|&b| b == b'.') {
+                Some(dot) => {
+                    dot >= 5
+                        && inner[..dot]
+                            .iter()
+                            .all(|&b| b == b' ' || b.is_ascii_digit())
+                        && inner[dot + 1..].len() == 6
+                        && inner[dot + 1..].iter().all(u8::is_ascii_digit)
+                }
+                None => false,
+            }
+        };
+        if !ok {
+            return Err("READ_ALL line is not \"<prio>[%5lu.%06lu] msg\"");
+        }
+        // Negative: every line carries the prefix — no bare text leaks.
+        if text
+            .split(|&b| b == b'\n')
+            .any(|l| !l.is_empty() && !l.starts_with(b"<"))
+        {
+            return Err("a READ_ALL line lacks the <prio> prefix");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_syslog_read_all_linux_format);
+
 /// The console-level actions, including the save/restore pairing.
 ///
 /// `CONSOLE_OFF` parks the current level only `if (saved == LOGLEVEL_DEFAULT)`,
@@ -1657,7 +1730,7 @@ fn smoke_abi_syslog_requires_cap_syslog() -> TestResult {
         // Privileged first, so the case proves the drop is what changed the
         // answer rather than the action being broken outright.
         if call(Syscall::Syslog.raw(), a2(SYSLOG_SIZE_BUFFER, 0, 0))
-            != Some(narf_console::klog::RING_CAPACITY as i64)
+            != Some(narf_console::klog::log_buf_len() as i64)
         {
             return Err("SIZE_BUFFER should work while privileged");
         }

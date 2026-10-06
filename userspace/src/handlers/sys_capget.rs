@@ -77,14 +77,15 @@ pub(crate) fn sys_capget(ctx: &mut dyn TrapContext) {
     // all-zero set for a pid that does not exist at all, which a caller
     // cannot tell apart from "that process holds no capabilities".
     // (Same defect capset fixed as audit finding #19.)
+    // `pid != task_pid_vnr(current)` compares against the caller's own TID;
+    // every other value goes through `find_task_by_vpid` (capability.c:115),
+    // which finds any thread, a non-leader's tid included.
     let task = current_task_id();
-    let self_pid = task_to_pid_raw(task).unwrap_or(task);
     let target = if pid == 0 {
         task
     } else {
-        match accept_pid_from(task, pid as u64) {
-            Some(outer) if outer == self_pid => task,
-            Some(outer) => proc_pid_to_tid(outer),
+        match find_task_by_vpid(task, pid) {
+            Some(target) => target,
             None => {
                 ctx.set_return(errno_ret(ESRCH));
                 return;

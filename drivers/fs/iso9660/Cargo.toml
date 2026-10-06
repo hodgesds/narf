@@ -23,6 +23,7 @@ narf-block        = { path = "../../../block" }
 narf-filesystem   = { path = "../../../filesystem" }
 narf-io           = { path = "../../../io" }
 narf-kernel-test  = { path = "../../../verification/kernel-test" }
+narf-time         = { path = "../../../time" }
 
 [lints]
 workspace = true

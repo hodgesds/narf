@@ -46,6 +46,10 @@ pub struct Iso9660Node<B: BlockDevice> {
     pub state: IrqSafeSpinLock<Iso9660NodeState>,
     /// `st_ino`: see [`isofs_get_ino`].
     ino: u64,
+    /// `st_mtim` (and `st_atim`/`st_ctim`, which Linux sets to the same
+    /// value) in wall-clock nanoseconds, from the §9.1.5 recording date of
+    /// the record Linux reads this inode from.
+    mtime_ns: u64,
 }
 
 /// `log2(SECTOR_SIZE)`: Linux's `ISOFS_BUFFER_BITS` for 2 KiB blocks.
@@ -101,8 +105,65 @@ impl<B: BlockDevice + 'static> Iso9660Node<B> {
                 data_length,
                 stat,
             }),
+            mtime_ns: 0,
+        }
+        .with_date(&record.recording_date_time)
+    }
+
+    /// Take the timestamps from `date` (a §9.1.5 recording date). A file's
+    /// come from its own record; a directory's from its "." record — see
+    /// [`dir_dot_date`].
+    pub fn with_date(mut self, date: &[u8; 7]) -> Self {
+        self.mtime_ns = crate::dir::recording_time_ns(date);
+        // The exact value travels in `InodeAttrs::mtime_ns`; `Stat` keeps
+        // the (lossy) cycles form for callers that only read `Stat`.
+        self.state.lock().stat.mtime_cycles = narf_time::ns_to_cycles(self.mtime_ns);
+        self
+    }
+
+    /// Exact timestamps for the stat path. `isofs_read_inode` sets ctime,
+    /// atime and mtime all to the record's `iso_date`.
+    fn attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            atime_ns: self.mtime_ns,
+            ctime_ns: self.mtime_ns,
+            mtime_ns: self.mtime_ns,
+            ..Default::default()
         }
     }
+
+    /// Node for a record found while scanning a directory. A directory's
+    /// times come from its own "." record, as Linux reads it.
+    async fn from_scanned(
+        volume: &Arc<Iso9660Volume<B>>,
+        record: &DirectoryRecord,
+        pos: (u64, u64),
+    ) -> Result<Self, FsError> {
+        let node = Iso9660Node::from_record(volume.clone(), record, pos);
+        if !record.is_directory() {
+            return Ok(node);
+        }
+        let mut sector = alloc::vec![0u8; SECTOR_SIZE];
+        let dot =
+            u64::from(record.extent_lba_le()) + u64::from(record.extended_attribute_record_length);
+        volume.read_sector(dot, &mut sector).await?;
+        Ok(node.with_date(&dot_record_date(&sector)?))
+    }
+}
+
+/// The §9.1.5 recording date of the record at the start of a directory's
+/// first logical block — its "." record. Linux reads a directory inode from
+/// there (`isofs_normalize_block_and_offset`: block = extent + extended
+/// attribute length, offset 0) and fails it with EIO when the record is
+/// shorter than a directory record header (`isofs_read_inode`).
+pub(crate) fn dot_record_date(sector: &[u8]) -> Result<[u8; 7], FsError> {
+    if sector.len() < core::mem::size_of::<DirectoryRecord>()
+        || usize::from(sector[0]) < core::mem::size_of::<DirectoryRecord>()
+    {
+        return Err(FsError::Io(BlockError::IOError));
+    }
+    Ok(read_directory_record(sector, 0).recording_date_time)
 }
 
 // ── FileOps ─────────────────────────────────────────────────────────
@@ -113,10 +174,7 @@ impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
     }
 
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
@@ -187,10 +245,13 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
+    }
+
+    /// The directory's "." record date. Without it every ISO 9660 directory
+    /// stat'd as the epoch.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.mtime_ns
     }
 
     fn rcu_walkable(&self) -> bool {
@@ -208,10 +269,8 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
             let entries = scan_directory(&self.volume, &self.state).await?;
             for (found_name, record, pos) in entries {
                 if names_match(&found_name, name) {
-                    return Ok(
-                        Arc::new(Iso9660Node::from_record(self.volume.clone(), &record, pos))
-                            as Arc<dyn FileOps>,
-                    );
+                    let node = Iso9660Node::from_scanned(&self.volume, &record, pos).await?;
+                    return Ok(Arc::new(node) as Arc<dyn FileOps>);
                 }
             }
             Err(FsError::NotFound)
@@ -227,10 +286,8 @@ impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
             let entries = scan_directory(&self.volume, &self.state).await?;
             for (found_name, record, pos) in entries {
                 if names_match(&found_name, name) && record.is_directory() {
-                    return Ok(
-                        Arc::new(Iso9660Node::from_record(self.volume.clone(), &record, pos))
-                            as Arc<dyn DirOps>,
-                    );
+                    let node = Iso9660Node::from_scanned(&self.volume, &record, pos).await?;
+                    return Ok(Arc::new(node) as Arc<dyn DirOps>);
                 }
             }
             Err(FsError::NotFound)
