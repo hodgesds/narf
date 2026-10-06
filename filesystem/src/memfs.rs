@@ -2120,7 +2120,24 @@ impl MemFile {
 
 impl Drop for MemFile {
     fn drop(&mut self) {
-        let blocks = self.data.lock().pages.len() as u64;
+        let mut data = self.data.lock();
+        // Retired pages kept their block charge "until the inode dies"
+        // (`release_page`) — this is that point, so they are returned with
+        // the live pages. Releasing only `pages` leaked one block of the
+        // mount's budget (and the owner's quota) per page truncated or
+        // punched while mapped, until in-range faults could no longer
+        // reserve one.
+        let blocks = (data.pages.len() + data.retired.len()) as u64;
+        // No mapping can still reach a page: every mapping owner holds an
+        // `Arc` to this file, so the inode only dies after the last one is
+        // gone. The frames are free to return to the allocator.
+        for page in data.pages.values_mut() {
+            page.mapped = false;
+        }
+        for page in data.retired.iter_mut() {
+            page.mapped = false;
+        }
+        drop(data);
         self._inode_lease.superblock.release_blocks(
             self.uid.load(Ordering::Relaxed),
             self.gid.load(Ordering::Relaxed),
