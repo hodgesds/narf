@@ -25,7 +25,7 @@ falling back to "trust every kthread."
 | Kernel model | Monolithic with loadable modules | Monolithic | **Framekernel**: minimal Ring-0 TCB + 16 hw-isolated driver domains in the same address space |
 | Driver isolation | None inside kernel; a buggy module can scribble anywhere | None inside kernel | **PKS** (Intel SPR+), **MTE** (aarch64), or **PCID-tagged per-domain PTs** (AMD / pre-SPR Intel) — hardware blocks cross-domain loads/stores; cost varies by backend |
 | Implementation language | C (Rust permitted in tree, opt-in subsystems) | C (predominantly) | **Rust, no_std**, top-to-bottom; `unsafe` walled into the HAL |
-| Concurrency model | Preemptive kthreads + softirqs + workqueues + BHs | Preemptive kthreads + taskqueues + netisr | Stackless **async `Future`s** on a single global executor; per-CPU queues; optional NUMA-aware work stealing |
+| Concurrency model | Preemptive kthreads + softirqs + workqueues + BHs | Preemptive kthreads + taskqueues + netisr | Stackless **async `Future`s** and stackful tasks on a single global executor; per-CPU queues; optional NUMA-aware work stealing |
 | Cross-context call | `syscall` → schedule → return; copy_to/from_user | `syscall` → schedule → return; `copyin/copyout` | **Direct context transfer** — caller donates its time-slice to the callee, no double trip |
 | IPC | pipes, UDS, SysV, futex, io_uring (zero-copy in narrow paths) | pipes, UDS, kqueue, capsicum sandboxing | **Narf-Ring**: zero-copy ownership-transfer over shared-memory rings, cap-gated |
 | Authorization | uid/gid + capabilities(7) + LSM (SELinux/AppArmor) | uid/gid + (FreeBSD) Capsicum + (OpenBSD) pledge/unveil | **`Cap<T>` everywhere**: no root, no ambient authority, type-encoded rights, epoch-revocable |
