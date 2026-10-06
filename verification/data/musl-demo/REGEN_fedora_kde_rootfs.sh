@@ -348,6 +348,14 @@ if [ -e "$WORK/root/usr/bin/plasma_session.narf-real" ]; then
     "$WORK/root/usr/bin/plasma_session"
 fi
 
+# Not on an audio-check boot. The audio gate deliberately does not want a
+# compositor: the graph has to stand up on its own, and a Plasma failure must
+# not read as an audio failure. Leaving the session to start anyway is worse
+# than noise — a Plasma process taking a fatal fault has twice left the guest
+# spinning on a dozen vCPUs with the serial stream dead, so the gate's own
+# result was lost to an unrelated crash. `ConditionKernelCommandLine` is the
+# narrowest way to say it: ordinary graphical boots are untouched.
+#
 # The session service starts after its two real prerequisites: the user
 # manager/session bus and DRM ownership policy.  They have no ordering edge
 # between them, so PID 1 starts both jobs in parallel.
@@ -385,6 +393,7 @@ fi
 printf '%s\n' \
   '[Unit]' \
   'Description=NARF Plasma Wayland Session' \
+  'ConditionKernelCommandLine=!narf_audio_check' \
   'Wants=dbus-broker.service' \
   'Wants=user@1000.service' \
   'After=user@1000.service' \

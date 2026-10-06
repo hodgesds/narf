@@ -256,40 +256,33 @@ if [ "$mode" = root ]; then
         fail "cannot open /proc/1/root (readlink: $(readlink /proc/1/root 2>&1))"
     note "proc: /proc/<pid>/root opens as a directory (readlink $(readlink /proc/self/root 2>&1))"
 
-    # devfd: `/dev/fd` is a devtmpfs symlink into procfs, and `/dev/fd/N` is
-    # how bash implements process substitution (`cmd < <(other)`). Recorded,
-    # not asserted: the audio contract does not depend on it, but a shell idiom
-    # this common failing is worth knowing from a run that otherwise passes.
-    # GLib's main loop computes every timeout from `g_get_monotonic_time()`,
-    # i.e. `clock_gettime(CLOCK_MONOTONIC)` through the vDSO. A clock that does
-    # not advance there makes every timeout read as already expired, so the
-    # loop polls with a zero timeout forever and burns a core while still
-    # working correctly - which is exactly the shape of the session manager's
-    # spin. `sleep` cannot see this: it uses the clock_nanosleep SYSCALL.
-    # Python's time.monotonic() is the vDSO path and is already in the image.
-    note "clock: $(python3 -c 'import time
-for name, fn in (("monotonic", time.monotonic), ("perf", time.perf_counter), ("realtime", time.time)):
-    a = fn(); time.sleep(0.5); b = fn()
-    print(f"{name}+{b - a:.3f}s", end=" ")' 2>&1)"
-
     # Does a blocking wait block? A `poll(2)` that returns immediately makes
     # any GLib main loop spin at 100% of a CPU while still working correctly,
-    # and the shape that matters here is `poll` over an EPOLL fd - GLib
+    # and the shape that matters here is `poll` over an EPOLL fd — GLib
     # polling PipeWire's loop.
-    note "$(timeout 60 runuser -u "$U" -- /usr/local/libexec/narf-poll-probe 2>&1 | tr '\n' ' ')"
+    # To a FILE, and through `setpriv`, deliberately. `note "$(timeout … runuser
+    # …)"` wedges the gate: `timeout` signals `runuser`, which does not forward
+    # it, so the probe survives and the command substitution blocks forever on
+    # a pipe whose write end is still held. `setpriv` execs its target, so the
+    # timeout lands on the probe itself, and a redirect leaves no pipe to wait
+    # on either way.
+    timeout -k 5 90 setpriv --reuid "$UID_N" --regid "$UID_N" --init-groups \
+        --inh-caps=-all -- /usr/local/libexec/narf-poll-probe \
+        >"$LOG/poll-probe" 2>&1
+    note "poll-probe rc=$?: $(tr '\n' ' ' <"$LOG/poll-probe")"
 
-    note "devfd: readlink=$(readlink /dev/fd 2>&1) fd0=$(ls -l /dev/fd/0 2>&1 | tail -1)"
-    if printf 'devfd-ok\n' | { read -r _probe < /dev/fd/0 && echo "$_probe"; } 2>/dev/null |
-        grep -q devfd-ok; then
-        note "devfd: /dev/fd/0 reads"
-    else
-        note "devfd: /dev/fd/0 does NOT read"
-    fi
-    if { cat < <(printf 'procsub-ok\n'); } 2>/dev/null | grep -q procsub-ok; then
-        note "devfd: process substitution works"
-    else
-        note "devfd: process substitution does NOT work"
-    fi
+    # `/dev/fd` is a devtmpfs symlink into procfs, and `/dev/fd/N` is how bash
+    # implements process substitution (`cmd < <(other)`). Following it needs the
+    # VFS expansion to stop at the proc-fd magic link rather than expand its
+    # readlink TEXT, which for an anonymous descriptor is `pipe:[12345]` and
+    # names nothing.
+    [ -e /dev/fd/0 ] ||
+        fail "/dev/fd/0 does not resolve (readlink /dev/fd: $(readlink /dev/fd 2>&1))"
+    printf 'devfd-ok\n' | { read -t 10 -r probe < /dev/fd/0 && [ "$probe" = devfd-ok ]; } ||
+        fail "/dev/fd/0 does not read back the caller's stdin"
+    { cat < <(printf 'procsub-ok\n'); } 2>/dev/null | grep -q procsub-ok ||
+        fail "bash process substitution (cmd < <(other)) does not work"
+    note "devfd: /dev/fd/0 reads and process substitution works"
 
     # A session bus, the way a seat session has one. Started explicitly rather
     # than through `dbus-run-session`, which hands the address back over a pipe
@@ -559,13 +552,6 @@ wait_for 300 "snapshot && [ -n \"\$(alsa_devices)\" ]" || {
     timeout 60 wpctl status >"$LOG/wpctl-status" 2>&1
     note "wpctl status rc=$?:"
     sed -n '1,40p' "$LOG/wpctl-status" 2>&1
-    # What the spinning process is actually asking the kernel for. If ptrace
-    # attach is unavailable the error line says so and costs nothing.
-    note "wireplumber syscall samples (ptrace attach is unavailable here):"
-    for _ in 1 2 3; do
-        note "  syscall=$(cat /proc/$WP_PID/syscall 2>&1) wchan=$(cat /proc/$WP_PID/wchan 2>&1)"
-        sleep 1
-    done
     note "pipewire log tail:"
     tail -n 15 "$LOG/pipewire" 2>&1
     note "wireplumber log tail:"
@@ -768,6 +754,13 @@ threads=$(grep -c . "$LOG/ps-L")
     fail "ps -L listed ${threads} thread(s) for a multi-threaded session manager"
 note "steady: ps -L lists ${threads} threads: $(awk '{print $3}' "$LOG/ps-L" | sort -u | tr '\n' ' ')"
 
+# NOT asserted here: `strace -p`. A tracer is now eligible to wait for a tracee
+# it did not fork, but the tracee's attach-stop is never reported to it, so the
+# tracer blocks in `wait4` forever instead of being told its tracee stopped —
+# and it does not die on SIGTERM either, so a `timeout` around it never
+# returns. Asserting it would hang this gate rather than fail it. See the
+# README's open-defect section.
+#
 # glibc's pthread_setname_np writes /proc/self/task/<tid>/comm. Every PipeWire
 # loop names itself that way, and each failure is one log line.
 if grep -aq "pthread_setname error" "$LOG/pipewire" "$LOG/wireplumber" 2>/dev/null; then
@@ -777,6 +770,8 @@ fi
 awk '{print $3}' "$LOG/ps-L" | grep -qv '^wireplumber$' ||
     fail "every thread is still named after the process; pthread_setname_np had no effect"
 note "steady: thread names are distinct, so pthread_setname_np takes effect"
+
+
 
 echo "NARF-AUDIO-CHECK: OK cards=2 device=${dev_id} profiles=${dev_profiles} playback=${play_s}s captured=${grew} idle-cpu=${wp_pct}%/${pw_pct}% threads=${threads}"
 exit 0

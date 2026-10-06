@@ -85,9 +85,22 @@ harness silently measured the wrong thing, each of which cost a boot:
 - **Assert per DEVICE, not globally.** With two cards present, switching one
   card's profile to `off` cannot make "no sink anywhere" true, so that
   condition can never be satisfied by a correct profile switch.
-- **`strace -p` cannot attach** (`wait4(__WALL): No child processes`). Thread
-  state is sampled from `/proc/<pid>/task/<tid>/stat` instead, which is what
-  `ps -L` reads too.
+- **`strace -p` is not usable yet** — it blocks in `wait4` and cannot be killed
+  by a timeout (see the open-defect section). Thread state is sampled from
+  `/proc/<pid>/task/<tid>/stat` instead, which is what `ps -L` reads too.
+- **Plasma does not run on an audio-check boot.** The gate does not want a
+  compositor, and leaving the session to start anyway is not merely noisy: a
+  Plasma process taking a fatal fault twice left the guest spinning on a dozen
+  vCPUs with the serial stream dead, losing the gate's own result to an
+  unrelated crash. `narf-plasma.service` carries
+  `ConditionKernelCommandLine=!narf_audio_check`; ordinary graphical boots are
+  untouched.
+- **Never wrap a `timeout`'d helper in a command substitution** unless the
+  helper is `exec`ed into. `note "$(timeout 60 runuser -u u -- probe)"` wedges
+  the gate: `timeout` signals `runuser`, which does not forward it, the probe
+  survives, and the substitution blocks forever on a pipe whose write end is
+  still held. Redirect to a file, and drop privileges with `setpriv`, which
+  execs its target so the timeout lands on the probe itself.
 
 ## Oracles
 
@@ -139,9 +152,16 @@ Ruled out so far, all measured in-guest:
 - GLib itself: a bare `gdbus monitor` main loop idles at 0%.
 
 It emits no log output at `WIREPLUMBER_DEBUG=4`, so it is a silent dispatch
-loop rather than repeated work. Narrowing it further wants a tracer, and
-`strace -p` cannot attach here: `wait4(__WALL)` does not consider a ptrace
-tracee that is not a child, so the tracer sees `No child processes`. Those two
-are coupled — the ptrace/wait4 gap is the next step.
+loop rather than repeated work.
+
+Narrowing it further wants a tracer, and `strace -p` is still unusable — but
+for a different reason than it was. A tracer is now eligible to wait for a
+tracee it did not fork (`wait4(__WALL)` no longer answers `No child
+processes`), yet the tracee's attach-stop is never reported to it, so the
+tracer blocks in `wait4` indefinitely instead of being told its tracee
+stopped. It does not die on `SIGTERM` in that state either, so a `timeout`
+around it never returns. Reporting the ptrace-stop to the tracer is the next
+step; until then do not put `strace -p` in the gate, because it hangs the run
+rather than failing it.
 
 Audible quality and physical power transitions still require hardware tests.

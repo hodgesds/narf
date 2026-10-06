@@ -112,10 +112,11 @@ stage passes. The vDSO monotonic clock, `poll`/`epoll` blocking semantics,
 level-not-cleared-on-consume for eventfd/socketpair/timerfd, ALSA control-fd
 readiness, and GLib itself (a bare `gdbus monitor` idles at 0%) have all been
 measured in-guest and ruled out; it produces no log output at trace level, so
-it is a silent dispatch loop. Narrowing it further wants a tracer, and
-`strace -p` cannot attach because `wait4(__WALL)` does not consider a ptrace
-tracee that is not a child. Those two are coupled and the ptrace/wait4 gap is
-the next step. Details and the full elimination list are in
+it is a silent dispatch loop. Narrowing it further wants a tracer. A tracer is
+now eligible to wait for a tracee it did not fork, but the tracee's attach-stop
+is never reported to it, so `strace -p` blocks in `wait4` instead of answering
+`No child processes` — reporting that stop is the next step. Details and the
+full elimination list are in
 [verification/data/pipewire-compat](verification/data/pipewire-compat/README.md).
 
 ## USB-C and Phoenix USB4
