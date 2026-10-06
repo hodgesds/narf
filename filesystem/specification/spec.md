@@ -333,6 +333,14 @@ blocking read. File operations do not expose a separate readiness predicate
 for callers to re-classify a zero-byte result.
 `poll_readiness_at` defaults to `poll_readiness`; offset-sensitive device
 descriptions such as `/dev/kmsg` override it so EOF is not reported readable.
+`llseek(offset, whence) -> Option<Result<u64, i64>>` defaults to `None`
+(generic byte-position `lseek`); a device whose position is not a byte offset
+returns `Some` and fully answers `lseek(2)` after the `SEEK_MAX` check — today
+only `/dev/kmsg` (`devkmsg_llseek`: SEEK_SET/END/DATA with offset 0, `ESPIPE`
+for a non-zero offset, `EINVAL` otherwise). `/dev/kmsg` is record-based: one
+record per `read`, a per-open sequence cursor (readiness keys off it, never off
+the file offset), `EINVAL` for a too-small buffer, `EPIPE` after overrun, and
+`<N>`-prefixed injection on `write`.
 `poll_edge_token` defaults to `(0, 0)`; stateful readiness providers advance
 one component whenever an edge-relevant source changes so `EPOLLET` cannot
 lose a drain/refill transition between readiness scans.

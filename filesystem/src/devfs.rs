@@ -385,84 +385,86 @@ impl FileOps for DevZero {
     }
 }
 
-/// `/dev/kmsg` — read-only snapshot of the kernel log ring.
+/// `/dev/kmsg` — record interface to the kernel log store
+/// (`kernel/printk/printk.c::kmsg_fops`, `Documentation/ABI/testing/dev-kmsg`).
 ///
-/// Mirrors Linux's `/dev/kmsg` (the canonical surface `dmesg` reads
-/// from). Each read returns a slice of the live klog snapshot
-/// starting at `offset` (caller-tracked, oldest-byte-first). At the
-/// current end of the live log, reads return `WouldBlock`; `sys_read`
-/// maps that to `EAGAIN` for `O_NONBLOCK` descriptions. Writes are
-/// accepted (a no-op) so a userspace tool
-/// can pipe to `> /dev/kmsg` without erroring; the actual kmsg
-/// "inject" facility from Linux isn't implemented (write-discard).
+/// * `read` returns exactly ONE record per call, formatted
+///   `"<prio>,<seq>,<ts_usec>,<flags>;<message>\n"` with non-printable bytes
+///   and `\` hex-escaped. A buffer too small for the record is `EINVAL`
+///   (and the record is skipped, as Linux advances first); a reader whose
+///   next record was overwritten gets `EPIPE` once and is moved to the
+///   oldest surviving record; a caught-up reader gets `WouldBlock`, which
+///   `sys_read` turns into `EAGAIN` for `O_NONBLOCK` or a park otherwise.
+/// * Each open has its own sequence cursor, starting at the oldest record
+///   (`devkmsg_open`). The file offset `sys_read` passes in is ignored.
+/// * `lseek(fd, 0, SEEK_SET)` = oldest record, `SEEK_END` = after the
+///   newest, `SEEK_DATA` = the first record after the last
+///   `SYSLOG_ACTION_CLEAR`; a non-zero offset is `ESPIPE`, any other whence
+///   `EINVAL` (`devkmsg_llseek`).
+/// * `write` injects one record: an optional `<N>` prefix gives level
+///   (`N & 7`) and facility (`N >> 3 & 0xff`, `LOG_USER` when 0 or absent);
+///   writes over `PRINTKRB_RECORD_MAX` bytes are `EINVAL` (`devkmsg_write`).
 ///
-/// The snapshot is computed PER READ — between reads, more bytes
-/// may have been recorded by `console::write_str → klog::record`.
-/// Callers wanting a stable view should fetch in a single large
-/// read; callers wanting tail-style updates can just keep reading
-/// past EOF (offset = current_len) on each iteration.
-/// Extract the human-readable message from a `/dev/kmsg` write. Linux's kmsg
-/// injection format is "<priority>,<seq>,<timestamp>,<flags>[,...];message":
-/// comma-separated numeric metadata, a ';', then the message. Strip the
-/// metadata prefix (only when it is exactly that shape) and the trailing
-/// newline; anything else is passed through verbatim so a bare
-/// `echo foo > /dev/kmsg` still shows "foo".
-fn kmsg_visible_message(buf: &[u8]) -> &str {
-    let text = core::str::from_utf8(buf).unwrap_or("");
-    // The record header is "<priority>,<seq>,<timestamp>,<flags>;" — the flags
-    // field can be non-numeric (e.g. "-" or "c"), so only require the FIRST
-    // comma-separated field (priority) to be all digits and the header to be
-    // comma-separated. That distinguishes a real record from a bare
-    // `echo foo;bar > /dev/kmsg`, which is passed through untouched.
-    let msg = match text.split_once(';') {
-        Some((meta, rest))
-            if meta.contains(',')
-                && meta
-                    .split(',')
-                    .next()
-                    .is_some_and(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit())) =>
-        {
-            rest
-        }
-        _ => text,
-    };
-    msg.trim_end_matches('\n')
-}
-
-/// `/dev/kmsg` reader — created fresh per open (see the devfs lookup), so
-/// `read_end` is this open's private cursor.
-#[derive(Default)]
+/// LINUX-GAP: `printk.devkmsg=`/`kernel/printk_devkmsg` (off / ratelimit)
+/// is not enforced — injections are never rate-limited or refused — and
+/// opening for read does not apply `check_syslog_permissions` (the node is
+/// root-only 0600, so DAC still gates it).
 struct DevKmsg {
-    /// High-water byte offset this open has read (or seeked) up to. epoll polls
-    /// `poll_readiness_at` with the STALE `item.offset` snapshotted at
-    /// `EPOLL_CTL_ADD`, NOT the fd's live position — so a reader (journald) that
-    /// has drained past that snapshot is reported readable forever and busy-
-    /// loops `epoll_wait` at 100% CPU, starving the box and blocking everyone
-    /// who logs to journald. Track the live drain progress here and base
-    /// readiness on it, mirroring Linux's per-open `/dev/kmsg` seq cursor.
-    read_end: core::sync::atomic::AtomicUsize,
+    /// `devkmsg_user.seq` behind `devkmsg_user.lock`: this open's next
+    /// record. Readiness keys off it, never off the (stale) offset epoll
+    /// snapshots at `EPOLL_CTL_ADD`, so a caught-up journald parks instead
+    /// of spinning.
+    seq: IrqSafeSpinLock<u64>,
 }
 
 impl DevKmsg {
+    fn new() -> Self {
+        Self {
+            seq: IrqSafeSpinLock::new(narf_console::klog::first_seq()),
+        }
+    }
+
+    /// `devkmsg_poll`.
     fn readable(&self) -> u32 {
-        // Use the O(1) length, not `snapshot().len()`: epoll re-polls this on
-        // every wait iteration, and a snapshot here reallocates the whole klog
-        // ring each time — enough allocator churn to peg the CPU.
-        if self.read_end.load(core::sync::atomic::Ordering::Relaxed)
-            < narf_console::klog::live_len()
-        {
-            crate::POLL_IN | crate::POLL_OUT
-        } else {
-            crate::POLL_OUT
+        let seq = *self.seq.lock();
+        match narf_console::klog::kmsg_poll(seq) {
+            None => 0,
+            Some(false) => crate::POLL_IN,
+            // "return error when data has vanished underneath us"
+            Some(true) => crate::POLL_IN | crate::POLL_ERR | crate::POLL_PRI,
         }
     }
 }
 
+/// `devkmsg_write`'s `<[0-9]*>` prefix: `(facility, level, message)`.
+fn kmsg_parse_prefix(buf: &[u8]) -> (u8, u8, &[u8]) {
+    let mut level = narf_console::klog::DEFAULT_MESSAGE_LOGLEVEL as u8;
+    let mut facility = narf_console::klog::LOG_USER;
+    let mut line = buf;
+    if buf.first() == Some(&b'<') {
+        // `simple_strtoul(line + 1, &endp, 10)`: digits (possibly none),
+        // accumulated into an unsigned long, then truncated to `unsigned
+        // int u`.
+        let digits = buf[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+        if buf.get(1 + digits) == Some(&b'>') {
+            let u = buf[1..1 + digits].iter().fold(0u64, |v, &d| {
+                v.wrapping_mul(10).wrapping_add((d - b'0') as u64)
+            }) as u32;
+            level = (u & 7) as u8;
+            let fac = ((u >> 3) & 0xff) as u8;
+            if fac != 0 {
+                facility = fac;
+            }
+            line = &buf[2 + digits..];
+        }
+    }
+    // `devkmsg_emit(facility, level, "%s", line)` stops at a NUL.
+    let end = line.iter().position(|&b| b == 0).unwrap_or(line.len());
+    (facility, level, &line[..end])
+}
+
 impl FileOps for DevKmsg {
     fn poll_readiness_at(&self, _offset: u64) -> u32 {
-        // Ignore the epoll snapshot offset (stale — see `read_end`); readiness
-        // follows this open's live read high-water so a caught-up journald
-        // parks instead of spinning.
         self.readable()
     }
 
@@ -470,49 +472,70 @@ impl FileOps for DevKmsg {
         self.readable()
     }
 
-    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+    fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         if buf.is_empty() {
+            // `sys_read` answers a zero-count read before reaching here.
             return Box::pin(async { Ok(0) });
         }
-        // Copy only the requested window straight from the ring (no full-log
-        // Vec snapshot per read — see poll_readiness_at).
-        let n = narf_console::klog::read_at(offset as usize, buf);
-        // Advance the live drain cursor past what this read consumed. Even a
-        // caught-up read (n == 0, WouldBlock) records the reader's position so
-        // readiness clears — otherwise poll_readiness would report POLLIN
-        // forever and the reader would spin.
-        self.read_end
-            .fetch_max(offset as usize + n, core::sync::atomic::Ordering::Relaxed);
-        Box::pin(async move {
-            if n == 0 {
-                Err(FsError::WouldBlock)
-            } else {
-                Ok(n)
-            }
-        })
+        let r = {
+            let mut seq = self.seq.lock();
+            narf_console::klog::kmsg_read(&mut seq, buf)
+        };
+        let out = match r {
+            narf_console::klog::KmsgRead::Record(n) => Ok(n),
+            narf_console::klog::KmsgRead::Empty => Err(FsError::WouldBlock),
+            // -EPIPE: "our last seen message is gone, return error and reset"
+            narf_console::klog::KmsgRead::Dropped => Err(FsError::BrokenPipe),
+            // -EINVAL: `pmsg.outbuf_len > count`
+            narf_console::klog::KmsgRead::TooSmall => Err(FsError::InvalidData),
+        };
+        Box::pin(async move { out })
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        // Forward the message to the console (which also records into klog, so
-        // a later /dev/kmsg read reflects it). systemd's kmsg log target — used
-        // by PID 1 and, crucially, by sd-executor for pre-exec failures like the
-        // mount-namespace error path — writes here; echoing surfaces those on
-        // the serial capture. The Linux kmsg record format is
-        // "<priority>,<seq>,<ts>,<flags>;message"; strip the leading metadata up
-        // to the first ';' so the human-readable message is what's shown.
         let len = buf.len();
-        let msg = kmsg_visible_message(buf);
-        if !msg.is_empty() {
-            use core::fmt::Write as _;
-            let _ = writeln!(narf_console::Writer, "kmsg: {msg}");
+        if len > narf_console::klog::PRINTKRB_RECORD_MAX {
+            return Box::pin(async { Err(FsError::InvalidData) });
+        }
+        let (facility, level, msg) = kmsg_parse_prefix(buf);
+        narf_console::klog::emit(facility, level, msg);
+        // Like any printk, an injected record also reaches the console when
+        // its level passes `console_loglevel`. systemd's kmsg log target —
+        // PID 1 and sd-executor's pre-exec failures — writes here, so this
+        // keeps those visible on a serial capture. Console only: the record
+        // itself was stored above.
+        let shown = msg.strip_suffix(b"\n").unwrap_or(msg);
+        if let Ok(text) = core::str::from_utf8(shown) {
+            if !text.is_empty() {
+                let lvl = level as u32;
+                narf_console::write_str_console_only_level(lvl, "kmsg: ");
+                narf_console::write_str_console_only_level(lvl, text);
+                narf_console::write_str_console_only_level(lvl, "\n");
+            }
         }
         Box::pin(async move { Ok(len) })
     }
 
+    fn llseek(&self, offset: i64, whence: u32) -> Option<Result<u64, i64>> {
+        const SEEK_SET: u32 = 0;
+        const SEEK_END: u32 = 2;
+        const SEEK_DATA: u32 = 3;
+        if offset != 0 {
+            return Some(Err(narf_lib::errno::ESPIPE));
+        }
+        let mut seq = self.seq.lock();
+        match whence {
+            SEEK_SET => *seq = narf_console::klog::first_seq(),
+            SEEK_DATA => *seq = narf_console::klog::clear_seq(),
+            SEEK_END => *seq = narf_console::klog::next_seq(),
+            _ => return Some(Err(narf_lib::errno::EINVAL)),
+        }
+        Some(Ok(0))
+    }
+
     fn stat(&self) -> Stat {
         Stat {
-            // Character devices have no seekable file size even though the
-            // underlying ring currently contains bytes.
+            // Character devices have no seekable file size.
             size: 0,
             blocks: 0,
             mode: Mode {
@@ -2010,81 +2033,229 @@ fn smoke_dev_fd_is_symlink() -> TestResult {
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_fd_is_symlink);
 
-/// `/dev/kmsg` writes strip the Linux "<pri>,<seq>,<ts>,<flags>;" metadata
-/// prefix so the human-readable message is what gets echoed, while non-record
-/// text (a bare `echo`) and malformed prefixes pass through unchanged.
-fn smoke_dev_kmsg_visible_message_strips_meta() -> TestResult {
-    // Canonical systemd record: metadata, ';', message, trailing newline.
-    if kmsg_visible_message(b"6,42,12345,-;hello udev\n") != "hello udev" {
-        return TestResult::Fail("kmsg metadata prefix not stripped");
+/// Split one `/dev/kmsg` record `"prio,seq,ts,flags;msg\n"` into its fields.
+fn kmsg_fields(rec: &[u8]) -> Option<(u64, u64, u64, u8, &[u8])> {
+    let semi = rec.iter().position(|&b| b == b';')?;
+    let body = rec[semi + 1..].strip_suffix(b"\n")?;
+    let hdr = core::str::from_utf8(&rec[..semi]).ok()?;
+    let mut it = hdr.split(',');
+    let prio = it.next()?.parse().ok()?;
+    let seq = it.next()?.parse().ok()?;
+    let ts = it.next()?.parse().ok()?;
+    let flags = it.next()?.bytes().next()?;
+    Some((prio, seq, ts, flags, body))
+}
+
+/// A `/dev/kmsg` open positioned after the newest record, so a test sees only
+/// what it records itself.
+fn kmsg_at_end() -> DevKmsg {
+    let k = DevKmsg::new();
+    let _ = k.llseek(0, 2);
+    k
+}
+
+/// `devkmsg_write`: `<N>` sets level `N & 7` and facility `N >> 3` (forced to
+/// LOG_USER when 0 or absent); malformed prefixes are message text.
+fn smoke_dev_kmsg_write_prefix_sets_level() -> TestResult {
+    let cases: [(&[u8], u8, u8, &[u8]); 8] = [
+        (b"<6>hello\n", 1, 6, b"hello\n"),
+        (b"<30>udevd[80]: up", 3, 6, b"udevd[80]: up"),
+        (b"<0>kern?", 1, 0, b"kern?"), // LOG_KERN is never injectable
+        (b"plain", 1, 4, b"plain"),    // default_message_loglevel
+        (b"<>x", 1, 0, b"x"),          // strtoul of no digits is 0
+        (b"<6x>y", 1, 4, b"<6x>y"),    // no '>' after the digits
+        (b"<14", 1, 4, b"<14"),
+        (b"a\0b", 1, 4, b"a"), // "%s" stops at NUL
+    ];
+    for (input, fac, lvl, msg) in cases {
+        if kmsg_parse_prefix(input) != (fac, lvl, msg) {
+            return TestResult::Fail("kmsg <N> prefix parse differs from devkmsg_write");
+        }
     }
-    // Bare echo (no ';'): passed through verbatim (minus trailing newline).
-    if kmsg_visible_message(b"just a line\n") != "just a line" {
-        return TestResult::Fail("bare kmsg line not preserved");
+    // End to end: the injected record reads back with prio = fac<<3 | lvl.
+    let k = kmsg_at_end();
+    if poll_once_devfs(k.write(0, b"<3>narf-kmsg-inject-probe\n")) != Some(Ok(26)) {
+        return TestResult::Fail("kmsg write must report the full length");
     }
-    // A ';' whose left side isn't pure numeric metadata must NOT be stripped.
-    if kmsg_visible_message(b"key=val;more") != "key=val;more" {
-        return TestResult::Fail("non-metadata prefix wrongly stripped");
+    let mut buf = [0u8; 256];
+    let n = match poll_once_devfs(k.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("injected record not readable"),
+    };
+    match kmsg_fields(&buf[..n]) {
+        Some((11, _, _, b'-', b"narf-kmsg-inject-probe")) => {}
+        _ => return TestResult::Fail("injected record has wrong prio or text"),
     }
-    // Empty write yields an empty message (nothing echoed).
-    if !kmsg_visible_message(b"").is_empty() {
-        return TestResult::Fail("empty kmsg write not empty");
+    // Negative: a write over PRINTKRB_RECORD_MAX is EINVAL and stores nothing.
+    let big = [b'z'; narf_console::klog::PRINTKRB_RECORD_MAX + 1];
+    if poll_once_devfs(k.write(0, &big)) != Some(Err(FsError::InvalidData)) {
+        return TestResult::Fail("oversized kmsg write must be EINVAL");
+    }
+    if poll_once_devfs(k.read(0, &mut buf)) != Some(Err(FsError::WouldBlock)) {
+        return TestResult::Fail("rejected kmsg write must not store a record");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "filesystem/devfs",
-    smoke_dev_kmsg_visible_message_strips_meta
-);
+kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_write_prefix_sets_level);
 
 /// Regression: `/dev/kmsg` readiness must CLEAR once the reader is caught up,
-/// including for epoll's stale `poll_readiness_at(snapshot_offset)`. Before the
-/// per-open `read_end` cursor, `poll_readiness_at` keyed off the passed offset
-/// (the `EPOLL_CTL_ADD` snapshot, ~0), so `0 < live_len()` stayed true forever:
-/// journald's epoll_wait re-reported /dev/kmsg readable every call, read got
-/// WouldBlock, and it busy-looped at 100% CPU — starving the box and blocking
-/// everyone who logs to journald (the CachyOS greeter never got to render).
+/// including for epoll's stale `poll_readiness_at(snapshot_offset)`. Keying
+/// readiness off that offset (the `EPOLL_CTL_ADD` snapshot, ~0) once made
+/// journald's epoll_wait report /dev/kmsg readable forever while read got
+/// WouldBlock — a 100% CPU spin that starved the box. Readiness follows the
+/// open's record cursor (`devkmsg_poll`).
 fn smoke_dev_kmsg_poll_clears_when_drained() -> TestResult {
-    narf_console::klog::__reset_for_test();
-    narf_console::klog::record("kmsg-drain-probe");
-    let total = narf_console::klog::live_len();
-    if total == 0 {
-        return TestResult::Fail("klog empty after record()");
+    let k = kmsg_at_end();
+    if k.poll_readiness() & crate::POLL_IN != 0 {
+        return TestResult::Fail("kmsg at SEEK_END must not report POLLIN");
     }
-    let k = DevKmsg::default();
-    // Unread records → POLLIN.
+    narf_console::klog::record("kmsg-drain-probe\n");
     if k.poll_readiness() & crate::POLL_IN == 0 {
         return TestResult::Fail("kmsg with an unread record must report POLLIN");
     }
-    // Drain sequentially exactly as an epoll reader does, until WouldBlock/0
-    // (which also records the read high-water). Bounded for safety.
-    let mut off = 0u64;
     let mut buf = [0u8; 1024];
     for _ in 0..64 {
-        match poll_once_devfs(k.read(off, &mut buf)) {
-            Some(Ok(n)) if n > 0 => off += n as u64,
+        match poll_once_devfs(k.read(0, &mut buf)) {
+            Some(Ok(n)) if n > 0 => {}
             _ => break,
         }
     }
-    // Caught up: readiness MUST drop POLLIN, both the offset-less query...
     if k.poll_readiness() & crate::POLL_IN != 0 {
         return TestResult::Fail("caught-up /dev/kmsg still POLLIN (poll_readiness)");
     }
-    // ...and the epoll query with a STALE snapshot offset (the exact spin bug).
     if k.poll_readiness_at(0) & crate::POLL_IN != 0 {
         return TestResult::Fail(
             "caught-up /dev/kmsg still POLLIN via stale offset (journald spin)",
         );
     }
-    // A new record re-arms POLLIN (readiness tracks fresh data).
-    narf_console::klog::record("kmsg-drain-probe-2");
+    narf_console::klog::record("kmsg-drain-probe-2\n");
     if k.poll_readiness_at(0) & crate::POLL_IN == 0 {
         return TestResult::Fail("new klog record did not re-arm POLLIN");
     }
-    narf_console::klog::__reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_poll_clears_when_drained);
+
+/// One record per read, in Linux's `prio,seq,ts,flags;msg\n` format; a buffer
+/// too small for the record is EINVAL and skips it; fragments of one line
+/// are one record.
+fn smoke_dev_kmsg_one_record_per_read() -> TestResult {
+    let k = kmsg_at_end();
+    let first = narf_console::klog::next_seq();
+    narf_console::klog::record("kmsg-rec-");
+    narf_console::klog::record("a\nkmsg-rec-b\nkmsg-rec-c\n");
+    let mut buf = [0u8; 512];
+    let n = match poll_once_devfs(k.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("record not readable"),
+    };
+    // Kernel record at default_message_loglevel: prio 4, flags '-'.
+    match kmsg_fields(&buf[..n]) {
+        Some((4, seq, _, b'-', b"kmsg-rec-a")) if seq == first => {}
+        _ => return TestResult::Fail("first read must be exactly the first record"),
+    }
+    if buf[..n].iter().filter(|&&b| b == b'\n').count() != 1 {
+        return TestResult::Fail("a read returned more than one record");
+    }
+    let mut tiny = [0u8; 4];
+    if poll_once_devfs(k.read(0, &mut tiny)) != Some(Err(FsError::InvalidData)) {
+        return TestResult::Fail("too-small buffer must be EINVAL");
+    }
+    // The too-small record was consumed; the next read is the third one.
+    let n = match poll_once_devfs(k.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("record after EINVAL not readable"),
+    };
+    match kmsg_fields(&buf[..n]) {
+        Some((4, seq, _, _, b"kmsg-rec-c")) if seq == first + 2 => {}
+        _ => return TestResult::Fail("EINVAL must skip exactly the record that did not fit"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_one_record_per_read);
+
+/// Overrun: a reader whose record was overwritten sees POLLERR, gets EPIPE
+/// once, and resumes at the oldest surviving record.
+fn smoke_dev_kmsg_overrun_epipe_resync() -> TestResult {
+    let k = kmsg_at_end();
+    // More records than the descriptor ring holds (log_buf_len >> 5).
+    let flood = (narf_console::klog::log_buf_len() >> 5) + 8;
+    for _ in 0..flood {
+        narf_console::klog::emit(narf_console::klog::LOG_USER, 7, b"kmsg-flood");
+    }
+    let want = crate::POLL_IN | crate::POLL_ERR | crate::POLL_PRI;
+    if k.poll_readiness() & want != want {
+        return TestResult::Fail("overrun reader must poll POLLIN|POLLERR|POLLPRI");
+    }
+    let mut buf = [0u8; 256];
+    if poll_once_devfs(k.read(0, &mut buf)) != Some(Err(FsError::BrokenPipe)) {
+        return TestResult::Fail("overrun read must be EPIPE");
+    }
+    let oldest = narf_console::klog::first_seq();
+    match poll_once_devfs(k.read(0, &mut buf)) {
+        Some(Ok(n)) => match kmsg_fields(&buf[..n]) {
+            Some((_, seq, _, _, _)) if seq >= oldest => {}
+            _ => return TestResult::Fail("read after EPIPE is not a surviving record"),
+        },
+        _ => return TestResult::Fail("read after EPIPE must succeed"),
+    }
+    if k.poll_readiness() & crate::POLL_ERR != 0 {
+        return TestResult::Fail("POLLERR must clear once resynced");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_overrun_epipe_resync);
+
+/// `devkmsg_llseek`: SEEK_SET = oldest, SEEK_END = after newest, SEEK_DATA =
+/// after the last SYSLOG_ACTION_CLEAR; non-zero offset ESPIPE, other whence
+/// EINVAL.
+fn smoke_dev_kmsg_llseek() -> TestResult {
+    let k = DevKmsg::new();
+    let probe = narf_console::klog::next_seq();
+    narf_console::klog::record("kmsg-seek-probe\n");
+    if k.llseek(0, 2) != Some(Ok(0)) {
+        return TestResult::Fail("SEEK_END must succeed with 0");
+    }
+    let mut buf = [0u8; 512];
+    if poll_once_devfs(k.read(0, &mut buf)) != Some(Err(FsError::WouldBlock)) {
+        return TestResult::Fail("read after SEEK_END must be EAGAIN");
+    }
+    if k.llseek(0, 0) != Some(Ok(0)) {
+        return TestResult::Fail("SEEK_SET must succeed with 0");
+    }
+    let oldest = narf_console::klog::first_seq();
+    match poll_once_devfs(k.read(0, &mut buf)) {
+        Some(Ok(n)) => match kmsg_fields(&buf[..n]) {
+            Some((_, seq, _, _, _)) if seq >= oldest && seq <= probe => {}
+            _ => return TestResult::Fail("SEEK_SET did not rewind to the oldest record"),
+        },
+        _ => return TestResult::Fail("read after SEEK_SET must return a record"),
+    }
+    narf_console::klog::syslog_clear();
+    narf_console::klog::record("kmsg-after-clear-probe\n");
+    if k.llseek(0, 3) != Some(Ok(0)) {
+        return TestResult::Fail("SEEK_DATA must succeed with 0");
+    }
+    match poll_once_devfs(k.read(0, &mut buf)) {
+        Some(Ok(n)) => match kmsg_fields(&buf[..n]) {
+            Some((_, _, _, _, b"kmsg-after-clear-probe")) => {}
+            _ => return TestResult::Fail("SEEK_DATA must land on the first post-CLEAR record"),
+        },
+        _ => return TestResult::Fail("read after SEEK_DATA must return a record"),
+    }
+    narf_console::klog::__reset_syslog_cursors();
+    if k.llseek(1, 0) != Some(Err(narf_lib::errno::ESPIPE)) {
+        return TestResult::Fail("non-zero offset must be ESPIPE");
+    }
+    if k.llseek(0, 1) != Some(Err(narf_lib::errno::EINVAL)) {
+        return TestResult::Fail("SEEK_CUR must be EINVAL");
+    }
+    if k.llseek(0, 4) != Some(Err(narf_lib::errno::EINVAL)) {
+        return TestResult::Fail("SEEK_HOLE must be EINVAL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_llseek);
 
 /// devtmpfs is writable for runtime aliases such as journald's `/dev/log`.
 fn smoke_dev_runtime_symlink_create_lookup_unlink() -> TestResult {
@@ -2519,56 +2690,13 @@ fn smoke_dev_random_rnd_ioctls_ok() -> TestResult {
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_random_rnd_ioctls_ok);
 
-/// `/dev/kmsg`'s poll/read fast-path (`klog::live_len` + `klog::read_at`)
-/// must agree byte-for-byte with the allocating `klog::snapshot()` it
-/// replaces. This guards the hot path that epoll/journald hammer: a
-/// regression back to `snapshot()` per poll/read reintroduces the
-/// whole-ring reallocation that starved the desktop boot.
-fn smoke_kmsg_read_at_matches_snapshot() -> TestResult {
-    // Seed a known record so the live region is non-empty and spans a wrap
-    // boundary in content terms; operate read-only against the live ring.
-    narf_console::klog::record("kmsg-fastpath-probe\n");
-    let snap = narf_console::klog::snapshot();
-    if narf_console::klog::live_len() != snap.len() {
-        return TestResult::Fail("live_len() disagrees with snapshot().len()");
-    }
-    let mut buf = [0u8; 512];
-    // Full-window, mid-window, and boundary reads must equal the snapshot slice.
-    let offsets = [
-        0usize,
-        snap.len() / 2,
-        snap.len().saturating_sub(7),
-        snap.len(),
-    ];
-    for &off in &offsets {
-        if off > snap.len() {
-            continue;
-        }
-        let cap = buf.len().min(snap.len().saturating_sub(off));
-        let n = narf_console::klog::read_at(off, &mut buf[..cap.max(1)]);
-        let expect = &snap[off..off + cap];
-        if n != expect.len() || buf[..n] != *expect {
-            return TestResult::Fail("read_at() window differs from snapshot()");
-        }
-    }
-    // At or past the end yields 0 (no readable bytes).
-    if narf_console::klog::read_at(snap.len(), &mut buf) != 0 {
-        return TestResult::Fail("read_at() at end should return 0");
-    }
-    if narf_console::klog::read_at(snap.len() + 4096, &mut buf) != 0 {
-        return TestResult::Fail("read_at() past end should return 0");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("filesystem/devfs", smoke_kmsg_read_at_matches_snapshot);
-
 /// A non-empty read at the current end of `/dev/kmsg` is temporary
 /// emptiness, not EOF. `sys_read` turns this result into `EAGAIN` for an
 /// `O_NONBLOCK` open. stress-ng's OOM detector drains `/dev/kmsg` until that
 /// error; returning `Ok(0)` instead makes it retry forever after a worker is
 /// terminated by a signal.
 fn smoke_dev_kmsg_empty_read_would_block() -> TestResult {
-    let dev = DevKmsg::default();
+    let dev = kmsg_at_end();
     let mut buf = [0u8; 16];
     match poll_once_devfs(dev.read(u64::MAX, &mut buf)) {
         Some(Err(FsError::WouldBlock)) => {}

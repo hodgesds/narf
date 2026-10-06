@@ -47,6 +47,15 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     } else {
         None
     };
+    // `vfs_llseek` → `file->f_op->llseek`: a device with its own seek
+    // semantics (`/dev/kmsg`'s record cursor) answers entirely by itself.
+    if let Some(result) = ops.llseek(offset, whence as u32) {
+        match result {
+            Ok(v) => ctx.set_return(SyscallReturn::ok(v)),
+            Err(errno) => ctx.set_return(errno_ret(errno)),
+        }
+        return;
+    }
     let current = description.offset();
     // Pipes, FIFOs and sockets are not seekable: `fs/pipe.c`'s
     // `pipefifo_fops` and net/socket.c's `socket_file_ops` define no

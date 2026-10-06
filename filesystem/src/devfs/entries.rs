@@ -108,7 +108,7 @@ pub(super) const ENTRIES: &[Entry] = &[
     Entry {
         name: "kmsg",
         file_type: FileType::Special,
-        file: || Some(Arc::new(DevKmsg::default())),
+        file: || Some(Arc::new(DevKmsg::new())),
         directory: || None,
         visible: || true,
     },
