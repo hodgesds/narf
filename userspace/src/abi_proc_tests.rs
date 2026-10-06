@@ -3806,3 +3806,59 @@ fn smoke_abi_proc_task_dir_is_named_by_tid() -> TestResult {
     }
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_task_dir_is_named_by_tid);
+
+// ── A tracer must be able to wait for a tracee it did not fork ───
+//
+// Linux's `do_wait` walks `tsk->ptraced` alongside `tsk->children`
+// (kernel/exit.c), so after PTRACE_ATTACH a tracer can `wait4` a task that is
+// not its child. NARF's wait-eligibility check does consult the tracee
+// registry — but that registry is keyed in the ptrace ABI's pid space, while
+// the wait path carries scheduler TaskIds. The two are identical until a task
+// forks and different for every real tracer, so the comparison never matched:
+// `has_living_child` saw no candidate and `wait4(-1, …, __WALL)` answered
+// ECHILD.
+//
+// That is the first thing `strace -p` does after attaching, so it could not
+// trace any process it had not forked itself: "strace: wait4(__WALL): No child
+// processes".
+//
+// Asserted on the predicate rather than through `wait4`, so the test pins the
+// id-space conversion itself instead of the whole wait state machine. The two
+// spaces are made to DIFFER here, or it would be vacuous: a TaskId with no pid
+// mapping converts to itself and an unconverted comparison matches by accident.
+fn smoke_abi_proc_tracer_of_any_takes_a_task_id() -> TestResult {
+    const TRACEE_TASK: u64 = 0x7000_3001;
+    const TRACEE_PID: u64 = 0x7000_30A1;
+    const TRACER_TASK: u64 = 0x7000_3002;
+    const TRACER_PID: u64 = 0x7000_30A2;
+
+    crate::handlers::register_task_to_pid(TRACEE_TASK, TRACEE_PID);
+    crate::handlers::register_task_to_pid(TRACER_TASK, TRACER_PID);
+    crate::ptrace::__test_set_tracer(TRACEE_TASK, Some(TRACER_TASK));
+
+    let any = crate::ptrace::is_tracer_of_any(TRACER_TASK, -1);
+    let specific = crate::ptrace::is_tracer_of_any(TRACER_TASK, TRACEE_PID as i64);
+    let wrong_tracer = crate::ptrace::is_tracer_of_any(TRACEE_TASK, -1);
+
+    crate::ptrace::__test_set_tracer(TRACEE_TASK, None);
+    let after_detach = crate::ptrace::is_tracer_of_any(TRACER_TASK, -1);
+    crate::handlers::__test_forget_task_pid(TRACEE_TASK);
+    crate::handlers::__test_forget_task_pid(TRACER_TASK);
+
+    if !any {
+        return TestResult::Fail(
+            "a tracer named by its TaskId did not match its own tracee (the wait path's ECHILD)",
+        );
+    }
+    if !specific {
+        return TestResult::Fail("a tracer named by its TaskId did not match its tracee by pid");
+    }
+    if wrong_tracer {
+        return TestResult::Fail("a task that traces nothing matched as a tracer");
+    }
+    if after_detach {
+        return TestResult::Fail("a detached tracer still matched its former tracee");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_tracer_of_any_takes_a_task_id);

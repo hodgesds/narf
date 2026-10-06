@@ -323,12 +323,26 @@ pub fn is_task_ptrace_stopped(task_id: u64) -> bool {
         .unwrap_or(false)
 }
 
-pub fn is_tracer_of_any(tracer_pid: u64, want: i64) -> bool {
+/// Does `tracer_task` trace anything a wait for `want` would select?
+///
+/// `tracer_task` is a scheduler TaskId, which is what the wait path carries;
+/// `tracers` is keyed and valued in the ptrace ABI's pid space, and the two
+/// diverge the moment a task forks. Convert here rather than at the call site,
+/// so a caller cannot get the space wrong: passing a TaskId straight through
+/// made `do_wait`'s tracee check silently never match, and a tracer that had
+/// attached to a non-child got ECHILD from `wait4(-1, …, __WALL)` instead of
+/// its tracee's stop. That is the first thing `strace -p` does after
+/// attaching, so it could not trace anything it had not itself forked.
+///
+/// Linux `do_wait` walks `tsk->ptraced` alongside `tsk->children`
+/// (kernel/exit.c), which is the list this stands in for.
+pub fn is_tracer_of_any(tracer_task: u64, want: i64) -> bool {
     let g = PTRACE_STATE.lock();
     let r = match g.as_ref() {
         Some(r) => r,
         None => return false,
     };
+    let tracer_pid = tid_to_pid(tracer_task);
     if want > 0 {
         r.tracers.get(&(want as u64)).copied() == Some(tracer_pid)
     } else {
