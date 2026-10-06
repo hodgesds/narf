@@ -14809,6 +14809,11 @@ fn register_thread_task_mapping(tid_raw: u64, task_raw: u64, tgid_raw: u64) {
         .insert(tid_raw, task_raw);
 }
 
+#[doc(hidden)]
+pub fn __test_register_thread_mapping(tid_raw: u64, task_raw: u64, tgid_raw: u64) {
+    register_thread_task_mapping(tid_raw, task_raw, tgid_raw);
+}
+
 pub(crate) fn task_to_linux_tid_raw(task_raw: u64) -> Option<u64> {
     TASK_TO_LINUX_TID[pid_task_shard(task_raw)]
         .map
@@ -17524,13 +17529,8 @@ pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> all
             // `find_task_by_vpid(who)`: any task in the caller's pid
             // namespace. Mesa's util_queue renices each worker with
             // `setpriority(PRIO_PROCESS, gettid(), 19)`.
-            let Some(task) = signal_tid_from_user(caller, who as u64) else {
-                return out;
-            };
-            // `find_task_by_vpid` returning NULL is the empty set —
-            // `signal_tid_from_user` falls back to identity for an
-            // unregistered id, so an existence check implements that.
-            if task == caller || crate::task::task_get(task).is_some() {
+            // `find_task_by_vpid` returning NULL is the empty set.
+            if let Some(task) = find_task_by_vpid(caller, who) {
                 out.push(task);
             }
         }

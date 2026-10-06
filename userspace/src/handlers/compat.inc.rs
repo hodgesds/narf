@@ -8153,27 +8153,34 @@ fn signal_target_exists(tid: u64) -> bool {
         .is_some_and(|m| m.contains_key(&tid))
 }
 
-/// Resolve the thread identifier supplied by a Linux signal syscall to the
-/// TaskId that owns NARF's signal state.  A thread-group leader is visible as
-/// its PID through gettid(2), while CLONE_THREAD siblings retain their
-/// distinct TaskId-derived TIDs.  Resolve the caller's own gettid value first:
-/// a leader PID can numerically collide with an unrelated sibling's raw
-/// TaskId, and treating raw task space as authoritative would misroute a
-/// self-directed tkill or make tgkill fail its tgid check with ESRCH.
-/// Keep other non-leader TIDs in task space, then map a leader PID (including
-/// the caller's PID-namespace view) back to its task.
-fn signal_tid_from_user(caller: u64, tid: u64) -> Option<u64> {
-    if tid == linux_tid_for_task(caller) {
+/// Linux `find_task_by_vpid(nr)`: the task — a CLONE_THREAD sibling's tid as
+/// well as a thread-group leader's pid — that `nr` names in `caller`'s PID
+/// namespace, or `None` (the handler's -ESRCH). `nr` is a `pid_t`; 0 and
+/// negative values name no task (`find_vpid(0)` is NULL), so callers that give
+/// 0 a meaning (`current`) must handle it before calling. Syscalls that accept
+/// only a thread-group id (`kill`'s group, `pidfd_open` without
+/// `PIDFD_THREAD`, `wait*`) must not use this.
+///
+/// Only the Linux number spaces are consulted — the caller's own gettid
+/// value, then the tid and pid registries. A number that names neither is
+/// unused as far as userspace can tell, even when it happens to equal a live
+/// scheduler TaskId: TaskIds are private and must never be accepted here.
+pub(crate) fn find_task_by_vpid(caller: u64, nr: i32) -> Option<u64> {
+    if nr <= 0 {
+        return None;
+    }
+    let nr = nr as u64;
+    if nr == linux_tid_for_task(caller) {
         return Some(caller);
     }
-    // Resolve the user number in the caller's active PID namespace first.
-    // The resulting root-visible ID can name either a non-leader thread or a
-    // process leader.
-    let outer = accept_pid_from(caller, tid)?;
-    if let Some(task) = linux_tid_to_task_raw(outer) {
-        return Some(task);
-    }
-    Some(pid_to_task_raw(outer).unwrap_or(outer))
+    let outer = accept_pid_from(caller, nr)?;
+    let task = linux_tid_to_task_raw(outer).or_else(|| pid_to_task_raw(outer))?;
+    (task == caller || crate::task::task_get(task).is_some()).then_some(task)
+}
+
+/// Linux `same_thread_group(a, b)`: both tasks belong to one thread group.
+pub(crate) fn same_thread_group(a: u64, b: u64) -> bool {
+    a == b || process_state_key(a) == process_state_key(b)
 }
 
 /// Linux-visible gettid(2) value for `task`. A thread-group leader reports

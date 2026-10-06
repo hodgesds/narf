@@ -729,14 +729,14 @@ kernel_test_in!("syscall_abi", smoke_abi_pidns_setns_rejects_pid_as_fd);
 
 // ── #26 tkill/tgkill non-leader raw-tid arm — Linux signal.c find_task_by_vpid ─
 //
-// A CLONE_THREAD sibling's gettid() is its raw TaskId, so signal_tid_from_user
-// accepts a raw non-leader tid directly. The old code did so WITHOUT any
-// namespace check, letting a container signal a HOST thread whose raw TaskId it
-// happened to name. The fix gates the raw arm on the sibling's thread group
-// being visible in the caller's ns. Discriminator: a root-ns process (leader +
-// one sibling thread) is invisible to a namespaced manager; the manager's
-// tkill of the sibling's raw tid returns ESRCH (fix) rather than delivering
-// (bug). A root-ns caller can still reach the sibling (regression guard).
+// A CLONE_THREAD sibling's gettid() is its own Linux tid (from the shared pid
+// allocator, registered by clone). An old version resolved non-leader tids
+// WITHOUT any namespace check, letting a container signal a HOST thread whose
+// tid it happened to name. The tid must resolve through the caller's ns.
+// Discriminator: a root-ns process (leader + one sibling thread) is invisible
+// to a namespaced manager; the manager's tkill of the sibling's tid returns
+// ESRCH (fix) rather than delivering (bug). A root-ns caller can still reach
+// the sibling (regression guard).
 fn smoke_abi_pidns_tkill_non_leader_ns_gated() -> TestResult {
     with_setup(|| {
         const MANAGER_TASK: u64 = 0xEB00;
@@ -745,7 +745,8 @@ fn smoke_abi_pidns_tkill_non_leader_ns_gated() -> TestResult {
         const WORKER_PID: u64 = 0xEB81;
         const LEADER_TASK: u64 = 0xEC00; // thread-group leader in the ROOT ns
         const GROUP_PID: u64 = 0xEC80;
-        const SIBLING_TID: u64 = 0xEC01; // non-leader sibling thread of GROUP_PID
+        const SIBLING_TASK: u64 = 0xEC01; // non-leader sibling thread of GROUP_PID
+        const SIBLING_TID: u64 = 0xEC83; // ... and its Linux tid
         const SIGTERM: u64 = 15;
 
         crate::pid_ns::__test_reset();
@@ -755,12 +756,11 @@ fn smoke_abi_pidns_tkill_non_leader_ns_gated() -> TestResult {
             build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
             // Root-ns process: leader at GROUP_PID …
             register(LEADER_TASK, GROUP_PID);
-            // … plus a sibling thread: task_to_pid_raw(SIBLING_TID) == GROUP_PID,
-            // but pid_to_task_raw(GROUP_PID) stays LEADER_TASK (so SIBLING_TID
-            // reads as a non-leader). Only the task→pid direction is registered.
-            crate::task::release_task(SIBLING_TID);
-            let _ = crate::task::Task::new_registered(SIBLING_TID, GROUP_PID);
-            crate::handlers::register_task_to_pid(SIBLING_TID, GROUP_PID);
+            // … plus a sibling thread registered the way clone(CLONE_THREAD)
+            // registers it: tid ↔ task, task → GROUP_PID.
+            crate::task::release_task(SIBLING_TASK);
+            let _ = crate::task::Task::new_registered(SIBLING_TASK, GROUP_PID);
+            crate::handlers::__test_register_thread_mapping(SIBLING_TID, SIBLING_TASK, GROUP_PID);
 
             // Namespaced manager: the sibling's group is invisible in its ns.
             set_task(MANAGER_TASK);
@@ -782,7 +782,7 @@ fn smoke_abi_pidns_tkill_non_leader_ns_gated() -> TestResult {
         })();
         set_task(FAKE_TASK);
         crate::pid_ns::__test_reset();
-        release_all(&[MANAGER_TASK, WORKER_TASK, LEADER_TASK, SIBLING_TID]);
+        release_all(&[MANAGER_TASK, WORKER_TASK, LEADER_TASK, SIBLING_TASK]);
         result
     })
 }

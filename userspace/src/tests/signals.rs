@@ -1684,9 +1684,12 @@ fn smoke_userspace_tkill_targets_specific_tid() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // Register the target tid so it exists for the signal target check
-    // (tkill now returns ESRCH for an unknown tid — Linux parity).
-    crate::handlers::register_task_to_pid(0xBBBB, 0xBBBB);
+    // Register the target as a real task (registry + pid <-> task maps) so
+    // tkill's find_task_by_vpid resolves it; an unknown tid is -ESRCH.
+    crate::handlers::register_pid_task_mapping(0xBBBB, 0xBBBB);
+    if crate::task::task_get(0xBBBB).is_none() {
+        let _ = crate::task::Task::new_registered(0xBBBB, 0xBBBB);
+    }
     // tkill TID=0xBBBB with signum=10 (SIGUSR1).
     let mut ctx = SigGapCtx {
         args: SyscallArgs {
@@ -1746,10 +1749,13 @@ fn smoke_userspace_tgkill_routes_via_tid() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // Register tid 0xDDDD as a member of thread-group 0xCCCC, so the
-    // target exists AND the (tgid,tid) consistency check passes — both
-    // required now that tgkill enforces Linux ESRCH semantics.
-    crate::handlers::register_task_to_pid(0xDDDD, 0xCCCC);
+    // Register tid 0xDDDD as a non-leader thread of thread-group 0xCCCC the
+    // way clone(CLONE_THREAD) does, so the target exists AND the (tgid,tid)
+    // consistency check passes — both required by Linux's ESRCH semantics.
+    if crate::task::task_get(0xDDDD).is_none() {
+        let _ = crate::task::Task::new_registered(0xDDDD, 0xCCCC);
+    }
+    crate::handlers::__test_register_thread_mapping(0xDDDD, 0xDDDD, 0xCCCC);
     // tgkill TGID=0xCCCC TID=0xDDDD SIG=15 (SIGTERM).
     let mut ctx = SigGapCtx {
         args: SyscallArgs {
@@ -2450,10 +2456,12 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
 
     // signum = 65 must be rejected: the bit-N-1 bitmaps represent the
     // full valid range 1..=64 (SIGRTMAX = 64 is now valid), so 65 is
-    // the first out-of-range value.
+    // the first out-of-range value. The target must exist: Linux looks the
+    // thread up first (-ESRCH) and validates the signal only for a found
+    // task (`do_send_specific` → `check_kill_permission`), so aim at self.
     let mut ctx = SigGapCtx {
         args: SyscallArgs {
-            arg0: 0xBEEF,
+            arg0: task_lookup(),
             arg1: 65,
             ..SyscallArgs::default()
         },
@@ -2464,9 +2472,8 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     __test_clear_global();
     crate::handlers::__test_signal_reset();
     // Linux parity: an out-of-range signum returns -EINVAL (was an
-    // InvalidOp NARF status before the signal-parity pass). The signum
-    // check fires before the target existence check, so 0xBEEF's
-    // (non)existence is irrelevant here.
+    // InvalidOp NARF status before the signal-parity pass), once the target
+    // has been found.
     if r == errno_ret(EINVAL) {
         TestResult::Pass
     } else {

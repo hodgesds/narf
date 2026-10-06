@@ -126,6 +126,7 @@ mod abi_sound_tests;
 mod abi_test_support;
 mod abi_tests;
 mod abi_thp_tests;
+mod abi_tid_lookup_tests;
 mod abi_time_tests;
 mod abi_uaccess_tests;
 mod abi_udev_protocol_tests;
