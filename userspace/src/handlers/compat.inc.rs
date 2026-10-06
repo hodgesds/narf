@@ -6711,6 +6711,14 @@ pub fn proc_current_outer_pid() -> u64 {
     task_to_pid_raw(task).unwrap_or(task)
 }
 
+/// /proc/thread-self hook — the calling THREAD's tid in its own pid-namespace
+/// view (== `gettid()`), the `<tid>` half of `<tgid>/task/<tid>`
+/// (fs/proc/thread_self.c: `task_pid_nr_ns(current, ns)`). Differs from
+/// [`proc_current_pid`] for every CLONE_THREAD sibling.
+pub fn proc_current_tid() -> u64 {
+    linux_tid_for_task(current_task_id())
+}
+
 /// `/proc/<N>` numeric-resolution hook. `N` is a pid in the READER's PID
 /// namespace; return the outer ProcessId the kernel keys on, or `None` when
 /// the reader is namespaced and `N` names no process in its namespace (so
@@ -6821,18 +6829,44 @@ pub fn proc_task_info(
     if !live {
         return None;
     }
+    // The group's mm — Linux `proc_mem_open` -> `mm_access(task)` reads
+    // `task->mm`, which every CLONE_THREAD sibling shares. The run-queue scan
+    // misses a task while some CPU is polling it, so:
+    //   1. the leader's slot, when it is queued;
+    //   2. the READER's own mm when the reader belongs to this thread group
+    //      (CLONE_THREAD implies CLONE_VM, so it is the same AddressSpace).
+    //      Keying this on `tid == current` alone left a sibling thread reading
+    //      /proc/self/maps with NO mm whenever the leader was running on
+    //      another CPU — an empty maps file, which glibc's
+    //      pthread_getattr_np turns into ENOENT;
+    //   3. any other queued member of the group.
+    // An unrelated reader never falls back to its own mm.
+    let reader_in_group = tid == current || task_to_pid_raw(current) == Some(pid);
+    let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
+        .or_else(|| {
+            if reader_in_group {
+                current_address_space()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            crate::task::thread_group_tids(pid)
+                .into_iter()
+                .filter(|&member| member != tid)
+                .find_map(|member| narf_scheduler::address_space_of(narf_scheduler::TaskId(member)))
+        });
     // brk top — the break is ADDRESS-SPACE state now (not per-task), so read it
-    // off the task's AS. This also gives every CLONE_VM thread the same `[heap]`
+    // off the group's AS. This also gives every CLONE_VM thread the same `[heap]`
     // range in its /proc/<tid>/maps (per-task keying showed threads no heap).
-    let brk_top = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
-        .map(|as_arc| as_arc.brk_top())
-        .unwrap_or(0);
+    let brk_top = as_arc.as_ref().map(|as_arc| as_arc.brk_top()).unwrap_or(0);
     // Stack top — the exclusive high end of the user-stack region. Read
-    // it off the task's AS (like `brk_top` above): the loader jitters the
+    // it off the group's AS (like `brk_top` above): the loader jitters the
     // stack top per exec (`kaslr::user_stack_top`), so a fixed constant
     // here would report a startstack the process never had. Falls back to
     // the nominal top for a task whose AS predates a loader run.
-    let stack_top = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid))
+    let stack_top = as_arc
+        .as_ref()
         .map(|as_arc| as_arc.stack_top())
         .filter(|&t| t != 0)
         .unwrap_or(crate::process::DEFAULT_USER_STACK_TOP);
@@ -6849,15 +6883,6 @@ pub fn proc_task_info(
     // cmdline — argv preserved at exec time. Empty for bare-spawn
     // tasks (initramfs init / shell) until their argv is recorded.
     let cmdline = proc_argv_of(pid);
-    let as_arc = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)).or_else(|| {
-        // Currently-polling task isn't in the queue scan; fall back to the
-        // active-AS slot.
-        if tid == current_task_id() {
-            narf_scheduler::current_address_space()
-        } else {
-            None
-        }
-    });
     let memory_stats = as_arc
         .as_ref()
         .map(|as_arc| as_arc.memory_stats())
@@ -11907,15 +11932,17 @@ fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result
 /// reported in the READER's pid namespace.
 ///
 /// `pid` arrives as an outer ProcessId (procfs has already resolved the
-/// path component), and each tid goes back out through `report_pid_to` for
-/// the same reason `/proc/locks` translates its owners — a tid is a pid in
-/// its namespace, and handing back a raw scheduler id would name a thread
-/// the reader cannot see.
+/// path component). Each member's identity is its Linux TID — a sibling's
+/// own `TASK_TO_LINUX_TID` number, the leader's tgid — never its tgid
+/// (`task_to_pid_raw` maps EVERY member to the tgid, which listed the leader
+/// once per thread and made every sibling's `task/<tid>` ENOENT) and never
+/// a scheduler TaskId. Linux `proc_task_readdir` renders
+/// `task_pid_nr_ns(task, ns)` and skips a thread invisible in `ns`
+/// (fs/proc/base.c); `proc_pid_report` is that filter-and-translate.
 pub fn proc_thread_list(pid: u64) -> alloc::vec::Vec<u64> {
-    let reader = current_task_id();
     crate::task::thread_group_tids(pid)
         .into_iter()
-        .map(|tid| report_pid_to(reader, task_to_pid_raw(tid).unwrap_or(tid)))
+        .filter_map(|task| proc_pid_report(task_to_linux_tid_raw(task).unwrap_or(pid)))
         .filter(|&v| v != 0)
         .collect()
 }
