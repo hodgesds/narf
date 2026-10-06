@@ -1030,14 +1030,26 @@ pub struct ProcTaskDir {
 #[derive(Debug)]
 struct ProcTaskTidDir {
     pid: u64,
+    /// The thread this directory names, as the READER names it. Carried
+    /// separately from `pid` because a thread's name, not the group's, is what
+    /// belongs under it.
+    tid: u64,
     /// The directory's inode: `/proc/<pid>/task/<tid>` (see `ProcTaskDir`).
     ino: u64,
 }
 
-/// `/proc/<pid>/task/<tid>/comm`
+/// `/proc/<pid>/task/<tid>/comm` — the THREAD's name, readable by anyone and
+/// writable by its owner.
+///
+/// Linux: `NOD("comm", S_IFREG|S_IRUGO|S_IWUSR, …)` in `tid_base_stuff`
+/// (fs/proc/base.c). The write side is not optional decoration: glibc's
+/// `pthread_setname_np` opens this file O_RDWR and writes the name, so a
+/// read-only node makes every `pthread_setname_np` fail — which is what
+/// PipeWire reports as "pthread_setname error" for each of its loops.
 #[derive(Debug)]
 struct ProcTaskTidComm {
     pid: u64,
+    tid: u64,
     ino: u64,
 }
 
@@ -1048,14 +1060,100 @@ impl FileOps for ProcTaskTidComm {
     fn inode_attrs(&self) -> crate::InodeAttrs {
         super::proc_attrs()
     }
+    /// Threads share the group's credentials, so the thread-group owner is the
+    /// owner of a thread's files too — and it has to be, or `S_IWUSR` would
+    /// never grant the owning task the write it needs.
+    fn owners(&self) -> (u32, u32) {
+        super::task_file_owners(self.pid)
+    }
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let pid = self.pid;
+        let tid = self.tid;
         Box::pin(async move {
-            let comm = task_info(pid, super::TaskInfoQuery::Basic)
-                .map(|i| i.comm)
-                .unwrap_or_else(|| format!("task-{}", pid));
+            // The THREAD's name, falling back to the group's only when no
+            // per-thread hook is installed (the thread-group leader's name is
+            // the group's name either way).
+            let comm = super::hook_thread_comm(tid)
+                .or_else(|| task_info(pid, super::TaskInfoQuery::Basic).map(|i| i.comm))
+                .unwrap_or_else(|| format!("task-{}", tid));
             let s = format!("{}\n", comm);
             slice_read(s.as_bytes(), offset, buf)
+        })
+    }
+    fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let tid = self.tid;
+        Box::pin(async move {
+            // `comm_write` clamps to TASK_COMM_LEN-1 and ignores a trailing
+            // newline or NUL; walk back to a UTF-8 boundary so the truncation
+            // cannot split a codepoint.
+            let trimmed = buf.trim_ascii_end();
+            let mut end = trimmed.len().min(15);
+            while end > 0 && (trimmed[end - 1] & 0xC0) == 0x80 {
+                end -= 1;
+            }
+            let name = core::str::from_utf8(&trimmed[..end]).map_err(|_| FsError::InvalidData)?;
+            // Linux returns the full count written even when it truncated, and
+            // an uninstalled hook must not turn a successful write into an
+            // error — same contract as `/proc/<pid>/comm`.
+            let _ = super::hook_set_thread_comm(tid, name);
+            Ok(buf.len())
+        })
+    }
+    fn stat(&self) -> Stat {
+        Stat {
+            size: 0,
+            blocks: 0,
+            mode: Mode {
+                file_type: FileType::File,
+                // S_IRUGO|S_IWUSR — only the owning task may rename a thread.
+                perms: 0o644,
+            },
+            mtime_cycles: 0,
+        }
+    }
+}
+
+/// `/proc/<pid>/task/<tid>/stat` — the thread's own row.
+///
+/// Same 52-field layout as the process file; `do_task_stat` with `whole = 0`
+/// substitutes the thread's id, name and CPU times and leaves the rest
+/// describing the group (fs/proc/array.c). Everything that reads per-thread
+/// CPU — `ps -L`, `top -H`, any profiler — reads exactly this.
+#[derive(Debug)]
+struct ProcTaskTidStat {
+    pid: u64,
+    tid: u64,
+    ino: u64,
+}
+
+impl FileOps for ProcTaskTidStat {
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn inode_attrs(&self) -> crate::InodeAttrs {
+        super::proc_attrs()
+    }
+    fn owners(&self) -> (u32, u32) {
+        super::task_file_owners(self.pid)
+    }
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let pid = self.pid;
+        let tid = self.tid;
+        Box::pin(async move {
+            let Some(mut info) = task_info(pid, super::TaskInfoQuery::Basic) else {
+                // Thread gone: Linux answers ESRCH, and every other per-pid
+                // file here surfaces that as a zero-length read.
+                return Ok(0);
+            };
+            if let Some(thread) = super::hook_thread_stat(tid) {
+                info.comm = thread.comm;
+                info.utime_ticks = thread.utime_ticks;
+                info.stime_ticks = thread.stime_ticks;
+            }
+            // Field 1 is the THREAD's id, which is what makes a reader able to
+            // tell two rows of the same process apart.
+            info.pid = tid;
+            slice_read(super::render_stat(&info).as_bytes(), offset, buf)
         })
     }
     fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -1082,19 +1180,22 @@ impl DirOps for ProcTaskTidDir {
         match name {
             "comm" => Some(Arc::new(ProcTaskTidComm {
                 pid: self.pid,
+                tid: self.tid,
+                ino: proc_pid_ino(self.ino, name),
+            })),
+            "stat" => Some(Arc::new(ProcTaskTidStat {
+                pid: self.pid,
+                tid: self.tid,
                 ino: proc_pid_ino(self.ino, name),
             })),
             _ => None,
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        Box::new(
-            [DirEntry {
-                name: "comm".into(),
-                file_type: FileType::File,
-            }]
-            .into_iter(),
-        )
+        Box::new(["comm", "stat"].into_iter().map(|name| DirEntry {
+            name: name.into(),
+            file_type: FileType::File,
+        }))
     }
 }
 
@@ -1172,6 +1273,7 @@ impl DirOps for ProcTaskDir {
         if self.tids().contains(&tid) {
             Some(Arc::new(ProcTaskTidDir {
                 pid: self.pid,
+                tid,
                 ino: self.tid_dir_ino(tid),
             }))
         } else {

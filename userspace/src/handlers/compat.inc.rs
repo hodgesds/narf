@@ -669,6 +669,25 @@ pub(crate) fn resolve_vfs_symlink_path_scoped(
             {
                 continue;
             }
+            // A proc-fd link is a MAGIC link: following it reopens descriptor
+            // N, it does not look up a literal pathname (Linux
+            // `proc_fd_link` -> `nd_jump_link`). Its readlink text is a
+            // DESCRIPTION, and for an anonymous descriptor — a pipe, socket,
+            // eventfd or memfd — that text is `pipe:[12345]`, which names
+            // nothing. Expanding it textually turned it into
+            // `/proc/<pid>/fd/pipe:[12345]` and the walk then failed.
+            //
+            // This is reached from OUTSIDE /proc, which is why `open_impl`'s
+            // `proc_magic_path` guard does not cover it: `/dev/fd` is a
+            // devtmpfs symlink into procfs, so expanding `/dev/fd/63` walks
+            // into procfs and meets the fd link here. Stop and hand the path
+            // back; `open_impl` recognises it and performs the jump. Without
+            // this, bash process substitution (`cmd < <(other)`) fails with
+            // "/dev/fd/63: No such file or directory", as do `/dev/stdin`,
+            // `/dev/stdout` and `/dev/stderr` whenever they name a pipe.
+            if is_final && parse_proc_fd_magic_path(current_task_id(), &prefix).is_some() {
+                return finish(expanded);
+            }
             if symlink_refused(scope.as_ref(), &prefix) {
                 return Err(ELOOP);
             }
@@ -1340,6 +1359,19 @@ type PathStat = (
 );
 
 fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathStat> {
+    stat_ino_path_dir_aware_depth(path, follow_final, 0)
+}
+
+/// `depth` bounds the two magic-link retries below. Each rewrites the path
+/// once and the rewrite is idempotent, so one retry is always enough; the
+/// counter is what makes that a property of the code rather than of the
+/// expander, because a kernel stack has no room to be wrong about it.
+fn stat_ino_path_dir_aware_depth(
+    path: &str,
+    follow_final: bool,
+    depth: u8,
+) -> Option<PathStat> {
+    const MAX_STAT_RETRY: u8 = 2;
     let file = current_resolve_absolute(path, |fs, root, rel| {
         if rel.is_empty() {
             // A file-rooted mount (mount --bind of a file, e.g. systemd's
@@ -1396,8 +1428,8 @@ fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathSta
         };
         if let Some(target) = proc_task_link_target(current_task_id(), probe) {
             let host = apply_chroot(&target);
-            if host != probe {
-                return stat_ino_path_dir_aware_ext(&host, true);
+            if host != probe && depth < MAX_STAT_RETRY {
+                return stat_ino_path_dir_aware_depth(&host, true, depth + 1);
             }
         }
     }
@@ -1458,6 +1490,25 @@ fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathSta
             0,
             narf_filesystem::InodeAttrs::default(),
         ));
+    }
+    // A symlink whose target leaves its own filesystem needs the VFS-wide
+    // resolver, which crosses mounts; `resolve_async_dentry_ext` restarts an
+    // absolute target at the OWNING filesystem's mount root. `open(2)` already
+    // expands the path that way before its lookup, so a path it could open and
+    // a path `stat(2)` could describe had diverged: `/dev/fd/0`, `/dev/stdin`
+    // and friends are devtmpfs symlinks into procfs, and `ls -l` on one
+    // reported ENOENT.
+    //
+    // Last resort, after every other shape has been tried, so a path that
+    // resolves today never pays for it. `follow_final` is threaded through,
+    // which keeps `lstat` describing the final link itself while still
+    // expanding the intermediate components the walk has to cross.
+    if depth < MAX_STAT_RETRY {
+        if let Ok(expanded) = resolve_vfs_symlink_path_scoped(path, follow_final) {
+            if expanded != path {
+                return stat_ino_path_dir_aware_depth(&expanded, follow_final, depth + 1);
+            }
+        }
     }
     None
 }
@@ -6787,6 +6838,42 @@ pub fn proc_argv_of(pid: u64) -> alloc::vec::Vec<u8> {
 pub fn proc_comm_of(pid: u64) -> Option<alloc::string::String> {
     let tid = proc_pid_to_tid(pid);
     proc_comm_of_task(tid)
+}
+
+/// Map a `/proc/<pid>/task/<tid>` name back to the scheduler task it names.
+///
+/// `proc_thread_list` renders a thread as `report_pid_to(reader, outer_tid)`,
+/// so the inverse is `accept_pid_from` followed by the tid tables. A thread
+/// group LEADER has no `TASK_TO_LINUX_TID` row — its tid is its pid, which is
+/// exactly how `linux_tid_for_task` resolves it.
+fn task_of_visible_tid(tid: u64) -> Option<u64> {
+    let outer = accept_pid_from(current_task_id(), tid)?;
+    linux_tid_to_task_raw(outer).or_else(|| pid_to_task_raw(outer))
+}
+
+/// `/proc/<pid>/task/<tid>/comm` read hook — the THREAD's own name.
+pub fn proc_thread_comm(tid: u64) -> Option<alloc::string::String> {
+    proc_comm_of_task(task_of_visible_tid(tid)?)
+}
+
+/// `/proc/<pid>/task/<tid>/stat` hook — the thread's own name and CPU time.
+/// USER_HZ = 100, so one tick is 10 ms, matching `proc_task_info`.
+pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat> {
+    const NS_PER_TICK: u64 = 10_000_000;
+    let task = task_of_visible_tid(tid)?;
+    Some(narf_filesystem::procfs::ThreadStat {
+        comm: proc_comm_of_task(task).unwrap_or_else(|| alloc::format!("task-{tid}")),
+        utime_ticks: cpu_time_ns_of(task) / NS_PER_TICK,
+        stime_ticks: kern_time_ns_of(task) / NS_PER_TICK,
+    })
+}
+
+/// `/proc/<pid>/task/<tid>/comm` write hook — what `pthread_setname_np` uses.
+/// The name is already clamped to TASK_COMM_LEN-1 by procfs.
+pub fn proc_set_thread_comm(tid: u64, name: &str) -> Result<(), narf_filesystem::FsError> {
+    let task = task_of_visible_tid(tid).ok_or(narf_filesystem::FsError::NotFound)?;
+    set_proc_comm(task, name);
+    Ok(())
 }
 
 /// Read the comm table by scheduler task id. Diagnostic filters run before
