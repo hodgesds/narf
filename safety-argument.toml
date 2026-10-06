@@ -1396,3 +1396,7 @@ argument = "Executor core (scheduler/src/lib.rs): poll_one_round_nested wraps po
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "frame/src/bare_main.rs installs narf_rcu's reclaim-offload hook (rcu_reclaim_kick) in run_async_demo. The hook only calls narf_scheduler::spawn_stackful on a task that runs narf_rcu::run_offloaded_reclaim. Reclamation still frees only nodes whose QSBR grace period has elapsed, the same objects at the same safety point as before. Only the context changes: a spawned kernel task instead of whatever frame reported quiescence. Destructors run later, never earlier, so no reader can lose its object. No authority, mapping, domain transition or capability change."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame/src/x86_64/trap.rs: when demand paging of a user-half address returns AddressSpaceError::Bus (the backing file refused a mapped page), the #PF handler records it, skips the stack-growth attempt, and passes SyncFaultInfo { bus: true } to the existing user signal hook, which delivers SIGBUS/BUS_ADRERR instead of SIGSEGV. The user-mode gate is unchanged (CS RPL == 3, CR2 in the user half). Kernel-mode faults with a guarded uaccess armed still fall through to the probe fixup (EFAULT), as Linux returns -EFAULT from copy_*_user over a SIGBUS page. No page is mapped, no authority or domain changes, and the swapgs/entry paths are untouched."

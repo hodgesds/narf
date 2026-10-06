@@ -71,7 +71,7 @@ pub(crate) fn sys_sigreturn(ctx: &mut dyn TrapContext) {
         // a full fatal-fault diagnostic and then terminates, which bounds it;
         // a task that *has* a SIGSEGV handler survives, so printing here would
         // hand userspace an unbounded console-spam loop.
-        let killed = sync_signal_hook().is_some_and(|hook| hook(ctx, 13, SyncFaultInfo { addr: 0 }));
+        let killed = sync_signal_hook().is_some_and(|hook| hook(ctx, 13, SyncFaultInfo { addr: 0, bus: false }));
         if !killed {
             // No signal machinery wired at all. Linux's badframe arm literally
             // reads `return 0`, so that is the answer left standing.

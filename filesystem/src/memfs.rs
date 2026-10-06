@@ -1632,7 +1632,10 @@ impl FilePage {
     /// Allocate a zeroed page. `NoSpace` on allocator exhaustion, which is
     /// the same answer the heap path gave.
     fn new_zeroed() -> Result<Self, FsError> {
-        let frame = narf_memory::frame::alloc_frame().map_err(|_| FsError::NoSpace)?;
+        // No frame is -ENOMEM (`shmem_get_folio_gfp`), not -ENOSPC: a fault
+        // must wait for reclaim (`VM_FAULT_OOM`), not die of SIGBUS as it
+        // would for a full mount.
+        let frame = narf_memory::frame::alloc_frame().map_err(|_| FsError::OutOfMemory)?;
         let page = Self {
             frame,
             mapped: false,
@@ -2606,6 +2609,12 @@ impl FileOps for MemFile {
         let uid = self.uid.load(Ordering::Relaxed);
         let gid = self.gid.load(Ordering::Relaxed);
         let mut data = self.data.lock();
+        // `shmem_get_folio_gfp(.., SGP_CACHE)`: a page at or past i_size is
+        // refused, and `vmf_error` turns that into VM_FAULT_SIGBUS. A fault
+        // never grows the file — only write/ftruncate/fallocate do.
+        if offset >= data.len {
+            return Err(FsError::BadAddress);
+        }
         if let Some(page) = data.pages.get_mut(&index) {
             page.mapped = true;
             return Ok(page.phys());
@@ -2622,9 +2631,6 @@ impl FileOps for MemFile {
         page.mapped = true;
         let phys = page.phys();
         data.pages.insert(index, page);
-        // A fault past the end grows the file the way a write would: the
-        // mapping tracks the file rather than snapshotting it.
-        data.len = core::cmp::max(data.len, offset + PAGE_SIZE);
         drop(data);
         self.touch_mtime_now();
         Ok(phys)

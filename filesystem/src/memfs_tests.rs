@@ -639,18 +639,28 @@ fn smoke_memfs_mmap_fault_aliases_the_file_page() -> TestResult {
     if file.mmap_fault(0) != Ok(phys) {
         return TestResult::Fail("mmap_fault is not idempotent for one offset");
     }
-    // A fault past the end grows the file — the mapping TRACKS the file
-    // rather than snapshotting it, which is the whole reason this is
-    // `mmap_fault` and not `mmap_frames`.
+    // `shmem_fault` refuses a page at or past i_size (mm/shmem.c:
+    // `index >= i_size` → error → `vmf_error` → VM_FAULT_SIGBUS); it never
+    // grows the file. This used to grow it — the same fault SIGBUSes on
+    // Linux, so nothing correct depends on that.
+    let size_before = file.stat().size;
+    if file.mmap_fault(8192).is_ok() {
+        return TestResult::Fail("a fault past end-of-file succeeded (Linux: SIGBUS)");
+    }
+    if file.stat().size != size_before {
+        return TestResult::Fail("a fault past end-of-file grew the file");
+    }
+    // A hole INSIDE i_size — ftruncate grew the file, nothing was written —
+    // faults in a fresh page: the Wayland `wl_shm` pool shape.
+    if poll_once(file.truncate(3 * 4096)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("growing ftruncate failed");
+    }
     let grown = match file.mmap_fault(8192) {
         Ok(phys) => phys,
-        Err(_) => return TestResult::Fail("mmap_fault of a hole failed"),
+        Err(_) => return TestResult::Fail("mmap_fault of a hole inside i_size failed"),
     };
     if grown == phys {
         return TestResult::Fail("two different offsets share one frame");
-    }
-    if file.stat().size < 8192 + 4096 {
-        return TestResult::Fail("a fault past the end did not grow the file");
     }
     // The page is real file content: readable, and charged.
     if file.stat().blocks != 2 * (4096 / 512) {

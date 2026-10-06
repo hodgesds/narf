@@ -256,7 +256,23 @@ fn reserve_rmap_alias_slots(sorted_phys: &mut [PhysAddr]) -> Result<(), ()> {
 /// below `narf-filesystem`, and the region table deliberately holds frames
 /// and no file objects (see `userspace/src/mapped_file.rs`). This is the same
 /// seam shape as [`install_shared_frame_hooks`] and `install_pager`.
-type FileFaultHook = fn(u64) -> Option<u64>;
+type FileFaultHook = fn(u64) -> Result<u64, FileFaultError>;
+
+/// Why the backing file could not supply a frame for a demand fault —
+/// Linux's `vm_fault_t` outcomes for a file-backed `->fault`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FileFaultError {
+    /// No mapping owner covers the address (a NARF-internal inconsistency or
+    /// a racing unmap): the fault is unresolved, delivered as SIGSEGV.
+    NoOwner,
+    /// `VM_FAULT_SIGBUS`: the page lies at or past end-of-file, the file is
+    /// out of space or quota, or reading it failed (`vmf_error` maps every
+    /// error other than `-ENOMEM` here).
+    Bus,
+    /// `VM_FAULT_OOM`: no frame could be allocated. The fault waits for
+    /// reclaim and retries, as an anonymous fault under reserve pressure does.
+    NoMemory,
+}
 static FILE_FAULT_HOOK: IrqSafeSpinLock<Option<FileFaultHook>> = IrqSafeSpinLock::new(None);
 
 /// Install the demand-paging callback for `RegionPerms::FILE_DEMAND` regions,
@@ -278,13 +294,39 @@ pub fn install_file_fault_hook(hook: FileFaultHook) -> Option<FileFaultHook> {
 /// address-space lock held — the hook re-enters the filesystem, which
 /// allocates, takes its own locks, and (for a BPF arena) installs a kernel
 /// page-table entry.
-fn file_fault_frame(vaddr: u64) -> Option<u64> {
-    let hook = (*FILE_FAULT_HOOK.lock())?;
+fn file_fault_frame(vaddr: u64) -> Result<u64, FileFaultError> {
+    let hook = (*FILE_FAULT_HOOK.lock()).ok_or(FileFaultError::NoOwner)?;
     let phys = hook(vaddr)?;
     // A zero or misaligned answer would be stored in a `phys` slot where zero
     // *means* "unbacked" and every consumer assumes page alignment, so it is
     // rejected here rather than corrupting the region table.
-    (phys != 0 && phys & 0xFFF == 0).then_some(phys)
+    if phys != 0 && phys & 0xFFF == 0 {
+        Ok(phys)
+    } else {
+        Err(FileFaultError::NoOwner)
+    }
+}
+
+/// The `AddressSpaceError` a failed file fault surfaces as. `NoMemory` asks the
+/// fault path to wait for reclaim and retry (`VM_FAULT_OOM`); with no reclaim
+/// to wait for it stays unresolved, as an exhausted anonymous fault does.
+fn file_fault_error(error: FileFaultError) -> AddressSpaceError {
+    match error {
+        FileFaultError::NoOwner => AddressSpaceError::Unmapped,
+        FileFaultError::Bus => AddressSpaceError::Bus,
+        FileFaultError::NoMemory => {
+            let node = crate::frame::local_node();
+            crate::reclaim::request_reclaim_ticket(
+                node,
+                1,
+                crate::reclaim::user_pressure_arms_oom(),
+            )
+            .map_or(
+                AddressSpaceError::OutOfRange,
+                AddressSpaceError::ReclaimPressure,
+            )
+        }
+    }
 }
 
 use crate::addr::{PhysAddr, VirtAddr};
@@ -1845,6 +1887,10 @@ fn release_failed_huge_region(
 /// Errors from the address-space surface.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AddressSpaceError {
+    /// A file-backed demand fault the file refused (`VM_FAULT_SIGBUS`): past
+    /// end-of-file, out of space, or an I/O error. Delivered as SIGBUS
+    /// (`BUS_ADRERR`), not SIGSEGV — the address IS mapped.
+    Bus,
     NotImplemented,
     Overlap,
     OutOfRange,
@@ -8764,10 +8810,10 @@ impl AddressSpace {
         // allocate/zero or enter their backing file in parallel.
         let phys = if file_backed {
             match file_fault_frame(v) {
-                Some(phys) => PhysAddr::new(phys),
-                None => {
+                Ok(phys) => PhysAddr::new(phys),
+                Err(error) => {
                     self.cancel_demand_page(v, ticket);
-                    return Err(AddressSpaceError::Unmapped);
+                    return Err(file_fault_error(error));
                 }
             }
         } else {
@@ -8871,10 +8917,10 @@ impl AddressSpace {
 
         let phys = if file_backed {
             match file_fault_frame(v) {
-                Some(phys) => PhysAddr::new(phys),
-                None => {
+                Ok(phys) => PhysAddr::new(phys),
+                Err(error) => {
                     self.cancel_demand_page(v, ticket);
-                    return Err(AddressSpaceError::Unmapped);
+                    return Err(file_fault_error(error));
                 }
             }
         } else {
@@ -13073,16 +13119,24 @@ static FILE_FAULT_HOOK_UNDER_TEST: IrqSafeSpinLock<Option<FileFaultHook>> =
 static TEST_FAULT_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TEST_FAULT_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TEST_FAULT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Error the test hook answers `TEST_FAULT_PAGE` with instead of a frame:
+/// 0 = none (serve the frame), 1 = `Bus`, 2 = `NoMemory`.
+static TEST_FAULT_ERROR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn test_file_fault_hook(vaddr: u64) -> Option<u64> {
+fn test_file_fault_hook(vaddr: u64) -> Result<u64, FileFaultError> {
     use core::sync::atomic::Ordering;
     let page = TEST_FAULT_PAGE.load(Ordering::Relaxed);
     if page != 0 && vaddr == page {
         TEST_FAULT_CALLS.fetch_add(1, Ordering::Relaxed);
-        return Some(TEST_FAULT_FRAME.load(Ordering::Relaxed));
+        match TEST_FAULT_ERROR.load(Ordering::Relaxed) {
+            1 => return Err(FileFaultError::Bus),
+            2 => return Err(FileFaultError::NoMemory),
+            _ => {}
+        }
+        return Ok(TEST_FAULT_FRAME.load(Ordering::Relaxed));
     }
     let chained = *FILE_FAULT_HOOK_UNDER_TEST.lock();
-    chained.and_then(|h| h(vaddr))
+    chained.map_or(Err(FileFaultError::NoOwner), |h| h(vaddr))
 }
 
 /// Put the test hook in front of whatever is installed, chaining to it.
@@ -14000,6 +14054,72 @@ fn smoke_memory_file_demand_refusal_is_a_segv() -> TestResult {
     }
 }
 kernel_test_in!("memory", smoke_memory_file_demand_refusal_is_a_segv);
+
+/// A file fault's outcome must survive to the trap, as Linux's `vm_fault_t`
+/// does. A file that refuses a MAPPED page (`VM_FAULT_SIGBUS` — past EOF, out
+/// of space, I/O error) surfaces as `Bus`, which the trap delivers as SIGBUS;
+/// it used to collapse into `Unmapped`, i.e. SIGSEGV, for a perfectly valid
+/// address. A file that is merely out of memory (`VM_FAULT_OOM`) must wait for
+/// reclaim and retry — `ReclaimPressure`, or `OutOfRange` when there is no
+/// reclaim to wait for — never SIGBUS or SIGSEGV. Neither may back the page.
+fn smoke_memory_file_demand_errors_keep_their_meaning() -> TestResult {
+    use core::sync::atomic::Ordering;
+
+    // SAFETY: as the test above.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let vbase = 0x0000_0080_0000_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(vbase),
+        len: 0x1000,
+        perms: RegionPerms::READ
+            | RegionPerms::WRITE
+            | RegionPerms::SHARED
+            | RegionPerms::FILE_DEMAND,
+        phys: Vec::new().into(),
+    })
+    .is_err()
+    {
+        return TestResult::Fail("map_region rejected a FILE_DEMAND region");
+    }
+    TEST_FAULT_PAGE.store(vbase, Ordering::Relaxed);
+    arm_test_file_fault_hook();
+    let unbacked = |a: &AddressSpace| {
+        a.lookup(VirtAddr::new(vbase))
+            .and_then(|r| r.phys.first().copied())
+            .is_none_or(|phys| phys.raw() == 0)
+    };
+
+    TEST_FAULT_ERROR.store(1, Ordering::Relaxed);
+    // SAFETY: as the test above.
+    let bus = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
+    let bus_unbacked = unbacked(&a);
+    TEST_FAULT_ERROR.store(2, Ordering::Relaxed);
+    // SAFETY: as the test above.
+    let oom = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
+    let oom_unbacked = unbacked(&a);
+
+    TEST_FAULT_ERROR.store(0, Ordering::Relaxed);
+    TEST_FAULT_PAGE.store(0, Ordering::Relaxed);
+    drop(a);
+
+    if bus != Err(AddressSpaceError::Bus) {
+        return TestResult::Fail("a file's SIGBUS refusal did not surface as Bus");
+    }
+    if !matches!(
+        oom,
+        Err(AddressSpaceError::ReclaimPressure(_)) | Err(AddressSpaceError::OutOfRange)
+    ) {
+        return TestResult::Fail("a file's out-of-memory fault did not ask for reclaim");
+    }
+    if !bus_unbacked || !oom_unbacked {
+        return TestResult::Fail("a failed file fault backed the page anyway");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_file_demand_errors_keep_their_meaning);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_tag0_remote_tlb_gate_matches_switch_contract() -> TestResult {

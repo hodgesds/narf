@@ -10418,6 +10418,11 @@ pub fn vector_to_signum(vector: u64) -> Option<u32> {
 pub struct SyncFaultInfo {
     /// Faulting address (CR2 / FAR_EL1). 0 when N/A.
     pub addr: u64,
+    /// A page fault on a MAPPED file page the file refused
+    /// (`VM_FAULT_SIGBUS`: past end-of-file, out of space, I/O error).
+    /// Delivered as SIGBUS / `BUS_ADRERR` rather than SIGSEGV — Linux
+    /// `do_sigbus` for a `VM_FAULT_SIGBUS` user fault.
+    pub bus: bool,
 }
 
 /// Function-pointer hook the arch trap dispatcher calls for
@@ -10592,9 +10597,13 @@ pub fn default_sync_signal_delivery(
     vector: u64,
     info: SyncFaultInfo,
 ) -> bool {
-    let signum = match vector_to_signum(vector) {
-        Some(s) => s,
-        None => return false,
+    let signum = if vector == 14 && info.bus {
+        SIGBUS
+    } else {
+        match vector_to_signum(vector) {
+            Some(s) => s,
+            None => return false,
+        }
     };
     if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
         return true;
@@ -10758,6 +10767,9 @@ pub fn default_sync_signal_delivery(
     // RIP through the same field.
     let (si_code, si_addr) = match vector {
         1 => (2 /* TRAP_TRACE */, info.addr),
+        // BUS_ADRERR (2): "nonexistent physical address" — the page is
+        // mapped, but the file behind it could not supply it.
+        14 if info.bus => (2, info.addr),
         14 => (page_fault_si_code(info.addr), info.addr),
         13 => (0x80 /* SI_KERNEL */, info.addr),
         6 => (1 /* ILL_ILLOPC */, info.addr),
