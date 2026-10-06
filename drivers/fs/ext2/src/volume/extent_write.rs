@@ -45,6 +45,8 @@ use super::{metadata_csum, BitmapKind, Ext2Volume};
 
 /// `EXT_INIT_MAX_LEN`.
 const EXT_INIT_MAX_LEN: u16 = 32768;
+/// `EXT_UNWRITTEN_MAX_LEN`.
+const EXT_UNWRITTEN_MAX_LEN: u16 = EXT_INIT_MAX_LEN - 1;
 /// Root node capacity inside `i_block` (60 bytes - 12-byte header).
 const ROOT_MAX: u16 = 4;
 
@@ -469,6 +471,61 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         }
         self.store_leaf(inode_no, inode, path, entries).await?;
         Ok(block)
+    }
+
+    /// `ext4_alloc_file_blocks(..., EXT4_GET_BLOCKS_CREATE_UNWRIT_EXT)` for
+    /// one block: map a hole at `logical` as an UNWRITTEN extent, which reads
+    /// back as zeros until written, so the block needs no zeroing. A mapped
+    /// block (written or not) is left alone. A new block physically and
+    /// logically adjacent to an unwritten extent extends it
+    /// (`ext4_can_extents_be_merged`). Returns whether a block was allocated.
+    pub(super) async fn extent_prealloc(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        logical: u64,
+    ) -> Result<bool, FsError> {
+        let logical = u32::try_from(logical)
+            .map_err(|_| FsError::Io(narf_block::BlockError::InvalidRange))?;
+        let path = self.extent_path(inode, logical).await?;
+        let leaf = &path.last().ok_or_else(corrupt)?.bytes;
+        let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
+        let mut entries = decode_leaves(leaf, &hdr)?;
+        if entries.iter().any(|e| e.covers(logical)) {
+            return Ok(false);
+        }
+        let prev = entries.iter().rposition(|e| e.logical < logical);
+        let goal = prev.map_or(0, |p| {
+            entries[p].physical + (logical - entries[p].logical) as u64
+        });
+        let block = self.alloc_block_near(goal).await?;
+        inode.blocks = inode
+            .blocks
+            .saturating_add((self.block_size() / 512) as u32);
+        let merges = prev.is_some_and(|p| {
+            let e = &entries[p];
+            e.is_uninitialized
+                && e.logical + e.len as u32 == logical
+                && e.physical + e.len as u64 == block
+                && e.len < EXT_UNWRITTEN_MAX_LEN
+        });
+        match prev {
+            Some(p) if merges => entries[p].len += 1,
+            _ => {
+                let at = prev.map_or(0, |p| p + 1);
+                entries.insert(
+                    at,
+                    ExtentLeaf {
+                        logical,
+                        len: 1,
+                        is_uninitialized: true,
+                        physical: block,
+                    },
+                );
+            }
+        }
+        self.store_leaf(inode_no, inode, path, entries).await?;
+        Ok(true)
     }
 
     /// `ext4_ext_remove_space(inode, 0, EXT_MAX_BLOCKS - 1)`: free every

@@ -2069,6 +2069,28 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
+    /// `ext4_alloc_file_blocks` over logical blocks `first..end`: every hole
+    /// becomes an unwritten extent. Extent-mapped inodes only — Linux's
+    /// `ext4_do_fallocate` refuses a block-mapped inode with -EOPNOTSUPP,
+    /// and so does this (`Unsupported`). A failure part-way (ENOSPC) leaves
+    /// what was already allocated in place, as Linux does; `inode` reflects
+    /// it either way, and the caller writes it.
+    pub(crate) async fn preallocate(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        first: u64,
+        end: u64,
+    ) -> Result<(), FsError> {
+        if !(self.superblock.uses_extents() && inode.uses_extents()) {
+            return Err(FsError::Unsupported);
+        }
+        for logical in first..end {
+            self.extent_prealloc(inode_no, inode, logical).await?;
+        }
+        Ok(())
+    }
+
     /// The block-map half of [`Self::truncate_inode_from`]
     /// (`ext4_ind_truncate`). Returns the 512-byte sectors released.
     async fn blockmap_free_from(&self, inode: &mut Inode, first: u64) -> Result<u32, FsError> {

@@ -596,6 +596,56 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         })
     }
 
+    /// `ext4_fallocate`. The VFS checks (`vfs_fallocate`: argument ranges,
+    /// mode combinations, fd mode, file type, immutable/append-only) are the
+    /// syscall layer's; what reaches here is a valid request.
+    fn fallocate<'a>(&'a self, mode: u32, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            const KEEP_SIZE: u32 = 0x01;
+            // Modes this filesystem implements; anything else is
+            // `ext4_fallocate`'s -EOPNOTSUPP.
+            if mode & !KEEP_SIZE != 0 {
+                return Err(FsError::Unsupported);
+            }
+            let end = offset.checked_add(len).ok_or(FsError::InvalidData)?;
+            let _update = self.volume.lock_inode_updates().await;
+            let inode_no = self.state.lock().inode_no;
+            let mut inode = self.volume.read_inode(inode_no).await?;
+            if inode.is_dir() {
+                return Err(FsError::InvalidPath);
+            }
+            // LINUX-GAP: `i_size` is 32 bits here (no `i_size_high`), so a
+            // range ending past 4 GiB is refused as `truncate` refuses it
+            // (EINVAL) where Linux would allocate it.
+            let new_size = if mode & KEEP_SIZE == 0 && end > u64::from(inode.size) {
+                Some(u32::try_from(end).map_err(|_| FsError::InvalidData)?)
+            } else {
+                None
+            };
+            let bs = self.volume.block_size() as u64;
+            let allocated = self
+                .volume
+                .preallocate(inode_no, &mut inode, offset / bs, end.div_ceil(bs))
+                .await;
+            if let Err(FsError::Unsupported) = allocated {
+                // Block-mapped: nothing was touched.
+                return Err(FsError::Unsupported);
+            }
+            // `ext4_do_fallocate` -> `ext4_alloc_file_blocks`: the size moves
+            // only once the whole range is allocated; a partial allocation
+            // (ENOSPC) keeps its blocks but not a size covering them.
+            if allocated.is_ok() {
+                if let Some(size) = new_size {
+                    inode.size = size;
+                }
+            }
+            // `file_modified`.
+            inode.touch_ctime_mtime(Ext2Volume::<B>::now_secs());
+            self.volume.write_inode(inode_no, &inode).await?;
+            allocated
+        })
+    }
+
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let new_size = u32::try_from(len).map_err(|_| FsError::InvalidData)?;

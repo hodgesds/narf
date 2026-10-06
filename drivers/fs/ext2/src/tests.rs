@@ -5510,6 +5510,103 @@ kernel_test_in!(
     smoke_ext4_extent_truncate_down_frees_blocks_past_eof
 );
 
+/// `fallocate` mode 0 and `FALLOC_FL_KEEP_SIZE` on an extent-mapped file
+/// (`ext4_do_fallocate`): holes become unwritten extents — real blocks, so a
+/// later write cannot hit ENOSPC, but reading back as zeros. Mode 0 moves
+/// `i_size` to cover the range; KEEP_SIZE allocates past EOF and leaves it.
+/// NARF had no ext4 `fallocate`: the syscall layer only raised the size,
+/// so `posix_fallocate`'s promise of space was empty and KEEP_SIZE was
+/// EOPNOTSUPP. A block-mapped file is EOPNOTSUPP on Linux too.
+fn smoke_ext4_fallocate_preallocates_unwritten_extents() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    const BS: u64 = 1024;
+    const KEEP_SIZE: u32 = 0x01;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let sectors = BS / 512;
+    let before = file.stat().blocks;
+    // Mode 0 over blocks 0..8: block 0 is mapped already, 1..=7 are holes.
+    if !matches!(poll_once(file.fallocate(0, 0, 8 * BS)), Some(Ok(()))) {
+        return TestResult::Fail("fallocate mode 0 failed");
+    }
+    if file.stat().size != 8 * BS {
+        return TestResult::Fail("fallocate mode 0 did not extend i_size");
+    }
+    if file.stat().blocks != before + 7 * sectors {
+        return TestResult::Fail("fallocate mode 0 did not allocate the holes");
+    }
+    let mut buf = alloc::vec![0xffu8; 8 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read of the preallocated range failed");
+    }
+    if buf[0] != b'x' || buf[1..].iter().any(|&b| b != 0) {
+        return TestResult::Fail("preallocated blocks did not read back as zeros");
+    }
+    // KEEP_SIZE past EOF: blocks 8..12 allocated, size unchanged.
+    if !matches!(
+        poll_once(file.fallocate(KEEP_SIZE, 8 * BS, 4 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("fallocate KEEP_SIZE failed");
+    }
+    if file.stat().size != 8 * BS {
+        return TestResult::Fail("fallocate KEEP_SIZE moved i_size");
+    }
+    if file.stat().blocks != before + 11 * sectors {
+        return TestResult::Fail("fallocate KEEP_SIZE did not allocate past EOF");
+    }
+    // A write into the preallocated range lands; its neighbours stay zero.
+    if !matches!(poll_once(file.write(3 * BS + 5, b"mid")), Some(Ok(3))) {
+        return TestResult::Fail("write into a preallocated block failed");
+    }
+    if file.stat().blocks != before + 11 * sectors {
+        return TestResult::Fail("writing into preallocated space allocated again");
+    }
+    let mut blk = [0xffu8; BS as usize];
+    if !matches!(poll_once(file.read(3 * BS, &mut blk)), Some(Ok(_)))
+        || &blk[5..8] != b"mid"
+        || blk[..5].iter().chain(&blk[8..]).any(|&b| b != 0)
+    {
+        return TestResult::Fail("a write into preallocated space read back wrong");
+    }
+    // Truncating down releases the preallocation past the new EOF as well.
+    if poll_once(file.truncate(2 * BS)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("truncate down failed");
+    }
+    if file.stat().blocks != before + sectors {
+        return TestResult::Fail("truncate down kept preallocated blocks past EOF");
+    }
+    // A block-mapped file: -EOPNOTSUPP (`ext4_do_fallocate`).
+    let content = [0x5au8; 100];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("block-map mount failed"),
+    };
+    use narf_filesystem::FsInstance;
+    let mapped = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("block-map lookup failed"),
+    };
+    match poll_once(mapped.fallocate(0, 0, 4 * BS)) {
+        Some(Err(FsError::Unsupported)) if mapped.stat().size == 100 => TestResult::Pass,
+        _ => TestResult::Fail(
+            "fallocate on a block-mapped file must be Unsupported and change nothing",
+        ),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_fallocate_preallocates_unwritten_extents
+);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font
