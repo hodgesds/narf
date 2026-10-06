@@ -290,6 +290,134 @@ pub fn decode_entry_layout(entry: &[u8]) -> Option<EntryLayout> {
     })
 }
 
+// ── Timestamps ──────────────────────────────────────────────────────
+
+/// Offsets of the 12-byte `timestamp` fields (ECMA-167 §1/7.3) in each
+/// entry shape, per Linux `fs/udf/ecma_167.h` (`struct fileEntry`,
+/// `struct extendedFileEntry`). The Extended File Entry inserts the 8-byte
+/// ObjectSize before them and a CreationTime between modification and
+/// attribute time.
+pub mod time_offset {
+    pub mod file_entry {
+        pub const ACCESS: usize = 72;
+        pub const MODIFICATION: usize = 84;
+        pub const ATTRIBUTE: usize = 96;
+    }
+    pub mod extended_file_entry {
+        pub const ACCESS: usize = 80;
+        pub const MODIFICATION: usize = 92;
+        pub const CREATION: usize = 104;
+        pub const ATTRIBUTE: usize = 116;
+    }
+}
+
+/// Linux `kernel/time/time.c::mktime64`, `unsigned int` arithmetic
+/// included, so a malformed month wraps exactly as the C does.
+fn mktime64(year0: u32, mon0: u32, day: u32, hour: u32, min: u32, sec: u32) -> i64 {
+    let mut mon = mon0.wrapping_sub(2);
+    let mut year = year0;
+    // 1..12 -> 11,12,1..10: February last, for its leap day.
+    if mon as i32 <= 0 {
+        mon = mon.wrapping_add(12);
+        year = year.wrapping_sub(1);
+    }
+    let days = (year / 4)
+        .wrapping_sub(year / 100)
+        .wrapping_add(year / 400)
+        .wrapping_add(367u32.wrapping_mul(mon) / 12)
+        .wrapping_add(day);
+    let days = i64::from(days) + i64::from(year.wrapping_mul(365)) - 719_499;
+    ((days * 24 + i64::from(hour)) * 60 + i64::from(min)) * 60 + i64::from(sec)
+}
+
+/// Decode a 12-byte ECMA-167 `timestamp` exactly as Linux
+/// `fs/udf/udftime.c::udf_disk_stamp_to_time` does, returning
+/// `(tv_sec, tv_nsec)`:
+///
+/// - `typeAndTimezone`: type in the top 4 bits; only type 1 (local time)
+///   carries an offset, a signed 12-bit count of minutes east of UTC, with
+///   -2047 meaning "unspecified" (treated as 0). Other types use offset 0.
+/// - seconds = `mktime64(year, month, day, hour, minute, second)` minus the
+///   offset.
+/// - nanoseconds = `1000 * (centiseconds * 10000 + hundredsOfMicroseconds *
+///   100 + microseconds)`, but only when all three are below 100; a bogus
+///   sub-second field yields 0.
+pub fn udf_timestamp(ts: &[u8]) -> (i64, u32) {
+    debug_assert!(ts.len() >= 12);
+    let type_and_tz = u16::from_le_bytes([ts[0], ts[1]]);
+    let year = u16::from_le_bytes([ts[2], ts[3]]);
+    let offset = if type_and_tz >> 12 == 1 {
+        // `int16_t offset = typeAndTimezone << 4; offset >>= 4;`
+        let offset = ((type_and_tz << 4) as i16) >> 4;
+        if offset == -2047 {
+            0
+        } else {
+            offset
+        }
+    } else {
+        0
+    };
+    let seconds = mktime64(
+        u32::from(year),
+        u32::from(ts[4]),
+        u32::from(ts[5]),
+        u32::from(ts[6]),
+        u32::from(ts[7]),
+        u32::from(ts[8]),
+    ) - i64::from(offset) * 60;
+    let (cs, hus, us) = (u32::from(ts[9]), u32::from(ts[10]), u32::from(ts[11]));
+    let nsec = if cs < 100 && hus < 100 && us < 100 {
+        1000 * (cs * 10_000 + hus * 100 + us)
+    } else {
+        0
+    };
+    (seconds, nsec)
+}
+
+/// [`udf_timestamp`] as wall-clock nanoseconds. A time before the epoch
+/// clamps to 0, since `narf_filesystem::InodeAttrs` is unsigned.
+pub fn udf_timestamp_ns(ts: &[u8]) -> u64 {
+    let (seconds, nsec) = udf_timestamp(ts);
+    u64::try_from(seconds).map_or(0, |s| s * 1_000_000_000 + u64::from(nsec))
+}
+
+/// The times Linux `udf_fill_inode` reads from an entry: accessTime as
+/// atime, modificationTime as mtime, attrTime as ctime.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EntryTimes {
+    pub atime_ns: u64,
+    pub mtime_ns: u64,
+    pub ctime_ns: u64,
+}
+
+/// Decode an (Extended) File Entry's timestamps. `None` for any other tag
+/// or a buffer too short to hold them.
+pub fn decode_entry_times(entry: &[u8]) -> Option<EntryTimes> {
+    use super::descriptor::tag_id;
+    let (access, modification, attribute) =
+        match super::descriptor::read_descriptor_tag(entry, 0).tag_identifier {
+            tag_id::FILE_ENTRY => (
+                time_offset::file_entry::ACCESS,
+                time_offset::file_entry::MODIFICATION,
+                time_offset::file_entry::ATTRIBUTE,
+            ),
+            tag_id::EXTENDED_FILE_ENTRY => (
+                time_offset::extended_file_entry::ACCESS,
+                time_offset::extended_file_entry::MODIFICATION,
+                time_offset::extended_file_entry::ATTRIBUTE,
+            ),
+            _ => return None,
+        };
+    if entry.len() < attribute + 12 {
+        return None;
+    }
+    Some(EntryTimes {
+        atime_ns: udf_timestamp_ns(&entry[access..access + 12]),
+        mtime_ns: udf_timestamp_ns(&entry[modification..modification + 12]),
+        ctime_ns: udf_timestamp_ns(&entry[attribute..attribute + 12]),
+    })
+}
+
 // ── Allocation Descriptors ──────────────────────────────────────────
 
 /// `short_ad` (ECMA-167 §4/14.14.1) — 8 bytes.

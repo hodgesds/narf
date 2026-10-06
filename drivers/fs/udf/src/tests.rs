@@ -773,3 +773,273 @@ fn smoke_udf_write_paths_are_read_only() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/udf", smoke_udf_write_paths_are_read_only);
+
+// ── Exact timestamps (ECMA-167 §1/7.3, Linux `udf_disk_stamp_to_time`) ─
+
+/// Encode a 12-byte ECMA-167 `timestamp`.
+#[allow(clippy::too_many_arguments)]
+fn udf_ts(
+    type_and_tz: u16,
+    year: u16,
+    mon: u8,
+    day: u8,
+    h: u8,
+    m: u8,
+    s: u8,
+    cs: u8,
+    hus: u8,
+    us: u8,
+) -> [u8; 12] {
+    let mut ts = [0u8; 12];
+    ts[0..2].copy_from_slice(&type_and_tz.to_le_bytes());
+    ts[2..4].copy_from_slice(&year.to_le_bytes());
+    ts[4..12].copy_from_slice(&[mon, day, h, m, s, cs, hus, us]);
+    ts
+}
+
+/// Type 1 (local time) with a signed 12-bit minutes-east-of-UTC offset.
+const fn local_tz(minutes: i16) -> u16 {
+    0x1000 | (minutes as u16 & 0x0fff)
+}
+
+const NS: u64 = 1_000_000_000;
+
+/// `build_udf_image` with known timestamps, plus a `SUB` directory whose
+/// entry is an Extended File Entry (tag 266, times at 80/92/116):
+///
+/// - `TEST.TXT` (File Entry): access 1600000000.000007 (type 1, UTC),
+///   modification 2023-11-15 03:43:20.123456 at UTC+5:30 = 1700000000.123456,
+///   attribute 1700000001.999999 with the "unspecified" offset -2047.
+/// - root (File Entry): modification 2022-04-15 00:22:03.50 at UTC-5 =
+///   1650000123.5; access 1650000000 typed 0 (the offset bits must be
+///   ignored); attribute 1650000200 with a bogus centiseconds of 100 (no
+///   sub-second part, as Linux sanitizes it).
+/// - `SUB` (Extended File Entry): modification 2021-06-01 12:00:00.000001
+///   UTC = 1622548800.000001; access and attribute distinct.
+fn build_udf_dated_image() -> Vec<u8> {
+    let (mut img, _) = build_udf_image();
+    let part = 257usize;
+    let root_fe = (part + 1) * SECTOR_SIZE;
+    let root_data = (part + 2) * SECTOR_SIZE;
+    let file_fe = (part + 3) * SECTOR_SIZE;
+    let sub_lbn: u32 = 5;
+    let sub_data_lbn: u32 = 6;
+    let sub_fe = (part + sub_lbn as usize) * SECTOR_SIZE;
+    let sub_data = (part + sub_data_lbn as usize) * SECTOR_SIZE;
+
+    let put = |img: &mut Vec<u8>, off: usize, ts: [u8; 12]| {
+        img[off..off + 12].copy_from_slice(&ts);
+    };
+    // TEST.TXT: FE access @72, modification @84, attribute @96.
+    put(
+        &mut img,
+        file_fe + 72,
+        udf_ts(local_tz(0), 2020, 9, 13, 12, 26, 40, 0, 0, 7),
+    );
+    put(
+        &mut img,
+        file_fe + 84,
+        udf_ts(local_tz(330), 2023, 11, 15, 3, 43, 20, 12, 34, 56),
+    );
+    put(
+        &mut img,
+        file_fe + 96,
+        udf_ts(local_tz(-2047), 2023, 11, 14, 22, 13, 21, 99, 99, 99),
+    );
+    finalise_tag(&mut img, file_fe, file_fe + 16, 176);
+    // Root.
+    put(
+        &mut img,
+        root_fe + 72,
+        udf_ts(0x0123, 2022, 4, 15, 5, 20, 0, 0, 0, 0),
+    );
+    put(
+        &mut img,
+        root_fe + 84,
+        udf_ts(local_tz(-300), 2022, 4, 15, 0, 22, 3, 50, 0, 0),
+    );
+    put(
+        &mut img,
+        root_fe + 96,
+        udf_ts(local_tz(0), 2022, 4, 15, 5, 23, 20, 100, 0, 0),
+    );
+
+    // SUB: a FID in the root stream (after ".." 40 B + TEST.TXT 48 B).
+    let fid_len = write_fid(
+        &mut img[root_data..],
+        88,
+        super::fid::characteristics::DIRECTORY,
+        sub_lbn,
+        0,
+        SECTOR_SIZE as u32,
+        b"SUB",
+        2,
+    );
+    img[root_fe + 56..root_fe + 64].copy_from_slice(&((88 + fid_len) as u64).to_le_bytes());
+    finalise_tag(&mut img, root_fe, root_fe + 16, 176);
+
+    // SUB's Extended File Entry: InformationLength @56, times @80/92/104/116,
+    // L_EA @208, L_AD @212, AD area @216.
+    write_tag_header(&mut img, sub_fe, tag_id::EXTENDED_FILE_ENTRY, 1, sub_lbn);
+    img[sub_fe + 16 + 4..sub_fe + 16 + 6].copy_from_slice(&4u16.to_le_bytes());
+    img[sub_fe + 16 + 8..sub_fe + 16 + 10].copy_from_slice(&1u16.to_le_bytes());
+    img[sub_fe + 16 + 11] = file_type::DIRECTORY;
+    img[sub_fe + 16 + 18..sub_fe + 16 + 20]
+        .copy_from_slice(&icb_flags::ALLOC_TYPE_LONG.to_le_bytes());
+    let parent = write_fid(
+        &mut img[sub_data..],
+        0,
+        super::fid::characteristics::DIRECTORY | super::fid::characteristics::PARENT,
+        1,
+        0,
+        SECTOR_SIZE as u32,
+        &[],
+        sub_data_lbn,
+    );
+    img[sub_fe + 56..sub_fe + 64].copy_from_slice(&(parent as u64).to_le_bytes());
+    put(
+        &mut img,
+        sub_fe + 80,
+        udf_ts(local_tz(0), 2021, 6, 1, 11, 0, 0, 0, 0, 0),
+    );
+    put(
+        &mut img,
+        sub_fe + 92,
+        udf_ts(local_tz(0), 2021, 6, 1, 12, 0, 0, 0, 0, 1),
+    );
+    put(
+        &mut img,
+        sub_fe + 104,
+        udf_ts(local_tz(0), 2001, 1, 1, 0, 0, 0, 0, 0, 0),
+    );
+    put(
+        &mut img,
+        sub_fe + 116,
+        udf_ts(local_tz(0), 2021, 6, 1, 13, 0, 0, 0, 0, 0),
+    );
+    img[sub_fe + 212..sub_fe + 216].copy_from_slice(&16u32.to_le_bytes());
+    write_long_ad(&mut img, sub_fe + 216, SECTOR_SIZE as u32, sub_data_lbn, 0);
+    finalise_tag(&mut img, sub_fe, sub_fe + 16, 216);
+    img
+}
+
+fn mount_udf(
+    img: Vec<u8>,
+) -> Option<alloc::sync::Arc<crate::volume::UdfVolume<narf_block::ram::RamBlockDevice>>> {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+    let device = RamBlockDevice::from_image(SECTOR_SIZE as u32, img);
+    poll_once(crate::volume::UdfVolume::mount(device, DomainId::DRIVER_0))?.ok()
+}
+
+/// A file reports its File Entry's accessTime / modificationTime / attrTime
+/// as atime / mtime / ctime (`udf_fill_inode`), each converted to UTC with
+/// its own offset and carrying microseconds, straight after lookup (no read
+/// needed), and `Stat::mtime_cycles` derives from the exact mtime.
+fn smoke_udf_file_exact_timestamps() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let Some(volume) = mount_udf(build_udf_dated_image()) else {
+        return TestResult::Fail("dated image did not mount");
+    };
+    let file = match poll_once(volume.root().lookup_async("TEST.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup TEST.TXT failed"),
+    };
+    let attrs = file.inode_attrs();
+    let mtime = 1_700_000_000 * NS + 123_456_000;
+    if attrs.mtime_ns != mtime {
+        return TestResult::Fail("file mtime is not the UTC modificationTime");
+    }
+    if attrs.atime_ns != 1_600_000_000 * NS + 7_000 {
+        return TestResult::Fail("file atime is not the accessTime");
+    }
+    if attrs.ctime_ns != 1_700_000_001 * NS + 999_999_000 {
+        return TestResult::Fail("file ctime is not the attrTime (unspecified offset = UTC)");
+    }
+    if file.stat().mtime_cycles != narf_time::ns_to_cycles(mtime) {
+        return TestResult::Fail("Stat::mtime_cycles does not derive from the exact mtime");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/udf", smoke_udf_file_exact_timestamps);
+
+/// A directory's `dir_mtime_ns` and `inode_attrs().mtime_ns` are its
+/// entry's modificationTime, exactly — for the root (a File Entry, read at
+/// mount) and for `SUB` (an Extended File Entry, whose times sit 8 bytes
+/// later and whose CreationTime must not be mistaken for any of them).
+fn smoke_udf_dir_exact_mtime() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let Some(volume) = mount_udf(build_udf_dated_image()) else {
+        return TestResult::Fail("dated image did not mount");
+    };
+    let root = volume.root();
+    let root_mtime = 1_650_000_123 * NS + 500_000_000;
+    if root.dir_mtime_ns() != root_mtime || root.inode_attrs().mtime_ns != root_mtime {
+        return TestResult::Fail("root mtime is not its modificationTime");
+    }
+    let sub = match poll_once(root.lookup_dir_async("SUB")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup_dir SUB failed"),
+    };
+    let want = 1_622_548_800 * NS + 1_000;
+    if sub.dir_mtime_ns() != want {
+        return TestResult::Fail("SUB dir_mtime_ns is not the EFE modificationTime");
+    }
+    let attrs = sub.inode_attrs();
+    if attrs.mtime_ns != want
+        || attrs.atime_ns != (1_622_548_800 - 3600) * NS
+        || attrs.ctime_ns != (1_622_548_800 + 3600) * NS
+    {
+        return TestResult::Fail("SUB times are not the EFE access/modification/attr times");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/udf", smoke_udf_dir_exact_mtime);
+
+/// `udf_disk_stamp_to_time` edges, mounted and pure: an offset applies only
+/// for type 1 (the root's type-0 accessTime ignores its offset bits), the
+/// "unspecified" offset -2047 is UTC, a negative 12-bit offset sign-extends,
+/// and a sub-second field at or above 100 zeroes the nanoseconds rather than
+/// being trusted (the root's attrTime).
+fn smoke_udf_timezone_edges() -> TestResult {
+    use crate::icb::udf_timestamp;
+    use narf_filesystem::FsInstance;
+
+    let Some(volume) = mount_udf(build_udf_dated_image()) else {
+        return TestResult::Fail("dated image did not mount");
+    };
+    let attrs = volume.root().inode_attrs();
+    if attrs.atime_ns != 1_650_000_000 * NS {
+        return TestResult::Fail("a type-0 timestamp applied its offset bits");
+    }
+    if attrs.ctime_ns != 1_650_000_200 * NS {
+        return TestResult::Fail("a centiseconds field of 100 was not sanitized to 0 ns");
+    }
+
+    let noon = |tz: u16| udf_timestamp(&udf_ts(tz, 2021, 6, 1, 12, 0, 0, 0, 0, 0));
+    if noon(local_tz(0)) != (1_622_548_800, 0) {
+        return TestResult::Fail("UTC noon decoded wrong");
+    }
+    if noon(local_tz(-1)) != (1_622_548_800 + 60, 0) {
+        return TestResult::Fail("a negative 12-bit offset did not sign-extend");
+    }
+    if noon(local_tz(2047)) != (1_622_548_800 - 2047 * 60, 0) {
+        return TestResult::Fail("the largest positive offset was not applied");
+    }
+    if noon(local_tz(-2047)) != (1_622_548_800, 0) {
+        return TestResult::Fail("the unspecified offset -2047 was not treated as UTC");
+    }
+    if noon(0x2000 | 0x0123) != (1_622_548_800, 0) {
+        return TestResult::Fail("a type-2 timestamp applied an offset");
+    }
+    if udf_timestamp(&udf_ts(local_tz(0), 2021, 6, 1, 12, 0, 0, 99, 100, 0)).1 != 0 {
+        return TestResult::Fail("hundredsOfMicroseconds of 100 was not sanitized");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/udf", smoke_udf_timezone_edges);

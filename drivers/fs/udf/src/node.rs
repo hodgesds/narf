@@ -26,7 +26,10 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use super::descriptor::read_descriptor_tag;
 use super::fid::{decode_fid, Fid};
-use super::icb::{ad_type, decode_entry_layout, file_type, read_long_ad, EntryLayout, LongAd};
+use super::icb::{
+    ad_type, decode_entry_layout, decode_entry_times, file_type, read_long_ad, EntryLayout,
+    EntryTimes, LongAd,
+};
 use super::volume::{read_extent, UdfVolume};
 use super::SECTOR_SIZE;
 
@@ -41,6 +44,18 @@ pub struct UdfNodeState {
     pub size_cache: u64,
     /// `Stat` snapshot. Mode is `DIR_RO` / `FILE_RO`.
     pub stat: Stat,
+    /// atime/mtime/ctime from the ICB, decoded as Linux `udf_fill_inode`
+    /// does. Zero until the ICB has been read.
+    pub times: EntryTimes,
+}
+
+impl UdfNodeState {
+    /// Record a freshly-decoded ICB: size, mode and exact timestamps.
+    fn apply(&mut self, layout: &EntryLayout, times: EntryTimes) {
+        self.size_cache = layout.information_length;
+        self.stat = stat_from_layout(layout, times.mtime_ns);
+        self.times = times;
+    }
 }
 
 /// A file or directory in a UDF volume.
@@ -51,8 +66,14 @@ pub struct UdfNode<B: BlockDevice> {
 }
 
 impl<B: BlockDevice + 'static> UdfNode<B> {
-    /// Construct the root node from the cached root ICB long_ad.
-    pub fn root_from_icb(volume: Arc<UdfVolume<B>>, icb: LongAd) -> Self {
+    /// Construct the root node from the cached root ICB long_ad, with the
+    /// root entry's layout and times decoded at mount (Linux reads the root
+    /// inode in `udf_fill_super`).
+    pub fn root_from_icb(
+        volume: Arc<UdfVolume<B>>,
+        icb: LongAd,
+        decoded: (EntryLayout, EntryTimes),
+    ) -> Self {
         let lsn = volume
             .translate_long_ad(&icb)
             .unwrap_or(volume.partition.partition_starting_location as u64);
@@ -62,13 +83,16 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
             mode: Mode::DIR_RO,
             mtime_cycles: 0,
         };
+        let mut state = UdfNodeState {
+            icb_lsn: lsn,
+            size_cache: 0,
+            stat,
+            times: EntryTimes::default(),
+        };
+        state.apply(&decoded.0, decoded.1);
         Self {
             volume,
-            state: IrqSafeSpinLock::new(UdfNodeState {
-                icb_lsn: lsn,
-                size_cache: 0,
-                stat,
-            }),
+            state: IrqSafeSpinLock::new(state),
         }
     }
 
@@ -92,8 +116,33 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
                 icb_lsn,
                 size_cache: 0,
                 stat,
+                times: EntryTimes::default(),
             }),
         })
+    }
+
+    /// A child node with its ICB read, as Linux's lookup does (`udf_iget`
+    /// → `udf_fill_inode`), so `stat` reports the real size and times
+    /// rather than a placeholder until the first `read`.
+    async fn load_fid(volume: &Arc<UdfVolume<B>>, fid: &Fid) -> Result<Self, FsError> {
+        let node = Self::from_fid(volume.clone(), fid)?;
+        let icb_lsn = node.state.lock().icb_lsn;
+        let icb = read_and_decode_icb(volume, icb_lsn).await?;
+        node.state.lock().apply(&icb.layout, icb.times);
+        Ok(node)
+    }
+
+    /// Exact timestamps for the stat path, which prefers `mtime_ns` over
+    /// the lossy `Stat::mtime_cycles`.
+    fn attrs(&self) -> narf_filesystem::InodeAttrs {
+        let times = self.state.lock().times;
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            atime_ns: times.atime_ns,
+            ctime_ns: times.ctime_ns,
+            mtime_ns: times.mtime_ns,
+            ..Default::default()
+        }
     }
 }
 
@@ -103,6 +152,7 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
 /// or read file extents.
 struct DecodedIcb {
     layout: EntryLayout,
+    times: EntryTimes,
     /// Long-AD list lifted out of the AD area. The MVP only consumes
     /// long_ad descriptors; if `alloc_type != 1` the list is empty
     /// and the caller should surface `FsError::Unsupported`.
@@ -122,6 +172,7 @@ async fn read_and_decode_icb<B: BlockDevice + 'static>(
         return Err(FsError::Io(BlockError::IOError));
     }
     let layout = decode_entry_layout(&sector).ok_or(FsError::Io(BlockError::IOError))?;
+    let times = decode_entry_times(&sector).ok_or(FsError::Io(BlockError::IOError))?;
 
     // Walk the AD area as long_ads (the only format the MVP
     // consumes). Skip embedded-data and other formats here; the
@@ -143,11 +194,15 @@ async fn read_and_decode_icb<B: BlockDevice + 'static>(
             off += 16;
         }
     }
-    Ok(DecodedIcb { layout, long_ads })
+    Ok(DecodedIcb {
+        layout,
+        times,
+        long_ads,
+    })
 }
 
-/// Build a `Stat` from a freshly-decoded ICB.
-fn stat_from_layout(layout: &EntryLayout) -> Stat {
+/// Build a `Stat` from a freshly-decoded ICB and its exact mtime.
+pub(crate) fn stat_from_layout(layout: &EntryLayout, mtime_ns: u64) -> Stat {
     let mode = if layout.file_type == file_type::DIRECTORY {
         Mode::DIR_RO
     } else {
@@ -157,7 +212,7 @@ fn stat_from_layout(layout: &EntryLayout) -> Stat {
         size: layout.information_length,
         blocks: layout.information_length.div_ceil(SECTOR_SIZE as u64),
         mode,
-        mtime_cycles: 0,
+        mtime_cycles: narf_time::ns_to_cycles(mtime_ns),
     }
 }
 
@@ -171,10 +226,7 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs()
     }
 
     /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
@@ -196,11 +248,7 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
             let icb_lsn = { self.state.lock().icb_lsn };
             let icb = read_and_decode_icb(&self.volume, icb_lsn).await?;
             // Refresh the cached size + stat under the spinlock.
-            {
-                let mut g = self.state.lock();
-                g.size_cache = icb.layout.information_length;
-                g.stat = stat_from_layout(&icb.layout);
-            }
+            self.state.lock().apply(&icb.layout, icb.times);
 
             if offset >= icb.layout.information_length {
                 return Ok(0);
@@ -307,6 +355,16 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
 // ── DirOps ──────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> DirOps for UdfNode<B> {
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.attrs()
+    }
+
+    /// The directory entry's modificationTime. Without it every UDF
+    /// directory stat'd as the epoch.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.state.lock().times.mtime_ns
+    }
+
     fn rcu_walkable(&self) -> bool {
         true
     }
@@ -325,7 +383,7 @@ impl<B: BlockDevice + 'static> DirOps for UdfNode<B> {
                     continue;
                 }
                 if names_match(&fid.identifier, name) {
-                    let node = UdfNode::from_fid(self.volume.clone(), &fid)?;
+                    let node = UdfNode::load_fid(&self.volume, &fid).await?;
                     return Ok(Arc::new(node) as Arc<dyn FileOps>);
                 }
             }
@@ -345,7 +403,7 @@ impl<B: BlockDevice + 'static> DirOps for UdfNode<B> {
                     continue;
                 }
                 if names_match(&fid.identifier, name) && fid.is_directory() {
-                    let node = UdfNode::from_fid(self.volume.clone(), &fid)?;
+                    let node = UdfNode::load_fid(&self.volume, &fid).await?;
                     return Ok(Arc::new(node) as Arc<dyn DirOps>);
                 }
             }
