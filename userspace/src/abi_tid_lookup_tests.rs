@@ -897,6 +897,52 @@ kernel_test_in!(
     smoke_abi_tid_timer_create_thread_id_non_leader
 );
 
+// ── perf_event_open — kernel/events/core.c:13911 find_lively_task_by_vpid ─
+fn smoke_abi_tid_perf_event_open_non_leader() -> TestResult {
+    use narf_linux_perf_uapi::PerfEventAttr;
+    with_groups(|| {
+        let attr = PerfEventAttr {
+            type_: 1, // PERF_TYPE_SOFTWARE
+            size: core::mem::size_of::<PerfEventAttr>() as u32,
+            config: 1, // PERF_COUNT_SW_TASK_CLOCK
+            ..PerfEventAttr::default()
+        };
+        let ap = &attr as *const _ as u64;
+        let minus1 = -1i32 as u64;
+        set_task(LEADER_TASK);
+        match call(
+            Syscall::PerfEventOpen.raw(),
+            a3(ap, SIB_TID, minus1, minus1),
+        ) {
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("perf_event_open(non-leader tid) must open a per-thread event"),
+        }
+        expect(
+            call(Syscall::PerfEventOpen.raw(), a3(ap, ABSENT, minus1, minus1)),
+            ESRCH,
+            "perf_event_open(unused pid) must be ESRCH",
+        )?;
+        expect(
+            call(
+                Syscall::PerfEventOpen.raw(),
+                a3(ap, SIB_TASK, minus1, minus1),
+            ),
+            ESRCH,
+            "perf_event_open accepted a raw TaskId",
+        )?;
+        // Only -1 means "no task"; any other negative pid is a failed lookup.
+        expect(
+            call(
+                Syscall::PerfEventOpen.raw(),
+                a3(ap, -2i32 as u64, 0, minus1),
+            ),
+            ESRCH,
+            "perf_event_open(pid -2) must be ESRCH",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_perf_event_open_non_leader);
+
 // ── ptrace — kernel/ptrace.c:1398 find_get_task_by_vpid; ptrace_attach
 // `same_thread_group(task, current)` → EPERM ───────────────────────────────
 fn smoke_abi_tid_ptrace_attach_same_group() -> TestResult {
