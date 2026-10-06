@@ -153,6 +153,55 @@ kernel_test_in!(
     smoke_page_cache_mapped_folio_is_pinned_until_unmap
 );
 
+/// `drop_clean_range` is RWF_DONTCACHE's dropbehind: within the range it
+/// drops exactly the folios reclaim could — clean, and held by nothing but
+/// the cache. A dirty page, a user-mapped page and a page someone holds all
+/// stay; the mapped one becomes droppable once unmapped.
+fn smoke_page_cache_drop_clean_range_spares_dirty_mapped_and_held() -> TestResult {
+    reset_globals();
+    let cache = alloc::sync::Arc::new(PageCache::with_capacity(0));
+    let mapping = FileMapping::new(cache.clone(), 7, 42);
+    for page in 0..5 {
+        cache.__insert_folio_for_test(
+            PageKey {
+                fs_id: 7,
+                inode: 42,
+                page_off: page,
+            },
+            clean_folio(page as u8),
+        );
+    }
+    if !mapping.mark_dirty(1) {
+        return TestResult::Fail("mark_dirty on a resident page must succeed");
+    }
+    let mapped = mapping.lookup(2).expect("inserted file folio");
+    let phys = mapped.mmap_frame();
+    drop(mapped);
+    let held = mapping.lookup(3).expect("inserted file folio");
+    // Page 4 lies outside the range.
+    if mapping.drop_clean_range(0, 4) != 1 {
+        return TestResult::Fail("dropbehind did not drop exactly the one clean, unheld page");
+    }
+    if mapping.lookup(0).is_some() {
+        return TestResult::Fail("the clean, unheld page survived dropbehind");
+    }
+    if mapping.lookup(1).is_none() || mapping.lookup(2).is_none() || mapping.lookup(4).is_none() {
+        return TestResult::Fail("dropbehind dropped a dirty, mapped or out-of-range page");
+    }
+    drop(held);
+    if !crate::page_cache::release_mapped_folio(phys) {
+        return TestResult::Fail("unmap did not release the mapped folio");
+    }
+    if mapping.drop_clean_range(0, 4) != 2 || mapping.lookup(1).is_none() {
+        return TestResult::Fail("released pages did not become droppable, or the dirty one went");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/page_cache",
+    smoke_page_cache_drop_clean_range_spares_dirty_mapped_and_held
+);
+
 /// Free-memory watermark: with no hard cap, a cache under the free
 /// watermark sheds clean pages toward the reclaim floor; the same
 /// workload with plenty of free memory keeps every page.

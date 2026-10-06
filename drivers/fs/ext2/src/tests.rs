@@ -6006,6 +6006,66 @@ kernel_test_in!(
     smoke_ext4_collapse_and_insert_range_shift_the_file
 );
 
+/// ext4 sets `FOP_DONTCACHE`, so `RWF_DONTCACHE` I/O is honoured: after the
+/// transfer the range is written back and its clean pages leave the cache
+/// (dropbehind). The next read therefore goes to the device — and finds the
+/// written bytes there. NARF refused the flag with EOPNOTSUPP everywhere.
+fn smoke_ext2_dontcache_drop_behind_writes_back_and_drops() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let content = [0x5au8; 6000];
+    let device = GatedCountingBlock::new(testing::hard_link_image(&content));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    if !file.supports_dontcache() {
+        return TestResult::Fail("ext2/ext4 files must honour RWF_DONTCACHE");
+    }
+    let mut buf = [0u8; 6000];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000)))
+        || !matches!(poll_once(file.write(100, b"new")), Some(Ok(3)))
+    {
+        return TestResult::Fail("warming the cache failed");
+    }
+    // Served from the cache: no device reads.
+    let reads = device.reads.load(Ordering::Relaxed);
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000)))
+        || device.reads.load(Ordering::Relaxed) != reads
+    {
+        return TestResult::Fail("a warm read went to the device");
+    }
+    if !matches!(poll_once(file.drop_behind(0, 6000)), Some(Ok(()))) {
+        return TestResult::Fail("drop_behind failed");
+    }
+    // The pages are gone: the read goes to the device, and the write made
+    // it there first.
+    buf.fill(0);
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000))) {
+        return TestResult::Fail("read after dropbehind failed");
+    }
+    if device.reads.load(Ordering::Relaxed) == reads {
+        return TestResult::Fail("dropbehind left the pages cached");
+    }
+    if &buf[100..103] != b"new" || buf[..100].iter().chain(&buf[103..]).any(|&b| b != 0x5a) {
+        return TestResult::Fail("dropbehind dropped a page before writing it back");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_dontcache_drop_behind_writes_back_and_drops
+);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font

@@ -1189,6 +1189,20 @@ pub trait FileOps: Send + Sync {
         Box::pin(async { Err(FsError::Unsupported) })
     }
 
+    /// Linux `FOP_DONTCACHE`: whether `RWF_DONTCACHE` I/O is honoured. A file
+    /// that says no makes `preadv2`/`pwritev2` with the flag -EOPNOTSUPP
+    /// (`kiocb_set_rw_flags`).
+    fn supports_dontcache(&self) -> bool {
+        false
+    }
+
+    /// After an `RWF_DONTCACHE` transfer over `offset..offset + len`: write
+    /// the range back and drop its clean, unmapped pages ("dropbehind").
+    /// Only called when [`Self::supports_dontcache`] said yes.
+    fn drop_behind<'a>(&'a self, _offset: u64, _len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn seek<'a>(&'a self, _offset: u64, _whence: u32) -> FsFuture<'a, u64> {
         Box::pin(async { Err(FsError::Unsupported) })
     }

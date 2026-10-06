@@ -850,6 +850,24 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         })
     }
 
+    /// ext4 sets `FOP_DONTCACHE`.
+    fn supports_dontcache(&self) -> bool {
+        true
+    }
+
+    /// `RWF_DONTCACHE` dropbehind: the range goes to disk, then its clean
+    /// pages leave the cache — except any still mapped or otherwise held,
+    /// which `folio_end_dropbehind` leaves alone too.
+    fn drop_behind<'a>(&'a self, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let page = PAGE_SIZE as u64;
+            let (first, end) = (offset / page, offset.saturating_add(len).div_ceil(page));
+            self.write_back_dirty(first, end).await?;
+            self.mapping.drop_clean_range(first, end);
+            Ok(())
+        })
+    }
+
     /// `ext4_fallocate`. The VFS checks (`vfs_fallocate`: argument ranges,
     /// mode combinations, fd mode, file type, immutable/append-only) are the
     /// syscall layer's; what reaches here is a valid request.
