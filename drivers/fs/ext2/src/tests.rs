@@ -6066,6 +6066,62 @@ kernel_test_in!(
     smoke_ext2_dontcache_drop_behind_writes_back_and_drops
 );
 
+/// `ext4_new_inode`: on a volume with the extents feature a new regular file
+/// gets `EXT4_EXTENTS_FL` and an empty extent root (`ext4_ext_tree_init`).
+/// NARF created every file block-mapped, so files it made could never use
+/// the extent-only fallocate modes (preallocation, zero/collapse/insert
+/// range) — fstests' fsx, which tests on a file it creates, disabled them
+/// all. On a plain ext2 volume a new file stays block-mapped.
+fn smoke_ext4_new_files_are_extent_mapped() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    const BS: u64 = 1024;
+    const KEEP_SIZE: u32 = 0x01;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (volume, _file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let root = volume.root();
+    let fresh = match poll_once(root.create("fresh")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create on the ext4 volume failed"),
+    };
+    if !matches!(
+        poll_once(fresh.fallocate(KEEP_SIZE, 0, 4 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("a file created on ext4 is not extent-mapped");
+    }
+    let payload = [0xc3u8; 3 * BS as usize];
+    let mut back = [0u8; 3 * BS as usize];
+    if !matches!(poll_once(fresh.write(BS, &payload)), Some(Ok(_)))
+        || !matches!(poll_once(fresh.read(BS, &mut back)), Some(Ok(n)) if n == back.len())
+        || back != payload
+    {
+        return TestResult::Fail("data did not round-trip through a new extent-mapped file");
+    }
+    // Plain ext2: no extents feature, so the new file stays block-mapped.
+    let content = [0x5au8; 100];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("ext2 mount failed"),
+    };
+    let plain = match poll_once(volume.root().create("plain")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create on the ext2 volume failed"),
+    };
+    match poll_once(plain.fallocate(KEEP_SIZE, 0, 4 * BS)) {
+        Some(Err(FsError::Unsupported)) => TestResult::Pass,
+        _ => TestResult::Fail("a file created on plain ext2 must stay block-mapped"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_new_files_are_extent_mapped);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font

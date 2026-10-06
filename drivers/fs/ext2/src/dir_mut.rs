@@ -425,6 +425,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // Allocate inode + initialise with timestamps.
         let new_ino = self.alloc_inode().await?;
         let mut new_inode = Inode::new_regular(mode);
+        self.init_new_file_extents(&mut new_inode);
         new_inode.uid = uid;
         new_inode.gid = gid;
         new_inode.atime = now;
