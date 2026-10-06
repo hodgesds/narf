@@ -4324,14 +4324,6 @@ mod sigframe {
     /// (IOPL, NT, RF, VM, AC, VIF, VIP) stay under kernel control, matching
     /// Linux's sigreturn policy.
     const SAFE_RFLAGS: u64 = 0xFD5;
-    /// FXSAVE64 image size; the frame's `mcontext.fpstate` area.
-    const FXSAVE_BYTES: usize = 512;
-
-    /// 64-byte-aligned FXSAVE64 staging buffer (FXSAVE requires 16, XSAVE
-    /// conventions use 64 — match Linux's frame alignment).
-    #[repr(C, align(64))]
-    struct FxSaveArea([u8; FXSAVE_BYTES]);
-
     #[repr(C)]
     #[derive(Copy, Clone, Default)]
     struct McContext {
@@ -4377,21 +4369,15 @@ mod sigframe {
         uc_sigmask: u64,
     }
 
-    // `uc_mcontext` sits 40 bytes into `UContext`; the siginfo block
-    // is 128 bytes and precedes the ucontext. `rt_sigreturn` is
-    // entered with RSP pointing at the siginfo (the handler's `ret`
-    // popped the 8-byte restorer cookie), so mcontext = RSP + 168.
-    const SIGINFO_BYTES: u64 = 128;
-    const MCONTEXT_FROM_SIGINFO: u64 = SIGINFO_BYTES + 40;
-
-    // Guard the layout this offset arithmetic assumes against silent
-    // struct drift. Must stay in lockstep with the `rt_sigframe`
-    // layout the `int 0x80` path builds in `frame/src/x86_64/trap.rs`,
-    // so a frame delivered on one path tears down correctly on the
-    // other.
+    // The frame layout is Linux's `rt_sigframe`, shared with the
+    // live-trap-frame path in `frame/src/x86_64/trap.rs` through
+    // `narf_arch::x86_64::sigframe` so the two can never drift: a frame
+    // delivered on one path tears down correctly on the other. Guard the
+    // struct sizes that layout assumes.
+    use narf_arch::x86_64::sigframe as layout;
     const _: () = {
-        assert!(core::mem::offset_of!(UContext, uc_mcontext) == 40);
-        assert!(MCONTEXT_FROM_SIGINFO == 168);
+        assert!(core::mem::offset_of!(UContext, uc_mcontext) as u64 == layout::MCONTEXT_OFFSET);
+        assert!(core::mem::size_of::<UContext>() as u64 == layout::UCONTEXT_BYTES);
     };
 
     unsafe fn as_bytes<T: Copy>(v: &T) -> &[u8] {
@@ -4447,22 +4433,38 @@ mod sigframe {
         };
 
         if want_siginfo || force_rt {
-            // FPU state travels in the frame, Linux-style (fpu__alloc_mathframe /
-            // copy_fpstate_to_sigframe): the handler may clobber XMM/MXCSR/x87
-            // freely, so the interrupted context's FPU registers are saved into
-            // a 64-byte-aligned area carved above the frame and restored by
-            // rt_sigreturn from `mcontext.fpstate`. Without this, a handler's
-            // vector-register state leaks into interrupted SSE sequences
-            // (memcpy, mallocng) — user heap corruption under itimer load.
-            let fpstate_vaddr = stack_top.wrapping_sub(FXSAVE_BYTES as u64) & !63u64;
-            let frame_size = 8 + 128 + core::mem::size_of::<UContext>() as u64;
-            let raw_rsp = fpstate_vaddr.wrapping_sub(frame_size);
-            let new_rsp = (raw_rsp & !0xFu64) | 0x8;
-            let siginfo_vaddr = new_rsp + 8;
-            let uctx_vaddr = siginfo_vaddr + 128;
+            // Linux `rt_sigframe`: [pretcode][ucontext][siginfo], with the
+            // interrupted context's full xstate (XSAVE standard format, or
+            // FXSAVE without XSAVE) carved above the frame
+            // (fpu__alloc_mathframe / copy_fpstate_to_sigframe) and restored
+            // by rt_sigreturn from `mcontext.fpstate`. A handler may clobber
+            // any vector register. The ORDER matters: handlers copy glibc's
+            // larger `sizeof(ucontext_t)` from `uc`, which must stay inside
+            // the frame — with siginfo below `uc` a 16 KiB sigaltstack frame
+            // overran the stack top and deadlocked Firefox's crash handler.
+            let l = layout::layout(stack_top, layout::fp_bytes());
+            let fpstate_vaddr = l.fpstate;
+            let new_rsp = l.rsp;
+            let siginfo_vaddr = l.info;
+            let uctx_vaddr = l.uc;
+
+            // The interrupted task's FPU registers are live in hardware here:
+            // delivery runs on the task's own kernel→user return path and
+            // kernel code is built without SSE.
+            let _ = narf_scheduler::stackful::materialize_current_user_fpu();
+            // SAFETY: CPL=0 with CR4.OSFXSR/OSXSAVE set; FPU ownership was
+            // materialized just above.
+            let fp = unsafe { layout::capture() };
 
             let uctx = UContext {
-                uc_flags: 0,
+                // `frame_uc_flags`.
+                uc_flags: layout::UC_SIGCONTEXT_SS
+                    | layout::UC_STRICT_RESTORE_SS
+                    | if fp.is_xstate() {
+                        layout::UC_FP_XSTATE
+                    } else {
+                        0
+                    },
                 uc_link: 0,
                 uc_stack_sp: params.altstack_sp,
                 uc_stack_flags: if want_altstack { 1 } else { 0 },
@@ -4502,26 +4504,6 @@ mod sigframe {
 
             let siginfo = params.siginfo_bytes();
 
-            // The interrupted task's FPU registers are live in hardware here:
-            // delivery runs on the task's own kernel→user return path and
-            // kernel code is built without SSE. FXSAVE64 into an aligned
-            // kernel buffer, then publish it through the same faulting
-            // copy_to_user as the rest of the frame.
-            #[cfg(target_arch = "x86_64")]
-            let fx = {
-                let mut fx = FxSaveArea([0; FXSAVE_BYTES]);
-                let _ = narf_scheduler::stackful::materialize_current_user_fpu();
-                // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` is 64-byte aligned
-                // and owned by this frame build.
-                unsafe {
-                    core::arch::asm!(
-                        "fxsave64 [{0}]",
-                        in(reg) fx.0.as_mut_ptr(),
-                        options(nostack, preserves_flags)
-                    );
-                }
-                fx
-            };
             // SAFETY: the active CR3 is the trapping task's; copy_to_user
             // brackets the writes with SMAP and faults user-side on a
             // bad address.
@@ -4531,9 +4513,9 @@ mod sigframe {
                     && crate::handlers::copy_to_user(siginfo_vaddr, &siginfo).is_ok()
                     && crate::handlers::copy_to_user(uctx_vaddr, as_bytes(&uctx)).is_ok()
             };
-            #[cfg(target_arch = "x86_64")]
             // SAFETY: same copy_to_user contract as the frame writes above.
-            let ok = ok && unsafe { crate::handlers::copy_to_user(fpstate_vaddr, &fx.0).is_ok() };
+            let ok =
+                ok && unsafe { crate::handlers::copy_to_user(fpstate_vaddr, fp.bytes()).is_ok() };
             if !ok {
                 return false;
             }
@@ -4573,16 +4555,16 @@ mod sigframe {
         }
     }
 
-    /// Restore `state` from an `rt_sigframe` at `sc_vaddr` (the value
-    /// of RSP on entry to `rt_sigreturn`). Returns the restored RAX so
-    /// the caller can surface it as the syscall return, or None if the
-    /// frame couldn't be read.
+    /// Restore `state` from an `rt_sigframe` whose siginfo is at `sc_vaddr`
+    /// (RSI at delivery; `rsp + UCONTEXT_BYTES` on the restorer path).
+    /// Returns the restored RAX so the caller can surface it as the
+    /// syscall return, or None for a bad frame.
     pub fn perform_sigreturn_from_state(state: &mut UserState, sc_vaddr: u64) -> Option<u64> {
         if sc_vaddr == 0 {
             return None;
         }
         let mut mc = McContext::default();
-        let mc_vaddr = sc_vaddr + MCONTEXT_FROM_SIGINFO;
+        let mc_vaddr = layout::uc_from_info(sc_vaddr).wrapping_add(layout::MCONTEXT_OFFSET);
         // SAFETY: user-supplied vaddr; copy_from_user brackets SMAP
         // and faults user-side on a bad address.
         // SAFETY: Valid memory or trusted environment
@@ -4621,33 +4603,21 @@ mod sigframe {
         // Restore only the safe RFLAGS bits; keep the rest of the
         // snapshot's flags (kernel-controlled).
         state.rflags = (mc.rflags & SAFE_RFLAGS) | (state.rflags & !SAFE_RFLAGS);
-        // Restore the FPU registers the delivery path saved into the frame
-        // (Linux fpu__restore_sig): the handler may have clobbered any of
-        // them. A frame without fpstate (legacy/naive) restores nothing.
-        #[cfg(target_arch = "x86_64")]
+        // Restore the FPU/xstate area the delivery path saved
+        // (`fpu__restore_sig`): the handler may have clobbered any vector
+        // register. A frame without fpstate (legacy/naive) restores nothing;
+        // a malformed xstate header is a bad frame (XRSTOR would #GP).
         if mc.fpstate != 0 {
-            let mut fx = FxSaveArea([0; FXSAVE_BYTES]);
-            // SAFETY: `fx` borrows a local aligned buffer; copy_from_user
-            // brackets SMAP and faults user-side on a bad address.
-            // SAFETY: Valid memory or trusted environment
-            if unsafe { crate::handlers::copy_from_user(&mut fx.0, mc.fpstate) }.is_err() {
-                return None;
-            }
-            // Sanitize MXCSR (bytes 24..28): reserved bits set would #GP the
-            // FXRSTOR at CPL=0 on user-controlled input (Linux masks with
-            // mxcsr_feature_mask).
-            let mut mxcsr = u32::from_ne_bytes([fx.0[24], fx.0[25], fx.0[26], fx.0[27]]);
-            mxcsr &= 0xffff;
-            fx.0[24..28].copy_from_slice(&mxcsr.to_ne_bytes());
             let _ = narf_scheduler::stackful::materialize_current_user_fpu();
-            // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` is 64-byte aligned and
-            // holds a sanitized FXSAVE image.
-            unsafe {
-                core::arch::asm!(
-                    "fxrstor64 [{0}]",
-                    in(reg) fx.0.as_ptr(),
-                    options(nostack, preserves_flags)
-                );
+            // SAFETY: CPL=0 with CR4.OSFXSR/OSXSAVE set; FPU ownership was
+            // materialized above. copy_from_user faults user-side.
+            let restored = unsafe {
+                layout::restore(mc.fpstate, |addr, dst| {
+                    crate::handlers::copy_from_user(dst, addr).is_ok()
+                })
+            };
+            if restored.is_err() {
+                return None;
             }
         }
         Some(mc.rax)

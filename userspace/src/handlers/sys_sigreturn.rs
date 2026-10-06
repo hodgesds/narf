@@ -23,6 +23,15 @@ pub(crate) fn sys_sigreturn(ctx: &mut dyn TrapContext) {
     let use_rsp = rec.map(|r| r.use_rsp).unwrap_or(false);
     if use_rsp || sc_vaddr == 0 {
         sc_vaddr = ctx.user_rsp();
+        // x86_64 `rt_sigframe` is [pretcode][ucontext][siginfo]: after the
+        // handler's `ret` popped pretcode, RSP points at the ucontext.
+        // `perform_sigreturn` takes the siginfo address (what delivery put
+        // in RSI), which sits `UCONTEXT_BYTES` above it. Linux's
+        // `rt_sigreturn` finds the same frame as `regs->sp - sizeof(long)`.
+        #[cfg(target_arch = "x86_64")]
+        if rec.map(|r| r.is_rt).unwrap_or(true) {
+            sc_vaddr = sc_vaddr.wrapping_add(narf_arch::x86_64::sigframe::UCONTEXT_BYTES);
+        }
     }
 
     // Pass the authoritative frame layout the kernel recorded at delivery so the

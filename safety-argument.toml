@@ -1372,3 +1372,11 @@ argument = "The frame edit copies two boolean link-state attributes from the exi
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The new fields expose only whether reference-counted promiscuity and all-multicast state is non-zero, matching the same public device flags returned by ioctl. The cross-crate hook transfers neither the counts nor mutation authority, and does not alter domain save/restore, guarded user access, capability invocation, or physical-frame ownership."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The x86_64 signal-frame fix moves the rt_sigframe layout and FPU save/restore into the untrusted narf_arch::x86_64::sigframe helper and has frame/ call it. frame/ gains no authority, domain transition, mapping or capability; it still builds the frame only on the current task's user stack and only rewrites the current task's trap frame, as before."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L122"
+argument = "All user-memory accesses in signal delivery and rt_sigreturn stay inside SMAP-bracketed, fault-guarded copies (copy_user_guarded / copy_from_user); the previously unguarded read_volatile of the user mcontext and fpstate is replaced by guarded copies, so a forged frame address is a bad frame instead of a kernel fault. XRSTOR only ever loads an image whose header Linux's validate_user_xstate_header rules accept (XCOMP_BV == 0, zero reserved bytes, XSTATE_BV within the enabled XCR0 user features) and whose MXCSR reserved bits are cleared, so user-controlled frame content cannot raise #GP at CPL 0; components the frame omits are restored to their init state, never left as the handler's."

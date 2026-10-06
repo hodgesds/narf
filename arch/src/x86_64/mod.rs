@@ -56,6 +56,7 @@ pub mod rtm_abort;
 pub mod s3_resume;
 pub mod setjmp;
 pub mod sgx;
+pub mod sigframe;
 pub mod sld;
 pub mod smap;
 pub mod smca;

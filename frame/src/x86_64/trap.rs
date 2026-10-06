@@ -38,6 +38,16 @@ unsafe fn signal_copy_to_user<T>(dst: u64, src: &T) -> bool {
     }
 }
 
+/// [`signal_copy_to_user`] for a byte slice (the variable-size xstate area).
+#[cfg(target_arch = "x86_64")]
+unsafe fn signal_copy_bytes_to_user(dst: u64, src: &[u8]) -> bool {
+    // SAFETY: `src` is a live kernel slice; `copy_user_guarded` accepts an
+    // arbitrary/faulting user destination.
+    unsafe {
+        narf_arch::x86_64::smap::copy_user_guarded(dst as *mut u8, src.as_ptr(), src.len()).is_ok()
+    }
+}
+
 /// Scheduler-stall watchdog. Detects a *global forward-progress stall*
 /// (the kernel keeps taking timer ticks but USER SYSCALLS stop advancing —
 /// the signature of the intermittent SMP wedge: workers parked/stuck while
@@ -2101,16 +2111,18 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         //     [new_rsp + 0  ]  fallback_return       (8 B)
         //     [new_rsp + 8  ]  SigContext            (176 B)
         //
-        //   SA_SIGINFO (rt_sigframe):
+        //   SA_SIGINFO (rt_sigframe, Linux order — see
+        //   narf_arch::x86_64::sigframe):
         //     [new_rsp + 0   ]  fallback_return      (8 B)
-        //     [new_rsp + 8   ]  siginfo_t            (128 B)
-        //     [new_rsp + 136 ]  ucontext_t           (per Linux
+        //     [new_rsp + 8   ]  ucontext             (304 B, per Linux
         //                                             arch/x86/include/uapi/asm/ucontext.h
         //                                             — uc_flags +
         //                                             uc_link +
         //                                             uc_stack +
         //                                             mcontext_t +
         //                                             sigmask)
+        //     [new_rsp + 312 ]  siginfo_t            (128 B)
+        //     … xstate area (64-byte aligned) up to the stack top
         //
         // `params.handler` is what libc registered via sigaction.
         // For a classic handler this is a trampoline that calls
@@ -2160,21 +2172,20 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         } else {
             self.frame.rsp.wrapping_sub(SYSV_RED_ZONE)
         };
-        // rt frames carry the interrupted context's FPU registers in a
-        // 64-byte-aligned FXSAVE64 area carved above the frame (Linux
-        // fpu__alloc_mathframe / copy_fpstate_to_sigframe); rt_sigreturn
-        // restores it via `mcontext.fpstate`. The handler may clobber
-        // XMM/MXCSR/x87 freely; without this, its vector state leaks into
-        // interrupted SSE sequences (memcpy, mallocng).
+        // rt frames follow Linux's `rt_sigframe` exactly (shared layout in
+        // `narf_arch::x86_64::sigframe`): pretcode, ucontext, siginfo, and the
+        // interrupted context's FPU/xstate area carved above the frame
+        // (`fpu__alloc_mathframe`). rt_sigreturn restores it via
+        // `mcontext.fpstate`, so the handler may clobber any vector state.
         let rt_frame = want_siginfo || force_rt;
-        let fpstate_vaddr = if rt_frame {
-            stack_top.wrapping_sub(FXSAVE_BYTES as u64) & !63u64
+        let rt_layout =
+            narf_arch::x86_64::sigframe::layout(stack_top, narf_arch::x86_64::sigframe::fp_bytes());
+        let fpstate_vaddr = if rt_frame { rt_layout.fpstate } else { 0 };
+        let new_rsp = if rt_frame {
+            rt_layout.rsp
         } else {
-            0
+            (stack_top.wrapping_sub(frame_size) & !0xFu64) | 0x8
         };
-        let stack_top = if rt_frame { fpstate_vaddr } else { stack_top };
-        let raw_rsp = stack_top.wrapping_sub(frame_size);
-        let new_rsp = (raw_rsp & !0xFu64) | 0x8;
 
         let saved_rip = if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
             self.frame.rip.wrapping_sub(2)
@@ -2183,12 +2194,30 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         };
 
         if want_siginfo || force_rt {
-            // rt_sigframe path: lay out [fallback_return][siginfo_t][ucontext_t].
-            let siginfo_vaddr = new_rsp + 8;
-            let uctx_vaddr = siginfo_vaddr + 128;
+            // rt_sigframe path: [pretcode][ucontext][siginfo] + xstate above.
+            let siginfo_vaddr = rt_layout.info;
+            let uctx_vaddr = rt_layout.uc;
+
+            // Materialize a deferred task image before capturing it. Merely
+            // executing CLTS here would desynchronise the scheduler's CR0.TS
+            // mirror and could save another task's registers into this frame.
+            // For a legacy/non-own-stack context with no published image, the
+            // same API still clears TS and its scheduler mirror together.
+            let _ = narf_scheduler::stackful::materialize_current_user_fpu();
+            // SAFETY: CPL=0 with CR4.OSFXSR/OSXSAVE set (boot-validated); the
+            // interrupted task's FPU state is live after materialization.
+            let fp = unsafe { narf_arch::x86_64::sigframe::capture() };
 
             let uctx = UContext {
-                uc_flags: 0,
+                // `frame_uc_flags`: SS is saved, strict-restore on 64-bit,
+                // and UC_FP_XSTATE when the FPU area is an xstate image.
+                uc_flags: narf_arch::x86_64::sigframe::UC_SIGCONTEXT_SS
+                    | narf_arch::x86_64::sigframe::UC_STRICT_RESTORE_SS
+                    | if fp.is_xstate() {
+                        narf_arch::x86_64::sigframe::UC_FP_XSTATE
+                    } else {
+                        0
+                    },
                 uc_link: 0,
                 uc_stack_sp: params.altstack_sp,
                 uc_stack_flags: if want_altstack {
@@ -2230,23 +2259,6 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 uc_sigmask: 0,
             };
 
-            // Materialize a deferred task image before capturing it. Merely
-            // executing CLTS here would desynchronise the scheduler's CR0.TS
-            // mirror and could save another task's registers into this frame.
-            // For a legacy/non-own-stack context with no published image, the
-            // same API still clears TS and its scheduler mirror together.
-            let _ = narf_scheduler::stackful::materialize_current_user_fpu();
-            let mut fx = FxSaveArea([0; FXSAVE_BYTES]);
-            // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` is a 64-byte-aligned
-            // buffer owned by this frame build.
-            unsafe {
-                core::arch::asm!(
-                    "fxsave64 [{0}]",
-                    in(reg) fx.0.as_mut_ptr(),
-                    options(nostack, preserves_flags)
-                );
-            }
-
             let info = params.siginfo_bytes();
             // SAFETY: each source is a live kernel object; destinations are
             // within the preflighted frame. Each guarded copy catches a racing
@@ -2257,7 +2269,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 signal_copy_to_user(new_rsp, &fallback_return)
                     && signal_copy_to_user(siginfo_vaddr, &info)
                     && signal_copy_to_user(uctx_vaddr, &uctx)
-                    && signal_copy_to_user(fpstate_vaddr, &fx.0)
+                    && signal_copy_bytes_to_user(fpstate_vaddr, fp.bytes())
             };
             if !delivered {
                 return false;
@@ -2411,7 +2423,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
 /// `getcontext` / `swapcontext` / debugger-side unwinders can walk
 /// it. Embedded inside `UContext` below.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct McContext {
     pub r8: u64,
     pub r9: u64,
@@ -2498,13 +2510,6 @@ pub struct SigContext {
     pub _pad: [u64; 3],
 }
 
-/// FXSAVE64 image size; the rt frame's `mcontext.fpstate` area.
-const FXSAVE_BYTES: usize = 512;
-
-/// 64-byte-aligned FXSAVE64 staging buffer.
-#[repr(C, align(64))]
-struct FxSaveArea([u8; FXSAVE_BYTES]);
-
 /// Restore a SigContext frame at user RSP+8 into the live trap
 /// frame. Called from `sys_sigreturn`. The user RSP at entry is
 /// pointing at the trampoline-return slot; the SigContext sits 8
@@ -2555,23 +2560,25 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64, is_rt: 
     );
 
     if is_rt {
-        // RT frame. RSP at rt_sigreturn entry points at siginfo
-        // (restorer popped pretcode).
-        // ucontext is at sc_vaddr + 128.
-        // mcontext is at sc_vaddr + 128 + 40 = sc_vaddr + 168.
-        let mc_vaddr = sc_vaddr + 168;
-        // SAFETY: rt_sigframe path — `mc_vaddr = sc_vaddr + 168` is the
-        // mcontext offset within the user `rt_sigframe` whose base
-        // (`sc_vaddr`) was validated above; the frame the kernel itself laid
-        // out reserves a full `McContext` there. `read_volatile` reads it as
-        // a plain POD copy and `with_user_access` opens the SMAP window for
-        // this read of a user PTE.
-        // SAFETY: Valid memory or trusted environment
-        let mc = unsafe {
-            narf_arch::x86_64::smap::with_user_access(|| {
-                core::ptr::read_volatile(mc_vaddr as *const McContext)
-            })
+        // RT frame. `sc_vaddr` is the siginfo address (RSI at delivery, or
+        // `rsp + UCONTEXT_BYTES` once the restorer popped pretcode); the
+        // ucontext sits directly below it (`narf_arch::x86_64::sigframe`).
+        let mc_vaddr = narf_arch::x86_64::sigframe::uc_from_info(sc_vaddr)
+            .wrapping_add(narf_arch::x86_64::sigframe::MCONTEXT_OFFSET);
+        let mut mc = McContext::default();
+        // SAFETY: `mc` is a live local of exactly size_of::<McContext>() bytes;
+        // `copy_user_guarded` tolerates an arbitrary/faulting user source, so
+        // a forged frame address is a bad frame, not a kernel fault.
+        let read = unsafe {
+            narf_arch::x86_64::smap::copy_user_guarded(
+                (&mut mc as *mut McContext).cast::<u8>(),
+                mc_vaddr as *const u8,
+                core::mem::size_of::<McContext>(),
+            )
         };
+        if read.is_err() {
+            return false;
+        }
         sc_rip = mc.rip;
         sc_rsp = mc.rsp;
         sc_rax = mc.rax;
@@ -2590,44 +2597,31 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64, is_rt: 
         sc_r14 = mc.r14;
         sc_r15 = mc.r15;
         sc_rflags = mc.rflags;
-        // Restore the FPU registers the delivery path saved into the frame's
-        // fpstate area (Linux fpu__restore_sig): the handler may have
-        // clobbered any of them. A zero fpstate (legacy/foreign frame)
-        // restores nothing.
+        // Restore the FPU/xstate area the delivery path saved
+        // (`fpu__restore_sig`): the handler may have clobbered any vector
+        // register. A zero fpstate (legacy/foreign frame) restores nothing;
+        // a malformed xstate header is a bad frame (XRSTOR would #GP).
         if mc.fpstate != 0 {
-            let mut fx = FxSaveArea([0; FXSAVE_BYTES]);
-            // SAFETY: `fx` is a local aligned buffer; the guarded user read
-            // opens SMAP for this read of the kernel-laid-out frame area.
-            unsafe {
-                narf_arch::x86_64::smap::with_user_access(|| {
-                    core::ptr::copy_nonoverlapping(
-                        mc.fpstate as *const u8,
-                        fx.0.as_mut_ptr(),
-                        FXSAVE_BYTES,
-                    );
-                });
-            }
-            // Sanitize MXCSR (bytes 24..28): reserved bits would #GP the
-            // CPL=0 FXRSTOR on user-controlled input (Linux masks with
-            // mxcsr_feature_mask).
-            let mut mxcsr = u32::from_ne_bytes([fx.0[24], fx.0[25], fx.0[26], fx.0[27]]);
-            mxcsr &= 0xffff;
-            fx.0[24..28].copy_from_slice(&mxcsr.to_ne_bytes());
             // A handler can be preempted after delivery and resume without
             // touching SIMD before entering rt_sigreturn. In that case the
             // task image is deferred and CR0.TS is armed here. Materialize it
-            // before FXRSTOR so the scheduler keeps hardware ownership live
-            // after the interrupted image replaces the handler image.
+            // before the restore so the scheduler keeps hardware ownership
+            // live after the interrupted image replaces the handler image.
             let _ = narf_scheduler::stackful::materialize_current_user_fpu();
-            // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` holds a sanitized
-            // 64-byte-aligned FXSAVE image. The materialization call also
-            // clears TS for a legacy context without a scheduler image.
-            unsafe {
-                core::arch::asm!(
-                    "fxrstor64 [{0}]",
-                    in(reg) fx.0.as_ptr(),
-                    options(nostack, preserves_flags)
-                );
+            // SAFETY: CPL=0 with CR4.OSFXSR/OSXSAVE set; FPU ownership was
+            // materialized above. Each user read is fault-guarded.
+            let restored = unsafe {
+                narf_arch::x86_64::sigframe::restore(mc.fpstate, |addr, dst| {
+                    narf_arch::x86_64::smap::copy_user_guarded(
+                        dst.as_mut_ptr(),
+                        addr as *const u8,
+                        dst.len(),
+                    )
+                    .is_ok()
+                })
+            };
+            if restored.is_err() {
+                return false;
             }
         }
     } else {
@@ -3052,6 +3046,79 @@ fn smoke_x86_64_sa_onstack_uses_altstack_top() -> TestResult {
 }
 kernel_test_in!("frame/x86_64", smoke_x86_64_sa_onstack_uses_altstack_top);
 
+/// An `SA_SIGINFO` frame must use Linux's `struct rt_sigframe` order
+/// (`arch/x86/include/asm/sigframe.h`): `pretcode`, then the kernel
+/// `struct ucontext`, then `struct siginfo`, with the FPU/xstate area
+/// carved ABOVE the frame (`get_sigframe` → `fpu__alloc_mathframe`) and
+/// 64-byte aligned.
+///
+/// The order is ABI that userspace leans on: glibc's `ucontext_t` is larger
+/// than the kernel's `struct ucontext` (0x3c8 vs 0x130 bytes on x86_64), and
+/// handlers routinely copy `sizeof(ucontext_t)` from the `uc` pointer they
+/// were given (Firefox's crash/exception handler does). On Linux that read
+/// stays inside the frame because siginfo and the xstate area follow `uc`.
+/// NARF put siginfo BELOW `uc` and only a 512-byte FXSAVE area above it, so
+/// on a 16 KiB `sigaltstack` the copy ran 0x98 bytes past the stack top,
+/// faulted with SEGV_ACCERR inside the handler, and the re-entered handler
+/// self-deadlocked on the lock its first instance held.
+fn smoke_x86_64_rt_sigframe_linux_layout() -> TestResult {
+    /// `sizeof(struct ucontext)` in the kernel UAPI (uc_flags, uc_link,
+    /// uc_stack, uc_mcontext, uc_sigmask).
+    const KERNEL_UCONTEXT_BYTES: u64 = 304;
+    /// glibc `sizeof(ucontext_t)` on x86_64.
+    const GLIBC_UCONTEXT_T_BYTES: u64 = 0x3c8;
+    const SIGINFO_BYTES: u64 = 128;
+
+    let user_stack = SmokeStack::new();
+    let altstack = SmokeStack::new();
+    let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, user_stack.top());
+    let params = SigDeliveryParams {
+        handler: 0xBABE_FACE,
+        restorer: 0x4000_1000,
+        signum: 11,
+        flags: SA_SIGINFO | SA_ONSTACK,
+        altstack_sp: altstack.base(),
+        altstack_size: altstack.bytes.len() as u64,
+        restartable_syscall: false,
+        prerewound_syscall: false,
+        si_code: 2,
+        si_addr: 0x1234_5000,
+        si_value: 0,
+        si_pid: 0,
+    };
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    if !ctx.deliver_signal(&params) {
+        return TestResult::Fail("deliver_signal returned false");
+    }
+    let alt_hi = altstack.base() + altstack.bytes.len() as u64;
+    let info = frame.rsi;
+    let uc = frame.rdx;
+    if uc != frame.rsp + 8 {
+        return TestResult::Fail("ucontext is not at rt_sigframe+8 (right after pretcode)");
+    }
+    if info != uc + KERNEL_UCONTEXT_BYTES {
+        return TestResult::Fail("siginfo does not follow the kernel struct ucontext");
+    }
+    if uc + GLIBC_UCONTEXT_T_BYTES > alt_hi {
+        return TestResult::Fail("a sizeof(ucontext_t) read from uc runs past the stack top");
+    }
+    let fpstate_off =
+        core::mem::offset_of!(UContext, uc_mcontext) + core::mem::offset_of!(McContext, fpstate);
+    // SAFETY: `uc` points into `altstack`, written by deliver_signal above.
+    let fpstate = unsafe { ((uc + fpstate_off as u64) as *const u64).read_unaligned() };
+    if fpstate & 63 != 0 {
+        return TestResult::Fail("fpstate area not 64-byte aligned");
+    }
+    if fpstate < info + SIGINFO_BYTES {
+        return TestResult::Fail("fpstate area is not above the rt_sigframe");
+    }
+    if fpstate >= alt_hi {
+        return TestResult::Fail("fpstate area is outside the selected stack");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("frame/x86_64", smoke_x86_64_rt_sigframe_linux_layout);
+
 /// SA_ONSTACK set but no altstack installed (`altstack_sp = 0`):
 /// the arch must fall back to the user RSP path — Linux spec
 /// behaviour (`sigsp` returns the regular sp when no altstack
@@ -3126,16 +3193,16 @@ fn smoke_x86_64_sa_siginfo_sets_three_args() -> TestResult {
     if frame.rdi != 11 {
         return TestResult::Fail("RDI != signum");
     }
-    // RSI = &siginfo. The arch lays siginfo at frame.rsp + 8.
-    let siginfo_vaddr = frame.rsp + 8;
-    if frame.rsi != siginfo_vaddr {
-        return TestResult::Fail("RSI != &siginfo (rsp + 8)");
-    }
-    // RDX = &ucontext. The arch lays ucontext at frame.rsp + 8 + 128.
-    let ucontext_vaddr = siginfo_vaddr + 128;
+    // Linux `rt_sigframe`: RDX = &ucontext at rsp + 8 (right after
+    // pretcode), RSI = &siginfo directly after the 304-byte ucontext.
+    let ucontext_vaddr = frame.rsp + 8;
     if frame.rdx != ucontext_vaddr {
-        return TestResult::Fail("RDX != &ucontext (rsp + 136)");
+        return TestResult::Fail("RDX != &ucontext (rsp + 8)");
     }
+    if frame.rsi != ucontext_vaddr + narf_arch::x86_64::sigframe::UCONTEXT_BYTES {
+        return TestResult::Fail("RSI != &siginfo (ucontext + 304)");
+    }
+    let siginfo_vaddr = frame.rsi;
     if frame.rip != 0xCAFE_F00D {
         return TestResult::Fail("RIP != handler");
     }
@@ -3224,7 +3291,10 @@ fn smoke_x86_64_rt_fpstate_saved_and_restored() -> TestResult {
 
     // The written UContext must point at a live fpstate area: nonzero,
     // 64-byte aligned, wholly below the interrupted RSP's red zone.
-    let uctx_vaddr = frame.rsp + 8 + 128;
+    let uctx_vaddr = frame.rdx;
+    if uctx_vaddr != frame.rsp + 8 {
+        return TestResult::Fail("ucontext is not at rt_sigframe+8");
+    }
     let fpstate_off =
         core::mem::offset_of!(UContext, uc_mcontext) + core::mem::offset_of!(McContext, fpstate);
     // SAFETY: the arch just wrote the UContext into the kernel-resident
@@ -3237,7 +3307,7 @@ fn smoke_x86_64_rt_fpstate_saved_and_restored() -> TestResult {
     if fpstate & 63 != 0 {
         return TestResult::Fail("fpstate area not 64-byte aligned");
     }
-    if fpstate + FXSAVE_BYTES as u64 > interrupted_rsp - 128 {
+    if fpstate + narf_arch::x86_64::sigframe::fp_bytes() > interrupted_rsp - 128 {
         return TestResult::Fail("fpstate area intrudes on the interrupted red zone");
     }
     // The saved image must hold the delivery-time XMM6 (FXSAVE64
@@ -3255,9 +3325,9 @@ fn smoke_x86_64_rt_fpstate_saved_and_restored() -> TestResult {
         core::arch::asm!("pcmpeqb xmm6, xmm6", options(nostack, preserves_flags));
     }
 
-    // rt sigreturn: user RSP at rt_sigreturn entry points at siginfo
-    // (the restorer popped the return slot) — sc_vaddr = frame.rsp + 8.
-    let sc_vaddr = frame.rsp + 8;
+    // rt sigreturn: `sc_vaddr` is the siginfo address the handler got in
+    // RSI (the restorer path derives the same value from RSP).
+    let sc_vaddr = frame.rsi;
     let mut ctx = X86TrapContext::from_int80(&mut frame);
     // SAFETY: synthetic trap-handler context — the test-built frame is
     // the "live" trap frame, and sc_vaddr points at the rt frame the
@@ -3282,6 +3352,113 @@ fn smoke_x86_64_rt_fpstate_saved_and_restored() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("frame/x86_64", smoke_x86_64_rt_fpstate_saved_and_restored);
+
+/// The signal frame carries the full XSAVE state, not just FXSAVE: a
+/// handler that clobbers the upper half of a YMM register must not leak it
+/// into the interrupted code (an AVX `memcpy`, here AVX-512 in glibc).
+/// Linux `copy_fpstate_to_sigframe` saves every enabled user feature.
+fn smoke_x86_64_rt_frame_preserves_ymm_upper() -> TestResult {
+    if !narf_arch::x86_64::xsave::caps().avx {
+        return TestResult::Skip("no AVX");
+    }
+    let stack = SmokeStack::new();
+    let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, stack.top());
+    let pattern: [u64; 4] = [1, 2, 0x0BAD_C0DE_0000_0003, 0x0BAD_C0DE_0000_0004];
+    let _ = narf_scheduler::stackful::materialize_current_user_fpu();
+    // SAFETY: CPL=0, AVX enabled in XCR0; touches only YMM7.
+    unsafe {
+        core::arch::asm!("vmovdqu ymm7, [{0}]", in(reg) pattern.as_ptr(), options(nostack, preserves_flags));
+    }
+    let params = SigDeliveryParams {
+        handler: 0xCAFE_F00D,
+        restorer: 0x4000_1000,
+        signum: 10,
+        flags: SA_SIGINFO,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        prerewound_syscall: false,
+        si_code: 0,
+        si_addr: 0,
+        si_value: 0,
+        si_pid: 0,
+    };
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    if !ctx.deliver_signal(&params) {
+        return TestResult::Fail("deliver_signal returned false");
+    }
+    // "Handler": all-ones into YMM7, upper half included.
+    // SAFETY: as above.
+    unsafe {
+        core::arch::asm!(
+            "vpcmpeqb ymm7, ymm7, ymm7",
+            options(nostack, preserves_flags)
+        );
+    }
+    let sc_vaddr = frame.rsi;
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    // SAFETY: synthetic trap context; sc_vaddr is the frame laid out above.
+    if !unsafe { perform_sigreturn(&mut ctx, sc_vaddr, true) } {
+        return TestResult::Fail("perform_sigreturn returned false");
+    }
+    let mut out = [0u64; 4];
+    // SAFETY: as above; reads YMM7 into a local.
+    unsafe {
+        core::arch::asm!("vmovdqu [{0}], ymm7", in(reg) out.as_mut_ptr(), options(nostack, preserves_flags));
+    }
+    if out != pattern {
+        return TestResult::Fail("sigreturn did not restore the YMM upper half");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("frame/x86_64", smoke_x86_64_rt_frame_preserves_ymm_upper);
+
+/// `rt_sigreturn` must refuse an xstate image whose header XRSTOR would
+/// fault on (`validate_user_xstate_header`: XCOMP_BV != 0 is the compacted
+/// format, never valid in a signal frame) — a bad frame, not a kernel #GP.
+fn smoke_x86_64_sigreturn_rejects_bad_xstate_header() -> TestResult {
+    if narf_arch::x86_64::xsave::caps().xcr0_supported == 0 {
+        return TestResult::Skip("no XSAVE");
+    }
+    let stack = SmokeStack::new();
+    let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, stack.top());
+    let params = SigDeliveryParams {
+        handler: 0xCAFE_F00D,
+        restorer: 0x4000_1000,
+        signum: 10,
+        flags: SA_SIGINFO,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        prerewound_syscall: false,
+        si_code: 0,
+        si_addr: 0,
+        si_value: 0,
+        si_pid: 0,
+    };
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    if !ctx.deliver_signal(&params) {
+        return TestResult::Fail("deliver_signal returned false");
+    }
+    let fpstate_off =
+        core::mem::offset_of!(UContext, uc_mcontext) + core::mem::offset_of!(McContext, fpstate);
+    // SAFETY: the frame was just written into the kernel-resident smoke stack.
+    let fpstate = unsafe { ((frame.rdx + fpstate_off as u64) as *const u64).read_unaligned() };
+    // Corrupt XCOMP_BV (xsave header at +512, second u64).
+    // SAFETY: inside the frame's xstate area on the smoke stack.
+    unsafe { ((fpstate + 520) as *mut u64).write_unaligned(1 << 63 | 3) };
+    let sc_vaddr = frame.rsi;
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    // SAFETY: synthetic trap context over the frame laid out above.
+    if unsafe { perform_sigreturn(&mut ctx, sc_vaddr, true) } {
+        return TestResult::Fail("sigreturn accepted a compacted-format xstate header");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_sigreturn_rejects_bad_xstate_header
+);
 
 /// sigreturn restores the interrupted context's arithmetic RFLAGS
 /// (CF/PF/AF/ZF/SF/OF) and DF from the frame — a signal landing
@@ -3319,7 +3496,7 @@ fn smoke_x86_64_sigreturn_restores_arithmetic_rflags() -> TestResult {
     // Rewrite the saved mcontext rflags the way user code can: the
     // flags the interrupted context depends on, alongside privileged
     // bits an attacker would love sigreturn to launder.
-    let uctx_vaddr = frame.rsp + 8 + 128;
+    let uctx_vaddr = frame.rdx;
     let rflags_vaddr = uctx_vaddr
         + (core::mem::offset_of!(UContext, uc_mcontext) + core::mem::offset_of!(McContext, rflags))
             as u64;
@@ -3328,7 +3505,7 @@ fn smoke_x86_64_sigreturn_restores_arithmetic_rflags() -> TestResult {
     // SAFETY: Valid memory or trusted environment
     unsafe { (rflags_vaddr as *mut u64).write_unaligned(0x202 | ZF | DF | AC | IOPL) };
 
-    let sc_vaddr = frame.rsp + 8;
+    let sc_vaddr = frame.rsi;
     let mut ctx = X86TrapContext::from_int80(&mut frame);
     // SAFETY: as in the fpstate smoke — synthetic trap-handler context
     // over the frame the arch laid out.
