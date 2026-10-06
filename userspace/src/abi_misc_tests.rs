@@ -345,9 +345,15 @@ fn smoke_abi_misc_process_vm_errnos() -> TestResult {
             return Err("process_vm_writev with liovcnt > 1024 must return -EINVAL");
         }
 
-        // 2. riovcnt > 1024 -> -EINVAL.
+        // 2. riovcnt > 1024 -> -EINVAL. The remote iovec array is imported
+        // only after a non-empty local one: an empty local iovec returns 0
+        // first (mm/process_vm_access.c:276), so give it one byte.
+        let mut byte = [0u8; 1];
+        let iov = [byte.as_mut_ptr() as u64, 1u64];
         let args = SyscallArgs {
             arg0: FAKE_TASK,
+            arg1: iov.as_ptr() as u64,
+            arg2: 1,
             arg4: 1025,
             ..Default::default()
         };
@@ -358,9 +364,15 @@ fn smoke_abi_misc_process_vm_errnos() -> TestResult {
             return Err("process_vm_writev with riovcnt > 1024 must return -EINVAL");
         }
 
-        // 3. Nonexistent pid -> -ESRCH.
+        // 3. Nonexistent pid -> -ESRCH. The task lookup comes after both
+        // iovec imports and only when there is something to copy (:276,
+        // :182), so both iovecs are non-empty.
         let args = SyscallArgs {
             arg0: 999_999,
+            arg1: iov.as_ptr() as u64,
+            arg2: 1,
+            arg3: iov.as_ptr() as u64,
+            arg4: 1,
             ..Default::default()
         };
         if call(Syscall::ProcessVmReadv.raw(), args) != Some(ESRCH) {

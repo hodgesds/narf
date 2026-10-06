@@ -120,36 +120,13 @@ pub(crate) fn sys_move_pages(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EPERM));
         return;
     }
-    let task = current_task_id();
-    let visible_pid = task_to_pid_raw(task).unwrap_or(task);
-    // Linux (mm/migrate.c) resolves `pid` via find_task_by_vpid — in the
-    // CALLER's pid namespace. Translate the inner pid to its outer ProcessId
-    // before the self-comparison, so a container naming itself by getpid() is
-    // not rejected as a foreign process. Audit finding #20.
-    if a.arg0 != 0 {
-        match accept_pid_from(task, a.arg0) {
-            Some(outer) if outer == task || outer == visible_pid => {}
-            // The pid did not resolve in the caller's namespace at all.
-            None => {
-                ctx.set_return(errno_ret(ESRCH));
-                return;
-            }
-            // It resolved to some outer id: ESRCH only if no task answers to
-            // it (find_task_by_vpid returned NULL), otherwise the
-            // ptrace_may_access denial, which is EPERM. Same existence probe
-            // sys_sched_getaffinity uses.
-            //
-            // LINUX-GAP: NARF cannot address a foreign mm here, so every live
-            // task other than the caller is refused rather than credential-
-            // checked; Linux would let a privileged caller through.
-            Some(outer) => {
-                let live = pid_to_task_raw(outer).is_some()
-                    || narf_scheduler::task_affinity(narf_scheduler::TaskId(outer)).is_some();
-                let errno: i64 = if live { EPERM } else { ESRCH };
-                ctx.set_return(errno_ret(errno));
-                return;
-            }
-        }
+    // `find_mm_struct` (mm/migrate.c:2534-2552): pid 0 is current->mm;
+    // otherwise `find_get_task_by_vpid(pid)` in the CALLER's pid namespace —
+    // any thread, a non-leader's tid included — else -ESRCH; then
+    // ptrace_may_access, else -EPERM.
+    if let Err(errno) = resolve_mm_target(current_task_id(), a.arg0 as i32) {
+        ctx.set_return(errno_ret(errno));
+        return;
     }
     if count == 0 {
         ctx.set_return(SyscallReturn::ok(0));

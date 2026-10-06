@@ -12,28 +12,39 @@ pub(crate) fn sys_process_madvise(ctx: &mut dyn TrapContext) {
     let pidfd = a.arg0 as u32;
     let iovcnt = a.arg2 as usize;
     let advice = a.arg3 as i32;
-    if iovcnt > 1024 {
+    let flags = a.arg4 as u32;
+    // mm/madvise.c:2118-2131: `flags != 0` (-EINVAL), then the iovec import
+    // (more than UIO_MAXIOV segments -EINVAL, a fault -EFAULT), then
+    // `pidfd_get_task`: not a pidfd -EBADF; it resolves PIDTYPE_TGID, so a
+    // PIDFD_THREAD pidfd naming a non-leader, or a reaped process, is -ESRCH.
+    if flags != 0 || iovcnt > 1024 {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
+    let Some(iov) = read_iovecs(a.arg1, iovcnt) else {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    };
     let task = current_task_id();
-    let target_pid = match fd::with_table(task, |t| {
+    let Some(target_pid) = fd::with_table(task, |t| {
         t.get(pidfd).and_then(|e| e.ops.pidfd_target_pid())
     })
-    .flatten()
-    {
-        Some(p) => p,
-        None => {
-            ctx.set_return(errno_ret(EBADF));
-            return;
-        }
+    .flatten() else {
+        ctx.set_return(errno_ret(EBADF));
+        return;
     };
-    // The pidfd was opened on getpid() = the VISIBLE ProcessId, so a self
-    // pidfd's target_pid is the visible pid, not the raw TaskId — accept either
-    // as "self" (otherwise a self-directed process_madvise wrongly EPERMs, seen
-    // as mem2_smoke `mem2-fail: process_madvise`).
-    let self_pid = task_to_pid_raw(task).unwrap_or(task);
-    if target_pid != task && target_pid != self_pid {
+    // The pidfd is keyed by an outer id, never a scheduler TaskId; only a
+    // thread-group leader's pid names a TGID task.
+    let Some(target) = pid_to_task_raw(target_pid)
+        .filter(|&t| t == task || crate::task::task_get(t).is_some())
+    else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
+    };
+    // LINUX-GAP: only the caller's own mm can be advised. Linux would go on
+    // to mm_access / process_madvise_remote_valid / CAP_SYS_NICE for a
+    // remote mm; NARF refuses every remote one with -EPERM.
+    if !shares_mm(task, target) {
         ctx.set_return(errno_ret(EPERM));
         return;
     }
@@ -41,13 +52,6 @@ pub(crate) fn sys_process_madvise(ctx: &mut dyn TrapContext) {
         Some(a) => a,
         None => {
             ctx.set_return(no_address_space());
-            return;
-        }
-    };
-    let iov = match read_iovecs(a.arg1, iovcnt) {
-        Some(v) => v,
-        None => {
-            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };

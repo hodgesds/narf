@@ -517,8 +517,10 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_process_madvise_bad_iovcnt_pos);
 fn smoke_abi_mem_process_madvise_bad_pidfd_neg() -> TestResult {
     with_setup(|| {
         // pidfd 999 isn't an open fd → the pidfd_target_pid lookup fails →
-        // -EBADF (reached before the AS check).
-        let args = a3(999, 0, 1, 4);
+        // -EBADF (reached before the AS check). The iovec array is imported
+        // first (mm/madvise.c:2123), so it must be readable.
+        let iov = [0u64; 2];
+        let args = a3(999, iov.as_ptr() as u64, 1, 4);
         match call(Syscall::ProcessMadvise.raw(), args) {
             Some(v) if v == EBADF => Ok(()),
             Some(_) => Err("process_madvise with a bogus pidfd should be -EBADF"),

@@ -383,6 +383,107 @@ fn smoke_abi_tid_kill_rt_sigqueueinfo_non_leader() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_tid_kill_rt_sigqueueinfo_non_leader);
 
+// ── migrate_pages / move_pages — mm/mempolicy.c:1882, mm/migrate.c:2541 ───
+fn smoke_abi_tid_migrate_move_pages_non_leader() -> TestResult {
+    with_groups(|| {
+        install_test_address_space()?;
+        let node0: u64 = 1;
+        let mask = &node0 as *const u64 as u64;
+        for (caller, target) in [
+            (SIB_TASK, SIB_TID),
+            (LEADER_TASK, SIB_TID),
+            (SIB_TASK, GROUP_PID),
+        ] {
+            set_task(caller);
+            expect(
+                call(Syscall::MigratePages.raw(), a3(target, 64, mask, mask)),
+                0,
+                "migrate_pages(thread of the caller's own process) must act on the shared mm",
+            )?;
+            expect(
+                call(Syscall::MovePages.raw(), a4(target, 0, 0, 0, 0)),
+                0,
+                "move_pages(thread of the caller's own process, count 0) must return 0",
+            )?;
+        }
+        set_task(LEADER_TASK);
+        expect(
+            call(Syscall::MigratePages.raw(), a3(ABSENT, 64, mask, mask)),
+            ESRCH,
+            "migrate_pages(unused pid) must be ESRCH",
+        )?;
+        expect(
+            call(Syscall::MovePages.raw(), a4(ABSENT, 0, 0, 0, 0)),
+            ESRCH,
+            "move_pages(unused pid) must be ESRCH",
+        )?;
+        expect(
+            call(Syscall::MovePages.raw(), a4(SIB_TASK, 0, 0, 0, 0)),
+            ESRCH,
+            "move_pages accepted a raw TaskId",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_migrate_move_pages_non_leader);
+
+/// Six-argument form (`process_vm_readv`).
+fn a5(arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> SyscallArgs {
+    SyscallArgs {
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        arg5,
+    }
+}
+
+// ── process_vm_readv — mm/process_vm_access.c:197 find_get_task_by_vpid,
+// after the iovec imports (:273-283) ─────────────────────────────────────
+fn smoke_abi_tid_process_vm_readv_non_leader() -> TestResult {
+    with_groups(|| {
+        install_test_address_space()?;
+        let src = [0x5au8; 8];
+        let mut dst = [0u8; 8];
+        let liov = [dst.as_mut_ptr() as u64, 8u64];
+        let riov = [src.as_ptr() as u64, 8u64];
+        let l = liov.as_ptr() as u64;
+        let r = riov.as_ptr() as u64;
+        set_task(LEADER_TASK);
+        expect(
+            call(Syscall::ProcessVmReadv.raw(), a5(SIB_TID, l, 1, r, 1, 0)),
+            8,
+            "process_vm_readv(non-leader tid of the caller's process) must copy",
+        )?;
+        if dst != src {
+            return Err("process_vm_readv reported 8 bytes but copied something else");
+        }
+        set_task(SIB_TASK);
+        expect(
+            call(Syscall::ProcessVmReadv.raw(), a5(SIB_TID, l, 1, r, 1, 0)),
+            8,
+            "process_vm_readv(own non-leader tid) must copy",
+        )?;
+        // An empty local iovec returns 0 before the task lookup (:276).
+        expect(
+            call(Syscall::ProcessVmReadv.raw(), a5(ABSENT, l, 0, r, 1, 0)),
+            0,
+            "process_vm_readv with an empty local iovec must return 0 before the lookup",
+        )?;
+        expect(
+            call(Syscall::ProcessVmReadv.raw(), a5(ABSENT, l, 1, r, 1, 0)),
+            ESRCH,
+            "process_vm_readv(unused pid) must be ESRCH",
+        )?;
+        expect(
+            call(Syscall::ProcessVmReadv.raw(), a5(SIB_TASK, l, 1, r, 1, 0)),
+            ESRCH,
+            "process_vm_readv accepted a raw TaskId",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_process_vm_readv_non_leader);
+
 // ── tkill / tgkill / rt_tgsigqueueinfo — kernel/signal.c:4168, :4184, :4231:
 // `pid <= 0 (|| tgid <= 0)` is EINVAL; then do_send_specific's
 // find_task_by_vpid (ESRCH) precedes check_kill_permission (EINVAL sig).

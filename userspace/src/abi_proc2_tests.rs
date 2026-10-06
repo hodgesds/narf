@@ -1580,15 +1580,19 @@ fn smoke_abi_proc2_process_vm_rejects_unmapped_inner_pid() -> TestResult {
         crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
         set_task(MANAGER_TASK);
 
-        // Inner pid 999 is not bound in the manager's namespace.
+        // Inner pid 999 is not bound in the manager's namespace. Both iovecs
+        // are non-empty: with nothing to copy Linux returns 0 before it ever
+        // looks the task up (mm/process_vm_access.c:276, :182).
+        let mut byte = [0u8; 1];
+        let iov = [byte.as_mut_ptr() as u64, 1u64];
         let r = call_raw(
             Syscall::ProcessVmReadv.raw(),
             SyscallArgs {
                 arg0: 999,
-                arg1: 0,
-                arg2: 0,
-                arg3: 0,
-                arg4: 0,
+                arg1: iov.as_ptr() as u64,
+                arg2: 1,
+                arg3: iov.as_ptr() as u64,
+                arg4: 1,
                 arg5: 0,
             },
         );
