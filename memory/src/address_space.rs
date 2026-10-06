@@ -12573,6 +12573,40 @@ impl AddressSpace {
             .cloned()
     }
 
+    /// Permissions of the VMA covering `vaddr` and the resident 4 KiB frame
+    /// backing its page (`PhysAddr(0)` when the page is not resident).
+    ///
+    /// Read-only and allocation-free — unlike [`Self::lookup`], which clones
+    /// the whole backing vector. This is what `get_futex_key` needs to tell a
+    /// private mapping (keyed by mm + address) from a `SHARED` one (keyed by
+    /// the backing object), on the futex hot path. A `SHARED` frame is never
+    /// migrated (`relocate_page_inner` / `migrate_frame_multi` refuse it) nor
+    /// swapped (`swap_out_private_batch` refuses it), so the frame returned
+    /// for a SHARED page is stable for as long as any VMA maps it.
+    pub fn page_backing(&self, vaddr: VirtAddr) -> Option<(RegionPerms, PhysAddr)> {
+        let address = vaddr.raw();
+        {
+            let regions = self.regions.lock();
+            if let Some(region) = regions.containing(address) {
+                let index = ((address - region.base.raw()) / 4096) as usize;
+                return Some((region.perms, region.backing_at(index)));
+            }
+        }
+        let huge = self.huge_regions.lock();
+        let region = huge.iter().find(|region| {
+            address >= region.base.raw() && address - region.base.raw() < region.len
+        })?;
+        let offset = address - region.base.raw();
+        let phys = region.frames.first().and_then(|first| {
+            let size = first.size_bytes();
+            region
+                .frames
+                .get((offset / size) as usize)
+                .map(|frame| PhysAddr::new(frame.phys() + ((offset % size) & !4095)))
+        });
+        Some((region.perms, phys.unwrap_or(PhysAddr::new(0))))
+    }
+
     /// Retain the resident RAM page covering `vaddr` while its authoritative
     /// mapping lock still excludes unmap, replacement, COW and reclaim.
     /// Lazy pages must first be faulted in by the caller's guarded user access.

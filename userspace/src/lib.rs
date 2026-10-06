@@ -102,6 +102,7 @@ mod abi_fdio_tests;
 mod abi_filemap_tests;
 mod abi_fsx2_tests;
 mod abi_fsx_tests;
+mod abi_futex_tests;
 mod abi_inode_identity_tests;
 mod abi_ioerrno_tests;
 mod abi_ipc_tests;

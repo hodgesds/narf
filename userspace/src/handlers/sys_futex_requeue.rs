@@ -97,10 +97,13 @@ pub(crate) fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
         }
     }
     if src != 0 {
-        let namespace = futex_namespace((entries[0].flags & FUTEX_PRIVATE) != 0);
         // Flags-aware: a FUTEX2_NUMA/MPOL source hashes by node, so the wake
         // must derive the same key the waiter registered under.
-        let key = match get_futex_key_flags(namespace, src, entries[0].flags) {
+        let key = match get_futex_key_flags(
+            (entries[0].flags & FUTEX_PRIVATE) != 0,
+            src,
+            entries[0].flags,
+        ) {
             Ok(k) => k,
             Err(errno) => {
                 ctx.set_return(SyscallReturn::ok((-errno) as u64));

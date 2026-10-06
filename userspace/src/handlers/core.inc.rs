@@ -5267,8 +5267,13 @@ pub(crate) fn robust_list_exit_walk(tid: u64) {
         let new = (word & FUTEX_WAITERS_BIT) | FUTEX_OWNER_DIED;
         // SAFETY: copy_to_user range-validates + SMAP-brackets the write.
         let _ = unsafe { copy_to_user(uaddr, &new.to_le_bytes()) };
-        futex_bump_counter(uaddr);
-        futex_wake_waiters(uaddr, 1);
+        // `handle_futex_death`: `futex_wake(uaddr, FLAGS_SIZE_32 |
+        // FLAGS_SHARED, 1, FUTEX_BITSET_MATCH_ANY)` — a SHARED wake, keyed
+        // by `get_futex_key` in the dying task's (still current) mm.
+        if let Ok(key) = get_futex_key(false, uaddr) {
+            futex_bump_counter_key(key);
+            futex_wake_waiters_key(key, 1);
+        }
     };
 
     // Walk the list. Termination: `next == head` (the head's own list
@@ -10564,6 +10569,25 @@ struct ClearChildTidEntry {
     as_root: narf_memory::PhysAddr,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     futex_namespace: u64,
+    /// The key `mm_release`'s `do_futex(tidptr, FUTEX_WAKE, 1, ...)` — a
+    /// SHARED op — resolves to: `(mm, address)` + `FUT_OFF_MMSHARED` for the
+    /// usual private mapping, the object key for a `MAP_SHARED` one.
+    /// Resolved at registration, while the mm can still be consulted.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    shared_key: FutexKey,
+}
+
+/// The SHARED-op key of the ctid word `uaddr` in `space` (see
+/// [`ClearChildTidEntry::shared_key`]). Outside the owning task's syscall the
+/// page cannot be faulted in, so a non-resident or unmapped word falls back
+/// to the mm key — what Linux would compute for a private mapping.
+fn clear_child_tid_shared_key(space: &Arc<AddressSpace>, uaddr: u64) -> FutexKey {
+    futex_shared_key_in(space, uaddr, false).unwrap_or_else(|_| {
+        futex_key(
+            futex_namespace_for_address_space(space) | FUTEX_NS_MMSHARED,
+            uaddr,
+        )
+    })
 }
 
 static CLEAR_CHILD_TID: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, ClearChildTidEntry>>> =
@@ -10579,10 +10603,16 @@ pub fn clear_child_tid_init() {
 }
 
 fn set_clear_child_tid(task_id_raw: u64, uaddr: u64) {
-    let (as_root, futex_namespace) = current_address_space()
-        .map(|space| (space.root, futex_namespace_for_address_space(&space)))
-        .unwrap_or((narf_memory::PhysAddr::new(0), 0));
-    set_clear_child_tid_with_as(task_id_raw, uaddr, as_root, futex_namespace);
+    let (as_root, futex_namespace, shared_key) = current_address_space()
+        .map(|space| {
+            (
+                space.root,
+                futex_namespace_for_address_space(&space),
+                clear_child_tid_shared_key(&space, uaddr),
+            )
+        })
+        .unwrap_or((narf_memory::PhysAddr::new(0), 0, futex_key(0, uaddr)));
+    set_clear_child_tid_with_as(task_id_raw, uaddr, as_root, futex_namespace, shared_key);
 }
 
 fn set_clear_child_tid_with_as(
@@ -10590,6 +10620,7 @@ fn set_clear_child_tid_with_as(
     uaddr: u64,
     as_root: narf_memory::PhysAddr,
     futex_namespace: u64,
+    shared_key: FutexKey,
 ) {
     let mut g = CLEAR_CHILD_TID.lock();
     if g.is_none() {
@@ -10605,6 +10636,7 @@ fn set_clear_child_tid_with_as(
                     uaddr,
                     as_root,
                     futex_namespace,
+                    shared_key,
                 },
             );
         }
@@ -10620,7 +10652,10 @@ fn take_clear_child_tid(task_id_raw: u64) -> Option<ClearChildTidEntry> {
 /// Test-only: install a clear_child_tid entry with an explicit private-futex
 /// namespace and no AS root (the exit path then skips the word write but still
 /// fires the wake), modelling a real thread whose private namespace is a live
-/// AddressSpace Arc pointer (always nonzero in production).
+/// AddressSpace Arc pointer (always nonzero in production). The word is taken
+/// to sit in a private mapping, so its SHARED-op key is the mm key
+/// (`futex_namespace | FUT_OFF_MMSHARED`, see
+/// [`__test_futex_mmshared_namespace`]).
 #[doc(hidden)]
 pub fn __test_set_clear_child_tid_scoped(task_id_raw: u64, uaddr: u64, futex_namespace: u64) {
     set_clear_child_tid_with_as(
@@ -10628,7 +10663,15 @@ pub fn __test_set_clear_child_tid_scoped(task_id_raw: u64, uaddr: u64, futex_nam
         uaddr,
         narf_memory::PhysAddr::new(0),
         futex_namespace,
+        futex_key(futex_namespace | FUTEX_NS_MMSHARED, uaddr),
     );
+}
+
+/// Test-only: the namespace a SHARED futex op on a PRIVATE mapping of the mm
+/// whose private namespace is `private_ns` is keyed under.
+#[doc(hidden)]
+pub fn __test_futex_mmshared_namespace(private_ns: u64) -> u64 {
+    private_ns | FUTEX_NS_MMSHARED
 }
 
 /// Diagnostic / test-only — inspect a task's clear_child_tid slot
@@ -10725,7 +10768,7 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     //
     // Wake BOTH namespaces. Linux's mm_release fires the exit wake as
     // `do_futex(tidptr, FUTEX_WAKE, 1, ...)` with NO FUTEX_PRIVATE_FLAG
-    // (kernel/fork.c) — i.e. SHARED (namespace 0) — and glibc's pthread_join
+    // (kernel/fork.c) — i.e. SHARED (`entry.shared_key`) — and glibc's pthread_join
     // (`lll_futex_wait` on `__default_pthread_attr`-cleared child_tid) and
     // musl's `__tl_lock` both wait SHARED on that word. Waking only the
     // recorded private namespace therefore missed every glibc/musl joiner and
@@ -10746,10 +10789,14 @@ fn fire_clear_child_tid_on_exit(_pid_raw: u64, tid_raw: u64) {
     // thread; see `futex_wake_one_key_spread` for why a direct handoff
     // here re-serializes the whole exit storm.
     let _ = futex_wake_one_key_spread(key);
-    if entry.futex_namespace != 0 {
-        let shared_key = futex_key(0, uaddr);
-        futex_bump_counter_key(shared_key);
-        let _ = futex_wake_one_key_spread(shared_key);
+    // The Linux wake itself: SHARED, keyed the way `get_futex_key` keys the
+    // word for a shared op — per-mm (FUT_OFF_MMSHARED) for a private
+    // mapping, by object for a MAP_SHARED one. NOT a global by-address key:
+    // that let one process's thread exit consume a wake meant for another
+    // process's waiter at the same address.
+    if entry.shared_key != key {
+        futex_bump_counter_key(entry.shared_key);
+        let _ = futex_wake_one_key_spread(entry.shared_key);
     }
 }
 
@@ -11444,6 +11491,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // clear_child_tid futex word after the slot is reaped.
     let child_as_root = child_as.root;
     let child_futex_namespace = futex_namespace_for_address_space(&child_as);
+    let child_ctid_shared_key = clear_child_tid_shared_key(&child_as, ca.child_tid);
     // A new thread joins the group — bump `signal->live` BEFORE the
     // child is spawned/enqueued. Under SMP another CPU can pick up and
     // EXIT the child the instant it's runnable; a not-yet-counted first
@@ -11748,6 +11796,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
             ca.child_tid,
             child_as_root,
             child_futex_namespace,
+            child_ctid_shared_key,
         );
     }
 

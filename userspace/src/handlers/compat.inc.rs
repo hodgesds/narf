@@ -8339,9 +8339,8 @@ const FUTEX_CMP_REQUEUE: u64 = 4;
 /// deadlocked at startup (the kcalc QtWayland-init hang).
 const FUTEX_WAKE_OP: u64 = 5;
 /// `FUTEX_WAIT_BITSET` (9) / `FUTEX_WAKE_BITSET` (10): wait/wake gated by
-/// a 32-bit bitmask. NARF's wait queue is per-uaddr (not per-bit), so we
-/// treat them as plain WAIT/WAKE — a superset wake is always safe, and
-/// the common musl/glibc callers pass FUTEX_BITSET_MATCH_ANY.
+/// a 32-bit bitmask. The waiter's bitset is queued with it, and a wake takes
+/// only waiters whose bitset intersects its own (`futex_wake`).
 const FUTEX_WAIT_BITSET: u64 = 9;
 const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE: u64 = 0x80;
@@ -8393,8 +8392,8 @@ fn futex_timeout_deadline(
 /// `nr_wake`/`nr_wake2` = arg2/arg3, `uaddr2` = arg4, `encoded_op` = arg5.
 /// Returns the syscall result (total woken, or a negative errno).
 fn futex_wake_op(
-    namespace: u64,
-    uaddr: u64,
+    private: bool,
+    key: FutexKey,
     nr_wake: u32,
     nr_wake2: u32,
     uaddr2: u64,
@@ -8409,7 +8408,7 @@ fn futex_wake_op(
     // -EINVAL and an unmapped one -EFAULT *before* any RMW work happens —
     // and it is what lets the RMW below assume 4-byte alignment, which
     // aarch64's `ldxr` requires outright.
-    let key2 = match get_futex_key(namespace, uaddr2) {
+    let key2 = match get_futex_key(private, uaddr2) {
         Ok(k) => k,
         Err(e) => return -e,
     };
@@ -8472,8 +8471,9 @@ fn futex_wake_op(
             Err(e) => return -(e as i64),
         }
     };
-    // Wake `nr_wake` on uaddr unconditionally.
-    let key = futex_key(namespace, uaddr);
+    // Wake `nr_wake` on uaddr unconditionally. `key` is the caller's
+    // `get_futex_key` result — rebuilding it from the address here would key
+    // a shared-object futex by VA.
     futex_bump_counter_key(key);
     let mut woken = futex_wake_waiters_key(key, nr_wake) as i64;
     // Conditionally wake `nr_wake2` on uaddr2 if (oldval CMP cmparg).
@@ -8510,7 +8510,18 @@ fn sign_extend_12(value: u32) -> i32 {
 /// keeps the implementation lock-free except for the table mutation.
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct FutexKey {
+    /// Which object the key names, with its kind in the low three bits
+    /// (`FUTEX_NS_KIND_MASK`): an `Arc<AddressSpace>` pointer (kind 0, a
+    /// `FUTEX_PRIVATE` op), that pointer `| FUTEX_NS_MMSHARED` (a shared op
+    /// on a private mapping), or one of the object kinds below.
     namespace: u64,
+    /// Object identity for the object kinds (`[st_dev, st_ino]` for an
+    /// inode key, `[0, backing identity]` for an inode-less file object);
+    /// zero for the mm-scoped kinds.
+    object: [u64; 2],
+    /// The address inside the object: the user virtual address for the
+    /// mm-scoped kinds, the absolute file offset for a file key, the
+    /// physical address of the word for an anonymous shared key.
     uaddr: u64,
     /// `key->both.node`. `FUTEX_NO_NODE` (-1) for every futex that did not
     /// ask for NUMA/MPOL hashing, which is all of the classic `futex(2)`
@@ -8529,6 +8540,7 @@ pub(crate) struct FutexKey {
 pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
     FutexKey {
         namespace,
+        object: [0; 2],
         uaddr,
         node: handler_sys_futex_wait::FUTEX_NO_NODE,
     }
@@ -8573,10 +8585,10 @@ pub(crate) fn futex2_word_span(flags: u64) -> u64 {
     }
 }
 
-pub(crate) fn get_futex_key(namespace: u64, uaddr: u64) -> Result<FutexKey, i64> {
+pub(crate) fn get_futex_key(private: bool, uaddr: u64) -> Result<FutexKey, i64> {
     // The classic `futex(2)` ABI has no width or NUMA bits: it is always a
     // single 32-bit word with no node.
-    get_futex_key_flags(namespace, uaddr, handler_sys_futex_wait::FUTEX2_SIZE_U32)
+    get_futex_key_flags(private, uaddr, handler_sys_futex_wait::FUTEX2_SIZE_U32)
 }
 
 /// `get_futex_key()` for the futex2 ABI, which can ask for NUMA and MPOL
@@ -8588,7 +8600,7 @@ pub(crate) fn get_futex_key(namespace: u64, uaddr: u64) -> Result<FutexKey, i64>
 /// (-EINVAL) before accessibility (-EFAULT), then the node word's own
 /// readability (-EFAULT) before its validity (-EINVAL).
 pub(crate) fn get_futex_key_flags(
-    namespace: u64,
+    private: bool,
     uaddr: u64,
     flags: u64,
 ) -> Result<FutexKey, i64> {
@@ -8644,11 +8656,27 @@ pub(crate) fn get_futex_key_flags(
             }
         }
     }
-    Ok(FutexKey {
-        namespace,
-        uaddr,
-        node,
-    })
+    // `if (!fshared) { key->private.mm = mm; key->private.address = address;
+    // return 0; }` — a FUTEX_PRIVATE op never looks at the VMA. Only a
+    // shared op resolves what backs the word.
+    let base = if private {
+        FutexKey {
+            namespace: current_address_space()
+                .map(|space| futex_namespace_for_address_space(&space))
+                .unwrap_or(0),
+            object: [0; 2],
+            uaddr,
+            node,
+        }
+    } else {
+        match current_address_space() {
+            Some(space) => futex_shared_key_in(&space, uaddr, true)?,
+            // No mm at all: only the kernel-test harness runs syscalls like
+            // that, and it has nothing to resolve a mapping against.
+            None => futex_key(0, uaddr),
+        }
+    };
+    Ok(FutexKey { node, ..base })
 }
 
 /// Namespace for a futex operation. Private futexes are scoped to the live
@@ -8658,13 +8686,190 @@ fn futex_namespace_for_address_space(space: &Arc<AddressSpace>) -> u64 {
     Arc::as_ptr(space) as usize as u64
 }
 
-fn futex_namespace(private: bool) -> u64 {
-    if !private {
-        return 0;
+/// Low bits of [`FutexKey::namespace`] that carry the key KIND. An
+/// `Arc<AddressSpace>` pointer is at least 8-aligned, so a namespace with any
+/// of these bits set can never equal an mm namespace — an object key can
+/// never collide with a private one.
+const FUTEX_NS_KIND_MASK: u64 = 7;
+/// `FUT_OFF_MMSHARED`: a SHARED op on a word in a PRIVATE mapping. Linux keys
+/// it `(mm, address)` like a private op but with this flag in `offset`, so a
+/// private op and a shared op on the same word are DIFFERENT futexes
+/// (`futex_match` compares `offset` too).
+const FUTEX_NS_MMSHARED: u64 = 1;
+/// Anonymous shared memory (`MAP_SHARED|MAP_ANONYMOUS`, System V shm): the
+/// key is the physical address of the word. Linux keys these by their shmem
+/// inode + page index; NARF's anonymous shared backing has no inode, but its
+/// frames are pinned to the object for the object's life — SHARED frames are
+/// never migrated or swapped (`AddressSpace::page_backing`) — so the frame
+/// identifies the object page exactly, across fork and across processes.
+const FUTEX_NS_SHARED_PHYS: u64 = 2;
+/// A file-backed `MAP_SHARED` mapping (memfd, tmpfs, device, page cache):
+/// `FUT_OFF_INODE`, keyed `[st_dev, st_ino]` + absolute file offset.
+const FUTEX_NS_SHARED_INODE: u64 = 3;
+/// A file object that reports no inode number: keyed by its mmap backing
+/// identity + file offset instead.
+const FUTEX_NS_SHARED_FILEOBJ: u64 = 5;
+
+/// Whether `namespace` is mm-scoped (private op, or shared op on a private
+/// mapping) — i.e. whether a key's address component is the user VA.
+#[inline]
+fn futex_ns_is_mm_scoped(namespace: u64) -> bool {
+    namespace & FUTEX_NS_KIND_MASK <= FUTEX_NS_MMSHARED
+}
+
+/// Publish a FUTEX_WAIT park target: the word to re-read (`uaddr`, in the
+/// waiter's own mm), the key to queue on, and the waiter's bitset.
+/// `futex_uaddr` is stored LAST — it is the "parked" flag the park loop
+/// keys off, so the rest of the key must be visible before it.
+pub(crate) fn futex_park_publish(
+    uc: &crate::user_task::UserTaskCtx,
+    uaddr: u64,
+    key: FutexKey,
+    bitset: u32,
+) {
+    futex_park_store_key(uc, key, bitset);
+    uc.futex_uaddr.store(uaddr, Ordering::Release);
+}
+
+fn futex_park_store_key(uc: &crate::user_task::UserTaskCtx, key: FutexKey, bitset: u32) {
+    uc.futex_key_object[0].store(key.object[0], Ordering::Release);
+    uc.futex_key_object[1].store(key.object[1], Ordering::Release);
+    uc.futex_key_addr.store(key.uaddr, Ordering::Release);
+    uc.futex_key_meta.store(
+        (u64::from(bitset) << 32) | u64::from((key.node as u32).wrapping_add(1)),
+        Ordering::Release,
+    );
+    uc.futex_namespace.store(key.namespace, Ordering::Release);
+}
+
+/// The key a parked task is queued under, or `None` when it is not
+/// futex-parked. The single decoder of the park fields — every register,
+/// drop and census path goes through it, so none of them can rebuild a
+/// shared key from the user VA (which names nothing for an object key).
+pub(crate) fn futex_park_key(uc: &crate::user_task::UserTaskCtx) -> Option<FutexKey> {
+    let uaddr = uc.futex_uaddr.load(Ordering::Acquire);
+    if uaddr == 0 {
+        return None;
     }
-    current_address_space()
-        .map(|space| futex_namespace_for_address_space(&space))
-        .unwrap_or(0)
+    Some(futex_park_key_parts(uc, uaddr).0)
+}
+
+/// `(key, bitset)` of the park target, for a known non-zero `uaddr`.
+fn futex_park_key_parts(uc: &crate::user_task::UserTaskCtx, uaddr: u64) -> (FutexKey, u32) {
+    let namespace = uc.futex_namespace.load(Ordering::Acquire);
+    let meta = uc.futex_key_meta.load(Ordering::Acquire);
+    let node = (meta as u32).wrapping_sub(1) as i32;
+    let bitset = match (meta >> 32) as u32 {
+        // A zero bitset never parks (`if (!bitset) return -EINVAL`), so zero
+        // means "never published" — a plain FUTEX_WAIT.
+        0 => FUTEX_BITSET_MATCH_ANY,
+        b => b,
+    };
+    let key = if futex_ns_is_mm_scoped(namespace) {
+        FutexKey {
+            namespace,
+            object: [0; 2],
+            uaddr,
+            node,
+        }
+    } else {
+        FutexKey {
+            namespace,
+            object: [
+                uc.futex_key_object[0].load(Ordering::Acquire),
+                uc.futex_key_object[1].load(Ordering::Acquire),
+            ],
+            uaddr: uc.futex_key_addr.load(Ordering::Acquire),
+            node,
+        }
+    };
+    (key, bitset)
+}
+
+/// The shared-op half of `kernel/futex/core.c::get_futex_key`, against
+/// `space`: which object the word at `uaddr` lives in.
+///
+///   * PRIVATE mapping (anonymous, heap, stack, `MAP_PRIVATE` file):
+///     `(mm, address)` + `FUT_OFF_MMSHARED` — per process, never shared
+///     with another mm that happens to use the same address.
+///   * `MAP_SHARED` file (memfd, tmpfs, device): `(inode, file offset)`, so
+///     every mapping of the object, at any address, in any process, is one
+///     futex.
+///   * anonymous `MAP_SHARED` / SysV shm: the physical word (see
+///     [`FUTEX_NS_SHARED_PHYS`]).
+///
+/// Linux runs `get_user_pages_fast` here, which faults the page in and fails
+/// with -EFAULT when nothing is mapped. `may_fault` lets the syscall path do
+/// the same for a not-yet-resident shared page; the exit and clone paths,
+/// which run outside the owning mm, pass `false` and settle for the mm key.
+///
+/// LINUX-GAP: a READ-ONLY `MAP_PRIVATE` file page that was never COW-broken
+/// is still a page-cache page on Linux and gets an inode key; NARF backs
+/// every private file page with a private frame, so it gets the mm key.
+pub(crate) fn futex_shared_key_in(
+    space: &Arc<AddressSpace>,
+    uaddr: u64,
+    may_fault: bool,
+) -> Result<FutexKey, i64> {
+    let mm_key = || FutexKey {
+        namespace: futex_namespace_for_address_space(space) | FUTEX_NS_MMSHARED,
+        object: [0; 2],
+        uaddr,
+        node: handler_sys_futex_wait::FUTEX_NO_NODE,
+    };
+    let mut faulted = false;
+    loop {
+        let Some((perms, phys)) = space.page_backing(VirtAddr::new(uaddr)) else {
+            // A kernel-half word is only reachable under the kernel-test
+            // buffer opt-in; it has no VMA by construction.
+            if uaddr >= AddressSpace::USER_HALF_END {
+                return Ok(mm_key());
+            }
+            // `get_user_pages_fast` on an unmapped address.
+            return Err(EFAULT);
+        };
+        if !perms.contains(narf_memory::RegionPerms::SHARED) {
+            return Ok(mm_key());
+        }
+        if let Some((ops, offset)) = crate::mapped_file::shared_file_at(space.identity(), uaddr) {
+            let ino = ops.ino();
+            return Ok(if ino != 0 {
+                FutexKey {
+                    namespace: FUTEX_NS_SHARED_INODE,
+                    object: [ops.inode_attrs().dev, ino],
+                    uaddr: offset,
+                    node: handler_sys_futex_wait::FUTEX_NO_NODE,
+                }
+            } else {
+                FutexKey {
+                    namespace: FUTEX_NS_SHARED_FILEOBJ,
+                    object: [0, ops.mmap_backing_identity() as u64],
+                    uaddr: offset,
+                    node: handler_sys_futex_wait::FUTEX_NO_NODE,
+                }
+            });
+        }
+        if phys.raw() != 0 {
+            return Ok(FutexKey {
+                namespace: FUTEX_NS_SHARED_PHYS,
+                object: [0; 2],
+                uaddr: phys.raw() + (uaddr & 0xfff),
+                node: handler_sys_futex_wait::FUTEX_NO_NODE,
+            });
+        }
+        if !may_fault || faulted {
+            return Ok(mm_key());
+        }
+        // Fault the shared page in (the guarded user read demand-backs it)
+        // and look again, as `get_user_pages_fast` would.
+        faulted = true;
+        let mut b = [0u8; 4];
+        // SAFETY: range-validated by the caller; copy_from_user faults the
+        // page in through the normal demand path and SMAP-brackets the read.
+        if unsafe { copy_from_user(&mut b, uaddr) }.is_err() {
+            return Err(EFAULT);
+        }
+    }
 }
 
 const FUTEX_BUCKET_COUNT: usize = 64;
@@ -8674,6 +8879,9 @@ fn futex_bucket_index(key: FutexKey) -> usize {
     // Futex words are normally 4-byte aligned and adjacent words are common,
     // so mix rather than masking the low address bits directly.
     let mut x = key.uaddr ^ key.namespace.rotate_left(17);
+    // Object keys only; zero for every mm-scoped key, which therefore hashes
+    // exactly as before object keys existed.
+    x ^= key.object[0].rotate_left(29) ^ key.object[1].rotate_left(7);
     // Only a futex that actually named a node perturbs the index. Linux
     // selects a per-node bucket ARRAY rather than stirring the index, so a
     // no-node futex — every classic `futex(2)` — must hash exactly as it did
@@ -8785,7 +8993,18 @@ pub fn __test_futex_bump_counter(uaddr: u64) {
 /// loop otherwise re-parks every ~1ms (no early wake), so a contended pthread
 /// lock handoff cost ~1ms. Keyed by task id so a re-registering waiter
 /// overwrites its own slot (bounded) and `futex_drop_waiter` can remove it.
-type FutexWaiterSet = alloc::collections::BTreeMap<u64, core::task::Waker>;
+type FutexWaiterSet = alloc::collections::BTreeMap<u64, FutexWaiter>;
+
+/// `FUTEX_BITSET_MATCH_ANY` — the bitset of every plain FUTEX_WAIT/WAKE.
+pub(crate) const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
+
+/// One queued waiter: its waker and its `futex_q::bitset`.
+struct FutexWaiter {
+    waker: core::task::Waker,
+    /// `futex_wake` takes this waiter only when `bitset & wake_bitset != 0`
+    /// (`kernel/futex/waitwake.c`); requeue and wake_op ignore it.
+    bitset: u32,
+}
 type FutexWaiterMap = alloc::collections::BTreeMap<FutexKey, FutexWaiterSet>;
 
 #[repr(align(64))]
@@ -8817,10 +9036,7 @@ fn futex_drop_task_waiters(task_id: u64) {
     // registration this task can own sits under its CURRENT park key. The
     // old shape swept all 256 bucket locks per task exit; a 1000-thread
     // exit storm hammered those global locks from every CPU at once.
-    let key = crate::user_task::with_user_task_ctx(task_id, |uc| {
-        let uaddr = uc.futex_uaddr.load(Ordering::Acquire);
-        (uaddr != 0).then(|| futex_key(uc.futex_namespace.load(Ordering::Acquire), uaddr))
-    });
+    let key = crate::user_task::with_user_task_ctx(task_id, futex_park_key);
     match key {
         Some(Some(key)) => futex_drop_waiter_key(key, task_id),
         // Not parked: nothing registered, nothing to sweep.
@@ -8854,12 +9070,22 @@ pub fn futex_register_waiter(uaddr: u64, task_id: u64, waker: core::task::Waker)
 }
 
 pub(crate) fn futex_register_waiter_key(key: FutexKey, task_id: u64, waker: core::task::Waker) {
+    futex_register_waiter_key_bitset(key, task_id, waker, FUTEX_BITSET_MATCH_ANY);
+}
+
+/// [`futex_register_waiter_key`] for a `FUTEX_WAIT_BITSET` / futex2 waiter.
+pub(crate) fn futex_register_waiter_key_bitset(
+    key: FutexKey,
+    task_id: u64,
+    waker: core::task::Waker,
+    bitset: u32,
+) {
     futex_wait_bucket(key)
         .values
         .lock()
         .entry(key)
         .or_default()
-        .insert(task_id, waker);
+        .insert(task_id, FutexWaiter { waker, bitset });
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
@@ -8888,6 +9114,14 @@ fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
 }
 
 pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
+    futex_wake_waiters_key_bitset(key, n, FUTEX_BITSET_MATCH_ANY)
+}
+
+/// `kernel/futex/waitwake.c::futex_wake`: wake up to `n` waiters on `key`
+/// whose bitset intersects `bitset`. A non-matching waiter is skipped — it
+/// stays queued and does not count toward `n` — and the return value is the
+/// number actually woken.
+pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) -> usize {
     // FUTEX_WAKE(..., 1) is the overwhelmingly common mutex/condvar handoff
     // (and stress-ng's futex hot path). Avoid allocating both a key vector and
     // an output vector for that single waiter. The waker still fires only after
@@ -8897,8 +9131,11 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
         let waiter = {
             let mut values = futex_wait_bucket(key).values.lock();
             let waiter = values.get_mut(&key).and_then(|set| {
-                let tid = set.keys().next().copied()?;
-                set.remove(&tid).map(|waker| (tid, waker))
+                let tid = set
+                    .iter()
+                    .find(|(_, w)| w.bitset & bitset != 0)
+                    .map(|(tid, _)| *tid)?;
+                set.remove(&tid).map(|w| (tid, w.waker))
             });
             if values.get(&key).is_some_and(|set| set.is_empty()) {
                 values.remove(&key);
@@ -8917,12 +9154,18 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
         let Some(set) = values.get_mut(&key) else {
             return 0;
         };
-        // BTreeMap has no pop; collect the first `n` keys then remove them.
-        let take: alloc::vec::Vec<u64> = set.keys().take(n as usize).copied().collect();
+        // BTreeMap has no pop; collect the first `n` matching keys then
+        // remove them.
+        let take: alloc::vec::Vec<u64> = set
+            .iter()
+            .filter(|(_, w)| w.bitset & bitset != 0)
+            .map(|(tid, _)| *tid)
+            .take(n as usize)
+            .collect();
         let mut out = alloc::vec::Vec::with_capacity(take.len());
         for tid in take {
             if let Some(w) = set.remove(&tid) {
-                out.push((tid, w));
+                out.push((tid, w.waker));
             }
         }
         if set.is_empty() {
@@ -8960,7 +9203,7 @@ pub(crate) fn futex_wake_one_key_spread(key: FutexKey) -> usize {
         let mut values = futex_wait_bucket(key).values.lock();
         let waiter = values.get_mut(&key).and_then(|set| {
             let tid = set.keys().next().copied()?;
-            set.remove(&tid).map(|waker| (tid, waker))
+            set.remove(&tid).map(|w| (tid, w.waker))
         });
         if values.get(&key).is_some_and(|set| set.is_empty()) {
             values.remove(&key);
@@ -9013,7 +9256,7 @@ fn futex_take_waiters(
     values: &mut FutexWaiterMap,
     key: FutexKey,
     n: u32,
-) -> alloc::vec::Vec<(u64, core::task::Waker)> {
+) -> alloc::vec::Vec<(u64, FutexWaiter)> {
     let Some(set) = values.get_mut(&key) else {
         return alloc::vec::Vec::new();
     };
@@ -9033,12 +9276,13 @@ fn futex_take_waiters(
 fn futex_insert_waiters(
     values: &mut FutexWaiterMap,
     key: FutexKey,
-    movers: alloc::vec::Vec<(u64, core::task::Waker)>,
+    movers: alloc::vec::Vec<(u64, FutexWaiter)>,
 ) -> alloc::vec::Vec<u64> {
     let mut tids = alloc::vec::Vec::with_capacity(movers.len());
     let dst = values.entry(key).or_default();
-    for (tid, waker) in movers {
-        dst.insert(tid, waker);
+    for (tid, waiter) in movers {
+        // `requeue_futex` moves the futex_q, bitset and all.
+        dst.insert(tid, waiter);
         tids.push(tid);
     }
     tids
@@ -9096,7 +9340,16 @@ fn futex_requeue_waiters_keyed(
             uc.futex_park_seq.fetch_add(1, Ordering::AcqRel);
             uc.futex_park_gen.store(gen2, Ordering::Release);
             uc.futex_val.store(new_val, Ordering::Release);
-            uc.futex_namespace.store(key2.namespace, Ordering::Release);
+            // The mover keeps its bitset (`requeue_futex` moves the whole
+            // futex_q) but takes key2's object and node.
+            let (_, bitset) = futex_park_key_parts(uc, 1);
+            futex_park_store_key(uc, key2, bitset);
+            // NOTE: `uaddr2` is the REQUEUER's address of the destination
+            // word. For an object key a mover in another process may map
+            // that object elsewhere, so its word re-validation can read the
+            // wrong address — which only ever yields a spurious return
+            // (POSIX-permitted; libc re-checks the word), never a lost wake:
+            // the queue entry itself sits under key2.
             uc.futex_uaddr.store(uaddr2, Ordering::Release);
             uc.futex_park_seq.fetch_add(1, Ordering::Release);
         });
@@ -9166,8 +9419,8 @@ pub(crate) fn futex_park_register_and_check(
         clear(uc);
         return FutexParkCheck::Wake;
     }
-    let key = futex_key(uc.futex_namespace.load(Ordering::Acquire), fu);
-    futex_register_waiter_key(key, task_id, waker.clone());
+    let (key, bitset) = futex_park_key_parts(uc, fu);
+    futex_register_waiter_key_bitset(key, task_id, waker.clone(), bitset);
     if uc.futex_park_seq.load(Ordering::Acquire) != seq_before {
         // A requeue retargeted us between the field loads and the
         // registration — the entry we just inserted names the stale word.
@@ -9266,6 +9519,32 @@ pub fn __test_futex_register_waiter_scoped(
     futex_register_waiter_key(futex_key(namespace, uaddr), task_id, waker);
 }
 
+/// Test-only: queue `task_id` on `uaddr` exactly as a parked `FUTEX_WAIT`
+/// (or `FUTEX_WAIT_BITSET` with `bitset`) from the CURRENT address space
+/// would — the key comes from the same `get_futex_key` funnel the syscall
+/// uses. The kernel-test harness has no yield hook, so a real `FUTEX_WAIT`
+/// returns synchronously without queueing; this is the queueing half of it.
+#[doc(hidden)]
+pub fn __test_futex_register_current(
+    private: bool,
+    uaddr: u64,
+    bitset: u32,
+    task_id: u64,
+    waker: core::task::Waker,
+) -> Result<(), i64> {
+    let key = get_futex_key(private, uaddr)?;
+    futex_register_waiter_key_bitset(key, task_id, waker, bitset);
+    Ok(())
+}
+
+/// Test-only twin of [`__test_futex_register_current`]: unqueue `task_id`.
+#[doc(hidden)]
+pub fn __test_futex_drop_current(private: bool, uaddr: u64, task_id: u64) {
+    if let Ok(key) = get_futex_key(private, uaddr) {
+        futex_drop_waiter_key(key, task_id);
+    }
+}
+
 #[doc(hidden)]
 pub fn __test_futex_wake_scoped(namespace: u64, uaddr: u64, n: u32) -> usize {
     let key = futex_key(namespace, uaddr);
@@ -9288,6 +9567,10 @@ pub fn dbg_futex_waiter_registered(namespace: u64, uaddr: u64, tid: u64) -> bool
 }
 
 /// Fatal-path futex snapshot: `(live_generation, registered_waiters)`.
+///
+/// Exact for mm-scoped keys only. A shared op on a `MAP_SHARED` object is
+/// keyed by `(object, offset)` (see `futex_park_key`), which `(namespace,
+/// uaddr)` cannot name, so for those parks this reports the empty mm key.
 pub fn dbg_futex_state(namespace: u64, uaddr: u64) -> (u64, usize) {
     let key = futex_key(namespace, uaddr);
     let generation = futex_wake_counter_key(key);
@@ -9328,18 +9611,18 @@ pub fn futex_wake_waiters_for_test(uaddr: u64, n: u32) -> usize {
 /// to suit a fixture, which then pinned it in place.
 fn futex_wait_core(
     ctx: &mut dyn TrapContext,
-    namespace: u64,
     uaddr: u64,
     val: u32,
     park_cap_ns: u64,
     flags: u64,
+    bitset: u32,
 ) {
     // The address is validated ONLY here, by the shared funnel. This helper
     // used to carry its own `uaddr == 0` shortcut, so the FUTEX2 wait path
     // kept reporting a spurious wake for a null word after the classic
     // FUTEX_WAIT arm was corrected — the same bug in a second place, which
     // is what a duplicated special case buys.
-    let key = match get_futex_key_flags(namespace, uaddr, flags) {
+    let key = match get_futex_key_flags(flags & FUTEX_PRIVATE != 0, uaddr, flags) {
         Ok(k) => k,
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));
@@ -9389,8 +9672,7 @@ fn futex_wait_core(
             uc.futex_park_gen.store(gen, Ordering::Release);
             // Park-loop word re-validation snapshot (see sys_futex).
             uc.futex_val.store(val, Ordering::Release);
-            uc.futex_uaddr.store(uaddr, Ordering::Release);
-            uc.futex_namespace.store(namespace, Ordering::Release);
+            futex_park_publish(uc, uaddr, key, bitset);
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;

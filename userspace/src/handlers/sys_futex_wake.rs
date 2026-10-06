@@ -22,9 +22,7 @@ use super::*;
 ///
 /// Bumps the per-uaddr wake counter — every cooperative waiter parked on
 /// this word observes the bump on its next poll and re-arms — and reports
-/// the number of waiters released. NARF keeps no per-task wait ownership
-/// (the counter is the queue), so we report the `nr` the caller asked to
-/// wake, which the pthread fast paths treat as "≤ nr released".
+/// the number of waiters actually released, as `futex_wake` does.
 pub(crate) fn sys_futex_wake(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let uaddr = args.arg0;
@@ -69,8 +67,7 @@ pub(crate) fn sys_futex_wake(ctx: &mut dyn TrapContext) {
     // reaches a key for a null address; `get_futex_key`'s access_ok fails
     // first. A caller waking a corrupted or uninitialised futex pointer was
     // told it had successfully woken nobody.
-    let key = match get_futex_key_flags(futex_namespace((flags & FUTEX_PRIVATE) != 0), uaddr, flags)
-    {
+    let key = match get_futex_key_flags((flags & FUTEX_PRIVATE) != 0, uaddr, flags) {
         Ok(k) => k,
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));
@@ -87,9 +84,10 @@ pub(crate) fn sys_futex_wake(ctx: &mut dyn TrapContext) {
     // A negative count reaches `futex_wake`'s `if (++ret >= nr_wake) break;`
     // and stops after the first waiter, so it behaves as nr == 1.
     let want = if nr < 0 { 1u32 } else { nr as u32 };
-    // Bump the gen counter AND fire up to `want` parked waiters on the real
-    // queue (futex2 and classic futex share the same words / queue).
+    // Bump the gen counter AND fire up to `want` parked waiters whose bitset
+    // intersects `mask` on the real queue (futex2 and classic futex share the
+    // same words / queue). `futex_wake` returns the number it woke.
     futex_bump_counter_key(key);
-    let _ = futex_wake_waiters_key(key, want);
-    ctx.set_return(SyscallReturn::ok(want as u64))
+    let woken = futex_wake_waiters_key_bitset(key, want, args.arg1 as u32);
+    ctx.set_return(SyscallReturn::ok(woken as u64))
 }

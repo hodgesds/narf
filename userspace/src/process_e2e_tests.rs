@@ -4729,20 +4729,25 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     // CORRECT LINUX SEMANTICS (this area has bitten us repeatedly — read
     // carefully before touching): the kernel's exit-time wake in `mm_release`
     // is `do_futex(child_tid, FUTEX_WAKE, 1, ...)` with NO FUTEX_PRIVATE_FLAG
-    // (linux kernel/fork.c) — i.e. a SHARED (namespace-0) wake. glibc's
+    // (linux kernel/fork.c) — i.e. a SHARED-op wake. glibc's
     // pthread_join and musl's __tl_lock both FUTEX_WAIT on that word SHARED.
-    // So the exit wake MUST bump the SHARED (namespace-0) counter. A PRIVATE-
+    // `get_futex_key` keys a shared op on a word in a PRIVATE mapping by
+    // (mm, address) + FUT_OFF_MMSHARED — per process, and distinct from the
+    // private-op key — so the exit wake MUST bump that counter. A PRIVATE-
     // only wake (the old bug) missed every glibc/musl joiner and quietly
     // degraded each join to the ~10 ms timer backstop — a lost-wake-shaped
     // stall that surfaced as the CachyOS Plasma greeter hang (Qt threads never
     // rejoining). `fire_clear_child_tid_on_exit` now wakes BOTH namespaces:
     // the recorded PRIVATE one (serves any private waiter on the word) AND the
-    // SHARED (namespace 0) one (the real Linux/glibc/musl target). This test
+    // SHARED-op one (the real Linux/glibc/musl target). It is NOT a global
+    // by-address key: that let one process's thread exit consume a wake meant
+    // for an unrelated process's waiter at the same address. This test
     // therefore asserts BOTH counters bump — the shared assertion is the
     // regression guard for the private-only bug; don't remove it.
     let private_ns = Arc::as_ptr(&parent_as) as usize as u64;
     let pre_private = crate::handlers::__test_futex_wake_counter_scoped(private_ns, ca.child_tid);
-    let pre_shared = crate::handlers::__test_futex_wake_counter_scoped(0, ca.child_tid);
+    let shared_ns = crate::handlers::__test_futex_mmshared_namespace(private_ns);
+    let pre_shared = crate::handlers::__test_futex_wake_counter_scoped(shared_ns, ca.child_tid);
 
     // Simulate child exit. The observer chain fires
     // fire_clear_child_tid_on_exit which bumps the futex counter at
@@ -4750,7 +4755,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     crate::user_task::notify_task_exited(PARENT, child_task_raw);
 
     let post_private = crate::handlers::__test_futex_wake_counter_scoped(private_ns, ca.child_tid);
-    let post_shared = crate::handlers::__test_futex_wake_counter_scoped(0, ca.child_tid);
+    let post_shared = crate::handlers::__test_futex_wake_counter_scoped(shared_ns, ca.child_tid);
     if post_private <= pre_private {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
@@ -4762,7 +4767,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail(
-            "CLONE_CHILD_CLEARTID exit did not bump the SHARED (namespace-0) futex \
+            "CLONE_CHILD_CLEARTID exit did not bump the SHARED-op futex \
              counter — Linux's mm_release wake carries no FUTEX_PRIVATE_FLAG and \
              glibc pthread_join waits shared, so a private-only wake strands the join",
         );
