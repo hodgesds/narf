@@ -21,3 +21,6 @@ fi
 # shellcheck disable=SC2086 # mksq intentionally contains loader + program.
 $mksq "$tmp/root" "$here/linux-gzip.sqfs" -noappend -no-progress \
     -all-root -no-xattrs -comp gzip -b 4096 -mkfs-time 1700000000 -all-time 1700000000
+
+# Distinct per-inode mtimes for the exact-timestamp tests (see patch_times.py).
+python3 "$here/patch_times.py" "$here/linux-gzip.sqfs" "$here/linux-times.sqfs"

@@ -116,6 +116,15 @@ impl DiskInode {
         }
     }
 
+    /// `st_mtim` in wall-clock nanoseconds. SquashFS stores only 32-bit
+    /// seconds, which Linux reads unsigned (`squashfs_new_inode`:
+    /// `inode_set_mtime(inode, le32_to_cpu(sqsh_ino->mtime), 0)`), so a value
+    /// at or above 2^31 is after 2038, not before 1970. Linux also reports
+    /// this time as atime and ctime.
+    pub fn mtime_ns(&self) -> u64 {
+        u64::from(self.mtime) * 1_000_000_000
+    }
+
     pub fn blocks_512(&self) -> u64 {
         let allocated = match &self.kind {
             DiskKind::File {

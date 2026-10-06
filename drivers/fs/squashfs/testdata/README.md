@@ -7,6 +7,12 @@ squashfs-tools binary was built without xattr or LZ4 authoring. Those formats
 are implemented with bounded decoders, but generated-image coverage remains a
 recorded audit gap.
 
+`linux-times.sqfs` is derived from it by `patch_times.py`: `-all-time` gives
+every inode one mtime, so the script stores the single inode-table metadata
+block uncompressed with a distinct mtime per inode (including one at or above
+2^31, which Linux decodes unsigned) and relocates the tables after it. The
+exact-timestamp tests mount it.
+
 Regenerate with `sh REGEN_fixture.sh`. The test suite mounts the image through
 `RamBlockDevice`; corrupt-input cases clone and mutate the bytes in memory so
 malformed fixtures are not stored separately.

@@ -240,3 +240,162 @@ kernel_test_in!(
     "drivers/fs/squashfs",
     smoke_squashfs_rejects_corrupt_superblocks
 );
+
+/// `linux-gzip.sqfs` with distinct per-inode mtimes (`testdata/patch_times.py`):
+/// `/` 1600000000, `nested/` 1650000123, `hello.txt` 1700000123,
+/// `nested/data.txt` 0xF000_0000.
+const TIMES_FIXTURE: &[u8] = include_bytes!("../testdata/linux-times.sqfs");
+
+/// A file reports its on-disk `squashfs_base_inode.mtime` exactly, through
+/// `InodeAttrs` (which the stat path prefers over the lossy
+/// `Stat::mtime_cycles`) and `statx`. SquashFS has no other time, and Linux's
+/// `squashfs_new_inode` reports the mtime as atime and ctime too.
+fn smoke_squashfs_file_exact_mtime() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let volume = match mount_image(TIMES_FIXTURE.to_vec()) {
+        Ok(volume) => volume,
+        Err(_) => return TestResult::Fail("times fixture did not mount"),
+    };
+    let hello = match poll_once(volume.root().lookup_async("hello.txt")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("hello lookup failed"),
+    };
+    let want = 1_700_000_123u64 * 1_000_000_000;
+    let attrs = hello.inode_attrs();
+    if attrs.mtime_ns != want {
+        return TestResult::Fail("file mtime_ns is not the on-disk mtime");
+    }
+    if attrs.atime_ns != want || attrs.ctime_ns != want {
+        return TestResult::Fail("file atime/ctime are not the mtime, as Linux reports");
+    }
+    if hello.stat().mtime_cycles != narf_time::ns_to_cycles(want) {
+        return TestResult::Fail("Stat::mtime_cycles does not derive from the exact mtime");
+    }
+    match poll_once(hello.statx_async(0, u32::MAX)) {
+        Some(Ok(sx)) if (sx.mtime.seconds, sx.mtime.nanoseconds) == (1_700_000_123, 0) => {}
+        _ => return TestResult::Fail("statx mtime is not the on-disk mtime"),
+    }
+    // The fixture's other inodes carry other times: a driver reporting the
+    // superblock's mkfs_time (1700000000) or a shared value fails here.
+    if attrs.mtime_ns == u64::from(volume.superblock.mkfs_time) * 1_000_000_000 {
+        return TestResult::Fail("file reported the superblock mkfs_time");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/squashfs", smoke_squashfs_file_exact_mtime);
+
+/// A directory's mtime reaches the stat path via `DirOps::dir_mtime_ns` and
+/// `inode_attrs().mtime_ns`, exactly; the epoch (what every SquashFS
+/// directory used to report) made every fontconfig cache look stale.
+fn smoke_squashfs_dir_exact_mtime() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let volume = match mount_image(TIMES_FIXTURE.to_vec()) {
+        Ok(volume) => volume,
+        Err(_) => return TestResult::Fail("times fixture did not mount"),
+    };
+    let root = volume.root();
+    let root_want = 1_600_000_000u64 * 1_000_000_000;
+    if root.dir_mtime_ns() != root_want || root.inode_attrs().mtime_ns != root_want {
+        return TestResult::Fail("root dir mtime is not the on-disk mtime");
+    }
+    let nested = match poll_once(root.lookup_dir_async("nested")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("nested lookup failed"),
+    };
+    let want = 1_650_000_123u64 * 1_000_000_000;
+    if nested.dir_mtime_ns() != want {
+        return TestResult::Fail("nested/ dir_mtime_ns is not the on-disk mtime");
+    }
+    let attrs = nested.inode_attrs();
+    if attrs.mtime_ns != want || attrs.atime_ns != want || attrs.ctime_ns != want {
+        return TestResult::Fail("nested/ inode_attrs times are not the on-disk mtime");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/squashfs", smoke_squashfs_dir_exact_mtime);
+
+/// Edges of the 32-bit seconds-only field: Linux decodes it unsigned
+/// (`le32_to_cpu` into a `time64_t`), so 0xF000_0000 is 4026531840 s (2097),
+/// not a pre-1970 negative time, and there is never a sub-second part.
+fn smoke_squashfs_mtime_unsigned_whole_seconds() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let volume = match mount_image(TIMES_FIXTURE.to_vec()) {
+        Ok(volume) => volume,
+        Err(_) => return TestResult::Fail("times fixture did not mount"),
+    };
+    let nested = match poll_once(volume.root().lookup_dir_async("nested")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("nested lookup failed"),
+    };
+    let data = match poll_once(nested.lookup_async("data.txt")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("nested data lookup failed"),
+    };
+    let want = 0xF000_0000u64 * 1_000_000_000;
+    if data.inode_attrs().mtime_ns != want {
+        return TestResult::Fail("a 32-bit mtime >= 2^31 was not decoded unsigned");
+    }
+    match poll_once(data.statx_async(0, u32::MAX)) {
+        Some(Ok(sx)) if (sx.mtime.seconds, sx.mtime.nanoseconds) == (0xF000_0000, 0) => {}
+        _ => return TestResult::Fail("statx mtime >= 2^31 was not decoded unsigned"),
+    }
+    for ns in [data.inode_attrs().mtime_ns, nested.dir_mtime_ns()] {
+        if ns % 1_000_000_000 != 0 {
+            return TestResult::Fail("SquashFS reported a sub-second part it cannot store");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/squashfs",
+    smoke_squashfs_mtime_unsigned_whole_seconds
+);
+
+/// SquashFS is read-only: Linux forces `SB_RDONLY` in `squashfs_fill_super`,
+/// so `link(2)` fails with EROFS from `mnt_want_write` (after the old name's
+/// lookup and the new name's EEXIST check, which the VFS does before the
+/// filesystem is asked). The driver answers `ReadOnly` (EROFS) for both link
+/// forms and creates no name.
+fn smoke_squashfs_link_is_erofs() -> TestResult {
+    use narf_filesystem::{FsError, FsInstance};
+
+    let volume = match mount_image(TIMES_FIXTURE.to_vec()) {
+        Ok(volume) => volume,
+        Err(_) => return TestResult::Fail("times fixture did not mount"),
+    };
+    let root = volume.root();
+    if !matches!(
+        poll_once(root.link("hello.txt", "alias")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("link on SquashFS did not return ReadOnly (EROFS)");
+    }
+    let nested = match poll_once(root.lookup_dir_async("nested")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("nested lookup failed"),
+    };
+    if !matches!(
+        poll_once(root.link_to("hello.txt", &*nested, "alias")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("cross-directory link did not return ReadOnly (EROFS)");
+    }
+    if !matches!(
+        poll_once(root.lookup_async("alias")),
+        Some(Err(FsError::NotFound))
+    ) || !matches!(
+        poll_once(nested.lookup_async("alias")),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("a refused link created a name");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/squashfs", smoke_squashfs_link_is_erofs);
