@@ -161,7 +161,11 @@ pub fn install_address_space_drop_hook(hook: AddressSpaceDropHook) {
 }
 
 fn retain_shared_frames(region: &Region) {
-    if let Some((retain, _)) = *SHARED_FRAME_HOOKS.lock() {
+    // Copy the hooks out first: an `if let` scrutinee's guard lives for the
+    // whole body, which would hold the global hook lock (IRQs masked) across
+    // the userspace callback.
+    let hooks = *SHARED_FRAME_HOOKS.lock();
+    if let Some((retain, _)) = hooks {
         for phys in region
             .phys
             .indexed()
@@ -175,7 +179,10 @@ fn retain_shared_frames(region: &Region) {
 
 fn release_shared_phys(phys: PhysAddr) {
     if phys.raw() != 0 {
-        if let Some((_, release)) = *SHARED_FRAME_HOOKS.lock() {
+        // Not `if let Some(..) = *LOCK.lock()`: that guard would stay held,
+        // IRQs masked, across the userspace release callback.
+        let hooks = *SHARED_FRAME_HOOKS.lock();
+        if let Some((_, release)) = hooks {
             release(phys.raw());
         }
     }
@@ -13004,7 +13011,16 @@ impl Drop for AddressSpace {
             .address_space_id
             .load(core::sync::atomic::Ordering::Acquire);
         if address_space_id != 0 {
-            if let Some(hook) = *ADDRESS_SPACE_DROP_HOOK.lock() {
+            // Copy the hook out and drop the guard BEFORE calling it. As
+            // `if let Some(hook) = *ADDRESS_SPACE_DROP_HOOK.lock()` the guard
+            // lived through the call, so `mapped_file::drop_address_space` —
+            // which drops every file owner, i.e. arbitrary destructors — ran
+            // holding this GLOBAL IrqSafeSpinLock with IRQs masked. Once
+            // teardown moved into a stackful reclaim task, a destructor that
+            // cooperatively yielded parked with the lock held and every CPU
+            // tearing down another address space spun on it forever.
+            let hook = *ADDRESS_SPACE_DROP_HOOK.lock();
+            if let Some(hook) = hook {
                 hook(address_space_id);
             }
         }
@@ -14120,6 +14136,48 @@ fn smoke_memory_file_demand_errors_keep_their_meaning() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_file_demand_errors_keep_their_meaning);
+
+/// The address-space drop hook must run with its registry lock RELEASED. It
+/// drops every file owner of the dying mm (arbitrary destructors); calling it
+/// under the global IrqSafeSpinLock meant a destructor that yielded parked
+/// with the lock held and every other CPU tearing down an address space spun
+/// on it with IRQs masked (a desktop wedge with five CPUs in
+/// `AddressSpace::drop`).
+fn smoke_memory_drop_hook_runs_without_its_lock() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    static LOCK_FREE: AtomicU32 = AtomicU32::new(0);
+    fn probe(_id: u64) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        if ADDRESS_SPACE_DROP_HOOK.try_lock().is_some() {
+            LOCK_FREE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let previous = *ADDRESS_SPACE_DROP_HOOK.lock();
+    CALLS.store(0, Ordering::Relaxed);
+    LOCK_FREE.store(0, Ordering::Relaxed);
+    *ADDRESS_SPACE_DROP_HOOK.lock() = Some(probe);
+    // SAFETY: as the tests above.
+    let a = unsafe { AddressSpace::new_for_user() };
+    let created = a.is_ok();
+    if let Ok(a) = a {
+        // Give it an identity so the hook fires.
+        let _ = a.identity();
+        drop(a);
+    }
+    *ADDRESS_SPACE_DROP_HOOK.lock() = previous;
+    if !created {
+        return TestResult::Skip("new_for_user failed");
+    }
+    if CALLS.load(Ordering::Relaxed) == 0 {
+        return TestResult::Fail("the drop hook did not run");
+    }
+    if LOCK_FREE.load(Ordering::Relaxed) != CALLS.load(Ordering::Relaxed) {
+        return TestResult::Fail("the drop hook ran while holding ADDRESS_SPACE_DROP_HOOK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_drop_hook_runs_without_its_lock);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_tag0_remote_tlb_gate_matches_switch_contract() -> TestResult {

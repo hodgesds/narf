@@ -98,6 +98,19 @@ fn encode_index(out: &mut [u8], off: usize, idx: &ExtentIndex) {
     out[off + 10..off + 12].copy_from_slice(&0u16.to_le_bytes());
 }
 
+/// Zero a node's entry area (everything after the 12-byte header) before it
+/// is re-encoded with fewer entries, so no stale entry survives past
+/// `eh_entries`. A non-root block keeps its trailing `ext4_extent_tail`,
+/// which `write_extent_node` recomputes.
+fn clear_entries(node: &mut [u8]) {
+    let end = if node.len() > 60 {
+        node.len() - 4
+    } else {
+        node.len()
+    };
+    node[12..end].iter_mut().for_each(|b| *b = 0);
+}
+
 fn decode_leaves(node: &[u8], hdr: &ExtentHeader) -> Result<Vec<ExtentLeaf>, FsError> {
     let n = hdr.entries as usize;
     if 12 + n * 12 > node.len() {
@@ -462,10 +475,127 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// extent and every tree block, leave an empty depth-0 root. Returns the
     /// number of 512-byte sectors released.
     pub(super) async fn extent_free_all(&self, inode: &mut Inode) -> Result<u32, FsError> {
+        let freed = self.extent_free_subtree(0, root_bytes(inode)).await?;
+        let mut root = root_bytes(inode);
+        root.iter_mut().for_each(|b| *b = 0);
+        write_header(&mut root, 0, ROOT_MAX, 0);
+        store_root(inode, &root);
+        Ok(freed)
+    }
+
+    /// `ext4_ext_remove_space(inode, first, EXT_MAX_BLOCKS - 1)`: free every
+    /// block mapped at logical `first` or beyond. An extent past the cut is
+    /// freed, one straddling it is trimmed to end there, and a subtree left
+    /// with no entries is freed with its node block. A root left empty
+    /// becomes an empty depth-0 leaf, as Linux leaves it. Returns the number
+    /// of 512-byte sectors released; the caller writes the inode.
+    pub(super) async fn extent_free_from(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        first: u32,
+    ) -> Result<u32, FsError> {
+        let mut root = root_bytes(inode);
+        let (entries, freed) = self
+            .extent_trim_node(inode_no, *inode, &mut root, first, 0)
+            .await?;
+        if entries == 0 {
+            root.iter_mut().for_each(|b| *b = 0);
+            write_header(&mut root, 0, ROOT_MAX, 0);
+        }
+        store_root(inode, &root);
+        Ok(freed)
+    }
+
+    /// Trim one node (`node`, already read) to the logical blocks below
+    /// `first`, writing back every child it keeps. Returns the node's
+    /// remaining entry count and the sectors freed beneath it. The node
+    /// itself is rewritten in `node`; the caller stores it.
+    fn extent_trim_node<'a>(
+        &'a self,
+        inode_no: u32,
+        inode: Inode,
+        node: &'a mut [u8],
+        first: u32,
+        level: usize,
+    ) -> super::TreeFuture<'a, (usize, u32)> {
+        alloc::boxed::Box::pin(async move {
+            // The tree's depth is bounded by `eh_depth` (at most 5); refuse a
+            // loop rather than recurse without end on a corrupt tree.
+            if level > 8 {
+                return Err(corrupt());
+            }
+            let spb = (self.block_size() / 512) as u32;
+            let hdr = ExtentHeader::parse(node).ok_or_else(corrupt)?;
+            let mut freed = 0u32;
+            if hdr.is_leaf() {
+                let mut kept = Vec::new();
+                for mut e in decode_leaves(node, &hdr)? {
+                    let start = e.logical;
+                    let end = u64::from(start) + u64::from(e.len);
+                    if start >= first {
+                        for b in 0..u64::from(e.len) {
+                            self.free_block(e.physical + b).await?;
+                            freed = freed.saturating_add(spb);
+                        }
+                    } else if end > u64::from(first) {
+                        let keep = (first - start) as u16;
+                        for b in u64::from(keep)..u64::from(e.len) {
+                            self.free_block(e.physical + b).await?;
+                            freed = freed.saturating_add(spb);
+                        }
+                        e.len = keep;
+                        kept.push(e);
+                    } else {
+                        kept.push(e);
+                    }
+                }
+                clear_entries(node);
+                write_header(node, kept.len() as u16, hdr.max, 0);
+                for (i, e) in kept.iter().enumerate() {
+                    encode_leaf(node, 12 + i * 12, e);
+                }
+                return Ok((kept.len(), freed));
+            }
+            let mut kept = Vec::new();
+            for idx in decode_indexes(node, &hdr)? {
+                let mut child = vec![0u8; self.block_size()];
+                self.read_block(idx.leaf, &mut child).await?;
+                if idx.logical >= first {
+                    // The whole subtree lies past the cut.
+                    freed = freed.saturating_add(self.extent_free_subtree(idx.leaf, child).await?);
+                    continue;
+                }
+                let (left, sub) = self
+                    .extent_trim_node(inode_no, inode, &mut child, first, level + 1)
+                    .await?;
+                freed = freed.saturating_add(sub);
+                if left == 0 {
+                    self.free_block(idx.leaf).await?;
+                    freed = freed.saturating_add(spb);
+                } else {
+                    self.write_extent_node(inode_no, &inode, idx.leaf, &mut child)
+                        .await?;
+                    kept.push(idx);
+                }
+            }
+            clear_entries(node);
+            write_header(node, kept.len() as u16, hdr.max, hdr.depth);
+            for (i, idx) in kept.iter().enumerate() {
+                encode_index(node, 12 + i * 12, idx);
+            }
+            Ok((kept.len(), freed))
+        })
+    }
+
+    /// Free the subtree rooted at `block` (`0` = the in-inode root, which is
+    /// not itself freed), every extent's blocks and every tree block in it.
+    /// Returns the number of 512-byte sectors released.
+    async fn extent_free_subtree(&self, block: u64, node: Vec<u8>) -> Result<u32, FsError> {
         let spb = (self.block_size() / 512) as u32;
         let mut freed = 0u32;
-        // Depth-first over (block, is_root) nodes.
-        let mut stack: Vec<(u64, Vec<u8>)> = vec![(0, root_bytes(inode))];
+        // Depth-first over (block, bytes) nodes.
+        let mut stack: Vec<(u64, Vec<u8>)> = vec![(block, node)];
         let mut budget = 1usize << 20;
         while let Some((block, node)) = stack.pop() {
             budget = budget.checked_sub(1).ok_or_else(corrupt)?;
@@ -489,10 +619,6 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 freed = freed.saturating_add(spb);
             }
         }
-        let mut root = root_bytes(inode);
-        root.iter_mut().for_each(|b| *b = 0);
-        write_header(&mut root, 0, ROOT_MAX, 0);
-        store_root(inode, &root);
         Ok(freed)
     }
 }

@@ -669,27 +669,49 @@ pub(crate) fn resolve_vfs_symlink_path_scoped(
             {
                 continue;
             }
+            if symlink_refused(scope.as_ref(), &prefix) {
+                return Err(ELOOP);
+            }
             // A proc-fd link is a MAGIC link: following it reopens descriptor
             // N, it does not look up a literal pathname (Linux
             // `proc_fd_link` -> `nd_jump_link`). Its readlink text is a
             // DESCRIPTION, and for an anonymous descriptor — a pipe, socket,
             // eventfd or memfd — that text is `pipe:[12345]`, which names
-            // nothing. Expanding it textually turned it into
-            // `/proc/<pid>/fd/pipe:[12345]` and the walk then failed.
+            // nothing; expanding it textually failed the walk.
             //
-            // This is reached from OUTSIDE /proc, which is why `open_impl`'s
-            // `proc_magic_path` guard does not cover it: `/dev/fd` is a
-            // devtmpfs symlink into procfs, so expanding `/dev/fd/63` walks
-            // into procfs and meets the fd link here. Stop and hand the path
-            // back; `open_impl` recognises it and performs the jump. Without
-            // this, bash process substitution (`cmd < <(other)`) fails with
-            // "/dev/fd/63: No such file or directory", as do `/dev/stdin`,
-            // `/dev/stdout` and `/dev/stderr` whenever they name a pipe.
-            if is_final && parse_proc_fd_magic_path(current_task_id(), &prefix).is_some() {
-                return finish(expanded);
-            }
-            if symlink_refused(scope.as_ref(), &prefix) {
-                return Err(ELOOP);
+            // So JUMP: land on the descriptor's own file and stop there, as
+            // `nd_jump_link` does (an O_PATH|O_NOFOLLOW fd on a symlink names
+            // the symlink). Every caller of this walk depends on that, not
+            // just `open`: libacl's `acl_set_file` is `setxattr` on
+            // `/proc/self/fd/N` (the udev `uaccess` ACL on `/dev/dri/card0`)
+            // and systemd's `fchmod_opath` is `chmod` on it. A pathless
+            // descriptor has no file to land on; hand the path back unchanged
+            // and let `open_impl` reopen the descriptor itself.
+            //
+            // Also reached from OUTSIDE /proc: `/dev/fd` is a devtmpfs symlink
+            // into procfs, so `/dev/fd/63` (bash process substitution) and
+            // `/dev/stdin` meet the fd link here.
+            if is_final {
+                let task = current_task_id();
+                if let Some(visible) = visible_path_of(task, &prefix)
+                    .filter(|visible| parse_proc_self_fd(visible).is_some())
+                {
+                    if let Some(sc) = scope.as_ref() {
+                        // `nd_jump_link`: -ELOOP under RESOLVE_NO_MAGICLINKS,
+                        // and -EXDEV for any scoped lookup ("not currently
+                        // safe"). RESOLVE_NO_XDEV is `finish`'s mount check.
+                        if sc.no_magiclinks {
+                            return Err(ELOOP);
+                        }
+                        if sc.is_scoped() {
+                            return Err(EXDEV);
+                        }
+                    }
+                    return match proc_fd_magic_target(task, visible) {
+                        Some(target) => finish(apply_chroot(&target)),
+                        None => finish(expanded),
+                    };
+                }
             }
 
             let mut bytes = alloc::vec![0u8; 4096];
@@ -2670,20 +2692,26 @@ pub(crate) fn parse_proc_self_fd(path: &str) -> Option<u32> {
 /// This is deliberately a boundary-aware prefix strip: a chroot at `/srv/a`
 /// must not make `/srv/another/proc/self/fd/3` look like a proc magic link.
 pub(crate) fn parse_proc_fd_magic_path(task: u64, host_path: &str) -> Option<u32> {
-    let visible = match root_dir_prefix(task).as_deref() {
+    parse_proc_self_fd(visible_path_of(task, host_path)?)
+}
+
+/// `host_path` (chroot applied) as the task names it, or `None` when it lies
+/// outside the task's root. Boundary-aware: a chroot at `/srv/a` does not
+/// strip `/srv/another`.
+fn visible_path_of(task: u64, host_path: &str) -> Option<&str> {
+    match root_dir_prefix(task).as_deref() {
         Some(prefix) if prefix != "/" => {
             let rest = host_path.strip_prefix(prefix)?;
             if rest.is_empty() {
-                "/"
+                Some("/")
             } else if rest.starts_with('/') {
-                rest
+                Some(rest)
             } else {
-                return None;
+                None
             }
         }
-        _ => host_path,
-    };
-    parse_proc_self_fd(visible)
+        _ => Some(host_path),
+    }
 }
 
 /// `/proc/{self,thread-self,<pid>}/{root,cwd,exe}` — the per-task magic links

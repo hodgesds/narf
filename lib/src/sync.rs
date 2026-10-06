@@ -52,6 +52,30 @@ pub fn contended_irq_lock(cpu: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Service the work a CPU spinning with interrupts masked would otherwise
+/// strand: pending TLB-shootdown requests (the installed hook) and
+/// `membarrier` rendezvous. Every spin-wait that can run with IRQs masked must
+/// call this — `IrqSafeSpinLock` does, the shootdown sender does, and a
+/// device request gate must too: a waiter that cannot take the shootdown IPI
+/// and never drains it leaves the sender (who may hold the very gate being
+/// waited on) spinning on its ack forever. Linux forbids the shape outright —
+/// TLB-flush IPIs WARN under `irqs_disabled()`.
+#[inline]
+pub fn service_masked_spin() {
+    run_lock_spin_hook();
+}
+
+/// Test-only: install `new` (or nothing) as the spin-wait hook, returning the
+/// previous one so a test can restore what boot installed.
+#[doc(hidden)]
+pub fn __test_swap_lock_spin_hook(new: Option<fn()>) -> Option<fn()> {
+    let raw = new.map_or(0, |f| f as usize);
+    let prev = LOCK_SPIN_HOOK.swap(raw, Ordering::AcqRel);
+    // SAFETY: only `set_lock_spin_hook` / this swap write the cell, always
+    // with a valid `fn()` or 0.
+    (prev != 0).then(|| unsafe { core::mem::transmute::<usize, fn()>(prev) })
+}
+
 /// Run the installed spin-wait hook if any. Tiny by design — one acquire load
 /// and an early return when nothing is wired (kernel-test, pre-boot, or the
 /// xAPIC fallback where shootdowns aren't broadcast).

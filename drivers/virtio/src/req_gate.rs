@@ -48,6 +48,11 @@ impl<'a> ReqGate<'a> {
             // virtio-blk gate (`blk_pci::ReqGate`, task #34) that this module
             // generalises — the yield was the missing half of that fix.
             if !narf_scheduler::cooperative_yield() {
+                // Can't yield (IRQs masked, or no stackful task): drain pending
+                // TLB shootdowns / membarrier work while spinning. A holder
+                // that shoots down while this waiter cannot ack would otherwise
+                // wait forever on the waiter, and the waiter on the gate.
+                narf_lib::sync::service_masked_spin();
                 core::hint::spin_loop();
             }
         }
@@ -59,3 +64,37 @@ impl Drop for ReqGate<'_> {
         self.0.store(false, Ordering::Release);
     }
 }
+
+/// A gate waiter that cannot yield — interrupts masked — must keep servicing
+/// pending TLB shootdowns while it spins. It did not: a desktop VM wedged with
+/// one CPU spinning here (IF=0) on the GPU gate while the gate's holder, on
+/// another CPU, waited forever in `shoot_request_mask` for this CPU's ack.
+///
+/// The test holds the gate and installs a spin-wait hook that releases it, so
+/// `acquire` can only return by servicing the hook while it spins. (Without
+/// the fix it spins forever, so the fail-before shape is a hang, not a
+/// failure.)
+fn smoke_virtio_req_gate_services_shootdowns_while_masked() -> narf_kernel_test::TestResult {
+    use core::sync::atomic::AtomicUsize;
+    use narf_kernel_test::TestResult;
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn release_hook() {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        FLAG.store(false, Ordering::Release);
+    }
+    CALLS.store(0, Ordering::Relaxed);
+    FLAG.store(true, Ordering::Release);
+    let previous = narf_lib::sync::__test_swap_lock_spin_hook(Some(release_hook));
+    narf_lib::sync::without_interrupts(|| drop(ReqGate::acquire(&FLAG)));
+    let _ = narf_lib::sync::__test_swap_lock_spin_hook(previous);
+    FLAG.store(false, Ordering::Release);
+    if CALLS.load(Ordering::Relaxed) == 0 {
+        return TestResult::Fail("a masked gate waiter did not service pending shootdowns");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "drivers/virtio/req_gate",
+    smoke_virtio_req_gate_services_shootdowns_while_masked
+);

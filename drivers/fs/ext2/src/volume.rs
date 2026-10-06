@@ -325,6 +325,10 @@ pub struct Ext2Volume<B: BlockDevice + 'static> {
     /// evicted when its last `Arc` drops (`Ext2Node::drop` removes its own
     /// entry). Never held while a node is dropped or across an `.await`.
     icache: IrqSafeSpinLock<BTreeMap<u32, Weak<super::node::Ext2Node<B>>>>,
+    /// Unlinked inodes whose last node has dropped and which are not yet
+    /// released (Linux's deferred `iput_final`). Drained by
+    /// [`Self::lock_inode_updates`].
+    orphans: IrqSafeSpinLock<Vec<u32>>,
     /// Source of node incarnations; see [`Self::new_file_mapping`].
     incarnations: core::sync::atomic::AtomicU32,
     /// Serializes whole-inode read/modify/write sequences. Directory
@@ -521,6 +525,12 @@ async fn read_byte_range_into_static<B: BlockDevice>(
     device_read_into(device, io.lbs, io.scratch_bytes, &io.pool[0], byte_off, dst).await
 }
 
+/// A boxed future for the recursive block-tree walks (an `async fn` cannot
+/// recurse directly).
+pub(crate) type TreeFuture<'a, T> = core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<T, FsError>> + Send + 'a>,
+>;
+
 impl<B: BlockDevice + 'static> Ext2Volume<B> {
     /// Mount an ext2 volume. Reads the superblock at byte offset
     /// 1024 (in 512-byte sectors that's LBA 2), validates the
@@ -674,6 +684,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             page_cache: page_cache.clone(),
             bdev_mapping: BlockMapping::new(page_cache, 0),
             icache: IrqSafeSpinLock::new(BTreeMap::new()),
+            orphans: IrqSafeSpinLock::new(Vec::new()),
             incarnations: core::sync::atomic::AtomicU32::new(1),
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
@@ -1336,6 +1347,83 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         )
     }
 
+    /// Queue an orphaned inode whose last node just dropped.
+    pub(crate) fn queue_orphan(&self, inode_no: u32) {
+        self.orphans.lock().push(inode_no);
+    }
+
+    /// Pop one queued orphan. A function of its own so the queue's guard is
+    /// gone before the caller's `.await` (a `while let` scrutinee would hold
+    /// it through the loop body).
+    fn pop_orphan(&self) -> Option<u32> {
+        self.orphans.lock().pop()
+    }
+
+    /// Take `inode_update_lock`, releasing any orphaned inodes first. Every
+    /// whole-inode update goes through here, so an inode unlinked while open
+    /// is released at the first update after its last reference drops.
+    pub(crate) async fn lock_inode_updates(&self) -> narf_lib::mutex::MutexGuard<'_, ()> {
+        let guard = self.inode_update_lock.lock().await;
+        while let Some(inode_no) = self.pop_orphan() {
+            if self.release_orphan(inode_no).await.is_err() {
+                // Keep it for the next update rather than leak it; the update
+                // the caller is about to make is unrelated and goes ahead.
+                self.queue_orphan(inode_no);
+                break;
+            }
+        }
+        guard
+    }
+
+    async fn release_orphan(&self, inode_no: u32) -> Result<(), FsError> {
+        // A node made live again since (by inode number) carries the release
+        // to its own drop.
+        if let Some(node) = self.icache_get(inode_no) {
+            node.mark_orphaned();
+            return Ok(());
+        }
+        let mut inode = self.read_inode(inode_no).await?;
+        // Linked again while open (`linkat` of an `O_TMPFILE`): it lives on.
+        if inode.links_count != 0 {
+            return Ok(());
+        }
+        self.truncate_inode(&mut inode).await?;
+        self.write_inode(inode_no, &inode).await?;
+        self.free_inode(inode_no).await
+    }
+
+    /// The inode's last link is gone (`links_count == 0`, not yet written).
+    /// Free it now when nothing holds it; otherwise persist the link count
+    /// and leave the inode, its size and its blocks to the last reference,
+    /// as Linux's `iput_final` does. Caller holds `inode_update_lock`.
+    ///
+    /// LINUX-GAP: ext4 also threads such an inode onto the on-disk orphan
+    /// list (`s_last_orphan`) so a crash before the release is recovered at
+    /// mount. NARF does not; e2fsck reclaims the inode instead.
+    pub(crate) async fn release_unlinked(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+    ) -> Result<(), FsError> {
+        debug_assert_eq!(inode.links_count, 0);
+        if let Some(node) = self.icache_get(inode_no) {
+            self.write_inode(inode_no, inode).await?;
+            node.mark_orphaned();
+            // Ours may have been the last reference; release it now if so.
+            drop(node);
+            while let Some(queued) = self.pop_orphan() {
+                if let Err(error) = self.release_orphan(queued).await {
+                    self.queue_orphan(queued);
+                    return Err(error);
+                }
+            }
+            return Ok(());
+        }
+        self.truncate_inode(inode).await?;
+        self.write_inode(inode_no, inode).await?;
+        self.free_inode(inode_no).await
+    }
+
     /// `evict`: forget the icache entry of `inode_no` if it still names the
     /// node at `node` (a racing `iget` may already have replaced it).
     pub(crate) fn icache_evict(&self, inode_no: u32, node: *const super::node::Ext2Node<B>) {
@@ -1954,6 +2042,128 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode.size = 0;
         inode.blocks = 0;
         Ok(())
+    }
+
+    /// `ext4_truncate` for a shrink to a nonzero size: free every block
+    /// mapped at logical block `first` or beyond (`first` is the first block
+    /// wholly past the new EOF), with any tree block left mapping nothing.
+    /// `i_blocks` drops by what was released; `i_size` and the inode write
+    /// are the caller's.
+    pub(crate) async fn truncate_inode_from(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        first: u64,
+    ) -> Result<(), FsError> {
+        if inode.is_fast_symlink(self.block_size() as u32) {
+            return Ok(());
+        }
+        let freed = if self.superblock.uses_extents() && inode.uses_extents() {
+            // Logical block numbers are 32-bit in an extent tree.
+            let first = u32::try_from(first).unwrap_or(u32::MAX);
+            self.extent_free_from(inode_no, inode, first).await?
+        } else {
+            self.blockmap_free_from(inode, first).await?
+        };
+        inode.blocks = inode.blocks.saturating_sub(freed);
+        Ok(())
+    }
+
+    /// The block-map half of [`Self::truncate_inode_from`]
+    /// (`ext4_ind_truncate`). Returns the 512-byte sectors released.
+    async fn blockmap_free_from(&self, inode: &mut Inode, first: u64) -> Result<u32, FsError> {
+        use super::inode::{DOUBLE_IND_IDX, N_DIRECT, SINGLE_IND_IDX, TRIPLE_IND_IDX};
+        let spb = (self.block_size() / 512) as u32;
+        let p = self.pointers_per_block() as u64;
+        let mut freed = 0u32;
+        for slot in first.min(N_DIRECT as u64) as usize..N_DIRECT {
+            if inode.block[slot] != 0 {
+                self.free_block(u64::from(inode.block[slot])).await?;
+                inode.block[slot] = 0;
+                freed = freed.saturating_add(spb);
+            }
+        }
+        // Each indirect tree maps `span` logical blocks starting at `base`.
+        let mut base = N_DIRECT as u64;
+        let mut span = p;
+        for (slot, level) in [
+            (SINGLE_IND_IDX, 1u32),
+            (DOUBLE_IND_IDX, 2),
+            (TRIPLE_IND_IDX, 3),
+        ] {
+            let root = u64::from(inode.block[slot]);
+            if root != 0 && first < base.saturating_add(span) {
+                let (empty, sub) = self
+                    .blockmap_free_branch(root, level, first.saturating_sub(base))
+                    .await?;
+                freed = freed.saturating_add(sub);
+                if empty {
+                    self.free_block(root).await?;
+                    inode.block[slot] = 0;
+                    freed = freed.saturating_add(spb);
+                }
+            }
+            base = base.saturating_add(span);
+            span = span.saturating_mul(p);
+        }
+        Ok(freed)
+    }
+
+    /// Free the entries of the `level`-deep indirect block `block` that map
+    /// relative logical blocks `start` and beyond. Returns whether the block
+    /// now maps nothing (the caller frees it) and the sectors released below
+    /// it; a block that keeps entries is written back.
+    fn blockmap_free_branch<'a>(
+        &'a self,
+        block: u64,
+        level: u32,
+        start: u64,
+    ) -> TreeFuture<'a, (bool, u32)> {
+        alloc::boxed::Box::pin(async move {
+            let spb = (self.block_size() / 512) as u32;
+            let p = self.pointers_per_block() as u64;
+            let child_span = p.saturating_pow(level - 1);
+            let mut buf = vec![0u8; self.block_size()];
+            self.read_block(block, &mut buf).await?;
+            let mut freed = 0u32;
+            let mut changed = false;
+            let mut live = false;
+            for j in 0..p {
+                let off = j as usize * 4;
+                let ptr = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+                if ptr == 0 {
+                    continue;
+                }
+                let child_first = j.saturating_mul(child_span);
+                if child_first.saturating_add(child_span) <= start {
+                    // Wholly before the cut.
+                    live = true;
+                    continue;
+                }
+                let child = u64::from(ptr);
+                let empty = if level == 1 {
+                    true
+                } else {
+                    let (empty, sub) = self
+                        .blockmap_free_branch(child, level - 1, start.saturating_sub(child_first))
+                        .await?;
+                    freed = freed.saturating_add(sub);
+                    empty
+                };
+                if empty {
+                    self.free_block(child).await?;
+                    freed = freed.saturating_add(spb);
+                    buf[off..off + 4].fill(0);
+                    changed = true;
+                } else {
+                    live = true;
+                }
+            }
+            if live && changed {
+                self.write_block(block, &buf).await?;
+            }
+            Ok((!live, freed))
+        })
     }
 
     /// Free every pointer in a single-indirect block.

@@ -3871,6 +3871,123 @@ fn smoke_ext2_rename_across_dirs() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_rename_across_dirs);
 
+/// `DirOps::rename_to` — the cross-directory rename the VFS calls — must move
+/// names on ext2/ext4 like `ext4_rename`. ext2 never implemented it, so every
+/// cross-directory move fell back to `-EXDEV` for a directory (and a
+/// link+unlink emulation for a file); Firefox's cache and profile writes hit
+/// that on the CachyOS root. Covers, through the trait:
+/// - a directory moved between directories: both parents' link counts and
+///   the moved directory's `..` follow it;
+/// - an existing EMPTY directory victim is replaced and released (its parent
+///   loses the ".." back-link);
+/// - a NON-EMPTY directory victim is refused with `Busy` (-ENOTEMPTY) and
+///   nothing moves.
+fn smoke_ext2_rename_to_moves_directories_across_dirs() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{DirOps, FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let mkdir =
+        |dir: &dyn DirOps, name: &str| poll_once(dir.mkdir(name)).is_some_and(|r| r.is_ok());
+    if !mkdir(&*root, "a") || !mkdir(&*root, "b") {
+        return TestResult::Fail("mkdir a/b failed");
+    }
+    let (a, b) = match (
+        poll_once(root.lookup_dir_async("a")),
+        poll_once(root.lookup_dir_async("b")),
+    ) {
+        (Some(Ok(a)), Some(Ok(b))) => (a, b),
+        _ => return TestResult::Fail("lookup a/b failed"),
+    };
+    if !mkdir(&*a, "sub")
+        || !mkdir(&*a, "x")
+        || !mkdir(&*b, "x")
+        || !mkdir(&*a, "y")
+        || !mkdir(&*b, "z")
+    {
+        return TestResult::Fail("mkdir children failed");
+    }
+    let z = match poll_once(b.lookup_dir_async("z")) {
+        Some(Ok(z)) => z,
+        _ => return TestResult::Fail("lookup b/z failed"),
+    };
+    if !mkdir(&*z, "keep") {
+        return TestResult::Fail("mkdir b/z/keep failed");
+    }
+    let ino = |parent: u32, name: &[u8]| -> Option<u32> {
+        let dir = poll_once(volume.read_inode(parent))?.ok()?;
+        poll_once(volume.dir_lookup(&dir, name))?
+            .ok()
+            .map(|(i, _)| i)
+    };
+    let links = |i: u32| {
+        poll_once(volume.read_inode(i))
+            .and_then(|r| r.ok())
+            .map(|n| n.links_count)
+    };
+    let root_ino = crate::EXT2_ROOT_INO;
+    let (Some(a_ino), Some(b_ino)) = (ino(root_ino, b"a"), ino(root_ino, b"b")) else {
+        return TestResult::Fail("inode lookup of a/b failed");
+    };
+
+    // 1. Move directory a/sub → b/sub.
+    match poll_once(a.rename_to("sub", &*b, "sub", 0)) {
+        Some(Ok(())) => {}
+        Some(Err(FsError::Unsupported)) => {
+            return TestResult::Fail("ext2 rename_to is Unsupported (the VFS reports -EXDEV)")
+        }
+        _ => return TestResult::Fail("rename_to of a directory across dirs failed"),
+    }
+    let Some(sub_ino) = ino(b_ino, b"sub") else {
+        return TestResult::Fail("b/sub missing after the move");
+    };
+    if ino(a_ino, b"sub").is_some() {
+        return TestResult::Fail("a/sub still present after the move");
+    }
+    if ino(sub_ino, b"..") != Some(b_ino) {
+        return TestResult::Fail("moved directory's .. does not name its new parent");
+    }
+
+    // 2. Replace the EMPTY directory b/x with a/x.
+    let Some(old_bx) = ino(b_ino, b"x") else {
+        return TestResult::Fail("b/x missing");
+    };
+    match poll_once(a.rename_to("x", &*b, "x", 0)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("replacing an empty directory failed"),
+    }
+    if ino(b_ino, b"x") == Some(old_bx) || ino(a_ino, b"x").is_some() {
+        return TestResult::Fail("empty-directory replacement did not move the name");
+    }
+    // a keeps only y (2 + 1); b holds sub, x, z (2 + 3).
+    if links(a_ino) != Some(3) || links(b_ino) != Some(5) {
+        return TestResult::Fail("parent link counts are wrong after the directory moves");
+    }
+
+    // 3. A NON-EMPTY victim (b/z holds keep) is refused, nothing changes.
+    match poll_once(a.rename_to("y", &*b, "z", 0)) {
+        Some(Err(FsError::Busy)) => {}
+        _ => return TestResult::Fail("replacing a non-empty directory was not Busy (-ENOTEMPTY)"),
+    }
+    if ino(a_ino, b"y").is_none() || ino(b_ino, b"z").is_none() {
+        return TestResult::Fail("a refused rename changed a directory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_rename_to_moves_directories_across_dirs
+);
+
 fn smoke_ext2_hardlink_bumps_link_count() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
@@ -5185,6 +5302,212 @@ fn smoke_ext2_truncate_then_extend_reads_zeros() -> TestResult {
 kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_truncate_then_extend_reads_zeros
+);
+
+/// Removing the last link of an inode something still holds must not free it
+/// (`ext2_evict_inode` runs from `iput_final`, at the LAST reference). The
+/// unlinked inode keeps its size, data and inode number until then, so an
+/// open descriptor still reads it and a `MAP_SHARED` mapping still faults it
+/// in. KDE's KSharedDataCache depends on exactly this: it unlinks a corrupted
+/// cache while other processes have it mapped. Freeing at unlink zeroed the
+/// size under plasmashell's mapping (SIGBUS on its next write) and handed the
+/// inode number and blocks to the replacement file.
+fn smoke_ext2_unlink_keeps_an_open_inode_until_its_last_reference() -> TestResult {
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let content = [0x5au8; 6000];
+    let device = GatedCountingBlock::new(testing::hard_link_image(&content));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let file = match poll_once(root.lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    // The fixture names the inode twice; drop both names.
+    if !matches!(poll_once(root.unlink("data")), Some(Ok(())))
+        || !matches!(poll_once(root.unlink("link")), Some(Ok(())))
+    {
+        return TestResult::Fail("unlink failed");
+    }
+    if file.stat().size != 6000 {
+        return TestResult::Fail("unlinking the last name zeroed an open inode's size");
+    }
+    let mut buf = [0u8; 6000];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000)))
+        || buf.iter().any(|&b| b != 0x5a)
+    {
+        return TestResult::Fail("an open, unlinked inode no longer reads its data");
+    }
+    if file.mmap_fault(4096).is_err() {
+        return TestResult::Fail("a mapping of an open, unlinked inode was refused");
+    }
+    // The inode number is still in use: a new file must get another one.
+    let fresh = match poll_once(root.create("fresh")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if fresh.ino() == u64::from(testing::FILE_INO) {
+        return TestResult::Fail("an open, unlinked inode number was reused");
+    }
+    // The last reference goes: the inode is released, so the next
+    // allocation can have its number again.
+    drop(file);
+    let again = match poll_once(root.create("again")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create after the last reference failed"),
+    };
+    if again.ino() != u64::from(testing::FILE_INO) {
+        return TestResult::Fail("dropping the last reference did not release the inode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_unlink_keeps_an_open_inode_until_its_last_reference
+);
+
+/// Truncating DOWN releases every block wholly past the new EOF
+/// (`ext4_truncate` -> `ext4_ind_truncate` / `ext4_ext_remove_space`). NARF
+/// shrank only `i_size` and kept the blocks mapped, so the next extension —
+/// a write past a hole, `ftruncate` up, an extending `fallocate` — read the
+/// old bytes back where Linux guarantees zeros. fstests' fsx found it within
+/// 60 operations, with and without mmap.
+fn smoke_ext2_truncate_down_frees_blocks_past_eof() -> TestResult {
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    const BS: u64 = testing::BLOCK_SIZE as u64;
+    // Six direct blocks of data, then one byte at block 14, which needs the
+    // single-indirect block.
+    let content = [0x5au8; 6000];
+    let device = GatedCountingBlock::new(testing::hard_link_image(&content));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    if !matches!(poll_once(file.write(14 * BS, &[0xa5])), Some(Ok(1))) {
+        return TestResult::Fail("write through the single-indirect block failed");
+    }
+    let before = file.stat().blocks;
+    // Keep blocks 0 and 1 (1500 bytes ends inside block 1).
+    if poll_once(file.truncate(1500)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("truncate down failed");
+    }
+    // Released: direct blocks 2..=5, block 14 and the indirect block.
+    let sectors = BS / 512;
+    if file.stat().blocks + 6 * sectors != before {
+        return TestResult::Fail("truncate down did not release the blocks past EOF");
+    }
+    if poll_once(file.truncate(15 * BS)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("re-extending truncate failed");
+    }
+    let mut buf = alloc::vec![0u8; 15 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read after re-extension failed");
+    }
+    if buf[..1500].iter().any(|&b| b != 0x5a) {
+        return TestResult::Fail("truncate damaged the bytes before the new EOF");
+    }
+    if buf[1500..].iter().any(|&b| b != 0) {
+        return TestResult::Fail("re-extension read back bytes from before the truncate");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_truncate_down_frees_blocks_past_eof
+);
+
+/// The extent-tree half of [`smoke_ext2_truncate_down_frees_blocks_past_eof`]
+/// (`ext4_ext_remove_space(inode, first, EXT_MAX_BLOCKS - 1)`): extents past
+/// the cut are freed, one straddling it is trimmed, and a tree that grew a
+/// leaf block keeps working after the cut.
+fn smoke_ext4_extent_truncate_down_frees_blocks_past_eof() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    const BS: u64 = 1024;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Blocks 0, 2, 4, ..., 14 written, the rest holes: eight one-block
+    // extents, more than the in-inode root holds, so the tree gains a leaf.
+    for i in 0..8u64 {
+        if !matches!(
+            poll_once(file.write(2 * i * BS, &[0xa0 + i as u8; 3])),
+            Some(Ok(3))
+        ) {
+            return TestResult::Fail("seeding the extents failed");
+        }
+    }
+    // A three-block extent at 16..=18 that the cut will split.
+    if !matches!(
+        poll_once(file.write(16 * BS, &[0xee; 3 * BS as usize])),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("seeding the straddling extent failed");
+    }
+    let before = file.stat().blocks;
+    // Keep through block 16, into which the new EOF falls.
+    let cut = 16 * BS + 10;
+    if poll_once(file.truncate(cut)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("truncate down failed");
+    }
+    // Released: blocks 17 and 18 of the straddling extent.
+    if file.stat().blocks + 2 * (BS / 512) != before {
+        return TestResult::Fail("truncate down did not trim the straddling extent");
+    }
+    // Then cut into the middle of the one-block extents: 8, 10, 12, 14 and
+    // what is left of the straddling extent (16) go — seven blocks in all.
+    if poll_once(file.truncate(7 * BS)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("second truncate down failed");
+    }
+    if file.stat().blocks + 7 * (BS / 512) != before {
+        return TestResult::Fail("truncate down did not free the extents past EOF");
+    }
+    if poll_once(file.truncate(20 * BS)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("re-extending truncate failed");
+    }
+    let mut buf = alloc::vec![0u8; 20 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read after re-extension failed");
+    }
+    for i in 0..4u64 {
+        let at = (2 * i * BS) as usize;
+        if buf[at..at + 3] != [0xa0 + i as u8; 3] {
+            return TestResult::Fail("truncate damaged an extent before the new EOF");
+        }
+    }
+    if buf[7 * BS as usize..].iter().any(|&b| b != 0) {
+        return TestResult::Fail("re-extension read back bytes from before the truncate");
+    }
+    // The trimmed tree still grows.
+    if !matches!(poll_once(file.write(9 * BS, b"new")), Some(Ok(3))) {
+        return TestResult::Fail("writing into the trimmed tree failed");
+    }
+    let mut back = [0u8; 3];
+    if !matches!(poll_once(file.read(9 * BS, &mut back)), Some(Ok(3))) || &back != b"new" {
+        return TestResult::Fail("data written into the trimmed tree did not read back");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_extent_truncate_down_frees_blocks_past_eof
 );
 
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`

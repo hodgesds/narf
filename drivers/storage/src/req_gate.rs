@@ -32,11 +32,20 @@ impl<'a> ReqGate<'a> {
     /// quiescent states and the sleep pumps continue to run on this
     /// CPU while we wait.
     pub(crate) fn acquire(flag: &'a AtomicBool) -> ReqGate<'a> {
+        let mut spins: u32 = 0;
         while flag
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             core::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            // A caller with IRQs masked cannot take a TLB-shootdown IPI; drain
+            // pending ones while waiting (see
+            // `narf_lib::sync::service_masked_spin`), every 256 spins like
+            // `IrqSafeSpinLock`.
+            if spins & 0xFF == 0 {
+                narf_lib::sync::service_masked_spin();
+            }
         }
         ReqGate(flag)
     }
