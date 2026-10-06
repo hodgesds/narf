@@ -4289,6 +4289,11 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
             Some(Some(Err(narf_filesystem::FsError::Unsupported))) => {
                 ctx.set_return(errno_ret(EPERM))
             }
+            // A read-only filesystem refusing the new name is EROFS, never
+            // the EXDEV this branch's fallback reports.
+            Some(Some(Err(narf_filesystem::FsError::ReadOnly))) => {
+                ctx.set_return(errno_ret(EROFS))
+            }
             _ => ctx.set_return(errno_ret(EXDEV)),
         }
         return;

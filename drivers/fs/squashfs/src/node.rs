@@ -338,6 +338,12 @@ impl<B: BlockDevice + 'static> DirOps for SquashfsNode<B> {
 }
 
 impl<B: BlockDevice + 'static> FsInstance for SquashfsVolume<B> {
+    /// Linux `squashfs_fill_super` sets `SB_RDONLY` unconditionally: every mount is
+    /// read-only, so writes are EROFS at the mount, before the filesystem.
+    fn always_read_only(&self) -> bool {
+        true
+    }
+
     fn root(&self) -> Arc<dyn DirOps> {
         let volume = self
             .self_weak

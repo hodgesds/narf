@@ -615,3 +615,18 @@ fn smoke_iso9660_timezone_edges() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/iso9660", smoke_iso9660_timezone_edges);
+
+/// Every isofs mount Linux accepts is read-only (`isofs_fill_super` refuses
+/// read-write), so the VFS refuses writes at the mount with EROFS.
+fn smoke_iso9660_always_read_only() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let Some(volume) = mount_dated(build_iso9660_dated_image()) else {
+        return TestResult::Fail("dated image did not mount");
+    };
+    if !volume.always_read_only() {
+        return TestResult::Fail("iso9660 does not declare every mount read-only");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/iso9660", smoke_iso9660_always_read_only);

@@ -2161,7 +2161,10 @@ fn smoke_dev_mknod_char_node() -> TestResult {
     if node.rdev() != rdev {
         return TestResult::Fail("mknod char node st_rdev != requested dev_t");
     }
-    if !matches!(node.open_instance_checked(false), Err(FsError::NoDeviceAddress)) {
+    if !matches!(
+        node.open_instance_checked(false),
+        Err(FsError::NoDeviceAddress)
+    ) {
         return TestResult::Fail("unclaimed mknod node did not reject ordinary open with ENXIO");
     }
     // It is now discoverable via lookup and enumerate.

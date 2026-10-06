@@ -399,3 +399,20 @@ fn smoke_squashfs_link_is_erofs() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/squashfs", smoke_squashfs_link_is_erofs);
+
+/// Linux `squashfs_fill_super` sets `SB_RDONLY` on every mount, so the VFS
+/// marks the mount read-only and refuses writes with EROFS before the
+/// filesystem runs — even when `mount` was not given `-o ro`.
+fn smoke_squashfs_always_read_only() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let volume = match mount_image(TIMES_FIXTURE.to_vec()) {
+        Ok(volume) => volume,
+        Err(_) => return TestResult::Fail("times fixture did not mount"),
+    };
+    if !volume.always_read_only() {
+        return TestResult::Fail("SquashFS does not declare every mount read-only");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/squashfs", smoke_squashfs_always_read_only);

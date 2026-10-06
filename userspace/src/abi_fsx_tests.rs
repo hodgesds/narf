@@ -5691,3 +5691,96 @@ fn smoke_abi_fsx_link_without_link_op_is_eperm() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_link_without_link_op_is_eperm);
+
+/// A filesystem whose every mount is read-only (Linux `fill_super` setting
+/// `SB_RDONLY`, as squashfs does) refuses writes at the mount even when
+/// `mount` was not asked for `ro`: `mnt_want_write` is EROFS before any
+/// filesystem operation. Before `FsInstance::always_read_only`, a squashfs
+/// mounted without `-o ro` let `link(2)` reach the driver, and the
+/// cross-directory branch reported EXDEV.
+struct AlwaysReadOnlyFs(narf_filesystem::MemFs);
+
+impl narf_filesystem::FsInstance for AlwaysReadOnlyFs {
+    fn root(&self) -> alloc::sync::Arc<dyn narf_filesystem::DirOps> {
+        self.0.root()
+    }
+    fn name(&self) -> &str {
+        "always-ro"
+    }
+    fn always_read_only(&self) -> bool {
+        true
+    }
+}
+
+fn smoke_abi_fsx_always_read_only_fs_is_erofs() -> TestResult {
+    setup();
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+    let fs = AlwaysReadOnlyFs(narf_filesystem::MemFs::with_seeds(
+        "always-ro",
+        &[("f", b"data")],
+    ));
+    let mnt = match registry().mount(&auth, "/abi-always-ro", fs) {
+        Ok(h) => h,
+        Err(_) => {
+            teardown();
+            return TestResult::Fail("mount of the always-read-only filesystem failed");
+        }
+    };
+    let outcome = (|| -> Result<(), &'static str> {
+        const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+        let old = b"/abi-always-ro/f\0";
+        let new = b"/abi-always-ro/g\0";
+        let rc = if wired(Syscall::Link) {
+            call(
+                Syscall::Link.raw(),
+                a1(old.as_ptr() as u64, new.as_ptr() as u64),
+            )
+        } else {
+            call(
+                Syscall::Linkat.raw(),
+                a4(
+                    AT_FDCWD,
+                    old.as_ptr() as u64,
+                    AT_FDCWD,
+                    new.as_ptr() as u64,
+                    0,
+                ),
+            )
+        };
+        if rc != Some(EROFS) {
+            return Err("link on an always-read-only mount was not EROFS");
+        }
+        const O_WRONLY: u64 = 1;
+        const O_CREAT: u64 = 0o100;
+        if call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, new.as_ptr() as u64, O_WRONLY | O_CREAT, 0o644),
+        ) != Some(EROFS)
+        {
+            return Err("O_CREAT on an always-read-only mount was not EROFS");
+        }
+        let dir = b"/abi-always-ro/d\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(EROFS) {
+            return Err("mkdir on an always-read-only mount was not EROFS");
+        }
+        // Reading is unaffected.
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, old.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                Ok(())
+            }
+            _ => Err("a read-only open on an always-read-only mount failed"),
+        }
+    })();
+    let _ = registry().unmount(&mnt, "/abi-always-ro");
+    teardown();
+    match outcome {
+        Ok(()) => TestResult::Pass,
+        Err(why) => TestResult::Fail(why),
+    }
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_always_read_only_fs_is_erofs);

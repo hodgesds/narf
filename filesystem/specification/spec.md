@@ -65,6 +65,23 @@ options, creator uid/gid and whether this is the initial mount namespace.
   Linux ABI installation before those syscalls are exposed.
 - Root-device format detection retains its separate `FsType` factory map;
   that map chooses a driver from on-disk signatures, not a userspace type name.
+- `FsInstance::always_read_only()` (default `false`) declares that every mount
+  of the instance is read-only, as Linux `fill_super` setting `SB_RDONLY`
+  does (squashfs; iso9660, whose read-write mounts Linux refuses). Every
+  mount path ORs `mnt_flags::READONLY` into such a mount, so writes are EROFS
+  at `mnt_want_write`, before any filesystem operation.
+
+### 3.0b Inode timestamps
+
+`InodeAttrs` carries `atime_ns`, `ctime_ns` and `mtime_ns`: exact wall-clock
+nanoseconds as the filesystem stores them, 0 meaning "not tracked". `stat` and
+`statx` prefer `mtime_ns` over `Stat::mtime_cycles`, whose ns→cycles→ns
+round trip is not exact. A directory's mtime comes from
+`DirOps::dir_mtime_ns()`. Disk filesystems report their on-disk times exactly
+for files and directories, at the format's precision (ext4's `*_extra`
+nanoseconds, btrfs nanoseconds, FAT 2 s, exFAT 10 ms with UTC offset, udf
+microseconds with timezone, iso9660 recording date with GMT offset, whole
+seconds for minix/squashfs/9P2000). Times before the epoch clamp to 0.
 
 `devfs::register_provider(DeviceProvider)` registers a named device family with
 file lookup, directory lookup and enumeration callbacks. Replacement is

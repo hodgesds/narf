@@ -269,6 +269,17 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
 }
 
 impl<B: BlockDevice + 'static> FsInstance for Iso9660Volume<B> {
+    /// Every isofs mount that Linux accepts is read-only: `isofs_fill_super`
+    /// ("We don't support read-write mounts") refuses anything else. Writes
+    /// are therefore EROFS at the mount, before the filesystem.
+    ///
+    /// LINUX-GAP: Linux rejects a read-WRITE isofs `mount(2)` with EACCES
+    /// (util-linux then retries read-only); NARF has no `mount(2)` path for
+    /// iso9660 yet and forces its internal mounts read-only instead.
+    fn always_read_only(&self) -> bool {
+        true
+    }
+
     fn root(&self) -> Arc<dyn DirOps> {
         let record = self.root_record();
         let volume = self

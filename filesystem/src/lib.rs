@@ -2397,6 +2397,15 @@ pub trait FsInstance: Send + Sync + 'static {
         self as *const Self as *const () as usize
     }
 
+    /// Whether every mount of this filesystem is read-only regardless of the
+    /// requested flags — Linux filesystems whose `fill_super` sets
+    /// `SB_RDONLY` unconditionally (squashfs, isofs). The VFS then refuses
+    /// writes at the mount (`mnt_want_write` -> EROFS) before any filesystem
+    /// operation runs, so e.g. `link(2)` is EROFS, never EXDEV or EPERM.
+    fn always_read_only(&self) -> bool {
+        false
+    }
+
     /// The single file this mount exposes, when the mount root is a FILE
     /// rather than a directory (Linux `mount --bind <file> <file2>`). Default
     /// `None` — a normal directory-rooted filesystem. A resolver that lands on
@@ -4398,6 +4407,11 @@ impl MountNamespace {
         flags: u64,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
+        let flags = if fs.always_read_only() {
+            flags | mnt_flags::READONLY
+        } else {
+            flags
+        };
         let root = pathwalk::Dentry::root(fs.root());
         let handle = Cap::<MountPoint, Write>::bootstrap();
         let store = self.store();
@@ -4829,6 +4843,11 @@ impl VfsRegistry {
         authority.check_live()?;
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let arc: Arc<dyn FsInstance> = Arc::new(fs);
+        let flags = if arc.always_read_only() {
+            flags | mnt_flags::READONLY
+        } else {
+            flags
+        };
         let root = pathwalk::Dentry::root(arc.root());
         let mut q = self.inner.lock();
         q.push(Mount {
@@ -4875,6 +4894,11 @@ impl VfsRegistry {
         flags: u64,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
+        let flags = if fs.always_read_only() {
+            flags | mnt_flags::READONLY
+        } else {
+            flags
+        };
         let handle: Cap<MountPoint, Write> = Cap::<MountPoint, Write>::bootstrap();
         let root = pathwalk::Dentry::root(fs.root());
         let mut q = self.inner.lock();
