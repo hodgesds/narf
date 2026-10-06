@@ -52,11 +52,13 @@ pub mod gatt_server;
 pub mod h4;
 pub mod h5;
 pub mod hci;
+pub mod hci_sock;
 pub mod hfp;
 pub mod hid_profile;
 pub mod hogp;
 pub mod l2cap;
 pub mod mesh;
+pub mod mgmt;
 pub mod opcode;
 pub mod profiles;
 pub mod rfcomm;
@@ -146,6 +148,22 @@ pub fn register_initcalls() {
     // Linux ref: net/bluetooth/hci_sysfs.c:bt_sysfs_init().
     narf_init::register(Stage::Late, "bluetooth-sysfs", || {
         let _ = narf_filesystem::sysfs::class_register("bluetooth");
+        InitResult::Ok
+    });
+    // Stage: install the mgmt (HCI_CHANNEL_CONTROL) handler so AF_BLUETOOTH
+    // sockets reach the native controller registry. Linux ref:
+    // net/bluetooth/mgmt.c.
+    narf_init::register(Stage::Late, "bluetooth-mgmt", || {
+        narf_filesystem::bluetooth::install_mgmt_handler(crate::mgmt::handle);
+        narf_filesystem::bluetooth::install_hci_handlers(
+            crate::hci_sock::send,
+            crate::hci_sock::drain_event,
+        );
+        narf_filesystem::bluetooth::install_hci_ioctl_handlers(
+            crate::hci_sock::dev_count,
+            crate::hci_sock::dev_info,
+            crate::hci_sock::dev_power,
+        );
         InitResult::Ok
     });
 }

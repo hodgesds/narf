@@ -94,6 +94,25 @@ pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 /// `AF_NETLINK` (16); they occupy different argument slots.
 pub const NETLINK_GENERIC: u32 = 16;
 
+/// Linux `AF_BLUETOOTH` (include/linux/socket.h). BlueZ (`bluetoothd`,
+/// `btmgmt`) opens `socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)` and selects a
+/// channel via `bind(sockaddr_hci)`; the mgmt API is `HCI_CHANNEL_CONTROL`.
+pub const AF_BLUETOOTH: u16 = 31;
+/// `BT_MAX_PROTO` = `BTPROTO_LAST(ISO=8) + 1` (net/bluetooth/af_bluetooth.c).
+pub const BT_MAX_PROTO: i32 = 9;
+/// `BTPROTO_HCI` (include/net/bluetooth/bluetooth.h). The only Bluetooth
+/// protocol NARF implements so far — raw HCI + the mgmt channel.
+pub const BTPROTO_HCI: u32 = 1;
+/// `sockaddr_hci.hci_channel` values (include/net/bluetooth/hci_sock.h).
+pub const HCI_CHANNEL_RAW: u16 = 0;
+pub const HCI_CHANNEL_USER: u16 = 1;
+pub const HCI_CHANNEL_MONITOR: u16 = 2;
+pub const HCI_CHANNEL_CONTROL: u16 = 3;
+pub const HCI_CHANNEL_LOGGING: u16 = 4;
+/// `sockaddr_hci.hci_dev` sentinel meaning "no specific controller" — used by
+/// the mgmt/monitor channels (include/net/bluetooth/hci_sock.h).
+pub const HCI_DEV_NONE: u16 = 0xffff;
+
 /// `sockaddr_nl` body (the bytes after the 2-byte `nl_family`) identifying
 /// the KERNEL as a uevent's sender: `nl_pad=0`, `nl_pid=0` (kernel),
 /// `nl_groups=1` (the KERNEL uevent group). libudev/udevd reject monitor
@@ -949,6 +968,9 @@ struct IcmpEchoState {
 
 static NEXT_NETLINK_PORTID: AtomicU32 = AtomicU32::new(1);
 static NETLINK_SOCKETS: IrqSafeSpinLock<Vec<Weak<SocketFile>>> = IrqSafeSpinLock::new(Vec::new());
+/// Open `AF_BLUETOOTH` sockets, tracked weakly so the mgmt/HCI event sink can
+/// fan asynchronous events (INDEX_ADDED, …) out to subscribed channels.
+static BLUETOOTH_SOCKETS: IrqSafeSpinLock<Vec<Weak<SocketFile>>> = IrqSafeSpinLock::new(Vec::new());
 
 /// Faithful per-socket storage for set/getsockopt values. Defaults
 /// match Linux's documented defaults. Fields that affect packet
@@ -1387,6 +1409,19 @@ enum SocketState {
     NetlinkSockDiag { replies: VecDeque<Vec<u8>> },
     /// `NETLINK_NETFILTER` response queue for nfnetlink conntrack dumps.
     NetlinkNetfilter { replies: VecDeque<Vec<u8>> },
+    /// `AF_BLUETOOTH` / `BTPROTO_HCI`. `channel` (HCI_CHANNEL_*) is chosen by
+    /// `bind(sockaddr_hci)` and selects the semantics: `CONTROL` is the mgmt
+    /// API, `RAW`/`USER` carry raw HCI for controller `dev`. mgmt/HCI replies
+    /// and asynchronous events queue in `replies`.
+    Bluetooth {
+        dev: u16,
+        channel: u16,
+        replies: VecDeque<Vec<u8>>,
+        /// Raw `struct hci_filter` from setsockopt(SOL_HCI, HCI_FILTER).
+        /// `None` passes every event (a lenient default); `Some` applies the
+        /// type + event-code masks on recv.
+        filter: Option<Vec<u8>>,
+    },
 }
 
 /// Deliver a UDP datagram that arrived from the wire to a bound AF_INET or
@@ -1712,6 +1747,16 @@ impl SocketFile {
                 );
             }
             SocketState::NetlinkUevent { reader }
+        } else if domain == AF_BLUETOOTH && protocol == BTPROTO_HCI {
+            // The HCI channel is chosen later by bind(sockaddr_hci); an
+            // unbound HCI socket defaults to the RAW channel (Linux
+            // hci_sock_create sets hci_pi(sk)->channel = HCI_CHANNEL_RAW).
+            SocketState::Bluetooth {
+                dev: HCI_DEV_NONE,
+                channel: HCI_CHANNEL_RAW,
+                replies: VecDeque::new(),
+                filter: None,
+            }
         } else {
             SocketState::Fresh
         };
@@ -1775,6 +1820,9 @@ impl SocketFile {
         });
         if domain == AF_NETLINK {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
+        }
+        if domain == AF_BLUETOOTH {
+            BLUETOOTH_SOCKETS.lock().push(Arc::downgrade(&socket));
         }
         socket
     }
@@ -3313,6 +3361,69 @@ impl FileOps for SocketFile {
         if cmd == SIOCETHTOOL {
             return self.ethtool_ioctl(arg);
         }
+        // Legacy HCI ioctls (hciconfig) on an AF_BLUETOOTH socket. DEVUP/DOWN
+        // take the dev id by value; GETDEVLIST/GETDEVINFO take a user pointer.
+        if self.domain == AF_BLUETOOTH {
+            const HCIDEVUP: u32 = 0x4004_48c9;
+            const HCIDEVDOWN: u32 = 0x4004_48ca;
+            const HCIGETDEVLIST: u32 = 0x8004_48d2;
+            const HCIGETDEVINFO: u32 = 0x8004_48d3;
+            match cmd {
+                HCIDEVUP | HCIDEVDOWN => {
+                    if narf_filesystem::bluetooth::hci_dev_power(arg as u16, cmd == HCIDEVUP) {
+                        return Ok(0);
+                    }
+                    return Err(FsError::NoDevice);
+                }
+                HCIGETDEVLIST => {
+                    // struct hci_dev_list_req { u16 dev_num; dev_req[] }; the
+                    // caller sets dev_num to the array capacity.
+                    let mut cap = [0u8; 2];
+                    // SAFETY: copy_from_user validates `arg` as a user address;
+                    // we read the 2-byte dev_num capacity field.
+                    if unsafe { crate::handlers::copy_from_user(&mut cap, arg as u64) }.is_err() {
+                        return Err(FsError::InvalidData);
+                    }
+                    let capacity = u16::from_le_bytes(cap) as usize;
+                    let count = narf_filesystem::bluetooth::hci_dev_count().min(capacity);
+                    let mut out = Vec::with_capacity(4 + count * 8);
+                    out.extend_from_slice(&(count as u16).to_le_bytes());
+                    out.extend_from_slice(&[0u8; 2]); // pad before dev_req[]
+                    for i in 0..count {
+                        out.extend_from_slice(&(i as u16).to_le_bytes()); // dev_id
+                        out.extend_from_slice(&[0u8; 2]); // pad
+                        out.extend_from_slice(&0u32.to_le_bytes()); // dev_opt
+                    }
+                    // SAFETY: copy_to_user validates `arg`; `out` is the
+                    // list_req header + `count` dev_req entries we just built.
+                    if unsafe { crate::handlers::copy_to_user(arg as u64, &out) }.is_err() {
+                        return Err(FsError::InvalidData);
+                    }
+                    return Ok(0);
+                }
+                HCIGETDEVINFO => {
+                    // struct hci_dev_info with dev_id set on input.
+                    let mut id = [0u8; 2];
+                    // SAFETY: copy_from_user validates `arg`; we read the
+                    // 2-byte dev_id input field.
+                    if unsafe { crate::handlers::copy_from_user(&mut id, arg as u64) }.is_err() {
+                        return Err(FsError::InvalidData);
+                    }
+                    let Some(info) =
+                        narf_filesystem::bluetooth::hci_dev_info(u16::from_le_bytes(id))
+                    else {
+                        return Err(FsError::NoDevice);
+                    };
+                    // SAFETY: copy_to_user validates `arg`; `info` is the
+                    // 92-byte hci_dev_info the stack packed.
+                    if unsafe { crate::handlers::copy_to_user(arg as u64, &info) }.is_err() {
+                        return Err(FsError::InvalidData);
+                    }
+                    return Ok(0);
+                }
+                _ => {}
+            }
+        }
         const SIOCGIFFLAGS: u32 = 0x8913;
         const SIOCSIFFLAGS: u32 = 0x8914;
         const SIOCGIFADDR: u32 = 0x8915;
@@ -4016,6 +4127,15 @@ impl SocketFile {
             // No-op sink (audit/netfilter/etc.): always writable (sends are
             // accepted + dropped), never readable (nothing is ever queued).
             SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
+            // AF_BLUETOOTH/HCI: always sendable; readable when a mgmt/HCI
+            // reply or event is queued.
+            SocketState::Bluetooth { replies, .. } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
         }
     }
 
@@ -4077,6 +4197,11 @@ impl SocketFile {
         // route it before the cross-family defaults consume those ops.
         if self.domain == AF_PACKET {
             return self.dispatch_packet(op);
+        }
+        // AF_BLUETOOTH owns getsockname/bind/options for its sockaddr_hci, so
+        // route it before the cross-family defaults (like AF_PACKET).
+        if self.domain == AF_BLUETOOTH {
+            return self.dispatch_bluetooth(op);
         }
         let op = match op {
             SocketOp::Recv { buf, flags }
@@ -4185,6 +4310,201 @@ impl SocketFile {
             (AF_NETLINK, _) => self.dispatch_netlink(op),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }
+    }
+
+    /// Build a `sockaddr_hci` (family + `hci_dev` + `hci_channel`, LE) for the
+    /// socket's current binding — getsockname on an `AF_BLUETOOTH`/HCI socket.
+    fn bluetooth_sockaddr(&self) -> SockAddr {
+        let (dev, channel) = match &*self.state.lock() {
+            SocketState::Bluetooth { dev, channel, .. } => (*dev, *channel),
+            _ => (HCI_DEV_NONE, HCI_CHANNEL_RAW),
+        };
+        let mut body = Vec::with_capacity(4);
+        body.extend_from_slice(&dev.to_le_bytes());
+        body.extend_from_slice(&channel.to_le_bytes());
+        SockAddr {
+            family: AF_BLUETOOTH,
+            body,
+        }
+    }
+
+    /// `bind(sockaddr_hci)` — select the HCI device + channel. Mirrors the
+    /// range checks in `hci_sock_bind`: a malformed address or an unknown
+    /// channel is -EINVAL.
+    fn bind_bluetooth(&self, addr: &SockAddr) -> SocketOpResult {
+        if addr.family != AF_BLUETOOTH || addr.body.len() < 4 {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let dev = u16::from_le_bytes([addr.body[0], addr.body[1]]);
+        let channel = u16::from_le_bytes([addr.body[2], addr.body[3]]);
+        match channel {
+            HCI_CHANNEL_RAW | HCI_CHANNEL_USER => {}
+            // Device-independent channels (mgmt/monitor/logging) carry the
+            // controller index in-band, so they bind with HCI_DEV_NONE.
+            HCI_CHANNEL_CONTROL | HCI_CHANNEL_MONITOR | HCI_CHANNEL_LOGGING => {
+                if dev != HCI_DEV_NONE {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+            }
+            _ => return SocketOpResult::Err(SockError::InvalidArg),
+        }
+        let mut state = self.state.lock();
+        match &mut *state {
+            SocketState::Bluetooth {
+                dev: d, channel: c, ..
+            } => {
+                *d = dev;
+                *c = channel;
+                SocketOpResult::Ok(0)
+            }
+            _ => SocketOpResult::Err(SockError::InvalidArg),
+        }
+    }
+
+    /// `AF_BLUETOOTH` / `BTPROTO_HCI` dispatcher. The bound HCI channel selects
+    /// the semantics; the mgmt (CONTROL) command/event flow and raw HCI event
+    /// delivery queue into the socket's `replies`, consumed by `recv`.
+    fn dispatch_bluetooth(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        match op {
+            SocketOp::Bind { addr } => self.bind_bluetooth(&addr),
+            SocketOp::GetSockName => SocketOpResult::Addr(self.bluetooth_sockaddr()),
+            SocketOp::GetPeerName => SocketOpResult::Err(SockError::NotConnected),
+            // SOL_HCI(0) / HCI_FILTER(2): store the raw struct hci_filter for
+            // the raw/user channel recv path. Other options fall through to the
+            // generic handler.
+            SocketOp::SetSockOpt { level, name, value } if level == 0 && name == 2 => {
+                let mut state = self.state.lock();
+                if let SocketState::Bluetooth { filter, .. } = &mut *state {
+                    *filter = Some(value.to_vec());
+                    SocketOpResult::Ok(0)
+                } else {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
+            }
+            SocketOp::SetSockOpt { level, name, value } => {
+                self.handle_setsockopt(level, name, value)
+            }
+            SocketOp::GetSockOpt { level, name, buf } => self.handle_getsockopt(level, name, buf),
+            SocketOp::Recv { buf, flags } => {
+                let (channel, dev, filter) = match &*self.state.lock() {
+                    SocketState::Bluetooth {
+                        channel,
+                        dev,
+                        filter,
+                        ..
+                    } => (*channel, *dev, filter.clone()),
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                let message = if channel == HCI_CHANNEL_CONTROL {
+                    // mgmt: drain the per-socket reply/event queue.
+                    let mut state = self.state.lock();
+                    match &mut *state {
+                        SocketState::Bluetooth { replies, .. } => {
+                            if flags & MSG_PEEK != 0 {
+                                replies.front().cloned()
+                            } else {
+                                replies.pop_front()
+                            }
+                        }
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    }
+                } else {
+                    // Raw/user: drain the controller's HCI events, skipping any
+                    // the socket's filter rejects (bounded to avoid spinning).
+                    let mut found = None;
+                    for _ in 0..64 {
+                        match narf_filesystem::bluetooth::hci_drain(dev) {
+                            Some(pkt) => {
+                                if Self::hci_filter_passes(filter.as_deref(), &pkt) {
+                                    found = Some(pkt);
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    found
+                };
+                match message {
+                    Some(message) => {
+                        let n = buf.len().min(message.len());
+                        buf[..n].copy_from_slice(&message[..n]);
+                        let peer = Some(self.bluetooth_sockaddr());
+                        if n < message.len() {
+                            SocketOpResult::ReceivedTruncated {
+                                copied: n,
+                                full_len: message.len(),
+                                peer,
+                            }
+                        } else {
+                            SocketOpResult::Received { n, peer }
+                        }
+                    }
+                    None => SocketOpResult::Err(SockError::WouldBlock),
+                }
+            }
+            SocketOp::Send { buf, .. } => {
+                let channel = match &*self.state.lock() {
+                    SocketState::Bluetooth { channel, .. } => *channel,
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                if channel == HCI_CHANNEL_CONTROL {
+                    // mgmt command. Linux `mgmt_control` rejects a frame shorter
+                    // than `struct mgmt_hdr` (6 bytes) with -EINVAL.
+                    if buf.len() < 6 {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    // The native BT stack (narf-bluetooth) installs the mgmt
+                    // handler via the filesystem broker at boot; without it the
+                    // channel accepts commands but produces no reply.
+                    if let Some(replies) = narf_filesystem::bluetooth::mgmt_handle(buf) {
+                        let mut state = self.state.lock();
+                        if let SocketState::Bluetooth { replies: queue, .. } = &mut *state {
+                            queue.extend(replies);
+                        }
+                    }
+                    // Wake any poller parked on this fd; recv drains the queue.
+                    narf_net::readiness::notify(0);
+                    SocketOpResult::Ok(buf.len() as u64)
+                } else {
+                    // Raw/user channel: forward the type-prefixed HCI packet to
+                    // the bound controller's transport.
+                    let dev = match &*self.state.lock() {
+                        SocketState::Bluetooth { dev, .. } => *dev,
+                        _ => return SocketOpResult::Err(SockError::InvalidArg),
+                    };
+                    let _ = narf_filesystem::bluetooth::hci_send(dev, buf);
+                    SocketOpResult::Ok(buf.len() as u64)
+                }
+            }
+            SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
+    }
+
+    /// Apply a `struct hci_filter` to a type-prefixed HCI packet: pass when the
+    /// packet type is set in `type_mask` and (for events) the event code is set
+    /// in `event_mask`. `None`/short filter passes everything. Mirrors Linux
+    /// `hci_sock.c` `hci_test_bit` checks in `hci_sock_recvmsg`.
+    fn hci_filter_passes(filter: Option<&[u8]>, pkt: &[u8]) -> bool {
+        let Some(f) = filter else { return true };
+        if f.len() < 4 || pkt.is_empty() {
+            return true;
+        }
+        let type_mask = u32::from_le_bytes([f[0], f[1], f[2], f[3]]);
+        let ptype = pkt[0] as u32;
+        if ptype < 32 && type_mask & (1 << ptype) == 0 {
+            return false;
+        }
+        // Event packets (0x04): also gate on the 64-bit event-code mask.
+        if pkt[0] == 0x04 && pkt.len() >= 2 && f.len() >= 12 {
+            let event_mask = u64::from_le_bytes(f[4..12].try_into().unwrap_or([0; 8]));
+            let code = pkt[1] as u64;
+            if code < 64 && event_mask & (1 << code) == 0 {
+                return false;
+            }
+        }
+        true
     }
 
     /// `AF_NETLINK` / `NETLINK_ROUTE` (rtnetlink) dispatcher. A `send` of an

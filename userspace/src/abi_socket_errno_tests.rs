@@ -13,6 +13,8 @@ const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
 const AF_INET6: u64 = 10;
 const AF_NETLINK: u64 = 16;
+const AF_BLUETOOTH: u64 = 31;
+const BTPROTO_HCI: u64 = 1;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
@@ -272,6 +274,172 @@ fn smoke_abi_socket_errno_socket_family_type_order() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket_errno",
     smoke_abi_socket_errno_socket_family_type_order
+);
+
+/// AF_BLUETOOTH/BTPROTO_HCI create + bind error codes, matching Linux
+/// `bt_sock_create` / `hci_sock_create` / `hci_sock_bind`.
+fn smoke_abi_socket_errno_bluetooth_hci() -> TestResult {
+    with_setup(|| {
+        // A raw HCI socket is valid.
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        // Wrong socket type → ESOCKTNOSUPPORT (hci_sock_create accepts RAW).
+        if sys(
+            Syscall::SocketOpen,
+            a2(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_HCI),
+        ) != Some(ESOCKTNOSUPPORT)
+        {
+            return Err("AF_BLUETOOTH non-RAW type must be ESOCKTNOSUPPORT");
+        }
+        // protocol >= BT_MAX_PROTO → EINVAL (bt_sock_create range check).
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_RAW, 99)) != Some(EINVAL) {
+            return Err("AF_BLUETOOTH proto >= BT_MAX_PROTO must be EINVAL");
+        }
+        // In-range but unregistered protocol (BTPROTO_L2CAP=0) → EPROTONOSUPPORT.
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_RAW, 0)) != Some(EPROTONOSUPPORT) {
+            return Err("unimplemented BT protocol must be EPROTONOSUPPORT");
+        }
+        // bind(sockaddr_hci{dev=HCI_DEV_NONE, channel=CONTROL}) — the mgmt
+        // channel binds device-independent.
+        let mut control = [0u8; 6];
+        control[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        control[2..4].copy_from_slice(&0xffffu16.to_le_bytes()); // HCI_DEV_NONE
+        control[4..6].copy_from_slice(&3u16.to_le_bytes()); // HCI_CHANNEL_CONTROL
+        if bind(fd, &control) != Some(0) {
+            return Err("bind to the mgmt control channel must succeed");
+        }
+        // An unknown channel is -EINVAL (hci_sock_bind).
+        let mut bad = control;
+        bad[4..6].copy_from_slice(&99u16.to_le_bytes());
+        let fd2 = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        if bind(fd2, &bad) != Some(EINVAL) {
+            return Err("bind to an unknown HCI channel must be EINVAL");
+        }
+        close(fd);
+        close(fd2);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_bluetooth_hci
+);
+
+/// End-to-end mgmt read API over an HCI_CHANNEL_CONTROL socket: a
+/// READ_VERSION command returns a CMD_COMPLETE wrapping it. Exercises the
+/// socket -> filesystem broker -> narf_bluetooth::mgmt path.
+fn smoke_abi_socket_bluetooth_mgmt_read_version() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        let mut control = [0u8; 6];
+        control[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        control[2..4].copy_from_slice(&0xffffu16.to_le_bytes()); // HCI_DEV_NONE
+        control[4..6].copy_from_slice(&3u16.to_le_bytes()); // HCI_CHANNEL_CONTROL
+        if bind(fd, &control) != Some(0) {
+            return Err("bind to mgmt control channel failed");
+        }
+        // mgmt_hdr{ opcode=READ_VERSION(1), index=MGMT_INDEX_NONE, len=0 }.
+        let cmd = [0x01, 0x00, 0xff, 0xff, 0x00, 0x00];
+        if send(fd, &cmd, 0) != Some(cmd.len() as i64) {
+            return Err("mgmt READ_VERSION send failed");
+        }
+        let mut buf = [0u8; 64];
+        let n = match recv(fd, &mut buf, 0) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("mgmt reply recv returned no data"),
+        };
+        // CMD_COMPLETE(0x0001), index NONE, body = READ_VERSION op + status 0.
+        if n < 9
+            || u16::from_le_bytes([buf[0], buf[1]]) != 0x0001
+            || u16::from_le_bytes([buf[2], buf[3]]) != 0xffff
+            || u16::from_le_bytes([buf[6], buf[7]]) != 0x0001
+            || buf[8] != 0x00
+        {
+            return Err("mgmt READ_VERSION reply shape mismatch");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_mgmt_read_version
+);
+
+/// Raw HCI channel plumbing: bind RAW, install an HCI_FILTER, send a
+/// type-prefixed command (accepted), and recv with no controller -> EAGAIN.
+fn smoke_abi_socket_bluetooth_hci_raw() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        let mut raw = [0u8; 6];
+        raw[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        raw[2..4].copy_from_slice(&0u16.to_le_bytes()); // dev 0
+        raw[4..6].copy_from_slice(&0u16.to_le_bytes()); // HCI_CHANNEL_RAW
+        if bind(fd, &raw) != Some(0) {
+            return Err("bind to the raw HCI channel failed");
+        }
+        // setsockopt(SOL_HCI=0, HCI_FILTER=2, struct hci_filter) is accepted.
+        let filter = [0u8; 14];
+        if setsockopt(fd, 0, 2, &filter) != Some(0) {
+            return Err("HCI_FILTER setsockopt was rejected");
+        }
+        // A type-prefixed HCI_Reset command is accepted (no controller to run it).
+        let cmd = [0x01u8, 0x03, 0x0c, 0x00];
+        if send(fd, &cmd, 0) != Some(cmd.len() as i64) {
+            return Err("raw HCI command send failed");
+        }
+        // With no controller bound there are no events: recv -> EAGAIN.
+        let mut buf = [0u8; 32];
+        if recv(fd, &mut buf, 0) != Some(EAGAIN) {
+            return Err("raw HCI recv with no events must be EAGAIN");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_hci_raw
+);
+
+/// Legacy HCI ioctls on an AF_BLUETOOTH socket: HCIGETDEVLIST returns the
+/// controller count (0 in QEMU), and HCIGETDEVINFO/HCIDEVUP on an absent
+/// controller are ENODEV (matching hci_sock.c).
+fn smoke_abi_socket_bluetooth_hci_ioctls() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        // HCIGETDEVLIST: dev_num capacity in, controller count out.
+        let mut list = [0u8; 4 + 4 * 8];
+        list[0..2].copy_from_slice(&4u16.to_le_bytes());
+        if sys(
+            Syscall::Ioctl,
+            a2(fd, 0x8004_48d2, list.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("HCIGETDEVLIST failed");
+        }
+        if u16::from_le_bytes([list[0], list[1]]) != 0 {
+            return Err("HCIGETDEVLIST count should be 0 with no controllers");
+        }
+        // HCIGETDEVINFO for dev 0 → ENODEV (no controller present).
+        let mut info = [0u8; 92];
+        if sys(
+            Syscall::Ioctl,
+            a2(fd, 0x8004_48d3, info.as_mut_ptr() as u64),
+        ) != Some(ENODEV)
+        {
+            return Err("HCIGETDEVINFO on an absent controller must be ENODEV");
+        }
+        // HCIDEVUP with dev id 0 by value → ENODEV.
+        if sys(Syscall::Ioctl, a2(fd, 0x4004_48c9, 0)) != Some(ENODEV) {
+            return Err("HCIDEVUP on an absent controller must be ENODEV");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_hci_ioctls
 );
 
 /// `inet_create`: SOCK_RAW without CAP_NET_RAW → EPERM (after the protocol

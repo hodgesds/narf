@@ -146,9 +146,9 @@ pub(super) fn validate_socket_create(
     task: u64,
 ) -> Result<(u16, u32, u32), i64> {
     use crate::socket::{
-        AF_BYPASS, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, IPPROTO_ICMP,
-        IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_PACKET, SOCK_RAW, SOCK_SEQPACKET,
-        SOCK_STREAM,
+        AF_BLUETOOTH, AF_BYPASS, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, BTPROTO_HCI,
+        BT_MAX_PROTO, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_PACKET, SOCK_RAW,
+        SOCK_SEQPACKET, SOCK_STREAM,
     };
     const NPROTO: i32 = 46; // AF_MAX, include/linux/socket.h
     const SOCK_MAX: u32 = 11; // SOCK_PACKET + 1, include/linux/net.h
@@ -233,6 +233,22 @@ pub(super) fn validate_socket_create(
                 return Err(ESOCKTNOSUPPORT);
             }
             Ok((domain, kind, raw_proto as u32))
+        }
+        AF_BLUETOOTH => {
+            // `bt_sock_create`: protocol outside [0, BT_MAX_PROTO) → -EINVAL;
+            // an unregistered protocol → -EPROTONOSUPPORT. Then the per-proto
+            // `create`: `hci_sock_create` accepts only SOCK_RAW → otherwise
+            // -ESOCKTNOSUPPORT. Only BTPROTO_HCI is registered so far.
+            if !(0..BT_MAX_PROTO).contains(&protocol) {
+                return Err(EINVAL);
+            }
+            if protocol as u32 != BTPROTO_HCI {
+                return Err(EPROTONOSUPPORT);
+            }
+            if kind != SOCK_RAW {
+                return Err(ESOCKTNOSUPPORT);
+            }
+            Ok((domain, kind, BTPROTO_HCI))
         }
         AF_BYPASS => Ok((domain, kind, raw_proto as u32)),
         _ => Err(EAFNOSUPPORT),
