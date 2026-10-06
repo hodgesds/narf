@@ -1100,3 +1100,92 @@ fn smoke_abi_tid_cpu_clocks_non_leader() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_tid_cpu_clocks_non_leader);
+
+// ── The same lookups inside a PID namespace (inner tids) ─────────────────
+//
+// MANAGER is inner pid 1, WORKER inner 2, WORKER's sibling thread inner 3.
+// The root-namespace OTHER group is invisible to them.
+#[cfg(feature = "container")]
+fn smoke_abi_tid_pidns_inner_tid_lookups() -> TestResult {
+    const MANAGER_TASK: u64 = 0xF400;
+    const MANAGER_PID: u64 = 0xF480;
+    const WORKER_TASK: u64 = 0xF401;
+    const WORKER_PID: u64 = 0xF481;
+    const WSIB_TASK: u64 = 0xF402;
+    const WSIB_TID: u64 = 0xF483;
+    const RLIMIT_NOFILE: u64 = 7;
+    with_groups(|| {
+        crate::pid_ns::__test_reset();
+        let r = (|| {
+            register_leader(MANAGER_TASK, MANAGER_PID);
+            register_leader(WORKER_TASK, WORKER_PID);
+            register_thread(WSIB_TASK, WSIB_TID, WORKER_PID);
+            crate::pid_ns::unshare_pid_ns(MANAGER_TASK, MANAGER_PID);
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, WORKER_TASK, WORKER_PID) != Some(2) {
+                return Err("worker was not assigned inner pid 2");
+            }
+            if crate::pid_ns::inherit_into_child(MANAGER_TASK, WSIB_TASK, WSIB_TID) != Some(3) {
+                return Err("worker thread was not assigned inner tid 3");
+            }
+            let mut old = [0u8; 16];
+            let out = old.as_mut_ptr() as u64;
+            for caller in [MANAGER_TASK, WORKER_TASK, WSIB_TASK] {
+                set_task(caller);
+                let sid = call(Syscall::Getsid.raw(), a0(2));
+                if sid.is_none_or(|v| v < 0) {
+                    return Err("getsid(inner 2) failed");
+                }
+                if call(Syscall::Getsid.raw(), a0(3)) != sid {
+                    return Err("getsid(inner non-leader tid 3) did not resolve the worker thread");
+                }
+                expect(
+                    call(Syscall::Prlimit64.raw(), a3(3, RLIMIT_NOFILE, 0, out)),
+                    0,
+                    "prlimit64(inner non-leader tid 3) failed",
+                )?;
+                expect(
+                    call(Syscall::Kill.raw(), a1(3, 0)),
+                    0,
+                    "kill(inner non-leader tid 3, 0) failed",
+                )?;
+                expect(
+                    call(Syscall::Kcmp.raw(), a2(3, 2, 1)),
+                    0,
+                    "kcmp(inner tid 3, inner 2, KCMP_VM) must report the shared mm",
+                )?;
+                // The OUTER numbers are not pids in this namespace.
+                for outer in [WSIB_TID, SIB_TID, OTHER_SIB_TID, GROUP_PID] {
+                    expect(
+                        call(Syscall::Getsid.raw(), a0(outer)),
+                        ESRCH,
+                        "getsid(tid outside the namespace) must be ESRCH",
+                    )?;
+                    expect(
+                        call(Syscall::Prlimit64.raw(), a3(outer, RLIMIT_NOFILE, 0, out)),
+                        ESRCH,
+                        "prlimit64(tid outside the namespace) must be ESRCH",
+                    )?;
+                    expect(
+                        call(Syscall::Kill.raw(), a1(outer, 0)),
+                        ESRCH,
+                        "kill(tid outside the namespace) must be ESRCH",
+                    )?;
+                }
+                expect(
+                    call(Syscall::Getpgid.raw(), a0(4)),
+                    ESRCH,
+                    "getpgid(unbound inner 4) must be ESRCH",
+                )?;
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::pid_ns::__test_reset();
+        for t in [MANAGER_TASK, WORKER_TASK, WSIB_TASK] {
+            crate::task::release_task(t);
+        }
+        r
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!("syscall_abi", smoke_abi_tid_pidns_inner_tid_lookups);
