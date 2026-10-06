@@ -757,6 +757,9 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let request = args.arg0;
     let pid = args.arg1;
+    // The pid exactly as userspace wrote it (a `pid_t` in the caller's pid
+    // namespace), for the requests that resolve it with find_task_by_vpid.
+    let user_pid = args.arg1 as i32;
     let addr = args.arg2;
     let data = args.arg3;
 
@@ -821,12 +824,14 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // (`find_get_task_by_vpid` → -ESRCH) and only then calls
             // `ptrace_attach`, so a pid that does not exist outranks every
             // attach-time check below.
-            let tid = pid_to_tid(pid);
-            let has_task = crate::user_task::with_user_task_ctx(tid, |_| ()).is_some();
-            if !has_task {
+            // `find_get_task_by_vpid` finds ANY thread — a non-leader's tid
+            // included — and never a raw scheduler TaskId.
+            let Some(tid) = crate::handlers::find_task_by_vpid(caller, user_pid)
+                .filter(|&t| crate::user_task::with_user_task_ctx(t, |_| ()).is_some())
+            else {
                 ctx.set_return(errno_ret(ESRCH));
                 return;
-            }
+            };
             // `kernel/ptrace.c::ptrace_attach`:
             //
             //     if (unlikely(task->flags & PF_KTHREAD))
@@ -840,7 +845,9 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // handlers that fork a helper) treats that as a bug in its own
             // argument marshalling, while EPERM correctly says the target
             // is off limits and the probe should fall back.
-            if pid == caller_pid {
+            // `same_thread_group`, not "same tid": a thread may not trace its
+            // own leader or a sibling either.
+            if crate::handlers::same_thread_group(tid, caller) {
                 ctx.set_return(errno_ret(EPERM));
                 return;
             }

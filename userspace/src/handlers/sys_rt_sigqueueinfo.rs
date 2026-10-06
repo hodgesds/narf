@@ -41,21 +41,15 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EPERM));
         return;
     }
-    let pid = if user_pid > 0 {
-        accept_pid_from(current_task_id(), user_pid as u64)
-    } else {
-        None
-    };
-    let Some(pid) = pid else {
+    // `kill_proc_info` → `find_vpid(pid)` + `pid_task(pid, PIDTYPE_PID)`
+    // (kernel/signal.c:1480, :1457): ANY thread in the caller's pid namespace,
+    // a non-leader's tid included; 0 and negative values name nothing
+    // (-ESRCH). The signal is process-directed (PIDTYPE_TGID), so it is
+    // raised on the thread's group below.
+    let Some(target) = find_task_by_vpid(current_task_id(), user_pid) else {
         ctx.set_return(errno_ret(ESRCH));
         return;
     };
-    let target = pid_to_task_raw(pid).unwrap_or(pid);
-    // ESRCH for a vanished target (Linux rt_sigqueueinfo(2)).
-    if !signal_target_exists(target) {
-        ctx.set_return(errno_ret(ESRCH));
-        return;
-    }
     // kill_pid_info reaches signal validation only after resolving a live
     // target, so a missing target wins over an invalid signum.
     if sig > 64 {

@@ -8411,82 +8411,100 @@ fn read_iovecs(arr_ptr: u64, count: usize) -> Option<alloc::vec::Vec<(u64, u64)>
     Some(out)
 }
 
+/// Do `a` and `b` share one `mm`? Always true within a thread group
+/// (CLONE_THREAD requires CLONE_VM); otherwise compare address spaces, which
+/// also covers CLONE_VM-without-CLONE_THREAD children.
+pub(crate) fn shares_mm(a: u64, b: u64) -> bool {
+    if same_thread_group(a, b) {
+        return true;
+    }
+    match (
+        narf_scheduler::address_space_of(narf_scheduler::TaskId(a)),
+        narf_scheduler::address_space_of(narf_scheduler::TaskId(b)),
+    ) {
+        (Some(x), Some(y)) => Arc::ptr_eq(&x, &y),
+        _ => false,
+    }
+}
+
+/// The `pid` → mm step of migrate_pages(2) / move_pages(2): `pid ?
+/// find_task_by_vpid(pid) : current` (-ESRCH), then
+/// `ptrace_may_access(PTRACE_MODE_READ_REALCREDS)` (-EPERM). A thread of the
+/// caller's own process (a non-leader's tid included) names the caller's mm.
+///
+/// LINUX-GAP: NARF cannot operate on a foreign mm here, so any task whose mm
+/// the caller does not share is refused with -EPERM even when Linux's
+/// credential check would let a privileged caller through.
+pub(crate) fn resolve_mm_target(caller: u64, pid: i32) -> Result<(), i64> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let target = find_task_by_vpid(caller, pid).ok_or(ESRCH)?;
+    if !ptrace_may_access(caller, target) || !shares_mm(caller, target) {
+        return Err(EPERM);
+    }
+    Ok(())
+}
+
 /// Shared core for process_vm_readv / process_vm_writev. `is_write`
 /// selects the direction: false copies remote→local (readv), true
 /// copies local→remote (writev). Both sides live in the same AS here.
 fn process_vm_transfer(ctx: &mut dyn TrapContext, is_write: bool) {
     let a = *ctx.args();
-    #[allow(unused_mut)]
-    let mut pid = a.arg0;
-    // The target pid is in the CALLER's pid namespace (Linux
-    // find_get_task_by_vpid, mm/process_vm_access.c). Translate inner ->
-    // outer before the self/AS checks below: untranslated, a containerized
-    // process probing its own inner pid took the cross-AS path and failed,
-    // and a foreign inner pid resolved to whatever host task owned the same
-    // number — a host address-space identity oracle. Unmapped inner -> ESRCH.
-    #[cfg(feature = "container")]
-    {
-        match accept_pid_from(current_task_id(), pid) {
-            Some(outer) => pid = outer,
-            None => {
-                ctx.set_return(errno_ret(ESRCH)); // ESRCH
-                return;
-            }
-        }
-    }
+    let pid = a.arg0 as i32;
     let local_ptr = a.arg1;
     let liovcnt = a.arg2 as usize;
     let remote_ptr = a.arg3;
     let riovcnt = a.arg4 as usize;
     let flags = a.arg5;
-    if flags != 0 || liovcnt > 1024 || riovcnt > 1024 {
-        ctx.set_return(errno_ret(EINVAL)); // EINVAL
+    // `process_vm_rw` (mm/process_vm_access.c:269-284): flags, then the local
+    // iovec import (more than UIO_MAXIOV segments is -EINVAL, a fault
+    // -EFAULT), an empty local iovec returns 0, then the remote iovec array.
+    if flags != 0 || liovcnt > 1024 {
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
-
-    // Detect a self-target across BOTH id spaces: `pid` here is whatever the
-    // caller passed, and getpid() returns the VISIBLE ProcessId
-    // (task_to_pid_raw), not the raw scheduler TaskId. Comparing only against
-    // current_task_id() misfires for any task whose visible pid differs from
-    // its tid — it then takes the cross-AS path and fails on address_space_of
-    // returning None → ESRCH (observed as pvm_smoke `pvm-fail: readv`).
-    let self_pid = task_to_pid_raw(current_task_id()).unwrap_or_else(current_task_id);
-    if pid != current_task_id() && pid != self_pid {
-        let Some(tid) = pid_to_task_raw(pid) else {
-            ctx.set_return(errno_ret(ESRCH)); // ESRCH
-            return;
-        };
-        let Some(target_as) = narf_scheduler::address_space_of(narf_scheduler::TaskId(tid)) else {
-            ctx.set_return(errno_ret(ESRCH)); // ESRCH
-            return;
-        };
-        let Some(cur_as) = current_address_space() else {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        };
-        if !Arc::ptr_eq(&target_as, &cur_as) {
-            ctx.set_return(errno_ret(EPERM)); // EPERM (cross-AS)
-            return;
-        }
-    } else if current_address_space().is_none() {
-        ctx.set_return(errno_ret(EFAULT)); // EFAULT
+    let Some(local) = read_iovecs(local_ptr, liovcnt) else {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    };
+    if local.iter().all(|&(_, len)| len == 0) {
+        ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-
-    let local = match read_iovecs(local_ptr, liovcnt) {
-        Some(v) => v,
-        None => {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        }
+    if riovcnt > 1024 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    let Some(remote) = read_iovecs(remote_ptr, riovcnt) else {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
     };
-    let remote = match read_iovecs(remote_ptr, riovcnt) {
-        Some(v) => v,
-        None => {
-            ctx.set_return(errno_ret(EFAULT)); // EFAULT
-            return;
-        }
+    // `process_vm_rw_core`: no remote pages → 0 before the task lookup.
+    if remote.iter().all(|&(_, len)| len == 0) {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    // `find_get_task_by_vpid(pid)` (:197): any thread in the caller's pid
+    // namespace, a non-leader's tid included; 0 names no task here (there is
+    // no `current` shortcut) — -ESRCH. Then `mm_access`: a task sharing the
+    // caller's mm needs no credential check; otherwise ptrace_may_access, and
+    // the -EACCES it yields is reported as -EPERM.
+    let caller = current_task_id();
+    let Some(target) = find_task_by_vpid(caller, pid) else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
     };
+    // LINUX-GAP: both sides must live in the caller's address space; a
+    // foreign mm is refused with -EPERM even when ptrace_may_access allows it.
+    if !shares_mm(caller, target) {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
+    if current_address_space().is_none() {
+        ctx.set_return(errno_ret(EFAULT));
+        return;
+    }
     let (src, dst) = if is_write {
         (&local, &remote)
     } else {
@@ -14903,6 +14921,8 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
         .as_mut()
         .and_then(|m| m.remove(&tid));
     if let Some(linux_tid) = linux_tid {
+        // A PIDFD_THREAD pidfd on this thread now reports its exit.
+        crate::pidfd::notify_thread_exit(linux_tid);
         #[cfg(feature = "cgroup")]
         narf_filesystem::cgroupfs::thread_exited(linux_tid);
         if let Some(m) = LINUX_TID_TO_TASK[pid_task_shard(linux_tid)].map.lock().as_mut() {
@@ -15878,7 +15898,9 @@ pub(crate) const CAP_SYS_PTRACE: u32 = 19;
 /// can restore it, so treating it as the caller's peer would hand over a
 /// process that is one `setuid` away from being root.
 pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
-    if caller == target {
+    // `kernel/ptrace.c:298`: `if (same_thread_group(task, current)) return 0;`
+    // — a thread may always inspect its own process, sibling threads included.
+    if same_thread_group(caller, target) {
         return true;
     }
     // `ptrace_has_cap`, consulted twice below. Capability over the whole
@@ -17282,8 +17304,10 @@ fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
             owner: crate::task::task_get(caller),
         });
     }
-    let outer = accept_pid_from(caller, pid)?;
-    let task = pid_to_task_raw(outer).or_else(|| task_to_pid_raw(outer).map(|_| outer))?;
+    // `kernel/sys.c:1751`: `find_task_by_vpid(pid)` — any thread in the
+    // caller's pid namespace, a non-leader's tid included (limits are shared
+    // thread-group state). Never a raw scheduler TaskId.
+    let task = find_task_by_vpid(caller, i32::try_from(pid).ok()?)?;
     Some(PrlimitTarget {
         tid: task,
         owner: Some(crate::task::task_get(task)?),
@@ -17584,13 +17608,8 @@ pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> all
             // `find_task_by_vpid(who)`: any task in the caller's pid
             // namespace. Mesa's util_queue renices each worker with
             // `setpriority(PRIO_PROCESS, gettid(), 19)`.
-            let Some(task) = signal_tid_from_user(caller, who as u64) else {
-                return out;
-            };
-            // `find_task_by_vpid` returning NULL is the empty set —
-            // `signal_tid_from_user` falls back to identity for an
-            // unregistered id, so an existence check implements that.
-            if task == caller || crate::task::task_get(task).is_some() {
+            // `find_task_by_vpid` returning NULL is the empty set.
+            if let Some(task) = find_task_by_vpid(caller, who) {
                 out.push(task);
             }
         }

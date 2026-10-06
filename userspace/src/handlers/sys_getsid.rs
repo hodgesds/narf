@@ -2,12 +2,17 @@
 use super::*;
 
 pub(crate) fn sys_getsid(ctx: &mut dyn TrapContext) {
-    let pid = ctx.args().arg0;
+    // `kernel/sys.c:1229` getsid: `pid_t pid`; 0 is `task_session(current)`,
+    // anything else is `find_task_by_vpid(pid)` (:1240) — any thread, a
+    // non-leader's tid included — or -ESRCH. The session lives in the
+    // thread group's shared state, keyed by the group leader here.
+    let pid = ctx.args().arg0 as i32;
+    let caller = current_task_id();
     let target_task = if pid == 0 {
-        current_task_id()
+        caller
     } else {
-        match accept_pid_from(current_task_id(), pid) {
-            Some(outer) => proc_pid_to_tid(outer),
+        match find_task_by_vpid(caller, pid) {
+            Some(task) => task,
             None => {
                 ctx.set_return(errno_ret(ESRCH));
                 return;
@@ -24,6 +29,6 @@ pub(crate) fn sys_getsid(ctx: &mut dyn TrapContext) {
     // `current_task_sid_user` -> `pgid_to_user` path); the two must live in
     // the same number space or the session-ownership check passes only by
     // coincidence.
-    let sid_user = pgid_to_user(read_sid(target_task));
+    let sid_user = pgid_to_user(read_sid(process_state_key(target_task)));
     ctx.set_return(SyscallReturn::ok(sid_user));
 }

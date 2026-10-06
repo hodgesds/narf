@@ -27,19 +27,26 @@ pub(crate) fn sys_get_robust_list(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let head_out = a.arg1;
     let len_out = a.arg2;
-    // Linux (kernel/futex/syscalls.c:59) resolves `pid` via find_task_by_vpid
-    // — in the CALLER's pid namespace. Translate inner -> outer -> TaskId
-    // before keying the robust-list table; the raw inner pid read an unrelated
-    // task's list head. Audit finding #22.
-    let task = if a.arg0 == 0 {
-        current_task_id()
+    // `futex_get_robust_list_common` (kernel/futex/syscalls.c:57-76): `int
+    // pid`; 0 is current, anything else is `find_task_by_vpid(pid)` — any
+    // thread, a non-leader's tid included (the robust list is per-thread) —
+    // or -ESRCH; then `ptrace_may_access(PTRACE_MODE_READ_REALCREDS)` or
+    // -EPERM. The table is keyed by scheduler TaskId.
+    let me = current_task_id();
+    let pid = a.arg0 as i32;
+    let task = if pid == 0 {
+        me
     } else {
-        let Some(outer) = accept_pid_from(current_task_id(), a.arg0) else {
+        let Some(task) = find_task_by_vpid(me, pid) else {
             ctx.set_return(errno_ret(ESRCH));
             return;
         };
-        proc_pid_to_tid(outer)
+        task
     };
+    if !ptrace_may_access(me, task) {
+        ctx.set_return(errno_ret(EPERM));
+        return;
+    }
     let head = {
         let g = ROBUST_LIST_TABLE.lock();
         g.as_ref()

@@ -293,7 +293,7 @@ fn priority_min_for_policy(policy: i32) -> Option<i64> {
 /// `find_process_by_pid(pid)` — `pid ? find_task_by_vpid(pid) : current`.
 ///
 /// The id is resolved in the CALLER's pid namespace and may name any task:
-/// a thread's tid or a process leader's pid (`signal_tid_from_user`). The
+/// a thread's tid or a process leader's pid (`find_task_by_vpid`). The
 /// registry lookup is what makes an id that names nothing come back `None`
 /// (→ -ESRCH) instead of silently addressing a phantom row. The caller
 /// itself always resolves, even in syscall-unit fixtures that never
@@ -306,20 +306,12 @@ fn find_process_by_pid(pid: i32) -> Option<u64> {
     if pid == 0 {
         return Some(caller);
     }
-    if pid < 0 {
-        return None;
-    }
     // `find_task_by_vpid` resolves ANY task id in the caller's namespace — a
     // sibling thread's tid as well as a process leader's pid. Mapping through
     // the process registry missed every non-leader thread, so glibc's
     // pthread_create, which applies explicit scheduling attributes with
     // sched_setscheduler(new_tid), failed with ESRCH (Qt's QThread::start).
-    let task = signal_tid_from_user(caller, pid as u64)?;
-    if task == caller || crate::task::task_get(task).is_some() {
-        Some(task)
-    } else {
-        None
-    }
+    find_task_by_vpid(caller, pid)
 }
 
 /// `sysctl_sched_base_slice`: 0.75 ms scaled by `1 + ilog2(min(cpus, 8))`

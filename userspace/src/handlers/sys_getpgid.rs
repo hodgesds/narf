@@ -11,28 +11,14 @@ pub(crate) fn sys_getpgid(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let target = {
-        if pid < 0 {
-            ctx.set_return(errno_ret(ESRCH));
-            return;
-        }
-        let caller = current_task_id();
-        let Some(outer) = accept_pid_from(caller, pid as u64) else {
-            ctx.set_return(errno_ret(ESRCH));
-            return;
-        };
-        let Some(target) = pid_to_task_raw(outer) else {
-            ctx.set_return(errno_ret(ESRCH));
-            return;
-        };
-        // PID bindings survive while a task is a waitable zombie, exactly as
-        // Linux's find_task_by_vpid does. Once reaped, both the binding and
-        // registry entry disappear; reject either kind of stale/missing PID.
-        if crate::task::task_get(target).is_none() {
-            ctx.set_return(errno_ret(ESRCH));
-            return;
-        }
-        target
+    // `kernel/sys.c:1198` do_getpgid: `find_task_by_vpid(pid)` finds ANY
+    // thread — a non-leader's tid included — and reports its process group
+    // (shared thread-group state, keyed by the group leader here). It finds
+    // waitable zombies too: their bindings survive until reap. Negative values
+    // name no task.
+    let Some(target) = find_task_by_vpid(current_task_id(), pid) else {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
     };
-    ctx.set_return(SyscallReturn::ok(pgid_to_user(read_pgid(target))));
+    ctx.set_return(SyscallReturn::ok(pgid_to_user(read_pgid(process_state_key(target)))));
 }

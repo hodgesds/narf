@@ -46,12 +46,14 @@ pub(crate) fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(ESRCH));
         return;
     };
-    let Some(target) = signal_tid_from_user(caller, user_tid as u64) else {
+    // `do_send_specific`: `find_task_by_vpid(pid)` — any thread in the
+    // caller's pid namespace, never a raw scheduler TaskId — that must belong
+    // to `tgid`, else -ESRCH (see sys_tgkill).
+    let Some(target) = find_task_by_vpid(caller, user_tid) else {
         ctx.set_return(errno_ret(ESRCH));
         return;
     };
-    // ESRCH for a vanished target + tgid consistency (see sys_tgkill).
-    if !signal_target_exists(target) || task_to_pid_raw(target).unwrap_or(target) != tgid {
+    if task_to_pid_raw(target).unwrap_or(target) != tgid {
         ctx.set_return(errno_ret(ESRCH));
         return;
     }

@@ -207,16 +207,14 @@ fn deliver_fasync(wake: &FasyncWake) {
     }
 }
 
-fn resolve_fasync_task(caller: u64, visible: i32, thread: bool) -> Option<u64> {
-    if visible <= 0 {
-        return None;
-    }
-    let outer = accept_pid_from(caller, visible as u64)?;
-    if thread {
-        linux_tid_to_task_raw(outer).or_else(|| pid_to_task_raw(outer))
-    } else {
-        pid_to_task_raw(outer)
-    }
+/// `find_vpid(who)` for F_SETOWN / F_SETOWN_EX (fs/fcntl.c:177, :250): the
+/// struct pid of ANY thread in the caller's pid namespace — a non-leader's
+/// tid included, for every owner type. The owner type only decides how the
+/// SIGIO is delivered (`send_sigio` finds the task with `pid_task(pid,
+/// PIDTYPE_PID)` and sends thread- or process-directed) and how F_GETOWN
+/// reports it.
+fn resolve_fasync_task(caller: u64, visible: i32) -> Option<u64> {
+    find_task_by_vpid(caller, visible)
 }
 
 fn fasync_owner_to_user(
@@ -231,8 +229,15 @@ fn fasync_owner_to_user(
                 .unwrap_or(0);
             (F_OWNER_TID, report_pid_to(caller, outer) as i32)
         }
+        // `pid_task(f_owner->pid, PIDTYPE_TGID)` (fs/fcntl.c:206, :272): a
+        // TGID owner named by a non-leader thread's tid has no TGID task, so
+        // F_GETOWN / F_GETOWN_EX report 0 for it (delivery still works).
         crate::fd::FasyncOwner::Process(task) => {
-            let outer = task_to_pid_raw(task).unwrap_or(0);
+            let outer = if process_state_key(task) == task {
+                task_to_pid_raw(task).unwrap_or(0)
+            } else {
+                0
+            };
             (F_OWNER_PID, report_pid_to(caller, outer) as i32)
         }
         crate::fd::FasyncOwner::ProcessGroup(group) => (
@@ -606,7 +611,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 let owner = if who == 0 {
                     crate::fd::FasyncOwner::None
                 } else if who > 0 {
-                    match resolve_fasync_task(task, who, false) {
+                    match resolve_fasync_task(task, who) {
                         Some(target) => crate::fd::FasyncOwner::Process(target),
                         None => {
                             ctx.set_return(errno_ret(ESRCH));
@@ -678,9 +683,9 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     return;
                 } else {
                     match owner_type {
-                        F_OWNER_TID => resolve_fasync_task(task, visible, true)
+                        F_OWNER_TID => resolve_fasync_task(task, visible)
                             .map(crate::fd::FasyncOwner::Tid),
-                        F_OWNER_PID => resolve_fasync_task(task, visible, false)
+                        F_OWNER_PID => resolve_fasync_task(task, visible)
                             .map(crate::fd::FasyncOwner::Process),
                         F_OWNER_PGRP => {
                             let group = pgid_from_user(visible as u64);
