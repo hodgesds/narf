@@ -76,6 +76,14 @@ pub struct ExfatVolume<B: BlockDevice> {
     io: IrqSafeSpinLock<VolumeIo>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
+    /// Minutes subtracted from a timestamp WITHOUT a valid UTC-offset
+    /// byte (Linux `exfat_tz_offset`). NARF accepts neither `time_offset=`
+    /// nor `sys_tz`, so this is Linux's default of 0: such fields decode
+    /// as UTC.
+    pub tz_offset_min: i64,
+    /// The root directory's times: the mount time, as Linux's
+    /// `exfat_read_root` stamps it (the root has no file entry).
+    pub root_times: super::dir::ExfatTimes,
 }
 
 impl<B: BlockDevice + 'static> ExfatVolume<B> {
@@ -143,6 +151,10 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
+            tz_offset_min: 0,
+            root_times: super::dir::ExfatTimes::root_at(
+                narf_time::now_wall().as_nanos().max(0) as u64
+            ),
         }))
     }
 
