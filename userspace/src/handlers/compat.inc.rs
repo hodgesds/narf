@@ -10431,6 +10431,23 @@ fn dump_fatal_x86_address_space(fault_va: u64) {
     }
 }
 
+/// `si_code` of the SIGSEGV for a user page fault at `addr`, as Linux's
+/// `do_user_addr_fault` (arch/x86/mm/fault.c) and arm64 `__do_page_fault`
+/// pick it: `SEGV_MAPERR` (1) when no VMA covers the address
+/// (`bad_area_nosemaphore` / `bad_area`), `SEGV_ACCERR` (2) when one does
+/// and the access is not permitted (`bad_area_access_error`). Fault
+/// handlers branch on this — SpiderMonkey's wasm/JIT handler and crash
+/// reporters treat a MAPERR as a wild pointer and an ACCERR as a guard or
+/// protection hit.
+///
+/// LINUX-GAP: a protection-key violation is `SEGV_PKUERR` (4) on Linux;
+/// NARF reports it as `SEGV_ACCERR`.
+pub(crate) fn page_fault_si_code(addr: u64) -> i32 {
+    let mapped = current_address_space()
+        .is_some_and(|space| space.contains_address(narf_memory::VirtAddr::new(addr)));
+    if mapped { 2 /* SEGV_ACCERR */ } else { 1 /* SEGV_MAPERR */ }
+}
+
 pub fn default_sync_signal_delivery(
     ctx: &mut dyn TrapContext,
     vector: u64,
@@ -10602,7 +10619,7 @@ pub fn default_sync_signal_delivery(
     // RIP through the same field.
     let (si_code, si_addr) = match vector {
         1 => (2 /* TRAP_TRACE */, info.addr),
-        14 => (2 /* SEGV_ACCERR */, info.addr),
+        14 => (page_fault_si_code(info.addr), info.addr),
         13 => (0x80 /* SI_KERNEL */, info.addr),
         6 => (1 /* ILL_ILLOPC */, info.addr),
         17 => (1 /* BUS_ADRALN */, info.addr),

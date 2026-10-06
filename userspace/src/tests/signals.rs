@@ -1332,8 +1332,9 @@ fn smoke_userspace_sync_signal_si_addr_from_payload() -> TestResult {
     if si_addr != fake_cr2 {
         return TestResult::Fail("si_addr was not stamped from SyncFaultInfo.addr");
     }
-    if si_code != 2 {
-        return TestResult::Fail("#PF si_code was not SEGV_ACCERR(2)");
+    // No VMA covers a non-canonical CR2, so Linux reports SEGV_MAPERR.
+    if si_code != 1 {
+        return TestResult::Fail("#PF on an unmapped address was not SEGV_MAPERR(1)");
     }
     TestResult::Pass
 }
