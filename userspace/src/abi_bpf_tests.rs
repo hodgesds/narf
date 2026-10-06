@@ -573,17 +573,15 @@ fn smoke_abi_bpf_unimplemented_cmds() -> TestResult {
         // `BPF_BTF_LOAD` used to be in this list; it is implemented now, and
         // its own conformance group lives in `abi_bpf_btf_tests.rs`. So were
         // `BPF_OBJ_PIN` / `BPF_OBJ_GET`, whose group is at the end of this file,
-        // and `BPF_PROG_QUERY`, whose group is below. `BPF_TASK_FD_QUERY` (20)
-        // is the remaining introspection gap; an out-of-range command is the
-        // catch-all.
-        for cmd in [20u64, 9999] {
-            let r = call(
-                Syscall::Bpf.raw(),
-                a2(cmd, attr.as_ptr() as u64, ATTR_LEN as u64),
-            );
-            if r != Some(EOPNOTSUPP) {
-                return Err("an unimplemented bpf(2) command did not return EOPNOTSUPP");
-            }
+        // and `BPF_PROG_QUERY`, whose group is below, and `BPF_TASK_FD_QUERY`
+        // (20), whose group follows it (an all-zero attr names pid 0, which is
+        // -ENOENT there). An out-of-range command is the catch-all.
+        let r = call(
+            Syscall::Bpf.raw(),
+            a2(9999, attr.as_ptr() as u64, ATTR_LEN as u64),
+        );
+        if r != Some(EOPNOTSUPP) {
+            return Err("an unimplemented bpf(2) command did not return EOPNOTSUPP");
         }
         Ok(())
     })
@@ -674,8 +672,8 @@ fn smoke_abi_bpf_task_fd_query_pos() -> TestResult {
         }
 
         // The query on the perf event fd names the attached program, and reports
-        // fd_type TRACEPOINT (1). `pid = 0` means "this task".
-        let mut q = task_fd_query_attr(0, ev);
+        // fd_type TRACEPOINT (1). `pid` names the calling task (its getpid()).
+        let mut q = task_fd_query_attr(FAKE_TASK as u32, ev);
         if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(0) {
             return Err("BPF_TASK_FD_QUERY on an event with a program failed");
         }
@@ -691,7 +689,7 @@ fn smoke_abi_bpf_task_fd_query_pos() -> TestResult {
             Syscall::Ioctl.raw(),
             a2(ev as u64, PERF_EVENT_IOC_SET_BPF, u64::from(u32::MAX)),
         );
-        let mut q = task_fd_query_attr(0, ev);
+        let mut q = task_fd_query_attr(FAKE_TASK as u32, ev);
         if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
             return Err("query on an event with no program was not ENOTSUP");
         }
@@ -708,14 +706,20 @@ fn smoke_abi_bpf_task_fd_query_neg() -> TestResult {
         // An fd that carries no BPF program (a fresh program fd is not a perf
         // event) is ENOTSUP.
         let prog_fd = load_prog(BPF_PROG_TYPE_TRACING, &ret_imm(1)).ok_or("bpf() not Ok")?;
-        let mut q = task_fd_query_attr(0, prog_fd as u32);
+        let mut q = task_fd_query_attr(FAKE_TASK as u32, prog_fd as u32);
         if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
             return Err("BPF_TASK_FD_QUERY on a non-perf fd was not ENOTSUP");
         }
-        // A pid that is not this task is a cross-task query NARF does not do.
+        // `get_pid_task(find_vpid(pid), PIDTYPE_PID)` finding nothing is
+        // -ENOENT (kernel/bpf/syscall.c:5572-5575): an unused pid, and pid 0,
+        // which names no task here.
         let mut q = task_fd_query_attr(0x7fff_0000, prog_fd as u32);
-        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(EOPNOTSUPP) {
-            return Err("BPF_TASK_FD_QUERY for another pid was not ENOTSUP");
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(ENOENT) {
+            return Err("BPF_TASK_FD_QUERY for an unused pid was not ENOENT");
+        }
+        let mut q = task_fd_query_attr(0, prog_fd as u32);
+        if bpf_mut(BPF_TASK_FD_QUERY, &mut q) != Some(ENOENT) {
+            return Err("BPF_TASK_FD_QUERY for pid 0 was not ENOENT");
         }
         // A nonzero flags is nonsense.
         let mut q = task_fd_query_attr(0, prog_fd as u32);
