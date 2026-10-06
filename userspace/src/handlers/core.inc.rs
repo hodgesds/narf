@@ -3253,6 +3253,17 @@ pub mod linux_compat {
 // `attrs` is `Default` for a filesystem that models none of them, and each
 // field then falls back to what this reported before the attrs existed:
 // `st_nlink = 1`, `st_dev = 0`, and mtime standing in for atime and ctime.
+/// Test hook — the `st_mtim` (`tv_sec`, `tv_nsec`) [`linux_stat_from_fs`]
+/// reports for a filesystem `Stat` + `InodeAttrs`.
+#[doc(hidden)]
+pub fn __test_linux_stat_mtim(
+    s: narf_filesystem::Stat,
+    attrs: narf_filesystem::InodeAttrs,
+) -> (i64, i64) {
+    let out = linux_stat_from_fs(s, 0, 0, 0, 1, attrs);
+    (out.st_mtim.tv_sec, out.st_mtim.tv_nsec)
+}
+
 fn linux_stat_from_fs(
     s: narf_filesystem::Stat,
     uid: u32,
@@ -3271,7 +3282,11 @@ fn linux_stat_from_fs(
         narf_filesystem::FileType::Fifo => 0o010000,
     };
     let mode_word: u32 = ftype_bits | (s.mode.perms as u32 & 0o7777);
-    let mtime_ns = narf_time::cycles_to_ns(s.mtime_cycles);
+    let mtime_ns = if attrs.mtime_ns != 0 {
+        attrs.mtime_ns
+    } else {
+        narf_time::cycles_to_ns(s.mtime_cycles)
+    };
     let timespec = |ns: u64| linux_compat::Timespec {
         tv_sec: (ns / 1_000_000_000) as i64,
         tv_nsec: (ns % 1_000_000_000) as i64,

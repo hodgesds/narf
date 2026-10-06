@@ -303,6 +303,12 @@ pub struct InodeAttrs {
     /// `st_ctim` in wall-clock nanoseconds since the epoch. Distinct from
     /// mtime: a `chmod` moves ctime and leaves mtime alone.
     pub ctime_ns: u64,
+    /// `st_mtim` in wall-clock nanoseconds since the epoch, exactly as the
+    /// filesystem stores it. When non-zero it takes precedence over
+    /// [`Stat::mtime_cycles`], whose ns→cycles→ns round trip is not exact:
+    /// an on-disk whole second came back a few nanoseconds short, and
+    /// fontconfig's cache check compares `st_mtim` to the nanosecond.
+    pub mtime_ns: u64,
     /// Whether this filesystem fills the struct at all. Without it a real
     /// `nlink` of 0 (an unlinked `O_TMPFILE` inode) is indistinguishable
     /// from "not tracked".

@@ -130,10 +130,25 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             // Report the on-disk `i_mtime` (wall-clock seconds since the epoch),
             // not a hardcoded 0 (which made every ext2 file claim mtime 1970 and
             // broke `ls -l`, `make`, `git`, `tar`, and any autoload/cache that
-            // keys on mtime). `Stat.mtime_cycles` is consumed by statx via
-            // `cycles_to_ns`, so encode the wall-clock ns through `ns_to_cycles`
-            // (its exact inverse) — the same round-trip memfs uses.
-            mtime_cycles: narf_time::ns_to_cycles((inode.mtime as u64) * 1_000_000_000),
+            // keys on mtime). The ns→cycles→ns round trip is NOT exact, so the
+            // precise value (with ext4's nanoseconds) travels in
+            // `InodeAttrs::mtime_ns`, which `stat`/`statx` prefer.
+            mtime_cycles: narf_time::ns_to_cycles(inode.mtime_ns()),
+        }
+    }
+
+    /// `InodeAttrs` for this node from the cached on-disk inode: device plus
+    /// exact atime/ctime/mtime, nanoseconds included. Nodes come out of
+    /// `iget` with their inode cached; an uncached one reports device only
+    /// and the stat path falls back to `Stat`.
+    fn attrs_from_cache(&self) -> narf_filesystem::InodeAttrs {
+        let inode = self.state.lock().inode;
+        narf_filesystem::InodeAttrs {
+            dev: self.volume.dev,
+            atime_ns: inode.map_or(0, |i| i.atime_ns()),
+            ctime_ns: inode.map_or(0, |i| i.ctime_ns()),
+            mtime_ns: inode.map_or(0, |i| i.mtime_ns()),
+            ..Default::default()
         }
     }
 
@@ -532,10 +547,7 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs_from_cache()
     }
 
     fn stat_async<'a>(&'a self) -> FsFuture<'a, Stat> {
@@ -680,10 +692,15 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
-        narf_filesystem::InodeAttrs {
-            dev: self.volume.dev,
-            ..Default::default()
-        }
+        self.attrs_from_cache()
+    }
+
+    /// The directory's on-disk `i_mtime` with ext4 nanoseconds. Without it
+    /// every ext2/ext4 directory stat'd as the epoch, so fontconfig judged
+    /// every system font cache stale (it compares the font directory's exact
+    /// `st_mtim`) and rescanned all fonts on each application start.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.state.lock().inode.map_or(0, |i| i.mtime_ns())
     }
 
     fn dcache_identity(&self) -> (usize, u64, u64) {

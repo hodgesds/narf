@@ -2265,6 +2265,7 @@ impl FileOps for MemFile {
             dev: self.superblock().dev,
             atime_ns: self.times.atime(),
             ctime_ns: self.times.ctime(),
+            mtime_ns: self.times.mtime(),
             tracked: true,
         }
     }
@@ -2731,6 +2732,7 @@ impl FileOps for MemSymlink {
             dev: self._inode_lease.superblock.dev,
             atime_ns: self.times.atime(),
             ctime_ns: self.times.ctime(),
+            mtime_ns: self.times.mtime(),
             tracked: true,
         }
     }
@@ -2842,6 +2844,7 @@ impl FileOps for MemSpecial {
             dev: self._inode_lease.superblock.dev,
             atime_ns: self.times.atime(),
             ctime_ns: self.times.ctime(),
+            mtime_ns: self.times.mtime(),
             tracked: true,
         }
     }
@@ -2921,6 +2924,7 @@ impl FileOps for MemFifo {
             dev: self._inode_lease.superblock.dev,
             atime_ns: self.times.atime(),
             ctime_ns: self.times.ctime(),
+            mtime_ns: self.times.mtime(),
             tracked: true,
         }
     }
@@ -3587,6 +3591,7 @@ impl DirOps for MemDir {
             dev: self.superblock.dev,
             atime_ns: self.times.atime(),
             ctime_ns: self.times.ctime(),
+            mtime_ns: self.times.mtime(),
             tracked: true,
         }
     }

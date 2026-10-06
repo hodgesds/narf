@@ -5186,3 +5186,92 @@ kernel_test_in!(
     "drivers/fs/ext2",
     smoke_ext2_truncate_then_extend_reads_zeros
 );
+
+/// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
+/// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
+/// are nanoseconds). fontconfig validates its system caches against a font
+/// directory's exact `st_mtim`; reporting the seconds alone (or zero) made
+/// every cache look stale. The extra word must also survive a write-back
+/// of an unchanged timestamp and be dropped when NARF rewrites the seconds.
+fn smoke_ext2_extra_timestamps_round_trip() -> TestResult {
+    use crate::inode::Inode;
+    const MTIME: u32 = 1_700_000_000;
+    const NSEC: u32 = 123_456_789;
+    let mut buf = alloc::vec![0u8; 256];
+    put_u16(&mut buf, 0, 0x4000 | 0o755); // S_IFDIR
+    put_u32(&mut buf, 8, MTIME); // i_atime
+    put_u32(&mut buf, 12, MTIME); // i_ctime
+    put_u32(&mut buf, 16, MTIME); // i_mtime
+    put_u16(&mut buf, 128, 32); // i_extra_isize: covers 132..160
+    put_u32(&mut buf, 136, NSEC << 2); // i_mtime_extra, epoch 0
+    put_u32(&mut buf, 140, (7 << 2) | 1); // i_atime_extra: 7 ns, epoch 1
+    let Some(mut inode) = Inode::parse(&buf) else {
+        return TestResult::Fail("256-byte inode did not parse");
+    };
+    let want = u64::from(MTIME) * 1_000_000_000 + u64::from(NSEC);
+    if inode.mtime_ns() != want {
+        return TestResult::Fail("i_mtime_extra nanoseconds were not decoded");
+    }
+    if inode.atime_ns() != (u64::from(MTIME) + (1 << 32)) * 1_000_000_000 + 7 {
+        return TestResult::Fail("i_atime_extra epoch bits were not applied");
+    }
+    if inode.ctime_ns() != u64::from(MTIME) * 1_000_000_000 {
+        return TestResult::Fail("a zero i_ctime_extra did not decode as whole seconds");
+    }
+    // Unchanged seconds: the extra word is written back as-is.
+    let mut out = buf.clone();
+    put_u32(&mut out, 136, 0);
+    inode.encode_into(&mut out);
+    if u32::from_le_bytes([out[136], out[137], out[138], out[139]]) != NSEC << 2 {
+        return TestResult::Fail("encode_into dropped an unchanged i_mtime_extra");
+    }
+    // Rewritten at seconds precision: the old fraction must not survive.
+    inode.mtime = MTIME + 5;
+    if inode.mtime_ns() != u64::from(MTIME + 5) * 1_000_000_000 {
+        return TestResult::Fail("a rewritten i_mtime kept the old nanoseconds");
+    }
+    inode.encode_into(&mut out);
+    if u32::from_le_bytes([out[136], out[137], out[138], out[139]]) != 0 {
+        return TestResult::Fail("encode_into kept nanoseconds for rewritten seconds");
+    }
+    // A 128-byte inode has no extra fields: whole seconds, no out-of-bounds.
+    let Some(small) = Inode::parse(&buf[..128]) else {
+        return TestResult::Fail("128-byte inode did not parse");
+    };
+    if small.mtime_ns() != u64::from(MTIME) * 1_000_000_000 {
+        return TestResult::Fail("a 128-byte inode reported sub-second time");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_extra_timestamps_round_trip);
+
+/// A directory on ext2/ext4 stats with its on-disk `i_mtime`, not the epoch:
+/// `DirOps::dir_mtime_ns` is what the stat path reads for directories, and
+/// `inode_attrs().mtime_ns` carries the exact value past the lossy
+/// ns→cycles→ns round trip.
+fn smoke_ext2_dir_reports_mtime() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    const ROOT_MTIME: u32 = 1_650_000_123;
+    let mut img = build_ext2_image(b"x");
+    put_u32(&mut img, 5 * 1024 + 128 + 16, ROOT_MTIME); // root i_mtime
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let want = u64::from(ROOT_MTIME) * 1_000_000_000;
+    if root.dir_mtime_ns() != want {
+        return TestResult::Fail("ext2 directory did not report its on-disk mtime");
+    }
+    if root.inode_attrs().mtime_ns != want {
+        return TestResult::Fail("ext2 directory InodeAttrs::mtime_ns is not exact");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_dir_reports_mtime);

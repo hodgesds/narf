@@ -5607,3 +5607,41 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx_mount_missing_target_beats_einval
 );
+
+/// `stat` reports a filesystem's exact `st_mtim` when it supplies
+/// `InodeAttrs::mtime_ns`. The legacy path round-trips the time through a
+/// TSC cycle count (`ns_to_cycles` / `cycles_to_ns`, fixed-point and not an
+/// exact inverse), which could turn an on-disk whole second into
+/// `sec - 1 . 999999xxx`. fontconfig compares a font directory's `st_mtim`
+/// to the nanosecond against its cache, so an inexact value made every
+/// system font cache stale.
+fn smoke_abi_fsx_stat_reports_exact_mtime_ns() -> TestResult {
+    let stat = narf_filesystem::Stat {
+        size: 0,
+        blocks: 0,
+        mode: narf_filesystem::Mode {
+            file_type: narf_filesystem::FileType::Dir,
+            perms: 0o755,
+        },
+        // Deliberately unrelated: the exact attrs value must win.
+        mtime_cycles: 12_345,
+    };
+    for (ns, sec, nsec) in [
+        (
+            1_700_000_000_123_456_789u64,
+            1_700_000_000i64,
+            123_456_789i64,
+        ),
+        (1_650_000_123_000_000_000, 1_650_000_123, 0),
+    ] {
+        let attrs = narf_filesystem::InodeAttrs {
+            mtime_ns: ns,
+            ..Default::default()
+        };
+        if crate::handlers::__test_linux_stat_mtim(stat, attrs) != (sec, nsec) {
+            return TestResult::Fail("stat did not report InodeAttrs::mtime_ns exactly");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_stat_reports_exact_mtime_ns);
