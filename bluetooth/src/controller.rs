@@ -314,6 +314,8 @@ pub fn register_ready_transport(transport: Arc<dyn HciTransport>, info: Controll
     // Publish /sys/class/bluetooth/hci<index> (Linux hci_register_dev also
     // creates the sysfs device on registration).
     let _ = crate::sysfs_bridge::register_hci_controller(index, info, &[]);
+    // Tell any open mgmt socket a controller appeared (MGMT_EV_INDEX_ADDED).
+    narf_filesystem::bluetooth::publish_mgmt_event(&crate::mgmt::index_added(index as u16));
     index
 }
 
@@ -364,6 +366,7 @@ pub fn bring_up_all(cap: &Cap<Bluetooth, Grant>) -> alloc::vec::Vec<BringupOutco
             drop(controllers);
             // Mirror the controller into /sys/class/bluetooth/hci<index>.
             let _ = crate::sysfs_bridge::register_hci_controller(index, info, &[]);
+            narf_filesystem::bluetooth::publish_mgmt_event(&crate::mgmt::index_added(index as u16));
         }
         out.push(BringupOutcome {
             transport: name,

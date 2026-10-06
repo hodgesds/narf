@@ -124,3 +124,33 @@ pub fn hci_dev_power(dev: u16, on: bool) -> bool {
     let f: HciDevPowerHandler = unsafe { core::mem::transmute::<usize, HciDevPowerHandler>(h) };
     f(dev, on)
 }
+
+/// Asynchronous mgmt event sink. The native stack calls `publish_mgmt_event`
+/// (e.g. on controller registration or a settings change); the socket layer
+/// installs a sink that fans the event out to subscribed mgmt sockets.
+pub type MgmtEventSink = fn(&[u8]);
+static MGMT_EVENT_SINK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the mgmt-event fan-out (the socket layer's broadcaster), returning
+/// the previously installed one so a test can restore it afterward.
+pub fn install_mgmt_event_sink(sink: MgmtEventSink) -> Option<MgmtEventSink> {
+    let prev = MGMT_EVENT_SINK.swap(sink as usize, Ordering::AcqRel);
+    if prev == 0 {
+        None
+    } else {
+        // SAFETY: only ever stored as `MgmtEventSink as usize`.
+        Some(unsafe { core::mem::transmute::<usize, MgmtEventSink>(prev) })
+    }
+}
+
+/// Deliver an already-framed mgmt event to every subscribed mgmt socket.
+/// A no-op until the socket layer has installed its sink.
+pub fn publish_mgmt_event(event: &[u8]) {
+    let h = MGMT_EVENT_SINK.load(Ordering::Acquire);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: only ever stored as `MgmtEventSink as usize`.
+    let f: MgmtEventSink = unsafe { core::mem::transmute::<usize, MgmtEventSink>(h) };
+    f(event);
+}

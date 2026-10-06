@@ -1822,6 +1822,9 @@ impl SocketFile {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
         }
         if domain == AF_BLUETOOTH {
+            // Install the mgmt-event fan-out once; the native stack publishes
+            // INDEX_ADDED / NEW_SETTINGS through the filesystem broker.
+            narf_filesystem::bluetooth::install_mgmt_event_sink(Self::broadcast_bluetooth_mgmt);
             BLUETOOTH_SOCKETS.lock().push(Arc::downgrade(&socket));
         }
         socket
@@ -4358,6 +4361,33 @@ impl SocketFile {
                 SocketOpResult::Ok(0)
             }
             _ => SocketOpResult::Err(SockError::InvalidArg),
+        }
+    }
+
+    /// Fan an asynchronous mgmt event (INDEX_ADDED / NEW_SETTINGS) out to every
+    /// open mgmt socket (HCI_CHANNEL_CONTROL). Installed into the filesystem
+    /// broker so the native stack can publish without depending on this crate.
+    fn broadcast_bluetooth_mgmt(event: &[u8]) {
+        let targets: Vec<Arc<Self>> = {
+            let mut sockets = BLUETOOTH_SOCKETS.lock();
+            sockets.retain(|weak| weak.strong_count() != 0);
+            sockets.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut delivered = false;
+        for socket in targets {
+            let mut state = socket.state.lock();
+            if let SocketState::Bluetooth {
+                channel, replies, ..
+            } = &mut *state
+            {
+                if *channel == HCI_CHANNEL_CONTROL && replies.len() < 256 {
+                    replies.push_back(event.to_vec());
+                    delivered = true;
+                }
+            }
+        }
+        if delivered {
+            narf_net::readiness::notify(0);
         }
     }
 
