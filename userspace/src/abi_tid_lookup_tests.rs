@@ -741,6 +741,111 @@ fn smoke_abi_tid_sched_priority_number_space() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_tid_sched_priority_number_space);
 
+// ── fcntl F_SETOWN / F_SETOWN_EX — fs/fcntl.c:177 / :250 `find_vpid` ──────
+//
+// A thread's struct pid is accepted for the TGID owner types; F_GETOWN /
+// F_GETOWN_EX then report 0 (`pid_task(pid, PIDTYPE_TGID)` is NULL, :206/:272).
+fn smoke_abi_tid_fcntl_setown_non_leader() -> TestResult {
+    const F_SETOWN: u64 = 8;
+    const F_GETOWN: u64 = 9;
+    const F_SETOWN_EX: u64 = 15;
+    const F_GETOWN_EX: u64 = 16;
+    const F_OWNER_TID: i32 = 0;
+    const F_OWNER_PID: i32 = 1;
+    fn owner_ex(kind: i32, pid: u64) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        b[..4].copy_from_slice(&kind.to_ne_bytes());
+        b[4..].copy_from_slice(&(pid as i32).to_ne_bytes());
+        b
+    }
+    with_groups(|| {
+        set_task(LEADER_TASK);
+        let mut fds = [0i32; 2];
+        expect(
+            call(Syscall::Pipe2.raw(), a1(fds.as_mut_ptr() as u64, 0)),
+            0,
+            "pipe2 failed",
+        )?;
+        let fd = fds[0] as u64;
+        expect(
+            call(Syscall::Fcntl.raw(), a2(fd, F_SETOWN, SIB_TID)),
+            0,
+            "F_SETOWN(non-leader tid) must be accepted",
+        )?;
+        expect(
+            call(Syscall::Fcntl.raw(), a1(fd, F_GETOWN)),
+            0,
+            "F_GETOWN after F_SETOWN(non-leader tid) must report 0",
+        )?;
+        expect(
+            call(Syscall::Fcntl.raw(), a2(fd, F_SETOWN, GROUP_PID)),
+            0,
+            "F_SETOWN(leader) failed",
+        )?;
+        expect(
+            call(Syscall::Fcntl.raw(), a1(fd, F_GETOWN)),
+            GROUP_PID as i64,
+            "F_GETOWN after F_SETOWN(leader) must report the pid",
+        )?;
+        expect(
+            call(Syscall::Fcntl.raw(), a2(fd, F_SETOWN, ABSENT)),
+            ESRCH,
+            "F_SETOWN(unused pid) must be ESRCH",
+        )?;
+        expect(
+            call(Syscall::Fcntl.raw(), a2(fd, F_SETOWN, SIB_TASK)),
+            ESRCH,
+            "F_SETOWN accepted a raw TaskId",
+        )?;
+
+        let ex = owner_ex(F_OWNER_PID, SIB_TID);
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd, F_SETOWN_EX, ex.as_ptr() as u64),
+            ),
+            0,
+            "F_SETOWN_EX(F_OWNER_PID, non-leader tid) must be accepted",
+        )?;
+        let mut got = [0xffu8; 8];
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd, F_GETOWN_EX, got.as_mut_ptr() as u64),
+            ),
+            0,
+            "F_GETOWN_EX failed",
+        )?;
+        if got != owner_ex(F_OWNER_PID, 0) {
+            return Err(
+                "F_GETOWN_EX after F_OWNER_PID(non-leader tid) must report {F_OWNER_PID, 0}",
+            );
+        }
+        let ex = owner_ex(F_OWNER_TID, SIB_TID);
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd, F_SETOWN_EX, ex.as_ptr() as u64),
+            ),
+            0,
+            "F_SETOWN_EX(F_OWNER_TID, non-leader tid) failed",
+        )?;
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd, F_GETOWN_EX, got.as_mut_ptr() as u64),
+            ),
+            0,
+            "F_GETOWN_EX failed",
+        )?;
+        if got != owner_ex(F_OWNER_TID, SIB_TID) {
+            return Err("F_GETOWN_EX after F_OWNER_TID must report the tid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_tid_fcntl_setown_non_leader);
+
 // ── ptrace — kernel/ptrace.c:1398 find_get_task_by_vpid; ptrace_attach
 // `same_thread_group(task, current)` → EPERM ───────────────────────────────
 fn smoke_abi_tid_ptrace_attach_same_group() -> TestResult {
