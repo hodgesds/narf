@@ -633,6 +633,114 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
+    /// `ext4_split_extent_at(..., EXT4_GET_BLOCKS_SPLIT_NOMERGE)`: if an
+    /// extent maps both `at - 1` and `at`, make `at` the first block of an
+    /// extent of its own (same state, written or not). Through `store_leaf`,
+    /// which grows the tree when the leaf is full.
+    pub(super) async fn extent_split_at(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        at: u32,
+    ) -> Result<(), FsError> {
+        if at == 0 {
+            return Ok(());
+        }
+        let path = self.extent_path(inode, at).await?;
+        let leaf = &path.last().ok_or_else(corrupt)?.bytes;
+        let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
+        let mut entries = decode_leaves(leaf, &hdr)?;
+        let Some(i) = entries.iter().position(|e| e.logical < at && e.covers(at)) else {
+            return Ok(());
+        };
+        let e = entries[i];
+        let head = (at - e.logical) as u16;
+        entries[i].len = head;
+        entries.insert(
+            i + 1,
+            ExtentLeaf {
+                logical: at,
+                len: e.len - head,
+                is_uninitialized: e.is_uninitialized,
+                physical: e.physical + u64::from(head),
+            },
+        );
+        self.store_leaf(inode_no, inode, path, entries).await
+    }
+
+    /// `ext4_ext_shift_extents`: move every extent starting at logical
+    /// `from` or beyond by `delta` blocks (left for COLLAPSE_RANGE, right for
+    /// INSERT_RANGE), index keys with them. The caller guarantees the moved
+    /// extents land on no other mapping (the collapsed range was removed;
+    /// an inserted range starts an extent of its own). Entry counts never
+    /// change, so every node is rewritten in place.
+    pub(super) async fn extent_shift(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        from: u32,
+        delta: i64,
+    ) -> Result<(), FsError> {
+        let mut root = root_bytes(inode);
+        self.extent_shift_node(inode_no, *inode, &mut root, from, delta, 0)
+            .await?;
+        store_root(inode, &root);
+        Ok(())
+    }
+
+    fn extent_shift_node<'a>(
+        &'a self,
+        inode_no: u32,
+        inode: Inode,
+        node: &'a mut [u8],
+        from: u32,
+        delta: i64,
+        level: usize,
+    ) -> super::TreeFuture<'a, ()> {
+        alloc::boxed::Box::pin(async move {
+            if level > 8 {
+                return Err(corrupt());
+            }
+            let moved = |logical: u32| -> Result<u32, FsError> {
+                u32::try_from(i64::from(logical) + delta).map_err(|_| corrupt())
+            };
+            let hdr = ExtentHeader::parse(node).ok_or_else(corrupt)?;
+            if hdr.is_leaf() {
+                let mut entries = decode_leaves(node, &hdr)?;
+                for e in entries.iter_mut().filter(|e| e.logical >= from) {
+                    e.logical = moved(e.logical)?;
+                }
+                for (i, e) in entries.iter().enumerate() {
+                    encode_leaf(node, 12 + i * 12, e);
+                }
+                return Ok(());
+            }
+            let mut indexes = decode_indexes(node, &hdr)?;
+            for k in 0..indexes.len() {
+                // A child may hold extents at `from` or beyond only if the
+                // next key (its range's end) lies past `from`.
+                let hi = indexes
+                    .get(k + 1)
+                    .map_or(u64::MAX, |n| u64::from(n.logical));
+                if hi > u64::from(from) {
+                    let mut child = vec![0u8; self.block_size()];
+                    self.read_block(indexes[k].leaf, &mut child).await?;
+                    self.extent_shift_node(inode_no, inode, &mut child, from, delta, level + 1)
+                        .await?;
+                    self.write_extent_node(inode_no, &inode, indexes[k].leaf, &mut child)
+                        .await?;
+                }
+            }
+            for idx in indexes.iter_mut().filter(|idx| idx.logical >= from) {
+                idx.logical = moved(idx.logical)?;
+            }
+            for (i, idx) in indexes.iter().enumerate() {
+                encode_index(node, 12 + i * 12, idx);
+            }
+            Ok(())
+        })
+    }
+
     /// `ext4_ext_remove_space(inode, 0, EXT_MAX_BLOCKS - 1)`: free every
     /// extent and every tree block, leave an empty depth-0 root. Returns the
     /// number of 512-byte sectors released.

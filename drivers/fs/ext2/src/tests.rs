@@ -5871,6 +5871,141 @@ kernel_test_in!(
     smoke_ext4_zero_range_zeroes_and_keeps_allocation
 );
 
+/// `FALLOC_FL_COLLAPSE_RANGE` and `FALLOC_FL_INSERT_RANGE`
+/// (`ext4_collapse_range` / `ext4_insert_range`): remove whole blocks and
+/// pull the rest of the file down, or open a hole and push the rest up,
+/// moving `i_size` by the same amount. Extent-mapped inodes only, block
+/// aligned, and a collapse may not reach EOF nor an insert start at it.
+/// NARF answered EOPNOTSUPP.
+fn smoke_ext4_collapse_and_insert_range_shift_the_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    const BS: u64 = 1024;
+    const COLLAPSE: u32 = 0x08;
+    const INSERT: u32 = 0x20;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Block i holds 0x10 + i throughout.
+    let mut seed = alloc::vec![0u8; 10 * BS as usize];
+    for (i, chunk) in seed.chunks_mut(BS as usize).enumerate() {
+        chunk.fill(0x10 + i as u8);
+    }
+    if poll_once(file.truncate(0)).is_none_or(|r| r.is_err())
+        || !matches!(poll_once(file.write(0, &seed)), Some(Ok(_)))
+    {
+        return TestResult::Fail("seeding the file failed");
+    }
+    let blocks_of = |file: &alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+                     n: u64|
+     -> Option<alloc::vec::Vec<u8>> {
+        let mut buf = alloc::vec![0u8; (n * BS) as usize];
+        match poll_once(file.read(0, &mut buf)) {
+            Some(Ok(got)) if got == buf.len() => Some(
+                buf.chunks(BS as usize)
+                    .map(|c| {
+                        if c.iter().all(|&b| b == c[0]) {
+                            c[0]
+                        } else {
+                            0xff
+                        }
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    };
+    let before = file.stat().blocks;
+    // Unaligned, and reaching EOF: EINVAL.
+    if !matches!(
+        poll_once(file.fallocate(COLLAPSE, 100, BS)),
+        Some(Err(FsError::InvalidData))
+    ) || !matches!(
+        poll_once(file.fallocate(COLLAPSE, 8 * BS, 2 * BS)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("an unaligned or EOF-reaching collapse was not EINVAL");
+    }
+    // Collapse blocks 2..5.
+    if !matches!(
+        poll_once(file.fallocate(COLLAPSE, 2 * BS, 3 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("collapse range failed");
+    }
+    if file.stat().size != 7 * BS || file.stat().blocks + 3 * (BS / 512) != before {
+        return TestResult::Fail("collapse range did not shrink i_size and release the blocks");
+    }
+    if blocks_of(&file, 7).as_deref() != Some(&[0x10, 0x11, 0x15, 0x16, 0x17, 0x18, 0x19][..]) {
+        return TestResult::Fail("collapse range did not pull the tail down");
+    }
+    // At or past EOF, and unaligned: EINVAL.
+    if !matches!(
+        poll_once(file.fallocate(INSERT, 7 * BS, BS)),
+        Some(Err(FsError::InvalidData))
+    ) || !matches!(
+        poll_once(file.fallocate(INSERT, BS, 100)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("an insert at EOF or unaligned was not EINVAL");
+    }
+    // Insert two blocks at 3, inside the extent now mapping 2..7: it splits.
+    if !matches!(
+        poll_once(file.fallocate(INSERT, 3 * BS, 2 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("insert range failed");
+    }
+    if file.stat().size != 9 * BS || file.stat().blocks + 3 * (BS / 512) != before {
+        return TestResult::Fail("insert range did not grow i_size by a hole");
+    }
+    if blocks_of(&file, 9).as_deref() != Some(&[0x10, 0x11, 0x15, 0, 0, 0x16, 0x17, 0x18, 0x19][..])
+    {
+        return TestResult::Fail("insert range did not push the tail up behind a hole");
+    }
+    // The inserted hole takes writes.
+    if !matches!(
+        poll_once(file.write(4 * BS, &[0x44; BS as usize])),
+        Some(Ok(_))
+    ) || blocks_of(&file, 9).as_deref()
+        != Some(&[0x10, 0x11, 0x15, 0, 0x44, 0x16, 0x17, 0x18, 0x19][..])
+    {
+        return TestResult::Fail("writing into the inserted hole went wrong");
+    }
+    // Block-mapped: EOPNOTSUPP for both.
+    use narf_filesystem::FsInstance;
+    let content = [0x5au8; 4 * BS as usize];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("block-map mount failed"),
+    };
+    let mapped = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("block-map lookup failed"),
+    };
+    if !matches!(
+        poll_once(mapped.fallocate(COLLAPSE, BS, BS)),
+        Some(Err(FsError::Unsupported))
+    ) || !matches!(
+        poll_once(mapped.fallocate(INSERT, BS, BS)),
+        Some(Err(FsError::Unsupported))
+    ) || mapped.stat().size != 4 * BS
+    {
+        return TestResult::Fail("collapse/insert on a block-mapped file must be Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_collapse_and_insert_range_shift_the_file
+);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font

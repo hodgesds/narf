@@ -2137,6 +2137,37 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         }
     }
 
+    /// Split the extent mapping both `at - 1` and `at` so `at` starts one
+    /// (`ext4_split_extent_at`). Extent-mapped inodes only.
+    pub(crate) async fn split_extent_at(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        at: u64,
+    ) -> Result<(), FsError> {
+        if !self.extent_mapped(inode) {
+            return Err(FsError::Unsupported);
+        }
+        let at = u32::try_from(at).map_err(|_| FsError::InvalidData)?;
+        self.extent_split_at(inode_no, inode, at).await
+    }
+
+    /// Move every extent at logical `from` or beyond by `delta` blocks
+    /// (`ext4_ext_shift_extents`). Extent-mapped inodes only.
+    pub(crate) async fn shift_extents(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        from: u64,
+        delta: i64,
+    ) -> Result<(), FsError> {
+        if !self.extent_mapped(inode) {
+            return Err(FsError::Unsupported);
+        }
+        let from = u32::try_from(from).map_err(|_| FsError::InvalidData)?;
+        self.extent_shift(inode_no, inode, from, delta).await
+    }
+
     /// The block-map half of [`Self::free_block_range`]
     /// (`ext4_ind_remove_space`). Returns the 512-byte sectors released.
     async fn blockmap_free_range(
