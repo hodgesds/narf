@@ -63,6 +63,7 @@
 
 extern crate alloc;
 
+pub mod bluetooth;
 pub mod bpffs;
 #[cfg(feature = "cgroup")]
 pub mod cgroupfs;

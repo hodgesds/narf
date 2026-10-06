@@ -4337,9 +4337,34 @@ impl SocketFile {
                     None => SocketOpResult::Err(SockError::WouldBlock),
                 }
             }
-            // mgmt/HCI command submission is wired in the next stage; for now a
-            // send is accepted so a client can probe the socket without error.
-            SocketOp::Send { buf, .. } => SocketOpResult::Ok(buf.len() as u64),
+            SocketOp::Send { buf, .. } => {
+                let channel = match &*self.state.lock() {
+                    SocketState::Bluetooth { channel, .. } => *channel,
+                    _ => return SocketOpResult::Err(SockError::InvalidArg),
+                };
+                if channel == HCI_CHANNEL_CONTROL {
+                    // mgmt command. Linux `mgmt_control` rejects a frame shorter
+                    // than `struct mgmt_hdr` (6 bytes) with -EINVAL.
+                    if buf.len() < 6 {
+                        return SocketOpResult::Err(SockError::InvalidArg);
+                    }
+                    // The native BT stack (narf-bluetooth) installs the mgmt
+                    // handler via the filesystem broker at boot; without it the
+                    // channel accepts commands but produces no reply.
+                    if let Some(replies) = narf_filesystem::bluetooth::mgmt_handle(buf) {
+                        let mut state = self.state.lock();
+                        if let SocketState::Bluetooth { replies: queue, .. } = &mut *state {
+                            queue.extend(replies);
+                        }
+                    }
+                    // Wake any poller parked on this fd; recv drains the queue.
+                    narf_net::readiness::notify(0);
+                    SocketOpResult::Ok(buf.len() as u64)
+                } else {
+                    // Raw/user HCI command TX is wired in a later stage.
+                    SocketOpResult::Ok(buf.len() as u64)
+                }
+            }
             SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
             _ => SocketOpResult::Err(SockError::NotSupported),
         }

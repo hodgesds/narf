@@ -324,6 +324,47 @@ kernel_test_in!(
     smoke_abi_socket_errno_bluetooth_hci
 );
 
+/// End-to-end mgmt read API over an HCI_CHANNEL_CONTROL socket: a
+/// READ_VERSION command returns a CMD_COMPLETE wrapping it. Exercises the
+/// socket -> filesystem broker -> narf_bluetooth::mgmt path.
+fn smoke_abi_socket_bluetooth_mgmt_read_version() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        let mut control = [0u8; 6];
+        control[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        control[2..4].copy_from_slice(&0xffffu16.to_le_bytes()); // HCI_DEV_NONE
+        control[4..6].copy_from_slice(&3u16.to_le_bytes()); // HCI_CHANNEL_CONTROL
+        if bind(fd, &control) != Some(0) {
+            return Err("bind to mgmt control channel failed");
+        }
+        // mgmt_hdr{ opcode=READ_VERSION(1), index=MGMT_INDEX_NONE, len=0 }.
+        let cmd = [0x01, 0x00, 0xff, 0xff, 0x00, 0x00];
+        if send(fd, &cmd, 0) != Some(cmd.len() as i64) {
+            return Err("mgmt READ_VERSION send failed");
+        }
+        let mut buf = [0u8; 64];
+        let n = match recv(fd, &mut buf, 0) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("mgmt reply recv returned no data"),
+        };
+        // CMD_COMPLETE(0x0001), index NONE, body = READ_VERSION op + status 0.
+        if n < 9
+            || u16::from_le_bytes([buf[0], buf[1]]) != 0x0001
+            || u16::from_le_bytes([buf[2], buf[3]]) != 0xffff
+            || u16::from_le_bytes([buf[6], buf[7]]) != 0x0001
+            || buf[8] != 0x00
+        {
+            return Err("mgmt READ_VERSION reply shape mismatch");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_mgmt_read_version
+);
+
 /// `inet_create`: SOCK_RAW without CAP_NET_RAW → EPERM (after the protocol
 /// lookup, so a bad protocol is still EPROTONOSUPPORT).
 /// `__inet_bind`: a port below 1024 without CAP_NET_BIND_SERVICE → EACCES.

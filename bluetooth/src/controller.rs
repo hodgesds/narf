@@ -304,6 +304,10 @@ pub fn register_ready_transport(transport: Arc<dyn HciTransport>, info: Controll
         .store(BringupPhase::Ready as u8, Ordering::Release);
     let index = controllers.len();
     controllers.push(controller);
+    drop(controllers);
+    // Publish /sys/class/bluetooth/hci<index> (Linux hci_register_dev also
+    // creates the sysfs device on registration).
+    let _ = crate::sysfs_bridge::register_hci_controller(index, info, &[]);
     index
 }
 
@@ -346,8 +350,14 @@ pub fn bring_up_all(cap: &Cap<Bluetooth, Grant>) -> alloc::vec::Vec<BringupOutco
         let name = t.name();
         let controller = Arc::new(Controller::new(t));
         let result = controller.bring_up(cap);
-        if result.is_ok() {
-            CONTROLLERS.lock().push(controller);
+        if let Ok(info) = &result {
+            let info = *info;
+            let mut controllers = CONTROLLERS.lock();
+            let index = controllers.len();
+            controllers.push(controller);
+            drop(controllers);
+            // Mirror the controller into /sys/class/bluetooth/hci<index>.
+            let _ = crate::sysfs_bridge::register_hci_controller(index, info, &[]);
         }
         out.push(BringupOutcome {
             transport: name,
