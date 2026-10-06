@@ -540,22 +540,36 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(freed)
     }
 
-    /// `ext4_ext_remove_space(inode, first, EXT_MAX_BLOCKS - 1)`: free every
-    /// block mapped at logical `first` or beyond. An extent past the cut is
-    /// freed, one straddling it is trimmed to end there, and a subtree left
-    /// with no entries is freed with its node block. A root left empty
-    /// becomes an empty depth-0 leaf, as Linux leaves it. Returns the number
-    /// of 512-byte sectors released; the caller writes the inode.
-    pub(super) async fn extent_free_from(
+    /// `ext4_ext_remove_space(inode, first, end - 1)`: free every block
+    /// mapped at logical `first..end` (`end = u64::MAX` for "to the end of
+    /// the file"). An extent wholly inside the range is freed, one crossing
+    /// an edge is trimmed to stop there, and one spanning the whole range is
+    /// split in two around it. A subtree left with no entries is freed with
+    /// its node block, and an index key follows its child's first extent
+    /// (`ext4_ext_correct_indexes`). A root left empty becomes an empty
+    /// depth-0 leaf, as Linux leaves it. Returns the number of 512-byte
+    /// sectors released; the caller writes the inode.
+    pub(super) async fn extent_free_range(
         &self,
         inode_no: u32,
         inode: &mut Inode,
         first: u32,
+        end: u64,
     ) -> Result<u32, FsError> {
-        let mut root = root_bytes(inode);
-        let (entries, freed) = self
-            .extent_trim_node(inode_no, *inode, &mut root, first, 0)
+        if end <= u64::from(first) {
+            return Ok(0);
+        }
+        // The one extent that can contain the whole range is split first:
+        // that is the only case that ADDS an entry, and `store_leaf` grows
+        // the tree for it. Everything after only removes or shortens.
+        let mut freed = self
+            .extent_split_around(inode_no, inode, first, end)
             .await?;
+        let mut root = root_bytes(inode);
+        let (entries, sub, _) = self
+            .extent_trim_node(inode_no, *inode, &mut root, first, end, 0)
+            .await?;
+        freed = freed.saturating_add(sub);
         if entries == 0 {
             root.iter_mut().for_each(|b| *b = 0);
             write_header(&mut root, 0, ROOT_MAX, 0);
@@ -564,18 +578,68 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(freed)
     }
 
-    /// Trim one node (`node`, already read) to the logical blocks below
-    /// `first`, writing back every child it keeps. Returns the node's
-    /// remaining entry count and the sectors freed beneath it. The node
-    /// itself is rewritten in `node`; the caller stores it.
+    /// If one extent maps both `first - 1` and `end`, replace it with the
+    /// part before `first` and the part from `end`, freeing the blocks in
+    /// between. Returns the sectors released.
+    async fn extent_split_around(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        first: u32,
+        end: u64,
+    ) -> Result<u32, FsError> {
+        let Ok(end32) = u32::try_from(end) else {
+            return Ok(0); // nothing maps past the 32-bit logical space
+        };
+        if first == 0 {
+            return Ok(0);
+        }
+        let path = self.extent_path(inode, first).await?;
+        let leaf = &path.last().ok_or_else(corrupt)?.bytes;
+        let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
+        let mut entries = decode_leaves(leaf, &hdr)?;
+        let Some(i) = entries
+            .iter()
+            .position(|e| e.logical < first && u64::from(e.logical) + u64::from(e.len) > end)
+        else {
+            return Ok(0);
+        };
+        let e = entries[i];
+        let spb = (self.block_size() / 512) as u32;
+        let head = (first - e.logical) as u16;
+        let skip = (end32 - e.logical) as u16;
+        let mut freed = 0u32;
+        for b in u64::from(head)..u64::from(skip) {
+            self.free_block(e.physical + b).await?;
+            freed = freed.saturating_add(spb);
+        }
+        let tail = ExtentLeaf {
+            logical: end32,
+            len: e.len - skip,
+            is_uninitialized: e.is_uninitialized,
+            physical: e.physical + u64::from(skip),
+        };
+        entries[i].len = head;
+        entries.insert(i + 1, tail);
+        self.store_leaf(inode_no, inode, path, entries).await?;
+        Ok(freed)
+    }
+
+    /// Trim one node (`node`, already read) of the logical blocks in
+    /// `first..end`, writing back every child it keeps. Returns the node's
+    /// remaining entry count, the sectors freed beneath it, and the first
+    /// logical block it still maps (for the parent's index key). The node
+    /// itself is rewritten in `node`; the caller stores it. Never adds an
+    /// entry: a range strictly inside one extent was split beforehand.
     fn extent_trim_node<'a>(
         &'a self,
         inode_no: u32,
         inode: Inode,
         node: &'a mut [u8],
         first: u32,
+        end: u64,
         level: usize,
-    ) -> super::TreeFuture<'a, (usize, u32)> {
+    ) -> super::TreeFuture<'a, (usize, u32, Option<u32>)> {
         alloc::boxed::Box::pin(async move {
             // The tree's depth is bounded by `eh_depth` (at most 5); refuse a
             // loop rather than recurse without end on a corrupt tree.
@@ -584,26 +648,34 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             let spb = (self.block_size() / 512) as u32;
             let hdr = ExtentHeader::parse(node).ok_or_else(corrupt)?;
+            let first64 = u64::from(first);
             let mut freed = 0u32;
             if hdr.is_leaf() {
                 let mut kept = Vec::new();
                 for mut e in decode_leaves(node, &hdr)? {
-                    let start = e.logical;
-                    let end = u64::from(start) + u64::from(e.len);
-                    if start >= first {
-                        for b in 0..u64::from(e.len) {
-                            self.free_block(e.physical + b).await?;
-                            freed = freed.saturating_add(spb);
-                        }
-                    } else if end > u64::from(first) {
-                        let keep = (first - start) as u16;
-                        for b in u64::from(keep)..u64::from(e.len) {
-                            self.free_block(e.physical + b).await?;
-                            freed = freed.saturating_add(spb);
-                        }
-                        e.len = keep;
+                    let start = u64::from(e.logical);
+                    let stop = start + u64::from(e.len);
+                    if stop <= first64 || start >= end {
                         kept.push(e);
-                    } else {
+                        continue;
+                    }
+                    // Blocks [lo, hi) of this extent (relative) go.
+                    let lo = first64.saturating_sub(start);
+                    let hi = (end.min(stop)) - start;
+                    for b in lo..hi {
+                        self.free_block(e.physical + b).await?;
+                        freed = freed.saturating_add(spb);
+                    }
+                    if lo > 0 {
+                        // Keeps its head (the split case was handled first,
+                        // so nothing of it survives past `end`).
+                        e.len = lo as u16;
+                        kept.push(e);
+                    } else if hi < u64::from(e.len) {
+                        // Keeps its tail, which now starts at `end`.
+                        e.logical += hi as u32;
+                        e.physical += hi;
+                        e.len -= hi as u16;
                         kept.push(e);
                     }
                 }
@@ -612,19 +684,31 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 for (i, e) in kept.iter().enumerate() {
                     encode_leaf(node, 12 + i * 12, e);
                 }
-                return Ok((kept.len(), freed));
+                let head = kept.first().map(|e| e.logical);
+                return Ok((kept.len(), freed, head));
             }
+            let indexes = decode_indexes(node, &hdr)?;
             let mut kept = Vec::new();
-            for idx in decode_indexes(node, &hdr)? {
+            for (k, mut idx) in indexes.iter().copied().enumerate() {
+                // The child maps [idx.logical, next key); the last child
+                // runs to the end of the logical space.
+                let lo = u64::from(idx.logical);
+                let hi = indexes
+                    .get(k + 1)
+                    .map_or(u64::MAX, |n| u64::from(n.logical));
+                if hi <= first64 || lo >= end {
+                    kept.push(idx);
+                    continue;
+                }
                 let mut child = vec![0u8; self.block_size()];
                 self.read_block(idx.leaf, &mut child).await?;
-                if idx.logical >= first {
-                    // The whole subtree lies past the cut.
+                if lo >= first64 && hi <= end {
+                    // The whole subtree lies inside the range.
                     freed = freed.saturating_add(self.extent_free_subtree(idx.leaf, child).await?);
                     continue;
                 }
-                let (left, sub) = self
-                    .extent_trim_node(inode_no, inode, &mut child, first, level + 1)
+                let (left, sub, head) = self
+                    .extent_trim_node(inode_no, inode, &mut child, first, end, level + 1)
                     .await?;
                 freed = freed.saturating_add(sub);
                 if left == 0 {
@@ -633,6 +717,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 } else {
                     self.write_extent_node(inode_no, &inode, idx.leaf, &mut child)
                         .await?;
+                    if let Some(head) = head {
+                        idx.logical = head;
+                    }
                     kept.push(idx);
                 }
             }
@@ -641,7 +728,8 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             for (i, idx) in kept.iter().enumerate() {
                 encode_index(node, 12 + i * 12, idx);
             }
-            Ok((kept.len(), freed))
+            let head = kept.first().map(|idx| idx.logical);
+            Ok((kept.len(), freed, head))
         })
     }
 

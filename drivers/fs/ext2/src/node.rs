@@ -392,6 +392,93 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             .await
     }
 
+    /// `ext4_punch_hole`: deallocate `offset..offset + len`, which then reads
+    /// as zeros; `i_size` never changes. Block-mapped and extent-mapped
+    /// inodes both punch. A hole at or past EOF is a no-op, and one running
+    /// past EOF stops at the end of the block holding it. The partial blocks
+    /// at either edge are zeroed in place (only where mapped: zeroing must
+    /// not allocate) and every whole block inside is released.
+    async fn punch_hole(&self, offset: u64, len: u64) -> Result<(), FsError> {
+        let bs = self.volume.block_size() as u64;
+        let page = PAGE_SIZE as u64;
+        let clip = |size: u64| -> Option<u64> {
+            if offset >= size {
+                return None;
+            }
+            let end = offset.saturating_add(len);
+            Some(if end >= size {
+                size.div_ceil(bs) * bs
+            } else {
+                end
+            })
+        };
+        let Some(end) = clip(self.stat().size) else {
+            return Ok(());
+        };
+        let (first_page, end_page) = (offset / page, end.div_ceil(page));
+        // `ext4_truncate_page_cache_block_range`: dirty data in the range
+        // reaches disk first, and no mapping may keep a page of it — the
+        // blocks underneath are about to change.
+        self.write_back_dirty(first_page, end_page).await?;
+        narf_filesystem::unmap_mapping_range(self, first_page * page)?;
+        let _update = self.volume.lock_inode_updates().await;
+        let inode_no = self.state.lock().inode_no;
+        let mut inode = self.volume.read_inode(inode_no).await?;
+        let Some(end) = clip(u64::from(inode.size)) else {
+            return Ok(());
+        };
+        self.mapping.remove_range(first_page, end_page);
+        let result = self.punch_blocks(inode_no, &mut inode, offset, end).await;
+        // `file_modified`, whether or not the punch got all the way.
+        inode.touch_ctime_mtime(Ext2Volume::<B>::now_secs());
+        let persisted = self.volume.write_inode(inode_no, &inode).await;
+        // A fault between the removal above and the block changes may have
+        // cached the old contents again.
+        self.mapping.remove_range(first_page, end_page);
+        result.and(persisted)
+    }
+
+    /// The on-disk half of [`Self::punch_hole`] over `offset..end`
+    /// (`ext4_zero_partial_blocks` + `ext4_ext_remove_space` /
+    /// `ext4_ind_remove_space`).
+    async fn punch_blocks(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        offset: u64,
+        end: u64,
+    ) -> Result<(), FsError> {
+        let bs = self.volume.block_size() as u64;
+        let first_whole = offset.div_ceil(bs);
+        let end_whole = end / bs;
+        // The partial head, which also covers a hole inside one block.
+        if offset % bs != 0 {
+            let to = end.min((offset / bs + 1) * bs);
+            self.zero_mapped(inode, offset, to).await?;
+        }
+        // The partial tail, unless the head already covered its block.
+        if end % bs != 0 && end_whole >= first_whole {
+            self.zero_mapped(inode, end_whole * bs, end).await?;
+        }
+        self.volume
+            .free_block_range(inode_no, inode, first_whole, end_whole)
+            .await
+    }
+
+    /// Zero `from..to` (inside one block) on disk if that block is mapped; a
+    /// hole already reads as zeros, and zeroing must not allocate one.
+    async fn zero_mapped(&self, inode: &Inode, from: u64, to: u64) -> Result<(), FsError> {
+        let bs = self.volume.block_size() as u64;
+        let phys = self.volume.map_block(inode, from / bs).await?;
+        if phys == 0 {
+            return Ok(());
+        }
+        let zeros = alloc::vec![0u8; (to - from) as usize];
+        self.volume
+            .write_byte_range(phys * bs + from % bs, &zeros)
+            .await
+    }
+
     /// Write the dirty pages in `[first_page, end_page)` to disk (Linux
     /// `filemap_write_and_wait_range` over `->writepages`): every block of
     /// each page inside EOF, allocating holes, then persist the inode if
@@ -602,6 +689,10 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
     fn fallocate<'a>(&'a self, mode: u32, offset: u64, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
             const KEEP_SIZE: u32 = 0x01;
+            const PUNCH_HOLE: u32 = 0x02;
+            if mode == PUNCH_HOLE | KEEP_SIZE {
+                return self.punch_hole(offset, len).await;
+            }
             // Modes this filesystem implements; anything else is
             // `ext4_fallocate`'s -EOPNOTSUPP.
             if mode & !KEEP_SIZE != 0 {

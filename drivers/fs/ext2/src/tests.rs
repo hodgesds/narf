@@ -5607,6 +5607,151 @@ kernel_test_in!(
     smoke_ext4_fallocate_preallocates_unwritten_extents
 );
 
+/// `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE` (`ext4_punch_hole`): the
+/// range reads back as zeros, whole blocks inside it are released, the
+/// partial blocks at its edges are zeroed in place, and `i_size` never
+/// moves. A hole strictly inside one extent splits it — with the in-inode
+/// root already full, that grows the tree. NARF answered EOPNOTSUPP.
+fn smoke_ext4_punch_hole_releases_and_zeroes() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    const BS: u64 = 1024;
+    const PUNCH: u32 = 0x02 | 0x01;
+    let sectors = BS / 512;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // One ten-block extent of 0x77.
+    if !matches!(
+        poll_once(file.write(0, &[0x77; 10 * BS as usize])),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("seeding the file failed");
+    }
+    let before = file.stat().blocks;
+    // Whole blocks 3, 4, 5 and 6 go; [2K+100, 3K) and [7K, 7K+50) are
+    // zeroed in place.
+    let (lo, hi) = (2 * BS + 100, 7 * BS + 50);
+    if !matches!(poll_once(file.fallocate(PUNCH, lo, hi - lo)), Some(Ok(()))) {
+        return TestResult::Fail("punch hole failed");
+    }
+    if file.stat().size != 10 * BS {
+        return TestResult::Fail("punch hole moved i_size");
+    }
+    if file.stat().blocks + 4 * sectors != before {
+        return TestResult::Fail("punch hole did not release the whole blocks inside it");
+    }
+    let mut buf = alloc::vec![0u8; 10 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read after punch failed");
+    }
+    let (lo, hi) = (lo as usize, hi as usize);
+    if buf[..lo].iter().chain(&buf[hi..]).any(|&b| b != 0x77) {
+        return TestResult::Fail("punch hole damaged bytes outside the hole");
+    }
+    if buf[lo..hi].iter().any(|&b| b != 0) {
+        return TestResult::Fail("the punched range did not read back as zeros");
+    }
+    // A hole inside one block only zeroes.
+    if !matches!(
+        poll_once(file.fallocate(PUNCH, 8 * BS + 10, 10)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("sub-block punch failed");
+    }
+    let mut blk = [0u8; BS as usize];
+    if !matches!(poll_once(file.read(8 * BS, &mut blk)), Some(Ok(_)))
+        || blk[10..20].iter().any(|&b| b != 0)
+        || blk[..10].iter().chain(&blk[20..]).any(|&b| b != 0x77)
+        || file.stat().blocks + 4 * sectors != before
+    {
+        return TestResult::Fail("a sub-block punch did not zero exactly its bytes");
+    }
+    // At or past EOF: a no-op.
+    if !matches!(poll_once(file.fallocate(PUNCH, 10 * BS, BS)), Some(Ok(())))
+        || file.stat().size != 10 * BS
+    {
+        return TestResult::Fail("a punch past EOF was not a no-op");
+    }
+    // The hole is writable again.
+    if !matches!(poll_once(file.write(4 * BS, b"back")), Some(Ok(4))) {
+        return TestResult::Fail("writing into the punched hole failed");
+    }
+    let mut back = [0u8; 4];
+    if !matches!(poll_once(file.read(4 * BS, &mut back)), Some(Ok(4))) || &back != b"back" {
+        return TestResult::Fail("data written into the punched hole did not read back");
+    }
+
+    // Four extents fill the in-inode root; splitting one needs a fifth.
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    for start in [0u64, 4, 8, 12] {
+        if !matches!(
+            poll_once(file.write(start * BS, &[0x66; 3 * BS as usize])),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("seeding four extents failed");
+        }
+    }
+    if !matches!(poll_once(file.fallocate(PUNCH, 5 * BS, BS)), Some(Ok(()))) {
+        return TestResult::Fail("punch that splits an extent in a full root failed");
+    }
+    let mut buf = alloc::vec![0u8; 15 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read after the splitting punch failed");
+    }
+    for blk in 0..15u64 {
+        let want = if blk % 4 == 3 || blk == 5 { 0 } else { 0x66 };
+        let at = (blk * BS) as usize;
+        if buf[at..at + BS as usize].iter().any(|&b| b != want) {
+            return TestResult::Fail("the splitting punch left the wrong blocks");
+        }
+    }
+
+    // Block-mapped: direct blocks and the single-indirect tree both punch.
+    use narf_filesystem::FsInstance;
+    let content = [0x5au8; 6000];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("block-map mount failed"),
+    };
+    let mapped = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("block-map lookup failed"),
+    };
+    if !matches!(poll_once(mapped.write(14 * BS, &[0xa5])), Some(Ok(1))) {
+        return TestResult::Fail("write through the single-indirect block failed");
+    }
+    let before = mapped.stat().blocks;
+    // Blocks 1..=5, block 14 and the emptied indirect block go.
+    if !matches!(
+        poll_once(mapped.fallocate(PUNCH, BS, 20 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("block-map punch failed");
+    }
+    if mapped.stat().blocks + 7 * sectors != before || mapped.stat().size != 14 * BS + 1 {
+        return TestResult::Fail("block-map punch released the wrong blocks or moved i_size");
+    }
+    let mut buf = alloc::vec![0u8; 14 * BS as usize + 1];
+    if !matches!(poll_once(mapped.read(0, &mut buf)), Some(Ok(n)) if n == buf.len())
+        || buf[..BS as usize].iter().any(|&b| b != 0x5a)
+        || buf[BS as usize..].iter().any(|&b| b != 0)
+    {
+        return TestResult::Fail("block-map punch did not read back as zeros");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_punch_hole_releases_and_zeroes);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font

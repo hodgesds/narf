@@ -2055,15 +2055,33 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         inode: &mut Inode,
         first: u64,
     ) -> Result<(), FsError> {
-        if inode.is_fast_symlink(self.block_size() as u32) {
+        self.free_block_range(inode_no, inode, first, u64::MAX)
+            .await
+    }
+
+    /// Release every block mapped at logical `first..end` and any tree block
+    /// left mapping nothing (`ext4_ext_remove_space` / `ext4_ind_remove_space`):
+    /// the block-freeing half of truncate and of `FALLOC_FL_PUNCH_HOLE`.
+    /// `i_blocks` drops by what was released; the caller writes the inode.
+    pub(crate) async fn free_block_range(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        first: u64,
+        end: u64,
+    ) -> Result<(), FsError> {
+        if inode.is_fast_symlink(self.block_size() as u32) || end <= first {
             return Ok(());
         }
         let freed = if self.superblock.uses_extents() && inode.uses_extents() {
-            // Logical block numbers are 32-bit in an extent tree.
-            let first = u32::try_from(first).unwrap_or(u32::MAX);
-            self.extent_free_from(inode_no, inode, first).await?
+            // Logical block numbers are 32-bit in an extent tree; nothing is
+            // mapped at or past 2^32.
+            match u32::try_from(first) {
+                Ok(first) => self.extent_free_range(inode_no, inode, first, end).await?,
+                Err(_) => 0,
+            }
         } else {
-            self.blockmap_free_from(inode, first).await?
+            self.blockmap_free_range(inode, first, end).await?
         };
         inode.blocks = inode.blocks.saturating_sub(freed);
         Ok(())
@@ -2091,14 +2109,21 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
-    /// The block-map half of [`Self::truncate_inode_from`]
-    /// (`ext4_ind_truncate`). Returns the 512-byte sectors released.
-    async fn blockmap_free_from(&self, inode: &mut Inode, first: u64) -> Result<u32, FsError> {
+    /// The block-map half of [`Self::free_block_range`]
+    /// (`ext4_ind_remove_space`). Returns the 512-byte sectors released.
+    async fn blockmap_free_range(
+        &self,
+        inode: &mut Inode,
+        first: u64,
+        end: u64,
+    ) -> Result<u32, FsError> {
         use super::inode::{DOUBLE_IND_IDX, N_DIRECT, SINGLE_IND_IDX, TRIPLE_IND_IDX};
         let spb = (self.block_size() / 512) as u32;
         let p = self.pointers_per_block() as u64;
         let mut freed = 0u32;
-        for slot in first.min(N_DIRECT as u64) as usize..N_DIRECT {
+        let direct_end = end.min(N_DIRECT as u64);
+        for slot in first.min(N_DIRECT as u64)..direct_end {
+            let slot = slot as usize;
             if inode.block[slot] != 0 {
                 self.free_block(u64::from(inode.block[slot])).await?;
                 inode.block[slot] = 0;
@@ -2114,9 +2139,15 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             (TRIPLE_IND_IDX, 3),
         ] {
             let root = u64::from(inode.block[slot]);
-            if root != 0 && first < base.saturating_add(span) {
+            let tree_end = base.saturating_add(span);
+            if root != 0 && first < tree_end && end > base {
                 let (empty, sub) = self
-                    .blockmap_free_branch(root, level, first.saturating_sub(base))
+                    .blockmap_free_branch(
+                        root,
+                        level,
+                        first.saturating_sub(base),
+                        end.saturating_sub(base),
+                    )
                     .await?;
                 freed = freed.saturating_add(sub);
                 if empty {
@@ -2125,22 +2156,23 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     freed = freed.saturating_add(spb);
                 }
             }
-            base = base.saturating_add(span);
+            base = tree_end;
             span = span.saturating_mul(p);
         }
         Ok(freed)
     }
 
     /// Free the entries of the `level`-deep indirect block `block` that map
-    /// relative logical blocks `start` and beyond. Returns whether the block
-    /// now maps nothing (the caller frees it) and the sectors released below
-    /// it; a block that keeps entries is written back.
-    fn blockmap_free_branch<'a>(
-        &'a self,
+    /// relative logical blocks `start..end`. Returns whether the block now
+    /// maps nothing (the caller frees it) and the sectors released below it;
+    /// a block that keeps entries is written back.
+    fn blockmap_free_branch(
+        &self,
         block: u64,
         level: u32,
         start: u64,
-    ) -> TreeFuture<'a, (bool, u32)> {
+        end: u64,
+    ) -> TreeFuture<'_, (bool, u32)> {
         alloc::boxed::Box::pin(async move {
             let spb = (self.block_size() / 512) as u32;
             let p = self.pointers_per_block() as u64;
@@ -2157,8 +2189,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     continue;
                 }
                 let child_first = j.saturating_mul(child_span);
-                if child_first.saturating_add(child_span) <= start {
-                    // Wholly before the cut.
+                let child_end = child_first.saturating_add(child_span);
+                if child_end <= start || child_first >= end {
+                    // Wholly outside the range.
                     live = true;
                     continue;
                 }
@@ -2167,7 +2200,12 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                     true
                 } else {
                     let (empty, sub) = self
-                        .blockmap_free_branch(child, level - 1, start.saturating_sub(child_first))
+                        .blockmap_free_branch(
+                            child,
+                            level - 1,
+                            start.saturating_sub(child_first),
+                            end.saturating_sub(child_first).min(child_span),
+                        )
                         .await?;
                     freed = freed.saturating_add(sub);
                     empty

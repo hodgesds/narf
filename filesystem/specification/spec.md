@@ -903,7 +903,8 @@ consumer can recognise aliases of the same `(filesystem, inode)` pair.
   protocol as above (the filesystem's `->read_folio` is the `fill`);
   `mark_dirty`/`take_dirty` drive writeback; `remove_from(page)` is
   `truncate_inode_pages` (`PageCache::remove_range`: removes dirty folios and
-  voids fills too — the bytes cease to exist). `FileFolio::mmap_frame`
+  voids fills too — the bytes cease to exist), and `remove_range(first, end)`
+  is `truncate_inode_pages_range`, the same for a hole punched mid-file. `FileFolio::mmap_frame`
   returns the physical cache page and acquires one external alias reference;
   failed PTE publication or later unmap releases it through the shared-frame
   hook. One strong folio hold spans all aliases, so a borrowed user PTE can

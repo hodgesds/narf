@@ -1453,6 +1453,14 @@ impl FileMapping {
         self.cache
             .remove_range(self.fs_id, self.inode, first_page, u64::MAX)
     }
+
+    /// Drop the pages `[first_page, end_page)`, dirty or not, and void fills
+    /// of them — Linux `truncate_inode_pages_range`, for a hole punched in
+    /// the middle of a file. Returns the pages dropped.
+    pub fn remove_range(&self, first_page: u64, end_page: u64) -> usize {
+        self.cache
+            .remove_range(self.fs_id, self.inode, first_page, end_page)
+    }
 }
 
 /// A retained page of a [`FileMapping`]. The bytes are shared with every
