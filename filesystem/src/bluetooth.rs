@@ -71,3 +71,56 @@ pub fn hci_drain(dev: u16) -> Option<Vec<u8>> {
     let f: HciDrainHandler = unsafe { core::mem::transmute::<usize, HciDrainHandler>(h) };
     f(dev)
 }
+
+// Legacy HCI ioctl providers (HCIGETDEVLIST / HCIGETDEVINFO / HCIDEVUP/DOWN).
+pub type HciDevCountHandler = fn() -> usize;
+pub type HciDevInfoHandler = fn(dev: u16) -> Option<Vec<u8>>;
+pub type HciDevPowerHandler = fn(dev: u16, on: bool) -> bool;
+
+static HCI_DEV_COUNT: AtomicUsize = AtomicUsize::new(0);
+static HCI_DEV_INFO: AtomicUsize = AtomicUsize::new(0);
+static HCI_DEV_POWER: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the legacy-ioctl providers (narf_bluetooth::hci_sock).
+pub fn install_hci_ioctl_handlers(
+    count: HciDevCountHandler,
+    info: HciDevInfoHandler,
+    power: HciDevPowerHandler,
+) {
+    HCI_DEV_COUNT.store(count as usize, Ordering::Release);
+    HCI_DEV_INFO.store(info as usize, Ordering::Release);
+    HCI_DEV_POWER.store(power as usize, Ordering::Release);
+}
+
+/// Registered controller count (0 if no stack installed).
+pub fn hci_dev_count() -> usize {
+    let h = HCI_DEV_COUNT.load(Ordering::Acquire);
+    if h == 0 {
+        return 0;
+    }
+    // SAFETY: only ever stored as `HciDevCountHandler as usize`.
+    let f: HciDevCountHandler = unsafe { core::mem::transmute::<usize, HciDevCountHandler>(h) };
+    f()
+}
+
+/// Packed `struct hci_dev_info` bytes for controller `dev`, or `None`.
+pub fn hci_dev_info(dev: u16) -> Option<Vec<u8>> {
+    let h = HCI_DEV_INFO.load(Ordering::Acquire);
+    if h == 0 {
+        return None;
+    }
+    // SAFETY: only ever stored as `HciDevInfoHandler as usize`.
+    let f: HciDevInfoHandler = unsafe { core::mem::transmute::<usize, HciDevInfoHandler>(h) };
+    f(dev)
+}
+
+/// Power controller `dev` on/off; false for an unknown index/no stack.
+pub fn hci_dev_power(dev: u16, on: bool) -> bool {
+    let h = HCI_DEV_POWER.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: only ever stored as `HciDevPowerHandler as usize`.
+    let f: HciDevPowerHandler = unsafe { core::mem::transmute::<usize, HciDevPowerHandler>(h) };
+    f(dev, on)
+}

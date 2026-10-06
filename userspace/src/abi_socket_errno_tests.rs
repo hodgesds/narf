@@ -401,6 +401,47 @@ kernel_test_in!(
     smoke_abi_socket_bluetooth_hci_raw
 );
 
+/// Legacy HCI ioctls on an AF_BLUETOOTH socket: HCIGETDEVLIST returns the
+/// controller count (0 in QEMU), and HCIGETDEVINFO/HCIDEVUP on an absent
+/// controller are ENODEV (matching hci_sock.c).
+fn smoke_abi_socket_bluetooth_hci_ioctls() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        // HCIGETDEVLIST: dev_num capacity in, controller count out.
+        let mut list = [0u8; 4 + 4 * 8];
+        list[0..2].copy_from_slice(&4u16.to_le_bytes());
+        if sys(
+            Syscall::Ioctl,
+            a2(fd, 0x8004_48d2, list.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("HCIGETDEVLIST failed");
+        }
+        if u16::from_le_bytes([list[0], list[1]]) != 0 {
+            return Err("HCIGETDEVLIST count should be 0 with no controllers");
+        }
+        // HCIGETDEVINFO for dev 0 → ENODEV (no controller present).
+        let mut info = [0u8; 92];
+        if sys(
+            Syscall::Ioctl,
+            a2(fd, 0x8004_48d3, info.as_mut_ptr() as u64),
+        ) != Some(ENODEV)
+        {
+            return Err("HCIGETDEVINFO on an absent controller must be ENODEV");
+        }
+        // HCIDEVUP with dev id 0 by value → ENODEV.
+        if sys(Syscall::Ioctl, a2(fd, 0x4004_48c9, 0)) != Some(ENODEV) {
+            return Err("HCIDEVUP on an absent controller must be ENODEV");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_hci_ioctls
+);
+
 /// `inet_create`: SOCK_RAW without CAP_NET_RAW → EPERM (after the protocol
 /// lookup, so a bad protocol is still EPROTONOSUPPORT).
 /// `__inet_bind`: a port below 1024 without CAP_NET_BIND_SERVICE → EACCES.

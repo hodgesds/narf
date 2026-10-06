@@ -159,6 +159,11 @@ pub fn register_initcalls() {
             crate::hci_sock::send,
             crate::hci_sock::drain_event,
         );
+        narf_filesystem::bluetooth::install_hci_ioctl_handlers(
+            crate::hci_sock::dev_count,
+            crate::hci_sock::dev_info,
+            crate::hci_sock::dev_power,
+        );
         InitResult::Ok
     });
 }

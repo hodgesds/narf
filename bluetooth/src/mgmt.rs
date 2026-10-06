@@ -274,6 +274,18 @@ pub fn handle(command: &[u8]) -> Vec<Vec<u8>> {
     }
 }
 
+/// Whether controller `index` is currently powered (mgmt POWERED setting).
+/// Used by the legacy HCIGETDEVINFO ioctl to report the HCI_UP flag.
+pub fn is_powered(index: u16) -> bool {
+    current_settings(index) & SETTING_POWERED != 0
+}
+
+/// Set controller `index`'s powered setting (the legacy HCIDEVUP/HCIDEVDOWN
+/// ioctls map onto the same state as mgmt SET_POWERED).
+pub fn set_powered(index: u16, on: bool) {
+    set_setting_bit(index, SETTING_POWERED, on);
+}
+
 /// `MGMT_EV_INDEX_ADDED` for a newly-registered controller (no parameters).
 pub fn index_added(index: u16) -> Vec<u8> {
     frame(EV_INDEX_ADDED, index, &[])

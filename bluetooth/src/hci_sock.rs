@@ -58,6 +58,42 @@ pub fn drain_event(dev: u16) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Number of registered controllers — for the HCIGETDEVLIST ioctl.
+pub fn dev_count() -> usize {
+    controller::controller_count()
+}
+
+/// Build the 92-byte `struct hci_dev_info` for controller `dev` (HCIGETDEVINFO).
+/// Fields NARF does not model (features, link policy/mode, stats) stay zero,
+/// as on a freshly-registered Linux adapter.
+pub fn dev_info(dev: u16) -> Option<Vec<u8>> {
+    let info = controller::controllers().get(dev as usize)?.info();
+    let mut b = alloc::vec![0u8; 92];
+    b[0..2].copy_from_slice(&dev.to_le_bytes()); // dev_id
+    let name = alloc::format!("hci{dev}");
+    let n = name.len().min(7); // name[8], keep nul-terminated
+    b[2..2 + n].copy_from_slice(&name.as_bytes()[..n]);
+    b[10..16].copy_from_slice(&info.bd_addr); // bdaddr
+    let flags: u32 = u32::from(crate::mgmt::is_powered(dev)); // bit0 = HCI_UP
+    b[16..20].copy_from_slice(&flags.to_le_bytes());
+    // type @20, features @21..29 left 0 (BR/EDR primary).
+    b[44..46].copy_from_slice(&info.acl_data_mtu.to_le_bytes());
+    b[46..48].copy_from_slice(&info.acl_total_num.to_le_bytes());
+    b[48..50].copy_from_slice(&u16::from(info.sco_data_mtu).to_le_bytes());
+    b[50..52].copy_from_slice(&info.sco_total_num.to_le_bytes());
+    Some(b)
+}
+
+/// Power a controller on/off (HCIDEVUP/HCIDEVDOWN). Returns false for an
+/// unknown index.
+pub fn dev_power(dev: u16, on: bool) -> bool {
+    if (dev as usize) >= controller::controller_count() {
+        return false;
+    }
+    crate::mgmt::set_powered(dev, on);
+    true
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod tests {
     use super::*;

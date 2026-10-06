@@ -3361,6 +3361,69 @@ impl FileOps for SocketFile {
         if cmd == SIOCETHTOOL {
             return self.ethtool_ioctl(arg);
         }
+        // Legacy HCI ioctls (hciconfig) on an AF_BLUETOOTH socket. DEVUP/DOWN
+        // take the dev id by value; GETDEVLIST/GETDEVINFO take a user pointer.
+        if self.domain == AF_BLUETOOTH {
+            const HCIDEVUP: u32 = 0x4004_48c9;
+            const HCIDEVDOWN: u32 = 0x4004_48ca;
+            const HCIGETDEVLIST: u32 = 0x8004_48d2;
+            const HCIGETDEVINFO: u32 = 0x8004_48d3;
+            match cmd {
+                HCIDEVUP | HCIDEVDOWN => {
+                    if narf_filesystem::bluetooth::hci_dev_power(arg as u16, cmd == HCIDEVUP) {
+                        return Ok(0);
+                    }
+                    return Err(FsError::NoDevice);
+                }
+                HCIGETDEVLIST => {
+                    // struct hci_dev_list_req { u16 dev_num; dev_req[] }; the
+                    // caller sets dev_num to the array capacity.
+                    let mut cap = [0u8; 2];
+                    // SAFETY: copy_from_user validates `arg` as a user address;
+                    // we read the 2-byte dev_num capacity field.
+                    if unsafe { crate::handlers::copy_from_user(&mut cap, arg as u64) }.is_err() {
+                        return Err(FsError::InvalidData);
+                    }
+                    let capacity = u16::from_le_bytes(cap) as usize;
+                    let count = narf_filesystem::bluetooth::hci_dev_count().min(capacity);
+                    let mut out = Vec::with_capacity(4 + count * 8);
+                    out.extend_from_slice(&(count as u16).to_le_bytes());
+                    out.extend_from_slice(&[0u8; 2]); // pad before dev_req[]
+                    for i in 0..count {
+                        out.extend_from_slice(&(i as u16).to_le_bytes()); // dev_id
+                        out.extend_from_slice(&[0u8; 2]); // pad
+                        out.extend_from_slice(&0u32.to_le_bytes()); // dev_opt
+                    }
+                    // SAFETY: copy_to_user validates `arg`; `out` is the
+                    // list_req header + `count` dev_req entries we just built.
+                    if unsafe { crate::handlers::copy_to_user(arg as u64, &out) }.is_err() {
+                        return Err(FsError::InvalidData);
+                    }
+                    return Ok(0);
+                }
+                HCIGETDEVINFO => {
+                    // struct hci_dev_info with dev_id set on input.
+                    let mut id = [0u8; 2];
+                    // SAFETY: copy_from_user validates `arg`; we read the
+                    // 2-byte dev_id input field.
+                    if unsafe { crate::handlers::copy_from_user(&mut id, arg as u64) }.is_err() {
+                        return Err(FsError::InvalidData);
+                    }
+                    let Some(info) =
+                        narf_filesystem::bluetooth::hci_dev_info(u16::from_le_bytes(id))
+                    else {
+                        return Err(FsError::NoDevice);
+                    };
+                    // SAFETY: copy_to_user validates `arg`; `info` is the
+                    // 92-byte hci_dev_info the stack packed.
+                    if unsafe { crate::handlers::copy_to_user(arg as u64, &info) }.is_err() {
+                        return Err(FsError::InvalidData);
+                    }
+                    return Ok(0);
+                }
+                _ => {}
+            }
+        }
         const SIOCGIFFLAGS: u32 = 0x8913;
         const SIOCSIFFLAGS: u32 = 0x8914;
         const SIOCGIFADDR: u32 = 0x8915;
