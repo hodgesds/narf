@@ -13,6 +13,8 @@ const AF_UNIX: u64 = 1;
 const AF_INET: u64 = 2;
 const AF_INET6: u64 = 10;
 const AF_NETLINK: u64 = 16;
+const AF_BLUETOOTH: u64 = 31;
+const BTPROTO_HCI: u64 = 1;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
 const SOCK_RAW: u64 = 3;
@@ -272,6 +274,54 @@ fn smoke_abi_socket_errno_socket_family_type_order() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket_errno",
     smoke_abi_socket_errno_socket_family_type_order
+);
+
+/// AF_BLUETOOTH/BTPROTO_HCI create + bind error codes, matching Linux
+/// `bt_sock_create` / `hci_sock_create` / `hci_sock_bind`.
+fn smoke_abi_socket_errno_bluetooth_hci() -> TestResult {
+    with_setup(|| {
+        // A raw HCI socket is valid.
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        // Wrong socket type → ESOCKTNOSUPPORT (hci_sock_create accepts RAW).
+        if sys(
+            Syscall::SocketOpen,
+            a2(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_HCI),
+        ) != Some(ESOCKTNOSUPPORT)
+        {
+            return Err("AF_BLUETOOTH non-RAW type must be ESOCKTNOSUPPORT");
+        }
+        // protocol >= BT_MAX_PROTO → EINVAL (bt_sock_create range check).
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_RAW, 99)) != Some(EINVAL) {
+            return Err("AF_BLUETOOTH proto >= BT_MAX_PROTO must be EINVAL");
+        }
+        // In-range but unregistered protocol (BTPROTO_L2CAP=0) → EPROTONOSUPPORT.
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_RAW, 0)) != Some(EPROTONOSUPPORT) {
+            return Err("unimplemented BT protocol must be EPROTONOSUPPORT");
+        }
+        // bind(sockaddr_hci{dev=HCI_DEV_NONE, channel=CONTROL}) — the mgmt
+        // channel binds device-independent.
+        let mut control = [0u8; 6];
+        control[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        control[2..4].copy_from_slice(&0xffffu16.to_le_bytes()); // HCI_DEV_NONE
+        control[4..6].copy_from_slice(&3u16.to_le_bytes()); // HCI_CHANNEL_CONTROL
+        if bind(fd, &control) != Some(0) {
+            return Err("bind to the mgmt control channel must succeed");
+        }
+        // An unknown channel is -EINVAL (hci_sock_bind).
+        let mut bad = control;
+        bad[4..6].copy_from_slice(&99u16.to_le_bytes());
+        let fd2 = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        if bind(fd2, &bad) != Some(EINVAL) {
+            return Err("bind to an unknown HCI channel must be EINVAL");
+        }
+        close(fd);
+        close(fd2);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_bluetooth_hci
 );
 
 /// `inet_create`: SOCK_RAW without CAP_NET_RAW → EPERM (after the protocol
