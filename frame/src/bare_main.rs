@@ -1996,6 +1996,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             // panel transitions out of StartRust.
                             narf_memory::diag::set_phase(narf_memory::diag::BootPhase::HeapUp);
                             let _ = writeln!(console::Writer, "  heap: slab is live");
+                            // `setup_log_buf`: honour `log_buf_len=` now that
+                            // the rings it asks for can be allocated.
+                            if let Some(v) = narf_boot::args().value("log_buf_len") {
+                                console::klog::log_buf_len_setup(v);
+                            }
+                            console::klog::setup_log_buf();
                             let n_nodes = narf_acpi::node_count().max(1) as usize;
                             let mut totals = 0usize;
                             for i in 0..n_nodes.min(narf_memory::FRAME_MAX_NUMA_NODES) {
@@ -2876,6 +2882,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_memory::heap::promote_to_slab();
                     narf_memory::diag::set_phase(narf_memory::diag::BootPhase::HeapUp);
                     let _ = writeln!(console::Writer, "  heap: slab is live");
+                    // `setup_log_buf`: honour `log_buf_len=` now that the
+                    // rings it asks for can be allocated.
+                    if let Some(v) = narf_boot::args().value("log_buf_len") {
+                        console::klog::log_buf_len_setup(v);
+                    }
+                    console::klog::setup_log_buf();
                     // Flat COW refcount table: heap + vmalloc are live and
                     // no user address space exists yet (its precondition).
                     narf_memory::frame::cow::init_flat_table();
@@ -4274,6 +4286,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
     {
+        // Timestamp kernel log records with the kernel's monotonic clock
+        // (CLOCK_MONOTONIC's source). This path never runs the async demo's
+        // TSC calibration, so the units are the clock's uncalibrated ones —
+        // still the same clock CLOCK_MONOTONIC reads in this build.
+        console::klog::set_clock(narf_time::monotonic_ns);
         // `test_subsystem=a,b,c` selects those subsystems (prefix-matched:
         // `filesystem` selects `filesystem/page_cache` too). This is the
         // change-based CI path — `cargo xtask affected` computes the
@@ -4345,6 +4362,9 @@ fn run_async_demo() -> ! {
             console::Writer,
             "  gic: generic timer started, IRQs unmasked"
         );
+        // aarch64 runs `monotonic_ns` in generic-timer ticks (no
+        // calibration step yet); it is still CLOCK_MONOTONIC's clock.
+        console::klog::set_clock(narf_time::monotonic_ns);
     }
 
     // Stage 2 Barrier: LAPIC timer IRQs are now live. `init_bsp`
@@ -4442,6 +4462,12 @@ fn run_async_demo() -> ! {
         }
         let (tsc_hz, tsc_src) = narf_time::calibrate_clocks_with_source();
         if tsc_hz != 0 {
+            // Timestamp kernel log records from here on (Linux's records are
+            // `[    0.000000]` until `sched_clock` is up). Installing before
+            // calibration would stamp early records in raw TSC cycles, which
+            // are larger than — and so out of order with — the ns that
+            // follow.
+            console::klog::set_clock(narf_time::monotonic_ns);
             let _ = writeln!(
                 console::Writer,
                 "  tsc: calibrated to {} MHz ({} cyc/ns) via {}",
