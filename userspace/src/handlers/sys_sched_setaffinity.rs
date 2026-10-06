@@ -99,6 +99,13 @@ pub(crate) fn sys_sched_setaffinity(ctx: &mut dyn TrapContext) {
 /// -EINVAL here (unlike the policy calls) — `find_task_by_vpid(-1)` simply
 /// finds nothing, so it is -ESRCH.
 ///
+/// `find_task_by_vpid` names ANY task in the caller's namespace: a
+/// CLONE_THREAD sibling's tid as well as a process leader's pid. Resolving
+/// through the process registry alone missed every non-leader thread, so
+/// glibc's `pthread_getattr_np(pthread_self())` — which ends in
+/// `sched_getaffinity(pd->tid)` — failed with ESRCH on every secondary
+/// thread (Firefox's `nsThread::InitCommon` release-asserts on it).
+///
 /// A kernel-spawned task with no ProcessId binding is still addressable by
 /// its raw TaskId while the scheduler knows its mask.
 pub(crate) fn resolve_affinity_target(caller: u64, pid: i32) -> Option<u64> {
@@ -108,12 +115,9 @@ pub(crate) fn resolve_affinity_target(caller: u64, pid: i32) -> Option<u64> {
     if pid < 0 {
         return None;
     }
-    let outer = accept_pid_from(caller, pid as u64)?;
-    match pid_to_task_raw(outer) {
-        Some(task) => Some(task),
-        None if narf_scheduler::task_affinity(narf_scheduler::TaskId(outer)).is_some() => {
-            Some(outer)
-        }
-        None => None,
+    if let Some(task) = find_process_by_pid(pid) {
+        return Some(task);
     }
+    let outer = accept_pid_from(caller, pid as u64)?;
+    narf_scheduler::task_affinity(narf_scheduler::TaskId(outer)).map(|_| outer)
 }

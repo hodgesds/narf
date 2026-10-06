@@ -14809,6 +14809,11 @@ fn register_thread_task_mapping(tid_raw: u64, task_raw: u64, tgid_raw: u64) {
         .insert(tid_raw, task_raw);
 }
 
+#[doc(hidden)]
+pub fn __test_register_thread_mapping(tid_raw: u64, task_raw: u64, tgid_raw: u64) {
+    register_thread_task_mapping(tid_raw, task_raw, tgid_raw);
+}
+
 pub(crate) fn task_to_linux_tid_raw(task_raw: u64) -> Option<u64> {
     TASK_TO_LINUX_TID[pid_task_shard(task_raw)]
         .map
