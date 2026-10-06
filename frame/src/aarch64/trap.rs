@@ -156,6 +156,66 @@ const EC_DATA_ABORT_CURRENT_EL: u64 = 0b10_0101;
 /// `vm_flags = VM_EXEC`.
 const EC_INSTRUCTION_ABORT_LOWER_EL: u64 = 0b10_0000;
 
+/// `ESR_ELx_EC_UNKNOWN`: an undefined/unallocated instruction.
+const EC_UNKNOWN: u64 = 0b00_0000;
+/// `ESR_ELx_EC_BTI`: branch-target-identification failure.
+const EC_BTI: u64 = 0b00_1101;
+/// `ESR_ELx_EC_ILL`: illegal execution state.
+const EC_ILLEGAL_STATE: u64 = 0b00_1110;
+/// `ESR_ELx_EC_PC_ALIGN`: misaligned PC.
+const EC_PC_ALIGN: u64 = 0b10_0010;
+/// `ESR_ELx_EC_SP_ALIGN`: misaligned SP.
+const EC_SP_ALIGN: u64 = 0b10_0110;
+/// `ESR_ELx_EC_BRK64`: an AArch64 `BRK` instruction.
+const EC_BRK64: u64 = 0b11_1100;
+/// DFSC/IFSC "alignment fault".
+const FSC_ALIGNMENT: u64 = 0b10_0001;
+
+/// The user signal an EL0 synchronous exception raises, expressed as the
+/// generic sync-fault hook's vector (x86 numbering, which
+/// `narf_userspace::default_sync_signal_delivery` maps to signal and
+/// `si_code`) and the faulting address it reports. `None` keeps the
+/// exception on the fatal path.
+///
+/// Linux arm64 (`el0t_64_sync_handler`, `arch/arm64/kernel/entry-common.c`):
+/// - DABT/IABT_LOW → `do_mem_abort`: SIGSEGV (MAPERR/ACCERR by VMA), or
+///   SIGBUS/BUS_ADRALN for an alignment fault (`fault.c` fault_info) →
+///   vector 14 / 17, address FAR.
+/// - PC_ALIGN / SP_ALIGN → `do_sp_pc_abort`: SIGBUS/BUS_ADRALN → vector 17,
+///   address FAR / SP.
+/// - UNKNOWN → `do_el0_undef`, BTI → `do_el0_bti`, ILL → `el0_inv` →
+///   `bad_el0_sync`: SIGILL/ILL_ILLOPC at the PC → vector 6.
+/// - BRK64 → `do_el0_brk64`: SIGTRAP/TRAP_BRKPT at the PC → vector 3.
+const fn el0_signal_route(ec: u64, esr: u64, far: u64, pc: u64, sp: u64) -> Option<(u64, u64)> {
+    match ec {
+        EC_DATA_ABORT_LOWER_EL | EC_INSTRUCTION_ABORT_LOWER_EL => {
+            if esr & 0x3F == FSC_ALIGNMENT {
+                Some((17, far))
+            } else {
+                Some((14, far))
+            }
+        }
+        EC_PC_ALIGN => Some((17, far)),
+        EC_SP_ALIGN => Some((17, sp)),
+        EC_UNKNOWN | EC_BTI | EC_ILLEGAL_STATE => Some((6, pc)),
+        EC_BRK64 => Some((3, pc)),
+        _ => None,
+    }
+}
+
+/// What [`try_heal_user_abort`] made of an abort.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum HealOutcome {
+    /// Recovered; re-execute the instruction.
+    Healed,
+    /// Not recovered: no mapping, a protection violation, or an alignment
+    /// fault — the SIGSEGV/SIGBUS(ADRALN) surface.
+    Unhealed,
+    /// The address is mapped but its backing file refused the page
+    /// (`VM_FAULT_SIGBUS`): SIGBUS/BUS_ADRERR.
+    Bus,
+}
+
 /// Whether an abort taken from EL0 with this exception class is one
 /// [`try_heal_user_abort`] can service: a data abort (a read or a write) or an
 /// instruction abort (a fetch). Both carry a faulting address in `FAR_EL1` and
@@ -228,18 +288,44 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
+    // SPSR_EL1.M[3:0] == 0b0000 (EL0t): the exception was taken from user mode.
+    let from_el0 = frame.spsr & 0xF == 0;
+    let mut el0_far = 0u64;
+    let mut el0_bus = false;
     if el0_abort_is_healable(ec) {
         // SAFETY: FAR_EL1 read at EL1 is always defined.
         let far = unsafe { sysreg::read_far_el1() };
         // Demand paging / stack grow / COW split for the EL0 fault. On
         // success we `eret` back to the faulting user instruction — or, for an
         // instruction abort, to the instruction that could not be fetched.
-        if try_heal_user_abort(esr, far, true) {
-            return;
+        match try_heal_user_abort(esr, far, true) {
+            HealOutcome::Healed => return,
+            outcome => el0_bus = outcome == HealOutcome::Bus,
         }
-        // Fall through to fatal if the abort wasn't a recoverable
-        // user-mode COW write / demand-paging miss — genuine bugs
-        // surface on the existing diagnostic path.
+        el0_far = far;
+    } else if ec == EC_PC_ALIGN {
+        // SAFETY: FAR_EL1 read at EL1 is always defined; for a PC alignment
+        // fault it holds the misaligned PC (`el0_pc`).
+        el0_far = unsafe { sysreg::read_far_el1() };
+    }
+
+    // A user exception nothing healed raises the user's signal through the
+    // same hook x86 uses (Linux `el0t_64_sync_handler`), instead of taking the
+    // fatal path: handlers run, and with none installed the default action
+    // terminates (or dumps) just this task.
+    if from_el0 {
+        if let Some((vector, addr)) = el0_signal_route(ec, esr, el0_far, frame.elr, frame.sp_el0) {
+            if let Some(hook) = narf_userspace::sync_signal_hook() {
+                let info = narf_userspace::SyncFaultInfo {
+                    addr,
+                    bus: vector == 14 && el0_bus,
+                };
+                let mut ctx = Aarch64TrapContext::from_svc(frame);
+                if hook(&mut ctx, vector, info) {
+                    return;
+                }
+            }
+        }
     }
 
     if ec == EC_DATA_ABORT_CURRENT_EL {
@@ -260,7 +346,11 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // pointer bug can't be COW/demand-heal-attempted. This mirrors the
         // x86_64 #PF handler servicing a CPL=0 fault on a user vaddr.
         let may_wait_for_reclaim = !narf_arch::aarch64::uaccess::guarded_copy_armed();
-        if in_user_half(far) && try_heal_user_abort(esr, far, may_wait_for_reclaim) {
+        // A Bus outcome is not healed: the guarded copy's fixup below turns
+        // it into -EFAULT, as Linux's copy_*_user does over a SIGBUS page.
+        if in_user_half(far)
+            && try_heal_user_abort(esr, far, may_wait_for_reclaim) == HealOutcome::Healed
+        {
             return;
         }
 
@@ -322,7 +412,7 @@ fn in_user_half(a: u64) -> bool {
 /// instruction abort, so a fetch is classified as a non-write and can never
 /// take the COW arm — matching Linux, which sets `vm_flags = VM_EXEC` without
 /// `FAULT_FLAG_WRITE` for `ESR_ELx_EC_IABT_LOW`.
-fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> bool {
+fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> HealOutcome {
     // ISS field for a Data Abort (Arm ARM DDI0487 D5.4):
     //   bit  6  (WnR)  : 0 = read, 1 = write
     //   bits [5:0] DFSC: fault status code. Top 4 bits 0b0011 indicate a
@@ -341,9 +431,10 @@ fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> bool {
     // installed). mmap's deferred-back path surfaces here; if the vaddr lands
     // in or just below a STACK_GUARD region the trap routes into
     // try_grow_stack.
+    let mut bus = false;
     if is_translation_fault {
         if narf_userspace::handlers::handle_numa_hint_fault(far) {
-            return true;
+            return HealOutcome::Healed;
         }
         if let Some(as_arc) = narf_userspace::active_user_as() {
             let v = narf_memory::VirtAddr::new(far);
@@ -357,12 +448,14 @@ fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> bool {
                 crate::bare::reclaim_wait::demand_page_no_wait(&as_arc, v)
             };
             if r.is_ok() {
-                return true;
+                return HealOutcome::Healed;
             }
+            // The file refused a mapped page: SIGBUS, never a stack grow.
+            bus = r == Err(narf_memory::AddressSpaceError::Bus);
             let limits = narf_userspace::handlers::current_stack_growth_limits();
             // SAFETY: same.
-            if unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
-                return true;
+            if !bus && unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
+                return HealOutcome::Healed;
             }
         }
     }
@@ -377,12 +470,16 @@ fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> bool {
                 // touched by the split.
                 let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
                 if remap_ok {
-                    return true;
+                    return HealOutcome::Healed;
                 }
             }
         }
     }
-    false
+    if bus {
+        HealOutcome::Bus
+    } else {
+        HealOutcome::Unhealed
+    }
 }
 
 /// Zero one saved general-purpose register in a live trap frame.
@@ -1314,6 +1411,72 @@ fn smoke_aarch64_sa_onstack_uses_altstack() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("aarch64", smoke_aarch64_sa_onstack_uses_altstack);
+
+/// Every EL0 synchronous exception class routes to the signal Linux raises
+/// (`el0t_64_sync_handler`). aarch64 used to send every unhealed EL0 fault to
+/// the fatal path, so no SIGSEGV/SIGBUS/SIGILL/SIGTRAP handler ever ran —
+/// crash reporters, JIT fault handlers and debuggers all depend on them.
+fn smoke_aarch64_el0_exceptions_route_to_linux_signals() -> TestResult {
+    const FAR: u64 = 0x0000_7fff_dead_b000;
+    const PC: u64 = 0x0000_4000_0000_1234;
+    const SP: u64 = 0x0000_7fff_ffff_e003;
+    const FSC_TRANSLATION_L3: u64 = 0b00_0111;
+    const FSC_PERMISSION_L3: u64 = 0b00_1111;
+    /// (exception class, ISS fault-status bits, expected route, what).
+    type Case = (u64, u64, Option<(u64, u64)>, &'static str);
+    let cases: [Case; 11] = [
+        (
+            EC_DATA_ABORT_LOWER_EL,
+            FSC_TRANSLATION_L3,
+            Some((14, FAR)),
+            "data abort, translation",
+        ),
+        (
+            EC_DATA_ABORT_LOWER_EL,
+            FSC_PERMISSION_L3,
+            Some((14, FAR)),
+            "data abort, permission",
+        ),
+        (
+            EC_DATA_ABORT_LOWER_EL,
+            FSC_ALIGNMENT,
+            Some((17, FAR)),
+            "data abort, alignment",
+        ),
+        (
+            EC_INSTRUCTION_ABORT_LOWER_EL,
+            FSC_TRANSLATION_L3,
+            Some((14, FAR)),
+            "instruction abort",
+        ),
+        (EC_PC_ALIGN, 0, Some((17, FAR)), "PC alignment"),
+        (EC_SP_ALIGN, 0, Some((17, SP)), "SP alignment"),
+        (EC_UNKNOWN, 0, Some((6, PC)), "undefined instruction"),
+        (EC_BTI, 0, Some((6, PC)), "BTI"),
+        (
+            EC_ILLEGAL_STATE,
+            0,
+            Some((6, PC)),
+            "illegal execution state",
+        ),
+        (EC_BRK64, 0, Some((3, PC)), "BRK"),
+        (EC_SVC_AARCH64, 0, None, "SVC (a syscall, not a fault)"),
+    ];
+    for (ec, iss, want, _what) in cases {
+        if el0_signal_route(ec, iss, FAR, PC, SP) != want {
+            return TestResult::Fail("an EL0 exception class routes to the wrong signal");
+        }
+    }
+    // An EL1 abort never takes the user-signal route.
+    if el0_signal_route(EC_DATA_ABORT_CURRENT_EL, FSC_TRANSLATION_L3, FAR, PC, SP).is_some() {
+        return TestResult::Fail("an EL1 data abort was routed to a user signal");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "aarch64",
+    smoke_aarch64_el0_exceptions_route_to_linux_signals
+);
 
 /// SA_SIGINFO: handler receives x0 = signum, x1 = &siginfo,
 /// x2 = &ucontext; siginfo prefix bytes + mcontext.pc match the
