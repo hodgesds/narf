@@ -395,6 +395,7 @@ printf '%s\n' \
   'Description=NARF Plasma Wayland Session' \
   'ConditionKernelCommandLine=!narf_audio_check' \
   'ConditionKernelCommandLine=!narf_ptrace_check' \
+  'ConditionKernelCommandLine=!narf_poll_check' \
   'Wants=dbus-broker.service' \
   'Wants=user@1000.service' \
   'After=user@1000.service' \
@@ -482,6 +483,28 @@ printf '%s\n' \
 install -d -m 0755 "$WORK/root/etc/systemd/system/multi-user.target.wants"
 ln -sfn ../narf-audio-gate.service \
   "$WORK/root/etc/systemd/system/multi-user.target.wants/narf-audio-gate.service"
+
+# Blocking-wait acceptance gate: prove a wait that should block does block.
+# The audio gate runs this probe too, but as one stage of a twenty-minute run;
+# its own flag makes a single iteration a bare multi-user boot, which is what
+# you want while chasing a spin.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify blocking-wait semantics on NARF' \
+  'ConditionKernelCommandLine=narf_poll_check' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'ExecStart=/usr/local/libexec/narf-poll-probe' \
+  'TimeoutStartSec=300' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  '' \
+  '[Install]' \
+  'WantedBy=multi-user.target' \
+  > "$WORK/root/etc/systemd/system/narf-poll-check.service"
+ln -sfn ../narf-poll-check.service \
+  "$WORK/root/etc/systemd/system/multi-user.target.wants/narf-poll-check.service"
 
 # ptrace attach acceptance gate: prove PTRACE_ATTACH reports its stop to a
 # tracer that did not fork the tracee. That is the door `strace -p` uses, and

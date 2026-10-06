@@ -735,28 +735,55 @@ for t in /proc/"$WP_PID"/task/*; do
     note "steady:   tid ${tid} '${tick_name[$tid]:-?}' used $(( delta * 100 / (hz * window) ))%"
 done
 
-# RECORDED, not asserted. WirePlumber's main loop spins here while the daemon
-# stays idle and every functional stage passes; see the README for what that
-# has been narrowed to and what has been ruled out. Failing the gate on it
-# would hide the contract this gate exists to prove, so it is reported on
-# every run — including in the verdict line — and tracked as an open defect.
+# ASSERTED. An idle session must be idle: no stream is running, nothing is
+# being reconfigured, and both processes should be parked in their event loops.
+#
+# This was a recorded WARNING for as long as WirePlumber's main loop spun at
+# 100% of a CPU here while every functional stage passed — which is the point.
+# A spin is invisible to a functional test, so unless something asserts on it
+# the next one to appear is found by noticing a warm laptop. The two kernel
+# defects behind it are fixed (an epoll fd's readiness cell that never fell
+# after its child drained, so `poll`/`ppoll` over it returned 0 immediately
+# and forever; and an empty-set `poll` with an indefinite timeout returning 0
+# at once instead of waiting) and `fedora-poll-probe.py` pins both directly.
+# This is the end-to-end half of the same contract.
 if [ "$wp_pct" -ge 50 ] || [ "$pw_pct" -ge 50 ]; then
-    note "steady: WARNING known open defect — an idle session should be near 0%"
-    # Diagnostic, not an assertion. `-k` matters: a plain `timeout` sends
-    # SIGTERM, and an strace parked in `wait4` on its tracee does not die on
-    # that, so the timeout itself never returns and the gate hangs instead of
-    # failing. Escalating to SIGKILL bounds it either way.
+    # Capture WHY before failing: the dominant syscall and the shape of the
+    # loop around it are what the diagnosis turned on last time, and they are
+    # not recoverable after the fact from a one-line verdict.
     #
-    # Two victims on purpose. The SPINNING thread is actively running, so its
-    # pending SIGSTOP is seen at the next signal check; the IDLE daemon is
-    # parked in epoll_wait, which is the case that has to interrupt a blocked
-    # syscall. If one works and the other does not, that is the answer.
+    # `-k` matters: a plain `timeout` sends SIGTERM, and an strace parked in
+    # `wait4` on its tracee does not die on that, so the timeout itself never
+    # returns and the gate hangs instead of failing. Escalating to SIGKILL
+    # bounds it either way.
     for victim in "wp:$WP_PID" "pw:$PW_PID"; do
-        timeout -k 5 35 strace -f -c -p "${victim#*:}" \
-            >"$LOG/strace-${victim%%:*}" 2>&1
-        note "steady: strace ${victim%%:*} rc=$?: \
-$(tr -s ' \n' ' ' <"$LOG/strace-${victim%%:*}" | head -c 320)"
+        tag="${victim%%:*}"
+        pid="${victim#*:}"
+        # Counts first: which syscall dominates.
+        timeout -k 5 35 strace -f -c -p "$pid" >"$LOG/strace-$tag" 2>&1
+        note "steady: strace-$tag counts rc=$?"
+        # Emit the summary table line by line. Folding it into one note
+        # truncated it to the header and threw away the only numbers that
+        # matter.
+        sed -n '/calls * errors* *syscall/,$p' "$LOG/strace-$tag" \
+            | head -20 >"$LOG/strace-$tag.tbl"
+        while IFS= read -r line; do
+            note "steady: strace-$tag | $line"
+        done <"$LOG/strace-$tag.tbl"
+        # Then a short RAW window: counts say which syscall, the raw trace
+        # says what the loop around it looks like (arguments, return values,
+        # and the order they repeat in), which is what distinguishes a wait
+        # that returns early from real repeated work. Note that the RETURN
+        # VALUE strace prints at a syscall-exit stop is currently the syscall
+        # NUMBER, not the result — a separate open gap in the ptrace exit-stop
+        # register report — so read the call rate, not the values.
+        timeout -k 5 3 strace -f -p "$pid" >"$LOG/straceraw-$tag" 2>&1
+        note "steady: strace-$tag raw rc=$? lines=$(wc -l <"$LOG/straceraw-$tag")"
+        while IFS= read -r line; do
+            note "steady: raw-$tag | $line"
+        done < <(head -30 "$LOG/straceraw-$tag")
     done
+    fail "idle session burns CPU — wireplumber ${wp_pct}%, pipewire ${pw_pct}%"
 fi
 
 # `ps -L` reads /proc/<pid>/task/<tid>/stat for every thread. It aborted with
@@ -769,12 +796,11 @@ threads=$(grep -c . "$LOG/ps-L")
     fail "ps -L listed ${threads} thread(s) for a multi-threaded session manager"
 note "steady: ps -L lists ${threads} threads: $(awk '{print $3}' "$LOG/ps-L" | sort -u | tr '\n' ' ')"
 
-# NOT asserted here: `strace -p`. A tracer is now eligible to wait for a tracee
-# it did not fork, but the tracee's attach-stop is never reported to it, so the
-# tracer blocks in `wait4` forever instead of being told its tracee stopped —
-# and it does not die on SIGTERM either, so a `timeout` around it never
-# returns. Asserting it would hang this gate rather than fail it. See the
-# README's open-defect section.
+# `strace -p` works now (it attaches to all of WirePlumber's threads and
+# reports), and the failure branch above uses it. It is deliberately NOT
+# asserted on a passing run: the shapes that actually broke it are pinned
+# directly and far more cheaply by `fedora-ptrace-probe.py`, which does not
+# need an audio stack to say so.
 #
 # glibc's pthread_setname_np writes /proc/self/task/<tid>/comm. Every PipeWire
 # loop names itself that way, and each failure is one log line.

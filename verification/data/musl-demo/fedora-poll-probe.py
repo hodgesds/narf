@@ -8,8 +8,10 @@ still behaving correctly — which is exactly the shape to look for. Everything
 here is deliberately IDLE: nothing is ever ready, so every wait must consume
 its full timeout.
 """
+import ctypes
 import os
 import select
+import signal
 import socket
 import time
 
@@ -21,6 +23,121 @@ def took(fn):
     start = time.monotonic()
     ready = fn()
     return time.monotonic() - start, ready
+
+
+# GLib's main loop does not call poll(2). `g_poll` calls PPOLL where it is
+# available, with a NULL timeout whenever it has no timeout source to serve,
+# and Python's `select` module exposes no ppoll — so every case above tests a
+# syscall GLib never issues. A traced WirePlumber showed its main thread in
+# ppoll 1.65 MILLION times in 35 seconds, so ppoll is the one that has to be
+# measured directly.
+class Pollfd(ctypes.Structure):
+    _fields_ = [
+        ("fd", ctypes.c_int),
+        ("events", ctypes.c_short),
+        ("revents", ctypes.c_short),
+    ]
+
+
+class Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+# glibc's wrapper takes four arguments and supplies sigsetsize itself, which is
+# where the `8` in a traced `ppoll(..., NULL, NULL, 8)` comes from.
+_libc.ppoll.restype = ctypes.c_int
+_libc.ppoll.argtypes = [
+    ctypes.c_void_p,
+    ctypes.c_ulong,
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+]
+
+
+def _ppoll(fds, timeout_ts):
+    arr = (Pollfd * len(fds))()
+    for i, (fd, events) in enumerate(fds):
+        arr[i].fd = fd
+        arr[i].events = events
+    ctypes.set_errno(0)
+    start = time.monotonic()
+    rc = _libc.ppoll(
+        ctypes.byref(arr),
+        len(fds),
+        None if timeout_ts is None else ctypes.byref(timeout_ts),
+        None,
+    )
+    elapsed = time.monotonic() - start
+    err = ctypes.get_errno()
+    if rc < 0:
+        return elapsed, [f"rc=-1 errno={err}"]
+    if rc > len(fds):
+        # Impossible by construction: ppoll returns how many entries have a
+        # non-zero revents, so it can never exceed nfds. Say so loudly rather
+        # than letting it read as "lots of fds were ready".
+        return elapsed, [f"rc={rc} EXCEEDS nfds={len(fds)}"]
+    return elapsed, [f"revents={arr[i].revents:#x}" for i in range(rc)]
+
+
+def ppoll_timed(fds, seconds):
+    """ppoll with a real timeout: must consume it and report nothing ready."""
+    ts = Timespec()
+    ts.tv_sec = int(seconds)
+    ts.tv_nsec = int((seconds - int(seconds)) * 1_000_000_000)
+    return _ppoll(fds, ts)
+
+
+_libc.poll.restype = ctypes.c_int
+_libc.poll.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int]
+
+
+def _poll(fds, timeout_ms):
+    arr = (Pollfd * len(fds))()
+    for i, (fd, events) in enumerate(fds):
+        arr[i].fd = fd
+        arr[i].events = events
+    ctypes.set_errno(0)
+    start = time.monotonic()
+    rc = _libc.poll(ctypes.byref(arr), len(fds), timeout_ms)
+    elapsed = time.monotonic() - start
+    err = ctypes.get_errno()
+    if rc < 0:
+        return elapsed, [f"rc=-1 errno={err}"]
+    if rc > len(fds):
+        return elapsed, [f"rc={rc} EXCEEDS nfds={len(fds)}"]
+    return elapsed, [f"revents={arr[i].revents:#x}" for i in range(rc)]
+
+
+def _bounded(bound, call):
+    """Run an INDEFINITE wait with SIGALRM as the only way out.
+
+    Every case above passed a 500 ms timeout, so the infinite wait — the one
+    an idle GLib loop actually makes — was never measured. It goes through
+    ctypes rather than `select`, because PEP 475 makes Python retry an
+    EINTR'd syscall transparently: a `select.poll().poll()` with no timeout
+    would restart after the handler and block forever instead of reporting.
+    """
+    previous = signal.signal(signal.SIGALRM, lambda *_: None)
+    signal.setitimer(signal.ITIMER_REAL, bound)
+    try:
+        return call()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def poll_blocking(fds, bound):
+    """poll(2) with timeout -1: block until an fd is ready, so forever here."""
+    return _bounded(bound, lambda: _poll(fds, -1))
+
+
+def ppoll_blocking(fds, bound):
+    """ppoll with a NULL timeout — the call GLib makes when it has nothing
+    scheduled. It must block until an fd is ready, i.e. forever here, so the
+    only way out is a signal. SIGALRM bounds it; returning BEFORE the alarm is
+    the defect."""
+    return _bounded(bound, lambda: _ppoll(fds, None))
 
 
 def main() -> None:
@@ -137,6 +254,36 @@ def main() -> None:
             continue
         results.append((f"ctl{card[-1]}-subscribed", took(lambda: pc.poll(TIMEOUT_MS))))
         os.close(cfd)
+
+    # 9. ppoll(2), the syscall GLib actually waits in. Same idle objects, and
+    #    GLib's exact mask, in both shapes it uses: a bounded timeout and the
+    #    indefinite NULL-timeout wait.
+    glib_fds = [
+        (efd, glib_mask),
+        (ep.fileno(), glib_mask),
+        (tfd, glib_mask),
+    ]
+    results.append(("ppoll-timeout", ppoll_timed(glib_fds, TIMEOUT_MS / 1000.0)))
+    results.append(("ppoll-null", ppoll_blocking(glib_fds, TIMEOUT_MS / 1000.0)))
+    # And the degenerate set, which isolates the wait itself from any fd:
+    results.append(("ppoll-empty-timeout", ppoll_timed([], TIMEOUT_MS / 1000.0)))
+    results.append(("ppoll-empty-null", ppoll_blocking([], TIMEOUT_MS / 1000.0)))
+    # The same two through poll(2) with timeout -1. If BOTH poll and ppoll
+    # return early it is the indefinite-wait path, not ppoll; if only ppoll
+    # does, it is ppoll's own.
+    results.append(("poll-infinite", poll_blocking(glib_fds, TIMEOUT_MS / 1000.0)))
+    results.append(("poll-empty-infinite", poll_blocking([], TIMEOUT_MS / 1000.0)))
+    # Bisect the set one fd at a time. An early return with nothing ready
+    # means some fd claims readiness through a channel that its own level
+    # then denies, and naming that fd is the difference between fixing the
+    # fd and fixing the poll return path.
+    for label, one in (("efd", efd), ("epoll", ep.fileno()), ("timerfd", tfd)):
+        results.append(
+            (f"poll-inf-{label}", poll_blocking([(one, glib_mask)], TIMEOUT_MS / 1000.0))
+        )
+        results.append(
+            (f"ppoll-t-{label}", ppoll_timed([(one, glib_mask)], TIMEOUT_MS / 1000.0))
+        )
 
     bad = []
     out = []

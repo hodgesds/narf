@@ -120,6 +120,8 @@ Contracts are checked against the local Linux 7.3-rc4 sources under
 | `/proc/<pid>/task/` named by thread id | `fs/proc/base.c` (`proc_task_readdir`) |
 | `/proc/<pid>/task/<tid>/comm` mode | `fs/proc/base.c` (`tid_base_stuff`) |
 | A ptrace-stop report names the THREAD, not the group leader | `kernel/signal.c` (`do_notify_parent_cldstop`) |
+| `poll(2)` returns 0 only when a timeout expired | `fs/select.c` (`do_sys_poll`, `poll_schedule_timeout`) |
+| An empty-set `poll` still waits out its timeout | `fs/select.c` (`do_sys_poll` with `nfds == 0`) |
 
 PipeWire's own requirements are read from its sources: `spa/plugins/alsa/
 alsa-udev.c` (which card properties are mandatory), `src/modules/
@@ -146,65 +148,70 @@ as the tracer's own child and as a non-child sibling, waited for by tid and by
 GROUP, which is what `strace -p` really does. Every case runs on the build
 host first, so the expected answer is Linux's own.
 
-`fedora-poll-probe.py` runs alongside the gate. It asserts that a blocking
-wait actually blocks — `poll` with no fds, on an eventfd, on an epoll fd, with
-GLib's exact `POLLIN|POLLERR|POLLHUP` mask, on each primitive after its level
-has been consumed, and on an ALSA control fd with mixer events subscribed.
+`fedora-poll-probe.py` runs alongside the gate, and has its own
+`narf_poll_check` gate for the same reason the ptrace probe does — a bare
+multi-user boot rather than a twenty-minute run. It asserts that a blocking
+wait actually blocks — `poll` and `ppoll`, with a finite timeout and with an
+indefinite one, with no fds, on an eventfd, on a timerfd, on an epoll fd, each
+of those alone and all together, with GLib's exact `POLLIN|POLLERR|POLLHUP`
+mask, on each primitive after its level has been consumed, and on an ALSA
+control fd with mixer events subscribed.
 A kernel that returns from any of those early makes every GLib main loop spin
 at 100% of a CPU while still behaving correctly, which is invisible to a
 functional test.
 
-## Known open defect: the session manager spins
+## Closed defect: the session manager spun
 
-WirePlumber's MAIN thread uses ~100% of one CPU once the graph is built, while
-the PipeWire daemon sits at 0% and every functional stage passes. The gate
-reports it on every run (including in the verdict line) but does not fail on
-it: failing would hide the contract this gate exists to prove.
+WirePlumber's MAIN thread used ~100% of one CPU once the graph was built,
+while the PipeWire daemon sat at 0% and every functional stage passed. It
+emitted nothing at `WIREPLUMBER_DEBUG=4`, so it was a silent dispatch loop
+rather than repeated work. The gate now ASSERTS an idle session is idle; for
+as long as the cause was unknown it only recorded a warning, because failing
+would have hidden the contract the gate exists to prove.
 
-Ruled out so far, all measured in-guest:
+Finding it needed a tracer, so it needed the two ptrace fixes above first.
+With `strace -p` working, the answer was immediate and quantitative: the main
+thread was in `ppoll` **1,654,732 times in 35 seconds**, every call returning
+with nothing ready.
 
-- the vDSO `CLOCK_MONOTONIC` (advances correctly, so GLib's timeouts are sane);
-- `poll`/`ppoll`/`epoll_wait` blocking semantics, with and without fds;
-- `POLLERR`/`POLLHUP` being treated as requested rather than output-only
-  (`do_poll` gets this right, and the probe confirms it);
-- `poll` over an epoll fd using GLib's exact mask — the shape
-  `wp_loop_source_new` creates (lib/wp/core.c);
-- a level not cleared on consume, for eventfd, Unix socketpair and timerfd,
-  individually and inside an epoll;
-- ALSA control-fd readiness, idle and with events subscribed;
-- GLib itself: a bare `gdbus monitor` main loop idles at 0%.
+That pointed at `ppoll`, but the probe found something broader. Two kernel
+defects, both pinned by `fedora-poll-probe.py`:
 
-It emits no log output at `WIREPLUMBER_DEBUG=4`, so it is a silent dispatch
-loop rather than repeated work.
+1. **A nested epoll fd's readiness cell never fell.** `push_ready` raises an
+   epoll instance's own cell when a child becomes ready, but the only place
+   that lowered it was `collect_ready` — the DIRECT-wait path — reasoning that
+   a purely-nested instance is judged by `poll_readiness` instead. `poll(2)`'s
+   park breaks that: it arms the cell and takes `any_ready` as the answer,
+   returning `poll_scan`'s count without consulting the timeout. So an epoll
+   fd whose child had ever gone ready and then been DRAINED stayed latched
+   high forever, and every later `poll`/`ppoll` over it returned 0
+   immediately. Any loop that polls an epoll fd rather than calling
+   `epoll_wait` on it then spins — and GLib over PipeWire's loop fd
+   (`wp_loop_source_new`) is exactly that shape. The level query now
+   reconciles the cell, a falling edge that wakes nobody.
+2. **An empty-set `poll` did not wait.** `poll(NULL, 0, -1)` returned 0 at
+   once, which poll(2) may only do when a timeout expired — and there is no
+   timeout there to expire. The finite case busy-spun a whole core for the
+   duration instead of parking. Both now take the ordinary park.
 
-Narrowing it further wants a tracer, and `strace -p` now works: it attaches to
-all seven WirePlumber threads and prints a syscall summary. Getting there took
-two fixes, each found by the shape of what failed rather than by reading the
-code:
+Two things about the measurement are worth keeping, because each cost a boot:
 
-1. A tracer was not eligible to wait for a tracee it had not forked, so
-   `wait4(-1, …, __WALL)` answered `No child processes` — the first thing
-   `strace -p` does after attaching. `is_tracer_of_any` compared a scheduler
-   TaskId against a map keyed in the ptrace ABI's pid space, which diverge the
-   moment a task forks, so the check silently never matched.
-2. Attaching then succeeded and `strace` hung in `wait4` anyway, because a
-   stop report named the thread GROUP rather than the stopping thread. The
-   pending map is keyed parent → child_pid, so all seven threads' attach-stops
-   collapsed into one slot filed under the leader's pid: a `waitpid(<worker
-   tid>)` matched nothing, and strace waits for one stop per attached thread.
-   `do_notify_parent_cldstop` is explicit that only a report to the real
-   parent is rewritten to the group leader, while a report to the tracer names
-   the thread.
+- **The existing probe could not have caught either one.** Every case passed a
+  500 ms timeout, so the INDEFINITE wait an idle GLib loop actually makes was
+  never measured; and Python's `select` exposes no `ppoll`, so the syscall
+  GLib really waits in was never called. The ppoll and infinite-wait cases go
+  through `ctypes`, and must: PEP 475 makes Python retry an EINTR'd syscall
+  transparently, so a `select.poll().poll()` with no timeout would restart
+  after the bounding alarm and block forever instead of reporting.
+- **A single-fd probe would have missed it too.** `poll` on the eventfd alone
+  and on the timerfd alone both blocked correctly; only the epoll fd was
+  latched, and only after a child of it had gone ready and been drained. The
+  per-fd bisect is what named it.
 
-Defect 2 is invisible to a single-threaded tracee, which is why the four
-simpler probe cases passed throughout and only `sibling-threadgroup` caught
-it. Its per-tid output is the diagnosis: `tids=3 stops=1 [121:stopped sig=19
-123:NO REPORT 124:NO REPORT]`.
-
-One caveat on the probe's own output: the `state=` it prints comes from
-`/proc/<pid>/task/<tid>/stat`, which still renders the PROCESS state, so a
-thread in a ptrace-stop reads `R` there where Linux shows `t`. The stop itself
-is real — the wait reports it — so this is a separate `stat` rendering gap,
-not a ptrace one.
+One caveat on reading a trace: at a syscall-exit stop the return value strace
+prints is currently the syscall NUMBER, not the result — which is why the
+spinning `ppoll` appeared to return `271`, `__NR_ppoll` on x86_64. Read the
+call RATE from a trace, not the values, until the exit-stop register report is
+fixed.
 
 Audible quality and physical power transitions still require hardware tests.

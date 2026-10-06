@@ -971,6 +971,39 @@ impl FileOps for EpollInstance {
             }
             return narf_filesystem::POLL_IN;
         }
+        // Reconcile our OWN cell level, now that we have computed the
+        // authoritative answer and it is "not readable".
+        //
+        // `push_ready` RAISES this cell on a child event, but the only place
+        // that LOWERED it was `collect_ready` — the direct-wait path — on the
+        // reasoning that "for the purely-nested case the parent's
+        // `poll_readiness` query is authoritative regardless". `poll(2)`'s
+        // park breaks that: it arms this cell and treats `any_ready` as the
+        // answer, returning `poll_scan`'s count without consulting the
+        // timeout. So an epoll fd whose child went ready and was then DRAINED
+        // stayed latched high forever, and every later `poll`/`ppoll` over it
+        // returned 0 immediately — before its timeout, which poll(2) may
+        // never do.
+        //
+        // Any loop that polls an epoll fd instead of calling `epoll_wait` on
+        // it then spins at 100% of a CPU while behaving correctly, which is
+        // why it is invisible to a functional test. That is precisely GLib
+        // over PipeWire's loop fd (`wp_loop_source_new`, lib/wp/core.c):
+        // WirePlumber's main thread was measured in `ppoll` 1,654,732 times
+        // in 35 seconds, every call returning nothing ready.
+        //
+        // Clearing is a FALLING edge — `set` fires no waker for it — so no
+        // parent is spuriously woken, and `push_ready` re-raises it on the
+        // next child event. The lost-wake window between this query and the
+        // parent's `arm` is closed by `arm` returning the cell's level: a
+        // child that goes ready in the window re-raises the cell and the arm
+        // reports it.
+        if self
+            .has_nested_parent
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            self.self_readiness.set(0, narf_filesystem::POLL_IN);
+        }
         0
     }
 
