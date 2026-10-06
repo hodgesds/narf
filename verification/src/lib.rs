@@ -2952,6 +2952,9 @@ mod aarch64_el0_preemption_e2e {
             entry: narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
             stack_top: VirtAddr::new(STACK_VADDR + PAGE_BYTES),
             fs_base: None,
+            // A freshly loaded image starts with a zero GS base, as execve
+            // does (Linux `start_thread_common`); this is a hand-built image.
+            gs_base: 0,
             entry_arg: None,
             loaded_mappings: alloc::vec::Vec::new(),
             // Hand-built image at a fixed CODE_VADDR — no ELF load bias.
@@ -3865,6 +3868,9 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
         entry: narf_userspace::EntryPoint(VirtAddr::new(CODE_VADDR)),
         stack_top: VirtAddr::new(stack_top),
         fs_base: None,
+        // A freshly loaded image starts with a zero GS base, as execve does
+        // (Linux `start_thread_common`); this is a hand-built image.
+        gs_base: 0,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
         // Hand-built image at a fixed CODE_VADDR — no ELF load bias.
