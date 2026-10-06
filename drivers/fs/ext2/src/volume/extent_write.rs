@@ -528,6 +528,111 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(true)
     }
 
+    /// `ext4_alloc_file_blocks(..., EXT4_GET_BLOCKS_CONVERT_UNWRITTEN)` over
+    /// logical `first..end`: every WRITTEN extent there becomes unwritten, so
+    /// it reads back as zeros while keeping its blocks. An extent crossing an
+    /// edge is split at it, and a converted piece merges with an unwritten,
+    /// physically contiguous neighbour in the same leaf, so a large range
+    /// does not fragment block by block. Holes are left alone (the caller
+    /// preallocates them first).
+    pub(super) async fn extent_convert_to_unwritten(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        first: u32,
+        end: u64,
+    ) -> Result<(), FsError> {
+        let mut logical = u64::from(first);
+        while logical < end {
+            let l32 = u32::try_from(logical)
+                .map_err(|_| FsError::Io(narf_block::BlockError::InvalidRange))?;
+            let path = self.extent_path(inode, l32).await?;
+            let leaf = &path.last().ok_or_else(corrupt)?.bytes;
+            let hdr = ExtentHeader::parse(leaf).ok_or_else(corrupt)?;
+            let mut entries = decode_leaves(leaf, &hdr)?;
+            let Some(i) = entries.iter().position(|e| e.covers(l32)) else {
+                // A hole: skip to the next extent in this leaf, if any.
+                logical = entries
+                    .iter()
+                    .map(|e| u64::from(e.logical))
+                    .find(|&s| s > logical)
+                    .unwrap_or(logical + 1)
+                    .min(end);
+                continue;
+            };
+            let e = entries[i];
+            let e_end = u64::from(e.logical) + u64::from(e.len);
+            if e.is_uninitialized {
+                logical = e_end;
+                continue;
+            }
+            // [e.logical, mid_lo) written | [mid_lo, mid_hi) unwritten |
+            // [mid_hi, e_end) written.
+            let mid_lo = logical;
+            let mid_hi = e_end
+                .min(end)
+                .min(mid_lo + u64::from(EXT_UNWRITTEN_MAX_LEN));
+            let at = |l: u64| e.physical + (l - u64::from(e.logical));
+            let mut repl = Vec::with_capacity(3);
+            if mid_lo > u64::from(e.logical) {
+                repl.push(ExtentLeaf {
+                    len: (mid_lo - u64::from(e.logical)) as u16,
+                    ..e
+                });
+            }
+            let mut mid = ExtentLeaf {
+                logical: mid_lo as u32,
+                len: (mid_hi - mid_lo) as u16,
+                is_uninitialized: true,
+                physical: at(mid_lo),
+            };
+            let mut start = i;
+            // `ext4_ext_try_to_merge` backwards into an unwritten neighbour.
+            if repl.is_empty() && i > 0 {
+                let prev = entries[i - 1];
+                if prev.is_uninitialized
+                    && prev.logical + u32::from(prev.len) == mid.logical
+                    && prev.physical + u64::from(prev.len) == mid.physical
+                    && u32::from(prev.len) + u32::from(mid.len) <= u32::from(EXT_UNWRITTEN_MAX_LEN)
+                {
+                    mid = ExtentLeaf {
+                        len: prev.len + mid.len,
+                        ..prev
+                    };
+                    start = i - 1;
+                }
+            }
+            let mut stop = i;
+            if mid_hi < e_end {
+                repl.push(mid);
+                repl.push(ExtentLeaf {
+                    logical: mid_hi as u32,
+                    len: (e_end - mid_hi) as u16,
+                    is_uninitialized: false,
+                    physical: at(mid_hi),
+                });
+            } else {
+                // ...and forwards into an unwritten successor.
+                if let Some(next) = entries.get(i + 1).copied() {
+                    if next.is_uninitialized
+                        && mid.logical + u32::from(mid.len) == next.logical
+                        && mid.physical + u64::from(mid.len) == next.physical
+                        && u32::from(mid.len) + u32::from(next.len)
+                            <= u32::from(EXT_UNWRITTEN_MAX_LEN)
+                    {
+                        mid.len += next.len;
+                        stop = i + 1;
+                    }
+                }
+                repl.push(mid);
+            }
+            entries.splice(start..=stop, repl);
+            self.store_leaf(inode_no, inode, path, entries).await?;
+            logical = mid_hi;
+        }
+        Ok(())
+    }
+
     /// `ext4_ext_remove_space(inode, 0, EXT_MAX_BLOCKS - 1)`: free every
     /// extent and every tree block, leave an empty depth-0 root. Returns the
     /// number of 512-byte sectors released.

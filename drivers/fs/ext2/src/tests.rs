@@ -5752,6 +5752,125 @@ fn smoke_ext4_punch_hole_releases_and_zeroes() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext4_punch_hole_releases_and_zeroes);
 
+/// `FALLOC_FL_ZERO_RANGE` (`ext4_zero_range`): the range reads back as
+/// zeros but stays allocated — written blocks go unwritten, holes are
+/// preallocated, partial edges are zeroed in place — and without KEEP_SIZE
+/// `i_size` grows to cover it. Block-mapped inodes are EOPNOTSUPP, as on
+/// Linux. NARF answered EOPNOTSUPP for every file.
+fn smoke_ext4_zero_range_zeroes_and_keeps_allocation() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    const BS: u64 = 1024;
+    const KEEP_SIZE: u32 = 0x01;
+    const ZERO_RANGE: u32 = 0x10;
+    let sectors = BS / 512;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Start empty, so the seed is one contiguous extent and the root has
+    // room for the splits below without growing the tree.
+    if poll_once(file.truncate(0)).is_none_or(|r| r.is_err())
+        || !matches!(
+            poll_once(file.write(0, &[0x77; 10 * BS as usize])),
+            Some(Ok(_))
+        )
+    {
+        return TestResult::Fail("seeding the file failed");
+    }
+    let before = file.stat().blocks;
+    let (lo, hi) = (2 * BS + 100, 7 * BS + 50);
+    if !matches!(
+        poll_once(file.fallocate(ZERO_RANGE, lo, hi - lo)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("zero range failed");
+    }
+    if file.stat().blocks != before || file.stat().size != 10 * BS {
+        return TestResult::Fail("zero range inside the file changed its allocation or size");
+    }
+    let mut buf = alloc::vec![0u8; 10 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read after zero range failed");
+    }
+    let (l, h) = (lo as usize, hi as usize);
+    if buf[..l].iter().chain(&buf[h..]).any(|&b| b != 0x77) || buf[l..h].iter().any(|&b| b != 0) {
+        return TestResult::Fail("zero range zeroed the wrong bytes");
+    }
+    // Without KEEP_SIZE past EOF: blocks 10 and 11 are allocated, i_size grows.
+    if !matches!(
+        poll_once(file.fallocate(ZERO_RANGE, 9 * BS, 3 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("extending zero range failed");
+    }
+    // Two data blocks (10 and 11); the tree may also grow a block, which
+    // `i_blocks` counts too — where the allocator puts them decides that.
+    if file.stat().size != 12 * BS || file.stat().blocks < before + 2 * sectors {
+        return TestResult::Fail("extending zero range did not allocate and grow i_size");
+    }
+    // With KEEP_SIZE past EOF: allocated, size unchanged.
+    let grown = file.stat().blocks;
+    if !matches!(
+        poll_once(file.fallocate(ZERO_RANGE | KEEP_SIZE, 12 * BS, 2 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("KEEP_SIZE zero range failed");
+    }
+    if file.stat().size != 12 * BS || file.stat().blocks < grown + 2 * sectors {
+        return TestResult::Fail("KEEP_SIZE zero range moved i_size or did not allocate");
+    }
+    let mut tail = alloc::vec![0xffu8; 3 * BS as usize];
+    if !matches!(poll_once(file.read(9 * BS, &mut tail)), Some(Ok(n)) if n == tail.len())
+        || tail.iter().any(|&b| b != 0)
+    {
+        return TestResult::Fail("the zeroed range past the old EOF did not read as zeros");
+    }
+    // The converted range takes writes again.
+    if !matches!(poll_once(file.write(4 * BS + 1, b"zz")), Some(Ok(2))) {
+        return TestResult::Fail("writing into the zeroed range failed");
+    }
+    let mut blk = [0xffu8; BS as usize];
+    if !matches!(poll_once(file.read(4 * BS, &mut blk)), Some(Ok(_)))
+        || &blk[1..3] != b"zz"
+        || blk[..1].iter().chain(&blk[3..]).any(|&b| b != 0)
+    {
+        return TestResult::Fail("a write into the zeroed range read back wrong");
+    }
+    // Block-mapped: EOPNOTSUPP, nothing changed.
+    use narf_filesystem::FsInstance;
+    let content = [0x5au8; 3000];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("block-map mount failed"),
+    };
+    let mapped = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("block-map lookup failed"),
+    };
+    let mut check = [0u8; 3000];
+    match poll_once(mapped.fallocate(ZERO_RANGE, 0, 2000)) {
+        Some(Err(FsError::Unsupported))
+            if matches!(poll_once(mapped.read(0, &mut check)), Some(Ok(3000)))
+                && check.iter().all(|&b| b == 0x5a) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail(
+            "zero range on a block-mapped file must be Unsupported and change nothing",
+        ),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_zero_range_zeroes_and_keeps_allocation
+);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font

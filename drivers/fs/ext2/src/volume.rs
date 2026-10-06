@@ -2109,6 +2109,34 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         Ok(())
     }
 
+    /// Whether `inode` maps its data through an extent tree — the inodes
+    /// Linux's `ext4_fallocate` modes other than punch hole require.
+    pub(crate) fn extent_mapped(&self, inode: &Inode) -> bool {
+        self.superblock.uses_extents() && inode.uses_extents()
+    }
+
+    /// Turn every written extent at logical `first..end` unwritten
+    /// (`EXT4_GET_BLOCKS_CONVERT_UNWRITTEN`): the blocks stay allocated and
+    /// read back as zeros. Extent-mapped inodes only.
+    pub(crate) async fn convert_to_unwritten(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        first: u64,
+        end: u64,
+    ) -> Result<(), FsError> {
+        if !self.extent_mapped(inode) {
+            return Err(FsError::Unsupported);
+        }
+        match u32::try_from(first) {
+            Ok(first) => {
+                self.extent_convert_to_unwritten(inode_no, inode, first, end)
+                    .await
+            }
+            Err(_) => Ok(()),
+        }
+    }
+
     /// The block-map half of [`Self::free_block_range`]
     /// (`ext4_ind_remove_space`). Returns the 512-byte sectors released.
     async fn blockmap_free_range(

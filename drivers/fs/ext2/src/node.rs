@@ -438,6 +438,78 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         result.and(persisted)
     }
 
+    /// `ext4_zero_range` (`FALLOC_FL_ZERO_RANGE`): `offset..offset + len`
+    /// reads back as zeros afterwards but stays ALLOCATED — holes become
+    /// unwritten extents, written whole blocks are converted to unwritten,
+    /// and the partial blocks at the edges are zeroed in place. Without
+    /// KEEP_SIZE, `i_size` grows to cover the range. Extent-mapped inodes
+    /// only: "Indirect files do not support unwritten extents".
+    async fn zero_range(&self, keep_size: bool, offset: u64, len: u64) -> Result<(), FsError> {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidData)?;
+        let bs = self.volume.block_size() as u64;
+        let page = PAGE_SIZE as u64;
+        let (first_page, end_page) = (offset / page, end.div_ceil(page));
+        // As for a punched hole, cached and mapped pages of the range must
+        // not outlive the change to the blocks under them.
+        self.write_back_dirty(first_page, end_page).await?;
+        narf_filesystem::unmap_mapping_range(self, first_page * page)?;
+        let _update = self.volume.lock_inode_updates().await;
+        let inode_no = self.state.lock().inode_no;
+        let mut inode = self.volume.read_inode(inode_no).await?;
+        if !self.volume.extent_mapped(&inode) {
+            return Err(FsError::Unsupported);
+        }
+        // LINUX-GAP: 32-bit `i_size`, as in `fallocate` mode 0.
+        let new_size = if !keep_size && end > u64::from(inode.size) {
+            Some(u32::try_from(end).map_err(|_| FsError::InvalidData)?)
+        } else {
+            None
+        };
+        self.mapping.remove_range(first_page, end_page);
+        let result = self
+            .zero_range_blocks(inode_no, &mut inode, offset, end, bs)
+            .await;
+        if result.is_ok() {
+            if let Some(size) = new_size {
+                inode.size = size;
+            }
+        }
+        inode.touch_ctime_mtime(Ext2Volume::<B>::now_secs());
+        let persisted = self.volume.write_inode(inode_no, &inode).await;
+        self.mapping.remove_range(first_page, end_page);
+        result.and(persisted)
+    }
+
+    async fn zero_range_blocks(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        offset: u64,
+        end: u64,
+        bs: u64,
+    ) -> Result<(), FsError> {
+        // Every hole in the range, edges included, becomes unwritten.
+        self.volume
+            .preallocate(inode_no, inode, offset / bs, end.div_ceil(bs))
+            .await?;
+        // The whole blocks read as zeros by going unwritten...
+        let (first_whole, end_whole) = (offset.div_ceil(bs), end / bs);
+        if end_whole > first_whole {
+            self.volume
+                .convert_to_unwritten(inode_no, inode, first_whole, end_whole)
+                .await?;
+        }
+        // ...and the partial edges by being zeroed (`ext4_zero_partial_blocks`).
+        if offset % bs != 0 {
+            let to = end.min((offset / bs + 1) * bs);
+            self.zero_mapped(inode, offset, to).await?;
+        }
+        if end % bs != 0 && end_whole >= first_whole {
+            self.zero_mapped(inode, end_whole * bs, end).await?;
+        }
+        Ok(())
+    }
+
     /// The on-disk half of [`Self::punch_hole`] over `offset..end`
     /// (`ext4_zero_partial_blocks` + `ext4_ext_remove_space` /
     /// `ext4_ind_remove_space`).
@@ -690,8 +762,12 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         Box::pin(async move {
             const KEEP_SIZE: u32 = 0x01;
             const PUNCH_HOLE: u32 = 0x02;
+            const ZERO_RANGE: u32 = 0x10;
             if mode == PUNCH_HOLE | KEEP_SIZE {
                 return self.punch_hole(offset, len).await;
+            }
+            if mode & !KEEP_SIZE == ZERO_RANGE {
+                return self.zero_range(mode & KEEP_SIZE != 0, offset, len).await;
             }
             // Modes this filesystem implements; anything else is
             // `ext4_fallocate`'s -EOPNOTSUPP.
