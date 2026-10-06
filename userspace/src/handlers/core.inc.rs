@@ -14716,6 +14716,33 @@ pub fn __test_forget_task_pid(task: u64) {
     }
 }
 
+/// Test-only: register a synthetic `CLONE_THREAD` sibling exactly as the clone
+/// path does (`register_thread_task_mapping`): `task` joins thread group `tgid`
+/// under Linux tid `linux_tid`. Undo with [`__test_forget_thread`].
+#[doc(hidden)]
+pub fn __test_register_thread(linux_tid: u64, task: u64, tgid: u64) {
+    register_thread_task_mapping(linux_tid, task, tgid);
+}
+
+/// Test-only: drop every identity row [`__test_register_thread`] created.
+#[doc(hidden)]
+pub fn __test_forget_thread(task: u64) {
+    let linux_tid = {
+        let _mutation = PID_TASK_MUTATION.lock();
+        TASK_TO_LINUX_TID[pid_task_shard(task)]
+            .map
+            .lock()
+            .as_mut()
+            .and_then(|m| m.remove(&task))
+    };
+    if let Some(linux_tid) = linux_tid {
+        if let Some(m) = LINUX_TID_TO_TASK[pid_task_shard(linux_tid)].map.lock().as_mut() {
+            m.remove(&linux_tid);
+        }
+    }
+    __test_forget_task_pid(task);
+}
+
 #[inline]
 fn pid_task_shard(id: u64) -> usize {
     (id as usize) & (PID_TASK_SHARDS - 1)

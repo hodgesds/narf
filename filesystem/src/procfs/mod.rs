@@ -43,6 +43,19 @@ pub fn set_thread_list_hook(f: ThreadListFn) {
     THREAD_LIST.store(f as usize, Ordering::Release);
 }
 
+/// Test-only: the installed `/proc/<pid>/task/` provider (0 when unset), so a
+/// test that installs one can put the previous slot back.
+#[doc(hidden)]
+pub fn __test_thread_list_hook_snapshot() -> usize {
+    THREAD_LIST.load(Ordering::Acquire)
+}
+
+/// Test-only: restore a slot captured by [`__test_thread_list_hook_snapshot`].
+#[doc(hidden)]
+pub fn __test_thread_list_hook_restore(raw: usize) {
+    THREAD_LIST.store(raw, Ordering::Release);
+}
+
 pub(crate) fn hook_thread_list(pid: u64) -> Option<Vec<u64>> {
     let raw = THREAD_LIST.load(Ordering::Acquire);
     if raw == 0 {

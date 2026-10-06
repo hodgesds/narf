@@ -11899,15 +11899,17 @@ fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result
 /// reported in the READER's pid namespace.
 ///
 /// `pid` arrives as an outer ProcessId (procfs has already resolved the
-/// path component), and each tid goes back out through `report_pid_to` for
-/// the same reason `/proc/locks` translates its owners — a tid is a pid in
-/// its namespace, and handing back a raw scheduler id would name a thread
-/// the reader cannot see.
+/// path component). Each member's identity is its Linux TID — a sibling's
+/// own `TASK_TO_LINUX_TID` number, the leader's tgid — never its tgid
+/// (`task_to_pid_raw` maps EVERY member to the tgid, which listed the leader
+/// once per thread and made every sibling's `task/<tid>` ENOENT) and never
+/// a scheduler TaskId. Linux `proc_task_readdir` renders
+/// `task_pid_nr_ns(task, ns)` and skips a thread invisible in `ns`
+/// (fs/proc/base.c); `proc_pid_report` is that filter-and-translate.
 pub fn proc_thread_list(pid: u64) -> alloc::vec::Vec<u64> {
-    let reader = current_task_id();
     crate::task::thread_group_tids(pid)
         .into_iter()
-        .map(|tid| report_pid_to(reader, task_to_pid_raw(tid).unwrap_or(tid)))
+        .filter_map(|task| proc_pid_report(task_to_linux_tid_raw(task).unwrap_or(pid)))
         .filter(|&v| v != 0)
         .collect()
 }
