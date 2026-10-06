@@ -2440,6 +2440,7 @@ fn do_execve_resolved(
     // the binary actually being mapped (the interpreter for scripts).
     set_proc_exe(task, &cur_path);
 
+
     // Step 5: swap the scheduler slot's AS Arc. Without this the
     // poll path's later activate() would still target the old AS
     // until the future's process.address_space update lands.
@@ -6892,6 +6893,15 @@ pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat>
         comm: proc_comm_of_task(task).unwrap_or_else(|| alloc::format!("task-{tid}")),
         utime_ticks: cpu_time_ns_of(task) / NS_PER_TICK,
         stime_ticks: kern_time_ns_of(task) / NS_PER_TICK,
+        // Same precedence as the process-level report, minus 'Z': a zombie
+        // thread has no row in `/proc/<pid>/task` to read.
+        state: if crate::ptrace::is_task_ptrace_stopped(task) {
+            't'
+        } else if is_task_stopped(task) {
+            'T'
+        } else {
+            'R'
+        },
     })
 }
 
@@ -7343,7 +7353,21 @@ pub fn proc_task_info(
         // outer ProcessId — stat field 1 must echo /proc/<N>.
         pid: visible_pid,
         comm,
-        state: if zombie { 'Z' } else { 'R' },
+        // `fs/proc/array.c::task_state_array` — 'T' (stopped) at 0x04, 't'
+        // (tracing stop) at 0x08, 'Z' (zombie) at 0x20, selected by the HIGHEST
+        // set bit (`task_state_index`), so this order is Linux's precedence.
+        // Reporting 'R' for a stopped task made `ps` and every monitor show a
+        // ptrace-stopped or job-control-stopped process as running, and left a
+        // tracer with no way to confirm from /proc that its tracee had stopped.
+        state: if zombie {
+            'Z'
+        } else if crate::ptrace::is_task_ptrace_stopped(tid) {
+            't'
+        } else if is_task_stopped(tid) {
+            'T'
+        } else {
+            'R'
+        },
         brk_top,
         stack_top,
         cmdline,

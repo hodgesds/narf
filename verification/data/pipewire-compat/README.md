@@ -120,6 +120,8 @@ Contracts are checked against the local Linux 7.3-rc4 sources under
 | `/proc/<pid>/task/` named by thread id | `fs/proc/base.c` (`proc_task_readdir`) |
 | `/proc/<pid>/task/<tid>/comm` mode | `fs/proc/base.c` (`tid_base_stuff`) |
 | A ptrace-stop report names the THREAD, not the group leader | `kernel/signal.c` (`do_notify_parent_cldstop`) |
+| A syscall-entry stop shows `rax == -ENOSYS` | `arch/x86/entry/entry_64.S` (`PUSH_AND_CLEAR_REGS rax=$-ENOSYS`) |
+| A stopped task reports `t` / `T`, not `R` | `fs/proc/array.c` (`task_state_array`) |
 | `poll(2)` returns 0 only when a timeout expired | `fs/select.c` (`do_sys_poll`, `poll_schedule_timeout`) |
 | An empty-set `poll` still waits out its timeout | `fs/select.c` (`do_sys_poll` with `nfds == 0`) |
 
@@ -208,10 +210,63 @@ Two things about the measurement are worth keeping, because each cost a boot:
   latched, and only after a child of it had gone ready and been drained. The
   per-fd bisect is what named it.
 
-One caveat on reading a trace: at a syscall-exit stop the return value strace
-prints is currently the syscall NUMBER, not the result — which is why the
-spinning `ppoll` appeared to return `271`, `__NR_ppoll` on x86_64. Read the
-call RATE from a trace, not the values, until the exit-stop register report is
-fixed.
+The caveat that used to live here — that a trace's return values were the
+syscall NUMBER, which is why the spinning `ppoll` appeared to return `271`
+(`__NR_ppoll`) — is fixed; see below.
+
+## Syscall-stop registers, and what a stopped task looks like in /proc
+
+Three more divergences, all found by extending `fedora-ptrace-probe.py` to
+read what a tracer actually reads and comparing it against the same probe on
+the build host:
+
+1. **A syscall-ENTRY stop reported `rax` as the syscall number.** Linux presets
+   it to `-ENOSYS` from the instant of entry — `pushq %rax` into `orig_ax`,
+   then `PUSH_AND_CLEAR_REGS rax=$-ENOSYS` — and that is how an ATTACHING
+   tracer tells an entry stop from an exit stop, since it cannot know which it
+   is looking at. Getting it wrong is what made strace pair the stops off by
+   one and print the number as a result.
+2. **A syscall-EXIT stop reported `rax` as the syscall number too.** The real
+   result could not be read from the saved user state: the exit asm folds the
+   dispatcher's return into the snapshot's `rax` slot only AFTER the dispatcher
+   returns, so inside the dispatch that state still holds the ENTRY register
+   file. Both stops now carry a pinned value for the tracer, separate from
+   what the tracee resumes with.
+3. **A stopped task reported `R` in `/proc/<pid>/stat`.** `task_state_array`
+   gives `T` for a job-control stop and `t` for a tracing stop, chosen by the
+   highest set state bit. `/proc/<pid>/task/<tid>/stat` needed its own answer
+   rather than the process's, because a stop is per-thread — a tracer stops
+   one tid at a time.
+
+And one that was not a register at all: **resuming a tracee raced its own
+park.** `enter_ptrace_stopped` publishes the stop report to the tracer and only
+THEN parks, so a tracer routinely resumed the tracee before it had parked. With
+no park arm of its own, a ptrace-stop fell into the generic deadline park,
+whose re-checked wake condition is "a deliverable signal is pending" — which a
+ptrace resume does not set — so that one wake was dropped and the tracee
+parked forever. Linux closes the same window from the tracer's side, with
+`wait_task_inactive(child, __TASK_TRACED|TASK_FROZEN)` in
+`ptrace_check_attach`. It presented as intermittency, which is the tell.
+
+## Known open gap: a traced execve reports nothing
+
+`strace -p` works. `strace <cmd>` does not: it hangs with its trace ending at
+`--- stopped by SIGSTOP ---`, which is its startup handshake (TRACEME +
+`raise(SIGSTOP)` in the forked child, so the tracer can set options before the
+execve). Linux gives the tracer two things at a successful exec and NARF gives
+neither:
+
+- the exec report — `ptrace_event(PTRACE_EVENT_EXEC, old_vpid)` at the end of
+  `begin_new_exec`, or for a tracer that did not ask for the event, the legacy
+  `send_sig(SIGTRAP, current, 0)`;
+- the execve syscall-EXIT stop, which is what prints `execve(...) = 0`. NARF's
+  exec path DIVERGES into the new image rather than returning through the
+  syscall exit, so no exit stop is ever taken.
+
+They have to land together. Adding only the SIGTRAP was measured: strace, still
+waiting for the exit stop, took the report for a real signal and injected it,
+so `/bin/echo` died of SIGTRAP (`rc=-5`) — a hang traded for a killed program.
+The probe RECORDS both strace shapes on every run rather than asserting them,
+so the gap stays visible and will announce itself the day it closes.
 
 Audible quality and physical power transitions still require hardware tests.

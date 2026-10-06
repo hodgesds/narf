@@ -1149,6 +1149,7 @@ impl FileOps for ProcTaskTidStat {
                 info.comm = thread.comm;
                 info.utime_ticks = thread.utime_ticks;
                 info.stime_ticks = thread.stime_ticks;
+                info.state = thread.state;
             }
             // Field 1 is the THREAD's id, which is what makes a reader able to
             // tell two rows of the same process apart.

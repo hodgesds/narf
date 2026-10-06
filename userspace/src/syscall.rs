@@ -49,6 +49,19 @@ pub trait TrapContext {
     /// in the arch's return registers.
     fn set_return(&mut self, ret: SyscallReturn);
 
+    /// The return the context will hand back as things stand, if this
+    /// implementation tracks one.
+    ///
+    /// The ptrace syscall-EXIT stop needs it: the saved user state still holds
+    /// the ENTRY register file at that point (the asm writes the folded result
+    /// into the snapshot's `rax` slot only after the dispatcher returns), so a
+    /// tracer reading registers there saw the syscall NUMBER where Linux shows
+    /// the result. `None` means "this context does not track one", and the
+    /// caller falls back to the saved state.
+    fn pending_return(&self) -> Option<SyscallReturn> {
+        None
+    }
+
     /// Get the current user stack pointer (RSP on x86_64).
     fn user_rsp(&self) -> u64;
 
@@ -4165,6 +4178,10 @@ impl TrapContext for ArgsOnlyCtx {
         &self.args
     }
     #[inline]
+    fn pending_return(&self) -> Option<SyscallReturn> {
+        Some(self.ret)
+    }
+    #[inline]
     fn set_return(&mut self, ret: SyscallReturn) {
         self.ret = ret;
         // Mirror the return value into the snapshot's rax slot
@@ -4671,6 +4688,29 @@ pub struct SyscallReturn {
 impl SyscallReturn {
     pub const OK: abi::NarfStatus = abi::NarfStatus::Ok;
     pub const INVALID_OP: abi::NarfStatus = abi::NarfStatus::InvalidOp;
+
+    /// The user-visible `rax` this return produces — the same fold the
+    /// syscall-exit asm performs in `frame/src/x86_64/syscall.rs`:
+    ///
+    /// ```text
+    /// "test edx, edx",   // status (rdx) == 0 (OK)?
+    /// "jz 2f",           // status == OK: keep rax = value
+    /// "mov rax, -22",    // status != OK: rax = -EINVAL
+    /// "2:",
+    /// "mov [rsp + 112], rax",
+    /// ```
+    ///
+    /// That store lands in the snapshot's `rax` slot only AFTER the dispatcher
+    /// has returned, which is why anything running inside the dispatch — the
+    /// ptrace syscall-exit stop above all — cannot read the answer out of the
+    /// saved user state and has to fold it here instead.
+    pub const fn user_rax(&self) -> u64 {
+        match self.status {
+            abi::NarfStatus::Ok => self.value,
+            // -EINVAL, as the asm's `mov rax, -22`.
+            _ => (-22i64) as u64,
+        }
+    }
 
     pub const fn ok(value: u64) -> Self {
         Self {

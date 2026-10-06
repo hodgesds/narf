@@ -1046,6 +1046,44 @@ fn park_should_block(
         return true;
     }
 
+    // Ptrace-stop: parked for the TRACER, and resumed only by it —
+    // PTRACE_CONT/SYSCALL/SINGLESTEP/DETACH clear the stopped flag and call
+    // `wake_signal`. SIGKILL still breaks through, as for a job-control stop.
+    //
+    // Register the waker BEFORE re-reading the flag: the same arm-then-recheck
+    // every other park below uses, and it matters more here than most.
+    // `enter_ptrace_stopped_inner` publishes the stop report to the tracer and
+    // only THEN parks, so a tracer routinely observes the stop and resumes the
+    // tracee before this loop has run once. With no arm of its own the tracee
+    // fell through to the generic deadline park, whose re-checked wake
+    // condition is "a deliverable signal is pending" — which a ptrace resume
+    // does not set — so that single `wake_signal` was dropped and the tracee
+    // stayed parked on its u64::MAX deadline forever. Linux closes the same
+    // window from the other side, with
+    // `wait_task_inactive(child, __TASK_TRACED|TASK_FROZEN)` in
+    // `ptrace_check_attach`, which holds the tracer until the tracee is really
+    // off the CPU.
+    //
+    // Symptom: `strace <cmd>` hung with its trace ending at
+    // "--- stopped by SIGSTOP ---". strace's startup handshake is TRACEME +
+    // raise(SIGSTOP) in the forked child so the tracer can set options before
+    // the execve; losing that one wake strands the child there. A
+    // PTRACE_SYSCALL stepping loop showed the other face of it, stops that
+    // never advanced to the next syscall. Both were intermittent, because both
+    // are a race.
+    if crate::ptrace::is_task_ptrace_stopped(task_id)
+        && (crate::handlers::signal_pending_bits(task_id) & crate::handlers::sig_bit(9)) == 0
+    {
+        crate::handlers::register_signal_waker(task_id, waker.clone());
+        if !crate::ptrace::is_task_ptrace_stopped(task_id) {
+            // Resumed in the check→register window.
+            crate::handlers::drop_signal_waker(task_id);
+            uc.sleep_deadline_ns.store(0, Ordering::Release);
+            return false;
+        }
+        return true;
+    }
+
     // Deadline-based park (sleep / nanosleep / pause / blocking poll·epoll·futex).
     let deadline = uc.sleep_deadline_ns.load(Ordering::Acquire);
     // Infinite SysV semaphore waits have a durable queue-local waker and no
