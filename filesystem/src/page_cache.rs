@@ -1251,6 +1251,67 @@ impl PageCache {
         dropped
     }
 
+    /// Drop the CLEAN folios of `(fs_id, inode)` overlapping pages
+    /// `[first_page, end_page)` that nobody but the cache holds — the
+    /// `RWF_DONTCACHE` "dropbehind" (`folio_end_dropbehind` invalidates a
+    /// clean folio once its I/O is done, but leaves a mapped one alone).
+    /// Dirty, mapped or otherwise referenced folios and fills stay, exactly
+    /// as reclaim would leave them. Returns the base pages dropped.
+    pub fn drop_clean_range(
+        &self,
+        fs_id: u32,
+        inode: u64,
+        first_page: u64,
+        end_page: u64,
+    ) -> usize {
+        if first_page >= end_page {
+            return 0;
+        }
+        let lo = PageKey {
+            fs_id,
+            inode,
+            page_off: first_page,
+        };
+        let hi = PageKey {
+            fs_id,
+            inode,
+            page_off: end_page,
+        };
+        let mut dropped = 0;
+        let mut removed: Vec<Arc<CacheFolio>> = Vec::new();
+        {
+            let mut g = self.inner.lock();
+            let mut victims: Vec<PageKey> = g
+                .folios
+                .range(lo..hi)
+                .filter(|(_, slot)| Self::evictable(slot, usize::MAX))
+                .map(|(k, _)| *k)
+                .collect();
+            if let Some(head) = Self::containing_key(&g, lo) {
+                if head != lo
+                    && g.folios
+                        .get(&head)
+                        .is_some_and(|s| Self::evictable(s, usize::MAX))
+                {
+                    victims.push(head);
+                }
+            }
+            for key in victims {
+                if let Some(SlotState::Resident { folio, .. }) =
+                    g.folios.remove(&key).map(|slot| slot.state)
+                {
+                    let pages = folio.page_count();
+                    g.resident_pages = g.resident_pages.saturating_sub(pages);
+                    dropped += pages;
+                    removed.push(folio);
+                }
+            }
+        }
+        // Frames return to the buddy outside the lock.
+        drop(removed);
+        dropped
+    }
+
     /// Invalidate every resident page and in-flight fill.
     pub fn clear(&self) {
         let wake: Vec<Waker> = {
@@ -1452,6 +1513,21 @@ impl FileMapping {
     pub fn remove_from(&self, first_page: u64) -> usize {
         self.cache
             .remove_range(self.fs_id, self.inode, first_page, u64::MAX)
+    }
+
+    /// Drop the pages `[first_page, end_page)`, dirty or not, and void fills
+    /// of them — Linux `truncate_inode_pages_range`, for a hole punched in
+    /// the middle of a file. Returns the pages dropped.
+    pub fn remove_range(&self, first_page: u64, end_page: u64) -> usize {
+        self.cache
+            .remove_range(self.fs_id, self.inode, first_page, end_page)
+    }
+
+    /// Drop the clean, unreferenced pages of `[first_page, end_page)` (see
+    /// [`PageCache::drop_clean_range`]): `RWF_DONTCACHE`'s dropbehind.
+    pub fn drop_clean_range(&self, first_page: u64, end_page: u64) -> usize {
+        self.cache
+            .drop_clean_range(self.fs_id, self.inode, first_page, end_page)
     }
 }
 

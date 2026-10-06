@@ -392,6 +392,260 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             .await
     }
 
+    /// `ext4_punch_hole`: deallocate `offset..offset + len`, which then reads
+    /// as zeros; `i_size` never changes. Block-mapped and extent-mapped
+    /// inodes both punch. A hole at or past EOF is a no-op, and one running
+    /// past EOF stops at the end of the block holding it. The partial blocks
+    /// at either edge are zeroed in place (only where mapped: zeroing must
+    /// not allocate) and every whole block inside is released.
+    async fn punch_hole(&self, offset: u64, len: u64) -> Result<(), FsError> {
+        let bs = self.volume.block_size() as u64;
+        let page = PAGE_SIZE as u64;
+        let clip = |size: u64| -> Option<u64> {
+            if offset >= size {
+                return None;
+            }
+            let end = offset.saturating_add(len);
+            Some(if end >= size {
+                size.div_ceil(bs) * bs
+            } else {
+                end
+            })
+        };
+        let Some(end) = clip(self.stat().size) else {
+            return Ok(());
+        };
+        let (first_page, end_page) = (offset / page, end.div_ceil(page));
+        // `ext4_truncate_page_cache_block_range`: dirty data in the range
+        // reaches disk first, and no mapping may keep a page of it — the
+        // blocks underneath are about to change.
+        self.write_back_dirty(first_page, end_page).await?;
+        narf_filesystem::unmap_mapping_range(self, first_page * page)?;
+        let _update = self.volume.lock_inode_updates().await;
+        let inode_no = self.state.lock().inode_no;
+        let mut inode = self.volume.read_inode(inode_no).await?;
+        let Some(end) = clip(u64::from(inode.size)) else {
+            return Ok(());
+        };
+        self.mapping.remove_range(first_page, end_page);
+        let result = self.punch_blocks(inode_no, &mut inode, offset, end).await;
+        // `file_modified`, whether or not the punch got all the way.
+        inode.touch_ctime_mtime(Ext2Volume::<B>::now_secs());
+        let persisted = self.volume.write_inode(inode_no, &inode).await;
+        // A fault between the removal above and the block changes may have
+        // cached the old contents again.
+        self.mapping.remove_range(first_page, end_page);
+        result.and(persisted)
+    }
+
+    /// `ext4_zero_range` (`FALLOC_FL_ZERO_RANGE`): `offset..offset + len`
+    /// reads back as zeros afterwards but stays ALLOCATED — holes become
+    /// unwritten extents, written whole blocks are converted to unwritten,
+    /// and the partial blocks at the edges are zeroed in place. Without
+    /// KEEP_SIZE, `i_size` grows to cover the range. Extent-mapped inodes
+    /// only: "Indirect files do not support unwritten extents".
+    async fn zero_range(&self, keep_size: bool, offset: u64, len: u64) -> Result<(), FsError> {
+        let end = offset.checked_add(len).ok_or(FsError::InvalidData)?;
+        let bs = self.volume.block_size() as u64;
+        let page = PAGE_SIZE as u64;
+        let (first_page, end_page) = (offset / page, end.div_ceil(page));
+        // As for a punched hole, cached and mapped pages of the range must
+        // not outlive the change to the blocks under them.
+        self.write_back_dirty(first_page, end_page).await?;
+        narf_filesystem::unmap_mapping_range(self, first_page * page)?;
+        let _update = self.volume.lock_inode_updates().await;
+        let inode_no = self.state.lock().inode_no;
+        let mut inode = self.volume.read_inode(inode_no).await?;
+        if !self.volume.extent_mapped(&inode) {
+            return Err(FsError::Unsupported);
+        }
+        // LINUX-GAP: 32-bit `i_size`, as in `fallocate` mode 0.
+        let new_size = if !keep_size && end > u64::from(inode.size) {
+            Some(u32::try_from(end).map_err(|_| FsError::InvalidData)?)
+        } else {
+            None
+        };
+        self.mapping.remove_range(first_page, end_page);
+        let result = self
+            .zero_range_blocks(inode_no, &mut inode, offset, end, bs)
+            .await;
+        if result.is_ok() {
+            if let Some(size) = new_size {
+                inode.size = size;
+            }
+        }
+        inode.touch_ctime_mtime(Ext2Volume::<B>::now_secs());
+        let persisted = self.volume.write_inode(inode_no, &inode).await;
+        self.mapping.remove_range(first_page, end_page);
+        result.and(persisted)
+    }
+
+    async fn zero_range_blocks(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        offset: u64,
+        end: u64,
+        bs: u64,
+    ) -> Result<(), FsError> {
+        // Every hole in the range, edges included, becomes unwritten.
+        self.volume
+            .preallocate(inode_no, inode, offset / bs, end.div_ceil(bs))
+            .await?;
+        // The whole blocks read as zeros by going unwritten...
+        let (first_whole, end_whole) = (offset.div_ceil(bs), end / bs);
+        if end_whole > first_whole {
+            self.volume
+                .convert_to_unwritten(inode_no, inode, first_whole, end_whole)
+                .await?;
+        }
+        // ...and the partial edges by being zeroed (`ext4_zero_partial_blocks`).
+        if offset % bs != 0 {
+            let to = end.min((offset / bs + 1) * bs);
+            self.zero_mapped(inode, offset, to).await?;
+        }
+        if end % bs != 0 && end_whole >= first_whole {
+            self.zero_mapped(inode, end_whole * bs, end).await?;
+        }
+        Ok(())
+    }
+
+    /// `ext4_collapse_range` (`insert == false`) and `ext4_insert_range`:
+    /// remove `offset..offset + len` and pull everything after it down, or
+    /// open a hole of `len` there and push everything from `offset` up.
+    /// `i_size` shrinks or grows by `len`. Both work on whole blocks of
+    /// extent-mapped inodes only, and checks run in Linux's order:
+    /// EOPNOTSUPP (block-mapped), EINVAL (unaligned), EINVAL (collapse
+    /// reaching EOF, insert at or past it).
+    async fn shift_range(&self, insert: bool, offset: u64, len: u64) -> Result<(), FsError> {
+        let bs = self.volume.block_size() as u64;
+        let page = PAGE_SIZE as u64;
+        let end = offset.checked_add(len).ok_or(FsError::InvalidData)?;
+        let validate = |volume: &Ext2Volume<B>, inode: &Inode| -> Result<u32, FsError> {
+            if !volume.extent_mapped(inode) {
+                return Err(FsError::Unsupported);
+            }
+            if (offset | len) % bs != 0 {
+                return Err(FsError::InvalidData);
+            }
+            let size = u64::from(inode.size);
+            if insert {
+                if offset >= size {
+                    return Err(FsError::InvalidData);
+                }
+                // LINUX-GAP: `s_maxbytes` is EFBIG on Linux; this driver's
+                // 32-bit `i_size` is the limit, answered as `truncate` does.
+                u32::try_from(size + len).map_err(|_| FsError::InvalidData)
+            } else {
+                // "There is no need to overlap collapse range with EOF, in
+                // which case it is effectively a truncate operation".
+                if end >= size {
+                    return Err(FsError::InvalidData);
+                }
+                Ok((size - len) as u32)
+            }
+        };
+        let inode_no = self.state.lock().inode_no;
+        {
+            let _update = self.volume.lock_inode_updates().await;
+            let inode = self.volume.read_inode(inode_no).await?;
+            validate(&self.volume, &inode)?;
+        }
+        // Everything from the page holding `offset` on moves: write it out,
+        // unmap it and drop it from the cache (`truncate_pagecache(inode,
+        // round_down(offset, PAGE_SIZE))`).
+        let start_page = offset / page;
+        self.write_back_dirty(start_page, u64::MAX).await?;
+        narf_filesystem::unmap_mapping_range(self, start_page * page)?;
+        let _update = self.volume.lock_inode_updates().await;
+        let mut inode = self.volume.read_inode(inode_no).await?;
+        let new_size = validate(&self.volume, &inode)?;
+        self.mapping.remove_from(start_page);
+        let (first, blocks) = (offset / bs, len / bs);
+        let result = if insert {
+            // `ext4_insert_range`: "Expand file to avoid data loss if there
+            // is error while shifting" — the size grows first, so extents
+            // pushed past the old EOF stay inside the file whatever happens.
+            inode.size = new_size;
+            // Split at the insertion point, push everything from it up.
+            match self
+                .volume
+                .split_extent_at(inode_no, &mut inode, first)
+                .await
+            {
+                Ok(()) => {
+                    self.volume
+                        .shift_extents(inode_no, &mut inode, first, blocks as i64)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            // Release the collapsed blocks, pull everything after them down.
+            match self
+                .volume
+                .free_block_range(inode_no, &mut inode, first, first + blocks)
+                .await
+            {
+                Ok(()) => {
+                    self.volume
+                        .shift_extents(inode_no, &mut inode, first + blocks, -(blocks as i64))
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        };
+        // A collapse shrinks only once the extents have moved down.
+        if result.is_ok() && !insert {
+            inode.size = new_size;
+        }
+        inode.touch_ctime_mtime(Ext2Volume::<B>::now_secs());
+        let persisted = self.volume.write_inode(inode_no, &inode).await;
+        self.mapping.remove_from(start_page);
+        result.and(persisted)
+    }
+
+    /// The on-disk half of [`Self::punch_hole`] over `offset..end`
+    /// (`ext4_zero_partial_blocks` + `ext4_ext_remove_space` /
+    /// `ext4_ind_remove_space`).
+    async fn punch_blocks(
+        &self,
+        inode_no: u32,
+        inode: &mut Inode,
+        offset: u64,
+        end: u64,
+    ) -> Result<(), FsError> {
+        let bs = self.volume.block_size() as u64;
+        let first_whole = offset.div_ceil(bs);
+        let end_whole = end / bs;
+        // The partial head, which also covers a hole inside one block.
+        if offset % bs != 0 {
+            let to = end.min((offset / bs + 1) * bs);
+            self.zero_mapped(inode, offset, to).await?;
+        }
+        // The partial tail, unless the head already covered its block.
+        if end % bs != 0 && end_whole >= first_whole {
+            self.zero_mapped(inode, end_whole * bs, end).await?;
+        }
+        self.volume
+            .free_block_range(inode_no, inode, first_whole, end_whole)
+            .await
+    }
+
+    /// Zero `from..to` (inside one block) on disk if that block is mapped; a
+    /// hole already reads as zeros, and zeroing must not allocate one.
+    async fn zero_mapped(&self, inode: &Inode, from: u64, to: u64) -> Result<(), FsError> {
+        let bs = self.volume.block_size() as u64;
+        let phys = self.volume.map_block(inode, from / bs).await?;
+        if phys == 0 {
+            return Ok(());
+        }
+        let zeros = alloc::vec![0u8; (to - from) as usize];
+        self.volume
+            .write_byte_range(phys * bs + from % bs, &zeros)
+            .await
+    }
+
     /// Write the dirty pages in `[first_page, end_page)` to disk (Linux
     /// `filemap_write_and_wait_range` over `->writepages`): every block of
     /// each page inside EOF, allocating holes, then persist the inode if
@@ -593,6 +847,87 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
         Box::pin(async move {
             let _ = self.load_inode().await?;
             Ok(self.state.lock().stat)
+        })
+    }
+
+    /// ext4 sets `FOP_DONTCACHE`.
+    fn supports_dontcache(&self) -> bool {
+        true
+    }
+
+    /// `RWF_DONTCACHE` dropbehind: the range goes to disk, then its clean
+    /// pages leave the cache — except any still mapped or otherwise held,
+    /// which `folio_end_dropbehind` leaves alone too.
+    fn drop_behind<'a>(&'a self, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            let page = PAGE_SIZE as u64;
+            let (first, end) = (offset / page, offset.saturating_add(len).div_ceil(page));
+            self.write_back_dirty(first, end).await?;
+            self.mapping.drop_clean_range(first, end);
+            Ok(())
+        })
+    }
+
+    /// `ext4_fallocate`. The VFS checks (`vfs_fallocate`: argument ranges,
+    /// mode combinations, fd mode, file type, immutable/append-only) are the
+    /// syscall layer's; what reaches here is a valid request.
+    fn fallocate<'a>(&'a self, mode: u32, offset: u64, len: u64) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            const KEEP_SIZE: u32 = 0x01;
+            const PUNCH_HOLE: u32 = 0x02;
+            const ZERO_RANGE: u32 = 0x10;
+            if mode == PUNCH_HOLE | KEEP_SIZE {
+                return self.punch_hole(offset, len).await;
+            }
+            const COLLAPSE_RANGE: u32 = 0x08;
+            const INSERT_RANGE: u32 = 0x20;
+            if mode & !KEEP_SIZE == ZERO_RANGE {
+                return self.zero_range(mode & KEEP_SIZE != 0, offset, len).await;
+            }
+            if mode == COLLAPSE_RANGE || mode == INSERT_RANGE {
+                return self.shift_range(mode == INSERT_RANGE, offset, len).await;
+            }
+            // Modes this filesystem implements; anything else is
+            // `ext4_fallocate`'s -EOPNOTSUPP.
+            if mode & !KEEP_SIZE != 0 {
+                return Err(FsError::Unsupported);
+            }
+            let end = offset.checked_add(len).ok_or(FsError::InvalidData)?;
+            let _update = self.volume.lock_inode_updates().await;
+            let inode_no = self.state.lock().inode_no;
+            let mut inode = self.volume.read_inode(inode_no).await?;
+            if inode.is_dir() {
+                return Err(FsError::InvalidPath);
+            }
+            // LINUX-GAP: `i_size` is 32 bits here (no `i_size_high`), so a
+            // range ending past 4 GiB is refused as `truncate` refuses it
+            // (EINVAL) where Linux would allocate it.
+            let new_size = if mode & KEEP_SIZE == 0 && end > u64::from(inode.size) {
+                Some(u32::try_from(end).map_err(|_| FsError::InvalidData)?)
+            } else {
+                None
+            };
+            let bs = self.volume.block_size() as u64;
+            let allocated = self
+                .volume
+                .preallocate(inode_no, &mut inode, offset / bs, end.div_ceil(bs))
+                .await;
+            if let Err(FsError::Unsupported) = allocated {
+                // Block-mapped: nothing was touched.
+                return Err(FsError::Unsupported);
+            }
+            // `ext4_do_fallocate` -> `ext4_alloc_file_blocks`: the size moves
+            // only once the whole range is allocated; a partial allocation
+            // (ENOSPC) keeps its blocks but not a size covering them.
+            if allocated.is_ok() {
+                if let Some(size) = new_size {
+                    inode.size = size;
+                }
+            }
+            // `file_modified`.
+            inode.touch_ctime_mtime(Ext2Volume::<B>::now_secs());
+            self.volume.write_inode(inode_no, &inode).await?;
+            allocated
         })
     }
 

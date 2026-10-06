@@ -9620,13 +9620,17 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                 ctx.set_return(errno_ret(EINVAL)); // -EINVAL
                 return;
             }
-            // NARF has no FMODE_NOWAIT, no atomic-write support and no
-            // per-I/O cache-drop, and the kernel answers each of those with
-            // -EOPNOTSUPP on a file that cannot provide them. RWF_NOWAIT is
-            // not even a gap: tmpfs does not set FMODE_NOWAIT either, so
-            // Linux gives -EOPNOTSUPP for the same call on the same kind of
-            // memory-backed file.
-            if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+            // NARF has no FMODE_NOWAIT and no atomic-write support, and the
+            // kernel answers each of those with -EOPNOTSUPP on a file that
+            // cannot provide them. RWF_NOWAIT is not even a gap: tmpfs does
+            // not set FMODE_NOWAIT either, so Linux gives -EOPNOTSUPP for the
+            // same call on the same kind of memory-backed file.
+            if flags & (RWF_NOWAIT | RWF_ATOMIC) != 0 {
+                ctx.set_return(errno_ret(EOPNOTSUPP)); // -EOPNOTSUPP
+                return;
+            }
+            // `kiocb_set_rw_flags`: RWF_DONTCACHE needs FOP_DONTCACHE.
+            if flags & RWF_DONTCACHE != 0 && !endpoint.ops.supports_dontcache() {
                 ctx.set_return(errno_ret(EOPNOTSUPP)); // -EOPNOTSUPP
                 return;
             }
@@ -9671,15 +9675,26 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         return;
     }
 
+    // RWF_DONTCACHE survived the flag checks above, so the file honours it:
+    // the transfer is ordinary buffered I/O followed by dropbehind.
+    let dontcache = v2 && a.arg5 & 0x80 != 0;
     if use_current_pos {
         // Hand the whole call to readv/writev, which own the position lock,
         // the blocking/EAGAIN rules and partial-progress reporting. They
         // repeat the descriptor and iovec checks above; that is cheap next to
         // the I/O and keeps one implementation of those rules.
+        let before = endpoint.description.offset();
         if is_write {
             handler_sys_writev::sys_writev(ctx);
         } else {
             handler_sys_readv::sys_readv(ctx);
+        }
+        // The range is where the shared position moved. For an O_APPEND
+        // write it can start below the bytes written; dropbehind only ever
+        // drops clean, unmapped pages, so the wider range costs nothing.
+        let after = endpoint.description.offset();
+        if dontcache && after > before {
+            let _ = poll_blocking(endpoint.ops.drop_behind(before, after - before));
         }
         return;
     }
@@ -9808,6 +9823,11 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
 
     if is_write && total != 0 {
         crate::mqueue::notify_modify_fd(task, fd);
+    }
+    // Dropbehind is best effort: the transfer already happened and is what
+    // the caller is told about.
+    if dontcache && total != 0 {
+        let _ = poll_blocking(endpoint.ops.drop_behind(pos, total as u64));
     }
     ctx.set_return(SyscallReturn::ok(total as u64));
 }

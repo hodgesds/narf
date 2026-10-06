@@ -5510,6 +5510,618 @@ kernel_test_in!(
     smoke_ext4_extent_truncate_down_frees_blocks_past_eof
 );
 
+/// `fallocate` mode 0 and `FALLOC_FL_KEEP_SIZE` on an extent-mapped file
+/// (`ext4_do_fallocate`): holes become unwritten extents — real blocks, so a
+/// later write cannot hit ENOSPC, but reading back as zeros. Mode 0 moves
+/// `i_size` to cover the range; KEEP_SIZE allocates past EOF and leaves it.
+/// NARF had no ext4 `fallocate`: the syscall layer only raised the size,
+/// so `posix_fallocate`'s promise of space was empty and KEEP_SIZE was
+/// EOPNOTSUPP. A block-mapped file is EOPNOTSUPP on Linux too.
+fn smoke_ext4_fallocate_preallocates_unwritten_extents() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    const BS: u64 = 1024;
+    const KEEP_SIZE: u32 = 0x01;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let sectors = BS / 512;
+    let before = file.stat().blocks;
+    // Mode 0 over blocks 0..8: block 0 is mapped already, 1..=7 are holes.
+    if !matches!(poll_once(file.fallocate(0, 0, 8 * BS)), Some(Ok(()))) {
+        return TestResult::Fail("fallocate mode 0 failed");
+    }
+    if file.stat().size != 8 * BS {
+        return TestResult::Fail("fallocate mode 0 did not extend i_size");
+    }
+    if file.stat().blocks != before + 7 * sectors {
+        return TestResult::Fail("fallocate mode 0 did not allocate the holes");
+    }
+    let mut buf = alloc::vec![0xffu8; 8 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read of the preallocated range failed");
+    }
+    if buf[0] != b'x' || buf[1..].iter().any(|&b| b != 0) {
+        return TestResult::Fail("preallocated blocks did not read back as zeros");
+    }
+    // KEEP_SIZE past EOF: blocks 8..12 allocated, size unchanged.
+    if !matches!(
+        poll_once(file.fallocate(KEEP_SIZE, 8 * BS, 4 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("fallocate KEEP_SIZE failed");
+    }
+    if file.stat().size != 8 * BS {
+        return TestResult::Fail("fallocate KEEP_SIZE moved i_size");
+    }
+    if file.stat().blocks != before + 11 * sectors {
+        return TestResult::Fail("fallocate KEEP_SIZE did not allocate past EOF");
+    }
+    // A write into the preallocated range lands; its neighbours stay zero.
+    if !matches!(poll_once(file.write(3 * BS + 5, b"mid")), Some(Ok(3))) {
+        return TestResult::Fail("write into a preallocated block failed");
+    }
+    if file.stat().blocks != before + 11 * sectors {
+        return TestResult::Fail("writing into preallocated space allocated again");
+    }
+    let mut blk = [0xffu8; BS as usize];
+    if !matches!(poll_once(file.read(3 * BS, &mut blk)), Some(Ok(_)))
+        || &blk[5..8] != b"mid"
+        || blk[..5].iter().chain(&blk[8..]).any(|&b| b != 0)
+    {
+        return TestResult::Fail("a write into preallocated space read back wrong");
+    }
+    // Truncating down releases the preallocation past the new EOF as well.
+    if poll_once(file.truncate(2 * BS)).is_none_or(|r| r.is_err()) {
+        return TestResult::Fail("truncate down failed");
+    }
+    if file.stat().blocks != before + sectors {
+        return TestResult::Fail("truncate down kept preallocated blocks past EOF");
+    }
+    // A block-mapped file: -EOPNOTSUPP (`ext4_do_fallocate`).
+    let content = [0x5au8; 100];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("block-map mount failed"),
+    };
+    use narf_filesystem::FsInstance;
+    let mapped = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("block-map lookup failed"),
+    };
+    match poll_once(mapped.fallocate(0, 0, 4 * BS)) {
+        Some(Err(FsError::Unsupported)) if mapped.stat().size == 100 => TestResult::Pass,
+        _ => TestResult::Fail(
+            "fallocate on a block-mapped file must be Unsupported and change nothing",
+        ),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_fallocate_preallocates_unwritten_extents
+);
+
+/// `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE` (`ext4_punch_hole`): the
+/// range reads back as zeros, whole blocks inside it are released, the
+/// partial blocks at its edges are zeroed in place, and `i_size` never
+/// moves. A hole strictly inside one extent splits it — with the in-inode
+/// root already full, that grows the tree. NARF answered EOPNOTSUPP.
+fn smoke_ext4_punch_hole_releases_and_zeroes() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    const BS: u64 = 1024;
+    const PUNCH: u32 = 0x02 | 0x01;
+    let sectors = BS / 512;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // One ten-block extent of 0x77.
+    if !matches!(
+        poll_once(file.write(0, &[0x77; 10 * BS as usize])),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("seeding the file failed");
+    }
+    let before = file.stat().blocks;
+    // Whole blocks 3, 4, 5 and 6 go; [2K+100, 3K) and [7K, 7K+50) are
+    // zeroed in place.
+    let (lo, hi) = (2 * BS + 100, 7 * BS + 50);
+    if !matches!(poll_once(file.fallocate(PUNCH, lo, hi - lo)), Some(Ok(()))) {
+        return TestResult::Fail("punch hole failed");
+    }
+    if file.stat().size != 10 * BS {
+        return TestResult::Fail("punch hole moved i_size");
+    }
+    if file.stat().blocks + 4 * sectors != before {
+        return TestResult::Fail("punch hole did not release the whole blocks inside it");
+    }
+    let mut buf = alloc::vec![0u8; 10 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read after punch failed");
+    }
+    let (lo, hi) = (lo as usize, hi as usize);
+    if buf[..lo].iter().chain(&buf[hi..]).any(|&b| b != 0x77) {
+        return TestResult::Fail("punch hole damaged bytes outside the hole");
+    }
+    if buf[lo..hi].iter().any(|&b| b != 0) {
+        return TestResult::Fail("the punched range did not read back as zeros");
+    }
+    // A hole inside one block only zeroes.
+    if !matches!(
+        poll_once(file.fallocate(PUNCH, 8 * BS + 10, 10)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("sub-block punch failed");
+    }
+    let mut blk = [0u8; BS as usize];
+    if !matches!(poll_once(file.read(8 * BS, &mut blk)), Some(Ok(_)))
+        || blk[10..20].iter().any(|&b| b != 0)
+        || blk[..10].iter().chain(&blk[20..]).any(|&b| b != 0x77)
+        || file.stat().blocks + 4 * sectors != before
+    {
+        return TestResult::Fail("a sub-block punch did not zero exactly its bytes");
+    }
+    // At or past EOF: a no-op.
+    if !matches!(poll_once(file.fallocate(PUNCH, 10 * BS, BS)), Some(Ok(())))
+        || file.stat().size != 10 * BS
+    {
+        return TestResult::Fail("a punch past EOF was not a no-op");
+    }
+    // The hole is writable again.
+    if !matches!(poll_once(file.write(4 * BS, b"back")), Some(Ok(4))) {
+        return TestResult::Fail("writing into the punched hole failed");
+    }
+    let mut back = [0u8; 4];
+    if !matches!(poll_once(file.read(4 * BS, &mut back)), Some(Ok(4))) || &back != b"back" {
+        return TestResult::Fail("data written into the punched hole did not read back");
+    }
+
+    // Four extents fill the in-inode root; splitting one needs a fifth.
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    for start in [0u64, 4, 8, 12] {
+        if !matches!(
+            poll_once(file.write(start * BS, &[0x66; 3 * BS as usize])),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("seeding four extents failed");
+        }
+    }
+    if !matches!(poll_once(file.fallocate(PUNCH, 5 * BS, BS)), Some(Ok(()))) {
+        return TestResult::Fail("punch that splits an extent in a full root failed");
+    }
+    let mut buf = alloc::vec![0u8; 15 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read after the splitting punch failed");
+    }
+    for blk in 0..15u64 {
+        let want = if blk % 4 == 3 || blk == 5 { 0 } else { 0x66 };
+        let at = (blk * BS) as usize;
+        if buf[at..at + BS as usize].iter().any(|&b| b != want) {
+            return TestResult::Fail("the splitting punch left the wrong blocks");
+        }
+    }
+
+    // Block-mapped: direct blocks and the single-indirect tree both punch.
+    use narf_filesystem::FsInstance;
+    let content = [0x5au8; 6000];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("block-map mount failed"),
+    };
+    let mapped = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("block-map lookup failed"),
+    };
+    if !matches!(poll_once(mapped.write(14 * BS, &[0xa5])), Some(Ok(1))) {
+        return TestResult::Fail("write through the single-indirect block failed");
+    }
+    let before = mapped.stat().blocks;
+    // Blocks 1..=5, block 14 and the emptied indirect block go.
+    if !matches!(
+        poll_once(mapped.fallocate(PUNCH, BS, 20 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("block-map punch failed");
+    }
+    if mapped.stat().blocks + 7 * sectors != before || mapped.stat().size != 14 * BS + 1 {
+        return TestResult::Fail("block-map punch released the wrong blocks or moved i_size");
+    }
+    let mut buf = alloc::vec![0u8; 14 * BS as usize + 1];
+    if !matches!(poll_once(mapped.read(0, &mut buf)), Some(Ok(n)) if n == buf.len())
+        || buf[..BS as usize].iter().any(|&b| b != 0x5a)
+        || buf[BS as usize..].iter().any(|&b| b != 0)
+    {
+        return TestResult::Fail("block-map punch did not read back as zeros");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_punch_hole_releases_and_zeroes);
+
+/// `FALLOC_FL_ZERO_RANGE` (`ext4_zero_range`): the range reads back as
+/// zeros but stays allocated — written blocks go unwritten, holes are
+/// preallocated, partial edges are zeroed in place — and without KEEP_SIZE
+/// `i_size` grows to cover it. Block-mapped inodes are EOPNOTSUPP, as on
+/// Linux. NARF answered EOPNOTSUPP for every file.
+fn smoke_ext4_zero_range_zeroes_and_keeps_allocation() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    const BS: u64 = 1024;
+    const KEEP_SIZE: u32 = 0x01;
+    const ZERO_RANGE: u32 = 0x10;
+    let sectors = BS / 512;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Start empty, so the seed is one contiguous extent and the root has
+    // room for the splits below without growing the tree.
+    if poll_once(file.truncate(0)).is_none_or(|r| r.is_err())
+        || !matches!(
+            poll_once(file.write(0, &[0x77; 10 * BS as usize])),
+            Some(Ok(_))
+        )
+    {
+        return TestResult::Fail("seeding the file failed");
+    }
+    let before = file.stat().blocks;
+    let (lo, hi) = (2 * BS + 100, 7 * BS + 50);
+    if !matches!(
+        poll_once(file.fallocate(ZERO_RANGE, lo, hi - lo)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("zero range failed");
+    }
+    if file.stat().blocks != before || file.stat().size != 10 * BS {
+        return TestResult::Fail("zero range inside the file changed its allocation or size");
+    }
+    let mut buf = alloc::vec![0u8; 10 * BS as usize];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(n)) if n == buf.len()) {
+        return TestResult::Fail("read after zero range failed");
+    }
+    let (l, h) = (lo as usize, hi as usize);
+    if buf[..l].iter().chain(&buf[h..]).any(|&b| b != 0x77) || buf[l..h].iter().any(|&b| b != 0) {
+        return TestResult::Fail("zero range zeroed the wrong bytes");
+    }
+    // Without KEEP_SIZE past EOF: blocks 10 and 11 are allocated, i_size grows.
+    if !matches!(
+        poll_once(file.fallocate(ZERO_RANGE, 9 * BS, 3 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("extending zero range failed");
+    }
+    // Two data blocks (10 and 11); the tree may also grow a block, which
+    // `i_blocks` counts too — where the allocator puts them decides that.
+    if file.stat().size != 12 * BS || file.stat().blocks < before + 2 * sectors {
+        return TestResult::Fail("extending zero range did not allocate and grow i_size");
+    }
+    // With KEEP_SIZE past EOF: allocated, size unchanged.
+    let grown = file.stat().blocks;
+    if !matches!(
+        poll_once(file.fallocate(ZERO_RANGE | KEEP_SIZE, 12 * BS, 2 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("KEEP_SIZE zero range failed");
+    }
+    if file.stat().size != 12 * BS || file.stat().blocks < grown + 2 * sectors {
+        return TestResult::Fail("KEEP_SIZE zero range moved i_size or did not allocate");
+    }
+    let mut tail = alloc::vec![0xffu8; 3 * BS as usize];
+    if !matches!(poll_once(file.read(9 * BS, &mut tail)), Some(Ok(n)) if n == tail.len())
+        || tail.iter().any(|&b| b != 0)
+    {
+        return TestResult::Fail("the zeroed range past the old EOF did not read as zeros");
+    }
+    // The converted range takes writes again.
+    if !matches!(poll_once(file.write(4 * BS + 1, b"zz")), Some(Ok(2))) {
+        return TestResult::Fail("writing into the zeroed range failed");
+    }
+    let mut blk = [0xffu8; BS as usize];
+    if !matches!(poll_once(file.read(4 * BS, &mut blk)), Some(Ok(_)))
+        || &blk[1..3] != b"zz"
+        || blk[..1].iter().chain(&blk[3..]).any(|&b| b != 0)
+    {
+        return TestResult::Fail("a write into the zeroed range read back wrong");
+    }
+    // Block-mapped: EOPNOTSUPP, nothing changed.
+    use narf_filesystem::FsInstance;
+    let content = [0x5au8; 3000];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("block-map mount failed"),
+    };
+    let mapped = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("block-map lookup failed"),
+    };
+    let mut check = [0u8; 3000];
+    match poll_once(mapped.fallocate(ZERO_RANGE, 0, 2000)) {
+        Some(Err(FsError::Unsupported))
+            if matches!(poll_once(mapped.read(0, &mut check)), Some(Ok(3000)))
+                && check.iter().all(|&b| b == 0x5a) =>
+        {
+            TestResult::Pass
+        }
+        _ => TestResult::Fail(
+            "zero range on a block-mapped file must be Unsupported and change nothing",
+        ),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_zero_range_zeroes_and_keeps_allocation
+);
+
+/// `FALLOC_FL_COLLAPSE_RANGE` and `FALLOC_FL_INSERT_RANGE`
+/// (`ext4_collapse_range` / `ext4_insert_range`): remove whole blocks and
+/// pull the rest of the file down, or open a hole and push the rest up,
+/// moving `i_size` by the same amount. Extent-mapped inodes only, block
+/// aligned, and a collapse may not reach EOF nor an insert start at it.
+/// NARF answered EOPNOTSUPP.
+fn smoke_ext4_collapse_and_insert_range_shift_the_file() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+    const BS: u64 = 1024;
+    const COLLAPSE: u32 = 0x08;
+    const INSERT: u32 = 0x20;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (_volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    // Block i holds 0x10 + i throughout.
+    let mut seed = alloc::vec![0u8; 10 * BS as usize];
+    for (i, chunk) in seed.chunks_mut(BS as usize).enumerate() {
+        chunk.fill(0x10 + i as u8);
+    }
+    if poll_once(file.truncate(0)).is_none_or(|r| r.is_err())
+        || !matches!(poll_once(file.write(0, &seed)), Some(Ok(_)))
+    {
+        return TestResult::Fail("seeding the file failed");
+    }
+    let blocks_of = |file: &alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+                     n: u64|
+     -> Option<alloc::vec::Vec<u8>> {
+        let mut buf = alloc::vec![0u8; (n * BS) as usize];
+        match poll_once(file.read(0, &mut buf)) {
+            Some(Ok(got)) if got == buf.len() => Some(
+                buf.chunks(BS as usize)
+                    .map(|c| {
+                        if c.iter().all(|&b| b == c[0]) {
+                            c[0]
+                        } else {
+                            0xff
+                        }
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    };
+    let before = file.stat().blocks;
+    // Unaligned, and reaching EOF: EINVAL.
+    if !matches!(
+        poll_once(file.fallocate(COLLAPSE, 100, BS)),
+        Some(Err(FsError::InvalidData))
+    ) || !matches!(
+        poll_once(file.fallocate(COLLAPSE, 8 * BS, 2 * BS)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("an unaligned or EOF-reaching collapse was not EINVAL");
+    }
+    // Collapse blocks 2..5.
+    if !matches!(
+        poll_once(file.fallocate(COLLAPSE, 2 * BS, 3 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("collapse range failed");
+    }
+    if file.stat().size != 7 * BS || file.stat().blocks + 3 * (BS / 512) != before {
+        return TestResult::Fail("collapse range did not shrink i_size and release the blocks");
+    }
+    if blocks_of(&file, 7).as_deref() != Some(&[0x10, 0x11, 0x15, 0x16, 0x17, 0x18, 0x19][..]) {
+        return TestResult::Fail("collapse range did not pull the tail down");
+    }
+    // At or past EOF, and unaligned: EINVAL.
+    if !matches!(
+        poll_once(file.fallocate(INSERT, 7 * BS, BS)),
+        Some(Err(FsError::InvalidData))
+    ) || !matches!(
+        poll_once(file.fallocate(INSERT, BS, 100)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("an insert at EOF or unaligned was not EINVAL");
+    }
+    // Insert two blocks at 3, inside the extent now mapping 2..7: it splits.
+    if !matches!(
+        poll_once(file.fallocate(INSERT, 3 * BS, 2 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("insert range failed");
+    }
+    if file.stat().size != 9 * BS || file.stat().blocks + 3 * (BS / 512) != before {
+        return TestResult::Fail("insert range did not grow i_size by a hole");
+    }
+    if blocks_of(&file, 9).as_deref() != Some(&[0x10, 0x11, 0x15, 0, 0, 0x16, 0x17, 0x18, 0x19][..])
+    {
+        return TestResult::Fail("insert range did not push the tail up behind a hole");
+    }
+    // The inserted hole takes writes.
+    if !matches!(
+        poll_once(file.write(4 * BS, &[0x44; BS as usize])),
+        Some(Ok(_))
+    ) || blocks_of(&file, 9).as_deref()
+        != Some(&[0x10, 0x11, 0x15, 0, 0x44, 0x16, 0x17, 0x18, 0x19][..])
+    {
+        return TestResult::Fail("writing into the inserted hole went wrong");
+    }
+    // Block-mapped: EOPNOTSUPP for both.
+    use narf_filesystem::FsInstance;
+    let content = [0x5au8; 4 * BS as usize];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("block-map mount failed"),
+    };
+    let mapped = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("block-map lookup failed"),
+    };
+    if !matches!(
+        poll_once(mapped.fallocate(COLLAPSE, BS, BS)),
+        Some(Err(FsError::Unsupported))
+    ) || !matches!(
+        poll_once(mapped.fallocate(INSERT, BS, BS)),
+        Some(Err(FsError::Unsupported))
+    ) || mapped.stat().size != 4 * BS
+    {
+        return TestResult::Fail("collapse/insert on a block-mapped file must be Unsupported");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_collapse_and_insert_range_shift_the_file
+);
+
+/// ext4 sets `FOP_DONTCACHE`, so `RWF_DONTCACHE` I/O is honoured: after the
+/// transfer the range is written back and its clean pages leave the cache
+/// (dropbehind). The next read therefore goes to the device — and finds the
+/// written bytes there. NARF refused the flag with EOPNOTSUPP everywhere.
+fn smoke_ext2_dontcache_drop_behind_writes_back_and_drops() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+
+    use crate::testing;
+    use crate::volume::Ext2Volume;
+
+    let content = [0x5au8; 6000];
+    let device = GatedCountingBlock::new(testing::hard_link_image(&content));
+    let volume = match poll_once(Ext2Volume::mount(device.clone(), DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let file = match poll_once(volume.root().lookup_async("data")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup failed"),
+    };
+    if !file.supports_dontcache() {
+        return TestResult::Fail("ext2/ext4 files must honour RWF_DONTCACHE");
+    }
+    let mut buf = [0u8; 6000];
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000)))
+        || !matches!(poll_once(file.write(100, b"new")), Some(Ok(3)))
+    {
+        return TestResult::Fail("warming the cache failed");
+    }
+    // Served from the cache: no device reads.
+    let reads = device.reads.load(Ordering::Relaxed);
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000)))
+        || device.reads.load(Ordering::Relaxed) != reads
+    {
+        return TestResult::Fail("a warm read went to the device");
+    }
+    if !matches!(poll_once(file.drop_behind(0, 6000)), Some(Ok(()))) {
+        return TestResult::Fail("drop_behind failed");
+    }
+    // The pages are gone: the read goes to the device, and the write made
+    // it there first.
+    buf.fill(0);
+    if !matches!(poll_once(file.read(0, &mut buf)), Some(Ok(6000))) {
+        return TestResult::Fail("read after dropbehind failed");
+    }
+    if device.reads.load(Ordering::Relaxed) == reads {
+        return TestResult::Fail("dropbehind left the pages cached");
+    }
+    if &buf[100..103] != b"new" || buf[..100].iter().chain(&buf[103..]).any(|&b| b != 0x5a) {
+        return TestResult::Fail("dropbehind dropped a page before writing it back");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_dontcache_drop_behind_writes_back_and_drops
+);
+
+/// `ext4_new_inode`: on a volume with the extents feature a new regular file
+/// gets `EXT4_EXTENTS_FL` and an empty extent root (`ext4_ext_tree_init`).
+/// NARF created every file block-mapped, so files it made could never use
+/// the extent-only fallocate modes (preallocation, zero/collapse/insert
+/// range) — fstests' fsx, which tests on a file it creates, disabled them
+/// all. On a plain ext2 volume a new file stays block-mapped.
+fn smoke_ext4_new_files_are_extent_mapped() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FsError, FsInstance};
+    const BS: u64 = 1024;
+    const KEEP_SIZE: u32 = 0x01;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (volume, _file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let root = volume.root();
+    let fresh = match poll_once(root.create("fresh")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create on the ext4 volume failed"),
+    };
+    if !matches!(
+        poll_once(fresh.fallocate(KEEP_SIZE, 0, 4 * BS)),
+        Some(Ok(()))
+    ) {
+        return TestResult::Fail("a file created on ext4 is not extent-mapped");
+    }
+    let payload = [0xc3u8; 3 * BS as usize];
+    let mut back = [0u8; 3 * BS as usize];
+    if !matches!(poll_once(fresh.write(BS, &payload)), Some(Ok(_)))
+        || !matches!(poll_once(fresh.read(BS, &mut back)), Some(Ok(n)) if n == back.len())
+        || back != payload
+    {
+        return TestResult::Fail("data did not round-trip through a new extent-mapped file");
+    }
+    // Plain ext2: no extents feature, so the new file stays block-mapped.
+    let content = [0x5au8; 100];
+    let device = GatedCountingBlock::new(crate::testing::hard_link_image(&content));
+    let volume = match poll_once(crate::volume::Ext2Volume::mount(
+        device,
+        narf_lib::id::DomainId::DRIVER_0,
+    )) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("ext2 mount failed"),
+    };
+    let plain = match poll_once(volume.root().create("plain")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create on the ext2 volume failed"),
+    };
+    match poll_once(plain.fallocate(KEEP_SIZE, 0, 4 * BS)) {
+        Some(Err(FsError::Unsupported)) => TestResult::Pass,
+        _ => TestResult::Fail("a file created on plain ext2 must stay block-mapped"),
+    }
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_new_files_are_extent_mapped);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font
