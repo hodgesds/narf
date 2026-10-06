@@ -2007,7 +2007,7 @@ fn do_execve_resolved(
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
         use core::fmt::Write as _;
-        let _ = writeln!(narf_console::Writer, "EXECVE path={}", path);
+        let _ = writeln!(narf_console::ConsoleOnlyWriter, "EXECVE path={}", path);
     }
 
     // Step 2: copy argv + envp — each a NUL-terminated array of
@@ -11205,7 +11205,7 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 let comm = proc_comm_of_task(task).unwrap_or_default();
                 if crate::syscall::unix_latency_line_wanted(&comm) {
                     let _ = writeln!(
-                        narf_console::Writer,
+                        narf_console::ConsoleOnlyWriter,
                         "UNIXACC ms={} by={} lfd={}",
                         narf_scheduler::narf_time::monotonic_ns() / 1_000_000,
                         comm,

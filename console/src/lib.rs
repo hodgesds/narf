@@ -128,19 +128,40 @@ pub fn write_str(s: &str) {
     write_str_level(klog::DEFAULT_MESSAGE_LOGLEVEL, s);
 }
 
-/// Write a priority-tagged kernel message. The klog ring always receives the
-/// bytes; only physical console fan-out is filtered by `console_loglevel`.
+/// Write a priority-tagged kernel message. The kernel log store always
+/// receives it; only physical console fan-out is filtered by
+/// `console_loglevel`.
 pub fn write_str_level(level: u32, s: &str) {
-    // Mirror to the kernel log ring *first*, before taking the
-    // console lock. klog uses its own IrqSafe lock so panic-time
-    // writes (which may already hold the console lock via the
-    // panic_sink path) still capture without a deadlock risk.
-    klog::record(s);
+    // Record into the kernel log store *first*, before taking the console
+    // lock. klog uses its own IrqSafe lock and never writes to the console
+    // while holding it, so the two locks are never nested.
+    klog::record_level(level, s);
 
     // Existing unlevelled Writer/klog call sites are INFO-equivalent. The
-    // ring above always receives them; quiet/loglevel only controls physical
-    // UART and framebuffer-console emission. Panic and trap sinks bypass this
-    // path and therefore remain visible at every log level.
+    // store above always receives them; quiet/loglevel only controls
+    // physical UART and framebuffer-console emission. Panic and trap sinks
+    // bypass this path and therefore remain visible at every log level.
+    write_console_level(level, s);
+}
+
+/// Write to the physical console (UART + framebuffer hook) ONLY — the text
+/// never enters the kernel log store, so `dmesg`, `/dev/kmsg` and
+/// `syslog(2)` never see it.
+///
+/// For high-volume debug streams (the `syscall-trace` feature's per-syscall
+/// lines) that would otherwise evict every real kernel message from the
+/// store within seconds. Filtered by `console_loglevel` at
+/// `DEFAULT_MESSAGE_LOGLEVEL`, exactly like the `write_str` it replaces.
+pub fn write_str_console_only(s: &str) {
+    write_console_level(klog::DEFAULT_MESSAGE_LOGLEVEL, s);
+}
+
+/// [`write_str_console_only`] at an explicit message level.
+pub fn write_str_console_only_level(level: u32, s: &str) {
+    write_console_level(level, s);
+}
+
+fn write_console_level(level: u32, s: &str) {
     if !klog::console_allows(level) {
         return;
     }
@@ -636,7 +657,7 @@ pub fn panic_sink(info: &core::panic::PanicInfo<'_>) -> ! {
 /// own register dumps.
 pub fn trap_sink(s: &str) {
     // Skip `klog::record` deliberately — it takes an
-    // `IrqSafeSpinLock` (`RING.lock()`) and the original faulting
+    // `IrqSafeSpinLock` (the log store's) and the original faulting
     // code may already hold it; deadlock there manifests as the
     // trap printer dying after one line. The FB hook is also
     // skipped for the same reason — the FB-console writer's path
@@ -676,6 +697,23 @@ pub struct Writer;
 impl fmt::Debug for Writer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Writer").finish()
+    }
+}
+
+/// Formatter adapter for [`write_str_console_only`]: physical console only,
+/// never the kernel log store. For debug streams such as `syscall-trace`.
+pub struct ConsoleOnlyWriter;
+
+impl fmt::Debug for ConsoleOnlyWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConsoleOnlyWriter").finish()
+    }
+}
+
+impl fmt::Write for ConsoleOnlyWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        write_str_console_only(s);
+        Ok(())
     }
 }
 

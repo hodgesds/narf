@@ -1184,6 +1184,16 @@ pub trait FileOps: Send + Sync {
         Box::pin(async { Err(FsError::Unsupported) })
     }
 
+    /// A file-specific `llseek` (`file_operations.llseek`) that REPLACES the
+    /// generic byte-position arithmetic of `lseek(2)`. `None` (the default)
+    /// keeps the generic path; `Some(Ok(v))` is lseek's return value;
+    /// `Some(Err(e))` is a positive Linux errno. `lseek` validates `whence`
+    /// against `SEEK_MAX` before calling this. For devices whose position is
+    /// not a byte offset — `/dev/kmsg`'s record cursor (`devkmsg_llseek`).
+    fn llseek(&self, _offset: i64, _whence: u32) -> Option<Result<u64, i64>> {
+        None
+    }
+
     fn copy_file_range_to<'a>(
         &'a self,
         _off_in: u64,

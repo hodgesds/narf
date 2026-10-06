@@ -1006,17 +1006,17 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         static POLLDIAG_N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
         let n = POLLDIAG_N.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 8 || n % 8192 == 0 {
-            let _ = write!(narf_console::Writer, "POLLDIAG t={task} #{n} fds=[");
+            let _ = write!(narf_console::ConsoleOnlyWriter, "POLLDIAG t={task} #{n} fds=[");
             for pfd in fds.iter().take(16) {
                 let _ = write!(
-                    narf_console::Writer,
+                    narf_console::ConsoleOnlyWriter,
                     "{}:ev{:#x}:re{:#x} ",
                     pfd.fd,
                     pfd.events,
                     pfd.revents
                 );
             }
-            let _ = writeln!(narf_console::Writer, "]");
+            let _ = writeln!(narf_console::ConsoleOnlyWriter, "]");
         }
     }
     if ready > 0 {

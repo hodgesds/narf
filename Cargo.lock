@@ -884,6 +884,7 @@ name = "narf-console"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
 ]

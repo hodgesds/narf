@@ -10184,7 +10184,7 @@ pub(crate) fn terminate_current_task(
         use core::fmt::Write;
         let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));
         let _ = writeln!(
-            narf_console::Writer,
+            narf_console::ConsoleOnlyWriter,
             "[process-exit] kind=signal tid={} pid={} comm={} signal={} core_dumped={} ip={:x}",
             task,
             pid,

@@ -15,6 +15,7 @@ path = "src/lib.rs"
 narf-lib    = { path = "../lib" }
 narf-arch   = { path = "../arch" }
 narf-memory = { path = "../memory" }
+narf-kernel-test = { path = "../verification/kernel-test" }
 
 [lints]
 workspace = true

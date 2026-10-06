@@ -40,18 +40,70 @@ pub fn remap_to_virtual(virt: VirtAddr);
 
 pub fn write_str(s: &str);
 pub fn write_str_level(level: u32, s: &str);
-pub fn klog::set_console_loglevel(level: u32);
+/// Physical console only (UART + FB hook); never enters the log store.
+pub fn write_str_console_only(s: &str);
+pub fn write_str_console_only_level(level: u32, s: &str);
+pub struct Writer;              // fmt adapter → write_str
+pub struct PriorityWriter<const LEVEL: u32>; // → write_str_level
+pub struct ConsoleOnlyWriter;   // → write_str_console_only
 pub fn panic_sink(info: &PanicInfo) -> !;
+pub fn trap_sink(s: &str);
 #[macro_export] macro_rules! klog { (...) => { ... } }
+
+// Kernel log store (`console::klog`) — Linux printk ringbuffer semantics.
+pub const LOG_BUF_SHIFT: u32 = 17;            // CONFIG_LOG_BUF_SHIFT default
+pub const DEFAULT_LOG_BUF_LEN: usize = 1 << 17;
+pub const PRINTKRB_RECORD_MAX: usize = 1024;  // record incl. NUL
+pub const PRINTK_MESSAGE_MAX: usize = 2048;   // rendered record
+pub const LOG_KERN: u8 = 0; pub const LOG_USER: u8 = 1;
+pub const LOG_NEWLINE: u8 = 2; pub const LOG_CONT: u8 = 8;
+pub enum KmsgRead { Record(usize), Empty, Dropped, TooSmall }
+pub fn klog::record(s: &str);                      // DEFAULT_MESSAGE_LOGLEVEL
+pub fn klog::record_level(level: u32, s: &str);
+pub fn klog::emit(facility: u8, level: u8, text: &[u8]); // /dev/kmsg write
+pub fn klog::first_seq() -> u64; pub fn klog::next_seq() -> u64;
+pub fn klog::clear_seq() -> u64; pub fn klog::log_buf_len() -> usize;
+pub fn klog::kmsg_read(cursor: &mut u64, out: &mut [u8]) -> KmsgRead;
+pub fn klog::kmsg_poll(cursor: u64) -> Option<bool /* vanished */>;
+pub fn klog::syslog_read(out: &mut [u8]) -> usize;
+pub fn klog::syslog_read_all(out: &mut [u8], clear: bool) -> usize;
+pub fn klog::syslog_all_size() -> usize;
+pub fn klog::syslog_size_unread() -> usize;
+pub fn klog::syslog_clear();
+pub fn klog::text_since(seq: u64) -> Vec<u8>; pub fn klog::snapshot() -> Vec<u8>;
+pub fn klog::set_clock(f: fn() -> u64);           // record timestamps (ns)
+pub fn klog::memparse(s: &str) -> u64;
+pub fn klog::log_buf_len_value(arg: &str, current: usize) -> Option<usize>;
+pub fn klog::log_buf_len_setup(arg: &str);        // `log_buf_len=`
+pub fn klog::setup_log_buf();                     // once the heap is live
+pub fn klog::set_console_loglevel(level: u32);
 ```
 
-`write_str` always records into the bounded klog ring, then applies Linux's
+`write_str` always records into the kernel log store, then applies Linux's
 `message_level < console_loglevel` rule to physical UART/framebuffer output.
 Legacy unlevelled `Writer` calls have `DEFAULT_MESSAGE_LOGLEVEL` priority.
 The `quiet` boot token selects that threshold, suppressing routine boot and
 runtime chatter; `debug` selects level 10, and `loglevel=N` selects an explicit
 1..15 threshold in command-line order. Panic and fatal-trap sinks bypass this
-filter and remain visible.
+filter and remain visible; they also bypass the store (its lock may be held by
+the code that faulted).
+
+The store is RECORD-based, like Linux's printk ringbuffer: each record has a
+64-bit sequence number, a monotonic timestamp (`set_clock`; 0 until the clock
+is installed), facility, level, `LOG_*` flags and at most
+`PRINTKRB_RECORD_MAX - 1` bytes of text. Kernel text is split into records at
+`\n`; an unterminated fragment waits (unreadable) for the rest of its line, and
+a line that outgrows a record, or is interrupted by an injected record,
+continues in a new record flagged `LOG_CONT`. The text ring defaults to
+`1 << CONFIG_LOG_BUF_SHIFT` = 128 KiB (Linux's Kconfig default, shipped by Arch);
+the descriptor ring holds `log_buf_len >> 5` records. `log_buf_len=` follows
+`log_buf_len_update`: `memparse`, clamp to 2 GiB, round up to a power of two,
+taken only if larger than the current size; `setup_log_buf` allocates the new
+rings once the heap is live and migrates every record with its sequence number.
+`/dev/kmsg` renders a record as `"<prio>,<seq>,<ts_usec>,<flags>;<text>\n"`
+(non-printables and `\` as `\xNN`); `syslog(2)` as
+`"<prio>[%5lu.%06lu] <line>\n"` per line of the record. Debug streams such as
+`syscall-trace` use `ConsoleOnlyWriter` so they never evict real messages.
 
 ### 3.1 MMU-enable handoff protocol
 
@@ -84,8 +136,16 @@ goes silent at the worst possible moment.
 ## 4. Invariants & safety properties
 
 - `panic_sink` is signal-safe: no allocation, no locks held across call sites.
-- Log records are never split across CPUs mid-line (coarse lock).
-- Ring-buffer log with fixed size so a flood cannot exhaust memory.
+- Physical console output is serialised per `write_str` call (coarse lock).
+  A log record never mixes CPUs: a fragment from another CPU commits the
+  pending line and starts its own record (Linux `caller_id`), and the
+  interrupted line resumes as a `LOG_CONT` record.
+- Ring-buffer log with fixed size so a flood cannot exhaust memory; records
+  are evicted whole, oldest first, and readers detect eviction by sequence
+  number (`/dev/kmsg` `EPIPE`, `syslog` READ skips to the oldest record).
+- The store lock is never held across allocation or console output; a
+  per-CPU re-entrancy guard drops a record attempted from an NMI/fault on the
+  CPU that holds it instead of deadlocking.
 - **`write_str` dereferences whichever base the handoff flag
   currently selects.** The flag is an `AtomicUsize` (0 = phys, 1 = virt);
   the base pointer is an `AtomicPtr<u8>` loaded with `Ordering::Acquire`
