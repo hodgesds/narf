@@ -59,9 +59,9 @@ connected mechanisms:
    [`docs/DOMAIN_BACKENDS.md`](docs/DOMAIN_BACKENDS.md).
 
 2. **The async executor is the scheduler.** Syscalls, IRQ work, and
-   driver tasks are stackless Rust `Future`s. Direct context transfer
-   lets a caller donate its remaining time slice to a callee, avoiding
-   a second scheduling round trip.
+   driver tasks are a mix of stackless Rust `Future`s and stackful tasks.
+   Direct context transfer lets a caller donate its remaining time slice
+   to a callee, avoiding a second scheduling round trip.
 
 3. **Narf-Ring carries data across boundaries.** Shared-memory rings
    transfer ownership of buffers instead of copying their bytes. The
@@ -214,7 +214,7 @@ with `--esp-size-mib` / `--root-fs` / `--root-label` flags.
 | TCB | Monolithic kernel — every driver is in the TCB | Minimal `frame/` + memory domain manager + caps core + executor + `security-model/`; drivers are *not* in the TCB |
 | Isolation | Address space (rings 0/3) | Up to 16 Ring-0 domains; PKS / PCID enforcement on x86_64, MTE design on aarch64 |
 | IPC | pipes / UDS / SysV / futex / io_uring | `Narf-Ring` — typed zero-copy ownership transfer with explicit acquire/release |
-| Concurrency | Threads + locks | Stackless `Future`s on a domain-aware executor; direct context transfer |
+| Concurrency | Threads + locks | Stackless `Future`s and stackful tasks on a domain-aware executor; direct context transfer |
 | ACPI / AML | ACPICA (C, imported) | From-scratch Rust parser + AML interpreter inside the TCB |
 
 A Linux-compat persona (`--features linux-compat`) sits on top of the
@@ -301,9 +301,6 @@ reading list), and `research/summaries/` (distilled primary sources).
 |---|---|
 | **x86_64** | First-class. Limine multiboot2 path; UEFI removable-media boot is tested through OVMF with Secure Boot disabled. |
 | **aarch64** | First-class. Linux-compatible FDT entry via direct boot or the removable-media `BOOTAA64.EFI` loader; AAVMF-gated in CI. Generic Timer + GICv3 + PSCI. |
-
-Real-hardware bring-up targets: AMD Zen2 Renoir (Vega8 / DCN 2.0) and
-AMD Phoenix HawkPoint1 (RDNA3.5 / DCN 3.5).
 
 ---
 
