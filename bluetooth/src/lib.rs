@@ -164,6 +164,7 @@ pub fn register_initcalls() {
             crate::hci_sock::dev_info,
             crate::hci_sock::dev_power,
         );
+        narf_filesystem::bluetooth::install_hci_monitor_replay(crate::hci_sock::monitor_replay);
         InitResult::Ok
     });
 }

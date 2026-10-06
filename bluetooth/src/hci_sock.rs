@@ -84,6 +84,37 @@ pub fn dev_info(dev: u16) -> Option<Vec<u8>> {
     Some(b)
 }
 
+/// Build the HCI_CHANNEL_MONITOR bind-time replay: one HCI_MON_NEW_INDEX
+/// packet per controller so btmon lists the adapters. Each packet is a
+/// hci_mon_hdr (opcode/index/len) + hci_mon_new_index (type, bus, bdaddr,
+/// name[8]). Linux ref: net/bluetooth/hci_sock.c send_monitor_replay.
+pub fn monitor_replay() -> Vec<Vec<u8>> {
+    const HCI_MON_NEW_INDEX: u16 = 0;
+    const HCI_PRIMARY: u8 = 0;
+    const HCI_VIRTUAL: u8 = 0;
+    let mut out = Vec::new();
+    for (i, controller) in controller::controllers().iter().enumerate() {
+        let info = controller.info();
+        let mut payload = Vec::with_capacity(16);
+        payload.push(HCI_PRIMARY); // type
+        payload.push(HCI_VIRTUAL); // bus
+        payload.extend_from_slice(&info.bd_addr);
+        let name = alloc::format!("hci{i}");
+        let mut name_field = [0u8; 8];
+        let n = name.len().min(8);
+        name_field[..n].copy_from_slice(&name.as_bytes()[..n]);
+        payload.extend_from_slice(&name_field);
+
+        let mut pkt = Vec::with_capacity(6 + payload.len());
+        pkt.extend_from_slice(&HCI_MON_NEW_INDEX.to_le_bytes());
+        pkt.extend_from_slice(&(i as u16).to_le_bytes());
+        pkt.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        pkt.extend_from_slice(&payload);
+        out.push(pkt);
+    }
+    out
+}
+
 /// Power a controller on/off (HCIDEVUP/HCIDEVDOWN). Returns false for an
 /// unknown index.
 pub fn dev_power(dev: u16, on: bool) -> bool {
@@ -150,4 +181,39 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/hci_sock", smoke_hci_sock_send_and_drain);
+
+    fn smoke_hci_sock_monitor_replay() -> TestResult {
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+        let transport: Arc<dyn crate::transport::HciTransport> =
+            Arc::new(LoopbackTransport::new("mon"));
+        crate::transport::register(transport.clone());
+        let _ = controller::register_ready_transport(
+            transport,
+            controller::ControllerInfo {
+                bd_addr: [1, 2, 3, 4, 5, 6],
+                ..controller::ControllerInfo::default()
+            },
+        );
+
+        let pkts = monitor_replay();
+        // One NEW_INDEX (opcode 0, index 0, len 16); bdaddr at payload+2
+        // (hdr 6 + type 1 + bus 1 = offset 8).
+        let ok = pkts.len() == 1
+            && pkts[0].len() == 22
+            && u16::from_le_bytes([pkts[0][0], pkts[0][1]]) == 0
+            && u16::from_le_bytes([pkts[0][2], pkts[0][3]]) == 0
+            && u16::from_le_bytes([pkts[0][4], pkts[0][5]]) == 16
+            && pkts[0][8..14] == [1, 2, 3, 4, 5, 6]
+            && &pkts[0][14..18] == b"hci0";
+
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+
+        if !ok {
+            return TestResult::Fail("monitor NEW_INDEX replay packet malformed");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/hci_sock", smoke_hci_sock_monitor_replay);
 }

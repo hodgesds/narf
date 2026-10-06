@@ -4351,17 +4351,34 @@ impl SocketFile {
             }
             _ => return SocketOpResult::Err(SockError::InvalidArg),
         }
-        let mut state = self.state.lock();
-        match &mut *state {
-            SocketState::Bluetooth {
-                dev: d, channel: c, ..
-            } => {
-                *d = dev;
-                *c = channel;
-                SocketOpResult::Ok(0)
+        // Binding the monitor channel replays a NEW_INDEX packet per
+        // controller (btmon's initial adapter list).
+        let replay = if channel == HCI_CHANNEL_MONITOR {
+            narf_filesystem::bluetooth::hci_monitor_replay()
+        } else {
+            Vec::new()
+        };
+        let result = {
+            let mut state = self.state.lock();
+            match &mut *state {
+                SocketState::Bluetooth {
+                    dev: d,
+                    channel: c,
+                    replies,
+                    ..
+                } => {
+                    *d = dev;
+                    *c = channel;
+                    replies.extend(replay);
+                    SocketOpResult::Ok(0)
+                }
+                _ => SocketOpResult::Err(SockError::InvalidArg),
             }
-            _ => SocketOpResult::Err(SockError::InvalidArg),
+        };
+        if matches!(result, SocketOpResult::Ok(_)) && channel == HCI_CHANNEL_MONITOR {
+            narf_net::readiness::notify(0);
         }
+        result
     }
 
     /// Fan an asynchronous mgmt event (INDEX_ADDED / NEW_SETTINGS) out to every
@@ -4425,8 +4442,8 @@ impl SocketFile {
                     } => (*channel, *dev, filter.clone()),
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
-                let message = if channel == HCI_CHANNEL_CONTROL {
-                    // mgmt: drain the per-socket reply/event queue.
+                let message = if channel == HCI_CHANNEL_CONTROL || channel == HCI_CHANNEL_MONITOR {
+                    // mgmt / monitor: drain the per-socket reply/event queue.
                     let mut state = self.state.lock();
                     match &mut *state {
                         SocketState::Bluetooth { replies, .. } => {
