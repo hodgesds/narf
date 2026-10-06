@@ -1509,10 +1509,15 @@ impl FileOps for ProcPidFile {
             let info = match task_info(pid, query) {
                 Some(i) => i,
                 None => {
-                    // Task gone (zombie reaped). Linux returns ESRCH;
-                    // we surface as 0 bytes for read — same outcome
-                    // for most consumers.
-                    return Ok(0);
+                    // Task gone (reaped) after the open. Every one of these
+                    // files answers -ESRCH then, not EOF: proc_single_show
+                    // (stat/status), comm_show, proc_pid_cmdline_read in
+                    // fs/proc/base.c, and m_start / show_smaps_rollup
+                    // (maps/numa_maps/smaps/smaps_rollup) in
+                    // fs/proc/task_mmu.c. An empty read looked like "no
+                    // VMAs", which glibc's pthread_getattr_np reports as
+                    // ENOENT instead of the real error.
+                    return Err(FsError::NoSuchProcess);
                 }
             };
             let body = match field {
