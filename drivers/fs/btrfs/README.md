@@ -334,6 +334,10 @@ widths.
 `fixture-nestedsubvol.img.sparse` has a normal directory followed by nested
 subvolumes (`container/outer/inner`) for multi-component `subvol=` mounts plus a
 read-only sibling used to verify root flags and mutation rejection.
+`fixture-times.img.sparse` is a small image whose inode `btrfs_timespec`s were
+patched to fixed values with distinct nanoseconds (`mkfs.btrfs --rootdir` keeps
+whole seconds only) and re-checksummed; it pins exact atime/ctime/mtime/otime
+reporting for files and directories (`NARF_BTRFS_TIMES_ONLY=1` regenerates it).
 `fixture-defaultsubvol.img.sparse` verifies that a plain mount honours the
 root-tree `default` entry. `fixture-laptop.img.sparse` covers a realistic
 non-mixed, 16 KiB-node, zstd-compressed distro layout with `root` and `home`

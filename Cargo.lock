@@ -1115,6 +1115,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1150,6 +1151,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]
@@ -1167,6 +1169,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]

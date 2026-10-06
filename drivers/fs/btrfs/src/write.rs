@@ -6008,8 +6008,15 @@ async fn create_node<B: BlockDevice + 'static>(
         gid: 0,
         nlink: 1,
         rdev: spec.rdev,
+        // `inode_item` stamps all four timespecs with the parent's mtime.
+        atime_sec: ptime_sec,
+        atime_nsec: ptime_nsec,
+        ctime_sec: ptime_sec,
+        ctime_nsec: ptime_nsec,
         mtime_sec: ptime_sec,
         mtime_nsec: ptime_nsec,
+        otime_sec: ptime_sec,
+        otime_nsec: ptime_nsec,
     };
     Ok((new_ino, inode))
 }
@@ -6880,8 +6887,9 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
 /// target dir's `i_size` grown.
 ///
 /// Scope (else the noted error): one mounted subvolume; the source must not be a
-/// directory (`PermissionDenied` — hard-linking a directory is EPERM) and
-/// `new_name` must be free. Hash-colliding peer names are preserved.
+/// directory (`OperationNotPermitted` — hard-linking a directory is EPERM) and
+/// `new_name` must be free (`Busy`, EEXIST). Hash-colliding peer names are
+/// preserved.
 pub async fn link_node<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     source_parent: u64,
@@ -6914,7 +6922,9 @@ pub async fn link_node<B: BlockDevice + 'static>(
         return Err(FsError::Unsupported);
     }
     if entry.ftype == format::FT_DIR {
-        return Err(FsError::PermissionDenied); // EPERM: no hard links to directories
+        // `vfs_link`: `if (S_ISDIR(inode->i_mode)) return -EPERM;`.
+        // `PermissionDenied` is EACCES on the generic link errno path.
+        return Err(FsError::OperationNotPermitted);
     }
     let child_ino = entry.location.objectid;
     let child_ftype = entry.ftype;
@@ -6930,7 +6940,10 @@ pub async fn link_node<B: BlockDevice + 'static>(
         .as_deref()
         .is_some_and(|body| find_dir_item(body, new_name).is_ok())
     {
-        return Err(FsError::InvalidData);
+        // EEXIST, as Linux's `filename_create` answers before `btrfs_link`
+        // runs (`Busy` is the VFS's EEXIST for link, as in ext2). This was
+        // `InvalidData` (EINVAL).
+        return Err(FsError::Busy);
     }
 
     let new_index = next_dir_index(vol, fs_root, target_parent).await?;

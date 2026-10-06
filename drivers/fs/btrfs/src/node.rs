@@ -24,6 +24,8 @@ use crate::volume::BtrfsVolume;
 
 /// Linux `STATX_BASIC_STATS` — the fields this driver populates.
 const STATX_BASIC_STATS: u32 = 0x7ff;
+/// Linux `STATX_BTIME`: `btrfs_getattr` reports the inode's `otime` as btime.
+const STATX_BTIME: u32 = 0x800;
 
 /// Legacy `_IOW(BTRFS_IOCTL_MAGIC, 14, struct btrfs_ioctl_vol_args)`.
 pub(crate) const BTRFS_IOC_SUBVOL_CREATE: u32 = 0x5000_940e;
@@ -181,6 +183,19 @@ impl<B: BlockDevice + 'static> BtrfsNode<B> {
 
     fn volume(&self) -> Result<Arc<BtrfsVolume<B>>, FsError> {
         self.vol.upgrade().ok_or(FsError::NotFound)
+    }
+
+    /// Exact on-disk atime/ctime/mtime for the stat path. The ns→cycles→ns
+    /// round trip behind [`Stat::mtime_cycles`] is not exact, so `stat` and
+    /// `statx` take `mtime_ns` from here; fontconfig compares a font
+    /// directory's `st_mtim` to the nanosecond.
+    fn attrs(&self) -> narf_filesystem::InodeAttrs {
+        narf_filesystem::InodeAttrs {
+            atime_ns: self.inode.atime_ns(),
+            ctime_ns: self.inode.ctime_ns(),
+            mtime_ns: self.inode.mtime_ns(),
+            ..Default::default()
+        }
     }
 
     fn ioctl_async_impl<'a>(
@@ -651,8 +666,14 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 file_type: self.inode.file_type(),
                 perms: self.inode.perms() & 0o777,
             },
-            mtime_cycles: 0,
+            // The on-disk `btrfs_timespec`, not 0 (every btrfs file claimed
+            // 1970). The exact value travels in `InodeAttrs::mtime_ns`.
+            mtime_cycles: narf_time::ns_to_cycles(self.inode.mtime_ns()),
         }
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.attrs()
     }
 
     fn ino(&self) -> u64 {
@@ -675,13 +696,13 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     fn statx_async<'a>(&'a self, _flags: u32, _mask: u32) -> FsFuture<'a, FsStatx> {
         Box::pin(async move {
-            let mtime = FsStatxTimestamp {
-                seconds: self.inode.mtime_sec,
-                nanoseconds: self.inode.mtime_nsec,
+            let ts = |seconds, nanoseconds| FsStatxTimestamp {
+                seconds,
+                nanoseconds,
             };
             let (rdev_major, rdev_minor) = self.inode.rdev_major_minor();
             Ok(FsStatx {
-                mask: STATX_BASIC_STATS,
+                mask: STATX_BASIC_STATS | STATX_BTIME,
                 block_size: self.volume().map(|v| v.sectorsize()).unwrap_or(4096),
                 nlink: self.inode.nlink,
                 uid: self.inode.uid,
@@ -690,10 +711,11 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
                 ino: self.ino,
                 size: self.inode.size,
                 blocks: self.inode.size.div_ceil(512),
-                // btrfs stores a single mtime; surface it for atime/ctime too.
-                atime: mtime,
-                ctime: mtime,
-                mtime,
+                // `btrfs_getattr`: each timespec as stored, otime as btime.
+                atime: ts(self.inode.atime_sec, self.inode.atime_nsec),
+                btime: ts(self.inode.otime_sec, self.inode.otime_nsec),
+                ctime: ts(self.inode.ctime_sec, self.inode.ctime_nsec),
+                mtime: ts(self.inode.mtime_sec, self.inode.mtime_nsec),
                 rdev_major,
                 rdev_minor,
                 ..FsStatx::default()
@@ -1101,6 +1123,17 @@ impl<B: BlockDevice + 'static> DirOps for BtrfsNode<B> {
 
     fn dir_owners(&self) -> (u32, u32) {
         (self.inode.uid, self.inode.gid)
+    }
+
+    fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
+        self.attrs()
+    }
+
+    /// The directory inode's on-disk mtime. Without it every btrfs directory
+    /// stat'd as the epoch, so fontconfig judged each font cache stale and
+    /// rescanned every font on application start.
+    fn dir_mtime_ns(&self) -> u64 {
+        self.inode.mtime_ns()
     }
 }
 

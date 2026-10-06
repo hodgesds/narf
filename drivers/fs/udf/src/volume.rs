@@ -87,6 +87,11 @@ pub struct UdfVolume<B: BlockDevice> {
     pub fsd: FileSetDescriptor,
     /// Decoded root-directory ICB (a long_ad lifted out of the FSD).
     pub root_icb: LongAd,
+    /// The root directory's (Extended) File Entry layout and timestamps,
+    /// read at mount as Linux's `udf_fill_super` reads the root inode
+    /// (`udf_iget`); a root ICB that is not a File Entry fails the mount
+    /// there too.
+    pub root_entry: (super::icb::EntryLayout, super::icb::EntryTimes),
     /// Per-volume registered DMA scratch buffer + cap. See
     /// `VolumeIo` doc for why this is minted once at mount time.
     /// Held inside an `IrqSafeSpinLock` because every sector op
@@ -246,6 +251,28 @@ impl<B: BlockDevice + 'static> UdfVolume<B> {
         let fsd = read_file_set(&sector_buf, 0);
         let root_icb = read_long_ad(&fsd.root_directory_icb, 0);
 
+        // ── Step 5: read the root directory's File Entry ───────
+        if root_icb.partition_ref != 0 {
+            drop(io);
+            return Err(FsError::Unsupported);
+        }
+        let root_lsn = partition.partition_starting_location as u64 + root_icb.extent_lbn as u64;
+        if root_lsn >= cap_blocks {
+            drop(io);
+            return Err(FsError::Io(BlockError::IOError));
+        }
+        Self::read_sector_into(&*device, &io, root_lsn, &mut sector_buf).await?;
+        let root_entry = match (
+            super::icb::decode_entry_layout(&sector_buf),
+            super::icb::decode_entry_times(&sector_buf),
+        ) {
+            (Some(layout), Some(times)) => (layout, times),
+            _ => {
+                drop(io);
+                return Err(FsError::Io(BlockError::IOError));
+            }
+        };
+
         Ok(Arc::new_cyclic(|self_weak| UdfVolume {
             device,
             domain,
@@ -256,6 +283,7 @@ impl<B: BlockDevice + 'static> UdfVolume<B> {
             lvd,
             fsd,
             root_icb,
+            root_entry,
             io: IrqSafeSpinLock::new(io),
         }))
     }
@@ -351,7 +379,11 @@ impl<B: BlockDevice + 'static> FsInstance for UdfVolume<B> {
             .upgrade()
             .expect("UdfVolume::root called after drop");
         let icb = self.root_icb;
-        Arc::new(super::node::UdfNode::root_from_icb(volume, icb))
+        Arc::new(super::node::UdfNode::root_from_icb(
+            volume,
+            icb,
+            self.root_entry,
+        ))
     }
 
     fn name(&self) -> &str {
