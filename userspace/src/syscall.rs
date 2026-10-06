@@ -3552,7 +3552,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             use core::fmt::Write as _;
             let a = ctx.args();
             let _ = writeln!(
-                narf_console::Writer,
+                narf_console::ConsoleOnlyWriter,
                 "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
                 crate::handlers::current_task_id(),
                 table.name_of(variant).unwrap_or("?"),
@@ -3602,7 +3602,7 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
         if syscall_trace_relevant(variant) {
             use core::fmt::Write as _;
             let _ = writeln!(
-                narf_console::Writer,
+                narf_console::ConsoleOnlyWriter,
                 "SYSR t={} {} done ms={}",
                 crate::handlers::current_task_id(),
                 table.name_of(variant).unwrap_or("?"),
@@ -3863,7 +3863,7 @@ fn trace_syscall_paths(name: &str, args: &SyscallArgs) {
         _ => return,
     }
     if !line.is_empty() {
-        let _ = writeln!(narf_console::Writer, "{line}");
+        let _ = writeln!(narf_console::ConsoleOnlyWriter, "{line}");
     }
 }
 
@@ -3895,7 +3895,7 @@ pub fn kernel_syscall_entry_plain_with_state(
             {
                 use core::fmt::Write as _;
                 let _ = writeln!(
-                    narf_console::Writer,
+                    narf_console::ConsoleOnlyWriter,
                     "UNKNOWN_SYSCALL num={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
                     num,
                     args.arg0,
@@ -3942,7 +3942,7 @@ pub fn kernel_syscall_entry_plain_with_state(
     if show_entry {
         use core::fmt::Write as _;
         let _ = writeln!(
-            narf_console::Writer,
+            narf_console::ConsoleOnlyWriter,
             "SYSC t={} {} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
             crate::handlers::current_task_id(),
             table.name_of(n).unwrap_or("?"),
@@ -3992,7 +3992,7 @@ pub fn kernel_syscall_entry_plain_with_state(
             let errors_only = trace_errors_only();
             if !errors_only || is_reportable_syscall_error(r.value) {
                 let _ = writeln!(
-                    narf_console::Writer,
+                    narf_console::ConsoleOnlyWriter,
                     "SYSR t={} {} = {} ({:#x}) st={:?} a0={:#x} a1={:#x} a2={:#x} a3={:#x} ms={}",
                     crate::handlers::current_task_id(),
                     table.name_of(n).unwrap_or("?"),
