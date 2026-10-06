@@ -173,20 +173,20 @@ fn smoke_abi_proc2_arch_prctl_get_fs_efault() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_proc2_arch_prctl_get_fs_efault);
 
 #[cfg(target_arch = "x86_64")]
-fn smoke_abi_proc2_arch_prctl_get_gs_einval() -> TestResult {
+fn smoke_abi_proc2_arch_prctl_get_gs_efault() -> TestResult {
     with_setup(|| {
-        // ARCH_GET_GS = 0x1004 shares the not-yet-wired `ARCH_SET_GS |
-        // ARCH_GET_GS` arm with SET_GS (which the base file covers); assert
-        // the GET_GS subcode also returns -EINVAL.
+        // ARCH_GET_GS = 0x1004 with a NULL destination is `put_user`'s
+        // -EFAULT (do_arch_prctl_64). This used to pin -EINVAL, the answer of
+        // NARF's unimplemented GS arm, not Linux's.
         const ARCH_GET_GS: u64 = 0x1004;
         match call(Syscall::ArchPrctl.raw(), a1(ARCH_GET_GS, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("arch_prctl ARCH_GET_GS did not return -EINVAL"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("arch_prctl ARCH_GET_GS(NULL) did not return -EFAULT"),
         }
     })
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("syscall_abi", smoke_abi_proc2_arch_prctl_get_gs_einval);
+kernel_test_in!("syscall_abi", smoke_abi_proc2_arch_prctl_get_gs_efault);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_proc2_arch_prctl_unknown_einval() -> TestResult {

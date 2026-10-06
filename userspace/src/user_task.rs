@@ -2880,6 +2880,16 @@ impl core::future::Future for UserTaskFuture {
             #[cfg(target_arch = "x86_64")]
             narf_scheduler::stackful::set_current_user_fs_base(fs_base);
         }
+        // The task's initial user GS base: 0 for a fresh image, the parent's
+        // for a fork/clone child. Own-stack runs this poll once per task; from
+        // then on the scheduler's per-task slot carries it across switches.
+        #[cfg(target_arch = "x86_64")]
+        if narf_scheduler::stackful::user_own_stack_enabled() {
+            // SAFETY: CPL0 with the kernel GS live; the exit `swapgs` makes
+            // this the user's GS.base.
+            unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(this.process.gs_base) };
+            narf_scheduler::stackful::set_current_user_gs_base(this.process.gs_base);
+        }
 
         // Interrupts off across the iretq. The trap handler
         // re-enables them on its swapgs path; the hook + longjmp

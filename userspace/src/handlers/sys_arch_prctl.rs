@@ -8,11 +8,42 @@ pub(crate) fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
     const ARCH_GET_FS: u64 = 0x1003;
     const ARCH_GET_GS: u64 = 0x1004;
 
+    // `TASK_SIZE_MAX` for 4-level paging: `(1 << 47) - PAGE_SIZE`
+    // (arch/x86/include/asm/page_64_types.h).
+    const TASK_SIZE_MAX: u64 = (1 << 47) - 4096;
+
     let args = *ctx.args();
     let code = args.arg0;
     let addr = args.arg1;
 
     match code {
+        // arch/x86/kernel/process_64.c::do_arch_prctl_64: both SET arms
+        // refuse a base at or above TASK_SIZE_MAX with -EPERM before touching
+        // anything ("Not strictly needed for %fs, but do it for symmetry").
+        ARCH_SET_FS | ARCH_SET_GS if addr >= TASK_SIZE_MAX => {
+            ctx.set_return(errno_ret(EPERM));
+        }
+        ARCH_SET_GS => {
+            // The user GS base sits in IA32_KERNEL_GS_BASE while the kernel's
+            // GS is live; the exit `swapgs` makes it the user's GS.base.
+            // SAFETY: CPL0 syscall context; `addr` is below TASK_SIZE_MAX.
+            unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(addr) };
+            // Per-task slot, so a preempt/park resume restores it.
+            narf_scheduler::stackful::set_current_user_gs_base(addr);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        ARCH_GET_GS => {
+            // `put_user(x86_gsbase_read_task(task), arg2)` — -EFAULT on a bad
+            // pointer.
+            // SAFETY: CPL0 syscall context, kernel GS live.
+            let gs_base = unsafe { narf_arch::x86_64::user_mode::user_gs_base() };
+            // SAFETY: copy_to_user range-validates and SMAP-brackets the write.
+            if unsafe { copy_to_user(addr, &gs_base.to_le_bytes()) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(0));
+        }
         ARCH_SET_FS => {
             // SAFETY: `addr` is treated as an opaque u64 the user
             // owns — the MSR write is unconditional at CPL=0 and
@@ -76,11 +107,6 @@ pub(crate) fn sys_arch_prctl(ctx: &mut dyn TrapContext) {
                 return;
             }
             ctx.set_return(SyscallReturn::ok(0));
-        }
-        ARCH_SET_GS | ARCH_GET_GS => {
-            // Not yet wired; GS is reserved for the kernel
-            // per-CPU pointer via swapgs.
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         }
         _ => {
             ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));

@@ -682,6 +682,20 @@ pub fn set_current_user_fs_base(fs_base: u64) {
     }
 }
 
+/// Publish the CURRENT stackful task's user GS base. Called by
+/// `arch_prctl(ARCH_SET_GS)`, the first poll (fork/clone inheritance) and
+/// execve (reset to 0) after they write `IA32_KERNEL_GS_BASE`, so the value is
+/// in the per-task slot even before the next switch-out saves it.
+#[cfg(target_arch = "x86_64")]
+pub fn set_current_user_gs_base(gs_base: u64) {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: in-flight task on this CPU.
+        unsafe { (*p).user_gs_base.store(gs_base, Ordering::Relaxed) };
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn user_fpu_save_task(cpu: usize, task: &KernelTask) {
@@ -693,6 +707,11 @@ fn user_fpu_save_task(cpu: usize, task: &KernelTask) {
     let fs_base = unsafe { narf_arch::x86_64::user_mode::user_fs_base_for_cpu(cpu) };
     task.user_fs_base.store(fs_base, Ordering::Relaxed);
     task.user_tls_valid.store(true, Ordering::Release);
+    // Same for the user GS base, parked in IA32_KERNEL_GS_BASE while the
+    // kernel's GS is live: a WRGSBASE since the last switch-in is only there.
+    // SAFETY: CPL0 on a scheduler path, so the kernel GS is the live one.
+    let gs_base = unsafe { narf_arch::x86_64::user_mode::user_gs_base() };
+    task.user_gs_base.store(gs_base, Ordering::Relaxed);
     let area = task.user_fpu.load(Ordering::Acquire);
     let live = task.user_fpu_live.load(Ordering::Acquire);
     // A task that never consumed FP/SIMD after its last deferred resume has no
@@ -834,6 +853,12 @@ pub(crate) fn request_current_sync_requeue(target_cpu: u32) {
 unsafe fn prepare_direct_arch_state(task: &KernelTask) {
     let top = ((task.stack.as_ptr() as u64) + task.stack.len() as u64) & !0xFu64;
     crate::retarget_kernel_stack(top);
+    // SAFETY: CPL0 with the kernel GS live; the value is the task's own user
+    // GS base (zero until it sets one), which only `swapgs` on the way out
+    // makes visible.
+    unsafe {
+        narf_arch::x86_64::user_mode::set_user_gs_base(task.user_gs_base.load(Ordering::Relaxed));
+    }
     if task.user_tls_valid.load(Ordering::Acquire) {
         // SAFETY: the task published this canonical user TLS base while its
         // address space was active.
@@ -1695,6 +1720,16 @@ pub struct KernelTask {
     /// legitimately be zero, and skipping that restore leaks another task's
     /// thread pointer across a direct context-switch resume.
     user_tls_valid: AtomicBool,
+    /// Per-task user GS base (x86_64). Linux keeps one per thread
+    /// (`thread.gsbase`), set by `arch_prctl(ARCH_SET_GS)` or `WRGSBASE`,
+    /// inherited by fork/clone and zeroed by execve. While the task is in the
+    /// kernel it lives in `IA32_KERNEL_GS_BASE` (after `swapgs`), so it is
+    /// saved from there at every switch-out and written back at every
+    /// switch-in. Zero is the correct initial value for every task, so unlike
+    /// `user_fs_base` it needs no "published" flag: restoring it
+    /// unconditionally is what keeps another task's value from leaking in.
+    #[cfg(target_arch = "x86_64")]
+    user_gs_base: AtomicU64,
     /// Owning scheduler wake cell. Its raw `stackful` back-pointer is cleared
     /// synchronously before this task is retired, while this Arc keeps the
     /// cell and direct address-space owner alive across a handoff.
@@ -1799,6 +1834,8 @@ impl KernelTask {
             user_context: AtomicPtr::new(core::ptr::null_mut()),
             user_cr3: AtomicU64::new(0),
             user_fs_base: AtomicU64::new(0),
+            #[cfg(target_arch = "x86_64")]
+            user_gs_base: AtomicU64::new(0),
             user_tls_valid: AtomicBool::new(false),
             wake_cell: narf_lib::sync::IrqSafeSpinLock::new(None),
             wake_cell_ptr: AtomicPtr::new(core::ptr::null_mut()),
@@ -2024,6 +2061,15 @@ impl KernelTask {
             // TLS access (`fs:[0]`) faults. Skipped only until the task publishes
             // a value; zero itself is valid and must overwrite another task's
             // FS_BASE.
+            // The user GS base likewise: unconditional, since zero is every
+            // task's initial value and skipping it would hand this task the
+            // previous task's GS.
+            // SAFETY: CPL0 with the kernel GS live; this task's own value.
+            unsafe {
+                narf_arch::x86_64::user_mode::set_user_gs_base(
+                    self.user_gs_base.load(Ordering::Relaxed),
+                );
+            }
             if self.user_tls_valid.load(Ordering::Acquire) {
                 let fs_base = self.user_fs_base.load(Ordering::Relaxed);
                 // SAFETY: `fs_base` is a canonical user vaddr published from this
@@ -4879,6 +4925,107 @@ pub mod tests {
         }
         if OBSERVED.load(Ordering::Acquire) != FS {
             return TestResult::Fail("FS_BASE not reloaded on kernel_switch resume");
+        }
+        TestResult::Pass
+    }
+
+    /// The switch-out save captures the user GS base from
+    /// `IA32_KERNEL_GS_BASE` (where it sits while the kernel's GS is live), so a
+    /// `WRGSBASE` the task did in user mode, with no syscall, survives the
+    /// switch. Linux saves `gsbase` the same way in `save_fsgs`.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_user_gs_base_saved_at_switch_out() -> TestResult {
+        const GS: u64 = 0x0000_7fee_1234_5000;
+        let task = KernelTask::new(core::future::ready(()));
+        // As if user code ran WRGSBASE: the value is only in the MSR.
+        // SAFETY: CPL0 test context, kernel GS live; the inactive slot is
+        // restored below.
+        unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(GS) };
+        user_fpu_save_task(this_cpu(), &task);
+        // SAFETY: as above.
+        unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(0) };
+        if task.user_gs_base.load(Ordering::Acquire) != GS {
+            return TestResult::Fail("switch-out did not save the live user GS base");
+        }
+        TestResult::Pass
+    }
+
+    /// Under own-stack, `poll_to_yield` must write the task's own user GS base
+    /// back before switching it in: the task sets GS and yields, a peer
+    /// clobbers the MSR, and on resume the task must see ITS value. A second,
+    /// fresh task that never set GS must see 0, not the clobber — the
+    /// unconditional restore is what stops one task's GS leaking into another.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_user_gs_base_reloaded_on_kernel_switch_resume() -> TestResult {
+        use core::sync::atomic::{AtomicU32, AtomicU64};
+        const GS: u64 = 0x0000_7fcc_ee00_0000;
+        const CLOBBER: u64 = 0x0000_1111_3333_0000;
+        static PHASE: AtomicU32 = AtomicU32::new(0);
+        static OBSERVED: AtomicU64 = AtomicU64::new(0);
+        static FRESH: AtomicU64 = AtomicU64::new(u64::MAX);
+
+        let saved_own_stack = USE_OWN_STACK.load(Ordering::Acquire);
+        USE_OWN_STACK.store(true, Ordering::Release);
+
+        struct GsResume;
+        impl Future for GsResume {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if PHASE.fetch_add(1, Ordering::AcqRel) == 0 {
+                    set_current_user_gs_base(GS);
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                // SAFETY: CPL0, kernel GS live.
+                OBSERVED.store(
+                    unsafe { narf_arch::x86_64::user_mode::user_gs_base() },
+                    Ordering::Release,
+                );
+                Poll::Ready(())
+            }
+        }
+        struct GsFresh;
+        impl Future for GsFresh {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                // SAFETY: CPL0, kernel GS live.
+                FRESH.store(
+                    unsafe { narf_arch::x86_64::user_mode::user_gs_base() },
+                    Ordering::Release,
+                );
+                Poll::Ready(())
+            }
+        }
+        PHASE.store(0, Ordering::Release);
+        OBSERVED.store(0, Ordering::Release);
+        FRESH.store(u64::MAX, Ordering::Release);
+
+        let mut task = KernelTask::new(GsResume);
+        let mut fresh = KernelTask::new(GsFresh);
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: standard stackful poll.
+        let r1 = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        // SAFETY: CPL0, kernel GS live — a peer's value left in the MSR.
+        unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(CLOBBER) };
+        // SAFETY: standard stackful poll.
+        let r2 = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
+        // SAFETY: as above.
+        unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(CLOBBER) };
+        // SAFETY: standard stackful poll.
+        let r3 = unsafe { fresh.poll_to_yield(&mut exec_ctx, &waker) };
+        // SAFETY: as above.
+        unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(0) };
+        USE_OWN_STACK.store(saved_own_stack, Ordering::Release);
+
+        if r1 != Poll::Pending || r2 != Poll::Ready(()) || r3 != Poll::Ready(()) {
+            return TestResult::Fail("unexpected poll results");
+        }
+        if OBSERVED.load(Ordering::Acquire) != GS {
+            return TestResult::Fail("user GS base not restored on kernel_switch resume");
+        }
+        if FRESH.load(Ordering::Acquire) != 0 {
+            return TestResult::Fail("a fresh task inherited another task's user GS base");
         }
         TestResult::Pass
     }
@@ -8046,6 +8193,13 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_user_fs_base_reloaded_on_kernel_switch_resume
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/stackful", smoke_user_gs_base_saved_at_switch_out);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_user_gs_base_reloaded_on_kernel_switch_resume
     );
     #[cfg(target_arch = "aarch64")]
     kernel_test_in!(

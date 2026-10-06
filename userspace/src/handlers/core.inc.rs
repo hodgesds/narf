@@ -11497,6 +11497,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(rsp),
         fs_base: child_tls_base(flags, ca.tls),
+        // Linux `copy_thread` copies the parent's GS base into the child (fork
+        // and threads alike); CLONE_SETTLS only replaces FS.
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: CPL0 syscall context, kernel GS live.
+        gs_base: unsafe { narf_arch::x86_64::user_mode::user_gs_base() },
+        #[cfg(not(target_arch = "x86_64"))]
+        gs_base: 0,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
         // Zero sentinel, like `entry` above: a cloned task resumes from

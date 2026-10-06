@@ -203,6 +203,7 @@ fn smoke_userspace_pending_spawn_publishes_only_after_inheritance() -> TestResul
             entry: crate::loader::EntryPoint(narf_memory::VirtAddr::new(0x400000)),
             stack_top: narf_memory::VirtAddr::new(0x7fff_ffff_f000),
             fs_base: None,
+            gs_base: 0,
             entry_arg: None,
             loaded_mappings: alloc::vec::Vec::new(),
         },

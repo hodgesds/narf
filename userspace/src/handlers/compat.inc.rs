@@ -2414,6 +2414,14 @@ fn do_execve_resolved(
             unsafe { narf_scheduler::set_user_fs_base(fb) };
             narf_scheduler::stackful::set_current_user_fs_base(fb);
         }
+        // execve zeroes the GS base (Linux `start_thread_common`): the old
+        // image's value must not survive into the new one.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: CPL0 syscall context, kernel GS live.
+            unsafe { narf_arch::x86_64::user_mode::set_user_gs_base(0) };
+            narf_scheduler::stackful::set_current_user_gs_base(0);
+        }
         #[cfg(target_arch = "aarch64")]
         {
             // Linux arm64 flush_thread clears TLS and FPSIMD during exec.

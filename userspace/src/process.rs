@@ -83,6 +83,12 @@ pub struct UserProcess {
     /// each user-mode entry so `mov rax, fs:[N]` lands in the
     /// per-task TLS block.
     pub fs_base: Option<u64>,
+    /// Initial user GS base (x86_64), applied on the task's first entry: 0 for
+    /// a freshly loaded image (execve zeroes it, Linux `start_thread_common`),
+    /// the parent's live value for fork/clone (`copy_thread`). Later changes
+    /// (`arch_prctl(ARCH_SET_GS)`, `WRGSBASE`) live in the scheduler's
+    /// per-task slot, which is saved and restored across every switch.
+    pub gs_base: u64,
     /// First-arg value to pass into the entry point (as RDI on
     /// x86_64). Used by `clone(2)` so a thread's start routine
     /// receives its argument; ordinary `_start` doesn't read RDI
@@ -797,6 +803,7 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         entry,
         stack_top: VirtAddr::new(rsp),
         fs_base,
+        gs_base: 0,
         entry_arg: None,
         loaded_mappings,
         program_bias,

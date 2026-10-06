@@ -277,6 +277,13 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             None
         },
+        // Linux `copy_thread` copies the parent's GS base into the child (fork
+        // and threads alike); CLONE_SETTLS only replaces FS.
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: CPL0 syscall context, kernel GS live.
+        gs_base: unsafe { narf_arch::x86_64::user_mode::user_gs_base() },
+        #[cfg(not(target_arch = "x86_64"))]
+        gs_base: 0,
         entry_arg: None,
         loaded_mappings: alloc::vec::Vec::new(),
     };
