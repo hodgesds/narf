@@ -430,3 +430,188 @@ kernel_test_in!(
     "drivers/fs/iso9660",
     smoke_iso9660_write_paths_are_read_only
 );
+
+// ── Exact timestamps (§9.1.5 recording date, Linux `iso_date`) ─────
+
+/// Byte offset of the §9.1.5 recording date within a directory record.
+const DATE_OFF: usize = 18;
+
+/// A §9.1.5 date: years since 1900, month, day, hour, minute, second, and a
+/// signed GMT offset in 15-minute units.
+fn iso_date(year: u16, mon: u8, day: u8, h: u8, m: u8, s: u8, tz: i8) -> [u8; 7] {
+    [(year - 1900) as u8, mon, day, h, m, s, tz as u8]
+}
+
+/// `build_iso9660_image` plus a `SUB` directory (extent 21) and distinct
+/// recording dates, chosen so each record Linux does NOT read for an inode
+/// carries a different time than the one it does:
+///
+/// - `TEST.TXT;1`: 2023-11-14 17:13:20 at GMT-5 (tz -20) = 1700000000.
+/// - root ".": 2022-04-15 14:22:03 at GMT+9 (tz +36) = 1650000123. The PVD's
+///   copy of the root record and the root ".." say 2001-01-01.
+/// - `SUB` in the root: 2001-01-01; `SUB`'s own ".": 2021-06-01 12:00:00
+///   GMT = 1622548800.
+fn build_iso9660_dated_image() -> Vec<u8> {
+    let (mut img, _) = build_iso9660_image();
+    let root = 18 * SECTOR_SIZE;
+    let stale = iso_date(2001, 1, 1, 0, 0, 0, 0);
+    // Root sector: "." @0 (34 B), ".." @34 (34 B), TEST.TXT;1 @68 (44 B).
+    img[root + DATE_OFF..root + DATE_OFF + 7]
+        .copy_from_slice(&iso_date(2022, 4, 15, 14, 22, 3, 36));
+    img[root + 34 + DATE_OFF..root + 34 + DATE_OFF + 7].copy_from_slice(&stale);
+    img[root + 68 + DATE_OFF..root + 68 + DATE_OFF + 7]
+        .copy_from_slice(&iso_date(2023, 11, 14, 17, 13, 20, -20));
+    let sub_off = 112;
+    let n = write_dir_record(
+        &mut img[root..],
+        sub_off,
+        21,
+        SECTOR_SIZE as u32,
+        dir_flags::DIRECTORY,
+        b"SUB",
+    );
+    debug_assert_eq!(n, 36);
+    img[root + sub_off + DATE_OFF..root + sub_off + DATE_OFF + 7].copy_from_slice(&stale);
+    // The PVD's embedded root record (§8.4.18) — not what Linux reads.
+    let pvd_root = 16 * SECTOR_SIZE + 156;
+    img[pvd_root + DATE_OFF..pvd_root + DATE_OFF + 7].copy_from_slice(&stale);
+    // SUB's extent: "." and "..".
+    let sub = 21 * SECTOR_SIZE;
+    let dot = write_dir_record(
+        &mut img[sub..],
+        0,
+        21,
+        SECTOR_SIZE as u32,
+        dir_flags::DIRECTORY,
+        &[0x00],
+    );
+    write_dir_record(
+        &mut img[sub..],
+        dot,
+        18,
+        SECTOR_SIZE as u32,
+        dir_flags::DIRECTORY,
+        &[0x01],
+    );
+    img[sub + DATE_OFF..sub + DATE_OFF + 7].copy_from_slice(&iso_date(2021, 6, 1, 12, 0, 0, 0));
+    img
+}
+
+fn mount_dated(
+    img: Vec<u8>,
+) -> Option<alloc::sync::Arc<crate::volume::Iso9660Volume<narf_block::ram::RamBlockDevice>>> {
+    use narf_block::ram::RamBlockDevice;
+    use narf_lib::id::DomainId;
+    let device = RamBlockDevice::from_image(SECTOR_SIZE as u32, img);
+    poll_once(crate::volume::Iso9660Volume::mount(
+        device,
+        DomainId::DRIVER_0,
+    ))?
+    .ok()
+}
+
+/// A file reports its record's recording date exactly, converted to GMT with
+/// the record's own offset (`iso_date`: `tv_sec -= tz * 15 * 60`), as atime,
+/// ctime and mtime alike (`isofs_read_inode`), and `Stat::mtime_cycles`
+/// derives from it.
+fn smoke_iso9660_file_exact_mtime() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let Some(volume) = mount_dated(build_iso9660_dated_image()) else {
+        return TestResult::Fail("dated image did not mount");
+    };
+    let file = match poll_once(volume.root().lookup_async("TEST.TXT")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup TEST.TXT failed"),
+    };
+    let want = 1_700_000_000u64 * 1_000_000_000;
+    let attrs = file.inode_attrs();
+    if attrs.mtime_ns != want {
+        return TestResult::Fail("file mtime is not the GMT-corrected recording date");
+    }
+    if attrs.atime_ns != want || attrs.ctime_ns != want {
+        return TestResult::Fail("file atime/ctime differ from the recording date");
+    }
+    if file.stat().mtime_cycles != narf_time::ns_to_cycles(want) {
+        return TestResult::Fail("Stat::mtime_cycles does not derive from the exact mtime");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/iso9660", smoke_iso9660_file_exact_mtime);
+
+/// A directory's time is its own "." record's, as Linux reads every directory
+/// inode at `(extent + ext_attr_len, 0)` — not the parent's entry for it,
+/// nor (for the root) the PVD's copy, both of which carry a different date
+/// in this image. `dir_mtime_ns` and `inode_attrs().mtime_ns` agree.
+fn smoke_iso9660_dir_exact_mtime() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let Some(volume) = mount_dated(build_iso9660_dated_image()) else {
+        return TestResult::Fail("dated image did not mount");
+    };
+    let root = volume.root();
+    let root_want = 1_650_000_123u64 * 1_000_000_000;
+    if root.dir_mtime_ns() != root_want || root.inode_attrs().mtime_ns != root_want {
+        return TestResult::Fail("root mtime is not its \".\" record's date");
+    }
+    let sub = match poll_once(root.lookup_dir_async("SUB")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("lookup_dir SUB failed"),
+    };
+    let want = 1_622_548_800u64 * 1_000_000_000;
+    if sub.dir_mtime_ns() != want || sub.inode_attrs().mtime_ns != want {
+        return TestResult::Fail("SUB mtime is not its \".\" record's date");
+    }
+    // The same directory reached through the file lookup path.
+    match poll_once(root.lookup_async("SUB")) {
+        Some(Ok(f)) if f.inode_attrs().mtime_ns == want => TestResult::Pass,
+        _ => TestResult::Fail("SUB via lookup_async did not report its \".\" date"),
+    }
+}
+
+kernel_test_in!("drivers/fs/iso9660", smoke_iso9660_dir_exact_mtime);
+
+/// `iso_date` edges, each against the value Linux computes: the GMT offset
+/// applies only within ±52 quarter-hours (13 h) and is otherwise ignored;
+/// a leap day and the last representable year (1900 + 255) decode through
+/// `mktime64`; an all-zero date goes through `mktime64`'s month wrap to
+/// 1899-11-30 (negative, so the unsigned ns form clamps to 0). Negative: a
+/// directory whose "." record is shorter than a record header fails with
+/// EIO, as `isofs_read_inode` does, instead of reporting a time.
+fn smoke_iso9660_timezone_edges() -> TestResult {
+    use crate::dir::{iso_date_seconds, recording_time_ns};
+    use narf_filesystem::{FsError, FsInstance};
+
+    let noon = |tz: i8| iso_date_seconds(&iso_date(2021, 6, 1, 12, 0, 0, tz));
+    if noon(0) != 1_622_548_800 {
+        return TestResult::Fail("GMT noon decoded wrong");
+    }
+    if noon(52) != 1_622_548_800 - 52 * 900 || noon(-52) != 1_622_548_800 + 52 * 900 {
+        return TestResult::Fail("a ±52 offset was not subtracted");
+    }
+    if noon(53) != 1_622_548_800 || noon(-53) != 1_622_548_800 || noon(-128) != 1_622_548_800 {
+        return TestResult::Fail("an offset beyond ±52 was not ignored");
+    }
+    if iso_date_seconds(&iso_date(2020, 2, 29, 23, 59, 59, 0)) != 1_583_020_799 {
+        return TestResult::Fail("leap day decoded wrong");
+    }
+    if iso_date_seconds(&iso_date(2155, 12, 31, 23, 59, 59, 0)) != 5_869_583_999 {
+        return TestResult::Fail("year 2155 decoded wrong");
+    }
+    if iso_date_seconds(&[0; 7]) != -25_599 * 86_400 || recording_time_ns(&[0; 7]) != 0 {
+        return TestResult::Fail("all-zero date did not follow mktime64's month wrap");
+    }
+
+    let mut img = build_iso9660_dated_image();
+    img[21 * SECTOR_SIZE] = 32; // SUB's "." record: one byte short of a header.
+    let Some(volume) = mount_dated(img) else {
+        return TestResult::Fail("image with a short SUB \".\" did not mount");
+    };
+    match poll_once(volume.root().lookup_dir_async("SUB")) {
+        Some(Err(FsError::Io(_))) => TestResult::Pass,
+        _ => TestResult::Fail("a short \".\" record did not fail the lookup with EIO"),
+    }
+}
+
+kernel_test_in!("drivers/fs/iso9660", smoke_iso9660_timezone_edges);
