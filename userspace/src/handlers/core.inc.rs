@@ -4216,8 +4216,11 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
             }
         },
     );
-    // `None` ⇒ unresolvable path or genuinely different mounts.
-    res.unwrap_or(EXDEV) as u64
+    // `None` ⇒ a parent stopped resolving. The only caller (`rename_impl`)
+    // has already walked both parents and proved they share a mount, so this
+    // is a component removed in between — `-ENOENT`, as Linux's lookup of a
+    // vanished dentry reports, not a cross-device move.
+    res.unwrap_or(ENOENT) as u64
 }
 
 // ── link / linkat — hard links ─────────────────────────────────────

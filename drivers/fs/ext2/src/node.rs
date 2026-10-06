@@ -952,6 +952,57 @@ impl<B: BlockDevice + 'static> DirOps for Ext2Node<B> {
         })
     }
 
+    /// `ext4_rename` across directories of this volume. The VFS has already
+    /// done `do_renameat2`'s checks (same mount, types, permissions,
+    /// ancestry); `dir_rename` moves the dirent, replaces a victim (an empty
+    /// directory only), and rebalances link counts and a moved directory's
+    /// `..`. Without this every cross-directory move on ext2/ext4 fell back to
+    /// EXDEV (directories) or a link+unlink emulation (files).
+    fn rename_to<'a>(
+        &'a self,
+        old_name: &'a str,
+        new_dir: &'a dyn DirOps,
+        new_name: &'a str,
+        flags: u32,
+    ) -> FsFuture<'a, ()> {
+        const RENAME_NOREPLACE: u32 = 1;
+        Box::pin(async move {
+            // RENAME_EXCHANGE / RENAME_WHITEOUT are not implemented here; the
+            // VFS answers EINVAL for them, as Linux does for an unsupported
+            // flag.
+            if flags & !RENAME_NOREPLACE != 0 {
+                return Err(FsError::Unsupported);
+            }
+            let (volume_id, _, new_parent) = new_dir.dcache_identity();
+            if volume_id != Arc::as_ptr(&self.volume) as *const () as usize {
+                return Err(FsError::Unsupported);
+            }
+            let new_parent = u32::try_from(new_parent).map_err(|_| FsError::InvalidData)?;
+            let _old_mutation = narf_filesystem::begin_path_mutation(self, &[old_name]);
+            let _new_mutation = narf_filesystem::begin_path_mutation(new_dir, &[new_name]);
+            let old_parent = self.state.lock().inode_no;
+            if flags & RENAME_NOREPLACE != 0 {
+                let new_parent_inode = self.volume.read_inode(new_parent).await?;
+                if self
+                    .volume
+                    .dir_lookup(&new_parent_inode, new_name.as_bytes())
+                    .await
+                    .is_ok()
+                {
+                    return Err(FsError::AlreadyExists);
+                }
+            }
+            self.volume
+                .dir_rename(
+                    old_parent,
+                    old_name.as_bytes(),
+                    new_parent,
+                    new_name.as_bytes(),
+                )
+                .await
+        })
+    }
+
     fn rmdir<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let _path_mutation = narf_filesystem::begin_path_mutation(self, &[name]);

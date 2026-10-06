@@ -725,26 +725,47 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             if victim_ino == target_ino {
                 return Ok(());
             }
+            let mut victim_inode = self.read_inode(victim_ino).await?;
+            let victim_is_dir = victim_inode.is_dir();
+            // `ext4_rename`: a directory may only be replaced when it is
+            // empty (`ext4_empty_dir` → -ENOTEMPTY, which `rename_errno`
+            // maps from `Busy`). Checked before any dirent changes so a
+            // refused rename leaves both directories untouched.
+            if victim_is_dir && !self.dir_is_empty(&victim_inode).await? {
+                return Err(FsError::Busy);
+            }
             let mut victim_parent = self.read_inode(new_parent_inode_no).await?;
             self.dir_delete(new_parent_inode_no, &mut victim_parent, new_name)
                 .await?;
+            if victim_is_dir {
+                // Released exactly as `dir_rmdir` does: the empty directory's
+                // blocks and inode are freed, and the parent loses the
+                // victim's ".." back-link.
+                self.truncate_inode(&mut victim_inode).await?;
+                victim_inode.links_count = 0;
+                victim_inode.touch_ctime(now);
+                self.write_inode(victim_ino, &victim_inode).await?;
+                self.note_dir_count_delta(victim_ino, -1).await?;
+                self.free_inode(victim_ino).await?;
+                victim_parent.links_count = victim_parent.links_count.saturating_sub(1);
+            } else {
+                // Release the replaced inode exactly as dir_unlink does: drop
+                // a link, and free the blocks + inode when the last one goes.
+                // Skipping this would leak the overwritten file's blocks on
+                // every config save.
+                victim_inode.links_count = victim_inode.links_count.saturating_sub(1);
+                victim_inode.touch_ctime(now);
+                if victim_inode.links_count == 0 {
+                    self.truncate_inode(&mut victim_inode).await?;
+                    self.write_inode(victim_ino, &victim_inode).await?;
+                    self.free_inode(victim_ino).await?;
+                } else {
+                    self.write_inode(victim_ino, &victim_inode).await?;
+                }
+            }
             victim_parent.touch_ctime_mtime(now);
             self.write_inode(new_parent_inode_no, &victim_parent)
                 .await?;
-            // Release the replaced inode exactly as dir_unlink does: drop a
-            // link, and free the blocks + inode when the last one goes.
-            // Skipping this would leak the overwritten file's blocks on
-            // every config save.
-            let mut victim_inode = self.read_inode(victim_ino).await?;
-            victim_inode.links_count = victim_inode.links_count.saturating_sub(1);
-            victim_inode.touch_ctime(now);
-            if victim_inode.links_count == 0 {
-                self.truncate_inode(&mut victim_inode).await?;
-                self.write_inode(victim_ino, &victim_inode).await?;
-                self.free_inode(victim_ino).await?;
-            } else {
-                self.write_inode(victim_ino, &victim_inode).await?;
-            }
         }
 
         // Insert into the new parent.

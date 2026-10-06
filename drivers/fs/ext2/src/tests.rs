@@ -3871,6 +3871,123 @@ fn smoke_ext2_rename_across_dirs() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_rename_across_dirs);
 
+/// `DirOps::rename_to` — the cross-directory rename the VFS calls — must move
+/// names on ext2/ext4 like `ext4_rename`. ext2 never implemented it, so every
+/// cross-directory move fell back to `-EXDEV` for a directory (and a
+/// link+unlink emulation for a file); Firefox's cache and profile writes hit
+/// that on the CachyOS root. Covers, through the trait:
+/// - a directory moved between directories: both parents' link counts and
+///   the moved directory's `..` follow it;
+/// - an existing EMPTY directory victim is replaced and released (its parent
+///   loses the ".." back-link);
+/// - a NON-EMPTY directory victim is refused with `Busy` (-ENOTEMPTY) and
+///   nothing moves.
+fn smoke_ext2_rename_to_moves_directories_across_dirs() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{DirOps, FsError, FsInstance};
+    use narf_lib::id::DomainId;
+
+    use crate::volume::Ext2Volume;
+
+    let img = build_ext2_image(b"x");
+    let device = RamBlockDevice::from_image(512, img);
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let root = volume.root();
+    let mkdir =
+        |dir: &dyn DirOps, name: &str| poll_once(dir.mkdir(name)).is_some_and(|r| r.is_ok());
+    if !mkdir(&*root, "a") || !mkdir(&*root, "b") {
+        return TestResult::Fail("mkdir a/b failed");
+    }
+    let (a, b) = match (
+        poll_once(root.lookup_dir_async("a")),
+        poll_once(root.lookup_dir_async("b")),
+    ) {
+        (Some(Ok(a)), Some(Ok(b))) => (a, b),
+        _ => return TestResult::Fail("lookup a/b failed"),
+    };
+    if !mkdir(&*a, "sub")
+        || !mkdir(&*a, "x")
+        || !mkdir(&*b, "x")
+        || !mkdir(&*a, "y")
+        || !mkdir(&*b, "z")
+    {
+        return TestResult::Fail("mkdir children failed");
+    }
+    let z = match poll_once(b.lookup_dir_async("z")) {
+        Some(Ok(z)) => z,
+        _ => return TestResult::Fail("lookup b/z failed"),
+    };
+    if !mkdir(&*z, "keep") {
+        return TestResult::Fail("mkdir b/z/keep failed");
+    }
+    let ino = |parent: u32, name: &[u8]| -> Option<u32> {
+        let dir = poll_once(volume.read_inode(parent))?.ok()?;
+        poll_once(volume.dir_lookup(&dir, name))?
+            .ok()
+            .map(|(i, _)| i)
+    };
+    let links = |i: u32| {
+        poll_once(volume.read_inode(i))
+            .and_then(|r| r.ok())
+            .map(|n| n.links_count)
+    };
+    let root_ino = crate::EXT2_ROOT_INO;
+    let (Some(a_ino), Some(b_ino)) = (ino(root_ino, b"a"), ino(root_ino, b"b")) else {
+        return TestResult::Fail("inode lookup of a/b failed");
+    };
+
+    // 1. Move directory a/sub → b/sub.
+    match poll_once(a.rename_to("sub", &*b, "sub", 0)) {
+        Some(Ok(())) => {}
+        Some(Err(FsError::Unsupported)) => {
+            return TestResult::Fail("ext2 rename_to is Unsupported (the VFS reports -EXDEV)")
+        }
+        _ => return TestResult::Fail("rename_to of a directory across dirs failed"),
+    }
+    let Some(sub_ino) = ino(b_ino, b"sub") else {
+        return TestResult::Fail("b/sub missing after the move");
+    };
+    if ino(a_ino, b"sub").is_some() {
+        return TestResult::Fail("a/sub still present after the move");
+    }
+    if ino(sub_ino, b"..") != Some(b_ino) {
+        return TestResult::Fail("moved directory's .. does not name its new parent");
+    }
+
+    // 2. Replace the EMPTY directory b/x with a/x.
+    let Some(old_bx) = ino(b_ino, b"x") else {
+        return TestResult::Fail("b/x missing");
+    };
+    match poll_once(a.rename_to("x", &*b, "x", 0)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("replacing an empty directory failed"),
+    }
+    if ino(b_ino, b"x") == Some(old_bx) || ino(a_ino, b"x").is_some() {
+        return TestResult::Fail("empty-directory replacement did not move the name");
+    }
+    // a keeps only y (2 + 1); b holds sub, x, z (2 + 3).
+    if links(a_ino) != Some(3) || links(b_ino) != Some(5) {
+        return TestResult::Fail("parent link counts are wrong after the directory moves");
+    }
+
+    // 3. A NON-EMPTY victim (b/z holds keep) is refused, nothing changes.
+    match poll_once(a.rename_to("y", &*b, "z", 0)) {
+        Some(Err(FsError::Busy)) => {}
+        _ => return TestResult::Fail("replacing a non-empty directory was not Busy (-ENOTEMPTY)"),
+    }
+    if ino(a_ino, b"y").is_none() || ino(b_ino, b"z").is_none() {
+        return TestResult::Fail("a refused rename changed a directory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext2_rename_to_moves_directories_across_dirs
+);
+
 fn smoke_ext2_hardlink_bumps_link_count() -> TestResult {
     use narf_block::ram::RamBlockDevice;
     use narf_filesystem::FsInstance;
