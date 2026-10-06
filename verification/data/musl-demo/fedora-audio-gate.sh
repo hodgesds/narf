@@ -742,6 +742,21 @@ done
 # every run — including in the verdict line — and tracked as an open defect.
 if [ "$wp_pct" -ge 50 ] || [ "$pw_pct" -ge 50 ]; then
     note "steady: WARNING known open defect — an idle session should be near 0%"
+    # Diagnostic, not an assertion. `-k` matters: a plain `timeout` sends
+    # SIGTERM, and an strace parked in `wait4` on its tracee does not die on
+    # that, so the timeout itself never returns and the gate hangs instead of
+    # failing. Escalating to SIGKILL bounds it either way.
+    #
+    # Two victims on purpose. The SPINNING thread is actively running, so its
+    # pending SIGSTOP is seen at the next signal check; the IDLE daemon is
+    # parked in epoll_wait, which is the case that has to interrupt a blocked
+    # syscall. If one works and the other does not, that is the answer.
+    for victim in "wp:$WP_PID" "pw:$PW_PID"; do
+        timeout -k 5 35 strace -f -c -p "${victim#*:}" \
+            >"$LOG/strace-${victim%%:*}" 2>&1
+        note "steady: strace ${victim%%:*} rc=$?: \
+$(tr -s ' \n' ' ' <"$LOG/strace-${victim%%:*}" | head -c 320)"
+    done
 fi
 
 # `ps -L` reads /proc/<pid>/task/<tid>/stat for every thread. It aborted with

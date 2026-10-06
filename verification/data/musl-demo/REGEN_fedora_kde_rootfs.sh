@@ -394,6 +394,7 @@ printf '%s\n' \
   '[Unit]' \
   'Description=NARF Plasma Wayland Session' \
   'ConditionKernelCommandLine=!narf_audio_check' \
+  'ConditionKernelCommandLine=!narf_ptrace_check' \
   'Wants=dbus-broker.service' \
   'Wants=user@1000.service' \
   'After=user@1000.service' \
@@ -445,6 +446,9 @@ install -m 0755 \
 install -m 0755 \
   "$ROOT/verification/data/musl-demo/fedora-poll-probe.py" \
   "$WORK/root/usr/local/libexec/narf-poll-probe"
+install -m 0755 \
+  "$ROOT/verification/data/musl-demo/fedora-ptrace-probe.py" \
+  "$WORK/root/usr/local/libexec/narf-ptrace-probe"
 
 # Desktop audio acceptance gate: prove stock PipeWire + WirePlumber discover
 # the cards through udev, build ACP card profiles, route a sink and a source,
@@ -478,6 +482,30 @@ printf '%s\n' \
 install -d -m 0755 "$WORK/root/etc/systemd/system/multi-user.target.wants"
 ln -sfn ../narf-audio-gate.service \
   "$WORK/root/etc/systemd/system/multi-user.target.wants/narf-audio-gate.service"
+
+# ptrace attach acceptance gate: prove PTRACE_ATTACH reports its stop to a
+# tracer that did not fork the tracee. That is the door `strace -p` uses, and
+# it is distinct from the TRACEME+exec path the musl strace smoke covers — a
+# tracer whose attach-stop is never reported blocks forever in wait4, which is
+# exactly how it presents. Opt-in via narf_ptrace_check so the probe costs a
+# bare multi-user boot rather than a run of the audio gate.
+printf '%s\n' \
+  '[Unit]' \
+  'Description=Verify PTRACE_ATTACH stop reporting on NARF' \
+  'ConditionKernelCommandLine=narf_ptrace_check' \
+  '' \
+  '[Service]' \
+  'Type=oneshot' \
+  'ExecStart=/usr/local/libexec/narf-ptrace-probe' \
+  'TimeoutStartSec=300' \
+  'StandardOutput=journal+console' \
+  'StandardError=journal+console' \
+  '' \
+  '[Install]' \
+  'WantedBy=multi-user.target' \
+  > "$WORK/root/etc/systemd/system/narf-ptrace-check.service"
+ln -sfn ../narf-ptrace-check.service \
+  "$WORK/root/etc/systemd/system/multi-user.target.wants/narf-ptrace-check.service"
 
 # Network acceptance gate: prove the distro has a WORKING off-box path
 # (the virtio NIC visible, TCP round-trip to the host across SLIRP, DNS through

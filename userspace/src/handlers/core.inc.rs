@@ -12415,7 +12415,33 @@ fn get_wait_recipient(child_pid: u64) -> Option<(u64, bool, u8)> {
 /// nudge it: stage SIGCHLD and wake any blocking wait4. Does NOT
 /// release the child PID — the child is still alive.
 pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: bool) {
-    let child_pid = task_to_pid_raw(child_task).unwrap_or(child_task);
+    // WHICH pid the report names depends on who receives it —
+    // `do_notify_parent_cldstop` (kernel/signal.c):
+    //
+    //     if (for_ptracer) {
+    //             parent = tsk->parent;
+    //     } else {
+    //             tsk = tsk->group_leader;
+    //             parent = tsk->real_parent;
+    //     }
+    //     ...
+    //     info.si_pid = task_pid_nr_ns(tsk, task_active_pid_ns(parent));
+    //
+    // A report to the TRACER names the stopping THREAD; only a report to the
+    // real parent is rewritten to the group leader. Naming the leader
+    // unconditionally collapsed every thread of a group into one slot (the
+    // pending map is keyed parent -> child_pid), so attaching to an N-thread
+    // process produced exactly ONE stop report, filed under the leader's pid:
+    // the tracer's `waitpid(<worker tid>)` matched nothing and a
+    // `waitpid(-1)` loop got one report instead of N. `strace -p` attaches to
+    // every tid under /proc/<pid>/task and then waits for one stop each, so
+    // it hung in wait4 against any multithreaded process.
+    let tid = task_to_linux_tid_raw(child_task).unwrap_or(child_task);
+    let child_pid = if crate::ptrace::is_task_traced(tid) {
+        tid
+    } else {
+        task_to_pid_raw(child_task).unwrap_or(child_task)
+    };
     push_stopcont_report_as(child_pid, wstatus, is_continued);
 }
 

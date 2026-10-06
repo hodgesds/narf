@@ -85,9 +85,11 @@ harness silently measured the wrong thing, each of which cost a boot:
 - **Assert per DEVICE, not globally.** With two cards present, switching one
   card's profile to `off` cannot make "no sink anywhere" true, so that
   condition can never be satisfied by a correct profile switch.
-- **`strace -p` is not usable yet** — it blocks in `wait4` and cannot be killed
-  by a timeout (see the open-defect section). Thread state is sampled from
-  `/proc/<pid>/task/<tid>/stat` instead, which is what `ps -L` reads too.
+- **A `timeout` around `strace -p` needs `-k`.** A plain `timeout` sends
+  SIGTERM, and an strace parked in `wait4` on its tracee does not die on that,
+  so the timeout itself never returns and the run hangs instead of failing.
+  `timeout -k 5 35` escalates to SIGKILL and bounds it either way. (`strace -p`
+  itself works now — see the ptrace section below.)
 - **Plasma does not run on an audio-check boot.** The gate does not want a
   compositor, and leaving the session to start anyway is not merely noisy: a
   Plasma process taking a fatal fault twice left the guest spinning on a dozen
@@ -117,11 +119,32 @@ Contracts are checked against the local Linux 7.3-rc4 sources under
 | Magic-link target rendered in the reader's root | `fs/proc/base.c` (`proc_pid_readlink`), `fs/d_path.c` |
 | `/proc/<pid>/task/` named by thread id | `fs/proc/base.c` (`proc_task_readdir`) |
 | `/proc/<pid>/task/<tid>/comm` mode | `fs/proc/base.c` (`tid_base_stuff`) |
+| A ptrace-stop report names the THREAD, not the group leader | `kernel/signal.c` (`do_notify_parent_cldstop`) |
 
 PipeWire's own requirements are read from its sources: `spa/plugins/alsa/
 alsa-udev.c` (which card properties are mandatory), `src/modules/
 flatpak-utils.h` and `src/modules/module-access.c` (the `/proc/<pid>/root`
 check), and `src/modules/module-rt.c` (the realtime policy path).
+
+`fedora-ptrace-probe.py` has its own gate, opt-in via the `narf_ptrace_check`
+kernel cmdline flag so an iteration costs a bare multi-user boot rather than a
+run of this one:
+
+```sh
+NARF_VBLK_IMG=target/narf-fedora-vblk.img \
+  XTASK_QEMU_APPEND=narf_ptrace_check \
+  XTASK_SYSTEMD_PID1_SUCCESS_MARKER="PTRACE-PROBE: OK" \
+  XTASK_SYSTEMD_PID1_FAILURE_MARKER="PTRACE-PROBE: FAIL" \
+  cargo xtask systemd-pid1 --arch=x86_64
+```
+
+It covers the door `strace -p` uses, which is not the one the musl strace
+smoke covers (that one is TRACEME + exec on the tracer's own child):
+PTRACE_ATTACH to a running task — spinning and parked in a blocking syscall,
+as the tracer's own child and as a non-child sibling, waited for by tid and by
+`waitpid(-1, __WALL)` — and finally to every thread of a non-child THREAD
+GROUP, which is what `strace -p` really does. Every case runs on the build
+host first, so the expected answer is Linux's own.
 
 `fedora-poll-probe.py` runs alongside the gate. It asserts that a blocking
 wait actually blocks — `poll` with no fds, on an eventfd, on an epoll fd, with
@@ -154,14 +177,34 @@ Ruled out so far, all measured in-guest:
 It emits no log output at `WIREPLUMBER_DEBUG=4`, so it is a silent dispatch
 loop rather than repeated work.
 
-Narrowing it further wants a tracer, and `strace -p` is still unusable — but
-for a different reason than it was. A tracer is now eligible to wait for a
-tracee it did not fork (`wait4(__WALL)` no longer answers `No child
-processes`), yet the tracee's attach-stop is never reported to it, so the
-tracer blocks in `wait4` indefinitely instead of being told its tracee
-stopped. It does not die on `SIGTERM` in that state either, so a `timeout`
-around it never returns. Reporting the ptrace-stop to the tracer is the next
-step; until then do not put `strace -p` in the gate, because it hangs the run
-rather than failing it.
+Narrowing it further wants a tracer, and `strace -p` now works: it attaches to
+all seven WirePlumber threads and prints a syscall summary. Getting there took
+two fixes, each found by the shape of what failed rather than by reading the
+code:
+
+1. A tracer was not eligible to wait for a tracee it had not forked, so
+   `wait4(-1, …, __WALL)` answered `No child processes` — the first thing
+   `strace -p` does after attaching. `is_tracer_of_any` compared a scheduler
+   TaskId against a map keyed in the ptrace ABI's pid space, which diverge the
+   moment a task forks, so the check silently never matched.
+2. Attaching then succeeded and `strace` hung in `wait4` anyway, because a
+   stop report named the thread GROUP rather than the stopping thread. The
+   pending map is keyed parent → child_pid, so all seven threads' attach-stops
+   collapsed into one slot filed under the leader's pid: a `waitpid(<worker
+   tid>)` matched nothing, and strace waits for one stop per attached thread.
+   `do_notify_parent_cldstop` is explicit that only a report to the real
+   parent is rewritten to the group leader, while a report to the tracer names
+   the thread.
+
+Defect 2 is invisible to a single-threaded tracee, which is why the four
+simpler probe cases passed throughout and only `sibling-threadgroup` caught
+it. Its per-tid output is the diagnosis: `tids=3 stops=1 [121:stopped sig=19
+123:NO REPORT 124:NO REPORT]`.
+
+One caveat on the probe's own output: the `state=` it prints comes from
+`/proc/<pid>/task/<tid>/stat`, which still renders the PROCESS state, so a
+thread in a ptrace-stop reads `R` there where Linux shows `t`. The stop itself
+is real — the wait reports it — so this is a separate `stat` rendering gap,
+not a ptrace one.
 
 Audible quality and physical power transitions still require hardware tests.
