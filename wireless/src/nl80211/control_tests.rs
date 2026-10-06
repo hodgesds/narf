@@ -888,6 +888,394 @@ impl crate::WirelessNetIface for RoamStub {
     }
 }
 
+// ── Userspace-SME management path ─────────────────────────────────
+//
+// A wpa_supplicant driving its own SME (no CONNECT/SAE offload) uses the
+// low-level MLME: REGISTER_FRAME to receive management frames, AUTHENTICATE
+// and ASSOCIATE to perform the exchange, FRAME to transmit action frames
+// (answered with a cookie + an NL80211_CMD_FRAME_TX_STATUS), and
+// DEAUTHENTICATE/DISASSOCIATE/EXTERNAL_AUTH. Command/attribute ids and errnos
+// are validated against /usr/src/linux include/uapi/linux/nl80211.h.
+
+const SME_NAME: &str = "wlan-sme";
+const SME_MAC: [u8; 6] = [2, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+const SME_PEER: [u8; 6] = [2, 0x01, 0x02, 0x03, 0x04, 0x05];
+// Distinguishable management frames the stub "exchanges", so each event can be
+// matched to its operation. First octet is the 802.11 frame-control type/subtype.
+const SME_AUTH_RESP: &[u8] = &[0xb0, 0x00, 0xa0, 0x01];
+const SME_ASSOC_RESP: &[u8] = &[0x10, 0x00, 0xa0, 0x02];
+const SME_DEAUTH: &[u8] = &[0xc0, 0x00, 0xa0, 0x03];
+const SME_DISASSOC: &[u8] = &[0xa0, 0x00, 0xa0, 0x04];
+
+struct SmeStub {
+    rx: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    tx: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
+    registered: core::sync::atomic::AtomicU32,
+    external_status: core::sync::atomic::AtomicU32,
+}
+impl Interface for SmeStub {
+    fn name(&self) -> &str {
+        SME_NAME
+    }
+    fn mac(&self) -> [u8; 6] {
+        SME_MAC
+    }
+    fn mtu(&self) -> u32 {
+        1500
+    }
+    fn link_up(&self) -> bool {
+        false
+    }
+    fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>> {
+        &self.rx
+    }
+    fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>> {
+        &self.tx
+    }
+}
+#[async_trait::async_trait]
+impl crate::WirelessNetIface for SmeStub {
+    fn supports_userspace_mlme(&self) -> bool {
+        true
+    }
+    fn get_wireless_info(&self) -> crate::WirelessIfaceInfo {
+        crate::WirelessIfaceInfo {
+            base_name: SME_NAME.into(),
+            base_mac: SME_MAC,
+            bands: Vec::new(),
+            modes: crate::iface::WirelessModes::STATION,
+            hw_caps: crate::iface::HwCaps {
+                ht_supported: false,
+                vht_supported: false,
+                he_supported: false,
+                eht_supported: false,
+            },
+        }
+    }
+    async fn scan(
+        &self,
+        _: crate::ScanRequest,
+    ) -> Result<Vec<crate::BssInfo>, crate::WirelessError> {
+        Ok(Vec::new())
+    }
+    async fn associate(&self, _: crate::AssociateRequest) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    async fn disassociate(&self) -> Result<(), crate::WirelessError> {
+        Ok(())
+    }
+    async fn set_config(&self, _: crate::WirelessConfig) -> Result<(), crate::WirelessError> {
+        Err(crate::WirelessError::NotSupported)
+    }
+    async fn mlme_authenticate(
+        &self,
+        req: crate::MlmeAuthRequest,
+    ) -> Result<Vec<u8>, crate::WirelessError> {
+        if req.peer != SME_PEER {
+            return Err(crate::WirelessError::InvalidArgs);
+        }
+        Ok(SME_AUTH_RESP.to_vec())
+    }
+    async fn mlme_associate(
+        &self,
+        _: crate::MlmeAssocRequest,
+    ) -> Result<Vec<u8>, crate::WirelessError> {
+        Ok(SME_ASSOC_RESP.to_vec())
+    }
+    async fn mlme_deauthenticate(
+        &self,
+        _: [u8; 6],
+        _: u16,
+    ) -> Result<Vec<u8>, crate::WirelessError> {
+        Ok(SME_DEAUTH.to_vec())
+    }
+    async fn mlme_disassociate(&self, _: [u8; 6], _: u16) -> Result<Vec<u8>, crate::WirelessError> {
+        Ok(SME_DISASSOC.to_vec())
+    }
+    fn register_mgmt_frame(
+        &self,
+        frame_type: u16,
+        _match_prefix: &[u8],
+    ) -> Result<(), crate::WirelessError> {
+        self.registered
+            .store(frame_type as u32, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+    async fn mgmt_tx(
+        &self,
+        _cookie: u64,
+        _req: crate::MgmtTxRequest,
+    ) -> Result<bool, crate::WirelessError> {
+        Ok(true)
+    }
+    async fn external_auth_status(
+        &self,
+        _bssid: [u8; 6],
+        status: u16,
+    ) -> Result<(), crate::WirelessError> {
+        self.external_status
+            .store(status as u32, core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use narf_net::netlink_generic::install_event_sink;
+    super::register();
+    let _restore = SinkRestore(install_event_sink(interop_sink));
+    let stub = Arc::new(SmeStub {
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+        registered: core::sync::atomic::AtomicU32::new(0),
+        external_status: core::sync::atomic::AtomicU32::new(0xffff),
+    });
+    let iface: Arc<dyn crate::WirelessNetIface> = stub.clone();
+    narf_net::iface::register(SME_NAME, SME_MAC, |_| Ok(()));
+    crate::registry::register(iface.clone());
+    let ifindex = match narf_net::netlink_route::ifindex_for_name(SME_NAME) {
+        Some(index) => index,
+        None => return TestResult::Fail("sme iface has no ifindex"),
+    };
+    let admin = match narf_net::kernel_admin(SME_NAME) {
+        Some(admin) => admin,
+        None => return TestResult::Fail("no kernel admin for sme iface"),
+    };
+    let ctx = RequestContext {
+        net_ns_id: 0,
+        admin: Some(&admin),
+    };
+
+    // GET_WIPHY advertises the userspace-SME commands wpa_supplicant keys off.
+    let wiphy = crate::registry::list()
+        .iter()
+        .position(|i| i.name() == SME_NAME)
+        .unwrap_or(0) as u32;
+    let attrs = wiphy_attrs(wiphy, &iface.get_wireless_info(), Some(iface.as_ref()));
+    let commands = match find_attr(&attrs, NL80211_ATTR_SUPPORTED_COMMANDS | NLA_F_NESTED) {
+        Some(commands) => nested_u32s(commands),
+        None => return TestResult::Fail("GET_WIPHY lacks SUPPORTED_COMMANDS"),
+    };
+    for needed in [37u32, 38, 39, 40, 58, 59, 127] {
+        if !commands.contains(&needed) {
+            return TestResult::Fail("SME iface did not advertise an MLME command");
+        }
+    }
+
+    // AUTHENTICATE: a valid request dispatches; a multicast peer is EINVAL.
+    let mut good = Vec::new();
+    push_attr(&mut good, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut good, 6, &SME_PEER);
+    push_attr(&mut good, 53, &0u32.to_ne_bytes()); // AUTH_TYPE = OPEN
+    if handle(AUTHENTICATE, &good, false, ctx).is_err() {
+        return TestResult::Fail("valid AUTHENTICATE rejected");
+    }
+    let mut mcast = Vec::new();
+    push_attr(&mut mcast, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut mcast, 6, &[1, 0, 0, 0, 0, 0]);
+    if !matches!(handle(AUTHENTICATE, &mcast, false, ctx), Err(EINVAL)) {
+        return TestResult::Fail("multicast AUTHENTICATE peer not EINVAL");
+    }
+    // Bad auth type (> SAE) is EINVAL; an unknown attribute is EOPNOTSUPP.
+    let mut bad_auth = Vec::new();
+    push_attr(&mut bad_auth, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut bad_auth, 6, &SME_PEER);
+    push_attr(&mut bad_auth, 53, &9u32.to_ne_bytes());
+    if !matches!(handle(AUTHENTICATE, &bad_auth, false, ctx), Err(EINVAL)) {
+        return TestResult::Fail("out-of-range AUTH_TYPE not EINVAL");
+    }
+    let mut unknown = good.clone();
+    push_attr(&mut unknown, 200, &[]);
+    if !matches!(handle(AUTHENTICATE, &unknown, false, ctx), Err(EOPNOTSUPP)) {
+        return TestResult::Fail("unknown AUTHENTICATE attribute not EOPNOTSUPP");
+    }
+
+    // A driver that does not run its SME in userspace rejects the MLME path.
+    let plain: Arc<dyn crate::WirelessNetIface> = Arc::new(InterfaceStub {
+        name: "wlan-nosme",
+        rx: IrqSafeSpinLock::new(None),
+        tx: IrqSafeSpinLock::new(None),
+    });
+    narf_net::iface::register("wlan-nosme", plain.mac(), |_| Ok(()));
+    crate::registry::register(plain.clone());
+    if let (Some(plain_index), Some(plain_admin)) = (
+        narf_net::netlink_route::ifindex_for_name("wlan-nosme"),
+        narf_net::kernel_admin("wlan-nosme"),
+    ) {
+        let pctx = RequestContext {
+            net_ns_id: 0,
+            admin: Some(&plain_admin),
+        };
+        let mut a = Vec::new();
+        push_attr(&mut a, 3, &plain_index.to_ne_bytes());
+        push_attr(&mut a, 6, &SME_PEER);
+        push_attr(&mut a, 53, &0u32.to_ne_bytes());
+        if !matches!(handle(AUTHENTICATE, &a, false, pctx), Err(EOPNOTSUPP)) {
+            return TestResult::Fail("non-SME driver AUTHENTICATE not EOPNOTSUPP");
+        }
+    }
+
+    // REGISTER_FRAME records a management subtype; a non-mgmt type is EINVAL.
+    let mut reg = Vec::new();
+    push_attr(&mut reg, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut reg, 101, &0x00b0u16.to_ne_bytes()); // mgmt/auth frame type
+    if handle(REGISTER_FRAME, &reg, false, ctx).is_err()
+        || stub.registered.load(Ordering::SeqCst) != 0xb0
+    {
+        return TestResult::Fail("REGISTER_FRAME did not record the mgmt subtype");
+    }
+    let mut reg_data = Vec::new();
+    push_attr(&mut reg_data, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut reg_data, 101, &0x0008u16.to_ne_bytes()); // data frame type
+    if !matches!(handle(REGISTER_FRAME, &reg_data, false, ctx), Err(EINVAL)) {
+        return TestResult::Fail("REGISTER_FRAME of a non-mgmt type not EINVAL");
+    }
+
+    // FRAME returns a cookie synchronously; a sub-header frame is EINVAL.
+    let mgmt = alloc::vec![0xd0u8; 28]; // action frame, full MAC header
+    let mut frame = Vec::new();
+    push_attr(&mut frame, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut frame, 51, &mgmt);
+    match handle(FRAME, &frame, false, ctx) {
+        Ok(replies)
+            if replies.len() == 1
+                && replies[0].command == FRAME
+                && find_attr(&replies[0].attrs, 88).is_some_and(|c| c.len() == 8) => {}
+        _ => return TestResult::Fail("FRAME did not return a cookie reply"),
+    }
+    let mut short = Vec::new();
+    push_attr(&mut short, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut short, 51, &[0xd0u8; 10]);
+    if !matches!(handle(FRAME, &short, false, ctx), Err(EINVAL)) {
+        return TestResult::Fail("sub-header FRAME not EINVAL");
+    }
+
+    // EXTERNAL_AUTH forwards the status code to the driver.
+    let mut ext = Vec::new();
+    push_attr(&mut ext, 3, &ifindex.to_ne_bytes());
+    push_attr(&mut ext, 6, &SME_PEER);
+    push_attr(&mut ext, 72, &0u16.to_ne_bytes()); // STATUS_CODE = success
+    if handle(EXTERNAL_AUTH, &ext, false, ctx).is_err() {
+        return TestResult::Fail("valid EXTERNAL_AUTH rejected");
+    }
+
+    // The async frame exchanges surface as `mlme`-group (19) events carrying
+    // NL80211_ATTR_FRAME (51); FRAME_TX_STATUS carries the cookie + ACK flag.
+    let event_has = |cmd: u8, frame: &[u8]| {
+        INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {
+            *ns == 0
+                && *group == 19
+                && msg.get(16) == Some(&cmd)
+                && find_attr(&msg[20..], 51) == Some(frame)
+        })
+    };
+
+    INTEROP_EVENTS.lock().clear();
+    narf_scheduler::block_on_spin(run_mlme(
+        iface.clone(),
+        0,
+        ifindex,
+        MlmeExec::Authenticate(crate::MlmeAuthRequest {
+            peer: SME_PEER,
+            ssid: b"sme-net".to_vec(),
+            channel: 0,
+            auth_type: 0,
+            auth_data: Vec::new(),
+        }),
+    ));
+    if !event_has(AUTHENTICATE, SME_AUTH_RESP) {
+        return TestResult::Fail("AUTHENTICATE event missing the response frame");
+    }
+
+    INTEROP_EVENTS.lock().clear();
+    narf_scheduler::block_on_spin(run_mlme(
+        iface.clone(),
+        0,
+        ifindex,
+        MlmeExec::Associate(crate::MlmeAssocRequest {
+            peer: SME_PEER,
+            ssid: b"sme-net".to_vec(),
+            channel: 0,
+            ie: Vec::new(),
+            prev_bssid: None,
+            use_mfp: true,
+        }),
+    ));
+    if !event_has(ASSOCIATE, SME_ASSOC_RESP) {
+        return TestResult::Fail("ASSOCIATE event missing the response frame");
+    }
+
+    INTEROP_EVENTS.lock().clear();
+    narf_scheduler::block_on_spin(run_mlme(
+        iface.clone(),
+        0,
+        ifindex,
+        MlmeExec::Deauthenticate {
+            peer: SME_PEER,
+            reason: 3,
+        },
+    ));
+    if !event_has(DEAUTHENTICATE, SME_DEAUTH) {
+        return TestResult::Fail("DEAUTHENTICATE event missing the frame");
+    }
+
+    INTEROP_EVENTS.lock().clear();
+    narf_scheduler::block_on_spin(run_mlme(
+        iface.clone(),
+        0,
+        ifindex,
+        MlmeExec::Disassociate {
+            peer: SME_PEER,
+            reason: 8,
+        },
+    ));
+    if !event_has(DISASSOCIATE, SME_DISASSOC) {
+        return TestResult::Fail("DISASSOCIATE event missing the frame");
+    }
+
+    INTEROP_EVENTS.lock().clear();
+    narf_scheduler::block_on_spin(run_mlme(
+        iface.clone(),
+        0,
+        ifindex,
+        MlmeExec::MgmtTx {
+            cookie: 0x1234,
+            request: crate::MgmtTxRequest {
+                channel: 0,
+                frame: mgmt.clone(),
+                offchannel_ok: false,
+                duration: 0,
+            },
+        },
+    ));
+    let tx_status_ok = INTEROP_EVENTS.lock().iter().any(|(ns, group, msg)| {
+        *ns == 0
+            && *group == 19
+            && msg.get(16) == Some(&FRAME_TX_STATUS)
+            && find_attr(&msg[20..], 88) == Some(&0x1234u64.to_ne_bytes()[..]) // COOKIE
+            && find_attr(&msg[20..], 92) == Some(&[][..]) // ACK flag
+            && find_attr(&msg[20..], 51) == Some(&mgmt[..]) // the TX'd frame
+    });
+    if !tx_status_ok {
+        return TestResult::Fail("FRAME_TX_STATUS missing cookie/ACK/frame");
+    }
+
+    narf_scheduler::block_on_spin(run_mlme(
+        iface.clone(),
+        0,
+        ifindex,
+        MlmeExec::ExternalAuth {
+            bssid: SME_PEER,
+            status: 0,
+        },
+    ));
+    if stub.external_status.load(Ordering::SeqCst) != 0 {
+        return TestResult::Fail("EXTERNAL_AUTH status not forwarded to the driver");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("wireless/nl80211", smoke_nl80211_userspace_sme_mlme);
+
 fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
     use narf_net::netlink_generic::install_event_sink;
     super::register();

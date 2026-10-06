@@ -105,6 +105,82 @@ pub trait WirelessNetIface: Interface {
 
     /// Configures PHY-level parameters.
     async fn set_config(&self, cfg: WirelessConfig) -> Result<(), WirelessError>;
+
+    // ── Userspace-SME MLME path (NL80211_CMD_AUTHENTICATE etc.) ───────
+    //
+    // When the SME runs in userspace (wpa_supplicant's own SME), the driver
+    // exposes the low-level MLME: it sends individual Authentication and
+    // (Re)Association frames on request and surfaces the peer's response, and
+    // it registers for / transmits arbitrary management frames. All default
+    // to unsupported; a driver that offloads the SME (the CONNECT path) leaves
+    // them untouched and [`supports_userspace_mlme`](Self::supports_userspace_mlme)
+    // returns false.
+
+    /// The driver drives its MLME from userspace: it implements the
+    /// authenticate/associate/deauthenticate/disassociate, management-frame
+    /// registration/TX and external-auth operations below.
+    fn supports_userspace_mlme(&self) -> bool {
+        false
+    }
+
+    /// Send an Authentication frame and return the peer's response frame,
+    /// delivered to userspace as NL80211_CMD_AUTHENTICATE.
+    async fn mlme_authenticate(&self, _req: MlmeAuthRequest) -> Result<Vec<u8>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Send an (Re)Association Request and return the (Re)Association Response
+    /// frame, delivered to userspace as NL80211_CMD_ASSOCIATE.
+    async fn mlme_associate(&self, _req: MlmeAssocRequest) -> Result<Vec<u8>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Send a Deauthentication frame to `peer`; returns the transmitted frame
+    /// for the NL80211_CMD_DEAUTHENTICATE notification.
+    async fn mlme_deauthenticate(
+        &self,
+        _peer: [u8; 6],
+        _reason: u16,
+    ) -> Result<Vec<u8>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Send a Disassociation frame to `peer`; returns the transmitted frame
+    /// for the NL80211_CMD_DISASSOCIATE notification.
+    async fn mlme_disassociate(
+        &self,
+        _peer: [u8; 6],
+        _reason: u16,
+    ) -> Result<Vec<u8>, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Register to receive management frames of the given 802.11 frame-control
+    /// type/subtype whose body starts with `match_prefix` (empty = all), for
+    /// NL80211_CMD_REGISTER_FRAME.
+    fn register_mgmt_frame(
+        &self,
+        _frame_type: u16,
+        _match_prefix: &[u8],
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Transmit a management frame under `cookie`; the returned bool reports
+    /// whether it was acknowledged, for NL80211_CMD_FRAME_TX_STATUS.
+    async fn mgmt_tx(&self, _cookie: u64, _req: MgmtTxRequest) -> Result<bool, WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
+
+    /// Report a userspace SAE (external-auth) result to the driver, for
+    /// NL80211_CMD_EXTERNAL_AUTH.
+    async fn external_auth_status(
+        &self,
+        _bssid: [u8; 6],
+        _status: u16,
+    ) -> Result<(), WirelessError> {
+        Err(WirelessError::NotSupported)
+    }
 }
 
 pub struct AssociateRequest {
@@ -123,6 +199,37 @@ pub enum SecurityConfig {
 pub struct WirelessConfig {
     pub channel: u32,
     pub tx_power_dbm: Option<i8>,
+}
+
+/// A userspace-SME Authentication request (NL80211_CMD_AUTHENTICATE).
+/// `auth_data` carries the SAE/FT authentication payload (empty for Open).
+pub struct MlmeAuthRequest {
+    pub peer: [u8; 6],
+    pub ssid: Vec<u8>,
+    pub channel: u32,
+    pub auth_type: u32,
+    pub auth_data: Vec<u8>,
+}
+
+/// A userspace-SME (Re)Association request (NL80211_CMD_ASSOCIATE). A set
+/// `prev_bssid` requests a Reassociation rather than an Association.
+pub struct MlmeAssocRequest {
+    pub peer: [u8; 6],
+    pub ssid: Vec<u8>,
+    pub channel: u32,
+    pub ie: Vec<u8>,
+    pub prev_bssid: Option<[u8; 6]>,
+    pub use_mfp: bool,
+}
+
+/// A management frame to transmit (NL80211_CMD_FRAME). `channel` 0 means the
+/// current operating channel; `offchannel_ok` permits off-channel transmission
+/// for the given `duration` (milliseconds).
+pub struct MgmtTxRequest {
+    pub channel: u32,
+    pub frame: Vec<u8>,
+    pub offchannel_ok: bool,
+    pub duration: u32,
 }
 
 pub mod registry {
