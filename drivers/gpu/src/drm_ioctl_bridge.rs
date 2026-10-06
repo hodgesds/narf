@@ -266,18 +266,102 @@ impl Drop for VirtGpuResource {
             drop(backing);
             return;
         }
-        let released = narf_drivers_virtio::gpu_pci::probed_device()
-            .map(|dev| dev.unref_virgl_resource(self.resource_id).is_ok())
-            .unwrap_or(false);
-        if released {
-            drop(backing);
-        } else {
-            // The host may still DMA through its resource backing. Leaking is
-            // bounded to the failed object and is safer than recycling pages.
-            core::mem::forget(backing);
-        }
+        // Linux `virtio_gpu_cmd_unref_resource` only queues UNREF; the backing
+        // is freed from the response callback (`virtio_gpu_cmd_unref_cb` →
+        // `virtio_gpu_cleanup_object`), so the final drop never waits for the
+        // device. Waiting here took the GPU request gate from whatever context
+        // dropped the last reference — an RCU reclaim, a file close, a cursor
+        // flush that already held that gate. The round-trip runs in its own
+        // stackful task instead, which can yield while the gate is busy; the
+        // backing travels with it and is released only on the host's ack.
+        let resource_id = self.resource_id;
+        let _ = narf_scheduler::spawn_stackful(async move {
+            if host_unref(resource_id) {
+                drop(backing);
+            } else {
+                // The host may still DMA through its resource backing. Leaking
+                // is bounded to the failed object and is safer than recycling
+                // pages.
+                core::mem::forget(backing);
+            }
+        });
     }
 }
+
+/// Send `RESOURCE_UNREF` for the host's final reference; `true` when the
+/// device acknowledged it (only then may the guest backing be recycled).
+/// Indirected so a kernel test can observe *when* it runs.
+fn host_unref(resource_id: u32) -> bool {
+    #[cfg(feature = "kernel-test")]
+    if let Some(hook) = *TEST_HOST_UNREF.lock() {
+        return hook(resource_id);
+    }
+    narf_drivers_virtio::gpu_pci::probed_device()
+        .map(|dev| dev.unref_virgl_resource(resource_id).is_ok())
+        .unwrap_or(false)
+}
+
+/// Test stand-in for the device's RESOURCE_UNREF.
+#[cfg(feature = "kernel-test")]
+type HostUnrefHook = fn(u32) -> bool;
+
+#[cfg(feature = "kernel-test")]
+static TEST_HOST_UNREF: narf_lib::sync::IrqSafeSpinLock<Option<HostUnrefHook>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Dropping the last reference to a host-owned VirGL resource must not talk
+/// to the device in the dropper's context. Linux's
+/// `virtio_gpu_cmd_unref_resource` only queues UNREF and frees the backing
+/// from the response callback (`virtio_gpu_cmd_unref_cb` →
+/// `virtio_gpu_cleanup_object`). NARF waited for the device inline — taking
+/// the GPU request gate — from wherever the drop happened; one such drop ran
+/// inside a cursor flush that already held that gate, and the CPU spun forever
+/// with interrupts masked. The release must happen later, exactly once, with
+/// the right id.
+#[cfg(feature = "kernel-test")]
+fn smoke_virtgpu_drop_defers_host_unref() -> narf_kernel_test::TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use narf_kernel_test::TestResult;
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    static LAST: AtomicU32 = AtomicU32::new(0);
+    fn record(resource_id: u32) -> bool {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        LAST.store(resource_id, Ordering::Relaxed);
+        true
+    }
+    CALLS.store(0, Ordering::Relaxed);
+    LAST.store(0, Ordering::Relaxed);
+    narf_scheduler::__reset_queues_for_test();
+    *TEST_HOST_UNREF.lock() = Some(record);
+
+    drop(VirtGpuResource {
+        resource_id: 0x7711,
+        backing: Some(ResourceBacking::HostOnly { size: 4096 }),
+        blob_mem: None,
+        host3d_blob: false,
+        host_owned: true,
+        last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
+    });
+    let inline_calls = CALLS.load(Ordering::Relaxed);
+    narf_scheduler::run_until_empty();
+    let later_calls = CALLS.load(Ordering::Relaxed);
+    let last = LAST.load(Ordering::Relaxed);
+
+    *TEST_HOST_UNREF.lock() = None;
+    narf_scheduler::__reset_queues_for_test();
+    if inline_calls != 0 {
+        return TestResult::Fail("dropping a host-owned resource sent UNREF inline");
+    }
+    if later_calls != 1 || last != 0x7711 {
+        return TestResult::Fail("the deferred UNREF did not run exactly once for this resource");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_virtgpu_drop_defers_host_unref
+);
 
 impl VirtGpuResource {
     /// Mappable byte length of the resource's backing.
