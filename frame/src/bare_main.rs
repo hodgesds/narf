@@ -4988,7 +4988,7 @@ fn boot_userspace_init() {
         {
             return;
         }
-        let _ = narf_scheduler::poll_one_round();
+        let _ = narf_scheduler::poll_one_round_nested();
         IN_FLIGHT.store(false, Ordering::Release);
     }
     // Nested-only: the executor-step pump advances spawned tasks when a

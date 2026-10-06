@@ -4453,6 +4453,40 @@ pub(crate) fn scheduler_wake_cell(waker: &Waker) -> Option<Arc<WakeCell>> {
 /// Each kernel task is visited at most once. The function never
 /// `halt_until_irq`s. Returns the number of tasks that completed
 /// this round (`Ready` returns), purely as a diagnostic.
+/// Per-CPU depth of [`poll_one_round_nested`] frames. While non-zero, the
+/// round's poll boundaries are not QSBR quiescent points.
+static NESTED_ROUND_DEPTH: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// One executor round driven from INSIDE another kernel frame: the
+/// `sleep_pumps` scheduler step that keeps tasks moving while a sync path
+/// busy-waits (`responsive_spin_until`).
+///
+/// Unlike a top-level [`poll_one_round`], it reports **no RCU quiescent
+/// state**. The interrupted frame is mid-execution and may hold driver gates,
+/// locks or raw RCU pointers, so a task's poll boundary here is not a
+/// quiescent point for this CPU — the same reason a preempted return is not
+/// one. Reporting it also ran deferred destructors inline, inside that frame:
+/// a freed VirGL buffer's `Drop` re-took the GPU request gate the interrupted
+/// cursor flush held, and the CPU spun forever with interrupts masked. Linux
+/// runs RCU callbacks from softirq or the rcuo kthreads, never inline in a
+/// caller holding driver locks. The top-level executor round reports (and
+/// drains) as before.
+pub fn poll_one_round_nested() -> usize {
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    // Executor context (no current task): this frame cannot migrate, so the
+    // decrement lands on the same CPU's counter.
+    NESTED_ROUND_DEPTH[cpu].fetch_add(1, Ordering::AcqRel);
+    let polled = poll_one_round();
+    NESTED_ROUND_DEPTH[cpu].fetch_sub(1, Ordering::AcqRel);
+    polled
+}
+
+#[inline]
+fn in_nested_round(cpu: usize) -> bool {
+    NESTED_ROUND_DEPTH[cpu.min(narf_lib::percpu::MAX_CPUS - 1)].load(Ordering::Acquire) != 0
+}
+
 pub fn poll_one_round() -> usize {
     let cpu = narf_lib::percpu::current_cpu();
     let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
@@ -4597,7 +4631,11 @@ pub fn poll_one_round() -> usize {
         // arbitrary-PC context switch, not a quiescent point; its suspended
         // continuation may still hold raw RCU references). `take_preempted_return`
         // reads-and-clears the per-CPU flag `poll_to_yield` set at switch-back.
-        if !stackful::take_preempted_return() {
+        // Nor inside a nested round (see `poll_one_round_nested`): the frame
+        // that called the pump is not at a quiescent point. The preempted flag
+        // is consumed either way.
+        let preempted = stackful::take_preempted_return();
+        if !preempted && !in_nested_round(cpu) {
             narf_rcu::report_quiescent();
         }
         match poll_result {

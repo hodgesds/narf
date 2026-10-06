@@ -1388,3 +1388,7 @@ argument = "Per-task user GS base (scheduler/src/stackful.rs): the executor save
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "frame/src/cross_crate_init.rs passes one more function pointer (narf_userspace::handlers::proc_current_tid) to narf_filesystem::procfs::install_proc_pidns_hooks, so /proc/thread-self can name the calling thread. The hook only reads the caller's own Linux tid. frame/ gains no authority, mapping, domain transition or capability, and the wiring runs once at boot, like the three hooks already installed beside it."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Executor core (scheduler/src/lib.rs): poll_one_round_nested wraps poll_one_round with a per-CPU depth counter, and the poll-boundary QSBR report is skipped while that depth is non-zero, the same way it is already skipped after a preempted return. This only removes quiescent reports. It can only make a grace period last longer, never end early, so no RCU reader can lose its object; deferred destructors run at the top-level round as before. No authority, mapping, domain transition or capability change."
