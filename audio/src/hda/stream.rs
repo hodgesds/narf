@@ -207,10 +207,18 @@ impl Stream {
 #[derive(Debug)]
 pub(super) struct Card(pub Arc<IntelHda>);
 impl PcmDevice for Card {
-    fn capabilities(&self, _: bool) -> narf_drivers_sound::hardware::PcmCapabilities {
+    fn capabilities(&self, capture: bool) -> narf_drivers_sound::hardware::PcmCapabilities {
         use narf_drivers_sound::hardware::PcmCapabilities;
+        // Only what this codec's converters can configure. A fixed list made
+        // HW_REFINE advertise a format HW_PARAMS rejected; see
+        // `query_supported_formats`. An empty query result falls back to the
+        // driver's own default format rather than offering nothing at all.
+        let mut formats = self.0.supported_formats[usize::from(capture)].clone();
+        if formats.is_empty() {
+            formats.push(default_params().format);
+        }
         PcmCapabilities {
-            formats: alloc::vec![SampleFormat::S16LE, SampleFormat::S32LE],
+            formats,
             rates: alloc::vec![SampleRate::R48000],
             channels: alloc::vec![ChannelCount::Stereo],
             period_frames: (16, 32768),
