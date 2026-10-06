@@ -114,6 +114,27 @@ pub fn hci_dev_info(dev: u16) -> Option<Vec<u8>> {
     f(dev)
 }
 
+/// HCI_CHANNEL_MONITOR bind-time replay provider (per-controller NEW_INDEX).
+pub type HciMonitorReplayHandler = fn() -> Vec<Vec<u8>>;
+static HCI_MONITOR_REPLAY: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the monitor-replay provider (narf_bluetooth::hci_sock::monitor_replay).
+pub fn install_hci_monitor_replay(replay: HciMonitorReplayHandler) {
+    HCI_MONITOR_REPLAY.store(replay as usize, Ordering::Release);
+}
+
+/// The monitor replay packets to deliver when a socket binds HCI_CHANNEL_MONITOR.
+pub fn hci_monitor_replay() -> Vec<Vec<u8>> {
+    let h = HCI_MONITOR_REPLAY.load(Ordering::Acquire);
+    if h == 0 {
+        return Vec::new();
+    }
+    // SAFETY: only ever stored as `HciMonitorReplayHandler as usize`.
+    let f: HciMonitorReplayHandler =
+        unsafe { core::mem::transmute::<usize, HciMonitorReplayHandler>(h) };
+    f()
+}
+
 /// Power controller `dev` on/off; false for an unknown index/no stack.
 pub fn hci_dev_power(dev: u16, on: bool) -> bool {
     let h = HCI_DEV_POWER.load(Ordering::Acquire);
@@ -123,4 +144,34 @@ pub fn hci_dev_power(dev: u16, on: bool) -> bool {
     // SAFETY: only ever stored as `HciDevPowerHandler as usize`.
     let f: HciDevPowerHandler = unsafe { core::mem::transmute::<usize, HciDevPowerHandler>(h) };
     f(dev, on)
+}
+
+/// Asynchronous mgmt event sink. The native stack calls `publish_mgmt_event`
+/// (e.g. on controller registration or a settings change); the socket layer
+/// installs a sink that fans the event out to subscribed mgmt sockets.
+pub type MgmtEventSink = fn(&[u8]);
+static MGMT_EVENT_SINK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the mgmt-event fan-out (the socket layer's broadcaster), returning
+/// the previously installed one so a test can restore it afterward.
+pub fn install_mgmt_event_sink(sink: MgmtEventSink) -> Option<MgmtEventSink> {
+    let prev = MGMT_EVENT_SINK.swap(sink as usize, Ordering::AcqRel);
+    if prev == 0 {
+        None
+    } else {
+        // SAFETY: only ever stored as `MgmtEventSink as usize`.
+        Some(unsafe { core::mem::transmute::<usize, MgmtEventSink>(prev) })
+    }
+}
+
+/// Deliver an already-framed mgmt event to every subscribed mgmt socket.
+/// A no-op until the socket layer has installed its sink.
+pub fn publish_mgmt_event(event: &[u8]) {
+    let h = MGMT_EVENT_SINK.load(Ordering::Acquire);
+    if h == 0 {
+        return;
+    }
+    // SAFETY: only ever stored as `MgmtEventSink as usize`.
+    let f: MgmtEventSink = unsafe { core::mem::transmute::<usize, MgmtEventSink>(h) };
+    f(event);
 }

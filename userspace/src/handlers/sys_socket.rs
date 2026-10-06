@@ -147,8 +147,8 @@ pub(super) fn validate_socket_create(
 ) -> Result<(u16, u32, u32), i64> {
     use crate::socket::{
         AF_BLUETOOTH, AF_BYPASS, AF_INET, AF_INET6, AF_NETLINK, AF_PACKET, AF_UNIX, BTPROTO_HCI,
-        BT_MAX_PROTO, IPPROTO_ICMP, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, SOCK_PACKET, SOCK_RAW,
-        SOCK_SEQPACKET, SOCK_STREAM,
+        BTPROTO_L2CAP, BTPROTO_RFCOMM, BTPROTO_SCO, BT_MAX_PROTO, IPPROTO_ICMP, IPPROTO_TCP,
+        IPPROTO_UDP, SOCK_DGRAM, SOCK_PACKET, SOCK_RAW, SOCK_SEQPACKET, SOCK_STREAM,
     };
     const NPROTO: i32 = 46; // AF_MAX, include/linux/socket.h
     const SOCK_MAX: u32 = 11; // SOCK_PACKET + 1, include/linux/net.h
@@ -242,13 +242,25 @@ pub(super) fn validate_socket_create(
             if !(0..BT_MAX_PROTO).contains(&protocol) {
                 return Err(EINVAL);
             }
-            if protocol as u32 != BTPROTO_HCI {
-                return Err(EPROTONOSUPPORT);
+            // Per-protocol socket-type rules (net/bluetooth/*_sock.c create):
+            //   HCI    → SOCK_RAW
+            //   L2CAP  → SOCK_SEQPACKET/STREAM/DGRAM/RAW
+            //   RFCOMM → SOCK_STREAM
+            //   SCO    → SOCK_SEQPACKET
+            match protocol as u32 {
+                BTPROTO_HCI if kind == SOCK_RAW => Ok((domain, kind, BTPROTO_HCI)),
+                BTPROTO_L2CAP
+                    if matches!(kind, SOCK_SEQPACKET | SOCK_STREAM | SOCK_DGRAM | SOCK_RAW) =>
+                {
+                    Ok((domain, kind, BTPROTO_L2CAP))
+                }
+                BTPROTO_RFCOMM if kind == SOCK_STREAM => Ok((domain, kind, BTPROTO_RFCOMM)),
+                BTPROTO_SCO if kind == SOCK_SEQPACKET => Ok((domain, kind, BTPROTO_SCO)),
+                BTPROTO_HCI | BTPROTO_L2CAP | BTPROTO_RFCOMM | BTPROTO_SCO => {
+                    Err(ESOCKTNOSUPPORT)
+                }
+                _ => Err(EPROTONOSUPPORT),
             }
-            if kind != SOCK_RAW {
-                return Err(ESOCKTNOSUPPORT);
-            }
-            Ok((domain, kind, BTPROTO_HCI))
         }
         AF_BYPASS => Ok((domain, kind, raw_proto as u32)),
         _ => Err(EAFNOSUPPORT),

@@ -442,6 +442,69 @@ kernel_test_in!(
     smoke_abi_socket_bluetooth_hci_ioctls
 );
 
+/// Binding HCI_CHANNEL_MONITOR is accepted; with no controllers the replay is
+/// empty so recv returns EAGAIN (the plumbing btmon drives).
+fn smoke_abi_socket_bluetooth_monitor() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        let mut mon = [0u8; 6];
+        mon[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        mon[2..4].copy_from_slice(&0xffffu16.to_le_bytes()); // HCI_DEV_NONE
+        mon[4..6].copy_from_slice(&2u16.to_le_bytes()); // HCI_CHANNEL_MONITOR
+        if bind(fd, &mon) != Some(0) {
+            return Err("bind to the monitor channel failed");
+        }
+        let mut buf = [0u8; 64];
+        if recv(fd, &mut buf, 0) != Some(EAGAIN) {
+            return Err("monitor recv with no controllers must be EAGAIN");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_monitor
+);
+
+/// L2CAP/RFCOMM/SCO protocol-family surface: per-protocol socket-type rules
+/// (ESOCKTNOSUPPORT), sockaddr bind, and a hardware-gated connect that fails.
+fn smoke_abi_socket_bluetooth_conn_family() -> TestResult {
+    with_setup(|| {
+        // L2CAP (proto 0) accepts SOCK_SEQPACKET.
+        let l2 = open(AF_BLUETOOTH, SOCK_SEQPACKET, 0)?;
+        // RFCOMM (proto 3) requires SOCK_STREAM.
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_SEQPACKET, 3)) != Some(ESOCKTNOSUPPORT) {
+            return Err("RFCOMM non-STREAM must be ESOCKTNOSUPPORT");
+        }
+        let rc = open(AF_BLUETOOTH, SOCK_STREAM, 3)?;
+        // SCO (proto 2) requires SOCK_SEQPACKET.
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_STREAM, 2)) != Some(ESOCKTNOSUPPORT) {
+            return Err("SCO non-SEQPACKET must be ESOCKTNOSUPPORT");
+        }
+        let sco = open(AF_BLUETOOTH, SOCK_SEQPACKET, 2)?;
+        // bind a sockaddr_l2 (family + psm + bdaddr + cid + bdaddr_type = 13).
+        let mut addr = [0u8; 13];
+        addr[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        addr[2..4].copy_from_slice(&0x1001u16.to_le_bytes()); // l2_psm
+        if bind(l2, &addr) != Some(0) {
+            return Err("L2CAP bind failed");
+        }
+        // connect needs a controller + reachable peer: it must fail here.
+        if connect(l2, &addr).is_none_or(|r| r >= 0) {
+            return Err("hardware-gated L2CAP connect should fail");
+        }
+        close(l2);
+        close(rc);
+        close(sco);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_conn_family
+);
+
 /// `inet_create`: SOCK_RAW without CAP_NET_RAW → EPERM (after the protocol
 /// lookup, so a bad protocol is still EPROTONOSUPPORT).
 /// `__inet_bind`: a port below 1024 without CAP_NET_BIND_SERVICE → EACCES.

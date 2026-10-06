@@ -162,7 +162,15 @@ fn set_mode(index: u16, opcode: u16, params: &[u8], bit: u32, max_val: u8) -> Ve
         return cmd_status(index, opcode, STATUS_INVALID_PARAMS);
     }
     let settings = set_setting_bit(index, bit, params[0] != 0);
+    // Notify every mgmt socket of the new state (MGMT_EV_NEW_SETTINGS). The
+    // requester also gets the CMD_COMPLETE below.
+    narf_filesystem::bluetooth::publish_mgmt_event(&new_settings(index, settings));
     cmd_complete(index, opcode, STATUS_SUCCESS, &settings.to_le_bytes())
+}
+
+/// `MGMT_EV_NEW_SETTINGS` carrying the controller's current settings bitmap.
+pub fn new_settings(index: u16, settings: u32) -> Vec<u8> {
+    frame(EV_NEW_SETTINGS, index, &settings.to_le_bytes())
 }
 
 /// Handle one mgmt command frame (as received on an `HCI_CHANNEL_CONTROL`
@@ -419,4 +427,61 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("bluetooth/mgmt", smoke_mgmt_set_powered_toggles_settings);
+
+    static CAPTURED: narf_lib::sync::IrqSafeSpinLock<Vec<Vec<u8>>> =
+        narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+    fn capture_sink(event: &[u8]) {
+        CAPTURED.lock().push(event.to_vec());
+    }
+
+    fn smoke_mgmt_event_fanout() -> TestResult {
+        use crate::transport::LoopbackTransport;
+        use alloc::sync::Arc;
+
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+        SETTINGS.lock().clear();
+        CAPTURED.lock().clear();
+        let previous = narf_filesystem::bluetooth::install_mgmt_event_sink(capture_sink);
+
+        // Registering a controller publishes MGMT_EV_INDEX_ADDED.
+        let transport: Arc<dyn crate::transport::HciTransport> =
+            Arc::new(LoopbackTransport::new("mgmt-ev"));
+        crate::transport::register(transport.clone());
+        let index =
+            controller::register_ready_transport(transport, controller::ControllerInfo::default())
+                as u16;
+        let saw_index_added = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 6
+                && u16::from_le_bytes([e[0], e[1]]) == EV_INDEX_ADDED
+                && u16::from_le_bytes([e[2], e[3]]) == index
+        });
+
+        // SET_POWERED publishes MGMT_EV_NEW_SETTINGS with the POWERED bit.
+        CAPTURED.lock().clear();
+        let _ = handle(&mgmt_cmd(OP_SET_POWERED, index, &[1]));
+        let saw_new_settings = CAPTURED.lock().iter().any(|e| {
+            e.len() >= 10
+                && u16::from_le_bytes([e[0], e[1]]) == EV_NEW_SETTINGS
+                && u16::from_le_bytes([e[2], e[3]]) == index
+                && u32::from_le_bytes([e[6], e[7], e[8], e[9]]) & SETTING_POWERED != 0
+        });
+
+        // Restore the production sink and clean up.
+        if let Some(prev) = previous {
+            narf_filesystem::bluetooth::install_mgmt_event_sink(prev);
+        }
+        crate::transport::__test_reset();
+        controller::__test_reset_controllers();
+        SETTINGS.lock().clear();
+
+        if !saw_index_added {
+            return TestResult::Fail("INDEX_ADDED was not published on controller registration");
+        }
+        if !saw_new_settings {
+            return TestResult::Fail("NEW_SETTINGS was not published on SET_POWERED");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("bluetooth/mgmt", smoke_mgmt_event_fanout);
 }

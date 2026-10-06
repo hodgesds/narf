@@ -100,9 +100,13 @@ pub const NETLINK_GENERIC: u32 = 16;
 pub const AF_BLUETOOTH: u16 = 31;
 /// `BT_MAX_PROTO` = `BTPROTO_LAST(ISO=8) + 1` (net/bluetooth/af_bluetooth.c).
 pub const BT_MAX_PROTO: i32 = 9;
-/// `BTPROTO_HCI` (include/net/bluetooth/bluetooth.h). The only Bluetooth
-/// protocol NARF implements so far — raw HCI + the mgmt channel.
+/// Bluetooth protocols (include/net/bluetooth/bluetooth.h). BTPROTO_HCI is the
+/// raw HCI + mgmt surface; L2CAP/RFCOMM/SCO are the connection-oriented
+/// protocol families (bind/getsockname implemented; connect is hardware-gated).
+pub const BTPROTO_L2CAP: u32 = 0;
 pub const BTPROTO_HCI: u32 = 1;
+pub const BTPROTO_SCO: u32 = 2;
+pub const BTPROTO_RFCOMM: u32 = 3;
 /// `sockaddr_hci.hci_channel` values (include/net/bluetooth/hci_sock.h).
 pub const HCI_CHANNEL_RAW: u16 = 0;
 pub const HCI_CHANNEL_USER: u16 = 1;
@@ -1422,6 +1426,10 @@ enum SocketState {
         /// type + event-code masks on recv.
         filter: Option<Vec<u8>>,
     },
+    /// Connection-oriented AF_BLUETOOTH protocols (L2CAP/RFCOMM/SCO; the
+    /// protocol is `self.protocol`). `bound` holds the raw sockaddr body set
+    /// by bind. The connection path is hardware-gated (controller + peer).
+    BluetoothConn { bound: Option<Vec<u8>> },
 }
 
 /// Deliver a UDP datagram that arrived from the wire to a bound AF_INET or
@@ -1757,6 +1765,9 @@ impl SocketFile {
                 replies: VecDeque::new(),
                 filter: None,
             }
+        } else if domain == AF_BLUETOOTH {
+            // L2CAP / RFCOMM / SCO — connection-oriented protocol family.
+            SocketState::BluetoothConn { bound: None }
         } else {
             SocketState::Fresh
         };
@@ -1822,6 +1833,9 @@ impl SocketFile {
             NETLINK_SOCKETS.lock().push(Arc::downgrade(&socket));
         }
         if domain == AF_BLUETOOTH {
+            // Install the mgmt-event fan-out once; the native stack publishes
+            // INDEX_ADDED / NEW_SETTINGS through the filesystem broker.
+            narf_filesystem::bluetooth::install_mgmt_event_sink(Self::broadcast_bluetooth_mgmt);
             BLUETOOTH_SOCKETS.lock().push(Arc::downgrade(&socket));
         }
         socket
@@ -4136,6 +4150,8 @@ impl SocketFile {
                 }
                 bits
             }
+            // L2CAP/RFCOMM/SCO: no live connection yet, so writable only.
+            SocketState::BluetoothConn { .. } => narf_filesystem::POLL_OUT,
         }
     }
 
@@ -4348,16 +4364,60 @@ impl SocketFile {
             }
             _ => return SocketOpResult::Err(SockError::InvalidArg),
         }
-        let mut state = self.state.lock();
-        match &mut *state {
-            SocketState::Bluetooth {
-                dev: d, channel: c, ..
-            } => {
-                *d = dev;
-                *c = channel;
-                SocketOpResult::Ok(0)
+        // Binding the monitor channel replays a NEW_INDEX packet per
+        // controller (btmon's initial adapter list).
+        let replay = if channel == HCI_CHANNEL_MONITOR {
+            narf_filesystem::bluetooth::hci_monitor_replay()
+        } else {
+            Vec::new()
+        };
+        let result = {
+            let mut state = self.state.lock();
+            match &mut *state {
+                SocketState::Bluetooth {
+                    dev: d,
+                    channel: c,
+                    replies,
+                    ..
+                } => {
+                    *d = dev;
+                    *c = channel;
+                    replies.extend(replay);
+                    SocketOpResult::Ok(0)
+                }
+                _ => SocketOpResult::Err(SockError::InvalidArg),
             }
-            _ => SocketOpResult::Err(SockError::InvalidArg),
+        };
+        if matches!(result, SocketOpResult::Ok(_)) && channel == HCI_CHANNEL_MONITOR {
+            narf_net::readiness::notify(0);
+        }
+        result
+    }
+
+    /// Fan an asynchronous mgmt event (INDEX_ADDED / NEW_SETTINGS) out to every
+    /// open mgmt socket (HCI_CHANNEL_CONTROL). Installed into the filesystem
+    /// broker so the native stack can publish without depending on this crate.
+    fn broadcast_bluetooth_mgmt(event: &[u8]) {
+        let targets: Vec<Arc<Self>> = {
+            let mut sockets = BLUETOOTH_SOCKETS.lock();
+            sockets.retain(|weak| weak.strong_count() != 0);
+            sockets.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut delivered = false;
+        for socket in targets {
+            let mut state = socket.state.lock();
+            if let SocketState::Bluetooth {
+                channel, replies, ..
+            } = &mut *state
+            {
+                if *channel == HCI_CHANNEL_CONTROL && replies.len() < 256 {
+                    replies.push_back(event.to_vec());
+                    delivered = true;
+                }
+            }
+        }
+        if delivered {
+            narf_net::readiness::notify(0);
         }
     }
 
@@ -4365,6 +4425,10 @@ impl SocketFile {
     /// the semantics; the mgmt (CONTROL) command/event flow and raw HCI event
     /// delivery queue into the socket's `replies`, consumed by `recv`.
     fn dispatch_bluetooth(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        // L2CAP/RFCOMM/SCO use their own connection-oriented dispatcher.
+        if self.protocol != BTPROTO_HCI {
+            return self.dispatch_bluetooth_conn(op);
+        }
         match op {
             SocketOp::Bind { addr } => self.bind_bluetooth(&addr),
             SocketOp::GetSockName => SocketOpResult::Addr(self.bluetooth_sockaddr()),
@@ -4395,8 +4459,8 @@ impl SocketFile {
                     } => (*channel, *dev, filter.clone()),
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
-                let message = if channel == HCI_CHANNEL_CONTROL {
-                    // mgmt: drain the per-socket reply/event queue.
+                let message = if channel == HCI_CHANNEL_CONTROL || channel == HCI_CHANNEL_MONITOR {
+                    // mgmt / monitor: drain the per-socket reply/event queue.
                     let mut state = self.state.lock();
                     match &mut *state {
                         SocketState::Bluetooth { replies, .. } => {
@@ -4505,6 +4569,55 @@ impl SocketFile {
             }
         }
         true
+    }
+
+    /// Connection-oriented AF_BLUETOOTH dispatcher (L2CAP/RFCOMM/SCO). bind
+    /// stores the local sockaddr and getsockname returns it; the actual
+    /// connect/listen/accept/send/recv path needs a controller + reachable
+    /// peer, which is hardware-gated, so those report NotSupported.
+    fn dispatch_bluetooth_conn(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
+        // Minimum sockaddr body length (after the 2-byte family) per protocol:
+        // L2CAP psm(2)+bdaddr(6)+cid(2)+type(1)=11, RFCOMM bdaddr(6)+chan(1)=7,
+        // SCO bdaddr(6)=6.
+        let min_body = match self.protocol {
+            BTPROTO_L2CAP => 11,
+            BTPROTO_RFCOMM => 7,
+            _ => 6,
+        };
+        match op {
+            SocketOp::Bind { addr } => {
+                if addr.family != AF_BLUETOOTH || addr.body.len() < min_body {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                let mut state = self.state.lock();
+                if let SocketState::BluetoothConn { bound, .. } = &mut *state {
+                    *bound = Some(addr.body.clone());
+                    SocketOpResult::Ok(0)
+                } else {
+                    SocketOpResult::Err(SockError::InvalidArg)
+                }
+            }
+            SocketOp::GetSockName => {
+                let body = match &*self.state.lock() {
+                    SocketState::BluetoothConn {
+                        bound: Some(body), ..
+                    } => body.clone(),
+                    _ => alloc::vec![0u8; min_body],
+                };
+                SocketOpResult::Addr(SockAddr {
+                    family: AF_BLUETOOTH,
+                    body,
+                })
+            }
+            SocketOp::SetSockOpt { level, name, value } => {
+                self.handle_setsockopt(level, name, value)
+            }
+            SocketOp::GetSockOpt { level, name, buf } => self.handle_getsockopt(level, name, buf),
+            SocketOp::Shutdown { .. } => SocketOpResult::Ok(0),
+            // Connecting/listening an L2CAP/RFCOMM/SCO channel requires a live
+            // controller and a reachable peer — hardware-gated.
+            _ => SocketOpResult::Err(SockError::NotSupported),
+        }
     }
 
     /// `AF_NETLINK` / `NETLINK_ROUTE` (rtnetlink) dispatcher. A `send` of an
