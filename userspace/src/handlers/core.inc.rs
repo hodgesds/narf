@@ -6221,6 +6221,12 @@ pub fn __test_cap_effective(task: u64, cap: u32) -> bool {
     cap_effective(task, cap)
 }
 
+/// Test hook — `task`'s whole PERMITTED set, the word an exec must rebuild.
+#[doc(hidden)]
+pub fn __test_caps_permitted(task: u64) -> u64 {
+    read_caps(task).permitted
+}
+
 fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
     let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
     let mut caps = read_caps(task);
@@ -6438,6 +6444,15 @@ fn cap_bprm_creds_from_file(
 ) -> bool {
     let root_uid = uid_from_user(task, 0).unwrap_or(u32::MAX);
     let mut effective = false;
+    // `get_file_caps` opens with `cap_clear(bprm->cred->cap_permitted)`:
+    // the new image's permitted set is rebuilt from scratch on every exec
+    // (root's below, file capabilities, then ambient), never inherited.
+    // Carrying the caller's set over leaked a non-root task's leftover
+    // privilege into the new image AND tripped `__cap_grew(permitted,
+    // ambient)` below, so the exec published AT_SECURE=1 and glibc's
+    // `secure_getenv` hid the environment — `systemd --user` then exited
+    // "Failed to determine $XDG_RUNTIME_DIR path" (ENXIO) at every login.
+    caps.permitted = 0;
     // `handle_privileged_root`; `root_privileged()` is
     // `!issecure(SECURE_NOROOT)`, and `has_fcap` is false.
     if !issecure(task, SECURE_NOROOT) {

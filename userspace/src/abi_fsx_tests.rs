@@ -1821,14 +1821,23 @@ fn smoke_abi_fsx_exec_secureexec_decision() -> TestResult {
                 return Err(msg);
             }
         }
-        // A non-root uid still holding a permitted set: `__cap_grew(permitted,
-        // ambient)` — the new image holds privilege its uid does not imply.
+        // A non-root uid still holding a permitted set (here root's full set,
+        // as after PR_SET_KEEPCAPS + setresuid) execs an ordinary binary.
+        // `get_file_caps` clears the new permitted set before anything else,
+        // so the image keeps no capability its uid does not imply, and with
+        // permitted == ambient == 0 `__cap_grew(permitted, ambient)` is false:
+        // NOT secureexec. Answering AT_SECURE here made glibc's
+        // `secure_getenv` hide $XDG_RUNTIME_DIR from `systemd --user`.
         stage_root_owned(cpath, 0o755)?;
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
         let secure = crate::handlers::__test_exec_credentials(task, path);
+        let permitted = crate::handlers::__test_caps_permitted(task);
         creds_reset();
-        if !secure {
-            return Err("a non-root exec that keeps permitted capabilities did not set AT_SECURE");
+        if secure {
+            return Err("a non-root exec of an ordinary binary set AT_SECURE");
+        }
+        if permitted != 0 {
+            return Err("a non-root exec kept the caller's permitted capabilities");
         }
         Ok(())
     })
