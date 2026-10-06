@@ -131,6 +131,69 @@ fn smoke_rcu_retire_box_advance_epoch_reclaims() -> TestResult {
 }
 kernel_test_in!("rcu", smoke_rcu_retire_box_advance_epoch_reclaims);
 
+/// With a reclaim worker installed, a quiescent report must NOT run
+/// grace-period-expired destructors inline: it hands them to the worker and
+/// wakes it. `report_quiescent` is reached from arbitrary places (a nested
+/// executor round inside a driver wait, an idle path) whose frame may hold
+/// driver gates or locks; a destructor that freed a VirGL buffer re-took the
+/// GPU request gate its caller held and spun forever. Linux runs RCU
+/// callbacks from softirq / the rcuo kthreads, never inline in such a caller.
+/// The explicit grace-period wait (`sync`) keeps its contract: everything
+/// retired before it is dropped when it returns.
+fn smoke_rcu_quiescent_offloads_destructors_to_worker() -> TestResult {
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    static WAKES: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn wake() {
+        WAKES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    WAKES.store(0, Ordering::Relaxed);
+    crate::report_quiescent();
+    crate::set_reclaim_offload(wake);
+    crate::retire_box(Box::new(Canary));
+    crate::advance_epoch_if_pending();
+    crate::report_quiescent();
+    let inline_drops = DROPS.load(Ordering::Relaxed);
+    let wakes = WAKES.load(Ordering::Relaxed);
+    let ran = crate::run_offloaded_reclaim();
+    let worker_drops = DROPS.load(Ordering::Relaxed);
+
+    // `sync` must still leave nothing retired before it undropped.
+    crate::retire_box(Box::new(Canary));
+    crate::sync();
+    let synced_drops = DROPS.load(Ordering::Relaxed);
+    crate::clear_reclaim_offload();
+    // Leave nothing behind for later tests.
+    let _ = crate::run_offloaded_reclaim();
+
+    if inline_drops != 0 {
+        return TestResult::Fail(
+            "quiescent report ran a destructor inline with a worker installed",
+        );
+    }
+    if wakes == 0 {
+        return TestResult::Fail("offloaded destructors without waking the worker");
+    }
+    if ran != 1 || worker_drops != 1 {
+        return TestResult::Fail("worker did not run the offloaded destructor exactly once");
+    }
+    if synced_drops != 2 {
+        return TestResult::Fail("sync returned before an object retired ahead of it was dropped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_quiescent_offloads_destructors_to_worker);
+
 /// Retiring far more objects than the old fixed bucket held must reclaim
 /// EVERY one of them.
 ///

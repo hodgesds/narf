@@ -1392,3 +1392,7 @@ argument = "frame/src/cross_crate_init.rs passes one more function pointer (narf
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Executor core (scheduler/src/lib.rs): poll_one_round_nested wraps poll_one_round with a per-CPU depth counter, and the poll-boundary QSBR report is skipped while that depth is non-zero, the same way it is already skipped after a preempted return. This only removes quiescent reports. It can only make a grace period last longer, never end early, so no RCU reader can lose its object; deferred destructors run at the top-level round as before. No authority, mapping, domain transition or capability change."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame/src/bare_main.rs installs narf_rcu's reclaim-offload hook (rcu_reclaim_kick) in run_async_demo. The hook only calls narf_scheduler::spawn_stackful on a task that runs narf_rcu::run_offloaded_reclaim. Reclamation still frees only nodes whose QSBR grace period has elapsed, the same objects at the same safety point as before. Only the context changes: a spawned kernel task instead of whatever frame reported quiescence. Destructors run later, never earlier, so no reader can lose its object. No authority, mapping, domain transition or capability change."

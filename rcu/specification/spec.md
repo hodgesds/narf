@@ -247,12 +247,44 @@ This single call:
 - Publishes the current CPU's epoch snapshot.
 - Advances any `sleepable_sync` tracker if its scope's readers have
   all released.
-- Drains a bounded slice of this CPU's `defer_drop` queue (bounded
-  to keep per-poll latency capped — residual work falls to the
-  reclamation worker Future below).
+- Detaches this CPU's grace-period-expired `defer_drop` entries and
+  hands them to the reclamation worker (below). It does **not** run
+  their destructors.
 
-A per-domain **reclamation worker Future** runs on a low-priority
-executor slot, draining the rest of the domain's deferred-drop queue.
+Only the top-level executor round reports. A round driven from inside
+another kernel frame (`scheduler::poll_one_round_nested`, the
+sleep-pump step during a driver busy-wait) is not a quiescent point:
+the interrupted frame may hold driver gates, locks or raw RCU
+pointers.
+
+**Reclamation worker.** Destructors are arbitrary `Drop` code — the
+last reference to an address space, a mapped device file or a GPU
+buffer — and may take driver gates or wait on hardware. Linux runs
+RCU callbacks from softirq / the rcuo kthreads, never inline in the
+code that happened to pass a quiescent state; NARF does the same:
+
+```rust
+// Installed once at boot, after the scheduler's ready queues exist.
+rcu::set_reclaim_offload(wake: fn());
+// Remove the hook (tests): implicit drains run destructors inline again.
+rcu::clear_reclaim_offload();
+// Run every handed-off destructor; returns how many ran.
+rcu::run_offloaded_reclaim() -> usize;
+```
+
+- With a hook installed, `report_quiescent` / `report_idle` splice
+  expired entries onto one global pending list and call `wake` on
+  the list's empty→pending transition only (coalesced). The boot
+  hook spawns a stackful task that calls `run_offloaded_reclaim`, so
+  a destructor runs with interrupts enabled, holding nothing of its
+  caller's, and can `cooperative_yield` on a busy device gate.
+- Without a hook (early boot, kernel tests) drains run destructors
+  inline, as before.
+- The explicit grace-period waits (`sync`, `sync_until`,
+  `SyncFuture`) keep their contract: they drain their own bucket and
+  run the pending list before returning, so everything retired before
+  the wait has been dropped.
+
 Reclamation runs *inside the domain that owned the allocation* so
 the `Drop` impl sees the correct PKS/MTE rights.
 
@@ -268,6 +300,10 @@ the `Drop` impl sees the correct PKS/MTE rights.
   (sleepable / hazard).
 - Reclamation happens in the owner's domain; cross-domain free is
   impossible by construction.
+- Once a reclaim offload is installed, no destructor runs inside
+  `report_quiescent` / `report_idle`: those only detach and hand off.
+  A quiescent report can therefore never re-enter a driver gate or
+  lock held by the frame that reported it.
 - A sleepable reader whose cap is revoked has its guard forcibly
   drained at its next `await` boundary (cooperative — the task sees
   a cancellation signal, its Drop runs, reservation releases).
