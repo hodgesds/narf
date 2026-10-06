@@ -52,6 +52,7 @@ pub mod gatt_server;
 pub mod h4;
 pub mod h5;
 pub mod hci;
+pub mod hci_sock;
 pub mod hfp;
 pub mod hid_profile;
 pub mod hogp;
@@ -154,6 +155,10 @@ pub fn register_initcalls() {
     // net/bluetooth/mgmt.c.
     narf_init::register(Stage::Late, "bluetooth-mgmt", || {
         narf_filesystem::bluetooth::install_mgmt_handler(crate::mgmt::handle);
+        narf_filesystem::bluetooth::install_hci_handlers(
+            crate::hci_sock::send,
+            crate::hci_sock::drain_event,
+        );
         InitResult::Ok
     });
 }

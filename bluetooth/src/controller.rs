@@ -115,6 +115,12 @@ impl Controller {
         *self.info.lock()
     }
 
+    /// The controller's HCI transport — used by raw/user HCI sockets to send
+    /// commands and drain events directly.
+    pub fn transport(&self) -> Arc<dyn HciTransport> {
+        self.transport.clone()
+    }
+
     /// Drive the bring-up sequence to completion. Each step issues a
     /// Mandatory command, waits for `HCI_Command_Complete`, and
     /// records the controller's response.

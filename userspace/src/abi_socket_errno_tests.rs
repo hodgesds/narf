@@ -365,6 +365,42 @@ kernel_test_in!(
     smoke_abi_socket_bluetooth_mgmt_read_version
 );
 
+/// Raw HCI channel plumbing: bind RAW, install an HCI_FILTER, send a
+/// type-prefixed command (accepted), and recv with no controller -> EAGAIN.
+fn smoke_abi_socket_bluetooth_hci_raw() -> TestResult {
+    with_setup(|| {
+        let fd = open(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI)?;
+        let mut raw = [0u8; 6];
+        raw[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_le_bytes());
+        raw[2..4].copy_from_slice(&0u16.to_le_bytes()); // dev 0
+        raw[4..6].copy_from_slice(&0u16.to_le_bytes()); // HCI_CHANNEL_RAW
+        if bind(fd, &raw) != Some(0) {
+            return Err("bind to the raw HCI channel failed");
+        }
+        // setsockopt(SOL_HCI=0, HCI_FILTER=2, struct hci_filter) is accepted.
+        let filter = [0u8; 14];
+        if setsockopt(fd, 0, 2, &filter) != Some(0) {
+            return Err("HCI_FILTER setsockopt was rejected");
+        }
+        // A type-prefixed HCI_Reset command is accepted (no controller to run it).
+        let cmd = [0x01u8, 0x03, 0x0c, 0x00];
+        if send(fd, &cmd, 0) != Some(cmd.len() as i64) {
+            return Err("raw HCI command send failed");
+        }
+        // With no controller bound there are no events: recv -> EAGAIN.
+        let mut buf = [0u8; 32];
+        if recv(fd, &mut buf, 0) != Some(EAGAIN) {
+            return Err("raw HCI recv with no events must be EAGAIN");
+        }
+        close(fd);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_bluetooth_hci_raw
+);
+
 /// `inet_create`: SOCK_RAW without CAP_NET_RAW → EPERM (after the protocol
 /// lookup, so a bad protocol is still EPROTONOSUPPORT).
 /// `__inet_bind`: a port below 1024 without CAP_NET_BIND_SERVICE → EACCES.
