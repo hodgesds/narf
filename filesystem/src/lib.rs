@@ -913,6 +913,14 @@ pub trait IoctlContext: Sync {
     fn process_id(&self) -> u32 {
         0
     }
+    /// Install `file` as a fresh descriptor in the calling process's fd table,
+    /// returning its number. `cloexec` requests `O_CLOEXEC`. Only the syscall
+    /// layer (which owns the table) can honour this; drivers use it to hand an
+    /// fd back from an ioctl — e.g. `VIDIOC_EXPBUF`'s dma-buf export, mirroring
+    /// DRM PRIME. The default is unsupported.
+    fn install_file(&self, _file: Arc<dyn FileOps>, _cloexec: bool) -> Result<i32, FsError> {
+        Err(FsError::Unsupported)
+    }
 }
 
 /// Filesystem-native quota inheritance requested while creating a snapshot.

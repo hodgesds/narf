@@ -46,8 +46,9 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_filesystem::{
-    FileOps, FileType, FsError, FsFuture, IoctlContext, MmapLifetime, Mode, Stat, POLL_IN,
+    FileOps, FileType, FsError, FsFuture, IoctlContext, MmapLifetime, Mode, Stat, POLL_IN, POLL_PRI,
 };
+use narf_lib::readiness::Readiness;
 use narf_lib::sync::IrqSafeSpinLock;
 
 // ── Major number ─────────────────────────────────────────────────────────
@@ -98,20 +99,37 @@ pub struct VideoDevice {
     pub buffers: Vec<crate::v4l2_ioctl::V4l2Buffer>,
     /// Running capture sequence counter, stamped into dequeued buffers.
     pub sequence: u32,
+    /// Poll/epoll readiness cell. `POLL_IN` is raised when a frame is ready
+    /// (a `Done` MMAP buffer or a queued raw-read frame) and cleared when
+    /// drained. Shared (`Arc`) with every [`VideoFile`] so `FileOps::readiness`
+    /// can borrow it without taking the device lock.
+    pub readiness: Arc<Readiness>,
 }
 
 impl VideoDevice {
     pub fn new(index: usize, name: String) -> Self {
+        Self::with_formats(index, name, crate::v4l2_ioctl::default_formats())
+    }
+
+    /// Construct a device advertising `formats` (from the UVC descriptor walk).
+    /// The initial capture format is the first format's first frame size.
+    pub fn with_formats(
+        index: usize,
+        name: String,
+        formats: Vec<crate::v4l2_ioctl::FmtEntry>,
+    ) -> Self {
+        let format = crate::v4l2_ioctl::pix_format_from(&formats);
         VideoDevice {
             index,
             name,
             frames: Vec::new(),
-            format: crate::v4l2_ioctl::default_pix_format(),
-            formats: crate::v4l2_ioctl::default_formats(),
+            format,
+            formats,
             controls: crate::v4l2_ioctl::default_controls(),
             streaming: false,
             buffers: Vec::new(),
             sequence: 0,
+            readiness: Arc::new(Readiness::new(0)),
         }
     }
 
@@ -121,6 +139,38 @@ impl VideoDevice {
             self.frames.remove(0);
         }
         self.frames.push(VideoFrame { data });
+    }
+
+    /// Deliver a freshly captured frame from the driver's capture pump.
+    ///
+    /// While streaming with a queued MMAP buffer, the frame is copied straight
+    /// into that buffer and stamped with a monotonic capture timestamp (the
+    /// live `DQBUF` path). Otherwise it falls back to the raw-read FIFO. Either
+    /// way `POLL_IN` is raised so blocked `poll`/`select`/`epoll`/`DQBUF`
+    /// waiters wake.
+    pub fn deliver_frame(&mut self, data: Vec<u8>) {
+        let ts = narf_time::monotonic_ns();
+        if self.streaming && crate::v4l2_ioctl::fill_queued_buffer(self, &data, ts) {
+            self.refresh_readiness();
+            return;
+        }
+        self.push_frame(data);
+        self.refresh_readiness();
+    }
+
+    /// Recompute the `POLL_IN` readiness level from the current frame/buffer
+    /// state. Called after every produce/consume transition.
+    pub fn refresh_readiness(&self) {
+        let ready = !self.frames.is_empty()
+            || self
+                .buffers
+                .iter()
+                .any(|b| b.state == crate::v4l2_ioctl::QState::Done);
+        if ready {
+            self.readiness.set(POLL_IN, 0);
+        } else {
+            self.readiness.set(0, POLL_IN);
+        }
     }
 
     /// Dequeue the oldest frame, if any.
@@ -171,6 +221,27 @@ pub fn register_video(name: &str) -> usize {
     // Register sysfs kobject: /sys/class/video4linux/video<N>/
     register_sysfs(idx, name);
 
+    idx
+}
+
+/// Register a camera advertising a real format table parsed from its UVC
+/// streaming descriptors (see [`crate::v4l2_ioctl::uvc_to_v4l2_formats`]).
+/// An empty `formats` falls back to [`crate::v4l2_ioctl::default_formats`], so
+/// a parse failure still yields a usable node.
+pub fn register_video_with_formats(name: &str, formats: Vec<crate::v4l2_ioctl::FmtEntry>) -> usize {
+    let idx = alloc_index();
+    let formats = if formats.is_empty() {
+        crate::v4l2_ioctl::default_formats()
+    } else {
+        formats
+    };
+    let dev = Arc::new(IrqSafeSpinLock::new(VideoDevice::with_formats(
+        idx,
+        name.into(),
+        formats,
+    )));
+    VIDEO_NODES.lock().push(dev);
+    register_sysfs(idx, name);
     idx
 }
 
@@ -228,11 +299,22 @@ fn register_sysfs(idx: usize, camera_name: &str) {
 #[derive(Debug)]
 pub struct VideoFile {
     dev: Arc<IrqSafeSpinLock<VideoDevice>>,
+    /// Shared readiness cell (cloned from the device) so `readiness()` can
+    /// return a borrow without taking the device lock.
+    readiness: Arc<Readiness>,
+    /// Per-open-file V4L2 event state (`SUBSCRIBE_EVENT`/`DQEVENT`). Minted
+    /// fresh per `open` by [`VideoFile::open_instance_checked`].
+    events: Arc<IrqSafeSpinLock<crate::v4l2_ioctl::FdEvents>>,
 }
 
 impl VideoFile {
     pub fn new(dev: Arc<IrqSafeSpinLock<VideoDevice>>) -> Self {
-        VideoFile { dev }
+        let readiness = dev.lock().readiness.clone();
+        VideoFile {
+            dev,
+            readiness,
+            events: Arc::new(IrqSafeSpinLock::new(crate::v4l2_ioctl::FdEvents::new())),
+        }
     }
 }
 
@@ -254,14 +336,19 @@ impl FileOps for VideoFile {
     /// Linux ref: `v4l2_read` → `vb2_read` in
     /// `drivers/media/common/videobuf2/videobuf2-v4l2.c`.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        let frame = self.dev.lock().pop_frame();
-        let n = match frame {
-            Some(f) => {
-                let copy = f.data.len().min(buf.len());
-                buf[..copy].copy_from_slice(&f.data[..copy]);
-                copy
-            }
-            None => 0,
+        let n = {
+            let mut dev = self.dev.lock();
+            let frame = dev.pop_frame();
+            let n = match frame {
+                Some(f) => {
+                    let copy = f.data.len().min(buf.len());
+                    buf[..copy].copy_from_slice(&f.data[..copy]);
+                    copy
+                }
+                None => 0,
+            };
+            dev.refresh_readiness();
+            n
         };
         Box::pin(async move { Ok(n) })
     }
@@ -293,13 +380,21 @@ impl FileOps for VideoFile {
         (81u64 << 8) | self.dev.lock().index as u64
     }
 
-    /// `POLL_IN` when a frame is ready.
+    /// Current readiness level: `POLL_IN` when a captured frame is ready
+    /// (a `Done` MMAP buffer or a queued raw-read frame), plus `POLL_PRI` when
+    /// a V4L2 event is pending for this fd (`DQEVENT`).
     fn poll_readiness(&self) -> u32 {
-        if self.dev.lock().has_frame() {
-            POLL_IN
-        } else {
-            0
+        let mut mask = self.readiness.mask();
+        if self.events.lock().has_events() {
+            mask |= POLL_PRI;
         }
+        mask
+    }
+
+    /// Durable readiness cell so the VFS poll/epoll layer parks on and is woken
+    /// by the capture pump's `deliver_frame` rather than busy-polling.
+    fn readiness(&self) -> Option<&Readiness> {
+        Some(&self.readiness)
     }
 
     /// V4L2 `VIDIOC_*` ioctl surface (format/controls/streaming buffers).
@@ -311,7 +406,18 @@ impl FileOps for VideoFile {
         arg: u64,
         ctx: &'a dyn IoctlContext,
     ) -> FsFuture<'a, u64> {
-        crate::v4l2_ioctl::dispatch(self.dev.clone(), cmd, arg, ctx)
+        crate::v4l2_ioctl::dispatch(self.dev.clone(), cmd, arg, ctx, self.events.clone())
+    }
+
+    /// Mint a fresh per-open instance so each descriptor gets its own V4L2
+    /// event subscription queue (`v4l2_fh`), while sharing the device and its
+    /// readiness cell.
+    ///
+    /// Linux ref: `v4l2_open` → `v4l2_fh_init` per `struct file`.
+    fn open_instance_checked(&self, _write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError> {
+        Ok(Some(
+            Arc::new(VideoFile::new(self.dev.clone())) as Arc<dyn FileOps>
+        ))
     }
 
     /// `mmap(2)` a `V4L2_MEMORY_MMAP` capture buffer. `offset` is the cookie
@@ -473,13 +579,19 @@ pub mod v4l2_tests {
     struct Mock {
         mem: IrqSafeSpinLock<Vec<u8>>,
         nonblock: bool,
+        /// Files "installed" via `install_file`, indexed by returned fd.
+        installed: IrqSafeSpinLock<Vec<Arc<dyn FileOps>>>,
     }
     impl Mock {
         fn new(nonblock: bool) -> Self {
             Self {
                 mem: IrqSafeSpinLock::new(vec![0u8; 8192]),
                 nonblock,
+                installed: IrqSafeSpinLock::new(Vec::new()),
             }
+        }
+        fn installed_file(&self, fd: i32) -> Arc<dyn FileOps> {
+            self.installed.lock()[fd as usize].clone()
         }
         fn put_u32(&self, off: usize, v: u32) {
             self.mem.lock()[ARG as usize + off..ARG as usize + off + 4]
@@ -518,6 +630,19 @@ pub mod v4l2_tests {
         fn nonblocking(&self) -> bool {
             self.nonblock
         }
+        fn install_file(&self, file: Arc<dyn FileOps>, _cloexec: bool) -> Result<i32, FsError> {
+            let mut t = self.installed.lock();
+            let fd = t.len() as i32;
+            t.push(file);
+            Ok(fd)
+        }
+        fn file(&self, fd: i32) -> Result<Arc<dyn FileOps>, FsError> {
+            self.installed
+                .lock()
+                .get(fd as usize)
+                .cloned()
+                .ok_or(FsError::BadFd)
+        }
     }
 
     /// Drive a bridge future to completion. The V4L2 handlers are immediately
@@ -542,9 +667,29 @@ pub mod v4l2_tests {
         }
     }
 
-    /// Issue one ioctl against a freshly registered device.
+    /// Issue one ioctl against a freshly registered device with a throwaway
+    /// per-fd event queue (fine for everything but the event tests).
     fn ioctl(dev: &Arc<IrqSafeSpinLock<VideoDevice>>, m: &Mock, cmd: u32) -> u64 {
-        run(crate::v4l2_ioctl::dispatch(dev.clone(), cmd, ARG, m)).expect("no EFAULT in tests")
+        let events = Arc::new(IrqSafeSpinLock::new(crate::v4l2_ioctl::FdEvents::new()));
+        ioctl_ev(dev, m, cmd, &events)
+    }
+
+    /// Issue one ioctl against a device with an explicit (persistent) per-fd
+    /// event queue, so subscribe → change → DQEVENT can be exercised.
+    fn ioctl_ev(
+        dev: &Arc<IrqSafeSpinLock<VideoDevice>>,
+        m: &Mock,
+        cmd: u32,
+        events: &Arc<IrqSafeSpinLock<crate::v4l2_ioctl::FdEvents>>,
+    ) -> u64 {
+        run(crate::v4l2_ioctl::dispatch(
+            dev.clone(),
+            cmd,
+            ARG,
+            m,
+            events.clone(),
+        ))
+        .expect("no EFAULT in tests")
     }
 
     fn fresh(name: &str) -> Arc<IrqSafeSpinLock<VideoDevice>> {
@@ -868,4 +1013,446 @@ pub mod v4l2_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/video/v4l2", streamoff_resets_buffers);
+
+    /// A device registered from parsed UVC descriptors advertises those real
+    /// formats/resolutions (not the synthetic default table).
+    fn register_with_formats_advertises_real() -> TestResult {
+        use crate::uvc::{FrameMode, PixelFmt, StreamFormat};
+        __reset_for_test();
+        let uvc = alloc::vec![StreamFormat {
+            format_index: 1,
+            pixel_fmt: PixelFmt::Mjpeg,
+            default_frame_index: 1,
+            frames: alloc::vec![FrameMode {
+                frame_index: 1,
+                width: 1920,
+                height: 1080,
+                frame_intervals: alloc::vec![333_333], // 30 fps in 100 ns units
+                continuous_min: None,
+                continuous_max: None,
+                continuous_step: None,
+                default_frame_interval: 333_333,
+            }],
+        }];
+        let table = crate::v4l2_ioctl::uvc_to_v4l2_formats(&uvc);
+        let idx = register_video_with_formats("RealCam", table);
+        let dev = get_device(idx).unwrap();
+        let m = Mock::new(true);
+        // ENUM_FMT index 0 → MJPG.
+        m.put_u32(0, 0);
+        m.put_u32(4, 1);
+        if ioctl(&dev, &m, ioc(DIR_WR, 2, 64)) != 0 || m.get_u32(44) != MJPG {
+            return TestResult::Fail("ENUM_FMT[0] should be the descriptor's MJPG");
+        }
+        // ENUM_FRAMESIZES[0] for MJPG → 1920x1080 (discrete).
+        for off in 0..11 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(0, 0);
+        m.put_u32(4, MJPG);
+        if ioctl(&dev, &m, ioc(DIR_WR, 74, 44)) != 0
+            || m.get_u32(12) != 1920
+            || m.get_u32(16) != 1080
+        {
+            return TestResult::Fail("ENUM_FRAMESIZES should report 1920x1080");
+        }
+        // Initial G_FMT should be the first real format (MJPG 1920x1080).
+        for off in [8usize, 12, 16] {
+            m.put_u32(off, 0);
+        }
+        m.put_u32(0, 1);
+        if ioctl(&dev, &m, ioc(DIR_WR, 4, 208)) != 0
+            || m.get_u32(16) != MJPG
+            || m.get_u32(8) != 1920
+            || m.get_u32(12) != 1080
+        {
+            return TestResult::Fail("initial G_FMT should match the first real format");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", register_with_formats_advertises_real);
+
+    /// deliver_frame fills a queued buffer, raises POLL_IN, stamps a capture
+    /// timestamp, and the readiness clears once the buffer is dequeued.
+    fn deliver_frame_readiness_and_timestamp() -> TestResult {
+        let dev = fresh("c");
+        let m = Mock::new(true);
+        // One MMAP buffer, queued, streaming.
+        m.put_u32(0, 1);
+        m.put_u32(4, 1);
+        m.put_u32(8, 1);
+        ioctl(&dev, &m, ioc(DIR_WR, 8, 20)); // REQBUFS
+        m.put_u32(0, 0);
+        m.put_u32(4, 1);
+        m.put_u32(60, 1);
+        ioctl(&dev, &m, ioc(DIR_WR, 15, 88)); // QBUF 0
+        m.put_u32(0, 1);
+        ioctl(&dev, &m, ioc(DIR_W, 18, 4)); // STREAMON
+
+        if dev.lock().readiness.mask() & POLL_IN != 0 {
+            return TestResult::Fail("no frame yet → POLL_IN must be clear");
+        }
+        // Live delivery from the capture pump.
+        dev.lock().deliver_frame(alloc::vec![0xCDu8; 4096]);
+        if dev.lock().readiness.mask() & POLL_IN == 0 {
+            return TestResult::Fail("deliver_frame should raise POLL_IN");
+        }
+        // Non-blocking DQBUF returns the live buffer with a capture timestamp.
+        m.put_u32(4, 1);
+        m.put_u32(60, 1);
+        if ioctl(&dev, &m, ioc(DIR_WR, 17, 88)) != 0 {
+            return TestResult::Fail("DQBUF should return the delivered buffer");
+        }
+        if m.get_u32(8) != 4096 {
+            return TestResult::Fail("bytesused should be the frame length");
+        }
+        // timestamp.tv_sec (@24) | tv_usec (@32) must be non-zero (monotonic).
+        if m.get_u32(24) | m.get_u32(28) | m.get_u32(32) | m.get_u32(36) == 0 {
+            return TestResult::Fail("DQBUF should carry a monotonic timestamp");
+        }
+        // Buffer consumed → readiness clears.
+        if dev.lock().readiness.mask() & POLL_IN != 0 {
+            return TestResult::Fail("POLL_IN should clear after the last DQBUF");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", deliver_frame_readiness_and_timestamp);
+
+    /// EXT_CTRLS: set/get via the pointed-to control array, with clamping and
+    /// an error_idx on an unknown id.
+    fn ext_ctrls_get_set_clamp() -> TestResult {
+        const BRIGHTNESS: u32 = 0x0098_0900;
+        let dev = fresh("c");
+        let m = Mock::new(true);
+        // The v4l2_ext_control array lives at ARG + 256 (a distinct user ptr).
+        let ctrl_off = 256usize;
+        let ctrl_addr = ARG + ctrl_off as u64;
+        let setup = |which: u32| {
+            m.put_u32(0, which); // which
+            m.put_u32(4, 1); // count
+            m.put_u32(8, 0); // error_idx
+            m.put_u32(12, 0); // request_fd
+            m.put_u32(16, 0); // reserved
+            m.put_u32(24, ctrl_addr as u32); // controls ptr (low)
+            m.put_u32(28, (ctrl_addr >> 32) as u32); // controls ptr (high)
+            m.put_u32(ctrl_off, BRIGHTNESS); // v4l2_ext_control.id
+            m.put_u32(ctrl_off + 4, 0); // size
+            m.put_u32(ctrl_off + 8, 0); // reserved2
+        };
+        // S_EXT_CTRLS brightness = 50 (within [-64,64]).
+        setup(0);
+        m.put_u32(ctrl_off + 12, 50);
+        if ioctl(&dev, &m, ioc(DIR_WR, 72, 32)) != 0 || m.get_i32(ctrl_off + 12) != 50 {
+            return TestResult::Fail("S_EXT_CTRLS should set brightness to 50");
+        }
+        // G_EXT_CTRLS reads it back.
+        setup(0);
+        m.put_u32(ctrl_off + 12, 0);
+        if ioctl(&dev, &m, ioc(DIR_WR, 71, 32)) != 0 || m.get_i32(ctrl_off + 12) != 50 {
+            return TestResult::Fail("G_EXT_CTRLS should return 50");
+        }
+        // S_EXT_CTRLS brightness = 1000 → clamped to max (64).
+        setup(0);
+        m.put_u32(ctrl_off + 12, 1000);
+        if ioctl(&dev, &m, ioc(DIR_WR, 72, 32)) != 0 || m.get_i32(ctrl_off + 12) != 64 {
+            return TestResult::Fail("S_EXT_CTRLS should clamp to 64");
+        }
+        // Unknown id → EINVAL with error_idx = 0.
+        setup(0);
+        m.put_u32(ctrl_off, 0xDEAD_BEEF);
+        if ioctl(&dev, &m, ioc(DIR_WR, 71, 32)) != eno(22) || m.get_u32(8) != 0 {
+            return TestResult::Fail("unknown id should be EINVAL with error_idx 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", ext_ctrls_get_set_clamp);
+
+    /// Subscribe to a control's events, change it, and dequeue the resulting
+    /// V4L2_EVENT_CTRL; the queue then reports ENOENT.
+    fn events_subscribe_ctrl_dqevent() -> TestResult {
+        const BRIGHTNESS: u32 = 0x0098_0900;
+        let dev = fresh("c");
+        let m = Mock::new(true);
+        let events = Arc::new(IrqSafeSpinLock::new(crate::v4l2_ioctl::FdEvents::new()));
+
+        // SUBSCRIBE_EVENT(V4L2_EVENT_CTRL, brightness).
+        m.put_u32(0, 3);
+        m.put_u32(4, BRIGHTNESS);
+        m.put_u32(8, 0);
+        if ioctl_ev(&dev, &m, ioc(DIR_W, 90, 32), &events) != 0 {
+            return TestResult::Fail("SUBSCRIBE_EVENT should succeed");
+        }
+        // Nothing queued yet → DQEVENT is ENOENT.
+        if ioctl_ev(&dev, &m, ioc(DIR_R, 89, 136), &events) != eno(2) {
+            return TestResult::Fail("empty DQEVENT should be ENOENT");
+        }
+        // S_CTRL brightness = 10 emits a control-change event.
+        m.put_u32(0, BRIGHTNESS);
+        m.put_u32(4, 10);
+        if ioctl_ev(&dev, &m, ioc(DIR_WR, 28, 8), &events) != 0 {
+            return TestResult::Fail("S_CTRL should succeed");
+        }
+        if !events.lock().has_events() {
+            return TestResult::Fail("S_CTRL should queue a CTRL event");
+        }
+        // DQEVENT returns it: type@0, changes@8 (payload+0), value@16 (payload+8),
+        // id@96.
+        for off in 0..34 {
+            m.put_u32(off * 4, 0);
+        }
+        if ioctl_ev(&dev, &m, ioc(DIR_R, 89, 136), &events) != 0 {
+            return TestResult::Fail("DQEVENT should return the event");
+        }
+        if m.get_u32(0) != 3 || m.get_u32(96) != BRIGHTNESS {
+            return TestResult::Fail("event type/id mismatch");
+        }
+        if m.get_u32(8) != 1 || m.get_i32(16) != 10 {
+            return TestResult::Fail("event payload should carry CH_VALUE + value 10");
+        }
+        // Drained.
+        if ioctl_ev(&dev, &m, ioc(DIR_R, 89, 136), &events) != eno(2) {
+            return TestResult::Fail("DQEVENT should be ENOENT after draining");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", events_subscribe_ctrl_dqevent);
+
+    /// CROPCAP/G_SELECTION/G_CROP all report the full (uncropped) frame.
+    fn selection_reports_full_frame() -> TestResult {
+        let dev = fresh("c"); // default YUYV 640x480
+        let m = Mock::new(true);
+        // CROPCAP.
+        m.put_u32(0, 1);
+        if ioctl(&dev, &m, ioc(DIR_WR, 58, 44)) != 0 {
+            return TestResult::Fail("CROPCAP should succeed");
+        }
+        if m.get_u32(12) != 640 || m.get_u32(16) != 480 {
+            return TestResult::Fail("CROPCAP bounds should be the full frame");
+        }
+        if m.get_u32(36) != 1 || m.get_u32(40) != 1 {
+            return TestResult::Fail("pixelaspect should be 1:1");
+        }
+        // G_SELECTION target CROP.
+        for off in 0..16 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(0, 1); // type
+        m.put_u32(4, 0); // V4L2_SEL_TGT_CROP
+        if ioctl(&dev, &m, ioc(DIR_WR, 94, 64)) != 0 {
+            return TestResult::Fail("G_SELECTION should succeed");
+        }
+        if m.get_u32(20) != 640 || m.get_u32(24) != 480 {
+            return TestResult::Fail("G_SELECTION r should be the full frame");
+        }
+        // G_CROP.
+        m.put_u32(0, 1);
+        if ioctl(&dev, &m, ioc(DIR_WR, 59, 20)) != 0 {
+            return TestResult::Fail("G_CROP should succeed");
+        }
+        if m.get_u32(12) != 640 || m.get_u32(16) != 480 {
+            return TestResult::Fail("G_CROP c should be the full frame");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", selection_reports_full_frame);
+
+    /// EXPBUF exports a dma-buf fd that mmaps the same physical frame as the
+    /// capture buffer, and blocks a subsequent REQBUFS reuse (EBUSY).
+    fn expbuf_exports_dmabuf() -> TestResult {
+        let dev = fresh("c");
+        let m = Mock::new(true);
+        // One MMAP buffer.
+        m.put_u32(0, 1);
+        m.put_u32(4, 1);
+        m.put_u32(8, 1);
+        ioctl(&dev, &m, ioc(DIR_WR, 8, 20)); // REQBUFS
+                                             // The buffer's first physical frame address.
+        let want = dev.lock().buffers[0].frames[0].start_address().raw();
+        // EXPBUF index 0.
+        for off in 0..16 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(0, 1); // type
+        m.put_u32(4, 0); // index
+        if ioctl(&dev, &m, ioc(DIR_WR, 16, 64)) != 0 {
+            return TestResult::Fail("EXPBUF should succeed");
+        }
+        let fd = m.get_i32(16);
+        if fd < 0 {
+            return TestResult::Fail("EXPBUF should return a valid fd");
+        }
+        // The exported fd mmaps the same frame.
+        let dmabuf = m.installed_file(fd);
+        match dmabuf.mmap_frames(0, 4096) {
+            Ok(frames) if frames.first() == Some(&want) => {}
+            _ => return TestResult::Fail("dma-buf should alias the buffer's frame"),
+        }
+        // REQBUFS reuse is now blocked (frames still referenced).
+        m.put_u32(0, 2);
+        m.put_u32(4, 1);
+        m.put_u32(8, 1);
+        if ioctl(&dev, &m, ioc(DIR_WR, 8, 20)) != eno(16) {
+            return TestResult::Fail("REQBUFS after EXPBUF should be EBUSY");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", expbuf_exports_dmabuf);
+
+    /// USERPTR: QBUF a user address, deliver a frame, and DQBUF copies the
+    /// captured bytes into that address.
+    fn userptr_qbuf_dqbuf_roundtrip() -> TestResult {
+        let dev = fresh("c");
+        let m = Mock::new(true);
+        // REQBUFS 1 USERPTR.
+        m.put_u32(0, 1);
+        m.put_u32(4, 1);
+        m.put_u32(8, 2); // V4L2_MEMORY_USERPTR
+        if ioctl(&dev, &m, ioc(DIR_WR, 8, 20)) != 0 || m.get_u32(0) != 1 {
+            return TestResult::Fail("REQBUFS USERPTR should grant 1");
+        }
+        if m.get_u32(12) & (1 << 1) == 0 {
+            return TestResult::Fail("caps should advertise SUPPORTS_USERPTR");
+        }
+        // QBUF 0 with a user pointer at ARG + 1024, length 64.
+        let uptr = ARG + 1024;
+        for off in 0..22 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(4, 1); // type
+        m.put_u32(60, 2); // memory USERPTR
+        m.put_u32(64, uptr as u32);
+        m.put_u32(68, (uptr >> 32) as u32);
+        m.put_u32(72, 64); // length
+        if ioctl(&dev, &m, ioc(DIR_WR, 15, 88)) != 0 {
+            return TestResult::Fail("QBUF USERPTR should succeed");
+        }
+        // STREAMON, deliver a frame, DQBUF.
+        m.put_u32(0, 1);
+        ioctl(&dev, &m, ioc(DIR_W, 18, 4));
+        dev.lock().deliver_frame(alloc::vec![0x5Au8; 64]);
+        for off in 0..22 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(4, 1);
+        m.put_u32(60, 2);
+        if ioctl(&dev, &m, ioc(DIR_WR, 17, 88)) != 0 {
+            return TestResult::Fail("DQBUF USERPTR should succeed");
+        }
+        if m.get_u32(8) != 64 {
+            return TestResult::Fail("bytesused should be 64");
+        }
+        if m.get_u32(1024) != 0x5A5A_5A5A {
+            return TestResult::Fail("captured bytes should land in the user pointer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", userptr_qbuf_dqbuf_roundtrip);
+
+    /// DMABUF import: export an MMAP buffer from one device and QBUF it (by fd)
+    /// into a second device's DMABUF pool; a delivered frame lands in the shared
+    /// physical frame.
+    fn dmabuf_import_qbuf() -> TestResult {
+        __reset_for_test();
+        let exporter = get_device(register_video("exp")).unwrap();
+        let importer = get_device(register_video("imp")).unwrap();
+        let m = Mock::new(true);
+        // Exporter: REQBUFS MMAP 1, EXPBUF 0 → dma-buf fd.
+        m.put_u32(0, 1);
+        m.put_u32(4, 1);
+        m.put_u32(8, 1);
+        ioctl(&exporter, &m, ioc(DIR_WR, 8, 20));
+        for off in 0..16 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(0, 1);
+        ioctl(&exporter, &m, ioc(DIR_WR, 16, 64)); // EXPBUF index 0
+        let fd = m.get_i32(16);
+        let want = exporter.lock().buffers[0].frames[0].start_address().raw();
+        // Importer: REQBUFS DMABUF 1, QBUF 0 referencing the fd.
+        m.put_u32(0, 1);
+        m.put_u32(4, 1);
+        m.put_u32(8, 4); // V4L2_MEMORY_DMABUF
+        if ioctl(&importer, &m, ioc(DIR_WR, 8, 20)) != 0 {
+            return TestResult::Fail("REQBUFS DMABUF should succeed");
+        }
+        for off in 0..22 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(4, 1);
+        m.put_u32(60, 4); // memory DMABUF
+        m.put_u32(64, fd as u32); // m.fd
+        if ioctl(&importer, &m, ioc(DIR_WR, 15, 88)) != 0 {
+            return TestResult::Fail("QBUF DMABUF should succeed");
+        }
+        // The importer buffer now borrows the exporter's frame.
+        let got = importer.lock().buffers[0].frames.first().copied();
+        if got.map(|f| f.start_address().raw()) != Some(want) {
+            return TestResult::Fail("DMABUF QBUF should import the exporter's frame");
+        }
+        if importer.lock().buffers[0].owns_frames {
+            return TestResult::Fail("imported frames must not be owned");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", dmabuf_import_qbuf);
+
+    /// Multiplanar: QUERYCAP advertises MPLANE, S_FMT/G_FMT negotiate a
+    /// single-plane pix_mp, and QUERYBUF fills the plane array.
+    fn mplane_format_and_querybuf() -> TestResult {
+        const MPLANE: u32 = 9;
+        const YUYV: u32 =
+            (b'Y' as u32) | ((b'U' as u32) << 8) | ((b'Y' as u32) << 16) | ((b'V' as u32) << 24);
+        let dev = fresh("c"); // YUYV 640x480
+        let m = Mock::new(true);
+        // QUERYCAP advertises the MPLANE capability.
+        if ioctl(&dev, &m, ioc(DIR_R, 0, 104)) != 0 || m.get_u32(84) & 0x1000 == 0 {
+            return TestResult::Fail("QUERYCAP should advertise CAPTURE_MPLANE");
+        }
+        // S_FMT MPLANE YUYV 640x480.
+        for off in 0..52 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(0, MPLANE);
+        m.put_u32(8, 640);
+        m.put_u32(12, 480);
+        m.put_u32(16, YUYV);
+        if ioctl(&dev, &m, ioc(DIR_WR, 5, 208)) != 0 {
+            return TestResult::Fail("S_FMT MPLANE should succeed");
+        }
+        if m.get_u32(188) & 0xff != 1 {
+            return TestResult::Fail("num_planes should be 1");
+        }
+        if m.get_u32(28) != 640 * 480 * 2 {
+            return TestResult::Fail("plane_fmt[0].sizeimage mismatch");
+        }
+        // REQBUFS MPLANE MMAP 1.
+        for off in 0..5 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(0, 1);
+        m.put_u32(4, MPLANE);
+        m.put_u32(8, 1);
+        if ioctl(&dev, &m, ioc(DIR_WR, 8, 20)) != 0 || m.get_u32(0) != 1 {
+            return TestResult::Fail("REQBUFS MPLANE should grant 1");
+        }
+        // QUERYBUF MPLANE with a plane array at ARG + 512.
+        let planes = ARG + 512;
+        for off in 0..22 {
+            m.put_u32(off * 4, 0);
+        }
+        m.put_u32(4, MPLANE);
+        m.put_u32(64, planes as u32);
+        m.put_u32(68, (planes >> 32) as u32);
+        if ioctl(&dev, &m, ioc(DIR_WR, 9, 88)) != 0 {
+            return TestResult::Fail("QUERYBUF MPLANE should succeed");
+        }
+        if m.get_u32(512 + 4) != 640 * 480 * 2 {
+            return TestResult::Fail("plane[0].length mismatch");
+        }
+        if m.get_u32(512 + 8) != 0 {
+            return TestResult::Fail("plane[0].m.mem_offset should be buffer 0");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/video/v4l2", mplane_format_and_querybuf);
 }

@@ -764,7 +764,18 @@ pub async fn try_bind_video_already_addressed(
     }
     let streaming_endpoints = find_video_streaming_endpoints(cfg);
     let vs_iface = find_video_streaming_interface(cfg).ok_or(UvcError::NoStreamingEndpoint)?;
-    let video_node = narf_drivers_video::devfs_bridge::register_video("USB Video Device");
+    // Advertise the camera's real formats/resolutions by parsing its
+    // VideoStreaming class-specific descriptors; fall back to the default table
+    // (inside register_video_with_formats) if the probe or parse yields nothing.
+    let formats = narf_drivers_video::uvc::probe_uvc(cfg)
+        .ok()
+        .map(|p| {
+            narf_drivers_video::uvc::parse_streaming_descriptors(&p.vs_cs_blob).unwrap_or_default()
+        })
+        .map(|f| narf_drivers_video::v4l2_ioctl::uvc_to_v4l2_formats(&f))
+        .unwrap_or_default();
+    let video_node =
+        narf_drivers_video::devfs_bridge::register_video_with_formats("USB Video Device", formats);
     let mut g = UVC_DEVICES.lock();
     let idx = g.len();
     g.push(UvcDevice {
@@ -1103,7 +1114,7 @@ async fn pump_video_frames(idx: usize) -> Result<(), UvcError> {
                     let frame = reassembler.take_frame();
                     let device = narf_drivers_video::devfs_bridge::get_device(video_node)
                         .ok_or(UvcError::CaptureFailed)?;
-                    device.lock().push_frame(frame);
+                    device.lock().deliver_frame(frame);
                 }
             }
             Ok(_) => narf_scheduler::yield_now().await,
