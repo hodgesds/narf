@@ -560,6 +560,11 @@ pub struct ThreadStat {
     pub comm: String,
     pub utime_ticks: u64,
     pub stime_ticks: u64,
+    /// `fs/proc/array.c::task_state_array` letter for THIS thread. A stop is
+    /// per-thread in Linux — a ptrace-stop above all, since a tracer stops one
+    /// tid at a time — so a per-thread `stat` that borrowed the process's
+    /// letter reported a parked thread as running.
+    pub state: char,
 }
 type ThreadStatFn = fn(u64) -> Option<ThreadStat>;
 
@@ -3063,9 +3068,14 @@ fn render_status(info: &ProcTaskInfo) -> String {
         format_args!(
             "State:\t{} ({})\n",
             info.state,
+            // `fs/proc/array.c::task_state_array` spells each one out, and
+            // `/proc/<pid>/status` is where a human looks first.
             match info.state {
                 'R' => "running",
                 'S' => "sleeping",
+                'D' => "disk sleep",
+                'T' => "stopped",
+                't' => "tracing stop",
                 'Z' => "zombie",
                 _ => "unknown",
             },

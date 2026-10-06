@@ -66,6 +66,16 @@ pub const NT_PRSTATUS: u64 = 1;
 /// SIGTRAP.
 pub const PTRACE_O_TRACESYSGOOD: u64 = 1;
 
+/// PTRACE_O_TRACEEXEC: report a successful execve as a PTRACE_EVENT_EXEC stop
+/// instead of the legacy SIGTRAP. The two are not interchangeable and they do
+/// not even arrive at the same point — see [`ptrace_report_exec`].
+pub const PTRACE_O_TRACEEXEC: u64 = 0x10;
+
+/// `PTRACE_EVENT_EXEC`, as it appears in a wait status: the stop signal is
+/// `SIGTRAP | (PTRACE_EVENT_EXEC << 8)`, so a tracer reads the event back as
+/// `status >> 16`.
+pub const PTRACE_EVENT_EXEC: u32 = 4;
+
 /// The set of PTRACE_SETOPTIONS bits Linux will accept, from
 /// `include/uapi/linux/ptrace.h`:
 ///
@@ -193,6 +203,25 @@ pub struct PtraceRegistry {
     /// ENTRY-stop, so the matching EXIT-stop reports the syscall number
     /// (state.rax holds the return value by then, not the number).
     pub orig_rax: BTreeMap<u64, u64>,
+    /// Maps tracee Process ID -> the `rax` a tracer must observe at the
+    /// CURRENT syscall-stop, which is not the `rax` the tracee resumes with.
+    ///
+    /// Linux stamps the two stops differently
+    /// (`arch/x86/entry/entry_64.S`):
+    ///
+    /// ```text
+    /// pushq   %rax                    /* pt_regs->orig_ax */
+    /// PUSH_AND_CLEAR_REGS rax=$-ENOSYS
+    /// ```
+    ///
+    /// so an entry-stop shows -ENOSYS and only the exit-stop shows the result.
+    /// Neither value can ride in the TRACEE's saved state: at entry it must
+    /// keep the syscall number so a resumed dispatch still works, and at exit
+    /// the folded result is not in the snapshot yet (the asm stores it after
+    /// the dispatcher returns). Set only by the syscall-stop path and cleared
+    /// by a signal-stop and by every resume, so a tracer never reads a stale
+    /// one.
+    pub stop_rax: BTreeMap<u64, u64>,
 }
 
 pub static PTRACE_STATE: IrqSafeSpinLock<Option<PtraceRegistry>> = IrqSafeSpinLock::new(None);
@@ -245,6 +274,7 @@ pub(crate) fn release_process(pid: u64) {
         r.syscall_stop.remove(&pid);
         r.options.remove(&pid);
         r.orig_rax.remove(&pid);
+        r.stop_rax.remove(&pid);
 
         let tracees: alloc::vec::Vec<u64> = r
             .tracers
@@ -259,6 +289,7 @@ pub(crate) fn release_process(pid: u64) {
             r.syscall_stop.remove(tracee);
             r.options.remove(tracee);
             r.orig_rax.remove(tracee);
+            r.stop_rax.remove(tracee);
         }
         let removed = tracees_before - r.tracers.len();
         if removed != 0 {
@@ -456,6 +487,31 @@ fn pinned_orig_rax(pid: u64) -> Option<u64> {
     g.as_ref().and_then(|r| r.orig_rax.get(&pid).copied())
 }
 
+/// Record the `rax` a tracer must see at the syscall-stop `pid` is entering.
+/// See [`PtraceRegistry::stop_rax`].
+fn pin_stop_rax(pid: u64, rax: u64) {
+    let mut g = PTRACE_STATE.lock();
+    if let Some(r) = g.as_mut() {
+        r.stop_rax.insert(pid, rax);
+    }
+}
+
+/// Drop the syscall-stop `rax` pin. A SIGNAL-stop reports the tracee's real
+/// registers, so a pin left over from an earlier syscall-stop must not leak
+/// into it.
+fn clear_stop_rax(pid: u64) {
+    let mut g = PTRACE_STATE.lock();
+    if let Some(r) = g.as_mut() {
+        r.stop_rax.remove(&pid);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pinned_stop_rax(pid: u64) -> Option<u64> {
+    let g = PTRACE_STATE.lock();
+    g.as_ref().and_then(|r| r.stop_rax.get(&pid).copied())
+}
+
 /// Syscall-entry/exit stop hook. Called from the live musl syscall
 /// dispatch (`kernel_syscall_entry_plain_with_state`) around the actual
 /// syscall body. `at_entry` selects the entry-stop (before the syscall
@@ -491,6 +547,15 @@ fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_ra
         }
         // Remember the syscall number so the exit-stop can report it.
         save_orig_rax(pid, orig_rax);
+        // `entry_64.S` pushes the user's rax into `orig_ax` and then presets
+        // `ax` to -ENOSYS, so a tracer at an entry-stop sees -ENOSYS and only
+        // the exit-stop carries a result. That is not cosmetic: an ATTACHING
+        // tracer cannot know whether the first syscall-stop it sees is an entry
+        // or an exit, and -ENOSYS in rax is how it tells. Reporting the syscall
+        // NUMBER here instead made strace pair the stops off by one and print
+        // the number where the return value belongs — a traced `ppoll` read
+        // `= 271`, which is `__NR_ppoll`.
+        pin_stop_rax(pid, wire::ENOSYS as u64);
         // Advance to the exit phase; PTRACE_SYSCALL from the tracer
         // re-arms whichever phase comes next when it resumes us.
         set_syscall_stop_phase(pid, SyscallStopPhase::Exit);
@@ -499,9 +564,18 @@ fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_ra
             return;
         }
         // Pin the syscall number so the tracer's GETREGS at the exit-stop
-        // reports orig_rax as the nr (state.rax now holds the return value).
+        // reports orig_rax as the nr.
         // Cleared by the resume path (PTRACE_SYSCALL/CONT).
         save_orig_rax(pid, orig_rax);
+        // And pin the RESULT for the tracer's rax. It cannot be read out of the
+        // saved user state: the exit asm folds the dispatcher's return into the
+        // snapshot's rax slot only AFTER the dispatcher returns, so while we
+        // stand inside the dispatch that state still holds the ENTRY register
+        // file — rax = the syscall number. `pending_return` is what userspace is
+        // about to receive, folded exactly as the asm folds it.
+        if let Some(ret) = ctx.pending_return() {
+            pin_stop_rax(pid, ret.user_rax());
+        }
         // Consumed on this exit stop.
         set_syscall_stop_phase(pid, SyscallStopPhase::None);
     }
@@ -555,8 +629,20 @@ pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
             return false;
         }
 
-        // Clear the pending bit so we don't process it again (it's intercepted)
+        // Dequeue the signal so it is not processed again — from BOTH sets,
+        // the way `dequeue_signal` does, because a signal sent to the PROCESS
+        // lives in the thread group's shared set and not in this thread's
+        // private one. Clearing only the private bit left a process-directed
+        // signal pending forever: it was re-delivered at every signal-delivery
+        // point, so a tracer stepping a tracee saw a signal-stop for it after
+        // every single syscall. `kill(getpid(), SIGSTOP)` is the ordinary way
+        // to raise one — it is how strace's own startup handshake works — so
+        // this hit the most common case there is.
         clear_pending_signal_bits(task, crate::handlers::sig_bit(signum));
+        clear_pending_signal_bits(
+            crate::handlers::shared_pending_key(task),
+            crate::handlers::sig_bit(signum),
+        );
 
         let tracer_tid = pid_to_tid(tracer_pid);
         // Put the task into ptrace stop!
@@ -567,7 +653,69 @@ pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
     }
 }
 
+/// Report a successful `execve` to the tracer, in the order Linux reports it.
+///
+/// There are TWO reports here, not one, and which comes first depends on
+/// `PTRACE_O_TRACEEXEC`. Measured on Linux 7.3 with a tracer stepping
+/// `PTRACE_SYSCALL` across `execve("/bin/true")` (`fedora-ptrace-probe.py`,
+/// case `execseq-*`), where `sys:N` is a syscall-stop for syscall N:
+///
+/// ```text
+/// without TRACEEXEC:  sys:59, sys:59, sig:5,  <new image's syscalls>
+/// with    TRACEEXEC:  sys:59, ev:4,   sys:59, <new image's syscalls>
+/// ```
+///
+/// So the execve syscall-EXIT stop happens either way — it is what prints
+/// `execve(...) = 0` — and the exec report is an event stop BEFORE it, or a
+/// SIGTRAP AFTER it. The difference in position is not arbitrary:
+/// `ptrace_event(PTRACE_EVENT_EXEC)` stops inside `begin_new_exec`, while the
+/// legacy `send_sig(SIGTRAP, current, 0)` merely queues a signal that is
+/// delivered later, in the exit-to-user loop that runs after the syscall-exit
+/// work.
+///
+/// NARF emitted only the first stop of either sequence: the exec path DIVERGES
+/// into the new image instead of returning through the syscall exit, so no
+/// exit stop was ever taken, and no exec report was sent at all. A tracer was
+/// left waiting for a stop that never came — `strace <cmd>` hung with its
+/// trace ending at the startup `--- stopped by SIGSTOP ---`.
+///
+/// Both halves must land together. Sending only the SIGTRAP was measured too:
+/// strace, still waiting for the exit stop, took the report for an ordinary
+/// signal and injected it, killing `/bin/true` with SIGTRAP. Half of this
+/// contract is worse than none of it.
+///
+/// Called after the point of no return and before the jump into the new image,
+/// which is where Linux's reports sit relative to the exec. Each stop parks
+/// and returns here when the tracer resumes, so the jump still happens.
+pub fn ptrace_report_exec(ctx: &mut dyn TrapContext) {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let task = current_task_id();
+    let pid = tid_to_pid(task);
+    let Some(tracer_pid) = get_task_tracer(pid) else {
+        return;
+    };
+    let tracer_tid = pid_to_tid(tracer_pid);
+    let trace_exec = ptrace_options(pid) & PTRACE_O_TRACEEXEC != 0;
+
+    const SIGTRAP: u32 = 5;
+    if trace_exec {
+        enter_ptrace_stopped(ctx, task, tracer_tid, SIGTRAP | (PTRACE_EVENT_EXEC << 8));
+    }
+    // The exec succeeded, so the syscall-exit stop must report 0 — the value
+    // userspace would have seen had this syscall returned normally.
+    ctx.set_return(SyscallReturn::ok(0));
+    ptrace_syscall_stop(ctx, false, u64::from(crate::syscall::Syscall::Execve.raw()));
+    if !trace_exec {
+        enter_ptrace_stopped(ctx, task, tracer_tid, SIGTRAP);
+    }
+}
+
 pub fn enter_ptrace_stopped(ctx: &mut dyn TrapContext, task: u64, tracer: u64, signum: u32) {
+    // A signal-stop reports the tracee's real registers, so drop any pin left
+    // by an earlier syscall-stop rather than letting it answer for them.
+    clear_stop_rax(tid_to_pid(task));
     enter_ptrace_stopped_inner(ctx, task, tracer, signum, None);
 }
 
@@ -591,15 +739,31 @@ fn enter_ptrace_stopped_inner(
             r.stop_signal.insert(pid, signum);
         }
     }
+    // Arm the park deadline BEFORE publishing the report. The report is what
+    // lets the tracer resume us, and a resume zeroes this field (see
+    // PTRACE_CONT/SYSCALL) — so setting it first means a resume that beats us
+    // to the park leaves a zeroed deadline behind, and `park_should_block`
+    // declines to block instead of stranding the tracee on u64::MAX. Setting it
+    // afterwards would overwrite the resume's clear and lose the wake.
+    //
+    // Gated on the YIELD HOOK as well as the task ctx, which is the same pair
+    // the park below requires: with no executor wired (the kernel-test
+    // context) this function returns WITHOUT parking, and arming a deadline
+    // that nothing will ever consume leaves the harness task asleep-forever
+    // from the next test onward.
+    let parking = crate::user_task::current_user_task().zip(crate::user_task::yield_hook());
+    if let Some((uctx, _)) = parking {
+        // SAFETY: uctx is the current task's live ctx; this is an atomic store.
+        unsafe {
+            (*uctx).sleep_deadline_ns.store(u64::MAX, Ordering::Release);
+        }
+    }
     // Notify tracer via push_stopcont_report
     // Linux wstatus for stopped tracee: (signum << 8) | 0x7f
     let wstatus = ((signum as i32) << 8) | 0x7f;
     push_stopcont_report(task, wstatus, false);
 
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
+    if let Some((uctx, hook)) = parking {
         // SAFETY: uctx is current task, yield hook never returns
         unsafe {
             let uc = &*uctx;
@@ -623,6 +787,8 @@ fn get_tracee_regs(pid: u64) -> Option<user_regs_struct> {
     // pin (entry-stop / signal-stop) orig_rax == the current rax.
     #[cfg(target_arch = "x86_64")]
     let orig_rax_pin = pinned_orig_rax(pid);
+    #[cfg(target_arch = "x86_64")]
+    let stop_rax_pin = pinned_stop_rax(pid);
     crate::user_task::with_user_task_ctx(tid, |uctx| {
         // SAFETY: tracee is registered and stopped, so its state pointer is valid and stable.
         let state = unsafe { *uctx.state.get() };
@@ -631,6 +797,10 @@ fn get_tracee_regs(pid: u64) -> Option<user_regs_struct> {
         {
             let fs_base = uctx.pending_fs_base.load(Ordering::Acquire);
             let orig_rax = orig_rax_pin.unwrap_or(state.rax);
+            // At a syscall-stop the tracer's `rax` comes from the pin, not the
+            // saved state: see `PtraceRegistry::stop_rax`. A signal-stop has no
+            // pin and reports the tracee's real register.
+            let rax = stop_rax_pin.unwrap_or(state.rax);
             user_regs_struct {
                 r15: state.r15,
                 r14: state.r14,
@@ -642,7 +812,7 @@ fn get_tracee_regs(pid: u64) -> Option<user_regs_struct> {
                 r10: state.r10,
                 r9: state.r9,
                 r8: state.r8,
-                rax: state.rax,
+                rax,
                 rcx: state.rcx,
                 rdx: state.rdx,
                 rsi: state.rsi,
@@ -935,6 +1105,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 r.syscall_stop.remove(&pid);
                 r.options.remove(&pid);
                 r.orig_rax.remove(&pid);
+                r.stop_rax.remove(&pid);
             }
             let tid = pid_to_tid(pid);
             crate::handlers::wake_signal(tid);
@@ -1116,6 +1287,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // orig_rax was there only for the tracer's GETREGS while
                     // stopped, so drop it now (state.rax resumes as truth).
                     r.orig_rax.remove(&pid);
+                    r.stop_rax.remove(&pid);
                     // PTRACE_SYSCALL arms a stop at the next syscall boundary.
                     // The syscall-stop hook (ptrace_syscall_stop) toggles this
                     // Entry → Exit → None; whichever phase is pending now is
@@ -1148,6 +1320,16 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 set_ptrace_signal_bypass(pid, data as u32);
                 raise_signal_pending(tid, data as u32);
             }
+            // Clear the tracee's infinite park deadline as well as waking it.
+            // `wake_signal` alone is a nudge: if the tracee has not reached its
+            // park loop yet there is no waker registered to receive it, and it
+            // would then park on the u64::MAX deadline the stop armed with
+            // nobody left to wake it. Zeroing the deadline makes the resume
+            // durable — `park_should_block` sees a park with no deadline and
+            // declines to block.
+            crate::user_task::with_user_task_ctx(tid, |uc| {
+                uc.sleep_deadline_ns.store(0, Ordering::Release);
+            });
             crate::handlers::wake_signal(tid);
             ctx.set_return(SyscallReturn::ok(0));
         }
@@ -1439,6 +1621,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     r.stop_signal.remove(&pid);
                     r.syscall_stop.remove(&pid);
                     r.orig_rax.remove(&pid);
+                    r.stop_rax.remove(&pid);
                 }
             }
             raise_signal_pending(tid, 9); // SIGKILL
