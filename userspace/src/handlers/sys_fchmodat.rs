@@ -78,8 +78,25 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
             return;
         }
     };
-    let path = resolve_cwd_path(task, &effective);
-    let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let mut path = resolve_cwd_path(task, &effective);
+    let mut follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+    // A followed `/proc/self/fd/N` changes the descriptor's own file
+    // (`nd_jump_link`), which the walk below cannot reach: it would take
+    // the procfs link's text literally. systemd's `fchmod_opath` falls back
+    // to `chmod("/proc/self/fd/N")` on kernels without fchmodat2.
+    if follow_final {
+        match proc_fd_jump(task, &resolve_cwd_path_user(task, &effective)) {
+            Some(ProcFdJump::Own(fd)) => {
+                fchmod_fd(ctx, fd, args.arg2, true);
+                return;
+            }
+            Some(ProcFdJump::Path(target)) => {
+                path = resolve_cwd_path(task, &target);
+                follow_final = false;
+            }
+            None => {}
+        }
+    }
 
     // `do_fchmodat`: `user_path_at` first, so a missing name is ENOENT
     // (ENOTDIR for a file used as a directory) even on a read-only mount;

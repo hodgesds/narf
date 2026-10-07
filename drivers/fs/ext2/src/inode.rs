@@ -121,8 +121,9 @@ pub struct Inode {
     pub mode: u16,
     /// POSIX owner id (`i_uid` plus Linux `l_i_uid_high`).
     pub uid: u32,
-    /// `i_size` — file size, low 32 bits.
-    pub size: u32,
+    /// `i_size_lo | i_size_high << 32` (`ext4_isize`). Byte 108 is ext2's
+    /// `i_dir_acl`, which ext4 reuses as `i_size_high` for every inode.
+    pub size: u64,
     /// `i_atime` — last access time (seconds since UNIX epoch).
     pub atime: u32,
     /// `i_ctime` — inode-change time (any metadata mutation).
@@ -175,7 +176,8 @@ impl Inode {
         let mode = u16::from_le_bytes([buf[0], buf[1]]);
         let uid = u16::from_le_bytes([buf[2], buf[3]]) as u32
             | ((u16::from_le_bytes([buf[120], buf[121]]) as u32) << 16);
-        let size = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let size = u64::from(u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]))
+            | (u64::from(u32::from_le_bytes([buf[108], buf[109], buf[110], buf[111]])) << 32);
         let atime = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let ctime = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
         let mtime = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
@@ -294,7 +296,10 @@ impl Inode {
         }
         buf[0..2].copy_from_slice(&self.mode.to_le_bytes());
         buf[2..4].copy_from_slice(&(self.uid as u16).to_le_bytes());
-        buf[4..8].copy_from_slice(&self.size.to_le_bytes());
+        // `ext4_isize_set`: both halves, so a file past 4 GiB keeps its size
+        // and a shrink below it clears the stale high half.
+        buf[4..8].copy_from_slice(&(self.size as u32).to_le_bytes());
+        buf[108..112].copy_from_slice(&((self.size >> 32) as u32).to_le_bytes());
         buf[8..12].copy_from_slice(&self.atime.to_le_bytes());
         buf[12..16].copy_from_slice(&self.ctime.to_le_bytes());
         buf[16..20].copy_from_slice(&self.mtime.to_le_bytes());

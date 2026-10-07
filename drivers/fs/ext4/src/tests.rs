@@ -728,7 +728,7 @@ fn smoke_ext4_inode_size_64bit_assembly() -> TestResult {
     };
     let expected: u64 = (0xABCD_0001u64 << 32) | 0x1234_5678u64;
     if ei.size64() != expected {
-        return TestResult::Fail("size64() must combine size + size_hi");
+        return TestResult::Fail("size64() must combine i_size and i_size_high");
     }
     TestResult::Pass
 }

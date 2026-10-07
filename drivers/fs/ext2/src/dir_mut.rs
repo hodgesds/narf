@@ -323,7 +323,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.write_directory_block(parent_inode_no, parent_inode, phys, &mut blockbuf)
             .await?;
         // Update parent inode bookkeeping.
-        parent_inode.size += bs as u32;
+        parent_inode.size += bs as u64;
         // i_blocks is in 512-byte sectors.
         parent_inode.blocks = parent_inode.blocks.saturating_add(bs as u32 / 512);
         self.write_inode(parent_inode_no, parent_inode).await
@@ -425,7 +425,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         // Allocate inode + initialise with timestamps.
         let new_ino = self.alloc_inode().await?;
         let mut new_inode = Inode::new_regular(mode);
-        self.init_new_file_extents(&mut new_inode);
+        self.init_extent_root(&mut new_inode);
         new_inode.uid = uid;
         new_inode.gid = gid;
         new_inode.atime = now;
@@ -478,17 +478,25 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut new_inode = Inode::new_directory(mode);
         new_inode.atime = now;
         new_inode.touch_ctime_mtime(now);
-        // Allocate the first data block to hold "." and "..".
-        let data_block = match self.alloc_block().await {
+        // Allocate the first data block to hold "." and "..": through an
+        // extent tree on an ext4 volume (`ext4_new_inode` gives directories
+        // one), otherwise as the block map's first direct pointer.
+        let first_block = if self.init_extent_root(&mut new_inode) {
+            self.map_block_alloc(new_ino, &mut new_inode, 0).await
+        } else {
+            self.alloc_block().await.inspect(|&b| {
+                new_inode.block[0] = b as u32;
+                new_inode.blocks = bs as u32 / 512;
+            })
+        };
+        let data_block = match first_block {
             Ok(b) => b,
             Err(e) => {
                 let _ = self.abort_inode_allocation(new_ino).await;
                 return Err(e);
             }
         };
-        new_inode.block[0] = data_block as u32;
-        new_inode.size = bs as u32;
-        new_inode.blocks = bs as u32 / 512;
+        new_inode.size = bs as u64;
         // Write "." + ".." into the data block.
         let mut blockbuf = vec![0u8; bs];
         splice::make_empty_dir(&mut blockbuf, new_ino, parent_inode_no);
@@ -847,7 +855,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut new_inode = Inode::new_symlink(0o777);
         new_inode.atime = now;
         new_inode.touch_ctime_mtime(now);
-        new_inode.size = target.len() as u32;
+        new_inode.size = target.len() as u64;
+        // The data block of a slow symlink, for rollback.
+        let mut slow_block: Option<u64> = None;
 
         if target.len() <= 60 {
             // Fast symlink — pack target bytes into block[].
@@ -870,7 +880,17 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 let _ = self.abort_inode_allocation(new_ino).await;
                 return Err(FsError::InvalidPath);
             }
-            let data_block = match self.alloc_block().await {
+            // `ext4_symlink`: a slow symlink is extent-mapped on an ext4
+            // volume, block-mapped otherwise.
+            let first_block = if self.init_extent_root(&mut new_inode) {
+                self.map_block_alloc(new_ino, &mut new_inode, 0).await
+            } else {
+                self.alloc_block().await.inspect(|&b| {
+                    new_inode.block[0] = b as u32;
+                    new_inode.blocks = bs as u32 / 512;
+                })
+            };
+            let data_block = match first_block {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = self.abort_inode_allocation(new_ino).await;
@@ -884,12 +904,11 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 let _ = self.abort_inode_allocation(new_ino).await;
                 return Err(error);
             }
-            new_inode.block[0] = data_block as u32;
-            new_inode.blocks = bs as u32 / 512;
+            slow_block = Some(data_block);
         }
         if let Err(error) = self.write_new_inode(new_ino, &new_inode).await {
-            if new_inode.blocks != 0 {
-                let _ = self.free_block(new_inode.block[0] as u64).await;
+            if let Some(block) = slow_block {
+                let _ = self.free_block(block).await;
             }
             let _ = self.abort_inode_allocation(new_ino).await;
             return Err(error);
@@ -939,9 +958,14 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             }
             return Ok(bytes[..len].to_vec());
         }
-        // Slow — single data block.
+        // Slow — single data block, found through the inode's mapping: an
+        // ext4 slow symlink is extent-mapped, so `i_block[0]` holds the
+        // extent header, not a block number (`ext4_get_link` reads logical
+        // block 0 through `ext4_bread`). Reading it as a pointer returned
+        // garbage for every link target longer than 60 bytes on a
+        // Linux-made ext4 volume.
         let bs = self.block_size();
-        let phys = inode.block[0] as u64;
+        let phys = self.map_block(inode, 0).await?;
         if phys == 0 {
             return Ok(Vec::new());
         }

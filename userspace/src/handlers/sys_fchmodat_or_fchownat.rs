@@ -72,8 +72,23 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let path = resolve_cwd_path(task, &effective);
-    let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let mut path = resolve_cwd_path(task, &effective);
+    let mut follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
+    // A followed `/proc/self/fd/N` changes the descriptor's own file
+    // (`nd_jump_link`); see `fchmodat_common`.
+    if follow_final {
+        match proc_fd_jump(task, &resolve_cwd_path_user(task, &effective)) {
+            Some(ProcFdJump::Own(fd)) => {
+                fchown_fd(ctx, fd, requested_uid, requested_gid, true);
+                return;
+            }
+            Some(ProcFdJump::Path(target)) => {
+                path = resolve_cwd_path(task, &target);
+                follow_final = false;
+            }
+            None => {}
+        }
+    }
 
     // `do_fchownat`: `user_path_at` first (ENOENT / ENOTDIR), then
     // `mnt_want_write` (EROFS), then `chown_common` -> `notify_change`.
