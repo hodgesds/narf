@@ -134,6 +134,8 @@ pub struct DriCardFile {
     /// for the same reason handles are per-file: one client's GPU addresses
     /// must not resolve in another's page tables.
     amdgpu_vm: crate::amdgpu_vm::VmState,
+    /// Per-open submission contexts (`fpriv->ctx_mgr`).
+    amdgpu_ctx: crate::amdgpu_ctx::CtxState,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
     /// Per-open flip-complete queue. The event's opaque `user_data` belongs to
@@ -179,6 +181,7 @@ impl DriCardFile {
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
             amdgpu_gem: crate::amdgpu_gem::GemState::new(),
             amdgpu_vm: crate::amdgpu_vm::VmState::new(),
+            amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
             pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
@@ -407,6 +410,17 @@ impl FileOps for DriCardFile {
                 result => return result,
             }
             match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_ctx::dispatch(
+                cmd,
+                arg,
+                &self.amdgpu_ctx,
+                // `drm_is_current_master(filp)`: whether THIS open holds it.
+                crate::drm_registry::mode_state(self.index)
+                    .is_some_and(|m| m.lock().is_master(self.open_id)),
+            ) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
@@ -754,6 +768,8 @@ pub struct DriRenderFile {
     /// for the same reason handles are per-file: one client's GPU addresses
     /// must not resolve in another's page tables.
     amdgpu_vm: crate::amdgpu_vm::VmState,
+    /// Per-open submission contexts (`fpriv->ctx_mgr`).
+    amdgpu_ctx: crate::amdgpu_ctx::CtxState,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
 }
@@ -868,6 +884,17 @@ impl FileOps for DriRenderFile {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
+            match crate::amdgpu_ctx::dispatch(
+                cmd,
+                arg,
+                &self.amdgpu_ctx,
+                // A render node never holds DRM master, so a client here needs
+                // CAP_SYS_NICE for an above-normal priority.
+                false,
+            ) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
             match crate::amdgpu_info::dispatch(cmd, arg) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
@@ -977,6 +1004,7 @@ impl DirOps for DriDir {
                             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
                             amdgpu_gem: crate::amdgpu_gem::GemState::new(),
                             amdgpu_vm: crate::amdgpu_vm::VmState::new(),
+                            amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
                         }));
                     }

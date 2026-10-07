@@ -127,6 +127,7 @@ pub mod amdgpu_atombios;
 pub mod amdgpu_backlight;
 pub mod amdgpu_compute;
 pub mod amdgpu_cp_fw;
+pub mod amdgpu_ctx;
 pub mod amdgpu_dc;
 pub mod amdgpu_dccg;
 pub mod amdgpu_dcn;

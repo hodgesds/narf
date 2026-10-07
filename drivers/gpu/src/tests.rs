@@ -7957,3 +7957,214 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_page_tables_are_walkable
 );
+
+/// `AMDGPU_CTX`, including the capability that gates an above-normal priority.
+///
+/// Mesa allocates a context per GL/Vulkan context and names it on every
+/// submission, so this is the last ioctl between opening the device and
+/// submitting work. The interesting part is the priority gate: NORMAL and
+/// below are open to everyone, above needs CAP_SYS_NICE or DRM master, and
+/// garbage in the field is DELIBERATELY not an error.
+fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
+    use crate::amdgpu_ctx::{dispatch, CtxState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+
+    let state = CtxState::new();
+    let ctx_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX;
+    let call = |op: u32, flags: u32, id: u32, priority: i32, master: bool| {
+        let mut r = [0u8; 24];
+        r[0..4].copy_from_slice(&op.to_le_bytes());
+        r[4..8].copy_from_slice(&flags.to_le_bytes());
+        r[8..12].copy_from_slice(&id.to_le_bytes());
+        r[12..16].copy_from_slice(&priority.to_le_bytes());
+        let rc = dispatch(ctx_cmd, r.as_mut_ptr() as usize, &state, master);
+        (rc, u32::from_le_bytes(r[0..4].try_into().unwrap()))
+    };
+
+    // ── alloc at NORMAL, which anyone may do ──
+    let (rc, id) = call(
+        u::AMDGPU_CTX_OP_ALLOC_CTX,
+        0,
+        0,
+        u::AMDGPU_CTX_PRIORITY_NORMAL,
+        false,
+    );
+    if rc.is_err() {
+        return TestResult::Fail("ALLOC_CTX at NORMAL priority failed");
+    }
+    if id == 0 {
+        return TestResult::Fail("context ids start at 1 so a zeroed field names nothing");
+    }
+    match state.get(id) {
+        Some(c) if c.priority == u::AMDGPU_CTX_PRIORITY_NORMAL => {}
+        _ => return TestResult::Fail("the context did not record its priority"),
+    }
+
+    // ── garbage priority is NOT an error ──
+    // Linux: "For backwards compatibility, we need to accept ioctls with
+    // garbage in the priority field", and such a request becomes NORMAL.
+    // Refusing it would break clients that never initialised the field.
+    for bogus in [u::AMDGPU_CTX_PRIORITY_UNSET, 12345, -7] {
+        let (rc, gid) = call(u::AMDGPU_CTX_OP_ALLOC_CTX, 0, 0, bogus, false);
+        if rc.is_err() {
+            return TestResult::Fail("a garbage priority must be accepted, not refused");
+        }
+        match state.get(gid) {
+            Some(c) if c.priority == u::AMDGPU_CTX_PRIORITY_NORMAL => {}
+            _ => return TestResult::Fail("a garbage priority should become NORMAL"),
+        }
+        let _ = call(u::AMDGPU_CTX_OP_FREE_CTX, 0, gid, 0, false);
+    }
+
+    // ── the priority gate ──
+    // The harness task holds the full boot capability set, so without this
+    // the unprivileged branch would never be reached and the gate would look
+    // like it worked while refusing nobody.
+    let saved = narf_filesystem::__test_swap_caller_capable_hook(Some(|_| false));
+
+    // No CAP_SYS_NICE and not master: refused.
+    for high in [
+        u::AMDGPU_CTX_PRIORITY_HIGH,
+        u::AMDGPU_CTX_PRIORITY_VERY_HIGH,
+    ] {
+        if !matches!(
+            call(u::AMDGPU_CTX_OP_ALLOC_CTX, 0, 0, high, false).0,
+            Err(FsError::PermissionDenied)
+        ) {
+            return TestResult::Fail("an above-normal priority needs CAP_SYS_NICE or master");
+        }
+    }
+    // Below NORMAL is open to everyone — a client may always deprioritise
+    // itself, and refusing that would be nonsense.
+    for low in [u::AMDGPU_CTX_PRIORITY_LOW, u::AMDGPU_CTX_PRIORITY_VERY_LOW] {
+        let (rc, lid) = call(u::AMDGPU_CTX_OP_ALLOC_CTX, 0, 0, low, false);
+        if rc.is_err() {
+            return TestResult::Fail("a below-normal priority should need no privilege");
+        }
+        let _ = call(u::AMDGPU_CTX_OP_FREE_CTX, 0, lid, 0, false);
+    }
+    // DRM master is the second arm: a compositor may prioritise its own work
+    // without holding a capability.
+    let (rc, mid) = call(
+        u::AMDGPU_CTX_OP_ALLOC_CTX,
+        0,
+        0,
+        u::AMDGPU_CTX_PRIORITY_HIGH,
+        true,
+    );
+    if rc.is_err() {
+        return TestResult::Fail("DRM master should be permitted an above-normal priority");
+    }
+    let _ = call(u::AMDGPU_CTX_OP_FREE_CTX, 0, mid, 0, false);
+
+    // And CAP_SYS_NICE is the other arm: granted it, a non-master gets in.
+    narf_filesystem::__test_swap_caller_capable_hook(Some(|cap| cap == 23));
+    let (rc, nid) = call(
+        u::AMDGPU_CTX_OP_ALLOC_CTX,
+        0,
+        0,
+        u::AMDGPU_CTX_PRIORITY_VERY_HIGH,
+        false,
+    );
+    if rc.is_err() {
+        return TestResult::Fail("CAP_SYS_NICE should permit an above-normal priority");
+    }
+    let _ = call(u::AMDGPU_CTX_OP_FREE_CTX, 0, nid, 0, false);
+    narf_filesystem::__test_swap_caller_capable_hook(saved);
+
+    // ── query ──
+    // A query naming no context is ENOENT, not a zeroed answer that would
+    // read as "healthy".
+    for op in [u::AMDGPU_CTX_OP_QUERY_STATE, u::AMDGPU_CTX_OP_QUERY_STATE2] {
+        if !matches!(call(op, 0, 999_999, 0, false).0, Err(FsError::NotFound)) {
+            return TestResult::Fail("a query naming no context should be ENOENT");
+        }
+        if call(op, 0, id, 0, false).0.is_err() {
+            return TestResult::Fail("a query on a live context failed");
+        }
+    }
+
+    // ── stable pstate ──
+    match call(u::AMDGPU_CTX_OP_GET_STABLE_PSTATE, 0, id, 0, false) {
+        (Ok(_), v) if v == u::AMDGPU_CTX_STABLE_PSTATE_NONE => {}
+        _ => return TestResult::Fail("a fresh context should report pstate NONE"),
+    }
+    if call(
+        u::AMDGPU_CTX_OP_SET_STABLE_PSTATE,
+        u::AMDGPU_CTX_STABLE_PSTATE_PEAK,
+        id,
+        0,
+        false,
+    )
+    .0
+    .is_err()
+    {
+        return TestResult::Fail("SET_STABLE_PSTATE to PEAK failed");
+    }
+    match call(u::AMDGPU_CTX_OP_GET_STABLE_PSTATE, 0, id, 0, false) {
+        (Ok(_), v) if v == u::AMDGPU_CTX_STABLE_PSTATE_PEAK => {}
+        _ => return TestResult::Fail("the set pstate did not read back"),
+    }
+    // The mask is four bits but only 0..=PEAK are defined, so the range check
+    // is separate from the mask check and both must bite.
+    if call(u::AMDGPU_CTX_OP_SET_STABLE_PSTATE, 5, id, 0, false)
+        .0
+        .is_ok()
+    {
+        return TestResult::Fail("a pstate above PEAK should be refused");
+    }
+    if call(u::AMDGPU_CTX_OP_SET_STABLE_PSTATE, 1 << 8, id, 0, false)
+        .0
+        .is_ok()
+    {
+        return TestResult::Fail("a flag outside the pstate mask should be refused");
+    }
+
+    // ── flags must be zero on every op but SET_STABLE_PSTATE ──
+    // Forward compatibility: a client setting an unknown flag is refused, not
+    // silently served without the behaviour it asked for.
+    for op in [
+        u::AMDGPU_CTX_OP_ALLOC_CTX,
+        u::AMDGPU_CTX_OP_FREE_CTX,
+        u::AMDGPU_CTX_OP_QUERY_STATE,
+        u::AMDGPU_CTX_OP_QUERY_STATE2,
+        u::AMDGPU_CTX_OP_GET_STABLE_PSTATE,
+    ] {
+        if call(op, 1, id, 0, false).0.is_ok() {
+            return TestResult::Fail("a non-zero flags field should be refused");
+        }
+    }
+
+    // ── free ──
+    if call(u::AMDGPU_CTX_OP_FREE_CTX, 0, id, 0, false).0.is_err() {
+        return TestResult::Fail("FREE_CTX of a live context failed");
+    }
+    if !matches!(
+        call(u::AMDGPU_CTX_OP_FREE_CTX, 0, id, 0, false).0,
+        Err(FsError::NotFound)
+    ) {
+        return TestResult::Fail("a double free should be ENOENT");
+    }
+    // Every context this test allocated has been freed, including the ones
+    // the refused-flags cases did NOT create.
+    if state.count() != 0 {
+        return TestResult::Fail("a context outlived its free");
+    }
+    // An unknown operation.
+    if call(99, 0, id, 0, false).0.is_ok() {
+        return TestResult::Fail("an unknown CTX operation should be refused");
+    }
+
+    // Contexts are per-open: a second table does not see this one's ids.
+    let other = CtxState::new();
+    if other.get(id).is_some() {
+        return TestResult::Fail("a context id leaked across opens");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_ctx",
+    smoke_amdgpu_ctx_alloc_query_and_priority_gate
+);

@@ -13340,6 +13340,22 @@ pub fn wait_init() {
         narf_filesystem::cgroupfs::install_kill_hook(cgroup_kill_hook);
         narf_filesystem::cgroupfs::install_freeze_hook(cgroup_freeze_hook);
     }
+    // Let the layers below the syscall boundary ask Linux's `capable()`
+    // question. `narf_filesystem::caller_capable` has existed, and failed
+    // closed, with nothing installed to answer it — so every caller read
+    // "not privileged" unconditionally. That is safe but not correct: the
+    // sites asking are deciding whether to SKIP an enforcement a privileged
+    // process is entitled to skip, so the answer being permanently false
+    // means CAP_SYS_TTY_CONFIG could never configure a VT, CAP_SYS_ADMIN
+    // could never override a PTY's exclusive mode or write to another
+    // terminal's input queue, and CAP_SYS_RESOURCE could never override a
+    // btrfs quota. Each of those is a capability that was checked and could
+    // not be held.
+    //
+    // The hook hands over the QUESTION, not a credential — a driver can ask
+    // whether the calling process holds a capability without being given
+    // anything it could use for something else.
+    narf_filesystem::install_caller_capable_hook(capable);
     // Share the process-global NsId counter with the filesystem crate so
     // a MountNamespace minted there (snapshot_global) draws an id from
     // the same space as every other namespace flavour.
