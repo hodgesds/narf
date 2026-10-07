@@ -9385,47 +9385,192 @@ pub fn clear_mempolicy_for_fault() {
 
 // ── adjtimex / clock_adjtime ─────────────────────────────────────────
 //
-// Kernel clock-discipline interface. NARF runs no NTP discipline, so a
-// query (`modes == 0`) reports a steady, synchronised clock: TIME_OK with
-// the default tick (10000 µs ⇒ 100 Hz) and zero frequency offset.
+// The kernel clock-discipline interface. `narf_time::ntp` owns the NTP
+// variables and implements `ntp_adjtimex()`; this layer is Linux's syscall
+// wrapper plus `do_adjtimex()` — copy `struct __kernel_timex` in, validate it
+// (which is where CAP_SYS_TIME is enforced), step the wall clock for
+// ADJ_SETOFFSET, then copy the whole struct back.
+//
+// What this replaces: `modes` was read and thrown away (`let _ = modes`),
+// nothing was validated, no capability was checked, and three fields were
+// written back as a hard-coded "steady, synchronised clock". So an
+// unprivileged `adjtimex({ modes: ADJ_SETOFFSET })` answered TIME_OK —
+// chrony/ntpd/hwclock believed they had stepped a clock they were never
+// allowed to touch — and a caller reading `offset`, `maxerror`, `constant`
+// or `tai` back got whatever its own buffer happened to hold, since the
+// kernel never wrote those fields.
 
-// `struct timex` field byte offsets (LP64, shared x86_64/aarch64).
-const TIMEX_OFF_MODES: u64 = 0;
-const TIMEX_OFF_FREQ: u64 = 16;
-const TIMEX_OFF_STATUS: u64 = 40;
-const TIMEX_OFF_TICK: u64 = 88;
-const TIME_OK: u64 = 0;
-const DEFAULT_TICK_US: i64 = 10_000;
+/// `struct __kernel_timex` field byte offsets and size (LP64, identical on
+/// x86_64 and aarch64). Linux copies the struct whole in and whole out, so a
+/// user buffer shorter than `TIMEX_SZ` faults exactly as it does there.
+const TIMEX_SZ: usize = 208;
+const TIMEX_OFF_MODES: usize = 0;
+const TIMEX_OFF_OFFSET: usize = 8;
+const TIMEX_OFF_FREQ: usize = 16;
+const TIMEX_OFF_MAXERROR: usize = 24;
+const TIMEX_OFF_ESTERROR: usize = 32;
+const TIMEX_OFF_STATUS: usize = 40;
+const TIMEX_OFF_CONSTANT: usize = 48;
+const TIMEX_OFF_PRECISION: usize = 56;
+const TIMEX_OFF_TOLERANCE: usize = 64;
+const TIMEX_OFF_TIME_SEC: usize = 72;
+const TIMEX_OFF_TIME_USEC: usize = 80;
+const TIMEX_OFF_TICK: usize = 88;
+/// `ppsfreq` … `stbcnt`: eight PPS fields, all reported as zero (NARF has no
+/// PPS — see the `narf_time::ntp` module docs), `shift` among them.
+const TIMEX_OFF_PPSFREQ: usize = 96;
+const TIMEX_OFF_TAI: usize = 160;
 
-/// Shared core: read `modes`, and for a read-only query fill the steady
-/// state fields. Returns the clock state (TIME_OK) or a negative errno.
-fn adjtimex_core(timex_ptr: u64) -> i64 {
+fn timex_i64(buf: &[u8; TIMEX_SZ], off: usize) -> i64 {
+    i64::from_ne_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+fn timex_i32(buf: &[u8; TIMEX_SZ], off: usize) -> i32 {
+    i32::from_ne_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+fn timex_put_i64(buf: &mut [u8; TIMEX_SZ], off: usize, v: i64) {
+    buf[off..off + 8].copy_from_slice(&v.to_ne_bytes());
+}
+
+fn timex_put_i32(buf: &mut [u8; TIMEX_SZ], off: usize, v: i32) {
+    buf[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+}
+
+/// `kernel/time/timekeeping.c::do_adjtimex()`: validate, then apply. The
+/// realtime sample is taken BEFORE an ADJ_SETOFFSET step, so `timex.time`
+/// reports the time the request observed rather than the stepped one — the
+/// order `__do_adjtimex` uses.
+fn adjtimex_apply(txc: &mut narf_time::ntp::Timex) -> Result<i64, i64> {
+    narf_time::ntp::validate(txc, capable(CAP_SYS_TIME))?;
+    let now = narf_scheduler::narf_time::now_wall();
+    if txc.modes & narf_time::ntp::ADJ_SETOFFSET != 0 {
+        adjtimex_inject_offset(txc, &now)?;
+    }
+    Ok(narf_time::ntp::adjtimex(
+        txc,
+        now.secs,
+        i64::from(now.nanos),
+    ))
+}
+
+/// `kernel/time/timekeeping.c::__timekeeping_inject_offset()` — step the wall
+/// clock by `timex.time`, which `ADJ_NANO` reads as nanoseconds and anything
+/// else as microseconds. The sub-second field was range-checked in
+/// `validate`; what is left is Linux's "make sure the proposed value is
+/// valid" check, which here means the stepped wall clock must not go
+/// negative (Linux's `timespec64_valid_settod` plus its `wall_to_monotonic`
+/// guard, both of which exist to keep a clock read from underflowing).
+fn adjtimex_inject_offset(
+    txc: &narf_time::ntp::Timex,
+    now: &narf_time::WallInstant,
+) -> Result<(), i64> {
+    let sub_ns = if txc.modes & narf_time::ntp::ADJ_NANO != 0 {
+        txc.time_usec
+    } else {
+        txc.time_usec * 1_000
+    };
+    let delta_ns = i128::from(txc.time_sec) * 1_000_000_000 + i128::from(sub_ns);
+    let now_ns = i128::from(now.secs) * 1_000_000_000 + i128::from(now.nanos);
+    if now_ns + delta_ns < 0 {
+        return Err(EINVAL);
+    }
+    let offset_ns = i128::from(narf_scheduler::narf_time::wall_offset_ns()) + delta_ns;
+    let offset_ns = match i64::try_from(offset_ns) {
+        Ok(v) => v,
+        Err(_) => return Err(EINVAL),
+    };
+    narf_scheduler::narf_time::set_wall_offset_uncapped(offset_ns);
+    // Republish to the vDSO vvar so __vdso_clock_gettime(CLOCK_REALTIME)
+    // tracks the step without a syscall, as sys_clock_settime does.
+    crate::vdso::update_wall_offset(offset_ns);
+    Ok(())
+}
+
+/// Shared core of `adjtimex(2)` and `clock_adjtime(2)`. Returns the clock
+/// state (`TIME_OK` / `TIME_ERROR`) or a negative errno.
+///
+/// `writeback_on_error` is the one place the two wrappers differ, and it is
+/// not cosmetic:
+///
+/// ```text
+/// SYSCALL_DEFINE1(adjtimex, ...)                 SYSCALL_DEFINE2(clock_adjtime, ...)
+///     ret = do_adjtimex(&txc);                       err = do_clock_adjtime(id, &ktx);
+///     return copy_to_user(txc_p, &txc, ...)          if (err >= 0 && copy_to_user(utx, &ktx, ...))
+///            ? -EFAULT : ret;                                return -EFAULT;
+/// ```
+///
+/// `adjtimex` copies the struct back unconditionally, so a refused request
+/// whose buffer is unwritable reports EFAULT rather than EPERM; the struct
+/// itself is unchanged, because `do_adjtimex` returned before touching it.
+/// `clock_adjtime` skips the copy on error and reports the errno.
+fn adjtimex_core(timex_ptr: u64, writeback_on_error: bool, clock_gate: Result<(), i64>) -> i64 {
     if timex_ptr == 0 {
-        return -14; // EFAULT
+        return -EFAULT;
     }
-    let modes = read_user_u32(timex_ptr.wrapping_add(TIMEX_OFF_MODES));
-    // We accept any modes word but apply nothing; report the steady state.
-    let _ = modes;
-    // freq = 0, status = 0 (synchronised), tick = default.
-    // SAFETY: timex_ptr is non-zero; each copy_to_user validates the field
-    // write against the user struct (well within sizeof(struct timex)).
-    unsafe {
-        if copy_to_user(timex_ptr.wrapping_add(TIMEX_OFF_FREQ), &0i64.to_le_bytes()).is_err()
-            || copy_to_user(
-                timex_ptr.wrapping_add(TIMEX_OFF_STATUS),
-                &0i32.to_le_bytes(),
-            )
-            .is_err()
-            || copy_to_user(
-                timex_ptr.wrapping_add(TIMEX_OFF_TICK),
-                &DEFAULT_TICK_US.to_le_bytes(),
-            )
-            .is_err()
-        {
-            return -14; // EFAULT
+    let mut buf = [0u8; TIMEX_SZ];
+    // SAFETY: copy_from_user range-validates the 208-byte read against the
+    // user mapping and brackets it with SMAP.
+    if unsafe { copy_from_user(&mut buf, timex_ptr) }.is_err() {
+        return -EFAULT;
+    }
+    // `clock_adjtime`'s clock lookup sits in `do_clock_adjtime`, i.e. AFTER
+    // the wrapper's `copy_from_user`: a bad clock id with a faulting timex
+    // pointer is -EFAULT, not -EINVAL. `adjtimex` has no clock to gate on and
+    // passes `Ok(())`.
+    if let Err(errno) = clock_gate {
+        return -errno;
+    }
+    let mut txc = narf_time::ntp::Timex {
+        modes: u32::from_ne_bytes(buf[TIMEX_OFF_MODES..TIMEX_OFF_MODES + 4].try_into().unwrap()),
+        offset: timex_i64(&buf, TIMEX_OFF_OFFSET),
+        freq: timex_i64(&buf, TIMEX_OFF_FREQ),
+        maxerror: timex_i64(&buf, TIMEX_OFF_MAXERROR),
+        esterror: timex_i64(&buf, TIMEX_OFF_ESTERROR),
+        status: timex_i32(&buf, TIMEX_OFF_STATUS),
+        constant: timex_i64(&buf, TIMEX_OFF_CONSTANT),
+        precision: timex_i64(&buf, TIMEX_OFF_PRECISION),
+        tolerance: timex_i64(&buf, TIMEX_OFF_TOLERANCE),
+        time_sec: timex_i64(&buf, TIMEX_OFF_TIME_SEC),
+        time_usec: timex_i64(&buf, TIMEX_OFF_TIME_USEC),
+        tick: timex_i64(&buf, TIMEX_OFF_TICK),
+        tai: timex_i32(&buf, TIMEX_OFF_TAI),
+    };
+    let state = match adjtimex_apply(&mut txc) {
+        Ok(state) => state,
+        Err(errno) => {
+            if writeback_on_error {
+                // The buffer still holds exactly what was read in.
+                // SAFETY: copy_to_user range-validates the 208-byte write and
+                // brackets it with SMAP.
+                if unsafe { copy_to_user(timex_ptr, &buf) }.is_err() {
+                    return -EFAULT;
+                }
+            }
+            return -errno;
         }
+    };
+    timex_put_i64(&mut buf, TIMEX_OFF_OFFSET, txc.offset);
+    timex_put_i64(&mut buf, TIMEX_OFF_FREQ, txc.freq);
+    timex_put_i64(&mut buf, TIMEX_OFF_MAXERROR, txc.maxerror);
+    timex_put_i64(&mut buf, TIMEX_OFF_ESTERROR, txc.esterror);
+    timex_put_i32(&mut buf, TIMEX_OFF_STATUS, txc.status);
+    timex_put_i64(&mut buf, TIMEX_OFF_CONSTANT, txc.constant);
+    timex_put_i64(&mut buf, TIMEX_OFF_PRECISION, txc.precision);
+    timex_put_i64(&mut buf, TIMEX_OFF_TOLERANCE, txc.tolerance);
+    timex_put_i64(&mut buf, TIMEX_OFF_TIME_SEC, txc.time_sec);
+    timex_put_i64(&mut buf, TIMEX_OFF_TIME_USEC, txc.time_usec);
+    timex_put_i64(&mut buf, TIMEX_OFF_TICK, txc.tick);
+    // `pps_fill_timex()`'s !CONFIG_NTP_PPS stub zeroes all eight PPS fields,
+    // `shift` included; they occupy one contiguous 64-byte run.
+    buf[TIMEX_OFF_PPSFREQ..TIMEX_OFF_PPSFREQ + 64].fill(0);
+    timex_put_i32(&mut buf, TIMEX_OFF_TAI, txc.tai);
+    // SAFETY: copy_to_user range-validates the 208-byte write against the
+    // user mapping and brackets it with SMAP.
+    if unsafe { copy_to_user(timex_ptr, &buf) }.is_err() {
+        return -EFAULT;
     }
-    TIME_OK as i64
+    state
 }
 
 // ── pidfd_getfd / kcmp ───────────────────────────────────────────────

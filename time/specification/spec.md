@@ -140,6 +140,37 @@ rating that's also monotonic. Record the decision for telemetry.
 - Wall-clock slewing is rate-limited; leap-seconds handled via smear
   (no monotonic violation ever).
 
+### 3.6 NTP discipline state (`adjtimex(2)` surface)
+
+```rust
+pub mod ntp {
+    pub struct Timex { /* the mutable half of struct __kernel_timex */ }
+
+    /// `timekeeping_validate_timex()` — EPERM/EINVAL for a request this
+    /// caller may not make or that names impossible values.
+    pub fn validate(txc: &Timex, cap_sys_time: bool) -> Result<(), i64>;
+    /// `ntp_adjtimex()` — apply the request's modes, fill in every
+    /// reported field, return the clock state (TIME_OK / TIME_ERROR).
+    pub fn adjtimex(txc: &mut Timex, now_sec: i64, now_nsec: i64) -> i64;
+    /// Current TAI offset, seconds (`ADJ_TAI`).
+    pub fn tai_offset() -> i32;
+
+    // ADJ_*, STA_*, TIME_* constants (include/uapi/linux/timex.h).
+}
+```
+
+The kernel's NTP variables (`tick_usec`, `time_status`, `time_freq`,
+`time_offset`, the error estimates, the TAI offset) live here, with Linux's
+boot defaults — `STA_UNSYNC`, so a query answers `TIME_ERROR` until a time
+daemon clears the bit. `userspace/`'s `adjtimex` / `clock_adjtime` handlers
+own the user-struct copy, the `CAP_SYS_TIME` gate and the `ADJ_SETOFFSET`
+step into the wall offset; everything else is state kept here.
+
+The *variables* are modelled; the discipline loop is not. See the
+`narf_time::ntp` module docs for the LINUX-GAPs that follow from that —
+`ADJ_OFFSET`/`ADJ_FREQUENCY` are recorded but never worked off, there is no
+leap-second state machine on this path (that is §3.5's smear), and no PPS.
+
 ## 4. Invariants & safety properties
 
 - `now_monotonic()` is wait-free and lock-free.

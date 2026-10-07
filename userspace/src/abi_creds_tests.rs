@@ -1876,6 +1876,65 @@ kernel_test_in!(
     smoke_abi_caps_clock_settime_requires_sys_time
 );
 
+/// `timekeeping_validate_timex`: **any** non-zero `modes` needs CAP_SYS_TIME,
+/// so an unprivileged `adjtimex` is a read-only query and nothing else. The
+/// exception is `ADJ_OFFSET_SS_READ` — `ADJ_ADJTIME | ADJ_OFFSET_READONLY |
+/// ADJ_OFFSET`, which only reads the pending `adjtime(3)` offset back.
+///
+/// This had no capability check at all: an unprivileged
+/// `adjtimex({ modes: ADJ_SETOFFSET })` stepped nothing but answered TIME_OK,
+/// so a time daemon believed it had disciplined the clock.
+fn smoke_abi_caps_adjtimex_requires_sys_time() -> TestResult {
+    with_setup(|| {
+        // `struct __kernel_timex` is 208 bytes; word 0 is `modes`.
+        const TX_WORDS: usize = 26;
+        const ADJ_FREQUENCY: u64 = 0x0002;
+        const ADJ_SETOFFSET: u64 = 0x0100;
+        const ADJ_OFFSET_SS_READ: u64 = 0xa001;
+        drop_all_caps();
+
+        // A read-only query is unprivileged — it must not be refused.
+        let mut tx = [0u64; TX_WORDS];
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v >= 0 => {}
+            _ => return Err("an unprivileged adjtimex query should still report the state"),
+        }
+        // So is reading the pending adjtime(3) offset.
+        let mut tx = [0u64; TX_WORDS];
+        tx[0] = ADJ_OFFSET_SS_READ;
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v >= 0 => {}
+            _ => return Err("ADJ_OFFSET_SS_READ is read-only and needs no capability"),
+        }
+        // Anything that writes state does not.
+        for modes in [ADJ_FREQUENCY, ADJ_SETOFFSET] {
+            let mut tx = [0u64; TX_WORDS];
+            tx[0] = modes;
+            match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+                Some(-1) => {}
+                Some(v) if v >= 0 => return Err("an unprivileged task disciplined the clock"),
+                _ => return Err("unprivileged adjtimex with modes: want -EPERM"),
+            }
+        }
+        // clock_adjtime enforces the same check behind the clock lookup.
+        let mut tx = [0u64; TX_WORDS];
+        tx[0] = ADJ_FREQUENCY;
+        match call(Syscall::ClockAdjtime.raw(), a1(0, tx.as_mut_ptr() as u64)) {
+            Some(-1) => {}
+            _ => return Err("unprivileged clock_adjtime with modes: want -EPERM"),
+        }
+
+        set_caps(CAP_SYS_TIME_BIT, CAP_SYS_TIME_BIT);
+        let mut tx = [0u64; TX_WORDS];
+        tx[0] = ADJ_FREQUENCY;
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v >= 0 => Ok(()),
+            _ => Err("adjtimex with CAP_SYS_TIME should be allowed to set the frequency"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_adjtimex_requires_sys_time);
+
 fn smoke_abi_caps_chroot_enoent_still_precedes_eperm() -> TestResult {
     with_setup(|| {
         // `error = -EPERM; if (!ns_capable(current_user_ns(),

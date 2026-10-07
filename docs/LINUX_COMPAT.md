@@ -163,7 +163,7 @@ Delivery model and mask width are detailed in §3.2.
 
 | Syscall(s) | Status | Gate | Notes / cite |
 |---|---|---|---|
-| `clock_gettime`, `clock_settime`, `clock_getres`, `clock_adjtime`, `adjtimex` | implemented | `adjtimex`/`clock_adjtime` under `linux-compat` | vDSO fast path for `clock_gettime` (§3.6) |
+| `clock_gettime`, `clock_settime`, `clock_getres`, `clock_adjtime`, `adjtimex` | implemented | `adjtimex`/`clock_adjtime` under `linux-compat` | vDSO fast path for `clock_gettime` (§3.6). `adjtimex`/`clock_adjtime` keep Linux's NTP variables (`time/src/ntp.rs`) and need CAP_SYS_TIME for any non-zero `modes`; only `ADJ_SETOFFSET` reaches the clock, and only CLOCK_REALTIME is adjustable (others `EOPNOTSUPP`). No discipline loop — see the `narf_time::ntp` LINUX-GAPs |
 | `gettimeofday`, `settimeofday`, `time` | implemented | — | |
 | `nanosleep`, `clock_nanosleep` | implemented | `clock_nanosleep` + `nanosleep` handlers under `linux-compat` (`handlers.rs:~21292`) | reads a `timespec*` (§3.5); finite sleeps park on the timer wheel |
 | POSIX timers: `timer_create`, `timer_settime`, `timer_gettime`, `timer_delete` | implemented | `linux-compat` (table entries `syscall.rs:2514`) | |
