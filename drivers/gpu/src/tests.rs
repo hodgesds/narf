@@ -6778,17 +6778,20 @@ fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
     }
 
     // `MODULE_FIRMWARE` for the IP modules Linux binds at GFX 11.0.1.
+    // In `enum AMDGPU_UCODE_ID` order, which is the order
+    // `psp_load_non_psp_fw` sends them in. The separate order assertions
+    // below say WHY each position matters; this one pins the names.
     let want: &[&str] = &[
         "amdgpu/psp_13_0_4_toc.bin",
-        "amdgpu/gc_11_0_1_imu.bin",
+        "amdgpu/sdma_6_0_1.bin",
         "amdgpu/gc_11_0_1_pfp.bin",
         "amdgpu/gc_11_0_1_me.bin",
         "amdgpu/gc_11_0_1_mec.bin",
-        "amdgpu/gc_11_0_1_rlc.bin",
         "amdgpu/gc_11_0_1_mes.bin",
         "amdgpu/gc_11_0_1_mes_2.bin",
         "amdgpu/gc_11_0_1_mes1.bin",
-        "amdgpu/sdma_6_0_1.bin",
+        "amdgpu/gc_11_0_1_imu.bin",
+        "amdgpu/gc_11_0_1_rlc.bin",
         "amdgpu/vcn_4_0_2.bin",
         "amdgpu/dcn_3_1_4_dmcub.bin",
         "amdgpu/psp_13_0_4_ta.bin",
@@ -6800,6 +6803,59 @@ fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
         if entry.name != *expected {
             return TestResult::Fail("a Phoenix firmware blob name is not Linux's");
         }
+    }
+
+    // The load ORDER is Linux's, not a preference. `psp_load_non_psp_fw`
+    // walks `adev->firmware.ucode[]`, indexed by `enum AMDGPU_UCODE_ID`, so
+    // the enum order IS the load order — and the PSP processes each load
+    // against the state the previous ones left.
+    //
+    // The two constraints that matter, both from `psp_load_non_psp_fw`:
+    //   * RLC is the LAST graphics blob. The autoload state machine starts
+    //     the moment it lands ("start rlc autoload after psp received all the
+    //     gfx firmware"), so every CP and MES blob must already be in.
+    //   * The non-graphics blobs (VCN, DMCUB) come after it.
+    let position = |needle: &str| info.fw_list.iter().position(|e| e.name.contains(needle));
+    let (Some(rlc), Some(sdma), Some(pfp), Some(mec), Some(mes), Some(imu)) = (
+        position("_rlc.bin"),
+        position("sdma_"),
+        position("_pfp.bin"),
+        position("_mec.bin"),
+        position("_mes.bin"),
+        position("_imu.bin"),
+    ) else {
+        return TestResult::Fail("a firmware blob the order depends on is missing");
+    };
+    for (what, at) in [
+        ("sdma", sdma),
+        ("pfp", pfp),
+        ("mec", mec),
+        ("mes", mes),
+        ("imu", imu),
+    ] {
+        let _ = what;
+        if at > rlc {
+            return TestResult::Fail("RLC must be the last graphics blob: autoload starts on it");
+        }
+    }
+    // SDMA is first of the IP firmwares, as its enum id is lowest.
+    if sdma > pfp {
+        return TestResult::Fail("SDMA loads before the CP engines");
+    }
+    // IMU sits between MES and RLC (enum ids 36/37 against MES 32-35, RLC 52).
+    if !(mes < imu && imu < rlc) {
+        return TestResult::Fail("IMU loads after MES and before RLC");
+    }
+    // And the non-graphics blobs trail RLC.
+    for tail in ["vcn_", "dmcub"] {
+        match position(tail) {
+            Some(at) if at > rlc => {}
+            _ => return TestResult::Fail("a non-graphics blob should load after RLC"),
+        }
+    }
+    // The TOC is first: the PSP needs the table of contents before any image.
+    if !info.fw_list[0].name.contains("_toc.bin") {
+        return TestResult::Fail("the TOC must be sent first");
     }
 
     // No SMU blob: Phoenix is an APU whose PMFW is BIOS-resident, and

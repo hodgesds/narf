@@ -382,21 +382,42 @@ impl FwEntry {
 /// (13_0_0, 13_0_6, 13_0_7, 13_0_10, 13_0_14, 14_0_2, 14_0_3); neither
 /// `smu_13_0_4.bin` nor `smu_14_0_1.bin` exists anywhere, so the entry this
 /// table used to carry could never have opened.
+/// The ORDER is Linux's, and it is a hardware contract rather than a
+/// preference. `psp_load_non_psp_fw` walks `adev->firmware.ucode[]`, which is
+/// indexed by `enum AMDGPU_UCODE_ID`, so the enum's order IS the load order:
+/// SDMA, then the CP engines (PFP, ME, MEC), then MES, then IMU, then RLC,
+/// and only then the non-graphics blobs (VCN, DMCUB).
+///
+/// This table was in a different order — IMU first, SDMA near the end, RLC
+/// before MES — which is one more variable between here and a GPU that comes
+/// up. The PSP processes each load against state the previous ones left.
 static PHOENIX_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_13_0_4_toc.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_0_1_imu.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_0_1.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_0_1_pfp.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_0_1_me.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_0_1_mec.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_0_1_rlc.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_0_1_mes.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_0_1_mes_2.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_0_1_mes1.bin"),
-    FwEntry::ip_fw("amdgpu/sdma_6_0_1.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_imu.bin"),
+    // RLC last of the graphics firmwares: the PSP's autoload state machine
+    // starts the moment this one lands, and it expects every other graphics
+    // blob to have been received already.
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_rlc.bin"),
     FwEntry::ip_fw("amdgpu/vcn_4_0_2.bin"),
     FwEntry::ip_fw("amdgpu/dcn_3_1_4_dmcub.bin"),
     FwEntry::ta("amdgpu/psp_13_0_4_ta.bin"),
 ];
+
+/// Whether `name` is the RLC blob, which is what triggers the PSP's autoload.
+///
+/// Matched by name because `FwEntry` carries no ucode id — the names are
+/// Linux's own `MODULE_FIRMWARE` strings and a `_rlc.bin` suffix identifies
+/// the blob across every family in this file.
+fn is_rlc_blob(name: &str) -> bool {
+    name.ends_with("_rlc.bin")
+}
 
 /// Strix Point — GFX **11.5.0**, DCN **3.5**, PSP **14.0.1**, SDMA 6.1.0,
 /// VCN 4.0.5. This is the bundle that used to sit in `PHOENIX_FW`.
@@ -413,14 +434,14 @@ static PHOENIX_FW: &[FwEntry] = &[
 #[allow(dead_code)]
 static STRIX_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_14_0_1_toc.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_mec.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_mes_2.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_mes1.bin"),
-    FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
     FwEntry::ip_fw("amdgpu/vcn_4_0_5.bin"),
     FwEntry::ip_fw("amdgpu/dcn_3_5_dmcub.bin"),
     FwEntry::ta("amdgpu/psp_14_0_1_ta.bin"),
@@ -1248,6 +1269,7 @@ impl AmdGpu {
         let mut skipped_optional = 0usize;
         let mut last_optional_skip: Option<alloc::string::String> = None;
 
+        let autoload = matches!(self.chip.family, Family::Phoenix);
         for entry in self.chip.fw_list {
             // SAFETY: caller-asserted exclusive BAR5; mp0_base
             // is resolved live (not stale).
@@ -1258,26 +1280,46 @@ impl AmdGpu {
                     skipped_optional += 1;
                     last_optional_skip = Some(alloc::string::String::from(entry.name));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Name the blob. A family's list is a dozen entries and
+                    // "firmware load failed" says nothing about which one, nor
+                    // whether the file was missing, malformed, or rejected by
+                    // the PSP — three problems with three different fixes.
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: firmware load failed at {} (cmd {:#x}): {e:?}",
+                        entry.name,
+                        entry.cmd
+                    );
+                    return Err(e);
+                }
             }
-        }
 
-        // GFX11+ (Phoenix/Strix) kicks the PSP-managed RLC autoload
-        // after the IP-firmware loop. `AUTOLOAD_RLC = 0x21` is a
-        // control command (no image), so we send it via the same
-        // mailbox with size=0-style trigger — PSP recognises the
-        // command and runs its autoload state machine over the
-        // already-staged firmwares. GFX9 (Renoir family) starts
-        // RLC by MMIO kick instead, so we skip the call there.
-        if matches!(self.chip.family, Family::Phoenix) {
-            // SAFETY: caller-asserted exclusive BAR5.
-            let r = unsafe { psp_send_control_command(&self.regs, mp0_base, PSP_CMD_AUTOLOAD_RLC) };
-            if r.is_err() {
-                // Non-fatal: log via the report. RLC autoload
-                // failure means the GFX ring won't come up, but
-                // it doesn't unwind the loads above — let the
-                // caller decide.
-                return Err(AmdgpuError::FirmwareLoadFailed);
+            // `psp_load_non_psp_fw`: "Start rlc autoload after psp received
+            // all the gfx firmware" — fired the moment RLC lands, which is
+            // why RLC is last among the graphics blobs in the table. This
+            // used to run after the WHOLE list, so VCN and DMCUB had been
+            // sent first; the PSP's state machine expects otherwise.
+            //
+            // GFX9 (the Renoir family) starts RLC by MMIO kick instead, so it
+            // is skipped there.
+            if autoload && is_rlc_blob(entry.name) {
+                // SAFETY: caller-asserted exclusive BAR5.
+                let r =
+                    unsafe { psp_send_control_command(&self.regs, mp0_base, PSP_CMD_AUTOLOAD_RLC) };
+                if let Err(e) = r {
+                    // Fatal, as it is in Linux: `psp_rlc_autoload_start`
+                    // failing returns the error from `psp_load_non_psp_fw`.
+                    // A comment here used to call it non-fatal while the code
+                    // returned an error — the code was right.
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: PSP RLC autoload failed: {e:?}; the GFX ring will not come up"
+                    );
+                    return Err(AmdgpuError::FirmwareLoadFailed);
+                }
             }
         }
 
