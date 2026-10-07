@@ -509,6 +509,8 @@ pub(crate) mod tests {
             fw_loaded: false,
             ip_blocks: alloc::vec![],
             vbios: None,
+            // Synthetic fixture: no discovery blob, so no GC table.
+            gc_info: None,
         };
         let (write, read) = narf_firmware::bootstrap_authority();
         write.revoke();

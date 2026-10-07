@@ -223,6 +223,14 @@ pub enum DiscoveryError {
     TooManyDies,
     /// `num_base_address > 16` — sanity bound. Real chips use 1-5.
     TooManyBaseAddresses,
+    /// `table_list[GC].offset` is zero: the binary carries no GC table.
+    /// Pre-discovery silicon, and QEMU.
+    NoGcTable,
+    /// The GC table's own checksum disagreed with `table_list[GC]`.
+    BadGcTableChecksum,
+    /// The GC table's `version_major` is one this parser has no field
+    /// layout for. v1 (GFX10/11) and v2 (GFX9) are the two Linux defines.
+    UnknownGcVersion(u16),
 }
 
 // ── Output shape ──────────────────────────────────────────────────
@@ -487,4 +495,186 @@ pub fn parse_discovery(blob: &[u8]) -> Result<Vec<IpBlock>, DiscoveryError> {
     }
 
     Ok(blocks)
+}
+
+// ── GC info table ───────────────────────────────────────────────────
+
+/// `union gc_info` (`discovery.h`) — the graphics-core topology, read from
+/// the discovery binary's `table_list[GC]` entry.
+///
+/// This is where the shader-engine geometry comes from, and it is the only
+/// honest source for it. Linux does **not** hardcode these per ASIC on
+/// GFX10/11: `amdgpu_discovery_get_gfx_info` reads them from this table
+/// (`amdgpu_discovery.c`), precisely because the same IP version ships with
+/// different harvest configurations. A Radeon 780M and a 760M are both
+/// GFX 11.0.1 and differ in CU count, so a hardcoded table would be wrong
+/// for one of them.
+///
+/// `AMDGPU_INFO_DEV_INFO` reports most of these straight to userspace, and
+/// Mesa uses the CU count, wave size and LDS size to make shader-compilation
+/// decisions — so a guessed value here is not a cosmetic error, it is wrong
+/// code generation.
+///
+/// The fields are normalised across the two layout families. v1 (GFX10/11)
+/// counts work-group processors per shader array and names the L2 slices
+/// `gl2c`; v2 (GFX9) counts compute units per shader array directly and
+/// names them `tccs`. Callers get one shape either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcInfo {
+    pub version_major: u16,
+    pub version_minor: u16,
+    /// `gc_num_se` — shader engines.
+    pub num_se: u32,
+    /// Shader arrays per shader engine. v1 `gc_num_sa_per_se`,
+    /// v2 `gc_num_sh_per_se`.
+    pub num_sa_per_se: u32,
+    /// Compute units per shader array.
+    ///
+    /// v2 reports this directly. v1 reports work-group processors in two
+    /// banks, and a WGP is two CUs:
+    /// `2 * (gc_num_wgp0_per_sa + gc_num_wgp1_per_sa)`, exactly as
+    /// `amdgpu_discovery.c` computes `max_cu_per_sh`.
+    pub num_cu_per_sa: u32,
+    /// `gc_num_rb_per_se` — render backends per shader engine.
+    pub num_rb_per_se: u32,
+    /// L2 cache slices. v1 `gc_num_gl2c`, v2 `gc_num_tccs`.
+    pub num_tccs: u32,
+    pub num_gprs: u32,
+    pub num_max_gs_thds: u32,
+    pub gs_table_depth: u32,
+    pub gsprim_buff_depth: u32,
+    pub parameter_cache_depth: u32,
+    pub double_offchip_lds_buffer: u32,
+    /// 32 on RDNA, 64 on GCN. Mesa branches on it.
+    pub wave_size: u32,
+    pub max_waves_per_simd: u32,
+    pub max_scratch_slots_per_cu: u32,
+    pub lds_size: u32,
+    pub num_sc_per_se: u32,
+    pub num_packer_per_sc: u32,
+    /// Cache geometry, v1.2 and later only; zero when the table predates it.
+    /// `DEV_INFO` reports zero for these on older tables too, so a zero here
+    /// is passed through rather than guessed.
+    pub tcp_l1_size: u32,
+    pub num_sqc_per_wgp: u32,
+    pub sqc_inst_cache_size: u32,
+    pub sqc_data_cache_size: u32,
+    pub gl1c_size_per_instance: u32,
+    pub gl2c_per_gpu: u32,
+}
+
+impl GcInfo {
+    /// Total active CUs: `num_se * num_sa_per_se * num_cu_per_sa`.
+    ///
+    /// Saturating, because a corrupt table must not panic in a probe path.
+    pub fn total_cus(&self) -> u32 {
+        self.num_se
+            .saturating_mul(self.num_sa_per_se)
+            .saturating_mul(self.num_cu_per_sa)
+    }
+}
+
+/// `gpu_info_header`: `u32 table_id, u16 version_major, u16 version_minor,
+/// u32 size`.
+const GPU_INFO_HEADER_SIZE: usize = 12;
+
+/// Parse `table_list[GC]` out of a discovery binary.
+///
+/// The outer signature and checksum are NOT re-verified here — a caller that
+/// reached this has already run [`parse_discovery`], which does both. What is
+/// verified is the GC table's own checksum against the directory entry,
+/// which is the only integrity check Linux applies to it
+/// (`amdgpu_discovery_get_gfx_info`: sum-of-bytes over `header.size`).
+pub fn parse_gc_info(blob: &[u8]) -> Result<GcInfo, DiscoveryError> {
+    let entry = 12 + TABLE_GC * 8;
+    let offset = u16_at(blob, entry)? as usize;
+    let checksum = u16_at(blob, entry + 2)?;
+    if offset == 0 {
+        return Err(DiscoveryError::NoGcTable);
+    }
+    if offset + GPU_INFO_HEADER_SIZE > blob.len() {
+        return Err(DiscoveryError::OffsetOutOfBounds);
+    }
+
+    let version_major = u16_at(blob, offset + 4)?;
+    let version_minor = u16_at(blob, offset + 6)?;
+    let size = u32_at(blob, offset + 8)? as usize;
+    if size < GPU_INFO_HEADER_SIZE || offset + size > blob.len() {
+        return Err(DiscoveryError::OffsetOutOfBounds);
+    }
+    if sum_bytes(&blob[offset..offset + size]) != checksum {
+        return Err(DiscoveryError::BadGcTableChecksum);
+    }
+
+    // Field `i` of the body, or zero when `size` stops short of it. A table
+    // is allowed to be any of its minor revisions, and the later ones only
+    // append — so reading past the declared size is the one thing that must
+    // not happen, and a short table yields zeros rather than an error.
+    let body = offset + GPU_INFO_HEADER_SIZE;
+    let limit = offset + size;
+    let f = |i: usize| -> u32 {
+        let at = body + i * 4;
+        if at + 4 <= limit {
+            u32_at(blob, at).unwrap_or(0)
+        } else {
+            0
+        }
+    };
+
+    let mut info = GcInfo {
+        version_major,
+        version_minor,
+        ..GcInfo::default()
+    };
+    match version_major {
+        1 => {
+            info.num_se = f(0);
+            // A WGP is two CUs; v1 banks them.
+            info.num_cu_per_sa = 2u32.saturating_mul(f(1).saturating_add(f(2)));
+            info.num_rb_per_se = f(3);
+            info.num_tccs = f(4);
+            info.num_gprs = f(5);
+            info.num_max_gs_thds = f(6);
+            info.gs_table_depth = f(7);
+            info.gsprim_buff_depth = f(8);
+            info.parameter_cache_depth = f(9);
+            info.double_offchip_lds_buffer = f(10);
+            info.wave_size = f(11);
+            info.max_waves_per_simd = f(12);
+            info.max_scratch_slots_per_cu = f(13);
+            info.lds_size = f(14);
+            info.num_sc_per_se = f(15);
+            info.num_sa_per_se = f(16);
+            info.num_packer_per_sc = f(17);
+            // f(18) = gc_num_gl2a, f(19..22) = v1.1's tcp/sdp counts.
+            info.tcp_l1_size = f(23);
+            info.num_sqc_per_wgp = f(24);
+            info.sqc_inst_cache_size = f(25);
+            info.sqc_data_cache_size = f(26);
+            // f(27) = gc_gl1c_per_sa.
+            info.gl1c_size_per_instance = f(28);
+            info.gl2c_per_gpu = f(29);
+        }
+        2 => {
+            info.num_se = f(0);
+            info.num_cu_per_sa = f(1);
+            info.num_sa_per_se = f(2);
+            info.num_rb_per_se = f(3);
+            info.num_tccs = f(4);
+            info.num_gprs = f(5);
+            info.num_max_gs_thds = f(6);
+            info.gs_table_depth = f(7);
+            info.gsprim_buff_depth = f(8);
+            info.parameter_cache_depth = f(9);
+            info.double_offchip_lds_buffer = f(10);
+            info.wave_size = f(11);
+            info.max_waves_per_simd = f(12);
+            info.max_scratch_slots_per_cu = f(13);
+            info.lds_size = f(14);
+            info.num_sc_per_se = f(15);
+            info.num_packer_per_sc = f(16);
+        }
+        other => return Err(DiscoveryError::UnknownGcVersion(other)),
+    }
+    Ok(info)
 }

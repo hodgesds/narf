@@ -313,6 +313,8 @@ fn vram_boot_revalidates_pci_authority_before_mmio() -> TestResult {
             num_bases: 3,
         }],
         vbios: Some(crate::amdgpu_vbios::tests::fixture()),
+        // Synthetic fixture: no discovery blob, so no GC table.
+        gc_info: None,
     };
     let cap = Cap::bootstrap();
     cap.revoke();
@@ -374,6 +376,8 @@ fn vram_boot_loader_construction_does_not_modify_hardware() -> TestResult {
             num_bases: 3,
         }],
         vbios: Some(crate::amdgpu_vbios::tests::with_image(bios())),
+        // Synthetic fixture: no discovery blob, so no GC table.
+        gc_info: None,
     };
     let firmware = crate::amdgpu_dmub::tests::fixture_firmware();
     let authority = Cap::bootstrap();

@@ -605,6 +605,14 @@ pub struct AmdGpu {
     /// garbage (typical on QEMU / older chips); callers fall
     /// back to the hardcoded `Family::mp0_base()` table.
     pub ip_blocks: Vec<IpBlock>,
+    /// Graphics-core topology from the same discovery binary's
+    /// `table_list[GC]`. `None` when the silicon publishes no GC table
+    /// (pre-discovery parts, and QEMU), or when it failed its checksum —
+    /// a wrong CU count is wrong shader code generation, so this fails
+    /// closed rather than defaulting.
+    ///
+    /// `AMDGPU_INFO_DEV_INFO` reports most of it to userspace verbatim.
+    pub gc_info: Option<crate::amdgpu_discovery::GcInfo>,
     /// Immutable platform VBIOS captured at probe, when available.
     pub vbios: Option<crate::amdgpu_vbios::Vbios>,
 }
@@ -686,7 +694,9 @@ impl AmdGpu {
         // SAFETY: BAR0 mapped, exclusive owner; the discovery
         // blob is read-only from the host side.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let ip_blocks = unsafe { read_ip_discovery(&fb_bar, &vram) };
+        // One read of the discovery blob answers both questions.
+        // SAFETY: as above.
+        let (ip_blocks, gc_info) = unsafe { read_discovery(&fb_bar, &vram) };
 
         Ok(Self {
             fb_bar,
@@ -695,6 +705,7 @@ impl AmdGpu {
             vram,
             mode: None,
             fw_loaded: false,
+            gc_info,
             ip_blocks,
             vbios: None,
         })
@@ -1631,10 +1642,13 @@ unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
 /// `fb_bar` must map BAR0 of an AMD GPU; the caller must hold
 /// exclusive ownership of the framebuffer aperture for the
 /// duration of the read.
-unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock> {
+unsafe fn read_discovery(
+    fb_bar: &MmioRegion,
+    vram: &VramInfo,
+) -> (Vec<IpBlock>, Option<crate::amdgpu_discovery::GcInfo>) {
     // No aperture → no discovery.
     if vram.size < amdgpu_discovery::DISCOVERY_TMR_OFFSET {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let off_in_vram = vram.size - amdgpu_discovery::DISCOVERY_TMR_OFFSET;
     // Cap the read at whatever the aperture actually exposes
@@ -1661,7 +1675,26 @@ unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock
         buf[i + 3] = bytes[3];
         i += 4;
     }
-    amdgpu_discovery::parse_discovery(&buf).unwrap_or_default()
+    // The GC table is parsed from the same bytes. Its absence is ordinary
+    // (QEMU, pre-discovery silicon) and is not worth reporting; a blob that
+    // parsed but whose GC table is corrupt is worth reporting, because the
+    // topology it would have carried is not guessable.
+    let gc_info = match amdgpu_discovery::parse_gc_info(&buf) {
+        Ok(info) => Some(info),
+        Err(amdgpu_discovery::DiscoveryError::NoGcTable) => None,
+        Err(error) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: discovery GC table unusable ({error:?}); shader topology unknown"
+            );
+            None
+        }
+    };
+    (
+        amdgpu_discovery::parse_discovery(&buf).unwrap_or_default(),
+        gc_info,
+    )
 }
 
 // ── VBIOS image acquisition ────────────────────────────────────────────────

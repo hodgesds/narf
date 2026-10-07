@@ -6736,3 +6736,174 @@ fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_phoenix_identity_matches_linux);
+
+/// Build a discovery blob carrying a `gc_info` v1.2 table describing a
+/// Radeon 780M: 1 shader engine, 2 shader arrays, 3 WGPs per bank per array.
+///
+/// 1 SE x 2 SA x (2 x (3 + 3)) CU = 24 — wait, the 780M has 12 CUs, so the
+/// banks are 3 and 0: `2 * (3 + 0) = 6` CU per SA, x 2 SA x 1 SE = 12.
+/// That asymmetry is the point of v1 having two WGP banks at all.
+fn build_gc_info_blob(version_minor: u16, fields: &[u32]) -> alloc::vec::Vec<u8> {
+    use crate::amdgpu_discovery as d;
+    let mut blob = alloc::vec![0u8; 0x400];
+    let gc_off: usize = 0x200;
+    let size = 12 + fields.len() * 4;
+
+    // Outer binary_header: signature + the GC directory entry. The GC parser
+    // does not re-verify the outer frame, so only the directory matters.
+    blob[0..4].copy_from_slice(&d::BINARY_SIGNATURE.to_le_bytes());
+    let entry = 12 + d::TABLE_GC * 8;
+    blob[entry..entry + 2].copy_from_slice(&(gc_off as u16).to_le_bytes());
+    blob[entry + 4..entry + 6].copy_from_slice(&(size as u16).to_le_bytes());
+
+    // gpu_info_header: table_id, version_major, version_minor, size.
+    blob[gc_off..gc_off + 4].copy_from_slice(&1u32.to_le_bytes());
+    blob[gc_off + 4..gc_off + 6].copy_from_slice(&1u16.to_le_bytes());
+    blob[gc_off + 6..gc_off + 8].copy_from_slice(&version_minor.to_le_bytes());
+    blob[gc_off + 8..gc_off + 12].copy_from_slice(&(size as u32).to_le_bytes());
+    for (i, v) in fields.iter().enumerate() {
+        let at = gc_off + 12 + i * 4;
+        blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    // The table's checksum, over exactly `size` bytes from its own start.
+    let csum = blob[gc_off..gc_off + size]
+        .iter()
+        .fold(0u16, |a, &b| a.wrapping_add(b as u16));
+    blob[entry + 2..entry + 4].copy_from_slice(&csum.to_le_bytes());
+    blob
+}
+
+/// The graphics-core topology comes from the discovery binary, not from a
+/// per-ASIC table in the driver.
+///
+/// This matters because `AMDGPU_INFO_DEV_INFO` reports most of it straight to
+/// userspace and Mesa makes shader-compilation decisions from the CU count,
+/// wave size and LDS size. Linux reads it from `table_list[GC]` for exactly
+/// this reason (`amdgpu_discovery_get_gfx_info`): a 780M and a 760M are both
+/// GFX 11.0.1 and differ in CU count, so anything hardcoded per IP version
+/// would be wrong for one of them.
+fn smoke_amdgpu_gc_info_reports_the_tables_topology() -> TestResult {
+    use crate::amdgpu_discovery::{parse_gc_info, DiscoveryError};
+
+    // v1 field order, through v1.2's cache geometry. 780M-shaped: one shader
+    // engine, two shader arrays, WGP banks of 3 and 0, wave32.
+    let v1: &[u32] = &[
+        1,       //  0 gc_num_se
+        3,       //  1 gc_num_wgp0_per_sa
+        0,       //  2 gc_num_wgp1_per_sa
+        2,       //  3 gc_num_rb_per_se
+        4,       //  4 gc_num_gl2c
+        1024,    //  5 gc_num_gprs
+        32,      //  6 gc_num_max_gs_thds
+        32,      //  7 gc_gs_table_depth
+        1792,    //  8 gc_gsprim_buff_depth
+        1024,    //  9 gc_parameter_cache_depth
+        1024,    // 10 gc_double_offchip_lds_buffer
+        32,      // 11 gc_wave_size
+        16,      // 12 gc_max_waves_per_simd
+        256,     // 13 gc_max_scratch_slots_per_cu
+        65536,   // 14 gc_lds_size
+        1,       // 15 gc_num_sc_per_se
+        2,       // 16 gc_num_sa_per_se
+        1,       // 17 gc_num_packer_per_sc
+        2,       // 18 gc_num_gl2a
+        16,      // 19 gc_num_tcp_per_sa
+        1,       // 20 gc_num_sdp_interface
+        16,      // 21 gc_num_tcps
+        4,       // 22 gc_num_tcp_per_wpg
+        16384,   // 23 gc_tcp_l1_size
+        2,       // 24 gc_num_sqc_per_wgp
+        32768,   // 25 gc_l1_instruction_cache_size_per_sqc
+        16384,   // 26 gc_l1_data_cache_size_per_sqc
+        1,       // 27 gc_gl1c_per_sa
+        131072,  // 28 gc_gl1c_size_per_instance
+        4194304, // 29 gc_gl2c_per_gpu
+    ];
+    let info = match parse_gc_info(&build_gc_info_blob(2, v1)) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("a valid gc_info v1.2 table was rejected"),
+    };
+    if info.num_se != 1 || info.num_sa_per_se != 2 {
+        return TestResult::Fail("shader engine / array counts did not decode");
+    }
+    // A WGP is two CUs, banked: 2 * (3 + 0) = 6 per shader array.
+    if info.num_cu_per_sa != 6 {
+        return TestResult::Fail("v1 should fold WGP banks into CUs per array");
+    }
+    // 1 SE x 2 SA x 6 CU = 12, which is the 780M's CU count.
+    if info.total_cus() != 12 {
+        return TestResult::Fail("total CU count is not the product of the geometry");
+    }
+    if info.wave_size != 32 {
+        return TestResult::Fail("RDNA is wave32 and Mesa branches on it");
+    }
+    if info.num_tccs != 4 || info.lds_size != 65536 {
+        return TestResult::Fail("L2 slice count / LDS size did not decode");
+    }
+    // v1.2's cache geometry, which DEV_INFO reports verbatim.
+    if info.tcp_l1_size != 16384 || info.num_sqc_per_wgp != 2 {
+        return TestResult::Fail("v1.2 cache geometry did not decode");
+    }
+    if info.gl1c_size_per_instance != 131072 || info.gl2c_per_gpu != 4194304 {
+        return TestResult::Fail("v1.2 GL1/GL2 sizes did not decode");
+    }
+
+    // A v1.0 table stops after field 18. The later fields must read as zero,
+    // not as whatever follows the table in the blob — DEV_INFO reports zero
+    // for them on older silicon too.
+    let short = parse_gc_info(&build_gc_info_blob(0, &v1[..19]));
+    match short {
+        Ok(i) if i.num_cu_per_sa == 6 && i.tcp_l1_size == 0 && i.gl2c_per_gpu == 0 => {}
+        Ok(_) => return TestResult::Fail("a v1.0 table leaked fields it does not carry"),
+        Err(_) => return TestResult::Fail("a valid v1.0 table was rejected"),
+    }
+
+    // v2 (GFX9) counts CUs per array directly rather than in WGP banks.
+    let v2: &[u32] = &[
+        1, 8, 1, 2, 4, 1024, 32, 32, 1792, 1024, 1024, 64, 10, 256, 65536, 1, 1,
+    ];
+    let mut blob = build_gc_info_blob(0, v2);
+    blob[0x200 + 4..0x200 + 6].copy_from_slice(&2u16.to_le_bytes());
+    let size = 12 + v2.len() * 4;
+    let csum = blob[0x200..0x200 + size]
+        .iter()
+        .fold(0u16, |a, &b| a.wrapping_add(b as u16));
+    let entry = 12 + crate::amdgpu_discovery::TABLE_GC * 8;
+    blob[entry + 2..entry + 4].copy_from_slice(&csum.to_le_bytes());
+    match parse_gc_info(&blob) {
+        Ok(i) if i.num_cu_per_sa == 8 && i.num_sa_per_se == 1 && i.wave_size == 64 => {}
+        Ok(_) => return TestResult::Fail("v2's field order was read as v1's"),
+        Err(_) => return TestResult::Fail("a valid gc_info v2.0 table was rejected"),
+    }
+
+    // A corrupted table is refused rather than believed. A wrong CU count is
+    // wrong shader codegen, so this must fail closed.
+    let mut bad = build_gc_info_blob(2, v1);
+    bad[0x200 + 12] ^= 0xFF;
+    if !matches!(parse_gc_info(&bad), Err(DiscoveryError::BadGcTableChecksum)) {
+        return TestResult::Fail("a GC table failing its checksum was accepted");
+    }
+
+    // No GC table at all is the QEMU and pre-discovery case, and it is a
+    // distinct answer from a corrupt one: the caller may fall back.
+    let mut none = build_gc_info_blob(2, v1);
+    let entry = 12 + crate::amdgpu_discovery::TABLE_GC * 8;
+    none[entry..entry + 2].copy_from_slice(&0u16.to_le_bytes());
+    if !matches!(parse_gc_info(&none), Err(DiscoveryError::NoGcTable)) {
+        return TestResult::Fail("an absent GC table should be NoGcTable");
+    }
+
+    // An unknown major version is refused by version, not guessed at.
+    let mut v9 = build_gc_info_blob(0, v1);
+    v9[0x200 + 4..0x200 + 6].copy_from_slice(&9u16.to_le_bytes());
+    match parse_gc_info(&v9) {
+        Err(DiscoveryError::UnknownGcVersion(9)) | Err(DiscoveryError::BadGcTableChecksum) => {}
+        _ => return TestResult::Fail("an unknown gc_info major version was decoded anyway"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/discovery",
+    smoke_amdgpu_gc_info_reports_the_tables_topology
+);
