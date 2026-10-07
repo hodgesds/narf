@@ -363,7 +363,15 @@ fn emit_tcb_frame(
             &mut frame[crate::pkt::ETH_HDR_LEN..],
         ) == crate::netfilter::Verdict::Accept
     {
-        let _ = dev.xmit(&frame);
+        // The frame was built with a checksum seed iff the egress advertises
+        // tx_checksum (see `build_tcb_frame` callers); request the matching
+        // offload so the driver completes it.
+        let meta = if dev.offloads.tx_checksum {
+            crate::TxMeta::with_csum(crate::L4CsumKind::Tcp)
+        } else {
+            crate::TxMeta::plain()
+        };
+        let _ = dev.xmit_meta(&frame, meta);
     }
 }
 
@@ -1938,6 +1946,7 @@ fn build_frame(
     window: u16,
     options: Vec<u8>,
     payload: &[u8],
+    offload_csum: bool,
 ) -> Vec<u8> {
     let opt_len = options.len();
     let tcp_hdr_len = TCP_HDR_MIN + opt_len;
@@ -1969,14 +1978,17 @@ fn build_frame(
     let bytes = hdr.encode();
     frame[tcp_off..tcp_off + bytes.len()].copy_from_slice(&bytes);
     frame[tcp_off + bytes.len()..tcp_off + bytes.len() + payload.len()].copy_from_slice(payload);
-    let segment = &frame[tcp_off..tcp_off + tcp_hdr_len + payload.len()];
-    // Patch the 2-byte TCP checksum in place (it lives at offset 16 of the
-    // TCP header, after src/dst port + seq + ack + dataoff/flags + window)
-    // rather than re-encoding the whole header into a fresh Vec and copying
-    // it back — saves one heap alloc + a full-header copy per outbound
-    // segment. The checksum was computed over the header with this field
-    // zeroed (as encoded above), which is the required pseudo-header form.
-    let cs = ipv4_pseudo_checksum(src_ip, dst_ip, segment);
+    // Patch the 2-byte TCP checksum in place (offset 16 of the TCP header).
+    // With checksum offload (egress advertises tx_checksum), write only the
+    // cheap pseudo-header seed and let hardware fold in the payload sum; the
+    // field then satisfies `ip_checksum(segment_with_seed) == full checksum`.
+    // Otherwise compute the full software checksum over the whole segment.
+    let cs = if offload_csum {
+        crate::pkt_tcp::ipv4_tcp_pseudo_seed(src_ip, dst_ip, (tcp_hdr_len + payload.len()) as u16)
+    } else {
+        let segment = &frame[tcp_off..tcp_off + tcp_hdr_len + payload.len()];
+        ipv4_pseudo_checksum(src_ip, dst_ip, segment)
+    };
     frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&cs.to_be_bytes());
     frame
 }
@@ -1995,6 +2007,7 @@ fn build_frame6(
     window: u16,
     options: Vec<u8>,
     payload: &[u8],
+    offload_csum: bool,
 ) -> Vec<u8> {
     let tcp_hdr_len = TCP_HDR_MIN + options.len();
     let hdr = TcpHeader {
@@ -2011,12 +2024,17 @@ fn build_frame6(
     };
     let mut segment = hdr.encode();
     segment.extend_from_slice(payload);
-    let checksum = crate::pkt_ipv6::pseudo_checksum(
-        src_ip,
-        dst_ip,
-        crate::pkt_ipv6::NEXT_HEADER_TCP,
-        &segment,
-    );
+    // See `build_frame`: offload writes only the pseudo-header seed.
+    let checksum = if offload_csum {
+        crate::pkt_ipv6::pseudo_seed(
+            src_ip,
+            dst_ip,
+            crate::pkt_ipv6::NEXT_HEADER_TCP,
+            segment.len() as u32,
+        )
+    } else {
+        crate::pkt_ipv6::pseudo_checksum(src_ip, dst_ip, crate::pkt_ipv6::NEXT_HEADER_TCP, &segment)
+    };
     segment[16..18].copy_from_slice(&checksum.to_be_bytes());
     let mut frame = Vec::new();
     crate::ipv6_stack::build_frame(
@@ -2057,6 +2075,7 @@ fn build_tcb_frame(
     window: u16,
     options: Vec<u8>,
     payload: &[u8],
+    offload_csum: bool,
 ) -> Vec<u8> {
     if t.is_ipv6 {
         build_frame6(
@@ -2072,6 +2091,7 @@ fn build_tcb_frame(
             window,
             options,
             payload,
+            offload_csum,
         )
     } else {
         build_frame(
@@ -2087,6 +2107,7 @@ fn build_tcb_frame(
             window,
             options,
             payload,
+            offload_csum,
         )
     }
 }
@@ -2146,6 +2167,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         65535,
         opts,
         &[],
+        iface.offloads.tx_checksum,
     );
     emit_tcb_frame(arc, &iface, frame);
     // Track SYN in the retransmit queue so a missed SYN-ACK
@@ -2181,6 +2203,7 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         window,
         opt_bytes,
         &[],
+        iface.offloads.tx_checksum,
     );
     emit_tcb_frame(arc, &iface, frame);
 }
@@ -2195,7 +2218,17 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
     } else {
         FLAG_RST
     };
-    let frame = build_tcb_frame(&arc.lock(), iface.mac, seq, ack, flags, 0, Vec::new(), &[]);
+    let frame = build_tcb_frame(
+        &arc.lock(),
+        iface.mac,
+        seq,
+        ack,
+        flags,
+        0,
+        Vec::new(),
+        &[],
+        iface.offloads.tx_checksum,
+    );
     emit_tcb_frame(arc, &iface, frame);
 }
 
@@ -2252,6 +2285,7 @@ fn send_data(
         window,
         opt_bytes,
         payload,
+        egress.dev.offloads.tx_checksum,
     );
     emit_tcb_frame(arc, &egress.dev, frame);
     if record_retx {
@@ -2478,6 +2512,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         window,
         opt_bytes,
         &payload,
+        iface.offloads.tx_checksum,
     );
     emit_tcb_frame(arc, &iface, frame);
     {
@@ -2546,6 +2581,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         window,
         opt_bytes,
         &[],
+        iface.offloads.tx_checksum,
     );
     emit_tcb_frame(arc, &iface, frame);
 }
@@ -2607,6 +2643,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         window,
         opt_bytes,
         &[],
+        iface.offloads.tx_checksum,
     );
     emit_tcb_frame(arc, &iface, frame);
 }
@@ -2831,6 +2868,7 @@ fn send_stateless_rst6(
         0,
         Vec::new(),
         &[],
+        false,
     );
     let _ = iface.xmit(&frame);
 }
@@ -2891,6 +2929,7 @@ fn send_stateless_rst(
         0,
         Vec::new(),
         &[],
+        false,
     );
     if crate::tcp_stack::nf_tx_filter_in(
         net_ns_id,
@@ -3668,6 +3707,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         window,
         opt_bytes,
         &payload,
+        iface.offloads.tx_checksum,
     );
     emit_tcb_frame(arc, &iface, frame);
     let mut t = arc.lock();

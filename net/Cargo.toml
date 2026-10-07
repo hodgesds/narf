@@ -20,5 +20,11 @@ narf-scheduler    = { path = "../scheduler" }
 narf-console      = { path = "../console" }
 narf-kernel-test  = { path = "../verification/kernel-test" }
 
+[features]
+# Compile the in-kernel test suite (the `kernel_test_in!` smokes). Off by
+# default so production kernels exclude all test code; the frame aggregator's
+# `kernel-test` feature enables it for the test image.
+kernel-test = []
+
 [lints]
 workspace = true

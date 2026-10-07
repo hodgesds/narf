@@ -90,6 +90,12 @@ pub struct NetIfaceEntry {
     /// rtnetlink. Driver-specific error paths can add to these through the
     /// accounting helpers below as they gain detailed hardware reporting.
     pub stats: IfaceCounterSnapshot,
+    /// Transmit/receive offloads the driver's send path honors. Default is
+    /// none; a driver that implements offloads calls [`set_offloads`] after
+    /// [`register`]. The stack consults this to decide whether to request a
+    /// checksum/TSO offload via [`crate::TxMeta`] instead of doing the work
+    /// in software.
+    pub offloads: crate::OffloadCapabilities,
 }
 
 /// One `netdev_hw_addr` on a device's multicast or unicast list.
@@ -116,6 +122,20 @@ pub fn set_driver_info(
         entry.driver = driver;
         entry.driver_version = driver_version;
         entry.bus_info = bus_info;
+    }
+}
+
+/// Record the transmit/receive offloads interface `name`'s send path honors.
+/// A driver calls this right after [`register`] when it implements checksum /
+/// TSO / VLAN offload; the stack then requests them via [`crate::TxMeta`]
+/// instead of doing the work in software.
+pub fn set_offloads(name: &str, offloads: crate::OffloadCapabilities) {
+    if let Some(entry) = IFACES
+        .lock()
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+    {
+        entry.offloads = offloads;
     }
 }
 
@@ -391,6 +411,9 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
         speed_mbps,
         duplex,
         stats,
+        offloads: old
+            .as_ref()
+            .map_or_else(Default::default, |old| old.offloads),
     });
     drop(g);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
@@ -805,6 +828,9 @@ pub struct NetIfaceSnapshot {
     pub speed_mbps: Option<u32>,
     pub duplex: Option<LinkDuplex>,
     pub stats: IfaceCounterSnapshot,
+    /// Offloads this interface's send path honors; the stack requests them
+    /// via [`crate::TxMeta`] rather than computing in software.
+    pub offloads: crate::OffloadCapabilities,
 }
 
 impl NetIfaceSnapshot {
@@ -895,6 +921,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         speed_mbps: entry.speed_mbps,
         duplex: entry.duplex,
         stats: entry.stats.clone(),
+        offloads: entry.offloads,
     }
 }
 

@@ -71,6 +71,7 @@ pub mod bypass;
 pub mod cbpf;
 pub mod dhcp;
 pub mod dns;
+pub mod gso;
 pub mod http;
 pub mod http2;
 pub mod icmp_sock;
@@ -121,13 +122,23 @@ pub use stack::{
     AdminIpv6Route, AttachError, StackAttach, StackAttachReply, StackDaemon,
 };
 
+// In-kernel test suites: compiled only under the `kernel-test` feature (or
+// host `cfg(test)`), so production kernels carry no test code.
+#[cfg(any(test, feature = "kernel-test"))]
 mod dhcp_dns_e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod errno_linux_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod ipv6_e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod protocol_coverage_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tcp_e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tcp_timer_e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests;
 
 use alloc::boxed::Box;

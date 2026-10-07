@@ -443,6 +443,33 @@ fn smoke_net_iface_drop_counters() -> TestResult {
 }
 kernel_test_in!("net", smoke_net_iface_drop_counters);
 
+// TCP TX checksum-offload seed: the stack writes only the pseudo-header seed
+// and the NIC sums the L4 segment (including the seeded field). That hardware
+// step is exactly `ip_checksum(segment_with_seed)`, which must equal the full
+// software `ipv4_pseudo_checksum` — proving the cheap seed offloads correctly.
+fn smoke_net_tcp_csum_offload_seed() -> TestResult {
+    use crate::pkt::ip_checksum;
+    use crate::pkt_tcp::{ipv4_pseudo_checksum, ipv4_tcp_pseudo_seed};
+    let src = [10, 0, 0, 1];
+    let dst = [192, 168, 5, 9];
+    let mut seg = alloc::vec![0u8; 20 + 37]; // TCP header + odd-length payload
+    for (i, b) in seg.iter_mut().enumerate() {
+        *b = (i.wrapping_mul(7) + 3) as u8;
+    }
+    seg[12] = (20u8 / 4) << 4; // data offset = 5 words
+    seg[16] = 0; // checksum field
+    seg[17] = 0;
+    let full = ipv4_pseudo_checksum(src, dst, &seg);
+    // Offload: seed the field, then the NIC's sum == ip_checksum(seg_with_seed).
+    let seed = ipv4_tcp_pseudo_seed(src, dst, seg.len() as u16);
+    seg[16..18].copy_from_slice(&seed.to_be_bytes());
+    if ip_checksum(&seg) != full {
+        return TestResult::Fail("checksum seed + hardware completion != full checksum");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_tcp_csum_offload_seed);
+
 fn smoke_net_stack_attach_cap_bootstrap() -> TestResult {
     // smoke: StackAttach struct can be constructed; caps round-trip.
     use crate::{NetIface, StackAttach, StackDaemon};
