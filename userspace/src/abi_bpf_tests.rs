@@ -597,13 +597,97 @@ kernel_test_in!("syscall_abi", smoke_abi_bpf_unimplemented_cmds);
 /// syscall created a moment earlier. Any process could load and run BPF, which
 /// makes the verifier the sole barrier and turns every verifier bug into an
 /// unprivileged primitive.
+/// Make the harness task unprivileged for the BPF gate: move its ids to an
+/// ordinary uid AND drop the two capabilities `bpf_capable()` accepts.
+///
+/// Moving the ids alone proves nothing now that the gate is a capability
+/// test. It used to be `euid == 0`, so these cases passed by moving euid;
+/// the harness task starts from `Caps::boot()`, which holds everything, and
+/// a case that only changed its uid would be answered by the privileged
+/// branch.
+fn drop_bpf_privilege() {
+    let caps = u64::MAX & !((1u64 << CAP_BPF) | (1u64 << CAP_SYS_ADMIN));
+    crate::handlers::__test_set_caps(FAKE_TASK, caps, caps);
+    crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+}
+
+/// Undo [`drop_bpf_privilege`] mid-case.
+fn restore_bpf_privilege() {
+    crate::handlers::__test_set_caps(FAKE_TASK, u64::MAX, u64::MAX);
+    crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+}
+
+/// The harness task at `uid`, holding exactly the capabilities in `caps`.
+fn with_caps_only(uid: u32, caps: &[u32]) {
+    let mask = caps.iter().fold(0u64, |acc, c| acc | (1u64 << c));
+    crate::handlers::__test_set_caps(FAKE_TASK, mask, mask);
+    crate::handlers::__test_set_fsids(FAKE_TASK, uid, uid);
+}
+
+const CAP_BPF: u32 = 39;
+const CAP_SYS_ADMIN: u32 = 21;
+
+/// `bpf(2)`'s gate is `bpf_capable()`, not `euid == 0`.
+///
+/// ```text
+/// static inline bool bpf_capable(void)
+/// {
+///         return capable(CAP_BPF) || capable(CAP_SYS_ADMIN);
+/// }
+/// ```
+///
+/// Both directions are wrong under a uid test and both are checked here.
+/// Root without the capability is the sandboxed-daemon case: a uid-0 service
+/// that dropped its capability set stayed able to load and attach programs,
+/// which is precisely the authority it was trying to give up. A non-root
+/// holder of CAP_BPF is how BPF tooling is actually shipped — `setcap
+/// cap_bpf,cap_perfmon+ep /usr/bin/bpftrace` — and it was refused outright,
+/// so the capability Linux added in 5.8 to avoid handing out CAP_SYS_ADMIN
+/// bought nothing here.
+fn smoke_abi_bpf_gate_is_cap_bpf_not_uid_zero() -> TestResult {
+    with_setup(|| {
+        let insns = ret_imm(7);
+
+        // uid 0, no CAP_BPF and no CAP_SYS_ADMIN: refused. Being root is not
+        // the question.
+        with_caps_only(0, &[]);
+        if load_prog(BPF_PROG_TYPE_TRACING, &insns) != Some(-1 /* EPERM */) {
+            return Err("uid 0 without CAP_BPF loaded a program");
+        }
+
+        // Each accepted capability on its own is enough, at an ordinary uid.
+        for cap in [CAP_BPF, CAP_SYS_ADMIN] {
+            with_caps_only(1000, &[cap]);
+            let fd = load_prog(BPF_PROG_TYPE_TRACING, &insns)
+                .ok_or("bpf() not Ok for a capable non-root task")?;
+            if fd < 0 {
+                return Err("a non-root task holding CAP_BPF or CAP_SYS_ADMIN was refused");
+            }
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        // A capability that is NOT one of the two does not open the gate —
+        // otherwise the test above would pass against `caps != 0`.
+        with_caps_only(0, &[CAP_SYS_PTRACE]);
+        if load_prog(BPF_PROG_TYPE_TRACING, &insns) != Some(-1) {
+            return Err("an unrelated capability satisfied the BPF gate");
+        }
+
+        restore_bpf_privilege();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_bpf_gate_is_cap_bpf_not_uid_zero);
+
+const CAP_SYS_PTRACE: u32 = 19;
+
 fn smoke_abi_bpf_requires_privilege() -> TestResult {
     with_setup(|| {
         let insns = ret_imm(7);
 
         // Unprivileged: refused, and refused *before* the attribute block is
         // read — so a bad pointer must still give EPERM, not EFAULT.
-        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        drop_bpf_privilege();
         if load_prog(BPF_PROG_TYPE_TRACING, &insns) != Some(-1 /* EPERM */) {
             return Err("unprivileged BPF_PROG_LOAD was not refused with EPERM");
         }
@@ -620,7 +704,7 @@ fn smoke_abi_bpf_requires_privilege() -> TestResult {
 
         // Privileged: the same call succeeds, so the gate is a privilege check
         // and not a blanket refusal.
-        crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+        restore_bpf_privilege();
         let fd = load_prog(BPF_PROG_TYPE_TRACING, &insns).ok_or("bpf() not Ok")?;
         if fd < 0 {
             return Err("privileged BPF_PROG_LOAD was refused");
@@ -872,7 +956,7 @@ fn smoke_abi_perf_set_bpf_requires_privilege() -> TestResult {
         // recorded fact and a future `FsError` split flips this one line
         // instead of discovering the gap. The refusal itself — which is the
         // security property — is identical either way.
-        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        drop_bpf_privilege();
         if call(
             Syscall::Ioctl.raw(),
             a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),
@@ -890,7 +974,7 @@ fn smoke_abi_perf_set_bpf_requires_privilege() -> TestResult {
 
         // Privileged again: the same calls work, so this is a privilege gate
         // and not a blanket refusal.
-        crate::handlers::__test_set_fsids(FAKE_TASK, 0, 0);
+        restore_bpf_privilege();
         if call(
             Syscall::Ioctl.raw(),
             a2(ev as u64, PERF_EVENT_IOC_SET_BPF, prog_fd as u64),

@@ -80,6 +80,7 @@ fn mq_errno(error: narf_filesystem::MqueueError) -> i64 {
         MqueueError::Invalid => EINVAL,
         MqueueError::NameTooLong => ENAMETOOLONG,
         MqueueError::PermissionDenied => 13,
+        MqueueError::OperationNotPermitted => EPERM,
         MqueueError::NoSpace => ENOSPC,
         MqueueError::BadDescriptor => EBADF,
         MqueueError::MessageTooLarge => EMSGSIZE,
@@ -218,18 +219,26 @@ pub fn sys_mq_open(ctx: &mut dyn TrapContext) {
         None
     };
     let task = current_task_id();
-    let (uid, gid) = crate::handlers::current_fs_ids();
     let mode = a.arg2 as u16;
     let name = backend_mq_name(&name);
+    let ns = namespace_id(task);
+    // `do_mq_open` looks the name up and then runs `inode_permission` against
+    // the inode it found, so the accessor is the per-inode one: a task in a
+    // non-initial user namespace holds no DAC authority over a queue whose
+    // owners that namespace cannot see (`capable_wrt_inode_uidgid`). With no
+    // existing queue there is no inode yet and the plain identity is right.
+    let accessor = match mqueuefs::owners_of(ns, &name) {
+        Some((owner, group)) => crate::handlers::accessor_for_inode(task, owner, group),
+        None => crate::handlers::current_accessor(task),
+    };
     let file = match mqueuefs::open(
-        namespace_id(task),
+        ns,
         &name,
         MqueueOpenOptions {
             flags: oflag,
             mode,
             umask: crate::handlers::current_umask() as u16,
-            uid,
-            gid,
+            accessor,
             attr,
             // The namespace's `/proc/sys/fs/mqueue/*` values and the one
             // capability that relaxes them (`capable(CAP_SYS_RESOURCE)`),
@@ -293,9 +302,18 @@ pub fn sys_mq_unlink(ctx: &mut dyn TrapContext) {
         }
     };
     let task = current_task_id();
-    let (uid, _) = crate::handlers::current_fs_ids();
+    let (fsuid, _) = crate::handlers::current_fs_ids();
     let name = backend_mq_name(&name);
-    match mqueuefs::unlink(namespace_id(task), &name, uid) {
+    let ns = namespace_id(task);
+    // `__check_sticky`'s third arm. CAP_FOWNER is asked WITH RESPECT TO the
+    // queue being removed, so a container task cannot use its in-namespace
+    // capability to unlink a queue whose owner it has no mapping for.
+    let fowner = mqueuefs::owners_of(ns, &name).is_some_and(|(owner, group)| {
+        crate::handlers::capable_wrt_inode_fowner(task, owner, group)
+    });
+    // The mqueuefs root is owned by whoever created the IPC namespace; NARF
+    // creates every one of them from the kernel's own context, so uid 0.
+    match mqueuefs::unlink(ns, &name, fsuid, 0, fowner) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         Err(error) => ctx.set_return(err(mq_errno(error))),
     }

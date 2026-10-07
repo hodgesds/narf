@@ -10,7 +10,7 @@ use crate::mqueuefs::{
     self, attributes, open, receive, send, unlink, MqueueAttr, MqueueFs, MqueueLimits,
     MqueueOpenOptions, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
-use crate::{FileType, FsInstance, POLL_IN, POLL_OUT};
+use crate::{Accessor, FileType, FsInstance, POLL_IN, POLL_OUT};
 
 fn poll_once<F: core::future::Future>(mut future: F) -> Option<F::Output> {
     unsafe fn clone(_: *const ()) -> RawWaker {
@@ -41,8 +41,7 @@ fn options(flags: u32, uid: u32, gid: u32) -> MqueueOpenOptions {
         flags,
         mode: 0o600,
         umask: 0,
-        uid,
-        gid,
+        accessor: Accessor::new(uid, gid),
         attr: None,
         limits: MqueueLimits::default(),
         privileged: uid == 0,
@@ -118,7 +117,7 @@ fn smoke_mqueuefs_unlink_keeps_open_description_alive() -> TestResult {
         Ok(id) => id,
         Err(error) => return TestResult::Fail(error),
     };
-    if unlink(0, "/lifetime", 0).is_err() || send(id, b"alive".to_vec(), 0).is_err() {
+    if unlink(0, "/lifetime", 0, 0, false).is_err() || send(id, b"alive".to_vec(), 0).is_err() {
         return TestResult::Fail("unlink destroyed an open queue");
     }
     if receive(id, 8192) != Ok((b"alive".to_vec(), 0)) {
@@ -143,8 +142,7 @@ fn smoke_mqueuefs_access_flags_attrs_and_status_file() -> TestResult {
             flags: O_CREAT | O_WRONLY | O_NONBLOCK,
             mode: 0o666,
             umask: 0o027,
-            uid: 42,
-            gid: 7,
+            accessor: Accessor::new(42, 7),
             attr: Some(MqueueAttr {
                 maxmsg: 4,
                 msgsize: 128,

@@ -165,6 +165,172 @@ fn smoke_abi_ipc_mq_unlink_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_mq_unlink_neg);
 
+/// `mq_open`'s permission check is a full DAC decision, not `uid == 0`.
+///
+/// `do_mq_open` looks the name up and runs `inode_permission` against the
+/// inode it found, so an existing queue is reached exactly as a file is:
+/// owner bits, then group bits (`in_group_p`, which consults the whole
+/// supplementary set), then other, with CAP_DAC_OVERRIDE as the bypass.
+///
+/// The backend instead built `Accessor::new(uid, gid)`, whose convenience
+/// derivation is `dac_override: uid == 0` with an EMPTY group list. Three
+/// consequences, each checked below: a uid-0 task that dropped
+/// CAP_DAC_OVERRIDE still opened every queue in the namespace; a task
+/// granted the capability at an ordinary uid could not open one it should
+/// have; and a caller in the queue's GROUP was denied the group bits,
+/// because the group it was in was not in the list.
+fn smoke_abi_ipc_mq_open_dac_follows_capabilities_not_uid0() -> TestResult {
+    with_setup(|| {
+        const CAP_DAC_OVERRIDE: u32 = 1;
+        let owner_only = b"abi_mq_dac_owner\0";
+
+        // Owned by 1000:1000, mode 0600 — nothing for group or other.
+        caps_and_ids(1000, 1000, &[]);
+        match call(
+            Syscall::MqOpen.raw(),
+            a2(owner_only.as_ptr() as u64, O_CREAT | O_RDWR, 0o600),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("setup: creating a 0600 queue as uid 1000 failed"),
+        }
+
+        // uid 0 WITHOUT CAP_DAC_OVERRIDE: refused. Being root is not the
+        // question Linux asks.
+        caps_and_ids(0, 0, &[]);
+        if call(
+            Syscall::MqOpen.raw(),
+            a1(owner_only.as_ptr() as u64, O_RDWR),
+        ) != Some(EACCES)
+        {
+            return Err("uid 0 without CAP_DAC_OVERRIDE opened another user's 0600 queue");
+        }
+
+        // An ordinary uid WITH CAP_DAC_OVERRIDE: allowed.
+        caps_and_ids(2000, 2000, &[CAP_DAC_OVERRIDE]);
+        match call(
+            Syscall::MqOpen.raw(),
+            a1(owner_only.as_ptr() as u64, O_RDWR),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("CAP_DAC_OVERRIDE at a non-zero uid did not reach the queue"),
+        }
+
+        // Group bits via a SUPPLEMENTARY group. 0060 gives the group rw and
+        // the owner nothing, so only the group path can succeed.
+        let group_only = b"abi_mq_dac_group\0";
+        // The create mode goes through `mode & ~umask`, and the fixture's
+        // umask would strip the group's write bit before the check under
+        // test ever runs.
+        let saved_umask = call(Syscall::Umask.raw(), a0(0)).unwrap_or(0o022);
+        caps_and_ids(1000, 500, &[]);
+        match call(
+            Syscall::MqOpen.raw(),
+            a2(group_only.as_ptr() as u64, O_CREAT | O_RDWR, 0o060),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("setup: creating a 0060 queue failed"),
+        }
+        // uid 3000, primary gid 3000, supplementary group 500. `setgroups`
+        // itself needs CAP_SETGID, so the group goes on while the task is
+        // still privileged and the credentials drop afterwards — which is
+        // the order a real daemon uses too.
+        restore_ipc_privilege(FAKE_TASK);
+        let groups: [u32; 1] = [500];
+        if call(Syscall::Setgroups.raw(), a1(1, groups.as_ptr() as u64)) != Some(0) {
+            return Err("setup: setgroups failed");
+        }
+        caps_and_ids(3000, 3000, &[]);
+        match call(
+            Syscall::MqOpen.raw(),
+            a1(group_only.as_ptr() as u64, O_RDWR),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("a supplementary group member was denied the queue's group bits"),
+        }
+
+        restore_ipc_privilege(FAKE_TASK);
+        let _ = call(Syscall::Umask.raw(), a0(saved_umask as u64));
+        let _ = call(Syscall::MqUnlink.raw(), a0(owner_only.as_ptr() as u64));
+        let _ = call(Syscall::MqUnlink.raw(), a0(group_only.as_ptr() as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_mq_open_dac_follows_capabilities_not_uid0
+);
+
+/// `mq_unlink` is `vfs_unlink` against a 01777 directory, so the rule is
+/// `__check_sticky` — and its third arm is CAP_FOWNER.
+///
+/// ```text
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), fsuid)) return 0;
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, dir), fsuid)) return 0;
+/// return !capable_wrt_inode_uidgid(idmap, inode, CAP_FOWNER);
+/// ```
+///
+/// The old test was `uid != 0 && uid != queue.owner`, which is the first two
+/// arms with the directory's owner written as a literal 0. CAP_FOWNER was
+/// missing, so the capability that exists to let a backup or cleanup service
+/// remove another user's file — the same authority that works on `/tmp` —
+/// did not work on a message queue.
+fn smoke_abi_ipc_mq_unlink_sticky_honours_cap_fowner() -> TestResult {
+    with_setup(|| {
+        const CAP_FOWNER: u32 = 3;
+        let name = b"abi_mq_sticky\0";
+
+        // Owned by 1000.
+        caps_and_ids(1000, 1000, &[]);
+        match call(
+            Syscall::MqOpen.raw(),
+            a2(name.as_ptr() as u64, O_CREAT | O_RDWR, 0o600),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("setup: queue create failed"),
+        }
+
+        // A different unprivileged uid: EPERM, the sticky errno (not EACCES,
+        // which is what a failed directory-permission check would give —
+        // 01777 means that check passes for everyone).
+        caps_and_ids(2000, 2000, &[]);
+        if call(Syscall::MqUnlink.raw(), a0(name.as_ptr() as u64)) != Some(EPERM) {
+            return Err("a non-owner without CAP_FOWNER unlinked another user's queue");
+        }
+
+        // The same uid holding CAP_FOWNER: allowed.
+        caps_and_ids(2000, 2000, &[CAP_FOWNER]);
+        if call(Syscall::MqUnlink.raw(), a0(name.as_ptr() as u64)) != Some(0) {
+            return Err("CAP_FOWNER did not satisfy the mqueue sticky check");
+        }
+
+        restore_ipc_privilege(FAKE_TASK);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_mq_unlink_sticky_honours_cap_fowner
+);
+
+/// The harness task at `uid`:`gid` holding exactly the capabilities in
+/// `caps`. Moving the ids alone would leave `Caps::boot()`'s full set in
+/// place and every assertion would be answered by the privileged branch.
+fn caps_and_ids(uid: u32, gid: u32, caps: &[u32]) {
+    let mask = caps.iter().fold(0u64, |acc, c| acc | (1u64 << c));
+    crate::handlers::__test_set_caps(FAKE_TASK, mask, mask);
+    crate::handlers::__test_set_fsids(FAKE_TASK, uid, gid);
+}
+
 // ── #25 mq_notify si_pid ────────────────────────────────────────────
 //
 // When a message arrives at an empty queue with a registered SIGEV_SIGNAL

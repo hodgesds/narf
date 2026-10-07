@@ -144,20 +144,25 @@ pub struct DrmFileCtx {
     pub authenticated: bool,
     /// Whether the caller holds the device master lock.
     pub is_master: bool,
-    /// Whether the caller is CAP_SYS_ADMIN.
-    pub is_root: bool,
+    /// Whether the caller holds **CAP_SYS_ADMIN**.
+    ///
+    /// Named for the capability and not for uid 0, because that is the
+    /// question `drm_ioctl_permit` asks — `!capable(CAP_SYS_ADMIN)` — and a
+    /// field called `is_root` invites the next caller to fill it in from a
+    /// uid, which is the conflation this gate must not inherit.
+    pub sys_admin: bool,
 }
 
 impl DrmFileCtx {
     /// File context for a render-node open.  No master, no auth, no
-    /// root — the kernel relies on the render-node minor's reduced
-    /// ioctl surface, not on uid checks.
+    /// CAP_SYS_ADMIN — the kernel relies on the render-node minor's
+    /// reduced ioctl surface, not on credential checks.
     pub const fn render_client() -> Self {
         DrmFileCtx {
             minor: MinorType::Render,
             authenticated: false,
             is_master: false,
-            is_root: false,
+            sys_admin: false,
         }
     }
 
@@ -172,7 +177,7 @@ impl DrmFileCtx {
             minor: MinorType::Primary,
             authenticated: true,
             is_master,
-            is_root: false,
+            sys_admin: false,
         }
     }
 
@@ -202,7 +207,7 @@ pub enum PermError {
     NotAuthenticated,
     /// `DRM_MASTER` set but caller isn't the master.
     NotMaster,
-    /// `DRM_ROOT_ONLY` set but caller isn't root.
+    /// `DRM_ROOT_ONLY` set but the caller lacks CAP_SYS_ADMIN.
     NotRoot,
 }
 
@@ -210,8 +215,17 @@ pub enum PermError {
 ///
 /// Mirrors `drivers/gpu/drm/drm_ioctl.c::drm_ioctl_permit` line-for-line.
 pub fn check_permission(flags: IoctlFlags, ctx: &DrmFileCtx) -> Result<(), PermError> {
-    // ROOT_ONLY first — root override.
-    if flags.root_only && !ctx.is_root {
+    // ROOT_ONLY first:
+    // `if (unlikely((flags & DRM_ROOT_ONLY) && !capable(CAP_SYS_ADMIN)))`.
+    //
+    // LINUX-GAP: no NARF ioctl sets `root_only`, and no caller sets
+    // `sys_admin`, so this arm is unreachable today. Linux marks only the
+    // six legacy entries that are themselves `drm_invalid_op`/`drm_noop`
+    // (SET_UNIQUE, BLOCK, UNBLOCK, ADD_DRAW, RM_DRAW, UPDATE_DRAW), none of
+    // which NARF dispatches. The gate is kept because the flag is ABI: a
+    // driver adding a privileged ioctl must have somewhere to declare it,
+    // and must find a capability test there rather than a uid test.
+    if flags.root_only && !ctx.sys_admin {
         return Err(PermError::NotRoot);
     }
     // AUTH: render clients are implicitly authenticated.
