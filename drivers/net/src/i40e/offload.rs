@@ -512,5 +512,6 @@ pub fn rx_metadata(qword: u64) -> narf_net::RxMeta {
     narf_net::RxMeta {
         csum_l3: good && ipv4,
         csum_l4: good,
+        ..Default::default()
     }
 }

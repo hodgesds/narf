@@ -1672,6 +1672,7 @@ fn smoke_i40e_frame_metadata_ring_roundtrip() -> TestResult {
     frame.set_rx_meta(RxMeta {
         csum_l3: true,
         csum_l4: true,
+        ..Default::default()
     });
     let (mut producer, mut consumer) = narf_ipc::channel::<Frame, 8>();
     producer.try_send(frame).unwrap();

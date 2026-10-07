@@ -71,6 +71,7 @@ pub mod bypass;
 pub mod cbpf;
 pub mod dhcp;
 pub mod dns;
+pub mod gro;
 pub mod gso;
 pub mod http;
 pub mod http2;
@@ -887,6 +888,12 @@ pub struct RxMeta {
     /// `true` if the hardware verified the L4 (TCP/UDP) checksum
     /// and found it valid.
     pub csum_l4: bool,
+    /// Number of wire segments coalesced into this frame by GRO (software) or
+    /// LRO (hardware). 0 or 1 means the frame was not coalesced.
+    pub gro_segs: u16,
+    /// Flow hash the device (RSS) or software computed over the 4-tuple, for
+    /// queue steering. 0 = none provided.
+    pub rx_hash: u32,
 }
 
 /// Capabilities of the frame-ring offload path, not just the underlying silicon.
