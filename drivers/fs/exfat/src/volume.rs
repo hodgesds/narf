@@ -77,10 +77,15 @@ pub struct ExfatVolume<B: BlockDevice> {
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
     /// Minutes subtracted from a timestamp WITHOUT a valid UTC-offset
-    /// byte (Linux `exfat_tz_offset`). NARF accepts neither `time_offset=`
-    /// nor `sys_tz`, so this is Linux's default of 0: such fields decode
-    /// as UTC.
+    /// byte (Linux `exfat_tz_offset`), from `time_offset=`.
+    ///
+    /// LINUX-GAP: `sys_tz` has no NARF equivalent (the kernel keeps no
+    /// timezone), so without `time_offset=` such fields decode as UTC —
+    /// which is what Linux does with `tz_minuteswest = 0`.
     pub tz_offset_min: i64,
+    /// `exfat_sb_info::options`: the ownership and permission model, which
+    /// for exFAT lives entirely in the mount options.
+    pub opts: crate::mount_opts::ExfatOpts,
     /// The root directory's times: the mount time, as Linux's
     /// `exfat_read_root` stamps it (the root has no file entry).
     pub root_times: super::dir::ExfatTimes,
@@ -91,6 +96,22 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
     /// signatures, walks the root directory cluster chain to load
     /// the up-case table, and returns a ready-to-use Arc.
     pub async fn mount(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
+        // A kernel-internal mount has no mounting task: init's ids and
+        // `init_fs.umask`, as Linux's own early mounts get.
+        Self::mount_with_opts(
+            device,
+            domain,
+            crate::mount_opts::ExfatOpts::defaults(0, 0, 0o022),
+        )
+        .await
+    }
+
+    /// `exfat_fill_super` with the options the mount was given.
+    pub async fn mount_with_opts(
+        device: Arc<B>,
+        domain: DomainId,
+        opts: crate::mount_opts::ExfatOpts,
+    ) -> Result<Arc<Self>, FsError> {
         let lbs = device.logical_block_size() as usize;
         let buffer = alloc_coherent(lbs, domain)
             .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
@@ -151,7 +172,8 @@ impl<B: BlockDevice + 'static> ExfatVolume<B> {
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
-            tz_offset_min: 0,
+            tz_offset_min: opts.tz_offset_min as i64,
+            opts,
             root_times: super::dir::ExfatTimes::root_at(
                 narf_time::now_wall().as_nanos().max(0) as u64
             ),

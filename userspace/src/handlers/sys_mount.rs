@@ -616,7 +616,8 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let (uid, gid) = current_fs_ids();
     let request = narf_filesystem::MountRequest {
         fs_type: &fstype, source: &source_resolved, options: &data,
-        uid, gid, initial_namespace: current_mount_namespace().is_none(),
+        uid, gid, umask: current_umask() as u16,
+        initial_namespace: current_mount_namespace().is_none(),
     };
     ctx.set_return(match fs_type.init(&request) {
         Ok(fs) => match current_mount_arc_with_flags(&auth, &target, fs, mnt_flags) {

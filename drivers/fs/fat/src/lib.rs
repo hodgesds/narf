@@ -31,6 +31,7 @@ pub mod bpb;
 pub mod dir;
 pub mod fat;
 pub mod fsinfo;
+pub mod mount_opts;
 pub mod node;
 pub mod volume;
 
@@ -132,21 +133,31 @@ fn fat_factory(dev: Arc<dyn narf_block::BlockDeviceSync>) -> Result<Arc<dyn FsIn
 }
 
 /// Register named mount constructors without mounting a volume.
+///
+/// Context-aware (`register_block_fstype_ctx`): FAT's ownership and
+/// permission model is the mount options plus the mounting task's uid, gid
+/// and umask, and the source+data constructor shape cannot see the latter.
 pub fn register_fstypes() {
-    narf_filesystem::register_block_fstype("fat", build_named);
-    narf_filesystem::register_block_fstype("vfat", build_named);
-    narf_filesystem::register_block_fstype("fat16", build_named);
-    narf_filesystem::register_block_fstype("fat32", build_named);
+    narf_filesystem::register_block_fstype_ctx("fat", build_named);
+    narf_filesystem::register_block_fstype_ctx("vfat", build_named);
+    narf_filesystem::register_block_fstype_ctx("fat16", build_named);
+    narf_filesystem::register_block_fstype_ctx("fat32", build_named);
 }
 
 fn build_named(
-    source: &str,
-    options: &str,
+    request: &narf_filesystem::MountRequest<'_>,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
-    if !options.is_empty() {
-        return Err(narf_filesystem::FsError::Unsupported);
-    }
-    let name = source.strip_prefix("/dev/").unwrap_or(source);
+    let opts = mount_opts::parse(request.options, request.uid, request.gid, request.umask)?;
+    let name = request
+        .source
+        .strip_prefix("/dev/")
+        .unwrap_or(request.source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
-    fat_factory(dev)
+    let async_dev = narf_block::SyncBlock::new(dev);
+    let vol = narf_scheduler::block_on(volume::FatVolume::mount_with_opts(
+        async_dev,
+        DomainId::DRIVER_0,
+        opts,
+    ))?;
+    Ok(vol as alloc::sync::Arc<dyn FsInstance>)
 }

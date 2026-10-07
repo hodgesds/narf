@@ -82,11 +82,17 @@ pub struct FatVolume<B: BlockDevice> {
     pub dev: u64,
     /// Seconds ADDED to the local time a FAT timestamp holds to get UTC:
     /// Linux `fat_tz_offset` is `-time_offset` minutes with `tz=UTC` /
-    /// `time_offset=`, else `sys_tz.tz_minuteswest`. NARF accepts neither
-    /// mount option and keeps no kernel timezone (`settimeofday` ignores
-    /// its `timezone*`, leaving Linux's default `tz_minuteswest = 0`), so
-    /// this is 0: the fields decode as UTC.
+    /// `time_offset=`, else `sys_tz.tz_minuteswest`. `time_offset=` is
+    /// honoured (see `mount_opts`).
+    ///
+    /// LINUX-GAP: the `sys_tz.tz_minuteswest` half has no NARF equivalent —
+    /// `settimeofday` ignores its `timezone*` and the kernel keeps no
+    /// timezone — so a mount with neither `tz=` nor `time_offset=` decodes
+    /// the fields as UTC, which is what Linux does with `tz_minuteswest = 0`.
     pub tz_offset_secs: i64,
+    /// `msdos_sb_info::options`: the ownership and permission model, which
+    /// for FAT lives entirely in the mount options.
+    pub opts: crate::mount_opts::FatOpts,
 }
 
 impl<B: BlockDevice + 'static> FatVolume<B> {
@@ -94,6 +100,23 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
     /// the 0xAA55 signature, detecting FAT12/16/32 by cluster
     /// count, and (for FAT32) loading the FSInfo sector.
     pub async fn mount(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
+        // A kernel-internal mount (the root-mount walker) has no mounting
+        // task: `init_fs.umask` is 0022 and init's ids are 0, which is the
+        // state Linux's own early mounts get.
+        Self::mount_with_opts(
+            device,
+            domain,
+            crate::mount_opts::FatOpts::defaults(0, 0, 0o022),
+        )
+        .await
+    }
+
+    /// `fat_fill_super` with the options the mount was given.
+    pub async fn mount_with_opts(
+        device: Arc<B>,
+        domain: DomainId,
+        opts: crate::mount_opts::FatOpts,
+    ) -> Result<Arc<Self>, FsError> {
         let lbs = device.logical_block_size() as usize;
         let buffer = alloc_coherent(lbs, domain)
             .map_err(|_| FsError::Io(narf_block::BlockError::IOError))?;
@@ -163,7 +186,8 @@ impl<B: BlockDevice + 'static> FatVolume<B> {
             self_weak: self_weak.clone(),
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
-            tz_offset_secs: 0,
+            tz_offset_secs: opts.tz_offset_secs,
+            opts,
         }))
     }
 
@@ -436,7 +460,14 @@ impl<B: BlockDevice + 'static> FsInstance for FatVolume<B> {
             narf_filesystem::Stat {
                 size: 0,
                 blocks: 0,
-                mode: narf_filesystem::Mode::DIR_RO,
+                // `fat_read_root`: `fat_make_mode(sbi, ATTR_DIR, S_IRWXUGO)`
+                // — the root obeys `dmask` like every other directory, and
+                // a fixed 0555 left a `uid=`/`umask=` mount with a root
+                // nobody could write.
+                mode: narf_filesystem::Mode {
+                    file_type: narf_filesystem::FileType::Dir,
+                    perms: self.opts.make_mode(false, true, false),
+                },
                 mtime_cycles: 0,
             },
             // Linux `fat_read_root`: every root timestamp is 0.
