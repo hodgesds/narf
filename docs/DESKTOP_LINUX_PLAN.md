@@ -178,6 +178,51 @@ never accumulate unverifiable work.
   rootfs is built by `REGEN_alpine_rootfs.sh` (not committed / not an auto CI
   case — it displaces the virtio-blk content smoke). On `main`.
 
+- **Rung 13 (stock Fedora + systemd as PID 1) — DONE.** The Alpine/busybox
+  chroot above proved a distro's *userland*; this boots a real **Fedora 43**
+  image with **systemd as PID 1** — units, targets, journal, D-Bus,
+  `systemd-udevd` with a populated device database, seats, and a
+  `systemd --user` manager for the desktop user. `distro_fedora` is the
+  launcher; the kernel hands systemd the real cmdline via
+  `SYSTEMD_PROC_CMDLINE`, and an xtask acceptance gate covers systemd-PID1
+  networking (qemu-net + netns). The image is built by
+  `REGEN_fedora_kde_rootfs.sh` and is not committed, so this is a local /
+  marker-gated gate rather than an automatic CI case.
+- **Rung 14 (desktop audio: stock PipeWire + WirePlumber) — DONE, one defect
+  open.** Unmodified Fedora PipeWire 1.4 and WirePlumber 0.5 build a complete
+  audio graph on NARF: both QEMU cards reach udev's database with the
+  properties `spa_alsa_udev` needs, WirePlumber attaches as a second process
+  over the PipeWire protocol, builds ACP card profiles, activates routes, and
+  exports sinks and a source that `wpctl status` lists. Five Linux-ABI defects
+  it surfaced are fixed (`/dev/snd` node ownership, `/proc/<pid>/root` rendered
+  in the reader's root frame, followable magic links, per-thread
+  `task/<tid>/{stat,comm}`, codec-reported HDA formats). **Open:**
+  WirePlumber's main thread burns ~100% of one CPU once the graph is built;
+  the gate reports it every run rather than failing on it. Details and the
+  elimination list: `verification/data/pipewire-compat/README.md`.
+- **Rung 15 (KDE Plasma session) — IN PROGRESS, the current frontier.** The
+  Fedora image runs a real Plasma Wayland session under `systemd --user`:
+  `distro_kde` chroots and execs the session, and a process-level oracle
+  (`fedora-plasma-probe.sh`) watches `kwin_wayland`, `plasmashell`, `kded`,
+  `kcminit` and `ksmserver`, emitting `PLASMA-READY` when kwin_wayland and
+  plasmashell both survive 10 s and `PLASMA-BLOCKED` otherwise. A long tail of
+  guards and taps sits beside it (`fedora-journal-tap.sh`,
+  `fedora-udev-seat-gate.sh`, `fedora-drm-policy.sh`,
+  `fedora-kcminit-wayland-guard.sh`, `fedora-xkbcomp-capture.sh`,
+  `fedora-xrdb-guard.sh`, …), each one a defect that was chased down. This is
+  **not** a closed result: Plasma is deliberately excluded from the audio gate
+  (`ConditionKernelCommandLine=!narf_audio_check`) because a Plasma process
+  taking a fatal fault left the guest spinning and cost that gate its verdict.
+- **Rung 16 (native AMDGPU display) — IMPLEMENTED, never run on silicon.**
+  Separate from the QEMU ladder above: a Stage::Late worker
+  (`amdgpu_usbc::start` → `amdgpu_platform::start`) boots DMCUB through the
+  Phoenix PSP 13.0.4 GPCOM ring, discovers sinks, derives timing from EDID,
+  runs a fixed-point DML port for watermarks and prefetch, programs the
+  DCN 3.1.4 pipeline (OTG, HUBP, DPP, MPC, OPP, DP stream encoder), trains the
+  link, and publishes a scanout that `narf_fb` adopts — including tunnelled
+  USB4 sinks and replay across suspend. **Nothing in this path has executed on
+  real hardware**; see `docs/notes/2026-10-07-amdgpu-status.md`.
+
 ### Kernel-ABI fixes the Wayland stack surfaced (each helps all Linux software)
 
 - **`stat` works on a mounted on-disk rootfs**: `stat`/`lstat`/`statx` drove
@@ -216,23 +261,28 @@ never accumulate unverifiable work.
 
 ### Remaining toward a *usable* desktop (not yet done)
 
-The minimal compositor (map a window, present via KMS, deliver real input,
-run an off-the-shelf client) is now proven end to end. The remaining work is
-breadth — running a *full* stock compositor + richer clients:
+The ladder's original question — can unmodified Linux graphics software run
+at all — is answered. What is left is a different question: does a *whole
+desktop session* stay up and stay responsive.
 
-- **A complete off-the-shelf compositor** — weston `--use-pixman` (or a
-  wlroots/Pixman one) instead of our minimal hand-written one, driving its own
-  KMS present + libinput. This is the integration that turns the pieces into a
-  real desktop session. Likely needs libinput + a udev shim, and exercises far
-  more of the protocol than our test compositors do.
-- **Richer / GPU clients** — a toolkit app (SDL2, GTK) beyond simple-shm, then
-  GL via Mesa-swrast. Likely next kernel gaps: PRIME/dma-buf buffer sharing,
-  more `epoll`/`signalfd`/`timerfd` edges, udev enumeration.
-- **Pointer/touch from real hardware** — Rung 11 bridges real evdev *keys*;
-  extend the bridge to pointer motion/buttons + the virtio-tablet, and feed
-  libinput rather than translating EV_* by hand.
-- **xdg-shell window management** — interactive move/resize/configure cycles,
-  multiple toplevels with focus, popups — vs the single map+present we prove.
+- **A Plasma session that stays alive** (Rung 15). `PLASMA-READY` is the
+  oracle; getting it green and keeping it green is the frontier. The failures
+  are no longer "feature absent" but "process faults / hangs under load",
+  which is a harder and less mechanical class of bug.
+- **The WirePlumber spin** (Rung 14). A silent dispatch loop at ~100% of one
+  CPU with every functional stage passing. Narrowing it wants a tracer, and
+  `strace -p` currently blocks in `wait4` because a tracee's attach-stop is
+  never reported to a tracer that did not fork it. **Reporting that stop is
+  the concrete next step**, and it unblocks diagnosis generally.
+- **Richer / GPU clients.** A toolkit app beyond simple-shm, then GL via
+  Mesa-swrast on the render node. Likely next gaps: PRIME/dma-buf export and
+  import between compositor and client, and more `epoll`/`signalfd`/`timerfd`
+  edges.
+- **Pointer and touch from real hardware,** fed to libinput rather than
+  translating `EV_*` by hand.
+- **Silicon.** Everything above is QEMU. The Stage 5 laptop gate — boot from
+  USB on Renoir/Lucienne or Phoenix HawkPoint1, native AMDGPU modeset,
+  keyboard, touchpad, Wi-Fi, NVMe — remains open. See `STATUS.md`.
 
 Note: the `user-mode-testbin` harness mounts no `/dev`, so device-file
 end-to-end proofs run from the **boot-init shell** (`run-interactive` /
@@ -240,27 +290,35 @@ end-to-end proofs run from the **boot-init shell** (`run-interactive` /
 
 ---
 
-## Current state (updated 2026-06-20)
+## Current state (updated 2026-10-07)
 
-All of Rungs 0–7 below have **landed on `main`** — see the Progress section
-above for what each delivered and how it's CI-proven. In short, NARF now:
+Rungs 0-12 landed on `main` and are CI-proven; Rungs 13-14 landed behind
+locally built rootfs images; Rung 15 is the open frontier. In short, NARF now:
 
 - maps device memory into userspace (the Rung-0 `FileOps::mmap_frames` +
   `sys_mmap MAP_SHARED` keystone);
-- exposes `/dev/fb0` (Linux fbdev), `/dev/input/event*` (evdev), and
-  `/dev/dri/card0` (DRM/KMS dumb-buffer modeset) — each driven by a real
-  musl C smoke;
-- runs unmodified **libdrm** (`modetest` enumerates + sets a mode +
-  presents + page-flips);
-- runs unmodified **libwayland** (libffi + libwayland 1.23 static-musl): a
-  Wayland compositor serves **multiple independent GUI client processes**,
-  each passing a frame-backed shared buffer over the socket (`SCM_RIGHTS`)
-  that the compositor blits to the screen.
+- exposes `/dev/fb0` (fbdev), `/dev/input/event*` (evdev), `/dev/uinput`, and
+  `/dev/dri/card0` (DRM/KMS dumb buffers, page-flip events), each driven by a
+  real musl C smoke;
+- runs unmodified **libdrm** (`modetest` enumerates, sets a mode, presents,
+  page-flips) and unmodified **libwayland** (a compositor serves multiple
+  independent GUI client processes passing frame-backed buffers over
+  `SCM_RIGHTS`), including an upstream weston client binary;
+- boots **stock Fedora 43 with systemd as PID 1** — journal, D-Bus, udev with
+  a populated database, seats, `systemd --user` — and runs **stock PipeWire +
+  WirePlumber** to a complete audio graph on it;
+- starts a **KDE Plasma Wayland session** on that image, which is where the
+  work currently is.
+
+A caveat that governs how to read all of this: the Fedora and Alpine images
+are generated locally by `REGEN_*_rootfs.sh` and are **not committed**, so
+Rungs 13-15 are marker-gated local gates, not automatic CI cases. Rungs 0-12
+are automatic `musl-demo` cases.
 
 The original pre-Rung-0 gaps once recorded here — "no device mmap",
-"DUMB_BUFFER returns 0", "card wired to amdgpu" — are all **resolved**. The
-card is the bochs/virtio-gpu DRM card; dumb buffers alloc/map/scanout;
-`SETCRTC` blits.
+"DUMB_BUFFER returns 0", "card wired to amdgpu" — are all resolved. Under
+QEMU the card is the bochs/virtio-gpu DRM card; dumb buffers alloc, map and
+scan out; `SETCRTC` blits.
 
 The sections below are the **original rung specifications** (kept for
 reference / rationale). They describe the work as future TODO; it is all
@@ -351,9 +409,12 @@ Verify: the program runs unmodified from the initramfs/rootfs and draws.
 - **Mesa software** (swrast/llvmpipe) on the render node → GL without HW.
 - **Wayland**: `libwayland` + a pixman-renderer compositor (weston
   `--use-pixman`, or a minimal wlroots-pixman compositor).
-- **dbus / udev-shim / logind-shim / fontconfig / freetype** as clients
-  hit them.
-- A minimal DE / panel. (GNOME/KDE remain out of scope.)
+- **dbus / udev / logind / fontconfig / freetype** as clients hit them.
+  (Superseded: these are no longer shims — stock systemd, `systemd-udevd` and
+  D-Bus run on the Fedora image. See Rung 13.)
+- A minimal DE / panel. (Superseded: KDE Plasma is the target — Rung 15.
+  This line read "GNOME/KDE remain out of scope" and is kept only to show
+  where the scope moved.)
 
 Hardware-accelerated GL/Vulkan via a real amdgpu command-submission path
 is a separate, much larger track (the existing `amdgpu_*` files) and is
