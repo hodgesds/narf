@@ -6207,6 +6207,85 @@ kernel_test_in!(
     smoke_ext4_new_dirs_and_slow_symlinks_are_extent_mapped
 );
 
+/// `i_size` is 64 bits: `i_size_lo` at byte 4 and `i_size_high` at byte 108
+/// (`ext4_isize`). The driver kept 32, so a file Linux grew past 4 GiB read
+/// back with its size wrapped, a write ending past 4 GiB stored a wrapped
+/// size, and truncate/fallocate past 4 GiB were EINVAL. Writing a size past
+/// 2 GiB turns RO_COMPAT_LARGE_FILE on (`ext4_update_inode`), and
+/// `s_maxbytes` — not 4 GiB — is the limit, answered EFBIG.
+fn smoke_ext4_file_size_is_64_bit() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsError;
+
+    use crate::inode::Inode;
+    const GIB: u64 = 1 << 30;
+
+    // The codec: both halves, and a shrink clears a stale high half.
+    let mut raw = alloc::vec![0u8; 128];
+    let mut inode = Inode::new_regular(0o644);
+    inode.size = 5 * GIB + 123;
+    inode.encode_into(&mut raw);
+    if Inode::parse(&raw).map(|i| i.size) != Some(5 * GIB + 123) {
+        return TestResult::Fail("a size past 4 GiB did not round-trip through i_size_high");
+    }
+    inode.size = 77;
+    inode.encode_into(&mut raw);
+    if Inode::parse(&raw).map(|i| i.size) != Some(77) {
+        return TestResult::Fail("shrinking below 4 GiB left a stale i_size_high");
+    }
+
+    // A volume: grow sparsely past 4 GiB, write there, and remount.
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (volume, file) = match mount_ext4_data(device.clone()) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    if poll_once(file.truncate(6 * GIB)).is_none_or(|r| r.is_err()) || file.stat().size != 6 * GIB {
+        return TestResult::Fail("truncate to 6 GiB failed");
+    }
+    if !matches!(poll_once(file.write(5 * GIB, b"far")), Some(Ok(3))) {
+        return TestResult::Fail("a write at 5 GiB failed");
+    }
+    let mut back = [0u8; 3];
+    if !matches!(poll_once(file.read(5 * GIB, &mut back)), Some(Ok(3))) || &back != b"far" {
+        return TestResult::Fail("the byte written at 5 GiB did not read back");
+    }
+    // `s_maxbytes`: past it is EFBIG, for a size change and for a write.
+    let max = volume.max_file_size();
+    if !matches!(
+        poll_once(file.truncate(max + 1)),
+        Some(Err(FsError::FileTooLarge))
+    ) {
+        return TestResult::Fail("truncate past s_maxbytes must be EFBIG");
+    }
+    if !matches!(
+        poll_once(file.write(max, b"x")),
+        Some(Err(FsError::FileTooLarge))
+    ) {
+        return TestResult::Fail("a write at s_maxbytes must be EFBIG");
+    }
+    drop(file);
+    drop(volume);
+    let (volume, file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("the volume did not remount"),
+    };
+    if file.stat().size != 6 * GIB {
+        return TestResult::Fail("a size past 4 GiB did not survive a remount");
+    }
+    if !matches!(poll_once(file.read(5 * GIB, &mut back)), Some(Ok(3))) || &back != b"far" {
+        return TestResult::Fail("the byte at 5 GiB did not survive a remount");
+    }
+    let mut sb = [0u8; 4];
+    if poll_once(volume.read_byte_range(1024 + 100, &mut sb)).is_none_or(|r| r.is_err())
+        || u32::from_le_bytes(sb) & crate::superblock::ro_compat::LARGE_FILE == 0
+    {
+        return TestResult::Fail("a file past 2 GiB did not turn RO_COMPAT_LARGE_FILE on");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext4_file_size_is_64_bit);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font

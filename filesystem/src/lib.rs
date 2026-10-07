@@ -766,6 +766,11 @@ pub enum FsError {
     /// A filesystem quota or qgroup hard limit would be exceeded. Maps to
     /// Linux `EDQUOT`, distinct from exhausted backing storage (`ENOSPC`).
     QuotaExceeded,
+    /// The file would grow past the largest size its filesystem can
+    /// represent (`s_maxbytes`; `inode_newsize_ok`, `ext4_insert_range`).
+    /// Maps to Linux `EFBIG`, distinct from a range the caller got wrong
+    /// (`EINVAL`).
+    FileTooLarge,
     /// A subsystem the operation depends on is not switched on for this
     /// filesystem. Maps to Linux `ENOTCONN`, which btrfs returns from every
     /// qgroup ioctl when quotas are disabled (`fs/btrfs/ioctl.c`:

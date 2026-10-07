@@ -42,16 +42,12 @@ pub struct Ext4Inode {
     /// `i_flags` — offset 32 of the on-disk inode. Per-file feature
     /// flags including `EXT4_EXTENTS_FL`.
     pub flags: u32,
-    /// Upper 32 bits of `i_size`. Combined with `core.size` they
-    /// form a 64-bit file length (HUGE_FILE / LARGE_FILE).
-    /// Offset 108 on the on-disk inode (`i_size_high`).
-    pub size_hi: u32,
 }
 
 impl Ext4Inode {
     /// Decode an ext4 inode from `buf`. Reads the shared 128-byte
-    /// core plus the ext4-only fields at offsets 32 (`i_flags`) and
-    /// 108 (`i_size_high`).
+    /// core — which already carries the full 64-bit `i_size`, high half
+    /// (offset 108) included — plus `i_flags` at offset 32.
     ///
     /// Returns `None` if the core decode fails (bad core layout) or
     /// `buf` is too short to contain the extended fields.
@@ -62,24 +58,13 @@ impl Ext4Inode {
             return None;
         }
         let flags = u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]);
-        // i_size_high at offset 108 (4 bytes). Falls back to zero
-        // on 128-byte rev-0 inodes — those are pre-LARGE_FILE.
-        let size_hi = if buf.len() >= 112 {
-            u32::from_le_bytes([buf[108], buf[109], buf[110], buf[111]])
-        } else {
-            0
-        };
-        Some(Self {
-            core,
-            flags,
-            size_hi,
-        })
+        Some(Self { core, flags })
     }
 
-    /// 64-bit file size — `i_size_high << 32 | i_size`. Files larger
-    /// than 4 GiB depend on this; smaller files have `size_hi == 0`.
+    /// 64-bit file size — `i_size_high << 32 | i_size`, as the shared core
+    /// decodes it. Files larger than 4 GiB depend on the high half.
     pub fn size64(&self) -> u64 {
-        ((self.size_hi as u64) << 32) | self.core.size as u64
+        self.core.size
     }
 
     /// True iff `EXT4_EXTENTS_FL` is set — the inode's `i_block[]`
@@ -136,20 +121,16 @@ impl Ext4Inode {
         Self {
             core,
             flags: EXT4_EXTENTS_FL,
-            size_hi: 0,
         }
     }
 
     /// Encode the ext4-only fields into `buf`. Caller should call
-    /// `Inode::encode_into` first to write the shared fields, then
-    /// this to overwrite `i_flags` and `i_size_high`.
+    /// `Inode::encode_into` first to write the shared fields — the full
+    /// 64-bit `i_size` among them — then this to overwrite `i_flags`.
     pub fn encode_into(&self, buf: &mut [u8]) {
         if buf.len() < 36 {
             return;
         }
         buf[32..36].copy_from_slice(&self.flags.to_le_bytes());
-        if buf.len() >= 112 {
-            buf[108..112].copy_from_slice(&self.size_hi.to_le_bytes());
-        }
     }
 }

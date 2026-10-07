@@ -329,6 +329,9 @@ pub struct Ext2Volume<B: BlockDevice + 'static> {
     /// released (Linux's deferred `iput_final`). Drained by
     /// [`Self::lock_inode_updates`].
     orphans: IrqSafeSpinLock<Vec<u32>>,
+    /// `s_feature_ro_compat & RO_COMPAT_LARGE_FILE`, as on disk now. Set
+    /// once, when the first inode past 2 GiB is written.
+    large_file: core::sync::atomic::AtomicBool,
     /// Source of node incarnations; see [`Self::new_file_mapping`].
     incarnations: core::sync::atomic::AtomicU32,
     /// Serializes whole-inode read/modify/write sequences. Directory
@@ -685,6 +688,9 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             bdev_mapping: BlockMapping::new(page_cache, 0),
             icache: IrqSafeSpinLock::new(BTreeMap::new()),
             orphans: IrqSafeSpinLock::new(Vec::new()),
+            large_file: core::sync::atomic::AtomicBool::new(
+                superblock.feature_ro_compat & super::superblock::ro_compat::LARGE_FILE != 0,
+            ),
             incarnations: core::sync::atomic::AtomicU32::new(1),
             inode_update_lock: Mutex::new(()),
             allocation_lock: Mutex::new(()),
@@ -1280,6 +1286,13 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         } else {
             self.read_byte_range(inode_byte_off, &mut buf).await?;
         }
+        // `ext4_update_inode`: the first file past 2 GiB turns the volume's
+        // RO_COMPAT_LARGE_FILE on, or an older kernel / e2fsck would take
+        // `i_size_high` for ext2's `i_dir_acl`.
+        if inode.size > 0x7fff_ffff && !self.large_file.load(core::sync::atomic::Ordering::Acquire)
+        {
+            self.set_large_file_feature().await?;
+        }
         inode.encode_into(&mut buf);
         // Keep this self-contained so every inode metadata writer
         // (chmod/chown, truncate, directory links, and data writes) inherits
@@ -1572,6 +1585,28 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             return Err(FsError::InvalidData);
         }
         self.write_byte_range(offset, &desc).await
+    }
+
+    /// Turn on RO_COMPAT_LARGE_FILE in the on-disk superblock (byte 100 of
+    /// it), keeping its checksum valid. Under the allocation lock, the one
+    /// the counter updates take for the same read-modify-write.
+    async fn set_large_file_feature(&self) -> Result<(), FsError> {
+        use core::sync::atomic::Ordering;
+        let _allocation = self.allocation_lock.lock().await;
+        if self.large_file.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut bytes = vec![0u8; 1024];
+        self.read_byte_range(1024, &mut bytes).await?;
+        let ro_compat = u32::from_le_bytes(bytes[100..104].try_into().expect("four bytes"))
+            | super::superblock::ro_compat::LARGE_FILE;
+        bytes[100..104].copy_from_slice(&ro_compat.to_le_bytes());
+        if metadata_csum::write_superblock_checksum(&self.superblock, &mut bytes).is_none() {
+            return Err(FsError::InvalidData);
+        }
+        self.write_byte_range(1024, &bytes).await?;
+        self.large_file.store(true, Ordering::Release);
+        Ok(())
     }
 
     async fn update_superblock_counters(&self, blocks: i64, inodes: i64) -> Result<(), FsError> {
@@ -2107,6 +2142,19 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
             self.extent_prealloc(inode_no, inode, logical).await?;
         }
         Ok(())
+    }
+
+    /// `s_maxbytes` (`ext4_max_size` without HUGE_FILE): `i_blocks` counts
+    /// 512-byte sectors in 32 bits, which bounds a file at 2^32 - 1 sectors,
+    /// rounded down to whole blocks — 2 TiB. Extent and block-map
+    /// addressing both reach further, so this is the limit.
+    ///
+    /// LINUX-GAP: with HUGE_FILE Linux widens `i_blocks` with
+    /// `l_i_blocks_hi` (and `EXT4_HUGE_FILE_FL` units) and allows 16 TiB at
+    /// 4 KiB blocks; this driver keeps the 32-bit `i_blocks`.
+    pub(crate) fn max_file_size(&self) -> u64 {
+        let blkbits = self.block_size().trailing_zeros();
+        ((u64::from(u32::MAX)) >> (blkbits - 9)) << blkbits
     }
 
     /// Whether `inode` maps its data through an extent tree — the inodes

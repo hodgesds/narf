@@ -323,7 +323,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         self.write_directory_block(parent_inode_no, parent_inode, phys, &mut blockbuf)
             .await?;
         // Update parent inode bookkeeping.
-        parent_inode.size += bs as u32;
+        parent_inode.size += bs as u64;
         // i_blocks is in 512-byte sectors.
         parent_inode.blocks = parent_inode.blocks.saturating_add(bs as u32 / 512);
         self.write_inode(parent_inode_no, parent_inode).await
@@ -496,7 +496,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
                 return Err(e);
             }
         };
-        new_inode.size = bs as u32;
+        new_inode.size = bs as u64;
         // Write "." + ".." into the data block.
         let mut blockbuf = vec![0u8; bs];
         splice::make_empty_dir(&mut blockbuf, new_ino, parent_inode_no);
@@ -855,7 +855,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
         let mut new_inode = Inode::new_symlink(0o777);
         new_inode.atime = now;
         new_inode.touch_ctime_mtime(now);
-        new_inode.size = target.len() as u32;
+        new_inode.size = target.len() as u64;
         // The data block of a slow symlink, for rollback.
         let mut slow_block: Option<u64> = None;
 

@@ -1081,6 +1081,9 @@ without creating the snapshot.
 `FsError::QuotaExceeded` is the storage-independent hard-quota failure and maps
 to Linux `EDQUOT`. It remains distinct from `FsError::NoSpace`/`ENOSPC`, so a
 caller can distinguish policy exhaustion from exhausted backing storage.
+`FsError::FileTooLarge` is a size past what the filesystem can represent
+(`s_maxbytes`: `inode_newsize_ok`, `ext4_insert_range`) and maps to Linux
+`EFBIG`, distinct from a malformed range (`InvalidData`/`EINVAL`).
 `FsError::OperationNotPermitted` represents an operation prohibited by object
 state and maps to Linux `EPERM`; it remains distinct from access-mode or
 credential denial (`PermissionDenied`/`EACCES`) and a read-only filesystem

@@ -138,7 +138,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             FileType::File
         };
         Stat {
-            size: inode.size as u64,
+            size: inode.size,
             blocks: inode.blocks as u64,
             mode: Mode {
                 file_type,
@@ -219,7 +219,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         offset: u64,
         dst: &mut [u8],
     ) -> Result<usize, FsError> {
-        let size = inode.size as u64;
+        let size = inode.size;
         if offset >= size {
             return Ok(0);
         }
@@ -279,7 +279,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
     /// is read uncached instead — it cannot be resident, so it holds no
     /// newer bytes than the disk.
     async fn read_file(&self, offset: u64, dst: &mut [u8]) -> Result<usize, FsError> {
-        let size = u64::from(self.load_inode().await?.size);
+        let size = self.load_inode().await?.size;
         if offset >= size {
             return Ok(0);
         }
@@ -328,6 +328,15 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         src: &[u8],
     ) -> Result<usize, FsError> {
         let inode_no = self.inode_no;
+        // `generic_write_checks_count`: at or past `s_maxbytes` is EFBIG, and
+        // a write crossing it is cut short there.
+        let max = self.volume.max_file_size();
+        if offset >= max {
+            return Err(FsError::FileTooLarge);
+        }
+        let src = &src[..src
+            .len()
+            .min((max - offset).min(usize::MAX as u64) as usize)];
         let mut done = 0usize;
         while done < src.len() {
             let pos = offset + done as u64;
@@ -359,8 +368,8 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
             }
             done += n;
             let end = pos + n as u64;
-            if end > u64::from(inode.size) {
-                inode.size = end as u32;
+            if end > inode.size {
+                inode.size = end;
             }
             // Publish the new block map and size to concurrent page fills
             // before this page's reference is dropped (after which reclaim
@@ -424,7 +433,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         let _update = self.volume.lock_inode_updates().await;
         let inode_no = self.state.lock().inode_no;
         let mut inode = self.volume.read_inode(inode_no).await?;
-        let Some(end) = clip(u64::from(inode.size)) else {
+        let Some(end) = clip(inode.size) else {
             return Ok(());
         };
         self.mapping.remove_range(first_page, end_page);
@@ -459,9 +468,12 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         if !self.volume.extent_mapped(&inode) {
             return Err(FsError::Unsupported);
         }
-        // LINUX-GAP: 32-bit `i_size`, as in `fallocate` mode 0.
-        let new_size = if !keep_size && end > u64::from(inode.size) {
-            Some(u32::try_from(end).map_err(|_| FsError::InvalidData)?)
+        // `inode_newsize_ok`: past `s_maxbytes` is EFBIG.
+        let new_size = if !keep_size && end > inode.size {
+            if end > self.volume.max_file_size() {
+                return Err(FsError::FileTooLarge);
+            }
+            Some(end)
         } else {
             None
         };
@@ -521,28 +533,30 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         let bs = self.volume.block_size() as u64;
         let page = PAGE_SIZE as u64;
         let end = offset.checked_add(len).ok_or(FsError::InvalidData)?;
-        let validate = |volume: &Ext2Volume<B>, inode: &Inode| -> Result<u32, FsError> {
+        let validate = |volume: &Ext2Volume<B>, inode: &Inode| -> Result<u64, FsError> {
             if !volume.extent_mapped(inode) {
                 return Err(FsError::Unsupported);
             }
             if (offset | len) % bs != 0 {
                 return Err(FsError::InvalidData);
             }
-            let size = u64::from(inode.size);
+            let size = inode.size;
             if insert {
                 if offset >= size {
                     return Err(FsError::InvalidData);
                 }
-                // LINUX-GAP: `s_maxbytes` is EFBIG on Linux; this driver's
-                // 32-bit `i_size` is the limit, answered as `truncate` does.
-                u32::try_from(size + len).map_err(|_| FsError::InvalidData)
+                // "Check whether the maximum file size would be exceeded".
+                if len > volume.max_file_size().saturating_sub(size) {
+                    return Err(FsError::FileTooLarge);
+                }
+                Ok(size + len)
             } else {
                 // "There is no need to overlap collapse range with EOF, in
                 // which case it is effectively a truncate operation".
                 if end >= size {
                     return Err(FsError::InvalidData);
                 }
-                Ok((size - len) as u32)
+                Ok(size - len)
             }
         };
         let inode_no = self.state.lock().inode_no;
@@ -664,7 +678,7 @@ impl<B: BlockDevice + 'static> Ext2Node<B> {
         let inode_no = self.inode_no;
         let mut inode = self.volume.read_inode(inode_no).await?;
         let before = (inode.blocks, inode.block);
-        let size = u64::from(inode.size);
+        let size = inode.size;
         let mut result = Ok(());
         for folio in &dirty {
             let page_start = folio.page() * PAGE_SIZE as u64;
@@ -899,11 +913,13 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
-            // LINUX-GAP: `i_size` is 32 bits here (no `i_size_high`), so a
-            // range ending past 4 GiB is refused as `truncate` refuses it
-            // (EINVAL) where Linux would allocate it.
-            let new_size = if mode & KEEP_SIZE == 0 && end > u64::from(inode.size) {
-                Some(u32::try_from(end).map_err(|_| FsError::InvalidData)?)
+            // `ext4_do_fallocate` -> `inode_newsize_ok`: past `s_maxbytes` is
+            // EFBIG.
+            let new_size = if mode & KEEP_SIZE == 0 && end > inode.size {
+                if end > self.volume.max_file_size() {
+                    return Err(FsError::FileTooLarge);
+                }
+                Some(end)
             } else {
                 None
             };
@@ -933,14 +949,18 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
 
     fn truncate<'a>(&'a self, len: u64) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            let new_size = u32::try_from(len).map_err(|_| FsError::InvalidData)?;
+            // `inode_newsize_ok`: past `s_maxbytes` is EFBIG.
+            if len > self.volume.max_file_size() {
+                return Err(FsError::FileTooLarge);
+            }
+            let new_size = len;
             let _update = self.volume.lock_inode_updates().await;
             let inode_no = self.state.lock().inode_no;
             let mut inode = self.volume.read_inode(inode_no).await?;
             if inode.is_dir() {
                 return Err(FsError::InvalidPath);
             }
-            let old_size = u64::from(inode.size);
+            let old_size = inode.size;
             if len < old_size {
                 // Publish i_size first so a racing fault at/after the new EOF
                 // fails. Then revoke every existing borrowed PTE before cache

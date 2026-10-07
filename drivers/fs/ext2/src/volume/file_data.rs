@@ -29,7 +29,7 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     ) -> Result<(), FsError> {
         debug_assert_eq!(dst.len(), PAGE_SIZE);
         let bs = self.block_size() as u64;
-        let size = u64::from(inode.size);
+        let size = inode.size;
         let start = page * PAGE_SIZE as u64;
         if start >= size {
             dst.fill(0);

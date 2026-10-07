@@ -1929,6 +1929,7 @@ fn open_impl_reserved(
                         narf_filesystem::FsError::NoDevice => 19, // ENODEV
                         narf_filesystem::FsError::OutOfMemory => 12,
                         narf_filesystem::FsError::QuotaExceeded => 122,
+                        narf_filesystem::FsError::FileTooLarge => 27, // EFBIG
                         // ENOTCONN. No `open` path produces it today — it is
                         // the qgroup ioctls' answer for "quotas are off" — but
                         // translating it truthfully costs nothing and is
@@ -4773,6 +4774,7 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::NoDevice => 19, // ENODEV
         narf_filesystem::FsError::OutOfMemory => 12,
         narf_filesystem::FsError::QuotaExceeded => 122,
+        narf_filesystem::FsError::FileTooLarge => 27, // EFBIG
         // ENOTCONN — see `FsError::NotConnected`.
         narf_filesystem::FsError::NotConnected => 107,
         narf_filesystem::FsError::BrokenPipe | narf_filesystem::FsError::StreamXrun => 32,
