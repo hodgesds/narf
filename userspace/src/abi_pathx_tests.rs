@@ -4143,6 +4143,55 @@ kernel_test_in!(
     smoke_abi_pathx_proc_self_fd_jump_reaches_the_file
 );
 
+// `chmod`/`chown` of a followed `/proc/self/fd/N` change the descriptor's own
+// file (`nd_jump_link`). Both resolve through the in-filesystem walker, which
+// took the procfs link literally: the change never reached the file. systemd's
+// `fchmod_opath` / `fchown_opath` fall back to exactly these calls on an
+// O_PATH descriptor. A descriptor the table does not hold is no entry of
+// `/proc/self/fd`: ENOENT.
+fn smoke_abi_pathx_chmod_chown_through_proc_self_fd() -> TestResult {
+    const O_PATH: u64 = 0o10000000;
+    with_memfs("/p2", "p2", &[("f", b"hello")], || {
+        let path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not O_PATH-open the seeded file"),
+        };
+        let magic = proc_self_fd_path(fd);
+        match call(
+            Syscall::Fchmodat.raw(),
+            a3(AT_FDCWD, magic.as_ptr() as u64, 0o640, 0),
+        ) {
+            Some(0) if file_perms("/p2/f") == Some(0o640) => {}
+            Some(0) => return Err("chmod(/proc/self/fd/N) did not reach the descriptor's file"),
+            _ => return Err("chmod(/proc/self/fd/N) should return 0"),
+        }
+        match call(
+            Syscall::Fchownat.raw(),
+            a3(AT_FDCWD, magic.as_ptr() as u64, 1234, 5678),
+        ) {
+            Some(0) if file_owners("/p2/f") == Some((1234, 5678)) => {}
+            Some(0) => return Err("chown(/proc/self/fd/N) did not reach the descriptor's file"),
+            _ => return Err("chown(/proc/self/fd/N) should return 0"),
+        }
+        let missing = proc_self_fd_path(9999);
+        match call(
+            Syscall::Fchmodat.raw(),
+            a3(AT_FDCWD, missing.as_ptr() as u64, 0o600, 0),
+        ) {
+            Some(v) if v == ENOENT_E => Ok(()),
+            _ => Err("chmod(/proc/self/fd/<closed>) must be -ENOENT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_chmod_chown_through_proc_self_fd
+);
+
 // `fs/stat.c::SYSCALL_DEFINE5(statx)` → do_statx → vfs_statx → cp_statx.
 // The mask and sync-type checks precede path resolution; vfs_statx's flag
 // gate precedes the walk; cp_statx's copy comes last.

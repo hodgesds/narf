@@ -1131,6 +1131,38 @@ fn proc_fd_magic_target(task: u64, user_path: &str) -> Option<alloc::string::Str
     fd_path_for_task(owner, fd).filter(|p| p.starts_with('/'))
 }
 
+/// Where a FOLLOWED `/proc/{self,thread-self,<pid>}/fd/N` lands for a
+/// syscall that changes the inode itself (`chmod`, `chown`). Following the
+/// magic link installs the descriptor's own file (`proc_fd_link` ->
+/// `nd_jump_link`), so the change applies to what the descriptor names —
+/// a pipe or a socket included, which has no path to walk.
+pub(crate) enum ProcFdJump {
+    /// One of the caller's own descriptors: act on it as `AT_EMPTY_PATH`
+    /// would.
+    Own(u32),
+    /// Another process's descriptor, as its file's caller-view path.
+    Path(alloc::string::String),
+}
+
+/// Classify `user_path` (caller view, absolute) as a proc-fd magic link
+/// being followed. `None` for anything else, and for a descriptor the table
+/// does not hold — that is no entry of the directory, and the ordinary walk
+/// reports ENOENT for it as Linux's lookup does.
+pub(crate) fn proc_fd_jump(task: u64, user_path: &str) -> Option<ProcFdJump> {
+    let own = user_path
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| user_path.strip_prefix("/proc/thread-self/fd/"));
+    match own {
+        Some(n) => {
+            let n = n.parse::<u32>().ok()?;
+            fd::with_table(task, |t| t.get(n).is_some())
+                .unwrap_or(false)
+                .then_some(ProcFdJump::Own(n))
+        }
+        None => proc_fd_magic_target(task, user_path).map(ProcFdJump::Path),
+    }
+}
+
 /// A node found by [`user_path_lookup`].
 pub(crate) struct LookedUpPath {
     /// Host-view absolute path (chroot applied), for resolver calls.
