@@ -372,6 +372,497 @@ pub fn authenticate_ap(v: &ApVerification<'_>) -> bool {
     verify_keyauth(v.public_key_der, v.key_auth, &sig_data)
 }
 
+/// AP-side WPA3 SAE-PK generation: password/Modifier derivation (proof-of-work
+/// over the public-key fingerprint), the base-32 encoding with the Damm
+/// checksum, KeyAuth signing and the SAE Confirm element assembly. Ported from
+/// the Wi-Fi Alliance reference (hostap `src/common/sae_pk.c` +
+/// `hostapd/sae_pk_gen.c`); the quasigroup tables are copied verbatim so
+/// generated passwords validate under hostapd. Gated behind the `sae-pk-ap`
+/// feature — NARF is primarily a station, so an AP build opts in.
+#[cfg(feature = "sae-pk-ap")]
+pub mod gen {
+    use super::*;
+    use alloc::string::String;
+    use narf_crypto::p256::ecdsa::sign_p256;
+    use narf_crypto::p256::point::{scalar_mul_base, AffinePoint};
+    use narf_crypto::p256::scalar::Scalar;
+
+    // Base-32 Damm quasigroup tables (hostap sae_pk.c, verbatim).
+    #[rustfmt::skip]
+    const D_MULT_TABLE: [u8; 1024] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0,
+        17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16,
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1,
+        18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17,
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2,
+        19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18,
+        4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3,
+        20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19,
+        5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4,
+        21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20,
+        6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5,
+        22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21,
+        7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6,
+        23, 24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22,
+        8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7,
+        24, 25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23,
+        9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+        25, 26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+        26, 27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+        27, 28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+        12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+        28, 29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        29, 30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+        14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+        30, 31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+        15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+        31, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+        16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17,
+        0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+        17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18,
+        1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2,
+        18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19,
+        2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3,
+        19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20,
+        3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4,
+        20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21,
+        4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5,
+        21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22,
+        5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6,
+        22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24, 23,
+        6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7,
+        23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25, 24,
+        7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8,
+        24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26, 25,
+        8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9,
+        25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27, 26,
+        9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10,
+        26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28, 27,
+        10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11,
+        27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29, 28,
+        11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12,
+        28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30, 29,
+        12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13,
+        29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31, 30,
+        13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14,
+        30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 31,
+        14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15,
+        31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16,
+        15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+    ];
+    const D_PERM_TABLE: [u8; 32] = [
+        7, 2, 1, 30, 16, 20, 27, 11, 31, 6, 8, 13, 29, 5, 10, 21, 22, 3, 24, 0, 23, 25, 12, 9, 28,
+        14, 4, 15, 17, 18, 19, 26,
+    ];
+
+    fn d_permute(mut val: u8, iter: u32) -> u8 {
+        for _ in 0..iter {
+            val = D_PERM_TABLE[val as usize];
+        }
+        val
+    }
+
+    fn d_invert(val: u8) -> u8 {
+        if val > 0 && val < 16 {
+            16 - val
+        } else {
+            val
+        }
+    }
+
+    /// Damm checksum character over a (possibly hyphenated) base-32 string;
+    /// hyphens are skipped, as in hostap `d_check_char`.
+    fn d_check_char(s: &[u8]) -> u8 {
+        let mut val = 0u8;
+        let mut iter = 1u32;
+        for &ch in s.iter().rev() {
+            let Some(c) = base32_value(ch) else {
+                continue;
+            };
+            let p = d_permute(c, iter);
+            iter += 1;
+            val = D_MULT_TABLE[val as usize * 32 + p as usize];
+        }
+        BASE32[d_invert(val) as usize]
+    }
+
+    /// Validate a SAE-PK password's trailing Damm checksum character (the typo
+    /// guard skipped by the station-side decoder).
+    pub fn validate_checksum(password: &str) -> bool {
+        let b = password.as_bytes();
+        b.len() >= 2 && b[b.len() - 1] == d_check_char(&b[..b.len() - 1])
+    }
+
+    // Read the top 19 bits big-endian; shift a buffer left by 19 bits with
+    // zero fill (hostap sae_pk_get_be19 / sae_pk_buf_shift_left_19).
+    fn get_be19(buf: &[u8]) -> u32 {
+        let b0 = *buf.first().unwrap_or(&0) as u32;
+        let b1 = *buf.get(1).unwrap_or(&0) as u32;
+        let b2 = *buf.get(2).unwrap_or(&0) as u32;
+        (b0 << 11) | (b1 << 3) | (b2 >> 5)
+    }
+    fn shift_left_19(buf: &mut [u8]) {
+        let len = buf.len();
+        if len < 3 {
+            buf.iter_mut().for_each(|b| *b = 0);
+            return;
+        }
+        let mut dst = 0usize;
+        let mut src = 2usize;
+        while src + 1 < len {
+            buf[dst] = (buf[src] << 3) | (buf[src + 1] >> 5);
+            dst += 1;
+            src += 1;
+        }
+        buf[dst] = buf[src] << 3;
+        dst += 1;
+        while dst < len {
+            buf[dst] = 0;
+            dst += 1;
+        }
+    }
+
+    /// Build the "PasswordBase" bit buffer: skip the `sec` leading zero octets
+    /// of the hash, then pack 20-bit groups of [Sec_1b | 19 fingerprint bits]
+    /// MSB-first (hostap sae_pk_gen.c).
+    fn password_base_bin(hash: &[u8], sec: usize) -> Vec<u8> {
+        let sec_1b: u32 = (sec == 3) as u32;
+        let ngroups = 8 * hash.len() / 20;
+        let mut work = hash[sec..].to_vec();
+        let mut bits: Vec<u8> = Vec::with_capacity(ngroups * 20);
+        for _ in 0..ngroups {
+            let val20 = (sec_1b << 19) | get_be19(&work);
+            shift_left_19(&mut work);
+            for b in (0..20).rev() {
+                bits.push(((val20 >> b) & 1) as u8);
+            }
+        }
+        let mut out = alloc::vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                out[i / 8] |= 1 << (7 - (i % 8));
+            }
+        }
+        out
+    }
+
+    fn add_char(out: &mut Vec<u8>, idx: u8, left: &mut usize) {
+        if *left == 0 {
+            return;
+        }
+        *left = left.saturating_sub(5);
+        if out.len() % 5 == 4 {
+            out.push(b'-');
+        }
+        out.push(BASE32[idx as usize]);
+    }
+
+    /// Base-32 encode `len_bits` of `src` into a hyphen-grouped password with a
+    /// trailing Damm checksum character (hostap sae_pk_base32_encode).
+    fn base32_encode(src: &[u8], len_bits: usize) -> String {
+        let len = len_bits.div_ceil(8);
+        let extra_pad = (5 - len % 5) % 5;
+        let mut out: Vec<u8> = Vec::new();
+        let mut left = len_bits;
+        let mut block: u64 = 0;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..(len + extra_pad) {
+            let val = if i < len { src[i] as u64 } else { 0 };
+            block = (block << 8) | val;
+            if i % 5 == 4 {
+                for j in (0..8).rev() {
+                    add_char(&mut out, ((block >> (j * 5)) & 0x1f) as u8, &mut left);
+                }
+                block = 0;
+            }
+        }
+        let chk = d_check_char(&out);
+        out.push(chk);
+        // All bytes are from BASE32 or '-', so this is valid ASCII/UTF-8.
+        String::from_utf8(out).unwrap_or_default()
+    }
+
+    /// Big-endian increment of the Modifier (hostap inc_byte_array).
+    fn inc_be(m: &mut [u8; SAE_PK_M_LEN]) {
+        for byte in m.iter_mut().rev() {
+            *byte = byte.wrapping_add(1);
+            if *byte != 0 {
+                break;
+            }
+        }
+    }
+
+    /// Proof-of-work search for a Modifier M such that
+    /// `SHA-256(SSID || M || K_AP)` begins with `leading_zero_octets` zero
+    /// bytes (Sec). Scans from the given `start` Modifier for up to `max_iters`
+    /// candidates; `None` if none is found within the bound. A real Sec=3
+    /// search averages 2^24 iterations, so callers pass a large bound.
+    pub fn find_modifier(
+        ssid: &[u8],
+        spki_der: &[u8],
+        leading_zero_octets: usize,
+        start: [u8; SAE_PK_M_LEN],
+        max_iters: u64,
+    ) -> Option<[u8; SAE_PK_M_LEN]> {
+        let mut m = start;
+        for _ in 0..max_iters {
+            let mut hasher = Sha256::new();
+            hasher.update(ssid);
+            hasher.update(&m);
+            hasher.update(spki_der);
+            let hash = hasher.finalize();
+            if hash[..leading_zero_octets].iter().all(|&b| b == 0) {
+                return Some(m);
+            }
+            inc_be(&mut m);
+        }
+        None
+    }
+
+    /// Generate the SAE-PK password of `groups` four-character groups
+    /// (`groups >= 3`) for a Modifier already known to satisfy the Sec
+    /// proof-of-work. Returns `None` for an out-of-range Sec/groups value.
+    pub fn generate_password(
+        ssid: &[u8],
+        spki_der: &[u8],
+        modifier: &[u8; SAE_PK_M_LEN],
+        sec: usize,
+        groups: usize,
+    ) -> Option<String> {
+        if (sec != 3 && sec != 5) || groups < 3 {
+            return None;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(ssid);
+        hasher.update(modifier);
+        hasher.update(spki_der);
+        let hash = hasher.finalize();
+        if hash[..sec].iter().any(|&b| b != 0) {
+            return None; // Modifier does not satisfy the Sec proof-of-work.
+        }
+        let base = password_base_bin(&hash, sec);
+        Some(base32_encode(&base, 20 * groups - 5))
+    }
+
+    fn der_len_byte(v: &[u8; 32]) -> (u8, bool) {
+        // ASN.1 INTEGER: prepend 0x00 when the high bit is set.
+        if v[0] & 0x80 != 0 {
+            (33, true)
+        } else {
+            (32, false)
+        }
+    }
+
+    fn der_encode_sig(r: &[u8; 32], s: &[u8; 32]) -> Vec<u8> {
+        let mut body = Vec::with_capacity(72);
+        for v in [r, s] {
+            let (len, pad) = der_len_byte(v);
+            body.push(0x02);
+            body.push(len);
+            if pad {
+                body.push(0x00);
+            }
+            body.extend_from_slice(v);
+        }
+        let mut sig = alloc::vec![0x30, body.len() as u8];
+        sig.extend_from_slice(&body);
+        sig
+    }
+
+    /// Sign a KeyAuth transcript (from [`keyauth_sig_data`]) with the AP's
+    /// ECDSA private key, returning the DER `SEQUENCE { r, s }` signature.
+    pub fn sign_keyauth(private_key: &[u8; 32], sig_data: &[u8]) -> Option<Vec<u8>> {
+        let mut hasher = Sha256::new();
+        hasher.update(sig_data);
+        let digest = hasher.finalize();
+        let (r, s) = sign_p256(private_key, &digest)?;
+        Some(der_encode_sig(&r, &s))
+    }
+
+    /// Derive the DER `SubjectPublicKeyInfo` for the AP public key `d * G` from
+    /// the private scalar.
+    pub fn public_key_spki(private_key: &[u8; 32]) -> Option<Vec<u8>> {
+        let d = Scalar::from_bytes_be(private_key).filter(|d| !d.is_zero())?;
+        let q: AffinePoint = scalar_mul_base(&d);
+        let encoded = q.to_encoded()?; // 64-byte X || Y
+        let mut der = P256_SPKI_PREFIX.to_vec();
+        der.push(0x04);
+        der.extend_from_slice(&encoded);
+        Some(der)
+    }
+
+    /// AES-SIV-encrypt the Modifier under the SAE KEK (no associated data) for
+    /// the SAE-PK element.
+    pub fn encrypt_modifier(kek: &[u8; 32], modifier: &[u8; SAE_PK_M_LEN]) -> Vec<u8> {
+        narf_crypto::aes_siv::encrypt(kek, &[], modifier)
+    }
+
+    fn push_element(out: &mut Vec<u8>, id: u8, body: &[u8]) {
+        out.push(id);
+        out.push(body.len() as u8);
+        out.extend_from_slice(body);
+    }
+
+    /// Assemble the SAE Confirm information elements carrying the SAE-PK
+    /// material: FILS Public Key (ext 12, key-type ECDSA), FILS Key
+    /// Confirmation (ext 3, the KeyAuth signature) and the SAE-PK
+    /// vendor-specific element (WFA OUI + encrypted Modifier).
+    pub fn build_confirm_elements(
+        spki_der: &[u8],
+        key_auth: &[u8],
+        encrypted_modifier: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        // FILS Public Key: ext-id(12) || key-type(0x02 = ECDSA) || DER.
+        let mut pk = alloc::vec![WLAN_EID_EXT_FILS_PUBLIC_KEY, 0x02];
+        pk.extend_from_slice(spki_der);
+        push_element(&mut out, WLAN_EID_EXTENSION, &pk);
+        // FILS Key Confirmation: ext-id(3) || DER ECDSA signature.
+        let mut kc = alloc::vec![WLAN_EID_EXT_FILS_KEY_CONFIRM];
+        kc.extend_from_slice(key_auth);
+        push_element(&mut out, WLAN_EID_EXTENSION, &kc);
+        // SAE-PK vendor element: WFA OUI || type || encrypted Modifier.
+        let mut ve = WFA_OUI.to_vec();
+        ve.push(0x1f);
+        ve.extend_from_slice(encrypted_modifier);
+        push_element(&mut out, WLAN_EID_VENDOR_SPECIFIC, &ve);
+        out
+    }
+
+    #[cfg(any(test, feature = "kernel-test"))]
+    mod gen_tests {
+        use super::*;
+        use narf_kernel_test::{kernel_test_in, TestResult};
+
+        // A fixed test private key (< n) for deterministic generation.
+        const TEST_D: [u8; 32] = [
+            0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16, 0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1,
+            0xd6, 0x93, 0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12, 0x7b, 0x8a, 0x62, 0x2b,
+            0x12, 0x0f, 0x67, 0x21,
+        ];
+
+        // Password encode -> station decode round-trip over a synthetic hash
+        // with Sec=3 leading zero octets (no proof-of-work needed): the
+        // generated password's checksum validates, its Sec_1b decodes to 3,
+        // and its fingerprint matches the hash.
+        fn smoke_sae_pk_gen_password_roundtrip() -> TestResult {
+            let mut hash = [0u8; 32];
+            hash[0] = 0;
+            hash[1] = 0;
+            hash[2] = 0;
+            for (i, b) in hash[3..].iter_mut().enumerate() {
+                *b = (0x11 * (i as u32 + 1)) as u8;
+            }
+            let base = password_base_bin(&hash, 3);
+            let pw = base32_encode(&base, 20 * 3 - 5);
+            if pw.len() != 14 || !validate_checksum(&pw) {
+                return TestResult::Fail("generated password malformed or bad checksum");
+            }
+            let (sec, fp, bits) = match password_fingerprint(&pw) {
+                Some(v) => v,
+                None => return TestResult::Fail("generated password failed station decode"),
+            };
+            if sec != 3 || !fingerprint_matches(&hash, sec, &fp, bits) {
+                return TestResult::Fail("generated fingerprint did not match the hash");
+            }
+            // A single-character mutation breaks the checksum.
+            let mut bad = pw.into_bytes();
+            bad[0] = if bad[0] == b'a' { b'b' } else { b'a' };
+            if validate_checksum(&String::from_utf8(bad).unwrap()) {
+                return TestResult::Fail("checksum accepted a mutated password");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!("wireless/sae_pk", smoke_sae_pk_gen_password_roundtrip);
+
+        // Proof-of-work search finds a 2-leading-zero-octet Modifier cheaply,
+        // and generate_password refuses a Modifier that fails its Sec.
+        fn smoke_sae_pk_gen_modifier_search() -> TestResult {
+            let spki = match public_key_spki(&TEST_D) {
+                Some(s) => s,
+                None => return TestResult::Fail("public_key_spki failed"),
+            };
+            let ssid = b"narf-pk";
+            let m = find_modifier(ssid, &spki, 2, [0u8; SAE_PK_M_LEN], 5_000_000);
+            let m = match m {
+                Some(m) => m,
+                None => return TestResult::Fail("no 2-zero-octet modifier found in budget"),
+            };
+            let mut h = Sha256::new();
+            h.update(ssid);
+            h.update(&m);
+            h.update(&spki);
+            let hash = h.finalize();
+            if hash[0] != 0 || hash[1] != 0 {
+                return TestResult::Fail("found modifier does not satisfy the target");
+            }
+            // generate_password demands the real Sec-3 leading zeros; a 2-octet
+            // modifier must be refused for Sec=3.
+            if generate_password(ssid, &spki, &m, 3, 3).is_some() && hash[2] != 0 {
+                return TestResult::Fail("generate_password accepted a sub-Sec modifier");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!("wireless/sae_pk", smoke_sae_pk_gen_modifier_search);
+
+        // KeyAuth sign -> verify round trip, and the full Confirm element set
+        // parses back to the same material with the Modifier recoverable.
+        fn smoke_sae_pk_gen_keyauth_and_elements() -> TestResult {
+            let spki = match public_key_spki(&TEST_D) {
+                Some(s) => s,
+                None => return TestResult::Fail("public_key_spki failed"),
+            };
+            let ele_ap = [0x21u8; 64];
+            let ele_sta = [0x22u8; 64];
+            let sca_ap = [0x23u8; 32];
+            let sca_sta = [0x24u8; 32];
+            let modifier = [0x5au8; SAE_PK_M_LEN];
+            let ap_bssid = [0x02, 0x11, 0x22, 0x33, 0x44, 0x55];
+            let sta_mac = [0x02, 0x66, 0x77, 0x88, 0x99, 0xaa];
+            let sig_data = keyauth_sig_data(
+                &ele_ap, &ele_sta, &sca_ap, &sca_sta, &modifier, &spki, &ap_bssid, &sta_mac,
+            );
+            let key_auth = match sign_keyauth(&TEST_D, &sig_data) {
+                Some(sig) => sig,
+                None => return TestResult::Fail("sign_keyauth failed"),
+            };
+            if !verify_keyauth(&spki, &key_auth, &sig_data) {
+                return TestResult::Fail("KeyAuth signature did not verify");
+            }
+            // Tampering the transcript must break verification.
+            let mut bad = sig_data.clone();
+            bad[0] ^= 0x01;
+            if verify_keyauth(&spki, &key_auth, &bad) {
+                return TestResult::Fail("KeyAuth verified a tampered transcript");
+            }
+            // Confirm elements assemble and parse back; AES-SIV Modifier round-trips.
+            let kek = [0x33u8; 32];
+            let encr = encrypt_modifier(&kek, &modifier);
+            let ies = build_confirm_elements(&spki, &key_auth, &encr);
+            let parsed = match parse_elements(&ies) {
+                Some(p) => p,
+                None => return TestResult::Fail("assembled Confirm elements did not parse"),
+            };
+            if parsed.public_key_der != spki
+                || parsed.key_auth != key_auth
+                || parsed.encrypted_modifier != encr
+            {
+                return TestResult::Fail("round-tripped Confirm elements differ");
+            }
+            match recover_modifier(&kek, &parsed.encrypted_modifier) {
+                Some(m) if m == modifier => TestResult::Pass,
+                _ => TestResult::Fail("Modifier not recovered from assembled element"),
+            }
+        }
+        kernel_test_in!("wireless/sae_pk", smoke_sae_pk_gen_keyauth_and_elements);
+    }
+}
+
 #[cfg(any(test, feature = "kernel-test"))]
 mod pk_tests {
     use super::*;
