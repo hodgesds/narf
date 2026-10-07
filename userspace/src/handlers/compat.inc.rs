@@ -167,6 +167,64 @@ fn resolve_cwd_path_owned(task: u64, path: alloc::string::String) -> alloc::stri
     rooted
 }
 
+/// Is `path` the path `prefix`, or something beneath it? Both are
+/// host-absolute and normalized; `prefix` must carry no trailing slash,
+/// except the root, under which everything lies.
+///
+/// This is the string form of Linux's "is this dentry on that mount"
+/// question, and it is what the `umount(2)` busy test and the mount-tree
+/// walks are asking.
+pub(crate) fn path_at_or_under(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return true;
+    }
+    path == prefix
+        || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+}
+
+/// Is any task's working directory at or under the host-absolute `target`?
+///
+/// Linux counts a task's `fs_struct.pwd` as a reference on the mount it sits
+/// on, which is half of why `umount(2)` answers -EBUSY. `CWD_TABLE` holds
+/// each task's cwd in ITS OWN chroot view, so the target has to be
+/// translated into that view per entry before the comparison — the same
+/// asymmetry [`chroot_path_matches`] exists for. A target outside a task's
+/// root cannot be its cwd at all.
+fn any_task_cwd_under(target: &str) -> bool {
+    CWD_TABLE.iter().any(|shard| {
+        shard.map.lock().as_ref().is_some_and(|m| {
+            m.iter().any(|(&task, cwd)| {
+                let visible = match root_dir_prefix(task) {
+                    Some(prefix) if prefix != "/" => match target.strip_prefix(prefix.as_str()) {
+                        Some("") => "/",
+                        Some(rest) => rest,
+                        None => return false,
+                    },
+                    _ => target,
+                };
+                path_at_or_under(cwd, visible)
+            })
+        })
+    })
+}
+
+/// Is any task's root directory at or under the host-absolute `target`?
+/// `fs_struct.root` is the other half of the reference `pwd` holds, and
+/// `ROOT_DIR_TABLE` already stores the chroot prefix host-absolute, so this
+/// comparison needs no translation.
+fn any_task_root_under(target: &str) -> bool {
+    if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    ROOT_DIR_TABLE.iter().any(|shard| {
+        shard
+            .map
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.values().any(|root| path_at_or_under(root, target)))
+    })
+}
+
 /// Compare a host-view normalized path with one path in the task's chroot
 /// view, without allocating the prefixed comparison string.
 fn chroot_path_matches(task: u64, path: &str, visible: &str, descendants: bool) -> bool {

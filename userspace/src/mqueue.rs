@@ -746,6 +746,19 @@ pub(crate) fn release_task_fd_paths(task: u64) {
     }
 }
 
+/// Test/reset hook — drop every recorded fd→path mapping.
+///
+/// `crate::fd::__test_reset` wipes the descriptor tables wholesale rather
+/// than closing each fd, so without this the paths those descriptors were
+/// opened on outlive them, and anything that reads the table as a liveness
+/// signal (the `umount(2)` busy test) sees references no task holds.
+#[doc(hidden)]
+pub fn __test_reset_fd_paths() {
+    for shard in FD_PATHS.iter() {
+        *shard.paths.lock() = None;
+    }
+}
+
 /// Test-only residue probe for the central task-exit sweep.
 pub(crate) fn task_has_fd_paths(task: u64) -> bool {
     FD_PATHS[fd_path_shard(task)]
@@ -790,6 +803,29 @@ pub(crate) fn fd_path(task: u64, fd: u32) -> Option<String> {
             .and_then(|slots| slots.get(fd as usize))
             .and_then(|slot| slot.as_ref())
             .map(|(path, _)| path.clone())
+    })
+}
+
+/// Is any open fd, in any task, backed by a path at or under `prefix`?
+///
+/// This is NARF's stand-in for Linux's `mnt_get_count()`: the per-mount
+/// reference count a `struct file` on that mount holds, which is what makes
+/// `umount(2)` answer -EBUSY. The table this walks is the one `open(2)`
+/// records into and `close(2)` / task exit retire, so an entry means a live
+/// descriptor — see `sys_umount2`.
+///
+/// `prefix` is a host-absolute path with no trailing slash (`/` itself is
+/// passed as `/`, and then everything is under it).
+pub(crate) fn any_fd_path_under(prefix: &str) -> bool {
+    FD_PATHS.iter().any(|shard| {
+        shard.paths.lock().as_ref().is_some_and(|tasks| {
+            tasks.values().any(|slots| {
+                slots
+                    .iter()
+                    .flatten()
+                    .any(|(path, _)| crate::handlers::path_at_or_under(path, prefix))
+            })
+        })
     })
 }
 

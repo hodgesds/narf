@@ -138,6 +138,7 @@ pub fn setup() {
     crate::namespaces::__test_reset_all();
     __test_clear_global();
     fd::__test_reset();
+    crate::mqueue::__test_reset_fd_paths();
     // The descriptor-allocation bound is a global hook; a case that lowered
     // RLIMIT_NOFILE must not leave the next one bounded by it. `setup` then
     // reinstalls it via `init_per_task_state` below, so every test still sees
@@ -244,6 +245,7 @@ pub fn teardown() {
     crate::handlers::__test_reset_task_id_lookup();
     __test_clear_global();
     fd::__test_reset();
+    crate::mqueue::__test_reset_fd_paths();
     *TEST_AS.lock() = None;
     crate::handlers::restore_address_space_lookup(*SAVED_AS_LOOKUP.lock());
 }

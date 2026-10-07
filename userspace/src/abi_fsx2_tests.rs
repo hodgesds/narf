@@ -4004,3 +4004,159 @@ fn smoke_abi_fsx2_xattr_exact_errnos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_xattr_exact_errnos);
+
+// ── umount2: the busy test, MNT_DETACH, and UMOUNT_NOFOLLOW ───────────
+//
+// `fs/namespace.c::do_umount` answers -EBUSY unless the caller asked for a
+// lazy (MNT_DETACH) or forced (MNT_FORCE) unmount. NARF's pop-by-path was
+// unconditional, so the three flags were accepted and dropped: a mount came
+// out from under whoever was still using it, and said 0.
+
+const MNT_FORCE: u64 = 1;
+const MNT_DETACH: u64 = 1 << 1;
+const UMOUNT_NOFOLLOW: u64 = 1 << 3;
+
+fn mount_tmpfs_at(target: &[u8]) -> Result<(), &'static str> {
+    let source = b"none\0";
+    let fstype = b"tmpfs\0";
+    let args = SyscallArgs {
+        arg0: source.as_ptr() as u64,
+        arg1: target.as_ptr() as u64,
+        arg2: fstype.as_ptr() as u64,
+        ..Default::default()
+    };
+    if call(Syscall::Mount.raw(), args) != Some(0) {
+        return Err("tmpfs setup mount failed");
+    }
+    Ok(())
+}
+
+fn mounted_at(path: &str) -> bool {
+    narf_filesystem::registry().list().iter().any(|m| m == path)
+}
+
+/// A mount with another mount beneath it is busy: Linux's
+/// `propagate_mount_busy` counts the child's hold on its mountpoint.
+/// MNT_DETACH takes the whole subtree instead, as `umount_tree` does.
+fn smoke_abi_fsx2_umount_submount_is_busy_until_detach() -> TestResult {
+    with_setup(|| {
+        let root = b"/abi-umount-busy\0";
+        let inner = b"/abi-umount-busy/inner\0";
+        mount_tmpfs_at(root)?;
+        if call(Syscall::Mkdir.raw(), a2(inner.as_ptr() as u64, 0o755, 0)) != Some(0) {
+            return Err("submount directory creation failed");
+        }
+        mount_tmpfs_at(inner)?;
+
+        let verdict = match call(Syscall::Umount2.raw(), a1(root.as_ptr() as u64, 0)) {
+            Some(v) if v == EBUSY => Ok(()),
+            Some(0) => Err("umount2 of a mount with a submount must not succeed"),
+            _ => Err("umount2 over a submount: want -EBUSY"),
+        };
+        // MNT_FORCE bypasses the busy test too — check the flag is read, then
+        // use MNT_DETACH for the real teardown.
+        let forced = match call(Syscall::Umount2.raw(), a1(inner.as_ptr() as u64, MNT_FORCE)) {
+            Some(0) => Ok(()),
+            _ => Err("umount2(MNT_FORCE) of an idle mount should succeed"),
+        };
+        mount_tmpfs_at(inner)?;
+        let detached = match call(Syscall::Umount2.raw(), a1(root.as_ptr() as u64, MNT_DETACH)) {
+            Some(0) if !mounted_at("/abi-umount-busy") && !mounted_at("/abi-umount-busy/inner") => {
+                Ok(())
+            }
+            Some(0) => Err("MNT_DETACH left the submount parented on a popped mount"),
+            _ => Err("umount2(MNT_DETACH) over a submount should succeed"),
+        };
+        let _ = call(
+            Syscall::Umount2.raw(),
+            a1(inner.as_ptr() as u64, MNT_DETACH),
+        );
+        let _ = call(Syscall::Umount2.raw(), a1(root.as_ptr() as u64, MNT_DETACH));
+        verdict.and(forced).and(detached)
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_umount_submount_is_busy_until_detach
+);
+
+/// An open file on the mount is the other reference Linux counts
+/// (`file->f_path.mnt`): busy while the descriptor lives, free once it is
+/// closed.
+fn smoke_abi_fsx2_umount_open_file_is_busy() -> TestResult {
+    with_setup(|| {
+        const O_CREAT: u64 = 0o100;
+        const O_RDWR: u64 = 2;
+        let root = b"/abi-umount-fd\0";
+        let file = b"/abi-umount-fd/held\0";
+        mount_tmpfs_at(root)?;
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(
+                (-100i64) as u64,
+                file.as_ptr() as u64,
+                O_CREAT | O_RDWR,
+                0o644,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("creating a file on the tmpfs failed"),
+        };
+        let held = match call(Syscall::Umount2.raw(), a1(root.as_ptr() as u64, 0)) {
+            Some(v) if v == EBUSY => Ok(()),
+            Some(0) => Err("umount2 unmounted a filesystem with an open file on it"),
+            _ => Err("umount2 with an open file on the mount: want -EBUSY"),
+        };
+        if call(Syscall::Close.raw(), a0(fd)) != Some(0) {
+            return Err("closing the held file failed");
+        }
+        let freed = match call(Syscall::Umount2.raw(), a1(root.as_ptr() as u64, 0)) {
+            Some(0) if !mounted_at("/abi-umount-fd") => Ok(()),
+            _ => Err("umount2 should succeed once the last file is closed"),
+        };
+        let _ = call(Syscall::Umount2.raw(), a1(root.as_ptr() as u64, MNT_DETACH));
+        held.and(freed)
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_umount_open_file_is_busy);
+
+/// `user_path_at` follows a trailing symlink unless UMOUNT_NOFOLLOW, so
+/// `umount2` through a symlink unmounts what it points at, while the flag
+/// resolves the link itself — which is no mount point, hence -EINVAL.
+fn smoke_abi_fsx2_umount_follows_symlink_unless_nofollow() -> TestResult {
+    with_setup(|| {
+        let root = b"/abi-umount-link\0";
+        let real = b"/abi-umount-link/mnt\0";
+        let alias = b"/abi-umount-link/alias\0";
+        mount_tmpfs_at(root)?;
+        if call(Syscall::Mkdir.raw(), a2(real.as_ptr() as u64, 0o755, 0)) != Some(0) {
+            return Err("symlinked mountpoint creation failed");
+        }
+        mount_tmpfs_at(real)?;
+        let target = b"mnt\0";
+        if call_symlink(target.as_ptr() as u64, alias.as_ptr() as u64) != Some(0) {
+            return Err("mountpoint alias symlink creation failed");
+        }
+
+        let nofollow = match call(
+            Syscall::Umount2.raw(),
+            a1(alias.as_ptr() as u64, UMOUNT_NOFOLLOW),
+        ) {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(0) => Err("UMOUNT_NOFOLLOW unmounted through a symlink anyway"),
+            _ => Err("umount2(symlink, UMOUNT_NOFOLLOW): want -EINVAL"),
+        };
+        let followed = match call(Syscall::Umount2.raw(), a1(alias.as_ptr() as u64, 0)) {
+            Some(0) if !mounted_at("/abi-umount-link/mnt") => Ok(()),
+            Some(v) if v == EINVAL => Err("umount2 did not follow the mountpoint symlink"),
+            _ => Err("umount2 through a symlink should unmount its target"),
+        };
+        let _ = call(Syscall::Umount2.raw(), a1(real.as_ptr() as u64, MNT_DETACH));
+        let _ = call(Syscall::Umount2.raw(), a1(root.as_ptr() as u64, MNT_DETACH));
+        nofollow.and(followed)
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_umount_follows_symlink_unless_nofollow
+);
