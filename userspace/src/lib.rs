@@ -83,6 +83,19 @@ pub mod socket;
 pub mod syscall;
 pub mod sysvipc;
 pub mod task;
+
+/// `/proc/sysvipc/{sem,msg,shm}` rows for the reader's IPC namespace
+/// (`0` = sem, `1` = msg, `2` = shm). One entry point so procfs holds one
+/// hook rather than three.
+pub fn proc_sysvipc_table(kind: u8) -> alloc::string::String {
+    match kind {
+        0 => sysvipc::proc_sysvipc_sem(),
+        1 => sysvipc::proc_sysvipc_msg(),
+        2 => handlers::proc_sysvipc_shm(),
+        _ => alloc::string::String::new(),
+    }
+}
+
 // TLS staging is arch-neutral now: `tls::block_displacement_from_tp` encodes
 // the variant (block below the thread pointer on x86_64, above the reserved
 // TCB words on aarch64) and `stage_tls` lays the block out accordingly.

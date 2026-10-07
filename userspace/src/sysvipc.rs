@@ -126,6 +126,17 @@ const SEM_UNDO: i16 = 0o10000;
 /// Masking at import makes it explicit that unknown bits neither reject the
 /// operation nor accidentally acquire behavior in later bit tests.
 const SEM_BEHAVIOR_FLAGS: i16 = IPC_NOWAIT | SEM_UNDO;
+// LINUX-GAP: `/proc/sys/kernel/{sem,msgmax,msgmnb,msgmni,shmmax,shmall,
+// shmmni,shm_rmid_forced}` do not exist. `ipc/ipc_sysctl.c` exposes each of
+// these limits per IPC namespace at mode 0644, so `sysctl -w
+// kernel.shmmax=...` and a `/etc/sysctl.d` drop-in for one of them succeed
+// there and get ENOENT here (systemd-sysctl logs the failure and carries
+// on). The limits below are compile-time constants — `SEMOPM` sizes a fixed
+// import buffer, and several others are consumed in `const` position — so
+// exposing them as writable knobs means first making them per-namespace
+// runtime state. `semctl(IPC_INFO)` / `msgctl(MSG_INFO)` /
+// `shmctl(IPC_INFO)` DO report them, which is where `ipcs -l` reads them
+// from.
 const SEMVMX: i32 = 32767;
 const SEMMNI: usize = 32_000;
 const SEMMSL: usize = 32_000;
@@ -4758,4 +4769,97 @@ pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
             .retain(|(namespace, _), _| *namespace != ipc_ns);
         state.usage.remove(&ipc_ns);
     });
+}
+
+// ════════════════════════════════════════════════════════════════════
+// /proc/sysvipc/{sem,msg,shm}
+// ════════════════════════════════════════════════════════════════════
+//
+// `ipc_init_proc_interface("sysvipc/sem", ...)` and its two siblings: one
+// row per object in the READER's IPC namespace, in the exact column widths
+// `sysvipc_{sem,msg,shm}_proc_show` print. `ipcs(1)` and `lsipc(1)` read
+// these in preference to the `*ctl(IPC_STAT)` walk, and the whole tree was
+// absent — so a tool that only reads procfs saw a machine with no IPC
+// objects at all, no matter how many were live.
+//
+// The ids and times come from the same per-object state IPC_STAT reports;
+// pids are translated into the reader's PID namespace, as `pid_nr_ns` does
+// at print time.
+
+/// `sysvipc_sem_proc_show`: `"%10d %10d  %4o %10u %5u %5u %5u %5u %10llu %10llu"`.
+pub fn proc_sysvipc_sem() -> alloc::string::String {
+    use core::fmt::Write as _;
+    let ns = current_ipc_namespace_id();
+    let mut out = alloc::string::String::new();
+    let sets: Vec<(u64, SemSetRef)> = with_sem_state(|state| {
+        state
+            .sets
+            .iter()
+            .filter(|((set_ns, _), _)| *set_ns == ns)
+            .map(|((_, id), set)| (*id, set.clone()))
+            .collect()
+    });
+    for (id, set) in sets {
+        let set = set.lock();
+        if set.removed {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "{:10} {:10}  {:4o} {:10} {:5} {:5} {:5} {:5} {:10} {:10}",
+            set.key as i32,
+            id as i32,
+            set.mode & 0o7777,
+            set.sems.len(),
+            set.uid,
+            set.gid,
+            set.cuid,
+            set.cgid,
+            set.otime,
+            set.ctime
+        );
+    }
+    out
+}
+
+/// `sysvipc_msg_proc_show`:
+/// `"%10d %10d  %4o  %10lu %10lu %5u %5u %5u %5u %5u %5u %10llu %10llu %10llu"`.
+pub fn proc_sysvipc_msg() -> alloc::string::String {
+    use core::fmt::Write as _;
+    let ns = current_ipc_namespace_id();
+    let reader = crate::handlers::current_task_id();
+    let mut out = alloc::string::String::new();
+    let queues: Vec<(u64, MsgQueueRef)> = with_msg_state(|state| {
+        state
+            .queues
+            .iter()
+            .filter(|((queue_ns, _), _)| *queue_ns == ns)
+            .map(|((_, id), queue)| (*id, queue.clone()))
+            .collect()
+    });
+    for (id, queue) in queues {
+        let queue = queue.lock();
+        if queue.removed {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "{:10} {:10}  {:4o}  {:10} {:10} {:5} {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10}",
+            queue.key as i32,
+            id as i32,
+            queue.mode & 0o7777,
+            queue.current_bytes,
+            queue.msgs.len(),
+            crate::handlers::report_pid_to(reader, queue.last_send_pid),
+            crate::handlers::report_pid_to(reader, queue.last_recv_pid),
+            queue.uid,
+            queue.gid,
+            queue.cuid,
+            queue.cgid,
+            queue.stime,
+            queue.rtime,
+            queue.ctime
+        );
+    }
+    out
 }

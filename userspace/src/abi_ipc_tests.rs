@@ -1868,6 +1868,73 @@ kernel_test_in!(
     smoke_abi_ipc_perms_follow_capabilities_not_uid0
 );
 
+/// `/proc/sysvipc/{sem,msg,shm}` — `ipc_init_proc_interface`'s three tables,
+/// one row per live object in the reader's IPC namespace. The whole
+/// directory was missing, so `ipcs(1)` and `lsipc(1)`, which read these in
+/// preference to walking `*ctl(IPC_STAT)`, saw a machine with no IPC objects
+/// on it however many were live.
+fn smoke_abi_ipc_proc_sysvipc_tables_list_live_objects() -> TestResult {
+    with_setup(|| {
+        // An explicit mode: `make_semset` creates with none, and a row that
+        // reported 0 either way would not prove the column.
+        let sem = match call(Syscall::Semget.raw(), a2(0, 3, IPC_CREAT | 0o600)) {
+            Some(id) if id >= 0 => id as u64,
+            _ => return Err("setup: semget IPC_PRIVATE|0600 failed"),
+        };
+        let msg = match call(Syscall::Msgget.raw(), a2(0, IPC_CREAT | 0o600, 0)) {
+            Some(id) if id >= 0 => id as u64,
+            _ => return Err("setup: msgget IPC_PRIVATE failed"),
+        };
+
+        // `kind`: 0 = sem, 1 = msg, 2 = shm, as the procfs hook numbers them.
+        let sem_rows = crate::proc_sysvipc_table(0);
+        let msg_rows = crate::proc_sysvipc_table(1);
+        let cleanup = |()| {
+            let _ = call(Syscall::Semctl.raw(), a3(sem, 0, IPC_RMID, 0));
+            let _ = call(Syscall::Msgctl.raw(), a2(msg, IPC_RMID, 0));
+        };
+
+        // The sem row's columns are key, semid, perms, nsems, then the four
+        // ids: `"%10d %10d  %4o %10u %5u %5u %5u %5u %10llu %10llu"`.
+        let Some(row) = sem_rows
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(&alloc::format!("{sem}")))
+        else {
+            cleanup(());
+            return Err("/proc/sysvipc/sem did not list a live set");
+        };
+        let cols: alloc::vec::Vec<&str> = row.split_whitespace().collect();
+        if cols.len() != 10 {
+            cleanup(());
+            return Err("/proc/sysvipc/sem row does not have sysvipc_sem_proc_show's columns");
+        }
+        if cols[2] != "600" || cols[3] != "3" {
+            cleanup(());
+            return Err("/proc/sysvipc/sem reported the wrong perms or nsems");
+        }
+
+        let listed_msg = msg_rows
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(&alloc::format!("{msg}")));
+        cleanup(());
+        if !listed_msg {
+            return Err("/proc/sysvipc/msg did not list a live queue");
+        }
+        // A removed object leaves the table.
+        if crate::proc_sysvipc_table(0)
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(&alloc::format!("{sem}")))
+        {
+            return Err("/proc/sysvipc/sem still lists a set after IPC_RMID");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_proc_sysvipc_tables_list_live_objects
+);
+
 fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
     with_setup(|| {
         #[cfg(target_arch = "x86_64")]

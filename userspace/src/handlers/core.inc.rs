@@ -18136,6 +18136,7 @@ fn pack_utsname_field(dst: &mut [u8], src: &str) {
 // the other — genuine sharing, exactly like Linux. Supersedes the
 // container id-by-key `shmget` in a linux-compat build.
 
+#[derive(Clone)]
 struct ShmSegment {
     handle: u64,
     key: u32,
@@ -18368,6 +18369,57 @@ fn current_shm_ipc_ns() -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
 #[cfg(not(feature = "container"))]
 fn current_shm_ipc_ns_id() -> u64 {
     0
+}
+
+/// `sysvipc_shm_proc_show`:
+/// `"%10d %10d  %4o %10lu %5u %5u  %5lu %5u %5u %5u %5u %10llu %10llu %10llu %10lu %10lu"`
+/// — one row per segment in the reader's IPC namespace.
+///
+/// LINUX-GAP: the `rss` and `swap` columns are the segment's resident and
+/// swapped page counts, which Linux takes from the shmem inode's
+/// `shmem_inode_info`. NARF's shmem backing does not account either, so both
+/// read as 0 — `ipcs -m` shows the size and attach count from this row and
+/// reports no residency, rather than a number nothing measured.
+pub fn proc_sysvipc_shm() -> alloc::string::String {
+    use core::fmt::Write as _;
+    let ns = current_shm_ipc_ns_id();
+    let reader = current_task_id();
+    let mut out = alloc::string::String::new();
+    let rows: alloc::vec::Vec<(u64, ShmSegment)> = {
+        let segments = SHM_SEGMENTS.lock();
+        segments
+            .as_ref()
+            .map(|map| {
+                map.iter()
+                    .filter(|((seg_ns, _), seg)| *seg_ns == ns && !seg.removed)
+                    .map(|((_, id), seg)| (*id, seg.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for (id, seg) in rows {
+        let _ = writeln!(
+            out,
+            "{:10} {:10}  {:4o} {:10} {:5} {:5}  {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:10} {:10}",
+            seg.key as i32,
+            id as i32,
+            seg.mode & 0o7777,
+            seg.len,
+            report_pid_to(reader, seg.cpid),
+            report_pid_to(reader, seg.lpid),
+            seg.nattch,
+            seg.uid,
+            seg.gid,
+            seg.cuid,
+            seg.cgid,
+            seg.atime,
+            seg.dtime,
+            seg.ctime,
+            0,
+            0
+        );
+    }
+    out
 }
 
 fn shm_register_as_owner(as_key: u64, pid: u64) {
