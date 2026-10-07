@@ -453,59 +453,76 @@ fn sample_two_scalars(test_seed: Option<&[u8; 64]>) -> (Scalar, Scalar) {
     (rand, mask)
 }
 
-/// Derive (KCK, PMK) from the shared K.x and the sorted (s_a, s_b)
-/// pair, per IEEE 802.11-2020 §12.4.5.4. The HKDF call below is
-/// equivalent to the spec's `KDF-Hash-Length(K, "SAE KCK and PMK",
-/// (s_a + s_b) mod r)` — we use the canonical sorted concatenation
-/// in place of the modular sum because it preserves the symmetry the
-/// spec relies on (both peers compute the same input) while keeping
-/// the KDF input the same length.
+/// SAE keyseed per IEEE 802.11-2020 §12.4.5.4:
+/// `keyseed = H(salt, k)` = HKDF-Extract(HMAC-SHA256) with a salt of
+/// `hash_len` (32) zero octets — the H2E case without rejected groups, which
+/// is the only case NARF produces (group 19 only, no group negotiation). `k`
+/// is the shared secret `K.x`.
+fn sae_keyseed(k_x: &[u8; 32]) -> [u8; 32] {
+    narf_crypto::hkdf::hkdf_extract(Some(&[0u8; 32]), k_x)
+}
+
+/// SAE key context: `(commit-scalar + peer-commit-scalar) mod r`, encoded
+/// big-endian to the order length (32 for P-256). The modular sum is
+/// inherently symmetric, so both peers derive the same context.
+fn sae_key_context(s_self: &Scalar, s_peer: &Scalar) -> [u8; 32] {
+    s_self.add(s_peer).to_bytes_be()
+}
+
+/// IEEE 802.11-2020 §12.7.1.6.2 KDF-Length over HMAC-SHA256
+/// (`sha256_prf_bits`): the concatenation of
+/// `HMAC-SHA256(key, LE16(i) || label || context || LE16(out_len*8))` for
+/// `i = 1, 2, …`, truncated to `out_len` bytes. `out_len` is a whole number of
+/// octets here, so no final-octet bit masking is needed.
+fn sae_kdf(keyseed: &[u8; 32], label: &[u8], context: &[u8], out_len: usize) -> Vec<u8> {
+    let len_bits = (out_len * 8) as u16;
+    let mut out = Vec::with_capacity(out_len);
+    let mut counter: u16 = 1;
+    while out.len() < out_len {
+        let mut msg = Vec::with_capacity(2 + label.len() + context.len() + 2);
+        msg.extend_from_slice(&counter.to_le_bytes());
+        msg.extend_from_slice(label);
+        msg.extend_from_slice(context);
+        msg.extend_from_slice(&len_bits.to_le_bytes());
+        let block = narf_crypto::hkdf::hmac_sha256(keyseed, &msg);
+        let take = core::cmp::min(32, out_len - out.len());
+        out.extend_from_slice(&block[..take]);
+        counter = counter.wrapping_add(1);
+    }
+    out
+}
+
+/// Derive (KCK, PMK) per IEEE 802.11-2020 §12.4.5.4:
+/// `KCK || PMK = KDF-Hash-Length(keyseed, "SAE KCK and PMK",
+/// (commit-scalar + peer-commit-scalar) mod r)`.
 fn derive_kck_pmk(k_x: &[u8; 32], s_self: &Scalar, s_peer: &Scalar) -> ([u8; 32], [u8; 32]) {
-    let s_self_b = s_self.to_bytes_be();
-    let s_peer_b = s_peer.to_bytes_be();
-    let (first, second) = if s_self_b.as_slice() < s_peer_b.as_slice() {
-        (s_self_b, s_peer_b)
-    } else {
-        (s_peer_b, s_self_b)
-    };
-    let mut salt: Vec<u8> = Vec::with_capacity(64);
-    salt.extend_from_slice(&first);
-    salt.extend_from_slice(&second);
-    let prk = narf_crypto::hkdf::hkdf_extract(Some(&salt), k_x);
-    let okm = narf_crypto::hkdf::hkdf_expand(&prk, b"SAE KCK and PMK", 64);
+    let keyseed = sae_keyseed(k_x);
+    let context = sae_key_context(s_self, s_peer);
+    let keys = sae_kdf(&keyseed, b"SAE KCK and PMK", &context, 64);
     let mut kck = [0u8; 32];
     let mut pmk = [0u8; 32];
-    kck.copy_from_slice(&okm[..32]);
-    pmk.copy_from_slice(&okm[32..]);
+    kck.copy_from_slice(&keys[..32]);
+    pmk.copy_from_slice(&keys[32..64]);
     (kck, pmk)
 }
 
 /// SAE-PK key derivation: as [`derive_kck_pmk`] but with the "SAE-PK keys"
-/// label and an output extended to `KCK || PMK || KEK` (hostap
-/// `sae_derive_keys` with `CONFIG_SAE_PK`). Returns `(kck, pmk, kek)`.
+/// label and output extended to `KCK || PMK || KEK` (hostap `sae_derive_keys`
+/// with `CONFIG_SAE_PK`). Returns `(kck, pmk, kek)`.
 fn derive_sae_pk_keys(
     k_x: &[u8; 32],
     s_self: &Scalar,
     s_peer: &Scalar,
 ) -> ([u8; 32], [u8; 32], [u8; 32]) {
-    let s_self_b = s_self.to_bytes_be();
-    let s_peer_b = s_peer.to_bytes_be();
-    let (first, second) = if s_self_b.as_slice() < s_peer_b.as_slice() {
-        (s_self_b, s_peer_b)
-    } else {
-        (s_peer_b, s_self_b)
-    };
-    let mut salt: Vec<u8> = Vec::with_capacity(64);
-    salt.extend_from_slice(&first);
-    salt.extend_from_slice(&second);
-    let prk = narf_crypto::hkdf::hkdf_extract(Some(&salt), k_x);
-    let okm = narf_crypto::hkdf::hkdf_expand(&prk, b"SAE-PK keys", 96);
+    let keyseed = sae_keyseed(k_x);
+    let context = sae_key_context(s_self, s_peer);
+    let keys = sae_kdf(&keyseed, b"SAE-PK keys", &context, 96);
     let mut kck = [0u8; 32];
     let mut pmk = [0u8; 32];
     let mut kek = [0u8; 32];
-    kck.copy_from_slice(&okm[..32]);
-    pmk.copy_from_slice(&okm[32..64]);
-    kek.copy_from_slice(&okm[64..]);
+    kck.copy_from_slice(&keys[..32]);
+    pmk.copy_from_slice(&keys[32..64]);
+    kek.copy_from_slice(&keys[64..96]);
     (kck, pmk, kek)
 }
 
@@ -720,4 +737,38 @@ mod session_tests {
         TestResult::Pass
     }
     kernel_test_in!("wireless/sae", smoke_sae_session_retry_counter);
+
+    // The IEEE 802.11 §12.7.1.6.2 KDF-Length construction: each output block is
+    // HMAC-SHA256(keyseed, LE16(i) || label || context || LE16(out_bits)).
+    // Validate the exact byte order against hand-assembled HMAC inputs.
+    fn smoke_sae_kdf_ieee_construction() -> TestResult {
+        let keyseed = [0x5au8; 32];
+        let label: &[u8] = b"SAE KCK and PMK";
+        let context = [0x11u8; 32];
+        let out = sae_kdf(&keyseed, label, &context, 64);
+        if out.len() != 64 {
+            return TestResult::Fail("KDF output length wrong");
+        }
+        for i in 1u16..=2 {
+            let mut msg = Vec::new();
+            msg.extend_from_slice(&i.to_le_bytes());
+            msg.extend_from_slice(label);
+            msg.extend_from_slice(&context);
+            msg.extend_from_slice(&512u16.to_le_bytes());
+            let block = narf_crypto::hkdf::hmac_sha256(&keyseed, &msg);
+            let off = (i as usize - 1) * 32;
+            if out[off..off + 32] != block {
+                return TestResult::Fail(
+                    "KDF block does not match HMAC(LE16(i)||label||ctx||LE16(len))",
+                );
+            }
+        }
+        // keyseed = HMAC-SHA256(zero-salt, K.x); context = (s_a + s_b) mod n.
+        let k_x = [0x42u8; 32];
+        if sae_keyseed(&k_x) != narf_crypto::hkdf::hkdf_extract(Some(&[0u8; 32]), &k_x) {
+            return TestResult::Fail("keyseed is not HKDF-Extract(zero-salt, K.x)");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("wireless/sae", smoke_sae_kdf_ieee_construction);
 }
