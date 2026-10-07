@@ -106,6 +106,65 @@ pub const BT_MAX_PROTO: i32 = 9;
 pub const BTPROTO_L2CAP: u32 = 0;
 pub const BTPROTO_HCI: u32 = 1;
 pub const BTPROTO_SCO: u32 = 2;
+
+/// `SOL_SCO` and its options (`include/net/bluetooth/sco.h`).
+pub const SOL_SCO: u32 = 17;
+pub const SCO_OPTIONS: u32 = 0x01;
+pub const SCO_CONNINFO: u32 = 0x02;
+/// SOL_BLUETOOTH option names (`include/net/bluetooth/bluetooth.h`).
+pub const BT_DEFER_SETUP: u32 = 7;
+pub const BT_VOICE: u32 = 11;
+pub const BT_SNDMTU: u32 = 12;
+pub const BT_RCVMTU: u32 = 13;
+pub const BT_PHY: u32 = 14;
+pub const BT_PKT_STATUS: u32 = 16;
+pub const BT_CODEC: u32 = 19;
+/// `BT_VOICE_CVSD_16BIT`, the setting `sco_sock_init` starts a socket with.
+pub const BT_VOICE_CVSD_16BIT: u16 = 0x0060;
+
+/// Per-socket SCO state (`struct sco_pinfo` + the `bt_sk` flags it uses).
+#[derive(Debug, Clone, Copy)]
+pub struct ScoSockState {
+    /// BT_LISTEN.
+    pub listening: bool,
+    /// BT_SK_DEFER_SETUP.
+    pub defer_setup: bool,
+    /// BT_SK_PKT_STATUS.
+    pub pkt_status: bool,
+    /// `sco_pi(sk)->setting` (BT_VOICE).
+    pub voice_setting: u16,
+}
+
+impl Default for ScoSockState {
+    fn default() -> Self {
+        Self {
+            listening: false,
+            defer_setup: false,
+            pkt_status: false,
+            voice_setting: BT_VOICE_CVSD_16BIT,
+        }
+    }
+}
+
+/// Listening SCO sockets by local bdaddr (`sco_sk_list` +
+/// `__sco_get_sock_listen_by_addr`); a dropped socket's entry is pruned on
+/// the next lookup.
+static SCO_LISTENERS: IrqSafeSpinLock<Vec<([u8; 6], alloc::sync::Weak<SocketFile>)>> =
+    IrqSafeSpinLock::new(Vec::new());
+
+/// `hci_get_route` found something: a registered controller that is up
+/// (`struct hci_dev_info.flags` bit HCI_UP).
+fn bt_controller_up() -> bool {
+    const HCI_DEV_INFO_FLAGS: usize = 16;
+    (0..narf_filesystem::bluetooth::hci_dev_count()).any(|dev| {
+        narf_filesystem::bluetooth::hci_dev_info(dev as u16)
+            .and_then(|info| {
+                info.get(HCI_DEV_INFO_FLAGS..HCI_DEV_INFO_FLAGS + 4)
+                    .map(|f| f[0] & 1 != 0)
+            })
+            .unwrap_or(false)
+    })
+}
 pub const BTPROTO_RFCOMM: u32 = 3;
 /// `sockaddr_hci.hci_channel` values (include/net/bluetooth/hci_sock.h).
 pub const HCI_CHANNEL_RAW: u16 = 0;
@@ -647,6 +706,9 @@ pub enum SocketOpResult {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SockError {
     BadFd,
+    /// EBADFD: the socket is in the wrong state for the call (Bluetooth's
+    /// `sco_sock_listen` / `sco_sock_accept` / `sco_sock_bind`).
+    BadFdState,
     NoMemory,
     InvalidArg,
     NotSupported,
@@ -722,6 +784,7 @@ impl SockError {
     pub fn errno(self) -> i32 {
         match self {
             Self::BadFd => errno::EBADF as i32,
+            Self::BadFdState => errno::EBADFD as i32,
             Self::NoMemory => errno::ENOMEM as i32,
             Self::InvalidArg => errno::EINVAL as i32,
             Self::NotSupported => errno::EOPNOTSUPP as i32, // ENOTSUP
@@ -1439,8 +1502,12 @@ enum SocketState {
     },
     /// Connection-oriented AF_BLUETOOTH protocols (L2CAP/RFCOMM/SCO; the
     /// protocol is `self.protocol`). `bound` holds the raw sockaddr body set
-    /// by bind. The connection path is hardware-gated (controller + peer).
-    BluetoothConn { bound: Option<Vec<u8>> },
+    /// by bind; `sco` the SCO per-socket state. Connecting is hardware-gated
+    /// (a controller and a peer), so a socket is never CONNECTED here.
+    BluetoothConn {
+        bound: Option<Vec<u8>>,
+        sco: ScoSockState,
+    },
 }
 
 /// Deliver a UDP datagram that arrived from the wire to a bound AF_INET or
@@ -1778,7 +1845,10 @@ impl SocketFile {
             }
         } else if domain == AF_BLUETOOTH {
             // L2CAP / RFCOMM / SCO — connection-oriented protocol family.
-            SocketState::BluetoothConn { bound: None }
+            SocketState::BluetoothConn {
+                bound: None,
+                sco: ScoSockState::default(),
+            }
         } else {
             SocketState::Fresh
         };
@@ -4161,7 +4231,10 @@ impl SocketFile {
                 }
                 bits
             }
-            // L2CAP/RFCOMM/SCO: no live connection yet, so writable only.
+            // `bt_sock_poll`: a listening socket reports only pending
+            // connections (`bt_accept_poll`), and none can arrive without a
+            // controller. Otherwise there is no live connection yet: writable.
+            SocketState::BluetoothConn { sco, .. } if sco.listening => 0,
             SocketState::BluetoothConn { .. } => narf_filesystem::POLL_OUT,
         }
     }
@@ -4586,6 +4659,139 @@ impl SocketFile {
     /// stores the local sockaddr and getsockname returns it; the actual
     /// connect/listen/accept/send/recv path needs a controller + reachable
     /// peer, which is hardware-gated, so those report NotSupported.
+    /// `sco_sock_listen`: EBADFD unless bound, EINVAL unless SOCK_SEQPACKET,
+    /// EADDRINUSE when another SCO socket already listens on the same local
+    /// address. Needs no controller.
+    fn sco_listen(self: &Arc<Self>) -> SocketOpResult {
+        let mut state = self.state.lock();
+        let SocketState::BluetoothConn {
+            bound: Some(src),
+            sco,
+        } = &mut *state
+        else {
+            return SocketOpResult::Err(SockError::BadFdState);
+        };
+        if sco.listening {
+            return SocketOpResult::Err(SockError::BadFdState);
+        }
+        if self.kind != SOCK_SEQPACKET {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        }
+        let bdaddr: [u8; 6] = match src.get(..6).and_then(|b| b.try_into().ok()) {
+            Some(b) => b,
+            None => return SocketOpResult::Err(SockError::InvalidArg),
+        };
+        let mut listeners = SCO_LISTENERS.lock();
+        listeners.retain(|(_, sock)| sock.strong_count() > 0);
+        if listeners.iter().any(|(addr, _)| *addr == bdaddr) {
+            return SocketOpResult::Err(SockError::AddrInUse);
+        }
+        listeners.push((bdaddr, Arc::downgrade(self)));
+        sco.listening = true;
+        SocketOpResult::Ok(0)
+    }
+
+    /// `sco_sock_setsockopt`. Like Linux it dispatches on the option name
+    /// whatever the (non-SOL_SOCKET) level, and a value shorter than the
+    /// option is EINVAL (`copy_safe_from_sockptr`).
+    fn sco_setsockopt(&self, name: u32, value: &[u8]) -> SocketOpResult {
+        let read_u32 = |v: &[u8]| -> Result<u32, SockError> {
+            v.get(..4)
+                .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+                .ok_or(SockError::InvalidArg)
+        };
+        let mut state = self.state.lock();
+        let SocketState::BluetoothConn { bound, sco } = &mut *state else {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        };
+        // Reachable SCO states here: OPEN (unbound), BOUND, LISTEN.
+        let open_or_bound = !sco.listening;
+        let bound_or_listen = bound.is_some();
+        match name {
+            BT_DEFER_SETUP => {
+                if !bound_or_listen {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                match read_u32(value) {
+                    Ok(v) => sco.defer_setup = v != 0,
+                    Err(e) => return SocketOpResult::Err(e),
+                }
+            }
+            BT_VOICE => {
+                if !open_or_bound {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                // struct bt_voice { u16 setting; } — stored before the
+                // controller lookup, exactly as Linux does.
+                match value.get(..2) {
+                    Some(b) => sco.voice_setting = u16::from_ne_bytes([b[0], b[1]]),
+                    None => return SocketOpResult::Err(SockError::InvalidArg),
+                }
+                // `hci_get_route`: no controller that is up → EBADFD.
+                if !bt_controller_up() {
+                    return SocketOpResult::Err(SockError::BadFdState);
+                }
+            }
+            BT_PKT_STATUS => match read_u32(value) {
+                Ok(v) => sco.pkt_status = v != 0,
+                Err(e) => return SocketOpResult::Err(e),
+            },
+            BT_CODEC => {
+                if !open_or_bound {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                if !bt_controller_up() {
+                    return SocketOpResult::Err(SockError::BadFdState);
+                }
+                // LINUX-GAP: no controller here exposes offload codecs
+                // (HCI_OFFLOAD_CODECS_ENABLED), which Linux also answers with
+                // EOPNOTSUPP.
+                return SocketOpResult::Err(SockError::NotSupported);
+            }
+            _ => return SocketOpResult::Err(SockError::NoProtoOpt),
+        }
+        SocketOpResult::Ok(0)
+    }
+
+    /// `sco_sock_getsockopt` (+ `sco_sock_getsockopt_old` for SOL_SCO).
+    fn sco_getsockopt(&self, level: u32, name: u32, buf: &mut [u8]) -> SocketOpResult {
+        let write = |buf: &mut [u8], bytes: &[u8]| -> SocketOpResult {
+            let n = core::cmp::min(buf.len(), bytes.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            SocketOpResult::OptValue { n }
+        };
+        let state = self.state.lock();
+        let SocketState::BluetoothConn { bound, sco } = &*state else {
+            return SocketOpResult::Err(SockError::InvalidArg);
+        };
+        if level == SOL_SCO {
+            return match name {
+                // Both need a CONNECTED (or deferred CONNECT2) link.
+                SCO_OPTIONS | SCO_CONNINFO => SocketOpResult::Err(SockError::NotConnected),
+                _ => SocketOpResult::Err(SockError::NoProtoOpt),
+            };
+        }
+        match name {
+            BT_DEFER_SETUP => {
+                if bound.is_none() {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
+                write(buf, &u32::from(sco.defer_setup).to_ne_bytes())
+            }
+            BT_VOICE => write(buf, &sco.voice_setting.to_ne_bytes()),
+            BT_PKT_STATUS => write(buf, &u32::from(sco.pkt_status).to_ne_bytes()),
+            BT_PHY | BT_SNDMTU | BT_RCVMTU => SocketOpResult::Err(SockError::NotConnected),
+            BT_CODEC => {
+                if !bt_controller_up() {
+                    SocketOpResult::Err(SockError::BadFdState)
+                } else {
+                    SocketOpResult::Err(SockError::NotSupported)
+                }
+            }
+            _ => SocketOpResult::Err(SockError::NoProtoOpt),
+        }
+    }
+
     fn dispatch_bluetooth_conn(self: &Arc<Self>, op: SocketOp<'_>) -> SocketOpResult {
         // Minimum sockaddr body length (after the 2-byte family) per protocol:
         // L2CAP psm(2)+bdaddr(6)+cid(2)+type(1)=11, RFCOMM bdaddr(6)+chan(1)=7,
@@ -4602,11 +4808,34 @@ impl SocketFile {
                 }
                 let mut state = self.state.lock();
                 if let SocketState::BluetoothConn { bound, .. } = &mut *state {
+                    // `sco_sock_bind`: only an OPEN (unbound) socket binds.
+                    if self.protocol == BTPROTO_SCO && bound.is_some() {
+                        return SocketOpResult::Err(SockError::BadFdState);
+                    }
                     *bound = Some(addr.body.clone());
                     SocketOpResult::Ok(0)
                 } else {
                     SocketOpResult::Err(SockError::InvalidArg)
                 }
+            }
+            SocketOp::Listen { .. } if self.protocol == BTPROTO_SCO => self.sco_listen(),
+            // `sco_sock_accept`: only a listener accepts, and with no
+            // controller no connection ever arrives to accept.
+            SocketOp::Accept if self.protocol == BTPROTO_SCO => match &*self.state.lock() {
+                SocketState::BluetoothConn { sco, .. } if sco.listening => {
+                    SocketOpResult::Err(SockError::WouldBlock)
+                }
+                _ => SocketOpResult::Err(SockError::BadFdState),
+            },
+            SocketOp::SetSockOpt { level, name, value }
+                if self.protocol == BTPROTO_SCO && level != SOL_SOCKET =>
+            {
+                self.sco_setsockopt(name, value)
+            }
+            SocketOp::GetSockOpt { level, name, buf }
+                if self.protocol == BTPROTO_SCO && level != SOL_SOCKET =>
+            {
+                self.sco_getsockopt(level, name, buf)
             }
             SocketOp::GetSockName => {
                 let body = match &*self.state.lock() {
