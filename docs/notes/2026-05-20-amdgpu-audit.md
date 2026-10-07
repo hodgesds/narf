@@ -1,5 +1,10 @@
 # AMDGPU scaffold audit (2026-05-20)
 
+> **SUPERSEDED (2026-10-07).** This snapshot is kept for history. Its central
+> claim — that IP discovery is the keystone gap — is no longer true: IP
+> discovery landed, as did most of what this note lists as blocked behind it.
+> For current state see [`2026-10-07-amdgpu-status.md`](2026-10-07-amdgpu-status.md).
+
 Snapshot of `drivers/gpu/src/amdgpu*.rs` at the start of the
 "yeah let's see how far we get" arc. Targets: Phoenix HawkPoint1
 (Zen4 + RDNA3.5, DCN 3.5, GFX 11.x) and Renoir / Lucienne /
