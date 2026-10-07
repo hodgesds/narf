@@ -295,7 +295,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<Rtw88Device, ProbeError> {
 /// baseline only delivers "chip detected + MAC readable" — there's
 /// no TX ring yet. Returning Err lets the kernel-side TCP stack
 /// surface the unimplemented-ness without crashing.
-pub fn send_frame_unimpl(_frame: &[u8]) -> Result<(), ()> {
+pub fn send_frame_unimpl(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     Err(())
 }
 

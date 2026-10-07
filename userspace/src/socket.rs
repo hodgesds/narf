@@ -9791,7 +9791,7 @@ fn smoke_socket_ioctl_reports_network_interface() -> TestResult {
     const NAME: &str = "nioctl0";
     const SIOCGIFADDR: u32 = 0x8915;
     const SIOCGIFMTU: u32 = 0x8921;
-    narf_net::iface::register(NAME, [0x02, 1, 2, 3, 4, 5], |_| Ok(()));
+    narf_net::iface::register(NAME, [0x02, 1, 2, 3, 4, 5], |_, _| Ok(()));
     narf_net::iface::set_iface_ipv4(NAME, [192, 0, 2, 9], [192, 0, 2, 1]);
     let sock = SocketFile::new(AF_INET, SOCK_DGRAM);
     let mut ifreq = [0u8; 40];

@@ -1071,7 +1071,7 @@ pub fn recv_frame(idx: usize, scratch: &mut [u8]) -> Result<Option<&[u8]>, NcmEr
 /// via NCM device 0 (the bring-up arc binds at most one USB-NCM
 /// device). Multi-NIC routing will replace this with a per-iface
 /// closure-equivalent dispatch table.
-fn ncm_send_static_trampoline(frame: &[u8]) -> Result<(), ()> {
+fn ncm_send_static_trampoline(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     match send_frame(0, frame) {
         Ok(_) => Ok(()),
         Err(_) => Err(()),

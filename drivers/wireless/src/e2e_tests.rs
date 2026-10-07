@@ -609,7 +609,7 @@ kernel_test_in!(
 
 /// Synthetic send-fn used by the wlan0 registration smoke. Returns
 /// `Ok(())` for every frame so the registration round-trip succeeds.
-fn synthetic_wlan0_send(_frame: &[u8]) -> Result<(), ()> {
+fn synthetic_wlan0_send(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     Ok(())
 }
 

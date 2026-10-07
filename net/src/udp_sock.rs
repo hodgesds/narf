@@ -1589,7 +1589,7 @@ kernel_test_in!("net/udp", smoke_udp_close_frees_port);
 /// .255, and not a /31's "broadcast".
 fn smoke_udp_broadcast_classification() -> TestResult {
     const IFACE: &str = "udpbc0";
-    iface::register(IFACE, [0x02, 0, 0, 0, 0xBC, 0], |_| Ok(()));
+    iface::register(IFACE, [0x02, 0, 0, 0, 0xBC, 0], |_, _| Ok(()));
     iface::add_addr(IFACE, [10, 91, 0, 2], 16);
     iface::add_addr(IFACE, [10, 92, 0, 0], 31);
     let checks = [
@@ -1625,7 +1625,7 @@ kernel_test_in!("net/udp", smoke_udp_broadcast_classification);
 
 static WIRE_CAPTURE: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
 
-fn wire_capture_send(frame: &[u8]) -> Result<(), ()> {
+fn wire_capture_send(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     WIRE_CAPTURE.lock().push(frame.to_vec());
     Ok(())
 }

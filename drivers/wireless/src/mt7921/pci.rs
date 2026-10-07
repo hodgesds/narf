@@ -391,7 +391,7 @@ pub fn l1_remap(abs: u32) -> u32 {
 /// up real TX once the DMA ring path lands; until then we return Err
 /// so the kernel-side TCP stack surfaces the unimplemented-ness
 /// without crashing.
-pub fn send_frame_unimpl(_frame: &[u8]) -> Result<(), ()> {
+pub fn send_frame_unimpl(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     Err(())
 }
 

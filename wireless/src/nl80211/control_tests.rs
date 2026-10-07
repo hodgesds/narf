@@ -180,7 +180,7 @@ fn smoke_nl80211_authority_and_scan_completion() -> TestResult {
         rx: IrqSafeSpinLock::new(None),
         tx: IrqSafeSpinLock::new(None),
     });
-    narf_net::iface::register(iface.name(), iface.mac(), |_| Ok(()));
+    narf_net::iface::register(iface.name(), iface.mac(), |_, _| Ok(()));
     crate::registry::register(iface.clone());
     let index = narf_net::netlink_route::ifindex_for_name(iface.name()).unwrap();
     let mut attrs = Vec::new();
@@ -509,7 +509,7 @@ fn smoke_nl80211_supplicant_interop() -> TestResult {
         rx: IrqSafeSpinLock::new(None),
         tx: IrqSafeSpinLock::new(None),
     });
-    narf_net::iface::register(INTEROP_NAME, INTEROP_MAC, |_| Ok(()));
+    narf_net::iface::register(INTEROP_NAME, INTEROP_MAC, |_, _| Ok(()));
     crate::registry::register(iface.clone());
     let ifindex = match narf_net::netlink_route::ifindex_for_name(INTEROP_NAME) {
         Some(index) => index,
@@ -780,7 +780,7 @@ fn smoke_nl80211_wpa3_sae_connect() -> TestResult {
         rx: IrqSafeSpinLock::new(None),
         tx: IrqSafeSpinLock::new(None),
     });
-    narf_net::iface::register(INTEROP_NAME, INTEROP_MAC, |_| Ok(()));
+    narf_net::iface::register(INTEROP_NAME, INTEROP_MAC, |_, _| Ok(()));
     crate::registry::register(iface.clone());
     let ifindex = match narf_net::netlink_route::ifindex_for_name(INTEROP_NAME) {
         Some(index) => index,
@@ -1031,7 +1031,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         external_status: core::sync::atomic::AtomicU32::new(0xffff),
     });
     let iface: Arc<dyn crate::WirelessNetIface> = stub.clone();
-    narf_net::iface::register(SME_NAME, SME_MAC, |_| Ok(()));
+    narf_net::iface::register(SME_NAME, SME_MAC, |_, _| Ok(()));
     crate::registry::register(iface.clone());
     let ifindex = match narf_net::netlink_route::ifindex_for_name(SME_NAME) {
         Some(index) => index,
@@ -1096,7 +1096,7 @@ fn smoke_nl80211_userspace_sme_mlme() -> TestResult {
         rx: IrqSafeSpinLock::new(None),
         tx: IrqSafeSpinLock::new(None),
     });
-    narf_net::iface::register("wlan-nosme", plain.mac(), |_| Ok(()));
+    narf_net::iface::register("wlan-nosme", plain.mac(), |_, _| Ok(()));
     crate::registry::register(plain.clone());
     if let (Some(plain_index), Some(plain_admin)) = (
         narf_net::netlink_route::ifindex_for_name("wlan-nosme"),
@@ -1396,7 +1396,7 @@ fn smoke_nl80211_ap_mode() -> TestResult {
         sta_deleted: core::sync::atomic::AtomicU32::new(0),
     });
     let iface: Arc<dyn crate::WirelessNetIface> = stub.clone();
-    narf_net::iface::register(AP_NAME, AP_MAC, |_| Ok(()));
+    narf_net::iface::register(AP_NAME, AP_MAC, |_, _| Ok(()));
     crate::registry::register(iface.clone());
     let ifindex = match narf_net::netlink_route::ifindex_for_name(AP_NAME) {
         Some(index) => index,
@@ -1515,7 +1515,7 @@ fn smoke_nl80211_ap_mode() -> TestResult {
         rx: IrqSafeSpinLock::new(None),
         tx: IrqSafeSpinLock::new(None),
     });
-    narf_net::iface::register("wlan-noap", plain.mac(), |_| Ok(()));
+    narf_net::iface::register("wlan-noap", plain.mac(), |_, _| Ok(()));
     crate::registry::register(plain.clone());
     if let (Some(pidx), Some(padmin)) = (
         narf_net::netlink_route::ifindex_for_name("wlan-noap"),
@@ -1543,7 +1543,7 @@ fn smoke_nl80211_connect_to_new_bss_roams() -> TestResult {
         rx: IrqSafeSpinLock::new(None),
         tx: IrqSafeSpinLock::new(None),
     });
-    narf_net::iface::register(ROAM_NAME, iface.mac(), |_| Ok(()));
+    narf_net::iface::register(ROAM_NAME, iface.mac(), |_, _| Ok(()));
     crate::registry::register(iface.clone());
     let ifindex = match narf_net::netlink_route::ifindex_for_name(ROAM_NAME) {
         Some(index) => index,

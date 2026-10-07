@@ -1584,7 +1584,7 @@ async fn e1000_tx_pump(device: Arc<E1000>, mut tx_cons: Consumer<Frame, TX_RING_
 
 /// SendFn registered with `narf_net::iface` at probe time. Routes
 /// the kernel-side TCP stack's outbound frames through E1000::tx.
-fn e1000_send_frame(frame: &[u8]) -> Result<(), ()> {
+fn e1000_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     // Clone the Arc out rather than holding the IRQ-masking CONTROLLER
     // lock across `tx`, which busy-polls the DD bit for up to 250 ms.
     // Holding it here masked interrupts on this CPU for the whole

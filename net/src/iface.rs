@@ -12,9 +12,12 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-/// Function pointer the driver supplies to send a single Ethernet
-/// frame. Returns Ok on enqueue, Err on driver failure.
-pub type SendFn = fn(&[u8]) -> Result<(), ()>;
+/// Function pointer the driver supplies to send a single Ethernet frame.
+/// `meta` carries the per-frame transmit offloads the stack is requesting
+/// (L4 checksum, TSO, VLAN); a driver that advertises no offloads in
+/// [`crate::Interface::offloads`] receives [`crate::TxMeta::plain`] and
+/// ignores the argument. Returns Ok on enqueue, Err on driver failure.
+pub type SendFn = fn(&[u8], crate::TxMeta) -> Result<(), ()>;
 
 /// Duplex state reported by a physical driver. `None` in snapshots means the
 /// driver has no authoritative link-mode sample.
@@ -241,7 +244,7 @@ static IFACES: IrqSafeSpinLock<Option<Vec<NetIfaceEntry>>> = IrqSafeSpinLock::ne
 /// if this task migrates mid-delivery, the release must still clear the flag
 /// it actually set, or that CPU is left permanently guarded and silently
 /// drops every later loopback frame.
-fn lo_send_fn(frame: &[u8]) -> Result<(), ()> {
+fn lo_send_fn(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     use core::sync::atomic::{AtomicBool, Ordering};
     const MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
     static IN_LOOPBACK: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
@@ -632,7 +635,7 @@ pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
         let e = v.iter().find(|e| e.name == iface_name).ok_or(())?;
         (e.send, e.name.clone())
     };
-    let result = send_fn(frame);
+    let result = send_fn(frame, crate::TxMeta::plain());
     record_tx_result(&name, frame.len(), result.is_ok());
     result
 }
@@ -652,7 +655,7 @@ pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
         let entry = v.iter().find(|e| e.ifindex == ifindex).ok_or(())?;
         (entry.send, entry.name.clone())
     };
-    let result = send_fn(frame);
+    let result = send_fn(frame, crate::TxMeta::plain());
     record_tx_result(&name, frame.len(), result.is_ok());
     result
 }
@@ -819,8 +822,16 @@ impl NetIfaceSnapshot {
     /// stack built. `ETH_P_ALL` packet sockets see it first
     /// (`dev_queue_xmit_nit`, `PACKET_OUTGOING`), then the driver sends it.
     pub fn xmit(&self, frame: &[u8]) -> Result<(), ()> {
+        self.xmit_meta(frame, crate::TxMeta::plain())
+    }
+
+    /// As [`Self::xmit`], but carries the per-frame transmit offloads the
+    /// stack is requesting (L4 checksum / TSO / VLAN). The stack sets these
+    /// only when [`Self::offloads`] advertises support; otherwise it hands a
+    /// fully-formed frame and [`crate::TxMeta::plain`].
+    pub fn xmit_meta(&self, frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
         crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
-        let result = (self.driver_send)(frame);
+        let result = (self.driver_send)(frame, meta);
         record_tx_result(&self.name, frame.len(), result.is_ok());
         result
     }
@@ -836,7 +847,7 @@ impl NetIfaceSnapshot {
         origin: Option<&crate::raw_sock::PacketSock>,
     ) -> Result<(), ()> {
         crate::raw_sock::dev_queue_xmit_nit(self, frame, protocol, origin);
-        let result = (self.driver_send)(frame);
+        let result = (self.driver_send)(frame, crate::TxMeta::plain());
         record_tx_result(&self.name, frame.len(), result.is_ok());
         result
     }
@@ -844,7 +855,7 @@ impl NetIfaceSnapshot {
     /// `dev_direct_xmit`: hand the frame straight to the driver, with no
     /// packet taps (`PACKET_QDISC_BYPASS`).
     pub fn xmit_direct(&self, frame: &[u8]) -> Result<(), ()> {
-        let result = (self.driver_send)(frame);
+        let result = (self.driver_send)(frame, crate::TxMeta::plain());
         record_tx_result(&self.name, frame.len(), result.is_ok());
         result
     }

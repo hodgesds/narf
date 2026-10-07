@@ -425,7 +425,7 @@ kernel_test_in!("net", smoke_net_arp_request_builder);
 // the e1000 (MPC) and virtio (ring-full) paths shows up in the interface
 // counters.
 fn smoke_net_iface_drop_counters() -> TestResult {
-    let name = crate::iface::register("ethcnt%d", [0x02, 0, 0, 0, 0, 0xC7], |_| Ok(()));
+    let name = crate::iface::register("ethcnt%d", [0x02, 0, 0, 0, 0, 0xC7], |_, _| Ok(()));
     crate::iface::note_rx_drop(&name, 3);
     crate::iface::note_rx_overrun(&name, 5);
     let snap = crate::iface::snapshot_counters();
@@ -5732,7 +5732,7 @@ fn bypass_register_loopback_for_test(name: &'static str) {
     }
     let authority = crate::bootstrap_authority();
     let _ = crate::register_loopback_named(&authority, name);
-    crate::iface::register(name, [0x02, 0, 0, 0, 0, 0xAA], |_b| Ok(()));
+    crate::iface::register(name, [0x02, 0, 0, 0, 0, 0xAA], |_b, _| Ok(()));
 }
 
 fn smoke_bypass_umem_register_valid() -> TestResult {
@@ -6049,7 +6049,7 @@ fn smoke_bypass_daemon_attach_succeeds() -> TestResult {
 kernel_test_in!("net/bypass", smoke_bypass_daemon_attach_succeeds);
 
 fn smoke_admin_handle_is_interface_bound() -> TestResult {
-    fn discard(_: &[u8]) -> Result<(), ()> {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
 
@@ -8404,7 +8404,7 @@ fn smoke_net_gateway_config_installs_default_route() -> TestResult {
     // wrong next hop. Invisible on x86_64, deterministic on aarch64 (smaller test
     // set → different neighbours). Start from a clean FIB.
     crate::route::__reset_for_test();
-    crate::iface::register(GWIF, [0x02, 0, 0, 0, 0, 0x99], |_| Ok(()));
+    crate::iface::register(GWIF, [0x02, 0, 0, 0, 0, 0x99], |_, _| Ok(()));
     crate::iface::set_iface_ipv4(GWIF, [198, 51, 100, 2], GW);
 
     let looked_up = crate::route::route_lookup(Ipv4Addr([203, 0, 113, 7]));
@@ -8469,8 +8469,8 @@ kernel_test_in!(
 /// given (`dev_new_index`) — re-registering a name keeps its ifindex, and
 /// later devices never reuse it.
 fn smoke_iface_register_allocates_name_and_stable_ifindex() -> TestResult {
-    let a = crate::iface::register("nrfa%d", [0x02, 0, 0, 0, 0xa1, 0], |_| Ok(()));
-    let b = crate::iface::register("nrfa%d", [0x02, 0, 0, 0, 0xa1, 1], |_| Ok(()));
+    let a = crate::iface::register("nrfa%d", [0x02, 0, 0, 0, 0xa1, 0], |_, _| Ok(()));
+    let b = crate::iface::register("nrfa%d", [0x02, 0, 0, 0, 0xa1, 1], |_, _| Ok(()));
     if a != "nrfa0" || b != "nrfa1" {
         return TestResult::Fail("eth%d-style names must take the lowest free number");
     }
@@ -8480,7 +8480,7 @@ fn smoke_iface_register_allocates_name_and_stable_ifindex() -> TestResult {
     if ia == ib || ia < 2 || ib < 2 {
         return TestResult::Fail("ifindexes must be distinct and leave 1 for lo");
     }
-    let again = crate::iface::register(&a, [0x02, 0, 0, 0, 0xa1, 2], |_| Ok(()));
+    let again = crate::iface::register(&a, [0x02, 0, 0, 0, 0xa1, 2], |_, _| Ok(()));
     if again != a || crate::iface::ifindex_of(&a) != Some(ia) {
         return TestResult::Fail("re-registering a device must keep its ifindex");
     }
@@ -8498,7 +8498,7 @@ kernel_test_in!(
 /// than rendering zero-filled stand-ins. Exercise the common RX/TX paths and
 /// confirm the registry snapshot observes the exact traffic.
 fn smoke_iface_counters_follow_live_traffic() -> TestResult {
-    let name = crate::iface::register("nrfstats%d", [0x02, 0, 0, 0, 0x5a, 1], |_| Ok(()));
+    let name = crate::iface::register("nrfstats%d", [0x02, 0, 0, 0, 0x5a, 1], |_, _| Ok(()));
     let Some(iface) = crate::iface::lookup(&name) else {
         return TestResult::Fail("registered statistics device not found");
     };
@@ -8537,7 +8537,7 @@ fn smoke_iface_registers_down_and_unconfigured() -> TestResult {
     const IFF_UP: u32 = 0x1;
     const IFF_RUNNING: u32 = 0x40;
     const IFF_LOWER_UP: u32 = 0x1_0000;
-    let name = crate::iface::register("nrfd%d", [0x02, 0, 0, 0, 0xd0, 0], |_| Ok(()));
+    let name = crate::iface::register("nrfd%d", [0x02, 0, 0, 0, 0xd0, 0], |_, _| Ok(()));
     let Some(nic) = crate::iface::lookup(&name) else {
         return TestResult::Fail("registered device not found");
     };
@@ -8624,7 +8624,7 @@ fn smoke_rtnetlink_extack_messages_are_linuxs() -> TestResult {
     const EINVAL: i32 = 22;
     const EEXIST: i32 = 17;
     const EADDRNOTAVAIL: i32 = 99;
-    let name = crate::iface::register("nrfx%d", [0x02, 0, 0, 0, 0xe7, 0], |_| Ok(()));
+    let name = crate::iface::register("nrfx%d", [0x02, 0, 0, 0, 0xe7, 0], |_, _| Ok(()));
     let Some(ifindex) = crate::iface::ifindex_of(&name) else {
         return TestResult::Fail("test interface has no ifindex");
     };
@@ -8803,7 +8803,7 @@ kernel_test_in!("net", smoke_rtnetlink_extack_messages_are_linuxs);
 /// them. NARF tagged every received frame as ifindex 1 (`lo`), so a socket
 /// bound to a NIC — what a DHCP client opens — never received anything.
 fn smoke_raw_packet_frames_carry_the_ingress_ifindex() -> TestResult {
-    let name = crate::iface::register("nrfp%d", [0x02, 0, 0, 0, 0xbe, 0], |_| Ok(()));
+    let name = crate::iface::register("nrfp%d", [0x02, 0, 0, 0, 0xbe, 0], |_, _| Ok(()));
     let Some(ifindex) = crate::iface::ifindex_of(&name) else {
         return TestResult::Fail("test interface has no ifindex");
     };
@@ -8860,7 +8860,7 @@ fn packet_open(sock_type: u32, proto: u16) -> alloc::sync::Arc<crate::raw_sock::
 /// `ptype_base`). Ported from the receive smokes of the old raw-socket table.
 fn smoke_packet_eth_p_all_and_ethertype_hooks() -> TestResult {
     use crate::raw_sock::{ETH_P_ALL, SOCK_RAW};
-    let name = crate::iface::register("nrfh%d", [0x02, 0, 0, 0, 0xbf, 0], |_| Ok(()));
+    let name = crate::iface::register("nrfh%d", [0x02, 0, 0, 0, 0xbf, 0], |_, _| Ok(()));
     crate::iface::set_link_state(&name, true);
     let Some(ifindex) = crate::iface::ifindex_of(&name) else {
         return TestResult::Fail("test interface has no ifindex");
@@ -8904,7 +8904,7 @@ kernel_test_in!("net/raw", smoke_packet_eth_p_all_and_ethertype_hooks);
 /// linear data while deriving auxdata for it.
 fn smoke_packet_short_vlan_frame_is_bounded() -> TestResult {
     use crate::raw_sock::{ETH_P_8021Q, ETH_P_ALL, SOCK_DGRAM};
-    let name = crate::iface::register("nrfv%d", [0x02, 0, 0, 0, 0xbf, 1], |_| Ok(()));
+    let name = crate::iface::register("nrfv%d", [0x02, 0, 0, 0, 0xbf, 1], |_, _| Ok(()));
     crate::iface::set_link_state(&name, true);
     let Some(dev) = crate::iface::lookup(&name) else {
         return TestResult::Fail("test interface missing");
@@ -8967,7 +8967,7 @@ fn smoke_packet_memberships_reference_the_device() -> TestResult {
         PacketMreq, ETH_P_ALL, MAX_ADDR_LEN, PACKET_MR_ALLMULTI, PACKET_MR_MULTICAST,
         PACKET_MR_PROMISC, SOCK_RAW,
     };
-    let name = crate::iface::register("nrfm%d", [0x02, 0, 0, 0, 0xbe, 1], |_| Ok(()));
+    let name = crate::iface::register("nrfm%d", [0x02, 0, 0, 0, 0xbe, 1], |_, _| Ok(()));
     let Some(ifindex) = crate::iface::ifindex_of(&name) else {
         return TestResult::Fail("test interface has no ifindex");
     };

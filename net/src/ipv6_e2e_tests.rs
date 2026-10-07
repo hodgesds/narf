@@ -57,7 +57,7 @@ use crate::resolv_conf;
 
 static IPV6_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
 
-fn v6_capture(frame: &[u8]) -> Result<(), ()> {
+fn v6_capture(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     IPV6_TX.lock().push(frame.to_vec());
     Ok(())
 }

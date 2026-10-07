@@ -7135,7 +7135,7 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_netlink_route_getroute_dump);
 
 fn smoke_abi_netlink_route_point_lookup() -> TestResult {
     with_setup(|| {
-        fn discard(_: &[u8]) -> Result<(), ()> {
+        fn discard(_: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
             Ok(())
         }
 

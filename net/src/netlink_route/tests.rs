@@ -207,7 +207,7 @@ fn getroute_dump_has_loopback_and_terminates() {
 
 #[test]
 fn getroute_point_query_uses_longest_prefix_match() {
-    fn discard(_: &[u8]) -> Result<(), ()> {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
 
@@ -645,7 +645,7 @@ fn iproute2_zero_padded_getaddr_dump_is_answered() {
 
 #[test]
 fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
-    fn discard(_: &[u8]) -> Result<(), ()> {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
 
@@ -735,7 +735,7 @@ fn delegated_admin_can_set_mtu_but_unprivileged_socket_gets_eperm() {
 
 #[test]
 fn setlink_notification_reports_complete_post_mutation_link_state() {
-    fn discard(_: &[u8]) -> Result<(), ()> {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
 
@@ -825,7 +825,7 @@ fn strict_check_rejects_short_dump_and_accepts_typed_request() {
 
 #[test]
 fn delegated_admin_can_add_and_delete_ipv4_route() {
-    fn discard(_: &[u8]) -> Result<(), ()> {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
 
@@ -903,7 +903,7 @@ fn delegated_admin_can_add_and_delete_ipv4_route() {
 
 #[test]
 fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
-    fn discard(_: &[u8]) -> Result<(), ()> {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
 
@@ -1004,7 +1004,7 @@ fn delegated_admin_can_add_and_delete_ipv6_address_and_route() {
 
 #[test]
 fn delegated_admin_can_add_and_delete_ipv4_neighbor() {
-    fn discard(_: &[u8]) -> Result<(), ()> {
+    fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
         Ok(())
     }
 

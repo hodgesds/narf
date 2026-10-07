@@ -403,7 +403,7 @@ kernel_test_in!("userspace", smoke_socket_inet_raw_icmp_loopback);
 static ICMP_TX_CAPTURE: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-fn icmp_capture_send(frame: &[u8]) -> Result<(), ()> {
+fn icmp_capture_send(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     ICMP_TX_CAPTURE.lock().push(frame.to_vec());
     Ok(())
 }
@@ -1554,7 +1554,7 @@ kernel_test_in!(
 static UDP_TX_CAPTURE: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>> =
     narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
 
-fn udp_capture_send(frame: &[u8]) -> Result<(), ()> {
+fn udp_capture_send(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     UDP_TX_CAPTURE.lock().push(frame.to_vec());
     Ok(())
 }
@@ -1699,8 +1699,8 @@ fn smoke_socket_bindtodevice_filters_receive() -> TestResult {
     const PEER: [u8; 4] = [10, 8, 0, 9];
     const PORT: u16 = 4343;
 
-    narf_net::iface::register(IFACE_A, [0x02, 0, 0, 0, 1, 0], |_| Ok(()));
-    narf_net::iface::register(IFACE_B, [0x02, 0, 0, 0, 1, 1], |_| Ok(()));
+    narf_net::iface::register(IFACE_A, [0x02, 0, 0, 0, 1, 0], |_, _| Ok(()));
+    narf_net::iface::register(IFACE_B, [0x02, 0, 0, 0, 1, 1], |_, _| Ok(()));
     let (Some(idx_a), Some(idx_b)) = (
         narf_net::iface::ifindex_of(IFACE_A),
         narf_net::iface::ifindex_of(IFACE_B),

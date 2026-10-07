@@ -40,7 +40,7 @@ use crate::pkt::{
 /// capture cells other test modules use, so no cross-module interference.
 static COV_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
 
-fn cov_send(frame: &[u8]) -> Result<(), ()> {
+fn cov_send(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     COV_TX.lock().push(frame.to_vec());
     Ok(())
 }
@@ -998,7 +998,7 @@ fn bypass_iface(name: &'static str) {
         let authority = crate::bootstrap_authority();
         let _ = crate::register_loopback_named(&authority, name);
     }
-    crate::iface::register(name, [0x02, 0, 0, 0, 0x7C, 0xAA], |_b| Ok(()));
+    crate::iface::register(name, [0x02, 0, 0, 0, 0x7C, 0xAA], |_b, _| Ok(()));
 }
 
 /// Claim every TCP flow to 10.0.75.1 (any port) with a fresh socket whose

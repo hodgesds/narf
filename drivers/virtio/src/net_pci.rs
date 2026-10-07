@@ -1949,7 +1949,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
 /// the fire-and-forget tx_dma path. tx_dma takes the buffer BY VALUE
 /// and keeps it alive (in the per-pair in-flight table) until the
 /// device completes the transmit, so we must NOT drop it here.
-fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
+fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     if frame.is_empty() || frame.len() > MAX_FRAME - 12 {
         return Err(());
     }
