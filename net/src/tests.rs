@@ -419,6 +419,30 @@ fn smoke_net_arp_request_builder() -> TestResult {
 }
 kernel_test_in!("net", smoke_net_arp_request_builder);
 
+// The driver drop/overrun accounting hooks (note_rx_drop / note_rx_overrun):
+// a dropped frame bumps rx_dropped, a hardware overrun bumps
+// rx_over_errors + rx_fifo_errors + rx_errors — so previously-silent loss on
+// the e1000 (MPC) and virtio (ring-full) paths shows up in the interface
+// counters.
+fn smoke_net_iface_drop_counters() -> TestResult {
+    let name = crate::iface::register("ethcnt%d", [0x02, 0, 0, 0, 0, 0xC7], |_| Ok(()));
+    crate::iface::note_rx_drop(&name, 3);
+    crate::iface::note_rx_overrun(&name, 5);
+    let snap = crate::iface::snapshot_counters();
+    let e = match snap.iter().find(|e| e.name == name) {
+        Some(e) => e,
+        None => return TestResult::Fail("registered iface absent from counter snapshot"),
+    };
+    if e.rx_drop != 3 {
+        return TestResult::Fail("note_rx_drop did not bump rx_dropped");
+    }
+    if e.rx_over_errors != 5 || e.rx_fifo != 5 || e.rx_errs != 5 {
+        return TestResult::Fail("note_rx_overrun did not bump over/fifo/errs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net", smoke_net_iface_drop_counters);
+
 fn smoke_net_stack_attach_cap_bootstrap() -> TestResult {
     // smoke: StackAttach struct can be constructed; caps round-trip.
     use crate::{NetIface, StackAttach, StackDaemon};

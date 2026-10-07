@@ -1778,7 +1778,12 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                                     return;
                                 }
                                 Err(narf_ipc::TrySendError::Full(_)) => {
-                                    // Frame dropped on scope exit.
+                                    // The driver→stack ring is full: the stack
+                                    // isn't draining fast enough. Frame is
+                                    // dropped on scope exit — count it so the
+                                    // loss is observable (rx_dropped) instead
+                                    // of silent.
+                                    narf_net::iface::note_rx_drop(primary_iface_name(), 1);
                                 }
                             }
                         }

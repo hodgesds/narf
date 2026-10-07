@@ -292,6 +292,9 @@ const REG_IMS: u64 = 0x00D0;
 const REG_IMC: u64 = 0x00D8;
 const REG_RCTL: u64 = 0x0100;
 const REG_TCTL: u64 = 0x0400;
+/// Missed Packets Count — RX frames dropped for want of a descriptor
+/// (receive-FIFO overrun). Clears on read. 8254x SDM §13.
+const REG_MPC: u64 = 0x4010;
 const REG_RDBAL: u64 = 0x2800;
 const REG_RDBAH: u64 = 0x2804;
 const REG_RDLEN: u64 = 0x2808;
@@ -1418,6 +1421,15 @@ impl E1000 {
         unsafe { self.mmio.read32(REG_STATUS) }
     }
 
+    /// Read + clear the Missed Packets Count — frames the MAC dropped because
+    /// no RX descriptor was available (receive-FIFO overrun). e1000 statistics
+    /// registers clear on read, so each call returns the count accumulated
+    /// since the previous read.
+    pub fn read_mpc(&self) -> u32 {
+        // SAFETY: MPC (0x4010) is within the mapped BAR0 register window.
+        unsafe { self.mmio.read32(REG_MPC) }
+    }
+
     /// Read IMS (Interrupt Mask Set/Read, 8254x SDM §13.4.20). A
     /// non-zero value indicates IRQ-driven completion is armed.
     pub fn read_ims(&self) -> u32 {
@@ -1551,8 +1563,14 @@ async fn e1000_rx_pump(device: Arc<E1000>, mut rx_prod: Producer<Frame, RX_RING_
             // Recently active: tight re-poll for low RX latency.
             narf_scheduler::yield_now().await;
         } else {
-            // Idle: park ~1 ms on the timer wheel so the executor can
-            // halt instead of spinning this empty poll every round.
+            // Idle: fold any receive-FIFO overruns accumulated during the
+            // prior burst into the interface counters (MPC is clear-on-read)
+            // so the loss is observable, then park ~1 ms on the timer wheel
+            // so the executor can halt instead of spinning this empty poll.
+            let missed = device.read_mpc();
+            if missed > 0 {
+                narf_net::iface::note_rx_overrun(e1000_ifname(), missed as u64);
+            }
             narf_time::sleep_cycles(idle_park_cycles).await;
         }
     }
