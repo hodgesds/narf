@@ -913,3 +913,97 @@ impl VmState {
         None
     }
 }
+
+// ── Activating an address space on the hardware ─────────────────────────
+
+/// Why an address space could not be made live.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ActivateError {
+    /// Nothing is mapped, so there is no root page directory to point at.
+    NoPageTables,
+    /// Every user VMID is bound and none could be evicted.
+    Vmid(crate::amdgpu_vmid::VmidError),
+    /// The TLB invalidate did not acknowledge within its budget.
+    Tlb(crate::amdgpu_vmhub_regs::TlbInvalidateError),
+}
+
+impl Geometry {
+    /// `vm_manager.num_level` — directory levels ABOVE the leaf, which is what
+    /// `PAGE_TABLE_DEPTH` holds. 3 on GMC 11, where four levels are walked.
+    ///
+    /// Writing 4 here would make the MMU expect a fifth level that does not
+    /// exist and treat the root's entries as pointers to tables that are
+    /// really leaves.
+    pub fn num_level(&self) -> u8 {
+        (Level::Ptb as u8) - (self.root_level as u8)
+    }
+}
+
+/// Make `vm`'s page tables the ones the GPU walks for a VMID.
+///
+/// The sequence is `gfxhub_v3_0_setup_vmid_config` plus
+/// `gmc_v11_0_flush_gpu_tlb`, in that order, and the order is not negotiable:
+/// the page-table base and the address bounds must be in place before the
+/// context is enabled, and the TLB must be invalidated after, or the MMU
+/// serves translations cached for whatever previously held this VMID. That
+/// last point is the whole reason this is one function rather than three calls
+/// a caller sequences itself — a forgotten invalidate is one process reading
+/// another's memory, and it does not fail loudly.
+///
+/// Both hubs are programmed. The GFX hub serves the shader engines and the MM
+/// hub serves the display and multimedia blocks; a VMID bound in one and not
+/// the other translates for some engines and faults for others.
+///
+/// LINUX-GAP: `fault_on_invalid` is always true here — RETRY is never set. A
+/// compute client that prefetches past a buffer wants the retry behaviour, and
+/// choosing it needs the per-context flag `AMDGPU_VM_PAGE_PRT` and friends
+/// carry; until a submission can express it, faulting is the safer default.
+#[allow(clippy::too_many_arguments)]
+pub fn activate<MG, MM>(
+    vm: &VmState,
+    pool: &mut crate::amdgpu_vmid::VmidPool,
+    pasid: crate::amdgpu_vmid::Pasid,
+    mmio_gfx: &mut MG,
+    regs_gfx: &crate::amdgpu_vmhub_regs::VmHubRegs,
+    mmio_mm: &mut MM,
+    regs_mm: &crate::amdgpu_vmhub_regs::VmHubRegs,
+) -> Result<u8, ActivateError>
+where
+    MG: crate::amdgpu_vmhub_regs::VmHubMmio,
+    MM: crate::amdgpu_vmhub_regs::VmHubMmio,
+{
+    use crate::amdgpu_vmhub_regs as hub;
+
+    // An address space with nothing mapped has no root directory. Binding a
+    // VMID to address 0 would point the MMU at physical page 0.
+    let root = vm.root_phys().ok_or(ActivateError::NoPageTables)?;
+    let geometry = vm.geometry();
+    let vmid = pool.bind(pasid, root).map_err(ActivateError::Vmid)?;
+
+    let depth = geometry.num_level();
+    let block_size = geometry.block_size as u8;
+    let end_pfn = geometry.max_pfn - 1;
+
+    // Written out twice rather than looped over a trait object: `VmHubMmio`'s
+    // helpers are generic, and the two hubs have different concrete MMIO types
+    // because they are different register windows.
+    fn program_hub<M: hub::VmHubMmio>(
+        mmio: &mut M,
+        regs: &hub::VmHubRegs,
+        vmid: u8,
+        root: u64,
+        end_pfn: u64,
+        depth: u8,
+        block_size: u8,
+    ) {
+        hub::write_vmid_pt_base(mmio, regs, vmid, root);
+        hub::write_vmid_aperture(mmio, regs, vmid, 0, end_pfn);
+        hub::write_vmid_cntl(mmio, regs, vmid, depth, block_size, true);
+    }
+    program_hub(mmio_gfx, regs_gfx, vmid, root, end_pfn, depth, block_size);
+    program_hub(mmio_mm, regs_mm, vmid, root, end_pfn, depth, block_size);
+
+    hub::invalidate_vmid_full(mmio_gfx, regs_gfx, mmio_mm, regs_mm, vmid)
+        .map_err(ActivateError::Tlb)?;
+    Ok(vmid)
+}

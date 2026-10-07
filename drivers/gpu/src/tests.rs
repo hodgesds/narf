@@ -8168,3 +8168,178 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_ctx",
     smoke_amdgpu_ctx_alloc_query_and_priority_gate
 );
+
+/// Activating an address space programs both hubs and then invalidates.
+///
+/// The ordering is the property: base and bounds before the context is
+/// enabled, TLB invalidated after. A forgotten invalidate means the MMU keeps
+/// serving translations cached for whatever previously held the VMID — one
+/// process reading another's memory, silently.
+fn smoke_amdgpu_vm_activate_programs_both_hubs() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, ActivateError, VmState, GPU_PAGE_SIZE};
+    use crate::amdgpu_vmhub_regs::{
+        test_support::MockVmHubMmio, GFXHUB_V3_0, MMHUB_V3_0, TLB_POLL_BUDGET,
+    };
+    use crate::amdgpu_vmid::{Pasid, VmidPool};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let mut pool = VmidPool::new(crate::amdgpu_vmid::VmHub::Gfx);
+
+    // An address space with nothing mapped has no root directory, and binding
+    // a VMID to address 0 would point the MMU at physical page 0.
+    let mut g0 = MockVmHubMmio::new();
+    let mut m0 = MockVmHubMmio::new();
+    if !matches!(
+        vm::activate(
+            &state,
+            &mut pool,
+            1 as Pasid,
+            &mut g0,
+            &GFXHUB_V3_0,
+            &mut m0,
+            &MMHUB_V3_0,
+        ),
+        Err(ActivateError::NoPageTables)
+    ) {
+        return TestResult::Fail("activating an empty address space must be refused");
+    }
+    if !g0.writes.is_empty() || !m0.writes.is_empty() {
+        return TestResult::Fail("a refused activation must touch no register");
+    }
+
+    // Map something so a root directory exists.
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let mut map = [0u8; 40];
+    map[0..4].copy_from_slice(&handle.to_le_bytes());
+    map[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    map[12..16]
+        .copy_from_slice(&(u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE).to_le_bytes());
+    map[16..24].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
+    map[32..40].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+    if vm::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        map.as_mut_ptr() as usize,
+        &state,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: MAP failed");
+    }
+    let Some(root) = state.root_phys() else {
+        return TestResult::Fail("setup: no root directory after a map");
+    };
+
+    // The invalidate polls an ACK; stage it so the poll terminates.
+    let mut gfx = MockVmHubMmio::new();
+    let mut mm = MockVmHubMmio::new();
+    // The invalidate polls an ACK register; make it answer on the first poll
+    // so the budget is not spent.
+    // The poll waits for the VMID's own bit in the ACK; all-ones satisfies it
+    // whichever VMID the pool hands out.
+    gfx.auto_ack_after = Some((GFXHUB_V3_0.inv_eng0_ack << 2, u32::MAX));
+    mm.auto_ack_after = Some((MMHUB_V3_0.inv_eng0_ack << 2, u32::MAX));
+
+    let vmid = match vm::activate(
+        &state,
+        &mut pool,
+        1 as Pasid,
+        &mut gfx,
+        &GFXHUB_V3_0,
+        &mut mm,
+        &MMHUB_V3_0,
+    ) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("activation of a mapped address space failed"),
+    };
+    if vmid == 0 {
+        return TestResult::Fail("a user address space must not be given the kernel VMID");
+    }
+
+    // Both hubs were programmed — a VMID bound in one and not the other
+    // translates for the shader engines and faults for display, or vice versa.
+    for (writes, regs, name) in [
+        (&gfx.writes, &GFXHUB_V3_0, "gfx"),
+        (&mm.writes, &MMHUB_V3_0, "mm"),
+    ] {
+        let _ = name;
+        let at = |dword: u32| -> Option<u32> {
+            writes
+                .iter()
+                .find(|(off, _)| *off == dword << 2)
+                .map(|(_, v)| *v)
+        };
+        let stride = regs.ctx_addr_distance * (vmid as u32);
+        // Page-table base: the low half holds the root's low 32 bits.
+        match at(regs.ctx0_pt_base_lo + stride) {
+            Some(v) if v == root as u32 => {}
+            _ => return TestResult::Fail("the page-table base was not programmed"),
+        }
+        // Bounds: start 0, end max_pfn - 1. Left at a cold-boot zero the
+        // context would bound its address space to nothing.
+        match at(regs.ctx0_pt_start_lo + stride) {
+            Some(0) => {}
+            _ => return TestResult::Fail("the page-table start bound was not programmed"),
+        }
+        match at(regs.ctx0_pt_end_lo + stride) {
+            Some(v) if v == (state.geometry().max_pfn - 1) as u32 => {}
+            _ => return TestResult::Fail("the page-table end bound was not programmed"),
+        }
+        // Context control: enabled, depth 3, every fault report on.
+        let cntl = match at(regs.ctx0_cntl + regs.ctx_distance * (vmid as u32)) {
+            Some(v) => v,
+            None => return TestResult::Fail("the context was never enabled"),
+        };
+        use crate::amdgpu_vmhub_regs as hub;
+        if cntl & hub::CTX_CNTL_ENABLE_CONTEXT == 0 {
+            return TestResult::Fail("the context-enable bit is clear");
+        }
+        if (cntl >> hub::CTX_CNTL_PT_DEPTH_SHIFT) & hub::CTX_CNTL_PT_DEPTH_MASK != 3 {
+            return TestResult::Fail("PAGE_TABLE_DEPTH should be num_level, which is 3");
+        }
+        if cntl & hub::CTX_CNTL_FAULT_ENABLE_DEFAULTS != hub::CTX_CNTL_FAULT_ENABLE_DEFAULTS {
+            return TestResult::Fail("a protection-fault report is disabled");
+        }
+    }
+
+    // The TLB invalidate happened, and it happened AFTER the context was
+    // enabled: its request register is written later than the cntl register.
+    let cntl_at = gfx.writes.iter().position(|(off, _)| {
+        *off == (GFXHUB_V3_0.ctx0_cntl + GFXHUB_V3_0.ctx_distance * (vmid as u32)) << 2
+    });
+    let inv_at = gfx
+        .writes
+        .iter()
+        .position(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2);
+    match (cntl_at, inv_at) {
+        (Some(c), Some(i)) if i > c => {}
+        (_, None) => return TestResult::Fail("no TLB invalidate was issued"),
+        _ => return TestResult::Fail("the TLB was invalidated before the context was enabled"),
+    }
+    let _ = TLB_POLL_BUDGET;
+
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_activate_programs_both_hubs
+);

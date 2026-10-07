@@ -259,32 +259,110 @@ pub fn write_vmid0_aperture<M: VmHubMmio>(
     mmio.write(regs.ctx0_pt_end_hi << 2, (end_pfn >> 32) as u32);
 }
 
+/// Per-VMID `PAGE_TABLE_START_ADDR` / `_END_ADDR`, as
+/// `gfxhub_v3_0_setup_vmid_config` writes them: start 0, end `max_pfn - 1`.
+///
+/// `write_vmid0_aperture` writes only context 0's pair. Every user VMID needs
+/// its own, or the hardware bounds the address space it walks for that context
+/// by whatever the registers happened to hold — zero, on a cold boot, which
+/// makes every address out of range.
+pub fn write_vmid_aperture<M: VmHubMmio>(
+    mmio: &mut M,
+    regs: &VmHubRegs,
+    vmid: u8,
+    start_pfn: u64,
+    end_pfn: u64,
+) {
+    let stride = regs.ctx_addr_distance * (vmid as u32);
+    mmio.write((regs.ctx0_pt_start_lo + stride) << 2, start_pfn as u32);
+    mmio.write(
+        (regs.ctx0_pt_start_hi + stride) << 2,
+        (start_pfn >> 32) as u32,
+    );
+    mmio.write((regs.ctx0_pt_end_lo + stride) << 2, end_pfn as u32);
+    mmio.write((regs.ctx0_pt_end_hi + stride) << 2, (end_pfn >> 32) as u32);
+}
+
 // ── Context-enable bits (per Linux mmhub_v3_0.c line 285-290) ──────
 
-/// `MMVM_CONTEXT0_CNTL.ENABLE_CONTEXT` bit (per `mmhub_3_0_0_sh_mask.h`).
-pub const CTX_CNTL_ENABLE_CONTEXT: u32 = 1 << 0;
-/// `PAGE_TABLE_DEPTH` field shift (2 bits at bit 1).
-pub const CTX_CNTL_PT_DEPTH_SHIFT: u32 = 1;
-/// `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT` shift.
-pub const CTX_CNTL_RETRY_FAULT_SHIFT: u32 = 3;
+// Field positions are from `gc_11_0_0_sh_mask.h` /
+// `mmhub_3_0_0_sh_mask.h`, which agree on this register:
+//
+// | bits  | field                                      |
+// |-------|--------------------------------------------|
+// | 0     | ENABLE_CONTEXT                             |
+// | 2:1   | PAGE_TABLE_DEPTH                           |
+// | 6:3   | PAGE_TABLE_BLOCK_SIZE                      |
+// | 7     | RETRY_PERMISSION_OR_INVALID_PAGE_FAULT     |
+// | 10    | RANGE_PROTECTION_FAULT_ENABLE_DEFAULT      |
+// | 12    | DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT |
+// | 14    | PDE0_PROTECTION_FAULT_ENABLE_DEFAULT       |
+// | 16    | VALID_PROTECTION_FAULT_ENABLE_DEFAULT      |
+// | 18    | READ_PROTECTION_FAULT_ENABLE_DEFAULT       |
+// | 20    | WRITE_PROTECTION_FAULT_ENABLE_DEFAULT      |
+// | 22    | EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT    |
 
-/// Enable a VMID context. `depth` is the page-table depth (0 =
-/// flat / GART, 4 = 4-level x86_64-style for user VMs).
+/// `ENABLE_CONTEXT` (bit 0).
+pub const CTX_CNTL_ENABLE_CONTEXT: u32 = 1 << 0;
+/// `PAGE_TABLE_DEPTH`, 2 bits at bit 1.
+pub const CTX_CNTL_PT_DEPTH_SHIFT: u32 = 1;
+pub const CTX_CNTL_PT_DEPTH_MASK: u32 = 0x3;
+/// `PAGE_TABLE_BLOCK_SIZE`, 4 bits at bit 3.
+pub const CTX_CNTL_PT_BLOCK_SIZE_SHIFT: u32 = 3;
+pub const CTX_CNTL_PT_BLOCK_SIZE_MASK: u32 = 0xF;
+/// `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT`, bit **7**.
+///
+/// This was declared at bit 3 — which is `PAGE_TABLE_BLOCK_SIZE`'s low bit —
+/// so asking for retry instead told the hardware the leaf page table was twice
+/// its real size. The old test only asserted `ENABLE_CONTEXT`, so it never
+/// exercised the retry argument and the collision survived.
+pub const CTX_CNTL_RETRY_FAULT_SHIFT: u32 = 7;
+
+/// The seven `*_PROTECTION_FAULT_ENABLE_DEFAULT` bits
+/// `gfxhub_v3_0_setup_vmid_config` sets, every one of them.
+///
+/// Without these the MMU does not report a fault it detects, so an access
+/// outside a mapping, through an invalid PDE0, or against the permissions in a
+/// PTE lands somewhere instead of raising. They are what makes the page tables
+/// an enforcement rather than a suggestion.
+pub const CTX_CNTL_FAULT_ENABLE_DEFAULTS: u32 = (1 << 10)  // RANGE
+    | (1 << 12) // DUMMY_PAGE
+    | (1 << 14) // PDE0
+    | (1 << 16) // VALID
+    | (1 << 18) // READ
+    | (1 << 20) // WRITE
+    | (1 << 22); // EXECUTE
+
+/// Enable a VMID context, as `gfxhub_v3_0_setup_vmid_config` does.
+///
+/// `depth` is `vm_manager.num_level` — 3 on GMC 11, the number of directory
+/// levels ABOVE the leaf, not the total. `block_size` is
+/// `vm_manager.block_size`; the field holds `block_size - 9`, which is 0 for
+/// GMC 11, so a driver that omitted the field would be accidentally right here
+/// and wrong on any part that sized its leaf tables differently.
+///
+/// `fault_on_invalid` false sets RETRY, which makes the GPU retry a faulting
+/// access rather than raise a VM_FAULT interrupt — what a compute client wants
+/// so a prefetch past the end of a buffer is not fatal.
 pub fn write_vmid_cntl<M: VmHubMmio>(
     mmio: &mut M,
     regs: &VmHubRegs,
     vmid: u8,
     depth: u8,
+    block_size: u8,
     fault_on_invalid: bool,
 ) {
     let dword = regs.ctx0_cntl + regs.ctx_distance * (vmid as u32);
     let mut val = CTX_CNTL_ENABLE_CONTEXT;
-    val |= ((depth as u32) & 0x3) << CTX_CNTL_PT_DEPTH_SHIFT;
+    val |= ((depth as u32) & CTX_CNTL_PT_DEPTH_MASK) << CTX_CNTL_PT_DEPTH_SHIFT;
+    // `block_size - 9`, saturating: a block size below 9 is not a layout this
+    // register can describe, and wrapping would set every bit of the field.
+    let encoded = u32::from(block_size.saturating_sub(9));
+    val |= (encoded & CTX_CNTL_PT_BLOCK_SIZE_MASK) << CTX_CNTL_PT_BLOCK_SIZE_SHIFT;
     if !fault_on_invalid {
-        // RETRY=1 lets the GPU retry on a fault rather than firing
-        // a VM_FAULT IH cookie — used for prefetch-friendly compute.
         val |= 1 << CTX_CNTL_RETRY_FAULT_SHIFT;
     }
+    val |= CTX_CNTL_FAULT_ENABLE_DEFAULTS;
     mmio.write(dword << 2, val);
 }
 
@@ -539,15 +617,56 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_write_vmid0_aperture_writes_4_dwords);
 
+    /// Every field of the context-control register, at its own position.
+    ///
+    /// The previous version of this test asserted only `ENABLE_CONTEXT`, which
+    /// is why `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT` sat at bit 3 — inside
+    /// `PAGE_TABLE_BLOCK_SIZE` — for as long as it did: nothing ever passed
+    /// `fault_on_invalid = false`, so the collision was never written.
     fn smoke_write_vmid_cntl_enables_context() -> TestResult {
+        // GMC 11: depth 3 (directory levels above the leaf), block size 9.
         let mut m = MockVmHubMmio::new();
-        write_vmid_cntl(&mut m, &GFXHUB_V3_0, 0, 0, true);
+        write_vmid_cntl(&mut m, &GFXHUB_V3_0, 0, 3, 9, true);
         if m.writes.len() != 1 {
             return TestResult::Fail("expected 1 write");
         }
         let (_, val) = m.writes[0];
         if val & CTX_CNTL_ENABLE_CONTEXT == 0 {
             return TestResult::Fail("enable bit not set");
+        }
+        if (val >> CTX_CNTL_PT_DEPTH_SHIFT) & CTX_CNTL_PT_DEPTH_MASK != 3 {
+            return TestResult::Fail("page-table depth did not land in bits 2:1");
+        }
+        // `block_size - 9` == 0 for GMC 11.
+        if (val >> CTX_CNTL_PT_BLOCK_SIZE_SHIFT) & CTX_CNTL_PT_BLOCK_SIZE_MASK != 0 {
+            return TestResult::Fail("block size should encode as zero for GMC 11");
+        }
+        if val & (1 << CTX_CNTL_RETRY_FAULT_SHIFT) != 0 {
+            return TestResult::Fail("fault_on_invalid should leave RETRY clear");
+        }
+        // All seven protection-fault reports must be on, or the MMU detects a
+        // fault and says nothing.
+        if val & CTX_CNTL_FAULT_ENABLE_DEFAULTS != CTX_CNTL_FAULT_ENABLE_DEFAULTS {
+            return TestResult::Fail("a protection-fault enable bit is missing");
+        }
+
+        // RETRY goes to bit 7 and must NOT disturb the block-size field.
+        let mut m = MockVmHubMmio::new();
+        write_vmid_cntl(&mut m, &GFXHUB_V3_0, 0, 3, 9, false);
+        let (_, val) = m.writes[0];
+        if val & (1 << 7) == 0 {
+            return TestResult::Fail("RETRY belongs at bit 7");
+        }
+        if (val >> CTX_CNTL_PT_BLOCK_SIZE_SHIFT) & CTX_CNTL_PT_BLOCK_SIZE_MASK != 0 {
+            return TestResult::Fail("RETRY leaked into PAGE_TABLE_BLOCK_SIZE");
+        }
+
+        // A larger leaf table encodes as block_size - 9.
+        let mut m = MockVmHubMmio::new();
+        write_vmid_cntl(&mut m, &GFXHUB_V3_0, 0, 2, 12, true);
+        let (_, val) = m.writes[0];
+        if (val >> CTX_CNTL_PT_BLOCK_SIZE_SHIFT) & CTX_CNTL_PT_BLOCK_SIZE_MASK != 3 {
+            return TestResult::Fail("block size 12 should encode as 3");
         }
         TestResult::Pass
     }
