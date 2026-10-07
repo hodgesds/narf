@@ -162,10 +162,16 @@ progress toward line rate.
   end for IPv4 — the stack builds egress frames straight into a pooled DMA
   buffer (`iface::tx_acquire`) and hands ownership to the driver
   (`SendFrameFn`/`xmit_frame`), with e1000 DMAing it directly and recycling via
-  `tx_release`. Gated per iface (`enable_zero_copy_tx`): a non-opted iface, an
-  IPv6 frame, or a TSO super-frame too large for the pool buffer falls back to
-  the byte-for-byte pre-P-F `Vec` copy path. _Remaining:_ zero-copy TX for
-  virtio + IPv6, mlx5 100G, net-bench.
+  `tx_release`. virtio-net also does zero-copy TX, via the shared-pool +
+  head-room variant of the contract (`enable_zero_copy_tx_pool`): it shares its
+  own `Arc<DmaPool>` so the stack's `tx_acquire` and its async TX reaper use one
+  free-list, and reserves 12 bytes of head-room for the virtio-net header
+  `tx_dma` writes in front — dropping the slice memcpy `vnet0_send_fn` did.
+  Gated per iface: a non-opted iface, an IPv6 frame, or a TSO super-frame too
+  large for the pool buffer falls back to the byte-for-byte pre-P-F `Vec` copy
+  path. Because virtio is the QEMU image's primary NIC, the path is live
+  end-to-end (the production-init boot comes up over it). _Remaining:_ zero-copy
+  TX for IPv6, mlx5 100G, net-bench.
 
 ## 5. Validation
 
