@@ -147,6 +147,13 @@ and CI compiler-cache integration.
   counters for 30 seconds before launch. An explicitly allowed development run
   may print advisory statistics but emits no JSON performance record.
 - `cargo xtask image --arch=x86_64 --bootloader=limine` — produce bootable ISO.
+- `cargo xtask grub-image --arch=x86_64` — produce
+  `target/grub-x86_64/boot/narf-frame-grub`, a direct-GRUB Multiboot2
+  artifact. The canonical image build first materialises NARF's compact,
+  loadable KASLR table; this compatibility artifact then removes only the
+  ordinary non-loadable ELF relocation sections that GRUB rejects. The bundle
+  also contains its initramfs and a mergeable `grub.cfg` stanza. It requires
+  no Limine at runtime.
 - `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
   Multiboot2 kernel ELF in native distribution packages and emit a
   checksummed release manifest.

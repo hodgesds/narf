@@ -27,6 +27,9 @@ use std::path::Path;
 
 /// `SHT_RELA`.
 const SHT_RELA: u32 = 4;
+/// `SHT_REL`. x86_64 NARF currently has only RELA sections, but a direct-GRUB
+/// artifact must reject either linker relocation encoding.
+const SHT_REL: u32 = 9;
 /// `SHF_ALLOC` — the section is part of the loaded image.
 const SHF_ALLOC: u64 = 0x2;
 
@@ -145,6 +148,47 @@ impl RelocTable {
 /// Header magic, so the apply pass can refuse a table that was never filled in
 /// rather than sliding by garbage.
 pub const RELOC_MAGIC: u32 = 0x4B41_534C; // "KASL"
+
+/// Refuse an ELF that still exposes ordinary linker relocation sections.
+///
+/// NARF's loadable `.kaslr_relocs` section is deliberately *not* an ELF REL or
+/// RELA section: `xtask relocs --patch` has already materialized the compact
+/// table consumed by the early boot stub. GRUB's Multiboot2 ELF loader rejects
+/// ELFs carrying the original linker REL/RELA sections, even when they are not
+/// loadable, so the direct-GRUB compatibility artifact removes them only after
+/// that compact table is patched.
+pub fn assert_no_linker_relocation_sections(elf_path: &Path) -> Result<()> {
+    let bytes = std::fs::read(elf_path)
+        .with_context(|| format!("reading direct-GRUB ELF {}", elf_path.display()))?;
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 {
+        bail!("{} is not an ELF64 image", elf_path.display());
+    }
+
+    let shoff = u64_at(&bytes, 0x28) as usize;
+    let shentsize = u16_at(&bytes, 0x3A) as usize;
+    let shnum = u16_at(&bytes, 0x3C) as usize;
+    let table_end = shoff.saturating_add(shnum.saturating_mul(shentsize));
+    if shoff == 0 || shentsize < 64 || table_end > bytes.len() {
+        bail!(
+            "{} has an invalid section-header table while validating the direct-GRUB artifact",
+            elf_path.display()
+        );
+    }
+
+    let remaining = (0..shnum)
+        .filter(|index| {
+            let section = shoff + index * shentsize;
+            matches!(u32_at(&bytes, section + 0x04), SHT_RELA | SHT_REL)
+        })
+        .count();
+    if remaining != 0 {
+        bail!(
+            "{} still has {remaining} ELF linker relocation section(s); refusing a GRUB artifact",
+            elf_path.display()
+        );
+    }
+    Ok(())
+}
 
 fn u16_at(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
