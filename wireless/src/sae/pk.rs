@@ -161,6 +161,13 @@ fn fingerprint_matches(hash: &[u8], sec: usize, fingerprint: &[u8], fp_bits: usi
     (0..fp_bits).all(|i| read_bit(hash, 8 * sec + i) == read_bit(fingerprint, i))
 }
 
+/// Whether `password` parses as a well-formed SAE-PK password (length class,
+/// 4-character groups, base32 alphabet). The caller uses this to decide that
+/// the SAE-PK AP-authentication path applies.
+pub fn is_sae_pk_password(password: &str) -> bool {
+    password_fingerprint(password).is_some()
+}
+
 /// Validate that `password` is the SAE-PK fingerprint of the AP public key
 /// `spki_der` under the given `ssid` and recovered `modifier`.
 pub fn validate_fingerprint(
@@ -860,6 +867,104 @@ pub mod gen {
             }
         }
         kernel_test_in!("wireless/sae_pk", smoke_sae_pk_gen_keyauth_and_elements);
+
+        // Full SAE-PK exchange between two SaeSessions: both derive the same
+        // KEK via the "SAE-PK keys" label, the AP's Confirm elements ride in
+        // the station's on_confirm, and the station recovers the Modifier and
+        // verifies KeyAuth over the exchange transcript (the exact plumbing
+        // iwlwifi's verify_sae_pk uses).
+        fn smoke_sae_pk_session_end_to_end() -> TestResult {
+            use crate::sae::{SaeSession, SaeState};
+            let ssid = "narf-pk-net";
+            let password = "abcd-efgh-ijkl"; // SAE-PK password format
+            let sta_mac = [2, 0, 0, 0, 0, 1];
+            let ap_mac = [2, 0, 0, 0, 0, 2];
+            let mut sta =
+                SaeSession::new(ssid, password, sta_mac, ap_mac).with_test_seed([0x11; 64]);
+            let mut ap =
+                SaeSession::new(ssid, password, ap_mac, sta_mac).with_test_seed([0x22; 64]);
+            if !sta.is_sae_pk() || !ap.is_sae_pk() {
+                return TestResult::Fail("SAE-PK password not detected");
+            }
+            let sta_commit = sta.build_commit();
+            let ap_commit = ap.build_commit();
+            if sta.on_commit(&ap_commit).is_err() || ap.on_commit(&sta_commit).is_err() {
+                return TestResult::Fail("SAE commit exchange failed");
+            }
+            // Both peers must derive the same KEK.
+            let kek = match (sta.kek(), ap.kek()) {
+                (Some(a), Some(b)) if a == b => *a,
+                _ => return TestResult::Fail("SAE-PK KEK missing or mismatched"),
+            };
+            let sta_confirm = sta.build_confirm();
+            let ap_confirm = ap.build_confirm();
+
+            // AP assembles its SAE-PK Confirm material over the station-canonical
+            // transcript (AP element/scalar first).
+            let ap_key = TEST_D;
+            let spki = match public_key_spki(&ap_key) {
+                Some(s) => s,
+                None => return TestResult::Fail("public_key_spki failed"),
+            };
+            let modifier = [0x5au8; SAE_PK_M_LEN];
+            let encr = encrypt_modifier(&kek, &modifier);
+            let (ele_ap, ele_sta, sca_ap, sca_sta) = sta.sae_pk_transcript();
+            let sig_data = keyauth_sig_data(
+                &ele_ap, &ele_sta, &sca_ap, &sca_sta, &modifier, &spki, &ap_mac, &sta_mac,
+            );
+            let key_auth = match sign_keyauth(&ap_key, &sig_data) {
+                Some(k) => k,
+                None => return TestResult::Fail("sign_keyauth failed"),
+            };
+            let ies = build_confirm_elements(&spki, &key_auth, &encr);
+
+            // AP accepts the plain station Confirm; the station accepts the AP
+            // Confirm with the SAE-PK elements appended.
+            let mut ap_confirm_pk = ap_confirm.clone();
+            ap_confirm_pk.extend_from_slice(&ies);
+            if ap.on_confirm(&sta_confirm).is_err() || sta.on_confirm(&ap_confirm_pk).is_err() {
+                return TestResult::Fail("SAE confirm exchange failed");
+            }
+            if sta.state() != SaeState::Accepted || ap.state() != SaeState::Accepted {
+                return TestResult::Fail("SAE did not reach Accepted");
+            }
+            if sta.peer_confirm_ies() != ies.as_slice() {
+                return TestResult::Fail("station did not capture the Confirm IEs");
+            }
+
+            // Station recovers the Modifier and verifies KeyAuth, exactly as the
+            // driver's verify_sae_pk does.
+            let elements = match parse_elements(sta.peer_confirm_ies()) {
+                Some(e) => e,
+                None => return TestResult::Fail("Confirm elements did not parse"),
+            };
+            match recover_modifier(sta.kek().unwrap(), &elements.encrypted_modifier) {
+                Some(m) if m == modifier => {}
+                _ => return TestResult::Fail("station failed to recover the Modifier"),
+            }
+            let (v_ele_ap, v_ele_sta, v_sca_ap, v_sca_sta) = sta.sae_pk_transcript();
+            let verify_data = keyauth_sig_data(
+                &v_ele_ap,
+                &v_ele_sta,
+                &v_sca_ap,
+                &v_sca_sta,
+                &modifier,
+                &elements.public_key_der,
+                &ap_mac,
+                &sta_mac,
+            );
+            if !verify_keyauth(&elements.public_key_der, &elements.key_auth, &verify_data) {
+                return TestResult::Fail("station KeyAuth verification failed");
+            }
+            // A forged KeyAuth (tampered transcript) is rejected.
+            let mut forged = verify_data.clone();
+            forged[0] ^= 0x01;
+            if verify_keyauth(&elements.public_key_der, &elements.key_auth, &forged) {
+                return TestResult::Fail("forged KeyAuth transcript accepted");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!("wireless/sae_pk", smoke_sae_pk_session_end_to_end);
     }
 }
 
