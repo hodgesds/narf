@@ -3304,14 +3304,105 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
                 args.arch.triple(),
             );
         }
-        if let Some(summary) = String::from_utf8_lossy(&serial)
-            .lines()
-            .find(|line| line.contains("── summary:"))
-        {
-            println!("{summary}");
+        // The exit status alone cannot say the suite RAN: on x86_64 the
+        // all-pass status is 1, which is also what QEMU exits with when it
+        // cannot start at all (e.g. another QEMU holds a disk image's write
+        // lock). Only the kernel's own summary line proves the suite ran,
+        // and it must agree with the status.
+        let text = String::from_utf8_lossy(&serial);
+        match kernel_test_summary(&text) {
+            Some(KernelTestSummary {
+                pass,
+                fail: 0,
+                skip,
+            }) => {
+                println!("── summary: {pass} pass, 0 fail, {skip} skip ──");
+                if pass == 0 {
+                    println!(
+                        "xtask test: WARNING — no test passed; did the subsystem filter \
+                         (or a missing feature) leave nothing to run?"
+                    );
+                }
+            }
+            Some(KernelTestSummary { fail, .. }) => {
+                emit_serial_tail(&serial);
+                bail!(
+                    "xtask test: QEMU exited all-pass but the kernel reported {fail} failing \
+                     test(s). See the `── failing tests ──` lines above."
+                );
+            }
+            None => {
+                emit_serial_tail(&serial);
+                bail!(
+                    "xtask test: QEMU exited {:?} but the kernel never printed its `── summary` \
+                     line — QEMU failed to start or the kernel died before finishing the suite. \
+                     See the QEMU output above.",
+                    status.code(),
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// The counts in the kernel harness's `── summary: P pass, F fail, S skip ──`
+/// line (`verification/src/lib.rs`).
+#[derive(Debug, PartialEq, Eq)]
+struct KernelTestSummary {
+    pass: u64,
+    fail: u64,
+    skip: u64,
+}
+
+/// Parse the LAST summary line in the serial capture: the suite prints one
+/// at the end. `None` if there is none, or it does not parse.
+fn kernel_test_summary(serial: &str) -> Option<KernelTestSummary> {
+    let line = serial
+        .lines()
+        .rev()
+        .find(|line| line.contains("── summary:"))?;
+    let rest = line.split("── summary:").nth(1)?;
+    let mut counts = rest.split(',').map(|part| {
+        part.split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+    });
+    Some(KernelTestSummary {
+        pass: counts.next()??,
+        fail: counts.next()??,
+        skip: counts.next()??,
+    })
+}
+
+#[cfg(test)]
+mod kernel_test_summary_tests {
+    use super::{kernel_test_summary, KernelTestSummary};
+
+    #[test]
+    fn parses_the_last_summary_line() {
+        let serial = "boot\n  init summary: 3 ok\n── summary: 2 pass, 1 fail, 0 skip ──\n\
+                      retry\n── summary: 2161 pass, 0 fail, 4 skip ──\n";
+        assert_eq!(
+            kernel_test_summary(serial),
+            Some(KernelTestSummary {
+                pass: 2161,
+                fail: 0,
+                skip: 4
+            })
+        );
+    }
+
+    #[test]
+    fn qemu_that_never_started_has_no_summary() {
+        let serial =
+            "qemu-system-x86_64: -device ide-hd,drive=sata0: Failed to get \"write\" lock\n";
+        assert_eq!(kernel_test_summary(serial), None);
+    }
+
+    #[test]
+    fn an_unparseable_summary_is_none() {
+        assert_eq!(kernel_test_summary("── summary: lots pass ──"), None);
+    }
 }
 
 /// Boot the kernel under QEMU *without* the `kernel-test` feature
