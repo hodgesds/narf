@@ -62,14 +62,9 @@ const DRM_GEM_CLOSE_NR: u32 = 0x09;
 
 const PAGE_SIZE: u64 = 4096;
 
-/// `AMDGPU_GEM_DOMAIN_MASK`.
-const DOMAIN_MASK: u64 = (uapi::AMDGPU_GEM_DOMAIN_CPU
-    | uapi::AMDGPU_GEM_DOMAIN_GTT
-    | uapi::AMDGPU_GEM_DOMAIN_VRAM
-    | uapi::AMDGPU_GEM_DOMAIN_GDS
-    | uapi::AMDGPU_GEM_DOMAIN_GWS
-    | uapi::AMDGPU_GEM_DOMAIN_OA
-    | uapi::AMDGPU_GEM_DOMAIN_DOORBELL) as u64;
+/// `AMDGPU_GEM_DOMAIN_MASK`, from the mirror — it was hand-composed here
+/// until the mirror gained the composite the C header actually defines.
+const DOMAIN_MASK: u64 = uapi::AMDGPU_GEM_DOMAIN_MASK as u64;
 
 /// The CPU/GTT/VRAM domains, which may be combined freely.
 const NORMAL_DOMAINS: u64 = (uapi::AMDGPU_GEM_DOMAIN_CPU
@@ -183,6 +178,11 @@ impl GemState {
     fn remove(&self, handle: u32) -> bool {
         let mut g = self.objects.lock();
         g.as_mut().is_some_and(|m| m.remove(&handle).is_some())
+    }
+
+    /// The object named by `handle`, for the VM layer's range checks.
+    pub fn object(&self, handle: u32) -> Option<Arc<GemObject>> {
+        self.get(handle)
     }
 
     /// Whether `handle` belongs to this table at all, so `GEM_CLOSE` can tell

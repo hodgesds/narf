@@ -1138,6 +1138,15 @@ pub const AMDGPU_GEM_DOMAIN_GWS: u32 = 0x10;
 pub const AMDGPU_GEM_DOMAIN_OA: u32 = 0x20;
 /// Doorbell MMIO region
 pub const AMDGPU_GEM_DOMAIN_DOORBELL: u32 = 0x40;
+/// Every defined domain bit. A `domains` word with anything outside this is
+/// EINVAL (`amdgpu_gem_create_ioctl`).
+pub const AMDGPU_GEM_DOMAIN_MASK: u32 = AMDGPU_GEM_DOMAIN_CPU
+    | AMDGPU_GEM_DOMAIN_GTT
+    | AMDGPU_GEM_DOMAIN_VRAM
+    | AMDGPU_GEM_DOMAIN_GDS
+    | AMDGPU_GEM_DOMAIN_GWS
+    | AMDGPU_GEM_DOMAIN_OA
+    | AMDGPU_GEM_DOMAIN_DOORBELL;
 
 /// GEM create flags
 /// CPU access will be required for the case of VRAM domain
@@ -1319,6 +1328,10 @@ pub const AMDGPU_VM_MTYPE_NC: u32 = 1 << 5;
 pub const AMDGPU_VM_MTYPE_WC: u32 = 2 << 5;
 pub const AMDGPU_VM_MTYPE_CC: u32 = 3 << 5;
 pub const AMDGPU_VM_MTYPE_UC: u32 = 4 << 5;
+/// read/write
+pub const AMDGPU_VM_MTYPE_RW: u32 = 5 << 5;
+/// don't allocate MALL
+pub const AMDGPU_VM_PAGE_NOALLOC: u32 = 1 << 9;
 
 /// HW IP types
 pub const AMDGPU_HW_IP_GFX: u32 = 0;
@@ -1368,6 +1381,7 @@ pub const AMDGPU_CS_CHUNK_CP_GFX_SHADOW_FLAGS_INIT_SHADOW: u32 = 0x1;
 /// Fence to handle operations
 pub const AMDGPU_FENCE_TO_HANDLE_GET_SYNCOBJ: u32 = 0;
 pub const AMDGPU_FENCE_TO_HANDLE_GET_SYNCOBJ_FD: u32 = 1;
+pub const AMDGPU_FENCE_TO_HANDLE_GET_SYNC_FILE_FD: u32 = 2;
 
 /// IDS flags
 pub const AMDGPU_IDS_FLAGS_FUSION: u32 = 0x01;
@@ -1578,6 +1592,19 @@ pub const AMDGPU_PROC_OPTIONS_KFD_SIGBUS_DELAY_DISABLED: u32 = 0xFFFFFFFF;
 /// IDS flags - additional
 pub const AMDGPU_IDS_FLAGS_GANG_SUBMIT: u32 = 0x10;
 pub const AMDGPU_IDS_FLAGS_MODE_PT: u32 = 0x2;
+
+/// `AMDGPU_TILING_SET(field, value)` — the macro takes a field NAME and
+/// composes `AMDGPU_TILING_<field>_{SHIFT,MASK}`, which Rust cannot do, so the
+/// shift and mask are passed instead. Call as
+/// `tiling_set(AMDGPU_TILING_SWIZZLE_MODE_SHIFT, AMDGPU_TILING_SWIZZLE_MODE_MASK, v)`.
+pub const fn tiling_set(shift: u64, mask: u64, value: u64) -> u64 {
+    (value & mask) << shift
+}
+
+/// `AMDGPU_TILING_GET(value, field)`.
+pub const fn tiling_get(shift: u64, mask: u64, value: u64) -> u64 {
+    (value >> shift) & mask
+}
 
 // ── kernel tests ──
 

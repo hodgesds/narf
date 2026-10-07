@@ -7395,3 +7395,361 @@ kernel_test_in!(
     "drivers/gpu",
     smoke_amdgpu_gem_lifecycle_and_handle_isolation
 );
+
+/// The GMC 11 address-space geometry, derived rather than asserted from memory.
+///
+/// Every number here follows from `gmc_v11_0_sw_init`'s one call,
+/// `amdgpu_vm_adjust_size(adev, 256 * 1024, 9, 3, 48)`, through the arithmetic
+/// in `amdgpu_vm_adjust_size` and `amdgpu_vm_pt_level_shift`. The test
+/// recomputes the decomposition independently of the module so a transcription
+/// slip in either shows up as a disagreement: a wrong level shift walks the GPU
+/// into the wrong page table.
+fn smoke_amdgpu_vm_gmc11_geometry() -> TestResult {
+    use crate::amdgpu_vm::{Geometry, Level, GPU_PAGE_SHIFT};
+
+    let g = Geometry::GMC11;
+    // vm_size = 1 << (48 - 30) GiB, max_pfn = vm_size << 18 = 2^36 pages.
+    if g.max_pfn != 1 << 36 {
+        return TestResult::Fail("max_pfn should be 2^36 pages (256 TiB at 4 KiB)");
+    }
+    // num_level 3 → root PDB2; block_size 9 because num_level > 1.
+    if g.root_level != Level::Pdb2 || g.block_size != 9 {
+        return TestResult::Fail("GMC11 roots at PDB2 with block_size 9");
+    }
+    // `amdgpu_vm_pt_level_shift`: 9 * (PDB0 - level) + block_size, PTB = 0.
+    // Recomputed from the formula rather than restated as four numbers, so a
+    // transcription slip in the module cannot be matched by the same slip here.
+    for (i, level) in [Level::Pdb2, Level::Pdb1, Level::Pdb0]
+        .into_iter()
+        .enumerate()
+    {
+        let steps = 2 - i as u32; // PDB0 - level
+        if g.level_shift(level) != 9 * steps + g.block_size {
+            return TestResult::Fail("a level shift disagrees with amdgpu_vm_pt_level_shift");
+        }
+    }
+    if g.level_shift(Level::Ptb) != 0 {
+        return TestResult::Fail("the leaf level shift is zero");
+    }
+    // Four levels walked, root first.
+    let walked: alloc::vec::Vec<Level> = g.levels().collect();
+    if walked != alloc::vec![Level::Pdb2, Level::Pdb1, Level::Pdb0, Level::Ptb] {
+        return TestResult::Fail("the walked levels are not PDB2..PTB");
+    }
+    // Root sized to cover max_pfn exactly: 2^36 >> 27 = 512. Leaf 1<<9.
+    for level in walked.iter().copied() {
+        if g.entries_at(level) != 512 {
+            return TestResult::Fail("every GMC11 level should hold 512 entries");
+        }
+    }
+    // 4 levels x 9 bits + 12 page bits = 48, which is the max_bits passed in.
+    let covered: u32 = GPU_PAGE_SHIFT + 9 * 4;
+    if 1u64 << covered != g.max_pfn * 4096 {
+        return TestResult::Fail("the level geometry does not cover max_pfn exactly");
+    }
+
+    // Index decomposition: VA bits 47:39 → PDB2, 38:30 → PDB1, 29:21 → PDB0,
+    // 20:12 → PTB. Build an address with a distinct index at each level.
+    let va = (0x1A2u64 << 39) | (0x0B3 << 30) | (0x1C4 << 21) | (0x0D5 << 12);
+    for (level, want) in [
+        (Level::Pdb2, 0x1A2u64),
+        (Level::Pdb1, 0x0B3),
+        (Level::Pdb0, 0x1C4),
+        (Level::Ptb, 0x0D5),
+    ] {
+        if g.index_at(va, level) != want {
+            return TestResult::Fail("a VA did not decompose into the expected indices");
+        }
+    }
+    // `DEV_INFO`'s pte_fragment_size: (1 << 9) * 4096 = 2 MiB.
+    if g.fragment_bytes() != 2 * 1024 * 1024 {
+        return TestResult::Fail("the fragment size should be 2 MiB");
+    }
+    // The usable window excludes the bottom 64 KiB and the top CSA/seq64/trap.
+    let (bottom, top) = g.usable();
+    if bottom != 1 << 16 {
+        return TestResult::Fail("the first 64 KiB is reserved so a null GPU pointer faults");
+    }
+    if top != g.max_pfn * 4096 - ((1 << 16) + (2 << 20) + (2 << 20)) {
+        return TestResult::Fail("the top reservation is trap + seq64 + CSA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc11_geometry);
+
+/// PTE composition, including the bits `gmc_v11_0_get_vm_pte` CLEARS.
+///
+/// The negative cases are the point. Linux clears `EXECUTABLE` and `NOALLOC`
+/// when a request does not ask for them rather than leaving whatever the base
+/// flags held, and PRT clears `VALID` — a PRT entry is deliberately not a valid
+/// translation. A transcription that only ORed the positive cases would look
+/// right and grant execute permission on every mapping.
+fn smoke_amdgpu_vm_pte_flags_match_gmc11() -> TestResult {
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::*;
+
+    // System memory, as every buffer is until there is VRAM placement.
+    let base = base_flags(true);
+    if base & PTE_VALID == 0 || base & PTE_SNOOPED == 0 || base & PTE_SYSTEM == 0 {
+        return TestResult::Fail("a system mapping is VALID | SNOOPED | SYSTEM");
+    }
+
+    // A plain read/write mapping: no execute, no noalloc, memory type NC.
+    let rw = pte_flags(
+        base,
+        u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE,
+        false,
+    );
+    if rw & PTE_READABLE == 0 || rw & PTE_WRITEABLE == 0 {
+        return TestResult::Fail("READABLE|WRITEABLE did not reach the PTE");
+    }
+    if rw & PTE_EXECUTABLE != 0 {
+        return TestResult::Fail("EXECUTABLE must be cleared when not requested");
+    }
+    if rw & PTE_NOALLOC != 0 {
+        return TestResult::Fail("NOALLOC must be cleared when not requested");
+    }
+    if rw & MTYPE_MASK != MTYPE_NC << MTYPE_SHIFT {
+        return TestResult::Fail("the default memory type is NC");
+    }
+
+    // Starting from flags that already have EXECUTABLE set, a request without
+    // it must come back without it.
+    let cleared = pte_flags(base | PTE_EXECUTABLE, u::AMDGPU_VM_PAGE_READABLE, false);
+    if cleared & PTE_EXECUTABLE != 0 {
+        return TestResult::Fail("EXECUTABLE survived a request that omitted it");
+    }
+
+    // The memory type lives at bits 50:48 on GFX10/11 — NOT 58:57 (GFX9) or
+    // 55:54 (GFX12). Using the wrong macro would collide with NOALLOC at 58.
+    for (vm_mtype, want) in [
+        (u::AMDGPU_VM_MTYPE_WC, MTYPE_WC),
+        (u::AMDGPU_VM_MTYPE_CC, MTYPE_CC),
+        (u::AMDGPU_VM_MTYPE_UC, MTYPE_UC),
+        (u::AMDGPU_VM_MTYPE_NC, MTYPE_NC),
+        (u::AMDGPU_VM_MTYPE_DEFAULT, MTYPE_NC),
+    ] {
+        let f = pte_flags(base, u::AMDGPU_VM_PAGE_READABLE | vm_mtype, false);
+        if (f & MTYPE_MASK) >> MTYPE_SHIFT != want {
+            return TestResult::Fail("a memory type did not land in bits 50:48");
+        }
+        if f & (1 << 57) != 0 || f & (1 << 58) != 0 {
+            return TestResult::Fail("the memory type spilled into bit 57 or 58");
+        }
+    }
+
+    // A COHERENT/UNCACHED buffer overrides the request's memory type, and is
+    // applied last for that reason.
+    let overridden = pte_flags(
+        base,
+        u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_MTYPE_WC,
+        true,
+    );
+    if (overridden & MTYPE_MASK) >> MTYPE_SHIFT != MTYPE_UC {
+        return TestResult::Fail("an uncached BO must override the requested memory type");
+    }
+
+    // PRT: sets PRT|SNOOPED|LOG|SYSTEM and clears VALID.
+    let prt = pte_flags(base, u::AMDGPU_VM_PAGE_PRT, false);
+    if prt & PTE_PRT == 0 || prt & PTE_LOG == 0 || prt & PTE_SYSTEM == 0 {
+        return TestResult::Fail("a PRT entry sets PRT | LOG | SYSTEM");
+    }
+    if prt & PTE_VALID != 0 {
+        return TestResult::Fail("a PRT entry must NOT be a valid translation");
+    }
+
+    // The leaf entry carries the physical address in bits 47:12, so a
+    // misaligned or out-of-range address must be refused rather than allowed
+    // to spill into the flags.
+    if make_pte(0x1000, rw).is_err() {
+        return TestResult::Fail("a page-aligned address should compose");
+    }
+    if make_pte(0x1001, rw).is_ok() {
+        return TestResult::Fail("a misaligned physical address must be refused");
+    }
+    if make_pte(1u64 << 48, rw).is_ok() {
+        return TestResult::Fail("an address beyond 48 bits must be refused");
+    }
+    let pte = make_pte(0xABCD_E000, rw).unwrap_or(0);
+    if pte & GMC_HOLE_MASK & !0xFFF != 0xABCD_E000 {
+        return TestResult::Fail("the physical address did not survive composition");
+    }
+
+    // The canonical hole: the hardware is programmed as if it does not exist.
+    if strip_hole(0xFFFF_8000_0000_1000) != 0x0000_8000_0000_1000 {
+        return TestResult::Fail("strip_hole should drop the sign-extension bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_pte_flags_match_gmc11
+);
+
+/// `AMDGPU_GEM_VA`'s validation and bookkeeping.
+fn smoke_amdgpu_vm_gem_va_maps_and_validates() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState, GMC_HOLE_START, VA_RESERVED_BOTTOM};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let va_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA;
+
+    // A 16 KiB buffer to map.
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&16384u64.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+
+    let req = |op: u32, flags: u32, va: u64, offset: u64, size: u64| {
+        let mut r = [0u8; 40];
+        r[0..4].copy_from_slice(&handle.to_le_bytes());
+        r[8..12].copy_from_slice(&op.to_le_bytes());
+        r[12..16].copy_from_slice(&flags.to_le_bytes());
+        r[16..24].copy_from_slice(&va.to_le_bytes());
+        r[24..32].copy_from_slice(&offset.to_le_bytes());
+        r[32..40].copy_from_slice(&size.to_le_bytes());
+        vm::dispatch(va_cmd, r.as_mut_ptr() as usize, &state, &gem)
+    };
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    const BASE_VA: u64 = 0x1_0000_0000;
+
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, 16384).is_err() {
+        return TestResult::Fail("a valid MAP was refused");
+    }
+    match state.lookup(BASE_VA + 4096) {
+        Some(m) if m.gem_handle == handle && m.va == BASE_VA && m.size == 16384 => {}
+        _ => return TestResult::Fail("the mapping was not recorded over its whole range"),
+    }
+    if state.lookup(BASE_VA + 16384).is_some() {
+        return TestResult::Fail("the mapping leaked past its end");
+    }
+
+    // An overlapping MAP is EINVAL; REPLACE is the op that asks for one to go.
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA + 4096, 0, 4096).is_ok() {
+        return TestResult::Fail("an overlapping MAP should be refused");
+    }
+    if req(u::AMDGPU_VA_OP_REPLACE, RW, BASE_VA + 4096, 0, 4096).is_err() {
+        return TestResult::Fail("REPLACE over a live range should succeed");
+    }
+    if state.lookup(BASE_VA).is_some() {
+        return TestResult::Fail("REPLACE should have dropped the mapping it covered");
+    }
+
+    // UNMAP names a mapping exactly; a partial range is EINVAL and an absent
+    // one is ENOENT, which are different answers a client can act on.
+    if !matches!(
+        req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA + 4096, 0, 8192),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("UNMAP of a partial range should be EINVAL");
+    }
+    if !matches!(
+        req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA + 0x10_0000, 0, 4096),
+        Err(FsError::NotFound)
+    ) {
+        return TestResult::Fail("UNMAP of an absent mapping should be ENOENT");
+    }
+    if req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA + 4096, 0, 4096).is_err() {
+        return TestResult::Fail("UNMAP of an exact mapping should succeed");
+    }
+    if state.mapping_count() != 0 {
+        return TestResult::Fail("the address space should be empty again");
+    }
+
+    // ── validation, in Linux's order ──
+    // Below VA_RESERVED_BOTTOM: a null GPU pointer must fault, so the first
+    // 64 KiB is never mappable.
+    if req(u::AMDGPU_VA_OP_MAP, RW, VA_RESERVED_BOTTOM - 4096, 0, 4096).is_ok() {
+        return TestResult::Fail("the bottom reserved region must not be mappable");
+    }
+    // Inside the canonical hole.
+    if req(u::AMDGPU_VA_OP_MAP, RW, GMC_HOLE_START, 0, 4096).is_ok() {
+        return TestResult::Fail("an address inside the VA hole must be refused");
+    }
+    // Past the top reservation.
+    let (_, top) = state.geometry().usable();
+    if req(u::AMDGPU_VA_OP_MAP, RW, top - 4096, 0, 8192).is_ok() {
+        return TestResult::Fail("a range crossing the top reservation must be refused");
+    }
+    // PRT cannot be combined with ordinary page permissions — the two flag
+    // sets are alternatives, not a union.
+    if req(
+        u::AMDGPU_VA_OP_MAP,
+        RW | u::AMDGPU_VM_PAGE_PRT,
+        BASE_VA,
+        0,
+        4096,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("PRT mixed with page permissions is an invalid combination");
+    }
+    // An undefined flag.
+    if req(u::AMDGPU_VA_OP_MAP, RW | (1 << 20), BASE_VA, 0, 4096).is_ok() {
+        return TestResult::Fail("an undefined VM flag should be refused");
+    }
+    // An unknown operation.
+    if req(99, RW, BASE_VA, 0, 4096).is_ok() {
+        return TestResult::Fail("an unknown VA operation should be refused");
+    }
+    // Mapping more of the buffer than it holds would map pages it does not own.
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 8192, 16384).is_ok() {
+        return TestResult::Fail("offset + size past the buffer's end must be refused");
+    }
+    // Misalignment, in each of the three fields.
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA + 1, 0, 4096).is_ok() {
+        return TestResult::Fail("an unaligned VA must be refused");
+    }
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, 4095).is_ok() {
+        return TestResult::Fail("an unaligned size must be refused");
+    }
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 1, 4096).is_ok() {
+        return TestResult::Fail("an unaligned buffer offset must be refused");
+    }
+    // A handle this open does not hold.
+    let mut foreign = [0u8; 40];
+    foreign[0..4].copy_from_slice(&0x4000_9999u32.to_le_bytes());
+    foreign[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    foreign[12..16].copy_from_slice(&RW.to_le_bytes());
+    foreign[16..24].copy_from_slice(&BASE_VA.to_le_bytes());
+    foreign[32..40].copy_from_slice(&4096u64.to_le_bytes());
+    if vm::dispatch(va_cmd, foreign.as_mut_ptr() as usize, &state, &gem).is_ok() {
+        return TestResult::Fail("a VA map naming a foreign GEM handle must be refused");
+    }
+
+    // CLEAR drops whatever intersects, and succeeds on an empty range.
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, 16384).is_err() {
+        return TestResult::Fail("re-MAP after the validation cases failed");
+    }
+    if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA + 4096, 0, 4096).is_err() {
+        return TestResult::Fail("CLEAR should succeed");
+    }
+    if state.mapping_count() != 0 {
+        return TestResult::Fail("CLEAR should have dropped the intersecting mapping");
+    }
+    if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA, 0, 4096).is_err() {
+        return TestResult::Fail("CLEAR of an empty range should still succeed");
+    }
+
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_gem_va_maps_and_validates
+);

@@ -130,6 +130,10 @@ pub struct DriCardFile {
     /// client's buffer. Kept even for a non-AMD card; the dispatcher is gated
     /// on the card's advertised driver name.
     amdgpu_gem: crate::amdgpu_gem::GemState,
+    /// Per-open GPU address space. Linux keeps one `amdgpu_vm` per DRM file
+    /// for the same reason handles are per-file: one client's GPU addresses
+    /// must not resolve in another's page tables.
+    amdgpu_vm: crate::amdgpu_vm::VmState,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
     /// Per-open flip-complete queue. The event's opaque `user_data` belongs to
@@ -174,6 +178,7 @@ impl DriCardFile {
             metadata,
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
             amdgpu_gem: crate::amdgpu_gem::GemState::new(),
+            amdgpu_vm: crate::amdgpu_vm::VmState::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
             pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
@@ -398,6 +403,10 @@ impl FileOps for DriCardFile {
         // DRM_AUTH nor DRM_MASTER in amdgpu's table).
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
@@ -741,6 +750,10 @@ pub struct DriRenderFile {
     /// client's buffer. Kept even for a non-AMD card; the dispatcher is gated
     /// on the card's advertised driver name.
     amdgpu_gem: crate::amdgpu_gem::GemState,
+    /// Per-open GPU address space. Linux keeps one `amdgpu_vm` per DRM file
+    /// for the same reason handles are per-file: one client's GPU addresses
+    /// must not resolve in another's page tables.
+    amdgpu_vm: crate::amdgpu_vm::VmState,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
 }
@@ -848,6 +861,10 @@ impl FileOps for DriRenderFile {
         // generic DRM path, as the virtio-gpu dispatcher above does.
         if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
             match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
@@ -959,6 +976,7 @@ impl DirOps for DriDir {
                             metadata,
                             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
                             amdgpu_gem: crate::amdgpu_gem::GemState::new(),
+                            amdgpu_vm: crate::amdgpu_vm::VmState::new(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
                         }));
                     }
