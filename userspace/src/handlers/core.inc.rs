@@ -5394,6 +5394,11 @@ pub(crate) const CAP_SYS_MODULE: u32 = 16;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
 pub(crate) const CAP_SYS_ADMIN: u32 = 21;
+/// `CAP_SYS_BOOT` (`include/uapi/linux/capability.h`: 22) — `reboot(2)` and
+/// `kexec_load(2)`. `kernel/reboot.c` checks it against the caller's ACTIVE
+/// PID namespace's user namespace, so a container owner holds it over its own
+/// namespace — see `sys_reboot`'s `reboot_pid_ns`.
+pub(crate) const CAP_SYS_BOOT: u32 = 22;
 /// `CAP_SYSLOG` — read the kernel log and control what reaches the console.
 /// Split out of CAP_SYS_ADMIN in 2.6.37 precisely so a log reader need not
 /// be given the whole of it.

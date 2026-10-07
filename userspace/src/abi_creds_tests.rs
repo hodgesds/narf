@@ -1346,6 +1346,7 @@ fn do_capget() -> Result<(u64, u64, u64), &'static str> {
 const CAP_SETUID_BIT: u64 = 1 << 7;
 const CAP_SETGID_BIT: u64 = 1 << 6;
 const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
+const CAP_SYS_BOOT_BIT: u64 = 1 << 22;
 const CAP_SYS_CHROOT_BIT: u64 = 1 << 18;
 const CAP_SYS_TIME_BIT: u64 = 1 << 25;
 const CAP_SYS_TTY_CONFIG_BIT: u64 = 1 << 26;
@@ -1934,6 +1935,41 @@ fn smoke_abi_caps_adjtimex_requires_sys_time() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_caps_adjtimex_requires_sys_time);
+
+/// `kernel/reboot.c::SYSCALL_DEFINE4(reboot)` checks
+/// `ns_capable(pid_ns->user_ns, CAP_SYS_BOOT)` BEFORE the magic pair, so an
+/// unprivileged caller is -EPERM even when its arguments are garbage.
+///
+/// There was no check at all here: any task could power the machine off.
+fn smoke_abi_caps_reboot_requires_sys_boot() -> TestResult {
+    with_setup(|| {
+        const MAGIC1: u64 = 0xfee1_dead;
+        const MAGIC2: u64 = 672_274_793;
+        const CMD_CAD_OFF: u64 = 0;
+        drop_all_caps();
+        // Garbage magics: the capability answer comes first.
+        match call(Syscall::Reboot.raw(), a2(0xdead, 0x1111, 0)) {
+            Some(-1) => {}
+            Some(-22) => return Err("reboot checked the magic before the capability"),
+            _ => return Err("unprivileged reboot: want -EPERM"),
+        }
+        // A real command fares no better.
+        match call(Syscall::Reboot.raw(), a2(MAGIC1, MAGIC2, CMD_CAD_OFF)) {
+            Some(-1) => {}
+            Some(0) => return Err("an unprivileged task reached the reboot path"),
+            _ => return Err("unprivileged reboot(CAD_OFF): want -EPERM"),
+        }
+        set_caps(CAP_SYS_BOOT_BIT, CAP_SYS_BOOT_BIT);
+        // CAD_OFF is the one command that is an accepted no-op, so it is the
+        // only arm a test may take with the capability in hand — the others
+        // would restart or power off the machine mid-suite.
+        match call(Syscall::Reboot.raw(), a2(MAGIC1, MAGIC2, CMD_CAD_OFF)) {
+            Some(0) => Ok(()),
+            _ => Err("reboot(CAD_OFF) with CAP_SYS_BOOT should return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_reboot_requires_sys_boot);
 
 fn smoke_abi_caps_chroot_enoent_still_precedes_eperm() -> TestResult {
     with_setup(|| {
