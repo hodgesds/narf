@@ -474,15 +474,24 @@ fn smoke_abi_ipc_mq_notify_signal_once() -> TestResult {
         if crate::handlers::signal_pending_bits(FAKE_TASK) & crate::handlers::sig_bit(10) == 0 {
             return Err("mq_notify did not queue its signal");
         }
+        // Signal 0 is NOT a registration Linux accepts — `do_mq_notify`:
+        //
+        //     if (notification->sigev_notify == SIGEV_SIGNAL &&
+        //         (!notification->sigev_signo ||
+        //          !valid_signal(notification->sigev_signo)))
+        //             return -EINVAL;
+        //
+        // This case asserted the opposite ("Linux's signal-zero
+        // registration"), which the handler's `0..=64` range obliged.
         let zero_fd = open_mq(b"abi_mq_notify_zero\0")?;
         let mut zero_event = [0u8; 64];
         zero_event[12..16].copy_from_slice(&0i32.to_ne_bytes()); // SIGEV_SIGNAL
         if call(
             Syscall::MqNotify.raw(),
             a1(zero_fd, zero_event.as_ptr() as u64),
-        ) != Some(0)
+        ) != Some(EINVAL)
         {
-            return Err("mq_notify rejected Linux's signal-zero registration");
+            return Err("mq_notify with signal 0 must be EINVAL");
         }
         Ok(())
     })
@@ -2280,6 +2289,55 @@ kernel_test_in!(
     "syscall_abi/mqlimits",
     smoke_abi_ipc_mqueue_limits_are_enforced
 );
+
+/// `do_mq_timedsend` validates the priority and the length BEFORE it reads
+/// the message, so an oversized or bad-priority send through an unreadable
+/// pointer is EMSGSIZE/EINVAL, not EFAULT — and `do_mq_notify` refuses
+/// signal 0, which is not a signal.
+fn smoke_abi_ipc_mqueue_send_errno_order() -> TestResult {
+    with_setup(|| {
+        const O_CREAT: u64 = 0o100;
+        const O_RDWR: u64 = 2;
+        const MQ_PRIO_MAX: u64 = 32_768;
+        let name = c"narf-mq-order";
+        let attr: [i64; 4] = [0, 4, 64, 0];
+        let fd = match call(
+            Syscall::MqOpen.raw(),
+            a3(
+                name.as_ptr() as u64,
+                O_CREAT | O_RDWR,
+                0o600,
+                attr.as_ptr() as u64,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("setup: mq_open failed"),
+        };
+        // msg_len past mq_msgsize, through a pointer that would fault.
+        let oversized = call(Syscall::MqTimedsend.raw(), a4(fd, BAD_PTR, 128, 0, 0));
+        // A priority at MQ_PRIO_MAX, same unreadable pointer.
+        let bad_prio = call(
+            Syscall::MqTimedsend.raw(),
+            a4(fd, BAD_PTR, 4, MQ_PRIO_MAX, 0),
+        );
+        // SIGEV_SIGNAL (notify 0) with signo 0.
+        let sigev = [0u64; 8];
+        let notify = call(Syscall::MqNotify.raw(), a1(fd, sigev.as_ptr() as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let _ = call(Syscall::MqUnlink.raw(), a0(name.as_ptr() as u64));
+        if oversized != Some(EMSGSIZE) {
+            return Err("mq_timedsend past mq_msgsize must be EMSGSIZE before the copy");
+        }
+        if bad_prio != Some(EINVAL) {
+            return Err("mq_timedsend at MQ_PRIO_MAX must be EINVAL before the copy");
+        }
+        if notify != Some(EINVAL) {
+            return Err("mq_notify with signal 0 must be EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mqueue_send_errno_order);
 
 fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
     with_setup(|| {

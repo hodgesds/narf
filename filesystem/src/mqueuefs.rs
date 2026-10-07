@@ -639,6 +639,12 @@ pub fn close_notification(handle_id: u64, task_id: u64) {
     let _ = notify(handle_id, task_id, None);
 }
 
+/// The queue's `mq_msgsize`, for the checks `do_mq_timedsend` makes BEFORE
+/// it copies the message in.
+pub fn msgsize_of(handle_id: u64) -> Result<i64, MqueueError> {
+    Ok(handle(handle_id)?.queue.msgsize)
+}
+
 pub fn receive(handle_id: u64, buffer_len: usize) -> Result<(Vec<u8>, u32), MqueueError> {
     let file = handle(handle_id)?;
     if file.flags.load(Ordering::Acquire) & O_ACCMODE == O_WRONLY {
