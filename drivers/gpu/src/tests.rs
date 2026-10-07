@@ -382,7 +382,7 @@ fn smoke_amdgpu_pm4_write_data_fence_packet() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_amdgpu_pm4_write_data_fence_packet);
 
 fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
-    use crate::amdgpu_ring::{Ring, DOORBELL_STRIDE_BYTES, RING_SIZE_DW};
+    use crate::amdgpu_ring::{Ring, RingError, DOORBELL_STRIDE_BYTES, NOP_DW, RING_SIZE_DW};
     let mut ring = match Ring::new(7) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("Ring::new failed"),
@@ -396,21 +396,109 @@ fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
     if ring.wptr() != 0 {
         return TestResult::Fail("fresh ring should have wptr=0");
     }
+    // A fresh ring is filled with the NOP PACKET, not zeros. A zero dword is
+    // a PM4 TYPE0 header naming register 0, so an engine that ran past the
+    // written region would write into register 0 rather than idle.
+    for i in [0u64, 1, 511, (RING_SIZE_DW as u64) - 1] {
+        // SAFETY: the ring's backing is alive for the test.
+        if unsafe { ring.peek(i) } != NOP_DW {
+            return TestResult::Fail("a fresh ring must be filled with NOP packets");
+        }
+    }
+
     let pkt = [0xDEAD_BEEFu32, 0x1234_5678, 0xAAAA_5555, 0x0000_0001];
     // SAFETY: smoke harness owns the ring exclusively.
-    let new_wptr = match unsafe { ring.submit(&pkt) } {
+    let new_wptr = match unsafe { ring.submit(&pkt, 0) } {
         Ok(w) => w,
         Err(_) => return TestResult::Fail("submit rejected 4-dword packet"),
     };
     if new_wptr != 4 || ring.wptr() != 4 {
         return TestResult::Fail("wptr didn't advance by 4 dwords");
     }
-    // Trying to submit a packet that would overflow the ring's
-    // contiguous tail returns NotEnoughRoomBeforeWrap.
+    for (i, want) in pkt.iter().enumerate() {
+        // SAFETY: as above.
+        if unsafe { ring.peek(i as u64) } != *want {
+            return TestResult::Fail("a submitted dword is not in the ring");
+        }
+    }
+
+    // Space is measured against what the GPU has CONSUMED, not against the
+    // end of the buffer — a packet may straddle the wrap freely.
+    if ring.used_dw(0) != 4 || ring.free_dw(0) != RING_SIZE_DW as u64 - 4 {
+        return TestResult::Fail("used/free accounting is wrong");
+    }
+    // With rptr caught up, the whole ring is free again even though wptr is
+    // not at the base.
+    if ring.free_dw(4) != RING_SIZE_DW as u64 {
+        return TestResult::Fail("a fully consumed ring should be entirely free");
+    }
+
+    // Writing more than the GPU has consumed must be refused: overwriting
+    // unconsumed dwords corrupts a command the engine is still executing.
     let huge = alloc::vec![0u32; RING_SIZE_DW];
     // SAFETY: same.
-    if unsafe { ring.submit(&huge) }.is_ok() {
-        return TestResult::Fail("oversized packet should fail");
+    if !matches!(unsafe { ring.submit(&huge, 0) }, Err(RingError::Full)) {
+        return TestResult::Fail("a packet larger than the free space must be Full");
+    }
+    // Larger than the ring can ever hold is a different answer — no amount of
+    // waiting would make it fit.
+    let enormous = alloc::vec![0u32; RING_SIZE_DW + 1];
+    if !matches!(
+        // SAFETY: smoke harness owns the ring exclusively.
+        unsafe { ring.submit(&enormous, 0) },
+        Err(RingError::TooLarge)
+    ) {
+        return TestResult::Fail("a packet larger than the ring must be TooLarge");
+    }
+
+    // ── the wrap ──
+    // Fill to four dwords short of the end, then submit an 8-dword packet so
+    // it straddles the boundary. The old implementation refused this outright.
+    let mut consumed = 0u64;
+    while ring.wptr() < RING_SIZE_DW as u64 - 4 {
+        // SAFETY: as above; rptr is advanced in step so there is always room.
+        if unsafe { ring.insert_nop(4, consumed) }.is_err() {
+            return TestResult::Fail("filling the ring with NOPs failed");
+        }
+        consumed = ring.wptr().saturating_sub(16);
+    }
+    let straddle: [u32; 8] = [0x1111_1111, 2, 3, 4, 5, 6, 7, 0x8888_8888];
+    let before = ring.wptr();
+    // SAFETY: as above.
+    if unsafe { ring.submit(&straddle, before) }.is_err() {
+        return TestResult::Fail("a packet straddling the wrap should be accepted");
+    }
+    if ring.wptr() != before + 8 {
+        return TestResult::Fail("the wrapping submit did not advance wptr by 8");
+    }
+    // The first four landed at the end of the buffer and the last four at the
+    // start — which is what a circular ring means.
+    for (i, want) in straddle.iter().enumerate() {
+        // SAFETY: as above.
+        if unsafe { ring.peek(before + i as u64) } != *want {
+            return TestResult::Fail("a straddling packet's dwords are misplaced");
+        }
+    }
+    // SAFETY: as above.
+    if unsafe { ring.peek(0) } != straddle[4] {
+        return TestResult::Fail("the wrapped tail should land at the ring base");
+    }
+
+    // ── alignment padding ──
+    let rptr = ring.wptr();
+    // SAFETY: as above.
+    if unsafe { ring.align_to(8, rptr) }.is_err() {
+        return TestResult::Fail("align_to failed");
+    }
+    if ring.wptr() % 8 != 0 {
+        return TestResult::Fail("align_to did not reach the alignment");
+    }
+    // Already aligned: a no-op, not a whole extra period of padding.
+    let aligned = ring.wptr();
+    // SAFETY: as above.
+    let _ = unsafe { ring.align_to(8, rptr) };
+    if ring.wptr() != aligned {
+        return TestResult::Fail("align_to padded an already-aligned ring");
     }
     TestResult::Pass
 }
@@ -2664,7 +2752,7 @@ fn smoke_amdgpu_gfx_pm4_write_data_lands_in_ring() -> TestResult {
 
     // Submit to the ring and verify wptr advanced.
     // SAFETY: smoke owns the ring exclusively.
-    let new_wptr = match unsafe { ring.submit(&staging) } {
+    let new_wptr = match unsafe { ring.submit(&staging, 0) } {
         Ok(w) => w,
         Err(_) => return TestResult::Fail("ring rejected fence packet"),
     };
@@ -2740,7 +2828,7 @@ fn smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring() -> TestResult {
 
     // Submit and verify wptr.
     // SAFETY: smoke owns the ring.
-    let new_wptr = match unsafe { ring.submit(&staging[..11]) } {
+    let new_wptr = match unsafe { ring.submit(&staging[..11], 0) } {
         Ok(w) => w,
         Err(_) => return TestResult::Fail("ring rejected composite IB"),
     };

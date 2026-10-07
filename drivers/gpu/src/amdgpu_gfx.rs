@@ -478,9 +478,28 @@ pub struct GfxContext {
     fence_buf: DmaBuffer,
     /// Next sequence number to publish.
     next_seq: u64,
+    /// The engine's ring read pointer, as last reported.
+    ///
+    /// LINUX-GAP: nothing reports it. Linux has the command processor write
+    /// `rptr` into a host page it named at queue setup
+    /// (`ring->rptr_gpu_addr`), and reads it from there to decide whether a
+    /// submission fits. That needs the queue descriptor the firmware consumes.
+    /// Until then this stays 0, which makes the ring effectively write-once:
+    /// `submit` starts refusing with `Full` after a ring's worth of dwords,
+    /// which is the SAFE direction — the alternative is overwriting commands
+    /// the engine may still be executing.
+    ring_rptr_dw: u64,
 }
 
 impl GfxContext {
+    /// Tell the context how far the engine has consumed its ring.
+    ///
+    /// For the firmware path to call once it can read `rptr` back, and for
+    /// tests to drive the wrap. Without it the ring fills and stays full.
+    pub fn set_ring_rptr(&mut self, rptr_dw: u64) {
+        self.ring_rptr_dw = rptr_dw;
+    }
+
     /// Allocate a fresh GFX context: ring + fence buffer.
     pub fn new(queue_idx: u16) -> Result<Self, RingError> {
         let ring = Ring::new(queue_idx)?;
@@ -498,6 +517,7 @@ impl GfxContext {
             ring,
             fence_buf,
             next_seq: 0,
+            ring_rptr_dw: 0,
         })
     }
 
@@ -559,7 +579,7 @@ impl GfxContext {
 
         // SAFETY: caller-promised ring exclusivity.
         unsafe {
-            self.ring.submit(&staging)?;
+            self.ring.submit(&staging, self.ring_rptr_dw)?;
         }
         compiler_fence(Ordering::SeqCst);
 
