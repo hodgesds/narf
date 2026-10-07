@@ -990,19 +990,48 @@ fn smoke_abi_proc_capset_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_capset_neg);
 
-// ── personality(2) — always-accept stub ──
+// ── personality(2) — the per-task execution domain ──
+//
+// `kernel/exec_domain.c`: the call RETURNS the previous personality and
+// 0xffffffff is the query spelling, not a persona. This used to be a stub
+// that returned a constant 0 and stored nothing, so a caller could neither
+// read its personality back nor have the flags in it mean anything.
 
-fn smoke_abi_proc_personality_pos() -> TestResult {
+const ADDR_NO_RANDOMIZE: u64 = 0x0004_0000;
+
+fn smoke_abi_proc_personality_roundtrips() -> TestResult {
     with_setup(|| {
-        // NARF's personality is a stub that returns 0 (the prior
-        // personality, conventionally PER_LINUX == 0) for any argument.
+        crate::handlers::__test_personality_reset();
+        // A fresh task is PER_LINUX with no flags, and the query leaves it so.
         match call(Syscall::Personality.raw(), a0(0xffff_ffff)) {
-            Some(0) => Ok(()),
-            _ => Err("personality stub did not return 0"),
+            Some(0) => {}
+            _ => return Err("personality(0xffffffff) should report PER_LINUX for a fresh task"),
         }
+        // Setting returns the PREVIOUS word...
+        match call(Syscall::Personality.raw(), a0(ADDR_NO_RANDOMIZE)) {
+            Some(0) => {}
+            _ => return Err("personality(ADDR_NO_RANDOMIZE) should return the previous word"),
+        }
+        // ...and the new one reads back.
+        match call(Syscall::Personality.raw(), a0(0xffff_ffff)) {
+            Some(v) if v as u64 == ADDR_NO_RANDOMIZE => {}
+            Some(0) => return Err("personality did not remember what was set"),
+            _ => return Err("personality query after a set reported the wrong word"),
+        }
+        // 0xffffffff must not have been stored as a persona.
+        match call(Syscall::Personality.raw(), a0(0)) {
+            Some(v) if v as u64 == ADDR_NO_RANDOMIZE => {}
+            _ => return Err("personality(0) should return the ADDR_NO_RANDOMIZE word it replaced"),
+        }
+        let verdict = match call(Syscall::Personality.raw(), a0(0xffff_ffff)) {
+            Some(0) => Ok(()),
+            _ => Err("personality(0) should have cleared the word"),
+        };
+        crate::handlers::__test_personality_reset();
+        verdict
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc_personality_pos);
+kernel_test_in!("syscall_abi", smoke_abi_proc_personality_roundtrips);
 
 // ── kcmp(2) — resource comparison ──
 

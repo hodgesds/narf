@@ -1511,6 +1511,9 @@ pub fn own_stack_park() {
         // to the resume below is sleep, and billing it as stime is exactly
         // the mistake that made the whole-syscall bracket unusable.
         crate::handlers::close_kernel_span(uc, narf_scheduler::current_task_id().raw());
+        // This slice is ending voluntarily — the task has work pending and is
+        // giving up the CPU to wait for it (`nr_voluntary_switches`).
+        crate::task::note_park(narf_scheduler::current_task_id().raw());
         // SAFETY: CPL0 on our own kernel stack, a stackful task is current.
         unsafe {
             (*uctx).parked_in_syscall.store(true, Ordering::Release);
@@ -3070,6 +3073,10 @@ impl core::future::Future for UserTaskFuture {
         {
             let now = narf_scheduler::narf_time::monotonic_ns();
             crate::handlers::account_user_cpu_ns(now.saturating_sub(slice_start_ns));
+            // Same boundary, the other half of what `/proc/<pid>/schedstat`
+            // and `/proc/<pid>/sched` report: one slice, and whether it ended
+            // because the task parked.
+            crate::task::note_slice_end();
         }
 
         // Save this task's x87/SSE register file. The trap left the

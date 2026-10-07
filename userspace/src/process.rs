@@ -251,7 +251,12 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // since the interpreter is the one object guaranteed to be mapped and
     // full of gadgets. The nominal base is a user-range address well
     // clear of the program window and the mmap arena.
-    let interp_bias: u64 = narf_memory::kaslr::user_elf_slot(0x0000_4000_0000_0000);
+    const INTERP_NOMINAL_BASE: u64 = 0x0000_4000_0000_0000;
+    let interp_bias: u64 = if crate::handlers::randomize_user_layout() {
+        narf_memory::kaslr::user_elf_slot(INTERP_NOMINAL_BASE)
+    } else {
+        INTERP_NOMINAL_BASE
+    };
 
     // Mirror Linux binfmt_elf's `start_data` / `end_data` bookkeeping for
     // RLIMIT_DATA: each PT_LOAD contributes its start and file-backed end;
@@ -444,7 +449,11 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
     // frames — which means the eagerly-committed window has to end at the
     // jittered top, not at the region end. Jittering after the fact put the
     // top in the lazy `phys 0` range and the writes silently found nothing.
-    let stack_top_v = narf_memory::kaslr::user_stack_top(DEFAULT_USER_STACK_TOP);
+    let stack_top_v = if crate::handlers::randomize_user_layout() {
+        narf_memory::kaslr::user_stack_top(DEFAULT_USER_STACK_TOP)
+    } else {
+        DEFAULT_USER_STACK_TOP
+    };
     // Publish it for `/proc/<pid>/stat`'s startstack, which used to report
     // the fixed nominal top.
     address_space.set_stack_top(stack_top_v);

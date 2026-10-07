@@ -707,7 +707,14 @@ pub const PROGRAM_WINDOW_BYTES: u64 = 512u64 << 30;
 pub fn program_load_bias(kind: crate::ExecKind, max_align: u64) -> u64 {
     match kind {
         crate::ExecKind::Elf64Dyn => {
-            let slot = narf_memory::kaslr::user_elf_slot(PROGRAM_DYN_BASE);
+            // `ADDR_NO_RANDOMIZE` opts this task out, exactly as
+            // `randomize_va_space = 0` opts the whole system out — see
+            // `handlers::randomize_user_layout`.
+            let slot = if crate::handlers::randomize_user_layout() {
+                narf_memory::kaslr::user_elf_slot(PROGRAM_DYN_BASE)
+            } else {
+                PROGRAM_DYN_BASE
+            };
             if max_align <= 4096 {
                 return slot;
             }

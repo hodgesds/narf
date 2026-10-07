@@ -324,6 +324,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     crate::fd::fork(parent_pid, child_tid.raw());
     crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
     cwd_fork(parent_pid, child_tid.raw());
+    personality_fork(parent_pid, child_tid.raw());
     // chroot inheritance (see do_clone3) — child inherits the parent's root.
     root_dir_fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());

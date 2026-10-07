@@ -2,10 +2,13 @@
 //!
 //! Each file is a zero-allocation generator that pulls a snapshot
 //! from the kernel via fn-pointer hooks wired in at boot.  If a
-//! particular counter or datum isn't tracked yet, the file renders
-//! the correct Linux shape filled with zeros and carries a
-//! `# TODO:` comment in the source — tooling parses structure,
-//! not non-zero values.
+//! particular counter or datum has no NARF source at all, the file renders
+//! the correct Linux shape with that field zeroed and carries a
+//! `LINUX-GAP:` note naming what Linux reads and why NARF cannot —
+//! tooling parses structure, not non-zero values. A zero that merely has
+//! not been wired up yet is a bug, not a gap: `sched`, `schedstat`,
+//! `wchan` and `syscall` all reported constants until the per-task
+//! accounting and park state behind them were plumbed in.
 //!
 //! Linux refs:
 //!   `fs/proc/base.c`    — per-pid file dispatch table
@@ -350,7 +353,12 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
         PidExtField::Mountinfo => render_mountinfo(pid).into_bytes(),
         PidExtField::Mountstats => render_mountstats(pid).into_bytes(),
         PidExtField::Mounts => render_mounts(pid).into_bytes(),
-        PidExtField::Personality => b"00000000\n".to_vec(),
+        // `fs/proc/base.c::proc_pid_personality` — `seq_printf("%08x\n",
+        // task->personality)`. The constant zero here reported PER_LINUX with
+        // no flags for every task, including one that had just set
+        // ADDR_NO_RANDOMIZE, so `setarch -R` and anything reading this file
+        // back (debuggers, reproducer harnesses) could not see the request.
+        PidExtField::Personality => format!("{:08x}\n", super::hook_personality(pid)).into_bytes(),
         PidExtField::Loginuid => {
             // Linux emits the raw uid, or the u32 sentinel (4294967295) when
             // unset. NARF stores per-pid; default = unset.
@@ -429,112 +437,184 @@ fn render_io(pid: u64) -> String {
 
 /// `/proc/<pid>/sched` — scheduler statistics for a task.
 ///
-/// Linux ref: `fs/proc/array.c:sched_show_task`.
-/// TODO: Pull real counters from the scheduler once per-task runtime
-/// accounting lands in narf_scheduler.
+/// Linux ref: `fs/proc/array.c:sched_show_task` → `kernel/sched/debug.c:
+/// proc_sched_show_task`. The numbers NARF keeps per task are real:
+/// `se.sum_exec_runtime` is its on-CPU time and the two switch counters are
+/// the slices it completed, split by whether the slice ended in a park.
+///
+/// LINUX-GAP: the PLL of the fair scheduler's own bookkeeping —
+/// `se.statistics.wait_*` / `sleep_*` / `block_*`, `se.avg.*` (PELT),
+/// `se.nr_migrations`, `clock-delta` — has no NARF equivalent to read.
+/// NARF's executor does not timestamp a task's time on the ready queue and
+/// keeps no per-entity load average, so those lines report zero rather than
+/// a number no code computed. They are reported at all because the file's
+/// shape is what `sched_show_task` consumers parse.
 fn render_sched(pid: u64) -> String {
     let comm = task_info(pid, super::TaskInfoQuery::Basic)
         .map(|i| i.comm)
         .unwrap_or_else(|| format!("task-{}", pid));
+    let sched = super::hook_sched_snapshot(pid);
     let nice = hook_nice(pid);
+    let run_ms = sched.run_ns as f64 / 1_000_000.0;
     let mut s = String::new();
     let _ = writeln!(s, "{} ({}, #threads: 1)", comm, pid);
     let _ = writeln!(
         s,
         "-------------------------------------------------------------------"
     );
-    // TODO: pull real ns-resolution runtime from narf_scheduler task stats.
-    let _ = writeln!(s, "se.exec_start                      :          0.000000");
-    let _ = writeln!(s, "se.sum_exec_runtime                :          0.000000");
-    let _ = writeln!(s, "se.statistics.wait_start           :          0.000000");
-    let _ = writeln!(s, "se.statistics.sleep_start          :          0.000000");
-    let _ = writeln!(s, "se.statistics.block_start          :          0.000000");
-    let _ = writeln!(s, "se.statistics.sleep_max            :          0.000000");
-    let _ = writeln!(s, "se.statistics.block_max            :          0.000000");
-    let _ = writeln!(s, "se.statistics.exec_max             :          0.000000");
-    let _ = writeln!(s, "se.statistics.slice_max            :          0.000000");
-    let _ = writeln!(s, "se.statistics.wait_max             :          0.000000");
-    let _ = writeln!(s, "se.statistics.wait_sum             :          0.000000");
-    let _ = writeln!(s, "se.statistics.wait_count           :                 0");
+    let _ = writeln!(s, "se.exec_start                      : {:18.6}", run_ms);
+    let _ = writeln!(s, "se.sum_exec_runtime                : {:18.6}", run_ms);
+    for field in [
+        "se.statistics.wait_start",
+        "se.statistics.sleep_start",
+        "se.statistics.block_start",
+        "se.statistics.sleep_max",
+        "se.statistics.block_max",
+        "se.statistics.exec_max",
+        "se.statistics.slice_max",
+        "se.statistics.wait_max",
+        "se.statistics.wait_sum",
+    ] {
+        let _ = writeln!(s, "{:35}:          0.000000", field);
+    }
+    let _ = writeln!(s, "se.statistics.wait_count           : {:17}", 0);
     let _ = writeln!(s, "se.statistics.iowait_sum           :          0.000000");
-    let _ = writeln!(s, "se.statistics.iowait_count         :                 0");
-    let _ = writeln!(s, "se.nr_migrations                   :                 0");
-    // TODO: pull nr_voluntary_switches / nr_involuntary_switches from
-    // the scheduler's task-switch accounting once that lands.
-    let _ = writeln!(s, "nr_voluntary_switches              :                 0");
-    let _ = writeln!(s, "nr_involuntary_switches            :                 0");
-    let _ = writeln!(s, "se.load.weight                     :              1024");
-    let _ = writeln!(s, "se.avg.load_sum                    :                 0");
-    let _ = writeln!(s, "se.avg.util_sum                    :                 0");
-    let _ = writeln!(s, "se.avg.load_avg                    :                 0");
-    let _ = writeln!(s, "se.avg.util_avg                    :                 0");
-    let _ = writeln!(s, "se.avg.last_update_time            :                 0");
-    let _ = writeln!(s, "policy                             :                 0");
+    let _ = writeln!(s, "se.statistics.iowait_count         : {:17}", 0);
+    let _ = writeln!(s, "se.nr_migrations                   : {:17}", 0);
     let _ = writeln!(
         s,
-        "prio                               :               {}",
-        20 + nice
+        "nr_voluntary_switches              : {:17}",
+        sched.voluntary_switches
     );
-    let _ = writeln!(s, "clock-delta                        :                 0");
+    let _ = writeln!(
+        s,
+        "nr_involuntary_switches            : {:17}",
+        sched.involuntary_switches
+    );
+    // `se.load.weight` for nice 0 is 1024; Linux scales it by the nice level
+    // through `sched_prio_to_weight[]`, which this approximates with the
+    // standard 1.25-per-level ratio the table is built from.
+    let _ = writeln!(
+        s,
+        "se.load.weight                     : {:17}",
+        nice_to_weight(nice)
+    );
+    let _ = writeln!(s, "se.avg.load_sum                    : {:17}", 0);
+    let _ = writeln!(s, "se.avg.util_sum                    : {:17}", 0);
+    let _ = writeln!(s, "se.avg.load_avg                    : {:17}", 0);
+    let _ = writeln!(s, "se.avg.util_avg                    : {:17}", 0);
+    let _ = writeln!(s, "se.avg.last_update_time            : {:17}", 0);
+    let _ = writeln!(
+        s,
+        "policy                             : {:17}",
+        sched.policy
+    );
+    let _ = writeln!(s, "prio                               : {:17}", 20 + nice);
+    let _ = writeln!(s, "clock-delta                        : {:17}", 0);
     s
+}
+
+/// `kernel/sched/core.c::sched_prio_to_weight[]` — nice 0 is 1024 and each
+/// level is ~1.25x the next, which is how that table is generated.
+fn nice_to_weight(nice: i32) -> u64 {
+    let mut weight = 1024f64;
+    let steps = nice.clamp(-20, 19);
+    for _ in 0..steps.abs() {
+        if steps > 0 {
+            weight /= 1.25;
+        } else {
+            weight *= 1.25;
+        }
+    }
+    weight as u64
 }
 
 /// `/proc/<pid>/schedstat` — three integers on one line.
 ///
 /// Linux shape: `run_time_ns wait_time_ns timeslices\n`
 /// Linux ref: `kernel/sched/stats.c:proc_schedstat_show`.
-/// TODO: wire real ns counters from narf_scheduler task stats.
-fn render_schedstat(_pid: u64) -> String {
-    // TODO: pull run_time_ns / wait_time_ns / timeslices from
-    // narf_scheduler per-task accounting once that lands.
-    "0 0 0\n".to_string()
+///
+/// LINUX-GAP: the middle field is run-queue WAIT time, which needs the
+/// enqueue timestamp Linux keeps in `se.statistics.wait_start`. NARF's
+/// executor does not timestamp readiness, so it reports 0 — the other two
+/// fields are real.
+fn render_schedstat(pid: u64) -> String {
+    let sched = super::hook_sched_snapshot(pid);
+    format!("{} {} {}\n", sched.run_ns, 0, sched.timeslices)
 }
 
 /// `/proc/<pid>/stack` — kernel-stack backtrace (privileged).
 ///
 /// Linux ref: `fs/proc/base.c:proc_pid_stack`.
-/// NARF has no unwinder yet; return a stub line that won't confuse parsers.
+///
+/// LINUX-GAP: NARF has no kernel-stack unwinder, so there is no frame chain
+/// to walk. The single null frame keeps the `[<%px>] %pS` shape a parser
+/// expects rather than inventing symbol names (`/proc/<pid>/wchan` names the
+/// blocking syscall instead, which NARF can answer truthfully).
 fn render_stack(_pid: u64) -> String {
-    // TODO: walk the kernel stack frame chain once an unwinder is
-    // available in narf_arch.
     "[<0000000000000000>] 0x0\n".to_string()
 }
 
-/// `/proc/<pid>/wchan` — symbol where the task is currently sleeping.
+/// `/proc/<pid>/wchan` — where the task is sleeping.
 ///
-/// Linux ref: `fs/proc/base.c:proc_wchan_operations`.
-/// TODO: surface the actual sleep-site once the scheduler exposes a
-/// per-task "parked in" symbol handle.
+/// Linux ref: `fs/proc/base.c:proc_pid_wchan`, which prints the symbol
+/// `get_wchan()` resolved, or `0` when it cannot name one (including every
+/// running task, and any kernel without KALLSYMS).
+///
+/// NARF answers it from the task's park state: a task parked inside a
+/// syscall is waiting in that syscall's handler, and those handlers really
+/// are named `sys_*`, so the name is the truth about where it is. Anything
+/// else prints `0`.
+///
+/// This used to print `sys_sleep` for EVERY task in state `S` — a symbol
+/// that exists in neither kernel, reported for tasks blocked in `poll`,
+/// `read` or `futex`. `ps -o wchan` and anything else keyed on this file was
+/// being told the same wrong thing about every sleeper.
 fn render_wchan(pid: u64) -> String {
-    let state = task_info(pid, super::TaskInfoQuery::Basic)
-        .map(|i| i.state)
-        .unwrap_or('R');
-    if state == 'S' {
-        // TODO: return the real wait-channel symbol name once
-        // narf_scheduler exposes per-task sleep-site info.
-        "sys_sleep\n".to_string()
-    } else {
-        "0\n".to_string()
+    match super::hook_sched_snapshot(pid).wchan {
+        Some(name) => format!("{}\n", name),
+        None => "0\n".to_string(),
     }
 }
 
-/// `/proc/<pid>/syscall` — current syscall number + args.
+/// `/proc/<pid>/syscall` — the syscall the task is blocked in.
 ///
-/// Linux ref: `fs/proc/base.c:proc_pid_syscall`.
-/// Format: `syscall_nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc\n`
-/// or `"running\n"` when the task is not blocked in a syscall.
-/// TODO: expose the saved syscall-entry frame from the trap path.
+/// Linux ref: `fs/proc/base.c:proc_pid_syscall` → `task_current_syscall()`.
+/// Format: `nr arg0 arg1 arg2 arg3 arg4 arg5 sp pc\n`, or `"running\n"` for
+/// a task that is not blocked (which is what `task_current_syscall` reports
+/// for anything still on a CPU), or `"-1 0x0 … 0x0\n"` for a task blocked
+/// outside a syscall.
+///
+/// The frame comes from the parked task's saved register state — the same
+/// place Linux reads it (`pt_regs`), and the same snapshot `PTRACE_GETREGS`
+/// serves. This used to print the `-1` no-syscall line for every task in a
+/// non-running state, so a debugger could never see what a hung process was
+/// waiting on.
 fn render_syscall(pid: u64) -> String {
-    let state = task_info(pid, super::TaskInfoQuery::Basic)
-        .map(|i| i.state)
-        .unwrap_or('R');
-    if state == 'R' {
-        "running\n".to_string()
-    } else {
-        // TODO: read the saved trap frame (syscall nr + args + rsp/rip)
-        // from narf_userspace::handlers once it exposes a per-task
-        // snapshot accessor for the saved int 0x80 frame.
-        "-1 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0\n".to_string()
+    let sched = super::hook_sched_snapshot(pid);
+    match sched.syscall {
+        Some(frame) => format!(
+            "{} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}\n",
+            frame[0] as i64,
+            frame[1],
+            frame[2],
+            frame[3],
+            frame[4],
+            frame[5],
+            frame[6],
+            frame[7],
+            frame[8]
+        ),
+        None => {
+            let state = task_info(pid, super::TaskInfoQuery::Basic)
+                .map(|i| i.state)
+                .unwrap_or('R');
+            if state == 'R' {
+                "running\n".to_string()
+            } else {
+                "-1 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x0\n".to_string()
+            }
+        }
     }
 }
 
@@ -771,7 +851,7 @@ fn loginuid_set(pid: u64, uid: u32) {
 /// the anonymous + file-backed extents (same denominator — the kernel
 /// tracks these separately only with a page-table walk, which NARF
 /// doesn't have yet). Fields without a data source are zeroed with a
-/// TODO comment, matching the style of `render_io` and other partial
+/// LINUX-GAP note, matching the style of `render_io` and other partial
 /// files in this module.
 ///
 /// Linux ref: `fs/proc/array.c:proc_pid_statm`.
@@ -1326,7 +1406,8 @@ kernel_test_in!(
     smoke_sched_contains_exec_runtime
 );
 
-/// Smoke: `render_schedstat` is exactly "0 0 0\n".
+/// Smoke: with no hook installed, `render_schedstat` is exactly "0 0 0\n" —
+/// the shape `proc_schedstat_show` prints, with nothing to report.
 fn smoke_schedstat_shape() -> TestResult {
     let out = render_schedstat(1);
     if out == "0 0 0\n" {
@@ -1336,6 +1417,86 @@ fn smoke_schedstat_shape() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/pid_ext", smoke_schedstat_shape);
+
+/// A task's real accounting reaches all four files: `schedstat`'s run time
+/// and timeslices, `sched`'s two switch counters, `wchan`'s blocking site,
+/// and `syscall`'s frame. Every one of these was a hard-coded constant.
+fn test_sched_snapshot(_pid: u64) -> super::ProcSchedSnapshot {
+    super::ProcSchedSnapshot {
+        run_ns: 1_234_567_890,
+        timeslices: 42,
+        voluntary_switches: 7,
+        involuntary_switches: 3,
+        policy: 0,
+        nice: 0,
+        // `read(fd=4, buf=0x1000, count=0x200)` parked at sp/pc.
+        syscall: Some([0, 4, 0x1000, 0x200, 0, 0, 0, 0x7fff_f000, 0x0040_1000]),
+        wchan: Some(alloc::string::String::from("read")),
+    }
+}
+
+fn smoke_sched_files_report_the_tasks_accounting() -> TestResult {
+    let prev = super::__test_sched_snapshot_hook_swap(Some(test_sched_snapshot));
+    let schedstat = render_schedstat(1);
+    let sched = render_sched(1);
+    let wchan = render_wchan(1);
+    let syscall = render_syscall(1);
+    super::__test_sched_snapshot_hook_restore(prev);
+
+    if schedstat != "1234567890 0 42\n" {
+        return TestResult::Fail("schedstat should report run_time_ns and timeslices");
+    }
+    if !sched.contains("nr_voluntary_switches              :                 7")
+        || !sched.contains("nr_involuntary_switches            :                 3")
+    {
+        return TestResult::Fail("sched should report the real switch counters");
+    }
+    if !sched.contains("se.sum_exec_runtime                :        1234.567890") {
+        return TestResult::Fail("sched should report sum_exec_runtime in ms");
+    }
+    if wchan != "read\n" {
+        return TestResult::Fail("wchan should name the syscall the task is parked in");
+    }
+    if syscall != "0 0x4 0x1000 0x200 0x0 0x0 0x0 0x7ffff000 0x401000\n" {
+        return TestResult::Fail("syscall should report the parked task's frame");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_sched_files_report_the_tasks_accounting
+);
+
+/// A task that is NOT parked in a syscall reports "running" — Linux's answer
+/// whenever `task_current_syscall` cannot read a stable frame — and `wchan`
+/// reports `0` rather than a symbol name. `wchan` used to answer `sys_sleep`
+/// for every sleeping task: a symbol in neither kernel.
+fn test_sched_snapshot_running(_pid: u64) -> super::ProcSchedSnapshot {
+    super::ProcSchedSnapshot {
+        run_ns: 5,
+        timeslices: 1,
+        ..Default::default()
+    }
+}
+
+fn smoke_syscall_and_wchan_for_a_running_task() -> TestResult {
+    let prev = super::__test_sched_snapshot_hook_swap(Some(test_sched_snapshot_running));
+    let wchan = render_wchan(1);
+    let syscall = render_syscall(1);
+    super::__test_sched_snapshot_hook_restore(prev);
+
+    if wchan != "0\n" {
+        return TestResult::Fail("wchan for an unparked task should be '0'");
+    }
+    if syscall != "running\n" {
+        return TestResult::Fail("syscall for an unparked running task should be 'running'");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs/pid_ext",
+    smoke_syscall_and_wchan_for_a_running_task
+);
 
 /// Smoke: `render_limits` has exactly 17 lines (header + 16 resources).
 fn smoke_limits_has_16_resource_lines() -> TestResult {

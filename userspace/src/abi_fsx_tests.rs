@@ -3597,8 +3597,15 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_accepted_flags_pos);
 // new root), not be taken literally — a literal "." matched no mount, umount2
 // failed, and systemd's `mount(".", "/", MS_MOVE)` fallback then returned
 // ENOENT → 226/EXIT_NAMESPACE (udevd et al., after the domainname fix).
+//
+// MNT_DETACH is not decoration here, and it is why systemd passes it: the
+// caller's cwd IS on the mount it is unmounting, which is a reference
+// `do_umount` counts, so the same call with flags 0 is -EBUSY on Linux. This
+// case asked for flags 0 and expected 0 — which only held while NARF's
+// pop-by-path ignored references altogether.
 fn smoke_abi_fsx_umount2_relative_dot() -> TestResult {
     with_setup(|| {
+        const MNT_DETACH: u64 = 1 << 1;
         crate::handlers::__test_cwd_reset();
         let target = b"/abi-swroot\0";
         let margs = SyscallArgs {
@@ -3618,11 +3625,18 @@ fn smoke_abi_fsx_umount2_relative_dot() -> TestResult {
             return Err("chdir into the new mount failed");
         }
         let dot = b".\0";
-        let r = call(Syscall::Umount2.raw(), a1(dot.as_ptr() as u64, 0));
+        // Resolution reaches the mount either way: with flags 0 it reaches it
+        // and finds the cwd reference (-EBUSY, not the -ENOENT or -EINVAL a
+        // literal "." would give), and with MNT_DETACH it unmounts.
+        let busy = call(Syscall::Umount2.raw(), a1(dot.as_ptr() as u64, 0));
+        let r = call(Syscall::Umount2.raw(), a1(dot.as_ptr() as u64, MNT_DETACH));
         crate::handlers::__test_cwd_reset();
+        if !matches!(busy, Some(v) if v == EBUSY) {
+            return Err("umount2(\".\") with the cwd on the mount must be -EBUSY");
+        }
         match r {
             Some(0) => Ok(()),
-            _ => Err("umount2(\".\") must resolve to the cwd mount and return 0"),
+            _ => Err("umount2(\".\", MNT_DETACH) must resolve to the cwd mount and return 0"),
         }
     })
 }

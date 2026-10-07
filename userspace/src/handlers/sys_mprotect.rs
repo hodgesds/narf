@@ -75,6 +75,23 @@ pub(crate) fn sys_mprotect(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
+    // `do_mprotect_pkey`, right after the same validation:
+    //
+    // ```text
+    // if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+    //         prot |= PROT_EXEC;
+    // ```
+    //
+    // No noexec exception here — unlike mmap, mprotect has no file in hand,
+    // and Linux applies the flag unconditionally. The personality bit was
+    // stored nowhere before, so this never fired.
+    const PROT_READ: u32 = 0x1;
+    const PROT_EXEC: u32 = 0x4;
+    let prot = if prot & PROT_READ != 0 && current_personality() & READ_IMPLIES_EXEC != 0 {
+        prot | PROT_EXEC
+    } else {
+        prot
+    };
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {

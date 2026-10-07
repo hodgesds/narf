@@ -3544,6 +3544,22 @@ impl TrapContext for IoAccountCtx<'_> {
     }
 }
 
+/// Name of the handler a raw Linux syscall number dispatches to, if this
+/// build installed one. Used by `/proc/<pid>/wchan`, which names the site a
+/// parked task is waiting in — and NARF's handler for `ppoll` really is
+/// called `ppoll`, so the name is the truth about where the task is.
+pub fn syscall_name_of_number(raw: u64) -> Option<&'static str> {
+    let variant = Syscall::from_raw(syscall_number(raw as u32))?;
+    let p = GLOBAL_TABLE.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: same contract as `kernel_syscall_entry` — the installed table is
+    // leaked for the life of the kernel, so the reference stays valid.
+    let table = unsafe { &*p };
+    table.name_of(variant)
+}
+
 pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {

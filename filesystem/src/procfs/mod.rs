@@ -536,6 +536,39 @@ type FdListFn = fn(u64) -> Vec<u32>;
 type FdPidfdPidFn = fn(u64, u32) -> Option<u64>;
 type RlimitsFn = fn(u64) -> [(u64, u64); 16];
 type NiceFn = fn(u64) -> i32;
+type PersonalityFn = fn(u64) -> u32;
+
+/// What `/proc/<pid>/{sched,schedstat,wchan,syscall}` report, from the
+/// per-task accounting `userspace/` keeps.
+///
+/// Linux reads these straight off `task_struct` (`se.sum_exec_runtime`,
+/// `nr_{voluntary,involuntary}_switches`, `pt_regs` for the syscall frame).
+/// NARF's live beside the task in `narf_userspace::task::Task`, so the
+/// procfs side takes one snapshot per read.
+#[derive(Clone, Debug, Default)]
+pub struct ProcSchedSnapshot {
+    /// `se.sum_exec_runtime` — on-CPU time, ns (user + in-syscall).
+    pub run_ns: u64,
+    /// Completed run slices (`/proc/<pid>/schedstat`'s third field).
+    pub timeslices: u64,
+    /// `nr_voluntary_switches` — slices that ended in a park.
+    pub voluntary_switches: u64,
+    /// `nr_involuntary_switches` — slices that ended any other way.
+    pub involuntary_switches: u64,
+    /// Scheduling policy (SCHED_OTHER = 0).
+    pub policy: u32,
+    /// `task_nice()`.
+    pub nice: i32,
+    /// The syscall frame of a task parked inside a syscall:
+    /// `[nr, arg0..arg5, sp, pc]`. `None` means "running", which is what
+    /// `/proc/<pid>/syscall` then prints.
+    pub syscall: Option<[u64; 9]>,
+    /// Where a parked task is waiting — the handler it is blocked in.
+    /// `None` prints `0`, as Linux does when it cannot name the site.
+    pub wchan: Option<String>,
+}
+
+type SchedSnapshotFn = fn(u64) -> ProcSchedSnapshot;
 type EnvironFn = fn(u64) -> Vec<u8>;
 type AuxvFn = fn(u64) -> Vec<u8>;
 type SetCommFn = fn(u64, &str) -> Result<(), FsError>;
@@ -647,6 +680,8 @@ static FD_LIST_HOOK: AtomicUsize = AtomicUsize::new(0);
 static FD_PIDFD_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
 static RLIMITS_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NICE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static PERSONALITY_HOOK: AtomicUsize = AtomicUsize::new(0);
+static SCHED_SNAPSHOT_HOOK: AtomicUsize = AtomicUsize::new(0);
 static ENVIRON_HOOK: AtomicUsize = AtomicUsize::new(0);
 static AUXV_HOOK: AtomicUsize = AtomicUsize::new(0);
 static SET_COMM_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -745,6 +780,22 @@ pub fn __test_fd_path_hook_snapshot() -> usize {
 #[doc(hidden)]
 pub fn __test_fd_path_hook_restore(prev: usize) {
     FD_PATH_HOOK.store(prev, Ordering::Release);
+}
+
+/// Test-only: snapshot the sched-snapshot hook slot, install one, put it
+/// back. Same reason as the fd-path pair — the hooks are process-global, and
+/// one case asserts the UN-hooked rendering.
+#[doc(hidden)]
+pub fn __test_sched_snapshot_hook_swap(f: Option<SchedSnapshotFn>) -> usize {
+    let prev = SCHED_SNAPSHOT_HOOK.load(Ordering::Acquire);
+    SCHED_SNAPSHOT_HOOK.store(f.map_or(0, |f| f as usize), Ordering::Release);
+    prev
+}
+
+/// Test-only counterpart to [`__test_sched_snapshot_hook_swap`].
+#[doc(hidden)]
+pub fn __test_sched_snapshot_hook_restore(prev: usize) {
+    SCHED_SNAPSHOT_HOOK.store(prev, Ordering::Release);
 }
 
 /// Wire the writable per-pid procfs hooks. Called once at boot after
@@ -1017,6 +1068,45 @@ pub(crate) fn hook_rlimits(pid: u64) -> [(u64, u64); 16] {
     // SAFETY: v was stored by install_proc_ext_hooks as a RlimitsFn fn-pointer; non-zero confirms it.
     let f: RlimitsFn = unsafe { core::mem::transmute(v) };
     f(pid)
+}
+
+/// `/proc/<pid>/personality` — `current->personality`, the word
+/// `proc_pid_personality` prints. Zero (PER_LINUX, no flags) when nothing
+/// has installed the hook.
+pub(crate) fn hook_personality(pid: u64) -> u32 {
+    let v = PERSONALITY_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return 0;
+    }
+    // SAFETY: only `set_personality_hook` writes this cell, always from a
+    // `PersonalityFn` fn-pointer; non-zero confirms it was stored.
+    let f: PersonalityFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+/// Wire `/proc/<pid>/personality` to the per-task personality word.
+pub fn set_personality_hook(f: PersonalityFn) {
+    PERSONALITY_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// `/proc/<pid>/{sched,schedstat,wchan,syscall}` — the per-task scheduler
+/// accounting and saved syscall frame. An uninstalled hook reports zeroes and
+/// "running", which is what the files said unconditionally before the hook
+/// existed.
+pub(crate) fn hook_sched_snapshot(pid: u64) -> ProcSchedSnapshot {
+    let v = SCHED_SNAPSHOT_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return ProcSchedSnapshot::default();
+    }
+    // SAFETY: only `set_sched_snapshot_hook` writes this cell, always from a
+    // `SchedSnapshotFn` fn-pointer; non-zero confirms it was stored.
+    let f: SchedSnapshotFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+/// Wire the per-task scheduler snapshot.
+pub fn set_sched_snapshot_hook(f: SchedSnapshotFn) {
+    SCHED_SNAPSHOT_HOOK.store(f as usize, Ordering::Release);
 }
 
 pub(crate) fn hook_nice(pid: u64) -> i32 {

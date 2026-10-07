@@ -92,19 +92,48 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // (which have none, except root) succeeds: `apply_chroot("/")` yields
     // "<root>/" (intentional, see apply_chroot), so umount2(".") right after
     // pivot_root(".",".") — cwd "/" in the new root — resolves to "<newroot>/".
+    //
+    // `user_path_at(AT_FDCWD, name, lookup_flags, &path)` carries
+    // LOOKUP_FOLLOW unless UMOUNT_NOFOLLOW, so `umount2("/link-to-mnt", 0)`
+    // unmounts what the link POINTS AT, while UMOUNT_NOFOLLOW resolves the
+    // link itself — which is never a mount point, so it falls into the
+    // "not mounted" -EINVAL below. NARF matched the UN-followed string
+    // against the mount list either way: the flag changed nothing, and
+    // unmounting through a symlink (how /etc/mtab-era tooling and
+    // `/dev/shm`-style aliases spell a mount) was -EINVAL.
+    //
+    // The hops run in the task's OWN view and are re-rooted once at the end,
+    // because a symlink's stored target is a name in that view: following it
+    // in host space would escape a chroot through its own links.
+    let task = current_task_id();
+    let mut visible = resolve_cwd_path_user(task, target_raw.as_str());
+    if flags & UMOUNT_NOFOLLOW == 0 {
+        for _ in 0..SYMLOOP_MAX {
+            let probe = apply_chroot(visible.trim_end_matches('/'));
+            let Some(link) = resolve_final_symlink_target(&probe) else {
+                break;
+            };
+            visible = if link.starts_with('/') {
+                resolve_cwd_path_user(task, &link)
+            } else {
+                // A relative target resolves against the link's directory.
+                let dir = visible
+                    .trim_end_matches('/')
+                    .rsplit_once('/')
+                    .map(|(dir, _)| dir)
+                    .unwrap_or("");
+                resolve_cwd_path_user(task, &alloc::format!("{}/{}", dir, link))
+            };
+        }
+    }
     let target = {
-        let t = resolve_cwd_path(current_task_id(), target_raw.as_str());
+        let t = apply_chroot(&visible);
         if t.len() > 1 {
             alloc::string::String::from(t.trim_end_matches('/'))
         } else {
             t
         }
     };
-    // We accept MNT_FORCE / MNT_DETACH / UMOUNT_NOFOLLOW but the registry
-    // doesn't yet track in-flight refs against a mount, so the pop-by-path
-    // is unconditional. The flag word is recorded for diagnostic symmetry
-    // only. (MNT_EXPIRE's conflict check is enforced below.)
-    let _ = flags & (MNT_FORCE | MNT_DETACH | UMOUNT_NOFOLLOW);
 
     // `user_path_at` runs first (-ENOENT), then `can_umount`'s `may_mount()`
     // (-EPERM), then its `path_mounted()` (-EINVAL, below). Probed on Linux
@@ -174,6 +203,47 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // `do_umount`'s `retval = -EBUSY`. Linux decides it from
+    // `mnt_get_count(mnt)` against the references it expects, and the
+    // references that count are exactly three things NARF records:
+    //
+    //   * a mount BENEATH the target pins its mountpoint
+    //     (`propagate_mount_busy`'s walk over `mnt_mounts`),
+    //   * a task's cwd or root on it pins it (`fs_struct`'s `pwd` / `root`,
+    //     each holding a `struct path`), and
+    //   * an open file on it pins it (`file->f_path.mnt`).
+    //
+    // The registry has no refcount of its own, so the three tables stand in
+    // for it. The answer matters: an unconditional pop tore a mount out from
+    // under a process still reading it, and reported success — so a teardown
+    // loop had no "come back later" state and a caller that depends on EBUSY
+    // to detect "someone is still in there" (systemd's `umount_recursive`,
+    // udisks, every container runtime's cleanup) never saw it.
+    let submounts: alloc::vec::Vec<alloc::string::String> = current_mount_list()
+        .into_iter()
+        .filter(|m| m != &target && path_at_or_under(m, target.as_str()))
+        .collect();
+    // MNT_DETACH is Linux's lazy unmount: detach the subtree now and let the
+    // last reference free it. NARF's mounts are Arc'd, so a task holding a
+    // file under a detached mount keeps the FsInstance alive by itself — the
+    // detach IS the pop, and the submounts go with it (deepest first, as
+    // `umount_tree` collects them).
+    //
+    // LINUX-GAP: MNT_FORCE additionally asks the filesystem to abort its
+    // in-flight requests (`sb->s_op->umount_begin`, which only the network
+    // filesystems implement). NARF has no such hook, so MNT_FORCE only
+    // bypasses the busy test, exactly like MNT_DETACH, and aborts nothing.
+    let lazy = flags & (MNT_DETACH | MNT_FORCE) != 0;
+    if !lazy
+        && (!submounts.is_empty()
+            || any_task_cwd_under(target.as_str())
+            || any_task_root_under(target.as_str())
+            || crate::mqueue::any_fd_path_under(target.as_str()))
+    {
+        ctx.set_return(fail(EBUSY));
+        return;
+    }
+
     let auth = narf_filesystem::bootstrap_mount_authority();
     // SAFETY: bootstrapping a Write cap is the same TCB-trusted op
     // the registry uses internally to mint the per-mount handle.
@@ -181,11 +251,22 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
         narf_capabilities::Cap::<narf_filesystem::MountPoint, narf_capabilities::Write>::bootstrap(
         );
     let _ = auth;
-    let result = if let Some(ns) = private_ns {
-        ns.unmount(target.as_str())
-    } else {
-        narf_filesystem::registry().unmount(&handle, target.as_str())
+    let unmount_one = |path: &str| {
+        if let Some(ns) = private_ns.as_ref() {
+            ns.unmount(path)
+        } else {
+            narf_filesystem::registry().unmount(&handle, path)
+        }
     };
+    if lazy {
+        // Deepest first, so no entry is left parented on a popped mount.
+        let mut nested = submounts;
+        nested.sort_by_key(|path| core::cmp::Reverse(path.len()));
+        for path in &nested {
+            let _ = unmount_one(path.as_str());
+        }
+    }
+    let result = unmount_one(target.as_str());
     // A real mount (including the old root systemd detaches after pivot_root)
     // unmounts and returns 0. A racing unmount that emptied the slot between
     // the check above and here lands on `NotFound` → -EINVAL, Linux's answer

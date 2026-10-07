@@ -80,6 +80,103 @@ fn task_map_fork<V: Clone>(table: &TaskMapTable<V>, parent: u64, child: u64) {
 static CWD_TABLE: TaskMapTable<alloc::string::String> =
     [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
 
+// ── personality(2) — the per-task execution domain ───────────────────
+//
+// `current->personality` (`include/uapi/linux/personality.h`). NARF
+// implements only the PER_LINUX domain, but the FLAG half of the word is not
+// about emulating another Unix: `ADDR_NO_RANDOMIZE` and `READ_IMPLIES_EXEC`
+// change how this kernel lays out and protects memory, and both are things
+// NARF can honour.
+
+/// `ADDR_NO_RANDOMIZE` — lay the address space out without randomisation.
+/// What `setarch -R` / `setarch --addr-no-randomize` sets, and what a
+/// debugger or a crash-reproduction harness needs.
+pub(crate) const ADDR_NO_RANDOMIZE: u32 = 0x0004_0000;
+/// `READ_IMPLIES_EXEC` — a readable mapping is also executable.
+pub(crate) const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
+static PERSONALITY_TABLE: TaskMapTable<u32> = [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
+
+/// `current->personality`. Absent means PER_LINUX with no flags, which is
+/// every task until one asks for something else.
+pub(crate) fn read_personality(task: u64) -> u32 {
+    task_map_get(&PERSONALITY_TABLE, task).unwrap_or(0)
+}
+
+/// Install `persona` on `task` (`kernel/exec_domain.c::set_personality`,
+/// which assigns the whole word — there is no per-bit validation, and an
+/// unknown domain in the low byte is simply remembered).
+pub(crate) fn write_personality(task: u64, persona: u32) {
+    task_map_set(&PERSONALITY_TABLE, task, persona);
+}
+
+/// The calling task's personality.
+pub(crate) fn current_personality() -> u32 {
+    read_personality(current_task_id())
+}
+
+/// Should this task's address space be randomised?
+///
+/// Linux folds the two questions together in `load_elf_binary`:
+///
+/// ```text
+/// if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+///         current->flags |= PF_RANDOMIZE;
+/// ```
+///
+/// — the global `randomize_va_space` sysctl AND the per-task opt-out, which
+/// is why `setarch -R` works on a kernel with ASLR on. NARF had only the
+/// global half ([`narf_memory::kaslr::user_aslr_enabled`]), so a task that
+/// asked for a fixed layout was randomised anyway and `personality(2)`
+/// reported success for it.
+pub(crate) fn randomize_user_layout() -> bool {
+    narf_memory::kaslr::user_aslr_enabled() && current_personality() & ADDR_NO_RANDOMIZE == 0
+}
+
+/// `arch/x86/kernel/process_64.c::set_personality_64bit`, the SET_PERSONALITY
+/// an x86_64 ELF exec runs:
+///
+/// ```text
+/// current->personality &= ~READ_IMPLIES_EXEC;
+/// ```
+///
+/// Everything else — ADDR_NO_RANDOMIZE above all — survives `execve`, which
+/// is the whole reason `setarch -R prog` affects `prog` rather than the
+/// `setarch` process that exits immediately after.
+///
+/// (`elf_read_implies_exec` can put the bit BACK for a binary with an
+/// executable stack, but on x86_64 it is `mmap_is_ia32() && ...` — false for
+/// every 64-bit image, so a 64-bit exec always clears it.)
+pub(crate) fn personality_exec(task: u64) {
+    let persona = read_personality(task);
+    if persona & READ_IMPLIES_EXEC != 0 {
+        write_personality(task, persona & !READ_IMPLIES_EXEC);
+    }
+}
+
+/// `fork(2)` inheritance: the child gets the parent's personality, as it
+/// gets the whole `task_struct` it was copied from.
+pub fn personality_fork(parent: u64, child: u64) {
+    task_map_fork(&PERSONALITY_TABLE, parent, child);
+}
+
+/// Initialise the per-task personality registry.
+pub fn personality_init() {
+    task_map_init(&PERSONALITY_TABLE);
+}
+
+/// Reset the registry — test hook.
+#[doc(hidden)]
+pub fn __test_personality_reset() {
+    task_map_init(&PERSONALITY_TABLE);
+}
+
+/// `/proc/<pid>/personality` — the hex word, as `proc_pid_personality` prints
+/// it. Takes a Linux PID, not a TaskId: this is the procfs hook.
+pub fn personality_of_pid(pid: u64) -> u32 {
+    read_personality(proc_pid_to_tid(pid))
+}
+
+
 /// Initialise the per-task cwd registry. Boot calls this once
 /// before any user task can issue `Syscall::Chdir` / `Getcwd`.
 pub fn cwd_init() {
@@ -165,6 +262,64 @@ fn resolve_cwd_path_owned(task: u64, path: alloc::string::String) -> alloc::stri
     rooted.push_str(&prefix);
     rooted.push_str(&normalized);
     rooted
+}
+
+/// Is `path` the path `prefix`, or something beneath it? Both are
+/// host-absolute and normalized; `prefix` must carry no trailing slash,
+/// except the root, under which everything lies.
+///
+/// This is the string form of Linux's "is this dentry on that mount"
+/// question, and it is what the `umount(2)` busy test and the mount-tree
+/// walks are asking.
+pub(crate) fn path_at_or_under(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return true;
+    }
+    path == prefix
+        || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+}
+
+/// Is any task's working directory at or under the host-absolute `target`?
+///
+/// Linux counts a task's `fs_struct.pwd` as a reference on the mount it sits
+/// on, which is half of why `umount(2)` answers -EBUSY. `CWD_TABLE` holds
+/// each task's cwd in ITS OWN chroot view, so the target has to be
+/// translated into that view per entry before the comparison — the same
+/// asymmetry [`chroot_path_matches`] exists for. A target outside a task's
+/// root cannot be its cwd at all.
+fn any_task_cwd_under(target: &str) -> bool {
+    CWD_TABLE.iter().any(|shard| {
+        shard.map.lock().as_ref().is_some_and(|m| {
+            m.iter().any(|(&task, cwd)| {
+                let visible = match root_dir_prefix(task) {
+                    Some(prefix) if prefix != "/" => match target.strip_prefix(prefix.as_str()) {
+                        Some("") => "/",
+                        Some(rest) => rest,
+                        None => return false,
+                    },
+                    _ => target,
+                };
+                path_at_or_under(cwd, visible)
+            })
+        })
+    })
+}
+
+/// Is any task's root directory at or under the host-absolute `target`?
+/// `fs_struct.root` is the other half of the reference `pwd` holds, and
+/// `ROOT_DIR_TABLE` already stores the chroot prefix host-absolute, so this
+/// comparison needs no translation.
+fn any_task_root_under(target: &str) -> bool {
+    if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
+    ROOT_DIR_TABLE.iter().any(|shard| {
+        shard
+            .map
+            .lock()
+            .as_ref()
+            .is_some_and(|m| m.values().any(|root| path_at_or_under(root, target)))
+    })
 }
 
 /// Compare a host-view normalized path with one path in the task's chroot
@@ -2452,6 +2607,10 @@ fn do_execve_resolved(
     // that handles SIGCHLD; without this the next SIGCHLD branches to the stale
     // handler vaddr in the new image and crashes.) Mask + pending are kept.
     sigaction_exec_reset(task);
+    // `SET_PERSONALITY` on the new image: x86_64's clears READ_IMPLIES_EXEC
+    // and keeps everything else, so ADDR_NO_RANDOMIZE survives the exec it
+    // was set for (`setarch -R prog`).
+    personality_exec(task);
     // The alternate signal stack, robust-list head, and clear_child_tid
     // uaddr all point into the OLD image's address space — Linux clears
     // all three on exec. A surviving sigaltstack sp would have the next
@@ -6968,6 +7127,78 @@ pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat>
         } else {
             'R'
         },
+    })
+}
+
+/// `/proc/<pid>/{sched,schedstat,wchan,syscall}` hook — the per-task
+/// scheduler accounting and, for a task parked inside a syscall, the frame it
+/// is parked in.
+///
+/// Linux reads the same four files out of `task_struct` + `pt_regs`:
+/// `se.sum_exec_runtime` (on-CPU ns), `nr_{voluntary,involuntary}_switches`,
+/// and `task_current_syscall()`, which reports a frame only for a task that
+/// is NOT on a CPU and leaves `/proc/<pid>/syscall` printing "running"
+/// otherwise. NARF's park flag (`parked_in_syscall`) is exactly that
+/// condition, and the saved register state is the same snapshot
+/// `PTRACE_GETREGS` serves.
+pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapshot {
+    let task = proc_pid_to_tid(pid);
+    let (timeslices, voluntary_switches, involuntary_switches) = crate::task::switch_counts(task);
+    let syscall = proc_task_syscall_frame(task);
+    // The handler a parked task is waiting in. A task parked outside a
+    // syscall (or one still running) has no site to name, and Linux prints 0
+    // for exactly that case.
+    let wchan = syscall
+        .and_then(|frame| crate::syscall::syscall_name_of_number(frame[0]))
+        .map(alloc::string::String::from);
+    narf_filesystem::procfs::ProcSchedSnapshot {
+        run_ns: cpu_time_ns_of(task).saturating_add(kern_time_ns_of(task)),
+        timeslices,
+        voluntary_switches,
+        involuntary_switches,
+        policy: read_sched_state(task).policy as u32,
+        nice: nice_of(pid),
+        syscall,
+        wchan,
+    }
+}
+
+/// `kernel/sched/syscalls.c::task_current_syscall()` — the syscall frame of a
+/// task that is parked, as `[nr, arg0..arg5, sp, pc]`.
+///
+/// `None` for a task that is not parked inside a syscall, which is what makes
+/// `/proc/<pid>/syscall` print "running": Linux fails the same way for a task
+/// still on a CPU, because the frame it would read is being written.
+///
+/// The registers are the parked task's saved user state. Nothing extra is
+/// recorded at syscall entry to make this work — at a park, the syscall
+/// number is still in the register the ABI delivered it in (the return value
+/// has not been written yet), exactly as Linux's `pt_regs->orig_ax` holds it.
+fn proc_task_syscall_frame(task: u64) -> Option<[u64; 9]> {
+    if !crate::task::parked_in_syscall(task) {
+        return None;
+    }
+    crate::user_task::with_user_task_ctx(task, |uctx| {
+        // SAFETY: the task is parked, so its saved state is complete and no
+        // trap path is writing it — the same contract `get_tracee_regs` reads
+        // a stopped tracee's state under.
+        let state = unsafe { *uctx.state.get() };
+        #[cfg(target_arch = "x86_64")]
+        {
+            // syscall(2) ABI: nr in rax, args in rdi/rsi/rdx/r10/r8/r9.
+            [
+                state.rax, state.rdi, state.rsi, state.rdx, state.r10, state.r8, state.r9,
+                state.rsp, state.rip,
+            ]
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // svc #0 ABI: nr in x8, args in x0..x5.
+            [
+                state.x[8], state.x[0], state.x[1], state.x[2], state.x[3], state.x[4], state.x[5],
+                state.sp, state.pc,
+            ]
+        }
     })
 }
 
