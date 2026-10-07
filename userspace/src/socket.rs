@@ -534,11 +534,22 @@ impl UnixAddr {
         Some(UnixAddr::Path(String::from(s)))
     }
 
-    /// Encode back into `SockAddr` body bytes (abstract keeps the leading
-    /// NUL; pathname is the raw bytes; unnamed is empty).
+    /// Encode back into the `SockAddr` body Linux reports for this address
+    /// (`getsockname`, `getpeername`, a datagram's `recvfrom` source).
+    /// Abstract keeps the leading NUL and its exact bytes; unnamed is empty;
+    /// a pathname is the path PLUS its terminating NUL — `unix_mkname_bsd`
+    /// stores it as `strlen(path) + offsetof(sun_path) + 1` however the
+    /// binder sized it. Socket-activated services rely on that length:
+    /// `sd_is_socket_unix` / PipeWire's `is_socket_unix` reject a listener
+    /// whose reported length leaves out the NUL.
     fn to_body(&self) -> Vec<u8> {
         match self {
-            UnixAddr::Path(p) => p.as_bytes().to_vec(),
+            UnixAddr::Path(p) => {
+                let mut b = Vec::with_capacity(p.len() + 1);
+                b.extend_from_slice(p.as_bytes());
+                b.push(0);
+                b
+            }
             UnixAddr::Abstract(name) => {
                 let mut b = Vec::with_capacity(name.len() + 1);
                 b.push(0u8);

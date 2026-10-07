@@ -842,10 +842,11 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_arch_prctl_gs_round_trip);
 fn smoke_abi_proc_set_tid_address_pos() -> TestResult {
     with_setup(|| {
         // set_tid_address records the pointer regardless of value and
-        // returns the caller's TID (FAKE_TASK). A NULL pointer is the
-        // legal "disable clear_child_tid" case and still returns the TID.
+        // returns the caller's TID — what gettid() reports. A NULL pointer is
+        // the legal "disable clear_child_tid" case and still returns the TID.
+        let tid = call(Syscall::Gettid.raw(), a0(0)).ok_or("gettid failed")?;
         match call(Syscall::SetTidAddress.raw(), a0(0)) {
-            Some(v) if v as u64 == FAKE_TASK => Ok(()),
+            Some(v) if v == tid => Ok(()),
             Some(_) => Err("set_tid_address did not return the caller TID"),
             None => Err("set_tid_address returned non-Ok status"),
         }
@@ -858,13 +859,58 @@ fn smoke_abi_proc_set_tid_address_nonzero() -> TestResult {
         // A non-zero (kernel-stack) pointer is recorded the same way; the
         // return is invariant to the pointer value (it's always the TID).
         let mut slot = [0u8; 8];
-        match call(Syscall::SetTidAddress.raw(), a0(slot.as_mut_ptr() as u64)) {
-            Some(v) if v as u64 == FAKE_TASK => Ok(()),
+        let tid = call(Syscall::Gettid.raw(), a0(0)).ok_or("gettid failed")?;
+        let r = call(Syscall::SetTidAddress.raw(), a0(slot.as_mut_ptr() as u64));
+        // Disarm clear_child_tid before the stack slot goes away.
+        let _ = call(Syscall::SetTidAddress.raw(), a0(0));
+        match r {
+            Some(v) if v == tid => Ok(()),
             _ => Err("set_tid_address with a pointer did not return the TID"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_set_tid_address_nonzero);
+
+/// `set_tid_address` returns `task_pid_vnr(current)`: the caller's TID as
+/// its own PID namespace sees it — the number `gettid()` returns — never the
+/// kernel's internal handle for the task. glibc keeps that return value as
+/// the main thread's `pd->tid` (`dl-tls_init_tp.c`) and uses it for
+/// `sched_getparam`/`sched_getscheduler` (`pthread_getschedparam`), `tgkill`
+/// (`pthread_kill`) and the owner TID of PI and robust mutexes. NARF returned
+/// its scheduler TaskId, which after a fork is a different number: every main
+/// thread's `pthread_getschedparam` failed ESRCH (PipeWire: "Failed to check
+/// RLIMIT_RTPRIO: Operation not permitted"), and had the number named another
+/// task it would have read that task's scheduling state instead.
+///
+/// The harness's FAKE_TASK has no pid mapping, so its TaskId and TID agree
+/// and cannot tell the two apart; this runs as a task whose do not.
+fn smoke_abi_proc_set_tid_address_returns_visible_tid() -> TestResult {
+    with_setup(|| {
+        const TASK: u64 = 0x7e_0061;
+        const VISIBLE_TID: u64 = 0x61;
+        crate::handlers::register_task_to_pid(TASK, VISIBLE_TID);
+        crate::handlers::register_pid_task_mapping(VISIBLE_TID, TASK);
+        set_task(TASK);
+        let gettid = call(Syscall::Gettid.raw(), a0(0));
+        let set = call(Syscall::SetTidAddress.raw(), a0(0));
+        set_task(FAKE_TASK);
+        crate::handlers::release_reaped_task(VISIBLE_TID);
+        if gettid != Some(VISIBLE_TID as i64) {
+            return Err("fixture: gettid() must report the visible TID");
+        }
+        match set {
+            Some(v) if v == VISIBLE_TID as i64 => Ok(()),
+            Some(v) if v == TASK as i64 => {
+                Err("set_tid_address returned the internal scheduler TaskId, not the TID")
+            }
+            _ => Err("set_tid_address must return the caller's visible TID"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_set_tid_address_returns_visible_tid
+);
 
 // ── capget(2) / capset(2) — capability-set round-trip ──
 

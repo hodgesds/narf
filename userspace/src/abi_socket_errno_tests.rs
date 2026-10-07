@@ -735,6 +735,123 @@ kernel_test_in!(
     smoke_abi_socket_errno_bind_unix_existing_path
 );
 
+/// systemd's `socket_address_listen` + `socket_apply_socket_options`
+/// (v261, src/shared/socket-label.c / src/core/socket.c) for a user unit like
+/// `pipewire.socket` — two `ListenStream=` paths, the second named with the
+/// first as its prefix, and `Priority=6`. Every step succeeds on Linux; the
+/// fatal ones are socket, SO_REUSEADDR, the umask(~SocketMode) bind and
+/// listen(SOMAXCONN). On NARF the unit failed ("Failed to listen on PipeWire
+/// Multimedia System Sockets"), so PipeWire never started.
+fn smoke_abi_socket_errno_systemd_listen_stream_sequence() -> TestResult {
+    const SOCK_NONBLOCK: u64 = 0o4000;
+    const SOCK_CLOEXEC: u64 = 0o2000000;
+    const SO_REUSEADDR: u64 = 2;
+    const SO_PRIORITY: u64 = 12;
+    const SO_PASSRIGHTS: u64 = 83;
+    with_memfs("/rt", "rt", &[], || {
+        let old = call(Syscall::Umask.raw(), a0(0o111)).ok_or("umask failed")?;
+        let mut outcome = Ok(());
+        for path in [&b"/rt/pipewire-0"[..], &b"/rt/pipewire-0-manager"[..]] {
+            let fd = match sys(
+                Syscall::SocketOpen,
+                a2(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => {
+                    outcome = Err("socket(AF_UNIX, STREAM|NONBLOCK|CLOEXEC) failed");
+                    break;
+                }
+            };
+            if setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &1i32.to_ne_bytes()) != Some(0) {
+                outcome = Err("SO_REUSEADDR on an AF_UNIX stream socket failed");
+                break;
+            }
+            let (addr, alen) = unix_addr(path);
+            if sys(Syscall::SocketBind, a2(fd, addr.as_ptr() as u64, alen)) != Some(0) {
+                outcome = Err("bind of a ListenStream= path failed");
+                break;
+            }
+            if sys(Syscall::SocketListen, a1(fd, 4096)) != Some(0) {
+                outcome = Err("listen(fd, SOMAXCONN) failed");
+                break;
+            }
+            if setsockopt(fd, SOL_SOCKET, SO_PASSRIGHTS, &0i32.to_ne_bytes()) != Some(0) {
+                outcome = Err("SO_PASSRIGHTS=0 failed");
+                break;
+            }
+            if setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &6i32.to_ne_bytes()) != Some(0) {
+                outcome = Err("SO_PRIORITY=6 failed");
+                break;
+            }
+        }
+        let _ = call(Syscall::Umask.raw(), a0(old as u64));
+        outcome
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_systemd_listen_stream_sequence
+);
+
+/// A socket-activated service recognises the listening socket systemd passed
+/// it by checking it the way PipeWire's `is_socket_unix()` does
+/// (src/modules/network-utils.h; libsystemd's `sd_is_socket_unix` is the same
+/// shape): SO_TYPE, SO_ACCEPTCONN, then getsockname() must name the bound
+/// path with a length that INCLUDES its terminating NUL
+/// (`len >= offsetof(sun_path) + strlen(path) + 1`). Linux guarantees that:
+/// `unix_bind_bsd` -> `unix_mkname_bsd` stores a pathname address as
+/// `offsetof + strlen + 1` however the caller sized it. pipewire-pulse
+/// failed this check, so it ignored the inherited
+/// `/run/user/<uid>/pulse/native`, tried to bind the path itself ("socket ...
+/// is in use"), exited, and systemd stopped it ("start-limit-hit"): no
+/// PulseAudio server, a muted Plasma volume icon.
+fn smoke_abi_socket_errno_unix_listener_is_recognisable_after_activation() -> TestResult {
+    const SO_TYPE: u64 = 3;
+    with_memfs("/act", "act", &[], || {
+        // Bound with the NUL counted (systemd's sockaddr_un_set_path) and
+        // without it (a caller passing offsetof + strlen): Linux reports the
+        // same address for both.
+        for (path, count_nul) in [(&b"/act/native"[..], true), (&b"/act/other"[..], false)] {
+            let fd = open(AF_UNIX, SOCK_STREAM, 0)?;
+            let (addr, alen) = unix_addr(path);
+            let alen = if count_nul { alen + 1 } else { alen };
+            if sys(Syscall::SocketBind, a2(fd, addr.as_ptr() as u64, alen)) != Some(0) {
+                return Err("bind failed");
+            }
+            if listen(fd) != Some(0) {
+                return Err("listen failed");
+            }
+            let mut val = [0u8; 4];
+            if getsockopt(fd, SOL_SOCKET, SO_TYPE, &mut val).0 != Some(0)
+                || i32::from_ne_bytes(val) != SOCK_STREAM as i32
+            {
+                return Err("SO_TYPE of a listening AF_UNIX stream socket must be SOCK_STREAM");
+            }
+            if getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &mut val).0 != Some(0)
+                || i32::from_ne_bytes(val) != 1
+            {
+                return Err("SO_ACCEPTCONN of a listening socket must be 1");
+            }
+            let (r, len, out) = get_name(fd, false);
+            if r != Some(0) || u16::from_ne_bytes([out[0], out[1]]) != AF_UNIX as u16 {
+                return Err("getsockname of a bound AF_UNIX socket must report AF_UNIX");
+            }
+            if (len as usize) < 2 + path.len() + 1 {
+                return Err("getsockname length must include the path's terminating NUL");
+            }
+            if &out[2..2 + path.len()] != path || out[2 + path.len()] != 0 {
+                return Err("getsockname must return the bound path, NUL-terminated");
+            }
+            close(fd);
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_unix_listener_is_recognisable_after_activation
+);
+
 /// `net/ipv6/af_inet6.c::inet6_bind_sk` / `__inet6_bind`: addrlen <
 /// SIN6_LEN_RFC2133 → EINVAL, then a foreign family → EAFNOSUPPORT.
 fn smoke_abi_socket_errno_bind_inet6_validation() -> TestResult {
