@@ -16236,8 +16236,43 @@ fn read_uidgid(task: u64) -> UidGid {
 /// for itself is a gate one of them will forget. `perf_event_open` needs no
 /// credential of its own, so this is where the regime is enforced for that path.
 pub(crate) fn task_may_use_bpf() -> bool {
-    read_uidgid(current_task_id()).euid == 0
+    // `kernel/bpf/syscall.c::bpf_token_capable(NULL, CAP_BPF)`, which with no
+    // BPF token in play is `bpf_capable()`:
+    //
+    // ```text
+    // static inline bool bpf_capable(void)
+    // {
+    //         return capable(CAP_BPF) || capable(CAP_SYS_ADMIN);
+    // }
+    // ```
+    //
+    // This used to read `euid == 0`, which is the same conflation found in
+    // `reboot`, SysV IPC and the mqueue limits: a uid-0 daemon that dropped
+    // its capabilities to sandbox itself still loaded and attached programs,
+    // while the shape BPF tooling is actually deployed as — `setcap
+    // cap_bpf,cap_perfmon+ep /usr/bin/bpftrace`, run by an ordinary user —
+    // was refused outright. CAP_BPF exists precisely so that loading a
+    // program need not mean total authority over the machine.
+    //
+    // CAP_SYS_ADMIN is kept as the second arm because Linux keeps it: it is
+    // what every pre-5.8 loader asks for, and dropping it here would break
+    // callers that predate the split.
+    //
+    // LINUX-GAP: Linux splits further by program type —
+    // `is_net_admin_prog_type` additionally demands CAP_NET_ADMIN (socket
+    // filters, XDP, tc) and `is_perfmon_prog_type` CAP_PERFMON (kprobes,
+    // tracepoints, perf events). NARF asks this one question for every
+    // command and every program type, which spec §4.10 fixes as the design
+    // ("no unprivileged mode and no second set of limits"); the per-type
+    // split would need the program-type taxonomy carried through the loader
+    // first.
+    capable(CAP_BPF) || capable(CAP_SYS_ADMIN)
 }
+
+/// `CAP_BPF` — "employ privileged BPF operations", split out of
+/// CAP_SYS_ADMIN in Linux 5.8 so that a BPF tool need not also be able to do
+/// everything else CAP_SYS_ADMIN permits.
+pub(crate) const CAP_BPF: u32 = 39;
 
 /// Filesystem identity used when creating Linux-visible inodes outside the
 /// generic open path (notably POSIX message queues).
@@ -16488,15 +16523,20 @@ pub fn report_ucred_to(reader: u64, mut cred: crate::socket::Ucred) -> crate::so
 /// replace the inherited identity, including supplementary groups.
 ///
 /// EVERY production code path that builds a `narf_filesystem::Accessor`
-/// for a real syscall MUST go through here. (Verified by grep: the
-/// open path is the sole call site; the only other `Accessor {…}`
-/// literals are in `tests.rs`.)
+/// for a real syscall MUST go through here — or through
+/// [`accessor_for_inode`], which wraps it.
+///
+/// The grep that guarded this used to look for `Accessor {…}` literals and
+/// so missed `Accessor::new`, whose convenience derivation of `dac_override`
+/// from `uid == 0` is the very thing this funnel exists to stop.
+/// `mqueuefs::open` was built that way and answered a real DAC question
+/// with it. Both spellings are production holes; grep for both.
 /// NOTE: the DAC capability flags this returns are NOT safe to pair with
 /// an arbitrary inode — see [`accessor_for_inode`], which clears them for
 /// a file whose owners are unmapped in the caller's user namespace. Use
 /// this directly only when no inode is involved (e.g. building a FUSE
 /// request context, which needs the ids alone).
-fn current_accessor(task: u64) -> narf_filesystem::Accessor {
+pub(crate) fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     let acc = read_uidgid(task);
     // Supplementary groups are part of the identity, not an extra. Linux's
     // group triplet test is in_group_p(), which matches the fsgid OR any
@@ -16612,7 +16652,11 @@ pub fn uidgid_fork(parent: u64, child: u64) {
 /// namespaces would be a way to read /etc/shadow. The previous `uid == 0`
 /// check got this right by accident, because an unmapped in-ns root
 /// translates to OVERFLOW_ID rather than 0.
-fn accessor_for_inode(task: u64, file_uid: u32, file_gid: u32) -> narf_filesystem::Accessor {
+pub(crate) fn accessor_for_inode(
+    task: u64,
+    file_uid: u32,
+    file_gid: u32,
+) -> narf_filesystem::Accessor {
     #[allow(unused_mut)]
     let mut acc = current_accessor(task);
     #[cfg(feature = "container")]
@@ -16754,6 +16798,13 @@ fn capable_wrt_inode(task: u64, file_uid: u32, file_gid: u32, cap: u32) -> bool 
     }
     let _ = (file_uid, file_gid);
     true
+}
+
+/// [`capable_wrt_inode`] for CAP_FOWNER, exported for the callers that run
+/// `__check_sticky` against something other than a VFS directory entry —
+/// POSIX message queues, whose root is 01777 like `/tmp`'s.
+pub(crate) fn capable_wrt_inode_fowner(task: u64, file_uid: u32, file_gid: u32) -> bool {
+    capable_wrt_inode(task, file_uid, file_gid, CAP_FOWNER)
 }
 
 /// `fs/namei.c::__check_sticky`:

@@ -5371,7 +5371,7 @@ fn smoke_drm_perm_master_only_blocks_authed() -> TestResult {
         minor: MinorType::Primary,
         authenticated: true,
         is_master: false,
-        is_root: false,
+        sys_admin: false,
     };
     let arg = [0u8; 68];
     match dispatch(&mut card, 0xB8, &arg, &authed) {

@@ -106,7 +106,16 @@ pub enum MqueueError {
     Exists,
     Invalid,
     NameTooLong,
+    /// -EACCES: a permission check on the queue's mode bits failed.
     PermissionDenied,
+    /// -EPERM: the mqueuefs root's sticky bit refused the removal.
+    ///
+    /// Distinct from `PermissionDenied` because Linux's errnos are:
+    /// `may_delete` returns -EACCES when the directory check fails and
+    /// -EPERM when `check_sticky` does, and `mq_unlink` can only ever
+    /// produce the latter — the directory is 01777, so the permission
+    /// check passes for everyone.
+    OperationNotPermitted,
     NoSpace,
     BadDescriptor,
     MessageTooLarge,
@@ -115,13 +124,25 @@ pub enum MqueueError {
 }
 
 /// Creation and open-file-description inputs for [`open`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MqueueOpenOptions {
     pub flags: u32,
     pub mode: u16,
     pub umask: u16,
-    pub uid: u32,
-    pub gid: u32,
+    /// The caller's filesystem identity: `fsuid`/`fsgid` (the ownership a
+    /// created queue gets, as `mqueue_get_inode` sets `inode->i_uid =
+    /// current_fsuid()`), its supplementary groups, and the two DAC override
+    /// capabilities.
+    ///
+    /// This used to be a bare `uid`/`gid` pair that `open` fed to
+    /// `Accessor::new`, whose convenience derivation reads `dac_override:
+    /// uid == 0`. That made this the last production DAC decision in the
+    /// tree taking its privilege from a uid rather than from a capability
+    /// set — a uid-0 task that dropped CAP_DAC_OVERRIDE still opened every
+    /// queue in the namespace, one granted the capability still could not,
+    /// and because `Accessor::new` leaves `groups` empty, a caller in the
+    /// queue's group was denied the group bits entirely.
+    pub accessor: Accessor,
     pub attr: Option<MqueueAttr>,
     /// The creating namespace's `/proc/sys/fs/mqueue/*` values.
     pub limits: MqueueLimits,
@@ -463,8 +484,7 @@ pub fn open(
         flags,
         mode,
         umask,
-        uid,
-        gid,
+        accessor,
         attr,
         limits,
         privileged,
@@ -485,7 +505,7 @@ pub fn open(
                     // A message queue is a file, never a directory.
                     is_dir: false,
                 },
-                &Accessor::new(uid, gid),
+                &accessor,
                 want,
             ) {
                 return Err(MqueueError::PermissionDenied);
@@ -517,7 +537,15 @@ pub fn open(
             });
             let attr = validate_attr(attr, limits, privileged)?;
             let inode = registry.alloc_id();
-            let queue = Arc::new(Queue::new(inode, uid, gid, mode & !umask & 0o777, attr));
+            // `mqueue_get_inode`: `inode->i_uid = current_fsuid(); inode->i_gid
+            // = current_fsgid();` — the accessor carries both.
+            let queue = Arc::new(Queue::new(
+                inode,
+                accessor.uid,
+                accessor.gid,
+                mode & !umask & 0o777,
+                attr,
+            ));
             registry.names.insert(key, queue.clone());
             queue
         };
@@ -525,18 +553,57 @@ pub fn open(
     })
 }
 
+/// The ids a queue was created with, for the caller's `CAP_FOWNER` test.
+/// `None` if the name does not exist.
+pub fn owners_of(namespace: u64, name: &str) -> Option<(u32, u32)> {
+    let name = normalize_name(name).ok()?;
+    with_registry(|registry| {
+        registry
+            .names
+            .get(&(namespace, name.to_string()))
+            .map(|queue| (queue.owner, queue.group))
+    })
+}
+
 /// Remove a queue name. Existing descriptors retain the queue object until
 /// their final `Arc` is dropped, matching Linux inode lifetime.
-pub fn unlink(namespace: u64, name: &str, uid: u32) -> Result<(), MqueueError> {
+///
+/// `do_mq_unlink` is an ordinary `vfs_unlink` against the mqueuefs root,
+/// which `mqueue_fill_super` creates as `S_IFDIR | S_ISVTX | S_IRWXUGO` —
+/// 01777, the same mode as `/tmp`. Everyone therefore passes the write-and-
+/// execute check on the directory, and `fs/namei.c::__check_sticky` is what
+/// actually decides:
+///
+/// ```text
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), fsuid)) return 0;
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, dir), fsuid)) return 0;
+/// return !capable_wrt_inode_uidgid(idmap, inode, CAP_FOWNER);
+/// ```
+///
+/// Three ways through, and the old `uid != 0 && uid != queue.owner` was two
+/// of them: the queue's owner, and — because the mqueuefs root is owned by
+/// whoever created the IPC namespace, uid 0 for the initial one — the
+/// directory's owner, spelled as a literal. `fowner` is the third, and it is
+/// the one that was missing: a task holding CAP_FOWNER over the queue may
+/// remove it, exactly as it may remove another user's file from `/tmp`.
+///
+/// `fsuid` is the filesystem uid, not the real one, which is what
+/// `current_fsuid()` means and what a `setfsuid`-ing file server depends on.
+pub fn unlink(
+    namespace: u64,
+    name: &str,
+    fsuid: u32,
+    dir_uid: u32,
+    fowner: bool,
+) -> Result<(), MqueueError> {
     let name = normalize_name(name)?;
     with_registry(|registry| {
         let key = (namespace, name.to_string());
         let Some(queue) = registry.names.get(&key) else {
             return Err(MqueueError::NotFound);
         };
-        // mqueuefs root is sticky: only root or the queue owner may unlink.
-        if uid != 0 && uid != queue.owner {
-            return Err(MqueueError::PermissionDenied);
+        if fsuid != queue.owner && fsuid != dir_uid && !fowner {
+            return Err(MqueueError::OperationNotPermitted);
         }
         registry.names.remove(&key);
         Ok(())
@@ -747,8 +814,9 @@ impl DirOps for MqueueDir {
                     flags: O_CREAT | O_RDWR,
                     mode: 0o666,
                     umask: 0o022,
-                    uid: 0,
-                    gid: 0,
+                    // A create through the mounted filesystem has no syscall
+                    // context: root, no groups, no DAC override.
+                    accessor: Accessor::new(0, 0),
                     attr: None,
                     // A create through the mounted filesystem has no syscall
                     // context to read the namespace's limits or the caller's
@@ -761,6 +829,7 @@ impl DirOps for MqueueDir {
                 MqueueError::Exists => FsError::Busy,
                 MqueueError::NoSpace => FsError::NoSpace,
                 MqueueError::PermissionDenied => FsError::PermissionDenied,
+                MqueueError::OperationNotPermitted => FsError::OperationNotPermitted,
                 _ => FsError::InvalidData,
             })
         })
