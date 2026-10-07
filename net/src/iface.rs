@@ -593,6 +593,29 @@ fn record_rx_nohandler(name: &str) {
     });
 }
 
+/// Record `n` inbound frames dropped in software — the driver received them but
+/// could not hand them to the stack (the driver→stack ring was full, or a
+/// replacement RX buffer could not be allocated). Mirrors Linux `rx_dropped`.
+/// Called by NIC drivers at their silent-drop sites so loss is observable.
+pub fn note_rx_drop(name: &str, n: u64) {
+    with_stats_mut(name, |stats| {
+        stats.rx_drop = stats.rx_drop.saturating_add(n);
+    });
+}
+
+/// Record `n` frames lost to a hardware receive-FIFO overrun — the device ran
+/// out of posted descriptors and dropped frames before the driver could
+/// service them. Mirrors Linux `rx_over_errors` + `rx_fifo_errors` (and counts
+/// toward `rx_errors`). Drivers report this from their overrun ISR cause or the
+/// device's missed-packets statistics register.
+pub fn note_rx_overrun(name: &str, n: u64) {
+    with_stats_mut(name, |stats| {
+        stats.rx_over_errors = stats.rx_over_errors.saturating_add(n);
+        stats.rx_fifo = stats.rx_fifo.saturating_add(n);
+        stats.rx_errs = stats.rx_errs.saturating_add(n);
+    });
+}
+
 /// Send a complete Ethernet frame out the interface named `iface_name`.
 /// Returns `Err` if no such iface is registered or the driver failed.
 ///

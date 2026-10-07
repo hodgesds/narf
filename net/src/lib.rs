@@ -147,10 +147,16 @@ use narf_lib::sync::IrqSafeSpinLock;
 // virtio-net's typical default split. `pub const` so tests and the
 // Stage-4 virtio binding can refer to the same number.
 
-/// RX ring depth (inbound frames from interface to consumer).
-pub const RX_RING_N: usize = 64;
-/// TX ring depth (outbound frames from consumer to interface).
-pub const TX_RING_N: usize = 64;
+/// RX ring depth (inbound frames from interface to consumer). Deep enough to
+/// absorb a 10G+ burst between NAPI poll rounds without the driver→stack
+/// handoff becoming the drop point (a 64-deep ring overflowed under any
+/// sustained RX). The ring is heap-constructed (see `narf_ipc::channel`), so a
+/// deep ring costs only ~48 KB of heap per interface, not stack. Must stay a
+/// power of two.
+pub const RX_RING_N: usize = 1024;
+/// TX ring depth (outbound frames from consumer to interface). Matched to
+/// [`RX_RING_N`] so a bursty sender isn't throttled by a shallow TX ring.
+pub const TX_RING_N: usize = 1024;
 
 // ── Frame ───────────────────────────────────────────────────────────
 
