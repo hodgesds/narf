@@ -232,6 +232,7 @@ pub fn driver_name(index: u32) -> Option<&'static str> {
     // other names do not have a private render UAPI yet.
     match g.cards.get(index as usize).map(|entry| entry.card.driver()) {
         Some("virtio_gpu") => Some("virtio_gpu"),
+        Some("amdgpu") => Some("amdgpu"),
         _ => None,
     }
 }

@@ -560,6 +560,9 @@ pub struct GcInfo {
     pub sqc_inst_cache_size: u32,
     pub sqc_data_cache_size: u32,
     pub gl1c_size_per_instance: u32,
+    /// `gc_gl1c_per_sa`. `DEV_INFO`'s `gl1c_cache_size` is the product of
+    /// this and `gl1c_size_per_instance`, so both are needed.
+    pub gl1c_per_sa: u32,
     pub gl2c_per_gpu: u32,
 }
 
@@ -651,7 +654,7 @@ pub fn parse_gc_info(blob: &[u8]) -> Result<GcInfo, DiscoveryError> {
             info.num_sqc_per_wgp = f(24);
             info.sqc_inst_cache_size = f(25);
             info.sqc_data_cache_size = f(26);
-            // f(27) = gc_gl1c_per_sa.
+            info.gl1c_per_sa = f(27);
             info.gl1c_size_per_instance = f(28);
             info.gl2c_per_gpu = f(29);
         }

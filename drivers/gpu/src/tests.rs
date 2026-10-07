@@ -6907,3 +6907,213 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/discovery",
     smoke_amdgpu_gc_info_reports_the_tables_topology
 );
+
+/// `AMDGPU_INFO` reports the device Mesa will actually compile for.
+///
+/// An "it returned success" test would be worthless here. `libdrm_amdgpu`'s
+/// `amdgpu_device_initialize` runs DEV_INFO and MEMORY before it will hand
+/// Mesa a device, and radeonsi reads the CU count, wave size and cache
+/// geometry out of DEV_INFO to make shader-compilation decisions — so what
+/// matters is the VALUES, and that they came from the GC table rather than
+/// from a guess. The replies are decoded back through the mirrored structs,
+/// whose layout is pinned against the C header separately.
+fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
+    use crate::amdgpu::Family;
+    use crate::amdgpu_discovery::{GcInfo, IpBlock, HW_ID_GC, HW_ID_SDMA0, MAX_BASE_ADDRS};
+    use crate::amdgpu_info::{query_against, Snapshot};
+    use crate::amdgpu_uapi as u;
+    use narf_filesystem::FsError;
+
+    fn ip(hw_id: u16, major: u8, minor: u8, revision: u8) -> IpBlock {
+        IpBlock {
+            hw_id,
+            instance: 0,
+            major,
+            minor,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: [0; MAX_BASE_ADDRS],
+            num_bases: 1,
+        }
+    }
+
+    // A Radeon 780M as the GC table describes it: 1 SE, 2 SA, 6 CU per SA.
+    let gc = GcInfo {
+        version_major: 1,
+        version_minor: 2,
+        num_se: 1,
+        num_sa_per_se: 2,
+        num_cu_per_sa: 6,
+        num_rb_per_se: 2,
+        num_tccs: 4,
+        num_gprs: 1024,
+        wave_size: 32,
+        lds_size: 65536,
+        gs_table_depth: 32,
+        gsprim_buff_depth: 1792,
+        num_max_gs_thds: 32,
+        double_offchip_lds_buffer: 1024,
+        tcp_l1_size: 16384,
+        num_sqc_per_wgp: 2,
+        sqc_inst_cache_size: 32768,
+        sqc_data_cache_size: 16384,
+        gl1c_size_per_instance: 131072,
+        gl1c_per_sa: 2,
+        gl2c_per_gpu: 4194304,
+        ..GcInfo::default()
+    };
+    let snap = Snapshot {
+        did: 0x15BF,
+        family: Family::Phoenix,
+        vram_size: 512 * 1024 * 1024,
+        gc: Some(gc),
+        ip_blocks: alloc::vec![ip(HW_ID_GC, 11, 0, 1), ip(HW_ID_SDMA0, 6, 0, 1)],
+    };
+
+    let decode = |bytes: &[u8]| -> u::DrmAmdgpuInfoDevice {
+        let mut d = u::DrmAmdgpuInfoDevice::default();
+        let n = core::mem::size_of::<u::DrmAmdgpuInfoDevice>().min(bytes.len());
+        // SAFETY: writing `n` bytes into a `#[repr(C)]` plain-data struct of
+        // at least `n` bytes; both sides are byte-addressable POD.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                &mut d as *mut u::DrmAmdgpuInfoDevice as *mut u8,
+                n,
+            );
+        }
+        d
+    };
+
+    let bytes = match query_against(&snap, u::AMDGPU_INFO_DEV_INFO, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("DEV_INFO was refused for a fully described device"),
+    };
+    if bytes.len() != core::mem::size_of::<u::DrmAmdgpuInfoDevice>() {
+        return TestResult::Fail("DEV_INFO reply is not the size of its struct");
+    }
+    let d = decode(&bytes);
+    if d.device_id != 0x15BF {
+        return TestResult::Fail("DEV_INFO did not report the PCI device id");
+    }
+    // Mesa keys ASIC behaviour off this; GFX 11.0.1 is family 148.
+    if d.family != u::AMDGPU_FAMILY_GC_11_0_1 {
+        return TestResult::Fail("Phoenix must report AMDGPU_FAMILY_GC_11_0_1");
+    }
+    if d.num_shader_engines != 1 || d.num_shader_arrays_per_engine != 2 {
+        return TestResult::Fail("shader geometry did not come from the GC table");
+    }
+    if d.num_cu_per_sh != 6 || d.cu_active_number != 12 {
+        return TestResult::Fail("CU counts are not the GC table's");
+    }
+    // Wave32 vs wave64 changes the shaders Mesa emits.
+    if d.wave_front_size != 32 {
+        return TestResult::Fail("wave_front_size must be the GC table's wave size");
+    }
+    if d.num_tcc_blocks != 4 || d.num_rb_pipes != 2 {
+        return TestResult::Fail("L2 slice / RB pipe counts are wrong");
+    }
+    // `gl1c_cache_size` is a PRODUCT in Linux, not a field copy:
+    // gc_gl1c_size_per_instance * gc_gl1c_per_sa = 131072 * 2.
+    if d.gl1c_cache_size != 262144 {
+        return TestResult::Fail("gl1c_cache_size must be size-per-instance times per-SA count");
+    }
+    if d.gl2c_cache_size != 4194304 || d.tcp_cache_size != 16384 {
+        return TestResult::Fail("cache geometry did not reach DEV_INFO");
+    }
+    // An APU, and nothing else claimed: PREEMPTION / TMZ / GANG_SUBMIT are
+    // submission-path capabilities and there is no submission path.
+    if d.ids_flags != u64::from(u::AMDGPU_IDS_FLAGS_FUSION) {
+        return TestResult::Fail("ids_flags should claim FUSION and nothing more");
+    }
+    if d.gart_page_size != 4096 || d.virtual_address_alignment != 4096 {
+        return TestResult::Fail("page size / VA alignment should be 4 KiB");
+    }
+
+    // ACCEL_WORKING is FALSE, and deliberately so: with no AMDGPU_CS, Mesa
+    // must decline the device at init rather than fail at first draw.
+    match query_against(&snap, u::AMDGPU_INFO_ACCEL_WORKING, [0; 4]) {
+        Ok(b) if b.len() == 4 && u32::from_le_bytes(b[..4].try_into().unwrap()) == 0 => {}
+        _ => return TestResult::Fail("ACCEL_WORKING must report false while there is no CS path"),
+    }
+
+    // MEMORY: three heaps. VRAM twice (the aperture is CPU-visible), GTT
+    // zero because no system-memory heap manager exists.
+    let mem = match query_against(&snap, u::AMDGPU_INFO_MEMORY, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("MEMORY was refused"),
+    };
+    if mem.len() != 96 {
+        return TestResult::Fail("MEMORY should be three 32-byte heap_info structs");
+    }
+    let total = u64::from_le_bytes(mem[0..8].try_into().unwrap());
+    let max_alloc = u64::from_le_bytes(mem[24..32].try_into().unwrap());
+    let gtt_total = u64::from_le_bytes(mem[64..72].try_into().unwrap());
+    if total != 512 * 1024 * 1024 {
+        return TestResult::Fail("VRAM heap total is not the probed aperture");
+    }
+    if max_alloc != total / 4 * 3 {
+        return TestResult::Fail("max_allocation should be three quarters of the heap");
+    }
+    if gtt_total != 0 {
+        return TestResult::Fail("GTT must report zero while no GART manager exists");
+    }
+
+    // HW_IP_INFO carries the discovered IP version and a ZERO ring mask —
+    // "present, unusable" rather than an error, which is how Linux reports
+    // an IP whose ring has not come up.
+    let hw = match query_against(
+        &snap,
+        u::AMDGPU_INFO_HW_IP_INFO,
+        [u::AMDGPU_HW_IP_GFX, 0, 0, 0],
+    ) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("HW_IP_INFO(GFX) was refused"),
+    };
+    if u32::from_le_bytes(hw[0..4].try_into().unwrap()) != 11
+        || u32::from_le_bytes(hw[4..8].try_into().unwrap()) != 0
+    {
+        return TestResult::Fail("HW_IP_INFO should report the discovered GC version");
+    }
+    if u32::from_le_bytes(hw[24..28].try_into().unwrap()) != 0 {
+        return TestResult::Fail("available_rings must be zero: no ring has been brought up");
+    }
+
+    // A device whose GC table was absent or corrupt cannot answer DEV_INFO.
+    // Refusing is the point — a zeroed topology would mis-compile shaders.
+    let blind = Snapshot {
+        gc: None,
+        ..snap.clone()
+    };
+    if !matches!(
+        query_against(&blind, u::AMDGPU_INFO_DEV_INFO, [0; 4]),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("DEV_INFO must be refused when the shader topology is unknown");
+    }
+    // MEMORY does not depend on the GC table and must still answer.
+    if query_against(&blind, u::AMDGPU_INFO_MEMORY, [0; 4]).is_err() {
+        return TestResult::Fail("MEMORY should not depend on the GC table");
+    }
+
+    // Silicon with no bring-up has no family id to report, so DEV_INFO is
+    // refused rather than answered with a family whose Mesa path is untried.
+    let unknown = Snapshot {
+        family: Family::Navi2,
+        ..snap.clone()
+    };
+    if query_against(&unknown, u::AMDGPU_INFO_DEV_INFO, [0; 4]).is_ok() {
+        return TestResult::Fail("an unaudited family should not be given a family id");
+    }
+
+    // An unknown query is EINVAL, as `amdgpu_info_ioctl`'s default arm is.
+    if !matches!(
+        query_against(&snap, 0xDEAD, [0; 4]),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("an unknown INFO query should be EINVAL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_info_reports_the_sourced_device);

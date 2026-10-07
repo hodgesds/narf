@@ -385,6 +385,16 @@ impl FileOps for DriCardFile {
                 result => return result,
             }
         }
+        // The amdgpu private UAPI is answered on the card node too: a client
+        // that opened card0 rather than renderD128 asks `AMDGPU_INFO` there,
+        // and Linux serves it from both (the INFO ioctl carries neither
+        // DRM_AUTH nor DRM_MASTER in amdgpu's table).
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            match crate::amdgpu_info::dispatch(cmd, arg) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+        }
         crate::drm_ioctl_bridge::dispatch_card_for_file(
             self.index,
             self.open_id,
@@ -806,6 +816,17 @@ impl FileOps for DriRenderFile {
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
             match crate::drm_ioctl_bridge::dispatch_virtgpu_render(cmd, arg, &self.virtgpu) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+        }
+        // The amdgpu private UAPI, on the render node. `AMDGPU_INFO` is what
+        // `libdrm_amdgpu`'s `amdgpu_device_initialize` calls first, and it
+        // calls it on whichever node it opened — Mesa uses the render node.
+        // Unimplemented commands return `Unsupported` and fall through to the
+        // generic DRM path, as the virtio-gpu dispatcher above does.
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            match crate::amdgpu_info::dispatch(cmd, arg) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }

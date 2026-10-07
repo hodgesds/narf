@@ -154,6 +154,7 @@ pub mod amdgpu_gmc;
 pub mod amdgpu_hdmi_audio;
 pub mod amdgpu_hpd;
 pub mod amdgpu_ih;
+pub mod amdgpu_info;
 pub mod amdgpu_mes;
 pub mod amdgpu_modeset;
 pub mod amdgpu_mst;
