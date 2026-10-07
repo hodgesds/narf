@@ -590,14 +590,24 @@ pub async fn try_bind_btusb_already_addressed(
 
     // Keep one interrupt-IN Event transfer outstanding across the whole
     // mandatory command sequence. Every successful poll re-arms it.
-    xhci_dev
-        .arm_interrupt_in(slot_id, event_dci, eps.event_in.max_packet.min(257) as u32)
-        .map_err(|_| BtUsbError::CommandTransfer)?;
+    if let Err(error) =
+        xhci_dev.arm_interrupt_in(slot_id, event_dci, eps.event_in.max_packet.min(257) as u32)
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  btusb: slot={} cannot arm event DCI {}: {:?}",
+            slot_id,
+            event_dci,
+            error
+        );
+        return Err(BtUsbError::CommandTransfer);
+    }
 
     // HCI_Reset (§7.3.2) — no parameters, no return params beyond
     // status. After this the controller is in a defined post-reset
     // state and discards any in-flight ACL / SCO traffic.
-    let _ = send_command_and_await_complete(
+    if let Err(error) = send_command_and_await_complete(
         xhci_dev,
         slot_id,
         eps.interface,
@@ -605,7 +615,17 @@ pub async fn try_bind_btusb_already_addressed(
         op::HCI_RESET,
         &[],
     )
-    .await?;
+    .await
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "  btusb: slot={} HCI Reset failed: {:?}",
+            slot_id,
+            error
+        );
+        return Err(error);
+    }
 
     // HCI_Read_Local_Version_Information (§7.4.1) — returns
     // Status (1) + HCI_Version (1) + HCI_Revision (2) +

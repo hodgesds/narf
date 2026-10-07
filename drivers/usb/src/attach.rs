@@ -633,24 +633,26 @@ async fn dispatch_after_address(
         {
             return AttachOutcome::WbdiFingerprint;
         }
-    }
 
-    // USB class-driver registry — VID/PID match for drivers that
-    // registered at Stage::Subsys (e.g. rtl8xxxu USB-WiFi dongles).
-    // Runs after every built-in class probe so a RTL8188EU dongle
-    // that looks like a CDC-ACM or vendor-class device doesn't get
-    // misclassified. Linux analogue: `usb_probe_device` walking the
-    // bus's driver list in `drivers/usb/core/driver.c` (~L310).
-    if let Some(c) = xhci::controller() {
-        use alloc::sync::Arc;
-        // Wrap the slot in a USBDevice with the VID/PID we already
-        // fetched so dispatch_probe can read vendor/product IDs
-        // without a second GET_DESCRIPTOR round-trip.
-        let mut dev = crate::device::USBDevice::new(c, slot_id, port, speed);
-        dev.set_ids(dev_vid, dev_pid);
-        let dev = Arc::new(dev);
-        if crate::class_registry::dispatch_probe(dev) {
-            return AttachOutcome::UsbClassDriver;
+        // USB class-driver registry — VID/PID or interface-class
+        // match for drivers registered at Stage::Subsys (e.g.
+        // rtl8xxxu USB-WiFi dongles). Run it after every built-in
+        // class probe so a broad registered match cannot steal a
+        // device that has a dedicated binder. Passing the full
+        // configuration descriptor is load-bearing: class-only
+        // matches must inspect interface triples, not treat an
+        // unknown 0000:0000 VID/PID as a wildcard for every device.
+        if let Some(c) = xhci::controller() {
+            use alloc::sync::Arc;
+            // Wrap the slot in a USBDevice with the VID/PID we already
+            // fetched so dispatch_probe can read vendor/product IDs
+            // without a second GET_DESCRIPTOR round-trip.
+            let mut dev = crate::device::USBDevice::new(c, slot_id, port, speed);
+            dev.set_ids(dev_vid, dev_pid);
+            let dev = Arc::new(dev);
+            if crate::class_registry::dispatch_probe(dev, &cfg_blob) {
+                return AttachOutcome::UsbClassDriver;
+            }
         }
     }
 
