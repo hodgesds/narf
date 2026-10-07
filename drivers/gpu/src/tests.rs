@@ -7117,3 +7117,281 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_info_reports_the_sourced_device);
+
+/// The amdgpu GEM lifecycle, and the isolation that makes per-open handles
+/// worth having.
+///
+/// `GEM_CREATE` → `GEM_MMAP` → resolve the offset to frames → `GEM_OP` reads
+/// the creation parameters back → `GEM_CLOSE`. Plus the validations Linux runs
+/// before allocating anything, which are the part a client can reach with
+/// hostile input.
+fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
+    use crate::amdgpu_gem::{dispatch, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::{ioc_nr, DRM_COMMAND_BASE};
+    use narf_filesystem::FsError;
+
+    // The dispatcher reads only the command number out of the ioctl word, and
+    // `ioc_nr` takes it from the low bits — so a bare nr is a valid command
+    // word here. On the test path the arg pointer is kernel-owned, which
+    // `copy_in`/`copy_out` tolerate.
+    let gem_cmd = |n: u32| DRM_COMMAND_BASE + n;
+    let close_cmd = 0x09u32;
+    // Guard the assumption the helper rests on.
+    if ioc_nr(gem_cmd(u::DRM_AMDGPU_GEM_CREATE)) != DRM_COMMAND_BASE {
+        return TestResult::Fail("test helper does not encode the ioctl nr the dispatcher reads");
+    }
+
+    let state = GemState::new();
+
+    // ── create ──
+    let mut req = [0u8; 32];
+    req[0..8].copy_from_slice(&8192u64.to_le_bytes()); // bo_size
+    req[8..16].copy_from_slice(&4096u64.to_le_bytes()); // alignment
+    req[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_VRAM as u64).to_le_bytes());
+    req[24..32].copy_from_slice(&(u::AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED as u64).to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_CREATE),
+        req.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_CREATE of an 8 KiB VRAM buffer failed");
+    }
+    let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
+    // Handles come from a high base so they cannot alias a dumb-buffer handle.
+    if handle < 0x4000_0000 {
+        return TestResult::Fail("a GEM handle must not fall in the dumb-handle space");
+    }
+
+    // ── mmap offset, and that it resolves to real distinct frames ──
+    let mut m = [0u8; 16];
+    m[0..4].copy_from_slice(&handle.to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_MMAP),
+        m.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_MMAP of a live handle failed");
+    }
+    let offset = u64::from_le_bytes(m[8..16].try_into().unwrap());
+    let frames = match state.mmap_frames(offset, 8192) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("the GEM_MMAP offset did not resolve to frames"),
+    };
+    if frames.len() != 2 {
+        return TestResult::Fail("8 KiB should resolve to two 4 KiB frames");
+    }
+    if frames[1] != frames[0] + 4096 {
+        return TestResult::Fail("the allocation should be physically contiguous");
+    }
+    if frames[0] == 0 || frames[0] % 4096 != 0 {
+        return TestResult::Fail("frame address is not a plausible page-aligned physical page");
+    }
+    // Zeroed before userspace sees it: these pages came from the kernel's own
+    // allocator and could hold anything.
+    // SAFETY: the frames were just allocated for this object and are
+    // kernel-mapped; reading 8192 bytes stays inside them.
+    let leaked = unsafe {
+        core::slice::from_raw_parts(
+            narf_memory::PhysAddr::new(frames[0]).kernel_ptr::<u8>(),
+            8192,
+        )
+    }
+    .iter()
+    .any(|b| *b != 0);
+    if leaked {
+        return TestResult::Fail("a GEM buffer handed to userspace was not zeroed");
+    }
+    // A longer map than the object must be refused, or a client reads past it.
+    if state.mmap_frames(offset, 8192 + 4096).is_ok() {
+        return TestResult::Fail("mapping more than the object's size was allowed");
+    }
+
+    // ── GEM_OP reports back what was asked for, not what we did ──
+    let mut info = [0u8; 32];
+    let mut opreq = [0u8; 24];
+    opreq[0..4].copy_from_slice(&handle.to_le_bytes());
+    opreq[4..8].copy_from_slice(&u::AMDGPU_GEM_OP_GET_GEM_CREATE_INFO.to_le_bytes());
+    opreq[8..16].copy_from_slice(&(info.as_mut_ptr() as u64).to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_OP),
+        opreq.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_OP GET_GEM_CREATE_INFO failed");
+    }
+    if u64::from_le_bytes(info[0..8].try_into().unwrap()) != 8192 {
+        return TestResult::Fail("GEM_OP did not report the page-rounded size");
+    }
+    if u64::from_le_bytes(info[16..24].try_into().unwrap()) != u::AMDGPU_GEM_DOMAIN_VRAM as u64 {
+        return TestResult::Fail("GEM_OP must report the domain the client asked for");
+    }
+
+    // SET_PLACEMENT needs a migration path there isn't one of, and must be
+    // refused rather than accepted-and-ignored.
+    let mut setp = [0u8; 24];
+    setp[0..4].copy_from_slice(&handle.to_le_bytes());
+    setp[4..8].copy_from_slice(&u::AMDGPU_GEM_OP_SET_PLACEMENT.to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_OP),
+        setp.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("SET_PLACEMENT should be refused while nothing can migrate");
+    }
+
+    // ── isolation: a second open's table does not see this handle ──
+    let other = GemState::new();
+    if other.owns(handle) {
+        return TestResult::Fail("a handle leaked across opens");
+    }
+    let mut m2 = [0u8; 16];
+    m2[0..4].copy_from_slice(&handle.to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_MMAP),
+        m2.as_mut_ptr() as usize,
+        &other,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("another open could mmap a handle it does not hold");
+    }
+    if other.mmap_frames(offset, 4096).is_ok() {
+        return TestResult::Fail("another open could resolve a foreign GEM offset to frames");
+    }
+
+    // ── GEM_CLOSE belongs to the owning table only ──
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    // The foreign table must decline it, so the generic dumb path still gets
+    // its chance at a handle that is not ours.
+    if !matches!(
+        dispatch(close_cmd, c.as_mut_ptr() as usize, &other),
+        Err(FsError::Unsupported)
+    ) {
+        return TestResult::Fail("GEM_CLOSE of a foreign handle should fall through, not fail");
+    }
+    if dispatch(close_cmd, c.as_mut_ptr() as usize, &state).is_err() {
+        return TestResult::Fail("GEM_CLOSE of our own handle failed");
+    }
+    if state.owns(handle) {
+        return TestResult::Fail("the handle survived GEM_CLOSE");
+    }
+    // A low handle is a dumb handle: fall through rather than claiming it.
+    let mut low = [0u8; 8];
+    low[0..4].copy_from_slice(&3u32.to_le_bytes());
+    if !matches!(
+        dispatch(close_cmd, low.as_mut_ptr() as usize, &state),
+        Err(FsError::Unsupported)
+    ) {
+        return TestResult::Fail("a dumb-buffer handle must fall through to the generic path");
+    }
+
+    // ── the validations, each reachable from userspace ──
+    let create = |size: u64, domains: u64, flags: u64| {
+        let mut r = [0u8; 32];
+        r[0..8].copy_from_slice(&size.to_le_bytes());
+        r[16..24].copy_from_slice(&domains.to_le_bytes());
+        r[24..32].copy_from_slice(&flags.to_le_bytes());
+        dispatch(
+            gem_cmd(u::DRM_AMDGPU_GEM_CREATE),
+            r.as_mut_ptr() as usize,
+            &state,
+        )
+    };
+    // An undefined create flag is EINVAL: accepting one would let a client
+    // believe it got a property it did not.
+    if create(4096, u::AMDGPU_GEM_DOMAIN_GTT as u64, 1 << 31).is_ok() {
+        return TestResult::Fail("an unsettable create flag was accepted");
+    }
+    // VRAM_CONTIGUOUS looks settable and is not — the kernel sets it.
+    if create(
+        4096,
+        u::AMDGPU_GEM_DOMAIN_GTT as u64,
+        u::AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS as u64,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("VRAM_CONTIGUOUS is not in SETTABLE_MASK");
+    }
+    // Encryption cannot be honoured without TMZ, and a client that asked for
+    // a secure buffer must not be given a plain one.
+    if create(
+        4096,
+        u::AMDGPU_GEM_DOMAIN_GTT as u64,
+        u::AMDGPU_GEM_CREATE_ENCRYPTED as u64,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("ENCRYPTED should be refused with no TMZ engine");
+    }
+    if create(4096, 0x8000, 0).is_ok() {
+        return TestResult::Fail("a domain outside AMDGPU_GEM_DOMAIN_MASK was accepted");
+    }
+    // The special domains are exclusive: never two at once, never mixed with
+    // CPU/GTT/VRAM (`amdgpu_gem_are_domains_valid`).
+    if create(
+        4096,
+        (u::AMDGPU_GEM_DOMAIN_GDS | u::AMDGPU_GEM_DOMAIN_GWS) as u64,
+        0,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("two special domains at once should be invalid");
+    }
+    if create(
+        4096,
+        (u::AMDGPU_GEM_DOMAIN_GDS | u::AMDGPU_GEM_DOMAIN_VRAM) as u64,
+        0,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("a special domain mixed with VRAM should be invalid");
+    }
+    if create(0, u::AMDGPU_GEM_DOMAIN_GTT as u64, 0).is_ok() {
+        return TestResult::Fail("a zero-sized buffer should be refused");
+    }
+
+    // A live GTT buffer, closed, so the test leaves no allocation behind.
+    let mut keep = [0u8; 32];
+    keep[0..8].copy_from_slice(&4096u64.to_le_bytes());
+    keep[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_CREATE),
+        keep.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_CREATE in the GTT domain failed");
+    }
+    let h2 = u32::from_le_bytes(keep[0..4].try_into().unwrap());
+    // WAIT_IDLE reports idle: nothing can be busy without a submission path.
+    let mut w = [0u8; 16];
+    w[0..4].copy_from_slice(&h2.to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_WAIT_IDLE),
+        w.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_WAIT_IDLE failed on a live handle");
+    }
+    let mut c2 = [0u8; 8];
+    c2[0..4].copy_from_slice(&h2.to_le_bytes());
+    let _ = dispatch(close_cmd, c2.as_mut_ptr() as usize, &state);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_gem_lifecycle_and_handle_isolation
+);

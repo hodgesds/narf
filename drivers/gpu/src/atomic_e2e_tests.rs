@@ -1267,16 +1267,32 @@ kernel_test_in!(
 // Linux ref: drm_atomic_uapi.c "Explicit Fencing Properties";
 // vkms's simulated-vblank hrtimer pacing.
 // ════════════════════════════════════════════════════════════════════════════
+/// Builds its own card rather than borrowing card 0's.
+///
+/// This used to read `drm_registry::mode_state(0)` and skip when it was
+/// absent, which made it pass or skip according to link order: the
+/// `drivers/gpu/e2e` registry tests call `__reset_for_test()` at both ends, so
+/// after any of them has run the registry is empty and card 0 has no mode
+/// state. Whether this test ran before or after one of those depended on the
+/// order the linker happened to emit the test section in, which shifts
+/// whenever an unrelated file changes size. It was silently skipping, which is
+/// worse than failing: the pacing property it exists to prove went unchecked.
+///
+/// Nothing here needs a REGISTERED card — only a `Card` with a CRTC carrying a
+/// mode — so it builds one.
 #[cfg(target_arch = "x86_64")]
 fn smoke_atomic_out_fence_vblank_pacing() -> TestResult {
-    let Some(mode_state) = crate::drm_registry::mode_state(0) else {
-        return TestResult::Skip("no card 0 mode state");
-    };
-    let mut card = mode_state.lock();
+    let mut card = make_card(1);
+    // A CRTC with no mode reports the 60 Hz default; set one explicitly so the
+    // interval under test is the mode's and not a fallback.
+    card.crtcs[0].mode = Some(Mode::FHD_60);
     let Some(crtc_id) = card.crtc_ids().next() else {
-        return TestResult::Skip("card 0 has no CRTCs");
+        return TestResult::Fail("make_card(1) produced no CRTC");
     };
     let refresh_hz = card.crtc_refresh_hz(crtc_id).max(1) as u64;
+    if refresh_hz != u64::from(Mode::FHD_60.refresh_hz) {
+        return TestResult::Fail("the CRTC did not report its mode's refresh rate");
+    }
     let interval_ns = 1_000_000_000u64 / refresh_hz;
     let now = narf_time::wall::monotonic_ns();
     let first = card.advance_vblank(crtc_id);
