@@ -437,3 +437,124 @@ fn smoke_abi_futex_requeue_ignores_bitset() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/futex", smoke_abi_futex_requeue_ignores_bitset);
+
+// ════════════════════════════════════════════════════════════════════
+// PI futexes (`kernel/futex/pi.c`).
+// ════════════════════════════════════════════════════════════════════
+
+const FUTEX_LOCK_PI: u64 = 6;
+const FUTEX_UNLOCK_PI: u64 = 7;
+const FUTEX_TRYLOCK_PI: u64 = 8;
+const FUTEX_LOCK_PI2: u64 = 13;
+const FUTEX_CLOCK_REALTIME: u64 = 256;
+const PI_WAITERS: u32 = 0x8000_0000;
+const PI_OWNER_DIED: u32 = 0x4000_0000;
+
+fn futex_timeout(uaddr: u64, op: u64, timeout: u64) -> Option<i64> {
+    call(
+        Syscall::Futex.raw(),
+        SyscallArgs {
+            arg0: uaddr,
+            arg1: op,
+            arg3: timeout,
+            ..Default::default()
+        },
+    )
+}
+
+/// The PI futex protocol behind every glibc `PTHREAD_PRIO_INHERIT` mutex.
+/// glibc probes for it once with `futex(&zero, FUTEX_UNLOCK_PI)`: ENOSYS
+/// means "no PI", and then every `pthread_mutex_init(PRIO_INHERIT)` fails
+/// ENOTSUP. NARF answered ENOSYS for all PI ops, so PipeWire's data loop
+/// ("can't create loop: Operation not supported") — and with it the whole
+/// session audio stack — never started.
+///
+/// The non-blocking decisions, in `futex_lock_pi_atomic` / `futex_lock_pi` /
+/// `futex_unlock_pi` order; the blocking handoff is the boot's to prove.
+fn smoke_abi_futex_pi_lock_unlock_protocol() -> TestResult {
+    with_setup(|| {
+        let me = call(Syscall::Gettid.raw(), a0(0)).ok_or("gettid")? as u32;
+        let word = core::sync::atomic::AtomicU32::new(0);
+        let p = &word as *const _ as u64;
+        let set = |v: u32| word.store(v, Ordering::SeqCst);
+        let get = || word.load(Ordering::SeqCst);
+        let p_op = |op: u64| futex(p, op | FUTEX_PRIVATE_FLAG, 0, 0);
+
+        // glibc's probe: not the owner of an unowned word → EPERM, not ENOSYS.
+        if p_op(FUTEX_UNLOCK_PI) != Some(EPERM) {
+            return Err("FUTEX_UNLOCK_PI on an unowned word must be EPERM (glibc's PI probe)");
+        }
+        // A free word is taken: it holds the caller's TID.
+        if p_op(FUTEX_LOCK_PI) != Some(0) || get() != me {
+            return Err("FUTEX_LOCK_PI on a free word must take it with the caller's TID");
+        }
+        // Owned by the caller: EDEADLK, for trylock too.
+        if p_op(FUTEX_LOCK_PI) != Some(EDEADLK) || p_op(FUTEX_TRYLOCK_PI) != Some(EDEADLK) {
+            return Err("locking a PI futex the caller owns must be EDEADLK");
+        }
+        // Unlock with nobody parked: the word returns to 0.
+        if p_op(FUTEX_UNLOCK_PI) != Some(0) || get() != 0 {
+            return Err("FUTEX_UNLOCK_PI with no waiters must clear the word");
+        }
+        // OWNER_DIED survives the take.
+        set(PI_OWNER_DIED);
+        if p_op(FUTEX_TRYLOCK_PI) != Some(0) || get() != (PI_OWNER_DIED | me) {
+            return Err("taking a free word must keep FUTEX_OWNER_DIED");
+        }
+        set(0);
+        // An owner TID that names no task: ESRCH.
+        set(0x3fff_fff0);
+        if p_op(FUTEX_LOCK_PI) != Some(ESRCH) || p_op(FUTEX_TRYLOCK_PI) != Some(ESRCH) {
+            return Err("a PI futex owned by a nonexistent TID must be ESRCH");
+        }
+        // Owned by another live task.
+        const OTHER: u64 = 0x7e_0051;
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        crate::handlers::register_task_to_pid(OTHER, OTHER);
+        let held = (|| {
+            set(OTHER as u32);
+            if p_op(FUTEX_TRYLOCK_PI) != Some(EAGAIN) || get() != OTHER as u32 {
+                return Err("TRYLOCK_PI on a held lock must be EWOULDBLOCK and leave the word");
+            }
+            if p_op(FUTEX_UNLOCK_PI) != Some(EPERM) {
+                return Err("unlocking a lock another task holds must be EPERM");
+            }
+            // An absolute deadline already past: the locker flags itself as
+            // a waiter, then times out.
+            let zero = [0u64; 2];
+            if futex_timeout(p, FUTEX_LOCK_PI2 | FUTEX_PRIVATE_FLAG, zero.as_ptr() as u64)
+                != Some(ETIMEDOUT)
+                || get() != (OTHER as u32 | PI_WAITERS)
+            {
+                return Err("LOCK_PI2 past its deadline must set FUTEX_WAITERS and time out");
+            }
+            Ok(())
+        })();
+        crate::handlers::release_reaped_task(OTHER);
+        held?;
+        // FUTEX_CLOCK_REALTIME is for LOCK_PI2 only.
+        set(0);
+        if futex_timeout(p, FUTEX_LOCK_PI | FUTEX_CLOCK_REALTIME, 0) != Some(ENOSYS) {
+            return Err("FUTEX_LOCK_PI | FUTEX_CLOCK_REALTIME must be ENOSYS");
+        }
+        // With a task parked: taking keeps FUTEX_WAITERS set, and the unlock
+        // hands the word to the waiters (no owner, WAITERS) and wakes one.
+        const T1: u64 = 0x7e_0052;
+        let parked = queue(true, p, MATCH_ANY, T1)?;
+        let r = (|| {
+            if p_op(FUTEX_LOCK_PI) != Some(0) || get() != (me | PI_WAITERS) {
+                return Err("taking a PI futex with a parked waiter must set FUTEX_WAITERS");
+            }
+            if p_op(FUTEX_UNLOCK_PI) != Some(0) || get() != PI_WAITERS {
+                return Err("unlocking with a parked waiter must leave FUTEX_WAITERS, no owner");
+            }
+            if parked.load(Ordering::Acquire) != 1 {
+                return Err("unlocking with a parked waiter must wake it");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_futex_drop_current(true, p, T1);
+        r
+    })
+}
+kernel_test_in!("syscall_abi/futex", smoke_abi_futex_pi_lock_unlock_protocol);

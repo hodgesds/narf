@@ -1,15 +1,24 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// Ops NARF does not implement but that Linux's `do_futex` still
-/// recognises. They are named here only for the two checks that run
+/// The priority-inheritance ops (`kernel/futex/pi.c`). The requeue-PI pair
+/// is still unimplemented and only named for the two checks that run
 /// BEFORE the dispatch switch — which ops carry a `struct timespec *`
 /// (`futex_cmd_has_timeout`) and which may carry `FUTEX_CLOCK_REALTIME`.
 /// Getting those sets wrong changes the errno an unimplemented op
 /// reports, which is what a libc feature probe reads.
 const FUTEX_LOCK_PI: u64 = 6;
+const FUTEX_UNLOCK_PI: u64 = 7;
+const FUTEX_TRYLOCK_PI: u64 = 8;
 const FUTEX_WAIT_REQUEUE_PI: u64 = 11;
 const FUTEX_LOCK_PI2: u64 = 13;
+
+/// The PI futex word (`include/uapi/linux/futex.h`): the owner's TID in the
+/// low 30 bits, plus "a task is blocked in the kernel on this lock" and
+/// "the previous owner died holding it".
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
 /// `kernel/futex/syscalls.c::SYSCALL_DEFINE6(futex)` → `do_futex()`.
 ///
@@ -63,7 +72,9 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
         FUTEX_WAIT | FUTEX_WAIT_BITSET | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_WAIT_REQUEUE_PI
     );
     let deadline = if has_timeout && args.arg3 != 0 {
-        match futex_timeout_deadline(args.arg3, cmd != FUTEX_WAIT, realtime) {
+        // FUTEX_LOCK_PI's deadline is always CLOCK_REALTIME (`do_futex`
+        // sets FLAGS_CLOCKRT for it); FUTEX_LOCK_PI2 follows the flag.
+        match futex_timeout_deadline(args.arg3, cmd != FUTEX_WAIT, realtime || cmd == FUTEX_LOCK_PI) {
             Ok(d) => d,
             Err(errno) => {
                 ctx.set_return(SyscallReturn::ok((-errno) as u64));
@@ -323,11 +334,180 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             };
             ctx.set_return(SyscallReturn::ok(r as u64));
         }
+        FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_TRYLOCK_PI => {
+            futex_lock_pi(ctx, uaddr, key, deadline, op == FUTEX_TRYLOCK_PI)
+        }
+        FUTEX_UNLOCK_PI => futex_unlock_pi(ctx, uaddr, key),
         // `do_futex` falls off the end of its switch with `return -ENOSYS`
-        // — that includes the PI ops NARF does not implement. ENOSYS is
+        // — that includes the requeue-PI ops NARF does not implement. ENOSYS is
         // the word libc probes look for when they decide to fall back to
         // an older op; the bare -1 sentinel reached them as EPERM, which
         // reads as "you are not allowed to lock", not "try another way".
         _ => ctx.set_return(SyscallReturn::ok((-ENOSYS) as u64)),
+    }
+}
+
+/// `kernel/futex/pi.c::futex_lock_pi` (and FUTEX_LOCK_PI2, and with
+/// `trylock` FUTEX_TRYLOCK_PI): take the PI lock at `uaddr`, whose word holds
+/// its owner's TID.
+///
+/// glibc builds every `PTHREAD_PRIO_INHERIT` mutex on these ops, and it
+/// treats any error it does not expect from LOCK_PI as "acquired" — so this
+/// must return 0 only when the caller really owns the lock, and must never
+/// return EINTR (Linux restarts it after a signal). Both fall out of the
+/// RIP-rewind park: a blocked locker parks on the futex key with the
+/// syscall rewound, and re-executes this function from the top when it is
+/// woken — by `futex_unlock_pi`, by a timeout, or by a signal, whose
+/// handler runs first.
+///
+/// Order, as `futex_lock_pi_atomic` + `futex_lock_pi`: EFAULT; EDEADLK when
+/// the caller already owns it; a free word is taken atomically (keeping
+/// OWNER_DIED, and FUTEX_WAITERS while others are parked); ESRCH when the
+/// owner does not exist; EWOULDBLOCK for trylock; otherwise FUTEX_WAITERS is
+/// set and the caller parks until the deadline (ETIMEDOUT).
+///
+/// LINUX-GAP: no priority inheritance proper — a blocked waiter does not
+/// boost the owner's scheduling priority (`rt_mutex_adjust_prio_chain`).
+/// The lock protocol and its errnos are Linux's; only the boost is missing.
+fn futex_lock_pi(
+    ctx: &mut dyn TrapContext,
+    uaddr: u64,
+    key: FutexKey,
+    deadline: Option<u64>,
+    trylock: bool,
+) {
+    let task = current_task_id();
+    let me = (linux_tid_for_task(task) as u32) & FUTEX_TID_MASK;
+    // Each pass either decides, or lost a compare-and-swap to another
+    // writer of the word; the next pass sees the newer value.
+    loop {
+        let Some((gen, uval)) = futex_wait_seqlock_read_key(key, || futex_read_user_word(uaddr))
+        else {
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
+        };
+        let owner = uval & FUTEX_TID_MASK;
+        if owner == me {
+            ctx.set_return(SyscallReturn::ok((-EDEADLK) as u64));
+            return;
+        }
+        if owner == 0 {
+            let mut newval = (uval & FUTEX_OWNER_DIED) | me;
+            if futex_waiter_count_key(key) > 0 {
+                newval |= FUTEX_WAITERS;
+            }
+            // SAFETY: `uaddr` passed `get_futex_key` (aligned, user range).
+            match unsafe { cmpxchg_user_u32(uaddr, uval, newval) } {
+                Ok(prev) if prev == uval => {
+                    ctx.set_return(SyscallReturn::ok(0));
+                    return;
+                }
+                Ok(_) => continue,
+                Err(_) => {
+                    ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                    return;
+                }
+            }
+        }
+        // `attach_to_pi_owner`: a TID that names no task is -ESRCH.
+        if task_of_visible_tid(u64::from(owner)).is_none() {
+            ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
+            return;
+        }
+        if trylock {
+            ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
+            return;
+        }
+        // Make the owner's unlock come to the kernel.
+        let parked_on = uval | FUTEX_WAITERS;
+        if uval & FUTEX_WAITERS == 0 {
+            // SAFETY: as above.
+            match unsafe { cmpxchg_user_u32(uaddr, uval, parked_on) } {
+                Ok(prev) if prev == uval => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                    return;
+                }
+            }
+        }
+        let deadline = deadline.unwrap_or(u64::MAX);
+        if deadline <= narf_scheduler::narf_time::monotonic_ns() {
+            ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
+            return;
+        }
+        let (Some(uctx), Some(hook)) = (
+            crate::user_task::current_user_task(),
+            crate::user_task::yield_hook(),
+        ) else {
+            // No task to park (the in-kernel test harness): the lock is
+            // held by someone else and cannot be waited for here.
+            ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
+            return;
+        };
+        #[cfg(target_arch = "x86_64")]
+        const SYSCALL_INSN_LEN: u64 = 2;
+        #[cfg(target_arch = "aarch64")]
+        const SYSCALL_INSN_LEN: u64 = 4;
+        // Re-execute LOCK_PI when woken: the decision above is re-made
+        // against the word as it is then.
+        ctx.set_rip(ctx.rip().wrapping_sub(SYSCALL_INSN_LEN));
+        // SAFETY: uctx is live for the trap round-trip.
+        unsafe {
+            let uc = &*uctx;
+            uc.futex_park_gen.store(gen, Ordering::Release);
+            // The park loop re-validates the word against this, so an
+            // unlock that rewrote it unparks even if its wake raced ahead.
+            uc.futex_val.store(parked_on, Ordering::Release);
+            futex_park_publish(uc, uaddr, key, FUTEX_BITSET_MATCH_ANY);
+            uc.sleep_deadline_ns.store(deadline, Ordering::Release);
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            if narf_scheduler::stackful::user_own_stack_enabled() {
+                own_stack_block(ctx);
+                return;
+            }
+            hook(uctx);
+        }
+    }
+}
+
+/// `kernel/futex/pi.c::futex_unlock_pi`: release the PI lock at `uaddr`.
+/// EFAULT, then EPERM unless the caller owns it. With tasks parked on it,
+/// the word becomes FUTEX_WAITERS with no owner and one waiter is woken: it
+/// re-executes FUTEX_LOCK_PI and takes the lock, and because the word is
+/// not zero no userspace fast path can take it past the parked waiters.
+/// Otherwise the word returns to 0 (OWNER_DIED goes with the release).
+fn futex_unlock_pi(ctx: &mut dyn TrapContext, uaddr: u64, key: FutexKey) {
+    let task = current_task_id();
+    let me = (linux_tid_for_task(task) as u32) & FUTEX_TID_MASK;
+    loop {
+        let Some(uval) = futex_read_user_word(uaddr) else {
+            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+            return;
+        };
+        if uval & FUTEX_TID_MASK != me {
+            ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
+            return;
+        }
+        let waiting = futex_waiter_count_key(key) > 0;
+        let newval = if waiting { FUTEX_WAITERS } else { 0 };
+        // SAFETY: `uaddr` passed `get_futex_key` (aligned, user range).
+        match unsafe { cmpxchg_user_u32(uaddr, uval, newval) } {
+            Ok(prev) if prev == uval => {}
+            Ok(_) => continue,
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                return;
+            }
+        }
+        // A locker that set FUTEX_WAITERS but has not registered its waker
+        // yet sees the generation move and does not sleep.
+        if uval & FUTEX_WAITERS != 0 || waiting {
+            futex_bump_counter_key(key);
+            futex_wake_waiters_key_bitset(key, 1, FUTEX_BITSET_MATCH_ANY);
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
     }
 }

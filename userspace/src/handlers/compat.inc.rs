@@ -9597,6 +9597,15 @@ fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
     futex_wake_waiters_key(futex_key(0, uaddr), n)
 }
 
+/// How many tasks have a waker registered on `key` — parked on the word.
+pub(crate) fn futex_waiter_count_key(key: FutexKey) -> usize {
+    futex_wait_bucket(key)
+        .values
+        .lock()
+        .get(&key)
+        .map_or(0, |waiters| waiters.len())
+}
+
 pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
     futex_wake_waiters_key_bitset(key, n, FUTEX_BITSET_MATCH_ANY)
 }
