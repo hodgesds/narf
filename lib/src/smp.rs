@@ -158,43 +158,31 @@ pub fn __reset_for_test_scoped() -> TestTopologyReset {
     snap
 }
 
-/// Read CPUID leaf 1 EBX[23:16] for the logical-processor count
+/// Read CPUID leaf 0xB sub-leaf 1 EBX[15:0] for the logical-processor count
 /// reported by the BSP. On QEMU `-smp N -cpu max` this matches `N`;
 /// real hardware with multi-package topologies needs ACPI MADT
-/// (later wave). Returns 1 if CPUID indicates a single-CPU system
-/// (HTT bit clear in EDX:28).
+/// (later wave). Returns 1 when the leaf reports none.
 ///
 /// # Safety
-/// CPUID is always legal at CPL=0; the unsafe boundary is purely
-/// for the inline-asm wrapper.
+/// CPUID is always legal at CPL=0; the unsafe boundary is purely for the
+/// privileged-instruction wrapper.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn count_x86_64_cpus_via_cpuid() -> u32 {
-    use core::arch::asm;
     // CPUID leaf 0xB sub 1 (Core level). EBX[15:0] = logical
     // processors at this level = total LPs in the package on
     // single-package systems. QEMU `-smp N -cpu max` populates
     // this correctly; CPUID leaf 1 EBX[23:16] is *not* reliable
     // under QEMU.
-    let mut a: u32 = 0xB;
-    let b: u64;
-    let mut c: u32 = 1; // sub-leaf
-                        // SAFETY: CPUID is always legal at CPL=0; we preserve rbx.
-    unsafe {
-        asm!(
-            "push rbx",
-            "cpuid",
-            "mov {b:r}, rbx",
-            "pop rbx",
-            inout("eax") a,
-            inout("ecx") c,
-            out("edx") _,
-            b = out(reg) b,
-            options(nostack, preserves_flags),
-        );
-    }
-    let _ = a;
-    let _ = c;
-    let n = (b as u32) & 0xFFFF;
+    // `core::arch`'s intrinsic rather than hand-rolled asm, for the reason
+    // spelled out in `narf_arch::x86_64::cpuid`: EBX is not an allowed
+    // inline-asm operand on x86_64, and the save/copy/restore dance that works
+    // around that silently returns the PRE-CPUID RBX whenever the compiler
+    // allocates RBX for the copy-out register. This sequence had the hazard
+    // twice over — it also claimed `nostack` while pushing.
+    //
+    // SAFETY: CPUID is legal at CPL=0; leaf 0xB is zero-filled when absent.
+    let b = unsafe { core::arch::x86_64::__cpuid_count(0xB, 1) }.ebx;
+    let n = b & 0xFFFF;
     if n == 0 {
         1
     } else {

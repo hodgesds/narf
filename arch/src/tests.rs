@@ -1615,6 +1615,90 @@ fn smoke_xsave_caps_decode() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("arch/xsave", smoke_xsave_caps_decode);
 
+/// `cpuid()` must return CPUID's real EBX.
+///
+/// EBX cannot be an inline-asm operand on x86_64 ("rbx is used internally by
+/// LLVM"), so reading it by hand means saving RBX, running CPUID, copying RBX
+/// out and restoring it — with the compiler choosing the registers. When it
+/// chose RBX for the copy-out destination, the restore overwrote the captured
+/// value and the caller got the pre-CPUID RBX. Allocation-dependent, so it
+/// struck per inlined copy: one call site read 2696 for an XSAVE area while
+/// the next read 2619428248 — a live stack address — in the same function.
+///
+/// The check is a self-consistency one, because the values are per-CPU: the
+/// AVX component's standard-format offset (leaf 0xD, sub-leaf 2, EBX) sits
+/// immediately after the 512-byte legacy region and the 64-byte XSAVE header,
+/// so it is 576 on every CPU that has AVX — and nowhere near a kernel
+/// address. The vendor string's EBX word is checked the same way: it is ASCII
+/// either way ("Genu", "Auth", "VMwa"…), which a garbage read is not.
+#[cfg(target_arch = "x86_64")]
+fn smoke_cpuid_returns_real_ebx() -> TestResult {
+    use crate::x86_64::{cpuid::cpuid, xsave};
+    // SAFETY: CPUID is legal at CPL=0; absent leaves read as zero.
+    let (_, vendor_ebx, _, _) = unsafe { cpuid(0, 0) };
+    if !vendor_ebx
+        .to_le_bytes()
+        .iter()
+        .all(|b| b.is_ascii_graphic() || *b == b' ')
+    {
+        return TestResult::Fail("CPUID leaf 0 EBX is not the vendor string's first word");
+    }
+    if !xsave::caps().avx {
+        return TestResult::Pass;
+    }
+    // SAFETY: as above; sub-leaf 2 is AVX's, present because XCR0 supports it.
+    let (size, offset, _, _) = unsafe { cpuid(0x0D, 2) };
+    if offset != 576 {
+        return TestResult::Fail("CPUID leaf 0xD sub 2 EBX is not the AVX state's 576-byte offset");
+    }
+    if size != 256 {
+        return TestResult::Fail("CPUID leaf 0xD sub 2 EAX is not the AVX state's 256-byte size");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/xsave", smoke_cpuid_returns_real_ebx);
+
+/// A signal frame must carry the standard-format xstate whenever XSAVE is
+/// usable — the 512-byte FXSAVE area is for a CPU that has no XSAVE at all.
+///
+/// This is the decision three `frame/x86_64` signal smokes depend on
+/// (`rt_frame_preserves_ymm_upper`, `sigreturn_rejects_bad_xstate_header`,
+/// `rt_sigframe_linux_layout`), and all three failed while pointing at signal
+/// delivery when the cause was a garbage CPUID EBX one layer down: a 2.5 GiB
+/// "XSAVE area" failed the fits-in-a-frame test and pinned every frame to
+/// FXSAVE. Asserting the decision where it is made names the layer.
+#[cfg(target_arch = "x86_64")]
+fn smoke_sigframe_uses_xstate_when_xsave_is_usable() -> TestResult {
+    use crate::x86_64::{sigframe, xsave};
+    let caps = xsave::caps();
+    let fp_bytes = sigframe::fp_bytes();
+    if caps.xcr0_supported == 0 {
+        if fp_bytes != 512 {
+            return TestResult::Fail("no XSAVE: the FPU area should be a bare 512-byte FXSAVE");
+        }
+        return TestResult::Pass;
+    }
+    // SAFETY: boot sets CR4.OSXSAVE before any task runs.
+    let mask = unsafe { xsave::read_xcr0() };
+    let area = xsave::area_size_for_mask(mask);
+    if !(576..=xsave::FPU_AREA_SIZE).contains(&area) {
+        return TestResult::Fail("the XSAVE area for XCR0 is not a plausible standard-format size");
+    }
+    if fp_bytes == 512 {
+        return TestResult::Fail("a signal frame fell back to FXSAVE on a CPU with usable XSAVE");
+    }
+    if fp_bytes != (area + sigframe::FP_XSTATE_MAGIC2_SIZE) as u64 {
+        return TestResult::Fail("the frame's FPU area is not the xstate size plus MAGIC2");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "arch/xsave",
+    smoke_sigframe_uses_xstate_when_xsave_is_usable
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_waitpkg_supported_path() -> TestResult {
     use crate::x86_64::waitpkg;

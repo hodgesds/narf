@@ -6,8 +6,6 @@
 //! and optional features degrade to fallbacks — this module provides
 //! the raw queries; policy lives in `frame/`.
 
-use core::arch::asm;
-
 /// Raw CPUID leaf read: returns (eax, ebx, ecx, edx).
 ///
 /// # Safety
@@ -17,30 +15,34 @@ use core::arch::asm;
 /// rest of `arch/`'s privileged-instruction wrappers.
 #[inline]
 pub unsafe fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
-    let (a, c, d): (u32, u32, u32);
-    let b: u64;
-    // LLVM reserves rbx; save/restore it through a scratch register rather
-    // than the stack. The old `push rbx`/`pop rbx` form was declared
-    // `options(nostack)`, which is a lie — under optimization the compiler
-    // then keeps live data in the red zone that `push rbx` clobbers, so
-    // release builds silently returned wrong CPUID values (mis-detected
-    // vendor/features). Using a scratch reg keeps `nostack` truthful.
-    // SAFETY: CPUID is always legal at CPL=0; we preserve rbx.
-    unsafe {
-        asm!(
-            "mov {tmp:r}, rbx",
-            "cpuid",
-            "mov {b:r}, rbx",
-            "mov rbx, {tmp:r}",
-            inout("eax") leaf => a,
-            inout("ecx") sub  => c,
-            out("edx") d,
-            b = out(reg) b,
-            tmp = out(reg) _,
-            options(nostack, preserves_flags),
-        );
-    }
-    (a, b as u32, c, d)
+    // `core::arch`'s intrinsic, not hand-rolled `asm!`, and the reason is
+    // narrow and load-bearing: EBX cannot be an inline-asm operand on x86_64
+    // ("rbx is used internally by LLVM"), so reading CPUID's EBX by hand means
+    // saving RBX, running CPUID, copying RBX out and restoring it — and every
+    // register in that dance is one the COMPILER picks. When it picks RBX
+    // itself for the copy-out destination, the restore immediately overwrites
+    // the value just captured, and the caller gets the pre-CPUID RBX: a stack
+    // address, a loop counter, whatever happened to be live.
+    //
+    // It is allocation-dependent, so it bites per inlined copy: the same leaf
+    // read from two call sites in one function returned 2696 from one and
+    // 2619428248 from the other, which is how it was found —
+    // `xsave::area_size_for_mask` saw a 2.5 GiB XSAVE area, decided the image
+    // could not fit a signal frame, and silently pinned every signal frame to
+    // the 512-byte FXSAVE fallback (no YMM/ZMM preservation across a handler,
+    // no xstate header to validate, and a frame too small for the
+    // `sizeof(ucontext_t)` read glibc handlers make).
+    //
+    // EBX carries the feature mask of leaf 7, every cache-topology field of
+    // leaf 4, the component offsets of leaf 0xD and a third of the vendor
+    // string, so the blast radius was everything that reads those.
+    // `__cpuid_count` lowers through LLVM's own CPUID handling, which knows
+    // how to get RBX out without this hazard.
+    //
+    // SAFETY: CPUID is legal at CPL=0 for any leaf; unsupported leaves return
+    // zeros rather than faulting.
+    let r = unsafe { core::arch::x86_64::__cpuid_count(leaf, sub) };
+    (r.eax, r.ebx, r.ecx, r.edx)
 }
 
 /// CPU-feature flags we care about during Stage 1–2 bring-up. Each
