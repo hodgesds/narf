@@ -569,6 +569,8 @@ pub struct ProcSchedSnapshot {
 }
 
 type SchedSnapshotFn = fn(u64) -> ProcSchedSnapshot;
+/// `/proc/sysvipc/{sem,msg,shm}` rows (0 = sem, 1 = msg, 2 = shm).
+type SysvipcFn = fn(u8) -> String;
 type EnvironFn = fn(u64) -> Vec<u8>;
 type AuxvFn = fn(u64) -> Vec<u8>;
 type SetCommFn = fn(u64, &str) -> Result<(), FsError>;
@@ -682,6 +684,7 @@ static RLIMITS_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NICE_HOOK: AtomicUsize = AtomicUsize::new(0);
 static PERSONALITY_HOOK: AtomicUsize = AtomicUsize::new(0);
 static SCHED_SNAPSHOT_HOOK: AtomicUsize = AtomicUsize::new(0);
+static SYSVIPC_HOOK: AtomicUsize = AtomicUsize::new(0);
 static ENVIRON_HOOK: AtomicUsize = AtomicUsize::new(0);
 static AUXV_HOOK: AtomicUsize = AtomicUsize::new(0);
 static SET_COMM_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -1107,6 +1110,25 @@ pub(crate) fn hook_sched_snapshot(pid: u64) -> ProcSchedSnapshot {
 /// Wire the per-task scheduler snapshot.
 pub fn set_sched_snapshot_hook(f: SchedSnapshotFn) {
     SCHED_SNAPSHOT_HOOK.store(f as usize, Ordering::Release);
+}
+
+/// The rows of one `/proc/sysvipc` table, from the SysV IPC registries.
+/// Empty when nothing has installed the hook, which is what the files
+/// reported before one existed — except that they did not exist at all.
+pub(crate) fn hook_sysvipc(kind: u8) -> String {
+    let v = SYSVIPC_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return String::new();
+    }
+    // SAFETY: only `set_sysvipc_hook` writes this cell, always from a
+    // `SysvipcFn` fn-pointer; non-zero confirms it was stored.
+    let f: SysvipcFn = unsafe { core::mem::transmute(v) };
+    f(kind)
+}
+
+/// Wire `/proc/sysvipc/{sem,msg,shm}` to the SysV IPC registries.
+pub fn set_sysvipc_hook(f: SysvipcFn) {
+    SYSVIPC_HOOK.store(f as usize, Ordering::Release);
 }
 
 pub(crate) fn hook_nice(pid: u64) -> i32 {

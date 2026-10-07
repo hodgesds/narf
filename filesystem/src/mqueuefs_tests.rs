@@ -7,8 +7,8 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::mqueuefs::{
-    self, attributes, open, receive, send, unlink, MqueueAttr, MqueueFs, MqueueOpenOptions,
-    O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
+    self, attributes, open, receive, send, unlink, MqueueAttr, MqueueFs, MqueueLimits,
+    MqueueOpenOptions, O_CREAT, O_NONBLOCK, O_RDONLY, O_RDWR, O_WRONLY,
 };
 use crate::{FileType, FsInstance, POLL_IN, POLL_OUT};
 
@@ -44,6 +44,8 @@ fn options(flags: u32, uid: u32, gid: u32) -> MqueueOpenOptions {
         uid,
         gid,
         attr: None,
+        limits: MqueueLimits::default(),
+        privileged: uid == 0,
     }
 }
 
@@ -148,6 +150,8 @@ fn smoke_mqueuefs_access_flags_attrs_and_status_file() -> TestResult {
                 msgsize: 128,
                 ..MqueueAttr::default()
             }),
+            limits: MqueueLimits::default(),
+            privileged: false,
         },
     ) {
         Ok(file) => file,

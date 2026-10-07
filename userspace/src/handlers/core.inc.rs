@@ -936,6 +936,14 @@ pub fn init_per_task_state() {
         crate::ns_last_pid_for_current,
         crate::set_ns_last_pid_for_current,
     );
+    // `/proc/sys/kernel/{sem,msg*,shm*}` are the caller's IPC-namespace
+    // limits, which live in `sysvipc`; same reasoning as the two above, and
+    // installing them here (rather than only in `frame`'s cross-crate init)
+    // is what makes them reachable from the kernel-test harness too.
+    narf_filesystem::procfs::sys_kernel::install_ipc_sysctl_hooks(
+        crate::proc_ipc_limit_read,
+        crate::proc_ipc_limit_write,
+    );
     rlimit_init();
     nice_init();
     umask_init();
@@ -5391,6 +5399,11 @@ pub(crate) const CAP_NET_RAW: u32 = 13;
 /// `RLIMIT_MEMLOCK`. Linux `mm/mlock.c::can_do_mlock` and the mlock accounting
 /// consult it host-scoped (`capable`, not `ns_capable`).
 pub(crate) const CAP_IPC_LOCK: u32 = 14;
+/// `CAP_IPC_OWNER` (`include/uapi/linux/capability.h`: 15) — bypass the
+/// permission checks on a System V IPC object. `ipc/util.c::ipcperms` asks
+/// for it against the IPC namespace's user namespace, and it is the ONLY
+/// bypass there: a uid-0 task that dropped it is refused like any other.
+pub(crate) const CAP_IPC_OWNER: u32 = 15;
 pub(crate) const CAP_SYS_MODULE: u32 = 16;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
@@ -5567,6 +5580,31 @@ fn write_caps(task: u64, caps: Caps) {
 /// container owner is refused inside its own namespace.
 pub(crate) fn capable(cap: u32) -> bool {
     task_capable(current_task_id(), cap)
+}
+
+/// `ns_capable(ipc_ns->user_ns, cap)` — the authority every System V IPC
+/// privilege check asks for (`ipcperms`' CAP_IPC_OWNER,
+/// `ipcctl_obtain_check`'s CAP_SYS_ADMIN, `shmctl_do_lock`'s CAP_IPC_LOCK).
+///
+/// Scoped to the IPC namespace's owning user namespace, as Linux scopes it:
+/// the owner of a container's IPC namespace administers the objects in it
+/// without holding anything on the host.
+///
+/// LINUX-GAP: a build without the `container` feature has no IPC namespace
+/// to scope against, so the check is host-scoped `capable()` — strictly
+/// narrower, and the same answer in the single-namespace case that build
+/// has.
+pub(crate) fn ipc_ns_capable(cap: u32) -> bool {
+    #[cfg(feature = "container")]
+    {
+        let task = current_task_id();
+        let ipc_ns = crate::namespaces::current_ipc_namespace(task);
+        task_ns_capable(task, &ipc_ns.owner_user_ns(), cap)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        capable(cap)
+    }
 }
 
 /// `security/commoncap.c::cap_capable` — does `task` hold `cap` with respect
@@ -10186,6 +10224,13 @@ pub fn __test_swap_shmem_vtable(
         // `install_shmem_syscall_vtable` or this function.
         Some(unsafe { &*prev })
     }
+}
+
+/// The largest segment the shmem backing can hold — `shm_ctlmax`'s default
+/// and its hard ceiling, since a tuned `shmmax` above it cannot be honoured
+/// by the allocator. `0` before the shmem registry is installed.
+pub fn shm_backing_max_len() -> u64 {
+    shmem_vtable().map_or(0, |v| (v.max_len)())
 }
 
 fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
@@ -18106,6 +18151,7 @@ fn pack_utsname_field(dst: &mut [u8], src: &str) {
 // the other — genuine sharing, exactly like Linux. Supersedes the
 // container id-by-key `shmget` in a linux-compat build.
 
+#[derive(Clone)]
 struct ShmSegment {
     handle: u64,
     key: u32,
@@ -18340,6 +18386,57 @@ fn current_shm_ipc_ns_id() -> u64 {
     0
 }
 
+/// `sysvipc_shm_proc_show`:
+/// `"%10d %10d  %4o %10lu %5u %5u  %5lu %5u %5u %5u %5u %10llu %10llu %10llu %10lu %10lu"`
+/// — one row per segment in the reader's IPC namespace.
+///
+/// LINUX-GAP: the `rss` and `swap` columns are the segment's resident and
+/// swapped page counts, which Linux takes from the shmem inode's
+/// `shmem_inode_info`. NARF's shmem backing does not account either, so both
+/// read as 0 — `ipcs -m` shows the size and attach count from this row and
+/// reports no residency, rather than a number nothing measured.
+pub fn proc_sysvipc_shm() -> alloc::string::String {
+    use core::fmt::Write as _;
+    let ns = current_shm_ipc_ns_id();
+    let reader = current_task_id();
+    let mut out = alloc::string::String::new();
+    let rows: alloc::vec::Vec<(u64, ShmSegment)> = {
+        let segments = SHM_SEGMENTS.lock();
+        segments
+            .as_ref()
+            .map(|map| {
+                map.iter()
+                    .filter(|((seg_ns, _), seg)| *seg_ns == ns && !seg.removed)
+                    .map(|((_, id), seg)| (*id, seg.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for (id, seg) in rows {
+        let _ = writeln!(
+            out,
+            "{:10} {:10}  {:4o} {:10} {:5} {:5}  {:5} {:5} {:5} {:5} {:5} {:10} {:10} {:10} {:10} {:10}",
+            seg.key as i32,
+            id as i32,
+            seg.mode & 0o7777,
+            seg.len,
+            report_pid_to(reader, seg.cpid),
+            report_pid_to(reader, seg.lpid),
+            seg.nattch,
+            seg.uid,
+            seg.gid,
+            seg.cuid,
+            seg.cgid,
+            seg.atime,
+            seg.dtime,
+            seg.ctime,
+            0,
+            0
+        );
+    }
+    out
+}
+
 fn shm_register_as_owner(as_key: u64, pid: u64) {
     SHM_AS_OWNERS
         .lock()
@@ -18363,6 +18460,41 @@ fn shm_mapping_transaction(
 /// Mirror Linux `shm_open` across fork. A separate address space gets one
 /// additional logical attachment for every inherited mapping; `CLONE_VM`
 /// merely adds another process owner of the same mm and does not change
+/// `ns->shm_rmid_forced` (`/proc/sys/kernel/shm_rmid_forced`): with it set,
+/// `shm_close` destroys a segment whose last attachment goes away even
+/// though nothing called IPC_RMID (`shm_mark_orphan` → `shm_destroy`), so a
+/// crashed process cannot leak a segment that outlives every user of it.
+fn shm_forced_rmid(ipc_ns: u64) -> bool {
+    crate::sysvipc::limits_of(ipc_ns).shm_rmid_forced
+}
+
+/// `ipc/shm.c::shm_destroy_orphaned`, which
+/// `proc_ipc_dointvec_minmax_orphans` runs the moment `shm_rmid_forced` is
+/// written: every segment in the namespace that is ALREADY unattached goes
+/// away immediately rather than waiting for a detach that will never come.
+pub fn shm_destroy_orphaned(ipc_ns: u64) {
+    let destroy: alloc::vec::Vec<u64> = {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let orphans: alloc::vec::Vec<ShmObjectKey> = map
+            .iter()
+            .filter(|((ns, _), seg)| *ns == ipc_ns && seg.nattch == 0)
+            .map(|(object, _)| *object)
+            .collect();
+        orphans
+            .into_iter()
+            .filter_map(|object| map.remove(&object).map(|seg| seg.handle))
+            .collect()
+    };
+    if let Some(vtable) = shmem_vtable() {
+        for handle in destroy {
+            if handle != 0 {
+                (vtable.destroy)(handle);
+            }
+        }
+    }
+}
+
 /// `shm_nattch`.
 fn shm_fork_process(
     parent_as: &Arc<AddressSpace>,
@@ -18479,7 +18611,7 @@ pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
             seg.nattch = seg.nattch.saturating_sub(1);
             seg.lpid = pid;
             seg.dtime = now;
-            if seg.removed && seg.nattch == 0 {
+            if seg.nattch == 0 && (seg.removed || shm_forced_rmid(object.0)) {
                 if let Some(seg) = map.remove(&object) {
                     destroy.push(seg.handle);
                 }
@@ -18507,9 +18639,6 @@ fn shm_ipc_allowed(seg: &ShmSegment, request: u32) -> bool {
     // mask before comparing it with the caller-selected permission class.
     let request = ((request >> 6) | (request >> 3) | request) & 0o7;
     let cred = current_ucred();
-    if cred.uid == 0 {
-        return true;
-    }
     let groups = current_groups();
     let granted = if cred.uid == seg.uid || cred.uid == seg.cuid {
         (seg.mode >> 6) & 0o7
@@ -18522,12 +18651,26 @@ fn shm_ipc_allowed(seg: &ShmSegment, request: u32) -> bool {
     } else {
         seg.mode & 0o7
     };
-    granted & request == request
+    // `ipcperms`: the capability is consulted only when the mode check
+    // fails, and it is CAP_IPC_OWNER — not uid 0, which is what this used.
+    // A root task that dropped the capability kept the bypass, and a task
+    // granted it without being root never got one.
+    granted & request == request || ipc_ns_capable(CAP_IPC_OWNER)
 }
 
+/// `ipc/util.c::ipcctl_obtain_check`'s ownership test:
+///
+/// ```text
+/// if (uid_eq(euid, ipcp->cuid) || uid_eq(euid, ipcp->uid) ||
+///     ns_capable(ns->user_ns, CAP_SYS_ADMIN))
+///         return ipcp;
+/// err = -EPERM;
+/// ```
+///
+/// The bypass is CAP_SYS_ADMIN, which this read as uid 0.
 fn shm_ipc_owner(seg: &ShmSegment) -> bool {
     let uid = current_ucred().uid;
-    uid == 0 || uid == seg.uid || uid == seg.cuid
+    uid == seg.uid || uid == seg.cuid || ipc_ns_capable(CAP_SYS_ADMIN)
 }
 
 /// Drop an in-progress attach reservation. If `IPC_RMID` raced the mapping,
@@ -18540,7 +18683,7 @@ fn shm_cancel_attach(object: ShmObjectKey) {
             return;
         };
         seg.nattch = seg.nattch.saturating_sub(1);
-        if seg.removed && seg.nattch == 0 {
+        if seg.nattch == 0 && (seg.removed || shm_forced_rmid(object.0)) {
             map.remove(&object).map(|seg| seg.handle)
         } else {
             None
@@ -18947,7 +19090,7 @@ impl PreparedShmMremapAlias {
                 segment.nattch = segment.nattch.saturating_sub(1);
                 segment.lpid = self.lpid;
                 segment.dtime = now;
-                if segment.removed && segment.nattch == 0 {
+                if segment.nattch == 0 && (segment.removed || shm_forced_rmid(object.0)) {
                     if let Some(segment) = segment_map.remove(&object) {
                         // Capacity was reserved for every possibly detached
                         // attachment, an upper bound on destroyed segments.
@@ -19121,7 +19264,7 @@ fn shm_record_fixed_punch(as_key: u64, lo: u64, hi: u64, lpid: u64) {
             seg.nattch = seg.nattch.saturating_sub(1);
             seg.lpid = lpid;
             seg.dtime = now;
-            if seg.removed && seg.nattch == 0 {
+            if seg.nattch == 0 && (seg.removed || shm_forced_rmid(object.0)) {
                 if let Some(seg) = map.remove(&object) {
                     destroy.push(seg.handle);
                 }

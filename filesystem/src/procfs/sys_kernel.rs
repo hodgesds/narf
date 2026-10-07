@@ -294,6 +294,82 @@ fn write_pid_max(v: &str) -> Result<(), FsError> {
 // it. The namespace state lives in narf-userspace, which installs the
 // hooks; before that (early boot, filesystem-only tests) reads are "0" and
 // writes are refused.
+// ── /proc/sys/kernel/{sem,msg*,shm*} ────────────────────────────────
+//
+// `ipc/ipc_sysctl.c` registers eight per-IPC-namespace limits, all 0644
+// except where noted, and the syscalls enforce whatever they hold:
+// `kernel.sem` is the four-value `sem_ctls` vector, `msgmax`/`msgmnb`/
+// `msgmni` bound a message, a queue and the queue count, `shmmax`/`shmall`/
+// `shmmni` bound a segment, the total pages and the segment count, and
+// `shm_rmid_forced` is 0/1.
+//
+// None of the files existed, so `sysctl -w kernel.msgmni=…` and every
+// `/etc/sysctl.d` drop-in naming one got ENOENT (systemd-sysctl logs the
+// failure and carries on) and no deployment could tighten or raise a limit.
+// The values live with the IPC namespaces in `narf_userspace`; these are the
+// eight `ctl_table` entries routed at them.
+type IpcSysctlReadFn = fn(u8) -> String;
+type IpcSysctlWriteFn = fn(u8, &str) -> Result<(), FsError>;
+static IPC_SYSCTL_READ: AtomicUsize = AtomicUsize::new(0);
+static IPC_SYSCTL_WRITE: AtomicUsize = AtomicUsize::new(0);
+
+/// Route the IPC limit files at the SysV IPC namespaces. Idempotent.
+pub fn install_ipc_sysctl_hooks(read: IpcSysctlReadFn, write: IpcSysctlWriteFn) {
+    IPC_SYSCTL_READ.store(read as usize, Ordering::Release);
+    IPC_SYSCTL_WRITE.store(write as usize, Ordering::Release);
+}
+
+pub(super) fn read_ipc_limit_for(key: u8) -> String {
+    read_ipc_limit(key)
+}
+
+/// As [`read_ipc_limit_for`], for a write.
+pub(super) fn write_ipc_limit_for(key: u8, value: &str) -> Result<(), FsError> {
+    write_ipc_limit(key, value)
+}
+
+fn read_ipc_limit(key: u8) -> String {
+    let v = IPC_SYSCTL_READ.load(Ordering::Acquire);
+    if v == 0 {
+        return String::from("0\n");
+    }
+    // SAFETY: only `install_ipc_sysctl_hooks` writes this cell, always from
+    // an `IpcSysctlReadFn` fn-pointer; non-zero confirms it was stored.
+    let f: IpcSysctlReadFn = unsafe { core::mem::transmute(v) };
+    f(key)
+}
+
+fn write_ipc_limit(key: u8, value: &str) -> Result<(), FsError> {
+    let v = IPC_SYSCTL_WRITE.load(Ordering::Acquire);
+    if v == 0 {
+        return Err(FsError::Unsupported);
+    }
+    // SAFETY: as in `read_ipc_limit`.
+    let f: IpcSysctlWriteFn = unsafe { core::mem::transmute(v) };
+    f(key, value)
+}
+
+// One pair per key, because a `ctl_table` entry carries plain fn pointers.
+macro_rules! ipc_limit_file {
+    ($read:ident, $write:ident, $index:expr) => {
+        fn $read() -> String {
+            read_ipc_limit($index)
+        }
+        fn $write(value: &str) -> Result<(), FsError> {
+            write_ipc_limit($index, value)
+        }
+    };
+}
+
+ipc_limit_file!(read_ipc_sem, write_ipc_sem, 0);
+ipc_limit_file!(read_ipc_msgmax, write_ipc_msgmax, 1);
+ipc_limit_file!(read_ipc_msgmnb, write_ipc_msgmnb, 2);
+ipc_limit_file!(read_ipc_msgmni, write_ipc_msgmni, 3);
+ipc_limit_file!(read_ipc_shmmax, write_ipc_shmmax, 4);
+ipc_limit_file!(read_ipc_shmall, write_ipc_shmall, 5);
+ipc_limit_file!(read_ipc_shmmni, write_ipc_shmmni, 6);
+ipc_limit_file!(read_ipc_shm_rmid_forced, write_ipc_shm_rmid_forced, 7);
+
 type NsLastPidReadFn = fn() -> i64;
 type NsLastPidWriteFn = fn(&str) -> Result<(), FsError>;
 static NS_LAST_PID_READ: AtomicUsize = AtomicUsize::new(0);
@@ -595,6 +671,31 @@ pub fn register_all() {
         write: Some(write_domainname),
         perms: 0o644,
     });
+    for (path, read, write) in [
+        (
+            "kernel/sem",
+            read_ipc_sem as fn() -> String,
+            write_ipc_sem as fn(&str) -> Result<(), FsError>,
+        ),
+        ("kernel/msgmax", read_ipc_msgmax, write_ipc_msgmax),
+        ("kernel/msgmnb", read_ipc_msgmnb, write_ipc_msgmnb),
+        ("kernel/msgmni", read_ipc_msgmni, write_ipc_msgmni),
+        ("kernel/shmmax", read_ipc_shmmax, write_ipc_shmmax),
+        ("kernel/shmall", read_ipc_shmall, write_ipc_shmall),
+        ("kernel/shmmni", read_ipc_shmmni, write_ipc_shmmni),
+        (
+            "kernel/shm_rmid_forced",
+            read_ipc_shm_rmid_forced,
+            write_ipc_shm_rmid_forced,
+        ),
+    ] {
+        register_sysctl(SysctlEntry {
+            path,
+            read,
+            write: Some(write),
+            perms: 0o644,
+        });
+    }
     register_sysctl(SysctlEntry {
         path: "kernel/pid_max",
         read: read_pid_max,

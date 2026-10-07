@@ -125,6 +125,47 @@ pub fn register_all() {
     register_proc("tty/drivers", agg(gen_tty_drivers));
     register_proc("fb", agg(gen_fb));
     register_proc("crypto", agg(gen_crypto));
+    // `ipc_init_proc_interface("sysvipc/sem", ...)` and its two siblings.
+    register_proc("sysvipc/sem", agg(gen_sysvipc_sem));
+    register_proc("sysvipc/msg", agg(gen_sysvipc_msg));
+    register_proc("sysvipc/shm", agg(gen_sysvipc_shm));
+}
+
+// ── /proc/sysvipc/{sem,msg,shm} ──────────────────────────────────────
+//
+// `ipc/util.c::ipc_init_proc_interface` gives each table a fixed header and
+// one row per object in the reader's IPC namespace. `ipcs(1)` and `lsipc(1)`
+// read these in preference to walking `*ctl(IPC_STAT)`, and the whole
+// `sysvipc` directory was missing — so a tool that reads only procfs saw a
+// machine with no IPC objects on it, however many were live. The rows come
+// from the registries through `hook_sysvipc`; the headers are format, so
+// they live here.
+
+fn gen_sysvipc_sem() -> Vec<u8> {
+    let mut s = String::from(
+        "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime
+",
+    );
+    s.push_str(&super::hook_sysvipc(0));
+    s.into_bytes()
+}
+
+fn gen_sysvipc_msg() -> Vec<u8> {
+    let mut s = String::from(
+        "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime
+",
+    );
+    s.push_str(&super::hook_sysvipc(1));
+    s.into_bytes()
+}
+
+fn gen_sysvipc_shm() -> Vec<u8> {
+    let mut s = String::from(
+        "       key      shmid perms       size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime        rss       swap
+",
+    );
+    s.push_str(&super::hook_sysvipc(2));
+    s.into_bytes()
 }
 
 // ── /proc/diskstats ──────────────────────────────────────────────────

@@ -474,15 +474,24 @@ fn smoke_abi_ipc_mq_notify_signal_once() -> TestResult {
         if crate::handlers::signal_pending_bits(FAKE_TASK) & crate::handlers::sig_bit(10) == 0 {
             return Err("mq_notify did not queue its signal");
         }
+        // Signal 0 is NOT a registration Linux accepts — `do_mq_notify`:
+        //
+        //     if (notification->sigev_notify == SIGEV_SIGNAL &&
+        //         (!notification->sigev_signo ||
+        //          !valid_signal(notification->sigev_signo)))
+        //             return -EINVAL;
+        //
+        // This case asserted the opposite ("Linux's signal-zero
+        // registration"), which the handler's `0..=64` range obliged.
         let zero_fd = open_mq(b"abi_mq_notify_zero\0")?;
         let mut zero_event = [0u8; 64];
         zero_event[12..16].copy_from_slice(&0i32.to_ne_bytes()); // SIGEV_SIGNAL
         if call(
             Syscall::MqNotify.raw(),
             a1(zero_fd, zero_event.as_ptr() as u64),
-        ) != Some(0)
+        ) != Some(EINVAL)
         {
-            return Err("mq_notify rejected Linux's signal-zero registration");
+            return Err("mq_notify with signal 0 must be EINVAL");
         }
         Ok(())
     })
@@ -692,7 +701,7 @@ fn smoke_abi_ipc_sem_undo_allocation_errno_order() -> TestResult {
         let mut increment = [0u8; 6];
         increment[2..4].copy_from_slice(&1i16.to_le_bytes());
         increment[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
-        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        drop_ipc_privilege(FAKE_TASK, 1000);
         crate::sysvipc::__test_fail_next_sem_undo_reserve();
         if call(
             Syscall::Semop.raw(),
@@ -1667,7 +1676,7 @@ fn smoke_abi_ipc_semctl_observable_errno_order() -> TestResult {
         }
         let id = make_semset(1)?;
         // semctl_main checks read permission before sem_num for GET*.
-        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        drop_ipc_privilege(FAKE_TASK, 1000);
         if call(Syscall::Semctl.raw(), a3(id, u32::MAX as u64, GETNCNT, 0)) != Some(EACCES) {
             return Err("GETNCNT must report EACCES before invalid sem_num");
         }
@@ -1744,7 +1753,7 @@ fn smoke_abi_ipc_semctl_stat_set_layout() -> TestResult {
             return Err("semctl IPC_SET mode did not round-trip through IPC_STAT");
         }
         let task = crate::handlers::current_task_id();
-        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        drop_ipc_privilege(task, 1000);
         if call(
             Syscall::Semctl.raw(),
             a3(id, 0, IPC_STAT, stat.as_mut_ptr() as u64),
@@ -1763,6 +1772,572 @@ fn smoke_abi_ipc_semctl_stat_set_layout() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semctl_stat_set_layout);
+
+/// `ipcperms` bypasses the mode bits for **CAP_IPC_OWNER**, and
+/// `ipcctl_obtain_check` bypasses the ownership test for **CAP_SYS_ADMIN** —
+/// not for uid 0, which is what every System V IPC check in NARF asked for:
+///
+///     if (caller_uid == 0) { return true; }
+///
+/// So a root task that dropped the capability kept the bypass, and a task
+/// granted the capability without being root never got one. Both directions
+/// are pinned here, and they are different capabilities: holding
+/// CAP_IPC_OWNER does not let a non-owner IPC_SET.
+fn smoke_abi_ipc_perms_follow_capabilities_not_uid0() -> TestResult {
+    with_setup(|| {
+        const CAP_IPC_OWNER_BIT: u64 = 1 << 15;
+        const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
+        #[cfg(target_arch = "x86_64")]
+        const SIZE: usize = 104;
+        #[cfg(target_arch = "aarch64")]
+        const SIZE: usize = 88;
+
+        let task = crate::handlers::current_task_id();
+        // Owner-readable only, created by root.
+        let id = match call(Syscall::Semget.raw(), a2(0, 1, IPC_CREAT | 0o600)) {
+            Some(id) if id >= 0 => id as u64,
+            _ => return Err("setup: semget IPC_PRIVATE|0600 failed"),
+        };
+        let mut stat = [0u8; SIZE];
+        let read = |stat: &mut [u8; SIZE]| {
+            call(
+                Syscall::Semctl.raw(),
+                a3(id, 0, IPC_STAT, stat.as_mut_ptr() as u64),
+            )
+        };
+
+        // A non-owner uid with no capability: the "other" class is 0.
+        drop_ipc_privilege(task, 1000);
+        if read(&mut stat) != Some(EACCES) {
+            restore_ipc_privilege(task);
+            return Err("a non-owner with no capability must get EACCES");
+        }
+        // The same non-owner uid, granted CAP_IPC_OWNER alone: allowed.
+        crate::handlers::__test_set_caps(task, CAP_IPC_OWNER_BIT, CAP_IPC_OWNER_BIT);
+        if read(&mut stat) != Some(0) {
+            restore_ipc_privilege(task);
+            return Err("CAP_IPC_OWNER must bypass the mode bits for a non-owner");
+        }
+        // But CAP_IPC_OWNER is not the ownership bypass: IPC_SET needs
+        // CAP_SYS_ADMIN (`ipcctl_obtain_check`).
+        let mut update = [0u8; SIZE];
+        update[20..24].copy_from_slice(&0o660u32.to_ne_bytes());
+        let set = |update: &[u8; SIZE]| {
+            call(
+                Syscall::Semctl.raw(),
+                a3(id, 0, IPC_SET, update.as_ptr() as u64),
+            )
+        };
+        if set(&update) != Some(EPERM) {
+            restore_ipc_privilege(task);
+            return Err("CAP_IPC_OWNER must not stand in for the ownership check");
+        }
+        crate::handlers::__test_set_caps(task, CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT);
+        if set(&update) != Some(0) {
+            restore_ipc_privilege(task);
+            return Err("CAP_SYS_ADMIN must bypass the ownership check");
+        }
+        // And root is not privileged by being root. A set owned by uid 1000
+        // with mode 0600 is unreadable by uid 0 once the capabilities are
+        // gone: the "other" class is 0 and nothing else applies.
+        drop_ipc_privilege(task, 1000);
+        let theirs = match call(Syscall::Semget.raw(), a2(0, 1, IPC_CREAT | 0o600)) {
+            Some(id) if id >= 0 => id as u64,
+            _ => {
+                restore_ipc_privilege(task);
+                return Err("setup: an unprivileged task must still create its own set");
+            }
+        };
+        crate::handlers::__test_set_caps(task, 0, 0);
+        crate::handlers::__test_set_fsids(task, 0, 0);
+        let mut other = [0u8; SIZE];
+        let read_theirs = call(
+            Syscall::Semctl.raw(),
+            a3(theirs, 0, IPC_STAT, other.as_mut_ptr() as u64),
+        );
+        let set_theirs = call(
+            Syscall::Semctl.raw(),
+            a3(theirs, 0, IPC_SET, update.as_ptr() as u64),
+        );
+        restore_ipc_privilege(task);
+        let _ = call(Syscall::Semctl.raw(), a3(theirs, 0, IPC_RMID, 0));
+        if read_theirs != Some(EACCES) || set_theirs != Some(EPERM) {
+            return Err("uid 0 without the capabilities must not bypass either check");
+        }
+
+        restore_ipc_privilege(task);
+        if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
+            return Err("cleanup: IPC_RMID failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_perms_follow_capabilities_not_uid0
+);
+
+/// `/proc/sysvipc/{sem,msg,shm}` — `ipc_init_proc_interface`'s three tables,
+/// one row per live object in the reader's IPC namespace. The whole
+/// directory was missing, so `ipcs(1)` and `lsipc(1)`, which read these in
+/// preference to walking `*ctl(IPC_STAT)`, saw a machine with no IPC objects
+/// on it however many were live.
+fn smoke_abi_ipc_proc_sysvipc_tables_list_live_objects() -> TestResult {
+    with_setup(|| {
+        // An explicit mode: `make_semset` creates with none, and a row that
+        // reported 0 either way would not prove the column.
+        let sem = match call(Syscall::Semget.raw(), a2(0, 3, IPC_CREAT | 0o600)) {
+            Some(id) if id >= 0 => id as u64,
+            _ => return Err("setup: semget IPC_PRIVATE|0600 failed"),
+        };
+        let msg = match call(Syscall::Msgget.raw(), a2(0, IPC_CREAT | 0o600, 0)) {
+            Some(id) if id >= 0 => id as u64,
+            _ => return Err("setup: msgget IPC_PRIVATE failed"),
+        };
+
+        // `kind`: 0 = sem, 1 = msg, 2 = shm, as the procfs hook numbers them.
+        let sem_rows = crate::proc_sysvipc_table(0);
+        let msg_rows = crate::proc_sysvipc_table(1);
+        let cleanup = |()| {
+            let _ = call(Syscall::Semctl.raw(), a3(sem, 0, IPC_RMID, 0));
+            let _ = call(Syscall::Msgctl.raw(), a2(msg, IPC_RMID, 0));
+        };
+
+        // The sem row's columns are key, semid, perms, nsems, then the four
+        // ids: `"%10d %10d  %4o %10u %5u %5u %5u %5u %10llu %10llu"`.
+        let Some(row) = sem_rows
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(&alloc::format!("{sem}")))
+        else {
+            cleanup(());
+            return Err("/proc/sysvipc/sem did not list a live set");
+        };
+        let cols: alloc::vec::Vec<&str> = row.split_whitespace().collect();
+        if cols.len() != 10 {
+            cleanup(());
+            return Err("/proc/sysvipc/sem row does not have sysvipc_sem_proc_show's columns");
+        }
+        if cols[2] != "600" || cols[3] != "3" {
+            cleanup(());
+            return Err("/proc/sysvipc/sem reported the wrong perms or nsems");
+        }
+
+        let listed_msg = msg_rows
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(&alloc::format!("{msg}")));
+        cleanup(());
+        if !listed_msg {
+            return Err("/proc/sysvipc/msg did not list a live queue");
+        }
+        // A removed object leaves the table.
+        if crate::proc_sysvipc_table(0)
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(&alloc::format!("{sem}")))
+        {
+            return Err("/proc/sysvipc/sem still lists a set after IPC_RMID");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_proc_sysvipc_tables_list_live_objects
+);
+
+// ── /proc/sys/kernel/{sem,msg*,shm*} ────────────────────────────────
+
+fn ipc_sysctl_read(path: &[u8]) -> Result<alloc::string::String, &'static str> {
+    let fd = call_open(path.as_ptr() as u64, 0).ok_or("open returned a non-Linux status")?;
+    if fd < 0 {
+        return Err("an IPC limit file could not be opened");
+    }
+    let mut buf = [0u8; 96];
+    let n = call(
+        Syscall::Read.raw(),
+        a2(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+    );
+    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+    match n {
+        Some(n) if n >= 0 => {
+            Ok(alloc::string::String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+        }
+        _ => Err("an IPC limit file could not be read"),
+    }
+}
+
+fn ipc_sysctl_write(path: &[u8], value: &[u8]) -> i64 {
+    let fd = match call_open(path.as_ptr() as u64, 1) {
+        Some(fd) if fd >= 0 => fd,
+        Some(fd) => return fd,
+        None => return i64::MIN,
+    };
+    let n = call(
+        Syscall::Write.raw(),
+        a2(fd as u64, value.as_ptr() as u64, value.len() as u64),
+    )
+    .unwrap_or(i64::MIN);
+    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+    n
+}
+
+/// `ipc/ipc_sysctl.c`'s eight per-namespace limits exist, round-trip, and
+/// refuse what their `ctl_table` entries refuse. None of the files existed:
+/// `sysctl -w kernel.msgmni=…` and every `/etc/sysctl.d` drop-in naming one
+/// got ENOENT.
+fn smoke_abi_ipc_sysctl_limits_round_trip() -> TestResult {
+    with_setup(|| {
+        crate::sysvipc::__test_reset_limits();
+        // `kernel.sem` is the four-value `sem_ctls` vector.
+        let sem = ipc_sysctl_read(b"/proc/sys/kernel/sem\0")?;
+        if sem.split_ascii_whitespace().count() != 4 {
+            crate::sysvipc::__test_reset_limits();
+            return Err("kernel.sem must report the four sem_ctls values");
+        }
+        if ipc_sysctl_write(b"/proc/sys/kernel/sem\0", b"64 1024 32 16\n") <= 0 {
+            crate::sysvipc::__test_reset_limits();
+            return Err("writing kernel.sem failed");
+        }
+        let verdict = (|| -> Result<(), &'static str> {
+            if ipc_sysctl_read(b"/proc/sys/kernel/sem\0")?
+                .split_ascii_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                != ["64", "1024", "32", "16"]
+            {
+                return Err("kernel.sem did not read back what was written");
+            }
+            // A partial vector is EINVAL: the handler writes all four or none.
+            if ipc_sysctl_write(b"/proc/sys/kernel/sem\0", b"64 1024\n") != -22 {
+                return Err("kernel.sem must refuse a short vector with EINVAL");
+            }
+            for (path, value) in [
+                (&b"/proc/sys/kernel/msgmax\0"[..], &b"4096\n"[..]),
+                (&b"/proc/sys/kernel/msgmnb\0"[..], &b"8192\n"[..]),
+                (&b"/proc/sys/kernel/msgmni\0"[..], &b"64\n"[..]),
+                (&b"/proc/sys/kernel/shmmax\0"[..], &b"1048576\n"[..]),
+                (&b"/proc/sys/kernel/shmall\0"[..], &b"256\n"[..]),
+                (&b"/proc/sys/kernel/shmmni\0"[..], &b"32\n"[..]),
+                (&b"/proc/sys/kernel/shm_rmid_forced\0"[..], &b"1\n"[..]),
+            ] {
+                if ipc_sysctl_write(path, value) <= 0 {
+                    return Err("writing an IPC limit failed");
+                }
+                if ipc_sysctl_read(path)?.trim()
+                    != alloc::string::String::from_utf8_lossy(value).trim()
+                {
+                    return Err("an IPC limit did not read back what was written");
+                }
+            }
+            // The bounded entries: `shm_rmid_forced` is 0..=1, and
+            // `msgmni`/`shmmni` are capped by the IDR width (`ipc_mni`).
+            if ipc_sysctl_write(b"/proc/sys/kernel/shm_rmid_forced\0", b"2\n") != -22 {
+                return Err("shm_rmid_forced must refuse a value above 1");
+            }
+            if ipc_sysctl_write(b"/proc/sys/kernel/msgmni\0", b"99999999\n") != -22 {
+                return Err("msgmni must refuse a value past ipc_mni");
+            }
+            if ipc_sysctl_write(b"/proc/sys/kernel/msgmax\0", b"not-a-number\n") != -22 {
+                return Err("a non-numeric IPC limit write must be EINVAL");
+            }
+            Ok(())
+        })();
+        crate::sysvipc::__test_reset_limits();
+        verdict
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_sysctl_limits_round_trip);
+
+/// A written limit is what the syscalls then enforce — the whole point of
+/// the files. Each of the three object types takes its bound from the
+/// namespace's live value.
+fn smoke_abi_ipc_sysctl_limits_are_enforced() -> TestResult {
+    with_setup(|| {
+        crate::sysvipc::__test_reset_limits();
+        let verdict = (|| -> Result<(), &'static str> {
+            // semget's nsems bound is `sem_ctls[0]`.
+            // Only `semmsl` and `semopm` may bind here: the namespace-wide
+            // pair stays generous, because earlier cases in this namespace
+            // have already created sets and semmns/semmni count those.
+            if ipc_sysctl_write(b"/proc/sys/kernel/sem\0", b"4 1024000 8 32000\n") <= 0 {
+                return Err("writing kernel.sem failed");
+            }
+            match call(Syscall::Semget.raw(), a2(0, 5, IPC_CREAT | 0o600)) {
+                Some(v) if v == EINVAL => {}
+                _ => return Err("semget past the written semmsl must be EINVAL"),
+            }
+            let id = match call(Syscall::Semget.raw(), a2(0, 4, IPC_CREAT | 0o600)) {
+                Some(id) if id >= 0 => id as u64,
+                _ => return Err("semget at the written semmsl must succeed"),
+            };
+            // semop's E2BIG boundary is `sem_ctls[2]`.
+            let sops = [0u8; 9 * 6];
+            match call(Syscall::Semop.raw(), a2(id, sops.as_ptr() as u64, 9)) {
+                Some(v) if v == E2BIG => {}
+                _ => {
+                    let _ = call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0));
+                    return Err("semop past the written semopm must be E2BIG");
+                }
+            }
+            let _ = call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0));
+
+            // msgsnd's size bound is `msg_ctlmax`.
+            if ipc_sysctl_write(b"/proc/sys/kernel/msgmax\0", b"8\n") <= 0 {
+                return Err("writing kernel.msgmax failed");
+            }
+            let q = match call(Syscall::Msgget.raw(), a2(0, IPC_CREAT | 0o600, 0)) {
+                Some(id) if id >= 0 => id as u64,
+                _ => return Err("msgget failed"),
+            };
+            let msg = [0u8; 8 + 16];
+            let send = call(Syscall::Msgsnd.raw(), a3(q, msg.as_ptr() as u64, 16, 0));
+            let _ = call(Syscall::Msgctl.raw(), a2(q, IPC_RMID, 0));
+            match send {
+                Some(v) if v == EINVAL => {}
+                _ => return Err("msgsnd past the written msgmax must be EINVAL"),
+            }
+
+            // shmget's size bound is `shm_ctlmax`.
+            if ipc_sysctl_write(b"/proc/sys/kernel/shmmax\0", b"4096\n") <= 0 {
+                return Err("writing kernel.shmmax failed");
+            }
+            match call(Syscall::Shmget.raw(), a3(0, 8192, IPC_CREAT | 0o600, 0)) {
+                Some(v) if v == EINVAL => Ok(()),
+                Some(v) if v == ENOSYS => Ok(()), // no shmem backing in this build
+                _ => Err("shmget past the written shmmax must be EINVAL"),
+            }
+        })();
+        crate::sysvipc::__test_reset_limits();
+        verdict
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_sysctl_limits_are_enforced);
+
+/// `shm_rmid_forced` is not a stored flag: writing it runs
+/// `shm_destroy_orphaned` over the namespace at once
+/// (`proc_ipc_dointvec_minmax_orphans`), and while it is set `shm_close`
+/// destroys a segment whose last attachment goes away even though nothing
+/// called IPC_RMID — which is the point, since a crashed process cannot then
+/// leak a segment that outlives every user of it.
+fn smoke_abi_ipc_shm_rmid_forced_destroys_orphans() -> TestResult {
+    with_setup(|| {
+        crate::sysvipc::__test_reset_limits();
+        let stat_size = 112;
+        let mut stat = alloc::vec![0u8; stat_size];
+        let seg = match call(Syscall::Shmget.raw(), a3(0, 4096, IPC_CREAT | 0o600, 0)) {
+            Some(id) if id >= 0 => id as u64,
+            // A build with no shmem backing answers ENOSYS; nothing to test.
+            _ => {
+                crate::sysvipc::__test_reset_limits();
+                return Ok(());
+            }
+        };
+        let stat_cmd = |id: u64, stat: &mut [u8]| {
+            call(
+                Syscall::Shmctl.raw(),
+                a3(id, IPC_STAT, stat.as_mut_ptr() as u64, 0),
+            )
+        };
+        if stat_cmd(seg, &mut stat) != Some(0) {
+            crate::sysvipc::__test_reset_limits();
+            let _ = call(Syscall::Shmctl.raw(), a3(seg, IPC_RMID, 0, 0));
+            return Err("setup: shmctl IPC_STAT on a fresh segment failed");
+        }
+        // The segment has no attachments, so the write sweeps it.
+        if ipc_sysctl_write(b"/proc/sys/kernel/shm_rmid_forced\0", b"1\n") <= 0 {
+            crate::sysvipc::__test_reset_limits();
+            let _ = call(Syscall::Shmctl.raw(), a3(seg, IPC_RMID, 0, 0));
+            return Err("writing shm_rmid_forced failed");
+        }
+        let after = stat_cmd(seg, &mut stat);
+        crate::sysvipc::__test_reset_limits();
+        match after {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(0) => {
+                let _ = call(Syscall::Shmctl.raw(), a3(seg, IPC_RMID, 0, 0));
+                Err("shm_rmid_forced did not destroy an already-orphaned segment")
+            }
+            _ => Err("shmctl IPC_STAT after the sweep returned an unexpected status"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_shm_rmid_forced_destroys_orphans
+);
+
+/// `/proc/sys/fs/mqueue/*` — `ipc/mqueue.c`'s five per-namespace limits,
+/// which `mq_open` enforces. None of the files existed and the limits were
+/// compile-time constants, so a `/etc/sysctl.d` drop-in naming one got
+/// ENOENT and no deployment could change what a queue may be created with.
+fn smoke_abi_ipc_mqueue_sysctl_limits() -> TestResult {
+    with_setup(|| {
+        const MQ_PATHS: [(&[u8], &[u8]); 5] = [
+            (b"/proc/sys/fs/mqueue/queues_max\0", b"64\n"),
+            (b"/proc/sys/fs/mqueue/msg_max\0", b"20\n"),
+            (b"/proc/sys/fs/mqueue/msgsize_max\0", b"4096\n"),
+            (b"/proc/sys/fs/mqueue/msg_default\0", b"5\n"),
+            (b"/proc/sys/fs/mqueue/msgsize_default\0", b"512\n"),
+        ];
+        crate::sysvipc::__test_reset_limits();
+        let verdict = (|| -> Result<(), &'static str> {
+            for (path, value) in MQ_PATHS {
+                if ipc_sysctl_write(path, value) <= 0 {
+                    return Err("writing an fs/mqueue limit failed");
+                }
+                if ipc_sysctl_read(path)?.trim()
+                    != alloc::string::String::from_utf8_lossy(value).trim()
+                {
+                    return Err("an fs/mqueue limit did not read back what was written");
+                }
+            }
+            // `proc_dointvec_minmax`'s declared ranges: msg_max is
+            // [1, HARD_MSGMAX] and msgsize_max [128, HARD_MSGSIZEMAX].
+            if ipc_sysctl_write(b"/proc/sys/fs/mqueue/msg_max\0", b"0\n") != -22 {
+                return Err("msg_max must refuse a value below its minimum");
+            }
+            if ipc_sysctl_write(b"/proc/sys/fs/mqueue/msgsize_max\0", b"64\n") != -22 {
+                return Err("msgsize_max must refuse a value below 128");
+            }
+            if ipc_sysctl_write(b"/proc/sys/fs/mqueue/msg_max\0", b"65537\n") != -22 {
+                return Err("msg_max must refuse a value past HARD_MSGMAX");
+            }
+            Ok(())
+        })();
+        crate::sysvipc::__test_reset_limits();
+        verdict
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mqueue_sysctl_limits);
+
+/// The written limits are what `mq_open` then enforces: an attr past
+/// `msg_max`/`msgsize_max` is EINVAL for an unprivileged caller, and a
+/// create with no attr takes `msg_default`/`msgsize_default`.
+fn smoke_abi_ipc_mqueue_limits_are_enforced() -> TestResult {
+    with_setup(|| {
+        const O_CREAT: u64 = 0o100;
+        const O_RDWR: u64 = 2;
+        // The syscall takes the name WITHOUT its leading slash: glibc's
+        // `mq_open` validates the `/` itself and passes `name + 1`, which
+        // is why the kernel's own tests use a bare name.
+        const MQ_NAME: &[u8] = b"narf-mq-limit\0";
+        crate::sysvipc::__test_reset_limits();
+        let task = crate::handlers::current_task_id();
+        let verdict = (|| -> Result<(), &'static str> {
+            if ipc_sysctl_write(b"/proc/sys/fs/mqueue/msg_max\0", b"4\n") <= 0
+                || ipc_sysctl_write(b"/proc/sys/fs/mqueue/msgsize_max\0", b"256\n") <= 0
+                || ipc_sysctl_write(b"/proc/sys/fs/mqueue/msg_default\0", b"3\n") <= 0
+                || ipc_sysctl_write(b"/proc/sys/fs/mqueue/msgsize_default\0", b"128\n") <= 0
+            {
+                return Err("writing the fs/mqueue limits failed");
+            }
+            // CAP_SYS_RESOURCE is the exemption, so drop it for the bounds to
+            // bind at all — exactly as on Linux, where a capable caller is
+            // bounded only by HARD_MSGMAX/HARD_MSGSIZEMAX.
+            const CAP_SYS_RESOURCE_BIT: u64 = 1 << 24;
+            crate::handlers::__test_set_caps(task, !CAP_SYS_RESOURCE_BIT, !CAP_SYS_RESOURCE_BIT);
+            // attr = { maxmsg: 8, msgsize: 128 } — past the written msg_max.
+            let attr: [i64; 4] = [0, 8, 128, 0];
+            let over = call(
+                Syscall::MqOpen.raw(),
+                a3(
+                    MQ_NAME.as_ptr() as u64,
+                    O_CREAT | O_RDWR,
+                    0o600,
+                    attr.as_ptr() as u64,
+                ),
+            );
+            if over != Some(EINVAL) {
+                if let Some(fd) = over.filter(|v| *v >= 0) {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                    let _ = call(Syscall::MqUnlink.raw(), a0(MQ_NAME.as_ptr() as u64));
+                }
+                return Err("mq_open past the written msg_max must be EINVAL");
+            }
+            // No attr: the defaults apply and the create succeeds.
+            let opened = call(
+                Syscall::MqOpen.raw(),
+                a3(MQ_NAME.as_ptr() as u64, O_CREAT | O_RDWR, 0o600, 0),
+            );
+            let fd = match opened {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("mq_open with no attr must take the defaults and succeed"),
+            };
+            let mut got = [0i64; 4];
+            let attrs = call(
+                Syscall::MqGetsetattr.raw(),
+                a3(fd, 0, got.as_mut_ptr() as u64, 0),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            let _ = call(Syscall::MqUnlink.raw(), a0(MQ_NAME.as_ptr() as u64));
+            if attrs != Some(0) {
+                return Err("mq_getsetattr on the new queue failed");
+            }
+            if got[1] != 3 || got[2] != 128 {
+                return Err("a default-attr queue did not take msg_default/msgsize_default");
+            }
+            Ok(())
+        })();
+        crate::sysvipc::__test_reset_limits();
+        restore_ipc_privilege(task);
+        let _ = call(
+            Syscall::MqUnlink.raw(),
+            a0(c"narf-mq-limit".as_ptr() as u64),
+        );
+        verdict
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mqlimits",
+    smoke_abi_ipc_mqueue_limits_are_enforced
+);
+
+/// `do_mq_timedsend` validates the priority and the length BEFORE it reads
+/// the message, so an oversized or bad-priority send through an unreadable
+/// pointer is EMSGSIZE/EINVAL, not EFAULT — and `do_mq_notify` refuses
+/// signal 0, which is not a signal.
+fn smoke_abi_ipc_mqueue_send_errno_order() -> TestResult {
+    with_setup(|| {
+        const O_CREAT: u64 = 0o100;
+        const O_RDWR: u64 = 2;
+        const MQ_PRIO_MAX: u64 = 32_768;
+        let name = c"narf-mq-order";
+        let attr: [i64; 4] = [0, 4, 64, 0];
+        let fd = match call(
+            Syscall::MqOpen.raw(),
+            a3(
+                name.as_ptr() as u64,
+                O_CREAT | O_RDWR,
+                0o600,
+                attr.as_ptr() as u64,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("setup: mq_open failed"),
+        };
+        // msg_len past mq_msgsize, through a pointer that would fault.
+        let oversized = call(Syscall::MqTimedsend.raw(), a4(fd, BAD_PTR, 128, 0, 0));
+        // A priority at MQ_PRIO_MAX, same unreadable pointer.
+        let bad_prio = call(
+            Syscall::MqTimedsend.raw(),
+            a4(fd, BAD_PTR, 4, MQ_PRIO_MAX, 0),
+        );
+        // SIGEV_SIGNAL (notify 0) with signo 0.
+        let sigev = [0u64; 8];
+        let notify = call(Syscall::MqNotify.raw(), a1(fd, sigev.as_ptr() as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let _ = call(Syscall::MqUnlink.raw(), a0(name.as_ptr() as u64));
+        if oversized != Some(EMSGSIZE) {
+            return Err("mq_timedsend past mq_msgsize must be EMSGSIZE before the copy");
+        }
+        if bad_prio != Some(EINVAL) {
+            return Err("mq_timedsend at MQ_PRIO_MAX must be EINVAL before the copy");
+        }
+        if notify != Some(EINVAL) {
+            return Err("mq_notify with signal 0 must be EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mqueue_send_errno_order);
 
 fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
     with_setup(|| {
@@ -1842,7 +2417,7 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         }
 
         let task = crate::handlers::current_task_id();
-        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        drop_ipc_privilege(task, 1000);
         if call(
             Syscall::Semctl.raw(),
             a3(index, 0, SEM_STAT, stat.as_mut_ptr() as u64),
@@ -1857,7 +2432,7 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         {
             return Err("SEM_STAT_ANY must bypass ordinary read permission");
         }
-        crate::handlers::__test_set_fsids(task, 0, 0);
+        restore_ipc_privilege(task);
         if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
             return Err("semctl info test cleanup failed");
         }
@@ -4170,14 +4745,13 @@ fn smoke_abi_ipc_shmctl_info_stat_and_lock() -> TestResult {
             return Err("setup: could not assign SHM_LOCK test owner");
         }
         let task = crate::handlers::current_task_id();
-        crate::handlers::__test_set_fsids(task, 1000, 1000);
-        // Model an unprivileged owner: drop caps so CAP_IPC_LOCK does not bypass
-        // RLIMIT_MEMLOCK on SHM_LOCK. `__test_set_fsids` sets fsuid directly and
-        // does NOT run the setfsuid cap fixup, so the task would otherwise still
-        // hold CAP_IPC_LOCK and shmctl's `can_do_mlock` would let the zero-limit
-        // lock through. Linux gates SHM_LOCK on `ns_capable(CAP_IPC_LOCK)` and
-        // then RLIMIT_MEMLOCK, so a non-cap owner over a zero limit gets EPERM.
+        // Model an unprivileged owner: Linux gates SHM_LOCK on
+        // `ns_capable(CAP_IPC_LOCK)` and only then on RLIMIT_MEMLOCK, so a
+        // non-cap owner over a zero limit gets EPERM. `drop_ipc_privilege`
+        // takes the ids and that capability together; the full drop below
+        // keeps this case's "no privilege at all" shape explicit.
         // setup() restores full caps for the next test.
+        drop_ipc_privilege(task, 1000);
         crate::handlers::__test_set_caps(task, 0, 0);
         let mut limit = [0u8; 16];
         limit[8..].copy_from_slice(&(8u64 * 1024 * 1024).to_ne_bytes());
@@ -4204,7 +4778,7 @@ fn smoke_abi_ipc_shmctl_info_stat_and_lock() -> TestResult {
         {
             return Err("SHM_UNLOCK did not release the per-user lock charge");
         }
-        crate::handlers::__test_set_fsids(task, 0, 0);
+        restore_ipc_privilege(task);
         if call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
             return Err("extended shmctl test cleanup failed");
         }

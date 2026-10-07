@@ -231,6 +231,11 @@ pub fn sys_mq_open(ctx: &mut dyn TrapContext) {
             uid,
             gid,
             attr,
+            // The namespace's `/proc/sys/fs/mqueue/*` values and the one
+            // capability that relaxes them (`capable(CAP_SYS_RESOURCE)`),
+            // which the backend read as `uid == 0`.
+            limits: crate::sysvipc::current_limits().mq,
+            privileged: crate::handlers::capable(crate::handlers::CAP_SYS_RESOURCE),
         },
     ) {
         Ok(file) => file,
@@ -314,6 +319,34 @@ pub fn sys_mq_timedsend(ctx: &mut dyn TrapContext) {
         ctx.set_return(err(errno));
         return;
     }
+    // `do_mq_timedsend` rejects the priority and the length BEFORE
+    // `load_msg` reads the buffer:
+    //
+    //     if (unlikely(msg_prio >= (unsigned long) MQ_PRIO_MAX))
+    //             return -EINVAL;
+    //     ...
+    //     if (unlikely(msg_len > info->attr.mq_msgsize)) { ret = -EMSGSIZE; … }
+    //     msg_ptr = load_msg(u_msg_ptr, msg_len);     /* -EFAULT */
+    //
+    // Both checks ran after the copy here, so an oversized send through a
+    // bad pointer reported EFAULT where Linux reports EMSGSIZE — and a
+    // caller that gets EFAULT goes looking for a pointer bug it does not
+    // have.
+    if prio >= narf_filesystem::mqueuefs::MQ_PRIO_MAX {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    match mqueuefs::msgsize_of(id) {
+        Ok(msgsize) if msg_len > msgsize as usize => {
+            ctx.set_return(err(EMSGSIZE));
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            ctx.set_return(err(mq_errno(error)));
+            return;
+        }
+    }
     // SAFETY: msg_ptr is the user message buffer; copy_from_user_vec
     // range-validates and SMAP-brackets the read of msg_len bytes.
     let bytes = match unsafe { crate::handlers::copy_from_user_vec(msg_ptr, msg_len) } {
@@ -359,9 +392,18 @@ pub fn sys_mq_timedsend(ctx: &mut dyn TrapContext) {
     }
 }
 
-/// `mq_notify(mqd, sigevent*)` — one-shot SIGEV_SIGNAL/SIGEV_NONE support.
-/// SIGEV_THREAD remains a libc/netlink protocol and is rejected until NARF's
-/// netlink layer exposes the Linux notification-cookie path.
+/// `mq_notify(mqd, sigevent*)` — one-shot SIGEV_SIGNAL/SIGEV_NONE.
+///
+/// LINUX-GAP: SIGEV_THREAD is -EINVAL. It is not a signal at all but a
+/// netlink protocol between glibc and the kernel: glibc opens an
+/// `AF_NETLINK` socket and passes its fd in `sigev_signo` (which
+/// `do_mq_notify` feeds to `netlink_getsockbyfd`) together with a 32-byte
+/// cookie in `sigev_value.sival_ptr`; the kernel retains that socket and
+/// sends the cookie to it when a message arrives, which glibc's helper
+/// thread is blocked reading. NARF's netlink layer has no path for a
+/// kernel-originated datagram to a userspace-owned socket, so the
+/// registration is refused rather than accepted and then silently never
+/// delivered.
 pub fn sys_mq_notify(ctx: &mut dyn TrapContext) {
     const SIGEV_SIGNAL: i32 = 0;
     const SIGEV_NONE: i32 = 1;
@@ -389,8 +431,11 @@ pub fn sys_mq_notify(ctx: &mut dyn TrapContext) {
         let value = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
         let signal = i32::from_ne_bytes(bytes[8..12].try_into().unwrap());
         let method = i32::from_ne_bytes(bytes[12..16].try_into().unwrap());
+        // `do_mq_notify`: `if (notification->sigev_signo >= _NSIG ||
+        // notification->sigev_signo <= 0) return -EINVAL` — signal 0 is not
+        // a signal, and this accepted it.
         if !matches!(method, SIGEV_SIGNAL | SIGEV_NONE)
-            || (method == SIGEV_SIGNAL && !(0..=64).contains(&signal))
+            || (method == SIGEV_SIGNAL && !(1..=64).contains(&signal))
         {
             ctx.set_return(err(EINVAL));
             return;

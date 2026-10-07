@@ -23,11 +23,52 @@ use crate::{
 
 /// Linux `MQ_PRIO_MAX` (`include/uapi/linux/mqueue.h`).
 pub const MQ_PRIO_MAX: u32 = 32_768;
+/// `DFLT_MSG` — `ipc_namespace.mq_msg_default`.
 pub const MQ_DEFAULT_MAXMSG: i64 = 10;
+/// `DFLT_MSGSIZE` — `mq_msgsize_default`.
 pub const MQ_DEFAULT_MSGSIZE: i64 = 8_192;
+/// `DFLT_MSGMAX` — `mq_msg_max`.
 pub const MQ_MAXMSG: i64 = 10;
+/// `DFLT_MSGSIZEMAX` — `mq_msgsize_max`.
 pub const MQ_MSGSIZE_MAX: i64 = 8_192;
+/// `DFLT_QUEUESMAX` — `mq_queues_max`.
 pub const MQ_QUEUES_MAX: usize = 256;
+/// `HARD_MSGMAX`: the ceiling even CAP_SYS_RESOURCE cannot pass.
+pub const MQ_HARD_MAXMSG: i64 = 65_536;
+/// `HARD_MSGSIZEMAX`.
+pub const MQ_HARD_MSGSIZE: i64 = 16 * 1024 * 1024;
+
+/// One IPC namespace's POSIX message-queue limits
+/// (`ipc/mqueue.c`'s `mq_sysctls`, under `/proc/sys/fs/mqueue/`).
+///
+/// They are the caller's to supply because they live with the IPC
+/// namespaces in `narf_userspace`, which this crate cannot reach — the same
+/// reason `MqueueOpenOptions` carries the uid, gid and umask.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MqueueLimits {
+    /// `mq_queues_max` — queues per namespace.
+    pub queues_max: usize,
+    /// `mq_msg_max` — the largest `mq_maxmsg` an unprivileged create may ask.
+    pub msg_max: i64,
+    /// `mq_msgsize_max` — likewise for `mq_msgsize`.
+    pub msgsize_max: i64,
+    /// `mq_msg_default` — `mq_maxmsg` when `mq_open` passes no attr.
+    pub msg_default: i64,
+    /// `mq_msgsize_default`.
+    pub msgsize_default: i64,
+}
+
+impl Default for MqueueLimits {
+    fn default() -> Self {
+        Self {
+            queues_max: MQ_QUEUES_MAX,
+            msg_max: MQ_MAXMSG,
+            msgsize_max: MQ_MSGSIZE_MAX,
+            msg_default: MQ_DEFAULT_MAXMSG,
+            msgsize_default: MQ_DEFAULT_MSGSIZE,
+        }
+    }
+}
 
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
@@ -82,6 +123,13 @@ pub struct MqueueOpenOptions {
     pub uid: u32,
     pub gid: u32,
     pub attr: Option<MqueueAttr>,
+    /// The creating namespace's `/proc/sys/fs/mqueue/*` values.
+    pub limits: MqueueLimits,
+    /// `capable(CAP_SYS_RESOURCE)`: raises the attr bounds to the HARD_*
+    /// ceilings and lets the queue count pass `queues_max`. This used to be
+    /// read as `uid == 0`, so a root task that dropped the capability kept
+    /// the exemption and a task granted it without being root never got one.
+    pub privileged: bool,
 }
 
 /// One-shot notification registration. `method` uses Linux SIGEV_* values.
@@ -334,15 +382,37 @@ fn normalize_name(name: &str) -> Result<&str, MqueueError> {
     Ok(name)
 }
 
-fn validate_attr(attr: MqueueAttr, privileged: bool) -> Result<MqueueAttr, MqueueError> {
+/// `mqueue_get_inode`'s attr bounds:
+///
+/// ```text
+/// if (!capable(CAP_SYS_RESOURCE) &&
+///     (info->attr.mq_maxmsg > ipc_ns->mq_msg_max ||
+///      info->attr.mq_msgsize > ipc_ns->mq_msgsize_max))
+///         goto out_inode;                 /* -EINVAL */
+/// if (info->attr.mq_maxmsg > HARD_MSGMAX ||
+///     info->attr.mq_msgsize > HARD_MSGSIZEMAX)
+///         goto out_inode;
+/// ```
+///
+/// — the namespace limits for an ordinary caller, the HARD_* ceilings for
+/// everyone.
+fn validate_attr(
+    attr: MqueueAttr,
+    limits: MqueueLimits,
+    privileged: bool,
+) -> Result<MqueueAttr, MqueueError> {
     if attr.maxmsg <= 0 || attr.msgsize <= 0 {
         return Err(MqueueError::Invalid);
     }
-    let maxmsg_limit = if privileged { 65_536 } else { MQ_MAXMSG };
-    let msgsize_limit = if privileged {
-        16 * 1024 * 1024
+    let maxmsg_limit = if privileged {
+        MQ_HARD_MAXMSG
     } else {
-        MQ_MSGSIZE_MAX
+        limits.msg_max.min(MQ_HARD_MAXMSG)
+    };
+    let msgsize_limit = if privileged {
+        MQ_HARD_MSGSIZE
+    } else {
+        limits.msgsize_max.min(MQ_HARD_MSGSIZE)
     };
     if attr.maxmsg > maxmsg_limit || attr.msgsize > msgsize_limit {
         return Err(MqueueError::Invalid);
@@ -396,6 +466,8 @@ pub fn open(
         uid,
         gid,
         attr,
+        limits,
+        privileged,
     } = options;
     let name = normalize_name(name)?.to_string();
     let want = requested_access(flags)?;
@@ -428,10 +500,22 @@ pub fn open(
                 .keys()
                 .filter(|(ns, _)| *ns == namespace)
                 .count();
-            if queue_count >= MQ_QUEUES_MAX && uid != 0 {
+            // `if (ipc_ns->mq_queues_count >= ipc_ns->mq_queues_max &&
+            //      !capable(CAP_SYS_RESOURCE))` — the capability, where this
+            // read `uid != 0`.
+            if queue_count >= limits.queues_max && !privileged {
                 return Err(MqueueError::NoSpace);
             }
-            let attr = validate_attr(attr.unwrap_or_default(), uid == 0)?;
+            // `do_create`'s default when `mq_open` passes no attr:
+            // `mq_msg_default` / `mq_msgsize_default`, each bounded by its
+            // max, rather than the compiled-in pair.
+            let attr = attr.unwrap_or(MqueueAttr {
+                flags: 0,
+                maxmsg: limits.msg_default.min(limits.msg_max),
+                msgsize: limits.msgsize_default.min(limits.msgsize_max),
+                curmsgs: 0,
+            });
+            let attr = validate_attr(attr, limits, privileged)?;
             let inode = registry.alloc_id();
             let queue = Arc::new(Queue::new(inode, uid, gid, mode & !umask & 0o777, attr));
             registry.names.insert(key, queue.clone());
@@ -555,6 +639,12 @@ pub fn close_notification(handle_id: u64, task_id: u64) {
     let _ = notify(handle_id, task_id, None);
 }
 
+/// The queue's `mq_msgsize`, for the checks `do_mq_timedsend` makes BEFORE
+/// it copies the message in.
+pub fn msgsize_of(handle_id: u64) -> Result<i64, MqueueError> {
+    Ok(handle(handle_id)?.queue.msgsize)
+}
+
 pub fn receive(handle_id: u64, buffer_len: usize) -> Result<(Vec<u8>, u32), MqueueError> {
     let file = handle(handle_id)?;
     if file.flags.load(Ordering::Acquire) & O_ACCMODE == O_WRONLY {
@@ -660,6 +750,11 @@ impl DirOps for MqueueDir {
                     uid: 0,
                     gid: 0,
                     attr: None,
+                    // A create through the mounted filesystem has no syscall
+                    // context to read the namespace's limits or the caller's
+                    // capability from: the compiled defaults, unprivileged.
+                    limits: MqueueLimits::default(),
+                    privileged: false,
                 },
             )
             .map_err(|error| match error {
