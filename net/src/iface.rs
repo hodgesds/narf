@@ -113,9 +113,16 @@ pub struct NetIfaceEntry {
     pub send_frame: Option<SendFrameFn>,
     /// Recycling pool backing zero-copy TX (`Some` iff `send_frame` is). The
     /// stack draws build buffers from it ([`tx_acquire`]); the driver returns
-    /// them on completion ([`tx_release`]). `Arc` so a snapshot can hold the
-    /// pool without re-looking-up the registry.
+    /// them on completion ([`tx_release`], or — for a driver that shares its
+    /// own pool — its async TX reaper). `Arc` so a snapshot can hold the pool
+    /// without re-looking-up the registry, and so a driver can share the very
+    /// pool its completion path already recycles into.
     pub tx_pool: Option<Arc<DmaPool>>,
+    /// Bytes of head-room the stack leaves before the Ethernet frame in a
+    /// zero-copy TX buffer, for a device header the driver writes in front
+    /// (virtio-net's 12-byte header). 0 for a device that DMAs from offset 0
+    /// (e1000). [`tx_acquire`] returns a `Frame` whose payload starts after it.
+    pub tx_headroom: usize,
 }
 
 /// One `netdev_hw_addr` on a device's multicast or unicast list.
@@ -159,44 +166,66 @@ pub fn set_offloads(name: &str, offloads: crate::OffloadCapabilities) {
     }
 }
 
-/// Opt an interface into zero-copy TX (P-F). The driver supplies a
-/// [`SendFrameFn`] that DMAs a handed-in [`crate::Frame`] directly, and the
-/// iface grows a recycling TX pool of `cap` buffers of `buf_len` bytes. After
-/// this, the stack builds egress frames straight into pool buffers and hands
-/// ownership to the driver instead of copying a slice through [`send`]. Called
-/// at probe, after [`register`]. Idempotent-ish: re-calling replaces the hook
-/// and pool.
+/// Opt an interface into zero-copy TX (P-F) with an iface-owned recycling pool
+/// of `cap` buffers of `buf_len` bytes and no head-room — the shape for a
+/// driver (e1000) whose TX is synchronous and recycles via [`tx_release`]. The
+/// driver supplies a [`SendFrameFn`] that DMAs a handed-in [`crate::Frame`]
+/// directly. Called at probe, after [`register`].
 pub fn enable_zero_copy_tx(name: &str, send_frame: SendFrameFn, buf_len: usize, cap: usize) {
     use narf_lib::id::DomainId;
+    let pool = Arc::new(DmaPool::new(buf_len, DomainId::DRIVER_0, cap));
+    enable_zero_copy_tx_pool(name, send_frame, pool, 0);
+}
+
+/// Opt an interface into zero-copy TX sharing a driver-provided `pool` and
+/// reserving `headroom` bytes before the frame — the shape for a driver
+/// (virtio-net) whose TX is async and which recycles completed buffers into
+/// its *own* pool. Sharing that pool means the stack's [`tx_acquire`] draws
+/// from, and the driver's reaper returns to, one free-list; `headroom` leaves
+/// room for the device header the driver writes in front of the frame. After
+/// this the stack builds egress frames into pool buffers and hands ownership
+/// to `send_frame` instead of copying a slice through [`send`].
+pub fn enable_zero_copy_tx_pool(
+    name: &str,
+    send_frame: SendFrameFn,
+    pool: Arc<DmaPool>,
+    headroom: usize,
+) {
     if let Some(entry) = IFACES
         .lock()
         .as_mut()
         .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
     {
         entry.send_frame = Some(send_frame);
-        entry.tx_pool = Some(Arc::new(DmaPool::new(buf_len, DomainId::DRIVER_0, cap)));
+        entry.tx_pool = Some(pool);
+        entry.tx_headroom = headroom;
     }
 }
 
 /// Acquire a TX build buffer from `name`'s zero-copy pool, wrapped as a
-/// [`crate::Frame`] of exactly `len` bytes for the stack to build into. Returns
-/// `None` — so the caller falls back to the classic copy path — when the iface
-/// has not opted into zero-copy TX, when `len` exceeds the pool's buffer size
-/// (e.g. a TSO super-frame larger than the pool buffer), or when the allocator
-/// is out of memory.
+/// [`crate::Frame`] of exactly `len` payload bytes starting after the iface's
+/// head-room, for the stack to build into. Returns `None` — so the caller
+/// falls back to the classic copy path — when the iface has not opted into
+/// zero-copy TX, when `headroom + len` exceeds the pool's buffer size (e.g. a
+/// TSO super-frame larger than the pool buffer), or when the allocator is out
+/// of memory.
 pub fn tx_acquire(name: &str, len: usize) -> Option<crate::Frame> {
-    let pool = {
+    let (pool, headroom) = {
         let g = IFACES.lock();
         let entry = g
             .as_ref()?
             .iter()
             .find(|entry| entry.name == name && entry.send_frame.is_some())?;
-        entry.tx_pool.clone()?
+        (entry.tx_pool.clone()?, entry.tx_headroom)
     };
-    if len > pool.buf_len() {
+    if headroom + len > pool.buf_len() {
         return None;
     }
-    Some(crate::Frame::new(pool.acquire()?, len as u32))
+    Some(crate::Frame::with_offset(
+        pool.acquire()?,
+        headroom as u32,
+        len as u32,
+    ))
 }
 
 /// Return a completed TX buffer to `name`'s zero-copy pool for reuse. The
@@ -490,10 +519,11 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
         offloads: old
             .as_ref()
             .map_or_else(Default::default, |old| old.offloads),
-        // A re-probe preserves any zero-copy TX opt-in (hook + pool) so the
-        // stack keeps the same recycling pool across a driver reset.
+        // A re-probe preserves any zero-copy TX opt-in (hook + pool + headroom)
+        // so the stack keeps the same recycling pool across a driver reset.
         send_frame: old.as_ref().and_then(|old| old.send_frame),
         tx_pool: old.as_ref().and_then(|old| old.tx_pool.clone()),
+        tx_headroom: old.as_ref().map_or(0, |old| old.tx_headroom),
     });
     drop(g);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its

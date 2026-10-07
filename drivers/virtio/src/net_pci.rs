@@ -298,8 +298,10 @@ pub struct VirtioNetPci {
     /// transmit returns its 4 KiB buffer here instead of freeing it, and
     /// `tx_buf_acquire` pops from here instead of `alloc_coherent` — keeping
     /// the coherent/buddy allocator off the per-frame TX hot path. Capped at
-    /// `TX_POOL_CAP`; overflow drops (frees) the buffer. Shared `DmaPool`.
-    tx_pool: DmaPool,
+    /// `TX_POOL_CAP`; overflow drops (frees) the buffer. `Arc` so zero-copy TX
+    /// (P-F) can share this exact pool with the iface layer: the stack's
+    /// `tx_acquire` draws from it and this driver's TX reaper recycles into it.
+    tx_pool: Arc<DmaPool>,
     /// Recycled RX DMA buffers (the RX frame/`skb` pool). The forwarder returns
     /// each fully-consumed RX buffer here instead of freeing it, and
     /// `rx_take_on` pops from here for the replacement it posts back to the
@@ -717,7 +719,7 @@ impl VirtioNetPci {
             ctrl_qidx,
             ctrl,
             cfg_phys,
-            tx_pool: DmaPool::new(4096, DomainId::DRIVER_0, TX_POOL_CAP),
+            tx_pool: Arc::new(DmaPool::new(4096, DomainId::DRIVER_0, TX_POOL_CAP)),
             rx_pool: DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP),
         };
 
@@ -1586,6 +1588,12 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         // `virtnet_get_drvinfo`: driver "virtio_net", VIRTNET_DRIVER_VERSION.
         narf_net::iface::set_driver_info(name, "virtio_net", Some("1.0.0"), bus_info);
         *PRIMARY_IFNAME.lock() = Some(name);
+        // Opt into zero-copy TX (P-F), sharing this controller's own TX pool so
+        // the stack's `tx_acquire` and the TX reaper use one free-list. 12-byte
+        // head-room for the virtio-net header `tx_dma` writes in front.
+        if let Some(pool) = with_at(idx, |c| c.tx_pool.clone()) {
+            narf_net::iface::enable_zero_copy_tx_pool(name, vnet0_send_frame_zc, pool, 12);
+        }
         name.into()
     } else {
         narf_net::iface::reserve_name("eth%d").into()
@@ -1972,6 +1980,28 @@ fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
         // `tx_dma` consumed `buf` (the closure moved it in). On the
         // None branch (no controller) the closure never ran and `buf`
         // would have been dropped inside `with_controller`'s map.
+        _ => Err(()),
+    }
+}
+
+/// Zero-copy `iface::SendFrameFn` (P-F). The stack built the Ethernet frame
+/// directly into a buffer drawn from this controller's own TX pool, at the
+/// 12-byte head-room `enable_zero_copy_tx_pool` requested — exactly the layout
+/// `tx_dma` expects (body at offset 12, header space in front). So hand the
+/// buffer straight to the fire-and-forget `tx_dma` with no copy; the TX reaper
+/// recycles it back into the shared pool on completion. Replaces the
+/// slice-into-`buf[12..]` memcpy `vnet0_send_fn` does.
+fn vnet0_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Result<(), ()> {
+    let len = frame.len() as usize;
+    if len == 0 || len > MAX_FRAME - 12 {
+        return Err(());
+    }
+    // `tx_acquire` built this via `Frame::with_offset(buf, 12, len)`, so the
+    // body is at `buf[12..12 + len]` and `buf[0..12]` is the header space.
+    // Discard the offset/len view and give `tx_dma` the whole buffer.
+    let (buf, _off, _len) = frame.into_parts_with_offset();
+    match with_controller(|c| c.tx_dma(buf, len as u32)) {
+        Some(Ok(())) => Ok(()),
         _ => Err(()),
     }
 }
