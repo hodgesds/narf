@@ -474,22 +474,20 @@ impl<B: BlockDevice + 'static> Ext2Volume<B> {
     }
 
     /// `ext4_new_inode` on a volume with the extents feature: a new regular
-    /// file maps its data through an extent tree, starting from an empty
-    /// depth-0 root (`ext4_ext_tree_init`). On a volume without the feature
-    /// the inode keeps the classic block map.
-    ///
-    /// LINUX-GAP: Linux does the same for directories (and for symlinks
-    /// whose target does not fit inline). This driver's directory code
-    /// still writes block pointers directly, so new directories stay block
-    /// mapped — valid ext4, which reads either kind.
-    pub(crate) fn init_new_file_extents(&self, inode: &mut Inode) {
+    /// file, directory or slow symlink maps its data through an extent tree,
+    /// starting from an empty depth-0 root (`ext4_ext_tree_init`). A fast
+    /// symlink keeps its target inline instead (`ext4_symlink` clears the
+    /// flag). On a volume without the feature nothing changes: the inode
+    /// keeps the classic block map. Returns whether the root was installed.
+    pub(crate) fn init_extent_root(&self, inode: &mut Inode) -> bool {
         if !self.superblock.uses_extents() {
-            return;
+            return false;
         }
         inode.flags |= super::super::inode::I_FLAGS_EXTENTS;
         let mut root = vec![0u8; 60];
         write_header(&mut root, 0, ROOT_MAX, 0);
         store_root(inode, &root);
+        true
     }
 
     /// `ext4_alloc_file_blocks(..., EXT4_GET_BLOCKS_CREATE_UNWRIT_EXT)` for

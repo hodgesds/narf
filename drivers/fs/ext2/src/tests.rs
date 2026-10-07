@@ -6122,6 +6122,91 @@ fn smoke_ext4_new_files_are_extent_mapped() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext4_new_files_are_extent_mapped);
 
+/// `ext4_new_inode` gives new directories and slow symlinks an extent tree
+/// too; a fast symlink keeps its target inline. And an extent-mapped slow
+/// symlink — every link target over 60 bytes on a Linux-made ext4 volume —
+/// is read through the mapping: `i_block[0]` holds the extent header, not a
+/// block number. NARF made directories and slow symlinks block-mapped, and
+/// read a slow symlink's `i_block[0]` as a pointer.
+fn smoke_ext4_new_dirs_and_slow_symlinks_are_extent_mapped() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    let device = RamBlockDevice::from_image(512, build_ext4_extent_image(b"x"));
+    let (volume, _file) = match mount_ext4_data(device) {
+        Ok(v) => v,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let root = volume.root();
+    let extent_mapped = |ino: u64| -> Option<bool> {
+        poll_once(volume.read_inode(ino as u32))
+            .and_then(|r| r.ok())
+            .map(|inode| inode.uses_extents())
+    };
+    // A directory, grown past its first block by long names.
+    let dir = match poll_once(root.mkdir("d")) {
+        Some(Ok(d)) => d,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    let dir_ino = match poll_once(root.lookup_async("d")) {
+        Some(Ok(node)) => node.ino(),
+        _ => return TestResult::Fail("lookup of the new directory failed"),
+    };
+    if extent_mapped(dir_ino) != Some(true) {
+        return TestResult::Fail("a directory created on ext4 is not extent-mapped");
+    }
+    let name = |i: u8| -> alloc::string::String {
+        let mut n = alloc::string::String::from("entry-");
+        n.push((b'a' + i) as char);
+        while n.len() < 200 {
+            n.push('z');
+        }
+        n
+    };
+    for i in 0..8 {
+        if !matches!(poll_once(dir.create(&name(i))), Some(Ok(_))) {
+            return TestResult::Fail("creating an entry in the new directory failed");
+        }
+    }
+    for i in 0..8 {
+        if !matches!(poll_once(dir.lookup_async(&name(i))), Some(Ok(_))) {
+            return TestResult::Fail("an entry of the grown directory is missing");
+        }
+    }
+    // A slow symlink: extent-mapped, and its target reads back.
+    let mut long = alloc::string::String::from("/usr/lib/");
+    while long.len() < 100 {
+        long.push('t');
+    }
+    let slow = match poll_once(root.symlink("slow", &long)) {
+        Some(Ok(l)) => l,
+        _ => return TestResult::Fail("slow symlink creation failed"),
+    };
+    if extent_mapped(slow.ino()) != Some(true) {
+        return TestResult::Fail("a slow symlink created on ext4 is not extent-mapped");
+    }
+    let mut buf = [0u8; 128];
+    match poll_once(slow.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == long.as_bytes() => {}
+        _ => return TestResult::Fail("an extent-mapped slow symlink did not read back its target"),
+    }
+    // A fast symlink stays inline.
+    let fast = match poll_once(root.symlink("fast", "/bin/busybox")) {
+        Some(Ok(l)) => l,
+        _ => return TestResult::Fail("fast symlink creation failed"),
+    };
+    if extent_mapped(fast.ino()) != Some(false) {
+        return TestResult::Fail("a fast symlink must keep its target inline");
+    }
+    match poll_once(fast.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == b"/bin/busybox" => TestResult::Pass,
+        _ => TestResult::Fail("a fast symlink did not read back its target"),
+    }
+}
+kernel_test_in!(
+    "drivers/fs/ext2",
+    smoke_ext4_new_dirs_and_slow_symlinks_are_extent_mapped
+);
+
 /// ext4 keeps sub-second timestamps in a large inode's `i_*time_extra`
 /// words (`ext4_decode_extra_time`: low 2 bits widen the seconds, upper 30
 /// are nanoseconds). fontconfig validates its system caches against a font
