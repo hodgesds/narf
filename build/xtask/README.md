@@ -75,8 +75,12 @@ reports what a boot-time KASLR slide would have to patch.
 `grub-image --arch=x86_64` produces `target/grub-x86_64/`: a direct-GRUB
 Multiboot2 kernel, its initramfs, and a `grub.cfg` stanza. It retains NARF's
 compact loadable KASLR table while removing the non-loadable linker
-relocation sections that GRUB refuses. Copy `boot/` into the host's `/boot`
-and merge the generated stanza; this path does not require Limine at runtime.
+relocation sections that GRUB refuses. On BIOS, copy `boot/` into the host's
+`/boot` and GRUB loads that artifact directly. On x86_64 UEFI, copy `esp/` to
+the root of the ESP as well: the generated stanza chainloads the bundled
+Limine EFI app, which loads the canonical kernel and initramfs from that ESP.
+The EFI app must be trusted by the active Secure Boot policy (or Secure Boot
+must be disabled); `grub-image` does not sign it.
 
 ## Relationships
 

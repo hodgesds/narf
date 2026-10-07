@@ -152,8 +152,11 @@ and CI compiler-cache integration.
   artifact. The canonical image build first materialises NARF's compact,
   loadable KASLR table; this compatibility artifact then removes only the
   ordinary non-loadable ELF relocation sections that GRUB rejects. The bundle
-  also contains its initramfs and a mergeable `grub.cfg` stanza. It requires
-  no Limine at runtime.
+  also contains its initramfs and a mergeable `grub.cfg` stanza. On BIOS the
+  stanza loads that ELF directly; on x86_64 UEFI it chainloads the bundled
+  Limine EFI app from `target/grub-x86_64/esp/`, which also contains the
+  canonical kernel, initramfs, and Limine configuration for installation to
+  the ESP.
 - `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
   Multiboot2 kernel ELF in native distribution packages and emit a
   checksummed release manifest.

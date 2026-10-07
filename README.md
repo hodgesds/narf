@@ -180,7 +180,7 @@ cargo xtask iso-boot --arch=aarch64 --release
 # Build the ISO without booting
 cargo xtask image --arch=x86_64 --release
 
-# Build a direct-GRUB Multiboot2 bundle (kernel, initramfs, and GRUB stanza)
+# Build a GRUB bundle (direct BIOS Multiboot2 + UEFI chainload assets)
 cargo xtask grub-image --arch=x86_64
 ```
 

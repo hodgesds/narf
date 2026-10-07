@@ -11,7 +11,7 @@
 // `cargo xtask test  --arch=aarch64`             — boot + run kernel tests
 // `cargo xtask host-test`                        — fast host unit-test gate
 // `cargo xtask image --arch=<arch>`              — bootable UEFI media
-// `cargo xtask grub-image --arch=x86_64`         — direct-GRUB Multiboot2 bundle
+// `cargo xtask grub-image --arch=x86_64`         — GRUB bundle (direct BIOS + UEFI shim)
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -187,9 +187,10 @@ enum Cmd {
     BpfBench(bpf_bench::BpfBenchArgs),
     /// Produce a bootable image.
     Image(BuildArgs),
-    /// Produce a direct-GRUB Multiboot2 bundle. The generated ELF retains
-    /// NARF's compact KASLR table but has no ordinary linker relocation
-    /// sections, which GRUB refuses even when they are non-loadable.
+    /// Produce a GRUB bundle. BIOS boots the generated Multiboot2 ELF
+    /// directly; x86_64 UEFI chainloads the bundled Limine EFI app. The BIOS
+    /// ELF retains NARF's compact KASLR table but has no ordinary linker
+    /// relocation sections, which GRUB refuses even when they are non-loadable.
     GrubImage(BuildArgs),
     /// Build removable media and boot it under OVMF/AAVMF UEFI.
     IsoBoot(BuildArgs),
@@ -9258,7 +9259,7 @@ interface_resolution: 1024x768
     Ok(())
 }
 
-/// Produce a direct-GRUB Multiboot2 bundle at `target/grub-x86_64/`.
+/// Produce a BIOS-direct / UEFI-chainload GRUB bundle at `target/grub-x86_64/`.
 ///
 /// GRUB accepts NARF's Multiboot2 header but rejects the normal kernel ELF
 /// because `--emit-relocs` leaves non-loadable `.rela.*` linker sections in
@@ -9311,12 +9312,70 @@ fn grub_image_cmd(args: &BuildArgs) -> Result<()> {
     std::fs::copy(&initramfs, boot_dir.join("initramfs.cpio"))
         .with_context(|| format!("copying initramfs from {}", initramfs.display()))?;
 
+    // x86_64-EFI GRUB has to leave UEFI and enter the legacy 32-bit
+    // Multiboot2 handoff state for this kernel. That transition faults on
+    // current OVMF/GRUB builds before the payload receives control (even for a
+    // minimal independent Multiboot2 probe). Keep the BIOS path above direct,
+    // but make the UEFI stanza chainload the already-built Limine EFI app.
+    // Limine loads the canonical ELF with the normal UEFI Multiboot2 path.
+    let limine_efi = stage.join("EFI/BOOT/BOOTX64.EFI");
+    let limine_conf = stage.join("boot/limine/limine.conf");
+    for (label, path) in [
+        ("Limine EFI app", &limine_efi),
+        ("Limine configuration", &limine_conf),
+    ] {
+        if !path.exists() {
+            bail!(
+                "{} missing at {}; `xtask image` did not stage the UEFI handoff assets",
+                label,
+                path.display()
+            );
+        }
+    }
+    let esp_dir = bundle.join("esp");
+    let esp_boot = esp_dir.join("boot");
+    let esp_limine = esp_boot.join("limine");
+    let esp_efi = esp_dir.join("EFI/NARF");
+    std::fs::create_dir_all(&esp_limine).with_context(|| {
+        format!(
+            "creating Limine configuration directory at {}",
+            esp_limine.display()
+        )
+    })?;
+    std::fs::create_dir_all(&esp_efi)
+        .with_context(|| format!("creating Limine EFI directory at {}", esp_efi.display()))?;
+    std::fs::copy(&kernel, esp_boot.join("narf-frame"))
+        .with_context(|| format!("copying UEFI kernel from {}", kernel.display()))?;
+    std::fs::copy(&initramfs, esp_boot.join("initramfs.cpio"))
+        .with_context(|| format!("copying UEFI initramfs from {}", initramfs.display()))?;
+    std::fs::copy(&limine_conf, esp_limine.join("limine.conf")).with_context(|| {
+        format!(
+            "copying Limine configuration from {}",
+            limine_conf.display()
+        )
+    })?;
+    std::fs::copy(&limine_efi, esp_efi.join("BOOTX64.EFI"))
+        .with_context(|| format!("copying Limine EFI app from {}", limine_efi.display()))?;
+
     let grub_cfg = r#"# Merge this stanza into the host's GRUB configuration.
-# For a full Linux userspace root, append:
-#   root=PARTLABEL=NARF_ROOT systemd_pid1
-menuentry "NARF (direct Multiboot2)" {
-    multiboot2 /boot/narf-frame-grub
-    module2 /boot/initramfs.cpio initramfs
+#
+# BIOS boots NARF directly through Multiboot2. For UEFI, first copy every file
+# under this bundle's `esp/` directory to the root of the EFI System Partition.
+# The UEFI branch then chainloads the bundled Limine app, avoiding GRUB's
+# legacy 32-bit Multiboot2 transition while retaining GRUB as the first menu.
+# The app must be trusted by the active Secure Boot policy (or Secure Boot must
+# be disabled); this bundle does not sign it.
+#
+# For a full Linux userspace root, append `root=PARTLABEL=NARF_ROOT systemd_pid1`
+# to the BIOS `multiboot2` line and to esp/boot/limine/limine.conf's kernel_cmdline.
+menuentry "NARF" {
+    if [ "${grub_platform}" = "efi" ]; then
+        search --no-floppy --file --set=narf_esp /EFI/NARF/BOOTX64.EFI
+        chainloader ($narf_esp)/EFI/NARF/BOOTX64.EFI
+    else
+        multiboot2 /boot/narf-frame-grub
+        module2 /boot/initramfs.cpio initramfs
+    fi
     boot
 }
 "#;
@@ -9342,8 +9401,9 @@ menuentry "NARF (direct Multiboot2)" {
     println!("xtask grub-image: wrote {}", bundle.display());
     println!("  kernel:    {}", grub_kernel.display());
     println!("  initramfs: {}", boot_dir.join("initramfs.cpio").display());
+    println!("  ESP:       {}", esp_dir.display());
     println!("  stanza:    {}", bundle.join("grub.cfg").display());
-    println!("  runtime: direct GRUB Multiboot2; no Limine required");
+    println!("  BIOS: direct GRUB Multiboot2; UEFI: GRUB chainloads bundled Limine");
     Ok(())
 }
 
