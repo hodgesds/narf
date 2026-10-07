@@ -735,6 +735,64 @@ kernel_test_in!(
     smoke_abi_socket_errno_bind_unix_existing_path
 );
 
+/// systemd's `socket_address_listen` + `socket_apply_socket_options`
+/// (v261, src/shared/socket-label.c / src/core/socket.c) for a user unit like
+/// `pipewire.socket` — two `ListenStream=` paths, the second named with the
+/// first as its prefix, and `Priority=6`. Every step succeeds on Linux; the
+/// fatal ones are socket, SO_REUSEADDR, the umask(~SocketMode) bind and
+/// listen(SOMAXCONN). On NARF the unit failed ("Failed to listen on PipeWire
+/// Multimedia System Sockets"), so PipeWire never started.
+fn smoke_abi_socket_errno_systemd_listen_stream_sequence() -> TestResult {
+    const SOCK_NONBLOCK: u64 = 0o4000;
+    const SOCK_CLOEXEC: u64 = 0o2000000;
+    const SO_REUSEADDR: u64 = 2;
+    const SO_PRIORITY: u64 = 12;
+    const SO_PASSRIGHTS: u64 = 83;
+    with_memfs("/rt", "rt", &[], || {
+        let old = call(Syscall::Umask.raw(), a0(0o111)).ok_or("umask failed")?;
+        let mut outcome = Ok(());
+        for path in [&b"/rt/pipewire-0"[..], &b"/rt/pipewire-0-manager"[..]] {
+            let fd = match sys(
+                Syscall::SocketOpen,
+                a2(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => {
+                    outcome = Err("socket(AF_UNIX, STREAM|NONBLOCK|CLOEXEC) failed");
+                    break;
+                }
+            };
+            if setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &1i32.to_ne_bytes()) != Some(0) {
+                outcome = Err("SO_REUSEADDR on an AF_UNIX stream socket failed");
+                break;
+            }
+            let (addr, alen) = unix_addr(path);
+            if sys(Syscall::SocketBind, a2(fd, addr.as_ptr() as u64, alen)) != Some(0) {
+                outcome = Err("bind of a ListenStream= path failed");
+                break;
+            }
+            if sys(Syscall::SocketListen, a1(fd, 4096)) != Some(0) {
+                outcome = Err("listen(fd, SOMAXCONN) failed");
+                break;
+            }
+            if setsockopt(fd, SOL_SOCKET, SO_PASSRIGHTS, &0i32.to_ne_bytes()) != Some(0) {
+                outcome = Err("SO_PASSRIGHTS=0 failed");
+                break;
+            }
+            if setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &6i32.to_ne_bytes()) != Some(0) {
+                outcome = Err("SO_PRIORITY=6 failed");
+                break;
+            }
+        }
+        let _ = call(Syscall::Umask.raw(), a0(old as u64));
+        outcome
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_systemd_listen_stream_sequence
+);
+
 /// `net/ipv6/af_inet6.c::inet6_bind_sk` / `__inet6_bind`: addrlen <
 /// SIN6_LEN_RFC2133 → EINVAL, then a foreign family → EAFNOSUPPORT.
 fn smoke_abi_socket_errno_bind_inet6_validation() -> TestResult {
