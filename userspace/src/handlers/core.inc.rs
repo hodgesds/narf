@@ -5391,6 +5391,11 @@ pub(crate) const CAP_NET_RAW: u32 = 13;
 /// `RLIMIT_MEMLOCK`. Linux `mm/mlock.c::can_do_mlock` and the mlock accounting
 /// consult it host-scoped (`capable`, not `ns_capable`).
 pub(crate) const CAP_IPC_LOCK: u32 = 14;
+/// `CAP_IPC_OWNER` (`include/uapi/linux/capability.h`: 15) — bypass the
+/// permission checks on a System V IPC object. `ipc/util.c::ipcperms` asks
+/// for it against the IPC namespace's user namespace, and it is the ONLY
+/// bypass there: a uid-0 task that dropped it is refused like any other.
+pub(crate) const CAP_IPC_OWNER: u32 = 15;
 pub(crate) const CAP_SYS_MODULE: u32 = 16;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
@@ -5567,6 +5572,31 @@ fn write_caps(task: u64, caps: Caps) {
 /// container owner is refused inside its own namespace.
 pub(crate) fn capable(cap: u32) -> bool {
     task_capable(current_task_id(), cap)
+}
+
+/// `ns_capable(ipc_ns->user_ns, cap)` — the authority every System V IPC
+/// privilege check asks for (`ipcperms`' CAP_IPC_OWNER,
+/// `ipcctl_obtain_check`'s CAP_SYS_ADMIN, `shmctl_do_lock`'s CAP_IPC_LOCK).
+///
+/// Scoped to the IPC namespace's owning user namespace, as Linux scopes it:
+/// the owner of a container's IPC namespace administers the objects in it
+/// without holding anything on the host.
+///
+/// LINUX-GAP: a build without the `container` feature has no IPC namespace
+/// to scope against, so the check is host-scoped `capable()` — strictly
+/// narrower, and the same answer in the single-namespace case that build
+/// has.
+pub(crate) fn ipc_ns_capable(cap: u32) -> bool {
+    #[cfg(feature = "container")]
+    {
+        let task = current_task_id();
+        let ipc_ns = crate::namespaces::current_ipc_namespace(task);
+        task_ns_capable(task, &ipc_ns.owner_user_ns(), cap)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        capable(cap)
+    }
 }
 
 /// `security/commoncap.c::cap_capable` — does `task` hold `cap` with respect
@@ -18507,9 +18537,6 @@ fn shm_ipc_allowed(seg: &ShmSegment, request: u32) -> bool {
     // mask before comparing it with the caller-selected permission class.
     let request = ((request >> 6) | (request >> 3) | request) & 0o7;
     let cred = current_ucred();
-    if cred.uid == 0 {
-        return true;
-    }
     let groups = current_groups();
     let granted = if cred.uid == seg.uid || cred.uid == seg.cuid {
         (seg.mode >> 6) & 0o7
@@ -18522,12 +18549,26 @@ fn shm_ipc_allowed(seg: &ShmSegment, request: u32) -> bool {
     } else {
         seg.mode & 0o7
     };
-    granted & request == request
+    // `ipcperms`: the capability is consulted only when the mode check
+    // fails, and it is CAP_IPC_OWNER — not uid 0, which is what this used.
+    // A root task that dropped the capability kept the bypass, and a task
+    // granted it without being root never got one.
+    granted & request == request || ipc_ns_capable(CAP_IPC_OWNER)
 }
 
+/// `ipc/util.c::ipcctl_obtain_check`'s ownership test:
+///
+/// ```text
+/// if (uid_eq(euid, ipcp->cuid) || uid_eq(euid, ipcp->uid) ||
+///     ns_capable(ns->user_ns, CAP_SYS_ADMIN))
+///         return ipcp;
+/// err = -EPERM;
+/// ```
+///
+/// The bypass is CAP_SYS_ADMIN, which this read as uid 0.
 fn shm_ipc_owner(seg: &ShmSegment) -> bool {
     let uid = current_ucred().uid;
-    uid == 0 || uid == seg.uid || uid == seg.cuid
+    uid == seg.uid || uid == seg.cuid || ipc_ns_capable(CAP_SYS_ADMIN)
 }
 
 /// Drop an in-progress attach reservation. If `IPC_RMID` raced the mapping,

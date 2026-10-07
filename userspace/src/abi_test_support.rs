@@ -366,6 +366,41 @@ pub fn drop_to_unprivileged_uid() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Make the harness task unprivileged for a System V IPC permission check:
+/// move its ids to `uid` AND drop the three capabilities the IPC paths
+/// bypass with.
+///
+/// Moving the ids is not enough, and that is the whole point of the
+/// capability checks: `ipcperms` bypasses the mode bits for CAP_IPC_OWNER,
+/// `ipcctl_obtain_check` bypasses the ownership test for CAP_SYS_ADMIN, and
+/// `shmctl_do_lock` the memlock limit for CAP_IPC_LOCK. The harness task
+/// starts with `Caps::boot()`, so a case that only changed its uid would be
+/// answered by the privileged branch and prove nothing.
+///
+/// `teardown()`/`setup()` reinstall the full set and the root ids for the
+/// next case.
+pub fn drop_ipc_privilege(task: u64, uid: u32) {
+    const CAP_IPC_LOCK: u64 = 1 << 14;
+    const CAP_IPC_OWNER: u64 = 1 << 15;
+    const CAP_SYS_ADMIN: u64 = 1 << 21;
+    let caps = u64::MAX & !(CAP_IPC_LOCK | CAP_IPC_OWNER | CAP_SYS_ADMIN);
+    crate::handlers::__test_set_caps(task, caps, caps);
+    crate::handlers::__test_set_fsids(task, uid, uid);
+}
+
+/// Undo [`drop_ipc_privilege`] mid-case: root ids and the full capability
+/// set back.
+///
+/// A case that keeps using the object afterwards needs both. The fixtures
+/// here create their sets with `IPC_CREAT` and no mode bits, and a mode-0
+/// IPC object is unreadable by its OWNER too — only CAP_IPC_OWNER gets in,
+/// which is exactly what `ipcperms` says and what the uid-0 bypass used to
+/// hide.
+pub fn restore_ipc_privilege(task: u64) {
+    crate::handlers::__test_set_caps(task, u64::MAX, u64::MAX);
+    crate::handlers::__test_set_fsids(task, 0, 0);
+}
+
 pub fn a0(arg0: u64) -> SyscallArgs {
     SyscallArgs {
         arg0,

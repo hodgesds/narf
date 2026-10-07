@@ -794,13 +794,11 @@ fn now_seconds() -> i64 {
 
 fn current_identity() -> (u64, u32, u32, Vec<u32>) {
     let cred = crate::handlers::current_ucred();
-    // Root is admitted before supplementary groups are consulted. Avoid the
-    // group-table and user-namespace lookups on this common IPC fast path.
-    let groups = if cred.uid == 0 {
-        Vec::new()
-    } else {
-        crate::handlers::current_groups()
-    };
+    // Unconditionally, as Linux's `in_group_p` consults the cred's
+    // `group_info` unconditionally. The old fast path skipped the copy for
+    // uid 0 — safe only while uid 0 short-circuited `ipc_allowed`, which is
+    // exactly the bypass that was wrong (Linux's is CAP_IPC_OWNER).
+    let groups = crate::handlers::current_groups();
     (u64::from(cred.pid), cred.uid, cred.gid, groups)
 }
 
@@ -816,9 +814,6 @@ fn ipc_allowed(
     mode: u32,
     request: u32,
 ) -> bool {
-    if caller_uid == 0 {
-        return true;
-    }
     let granted = if caller_uid == uid || caller_uid == cuid {
         (mode >> 6) & 0o7
     } else if caller_gid == gid
@@ -830,11 +825,34 @@ fn ipc_allowed(
     } else {
         mode & 0o7
     };
-    granted & request == request
+    // `ipcperms`:
+    //
+    //     if ((requested_mode & ~granted_mode & 0007) &&
+    //         !ns_capable(ns->user_ns, CAP_IPC_OWNER))
+    //             return -1;
+    //
+    // The capability is consulted only when the mode check fails — so the
+    // common path never looks one up — and it is CAP_IPC_OWNER, where this
+    // admitted uid 0 outright. A root task that dropped the capability kept
+    // the bypass; a task granted it without being root never got one.
+    granted & request == request || crate::handlers::ipc_ns_capable(crate::handlers::CAP_IPC_OWNER)
 }
 
+/// `ipc/util.c::ipcctl_obtain_check`'s ownership test, which IPC_SET,
+/// IPC_RMID and SHM_LOCK go through:
+///
+/// ```text
+/// if (uid_eq(euid, ipcp->cuid) || uid_eq(euid, ipcp->uid) ||
+///     ns_capable(ns->user_ns, CAP_SYS_ADMIN))
+///         return ipcp;
+/// err = -EPERM;
+/// ```
+///
+/// The bypass is CAP_SYS_ADMIN, which this read as uid 0.
 fn ipc_owner(caller_uid: u32, uid: u32, cuid: u32) -> bool {
-    caller_uid == 0 || caller_uid == uid || caller_uid == cuid
+    caller_uid == uid
+        || caller_uid == cuid
+        || crate::handlers::ipc_ns_capable(crate::handlers::CAP_SYS_ADMIN)
 }
 
 type SemStatSnapshot = (u32, u32, u32, u32, u32, u32, i64, i64, usize);

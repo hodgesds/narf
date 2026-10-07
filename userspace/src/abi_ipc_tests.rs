@@ -692,7 +692,7 @@ fn smoke_abi_ipc_sem_undo_allocation_errno_order() -> TestResult {
         let mut increment = [0u8; 6];
         increment[2..4].copy_from_slice(&1i16.to_le_bytes());
         increment[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
-        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        drop_ipc_privilege(FAKE_TASK, 1000);
         crate::sysvipc::__test_fail_next_sem_undo_reserve();
         if call(
             Syscall::Semop.raw(),
@@ -1667,7 +1667,7 @@ fn smoke_abi_ipc_semctl_observable_errno_order() -> TestResult {
         }
         let id = make_semset(1)?;
         // semctl_main checks read permission before sem_num for GET*.
-        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        drop_ipc_privilege(FAKE_TASK, 1000);
         if call(Syscall::Semctl.raw(), a3(id, u32::MAX as u64, GETNCNT, 0)) != Some(EACCES) {
             return Err("GETNCNT must report EACCES before invalid sem_num");
         }
@@ -1744,7 +1744,7 @@ fn smoke_abi_ipc_semctl_stat_set_layout() -> TestResult {
             return Err("semctl IPC_SET mode did not round-trip through IPC_STAT");
         }
         let task = crate::handlers::current_task_id();
-        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        drop_ipc_privilege(task, 1000);
         if call(
             Syscall::Semctl.raw(),
             a3(id, 0, IPC_STAT, stat.as_mut_ptr() as u64),
@@ -1763,6 +1763,110 @@ fn smoke_abi_ipc_semctl_stat_set_layout() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semctl_stat_set_layout);
+
+/// `ipcperms` bypasses the mode bits for **CAP_IPC_OWNER**, and
+/// `ipcctl_obtain_check` bypasses the ownership test for **CAP_SYS_ADMIN** —
+/// not for uid 0, which is what every System V IPC check in NARF asked for:
+///
+///     if (caller_uid == 0) { return true; }
+///
+/// So a root task that dropped the capability kept the bypass, and a task
+/// granted the capability without being root never got one. Both directions
+/// are pinned here, and they are different capabilities: holding
+/// CAP_IPC_OWNER does not let a non-owner IPC_SET.
+fn smoke_abi_ipc_perms_follow_capabilities_not_uid0() -> TestResult {
+    with_setup(|| {
+        const CAP_IPC_OWNER_BIT: u64 = 1 << 15;
+        const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
+        #[cfg(target_arch = "x86_64")]
+        const SIZE: usize = 104;
+        #[cfg(target_arch = "aarch64")]
+        const SIZE: usize = 88;
+
+        let task = crate::handlers::current_task_id();
+        // Owner-readable only, created by root.
+        let id = match call(Syscall::Semget.raw(), a2(0, 1, IPC_CREAT | 0o600)) {
+            Some(id) if id >= 0 => id as u64,
+            _ => return Err("setup: semget IPC_PRIVATE|0600 failed"),
+        };
+        let mut stat = [0u8; SIZE];
+        let read = |stat: &mut [u8; SIZE]| {
+            call(
+                Syscall::Semctl.raw(),
+                a3(id, 0, IPC_STAT, stat.as_mut_ptr() as u64),
+            )
+        };
+
+        // A non-owner uid with no capability: the "other" class is 0.
+        drop_ipc_privilege(task, 1000);
+        if read(&mut stat) != Some(EACCES) {
+            restore_ipc_privilege(task);
+            return Err("a non-owner with no capability must get EACCES");
+        }
+        // The same non-owner uid, granted CAP_IPC_OWNER alone: allowed.
+        crate::handlers::__test_set_caps(task, CAP_IPC_OWNER_BIT, CAP_IPC_OWNER_BIT);
+        if read(&mut stat) != Some(0) {
+            restore_ipc_privilege(task);
+            return Err("CAP_IPC_OWNER must bypass the mode bits for a non-owner");
+        }
+        // But CAP_IPC_OWNER is not the ownership bypass: IPC_SET needs
+        // CAP_SYS_ADMIN (`ipcctl_obtain_check`).
+        let mut update = [0u8; SIZE];
+        update[20..24].copy_from_slice(&0o660u32.to_ne_bytes());
+        let set = |update: &[u8; SIZE]| {
+            call(
+                Syscall::Semctl.raw(),
+                a3(id, 0, IPC_SET, update.as_ptr() as u64),
+            )
+        };
+        if set(&update) != Some(EPERM) {
+            restore_ipc_privilege(task);
+            return Err("CAP_IPC_OWNER must not stand in for the ownership check");
+        }
+        crate::handlers::__test_set_caps(task, CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT);
+        if set(&update) != Some(0) {
+            restore_ipc_privilege(task);
+            return Err("CAP_SYS_ADMIN must bypass the ownership check");
+        }
+        // And root is not privileged by being root. A set owned by uid 1000
+        // with mode 0600 is unreadable by uid 0 once the capabilities are
+        // gone: the "other" class is 0 and nothing else applies.
+        drop_ipc_privilege(task, 1000);
+        let theirs = match call(Syscall::Semget.raw(), a2(0, 1, IPC_CREAT | 0o600)) {
+            Some(id) if id >= 0 => id as u64,
+            _ => {
+                restore_ipc_privilege(task);
+                return Err("setup: an unprivileged task must still create its own set");
+            }
+        };
+        crate::handlers::__test_set_caps(task, 0, 0);
+        crate::handlers::__test_set_fsids(task, 0, 0);
+        let mut other = [0u8; SIZE];
+        let read_theirs = call(
+            Syscall::Semctl.raw(),
+            a3(theirs, 0, IPC_STAT, other.as_mut_ptr() as u64),
+        );
+        let set_theirs = call(
+            Syscall::Semctl.raw(),
+            a3(theirs, 0, IPC_SET, update.as_ptr() as u64),
+        );
+        restore_ipc_privilege(task);
+        let _ = call(Syscall::Semctl.raw(), a3(theirs, 0, IPC_RMID, 0));
+        if read_theirs != Some(EACCES) || set_theirs != Some(EPERM) {
+            return Err("uid 0 without the capabilities must not bypass either check");
+        }
+
+        restore_ipc_privilege(task);
+        if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
+            return Err("cleanup: IPC_RMID failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_perms_follow_capabilities_not_uid0
+);
 
 fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
     with_setup(|| {
@@ -1842,7 +1946,7 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         }
 
         let task = crate::handlers::current_task_id();
-        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        drop_ipc_privilege(task, 1000);
         if call(
             Syscall::Semctl.raw(),
             a3(index, 0, SEM_STAT, stat.as_mut_ptr() as u64),
@@ -1857,7 +1961,7 @@ fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
         {
             return Err("SEM_STAT_ANY must bypass ordinary read permission");
         }
-        crate::handlers::__test_set_fsids(task, 0, 0);
+        restore_ipc_privilege(task);
         if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
             return Err("semctl info test cleanup failed");
         }
@@ -4170,14 +4274,13 @@ fn smoke_abi_ipc_shmctl_info_stat_and_lock() -> TestResult {
             return Err("setup: could not assign SHM_LOCK test owner");
         }
         let task = crate::handlers::current_task_id();
-        crate::handlers::__test_set_fsids(task, 1000, 1000);
-        // Model an unprivileged owner: drop caps so CAP_IPC_LOCK does not bypass
-        // RLIMIT_MEMLOCK on SHM_LOCK. `__test_set_fsids` sets fsuid directly and
-        // does NOT run the setfsuid cap fixup, so the task would otherwise still
-        // hold CAP_IPC_LOCK and shmctl's `can_do_mlock` would let the zero-limit
-        // lock through. Linux gates SHM_LOCK on `ns_capable(CAP_IPC_LOCK)` and
-        // then RLIMIT_MEMLOCK, so a non-cap owner over a zero limit gets EPERM.
+        // Model an unprivileged owner: Linux gates SHM_LOCK on
+        // `ns_capable(CAP_IPC_LOCK)` and only then on RLIMIT_MEMLOCK, so a
+        // non-cap owner over a zero limit gets EPERM. `drop_ipc_privilege`
+        // takes the ids and that capability together; the full drop below
+        // keeps this case's "no privilege at all" shape explicit.
         // setup() restores full caps for the next test.
+        drop_ipc_privilege(task, 1000);
         crate::handlers::__test_set_caps(task, 0, 0);
         let mut limit = [0u8; 16];
         limit[8..].copy_from_slice(&(8u64 * 1024 * 1024).to_ne_bytes());
@@ -4204,7 +4307,7 @@ fn smoke_abi_ipc_shmctl_info_stat_and_lock() -> TestResult {
         {
             return Err("SHM_UNLOCK did not release the per-user lock charge");
         }
-        crate::handlers::__test_set_fsids(task, 0, 0);
+        restore_ipc_privilege(task);
         if call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
             return Err("extended shmctl test cleanup failed");
         }

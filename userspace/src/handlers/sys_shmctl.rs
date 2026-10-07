@@ -341,7 +341,9 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(errno_ret(EPERM));
                 return;
             }
-            let privileged = current_ucred().uid == 0;
+            // `shmctl_do_lock`: `if (!ns_capable(ns->user_ns,
+            // CAP_IPC_LOCK))` — not uid 0, which is what this asked.
+            let privileged = ipc_ns_capable(CAP_IPC_LOCK);
             // `cmd == SHM_LOCK && !rlimit(RLIMIT_MEMLOCK)`. A zero memlock
             // limit is an authority failure, not an accounting one, so it is
             // -EPERM here and -ENOMEM further down once shmem_lock charges a
