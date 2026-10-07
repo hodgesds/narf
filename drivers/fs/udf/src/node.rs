@@ -42,18 +42,28 @@ pub struct UdfNodeState {
     /// File body length in bytes (cached after the first ICB read).
     /// Initialised lazily — `0` means "not yet probed".
     pub size_cache: u64,
-    /// `Stat` snapshot. Mode is `DIR_RO` / `FILE_RO`.
+    /// `Stat` snapshot, with the mode `udf_fill_inode` would report.
     pub stat: Stat,
+    /// The File Entry's recorded `Uid`/`Gid` (`UDF_INVALID_ID` until an ICB
+    /// has been read, which is also its "not recorded" value).
+    pub recorded_ids: (u32, u32),
     /// atime/mtime/ctime from the ICB, decoded as Linux `udf_fill_inode`
     /// does. Zero until the ICB has been read.
     pub times: EntryTimes,
 }
 
 impl UdfNodeState {
-    /// Record a freshly-decoded ICB: size, mode and exact timestamps.
-    fn apply(&mut self, layout: &EntryLayout, times: EntryTimes) {
+    /// Record a freshly-decoded ICB: size, ownership, mode and exact
+    /// timestamps.
+    fn apply(
+        &mut self,
+        layout: &EntryLayout,
+        times: EntryTimes,
+        opts: &crate::mount_opts::UdfOpts,
+    ) {
         self.size_cache = layout.information_length;
-        self.stat = stat_from_layout(layout, times.mtime_ns);
+        self.stat = stat_from_layout(layout, times.mtime_ns, opts);
+        self.recorded_ids = (layout.uid, layout.gid);
         self.times = times;
     }
 }
@@ -87,9 +97,10 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
             icb_lsn: lsn,
             size_cache: 0,
             stat,
+            recorded_ids: (crate::icb::UDF_INVALID_ID, crate::icb::UDF_INVALID_ID),
             times: EntryTimes::default(),
         };
-        state.apply(&decoded.0, decoded.1);
+        state.apply(&decoded.0, decoded.1, &volume.opts);
         Self {
             volume,
             state: IrqSafeSpinLock::new(state),
@@ -116,6 +127,7 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
                 icb_lsn,
                 size_cache: 0,
                 stat,
+                recorded_ids: (crate::icb::UDF_INVALID_ID, crate::icb::UDF_INVALID_ID),
                 times: EntryTimes::default(),
             }),
         })
@@ -128,7 +140,9 @@ impl<B: BlockDevice + 'static> UdfNode<B> {
         let node = Self::from_fid(volume.clone(), fid)?;
         let icb_lsn = node.state.lock().icb_lsn;
         let icb = read_and_decode_icb(volume, icb_lsn).await?;
-        node.state.lock().apply(&icb.layout, icb.times);
+        node.state
+            .lock()
+            .apply(&icb.layout, icb.times, &volume.opts);
         Ok(node)
     }
 
@@ -202,11 +216,25 @@ async fn read_and_decode_icb<B: BlockDevice + 'static>(
 }
 
 /// Build a `Stat` from a freshly-decoded ICB and its exact mtime.
-pub(crate) fn stat_from_layout(layout: &EntryLayout, mtime_ns: u64) -> Stat {
-    let mode = if layout.file_type == file_type::DIRECTORY {
-        Mode::DIR_RO
-    } else {
-        Mode::FILE_RO
+/// `udf_fill_inode`'s stat: the File Entry's own permissions (converted from
+/// UDF's shifted three-bit groups by `udf_convert_permissions`), unless
+/// `mode=`/`dmode=` replace them, and then `& ~umask`.
+///
+/// NARF reported a flat 0444/0555 here, so a UDF volume's real permissions —
+/// which it DOES record, unlike FAT or ISO 9660 — were invisible.
+pub(crate) fn stat_from_layout(
+    layout: &EntryLayout,
+    mtime_ns: u64,
+    opts: &crate::mount_opts::UdfOpts,
+) -> Stat {
+    let is_dir = layout.file_type == file_type::DIRECTORY;
+    let mode = Mode {
+        file_type: if is_dir {
+            narf_filesystem::FileType::Dir
+        } else {
+            narf_filesystem::FileType::File
+        },
+        perms: opts.mode(is_dir, layout.permissions, layout.icb_flags),
     };
     Stat {
         size: layout.information_length,
@@ -219,6 +247,13 @@ pub(crate) fn stat_from_layout(layout: &EntryLayout, mtime_ns: u64) -> Stat {
 // ── FileOps ─────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
+    /// `udf_fill_inode`: the File Entry's recorded ids, with the mount's
+    /// `uid=`/`gid=` standing in for `UDF_INVALID_ID` or overriding them.
+    fn owners(&self) -> (u32, u32) {
+        let (uid, gid) = self.state.lock().recorded_ids;
+        self.volume.opts.owner_ids(uid, gid)
+    }
+
     /// Linux `__udf_iget`: the inode number is the physical block of the
     /// file's ICB (`udf_get_lb_pblock(sb, &icb, 0)`), which `icb_lsn` holds.
     fn ino(&self) -> u64 {
@@ -248,7 +283,9 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
             let icb_lsn = { self.state.lock().icb_lsn };
             let icb = read_and_decode_icb(&self.volume, icb_lsn).await?;
             // Refresh the cached size + stat under the spinlock.
-            self.state.lock().apply(&icb.layout, icb.times);
+            self.state
+                .lock()
+                .apply(&icb.layout, icb.times, &self.volume.opts);
 
             if offset >= icb.layout.information_length {
                 return Ok(0);
@@ -355,6 +392,17 @@ impl<B: BlockDevice + 'static> FileOps for UdfNode<B> {
 // ── DirOps ──────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> DirOps for UdfNode<B> {
+    /// The directory's own converted permissions, not the VFS's fixed 0755.
+    fn dir_mode(&self) -> u16 {
+        self.state.lock().stat.mode.perms
+    }
+
+    /// As [`FileOps::owners`].
+    fn dir_owners(&self) -> (u32, u32) {
+        let (uid, gid) = self.state.lock().recorded_ids;
+        self.volume.opts.owner_ids(uid, gid)
+    }
+
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         self.attrs()
     }

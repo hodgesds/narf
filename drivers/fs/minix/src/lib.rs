@@ -99,12 +99,24 @@ pub fn register_fstypes() {
     narf_filesystem::register_block_fstype("minix", build_named);
 }
 
+/// `minix_init_fs_context` installs `minix_context_ops`, which has NO
+/// `parse_param`: minix takes no filesystem-specific option at all. The
+/// generic layer still consumes the superblock flag names (`ro`, `sync`, …)
+/// from the data string, and anything left over is
+/// `"minix: Unknown parameter '%s'"` — EINVAL.
+///
+/// This refused ANY non-empty data string with EOPNOTSUPP, so a line as
+/// ordinary as `mount -t minix -o ro /dev/sdb1 /mnt` failed whenever the
+/// mounter left `ro` in the data (which `fsconfig(2)` callers and NARF's own
+/// `fsconfig` path do).
 fn build_named(
     source: &str,
     options: &str,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
-    if !options.is_empty() {
-        return Err(narf_filesystem::FsError::Unsupported);
+    for opt in narf_filesystem::fsopts::iter(options) {
+        if !narf_filesystem::fsopts::is_vfs_param(opt.key) {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
     }
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;

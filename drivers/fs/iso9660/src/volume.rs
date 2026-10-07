@@ -72,6 +72,9 @@ pub struct Iso9660Volume<B: BlockDevice> {
     io: IrqSafeSpinLock<VolumeIo>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
+    /// `isofs_sb_info`'s ownership and permission state: ISO 9660 records
+    /// carry none, so this is `uid=`/`gid=`/`mode=`/`dmode=`.
+    pub opts: crate::mount_opts::IsoOpts,
     /// Recording date of the root directory's own "." record, read at mount.
     /// Linux reads every directory inode from its "." record
     /// (`isofs_normalize_block_and_offset`), the root included
@@ -95,6 +98,15 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
     /// Requires `device.logical_block_size() == 2048` (the standard
     /// LBS, see `lib.rs` doc).
     pub async fn mount(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
+        Self::mount_with_opts(device, domain, crate::mount_opts::IsoOpts::default()).await
+    }
+
+    /// `isofs_fill_super` with the options the mount was given.
+    pub async fn mount_with_opts(
+        device: Arc<B>,
+        domain: DomainId,
+        opts: crate::mount_opts::IsoOpts,
+    ) -> Result<Arc<Self>, FsError> {
         if device.logical_block_size() as usize != SECTOR_SIZE {
             return Err(FsError::Unsupported);
         }
@@ -180,6 +192,7 @@ impl<B: BlockDevice + 'static> Iso9660Volume<B> {
             io: IrqSafeSpinLock::new(io),
             dev: narf_filesystem::inode_id::alloc_anon_dev(),
             root_date,
+            opts,
         }))
     }
 
@@ -274,8 +287,11 @@ impl<B: BlockDevice + 'static> FsInstance for Iso9660Volume<B> {
     /// are therefore EROFS at the mount, before the filesystem.
     ///
     /// LINUX-GAP: Linux rejects a read-WRITE isofs `mount(2)` with EACCES
-    /// (util-linux then retries read-only); NARF has no `mount(2)` path for
-    /// iso9660 yet and forces its internal mounts read-only instead.
+    /// (`isofs_fill_super`'s `if (!sb_rdonly(s)) return -EACCES`, after which
+    /// util-linux retries read-only). NARF's constructor cannot see the
+    /// mount flags — `MountRequest` carries the data string and the mounting
+    /// task's ids, not `MS_RDONLY` — so an `mount -t iso9660` without `ro`
+    /// silently becomes a read-only mount here instead of being refused.
     fn always_read_only(&self) -> bool {
         true
     }

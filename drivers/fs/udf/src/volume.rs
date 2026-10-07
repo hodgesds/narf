@@ -72,6 +72,9 @@ pub struct UdfVolume<B: BlockDevice> {
     pub self_weak: Weak<UdfVolume<B>>,
     /// The superblock's `st_dev`, allocated at mount.
     pub dev: u64,
+    /// `udf_sb_info`'s ownership and permission overrides — UDF records
+    /// both on disk, so these replace rather than invent them.
+    pub opts: crate::mount_opts::UdfOpts,
     /// Anchor that the mount used. Kept around for debugging /
     /// observability; the rest of the volume state is derived from
     /// it.
@@ -121,6 +124,15 @@ impl<B: BlockDevice + 'static> UdfVolume<B> {
     ///
     /// Requires `device.logical_block_size() == 2048`.
     pub async fn mount(device: Arc<B>, domain: DomainId) -> Result<Arc<Self>, FsError> {
+        Self::mount_with_opts(device, domain, crate::mount_opts::UdfOpts::default()).await
+    }
+
+    /// `udf_fill_super` with the options the mount was given.
+    pub async fn mount_with_opts(
+        device: Arc<B>,
+        domain: DomainId,
+        opts: crate::mount_opts::UdfOpts,
+    ) -> Result<Arc<Self>, FsError> {
         if device.logical_block_size() as usize != SECTOR_SIZE {
             return Err(FsError::Unsupported);
         }
@@ -285,6 +297,7 @@ impl<B: BlockDevice + 'static> UdfVolume<B> {
             root_icb,
             root_entry,
             io: IrqSafeSpinLock::new(io),
+            opts,
         }))
     }
 

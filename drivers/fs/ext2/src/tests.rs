@@ -742,8 +742,11 @@ fn smoke_ext2_volume_reconfigure_takes_ext4_params() -> TestResult {
     {
         return TestResult::Fail("reconfigure refused fstab ext4 parameters");
     }
+    // An unknown parameter is `InvalidData` -> -EINVAL, the errno
+    // `vfs_parse_fs_param` reports for "Unknown parameter"; it used to be
+    // `Unsupported`, which the mount path maps to -EOPNOTSUPP.
     match volume.reconfigure("commit=60,not_an_ext4_option") {
-        Err(FsError::Unsupported) => TestResult::Pass,
+        Err(FsError::InvalidData) => TestResult::Pass,
         _ => TestResult::Fail("reconfigure accepted a parameter ext4 does not have"),
     }
 }
