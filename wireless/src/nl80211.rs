@@ -87,17 +87,13 @@ fn find_attr(attrs: &[u8], requested_kind: u16) -> Option<&[u8]> {
     None
 }
 
-fn interface_attrs(index: u32, info: &crate::WirelessIfaceInfo) -> Vec<u8> {
+fn interface_attrs(index: u32, info: &crate::WirelessIfaceInfo, iftype: u32) -> Vec<u8> {
     let mut attrs = Vec::new();
     push_attr(&mut attrs, NL80211_ATTR_WIPHY, &index.to_ne_bytes());
     let ifindex = narf_net::netlink_route::ifindex_for_name(&info.base_name).unwrap_or(0);
     push_attr(&mut attrs, NL80211_ATTR_IFINDEX, &ifindex.to_ne_bytes());
     named_attr(&mut attrs, NL80211_ATTR_IFNAME, &info.base_name);
-    push_attr(
-        &mut attrs,
-        NL80211_ATTR_IFTYPE,
-        &NL80211_IFTYPE_STATION.to_ne_bytes(),
-    );
+    push_attr(&mut attrs, NL80211_ATTR_IFTYPE, &iftype.to_ne_bytes());
     push_attr(&mut attrs, NL80211_ATTR_MAC, &info.base_mac);
     attrs
 }
@@ -191,24 +187,42 @@ fn wiphy_attrs(
         NL80211_ATTR_SUPPORTED_IFTYPES | NLA_F_NESTED,
         &modes,
     );
+    let mut command_list: Vec<u32> = alloc::vec![
+        NL80211_CMD_GET_WIPHY as u32,
+        NL80211_CMD_GET_INTERFACE as u32,
+        NL80211_CMD_GET_PROTOCOL_FEATURES as u32,
+        32, // GET_SCAN
+        33, // TRIGGER_SCAN
+        46, // CONNECT
+        48, // DISCONNECT
+    ];
+    // A userspace-SME driver additionally advertises the low-level MLME /
+    // management-frame commands wpa_supplicant uses when it runs its own SME.
+    if iface.is_some_and(|iface| iface.supports_userspace_mlme()) {
+        command_list.extend_from_slice(&[
+            37,  // AUTHENTICATE
+            38,  // ASSOCIATE
+            39,  // DEAUTHENTICATE
+            40,  // DISASSOCIATE
+            58,  // REGISTER_FRAME
+            59,  // FRAME
+            127, // EXTERNAL_AUTH
+        ]);
+    }
+    // An AP-capable driver advertises the beacon + station-table commands.
+    if iface.is_some_and(|iface| iface.supports_ap()) {
+        command_list.extend_from_slice(&[
+            14, // SET_BEACON
+            15, // START_AP
+            16, // STOP_AP
+            18, // SET_STATION
+            19, // NEW_STATION
+            20, // DEL_STATION
+        ]);
+    }
     let mut commands = Vec::new();
-    for (index, command) in [
-        NL80211_CMD_GET_WIPHY,
-        NL80211_CMD_GET_INTERFACE,
-        NL80211_CMD_GET_PROTOCOL_FEATURES,
-        32,
-        33,
-        46,
-        48,
-    ]
-    .iter()
-    .enumerate()
-    {
-        push_attr(
-            &mut commands,
-            index as u16 + 1,
-            &(*command as u32).to_ne_bytes(),
-        );
+    for (index, command) in command_list.iter().enumerate() {
+        push_attr(&mut commands, index as u16 + 1, &command.to_ne_bytes());
     }
     push_attr(
         &mut attrs,
@@ -290,7 +304,11 @@ fn handle_in(command: u8, attrs: &[u8], dump: bool, namespace: u64) -> Result<Ve
             })
             .map(|(index, iface)| GenlReply {
                 command: NL80211_CMD_NEW_INTERFACE,
-                attrs: interface_attrs(index as u32, &iface.get_wireless_info()),
+                attrs: interface_attrs(
+                    index as u32,
+                    &iface.get_wireless_info(),
+                    iface.current_iftype(),
+                ),
             })
             .collect(),
         NL80211_CMD_GET_PROTOCOL_FEATURES => {
@@ -346,6 +364,63 @@ const OPERATIONS: &[GenlOperation] = &[
     },
     GenlOperation {
         command: NL80211_CMD_GET_PROTOCOL_FEATURES,
+        flags: GENL_CMD_CAP_DO,
+    },
+    // Userspace-SME MLME + management-frame commands. Presence in the family
+    // op table is required before the context handler is reached; per-wiphy
+    // capability (supports_userspace_mlme) is enforced there.
+    GenlOperation {
+        command: 37, // AUTHENTICATE
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 38, // ASSOCIATE
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 39, // DEAUTHENTICATE
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 40, // DISASSOCIATE
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 58, // REGISTER_FRAME
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 59, // FRAME
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 127, // EXTERNAL_AUTH
+        flags: GENL_CMD_CAP_DO,
+    },
+    // Access-Point mode commands. Per-wiphy AP capability (supports_ap) is
+    // enforced in the context handler.
+    GenlOperation {
+        command: 14, // SET_BEACON
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 15, // START_AP
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 16, // STOP_AP
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 18, // SET_STATION
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 19, // NEW_STATION
+        flags: GENL_CMD_CAP_DO,
+    },
+    GenlOperation {
+        command: 20, // DEL_STATION
         flags: GENL_CMD_CAP_DO,
     },
 ];

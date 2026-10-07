@@ -42,6 +42,7 @@
 
 pub mod dragonfly;
 pub mod groups;
+pub mod pk;
 pub mod pt;
 pub mod session;
 

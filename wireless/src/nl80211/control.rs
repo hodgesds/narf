@@ -19,6 +19,27 @@ const GET_SCAN: u8 = 32;
 const CONNECT: u8 = 46;
 const ROAM: u8 = 47;
 const DISCONNECT: u8 = 48;
+// Userspace-SME MLME command numbers (nl80211_commands).
+const AUTHENTICATE: u8 = 37;
+const ASSOCIATE: u8 = 38;
+const DEAUTHENTICATE: u8 = 39;
+const DISASSOCIATE: u8 = 40;
+const REGISTER_FRAME: u8 = 58;
+const FRAME: u8 = 59;
+const FRAME_TX_STATUS: u8 = 60;
+const EXTERNAL_AUTH: u8 = 127;
+// Access-Point command numbers (nl80211_commands).
+const SET_BEACON: u8 = 14;
+const START_AP: u8 = 15;
+const STOP_AP: u8 = 16;
+const SET_STATION: u8 = 18;
+const NEW_STATION: u8 = 19;
+const DEL_STATION: u8 = 20;
+
+/// Monotonic cookie source for NL80211_CMD_FRAME transmissions. The cookie
+/// returned in the FRAME reply is echoed back in the matching
+/// NL80211_CMD_FRAME_TX_STATUS notification.
+static FRAME_COOKIE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 struct Cache {
     name: String,
@@ -110,6 +131,16 @@ fn attr<'a>(attrs: &[(u16, &'a [u8])], kind: u16) -> Option<&'a [u8]> {
 fn u32_attr(attrs: &[(u16, &[u8])], kind: u16) -> Result<Option<u32>, i32> {
     attr(attrs, kind)
         .map(|b| Ok(u32::from_ne_bytes(b.try_into().map_err(|_| EINVAL)?)))
+        .transpose()
+}
+fn u16_attr(attrs: &[(u16, &[u8])], kind: u16) -> Result<Option<u16>, i32> {
+    attr(attrs, kind)
+        .map(|b| Ok(u16::from_ne_bytes(b.try_into().map_err(|_| EINVAL)?)))
+        .transpose()
+}
+fn mac_attr(attrs: &[(u16, &[u8])], kind: u16) -> Result<Option<[u8; 6]>, i32> {
+    attr(attrs, kind)
+        .map(|b| b.try_into().map_err(|_| EINVAL))
         .transpose()
 }
 fn channel(frequency: u32) -> Result<u32, i32> {
@@ -280,6 +311,24 @@ pub(super) fn handle(
     dump: bool,
     context: RequestContext<'_>,
 ) -> Result<Vec<GenlReply>, i32> {
+    if matches!(
+        command,
+        AUTHENTICATE
+            | ASSOCIATE
+            | DEAUTHENTICATE
+            | DISASSOCIATE
+            | REGISTER_FRAME
+            | FRAME
+            | EXTERNAL_AUTH
+    ) {
+        return mlme_handle(command, bytes, context);
+    }
+    if matches!(
+        command,
+        START_AP | STOP_AP | SET_BEACON | NEW_STATION | SET_STATION | DEL_STATION
+    ) {
+        return ap_handle(command, bytes, context);
+    }
     if !matches!(command, SCAN | GET_SCAN | CONNECT | DISCONNECT) {
         return super::handle_in(command, bytes, dump, context.net_ns_id);
     }
@@ -349,6 +398,396 @@ pub(super) fn handle(
         execute(iface, admin, namespace, index, operation).await;
     });
     Ok(Vec::new()) // generic netlink emits the requested ACK
+}
+
+/// Reject any attribute outside the per-command allowlist, so an ambiguous or
+/// unhandled parameter never silently changes the request (matches the CONNECT
+/// path and `nl80211`'s strict per-op attribute policy).
+fn reject_unknown(attrs: &[(u16, &[u8])], allowed: &[u16]) -> Result<(), i32> {
+    if attrs.iter().any(|(kind, _)| !allowed.contains(kind)) {
+        Err(EOPNOTSUPP)
+    } else {
+        Ok(())
+    }
+}
+
+/// A unicast peer/BSSID address: present, individual (not group), non-zero.
+fn require_peer(attrs: &[(u16, &[u8])]) -> Result<[u8; 6], i32> {
+    let peer = mac_attr(attrs, 6)?.ok_or(EINVAL)?;
+    if peer[0] & 1 != 0 || peer == [0; 6] {
+        return Err(EINVAL);
+    }
+    Ok(peer)
+}
+
+fn mlme_errno(err: crate::WirelessError) -> i32 {
+    match err {
+        crate::WirelessError::InvalidArgs => EINVAL,
+        crate::WirelessError::Busy => EBUSY,
+        crate::WirelessError::Denied => EPERM,
+        _ => EOPNOTSUPP,
+    }
+}
+
+/// Publish an MLME notification carrying the exchanged management frame
+/// (NL80211_ATTR_FRAME) on the `mlme` multicast group, as cfg80211 does for
+/// the authenticate/associate/deauthenticate/disassociate events.
+fn publish_mlme_frame(
+    iface: &dyn crate::WirelessNetIface,
+    ns: u64,
+    index: u32,
+    command: u8,
+    frame: &[u8],
+) {
+    if !super::in_namespace(iface, ns) {
+        return;
+    }
+    let mut attrs = Vec::new();
+    push_attr(&mut attrs, 3, &index.to_ne_bytes());
+    push_attr(&mut attrs, 51, frame); // NL80211_ATTR_FRAME
+    publish_event(NL80211_FAMILY_ID, 19, ns, GenlReply { command, attrs });
+}
+
+/// A validated userspace-SME frame exchange, run asynchronously off the
+/// `mlme_handle` dispatch (split out so the resulting event is exercisable
+/// directly, as `execute` is for CONNECT/SCAN).
+enum MlmeExec {
+    Authenticate(crate::MlmeAuthRequest),
+    Associate(crate::MlmeAssocRequest),
+    Deauthenticate {
+        peer: [u8; 6],
+        reason: u16,
+    },
+    Disassociate {
+        peer: [u8; 6],
+        reason: u16,
+    },
+    MgmtTx {
+        cookie: u64,
+        request: crate::MgmtTxRequest,
+    },
+    ExternalAuth {
+        bssid: [u8; 6],
+        status: u16,
+    },
+}
+
+async fn run_mlme(iface: Arc<dyn crate::WirelessNetIface>, ns: u64, index: u32, exec: MlmeExec) {
+    match exec {
+        MlmeExec::Authenticate(request) => {
+            if let Ok(frame) = iface.mlme_authenticate(request).await {
+                publish_mlme_frame(iface.as_ref(), ns, index, AUTHENTICATE, &frame);
+            }
+        }
+        MlmeExec::Associate(request) => {
+            if let Ok(frame) = iface.mlme_associate(request).await {
+                publish_mlme_frame(iface.as_ref(), ns, index, ASSOCIATE, &frame);
+            }
+        }
+        MlmeExec::Deauthenticate { peer, reason } => {
+            if let Ok(frame) = iface.mlme_deauthenticate(peer, reason).await {
+                publish_mlme_frame(iface.as_ref(), ns, index, DEAUTHENTICATE, &frame);
+            }
+        }
+        MlmeExec::Disassociate { peer, reason } => {
+            if let Ok(frame) = iface.mlme_disassociate(peer, reason).await {
+                publish_mlme_frame(iface.as_ref(), ns, index, DISASSOCIATE, &frame);
+            }
+        }
+        MlmeExec::MgmtTx { cookie, request } => {
+            let sent = request.frame.clone();
+            let acked = iface.mgmt_tx(cookie, request).await.unwrap_or(false);
+            if super::in_namespace(iface.as_ref(), ns) {
+                let mut attrs = Vec::new();
+                push_attr(&mut attrs, 3, &index.to_ne_bytes());
+                push_attr(&mut attrs, 51, &sent);
+                push_attr(&mut attrs, 88, &cookie.to_ne_bytes()); // COOKIE
+                if acked {
+                    push_attr(&mut attrs, 92, &[]); // NL80211_ATTR_ACK flag
+                }
+                publish_event(
+                    NL80211_FAMILY_ID,
+                    19,
+                    ns,
+                    GenlReply {
+                        command: FRAME_TX_STATUS,
+                        attrs,
+                    },
+                );
+            }
+        }
+        MlmeExec::ExternalAuth { bssid, status } => {
+            let _ = iface.external_auth_status(bssid, status).await;
+        }
+    }
+}
+
+/// Userspace-SME management path: AUTHENTICATE / ASSOCIATE / DEAUTHENTICATE /
+/// DISASSOCIATE / REGISTER_FRAME / FRAME / EXTERNAL_AUTH. Mirrors the CONNECT
+/// path: interface-bound admin authority is required, the frame exchanges run
+/// asynchronously and surface their result as `mlme`-group events, and FRAME
+/// returns its cookie synchronously (as cfg80211's nl80211_tx_mgmt does).
+fn mlme_handle(
+    command: u8,
+    bytes: &[u8],
+    context: RequestContext<'_>,
+) -> Result<Vec<GenlReply>, i32> {
+    let attrs = attributes(bytes)?;
+    let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
+    let iface = crate::registry::list()
+        .into_iter()
+        .find(|iface| {
+            narf_net::netlink_route::ifindex_for_name(iface.name()) == Some(index)
+                && super::in_namespace(iface.as_ref(), context.net_ns_id)
+        })
+        .ok_or(ENODEV)?;
+    let _admin = context
+        .admin
+        .filter(|admin| authorized(admin, iface.as_ref(), context.net_ns_id))
+        .ok_or(EPERM)?;
+    // cfg80211 rejects these on a driver that offloads its SME (-EOPNOTSUPP
+    // before the op is attempted).
+    if !iface.supports_userspace_mlme() {
+        return Err(EOPNOTSUPP);
+    }
+    let ns = context.net_ns_id;
+    match command {
+        REGISTER_FRAME => {
+            reject_unknown(&attrs, &[3, 91, 101])?;
+            let frame_type = u16_attr(&attrs, 101)?.ok_or(EINVAL)?;
+            // Must name a management frame: FC type bits (2..3) == 00.
+            if frame_type & 0x000c != 0 {
+                return Err(EINVAL);
+            }
+            let match_prefix = attr(&attrs, 91).unwrap_or(&[]);
+            iface
+                .register_mgmt_frame(frame_type, match_prefix)
+                .map_err(mlme_errno)?;
+            Ok(Vec::new())
+        }
+        FRAME => {
+            reject_unknown(&attrs, &[3, 38, 51, 87, 108])?;
+            let frame = attr(&attrs, 51).ok_or(EINVAL)?;
+            // At least a 24-byte MAC header, and a management frame.
+            if frame.len() < 24 || frame[0] & 0x000c != 0 {
+                return Err(EINVAL);
+            }
+            let channel = u32_attr(&attrs, 38)?.map(channel).transpose()?.unwrap_or(0);
+            let request = crate::MgmtTxRequest {
+                channel,
+                frame: frame.to_vec(),
+                offchannel_ok: attr(&attrs, 108).is_some(),
+                duration: u32_attr(&attrs, 87)?.unwrap_or(0),
+            };
+            let cookie = FRAME_COOKIE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            narf_scheduler::spawn(run_mlme(
+                iface,
+                ns,
+                index,
+                MlmeExec::MgmtTx { cookie, request },
+            ));
+            // Return the cookie synchronously, as cfg80211's nl80211_tx_mgmt does.
+            let mut attrs = Vec::new();
+            push_attr(&mut attrs, 88, &cookie.to_ne_bytes());
+            Ok(alloc::vec![GenlReply {
+                command: FRAME,
+                attrs,
+            }])
+        }
+        EXTERNAL_AUTH => {
+            reject_unknown(&attrs, &[3, 6, 52, 72, 76])?;
+            let bssid = require_peer(&attrs)?;
+            let status = u16_attr(&attrs, 72)?.ok_or(EINVAL)?;
+            narf_scheduler::spawn(run_mlme(
+                iface,
+                ns,
+                index,
+                MlmeExec::ExternalAuth { bssid, status },
+            ));
+            Ok(Vec::new())
+        }
+        AUTHENTICATE => {
+            reject_unknown(&attrs, &[3, 6, 38, 42, 52, 53, 156])?;
+            let peer = require_peer(&attrs)?;
+            // nl80211_auth_type: OPEN(0)..SAE(4) are the values this stack maps.
+            let auth_type = u32_attr(&attrs, 53)?.unwrap_or(0);
+            if auth_type > 4 {
+                return Err(EINVAL);
+            }
+            let ssid = attr(&attrs, 52).unwrap_or(&[]);
+            if ssid.len() > 32 {
+                return Err(EINVAL);
+            }
+            let channel = u32_attr(&attrs, 38)?.map(channel).transpose()?.unwrap_or(0);
+            let request = crate::MlmeAuthRequest {
+                peer,
+                ssid: ssid.to_vec(),
+                channel,
+                auth_type,
+                auth_data: attr(&attrs, 156).unwrap_or(&[]).to_vec(),
+            };
+            narf_scheduler::spawn(run_mlme(iface, ns, index, MlmeExec::Authenticate(request)));
+            Ok(Vec::new())
+        }
+        ASSOCIATE => {
+            reject_unknown(&attrs, &[3, 6, 38, 42, 52, 66, 73, 74, 75, 76, 79])?;
+            let peer = require_peer(&attrs)?;
+            let ssid = attr(&attrs, 52).ok_or(EINVAL)?;
+            if ssid.is_empty() || ssid.len() > 32 {
+                return Err(EINVAL);
+            }
+            let channel = u32_attr(&attrs, 38)?.map(channel).transpose()?.unwrap_or(0);
+            let prev_bssid = mac_attr(&attrs, 79)?;
+            if prev_bssid.is_some_and(|b| b[0] & 1 != 0 || b == [0; 6]) {
+                return Err(EINVAL);
+            }
+            let request = crate::MlmeAssocRequest {
+                peer,
+                ssid: ssid.to_vec(),
+                channel,
+                ie: attr(&attrs, 42).unwrap_or(&[]).to_vec(),
+                prev_bssid,
+                use_mfp: u32_attr(&attrs, 66)? == Some(2),
+            };
+            narf_scheduler::spawn(run_mlme(iface, ns, index, MlmeExec::Associate(request)));
+            Ok(Vec::new())
+        }
+        DEAUTHENTICATE | DISASSOCIATE => {
+            reject_unknown(&attrs, &[3, 6, 54])?;
+            let peer = require_peer(&attrs)?;
+            // Default reason 3 = STA is leaving (IEEE 802.11 reason code).
+            let reason = u16_attr(&attrs, 54)?.unwrap_or(3);
+            let exec = if command == DEAUTHENTICATE {
+                MlmeExec::Deauthenticate { peer, reason }
+            } else {
+                MlmeExec::Disassociate { peer, reason }
+            };
+            narf_scheduler::spawn(run_mlme(iface, ns, index, exec));
+            Ok(Vec::new())
+        }
+        _ => Err(EOPNOTSUPP),
+    }
+}
+
+/// Access-Point configuration path: START_AP / STOP_AP / SET_BEACON and the
+/// NEW/SET/DEL_STATION table operations. Beacon and station setup are
+/// synchronous — the netlink reply is the result hostapd waits on — so these
+/// return the driver's errno directly rather than deferring to an event.
+fn ap_handle(
+    command: u8,
+    bytes: &[u8],
+    context: RequestContext<'_>,
+) -> Result<Vec<GenlReply>, i32> {
+    let attrs = attributes(bytes)?;
+    let index = u32_attr(&attrs, 3)?.ok_or(EINVAL)?;
+    let iface = crate::registry::list()
+        .into_iter()
+        .find(|iface| {
+            narf_net::netlink_route::ifindex_for_name(iface.name()) == Some(index)
+                && super::in_namespace(iface.as_ref(), context.net_ns_id)
+        })
+        .ok_or(ENODEV)?;
+    let _admin = context
+        .admin
+        .filter(|admin| authorized(admin, iface.as_ref(), context.net_ns_id))
+        .ok_or(EPERM)?;
+    if !iface.supports_ap() {
+        return Err(EOPNOTSUPP);
+    }
+    match command {
+        START_AP => {
+            reject_unknown(&attrs, &[3, 12, 13, 14, 15, 38, 39, 52, 53, 70, 126, 159])?;
+            let ssid = attr(&attrs, 52).ok_or(EINVAL)?;
+            if ssid.is_empty() || ssid.len() > 32 {
+                return Err(EINVAL);
+            }
+            // The beacon head carries the 802.11 header + fixed beacon fields.
+            let beacon_head = attr(&attrs, 14).ok_or(EINVAL)?;
+            if beacon_head.len() < 24 {
+                return Err(EINVAL);
+            }
+            let beacon_interval = u32_attr(&attrs, 12)?.ok_or(EINVAL)?;
+            if beacon_interval == 0 {
+                return Err(EINVAL);
+            }
+            let dtim_period = u32_attr(&attrs, 13)?.unwrap_or(1);
+            if dtim_period == 0 {
+                return Err(EINVAL);
+            }
+            // An AP must be given an operating channel.
+            let channel = u32_attr(&attrs, 38)?
+                .map(channel)
+                .transpose()?
+                .ok_or(EINVAL)?;
+            let cfg = crate::ApConfig {
+                ssid: ssid.to_vec(),
+                beacon_head: beacon_head.to_vec(),
+                beacon_tail: attr(&attrs, 15).unwrap_or(&[]).to_vec(),
+                beacon_interval,
+                dtim_period,
+                channel,
+                hidden_ssid: u32_attr(&attrs, 126)?.unwrap_or(0),
+                privacy: attr(&attrs, 70).is_some(),
+            };
+            iface.start_ap(cfg).map_err(mlme_errno)?;
+            Ok(Vec::new())
+        }
+        STOP_AP => {
+            reject_unknown(&attrs, &[3])?;
+            iface.stop_ap().map_err(mlme_errno)?;
+            Ok(Vec::new())
+        }
+        SET_BEACON => {
+            reject_unknown(&attrs, &[3, 14, 15])?;
+            let head = attr(&attrs, 14);
+            let tail = attr(&attrs, 15);
+            // At least one of head/tail must be present to change anything.
+            if head.is_none() && tail.is_none() {
+                return Err(EINVAL);
+            }
+            if head.is_some_and(|h| h.len() < 24) {
+                return Err(EINVAL);
+            }
+            iface
+                .set_beacon(head.unwrap_or(&[]).to_vec(), tail.unwrap_or(&[]).to_vec())
+                .map_err(mlme_errno)?;
+            Ok(Vec::new())
+        }
+        NEW_STATION | SET_STATION => {
+            reject_unknown(&attrs, &[3, 6, 16, 17, 18, 19, 67])?;
+            let mac = require_peer(&attrs)?;
+            // A fully-associated station needs an AID (1..=2007) and the rates
+            // it negotiated; NL80211_CMD_NEW_STATION requires both.
+            let aid = u16_attr(&attrs, 16)?.unwrap_or(0);
+            if command == NEW_STATION && !(1..=2007).contains(&aid) {
+                return Err(EINVAL);
+            }
+            let sta = crate::StationConfig {
+                mac,
+                aid,
+                listen_interval: u16_attr(&attrs, 18)?.unwrap_or(0),
+                supported_rates: attr(&attrs, 19).unwrap_or(&[]).to_vec(),
+            };
+            if command == NEW_STATION {
+                iface.add_station(sta).map_err(mlme_errno)?;
+            } else {
+                iface.set_station(sta).map_err(mlme_errno)?;
+            }
+            Ok(Vec::new())
+        }
+        DEL_STATION => {
+            reject_unknown(&attrs, &[3, 6, 54])?;
+            // MAC is optional: its absence removes every station.
+            let mac = mac_attr(&attrs, 6)?;
+            if mac.is_some_and(|m| m[0] & 1 != 0 && m != [0xff; 6]) {
+                return Err(EINVAL);
+            }
+            let reason = u16_attr(&attrs, 54)?.unwrap_or(2);
+            iface.del_station(mac, reason).map_err(mlme_errno)?;
+            Ok(Vec::new())
+        }
+        _ => Err(EOPNOTSUPP),
+    }
 }
 
 async fn execute(
