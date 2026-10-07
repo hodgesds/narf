@@ -251,6 +251,30 @@ pub trait HwNic: Send + Sync + 'static {
     fn rx_ring(&self) -> &IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>;
     /// TX producer half.
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>;
+
+    // ── Multi-queue + RSS (first-class; single-queue by default) ─────
+    // Mirrors `narf_net::Interface`; defaults keep single-queue drivers
+    // unchanged. A multi-queue driver overrides these and the shared NAPI
+    // helper (`narf_net::napi`) + RSS core (`narf_net::rss`) drive per-queue
+    // pollers and flow steering off them.
+
+    /// Number of RX queues the device exposes. 1 ⇒ no multi-queue.
+    fn num_rx_queues(&self) -> u16 {
+        1
+    }
+    /// Number of TX queues. 1 ⇒ no multi-queue.
+    fn num_tx_queues(&self) -> u16 {
+        1
+    }
+    /// RSS configuration (Toeplitz key + indirection table) for a multi-queue
+    /// device; `None` when single-queue.
+    fn rss(&self) -> Option<narf_net::rss::RssConfig> {
+        None
+    }
+    /// Preferred CPU / IRQ binding for queue `q`. Default: boot CPU, no vector.
+    fn queue_affinity(&self, _q: u16) -> narf_net::rss::QueueAffinity {
+        narf_net::rss::QueueAffinity::default()
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

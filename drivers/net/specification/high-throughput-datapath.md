@@ -140,9 +140,20 @@ progress toward line rate.
   checksum-offload requests when the iface advertises them; drivers already
   honor `TxMeta` (P-A). Validate with ixgbe/i40e/virtio.
 - **P3 — GRO on RX.** Software GRO stage + `RxMeta` flow-hash/seg-count
-  extensions (P-B).
+  extensions (P-B). _Landed:_ the `net::gro` engine plus live wiring into
+  `tcp_stack::rx_handler` — per-CPU, iface-tagged, sitting after XDP/AF_PACKET
+  and before L3, flushed at NAPI-complete (`drain_pump` idle, virtio park).
+  Opt-in (`set_gro`) and loopback-bypassed, so the default path is unchanged.
 - **P4 — Multi-queue + RSS + NAPI/moderation.** Per-queue contract, per-core
-  pollers, RSS steering, shared NAPI helper, ITR (P-D, P-E).
+  pollers, RSS steering, shared NAPI helper, ITR (P-D, P-E). _Landed:_ the
+  first-class contract (`Interface`/`HwNic` `num_rx_queues`/`num_tx_queues`/
+  `rss`/`queue_affinity`, all defaulting to single-queue), the shared RSS core
+  (`net::rss`: Toeplitz matching the MS conformance vectors, flow-tuple
+  extraction, indirection table, flow→queue selection), and the shared NAPI
+  helper (`net::napi`: budgeted poll + race-free arm/recheck completion +
+  adaptive ITR). Validated by KATs + no-regression; no multi-queue `HwNic`
+  driver wires the trait path yet (virtio keeps its internal mq/NAPI), so the
+  per-core-poller spawn is adopted per driver as their datapaths move over.
 - **P5 — Zero-copy TX for all drivers + 100G bring-up.** Remove e1000-style
   copies, buffer recycling pools (P-F); bring mlx5 to line rate; net-bench to
   measure saturation.

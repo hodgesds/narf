@@ -84,6 +84,7 @@ pub mod ipv4;
 pub mod ipv6;
 pub mod ipv6_stack;
 pub mod mqtt;
+pub mod napi;
 pub mod netfilter;
 pub mod netlink_audit;
 pub mod netlink_diag;
@@ -110,6 +111,7 @@ pub mod raw_sock;
 pub mod readiness;
 pub mod resolv_conf;
 pub mod route;
+pub mod rss;
 pub mod stack;
 pub mod stun;
 pub mod tcp;
@@ -393,6 +395,34 @@ pub trait Interface: Send + Sync {
     /// TX producer half. Caller `lock().take()`s the producer to push
     /// outbound frames.
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>;
+
+    // ── Multi-queue + RSS (first-class; single-queue by default) ─────
+    //
+    // Every accessor defaults to the single-queue case, so a driver that does
+    // not do multi-queue is unchanged. A device that spreads flows across RX
+    // queues overrides `num_rx_queues` + `rss` (so the stack steers TX to the
+    // same queue a flow's RX hashes to) and `queue_affinity` (so one NAPI
+    // poller per queue pins to the queue's core — the flow stays L1/L2-local,
+    // no cross-core bouncing or reordering).
+
+    /// Number of RX queues the device exposes. 1 ⇒ no multi-queue.
+    fn num_rx_queues(&self) -> u16 {
+        1
+    }
+    /// Number of TX queues. 1 ⇒ no multi-queue.
+    fn num_tx_queues(&self) -> u16 {
+        1
+    }
+    /// RSS configuration (Toeplitz key + indirection table) when the device
+    /// steers flows across RX queues; `None` for a single-queue device.
+    fn rss(&self) -> Option<crate::rss::RssConfig> {
+        None
+    }
+    /// Preferred CPU / IRQ binding for queue `q`. Default binds every queue to
+    /// the boot CPU with no dedicated vector (the single-queue case).
+    fn queue_affinity(&self, _q: u16) -> crate::rss::QueueAffinity {
+        crate::rss::QueueAffinity::default()
+    }
 }
 
 // ── Registry ────────────────────────────────────────────────────────
