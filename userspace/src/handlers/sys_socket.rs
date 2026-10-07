@@ -238,7 +238,8 @@ pub(super) fn validate_socket_create(
             // `bt_sock_create`: protocol outside [0, BT_MAX_PROTO) → -EINVAL;
             // an unregistered protocol → -EPROTONOSUPPORT. Then the per-proto
             // `create`: `hci_sock_create` accepts only SOCK_RAW → otherwise
-            // -ESOCKTNOSUPPORT. Only BTPROTO_HCI is registered so far.
+            // -ESOCKTNOSUPPORT. HCI, L2CAP, SCO and RFCOMM are registered;
+            // BNEP, CMTP, HIDP, AVDTP and ISO are not.
             if !(0..BT_MAX_PROTO).contains(&protocol) {
                 return Err(EINVAL);
             }

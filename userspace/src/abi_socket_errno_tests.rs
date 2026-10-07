@@ -294,8 +294,9 @@ fn smoke_abi_socket_errno_bluetooth_hci() -> TestResult {
         if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_RAW, 99)) != Some(EINVAL) {
             return Err("AF_BLUETOOTH proto >= BT_MAX_PROTO must be EINVAL");
         }
-        // In-range but unregistered protocol (BTPROTO_L2CAP=0) → EPROTONOSUPPORT.
-        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_RAW, 0)) != Some(EPROTONOSUPPORT) {
+        // In-range but unregistered protocol → EPROTONOSUPPORT. L2CAP (0) is
+        // registered now and takes SOCK_RAW, so probe BTPROTO_BNEP (4).
+        if sys(Syscall::SocketOpen, a2(AF_BLUETOOTH, SOCK_RAW, 4)) != Some(EPROTONOSUPPORT) {
             return Err("unimplemented BT protocol must be EPROTONOSUPPORT");
         }
         // bind(sockaddr_hci{dev=HCI_DEV_NONE, channel=CONTROL}) — the mgmt
