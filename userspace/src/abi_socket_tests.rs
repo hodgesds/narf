@@ -6144,25 +6144,13 @@ fn smoke_abi_netlink_reply_pid_matches_bound_port() -> TestResult {
         }
 
         // Every message in the dump must be stamped with our port id.
-        let mut saw_done = false;
-        for _ in 0..64 {
-            let mut reply = [0u8; 1024];
-            let n = netlink_recv(fd, &mut reply).ok_or("dump recv")?;
-            if n < NLMSG_HDRLEN as i64 {
-                return Err("dump recv returned a short message");
-            }
+        drain_dump_to_done(fd, |reply| {
             let msg_pid = u32::from_ne_bytes(reply[12..16].try_into().unwrap());
             if msg_pid != portid {
                 return Err("dump reply nlmsg_pid did not match the bound port id");
             }
-            if nlmsg_type_of(&reply) == NLMSG_DONE {
-                saw_done = true;
-                break;
-            }
-        }
-        if !saw_done {
-            return Err("dump did not terminate with NLMSG_DONE");
-        }
+            Ok(())
+        })?;
 
         // The NLMSG_ERROR ack path: RTM_NEWADDR(127.0.0.1/8 on lo) with
         // NLM_F_ACK — the exact request systemd's loopback_setup enqueues. It
@@ -6504,6 +6492,47 @@ kernel_test_in!(
     smoke_abi_netlink_route_mutation_needs_cap_net_admin
 );
 
+/// Every dump NARF builds is one message per object plus the terminator, so
+/// this is a runaway guard — not an expected message count.
+const MAX_DUMP_MESSAGES: usize = 4096;
+
+/// Drain a netlink dump to its terminating `NLMSG_DONE`, running `check` on
+/// every message that precedes it. Returns how many that was.
+///
+/// A dump is as long as the thing it dumps — one RTM_NEWLINK per interface —
+/// so a fixed message bound is not a property of the kernel: it is an
+/// assertion about how many interfaces happen to exist when the case runs.
+/// These drains were bounded at 16, 32 and 64 messages and reported "did not
+/// terminate with NLMSG_DONE" when the bound ran out, so
+/// `smoke_abi_netlink_route_getlink_dump` passed or failed depending on how
+/// many netdevs the rest of the suite had registered first — and the
+/// kernel-test registry's order comes from a linker section, so adding four
+/// unrelated cases anywhere in the tree was enough to flip it.
+///
+/// The bound is now a safety valve, and the failure this assertion exists for
+/// — the reply queue ending without its terminator — is reported as itself.
+/// Both answers are the ones a caller actually cares about: `ip link` reads
+/// until DONE and has no message budget either.
+fn drain_dump_to_done(
+    fd: u64,
+    mut check: impl FnMut(&[u8]) -> Result<(), &'static str>,
+) -> Result<usize, &'static str> {
+    for seen in 0..MAX_DUMP_MESSAGES {
+        let mut msg = [0u8; 2048];
+        let n = netlink_recv(fd, &mut msg).ok_or("dump recv status")?;
+        if n < NLMSG_HDRLEN as i64 {
+            // The recv is MSG_DONTWAIT, so a short answer (or -EAGAIN) means
+            // the queue is empty: the dump ended without its terminator.
+            return Err("the dump's reply queue ran dry before NLMSG_DONE");
+        }
+        if nlmsg_type_of(&msg) == NLMSG_DONE {
+            return Ok(seen);
+        }
+        check(&msg[..n as usize])?;
+    }
+    Err("dump did not terminate with NLMSG_DONE")
+}
+
 /// Every RTM_NEWLINK of a link dump: `(ifindex, ifi_type, ifi_flags, name)`.
 fn rtnl_links(
     fd: u64,
@@ -6514,11 +6543,11 @@ fn rtnl_links(
         return Err("RTM_GETLINK send failed");
     }
     let mut links = alloc::vec::Vec::new();
-    for _ in 0..64 {
+    for _ in 0..MAX_DUMP_MESSAGES {
         let mut msg = [0u8; 2048];
         let n = netlink_recv(fd, &mut msg).ok_or("dump recv")? as usize;
         if n < NLMSG_HDRLEN {
-            return Err("short dump message");
+            return Err("the dump's reply queue ran dry before NLMSG_DONE");
         }
         match nlmsg_type_of(&msg) {
             NLMSG_DONE => return Ok(links),
@@ -6949,22 +6978,9 @@ fn smoke_abi_netlink_route_getlink_dump() -> TestResult {
         if !window_contains(&buf[..n], b"noqueue\0") {
             return Err("RTM_NEWLINK dump did not contain the qdisc");
         }
-        // Drain remaining links until NLMSG_DONE terminates the dump.
-        let mut saw_done = false;
-        for _ in 0..16 {
-            let mut b2 = [0u8; 512];
-            let m = netlink_recv(fd, &mut b2).ok_or("drain recv status")?;
-            if m < NLMSG_HDRLEN as i64 {
-                break;
-            }
-            if nlmsg_type_of(&b2) == NLMSG_DONE {
-                saw_done = true;
-                break;
-            }
-        }
-        if !saw_done {
-            return Err("RTM_GETLINK dump did not terminate with NLMSG_DONE");
-        }
+        // Drain the remaining links — one message per interface, however
+        // many this kernel has — until NLMSG_DONE terminates the dump.
+        drain_dump_to_done(fd, |_| Ok(()))?;
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())
     })
@@ -6991,21 +7007,7 @@ fn smoke_abi_netlink_route_getaddr_dump() -> TestResult {
             return Err("RTM_NEWADDR ifa_family was not AF_INET");
         }
         // Terminates with NLMSG_DONE.
-        let mut saw_done = false;
-        for _ in 0..16 {
-            let mut b2 = [0u8; 512];
-            let m = netlink_recv(fd, &mut b2).ok_or("drain recv status")?;
-            if m < NLMSG_HDRLEN as i64 {
-                break;
-            }
-            if nlmsg_type_of(&b2) == NLMSG_DONE {
-                saw_done = true;
-                break;
-            }
-        }
-        if !saw_done {
-            return Err("RTM_GETADDR dump did not terminate with NLMSG_DONE");
-        }
+        drain_dump_to_done(fd, |_| Ok(()))?;
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())
     })
@@ -7026,26 +7028,14 @@ fn smoke_abi_netlink_route_zero_padded_dump_is_answered() -> TestResult {
         if netlink_send(fd, &req).ok_or("send status")? != req.len() as i64 {
             return Err("send of a zero-padded RTM_GETADDR dump did not return its full length");
         }
-        let mut saw_done = false;
-        for _ in 0..32 {
-            let mut buf = [0u8; 512];
-            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
-            if n < NLMSG_HDRLEN as i64 {
-                break;
-            }
+        drain_dump_to_done(fd, |buf| {
             let seq = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
             if seq != 11 {
                 return Err("padding was answered as a second request");
             }
-            if nlmsg_type_of(&buf) == NLMSG_DONE {
-                saw_done = true;
-                break;
-            }
-        }
+            Ok(())
+        })?;
         let _ = call(Syscall::Close.raw(), a0(fd));
-        if !saw_done {
-            return Err("zero-padded RTM_GETADDR dump did not end with NLMSG_DONE");
-        }
         Ok(())
     })
 }
@@ -7136,21 +7126,7 @@ fn smoke_abi_netlink_route_getroute_dump() -> TestResult {
         if buf[NLMSG_HDRLEN] != AF_INET as u8 {
             return Err("RTM_NEWROUTE rtm_family was not AF_INET");
         }
-        let mut saw_done = false;
-        for _ in 0..32 {
-            let mut b2 = [0u8; 512];
-            let m = netlink_recv(fd, &mut b2).ok_or("drain recv status")?;
-            if m < NLMSG_HDRLEN as i64 {
-                break;
-            }
-            if nlmsg_type_of(&b2) == NLMSG_DONE {
-                saw_done = true;
-                break;
-            }
-        }
-        if !saw_done {
-            return Err("RTM_GETROUTE dump did not terminate with NLMSG_DONE");
-        }
+        drain_dump_to_done(fd, |_| Ok(()))?;
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())
     })
@@ -7230,21 +7206,7 @@ fn smoke_abi_netlink_route_getneigh_dump() -> TestResult {
         }
         // An empty neighbor cache is valid; it must still complete rather
         // than leaving Linux tooling blocked forever.
-        let mut saw_done = false;
-        for _ in 0..32 {
-            let mut buf = [0u8; 512];
-            let n = netlink_recv(fd, &mut buf).ok_or("recv status")?;
-            if n < NLMSG_HDRLEN as i64 {
-                break;
-            }
-            if nlmsg_type_of(&buf) == NLMSG_DONE {
-                saw_done = true;
-                break;
-            }
-        }
-        if !saw_done {
-            return Err("RTM_GETNEIGH dump did not terminate with NLMSG_DONE");
-        }
+        drain_dump_to_done(fd, |_| Ok(()))?;
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())
     })
@@ -7296,18 +7258,7 @@ fn smoke_abi_netlink_route_getqdisc_dump() -> TestResult {
         if !window_contains(&first[..n as usize], b"noqueue\0") {
             return Err("RTM_NEWQDISC did not identify noqueue");
         }
-        let mut saw_done = false;
-        for _ in 0..32 {
-            let mut buf = [0u8; 512];
-            let n = netlink_recv(fd, &mut buf).ok_or("drain status")?;
-            if n >= NLMSG_HDRLEN as i64 && nlmsg_type_of(&buf) == NLMSG_DONE {
-                saw_done = true;
-                break;
-            }
-        }
-        if !saw_done {
-            return Err("RTM_GETQDISC did not terminate with NLMSG_DONE");
-        }
+        drain_dump_to_done(fd, |_| Ok(()))?;
         let _ = call(Syscall::Close.raw(), a0(fd));
         Ok(())
     })
@@ -9855,11 +9806,11 @@ fn smoke_abi_netlink_sock_diag_tcp_dump() -> TestResult {
         }
 
         let mut saw_done = false;
-        for _ in 0..256 {
+        for _ in 0..MAX_DUMP_MESSAGES {
             let mut reply = [0u8; 256];
             let n = netlink_recv(fd, &mut reply).ok_or("sock_diag recv status")?;
             if n < 16 {
-                return Err("short NETLINK_SOCK_DIAG reply");
+                return Err("the sock_diag dump's reply queue ran dry before NLMSG_DONE");
             }
             let kind = nlmsg_type_of(&reply);
             if kind == 3 {
