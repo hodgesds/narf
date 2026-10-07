@@ -59,6 +59,8 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
     const MADV_NOHUGEPAGE: i32 = 15;
     const MADV_COLD: i32 = 20;
     const MADV_PAGEOUT: i32 = 21;
+    const MADV_GUARD_INSTALL: i32 = 102;
+    const MADV_GUARD_REMOVE: i32 = 103;
 
     let accepted = matches!(
         advice,
@@ -74,9 +76,11 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
             | MADV_NOHUGEPAGE
             | MADV_COLD
             | MADV_PAGEOUT
+            | MADV_GUARD_INSTALL
+            | MADV_GUARD_REMOVE
     );
     // DONTFORK/DOFORK, WIPEONFORK/KEEPONFORK, DONTDUMP/DODUMP, POPULATE_*,
-    // REMOVE, COLLAPSE, guard pages, and unknown values have observable
+    // REMOVE, COLLAPSE, and unknown values have observable
     // semantics beyond a hint. Fail explicitly until those state machines
     // exist. LINUX-GAP: Linux accepts the named ones; only a genuinely
     // unknown `advice` is EINVAL there.
@@ -124,7 +128,7 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
     // to alter the contents — a discard is effectively a memset(0). A
     // writable mapping can be overwritten directly, so refusing the discard
     // would protect nothing, and file-backed pages come back from the file.
-    if matches!(advice, MADV_DONTNEED | MADV_FREE)
+    if matches!(advice, MADV_DONTNEED | MADV_FREE | MADV_GUARD_INSTALL)
         && handler_sys_mseal::range_is_sealed(as_ref.identity(), base.as_u64(), len)
     {
         let writable = as_ref
@@ -166,6 +170,25 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
             }
             Err(_) => ctx.set_return(errno_ret(ENOMEM)),
         },
+        // Guard markers (`madvise_guard_install` / `madvise_guard_remove`).
+        // The walk mirrors `madvise_walk_vmas`: an invalid VMA (VM_SPECIAL,
+        // hugetlb, or VM_LOCKED for install) is EINVAL, a hole ENOMEM after
+        // the mapped parts were processed.
+        MADV_GUARD_INSTALL | MADV_GUARD_REMOVE => {
+            let result = if advice == MADV_GUARD_INSTALL {
+                as_ref.madvise_guard_install(base, len)
+            } else {
+                as_ref.madvise_guard_remove(base, len)
+            };
+            match result {
+                Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+                Err(narf_memory::AddressSpaceError::AlignmentMismatch)
+                | Err(narf_memory::AddressSpaceError::OutOfRange) => {
+                    ctx.set_return(errno_ret(EINVAL))
+                }
+                Err(_) => ctx.set_return(errno_ret(ENOMEM)),
+            }
+        }
         // These values are performance hints only. NARF has no readahead,
         // KSM, THP promotion, or active LRU aging policy to tune yet, so a
         // successful no-op preserves their contract.
