@@ -1,4 +1,5 @@
-//! USB class-driver registry — VID/PID match → probe dispatch.
+//! USB class-driver registry — VID/PID or interface-class match →
+//! probe dispatch.
 //!
 //! Equivalent to Linux's `usb_register_driver` /
 //! `usb_match_id` pattern. A class driver registers a
@@ -39,7 +40,7 @@ use crate::device::USBDevice;
 
 // ── Public types ────────────────────────────────────────────────────
 
-/// A single VID/PID + optional class-triple match entry.
+/// A single VID/PID + optional interface-class-triple match entry.
 ///
 /// Mirrors `struct usb_device_id` (Linux `include/linux/usb.h` L730):
 /// `idVendor`, `idProduct`, plus class/subclass/protocol guards that
@@ -48,11 +49,14 @@ use crate::device::USBDevice;
 pub struct UsbClassMatch {
     pub vendor_id: u16,
     pub product_id: u16,
-    /// If `Some`, the device's `bDeviceClass` must equal this value.
+    /// If `Some`, a configuration interface's `bInterfaceClass` must
+    /// equal this value.
     pub class: Option<u8>,
-    /// If `Some`, the device's `bDeviceSubClass` must equal this value.
+    /// If `Some`, that interface's `bInterfaceSubClass` must equal this
+    /// value.
     pub subclass: Option<u8>,
-    /// If `Some`, the device's `bDeviceProtocol` must equal this value.
+    /// If `Some`, that interface's `bInterfaceProtocol` must equal this
+    /// value.
     pub protocol: Option<u8>,
 }
 
@@ -67,7 +71,9 @@ impl UsbClassMatch {
         }
     }
 
-    /// Construct a class-only match.
+    /// Construct a class-only interface match. A zero VID/PID pair is
+    /// reserved here as the explicit wildcard; USB VID 0 is not
+    /// assignable to a physical device.
     pub const fn class_only(class: u8) -> Self {
         Self {
             vendor_id: 0,
@@ -144,10 +150,54 @@ pub fn register_class_driver(
     Ok(())
 }
 
+/// Return whether one match entry accepts this device. A non-zero
+/// VID/PID pair is exact; `(0, 0)` is the explicit class-only
+/// wildcard. Class/subclass/protocol guards are evaluated against
+/// Interface Descriptors in `config`, never against the device-level
+/// class triple.
+pub(crate) fn match_entry(
+    entry: &UsbClassMatch,
+    vendor_id: u16,
+    product_id: u16,
+    config: &[u8],
+) -> bool {
+    let ids_match = (entry.vendor_id == 0 && entry.product_id == 0)
+        || (entry.vendor_id == vendor_id && entry.product_id == product_id);
+    if !ids_match {
+        return false;
+    }
+
+    if entry.class.is_none() && entry.subclass.is_none() && entry.protocol.is_none() {
+        return true;
+    }
+
+    let mut offset = 0usize;
+    while offset + 2 <= config.len() {
+        let len = config[offset] as usize;
+        if len < 2 || offset + len > config.len() {
+            break;
+        }
+        if config[offset + 1] == 0x04 && len >= 9 {
+            let class_matches = entry.class.is_none_or(|class| class == config[offset + 5]);
+            let subclass_matches = entry
+                .subclass
+                .is_none_or(|subclass| subclass == config[offset + 6]);
+            let protocol_matches = entry
+                .protocol
+                .is_none_or(|protocol| protocol == config[offset + 7]);
+            if class_matches && subclass_matches && protocol_matches {
+                return true;
+            }
+        }
+        offset += len;
+    }
+    false
+}
+
 /// Walk all registered class drivers in registration order. For each
-/// driver, check every `UsbClassMatch` entry against the device's
-/// `vendor_id` + `product_id`. The first driver whose table contains
-/// a matching entry has its `probe` function called.
+/// driver, check every [`UsbClassMatch`] entry against the device's
+/// VID/PID and its Configuration Descriptor. The first driver whose
+/// table contains a matching entry has its `probe` function called.
 ///
 /// Returns `true` if a driver claimed the device; `false` if no match
 /// was found across all registered drivers.
@@ -155,7 +205,7 @@ pub fn register_class_driver(
 /// Equivalent to Linux's per-device `usb_match_id` call within the
 /// driver core's `__usb_match_id` + `usb_probe_device` chain in
 /// `drivers/usb/core/driver.c` (~L141, L310).
-pub fn dispatch_probe(device: Arc<USBDevice>) -> bool {
+pub fn dispatch_probe(device: Arc<USBDevice>, config: &[u8]) -> bool {
     let vid = device.vendor_id();
     let pid = device.product_id();
 
@@ -169,13 +219,9 @@ pub fn dispatch_probe(device: Arc<USBDevice>) -> bool {
     };
 
     for (name, matches, probe) in snapshot {
-        let matched = matches.iter().any(|m| {
-            if m.vendor_id != vid || m.product_id != pid {
-                return false;
-            }
-            // Optional class-triple guards — all present guards must match.
-            true
-        });
+        let matched = matches
+            .iter()
+            .any(|entry| match_entry(entry, vid, pid, config));
         if !matched {
             continue;
         }

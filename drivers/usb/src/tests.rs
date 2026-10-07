@@ -32,6 +32,69 @@ fn smoke_xhci_bring_up() -> TestResult {
 }
 kernel_test_in!("drivers/usb/xhci", smoke_xhci_bring_up);
 
+/// A full-speed controller starts EP0 at the required safe 8-byte
+/// maximum, then must take the real `bMaxPacketSize0` from the first
+/// Device Descriptor packet before asking for VID/PID bytes at offsets
+/// 8..11. This is the WCN6855 pass-through shape: full-speed transport,
+/// 64-byte EP0.
+fn smoke_xhci_ep0_mps_from_device_descriptor() -> TestResult {
+    use crate::xhci::PortSpeed;
+
+    let cases = [
+        (PortSpeed::Low, 8, Some(8)),
+        (PortSpeed::Low, 64, None),
+        (PortSpeed::Full, 64, Some(64)),
+        (PortSpeed::Full, 7, None),
+        (PortSpeed::High, 64, Some(64)),
+        (PortSpeed::High, 8, None),
+        (PortSpeed::Super, 9, Some(512)),
+        (PortSpeed::SuperPlus, 13, Some(8192)),
+        (PortSpeed::Super, 14, None),
+    ];
+    for (speed, raw, expected) in cases {
+        if speed.ep0_max_packet_from_descriptor(raw) != expected {
+            return TestResult::Fail("EP0 bMaxPacketSize0 decode mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_ep0_mps_from_device_descriptor
+);
+
+/// Control-transfer completion matching must include the originating
+/// TRB pointer. A Data/Status pair shares slot + DCI, so accepting the
+/// stale Status completion as the next TD's Data completion zeros the
+/// descriptor buffer and makes a full-speed device disappear.
+fn smoke_xhci_control_event_matches_originating_trb() -> TestResult {
+    use crate::xhci::Xhci;
+
+    const SLOT: u8 = 7;
+    const DATA_TRB: u64 = 0x0000_0001_2345_6000;
+    const STATUS_TRB: u64 = DATA_TRB + 0x10;
+    // Transfer Event = type 32, DCI 1, slot 7. The low address bits
+    // carry no pointer data and must be ignored by the matcher.
+    let status_event = [
+        (STATUS_TRB as u32) | 0xF,
+        (STATUS_TRB >> 32) as u32,
+        0,
+        (32 << 10) | (1 << 16) | ((SLOT as u32) << 24),
+    ];
+    if Xhci::control_transfer_event_matches(&status_event, SLOT, DATA_TRB) {
+        return TestResult::Fail("stale control Status event matched a Data TRB");
+    }
+    if !Xhci::control_transfer_event_matches(&status_event, SLOT, STATUS_TRB) {
+        return TestResult::Fail("control Status event missed its originating TRB");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/xhci",
+    smoke_xhci_control_event_matches_originating_trb
+);
+
 fn smoke_xhci_amd_phoenix_matches() -> TestResult {
     use crate::xhci;
     use narf_bus::driver_match::__reset_for_test;
@@ -1867,6 +1930,39 @@ fn build_cfg_with_class(
     ]);
     v
 }
+
+/// Class-only registry entries must inspect interface descriptors. In
+/// particular, the WCN6855's Wireless/RF/Bluetooth interface must never
+/// fall through and be claimed as a wildcard USB-audio device when a
+/// descriptor read did not produce a VID/PID.
+fn smoke_usb_class_registry_checks_interface_triples() -> TestResult {
+    use crate::class_registry::{match_entry, UsbClassMatch};
+
+    let audio = UsbClassMatch::class_only(0x01);
+    let qca_bt = build_cfg_with_class(0xE0, 0x01, 0x01, 0);
+    if match_entry(&audio, 0, 0, &qca_bt) {
+        return TestResult::Fail("USB-audio wildcard matched Bluetooth interface");
+    }
+
+    let audio_cfg = build_cfg_with_class(0x01, 0x01, 0x00, 3);
+    if !match_entry(&audio, 0x1234, 0x5678, &audio_cfg) {
+        return TestResult::Fail("USB-audio class match missed AudioControl interface");
+    }
+
+    let qca = UsbClassMatch::vid_pid(0x10ab, 0x9309);
+    if !match_entry(&qca, 0x10ab, 0x9309, &qca_bt) {
+        return TestResult::Fail("exact WCN6855 VID/PID match missed");
+    }
+    if match_entry(&qca, 0, 0, &qca_bt) {
+        return TestResult::Fail("exact WCN6855 VID/PID match became wildcard");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/usb/class-registry",
+    smoke_usb_class_registry_checks_interface_triples
+);
 
 fn smoke_usb_uac_finder_picks_audiocontrol_interface() -> TestResult {
     use crate::uac::{
@@ -3874,7 +3970,9 @@ fn smoke_xhci_setup_data_status_stage_encode() -> TestResult {
     if trb.parameter != u64::from_le_bytes(setup) {
         return TestResult::Fail("Setup packet not packed into parameter");
     }
-    // Data Stage IN with IOC.
+    // Data Stage IN with IOC. A real control-TD completion path must
+    // identify this event by TRB pointer, then drain the separately
+    // requested Status Stage event before issuing its next transfer.
     let trb = encode_data_stage(0x2000_0000, 18, /*dir_in*/ true, /*ioc*/ true, 1);
     if ((trb.control & TRB_TYPE_MASK) >> TRB_TYPE_SHIFT) != TRB_TYPE_DATA_STAGE {
         return TestResult::Fail("Data Stage wrong type");
@@ -3895,6 +3993,9 @@ fn smoke_xhci_setup_data_status_stage_encode() -> TestResult {
     }
     if (trb.control & TRB_DIR_IN) != 0 {
         return TestResult::Fail("Status Stage after IN data must be OUT");
+    }
+    if (trb.control & TRB_IOC) == 0 {
+        return TestResult::Fail("Status Stage IOC missing");
     }
     TestResult::Pass
 }

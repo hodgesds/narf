@@ -467,6 +467,7 @@ pub(crate) fn note_park(tid: u64) {
 
 /// Fold a completed run slice into the switch counters. Called at the same
 /// slice boundary that charges `user_cpu_ns`, so one slice is one count.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn note_slice_end() {
     let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();

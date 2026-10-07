@@ -137,6 +137,18 @@ also consult upstream Linux GPL sources.
   direction bit set; `Xhci::control_out` accepts only host-to-device requests.
   Payload-bearing class requests (including HID `SET_REPORT`) must use the
   matching method so the xHCI Data Stage has the correct direction.
+- `Xhci::get_device_descriptor(slot_id)` first reads the mandatory 8-byte
+  descriptor prefix, validates and applies `bMaxPacketSize0` through Evaluate
+  Context, then returns only a complete 18-byte Device Descriptor. Callers may
+  therefore read `idVendor`/`idProduct` at offsets 8..12 without accepting a
+  zero-filled short response.
+- `Xhci::control_in` and `Xhci::control_out` identify Data and Status Stage
+  completion events by their originating control-ring TRB and drain both before
+  returning. A queued Status completion may never satisfy the next control TD.
+- `class_registry::dispatch_probe(device, config)` evaluates exact VID/PID
+  entries against the device descriptor and class-triple entries against
+  Interface Descriptors in `config`. A class-only entry is an explicit
+  `(0, 0)` VID/PID wildcard, not a match for an unrelated interface.
 - `find_video_streaming_endpoints(config)` returns each UVC bulk/isochronous IN
   endpoint with its owning interface and alternate setting.
   `select_video_streaming_iso_endpoint(endpoints, payload)` chooses the smallest
