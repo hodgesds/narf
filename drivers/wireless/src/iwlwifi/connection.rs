@@ -471,11 +471,13 @@ impl Connection {
         password: &[u8],
     ) -> Result<[u8; 32], &'static str> {
         use narf_wireless::sae::{SaeSession, SaeState, SAE_STATUS_HASH_TO_ELEMENT};
-        let ssid =
-            core::str::from_utf8(&self.beacon.ssid).map_err(|_| "SSID is not valid UTF-8")?;
+        // Own the SSID: its borrow must outlive the `&mut self` TX calls below
+        // (SAE-PK verification at the end needs it again).
+        let ssid = alloc::string::String::from_utf8(self.beacon.ssid.clone())
+            .map_err(|_| "SSID is not valid UTF-8")?;
         let password =
             core::str::from_utf8(password).map_err(|_| "SAE password is not valid UTF-8")?;
-        let mut sae = SaeSession::new(ssid, password, self.local, self.beacon.bssid);
+        let mut sae = SaeSession::new(&ssid, password, self.local, self.beacon.bssid);
 
         // Commit (seq 1). H2E signals via status SAE_STATUS_HASH_TO_ELEMENT.
         // `build_commit` is called once: an anti-clogging retry must resend the
@@ -546,7 +548,51 @@ impl Connection {
         if sae.state() != SaeState::Accepted {
             return Err("SAE did not reach Accepted");
         }
+        // WPA3 SAE-PK: the AP must prove possession of the public key whose
+        // fingerprint the password encodes. Authenticate it before trusting
+        // the PMK, and abort the association on failure (evil-twin defence).
+        if sae.is_sae_pk() {
+            self.verify_sae_pk(&sae, &ssid, password)?;
+        }
         sae.pmk().copied().ok_or("SAE produced no PMK")
+    }
+
+    /// WPA3 SAE-PK AP authentication: recover the Modifier from the AP's
+    /// Confirm element (AES-SIV under the SAE KEK), confirm the password's
+    /// public-key fingerprint, and verify the ECDSA KeyAuth signature over the
+    /// SAE exchange transcript. Returns `Err` (aborting the association) unless
+    /// every check passes.
+    fn verify_sae_pk(
+        &self,
+        sae: &narf_wireless::sae::SaeSession,
+        ssid: &str,
+        password: &str,
+    ) -> Result<(), &'static str> {
+        use narf_wireless::sae::pk;
+        let kek = sae.kek().ok_or("SAE-PK: KEK not derived")?;
+        let elements = pk::parse_elements(sae.peer_confirm_ies())
+            .ok_or("SAE-PK: Confirm elements missing or malformed")?;
+        let modifier = pk::recover_modifier(kek, &elements.encrypted_modifier)
+            .ok_or("SAE-PK: Modifier recovery (AES-SIV) failed")?;
+        let (ele_ap, ele_sta, sca_ap, sca_sta) = sae.sae_pk_transcript();
+        let verification = pk::ApVerification {
+            ssid: ssid.as_bytes(),
+            password,
+            modifier: &modifier,
+            public_key_der: &elements.public_key_der,
+            key_auth: &elements.key_auth,
+            ele_ap: &ele_ap,
+            ele_sta: &ele_sta,
+            sca_ap: &sca_ap,
+            sca_sta: &sca_sta,
+            ap_bssid: &self.beacon.bssid,
+            sta_mac: &self.local,
+        };
+        if pk::authenticate_ap(&verification) {
+            Ok(())
+        } else {
+            Err("SAE-PK AP authentication failed")
+        }
     }
 
     pub async fn send(&mut self, hw: &mut Hardware, ethernet: &[u8]) -> Result<(), &'static str> {

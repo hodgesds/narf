@@ -84,6 +84,16 @@ pub struct SaeSession {
     peer_element: AffinePoint,
     /// KCK derived from K via HKDF (`SAE KCK and PMK` label, §12.4.5.4).
     kck: Option<[u8; 32]>,
+    /// KEK derived for an SAE-PK session (the AES-SIV key that protects the
+    /// AP's Modifier); `None` for a plain SAE session.
+    kek: Option<[u8; 32]>,
+    /// Whether the configured password is an SAE-PK password. Selects the
+    /// "SAE-PK keys" key-derivation label and enables AP authentication.
+    sae_pk: bool,
+    /// Trailing information elements of the peer's Confirm frame — the SAE-PK
+    /// element carriage (FILS public key / key confirmation + SAE-PK vendor
+    /// element); empty for a plain SAE session.
+    peer_confirm_ies: Vec<u8>,
     /// PMK — the SAE output, fed to the 4-Way Handshake as the PSK
     /// replacement for the WPA2-PSK path.
     pmk: Option<[u8; 32]>,
@@ -132,6 +142,9 @@ impl SaeSession {
             peer_element: AffinePoint::INFINITY,
             kck: None,
             pmk: None,
+            kek: None,
+            sae_pk: super::pk::is_sae_pk_password(password),
+            peer_confirm_ies: Vec::new(),
             own_mac,
             peer_mac,
             send_confirm_counter: 0,
@@ -163,6 +176,36 @@ impl SaeSession {
     /// for debugging and for re-verifying Confirm transcripts.
     pub fn kck(&self) -> Option<&[u8; 32]> {
         self.kck.as_ref()
+    }
+
+    /// Whether this is an SAE-PK session (the configured password is an
+    /// SAE-PK password).
+    pub fn is_sae_pk(&self) -> bool {
+        self.sae_pk
+    }
+
+    /// The SAE-PK KEK (AES-SIV key), available after `on_commit` for an
+    /// SAE-PK session.
+    pub fn kek(&self) -> Option<&[u8; 32]> {
+        self.kek.as_ref()
+    }
+
+    /// The information elements that trailed the peer's Confirm frame (the
+    /// SAE-PK element carriage), captured by `on_confirm`.
+    pub fn peer_confirm_ies(&self) -> &[u8] {
+        &self.peer_confirm_ies
+    }
+
+    /// The SAE-PK KeyAuth transcript element/scalar pair in the canonical
+    /// AP-then-STA order used by the signature: `(eleAP, eleSTA, scaAP,
+    /// scaSTA)`. From the station's view the AP is the peer. Elements are the
+    /// 64-byte `X || Y` point encodings; scalars are 32-byte big-endian.
+    pub fn sae_pk_transcript(&self) -> ([u8; 64], [u8; 64], [u8; 32], [u8; 32]) {
+        let ele_ap = self.peer_element.to_encoded().unwrap_or([0u8; 64]);
+        let ele_sta = self.commit_element.to_encoded().unwrap_or([0u8; 64]);
+        let sca_ap = self.peer_scalar.to_bytes_be();
+        let sca_sta = self.commit_scalar.to_bytes_be();
+        (ele_ap, ele_sta, sca_ap, sca_sta)
     }
 
     /// Build our outgoing Commit. Encodes the SAE-frame variable body:
@@ -258,10 +301,19 @@ impl SaeSession {
 
         // Derive KCK || PMK via HKDF per §12.4.5.4. The KDF input is
         // K.x; the salt is the bit-wise sum (as canonical sorted pair)
-        // of the two scalars; the label is "SAE KCK and PMK".
-        let (kck, pmk) = derive_kck_pmk(&k_x, &self.commit_scalar, &peer_scalar);
-        self.kck = Some(kck);
-        self.pmk = Some(pmk);
+        // of the two scalars; the label is "SAE KCK and PMK". For an
+        // SAE-PK session the label becomes "SAE-PK keys" and the output is
+        // extended to KCK || PMK || KEK (hostap sae_derive_keys).
+        if self.sae_pk {
+            let (kck, pmk, kek) = derive_sae_pk_keys(&k_x, &self.commit_scalar, &peer_scalar);
+            self.kck = Some(kck);
+            self.pmk = Some(pmk);
+            self.kek = Some(kek);
+        } else {
+            let (kck, pmk) = derive_kck_pmk(&k_x, &self.commit_scalar, &peer_scalar);
+            self.kck = Some(kck);
+            self.pmk = Some(pmk);
+        }
         Ok(())
     }
 
@@ -305,9 +357,15 @@ impl SaeSession {
         }
         let kck = self.kck.ok_or(SaeError::Protocol)?;
         let frame = ConfirmFrame::decode(peer_confirm).ok_or(SaeError::InvalidParameters)?;
-        if frame.confirm.len() != 32 {
+        // The 32-byte Confirm field may be followed by information elements
+        // (the SAE-PK element carriage); keep the MAC and stash any trailer.
+        if frame.confirm.len() < 32 {
             return Err(SaeError::InvalidParameters);
         }
+        if self.sae_pk {
+            self.peer_confirm_ies = frame.confirm[32..].to_vec();
+        }
+        let peer_mac = &frame.confirm[..32];
 
         // Expected: HMAC-SHA256(KCK, peer_sc || peer_sc_scalar || peer_e || own_sc_scalar || own_e)
         let mut data: Vec<u8> = Vec::with_capacity(2 + 32 + 64 + 32 + 64);
@@ -320,14 +378,14 @@ impl SaeSession {
         data.extend_from_slice(&our_e);
 
         let expected = HmacSha256.mac(&kck, &data);
-        if expected.len() != frame.confirm.len() {
+        if expected.len() != peer_mac.len() {
             return Err(SaeError::ConfirmMismatch);
         }
         // Constant-time-ish compare. The peer-controlled Confirm is
         // public output — an attacker observing timing here learns
         // only what they already know.
         let mut diff = 0u8;
-        for (a, b) in expected.iter().zip(frame.confirm.iter()) {
+        for (a, b) in expected.iter().zip(peer_mac.iter()) {
             diff |= a ^ b;
         }
         if diff != 0 {
@@ -420,6 +478,35 @@ fn derive_kck_pmk(k_x: &[u8; 32], s_self: &Scalar, s_peer: &Scalar) -> ([u8; 32]
     kck.copy_from_slice(&okm[..32]);
     pmk.copy_from_slice(&okm[32..]);
     (kck, pmk)
+}
+
+/// SAE-PK key derivation: as [`derive_kck_pmk`] but with the "SAE-PK keys"
+/// label and an output extended to `KCK || PMK || KEK` (hostap
+/// `sae_derive_keys` with `CONFIG_SAE_PK`). Returns `(kck, pmk, kek)`.
+fn derive_sae_pk_keys(
+    k_x: &[u8; 32],
+    s_self: &Scalar,
+    s_peer: &Scalar,
+) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let s_self_b = s_self.to_bytes_be();
+    let s_peer_b = s_peer.to_bytes_be();
+    let (first, second) = if s_self_b.as_slice() < s_peer_b.as_slice() {
+        (s_self_b, s_peer_b)
+    } else {
+        (s_peer_b, s_self_b)
+    };
+    let mut salt: Vec<u8> = Vec::with_capacity(64);
+    salt.extend_from_slice(&first);
+    salt.extend_from_slice(&second);
+    let prk = narf_crypto::hkdf::hkdf_extract(Some(&salt), k_x);
+    let okm = narf_crypto::hkdf::hkdf_expand(&prk, b"SAE-PK keys", 96);
+    let mut kck = [0u8; 32];
+    let mut pmk = [0u8; 32];
+    let mut kek = [0u8; 32];
+    kck.copy_from_slice(&okm[..32]);
+    pmk.copy_from_slice(&okm[32..64]);
+    kek.copy_from_slice(&okm[64..]);
+    (kck, pmk, kek)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
