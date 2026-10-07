@@ -282,6 +282,7 @@ fn build_fs_from_source(
             options,
             uid,
             gid,
+            umask: crate::handlers::current_umask() as u16,
             initial_namespace: crate::handlers::current_mount_namespace().is_none(),
         })
         .map(Some)

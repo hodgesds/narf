@@ -166,6 +166,20 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
 }
 
 impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
+    /// `minix_iget`: `inode->i_uid = (uid_t)raw_inode->i_uid; i_gid =
+    /// (gid_t)raw_inode->i_gid`. minix is a Unix filesystem — it HAS owners
+    /// on disk, in every version — and the trait default reported root for
+    /// every file on the volume, so `ls -l` showed one owner and a
+    /// permission check against the real one could never succeed.
+    fn owners(&self) -> (u32, u32) {
+        match *self.inode.lock() {
+            Some(inode) => (u32::from(inode.uid), u32::from(inode.gid)),
+            // Not read yet: the stat path reads the inode first, so this is
+            // only reachable for a node nothing has looked at.
+            None => (0, 0),
+        }
+    }
+
     /// `st_ino`: the on-disk inode number, as Linux's `minix_iget` uses it
     /// (the root is `MINIX_ROOT_INO` = 1).
     fn ino(&self) -> u64 {
@@ -258,6 +272,22 @@ impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for MinixNode<B> {
+    /// The directory's own on-disk mode, not the VFS's fixed 0755.
+    fn dir_mode(&self) -> u16 {
+        match *self.inode.lock() {
+            Some(inode) => inode.mode & 0o777,
+            None => 0o755,
+        }
+    }
+
+    /// As [`FileOps::owners`]: the on-disk ids.
+    fn dir_owners(&self) -> (u32, u32) {
+        match *self.inode.lock() {
+            Some(inode) => (u32::from(inode.uid), u32::from(inode.gid)),
+            None => (0, 0),
+        }
+    }
+
     /// `st_ino`: the on-disk inode number, as Linux's `minix_iget` uses it
     /// (the root is `MINIX_ROOT_INO` = 1).
     fn ino(&self) -> u64 {

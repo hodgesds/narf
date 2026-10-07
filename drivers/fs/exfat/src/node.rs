@@ -95,6 +95,7 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
     /// `first_cluster_of_root_directory`. The root has no
     /// containing dirent, so its size/attributes are synthetic.
     pub fn new_root(volume: Arc<ExfatVolume<B>>, first_cluster: u32) -> Self {
+        let root_perms = volume.opts.make_mode(false, true);
         let times = volume.root_times;
         Self {
             volume,
@@ -106,7 +107,14 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
                 stat: Stat {
                     size: 0,
                     blocks: 0,
-                    mode: Mode::DIR_RO,
+                    // `exfat_read_root`: `exfat_make_mode(sbi,
+                    // EXFAT_ATTR_SUBDIR, 0777)` — the root obeys `dmask`,
+                    // where a fixed 0555 left a `uid=`/`umask=` mount with
+                    // a root its owner could not write.
+                    mode: Mode {
+                        file_type: FileType::Dir,
+                        perms: root_perms,
+                    },
                     mtime_cycles: narf_time::ns_to_cycles(times.mtime_ns),
                 },
                 times,
@@ -128,11 +136,13 @@ impl<B: BlockDevice + 'static> ExfatNode<B> {
                 } else {
                     FileType::File
                 },
-                perms: if (dirent.file.file_attributes & file_attr::READ_ONLY) != 0 {
-                    0o444
-                } else {
-                    0o666
-                },
+                // `exfat_fill_inode`: `exfat_make_mode(sbi, info->attr,
+                // 0777)`. The flat 0666/0444 this replaces ignored every
+                // mask and umask the mount was given.
+                perms: volume.opts.make_mode(
+                    dirent.file.file_attributes & file_attr::READ_ONLY != 0,
+                    dirent.is_directory(),
+                ),
             },
             mtime_cycles: narf_time::ns_to_cycles(times.mtime_ns),
         };
@@ -411,6 +421,14 @@ impl<B: BlockDevice + 'static> DirectoryScanner<B> {
 // ── FileOps / DirOps surface ────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
+    /// `exfat_fill_inode`: `inode->i_uid = sbi->options.fs_uid; i_gid =
+    /// sbi->options.fs_gid`. exFAT stores no owner, so the mount's ids are
+    /// the answer — reporting root for every file (the trait default) made a
+    /// `uid=1000` mount unusable by the user who mounted it.
+    fn owners(&self) -> (u32, u32) {
+        (self.volume.opts.owners.uid, self.volume.opts.owners.gid)
+    }
+
     fn ino(&self) -> u64 {
         self.ino
     }
@@ -462,6 +480,17 @@ impl<B: BlockDevice + 'static> FileOps for ExfatNode<B> {
 }
 
 impl<B: BlockDevice + 'static> DirOps for ExfatNode<B> {
+    /// The directory's own `exfat_make_mode(..., 0777)` — `dmask`, not the
+    /// VFS's fixed 0755.
+    fn dir_mode(&self) -> u16 {
+        self.state.lock().stat.mode.perms
+    }
+
+    /// As [`FileOps::owners`]: the mount's ids.
+    fn dir_owners(&self) -> (u32, u32) {
+        (self.volume.opts.owners.uid, self.volume.opts.owners.gid)
+    }
+
     fn ino(&self) -> u64 {
         self.ino
     }

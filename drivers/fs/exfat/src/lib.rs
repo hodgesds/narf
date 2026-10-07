@@ -42,6 +42,7 @@ extern crate alloc;
 pub mod boot;
 pub mod dir;
 pub mod fat;
+pub mod mount_opts;
 pub mod node;
 pub mod upcase;
 pub mod volume;
@@ -49,22 +50,26 @@ pub mod volume;
 mod tests;
 
 /// Register the named mount constructor without probing a device.
+///
+/// Context-aware: exFAT's ownership and permission model is the mount
+/// options plus the mounting task's uid, gid and umask (see `mount_opts`).
 pub fn register_fstypes() {
-    narf_filesystem::register_block_fstype("exfat", build_named);
+    narf_filesystem::register_block_fstype_ctx("exfat", build_named);
 }
 
 fn build_named(
-    source: &str,
-    options: &str,
+    request: &narf_filesystem::MountRequest<'_>,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
-    if !options.is_empty() {
-        return Err(narf_filesystem::FsError::Unsupported);
-    }
-    let name = source.strip_prefix("/dev/").unwrap_or(source);
+    let opts = mount_opts::parse(request.options, request.uid, request.gid, request.umask)?;
+    let name = request
+        .source
+        .strip_prefix("/dev/")
+        .unwrap_or(request.source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
-    let fs = narf_scheduler::block_on(volume::ExfatVolume::mount(
+    let fs = narf_scheduler::block_on(volume::ExfatVolume::mount_with_opts(
         narf_block::SyncBlock::new(dev),
         narf_driver_runtime::DomainId::DRIVER_0,
+        opts,
     ))?;
     Ok(fs)
 }

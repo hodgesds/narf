@@ -64,6 +64,8 @@ pub const SECTOR_SIZE: usize = 2048;
 /// volume (the two fall-back positions live in [`volume`]).
 pub const AVDP_PRIMARY_SECTOR: u64 = 256;
 
+pub mod mount_opts;
+
 /// Register the named mount constructor without probing a device.
 pub fn register_fstypes() {
     narf_filesystem::register_block_fstype("udf", build_named);
@@ -73,14 +75,13 @@ fn build_named(
     source: &str,
     options: &str,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
-    if !options.is_empty() {
-        return Err(narf_filesystem::FsError::Unsupported);
-    }
+    let opts = mount_opts::parse(options)?;
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
-    let fs = narf_scheduler::block_on(volume::UdfVolume::mount(
+    let fs = narf_scheduler::block_on(volume::UdfVolume::mount_with_opts(
         narf_block::SyncBlock::new(dev),
         narf_driver_runtime::DomainId::DRIVER_0,
+        opts,
     ))?;
     Ok(fs)
 }

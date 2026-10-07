@@ -55,15 +55,37 @@ fn squashfs_factory(dev: Arc<dyn BlockDeviceSync>) -> Result<Arc<dyn FsInstance>
     Ok(volume)
 }
 
+/// `squashfs_parse_param` (`fs/squashfs/super.c`) — squashfs has exactly two
+/// parameters, `errors=continue|panic` and `threads=`, and anything else is
+/// EINVAL (`"squashfs: Unknown parameter '%s'"`).
+///
+/// This used to accept only the two literal spellings `errors=continue` and
+/// `threads=single` and answer EOPNOTSUPP for everything else — including
+/// `errors=panic` and the other `threads=` values Linux takes, so a
+/// legitimate mount line failed on a parameter squashfs itself documents.
+///
+/// LINUX-GAP: both are accepted and neither is acted on. `errors=panic`
+/// would have to panic the kernel on a decode error, where NARF reports EIO
+/// to the caller; `threads=` selects between Linux's single/multi/percpu
+/// decompressors, and NARF has one bounded decoder stream.
 fn squashfs_fstype_builder(source: &str, options: &str) -> Result<Arc<dyn FsInstance>, FsError> {
-    // Linux accepts only decompressor/error-policy mount options.  NARF uses
-    // one bounded decoder stream and continues with EIO-style errors; reject
-    // options that would claim different semantics.
-    if !options.is_empty() {
-        for option in options.split(',').filter(|s| !s.is_empty()) {
-            if option != "ro" && option != "errors=continue" && option != "threads=single" {
-                return Err(FsError::Unsupported);
-            }
+    const ERRORS: &[&str] = &["continue", "panic"];
+    const THREADS: &[&str] = &["single", "multi", "percpu"];
+    for opt in narf_filesystem::fsopts::iter(options) {
+        if narf_filesystem::fsopts::is_vfs_param(opt.key) {
+            continue;
+        }
+        match opt.key {
+            "errors" => narf_filesystem::fsopts::enum_value(opt.value, ERRORS)?,
+            // `fsparam_string`: a name, or a decompressor count
+            // (`squashfs_parse_param_threads_num`, base 0).
+            "threads" => match opt.value {
+                Some(v)
+                    if THREADS.contains(&v)
+                        || narf_filesystem::fsopts::kstrtouint(v, 0).is_some() => {}
+                _ => return Err(FsError::InvalidData),
+            },
+            _ => return Err(FsError::InvalidData),
         }
     }
     let name = source.strip_prefix("/dev/").unwrap_or(source);

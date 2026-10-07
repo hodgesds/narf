@@ -80,6 +80,7 @@ pub(crate) mod devfs_vt;
 pub mod efivarfs;
 pub mod fifo;
 pub mod fs_registry;
+pub mod fsopts;
 pub mod fuse;
 pub mod fuse_conn;
 pub mod inode_id;
@@ -127,8 +128,8 @@ pub use devfs::{
 pub use devfs_input::{DevInputDir, DeviceKind, InputEventFile, UinputControlFile};
 pub use efivarfs::EfivarFs;
 pub use fs_registry::{
-    lookup_fstype, register_block_fstype, register_fs_type, register_fstype, registered_fstypes,
-    FileSystemType, FsBuilder, FsInit, MountRequest,
+    lookup_fstype, register_block_fstype, register_block_fstype_ctx, register_fs_type,
+    register_fstype, registered_fstypes, FileSystemType, FsBuilder, FsInit, MountRequest,
 };
 pub use fuse::{
     FuseInHeader, FuseInitFlag, FuseInitIn, FuseInitOut, FuseOpcode, FuseOutHeader,

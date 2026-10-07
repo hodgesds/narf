@@ -37,6 +37,8 @@ pub mod dir;
 pub mod node;
 pub mod volume;
 
+pub mod mount_opts;
+
 mod tests;
 
 /// ISO 9660 logical block size — fixed at 2048 bytes by ECMA-119
@@ -57,14 +59,13 @@ fn build_named(
     source: &str,
     options: &str,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, narf_filesystem::FsError> {
-    if !options.is_empty() {
-        return Err(narf_filesystem::FsError::Unsupported);
-    }
+    let opts = mount_opts::parse(options)?;
     let name = source.strip_prefix("/dev/").unwrap_or(source);
     let dev = narf_block::find_block_device(name).ok_or(narf_filesystem::FsError::NotFound)?;
-    let fs = narf_scheduler::block_on(volume::Iso9660Volume::mount(
+    let fs = narf_scheduler::block_on(volume::Iso9660Volume::mount_with_opts(
         narf_block::SyncBlock::new(dev),
         narf_driver_runtime::DomainId::DRIVER_0,
+        opts,
     ))?;
     Ok(fs)
 }

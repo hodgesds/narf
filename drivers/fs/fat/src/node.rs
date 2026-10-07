@@ -332,6 +332,21 @@ impl<B: BlockDevice + 'static> FatNode<B> {
         }
     }
 
+    /// `fat_fill_inode`'s mode: `fat_make_mode(sbi, de->attr, S_IRWXUGO)`
+    /// for a directory, and the same for a file except under `showexec`,
+    /// where a non-executable 8.3 extension starts at `S_IRUGO|S_IWUGO`.
+    ///
+    /// This used to be a flat 0666, or 0444 for ATTR_RO, for files and
+    /// directories alike: no `umask`, `dmask` or `fmask` reached a mode bit,
+    /// because the driver refused every mount option that could carry one.
+    fn mode_from_entry(&self, entry: &RawDirEntry) -> u16 {
+        let is_dir = entry.is_directory();
+        let exec_ext = crate::mount_opts::FatOpts::exec_extension(&entry.name[8..11]);
+        self.volume
+            .opts
+            .make_mode(entry.attr & attr::READ_ONLY != 0, is_dir, exec_ext)
+    }
+
     fn stat_from_entry(&self, entry: &RawDirEntry) -> Stat {
         let sector_size = self.volume.bpb.bytes_per_sec as u64;
         Stat {
@@ -343,11 +358,7 @@ impl<B: BlockDevice + 'static> FatNode<B> {
                 } else {
                     FileType::File
                 },
-                perms: if (entry.attr & attr::READ_ONLY) != 0 {
-                    0o444
-                } else {
-                    0o666
-                },
+                perms: self.mode_from_entry(entry),
             },
             mtime_cycles: narf_time::ns_to_cycles(self.times_from_entry(entry).mtime_ns),
         }
@@ -746,6 +757,15 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
         self.inode_number()
     }
 
+    /// `fat_fill_inode`: `inode->i_uid = sbi->options.fs_uid; i_gid =
+    /// sbi->options.fs_gid`. FAT stores no owner, so the mount's — the
+    /// mounting task's unless `uid=`/`gid=` said otherwise. Reporting root
+    /// for every file (the trait default) made a `uid=1000` mount of a
+    /// removable disk unusable by the user who mounted it.
+    fn owners(&self) -> (u32, u32) {
+        (self.volume.opts.owners.uid, self.volume.opts.owners.gid)
+    }
+
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {
         self.attrs()
     }
@@ -934,6 +954,17 @@ impl<B: BlockDevice + 'static> FileOps for FatNode<B> {
 impl<B: BlockDevice + 'static> DirOps for FatNode<B> {
     fn ino(&self) -> u64 {
         self.inode_number()
+    }
+
+    /// The directory's own `fat_make_mode(..., S_IRWXUGO)` — `dmask`, not
+    /// the VFS's fixed 0755.
+    fn dir_mode(&self) -> u16 {
+        self.state.lock().stat.mode.perms
+    }
+
+    /// As [`FileOps::owners`]: the mount's ids.
+    fn dir_owners(&self) -> (u32, u32) {
+        (self.volume.opts.owners.uid, self.volume.opts.owners.gid)
     }
 
     fn inode_attrs(&self) -> narf_filesystem::InodeAttrs {

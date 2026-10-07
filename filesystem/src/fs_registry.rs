@@ -19,6 +19,12 @@ pub struct MountRequest<'a> {
     pub options: &'a str,
     pub uid: u32,
     pub gid: u32,
+    /// The mounting task's `current_umask()`. The formats with no POSIX
+    /// ownership on disk derive every inode's mode from it
+    /// (`fat_fill_super`: `opts->fs_fmask = opts->fs_dmask =
+    /// current_umask()`), so a constructor that cannot see it cannot report
+    /// Linux's modes. `init_fs.umask` (0022) for a kernel-internal mount.
+    pub umask: u16,
     pub initial_namespace: bool,
 }
 
@@ -87,6 +93,22 @@ pub fn register_fstype(name: &'static str, builder: FsBuilder) {
 
 /// Register a block-device filesystem. The builder resolves its source and
 /// validates options; the metadata controls `/proc/filesystems`' nodev column.
+/// Register a device-backed type whose constructor needs the mount context.
+///
+/// The `FsBuilder` shape (source + data only) cannot express the ownership
+/// model of FAT, exFAT, ISO 9660 or UDF: those have no POSIX metadata on
+/// disk, so Linux starts every inode from the MOUNTING TASK's uid, gid and
+/// umask and lets `uid=`/`gid=`/`umask=` override. A constructor registered
+/// here sees all three.
+pub fn register_block_fstype_ctx(name: &'static str, init: FsInit) {
+    register_fs_type(FileSystemType {
+        name,
+        requires_device: true,
+        subtypes: false,
+        constructor: Constructor::Context(init),
+    });
+}
+
 pub fn register_block_fstype(name: &'static str, builder: FsBuilder) {
     register_fs_type(FileSystemType {
         name,

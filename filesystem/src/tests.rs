@@ -3124,6 +3124,7 @@ fn smoke_fs_registry_custom_fstype_mounts() -> TestResult {
         options: "some-data",
         uid: 0,
         gid: 0,
+        umask: 0o022,
         initial_namespace: true,
     }) {
         Ok(fs) => fs,

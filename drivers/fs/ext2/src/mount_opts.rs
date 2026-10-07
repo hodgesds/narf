@@ -147,9 +147,13 @@ fn kind_accepts(kind: Kind, value: Option<&str>) -> bool {
 }
 
 /// Validate a remount's ext4 parameter string. `Unsupported` is the
-/// "Unknown parameter" answer (the syscall layer reports it as -EINVAL, as
-/// `vfs_parse_fs_param` does); `InvalidData` a known key with a bad value
-/// or a change `__ext4_remount` refuses.
+/// `InvalidData` — which the syscall layer reports as -EINVAL, the errno
+/// `vfs_parse_fs_param` gives both an unknown parameter and a known key with
+/// a bad value, as well as a change `__ext4_remount` refuses. (This used to
+/// answer `Unsupported` for an unknown key, which the mount path maps to
+/// -EOPNOTSUPP: a remount with a typo'd option reported "operation not
+/// supported" where Linux says "invalid argument", and `mount -o remount`
+/// prints that errno verbatim.)
 pub fn validate_remount(options: &str) -> Result<(), FsError> {
     for item in options.split(',').filter(|s| !s.is_empty()) {
         let (key, value) = match item.split_once('=') {
@@ -165,7 +169,7 @@ pub fn validate_remount(options: &str) -> Result<(), FsError> {
             }
         }
         if !known {
-            return Err(FsError::Unsupported);
+            return Err(FsError::InvalidData);
         }
         if !accepted {
             return Err(FsError::InvalidData);
@@ -216,8 +220,8 @@ fn smoke_ext4_remount_accepts_fstab_options() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext4_remount_accepts_fstab_options);
 
-/// Linux's refusals: an unknown key ("Unknown parameter", reported as
-/// `Unsupported` -> -EINVAL), a flag given a value, a number that is not
+/// Linux's refusals, every one of them -EINVAL: an unknown key ("Unknown
+/// parameter"), a flag given a value, a number that is not
 /// one, an enum value outside its table, and the changes ext4 refuses on
 /// a remount (data mode, journal device, DAX policy).
 fn smoke_ext4_remount_refuses_like_linux() -> TestResult {
@@ -233,9 +237,10 @@ fn smoke_ext4_remount_refuses_like_linux() -> TestResult {
         ("dax=always", false),
     ];
     for (line, unknown) in cases {
+        let _ = unknown;
         match validate_remount(line) {
-            Err(FsError::Unsupported) if unknown => {}
-            Err(FsError::InvalidData) if !unknown => {}
+            // Both shapes are -EINVAL, as `vfs_parse_fs_param` reports them.
+            Err(FsError::InvalidData) => {}
             _ => return TestResult::Fail("an ext4 remount parameter Linux refuses was accepted"),
         }
     }

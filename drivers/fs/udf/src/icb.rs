@@ -234,6 +234,58 @@ pub struct EntryLayout {
     pub ad_area_offset: usize,
     /// AD area length in bytes (L_AD).
     pub ad_area_length: usize,
+    /// §4/14.9.2 `Uid`. `UDF_INVALID_ID` (0xFFFF_FFFF) means "not
+    /// recorded", and Linux then reports the mount's `uid=`.
+    pub uid: u32,
+    /// §4/14.9.3 `Gid`, with the same sentinel.
+    pub gid: u32,
+    /// §4/14.9.4 `Permissions` — three-bit groups at shifted positions,
+    /// decoded by `udf_convert_permissions`.
+    pub permissions: u32,
+    /// The icb_tag's flags, which carry setuid/setgid/sticky.
+    pub icb_flags: u16,
+}
+
+/// `UDF_INVALID_ID`: the Uid/Gid value that means "not recorded".
+pub const UDF_INVALID_ID: u32 = 0xFFFF_FFFF;
+
+/// Field offsets shared by both entry shapes (the Extended File Entry's
+/// +40-byte shift starts after ModificationTime).
+pub mod fe_perm_offset {
+    pub const UID: usize = 36;
+    pub const GID: usize = 40;
+    pub const PERMISSIONS: usize = 44;
+}
+
+/// `udf_convert_permissions(fe)`:
+///
+/// ```text
+/// mode =  ((permissions)      & 0007) |
+///         ((permissions >> 2) & 0070) |
+///         ((permissions >> 4) & 0700) |
+///         ((flags & ICBTAG_FLAG_SETUID) ? S_ISUID : 0) |
+///         ((flags & ICBTAG_FLAG_SETGID) ? S_ISGID : 0) |
+///         ((flags & ICBTAG_FLAG_STICKY) ? S_ISVTX : 0);
+/// ```
+///
+/// UDF records permissions in four-bit groups (delete/attr/read/write/
+/// execute per class), so the POSIX triplets sit at 0, 2 and 4 bit shifts
+/// rather than the 0/3/6 a POSIX mode uses.
+pub fn convert_permissions(permissions: u32, icb_flags: u16) -> u16 {
+    const ICBTAG_FLAG_SETUID: u16 = 0x40;
+    const ICBTAG_FLAG_SETGID: u16 = 0x80;
+    const ICBTAG_FLAG_STICKY: u16 = 0x100;
+    let mut mode = (permissions & 0o7) | ((permissions >> 2) & 0o70) | ((permissions >> 4) & 0o700);
+    if icb_flags & ICBTAG_FLAG_SETUID != 0 {
+        mode |= 0o4000;
+    }
+    if icb_flags & ICBTAG_FLAG_SETGID != 0 {
+        mode |= 0o2000;
+    }
+    if icb_flags & ICBTAG_FLAG_STICKY != 0 {
+        mode |= 0o1000;
+    }
+    mode as u16
 }
 
 /// Walk a freshly-read (Extended) File Entry buffer and return the
@@ -280,6 +332,14 @@ pub fn decode_entry_layout(entry: &[u8]) -> Option<EntryLayout> {
         return None;
     }
 
+    let mut id_bytes = [0u8; 4];
+    id_bytes.copy_from_slice(&entry[fe_perm_offset::UID..fe_perm_offset::UID + 4]);
+    let uid = u32::from_le_bytes(id_bytes);
+    id_bytes.copy_from_slice(&entry[fe_perm_offset::GID..fe_perm_offset::GID + 4]);
+    let gid = u32::from_le_bytes(id_bytes);
+    id_bytes.copy_from_slice(&entry[fe_perm_offset::PERMISSIONS..fe_perm_offset::PERMISSIONS + 4]);
+    let permissions = u32::from_le_bytes(id_bytes);
+
     Some(EntryLayout {
         tag_identifier: id,
         file_type: icb_tag.file_type,
@@ -287,6 +347,10 @@ pub fn decode_entry_layout(entry: &[u8]) -> Option<EntryLayout> {
         information_length: info_len,
         ad_area_offset,
         ad_area_length: l_ad,
+        uid,
+        gid,
+        permissions,
+        icb_flags: icb_tag.flags,
     })
 }
 

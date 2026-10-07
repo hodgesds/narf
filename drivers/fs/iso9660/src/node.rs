@@ -86,10 +86,18 @@ impl<B: BlockDevice + 'static> Iso9660Node<B> {
         };
         let extent_lba = record.extent_lba_le();
         let data_length = record.data_length_le();
-        let mode = if record.is_directory() {
-            Mode::DIR_RO
-        } else {
-            Mode::FILE_RO
+        // `isofs_read_inode`: `dmode`/`mode=` when given, else r-x for all
+        // — files included, because "the disc could be shared with DOS
+        // machines so virtually anything could be a valid executable".
+        // NARF reported 0444 for files, so a binary or script burnt to a
+        // disc was not executable.
+        let mode = Mode {
+            file_type: if record.is_directory() {
+                FileType::Dir
+            } else {
+                FileType::File
+            },
+            perms: volume.opts.mode(record.is_directory()),
         };
         let stat = Stat {
             size: data_length as u64,
@@ -169,6 +177,13 @@ pub(crate) fn dot_record_date(sector: &[u8]) -> Result<[u8; 7], FsError> {
 // ── FileOps ─────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
+    /// `isofs_read_inode`: `inode->i_uid = sbi->s_uid; i_gid = sbi->s_gid`
+    /// — the mount's `uid=`/`gid=` (root by default, as isofs defaults them,
+    /// not the mounting task's).
+    fn owners(&self) -> (u32, u32) {
+        (self.volume.opts.owners.uid, self.volume.opts.owners.gid)
+    }
+
     fn ino(&self) -> u64 {
         self.ino
     }
@@ -240,6 +255,16 @@ impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
 // ── DirOps ──────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> DirOps for Iso9660Node<B> {
+    /// `dmode=`, else r-x for all — not the VFS's fixed 0755.
+    fn dir_mode(&self) -> u16 {
+        self.volume.opts.mode(true)
+    }
+
+    /// As [`FileOps::owners`]: the mount's ids.
+    fn dir_owners(&self) -> (u32, u32) {
+        (self.volume.opts.owners.uid, self.volume.opts.owners.gid)
+    }
+
     fn ino(&self) -> u64 {
         self.ino
     }

@@ -434,7 +434,20 @@ read-write for single-device SINGLE/DUP filesystems, including compressed
 reads, alternate checksums, subvolumes, snapshots, and COW namespace/file
 mutations; multi-device and RAID profiles remain unsupported. **Bind mounts**
 work through VFS path resolution. Missing: ext4-with-journal, xfs, zfs, NFS,
-and SMB. (The `xtask disk-write-partitioned` path lays down a FAT32 ESP + ext4
+and SMB.
+
+Each driver parses its own `fs_parameter_spec` table
+(`drivers/fs/*/src/mount_opts.rs`, `narf_filesystem::fsopts` for what they
+share), so `mount -o uid=1000,gid=1000,umask=022 -t vfat` and the rest of
+the removable-media forms work, with an unknown parameter or a malformed
+value answering EINVAL as `vfs_parse_fs_param` does. For the formats with no
+POSIX metadata (FAT, exFAT, ISO 9660) those options ARE the ownership and
+permission model, applied through `fat_make_mode` / `exfat_make_mode` /
+`isofs_read_inode`'s defaults; UDF and minix report what they record on
+disk, with UDF's options overriding it. What each driver accepts without
+acting on is a `LINUX-GAP` at its `mount_opts` module — NLS tables, discard,
+Rock Ridge and Joliet (neither implemented), squashfs's decompressor
+choice. (The `xtask disk-write-partitioned` path lays down a FAT32 ESP + ext4
 root, but ext4 write support inside the kernel is **not** claimed here —
 **unverified**; treat kernel ext4 as read-path-only until confirmed.) The
 [Btrfs driver README](../drivers/fs/btrfs/README.md) is the authoritative
