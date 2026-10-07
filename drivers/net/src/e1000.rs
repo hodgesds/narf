@@ -448,7 +448,13 @@ const IMS_DEFAULT: u32 =
     IMS_RXT0 | IMS_RXDMT0 | IMS_RXO | IMS_RXSEQ | IMS_TXDW | IMS_TXQE | IMS_LSC;
 
 const TX_RING_LEN: usize = 8;
-const RX_RING_LEN: usize = 8;
+/// RX descriptor ring depth. The ring page is 4096 bytes = 256 × 16-byte
+/// descriptors, so 256 is the most the existing allocation holds and matches
+/// the Linux e1000 default. An 8-deep ring overran (RXO) under any burst —
+/// a `curl` download or `ping` flood fills 8 slots before the RX pump drains
+/// them and the device silently drops the rest — so the ring is sized to
+/// absorb a full burst. RDLEN = 256*16 = 4096 (128-byte-aligned, valid).
+const RX_RING_LEN: usize = 256;
 /// Buffer size for each RX entry — must match RCTL.BSIZE.
 const RX_BUF_LEN: usize = 2048;
 
