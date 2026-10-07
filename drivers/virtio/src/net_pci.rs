@@ -62,6 +62,7 @@ use alloc::vec::Vec;
 
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
+use narf_io::pool::DmaPool;
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -297,14 +298,14 @@ pub struct VirtioNetPci {
     /// transmit returns its 4 KiB buffer here instead of freeing it, and
     /// `tx_buf_acquire` pops from here instead of `alloc_coherent` — keeping
     /// the coherent/buddy allocator off the per-frame TX hot path. Capped at
-    /// `TX_POOL_CAP`; overflow drops (frees) the buffer.
-    tx_pool: IrqSafeSpinLock<Vec<DmaBuffer>>,
+    /// `TX_POOL_CAP`; overflow drops (frees) the buffer. Shared `DmaPool`.
+    tx_pool: DmaPool,
     /// Recycled RX DMA buffers (the RX frame/`skb` pool). The forwarder returns
     /// each fully-consumed RX buffer here instead of freeing it, and
     /// `rx_take_on` pops from here for the replacement it posts back to the
     /// device — keeping the buddy allocator off the per-frame RX hot path.
-    /// Capped at `RX_POOL_CAP`.
-    rx_pool: IrqSafeSpinLock<Vec<DmaBuffer>>,
+    /// Capped at `RX_POOL_CAP`. Shared `DmaPool`.
+    rx_pool: DmaPool,
 }
 
 /// Control-queue runtime state. `ctrl_buf` holds back-to-back
@@ -716,8 +717,8 @@ impl VirtioNetPci {
             ctrl_qidx,
             ctrl,
             cfg_phys,
-            tx_pool: IrqSafeSpinLock::new(Vec::new()),
-            rx_pool: IrqSafeSpinLock::new(Vec::new()),
+            tx_pool: DmaPool::new(4096, DomainId::DRIVER_0, TX_POOL_CAP),
+            rx_pool: DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP),
         };
 
         // VirtIO 1.2 §5.1.6.5.5: after DRIVER_OK, tell the device
@@ -925,19 +926,13 @@ impl VirtioNetPci {
     /// Take a 4 KiB TX DMA buffer — recycled from `tx_pool` if available,
     /// else a fresh coherent allocation. Pairs with `tx_buf_release`.
     fn tx_buf_acquire(&self) -> Option<DmaBuffer> {
-        if let Some(b) = self.tx_pool.lock().pop() {
-            return Some(b);
-        }
-        alloc_coherent(4096, DomainId::DRIVER_0).ok()
+        self.tx_pool.acquire()
     }
 
     /// Return a completed TX DMA buffer to `tx_pool` for reuse, or drop it
     /// (freeing) when the pool is already at `TX_POOL_CAP`.
     fn tx_buf_release(&self, buf: DmaBuffer) {
-        let mut pool = self.tx_pool.lock();
-        if pool.len() < TX_POOL_CAP {
-            pool.push(buf);
-        }
+        self.tx_pool.release(buf);
     }
 
     /// Take a 4 KiB RX DMA buffer — recycled from the RX frame pool if
@@ -945,19 +940,13 @@ impl VirtioNetPci {
     /// whole buffer on receive, so a recycled (un-zeroed) buffer is fine.
     /// Pairs with [`Self::rx_buf_release`].
     pub fn rx_buf_acquire(&self) -> Option<DmaBuffer> {
-        if let Some(b) = self.rx_pool.lock().pop() {
-            return Some(b);
-        }
-        alloc_coherent(4096, DomainId::DRIVER_0).ok()
+        self.rx_pool.acquire()
     }
 
     /// Return a fully-consumed RX DMA buffer to the RX frame pool for reuse,
     /// or drop it (freeing) when the pool is already at `RX_POOL_CAP`.
     pub fn rx_buf_release(&self, buf: DmaBuffer) {
-        let mut pool = self.rx_pool.lock();
-        if pool.len() < RX_POOL_CAP {
-            pool.push(buf);
-        }
+        self.rx_pool.release(buf);
     }
 
     pub fn tx_dma(&self, buf: DmaBuffer, frame_len: u32) -> Result<(), VirtioPciError> {

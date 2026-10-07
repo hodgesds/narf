@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod iommu;
 mod iommu_e2e_tests;
+pub mod pool;
 mod tests;
 
 use core::fmt;

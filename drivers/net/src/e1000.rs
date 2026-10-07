@@ -1395,6 +1395,65 @@ impl E1000 {
         len
     }
 
+    /// Process one received frame **in place** from its RX DMA page — zero
+    /// copy — then re-arm the descriptor. The device has set DD (it is done
+    /// writing the page) and we re-arm the slot only after `f` returns, so
+    /// processing can never race a device write: because e1000's RX is
+    /// synchronous no replacement buffer is needed (unlike virtio, which must
+    /// swap in a fresh buffer before handing the filled one upward). This is
+    /// the P-F zero-copy RX path; it replaces the per-frame byte copy `rx_recv`
+    /// does into a scratch buffer. Returns `true` iff a frame was processed.
+    pub fn rx_recv_in_place<F: FnMut(&mut [u8])>(&self, mut f: F) -> bool {
+        let mut head_g = self.rx_head.lock();
+        let head = (*head_g) as usize;
+        let ring_phys = self.rx_ring.dma_addr().raw();
+        let desc_addr = ring_phys + (head * 16) as u64;
+        // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
+        let desc = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
+        };
+        if desc.status & RXD_STAT_DD == 0 {
+            return false;
+        }
+        let len = (desc.length as usize).min(RX_BUF_LEN);
+        // Descriptor `head` is backed by `rx_pool[head]` at probe and re-armed
+        // in place (the buffer address never changes), so the pairing is stable
+        // for the device's lifetime. Hand the stack a mutable slice straight
+        // into that identity-mapped page.
+        // SAFETY: the page is device-filled (DD set) and not concurrently
+        // written (we re-arm only after `f` returns); it is identity-mapped and
+        // `len <= RX_BUF_LEN <= page size`, so the slice stays within the
+        // buffer. An XDP rewrite in `f` writes the page we own until re-arm.
+        let frame = unsafe {
+            core::slice::from_raw_parts_mut(self.rx_pool[head].cpu_mut_ptr_at::<u8>(0), len)
+        };
+        f(frame);
+        // Re-arm the descriptor: clear status, keep the same buffer address.
+        let new_desc = RxDesc {
+            addr: desc.addr,
+            length: 0,
+            csum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        // SAFETY: identity-mapped DMA ring.
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                new_desc,
+            );
+        }
+        let new_head = ((head + 1) % RX_RING_LEN) as u32;
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_RDT, head as u32);
+        }
+        *head_g = new_head;
+        true
+    }
+
     /// `true` if at least one RX descriptor has its DD bit set.
     /// Cheaper than `rx_recv` when callers want to poll without
     /// consuming.
@@ -1600,25 +1659,19 @@ fn e1000_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
 /// processed. Called from a kernel-side polling task spawned at
 /// boot.
 pub fn rx_pump_step() -> bool {
-    let mut buf = [0u8; 1600];
-    // Same shape as `e1000_send_frame`: don't hold CONTROLLER across the
-    // ring drain, or a TX stuck in its 250 ms DD poll under the same
-    // lock stalls RX (and vice versa) with interrupts masked. `rx_recv`
-    // serializes against other RX consumers on the controller's own
-    // `rx_head` lock.
-    let n = match probed_controller() {
-        Some(c) => c.rx_recv(&mut buf),
-        None => 0,
-    };
-    if n == 0 {
-        return false;
+    // Zero-copy: dispatch the frame straight out of its RX DMA page rather than
+    // copying it into a scratch buffer first (P-F). Same lock discipline as
+    // `e1000_send_frame` — `rx_recv_in_place` holds only the controller's
+    // `rx_head` lock across the synchronous stack dispatch, never CONTROLLER,
+    // so a TX stuck in its 250 ms DD poll cannot stall RX. An attached XDP
+    // program rewriting header bytes writes the DMA page directly, which the
+    // driver owns until it re-arms the slot after dispatch returns.
+    match probed_controller() {
+        Some(c) => c.rx_recv_in_place(|frame| {
+            narf_net::iface::on_rx_frame_from(e1000_ifname(), frame);
+        }),
+        None => false,
     }
-    // `&mut`: an attached XDP program may rewrite header bytes in place. `buf`
-    // is this function's own stack scratch buffer holding a copy of the RX
-    // descriptor's payload, so mutating it before the stack parses it out is
-    // sound and never touches the live DMA ring.
-    narf_net::iface::on_rx_frame_from(e1000_ifname(), &mut buf[..n]);
-    true
 }
 
 /// Every Intel device id this driver claims. Kept as a single
