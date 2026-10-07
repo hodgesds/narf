@@ -5665,9 +5665,21 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_stat_reports_exact_mtime_ns);
 /// Linux's kernfs-backed sysfs. NARF answered EINVAL (the generic
 /// `Unsupported` mapping), which fontconfig's `FcAtomicLock` does not treat
 /// as "no hard links here", so it never fell back to its mkdir lock.
+///
+/// `SysFs` is a handle on ONE global kobject tree, and several driver and
+/// bluetooth sysfs-bridge cases call `sysfs::__reset_for_test()`, which
+/// empties it (root AND provider list) so they can assert what their own
+/// bridge creates. This case needs `/sys/kernel/uevent_seqnum` to exist, so
+/// it populates that subtree itself rather than inheriting whatever the
+/// previous case left: it used to answer -ENOENT (the path never resolved,
+/// so `link` never reached the EPERM this asserts) whenever the kernel-test
+/// registry's linker-section order happened to put it after one of those
+/// resets. `populate_kernel_dir` is idempotent and does not go through the
+/// cleared provider list.
 fn smoke_abi_fsx_link_without_link_op_is_eperm() -> TestResult {
     setup();
     let _kbuf = crate::handlers::kernel_buffers_guard();
+    narf_filesystem::sysfs::populate_kernel_dir();
     let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
     let mnt = match registry().mount(&auth, "/abisys-link", narf_filesystem::SysFs::new()) {
         Ok(h) => h,

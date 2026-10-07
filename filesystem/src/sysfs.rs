@@ -3679,6 +3679,21 @@ kernel_test_in!(
 // ── Reset helper for tests ────────────────────────────────────────────
 
 /// Reset global sysfs state for test isolation.  NOT for production.
+///
+/// This empties the ONE tree every `SysFs` handle is a view of, and clears
+/// the provider list with it — so after a call, `populate_all()` has nothing
+/// to run and the boot-populated subtrees (`/sys/kernel`, `/sys/class/*`, …)
+/// are gone for every case that runs later in the same image. The
+/// kernel-test registry's order comes from a linker section, so "later" is
+/// not something a test author can see or rely on.
+///
+/// A case that needs a standard subtree must therefore build it itself —
+/// `populate_kernel_dir()` / `get_or_create_child()`, which do not go through
+/// the cleared provider list — rather than inherit it. Both
+/// `smoke_abi_inode_sysfs_dirs` and
+/// `smoke_abi_fsx_link_without_link_op_is_eperm` do exactly that, the second
+/// after spending a while failing with -ENOENT whenever link order put it
+/// after one of these resets.
 #[doc(hidden)]
 pub fn __reset_for_test() {
     *SYSFS_ROOT.lock() = None;
