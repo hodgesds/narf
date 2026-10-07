@@ -20,4 +20,8 @@ bitflags = "2.4"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [features]
-kernel-test = []
+# Tests cover the AP-side SAE-PK generator, so kernel-test pulls it in.
+kernel-test = ["sae-pk-ap"]
+# WPA3 SAE-PK AP-side password/KeyAuth generation (needs ECDSA signing). Off by
+# default — NARF is primarily a station; an AP build opts in.
+sae-pk-ap = ["narf-crypto/ecdsa-sign"]
