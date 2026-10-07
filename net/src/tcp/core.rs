@@ -343,10 +343,23 @@ pub struct CachedEgress {
     pub dev: iface::NetIfaceSnapshot,
 }
 
+/// The TX offload metadata for a frame emitted on `dev`: TSO (which implies L4
+/// checksum) when `tso_mss` is set and the device supports it, else L4 checksum
+/// alone when advertised, else none. Must agree with the `offload_csum`
+/// argument the frame was built with.
+fn offload_meta(dev: &iface::NetIfaceSnapshot, tso_mss: Option<u16>) -> crate::TxMeta {
+    match tso_mss {
+        Some(mss) if dev.offloads.max_tso_bytes > 0 => crate::TxMeta::with_tso(mss),
+        _ if dev.offloads.tx_checksum => crate::TxMeta::with_csum(crate::L4CsumKind::Tcp),
+        _ => crate::TxMeta::plain(),
+    }
+}
+
 fn emit_tcb_frame(
     arc: &Arc<IrqSafeSpinLock<Tcb>>,
     dev: &iface::NetIfaceSnapshot,
     mut frame: Vec<u8>,
+    meta: crate::TxMeta,
 ) {
     let iface_name = dev.name.as_str();
     let (net_ns_id, is_ipv6) = {
@@ -363,14 +376,6 @@ fn emit_tcb_frame(
             &mut frame[crate::pkt::ETH_HDR_LEN..],
         ) == crate::netfilter::Verdict::Accept
     {
-        // The frame was built with a checksum seed iff the egress advertises
-        // tx_checksum (see `build_tcb_frame` callers); request the matching
-        // offload so the driver completes it.
-        let meta = if dev.offloads.tx_checksum {
-            crate::TxMeta::with_csum(crate::L4CsumKind::Tcp)
-        } else {
-            crate::TxMeta::plain()
-        };
         let _ = dev.xmit_meta(&frame, meta);
     }
 }
@@ -2169,7 +2174,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
     // Track SYN in the retransmit queue so a missed SYN-ACK
     // re-triggers retransmit.
     let mut t = arc.lock();
@@ -2205,7 +2210,7 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
 }
 
 fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool) {
@@ -2229,7 +2234,7 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
 }
 
 /// Build & send one data segment carrying `payload` from sequence
@@ -2241,6 +2246,7 @@ fn send_data(
     payload: &[u8],
     extra_flags: u8,
     record_retx: bool,
+    tso_mss: Option<u16>,
 ) {
     if !payload.is_empty() {
         rxtx_note_tx();
@@ -2276,6 +2282,11 @@ fn send_data(
         t.unacked_data_segments = 0;
         (t.rcv_nxt, window, opts)
     };
+    // TSO super-frame: only when this is a multi-MSS payload AND the egress
+    // can segment it. TSO implies L4 checksum offload, so the frame carries
+    // the checksum seed in either offload case.
+    let tso = tso_mss.filter(|_| egress.dev.offloads.max_tso_bytes > 0);
+    let csum_off = tso.is_some() || egress.dev.offloads.tx_checksum;
     let frame = build_tcb_frame(
         &arc.lock(),
         egress.mac,
@@ -2285,9 +2296,9 @@ fn send_data(
         window,
         opt_bytes,
         payload,
-        egress.dev.offloads.tx_checksum,
+        csum_off,
     );
-    emit_tcb_frame(arc, &egress.dev, frame);
+    emit_tcb_frame(arc, &egress.dev, frame, offload_meta(&egress.dev, tso));
     if record_retx {
         let mut t = arc.lock();
         let payload_len = payload.len() as u32;
@@ -2514,7 +2525,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &payload,
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
     {
         let mut t = arc.lock();
         // The buffer was rewound to snd_una: advance past what we resent so
@@ -2583,7 +2594,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
 }
 
 fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -2645,7 +2656,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
 }
 
 fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -2670,10 +2681,24 @@ fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 /// window / MSS. Called on each `tcp_send` and after each ACK.
 pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     loop {
-        let (chunks, seq, fin_flag, mss, drained_all) = {
+        let (chunks, seq, fin_flag, tso_arg, drained_all) = {
             let mut t = arc.lock();
             let usable = t.usable_send_window();
             let mss = t.opts.peer_mss as u32;
+            // TSO: if the memoized egress can segment, build one super-frame of
+            // up to `max_tso_bytes` (less header headroom) per emit and let the
+            // NIC cut it into MSS segments; otherwise emit MSS segments as
+            // before. `tso_arg` carries the MSS down to `send_data`.
+            let tso_max = t
+                .egress
+                .as_ref()
+                .map_or(0u32, |e| e.dev.offloads.max_tso_bytes);
+            let seg_cap = if tso_max > 0 {
+                tso_max.saturating_sub(128).max(mss)
+            } else {
+                mss
+            };
+            let tso_arg = if tso_max > 0 { Some(mss as u16) } else { None };
             if usable == 0 {
                 // Arm persist only when the RECEIVER's window is closed.
                 // Running out of cwnd (or filling a still-open window) is
@@ -2700,7 +2725,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                     let seq = t.fin_seq;
                     let flags = FLAG_FIN;
                     t.snd_nxt = t.snd_nxt.wrapping_add(1);
-                    (Vec::<Vec<u8>>::new(), seq, flags, mss, true)
+                    (Vec::<Vec<u8>>::new(), seq, flags, None, true)
                 } else {
                     break;
                 }
@@ -2709,7 +2734,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 let mut remaining = unsent.min(usable);
                 let starting_seq = t.send_buf.seq_at_sent_offset();
                 while remaining > 0 {
-                    let take = remaining.min(mss);
+                    let take = remaining.min(seg_cap);
                     let (a, b) = t.send_buf.unsent_slices(take as usize);
                     let mut chunk = Vec::with_capacity(take as usize);
                     chunk.extend_from_slice(a);
@@ -2732,7 +2757,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                     chunks,
                     starting_seq,
                     if attach_fin { FLAG_FIN } else { 0 },
-                    mss,
+                    tso_arg,
                     drained,
                 )
             }
@@ -2740,7 +2765,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         if chunks.is_empty() {
             if fin_flag != 0 {
                 // Pure FIN segment.
-                send_data(arc, seq, &[], FLAG_FIN, true);
+                send_data(arc, seq, &[], FLAG_FIN, true, None);
                 break;
             }
             break;
@@ -2753,10 +2778,14 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             } else {
                 FLAG_PSH
             };
-            send_data(arc, cur_seq, c, extra, true);
+            // A chunk larger than one MSS is a TSO super-frame; `send_data`
+            // requests hardware segmentation. `tso_arg` is `Some(mss)` only
+            // for a TSO-capable egress, so a single-MSS chunk or a non-TSO
+            // egress sends normally.
+            let seg_tso = tso_arg.filter(|&m| c.len() > m as usize);
+            send_data(arc, cur_seq, c, extra, true, seg_tso);
             cur_seq = cur_seq.wrapping_add(c.len() as u32);
         }
-        let _ = mss;
         let _ = drained_all;
         if fin_flag != 0 {
             break;
@@ -3709,7 +3738,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &payload,
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
     let mut t = arc.lock();
     // Karn: no RTT sample from any record covering the resent range.
     let end = seq.wrapping_add(payload.len() as u32);
