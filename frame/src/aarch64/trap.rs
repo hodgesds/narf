@@ -452,9 +452,11 @@ fn try_heal_user_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> HealOu
             }
             // The file refused a mapped page: SIGBUS, never a stack grow.
             bus = r == Err(narf_memory::AddressSpaceError::Bus);
+            // A guard marker is a final SIGSEGV, never a stack grow.
+            let guard_fault = r == Err(narf_memory::AddressSpaceError::GuardPage);
             let limits = narf_userspace::handlers::current_stack_growth_limits();
             // SAFETY: same.
-            if !bus && unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
+            if !bus && !guard_fault && unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
                 return HealOutcome::Healed;
             }
         }
