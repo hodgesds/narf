@@ -16,6 +16,7 @@
 
 pub mod clockevent;
 pub mod hpet;
+pub mod ntp;
 pub mod rtc;
 pub mod timer_wheel;
 pub mod wall;

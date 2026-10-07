@@ -9,6 +9,7 @@ const CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
 const CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
+const CLOCK_TAI: u64 = 11;
 
 /// SIGALRM — `timer_create`'s default signo when `sigevent` is NULL.
 const SIGALRM_SIGNO: i32 = 14;
@@ -43,54 +44,362 @@ fn smoke_abi_time_sysinfo_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_sysinfo_neg);
 
-// ── adjtimex(timex) ───────────────────────────────────────────────────
-// timex==0 → ok(-EFAULT); a valid timex buffer → ok(TIME_OK=0).
+// ── adjtimex(timex) / clock_adjtime(clockid, timex) ──────────────────
+//
+// `struct __kernel_timex` as the 26 LP64 words the ABI lays it out as.
+// The three `int` members (`modes`, `status`, `tai`) each own a whole word
+// with the pad behind them, so a whole-word store is safe and a read of the
+// low half is the field.
+const TX_WORDS: usize = 26;
+const TX_MODES: usize = 0;
+const TX_OFFSET: usize = 1;
+const TX_FREQ: usize = 2;
+const TX_MAXERROR: usize = 3;
+const TX_ESTERROR: usize = 4;
+const TX_STATUS: usize = 5;
+const TX_CONSTANT: usize = 6;
+const TX_PRECISION: usize = 7;
+const TX_TOLERANCE: usize = 8;
+const TX_TIME_SEC: usize = 9;
+const TX_TIME_USEC: usize = 10;
+const TX_TICK: usize = 11;
+const TX_TAI: usize = 20;
 
-fn smoke_abi_time_adjtimex_pos() -> TestResult {
+// `timex.modes` bits (`include/uapi/linux/timex.h`).
+const ADJ_FREQUENCY: u64 = 0x0002;
+const ADJ_STATUS: u64 = 0x0010;
+const ADJ_SETOFFSET: u64 = 0x0100;
+const ADJ_TICK: u64 = 0x4000;
+const ADJ_ADJTIME: u64 = 0x8000;
+
+// `timex.status` bits and the clock states the call returns.
+const STA_PLL: i64 = 0x0001;
+const STA_UNSYNC: i64 = 0x0040;
+const TIME_OK: i64 = 0;
+const TIME_ERROR: i64 = 5;
+
+/// Linux's boot defaults (`kernel/time/ntp.c`'s `tk_ntp_data[]`), which an
+/// undisciplined NARF clock keeps: 100 Hz tick, `NTP_PHASE_LIMIT` error
+/// estimates, `MAXFREQ_SCALED / PPM_SCALE` tolerance.
+const DEFAULT_TICK_USEC: i64 = 10_000;
+const NTP_PHASE_LIMIT: i64 = 16_000_000;
+const FREQ_TOLERANCE: i64 = 32_768_000;
+
+fn timex_status(tx: &[u64; TX_WORDS]) -> i64 {
+    i64::from(tx[TX_STATUS] as u32 as i32)
+}
+
+/// A read-only query (`modes == 0`) needs no privilege and reports the
+/// undisciplined clock Linux reports before anything syncs it: `STA_UNSYNC`
+/// in `status`, which `is_error_status()` turns into TIME_ERROR. Every
+/// read-only field is filled in — the old handler wrote back only `freq`,
+/// `status` and `tick` and left the rest of the caller's buffer untouched.
+fn smoke_abi_time_adjtimex_query_reports_undisciplined() -> TestResult {
     with_setup(|| {
-        // struct timex is large; a generously-sized zeroed buffer covers
-        // every field the handler reads/writes (modes/freq/status/tick).
-        let mut tx = [0u8; 256];
+        let mut tx = [0u64; TX_WORDS];
+        // Poison the fields the kernel owns: a handler that does not write
+        // them back would hand these values to the caller as clock state.
+        tx[TX_MAXERROR] = 0xdead;
+        tx[TX_ESTERROR] = 0xdead;
+        tx[TX_PRECISION] = 0xdead;
+        tx[TX_TOLERANCE] = 0xdead;
+        tx[TX_TAI] = 0xdead;
         match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
-            Some(0) => Ok(()),
-            _ => Err("adjtimex with a valid buffer should return TIME_OK (0)"),
+            Some(v) if v == TIME_ERROR => {}
+            Some(v) if v == TIME_OK => {
+                return Err("an undisciplined clock reported TIME_OK, not TIME_ERROR")
+            }
+            _ => return Err("adjtimex query should return the clock state"),
         }
+        if timex_status(&tx) & STA_UNSYNC == 0 {
+            return Err("adjtimex should report STA_UNSYNC on an undisciplined clock");
+        }
+        if tx[TX_TICK] as i64 != DEFAULT_TICK_USEC {
+            return Err("adjtimex should report the 100 Hz USER_TICK_USEC tick");
+        }
+        if tx[TX_PRECISION] as i64 != 1 || tx[TX_TOLERANCE] as i64 != FREQ_TOLERANCE {
+            return Err("adjtimex left precision/tolerance unwritten");
+        }
+        if tx[TX_MAXERROR] as i64 != NTP_PHASE_LIMIT || tx[TX_ESTERROR] as i64 != NTP_PHASE_LIMIT {
+            return Err("adjtimex left maxerror/esterror unwritten");
+        }
+        if tx[TX_TAI] as u32 != 0 || tx[TX_OFFSET] as i64 != 0 || tx[TX_FREQ] as i64 != 0 {
+            return Err("adjtimex left tai/offset/freq unwritten");
+        }
+        Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_time_adjtimex_pos);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_adjtimex_query_reports_undisciplined
+);
 
+/// The struct is copied in whole, so a NULL or faulting pointer is -EFAULT
+/// before anything else happens.
 fn smoke_abi_time_adjtimex_neg() -> TestResult {
-    with_setup(|| match call(Syscall::Adjtimex.raw(), a0(0)) {
-        Some(v) if v == EFAULT => Ok(()),
-        _ => Err("adjtimex(NULL) should return -EFAULT"),
+    with_setup(|| {
+        match call(Syscall::Adjtimex.raw(), a0(0)) {
+            Some(v) if v == EFAULT => {}
+            _ => return Err("adjtimex(NULL) should return -EFAULT"),
+        }
+        match call(Syscall::Adjtimex.raw(), a0(BAD_PTR)) {
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("adjtimex(unmapped) should return -EFAULT"),
+        }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_adjtimex_neg);
 
-// ── clock_adjtime(clockid, timex) ─────────────────────────────────────
-// Accepted clock + valid buffer → ok(0); an unknown clockid → ok(-EINVAL).
+/// `ADJ_STATUS` takes the writable status bits from the request and
+/// `ADJ_TICK` replaces the tick, and both read back. Clearing `STA_UNSYNC`
+/// is what makes the call answer TIME_OK, exactly as it does once a time
+/// daemon takes over on Linux.
+fn smoke_abi_time_adjtimex_status_and_tick_roundtrip() -> TestResult {
+    with_setup(|| {
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_STATUS | ADJ_TICK;
+        tx[TX_STATUS] = STA_PLL as u64;
+        tx[TX_TICK] = 10_500;
+        let verdict = match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v == TIME_OK => {
+                if timex_status(&tx) != STA_PLL {
+                    Err("ADJ_STATUS should install exactly the writable bits requested")
+                } else if tx[TX_TICK] as i64 != 10_500 {
+                    Err("ADJ_TICK should install and report the new tick")
+                } else {
+                    Ok(())
+                }
+            }
+            Some(v) if v == TIME_ERROR => Err("clearing STA_UNSYNC should answer TIME_OK"),
+            _ => Err("adjtimex(ADJ_STATUS|ADJ_TICK) should return the clock state"),
+        };
+        // Put the kernel's NTP state back: turning the PLL off resets the
+        // discipline to the boot default (`process_adj_status`).
+        let mut restore = [0u64; TX_WORDS];
+        restore[TX_MODES] = ADJ_STATUS | ADJ_TICK;
+        restore[TX_STATUS] = STA_UNSYNC as u64;
+        restore[TX_TICK] = DEFAULT_TICK_USEC as u64;
+        match call(Syscall::Adjtimex.raw(), a0(restore.as_mut_ptr() as u64)) {
+            Some(v) if v == TIME_ERROR => verdict,
+            _ => Err("restoring STA_UNSYNC should answer TIME_ERROR again"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_adjtimex_status_and_tick_roundtrip
+);
 
+/// `timekeeping_validate_timex` refuses a request before any of it is
+/// applied: a tick more than 10% off nominal, a `freq` whose scaling would
+/// overflow, and `ADJ_ADJTIME` without its `ADJ_OFFSET_SINGLESHOT` spelling.
+fn smoke_abi_time_adjtimex_rejects_invalid_requests() -> TestResult {
+    with_setup(|| {
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_TICK;
+        tx[TX_TICK] = 5_000;
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("a tick 50% off nominal should be -EINVAL"),
+        }
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_FREQUENCY;
+        tx[TX_FREQ] = i64::MAX as u64;
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("a freq that overflows PPM_SCALE should be -EINVAL"),
+        }
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_ADJTIME;
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("ADJ_ADJTIME without ADJ_OFFSET_SINGLESHOT should be -EINVAL"),
+        }
+        // None of the refusals may have reached the state.
+        let mut tx = [0u64; TX_WORDS];
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(_) if tx[TX_TICK] as i64 == DEFAULT_TICK_USEC => Ok(()),
+            _ => Err("a refused request changed the tick anyway"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_adjtimex_rejects_invalid_requests
+);
+
+/// `ADJ_FREQUENCY` round-trips through `time_freq`'s `PPM_SCALE` scaling,
+/// and a request past `MAXFREQ_SCALED` clamps to the reported tolerance
+/// rather than being refused.
+fn smoke_abi_time_adjtimex_freq_roundtrip() -> TestResult {
+    with_setup(|| {
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_FREQUENCY;
+        tx[TX_FREQ] = 6_553_600; // 100 ppm in timex's 2^16-scaled ppm
+        let verdict = match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(_) if tx[TX_FREQ] as i64 == 6_553_600 => Ok(()),
+            Some(_) => Err("ADJ_FREQUENCY did not round-trip through PPM_SCALE"),
+            _ => Err("adjtimex(ADJ_FREQUENCY) should return the clock state"),
+        };
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_FREQUENCY;
+        tx[TX_FREQ] = (FREQ_TOLERANCE as u64) * 2_000; // well past MAXFREQ
+        let clamped = match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(_) if tx[TX_FREQ] as i64 == FREQ_TOLERANCE => Ok(()),
+            Some(_) => Err("a freq past MAXFREQ_SCALED should clamp to the tolerance"),
+            _ => Err("adjtimex(ADJ_FREQUENCY) should return the clock state"),
+        };
+        // Back to zero so the next test sees the boot default.
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_FREQUENCY;
+        let _ = call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64));
+        verdict.and(clamped)
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_adjtimex_freq_roundtrip);
+
+/// `ADJ_SETOFFSET` is the one mode that reaches the timekeeper: it steps
+/// CLOCK_REALTIME by `timex.time`, and `timex.time` reads back as the time
+/// the request saw, not the stepped one.
+fn smoke_abi_time_adjtimex_setoffset_steps_the_clock() -> TestResult {
+    with_setup(|| {
+        let mut before = [0i64; 2];
+        match call(
+            Syscall::ClockGetTime.raw(),
+            a1(CLOCK_REALTIME, before.as_mut_ptr() as u64),
+        ) {
+            Some(0) => {}
+            _ => return Err("clock_gettime(CLOCK_REALTIME) should succeed"),
+        }
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_SETOFFSET;
+        tx[TX_TIME_SEC] = 100;
+        let reported = match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v >= 0 => tx[TX_TIME_SEC] as i64,
+            _ => return Err("adjtimex(ADJ_SETOFFSET) should return the clock state"),
+        };
+        let mut after = [0i64; 2];
+        let _ = call(
+            Syscall::ClockGetTime.raw(),
+            a1(CLOCK_REALTIME, after.as_mut_ptr() as u64),
+        );
+        // Step it back before judging, so a failure does not leave the wall
+        // clock 100 seconds ahead for every later test.
+        let mut undo = [0u64; TX_WORDS];
+        undo[TX_MODES] = ADJ_SETOFFSET;
+        undo[TX_TIME_SEC] = (-100i64) as u64;
+        let _ = call(Syscall::Adjtimex.raw(), a0(undo.as_mut_ptr() as u64));
+
+        if after[0] - before[0] < 99 {
+            return Err("ADJ_SETOFFSET did not step CLOCK_REALTIME");
+        }
+        if reported > before[0] + 1 {
+            return Err("timex.time should report the pre-step realtime sample");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_adjtimex_setoffset_steps_the_clock
+);
+
+/// `ADJ_TAI` takes its value from `timex.constant` — not a field of its own —
+/// and reports it in `timex.tai`, while `constant` itself reads back as the
+/// PLL time constant. `ADJ_SETOFFSET`'s sub-second field is a magnitude: a
+/// negative or out-of-range `time.tv_usec` is -EINVAL.
+fn smoke_abi_time_adjtimex_tai_and_setoffset_validation() -> TestResult {
+    with_setup(|| {
+        const ADJ_TAI: u64 = 0x0080;
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_TAI;
+        tx[TX_CONSTANT] = 37; // the 2026 UTC-TAI offset
+        let verdict = match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v >= 0 => {
+                if tx[TX_TAI] as u32 as i32 != 37 {
+                    Err("ADJ_TAI should report the installed TAI offset in timex.tai")
+                } else if tx[TX_CONSTANT] as i64 != 2 {
+                    Err("timex.constant should read back the PLL time constant")
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err("adjtimex(ADJ_TAI) should return the clock state"),
+        };
+        // Back to the boot default.
+        let mut restore = [0u64; TX_WORDS];
+        restore[TX_MODES] = ADJ_TAI;
+        let _ = call(Syscall::Adjtimex.raw(), a0(restore.as_mut_ptr() as u64));
+
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_SETOFFSET;
+        tx[TX_TIME_USEC] = 1_000_000;
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("ADJ_SETOFFSET with tv_usec >= USEC_PER_SEC should be -EINVAL"),
+        }
+        let mut tx = [0u64; TX_WORDS];
+        tx[TX_MODES] = ADJ_SETOFFSET;
+        tx[TX_TIME_USEC] = (-1i64) as u64;
+        match call(Syscall::Adjtimex.raw(), a0(tx.as_mut_ptr() as u64)) {
+            Some(v) if v == EINVAL => verdict,
+            _ => Err("ADJ_SETOFFSET with a negative tv_usec should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_adjtimex_tai_and_setoffset_validation
+);
+
+/// CLOCK_REALTIME is the one clock with a `.clock_adj`.
 fn smoke_abi_time_clock_adjtime_pos() -> TestResult {
     with_setup(|| {
-        let mut tx = [0u8; 256];
+        let mut tx = [0u64; TX_WORDS];
         match call(
             Syscall::ClockAdjtime.raw(),
             a1(CLOCK_REALTIME, tx.as_mut_ptr() as u64),
         ) {
-            Some(0) => Ok(()),
-            _ => Err("clock_adjtime(CLOCK_REALTIME, buf) should return 0"),
+            Some(v) if v == TIME_ERROR && tx[TX_TICK] as i64 == DEFAULT_TICK_USEC => Ok(()),
+            Some(v) if v == TIME_OK => Err("an undisciplined clock reported TIME_OK"),
+            _ => Err("clock_adjtime(CLOCK_REALTIME) should return the clock state"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_clock_adjtime_pos);
 
+/// A clock that exists but has no discipline interface is -EOPNOTSUPP; only
+/// an id that names no clock is -EINVAL. Both come after the struct copy, so
+/// a faulting pointer beats either.
 fn smoke_abi_time_clock_adjtime_neg() -> TestResult {
     with_setup(|| {
-        let mut tx = [0u8; 256];
-        // clockid 99 is not one of REALTIME/MONOTONIC/BOOTTIME/TAI.
-        match call(Syscall::ClockAdjtime.raw(), a1(99, tx.as_mut_ptr() as u64)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("clock_adjtime on an unknown clockid should return -EINVAL"),
+        let mut tx = [0u64; TX_WORDS];
+        for (clockid, want, what) in [
+            (CLOCK_MONOTONIC, EOPNOTSUPP, "CLOCK_MONOTONIC"),
+            (CLOCK_MONOTONIC_COARSE, EOPNOTSUPP, "CLOCK_MONOTONIC_COARSE"),
+            (CLOCK_TAI, EOPNOTSUPP, "CLOCK_TAI"),
+            (CLOCK_PROCESS_CPUTIME_ID, EOPNOTSUPP, "a CPU-time clock"),
+            // Index 10 is a hole in `posix_clocks[]`; 99 is past its end.
+            (10, EINVAL, "the posix_clocks[] hole"),
+            (99, EINVAL, "an unknown clockid"),
+        ] {
+            match call(
+                Syscall::ClockAdjtime.raw(),
+                a1(clockid, tx.as_mut_ptr() as u64),
+            ) {
+                Some(v) if v == want => {}
+                _ => {
+                    let _ = what;
+                    return Err(
+                        "clock_adjtime answered the wrong errno for a clock it cannot adjust",
+                    );
+                }
+            }
+        }
+        // `copy_from_user` runs before the clock lookup.
+        match call(Syscall::ClockAdjtime.raw(), a1(99, BAD_PTR)) {
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("clock_adjtime should fault on the struct before judging the clockid"),
         }
     })
 }

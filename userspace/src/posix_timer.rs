@@ -66,17 +66,17 @@ use crate::errno::{to_ret as err, *};
 // a clockid Linux knows but cannot arm a timer on is EOPNOTSUPP, while
 // one it does not know at all is EINVAL, and the two are not
 // interchangeable to a caller probing for clock support.
-const CLOCKID_REALTIME: i32 = 0;
-const CLOCKID_MONOTONIC: i32 = 1;
-const CLOCKID_PROCESS_CPUTIME_ID: i32 = 2;
-const CLOCKID_THREAD_CPUTIME_ID: i32 = 3;
-const CLOCKID_MONOTONIC_RAW: i32 = 4;
-const CLOCKID_REALTIME_COARSE: i32 = 5;
-const CLOCKID_MONOTONIC_COARSE: i32 = 6;
-const CLOCKID_BOOTTIME: i32 = 7;
-const CLOCKID_REALTIME_ALARM: i32 = 8;
-const CLOCKID_BOOTTIME_ALARM: i32 = 9;
-const CLOCKID_TAI: i32 = 11;
+pub(crate) const CLOCKID_REALTIME: i32 = 0;
+pub(crate) const CLOCKID_MONOTONIC: i32 = 1;
+pub(crate) const CLOCKID_PROCESS_CPUTIME_ID: i32 = 2;
+pub(crate) const CLOCKID_THREAD_CPUTIME_ID: i32 = 3;
+pub(crate) const CLOCKID_MONOTONIC_RAW: i32 = 4;
+pub(crate) const CLOCKID_REALTIME_COARSE: i32 = 5;
+pub(crate) const CLOCKID_MONOTONIC_COARSE: i32 = 6;
+pub(crate) const CLOCKID_BOOTTIME: i32 = 7;
+pub(crate) const CLOCKID_REALTIME_ALARM: i32 = 8;
+pub(crate) const CLOCKID_BOOTTIME_ALARM: i32 = 9;
+pub(crate) const CLOCKID_TAI: i32 = 11;
 
 /// Largest timerid `lock_timer()` will look up — see [`timer_id_arg`].
 const TIMER_ID_MAX: u32 = i32::MAX as u32;
