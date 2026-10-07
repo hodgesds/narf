@@ -859,3 +859,96 @@ fn smoke_abi_mem2_madvise_exact_errnos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem2_madvise_exact_errnos);
+
+// ── madvise MADV_GUARD_INSTALL / MADV_GUARD_REMOVE ───────────────────
+
+/// `madvise_guard_install` / `madvise_guard_remove` through the syscall:
+/// a guard page faults SEGV_MAPERR although a VMA covers it; a hole is
+/// -ENOMEM with the mapped part still processed (`madvise_walk_vmas`);
+/// `is_valid_guard_vma` refuses an mlocked VMA for install (-EINVAL) but not
+/// for remove.
+fn smoke_abi_mem2_madvise_guard_install_remove() -> TestResult {
+    const PAGE: u64 = 0x1000;
+    const MADV_GUARD_INSTALL: u64 = 102;
+    const MADV_GUARD_REMOVE: u64 = 103;
+    const SEGV_MAPERR: i32 = 1;
+    const SEGV_ACCERR: i32 = 2;
+    with_setup(|| {
+        with_mseal_as(|base, len| {
+            let space = MSEAL_AS
+                .lock()
+                .clone()
+                .ok_or("test address space vanished")?;
+            let guarded = |va: u64| space.is_guard_page(narf_memory::VirtAddr::new(va));
+            if call(
+                Syscall::Madvise.raw(),
+                a2(base + PAGE, PAGE, MADV_GUARD_INSTALL),
+            ) != Some(0)
+            {
+                return Err("MADV_GUARD_INSTALL over a private anonymous page must succeed");
+            }
+            if !guarded(base + PAGE) || guarded(base) || guarded(base + 2 * PAGE) {
+                return Err("MADV_GUARD_INSTALL marked the wrong pages");
+            }
+            if crate::handlers::page_fault_si_code(base + PAGE + 8) != SEGV_MAPERR {
+                return Err("a fault on a guard page must be SEGV_MAPERR");
+            }
+            if crate::handlers::page_fault_si_code(base) != SEGV_ACCERR {
+                return Err("an unguarded mapped page must stay SEGV_ACCERR");
+            }
+            // [base+3p, base+len+p) runs off the end of the VMA.
+            if call(
+                Syscall::Madvise.raw(),
+                a2(base + 3 * PAGE, 2 * PAGE, MADV_GUARD_INSTALL),
+            ) != Some(ENOMEM)
+            {
+                return Err("MADV_GUARD_INSTALL across a hole must be -ENOMEM");
+            }
+            if !guarded(base + 3 * PAGE) {
+                return Err("the mapped part before a hole must still be guarded");
+            }
+            if call(Syscall::MLock.raw(), a2(base, PAGE, 0)) != Some(0) {
+                return Err("setup: mlock of the first page failed");
+            }
+            if call(Syscall::Madvise.raw(), a2(base, PAGE, MADV_GUARD_INSTALL)) != Some(EINVAL) {
+                return Err("MADV_GUARD_INSTALL over an mlocked VMA must be -EINVAL");
+            }
+            if call(Syscall::Madvise.raw(), a2(base, len, MADV_GUARD_REMOVE)) != Some(0) {
+                return Err("MADV_GUARD_REMOVE over an mlocked VMA must succeed");
+            }
+            if (0..len / PAGE).any(|page| guarded(base + page * PAGE)) {
+                return Err("MADV_GUARD_REMOVE left a marker");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_madvise_guard_install_remove);
+
+/// `can_madvise_modify`: MADV_GUARD_INSTALL is a discard (`is_discard`), so
+/// it is -EPERM on a sealed read-only anonymous mapping; MADV_GUARD_REMOVE is
+/// not a discard and stays allowed.
+fn smoke_abi_mem2_madvise_guard_install_sealed_eperm() -> TestResult {
+    const MADV_GUARD_INSTALL: u64 = 102;
+    const MADV_GUARD_REMOVE: u64 = 103;
+    with_setup(|| {
+        with_mseal_as(|base, len| {
+            if call(Syscall::MProtect.raw(), a2(base, len, 1)) != Some(0)
+                || call(Syscall::Mseal.raw(), a2(base, len, 0)) != Some(0)
+            {
+                return Err("setup: seal a read-only anonymous mapping");
+            }
+            if call(Syscall::Madvise.raw(), a2(base, len, MADV_GUARD_INSTALL)) != Some(EPERM) {
+                return Err("MADV_GUARD_INSTALL on a sealed read-only anon VMA must be -EPERM");
+            }
+            if call(Syscall::Madvise.raw(), a2(base, len, MADV_GUARD_REMOVE)) != Some(0) {
+                return Err("MADV_GUARD_REMOVE is not a discard and must pass the seal");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem2_madvise_guard_install_sealed_eperm
+);

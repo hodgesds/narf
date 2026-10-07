@@ -67,6 +67,7 @@ pub mod vmalloc;
 pub mod wx;
 pub mod zpool;
 
+mod guard_tests;
 mod tests;
 
 pub use address_space::{

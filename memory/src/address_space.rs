@@ -16,7 +16,7 @@
 //! compile and test against it.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::cell::Cell;
 
@@ -175,6 +175,26 @@ fn retain_shared_frames(region: &Region) {
             retain(phys.raw());
         }
     }
+}
+
+/// `slots` (backing for the pages from `base`) with every guard-marked page
+/// zeroed. Leaf installers treat a zero slot as lazy and leave it unmapped,
+/// so a guarded SHARED page — which keeps its borrowed frame until
+/// MADV_GUARD_REMOVE — is never mapped again by materialize or mprotect.
+fn guard_masked<'a>(
+    guards: &BTreeSet<u64>,
+    base: u64,
+    slots: &'a [PhysAddr],
+) -> alloc::borrow::Cow<'a, [PhysAddr]> {
+    let end = base.saturating_add((slots.len() as u64) << 12);
+    if guards.range(base..end).next().is_none() {
+        return alloc::borrow::Cow::Borrowed(slots);
+    }
+    let mut masked = slots.to_vec();
+    for &page in guards.range(base..end) {
+        masked[((page - base) >> 12) as usize] = PhysAddr::new(0);
+    }
+    alloc::borrow::Cow::Owned(masked)
 }
 
 fn release_shared_phys(phys: PhysAddr) {
@@ -880,6 +900,14 @@ struct RegionTable {
     /// Kept under the same lock as `Region::phys` so the two authorities can
     /// never disagree at a visible transaction boundary.
     swap_pages: BTreeMap<u64, SwapPageState>,
+    /// Page-aligned user VAs carrying an `MADV_GUARD_INSTALL` marker — the
+    /// analogue of Linux's guard PTE marker. A guarded page has no backing
+    /// (private) or no leaf (shared) and every fault on it is `GuardPage`.
+    /// Keyed by VA like `swap_pages`, but unlike swap it cannot make the
+    /// structural paths refuse: fork copies markers, mremap moves them and
+    /// munmap drops them, exactly as Linux treats the PTE markers. Splits,
+    /// merges, mprotect and MADV_DONTNEED keep VAs, so they leave it alone.
+    guard_pages: BTreeSet<u64>,
     /// Maintained Linux mm-counters (total_vm/locked_vm/data_vm/RSS). See
     /// [`RegionAcct`] for the maintenance contract. Replaces the former lazy
     /// `mapped_bytes_cache`: the cache was invalidated by every mutation, so
@@ -1038,6 +1066,7 @@ impl RegionTable {
             demand_pages: DemandClaims::try_new()?,
             cow_pages: BTreeMap::new(),
             swap_pages: BTreeMap::new(),
+            guard_pages: BTreeSet::new(),
             acct: RegionAcct::default(),
             stack_chain_cache: Cell::new(None),
             #[cfg(target_arch = "x86_64")]
@@ -1199,13 +1228,45 @@ impl RegionTable {
             // count; a page past the materialized prefix is unbacked (demand-zero)
             // exactly like an in-range `phys[i] == 0`. `phys.get(i)` treats both
             // uniformly (and can't panic on `first > phys.len()`).
-            if let Some(i) =
-                (first..first + count).find(|&i| region.phys.get(i).is_none_or(|p| p.raw() == 0))
-            {
+            // A guard page is never populated: Linux's populate walk faults it
+            // (VM_FAULT_SIGSEGV) and ignores the error, so mlock/MAP_POPULATE
+            // step over it.
+            if let Some(i) = (first..first + count).find(|&i| {
+                region.phys.get(i).is_none_or(|p| p.raw() == 0)
+                    && !self.guard_pages.contains(&(rb + (i as u64) * 4096))
+            }) {
                 return Some(page + ((i - first) as u64) * 4096);
             }
         }
         None
+    }
+
+    /// Remove and return the guard markers in `[lo, hi)`.
+    fn take_guards(&mut self, lo: u64, hi: u64) -> BTreeSet<u64> {
+        let mut from_lo = self.guard_pages.split_off(&lo);
+        let mut from_hi = from_lo.split_off(&hi);
+        self.guard_pages.append(&mut from_hi);
+        from_lo
+    }
+
+    /// Drop the guard markers in `[lo, hi)` — the range stopped being
+    /// mapped (munmap, MAP_FIXED replacement, an mremap source or a
+    /// truncated tail), which takes Linux's PTE markers with it.
+    fn drop_guards(&mut self, lo: u64, hi: u64) {
+        if lo < hi && !self.guard_pages.is_empty() {
+            drop(self.take_guards(lo, hi));
+        }
+    }
+
+    /// Move the guard markers of `[lo, hi)` by `new_lo - lo` (mremap moves
+    /// the PTE markers with the pages).
+    fn move_guards(&mut self, lo: u64, hi: u64, new_lo: u64) {
+        if lo >= hi || self.guard_pages.is_empty() {
+            return;
+        }
+        for page in self.take_guards(lo, hi) {
+            self.guard_pages.insert(page - lo + new_lo);
+        }
     }
 
     fn try_reserve_nodes(&mut self, additional: usize) -> Result<(), AddressSpaceError> {
@@ -1898,6 +1959,10 @@ pub enum AddressSpaceError {
     /// end-of-file, out of space, or an I/O error. Delivered as SIGBUS
     /// (`BUS_ADRERR`), not SIGSEGV — the address IS mapped.
     Bus,
+    /// The page carries an `MADV_GUARD_INSTALL` guard marker
+    /// (`VM_FAULT_SIGSEGV`): any access faults, and a kernel user copy over
+    /// it is EFAULT.
+    GuardPage,
     NotImplemented,
     Overlap,
     OutOfRange,
@@ -5149,6 +5214,11 @@ impl AddressSpace {
             assert!(regions.insert_reserved(tail).is_none());
         }
         assert!(regions.insert_reserved(moved).is_none());
+        // `move_ptes` carries guard markers with the pages: what is kept
+        // moves to the destination, a truncated tail's markers go with it.
+        let kept = (old_hi - old_lo).min(new_hi - new_lo);
+        regions.drop_guards(old_lo + kept, old_hi);
+        regions.move_guards(old_lo, old_lo + kept, new_lo);
         drop(regions);
         drop(huge);
 
@@ -5489,6 +5559,11 @@ impl AddressSpace {
                 .saturating_add(acct_new_resident);
             regions.invalidate_mapping(source_region_base);
         }
+        // As for a private relocation: the kept span's guard markers move
+        // to the destination, a truncated tail's are dropped.
+        let kept = (old_hi - old_lo).min(new_hi - new_lo);
+        regions.drop_guards(old_lo + kept, old_hi);
+        regions.move_guards(old_lo, old_lo + kept, new_lo);
         drop(regions);
         drop(huge);
 
@@ -5841,6 +5916,9 @@ impl AddressSpace {
         );
         regions.invalidate_mapping(old_lo);
         assert!(regions.insert_reserved(moved).is_none());
+        // MREMAP_DONTUNMAP moves the page tables, guard markers included; the
+        // source stays mapped but empty.
+        regions.move_guards(old_lo, old_hi, new_lo);
         drop(regions);
         drop(huge);
         self.flush_region_broadcast(old_base, len >> 12);
@@ -6228,6 +6306,10 @@ impl AddressSpace {
                 .expect("shared mremap source disappeared under region lock");
             source_region.perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
             regions.invalidate_mapping(source_region_base);
+            // The page tables (guard markers included) moved to the alias;
+            // the source stays mapped but empty. A Duplicate alias copies no
+            // page tables, so it starts without markers.
+            regions.move_guards(source_lo, source_hi, destination_lo);
         }
         drop(regions);
         drop(huge);
@@ -6543,6 +6625,11 @@ impl AddressSpace {
             let region = regions
                 .remove(base.as_u64())
                 .ok_or(AddressSpaceError::Unmapped)?;
+            // munmap takes the guard markers with the mapping.
+            regions.drop_guards(
+                region.base.as_u64(),
+                region.base.as_u64().saturating_add(region.len),
+            );
             // Tear down the leaf PTEs BEFORE dropping the lock (local
             // invalidation only; the batched cross-CPU flush + the frame
             // frees run below, outside the lock). Deferring the whole walk
@@ -6723,6 +6810,8 @@ impl AddressSpace {
             let region = regions
                 .remove(lo)
                 .expect("exact VMA disappeared under region lock");
+            // The punched range stops being mapped: its guard markers go too.
+            regions.drop_guards(lo, hi);
             if self.root.as_u64() != 0 {
                 // SAFETY: the removed node's authoritative backing remains
                 // owned by `region`, and both structural locks still exclude
@@ -7013,6 +7102,10 @@ impl AddressSpace {
         // (an infinite-#PF trap for the old spurious-fault heuristic).
         // stress-ng --vma's concurrent mmap/munmap threads (CLONE_VM AS on
         // SMP) hit this window continuously.
+        // Committed from here on (every fallible reservation is behind us):
+        // the punched range stops being mapped, guard markers included.
+        // Preserved head/tail fragments keep theirs — they lie outside it.
+        regions.drop_guards(lo, hi);
         {
             for key in overlap_keys {
                 let old = regions
@@ -8012,6 +8105,11 @@ impl AddressSpace {
             let address = vaddr.as_u64().saturating_add(copied as u64);
             let base_regions = self.regions.lock();
             if let Some(region) = base_regions.containing(address) {
+                // A guard page reads as a fault (a guarded SHARED page still
+                // owns its frame, so the backing alone cannot say).
+                if base_regions.guard_pages.contains(&(address & !0xFFF)) {
+                    break;
+                }
                 let offset = address - region.base.as_u64();
                 let page = (offset / 4096) as usize;
                 let in_page = (offset % 4096) as usize;
@@ -8184,6 +8282,13 @@ impl AddressSpace {
             let rb = region.base.as_u64();
             if region.perms.prot_only().0 == 0 {
                 return Err(AddressSpaceError::Unmapped);
+            }
+            // `handle_pte_marker` -> VM_FAULT_SIGSEGV. Checked before the
+            // backed-page repair: a guarded SHARED page keeps its frame (the
+            // data outlives the guard, as page-cache data does on Linux) but
+            // must not be mapped again until MADV_GUARD_REMOVE.
+            if regions.guard_pages.contains(&(v & !0xFFF)) {
+                return Err(AddressSpaceError::GuardPage);
             }
             let index = ((v - rb) >> 12) as usize;
             // `containing(v)` proved the page lies in this region, so `index`
@@ -8651,6 +8756,10 @@ impl AddressSpace {
         // retries the instruction until that bounded batch publishes a leaf.
         let swap_requests = {
             let mut table = self.regions.lock();
+            // A guard marker wins over any swap state (see claim_demand_page).
+            if table.guard_pages.contains(&v) {
+                return Err(AddressSpaceError::GuardPage);
+            }
             match table.swap_pages.get(&v).copied() {
                 Some(SwapPageState::Evicting(_)) | Some(SwapPageState::Loading) => return Ok(()),
                 Some(SwapPageState::Swapped) => {
@@ -9786,7 +9895,7 @@ impl AddressSpace {
         // page (cheaper than adding a per-arch in-place mutate
         // helper, since map_4kb already handles the leaf rewrite).
         // SAFETY: Valid memory or trusted environment
-        unsafe { self.rewrite_perms_pages(&hits, false) };
+        unsafe { self.rewrite_perms_pages(&hits, &g.guard_pages, false) };
         drop(g);
         Ok(())
     }
@@ -10122,7 +10231,7 @@ impl AddressSpace {
             // post-split phys slot (the Drop path consults the new
             // region table, not the old one) — and the regions lock is
             // still held, so no racing unmap can free them mid-rewrite.
-            unsafe { self.rewrite_perms_pages(&touched, false) };
+            unsafe { self.rewrite_perms_pages(&touched, &g.guard_pages, false) };
         }
         drop(g);
         drop(huge);
@@ -10322,6 +10431,185 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Page-align `[base, base + len)` for the guard calls, as
+    /// `madvise_dontneed` does. `AlignmentMismatch` / `OutOfRange` are EINVAL.
+    fn guard_range(base: VirtAddr, len: u64) -> Result<(u64, u64), AddressSpaceError> {
+        if base.as_u64() & 0xFFF != 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let lo = base.as_u64();
+        let rounded = len
+            .checked_add(0xFFF)
+            .map(|value| value & !0xFFF)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        let hi = lo
+            .checked_add(rounded)
+            .filter(|end| *end <= Self::USER_HALF_END)
+            .ok_or(AddressSpaceError::OutOfRange)?;
+        Ok((lo, hi))
+    }
+
+    /// `mm/madvise.c::madvise_walk_vmas` for the guard advice: the mapped
+    /// spans of `[lo, hi)` the walk reaches, and its result. VMAs are visited
+    /// in address order; one failing `is_valid_guard_vma` (`VM_SPECIAL` —
+    /// here LOCK_EXEMPT — hugetlb, or `VM_LOCKED` unless `allow_locked`)
+    /// stops the walk with EINVAL (`OutOfRange`) AFTER the earlier VMAs were
+    /// processed; a hole only records ENOMEM (`Unmapped`) and the walk
+    /// carries on, so the mapped parts are still processed.
+    ///
+    /// `huge_stop` is [`Self::guard_huge_stop`], taken before the region lock
+    /// (huge -> regular is the lock order).
+    fn guard_walk(
+        g: &RegionTable,
+        lo: u64,
+        hi: u64,
+        huge_stop: u64,
+        allow_locked: bool,
+    ) -> (Vec<(u64, u64)>, Result<(), AddressSpaceError>) {
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        let mut cursor = lo;
+        let mut hole = false;
+        let mut invalid = huge_stop < hi;
+        for r in g.overlapping(lo, hi) {
+            let rb = r.base.as_u64().max(lo);
+            let re = r.base.as_u64().saturating_add(r.len).min(hi);
+            if rb >= huge_stop {
+                break;
+            }
+            if r.perms.contains(RegionPerms::LOCK_EXEMPT)
+                || (!allow_locked && r.perms.contains(RegionPerms::LOCKED))
+            {
+                invalid = true;
+                break;
+            }
+            if rb > cursor {
+                hole = true;
+            }
+            match spans.last_mut() {
+                Some(last) if last.1 == rb => last.1 = re,
+                _ => spans.push((rb, re)),
+            }
+            cursor = re;
+        }
+        let result = if invalid {
+            Err(AddressSpaceError::OutOfRange)
+        } else if hole || cursor < hi {
+            Err(AddressSpaceError::Unmapped)
+        } else {
+            Ok(())
+        };
+        (spans, result)
+    }
+
+    /// Start of the first hugetlb VMA in `[lo, hi)` (clamped to `lo`), or
+    /// `hi`: hugetlb VMAs live in their own table, and the first one is where
+    /// an otherwise valid guard walk stops with EINVAL.
+    fn guard_huge_stop(&self, lo: u64, hi: u64) -> u64 {
+        self.huge_regions
+            .lock()
+            .iter()
+            .filter(|r| r.base.as_u64() < hi && lo < r.base.as_u64() + r.len)
+            .map(|r| r.base.as_u64().max(lo))
+            .min()
+            .unwrap_or(hi)
+    }
+
+    /// `madvise(MADV_GUARD_INSTALL)` (`mm/madvise.c::madvise_guard_install`):
+    /// every page of the range faults with SIGSEGV until
+    /// `MADV_GUARD_REMOVE`, and its current contents are gone — private
+    /// pages are released exactly as `MADV_DONTNEED` releases them; shared
+    /// pages only lose their leaves (the frames belong to the page cache or a
+    /// shared object, whose data comes back once the guard is removed).
+    ///
+    /// Errors and partial progress follow [`Self::guard_walk`]. The markers
+    /// are installed BEFORE the pages are released, so a racing fault
+    /// already sees the guard and cannot repopulate a page in between.
+    pub fn madvise_guard_install(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
+        let (lo, hi) = Self::guard_range(base, len)?;
+        if lo == hi {
+            return Ok(());
+        }
+        let huge_stop = self.guard_huge_stop(lo, hi);
+        let (spans, walk) = {
+            let mut g = self.regions.lock();
+            let (spans, walk) = Self::guard_walk(&g, lo, hi, huge_stop, false);
+            for &(start, end) in &spans {
+                for page in (start..end).step_by(4096) {
+                    g.guard_pages.insert(page);
+                }
+            }
+            (spans, walk)
+        };
+        for &(start, end) in &spans {
+            // Private pages (swapped ones included): MADV_DONTNEED's release.
+            match self.madvise_dontneed(VirtAddr::new(start), end - start) {
+                // A concurrent munmap took the span (and its markers) with it.
+                Ok(()) | Err(AddressSpaceError::Unmapped) => {}
+                Err(error) => {
+                    // Never leave a marker over a page that is still mapped.
+                    let mut g = self.regions.lock();
+                    for &(start, end) in &spans {
+                        g.drop_guards(start, end);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        // Shared pages: drop the leaves, keep the borrowed frames.
+        if self.root.as_u64() != 0 {
+            for &(start, end) in &spans {
+                let mut unmapped_shared = false;
+                let mut g = self.regions.lock();
+                g.for_each_overlapping_mut(start, end, |r| {
+                    if !r.perms.contains(RegionPerms::SHARED) {
+                        return;
+                    }
+                    let rb = r.base.as_u64();
+                    let first = ((start.max(rb) - rb) >> 12) as usize;
+                    let last = ((end.min(rb.saturating_add(r.len)) - rb) >> 12) as usize;
+                    let backed_end = last.min(r.phys.len());
+                    if first < backed_end {
+                        // SAFETY: the region lock pins the shared region's
+                        // backing; the broadcast below runs before return.
+                        unsafe { self.unmap_region_window_local(r, first, backed_end) };
+                        unmapped_shared = true;
+                    }
+                });
+                drop(g);
+                if unmapped_shared {
+                    self.flush_region_broadcast(VirtAddr::new(start), (end - start) >> 12);
+                }
+            }
+        }
+        walk
+    }
+
+    /// `madvise(MADV_GUARD_REMOVE)` (`madvise_guard_remove`): drop the guard
+    /// markers in the range and nothing else — an unguarded page faults in
+    /// as it would have (zero-fill, or the file/shared data). Locked VMAs are
+    /// allowed here, unlike install. Errors as for install.
+    pub fn madvise_guard_remove(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
+        let (lo, hi) = Self::guard_range(base, len)?;
+        if lo == hi {
+            return Ok(());
+        }
+        let huge_stop = self.guard_huge_stop(lo, hi);
+        let mut g = self.regions.lock();
+        let (spans, walk) = Self::guard_walk(&g, lo, hi, huge_stop, true);
+        for (start, end) in spans {
+            g.drop_guards(start, end);
+        }
+        walk
+    }
+
+    /// Whether the page at `va` carries a guard marker.
+    pub fn is_guard_page(&self, va: VirtAddr) -> bool {
+        self.regions
+            .lock()
+            .guard_pages
+            .contains(&(va.as_u64() & !0xFFF))
+    }
+
     /// Linux-shaped lazy `madvise(MADV_FREE)`: mark the range's resident
     /// pages discardable WITHOUT unmapping them. Each present leaf gets the
     /// software `LAZYFREE` bit with DIRTY + ACCESSED cleared and stays
@@ -10512,7 +10800,12 @@ impl AddressSpace {
     /// Region.phys must remain valid for the duration of the
     /// call; we only re-target the same phys.
     #[cfg(target_arch = "x86_64")]
-    unsafe fn rewrite_perms_pages(&self, regions: &[Region], cow_readonly: bool) {
+    unsafe fn rewrite_perms_pages(
+        &self,
+        regions: &[Region],
+        guards: &BTreeSet<u64>,
+        cow_readonly: bool,
+    ) {
         use crate::x86_64::paging::rewrite_4kb_scatter_range;
         if self.root.as_u64() == 0 {
             return;
@@ -10554,6 +10847,8 @@ impl AddressSpace {
                 // other callers keep the exact per-page writability decision.
                 for (first, slots) in r.phys.chunks(0, r.phys.len()) {
                     let base = VirtAddr::new(r.base.as_u64() + first as u64 * 4096);
+                    let slots = guard_masked(guards, base.as_u64(), slots);
+                    let slots: &[PhysAddr] = &slots;
                     let cow_counts = if cow_readonly {
                         None
                     } else {
@@ -10594,7 +10889,12 @@ impl AddressSpace {
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe fn rewrite_perms_pages(&self, regions: &[Region], cow_readonly: bool) {
+    unsafe fn rewrite_perms_pages(
+        &self,
+        regions: &[Region],
+        guards: &BTreeSet<u64>,
+        cow_readonly: bool,
+    ) {
         use crate::aarch64::paging::rewrite_4kb_scatter_range;
         if self.root.as_u64() == 0 {
             return;
@@ -10615,6 +10915,8 @@ impl AddressSpace {
             // read-only — skip the per-page COW refcount lookup and force RO.
             for (first, slots) in r.phys.chunks(0, r.phys.len()) {
                 let base = VirtAddr::new(r.base.as_u64() + first as u64 * 4096);
+                let slots = guard_masked(guards, base.as_u64(), slots);
+                let slots: &[PhysAddr] = &slots;
                 let cow_counts = if cow_readonly {
                     None
                 } else {
@@ -10641,7 +10943,13 @@ impl AddressSpace {
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    unsafe fn rewrite_perms_pages(&self, _regions: &[Region], _cow_readonly: bool) {}
+    unsafe fn rewrite_perms_pages(
+        &self,
+        _regions: &[Region],
+        _guards: &BTreeSet<u64>,
+        _cow_readonly: bool,
+    ) {
+    }
 
     /// One fused fork pass building the child address space region by
     /// region: each parent region's metadata and backing list are cloned
@@ -11054,6 +11362,12 @@ impl AddressSpace {
             let first = first.min(last);
 
             for (first, slice) in r.phys.chunks(first, last) {
+                let slice = guard_masked(
+                    &regions.guard_pages,
+                    r.base.as_u64() + ((first as u64) << 12),
+                    slice,
+                );
+                let slice: &[PhysAddr] = &slice;
                 let cow_counts = r
                     .perms
                     .contains(RegionPerms::COW)
@@ -11166,6 +11480,12 @@ impl AddressSpace {
             let last = last.min(r.phys.len());
             let first = first.min(last);
             for (first, slice) in r.phys.chunks(first, last) {
+                let slice = guard_masked(
+                    &regions.guard_pages,
+                    r.base.as_u64() + ((first as u64) << 12),
+                    slice,
+                );
+                let slice: &[PhysAddr] = &slice;
                 let cow_counts = r
                     .perms
                     .contains(RegionPerms::COW)
@@ -11267,7 +11587,7 @@ impl AddressSpace {
         // `cow_readonly = true`: fork-COW WRITE-strip. Every private page was
         // inc_ref'd by clone_for_fork so all become read-only; skip the per-page
         // refcount lookup and leave non-COW (e.g. MAP_SHARED) regions untouched.
-        unsafe { self.rewrite_perms_pages(&snapshot, true) };
+        unsafe { self.rewrite_perms_pages(&snapshot, &g.guard_pages, true) };
         drop(g);
         Ok(())
     }
@@ -11426,6 +11746,13 @@ impl AddressSpace {
                     fork_child_reserve_failure_injected,
                 )
             }?;
+            // `copy_page_range` copies guard PTE markers into the child. Only
+            // markers inside a region the child actually received carry over.
+            for &page in &g.guard_pages {
+                if child_regions.containing(page).is_some() {
+                    child_regions.guard_pages.insert(page);
+                }
+            }
         }
         drop(vma_guard);
 
@@ -12484,6 +12811,10 @@ impl AddressSpace {
         let page_va = VirtAddr::new(vaddr.as_u64() & !0xFFF);
         let g = self.regions.lock();
         let v = page_va.as_u64();
+        // Never reinstall a leaf over a guard marker.
+        if g.guard_pages.contains(&v) {
+            return Err(AddressSpaceError::GuardPage);
+        }
         let region = g
             .iter()
             .find(|r| {
@@ -12540,6 +12871,10 @@ impl AddressSpace {
         let page_va = VirtAddr::new(vaddr.as_u64() & !0xFFF);
         let g = self.regions.lock();
         let v = page_va.as_u64();
+        // Never reinstall a leaf over a guard marker.
+        if g.guard_pages.contains(&v) {
+            return Err(AddressSpaceError::GuardPage);
+        }
         let region = g
             .iter()
             .find(|r| {
@@ -12675,6 +13010,11 @@ impl AddressSpace {
                 || (region.perms.contains(RegionPerms::LOCK_EXEMPT)
                     && !region.perms.contains(RegionPerms::PINNABLE_RAM))
             {
+                return None;
+            }
+            // GUP fails on a guard marker (no present PTE, and the fault it
+            // would take is VM_FAULT_SIGSEGV).
+            if regions.guard_pages.contains(&(address & !0xFFF)) {
                 return None;
             }
             let index = ((address - region.base.raw()) / 4096) as usize;

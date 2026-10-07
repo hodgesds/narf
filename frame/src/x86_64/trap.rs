@@ -1539,6 +1539,8 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                     return;
                 }
                 file_fault_bus = r == Err(narf_memory::AddressSpaceError::Bus);
+                // A guard marker is a final SIGSEGV, never a stack grow.
+                let guard_fault = r == Err(narf_memory::AddressSpaceError::GuardPage);
                 // Demand-alloc surfaced Unmapped: vaddr might land in or just
                 // below a STACK_GUARD region. try_grow_stack expands lazy stack
                 // metadata through the fault, moves the guard below it, and
@@ -1557,7 +1559,7 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // are delivered far more often near a stack boundary).
                 // try_grow_stack requires a nearby real STACK_GUARD region, so
                 // a non-stack user vaddr still reaches the SEGV/panic surface.
-                if !file_fault_bus && (from_user || cr2_in_user_half) {
+                if !file_fault_bus && !guard_fault && (from_user || cr2_in_user_half) {
                     let limits = narf_userspace::handlers::current_stack_growth_limits();
                     // SAFETY: same identity-map argument.
                     if unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {

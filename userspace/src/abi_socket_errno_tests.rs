@@ -852,6 +852,103 @@ kernel_test_in!(
     smoke_abi_socket_errno_unix_listener_is_recognisable_after_activation
 );
 
+/// SCO sockets as `net/bluetooth/sco.c` defines them, in the sequence
+/// PipeWire's HFP/HSP backend uses to listen for headset audio
+/// (`sco_listen` in spa/plugins/bluez5/backend-native.c): socket, bind to
+/// BDADDR_ANY, `setsockopt(SOL_BLUETOOTH, BT_DEFER_SETUP, 1)`, listen. NARF
+/// had no SCO socket options at all — every one was ENOPROTOOPT — and
+/// refused `listen` with EOPNOTSUPP. Linux needs no controller for any of
+/// that; only the options that route to one (BT_VOICE, BT_CODEC) answer
+/// EBADFD without a controller that is up, and the kernel-test image has
+/// none.
+fn smoke_abi_socket_errno_bluetooth_sco_listen_and_options() -> TestResult {
+    const BTPROTO_SCO: u64 = 2;
+    const SOL_BLUETOOTH: u64 = 274;
+    const SOL_SCO: u64 = 17;
+    const SCO_OPTIONS: u64 = 1;
+    const BT_DEFER_SETUP: u64 = 7;
+    const BT_VOICE: u64 = 11;
+    const BT_PKT_STATUS: u64 = 16;
+    const SOCK_NONBLOCK: u64 = 0o4000;
+    with_setup(|| {
+        let fd = open(AF_BLUETOOTH, SOCK_SEQPACKET | SOCK_NONBLOCK, BTPROTO_SCO)?;
+        let one = 1u32.to_ne_bytes();
+        // BT_DEFER_SETUP needs BT_BOUND or BT_LISTEN.
+        if setsockopt(fd, SOL_BLUETOOTH, BT_DEFER_SETUP, &one) != Some(EINVAL) {
+            return Err("BT_DEFER_SETUP on an unbound SCO socket must be EINVAL");
+        }
+        // struct sockaddr_sco { sa_family_t; bdaddr_t } bound to BDADDR_ANY.
+        let mut sco = [0u8; 8];
+        sco[0..2].copy_from_slice(&(AF_BLUETOOTH as u16).to_ne_bytes());
+        if bind(fd, &sco) != Some(0) {
+            return Err("binding an SCO socket to BDADDR_ANY must succeed");
+        }
+        if bind(fd, &sco) != Some(EBADFD) {
+            return Err("binding an already-bound SCO socket must be EBADFD");
+        }
+        if setsockopt(fd, SOL_BLUETOOTH, BT_DEFER_SETUP, &one[..2]) != Some(EINVAL) {
+            return Err("a value shorter than the option must be EINVAL");
+        }
+        if setsockopt(fd, SOL_BLUETOOTH, BT_DEFER_SETUP, &one) != Some(0) {
+            return Err("BT_DEFER_SETUP on a bound SCO socket must succeed");
+        }
+        let mut val = [0u8; 4];
+        if getsockopt(fd, SOL_BLUETOOTH, BT_DEFER_SETUP, &mut val).0 != Some(0)
+            || u32::from_ne_bytes(val) != 1
+        {
+            return Err("BT_DEFER_SETUP must read back as set");
+        }
+        if setsockopt(fd, SOL_BLUETOOTH, BT_PKT_STATUS, &one) != Some(0) {
+            return Err("BT_PKT_STATUS must be settable in any state");
+        }
+        let mut voice = [0u8; 2];
+        if getsockopt(fd, SOL_BLUETOOTH, BT_VOICE, &mut voice).0 != Some(0)
+            || u16::from_ne_bytes(voice) != 0x0060
+        {
+            return Err("BT_VOICE must start as BT_VOICE_CVSD_16BIT");
+        }
+        if setsockopt(fd, SOL_BLUETOOTH, BT_VOICE, &0x0003u16.to_ne_bytes()) != Some(EBADFD) {
+            return Err("BT_VOICE with no controller up must be EBADFD (hci_get_route)");
+        }
+        if setsockopt(fd, SOL_BLUETOOTH, 0x7f, &one) != Some(ENOPROTOOPT) {
+            return Err("an unknown SCO option must be ENOPROTOOPT");
+        }
+        if getsockopt(fd, SOL_SCO, SCO_OPTIONS, &mut val).0 != Some(ENOTCONN) {
+            return Err("SCO_OPTIONS on an unconnected socket must be ENOTCONN");
+        }
+        // Accept needs a listener; listen needs no controller.
+        if sys(Syscall::SocketAccept, a2(fd, 0, 0)) != Some(EBADFD) {
+            return Err("accept on a non-listening SCO socket must be EBADFD");
+        }
+        if listen(fd) != Some(0) {
+            return Err("listen on a bound SCO socket must succeed");
+        }
+        if sys(Syscall::SocketAccept, a2(fd, 0, 0)) != Some(EAGAIN) {
+            return Err(
+                "accept on a non-blocking SCO listener with nothing pending must be EAGAIN",
+            );
+        }
+        // A second listener on the same local address.
+        let other = open(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_SCO)?;
+        let r = (|| {
+            if bind(other, &sco) != Some(0) {
+                return Err("binding a second SCO socket failed");
+            }
+            if listen(other) != Some(EADDRINUSE_ERR) {
+                return Err("a second SCO listener on the same address must be EADDRINUSE");
+            }
+            Ok(())
+        })();
+        close(other);
+        close(fd);
+        r
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket_errno",
+    smoke_abi_socket_errno_bluetooth_sco_listen_and_options
+);
+
 /// `net/ipv6/af_inet6.c::inet6_bind_sk` / `__inet6_bind`: addrlen <
 /// SIN6_LEN_RFC2133 → EINVAL, then a foreign family → EAFNOSUPPORT.
 fn smoke_abi_socket_errno_bind_inet6_validation() -> TestResult {

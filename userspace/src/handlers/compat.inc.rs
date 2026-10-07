@@ -9546,6 +9546,10 @@ pub(crate) fn futex_shared_key_in(
         if !perms.contains(narf_memory::RegionPerms::SHARED) {
             return Ok(mm_key());
         }
+        // `get_user_pages_fast` fails on an MADV_GUARD_INSTALL marker.
+        if space.is_guard_page(VirtAddr::new(uaddr)) {
+            return Err(EFAULT);
+        }
         if let Some((ops, offset)) = crate::mapped_file::shared_file_at(space.identity(), uaddr) {
             let ino = ops.ino();
             return Ok(if ino != 0 {
@@ -11169,11 +11173,16 @@ fn dump_fatal_x86_address_space(fault_va: u64) {
 /// reporters treat a MAPERR as a wild pointer and an ACCERR as a guard or
 /// protection hit.
 ///
+/// An `MADV_GUARD_INSTALL` page is `SEGV_MAPERR` although a VMA covers it:
+/// its marker faults `VM_FAULT_SIGSEGV`, which x86 `mm_fault_error` sends to
+/// `bad_area_nosemaphore` and arm64 `do_page_fault` reports as MAPERR.
+///
 /// LINUX-GAP: a protection-key violation is `SEGV_PKUERR` (4) on Linux;
 /// NARF reports it as `SEGV_ACCERR`.
 pub(crate) fn page_fault_si_code(addr: u64) -> i32 {
+    let va = narf_memory::VirtAddr::new(addr);
     let mapped = current_address_space()
-        .is_some_and(|space| space.contains_address(narf_memory::VirtAddr::new(addr)));
+        .is_some_and(|space| space.contains_address(va) && !space.is_guard_page(va));
     if mapped { 2 /* SEGV_ACCERR */ } else { 1 /* SEGV_MAPERR */ }
 }
 

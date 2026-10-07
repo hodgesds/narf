@@ -9,8 +9,10 @@ pub(super) fn mlock_errno(error: narf_memory::AddressSpaceError) -> i64 {
         | narf_memory::AddressSpaceError::AlignmentMismatch => EINVAL,
         // A refused file fault (VM_FAULT_SIGBUS) is -EFAULT from GUP
         // (`vm_fault_to_errno`), which `__mlock_posix_error_return` reports
-        // as -ENOMEM — the same bucket as an unmapped page.
+        // as -ENOMEM — the same bucket as an unmapped page. So is a guard
+        // page's VM_FAULT_SIGSEGV (populate skips guards; this is the floor).
         narf_memory::AddressSpaceError::Bus
+        | narf_memory::AddressSpaceError::GuardPage
         | narf_memory::AddressSpaceError::Unmapped
         | narf_memory::AddressSpaceError::LockLimit
         | narf_memory::AddressSpaceError::MappingLimit
