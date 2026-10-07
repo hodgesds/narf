@@ -365,6 +365,11 @@ pub struct Mapping {
 pub struct VmState {
     geometry: Geometry,
     mappings: IrqSafeSpinLock<Option<BTreeMap<u64, Mapping>>>,
+    /// The root page directory and the hierarchy beneath it. `None` until the
+    /// first mapping, so an open that never submits allocates nothing.
+    root: IrqSafeSpinLock<Option<Node>>,
+    /// Tables allocated, bounded by [`MAX_TABLES`].
+    tables: IrqSafeSpinLock<u64>,
 }
 
 impl Default for VmState {
@@ -378,6 +383,8 @@ impl VmState {
         VmState {
             geometry: Geometry::GMC11,
             mappings: IrqSafeSpinLock::new(None),
+            root: IrqSafeSpinLock::new(None),
+            tables: IrqSafeSpinLock::new(0),
         }
     }
 
@@ -568,20 +575,341 @@ pub fn dispatch(
             {
                 return Err(FsError::InvalidData);
             }
-            vm.insert(
-                Mapping {
-                    va,
-                    size,
-                    gem_handle: handle,
-                    offset,
-                    vm_flags: flags,
-                },
-                operation == uapi::AMDGPU_VA_OP_REPLACE,
-            )?;
+            let replace = operation == uapi::AMDGPU_VA_OP_REPLACE;
+            if replace {
+                // REPLACE drops whatever it covers, so the old translations
+                // must go before the new ones are written — otherwise a page
+                // the old mapping owned stays reachable under the new one.
+                vm.dematerialise(va, size);
+            }
+            let mapping = Mapping {
+                va,
+                size,
+                gem_handle: handle,
+                offset,
+                vm_flags: flags,
+            };
+            vm.insert(mapping, replace)?;
+            // A buffer created COHERENT / EXT_COHERENT / UNCACHED forces the
+            // memory type, whatever the mapping asked for.
+            let uncached = object.flags
+                & (uapi::AMDGPU_GEM_CREATE_COHERENT
+                    | uapi::AMDGPU_GEM_CREATE_EXT_COHERENT
+                    | uapi::AMDGPU_GEM_CREATE_UNCACHED) as u64
+                != 0;
+            if let Err(error) = vm.materialise(&mapping, object.phys, uncached) {
+                // Leave neither half-written tables nor a mapping record
+                // claiming translations that do not exist.
+                vm.dematerialise(va, size);
+                let _ = vm.unmap(va, size);
+                return Err(error);
+            }
         }
-        uapi::AMDGPU_VA_OP_UNMAP => vm.unmap(va, size)?,
-        uapi::AMDGPU_VA_OP_CLEAR => vm.clear(va, size)?,
+        uapi::AMDGPU_VA_OP_UNMAP => {
+            vm.unmap(va, size)?;
+            vm.dematerialise(va, size);
+        }
+        uapi::AMDGPU_VA_OP_CLEAR => {
+            vm.clear(va, size)?;
+            vm.dematerialise(va, size);
+        }
         _ => unreachable!("operation validated above"),
     }
     Ok(0)
+}
+
+// ── Page-table materialisation ──────────────────────────────────────────
+
+/// One allocated page table: `entries_at(level)` 64-bit entries.
+///
+/// Every level's table is one GPU page here. That is exact for GMC 11, where
+/// each level holds 512 entries of 8 bytes; a part whose `block_size` made a
+/// level larger would need a higher-order allocation, which [`PageTable::new`]
+/// computes rather than assumes.
+#[derive(Debug)]
+struct PageTable {
+    phys: u64,
+    order: u8,
+}
+
+impl PageTable {
+    /// Allocate and clear a table for `level`.
+    ///
+    /// A fresh table is filled with the INVALID pattern, not with zeros.
+    /// `amdgpu_vm_pt_clear` writes `AMDGPU_PTE_EXECUTABLE` into a leaf's
+    /// entries on everything from Vega 10 on — a fault-priority workaround —
+    /// and `AMDGPU_PDE_PTE` into a directory's. Neither carries `PTE_VALID`,
+    /// so neither translates; the difference is which fault the hardware
+    /// reports, and reporting the wrong one sends a future debugging session
+    /// in the wrong direction.
+    fn new(geometry: &Geometry, level: Level) -> Result<Self, FsError> {
+        let bytes = geometry.entries_at(level) * 8;
+        let pages = bytes.div_ceil(GPU_PAGE_SIZE);
+        let mut order = 0u8;
+        while (1u64 << order) < pages {
+            order += 1;
+        }
+        let frame = narf_memory::frame::alloc_pages_on(0, order).map_err(|_| FsError::NoSpace)?;
+        let table = PageTable {
+            phys: frame.start_address().raw(),
+            order,
+        };
+        let invalid: u64 = if level == Level::Ptb {
+            PTE_EXECUTABLE
+        } else {
+            PDE_PTE
+        };
+        for i in 0..geometry.entries_at(level) {
+            // SAFETY: `i` is bounded by the table's entry count and the
+            // allocation covers that many 8-byte entries.
+            unsafe { table.write(i, invalid) };
+        }
+        Ok(table)
+    }
+
+    /// Write entry `index`.
+    ///
+    /// # Safety
+    /// `index` must be within the table's entry count.
+    unsafe fn write(&self, index: u64, value: u64) {
+        // SAFETY: physical memory is kernel-mapped at a fixed offset, and the
+        // caller bounds `index` against the allocation.
+        unsafe {
+            let base = narf_memory::PhysAddr::new(self.phys).kernel_mut_ptr::<u64>();
+            base.add(index as usize).write_volatile(value);
+        }
+    }
+
+    /// Read entry `index`.
+    ///
+    /// # Safety
+    /// As [`PageTable::write`].
+    unsafe fn read(&self, index: u64) -> u64 {
+        // SAFETY: as above.
+        unsafe {
+            let base = narf_memory::PhysAddr::new(self.phys).kernel_ptr::<u64>();
+            base.add(index as usize).read_volatile()
+        }
+    }
+}
+
+impl Drop for PageTable {
+    fn drop(&mut self) {
+        let frame = narf_memory::PhysFrame::containing(narf_memory::PhysAddr::new(self.phys));
+        narf_memory::frame::free_pages(frame, self.order);
+    }
+}
+
+/// A directory and the children it points at, keyed by entry index.
+#[derive(Debug)]
+struct Node {
+    table: PageTable,
+    children: BTreeMap<u64, Node>,
+    /// Live leaf entries beneath this node, so an emptied subtree can be freed
+    /// without walking it.
+    live: u64,
+}
+
+/// `amdgpu_gmc_get_pde_for_bo` + `gmc_v11_0_get_vm_pde`, for a table in system
+/// memory — which every table here is.
+///
+/// `amdgpu_ttm_tt_pde_flags` gives `VALID | SYSTEM | SNOOPED` for a cached
+/// TT placement, and `gmc_v11_0_get_vm_pde` then skips the VRAM MC→PA
+/// conversion precisely because `SYSTEM` is set. `AMDGPU_PDE_PTE` is NOT set:
+/// that marks a directory entry as a leaf mapping a huge page, and this one
+/// points at a child table.
+fn make_pde(table_phys: u64) -> Result<u64, FsError> {
+    // `BUG_ON(*addr & 0xFFFF00000000003FULL)` — the address field is bits
+    // 47:6, so a PDE address must be 64-byte aligned and inside 48 bits.
+    if table_phys & 0xFFFF_0000_0000_003F != 0 {
+        return Err(FsError::InvalidData);
+    }
+    Ok(table_phys | PTE_VALID | PTE_SYSTEM | PTE_SNOOPED)
+}
+
+/// A bound on the tables one address space may hold.
+///
+/// GMC 11 can address 256 TiB, and a client that mapped all of it would ask
+/// for 2^27 leaf tables — half a terabyte of page tables. Linux survives that
+/// because TTM evicts page tables under pressure; nothing here does, so the
+/// allocation is capped and a map beyond it is ENOMEM. 4096 tables is 16 MiB
+/// of tables, enough for 8 GiB of mappings at 4 KiB granularity.
+const MAX_TABLES: u64 = 4096;
+
+impl VmState {
+    /// Physical address of the root page directory, for
+    /// `VM_CONTEXTn_PAGE_TABLE_BASE_ADDR`. `None` until something is mapped.
+    pub fn root_phys(&self) -> Option<u64> {
+        self.root.lock().as_ref().map(|n| n.table.phys)
+    }
+
+    /// Tables currently allocated, root included.
+    pub fn table_count(&self) -> u64 {
+        *self.tables.lock()
+    }
+
+    /// Write the leaf entries for `mapping`, creating directories as needed.
+    ///
+    /// LINUX-GAP: one PTE per 4 KiB page, always. Linux coalesces a run into a
+    /// huge leaf PDE when the alignment allows (`AMDGPU_PTE_FRAG` and
+    /// `AMDGPU_PDE_PTE`), which is both faster to write and cheaper for the
+    /// hardware to walk. Doing that needs the fragment logic in
+    /// `amdgpu_vm_pt_update_range`, and getting it wrong maps more than was
+    /// asked for — so the slow, exact form comes first.
+    fn materialise(
+        &self,
+        mapping: &Mapping,
+        phys_base: u64,
+        uncached: bool,
+    ) -> Result<(), FsError> {
+        let geometry = self.geometry;
+        let flags = pte_flags(base_flags(true), mapping.vm_flags, uncached);
+        let pages = mapping.size / GPU_PAGE_SIZE;
+
+        let mut root_guard = self.root.lock();
+        let mut tables = self.tables.lock();
+        if root_guard.is_none() {
+            *root_guard = Some(Node {
+                table: PageTable::new(&geometry, geometry.root_level)?,
+                children: BTreeMap::new(),
+                live: 0,
+            });
+            *tables += 1;
+        }
+
+        for page in 0..pages {
+            let va = mapping.va + page * GPU_PAGE_SIZE;
+            let phys = phys_base + mapping.offset + page * GPU_PAGE_SIZE;
+            let pte = make_pte(phys, flags)?;
+
+            // Descend, creating each missing directory and linking it into its
+            // parent as we go.
+            let mut node = root_guard.as_mut().expect("root just ensured");
+            let levels: Vec<Level> = geometry.levels().collect();
+            for window in levels.windows(2) {
+                let (level, child_level) = (window[0], window[1]);
+                let index = geometry.index_at(va, level);
+                if !node.children.contains_key(&index) {
+                    if *tables >= MAX_TABLES {
+                        return Err(FsError::NoSpace);
+                    }
+                    let child = PageTable::new(&geometry, child_level)?;
+                    let pde = make_pde(child.phys)?;
+                    // SAFETY: `index` is masked to the level's entry count by
+                    // `index_at`.
+                    unsafe { node.table.write(index, pde) };
+                    *tables += 1;
+                    node.children.insert(
+                        index,
+                        Node {
+                            table: child,
+                            children: BTreeMap::new(),
+                            live: 0,
+                        },
+                    );
+                }
+                node.live += 1;
+                node = node.children.get_mut(&index).expect("just inserted");
+            }
+
+            let leaf = geometry.index_at(va, Level::Ptb);
+            // SAFETY: as above.
+            unsafe { node.table.write(leaf, pte) };
+            node.live += 1;
+        }
+        Ok(())
+    }
+
+    /// Restore the invalid pattern over `[va, va+size)` and free directories
+    /// that no longer hold anything.
+    fn dematerialise(&self, va: u64, size: u64) {
+        let geometry = self.geometry;
+        let pages = size / GPU_PAGE_SIZE;
+        let mut root_guard = self.root.lock();
+        let mut tables = self.tables.lock();
+        let Some(root) = root_guard.as_mut() else {
+            return;
+        };
+        let levels: Vec<Level> = geometry.levels().collect();
+
+        for page in 0..pages {
+            let va = va + page * GPU_PAGE_SIZE;
+            Self::clear_one(&geometry, root, &levels, 0, va, &mut tables);
+        }
+        if root.live == 0 {
+            *tables -= 1;
+            *root_guard = None;
+        }
+    }
+
+    /// Clear one leaf and unwind, freeing any directory left empty. Recursive
+    /// so the unwind happens on the way back up, which is the only point at
+    /// which a parent knows whether its child became empty.
+    fn clear_one(
+        geometry: &Geometry,
+        node: &mut Node,
+        levels: &[Level],
+        depth: usize,
+        va: u64,
+        tables: &mut u64,
+    ) {
+        let level = levels[depth];
+        let index = geometry.index_at(va, level);
+        if level == Level::Ptb {
+            // SAFETY: `index` is masked to the table's entry count.
+            let current = unsafe { node.table.read(index) };
+            if current & PTE_VALID == 0 {
+                return;
+            }
+            // SAFETY: as above.
+            unsafe { node.table.write(index, PTE_EXECUTABLE) };
+            node.live = node.live.saturating_sub(1);
+            return;
+        }
+        let Some(child) = node.children.get_mut(&index) else {
+            return;
+        };
+        let before = child.live;
+        Self::clear_one(geometry, child, levels, depth + 1, va, tables);
+        if child.live == before {
+            // Nothing changed below, so nothing to unwind.
+            return;
+        }
+        node.live = node.live.saturating_sub(1);
+        if child.live == 0 {
+            // SAFETY: `index` is masked to the table's entry count.
+            unsafe { node.table.write(index, PDE_PTE) };
+            node.children.remove(&index);
+            *tables -= 1;
+        }
+    }
+
+    /// Read a leaf entry for `va`, for tests and for a future fault handler.
+    pub fn leaf_entry(&self, va: u64) -> Option<u64> {
+        let geometry = self.geometry;
+        let g = self.root.lock();
+        let mut node = g.as_ref()?;
+        let levels: Vec<Level> = geometry.levels().collect();
+        for window in levels.windows(2) {
+            let index = geometry.index_at(va, window[0]);
+            node = node.children.get(&index)?;
+        }
+        // SAFETY: `index_at` masks to the table's entry count.
+        Some(unsafe { node.table.read(geometry.index_at(va, Level::Ptb)) })
+    }
+
+    /// Read a directory entry at `level` for `va`.
+    pub fn directory_entry(&self, va: u64, level: Level) -> Option<u64> {
+        let geometry = self.geometry;
+        let g = self.root.lock();
+        let mut node = g.as_ref()?;
+        for window in geometry.levels().collect::<Vec<_>>().windows(2) {
+            if window[0] == level {
+                // SAFETY: as above.
+                return Some(unsafe { node.table.read(geometry.index_at(va, level)) });
+            }
+            node = node.children.get(&geometry.index_at(va, window[0]))?;
+        }
+        None
+    }
 }

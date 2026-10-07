@@ -7753,3 +7753,207 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_gem_va_maps_and_validates
 );
+
+/// Page tables are really built: the entries are read back out of the memory
+/// the GPU would walk.
+///
+/// This is the first test in the VM series that touches hardware-format memory
+/// rather than pure functions. What it checks is that a mapping produces a
+/// walkable chain — root PDE → PDB1 PDE → PDB0 PDE → leaf PTE — with the
+/// physical address and flags at each step, and that unmapping restores the
+/// invalid pattern and frees the directories that are left empty.
+fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, Level, VmState, GPU_PAGE_SIZE};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let g = state.geometry();
+
+    // Nothing mapped: no root directory, no tables.
+    if state.root_phys().is_some() || state.table_count() != 0 {
+        return TestResult::Fail("an unused address space should allocate nothing");
+    }
+
+    // A 3-page buffer, so the mapping spans more than one leaf entry.
+    const PAGES: u64 = 3;
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&(PAGES * GPU_PAGE_SIZE).to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let Some(object) = gem.object(handle) else {
+        return TestResult::Fail("setup: the created object is not in the table");
+    };
+    let phys = object.phys;
+
+    let va_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA;
+    let req = |op: u32, flags: u32, va: u64, offset: u64, size: u64| {
+        let mut r = [0u8; 40];
+        r[0..4].copy_from_slice(&handle.to_le_bytes());
+        r[8..12].copy_from_slice(&op.to_le_bytes());
+        r[12..16].copy_from_slice(&flags.to_le_bytes());
+        r[16..24].copy_from_slice(&va.to_le_bytes());
+        r[24..32].copy_from_slice(&offset.to_le_bytes());
+        r[32..40].copy_from_slice(&size.to_le_bytes());
+        vm::dispatch(va_cmd, r.as_mut_ptr() as usize, &state, &gem)
+    };
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    // An address with a distinct index at every level, so a swapped shift
+    // would land the entry in the wrong table.
+    const BASE_VA: u64 = (0x11u64 << 39) | (0x22 << 30) | (0x33 << 21) | (0x44 << 12);
+
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, PAGES * GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("MAP of a 3-page buffer failed");
+    }
+
+    // Root plus one table at each of PDB1, PDB0 and PTB: four in all, since
+    // the three pages share a leaf table.
+    if state.table_count() != 4 {
+        return TestResult::Fail("a 3-page map in one leaf should need exactly four tables");
+    }
+    let Some(root) = state.root_phys() else {
+        return TestResult::Fail("the root page directory was not allocated");
+    };
+    if root % GPU_PAGE_SIZE != 0 {
+        return TestResult::Fail("the root directory must be page aligned");
+    }
+
+    // Each directory entry must be a valid, system, snooped pointer at a
+    // page-aligned child — and must NOT carry PDE_PTE, which would mark it a
+    // leaf mapping a huge page instead of a pointer to a table.
+    for level in [Level::Pdb2, Level::Pdb1, Level::Pdb0] {
+        let Some(pde) = state.directory_entry(BASE_VA, level) else {
+            return TestResult::Fail("a directory entry on the mapped path is missing");
+        };
+        if pde & vm::PTE_VALID == 0 {
+            return TestResult::Fail("a directory entry on the mapped path is not valid");
+        }
+        if pde & vm::PTE_SYSTEM == 0 || pde & vm::PTE_SNOOPED == 0 {
+            return TestResult::Fail("a table in system memory needs SYSTEM | SNOOPED");
+        }
+        if pde & vm::PDE_PTE != 0 {
+            return TestResult::Fail("a pointer PDE must not be marked as a leaf");
+        }
+        // `gmc_v11_0_get_vm_pde`'s `BUG_ON(*addr & 0xFFFF00000000003F)` is on
+        // the ADDRESS, before the flags are folded in — and VALID|SYSTEM|
+        // SNOOPED are bits 0:2, inside that mask. So the composed entry is
+        // checked differently: bits 63:48 must be clear, and the low 12 bits
+        // must be exactly those three flags, which is only possible if the
+        // address underneath them is page aligned.
+        if pde & 0xFFFF_0000_0000_0000 != 0 {
+            return TestResult::Fail("a PDE carries bits above the 48-bit address space");
+        }
+        if pde & 0xFFF != vm::PTE_VALID | vm::PTE_SYSTEM | vm::PTE_SNOOPED {
+            return TestResult::Fail("a PDE's low bits are not exactly its three flags");
+        }
+    }
+
+    // The leaves: one per page, each pointing at its own frame.
+    for page in 0..PAGES {
+        let va = BASE_VA + page * GPU_PAGE_SIZE;
+        let Some(pte) = state.leaf_entry(va) else {
+            return TestResult::Fail("a leaf entry on the mapped path is missing");
+        };
+        if pte & vm::PTE_VALID == 0 {
+            return TestResult::Fail("a mapped page's PTE is not valid");
+        }
+        if pte & !0xFFFu64 & vm::GMC_HOLE_MASK != phys + page * GPU_PAGE_SIZE {
+            return TestResult::Fail("a PTE does not point at the buffer's frame");
+        }
+        if pte & vm::PTE_READABLE == 0 || pte & vm::PTE_WRITEABLE == 0 {
+            return TestResult::Fail("the mapping's permissions did not reach the PTE");
+        }
+        if pte & vm::PTE_EXECUTABLE != 0 {
+            return TestResult::Fail("execute was not requested and must not be granted");
+        }
+    }
+    // One page past the mapping must be invalid, not merely absent from the
+    // bookkeeping — this is what stops a shader reading past the buffer.
+    match state.leaf_entry(BASE_VA + PAGES * GPU_PAGE_SIZE) {
+        Some(pte) if pte & vm::PTE_VALID == 0 => {}
+        Some(_) => return TestResult::Fail("the page after the mapping is a valid translation"),
+        None => {
+            return TestResult::Fail("the leaf table past the mapping should exist and be invalid")
+        }
+    }
+
+    // A second mapping far away needs its own PDB1/PDB0/PTB but shares the
+    // root, so three more tables.
+    const FAR_VA: u64 = BASE_VA + (1u64 << 39);
+    if req(u::AMDGPU_VA_OP_MAP, RW, FAR_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("a second, distant MAP failed");
+    }
+    if state.table_count() != 7 {
+        return TestResult::Fail("a distant map should add three tables, sharing the root");
+    }
+
+    // Unmapping the far one frees its three tables and leaves the near one.
+    if req(u::AMDGPU_VA_OP_UNMAP, RW, FAR_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("UNMAP of the distant mapping failed");
+    }
+    if state.table_count() != 4 {
+        return TestResult::Fail("an emptied subtree should be freed");
+    }
+    if state.leaf_entry(FAR_VA).is_some() {
+        return TestResult::Fail("the freed subtree is still walkable");
+    }
+    if state.leaf_entry(BASE_VA).is_none() {
+        return TestResult::Fail("freeing one subtree disturbed another");
+    }
+
+    // Unmapping the last mapping releases everything, root included.
+    if req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA, 0, PAGES * GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("UNMAP of the first mapping failed");
+    }
+    if state.table_count() != 0 || state.root_phys().is_some() {
+        return TestResult::Fail("the last unmap should release the root directory too");
+    }
+
+    // An executable mapping gets the bit; the same range re-mapped read-only
+    // must not keep it. This is the clearing behaviour gmc_v11_0_get_vm_pte
+    // relies on, seen through the real tables.
+    const X: u32 = RW | u::AMDGPU_VM_PAGE_EXECUTABLE;
+    if req(u::AMDGPU_VA_OP_MAP, X, BASE_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("an executable MAP failed");
+    }
+    match state.leaf_entry(BASE_VA) {
+        Some(pte) if pte & vm::PTE_EXECUTABLE != 0 => {}
+        _ => return TestResult::Fail("EXECUTABLE did not reach the PTE"),
+    }
+    if req(u::AMDGPU_VA_OP_REPLACE, RW, BASE_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("REPLACE over an executable mapping failed");
+    }
+    match state.leaf_entry(BASE_VA) {
+        Some(pte) if pte & vm::PTE_EXECUTABLE == 0 && pte & vm::PTE_VALID != 0 => {}
+        _ => return TestResult::Fail("REPLACE left the execute bit set"),
+    }
+
+    // CLEAR tears down whatever it covers.
+    if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("CLEAR failed");
+    }
+    if state.table_count() != 0 {
+        return TestResult::Fail("CLEAR should have released the tables");
+    }
+
+    let _ = g;
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_page_tables_are_walkable
+);
