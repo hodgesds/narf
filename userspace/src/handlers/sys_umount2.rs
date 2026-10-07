@@ -140,7 +140,8 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // 6.18: an unprivileged umount2 of a missing path is ENOENT, of an
     // existing non-mountpoint EPERM. This handler had no privilege check at
     // all, so any task could unmount anything.
-    let mounted = current_mount_list().iter().any(|m| m == &target);
+    let mount_list = current_mount_list();
+    let mounted = mount_list.iter().any(|m| m == &target);
     if !mounted && stat_path_dir_aware(target.as_str()).is_none() {
         ctx.set_return(fail(ENOENT));
         return;
@@ -219,9 +220,20 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // loop had no "come back later" state and a caller that depends on EBUSY
     // to detect "someone is still in there" (systemd's `umount_recursive`,
     // udisks, every container runtime's cleanup) never saw it.
-    let submounts: alloc::vec::Vec<alloc::string::String> = current_mount_list()
+    // The table is in attachment order. Only mounts attached AFTER the
+    // topmost target mount can be its children. This distinction matters for
+    // `pivot_root(".", ".")`: it stacks the old root over the already
+    // recursively-bound new root, then lazily detaches the top mount. Entries
+    // that predate that stack operation belong to the new root and must
+    // survive, including its recursively cloned `/run` mount.
+    let topmost = mount_list
+        .iter()
+        .rposition(|mount| mount == &target)
+        .expect("mounted target must have a topmost attachment");
+    let submounts: alloc::vec::Vec<alloc::string::String> = mount_list
         .into_iter()
-        .filter(|m| m != &target && path_at_or_under(m, target.as_str()))
+        .skip(topmost + 1)
+        .filter(|mount| path_at_or_under(mount, target.as_str()))
         .collect();
     // MNT_DETACH is Linux's lazy unmount: detach the subtree now and let the
     // last reference free it. NARF's mounts are Arc'd, so a task holding a

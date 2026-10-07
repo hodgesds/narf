@@ -3556,6 +3556,156 @@ kernel_test_in!(
     smoke_abi_socket_notify_sendmsg_across_cloned_mount_namespace
 );
 
+/// A systemd service sandbox recursively bind-mounts its root before entering
+/// it. Its `/run` is a distinct mount, and PID 1's `$NOTIFY_SOCKET` lives
+/// there. The recursive bind must consequently clone the `/run` attachment
+/// beneath the sandbox root, preserving the pathname socket's VFS identity.
+/// Otherwise `sd_notify("READY=1")` sees ENOENT after the root switch and the
+/// service times out even though it is otherwise healthy.
+fn smoke_abi_socket_notify_survives_recursive_bind_root_swap() -> TestResult {
+    with_setup(|| {
+        const MANAGER_TASK: u64 = 0xC190;
+        const SERVICE_TASK: u64 = 0xC191;
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const MS_BIND: u64 = 1 << 12;
+        const MS_REC: u64 = 1 << 14;
+        const SOURCE_ROOT: &str = "/abi-notify-rbind-root";
+        const SOURCE_RUN: &str = "/abi-notify-rbind-root/run";
+        const SOURCE_SOCKET: &[u8] = b"/abi-notify-rbind-root/run/systemd/notify\0";
+        const SANDBOX_SOCKET: &[u8] = b"/run/systemd/notify\0";
+
+        let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
+        let source_root = registry()
+            .mount_arc(
+                &auth,
+                SOURCE_ROOT,
+                alloc::sync::Arc::new(MemFs::with_seeds("notify-rbind-root", &[])),
+            )
+            .map_err(|_| "recursive-bind root setup failed")?;
+        let source_run = registry()
+            .mount_arc(
+                &auth,
+                SOURCE_RUN,
+                alloc::sync::Arc::new(MemFs::with_seeds("notify-rbind-run", &[])),
+            )
+            .map_err(|_| "recursive-bind /run setup failed")?;
+        let result = (|| {
+            set_task(MANAGER_TASK);
+            let systemd_dir = b"/abi-notify-rbind-root/run/systemd\0";
+            if call(
+                Syscall::Mkdir.raw(),
+                a2(systemd_dir.as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+            {
+                return Err("could not create the notify socket directory");
+            }
+            let sandbox_dir = b"/abi-notify-rbind-root/run/systemd/mount-rootfs\0";
+            if call(
+                Syscall::Mkdir.raw(),
+                a2(sandbox_dir.as_ptr() as u64, 0o755, 0),
+            ) != Some(0)
+            {
+                return Err("could not create the sandbox root directory");
+            }
+            let rx = open_unix(SOCK_DGRAM)?;
+            let (source_addr, source_len) = unix_sockaddr(SOURCE_SOCKET);
+            if call(
+                Syscall::SocketBind.raw(),
+                a2(rx, source_addr.as_ptr() as u64, source_len),
+            ) != Some(0)
+            {
+                return Err("manager could not bind the source notify socket");
+            }
+
+            set_task(SERVICE_TASK);
+            if !crate::handlers::install_root_dir(SERVICE_TASK, SOURCE_ROOT) {
+                return Err("service could not enter its source root");
+            }
+            if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+                return Err("service could not clone its mount namespace");
+            }
+            // systemd runs this after its root has become `/mnt`: both paths
+            // below are visible paths, translated by apply_chroot() to the
+            // source root and its mount-rootfs child respectively.
+            let source = b"/\0";
+            let target = b"/run/systemd/mount-rootfs\0";
+            if call(
+                Syscall::Mount.raw(),
+                SyscallArgs {
+                    arg0: source.as_ptr() as u64,
+                    arg1: target.as_ptr() as u64,
+                    arg3: MS_BIND | MS_REC,
+                    ..Default::default()
+                },
+            ) != Some(0)
+            {
+                return Err("service could not recursively bind its root");
+            }
+            // Match systemd's effective mount_switch_root_pivot() sequence:
+            // it fchdirs to the new root (a chdir reaches the same cwd state
+            // here), pivots with (".", "."), then lazily detaches the
+            // stacked old root. The detach must leave the recursive `/run`
+            // clone in place.
+            if call(Syscall::Chdir.raw(), a0(target.as_ptr() as u64)) != Some(0) {
+                return Err("service could not enter the recursively-bound root");
+            }
+            let dot = b".\0";
+            if call(
+                Syscall::PivotRoot.raw(),
+                a1(dot.as_ptr() as u64, dot.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("service could not pivot into its recursively-bound root");
+            }
+            if call(Syscall::Umount2.raw(), a1(dot.as_ptr() as u64, 2)) != Some(0) {
+                return Err("service could not detach the stacked old root");
+            }
+
+            let tx = open_unix(SOCK_DGRAM)?;
+            let (sandbox_addr, sandbox_len) = unix_sockaddr(SANDBOX_SOCKET);
+            let payload = b"READY=1\nSTATUS=recursive bind root swap";
+            let mut iov = [0u8; 16];
+            iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+            iov[8..].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+            let mut msg = [0u8; 56];
+            msg[..8].copy_from_slice(&(sandbox_addr.as_ptr() as u64).to_ne_bytes());
+            msg[8..16].copy_from_slice(&sandbox_len.to_ne_bytes());
+            msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+            msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+            if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0))
+                != Some(payload.len() as i64)
+            {
+                return Err("READY=1 vanished through the recursively-bound /run mount");
+            }
+
+            set_task(MANAGER_TASK);
+            let mut received = [0u8; 64];
+            if call(
+                Syscall::SocketRecv.raw(),
+                a3(rx, received.as_mut_ptr() as u64, received.len() as u64, 0),
+            ) != Some(payload.len() as i64)
+                || &received[..payload.len()] != payload
+            {
+                return Err("manager did not receive READY=1 through the sandbox root");
+            }
+            Ok(())
+        })();
+
+        set_task(SERVICE_TASK);
+        crate::handlers::clear_current_mount_namespace_for_test();
+        crate::handlers::__test_root_dir_reset();
+        set_task(MANAGER_TASK);
+        let _ = registry().unmount(&source_run, SOURCE_RUN);
+        let _ = registry().unmount(&source_root, SOURCE_ROOT);
+        set_task(FAKE_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_notify_survives_recursive_bind_root_swap
+);
+
 /// systemd's `PrivateMounts=yes` setup may overmount the directory that holds
 /// `$NOTIFY_SOCKET`, then bind the notify *file* back into the service view.
 /// The target spelling is therefore under a different parent mount even though

@@ -30,7 +30,9 @@ and CI compiler-cache integration.
   and stages the NRFW blob in `target/firmware/NAME`. `SIG` and `KEY` are
   raw 64- and 32-byte files. Without both options, the blob is unsigned.
 
-- `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot.
+- `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
+  builds strip debug-only ELF sections by default while retaining ordinary
+  symbols; `--debug` retains full debuginfo for GDB and crash diagnosis.
 - `cargo xtask run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
   — opt into QEMU's OpenGL-backed virtio-gpu device. The default remains
   `--gpu-backend=auto`: graphical runs prefer VirGL when QEMU advertises the

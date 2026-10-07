@@ -184,7 +184,10 @@ opt-level       = 3
 lto             = false
 codegen-units   = 16
 panic           = "abort"
-strip           = "none"        # keep symbols — observability/ needs them
+# Keep ordinary ELF symbols for observability, but omit DWARF and the other
+# debug-only ELF sections from optimized artifacts. Debug profiles retain their
+# full debug information for GDB and crash diagnosis.
+strip           = "debuginfo"
 debug           = 2
 overflow-checks = false         # release trusts bounds; debug always checks
 incremental     = false
