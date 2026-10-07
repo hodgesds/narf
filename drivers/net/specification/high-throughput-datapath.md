@@ -156,7 +156,16 @@ progress toward line rate.
   per-core-poller spawn is adopted per driver as their datapaths move over.
 - **P5 — Zero-copy TX for all drivers + 100G bring-up.** Remove e1000-style
   copies, buffer recycling pools (P-F); bring mlx5 to line rate; net-bench to
-  measure saturation.
+  measure saturation. _In progress:_ the shared recycling pool
+  (`io::pool::DmaPool`) now backs virtio's RX/TX free-lists; e1000 RX dispatches
+  in place from the DMA page (no scratch copy); and zero-copy TX is wired end to
+  end for IPv4 — the stack builds egress frames straight into a pooled DMA
+  buffer (`iface::tx_acquire`) and hands ownership to the driver
+  (`SendFrameFn`/`xmit_frame`), with e1000 DMAing it directly and recycling via
+  `tx_release`. Gated per iface (`enable_zero_copy_tx`): a non-opted iface, an
+  IPv6 frame, or a TSO super-frame too large for the pool buffer falls back to
+  the byte-for-byte pre-P-F `Vec` copy path. _Remaining:_ zero-copy TX for
+  virtio + IPv6, mlx5 100G, net-bench.
 
 ## 5. Validation
 

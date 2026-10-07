@@ -355,10 +355,36 @@ fn offload_meta(dev: &iface::NetIfaceSnapshot, tso_mss: Option<u16>) -> crate::T
     }
 }
 
+/// An egress frame the stack built, either as a plain `Vec` (classic copy TX)
+/// or directly in a DMA buffer from the iface's TX pool (zero-copy TX, P-F).
+/// `emit_tcb_frame` dispatches each to the matching driver hand-off.
+enum TxFrame {
+    Owned(Vec<u8>),
+    Dma(crate::Frame),
+}
+
+impl TxFrame {
+    fn len(&self) -> usize {
+        match self {
+            TxFrame::Owned(v) => v.len(),
+            TxFrame::Dma(f) => f.len() as usize,
+        }
+    }
+
+    /// Mutable view of the frame bytes — the TX netfilter hook rewrites these
+    /// in place for both buffer kinds.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            TxFrame::Owned(v) => v.as_mut_slice(),
+            TxFrame::Dma(f) => f.payload_mut(),
+        }
+    }
+}
+
 fn emit_tcb_frame(
     arc: &Arc<IrqSafeSpinLock<Tcb>>,
     dev: &iface::NetIfaceSnapshot,
-    mut frame: Vec<u8>,
+    mut frame: TxFrame,
     meta: crate::TxMeta,
 ) {
     let iface_name = dev.name.as_str();
@@ -369,14 +395,21 @@ fn emit_tcb_frame(
     if frame.len() < crate::pkt::ETH_HDR_LEN {
         return;
     }
-    if is_ipv6
+    let accepted = is_ipv6
         || crate::tcp_stack::nf_tx_filter_in(
             net_ns_id,
             iface_name,
-            &mut frame[crate::pkt::ETH_HDR_LEN..],
-        ) == crate::netfilter::Verdict::Accept
-    {
-        let _ = dev.xmit_meta(&frame, meta);
+            &mut frame.bytes_mut()[crate::pkt::ETH_HDR_LEN..],
+        ) == crate::netfilter::Verdict::Accept;
+    if accepted {
+        match frame {
+            TxFrame::Owned(v) => {
+                let _ = dev.xmit_meta(&v, meta);
+            }
+            TxFrame::Dma(f) => {
+                let _ = dev.xmit_frame(f, meta);
+            }
+        }
     }
 }
 
@@ -1938,7 +1971,18 @@ pub fn set_congestion_control<C: CongestionControl>(
 
 /// Construct the bytes for an Ethernet+IPv4+TCP frame carrying
 /// `payload`. Used by every outbound path.
-fn build_frame(
+/// Total bytes an IPv4 TCP frame with `opt_len` option bytes and `payload_len`
+/// data occupies — the size to allocate / acquire before building.
+fn ipv4_frame_len(opt_len: usize, payload_len: usize) -> usize {
+    ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN + opt_len + payload_len
+}
+
+/// Build a complete Ethernet/IPv4/TCP frame into `out` (which must be at least
+/// [`ipv4_frame_len`] bytes). The zero-copy TX path builds straight into a DMA
+/// buffer's payload here; the `Vec`-returning [`build_frame`] wraps it.
+#[allow(clippy::too_many_arguments)]
+fn build_frame_into(
+    out: &mut [u8],
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
     src_ip: [u8; 4],
@@ -1952,13 +1996,13 @@ fn build_frame(
     options: Vec<u8>,
     payload: &[u8],
     offload_csum: bool,
-) -> Vec<u8> {
+) {
     let opt_len = options.len();
     let tcp_hdr_len = TCP_HDR_MIN + opt_len;
-    let total = ETH_HDR_LEN + IPV4_HDR_LEN + tcp_hdr_len + payload.len();
-    let mut frame = vec![0u8; total];
+    let total = ipv4_frame_len(opt_len, payload.len());
+    let frame = &mut out[..total];
     let ip_total = (IPV4_HDR_LEN + tcp_hdr_len + payload.len()) as u16;
-    let _ = write_eth_header(&mut frame, dst_mac, src_mac, ETHERTYPE_IPV4);
+    let _ = write_eth_header(frame, dst_mac, src_mac, ETHERTYPE_IPV4);
     let _ = write_ipv4_header(
         &mut frame[ETH_HDR_LEN..],
         ip_total,
@@ -1995,6 +2039,41 @@ fn build_frame(
         ipv4_pseudo_checksum(src_ip, dst_ip, segment)
     };
     frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&cs.to_be_bytes());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_frame(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: Vec<u8>,
+    payload: &[u8],
+    offload_csum: bool,
+) -> Vec<u8> {
+    let mut frame = vec![0u8; ipv4_frame_len(options.len(), payload.len())];
+    build_frame_into(
+        &mut frame,
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+        window,
+        options,
+        payload,
+        offload_csum,
+    );
     frame
 }
 
@@ -2072,6 +2151,7 @@ fn iface_for_tcb(t: &Tcb) -> Option<crate::iface::NetIfaceSnapshot> {
 
 #[allow(clippy::too_many_arguments)]
 fn build_tcb_frame(
+    dev: &iface::NetIfaceSnapshot,
     t: &Tcb,
     src_mac: [u8; 6],
     seq: u32,
@@ -2081,9 +2161,11 @@ fn build_tcb_frame(
     options: Vec<u8>,
     payload: &[u8],
     offload_csum: bool,
-) -> Vec<u8> {
+) -> TxFrame {
     if t.is_ipv6 {
-        build_frame6(
+        // IPv6 egress stays on the classic copy path (its builder lives in
+        // `ipv6_stack`); zero-copy TX is wired for IPv4 first.
+        return TxFrame::Owned(build_frame6(
             src_mac,
             t.remote_mac,
             t.local_addr6,
@@ -2097,24 +2179,49 @@ fn build_tcb_frame(
             options,
             payload,
             offload_csum,
-        )
-    } else {
-        build_frame(
-            src_mac,
-            t.remote_mac,
-            t.local_addr,
-            t.remote_addr,
-            t.local_port,
-            t.remote_port,
-            seq,
-            ack,
-            flags,
-            window,
-            options,
-            payload,
-            offload_csum,
-        )
+        ));
     }
+    // IPv4: when the egress iface offers zero-copy TX and a pool buffer is big
+    // enough for this frame, build straight into it — no copy before the DMA.
+    // A TSO super-frame larger than the pool buffer, or a non-zero-copy iface,
+    // falls through to the `Vec` path (byte-for-byte the pre-P-F behaviour).
+    let total = ipv4_frame_len(options.len(), payload.len());
+    if dev.zero_copy_tx() {
+        if let Some(mut f) = iface::tx_acquire(&dev.name, total) {
+            build_frame_into(
+                f.payload_mut(),
+                src_mac,
+                t.remote_mac,
+                t.local_addr,
+                t.remote_addr,
+                t.local_port,
+                t.remote_port,
+                seq,
+                ack,
+                flags,
+                window,
+                options,
+                payload,
+                offload_csum,
+            );
+            return TxFrame::Dma(f);
+        }
+    }
+    TxFrame::Owned(build_frame(
+        src_mac,
+        t.remote_mac,
+        t.local_addr,
+        t.remote_addr,
+        t.local_port,
+        t.remote_port,
+        seq,
+        ack,
+        flags,
+        window,
+        options,
+        payload,
+        offload_csum,
+    ))
 }
 
 fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
@@ -2164,6 +2271,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         FLAG_SYN
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         our_iss,
@@ -2200,6 +2308,7 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         (t.snd_nxt, t.rcv_nxt, window, opts)
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -2224,6 +2333,7 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
         FLAG_RST
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -2288,6 +2398,7 @@ fn send_data(
     let tso = tso_mss.filter(|_| egress.dev.offloads.max_tso_bytes > 0);
     let csum_off = tso.is_some() || egress.dev.offloads.tx_checksum;
     let frame = build_tcb_frame(
+        &egress.dev,
         &arc.lock(),
         egress.mac,
         seq,
@@ -2515,6 +2626,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         None => return,
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -2584,6 +2696,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         (seq, window, opts, t.rcv_nxt)
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -2646,6 +2759,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         (t.snd_una.wrapping_sub(1), window, opts, t.rcv_nxt)
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -3728,6 +3842,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         None => return,
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,

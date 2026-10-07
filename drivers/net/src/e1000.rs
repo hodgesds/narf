@@ -1334,6 +1334,58 @@ impl E1000 {
         Ok(slot)
     }
 
+    /// Zero-copy transmit (P-F): post a TX descriptor pointing straight at
+    /// `buf_phys` (the DMA address of a buffer the stack built the frame into)
+    /// and poll DD, with NO copy into a per-slot buffer — unlike [`Self::tx`],
+    /// which copies the caller's slice. The caller owns the backing buffer and
+    /// must keep it alive until this returns (it does: the call is
+    /// synchronous). Same 250 ms DD budget and lock discipline as `tx`.
+    pub fn tx_dma_frame(&self, buf_phys: u64, len: usize) -> Result<(), E1000Error> {
+        if len == 0 || len > 1518 {
+            return Err(E1000Error::FrameTooLong);
+        }
+        let mut tail_g = self.tx_tail.lock();
+        let slot = (*tail_g) as usize % TX_RING_LEN;
+        let ring_phys = self.tx_ring.dma_addr().raw();
+        let desc_addr = ring_phys + (slot * 16) as u64;
+        let desc = TxDesc {
+            addr: buf_phys,
+            length: len as u16,
+            cso: 0,
+            cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        // SAFETY: identity-mapped DMA ring page; slot < TX_RING_LEN.
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
+                desc,
+            );
+        }
+        let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_TDT, next_tail);
+        }
+        *tail_g = next_tail;
+        drop(tail_g);
+
+        // Poll for DD (same budget as `tx`); the device reads `buf_phys`
+        // directly during this window.
+        let done = narf_scheduler::responsive_spin_until(
+            // SAFETY: coherent DMA via the kernel direct map.
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u8>()) } & TXD_STAT_DD != 0,
+            narf_time::Deadline::after_ms(250),
+        );
+        if !done {
+            return Err(E1000Error::TxTimeout);
+        }
+        Ok(())
+    }
+
     /// Drain one received frame from the RX ring, copying it into
     /// `out` and returning the number of bytes. Returns 0 if no
     /// frame is currently pending. After consuming, the descriptor
@@ -1560,6 +1612,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     narf_net::iface::set_link_metadata(&name, carrier, speed_mbps, duplex);
     *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
     narf_net::iface::install_rx_drain(rx_pump_step);
+    // Opt into zero-copy TX (P-F): the stack builds egress frames straight into
+    // a pooled DMA buffer and hands it to `e1000_send_frame_zc`, which DMAs it
+    // without the per-frame slice copy `e1000_send_frame` does. 2 KiB buffers
+    // (max Ethernet frame 1518 < 2048); a TX-ring-deep recycling pool.
+    narf_net::iface::enable_zero_copy_tx(e1000_ifname(), e1000_send_frame_zc, 2048, TX_RING_LEN);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -1652,6 +1709,25 @@ fn e1000_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     // starves timers and RCU. See `probed_controller`.
     let ctrl = probed_controller().ok_or(())?;
     ctrl.tx(frame).map_err(|_| ())
+}
+
+/// Zero-copy `SendFrameFn` (P-F): the stack built this frame directly into a
+/// DMA buffer from the iface TX pool, so DMA it straight from that buffer with
+/// no copy, then recycle the buffer back to the pool. e1000 TX is synchronous
+/// (`tx_dma_frame` polls DD before returning), so the device is done reading
+/// the buffer the moment the call returns — the recycle is safe immediately,
+/// on both success and failure.
+fn e1000_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Result<(), ()> {
+    // `Frame::new` built it at offset 0, so `into_parts` gives the payload at
+    // the buffer origin — exactly what the device DMAs.
+    let (buf, len) = frame.into_parts();
+    let phys = buf.dma_addr().raw();
+    let result = match probed_controller() {
+        Some(c) => c.tx_dma_frame(phys, len as usize).map_err(|_| ()),
+        None => Err(()),
+    };
+    narf_net::iface::tx_release(e1000_ifname(), buf);
+    result
 }
 
 /// Drain one frame from the RX ring + dispatch it through the

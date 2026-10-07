@@ -7,9 +7,11 @@
 //! lands when a real consumer needs it.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use narf_io::pool::DmaPool;
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// Function pointer the driver supplies to send a single Ethernet frame.
@@ -18,6 +20,14 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// [`crate::Interface::offloads`] receives [`crate::TxMeta::plain`] and
 /// ignores the argument. Returns Ok on enqueue, Err on driver failure.
 pub type SendFn = fn(&[u8], crate::TxMeta) -> Result<(), ()>;
+
+/// Zero-copy transmit hook (P-F). A driver that opts in via
+/// [`enable_zero_copy_tx`] supplies this: it takes ownership of a
+/// [`crate::Frame`] the stack built directly into a DMA buffer drawn from the
+/// interface's TX pool, DMAs that buffer with no copy, and recycles it back to
+/// the pool (via [`tx_release`]) on completion. Returns Ok on enqueue, Err on
+/// driver failure (the buffer is still the driver's to recycle on Err).
+pub type SendFrameFn = fn(crate::Frame, crate::TxMeta) -> Result<(), ()>;
 
 /// Duplex state reported by a physical driver. `None` in snapshots means the
 /// driver has no authoritative link-mode sample.
@@ -96,6 +106,16 @@ pub struct NetIfaceEntry {
     /// checksum/TSO offload via [`crate::TxMeta`] instead of doing the work
     /// in software.
     pub offloads: crate::OffloadCapabilities,
+    /// Zero-copy TX hook (P-F): `Some` once the driver opts in via
+    /// [`enable_zero_copy_tx`]. When set, the stack builds egress frames
+    /// directly into a buffer from `tx_pool` and hands ownership here instead
+    /// of copying a slice through [`send`]. `None` ⇒ the classic copy path.
+    pub send_frame: Option<SendFrameFn>,
+    /// Recycling pool backing zero-copy TX (`Some` iff `send_frame` is). The
+    /// stack draws build buffers from it ([`tx_acquire`]); the driver returns
+    /// them on completion ([`tx_release`]). `Arc` so a snapshot can hold the
+    /// pool without re-looking-up the registry.
+    pub tx_pool: Option<Arc<DmaPool>>,
 }
 
 /// One `netdev_hw_addr` on a device's multicast or unicast list.
@@ -136,6 +156,62 @@ pub fn set_offloads(name: &str, offloads: crate::OffloadCapabilities) {
         .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
     {
         entry.offloads = offloads;
+    }
+}
+
+/// Opt an interface into zero-copy TX (P-F). The driver supplies a
+/// [`SendFrameFn`] that DMAs a handed-in [`crate::Frame`] directly, and the
+/// iface grows a recycling TX pool of `cap` buffers of `buf_len` bytes. After
+/// this, the stack builds egress frames straight into pool buffers and hands
+/// ownership to the driver instead of copying a slice through [`send`]. Called
+/// at probe, after [`register`]. Idempotent-ish: re-calling replaces the hook
+/// and pool.
+pub fn enable_zero_copy_tx(name: &str, send_frame: SendFrameFn, buf_len: usize, cap: usize) {
+    use narf_lib::id::DomainId;
+    if let Some(entry) = IFACES
+        .lock()
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+    {
+        entry.send_frame = Some(send_frame);
+        entry.tx_pool = Some(Arc::new(DmaPool::new(buf_len, DomainId::DRIVER_0, cap)));
+    }
+}
+
+/// Acquire a TX build buffer from `name`'s zero-copy pool, wrapped as a
+/// [`crate::Frame`] of exactly `len` bytes for the stack to build into. Returns
+/// `None` — so the caller falls back to the classic copy path — when the iface
+/// has not opted into zero-copy TX, when `len` exceeds the pool's buffer size
+/// (e.g. a TSO super-frame larger than the pool buffer), or when the allocator
+/// is out of memory.
+pub fn tx_acquire(name: &str, len: usize) -> Option<crate::Frame> {
+    let pool = {
+        let g = IFACES.lock();
+        let entry = g
+            .as_ref()?
+            .iter()
+            .find(|entry| entry.name == name && entry.send_frame.is_some())?;
+        entry.tx_pool.clone()?
+    };
+    if len > pool.buf_len() {
+        return None;
+    }
+    Some(crate::Frame::new(pool.acquire()?, len as u32))
+}
+
+/// Return a completed TX buffer to `name`'s zero-copy pool for reuse. The
+/// driver calls this from its [`SendFrameFn`] once the device is done with the
+/// buffer (synchronous drivers: immediately; async: on TX completion). A
+/// buffer for an iface that is no longer zero-copy simply drops (frees).
+pub fn tx_release(name: &str, buf: narf_io::DmaBuffer) {
+    let pool = {
+        let g = IFACES.lock();
+        g.as_ref()
+            .and_then(|v| v.iter().find(|entry| entry.name == name))
+            .and_then(|entry| entry.tx_pool.clone())
+    };
+    if let Some(pool) = pool {
+        pool.release(buf);
     }
 }
 
@@ -414,6 +490,10 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
         offloads: old
             .as_ref()
             .map_or_else(Default::default, |old| old.offloads),
+        // A re-probe preserves any zero-copy TX opt-in (hook + pool) so the
+        // stack keeps the same recycling pool across a driver reset.
+        send_frame: old.as_ref().and_then(|old| old.send_frame),
+        tx_pool: old.as_ref().and_then(|old| old.tx_pool.clone()),
     });
     drop(g);
     // Publish this interface's `net.ipv4.conf.<dev>.*` keys and seed its
@@ -831,9 +911,40 @@ pub struct NetIfaceSnapshot {
     /// Offloads this interface's send path honors; the stack requests them
     /// via [`crate::TxMeta`] rather than computing in software.
     pub offloads: crate::OffloadCapabilities,
+    /// Zero-copy TX hook, mirrored from the entry. `Some` ⇒ the stack may hand
+    /// an owned [`crate::Frame`] to [`Self::xmit_frame`]; private so every
+    /// transmit still passes through the snapshot's tap-aware methods.
+    send_frame: Option<SendFrameFn>,
 }
 
 impl NetIfaceSnapshot {
+    /// Whether this interface accepts zero-copy (owned-`Frame`) transmits. When
+    /// false the stack builds into a `Vec` and uses [`Self::xmit_meta`].
+    pub fn zero_copy_tx(&self) -> bool {
+        self.send_frame.is_some()
+    }
+
+    /// Transmit a frame the stack built directly into a DMA buffer drawn from
+    /// this iface's TX pool ([`tx_acquire`]) — no copy. Runs the AF_PACKET
+    /// outgoing tap (like [`Self::xmit_meta`]) then hands ownership to the
+    /// driver's zero-copy hook, which DMAs the buffer and recycles it. Falls
+    /// back to a slice copy through the classic send fn if the iface somehow
+    /// lost its hook between acquire and xmit.
+    pub fn xmit_frame(&self, frame: crate::Frame, meta: crate::TxMeta) -> Result<(), ()> {
+        let len = frame.len() as usize;
+        crate::raw_sock::dev_queue_xmit_nit(
+            self,
+            frame.payload(),
+            crate::raw_sock::tx_protocol(frame.payload()),
+            None,
+        );
+        let result = match self.send_frame {
+            Some(send_frame) => send_frame(frame, meta),
+            None => (self.driver_send)(frame.payload(), meta),
+        };
+        record_tx_result(&self.name, len, result.is_ok());
+        result
+    }
     /// `dev->type`: `ARPHRD_LOOPBACK` for `lo`, `ARPHRD_ETHER` otherwise.
     #[must_use]
     pub fn hatype(&self) -> u16 {
@@ -922,6 +1033,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         duplex: entry.duplex,
         stats: entry.stats.clone(),
         offloads: entry.offloads,
+        send_frame: entry.send_frame,
     }
 }
 
@@ -1418,4 +1530,51 @@ pub fn drain_pump() -> bool {
         crate::tcp_stack::gro_flush();
     }
     any
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+mod zc_tx_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn dummy_send(_f: &[u8], _m: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+    fn dummy_send_frame(_f: crate::Frame, _m: crate::TxMeta) -> Result<(), ()> {
+        Ok(())
+    }
+
+    // Exercises the zero-copy TX acquire/release/size-guard path end to end on
+    // a throwaway interface. `register` replaces a same-named entry in place,
+    // so re-running within a boot refreshes rather than duplicates.
+    fn smoke_iface_zero_copy_tx_acquire() -> TestResult {
+        let name = register("zc-selftest", [2, 0, 0, 0, 0, 1], dummy_send);
+        // Before opt-in: not zero-copy, so acquire returns None and the stack
+        // uses the classic copy path.
+        if tx_acquire(&name, 128).is_some() {
+            return TestResult::Fail("acquire succeeded before zero-copy opt-in");
+        }
+        enable_zero_copy_tx(&name, dummy_send_frame, 2048, 8);
+        // In-size acquire yields a Frame of exactly the requested length.
+        let f = match tx_acquire(&name, 128) {
+            Some(f) => f,
+            None => return TestResult::Fail("acquire failed after opt-in"),
+        };
+        if f.len() != 128 {
+            return TestResult::Fail("acquired frame has the wrong length");
+        }
+        // Oversized (> pool buffer) falls back to None — e.g. a TSO super-frame
+        // too large for the pool buffer uses the Vec path instead.
+        if tx_acquire(&name, 4096).is_some() {
+            return TestResult::Fail("oversized acquire should fall back to None");
+        }
+        // Recycle the buffer; the pool must then hold it for reuse.
+        let (buf, _len) = f.into_parts();
+        tx_release(&name, buf);
+        if tx_acquire(&name, 256).is_none() {
+            return TestResult::Fail("acquire failed after a buffer was recycled");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/iface", smoke_iface_zero_copy_tx_acquire);
 }
