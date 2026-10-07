@@ -1410,5 +1410,12 @@ pub fn drain_pump() -> bool {
             any = true;
         }
     }
+    // A round that drained nothing is the end of a receive burst (the
+    // NAPI-complete point): flush any TCP segments GRO is still holding so
+    // coalesced data is never stranded waiting for a next segment that may not
+    // come. A no-op when GRO is disabled or this CPU holds nothing.
+    if !any {
+        crate::tcp_stack::gro_flush();
+    }
     any
 }

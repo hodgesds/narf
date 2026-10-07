@@ -1794,6 +1794,15 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                     if let Some(b) = to_recycle.take() {
                         with_at(idx, |c| c.rx_buf_release(b));
                     }
+                    // NAPI-complete for this pair: the RX ring drained this round,
+                    // so flush any TCP segments GRO coalesced for the frames just
+                    // delivered. Only pair/idx 0 feeds GRO (it owns the synchronous
+                    // tap into the stack), so only it needs draining. This runs on
+                    // the forwarder's own CPU — the same CPU the offers ran on — so
+                    // it drains that CPU's per-CPU coalescer. No-op when GRO is off.
+                    if idx == 0 {
+                        narf_net::tcp_stack::gro_flush();
+                    }
                     // Adapt cadence: reset to fast-poll if this round drained
                     // anything (per-queue), else step toward the slow fallback.
                     if processed_any {
