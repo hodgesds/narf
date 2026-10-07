@@ -86,12 +86,33 @@ use crate::amdgpu_discovery::{self, IpBlock};
 /// Advanced Micro Devices, Inc. (PCI Special Interest Group ID).
 pub const AMD_VENDOR: u16 = 0x1002;
 
-/// Phoenix HawkPoint1 — the user's Ryzen 7 PRO 8840HS iGPU.
+// The APU device ids below are checked against the PCI SIG id database
+// (`/usr/share/hwdata/pci.ids`, vendor 1002), not against amdgpu — modern
+// amdgpu matches APUs by IP-discovery version and carries no id table for
+// them, so a wrong constant here cannot be caught by reading the driver.
+//
+// Three of these were wrong and each sent a real machine down a path built
+// for different silicon; the comments record what they were.
+
+/// Phoenix HawkPoint1 (Ryzen 8040 series iGPU). GFX 11.0.1.
 pub const PHOENIX_HAWKPOINT1: u16 = 0x1900;
-/// Phoenix discrete sibling.
-pub const PHOENIX_DISCRETE: u16 = 0x1681;
-/// Strix Point.
-pub const STRIX_POINT: u16 = 0x15BF;
+/// Phoenix1 — **Radeon 780M**, Ryzen 7040 series. GFX 11.0.1, DCN 3.1.4.
+///
+/// Was labelled `STRIX_POINT` and mapped to the Strix firmware bundle. Strix
+/// is 0x150E; 0x15BF is Phoenix, so every 780M laptop asked the PSP for
+/// `psp_14_0_4_toc.bin` and failed firmware open before reaching DCN.
+pub const PHOENIX1: u16 = 0x15BF;
+/// Phoenix2 — the cut-down Phoenix die (Ryzen 7x40U low end). Same IP set.
+pub const PHOENIX2: u16 = 0x15C8;
+/// Strix Point (Radeon 880M / 890M). GFX **11.5.0**, DCN **3.5**,
+/// PSP 14.0.1 — a different IP stack from Phoenix, not a Phoenix variant.
+pub const STRIX_POINT: u16 = 0x150E;
+/// Rembrandt (Radeon 680M, Ryzen 6000 series). GFX **10.3.6**, DCN 3.1.2 —
+/// RDNA2, one whole architecture before Phoenix.
+///
+/// Was labelled `PHOENIX_DISCRETE` and mapped to the Phoenix family and
+/// firmware. It is neither discrete nor Phoenix.
+pub const REMBRANDT: u16 = 0x1681;
 /// Raphael.
 pub const RAPHAEL: u16 = 0x164E;
 /// Lucienne — Renoir refresh / low-cost variant (Ryzen 5000U some
@@ -314,6 +335,11 @@ impl FwEntry {
     /// SMU PMFW via MP1 mailbox (Phoenix-class). The `cmd` field
     /// here is the SMU sentinel, NOT a PSP cmd id — the dispatch
     /// loop routes accordingly.
+    // Unused while the only audited families are APUs, whose PMFW is
+    // BIOS-resident. Kept because a discrete bring-up needs it and because
+    // deleting it would invite the next table to reach for `ip_fw` instead,
+    // which loads at a different point in the PSP sequence.
+    #[allow(dead_code)]
     const fn smu_pmfw(name: &'static str) -> Self {
         Self {
             name,
@@ -338,11 +364,55 @@ impl FwEntry {
 // (gfx11+; gfx9 APU SMU lives in BIOS) → IP firmwares (SDMA →
 // CP → MES → RLC → IMU → VCN → DMCUB) → TAs.
 
-/// Phoenix / Phoenix2 / HawkPoint — GFX 11.5 + DCN 3.5 +
-/// PSP 14.0.1 + SDMA 6.1 + VCN 4.0.5 + SMU 14.0.1.
+/// Phoenix1 / Phoenix2 / HawkPoint — GFX **11.0.1**, DCN **3.1.4**,
+/// PSP **13.0.4**, SDMA 6.0.1, VCN 4.0.2.
+///
+/// Every name here is the one Linux declares for this IP set:
+/// `psp_v13_0_4.c`, `imu_v11_0.c`, `gfx_v11_0.c`, `mes_v11_0.c`,
+/// `sdma_v6_0.c`, `amdgpu_vcn.c` (`FIRMWARE_VCN4_0_2`) and
+/// `amdgpu_dm_dmub.h` (`FIRMWARE_DCN_314_DMUB`).
+///
+/// This table previously held the **Strix** bundle — GFX 11.5, DCN 3.5,
+/// PSP 14.0.1 — under a doc comment that said so. Phoenix is RDNA3 and
+/// Strix is RDNA3.5; they share no firmware file.
+///
+/// There is deliberately **no SMU entry**. Phoenix is an APU and its PMFW
+/// is BIOS-resident, loaded by the PSP — exactly as `RENOIR_FW` notes for
+/// GFX9 APUs. linux-firmware ships `smu_*.bin` only for discrete parts
+/// (13_0_0, 13_0_6, 13_0_7, 13_0_10, 13_0_14, 14_0_2, 14_0_3); neither
+/// `smu_13_0_4.bin` nor `smu_14_0_1.bin` exists anywhere, so the entry this
+/// table used to carry could never have opened.
 static PHOENIX_FW: &[FwEntry] = &[
+    FwEntry::toc("amdgpu/psp_13_0_4_toc.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_imu.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_me.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_mec.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_mes.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_mes_2.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_mes1.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_0_1.bin"),
+    FwEntry::ip_fw("amdgpu/vcn_4_0_2.bin"),
+    FwEntry::ip_fw("amdgpu/dcn_3_1_4_dmcub.bin"),
+    FwEntry::ta("amdgpu/psp_13_0_4_ta.bin"),
+];
+
+/// Strix Point — GFX **11.5.0**, DCN **3.5**, PSP **14.0.1**, SDMA 6.1.0,
+/// VCN 4.0.5. This is the bundle that used to sit in `PHOENIX_FW`.
+///
+/// No SMU entry, for the same reason Phoenix has none: Strix is an APU and
+/// `smu_14_0_1.bin` does not exist in linux-firmware.
+///
+/// Reaching this table does not mean Strix is supported — see the mapping,
+/// which routes Strix to `UNAUDITED_FW`. Its DCN 3.5 display path, SMU 14
+/// interface and GFX 11.5 differences have had no bring-up. The table is
+/// kept correct so that work starts from facts rather than from this file.
+// Unused: the mapping routes Strix to `UNAUDITED_FW` until it has a real
+// bring-up. Kept correct so that work does not start by re-deriving it.
+#[allow(dead_code)]
+static STRIX_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_14_0_1_toc.bin"),
-    FwEntry::smu_pmfw("amdgpu/smu_14_0_1.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
@@ -354,25 +424,6 @@ static PHOENIX_FW: &[FwEntry] = &[
     FwEntry::ip_fw("amdgpu/vcn_4_0_5.bin"),
     FwEntry::ip_fw("amdgpu/dcn_3_5_dmcub.bin"),
     FwEntry::ta("amdgpu/psp_14_0_1_ta.bin"),
-];
-
-/// Strix Point — GFX 11.5 same gc_11_5_0_* but with strix-suffixed
-/// PSP/SMU/DCN per Linux's `cfg/ip_versions.c`. Currently treated
-/// as Phoenix-equivalent until we have a real Strix bring-up.
-static STRIX_FW: &[FwEntry] = &[
-    FwEntry::toc("amdgpu/psp_14_0_4_toc.bin"),
-    FwEntry::smu_pmfw("amdgpu/smu_14_0_4.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_mec.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_mes_2.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_mes1.bin"),
-    FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
-    FwEntry::ip_fw("amdgpu/vcn_4_0_5.bin"),
-    FwEntry::ip_fw("amdgpu/dcn_3_5_dmcub.bin"),
-    FwEntry::ta("amdgpu/psp_14_0_4_ta.bin"),
 ];
 
 /// Renoir — GFX9, DCN 2.0, PSP 12.0. APU; SMU PMFW is BIOS-
@@ -414,17 +465,51 @@ static GREEN_SARDINE_FW: &[FwEntry] = &[
 /// the pre-multi-IP behaviour for those chips.
 static UNAUDITED_FW: &[FwEntry] = &[];
 
+/// Test hook for [`chip_info_for_pci_id`] — the id-to-firmware mapping is
+/// the one thing here that cannot be checked by reading amdgpu, so it is
+/// checked against `pci.ids` and `MODULE_FIRMWARE` by a kernel test instead.
+#[doc(hidden)]
+pub fn __test_chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
+    chip_info_for_pci_id(vid, did)
+}
+
 /// Look up family + asic + firmware name for a known PCI ID.
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     if vid != AMD_VENDOR {
         return None;
     }
     let (family, asic, fw_name, fw_list) = match did {
-        // Phoenix / HawkPoint / Strix all carry RDNA3.5 iGPU →
-        // DCN 3.5 display IP; they take the DCN 3.5 modeset path.
-        PHOENIX_HAWKPOINT1 => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
-        PHOENIX_DISCRETE => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
-        STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", STRIX_FW),
+        // Phoenix1 / Phoenix2 / HawkPoint are RDNA3: GFX 11.0.1 with
+        // **DCN 3.1.4**. The comment that used to stand here said all three
+        // of these plus Strix "carry RDNA3.5 iGPU → DCN 3.5", which is the
+        // error the firmware tables were built on. Strix is RDNA3.5; these
+        // are not, and the live display path (`amdgpu_platform::start` →
+        // DCN314) has always agreed with that.
+        PHOENIX_HAWKPOINT1 => (
+            Family::Phoenix,
+            "hawkpoint",
+            "amdgpu/phoenix.bin",
+            PHOENIX_FW,
+        ),
+        PHOENIX1 => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
+        PHOENIX2 => (
+            Family::Phoenix,
+            "phoenix2",
+            "amdgpu/phoenix.bin",
+            PHOENIX_FW,
+        ),
+        // Strix is a different IP stack (GFX 11.5 / DCN 3.5 / PSP 14.0.1)
+        // and has had no bring-up. Claiming it by handing it the Phoenix
+        // family would put DCN 3.1.4 register sequences on DCN 3.5 silicon.
+        STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", UNAUDITED_FW),
+        // Rembrandt is RDNA2 (GFX 10.3.6 / DCN 3.1.2) — not Phoenix, and
+        // not a generation this driver has any path for.
+        REMBRANDT => (
+            Family::Navi2,
+            "rembrandt",
+            "amdgpu/rembrandt.bin",
+            UNAUDITED_FW,
+        ),
         RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
         CEZANNE => (
             Family::Renoir,
@@ -1720,8 +1805,26 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     dev.vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) }.ok();
     let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
     let is_apu = matches!(dev.chip.family, Family::Renoir | Family::Phoenix);
+    // Captured before the move into CONTROLLER; both are Copy.
+    let (bound_asic, bound_family) = (dev.chip.asic, dev.chip.family);
     *PCI_AUTHORITY.lock() = Some(cap);
     *CONTROLLER.lock() = Some(dev);
+    // One identity line, before anything can fail. On a machine that gets no
+    // picture this is what says whether the driver bound at all, which ASIC
+    // table it chose, and therefore which firmware bundle it is about to ask
+    // the PSP for — the question a wrong PCI-id constant makes unanswerable.
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: bound {:04x}:{:04x} asic={} family={:?} vbios={}",
+            device.id.vendor,
+            device.id.device,
+            bound_asic,
+            bound_family,
+            vbios_version.as_deref().unwrap_or("<none>"),
+        );
+    }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("amdgpu"),
         kind: narf_drivers::BoundKind::Graphics,
@@ -1870,9 +1973,11 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
 /// listed.
 pub fn register_pci_driver() {
     let exact: &[(&'static str, u16, u16)] = &[
-        ("amdgpu-phoenix", AMD_VENDOR, PHOENIX_HAWKPOINT1),
-        ("amdgpu-phoenix-d", AMD_VENDOR, PHOENIX_DISCRETE),
+        ("amdgpu-hawkpoint", AMD_VENDOR, PHOENIX_HAWKPOINT1),
+        ("amdgpu-phoenix1", AMD_VENDOR, PHOENIX1),
+        ("amdgpu-phoenix2", AMD_VENDOR, PHOENIX2),
         ("amdgpu-strix", AMD_VENDOR, STRIX_POINT),
+        ("amdgpu-rembrandt", AMD_VENDOR, REMBRANDT),
         ("amdgpu-raphael", AMD_VENDOR, RAPHAEL),
         ("amdgpu-cezanne", AMD_VENDOR, CEZANNE),
         ("amdgpu-renoir", AMD_VENDOR, RENOIR),

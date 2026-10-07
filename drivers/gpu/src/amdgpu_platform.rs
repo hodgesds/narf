@@ -184,36 +184,91 @@ fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Er
 
 /// Build the one platform display owner without issuing hardware writes.
 /// Failure here permits retaining the pre-existing firmware attachment.
+/// Report a failed boot-handoff stage on the console.
+///
+/// `prepare` has eleven distinct early returns and `start` used to collapse
+/// every one of them into a bare `return false`, so a machine that got no
+/// native display looked identical whether the firmware blob was missing, the
+/// VBIOS was unreadable, VRAM could not be claimed or the PSP ring never came
+/// up. Several of those are a one-line fix once you know which one it is.
+///
+/// Two variants are reachable from more than one place, so the stage name
+/// carries the information the variant cannot: `Invalid` from the boot
+/// framebuffer record and from its geometry arithmetic, `Revoked` from PCI
+/// authority, the firmware registry and the TOC.
+fn stage_failed<T>(stage: &str, result: Result<T, Error>) -> Result<T, Error> {
+    if let Err(error) = &result {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: boot handoff refused at {stage}: {error:?}"
+        );
+    }
+    result
+}
+
 pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
-    let boot = BOOT_FB.lock().ok_or(Error::Invalid)?;
+    let boot = stage_failed(
+        "boot-framebuffer-record",
+        BOOT_FB.lock().ok_or(Error::Invalid),
+    )?;
     let size = (boot.pitch as u64)
         .checked_mul(boot.height as u64)
         .filter(|n| *n != 0)
         .ok_or(Error::Invalid)?;
-    let boot_range = boot.addr..boot.addr.checked_add(size).ok_or(Error::Invalid)?;
-    let cap = crate::amdgpu::pci_authority().ok_or(Error::Revoked)?;
-    let fw_cap: Cap<narf_firmware::FirmwareRegistry, Read> =
+    let boot_range = stage_failed(
+        "boot-framebuffer-geometry",
+        boot.addr
+            .checked_add(size)
+            .map(|end| boot.addr..end)
+            .ok_or(Error::Invalid),
+    )?;
+    let cap = stage_failed(
+        "pci-authority",
+        crate::amdgpu::pci_authority().ok_or(Error::Revoked),
+    )?;
+    let fw_cap: Cap<narf_firmware::FirmwareRegistry, Read> = stage_failed(
+        "firmware-registry",
         narf_firmware::trusted_loader_authority()
-            .ok_or(Error::Revoked)?
-            .derive()
-            .map_err(|_| Error::Revoked)?;
-    let toc = fw_cap.invoke(OpenToc).map_err(|_| Error::Revoked)??;
+            .ok_or(Error::Revoked)
+            .and_then(|a| a.derive().map_err(|_| Error::Revoked)),
+    )?;
+    let toc = stage_failed(
+        "psp-toc-open",
+        fw_cap.invoke(OpenToc).map_err(|_| Error::Revoked)?,
+    )?;
     crate::amdgpu::with_controller(|gpu| {
-        let firmware = Firmware::open(gpu, &fw_cap).map_err(Error::Firmware)?;
-        let clients = inventory(gpu, &cap)?;
+        let firmware = stage_failed(
+            "firmware-open",
+            Firmware::open(gpu, &fw_cap).map_err(Error::Firmware),
+        )?;
+        let clients = stage_failed("display-inventory", inventory(gpu, &cap))?;
         // SAFETY: sole boot owner, no NARF clients have initialized; VM clients
         // are rejected and all live supported scanouts/cursors inventoried.
         let plan = unsafe { crate::amdgpu_vram_boot::Plan::read(gpu, &cap, boot_range, &clients) }
-            .map_err(Error::Memory)?;
+            .map_err(Error::Memory);
+        let plan = stage_failed("vram-boot-plan", plan)?;
         // SAFETY: boot handoff owns the free VRAM; all subsequent display
         // clients share this pool. Firmware and boot surfaces remain excluded.
-        let pool = Arc::new(unsafe { plan.into_pool() }.map_err(Error::Memory)?);
+        let pool = Arc::new(stage_failed(
+            "vram-pool",
+            unsafe { plan.into_pool() }.map_err(Error::Memory),
+        )?);
         // SAFETY: exact GPU, authenticated containers, lifetime mappings and
         // exclusive PSP/DMUB ownership are retained by the loader and pool.
-        let loader = unsafe { Loader::new_psp(gpu, cap, &pool, &firmware, &toc) }?;
+        let loader = stage_failed("psp-loader", unsafe {
+            Loader::new_psp(gpu, cap, &pool, &firmware, &toc)
+        })?;
         Ok((loader, pool))
     })
-    .ok_or(Error::Unsupported)?
+    .ok_or(Error::Unsupported)
+    .inspect_err(|_| {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: boot handoff refused: no AMD controller bound"
+        );
+    })?
 }
 
 /// A hub pixel pipe is free when it is blanked and its timing generator is
@@ -386,14 +441,30 @@ struct Display {
 static DISPLAY: narf_lib::mutex::Mutex<Option<Display>> = narf_lib::mutex::Mutex::new(None);
 
 pub(crate) fn start() -> bool {
+    // Every `false` below means "the native path did not take"; the caller
+    // then falls back to attaching to running DAL firmware, which leaves the
+    // panel on the UEFI framebuffer. That fallback used to be silent and
+    // indistinguishable from success on a machine whose boot framebuffer
+    // already shows the right thing.
     let (loader, pool) = match prepare() {
         Ok(prepared) => prepared,
+        // `prepare` has already named the stage.
         Err(_) => return false,
     };
     let Some(mut owner) = DISPLAY.try_lock() else {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: display owner lock held; native bring-up skipped"
+        );
         return false;
     };
     if owner.is_some() {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: display owner already claimed; native bring-up skipped"
+        );
         return false;
     }
     *owner = Some(Display {

@@ -166,8 +166,10 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
     let regs = registered_pci_drivers();
     let want: &[(u16, u16)] = &[
         (amdgpu::AMD_VENDOR, amdgpu::PHOENIX_HAWKPOINT1),
-        (amdgpu::AMD_VENDOR, amdgpu::PHOENIX_DISCRETE),
+        (amdgpu::AMD_VENDOR, amdgpu::PHOENIX1),
+        (amdgpu::AMD_VENDOR, amdgpu::PHOENIX2),
         (amdgpu::AMD_VENDOR, amdgpu::STRIX_POINT),
+        (amdgpu::AMD_VENDOR, amdgpu::REMBRANDT),
         (amdgpu::AMD_VENDOR, amdgpu::RAPHAEL),
         (amdgpu::AMD_VENDOR, amdgpu::CEZANNE),
         (amdgpu::AMD_VENDOR, amdgpu::RENOIR),
@@ -6645,3 +6647,92 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_discovery_resolves_load_bearing_blocks
 );
+
+/// The Phoenix PCI ids and firmware bundle, against the two sources of truth
+/// that can actually settle them.
+///
+/// Device ids come from the PCI SIG database (`pci.ids`, vendor 1002) because
+/// modern amdgpu matches APUs by IP-discovery version and carries no id table
+/// for them — so a wrong constant cannot be caught by reading the driver, only
+/// by booting the machine it is wrong about. Firmware names come from the
+/// `MODULE_FIRMWARE` declarations of the IP modules Linux binds for GFX 11.0.1.
+///
+/// Three constants were wrong before this test existed:
+///   * `0x15BF` was labelled Strix Point. It is Phoenix1 — the Radeon 780M —
+///     so every 780M asked the PSP for Strix firmware.
+///   * `0x1681` was labelled a "Phoenix discrete sibling". It is Rembrandt,
+///     RDNA2 (GFX 10.3.6), an architecture earlier.
+///   * `PHOENIX_FW` held the Strix bundle outright (GFX 11.5, DCN 3.5,
+///     PSP 14.0.1), under a doc comment that said so.
+fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
+    use crate::amdgpu;
+    // pci.ids, vendor 1002.
+    if amdgpu::PHOENIX1 != 0x15BF || amdgpu::PHOENIX2 != 0x15C8 {
+        return TestResult::Fail("Phoenix1/Phoenix2 device ids disagree with pci.ids");
+    }
+    if amdgpu::STRIX_POINT != 0x150E {
+        return TestResult::Fail("Strix Point is 0x150E, not a Phoenix id");
+    }
+    if amdgpu::REMBRANDT != 0x1681 {
+        return TestResult::Fail("Rembrandt is 0x1681");
+    }
+    if amdgpu::PHOENIX_HAWKPOINT1 != 0x1900 {
+        return TestResult::Fail("HawkPoint1 is 0x1900");
+    }
+
+    // The 780M must resolve to the Phoenix family and the Phoenix bundle.
+    let Some(info) = amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, amdgpu::PHOENIX1)
+    else {
+        return TestResult::Fail("the Radeon 780M's device id resolves to no chip");
+    };
+    if info.family != amdgpu::Family::Phoenix {
+        return TestResult::Fail("the 780M should resolve to Family::Phoenix");
+    }
+
+    // `MODULE_FIRMWARE` for the IP modules Linux binds at GFX 11.0.1.
+    let want: &[&str] = &[
+        "amdgpu/psp_13_0_4_toc.bin",
+        "amdgpu/gc_11_0_1_imu.bin",
+        "amdgpu/gc_11_0_1_pfp.bin",
+        "amdgpu/gc_11_0_1_me.bin",
+        "amdgpu/gc_11_0_1_mec.bin",
+        "amdgpu/gc_11_0_1_rlc.bin",
+        "amdgpu/gc_11_0_1_mes.bin",
+        "amdgpu/gc_11_0_1_mes_2.bin",
+        "amdgpu/gc_11_0_1_mes1.bin",
+        "amdgpu/sdma_6_0_1.bin",
+        "amdgpu/vcn_4_0_2.bin",
+        "amdgpu/dcn_3_1_4_dmcub.bin",
+        "amdgpu/psp_13_0_4_ta.bin",
+    ];
+    if info.fw_list.len() != want.len() {
+        return TestResult::Fail("the Phoenix firmware bundle changed size");
+    }
+    for (entry, expected) in info.fw_list.iter().zip(want) {
+        if entry.name != *expected {
+            return TestResult::Fail("a Phoenix firmware blob name is not Linux's");
+        }
+    }
+
+    // No SMU blob: Phoenix is an APU whose PMFW is BIOS-resident, and
+    // linux-firmware ships `smu_*.bin` for discrete parts only. The entry
+    // this table used to carry named a file that exists nowhere.
+    if info
+        .fw_list
+        .iter()
+        .any(|e| e.cmd == amdgpu::SMU_LOAD_PMFW_MP1)
+    {
+        return TestResult::Fail("an APU bundle must not carry an SMU PMFW blob");
+    }
+
+    // Silicon with no bring-up must not borrow another family's firmware.
+    for did in [amdgpu::STRIX_POINT, amdgpu::REMBRANDT] {
+        match amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, did) {
+            Some(info) if info.fw_list.is_empty() => {}
+            Some(_) => return TestResult::Fail("unaudited silicon was given a firmware bundle"),
+            None => return TestResult::Fail("an id in the match table resolves to no chip"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_phoenix_identity_matches_linux);
