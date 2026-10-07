@@ -413,6 +413,10 @@ impl FileOps for DriCardFile {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }
+            match crate::amdgpu_cs::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_ctx) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
             match crate::amdgpu_ctx::dispatch(
                 cmd,
                 arg,
@@ -881,6 +885,10 @@ impl FileOps for DriRenderFile {
                 result => return result,
             }
             match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_cs::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_ctx) {
                 Err(FsError::Unsupported) => {}
                 result => return result,
             }

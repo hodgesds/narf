@@ -8431,3 +8431,276 @@ kernel_test_in!(
     "drivers/gpu/amdgpu_vm",
     smoke_amdgpu_vm_activate_programs_both_hubs
 );
+
+/// `AMDGPU_CS`'s parser against the input a hostile client would send.
+///
+/// The IB's CONTENTS are not validated — not here and not in Linux, where
+/// `parse_cs` is NULL for GFX11 — because the command processor executes an
+/// IB through the submitting client's own page tables, and those are the
+/// boundary. What this file must get right is narrower: it follows
+/// user-controlled pointers three levels deep, with two user-controlled counts
+/// bounding them, and it decides whether an address the client named is one it
+/// actually owns.
+fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
+    use crate::amdgpu_cs::{parse, Ib};
+    use crate::amdgpu_ctx::{dispatch as ctx_dispatch, CtxState};
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState, GPU_PAGE_SIZE};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let ctx = CtxState::new();
+
+    // A context to submit against.
+    let mut ctx_req = [0u8; 24];
+    ctx_req[0..4].copy_from_slice(&u::AMDGPU_CTX_OP_ALLOC_CTX.to_le_bytes());
+    if ctx_dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX,
+        ctx_req.as_mut_ptr() as usize,
+        &ctx,
+        false,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: context alloc failed");
+    }
+    let ctx_id = u32::from_le_bytes(ctx_req[0..4].try_into().unwrap());
+
+    // A 2-page buffer mapped read/write at a known GPU address.
+    const IB_VA: u64 = 0x2_0000_0000;
+    const MAPPED: u64 = 2 * GPU_PAGE_SIZE;
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&MAPPED.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let do_map = |flags: u32, va: u64, size: u64| {
+        let mut m = [0u8; 40];
+        m[0..4].copy_from_slice(&handle.to_le_bytes());
+        m[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+        m[12..16].copy_from_slice(&flags.to_le_bytes());
+        m[16..24].copy_from_slice(&va.to_le_bytes());
+        m[32..40].copy_from_slice(&size.to_le_bytes());
+        vm::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+            m.as_mut_ptr() as usize,
+            &state,
+            &gem,
+        )
+    };
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    if do_map(RW, IB_VA, MAPPED).is_err() {
+        return TestResult::Fail("setup: MAP failed");
+    }
+
+    // Build a chunk array: one IB chunk describing `ib_bytes` at `va`.
+    // The layout is the real one — an array of pointers to chunk headers,
+    // each pointing at its own body.
+    struct Req {
+        body: [u32; 8],
+        header: [u32; 4],
+        pointers: [u64; 1],
+    }
+    let build = |va: u64, ib_bytes: u32, ip_type: u32, flags: u32| -> alloc::boxed::Box<Req> {
+        let mut r = alloc::boxed::Box::new(Req {
+            body: [0; 8],
+            header: [0; 4],
+            pointers: [0; 1],
+        });
+        r.body[1] = flags;
+        r.body[2] = va as u32;
+        r.body[3] = (va >> 32) as u32;
+        r.body[4] = ib_bytes;
+        r.body[5] = ip_type;
+        let body_ptr = r.body.as_ptr() as u64;
+        r.header[0] = u::AMDGPU_CHUNK_ID_IB;
+        r.header[1] = 8; // length_dw
+        r.header[2] = body_ptr as u32;
+        r.header[3] = (body_ptr >> 32) as u32;
+        r.pointers[0] = r.header.as_ptr() as u64;
+        r
+    };
+    let run = |r: &Req| parse(ctx_id, 1, r.pointers.as_ptr() as u64, &state, &ctx);
+
+    // ── the happy path ──
+    let good = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    match run(&good) {
+        Ok(s) if s.ctx_id == ctx_id && s.ibs.len() == 1 => {
+            let want = Ib {
+                va_start: IB_VA,
+                length_dw: 64,
+                ip_type: u::AMDGPU_HW_IP_GFX,
+                ip_instance: 0,
+                ring: 0,
+                flags: 0,
+            };
+            if s.ibs[0] != want {
+                return TestResult::Fail("a valid IB did not parse to its fields");
+            }
+        }
+        _ => return TestResult::Fail("a well-formed submission was refused"),
+    }
+
+    // ── the address checks, which are the point ──
+    // An IB at an address the client never mapped.
+    if run(&build(IB_VA + 0x1000_0000, 256, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB at an unmapped address was accepted");
+    }
+    // An IB that STARTS inside the mapping and runs past its end. This is the
+    // one a naive check misses: the start address is perfectly valid.
+    if run(&build(IB_VA + MAPPED - 64, 256, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB running past the end of its mapping was accepted");
+    }
+    // Exactly reaching the end is fine — an off-by-one here would reject
+    // legitimate work.
+    if run(&build(IB_VA + MAPPED - 256, 256, u::AMDGPU_HW_IP_GFX, 0)).is_err() {
+        return TestResult::Fail("an IB ending exactly at the mapping's end was refused");
+    }
+    // An address that overflows when the length is added.
+    if run(&build(u64::MAX - 16, 256, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB whose end overflows was accepted");
+    }
+    // A write-only mapping cannot be fetched from: the fetch itself faults.
+    const WO: u32 = u::AMDGPU_VM_PAGE_WRITEABLE;
+    if do_map(WO, IB_VA + 0x1000_0000, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("setup: write-only MAP failed");
+    }
+    if !matches!(
+        run(&build(IB_VA + 0x1000_0000, 64, u::AMDGPU_HW_IP_GFX, 0)),
+        Err(FsError::PermissionDenied)
+    ) {
+        return TestResult::Fail("an IB in an unreadable mapping should be EACCES");
+    }
+
+    // ── the field checks ──
+    if run(&build(IB_VA, 0, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("a zero-length IB names no work and must be refused");
+    }
+    if run(&build(IB_VA, 255, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB that is not a whole number of dwords must be refused");
+    }
+    if run(&build(IB_VA, 0xFFFF_FFFC, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB beyond the packet-size maximum must be refused");
+    }
+    if run(&build(IB_VA + 2, 256, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("a misaligned IB address must be refused");
+    }
+    // An engine this driver has no ring for.
+    if run(&build(IB_VA, 256, u::AMDGPU_HW_IP_VCE, 0)).is_ok() {
+        return TestResult::Fail("an IB for an absent engine must be refused");
+    }
+    // The constant engine is blocked on modern amdgpu behind a debug knob,
+    // and there is no knob here.
+    if run(&build(
+        IB_VA,
+        256,
+        u::AMDGPU_HW_IP_GFX,
+        u::AMDGPU_IB_FLAG_CE,
+    ))
+    .is_ok()
+    {
+        return TestResult::Fail("a CE submission must be refused");
+    }
+    if run(&build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 1 << 20)).is_ok() {
+        return TestResult::Fail("an undefined IB flag must be refused");
+    }
+
+    // ── the pointer walk ──
+    let g = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    // A null chunk array.
+    if !matches!(parse(ctx_id, 1, 0, &state, &ctx), Err(FsError::BadAddress)) {
+        return TestResult::Fail("a null chunk array should be EFAULT");
+    }
+    // A null pointer INSIDE the array — the second level.
+    let mut null_inner = [0u64; 1];
+    if !matches!(
+        parse(ctx_id, 1, null_inner.as_mut_ptr() as u64, &state, &ctx),
+        Err(FsError::BadAddress)
+    ) {
+        return TestResult::Fail("a null chunk pointer should be EFAULT");
+    }
+    // A chunk count the client inflated. Unbounded, this sizes a read.
+    if parse(ctx_id, 100_000, g.pointers.as_ptr() as u64, &state, &ctx).is_ok() {
+        return TestResult::Fail("an absurd chunk count must be refused");
+    }
+    if parse(ctx_id, 0, g.pointers.as_ptr() as u64, &state, &ctx).is_ok() {
+        return TestResult::Fail("a submission with no chunks must be refused");
+    }
+    // A `length_dw` the client inflated, which sizes the third read.
+    //
+    // Two values, deliberately. 0xFFFF_FFFF is rejected by `copy_in`'s own
+    // 1 MiB cap whatever this parser does — so on its own it proves nothing
+    // about the parser's bound, which a mutation test showed: removing that
+    // bound left this case still passing. 1000 dwords is 4 KiB, comfortably
+    // inside `copy_in`'s cap, so only the parser's own limit refuses it.
+    let mut inflated = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    inflated.header[1] = 0xFFFF_FFFF;
+    if run(&inflated).is_ok() {
+        return TestResult::Fail("an absurd chunk length must be refused");
+    }
+    let mut over_bound = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    over_bound.header[1] = 1000;
+    if run(&over_bound).is_ok() {
+        return TestResult::Fail("a chunk length past the parser's own bound must be refused");
+    }
+    // A chunk shorter than the IB struct it claims to be.
+    let mut short = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    short.header[1] = 4;
+    if run(&short).is_ok() {
+        return TestResult::Fail("a chunk shorter than drm_amdgpu_cs_chunk_ib must be refused");
+    }
+
+    // ── chunks that are refused rather than ignored ──
+    // A dropped ordering constraint is a race, not an error.
+    for id in [
+        u::AMDGPU_CHUNK_ID_DEPENDENCIES,
+        u::AMDGPU_CHUNK_ID_SYNCOBJ_IN,
+        u::AMDGPU_CHUNK_ID_SYNCOBJ_OUT,
+        u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT,
+        u::AMDGPU_CHUNK_ID_FENCE,
+        u::AMDGPU_CHUNK_ID_BO_HANDLES,
+    ] {
+        let mut other = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+        other.header[0] = id;
+        if !matches!(run(&other), Err(FsError::Unsupported)) {
+            return TestResult::Fail("a synchronisation chunk must be refused, never ignored");
+        }
+    }
+    // An unknown chunk id.
+    let mut unknown = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    unknown.header[0] = 0xDEAD;
+    if !matches!(run(&unknown), Err(FsError::InvalidData)) {
+        return TestResult::Fail("an unknown chunk id must be EINVAL");
+    }
+
+    // ── the context ──
+    if parse(ctx_id + 999, 1, g.pointers.as_ptr() as u64, &state, &ctx).is_ok() {
+        return TestResult::Fail("a submission naming no context must be refused");
+    }
+    // Contexts are per-open, so another open's table does not resolve this id.
+    let other_ctx = CtxState::new();
+    if parse(ctx_id, 1, g.pointers.as_ptr() as u64, &state, &other_ctx).is_ok() {
+        return TestResult::Fail("a context id must not resolve in another open's table");
+    }
+
+    let _ = &mut null_inner;
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_cs",
+    smoke_amdgpu_cs_parser_rejects_hostile_input
+);
