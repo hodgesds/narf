@@ -148,6 +148,8 @@ pub(crate) fn load_file_demand_page(
 /// Read `len` bytes of an fd starting at `offset` into a fresh buffer,
 /// zero-padding past EOF (the BSS tail of a file-backed segment).
 pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
+    const PROT_READ: u32 = 0x1;
+    const PROT_EXEC: u32 = 0x4;
     let args = *ctx.args();
     let hint = args.arg0;
     // Standard 6-arg mmap ABI: arg2 prot, arg3 flags, arg4 fd, arg5 offset.
@@ -283,9 +285,14 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     };
 
+    // Whether the backing object would allow an execute mapping at all —
+    // NARF's `path_noexec` (see the READ_IMPLIES_EXEC block below). Anonymous
+    // memory always would.
+    let mut file_allows_exec = true;
     if !anonymous {
         let ops = fd::with_table(current_task_id(), |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
         if let Some(ops) = ops {
+            file_allows_exec = ops.mmap_max_prot(offset) & PROT_EXEC != 0;
             match ops.validate_mmap(offset, len as usize, prot, flags) {
                 Ok(adjusted) => {
                     if adjusted & 7 & !ops.mmap_max_prot(offset) != 0 {
@@ -402,6 +409,30 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
         ctx.set_return(errno_ret(EINVAL));
         return;
+    }
+
+    // `mm/mmap.c::do_mmap`:
+    //
+    // ```text
+    // /*
+    //  * Does the application expect PROT_READ to imply PROT_EXEC?
+    //  *
+    //  * (the exception is when the underlying filesystem is noexec
+    //  *  mounted, in which case we don't add PROT_EXEC.)
+    //  */
+    // if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+    //         if (!(file && path_noexec(&file->f_path)))
+    //                 prot |= PROT_EXEC;
+    // ```
+    //
+    // The personality flag was stored nowhere and consulted nowhere, so a
+    // task that asked for it got W^X-style protections anyway — and the
+    // ancient toolchains that need it (a missing PT_GNU_STACK, trampolines on
+    // the stack) fault instead of running. The noexec exception is kept: it is
+    // what stops this flag from turning every readable mapping of a
+    // non-executable object into an EACCES.
+    if prot & PROT_READ != 0 && current_personality() & READ_IMPLIES_EXEC != 0 && file_allows_exec {
+        prot |= PROT_EXEC;
     }
 
     let pages = (len >> 12) as usize;

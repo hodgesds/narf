@@ -80,6 +80,103 @@ fn task_map_fork<V: Clone>(table: &TaskMapTable<V>, parent: u64, child: u64) {
 static CWD_TABLE: TaskMapTable<alloc::string::String> =
     [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
 
+// ── personality(2) — the per-task execution domain ───────────────────
+//
+// `current->personality` (`include/uapi/linux/personality.h`). NARF
+// implements only the PER_LINUX domain, but the FLAG half of the word is not
+// about emulating another Unix: `ADDR_NO_RANDOMIZE` and `READ_IMPLIES_EXEC`
+// change how this kernel lays out and protects memory, and both are things
+// NARF can honour.
+
+/// `ADDR_NO_RANDOMIZE` — lay the address space out without randomisation.
+/// What `setarch -R` / `setarch --addr-no-randomize` sets, and what a
+/// debugger or a crash-reproduction harness needs.
+pub(crate) const ADDR_NO_RANDOMIZE: u32 = 0x0004_0000;
+/// `READ_IMPLIES_EXEC` — a readable mapping is also executable.
+pub(crate) const READ_IMPLIES_EXEC: u32 = 0x0040_0000;
+static PERSONALITY_TABLE: TaskMapTable<u32> = [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
+
+/// `current->personality`. Absent means PER_LINUX with no flags, which is
+/// every task until one asks for something else.
+pub(crate) fn read_personality(task: u64) -> u32 {
+    task_map_get(&PERSONALITY_TABLE, task).unwrap_or(0)
+}
+
+/// Install `persona` on `task` (`kernel/exec_domain.c::set_personality`,
+/// which assigns the whole word — there is no per-bit validation, and an
+/// unknown domain in the low byte is simply remembered).
+pub(crate) fn write_personality(task: u64, persona: u32) {
+    task_map_set(&PERSONALITY_TABLE, task, persona);
+}
+
+/// The calling task's personality.
+pub(crate) fn current_personality() -> u32 {
+    read_personality(current_task_id())
+}
+
+/// Should this task's address space be randomised?
+///
+/// Linux folds the two questions together in `load_elf_binary`:
+///
+/// ```text
+/// if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+///         current->flags |= PF_RANDOMIZE;
+/// ```
+///
+/// — the global `randomize_va_space` sysctl AND the per-task opt-out, which
+/// is why `setarch -R` works on a kernel with ASLR on. NARF had only the
+/// global half ([`narf_memory::kaslr::user_aslr_enabled`]), so a task that
+/// asked for a fixed layout was randomised anyway and `personality(2)`
+/// reported success for it.
+pub(crate) fn randomize_user_layout() -> bool {
+    narf_memory::kaslr::user_aslr_enabled() && current_personality() & ADDR_NO_RANDOMIZE == 0
+}
+
+/// `arch/x86/kernel/process_64.c::set_personality_64bit`, the SET_PERSONALITY
+/// an x86_64 ELF exec runs:
+///
+/// ```text
+/// current->personality &= ~READ_IMPLIES_EXEC;
+/// ```
+///
+/// Everything else — ADDR_NO_RANDOMIZE above all — survives `execve`, which
+/// is the whole reason `setarch -R prog` affects `prog` rather than the
+/// `setarch` process that exits immediately after.
+///
+/// (`elf_read_implies_exec` can put the bit BACK for a binary with an
+/// executable stack, but on x86_64 it is `mmap_is_ia32() && ...` — false for
+/// every 64-bit image, so a 64-bit exec always clears it.)
+pub(crate) fn personality_exec(task: u64) {
+    let persona = read_personality(task);
+    if persona & READ_IMPLIES_EXEC != 0 {
+        write_personality(task, persona & !READ_IMPLIES_EXEC);
+    }
+}
+
+/// `fork(2)` inheritance: the child gets the parent's personality, as it
+/// gets the whole `task_struct` it was copied from.
+pub fn personality_fork(parent: u64, child: u64) {
+    task_map_fork(&PERSONALITY_TABLE, parent, child);
+}
+
+/// Initialise the per-task personality registry.
+pub fn personality_init() {
+    task_map_init(&PERSONALITY_TABLE);
+}
+
+/// Reset the registry — test hook.
+#[doc(hidden)]
+pub fn __test_personality_reset() {
+    task_map_init(&PERSONALITY_TABLE);
+}
+
+/// `/proc/<pid>/personality` — the hex word, as `proc_pid_personality` prints
+/// it. Takes a Linux PID, not a TaskId: this is the procfs hook.
+pub fn personality_of_pid(pid: u64) -> u32 {
+    read_personality(proc_pid_to_tid(pid))
+}
+
+
 /// Initialise the per-task cwd registry. Boot calls this once
 /// before any user task can issue `Syscall::Chdir` / `Getcwd`.
 pub fn cwd_init() {
@@ -2510,6 +2607,10 @@ fn do_execve_resolved(
     // that handles SIGCHLD; without this the next SIGCHLD branches to the stale
     // handler vaddr in the new image and crashes.) Mask + pending are kept.
     sigaction_exec_reset(task);
+    // `SET_PERSONALITY` on the new image: x86_64's clears READ_IMPLIES_EXEC
+    // and keeps everything else, so ADDR_NO_RANDOMIZE survives the exec it
+    // was set for (`setarch -R prog`).
+    personality_exec(task);
     // The alternate signal stack, robust-list head, and clear_child_tid
     // uaddr all point into the OLD image's address space — Linux clears
     // all three on exec. A surviving sigaltstack sp would have the next

@@ -350,7 +350,12 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
         PidExtField::Mountinfo => render_mountinfo(pid).into_bytes(),
         PidExtField::Mountstats => render_mountstats(pid).into_bytes(),
         PidExtField::Mounts => render_mounts(pid).into_bytes(),
-        PidExtField::Personality => b"00000000\n".to_vec(),
+        // `fs/proc/base.c::proc_pid_personality` — `seq_printf("%08x\n",
+        // task->personality)`. The constant zero here reported PER_LINUX with
+        // no flags for every task, including one that had just set
+        // ADDR_NO_RANDOMIZE, so `setarch -R` and anything reading this file
+        // back (debuggers, reproducer harnesses) could not see the request.
+        PidExtField::Personality => format!("{:08x}\n", super::hook_personality(pid)).into_bytes(),
         PidExtField::Loginuid => {
             // Linux emits the raw uid, or the u32 sentinel (4294967295) when
             // unset. NARF stores per-pid; default = unset.

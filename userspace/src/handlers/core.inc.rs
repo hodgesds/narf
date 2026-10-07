@@ -910,6 +910,7 @@ pub fn init_per_task_state() {
     // while it seeds stdio into tables whose tasks do not exist yet.
     crate::fd::install_nofile_limit_lookup(task_nofile_limit);
     cwd_init();
+    personality_init();
     sigaction_init();
     signal_init();
     uidgid_init();
@@ -11928,6 +11929,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
 
     if !share_fs {
         cwd_fork(parent_pid, child_tid.raw());
+        personality_fork(parent_pid, child_tid.raw());
     }
     // chroot: a child inherits the parent's root directory (Linux copies
     // fs->root on fork). Without this, a process exec'd inside a chroot
@@ -14316,6 +14318,7 @@ fn release_task_tables(tid: u64) {
 
     // Filesystem view.
     task_map_remove(&CWD_TABLE, tid);
+    task_map_remove(&PERSONALITY_TABLE, tid);
     remove_root_dir(tid);
     remove_mount_namespace(tid);
     crate::mqueue::release_task_fd_paths(tid);

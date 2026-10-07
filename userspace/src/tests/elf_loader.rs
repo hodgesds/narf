@@ -570,6 +570,58 @@ fn aslr_test_dyn_image() -> alloc::vec::Vec<u8> {
     b
 }
 
+/// `personality(ADDR_NO_RANDOMIZE)` pins this task's layout with the system
+/// ASLR switch left ON — the per-task half of
+///
+/// ```text
+/// if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+///         current->flags |= PF_RANDOMIZE;
+/// ```
+///
+/// which is what `setarch -R prog` relies on. NARF had only the global half,
+/// so the flag was stored (and, before that, not even stored) and the image
+/// was randomised anyway.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_addr_no_randomize_pins_layout() -> TestResult {
+    use crate::loader::PROGRAM_DYN_BASE;
+    use crate::{load_user_process_with, DEFAULT_USER_STACK_TOP};
+
+    // The global switch stays ON: this test is about the per-task opt-out, and
+    // pinning it off here would prove nothing.
+    if !narf_memory::kaslr::user_aslr_enabled() {
+        return TestResult::Fail("user ASLR should be on by default");
+    }
+    let task = crate::handlers::current_task_id();
+    let saved = crate::handlers::read_personality(task);
+    crate::handlers::write_personality(task, crate::handlers::ADDR_NO_RANDOMIZE);
+    let bytes = aslr_test_dyn_image();
+
+    let mut verdict = TestResult::Pass;
+    for _ in 0..3 {
+        // SAFETY: harness keeps the low 4 GiB identity-mapped and the frame
+        // allocator initialised, satisfying the loader's `# Safety` contract.
+        let proc = match unsafe { load_user_process_with(&bytes, &["x"], &[], &[]) } {
+            Ok(p) => p,
+            Err(_) => {
+                verdict = TestResult::Fail("load_user_process_with failed");
+                break;
+            }
+        };
+        if proc.program_bias != PROGRAM_DYN_BASE {
+            verdict = TestResult::Fail("ADDR_NO_RANDOMIZE: ET_DYN base should be the nominal base");
+            break;
+        }
+        if proc.address_space.stack_top() != DEFAULT_USER_STACK_TOP {
+            verdict = TestResult::Fail("ADDR_NO_RANDOMIZE: stack top should be the nominal top");
+            break;
+        }
+    }
+    crate::handlers::write_personality(task, saved);
+    verdict
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_addr_no_randomize_pins_layout);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_aslr_pinned_off_is_canonical() -> TestResult {
     // The control for the randomisation test below: with user ASLR pinned

@@ -2078,3 +2078,79 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_mem_mprotect_jit_flip_spans_split_regions
 );
+
+// ── personality(READ_IMPLIES_EXEC) ───────────────────────────────────
+//
+// `mm/mmap.c::do_mmap`:
+//
+//   if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
+//           if (!(file && path_noexec(&file->f_path)))
+//                   prot |= PROT_EXEC;
+//
+// and the same two lines without the file exception in
+// `mm/mprotect.c::do_mprotect_pkey`. The personality word was stored nowhere
+// before, so neither fired: a task that asked for READ_IMPLIES_EXEC got
+// non-executable readable mappings and faulted on the trampolines it asked
+// to be allowed to run.
+fn smoke_abi_mem_personality_read_implies_exec() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|as_ref| {
+            const PROT_READ: u64 = 0x1;
+            const MAP_PRIVATE: u64 = 0x02;
+            const MAP_ANONYMOUS: u64 = 0x20;
+            const READ_IMPLIES_EXEC: u64 = 0x0040_0000;
+            const LEN: u64 = 0x1000;
+
+            let exec_at = |base: u64| {
+                as_ref
+                    .regions_snapshot()
+                    .into_iter()
+                    .find(|region| region.base.as_u64() == base)
+                    .is_some_and(|region| region.perms.contains(RegionPerms::EXEC))
+            };
+            let map = |prot: u64| -> Option<u64> {
+                match call(
+                    Syscall::Mmap.raw(),
+                    SyscallArgs {
+                        arg0: 0,
+                        arg1: LEN,
+                        arg2: prot,
+                        arg3: MAP_PRIVATE | MAP_ANONYMOUS,
+                        arg4: (-1i64) as u64,
+                        arg5: 0,
+                    },
+                ) {
+                    Some(v) if v > 0 => Some(v as u64),
+                    _ => None,
+                }
+            };
+
+            crate::handlers::__test_personality_reset();
+            // Control: a readable mapping is not executable by default.
+            let Some(plain) = map(PROT_READ) else {
+                return Err("anonymous PROT_READ mmap failed");
+            };
+            if exec_at(plain) {
+                return Err("a PROT_READ mapping is executable without READ_IMPLIES_EXEC");
+            }
+
+            if call(Syscall::Personality.raw(), a0(READ_IMPLIES_EXEC)) != Some(0) {
+                return Err("personality(READ_IMPLIES_EXEC) should return the previous word");
+            }
+            let implied = match map(PROT_READ) {
+                Some(base) if exec_at(base) => Ok(()),
+                Some(_) => Err("READ_IMPLIES_EXEC did not make a new readable mapping executable"),
+                None => Err("anonymous PROT_READ mmap failed under READ_IMPLIES_EXEC"),
+            };
+            // mprotect applies it too — no file, so no noexec exception.
+            let reprotected = match call(Syscall::MProtect.raw(), a2(plain, LEN, PROT_READ)) {
+                Some(0) if exec_at(plain) => Ok(()),
+                Some(0) => Err("mprotect(PROT_READ) under READ_IMPLIES_EXEC did not add PROT_EXEC"),
+                _ => Err("mprotect(PROT_READ) failed"),
+            };
+            crate::handlers::__test_personality_reset();
+            implied.and(reprotected)
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_personality_read_implies_exec);

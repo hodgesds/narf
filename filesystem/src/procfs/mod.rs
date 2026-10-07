@@ -536,6 +536,7 @@ type FdListFn = fn(u64) -> Vec<u32>;
 type FdPidfdPidFn = fn(u64, u32) -> Option<u64>;
 type RlimitsFn = fn(u64) -> [(u64, u64); 16];
 type NiceFn = fn(u64) -> i32;
+type PersonalityFn = fn(u64) -> u32;
 type EnvironFn = fn(u64) -> Vec<u8>;
 type AuxvFn = fn(u64) -> Vec<u8>;
 type SetCommFn = fn(u64, &str) -> Result<(), FsError>;
@@ -647,6 +648,7 @@ static FD_LIST_HOOK: AtomicUsize = AtomicUsize::new(0);
 static FD_PIDFD_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
 static RLIMITS_HOOK: AtomicUsize = AtomicUsize::new(0);
 static NICE_HOOK: AtomicUsize = AtomicUsize::new(0);
+static PERSONALITY_HOOK: AtomicUsize = AtomicUsize::new(0);
 static ENVIRON_HOOK: AtomicUsize = AtomicUsize::new(0);
 static AUXV_HOOK: AtomicUsize = AtomicUsize::new(0);
 static SET_COMM_HOOK: AtomicUsize = AtomicUsize::new(0);
@@ -1017,6 +1019,25 @@ pub(crate) fn hook_rlimits(pid: u64) -> [(u64, u64); 16] {
     // SAFETY: v was stored by install_proc_ext_hooks as a RlimitsFn fn-pointer; non-zero confirms it.
     let f: RlimitsFn = unsafe { core::mem::transmute(v) };
     f(pid)
+}
+
+/// `/proc/<pid>/personality` — `current->personality`, the word
+/// `proc_pid_personality` prints. Zero (PER_LINUX, no flags) when nothing
+/// has installed the hook.
+pub(crate) fn hook_personality(pid: u64) -> u32 {
+    let v = PERSONALITY_HOOK.load(Ordering::Acquire);
+    if v == 0 {
+        return 0;
+    }
+    // SAFETY: only `set_personality_hook` writes this cell, always from a
+    // `PersonalityFn` fn-pointer; non-zero confirms it was stored.
+    let f: PersonalityFn = unsafe { core::mem::transmute(v) };
+    f(pid)
+}
+
+/// Wire `/proc/<pid>/personality` to the per-task personality word.
+pub fn set_personality_hook(f: PersonalityFn) {
+    PERSONALITY_HOOK.store(f as usize, Ordering::Release);
 }
 
 pub(crate) fn hook_nice(pid: u64) -> i32 {
