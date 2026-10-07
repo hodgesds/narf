@@ -4,7 +4,6 @@ use super::*;
 const SHMID64_SIZE: usize = 112;
 const SHMINFO64_SIZE: usize = 72;
 const SHM_INFO_SIZE: usize = 48;
-const SHMMNI: u64 = 4096;
 const SHM_LOCK: u64 = 11;
 const SHM_UNLOCK: u64 = 12;
 const SHM_STAT: u64 = 13;
@@ -165,7 +164,13 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(errno_ret(ENOSYS));
                 return;
             };
-            let shmmax = (vtable.max_len)();
+            // `shminfo64` reports the namespace's live limits
+            // (`/proc/sys/kernel/shm{max,all,mni}`), bounded by what the
+            // backing can actually hold.
+            let limits = crate::sysvipc::current_limits();
+            let shmmax = crate::sysvipc::effective_shmmax(&limits).min((vtable.max_len)());
+            let shmmni = limits.shmmni as u64;
+            let shmall = crate::sysvipc::effective_shmall(&limits);
             let max_index = {
                 let segments = SHM_SEGMENTS.lock();
                 segments
@@ -180,9 +185,9 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
             let mut out = [0u8; SHMINFO64_SIZE];
             shm_put_u64(&mut out, 0, shmmax);
             shm_put_u64(&mut out, 8, 1);
-            shm_put_u64(&mut out, 16, SHMMNI);
-            shm_put_u64(&mut out, 24, SHMMNI);
-            shm_put_u64(&mut out, 32, SHMMNI.saturating_mul(shmmax / 4096));
+            shm_put_u64(&mut out, 16, shmmni);
+            shm_put_u64(&mut out, 24, shmmni);
+            shm_put_u64(&mut out, 32, shmall);
             // SAFETY: Linux snapshots limits/index before validating copyout.
             if unsafe { copy_to_user(a.arg2, &out) }.is_err() {
                 ctx.set_return(errno_ret(EFAULT));

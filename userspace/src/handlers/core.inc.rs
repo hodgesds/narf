@@ -936,6 +936,14 @@ pub fn init_per_task_state() {
         crate::ns_last_pid_for_current,
         crate::set_ns_last_pid_for_current,
     );
+    // `/proc/sys/kernel/{sem,msg*,shm*}` are the caller's IPC-namespace
+    // limits, which live in `sysvipc`; same reasoning as the two above, and
+    // installing them here (rather than only in `frame`'s cross-crate init)
+    // is what makes them reachable from the kernel-test harness too.
+    narf_filesystem::procfs::sys_kernel::install_ipc_sysctl_hooks(
+        crate::proc_ipc_limit_read,
+        crate::proc_ipc_limit_write,
+    );
     rlimit_init();
     nice_init();
     umask_init();
@@ -10218,6 +10226,13 @@ pub fn __test_swap_shmem_vtable(
     }
 }
 
+/// The largest segment the shmem backing can hold — `shm_ctlmax`'s default
+/// and its hard ceiling, since a tuned `shmmax` above it cannot be honoured
+/// by the allocator. `0` before the shmem registry is installed.
+pub fn shm_backing_max_len() -> u64 {
+    shmem_vtable().map_or(0, |v| (v.max_len)())
+}
+
 fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
     let p = SHMEM_VTABLE.load(core::sync::atomic::Ordering::Acquire);
     if p.is_null() {
@@ -18445,6 +18460,41 @@ fn shm_mapping_transaction(
 /// Mirror Linux `shm_open` across fork. A separate address space gets one
 /// additional logical attachment for every inherited mapping; `CLONE_VM`
 /// merely adds another process owner of the same mm and does not change
+/// `ns->shm_rmid_forced` (`/proc/sys/kernel/shm_rmid_forced`): with it set,
+/// `shm_close` destroys a segment whose last attachment goes away even
+/// though nothing called IPC_RMID (`shm_mark_orphan` → `shm_destroy`), so a
+/// crashed process cannot leak a segment that outlives every user of it.
+fn shm_forced_rmid(ipc_ns: u64) -> bool {
+    crate::sysvipc::limits_of(ipc_ns).shm_rmid_forced
+}
+
+/// `ipc/shm.c::shm_destroy_orphaned`, which
+/// `proc_ipc_dointvec_minmax_orphans` runs the moment `shm_rmid_forced` is
+/// written: every segment in the namespace that is ALREADY unattached goes
+/// away immediately rather than waiting for a detach that will never come.
+pub fn shm_destroy_orphaned(ipc_ns: u64) {
+    let destroy: alloc::vec::Vec<u64> = {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let orphans: alloc::vec::Vec<ShmObjectKey> = map
+            .iter()
+            .filter(|((ns, _), seg)| *ns == ipc_ns && seg.nattch == 0)
+            .map(|(object, _)| *object)
+            .collect();
+        orphans
+            .into_iter()
+            .filter_map(|object| map.remove(&object).map(|seg| seg.handle))
+            .collect()
+    };
+    if let Some(vtable) = shmem_vtable() {
+        for handle in destroy {
+            if handle != 0 {
+                (vtable.destroy)(handle);
+            }
+        }
+    }
+}
+
 /// `shm_nattch`.
 fn shm_fork_process(
     parent_as: &Arc<AddressSpace>,
@@ -18561,7 +18611,7 @@ pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
             seg.nattch = seg.nattch.saturating_sub(1);
             seg.lpid = pid;
             seg.dtime = now;
-            if seg.removed && seg.nattch == 0 {
+            if seg.nattch == 0 && (seg.removed || shm_forced_rmid(object.0)) {
                 if let Some(seg) = map.remove(&object) {
                     destroy.push(seg.handle);
                 }
@@ -18633,7 +18683,7 @@ fn shm_cancel_attach(object: ShmObjectKey) {
             return;
         };
         seg.nattch = seg.nattch.saturating_sub(1);
-        if seg.removed && seg.nattch == 0 {
+        if seg.nattch == 0 && (seg.removed || shm_forced_rmid(object.0)) {
             map.remove(&object).map(|seg| seg.handle)
         } else {
             None
@@ -19040,7 +19090,7 @@ impl PreparedShmMremapAlias {
                 segment.nattch = segment.nattch.saturating_sub(1);
                 segment.lpid = self.lpid;
                 segment.dtime = now;
-                if segment.removed && segment.nattch == 0 {
+                if segment.nattch == 0 && (segment.removed || shm_forced_rmid(object.0)) {
                     if let Some(segment) = segment_map.remove(&object) {
                         // Capacity was reserved for every possibly detached
                         // attachment, an upper bound on destroyed segments.
@@ -19214,7 +19264,7 @@ fn shm_record_fixed_punch(as_key: u64, lo: u64, hi: u64, lpid: u64) {
             seg.nattch = seg.nattch.saturating_sub(1);
             seg.lpid = lpid;
             seg.dtime = now;
-            if seg.removed && seg.nattch == 0 {
+            if seg.nattch == 0 && (seg.removed || shm_forced_rmid(object.0)) {
                 if let Some(seg) = map.remove(&object) {
                     destroy.push(seg.handle);
                 }

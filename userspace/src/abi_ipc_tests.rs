@@ -1935,6 +1935,226 @@ kernel_test_in!(
     smoke_abi_ipc_proc_sysvipc_tables_list_live_objects
 );
 
+// ── /proc/sys/kernel/{sem,msg*,shm*} ────────────────────────────────
+
+fn ipc_sysctl_read(path: &[u8]) -> Result<alloc::string::String, &'static str> {
+    let fd = call_open(path.as_ptr() as u64, 0).ok_or("open returned a non-Linux status")?;
+    if fd < 0 {
+        return Err("an IPC limit file could not be opened");
+    }
+    let mut buf = [0u8; 96];
+    let n = call(
+        Syscall::Read.raw(),
+        a2(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+    );
+    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+    match n {
+        Some(n) if n >= 0 => {
+            Ok(alloc::string::String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+        }
+        _ => Err("an IPC limit file could not be read"),
+    }
+}
+
+fn ipc_sysctl_write(path: &[u8], value: &[u8]) -> i64 {
+    let fd = match call_open(path.as_ptr() as u64, 1) {
+        Some(fd) if fd >= 0 => fd,
+        Some(fd) => return fd,
+        None => return i64::MIN,
+    };
+    let n = call(
+        Syscall::Write.raw(),
+        a2(fd as u64, value.as_ptr() as u64, value.len() as u64),
+    )
+    .unwrap_or(i64::MIN);
+    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+    n
+}
+
+/// `ipc/ipc_sysctl.c`'s eight per-namespace limits exist, round-trip, and
+/// refuse what their `ctl_table` entries refuse. None of the files existed:
+/// `sysctl -w kernel.msgmni=…` and every `/etc/sysctl.d` drop-in naming one
+/// got ENOENT.
+fn smoke_abi_ipc_sysctl_limits_round_trip() -> TestResult {
+    with_setup(|| {
+        crate::sysvipc::__test_reset_limits();
+        // `kernel.sem` is the four-value `sem_ctls` vector.
+        let sem = ipc_sysctl_read(b"/proc/sys/kernel/sem\0")?;
+        if sem.split_ascii_whitespace().count() != 4 {
+            crate::sysvipc::__test_reset_limits();
+            return Err("kernel.sem must report the four sem_ctls values");
+        }
+        if ipc_sysctl_write(b"/proc/sys/kernel/sem\0", b"64 1024 32 16\n") <= 0 {
+            crate::sysvipc::__test_reset_limits();
+            return Err("writing kernel.sem failed");
+        }
+        let verdict = (|| -> Result<(), &'static str> {
+            if ipc_sysctl_read(b"/proc/sys/kernel/sem\0")?
+                .split_ascii_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                != ["64", "1024", "32", "16"]
+            {
+                return Err("kernel.sem did not read back what was written");
+            }
+            // A partial vector is EINVAL: the handler writes all four or none.
+            if ipc_sysctl_write(b"/proc/sys/kernel/sem\0", b"64 1024\n") != -22 {
+                return Err("kernel.sem must refuse a short vector with EINVAL");
+            }
+            for (path, value) in [
+                (&b"/proc/sys/kernel/msgmax\0"[..], &b"4096\n"[..]),
+                (&b"/proc/sys/kernel/msgmnb\0"[..], &b"8192\n"[..]),
+                (&b"/proc/sys/kernel/msgmni\0"[..], &b"64\n"[..]),
+                (&b"/proc/sys/kernel/shmmax\0"[..], &b"1048576\n"[..]),
+                (&b"/proc/sys/kernel/shmall\0"[..], &b"256\n"[..]),
+                (&b"/proc/sys/kernel/shmmni\0"[..], &b"32\n"[..]),
+                (&b"/proc/sys/kernel/shm_rmid_forced\0"[..], &b"1\n"[..]),
+            ] {
+                if ipc_sysctl_write(path, value) <= 0 {
+                    return Err("writing an IPC limit failed");
+                }
+                if ipc_sysctl_read(path)?.trim()
+                    != alloc::string::String::from_utf8_lossy(value).trim()
+                {
+                    return Err("an IPC limit did not read back what was written");
+                }
+            }
+            // The bounded entries: `shm_rmid_forced` is 0..=1, and
+            // `msgmni`/`shmmni` are capped by the IDR width (`ipc_mni`).
+            if ipc_sysctl_write(b"/proc/sys/kernel/shm_rmid_forced\0", b"2\n") != -22 {
+                return Err("shm_rmid_forced must refuse a value above 1");
+            }
+            if ipc_sysctl_write(b"/proc/sys/kernel/msgmni\0", b"99999999\n") != -22 {
+                return Err("msgmni must refuse a value past ipc_mni");
+            }
+            if ipc_sysctl_write(b"/proc/sys/kernel/msgmax\0", b"not-a-number\n") != -22 {
+                return Err("a non-numeric IPC limit write must be EINVAL");
+            }
+            Ok(())
+        })();
+        crate::sysvipc::__test_reset_limits();
+        verdict
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_sysctl_limits_round_trip);
+
+/// A written limit is what the syscalls then enforce — the whole point of
+/// the files. Each of the three object types takes its bound from the
+/// namespace's live value.
+fn smoke_abi_ipc_sysctl_limits_are_enforced() -> TestResult {
+    with_setup(|| {
+        crate::sysvipc::__test_reset_limits();
+        let verdict = (|| -> Result<(), &'static str> {
+            // semget's nsems bound is `sem_ctls[0]`.
+            // Only `semmsl` and `semopm` may bind here: the namespace-wide
+            // pair stays generous, because earlier cases in this namespace
+            // have already created sets and semmns/semmni count those.
+            if ipc_sysctl_write(b"/proc/sys/kernel/sem\0", b"4 1024000 8 32000\n") <= 0 {
+                return Err("writing kernel.sem failed");
+            }
+            match call(Syscall::Semget.raw(), a2(0, 5, IPC_CREAT | 0o600)) {
+                Some(v) if v == EINVAL => {}
+                _ => return Err("semget past the written semmsl must be EINVAL"),
+            }
+            let id = match call(Syscall::Semget.raw(), a2(0, 4, IPC_CREAT | 0o600)) {
+                Some(id) if id >= 0 => id as u64,
+                _ => return Err("semget at the written semmsl must succeed"),
+            };
+            // semop's E2BIG boundary is `sem_ctls[2]`.
+            let sops = [0u8; 9 * 6];
+            match call(Syscall::Semop.raw(), a2(id, sops.as_ptr() as u64, 9)) {
+                Some(v) if v == E2BIG => {}
+                _ => {
+                    let _ = call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0));
+                    return Err("semop past the written semopm must be E2BIG");
+                }
+            }
+            let _ = call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0));
+
+            // msgsnd's size bound is `msg_ctlmax`.
+            if ipc_sysctl_write(b"/proc/sys/kernel/msgmax\0", b"8\n") <= 0 {
+                return Err("writing kernel.msgmax failed");
+            }
+            let q = match call(Syscall::Msgget.raw(), a2(0, IPC_CREAT | 0o600, 0)) {
+                Some(id) if id >= 0 => id as u64,
+                _ => return Err("msgget failed"),
+            };
+            let msg = [0u8; 8 + 16];
+            let send = call(Syscall::Msgsnd.raw(), a3(q, msg.as_ptr() as u64, 16, 0));
+            let _ = call(Syscall::Msgctl.raw(), a2(q, IPC_RMID, 0));
+            match send {
+                Some(v) if v == EINVAL => {}
+                _ => return Err("msgsnd past the written msgmax must be EINVAL"),
+            }
+
+            // shmget's size bound is `shm_ctlmax`.
+            if ipc_sysctl_write(b"/proc/sys/kernel/shmmax\0", b"4096\n") <= 0 {
+                return Err("writing kernel.shmmax failed");
+            }
+            match call(Syscall::Shmget.raw(), a3(0, 8192, IPC_CREAT | 0o600, 0)) {
+                Some(v) if v == EINVAL => Ok(()),
+                Some(v) if v == ENOSYS => Ok(()), // no shmem backing in this build
+                _ => Err("shmget past the written shmmax must be EINVAL"),
+            }
+        })();
+        crate::sysvipc::__test_reset_limits();
+        verdict
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_sysctl_limits_are_enforced);
+
+/// `shm_rmid_forced` is not a stored flag: writing it runs
+/// `shm_destroy_orphaned` over the namespace at once
+/// (`proc_ipc_dointvec_minmax_orphans`), and while it is set `shm_close`
+/// destroys a segment whose last attachment goes away even though nothing
+/// called IPC_RMID — which is the point, since a crashed process cannot then
+/// leak a segment that outlives every user of it.
+fn smoke_abi_ipc_shm_rmid_forced_destroys_orphans() -> TestResult {
+    with_setup(|| {
+        crate::sysvipc::__test_reset_limits();
+        let stat_size = 112;
+        let mut stat = alloc::vec![0u8; stat_size];
+        let seg = match call(Syscall::Shmget.raw(), a3(0, 4096, IPC_CREAT | 0o600, 0)) {
+            Some(id) if id >= 0 => id as u64,
+            // A build with no shmem backing answers ENOSYS; nothing to test.
+            _ => {
+                crate::sysvipc::__test_reset_limits();
+                return Ok(());
+            }
+        };
+        let stat_cmd = |id: u64, stat: &mut [u8]| {
+            call(
+                Syscall::Shmctl.raw(),
+                a3(id, IPC_STAT, stat.as_mut_ptr() as u64, 0),
+            )
+        };
+        if stat_cmd(seg, &mut stat) != Some(0) {
+            crate::sysvipc::__test_reset_limits();
+            let _ = call(Syscall::Shmctl.raw(), a3(seg, IPC_RMID, 0, 0));
+            return Err("setup: shmctl IPC_STAT on a fresh segment failed");
+        }
+        // The segment has no attachments, so the write sweeps it.
+        if ipc_sysctl_write(b"/proc/sys/kernel/shm_rmid_forced\0", b"1\n") <= 0 {
+            crate::sysvipc::__test_reset_limits();
+            let _ = call(Syscall::Shmctl.raw(), a3(seg, IPC_RMID, 0, 0));
+            return Err("writing shm_rmid_forced failed");
+        }
+        let after = stat_cmd(seg, &mut stat);
+        crate::sysvipc::__test_reset_limits();
+        match after {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(0) => {
+                let _ = call(Syscall::Shmctl.raw(), a3(seg, IPC_RMID, 0, 0));
+                Err("shm_rmid_forced did not destroy an already-orphaned segment")
+            }
+            _ => Err("shmctl IPC_STAT after the sweep returned an unexpected status"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ipc_shm_rmid_forced_destroys_orphans
+);
+
 fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
     with_setup(|| {
         #[cfg(target_arch = "x86_64")]

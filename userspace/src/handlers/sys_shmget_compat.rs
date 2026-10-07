@@ -101,8 +101,15 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    const SHMMNI: usize = 4096;
-    let shmmax = (v.max_len)();
+    // `newseg`: the namespace's live `shm_ctlmax` / `shm_ctlall` /
+    // `shm_ctlmni` (`/proc/sys/kernel/shm{max,all,mni}`), which were three
+    // compile-time constants with no files behind them.
+    let limits = crate::sysvipc::current_limits();
+    let shmmni = limits.shmmni;
+    // A tuned `shmmax` cannot exceed what the backing can hold: the
+    // allocation would fail later with ENOMEM instead of the EINVAL Linux
+    // reports for an oversized request.
+    let shmmax = crate::sysvipc::effective_shmmax(&limits).min((v.max_len)());
     if size > shmmax {
         ctx.set_return(errno_ret(EINVAL));
         return;
@@ -117,8 +124,8 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
                 pages.saturating_add(seg.len.div_ceil(4096)),
             )
         });
-    let shmall = SHMMNI as u64 * shmmax / 4096;
-    if used_pages.saturating_add(requested_pages) > shmall || live_ids >= SHMMNI {
+    let shmall = crate::sysvipc::effective_shmall(&limits);
+    if used_pages.saturating_add(requested_pages) > shmall || live_ids >= shmmni {
         ctx.set_return(errno_ret(ENOSPC));
         return;
     }

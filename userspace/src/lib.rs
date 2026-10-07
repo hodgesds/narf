@@ -84,6 +84,25 @@ pub mod syscall;
 pub mod sysvipc;
 pub mod task;
 
+/// `/proc/sys/kernel/{sem,msgmax,msgmnb,msgmni,shmmax,shmall,shmmni,
+/// shm_rmid_forced}` — read one key of the calling task's IPC namespace
+/// limits. Procfs passes the key index so it holds one hook pair, not eight.
+pub fn proc_ipc_limit_read(key: u8) -> alloc::string::String {
+    match sysvipc::IpcSysctl::from_index(key) {
+        Some(key) => sysvipc::sysctl_read(key),
+        None => alloc::string::String::new(),
+    }
+}
+
+/// Apply a write to one IPC limit key, with the errno Linux's `ctl_table`
+/// handler would report for a malformed or out-of-range value.
+pub fn proc_ipc_limit_write(key: u8, value: &str) -> Result<(), narf_filesystem::FsError> {
+    let Some(key) = sysvipc::IpcSysctl::from_index(key) else {
+        return Err(narf_filesystem::FsError::InvalidData);
+    };
+    sysvipc::sysctl_write(key, value).map_err(|_| narf_filesystem::FsError::InvalidData)
+}
+
 /// `/proc/sysvipc/{sem,msg,shm}` rows for the reader's IPC namespace
 /// (`0` = sem, `1` = msg, `2` = shm). One entry point so procfs holds one
 /// hook rather than three.

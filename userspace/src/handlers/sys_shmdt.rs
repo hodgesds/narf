@@ -133,7 +133,9 @@ pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
         seg.nattch = seg.nattch.saturating_sub(1);
         seg.lpid = lpid;
         seg.dtime = now;
-        if seg.removed && seg.nattch == 0 {
+        // `shm_close`: the last detach destroys a removed segment, and —
+        // under `shm_rmid_forced` — an unremoved one too.
+        if seg.nattch == 0 && (seg.removed || shm_forced_rmid(object.0)) {
             map.remove(&object).map(|seg| seg.handle)
         } else {
             None

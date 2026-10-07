@@ -126,17 +126,10 @@ const SEM_UNDO: i16 = 0o10000;
 /// Masking at import makes it explicit that unknown bits neither reject the
 /// operation nor accidentally acquire behavior in later bit tests.
 const SEM_BEHAVIOR_FLAGS: i16 = IPC_NOWAIT | SEM_UNDO;
-// LINUX-GAP: `/proc/sys/kernel/{sem,msgmax,msgmnb,msgmni,shmmax,shmall,
-// shmmni,shm_rmid_forced}` do not exist. `ipc/ipc_sysctl.c` exposes each of
-// these limits per IPC namespace at mode 0644, so `sysctl -w
-// kernel.shmmax=...` and a `/etc/sysctl.d` drop-in for one of them succeed
-// there and get ENOENT here (systemd-sysctl logs the failure and carries
-// on). The limits below are compile-time constants — `SEMOPM` sizes a fixed
-// import buffer, and several others are consumed in `const` position — so
-// exposing them as writable knobs means first making them per-namespace
-// runtime state. `semctl(IPC_INFO)` / `msgctl(MSG_INFO)` /
-// `shmctl(IPC_INFO)` DO report them, which is where `ipcs -l` reads them
-// from.
+// The constants below are the COMPILED DEFAULTS of the per-namespace limits
+// (`ipc/ipc_sysctl.c`'s `sem_ctls`, `msg_ctl*`, `shm_ctl*`). The live values
+// are [`IpcLimits`], which `/proc/sys/kernel/{sem,msgmax,msgmnb,msgmni,
+// shmmax,shmall,shmmni,shm_rmid_forced}` read and write.
 const SEMVMX: i32 = 32767;
 const SEMMNI: usize = 32_000;
 const SEMMSL: usize = 32_000;
@@ -428,10 +421,8 @@ static SEM_UNDO_SHARING: IrqSafeSpinLock<Option<SemUndoSharing>> = IrqSafeSpinLo
 static SEM_UNDO_SHARED: AtomicBool = AtomicBool::new(false);
 static SEM_UNDO_OBSERVER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-/// Linux's default SEMOPM limit.  This sizes the fixed import buffer as well
-/// as defining the observable E2BIG boundary.
-const MAX_SOPS: usize = SEMOPM;
-
+/// `sem_ctls[3]`, with the kernel-test override that lets a case drive the
+/// ENOSPC arm without allocating 32000 sets.
 fn semmni() -> usize {
     #[cfg(feature = "kernel-test")]
     {
@@ -440,7 +431,260 @@ fn semmni() -> usize {
             return override_limit;
         }
     }
-    SEMMNI
+    current_limits().semmni
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Per-namespace tunable limits (`ipc/ipc_sysctl.c`)
+// ════════════════════════════════════════════════════════════════════
+//
+// Linux keeps these on `struct ipc_namespace` and exposes each at mode 0644
+// under `/proc/sys/kernel/`, so `sysctl -w kernel.msgmni=…` and an
+// `/etc/sysctl.d` drop-in change what the syscalls then enforce. NARF had
+// them as compile-time constants with no files at all: every such write got
+// ENOENT (systemd-sysctl logs the failure and carries on) and no deployment
+// could tighten or raise a limit.
+//
+// `create_ipc_ns` starts a new namespace from the compiled defaults rather
+// than inheriting the parent's, so an absent row IS the defaults and only a
+// namespace that has been tuned costs a map entry.
+
+/// One IPC namespace's tunable limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpcLimits {
+    /// `sem_ctls[0]` — max semaphores per set (`semget`'s `nsems`).
+    pub semmsl: usize,
+    /// `sem_ctls[1]` — max semaphores system-wide in this namespace.
+    pub semmns: usize,
+    /// `sem_ctls[2]` — max operations per `semop` call.
+    pub semopm: usize,
+    /// `sem_ctls[3]` — max semaphore sets.
+    pub semmni: usize,
+    /// `msg_ctlmax` — max bytes in one message.
+    pub msgmax: usize,
+    /// `msg_ctlmnb` — default/maximum bytes a queue holds.
+    pub msgmnb: usize,
+    /// `msg_ctlmni` — max message queues.
+    pub msgmni: usize,
+    /// `shm_ctlmax` — max bytes in one segment. `None` is "whatever the
+    /// shmem backing can hold", which is the bound NARF enforced before the
+    /// knob existed and the only one it can promise.
+    pub shmmax: Option<u64>,
+    /// `shm_ctlall` — max total shared pages. `None` derives Linux's
+    /// `shmmni * shmmax / PAGE_SIZE`.
+    pub shmall: Option<u64>,
+    /// `shm_ctlmni` — max segments.
+    pub shmmni: usize,
+    /// `shm_rmid_forced`.
+    pub shm_rmid_forced: bool,
+}
+
+impl Default for IpcLimits {
+    fn default() -> Self {
+        Self {
+            semmsl: SEMMSL,
+            semmns: SEMMNS,
+            semopm: SEMOPM,
+            semmni: SEMMNI,
+            msgmax: MSG_MAX_BYTES,
+            msgmnb: MSG_DEFAULT_QUEUE_BYTES,
+            msgmni: MSG_MAX_QUEUES,
+            shmmax: None,
+            shmall: None,
+            shmmni: SHMMNI,
+            shm_rmid_forced: false,
+        }
+    }
+}
+
+/// `shm_ctlmni`'s default (`ipc/shm.c`: `SHMMNI`).
+pub const SHMMNI: usize = 4096;
+
+static IPC_LIMITS: IrqSafeSpinLock<Option<BTreeMap<u64, IpcLimits>>> = IrqSafeSpinLock::new(None);
+
+/// This namespace's live limits.
+pub fn limits_of(ns: u64) -> IpcLimits {
+    IPC_LIMITS
+        .lock()
+        .as_ref()
+        .and_then(|map| map.get(&ns).copied())
+        .unwrap_or_default()
+}
+
+/// The calling task's namespace limits — what every enforcement site asks.
+pub fn current_limits() -> IpcLimits {
+    limits_of(current_ipc_namespace_id())
+}
+
+fn with_limits_mut<R>(ns: u64, f: impl FnOnce(&mut IpcLimits) -> R) -> R {
+    let mut guard = IPC_LIMITS.lock();
+    let map = guard.get_or_insert_with(BTreeMap::new);
+    f(map.entry(ns).or_default())
+}
+
+/// Reset every namespace's limits to the compiled defaults — test hook.
+/// Ungated like the other `__test_*` resets: it only clears a map.
+#[doc(hidden)]
+pub fn __test_reset_limits() {
+    *IPC_LIMITS.lock() = None;
+}
+
+/// The `/proc/sys/kernel/*` keys, in the order the procfs side numbers them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcSysctl {
+    Sem,
+    Msgmax,
+    Msgmnb,
+    Msgmni,
+    Shmmax,
+    Shmall,
+    Shmmni,
+    ShmRmidForced,
+}
+
+impl IpcSysctl {
+    /// The procfs hook passes a key index rather than eight hook pairs.
+    pub fn from_index(index: u8) -> Option<Self> {
+        Some(match index {
+            0 => Self::Sem,
+            1 => Self::Msgmax,
+            2 => Self::Msgmnb,
+            3 => Self::Msgmni,
+            4 => Self::Shmmax,
+            5 => Self::Shmall,
+            6 => Self::Shmmni,
+            7 => Self::ShmRmidForced,
+            _ => return None,
+        })
+    }
+}
+
+/// Render one key for `/proc/sys/kernel/<key>`.
+///
+/// `kernel/sem` is four values on one line (`proc_ipc_sem_dointvec` over a
+/// `4*sizeof(int)` vector); every other key is one.
+pub fn sysctl_read(key: IpcSysctl) -> alloc::string::String {
+    use alloc::string::ToString as _;
+    let l = current_limits();
+    match key {
+        IpcSysctl::Sem => {
+            alloc::format!("{}\t{}\t{}\t{}\n", l.semmsl, l.semmns, l.semopm, l.semmni)
+        }
+        IpcSysctl::Msgmax => alloc::format!("{}\n", l.msgmax),
+        IpcSysctl::Msgmnb => alloc::format!("{}\n", l.msgmnb),
+        IpcSysctl::Msgmni => alloc::format!("{}\n", l.msgmni),
+        IpcSysctl::Shmmax => alloc::format!("{}\n", effective_shmmax(&l)),
+        IpcSysctl::Shmall => alloc::format!("{}\n", effective_shmall(&l)),
+        IpcSysctl::Shmmni => alloc::format!("{}\n", l.shmmni),
+        IpcSysctl::ShmRmidForced => u8::from(l.shm_rmid_forced).to_string() + "\n",
+    }
+}
+
+/// Apply a write to one key. Returns the positive errno Linux's handler
+/// would report: a value that is not a number, or outside the range the
+/// `ctl_table` entry declares, is EINVAL.
+///
+/// Linux's `proc_dointvec_minmax` bounds `shmmni` and `msgmni` by `ipc_mni`
+/// (the IDR width) and `shm_rmid_forced` to 0..=1; `shmmax`/`shmall` are
+/// `proc_doulongvec_minmax` with no bound; `sem` takes exactly four values.
+pub fn sysctl_write(key: IpcSysctl, value: &str) -> Result<(), i64> {
+    let ns = current_ipc_namespace_id();
+    let fields: Vec<&str> = value.split_ascii_whitespace().collect();
+    let one = |fields: &[&str]| -> Result<u64, i64> {
+        match fields {
+            [single] => parse_sysctl_u64(single),
+            _ => Err(EINVAL),
+        }
+    };
+    match key {
+        IpcSysctl::Sem => {
+            // `proc_ipc_sem_dointvec` writes the whole vector or none of it.
+            if fields.len() != 4 {
+                return Err(EINVAL);
+            }
+            let mut parsed = [0usize; 4];
+            for (slot, field) in parsed.iter_mut().zip(fields.iter()) {
+                *slot = usize::try_from(parse_sysctl_u64(field)?).map_err(|_| EINVAL)?;
+            }
+            with_limits_mut(ns, |l| {
+                l.semmsl = parsed[0];
+                l.semmns = parsed[1];
+                l.semopm = parsed[2];
+                l.semmni = parsed[3];
+            });
+        }
+        IpcSysctl::Msgmax => {
+            let v = usize::try_from(one(&fields)?).map_err(|_| EINVAL)?;
+            with_limits_mut(ns, |l| l.msgmax = v);
+        }
+        IpcSysctl::Msgmnb => {
+            let v = usize::try_from(one(&fields)?).map_err(|_| EINVAL)?;
+            with_limits_mut(ns, |l| l.msgmnb = v);
+        }
+        IpcSysctl::Msgmni => {
+            let v = usize::try_from(one(&fields)?).map_err(|_| EINVAL)?;
+            // `.extra2 = &ipc_mni`.
+            if v > IPCMNI as usize {
+                return Err(EINVAL);
+            }
+            with_limits_mut(ns, |l| l.msgmni = v);
+        }
+        IpcSysctl::Shmmax => {
+            let v = one(&fields)?;
+            with_limits_mut(ns, |l| l.shmmax = Some(v));
+        }
+        IpcSysctl::Shmall => {
+            let v = one(&fields)?;
+            with_limits_mut(ns, |l| l.shmall = Some(v));
+        }
+        IpcSysctl::Shmmni => {
+            let v = usize::try_from(one(&fields)?).map_err(|_| EINVAL)?;
+            if v > IPCMNI as usize {
+                return Err(EINVAL);
+            }
+            with_limits_mut(ns, |l| l.shmmni = v);
+        }
+        IpcSysctl::ShmRmidForced => {
+            let v = one(&fields)?;
+            if v > 1 {
+                return Err(EINVAL);
+            }
+            with_limits_mut(ns, |l| l.shm_rmid_forced = v == 1);
+            if v == 1 {
+                // `proc_ipc_dointvec_minmax_orphans` runs
+                // `shm_destroy_orphaned` on the write itself, so segments
+                // that are already unattached go away now rather than at a
+                // detach that will never come.
+                crate::handlers::shm_destroy_orphaned(ns);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `proc_dointvec`'s value syntax: optional sign, decimal digits, and the
+/// trailing newline `echo` adds.
+fn parse_sysctl_u64(text: &str) -> Result<u64, i64> {
+    let text = text.trim_matches(|c: char| c == '\n' || c == '\r' || c == ' ' || c == '\t');
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(EINVAL);
+    }
+    text.parse::<u64>().map_err(|_| EINVAL)
+}
+
+/// `shm_ctlmax`: the tuned value, or the largest segment the shmem backing
+/// can hold.
+pub fn effective_shmmax(limits: &IpcLimits) -> u64 {
+    limits
+        .shmmax
+        .unwrap_or_else(crate::handlers::shm_backing_max_len)
+}
+
+/// `shm_ctlall`: the tuned value, or Linux's `shmmni * shmmax / PAGE_SIZE`.
+pub fn effective_shmall(limits: &IpcLimits) -> u64 {
+    limits
+        .shmall
+        .unwrap_or_else(|| (limits.shmmni as u64).saturating_mul(effective_shmmax(limits) / 4096))
 }
 
 fn with_sem_state<R>(f: impl FnOnce(&mut SemState) -> R) -> R {
@@ -2801,7 +3045,8 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let key = a.arg0 as u32;
     let nsems_raw = a.arg1 as i32;
-    if nsems_raw < 0 || nsems_raw as usize > SEMMSL {
+    let limits = current_limits();
+    if nsems_raw < 0 || nsems_raw as usize > limits.semmsl {
         ctx.set_return(err(EINVAL));
         return;
     }
@@ -2858,7 +3103,8 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
                 return Ok(None);
             }
             let usage = state.usage.get(&ipc_ns).copied().unwrap_or_default();
-            if usage.sem_count.saturating_add(nsems) > SEMMNS || usage.set_count >= semmni() {
+            if usage.sem_count.saturating_add(nsems) > limits.semmns || usage.set_count >= semmni()
+            {
                 return Err(ENOSPC);
             }
             let mut sems = Vec::new();
@@ -2999,7 +3245,10 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
         None
     };
 
-    if nsops > MAX_SOPS {
+    // `semop`'s E2BIG boundary is the namespace's live `semopm`. The import
+    // below keeps SEMOPM_FAST entries on the stack and heap-allocates beyond
+    // that, so a raised limit needs no fixed buffer to grow.
+    if nsops > current_limits().semopm {
         finish_semtimedop_wait(timed);
         unlink_sem_wait_if_present(object, task, may_have_wait);
         ctx.set_return(err(E2BIG));
@@ -3227,12 +3476,13 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
             });
             let clamp_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
             let mut out = [0u8; SEMINFO_SIZE];
-            put_i32(&mut out, 0, SEMMNS as i32); // semmap (legacy)
+            let l = current_limits();
+            put_i32(&mut out, 0, l.semmns as i32); // semmap (legacy)
             put_i32(&mut out, 4, semmni() as i32);
-            put_i32(&mut out, 8, SEMMNS as i32);
-            put_i32(&mut out, 12, SEMMNS as i32); // semmnu (legacy)
-            put_i32(&mut out, 16, SEMMSL as i32);
-            put_i32(&mut out, 20, SEMOPM as i32);
+            put_i32(&mut out, 8, l.semmns as i32);
+            put_i32(&mut out, 12, l.semmns as i32); // semmnu (legacy)
+            put_i32(&mut out, 16, l.semmsl as i32);
+            put_i32(&mut out, 20, l.semopm as i32);
             put_i32(&mut out, 24, SEMUME);
             if cmd == SEM_INFO {
                 put_i32(&mut out, 28, clamp_i32(usage.set_count));
@@ -3825,7 +4075,7 @@ fn msg_max_queues() -> usize {
             return override_limit;
         }
     }
-    MSG_MAX_QUEUES
+    current_limits().msgmni
 }
 
 fn with_msg_state<R>(f: impl FnOnce(&mut MsgState) -> R) -> R {
@@ -3953,7 +4203,7 @@ pub fn sys_msgget(ctx: &mut dyn TrapContext) {
             rtime: 0,
             ctime: now_seconds(),
             current_bytes: 0,
-            max_bytes: MSG_DEFAULT_QUEUE_BYTES,
+            max_bytes: current_limits().msgmnb,
             last_send_pid: 0,
             last_recv_pid: 0,
             send_wait_head: None,
@@ -4042,7 +4292,7 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
             return;
         }
         let mtype = i64::from_le_bytes(hdr);
-        if msgsz > MSG_MAX_BYTES || msqid_raw < 0 || mtype <= 0 {
+        if msgsz > current_limits().msgmax || msqid_raw < 0 || mtype <= 0 {
             clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
             ctx.set_return(err(EINVAL));
             return;
@@ -4194,7 +4444,7 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
     // keeping allocation out of the global queue lock below.
     let mut copy_payload = Vec::new();
     if flg & MSG_COPY != 0 {
-        let copy_capacity = core::cmp::min(msgsz, MSG_MAX_BYTES);
+        let copy_capacity = core::cmp::min(msgsz, current_limits().msgmax);
         if copy_payload.try_reserve_exact(copy_capacity).is_err() {
             clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
             ctx.set_return(err(ENOMEM));
@@ -4406,8 +4656,9 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                 put_i32(&mut out, 4, MSG_MAP);
                 put_i32(&mut out, 24, MSG_TQL);
             }
-            put_i32(&mut out, 8, MSG_MAX_BYTES as i32);
-            put_i32(&mut out, 12, MSG_DEFAULT_QUEUE_BYTES as i32);
+            let l = current_limits();
+            put_i32(&mut out, 8, l.msgmax as i32);
+            put_i32(&mut out, 12, l.msgmnb as i32);
             put_i32(&mut out, 16, msg_max_queues().min(i32::MAX as usize) as i32);
             put_i32(&mut out, 20, MSG_SEGMENT_BYTES);
             put_u16(&mut out, 28, MSG_SEGMENTS);
@@ -4611,7 +4862,12 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                 if q.removed {
                     Err(EINVAL)
                 } else if !ipc_owner(caller_uid, q.uid, q.cuid)
-                    || new_max > MSG_DEFAULT_QUEUE_BYTES as u64 && caller_uid != 0
+                    // `msgctl_down`: `if (msg_qbytes > ns->msg_ctlmnb &&
+                    // !capable(CAP_SYS_RESOURCE)) goto out_unlock0;` — the
+                    // capability, where this asked `caller_uid != 0`, and the
+                    // namespace's live `msgmnb` rather than its default.
+                    || new_max > current_limits().msgmnb as u64
+                        && !crate::handlers::capable(crate::handlers::CAP_SYS_RESOURCE)
                 {
                     Err(EPERM)
                 } else {
@@ -4641,7 +4897,12 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                 if q.removed {
                     Err(EINVAL)
                 } else if !ipc_owner(caller_uid, q.uid, q.cuid)
-                    || new_max > MSG_DEFAULT_QUEUE_BYTES as u64 && caller_uid != 0
+                    // `msgctl_down`: `if (msg_qbytes > ns->msg_ctlmnb &&
+                    // !capable(CAP_SYS_RESOURCE)) goto out_unlock0;` — the
+                    // capability, where this asked `caller_uid != 0`, and the
+                    // namespace's live `msgmnb` rather than its default.
+                    || new_max > current_limits().msgmnb as u64
+                        && !crate::handlers::capable(crate::handlers::CAP_SYS_RESOURCE)
                 {
                     Err(EPERM)
                 } else {
