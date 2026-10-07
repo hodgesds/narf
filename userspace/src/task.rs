@@ -96,6 +96,20 @@ pub struct Task {
     /// Time spent executing syscall continuations for this task. Kept beside
     /// `user_cpu_ns` so the hot accounting path never takes a B-tree lock.
     kernel_cpu_ns: AtomicU64,
+    /// Run slices this task has completed — Linux's third
+    /// `/proc/<pid>/schedstat` field (`se.statistics` "timeslices"), folded
+    /// at the same slice boundary as `user_cpu_ns`.
+    timeslices: AtomicU64,
+    /// Slices that ended because the task PARKED (`nr_voluntary_switches`).
+    voluntary_switches: AtomicU64,
+    /// Slices that ended any other way — the trap returned and the task was
+    /// still runnable (`nr_involuntary_switches`).
+    involuntary_switches: AtomicU64,
+    /// Set by the park path and consumed by the slice fold, so the fold can
+    /// tell the two counters above apart without the scheduler publishing a
+    /// per-task reason. (Reading the executor's own preemption flag would
+    /// consume it and break its QSBR decision.)
+    parked_this_slice: AtomicU32,
     /// Number of process children created by this task. Fork placement uses
     /// the per-parent sequence so a child's own helper forks cannot consume
     /// another parent's CPU rotation.
@@ -167,6 +181,10 @@ impl Task {
             exit_code: AtomicI32::new(0),
             user_cpu_ns: AtomicU64::new(0),
             kernel_cpu_ns: AtomicU64::new(0),
+            timeslices: AtomicU64::new(0),
+            voluntary_switches: AtomicU64::new(0),
+            involuntary_switches: AtomicU64::new(0),
+            parked_this_slice: AtomicU32::new(0),
             fork_sequence: AtomicU64::new(0),
             fork_base_cpu: AtomicU32::new(u32::MAX),
             group_exiting: core::sync::atomic::AtomicBool::new(false),
@@ -435,6 +453,57 @@ pub(crate) fn current_task_is(tid: u64) -> bool {
     let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
     // SAFETY: same publication/lifetime contract as `account_current_cpu_ns`.
     !ptr.is_null() && unsafe { (*ptr).tid == tid }
+}
+
+/// Note that the current task is parking: the slice about to end is a
+/// VOLUNTARY switch. Called from the park funnel in `user_task`, which is the
+/// only place a user task stops running while still having work to do.
+#[inline]
+pub(crate) fn note_park(tid: u64) {
+    if let Some(task) = task_get(tid) {
+        task.parked_this_slice.store(1, Ordering::Relaxed);
+    }
+}
+
+/// Fold a completed run slice into the switch counters. Called at the same
+/// slice boundary that charges `user_cpu_ns`, so one slice is one count.
+#[inline]
+pub(crate) fn note_slice_end() {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: same publication/lifetime contract as `account_current_cpu_ns`
+    // — the scheduler published this pointer for the in-flight task and keeps
+    // it pinned for the duration of the poll.
+    let task = unsafe { &*ptr };
+    task.timeslices.fetch_add(1, Ordering::Relaxed);
+    if task.parked_this_slice.swap(0, Ordering::Relaxed) != 0 {
+        task.voluntary_switches.fetch_add(1, Ordering::Relaxed);
+    } else {
+        task.involuntary_switches.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// `(timeslices, voluntary_switches, involuntary_switches)` for `tid`.
+#[inline]
+pub(crate) fn switch_counts(tid: u64) -> (u64, u64, u64) {
+    task_get(tid).map_or((0, 0, 0), |task| {
+        (
+            task.timeslices.load(Ordering::Relaxed),
+            task.voluntary_switches.load(Ordering::Relaxed),
+            task.involuntary_switches.load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// Is `tid` parked inside a syscall? `/proc/<pid>/syscall` and
+/// `/proc/<pid>/wchan` both need exactly this question answered: Linux's
+/// `task_current_syscall` only reports a frame for a task that is not on a
+/// CPU, and prints "running" otherwise.
+#[inline]
+pub(crate) fn parked_in_syscall(tid: u64) -> bool {
+    task_get(tid).is_some_and(|task| task.uctx.parked_in_syscall.load(Ordering::Relaxed))
 }
 
 #[inline]

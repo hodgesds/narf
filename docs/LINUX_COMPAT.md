@@ -362,6 +362,14 @@ subdirs `fd/` (symlinks to backing paths), `fdinfo/`, `task/`, `ns/` (namespace
 symlinks in `flavour:[id]` form). `exe`/`cwd`/`root` symlinks and `statm`
 also present per bring-up notes.
 
+`personality` reports the real per-task word; `sched`/`schedstat` report the
+task's on-CPU time, completed slices and voluntary/involuntary switch counts;
+`wchan` names the syscall a parked task is blocked in and `syscall` reports
+that task's saved frame (`"running"` otherwise, as Linux does for a task on a
+CPU). What those files cannot source from NARF — run-queue wait time, PELT
+averages, migration counts, a kernel-stack backtrace — is zeroed with a
+`LINUX-GAP` note at the renderer rather than invented.
+
 ### `/sys` (sysfs — `filesystem/src/sysfs.rs`)
 
 Kobject tree: `class/block/<dev>/` (`size`, `removable`, `queue/scheduler`),

@@ -15,9 +15,11 @@
 //! | /proc/sys/kernel/keys/maxkeys      | "200\n"   | no keyring subsystem |
 //! | /proc/sys/user/max_*_namespaces    | "0\n"     | namespace support disabled in this build |
 //!
-//! NOTE: `/proc/<pid>/cgroup`, `/proc/<pid>/personality`, and
-//! `/proc/<pid>/wchan` are per-task stubs that live in `pid_ext.rs`
-//! because they are served through the per-pid `DirOps` path.
+//! NOTE: `/proc/<pid>/cgroup` is a per-task stub that lives in `pid_ext.rs`
+//! because it is served through the per-pid `DirOps` path.
+//! `/proc/<pid>/personality` and `/proc/<pid>/wchan` were listed here too;
+//! both now report real per-task state (the personality word, and the
+//! syscall a parked task is blocked in) and are no longer stubs.
 //!
 //! NOTE: `/proc/sys/kernel/modprobe` is implemented in `sys_kernel.rs`
 //! and is intentionally NOT duplicated here.

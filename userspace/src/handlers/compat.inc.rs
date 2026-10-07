@@ -7130,6 +7130,78 @@ pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat>
     })
 }
 
+/// `/proc/<pid>/{sched,schedstat,wchan,syscall}` hook — the per-task
+/// scheduler accounting and, for a task parked inside a syscall, the frame it
+/// is parked in.
+///
+/// Linux reads the same four files out of `task_struct` + `pt_regs`:
+/// `se.sum_exec_runtime` (on-CPU ns), `nr_{voluntary,involuntary}_switches`,
+/// and `task_current_syscall()`, which reports a frame only for a task that
+/// is NOT on a CPU and leaves `/proc/<pid>/syscall` printing "running"
+/// otherwise. NARF's park flag (`parked_in_syscall`) is exactly that
+/// condition, and the saved register state is the same snapshot
+/// `PTRACE_GETREGS` serves.
+pub fn proc_sched_snapshot(pid: u64) -> narf_filesystem::procfs::ProcSchedSnapshot {
+    let task = proc_pid_to_tid(pid);
+    let (timeslices, voluntary_switches, involuntary_switches) = crate::task::switch_counts(task);
+    let syscall = proc_task_syscall_frame(task);
+    // The handler a parked task is waiting in. A task parked outside a
+    // syscall (or one still running) has no site to name, and Linux prints 0
+    // for exactly that case.
+    let wchan = syscall
+        .and_then(|frame| crate::syscall::syscall_name_of_number(frame[0]))
+        .map(alloc::string::String::from);
+    narf_filesystem::procfs::ProcSchedSnapshot {
+        run_ns: cpu_time_ns_of(task).saturating_add(kern_time_ns_of(task)),
+        timeslices,
+        voluntary_switches,
+        involuntary_switches,
+        policy: read_sched_state(task).policy as u32,
+        nice: nice_of(pid),
+        syscall,
+        wchan,
+    }
+}
+
+/// `kernel/sched/syscalls.c::task_current_syscall()` — the syscall frame of a
+/// task that is parked, as `[nr, arg0..arg5, sp, pc]`.
+///
+/// `None` for a task that is not parked inside a syscall, which is what makes
+/// `/proc/<pid>/syscall` print "running": Linux fails the same way for a task
+/// still on a CPU, because the frame it would read is being written.
+///
+/// The registers are the parked task's saved user state. Nothing extra is
+/// recorded at syscall entry to make this work — at a park, the syscall
+/// number is still in the register the ABI delivered it in (the return value
+/// has not been written yet), exactly as Linux's `pt_regs->orig_ax` holds it.
+fn proc_task_syscall_frame(task: u64) -> Option<[u64; 9]> {
+    if !crate::task::parked_in_syscall(task) {
+        return None;
+    }
+    crate::user_task::with_user_task_ctx(task, |uctx| {
+        // SAFETY: the task is parked, so its saved state is complete and no
+        // trap path is writing it — the same contract `get_tracee_regs` reads
+        // a stopped tracee's state under.
+        let state = unsafe { *uctx.state.get() };
+        #[cfg(target_arch = "x86_64")]
+        {
+            // syscall(2) ABI: nr in rax, args in rdi/rsi/rdx/r10/r8/r9.
+            [
+                state.rax, state.rdi, state.rsi, state.rdx, state.r10, state.r8, state.r9,
+                state.rsp, state.rip,
+            ]
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // svc #0 ABI: nr in x8, args in x0..x5.
+            [
+                state.x[8], state.x[0], state.x[1], state.x[2], state.x[3], state.x[4], state.x[5],
+                state.sp, state.pc,
+            ]
+        }
+    })
+}
+
 /// `/proc/<pid>/task/<tid>/comm` write hook — what `pthread_setname_np` uses.
 /// The name is already clamped to TASK_COMM_LEN-1 by procfs.
 pub fn proc_set_thread_comm(tid: u64, name: &str) -> Result<(), narf_filesystem::FsError> {

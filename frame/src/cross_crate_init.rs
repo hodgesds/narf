@@ -170,6 +170,9 @@ fn install_proc_ext_hooks() {
     narf_filesystem::procfs::set_fd_list_hook(narf_userspace::handlers::proc_fd_list);
     // /proc/<pid>/personality: the per-task execution domain + flags.
     narf_filesystem::procfs::set_personality_hook(narf_userspace::handlers::personality_of_pid);
+    // /proc/<pid>/{sched,schedstat,wchan,syscall}: the per-task scheduler
+    // accounting and the saved frame of a task parked in a syscall.
+    narf_filesystem::procfs::set_sched_snapshot_hook(narf_userspace::handlers::proc_sched_snapshot);
     // /sys/class/net/<dev>: every interface the network stack has, under the
     // name and ifindex rtnetlink reports, so udev's database (keyed on
     // ifindex) and NetworkManager agree about which device is which.
