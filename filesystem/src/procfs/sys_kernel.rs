@@ -319,6 +319,15 @@ pub fn install_ipc_sysctl_hooks(read: IpcSysctlReadFn, write: IpcSysctlWriteFn) 
     IPC_SYSCTL_WRITE.store(write as usize, Ordering::Release);
 }
 
+pub(super) fn read_ipc_limit_for(key: u8) -> String {
+    read_ipc_limit(key)
+}
+
+/// As [`read_ipc_limit_for`], for a write.
+pub(super) fn write_ipc_limit_for(key: u8, value: &str) -> Result<(), FsError> {
+    write_ipc_limit(key, value)
+}
+
 fn read_ipc_limit(key: u8) -> String {
     let v = IPC_SYSCTL_READ.load(Ordering::Acquire);
     if v == 0 {

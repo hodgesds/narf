@@ -477,6 +477,9 @@ pub struct IpcLimits {
     pub shmmni: usize,
     /// `shm_rmid_forced`.
     pub shm_rmid_forced: bool,
+    /// POSIX message queues (`/proc/sys/fs/mqueue/*`), which Linux keeps on
+    /// the same `ipc_namespace`.
+    pub mq: narf_filesystem::mqueuefs::MqueueLimits,
 }
 
 impl Default for IpcLimits {
@@ -493,6 +496,7 @@ impl Default for IpcLimits {
             shmall: None,
             shmmni: SHMMNI,
             shm_rmid_forced: false,
+            mq: narf_filesystem::mqueuefs::MqueueLimits::default(),
         }
     }
 }
@@ -540,6 +544,12 @@ pub enum IpcSysctl {
     Shmall,
     Shmmni,
     ShmRmidForced,
+    /// `/proc/sys/fs/mqueue/queues_max`.
+    MqQueuesMax,
+    MqMsgMax,
+    MqMsgsizeMax,
+    MqMsgDefault,
+    MqMsgsizeDefault,
 }
 
 impl IpcSysctl {
@@ -554,6 +564,11 @@ impl IpcSysctl {
             5 => Self::Shmall,
             6 => Self::Shmmni,
             7 => Self::ShmRmidForced,
+            8 => Self::MqQueuesMax,
+            9 => Self::MqMsgMax,
+            10 => Self::MqMsgsizeMax,
+            11 => Self::MqMsgDefault,
+            12 => Self::MqMsgsizeDefault,
             _ => return None,
         })
     }
@@ -577,6 +592,11 @@ pub fn sysctl_read(key: IpcSysctl) -> alloc::string::String {
         IpcSysctl::Shmall => alloc::format!("{}\n", effective_shmall(&l)),
         IpcSysctl::Shmmni => alloc::format!("{}\n", l.shmmni),
         IpcSysctl::ShmRmidForced => u8::from(l.shm_rmid_forced).to_string() + "\n",
+        IpcSysctl::MqQueuesMax => alloc::format!("{}\n", l.mq.queues_max),
+        IpcSysctl::MqMsgMax => alloc::format!("{}\n", l.mq.msg_max),
+        IpcSysctl::MqMsgsizeMax => alloc::format!("{}\n", l.mq.msgsize_max),
+        IpcSysctl::MqMsgDefault => alloc::format!("{}\n", l.mq.msg_default),
+        IpcSysctl::MqMsgsizeDefault => alloc::format!("{}\n", l.mq.msgsize_default),
     }
 }
 
@@ -657,6 +677,42 @@ pub fn sysctl_write(key: IpcSysctl, value: &str) -> Result<(), i64> {
                 // detach that will never come.
                 crate::handlers::shm_destroy_orphaned(ns);
             }
+        }
+        // `mq_sysctls`: `queues_max` is a plain `proc_dointvec`, while the
+        // other four are `proc_dointvec_minmax` over the ranges
+        // `mq_sysctls`'s `extra1`/`extra2` declare — a value outside one is
+        // EINVAL, not a clamp.
+        IpcSysctl::MqQueuesMax => {
+            let v = usize::try_from(one(&fields)?).map_err(|_| EINVAL)?;
+            with_limits_mut(ns, |l| l.mq.queues_max = v);
+        }
+        IpcSysctl::MqMsgMax | IpcSysctl::MqMsgDefault => {
+            let v = i64::try_from(one(&fields)?).map_err(|_| EINVAL)?;
+            // `msg_max_limit_min` = 1, `msg_max_limit_max` = HARD_MSGMAX.
+            if !(1..=narf_filesystem::mqueuefs::MQ_HARD_MAXMSG).contains(&v) {
+                return Err(EINVAL);
+            }
+            with_limits_mut(ns, |l| {
+                if key == IpcSysctl::MqMsgMax {
+                    l.mq.msg_max = v;
+                } else {
+                    l.mq.msg_default = v;
+                }
+            });
+        }
+        IpcSysctl::MqMsgsizeMax | IpcSysctl::MqMsgsizeDefault => {
+            let v = i64::try_from(one(&fields)?).map_err(|_| EINVAL)?;
+            // `msg_maxsize_limit_min` = 128, `..._max` = HARD_MSGSIZEMAX.
+            if !(128..=narf_filesystem::mqueuefs::MQ_HARD_MSGSIZE).contains(&v) {
+                return Err(EINVAL);
+            }
+            with_limits_mut(ns, |l| {
+                if key == IpcSysctl::MqMsgsizeMax {
+                    l.mq.msgsize_max = v;
+                } else {
+                    l.mq.msgsize_default = v;
+                }
+            });
         }
     }
     Ok(())

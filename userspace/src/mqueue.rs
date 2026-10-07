@@ -231,6 +231,11 @@ pub fn sys_mq_open(ctx: &mut dyn TrapContext) {
             uid,
             gid,
             attr,
+            // The namespace's `/proc/sys/fs/mqueue/*` values and the one
+            // capability that relaxes them (`capable(CAP_SYS_RESOURCE)`),
+            // which the backend read as `uid == 0`.
+            limits: crate::sysvipc::current_limits().mq,
+            privileged: crate::handlers::capable(crate::handlers::CAP_SYS_RESOURCE),
         },
     ) {
         Ok(file) => file,

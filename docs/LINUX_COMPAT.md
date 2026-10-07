@@ -364,8 +364,10 @@ also present per bring-up notes. `sysvipc/{sem,msg,shm}` list the System V
 IPC objects of the reader's IPC namespace in `ipc_init_proc_interface`'s
 column layout (what `ipcs`/`lsipc` prefer over the `*ctl(IPC_STAT)` walk),
 and `/proc/sys/kernel/{sem,msgmax,msgmnb,msgmni,shmmax,shmall,shmmni,
-shm_rmid_forced}` are the per-IPC-namespace limits `ipc/ipc_sysctl.c`
-exposes — writable, and enforced by the syscalls that read them.
+shm_rmid_forced}` and `/proc/sys/fs/mqueue/{queues_max,msg_max,msgsize_max,
+msg_default,msgsize_default}` are the per-IPC-namespace limits
+`ipc/ipc_sysctl.c` and `ipc/mqueue.c` expose — writable, and enforced by the
+syscalls that read them.
 
 `personality` reports the real per-task word; `sched`/`schedstat` report the
 task's on-CPU time, completed slices and voluntary/involuntary switch counts;

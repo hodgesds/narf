@@ -150,6 +150,26 @@ pub fn aio_max_nr() -> u64 {
 
 /// Register every `/proc/sys/fs/*` sysctl. Called once at boot.
 /// Idempotent — repeated calls replace the existing entries.
+// One read/write pair per `fs/mqueue/` key: a `ctl_table` entry carries
+// plain fn pointers, and the values live with the IPC namespaces in
+// `narf_userspace` (see `sys_kernel::install_ipc_sysctl_hooks`).
+macro_rules! mq_limit_file {
+    ($read:ident, $write:ident, $index:expr) => {
+        fn $read() -> String {
+            super::sys_kernel::read_ipc_limit_for($index)
+        }
+        fn $write(value: &str) -> Result<(), FsError> {
+            super::sys_kernel::write_ipc_limit_for($index, value)
+        }
+    };
+}
+
+mq_limit_file!(read_mq_queues_max, write_mq_queues_max, 8);
+mq_limit_file!(read_mq_msg_max, write_mq_msg_max, 9);
+mq_limit_file!(read_mq_msgsize_max, write_mq_msgsize_max, 10);
+mq_limit_file!(read_mq_msg_default, write_mq_msg_default, 11);
+mq_limit_file!(read_mq_msgsize_default, write_mq_msgsize_default, 12);
+
 pub fn register_all() {
     // file-max: global open-file ceiling; seeded at the i64-max
     // effective-unlimited value systemd expects to read back.
@@ -166,6 +186,36 @@ pub fn register_all() {
 
     // file-nr: read-only three-integer snapshot.
     // Linux ref: `fs/file.c` proc_nr_files().
+    // `ipc/mqueue.c`'s `mq_sysctls`, registered under `fs/mqueue/`: the
+    // per-IPC-namespace POSIX message-queue limits, which `mq_open` enforces.
+    // None of the five existed, so a `/etc/sysctl.d` drop-in naming one got
+    // ENOENT and the limits were compile-time constants.
+    for (path, key) in [
+        ("fs/mqueue/queues_max", 8u8),
+        ("fs/mqueue/msg_max", 9),
+        ("fs/mqueue/msgsize_max", 10),
+        ("fs/mqueue/msg_default", 11),
+        ("fs/mqueue/msgsize_default", 12),
+    ] {
+        register_sysctl(SysctlEntry {
+            path,
+            read: match key {
+                8 => read_mq_queues_max,
+                9 => read_mq_msg_max,
+                10 => read_mq_msgsize_max,
+                11 => read_mq_msg_default,
+                _ => read_mq_msgsize_default,
+            },
+            write: Some(match key {
+                8 => write_mq_queues_max,
+                9 => write_mq_msg_max,
+                10 => write_mq_msgsize_max,
+                11 => write_mq_msg_default,
+                _ => write_mq_msgsize_default,
+            }),
+            perms: 0o644,
+        });
+    }
     register_sysctl(SysctlEntry {
         path: "fs/file-nr",
         read: gen_file_nr,

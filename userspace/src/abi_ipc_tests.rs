@@ -2155,6 +2155,132 @@ kernel_test_in!(
     smoke_abi_ipc_shm_rmid_forced_destroys_orphans
 );
 
+/// `/proc/sys/fs/mqueue/*` — `ipc/mqueue.c`'s five per-namespace limits,
+/// which `mq_open` enforces. None of the files existed and the limits were
+/// compile-time constants, so a `/etc/sysctl.d` drop-in naming one got
+/// ENOENT and no deployment could change what a queue may be created with.
+fn smoke_abi_ipc_mqueue_sysctl_limits() -> TestResult {
+    with_setup(|| {
+        const MQ_PATHS: [(&[u8], &[u8]); 5] = [
+            (b"/proc/sys/fs/mqueue/queues_max\0", b"64\n"),
+            (b"/proc/sys/fs/mqueue/msg_max\0", b"20\n"),
+            (b"/proc/sys/fs/mqueue/msgsize_max\0", b"4096\n"),
+            (b"/proc/sys/fs/mqueue/msg_default\0", b"5\n"),
+            (b"/proc/sys/fs/mqueue/msgsize_default\0", b"512\n"),
+        ];
+        crate::sysvipc::__test_reset_limits();
+        let verdict = (|| -> Result<(), &'static str> {
+            for (path, value) in MQ_PATHS {
+                if ipc_sysctl_write(path, value) <= 0 {
+                    return Err("writing an fs/mqueue limit failed");
+                }
+                if ipc_sysctl_read(path)?.trim()
+                    != alloc::string::String::from_utf8_lossy(value).trim()
+                {
+                    return Err("an fs/mqueue limit did not read back what was written");
+                }
+            }
+            // `proc_dointvec_minmax`'s declared ranges: msg_max is
+            // [1, HARD_MSGMAX] and msgsize_max [128, HARD_MSGSIZEMAX].
+            if ipc_sysctl_write(b"/proc/sys/fs/mqueue/msg_max\0", b"0\n") != -22 {
+                return Err("msg_max must refuse a value below its minimum");
+            }
+            if ipc_sysctl_write(b"/proc/sys/fs/mqueue/msgsize_max\0", b"64\n") != -22 {
+                return Err("msgsize_max must refuse a value below 128");
+            }
+            if ipc_sysctl_write(b"/proc/sys/fs/mqueue/msg_max\0", b"65537\n") != -22 {
+                return Err("msg_max must refuse a value past HARD_MSGMAX");
+            }
+            Ok(())
+        })();
+        crate::sysvipc::__test_reset_limits();
+        verdict
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_mqueue_sysctl_limits);
+
+/// The written limits are what `mq_open` then enforces: an attr past
+/// `msg_max`/`msgsize_max` is EINVAL for an unprivileged caller, and a
+/// create with no attr takes `msg_default`/`msgsize_default`.
+fn smoke_abi_ipc_mqueue_limits_are_enforced() -> TestResult {
+    with_setup(|| {
+        const O_CREAT: u64 = 0o100;
+        const O_RDWR: u64 = 2;
+        // The syscall takes the name WITHOUT its leading slash: glibc's
+        // `mq_open` validates the `/` itself and passes `name + 1`, which
+        // is why the kernel's own tests use a bare name.
+        const MQ_NAME: &[u8] = b"narf-mq-limit\0";
+        crate::sysvipc::__test_reset_limits();
+        let task = crate::handlers::current_task_id();
+        let verdict = (|| -> Result<(), &'static str> {
+            if ipc_sysctl_write(b"/proc/sys/fs/mqueue/msg_max\0", b"4\n") <= 0
+                || ipc_sysctl_write(b"/proc/sys/fs/mqueue/msgsize_max\0", b"256\n") <= 0
+                || ipc_sysctl_write(b"/proc/sys/fs/mqueue/msg_default\0", b"3\n") <= 0
+                || ipc_sysctl_write(b"/proc/sys/fs/mqueue/msgsize_default\0", b"128\n") <= 0
+            {
+                return Err("writing the fs/mqueue limits failed");
+            }
+            // CAP_SYS_RESOURCE is the exemption, so drop it for the bounds to
+            // bind at all — exactly as on Linux, where a capable caller is
+            // bounded only by HARD_MSGMAX/HARD_MSGSIZEMAX.
+            const CAP_SYS_RESOURCE_BIT: u64 = 1 << 24;
+            crate::handlers::__test_set_caps(task, !CAP_SYS_RESOURCE_BIT, !CAP_SYS_RESOURCE_BIT);
+            // attr = { maxmsg: 8, msgsize: 128 } — past the written msg_max.
+            let attr: [i64; 4] = [0, 8, 128, 0];
+            let over = call(
+                Syscall::MqOpen.raw(),
+                a3(
+                    MQ_NAME.as_ptr() as u64,
+                    O_CREAT | O_RDWR,
+                    0o600,
+                    attr.as_ptr() as u64,
+                ),
+            );
+            if over != Some(EINVAL) {
+                if let Some(fd) = over.filter(|v| *v >= 0) {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                    let _ = call(Syscall::MqUnlink.raw(), a0(MQ_NAME.as_ptr() as u64));
+                }
+                return Err("mq_open past the written msg_max must be EINVAL");
+            }
+            // No attr: the defaults apply and the create succeeds.
+            let opened = call(
+                Syscall::MqOpen.raw(),
+                a3(MQ_NAME.as_ptr() as u64, O_CREAT | O_RDWR, 0o600, 0),
+            );
+            let fd = match opened {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("mq_open with no attr must take the defaults and succeed"),
+            };
+            let mut got = [0i64; 4];
+            let attrs = call(
+                Syscall::MqGetsetattr.raw(),
+                a3(fd, 0, got.as_mut_ptr() as u64, 0),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            let _ = call(Syscall::MqUnlink.raw(), a0(MQ_NAME.as_ptr() as u64));
+            if attrs != Some(0) {
+                return Err("mq_getsetattr on the new queue failed");
+            }
+            if got[1] != 3 || got[2] != 128 {
+                return Err("a default-attr queue did not take msg_default/msgsize_default");
+            }
+            Ok(())
+        })();
+        crate::sysvipc::__test_reset_limits();
+        restore_ipc_privilege(task);
+        let _ = call(
+            Syscall::MqUnlink.raw(),
+            a0(c"narf-mq-limit".as_ptr() as u64),
+        );
+        verdict
+    })
+}
+kernel_test_in!(
+    "syscall_abi/mqlimits",
+    smoke_abi_ipc_mqueue_limits_are_enforced
+);
+
 fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
     with_setup(|| {
         #[cfg(target_arch = "x86_64")]
