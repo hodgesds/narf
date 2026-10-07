@@ -525,10 +525,37 @@ impl AddressSpace {
     /// delivered as SIGBUS/BUS_ADRERR; `FileFaultError::NoMemory` →
     /// `ReclaimPressure` (`VM_FAULT_OOM`: wait for reclaim, retry), or
     /// `OutOfRange` when no reclaim can be requested. No failure backs the page.
+    ///
+    /// A page carrying an `MADV_GUARD_INSTALL` marker returns
+    /// `AddressSpaceError::GuardPage` (`VM_FAULT_SIGSEGV`, delivered as
+    /// SIGSEGV/SEGV_MAPERR; a kernel user copy over it is EFAULT) and is never
+    /// backed, swapped in, or remapped while the marker stands.
     pub unsafe fn demand_alloc_page(
         &self,
         vaddr: VirtAddr,
     ) -> Result<(), AddressSpaceError>;
+    /// `madvise(MADV_GUARD_INSTALL)` / `madvise(MADV_GUARD_REMOVE)`
+    /// (`mm/madvise.c`). Markers are per page and keyed by VA, like Linux's
+    /// guard PTE markers: fork copies them, mremap moves them (a truncated
+    /// tail drops its own), munmap/MAP_FIXED/brk shrink drop them, and
+    /// splits, merges, mprotect and MADV_DONTNEED/FREE keep them. Install
+    /// releases private pages as MADV_DONTNEED does; a SHARED page keeps its
+    /// borrowed frame but loses its leaf, and no installer (fault repair,
+    /// `materialize`, mprotect, mremap) maps it until the marker is removed.
+    /// Populate (mlock, MAP_POPULATE) skips guarded pages.
+    ///
+    /// Errors follow `madvise_walk_vmas`: VMAs are visited in order; a
+    /// LOCK_EXEMPT (`VM_SPECIAL`) or hugetlb VMA — or, for install only, a
+    /// LOCKED one — stops the walk with `OutOfRange` (EINVAL) after the
+    /// earlier VMAs were processed; a hole is `Unmapped` (ENOMEM) once the
+    /// whole range has been walked. A misaligned start is
+    /// `AlignmentMismatch` (EINVAL).
+    pub fn madvise_guard_install(&self, base: VirtAddr, len: u64)
+        -> Result<(), AddressSpaceError>;
+    pub fn madvise_guard_remove(&self, base: VirtAddr, len: u64)
+        -> Result<(), AddressSpaceError>;
+    /// Whether the page containing `va` carries a guard marker.
+    pub fn is_guard_page(&self, va: VirtAddr) -> bool;
     /// Materialize only current regions intersecting a page-aligned user range.
     /// The region lock is held through the page-table walk.
     pub unsafe fn materialize_range(
