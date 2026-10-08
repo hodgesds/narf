@@ -333,41 +333,48 @@ fn mid(max: u8) -> u8 {
 // The SMU mailbox protocol is in amdgpu_smu.rs; here we model the
 // per-message dispatch + the param-encoding rules.
 //
-// Per Linux Phoenix uses SMU v13_0_4 — message IDs from
-// pmfw_if/smu_v13_0_0_ppsmc.h (lines 67-80):
-//   PPSMC_MSG_SetSoftMinByFreq           = 0x19
-//   PPSMC_MSG_SetSoftMaxByFreq           = 0x1A
-//   PPSMC_MSG_SetHardMinByFreq           = 0x1B
-//   PPSMC_MSG_SetHardMaxByFreq           = 0x1C
-//   PPSMC_MSG_SetWorkloadMask            = 0x24
-//   PPSMC_MSG_SetMinDeepSleepDcefclk     = 0x24 (Renoir = rv_ppsmc.h)
+// LINUX-GAP: the message table that stood here was SMU **13.0.0**'s — Navi3x
+// discrete — introduced under the comment "Per Linux Phoenix uses SMU v13_0_4
+// — message IDs from pmfw_if/smu_v13_0_0_ppsmc.h", which names the wrong
+// header in its own sentence. The two generations share no message space.
+//
+// The five ids are correct for 13.0.0 and all mean something else on Phoenix
+// (`smu_v13_0_4_ppsmc.h`):
+//
+//   0x19  SetSoftMinByFreq   ->  AllowGfxOff
+//   0x1A  SetSoftMaxByFreq   ->  DisallowGfxOff
+//   0x1B  SetHardMinByFreq   ->  SetSoftMaxGfxClk
+//   0x1C  SetHardMaxByFreq   ->  SetHardMinGfxClk
+//   0x24  SetWorkloadMask    ->  SetSoftMinSocclkByFreq
+//
+// So a soft-min clamp would have told the SMU to allow GFXOFF and a soft-max
+// clamp to disallow it — the clocks never clamped, and GFXOFF got toggled on
+// every DPM decision instead.
+//
+// 13.0.4 has no generic by-frequency message and no workload mask at all. It
+// has one message per clock, which `amdgpu_smu_v13` carries and this now
+// routes through: `set_range_msgs` returns the pair for a domain, and the
+// param is a bare frequency in MHz with no domain byte.
 
-pub const PPSMC_MSG_SET_SOFT_MIN_BY_FREQ: u32 = 0x19;
-pub const PPSMC_MSG_SET_SOFT_MAX_BY_FREQ: u32 = 0x1A;
-pub const PPSMC_MSG_SET_HARD_MIN_BY_FREQ: u32 = 0x1B;
-pub const PPSMC_MSG_SET_HARD_MAX_BY_FREQ: u32 = 0x1C;
-pub const PPSMC_MSG_SET_WORKLOAD_MASK: u32 = 0x24;
-pub const PPSMC_MSG_SET_MIN_DEEP_SLEEP_DCEFCLK: u32 = 0x24;
+/// LINUX-GAP: `PPSMC_MSG_SetWorkloadMask` does not exist on SMU 13.0.4 —
+/// there is no workload-hint message in its 0x01..0x30 space. The power
+/// profile is expressed on this generation through the per-clock clamps and
+/// `SetSoftMinGfxclk`, so [`build_ppsmc_dispatch`] no longer emits one.
+/// `Dpm`'s workload mask is still computed and still meaningful to the
+/// driver's own policy; it just has nowhere to be sent.
+pub const SMU_13_0_4_HAS_NO_WORKLOAD_MASK: () = ();
 
-/// Encode a SetSoftMin/MaxByFreq param. High byte = clock-domain
-/// ID per SMU13 driver-IF; low 3 bytes = frequency in MHz.
+/// A frequency parameter for SMU 13.0.4's per-clock messages: the frequency
+/// in MHz, whole.
 ///
-/// Per `pm/swsmu/smu13/smu_v13_0.c::smu_cmn_send_msg_with_param`
-/// and the SMU13 driver-IF table.
-pub fn encode_freq_param(domain_id: u8, freq_mhz: u32) -> u32 {
-    ((domain_id as u32) << 24) | (freq_mhz & 0x00FF_FFFF)
-}
-
-/// SMU13 per-domain clock IDs (smu_v13_0 driver-IF). One byte each.
-pub fn smu13_domain_id(d: ClockDomain) -> u8 {
-    match d {
-        ClockDomain::Gfxclk => 0,
-        ClockDomain::Socclk => 1,
-        ClockDomain::Uclk => 2,
-        ClockDomain::Fclk => 3,
-        ClockDomain::Vclk => 4,
-        ClockDomain::Dclk => 5,
-    }
+/// LINUX-GAP: the previous `encode_freq_param` packed a clock-domain id into
+/// the top byte, which is 13.0.0's generic-message encoding
+/// (`SetSoftMinByFreq` takes `(clk_id << 16) | freq` there, and even that is
+/// a sixteen-bit shift, not twenty-four). On 13.0.4 the domain is the message
+/// id, so a domain byte in the parameter is a frequency of several hundred
+/// million MHz.
+pub fn encode_freq_param(freq_mhz: u32) -> u32 {
+    freq_mhz
 }
 
 /// One PPSMC message produced by the dispatch path.
@@ -377,33 +384,34 @@ pub struct PpsmcMessage {
     pub param: u32,
 }
 
-/// Build the full sequence of PPSMC messages needed to push the
-/// outcome of `Dpm::apply_inputs` to the SMU mailbox. Caller writes
-/// each in turn via the SMU mailbox driver.
+/// Build the sequence of PPSMC messages needed to push the outcome of
+/// `Dpm::apply_inputs` to the SMU mailbox. Caller writes each in turn via the
+/// SMU mailbox driver.
 ///
-/// Sequence:
-///   1. SetWorkloadMask — tells the SMU which workload hint to use
-///      for residency-based clock scaling.
-///   2. SetSoftMinByFreq + SetSoftMaxByFreq per domain — clamps
-///      the SMU's DPM controller to the kernel's chosen range.
+/// Two messages per domain — soft min then soft max — using the per-clock ids
+/// `amdgpu_smu_v13::set_range_msgs` resolves. A domain the generation has no
+/// message for (UCLK, VCLK and DCLK are all SMU-managed on this APU) is
+/// skipped rather than sent to a neighbouring message id.
+///
+/// `workload_mask` is accepted and ignored; see
+/// [`SMU_13_0_4_HAS_NO_WORKLOAD_MASK`].
 pub fn build_ppsmc_dispatch(
     workload_mask: u32,
     targets: &[(ClockDomain, u32)],
 ) -> Vec<PpsmcMessage> {
-    let mut msgs = Vec::with_capacity(1 + targets.len() * 2);
-    msgs.push(PpsmcMessage {
-        msg: PPSMC_MSG_SET_WORKLOAD_MASK,
-        param: workload_mask,
-    });
+    let _ = workload_mask;
+    let mut msgs = Vec::with_capacity(targets.len() * 2);
     for (domain, freq_mhz) in targets {
-        let domain_id = smu13_domain_id(*domain);
-        let param = encode_freq_param(domain_id, *freq_mhz);
+        let Some((set_min, set_max)) = crate::amdgpu_smu_v13::set_range_msgs(*domain) else {
+            continue;
+        };
+        let param = encode_freq_param(*freq_mhz);
         msgs.push(PpsmcMessage {
-            msg: PPSMC_MSG_SET_SOFT_MIN_BY_FREQ,
+            msg: set_min,
             param,
         });
         msgs.push(PpsmcMessage {
-            msg: PPSMC_MSG_SET_SOFT_MAX_BY_FREQ,
+            msg: set_max,
             param,
         });
     }
@@ -694,49 +702,55 @@ mod smoke_tests {
 
     // ── PPSMC dispatch ─────────────────────────────────────────
 
-    fn smoke_encode_freq_param_packs_domain_and_freq() -> TestResult {
-        // GFXCLK domain id = 0, 2400 MHz.
-        let p = encode_freq_param(0, 2400);
-        if p & 0xFF_FFFF != 2400 {
-            return TestResult::Fail("freq nibble wrong");
-        }
-        if p >> 24 != 0 {
-            return TestResult::Fail("domain id wrong");
-        }
-        // SOCCLK domain id = 1, 1200 MHz.
-        let p = encode_freq_param(1, 1200);
-        if p >> 24 != 1 {
-            return TestResult::Fail("socclk id wrong");
-        }
-        if p & 0xFF_FFFF != 1200 {
-            return TestResult::Fail("socclk freq wrong");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!("drivers/gpu", smoke_encode_freq_param_packs_domain_and_freq);
-
-    fn smoke_build_ppsmc_dispatch_workload_first() -> TestResult {
+    /// Message ids spelled out from `smu_v13_0_4_ppsmc.h`, with the 13.0.0
+    /// value each used to carry alongside, since the whole defect was sending
+    /// the other generation's table.
+    fn smoke_ppsmc_dispatch_uses_per_clock_messages() -> TestResult {
         let msgs = build_ppsmc_dispatch(
             0x100,
-            &[(ClockDomain::Gfxclk, 2400), (ClockDomain::Uclk, 3200)],
+            &[
+                (ClockDomain::Gfxclk, 2400),
+                // UCLK has no soft min/max message on this generation.
+                (ClockDomain::Uclk, 3200),
+                (ClockDomain::Socclk, 1200),
+            ],
         );
-        // 1 workload-mask + 2 domains × 2 (min + max) = 5 msgs.
-        if msgs.len() != 5 {
-            return TestResult::Fail("expected 5 msgs");
+        // Two messages for GFXCLK, none for UCLK, two for SOCCLK. No
+        // workload-mask message: 13.0.4 does not have one.
+        if msgs.len() != 4 {
+            return TestResult::Fail("expected two messages each for GFXCLK and SOCCLK only");
         }
-        if msgs[0].msg != PPSMC_MSG_SET_WORKLOAD_MASK || msgs[0].param != 0x100 {
-            return TestResult::Fail("workload mask not first");
+        // SetSoftMinGfxclk 0x09 then SetSoftMaxGfxClk 0x1B. The old table
+        // would have sent 0x19 and 0x1A, which are AllowGfxOff and
+        // DisallowGfxOff here.
+        if msgs[0].msg != 0x09 || msgs[1].msg != 0x1B {
+            return TestResult::Fail("GFXCLK clamps are SetSoftMinGfxclk 0x09 / SetSoftMax 0x1B");
         }
-        // After workload: per-domain MIN then MAX.
-        if msgs[1].msg != PPSMC_MSG_SET_SOFT_MIN_BY_FREQ {
-            return TestResult::Fail("not SOFT_MIN first per-domain");
+        // SetSoftMinSocclkByFreq 0x24 then SetSoftMaxSocclkByFreq 0x1D — the
+        // min is *above* the max in the message space, so neither can be
+        // derived from the other.
+        if msgs[2].msg != 0x24 || msgs[3].msg != 0x1D {
+            return TestResult::Fail("SOCCLK clamps are 0x24 min and 0x1D max");
         }
-        if msgs[2].msg != PPSMC_MSG_SET_SOFT_MAX_BY_FREQ {
-            return TestResult::Fail("not SOFT_MAX after MIN");
+        // The parameter is a bare frequency: a domain byte in the top would
+        // make 2400 MHz into hundreds of millions.
+        if msgs[0].param != 2400 || msgs[1].param != 2400 {
+            return TestResult::Fail("the param is the frequency in MHz, undecorated");
+        }
+        if msgs[2].param != 1200 {
+            return TestResult::Fail("SOCCLK param");
+        }
+        if encode_freq_param(2400) != 2400 {
+            return TestResult::Fail("no domain id is packed into the param");
+        }
+        // A domain with no message must be skipped, not sent to a neighbour.
+        let only_uclk = build_ppsmc_dispatch(0, &[(ClockDomain::Uclk, 3200)]);
+        if !only_uclk.is_empty() {
+            return TestResult::Fail("UCLK has no clamp message and must emit nothing");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_build_ppsmc_dispatch_workload_first);
+    kernel_test_in!("drivers/gpu", smoke_ppsmc_dispatch_uses_per_clock_messages);
 
     fn smoke_targets_to_freqs_indexes_level_table() -> TestResult {
         let mut dpm = Dpm::new();
@@ -769,16 +783,18 @@ mod smoke_tests {
         let targets = dpm.apply_inputs(inputs);
         let freqs = targets_to_freqs(&dpm, &targets);
         let msgs = build_ppsmc_dispatch(0, &freqs);
-        // Expect WORKLOAD + (MIN+MAX) per domain.
-        if msgs.len() != 1 + freqs.len() * 2 {
+        // Two messages per domain that has a clamp message, and no
+        // workload-mask message on this generation.
+        let clampable = freqs
+            .iter()
+            .filter(|(d, _)| crate::amdgpu_smu_v13::set_range_msgs(*d).is_some())
+            .count();
+        if msgs.len() != clampable * 2 {
             return TestResult::Fail("dispatch msg count off");
         }
-        // GFX should be at level max=2 → 2400 MHz.
-        let gfx_msg = msgs
-            .iter()
-            .find(|m| m.msg == PPSMC_MSG_SET_SOFT_MAX_BY_FREQ && m.param & 0xFF_FFFF == 2400);
-        if gfx_msg.is_none() {
-            return TestResult::Fail("no SOFT_MAX for GFX at 2400");
+        // GFX should be at level max=2 → 2400 MHz, via SetSoftMaxGfxClk 0x1B.
+        if !msgs.iter().any(|m| m.msg == 0x1B && m.param == 2400) {
+            return TestResult::Fail("no SetSoftMaxGfxClk for GFX at 2400");
         }
         TestResult::Pass
     }

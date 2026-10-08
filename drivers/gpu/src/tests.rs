@@ -3527,6 +3527,48 @@ fn smoke_amdgpu_pm4_acquire_mem_full_invalidate_layout() -> TestResult {
     if buf[6] != 4 {
         return TestResult::Fail("poll_interval wrong");
     }
+    // The bit positions, spelled out from soc15d.h's
+    // PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_* setters.
+    use crate::amdgpu_pm4::{
+        ACQUIRE_DB_DEST_BASE_ENA, ACQUIRE_SH_ICACHE_ACTION_ENA, ACQUIRE_SH_KCACHE_ACTION_ENA,
+        ACQUIRE_TCL1_ACTION_ENA, ACQUIRE_TC_ACTION_ENA, ACQUIRE_TC_WB_ACTION_ENA,
+    };
+    if ACQUIRE_TC_WB_ACTION_ENA != 1 << 18
+        || ACQUIRE_TCL1_ACTION_ENA != 1 << 22
+        || ACQUIRE_TC_ACTION_ENA != 1 << 23
+        || ACQUIRE_SH_KCACHE_ACTION_ENA != 1 << 27
+        || ACQUIRE_SH_ICACHE_ACTION_ENA != 1 << 29
+        || ACQUIRE_DB_DEST_BASE_ENA != 1 << 14
+    {
+        return TestResult::Fail("CP_COHER_CNTL bit positions");
+    }
+
+    // GFX10+ puts cache invalidation in a seventh payload dword, GCR_CNTL,
+    // so the packet is one dword longer and COHER_CNTL carries none of the
+    // bits above.
+    let mut buf = [0u32; 8];
+    {
+        let mut b = Pm4Builder::new(&mut buf);
+        if b.acquire_mem_gfx11(
+            0,
+            0,
+            !0u64,
+            4,
+            crate::amdgpu_pm4::GCR_FULL_SHADER_INVALIDATE,
+        )
+        .is_err()
+        {
+            return TestResult::Fail("acquire_mem_gfx11 emit failed");
+        }
+    }
+    if ((buf[0] >> 16) & 0x3FFF) != 6 {
+        return TestResult::Fail("the GFX11 form has seven data dwords, so count-1 is 6");
+    }
+    // GLI_INV=1 at 0, GLM_WB/INV at 4/5, GLK_WB/INV at 6/7, GLV_INV at 8,
+    // GL1_INV at 9, GL2_INV/WB at 14/15. Literal, from nvd.h.
+    if buf[7] != 0x0000_C3F1 {
+        return TestResult::Fail("GCR_CNTL full-invalidate encoding");
+    }
     TestResult::Pass
 }
 kernel_test_in!(

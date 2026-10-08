@@ -73,9 +73,20 @@ pub enum Pm4Op {
     ContextControl = 0x28,
 }
 
-// ── ACQUIRE_MEM coher-cntl bits (GFX9 — gfx_v9_0.c) ────────────────
+// ── ACQUIRE_MEM coher-cntl bits (GFX9 only) ───────────────────────
 //
-// Each bit gates flushing one cache.
+// Each bit gates flushing one cache. Positions verified against
+// `soc15d.h`'s `PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_*` setters.
+//
+// LINUX-GAP: `CP_COHER_CNTL` is the GFX9 form. GFX10 and up moved cache
+// invalidation into a **ninth dword**, `GCR_CNTL`, with an entirely different
+// field layout — GLI_INV at 0, GLM_WB/INV at 4/5, GLK_WB/INV at 6/7, GLV_INV
+// at 8, GL1_INV at 9, GL2_DISCARD/INV/WB at 13/14/15, SEQ at 16
+// (`nvd.h`). None of the bits below exist there, so a GFX11 ring fed
+// [`ACQUIRE_FULL_SHADER_INVALIDATE`] through [`Pm4Builder::acquire_mem`]
+// would set reserved bits in COHER_CNTL, invalidate nothing, and be one dword
+// short of the packet the CP expects. [`Pm4Builder::acquire_mem_gfx11`] is the
+// form for the target chip.
 
 /// L1 texture cache invalidate.
 pub const ACQUIRE_TCL1_ACTION_ENA: u32 = 1 << 22;
@@ -94,12 +105,29 @@ pub const ACQUIRE_DB_DEST_BASE_ENA: u32 = 1 << 14;
 
 /// Composite mask: invalidate every shader-visible cache. Use this
 /// between compute dispatches when the next dispatch can't trust
-/// any cache residency.
+/// any cache residency. **GFX9 only** — see the gap note above.
 pub const ACQUIRE_FULL_SHADER_INVALIDATE: u32 = ACQUIRE_TCL1_ACTION_ENA
     | ACQUIRE_TC_ACTION_ENA
     | ACQUIRE_TC_WB_ACTION_ENA
     | ACQUIRE_SH_ICACHE_ACTION_ENA
     | ACQUIRE_SH_KCACHE_ACTION_ENA;
+
+/// The GFX10+ `GCR_CNTL` equivalent: write back and invalidate every
+/// shader-visible cache. Fields from `nvd.h` via
+/// [`crate::amdgpu_pm4_defs`], which audited exact. `GLI_INV` takes the
+/// two-bit encoding 1 (ALL) rather than a flag.
+pub const GCR_FULL_SHADER_INVALIDATE: u32 = {
+    use crate::amdgpu_pm4_defs as d;
+    d::packet3_acquire_mem_gcr_cntl_gli_inv(1)
+        | d::packet3_acquire_mem_gcr_cntl_glm_wb(1)
+        | d::packet3_acquire_mem_gcr_cntl_glm_inv(1)
+        | d::packet3_acquire_mem_gcr_cntl_glk_wb(1)
+        | d::packet3_acquire_mem_gcr_cntl_glk_inv(1)
+        | d::packet3_acquire_mem_gcr_cntl_glv_inv(1)
+        | d::packet3_acquire_mem_gcr_cntl_gl1_inv(1)
+        | d::packet3_acquire_mem_gcr_cntl_gl2_inv(1)
+        | d::packet3_acquire_mem_gcr_cntl_gl2_wb(1)
+};
 
 /// PM4 packet builder. Writes 32-bit words into `out`; returns
 /// the byte length the caller should advance the ring's
@@ -222,6 +250,33 @@ impl<'a> Pm4Builder<'a> {
         self.push(coher_base as u32)?;
         self.push((coher_base >> 32) as u32)?;
         self.push(poll_interval)?;
+        Ok(())
+    }
+
+    /// `ACQUIRE_MEM` in its GFX10+ form: the same six payload dwords followed
+    /// by a seventh, `GCR_CNTL`, which is where cache invalidation lives from
+    /// GFX10 onward (`nvd.h`). `COHER_CNTL` keeps only `ENGINE_SEL` at bit 31.
+    ///
+    /// `gcr_cntl` is built from the `packet3_acquire_mem_gcr_cntl_*` encoders
+    /// in [`crate::amdgpu_pm4_defs`], or [`GCR_FULL_SHADER_INVALIDATE`] for
+    /// the equivalent of the GFX9 composite.
+    pub fn acquire_mem_gfx11(
+        &mut self,
+        coher_cntl: u32,
+        coher_base: u64,
+        coher_size: u64,
+        poll_interval: u32,
+        gcr_cntl: u32,
+    ) -> Result<(), Pm4Error> {
+        let hdr = Self::type3_header(Pm4Op::AcquireMem, 7)?;
+        self.push(hdr)?;
+        self.push(coher_cntl)?;
+        self.push(coher_size as u32)?;
+        self.push((coher_size >> 32) as u32)?;
+        self.push(coher_base as u32)?;
+        self.push((coher_base >> 32) as u32)?;
+        self.push(poll_interval)?;
+        self.push(gcr_cntl)?;
         Ok(())
     }
 
