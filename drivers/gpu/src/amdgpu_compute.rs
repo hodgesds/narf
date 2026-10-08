@@ -44,24 +44,35 @@ use alloc::vec::Vec;
 
 // ── PM4 opcodes (PACKET_TYPE3) ───────────────────────────────────
 //
-// Values per Linux `soc15d.h`. PACKET3 header format:
+// Values per Linux `nvd.h`/`soc15d.h`. PACKET3 header format:
 //   bits[31:30] = type (= 3)
-//   bits[29:16] = predicate / reserved
+//   bits[29:16] = (count - 1) in dwords, fourteen bits
 //   bits[15:8]  = opcode
-//   bits[7:0]   = (count - 1) in dwords
+//   bits[7:1]   = predicate / compute flag
 //
-// `PACKET3_COMPUTE` sets bit 1 of the count field to flag a
-// compute-queue packet (vs GFX queue).
+// `PACKET3_COMPUTE` additionally sets bit 1 to flag a compute-queue packet.
 
-/// Packet header dword for `(opcode, count)`.
+/// Packet header dword for `(opcode, count - 1)`.
+///
+/// The count occupies bits **29:16**, not 7:0 — `PACKET3(op, n)` is
+/// `(PACKET_TYPE3 << 30) | ((op & 0xFF) << 8) | ((n & 0x3FFF) << 16)`. This
+/// delegates to [`crate::amdgpu_pm4_defs::packet3`], the mechanical mirror of
+/// that macro, rather than keeping a second hand-written copy.
+///
+/// LINUX-GAP: the copy that stood here put the count in bits 7:0, and its own
+/// comment described the layout that way — "bits[29:16] = predicate /
+/// reserved, bits[7:0] = (count - 1)". A fourteen-bit count in the low byte
+/// also truncates: every KIQ packet this module builds would have declared a
+/// length of zero dwords in the field the CP reads, and set the compute flag's
+/// neighbouring predicate bits instead.
 pub const fn packet3(opcode: u8, count_minus_one: u8) -> u32 {
-    (3u32 << 30) | ((opcode as u32) << 8) | (count_minus_one as u32)
+    crate::amdgpu_pm4_defs::packet3(opcode as u32, count_minus_one as u32)
 }
 
-/// Same as [`packet3`] but flags the packet as bound for a
-/// compute queue (sets bit 1).
+/// Same as [`packet3`] but flags the packet as bound for a compute queue
+/// (`PACKET3_COMPUTE` sets bit 1).
 pub const fn packet3_compute(opcode: u8, count_minus_one: u8) -> u32 {
-    packet3(opcode, count_minus_one) | (1 << 1)
+    crate::amdgpu_pm4_defs::packet3_compute(opcode as u32, count_minus_one as u32)
 }
 
 /// PACKET3 NOP.
@@ -525,22 +536,59 @@ mod smoke_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    /// `PACKET3(op, n)` from `nvd.h`, spelled out: type at 31:30, count-1 at
+    /// **29:16**, opcode at 15:8.
     fn smoke_packet3_header_encoding() -> TestResult {
-        // PACKET3 (op=NOP=0x10, count-1=0).
         let h = packet3(PACKET3_NOP, 0);
-        if h >> 30 != 3 {
-            return TestResult::Fail("type field wrong");
+        if h != 0xC000_1000 {
+            return TestResult::Fail("PACKET3(NOP, 0) is 0xC0001000");
         }
-        if (h >> 8) & 0xFF != PACKET3_NOP as u32 {
-            return TestResult::Fail("opcode field wrong");
+        // A non-zero count must land in bits 29:16, not the low byte.
+        let h = packet3(PACKET3_SET_RESOURCES, 6);
+        if h != 0xC006_A000 {
+            return TestResult::Fail("the count goes in bits 29:16");
         }
         if h & 0xFF != 0 {
-            return TestResult::Fail("count field wrong");
+            return TestResult::Fail("the low byte carries the predicate, not the count");
         }
-        // PACKET3_COMPUTE sets bit 1 of count.
+        // A count wider than a byte must survive: the field is fourteen bits.
+        if (packet3(PACKET3_NOP, 0xFF) >> 16) & 0x3FFF != 0xFF {
+            return TestResult::Fail("the count field is fourteen bits wide");
+        }
+        // PACKET3_COMPUTE adds bit 1 on top.
         let h = packet3_compute(PACKET3_INDIRECT_BUFFER, 2);
-        if h & (1 << 1) == 0 {
-            return TestResult::Fail("compute flag not set");
+        if h != 0xC002_3F02 {
+            return TestResult::Fail("PACKET3_COMPUTE(INDIRECT_BUFFER, 2)");
+        }
+        // Opcodes, from nvd.h.
+        if PACKET3_NOP != 0x10
+            || PACKET3_INDIRECT_BUFFER != 0x3F
+            || PACKET3_SET_RESOURCES != 0xA0
+            || PACKET3_MAP_QUEUES != 0xA2
+            || PACKET3_UNMAP_QUEUES != 0xA3
+            || PACKET3_QUERY_STATUS != 0xA4
+        {
+            return TestResult::Fail("KIQ opcode values");
+        }
+        // MAP_QUEUES field shifts, which are not evenly spaced.
+        if MAP_QUEUES_QUEUE_SEL_SHIFT != 4
+            || MAP_QUEUES_VMID_SHIFT != 8
+            || MAP_QUEUES_QUEUE_SHIFT != 13
+            || MAP_QUEUES_PIPE_SHIFT != 16
+            || MAP_QUEUES_ME_SHIFT != 18
+            || MAP_QUEUES_QUEUE_TYPE_SHIFT != 21
+            || MAP_QUEUES_ALLOC_FORMAT_SHIFT != 24
+            || MAP_QUEUES_ENGINE_SEL_SHIFT != 26
+            || MAP_QUEUES_NUM_QUEUES_SHIFT != 29
+            || MAP_QUEUES_DOORBELL_OFFSET_SHIFT != 2
+        {
+            return TestResult::Fail("MAP_QUEUES field shifts");
+        }
+        if SET_RESOURCES_VMID_MASK_SHIFT != 0
+            || SET_RESOURCES_UNMAP_LATENCY_SHIFT != 16
+            || SET_RESOURCES_QUEUE_TYPE_SHIFT != 29
+        {
+            return TestResult::Fail("SET_RESOURCES field shifts");
         }
         TestResult::Pass
     }

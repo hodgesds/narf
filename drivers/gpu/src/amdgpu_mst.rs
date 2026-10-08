@@ -319,8 +319,9 @@ impl Topology {
 //      VCPI_PAYLOAD_TABLE_UPDATED bit.
 //   3. Send the ALLOCATE_PAYLOAD MST sideband message over AUX to
 //      the branch+sink pair so the branch updates its own table.
-//   4. Send the ENABLE_STREAM SB message — flips the branch from
-//      "VCPI reserved" → "VCPI carrying real pixels".
+//   4. Send POWER_UP_PHY for the sink's port on that branch. There is no
+//      "enable stream" sideband request; step 2's DPCD sequence is what makes
+//      the VCPI carry pixels.
 //
 // References (post 2026-05-20 GPL relicense):
 //   - drivers/gpu/drm/display/drm_dp_mst_topology.c (drm_dp_mst_*
@@ -338,12 +339,29 @@ pub const DPCD_PAYLOAD_TABLE_UPDATE_STATUS: u16 = 0x02C0;
 /// has reached it. Cleared by writing 1 back.
 pub const PAYLOAD_TABLE_UPDATED_BIT: u8 = 1 << 0;
 
-/// MST sideband message opcodes (subset).
-/// Per VESA DP MST spec.
-pub const MST_SB_ALLOCATE_PAYLOAD: u8 = 0x10;
-pub const MST_SB_ENABLE_STREAM: u8 = 0x12;
-pub const MST_SB_REMOTE_DPCD_READ: u8 = 0x20;
-pub const MST_SB_REMOTE_DPCD_WRITE: u8 = 0x21;
+/// `DP_POWER_UP_PHY` / `DP_POWER_DOWN_PHY` — the sideband requests that light
+/// a downstream port (`drm_dp_send_power_updown_phy`).
+pub const SB_POWER_UP_PHY: u8 = 0x24;
+pub const SB_POWER_DOWN_PHY: u8 = 0x25;
+
+// LINUX-GAP: a second opcode block stood here —
+//
+//   MST_SB_ALLOCATE_PAYLOAD = 0x10
+//   MST_SB_ENABLE_STREAM    = 0x12
+//
+// — duplicating the `SB_*` set above with wrong values. `DP_ALLOCATE_PAYLOAD`
+// is **0x11**; 0x10 is `DP_ENUM_PATH_RESOURCES`, so every allocation request
+// asked the branch to enumerate its path resources instead.
+// `SB_ALLOCATE_PAYLOAD` three hundred lines up had it right, which is what
+// made the duplicate possible.
+//
+// There is no ENABLE_STREAM sideband request at all. DP 1.2a Table 2-80 runs
+// 0x00, 0x01, 0x02, 0x10..0x14, 0x20..0x25, 0x30, 0x38, and 0x12 is
+// `DP_QUERY_PAYLOAD`. Enabling a stream on MST is the DPCD sequence
+// [`commit_payload_to_sink`] already performs — ALLOCATE_SET,
+// START_TIME_SLOT, TIME_SLOT_COUNT, then the ACT trigger. The nearest real
+// sideband is `DP_POWER_UP_PHY`, which is what Linux sends to bring a
+// downstream port up, and that is what replaces it.
 
 /// Trait for the host driver's AUX channel. Same shape as the
 /// existing dp_aux module's transport.
@@ -352,9 +370,18 @@ pub trait MstAux {
     fn dpcd_write_u8(&mut self, addr: u16, value: u8) -> u8;
     /// Read a DPCD byte.
     fn dpcd_read_u8(&mut self, addr: u16) -> u8;
-    /// Issue an MST sideband message (already packetised + checksummed).
-    /// Returns the response payload.
-    fn sb_message(&mut self, opcode: u8, body: &[u8]) -> alloc::vec::Vec<u8>;
+    /// Issue an MST sideband message. The implementor builds the message
+    /// header — `(lct << 4) | lcr`, then `rad[0..lct/2]`, then the
+    /// length/flags bytes and the CRC4 (`drm_dp_encode_sideband_msg_hdr`) —
+    /// and appends `body`, which is the request-specific payload only.
+    ///
+    /// LINUX-GAP: the previous signature took `(opcode, body)` and callers
+    /// pushed the LCT and RAD into `body`. Those are header fields: the
+    /// relative address identifies the destination branch and is covered by
+    /// the header CRC, not by the request payload. A request with them in the
+    /// body is addressed to nothing and has extra bytes where the branch
+    /// expects its first field.
+    fn sb_message(&mut self, opcode: u8, lct: u8, rad: &[u8], body: &[u8]) -> alloc::vec::Vec<u8>;
 }
 
 /// Poll cap for the PAYLOAD_TABLE_UPDATE_STATUS bit.
@@ -397,11 +424,12 @@ pub fn commit_payload_to_sink<A: MstAux>(
     Ok(())
 }
 
-/// Send the ALLOCATE_PAYLOAD MST sideband message — tells the
-/// branch+leaf chain about the new VCPI's bandwidth + lct/rad.
+/// Send the ALLOCATE_PAYLOAD MST sideband message — tells the branch about
+/// the new VCPI's bandwidth.
 pub fn send_allocate_payload<A: MstAux>(
     aux: &mut A,
     vcpi: u8,
+    sink_port: u8,
     pbn: u16,
     branch_lct: u8,
     branch_rad: &[u8],
@@ -409,51 +437,66 @@ pub fn send_allocate_payload<A: MstAux>(
     if vcpi == 0 || vcpi > 63 {
         return Err(MstStreamError::BadVcpi);
     }
-    // Body layout per DP MST spec §2.11.5.3:
-    //   [LCT | RAD bytes... | VCPI | PBN]
-    // PBN is encoded as a single payload byte (low byte; high byte is
-    // always 0 for practical bandwidths and is omitted by the branch).
-    let mut body = alloc::vec::Vec::with_capacity(3 + branch_rad.len());
-    body.push(branch_lct);
-    for r in branch_rad {
-        body.push(*r);
+    if sink_port > 0xf {
+        return Err(MstStreamError::BadPort);
     }
-    body.push(vcpi);
-    body.push((pbn & 0xFF) as u8);
-    let _resp = aux.sb_message(MST_SB_ALLOCATE_PAYLOAD, &body);
+    // Body layout from `drm_dp_encode_sideband_req`'s `DP_ALLOCATE_PAYLOAD`
+    // arm:
+    //
+    //   [0] (port_number & 0xf) << 4 | (number_sdp_streams & 0xf)
+    //   [1] vcpi & 0x7f
+    //   [2] pbn >> 8
+    //   [3] pbn & 0xff
+    //   [4..] packed sdp_stream_sink nibbles, two per byte
+    //
+    // LINUX-GAP: what stood here was `[lct, rad..., vcpi, pbn & 0xff]` under
+    // the citation "DP MST spec §2.11.5.3". The LCT and RAD are header
+    // fields; the port number and SDP stream count were absent entirely; and
+    // the PBN high byte was dropped as "always 0 for practical bandwidths and
+    // omitted by the branch", which is wrong above 255 PBN — a single 1080p60
+    // stream is past that and 4K60 is around 2000. SDP stream sinks are not
+    // emitted here, which matches `number_sdp_streams = 0`.
+    let mut body = alloc::vec::Vec::with_capacity(4);
+    body.push((sink_port & 0xf) << 4);
+    body.push(vcpi & 0x7f);
+    body.push((pbn >> 8) as u8);
+    body.push((pbn & 0xff) as u8);
+    let _resp = aux.sb_message(SB_ALLOCATE_PAYLOAD, branch_lct, branch_rad, &body);
     Ok(())
 }
 
-/// Send the ENABLE_STREAM MST sideband message — flips the
-/// per-VCPI carrying state on the branch. Must follow a successful
-/// ALLOCATE_PAYLOAD + commit_payload_to_sink.
-pub fn send_enable_stream<A: MstAux>(
+/// Send `DP_POWER_UP_PHY` or `DP_POWER_DOWN_PHY` for a downstream port
+/// (`drm_dp_send_power_updown_phy`). The body is one byte: the port number in
+/// the high nibble.
+pub fn send_power_up_phy<A: MstAux>(
     aux: &mut A,
-    vcpi: u8,
+    sink_port: u8,
     branch_lct: u8,
     branch_rad: &[u8],
+    up: bool,
 ) -> Result<(), MstStreamError> {
-    if vcpi == 0 || vcpi > 63 {
-        return Err(MstStreamError::BadVcpi);
+    if sink_port > 0xf {
+        return Err(MstStreamError::BadPort);
     }
-    let mut body = alloc::vec::Vec::with_capacity(4 + branch_rad.len());
-    body.push(branch_lct);
-    for r in branch_rad {
-        body.push(*r);
-    }
-    body.push(vcpi);
-    let _resp = aux.sb_message(MST_SB_ENABLE_STREAM, &body);
+    let opcode = if up {
+        SB_POWER_UP_PHY
+    } else {
+        SB_POWER_DOWN_PHY
+    };
+    let _resp = aux.sb_message(opcode, branch_lct, branch_rad, &[(sink_port & 0xf) << 4]);
     Ok(())
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MstStreamError {
     BadVcpi,
+    /// Port number wider than the four bits the sideband body carries.
+    BadPort,
     CommitTimeout,
 }
 
-/// Full live activation: VCPI alloc (from PayloadTable) → DPCD
-/// commit → sideband ALLOCATE_PAYLOAD → sideband ENABLE_STREAM.
+/// Full live activation: VCPI alloc (from PayloadTable) → DPCD commit →
+/// sideband ALLOCATE_PAYLOAD → sideband POWER_UP_PHY.
 #[allow(clippy::too_many_arguments)] // MST stream activation genuinely requires all DP topology fields
 pub fn activate_stream<A: MstAux>(
     aux: &mut A,
@@ -474,8 +517,8 @@ pub fn activate_stream<A: MstAux>(
         0
     };
     commit_payload_to_sink(aux, vcpi, start_time_slot, slots_per_pbn as u8)?;
-    send_allocate_payload(aux, vcpi, pbn, branch_lct, branch_rad)?;
-    send_enable_stream(aux, vcpi, branch_lct, branch_rad)?;
+    send_allocate_payload(aux, vcpi, sink_port, pbn, branch_lct, branch_rad)?;
+    send_power_up_phy(aux, sink_port, branch_lct, branch_rad, true)?;
     Ok(vcpi)
 }
 
@@ -704,7 +747,9 @@ mod smoke_tests {
 
     struct MockMstAux {
         dpcd_writes: Vec<(u16, u8)>,
-        sb_messages: Vec<(u8, Vec<u8>)>,
+        /// `(opcode, lct, rad, body)` — the header fields the implementor
+        /// would encode, kept separate from the request payload.
+        sb_messages: Vec<(u8, u8, Vec<u8>, Vec<u8>)>,
         /// After N reads, return PAYLOAD_TABLE_UPDATED_BIT.
         poll_count: u32,
     }
@@ -722,8 +767,9 @@ mod smoke_tests {
             }
             0
         }
-        fn sb_message(&mut self, opcode: u8, body: &[u8]) -> Vec<u8> {
-            self.sb_messages.push((opcode, body.to_vec()));
+        fn sb_message(&mut self, opcode: u8, lct: u8, rad: &[u8], body: &[u8]) -> Vec<u8> {
+            self.sb_messages
+                .push((opcode, lct, rad.to_vec(), body.to_vec()));
             Vec::new()
         }
     }
@@ -768,30 +814,80 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_commit_payload_rejects_bad_vcpi);
 
-    fn smoke_send_allocate_payload_carries_rad() -> TestResult {
+    /// Body layout from `drm_dp_encode_sideband_req`'s `DP_ALLOCATE_PAYLOAD`
+    /// arm, spelled out byte by byte. LCT and RAD belong to the header, so
+    /// they must not appear in the body.
+    fn smoke_send_allocate_payload_body_layout() -> TestResult {
         let mut aux = MockMstAux {
             dpcd_writes: Vec::new(),
             sb_messages: Vec::new(),
             poll_count: 0,
         };
-        send_allocate_payload(&mut aux, 7, 0x40, 2, &[0x11, 0x22]).expect("send");
+        // VCPI 7, sink port 3, PBN 0x0240 — above 255, so the high byte
+        // matters.
+        send_allocate_payload(&mut aux, 7, 3, 0x0240, 2, &[0x11]).expect("send");
         if aux.sb_messages.len() != 1 {
             return TestResult::Fail("expected 1 SB message");
         }
-        let (op, body) = &aux.sb_messages[0];
-        if *op != MST_SB_ALLOCATE_PAYLOAD {
-            return TestResult::Fail("wrong opcode");
+        let (op, lct, rad, body) = &aux.sb_messages[0];
+        // DP_ALLOCATE_PAYLOAD is 0x11. 0x10 is DP_ENUM_PATH_RESOURCES.
+        if *op != 0x11 {
+            return TestResult::Fail("DP_ALLOCATE_PAYLOAD is 0x11, not 0x10");
         }
-        // body: [lct=2, rad bytes, vcpi=7, pbn_hi=0, pbn_lo=0x40].
-        if body.len() != 5 {
-            return TestResult::Fail("body wrong length");
+        // The relative address goes to the header, not the payload.
+        if *lct != 2 || rad.as_slice() != [0x11] {
+            return TestResult::Fail("LCT and RAD must reach the header");
         }
-        if body[0] != 2 || body[1] != 0x11 || body[2] != 0x22 || body[3] != 7 {
-            return TestResult::Fail("body bytes wrong");
+        if body.len() != 4 {
+            return TestResult::Fail("the body is exactly four bytes for zero SDP streams");
+        }
+        // port_number in the high nibble, number_sdp_streams in the low.
+        if body[0] != 0x30 {
+            return TestResult::Fail("byte 0 is port << 4 | sdp_streams");
+        }
+        if body[1] != 7 {
+            return TestResult::Fail("byte 1 is the VCPI, seven bits");
+        }
+        // PBN high byte first. Dropping it would make 0x0240 look like 0x40.
+        if body[2] != 0x02 || body[3] != 0x40 {
+            return TestResult::Fail("PBN is two bytes, high first");
+        }
+        // Ports are four bits in this body.
+        if send_allocate_payload(&mut aux, 7, 16, 0x40, 2, &[0x11]) != Err(MstStreamError::BadPort)
+        {
+            return TestResult::Fail("a port above 15 must be refused");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_send_allocate_payload_carries_rad);
+    kernel_test_in!("drivers/gpu", smoke_send_allocate_payload_body_layout);
+
+    /// `DP_POWER_UP_PHY` is 0x24 with a one-byte body. There is no
+    /// ENABLE_STREAM request; 0x12 is `DP_QUERY_PAYLOAD`.
+    fn smoke_send_power_up_phy_body() -> TestResult {
+        let mut aux = MockMstAux {
+            dpcd_writes: Vec::new(),
+            sb_messages: Vec::new(),
+            poll_count: 0,
+        };
+        send_power_up_phy(&mut aux, 3, 2, &[0x11], true).expect("power up");
+        send_power_up_phy(&mut aux, 3, 2, &[0x11], false).expect("power down");
+        if aux.sb_messages.len() != 2 {
+            return TestResult::Fail("expected two SB messages");
+        }
+        if aux.sb_messages[0].0 != 0x24 || aux.sb_messages[1].0 != 0x25 {
+            return TestResult::Fail("POWER_UP_PHY is 0x24 and POWER_DOWN_PHY 0x25");
+        }
+        if aux.sb_messages[0].3.as_slice() != [0x30] {
+            return TestResult::Fail("the body is one byte, port in the high nibble");
+        }
+        // The request-name space has no 0x12-as-enable-stream: that id is
+        // QUERY_PAYLOAD, which this module names correctly elsewhere.
+        if SB_QUERY_PAYLOAD != 0x12 {
+            return TestResult::Fail("DP_QUERY_PAYLOAD is 0x12");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_send_power_up_phy_body);
 
     fn smoke_activate_stream_end_to_end() -> TestResult {
         let mut aux = MockMstAux {
@@ -806,15 +902,15 @@ mod smoke_tests {
         if vcpi == 0 {
             return TestResult::Fail("vcpi 0");
         }
-        // 2 SB messages — ALLOCATE_PAYLOAD + ENABLE_STREAM.
+        // 2 SB messages — ALLOCATE_PAYLOAD then POWER_UP_PHY.
         if aux.sb_messages.len() != 2 {
             return TestResult::Fail("expected 2 SB msgs");
         }
-        if aux.sb_messages[0].0 != MST_SB_ALLOCATE_PAYLOAD {
-            return TestResult::Fail("1st SB not ALLOC");
+        if aux.sb_messages[0].0 != SB_ALLOCATE_PAYLOAD {
+            return TestResult::Fail("1st SB not ALLOCATE_PAYLOAD");
         }
-        if aux.sb_messages[1].0 != MST_SB_ENABLE_STREAM {
-            return TestResult::Fail("2nd SB not ENABLE");
+        if aux.sb_messages[1].0 != SB_POWER_UP_PHY {
+            return TestResult::Fail("2nd SB not POWER_UP_PHY");
         }
         // PayloadTable updated.
         if table.allocations.len() != 1 {
