@@ -7193,7 +7193,7 @@ fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
     if !s.idle() {
         return TestResult::Fail("raw=0 must decode as idle");
     }
-    if s.any_busy() || s.cp_busy() || s.rlc_busy() {
+    if s.any_busy() || s.cp_busy() {
         return TestResult::Fail("raw=0 must not be busy");
     }
     if s.is_sentinel() {
@@ -7210,6 +7210,59 @@ fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
     let s3 = GrbmStatus { raw: 0xFFFF_FFFF };
     if !s3.is_sentinel() {
         return TestResult::Fail("0xFFFFFFFF must be sentinel");
+    }
+    // The RLC's busy bit is NOT in this register. `gc_9_0_sh_mask.h` and
+    // `gc_11_0_0_sh_mask.h` both define `GRBM_STATUS2__RLC_BUSY` and neither
+    // defines a `GRBM_STATUS__RLC_BUSY`; bit 26 of GRBM_STATUS is `DB_BUSY`
+    // (0x04000000). And the GRBM_STATUS2 bit moves: 0x04000000 on GFX9,
+    // 0x01000000 on GFX11.
+    use crate::amdgpu_gfx::{GfxGeneration, GrbmStatus2};
+    if GfxGeneration::Gfx9.grbm_status2_rlc_busy() != 0x0400_0000
+        || GfxGeneration::Gfx11.grbm_status2_rlc_busy() != 0x0100_0000
+    {
+        return TestResult::Fail("GRBM_STATUS2__RLC_BUSY moved between the two headers");
+    }
+    if GfxGeneration::Gfx9.grbm_status2_rel() != 0x0002 * 4
+        || GfxGeneration::Gfx11.grbm_status2_rel() != 0x0DA2 * 4
+    {
+        return TestResult::Fail("GRBM_STATUS2 is 0x0002 on GFX9 and 0x0da2 on GFX11");
+    }
+    // A GFX11 part reporting RLC busy must not be read with GFX9's bit, and
+    // vice versa — that is the whole reason this is per-generation.
+    let rlc11 = GrbmStatus2 { raw: 0x0100_0000 };
+    if !rlc11.rlc_busy(GfxGeneration::Gfx11) || rlc11.rlc_busy(GfxGeneration::Gfx9) {
+        return TestResult::Fail("GFX11's RLC_BUSY is bit 24");
+    }
+    let rlc9 = GrbmStatus2 { raw: 0x0400_0000 };
+    if !rlc9.rlc_busy(GfxGeneration::Gfx9) || rlc9.rlc_busy(GfxGeneration::Gfx11) {
+        return TestResult::Fail("GFX9's RLC_BUSY is bit 26");
+    }
+    // That same bit 26, in GRBM_STATUS, is DB_BUSY — and it does count as busy.
+    let db = GrbmStatus {
+        raw: crate::amdgpu_gfx::GRBM_STATUS_DB_BUSY,
+    };
+    if db.idle() {
+        return TestResult::Fail("DB_BUSY is a real GRBM_STATUS busy bit");
+    }
+    // The register offsets, from the two headers.
+    if GfxGeneration::Gfx9.grbm_status_rel() != 0x0004 * 4
+        || GfxGeneration::Gfx11.grbm_status_rel() != 0x0DA4 * 4
+    {
+        return TestResult::Fail("GRBM_STATUS is 0x0004 on GFX9 and 0x0da4 on GFX11");
+    }
+    // regCP_ME_CNTL: 0x01b6 on BASE_IDX 0 for GFX9, 0x0803 on BASE_IDX 1 for
+    // GFX11 — the window changes with the generation.
+    if GfxGeneration::Gfx9.cp_me_cntl_rel() != (0x01B6 * 4, 0)
+        || GfxGeneration::Gfx11.cp_me_cntl_rel() != (0x0803 * 4, 1)
+    {
+        return TestResult::Fail("CP_ME_CNTL's offset and base index are per-generation");
+    }
+    // CP_ME_CNTL__ME_HALT 0x10000000, __PFP_HALT 0x04000000, __CE_HALT
+    // 0x01000000. GFX10 dropped the constant engine, so GFX11 drives only two.
+    if GfxGeneration::Gfx9.cp_me_cntl_halt_all() != 0x1500_0000
+        || GfxGeneration::Gfx11.cp_me_cntl_halt_all() != 0x1400_0000
+    {
+        return TestResult::Fail("GFX11 has no constant engine to halt");
     }
     TestResult::Pass
 }

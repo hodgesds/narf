@@ -199,10 +199,106 @@ pub const GRBM_STATUS_GUI_ACTIVE: u32 = 1 << 31;
 pub const GRBM_STATUS_CP_BUSY: u32 = 1 << 29;
 /// `GRBM_STATUS.CP_COHERENCY_BUSY` — CP cache-coherency unit busy.
 pub const GRBM_STATUS_CP_COHERENCY_BUSY: u32 = 1 << 28;
-/// `GRBM_STATUS.RLC_BUSY` — RLC microcontroller busy.
-pub const GRBM_STATUS_RLC_BUSY: u32 = 1 << 26;
+/// `GRBM_STATUS.ANY_ACTIVE` (0x08000000).
+pub const GRBM_STATUS_ANY_ACTIVE: u32 = 1 << 27;
+/// `GRBM_STATUS.DB_BUSY` (0x04000000) — the depth block.
+///
+/// LINUX-GAP: this bit was named `GRBM_STATUS_RLC_BUSY` and read back by
+/// `GrbmStatus::rlc_busy`. `GRBM_STATUS` has no `RLC_BUSY` field on either
+/// generation — neither `gc_9_0_sh_mask.h` nor `gc_11_0_0_sh_mask.h` defines
+/// one — and bit 26 of it is `DB_BUSY`. The RLC's busy bit lives in
+/// `GRBM_STATUS2`, and even there it moves between generations; see
+/// [`GfxGeneration::grbm_status2_rlc_busy`]. So the idle check that gated
+/// touching `CP_RB0_BASE` was waiting on the depth block, and `rlc_busy()`
+/// answered about the wrong unit entirely.
+pub const GRBM_STATUS_DB_BUSY: u32 = 1 << 26;
 /// `GRBM_STATUS.GDS_BUSY` — Global Data Share busy.
 pub const GRBM_STATUS_GDS_BUSY: u32 = 1 << 15;
+
+/// Which GFX generation a register window or bit position belongs to. The two
+/// this driver carries tables for do not agree on either, so the ones that
+/// move are selected here rather than being `_GFX9`/`_GFX11` constants a caller
+/// might pick the wrong one of.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GfxGeneration {
+    /// GFX9 — Vega, Renoir, Cezanne. `gc_9_0_offset.h`.
+    Gfx9,
+    /// GFX11 — Phoenix, Navi3x. `gc_11_0_0_offset.h`.
+    Gfx11,
+}
+
+impl GfxGeneration {
+    /// `GRBM_STATUS` — 0x0004 on GFX9, 0x0da4 on GFX11, BASE_IDX 0 on both.
+    pub const fn grbm_status_rel(self) -> u32 {
+        match self {
+            GfxGeneration::Gfx9 => 0x0004 * 4,
+            GfxGeneration::Gfx11 => 0x0DA4 * 4,
+        }
+    }
+
+    /// `GRBM_STATUS2` — 0x0002 on GFX9, 0x0da2 on GFX11, BASE_IDX 0 on both.
+    /// This is where the RLC's busy bit actually is.
+    pub const fn grbm_status2_rel(self) -> u32 {
+        match self {
+            GfxGeneration::Gfx9 => 0x0002 * 4,
+            GfxGeneration::Gfx11 => 0x0DA2 * 4,
+        }
+    }
+
+    /// `GRBM_STATUS2__RLC_BUSY` — 0x04000000 on GFX9 but 0x01000000 on GFX11.
+    /// The field keeps its name across the two headers and changes position,
+    /// which is exactly the case a shared constant cannot express.
+    pub const fn grbm_status2_rlc_busy(self) -> u32 {
+        match self {
+            GfxGeneration::Gfx9 => 1 << 26,
+            GfxGeneration::Gfx11 => 1 << 24,
+        }
+    }
+
+    /// `CP_STAT` — 0x01a0 on GFX9, 0x0f40 on GFX11, BASE_IDX 0 on both.
+    /// `gfx_v11_0_cp_gfx_enable` polls it to zero after un-halting the CP.
+    pub const fn cp_stat_rel(self) -> u32 {
+        match self {
+            GfxGeneration::Gfx9 => 0x01A0 * 4,
+            GfxGeneration::Gfx11 => 0x0F40 * 4,
+        }
+    }
+
+    /// `CP_ME_CNTL` — 0x01b6 on BASE_IDX 0 for GFX9, 0x0803 on **BASE_IDX 1**
+    /// for GFX11. Returns the offset and the base index it belongs to, because
+    /// the window changes with the generation; see [`GC_BASE_IDX_1`].
+    pub const fn cp_me_cntl_rel(self) -> (u32, usize) {
+        match self {
+            GfxGeneration::Gfx9 => (0x01B6 * 4, 0),
+            GfxGeneration::Gfx11 => (0x0803 * 4, 1),
+        }
+    }
+
+    /// The `CP_ME_CNTL` halt bits this generation's CP has.
+    ///
+    /// `gfx_v9_0_cp_gfx_enable` drives ME, PFP and CE; `gfx_v11_0_cp_gfx_enable`
+    /// drives only ME and PFP — GFX10 dropped the constant engine, so setting
+    /// `CE_HALT` on GFX11 halts a unit that is not there.
+    pub const fn cp_me_cntl_halt_all(self) -> u32 {
+        match self {
+            GfxGeneration::Gfx9 => CP_ME_CNTL_ME_HALT | CP_ME_CNTL_PFP_HALT | CP_ME_CNTL_CE_HALT,
+            GfxGeneration::Gfx11 => CP_ME_CNTL_ME_HALT | CP_ME_CNTL_PFP_HALT,
+        }
+    }
+}
+
+/// `GRBM_STATUS2`, whose only field this driver reads is the RLC's.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct GrbmStatus2 {
+    pub raw: u32,
+}
+
+impl GrbmStatus2 {
+    /// RLC microcontroller busy, per this generation's bit position.
+    pub fn rlc_busy(&self, generation: GfxGeneration) -> bool {
+        self.raw & generation.grbm_status2_rlc_busy() != 0
+    }
+}
 
 /// Decoded view of `mmGRBM_STATUS`. Foundations wave uses this as
 /// a presence-test corroborator; later waves drive scheduler /
@@ -221,18 +317,18 @@ impl GrbmStatus {
     pub fn cp_busy(&self) -> bool {
         self.raw & GRBM_STATUS_CP_BUSY != 0
     }
-    /// RLC microcontroller busy.
-    pub fn rlc_busy(&self) -> bool {
-        self.raw & GRBM_STATUS_RLC_BUSY != 0
-    }
-    /// Every documented busy bit clear. Invariant the ring/scheduler
-    /// bring-up (Wave-81+) waits on before touching CP_RB0_BASE.
+    /// Every documented busy bit in THIS register clear. Invariant the
+    /// ring/scheduler bring-up waits on before touching `CP_RB0_BASE`.
+    ///
+    /// The RLC is not among them: its busy bit is in `GRBM_STATUS2`, so a
+    /// caller that needs it reads [`GrbmStatus2`] as well.
     pub fn idle(&self) -> bool {
         self.raw
             & (GRBM_STATUS_GUI_ACTIVE
+                | GRBM_STATUS_ANY_ACTIVE
                 | GRBM_STATUS_CP_BUSY
                 | GRBM_STATUS_CP_COHERENCY_BUSY
-                | GRBM_STATUS_RLC_BUSY
+                | GRBM_STATUS_DB_BUSY
                 | GRBM_STATUS_GDS_BUSY)
             == 0
     }
@@ -278,24 +374,28 @@ pub const fn grbm_gfx_index_for(se: u8, sh: u8, instance: u8) -> u32 {
 // carries its own offset block (see `GFX11_*` further down) rather than
 // reusing the GFX9 `*_REL` constants.
 
-// CP_GFX_CNTL halt bits — distinct positions from CP_ME_CNTL on GFX9.
-
-/// `regCP_GFX_CNTL` (0x2a00, **BASE_IDX 1**) — the GFX11 CP halt register.
+/// `regCP_GFX_CNTL` (0x2a00, **BASE_IDX 1**).
 ///
 /// Was 0x103E in base window 0, which is neither this register nor that
 /// window. See [`GC_BASE_IDX_1`]: reaching it needs the second GC window,
-/// which nothing here resolves yet, so no caller may use it until that lands.
+/// which nothing here resolves yet.
+///
+/// LINUX-GAP: this was documented as "the GFX11 CP halt register" and carried
+/// `CP_GFX_CNTL_FE_HALT` 1<<0, `CP_GFX_CNTL_PFP_HALT_GFX11` 1<<4 and
+/// `CP_GFX_CNTL_ME_HALT_GFX11` 1<<8. `gc_11_0_0_sh_mask.h` gives this register
+/// exactly two fields — `ENGINE_SEL` bit 0 and `CONFIG` bits[2:1] — and no
+/// halt bit at all. GFX11 halts the CP through `CP_ME_CNTL` with the same
+/// `ME_HALT`/`PFP_HALT` bits as GFX9 (`gfx_v11_0_cp_gfx_enable` at
+/// `gfx_v11_0.c:3189`), only at a different offset and base index; see
+/// [`GfxGeneration::cp_me_cntl_rel`]. Linux's only use of `regCP_GFX_CNTL` is
+/// setting `ENGINE_SEL` (`gfx_v11_0.c:4793`), so the fabricated `FE_HALT` bit
+/// would have selected an engine rather than halting one.
 pub const CP_GFX_CNTL_REL: u32 = 0x2A00 * 4;
 
-/// `CP_GFX_CNTL` — halt the FE (front-end fetch).
-pub const CP_GFX_CNTL_FE_HALT: u32 = 1 << 0;
-/// `CP_GFX_CNTL` — halt the PFP engine.
-pub const CP_GFX_CNTL_PFP_HALT_GFX11: u32 = 1 << 4;
-/// `CP_GFX_CNTL` — halt the ME engine.
-pub const CP_GFX_CNTL_ME_HALT_GFX11: u32 = 1 << 8;
-/// Combined: halt all GFX11 CP engines.
-pub const CP_GFX_CNTL_HALT_ALL: u32 =
-    CP_GFX_CNTL_FE_HALT | CP_GFX_CNTL_PFP_HALT_GFX11 | CP_GFX_CNTL_ME_HALT_GFX11;
+/// `CP_GFX_CNTL__ENGINE_SEL` (0x00000001).
+pub const CP_GFX_CNTL_ENGINE_SEL: u32 = 1 << 0;
+/// `CP_GFX_CNTL__CONFIG` (0x00000006).
+pub const CP_GFX_CNTL_CONFIG_MASK: u32 = 0x6;
 
 // ── Sequence shape ─────────────────────────────────────────────────
 

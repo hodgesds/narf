@@ -158,6 +158,9 @@ pub enum CpFwError {
     InvalidateTimeout,
     /// Poll for ICACHE_PRIMED timed out.
     PrimeTimeout,
+    /// `CP_STAT` never read back zero after the CP was un-halted. Linux logs
+    /// "failed to unhalt cp gfx" here and carries on; this reports it.
+    CpEnableTimeout,
 }
 
 // ── Mmio trait ────────────────────────────────────────────────────
@@ -261,19 +264,45 @@ pub fn load_all_cp_fw<M: CpFwMmio>(
 
 // ── CP enable handshake ───────────────────────────────────────────
 
-/// `CP_GFX_CNTL` register — write 0 to unhalt all engines; the
-/// halt bits per `amdgpu_gfx.rs::CP_GFX_CNTL_HALT_ALL`.
+/// Un-halt the GFX CP, following `gfx_v11_0_cp_gfx_enable`
+/// (`gfx_v11_0.c:3189`): read `CP_ME_CNTL`, clear this generation's halt bits,
+/// write it back, then poll `CP_STAT` to zero.
 ///
-/// Mirrors `gfx_v11_0_cp_gfx_enable` — write 0 to unhalt, poll the
-/// CP_STAT register's BUSY_STATUS bits to confirm engines are
-/// fetching. Linux uses a 50 ms timeout against a 1 µs udelay.
-pub fn cp_enable<M: CpFwMmio>(mmio: &mut M, gc_base: u32) -> Result<(), CpFwError> {
-    let cntl_addr = (gc_base + (crate::amdgpu_gfx::CP_GFX_CNTL_REL / 4)) << 2;
-    mmio.write(cntl_addr, 0);
-    // Linux polls regCP_STAT to confirm the engines are running but
-    // the canonical implementation here just trusts the write — the
-    // ring will fail to fetch if the engines didn't come up.
-    Ok(())
+/// LINUX-GAP: this used to write 0 to `CP_GFX_CNTL`, described as unhalting
+/// all engines. `CP_GFX_CNTL` holds only `ENGINE_SEL` and `CONFIG`; the halt
+/// bits are in `CP_ME_CNTL`, so the write cleared an engine selector and left
+/// every engine halted. It also skipped the `CP_STAT` poll entirely, so a CP
+/// that never came up looked like success.
+///
+/// `CP_ME_CNTL` is BASE_IDX 1 on GFX11 and BASE_IDX 0 on GFX9, while `CP_STAT`
+/// is BASE_IDX 0 on both, so both windows are parameters. Linux polls against
+/// `usec_timeout` (50 ms) at 1 µs a turn; [`CP_FW_POLL_BUDGET`] is the
+/// equivalent iteration cap here.
+pub fn cp_enable<M: CpFwMmio>(
+    mmio: &mut M,
+    generation: crate::amdgpu_gfx::GfxGeneration,
+    gc_base_idx0: u32,
+    gc_base_idx1: u32,
+) -> Result<(), CpFwError> {
+    let (me_cntl_rel, me_cntl_idx) = generation.cp_me_cntl_rel();
+    let me_cntl_base = if me_cntl_idx == 0 {
+        gc_base_idx0
+    } else {
+        gc_base_idx1
+    };
+    let me_cntl = (me_cntl_base + (me_cntl_rel / 4)) << 2;
+    let cp_stat = (gc_base_idx0 + (generation.cp_stat_rel() / 4)) << 2;
+
+    // Read-modify-write: the other fields of CP_ME_CNTL are not ours to clear.
+    let current = mmio.read(me_cntl);
+    mmio.write(me_cntl, current & !generation.cp_me_cntl_halt_all());
+
+    for _ in 0..CP_FW_POLL_BUDGET {
+        if mmio.read(cp_stat) == 0 {
+            return Ok(());
+        }
+    }
+    Err(CpFwError::CpEnableTimeout)
 }
 
 // ── Test support ──────────────────────────────────────────────────
@@ -487,16 +516,41 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_load_all_cp_fw_engine_order);
 
-    fn smoke_cp_enable_writes_zero_to_gfx_cntl() -> TestResult {
+    /// Literals from `gc_11_0_0_offset.h` / `gc_9_0_offset.h` and
+    /// `gc_*_sh_mask.h`, not from the constants under test.
+    fn smoke_cp_enable_clears_the_me_cntl_halt_bits() -> TestResult {
+        use crate::amdgpu_gfx::GfxGeneration;
+        // regCP_ME_CNTL 0x0803 BASE_IDX 1 on GFX11, regCP_STAT 0x0f40 idx 0.
+        // CP_ME_CNTL__ME_HALT 0x10000000, __PFP_HALT 0x04000000; GFX10 dropped
+        // the constant engine so __CE_HALT 0x01000000 is not touched.
         let mut m = MockCpFwMmio::new();
-        cp_enable(&mut m, 0).expect("enable");
+        let (idx0, idx1) = (0x1000u32, 0x9000u32);
+        let me_cntl = (idx1 + 0x0803) << 2;
+        let cp_stat = (idx0 + 0x0F40) << 2;
+        // Halted, with CE_HALT and an unrelated bit also set.
+        m.reads.push_back((me_cntl, 0x1500_0002));
+        m.reads.push_back((cp_stat, 0));
+        cp_enable(&mut m, GfxGeneration::Gfx11, idx0, idx1).expect("enable");
         if m.writes.len() != 1 {
-            return TestResult::Fail("expected 1 write");
+            return TestResult::Fail("expected exactly the CP_ME_CNTL write");
         }
-        if m.writes[0].1 != 0 {
-            return TestResult::Fail("not unhalt (val != 0)");
+        if m.writes[0].0 != me_cntl {
+            return TestResult::Fail("the halt bits are in CP_ME_CNTL, not CP_GFX_CNTL");
+        }
+        // ME_HALT and PFP_HALT cleared; CE_HALT and bit 1 left alone.
+        if m.writes[0].1 != 0x0100_0002 {
+            return TestResult::Fail("GFX11 clears only ME_HALT and PFP_HALT");
+        }
+        // GFX9 clears CE_HALT too, and reaches CP_ME_CNTL through window 0.
+        let mut m9 = MockCpFwMmio::new();
+        let me_cntl9 = (idx0 + 0x01B6) << 2;
+        m9.reads.push_back((me_cntl9, 0x1500_0002));
+        m9.reads.push_back(((idx0 + 0x01A0) << 2, 0));
+        cp_enable(&mut m9, GfxGeneration::Gfx9, idx0, idx1).expect("gfx9 enable");
+        if m9.writes[0].0 != me_cntl9 || m9.writes[0].1 != 0x0000_0002 {
+            return TestResult::Fail("GFX9 clears ME, PFP and CE through window 0");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_cp_enable_writes_zero_to_gfx_cntl);
+    kernel_test_in!("drivers/gpu", smoke_cp_enable_clears_the_me_cntl_halt_bits);
 }
