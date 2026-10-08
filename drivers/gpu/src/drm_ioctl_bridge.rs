@@ -210,6 +210,15 @@ impl VirtGpuFence {
             .map(|dev| dev.wait_fence(&self.transport, timeout_ms))
             .unwrap_or(true)
     }
+
+    async fn wait_device_async(&self, timeout_ms: u64) -> bool {
+        match narf_drivers_virtio::gpu_pci::probed_device() {
+            Some(dev) => dev.wait_fence_async(&self.transport, timeout_ms).await,
+            // A removed device cannot make further progress. Treat its
+            // abandoned fences as done so userspace cannot wedge forever.
+            None => true,
+        }
+    }
 }
 
 impl crate::drm::syncobj::DmaFence for VirtGpuFence {
@@ -1147,6 +1156,86 @@ pub fn dispatch_virtgpu_render(
     dispatch_virtgpu_render_inner(cmd, arg, state, None)
 }
 
+/// Whether `cmd` is the virtio-gpu resource fence-wait ioctl.
+///
+/// `FileOps::ioctl_user` uses this to move the only potentially long-lived
+/// virtgpu ioctl onto the userspace task's async path. Other commands stay on
+/// the normal synchronous dispatcher because they complete their controlq
+/// round-trip before returning.
+pub(crate) fn is_virtgpu_wait_ioctl(cmd: u32) -> bool {
+    cmd == drm_uapi::DRM_IOCTL_VIRTGPU_WAIT
+}
+
+/// Async form of [`drm_uapi::DRM_IOCTL_VIRTGPU_WAIT`].
+///
+/// This runs through `FileOps::ioctl_user`, whose future parks the current
+/// userspace task. It is deliberately separate from the synchronous DRM
+/// dispatcher below: driving the IRQ-backed fence future with a synchronous
+/// poll would recreate the compositor busy loop this path avoids.
+pub(crate) async fn wait_virtgpu_render(
+    arg: usize,
+    state: &VirtGpuRenderState,
+) -> Result<u64, FsError> {
+    let (fence, nowait) = virtgpu_wait_request(arg, state)?;
+    let Some(fence) = fence else {
+        // Never referenced by a fenced submission — idle. The synchronous
+        // TRANSFER/CREATE paths complete before their ioctls return, so they
+        // leave no wait obligation.
+        return Ok(0);
+    };
+    if nowait {
+        return if fence.is_device_signalled() {
+            Ok(0)
+        } else {
+            // FsError::Busy → EBUSY at the syscall layer, matching Linux's
+            // dma_resv_test_signaled() == false path.
+            Err(FsError::Busy)
+        };
+    }
+    if fence.wait_device_async(15_000).await {
+        Ok(0)
+    } else {
+        Err(FsError::Busy)
+    }
+}
+
+/// Read and resolve a VIRTGPU_WAIT request without waiting. Keeping the
+/// request decoding shared makes the synchronous DRM dispatcher and the async
+/// userspace-file path agree on NOWAIT, missing-handle, and idle-resource
+/// semantics.
+fn virtgpu_wait_request(
+    arg: usize,
+    state: &VirtGpuRenderState,
+) -> Result<(Option<Arc<VirtGpuFence>>, bool), FsError> {
+    const VIRTGPU_WAIT_NOWAIT: u32 = 1;
+    let req: drm_uapi::DrmVirtGpuWaitUapi = read_uapi(arg)?;
+    let resource = state.find(req.handle).ok_or(FsError::NotFound)?;
+    let fence = resource.last_fence.lock().clone();
+    Ok((fence, req.flags & VIRTGPU_WAIT_NOWAIT != 0))
+}
+
+/// Synchronous compatibility implementation for direct in-kernel callers of
+/// [`dispatch_virtgpu_render`]. The actual `/dev/dri/*` ioctl route uses
+/// [`wait_virtgpu_render`] above and therefore parks the userspace task.
+fn wait_virtgpu_render_sync(arg: usize, state: &VirtGpuRenderState) -> Result<u64, FsError> {
+    let (fence, nowait) = virtgpu_wait_request(arg, state)?;
+    let Some(fence) = fence else {
+        return Ok(0);
+    };
+    if nowait {
+        return if fence.is_device_signalled() {
+            Ok(0)
+        } else {
+            Err(FsError::Busy)
+        };
+    }
+    if fence.wait_device(15_000) {
+        Ok(0)
+    } else {
+        Err(FsError::Busy)
+    }
+}
+
 /// Primary-node variant: GEM_CLOSE must also drop the imported KMS GEM-handle
 /// reference held in the card's global mode state.
 pub fn dispatch_virtgpu_render_for_card(
@@ -1440,35 +1529,7 @@ fn dispatch_virtgpu_render_inner(
         }
         DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => handle_transfer_3d(arg, state, true),
         DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST => handle_transfer_3d(arg, state, false),
-        DRM_IOCTL_VIRTGPU_WAIT => {
-            // `virtio_gpu_wait_ioctl`: NOWAIT tests the BO's reservation and
-            // reports EBUSY while work is outstanding; otherwise wait up to
-            // 15 s (Linux's DRM long timeout) and report EBUSY on expiry.
-            const VIRTGPU_WAIT_NOWAIT: u32 = 1;
-            let req: DrmVirtGpuWaitUapi = read_uapi(arg)?;
-            let resource = state.find(req.handle).ok_or(FsError::NotFound)?;
-            let fence = resource.last_fence.lock().clone();
-            let Some(fence) = fence else {
-                // Never referenced by a fenced submission — idle. The
-                // synchronous TRANSFER/CREATE paths complete before their
-                // ioctls return, so they leave no wait obligation.
-                return Ok(0);
-            };
-            if req.flags & VIRTGPU_WAIT_NOWAIT != 0 {
-                return if fence.is_device_signalled() {
-                    Ok(0)
-                } else {
-                    // FsError::Busy → EBUSY at the syscall layer, matching
-                    // Linux's dma_resv_test_signaled() == false path.
-                    Err(FsError::Busy)
-                };
-            }
-            if fence.wait_device(15_000) {
-                Ok(0)
-            } else {
-                Err(FsError::Busy)
-            }
-        }
+        DRM_IOCTL_VIRTGPU_WAIT => wait_virtgpu_render_sync(arg, state),
         DRM_IOCTL_VIRTGPU_GET_CAPS => {
             let req: DrmVirtGpuGetCapsUapi = read_uapi(arg)?;
             // Linux rejects a zero transfer size with EINVAL. A null or bad

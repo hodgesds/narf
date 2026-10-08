@@ -397,6 +397,23 @@ impl FileOps for DriCardFile {
         )
     }
 
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        _context: &'a dyn narf_filesystem::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
+                && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
+            {
+                return crate::drm_ioctl_bridge::wait_virtgpu_render(arg as usize, &self.virtgpu)
+                    .await;
+            }
+            self.ioctl(cmd, arg as usize)
+        })
+    }
+
     /// DRM dumb-buffer mmap: resolve a MAP_DUMB fake offset to the
     /// physical frames of the dumb buffer. Called by `sys_mmap` for
     /// MAP_SHARED on this fd.
@@ -820,6 +837,23 @@ impl FileOps for DriRenderFile {
             None,
             None,
         )
+    }
+
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        _context: &'a dyn narf_filesystem::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu")
+                && crate::drm_ioctl_bridge::is_virtgpu_wait_ioctl(cmd)
+            {
+                return crate::drm_ioctl_bridge::wait_virtgpu_render(arg as usize, &self.virtgpu)
+                    .await;
+            }
+            self.ioctl(cmd, arg as usize)
+        })
     }
 
     /// Render node for card `self.index`. Lets `sys_ioctl` service the PRIME
