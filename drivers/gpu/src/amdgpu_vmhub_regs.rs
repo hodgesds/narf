@@ -102,7 +102,17 @@ pub struct VmHubRegs {
 // regGCVM_CONTEXT0_CNTL                                     = 0x1688
 // regGCVM_CONTEXT1_CNTL                                     = 0x1689  → distance = 1
 // regGCVM_INVALIDATE_ENG0_REQ                               = 0x16ab
-// regGCVM_INVALIDATE_ENG0_ACK is at 0x16a7..; computed as REQ-4.
+// regGCVM_INVALIDATE_ENG0_ACK                               = 0x16bd
+//
+// LINUX-GAP: the ACK offsets in this file were all derived from REQ by
+// subtraction, with the note "computed as REQ-4". The ACK block is *above*
+// the REQ block, and by different amounts per hub: GFXHUB v3.0, MMHUB v3.0
+// and GFXHUB v2.3 all put it at REQ + 0x12, while MMHUB v2.3 puts it at
+// REQ + 1. There are eighteen invalidation engines, so a block of REQs is
+// followed by a block of ACKs — but only on the hubs that lay them out that
+// way, and nothing about the register map lets the one be computed from the
+// other. Every one of the four was wrong, so a TLB invalidate would have
+// polled a register that never acknowledges and spun out its whole budget.
 
 pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_pt_base_lo: 0x16f3,
@@ -115,7 +125,7 @@ pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_cntl: 0x1688,
     ctx_distance: 1,
     inv_eng0_req: 0x16ab,
-    inv_eng0_ack: 0x169f,
+    inv_eng0_ack: 0x16bd,
 };
 
 // ── MMHUB v3.0 (Phoenix) ───────────────────────────────────────────
@@ -126,6 +136,9 @@ pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
 // regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32 = 0x07eb
 // regMMVM_CONTEXT0_CNTL = 0x0740
 // regMMVM_INVALIDATE_ENG0_REQ = 0x0763
+// regMMVM_INVALIDATE_ENG0_ACK = 0x0775
+//
+// MMHUB is BASE_IDX 1 on this generation too, not just on v2.3.
 
 pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_pt_base_lo: 0x07ab,
@@ -138,7 +151,7 @@ pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_cntl: 0x0740,
     ctx_distance: 1,
     inv_eng0_req: 0x0763,
-    inv_eng0_ack: 0x0757,
+    inv_eng0_ack: 0x0775,
 };
 
 // ── GFX10.3 GFXHUB (Renoir) ───────────────────────────────────────
@@ -149,6 +162,7 @@ pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
 // mmGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32 = 0x16a7
 // mmGCVM_CONTEXT0_CNTL = 0x15fc
 // mmGCVM_INVALIDATE_ENG0_REQ = 0x161f
+// mmGCVM_INVALIDATE_ENG0_ACK = 0x1631
 
 pub const GFXHUB_V2_3: VmHubRegs = VmHubRegs {
     ctx0_pt_base_lo: 0x1667,
@@ -161,7 +175,7 @@ pub const GFXHUB_V2_3: VmHubRegs = VmHubRegs {
     ctx0_cntl: 0x15fc,
     ctx_distance: 1,
     inv_eng0_req: 0x161f,
-    inv_eng0_ack: 0x1613,
+    inv_eng0_ack: 0x1631,
 };
 
 // ── MMHUB v2.3 (Renoir) ───────────────────────────────────────────
@@ -169,8 +183,18 @@ pub const GFXHUB_V2_3: VmHubRegs = VmHubRegs {
 // mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 = 0x0940
 // mmMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32 = 0x0942
 // mmMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32 = 0x0944
+// mmMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 = 0x0948  → distance = 8
 // mmMMVM_CONTEXT0_CNTL = 0x0740
 // mmMMVM_INVALIDATE_ENG0_REQ = 0x0a01
+// mmMMVM_INVALIDATE_ENG0_ACK = 0x0a02
+//
+// LINUX-GAP: `ctx_addr_distance` was 2 here. This hub **interleaves** its
+// per-context address registers — base, start, end for CONTEXT0 at
+// 0x0940..0x0945, then CONTEXT1's at 0x0948 — where the other three group all
+// sixteen bases together, then all starts, then all ends, two dwords apart. A
+// distance of 2 therefore wrote VMID 1's page-table base into VMID 0's
+// START_ADDR register, and so on up the hub: one context's root address
+// becoming another context's address range.
 //
 // Note: MMHUB v2.3 has BASE_IDX = 1 (different segment) — the
 // per-BAR-offset register window expects an additional segment
@@ -185,11 +209,11 @@ pub const MMHUB_V2_3: VmHubRegs = VmHubRegs {
     ctx0_pt_start_hi: 0x0943,
     ctx0_pt_end_lo: 0x0944,
     ctx0_pt_end_hi: 0x0945,
-    ctx_addr_distance: 2,
+    ctx_addr_distance: 8,
     ctx0_cntl: 0x0740,
     ctx_distance: 1,
     inv_eng0_req: 0x0a01,
-    inv_eng0_ack: 0x09f5,
+    inv_eng0_ack: 0x0a02,
 };
 
 /// Look up the per-hub register layout for `family` + `hub`.
@@ -549,15 +573,87 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_phoenix_gfxhub_offsets_stride);
 
-    fn smoke_renoir_mmhub_offsets() -> TestResult {
-        let r = MMHUB_V2_3;
-        // Linux mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 = 0x0940.
-        if r.ctx0_pt_base_lo != 0x0940 {
-            return TestResult::Fail("MMHUB v2.3 base lo wrong");
+    /// Dword ids spelled out from the `asic_reg` headers for all four hubs.
+    fn smoke_vmhub_offsets_against_headers() -> TestResult {
+        // The invalidation ACK is **above** the REQ, by 0x12 on three hubs and
+        // by 1 on the fourth. None of this is derivable from REQ, which is
+        // what the old "computed as REQ-4" note tried to do — and all four
+        // values it produced were wrong, so a TLB invalidate polled a register
+        // that never acknowledges.
+        for (name, req, ack) in [
+            (
+                "GFXHUB v3.0",
+                GFXHUB_V3_0.inv_eng0_req,
+                GFXHUB_V3_0.inv_eng0_ack,
+            ),
+            (
+                "MMHUB v3.0",
+                MMHUB_V3_0.inv_eng0_req,
+                MMHUB_V3_0.inv_eng0_ack,
+            ),
+            (
+                "GFXHUB v2.3",
+                GFXHUB_V2_3.inv_eng0_req,
+                GFXHUB_V2_3.inv_eng0_ack,
+            ),
+            (
+                "MMHUB v2.3",
+                MMHUB_V2_3.inv_eng0_req,
+                MMHUB_V2_3.inv_eng0_ack,
+            ),
+        ] {
+            let _ = name;
+            if ack <= req {
+                return TestResult::Fail("the ACK block sits above the REQ block");
+            }
+        }
+        if GFXHUB_V3_0.inv_eng0_req != 0x16ab || GFXHUB_V3_0.inv_eng0_ack != 0x16bd {
+            return TestResult::Fail("regGCVM_INVALIDATE_ENG0_REQ/ACK are 0x16ab/0x16bd");
+        }
+        if MMHUB_V3_0.inv_eng0_req != 0x0763 || MMHUB_V3_0.inv_eng0_ack != 0x0775 {
+            return TestResult::Fail("regMMVM_INVALIDATE_ENG0_REQ/ACK are 0x0763/0x0775");
+        }
+        if GFXHUB_V2_3.inv_eng0_req != 0x161f || GFXHUB_V2_3.inv_eng0_ack != 0x1631 {
+            return TestResult::Fail("mmGCVM_INVALIDATE_ENG0_REQ/ACK are 0x161f/0x1631");
+        }
+        // The one hub where the gap is 1, not 0x12.
+        if MMHUB_V2_3.inv_eng0_req != 0x0a01 || MMHUB_V2_3.inv_eng0_ack != 0x0a02 {
+            return TestResult::Fail("mmMMVM_INVALIDATE_ENG0_REQ/ACK are 0x0a01/0x0a02");
+        }
+
+        // Three hubs group all sixteen contexts' bases together, two dwords
+        // apart. MMHUB v2.3 interleaves base/start/end per context instead,
+        // so its stride is eight.
+        if GFXHUB_V3_0.ctx0_pt_base_lo + GFXHUB_V3_0.ctx_addr_distance != 0x16f5 {
+            return TestResult::Fail("regGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 is 0x16f5");
+        }
+        if MMHUB_V3_0.ctx0_pt_base_lo + MMHUB_V3_0.ctx_addr_distance != 0x07ad {
+            return TestResult::Fail("regMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 is 0x07ad");
+        }
+        if GFXHUB_V2_3.ctx0_pt_base_lo + GFXHUB_V2_3.ctx_addr_distance != 0x1669 {
+            return TestResult::Fail("mmGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 is 0x1669");
+        }
+        if MMHUB_V2_3.ctx_addr_distance != 8
+            || MMHUB_V2_3.ctx0_pt_base_lo + MMHUB_V2_3.ctx_addr_distance != 0x0948
+        {
+            return TestResult::Fail("mmMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 is 0x0948");
+        }
+        // With a stride of 2, VMID 1's base would land on VMID 0's START.
+        if MMHUB_V2_3.ctx0_pt_base_lo + 2 != MMHUB_V2_3.ctx0_pt_start_lo {
+            return TestResult::Fail("MMHUB v2.3's start follows its base by two");
+        }
+
+        // The CNTL block is one dword per context on every hub.
+        if GFXHUB_V3_0.ctx0_cntl + GFXHUB_V3_0.ctx_distance != 0x1689
+            || MMHUB_V3_0.ctx0_cntl + MMHUB_V3_0.ctx_distance != 0x0741
+            || GFXHUB_V2_3.ctx0_cntl + GFXHUB_V2_3.ctx_distance != 0x15fd
+            || MMHUB_V2_3.ctx0_cntl + MMHUB_V2_3.ctx_distance != 0x0741
+        {
+            return TestResult::Fail("CONTEXT1_CNTL");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_renoir_mmhub_offsets);
+    kernel_test_in!("drivers/gpu", smoke_vmhub_offsets_against_headers);
 
     fn smoke_regs_for_family_hub_mapping() -> TestResult {
         if regs_for(Family::Phoenix, VmHub::Gfx).is_none() {
