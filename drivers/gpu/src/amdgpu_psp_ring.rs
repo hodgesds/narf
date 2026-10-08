@@ -302,6 +302,54 @@ pub struct Psp {
     fb_base: u64,
     fb_offset: u64,
 }
+/// One IP version's register window, for a caller whose register ids are only
+/// valid on some of the versions an IP reports.
+///
+/// Sibling revisions of the same IP agree on neither their SOC15 `_BASE_IDX`
+/// nor their offsets — MMHUB 3.0.0 and 3.0.1 put `regMMVM_CONTEXT0_CNTL` at
+/// the same 0x0740 on different base indices, 3.0.2 moves it to 0x06c0, and
+/// DCN 3.5 shifts `regHUBPREQ0_DCSURF_SURFACE_INUSE` one dword down from
+/// 3.1.4's. So a window belongs to exactly one version, and widening a
+/// version list without widening its register table turns a clean
+/// `Unsupported` into a write to an unrelated register.
+///
+/// Implement this on a row type that carries whatever offsets the caller
+/// needs, put one row per supported version in a table, and resolve it with
+/// [`bank_for`]. Supporting another GPU is then adding rows.
+pub(crate) trait RegWindow: Copy {
+    /// Discovery-blob version this window describes: (major, minor, revision).
+    fn version(&self) -> (u8, u8, u8);
+    /// The `_BASE_IDX` every register in this window carries.
+    fn base_idx(&self) -> usize;
+    /// Highest dword the caller reads or writes through this base.
+    fn last(&self) -> u32;
+}
+
+/// Resolve the instance-0 bank for `id` and return it with the window row
+/// matching the version discovery reports.
+///
+/// `Unsupported` when no row covers that version — never a fallback to another
+/// generation's row.
+pub(crate) fn bank_for<W: RegWindow>(
+    gpu: &AmdGpu,
+    id: u16,
+    windows: &[W],
+) -> Result<(u64, W), Error> {
+    let ip = discovery::find_ip(&gpu.ip_blocks, id, 0).ok_or(Error::Unsupported)?;
+    let window = windows
+        .iter()
+        .find(|w| w.version() == (ip.major, ip.minor, ip.revision))
+        .ok_or(Error::Unsupported)?;
+    let base = bank(
+        gpu,
+        id,
+        &[window.version()],
+        window.base_idx(),
+        window.last(),
+    )?;
+    Ok((base, *window))
+}
+
 pub(crate) fn bank(
     gpu: &AmdGpu,
     id: u16,

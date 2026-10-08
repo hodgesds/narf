@@ -70,132 +70,219 @@ impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenToc {
 //
 // `amdgpu_psp_ring::bank`'s fourth argument indexes `ip.base_addrs`, so it is
 // the register's SOC15 `_BASE_IDX` — a property of the REGISTER, not of the IP
-// block or of its instance. The fifth is the highest dword this file reads
-// through that base, which `bank` bounds-checks against the BAR.
+// block or of its instance. The fifth is the highest dword read through that
+// base, which `bank` bounds-checks against the BAR.
 //
-// DCN: every HUBP / HUBPREQ / CURSOR register read below is `_BASE_IDX 2` in
-// `dcn/dcn_3_1_4_offset.h`.
-const DCN_BASE_IDX: usize = 2;
-/// `regCURSOR0_3_CURSOR_SIZE` = 0x090f — highest dword `scan_surfaces` reads
-/// (`regCURSOR0_0_CURSOR_SIZE` 0x067b + 3 × `HUBP_PIPE_STRIDE`).
-const CURSOR0_3_CURSOR_SIZE: u32 = 0x090f;
-/// `regHUBP3_DCHUBP_CNTL` = 0x0887 — highest hub dword `free_pipe` reads.
-const HUBP3_DCHUBP_CNTL: u32 = 0x0887;
-/// `regOTG3_OTG_CONTROL` = 0x1cc1 — highest timing-generator dword `free_pipe`
-/// reads.
-const OTG3_OTG_CONTROL: u32 = 0x1cc1;
+// Each of the three IPs this file reads gets a table with one row per
+// supported version, resolved against the discovery blob by
+// `amdgpu_psp_ring::bank_for`. Sibling revisions of the same IP move both base
+// indices and offsets, so a row covers exactly one version and an unlisted one
+// is `Unsupported` rather than silently borrowing a neighbour's window.
+// Supporting another GPU is adding rows here (and, for DCN, the modeset table
+// in `amdgpu_dcn`).
 
-// GC: `gc/gc_11_0_0_offset.h` serves every GC 11.0.x — `gfx_v11_0.c` includes
-// it unconditionally — and puts `regGCVM_CONTEXT0_CNTL` at 0x1688 on
-// `_BASE_IDX 0`.
-const GC_BASE_IDX: usize = 0;
-const GCVM_CONTEXT0_CNTL: u32 = 0x1688;
-
-// MMHUB: Phoenix is MMHUB 3.0.1. Linux `gmc_v11_0.c:578` selects
-// `mmhub_v3_0_1_funcs` for that version, and `mmhub_v3_0_1.c:27` includes
-// `mmhub/mmhub_3_0_1_offset.h`, where `regMMVM_CONTEXT0_CNTL` is 0x0740 with
-// `_BASE_IDX` **1**.
-//
-// The three MMHUB 3.0.x headers share no window, so no single (base index,
-// offset) pair can serve all three: 3.0.0 puts the same 0x0740 on
-// `_BASE_IDX 0`, while 3.0.2 moves the register to 0x06c0. This accepted all
-// three against `_BASE_IDX 0` + 0x0740 — the wrong segment on the hardware we
-// target and the wrong register on 3.0.2 — so the sixteen reads landed
-// somewhere unrelated and the handoff either refused a quiescent GPU or
-// admitted a live VM context, on whatever bit 0 those dwords happened to
-// carry. `amdgpu_vmhub_regs` already records that this generation's MMHUB is
-// BASE_IDX 1; only the version whose window this is gets accepted here.
-const MMHUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 0, 1)];
-const MMHUB_BASE_IDX: usize = 1;
-const MMVM_CONTEXT0_CNTL: u32 = 0x0740;
-
-/// Both hubs carry sixteen VM contexts one dword apart
-/// (`regGCVM_CONTEXT1_CNTL` 0x1689, `regMMVM_CONTEXT1_CNTL` 0x0741), each with
-/// `ENABLE_CONTEXT` in bit 0.
+/// Both VM hubs carry sixteen contexts one dword apart
+/// (`regGCVM_CONTEXT1_CNTL` 0x1689 against 0x1688, `regMMVM_CONTEXT1_CNTL`
+/// 0x0741 against 0x0740), each with `ENABLE_CONTEXT` in bit 0.
 const VM_CONTEXTS: u32 = 16;
 const VM_CONTEXT_ENABLE: u32 = 1 << 0;
 
-/// Production boot has not initialized GFX/GART or other driver VRAM clients.
-/// Reject live VM contexts rather than guessing the size of inherited tables.
-fn inventory(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Result<Vec<Range<u64>>, Error> {
-    use crate::amdgpu_discovery as ip;
-    let dcn = crate::amdgpu_psp_ring::bank(
-        gpu,
-        ip::HW_ID_DCN,
-        &[(3, 1, 4)],
-        DCN_BASE_IDX,
-        CURSOR0_3_CURSOR_SIZE,
-    )
-    .map_err(Error::Psp)?;
-    let gc = crate::amdgpu_psp_ring::bank(
-        gpu,
-        ip::HW_ID_GC,
-        &[(11, 0, 1), (11, 0, 4)],
-        GC_BASE_IDX,
-        GCVM_CONTEXT0_CNTL + VM_CONTEXTS - 1,
-    )
-    .map_err(Error::Psp)?;
-    let hub = crate::amdgpu_psp_ring::bank(
-        gpu,
-        ip::HW_ID_MMHUB,
-        MMHUB_VERSIONS,
-        MMHUB_BASE_IDX,
-        MMVM_CONTEXT0_CNTL + VM_CONTEXTS - 1,
-    )
-    .map_err(Error::Psp)?;
-    if gpu.fw_loaded || gpu.mode.is_some() {
-        return Err(Error::Busy);
-    }
-    cap.invoke(Op(|| {
-        for (base, first) in [(gc, GCVM_CONTEXT0_CNTL), (hub, MMVM_CONTEXT0_CNTL)] {
-            for index in 0..u64::from(VM_CONTEXTS) {
-                // SAFETY: exact IP bank and entire context array bounded above.
-                let value = unsafe { gpu.regs.read32(base + (u64::from(first) + index) * 4) };
-                if value == u32::MAX || value & VM_CONTEXT_ENABLE != 0 {
-                    return Err(Error::Busy);
-                }
-            }
-        }
-        // SAFETY: bank validation bounds all four HUBP/cursor instances.
-        scan_surfaces(|reg| unsafe { gpu.regs.read32(dcn + reg as u64 * 4) })
-    }))
-    .map_err(|_| Error::Revoked)?
+/// One VM hub's `*VM_CONTEXT0_CNTL` window.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct VmWindow {
+    version: (u8, u8, u8),
+    base_idx: usize,
+    ctx0_cntl: u32,
 }
-// The inherited-scanout window. Every id below is `_BASE_IDX 2` in
-// `dcn/dcn_3_1_4_offset.h`, and every mask is the one `dcn_3_1_4_sh_mask.h`
-// gives for the named field:
-//
-//   regHUBP0_DCSURF_SURFACE_CONFIG            0x05e5  SURFACE_PIXEL_FORMAT 0x7f
-//   regHUBP0_DCSURF_TILING_CONFIG             0x05e7  SW_MODE              0x1f
-//   regHUBP0_DCSURF_PRI_VIEWPORT_START        0x05e9  X/Y_START          0x3fff
-//   regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION    0x05ea  WIDTH/HEIGHT       0x3fff
-//   regHUBP0_DCHUBP_CNTL                      0x05f3  HUBP_BLANK_EN         0x1
-//   regHUBPREQ0_DCSURF_SURFACE_PITCH          0x0607  PITCH              0x3fff
-//   regHUBPREQ0_VMID_SETTINGS_0               0x0609  VMID                  0xf
-//   regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS        0x060a  (+1 = _HIGH)
-//   regHUBPREQ0_DCSURF_SECONDARY_SURFACE_ADDRESS      0x060e  (+1 = _HIGH)
-//   regHUBPREQ0_DCSURF_SURFACE_CONTROL        0x061a
-//   regHUBPREQ0_DCSURF_SURFACE_INUSE          0x0621  (+1 = _HIGH)
-//   regHUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE 0x0625  (+1 = _HIGH)
-//   regCURSOR0_0_CURSOR_CONTROL               0x0678
-//   regCURSOR0_0_CURSOR_SURFACE_ADDRESS       0x0679  (+1 = _HIGH)
-//   regCURSOR0_0_CURSOR_SIZE                  0x067b  HEIGHT/WIDTH       0x1ff
-//
-// `_ADDRESS_HIGH` is 0x0000ffff wide on both the surface and the cursor, so a
-// high half with anything above bit 15 set is not an address this GPU wrote.
-const SURFACE_CONFIG: u32 = 0x05e5;
-const TILING_CONFIG: u32 = 0x05e7;
-const PRI_VIEWPORT_START: u32 = 0x05e9;
-const PRI_VIEWPORT_DIMENSION: u32 = 0x05ea;
-const VMID_SETTINGS_0: u32 = 0x0609;
-const SURFACE_CONTROL: u32 = 0x061a;
-const SURFACE_INUSE: u32 = 0x0621;
-const SURFACE_EARLIEST_INUSE: u32 = 0x0625;
-const SECONDARY_SURFACE_ADDRESS: u32 = 0x060e;
-const CURSOR_CONTROL: u32 = 0x0678;
-const CURSOR_SURFACE_ADDRESS: u32 = 0x0679;
-const CURSOR_SIZE: u32 = 0x067b;
+impl crate::amdgpu_psp_ring::RegWindow for VmWindow {
+    fn version(&self) -> (u8, u8, u8) {
+        self.version
+    }
+    fn base_idx(&self) -> usize {
+        self.base_idx
+    }
+    fn last(&self) -> u32 {
+        self.ctx0_cntl + VM_CONTEXTS - 1
+    }
+}
 
+/// `gc/gc_11_0_0_offset.h` serves every GC 11.0.x — `gfx_v11_0.c` includes it
+/// unconditionally — and puts `regGCVM_CONTEXT0_CNTL` at 0x1688 on
+/// `_BASE_IDX 0`, running to `regGCVM_CONTEXT15_CNTL` 0x1697.
+const GFXHUB_WINDOWS: &[VmWindow] = &[
+    // Phoenix1 (780M).
+    VmWindow {
+        version: (11, 0, 1),
+        base_idx: 0,
+        ctx0_cntl: 0x1688,
+    },
+    // Phoenix2.
+    VmWindow {
+        version: (11, 0, 4),
+        base_idx: 0,
+        ctx0_cntl: 0x1688,
+    },
+];
+
+/// The MMHUB 3.0.x headers share no window, which is why this is a table and
+/// not a constant: all three name `regMMVM_CONTEXT0_CNTL`, and no two of them
+/// agree on where it is.
+///
+/// This was one `_BASE_IDX 0` + 0x0740 pair accepted for all three versions.
+/// On the hardware we target that read the wrong segment, so the sixteen reads
+/// that decide whether a VM client is live landed somewhere unrelated and the
+/// handoff either refused a quiescent GPU — leaving the panel on the UEFI
+/// framebuffer — or admitted a live VM context, on whatever bit 0 those dwords
+/// happened to carry. `amdgpu_vmhub_regs` already recorded that this
+/// generation's MMHUB is BASE_IDX 1.
+const MMHUB_WINDOWS: &[VmWindow] = &[
+    // `mmhub_3_0_0_offset.h` — Navi3x (`mmhub_v3_0.c`).
+    VmWindow {
+        version: (3, 0, 0),
+        base_idx: 0,
+        ctx0_cntl: 0x0740,
+    },
+    // `mmhub_3_0_1_offset.h` — Phoenix. Linux `gmc_v11_0.c:578` selects
+    // `mmhub_v3_0_1_funcs`, and `mmhub_v3_0_1.c:27` includes this header: the
+    // same offsets as 3.0.0 on `_BASE_IDX` **1**.
+    VmWindow {
+        version: (3, 0, 1),
+        base_idx: 1,
+        ctx0_cntl: 0x0740,
+    },
+    // `mmhub_3_0_2_offset.h` — 3.0.0's base index, but the register moved.
+    VmWindow {
+        version: (3, 0, 2),
+        base_idx: 0,
+        ctx0_cntl: 0x06c0,
+    },
+];
+
+/// One DCN version's inherited-scanout window: every register `scan_surfaces`
+/// and `free_pipe` read, since a DCN revision may move any of them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct SurfaceWindow {
+    version: (u8, u8, u8),
+    base_idx: usize,
+    /// `regHUBP0_DCSURF_SURFACE_CONFIG`.
+    surface_config: u32,
+    /// `regHUBP0_DCSURF_TILING_CONFIG`.
+    tiling_config: u32,
+    /// `regHUBP0_DCSURF_PRI_VIEWPORT_START`.
+    viewport_start: u32,
+    /// `regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION`.
+    viewport_dimension: u32,
+    /// `regHUBP0_DCHUBP_CNTL`.
+    hubp_cntl: u32,
+    /// `regHUBPREQ0_DCSURF_SURFACE_PITCH`.
+    surface_pitch: u32,
+    /// `regHUBPREQ0_VMID_SETTINGS_0`.
+    vmid_settings: u32,
+    /// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS` (+1 = `_HIGH`).
+    primary_address: u32,
+    /// `regHUBPREQ0_DCSURF_SECONDARY_SURFACE_ADDRESS` (+1 = `_HIGH`).
+    secondary_address: u32,
+    /// `regHUBPREQ0_DCSURF_SURFACE_CONTROL`.
+    surface_control: u32,
+    /// `regHUBPREQ0_DCSURF_SURFACE_INUSE` (+1 = `_HIGH`).
+    surface_inuse: u32,
+    /// `regHUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE` (+1 = `_HIGH`).
+    surface_earliest_inuse: u32,
+    /// `regCURSOR0_0_CURSOR_CONTROL`.
+    cursor_control: u32,
+    /// `regCURSOR0_0_CURSOR_SURFACE_ADDRESS` (+1 = `_HIGH`).
+    cursor_address: u32,
+    /// `regCURSOR0_0_CURSOR_SIZE`.
+    cursor_size: u32,
+    /// `regOTG0_OTG_CONTROL`.
+    otg_control: u32,
+    /// How many HUBP/CURSOR/OTG instances the ASIC has.
+    pipes: u8,
+    /// Dword distance between HUBP/HUBPREQ/CURSOR instances.
+    pipe_stride: u32,
+    /// Dword distance between OTG instances.
+    otg_stride: u32,
+}
+impl SurfaceWindow {
+    /// Highest dword any reader of this window touches: the last pipe's
+    /// `OTG_CONTROL`. The timing generators sit far above the hubs, so this
+    /// bounds the surface scan's last `CURSOR_SIZE` and the pipe scan's last
+    /// `DCHUBP_CNTL` as well — on DCN 3.1.4, `regOTG3_OTG_CONTROL` 0x1cc1
+    /// against `regCURSOR0_3_CURSOR_SIZE` 0x090f and `regHUBP3_DCHUBP_CNTL`
+    /// 0x0887.
+    const fn last_reg(&self) -> u32 {
+        self.otg_control + (self.pipes as u32 - 1) * self.otg_stride
+    }
+}
+impl crate::amdgpu_psp_ring::RegWindow for SurfaceWindow {
+    fn version(&self) -> (u8, u8, u8) {
+        self.version
+    }
+    fn base_idx(&self) -> usize {
+        self.base_idx
+    }
+    fn last(&self) -> u32 {
+        self.last_reg()
+    }
+}
+
+/// `dcn/dcn_3_1_4_offset.h` — Phoenix. Everything the scan reads is
+/// `_BASE_IDX 2`.
+const DCN_3_1_4: SurfaceWindow = SurfaceWindow {
+    version: (3, 1, 4),
+    base_idx: 2,
+    surface_config: 0x05e5,
+    tiling_config: 0x05e7,
+    viewport_start: 0x05e9,
+    viewport_dimension: 0x05ea,
+    hubp_cntl: 0x05f3,
+    surface_pitch: 0x0607,
+    vmid_settings: 0x0609,
+    primary_address: 0x060a,
+    secondary_address: 0x060e,
+    surface_control: 0x061a,
+    surface_inuse: 0x0621,
+    surface_earliest_inuse: 0x0625,
+    cursor_control: 0x0678,
+    cursor_address: 0x0679,
+    cursor_size: 0x067b,
+    otg_control: 0x1b41,
+    pipes: 4,
+    pipe_stride: 0xdc,
+    otg_stride: 0x80,
+};
+
+/// `dcn/dcn_3_5_0_offset.h` — Strix / HawkPoint, the other display generation
+/// `amdgpu_dcn` carries a modeset table for.
+///
+/// This is why the window is a table rather than one set of constants: DCN 3.5
+/// shifts `DCSURF_SURFACE_INUSE` and `DCSURF_SURFACE_EARLIEST_INUSE` one dword
+/// **down** from 3.1.4's (0x0620/0x0624 against 0x0621/0x0625 — 3.1.4's
+/// `SURFACE_FLIP_INTERRUPT` at 0x0620 is gone), and moves `OTG0_OTG_CONTROL`
+/// from 0x1b41 to 0x1b43. Reading 3.1.4's ids on a 3.5 part would take
+/// `INUSE_HIGH` for the low half of an address and `INUSE_C` for its high
+/// half. Every other id below is identical in both headers.
+const DCN_3_5_0: SurfaceWindow = SurfaceWindow {
+    version: (3, 5, 0),
+    surface_inuse: 0x0620,
+    surface_earliest_inuse: 0x0624,
+    otg_control: 0x1b43,
+    ..DCN_3_1_4
+};
+
+const SURFACE_WINDOWS: &[SurfaceWindow] = &[DCN_3_1_4, DCN_3_5_0];
+
+// Field masks. `dcn_3_1_4_sh_mask.h` and `dcn_3_5_0_sh_mask.h` agree on every
+// one of these, so they are not part of the per-version window:
+//
+//   SURFACE_PIXEL_FORMAT        0x0000007f   SW_MODE              0x0000001f
+//   PRI_VIEWPORT_X/Y_START      0x00003fff   WIDTH/HEIGHT         0x3fff0000
+//   PITCH                       0x00003fff   VMID                 0x0000000f
+//   HUBP_BLANK_EN               0x00000001   OTG_MASTER_EN        0x00000001
+//   CURSOR_ENABLE               0x00000001   CURSOR_MODE          0x00000700
+//   CURSOR_TMZ                  0x00001000   CURSOR_PITCH         0x00030000
+//   CURSOR_HEIGHT               0x000001ff   CURSOR_WIDTH         0x01ff0000
+//   *_SURFACE_ADDRESS_HIGH      0x0000ffff
 const SURFACE_PIXEL_FORMAT: u32 = 0x7f;
 const SW_MODE: u32 = 0x1f;
 /// `PRIMARY_SURFACE_TMZ` | `PRIMARY_SURFACE_DCC_EN` |
@@ -216,7 +303,38 @@ const CURSOR_PITCH: u32 = 0x3;
 const CURSOR_PITCH_SHIFT: u32 = 16;
 const CURSOR_DIM: u32 = 0x1ff;
 
-fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Error> {
+/// Production boot has not initialized GFX/GART or other driver VRAM clients.
+/// Reject live VM contexts rather than guessing the size of inherited tables.
+fn inventory(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Result<Vec<Range<u64>>, Error> {
+    use crate::amdgpu_discovery as ip;
+    use crate::amdgpu_psp_ring::bank_for;
+    let (dcn, surface) = bank_for(gpu, ip::HW_ID_DCN, SURFACE_WINDOWS).map_err(Error::Psp)?;
+    let (gc, gfxhub) = bank_for(gpu, ip::HW_ID_GC, GFXHUB_WINDOWS).map_err(Error::Psp)?;
+    let (hub, mmhub) = bank_for(gpu, ip::HW_ID_MMHUB, MMHUB_WINDOWS).map_err(Error::Psp)?;
+    if gpu.fw_loaded || gpu.mode.is_some() {
+        return Err(Error::Busy);
+    }
+    cap.invoke(Op(|| {
+        for (base, first) in [(gc, gfxhub.ctx0_cntl), (hub, mmhub.ctx0_cntl)] {
+            for index in 0..u64::from(VM_CONTEXTS) {
+                // SAFETY: exact IP bank and entire context array bounded above.
+                let value = unsafe { gpu.regs.read32(base + (u64::from(first) + index) * 4) };
+                if value == u32::MAX || value & VM_CONTEXT_ENABLE != 0 {
+                    return Err(Error::Busy);
+                }
+            }
+        }
+        // SAFETY: bank validation bounds every HUBP/cursor instance.
+        scan_surfaces(&surface, |reg| unsafe {
+            gpu.regs.read32(dcn + reg as u64 * 4)
+        })
+    }))
+    .map_err(|_| Error::Revoked)?
+}
+fn scan_surfaces(
+    window: &SurfaceWindow,
+    mut read: impl FnMut(u32) -> u32,
+) -> Result<Vec<Range<u64>>, Error> {
     let mut ranges = Vec::new();
     let mut read = |reg| {
         let v = read(reg);
@@ -226,11 +344,9 @@ fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Er
             Ok(v)
         }
     };
-    for index in 0..u32::from(crate::amdgpu_dcn::DCN_PIPES) {
-        let delta = index * crate::amdgpu_dcn::HUBP_PIPE_STRIDE;
-        if read(crate::amdgpu_dcn::HUBP0_DCHUBP_CNTL + delta)? & crate::amdgpu_dcn::HUBP_BLANK_FORCE
-            == 0
-        {
+    for index in 0..u32::from(window.pipes) {
+        let delta = index * window.pipe_stride;
+        if read(window.hubp_cntl + delta)? & crate::amdgpu_dcn::HUBP_BLANK_FORCE == 0 {
             // Only packed, linear RGB is a bounded inherited scanout here.
             // Reject DCC/YUV/stereo/VM surfaces instead of overlooking metadata.
             //
@@ -240,23 +356,22 @@ fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Er
             // 24 ARGB16161616F and 26 ARGB16161616_UNORM eight. 12
             // (AYCrCb8888), 65..=67 (420 YCbCr/YCrCb) and 112..=119 are the
             // YUV and packed-float formats this handoff will not size.
-            let format = read(SURFACE_CONFIG + delta)? & SURFACE_PIXEL_FORMAT;
+            let format = read(window.surface_config + delta)? & SURFACE_PIXEL_FORMAT;
             let bpp = match format {
                 1 | 3 => 2,
                 8 | 10 => 4,
                 24 | 26 => 8,
                 _ => return Err(Error::Unsupported),
             };
-            if read(TILING_CONFIG + delta)? & SW_MODE != 0
-                || read(SURFACE_CONTROL + delta)? & SURFACE_PROTECTED_OR_COMPRESSED != 0
-                || read(VMID_SETTINGS_0 + delta)? & VMID != 0
+            if read(window.tiling_config + delta)? & SW_MODE != 0
+                || read(window.surface_control + delta)? & SURFACE_PROTECTED_OR_COMPRESSED != 0
+                || read(window.vmid_settings + delta)? & VMID != 0
             {
                 return Err(Error::Unsupported);
             }
-            let viewport = read(PRI_VIEWPORT_DIMENSION + delta)?;
-            let start = read(PRI_VIEWPORT_START + delta)?;
-            let pitch =
-                (read(crate::amdgpu_dcn::HUBPREQ0_DCSURF_SURFACE_PITCH + delta)? & PITCH) + 1;
+            let viewport = read(window.viewport_dimension + delta)?;
+            let start = read(window.viewport_start + delta)?;
+            let pitch = (read(window.surface_pitch + delta)? & PITCH) + 1;
             let rows = ((start >> 16) & VIEWPORT_COORD) + ((viewport >> 16) & VIEWPORT_COORD);
             if rows == 0
                 || (viewport & VIEWPORT_COORD) == 0
@@ -271,10 +386,10 @@ fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Er
             // eye, which shares the primary's pitch and so its size.
             let before = ranges.len();
             for reg in [
-                crate::amdgpu_dcn::HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS,
-                SECONDARY_SURFACE_ADDRESS,
-                SURFACE_INUSE,
-                SURFACE_EARLIEST_INUSE,
+                window.primary_address,
+                window.secondary_address,
+                window.surface_inuse,
+                window.surface_earliest_inuse,
             ] {
                 let low = read(reg + delta)?;
                 let high = read(reg + 1 + delta)?;
@@ -290,7 +405,7 @@ fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Er
                 return Err(Error::Invalid);
             }
         }
-        let control = read(CURSOR_CONTROL + delta)?;
+        let control = read(window.cursor_control + delta)?;
         if control & CURSOR_ENABLE != 0 {
             // `CURSOR_MODE` 1..=3 are the 32-bit-per-pixel formats
             // (`COLOR_1BIT_AND`, `COLOR_PRE_MULTIPLIED_ALPHA`,
@@ -301,15 +416,15 @@ fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Er
             if !matches!(mode, 1..=3) || control & CURSOR_TMZ != 0 {
                 return Err(Error::Unsupported);
             }
-            let size = read(CURSOR_SIZE + delta)?;
+            let size = read(window.cursor_size + delta)?;
             let rows = size & CURSOR_DIM;
             let width = (size >> 16) & CURSOR_DIM;
             let pitch = 64u64 << ((control >> CURSOR_PITCH_SHIFT) & CURSOR_PITCH);
             if rows == 0 || width == 0 || width as u64 > pitch || pitch > 256 {
                 return Err(Error::Invalid);
             }
-            let address = read(CURSOR_SURFACE_ADDRESS + delta)? as u64
-                | (read(CURSOR_SURFACE_ADDRESS + 1 + delta)? as u64) << 32;
+            let address = read(window.cursor_address + delta)? as u64
+                | (read(window.cursor_address + 1 + delta)? as u64) << 32;
             ranges.push(
                 address
                     ..address
@@ -413,8 +528,8 @@ pub(crate) fn prepare() -> Result<(Loader, Arc<Pool>), Error> {
 /// A hub pixel pipe is free when it is blanked and its timing generator is
 /// stopped; claiming one that is not would disturb a live scanout. These are the
 /// same two signals the boot inventory uses to decide a surface is in use.
-fn idle_pipe(mut state: impl FnMut(u8) -> (u32, u32)) -> Option<u8> {
-    for pipe in 0..4u8 {
+fn idle_pipe(pipes: u8, mut state: impl FnMut(u8) -> (u32, u32)) -> Option<u8> {
+    for pipe in 0..pipes {
         let (blank, master) = state(pipe);
         // An all-ones read is a vanished device, not an idle pipe.
         if blank == u32::MAX || master == u32::MAX {
@@ -430,32 +545,17 @@ fn idle_pipe(mut state: impl FnMut(u8) -> (u32, u32)) -> Option<u8> {
 }
 fn free_pipe(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Option<u8> {
     use crate::amdgpu_discovery as ip;
-    let hubp = crate::amdgpu_psp_ring::bank(
-        gpu,
-        ip::HW_ID_DCN,
-        &[(3, 1, 4)],
-        DCN_BASE_IDX,
-        HUBP3_DCHUBP_CNTL,
-    )
-    .ok()?;
-    let otg = crate::amdgpu_psp_ring::bank(
-        gpu,
-        ip::HW_ID_DCN,
-        &[(3, 1, 4)],
-        DCN_BASE_IDX,
-        OTG3_OTG_CONTROL,
-    )
-    .ok()?;
+    let (dcn, window) =
+        crate::amdgpu_psp_ring::bank_for(gpu, ip::HW_ID_DCN, SURFACE_WINDOWS).ok()?;
     cap.invoke(Op(|| {
-        idle_pipe(|pipe| {
-            use crate::amdgpu_dcn as dcn;
-            let hub_reg = dcn::for_pipe(dcn::HUBP0_DCHUBP_CNTL, pipe, dcn::HUBP_PIPE_STRIDE);
-            let otg_reg = dcn::for_pipe(dcn::OTG0_OTG_CONTROL, pipe, dcn::OTG_PIPE_STRIDE);
-            // SAFETY: both banks are bounded above for all four instances.
+        idle_pipe(window.pipes, |pipe| {
+            let hub_reg = crate::amdgpu_dcn::for_pipe(window.hubp_cntl, pipe, window.pipe_stride);
+            let otg_reg = crate::amdgpu_dcn::for_pipe(window.otg_control, pipe, window.otg_stride);
+            // SAFETY: the bank is bounded above every instance of both blocks.
             unsafe {
                 (
-                    gpu.regs.read32(hubp + u64::from(hub_reg) * 4),
-                    gpu.regs.read32(otg + u64::from(otg_reg) * 4),
+                    gpu.regs.read32(dcn + u64::from(hub_reg) * 4),
+                    gpu.regs.read32(dcn + u64::from(otg_reg) * 4),
                 )
             }
         })
@@ -775,60 +875,120 @@ mod tests {
         }
         regs
     }
-    /// Every value here is read off the AMD header, never off the constant it
-    /// checks: `dcn/dcn_3_1_4_offset.h`, `gc/gc_11_0_0_offset.h` and
-    /// `mmhub/mmhub_3_0_1_offset.h`.
+    /// Every literal here is read off the AMD header, never off the row it
+    /// checks. One case per row, so adding a GPU means adding a case: a new
+    /// row with no case is a window nothing has verified.
     fn platform_register_windows_match_the_amd_headers() -> TestResult {
-        use crate::amdgpu_dcn as dcn;
-        let last = dcn::DCN_PIPES - 1;
-        // regHUBP0_DCHUBP_CNTL 0x05f3 _BASE_IDX 2; regCURSOR0_0_CURSOR_SIZE
-        // 0x067b and regCURSOR0_3_CURSOR_SIZE 0x090f share that base.
-        if DCN_BASE_IDX != 2 {
-            return TestResult::Fail("DCN 3.1.4 puts HUBP/HUBPREQ/CURSOR on BASE_IDX 2");
+        // `gc/gc_11_0_0_offset.h`: regGCVM_CONTEXT0_CNTL 0x1688 _BASE_IDX 0,
+        // regGCVM_CONTEXT15_CNTL 0x1697. Both GC 11.0.x revisions use it.
+        let gfxhub_expected = [
+            VmWindow {
+                version: (11, 0, 1),
+                base_idx: 0,
+                ctx0_cntl: 0x1688,
+            },
+            VmWindow {
+                version: (11, 0, 4),
+                base_idx: 0,
+                ctx0_cntl: 0x1688,
+            },
+        ];
+        if GFXHUB_WINDOWS != gfxhub_expected {
+            return TestResult::Fail("a GFXHUB row does not match gc_11_0_0_offset.h");
         }
-        if CURSOR_SIZE != 0x067b
-            || CURSOR0_3_CURSOR_SIZE != 0x090f
-            || dcn::for_pipe(CURSOR_SIZE, last, dcn::HUBP_PIPE_STRIDE) != CURSOR0_3_CURSOR_SIZE
+        // mmhub_3_0_0_offset.h: 0x0740 _BASE_IDX 0.
+        // mmhub_3_0_1_offset.h: 0x0740 _BASE_IDX 1.
+        // mmhub_3_0_2_offset.h: 0x06c0 _BASE_IDX 0.
+        let mmhub_expected = [
+            VmWindow {
+                version: (3, 0, 0),
+                base_idx: 0,
+                ctx0_cntl: 0x0740,
+            },
+            VmWindow {
+                version: (3, 0, 1),
+                base_idx: 1,
+                ctx0_cntl: 0x0740,
+            },
+            VmWindow {
+                version: (3, 0, 2),
+                base_idx: 0,
+                ctx0_cntl: 0x06c0,
+            },
+        ];
+        if MMHUB_WINDOWS != mmhub_expected {
+            return TestResult::Fail("an MMHUB row does not match its mmhub_3_0_x_offset.h");
+        }
+        // regGCVM_CONTEXT15_CNTL 0x1697, regMMVM_CONTEXT15_CNTL 0x074f: both
+        // hubs run sixteen contexts one dword apart, and the window's `last`
+        // must reach the sixteenth.
+        if VM_CONTEXTS != 16 || VM_CONTEXT_ENABLE != 0x1 {
+            return TestResult::Fail("sixteen contexts, ENABLE_CONTEXT in bit 0");
+        }
         {
-            return TestResult::Fail("the surface scan's upper bound is not CURSOR0_3_CURSOR_SIZE");
+            use crate::amdgpu_psp_ring::RegWindow as _;
+            if GFXHUB_WINDOWS[0].last() != 0x1697 || MMHUB_WINDOWS[1].last() != 0x074f {
+                return TestResult::Fail("a VM window stops short of CONTEXT15_CNTL");
+            }
         }
-        // regHUBP3_DCHUBP_CNTL 0x0887, regOTG3_OTG_CONTROL 0x1cc1.
-        if HUBP3_DCHUBP_CNTL != 0x0887
-            || dcn::for_pipe(dcn::HUBP0_DCHUBP_CNTL, last, dcn::HUBP_PIPE_STRIDE)
-                != HUBP3_DCHUBP_CNTL
+        // dcn/dcn_3_1_4_offset.h. Every id is _BASE_IDX 2.
+        let dcn314_expected = SurfaceWindow {
+            version: (3, 1, 4),
+            base_idx: 2,
+            surface_config: 0x05e5,
+            tiling_config: 0x05e7,
+            viewport_start: 0x05e9,
+            viewport_dimension: 0x05ea,
+            hubp_cntl: 0x05f3,
+            surface_pitch: 0x0607,
+            vmid_settings: 0x0609,
+            primary_address: 0x060a,
+            secondary_address: 0x060e,
+            surface_control: 0x061a,
+            surface_inuse: 0x0621,
+            surface_earliest_inuse: 0x0625,
+            cursor_control: 0x0678,
+            cursor_address: 0x0679,
+            cursor_size: 0x067b,
+            otg_control: 0x1b41,
+            pipes: 4,
+            pipe_stride: 0xdc,
+            otg_stride: 0x80,
+        };
+        // dcn/dcn_3_5_0_offset.h. Identical except for the two in-use reports
+        // and OTG_CONTROL, which is the whole reason this is a table.
+        let dcn350_expected = SurfaceWindow {
+            version: (3, 5, 0),
+            surface_inuse: 0x0620,
+            surface_earliest_inuse: 0x0624,
+            otg_control: 0x1b43,
+            ..dcn314_expected
+        };
+        if SURFACE_WINDOWS != [dcn314_expected, dcn350_expected] {
+            return TestResult::Fail("a DCN row does not match its dcn_x_y_z_offset.h");
+        }
+        if dcn314_expected.surface_inuse == dcn350_expected.surface_inuse
+            || dcn314_expected.otg_control == dcn350_expected.otg_control
         {
-            return TestResult::Fail("the pipe scan's hub bound is not HUBP3_DCHUBP_CNTL");
+            return TestResult::Fail("these are the ids the two DCN headers disagree on");
         }
-        if OTG3_OTG_CONTROL != 0x1cc1
-            || dcn::for_pipe(dcn::OTG0_OTG_CONTROL, last, dcn::OTG_PIPE_STRIDE) != OTG3_OTG_CONTROL
+        // regHUBP1_DCHUBP_CNTL 0x06cf against 0x05f3; regOTG1_OTG_CONTROL
+        // 0x1bc1 against 0x1b41. regHUBP3_DCHUBP_CNTL 0x0887,
+        // regCURSOR0_3_CURSOR_SIZE 0x090f, regOTG3_OTG_CONTROL 0x1cc1 — the
+        // bound has to clear all three, and 3.5's OTG3 is 0x1cc3.
+        let w = DCN_3_1_4;
+        if w.hubp_cntl + w.pipe_stride != 0x06cf || w.otg_control + w.otg_stride != 0x1bc1 {
+            return TestResult::Fail("a DCN 3.1.4 pipe stride is wrong");
+        }
+        let top = u32::from(w.pipes - 1);
+        if w.hubp_cntl + top * w.pipe_stride != 0x0887
+            || w.cursor_size + top * w.pipe_stride != 0x090f
+            || w.last_reg() != 0x1cc1
         {
-            return TestResult::Fail("the pipe scan's timing bound is not OTG3_OTG_CONTROL");
+            return TestResult::Fail("DCN 3.1.4's bank bound is not OTG3_OTG_CONTROL");
         }
-        // regGCVM_CONTEXT0_CNTL 0x1688 _BASE_IDX 0, regGCVM_CONTEXT15_CNTL
-        // 0x1697.
-        if GC_BASE_IDX != 0 || GCVM_CONTEXT0_CNTL != 0x1688 {
-            return TestResult::Fail("GC 11.0.x puts GCVM_CONTEXT0_CNTL at 0x1688 on BASE_IDX 0");
-        }
-        if VM_CONTEXTS != 16 || GCVM_CONTEXT0_CNTL + VM_CONTEXTS - 1 != 0x1697 {
-            return TestResult::Fail("GCVM_CONTEXT15_CNTL is 0x1697");
-        }
-        // regMMVM_CONTEXT0_CNTL 0x0740 _BASE_IDX 1, regMMVM_CONTEXT15_CNTL
-        // 0x074f. `mmhub_3_0_0_offset.h` repeats those offsets on BASE_IDX 0
-        // and `mmhub_3_0_2_offset.h` moves the register to 0x06c0, so a window
-        // that serves 3.0.1 serves neither of the others.
-        if MMHUB_BASE_IDX != 1 || MMVM_CONTEXT0_CNTL != 0x0740 {
-            return TestResult::Fail("MMHUB 3.0.1 puts MMVM_CONTEXT0_CNTL at 0x0740 on BASE_IDX 1");
-        }
-        if MMVM_CONTEXT0_CNTL + VM_CONTEXTS - 1 != 0x074f {
-            return TestResult::Fail("MMVM_CONTEXT15_CNTL is 0x074f");
-        }
-        if MMHUB_VERSIONS != [(3, 0, 1)] {
-            return TestResult::Fail("only MMHUB 3.0.1 has this register window");
-        }
-        // GCVM_CONTEXT0_CNTL__ENABLE_CONTEXT and
-        // MMVM_CONTEXT0_CNTL__ENABLE_CONTEXT are both 0x00000001.
-        if VM_CONTEXT_ENABLE != 0x1 {
-            return TestResult::Fail("ENABLE_CONTEXT is bit 0 on both hubs");
+        if DCN_3_5_0.last_reg() != 0x1cc3 {
+            return TestResult::Fail("DCN 3.5's bank bound is not its own OTG3_OTG_CONTROL");
         }
         TestResult::Pass
     }
@@ -854,7 +1014,7 @@ mod tests {
         regs[0x679] = 0x18000000;
         regs[0x67a] = 2;
         regs[0x67b] = (128 << 16) | 64;
-        let ranges = scan_surfaces(|r| regs[r as usize]).unwrap();
+        let ranges = scan_surfaces(&DCN_3_1_4, |r| regs[r as usize]).unwrap();
         if ranges
             != [
                 0x2_12000000..0x2_12300000,
@@ -874,7 +1034,7 @@ mod tests {
         ] {
             let previous = regs[offset];
             regs[offset] = value;
-            if scan_surfaces(|r| regs[r as usize]).is_ok() {
+            if scan_surfaces(&DCN_3_1_4, |r| regs[r as usize]).is_ok() {
                 return TestResult::Fail("unsupported surface ownership accepted");
             }
             regs[offset] = previous;
@@ -889,15 +1049,19 @@ mod tests {
         // Pipe 0 is fetching, pipe 1 is blanked but its generator still runs,
         // pipe 2 is genuinely idle.
         let state = [(0, 1), (1, 1), (1, 0), (1, 0)];
-        if idle_pipe(|pipe| state[pipe as usize]) != Some(2) {
+        if idle_pipe(DCN_3_1_4.pipes, |pipe| state[pipe as usize]) != Some(2) {
             return TestResult::Fail("claimed a pipe that was not idle");
         }
         // Every pipe busy means there is nothing to claim.
-        if idle_pipe(|_| (0, 1)).is_some() || idle_pipe(|_| (1, 1)).is_some() {
+        if idle_pipe(DCN_3_1_4.pipes, |_| (0, 1)).is_some()
+            || idle_pipe(DCN_3_1_4.pipes, |_| (1, 1)).is_some()
+        {
             return TestResult::Fail("claimed a busy pipe");
         }
         // A vanished device is not four idle pipes.
-        if idle_pipe(|_| (u32::MAX, u32::MAX)).is_some() || idle_pipe(|_| (1, u32::MAX)).is_some() {
+        if idle_pipe(DCN_3_1_4.pipes, |_| (u32::MAX, u32::MAX)).is_some()
+            || idle_pipe(DCN_3_1_4.pipes, |_| (1, u32::MAX)).is_some()
+        {
             return TestResult::Fail("claimed a pipe on a vanished device");
         }
         TestResult::Pass
