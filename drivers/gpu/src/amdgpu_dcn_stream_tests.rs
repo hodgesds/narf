@@ -59,16 +59,27 @@ fn run<T>(future: impl core::future::Future<Output = T>) -> T {
 
 fn stream_main_attributes_describe_the_timing_to_the_sink() -> TestResult {
     let mut stream = engine(1);
+    let at = |reg: u64| reg + STRIDE;
+    // `DP0_DP_PIXEL_FORMAT__DP_PIXEL_PER_CYCLE_PROCESSING_MODE_MASK` is
+    // 0x40000000 — one bit at 30. Seed reserved bit 31 so an over-wide mask
+    // shows up as a cleared bit.
+    stream.io.values[at(DP_PIXEL_FORMAT) as usize] = 0x8000_0000;
     if stream.program(&timing(), Depth::Bpc8).is_err() {
         return TestResult::Fail("stream attributes rejected");
     }
-    let at = |reg: u64| reg + STRIDE;
     let v = &stream.io.values;
-    // Uncompressed RGB at eight bits per component.
-    if v[at(DP_PIXEL_FORMAT) as usize] & 0x7 != PIXEL_ENCODING_RGB
-        || v[at(DP_PIXEL_FORMAT) as usize] >> 24 & 0x7 != 1
-    {
+    // Uncompressed RGB at eight bits per component. DP_PIXEL_ENCODING is
+    // 0x00000007 and DP_COMPONENT_DEPTH 0x07000000.
+    let format = v[at(DP_PIXEL_FORMAT) as usize];
+    if format & 0x0000_0007 != PIXEL_ENCODING_RGB || (format & 0x0700_0000) >> 24 != 1 {
         return TestResult::Fail("pixel format");
+    }
+    // One pixel per cycle: no ODM combine on this path.
+    if format & 0x4000_0000 != 0 {
+        return TestResult::Fail("pixel-per-cycle processing mode");
+    }
+    if format & 0x8000_0000 == 0 {
+        return TestResult::Fail("DP_PIXEL_FORMAT's reserved bit 31 was cleared");
     }
     // MISC0 carries the colorimetry depth in bits 7:5 of the byte at bit 24.
     if v[at(DP_MSA_COLORIMETRY) as usize] != 1 << 5 << 24 {
