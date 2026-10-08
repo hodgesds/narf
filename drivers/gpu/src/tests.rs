@@ -4979,37 +4979,122 @@ kernel_test_in!(
     smoke_amdgpu_backlight_init_rejects_period_overflow
 );
 
-// ── amdgpu/smu (thermal) ───────────────────────────────────────────
+// ── amdgpu/smu (metrics table) ─────────────────────────────────────
 
-fn smoke_amdgpu_smu_read_gpu_temperature_decodes_decicelsius() -> TestResult {
-    use crate::amdgpu_smu::{
-        read_gpu_temperature_millicelsius, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
-        SMU_RESP_OK,
+/// Field offsets are literals from `offsetof` on `SmuMetrics_t` in
+/// `smu13_driver_if_v13_0_4.h`, not the module's own constants.
+fn smoke_amdgpu_smu_metrics_table_decode() -> TestResult {
+    use crate::amdgpu_smu::{parse_metrics, SMU_METRICS_V13_0_4_BYTES};
+    if SMU_METRICS_V13_0_4_BYTES != 160 {
+        return TestResult::Fail("sizeof(SmuMetrics_t) is 160 bytes on SMU 13.0.4");
+    }
+    let mut t = alloc::vec![0u8; SMU_METRICS_V13_0_4_BYTES];
+    let put16 = |t: &mut alloc::vec::Vec<u8>, o: usize, v: u16| {
+        t[o..o + 2].copy_from_slice(&v.to_le_bytes())
     };
-    let mp1_base = 0x16000;
-    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
-    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
-
-    let mut m = MockSmu::new();
-    m.stage_read(resp, 1); // handshake idle
-    m.stage_read(resp, SMU_RESP_OK);
-    // SMU reports temperature in d°C — 612 = 61.2 °C.
-    m.stage_read(arg, 612);
-
-    let mc = match read_gpu_temperature_millicelsius(&mut m, mp1_base) {
-        Ok(t) => t,
-        Err(_) => return TestResult::Fail("temperature read errored on happy path"),
+    let put32 = |t: &mut alloc::vec::Vec<u8>, o: usize, v: u32| {
+        t[o..o + 4].copy_from_slice(&v.to_le_bytes())
     };
-    // d°C → m°C: 612 * 100 = 61_200.
-    if mc != 61_200 {
-        return TestResult::Fail("decode of d°C → m°C wrong");
+    put16(&mut t, 0x00, 2200); // GfxclkFrequency
+    put16(&mut t, 0x02, 900); // SocclkFrequency
+    put16(&mut t, 0x08, 3200); // MemclkFrequency
+    put16(&mut t, 0x0c, 4250); // GfxActivity, centi-percent
+    put16(&mut t, 0x0e, 0); // UvdActivity
+    put16(&mut t, 0x10, 1050); // Voltage[0] = VDDCR_VDD
+    put16(&mut t, 0x12, 950); // Voltage[1] = VDDCR_SOC
+    put16(&mut t, 0x4e, 5500); // L3Temperature
+    put16(&mut t, 0x50, 6120); // GfxTemperature, centi-Celsius
+    put16(&mut t, 0x52, 6480); // SocTemperature
+    put16(&mut t, 0x54, 0x0003); // ThrottlerStatus
+    put16(&mut t, 0x56, 15_000); // CurrentSocketPower, mW
+    put32(&mut t, 0x5c, 12_500); // ApuPower, mW
+    put16(&mut t, 0x88, 14_200); // AverageSocketPower
+
+    let m = match parse_metrics(&t) {
+        Some(m) => m,
+        None => return TestResult::Fail("a full-size table must decode"),
+    };
+    if m.gfxclk_mhz != 2200 || m.socclk_mhz != 900 || m.memclk_mhz != 3200 {
+        return TestResult::Fail("clock fields at 0x00, 0x02, 0x08");
+    }
+    if m.gfx_activity_centi_percent != 4250 || m.gfx_activity_percent() != 42 {
+        return TestResult::Fail("activity is centi-percent at 0x0c");
+    }
+    // Voltage is an array; the SOC entry must not be read as a separate
+    // scalar at some other offset.
+    if m.vddgfx_mv != 1050 || m.vddsoc_mv != 950 {
+        return TestResult::Fail("Voltage[2] at 0x10 indexes VDD then SOC");
+    }
+    if m.gfx_temperature_centi_c != 6120 || m.soc_temperature_centi_c != 6480 {
+        return TestResult::Fail("temperatures at 0x50 and 0x52");
+    }
+    if m.l3_temperature_centi_c != 5500 {
+        return TestResult::Fail("L3Temperature is at 0x4e, just below GfxTemperature");
+    }
+    // Centi-Celsius to milli-Celsius is a factor of ten. Reading the field as
+    // tenths of a degree would give 612_000 here instead of 61_200.
+    if m.edge_temperature_milli_c() != 61_200 {
+        return TestResult::Fail("GfxTemperature is centi-Celsius, so milli-C is x10");
+    }
+    if m.hotspot_temperature_milli_c() != 64_800 {
+        return TestResult::Fail("hotspot comes from SocTemperature");
+    }
+    if m.throttler_status != 3 || m.current_socket_power_mw != 15_000 {
+        return TestResult::Fail("throttler at 0x54, socket power at 0x56");
+    }
+    // ApuPower is one of the two uint32_t fields; a uint16_t read here would
+    // clip anything above 65535 and misplace dGpuPower.
+    if m.apu_power_mw != 12_500 || m.average_socket_power_mw != 14_200 {
+        return TestResult::Fail("ApuPower is a u32 at 0x5c; AverageSocketPower is at 0x88");
+    }
+    // A short buffer is rejected rather than decoded out of bounds.
+    if parse_metrics(&t[..SMU_METRICS_V13_0_4_BYTES - 1]).is_some() {
+        return TestResult::Fail("a short table must be rejected");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
-    smoke_amdgpu_smu_read_gpu_temperature_decodes_decicelsius
+    smoke_amdgpu_smu_metrics_table_decode
 );
+
+/// The SMU 13.0.4 message ids, spelled out from
+/// `smu_v13_0_4_ppsmc.h`. The whole table checks out; this pins the ones the
+/// bring-up path depends on, and the message-count bound that showed the
+/// temperature message to be fabricated.
+fn smoke_amdgpu_smu_v13_message_ids() -> TestResult {
+    use crate::amdgpu_smu_v13::*;
+    if V13_MSG_TEST != 0x01 || V13_MSG_GET_PMFW_VERSION != 0x02 || V13_MSG_GET_DRIVER_IF != 0x03 {
+        return TestResult::Fail("TestMessage/GetPmfwVersion/GetDriverIfVersion are 0x01..0x03");
+    }
+    if V13_MSG_SET_DRAM_ADDR_HI != 0x0D
+        || V13_MSG_SET_DRAM_ADDR_LO != 0x0E
+        || V13_MSG_XFER_SMU2DRAM != 0x0F
+        || V13_MSG_XFER_DRAM2SMU != 0x10
+    {
+        return TestResult::Fail("the metrics-table transfer quartet is 0x0D..0x10");
+    }
+    if V13_MSG_ALLOW_GFX_OFF != 0x19 || V13_MSG_DISALLOW_GFX_OFF != 0x1A {
+        return TestResult::Fail("GFXOFF control is 0x19/0x1A on SMU13, not 0x07/0x08");
+    }
+    // The hard/soft min/max messages are not laid out in a block: SOCCLK's
+    // hard min is 0x13 while FCLK's is 0x23, and the soft mins are 0x24 and
+    // 0x14 respectively. Nothing here can be derived from a neighbour.
+    if V13_MSG_SET_HARD_MIN_SOCCLK != 0x13
+        || V13_MSG_SET_SOFT_MIN_FCLK != 0x14
+        || V13_MSG_SET_HARD_MIN_FCLK != 0x23
+        || V13_MSG_SET_SOFT_MIN_SOCCLK != 0x24
+    {
+        return TestResult::Fail("the clock min messages are interleaved, not contiguous");
+    }
+    // PPSMC_Message_Count is 0x31; anything at or above it is not a message.
+    // 0x36 was being sent as GetCurrentTemperature.
+    if V13_MSG_SET_SOFT_MIN_SOCCLK >= 0x31 {
+        return TestResult::Fail("message ids must be below PPSMC_Message_Count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu/smu", smoke_amdgpu_smu_v13_message_ids);
 
 // ── DMA-buf smokes ────────────────────────────────────────────────────
 
