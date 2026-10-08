@@ -59,6 +59,30 @@ unsafe fn dsb_st() {
 
 // ── reads ──────────────────────────────────────────────────────────
 
+/// Read a naturally-aligned 64-bit MMIO register at `va`, as ONE access.
+///
+/// Both x86_64 and aarch64 issue a single 64-bit load for an aligned
+/// `read_volatile::<u64>`, which is what a device with a 64-bit register
+/// requires: two 32-bit halves can be observed out of order or interleaved
+/// with the device's own update of the other half.
+///
+/// # Safety
+/// `va` must be a readable kernel mapping covering [va, va+8), 8-byte
+/// aligned; the device must tolerate the read at this offset.
+#[inline]
+pub unsafe fn read64(va: u64) -> u64 {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller-asserted; volatile defeats the load combiner.
+    let v = unsafe { core::ptr::read_volatile(va as *const u64) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: barrier always legal.
+    unsafe {
+        dmb_ishld();
+    }
+    compiler_fence(Ordering::SeqCst);
+    v
+}
+
 /// Read a naturally-aligned 32-bit MMIO register at `va`.
 ///
 /// # Safety
@@ -138,6 +162,38 @@ pub unsafe fn write32(va: u64, value: u32) {
     // the local CPU's buffer onto the interconnect, so the device
     // sees it before any subsequent CPU operation.
     // SAFETY: Valid memory or trusted environment
+    unsafe {
+        dsb_st();
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Write a naturally-aligned 64-bit MMIO register at `va`, as ONE access.
+///
+/// A device whose register is 64 bits wide latches the whole quadword; two
+/// 32-bit stores let it latch a half-updated value. Linux's
+/// `amdgpu_mm_wdoorbell64` uses `atomic64_set` for exactly this reason, and a
+/// GFX11 ring doorbell is one of these registers.
+///
+/// # Safety
+/// `va` must be a writable kernel mapping covering [va, va+8), 8-byte
+/// aligned; the caller owns the device exclusively for the duration.
+#[inline]
+pub unsafe fn write64(va: u64, value: u64) {
+    compiler_fence(Ordering::SeqCst);
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: barrier always legal.
+    unsafe {
+        dmb_ishst();
+    }
+    // SAFETY: caller-asserted; volatile defeats the store combiner, and an
+    // aligned u64 store is a single access on both targets.
+    unsafe {
+        core::ptr::write_volatile(va as *mut u64, value);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: barrier always legal; dsb st pushes the store onto the
+    // interconnect before any subsequent CPU operation.
     unsafe {
         dsb_st();
     }

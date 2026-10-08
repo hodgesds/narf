@@ -382,8 +382,10 @@ fn smoke_amdgpu_pm4_write_data_fence_packet() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_amdgpu_pm4_write_data_fence_packet);
 
 fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
-    use crate::amdgpu_ring::{Ring, RingError, DOORBELL_STRIDE_BYTES, NOP_DW, RING_SIZE_DW};
-    let mut ring = match Ring::new(7) {
+    use crate::amdgpu_ring::{
+        DoorbellKind, Ring, RingError, DOORBELL_STRIDE_BYTES, NOP_DW, RING_SIZE_DW,
+    };
+    let mut ring = match Ring::new(7, DoorbellKind::Gfx) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("Ring::new failed"),
     };
@@ -3017,11 +3019,69 @@ kernel_test_in!(
 // dwords. The unit tests already cover Pm4Builder and Ring
 // individually; this one verifies they compose.
 
+/// Every literal is from `amdgpu_doorbell.h` or from the `*_ring_set_wptr`
+/// function named beside it, never from the constant it checks.
+fn smoke_amdgpu_ring_doorbell_index_space_and_payload() -> TestResult {
+    use crate::amdgpu_ring::{doorbell_payload_for, DoorbellKind, Ring, DOORBELL_STRIDE_BYTES};
+
+    // `amdgpu_doorbell.h` above `AMDGPU_DOORBELL64_ASSIGNMENT`: "64bit
+    // doorbell, offset are in QWORD". So an assignment-enum slot is 8 bytes.
+    if DOORBELL_STRIDE_BYTES != 8 {
+        return TestResult::Fail("an assignment-enum doorbell slot is a quadword");
+    }
+    // AMDGPU_NAVI10_DOORBELL_GFX_RING0 = 0x08B, AMDGPU_NAVI10_DOORBELL_MEC_RING0
+    // = 0x003, AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 = 0x100. Linux doubles each
+    // into the dword space (`ring->doorbell_index = ... << 1`, gfx_v11_0.c:1178)
+    // and `amdgpu_mm_wdoorbell64` indexes a `uint32_t *`, so the byte offset is
+    // the enum value times eight.
+    for (slot, want) in [(0x08Bu16, 0x458u64), (0x003, 0x018), (0x100, 0x800)] {
+        let ring = match Ring::new(slot, DoorbellKind::Gfx) {
+            Ok(r) => r,
+            Err(_) => return TestResult::Fail("Ring::new failed"),
+        };
+        if ring.doorbell_offset() != want {
+            return TestResult::Fail("doorbell byte offset is not the QWORD slot times eight");
+        }
+        // The same number the other way round: Linux's dword index, scaled by
+        // the four bytes a `uint32_t *` step covers.
+        if ring.doorbell_offset() != (u64::from(slot) << 1) * 4 {
+            return TestResult::Fail("the two doorbell index spaces disagree");
+        }
+    }
+
+    // gfx_v11_0_ring_set_wptr_gfx: WDOORBELL64(idx, ring->wptr) — dwords.
+    // sdma_v6_0_ring_set_wptr:     WDOORBELL64(idx, ring->wptr << 2) — bytes.
+    // vcn_v4_0_unified_ring_set_wptr: WDOORBELL32(idx, lower_32_bits(wptr)).
+    if doorbell_payload_for(DoorbellKind::Gfx, 6) != 6 {
+        return TestResult::Fail("a GFX doorbell carries the dword wptr");
+    }
+    if doorbell_payload_for(DoorbellKind::Sdma, 6) != 24 {
+        return TestResult::Fail("an SDMA doorbell carries the BYTE wptr");
+    }
+    // A rolled-over pointer: VCN's doorbell is only 32 bits wide, so it drops
+    // the high half, while GFX and SDMA carry it.
+    let rolled = 0x1_0000_0005u64;
+    if doorbell_payload_for(DoorbellKind::Vcn, rolled) != 5 {
+        return TestResult::Fail("a VCN doorbell is 32 bits wide");
+    }
+    if doorbell_payload_for(DoorbellKind::Gfx, rolled) != rolled {
+        return TestResult::Fail("a GFX doorbell carries the whole 64-bit wptr");
+    }
+    if doorbell_payload_for(DoorbellKind::Sdma, rolled) != rolled << 2 {
+        return TestResult::Fail("an SDMA doorbell carries the whole byte pointer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_ring_doorbell_index_space_and_payload
+);
+
 fn smoke_amdgpu_gfx_pm4_write_data_lands_in_ring() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
-    use crate::amdgpu_ring::Ring;
+    use crate::amdgpu_ring::{DoorbellKind, Ring};
 
-    let mut ring = match Ring::new(11) {
+    let mut ring = match Ring::new(11, DoorbellKind::Gfx) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("Ring::new failed"),
     };
@@ -3090,7 +3150,7 @@ fn smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
     use crate::amdgpu_ring::Ring;
 
-    let mut ring = match Ring::new(12) {
+    let mut ring = match Ring::new(12, crate::amdgpu_ring::DoorbellKind::Gfx) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("Ring::new failed"),
     };

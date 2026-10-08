@@ -1,4 +1,4 @@
-//! AMDGPU GFX / SDMA ring submission scaffolding — clean-room.
+//! AMDGPU GFX / compute / SDMA / VCN ring submission scaffolding — clean-room.
 //!
 //! Reference: AMD KGD (Kernel-mode Graphics Driver) public ring
 //! protocol notes + the public PM4 packet format reference.
@@ -52,9 +52,59 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_driver_runtime::{alloc_coherent, DmaBuffer, DomainId, MmioRegion};
 
-/// Doorbell BAR (BAR2 on Vega/Navi). Each per-queue doorbell is
-/// 8 bytes wide; queue index N lives at offset `N * 8`.
+/// Doorbell BAR (BAR2 on Vega/Navi). Each per-queue doorbell is a quadword, so
+/// slot N lives at byte offset `N * 8`.
+///
+/// Linux has TWO doorbell index spaces a dword apart in scale, and mixing them
+/// is a silent factor-of-two:
+///
+///   * The **assignment enum** — `AMDGPU_NAVI10_DOORBELL_GFX_RING0` = 0x08B,
+///     `..._MEC_RING0` = 0x003, `..._sDMA_ENGINE0` = 0x100 — is in QWORDs.
+///     `amdgpu_doorbell.h` says so above `AMDGPU_DOORBELL64_ASSIGNMENT`:
+///     "64bit doorbell, offset are in QWORD, occupy 2KB doorbell space". The
+///     `..._DOORBELL64_VCN0_1` entry's comment, "lower 32 bits for VNC0 and
+///     upper 32 bits for VNC1", is the same statement from the other side: one
+///     index, two 32-bit engines.
+///   * `amdgpu_ring::doorbell_index` is in DWORDs, because
+///     `amdgpu_mm_wdoorbell64` indexes a `uint32_t *cpu_addr`
+///     (`amdgpu_doorbell_mgr.c`) — byte address `cpu_addr + index`, i.e.
+///     `index * 4`. That is why every ring setup converts:
+///     `ring->doorbell_index = adev->doorbell_index.gfx_ring0 << 1`
+///     (`gfx_v11_0.c:1178`, `mes_v11_0.c:1652`, `vcn_v4_0.c:222`).
+///
+/// [`Ring::new`]'s `queue_idx` is the **assignment-enum** space, the QWORD one,
+/// so `AMDGPU_NAVI10_DOORBELL_*` values drop straight in and the byte offset
+/// works out the same either way: `0x08B * 8` here against Linux's
+/// `(0x08B << 1) * 4`. Do not pass a `ring->doorbell_index`; that is already
+/// doubled.
 pub const DOORBELL_STRIDE_BYTES: u64 = 8;
+
+/// Which engine's doorbell protocol a ring speaks. The payload is NOT uniform
+/// across AMD engines, so a ring has to know:
+///
+///   * GFX, compute and MES write the dword `wptr` as a quadword —
+///     `WDOORBELL64(ring->doorbell_index, ring->wptr)`
+///     (`gfx_v11_0.c::gfx_v11_0_ring_set_wptr_gfx` and `..._compute`,
+///     `mes_v11_0.c:87`).
+///   * SDMA writes the same pointer in BYTES —
+///     `WDOORBELL64(ring->doorbell_index, ring->wptr << 2)`
+///     (`sdma_v6_0.c::sdma_v6_0_ring_set_wptr`). A dword value here would
+///     announce a pointer four times short of the truth.
+///   * VCN writes only the low 32 bits, as a dword count —
+///     `WDOORBELL32(ring->doorbell_index, lower_32_bits(ring->wptr))`
+///     (`vcn_v4_0.c::vcn_v4_0_unified_ring_set_wptr`).
+///
+/// Adding an engine is adding a variant plus its arm in
+/// [`Ring::doorbell_payload`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DoorbellKind {
+    /// Quadword doorbell carrying a dword pointer: GFX, compute, MES.
+    Gfx,
+    /// Quadword doorbell carrying a byte pointer: SDMA.
+    Sdma,
+    /// Dword doorbell carrying a dword pointer: VCN.
+    Vcn,
+}
 
 /// Ring size in dwords. 1024 is a comfortable middle-ground —
 /// enough headroom for ~50 PM4 IB-submission groups before the
@@ -63,7 +113,7 @@ pub const DOORBELL_STRIDE_BYTES: u64 = 8;
 pub const RING_SIZE_DW: usize = 1024;
 const RING_BYTES: usize = RING_SIZE_DW * 4;
 
-/// One GFX or SDMA submission ring. Backed by a DMA-coherent
+/// One GFX, compute, SDMA or VCN submission ring. Backed by a DMA-coherent
 /// page; the GPU reads from `phys_addr()` directly.
 #[derive(Debug)]
 pub struct Ring {
@@ -74,7 +124,9 @@ pub struct Ring {
     wptr_dw: u64,
     /// Per-queue doorbell offset within BAR2.
     doorbell_off: u64,
-    /// Queue index for diagnostics.
+    /// Which engine's doorbell protocol this ring speaks.
+    kind: DoorbellKind,
+    /// Queue index for diagnostics, in the assignment-enum (QWORD) space.
     pub queue_idx: u16,
 }
 
@@ -90,6 +142,23 @@ pub enum RingError {
     Full,
 }
 
+/// The value `kind`'s doorbell carries for a write pointer of `wptr_dw`
+/// dwords.
+///
+/// Free-standing rather than a method so the conversion is testable at pointer
+/// values a ring cannot be walked to, and so adding an engine is one arm here.
+/// See [`DoorbellKind`] for the per-engine citations.
+pub const fn doorbell_payload_for(kind: DoorbellKind, wptr_dw: u64) -> u64 {
+    match kind {
+        DoorbellKind::Gfx => wptr_dw,
+        // `ring->wptr << 2`: SDMA's doorbell is a byte pointer.
+        DoorbellKind::Sdma => wptr_dw << 2,
+        // `lower_32_bits(ring->wptr)`: VCN's doorbell is 32 bits wide, so the
+        // high half of a rolled-over pointer is not announced at all.
+        DoorbellKind::Vcn => (wptr_dw as u32) as u64,
+    }
+}
+
 /// `PACKET3(PACKET3_NOP, 0x3FFF)` — `gfx_v11_0.c`'s `.nop`.
 ///
 /// A whole-ring filler and the padding between packets. The count field is
@@ -99,9 +168,13 @@ pub const NOP_DW: u32 =
     crate::amdgpu_pm4_defs::packet3(crate::amdgpu_pm4_defs::PACKET3_NOP, 0x3FFF);
 
 impl Ring {
-    /// Allocate a fresh ring + compute its doorbell offset for
-    /// the given queue index.
-    pub fn new(queue_idx: u16) -> Result<Self, RingError> {
+    /// Allocate a fresh ring + compute its doorbell offset for the given queue
+    /// index.
+    ///
+    /// `queue_idx` is an `AMDGPU_NAVI10_DOORBELL_*` assignment value — the
+    /// QWORD index space; see [`DOORBELL_STRIDE_BYTES`]. `kind` selects the
+    /// doorbell payload, which differs per engine; see [`DoorbellKind`].
+    pub fn new(queue_idx: u16, kind: DoorbellKind) -> Result<Self, RingError> {
         let backing =
             alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
         // Fill with the NOP PACKET. This used to write zeros, described as
@@ -120,6 +193,7 @@ impl Ring {
             backing,
             wptr_dw: 0,
             doorbell_off: queue_idx as u64 * DOORBELL_STRIDE_BYTES,
+            kind,
             queue_idx,
         })
     }
@@ -240,21 +314,45 @@ impl Ring {
         Ok(self.wptr_dw)
     }
 
-    /// Ring the per-queue doorbell. Writes `wptr` to BAR2 +
-    /// `doorbell_off`; the GPU's doorbell hardware translates that
-    /// into a "ring wptr advanced" signal to the engine.
+    /// The value this engine's doorbell carries for the current `wptr`.
+    pub fn doorbell_payload(&self) -> u64 {
+        doorbell_payload_for(self.kind, self.wptr_dw)
+    }
+
+    /// Ring the per-queue doorbell. Writes the payload to BAR2 +
+    /// `doorbell_off`; the GPU's doorbell hardware translates that into a
+    /// "ring wptr advanced" signal to the engine.
+    ///
+    /// GFX and SDMA doorbells are a single quadword access
+    /// (`amdgpu_mm_wdoorbell64` is an `atomic64_set`), VCN's a single dword
+    /// (`WDOORBELL32`).
+    ///
+    /// This used to write the low half and then a literal zero to the high
+    /// half, described as "only the low 32 bits carry the wptr; the upper 32
+    /// are reserved". They are not reserved: the pointer is free-running and
+    /// 64-bit, as this module's own header says, so zeroing the high half
+    /// announces a wptr 2^32 dwords in the past once one ever rolls over. Two
+    /// stores also let the engine latch a half-updated quadword, which is why
+    /// Linux uses one atomic 64-bit write.
+    ///
+    /// LINUX-GAP: Linux also publishes the pointer to a host-memory shadow
+    /// (`atomic64_set(ring->wptr_cpu_addr, ..)`) immediately before the
+    /// doorbell, which is what the engine reads when doorbells are off and
+    /// what MES polls. That needs the queue descriptor the firmware consumes —
+    /// the same gap as `rptr` in the header above.
     ///
     /// # Safety
-    /// `bar2` must map the doorbell window of the corresponding
-    /// AMD GPU; caller owns the doorbell range exclusively while
-    /// this queue is alive.
+    /// `bar2` must map the doorbell window of the corresponding AMD GPU;
+    /// caller owns the doorbell range exclusively while this queue is alive.
     pub unsafe fn ring_doorbell(&self, bar2: &MmioRegion) {
-        // Doorbell is 64-bit, but only the low 32 bits carry the
-        // wptr; the upper 32 are reserved.
-        // SAFETY: caller-asserted ownership.
+        let payload = self.doorbell_payload();
+        // SAFETY: caller-asserted ownership; the offset is a multiple of
+        // DOORBELL_STRIDE_BYTES and so quadword-aligned.
         unsafe {
-            bar2.write32(self.doorbell_off, self.wptr_dw as u32);
-            bar2.write32(self.doorbell_off + 4, 0);
+            match self.kind {
+                DoorbellKind::Gfx | DoorbellKind::Sdma => bar2.write64(self.doorbell_off, payload),
+                DoorbellKind::Vcn => bar2.write32(self.doorbell_off, payload as u32),
+            }
         }
     }
 }

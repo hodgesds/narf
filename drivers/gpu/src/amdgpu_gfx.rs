@@ -493,7 +493,8 @@ impl GfxContext {
 
     /// Allocate a fresh GFX context: ring + fence buffer.
     pub fn new(queue_idx: u16) -> Result<Self, RingError> {
-        let ring = Ring::new(queue_idx)?;
+        // A GFX ring: the doorbell carries the dword wptr as a quadword.
+        let ring = Ring::new(queue_idx, crate::amdgpu_ring::DoorbellKind::Gfx)?;
         // 8 bytes is enough — single u64 sequence number. Hardware
         // requires 8-byte alignment for the WRITE_DATA target
         // anyway, and DMA pages are 4-KiB aligned so this is fine.

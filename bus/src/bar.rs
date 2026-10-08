@@ -354,6 +354,33 @@ impl MmioRegion {
             narf_arch::mmio::write32(self.virt + offset, value);
         }
     }
+
+    /// Read a naturally-aligned 64-bit MMIO quadword at `offset`, as one
+    /// access.
+    ///
+    /// # Safety
+    /// `offset + 8 <= self.len`, `offset` 8-byte aligned, and the device must
+    /// tolerate a register read here.
+    #[inline]
+    pub unsafe fn read64(&self, offset: u64) -> u64 {
+        // SAFETY: caller-asserted in-range, naturally-aligned.
+        unsafe { narf_arch::mmio::read64(self.virt + offset) }
+    }
+
+    /// Write a naturally-aligned 64-bit MMIO quadword at `offset`, as one
+    /// access — for registers the device latches whole, where two 32-bit
+    /// stores would let it see a half-updated value.
+    ///
+    /// # Safety
+    /// `offset + 8 <= self.len`, `offset` 8-byte aligned; caller owns the
+    /// device exclusively.
+    #[inline]
+    pub unsafe fn write64(&self, offset: u64, value: u64) {
+        // SAFETY: caller-asserted in-range, naturally-aligned.
+        unsafe {
+            narf_arch::mmio::write64(self.virt + offset, value);
+        }
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
