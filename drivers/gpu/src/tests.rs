@@ -8587,7 +8587,9 @@ fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
     let state = CtxState::new();
     let ctx_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX;
     let call = |op: u32, flags: u32, id: u32, priority: i32, master: bool| {
-        let mut r = [0u8; 24];
+        // Exactly `sizeof(union drm_amdgpu_ctx)`, so a dispatch that asked for
+        // more would over-read this buffer rather than silently find stack.
+        let mut r = [0u8; core::mem::size_of::<u::DrmAmdgpuCtx>()];
         r[0..4].copy_from_slice(&op.to_le_bytes());
         r[4..8].copy_from_slice(&flags.to_le_bytes());
         r[8..12].copy_from_slice(&id.to_le_bytes());
@@ -8979,8 +8981,8 @@ fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
     let state = VmState::new();
     let ctx = CtxState::new();
 
-    // A context to submit against.
-    let mut ctx_req = [0u8; 24];
+    // A context to submit against, sized at the union exactly.
+    let mut ctx_req = [0u8; core::mem::size_of::<u::DrmAmdgpuCtx>()];
     ctx_req[0..4].copy_from_slice(&u::AMDGPU_CTX_OP_ALLOC_CTX.to_le_bytes());
     if ctx_dispatch(
         DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX,

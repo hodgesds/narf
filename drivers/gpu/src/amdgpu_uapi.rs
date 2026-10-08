@@ -29,12 +29,25 @@ pub struct DrmAmdgpuGemCreateOut {
     pub _pad: u32,
 }
 
-/// C: drm_amdgpu_gem_create (union)
+/// C: `union drm_amdgpu_gem_create`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (32 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `32` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuGemCreate {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuGemCreate {
     pub in_: DrmAmdgpuGemCreateIn,
     pub out: DrmAmdgpuGemCreateOut,
+}
+impl Default for DrmAmdgpuGemCreate {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_bo_list_in
@@ -72,12 +85,25 @@ pub struct DrmAmdgpuBoListOut {
     pub _pad: u32,
 }
 
-/// C: drm_amdgpu_bo_list (union)
+/// C: `union drm_amdgpu_bo_list`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (24 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `24` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuBoList {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuBoList {
     pub in_: DrmAmdgpuBoListIn,
     pub out: DrmAmdgpuBoListOut,
+}
+impl Default for DrmAmdgpuBoList {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_ctx_in
@@ -121,21 +147,45 @@ pub struct DrmAmdgpuCtxOutPstate {
     pub _pad: u32,
 }
 
-/// C: drm_amdgpu_ctx_out (union - largest member)
+/// C: `union drm_amdgpu_ctx_out` — itself a union of three arms, all starting
+/// at offset zero, sized by the widest (`state`, sixteen bytes).
+///
+/// The previous mirror was the flattened `state` arm declared as a struct, so
+/// `alloc.ctx_id` and `pstate.flags` had no names, and the three arms' sizes
+/// summed to 24 wherever a caller reasoned about the whole union.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuCtxOut {
-    pub flags: u64,
-    pub hangs: u32,
-    pub reset_status: u32,
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuCtxOut {
+    pub alloc: DrmAmdgpuCtxOutAlloc,
+    pub state: DrmAmdgpuCtxOutState,
+    pub pstate: DrmAmdgpuCtxOutPstate,
+}
+impl Default for DrmAmdgpuCtxOut {
+    fn default() -> Self {
+        // SAFETY: POD members, no niches.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
-/// C: drm_amdgpu_ctx (union)
+/// C: `union drm_amdgpu_ctx`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (16 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `16` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuCtx {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuCtx {
     pub in_: DrmAmdgpuCtxIn,
     pub out: DrmAmdgpuCtxOut,
+}
+impl Default for DrmAmdgpuCtx {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_userq_in
@@ -177,12 +227,25 @@ pub struct DrmAmdgpuUserqOut {
     pub _pad: u32,
 }
 
-/// C: drm_amdgpu_userq (union)
+/// C: `union drm_amdgpu_userq`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (72 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `72` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuUserq {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuUserq {
     pub in_: DrmAmdgpuUserqIn,
     pub out: DrmAmdgpuUserqOut,
+}
+impl Default for DrmAmdgpuUserq {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_userq_mqd_gfx11
@@ -293,12 +356,25 @@ pub struct DrmAmdgpuVmOut {
     pub flags: u64,
 }
 
-/// C: drm_amdgpu_vm (union)
+/// C: `union drm_amdgpu_vm`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (8 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `8` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuVm {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuVm {
     pub in_: DrmAmdgpuVmIn,
     pub out: DrmAmdgpuVmOut,
+}
+impl Default for DrmAmdgpuVm {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_sched_in
@@ -313,12 +389,19 @@ pub struct DrmAmdgpuSchedIn {
     pub ctx_id: u32,
 }
 
-/// C: drm_amdgpu_sched (union)
+/// C: `union drm_amdgpu_sched`. One member, so the union is exactly
+/// `DrmAmdgpuSchedIn` — the `[u32; 0]` second field this used to carry was
+/// not in the C and contributed nothing but confusion.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuSched {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuSched {
     pub in_: DrmAmdgpuSchedIn,
-    pub _pad: [u32; 0],
+}
+impl Default for DrmAmdgpuSched {
+    fn default() -> Self {
+        // SAFETY: POD member, no niches.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_gem_userptr
@@ -380,12 +463,25 @@ pub struct DrmAmdgpuGemMmapOut {
     pub addr_ptr: u64,
 }
 
-/// C: drm_amdgpu_gem_mmap (union)
+/// C: `union drm_amdgpu_gem_mmap`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (8 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `8` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuGemMmap {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuGemMmap {
     pub in_: DrmAmdgpuGemMmapIn,
     pub out: DrmAmdgpuGemMmapOut,
+}
+impl Default for DrmAmdgpuGemMmap {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_gem_wait_idle_in
@@ -410,12 +506,25 @@ pub struct DrmAmdgpuGemWaitIdleOut {
     pub domain: u32,
 }
 
-/// C: drm_amdgpu_gem_wait_idle (union)
+/// C: `union drm_amdgpu_gem_wait_idle`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (16 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `16` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuGemWaitIdle {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuGemWaitIdle {
     pub in_: DrmAmdgpuGemWaitIdleIn,
     pub out: DrmAmdgpuGemWaitIdleOut,
+}
+impl Default for DrmAmdgpuGemWaitIdle {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_wait_cs_in
@@ -440,12 +549,25 @@ pub struct DrmAmdgpuWaitCsOut {
     pub status: u64,
 }
 
-/// C: drm_amdgpu_wait_cs (union)
+/// C: `union drm_amdgpu_wait_cs`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (32 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `32` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuWaitCs {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuWaitCs {
     pub in_: DrmAmdgpuWaitCsIn,
     pub out: DrmAmdgpuWaitCsOut,
+}
+impl Default for DrmAmdgpuWaitCs {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_fence
@@ -478,12 +600,25 @@ pub struct DrmAmdgpuWaitFencesOut {
     pub first_signaled: u32,
 }
 
-/// C: drm_amdgpu_wait_fences (union)
+/// C: `union drm_amdgpu_wait_fences`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (24 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `24` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuWaitFences {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuWaitFences {
     pub in_: DrmAmdgpuWaitFencesIn,
     pub out: DrmAmdgpuWaitFencesOut,
+}
+impl Default for DrmAmdgpuWaitFences {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_gem_vm_entry
@@ -593,12 +728,25 @@ pub struct DrmAmdgpuCsOut {
     pub handle: u64,
 }
 
-/// C: drm_amdgpu_cs (union)
+/// C: `union drm_amdgpu_cs`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (24 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `24` bytes for it.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuCs {
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuCs {
     pub in_: DrmAmdgpuCsIn,
     pub out: DrmAmdgpuCsOut,
+}
+impl Default for DrmAmdgpuCs {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_cs_chunk
@@ -681,12 +829,43 @@ pub struct DrmAmdgpuCsChunkCpGfxShadow {
     pub flags: u64,
 }
 
-/// C: drm_amdgpu_fence_to_handle (union)
+/// C: the `in` arm of `union drm_amdgpu_fence_to_handle`, an anonymous
+/// struct.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
-pub struct DrmAmdgpuFenceToHandle {
+pub struct DrmAmdgpuFenceToHandleIn {
+    pub fence: DrmAmdgpuFence,
+    /// AMDGPU_FENCE_TO_HANDLE_GET_*
+    pub what: u32,
+    pub pad: u32,
+}
+
+/// C: the `out` arm of `union drm_amdgpu_fence_to_handle`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmAmdgpuFenceToHandleOut {
     pub handle: u32,
-    pub _pad: u32,
+}
+
+/// C: `union drm_amdgpu_fence_to_handle`.
+///
+/// A real union: `in_` and `out` **overlap at offset zero**, and the size is
+/// the larger of the two (32 bytes), not their sum. An ioctl reads the
+/// request and writes its reply over the same storage, which is why a
+/// userspace client allocates only `32` bytes for it.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuFenceToHandle {
+    pub in_: DrmAmdgpuFenceToHandleIn,
+    pub out: DrmAmdgpuFenceToHandleOut,
+}
+impl Default for DrmAmdgpuFenceToHandle {
+    fn default() -> Self {
+        // Every member is plain data with no invalid bit pattern, so a zeroed
+        // union is a valid value of either arm.
+        // SAFETY: POD members, no niches, no padding invariants.
+        unsafe { core::mem::zeroed() }
+    }
 }
 
 /// C: drm_amdgpu_cs_chunk_syncobj_in
@@ -1079,11 +1258,30 @@ pub struct DrmAmdgpuInfoUqMetadataSdma {
     pub csa_alignment: u32,
 }
 
-/// C: drm_amdgpu_info_uq_metadata (union)
+/// C: the anonymous union inside `struct drm_amdgpu_info_uq_metadata`. Three
+/// arms, the widest of which is the gfx one at sixteen bytes.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone)]
+pub union DrmAmdgpuInfoUqMetadataArms {
+    pub gfx: DrmAmdgpuInfoUqMetadataGfx,
+    pub compute: DrmAmdgpuInfoUqMetadataCompute,
+    pub sdma: DrmAmdgpuInfoUqMetadataSdma,
+}
+impl Default for DrmAmdgpuInfoUqMetadataArms {
+    fn default() -> Self {
+        // SAFETY: POD members, no niches.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+/// C: `struct drm_amdgpu_info_uq_metadata` — a struct whose sole member is
+/// that union, so it is sixteen bytes. The previous mirror had a bare
+/// `gfx_data: [u32; 4]`, which was the right size but named none of the
+/// fields and dropped the compute and sdma arms entirely.
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
 pub struct DrmAmdgpuInfoUqMetadata {
-    pub gfx_data: [u32; 4],
+    pub arms: DrmAmdgpuInfoUqMetadataArms,
 }
 
 /// C: drm_amdgpu_proc_options
@@ -1884,3 +2082,208 @@ fn smoke_amdgpu_uapi_struct_sizes() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/amdgpu_uapi", smoke_amdgpu_uapi_struct_sizes);
+
+/// Every ioctl argument type in this header is a `union`, so its size is the
+/// **larger** of its arms and both arms start at offset zero. Sizes are
+/// `sizeof` on the C unions; a mirror that laid the arms out sequentially
+/// would be the sum instead, and would put `out` past the end of the buffer a
+/// userspace client allocated.
+fn smoke_amdgpu_uapi_ioctl_unions_overlap() -> TestResult {
+    use core::mem::{offset_of, size_of};
+    macro_rules! check {
+        ($t:ty, $size:expr, $name:literal) => {{
+            if size_of::<$t>() != $size {
+                return TestResult::Fail(concat!($name, ": size is the larger arm, not the sum"));
+            }
+            if offset_of!($t, in_) != 0 {
+                return TestResult::Fail(concat!($name, ": the in arm starts at zero"));
+            }
+        }};
+    }
+    macro_rules! check_both {
+        ($t:ty, $size:expr, $name:literal) => {{
+            check!($t, $size, $name);
+            if offset_of!($t, out) != 0 {
+                return TestResult::Fail(concat!($name, ": the out arm overlaps the in arm"));
+            }
+        }};
+    }
+    check_both!(DrmAmdgpuGemCreate, 32, "drm_amdgpu_gem_create");
+    check_both!(DrmAmdgpuBoList, 24, "drm_amdgpu_bo_list");
+    check_both!(DrmAmdgpuCtx, 16, "drm_amdgpu_ctx");
+    check_both!(DrmAmdgpuUserq, 72, "drm_amdgpu_userq");
+    check_both!(DrmAmdgpuVm, 8, "drm_amdgpu_vm");
+    check_both!(DrmAmdgpuGemMmap, 8, "drm_amdgpu_gem_mmap");
+    check_both!(DrmAmdgpuGemWaitIdle, 16, "drm_amdgpu_gem_wait_idle");
+    check_both!(DrmAmdgpuWaitCs, 32, "drm_amdgpu_wait_cs");
+    check_both!(DrmAmdgpuWaitFences, 24, "drm_amdgpu_wait_fences");
+    check_both!(DrmAmdgpuCs, 24, "drm_amdgpu_cs");
+    check_both!(DrmAmdgpuFenceToHandle, 32, "drm_amdgpu_fence_to_handle");
+    // One arm only, so there is no `out` to overlap.
+    check!(DrmAmdgpuSched, 16, "drm_amdgpu_sched");
+
+    // `union drm_amdgpu_ctx_out` is a union of three arms, not a struct of
+    // one: summing the state and pstate arms is where a 24 comes from.
+    if size_of::<DrmAmdgpuCtxOut>() != 16 {
+        return TestResult::Fail("union drm_amdgpu_ctx_out is 16 bytes, not 24");
+    }
+    if size_of::<DrmAmdgpuCtxOutAlloc>() != 8
+        || size_of::<DrmAmdgpuCtxOutState>() != 16
+        || size_of::<DrmAmdgpuCtxOutPstate>() != 8
+    {
+        return TestResult::Fail("ctx_out arm sizes");
+    }
+    if offset_of!(DrmAmdgpuCtxOut, alloc) != 0
+        || offset_of!(DrmAmdgpuCtxOut, state) != 0
+        || offset_of!(DrmAmdgpuCtxOut, pstate) != 0
+    {
+        return TestResult::Fail("the three ctx_out arms all start at zero");
+    }
+
+    // `drm_amdgpu_fence_to_handle`'s in arm is the wide one: a 24-byte
+    // `drm_amdgpu_fence` plus `what` and a pad. A mirror carrying only the
+    // 8-byte reply would size the whole ioctl at 8.
+    if size_of::<DrmAmdgpuFenceToHandleIn>() != 32 || size_of::<DrmAmdgpuFence>() != 24 {
+        return TestResult::Fail("the fence_to_handle in arm is 32 bytes");
+    }
+    if offset_of!(DrmAmdgpuFenceToHandleIn, what) != 24 {
+        return TestResult::Fail("`what` follows the 24-byte fence");
+    }
+
+    // `drm_amdgpu_info_uq_metadata` wraps a three-arm union whose widest arm
+    // is the 16-byte gfx one; compute and sdma are 8 each and overlap it.
+    if size_of::<DrmAmdgpuInfoUqMetadata>() != 16 {
+        return TestResult::Fail("drm_amdgpu_info_uq_metadata is 16 bytes");
+    }
+    if size_of::<DrmAmdgpuInfoUqMetadataGfx>() != 16
+        || size_of::<DrmAmdgpuInfoUqMetadataCompute>() != 8
+        || size_of::<DrmAmdgpuInfoUqMetadataSdma>() != 8
+    {
+        return TestResult::Fail("uq_metadata arm sizes");
+    }
+    if offset_of!(DrmAmdgpuInfoUqMetadataArms, gfx) != 0
+        || offset_of!(DrmAmdgpuInfoUqMetadataArms, compute) != 0
+        || offset_of!(DrmAmdgpuInfoUqMetadataArms, sdma) != 0
+    {
+        return TestResult::Fail("the three uq_metadata arms all start at zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_uapi",
+    smoke_amdgpu_uapi_ioctl_unions_overlap
+);
+
+// ── Debug for the ioctl argument unions ──
+
+impl core::fmt::Debug for DrmAmdgpuGemCreate {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuGemCreate(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuBoList {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuBoList(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuCtx {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuCtx(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuUserq {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuUserq(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuVm {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuVm(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuSched {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuSched(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuGemMmap {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuGemMmap(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuGemWaitIdle {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuGemWaitIdle(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuWaitCs {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuWaitCs(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuWaitFences {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuWaitFences(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuCs {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuCs(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuFenceToHandle {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuFenceToHandle(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuInfoUqMetadataArms {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuInfoUqMetadataArms(union)")
+    }
+}
+
+impl core::fmt::Debug for DrmAmdgpuCtxOut {
+    /// Which arm is live is the caller's knowledge, not the union's, so this
+    /// names the type rather than guessing at a member.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DrmAmdgpuCtxOut(union)")
+    }
+}

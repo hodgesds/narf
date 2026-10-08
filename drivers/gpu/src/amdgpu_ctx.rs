@@ -163,8 +163,10 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
         return Err(FsError::Unsupported);
     }
     // `union drm_amdgpu_ctx`: in { op u32, flags u32, ctx_id u32, priority i32 }
-    // overlaying out, which is 24 bytes (flags u64, hangs u32, reset_status u32,
-    // then the pstate arm). The union is the larger of the two.
+    // overlaying `union drm_amdgpu_ctx_out`, whose own three arms — alloc (8),
+    // state (16), pstate (8) — likewise overlap, making it 16. Both the in and
+    // out arms are therefore 16 bytes, and so is the whole union: a conforming
+    // client allocates exactly that much.
     let size = core::mem::size_of::<uapi::DrmAmdgpuCtx>();
     // SAFETY: `arg` is the ioctl pointer the trap layer validated (or
     // kernel-owned on the test path); `copy_in` bounds-checks and brackets it.
@@ -185,7 +187,7 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
     // Every op but SET_STABLE_PSTATE requires `flags` to be zero. That is the
     // forward-compatibility rule: a client setting an unknown flag must be
     // refused, not silently served without the behaviour it asked for.
-    let mut out = [0u8; 24];
+    let mut out = [0u8; core::mem::size_of::<uapi::DrmAmdgpuCtxOut>()];
     match op {
         uapi::AMDGPU_CTX_OP_ALLOC_CTX => {
             if flags != 0 {
@@ -240,7 +242,9 @@ pub fn dispatch(cmd: u32, arg: usize, state: &CtxState, is_master: bool) -> Resu
         }
         _ => return Err(FsError::InvalidData),
     }
-    // SAFETY: `arg` as above; the out arm occupies the same 24 bytes.
+    // SAFETY: `arg` as above; the out arm overlays the in arm at offset zero
+    // and is the same 16 bytes, so this writes within the buffer `copy_in`
+    // already validated.
     unsafe { copy_out(arg, &out)? };
     Ok(0)
 }
