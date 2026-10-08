@@ -61,22 +61,34 @@ pub enum ConnectorKind {
     DviD,
     Vga,
     Lvds,
-    Dsi,
+    /// `CONNECTOR_OBJECT_ID_USBC` — a DisplayPort tunnel over a USB-C port,
+    /// which is how Phoenix's DPIA outputs present.
+    Usbc,
     Unknown(u8),
 }
 
 impl ConnectorKind {
+    /// `CONNECTOR_OBJECT_ID_*` from `ObjectID.h`.
+    ///
+    /// LINUX-GAP: `Vga` was 0x01, which is `SINGLE_LINK_DVI_I` — VGA is
+    /// **0x05**. And `Dsi` was 0x15, which is `CONNECTOR_OBJECT_ID_MXM`; there
+    /// is no DSI connector object id in the enum at all. 0x17 is
+    /// `CONNECTOR_OBJECT_ID_USBC`, which is the one Phoenix actually has and
+    /// which was missing.
+    ///
+    /// DVI comes in four ids — single and dual link of each of I and D — and
+    /// only two were mapped, so a dual-link DVI-D panel read as unknown.
     fn from_object_enum(id: u8) -> Self {
         match id {
-            0x13 => ConnectorKind::Dp,
-            0x14 => ConnectorKind::Edp,
+            0x01 | 0x02 => ConnectorKind::DviI,
+            0x03 | 0x04 => ConnectorKind::DviD,
+            0x05 => ConnectorKind::Vga,
             0x0C => ConnectorKind::HdmiA,
             0x0D => ConnectorKind::HdmiB,
-            0x02 => ConnectorKind::DviI,
-            0x03 => ConnectorKind::DviD,
-            0x01 => ConnectorKind::Vga,
             0x0E => ConnectorKind::Lvds,
-            0x15 => ConnectorKind::Dsi,
+            0x13 => ConnectorKind::Dp,
+            0x14 | 0x16 => ConnectorKind::Edp,
+            0x17 => ConnectorKind::Usbc,
             other => ConnectorKind::Unknown(other),
         }
     }
@@ -102,37 +114,65 @@ impl fmt::Debug for DisplayPath {
     }
 }
 
-/// One link in the per-path object chain. Each path entry's
-/// 8-byte header is followed by a list of intermediate
-/// (encoder / transmitter / clock-source) object ids, the chain
-/// terminating with a sentinel object id of `0`.
+/// One link in the per-path object chain. Each path entry's 8-byte header is
+/// followed by a list of intermediate object ids, the chain terminating with a
+/// sentinel object id of `0`.
+///
+/// An object id packs three fields (`displayobject.h`): the **object type** in
+/// bits 15:12, an enum id in bits 11:8, and the object's own id in bits 7:0.
 #[derive(Copy, Clone, Debug)]
 pub struct ObjectLink {
-    /// Object enum-type byte (`bits[15:8]` of the object id):
-    ///   - 0x21 = encoder
-    ///   - 0x22 = transmitter
-    ///   - 0x23 = clock source
-    ///   - 0x12 = router
+    /// Object type, bits 15:12 — a `GRAPH_OBJECT_TYPE_*` value.
     pub kind: u8,
-    /// Per-instance index (`bits[7:0]` of the object id).
+    /// Enum id, bits 11:8: which instance of this object type.
+    pub enum_id: u8,
+    /// The object's own id, bits 7:0 — e.g. an `ENCODER_OBJECT_ID_*` when the
+    /// type is `GRAPH_OBJECT_TYPE_ENCODER`.
     pub instance: u8,
 }
 
-/// Object-link kind bytes per ATOM `ATOM_OBJECT_TYPE_*`.
-pub const ATOM_OBJECT_TYPE_ENCODER: u8 = 0x21;
-pub const ATOM_OBJECT_TYPE_TRANSMITTER: u8 = 0x22;
-pub const ATOM_OBJECT_TYPE_CLOCK_SRC: u8 = 0x23;
-pub const ATOM_OBJECT_TYPE_ROUTER: u8 = 0x12;
+/// `GRAPH_OBJECT_TYPE_*` from `ObjectID.h`, the values that go in bits 15:12.
+///
+/// LINUX-GAP: the constants that stood here were `ATOM_OBJECT_TYPE_ENCODER =
+/// 0x21`, `_TRANSMITTER = 0x22`, `_CLOCK_SRC = 0x23`, `_ROUTER = 0x12`,
+/// described as "bits[15:8] of the object id". No `ATOM_OBJECT_TYPE_*` exists
+/// anywhere in the AMD tree. The type field is four bits at 12, not a byte at
+/// 8, and its value space is 0..7 — so a comparison against 0x21 can never
+/// match. There are also no "transmitter" or "clock source" object types:
+/// those are object *ids* within the encoder type. 0x21 and 0x22 happen to be
+/// `ENCODER_OBJECT_ID_*` values from a different field entirely.
+pub const GRAPH_OBJECT_TYPE_NONE: u8 = 0x0;
+pub const GRAPH_OBJECT_TYPE_GPU: u8 = 0x1;
+pub const GRAPH_OBJECT_TYPE_ENCODER: u8 = 0x2;
+pub const GRAPH_OBJECT_TYPE_CONNECTOR: u8 = 0x3;
+pub const GRAPH_OBJECT_TYPE_ROUTER: u8 = 0x4;
+pub const GRAPH_OBJECT_TYPE_DISPLAY_PATH: u8 = 0x6;
+pub const GRAPH_OBJECT_TYPE_GENERIC: u8 = 0x7;
+
+/// `displayobject.h`'s `enum object_id_bit`.
+pub const OBJECT_ID_MASK: u16 = 0x00FF;
+pub const ENUM_ID_MASK: u16 = 0x0F00;
+pub const ENUM_ID_SHIFT: u32 = 8;
+pub const OBJECT_TYPE_MASK: u16 = 0xF000;
+pub const OBJECT_TYPE_SHIFT: u32 = 12;
 
 impl ObjectLink {
+    /// Split a raw object id into its three fields.
+    pub fn from_raw(objid: u16) -> Self {
+        Self {
+            kind: ((objid & OBJECT_TYPE_MASK) >> OBJECT_TYPE_SHIFT) as u8,
+            enum_id: ((objid & ENUM_ID_MASK) >> ENUM_ID_SHIFT) as u8,
+            instance: (objid & OBJECT_ID_MASK) as u8,
+        }
+    }
     pub fn is_encoder(self) -> bool {
-        self.kind == ATOM_OBJECT_TYPE_ENCODER
+        self.kind == GRAPH_OBJECT_TYPE_ENCODER
     }
-    pub fn is_transmitter(self) -> bool {
-        self.kind == ATOM_OBJECT_TYPE_TRANSMITTER
+    pub fn is_connector(self) -> bool {
+        self.kind == GRAPH_OBJECT_TYPE_CONNECTOR
     }
-    pub fn is_clock_source(self) -> bool {
-        self.kind == ATOM_OBJECT_TYPE_CLOCK_SRC
+    pub fn is_router(self) -> bool {
+        self.kind == GRAPH_OBJECT_TYPE_ROUTER
     }
 }
 
@@ -223,10 +263,7 @@ impl<'a> Iterator for ObjectLinkIter<'a> {
         if id == 0 {
             return None;
         }
-        Some(ObjectLink {
-            kind: ((id >> 8) & 0xFF) as u8,
-            instance: (id & 0xFF) as u8,
-        })
+        Some(ObjectLink::from_raw(id))
     }
 }
 
@@ -246,8 +283,14 @@ impl<'a> Iterator for DisplayObjectTable<'a> {
         let conn_obj_id = u16::from_le_bytes([self.raw[off + 4], self.raw[off + 5]]);
         let gpu_obj_id = u16::from_le_bytes([self.raw[off + 6], self.raw[off + 7]]);
         self.cursor += 8;
-        let connector_kind = ConnectorKind::from_object_enum(((conn_obj_id >> 8) & 0xFF) as u8);
-        let connector_index = (conn_obj_id & 0xFF) as u8;
+        // LINUX-GAP: these two were the other way round — the connector kind
+        // was decoded from the high byte and the index from the low. The
+        // object's own id is bits **7:0** and the enum id (which instance of
+        // that connector type) is bits 11:8, so a DisplayPort connector
+        // (0x3113) read as kind 0x31 and index 0x13.
+        let link = ObjectLink::from_raw(conn_obj_id);
+        let connector_kind = ConnectorKind::from_object_enum(link.instance);
+        let connector_index = link.enum_id;
         Some(DisplayPath {
             device_tag,
             connector_kind,

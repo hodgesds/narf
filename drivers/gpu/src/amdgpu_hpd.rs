@@ -294,6 +294,10 @@ impl HpdMachine {
                 | ConnectorKind::HdmiB
                 | ConnectorKind::DviI
                 | ConnectorKind::DviD
+                // A DisplayPort tunnel over USB-C still reports hot-plug; the
+                // DPIA delivers it through DMUB rather than a DC_HPD pin, but
+                // the connector is hot-pluggable.
+                | ConnectorKind::Usbc
         )
     }
 
@@ -487,12 +491,7 @@ mod smoke_tests {
             }
         }
         // Internal don't.
-        for k in [
-            ConnectorKind::Edp,
-            ConnectorKind::Lvds,
-            ConnectorKind::Dsi,
-            ConnectorKind::Vga,
-        ] {
+        for k in [ConnectorKind::Edp, ConnectorKind::Lvds, ConnectorKind::Vga] {
             if HpdMachine::connector_uses_hpd(k) {
                 return TestResult::Fail("internal should not use HPD");
             }

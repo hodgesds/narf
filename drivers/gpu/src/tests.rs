@@ -805,10 +805,13 @@ kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_v11_directory_round_trip);
 
 fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayObjError, DisplayObjectTable};
-    // Build a synthetic display-object table with 3 paths:
-    //   path 0: DP connector (object id 0x13), instance 0
-    //   path 1: HDMI-A (0x0C), instance 1
-    //   path 2: eDP   (0x14), instance 0
+    // Build a synthetic display-object table with 3 paths. An object id is
+    // type at 15:12, enum id at 11:8, object id at 7:0 — so a connector is
+    // 0x3 in the top nibble, the instance next, and the
+    // `CONNECTOR_OBJECT_ID_*` in the low byte:
+    //   path 0: DP     (0x13) enum 1
+    //   path 1: HDMI-A (0x0C) enum 2
+    //   path 2: eDP    (0x14) enum 1
     let mut t = alloc::vec![0u8; 8 + 3 * 8];
     // Header.
     t[0..2].copy_from_slice(&((8u16 + 3 * 8).to_le_bytes()));
@@ -818,9 +821,9 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     t[6] = 3; // num_paths
               // Paths start at 8.
     let paths = [
-        (0x0001u16, (0x13u16 << 8), 0x1100u16),        // DP
-        (0x0002u16, (0x0Cu16 << 8) | 1u16, 0x1101u16), // HDMI-A
-        (0x0004u16, (0x14u16 << 8), 0x1102u16),        // eDP
+        (0x0001u16, 0x3113u16, 0x1100u16), // DP, enum 1
+        (0x0002u16, 0x320Cu16, 0x1101u16), // HDMI-A, enum 2
+        (0x0004u16, 0x3114u16, 0x1102u16), // eDP, enum 1
     ];
     for (i, (tag, conn, gpu)) in paths.iter().enumerate() {
         let off = 8 + i * 8;
@@ -844,8 +847,8 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
         return TestResult::Fail("path 0 not DP");
     }
     let p1 = tbl.next().expect("second path");
-    if p1.connector_kind != ConnectorKind::HdmiA || p1.connector_index != 1 {
-        return TestResult::Fail("path 1 not HDMI-A.1");
+    if p1.connector_kind != ConnectorKind::HdmiA || p1.connector_index != 2 {
+        return TestResult::Fail("path 1 not HDMI-A enum 2");
     }
     let p2 = tbl.next().expect("third path");
     if p2.connector_kind != ConnectorKind::Edp {
@@ -1019,52 +1022,116 @@ kernel_test_in!(
 // module and this test are both gone rather than pointed at a second copy of
 // that work.
 
+/// An object id packs type at 15:12, enum id at 11:8 and the object's own id
+/// at 7:0 (`displayobject.h`). Values spelled out from `ObjectID.h`.
 fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     use crate::amdgpu_atom_displayobj::{
-        DisplayObjectTable, ATOM_OBJECT_TYPE_CLOCK_SRC, ATOM_OBJECT_TYPE_ENCODER,
-        ATOM_OBJECT_TYPE_TRANSMITTER,
+        ConnectorKind, DisplayObjectTable, ObjectLink, ENUM_ID_MASK, ENUM_ID_SHIFT,
+        GRAPH_OBJECT_TYPE_CONNECTOR, GRAPH_OBJECT_TYPE_ENCODER, GRAPH_OBJECT_TYPE_GPU,
+        GRAPH_OBJECT_TYPE_ROUTER, OBJECT_ID_MASK, OBJECT_TYPE_MASK, OBJECT_TYPE_SHIFT,
     };
-    // Path-with-chain layout: 8-byte header + 6 bytes of chain
-    // (3 × u16 — encoder, transmitter, sentinel). One path,
-    // size = 14 bytes total.
+    // `enum object_id_bit`: four bits of type at 12, four of enum id at 8.
+    if OBJECT_ID_MASK != 0x00FF
+        || ENUM_ID_MASK != 0x0F00
+        || ENUM_ID_SHIFT != 8
+        || OBJECT_TYPE_MASK != 0xF000
+        || OBJECT_TYPE_SHIFT != 12
+    {
+        return TestResult::Fail("object-id field positions");
+    }
+    // `GRAPH_OBJECT_TYPE_*` are 0..7, so nothing in this field can equal the
+    // 0x21/0x22/0x23 the old constants compared against.
+    if GRAPH_OBJECT_TYPE_GPU != 1
+        || GRAPH_OBJECT_TYPE_ENCODER != 2
+        || GRAPH_OBJECT_TYPE_CONNECTOR != 3
+        || GRAPH_OBJECT_TYPE_ROUTER != 4
+    {
+        return TestResult::Fail("GRAPH_OBJECT_TYPE values");
+    }
+    // Encoder type 2, enum id 1, ENCODER_OBJECT_ID_INTERNAL_UNIPHY1 (0x20).
+    let enc = ObjectLink::from_raw(0x2120);
+    if enc.kind != GRAPH_OBJECT_TYPE_ENCODER || enc.enum_id != 1 || enc.instance != 0x20 {
+        return TestResult::Fail("0x2120 is encoder, enum 1, object 0x20");
+    }
+    if !enc.is_encoder() || enc.is_connector() || enc.is_router() {
+        return TestResult::Fail("encoder predicate");
+    }
+    // Connector type 3, enum id 1, CONNECTOR_OBJECT_ID_DISPLAYPORT (0x13).
+    let conn = ObjectLink::from_raw(0x3113);
+    if !conn.is_connector() || conn.instance != 0x13 {
+        return TestResult::Fail("0x3113 is connector, object 0x13");
+    }
+
+    // Path-with-chain layout: 8-byte header + 6 bytes of chain (encoder,
+    // connector, sentinel). One path, 14 bytes.
     let mut t = alloc::vec![0u8; 8 + 14];
-    // Header.
     t[0..2].copy_from_slice(&((8u16 + 14).to_le_bytes()));
     t[2] = 1;
     t[3] = 0;
     t[4..6].copy_from_slice(&0u16.to_le_bytes());
     t[6] = 1;
-    // Path 0 header (8 bytes):
     let off = 8;
     t[off..off + 2].copy_from_slice(&0x0001u16.to_le_bytes()); // device_tag
     t[off + 2..off + 4].copy_from_slice(&14u16.to_le_bytes()); // path size
-    t[off + 4..off + 6].copy_from_slice(&(0x13u16 << 8).to_le_bytes()); // DP/0
+                                                               // Connector object id: type 3, enum 1, DISPLAYPORT 0x13.
+    t[off + 4..off + 6].copy_from_slice(&0x3113u16.to_le_bytes());
     t[off + 6..off + 8].copy_from_slice(&0x1100u16.to_le_bytes()); // GPU obj
-                                                                   // Chain: encoder/0 (0x21<<8), transmitter/2 (0x22<<8 | 2), sentinel.
-    t[off + 8..off + 10].copy_from_slice(&((ATOM_OBJECT_TYPE_ENCODER as u16) << 8).to_le_bytes());
-    t[off + 10..off + 12]
-        .copy_from_slice(&((ATOM_OBJECT_TYPE_TRANSMITTER as u16) << 8 | 2u16).to_le_bytes());
-    t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes());
+    t[off + 8..off + 10].copy_from_slice(&0x2120u16.to_le_bytes()); // encoder
+    t[off + 10..off + 12].copy_from_slice(&0x3113u16.to_le_bytes()); // connector
+    t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes()); // sentinel
 
     let mut tbl = match DisplayObjectTable::parse(&t) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("path parse"),
     };
-    let _path = tbl.next().expect("first path");
-    // Walk the chain following that path.
+    let path = tbl.next().expect("first path");
+    if path.connector_kind != ConnectorKind::Dp {
+        return TestResult::Fail("0x13 in the low byte is DisplayPort");
+    }
     let mut chain = tbl.chain_at(8, 14);
     let l1 = chain.next().expect("link 1");
-    if l1.kind != ATOM_OBJECT_TYPE_ENCODER || l1.instance != 0 {
-        return TestResult::Fail("link 1 not encoder/0");
+    if !l1.is_encoder() || l1.enum_id != 1 || l1.instance != 0x20 {
+        return TestResult::Fail("link 1 not encoder enum 1 object 0x20");
     }
     let l2 = chain.next().expect("link 2");
-    if l2.kind != ATOM_OBJECT_TYPE_TRANSMITTER || l2.instance != 2 {
-        return TestResult::Fail("link 2 not transmitter/2");
+    if !l2.is_connector() || l2.instance != 0x13 {
+        return TestResult::Fail("link 2 not connector 0x13");
     }
     if chain.next().is_some() {
         return TestResult::Fail("sentinel didn't terminate chain");
     }
-    let _ = ATOM_OBJECT_TYPE_CLOCK_SRC; // referenced for visibility check
+
+    // Connector object ids, from ObjectID.h. VGA is 0x05 — 0x01 is
+    // single-link DVI-I — and 0x17 is USBC, which Phoenix's DPIA presents as.
+    for (id, want) in [
+        (0x01u8, ConnectorKind::DviI),
+        (0x02, ConnectorKind::DviI),
+        (0x03, ConnectorKind::DviD),
+        (0x04, ConnectorKind::DviD),
+        (0x05, ConnectorKind::Vga),
+        (0x0C, ConnectorKind::HdmiA),
+        (0x0D, ConnectorKind::HdmiB),
+        (0x0E, ConnectorKind::Lvds),
+        (0x13, ConnectorKind::Dp),
+        (0x14, ConnectorKind::Edp),
+        (0x16, ConnectorKind::Edp),
+        (0x17, ConnectorKind::Usbc),
+    ] {
+        let objid = 0x3000u16 | 0x0100 | id as u16;
+        let mut t2 = t.clone();
+        t2[off + 4..off + 6].copy_from_slice(&objid.to_le_bytes());
+        let mut tbl2 = DisplayObjectTable::parse(&t2).expect("parse");
+        if tbl2.next().expect("path").connector_kind != want {
+            return TestResult::Fail("connector object id mapping");
+        }
+    }
+    // 0x15 is MXM, not DSI — there is no DSI connector object id.
+    let mut t2 = t.clone();
+    t2[off + 4..off + 6].copy_from_slice(&0x3115u16.to_le_bytes());
+    let mut tbl2 = DisplayObjectTable::parse(&t2).expect("parse");
+    if tbl2.next().expect("path").connector_kind != ConnectorKind::Unknown(0x15) {
+        return TestResult::Fail("0x15 is MXM and must not decode as a panel");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_displayobj_object_chain_walker);
@@ -1472,22 +1539,29 @@ fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_gpio_pin_lut_round_trip);
 
+/// Record types from `enum atom_object_record_type_id` and cap bits from
+/// `enum atom_encoder_caps_def`, both spelled out.
 fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
     use crate::amdgpu_atom_encoder_caps::{
-        find_encoder_caps, RecordIter, ATOM_RECORD_TYPE_ENCODER_CAP, ATOM_RECORD_TYPE_END,
-        ATOM_RECORD_TYPE_HPD_INT_ID,
+        find_encoder_caps, RecordIter, ATOM_ENCODER_CAP_RECORD_TYPE, ATOM_HPD_INT_RECORD_TYPE,
+        ATOM_I2C_RECORD_TYPE, ATOM_RECORD_END_TYPE,
     };
-    // Build a TLV tail with three records:
-    //   HPD_INT_ID (kind 1, len 4) — payload "AB"
-    //   ENCODER_CAP (kind 6, len 4) — caps = HBR2|HBR3|10bpc = 0x0B
-    //   END (kind 0xFF, len 2) — sentinel
+    // I²C is 1 and HPD-int is 2 — the pair that was swapped — and encoder caps
+    // is 20, not 6.
+    if ATOM_I2C_RECORD_TYPE != 1 || ATOM_HPD_INT_RECORD_TYPE != 2 {
+        return TestResult::Fail("I2C is record type 1 and HPD-int is 2");
+    }
+    if ATOM_ENCODER_CAP_RECORD_TYPE != 20 || ATOM_RECORD_END_TYPE != 0xFF {
+        return TestResult::Fail("encoder caps is record type 20");
+    }
+    // A TLV tail: HPD-int (4 bytes), encoder caps (6 bytes: 2-byte header plus
+    // a u32), then the sentinel. caps = MST_EN | HBR3_EN | USB_C_TYPE = 0x109,
+    // which needs the ninth bit and so cannot survive a u16 read.
     let mut tail = alloc::vec::Vec::new();
-    tail.extend_from_slice(&[ATOM_RECORD_TYPE_HPD_INT_ID, 4, b'A', b'B']);
-    tail.extend_from_slice(&[ATOM_RECORD_TYPE_ENCODER_CAP, 4, 0x0B, 0x00]);
-    tail.extend_from_slice(&[ATOM_RECORD_TYPE_END, 2]);
-    // Iterator should yield 2 records (HPD + caps), stopping at END.
-    let count = RecordIter::new(&tail).count();
-    if count != 2 {
+    tail.extend_from_slice(&[ATOM_HPD_INT_RECORD_TYPE, 4, b'A', b'B']);
+    tail.extend_from_slice(&[ATOM_ENCODER_CAP_RECORD_TYPE, 6, 0x09, 0x01, 0x00, 0x00]);
+    tail.extend_from_slice(&[ATOM_RECORD_END_TYPE, 2]);
+    if RecordIter::new(&tail).count() != 2 {
         return TestResult::Fail("expected 2 records before END");
     }
     let caps = match find_encoder_caps(&tail) {
@@ -1495,14 +1569,31 @@ fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
         Ok(None) => return TestResult::Fail("encoder caps record not found"),
         Err(_) => return TestResult::Fail("decode error"),
     };
-    if !caps.supports_hbr2() || !caps.supports_hbr3() {
-        return TestResult::Fail("HBR2/HBR3 bits");
+    if caps.raw_caps != 0x109 {
+        return TestResult::Fail("encodercaps is a u32, so bit 8 must survive");
     }
-    if !caps.supports_10bpc() {
-        return TestResult::Fail("10bpc bit");
+    // Bit 0 is MST_EN, bit 3 is HBR3 — not bit 1, which is HBR2.
+    if !caps.mst_enabled() || !caps.supports_hbr3() {
+        return TestResult::Fail("MST_EN is bit 0 and HBR3_EN bit 3");
     }
-    if caps.supports_ycbcr420() {
-        return TestResult::Fail("YCbCr420 bit unexpectedly set");
+    if caps.supports_hbr2() || caps.supports_hdmi_6gbps() || caps.supports_dp2() {
+        return TestResult::Fail("HBR2, HDMI 6Gbps and DP2 bits are clear here");
+    }
+    // Bit 8: the USB-C marker, which a sixteen-bit read would lose.
+    if !caps.is_usb_c() {
+        return TestResult::Fail("USB_C_TYPE is bit 8");
+    }
+    // A four-byte payload is the minimum; a two-byte one is truncated.
+    let short = [
+        ATOM_ENCODER_CAP_RECORD_TYPE,
+        4,
+        0x01,
+        0x00,
+        ATOM_RECORD_END_TYPE,
+        2,
+    ];
+    if find_encoder_caps(&short).is_ok() {
+        return TestResult::Fail("a two-byte caps payload must be refused");
     }
     TestResult::Pass
 }

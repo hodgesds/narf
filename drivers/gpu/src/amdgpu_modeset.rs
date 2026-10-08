@@ -106,10 +106,7 @@ impl Connector {
     /// `true` if the connector is an internal panel (no HPD pin,
     /// no detach). eDP / LVDS / DSI.
     pub fn is_internal_panel(&self) -> bool {
-        matches!(
-            self.kind,
-            ConnectorKind::Edp | ConnectorKind::Lvds | ConnectorKind::Dsi
-        )
+        matches!(self.kind, ConnectorKind::Edp | ConnectorKind::Lvds)
     }
 }
 
@@ -233,9 +230,7 @@ impl KmsState {
                 // poll); external connectors start `Disconnected`
                 // and flip to `Connected` on the first HPD IRQ.
                 status: match path.connector_kind {
-                    ConnectorKind::Edp | ConnectorKind::Lvds | ConnectorKind::Dsi => {
-                        ConnectorStatus::Connected
-                    }
+                    ConnectorKind::Edp | ConnectorKind::Lvds => ConnectorStatus::Connected,
                     _ => ConnectorStatus::Disconnected,
                 },
                 bound_crtc: None,
