@@ -615,11 +615,15 @@ virtgpu userspace ABI:
   for host execution. Up to four submissions occupy private request/response
   slots on the control queue; a full pipeline waits responsively for a slot.
   The returned fence is shared by the referenced BO reservations,
-  `FENCE_FD_OUT` sync-file, and binary output syncobjs. `VIRTGPU_WAIT`, poll,
-  input fence fds, and foreign-context input syncobjs observe that real device
-  completion; dependencies on the same ordered context/ring do not serialize
-  submission. Descriptor exhaustion returns `EMFILE` before GPU work is
-  queued. EXECBUFFER syncobj records accept binary point zero and the input
+  `FENCE_FD_OUT` sync-file, and binary output syncobjs. `VIRTGPU_WAIT` on a
+  primary or render node is an asynchronous file operation: it parks the
+  userspace task on the VirtIO-GPU controlQ completion wake (with a bounded
+  timer fallback when MSI-X is unavailable), rather than busy-polling the
+  fence. Poll, input fence fds, and foreign-context input syncobjs observe
+  that same real device completion; dependencies on the same ordered
+  context/ring do not serialize submission. Descriptor exhaustion returns
+  `EMFILE` before GPU work is queued. EXECBUFFER syncobj records accept binary
+  point zero and the input
   RESET flag; non-zero timeline points remain unsupported.
 - A queued page-flip deadline remains advertised to poll until its event is
   consumed, even after the deadline expires. This closes the readiness-scan

@@ -8900,6 +8900,12 @@ pub fn handle_numa_hint_fault(va: u64) -> bool {
 /// One page is protected per 256 ticks and the scan cursor advances across
 /// VMAs, bounding both IRQ work and hint-fault frequency.
 pub fn numa_balance_tick() {
+    // Counts-only syscall tracing snapshots on the timer cadence, so selected
+    // syscalls need only update their CPU-local counters. The hook defers its
+    // actual report to executor context; this timer return may be IRQ context.
+    #[cfg(feature = "syscall-trace")]
+    crate::syscall::syscall_trace_timer_tick();
+
     // This is the existing cross-architecture user-mode timer hook. Keep perf
     // multiplexing ahead of NUMA's optional per-task state lookup so tasks
     // without automatic NUMA balancing still rotate oversubscribed counters.
@@ -18453,6 +18459,9 @@ fn current_shm_ipc_ns_id() -> u64 {
 /// reports no residency, rather than a number nothing measured.
 pub fn proc_sysvipc_shm() -> alloc::string::String {
     use core::fmt::Write as _;
+    #[cfg(feature = "container")]
+    let ns = current_shm_ipc_ns().id();
+    #[cfg(not(feature = "container"))]
     let ns = current_shm_ipc_ns_id();
     let reader = current_task_id();
     let mut out = alloc::string::String::new();

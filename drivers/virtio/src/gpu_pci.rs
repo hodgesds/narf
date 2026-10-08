@@ -19,9 +19,10 @@
 //!     buffer so the same drawing primitives that ran on bochs
 //!     work here without changes.
 //!
-//! Polled completion only — the scanout flushes are infrequent
-//! enough that adding an MSI-X vector + waker isn't worth the
-//! complexity yet.
+//! Scanout setup remains synchronous, but fenced VirGL submissions use the
+//! controlq MSI-X vector to park their userspace waiter until a completion is
+//! available. The small 2D setup path can retain its straightforward polled
+//! round trips without making a compositor's rendering thread busy-spin.
 
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -199,6 +200,11 @@ impl SubmittedFence {
         self.signalled.store(true, Ordering::Release);
     }
 }
+
+/// Controlq completion is drained by the awakened task. The generic IRQ
+/// dispatcher advances the vector fire count before it invokes this handler,
+/// which is exactly what [`narf_interrupts::wait_for_irq_until`] observes.
+fn virtio_gpu_irq_noop() {}
 
 /// Maximum primary scanout size. A 4 MiB contiguous DMA allocation covers
 /// QEMU GTK's normal 1280×800 mode; a larger host mode is safely capped to
@@ -439,6 +445,12 @@ impl VirtioGpuPci {
                 Ok((v, t)) => (Some(v), Some(t)),
                 Err(_) => (None, None),
             };
+        if let Some(vector) = irq_vector {
+            // `wait_for_irq` observes the generic dispatch fire count. The
+            // waiter drains controlq in task context after the wake, so the
+            // IRQ body intentionally has no device-MMIO work to do.
+            narf_interrupts::install_handler(vector, virtio_gpu_irq_noop);
+        }
 
         // Resolve the host-visible blob window (shmid 0) if the host exposes
         // one and 3D is enabled. Failure is non-fatal: host3d mappable blobs
@@ -1124,14 +1136,64 @@ impl VirtioGpuPci {
         fence.is_signalled()
     }
 
-    /// Wait (responsively — sleep pumps keep running, and the request gate is
-    /// only held for brief reap polls) until `fence` signals or
-    /// `timeout_ms` expires. Returns whether it signalled.
+    /// Wait synchronously (responsively — sleep pumps keep running, and the
+    /// request gate is only held for brief reap polls) until `fence` signals
+    /// or `timeout_ms` expires. Returns whether it signalled.
+    ///
+    /// This is retained for synchronous kernel callers. Userspace fence waits
+    /// must use [`Self::wait_fence_async`] so the calling task parks instead
+    /// of consuming a CPU while the host renders.
     pub fn wait_fence(&self, fence: &SubmittedFence, timeout_ms: u64) -> bool {
         narf_scheduler::responsive_spin_until(
             || self.fence_signalled(fence),
             narf_time::Deadline::after_ms(timeout_ms),
         )
+    }
+
+    /// Asynchronously wait for a fenced VirGL submission.
+    ///
+    /// The control queue's MSI-X vector is armed before the second completion
+    /// check, closing the check-to-sleep race: a completion before the waiter
+    /// snapshot is caught by that check, and one afterwards advances the IRQ
+    /// fire count and wakes this task. A 1 ms timer poll is only the fallback
+    /// when MSI-X could not be configured, so an unavailable interrupt path
+    /// degrades latency rather than turning a desktop compositor into a busy
+    /// loop.
+    pub async fn wait_fence_async(&self, fence: &SubmittedFence, timeout_ms: u64) -> bool {
+        let deadline = narf_time::Deadline::after_ms(timeout_ms);
+        loop {
+            if self.fence_signalled(fence) {
+                return true;
+            }
+            if deadline.expired() {
+                return false;
+            }
+
+            match self.irq_vector {
+                Some(vector) => {
+                    // Create the future before the final completion probe so
+                    // the IRQ-count baseline covers the whole sleep window.
+                    let waiter = narf_interrupts::wait_for_irq_until(vector, deadline);
+                    if self.fence_signalled(fence) {
+                        return true;
+                    }
+                    // A timeout still falls through to the next loop's final
+                    // reap, covering a completion that raced the timer.
+                    let _ = waiter.await;
+                }
+                None => {
+                    // Keep the fallback bounded to a millisecond so a missed
+                    // or unsupported MSI-X binding costs latency, not a CPU.
+                    let delay_cycles = deadline
+                        .remaining_cycles()
+                        .min(narf_time::wall::ns_to_cycles(1_000_000));
+                    if delay_cycles == 0 {
+                        return self.fence_signalled(fence);
+                    }
+                    narf_time::sleep_cycles(delay_cycles).await;
+                }
+            }
+        }
     }
 
     /// Synchronise a resource's guest backing into the host VirGL context.

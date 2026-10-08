@@ -2219,6 +2219,124 @@ fn smoke_abi_async_inotify_poll_readiness() -> TestResult {
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_poll_readiness);
 
+/// Qt probes a ready inotify fd with `FIONREAD` before allocating its read
+/// buffer. The count must cover exactly the queued serialized records; an
+/// ENOTTY or zero count leaves a genuine POLLIN level unconsumed and turns the
+/// caller's ppoll/ioctl loop into a CPU spin.
+fn smoke_abi_async_inotify_fionread() -> TestResult {
+    with_memfs("/ino", "ino", &[], || {
+        const FIONREAD: u64 = 0x541b;
+        let (ifd, _wd) = watch(b"/ino\0", IN_CREATE)?;
+        if call_open(c"/ino/x".as_ptr() as u64, O_CREAT | O_WRONLY).is_none() {
+            return Err("create open failed");
+        }
+        let mut available = -1i32;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ifd, FIONREAD, (&mut available as *mut i32) as u64),
+        ) != Some(0)
+            || available <= 0
+        {
+            return Err("FIONREAD did not report queued inotify bytes");
+        }
+        let mut buf = [0u8; 128];
+        let read = call(
+            Syscall::Read.raw(),
+            a2(ifd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        );
+        if read != Some(available as i64) {
+            return Err("FIONREAD count did not match the drained inotify stream");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_fionread);
+
+/// Linux's inotify file operations expose only FIONREAD plus the optional
+/// checkpoint/restore cursor setter. The latter takes an integer directly in
+/// the ioctl argument despite its `_IOW` encoding; the next new watch must use
+/// the requested descriptor. Zero and values beyond a signed `int` are EINVAL.
+fn smoke_abi_async_inotify_setnextwd() -> TestResult {
+    with_memfs("/ino", "ino", &[], || {
+        const FIONBIO: u64 = 0x5421;
+        const F_GETFL: u64 = 3;
+        const O_NONBLOCK: i64 = 0o4000;
+        const INOTIFY_IOC_SETNEXTWD: u64 = 0x4004_4900;
+        let ifd = match call(Syscall::InotifyInit1.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("inotify_init1 failed"),
+        };
+        // FIONBIO is handled by the generic VFS ioctl layer before the
+        // inotify file operation. Exercise it on the actual inotify fd,
+        // rather than relying solely on the equivalent pipe coverage.
+        let mut nonblocking = 1i32;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ifd, FIONBIO, (&mut nonblocking as *mut i32) as u64),
+        ) != Some(0)
+        {
+            return Err("FIONBIO(1) on inotify was not 0");
+        }
+        if !matches!(
+            call(Syscall::Fcntl.raw(), a2(ifd, F_GETFL, 0)),
+            Some(flags) if flags & O_NONBLOCK != 0
+        ) {
+            return Err("FIONBIO(1) did not set O_NONBLOCK on inotify");
+        }
+        nonblocking = 0;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(ifd, FIONBIO, (&mut nonblocking as *mut i32) as u64),
+        ) != Some(0)
+        {
+            return Err("FIONBIO(0) on inotify was not 0");
+        }
+        if !matches!(
+            call(Syscall::Fcntl.raw(), a2(ifd, F_GETFL, 0)),
+            Some(flags) if flags & O_NONBLOCK == 0
+        ) {
+            return Err("FIONBIO(0) did not clear O_NONBLOCK on inotify");
+        }
+        if call(Syscall::Ioctl.raw(), a2(ifd, INOTIFY_IOC_SETNEXTWD, 77)) != Some(0) {
+            return Err("INOTIFY_IOC_SETNEXTWD failed");
+        }
+        let wd = call(
+            Syscall::InotifyAddWatch.raw(),
+            a2(ifd, c"/ino".as_ptr() as u64, IN_CREATE),
+        );
+        if wd != Some(77) {
+            return Err("SETNEXTWD did not select the requested watch descriptor");
+        }
+        if call_open(c"/ino/second".as_ptr() as u64, O_CREAT | O_WRONLY).is_none() {
+            return Err("create second watched file failed");
+        }
+        // Starting from an occupied cursor must skip the existing watch and
+        // allocate cyclically, as Linux's idr_alloc_cyclic does.
+        if call(Syscall::Ioctl.raw(), a2(ifd, INOTIFY_IOC_SETNEXTWD, 77)) != Some(0)
+            || call(
+                Syscall::InotifyAddWatch.raw(),
+                a2(ifd, c"/ino/second".as_ptr() as u64, IN_CREATE),
+            ) != Some(78)
+        {
+            return Err("SETNEXTWD did not skip an occupied watch descriptor");
+        }
+        for invalid in [0, i32::MAX as u64 + 1] {
+            if call(
+                Syscall::Ioctl.raw(),
+                a2(ifd, INOTIFY_IOC_SETNEXTWD, invalid),
+            ) != Some(EINVAL)
+            {
+                return Err("SETNEXTWD invalid cursor was not EINVAL");
+            }
+        }
+        if call(Syscall::Ioctl.raw(), a2(ifd, 0xdead_beef, 0)) != Some(-25) {
+            return Err("unknown inotify ioctl was not ENOTTY");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/async", smoke_abi_async_inotify_setnextwd);
+
 fn smoke_abi_async_inotify_epollet_hidden_refill() -> TestResult {
     with_memfs("/ino", "ino", &[], || {
         let (ifd, _wd) = watch(b"/ino\0", IN_CREATE)?;

@@ -1200,6 +1200,10 @@ fn park_should_block(
                     // re-scan picks up the readiness. This closes the lost-wake
                     // race for the TARGETED wake path.
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    #[cfg(feature = "syscall-trace")]
+                    crate::syscall::syscall_trace_account_park(
+                        crate::syscall::SyscallTraceParkEvent::IoLatch,
+                    );
                     return false;
                 }
                 // Now close the window for the UNTARGETED / broadcast wake too
@@ -1232,6 +1236,10 @@ fn park_should_block(
                     // and parks on its socket's targeted io-owner wake.
                     crate::handlers::drop_io_waiter(task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    #[cfg(feature = "syscall-trace")]
+                    crate::syscall::syscall_trace_account_park(
+                        crate::syscall::SyscallTraceParkEvent::PollRecheck,
+                    );
                     return false;
                 }
                 // signalfd lost-wake guard. A signalfd reads BLOCKED signals,
@@ -1352,6 +1360,12 @@ fn park_should_block(
             // slot. Registering an inert u64::MAX entry still takes the global
             // wheel lock on every park and cancel, serializing unrelated CPUs.
             if fire_ns == u64::MAX {
+                if uc.net_io_wait.load(Ordering::Acquire) {
+                    #[cfg(feature = "syscall-trace")]
+                    crate::syscall::syscall_trace_account_park(
+                        crate::syscall::SyscallTraceParkEvent::Block,
+                    );
+                }
                 return true;
             }
             let fire_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
@@ -1393,13 +1407,31 @@ fn park_should_block(
                         // register on the wrong waiter queue.
                         uc.flock_key.store(0, Ordering::Release);
                         uc.sigwait_set.store(0, Ordering::Release);
+                        if uc.net_io_wait.load(Ordering::Acquire) {
+                            #[cfg(feature = "syscall-trace")]
+                            crate::syscall::syscall_trace_account_park(
+                                crate::syscall::SyscallTraceParkEvent::TimerFull,
+                            );
+                        }
                         return false;
                     }
                 }
             }
+            if uc.net_io_wait.load(Ordering::Acquire) {
+                #[cfg(feature = "syscall-trace")]
+                crate::syscall::syscall_trace_account_park(
+                    crate::syscall::SyscallTraceParkEvent::Block,
+                );
+            }
             return true;
         }
         // Deadline reached / signal pending → clear and proceed (re-execute).
+        if uc.net_io_wait.load(Ordering::Acquire) {
+            #[cfg(feature = "syscall-trace")]
+            crate::syscall::syscall_trace_account_park(
+                crate::syscall::SyscallTraceParkEvent::Deadline,
+            );
+        }
         // Drop any signal-waker entry this park registered (no-op if
         // `wake_signal` already consumed it when it fired us).
         crate::handlers::drop_signal_waker(task_id);
@@ -1545,6 +1577,10 @@ pub fn own_stack_park() {
         // (clear-deadline → re-execute) contract. Non-io parks
         // (sleep/futex/console/job-stop) keep the re-check loop.
         if uc.net_io_wait.load(Ordering::Acquire) {
+            #[cfg(feature = "syscall-trace")]
+            crate::syscall::syscall_trace_account_park(
+                crate::syscall::SyscallTraceParkEvent::ResumeIo,
+            );
             uc.sleep_deadline_ns.store(0, Ordering::Release);
             uc.net_io_wait.store(false, Ordering::Release);
             uc.durable_io_wait.store(false, Ordering::Release);

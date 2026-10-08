@@ -584,6 +584,7 @@ pub fn with_chain_states<F: FnMut(&Arc<dyn ControllerState>)>(
 /// back through `root()`, whose controller reconciliation may allocate. Map
 /// lookups, `Arc` clones, parent traversal, and state downcasts do not allocate;
 /// callers must keep `f` allocation-free as well.
+#[cfg(feature = "cgroup-memory")]
 pub(super) fn with_existing_chain_states<F: FnMut(&Arc<dyn ControllerState>)>(
     pid: u64,
     name: &'static str,

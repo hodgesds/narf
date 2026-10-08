@@ -648,6 +648,34 @@ const IN_Q_OVERFLOW: u32 = 0x0000_4000;
 const OVERFLOW_WD: i32 = -1;
 
 impl InotifyState {
+    /// Allocate the next positive watch descriptor, starting from the cursor
+    /// set by `INOTIFY_IOC_SETNEXTWD` when checkpoint/restore requested one.
+    ///
+    /// Linux's `idr_alloc_cyclic` advances from its cursor and skips an
+    /// occupied descriptor.  The inotify per-instance queue is bounded, so at
+    /// most `watches.len() + 1` probes are needed to find the next free slot;
+    /// this also avoids walking the entire signed-32-bit descriptor space after
+    /// a restore chooses a high cursor.
+    fn allocate_watch_descriptor(&mut self) -> Option<i32> {
+        let mut candidate = self.next_wd.clamp(1, i32::MAX);
+        for _ in 0..=self.watches.len() {
+            if !self.watches.contains_key(&candidate) {
+                self.next_wd = if candidate == i32::MAX {
+                    1
+                } else {
+                    candidate + 1
+                };
+                return Some(candidate);
+            }
+            candidate = if candidate == i32::MAX {
+                1
+            } else {
+                candidate + 1
+            };
+        }
+        None
+    }
+
     /// Queue one event, honouring `fs.inotify.max_queued_events`.
     ///
     /// The queue used to be unbounded, so the knob capped nothing and a
@@ -1231,6 +1259,58 @@ impl FileOps for InotifyFile {
         }
     }
 
+    /// Inotify-specific ioctls. `FIONREAD` / `TIOCINQ` reports the exact
+    /// unread byte count of the serialized event stream. Qt's inotify
+    /// integration probes it after `ppoll` before choosing its read buffer;
+    /// answering ENOTTY leaves its real queued event unconsumed, so the
+    /// subsequent poll returns immediately forever. `SETNEXTWD` mirrors the
+    /// optional Linux checkpoint/restore ioctl and accepts its value directly
+    /// in `arg`, despite the `_IOW` encoding.
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn narf_filesystem::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        const FIONREAD: u32 = 0x541b;
+        // _IOW('I', 0, __s32). Linux's CONFIG_CHECKPOINT_RESTORE implementation
+        // treats the argument as the scalar desired cursor, not an `int *`.
+        const INOTIFY_IOC_SETNEXTWD: u32 = 0x4004_4900;
+        let id = self.id;
+        Box::pin(async move {
+            if cmd == INOTIFY_IOC_SETNEXTWD {
+                if arg == 0 || arg > i32::MAX as u64 {
+                    return Err(FsError::InvalidData);
+                }
+                return with_inotify(|m| {
+                    let state = m.get_mut(&id).ok_or(FsError::BadFd)?;
+                    state.next_wd = arg as i32;
+                    Ok(0)
+                });
+            }
+            if cmd != FIONREAD {
+                return Err(FsError::Unsupported);
+            }
+            // Linux exposes an `int`. The queue is already bounded by
+            // fs.inotify.max_queued_events; saturating still preserves a
+            // sensible answer should an administrator choose an extreme
+            // limit or a very long-name workload.
+            let bytes = with_inotify(|m| {
+                m.get(&id)
+                    .map(|state| {
+                        state
+                            .events
+                            .iter()
+                            .fold(0usize, |total, event| total.saturating_add(event.len()))
+                    })
+                    .unwrap_or(0)
+            })
+            .min(i32::MAX as usize) as i32;
+            context.write(arg, &bytes.to_ne_bytes())?;
+            Ok(0)
+        })
+    }
+
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         let id = self.id;
         Box::pin(async move {
@@ -1520,8 +1600,9 @@ pub fn sys_inotify_add_watch(ctx: &mut dyn TrapContext) {
             }
             return Some(Ok(*wd));
         }
-        let wd = st.next_wd;
-        st.next_wd = st.next_wd.wrapping_add(1);
+        let Some(wd) = st.allocate_watch_descriptor() else {
+            return Some(Err(ENOSPC));
+        };
         st.watches.insert(wd, Watch { path, mask });
         Some(Ok(wd))
     });

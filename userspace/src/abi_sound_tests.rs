@@ -6,6 +6,25 @@ use alloc::sync::Arc;
 use narf_filesystem::{FileOps, FsInstance};
 
 const BAD: u64 = 0x0000_8000_0000_0000;
+
+/// ALSA syscall tests require an endpoint published by a successfully probed
+/// sound card.  The aarch64 QEMU fixture may expose no usable sound device;
+/// that is an unavailable-hardware condition, not an ABI failure.
+fn sound_endpoint_available(playback: bool) -> bool {
+    narf_filesystem::devfs::DevFs::new()
+        .root()
+        .lookup_dir("snd")
+        .is_some_and(|dir| {
+            dir.enumerate(0, 256).into_iter().any(|(name, _)| {
+                if playback {
+                    name.starts_with("pcm") && name.ends_with('p')
+                } else {
+                    name.starts_with("control")
+                }
+            })
+        })
+}
+
 fn install_sound(playback: bool) -> Result<(u32, Arc<dyn FileOps>), &'static str> {
     let dir = narf_filesystem::devfs::DevFs::new()
         .root()
@@ -57,6 +76,9 @@ fn pcm_params() -> [u8; 608] {
     b
 }
 fn smoke_alsa_ioctl_errno_and_mmap_through_syscalls() -> TestResult {
+    if !sound_endpoint_available(true) {
+        return TestResult::Skip("requires a playback /dev/snd endpoint");
+    }
     with_setup(|| {
         let (fd, ops) = install_sound(true)?;
         let mut version = 0u32;
@@ -168,6 +190,9 @@ kernel_test_in!(
 );
 
 fn smoke_alsa_control_errno_through_syscalls() -> TestResult {
+    if !sound_endpoint_available(false) {
+        return TestResult::Skip("requires a control /dev/snd endpoint");
+    }
     with_setup(|| {
         let (fd, _) = install_sound(false)?;
         for (cmd, arg, errno) in [
@@ -198,6 +223,9 @@ kernel_test_in!(
 );
 
 fn smoke_alsa_xrun_epipe_does_not_raise_sigpipe() -> TestResult {
+    if !sound_endpoint_available(true) {
+        return TestResult::Skip("requires a playback /dev/snd endpoint");
+    }
     with_setup(|| {
         let (fd, _) = install_sound(true)?;
         let mut params = pcm_params();

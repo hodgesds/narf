@@ -50,7 +50,12 @@ blk/net/console/rng.
   fence, not by a device-global id watermark, because native-context rings may
   retire out of global order. Synchronous commands and fence reaping share one
   request gate and route every used entry back to its descriptor chain. The
-  DRM render-node bridge owns per-open resource lifetime and validates all
+  async fence-wait surface arms the controlQ MSI-X vector before its final
+  completion probe, then parks the caller until that vector fires; if MSI-X
+  cannot be configured it uses a bounded timer poll rather than a busy loop.
+  The caller reaps the used ring after each wake, so hard IRQ context performs
+  only generic wake delivery. The DRM render-node bridge owns per-open
+  resource lifetime and validates all
   user-provided command sizes before it calls this surface. Resource and blob
   creation accept a bounded `MemEntry` scatter/gather list, matching Linux's
   shmem scatterlist translation; callers retain every segment until detach +
