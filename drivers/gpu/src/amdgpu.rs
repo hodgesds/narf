@@ -1379,12 +1379,24 @@ impl AmdGpu {
         let dcn_base = self
             .ip_block_base(amdgpu_discovery::HW_ID_DCN, 0)
             .ok_or(AmdgpuError::UnknownAsic)?;
-        let user_level = crate::amdgpu_backlight::user_level_for_percent(percent);
-        let writes = crate::amdgpu_backlight::build_set_user_level(dcn_base, user_level);
+        let brightness = crate::amdgpu_backlight::user_level_for_percent(percent);
+        // The duty count is the brightness scaled against the period VBIOS
+        // programmed, so the period has to be read back first — it is not a
+        // value this driver chooses.
+        // SAFETY: caller-asserted BAR5 ownership; the register is inside the
+        // DCN window `ip_block_base` resolved.
+        let period_cntl = unsafe {
+            mm_read(
+                &self.regs,
+                (dcn_base + crate::amdgpu_backlight::BL_PWM_PERIOD_CNTL) << 2,
+            )
+        };
+        let writes = crate::amdgpu_backlight::build_set_user_level(0, brightness, period_cntl)
+            .map_err(|_| AmdgpuError::UnknownAsic)?;
         // SAFETY: caller-asserted BAR5 ownership.
         unsafe {
             for w in &writes {
-                mm_write(&self.regs, w.addr, w.value);
+                mm_write(&self.regs, (dcn_base + w.addr) << 2, w.value);
             }
         }
         Ok(())

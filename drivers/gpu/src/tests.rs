@@ -4897,82 +4897,141 @@ kernel_test_in!(
     smoke_amdgpu_backlight_user_level_for_percent
 );
 
-fn smoke_amdgpu_backlight_init_sequence_locks_around_writes() -> TestResult {
-    use crate::amdgpu_backlight::{
-        build_backlight_init, BL_PWM_CNTL_EN, BL_PWM_CNTL_GRP1_FRAC_BL_EN, BL_PWM_CNTL_REL,
-        BL_PWM_GRP1_LOCK, BL_PWM_GRP1_REG_LOCK_REL, BL_PWM_PERIOD_200HZ_RENOIR,
-        BL_PWM_PERIOD_CNTL_REL, BL_PWM_USER_LEVEL_REL,
-    };
-    let dcn_base: u32 = 0x0008_0000;
-    let writes = match build_backlight_init(dcn_base, BL_PWM_PERIOD_200HZ_RENOIR, 0x7FFF) {
-        Ok(w) => w,
-        Err(_) => return TestResult::Fail("build_backlight_init failed on valid input"),
-    };
-    if writes.len() != 5 {
-        return TestResult::Fail("init must emit exactly 5 writes");
-    }
-    // First write: lock asserted.
-    if writes[0].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[0].value != BL_PWM_GRP1_LOCK
+/// Register ids and field positions are literals from
+/// `dcn_3_1_4_offset.h`/`_sh_mask.h`.
+fn smoke_amdgpu_backlight_registers_and_fields() -> TestResult {
+    use crate::amdgpu_backlight::*;
+    // regPWRSEQ0_BL_PWM_CNTL 0x2f19, then CNTL2, PERIOD_CNTL, GRP1_REG_LOCK —
+    // four consecutive dwords, with no USER_LEVEL among them.
+    if BL_PWM_CNTL != 0x2f19
+        || BL_PWM_CNTL2 != 0x2f1a
+        || BL_PWM_PERIOD_CNTL != 0x2f1b
+        || BL_PWM_GRP1_REG_LOCK != 0x2f1c
     {
-        return TestResult::Fail("first write must assert GRP1 lock");
+        return TestResult::Fail("the PWRSEQ0 BL_PWM block is 0x2f19..0x2f1c");
     }
-    // Last write: lock cleared.
-    if writes[4].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[4].value != 0 {
-        return TestResult::Fail("last write must clear GRP1 lock");
+    // regPWRSEQ1_BL_PWM_CNTL is 0x2f85.
+    if for_pwrseq(BL_PWM_CNTL, 1) != 0x2f85 || PWRSEQ_STRIDE != 0x6c {
+        return TestResult::Fail("the per-sequencer stride is 0x6c");
     }
-    // Body writes (in order): period, cntl, user_level.
-    if writes[1].addr != dcn_base + BL_PWM_PERIOD_CNTL_REL
-        || writes[1].value != BL_PWM_PERIOD_200HZ_RENOIR
+    // The ABM user-level register is a different block at a different base
+    // index, not a member of this run.
+    if ABM0_BL1_PWM_USER_LEVEL != 0x0e7b {
+        return TestResult::Fail("regABM0_BL1_PWM_USER_LEVEL is 0x0e7b at BASE_IDX 3");
+    }
+    // BL_PWM_EN is bit 31 and the duty count occupies 15:0, so an enable at
+    // bit 0 would be a duty of one.
+    if BL_PWM_EN != 1 << 31 || BL_PWM_FRACTIONAL_EN != 1 << 30 {
+        return TestResult::Fail("BL_PWM_EN is bit 31, FRACTIONAL_EN bit 30");
+    }
+    if BL_ACTIVE_INT_FRAC_CNT_MASK != 0x0000_FFFF {
+        return TestResult::Fail("the duty count is bits 15:0");
+    }
+    if BL_PWM_EN & BL_ACTIVE_INT_FRAC_CNT_MASK != 0 {
+        // Trivially true, but states the property the old table violated.
+        return TestResult::Fail("the enable must not overlap the duty count");
+    }
+    // The lock is bit 0; bit 31 is the master-lock bypass.
+    if BL_PWM_GRP1_REG_LOCK_BIT != 1
+        || BL_PWM_GRP1_REG_UPDATE_PENDING != 1 << 8
+        || BL_PWM_GRP1_UPDATE_AT_FRAME_START != 1 << 16
+        || BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN != 1 << 31
     {
-        return TestResult::Fail("period write missing or wrong");
+        return TestResult::Fail("GRP1_REG_LOCK fields are 0, 8, 16, 31");
     }
-    if writes[2].addr != dcn_base + BL_PWM_CNTL_REL
-        || writes[2].value != (BL_PWM_CNTL_EN | BL_PWM_CNTL_GRP1_FRAC_BL_EN)
-    {
-        return TestResult::Fail("CNTL write missing or wrong");
-    }
-    if writes[3].addr != dcn_base + BL_PWM_USER_LEVEL_REL || writes[3].value != 0x7FFF {
-        return TestResult::Fail("USER_LEVEL write missing or wrong");
+    // The period is sixteen bits with a four-bit BITCNT above it.
+    if BL_PWM_PERIOD_MASK != 0x0000_FFFF || BL_PWM_PERIOD_BITCNT_MASK != 0x000F_0000 {
+        return TestResult::Fail("period is 15:0 and BITCNT 19:16");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
-    smoke_amdgpu_backlight_init_sequence_locks_around_writes
+    smoke_amdgpu_backlight_registers_and_fields
 );
 
-fn smoke_amdgpu_backlight_set_user_level_is_lock_write_unlock() -> TestResult {
-    use crate::amdgpu_backlight::{
-        build_set_user_level, BL_PWM_GRP1_LOCK, BL_PWM_GRP1_REG_LOCK_REL, BL_PWM_USER_LEVEL_REL,
+/// `dce_panel_cntl_set_backlight_level`'s own worked example: with a masked
+/// period of 0x24 and a bit count of 6, a brightness of 0xEFF0 gives an
+/// active product of 0x21BDC0 and a duty of 0x86F7.
+fn smoke_amdgpu_backlight_duty_scales_against_period() -> TestResult {
+    use crate::amdgpu_backlight::active_duty_count;
+    // BITCNT 6 in bits 19:16, period 0x24. The header's own arithmetic:
+    // 0xEFF0 * 0x24 = 0x21BDC0, >> 6 = 0x86F7 after the 16-bit mask and the
+    // rounding bit.
+    let period_cntl = (6u32 << 16) | 0x24;
+    if active_duty_count(0xEFF0, period_cntl) != 0x86F7 {
+        return TestResult::Fail("the duty must be the brightness scaled by the period");
+    }
+    // A BITCNT of zero means sixteen, not a zero shift: 0xFFFF * 0xFFFF is
+    // 0xFFFE0001, which shifted right sixteen is 0xFFFE. A zero shift would
+    // mask to 0x0001 instead.
+    if active_duty_count(0xFFFF, 0xFFFF) != 0xFFFE {
+        return TestResult::Fail("a BITCNT of zero means a shift of sixteen");
+    }
+    // Writing the brightness through unscaled, as the old builder did, would
+    // give 0x8000 here instead.
+    let half = active_duty_count(0x8000, (6u32 << 16) | 0x24);
+    if half >= 0x8000 {
+        return TestResult::Fail("a short period must scale the duty down");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/backlight",
+    smoke_amdgpu_backlight_duty_scales_against_period
+);
+
+fn smoke_amdgpu_backlight_set_user_level_locks_then_unlocks() -> TestResult {
+    use crate::amdgpu_backlight::*;
+    let period_cntl = (6u32 << 16) | 0x24;
+    let writes = match build_set_user_level(1, 0xEFF0, period_cntl) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("sequencer 1 rejected"),
     };
-    let dcn_base: u32 = 0x0008_0000;
-    let writes = build_set_user_level(dcn_base, 0xABCD);
     if writes.len() != 3 {
         return TestResult::Fail("hot-path set must be exactly 3 writes");
     }
-    if writes[0].value != BL_PWM_GRP1_LOCK {
-        return TestResult::Fail("first write must lock");
+    // Lock taken with the master-lock bypass, both bits set.
+    if writes[0].addr != 0x2f88 || writes[0].value != (1 << 31 | 1) {
+        return TestResult::Fail("the lock takes bit 0 together with the bypass at 31");
     }
-    if writes[1].addr != dcn_base + BL_PWM_USER_LEVEL_REL || writes[1].value != 0xABCD {
-        return TestResult::Fail("USER_LEVEL write missing or wrong");
+    // The duty and the enable are the same register.
+    if writes[1].addr != 0x2f85 || writes[1].value != (1 << 31) | 0x86F7 {
+        return TestResult::Fail("the duty goes into BL_PWM_CNTL beside the enable");
     }
-    if writes[2].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[2].value != 0 {
-        return TestResult::Fail("last write must unlock");
+    // Release clears the lock but keeps the bypass.
+    if writes[2].addr != 0x2f88 || writes[2].value != 1 << 31 {
+        return TestResult::Fail("release clears bit 0 only");
+    }
+    if build_set_user_level(PWRSEQ_INSTANCES, 0, 0).is_ok() {
+        return TestResult::Fail("out-of-range sequencer accepted");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
-    smoke_amdgpu_backlight_set_user_level_is_lock_write_unlock
+    smoke_amdgpu_backlight_set_user_level_locks_then_unlocks
 );
 
 fn smoke_amdgpu_backlight_init_rejects_period_overflow() -> TestResult {
-    use crate::amdgpu_backlight::{build_backlight_init, BacklightError};
-    // 25-bit period overflows the 24-bit field.
-    match build_backlight_init(0x0008_0000, 1u32 << 25, 0x7FFF) {
-        Err(BacklightError::PeriodOverflow) => TestResult::Pass,
-        _ => TestResult::Fail("period overflow must be rejected"),
+    use crate::amdgpu_backlight::{build_backlight_init, BacklightError, BL_PWM_PERIOD_MAX};
+    // The field is sixteen bits, so the 200 Hz-at-100 MHz period of 500_000
+    // that this module used to ship as a default does not fit.
+    if BL_PWM_PERIOD_MAX != 0xFFFF {
+        return TestResult::Fail("the period field is sixteen bits");
     }
+    match build_backlight_init(0, 500_000, 0x7FFF) {
+        Err(BacklightError::PeriodOverflow) => {}
+        _ => return TestResult::Fail("500_000 does not fit a sixteen-bit period"),
+    }
+    match build_backlight_init(0, 1u32 << 16, 0x7FFF) {
+        Err(BacklightError::PeriodOverflow) => {}
+        _ => return TestResult::Fail("a seventeen-bit period must be rejected"),
+    }
+    if build_backlight_init(0, 0xFFFF, 0x7FFF).is_err() {
+        return TestResult::Fail("a full sixteen-bit period is valid");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",

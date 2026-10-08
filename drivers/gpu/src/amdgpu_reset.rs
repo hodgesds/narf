@@ -143,22 +143,56 @@ pub fn evaluate_hang(state: &EngineTdrState, now_ms: u64) -> ResetAction {
 
 // ── Soft reset (per-engine) ────────────────────────────────────────
 
-/// Per-engine GRBM_SOFT_RESET bit positions. Per gc_11_0_0_sh_mask.h
-/// (Phoenix). Earlier silicon has these at different bit positions —
-/// the runtime registry could carry per-family overrides; for now
-/// Phoenix is the bring-up target.
+/// `regGRBM_SOFT_RESET` is dword 0x0da8 at BASE_IDX **0**, so the byte offset
+/// within the GC window is `0x0da8 << 2`.
 pub const GRBM_SOFT_RESET_OFFSET: u32 = 0x0DA8 << 2;
-pub const SOFT_RESET_BIT_GFX: u32 = 1 << 14;
-pub const SOFT_RESET_BIT_CP: u32 = 1 << 0;
-pub const SOFT_RESET_BIT_SDMA: u32 = 1 << 1;
-pub const SOFT_RESET_BIT_VCN: u32 = 1 << 17;
 
-pub fn soft_reset_bit(engine: ResetEngine) -> u32 {
+/// Per-engine `GRBM_SOFT_RESET` bit positions, from `gc_11_0_0_sh_mask.h`.
+/// The bits are not densely packed and not ordered by engine: CP is at 0, RLC
+/// at 2, then a gap to UTCL2 at 15, GFX at 16, the three CP sub-blocks at
+/// 17..19, CAC at 20, EA at 22 and the two SDMAs at 23 and 24.
+pub const SOFT_RESET_BIT_CP: u32 = 1 << 0;
+pub const SOFT_RESET_BIT_RLC: u32 = 1 << 2;
+pub const SOFT_RESET_BIT_UTCL2: u32 = 1 << 15;
+/// `SOFT_RESET_GFX` is bit **16**. Bit 14 — what this used to carry — is not
+/// a defined field in this register at all.
+pub const SOFT_RESET_BIT_GFX: u32 = 1 << 16;
+pub const SOFT_RESET_BIT_CPF: u32 = 1 << 17;
+pub const SOFT_RESET_BIT_CPC: u32 = 1 << 18;
+pub const SOFT_RESET_BIT_CPG: u32 = 1 << 19;
+pub const SOFT_RESET_BIT_CAC: u32 = 1 << 20;
+pub const SOFT_RESET_BIT_EA: u32 = 1 << 22;
+/// The two SDMA engines have **separate** bits, 23 and 24 — not one shared
+/// bit, and not bit 1, which is undefined here.
+pub const SOFT_RESET_BIT_SDMA0: u32 = 1 << 23;
+pub const SOFT_RESET_BIT_SDMA1: u32 = 1 << 24;
+
+// LINUX-GAP: there is no VCN bit in `GRBM_SOFT_RESET`. GRBM covers the
+// graphics and SDMA blocks only; VCN resets through its own
+// `UVD_SOFT_RESET`/`UVD_POWER_STATUS` path in `vcn_v4_0.c`, or through the
+// SMU's `PowerDownVcn`/`PowerUpVcn` pair on an APU. What stood here was
+// `1 << 17`, which is `SOFT_RESET_CPF` — a VCN reset request would have reset
+// the command processor's fetcher instead.
+
+/// The `GRBM_SOFT_RESET` bits for `engine`, or `None` for an engine this
+/// register does not cover.
+pub fn soft_reset_bit(engine: ResetEngine) -> Option<u32> {
     match engine {
-        ResetEngine::Gfx => SOFT_RESET_BIT_GFX | SOFT_RESET_BIT_CP,
-        ResetEngine::Compute => SOFT_RESET_BIT_CP,
-        ResetEngine::Sdma0 | ResetEngine::Sdma1 => SOFT_RESET_BIT_SDMA,
-        ResetEngine::Vcn => SOFT_RESET_BIT_VCN,
+        // `gfx_v11_0_soft_reset` pulses the graphics block together with the
+        // CP sub-blocks that feed it.
+        ResetEngine::Gfx => Some(
+            SOFT_RESET_BIT_GFX
+                | SOFT_RESET_BIT_CP
+                | SOFT_RESET_BIT_CPF
+                | SOFT_RESET_BIT_CPG
+                | SOFT_RESET_BIT_CPC,
+        ),
+        // Compute runs on the MEC, which is the CPC sub-block.
+        ResetEngine::Compute => Some(SOFT_RESET_BIT_CP | SOFT_RESET_BIT_CPC),
+        ResetEngine::Sdma0 => Some(SOFT_RESET_BIT_SDMA0),
+        ResetEngine::Sdma1 => Some(SOFT_RESET_BIT_SDMA1),
+        // Not a GRBM block — see the gap note above.
+        ResetEngine::Vcn => None,
     }
 }
 
@@ -168,19 +202,26 @@ pub trait ResetMmio {
     fn write(&mut self, byte_off: u32, value: u32);
 }
 
-/// Apply a per-engine soft reset by pulsing the GRBM_SOFT_RESET
-/// bit. Sequence per Linux `gfx_v11_0.c::gfx_v11_0_soft_reset`:
-///   1. Read GRBM_SOFT_RESET, OR in the engine's bit, write back.
+/// Apply a per-engine soft reset by pulsing the `GRBM_SOFT_RESET` bits.
+/// Sequence per Linux `gfx_v11_0.c::gfx_v11_0_soft_reset`:
+///
+///   1. Read GRBM_SOFT_RESET, OR in the engine's bits, write back.
 ///   2. Wait ~50 µs for the engine to halt.
-///   3. Clear the bit (write back without it) — engine restarts.
-pub fn apply_soft_reset<M: ResetMmio>(mmio: &mut M, engine: ResetEngine) {
-    let bit = soft_reset_bit(engine);
+///   3. Clear the bits (write back without them) — engine restarts.
+///
+/// Returns `false` for an engine `GRBM_SOFT_RESET` does not cover, without
+/// touching the register.
+pub fn apply_soft_reset<M: ResetMmio>(mmio: &mut M, engine: ResetEngine) -> bool {
+    let Some(bit) = soft_reset_bit(engine) else {
+        return false;
+    };
     let cur = mmio.read(GRBM_SOFT_RESET_OFFSET);
     mmio.write(GRBM_SOFT_RESET_OFFSET, cur | bit);
     // Caller's responsibility to wait for the halt. In production
     // this is a udelay(50). We don't have a delay primitive in the
     // pure-logic layer; production glue wraps the call.
     mmio.write(GRBM_SOFT_RESET_OFFSET, cur & !bit);
+    true
 }
 
 // ── BACO (full reset) ──────────────────────────────────────────────
@@ -348,20 +389,70 @@ mod smoke_tests {
         }
     }
 
+    /// Bit positions spelled out from `gc_11_0_0_sh_mask.h`, not built from
+    /// the module's constants.
+    fn smoke_grbm_soft_reset_bit_positions() -> TestResult {
+        if GRBM_SOFT_RESET_OFFSET != 0x0DA8 << 2 {
+            return TestResult::Fail("regGRBM_SOFT_RESET is dword 0x0da8 at BASE_IDX 0");
+        }
+        if SOFT_RESET_BIT_CP != 1 || SOFT_RESET_BIT_RLC != 1 << 2 {
+            return TestResult::Fail("CP is bit 0 and RLC bit 2");
+        }
+        // GFX is 16, not 14, and the three CP sub-blocks follow it.
+        if SOFT_RESET_BIT_GFX != 1 << 16 {
+            return TestResult::Fail("SOFT_RESET_GFX is bit 16");
+        }
+        if SOFT_RESET_BIT_CPF != 1 << 17
+            || SOFT_RESET_BIT_CPC != 1 << 18
+            || SOFT_RESET_BIT_CPG != 1 << 19
+        {
+            return TestResult::Fail("CPF/CPC/CPG are bits 17, 18, 19");
+        }
+        if SOFT_RESET_BIT_UTCL2 != 1 << 15
+            || SOFT_RESET_BIT_CAC != 1 << 20
+            || SOFT_RESET_BIT_EA != 1 << 22
+        {
+            return TestResult::Fail("UTCL2 15, CAC 20, EA 22");
+        }
+        // Two SDMA engines, two bits, 23 and 24 — bit 1 is undefined here.
+        if SOFT_RESET_BIT_SDMA0 != 1 << 23 || SOFT_RESET_BIT_SDMA1 != 1 << 24 {
+            return TestResult::Fail("the SDMA engines have separate bits at 23 and 24");
+        }
+        if soft_reset_bit(ResetEngine::Sdma0) == soft_reset_bit(ResetEngine::Sdma1) {
+            return TestResult::Fail("the two SDMAs must not share a reset bit");
+        }
+        // VCN is not in this register at all.
+        if soft_reset_bit(ResetEngine::Vcn).is_some() {
+            return TestResult::Fail("GRBM_SOFT_RESET has no VCN bit");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_grbm_soft_reset_bit_positions);
+
     fn smoke_apply_soft_reset_pulses_bit() -> TestResult {
         let mut m = MockResetMmio { writes: Vec::new() };
-        apply_soft_reset(&mut m, ResetEngine::Gfx);
+        if !apply_soft_reset(&mut m, ResetEngine::Gfx) {
+            return TestResult::Fail("GFX reset refused");
+        }
         // 2 writes: set-bit, clear-bit.
         if m.writes.len() != 2 {
             return TestResult::Fail("expected 2 writes");
         }
-        let bit = soft_reset_bit(ResetEngine::Gfx);
-        // First write OR'd the bit; second cleared it.
-        if m.writes[0].1 & bit == 0 {
-            return TestResult::Fail("set didn't include bit");
+        let bit = soft_reset_bit(ResetEngine::Gfx).expect("gfx has a bit");
+        // First write OR'd the bits; second cleared them.
+        if m.writes[0].1 & bit != bit {
+            return TestResult::Fail("set didn't include every bit");
         }
         if m.writes[1].1 & bit != 0 {
-            return TestResult::Fail("clear left bit set");
+            return TestResult::Fail("clear left bits set");
+        }
+        // A VCN request touches nothing rather than resetting the CP fetcher.
+        let mut m = MockResetMmio { writes: Vec::new() };
+        if apply_soft_reset(&mut m, ResetEngine::Vcn) {
+            return TestResult::Fail("VCN soft reset must be refused");
+        }
+        if !m.writes.is_empty() {
+            return TestResult::Fail("a refused reset must not write GRBM_SOFT_RESET");
         }
         TestResult::Pass
     }
