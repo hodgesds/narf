@@ -170,8 +170,15 @@ progress toward line rate.
   Gated per iface: a non-opted iface, an IPv6 frame, or a TSO super-frame too
   large for the pool buffer falls back to the byte-for-byte pre-P-F `Vec` copy
   path. Because virtio is the QEMU image's primary NIC, the path is live
-  end-to-end (the production-init boot comes up over it). _Remaining:_ zero-copy
-  TX for IPv6, mlx5 100G, net-bench.
+  end-to-end (the production-init boot comes up over it). IPv6 TCP egress takes
+  the same zero-copy path (`build_frame6_into`). net-bench (`net/bench`) logs
+  the per-packet software cost of the checksum / GSO / GRO primitives via
+  `cargo xtask test --kernel-tests-only --subsystem=net/bench`. _Deferred:_
+  mlx5 100G bring-up — the mlx5 RX/TX datapath is a from-scratch `Stage 15+`
+  stub, and with no ConnectX hardware and no QEMU emulation it could only be
+  written blind (KAT + no-regression, never exercised), so it waits for
+  hardware. The shared pool / zero-copy TX contract / RSS core / NAPI helper
+  are all in place for it to build on when that happens.
 
 ## 5. Validation
 
