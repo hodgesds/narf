@@ -1223,6 +1223,32 @@ impl Hardware {
         result
     }
 
+    /// Zero-copy counterpart to [`Self::transmit_with_meta`] (P-F): submit a
+    /// frame already resident in an owned `DmaBuffer` at `buffer[offset..][..len]`
+    /// with no copy. On ring-full / pre-DMA error the buffer is returned in the
+    /// `Err` so the caller can retry without losing it.
+    pub fn transmit_frame(
+        &self,
+        buffer: DmaBuffer,
+        offset: usize,
+        len: usize,
+        meta: narf_net::TxMeta,
+        index: usize,
+    ) -> Result<(), (I40eError, DmaBuffer)> {
+        if self.irq().failed() {
+            return Err((I40eError::DeviceFailed, buffer));
+        }
+        let result = {
+            let mut queue = self.queues[index].lock();
+            // SAFETY: this PF owns the configured queue and its DMA buffers.
+            unsafe { queue.submit_frame(&self.csr, buffer, offset, len, meta) }
+        };
+        if matches!(result, Err((I40eError::InvalidTxHead, _))) {
+            self.irq().fail();
+        }
+        result
+    }
+
     /// Submit one plain frame on queue 0 without waiting for completion.
     pub fn transmit(&self, frame: &[u8]) -> Result<(), I40eError> {
         self.transmit_with_meta(

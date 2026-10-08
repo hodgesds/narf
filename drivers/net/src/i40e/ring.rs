@@ -619,6 +619,79 @@ impl QueuePair {
         Ok(())
     }
 
+    /// Zero-copy counterpart to [`Self::submit`] (P-F): publish a frame that
+    /// already lives in an owned `DmaBuffer` at `buffer[offset..offset+len]` —
+    /// no `alloc_coherent` + copy. The buffer is retained in `tx_bufs` until
+    /// the device completes EOP, exactly like `submit` retains its private
+    /// copy. On a ring-full (or pre-DMA error) the buffer is handed back in the
+    /// `Err` so the caller can retry without losing it; on success ownership
+    /// transfers to the ring.
+    ///
+    /// # Safety
+    /// `csr` must be this PF's mapped BAR0 with this queue enabled.
+    pub unsafe fn submit_frame(
+        &mut self,
+        csr: &MmioRegion,
+        mut buffer: DmaBuffer,
+        offset: usize,
+        len: usize,
+        meta: TxMeta,
+    ) -> Result<(), (I40eError, DmaBuffer)> {
+        if offset + len > buffer.len() {
+            return Err((I40eError::FrameTooLong, buffer));
+        }
+        let plan =
+            match super::offload::TxPlan::parse(&buffer.as_slice()[offset..offset + len], meta) {
+                Ok(p) => p,
+                Err(e) => return Err((e, buffer)),
+            };
+        if let Err(e) = self.reclaim() {
+            return Err((e, buffer));
+        }
+        let count = len.div_ceil(4096) + usize::from(plan.context.is_some());
+        let free = (self.tx_clean + RING_LEN - self.tx_next - 1) % RING_LEN;
+        if count > free as usize {
+            return Err((I40eError::TxRingFull, buffer));
+        }
+        // Offload seeds (pseudo-header checksum) are written in place into the
+        // frame's own buffer — the device reads them straight back.
+        plan.prepare(&mut buffer.as_mut_slice()[offset..offset + len]);
+        let base = buffer.dma_addr().raw() + offset as u64;
+        let mut slot = self.tx_next;
+        if let Some((word0, word1)) = plan.context {
+            self.write_tx(slot, word0, word1);
+            slot = (slot + 1) % RING_LEN;
+        }
+        let mut chunk = 0;
+        while chunk < len {
+            let clen = (len - chunk).min(4096);
+            let last = chunk + clen == len;
+            let command = plan.command
+                | TX_DESC_CMD_ICRC
+                | if last {
+                    TX_DESC_CMD_EOP | TX_DESC_CMD_RS
+                } else {
+                    0
+                };
+            let qw1 = (command << TXD_QW1_CMD_SHIFT)
+                | (plan.offset << TXD_QW1_OFFSET_SHIFT)
+                | ((clen as u64) << TXD_QW1_TX_BUF_SZ_SHIFT);
+            self.write_tx(slot, base + chunk as u64, qw1);
+            if last {
+                self.tx_bufs[slot as usize] = Some(buffer);
+                break;
+            }
+            slot = (slot + 1) % RING_LEN;
+            chunk += clen;
+        }
+        self.tx_next = (slot + 1) % RING_LEN;
+        dma_barrier();
+        // SAFETY: caller owns the enabled queue; the buffer is retained in
+        // tx_bufs before the device is allowed to fetch.
+        unsafe { csr.write32(reg_qtx_tail(self.pf_q), self.tx_next as u32) };
+        Ok(())
+    }
+
     fn write_tx(&self, slot: u16, word0: u64, word1: u64) {
         let off = slot as u64 * DESC_BYTES;
         // SAFETY: slot is reduced modulo RING_LEN at every transition.
@@ -930,6 +1003,53 @@ pub(super) mod runtime_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/net/i40e", smoke_i40e_tx_credit_and_bad_head);
+
+    fn smoke_i40e_submit_frame_zero_copy() -> TestResult {
+        let (_memory, csr) = fake_csr();
+        let mut queue = QueuePair::alloc(0).unwrap();
+        let packet = super::super::tests::tcp_packet(false, 100);
+        let len = packet.len();
+        // The frame's own DMA buffer — what the stack would have built into.
+        let mut buf = alloc_coherent(len, DomainId::DRIVER_0).unwrap();
+        buf.as_mut_slice()[..len].copy_from_slice(&packet);
+        let buf_phys = buf.dma_addr().raw();
+        // SAFETY: test-owned simulated queue.
+        if unsafe { queue.submit_frame(&csr, buf, 0, len, TxMeta::plain()) }.is_err() {
+            return TestResult::Fail("submit_frame rejected a frame on an empty ring");
+        }
+        // Zero copy: the descriptor DMAs the frame's OWN buffer, not a fresh one.
+        if descriptor(&queue, 0).0 != buf_phys {
+            return TestResult::Fail("submit_frame did not DMA the frame's own buffer");
+        }
+        // The EOP slot retains the buffer (ownership transferred to the ring).
+        if queue.tx_bufs[0].is_none() {
+            return TestResult::Fail("submit_frame did not retain the frame buffer at EOP");
+        }
+
+        // Give-back-on-full: fill the ring, then a further submit_frame hands the
+        // buffer back in the Err rather than consuming or dropping it.
+        let small = super::super::tests::tcp_packet(false, 10);
+        while queue.tx_next != RING_LEN - 1 {
+            // SAFETY: test-owned simulated queue.
+            unsafe { queue.submit(&csr, &small, TxMeta::plain()).unwrap() };
+        }
+        let mut again = alloc_coherent(len, DomainId::DRIVER_0).unwrap();
+        again.as_mut_slice()[..len].copy_from_slice(&packet);
+        let again_phys = again.dma_addr().raw();
+        // SAFETY: test-owned simulated queue, ring now full.
+        match unsafe { queue.submit_frame(&csr, again, 0, len, TxMeta::plain()) } {
+            Err((I40eError::TxRingFull, returned)) => {
+                if returned.dma_addr().raw() != again_phys {
+                    return TestResult::Fail("ring-full did not hand back the same buffer");
+                }
+            }
+            _ => {
+                return TestResult::Fail("submit_frame on a full ring should give the buffer back")
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/i40e", smoke_i40e_submit_frame_zero_copy);
 
     fn smoke_i40e_rx_fragment_discard_and_metadata() -> TestResult {
         let (_memory, csr) = fake_csr();
