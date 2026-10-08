@@ -813,6 +813,35 @@ impl SockError {
     }
 }
 
+/// A queued extended socket error for `MSG_ERRQUEUE` / `IP_RECVERR` — the
+/// `sock_extended_err` a datagram socket reports after an ICMP error (QUIC
+/// PMTU discovery reads these to learn the path MTU). Delivered by the
+/// `net`-layer ICMP hook; drained by `recvmsg(MSG_ERRQUEUE)`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExtSockError {
+    /// `ee_errno` (e.g. EMSGSIZE for fragmentation-needed).
+    pub errno: u32,
+    /// `ee_origin` — SO_EE_ORIGIN_ICMP (2).
+    pub origin: u8,
+    /// `ee_type` / `ee_code` — the ICMP type/code.
+    pub icmp_type: u8,
+    pub icmp_code: u8,
+    /// `ee_info` — the discovered next-hop MTU for a frag-needed error.
+    pub info: u32,
+    /// The router/host that sent the ICMP error (cmsg offender address).
+    pub offender_ip: [u8; 4],
+}
+
+/// A source-address override supplied by an `IP_PKTINFO` / `IPV6_PKTINFO`
+/// send control message (`sendmsg`). QUIC uses it to pin a reply's source
+/// address to the one the peer saw. `addr` holds an IPv4 `ipi_spec_dst` in its
+/// first 4 bytes, or a full IPv6 `ipi6_addr`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SendPktInfo {
+    pub v6: bool,
+    pub addr: [u8; 16],
+}
+
 // ── SocketFile (FileOps impl, lives in fd table) ────────────────
 
 pub struct SocketFile {
@@ -842,6 +871,17 @@ pub struct SocketFile {
     /// Pending async error. connect/send/recv set on failure;
     /// getsockopt(SO_ERROR) consumes (returns + clears) it.
     pending_error: IrqSafeSpinLock<Option<SockError>>,
+    /// `sk_error_queue`: ICMP errors queued for `recvmsg(MSG_ERRQUEUE)` when
+    /// IP_RECVERR is set. Filled by the net-layer ICMP hook; drained by the
+    /// errqueue recv path. QUIC reads these for PMTU discovery.
+    inet_err_queue: IrqSafeSpinLock<VecDeque<ExtSockError>>,
+    /// Per-recv handoff of the dequeued [`ExtSockError`] from the errqueue recv
+    /// to the `recvmsg` cmsg builder (keyed by task, like the RX ancillary
+    /// stash).
+    inet_err_ancillary: IrqSafeSpinLock<BTreeMap<u64, ExtSockError>>,
+    /// Per-send handoff of an `IP_PKTINFO`/`IPV6_PKTINFO` source override from
+    /// the `sendmsg` cmsg parser to the datagram send path (keyed by task).
+    send_pktinfo: IrqSafeSpinLock<BTreeMap<u64, SendPktInfo>>,
     /// `sk_shutdown`: `RCV_SHUTDOWN` / `SEND_SHUTDOWN` bits set by
     /// shutdown(2). Read by the AF_INET datagram path.
     sk_shutdown: AtomicU8,
@@ -1862,6 +1902,9 @@ impl SocketFile {
             options: IrqSafeSpinLock::new(SockOptions::default()),
             nonblock: AtomicBool::new(false),
             pending_error: IrqSafeSpinLock::new(None),
+            inet_err_queue: IrqSafeSpinLock::new(VecDeque::new()),
+            inet_err_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
+            send_pktinfo: IrqSafeSpinLock::new(BTreeMap::new()),
             sk_shutdown: AtomicU8::new(0),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
             icmp_echo: IrqSafeSpinLock::new(IcmpEchoState::default()),
@@ -1918,6 +1961,12 @@ impl SocketFile {
             // INDEX_ADDED / NEW_SETTINGS through the filesystem broker.
             narf_filesystem::bluetooth::install_mgmt_event_sink(Self::broadcast_bluetooth_mgmt);
             BLUETOOTH_SOCKETS.lock().push(Arc::downgrade(&socket));
+        }
+        if domain == AF_INET || domain == AF_INET6 {
+            // Route net-layer ICMP errors for UDP datagrams into this socket
+            // layer's error queues (IP_RECVERR / MSG_ERRQUEUE). Idempotent —
+            // `install_udp_icmp_hook` just replaces the single sink slot.
+            narf_net::udp_sock::install_udp_icmp_hook(Self::deliver_udp_icmp_error);
         }
         socket
     }
@@ -2880,6 +2929,66 @@ impl SocketFile {
     /// can report it. Used by connect/send failure paths.
     pub fn set_pending_error(&self, e: SockError) {
         *self.pending_error.lock() = Some(e);
+    }
+
+    /// Queue an extended error for `MSG_ERRQUEUE` (IP_RECVERR) and wake pollers
+    /// (`POLLERR`). Bounded so a flood of ICMP errors can't grow it without
+    /// limit.
+    pub(crate) fn push_inet_err(&self, e: ExtSockError) {
+        const MAX_ERRQ: usize = 64;
+        let mut q = self.inet_err_queue.lock();
+        if q.len() < MAX_ERRQ {
+            q.push_back(e);
+        }
+    }
+
+    /// Dequeue the oldest extended error (the errqueue recv path).
+    pub(crate) fn pop_inet_err(&self) -> Option<ExtSockError> {
+        self.inet_err_queue.lock().pop_front()
+    }
+
+    /// Whether an extended error is queued (`poll` reports `POLLERR`).
+    pub(crate) fn has_inet_err(&self) -> bool {
+        !self.inet_err_queue.lock().is_empty()
+    }
+
+    /// Stash the dequeued extended error for this task's in-flight `recvmsg` so
+    /// its cmsg builder can emit the `IP_RECVERR` control message.
+    pub(crate) fn stash_inet_err_ancillary(&self, e: ExtSockError) {
+        self.inet_err_ancillary
+            .lock()
+            .insert(crate::handlers::current_task_id(), e);
+    }
+
+    /// Take this task's stashed extended error (the `recvmsg` cmsg builder).
+    pub(crate) fn take_inet_err_ancillary(&self) -> Option<ExtSockError> {
+        self.inet_err_ancillary
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    /// Stash a per-send `IP_PKTINFO`/`IPV6_PKTINFO` source override for this
+    /// task's in-flight `sendmsg`, consumed by the datagram send path.
+    pub(crate) fn stash_send_pktinfo(&self, pi: SendPktInfo) {
+        self.send_pktinfo
+            .lock()
+            .insert(crate::handlers::current_task_id(), pi);
+    }
+
+    /// Take this task's stashed send source override (the datagram send path).
+    pub(crate) fn take_send_pktinfo(&self) -> Option<SendPktInfo> {
+        self.send_pktinfo
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    /// The net-layer ICMP-error sink (registered via `install_udp_icmp_hook`).
+    /// Finds the AF_INET datagram socket that sent the offending datagram and,
+    /// when IP_RECVERR is set, queues the error for `MSG_ERRQUEUE`; it is also
+    /// recorded as the socket's pending error so a connected socket observes it
+    /// via SO_ERROR / its next operation.
+    pub(crate) fn deliver_udp_icmp_error(e: &narf_net::udp_sock::UdpIcmpError) {
+        crate::socket::inet_dgram::deliver_icmp_error(e);
     }
 
     /// Encode the socket's locally-bound address (if any). Honors

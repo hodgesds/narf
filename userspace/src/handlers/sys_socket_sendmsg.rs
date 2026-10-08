@@ -137,6 +137,16 @@ pub(super) fn sendmsg_on_socket(
         Ok(ancillary) => ancillary,
         Err(errno) => return SendMsgResult::Error(errno),
     };
+    // An IP_PKTINFO/IPV6_PKTINFO source override applies to the AF_INET/INET6
+    // datagram send that follows; stash it for the send path to consume.
+    if let Some(pi) = ancillary.src_override {
+        if matches!(
+            sock.domain,
+            crate::socket::AF_INET | crate::socket::AF_INET6
+        ) {
+            sock.stash_send_pktinfo(pi);
+        }
+    }
 
     let mut total = alloc::vec::Vec::new();
     if total.try_reserve_exact(total_len).is_err() {

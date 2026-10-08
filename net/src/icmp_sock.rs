@@ -716,8 +716,35 @@ pub fn deliver_error_in(
 
     match orig_protocol {
         IP_PROTO_UDP => {
-            // Deliver to the UDP socket that sent the triggering datagram.
+            // Deliver to the in-kernel UDP socket that sent the triggering
+            // datagram.
             deliver_icmp_error_in(net_ns_id, orig_src_ip, orig_src_port, err);
+            // Also hand it to the userspace datagram-socket layer (the
+            // registry Firefox/QUIC use) for IP_RECVERR / MSG_ERRQUEUE. The
+            // next-hop MTU of a fragmentation-needed error is the low 16 bits
+            // of the ICMP "unused" word (`icmp_body[6..8]`).
+            let orig_dst_port = u16::from_be_bytes([orig_l4[2], orig_l4[3]]);
+            let info = if icmp_type == ICMP_DEST_UNREACHABLE && icmp_code == 4 {
+                u32::from(u16::from_be_bytes([icmp_body[6], icmp_body[7]]))
+            } else {
+                0
+            };
+            // Only errors `udp_err` would report (skip source-quench/redirect,
+            // which map to None).
+            if let Some((errno, _hard)) = crate::udp_sock::icmp_err_convert(icmp_type, icmp_code) {
+                crate::udp_sock::notify_udp_icmp_error(&crate::udp_sock::UdpIcmpError {
+                    net_ns_id,
+                    local_ip: orig_src_ip,
+                    local_port: orig_src_port,
+                    peer_ip: orig_dst_ip,
+                    peer_port: orig_dst_port,
+                    icmp_type,
+                    icmp_code,
+                    errno: errno as u32,
+                    info,
+                    offender_ip: from_ip,
+                });
+            }
         }
         IP_PROTO_TCP => {
             // Signal the TCP connection.

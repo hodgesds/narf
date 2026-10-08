@@ -12036,6 +12036,8 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
 struct ScmSendAncillary {
     fds: alloc::vec::Vec<crate::socket::ScmRightsFile>,
     cred: Option<crate::socket::Ucred>,
+    /// Source-address override from an `IP_PKTINFO` / `IPV6_PKTINFO` cmsg.
+    src_override: Option<crate::socket::SendPktInfo>,
 }
 
 /// Parse Linux `SOL_SOCKET` send control messages. `SCM_RIGHTS` descriptors
@@ -12053,6 +12055,7 @@ fn parse_scm_send_ancillary(
     let mut out = ScmSendAncillary {
         fds: alloc::vec::Vec::new(),
         cred: None,
+        src_override: None,
     };
     if ctrl_len == 0 {
         return Ok(out);
@@ -12124,6 +12127,27 @@ fn parse_scm_send_ancillary(
                     out.cred = Some(validate_scm_ucred(supplied)?);
                 }
                 _ => return Err(EINVAL),
+            }
+        } else if level == 0 && ctype == 8 {
+            // SOL_IP / IP_PKTINFO: struct in_pktinfo { int ipi_ifindex;
+            // in_addr ipi_spec_dst; in_addr ipi_addr; } = 12 bytes. The source
+            // override is `ipi_spec_dst`; a zero spec_dst means "no override".
+            if cmsg_len >= 16 + 12 {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&ctrl[off + 20..off + 24]);
+                if addr[..4] != [0, 0, 0, 0] {
+                    out.src_override = Some(crate::socket::SendPktInfo { v6: false, addr });
+                }
+            }
+        } else if level == 41 && ctype == 50 {
+            // SOL_IPV6 / IPV6_PKTINFO: struct in6_pktinfo { in6_addr ipi6_addr;
+            // int ipi6_ifindex; } = 20 bytes. Source override is `ipi6_addr`.
+            if cmsg_len >= 16 + 20 {
+                let mut addr = [0u8; 16];
+                addr.copy_from_slice(&ctrl[off + 16..off + 32]);
+                if addr != [0u8; 16] {
+                    out.src_override = Some(crate::socket::SendPktInfo { v6: true, addr });
+                }
             }
         }
         // Advance to the next cmsg (CMSG_ALIGN to 8 bytes).
@@ -12291,6 +12315,30 @@ fn install_ipv4_ancillary(
         }
     }
     put_cmsgs(msg_ptr, &records)
+}
+
+/// Install the `IP_RECVERR` control message for a `recvmsg(MSG_ERRQUEUE)` on an
+/// AF_INET datagram socket: a `struct sock_extended_err` (16 bytes) immediately
+/// followed by the offender `sockaddr_in` (16 bytes), which `SO_EE_OFFENDER`
+/// points at. QUIC reads `ee_info` (the discovered next-hop MTU) for PMTU
+/// discovery. Returns whether the record was truncated by the control buffer.
+fn install_ipv4_errqueue(msg_ptr: u64, ext: crate::socket::ExtSockError) -> bool {
+    const SOL_IP: i32 = 0;
+    const IP_RECVERR: i32 = 11;
+    let mut data = alloc::vec::Vec::with_capacity(32);
+    data.extend_from_slice(&ext.errno.to_ne_bytes()); // ee_errno
+    data.push(ext.origin); // ee_origin (SO_EE_ORIGIN_ICMP)
+    data.push(ext.icmp_type); // ee_type
+    data.push(ext.icmp_code); // ee_code
+    data.push(0); // ee_pad
+    data.extend_from_slice(&ext.info.to_ne_bytes()); // ee_info (next-hop MTU)
+    data.extend_from_slice(&0u32.to_ne_bytes()); // ee_data
+    // Offender sockaddr_in (family, port 0, addr, sin_zero).
+    data.extend_from_slice(&2u16.to_ne_bytes());
+    data.extend_from_slice(&0u16.to_be_bytes());
+    data.extend_from_slice(&ext.offender_ip);
+    data.extend_from_slice(&[0u8; 8]);
+    put_cmsgs(msg_ptr, &[(SOL_IP, IP_RECVERR, data)])
 }
 
 /// Install the control records produced by `packet_recvmsg`: generic receive
