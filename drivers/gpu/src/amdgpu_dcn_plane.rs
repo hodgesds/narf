@@ -56,9 +56,71 @@ const MPC_LAST_REG: u32 = (MPC_OUT_MUX + 3 * MPC_OUT_STRIDE) as u32;
 const INSTANCES: u8 = 4;
 
 /// `DSCL_MODE_SCALING_444_BYPASS`: an unscaled RGB plane takes no scaler taps.
+/// `DSCL_MODE_SCALING_444_BYPASS` from `enum dscl_mode_sel`
+/// (`dcn10_dpp_dscl.c:79-87`).
 const SCALER_BYPASS: u32 = 0;
+/// `DSCL0_SCL_MODE__DSCL_MODE_MASK` — **three** bits, not two. The enum runs to
+/// `DSCL_MODE_DSCL_BYPASS` = 6, so bit 2 is live.
+///
+/// LINUX-GAP: this was masked 0x3. On a handoff from firmware that left the
+/// scaler in mode 4, 5 or 6, clearing only the low two bits would have left
+/// mode 4 (`SCALING_420_LUMA_BYPASS`) behind instead of reaching bypass.
+const DSCL_MODE: u32 = 0x0000_0007;
 /// `MPCC_TOP_SEL`/`MPCC_BOT_SEL` park with all ones.
 const MPCC_UNSET: u32 = 0xf;
+
+// `MPCC0_MPCC_CONTROL` fields, from `dcn_3_1_4_sh_mask.h`:
+//
+//   MPCC_MODE                     0x00000003
+//   MPCC_ALPHA_BLND_MODE          0x00000030
+//   MPCC_ALPHA_MULTIPLIED_MODE    0x00000040
+//   MPCC_BLND_ACTIVE_OVERLAP_ONLY 0x00000080
+//   MPCC_BG_BPC                   0x00000700
+//   MPCC_GLOBAL_ALPHA             0x00FF0000
+//
+// LINUX-GAP: the mask was `0xf | 0x3 << 4 | 0x3 << 8` — two bits wider than
+// `MPCC_MODE` (reaching reserved bits 3:2) and one bit narrower than
+// `MPCC_BG_BPC`. The fields below are the ones `mpc1_update_blending` and
+// `mpc1_mux_plane` write, with the values `dcn20_hwseq.c:2960-2990` composes
+// for an opaque plane.
+const MPCC_MODE: u32 = 0x0000_0003;
+const MPCC_ALPHA_BLND_MODE: u32 = 0x0000_0030;
+const MPCC_ALPHA_MULTIPLIED_MODE: u32 = 0x0000_0040;
+const MPCC_BLND_ACTIVE_OVERLAP_ONLY: u32 = 0x0000_0080;
+const MPCC_BG_BPC: u32 = 0x0000_0700;
+const MPCC_GLOBAL_ALPHA: u32 = 0x00FF_0000;
+
+/// `MPCC_BLEND_MODE_TOP_LAYER_ONLY` from `enum mpcc_blend_mode`
+/// (`inc/hw/mpc.h:70-75`): BYPASS 0, TOP_LAYER_PASSTHROUGH 1, TOP_LAYER_ONLY 2,
+/// TOP_BOT_BLENDING 3.
+///
+/// LINUX-GAP: this register was written 0, `MPCC_BLEND_MODE_BYPASS`, under a
+/// comment describing opaque passthrough. `mpc1_mux_plane` writes
+/// `TOP_LAYER_ONLY` for exactly this case — no bottom layer — and Linux's MPC
+/// never writes BYPASS anywhere. A bypassed MPCC does not put the DPP's pixels
+/// on the OPP at all.
+const MPCC_BLEND_MODE_TOP_LAYER_ONLY: u32 = 2;
+/// `MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA` (`inc/hw/mpc.h`), which
+/// `dcn20_hwseq.c` selects for a plane with no per-pixel alpha, paired with
+/// `global_alpha = 0xff`.
+const MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA: u32 = 2;
+/// `blnd_cfg.global_alpha = 0xff` — fully opaque.
+const MPCC_GLOBAL_ALPHA_OPAQUE: u32 = 0xff;
+/// `blnd_cfg.background_color_bpc = 4` (`dcn20_hwseq.c:2985`).
+const MPCC_BG_BPC_DEFAULT: u32 = 4;
+
+// `FMT0_FMT_CONTROL`:
+//
+//   FMT_PIXEL_ENCODING            0x00030000
+//   FMT_SUBSAMPLING_MODE          0x000C0000
+//   FMT_CBCR_BIT_REDUCTION_BYPASS 0x00200000
+//
+// LINUX-GAP: the mask was `0x7 << 16`, which straddles the first two fields —
+// all of `FMT_PIXEL_ENCODING` and only the LOW bit of `FMT_SUBSAMPLING_MODE`.
+// `opp1_program_fmt`'s RGB arm clears all three, so an inherited
+// `FMT_SUBSAMPLING_MODE` of 2 (what a 4:2:2 or 4:2:0 stream leaves) would have
+// survived into an RGB stream.
+const FMT_RGB_FIELDS: u32 = 0x0003_0000 | 0x000C_0000 | 0x0020_0000;
 /// `TEST_PATTERN_MODE_HORIZONTALBARS` with both bar colours black, which is how
 /// DCN2 onwards paints a blanked stream.
 const DPG_MODE_SOLID: u32 = 4;
@@ -163,7 +225,7 @@ impl<I: Io> Block<I> {
         self.update(reg, 0x7f, cnvc_format(format))?;
         // Bypass the scaler outright rather than programming unity taps.
         let reg = self.dpp(SCL_MODE);
-        self.update(reg, 0x3, SCALER_BYPASS)?;
+        self.update(reg, DSCL_MODE, SCALER_BYPASS)?;
         let reg = self.dpp(RECOUT_START);
         self.set(reg, 0)?;
         let reg = self.dpp(RECOUT_SIZE);
@@ -185,9 +247,23 @@ impl<I: Io> Block<I> {
         self.update(reg, 0xf, MPCC_UNSET)?;
         let reg = self.mpcc(MPCC_OPP_ID);
         self.update(reg, 0xf, opp as u32)?;
-        // Opaque, no alpha blending, 8-bit background.
+        // Top layer only, with the opaque blend configuration
+        // `dcn20_hwseq.c:2960-2990` composes: global alpha at 0xff, no
+        // pre-multiplication, not overlap-only, background bpc 4.
         let reg = self.mpcc(MPCC_CONTROL);
-        self.update(reg, 0xf | 0x3 << 4 | 0x3 << 8, 0)?;
+        self.update(
+            reg,
+            MPCC_MODE
+                | MPCC_ALPHA_BLND_MODE
+                | MPCC_ALPHA_MULTIPLIED_MODE
+                | MPCC_BLND_ACTIVE_OVERLAP_ONLY
+                | MPCC_BG_BPC
+                | MPCC_GLOBAL_ALPHA,
+            MPCC_BLEND_MODE_TOP_LAYER_ONLY
+                | MPCC_ALPHA_BLEND_MODE_GLOBAL_ALPHA << MPCC_ALPHA_BLND_MODE.trailing_zeros()
+                | MPCC_BG_BPC_DEFAULT << MPCC_BG_BPC.trailing_zeros()
+                | MPCC_GLOBAL_ALPHA_OPAQUE << MPCC_GLOBAL_ALPHA.trailing_zeros(),
+        )?;
         let instance = self.instance as u32;
         let reg = MPC_OUT_MUX + opp as u64 * MPC_OUT_STRIDE;
         self.update(reg, 0xf, instance)
@@ -213,7 +289,7 @@ impl<I: Io> Block<I> {
         let reg = self.opp(OPP_PIPE_CONTROL);
         self.update(reg, 1, 1)?;
         let reg = self.opp(FMT_CONTROL);
-        self.update(reg, 0x7 << 16, encoding.code() << 16)?;
+        self.update(reg, FMT_RGB_FIELDS, encoding.code() << 16)?;
         // No truncation, no spatial dither, no frame randomisation.
         let reg = self.opp(FMT_BIT_DEPTH_CONTROL);
         self.set(reg, 0)?;

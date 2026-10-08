@@ -36,6 +36,9 @@ fn plane_dpp_bypasses_the_scaler_for_an_unscaled_plane() -> TestResult {
     let mut dpp = block(1, DPP_LAST_REG);
     let at = |reg: u64| reg + DPP_STRIDE;
     let (width, height) = (1920u32, 1080u32);
+    // Inherited scaler mode 6, `DSCL_MODE_DSCL_BYPASS` — the highest value
+    // `enum dscl_mode_sel` defines. A two-bit mask would leave 4 behind.
+    dpp.io.values[at(SCL_MODE) as usize] = 6;
     if dpp.update(at(DPP_CONTROL), 1 << 4, 1 << 4).is_err()
         || dpp
             .update(
@@ -44,7 +47,7 @@ fn plane_dpp_bypasses_the_scaler_for_an_unscaled_plane() -> TestResult {
                 cnvc_format(Format::Rgb32),
             )
             .is_err()
-        || dpp.update(at(SCL_MODE), 0x3, SCALER_BYPASS).is_err()
+        || dpp.update(at(SCL_MODE), DSCL_MODE, SCALER_BYPASS).is_err()
         || dpp.set(at(RECOUT_START), 0).is_err()
         || dpp.set(at(RECOUT_SIZE), width | height << 16).is_err()
         || dpp.set(at(MPC_SIZE), width | height << 16).is_err()
@@ -59,8 +62,9 @@ fn plane_dpp_bypasses_the_scaler_for_an_unscaled_plane() -> TestResult {
     if dpp.io.values[at(CNVC_SURFACE_PIXEL_FORMAT) as usize] & 0x7f != 8 {
         return TestResult::Fail("converter pixel format");
     }
-    // Bypass, not unity taps.
-    if dpp.io.values[at(SCL_MODE) as usize] & 3 != SCALER_BYPASS {
+    // Bypass, not unity taps. `DSCL0_SCL_MODE__DSCL_MODE_MASK` is 0x00000007 —
+    // three bits, because the enum runs to 6.
+    if dpp.io.values[at(SCL_MODE) as usize] & 0x0000_0007 != SCALER_BYPASS {
         return TestResult::Fail("scaler not bypassed");
     }
     // The recout and combiner size both match the active area for a 1:1 plane.
@@ -82,6 +86,9 @@ kernel_test_in!(
 
 fn plane_mpc_binds_one_pipe_with_nothing_beneath_it() -> TestResult {
     let mut mpc = block(2, MPC_LAST_REG);
+    // Seed MPCC_CONTROL's reserved bits 3:2 and an inherited FMT-style
+    // subsampling value so an over-wide mask shows up as a cleared bit.
+    mpc.io.values[(MPCC_CONTROL + 2 * MPCC_STRIDE) as usize] = 0x0000_000C;
     let at = |reg: u64| reg + 2 * MPCC_STRIDE;
     // Leave a stale bottom select behind to prove it gets cleared.
     mpc.io.values[at(MPCC_BOT_SEL) as usize] = 1;
@@ -100,9 +107,33 @@ fn plane_mpc_binds_one_pipe_with_nothing_beneath_it() -> TestResult {
     if mpc.io.values[at(MPCC_OPP_ID) as usize] & 0xf != 1 {
         return TestResult::Fail("OPP binding");
     }
-    // Opaque passthrough: no blend mode, no alpha, no background depth.
-    if mpc.io.values[at(MPCC_CONTROL) as usize] & (0xf | 0x3 << 4 | 0x3 << 8) != 0 {
-        return TestResult::Fail("blend mode");
+    // `mpc1_mux_plane` with no bottom layer writes `MPCC_MODE` =
+    // `MPCC_BLEND_MODE_TOP_LAYER_ONLY` = 2. BYPASS (0) is a different mode and
+    // Linux's MPC never writes it: a bypassed MPCC puts nothing on the OPP.
+    let control = mpc.io.values[at(MPCC_CONTROL) as usize];
+    if control & 0x0000_0003 != 2 {
+        return TestResult::Fail("MPCC_MODE must be TOP_LAYER_ONLY, not BYPASS");
+    }
+    // The opaque blend configuration from `dcn20_hwseq.c:2960-2990`:
+    // MPCC_ALPHA_BLND_MODE 0x30 = 2 (global alpha), MPCC_GLOBAL_ALPHA
+    // 0x00FF0000 = 0xff, MPCC_BG_BPC 0x700 = 4, with
+    // MPCC_ALPHA_MULTIPLIED_MODE 0x40 and MPCC_BLND_ACTIVE_OVERLAP_ONLY 0x80
+    // both clear.
+    if (control & 0x0000_0030) >> 4 != 2 {
+        return TestResult::Fail("alpha blend mode");
+    }
+    if (control & 0x00FF_0000) >> 16 != 0xff {
+        return TestResult::Fail("global alpha must be fully opaque");
+    }
+    if (control & 0x0000_0700) >> 8 != 4 {
+        return TestResult::Fail("background colour bpc");
+    }
+    if control & (0x0000_0040 | 0x0000_0080) != 0 {
+        return TestResult::Fail("pre-multiplied or overlap-only alpha");
+    }
+    // Reserved bits 3:2 are not ours: the old mask was 0xf, two bits too wide.
+    if control & 0x0000_000C != 0x0000_000C {
+        return TestResult::Fail("MPCC_CONTROL's reserved bits 3:2 were cleared");
     }
     // The OPP's own output mux must point at this combiner.
     if mpc.io.values[mux as usize] & 0xf != 2 {
@@ -132,14 +163,21 @@ fn plane_opp_formatter_passes_depth_through() -> TestResult {
     let mut opp = block(0, OPP_LAST_REG);
     // Leave truncation and dithering enabled to prove they get cleared.
     opp.io.values[FMT_BIT_DEPTH_CONTROL as usize] = 1 | 1 << 8 | 1 << 13;
+    // And an inherited 4:2:2 formatter state: FMT_SUBSAMPLING_MODE 0x000C0000
+    // = 2 plus FMT_CBCR_BIT_REDUCTION_BYPASS 0x00200000. Both must go.
+    opp.io.values[FMT_CONTROL as usize] = 0x0008_0000 | 0x0020_0000;
     if opp.opp_program(Encoding::Rgb, 1920, 1080).is_err() {
         return TestResult::Fail("OPP programming rejected");
     }
     if opp.io.values[OPP_PIPE_CONTROL as usize] & 1 == 0 {
         return TestResult::Fail("OPP clock left gated");
     }
-    if opp.io.values[FMT_CONTROL as usize] >> 16 & 0x7 != 0 {
-        return TestResult::Fail("pixel encoding");
+    // `opp1_program_fmt`'s RGB arm clears FMT_PIXEL_ENCODING 0x00030000,
+    // FMT_SUBSAMPLING_MODE 0x000C0000 and FMT_CBCR_BIT_REDUCTION_BYPASS
+    // 0x00200000 — all three, not the one-and-a-half a `0x7 << 16` mask reaches.
+    let fmt = opp.io.values[FMT_CONTROL as usize];
+    if fmt & (0x0003_0000 | 0x000C_0000 | 0x0020_0000) != 0 {
+        return TestResult::Fail("pixel encoding, subsampling or CbCr bypass retained");
     }
     // Truncation and dithering must be off so the plane's depth survives.
     if opp.io.values[FMT_BIT_DEPTH_CONTROL as usize] != 0 {
