@@ -3910,29 +3910,96 @@ kernel_test_in!(
     smoke_amdgpu_ih4_validation_rejects_bad_inputs
 );
 
+/// Every number here is quoted from `soc15_ih_clientid.h`,
+/// `ivsrcid/dcn/irqsrcs_dcn_1_0.h` or `irq_service_dcn314.c` — not from the
+/// constant it checks. A cookie decode composed from its own constants
+/// round-trips whatever it holds, which is why this one does not.
 fn smoke_amdgpu_ih_cookie_header_round_trip() -> TestResult {
-    use crate::amdgpu_ih::{IhCookieHeader, CLIENT_ID_DCN, SOURCE_ID_DCN_VBLANK};
-    // Synthesize a "DCN VBlank on controller 1" cookie header.
+    use crate::amdgpu_ih::{
+        dcn_vblank_source_id, decode_hpd_ctxid, HpdEvent, IhCookieHeader, CLIENT_ID_ATHUB,
+        CLIENT_ID_DCN, CLIENT_ID_GFX, CLIENT_ID_IH, CLIENT_ID_MP0, CLIENT_ID_MP1, CLIENT_ID_RLC,
+        CLIENT_ID_SDMA0, CLIENT_ID_SDMA1, CLIENT_ID_UTCL2, CLIENT_ID_VCN, CLIENT_ID_VMC,
+        SOURCE_ID_DCN_HPD,
+    };
+    // `enum soc15_ih_clientid` is a flat table, so a wrong value is always some
+    // other real client: 0x05 is ISP, 0x06 is PCIE0, 0x09 is SDMA1.
+    for (got, want, name) in [
+        (CLIENT_ID_IH, 0x00, "IH"),
+        (CLIENT_ID_ATHUB, 0x02, "ATHUB"),
+        (CLIENT_ID_DCN, 0x04, "DCE"),
+        (CLIENT_ID_RLC, 0x07, "RLC"),
+        (CLIENT_ID_SDMA0, 0x08, "SDMA0"),
+        (CLIENT_ID_SDMA1, 0x09, "SDMA1"),
+        (CLIENT_ID_VCN, 0x10, "VCN/UVD"),
+        (CLIENT_ID_VMC, 0x12, "VMC"),
+        (CLIENT_ID_GFX, 0x14, "GRBM_CP"),
+        (CLIENT_ID_UTCL2, 0x1B, "UTCL2"),
+        (CLIENT_ID_MP0, 0x1E, "MP0"),
+        (CLIENT_ID_MP1, 0x1F, "MP1"),
+    ] {
+        if got != want {
+            let _ = name;
+            return TestResult::Fail("a SOC15 IH client id does not match the header");
+        }
+    }
+    // No two of them may collide — VMC was 0x09, the same as SDMA1.
+    let ids = [
+        CLIENT_ID_IH,
+        CLIENT_ID_ATHUB,
+        CLIENT_ID_DCN,
+        CLIENT_ID_RLC,
+        CLIENT_ID_SDMA0,
+        CLIENT_ID_SDMA1,
+        CLIENT_ID_VCN,
+        CLIENT_ID_VMC,
+        CLIENT_ID_GFX,
+        CLIENT_ID_UTCL2,
+        CLIENT_ID_MP0,
+        CLIENT_ID_MP1,
+    ];
+    for (i, a) in ids.iter().enumerate() {
+        if ids[i + 1..].contains(a) {
+            return TestResult::Fail("two distinct IH clients share an id");
+        }
+    }
+    // `DC_D1..D6_OTG_VSTARTUP` = 0x3C..0x41, which is what
+    // `to_dal_irq_source_dcn314` maps to DC_IRQ_SOURCE_VBLANK1..6. The pipe is
+    // in the source id, not in src_data.
+    for (pipe, want) in [(0u8, 0x3Cu8), (1, 0x3D), (2, 0x3E), (3, 0x3F)] {
+        if dcn_vblank_source_id(pipe) != want {
+            return TestResult::Fail("DCN vblank source ids are 0x3c..0x41, one per pipe");
+        }
+    }
+    // `DCN_1_0__SRCID__DC_HPD1_INT` = 9 for every connector and both kinds.
+    if SOURCE_ID_DCN_HPD != 0x09 {
+        return TestResult::Fail("every HPD event shares source id 9");
+    }
+    // CTXID 0..5 are DC_HPD1..6_INT, 6..11 are DC_HPD1..6_RX_INT.
+    if decode_hpd_ctxid(0) != Some(HpdEvent::Plug(0))
+        || decode_hpd_ctxid(5) != Some(HpdEvent::Plug(5))
+        || decode_hpd_ctxid(6) != Some(HpdEvent::SinkIrq(0))
+        || decode_hpd_ctxid(11) != Some(HpdEvent::SinkIrq(5))
+        || decode_hpd_ctxid(12).is_some()
+    {
+        return TestResult::Fail("HPD context ids split 0..5 plug and 6..11 sink-IRQ");
+    }
+
+    // A real cookie: DCE client, pipe 1's vblank.
     let hdr = IhCookieHeader {
         client_id: CLIENT_ID_DCN,
-        source_id: SOURCE_ID_DCN_VBLANK,
+        source_id: dcn_vblank_source_id(1),
         ring_id: 0,
         reserved: 0,
     };
     let dw = hdr.to_dword();
-    let back = IhCookieHeader::from_dword(dw);
-    if back != hdr {
+    if IhCookieHeader::from_dword(dw) != hdr {
         return TestResult::Fail("cookie header round-trip mismatch");
     }
-    if back.client_id != CLIENT_ID_DCN || back.source_id != SOURCE_ID_DCN_VBLANK {
-        return TestResult::Fail("decoded client/source ids wrong");
-    }
-    // Cross-check bit layout against the public AMD docs:
-    //   client_id in bits[7:0], source_id in [15:8].
-    if (dw & 0xFF) != CLIENT_ID_DCN as u32 {
+    // client_id in bits[7:0], source_id in [15:8].
+    if (dw & 0xFF) != 0x04 {
         return TestResult::Fail("client_id not in dw[7:0]");
     }
-    if ((dw >> 8) & 0xFF) != SOURCE_ID_DCN_VBLANK as u32 {
+    if ((dw >> 8) & 0xFF) != 0x3D {
         return TestResult::Fail("source_id not in dw[15:8]");
     }
     TestResult::Pass

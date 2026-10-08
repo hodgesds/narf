@@ -4,8 +4,12 @@
 //! transitions. Each external connector (DP, HDMI) has a
 //! dedicated HPD pin; the GPU's DCN block monitors voltage on
 //! the pin and raises an IH interrupt with `source_id =
-//! SOURCE_ID_DCN_HPD` when it transitions. The IH cookie's
-//! source-data payload encodes which connector instance fired.
+//! SOURCE_ID_DCN_HPD` (9) when it transitions. That one source id covers all
+//! six connectors AND both event kinds, so the cookie's `src_data[0]` is what
+//! identifies the event: 0..5 are plug events on connectors 1..6 and 6..11 are
+//! DisplayPort sink IRQs on the same six. It does NOT say whether a plug event
+//! is a connect or a disconnect — Linux's `handle_hpd_irq_helper` calls
+//! `dc_link_detect` to go and read the link state.
 //!
 //! ## Reference
 //!
@@ -15,6 +19,11 @@
 //!   — HPD pin enumeration (`enum hpd_source_id`)
 //! - Linux `drivers/gpu/drm/amd/display/dc/dce/dce_hwseq.c` —
 //!   per-IP HPD register window
+//! - Linux `drivers/gpu/drm/amd/display/dc/irq/dcn314/irq_service_dcn314.c`
+//!   (`to_dal_irq_source_dcn314`) — the (source id, `src_data[0]`) table this
+//!   module decodes, for the part we target
+//! - Linux `drivers/gpu/drm/amd/include/ivsrcid/dcn/irqsrcs_dcn_1_0.h` —
+//!   `DCN_1_0__SRCID__DC_HPD1_INT` and the `CTXID` split
 //!
 //! GPL-2.0-or-later (matches NARF). Adapted directly.
 //!
@@ -61,9 +70,16 @@ pub enum HpdSource {
 }
 
 impl HpdSource {
-    /// Decode from the IH cookie's source-data byte.
-    pub fn from_byte(b: u8) -> Option<Self> {
-        match b & 0x07 {
+    /// Which connector an HPD context id names, 0-based.
+    ///
+    /// LINUX-GAP: this took `b & 0x07` off a byte it called the "source-data
+    /// byte", mapping 0..5 and rejecting 6 and 7. The field it reads is the IV
+    /// entry's `src_data[0]`, which `irq_service_dcn314.c` splits 0..5 for the
+    /// six plug events and **6..11 for the six DisplayPort sink-IRQ events** —
+    /// so masking to three bits folded HPD1RX and HPD2RX onto HPD7/HPD8 and
+    /// dropped the rest. [`crate::amdgpu_ih::decode_hpd_ctxid`] is the split.
+    pub fn from_index(index: u8) -> Option<Self> {
+        match index {
             0 => Some(HpdSource::Hpd1),
             1 => Some(HpdSource::Hpd2),
             2 => Some(HpdSource::Hpd3),
@@ -77,9 +93,10 @@ impl HpdSource {
 
 // ── HPD event kind ───────────────────────────────────────────────
 
-/// Decoded HPD event kind. The IH cookie's source-data byte
-/// carries a sub-id (in bits[12:8] per the spec) that
-/// distinguishes long vs short pulse.
+/// Decoded HPD event kind.
+///
+/// The cookie distinguishes a plug event from a sink IRQ, but NOT a connect
+/// from a disconnect — see [`HpdEvent::from_ih_cookie`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HpdEventKind {
     /// Long pulse — pin transitioned to a stable state.
@@ -105,20 +122,32 @@ pub struct HpdEvent {
 }
 
 impl HpdEvent {
-    /// Decode an IH HPD cookie. dword 1 carries:
-    ///   bits[7:0]  : HPD source index
-    ///   bits[15:8] : sub-id (1 = connect, 0 = disconnect, 2 = short)
-    pub fn from_ih_cookie(dword1: u32, tsc: u64) -> Option<Self> {
-        let src = HpdSource::from_byte((dword1 & 0xFF) as u8)?;
-        let sub = (dword1 >> 8) & 0xFF;
-        let kind = match sub {
-            0 => HpdEventKind::LongPulseDisconnect,
-            1 => HpdEventKind::LongPulseConnect,
-            2 => HpdEventKind::ShortPulse,
-            _ => return None,
+    /// Decode an IH HPD cookie.
+    ///
+    /// `ctxid` is the IV entry's `src_data[0]` — the only field that
+    /// identifies an HPD event, since all six connectors and both event kinds
+    /// share source id `SOURCE_ID_DCN_HPD`. `asserted` is the HPD pin level the
+    /// caller read back, and is ignored for a sink IRQ.
+    ///
+    /// LINUX-GAP: this used to decode a 16-bit layout of its own invention —
+    /// "bits[7:0]: HPD source index, bits[15:8]: sub-id (1 = connect,
+    /// 0 = disconnect, 2 = short)". The hardware has no such sub-id field, and
+    /// more importantly the cookie does not say whether a plug event is a
+    /// connect or a disconnect: Linux's `handle_hpd_irq_helper` calls
+    /// `dc_link_detect` to go and look. So `asserted` is a parameter rather
+    /// than something decoded out of the dword, and the cookie's own 0..11
+    /// context id supplies the connector and the plug/sink-IRQ split.
+    ///
+    /// Nothing reads the HPD status register back yet, so no caller can supply
+    /// `asserted` from hardware; that read is the remaining gap.
+    pub fn from_ih_cookie(ctxid: u8, asserted: bool, tsc: u64) -> Option<Self> {
+        let (index, kind) = match crate::amdgpu_ih::decode_hpd_ctxid(ctxid)? {
+            crate::amdgpu_ih::HpdEvent::Plug(i) if asserted => (i, HpdEventKind::LongPulseConnect),
+            crate::amdgpu_ih::HpdEvent::Plug(i) => (i, HpdEventKind::LongPulseDisconnect),
+            crate::amdgpu_ih::HpdEvent::SinkIrq(i) => (i, HpdEventKind::ShortPulse),
         };
         Some(Self {
-            source: src,
+            source: HpdSource::from_index(index)?,
             kind,
             tsc,
         })
@@ -322,34 +351,46 @@ mod smoke_tests {
     use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayPath};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    /// The context ids are `DCN_1_0__CTXID__DC_HPD*_INT` 0..5 and
+    /// `..._RX_INT` 6..11, read off `irqsrcs_dcn_1_0.h`.
     fn smoke_hpd_cookie_decode() -> TestResult {
-        // Connect on HPD2.
-        let dw1 = (HpdSource::Hpd2 as u32) | (1 << 8);
-        let e = HpdEvent::from_ih_cookie(dw1, 1000).expect("decode");
+        // CTXID 1 with the pin asserted: a connect on HPD2.
+        let e = HpdEvent::from_ih_cookie(1, true, 1000).expect("decode");
         if e.source != HpdSource::Hpd2 {
             return TestResult::Fail("source wrong");
         }
         if e.kind != HpdEventKind::LongPulseConnect {
             return TestResult::Fail("kind wrong");
         }
-        // Disconnect on HPD1.
-        // `0 << 8` documents bits[9:8] = 0 (disconnect event type) explicitly.
-        #[allow(clippy::identity_op)]
-        let dw1 = (HpdSource::Hpd1 as u32) | (0 << 8);
-        let e = HpdEvent::from_ih_cookie(dw1, 0).unwrap();
-        if e.kind != HpdEventKind::LongPulseDisconnect {
+        // The same cookie with the pin low is a disconnect — the cookie itself
+        // does not say which, so only `asserted` separates these two.
+        let e = HpdEvent::from_ih_cookie(0, false, 0).expect("decode");
+        if e.source != HpdSource::Hpd1 || e.kind != HpdEventKind::LongPulseDisconnect {
             return TestResult::Fail("disconnect not decoded");
         }
-        // Short pulse on HPD3.
-        let dw1 = (HpdSource::Hpd3 as u32) | (2 << 8);
-        let e = HpdEvent::from_ih_cookie(dw1, 0).unwrap();
-        if e.kind != HpdEventKind::ShortPulse {
-            return TestResult::Fail("short pulse not decoded");
+        // CTXID 8 is DC_HPD3_RX_INT: a sink IRQ on HPD3, whatever the pin
+        // level, because a short pulse leaves the pin where it was.
+        for asserted in [true, false] {
+            let e = HpdEvent::from_ih_cookie(8, asserted, 0).expect("decode");
+            if e.source != HpdSource::Hpd3 || e.kind != HpdEventKind::ShortPulse {
+                return TestResult::Fail("short pulse not decoded");
+            }
         }
-        // Bad sub-id.
-        let dw1 = (HpdSource::Hpd1 as u32) | (9 << 8);
-        if HpdEvent::from_ih_cookie(dw1, 0).is_some() {
-            return TestResult::Fail("bad sub-id should fail");
+        // CTXID 6 and 7 are HPD1RX and HPD2RX, not plug events on a seventh and
+        // eighth connector — the old three-bit mask folded them onto HPD7/HPD8.
+        if HpdEvent::from_ih_cookie(6, true, 0).map(|e| (e.source, e.kind))
+            != Some((HpdSource::Hpd1, HpdEventKind::ShortPulse))
+        {
+            return TestResult::Fail("CTXID 6 is HPD1's sink IRQ");
+        }
+        if HpdEvent::from_ih_cookie(7, true, 0).map(|e| e.source) != Some(HpdSource::Hpd2) {
+            return TestResult::Fail("CTXID 7 is HPD2's sink IRQ");
+        }
+        // 12 and above are DC_IRQ_SOURCE_INVALID.
+        if HpdEvent::from_ih_cookie(12, true, 0).is_some()
+            || HpdEvent::from_ih_cookie(255, true, 0).is_some()
+        {
+            return TestResult::Fail("a context id past 11 is not an HPD event");
         }
         TestResult::Pass
     }
