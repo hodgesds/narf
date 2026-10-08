@@ -2077,6 +2077,81 @@ fn build_frame(
     frame
 }
 
+/// Total bytes an Ethernet/IPv6/TCP frame occupies — the size to allocate /
+/// acquire before building.
+fn ipv6_frame_len(opt_len: usize, payload_len: usize) -> usize {
+    ETH_HDR_LEN + crate::pkt_ipv6::IPV6_HDR_LEN + TCP_HDR_MIN + opt_len + payload_len
+}
+
+/// Build a complete Ethernet/IPv6/TCP frame into `out` (≥ [`ipv6_frame_len`]
+/// bytes) — the IPv6 counterpart to [`build_frame_into`]. Writes the L2 header,
+/// the IPv6 fixed header, then the TCP header + payload, and patches the TCP
+/// checksum over the segment. The zero-copy TX path builds straight into a DMA
+/// buffer here; [`build_frame6`] wraps it for the `Vec` path.
+#[allow(clippy::too_many_arguments)]
+fn build_frame6_into(
+    out: &mut [u8],
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: Vec<u8>,
+    payload: &[u8],
+    offload_csum: bool,
+) {
+    use crate::pkt_ipv6::{Ipv6Header, IPV6_HDR_LEN, NEXT_HEADER_TCP};
+    let tcp_hdr_len = TCP_HDR_MIN + options.len();
+    let seg_len = tcp_hdr_len + payload.len();
+    let total = ETH_HDR_LEN + IPV6_HDR_LEN + seg_len;
+    let frame = &mut out[..total];
+    let _ = write_eth_header(frame, dst_mac, src_mac, crate::pkt::ETHERTYPE_IPV6);
+    let ip = Ipv6Header {
+        version: 6,
+        traffic_class: 0,
+        flow_label: 0,
+        payload_length: seg_len as u16,
+        next_header: NEXT_HEADER_TCP,
+        hop_limit: 64,
+        src_ip,
+        dst_ip,
+    };
+    frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN].copy_from_slice(&ip.encode());
+    let seg_off = ETH_HDR_LEN + IPV6_HDR_LEN;
+    let hdr = TcpHeader {
+        src_port,
+        dst_port,
+        sequence: seq,
+        acknowledgement: ack,
+        header_len: tcp_hdr_len as u8,
+        flags,
+        window,
+        checksum: 0,
+        urgent_ptr: 0,
+        options,
+    };
+    let bytes = hdr.encode();
+    frame[seg_off..seg_off + bytes.len()].copy_from_slice(&bytes);
+    frame[seg_off + bytes.len()..seg_off + bytes.len() + payload.len()].copy_from_slice(payload);
+    // See `build_frame_into`: offload writes only the pseudo-header seed.
+    let checksum = if offload_csum {
+        crate::pkt_ipv6::pseudo_seed(src_ip, dst_ip, NEXT_HEADER_TCP, seg_len as u32)
+    } else {
+        crate::pkt_ipv6::pseudo_checksum(
+            src_ip,
+            dst_ip,
+            NEXT_HEADER_TCP,
+            &frame[seg_off..seg_off + seg_len],
+        )
+    };
+    frame[seg_off + 16..seg_off + 18].copy_from_slice(&checksum.to_be_bytes());
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_frame6(
     src_mac: [u8; 6],
@@ -2093,45 +2168,22 @@ fn build_frame6(
     payload: &[u8],
     offload_csum: bool,
 ) -> Vec<u8> {
-    let tcp_hdr_len = TCP_HDR_MIN + options.len();
-    let hdr = TcpHeader {
+    let mut frame = vec![0u8; ipv6_frame_len(options.len(), payload.len())];
+    build_frame6_into(
+        &mut frame,
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
         src_port,
         dst_port,
-        sequence: seq,
-        acknowledgement: ack,
-        header_len: tcp_hdr_len as u8,
+        seq,
+        ack,
         flags,
         window,
-        checksum: 0,
-        urgent_ptr: 0,
         options,
-    };
-    let mut segment = hdr.encode();
-    segment.extend_from_slice(payload);
-    // See `build_frame`: offload writes only the pseudo-header seed.
-    let checksum = if offload_csum {
-        crate::pkt_ipv6::pseudo_seed(
-            src_ip,
-            dst_ip,
-            crate::pkt_ipv6::NEXT_HEADER_TCP,
-            segment.len() as u32,
-        )
-    } else {
-        crate::pkt_ipv6::pseudo_checksum(src_ip, dst_ip, crate::pkt_ipv6::NEXT_HEADER_TCP, &segment)
-    };
-    segment[16..18].copy_from_slice(&checksum.to_be_bytes());
-    let mut frame = Vec::new();
-    crate::ipv6_stack::build_frame(
-        &mut frame,
-        crate::ipv6_stack::Ipv6FrameSpec {
-            src_mac,
-            dst_mac,
-            src_ip,
-            dst_ip,
-            next_header: crate::pkt_ipv6::NEXT_HEADER_TCP,
-            hop_limit: 64,
-            body: &segment,
-        },
+        payload,
+        offload_csum,
     );
     frame
 }
@@ -2162,10 +2214,58 @@ fn build_tcb_frame(
     payload: &[u8],
     offload_csum: bool,
 ) -> TxFrame {
+    // When the egress iface offers zero-copy TX and a pool buffer is big
+    // enough for this frame, build straight into it — no copy before the DMA.
+    // A TSO super-frame larger than the pool buffer, or a non-zero-copy iface,
+    // falls through to the `Vec` path (byte-for-byte the pre-P-F behaviour).
+    // Both v4 and v6 take the zero-copy path; they differ only in the builder.
+    let total = if t.is_ipv6 {
+        ipv6_frame_len(options.len(), payload.len())
+    } else {
+        ipv4_frame_len(options.len(), payload.len())
+    };
+    if dev.zero_copy_tx() {
+        if let Some(mut f) = iface::tx_acquire(&dev.name, total) {
+            if t.is_ipv6 {
+                build_frame6_into(
+                    f.payload_mut(),
+                    src_mac,
+                    t.remote_mac,
+                    t.local_addr6,
+                    t.remote_addr6,
+                    t.local_port,
+                    t.remote_port,
+                    seq,
+                    ack,
+                    flags,
+                    window,
+                    options,
+                    payload,
+                    offload_csum,
+                );
+            } else {
+                build_frame_into(
+                    f.payload_mut(),
+                    src_mac,
+                    t.remote_mac,
+                    t.local_addr,
+                    t.remote_addr,
+                    t.local_port,
+                    t.remote_port,
+                    seq,
+                    ack,
+                    flags,
+                    window,
+                    options,
+                    payload,
+                    offload_csum,
+                );
+            }
+            return TxFrame::Dma(f);
+        }
+    }
     if t.is_ipv6 {
-        // IPv6 egress stays on the classic copy path (its builder lives in
-        // `ipv6_stack`); zero-copy TX is wired for IPv4 first.
-        return TxFrame::Owned(build_frame6(
+        TxFrame::Owned(build_frame6(
             src_mac,
             t.remote_mac,
             t.local_addr6,
@@ -2179,49 +2279,24 @@ fn build_tcb_frame(
             options,
             payload,
             offload_csum,
-        ));
+        ))
+    } else {
+        TxFrame::Owned(build_frame(
+            src_mac,
+            t.remote_mac,
+            t.local_addr,
+            t.remote_addr,
+            t.local_port,
+            t.remote_port,
+            seq,
+            ack,
+            flags,
+            window,
+            options,
+            payload,
+            offload_csum,
+        ))
     }
-    // IPv4: when the egress iface offers zero-copy TX and a pool buffer is big
-    // enough for this frame, build straight into it — no copy before the DMA.
-    // A TSO super-frame larger than the pool buffer, or a non-zero-copy iface,
-    // falls through to the `Vec` path (byte-for-byte the pre-P-F behaviour).
-    let total = ipv4_frame_len(options.len(), payload.len());
-    if dev.zero_copy_tx() {
-        if let Some(mut f) = iface::tx_acquire(&dev.name, total) {
-            build_frame_into(
-                f.payload_mut(),
-                src_mac,
-                t.remote_mac,
-                t.local_addr,
-                t.remote_addr,
-                t.local_port,
-                t.remote_port,
-                seq,
-                ack,
-                flags,
-                window,
-                options,
-                payload,
-                offload_csum,
-            );
-            return TxFrame::Dma(f);
-        }
-    }
-    TxFrame::Owned(build_frame(
-        src_mac,
-        t.remote_mac,
-        t.local_addr,
-        t.remote_addr,
-        t.local_port,
-        t.remote_port,
-        seq,
-        ack,
-        flags,
-        window,
-        options,
-        payload,
-        offload_csum,
-    ))
 }
 
 fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
