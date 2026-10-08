@@ -117,7 +117,6 @@ pub enum GpuError {
 }
 
 pub mod amdgpu;
-pub mod amdgpu_atom_dcn;
 pub mod amdgpu_atom_displayobj;
 pub mod amdgpu_atom_encoder_caps;
 pub mod amdgpu_atom_fwinfo;

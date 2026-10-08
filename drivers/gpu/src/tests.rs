@@ -572,56 +572,95 @@ fn smoke_dp_aux_native_write_encodes_payload() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_dp_aux_native_write_encodes_payload);
 
+/// Offsets spelled out from `offsetof` on `struct atom_firmware_info_v3_4`.
 fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
-    use crate::amdgpu_atom_fwinfo::{parse, FwInfoError};
-    let mut t = alloc::vec![0u8; 0x80];
-    // ATOM_COMMON_TABLE_HEADER: usSize=0x80, fmt=4, content=0x34
-    t[0..2].copy_from_slice(&0x80u16.to_le_bytes());
-    t[2] = 4;
-    t[3] = 0x34;
-    // firmware_revision = 0x0000_1234
-    t[0x04..0x08].copy_from_slice(&0x1234u32.to_le_bytes());
-    // engine clock = 1500 MHz = 150_000 (10kHz units)
-    t[0x08..0x0C].copy_from_slice(&150_000u32.to_le_bytes());
-    // memory clock = 6400 MHz = 640_000
-    t[0x0C..0x10].copy_from_slice(&640_000u32.to_le_bytes());
-    // max pixel clock = 1188 MHz = 118_800
-    t[0x20..0x24].copy_from_slice(&118_800u32.to_le_bytes());
-    // bootup VDDC = 950 mV
-    t[0x2E..0x30].copy_from_slice(&950u16.to_le_bytes());
-    // memory module id = 7, cooling solution id = 2
-    t[0x59] = 7;
-    t[0x5A] = 2;
+    use crate::amdgpu_atom_fwinfo::{
+        parse, FwInfoError, ATOM_FIRMWARE_CAP_FIRMWARE_POSTED, FWINFO_V3_1_BYTES, FWINFO_V3_4_BYTES,
+    };
+    if FWINFO_V3_1_BYTES != 72 || FWINFO_V3_4_BYTES != 108 {
+        return TestResult::Fail("v3.1 is 72 bytes and v3.4 is 108");
+    }
+    let mut t = alloc::vec![0u8; FWINFO_V3_4_BYTES];
+    // atom_common_table_header: structuresize u16, format_revision u8,
+    // content_revision u8. The major is 3 and the minor a whole byte — not a
+    // nibble pair, which is what `content_revision >> 4` assumed.
+    t[0..2].copy_from_slice(&(FWINFO_V3_4_BYTES as u16).to_le_bytes());
+    t[2] = 3;
+    t[3] = 4;
+    t[0x04..0x08].copy_from_slice(&0x1234u32.to_le_bytes()); // firmware_revision
+    t[0x08..0x0c].copy_from_slice(&150_000u32.to_le_bytes()); // bootup_sclk, 1500 MHz
+    t[0x0c..0x10].copy_from_slice(&640_000u32.to_le_bytes()); // bootup_mclk, 6400 MHz
+                                                              // firmware_capability is a full dword at 0x10, not a u16 at 0x51.
+    t[0x10..0x14].copy_from_slice(&ATOM_FIRMWARE_CAP_FIRMWARE_POSTED.to_le_bytes());
+    t[0x14..0x18].copy_from_slice(&0xDEAD_0000u32.to_le_bytes()); // main_call_parser_entry
+    t[0x18..0x1c].copy_from_slice(&0x0000_1F00u32.to_le_bytes()); // bios_scratch_reg_startaddr
+    t[0x1c..0x1e].copy_from_slice(&950u16.to_le_bytes()); // bootup_vddc_mv
+    t[0x1e..0x20].copy_from_slice(&900u16.to_le_bytes()); // bootup_vddci_mv
+    t[0x20..0x22].copy_from_slice(&1350u16.to_le_bytes()); // bootup_mvddc_mv
+    t[0x22..0x24].copy_from_slice(&800u16.to_le_bytes()); // bootup_vddgfx_mv
+    t[0x24] = 7; // mem_module_id
+    t[0x25] = 2; // coolingsolution_id
+    t[0x28..0x2c].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // mc_baseaddr_high
+    t[0x2c..0x30].copy_from_slice(&0x8000_0000u32.to_le_bytes()); // mc_baseaddr_low
+    t[0x3c..0x40].copy_from_slice(&0x55u32.to_le_bytes()); // pplib_pptable_id
+
     let info = match parse(&t) {
         Ok(i) => i,
-        Err(_) => return TestResult::Fail("FwInfo parse rejected synthetic table"),
+        Err(_) => return TestResult::Fail("FwInfo parse rejected a valid v3.4 table"),
     };
-    if info.format_revision != 4 || info.content_revision != 0x34 {
-        return TestResult::Fail("revision fields wrong");
+    if info.format_revision != 3 || info.content_revision != 4 {
+        return TestResult::Fail("the major is 3 and the minor 4");
     }
     if info.firmware_revision != 0x1234 {
         return TestResult::Fail("firmware_revision round-trip");
     }
-    if info.default_engine_mhz() != 1500 {
-        return TestResult::Fail("engine clock MHz conversion");
+    if info.bootup_sclk_mhz() != 1500 || info.bootup_mclk_mhz() != 6400 {
+        return TestResult::Fail("clock MHz conversion");
     }
-    if info.default_memory_mhz() != 6400 {
-        return TestResult::Fail("memory clock MHz conversion");
+    // The capability dword sits where the old parser read an SPLL frequency.
+    if !info.firmware_posted() || info.firmware_capability != 1 {
+        return TestResult::Fail("firmware_capability is a dword at 0x10");
     }
-    if info.max_pixel_clock_pll_10khz != 118_800 {
-        return TestResult::Fail("max pixel clock");
+    if info.main_call_parser_entry != 0xDEAD_0000 || info.bios_scratch_reg_startaddr != 0x1F00 {
+        return TestResult::Fail("parser entry at 0x14, scratch start at 0x18");
     }
-    if info.bootup_vddc_mv != 950 {
-        return TestResult::Fail("bootup VDDC");
+    // Four voltages in a row from 0x1c. The old parser read bootup_vddc from
+    // 0x2e, which is the top half of mc_baseaddr_low.
+    if info.bootup_vddc_mv != 950
+        || info.bootup_vddci_mv != 900
+        || info.bootup_mvddc_mv != 1350
+        || info.bootup_vddgfx_mv != 800
+    {
+        return TestResult::Fail("the voltage quartet starts at 0x1c");
     }
-    if info.memory_module_id != 7 || info.cooling_solution_id != 2 {
-        return TestResult::Fail("memory/cooling ids");
+    if info.mem_module_id != 7 || info.coolingsolution_id != 2 {
+        return TestResult::Fail("the ids are at 0x24 and 0x25, not 0x59 and 0x5a");
     }
-    // V2.x rejected.
+    if info.mc_baseaddr_high != 1 || info.mc_baseaddr_low != 0x8000_0000 {
+        return TestResult::Fail("mc_baseaddr pair at 0x28/0x2c");
+    }
+    if info.pplib_pptable_id != Some(0x55) {
+        return TestResult::Fail("pplib_pptable_id is at 0x3c on v3.4");
+    }
+
+    // A v3.1 table is 72 bytes and stops before pplib_pptable_id. The old
+    // guard demanded 0x5B and would have rejected it outright.
+    let short = &t[..FWINFO_V3_1_BYTES];
+    match parse(short) {
+        Ok(i) if i.pplib_pptable_id.is_none() => {}
+        Ok(_) => return TestResult::Fail("a 72-byte table has no pplib_pptable_id"),
+        Err(_) => return TestResult::Fail("a 72-byte v3.1 table is valid"),
+    }
+    if parse(&t[..FWINFO_V3_1_BYTES - 1]).is_err() {
+        // Shorter than the smallest v3 structure.
+    } else {
+        return TestResult::Fail("a table below 72 bytes must be rejected");
+    }
+    // A major other than 3 is refused.
     let mut bad = t.clone();
-    bad[3] = 0x24; // content rev V2.4
-    if !matches!(parse(&bad), Err(FwInfoError::UnsupportedVersion(_))) {
-        return TestResult::Fail("V2 should be rejected");
+    bad[2] = 2;
+    if !matches!(parse(&bad), Err(FwInfoError::UnsupportedVersion(2))) {
+        return TestResult::Fail("format_revision 2 must be rejected");
     }
     TestResult::Pass
 }
@@ -969,53 +1008,16 @@ kernel_test_in!(
     smoke_amdgpu_offsets_runtime_registry_overrides_compile_time
 );
 
-fn smoke_amdgpu_atom_dcn_init_data_round_trip() -> TestResult {
-    use crate::amdgpu_atom_dcn::{parse, DcnInitError};
-    let mut t = alloc::vec![0u8; 0x20];
-    t[0..2].copy_from_slice(&0x1Au16.to_le_bytes());
-    t[2] = 1;
-    t[3] = 0;
-    t[0x04] = 4; // max_disp_engines
-    t[0x05] = 2; // max_active
-    t[0x06] = 6; // max_ppll
-    t[0x07] = 1; // core_ref_clk_source
-                 // disp_clk_used = 600 MHz = 60_000 (10 kHz units)
-    t[0x08..0x0C].copy_from_slice(&60_000u32.to_le_bytes());
-    // max_disp_clk = 1500 MHz
-    t[0x0C..0x10].copy_from_slice(&150_000u32.to_le_bytes());
-    // boot mode 1920x1080 @ 148.5 MHz
-    t[0x10..0x12].copy_from_slice(&1920u16.to_le_bytes());
-    t[0x12..0x14].copy_from_slice(&1080u16.to_le_bytes());
-    t[0x14..0x18].copy_from_slice(&14_850u32.to_le_bytes());
-    t[0x18] = 0; // XRGB8888
-    let info = match parse(&t) {
-        Ok(i) => i,
-        Err(_) => return TestResult::Fail("parse rejected"),
-    };
-    if info.format_revision != 1 {
-        return TestResult::Fail("format revision");
-    }
-    if info.max_disp_engines != 4 || info.max_active_engines != 2 {
-        return TestResult::Fail("engine counts");
-    }
-    if info.boot_h_active != 1920 || info.boot_v_active != 1080 {
-        return TestResult::Fail("boot mode resolution");
-    }
-    if info.boot_pixel_clock_10khz != 14_850 {
-        return TestResult::Fail("boot pixel clock");
-    }
-    if info.max_disp_clk_10khz != 150_000 {
-        return TestResult::Fail("max disp clock");
-    }
-    // V2 rejected.
-    let mut bad = t.clone();
-    bad[2] = 2;
-    if !matches!(parse(&bad), Err(DcnInitError::UnsupportedVersion(_))) {
-        return TestResult::Fail("V2 should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_dcn_init_data_round_trip);
+// LINUX-GAP: `smoke_amdgpu_atom_dcn_init_data_round_trip` stood here,
+// exercising an `ATOM_DCN_INIT_DATA` parser at data-table index 0x14. No such
+// table exists: index 0x14 of `atom_master_list_of_data_tables_v2_1` is
+// `sw_datatable20`, a software-reserved slot, and none of the fields that
+// parser decoded — `ulMaxDispEngineNum`, `ulMaxPPLLNum`,
+// `ulBootDispMode_pixel_clock` — appear in `atomfirmware.h`. The real
+// per-board display-engine parameters are `atom_display_controller_info_v4_x`
+// at index 27, which `amdgpu_dcn_inventory` reads and which audited clean. The
+// module and this test are both gone rather than pointed at a second copy of
+// that work.
 
 fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     use crate::amdgpu_atom_displayobj::{
@@ -1384,30 +1386,36 @@ fn smoke_amdgpu_rlc_autoload_toc_bitfields() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_autoload_toc_bitfields);
 
+/// Entry layout from `struct atom_gpio_pin_assignment`: a 32-bit register
+/// index, then three bytes and a reserved one.
 fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
-    use crate::amdgpu_atom_gpiopin::{GpioId, GpioPinLut};
-    // Synthetic LUT: header + 4 pin assignments
-    //   pin 0: DDC SCL (id 0x0A) on byte 0x10 mask 0x01
-    //   pin 1: DDC SDA (0x0B)    on byte 0x11 mask 0x02
-    //   pin 2: HPD     (0x01)    on byte 0x20 mask 0x10
-    //   pin 3: Backlight (0x03)  on byte 0x40 mask 0x80
-    let mut t = alloc::vec![0u8; 4 + 4 * 8];
-    t[0..2].copy_from_slice(&((4u16 + 4 * 8).to_le_bytes()));
-    t[2] = 1;
-    t[3] = 0;
-    let pins = [
-        (0x000Au16, 0u8, 1u8, 0x10u8, 0x01u8),
-        (0x000Bu16, 0u8, 1u8, 0x11u8, 0x02u8),
-        (0x0001u16, 1u8, 0u8, 0x20u8, 0x10u8),
-        (0x0003u16, 2u8, 1u8, 0x40u8, 0x80u8),
+    use crate::amdgpu_atom_gpiopin::{
+        GpioPinLut, GPIO_PIN_ASSIGNMENT_BYTES, I2C_HW_CAP, PP_AC_DC_SWITCH_GPIO_PINID,
+        TABLE_HEADER_BYTES,
+    };
+    if GPIO_PIN_ASSIGNMENT_BYTES != 8 || TABLE_HEADER_BYTES != 4 {
+        return TestResult::Fail("an entry is 8 bytes after a 4-byte header");
+    }
+    // Four entries: an I²C pair on engine 2 (clock then data, lane 0 and 1),
+    // a generic AC/DC switch pin, and another generic one.
+    let entries: [(u32, u8, u8, u8); 4] = [
+        (0x0000_1234, 3, 11, I2C_HW_CAP | (2 << 4)),
+        (0x0000_1235, 5, 13, I2C_HW_CAP | (2 << 4) | 1),
+        (0x0000_2000, 7, 15, PP_AC_DC_SWITCH_GPIO_PINID),
+        (0x0000_3000, 1, 9, 42),
     ];
-    for (i, (id, idx, ty, off, mask)) in pins.iter().enumerate() {
-        let p = 4 + i * 8;
-        t[p..p + 2].copy_from_slice(&id.to_le_bytes());
-        t[p + 2] = *idx;
-        t[p + 3] = *ty;
-        t[p + 4] = *off;
-        t[p + 5] = *mask;
+    let mut t = alloc::vec![0u8; TABLE_HEADER_BYTES + entries.len() * GPIO_PIN_ASSIGNMENT_BYTES];
+    let size = t.len() as u16;
+    t[0..2].copy_from_slice(&size.to_le_bytes());
+    t[2] = 1;
+    t[3] = 1;
+    for (i, (reg, bitshift, mask_bitshift, id)) in entries.iter().enumerate() {
+        let p = TABLE_HEADER_BYTES + i * GPIO_PIN_ASSIGNMENT_BYTES;
+        t[p..p + 4].copy_from_slice(&reg.to_le_bytes());
+        t[p + 4] = *bitshift;
+        t[p + 5] = *mask_bitshift;
+        t[p + 6] = *id;
+        // byte 7 is reserved and stays zero.
     }
     let mut lut = match GpioPinLut::parse(&t) {
         Ok(l) => l,
@@ -1416,20 +1424,49 @@ fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
     if lut.pin_count() != 4 {
         return TestResult::Fail("pin_count != 4");
     }
-    let scl = lut.find(GpioId::DdcScl).expect("DDC SCL");
-    if scl.gpio_byte_offset != 0x10 || scl.gpio_mask != 0x01 {
-        return TestResult::Fail("DDC SCL byte/mask");
+    let all: alloc::vec::Vec<_> = lut.by_ref().collect();
+    // The register index is a full dword at offset 0 — reading a u16 id there
+    // instead, as the old decode did, would make 0x1234 the "gpio id".
+    if all[0].data_a_reg_index != 0x1234 || all[1].data_a_reg_index != 0x1235 {
+        return TestResult::Fail("data_a_reg_index is a dword at offset 0");
     }
-    let sda = lut.find(GpioId::DdcSda).expect("DDC SDA");
-    if sda.gpio_byte_offset != 0x11 || sda.gpio_mask != 0x02 {
-        return TestResult::Fail("DDC SDA byte/mask");
+    if all[0].gpio_bitshift != 3 || all[0].gpio_mask_bitshift != 11 {
+        return TestResult::Fail("the two bit shifts are bytes 4 and 5");
     }
-    let hpd = lut.find(GpioId::Hpd).expect("HPD");
-    if hpd.pin_type != 0 {
-        return TestResult::Fail("HPD pin_type != 0 (input)");
+    if all[0].bit_mask() != 1 << 3 {
+        return TestResult::Fail("bit_mask is 1 << gpio_bitshift");
     }
-    if lut.find(GpioId::PanelPower).is_some() {
-        return TestResult::Fail("PanelPower should be absent");
+    // gpio_id is one byte at offset 6.
+    if all[2].gpio_id != PP_AC_DC_SWITCH_GPIO_PINID || all[3].gpio_id != 42 {
+        return TestResult::Fail("gpio_id is a byte at offset 6");
+    }
+    // An I²C line is identified by bit 7, with the engine in bits 6:4 and the
+    // lane mux in 3:0 — not by a DDC-SCL/DDC-SDA id, which does not exist.
+    if !all[0].is_i2c() || !all[1].is_i2c() {
+        return TestResult::Fail("I2C_HW_CAP marks an I2C pin");
+    }
+    if all[0].i2c_engine_id() != 2 || all[1].i2c_engine_id() != 2 {
+        return TestResult::Fail("the engine id is bits 6:4");
+    }
+    if all[0].i2c_lane_mux() != 0 || all[1].i2c_lane_mux() != 1 {
+        return TestResult::Fail("the lane mux is bits 3:0");
+    }
+    if all[2].is_i2c() || all[3].is_i2c() {
+        return TestResult::Fail("a generic GPIO has bit 7 clear");
+    }
+    // The pair lookup returns them in table order.
+    let (scl, sda) = match lut.find_i2c_engine(2) {
+        Some(p) => p,
+        None => return TestResult::Fail("engine 2 pair not found"),
+    };
+    if scl.data_a_reg_index != 0x1234 || sda.data_a_reg_index != 0x1235 {
+        return TestResult::Fail("the pair comes back clock then data");
+    }
+    if lut.find_i2c_engine(3).is_some() {
+        return TestResult::Fail("engine 3 has no pins");
+    }
+    if lut.find_id(PP_AC_DC_SWITCH_GPIO_PINID).is_none() {
+        return TestResult::Fail("exact-id lookup");
     }
     TestResult::Pass
 }

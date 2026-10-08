@@ -456,11 +456,12 @@ pub fn send_allocate_payload<A: MstAux>(
     // omitted by the branch", which is wrong above 255 PBN — a single 1080p60
     // stream is past that and 4K60 is around 2000. SDP stream sinks are not
     // emitted here, which matches `number_sdp_streams = 0`.
-    let mut body = alloc::vec::Vec::with_capacity(4);
-    body.push((sink_port & 0xf) << 4);
-    body.push(vcpi & 0x7f);
-    body.push((pbn >> 8) as u8);
-    body.push((pbn & 0xff) as u8);
+    let body = [
+        (sink_port & 0xf) << 4,
+        vcpi & 0x7f,
+        (pbn >> 8) as u8,
+        (pbn & 0xff) as u8,
+    ];
     let _resp = aux.sb_message(SB_ALLOCATE_PAYLOAD, branch_lct, branch_rad, &body);
     Ok(())
 }
