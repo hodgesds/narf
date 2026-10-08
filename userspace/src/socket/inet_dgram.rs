@@ -782,9 +782,15 @@ impl SocketFile {
         if super::sockopt::is_multicast_v4(dest.0) {
             return self.inet_dgram_send_mcast(buf, local_addr, local_port, dest);
         }
-        let (dev, broadcast, ip_ttl, ip_tos) = {
+        let (dev, broadcast, ip_ttl, ip_tos, ip_pmtudisc) = {
             let o = self.options.lock();
-            (o.bindtodevice_index, o.broadcast, o.ip_ttl, o.ip_tos)
+            (
+                o.bindtodevice_index,
+                o.broadcast,
+                o.ip_ttl,
+                o.ip_tos,
+                o.ext.ip_pmtudisc,
+            )
         };
         // Route lookup: no route → ENETUNREACH (`net/ipv4/udp.c:1238-1244`);
         // a broadcast route without SO_BROADCAST → EACCES
@@ -869,6 +875,7 @@ impl SocketFile {
                 bind_to_device: dev,
                 ip_ttl: ip_ttl.min(255) as u8,
                 ip_tos: ip_tos.min(255) as u8,
+                ip_pmtudisc,
                 sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
                 ..Default::default()
             };
