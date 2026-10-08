@@ -78,6 +78,11 @@ pub struct UdpOptions {
     /// IP_TOS: DSCP/ECN byte override for outgoing datagrams (0 = default).
     /// Linux `ip_setsockopt` / `do_ip_setsockopt` (net/ipv4/ip_sockglue.c).
     pub ip_tos: u8,
+    /// IP_MTU_DISCOVER value (`IP_PMTUDISC_*`): controls the IPv4 Don't-Fragment
+    /// bit. `DONT`(0)/`OMIT`(5) clear DF (allow fragmentation); `WANT`(1,
+    /// default), `DO`(2), `PROBE`(3) set it. QUIC sets `IP_PMTUDISC_DO` so its
+    /// probes are never fragmented. Linux `ip_sockglue.c` / `ip_select_fb_ident`.
+    pub ip_pmtudisc: i32,
 }
 
 impl Default for UdpOptions {
@@ -92,6 +97,7 @@ impl Default for UdpOptions {
             reuseport: false,
             ip_ttl: 0, // 0 = use system default (64)
             ip_tos: 0,
+            ip_pmtudisc: 1, // IP_PMTUDISC_WANT: DF set (NARF's prior default)
         }
     }
 }
@@ -432,7 +438,12 @@ fn udp_send_inner(
         return Err(UdpError::NoBroadcastPermission);
     }
 
-    let (opts_sndbuf, ip_ttl, ip_tos) = (options.sndbuf, options.ip_ttl, options.ip_tos);
+    let (opts_sndbuf, ip_ttl, ip_tos, ip_pmtudisc) = (
+        options.sndbuf,
+        options.ip_ttl,
+        options.ip_tos,
+        options.ip_pmtudisc,
+    );
     if payload.len() > opts_sndbuf {
         return Err(UdpError::MsgTooLong);
     }
@@ -510,6 +521,13 @@ fn udp_send_inner(
     }
     if ip_ttl != 0 {
         frame[ETH_HDR_LEN + 8] = ip_ttl;
+    }
+    // IP_MTU_DISCOVER → the Don't-Fragment bit (flags byte, bit 6 of IP header
+    // byte 6). `write_ipv4_header` sets DF; honor IP_PMTUDISC_DONT(0) /
+    // IP_PMTUDISC_OMIT(5) by clearing it so those sends may fragment. All other
+    // values (WANT/DO/PROBE) keep DF — what QUIC's PMTU probing requires.
+    if ip_pmtudisc == 0 || ip_pmtudisc == 5 {
+        frame[ETH_HDR_LEN + 6] &= !0x40;
     }
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
 
@@ -1692,3 +1710,49 @@ fn smoke_udp_send_wire_frame_is_well_formed() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/udp", smoke_udp_send_wire_frame_is_well_formed);
+
+/// IP_MTU_DISCOVER drives the IPv4 Don't-Fragment bit (P-F/QUIC): `DO` keeps
+/// DF set (QUIC needs its probes unfragmented), `DONT` clears it. The DF bit
+/// is bit 0x40 of IP-header byte 6.
+fn smoke_udp_pmtudisc_controls_df() -> TestResult {
+    const IFACE: &str = "udpdf0";
+    const LOCAL: [u8; 4] = [10, 94, 0, 2];
+    const PEER: [u8; 4] = [10, 94, 0, 9];
+    const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x94, 9];
+    iface::register(IFACE, [0x02, 0, 0, 0, 0x94, 2], wire_capture_send);
+    iface::set_iface_ipv4(IFACE, LOCAL, LOCAL);
+    iface::add_addr(IFACE, LOCAL, 24);
+    crate::arp_cache::insert(IFACE, PEER, PEER_MAC);
+    crate::tcp_stack::__arp_insert_legacy(PEER, PEER_MAC);
+
+    // Send once per pmtudisc setting and report the DF bit the frame carried.
+    let df_for = |pmtudisc: i32, port: u16| -> Option<bool> {
+        WIRE_CAPTURE.lock().clear();
+        let opts = UdpOptions {
+            ip_pmtudisc: pmtudisc,
+            ..UdpOptions::default()
+        };
+        let sock = udp_bind(SocketAddrV4::new(LOCAL, port), opts).ok()?;
+        let sent = udp_send(&sock, b"df", Some(SocketAddrV4::new(PEER, 5353)));
+        udp_close(&sock);
+        if sent != Ok(2) {
+            return None;
+        }
+        let frames = core::mem::take(&mut *WIRE_CAPTURE.lock());
+        frames.first().map(|f| f[ETH_HDR_LEN + 6] & 0x40 != 0)
+    };
+
+    // IP_PMTUDISC_DO (2) and the WANT (1) default both set DF.
+    if df_for(2, 59040) != Some(true) {
+        return TestResult::Fail("IP_PMTUDISC_DO did not set the DF bit");
+    }
+    if df_for(1, 59041) != Some(true) {
+        return TestResult::Fail("IP_PMTUDISC_WANT (default) did not set the DF bit");
+    }
+    // IP_PMTUDISC_DONT (0) clears DF so the datagram may fragment.
+    if df_for(0, 59042) != Some(false) {
+        return TestResult::Fail("IP_PMTUDISC_DONT did not clear the DF bit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_pmtudisc_controls_df);

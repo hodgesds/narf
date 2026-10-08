@@ -299,6 +299,7 @@ struct PendingUdp6 {
     source: [u8; 16],
     destination: [u8; 16],
     hop_limit: u8,
+    traffic_class: u8,
     udp: Vec<u8>,
     mtu: u32,
     may_fragment: bool,
@@ -347,6 +348,7 @@ pub fn neighbor_resolved(net_ns_id: u64, iface_name: &str, neighbor: [u8; 16], m
             packet.source,
             packet.destination,
             packet.hop_limit,
+            packet.traffic_class,
             &packet.udp,
             packet.mtu,
             packet.may_fragment,
@@ -370,6 +372,7 @@ pub fn __pending_udp6_test_insert(net_ns_id: u64, iface: &str, neighbor: [u8; 16
         source: [0; 16],
         destination: neighbor,
         hop_limit: 64,
+        traffic_class: 0,
         udp: alloc::vec![0; 8],
         mtu: 1280,
         may_fragment: false,
@@ -423,6 +426,7 @@ pub fn send_udp(
     payload: &[u8],
     bound_ifindex: u32,
     hop_limit: u8,
+    traffic_class: u8,
     socket_mtu: Option<u32>,
     mtu_discover: u32,
     dontfrag: bool,
@@ -493,6 +497,7 @@ pub fn send_udp(
             source,
             destination,
             hop_limit: if hop_limit == 0 { 64 } else { hop_limit },
+            traffic_class,
             udp,
             mtu: path_mtu,
             may_fragment,
@@ -507,11 +512,24 @@ pub fn send_udp(
         source,
         destination,
         if hop_limit == 0 { 64 } else { hop_limit },
+        traffic_class,
         &udp,
         path_mtu,
         may_fragment,
     )?;
     Ok(payload.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Patch the IPv6 Traffic Class field (for ECN / DSCP from `IPV6_TCLASS`) into
+/// a frame `build_frame` just wrote with TC 0. The first 4 header bytes are
+/// version(4) | traffic_class(8) | flow_label(20); `build_frame` writes
+/// version 6 + flow_label 0, so only the TC bits (low nibble of byte 0, high
+/// nibble of byte 1) need setting, preserving version and the flow label.
+fn apply_tclass(frame: &mut [u8], tc: u8) {
+    let base = ETH_HDR_LEN;
+    frame[base] = 0x60 | (tc >> 4);
+    frame[base + 1] = (frame[base + 1] & 0x0f) | ((tc & 0x0f) << 4);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -521,6 +539,7 @@ fn emit_udp6(
     source: [u8; 16],
     destination: [u8; 16],
     hop_limit: u8,
+    traffic_class: u8,
     udp: &[u8],
     mtu: u32,
     may_fragment: bool,
@@ -539,6 +558,7 @@ fn emit_udp6(
                 body: udp,
             },
         );
+        apply_tclass(&mut frame, traffic_class);
         return iface.xmit(&frame).map_err(|_| Udp6SendError::DeviceFailure);
     }
     if !may_fragment || mtu as usize <= IPV6_HDR_LEN + 8 {
@@ -559,6 +579,7 @@ fn emit_udp6(
                 body: &fragment,
             },
         );
+        apply_tclass(&mut frame, traffic_class);
         iface
             .xmit(&frame)
             .map_err(|_| Udp6SendError::DeviceFailure)?;
