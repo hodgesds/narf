@@ -768,6 +768,70 @@ impl QueuePair {
         Some(payload)
     }
 
+    /// Zero-copy counterpart to [`Self::receive_with_meta`] (P-F): hand the
+    /// device-filled RX buffer out as an owned `DmaBuffer` (plus its length and
+    /// checksum metadata) and swap a fresh buffer into the slot, instead of
+    /// copying the frame into a `Vec`. Return shape mirrors `receive_with_meta`:
+    /// outer `None` = nothing pending, inner `None` = a fragment/error the
+    /// device still re-arms but software discards, inner `Some` = a delivered
+    /// frame. A refill-allocation failure leaves the frame in the ring (returns
+    /// outer `None`) so it is retried rather than dropped with no replacement.
+    ///
+    /// # Safety
+    /// `csr` must be this PF's mapped BAR0.
+    pub unsafe fn receive_frame(
+        &mut self,
+        csr: &MmioRegion,
+    ) -> Option<Option<(DmaBuffer, usize, RxMeta)>> {
+        let slot = self.rx_next;
+        let off = slot as u64 * DESC_BYTES;
+        // SAFETY: `off + 16 <= RING_BYTES`; writeback qword 1 holds status.
+        let status = unsafe { core::ptr::read_volatile(self.rx_ring.cpu_ptr_at::<u64>(off + 8)) };
+        if !rx_desc_done(status) {
+            return None;
+        }
+        dma_barrier();
+        let len = rx_desc_len(status) as usize;
+        let errors = rx_desc_errors(status);
+        let eof = rx_desc_eof(status);
+        let deliver = !self.rx_discard
+            && eof
+            && errors & 0x07 == 0
+            && len > 0
+            && len <= RX_MAX_FRAME as usize;
+
+        // Hand out the filled buffer only when deliverable AND a replacement is
+        // in hand, so the slot is never left empty. On a refill failure, bail
+        // before mutating any state so the frame is retried next poll.
+        let (payload, phys) = if deliver {
+            let replacement = match alloc_coherent(RX_BUF_BYTES, DomainId::DRIVER_0) {
+                Ok(b) => b,
+                Err(_) => return None,
+            };
+            let repl_phys = replacement.dma_addr().raw();
+            let filled = core::mem::replace(&mut self.rx_bufs[slot as usize], replacement);
+            let meta = super::offload::rx_metadata(status);
+            (Some((filled, len, meta)), repl_phys)
+        } else {
+            // Fragment / error: re-arm the same buffer, deliver nothing.
+            (None, self.rx_bufs[slot as usize].dma_addr().raw())
+        };
+        self.rx_discard = !eof;
+
+        // Re-arm the slot in the read format, pointing at `phys`.
+        // SAFETY: as above.
+        unsafe {
+            core::ptr::write_volatile(self.rx_ring.cpu_mut_ptr_at::<u64>(off), phys);
+            core::ptr::write_volatile(self.rx_ring.cpu_mut_ptr_at::<u64>(off + 8), 0);
+        }
+        dma_barrier();
+        self.rx_next = (slot + 1) % RING_LEN;
+        // SAFETY: caller-asserted mapped CSR window.
+        unsafe { csr.write32(reg_qrx_tail(self.pf_q), slot as u32) };
+        dma_barrier();
+        Some(payload)
+    }
+
     /// Compatibility helper that discards RX checksum metadata.
     /// # Safety
     /// Same requirements as `receive_with_meta`.

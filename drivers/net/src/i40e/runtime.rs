@@ -342,21 +342,19 @@ async fn queue_pump(
             if hw.irq().failed() {
                 break;
             }
+            // Zero-copy (P-F): take the device-filled DMA buffer straight out
+            // of the RX slot as a Frame (refilling the slot), no copy into a
+            // Vec and then a freshly-allocated frame.
             // SAFETY: hardware lease prevents reset and DMA reclamation.
-            let packet = unsafe { hw.queues[index].lock().receive_with_meta(&hw.csr) };
+            let packet = unsafe { hw.queues[index].lock().receive_frame(&hw.csr) };
             let Some(packet) = packet else {
                 break;
             };
             drained += 1;
-            let delivered = if let Some((bytes, meta)) = packet {
-                if let Ok(buffer) = alloc_coherent(bytes.len(), DomainId::DRIVER_0) {
-                    let mut frame = Frame::new(buffer, bytes.len() as u32);
-                    frame.payload_mut().copy_from_slice(&bytes);
-                    frame.set_rx_meta(meta);
-                    rx.lock().try_send(frame).is_ok()
-                } else {
-                    false
-                }
+            let delivered = if let Some((buffer, len, meta)) = packet {
+                let mut frame = Frame::new(buffer, len as u32);
+                frame.set_rx_meta(meta);
+                rx.lock().try_send(frame).is_ok()
             } else {
                 false
             };
