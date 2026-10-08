@@ -7069,6 +7069,11 @@ pub fn set_proc_argv_packed(pid: u64, packed: alloc::vec::Vec<u8>) {
 /// PR_SET_NAME (TASK_COMM_LEN = 16 including NUL).
 pub fn set_proc_comm(pid: u64, name: &str) {
     let trimmed: alloc::string::String = name.chars().take(15).collect();
+    // Counts-only syscall tracing snapshots the selected task ids here, while
+    // names are being published, so its hot path never takes PROC_COMM's
+    // lock to re-match a comm string for every syscall.
+    #[cfg(feature = "syscall-trace")]
+    crate::syscall::syscall_trace_note_comm(pid, &trimmed);
     let mut g = PROC_COMM.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     map.insert(pid, trimmed);
