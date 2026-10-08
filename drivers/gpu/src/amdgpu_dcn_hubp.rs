@@ -62,6 +62,58 @@ const INSTANCES: u8 = 4;
 
 /// `DC_SW_LINEAR`. No other swizzle is modelled by the mode math.
 const SW_MODE_LINEAR: u32 = 0;
+
+// Field positions, from `dcn_3_1_4_sh_mask.h`. The `DCHUBP_REQ_SIZE_CONFIG`
+// run is NOT evenly spaced — three bits sit unused between `MIN_CHUNK_SIZE`
+// and `META_CHUNK_SIZE`, and two more between `MIN_META_CHUNK_SIZE` and
+// `DPTE_GROUP_SIZE`:
+//
+//   SWATH_HEIGHT          0x00000007   shift 0
+//   PTE_ROW_HEIGHT_LINEAR 0x00000070   shift 4
+//   CHUNK_SIZE            0x00000700   shift 8
+//   MIN_CHUNK_SIZE        0x00001800   shift 11
+//   META_CHUNK_SIZE       0x00030000   shift 16
+//   MIN_META_CHUNK_SIZE   0x000C0000   shift 18
+//   DPTE_GROUP_SIZE       0x00700000   shift 20
+//   VM_GROUP_SIZE         0x07000000   shift 24
+//
+// LINUX-GAP: `META_CHUNK_SIZE` was written at shift 14 and
+// `MIN_META_CHUNK_SIZE` at 17 — as though the run continued at three-bit
+// spacing from `MIN_CHUNK_SIZE`. Neither value is zero on this path
+// (`amdgpu_dml` gives `META_CHUNK_BYTES` 2048 → 1 and `MIN_META_CHUNK_BYTES`
+// 256 → 3), so the whole-register write put 1 into reserved bits 15:14 and
+// split 3 across `META_CHUNK_SIZE`'s high bit and `MIN_META_CHUNK_SIZE`'s low
+// one, landing META_CHUNK_SIZE = 2 and MIN_META_CHUNK_SIZE = 1. The smoke test
+// composed its expectation with the same two shifts, so it passed.
+const REQ_SWATH_HEIGHT_SHIFT: u32 = 0;
+const REQ_PTE_ROW_HEIGHT_LINEAR_SHIFT: u32 = 4;
+const REQ_CHUNK_SIZE_SHIFT: u32 = 8;
+const REQ_MIN_CHUNK_SIZE_SHIFT: u32 = 11;
+const REQ_META_CHUNK_SIZE_SHIFT: u32 = 16;
+const REQ_MIN_META_CHUNK_SIZE_SHIFT: u32 = 18;
+const REQ_DPTE_GROUP_SIZE_SHIFT: u32 = 20;
+const REQ_VM_GROUP_SIZE_SHIFT: u32 = 24;
+
+// `HUBPRET_CONTROL`, same header:
+//
+//   DET_BUF_PLANE1_BASE_ADDRESS 0x00001FF0   PACK_3TO2_ELEMENT_DISABLE 0x8000
+//   CROSSBAR_SRC_ALPHA          0x00030000   CROSSBAR_SRC_Y_G   0x000C0000
+//   CROSSBAR_SRC_CB_B           0x00300000   CROSSBAR_SRC_CR_R  0x00C00000
+//
+// LINUX-GAP: the detile-buffer field was masked as `0xfff << 4`, three bits
+// wider than the nine it has, so the update also cleared reserved bits 14:13
+// and `PACK_3TO2_ELEMENT_DISABLE` at 15 — a field no DCN hubp code in Linux
+// writes, and so one whose reset value this had no business changing.
+const DET_BUF_PLANE1_BASE_ADDRESS: u32 = 0x0000_1FF0;
+/// `CROSSBAR_SRC_CB_B` | `CROSSBAR_SRC_CR_R`. `hubp2_program_pixel_format`
+/// updates only these two of the four crossbar fields.
+const CROSSBAR_CB_B_AND_CR_R: u32 = 0x0030_0000 | 0x00C0_0000;
+const CROSSBAR_SRC_CB_B_SHIFT: u32 = 20;
+const CROSSBAR_SRC_CR_R_SHIFT: u32 = 22;
+/// `red_bar` / `blue_bar` for a non-byte-swapped A*GB surface, per
+/// `hubp2_program_pixel_format`. An ABGR surface swaps them to 2 and 3.
+const CROSSBAR_SRC_CR_R_ARGB: u32 = 3;
+const CROSSBAR_SRC_CB_B_ARGB: u32 = 2;
 /// HUBP surface addresses are 48-bit and must land on a 256-byte request.
 const ADDRESS_BITS: u32 = 48;
 const ADDRESS_ALIGN: u64 = 256;
@@ -155,9 +207,10 @@ impl<I: Io> Engine<I> {
         let ttu = &registers.ttu;
         self.update(
             HUBPRET_CONTROL,
-            0xfff << 4 | 0x3 << 20 | 0x3 << 22,
+            DET_BUF_PLANE1_BASE_ADDRESS | CROSSBAR_CB_B_AND_CR_R,
             // No second detile plane, and the RGB crossbar is straight through.
-            3 << 22 | 2 << 20,
+            CROSSBAR_SRC_CR_R_ARGB << CROSSBAR_SRC_CR_R_SHIFT
+                | CROSSBAR_SRC_CB_B_ARGB << CROSSBAR_SRC_CB_B_SHIFT,
         )?;
         self.set(
             DCN_EXPANSION_MODE,
@@ -168,14 +221,14 @@ impl<I: Io> Engine<I> {
         )?;
         self.set(
             DCHUBP_REQ_SIZE_CONFIG,
-            rq.swath_height
-                | rq.pte_row_height_linear << 4
-                | rq.chunk_size << 8
-                | rq.min_chunk_size << 11
-                | rq.meta_chunk_size << 14
-                | rq.min_meta_chunk_size << 17
-                | rq.dpte_group_size << 20
-                | rq.mpte_group_size << 24,
+            rq.swath_height << REQ_SWATH_HEIGHT_SHIFT
+                | rq.pte_row_height_linear << REQ_PTE_ROW_HEIGHT_LINEAR_SHIFT
+                | rq.chunk_size << REQ_CHUNK_SIZE_SHIFT
+                | rq.min_chunk_size << REQ_MIN_CHUNK_SIZE_SHIFT
+                | rq.meta_chunk_size << REQ_META_CHUNK_SIZE_SHIFT
+                | rq.min_meta_chunk_size << REQ_MIN_META_CHUNK_SIZE_SHIFT
+                | rq.dpte_group_size << REQ_DPTE_GROUP_SIZE_SHIFT
+                | rq.mpte_group_size << REQ_VM_GROUP_SIZE_SHIFT,
         )?;
         // There is no chroma plane on this path.
         self.set(DCHUBP_REQ_SIZE_CONFIG_C, 0)?;
