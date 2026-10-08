@@ -1337,20 +1337,18 @@ impl AmdGpu {
         // header for the per-register shifts). Everything else with
         // a discoverable DCN block today is DCN 2.0 (Renoir,
         // Cezanne, Lucienne).
-        let seq = match self.chip.family {
-            Family::Phoenix => crate::amdgpu_dcn::dcn35_modeset_sequence(
-                &timing,
-                self.vram.base,
-                mode.stride,
-                dcn_base,
-            ),
-            _ => crate::amdgpu_dcn::dcn20_modeset_sequence(
-                &timing,
-                self.vram.base,
-                mode.stride,
-                dcn_base,
-            ),
-        };
+        // LINUX-GAP: this selected `dcn35_modeset_sequence` for Phoenix.
+        // Phoenix is DCN **3.1.4**, which agrees with DCN 2.0 on all nine OTG
+        // registers; DCN 3.5 moves four of them. `amdgpu_modeset` was
+        // corrected to the 2.0 sequence in an earlier pass and this call site
+        // was not, so the two modeset paths disagreed — and this is the one
+        // `set_mode` uses, which is what the PM resume path re-runs.
+        let seq = crate::amdgpu_dcn::dcn20_modeset_sequence(
+            &timing,
+            self.vram.base,
+            mode.stride,
+            dcn_base,
+        );
 
         // Drive the sequencer.
         // SAFETY: caller-asserted exclusive ownership of BAR5.
@@ -1386,10 +1384,15 @@ impl AmdGpu {
         // value this driver chooses.
         // SAFETY: caller-asserted BAR5 ownership; the register is inside the
         // DCN window `ip_block_base` resolved.
+        // `mm_read`/`mm_write` drive MM_INDEX, which takes a **dword**
+        // register address — `reg_offset[IP][inst][BASE_IDX] + dword_id`, the
+        // same sum `SOC15_REG_OFFSET` forms. `ip_block_base` returns that
+        // dword base straight out of the discovery blob, so the dword id is
+        // added to it unshifted.
         let period_cntl = unsafe {
             mm_read(
                 &self.regs,
-                (dcn_base + crate::amdgpu_backlight::BL_PWM_PERIOD_CNTL) << 2,
+                dcn_base + crate::amdgpu_backlight::BL_PWM_PERIOD_CNTL,
             )
         };
         let writes = crate::amdgpu_backlight::build_set_user_level(0, brightness, period_cntl)
@@ -1397,7 +1400,7 @@ impl AmdGpu {
         // SAFETY: caller-asserted BAR5 ownership.
         unsafe {
             for w in &writes {
-                mm_write(&self.regs, (dcn_base + w.addr) << 2, w.value);
+                mm_write(&self.regs, dcn_base + w.addr, w.value);
             }
         }
         Ok(())

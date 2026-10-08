@@ -2212,9 +2212,7 @@ fn smoke_dcn20_build_modeset_from_discovery_produces_seq() -> TestResult {
     // The very first write must blank HUBP — the DCN 2.0 prologue
     // requires disabling scanout before reprogramming.
     let first = seq[0];
-    let expected_blank = 0x0001_2000
-        + crate::amdgpu_dcn::DCN20_HUBP0_REL
-        + crate::amdgpu_dcn::DCN20_HUBP_BLANK_EN_REL;
+    let expected_blank = 0x0001_2000 + crate::amdgpu_dcn::HUBP0_DCHUBP_CNTL;
     if first.addr != expected_blank || first.value & crate::amdgpu_dcn::HUBP_BLANK_FORCE == 0 {
         return TestResult::Fail("prologue should force HUBP blank first");
     }
@@ -2301,9 +2299,8 @@ kernel_test_in!(
 
 fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{
-        dcn20_modeset_sequence, timing_for_mode, DCN20_HUBP0_REL, DCN20_HUBP_BLANK_EN_REL,
-        DCN20_OTG0_REL, DCN20_OTG_CONTROL_REL, DCN20_OTG_H_TOTAL_REL, HUBP_BLANK_FORCE,
-        OTG_MASTER_EN,
+        dcn20_modeset_sequence, timing_for_mode, HUBP0_DCHUBP_CNTL, HUBP_BLANK_FORCE,
+        OTG0_OTG_CONTROL, OTG0_OTG_H_TOTAL, OTG_MASTER_EN,
     };
     let timing = match timing_for_mode(1920, 1080, 60) {
         Some(t) => t,
@@ -2312,9 +2309,9 @@ fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     let dcn_base: u32 = 0x0010_0000;
     let seq = dcn20_modeset_sequence(&timing, 0x1000_0000, 1920, dcn_base);
 
-    let want_blank = dcn_base + DCN20_HUBP0_REL + DCN20_HUBP_BLANK_EN_REL;
-    let want_h_total = dcn_base + DCN20_OTG0_REL + DCN20_OTG_H_TOTAL_REL;
-    let want_master = dcn_base + DCN20_OTG0_REL + DCN20_OTG_CONTROL_REL;
+    let want_blank = dcn_base + HUBP0_DCHUBP_CNTL;
+    let want_h_total = dcn_base + OTG0_OTG_H_TOTAL;
+    let want_master = dcn_base + OTG0_OTG_CONTROL;
 
     // HUBP_BLANK must appear (twice — once forced in prologue,
     // once cleared in epilogue).
@@ -2348,9 +2345,8 @@ kernel_test_in!(
 
 fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{
-        dcn35_modeset_sequence, timing_for_mode, DCN35_HUBP0_REL, DCN35_HUBP_BLANK_EN_REL,
-        DCN35_OTG0_REL, DCN35_OTG_CONTROL_REL, DCN35_OTG_H_TOTAL_REL, DCN35_OTG_V_BLANK_REL,
-        HUBP_BLANK_FORCE, OTG_MASTER_EN,
+        dcn35_modeset_sequence, timing_for_mode, DCN35_OTG0_OTG_CONTROL, DCN35_OTG0_OTG_H_TOTAL,
+        DCN35_OTG0_OTG_V_BLANK_START_END, HUBP0_DCHUBP_CNTL, HUBP_BLANK_FORCE, OTG_MASTER_EN,
     };
     let timing = match timing_for_mode(1920, 1080, 60) {
         Some(t) => t,
@@ -2359,10 +2355,10 @@ fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
     let dcn_base: u32 = 0x0010_0000;
     let seq = dcn35_modeset_sequence(&timing, 0x1000_0000, 1920, dcn_base);
 
-    let want_blank = dcn_base + DCN35_HUBP0_REL + DCN35_HUBP_BLANK_EN_REL;
-    let want_h_total = dcn_base + DCN35_OTG0_REL + DCN35_OTG_H_TOTAL_REL;
-    let want_v_blank = dcn_base + DCN35_OTG0_REL + DCN35_OTG_V_BLANK_REL;
-    let want_master = dcn_base + DCN35_OTG0_REL + DCN35_OTG_CONTROL_REL;
+    let want_blank = dcn_base + HUBP0_DCHUBP_CNTL;
+    let want_h_total = dcn_base + DCN35_OTG0_OTG_H_TOTAL;
+    let want_v_blank = dcn_base + DCN35_OTG0_OTG_V_BLANK_START_END;
+    let want_master = dcn_base + DCN35_OTG0_OTG_CONTROL;
 
     // HUBP_BLANK_EN forced in prologue, cleared in epilogue.
     let blank_forced = seq
@@ -2410,25 +2406,25 @@ kernel_test_in!(
 
 fn smoke_dcn35_uses_different_offsets_than_dcn20() -> TestResult {
     use crate::amdgpu_dcn::{
-        DCN20_OTG_CONTROL_REL, DCN20_OTG_INTERRUPT_CONTROL_REL, DCN20_OTG_V_BLANK_REL,
-        DCN20_OTG_V_SYNC_A_REL, DCN35_OTG_CONTROL_REL, DCN35_OTG_INTERRUPT_CONTROL_REL,
-        DCN35_OTG_V_BLANK_REL, DCN35_OTG_V_SYNC_A_REL,
+        DCN35_OTG0_OTG_CONTROL, DCN35_OTG0_OTG_INTERRUPT_CONTROL, DCN35_OTG0_OTG_V_BLANK_START_END,
+        DCN35_OTG0_OTG_V_SYNC_A, OTG0_OTG_CONTROL, OTG0_OTG_INTERRUPT_CONTROL,
+        OTG0_OTG_V_BLANK_START_END, OTG0_OTG_V_SYNC_A,
     };
     // Phoenix's DCN 3.5 shifted V_BLANK / V_SYNC / OTG_CONTROL /
     // INTERRUPT_CONTROL inside the OTG block vs DCN 2.0 (Renoir).
     // If any of these ever drift to match the DCN 2.0 value the
     // Phoenix path would silently program the wrong register on
     // real hardware — pin the invariant.
-    if DCN20_OTG_V_BLANK_REL == DCN35_OTG_V_BLANK_REL {
+    if OTG0_OTG_V_BLANK_START_END == DCN35_OTG0_OTG_V_BLANK_START_END {
         return TestResult::Fail("DCN35 V_BLANK offset must differ from DCN20");
     }
-    if DCN20_OTG_V_SYNC_A_REL == DCN35_OTG_V_SYNC_A_REL {
+    if OTG0_OTG_V_SYNC_A == DCN35_OTG0_OTG_V_SYNC_A {
         return TestResult::Fail("DCN35 V_SYNC_A offset must differ from DCN20");
     }
-    if DCN20_OTG_CONTROL_REL == DCN35_OTG_CONTROL_REL {
+    if OTG0_OTG_CONTROL == DCN35_OTG0_OTG_CONTROL {
         return TestResult::Fail("DCN35 OTG_CONTROL offset must differ from DCN20");
     }
-    if DCN20_OTG_INTERRUPT_CONTROL_REL == DCN35_OTG_INTERRUPT_CONTROL_REL {
+    if OTG0_OTG_INTERRUPT_CONTROL == DCN35_OTG0_OTG_INTERRUPT_CONTROL {
         return TestResult::Fail("DCN35 INTERRUPT_CONTROL offset must differ from DCN20");
     }
     TestResult::Pass
@@ -9671,113 +9667,76 @@ kernel_test_in!(
     smoke_amdgpu_smu_mailbox_offsets_match_mp13
 );
 
-/// The DCN register offsets against the dword ids in the AMD headers.
+/// The DCN register ids against the AMD headers, as absolute dwords.
 ///
-/// Every DCN test in this suite composed its expected addresses from the same
-/// constants it was checking, so changing a constant changed both sides and
-/// nothing could fail. This one carries the header values literally.
-///
-/// The deltas are all relative to the first register of each block, which is
-/// how the tables are written: `regOTG0_OTG_H_TOTAL` (0x1b2a),
-/// `regHUBP0_DCHUBP_CNTL` (0x05f3), `regOPP_PIPE0_OPP_PIPE_CONTROL` (0x188c).
+/// LINUX-GAP: an earlier version of this test checked each table's *deltas*
+/// from the first register of its block, which is what the tables stored. That
+/// verified the offsets and left two things it structurally could not see: the
+/// per-block bases those offsets were added to, and the unit — `DcnWrite::addr`
+/// goes into MM_INDEX, which takes a dword address, while the tables were in
+/// bytes. The ids are absolute now and this checks them directly.
 fn smoke_amdgpu_dcn_offsets_match_headers() -> TestResult {
     use crate::amdgpu_dcn::*;
 
-    // `dcn_2_0_0_offset.h` and `dcn_3_1_4_offset.h` agree on all seven OTG
-    // registers. The block is NOT a contiguous run — the gaps are the point.
-    const OTG_H_TOTAL: u32 = 0x1b2a;
-    let otg_314: &[(u32, u32, u32)] = &[
-        (OTG_H_TOTAL_REL, 0x1b2a, DCN20_OTG_H_TOTAL_REL),
-        (OTG_H_BLANK_START_END_REL, 0x1b2b, DCN20_OTG_H_BLANK_REL),
-        (OTG_H_SYNC_A_REL, 0x1b2c, DCN20_OTG_H_SYNC_A_REL),
-        (OTG_V_TOTAL_REL, 0x1b2f, DCN20_OTG_V_TOTAL_REL),
-        (OTG_V_BLANK_START_END_REL, 0x1b36, DCN20_OTG_V_BLANK_REL),
-        (OTG_V_SYNC_A_REL, 0x1b37, DCN20_OTG_V_SYNC_A_REL),
-        (OTG_CONTROL_REL, 0x1b41, DCN20_OTG_CONTROL_REL),
-    ];
-    for (generic, dword, dcn20) in otg_314.iter().copied() {
-        let want = (dword - OTG_H_TOTAL) * 4;
-        if generic != want {
-            return TestResult::Fail("a generic OTG offset is not its header delta");
-        }
-        if dcn20 != want {
-            return TestResult::Fail("a DCN 2.0 OTG offset is not its header delta");
-        }
-    }
-
-    // `dcn_3_5_0_offset.h` moves three of them, which is why Phoenix must NOT
-    // use this table: V_BLANK 0x1b38, V_SYNC_A 0x1b39, OTG_CONTROL 0x1b43.
-    let otg_35: &[(u32, u32)] = &[
-        (DCN35_OTG_H_TOTAL_REL, 0x1b2a),
-        (DCN35_OTG_H_BLANK_REL, 0x1b2b),
-        (DCN35_OTG_H_SYNC_A_REL, 0x1b2c),
-        (DCN35_OTG_V_TOTAL_REL, 0x1b2f),
-        (DCN35_OTG_V_BLANK_REL, 0x1b38),
-        (DCN35_OTG_V_SYNC_A_REL, 0x1b39),
-        (DCN35_OTG_CONTROL_REL, 0x1b43),
-    ];
-    for (got, dword) in otg_35.iter().copied() {
-        if got != (dword - OTG_H_TOTAL) * 4 {
-            return TestResult::Fail("a DCN 3.5 OTG offset is not its header delta");
-        }
-    }
-    // And the two generations must genuinely differ where the headers do, or
-    // the Phoenix-vs-Strix distinction this commit draws is meaningless.
-    if DCN35_OTG_V_BLANK_REL == DCN20_OTG_V_BLANK_REL
-        || DCN35_OTG_CONTROL_REL == DCN20_OTG_CONTROL_REL
+    // `dcn_2_0_0_offset.h` and `dcn_3_1_4_offset.h` agree on all nine OTG
+    // registers. The block is NOT a contiguous run — the gaps are the point,
+    // and two of them were previously rounded to a multiple of 0x10.
+    if OTG0_OTG_H_TOTAL != 0x1b2a
+        || OTG0_OTG_H_BLANK_START_END != 0x1b2b
+        || OTG0_OTG_H_SYNC_A != 0x1b2c
+        || OTG0_OTG_V_TOTAL != 0x1b2f
+        || OTG0_OTG_V_BLANK_START_END != 0x1b36
+        || OTG0_OTG_V_SYNC_A != 0x1b37
+        || OTG0_OTG_CONTROL != 0x1b41
     {
-        return TestResult::Fail("DCN 3.5's vertical timing registers moved; the tables must too");
+        return TestResult::Fail("an OTG timing register id disagrees with the header");
+    }
+    // OTG_STATUS is +0x1f from H_TOTAL and INTERRUPT_CONTROL +0x2f, not the
+    // +0x20 and +0x30 the byte table carried.
+    if OTG0_OTG_STATUS != 0x1b49 || OTG0_OTG_INTERRUPT_CONTROL != 0x1b59 {
+        return TestResult::Fail("regOTG0_OTG_STATUS is 0x1b49 and _INTERRUPT_CONTROL 0x1b59");
+    }
+    if OTG0_OTG_STATUS - OTG0_OTG_H_TOTAL == 0x20
+        || OTG0_OTG_INTERRUPT_CONTROL - OTG0_OTG_H_TOTAL == 0x30
+    {
+        return TestResult::Fail("neither offset is a round multiple of 0x10");
     }
 
     // HUBP. The surface registers are in the HUBPREQ sub-block, so their ids
     // do not continue from DCHUBP_CNTL, and LOW is below HIGH.
-    const HUBP_CNTL: u32 = 0x05f3;
-    let hubp: &[(u32, u32, u32)] = &[
-        (HUBP_DCHUBP_CNTL_REL, 0x05f3, DCN20_HUBP_BLANK_EN_REL),
-        (
-            HUBP_PRIMARY_SURFACE_PITCH_REL,
-            0x0607,
-            DCN20_HUBP_SURFACE_PITCH_REL,
-        ),
-        (
-            HUBP_PRIMARY_SURFACE_ADDRESS_REL,
-            0x060a,
-            DCN20_HUBP_PRI_ADDR_LO_REL,
-        ),
-        (
-            HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL,
-            0x060b,
-            DCN20_HUBP_PRI_ADDR_HI_REL,
-        ),
-    ];
-    for (generic, dword, dcn20) in hubp.iter().copied() {
-        let want = (dword - HUBP_CNTL) * 4;
-        if generic != want || dcn20 != want {
-            return TestResult::Fail("a HUBP offset is not its header delta");
-        }
+    if HUBP0_DCHUBP_CNTL != 0x05f3
+        || HUBPREQ0_DCSURF_SURFACE_PITCH != 0x0607
+        || HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS != 0x060a
+        || HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH != 0x060b
+    {
+        return TestResult::Fail("a HUBP register id disagrees with the header");
     }
-    // The address halves must be in the right order — swapped, every scanout
-    // address is assembled from the wrong two registers.
-    if HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL <= HUBP_PRIMARY_SURFACE_ADDRESS_REL {
+    if HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH <= HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS {
         return TestResult::Fail("the surface address HIGH half is above the LOW half");
     }
-    // Blanking is a field of DCHUBP_CNTL, so its "offset" is the register's.
-    if DCN20_HUBP_BLANK_EN_REL != HUBP_DCHUBP_CNTL_REL {
-        return TestResult::Fail("HUBP_BLANK_EN is a field of DCHUBP_CNTL, not its own register");
+
+    // OPP_PIPE0 has exactly one register.
+    if OPP_PIPE0_OPP_PIPE_CONTROL != 0x188c {
+        return TestResult::Fail("regOPP_PIPE0_OPP_PIPE_CONTROL is 0x188c");
     }
 
-    // Per-pipe strides, from the difference between pipe 0 and pipe 1.
+    // Per-pipe strides, in dwords, from the difference between pipe 0 and
+    // pipe 1 in the header.
     for (got, p0, p1) in [
-        (DCN20_OTG_STRIDE, 0x1b2a, 0x1baa),
-        (DCN20_HUBP_STRIDE, 0x05f3, 0x06cf),
-        (DCN20_OPP_STRIDE, 0x188c, 0x18e6),
+        (OTG_PIPE_STRIDE, 0x1b2a, 0x1baa),
+        (HUBP_PIPE_STRIDE, 0x05f3, 0x06cf),
+        (OPP_PIPE_STRIDE, 0x188c, 0x18e6),
     ] {
-        if got != (p1 - p0) * 4 {
+        if got != p1 - p0 {
             return TestResult::Fail("a per-pipe stride is not the header's pipe delta");
         }
     }
-    if DCN35_HUBP_STRIDE != DCN20_HUBP_STRIDE || DCN35_OPP_STRIDE != DCN20_OPP_STRIDE {
-        return TestResult::Fail("the pipe strides do not change between these DCN revisions");
+    // HUBPREQ strides with HUBP: 0x06e3 - 0x0607.
+    if for_pipe(HUBPREQ0_DCSURF_SURFACE_PITCH, 1, HUBP_PIPE_STRIDE) != 0x06e3 {
+        return TestResult::Fail("HUBPREQ pipe 1 pitch is 0x06e3");
+    }
+    if for_pipe(OTG0_OTG_H_TOTAL, 3, OTG_PIPE_STRIDE) != 0x1caa {
+        return TestResult::Fail("regOTG3_OTG_H_TOTAL is 0x1caa");
     }
     TestResult::Pass
 }
