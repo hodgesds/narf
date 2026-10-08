@@ -167,8 +167,6 @@ pub mod amdgpu_pcie_recovery;
 pub mod amdgpu_platform;
 pub mod amdgpu_pm4;
 pub mod amdgpu_pm4_defs;
-pub mod amdgpu_pptable;
-pub mod amdgpu_pptable_subtables;
 pub mod amdgpu_psp;
 pub mod amdgpu_psp_ring;
 pub mod amdgpu_reset;

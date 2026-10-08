@@ -754,54 +754,27 @@ fn smoke_dp_link_training_completes_against_stub() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_dp_link_training_completes_against_stub);
 
-fn smoke_amdgpu_pptable_v11_directory_round_trip() -> TestResult {
-    use crate::amdgpu_pptable::{PpTable, PpTableError, Subtable};
-    let mut t = alloc::vec![0u8; 80];
-    // Header: usSize=80, fmt=11, content=0
-    t[0..2].copy_from_slice(&80u16.to_le_bytes());
-    t[2] = 11;
-    t[3] = 0;
-    // Set a subset of offsets.
-    // Subtable::PlatformDescriptor (idx 0) → 0x100
-    t[4..8].copy_from_slice(&0x100u32.to_le_bytes());
-    // Subtable::FanTable (idx 4) → 0x200
-    t[20..24].copy_from_slice(&0x200u32.to_le_bytes());
-    // Subtable::SocClockDependency (idx 6) → 0x300
-    t[28..32].copy_from_slice(&0x300u32.to_le_bytes());
-    let pp = match PpTable::parse(&t) {
-        Ok(p) => p,
-        Err(_) => return TestResult::Fail("PpTable parse rejected V11.0"),
-    };
-    if pp.format_revision != 11 {
-        return TestResult::Fail("format revision");
-    }
-    if pp.present_count() != 3 {
-        return TestResult::Fail("present_count != 3");
-    }
-    if pp.offset(Subtable::PlatformDescriptor) != Ok(0x100) {
-        return TestResult::Fail("PlatformDescriptor offset");
-    }
-    if pp.offset(Subtable::FanTable) != Ok(0x200) {
-        return TestResult::Fail("FanTable offset");
-    }
-    if !matches!(
-        pp.offset(Subtable::OverdriveTable8),
-        Err(PpTableError::TableAbsent)
-    ) {
-        return TestResult::Fail("absent subtable should fail");
-    }
-    // V8 rejected.
-    let mut bad = t.clone();
-    bad[2] = 8;
-    if !matches!(
-        PpTable::parse(&bad),
-        Err(PpTableError::UnsupportedVersion(_))
-    ) {
-        return TestResult::Fail("V8 should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_v11_directory_round_trip);
+// LINUX-GAP: four PowerPlay-table smokes stood here, exercising
+// `amdgpu_pptable` and `amdgpu_pptable_subtables`. Both modules are gone.
+//
+// The directory they decoded was sixteen `u32` pointers from offset 0x04, with
+// names like `ulPlatformDescriptorOffset`, `ulOverdriveTable8Offset`,
+// `ulVdciClockDependencyTableOffset` and `ulSrambitTableOffset`, cited as
+// "V11.0 — Vega+ baseline". The real Vega+ table is
+// `ATOM_Vega10_POWERPLAYTABLE`: a four-byte common header, then
+// `ucTableRevision` at 0x04 and `usTableSize` at 0x05 — so the first
+// "pointer" straddled two scalars — and its subtable offsets are **u16**,
+// living at 0x30..0x4e. Not one of the sixteen field names appears in any AMD
+// header, the pointer width is wrong, and the base offset is wrong.
+//
+// The table id was wrong too: the module read `data_table(0x32)`, and the
+// master data table has around thirty-five entries.
+//
+// And neither chip in this driver's roster has a PowerPlay table at all.
+// `renoir_ppt.c` and `smu_v13_0_4_ppt.c` define no `setup_pptable`: an APU's
+// power limits live in PMFW, not in VBIOS. There is nothing here to parse on
+// the hardware this driver targets, so the modules are deleted rather than
+// rewritten against a table that would still never be read.
 
 fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayObjError, DisplayObjectTable};
@@ -1135,105 +1108,6 @@ fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_displayobj_object_chain_walker);
-
-fn smoke_amdgpu_pptable_fan_table_round_trip() -> TestResult {
-    use crate::amdgpu_pptable_subtables::{FanTable, PpSubtableError};
-    let mut t = alloc::vec![0u8; 0x40];
-    // Header: usSize=0x40, fmt=11, content=0
-    t[0..2].copy_from_slice(&0x40u16.to_le_bytes());
-    t[2] = 11;
-    t[3] = 0;
-    // Body.
-    t[4] = 9; // rev_id
-    t[5] = 30; // thyst
-    t[6..8].copy_from_slice(&3_000u16.to_le_bytes()); // t_min = 30.00 C
-    t[8..10].copy_from_slice(&6_000u16.to_le_bytes()); // t_med = 60.00 C
-    t[10..12].copy_from_slice(&8_000u16.to_le_bytes()); // t_high = 80.00 C
-    t[12..14].copy_from_slice(&50u16.to_le_bytes()); // pwm_min
-    t[14..16].copy_from_slice(&128u16.to_le_bytes()); // pwm_med
-    t[16..18].copy_from_slice(&200u16.to_le_bytes()); // pwm_high
-    t[18..20].copy_from_slice(&9_500u16.to_le_bytes()); // t_max = 95.00 C
-    t[20] = 1; // fan_control_mode
-    t[21..23].copy_from_slice(&255u16.to_le_bytes()); // fan_pwm_max
-    t[31] = 80; // target_temperature (whole C)
-    t[51] = 1; // enable_zero_rpm
-    t[52] = 50; // fan_stop_temperature (whole C)
-    t[53] = 60; // fan_start_temperature (whole C)
-
-    let fan = match FanTable::parse(&t) {
-        Ok(f) => f,
-        Err(_) => return TestResult::Fail("FanTable parse rejected"),
-    };
-    if fan.rev_id != 9 {
-        return TestResult::Fail("rev_id");
-    }
-    if fan.t_min != 3_000 || fan.t_max != 9_500 {
-        return TestResult::Fail("temperature range");
-    }
-    if fan.pwm_min != 50 || fan.fan_pwm_max != 255 {
-        return TestResult::Fail("pwm values");
-    }
-    if fan.target_temperature != 80 || fan.fan_stop_temperature != 50 {
-        return TestResult::Fail("target/stop temps");
-    }
-    if fan.enable_zero_rpm != 1 {
-        return TestResult::Fail("zero_rpm");
-    }
-    // rev_id 11 rejected.
-    let mut bad = t.clone();
-    bad[4] = 11;
-    if !matches!(
-        FanTable::parse(&bad),
-        Err(PpSubtableError::UnsupportedRevision(11))
-    ) {
-        return TestResult::Fail("rev 11 should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_fan_table_round_trip);
-
-fn smoke_amdgpu_pptable_powertune_table_round_trip() -> TestResult {
-    use crate::amdgpu_pptable_subtables::{PowerTuneTable, PpSubtableError};
-    let mut t = alloc::vec![0u8; 0x40];
-    t[0..2].copy_from_slice(&0x40u16.to_le_bytes());
-    t[2] = 11;
-    t[3] = 0;
-    t[4] = 1; // rev_id
-              // TDP = 80 W = 640 (Q5.3).
-    t[5..7].copy_from_slice(&640u16.to_le_bytes());
-    t[7..9].copy_from_slice(&720u16.to_le_bytes()); // configurable_tdp = 90 W
-    t[9..11].copy_from_slice(&20_480u16.to_le_bytes()); // tdc = 80 A in Q8.8
-    t[21..23].copy_from_slice(&10_000u16.to_le_bytes()); // tj_max = 100.00 C
-    t[27..29].copy_from_slice(&10_500u16.to_le_bytes()); // shutdown = 105.00 C
-
-    let pt = match PowerTuneTable::parse(&t) {
-        Ok(p) => p,
-        Err(_) => return TestResult::Fail("PowerTuneTable parse rejected"),
-    };
-    if pt.tdp_watts() != 80 {
-        return TestResult::Fail("TDP watts conversion");
-    }
-    if pt.tj_max_celsius() != 100 {
-        return TestResult::Fail("TjMax celsius conversion");
-    }
-    if pt.software_shutdown_temp != 10_500 {
-        return TestResult::Fail("shutdown temp round-trip");
-    }
-    // rev_id 6 rejected (>5).
-    let mut bad = t.clone();
-    bad[4] = 6;
-    if !matches!(
-        PowerTuneTable::parse(&bad),
-        Err(PpSubtableError::UnsupportedRevision(6))
-    ) {
-        return TestResult::Fail("rev 6 should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu",
-    smoke_amdgpu_pptable_powertune_table_round_trip
-);
 
 fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     // Symmetric to the data-table directory smoke from Stage 3

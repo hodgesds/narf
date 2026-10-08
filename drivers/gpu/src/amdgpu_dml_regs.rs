@@ -99,6 +99,66 @@ pub struct Registers {
     pub ttu: ThrottleRegisters,
 }
 
+// Field widths from the `_MASK` definitions in `dcn_3_1_4_sh_mask.h`. Named
+// rather than written inline because the mechanism below only refuses what the
+// width says it should: a width that is too wide lets a value through for the
+// hardware to truncate silently, and one that is too narrow refuses a mode the
+// hardware would have accepted.
+//
+// LINUX-GAP: six of these were wrong before being read off the header.
+//
+//   ref_freq_to_pix_freq           was 23, mask 0x001FFFFF -> 21
+//   refcyc_per_htotal              was 24, mask 0x001FFFFF -> 21
+//   dst_y_per_row_vblank           was  7, mask 0x00003F00 -> 6
+//   vratio_prefetch                was 23, mask 0x003FFFFF -> 22
+//   refcyc_per_pte_group_vblank_l  was 13, mask 0x007FFFFF -> 23
+//   refcyc_per_req_delivery[_pre]  was 22, mask 0x007FFFFF -> 23
+//
+// The first four are too wide. `ref_freq_to_pix_freq` is the ratio every other
+// DLG value is scaled by, so a truncated one does not fail — it shifts the
+// whole latency schedule. The last two are too narrow: 13 bits against 23 is a
+// factor of a thousand, so `refcyc_per_pte_group_vblank_l` refused very nearly
+// every real configuration, and a mode that DML accepts came back `Unsupported`.
+
+/// `HUBPREQ0_REF_FREQ_TO_PIX_FREQ__REF_FREQ_TO_PIX_FREQ_MASK`.
+pub(crate) const W_REF_FREQ_TO_PIX_FREQ: u32 = 21;
+/// `HUBPREQ0_DST_DIMENSIONS__REFCYC_PER_HTOTAL_MASK`.
+pub(crate) const W_REFCYC_PER_HTOTAL: u32 = 21;
+/// `HUBPREQ0_BLANK_OFFSET_0__REFCYC_H_BLANK_END_MASK`.
+pub(crate) const W_REFCYC_H_BLANK_END: u32 = 13;
+/// `HUBPREQ0_BLANK_OFFSET_0__DLG_V_BLANK_END_MASK`.
+pub(crate) const W_DLG_VBLANK_END: u32 = 15;
+/// `HUBPREQ0_BLANK_OFFSET_1__MIN_DST_Y_NEXT_START_MASK`.
+pub(crate) const W_MIN_DST_Y_NEXT_START: u32 = 18;
+/// `HUBPREQ0_DST_AFTER_SCALER__REFCYC_X_AFTER_SCALER_MASK`.
+pub(crate) const W_REFCYC_X_AFTER_SCALER: u32 = 13;
+/// `HUBPREQ0_DST_AFTER_SCALER__DST_Y_AFTER_SCALER_MASK`.
+pub(crate) const W_DST_Y_AFTER_SCALER: u32 = 3;
+/// `HUBPREQ0_PREFETCH_SETTINGS__DST_Y_PREFETCH_MASK`.
+pub(crate) const W_DST_Y_PREFETCH: u32 = 8;
+/// `HUBPREQ0_PREFETCH_SETTINGS__VRATIO_PREFETCH_MASK`.
+pub(crate) const W_VRATIO_PREFETCH: u32 = 22;
+/// `HUBPREQ0_VBLANK_PARAMETERS_0__DST_Y_PER_VM_VBLANK_MASK`.
+pub(crate) const W_DST_Y_PER_VM_VBLANK: u32 = 7;
+/// `HUBPREQ0_VBLANK_PARAMETERS_0__DST_Y_PER_ROW_VBLANK_MASK` — six bits, one
+/// narrower than its neighbour in the same register.
+pub(crate) const W_DST_Y_PER_ROW_VBLANK: u32 = 6;
+/// `HUBPREQ0_NOM_PARAMETERS_0__DST_Y_PER_PTE_ROW_NOM_L_MASK`.
+pub(crate) const W_DST_Y_PER_PTE_ROW_NOM_L: u32 = 17;
+/// `HUBPREQ0_NOM_PARAMETERS_1__REFCYC_PER_PTE_GROUP_NOM_L_MASK`.
+pub(crate) const W_REFCYC_PER_PTE_GROUP_NOM_L: u32 = 23;
+/// `HUBPREQ0_VBLANK_PARAMETERS_1__REFCYC_PER_PTE_GROUP_VBLANK_L_MASK`.
+pub(crate) const W_REFCYC_PER_PTE_GROUP_VBLANK_L: u32 = 23;
+/// `HUBPREQ0_PER_LINE_DELIVERY[_PRE]__REFCYC_PER_LINE_DELIVERY[_PRE]_L_MASK`.
+pub(crate) const W_REFCYC_PER_LINE_DELIVERY: u32 = 13;
+/// `HUBPREQ0_DCN_GLOBAL_TTU_CNTL__MIN_TTU_VBLANK_MASK`.
+pub(crate) const W_MIN_TTU_VBLANK: u32 = 24;
+/// `HUBPREQ0_DCN_TTU_QOS_WM__QoS_LEVEL_HIGH_WM_MASK`.
+pub(crate) const W_QOS_LEVEL_WM: u32 = 14;
+/// `HUBPREQ0_DCN_SURF0_TTU_CNTL0__REFCYC_PER_REQ_DELIVERY_MASK` and its
+/// `_PRE` twin in CNTL1.
+pub(crate) const W_REFCYC_PER_REQ_DELIVERY: u32 = 23;
+
 /// Encode `value` into a field of `bits` whole bits with `frac` fractional bits,
 /// truncating toward zero as the hardware format does but refusing a value the
 /// field cannot represent.
@@ -295,34 +355,42 @@ impl Registers {
         let pte_row_lines = Fx::int(requests.dpte_row_height as i64).over(geometry.v_ratio);
         let groups_per_row = Fx::int(requests.dpte_groups_per_row_ub as i64);
         let dlg = LatencyRegisters {
-            ref_freq_to_pix_freq: field(ref_to_pix, 19, 23)?,
-            refcyc_per_htotal: field(ref_to_pix.times(Fx::int(h_total as i64)), 8, 24)?,
+            ref_freq_to_pix_freq: field(ref_to_pix, 19, W_REF_FREQ_TO_PIX_FREQ)?,
+            refcyc_per_htotal: field(
+                ref_to_pix.times(Fx::int(h_total as i64)),
+                8,
+                W_REFCYC_PER_HTOTAL,
+            )?,
             refcyc_h_blank_end: field(
                 ref_to_pix.times(Fx::int(config.timing.h_blank_end() as i64)),
                 0,
-                13,
+                W_REFCYC_H_BLANK_END,
             )?,
-            dlg_vblank_end: whole(config.timing.v_blank_end() as u64, 15)?,
-            min_dst_y_next_start: field(Fx::int(min_dst_y_next_start as i64), 2, 18)?,
+            dlg_vblank_end: whole(config.timing.v_blank_end() as u64, W_DLG_VBLANK_END)?,
+            min_dst_y_next_start: field(
+                Fx::int(min_dst_y_next_start as i64),
+                2,
+                W_MIN_DST_Y_NEXT_START,
+            )?,
             refcyc_x_after_scaler: field(
                 ref_to_pix.times(Fx::int(prefetch.dst_x_after_scaler as i64)),
                 0,
-                13,
+                W_REFCYC_X_AFTER_SCALER,
             )?,
-            dst_y_after_scaler: whole(prefetch.dst_y_after_scaler as u64, 3)?,
-            dst_y_prefetch: field(prefetch.dst_y_prefetch, 2, 8)?,
-            dst_y_per_vm_vblank: field(prefetch.dst_y_per_vm_vblank, 2, 7)?,
-            dst_y_per_row_vblank: field(prefetch.dst_y_per_row_vblank, 2, 7)?,
-            vratio_prefetch: field(prefetch.v_ratio_prefetch, 19, 23)?,
+            dst_y_after_scaler: whole(prefetch.dst_y_after_scaler as u64, W_DST_Y_AFTER_SCALER)?,
+            dst_y_prefetch: field(prefetch.dst_y_prefetch, 2, W_DST_Y_PREFETCH)?,
+            dst_y_per_vm_vblank: field(prefetch.dst_y_per_vm_vblank, 2, W_DST_Y_PER_VM_VBLANK)?,
+            dst_y_per_row_vblank: field(prefetch.dst_y_per_row_vblank, 2, W_DST_Y_PER_ROW_VBLANK)?,
+            vratio_prefetch: field(prefetch.v_ratio_prefetch, 19, W_VRATIO_PREFETCH)?,
             vready_after_vcount0,
-            dst_y_per_pte_row_nom_l: field(pte_row_lines, 2, 17)?,
+            dst_y_per_pte_row_nom_l: field(pte_row_lines, 2, W_DST_Y_PER_PTE_ROW_NOM_L)?,
             refcyc_per_pte_group_nom_l: field(
                 pte_row_lines
                     .times(Fx::int(h_total as i64))
                     .times(ref_to_pix)
                     .over(groups_per_row),
                 0,
-                23,
+                W_REFCYC_PER_PTE_GROUP_NOM_L,
             )?,
             refcyc_per_pte_group_vblank_l: field(
                 prefetch
@@ -331,10 +399,14 @@ impl Registers {
                     .times(ref_to_pix)
                     .over(groups_per_row),
                 0,
-                13,
+                W_REFCYC_PER_PTE_GROUP_VBLANK_L,
             )?,
-            refcyc_per_line_delivery_l: field(line_delivery, 0, 13)?,
-            refcyc_per_line_delivery_pre_l: field(line_delivery_pre, 0, 13)?,
+            refcyc_per_line_delivery_l: field(line_delivery, 0, W_REFCYC_PER_LINE_DELIVERY)?,
+            refcyc_per_line_delivery_pre_l: field(
+                line_delivery_pre,
+                0,
+                W_REFCYC_PER_LINE_DELIVERY,
+            )?,
             // The delta-DRQ limit is disabled, and the cursor handles keep
             // DML's fixed values even with no cursor surface programmed.
             dst_y_delta_drq_limit: 0x7fff,
@@ -352,16 +424,16 @@ impl Registers {
             ),
         );
         let ttu = ThrottleRegisters {
-            min_ttu_vblank: field(min_ttu_vblank.times(refclk), 0, 24)?,
+            min_ttu_vblank: field(min_ttu_vblank.times(refclk), 0, W_MIN_TTU_VBLANK)?,
             qos_level_low_wm: 0,
             qos_level_high_wm: field(
                 Fx::int(4).times(Fx::int(h_total as i64)).times(ref_to_pix),
                 0,
-                14,
+                W_QOS_LEVEL_WM,
             )?,
             qos_level_flip: 14,
-            refcyc_per_req_delivery_l: field(req_delivery, 10, 22)?,
-            refcyc_per_req_delivery_pre_l: field(req_delivery_pre, 10, 22)?,
+            refcyc_per_req_delivery_l: field(req_delivery, 10, W_REFCYC_PER_REQ_DELIVERY)?,
+            refcyc_per_req_delivery_pre_l: field(req_delivery_pre, 10, W_REFCYC_PER_REQ_DELIVERY)?,
             qos_level_fixed_l: 8,
             qos_ramp_disable_l: 0,
         };
