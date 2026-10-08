@@ -37,14 +37,17 @@
 //!   (lines 119-131) — VMID base addr write.
 //! - Linux `drivers/gpu/drm/amd/amdgpu/gfxhub_v3_0.c::gfxhub_v3_0_init_gart_aperture_regs`
 //!   (lines 133-148) — START/END addr write for VMID 0 (GART).
-//! - Linux `drivers/gpu/drm/amd/amdgpu/mmhub_v3_0.c::mmhub_v3_0_setup_vm_pt_regs`
-//!   (lines 136-149) — MMHUB v3.0 (Phoenix) equivalent.
+//! - Linux `drivers/gpu/drm/amd/amdgpu/mmhub_v3_0_1.c::mmhub_v3_0_1_setup_vm_pt_regs`
+//!   (lines 135-148) — MMHUB v3.0.1 (Phoenix) equivalent. `gmc_v11_0.c:578`
+//!   selects `mmhub_v3_0_1_funcs` for this version.
 //! - Linux `drivers/gpu/drm/amd/include/asic_reg/gc/gc_11_0_0_offset.h`
 //!   — Phoenix GC11 register offsets.
 //! - Linux `drivers/gpu/drm/amd/include/asic_reg/gc/gc_10_3_0_offset.h`
 //!   — Renoir GC10.3 register offsets.
-//! - Linux `drivers/gpu/drm/amd/include/asic_reg/mmhub/mmhub_3_0_0_offset.h`
-//!   — Phoenix MMHUB v3.0 register offsets.
+//! - Linux `drivers/gpu/drm/amd/include/asic_reg/mmhub/mmhub_3_0_1_offset.h`
+//!   — Phoenix MMHUB v3.0.1 register offsets. This, not `mmhub_3_0_0_offset.h`:
+//!   the two agree on every offset below but not on the base index, and 3.0.1
+//!   is what `mmhub_v3_0_1.c` includes.
 //! - Linux `drivers/gpu/drm/amd/include/asic_reg/mmhub/mmhub_2_3_0_offset.h`
 //!   — Renoir MMHUB v2.3 register offsets.
 //!
@@ -138,7 +141,11 @@ pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
 // regMMVM_INVALIDATE_ENG0_REQ = 0x0763
 // regMMVM_INVALIDATE_ENG0_ACK = 0x0775
 //
-// MMHUB is BASE_IDX 1 on this generation too, not just on v2.3.
+// MMHUB is BASE_IDX 1 on this generation too, not just on v2.3 — per
+// `mmhub_3_0_1_offset.h`, which is the header `mmhub_v3_0_1.c` includes for
+// Phoenix. `mmhub_3_0_0_offset.h` repeats all of the offsets above but puts
+// them on BASE_IDX 0, and `mmhub_3_0_2_offset.h` moves `regMMVM_CONTEXT0_CNTL`
+// to 0x06c0, so neither window may be substituted for this one.
 
 pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_pt_base_lo: 0x07ab,

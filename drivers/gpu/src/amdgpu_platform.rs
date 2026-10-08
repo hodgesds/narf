@@ -66,31 +66,92 @@ impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenToc {
     }
 }
 
+// ── The boot-inventory register windows ───────────────────────────────────
+//
+// `amdgpu_psp_ring::bank`'s fourth argument indexes `ip.base_addrs`, so it is
+// the register's SOC15 `_BASE_IDX` — a property of the REGISTER, not of the IP
+// block or of its instance. The fifth is the highest dword this file reads
+// through that base, which `bank` bounds-checks against the BAR.
+//
+// DCN: every HUBP / HUBPREQ / CURSOR register read below is `_BASE_IDX 2` in
+// `dcn/dcn_3_1_4_offset.h`.
+const DCN_BASE_IDX: usize = 2;
+/// `regCURSOR0_3_CURSOR_SIZE` = 0x090f — highest dword `scan_surfaces` reads
+/// (`regCURSOR0_0_CURSOR_SIZE` 0x067b + 3 × `HUBP_PIPE_STRIDE`).
+const CURSOR0_3_CURSOR_SIZE: u32 = 0x090f;
+/// `regHUBP3_DCHUBP_CNTL` = 0x0887 — highest hub dword `free_pipe` reads.
+const HUBP3_DCHUBP_CNTL: u32 = 0x0887;
+/// `regOTG3_OTG_CONTROL` = 0x1cc1 — highest timing-generator dword `free_pipe`
+/// reads.
+const OTG3_OTG_CONTROL: u32 = 0x1cc1;
+
+// GC: `gc/gc_11_0_0_offset.h` serves every GC 11.0.x — `gfx_v11_0.c` includes
+// it unconditionally — and puts `regGCVM_CONTEXT0_CNTL` at 0x1688 on
+// `_BASE_IDX 0`.
+const GC_BASE_IDX: usize = 0;
+const GCVM_CONTEXT0_CNTL: u32 = 0x1688;
+
+// MMHUB: Phoenix is MMHUB 3.0.1. Linux `gmc_v11_0.c:578` selects
+// `mmhub_v3_0_1_funcs` for that version, and `mmhub_v3_0_1.c:27` includes
+// `mmhub/mmhub_3_0_1_offset.h`, where `regMMVM_CONTEXT0_CNTL` is 0x0740 with
+// `_BASE_IDX` **1**.
+//
+// The three MMHUB 3.0.x headers share no window, so no single (base index,
+// offset) pair can serve all three: 3.0.0 puts the same 0x0740 on
+// `_BASE_IDX 0`, while 3.0.2 moves the register to 0x06c0. This accepted all
+// three against `_BASE_IDX 0` + 0x0740 — the wrong segment on the hardware we
+// target and the wrong register on 3.0.2 — so the sixteen reads landed
+// somewhere unrelated and the handoff either refused a quiescent GPU or
+// admitted a live VM context, on whatever bit 0 those dwords happened to
+// carry. `amdgpu_vmhub_regs` already records that this generation's MMHUB is
+// BASE_IDX 1; only the version whose window this is gets accepted here.
+const MMHUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 0, 1)];
+const MMHUB_BASE_IDX: usize = 1;
+const MMVM_CONTEXT0_CNTL: u32 = 0x0740;
+
+/// Both hubs carry sixteen VM contexts one dword apart
+/// (`regGCVM_CONTEXT1_CNTL` 0x1689, `regMMVM_CONTEXT1_CNTL` 0x0741), each with
+/// `ENABLE_CONTEXT` in bit 0.
+const VM_CONTEXTS: u32 = 16;
+const VM_CONTEXT_ENABLE: u32 = 1 << 0;
+
 /// Production boot has not initialized GFX/GART or other driver VRAM clients.
 /// Reject live VM contexts rather than guessing the size of inherited tables.
 fn inventory(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Result<Vec<Range<u64>>, Error> {
     use crate::amdgpu_discovery as ip;
-    let dcn = crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_DCN, &[(3, 1, 4)], 2, 0x90f)
-        .map_err(Error::Psp)?;
-    let gc = crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_GC, &[(11, 0, 1), (11, 0, 4)], 0, 0x1697)
-        .map_err(Error::Psp)?;
+    let dcn = crate::amdgpu_psp_ring::bank(
+        gpu,
+        ip::HW_ID_DCN,
+        &[(3, 1, 4)],
+        DCN_BASE_IDX,
+        CURSOR0_3_CURSOR_SIZE,
+    )
+    .map_err(Error::Psp)?;
+    let gc = crate::amdgpu_psp_ring::bank(
+        gpu,
+        ip::HW_ID_GC,
+        &[(11, 0, 1), (11, 0, 4)],
+        GC_BASE_IDX,
+        GCVM_CONTEXT0_CNTL + VM_CONTEXTS - 1,
+    )
+    .map_err(Error::Psp)?;
     let hub = crate::amdgpu_psp_ring::bank(
         gpu,
         ip::HW_ID_MMHUB,
-        &[(3, 0, 0), (3, 0, 1), (3, 0, 2)],
-        0,
-        0x74f,
+        MMHUB_VERSIONS,
+        MMHUB_BASE_IDX,
+        MMVM_CONTEXT0_CNTL + VM_CONTEXTS - 1,
     )
     .map_err(Error::Psp)?;
     if gpu.fw_loaded || gpu.mode.is_some() {
         return Err(Error::Busy);
     }
     cap.invoke(Op(|| {
-        for (base, first) in [(gc, 0x1688), (hub, 0x740)] {
-            for index in 0..16 {
+        for (base, first) in [(gc, GCVM_CONTEXT0_CNTL), (hub, MMVM_CONTEXT0_CNTL)] {
+            for index in 0..u64::from(VM_CONTEXTS) {
                 // SAFETY: exact IP bank and entire context array bounded above.
-                let value = unsafe { gpu.regs.read32(base + (first + index) * 4) };
-                if value == u32::MAX || value & 1 != 0 {
+                let value = unsafe { gpu.regs.read32(base + (u64::from(first) + index) * 4) };
+                if value == u32::MAX || value & VM_CONTEXT_ENABLE != 0 {
                     return Err(Error::Busy);
                 }
             }
@@ -100,6 +161,61 @@ fn inventory(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Result<Vec<Range<u
     }))
     .map_err(|_| Error::Revoked)?
 }
+// The inherited-scanout window. Every id below is `_BASE_IDX 2` in
+// `dcn/dcn_3_1_4_offset.h`, and every mask is the one `dcn_3_1_4_sh_mask.h`
+// gives for the named field:
+//
+//   regHUBP0_DCSURF_SURFACE_CONFIG            0x05e5  SURFACE_PIXEL_FORMAT 0x7f
+//   regHUBP0_DCSURF_TILING_CONFIG             0x05e7  SW_MODE              0x1f
+//   regHUBP0_DCSURF_PRI_VIEWPORT_START        0x05e9  X/Y_START          0x3fff
+//   regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION    0x05ea  WIDTH/HEIGHT       0x3fff
+//   regHUBP0_DCHUBP_CNTL                      0x05f3  HUBP_BLANK_EN         0x1
+//   regHUBPREQ0_DCSURF_SURFACE_PITCH          0x0607  PITCH              0x3fff
+//   regHUBPREQ0_VMID_SETTINGS_0               0x0609  VMID                  0xf
+//   regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS        0x060a  (+1 = _HIGH)
+//   regHUBPREQ0_DCSURF_SECONDARY_SURFACE_ADDRESS      0x060e  (+1 = _HIGH)
+//   regHUBPREQ0_DCSURF_SURFACE_CONTROL        0x061a
+//   regHUBPREQ0_DCSURF_SURFACE_INUSE          0x0621  (+1 = _HIGH)
+//   regHUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE 0x0625  (+1 = _HIGH)
+//   regCURSOR0_0_CURSOR_CONTROL               0x0678
+//   regCURSOR0_0_CURSOR_SURFACE_ADDRESS       0x0679  (+1 = _HIGH)
+//   regCURSOR0_0_CURSOR_SIZE                  0x067b  HEIGHT/WIDTH       0x1ff
+//
+// `_ADDRESS_HIGH` is 0x0000ffff wide on both the surface and the cursor, so a
+// high half with anything above bit 15 set is not an address this GPU wrote.
+const SURFACE_CONFIG: u32 = 0x05e5;
+const TILING_CONFIG: u32 = 0x05e7;
+const PRI_VIEWPORT_START: u32 = 0x05e9;
+const PRI_VIEWPORT_DIMENSION: u32 = 0x05ea;
+const VMID_SETTINGS_0: u32 = 0x0609;
+const SURFACE_CONTROL: u32 = 0x061a;
+const SURFACE_INUSE: u32 = 0x0621;
+const SURFACE_EARLIEST_INUSE: u32 = 0x0625;
+const SECONDARY_SURFACE_ADDRESS: u32 = 0x060e;
+const CURSOR_CONTROL: u32 = 0x0678;
+const CURSOR_SURFACE_ADDRESS: u32 = 0x0679;
+const CURSOR_SIZE: u32 = 0x067b;
+
+const SURFACE_PIXEL_FORMAT: u32 = 0x7f;
+const SW_MODE: u32 = 0x1f;
+/// `PRIMARY_SURFACE_TMZ` | `PRIMARY_SURFACE_DCC_EN` |
+/// `SECONDARY_SURFACE_TMZ` | `SECONDARY_SURFACE_DCC_EN`. With DCC off there is
+/// no metadata surface to account for.
+const SURFACE_PROTECTED_OR_COMPRESSED: u32 = 0x0303;
+const VMID: u32 = 0xf;
+const VIEWPORT_COORD: u32 = 0x3fff;
+const PITCH: u32 = 0x3fff;
+const ADDRESS_HIGH: u32 = 0xffff;
+const CURSOR_ENABLE: u32 = 1 << 0;
+/// `CURSOR_MODE` is 0x00000700 — three bits at 8.
+const CURSOR_MODE: u32 = 0x7;
+const CURSOR_MODE_SHIFT: u32 = 8;
+const CURSOR_TMZ: u32 = 1 << 12;
+/// `CURSOR_PITCH` is 0x00030000 — two bits at 16, encoding 64 << n.
+const CURSOR_PITCH: u32 = 0x3;
+const CURSOR_PITCH_SHIFT: u32 = 16;
+const CURSOR_DIM: u32 = 0x1ff;
+
 fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Error> {
     let mut ranges = Vec::new();
     let mut read = |reg| {
@@ -110,42 +226,59 @@ fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Er
             Ok(v)
         }
     };
-    for index in 0..4 {
-        let delta = index * 0xdc;
-        if read(0x5f3 + delta)? & 1 == 0 {
+    for index in 0..u32::from(crate::amdgpu_dcn::DCN_PIPES) {
+        let delta = index * crate::amdgpu_dcn::HUBP_PIPE_STRIDE;
+        if read(crate::amdgpu_dcn::HUBP0_DCHUBP_CNTL + delta)? & crate::amdgpu_dcn::HUBP_BLANK_FORCE
+            == 0
+        {
             // Only packed, linear RGB is a bounded inherited scanout here.
             // Reject DCC/YUV/stereo/VM surfaces instead of overlooking metadata.
-            let format = read(0x5e5 + delta)? & 0x7f;
+            //
+            // `hubp1_program_pixel_format` in Linux
+            // `display/dc/hubp/dcn10/dcn10_hubp.c` is the encoding: 1 ARGB1555
+            // and 3 RGB565 are two bytes, 8 A*GB8888 and 10 A*GB2101010 four,
+            // 24 ARGB16161616F and 26 ARGB16161616_UNORM eight. 12
+            // (AYCrCb8888), 65..=67 (420 YCbCr/YCrCb) and 112..=119 are the
+            // YUV and packed-float formats this handoff will not size.
+            let format = read(SURFACE_CONFIG + delta)? & SURFACE_PIXEL_FORMAT;
             let bpp = match format {
                 1 | 3 => 2,
                 8 | 10 => 4,
                 24 | 26 => 8,
                 _ => return Err(Error::Unsupported),
             };
-            if read(0x5e7 + delta)? & 0x1f != 0
-                || read(0x61a + delta)? & 0x303 != 0
-                || read(0x609 + delta)? & 0xf != 0
+            if read(TILING_CONFIG + delta)? & SW_MODE != 0
+                || read(SURFACE_CONTROL + delta)? & SURFACE_PROTECTED_OR_COMPRESSED != 0
+                || read(VMID_SETTINGS_0 + delta)? & VMID != 0
             {
                 return Err(Error::Unsupported);
             }
-            let viewport = read(0x5ea + delta)?;
-            let start = read(0x5e9 + delta)?;
-            let pitch = (read(0x607 + delta)? & 0x3fff) + 1;
-            let rows = ((start >> 16) & 0x3fff) + ((viewport >> 16) & 0x3fff);
+            let viewport = read(PRI_VIEWPORT_DIMENSION + delta)?;
+            let start = read(PRI_VIEWPORT_START + delta)?;
+            let pitch =
+                (read(crate::amdgpu_dcn::HUBPREQ0_DCSURF_SURFACE_PITCH + delta)? & PITCH) + 1;
+            let rows = ((start >> 16) & VIEWPORT_COORD) + ((viewport >> 16) & VIEWPORT_COORD);
             if rows == 0
-                || (viewport & 0x3fff) == 0
-                || (start & 0x3fff) + (viewport & 0x3fff) > pitch
+                || (viewport & VIEWPORT_COORD) == 0
+                || (start & VIEWPORT_COORD) + (viewport & VIEWPORT_COORD) > pitch
             {
                 return Err(Error::Invalid);
             }
             let size = pitch as u64 * rows as u64 * bpp;
-            // Include programmed, latched and earliest-in-use surfaces: a
-            // boot-time flip can still be draining its previous allocation.
+            // Include the programmed primary and secondary surfaces and both
+            // in-use reports: a boot-time flip can still be draining its
+            // previous allocation. The secondary surface is the stereo right
+            // eye, which shares the primary's pitch and so its size.
             let before = ranges.len();
-            for reg in [0x60a, 0x60e, 0x621, 0x625] {
+            for reg in [
+                crate::amdgpu_dcn::HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS,
+                SECONDARY_SURFACE_ADDRESS,
+                SURFACE_INUSE,
+                SURFACE_EARLIEST_INUSE,
+            ] {
                 let low = read(reg + delta)?;
                 let high = read(reg + 1 + delta)?;
-                if high & !0xffff != 0 {
+                if high & !ADDRESS_HIGH != 0 {
                     return Err(Error::Invalid);
                 }
                 let address = low as u64 | (high as u64) << 32;
@@ -157,20 +290,26 @@ fn scan_surfaces(mut read: impl FnMut(u32) -> u32) -> Result<Vec<Range<u64>>, Er
                 return Err(Error::Invalid);
             }
         }
-        let control = read(0x678 + delta)?;
-        if control & 1 != 0 {
-            let mode = (control >> 8) & 7;
-            if !matches!(mode, 1..=3) || control & 0x1000 != 0 {
+        let control = read(CURSOR_CONTROL + delta)?;
+        if control & CURSOR_ENABLE != 0 {
+            // `CURSOR_MODE` 1..=3 are the 32-bit-per-pixel formats
+            // (`COLOR_1BIT_AND`, `COLOR_PRE_MULTIPLIED_ALPHA`,
+            // `COLOR_UN_PRE_MULTIPLIED_ALPHA` in Linux `dc/dc_hw_types.h`);
+            // 0 is mono and 4..=5 are the 64-bit float ones, none of which the
+            // four-bytes-per-pixel size below would describe.
+            let mode = (control >> CURSOR_MODE_SHIFT) & CURSOR_MODE;
+            if !matches!(mode, 1..=3) || control & CURSOR_TMZ != 0 {
                 return Err(Error::Unsupported);
             }
-            let size = read(0x67b + delta)?;
-            let rows = size & 0x1ff;
-            let width = (size >> 16) & 0x1ff;
-            let pitch = 64u64 << ((control >> 16) & 3);
+            let size = read(CURSOR_SIZE + delta)?;
+            let rows = size & CURSOR_DIM;
+            let width = (size >> 16) & CURSOR_DIM;
+            let pitch = 64u64 << ((control >> CURSOR_PITCH_SHIFT) & CURSOR_PITCH);
             if rows == 0 || width == 0 || width as u64 > pitch || pitch > 256 {
                 return Err(Error::Invalid);
             }
-            let address = read(0x679 + delta)? as u64 | (read(0x67a + delta)? as u64) << 32;
+            let address = read(CURSOR_SURFACE_ADDRESS + delta)? as u64
+                | (read(CURSOR_SURFACE_ADDRESS + 1 + delta)? as u64) << 32;
             ranges.push(
                 address
                     ..address
@@ -281,7 +420,9 @@ fn idle_pipe(mut state: impl FnMut(u8) -> (u32, u32)) -> Option<u8> {
         if blank == u32::MAX || master == u32::MAX {
             return None;
         }
-        if blank & 1 != 0 && master & 1 == 0 {
+        if blank & crate::amdgpu_dcn::HUBP_BLANK_FORCE != 0
+            && master & crate::amdgpu_dcn::OTG_MASTER_EN == 0
+        {
             return Some(pipe);
         }
     }
@@ -289,15 +430,32 @@ fn idle_pipe(mut state: impl FnMut(u8) -> (u32, u32)) -> Option<u8> {
 }
 fn free_pipe(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Option<u8> {
     use crate::amdgpu_discovery as ip;
-    let hubp = crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_DCN, &[(3, 1, 4)], 2, 0x8c7).ok()?;
-    let otg = crate::amdgpu_psp_ring::bank(gpu, ip::HW_ID_DCN, &[(3, 1, 4)], 2, 0x1cc1).ok()?;
+    let hubp = crate::amdgpu_psp_ring::bank(
+        gpu,
+        ip::HW_ID_DCN,
+        &[(3, 1, 4)],
+        DCN_BASE_IDX,
+        HUBP3_DCHUBP_CNTL,
+    )
+    .ok()?;
+    let otg = crate::amdgpu_psp_ring::bank(
+        gpu,
+        ip::HW_ID_DCN,
+        &[(3, 1, 4)],
+        DCN_BASE_IDX,
+        OTG3_OTG_CONTROL,
+    )
+    .ok()?;
     cap.invoke(Op(|| {
         idle_pipe(|pipe| {
+            use crate::amdgpu_dcn as dcn;
+            let hub_reg = dcn::for_pipe(dcn::HUBP0_DCHUBP_CNTL, pipe, dcn::HUBP_PIPE_STRIDE);
+            let otg_reg = dcn::for_pipe(dcn::OTG0_OTG_CONTROL, pipe, dcn::OTG_PIPE_STRIDE);
             // SAFETY: both banks are bounded above for all four instances.
             unsafe {
                 (
-                    gpu.regs.read32(hubp + (0x5f3 + pipe as u64 * 0xdc) * 4),
-                    gpu.regs.read32(otg + (0x1b41 + pipe as u64 * 0x80) * 4),
+                    gpu.regs.read32(hubp + u64::from(hub_reg) * 4),
+                    gpu.regs.read32(otg + u64::from(otg_reg) * 4),
                 )
             }
         })
@@ -617,6 +775,67 @@ mod tests {
         }
         regs
     }
+    /// Every value here is read off the AMD header, never off the constant it
+    /// checks: `dcn/dcn_3_1_4_offset.h`, `gc/gc_11_0_0_offset.h` and
+    /// `mmhub/mmhub_3_0_1_offset.h`.
+    fn platform_register_windows_match_the_amd_headers() -> TestResult {
+        use crate::amdgpu_dcn as dcn;
+        let last = dcn::DCN_PIPES - 1;
+        // regHUBP0_DCHUBP_CNTL 0x05f3 _BASE_IDX 2; regCURSOR0_0_CURSOR_SIZE
+        // 0x067b and regCURSOR0_3_CURSOR_SIZE 0x090f share that base.
+        if DCN_BASE_IDX != 2 {
+            return TestResult::Fail("DCN 3.1.4 puts HUBP/HUBPREQ/CURSOR on BASE_IDX 2");
+        }
+        if CURSOR_SIZE != 0x067b
+            || CURSOR0_3_CURSOR_SIZE != 0x090f
+            || dcn::for_pipe(CURSOR_SIZE, last, dcn::HUBP_PIPE_STRIDE) != CURSOR0_3_CURSOR_SIZE
+        {
+            return TestResult::Fail("the surface scan's upper bound is not CURSOR0_3_CURSOR_SIZE");
+        }
+        // regHUBP3_DCHUBP_CNTL 0x0887, regOTG3_OTG_CONTROL 0x1cc1.
+        if HUBP3_DCHUBP_CNTL != 0x0887
+            || dcn::for_pipe(dcn::HUBP0_DCHUBP_CNTL, last, dcn::HUBP_PIPE_STRIDE)
+                != HUBP3_DCHUBP_CNTL
+        {
+            return TestResult::Fail("the pipe scan's hub bound is not HUBP3_DCHUBP_CNTL");
+        }
+        if OTG3_OTG_CONTROL != 0x1cc1
+            || dcn::for_pipe(dcn::OTG0_OTG_CONTROL, last, dcn::OTG_PIPE_STRIDE) != OTG3_OTG_CONTROL
+        {
+            return TestResult::Fail("the pipe scan's timing bound is not OTG3_OTG_CONTROL");
+        }
+        // regGCVM_CONTEXT0_CNTL 0x1688 _BASE_IDX 0, regGCVM_CONTEXT15_CNTL
+        // 0x1697.
+        if GC_BASE_IDX != 0 || GCVM_CONTEXT0_CNTL != 0x1688 {
+            return TestResult::Fail("GC 11.0.x puts GCVM_CONTEXT0_CNTL at 0x1688 on BASE_IDX 0");
+        }
+        if VM_CONTEXTS != 16 || GCVM_CONTEXT0_CNTL + VM_CONTEXTS - 1 != 0x1697 {
+            return TestResult::Fail("GCVM_CONTEXT15_CNTL is 0x1697");
+        }
+        // regMMVM_CONTEXT0_CNTL 0x0740 _BASE_IDX 1, regMMVM_CONTEXT15_CNTL
+        // 0x074f. `mmhub_3_0_0_offset.h` repeats those offsets on BASE_IDX 0
+        // and `mmhub_3_0_2_offset.h` moves the register to 0x06c0, so a window
+        // that serves 3.0.1 serves neither of the others.
+        if MMHUB_BASE_IDX != 1 || MMVM_CONTEXT0_CNTL != 0x0740 {
+            return TestResult::Fail("MMHUB 3.0.1 puts MMVM_CONTEXT0_CNTL at 0x0740 on BASE_IDX 1");
+        }
+        if MMVM_CONTEXT0_CNTL + VM_CONTEXTS - 1 != 0x074f {
+            return TestResult::Fail("MMVM_CONTEXT15_CNTL is 0x074f");
+        }
+        if MMHUB_VERSIONS != [(3, 0, 1)] {
+            return TestResult::Fail("only MMHUB 3.0.1 has this register window");
+        }
+        // GCVM_CONTEXT0_CNTL__ENABLE_CONTEXT and
+        // MMVM_CONTEXT0_CNTL__ENABLE_CONTEXT are both 0x00000001.
+        if VM_CONTEXT_ENABLE != 0x1 {
+            return TestResult::Fail("ENABLE_CONTEXT is bit 0 on both hubs");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/vram",
+        platform_register_windows_match_the_amd_headers
+    );
     fn platform_inventory_retains_latched_surfaces_and_cursor() -> TestResult {
         let mut regs = registers();
         regs[0x5f3] = 0;
