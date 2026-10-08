@@ -14,6 +14,18 @@ use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // OTG instance block, stride 0x80.
+/// The DCN versions these offsets describe. One entry, and widening it is not
+/// the way to add a display generation: nine of the twenty-three registers
+/// below move on DCN 3.5 (`dcn_3_5_0_offset.h`) — `OTG_V_BLANK_START_END`
+/// 0x1b36→0x1b38, `OTG_V_SYNC_A` 0x1b37→0x1b39, `OTG_V_SYNC_A_CNTL`
+/// 0x1b38→0x1b3a, `OTG_CONTROL` 0x1b41→0x1b43, `OTG_CLOCK_CONTROL`
+/// 0x1b85→0x1b84, `OTG_VSTARTUP_PARAM`, `OTG_VUPDATE_PARAM` and
+/// `OTG_VREADY_PARAM` each down one, and `VTG0_CONTROL` 0x052d→0x0537.
+/// Another generation needs its own offset table, selected per version the way
+/// `amdgpu_platform::SURFACE_WINDOWS` does it; `amdgpu_dcn` already carries the
+/// DCN 3.5 OTG ids for the modeset scaffold.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const OTG_H_TOTAL: u64 = 0x1b2a;
 const OTG_H_BLANK_START_END: u64 = 0x1b2b;
 const OTG_H_SYNC_A: u64 = 0x1b2c;
@@ -312,7 +324,7 @@ impl Otg {
             return Err(Error::Invalid);
         }
         let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, LAST_REG)
+            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 2, LAST_REG)
                 .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine {
             io: Mmio {

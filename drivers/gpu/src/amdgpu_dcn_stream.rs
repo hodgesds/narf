@@ -14,6 +14,14 @@ use crate::{
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+/// The DCN versions these offsets describe. Twelve of the fourteen registers
+/// below move on DCN 3.5 (`dcn_3_5_0_offset.h`): the whole DP stream-encoder
+/// block shifts up 0x16 dwords, `DP_PIXEL_FORMAT` 0x2109→0x211f through
+/// `DP_MSA_TIMING_PARAM4` 0x214f→0x2165. Another generation needs its own
+/// offset table, selected per version the way
+/// `amdgpu_platform::SURFACE_WINDOWS` does it.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const DP_PIXEL_FORMAT: u64 = 0x2109;
 const DP_MSA_COLORIMETRY: u64 = 0x210a;
 const DP_VID_STREAM_CNTL: u64 = 0x210c;
@@ -300,7 +308,7 @@ impl Stream {
             return Err(Error::Invalid);
         }
         let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, LAST_REG)
+            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 2, LAST_REG)
                 .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine {
             io: Mmio {

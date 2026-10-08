@@ -12,6 +12,19 @@ use core::future::Future;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+/// The DCN versions this module drives. Unusually, every offset below is
+/// identical on DCN 3.5 at the same base index 1 — `DPSTREAMCLK_CNTL` 0x004a,
+/// `DTBCLK_P_CNTL` 0x0068, `DENTIST_DISPCLK_CNTL` 0x0064,
+/// `OTG_PIXEL_RATE_DIV` 0x006f, `DPPCLK0_DTO_PARAM` 0x0099 and
+/// `DPPCLK_DTO_CTRL` 0x00b6 all match — so this table is portable where the
+/// other DCN modules' are not.
+///
+/// The entry is still one, because the SEQUENCE is not portable: this follows
+/// `dcn314_dccg.c`, and DCN 3.5 has its own `dcn35_dccg.c` with different root
+/// clock gating and DTBCLK handling. Matching register ids are not a licence to
+/// drive another generation; check the sequencer before adding a row.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const DPSTREAMCLK_CNTL: u64 = 0x004a;
 const DTBCLK_P_CNTL: u64 = 0x0068;
 const DENTIST_DISPCLK_CNTL: u64 = 0x0064;
@@ -207,7 +220,7 @@ impl Dccg {
     /// and must not let another client reprogram the same dividers.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
         let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 1, LAST_REG)
+            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 1, LAST_REG)
                 .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine {
             io: Mmio {

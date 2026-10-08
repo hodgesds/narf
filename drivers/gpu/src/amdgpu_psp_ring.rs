@@ -22,6 +22,17 @@ const DESTROY: u32 = 3 << 16;
 const COMMAND: u64 = 4096;
 const FENCE: u64 = 8192;
 const BUFFER_SIZE: u64 = 12288;
+/// `regDCN_VM_FB_LOCATION_BASE` / `_TOP` / `_OFFSET`, dwords 0x0475..0x0477 at
+/// DCN base index 2 — where the hub believes the frame buffer is.
+const DCN_VM_FB_LOCATION_BASE: u64 = 0x0475;
+const DCN_VM_FB_OFFSET: u32 = 0x0477;
+/// The DCN versions this three-register window describes. All three ids and
+/// their base index are identical on DCN 3.5 (`dcn_3_5_0_offset.h`), so unlike
+/// the other DCN windows in this driver this one is portable and a row may be
+/// added without a second table. The constructor's real gate is PSP: MP0 is
+/// pinned to 13.0.4 below, and a DCN 3.5 part pairs with 13.0.11.
+const DCN_FB_LOCATION_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const HDP_HOLE: u64 = 0x7f000;
 const MAX_IMAGE: usize = 16 * 1024 * 1024;
 
@@ -416,15 +427,21 @@ impl Psp {
         if gpu.regs.len < HDP_HOLE + 4096 {
             return Err(Error::Invalid);
         }
-        let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, 0x477)?;
+        let dcn = bank(
+            gpu,
+            discovery::HW_ID_DCN,
+            DCN_FB_LOCATION_VERSIONS,
+            2,
+            DCN_VM_FB_OFFSET,
+        )?;
         let (base, top, offset) = authority
             .invoke(Op(|| {
                 // SAFETY: constructor bounds the discovered DCN bank.
                 unsafe {
                     (
-                        gpu.regs.read32(dcn + 0x475 * 4),
-                        gpu.regs.read32(dcn + 0x476 * 4),
-                        gpu.regs.read32(dcn + 0x477 * 4),
+                        gpu.regs.read32(dcn + DCN_VM_FB_LOCATION_BASE * 4),
+                        gpu.regs.read32(dcn + (DCN_VM_FB_LOCATION_BASE + 1) * 4),
+                        gpu.regs.read32(dcn + u64::from(DCN_VM_FB_OFFSET) * 4),
                     )
                 }
             }))

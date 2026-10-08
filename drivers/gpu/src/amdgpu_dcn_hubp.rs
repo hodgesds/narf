@@ -15,6 +15,16 @@ use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // HUBP block, stride 0xdc.
+/// The DCN versions these offsets describe. Seventeen of the thirty registers
+/// below move on DCN 3.5 (`dcn_3_5_0_offset.h`): the whole HUBPREQ pacing block
+/// shifts down one dword, from `DCN_EXPANSION_MODE` 0x0629→0x0628 through
+/// `REF_FREQ_TO_PIX_FREQ` 0x065d→0x065c, because 3.1.4's
+/// `DCSURF_SURFACE_FLIP_INTERRUPT` is gone. A HUBP programmed with a
+/// neighbouring generation's deadline ids underflows, so another generation
+/// needs its own offset table, selected per version the way
+/// `amdgpu_platform::SURFACE_WINDOWS` does it.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const DCSURF_SURFACE_CONFIG: u64 = 0x05e5;
 const DCSURF_TILING_CONFIG: u64 = 0x05e7;
 const DCSURF_PRI_VIEWPORT_START: u64 = 0x05e9;
@@ -304,7 +314,7 @@ impl Hubp {
             return Err(Error::Invalid);
         }
         let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, LAST_REG)
+            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 2, LAST_REG)
                 .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine {
             io: Mmio {

@@ -11,6 +11,15 @@ use core::future::Future;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+/// The DCN versions the register ids in this module describe. The DIG and DP
+/// link blocks move wholesale on DCN 3.5 (`dcn_3_5_0_offset.h`):
+/// `regDIG0_DIG_BE_CNTL` 0x20b1→0x20bc, `regDIG0_DIG_BE_EN_CNTL`
+/// 0x20b2→0x20bd, `regDP0_DP_LINK_CNTL` 0x2108→0x211e — the same +0x16 shift
+/// `amdgpu_dcn_stream` sees on the stream half. Another generation needs its
+/// own ids, selected per version the way `amdgpu_platform::SURFACE_WINDOWS`
+/// does it.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
     pub channel: Channel,
@@ -147,7 +156,7 @@ impl Encoder<Mmio> {
         let base = crate::amdgpu_psp_ring::bank(
             gpu,
             crate::amdgpu_discovery::HW_ID_DCN,
-            &[(3, 1, 4)],
+            DCN_VERSIONS,
             2,
             0x251e,
         )

@@ -96,13 +96,21 @@ impl Firmware {
     }
 }
 
+/// The DCN versions whose DMUB this module boots. Not a register window — the
+/// gate is the firmware: DMUB's inbox ABI and its cache-window layout are
+/// per-ASIC in Linux (`dmub_dcn314.c` against `dmub_dcn35.c`), and the blob
+/// itself is named per version. Supporting another generation means another
+/// blob and its own `dmub_dcn*` sequence, so this list stays in step with the
+/// firmware this module actually knows how to hand over to.
+const DMUB_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 pub(crate) fn dcn314_ip(gpu: &AmdGpu) -> Result<&crate::amdgpu_discovery::IpBlock, Error> {
     let mut blocks = gpu
         .ip_blocks
         .iter()
         .filter(|b| b.hw_id == crate::amdgpu_discovery::HW_ID_DCN && b.instance == 0);
     let ip = blocks.next().ok_or(Error::Unsupported)?;
-    if blocks.next().is_some() || (ip.major, ip.minor, ip.revision) != (3, 1, 4) {
+    if blocks.next().is_some() || !DMUB_VERSIONS.contains(&(ip.major, ip.minor, ip.revision)) {
         return Err(Error::Unsupported);
     }
     Ok(ip)

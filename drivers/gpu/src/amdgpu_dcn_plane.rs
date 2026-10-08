@@ -16,6 +16,14 @@ use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // DPP block (base index 2), stride 0x16b.
+/// The DCN versions these offsets describe. The DPP, DSCL, FMT, DPG and OPP
+/// ids below are identical on DCN 3.5, but the MPC bank is reorganised:
+/// `MPC_OUT_MUX` moves 0x0580→0x03d8 and the per-MPCC stride goes 0x20→0x15
+/// (`regMPCC1_MPCC_TOP_SEL` 0x0020 against 0x0015). So this is not one entry
+/// short of portable — another generation needs its own MPC ids and stride,
+/// selected per version the way `amdgpu_platform::SURFACE_WINDOWS` does it.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const DPP_CONTROL: u64 = 0x0cc5;
 const CNVC_SURFACE_PIXEL_FORMAT: u64 = 0x0ccf;
 const SCL_MODE: u64 = 0x0cfb;
@@ -232,7 +240,7 @@ impl<I: Io> Block<I> {
 }
 
 fn bank(gpu: &AmdGpu, index: usize, last: u32) -> Result<u64, Error> {
-    crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], index, last)
+    crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, index, last)
         .map_err(|_| Error::Unsupported)
 }
 
