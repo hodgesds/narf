@@ -12293,6 +12293,30 @@ fn install_ipv4_ancillary(
     put_cmsgs(msg_ptr, &records)
 }
 
+/// Install the `IP_RECVERR` control message for a `recvmsg(MSG_ERRQUEUE)` on an
+/// AF_INET datagram socket: a `struct sock_extended_err` (16 bytes) immediately
+/// followed by the offender `sockaddr_in` (16 bytes), which `SO_EE_OFFENDER`
+/// points at. QUIC reads `ee_info` (the discovered next-hop MTU) for PMTU
+/// discovery. Returns whether the record was truncated by the control buffer.
+fn install_ipv4_errqueue(msg_ptr: u64, ext: crate::socket::ExtSockError) -> bool {
+    const SOL_IP: i32 = 0;
+    const IP_RECVERR: i32 = 11;
+    let mut data = alloc::vec::Vec::with_capacity(32);
+    data.extend_from_slice(&ext.errno.to_ne_bytes()); // ee_errno
+    data.push(ext.origin); // ee_origin (SO_EE_ORIGIN_ICMP)
+    data.push(ext.icmp_type); // ee_type
+    data.push(ext.icmp_code); // ee_code
+    data.push(0); // ee_pad
+    data.extend_from_slice(&ext.info.to_ne_bytes()); // ee_info (next-hop MTU)
+    data.extend_from_slice(&0u32.to_ne_bytes()); // ee_data
+    // Offender sockaddr_in (family, port 0, addr, sin_zero).
+    data.extend_from_slice(&2u16.to_ne_bytes());
+    data.extend_from_slice(&0u16.to_be_bytes());
+    data.extend_from_slice(&ext.offender_ip);
+    data.extend_from_slice(&[0u8; 8]);
+    put_cmsgs(msg_ptr, &[(SOL_IP, IP_RECVERR, data)])
+}
+
 /// Install the control records produced by `packet_recvmsg`: generic receive
 /// timestamp first (`sock_recv_cmsgs`), then `PACKET_AUXDATA` (`put_cmsg`).
 /// Returns whether any requested record was truncated.

@@ -191,12 +191,20 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                     None
                 };
                 const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
+                let mut errqueue = false;
                 let ancillary_truncated = if sock.domain == crate::socket::AF_INET {
-                    install_ipv4_ancillary(
+                    let mut trunc = install_ipv4_ancillary(
                         msg_ptr,
                         sock.take_inet4_recv_ancillary(),
                         sock.inet4_cmsg_options(),
-                    )
+                    );
+                    // MSG_ERRQUEUE: the errqueue recv stashed a queued ICMP
+                    // error — emit it as the IP_RECVERR control message.
+                    if let Some(ext) = sock.take_inet_err_ancillary() {
+                        trunc |= install_ipv4_errqueue(msg_ptr, ext);
+                        errqueue = true;
+                    }
+                    trunc
                 } else if sock.domain == crate::socket::AF_INET6 {
                     let (pktinfo, hoplimit, tclass) = sock.inet6_ancillary_options();
                     install_ipv6_ancillary(
@@ -214,9 +222,14 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
                         flags & MSG_CMSG_CLOEXEC != 0,
                     )
                 };
-                // Preserve this for the msg_flags write below.
-                if ancillary_truncated {
-                    write_user_u32(msg_ptr + 48, 0x8); // MSG_CTRUNC
+                // Preserve these for the msg_flags OR below (MSG_TRUNC is added
+                // there). A bare write matches the prior MSG_CTRUNC behaviour.
+                let mut out_flags = if ancillary_truncated { 0x8 } else { 0 }; // MSG_CTRUNC
+                if errqueue {
+                    out_flags |= crate::socket::MSG_ERRQUEUE;
+                }
+                if out_flags != 0 {
+                    write_user_u32(msg_ptr + 48, out_flags);
                 }
             }
 

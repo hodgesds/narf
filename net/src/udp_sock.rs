@@ -182,6 +182,52 @@ pub fn icmp_err_convert(icmp_type: u8, icmp_code: u8) -> Option<(i32, bool)> {
     Some((errno as i32, hard))
 }
 
+// ── Cross-layer ICMP error delivery to the userspace socket layer ──
+
+/// A UDP ICMP error handed to the userspace datagram-socket layer for
+/// `IP_RECVERR` / `MSG_ERRQUEUE` (QUIC PMTU discovery). `net` cannot reach the
+/// userspace socket registry directly, so that layer installs a hook at init
+/// and the ICMP input path delivers every UDP error here, in addition to the
+/// in-kernel `UdpSocket` err_queue.
+#[derive(Clone, Copy, Debug)]
+pub struct UdpIcmpError {
+    pub net_ns_id: u64,
+    /// Local (source) address/port of the datagram that triggered the error —
+    /// how the userspace layer finds the owning socket.
+    pub local_ip: [u8; 4],
+    pub local_port: u16,
+    /// Remote (destination) address/port of that datagram.
+    pub peer_ip: [u8; 4],
+    pub peer_port: u16,
+    pub icmp_type: u8,
+    pub icmp_code: u8,
+    /// Mapped Linux errno (`ee_errno`): EMSGSIZE for fragmentation-needed,
+    /// ECONNREFUSED for port-unreachable, etc. (see [`icmp_err_convert`]).
+    pub errno: u32,
+    /// Next-hop MTU for a fragmentation-needed error (`ee_info`), else 0.
+    pub info: u32,
+    /// The router/host that sent the ICMP error (`sock_extended_err` offender).
+    pub offender_ip: [u8; 4],
+}
+
+type UdpIcmpHook = fn(&UdpIcmpError);
+static UDP_ICMP_HOOK: IrqSafeSpinLock<Option<UdpIcmpHook>> = IrqSafeSpinLock::new(None);
+
+/// Install the userspace datagram-socket ICMP-error sink. Called once at init.
+pub fn install_udp_icmp_hook(hook: UdpIcmpHook) {
+    *UDP_ICMP_HOOK.lock() = Some(hook);
+}
+
+/// Deliver a UDP ICMP error to the userspace socket layer if a hook is
+/// installed. The fn pointer is copied out before the call so a re-entrant
+/// hook never runs under the registration lock.
+pub fn notify_udp_icmp_error(err: &UdpIcmpError) {
+    let hook = *UDP_ICMP_HOOK.lock();
+    if let Some(hook) = hook {
+        hook(err);
+    }
+}
+
 // ── UDP socket ─────────────────────────────────────────────────────
 
 #[derive(Debug)]

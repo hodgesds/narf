@@ -85,6 +85,59 @@ fn view_of(s: &SocketFile) -> Option<BindView> {
     })
 }
 
+/// Deliver an ICMP error (from the net-layer `install_udp_icmp_hook` sink) to
+/// the AF_INET datagram socket that sent the offending datagram. Queues it for
+/// `recvmsg(MSG_ERRQUEUE)` when IP_RECVERR is set, and records it as the
+/// pending async error so a connected socket also observes it via SO_ERROR /
+/// its next operation. Mirrors Linux `__udp4_lib_err` → `ip_icmp_error` /
+/// `sock_queue_err_skb`.
+pub(super) fn deliver_icmp_error(e: &narf_net::udp_sock::UdpIcmpError) {
+    if e.errno == 0 {
+        return;
+    }
+    let socks = {
+        let bound = INET_DGRAM_BOUND.lock();
+        match bound
+            .as_ref()
+            .and_then(|m| m.get(&(e.net_ns_id, e.local_port)))
+        {
+            Some(chain) => chain.clone(),
+            None => return,
+        }
+    };
+    let local = u32::from_be_bytes(e.local_ip);
+    let peer = (u32::from_be_bytes(e.peer_ip), e.peer_port);
+    let ext = crate::socket::ExtSockError {
+        errno: e.errno,
+        origin: 2, // SO_EE_ORIGIN_ICMP
+        icmp_type: e.icmp_type,
+        icmp_code: e.icmp_code,
+        info: e.info,
+        offender_ip: e.offender_ip,
+    };
+    for s in socks {
+        let Some(view) = view_of(&s) else { continue };
+        // Match the socket's bound local address (exact, or a wildcard bind).
+        if view.addr != 0 && view.addr != local {
+            continue;
+        }
+        let recverr = s.options.lock().ext.ip_recverr;
+        // A connected socket only takes an error whose 4-tuple matches its
+        // peer; an unconnected socket takes it only with IP_RECVERR set.
+        match view.peer {
+            Some(p) if p != peer => continue,
+            None if !recverr => continue,
+            _ => {}
+        }
+        if recverr {
+            s.push_inet_err(ext);
+        }
+        s.set_pending_error(crate::socket::SockError::Stack(e.errno as i32));
+        s.dgram_readiness.notify(narf_filesystem::POLL_ERR);
+        narf_net::readiness::notify(0);
+    }
+}
+
 /// `(ip, port)` out of an AF_INET / AF_UNSPEC sockaddr body whose length the
 /// caller has already checked.
 fn sin_of(addr: &SockAddr) -> (u32, u16) {
@@ -1056,11 +1109,21 @@ impl SocketFile {
 
     /// `recv(2)` family — `udp_recvmsg` (`net/ipv4/udp.c:1816`).
     pub(super) fn inet_dgram_recv(&self, buf: &mut [u8], flags: u32) -> SocketOpResult {
-        // NARF keeps no ICMP error queue, so MSG_ERRQUEUE always finds it
-        // empty: `ip_recv_error` → EAGAIN (`net/ipv4/ip_sockglue.c:535`).
-        // The syscall layer treats this as non-blocking.
+        // `ip_recv_error` (`net/ipv4/ip_sockglue.c`): pop the oldest queued
+        // ICMP error, report the offender as the message name, and stash the
+        // extended-error record so the recvmsg cmsg builder can emit the
+        // IP_RECVERR control message. QUIC reads this for PMTU discovery. An
+        // empty queue is EAGAIN (the syscall layer treats errqueue as
+        // non-blocking).
         if flags & MSG_ERRQUEUE != 0 {
-            return SocketOpResult::Err(SockError::WouldBlock);
+            let Some(ext) = self.pop_inet_err() else {
+                return SocketOpResult::Err(SockError::WouldBlock);
+            };
+            self.stash_inet_err_ancillary(ext);
+            // The errored datagram's payload is not retained; the error is
+            // carried entirely by the cmsg. msg_name = the ICMP offender.
+            let peer = Some(make_sockaddr_in(u32::from_be_bytes(ext.offender_ip), 0));
+            return SocketOpResult::Received { n: 0, peer };
         }
         // `__skb_recv_udp` reports a pending socket error before looking at
         // the queue (`net/ipv4/udp.c:1729`).
@@ -1141,7 +1204,7 @@ impl SocketFile {
         if readable {
             bits |= narf_filesystem::POLL_IN;
         }
-        if self.pending_error.lock().is_some() {
+        if self.pending_error.lock().is_some() || self.has_inet_err() {
             bits |= narf_filesystem::POLL_ERR;
         }
         let shut = self.sk_shutdown();
