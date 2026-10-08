@@ -455,7 +455,10 @@ pub struct Igc {
     mac: [u8; 6],
     tx_ring_buf: DmaBuffer,
     rx_ring_buf: DmaBuffer,
-    rx_buf_pool: alloc::vec::Vec<DmaBuffer>,
+    /// The DMA buffer currently armed in each RX descriptor slot. Zero-copy RX
+    /// (`rx_recv_frame`) hands a filled buffer up as a `Frame` and swaps a
+    /// fresh one into its slot, so the set rotates — hence the lock.
+    rx_buf_pool: IrqSafeSpinLock<alloc::vec::Vec<DmaBuffer>>,
     tx_buf: DmaBuffer,
     tx_tail: IrqSafeSpinLock<u16>,
     rx_head: IrqSafeSpinLock<u16>,
@@ -674,7 +677,7 @@ impl Igc {
             mac,
             tx_ring_buf,
             rx_ring_buf,
-            rx_buf_pool,
+            rx_buf_pool: IrqSafeSpinLock::new(rx_buf_pool),
             tx_buf,
             tx_tail: IrqSafeSpinLock::new(0),
             rx_head: IrqSafeSpinLock::new(0),
@@ -892,16 +895,16 @@ impl Igc {
             return 0;
         }
         let len = (desc.length as usize).min(out.len()).min(FRAME_SIZE);
-        let buf_phys = self.rx_buf_pool[idx].dma_addr().raw();
+        let slots = self.rx_buf_pool.lock();
+        let buf_phys = slots[idx].dma_addr().raw();
         for (i, b) in out.iter_mut().enumerate().take(len) {
             // SAFETY: `buf_phys` is the identity-mapped DMA address of this
             // RX slot's packet buffer (`rx_buf_pool[idx]`); `i < len` and
             // `len <= FRAME_SIZE` so `buf_phys + i` stays inside the buffer.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe {
-                core::ptr::read_volatile(self.rx_buf_pool[idx].cpu_ptr_at::<u8>(i as u64))
-            };
+            *b = unsafe { core::ptr::read_volatile(slots[idx].cpu_ptr_at::<u8>(i as u64)) };
         }
+        drop(slots);
         let _ = ADV_RXD_STAT_EOP; // multi-buffer frames land in a follow-up.
                                   // Refill: write the slot in the read form so the chip can
                                   // re-use it. `hdr_addr = 0` clears the wb-form DD bit since
@@ -925,6 +928,51 @@ impl Igc {
             self.mmio.write32(REG_RDT, (idx % RX_RING_LEN) as u32);
         }
         len
+    }
+
+    /// Zero-copy receive (P-F): hand the descriptor's own DMA buffer to the
+    /// stack as a `Frame` and swap a fresh buffer into its slot — no copy into
+    /// a scratch buffer and then a freshly-allocated frame, unlike the pump's
+    /// old `rx` + `Frame::new` + `copy_from_slice`. Returns `None` when no
+    /// frame is pending, or when the refill allocation fails (the frame is then
+    /// left in its descriptor for the next poll rather than dropped).
+    pub fn rx_recv_frame(&self) -> Option<Frame> {
+        let mut head = self.rx_head.lock();
+        let idx = *head as usize;
+        let ring_phys = self.rx_ring_buf.dma_addr().raw();
+        let desc_ptr = narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64)
+            .kernel_mut_ptr::<AdvRxDescWb>();
+        // SAFETY: identity-mapped DMA; idx < RX_RING_LEN.
+        let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
+        if desc.status_error & ADV_RXD_STAT_DD == 0 {
+            return None;
+        }
+        let len = (desc.length as usize).min(FRAME_SIZE);
+        // Refill before handing the filled buffer up so the chip never sees an
+        // empty slot. On allocation failure, bail without advancing.
+        let replacement = alloc_coherent(FRAME_SIZE, DomainId::DRIVER_0).ok()?;
+        let repl_phys = replacement.dma_addr().raw();
+        let filled = {
+            let mut slots = self.rx_buf_pool.lock();
+            core::mem::replace(&mut slots[idx], replacement)
+        };
+        // Re-hand the slot in the read form (hdr_addr = 0 clears the wb DD bit).
+        let read_form = AdvRxDescRead {
+            pkt_addr: repl_phys,
+            hdr_addr: 0,
+        };
+        // SAFETY: identity-mapped DMA; AdvRxDescRead is the same 16 bytes as
+        // AdvRxDescWb (the chip selects interpretation via SRRCTL.DESCTYPE).
+        unsafe {
+            core::ptr::write_volatile(desc_ptr as *mut AdvRxDescRead, read_form);
+        }
+        *head = ((idx + 1) % RX_RING_LEN) as u16;
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_RDT, (idx % RX_RING_LEN) as u32);
+        }
+        Some(Frame::new(filled, len as u32))
     }
 }
 
@@ -1124,16 +1172,16 @@ fn spawn_pumps(
 }
 
 async fn igc_rx_pump(device: Arc<Igc>, mut rx_prod: Producer<Frame, RX_RING_N>) {
-    let mut buf = [0u8; 2048];
+    // Zero-copy (P-F): take the device-filled DMA buffer straight out of the RX
+    // descriptor as a Frame (refilling the slot), with no copy through a scratch
+    // buffer + freshly-allocated frame.
     loop {
-        let n = device.rx(&mut buf);
-        if n > 0 {
-            let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
-            let mut frame = Frame::new(dma_buf, n as u32);
-            frame.payload_mut().copy_from_slice(&buf[..n]);
-            let _ = rx_prod.send(frame).await;
+        match device.rx_recv_frame() {
+            Some(frame) => {
+                let _ = rx_prod.send(frame).await;
+            }
+            None => narf_scheduler::yield_now().await,
         }
-        narf_scheduler::yield_now().await;
     }
 }
 
