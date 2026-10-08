@@ -495,8 +495,11 @@ impl Pipeline {
         self.dccg
             .set_pixel_rate_div(self.pipe, Divider::By1, Divider::By4)?;
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
-            self.dccg
-                .set_dp_stream_clock(self.route.aux, crate::amdgpu_dcn_dccg::StreamClock::Dtbclk)?;
+            self.dccg.set_dp_stream_clock(
+                self.route.aux,
+                self.pipe,
+                crate::amdgpu_dcn_dccg::StreamClock::Dtbclk,
+            )?;
         }
 
         // 2. Timing, with the global sync the prefetch schedule settled on.
@@ -596,6 +599,7 @@ impl Pipeline {
                 self.dccg
                     .set_dp_stream_clock(
                         self.route.aux,
+                        self.pipe,
                         crate::amdgpu_dcn_dccg::StreamClock::Disabled,
                     )
                     .map_err(Error::Hardware),

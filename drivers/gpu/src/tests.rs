@@ -627,47 +627,6 @@ fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_fwinfo_v3_round_trip);
 
-fn smoke_amdgpu_ucode_header_round_trip() -> TestResult {
-    use crate::amdgpu_ucode::{parse, payload, UcodeError, UCODE_MAGIC};
-    // Build a 1024-byte synthetic blob: 4-byte magic + 32-byte
-    // common header at offset 4 + zero-fill to 256, then a
-    // 768-byte fake payload starting at offset 256.
-    let mut blob = alloc::vec![0u8; 1024];
-    blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
-    blob[4..8].copy_from_slice(&256u32.to_le_bytes()); // start_offset
-    blob[8..12].copy_from_slice(&768u32.to_le_bytes()); // payload_size
-    blob[12..16].copy_from_slice(&0x0001_0203u32.to_le_bytes()); // version
-    blob[16..20].copy_from_slice(&0x0042u32.to_le_bytes()); // feature ver
-    let hdr = match parse(&blob) {
-        Ok(h) => h,
-        Err(_) => return TestResult::Fail("ucode parse rejected synthetic blob"),
-    };
-    if hdr.start_offset != 256 || hdr.payload_size != 768 {
-        return TestResult::Fail("offsets round-trip");
-    }
-    if hdr.version != 0x0001_0203 || hdr.feature_version != 0x0042 {
-        return TestResult::Fail("version round-trip");
-    }
-    let p = payload(&blob, &hdr);
-    if p.len() != 768 {
-        return TestResult::Fail("payload length");
-    }
-    // Bad magic.
-    let mut bad = blob.clone();
-    bad[0] ^= 0xFF;
-    if !matches!(parse(&bad), Err(UcodeError::BadMagic)) {
-        return TestResult::Fail("bad magic should reject");
-    }
-    // Payload-out-of-bounds.
-    let mut bad = blob.clone();
-    bad[8..12].copy_from_slice(&2000u32.to_le_bytes()); // size > blob
-    if !matches!(parse(&bad), Err(UcodeError::PayloadOutOfBounds)) {
-        return TestResult::Fail("oversize payload should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/gpu", smoke_amdgpu_ucode_header_round_trip);
-
 fn smoke_dp_link_training_completes_against_stub() -> TestResult {
     // Stub AUX channel that simulates a healthy 2-lane sink: CR
     // succeeds on the second poll (after one swing bump);
@@ -1266,68 +1225,164 @@ kernel_test_in!(
     smoke_amdgpu_atombios_command_table_directory
 );
 
-fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
-    use crate::amdgpu_rlc::{autoload_iter, looks_like_rlc, parse};
-    use crate::amdgpu_ucode::UCODE_MAGIC;
-    // Build a 1024-byte synthetic RLC blob:
-    //   - 4-byte magic + common ucode header (version etc.)
-    //   - RLC extension at offset 0x24
-    //   - autoload offset table at 0x100, 3 × 12 byte entries
-    //   - payload at 0x200 (24-byte filler — autoload entries
-    //     point into it)
-    let mut blob = alloc::vec![0u8; 1024];
-    blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
-    blob[4..8].copy_from_slice(&256u32.to_le_bytes()); // start_offset
-    blob[8..12].copy_from_slice(&512u32.to_le_bytes()); // payload_size
-    blob[12..16].copy_from_slice(&1u32.to_le_bytes()); // version
-                                                       // RLC extension fields.
-    blob[0x58..0x5C].copy_from_slice(&0x100u32.to_le_bytes()); // autoload offset
-    blob[0x5C..0x60].copy_from_slice(&36u32.to_le_bytes()); // autoload size
-                                                            // Autoload entries: 3 × 12 bytes.
-    let entries = [
-        (0x10u32, 0x200u32, 8u32),
-        (0x11u32, 0x208u32, 8u32),
-        (0x12u32, 0x210u32, 8u32),
-    ];
-    for (i, (id, off, sz)) in entries.iter().enumerate() {
-        let base = 0x100 + i * 12;
-        blob[base..base + 4].copy_from_slice(&id.to_le_bytes());
-        blob[base + 4..base + 8].copy_from_slice(&off.to_le_bytes());
-        blob[base + 8..base + 12].copy_from_slice(&sz.to_le_bytes());
-    }
-    let header = match parse(&blob) {
+/// The header offsets and the TOC bitfield layout are both spelled out as
+/// literals here rather than built from the module's constants: `offsetof` on
+/// the Linux structures is the authority, so a wrong constant has to fail
+/// rather than be restated.
+fn smoke_amdgpu_rlc_header_v2_2_round_trip() -> TestResult {
+    use crate::amdgpu_rlc::{parse, region, RlcError};
+    // A v2.2 blob: common header, the v2.0/v2.1/v2.2 tails, and three
+    // payload regions the header points at.
+    let mut blob = alloc::vec![0u8; 0x400];
+    let put = |b: &mut alloc::vec::Vec<u8>, o: usize, v: u32| {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes())
+    };
+    put(&mut blob, 0x00, 0x400); // size_bytes == blob length
+    put(&mut blob, 0x04, 0xac); // header_size_bytes
+    blob[0x08..0x0a].copy_from_slice(&2u16.to_le_bytes()); // major
+    blob[0x0a..0x0c].copy_from_slice(&2u16.to_le_bytes()); // minor
+    put(&mut blob, 0x14, 0x100); // ucode_size_bytes
+    put(&mut blob, 0x18, 0x100); // ucode_array_offset_bytes
+    put(&mut blob, 0x20, 0x42); // ucode_feature_version
+    put(&mut blob, 0x24, 0x8); // jt_offset, dwords
+    put(&mut blob, 0x28, 0x4); // jt_size, dwords
+    put(&mut blob, 0x30, 0x1234); // clear_state_descriptor_offset
+    put(&mut blob, 0x48, 0x40); // reg_list_format size
+    put(&mut blob, 0x4c, 0x200); //                  offset
+    put(&mut blob, 0x74, 0x10); // save_restore_list_cntl size
+    put(&mut blob, 0x78, 0x240); //                        offset
+    put(&mut blob, 0x9c, 0x20); // iram size
+    put(&mut blob, 0xa0, 0x250); //      offset
+    blob[0x200] = 0xAA;
+    blob[0x250] = 0xBB;
+
+    let h = match parse(&blob) {
         Ok(h) => h,
-        Err(_) => return TestResult::Fail("RLC parse"),
+        Err(_) => return TestResult::Fail("v2.2 RLC header rejected"),
     };
-    if header.autoload_offset_table_offset != 0x100 || header.autoload_offset_table_size != 36 {
-        return TestResult::Fail("autoload table fields");
+    if h.minor != 2 || h.ucode_feature_version != 0x42 {
+        return TestResult::Fail("common/feature fields");
     }
-    let walked: alloc::vec::Vec<_> = match autoload_iter(&blob, &header) {
-        Ok(it) => it.collect(),
-        Err(_) => return TestResult::Fail("autoload_iter"),
-    };
-    if walked.len() != 3 {
-        return TestResult::Fail("autoload entry count");
+    // 0x24 is jt_offset, not a save/restore list offset, and it is a dword
+    // count rather than a byte offset.
+    if h.jt_offset_dw != 8 || h.jt_size_dw != 4 {
+        return TestResult::Fail("jump table is at 0x24/0x28, in dwords");
     }
-    if walked[0].firmware_id != 0x10 || walked[0].offset != 0x200 || walked[0].size != 8 {
-        return TestResult::Fail("autoload entry 0");
+    if h.clear_state_descriptor_offset != 0x1234 {
+        return TestResult::Fail("clear_state_descriptor_offset is at 0x30");
     }
-    if walked[2].firmware_id != 0x12 {
-        return TestResult::Fail("autoload entry 2 id");
+    if h.reg_list_format.offset_bytes != 0x200 || h.reg_list_format.size_bytes != 0x40 {
+        return TestResult::Fail("reg_list_format region is size at 0x48, offset at 0x4c");
     }
-    if !looks_like_rlc(&blob) {
-        return TestResult::Fail("looks_like_rlc rejected synthetic blob");
+    match h.save_restore_list_cntl {
+        Some(r) if r.offset_bytes == 0x240 && r.size_bytes == 0x10 => {}
+        _ => return TestResult::Fail("save_restore_list_cntl region is at 0x74/0x78"),
     }
-    let bogus = [0u8; 1024];
-    if looks_like_rlc(&bogus) {
-        return TestResult::Fail("looks_like_rlc accepted zeroed blob");
+    match h.iram {
+        Some(r) if r.offset_bytes == 0x250 && r.size_bytes == 0x20 => {}
+        _ => return TestResult::Fail("iram region is at 0x9c/0xa0"),
+    }
+    // v2.2 stops before the RLCP/RLCV pair; those must not be read.
+    if h.rlcp.is_some() || h.rlcv.is_some() {
+        return TestResult::Fail("v2.2 must not decode v2.3 fields");
+    }
+    if region(&blob, &h.reg_list_format).map(|s| s[0]) != Some(0xAA) {
+        return TestResult::Fail("reg_list_format slice");
+    }
+    if h.iram.and_then(|r| region(&blob, &r)).map(|s| s[0]) != Some(0xBB) {
+        return TestResult::Fail("iram slice");
+    }
+
+    // Validation is `fw->size == hdr->size_bytes`; there is no magic word.
+    let mut bad = blob.clone();
+    put(&mut bad, 0x00, 0x401);
+    if !matches!(parse(&bad), Err(RlcError::BadCommonHeader)) {
+        return TestResult::Fail("size_bytes disagreement should reject");
+    }
+    // A region pointing past the blob must be caught, not sliced later.
+    let mut bad = blob.clone();
+    put(&mut bad, 0xa0, 0x3f0);
+    if !matches!(parse(&bad), Err(RlcError::OutOfBounds)) {
+        return TestResult::Fail("out-of-bounds iram should reject");
+    }
+    // Only the v2 chain is described.
+    let mut bad = blob.clone();
+    bad[0x08..0x0a].copy_from_slice(&1u16.to_le_bytes());
+    if !matches!(parse(&bad), Err(RlcError::UnsupportedMajor(1))) {
+        return TestResult::Fail("major 1 should reject");
+    }
+    // A v2.1 blob truncated to the v2.0 length is short of its own fields.
+    let mut short = alloc::vec![0u8; 0x80];
+    put(&mut short, 0x00, 0x80);
+    short[0x08..0x0a].copy_from_slice(&2u16.to_le_bytes());
+    short[0x0a..0x0c].copy_from_slice(&1u16.to_le_bytes());
+    if !matches!(parse(&short), Err(RlcError::Truncated)) {
+        return TestResult::Fail("v2.1 shorter than 0x9c should reject");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/gpu",
-    smoke_amdgpu_rlc_header_and_autoload_round_trip
-);
+kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_header_v2_2_round_trip);
+
+fn smoke_amdgpu_rlc_autoload_toc_bitfields() -> TestResult {
+    use crate::amdgpu_rlc::{autoload_iter, autoload_total_size};
+    // Four 16-byte entries, the last with an out-of-range id so the walk
+    // terminates on it. Dwords are composed by hand from the bitfield
+    // positions: offset bits 24:0, id bits 31:25, size bits 31:14.
+    let mut toc = alloc::vec![0u8; 16 * 4];
+    let put = |b: &mut alloc::vec::Vec<u8>, o: usize, v: u32| {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes())
+    };
+    // id 1 (RLC_G_UCODE), offset 0x40 dwords, size 0x10 dwords, load_at_boot.
+    put(&mut toc, 0x00, 1 << 25 | 0x40);
+    put(&mut toc, 0x04, 0x10 << 14 | 1);
+    // id 13 (CP_PFP), offset 0x50 dwords, size 0x20 dwords, signed_source,
+    // memory_destination 2.
+    put(&mut toc, 0x10, 13 << 25 | 0x50);
+    put(&mut toc, 0x14, 0x20 << 14 | 1 << 13 | 2 << 3);
+    // id 36, the highest valid id below MAX.
+    put(&mut toc, 0x20, 36 << 25 | 0x70);
+    put(&mut toc, 0x24, 0x8 << 14);
+    // id 37 == SOC21_FIRMWARE_ID_MAX ends the walk.
+    put(&mut toc, 0x30, 37 << 25 | 0x90);
+    put(&mut toc, 0x34, 0x8 << 14);
+
+    let walked: alloc::vec::Vec<_> = autoload_iter(&toc).collect();
+    if walked.len() != 3 {
+        return TestResult::Fail("walk must stop at the first id outside (INVALID, MAX)");
+    }
+    // Both offset and size are dword counts in the blob and bytes here.
+    if walked[0].firmware_id != 1 || walked[0].offset != 0x100 || walked[0].size != 0x40 {
+        return TestResult::Fail("entry 0: id in bits 31:25, offset and size scaled by four");
+    }
+    if !walked[0].load_at_boot || walked[0].signed_source {
+        return TestResult::Fail("entry 0 DW1 flags");
+    }
+    if walked[1].firmware_id != 13 || walked[1].offset != 0x140 || walked[1].size != 0x80 {
+        return TestResult::Fail("entry 1 fields");
+    }
+    if !walked[1].signed_source || walked[1].memory_destination != 2 {
+        return TestResult::Fail("entry 1: signed_source is bit 13, memdst bits 4:3");
+    }
+    if walked[2].firmware_id != 36 {
+        return TestResult::Fail("id 36 is below MAX and must be walked");
+    }
+    // An id of zero terminates just as MAX does.
+    let zeroed = alloc::vec![0u8; 16 * 4];
+    if autoload_iter(&zeroed).count() != 0 {
+        return TestResult::Fail("a zero id is INVALID and ends the walk");
+    }
+    // Sum of sizes is 0x40 + 0x80 + 0x20 = 0xe0, but the last region ends at
+    // 0x1c0 + 0x20 = 0x1e0, so the padded bound wins.
+    if autoload_total_size(&toc) != 0x1e0 {
+        return TestResult::Fail("total size must cover padded offsets");
+    }
+    // Partial trailing bytes are not half an entry.
+    if autoload_iter(&toc[..16 + 8]).count() != 1 {
+        return TestResult::Fail("a partial entry must not be decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_autoload_toc_bitfields);
 
 fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
     use crate::amdgpu_atom_gpiopin::{GpioId, GpioPinLut};

@@ -13,6 +13,7 @@ use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 const DPSTREAMCLK_CNTL: u64 = 0x004a;
+const DTBCLK_P_CNTL: u64 = 0x0068;
 const DENTIST_DISPCLK_CNTL: u64 = 0x0064;
 const OTG_PIXEL_RATE_DIV: u64 = 0x006f;
 const DPPCLK0_DTO_PARAM: u64 = 0x0099;
@@ -146,16 +147,38 @@ impl<I: Io> Engine<I> {
             (k1.code() | k2.code() << 1) << shift,
         )
     }
-    /// Route a DPIA's stream clock, or park it.
-    fn set_dp_stream_clock(&mut self, dpia: u8, source: StreamClock) -> Result<(), Error> {
-        if dpia >= INSTANCES {
+    /// Point one OTG's `DTBCLK_P` mux at DTBCLK0, or park it on DPREFCLK.
+    /// `dccg314_set_dtbclk_p_src`: the source select is 2 for DTBCLK0 — zero
+    /// selects DPREFCLK, so an enable alone routes the wrong clock. Three bits
+    /// per OTG, a two-bit select then the enable.
+    fn set_dtbclk_p_src(&mut self, otg: u8, source: StreamClock) -> Result<(), Error> {
+        if otg >= INSTANCES {
             return Err(Error::Invalid);
         }
+        let shift = otg as u32 * 3;
+        let value = match source {
+            StreamClock::Disabled => 0,
+            StreamClock::Dtbclk => 2 | 1 << 2,
+        };
+        self.update(DTBCLK_P_CNTL, 0x7 << shift, value << shift)
+    }
+    /// Route a DPIA's stream clock from one OTG's DTBCLK_P, or park it.
+    ///
+    /// `dccg314_set_dpstreamclk` does two things, in this order: it points the
+    /// OTG's `DTBCLK_P` mux at DTBCLK0, then selects that OTG as the DPIA's
+    /// stream-clock source. Without the first the mux stays on DPREFCLK and
+    /// the DPIA is clocked by whatever that happens to be; without the second
+    /// every DPIA takes OTG 0, so a stream on any other pipe runs at the wrong
+    /// pixel rate. Four bits per DPIA, a three-bit OTG select then the enable.
+    fn set_dp_stream_clock(&mut self, dpia: u8, otg: u8, source: StreamClock) -> Result<(), Error> {
+        if dpia >= INSTANCES || otg >= INSTANCES {
+            return Err(Error::Invalid);
+        }
+        self.set_dtbclk_p_src(otg, source)?;
         let shift = dpia as u32 * 4;
         let value = match source {
             StreamClock::Disabled => 0,
-            // Source select zero with the enable bit set takes DTBCLK.
-            StreamClock::Dtbclk => 1 << 3,
+            StreamClock::Dtbclk => otg as u32 | 1 << 3,
         };
         self.update(DPSTREAMCLK_CNTL, 0xf << shift, value << shift)
     }
@@ -198,8 +221,13 @@ impl Dccg {
     pub fn set_pixel_rate_div(&mut self, otg: u8, k1: Divider, k2: Divider) -> Result<(), Error> {
         self.0.set_pixel_rate_div(otg, k1, k2)
     }
-    pub fn set_dp_stream_clock(&mut self, dpia: u8, source: StreamClock) -> Result<(), Error> {
-        self.0.set_dp_stream_clock(dpia, source)
+    pub fn set_dp_stream_clock(
+        &mut self,
+        dpia: u8,
+        otg: u8,
+        source: StreamClock,
+    ) -> Result<(), Error> {
+        self.0.set_dp_stream_clock(dpia, otg, source)
     }
     /// The DISPCLK divider DENTIST has applied, and the one requested.
     pub fn dispclk_dividers(&mut self) -> Result<(u32, u32), Error> {
