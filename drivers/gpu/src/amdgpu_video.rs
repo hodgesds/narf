@@ -320,7 +320,14 @@ impl DecodeSession {
 /// a struct of `IB_PACKET` headers + per-codec payloads; we
 /// emit the dword stream directly.
 ///
-/// Packet shape (all VCN versions; payload size varies by codec):
+/// LINUX-GAP: this is a NARF-local shape, not a firmware ABI. The kernel
+/// never builds a decode packet: a decode job arrives from userspace as an
+/// indirect buffer already containing an `rvcn_dec_message_*` structure that
+/// Mesa assembled, and amdgpu only maps it and advances the ring. So nothing
+/// below can be checked against a header, and on VCN 4 there is not even a
+/// decode ring to submit it to — see [`VCN_DEC_KMD_CMD`].
+///
+/// Packet shape (NARF-local; payload size varies by codec):
 ///
 /// ```text
 /// dw 0  : VCN_DEC_CMD_HEADER (PACKET_TYPE = 0x4, CMD = DECODE)
@@ -393,13 +400,42 @@ pub fn retire_decode(session: &mut DecodeSession, _seq: u64) {
     }
 }
 
-/// VCN packet header — PACKET_TYPE=4 (IB), CMD=0x0 (DECODE).
-/// VCN firmware reads this constant on every packet.
-pub const VCN_DEC_CMD_HEADER: u32 = 0x4000_0000;
+/// `VCN_DEC_KMD_CMD` (`amdgpu_vcn.h`). A decode-ring command word is this OR
+/// the command shifted left one — `VCN_DEC_KMD_CMD | (VCN_DEC_CMD_x << 1)`,
+/// as every `amdgpu_ring_write` in `vcn_v2_0.c` spells it.
+///
+/// LINUX-GAP: there is no `0x4000_0000` "packet header" and no `PACKET_TYPE`
+/// field in the VCN decode ring; the previous constant and its description
+/// were invented, and the real top bit is 31, not 30.
+///
+/// This matters less than it looks for the target chip: VCN 4.0 has **no
+/// separate decode ring**. `vcn_v4_0.c` registers only
+/// `vcn_v4_0_unified_ring_funcs`, and both decode and encode traffic go
+/// through it with the [`VCN_ENC_CMD_NO_OP`] family. `VCN_DEC_CMD_*` and this
+/// word are VCN 2.0-era, so nothing on Phoenix (VCN 4.0.2) should emit them.
+pub const VCN_DEC_KMD_CMD: u32 = 0x8000_0000;
+pub const VCN_DEC_CMD_FENCE: u32 = 0x0000_0000;
+pub const VCN_DEC_CMD_TRAP: u32 = 0x0000_0001;
+pub const VCN_DEC_CMD_WRITE_REG: u32 = 0x0000_0004;
+pub const VCN_DEC_CMD_REG_READ_COND_WAIT: u32 = 0x0000_0006;
+pub const VCN_DEC_CMD_PACKET_START: u32 = 0x0000_000A;
+pub const VCN_DEC_CMD_PACKET_END: u32 = 0x0000_000B;
 
+/// Encode one decode-ring command word the way `vcn_v2_0.c` does.
+pub const fn dec_ring_cmd(cmd: u32) -> u32 {
+    VCN_DEC_KMD_CMD | (cmd << 1)
+}
+
+/// The header dword [`build_decode_packet`] emits. `PACKET_START` is what a
+/// VCN 2.0 decode ring opens a packet with.
+pub const VCN_DEC_CMD_HEADER: u32 = dec_ring_cmd(VCN_DEC_CMD_PACKET_START);
+
+/// LINUX-GAP: cited as "Linux `vcn_dec.h` codec enumeration", which is not a
+/// file in the AMD tree. The codec ids a decode job carries live in the
+/// firmware message Mesa builds (`rvcn_dec_message_create`), never in the
+/// kernel, so these values have no in-tree source and are NARF-local
+/// placeholders.
 fn codec_word_for(c: Codec) -> u32 {
-    // Per Linux `vcn_dec.h` codec enumeration (one byte each for
-    // codec + profile + level + reserved).
     match c {
         Codec::H264 => 0x01, // AVC
         Codec::Hevc => 0x02, // HEVC
@@ -678,14 +714,22 @@ pub fn build_encode_destroy_msg(session: &mut EncodeSession) -> Result<EncodePac
 // wptr; doorbell mode replaces it with a doorbell write that the
 // FW polls.
 
-/// Encode ring registers — offsets relative to the VCN0 IP block
-/// base. Multiple rings exist (`UVD_RB_WPTR` .. `UVD_RB_WPTR4`);
-/// the unified-queue VCNs (v4+) use ring 0 for both decode + encode.
-pub const VCN_ENC_RING_RPTR_REL: u32 = 0x0;
-pub const VCN_ENC_RING_WPTR_REL: u32 = 0x4;
-pub const VCN_ENC_RING_BASE_LO_REL: u32 = 0x8;
-pub const VCN_ENC_RING_BASE_HI_REL: u32 = 0xC;
-pub const VCN_ENC_RING_SIZE_REL: u32 = 0x10;
+/// Unified-ring registers, as absolute dword ids from
+/// `vcn/vcn_4_0_0_offset.h` at BASE_IDX 1. `vcn_v4_0_unified_ring_get_rptr`
+/// reads `regUVD_RB_RPTR` and `..._set_wptr` writes `regUVD_RB_WPTR`; v4+ uses
+/// this one ring for both decode and encode.
+///
+/// The pointer pair and the buffer descriptor are **two separate runs**, 0x3e
+/// dwords apart — not one block starting at the IP base. `regUVD_RB_RPTR2`
+/// and `_WPTR2` (0x00ae/0x00af) sit immediately after the first pair, which is
+/// why the descriptor cannot follow it.
+pub const UVD_RB_RPTR: u32 = 0x00ac;
+pub const UVD_RB_WPTR: u32 = 0x00ad;
+pub const UVD_RB_RPTR2: u32 = 0x00ae;
+pub const UVD_RB_WPTR2: u32 = 0x00af;
+pub const UVD_RB_BASE_LO: u32 = 0x00ea;
+pub const UVD_RB_BASE_HI: u32 = 0x00eb;
+pub const UVD_RB_SIZE: u32 = 0x00ec;
 
 /// One encode ring. Tracks the (rptr, wptr) head-tail pair the
 /// firmware reads; the driver mirrors them in CPU memory so it
@@ -756,8 +800,10 @@ impl EncodeRing {
 /// MMIO trait for the encode ring — same pattern as the PSP +
 /// VMHUB Mmio traits.
 pub trait VcnEncMmio {
-    fn read(&mut self, vcn_base_plus_offset: u32) -> u32;
-    fn write(&mut self, vcn_base_plus_offset: u32, value: u32);
+    /// `reg` is the VCN block base plus an absolute dword id from
+    /// `vcn_4_0_0_offset.h`.
+    fn read(&mut self, reg: u32) -> u32;
+    fn write(&mut self, reg: u32, value: u32);
 }
 
 /// Set up the encode ring registers — programs `UVD_RB_BASE_LO`,
@@ -767,24 +813,21 @@ pub trait VcnEncMmio {
 /// Adapted from `vcn_v4_0.c::vcn_v4_0_pause_dpg_mode`
 /// register-init block (around line 1100-1108).
 pub fn setup_encode_ring_regs<M: VcnEncMmio>(mmio: &mut M, vcn_base: u32, ring: &EncodeRing) {
+    mmio.write(vcn_base + UVD_RB_BASE_LO, ring.ring_base_phys as u32);
     mmio.write(
-        vcn_base + VCN_ENC_RING_BASE_LO_REL,
-        ring.ring_base_phys as u32,
-    );
-    mmio.write(
-        vcn_base + VCN_ENC_RING_BASE_HI_REL,
+        vcn_base + UVD_RB_BASE_HI,
         (ring.ring_base_phys >> 32) as u32,
     );
-    mmio.write(vcn_base + VCN_ENC_RING_SIZE_REL, ring.ring_size_bytes);
+    mmio.write(vcn_base + UVD_RB_SIZE, ring.ring_size_bytes);
     // Reset rptr/wptr to 0 — firmware reads from there.
-    mmio.write(vcn_base + VCN_ENC_RING_RPTR_REL, 0);
-    mmio.write(vcn_base + VCN_ENC_RING_WPTR_REL, 0);
+    mmio.write(vcn_base + UVD_RB_RPTR, 0);
+    mmio.write(vcn_base + UVD_RB_WPTR, 0);
 }
 
 /// Commit the encode ring's wptr to silicon. Mirrors
 /// `vcn_v4_0.c::vcn_v4_0_unified_ring_set_wptr` (line 1785-1798).
 pub fn commit_encode_wptr<M: VcnEncMmio>(mmio: &mut M, vcn_base: u32, ring: &EncodeRing) {
-    mmio.write(vcn_base + VCN_ENC_RING_WPTR_REL, ring.wptr_dw);
+    mmio.write(vcn_base + UVD_RB_WPTR, ring.wptr_dw);
 }
 
 /// Read the firmware's current rptr — mirrors
@@ -792,7 +835,7 @@ pub fn commit_encode_wptr<M: VcnEncMmio>(mmio: &mut M, vcn_base: u32, ring: &Enc
 /// host calls this on an IH dispatch to figure out how many
 /// dwords are now drainable.
 pub fn read_encode_rptr<M: VcnEncMmio>(mmio: &mut M, vcn_base: u32) -> u32 {
-    mmio.read(vcn_base + VCN_ENC_RING_RPTR_REL)
+    mmio.read(vcn_base + UVD_RB_RPTR)
 }
 
 // Add error variant for the encode-ring path.
@@ -916,7 +959,12 @@ mod smoke_tests {
         if p.dws.len() != 11 + 2 * 2 {
             return TestResult::Fail("packet length wrong");
         }
-        if p.dws[0] != VCN_DEC_CMD_HEADER {
+        // `VCN_DEC_KMD_CMD | (VCN_DEC_CMD_PACKET_START << 1)`: the top bit is
+        // 31, not 30, and the command is shifted left one.
+        if VCN_DEC_KMD_CMD != 0x8000_0000 || dec_ring_cmd(VCN_DEC_CMD_PACKET_END) != 0x8000_0016 {
+            return TestResult::Fail("a decode-ring command is 0x80000000 | cmd << 1");
+        }
+        if p.dws[0] != 0x8000_0014 {
             return TestResult::Fail("header dword wrong");
         }
         if p.dws[2] != 0x02 {
@@ -1122,11 +1170,28 @@ mod smoke_tests {
         if m.writes.len() != 5 {
             return TestResult::Fail("expected 5 ring-setup writes");
         }
-        if m.writes[0] != (0x100 + VCN_ENC_RING_BASE_LO_REL, 0xDEAD_0000) {
-            return TestResult::Fail("base lo wrong");
+        // Dword ids from `vcn_4_0_0_offset.h`, spelled out: the buffer
+        // descriptor is 0x00ea..0x00ec and the pointer pair 0x00ac/0x00ad —
+        // two runs 0x3e dwords apart, not one block from the IP base.
+        if m.writes[0] != (0x100 + 0x00ea, 0xDEAD_0000) {
+            return TestResult::Fail("regUVD_RB_BASE_LO is 0x00ea");
         }
-        if m.writes[2] != (0x100 + VCN_ENC_RING_SIZE_REL, 4096) {
-            return TestResult::Fail("size wrong");
+        if m.writes[1] != (0x100 + 0x00eb, 0) {
+            return TestResult::Fail("regUVD_RB_BASE_HI is 0x00eb");
+        }
+        if m.writes[2] != (0x100 + 0x00ec, 4096) {
+            return TestResult::Fail("regUVD_RB_SIZE is 0x00ec");
+        }
+        if m.writes[3] != (0x100 + 0x00ac, 0) || m.writes[4] != (0x100 + 0x00ad, 0) {
+            return TestResult::Fail("the pointer pair is regUVD_RB_RPTR/_WPTR, 0x00ac/0x00ad");
+        }
+        // regUVD_RB_RPTR2/_WPTR2 sit immediately above the first pair, so the
+        // descriptor cannot be adjacent to it.
+        if UVD_RB_RPTR2 != 0x00ae || UVD_RB_WPTR2 != 0x00af {
+            return TestResult::Fail("the second ring's pointer pair is 0x00ae/0x00af");
+        }
+        if UVD_RB_BASE_LO - UVD_RB_WPTR != 0x3d {
+            return TestResult::Fail("the two runs are not adjacent");
         }
         TestResult::Pass
     }
@@ -1142,8 +1207,8 @@ mod smoke_tests {
         if m.writes.len() != 1 {
             return TestResult::Fail("expected 1 wptr write");
         }
-        if m.writes[0] != (0x100 + VCN_ENC_RING_WPTR_REL, 0x42) {
-            return TestResult::Fail("wptr write wrong");
+        if m.writes[0] != (0x100 + 0x00ad, 0x42) {
+            return TestResult::Fail("regUVD_RB_WPTR is 0x00ad");
         }
         TestResult::Pass
     }
