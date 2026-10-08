@@ -67,6 +67,8 @@ pub fn release_network_namespace(net_ns_id: u64) {
 
 pub mod arp;
 pub mod arp_cache;
+#[cfg(any(test, feature = "kernel-test"))]
+mod bench;
 pub mod bypass;
 pub mod cbpf;
 pub mod dhcp;

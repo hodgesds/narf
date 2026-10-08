@@ -3317,6 +3317,15 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
                 skip,
             }) => {
                 println!("── summary: {pass} pass, 0 fail, {skip} skip ──");
+                // Surface datapath microbenchmark metrics: `net/bench` logs
+                // `NETBENCH ...` lines to the console (ns/packet + the pps /
+                // Gb/s ceiling each primitive implies). They scroll past in the
+                // full suite, so relay them here — `cargo xtask test
+                // --kernel-tests-only --subsystem=net/bench` is the net-bench
+                // invocation and this is where its numbers show.
+                for line in text.lines().filter(|l| l.contains("NETBENCH")) {
+                    println!("{}", line.trim_end());
+                }
                 if pass == 0 {
                     println!(
                         "xtask test: WARNING — no test passed; did the subsystem filter \
