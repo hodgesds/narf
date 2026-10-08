@@ -3804,26 +3804,69 @@ kernel_test_in!(
     smoke_amdgpu_sdma6_ring_init_phoenix_delta
 );
 
-fn smoke_amdgpu_sdma6_uses_different_offsets_than_v4() -> TestResult {
-    use crate::amdgpu_sdma::{
-        SDMA6_QUEUE0_RB_BASE_REL, SDMA6_QUEUE0_RB_CNTL_REL, SDMA_GFX_RB_BASE_REL,
-        SDMA_GFX_RB_CNTL_REL,
-    };
-    // Ensure the Phoenix delta actually shifted offsets — if these
-    // ever drift to match v4 numerically, smokes that exercise
-    // both paths against shared register fixtures will silently
-    // collide. Pin the invariant.
-    if SDMA_GFX_RB_CNTL_REL == SDMA6_QUEUE0_RB_CNTL_REL {
-        return TestResult::Fail("v4 and v6 RB_CNTL offsets must differ");
+/// SDMA 6.0's ring registers sit at the SAME offsets as SDMA 4.0's.
+///
+/// Only the names changed — `mmSDMA0_GFX_*` became `regSDMA0_QUEUE0_*`, and
+/// the block moved from `sdma0/sdma0_4_0_offset.h` into
+/// `gc/gc_11_0_0_offset.h`. A reader comparing the two headers by name finds
+/// nothing in common and can conclude the numbers moved. They did not.
+///
+/// The test this replaces asserted the opposite — "ensure the Phoenix delta
+/// actually shifted offsets ... pin the invariant" — and so defended a table
+/// that matched neither generation (0x1F..0x2D against a real 0x80..0xAB).
+/// Asserting that two things differ is only ever as good as the reason they
+/// should, and there was none.
+fn smoke_amdgpu_sdma_v4_and_v6_share_offsets() -> TestResult {
+    use crate::amdgpu_sdma::*;
+
+    // Dword ids from `sdma0_4_0_offset.h` and `gc_11_0_0_offset.h`, which
+    // agree on every one.
+    let pairs: &[(u32, u32, u32)] = &[
+        (SDMA_GFX_RB_CNTL_REL, SDMA6_QUEUE0_RB_CNTL_REL, 0x80),
+        (SDMA_GFX_RB_BASE_REL, SDMA6_QUEUE0_RB_BASE_REL, 0x81),
+        (SDMA_GFX_RB_BASE_HI_REL, SDMA6_QUEUE0_RB_BASE_HI_REL, 0x82),
+        (SDMA_GFX_RB_RPTR_REL, SDMA6_QUEUE0_RB_RPTR_REL, 0x83),
+        (SDMA_GFX_RB_RPTR_HI_REL, SDMA6_QUEUE0_RB_RPTR_HI_REL, 0x84),
+        (SDMA_GFX_RB_WPTR_REL, SDMA6_QUEUE0_RB_WPTR_REL, 0x85),
+        (SDMA_GFX_RB_WPTR_HI_REL, SDMA6_QUEUE0_RB_WPTR_HI_REL, 0x86),
+        // 0x87 is WPTR_POLL_CNTL — the run is not contiguous here, which is
+        // what the previous values got wrong by assuming it was.
+        (
+            SDMA_GFX_RB_RPTR_ADDR_HI_REL,
+            SDMA6_QUEUE0_RB_RPTR_ADDR_HI_REL,
+            0x88,
+        ),
+        (
+            SDMA_GFX_RB_RPTR_ADDR_LO_REL,
+            SDMA6_QUEUE0_RB_RPTR_ADDR_LO_REL,
+            0x89,
+        ),
+        (SDMA_GFX_DOORBELL_REL, SDMA6_QUEUE0_DOORBELL_REL, 0x92),
+        (
+            SDMA_GFX_DOORBELL_OFFSET_REL,
+            SDMA6_QUEUE0_DOORBELL_OFFSET_REL,
+            0xAB,
+        ),
+    ];
+    for (v4, v6, dword) in pairs.iter().copied() {
+        if v4 != dword * 4 {
+            return TestResult::Fail("an SDMA 4.0 offset is not its header dword id");
+        }
+        if v6 != dword * 4 {
+            return TestResult::Fail("an SDMA 6.0 offset is not its header dword id");
+        }
     }
-    if SDMA_GFX_RB_BASE_REL == SDMA6_QUEUE0_RB_BASE_REL {
-        return TestResult::Fail("v4 and v6 RB_BASE offsets must differ");
+    // The gap at 0x87 is the whole point: RPTR_ADDR_HI does not follow
+    // WPTR_HI, and treating the block as one contiguous run put the
+    // writeback address into the write-pointer poll control register.
+    if SDMA_GFX_RB_RPTR_ADDR_HI_REL == SDMA_GFX_RB_WPTR_HI_REL + 4 {
+        return TestResult::Fail("RPTR_ADDR_HI must not immediately follow WPTR_HI");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
-    smoke_amdgpu_sdma6_uses_different_offsets_than_v4
+    smoke_amdgpu_sdma_v4_and_v6_share_offsets
 );
 // ─── amdgpu_ddc: EDID-read transport scaffold ────────────────────
 
@@ -9078,4 +9121,53 @@ fn smoke_amdgpu_mqd_gfx11_matches_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_mqd",
     smoke_amdgpu_mqd_gfx11_matches_linux
+);
+
+/// The SMU mailbox registers, against `mp_13_0_4_offset.h`.
+///
+/// `regMP1_SMN_C2PMSG_N` is dword `0x240 + N`: C2PMSG_64 is 0x0280, 66 is
+/// 0x0282, 82 is 0x0292, 90 is 0x029a. The offsets here were `0x29C + N * 4`,
+/// which is neither the dword id nor a byte offset derived from one — it put
+/// the argument register at byte 0x3A4 where C2PMSG_66 is at 0xA08. Every SMU
+/// message went to the wrong register and every response was read from
+/// another.
+fn smoke_amdgpu_smu_mailbox_offsets_match_mp13() -> TestResult {
+    use crate::amdgpu_smu::{
+        MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL, MP1_C2PMSG_PMFW_HI_REL, MP1_C2PMSG_PMFW_LO_REL,
+        MP1_C2PMSG_RESP_REL,
+    };
+    // (byte offset, header dword id)
+    let want: &[(u32, u32)] = &[
+        (MP1_C2PMSG_PMFW_LO_REL, 0x0280), // C2PMSG_64
+        (MP1_C2PMSG_PMFW_HI_REL, 0x0281), // C2PMSG_65
+        (MP1_C2PMSG_ARG_REL, 0x0282),     // C2PMSG_66
+        (MP1_C2PMSG_MSG_REL, 0x0292),     // C2PMSG_82
+        (MP1_C2PMSG_RESP_REL, 0x029A),    // C2PMSG_90
+    ];
+    for (got, dword) in want.iter().copied() {
+        if got != dword * 4 {
+            return TestResult::Fail("an SMU mailbox offset is not its header dword id");
+        }
+    }
+    // The three mailbox registers must be distinct, or a message would be
+    // written over its own argument or read back as its own response.
+    if MP1_C2PMSG_ARG_REL == MP1_C2PMSG_MSG_REL
+        || MP1_C2PMSG_MSG_REL == MP1_C2PMSG_RESP_REL
+        || MP1_C2PMSG_ARG_REL == MP1_C2PMSG_RESP_REL
+    {
+        return TestResult::Fail("the SMU mailbox registers must be distinct");
+    }
+    // The firmware-load pair is adjacent — C2PMSG_64 and 65 — and below the
+    // argument register, which the spacing confirms.
+    if MP1_C2PMSG_PMFW_HI_REL != MP1_C2PMSG_PMFW_LO_REL + 4 {
+        return TestResult::Fail("the PMFW address halves are adjacent registers");
+    }
+    if MP1_C2PMSG_ARG_REL != MP1_C2PMSG_PMFW_HI_REL + 4 {
+        return TestResult::Fail("C2PMSG_66 follows C2PMSG_65");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_mailbox_offsets_match_mp13
 );

@@ -86,9 +86,15 @@ pub const SDMA_GFX_RB_WPTR_REL: u32 = 0x85 * 4;
 /// `mmSDMA0_GFX_RB_WPTR_HI` — high bits of wptr.
 pub const SDMA_GFX_RB_WPTR_HI_REL: u32 = 0x86 * 4;
 /// `mmSDMA0_GFX_RB_RPTR_ADDR_HI` — writeback target hi.
-pub const SDMA_GFX_RB_RPTR_ADDR_HI_REL: u32 = 0x87 * 4;
+/// `mmSDMA0_GFX_RB_RPTR_ADDR_HI` (0x0088). Was 0x87, which is
+/// `mmSDMA0_GFX_RB_WPTR_POLL_CNTL` — the writeback address's high half was
+/// being written into the write-pointer poll control register. The run is
+/// NOT contiguous here: 0x87 sits between WPTR_HI and RPTR_ADDR_HI.
+pub const SDMA_GFX_RB_RPTR_ADDR_HI_REL: u32 = 0x88 * 4;
 /// `mmSDMA0_GFX_RB_RPTR_ADDR_LO` — writeback target lo.
-pub const SDMA_GFX_RB_RPTR_ADDR_LO_REL: u32 = 0x88 * 4;
+/// `mmSDMA0_GFX_RB_RPTR_ADDR_LO` (0x0089). Was 0x88, which is the HIGH half
+/// — so the two halves of the writeback address overwrote each other.
+pub const SDMA_GFX_RB_RPTR_ADDR_LO_REL: u32 = 0x89 * 4;
 /// `mmSDMA0_GFX_DOORBELL` — per-queue doorbell enable.
 pub const SDMA_GFX_DOORBELL_REL: u32 = 0x92 * 4;
 /// `mmSDMA0_GFX_DOORBELL_OFFSET` — BAR2 byte offset of the doorbell.
@@ -158,27 +164,32 @@ impl SdmaRingInitSequence {
 // offsets. Ring-init shape is identical to v4.
 
 /// `mmSDMA0_QUEUE0_RB_CNTL` (Phoenix).
-pub const SDMA6_QUEUE0_RB_CNTL_REL: u32 = 0x1F * 4;
-/// `mmSDMA0_QUEUE0_RB_BASE`.
-pub const SDMA6_QUEUE0_RB_BASE_REL: u32 = 0x20 * 4;
-/// `mmSDMA0_QUEUE0_RB_BASE_HI`.
-pub const SDMA6_QUEUE0_RB_BASE_HI_REL: u32 = 0x21 * 4;
-/// `mmSDMA0_QUEUE0_RB_RPTR`.
-pub const SDMA6_QUEUE0_RB_RPTR_REL: u32 = 0x22 * 4;
-/// `mmSDMA0_QUEUE0_RB_RPTR_HI`.
-pub const SDMA6_QUEUE0_RB_RPTR_HI_REL: u32 = 0x23 * 4;
-/// `mmSDMA0_QUEUE0_RB_WPTR`.
-pub const SDMA6_QUEUE0_RB_WPTR_REL: u32 = 0x24 * 4;
-/// `mmSDMA0_QUEUE0_RB_WPTR_HI`.
-pub const SDMA6_QUEUE0_RB_WPTR_HI_REL: u32 = 0x25 * 4;
-/// `mmSDMA0_QUEUE0_RB_RPTR_ADDR_HI`.
-pub const SDMA6_QUEUE0_RB_RPTR_ADDR_HI_REL: u32 = 0x26 * 4;
-/// `mmSDMA0_QUEUE0_RB_RPTR_ADDR_LO`.
-pub const SDMA6_QUEUE0_RB_RPTR_ADDR_LO_REL: u32 = 0x27 * 4;
-/// `mmSDMA0_QUEUE0_DOORBELL` (Phoenix).
-pub const SDMA6_QUEUE0_DOORBELL_REL: u32 = 0x2C * 4;
-/// `mmSDMA0_QUEUE0_DOORBELL_OFFSET` (Phoenix).
-pub const SDMA6_QUEUE0_DOORBELL_OFFSET_REL: u32 = 0x2D * 4;
+// SDMA 6.0's register offsets are IDENTICAL to SDMA 4.0's. Only the names
+// changed — `mmSDMA0_GFX_*` became `regSDMA0_QUEUE0_*`, and the block moved
+// into `gc_11_0_0_offset.h` — so a reader comparing the two headers by name
+// finds nothing in common and may conclude the numbers moved too. They did
+// not. This table held 0x1F..0x2D, which matches neither generation.
+pub const SDMA6_QUEUE0_RB_CNTL_REL: u32 = 0x80 * 4;
+/// `regSDMA0_QUEUE0_RB_BASE` (0x0081).
+pub const SDMA6_QUEUE0_RB_BASE_REL: u32 = 0x81 * 4;
+/// `regSDMA0_QUEUE0_RB_BASE_HI` (0x0082).
+pub const SDMA6_QUEUE0_RB_BASE_HI_REL: u32 = 0x82 * 4;
+/// `regSDMA0_QUEUE0_RB_RPTR` (0x0083).
+pub const SDMA6_QUEUE0_RB_RPTR_REL: u32 = 0x83 * 4;
+/// `regSDMA0_QUEUE0_RB_RPTR_HI` (0x0084).
+pub const SDMA6_QUEUE0_RB_RPTR_HI_REL: u32 = 0x84 * 4;
+/// `regSDMA0_QUEUE0_RB_WPTR` (0x0085).
+pub const SDMA6_QUEUE0_RB_WPTR_REL: u32 = 0x85 * 4;
+/// `regSDMA0_QUEUE0_RB_WPTR_HI` (0x0086).
+pub const SDMA6_QUEUE0_RB_WPTR_HI_REL: u32 = 0x86 * 4;
+/// `regSDMA0_QUEUE0_RB_RPTR_ADDR_HI` (0x0088) — 0x87 is WPTR_POLL_CNTL.
+pub const SDMA6_QUEUE0_RB_RPTR_ADDR_HI_REL: u32 = 0x88 * 4;
+/// `regSDMA0_QUEUE0_RB_RPTR_ADDR_LO` (0x0089).
+pub const SDMA6_QUEUE0_RB_RPTR_ADDR_LO_REL: u32 = 0x89 * 4;
+/// `regSDMA0_QUEUE0_DOORBELL` (0x0092).
+pub const SDMA6_QUEUE0_DOORBELL_REL: u32 = 0x92 * 4;
+/// `regSDMA0_QUEUE0_DOORBELL_OFFSET` (0x00ab).
+pub const SDMA6_QUEUE0_DOORBELL_OFFSET_REL: u32 = 0xAB * 4;
 
 /// Build the SDMA v6.0 ring-init sequence (Phoenix HawkPoint1).
 /// Structurally identical to v4 — same disable / base / wptr_addr /

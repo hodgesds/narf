@@ -51,14 +51,39 @@
 
 extern crate alloc;
 
-// ── Register offsets (relative to MP1 IP-block base) ───────────────
+// ── Register offsets (relative to the MP1 IP-block base) ───────────
+//
+// `regMP1_SMN_C2PMSG_N` is dword `0x240 + N`, which the headers bear out:
+// C2PMSG_64 is 0x0280, 65 is 0x0281, 66 is 0x0282, 82 is 0x0292 and 90 is
+// 0x029a. The byte offset is that times four.
+//
+// These were `0x29C + N * 4`, a formula that is neither the dword id nor a
+// byte offset derived from one: it put the argument register at byte 0x3A4
+// where C2PMSG_66 is at 0xA08. Every SMU message — the version handshake,
+// GFX power up and down, the DPM frequency calls — went to the wrong
+// register, and the response was read from another wrong one.
+//
+// LINUX-GAP: on Phoenix (`mp_13_0_4_offset.h`) these are **BASE_IDX 1**, so
+// they are addressed from the MP1 block's second window. `mp1_base` here is
+// a single value and the callers pass window 0, which is the same shape of
+// gap recorded for the GC registers in `amdgpu_gfx`. Resolving the second
+// window is the fix; until then an SMU message lands in the wrong window
+// even with the right offset.
 
-/// MP1_C2PMSG_66 — argument register (host → SMU).
-pub const MP1_C2PMSG_ARG_REL: u32 = 0x29C + 66 * 4;
-/// MP1_C2PMSG_82 — message-id register (host → SMU).
-pub const MP1_C2PMSG_MSG_REL: u32 = 0x29C + 82 * 4;
-/// MP1_C2PMSG_90 — response register (SMU → host).
-pub const MP1_C2PMSG_RESP_REL: u32 = 0x29C + 90 * 4;
+/// Dword id of `regMP1_SMN_C2PMSG_0`, from which the rest follow.
+const MP1_C2PMSG_BASE_DWORD: u32 = 0x240;
+
+/// Byte offset of `regMP1_SMN_C2PMSG_<n>` within the MP1 window.
+const fn mp1_c2pmsg(n: u32) -> u32 {
+    (MP1_C2PMSG_BASE_DWORD + n) * 4
+}
+
+/// `MP1_SMN_C2PMSG_66` — argument register (host → SMU).
+pub const MP1_C2PMSG_ARG_REL: u32 = mp1_c2pmsg(66);
+/// `MP1_SMN_C2PMSG_82` — message-id register (host → SMU).
+pub const MP1_C2PMSG_MSG_REL: u32 = mp1_c2pmsg(82);
+/// `MP1_SMN_C2PMSG_90` — response register (SMU → host).
+pub const MP1_C2PMSG_RESP_REL: u32 = mp1_c2pmsg(90);
 
 // ── Response codes ──────────────────────────────────────────────────
 
@@ -142,9 +167,9 @@ pub const PPSMC_MSG_PREPARE_MP1_FOR_UNLOAD: u32 = 0x35;
 /// MP1_C2PMSG_64 — PMFW phys-lo on input; never used for other
 /// SMU messages so collisions with `send_message_*` are
 /// structurally impossible (those use slot 90).
-pub const MP1_C2PMSG_PMFW_LO_REL: u32 = 0x29C + 64 * 4;
+pub const MP1_C2PMSG_PMFW_LO_REL: u32 = mp1_c2pmsg(64);
 /// MP1_C2PMSG_65 — PMFW phys-hi.
-pub const MP1_C2PMSG_PMFW_HI_REL: u32 = 0x29C + 65 * 4;
+pub const MP1_C2PMSG_PMFW_HI_REL: u32 = mp1_c2pmsg(65);
 
 /// `PPSMC_MSG_LoadMicrocode` — Phoenix-class only (smu_v14+).
 /// Tells the MP1 ROM to start consuming the PMFW image at the
