@@ -800,6 +800,72 @@ impl Igc {
         Ok(())
     }
 
+    /// Zero-copy transmit (P-F): post the TX descriptor pointing straight at
+    /// the `Frame`'s own DMA buffer — no copy into the shared `tx_buf`, unlike
+    /// [`Self::tx`]. Honors the frame's `TxMeta` (advanced TSO / checksum
+    /// descriptor, else legacy). igc TX is synchronous (polls Done), so the
+    /// device is finished the moment this returns and the caller may drop or
+    /// recycle the buffer immediately.
+    pub fn tx_frame(&self, frame: &Frame) -> Result<(), IgcError> {
+        let len = frame.len() as usize;
+        if len == 0 || len > FRAME_SIZE {
+            return Err(IgcError::QueueTooSmall);
+        }
+        let buf_phys = frame.buf().dma_addr_at(frame.offset() as u64).raw();
+        let meta = frame.tx_meta();
+        let mut tail = self.tx_tail.lock();
+        let idx = *tail as usize;
+        let ring_phys = self.tx_ring_buf.dma_addr().raw();
+        let desc_addr = ring_phys + (idx * 16) as u64;
+        if let Some(mss) = meta.tso_mss {
+            // SAFETY: identity-mapped DMA, idx < TX_RING_LEN.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvTxDataDesc>(),
+                    AdvTxDataDesc::with_tso(buf_phys, len as u16, mss),
+                );
+            }
+        } else if meta.csum_l4.is_some() {
+            // SAFETY: same.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvTxDataDesc>(),
+                    AdvTxDataDesc::with_csum(buf_phys, len as u16),
+                );
+            }
+        } else {
+            // SAFETY: identity-mapped DMA, idx < TX_RING_LEN.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<LegacyTxDesc>(),
+                    LegacyTxDesc {
+                        addr: buf_phys,
+                        length: len as u16,
+                        cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let next = ((idx + 1) % TX_RING_LEN) as u16;
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_TDT, next as u32);
+        }
+        // Poll Done; the device reads the frame's buffer directly in this window.
+        let done = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped DMA.
+            || unsafe { core::ptr::read_volatile((narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u8>()).add(12)) } & TXD_STAT_DD != 0,
+            narf_time::Deadline::after_ms(250),
+        );
+        if !done {
+            return Err(IgcError::ResetTimeout);
+        }
+        *tail = next;
+        Ok(())
+    }
+
     /// Receive a single frame using the advanced RX descriptor
     /// format; returns the byte count copied into `out`, or 0 if no
     /// frame is currently available.
@@ -1072,7 +1138,10 @@ async fn igc_rx_pump(device: Arc<Igc>, mut rx_prod: Producer<Frame, RX_RING_N>) 
 }
 
 async fn igc_tx_pump(device: Arc<Igc>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    // Zero-copy (P-F): DMA each frame straight out of its own buffer and honor
+    // the TxMeta the stack set, instead of copying the payload into the shared
+    // tx_buf and forcing plain metadata.
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.tx(frame.payload(), &TxMeta::plain());
+        let _ = device.tx_frame(&frame);
     }
 }
