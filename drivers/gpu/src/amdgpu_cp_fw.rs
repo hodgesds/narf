@@ -18,8 +18,15 @@
 //!   6. Poll `CP_<eng>_IC_OP_CNTL.ICACHE_PRIMED = 1` — wait for the
 //!      prime to complete.
 //!
-//! After all three engines are primed, the driver clears `CP_GFX_CNTL`
-//! to unhalt them and the CP starts fetching PM4 from the ring.
+//! LINUX-GAP: priming the caches does not start the engines, and the unhalt
+//! is not one register. `gfx_v11_0_cp_gfx_load_pfp_microcode_rs64` also sets
+//! `CP_PFP_PRGRM_CNTR_START`/`_HI` per pipe and toggles `CP_ME_CNTL`'s
+//! per-pipe `PFP_PIPEn_RESET` then `PFP_PIPEn_ACTIVE`; the data sections go
+//! through a second register set (`CP_GFX_RS64_DC_BASE0_LO`/`_HI`,
+//! `CP_GFX_RS64_DC_BASE_CNTL` 0x2a08, `CP_GFX_RS64_DC_OP_CNTL` 0x2a09 for
+//! PFP/ME; `CP_MEC_MDBASE_LO`/`_HI` with `CP_MEC_DC_*` for the MEC), and the
+//! MEC is released through `CP_MEC_RS64_CNTL.MEC_HALT`. None of that is here.
+//! `CP_GFX_CNTL` (0x2a00) exists but is not the unhalt.
 //!
 //! ## References (post 2026-05-20 GPL relicense)
 //!
@@ -51,25 +58,45 @@ pub const CP_ME_IC_BASE_HI: u32 = 0x5845;
 pub const CP_ME_IC_BASE_CNTL: u32 = 0x5846;
 pub const CP_ME_IC_OP_CNTL: u32 = 0x5847;
 
-// MEC (Micro Engine for Compute) — compute queue scheduler. The
-// MEC firmware is loaded into its own RS64-based engine with the
-// CP_MEC_DC_BASE / CP_MEC_RS64_CNTL register block at 0x5870+.
+// MEC (Micro Engine for Compute) — compute queue scheduler. Its instruction
+// cache is the **CPC** block, not the MEC block: `CP_CPC_IC_BASE_*` and
+// `CP_CPC_IC_OP_CNTL`, which `gfx_v11_0_cp_compute_load_microcode_rs64` is
+// what programs with the MEC firmware's address.
+pub const CP_CPC_IC_BASE_LO: u32 = 0x584c;
+pub const CP_CPC_IC_BASE_HI: u32 = 0x584d;
+pub const CP_CPC_IC_BASE_CNTL: u32 = 0x584e;
+/// The CPC's OP_CNTL is nowhere near its BASE registers: 0x297a against
+/// 0x584c. PFP and ME keep theirs adjacent; this one does not.
+pub const CP_CPC_IC_OP_CNTL: u32 = 0x297a;
+
+// The MEC **data** cache is a separate block, and its control register is not
+// adjacent to its bases either — 0x290b follows 0x5871.
 pub const CP_MEC_DC_BASE_LO: u32 = 0x5870;
 pub const CP_MEC_DC_BASE_HI: u32 = 0x5871;
-pub const CP_MEC_DC_BASE_CNTL: u32 = 0x5872;
+pub const CP_MEC_DC_BASE_CNTL: u32 = 0x290b;
+pub const CP_MEC_DC_OP_CNTL: u32 = 0x290c;
+/// Engine halt/reset/step control, with per-pipe `MEC_PIPEn_RESET` at 16..19
+/// and `MEC_PIPEn_ACTIVE` at 26..29. Not an OP_CNTL: its bit 4 is
+/// `MEC_INVALIDATE_ICACHE`, and it carries `MEC_HALT` at bit 30.
 pub const CP_MEC_RS64_CNTL: u32 = 0x2904;
 pub const CP_MEC_RS64_INSTR_PNTR: u32 = 0x2908;
 
-// IC_OP_CNTL bits per gc_11_0_0_sh_mask.h.
-pub const IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_SHIFT: u32 = 0;
-pub const IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_BIT: u32 = 1 << 0;
-pub const IC_OP_CNTL_PRIME_ICACHE_BIT: u32 = 1 << 1;
-pub const IC_OP_CNTL_ICACHE_PRIMED_BIT: u32 = 1 << 2;
+// IC_OP_CNTL bits per gc_11_0_0_sh_mask.h. They are not consecutive from
+// zero: the request and its completion are adjacent, then a three-bit gap
+// before the prime pair.
+pub const IC_OP_CNTL_INVALIDATE_CACHE_BIT: u32 = 1 << 0;
+pub const IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_SHIFT: u32 = 1;
+pub const IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_BIT: u32 = 1 << 1;
+pub const IC_OP_CNTL_PRIME_ICACHE_BIT: u32 = 1 << 4;
+pub const IC_OP_CNTL_ICACHE_PRIMED_BIT: u32 = 1 << 5;
 
-// IC_BASE_CNTL bits.
+// IC_BASE_CNTL bits. `CACHE_POLICY` is two bits at 24, not three at 4 —
+// bits 6:4 are `ADDRESS_CLAMP` and reserved space, so clearing 0x70 would
+// clear the address clamp and leave the cache policy untouched.
 pub const IC_BASE_CNTL_VMID_MASK: u32 = 0x0000_000F;
-pub const IC_BASE_CNTL_CACHE_POLICY_MASK: u32 = 0x0000_0070;
+pub const IC_BASE_CNTL_ADDRESS_CLAMP: u32 = 1 << 4;
 pub const IC_BASE_CNTL_EXE_DISABLE: u32 = 1 << 23;
+pub const IC_BASE_CNTL_CACHE_POLICY_MASK: u32 = 0x0300_0000;
 
 // ── Engine identifier ─────────────────────────────────────────────
 
@@ -97,13 +124,16 @@ impl CpEngine {
                 CP_ME_IC_BASE_CNTL,
                 CP_ME_IC_OP_CNTL,
             ),
+            // The MEC's instruction cache is the CPC block. The MEC_DC
+            // registers are its *data* cache, and CP_MEC_RS64_CNTL is the
+            // engine's halt/reset control — neither is an instruction-cache
+            // OP_CNTL, and writing a prime request into the latter would land
+            // on reserved bits next to MEC_HALT.
             CpEngine::Mec => (
-                CP_MEC_DC_BASE_LO,
-                CP_MEC_DC_BASE_HI,
-                CP_MEC_DC_BASE_CNTL,
-                // MEC RS64 OP_CNTL — different reg from PFP/ME but
-                // bit layout matches.
-                CP_MEC_RS64_CNTL,
+                CP_CPC_IC_BASE_LO,
+                CP_CPC_IC_BASE_HI,
+                CP_CPC_IC_BASE_CNTL,
+                CP_CPC_IC_OP_CNTL,
             ),
         }
     }
@@ -304,21 +334,74 @@ mod smoke_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
+    /// Dword ids spelled out from `gc_11_0_0_offset.h`. PFP and ME keep their
+    /// quads adjacent; nothing else in this block does, so none of the other
+    /// values can be reached by continuing a run.
     fn smoke_engine_register_quads_correct() -> TestResult {
         let (lo, hi, cntl, op) = CpEngine::Pfp.registers();
         if lo != 0x5840 || hi != 0x5841 || cntl != 0x5842 || op != 0x5843 {
             return TestResult::Fail("PFP regs wrong");
         }
-        let (lo, _, _, _) = CpEngine::Me.registers();
-        if lo != 0x5844 {
-            return TestResult::Fail("ME base_lo wrong");
+        let (lo, hi, cntl, op) = CpEngine::Me.registers();
+        if lo != 0x5844 || hi != 0x5845 || cntl != 0x5846 || op != 0x5847 {
+            return TestResult::Fail("ME regs wrong");
         }
-        let (lo, _, _, _) = CpEngine::Mec.registers();
-        if lo != 0x5870 {
-            return TestResult::Fail("MEC base_lo wrong");
+        // The MEC's instruction cache is the CPC block, and its OP_CNTL is in
+        // a different part of the map from its bases.
+        let (lo, hi, cntl, op) = CpEngine::Mec.registers();
+        if lo != 0x584c || hi != 0x584d || cntl != 0x584e {
+            return TestResult::Fail("MEC loads through CP_CPC_IC_BASE_*, not CP_MEC_DC_*");
+        }
+        if op != 0x297a {
+            return TestResult::Fail("regCP_CPC_IC_OP_CNTL is 0x297a, far from its bases");
+        }
+        // The MEC data cache is a separate block whose control register is
+        // likewise not adjacent to its bases; 0x5872 is regCP_MEC_MIBOUND_LO.
+        if CP_MEC_DC_BASE_LO != 0x5870 || CP_MEC_DC_BASE_HI != 0x5871 {
+            return TestResult::Fail("MEC data cache bases");
+        }
+        if CP_MEC_DC_BASE_CNTL != 0x290b || CP_MEC_DC_OP_CNTL != 0x290c {
+            return TestResult::Fail("regCP_MEC_DC_BASE_CNTL is 0x290b, not 0x5872");
+        }
+        if CP_MEC_RS64_CNTL != 0x2904 || CP_MEC_RS64_INSTR_PNTR != 0x2908 {
+            return TestResult::Fail("MEC engine control registers");
         }
         TestResult::Pass
     }
+
+    /// `gc_11_0_0_sh_mask.h`. Neither bitfield runs consecutively from zero,
+    /// which is the shape a hand-filled table falls into.
+    fn smoke_cp_fw_register_bitfields() -> TestResult {
+        // INVALIDATE_CACHE 0, INVALIDATE_CACHE_COMPLETE 1, then a gap, then
+        // PRIME_ICACHE 4 and ICACHE_PRIMED 5. Polling bit 0 for completion
+        // would read the request back.
+        if IC_OP_CNTL_INVALIDATE_CACHE_BIT != 1
+            || IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_BIT != 1 << 1
+            || IC_OP_CNTL_INVALIDATE_CACHE_COMPLETE_SHIFT != 1
+        {
+            return TestResult::Fail("the invalidate request is bit 0 and its completion bit 1");
+        }
+        if IC_OP_CNTL_PRIME_ICACHE_BIT != 1 << 4 || IC_OP_CNTL_ICACHE_PRIMED_BIT != 1 << 5 {
+            return TestResult::Fail("PRIME_ICACHE is bit 4 and ICACHE_PRIMED bit 5");
+        }
+        // VMID 3:0, ADDRESS_CLAMP 4, EXE_DISABLE 23, CACHE_POLICY 25:24.
+        if IC_BASE_CNTL_VMID_MASK != 0xF || IC_BASE_CNTL_ADDRESS_CLAMP != 1 << 4 {
+            return TestResult::Fail("VMID is 3:0 and ADDRESS_CLAMP bit 4");
+        }
+        if IC_BASE_CNTL_EXE_DISABLE != 1 << 23 {
+            return TestResult::Fail("EXE_DISABLE is bit 23");
+        }
+        if IC_BASE_CNTL_CACHE_POLICY_MASK != 0x0300_0000 {
+            return TestResult::Fail("CACHE_POLICY is two bits at 24, not three at 4");
+        }
+        // The two must not overlap: a 0x70 cache-policy mask would have
+        // swallowed ADDRESS_CLAMP and cleared it instead.
+        if IC_BASE_CNTL_CACHE_POLICY_MASK & IC_BASE_CNTL_ADDRESS_CLAMP != 0 {
+            return TestResult::Fail("the cache policy mask must not cover ADDRESS_CLAMP");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_cp_fw_register_bitfields);
     kernel_test_in!("drivers/gpu", smoke_engine_register_quads_correct);
 
     fn smoke_load_cp_fw_rejects_unaligned() -> TestResult {
@@ -393,7 +476,7 @@ mod smoke_tests {
                 found_pfp_first = true;
                 break;
             }
-            if *off == CP_ME_IC_BASE_LO << 2 || *off == CP_MEC_DC_BASE_LO << 2 {
+            if *off == CP_ME_IC_BASE_LO << 2 || *off == CP_CPC_IC_BASE_LO << 2 {
                 return TestResult::Fail("ME/MEC written before PFP");
             }
         }
