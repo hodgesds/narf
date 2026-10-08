@@ -955,8 +955,8 @@ kernel_test_in!(
 #[allow(unused_assignments)]
 fn smoke_amdgpu_mes_startup_set_hw_resources() -> TestResult {
     use crate::amdgpu_mes::{
-        build_set_hw_resources, decode_api_header, MesApiOpcode, MesRing, MES_API_FRAME_DWORDS,
-        MES_API_TYPE_SCHEDULER,
+        build_set_hw_resources, decode_api_header, hw_rsrc_flags, MesApiOpcode, MesHwResources,
+        MesRing, MES_API_FRAME_DWORDS, MES_API_TYPE_SCHEDULER,
     };
 
     // Fake state machine: Reset → Configured → Ready.
@@ -970,7 +970,15 @@ fn smoke_amdgpu_mes_startup_set_hw_resources() -> TestResult {
 
     let mut ring = MesRing::new(0x10_0000, 8 * 1024, 0x80).expect("MES ring");
 
-    let pkt = build_set_hw_resources(0xFFFE, 0xFFFE, 0xFFFF_FFFE, 0x01, 0x01, true);
+    let pkt = build_set_hw_resources(&MesHwResources {
+        vmid_mask_mmhub: 0xFFFE,
+        vmid_mask_gfxhub: 0xFFFE,
+        compute_hqd_mask: [0xFFFF_FFFE, 0, 0, 0, 0, 0, 0, 0],
+        gfx_hqd_mask: [0x01, 0],
+        sdma_hqd_mask: [0x01, 0],
+        flags: hw_rsrc_flags::DEFAULTS,
+        ..MesHwResources::default()
+    });
     if pkt.len() != MES_API_FRAME_DWORDS {
         return TestResult::Fail("SET_HW_RSRC frame not padded");
     }
