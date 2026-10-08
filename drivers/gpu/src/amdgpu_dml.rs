@@ -496,7 +496,10 @@ const DISPCLK_DELAY_SUBTOTAL: i64 = 119;
 const MAX_INTER_DCN_TILE_REPEATERS: i64 = 8;
 /// `VBlankNomDefaultUS`.
 const VBLANK_NOM_DEFAULT_US: i64 = 668;
-/// `__DML_VBA_MIN_VSTARTUP__` and the DST_Y_PREFETCH register's U6.2 ceiling.
+/// `__DML_VBA_MIN_VSTARTUP__`, and the clamp
+/// `CalculateVStartupAndRelevantOtherParameters` applies — 1023, which is the
+/// width of `OTG_VSTARTUP_PARAM.VSTARTUP_START` (mask `0x3FF`), not a
+/// DST_Y_PREFETCH limit.
 const MIN_VSTARTUP: u32 = 9;
 const MAX_VSTARTUP: u32 = 1023;
 /// `max_vratio_pre`: prefetch may not exceed four source lines per dest line.

@@ -217,9 +217,7 @@ const MM_DATA: u64 = 0x0004;
 // that pre-relicense scaffold mislabelled LOAD_TA). Re-export
 // the names load_firmware uses inline below.
 use crate::amdgpu_psp::{
-    MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL, PSP_CMD_AUTOLOAD_RLC,
-    PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC, PSP_STATUS_CODE_MASK,
-    PSP_STATUS_DONE_BIT,
+    PSP_CMD_AUTOLOAD_RLC, PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC,
 };
 
 // ── Chip-info table ────────────────────────────────────────────────
@@ -1040,59 +1038,21 @@ impl AmdGpu {
             return Err(AmdgpuError::FirmwareLoadFailed);
         }
 
-        // Step 2-3: program phys + size + command.
-        // SAFETY: BAR5 mapped, exclusive owner; mp0_base + offsets
-        // are valid register-bus addresses for this family.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
-            mm_write(
-                &self.regs,
-                mp0_base + MP0_C2PMSG_67_REL,
-                (phys >> 32) as u32,
-            );
-        }
-        compiler_fence(Ordering::SeqCst);
-        let cmd = PSP_CMD_LOAD_IP_FW | (size << 8);
-        // SAFETY: same.
-        unsafe {
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, cmd);
-        }
-
-        // Step 4-5: poll MP0_C2PMSG_64 for the done bit. PSP
-        // typically responds within ~50 ms; bound the spin so a
-        // wedged controller surfaces as FirmwareLoadFailed.
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
-        // alive during this multi-millisecond wait. 500 ms wedge
-        // threshold (10x typical PSP TA-load latency).
-        let _ = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) } & PSP_STATUS_DONE_BIT != 0,
-            narf_time::Deadline::after_ms(500),
-        );
-        // SAFETY: identity-mapped MMIO.
-        let last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
-        if last & PSP_STATUS_DONE_BIT == 0 {
-            return Err(AmdgpuError::FirmwareLoadFailed);
-        }
-        if last & PSP_STATUS_CODE_MASK != 0 {
-            // PSP rejected the image. Status codes are
-            // ASIC-specific; surface them so callers can log.
-            return Err(AmdgpuError::FirmwareLoadFailed);
-        }
-
-        // Step 6: record the version coupling.
-        narf_drivers::set_bound_firmware(
-            "amdgpu",
-            narf_drivers::BoundFirmware {
-                blob_name: alloc::string::String::from(self.chip.fw_name),
-                sha256: view.sha256,
-                signer: view.signer,
-                version: None,
-            },
-        );
-        self.fw_loaded = true;
-        Ok(())
+        // LINUX-GAP: there is no MP0 mailbox command that loads a firmware
+        // image. What stood here wrote `phys` lo/hi to C2PMSG_64 and _67, a
+        // `cmd | size << 8` trigger to C2PMSG_69, and polled C2PMSG_64 for a
+        // completion — a sequence that appears in no `psp_v*.c`. C2PMSG_67 is
+        // never addressed by the driver, no command word packs a size, and
+        // the register polled for completion is always the one the command
+        // was written to. `GFX_CMD_ID_LOAD_IP_FW` is the `cmd_id` of a
+        // `psp_gfx_cmd_resp` placed in the GPCOM ring buffer, which
+        // `amdgpu_psp_ring` builds and the live bring-up path uses.
+        //
+        // Fail closed rather than write that to live registers. Rewiring this
+        // scaffold onto the ring, and recording `BoundFirmware` when it
+        // succeeds, is the follow-up.
+        let _ = (mp0_base, phys, size, view.sha256, view.signer);
+        Err(AmdgpuError::UnsupportedFirmwareLoad)
     }
 
     /// Dispatch one firmware blob through the PSP mailbox using
@@ -1143,57 +1103,13 @@ impl AmdGpu {
             return Err(AmdgpuError::FirmwareLoadFailed);
         }
 
-        // SAFETY: BAR5 mapped, exclusive owner; mp0_base + offsets
-        // are valid register-bus addresses for this family.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
-            mm_write(
-                &self.regs,
-                mp0_base + MP0_C2PMSG_67_REL,
-                (phys >> 32) as u32,
-            );
-        }
-        compiler_fence(Ordering::SeqCst);
-        let trigger = (entry.cmd & 0xFF) | (size << 8);
-        // SAFETY: same.
-        unsafe {
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, trigger);
-        }
-
-        // Poll for done bit. 500 ms wedge threshold matches per-IP
-        // load latency (PSP TA-load is the slowest at ~50 ms typical).
-        let _ = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) }
-                & PSP_STATUS_DONE_BIT
-                != 0,
-            narf_time::Deadline::after_ms(500),
-        );
-        // SAFETY: identity-mapped MMIO.
-        let last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
-        if last & PSP_STATUS_DONE_BIT == 0 {
-            return Err(AmdgpuError::FirmwareLoadFailed);
-        }
-        if last & PSP_STATUS_CODE_MASK != 0 {
-            return Err(AmdgpuError::FirmwareLoadFailed);
-        }
-
-        // Record the version coupling. set_bound_firmware overwrites
-        // the previous entry per driver, so the LAST blob loaded
-        // surfaces in the inventory — which is what an operator
-        // wants (the most-recent PSP transaction's signer/sha).
-        // Full multi-blob history is a follow-up if we ever need it.
-        narf_drivers::set_bound_firmware(
-            "amdgpu",
-            narf_drivers::BoundFirmware {
-                blob_name: alloc::string::String::from(entry.name),
-                sha256: view.sha256,
-                signer: view.signer,
-                version: None,
-            },
-        );
-        Ok(true)
+        // LINUX-GAP: as in `load_firmware` — the mailbox carries no image
+        // load, so there is nothing correct to write here. Every `FwEntry`
+        // command in `chip.fw_list` (`LOAD_IP_FW`, `LOAD_TA`, `LOAD_ASD`,
+        // `LOAD_TOC`) is a GPCOM ring `cmd_id`, which `amdgpu_psp_ring`
+        // submits. Fail closed until this is rewired onto that ring.
+        let _ = (mp0_base, phys, size, entry.cmd, view.sha256, view.signer);
+        Err(AmdgpuError::UnsupportedFirmwareLoad)
     }
 
     /// Dispatch an SMU PMFW blob via the MP1 mailbox. Phoenix-class
@@ -1564,35 +1480,13 @@ unsafe fn psp_send_control_command(
     mp0_base: u32,
     cmd: u32,
 ) -> Result<(), AmdgpuError> {
-    // Per psp_gfx_if.h, control commands occupy the same mailbox
-    // slot family as image-load commands. Lo/hi phys slots get
-    // zero (or harmless prior contents — PSP ignores them for the
-    // commands that don't consume an image).
-    // SAFETY: caller-asserted exclusive MMIO.
-    unsafe {
-        mm_write(regs, mp0_base + MP0_C2PMSG_64_REL, 0);
-        mm_write(regs, mp0_base + MP0_C2PMSG_67_REL, 0);
-    }
-    compiler_fence(Ordering::SeqCst);
-    let trigger = cmd & 0xFF;
-    // SAFETY: same.
-    unsafe {
-        mm_write(regs, mp0_base + MP0_C2PMSG_69_REL, trigger);
-    }
-    let _ = narf_scheduler::responsive_spin_until(
-        // SAFETY: identity-mapped MMIO.
-        || unsafe { mm_read(regs, mp0_base + MP0_C2PMSG_64_REL) } & PSP_STATUS_DONE_BIT != 0,
-        narf_time::Deadline::after_ms(500),
-    );
-    // SAFETY: identity-mapped MMIO.
-    let last = unsafe { mm_read(regs, mp0_base + MP0_C2PMSG_64_REL) };
-    if last & PSP_STATUS_DONE_BIT == 0 {
-        return Err(AmdgpuError::FirmwareLoadFailed);
-    }
-    if last & PSP_STATUS_CODE_MASK != 0 {
-        return Err(AmdgpuError::FirmwareLoadFailed);
-    }
-    Ok(())
+    // LINUX-GAP: `AUTOLOAD_RLC`, `BOOT_CFG` and the rest of `psp_gfx_cmd_id`
+    // are GPCOM ring commands, not mailbox commands. The MP0 mailbox accepts
+    // only `psp_bootloader_cmd` values on C2PMSG_35 and `psp_gfx_ctrl_cmd_id`
+    // values on C2PMSG_64; `amdgpu_psp::ring_control` is the entry point for
+    // the latter, and `amdgpu_psp_ring` carries the former kind.
+    let _ = (regs, mp0_base, cmd);
+    Err(AmdgpuError::UnsupportedFirmwareLoad)
 }
 
 /// Per-initialize report — what the host learned about the chip

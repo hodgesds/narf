@@ -2350,81 +2350,220 @@ kernel_test_in!(
 
 // ── amdgpu/psp ─────────────────────────────────────────────────────
 //
-// PSP MP0 mailbox smokes. The real PSP firmware-load handshake
-// goes through `AmdGpu::load_firmware` which the tests can't
-// execute (needs BAR5 + a real registry blob). The protocol
-// primitive lives in `amdgpu_psp::send_command` and is testable
-// against a `MockPsp` that scripts the canonical sequence.
+// MP0 mailbox smokes. The mailbox carries three operations: the sign-of-life
+// read, the bootloader component load, and ring create/control. Firmware
+// images go through the GPCOM ring instead — `amdgpu_psp_ring` — so there is
+// no mailbox image-load sequence to test.
+//
+// Register offsets are literals here, from `mp_13_0_4_offset.h`: C2PMSG_N is
+// dword 0x40 + N, so byte 0x100 + N * 4 within the MP0 window.
 
-fn smoke_amdgpu_psp_send_command_drives_canonical_sequence() -> TestResult {
+fn smoke_amdgpu_psp_mailbox_register_offsets() -> TestResult {
     use crate::amdgpu_psp::{
-        send_command, MockPsp, MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL,
-        PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
+        MP0_C2PMSG_35_REL, MP0_C2PMSG_36_REL, MP0_C2PMSG_64_REL, MP0_C2PMSG_69_REL,
+        MP0_C2PMSG_70_REL, MP0_C2PMSG_71_REL, MP0_C2PMSG_81_REL, PSP_STATUS_CODE_MASK,
+        PSP_STATUS_DONE_BIT,
     };
-    let mp0_base = 0x000B_0000;
-    let lo = mp0_base + MP0_C2PMSG_64_REL;
-    let hi = mp0_base + MP0_C2PMSG_67_REL;
-    let trig = mp0_base + MP0_C2PMSG_69_REL;
-
-    let mut m = MockPsp::new();
-    // Step 4: poll — PSP reports DONE + status 0.
-    m.stage_read(lo, PSP_STATUS_DONE_BIT);
-
-    let phys: u64 = 0x1_2345_6789;
-    let size: u32 = 0x4000; // 16 KiB image
-    match send_command(&mut m, mp0_base, PSP_CMD_LOAD_IP_FW, phys, size) {
-        Ok(0) => {}
-        Ok(other) => {
-            let _ = other;
-            return TestResult::Fail("expected status 0 on happy path");
-        }
-        Err(e) => {
-            let _ = e;
-            return TestResult::Fail("send_command errored on happy path");
-        }
+    // regMP0_SMN_C2PMSG_35 = 0x0063 dwords -> 0x18c bytes, and so on.
+    if MP0_C2PMSG_35_REL != 0x18c || MP0_C2PMSG_36_REL != 0x190 {
+        return TestResult::Fail("bootloader slots are C2PMSG_35/36 at dwords 0x63/0x64");
     }
-
-    // Captured writes (in order): phys lo, phys hi, trigger word.
-    if m.writes.len() != 3 {
-        return TestResult::Fail("expected exactly 3 mailbox writes");
+    if MP0_C2PMSG_64_REL != 0x200 {
+        return TestResult::Fail("C2PMSG_64 is dword 0x80, byte 0x200");
     }
-    if m.writes[0] != (lo, phys as u32) {
-        return TestResult::Fail("phys-lo write missing or wrong");
+    if MP0_C2PMSG_69_REL != 0x214 || MP0_C2PMSG_70_REL != 0x218 || MP0_C2PMSG_71_REL != 0x21c {
+        return TestResult::Fail("ring address/size slots are C2PMSG_69..71");
     }
-    if m.writes[1] != (hi, (phys >> 32) as u32) {
-        return TestResult::Fail("phys-hi write missing or wrong");
+    if MP0_C2PMSG_81_REL != 0x244 {
+        return TestResult::Fail("sign of life is C2PMSG_81 at dword 0xa1");
     }
-    let expect_trigger = (PSP_CMD_LOAD_IP_FW & 0xFF) | (size << 8);
-    if m.writes[2] != (trig, expect_trigger) {
-        return TestResult::Fail("trigger word missing or wrong");
+    // GFX_CMD_RESPONSE_MASK and GFX_CMD_STATUS_MASK. The status code is the
+    // low sixteen bits; GFX_CMD_RESERVED_MASK covers 0x7FF00000 between them,
+    // so a 30:0 status mask would read reserved bits as a failure.
+    if PSP_STATUS_DONE_BIT != 0x8000_0000 || PSP_STATUS_CODE_MASK != 0x0000_FFFF {
+        return TestResult::Fail("response flag is bit 31, status is bits 15:0");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
-    smoke_amdgpu_psp_send_command_drives_canonical_sequence
+    smoke_amdgpu_psp_mailbox_register_offsets
+);
+
+fn smoke_amdgpu_psp_bootloader_load_shifts_address_by_twenty() -> TestResult {
+    use crate::amdgpu_psp::{
+        bootloader_cmd, bootloader_load_component, is_sos_alive, MockPsp, PspError,
+        MP0_C2PMSG_35_REL, MP0_C2PMSG_36_REL, MP0_C2PMSG_81_REL, PSP_STATUS_DONE_BIT,
+    };
+    let mp0_base = 0x000B_0000;
+    let mut m = MockPsp::new();
+
+    // Sign of life: any non-zero value means sOS is already up.
+    if is_sos_alive(&mut m, mp0_base) {
+        return TestResult::Fail("a zero sign-of-life register means sOS is not up");
+    }
+    m.stage_read(mp0_base + MP0_C2PMSG_81_REL, 0x1);
+    if !is_sos_alive(&mut m, mp0_base) {
+        return TestResult::Fail("a non-zero sign-of-life register means sOS is up");
+    }
+
+    // Completion is polled on the command register itself, C2PMSG_35.
+    m.stage_read(mp0_base + MP0_C2PMSG_35_REL, PSP_STATUS_DONE_BIT);
+    let phys: u64 = 0x1_2340_0000; // 1 MiB aligned
+    if bootloader_load_component(
+        &mut m,
+        mp0_base,
+        bootloader_cmd::LOAD_KEY_DATABASE,
+        phys,
+        0x4000,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("bootloader load errored on happy path");
+    }
+    // Two writes: the shifted address, then the command. No high half, no
+    // size — the mailbox has neither.
+    if m.writes.len() != 2 {
+        return TestResult::Fail("expected exactly two mailbox writes");
+    }
+    if m.writes[0] != (mp0_base + MP0_C2PMSG_36_REL, 0x1234) {
+        return TestResult::Fail("address goes to C2PMSG_36 shifted right by twenty");
+    }
+    // PSP_BL__LOAD_KEY_DATABASE is 0x80000, written whole — not a low byte.
+    if m.writes[1] != (mp0_base + MP0_C2PMSG_35_REL, 0x0008_0000) {
+        return TestResult::Fail("command goes to C2PMSG_35 unshifted and unmasked");
+    }
+
+    // The shift discards the low twenty bits, so a misaligned address is
+    // refused rather than silently truncated.
+    let mut m = MockPsp::new();
+    match bootloader_load_component(
+        &mut m,
+        mp0_base,
+        bootloader_cmd::LOAD_SOSDRV,
+        0x1_2345_6789,
+        0x1000,
+    ) {
+        Err(PspError::Misaligned) => {}
+        _ => return TestResult::Fail("a misaligned component must be refused"),
+    }
+    if !m.writes.is_empty() {
+        return TestResult::Fail("a refused load must not touch the mailbox");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/psp",
+    smoke_amdgpu_psp_bootloader_load_shifts_address_by_twenty
+);
+
+fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
+    use crate::amdgpu_psp::{
+        gfx_ctrl_cmd_id, ring_control, ring_create, MockPsp, PspError, MP0_C2PMSG_64_REL,
+        MP0_C2PMSG_69_REL, MP0_C2PMSG_70_REL, MP0_C2PMSG_71_REL, PSP_STATUS_DONE_BIT,
+    };
+    let mp0_base = 0x000B_0000;
+    let ready = mp0_base + MP0_C2PMSG_64_REL;
+    let mut m = MockPsp::new();
+    // One read for the sOS-ready wait, one for the command completion; the
+    // mock serves staged reads per offset in order.
+    m.stage_read(ready, PSP_STATUS_DONE_BIT);
+    m.stage_read(ready, PSP_STATUS_DONE_BIT);
+
+    let ring_phys: u64 = 0xDEAD_BEEF_0000_1000;
+    if ring_create(&mut m, mp0_base, ring_phys, 0x1000, 1).is_err() {
+        return TestResult::Fail("ring create errored on happy path");
+    }
+    if m.writes.len() != 4 {
+        return TestResult::Fail("expected address lo, hi, size, then the command");
+    }
+    if m.writes[0] != (mp0_base + MP0_C2PMSG_69_REL, 0x0000_1000) {
+        return TestResult::Fail("ring address low half goes to C2PMSG_69");
+    }
+    if m.writes[1] != (mp0_base + MP0_C2PMSG_70_REL, 0xDEAD_BEEF) {
+        return TestResult::Fail("ring address high half goes to C2PMSG_70");
+    }
+    if m.writes[2] != (mp0_base + MP0_C2PMSG_71_REL, 0x1000) {
+        return TestResult::Fail("ring size in bytes goes to C2PMSG_71");
+    }
+    // The ring type is shifted into bits 31:16.
+    if m.writes[3] != (ready, 0x0001_0000) {
+        return TestResult::Fail("ring type is written to C2PMSG_64 shifted left sixteen");
+    }
+
+    // GFX_CTRL_CMD_ID values are already positioned in bits 31:16, so a
+    // control command is written whole.
+    let mut m = MockPsp::new();
+    m.stage_read(ready, PSP_STATUS_DONE_BIT);
+    if ring_control(&mut m, mp0_base, gfx_ctrl_cmd_id::DESTROY_RINGS).is_err() {
+        return TestResult::Fail("ring control errored");
+    }
+    if m.writes.len() != 1 || m.writes[0] != (ready, 0x0003_0000) {
+        return TestResult::Fail("GFX_CTRL_CMD_ID_DESTROY_RINGS is 0x00030000");
+    }
+
+    // Nothing ready: the wait must time out rather than publish the ring.
+    let mut m = MockPsp::new();
+    match ring_create(&mut m, mp0_base, 0x1000, 0x1000, 1) {
+        Err(PspError::Timeout) => {}
+        _ => return TestResult::Fail("expected a timeout when sOS never signals ready"),
+    }
+    if !m.writes.is_empty() {
+        return TestResult::Fail("the ring must not be published before sOS is ready");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/psp",
+    smoke_amdgpu_psp_ring_create_sequence
 );
 
 fn smoke_amdgpu_psp_surfaces_rejection_status() -> TestResult {
     use crate::amdgpu_psp::{
-        send_command, MockPsp, PspError, MP0_C2PMSG_64_REL, PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
+        bootloader_cmd, bootloader_load_component, MockPsp, PspError, MP0_C2PMSG_35_REL,
+        PSP_STATUS_DONE_BIT,
     };
     let mp0_base = 0x000B_0000;
-    let lo = mp0_base + MP0_C2PMSG_64_REL;
-
     let mut m = MockPsp::new();
-    // PSP set DONE but with a non-zero status code (sig fail).
+    // DONE set with a non-zero status code in the low sixteen bits.
     let rejected_code: u32 = 0x0000_0042;
-    m.stage_read(lo, PSP_STATUS_DONE_BIT | rejected_code);
-
-    match send_command(&mut m, mp0_base, PSP_CMD_LOAD_IP_FW, 0x1000, 0x1000) {
-        Err(PspError::Rejected(code)) if code == rejected_code => TestResult::Pass,
+    m.stage_read(
+        mp0_base + MP0_C2PMSG_35_REL,
+        PSP_STATUS_DONE_BIT | rejected_code,
+    );
+    match bootloader_load_component(
+        &mut m,
+        mp0_base,
+        bootloader_cmd::LOAD_SOSDRV,
+        0x10_0000,
+        0x1000,
+    ) {
+        Err(PspError::Rejected(code)) if code == rejected_code => {}
         Err(other) => {
             let _ = other;
-            TestResult::Fail("expected PspError::Rejected(0x42)")
+            return TestResult::Fail("expected PspError::Rejected(0x42)");
         }
-        Ok(_) => TestResult::Fail("PSP rejection silently passed"),
+        Ok(_) => return TestResult::Fail("PSP rejection silently passed"),
     }
+    // Reserved bits are not a status code. GFX_CMD_RESERVED_MASK is
+    // 0x7FF00000, which a bits-30:0 status mask would have read as failure.
+    let mut m = MockPsp::new();
+    m.stage_read(
+        mp0_base + MP0_C2PMSG_35_REL,
+        PSP_STATUS_DONE_BIT | 0x7FF0_0000,
+    );
+    if bootloader_load_component(
+        &mut m,
+        mp0_base,
+        bootloader_cmd::LOAD_SOSDRV,
+        0x10_0000,
+        0x1000,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("reserved bits must not read as a failure code");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
@@ -2432,10 +2571,16 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_psp_timeout_when_done_never_sets() -> TestResult {
-    use crate::amdgpu_psp::{send_command, MockPsp, PspError, PSP_CMD_LOAD_IP_FW};
-    // Stage nothing — mock returns 0 (DONE not set) on every read.
+    use crate::amdgpu_psp::{bootloader_cmd, bootloader_load_component, MockPsp, PspError};
+    // Stage nothing — the mock returns 0 (DONE never set) on every read.
     let mut m = MockPsp::new();
-    match send_command(&mut m, 0x000B_0000, PSP_CMD_LOAD_IP_FW, 0x1000, 0x1000) {
+    match bootloader_load_component(
+        &mut m,
+        0x000B_0000,
+        bootloader_cmd::LOAD_SYSDRV,
+        0x10_0000,
+        0x1000,
+    ) {
         Err(PspError::Timeout) => TestResult::Pass,
         _ => TestResult::Fail("expected PspError::Timeout when DONE never sets"),
     }
@@ -2445,34 +2590,32 @@ kernel_test_in!(
     smoke_amdgpu_psp_timeout_when_done_never_sets
 );
 
-fn smoke_amdgpu_psp_rejects_empty_or_oversize_image() -> TestResult {
-    use crate::amdgpu_psp::{
-        send_command, MockPsp, PspError, PSP_CMD_LOAD_IP_FW, PSP_MAX_IMAGE_SIZE,
-    };
+/// The command ids for loading firmware are ring commands, not mailbox
+/// commands, and the mailbox entry point must refuse them rather than write a
+/// sequence that appears in no `psp_v*.c`.
+fn smoke_amdgpu_psp_image_load_is_not_a_mailbox_command() -> TestResult {
+    use crate::amdgpu_psp::{gfx_cmd_id, load_ip_firmware, MockPsp, PspError};
     let mut m = MockPsp::new();
-    match send_command(&mut m, 0x000B_0000, PSP_CMD_LOAD_IP_FW, 0x1000, 0) {
-        Err(PspError::EmptyImage) => {}
-        _ => return TestResult::Fail("zero-size image must be rejected"),
+    match load_ip_firmware(&mut m, 0x000B_0000, 0x10_0000, 0x4000) {
+        Err(PspError::NotAMailboxCommand) => {}
+        _ => return TestResult::Fail("an image load through the mailbox must be refused"),
     }
-    match send_command(
-        &mut m,
-        0x000B_0000,
-        PSP_CMD_LOAD_IP_FW,
-        0x1000,
-        PSP_MAX_IMAGE_SIZE + 1,
-    ) {
-        Err(PspError::ImageTooLarge) => {}
-        _ => return TestResult::Fail("oversize image must be rejected"),
-    }
-    // Neither rejected path should have touched the mailbox.
     if !m.writes.is_empty() {
-        return TestResult::Fail("rejected images must not write mailbox");
+        return TestResult::Fail("a refused command must not touch the mailbox");
+    }
+    // The ring command ids themselves, from `enum psp_gfx_cmd_id`. LOAD_IP_FW
+    // is 0x06; an earlier scaffold had it at 0x05, which is SETUP_TMR.
+    if gfx_cmd_id::LOAD_IP_FW != 0x06 || gfx_cmd_id::SETUP_TMR != 0x05 {
+        return TestResult::Fail("LOAD_IP_FW is 0x06 and SETUP_TMR is 0x05");
+    }
+    if gfx_cmd_id::LOAD_TOC != 0x20 || gfx_cmd_id::AUTOLOAD_RLC != 0x21 {
+        return TestResult::Fail("LOAD_TOC is 0x20 and AUTOLOAD_RLC is 0x21");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
-    smoke_amdgpu_psp_rejects_empty_or_oversize_image
+    smoke_amdgpu_psp_image_load_is_not_a_mailbox_command
 );
 
 // ── amdgpu/smu (bring_up) ──────────────────────────────────────────
