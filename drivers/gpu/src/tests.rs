@@ -3501,10 +3501,10 @@ kernel_test_in!(
 // degenerate inputs (empty / oversize copy).
 
 fn smoke_amdgpu_sdma_packet_copy_linear_layout() -> TestResult {
-    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_COPY, SDMA_SUBOP_COPY_LINEAR};
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration};
     let mut buf = [0u32; 7];
     let bytes_written = {
-        let mut b = SdmaBuilder::new(&mut buf);
+        let mut b = SdmaBuilder::new(&mut buf, SdmaGeneration::V6);
         let src: u64 = 0x1111_2222_3333_4400;
         let dst: u64 = 0x5555_6666_7777_8800;
         if b.copy_linear(src, dst, 0x4000).is_err() {
@@ -3516,9 +3516,10 @@ fn smoke_amdgpu_sdma_packet_copy_linear_layout() -> TestResult {
         return TestResult::Fail("copy_linear should emit 7 dwords");
     }
 
-    // Header: OP=COPY << 24, SUB_OP=LINEAR << 16.
-    let want_hdr = (SDMA_OP_COPY << 24) | (SDMA_SUBOP_COPY_LINEAR << 16);
-    if buf[0] != want_hdr {
+    // `sdma_v6_0_0_pkt_open.h`: op is bits[7:0] and sub_op bits[15:8], so
+    // SDMA_OP_COPY 1 with SDMA_SUBOP_COPY_LINEAR 0 is the literal 0x00000001 —
+    // NOT 0x01000000.
+    if buf[0] != 0x0000_0001 {
         return TestResult::Fail("copy header dword wrong");
     }
     // Count = bytes - 1.
@@ -3550,20 +3551,22 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_sdma_packet_fence_layout() -> TestResult {
-    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_FENCE};
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration, SdmaPktError};
     let mut buf = [0u32; 4];
-    let dst: u64 = 0xAAAA_BBBB_CCCC_DDDD;
+    // Dword-aligned: `sdma_v6_0_ring_emit_fence` WARN_ONs `addr & 0x3`.
+    let dst: u64 = 0xAAAA_BBBB_CCCC_DDDC;
     {
-        let mut b = SdmaBuilder::new(&mut buf);
+        let mut b = SdmaBuilder::new(&mut buf, SdmaGeneration::V6);
         if b.fence(dst, 42).is_err() {
             return TestResult::Fail("fence emit failed");
         }
     }
-    let want_hdr = SDMA_OP_FENCE << 24;
-    if buf[0] != want_hdr {
+    // SDMA_OP_FENCE 5 in bits[7:0], plus SDMA_PKT_FENCE_HEADER_MTYPE(0x3) at
+    // shift 16 — the Ucached type `sdma_v6_0_ring_emit_fence` writes.
+    if buf[0] != 0x0003_0005 {
         return TestResult::Fail("fence header dword wrong");
     }
-    if buf[1] != 0xCCCC_DDDD {
+    if buf[1] != 0xCCCC_DDDC {
         return TestResult::Fail("fence dst lo wrong");
     }
     if buf[2] != 0xAAAA_BBBB {
@@ -3571,6 +3574,24 @@ fn smoke_amdgpu_sdma_packet_fence_layout() -> TestResult {
     }
     if buf[3] != 42 {
         return TestResult::Fail("fence value wrong");
+    }
+    // v4 has no MTYPE field: `sdma_v4_0_ring_emit_fence` writes a bare op.
+    let mut v4 = [0u32; 4];
+    {
+        let mut b = SdmaBuilder::new(&mut v4, SdmaGeneration::V4);
+        if b.fence(dst, 42).is_err() {
+            return TestResult::Fail("v4 fence emit failed");
+        }
+    }
+    if v4[0] != 0x0000_0005 {
+        return TestResult::Fail("a v4 fence header carries no MTYPE");
+    }
+    // A misaligned target would publish the fence somewhere else.
+    let mut bad = [0u32; 4];
+    let mut b = SdmaBuilder::new(&mut bad, SdmaGeneration::V6);
+    match b.fence(0x1002, 42) {
+        Err(SdmaPktError::UnalignedFence) => {}
+        _ => return TestResult::Fail("a misaligned fence target must be rejected"),
     }
     TestResult::Pass
 }
@@ -3580,19 +3601,35 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_sdma_packet_rejects_empty_and_oversize_copy() -> TestResult {
-    use crate::amdgpu_sdma::{SdmaBuilder, SdmaPktError, SDMA_COPY_MAX_BYTES};
-    let mut buf = [0u32; 7];
-    let mut b = SdmaBuilder::new(&mut buf);
-    match b.copy_linear(0x1000, 0x2000, 0) {
-        Err(SdmaPktError::EmptyCopy) => {}
-        _ => return TestResult::Fail("zero-byte copy must be rejected"),
-    }
-    match b.copy_linear(0x1000, 0x2000, SDMA_COPY_MAX_BYTES + 1) {
-        Err(SdmaPktError::CopyTooLarge) => {}
-        _ => return TestResult::Fail("oversized copy must be rejected"),
-    }
-    if b.bytes_written() != 0 {
-        return TestResult::Fail("rejected calls must not advance pos");
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration, SdmaPktError};
+    // `sdma_v4_0.c:2612` .copy_max_bytes = 1 << 22 (COUNT mask 0x003FFFFF);
+    // `sdma_v6_0.c:1861` .copy_max_bytes = 1 << 30 (COUNT mask 0x3FFFFFFF).
+    // COUNT holds byte_count - 1, so the limit is the power of two itself.
+    for (generation, max) in [
+        (SdmaGeneration::V4, 1u32 << 22),
+        (SdmaGeneration::V6, 1u32 << 30),
+    ] {
+        if generation.copy_max_bytes() != max {
+            return TestResult::Fail("copy_max_bytes is not this generation's COUNT width");
+        }
+        let mut buf = [0u32; 7];
+        let mut b = SdmaBuilder::new(&mut buf, generation);
+        match b.copy_linear(0x1000, 0x2000, 0) {
+            Err(SdmaPktError::EmptyCopy) => {}
+            _ => return TestResult::Fail("zero-byte copy must be rejected"),
+        }
+        match b.copy_linear(0x1000, 0x2000, max + 1) {
+            Err(SdmaPktError::CopyTooLarge) => {}
+            _ => return TestResult::Fail("oversized copy must be rejected"),
+        }
+        if b.bytes_written() != 0 {
+            return TestResult::Fail("rejected calls must not advance pos");
+        }
+        // The limit itself is legal, and v6's is four orders larger than v4's:
+        // a scaffold stuck on v4's width would refuse a 4 MiB copy here.
+        if b.copy_linear(0x1000, 0x2000, max).is_err() {
+            return TestResult::Fail("a copy of exactly copy_max_bytes is legal");
+        }
     }
     TestResult::Pass
 }
@@ -3602,10 +3639,10 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_sdma_packet_nop_and_trap() -> TestResult {
-    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_NOP, SDMA_OP_TRAP};
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration};
     let mut buf = [0u32; 3];
     {
-        let mut b = SdmaBuilder::new(&mut buf);
+        let mut b = SdmaBuilder::new(&mut buf, SdmaGeneration::V6);
         if b.nop().is_err() {
             return TestResult::Fail("nop emit failed");
         }
@@ -3616,13 +3653,16 @@ fn smoke_amdgpu_sdma_packet_nop_and_trap() -> TestResult {
             return TestResult::Fail("expected 3 dwords (nop=1 + trap=2)");
         }
     }
-    if buf[0] != (SDMA_OP_NOP << 24) {
+    // SDMA_OP_NOP 0 and SDMA_OP_TRAP 6, in bits[7:0].
+    if buf[0] != 0x0000_0000 {
         return TestResult::Fail("NOP header wrong");
     }
-    if buf[1] != (SDMA_OP_TRAP << 24) {
+    if buf[1] != 0x0000_0006 {
         return TestResult::Fail("TRAP header wrong");
     }
-    if buf[2] != 0xC0DE_F00D {
+    // `SDMA_PKT_TRAP_INT_CONTEXT_int_context_mask` is 0x0FFFFFFF, so the top
+    // four bits of the argument are not part of the field.
+    if buf[2] != 0x00DE_F00D {
         return TestResult::Fail("TRAP ack wrong");
     }
     TestResult::Pass
@@ -4132,56 +4172,85 @@ kernel_test_in!(
 // ── amdgpu/sdma (v6.0 Phoenix) ─────────────────────────────────────
 
 fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
-    use crate::amdgpu_sdma::{
-        build_sdma6_ring_init, SDMA6_QUEUE0_DOORBELL_OFFSET_REL, SDMA6_QUEUE0_DOORBELL_REL,
-        SDMA6_QUEUE0_RB_BASE_HI_REL, SDMA6_QUEUE0_RB_BASE_REL, SDMA6_QUEUE0_RB_CNTL_REL,
-        SDMA_DOORBELL_ENABLE, SDMA_RB_ENABLE, SDMA_RB_RPTR_WRITEBACK_ENABLE, SDMA_RB_SIZE_SHIFT,
-    };
-    let sdma_base: u32 = 0x0007_0000;
+    use crate::amdgpu_sdma::build_sdma6_ring_init;
+    let base: u32 = 0x0007_0000;
     let ring_phys: u64 = 0x0000_0001_2000_0000;
     let ring_size_dw: u32 = 2048;
     let doorbell_idx: u32 = 4;
     let rptr_phys: u64 = 0x0000_0002_3000_0000;
+    let wptr_poll_phys: u64 = 0x0000_0002_3000_1000;
 
-    let seq =
-        match build_sdma6_ring_init(sdma_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys) {
-            Ok(s) => s,
-            Err(_) => return TestResult::Fail("build_sdma6_ring_init failed on valid input"),
-        };
+    let seq = match build_sdma6_ring_init(
+        base,
+        ring_phys,
+        ring_size_dw,
+        doorbell_idx,
+        rptr_phys,
+        wptr_poll_phys,
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("build_sdma6_ring_init failed on valid input"),
+    };
     let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
-    // First write: CNTL = 0.
-    if w.first().map(|x| (x.addr, x.value)) != Some((sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, 0)) {
+
+    // Every register id is `gc/gc_11_0_0_offset.h`, byte-scaled, and the CNTL
+    // value is composed from `gc_11_0_0_sh_mask.h`'s own masks — not from this
+    // module's constants.
+    //
+    //   regSDMA0_QUEUE0_RB_CNTL             0x0080   MINOR_PTR_UPDATE  0x00b5
+    //   regSDMA0_QUEUE0_RB_BASE             0x0081   DOORBELL          0x0092
+    //   regSDMA0_QUEUE0_RB_BASE_HI          0x0082   DOORBELL_OFFSET   0x00ab
+    //   regSDMA0_QUEUE0_RB_WPTR_POLL_ADDR_HI 0x00b2  IB_CNTL           0x008a
+    //   regSDMA0_QUEUE0_RB_WPTR_POLL_ADDR_LO 0x00b3
+    //
+    //   RB_SIZE 0x0000003E (shift 1)   RPTR_WRITEBACK_ENABLE 0x00001000
+    //   RB_PRIV 0x00800000             F32_WPTR_POLL_ENABLE  0x00000800
+    //   WPTR_POLL_ENABLE 0x00000100    RB_ENABLE             0x00000001
+    //   DOORBELL ENABLE 0x10000000     IB_ENABLE             0x00000001
+    let cntl = base + 0x80 * 4;
+    let cntl_no_enable = (11 << 1) | 0x0080_0000 | 0x0000_1000 | 0x0000_0800;
+    if ring_size_dw.trailing_zeros() != 11 {
+        return TestResult::Fail("2048 dwords is log2 11");
+    }
+    if w.first().map(|x| (x.addr, x.value)) != Some((cntl, 0)) {
         return TestResult::Fail("first write must disable CNTL");
     }
-    // Last write: CNTL | RB_ENABLE.
-    let expected_en = (ring_size_dw.trailing_zeros() << SDMA_RB_SIZE_SHIFT)
-        | SDMA_RB_RPTR_WRITEBACK_ENABLE
-        | SDMA_RB_ENABLE;
-    if w.last().map(|x| (x.addr, x.value))
-        != Some((sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, expected_en))
-    {
-        return TestResult::Fail("last write must enable CNTL");
+    // The legacy wptr poll stays off; Linux enables the F32 one instead.
+    if cntl_no_enable & 0x0000_0100 != 0 {
+        return TestResult::Fail("WPTR_POLL_ENABLE must stay clear");
     }
-    // Body writes hit the v6 QUEUE0_ namespace, NOT the v4 GFX_ namespace.
+    // Last write: IB_CNTL, after RB_ENABLE. Without it the ring runs but every
+    // indirect buffer on it is refused.
+    if w.last().map(|x| (x.addr, x.value)) != Some((base + 0x8A * 4, 0x0000_0001)) {
+        return TestResult::Fail("last write must enable IB_CNTL");
+    }
     let want = [
-        (
-            sdma_base + SDMA6_QUEUE0_RB_BASE_REL,
-            (ring_phys >> 8) as u32,
-        ),
-        (
-            sdma_base + SDMA6_QUEUE0_RB_BASE_HI_REL,
-            (ring_phys >> 40) as u32,
-        ),
-        (
-            sdma_base + SDMA6_QUEUE0_DOORBELL_OFFSET_REL,
-            doorbell_idx << 2,
-        ),
-        (sdma_base + SDMA6_QUEUE0_DOORBELL_REL, SDMA_DOORBELL_ENABLE),
+        (base + 0xB3 * 4, wptr_poll_phys as u32),
+        (base + 0xB2 * 4, (wptr_poll_phys >> 32) as u32),
+        (base + 0x89 * 4, rptr_phys as u32 & 0xFFFF_FFFC),
+        (base + 0x88 * 4, (rptr_phys >> 32) as u32),
+        (cntl, cntl_no_enable),
+        (base + 0x81 * 4, (ring_phys >> 8) as u32),
+        (base + 0x82 * 4, (ring_phys >> 40) as u32),
+        (base + 0xB5 * 4, 1),
+        (base + 0xAB * 4, doorbell_idx << 2),
+        (base + 0x92 * 4, 0x1000_0000),
+        (base + 0xB5 * 4, 0),
+        (cntl, cntl_no_enable | 0x0000_0001),
     ];
     for (addr, value) in want {
         if !w.iter().any(|x| x.addr == addr && x.value == value) {
             return TestResult::Fail("missing expected v6 ring-init write");
         }
+    }
+    // MINOR_PTR_UPDATE brackets the wptr write: set before, cleared after.
+    let minor = base + 0xB5 * 4;
+    let set = w.iter().position(|x| x.addr == minor && x.value == 1);
+    let cleared = w.iter().rposition(|x| x.addr == minor && x.value == 0);
+    let wptr = w.iter().position(|x| x.addr == base + 0x85 * 4);
+    match (set, cleared, wptr) {
+        (Some(a), Some(b), Some(_)) if a < b => {}
+        _ => return TestResult::Fail("MINOR_PTR_UPDATE must bracket the wptr write"),
     }
     TestResult::Pass
 }
