@@ -1983,6 +1983,94 @@ kernel_test_in!(
     smoke_amdgpu_atom_vm_reg_write_via_closure
 );
 
+/// `atom.c:650`: `amdgpu_atom_execute_table_locked(ctx, idx, ctx->ps +
+/// ctx->ps_shift, ctx->ps_size - ctx->ps_shift)`. A callee gets the parameter
+/// window *above* the caller's own, not the caller's window again.
+fn smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window() -> TestResult {
+    use crate::amdgpu_atom_vm::{execute_table, AtomError, AtomState, ResolvedTable};
+    use alloc::boxed::Box;
+
+    // Table 1: MOVE PS[0] <- 0xAA, then CALLTABLE 2, then EOT. Declares two
+    // dwords of parameters, so its callee's window starts at ps[2].
+    const CALLER: &[u8] = &[
+        2, 0x05, 0, 0xAA, 0, 0, 0, // MOVE PS[0] <- 0xAA
+        82, 2,  // CALLTABLE 2
+        91, // EOT
+    ];
+    // Table 2: MOVE PS[0] <- 0xBB, EOT. Its PS[0] must be the caller's ps[2].
+    const CALLEE: &[u8] = &[2, 0x05, 0, 0xBB, 0, 0, 0, 91];
+
+    let mut state = AtomState::new(8, 4);
+    state.table_resolver = Box::new(|id| match id {
+        1 => Some(ResolvedTable {
+            body: CALLER,
+            ps_dwords: 2,
+        }),
+        2 => Some(ResolvedTable {
+            body: CALLEE,
+            ps_dwords: 1,
+        }),
+        _ => None,
+    });
+    let mut ps = [0u32; 4];
+    if execute_table(&mut state, 1, &mut ps).is_err() {
+        return TestResult::Fail("nested table execution errored");
+    }
+    if ps[0] != 0xAA {
+        return TestResult::Fail("the caller's own PS[0] write did not land");
+    }
+    if ps[2] != 0xBB {
+        return TestResult::Fail("the callee's PS[0] must be the caller's ps[2]");
+    }
+    // The defect this replaces: the callee wrote over ps[0], so the caller's
+    // 0xAA was replaced by 0xBB and ps[2] stayed zero.
+    if ps[1] != 0 || ps[3] != 0 {
+        return TestResult::Fail("nothing else in the window should be touched");
+    }
+
+    // A table that calls itself must be refused, not recursed: VBIOS bytecode
+    // is data read off the card. `ATOM_EXECUTE_MAX_DEPTH` is 32.
+    const LOOP: &[u8] = &[82, 1, 91];
+    let mut state = AtomState::new(8, 4);
+    state.table_resolver = Box::new(|id| match id {
+        1 => Some(ResolvedTable {
+            body: LOOP,
+            ps_dwords: 0,
+        }),
+        _ => None,
+    });
+    let mut ps = [0u32; 4];
+    match execute_table(&mut state, 1, &mut ps) {
+        Err(AtomError::CallTableTooDeep) => {}
+        Err(_) => return TestResult::Fail("a self-calling table must be CallTableTooDeep"),
+        Ok(()) => return TestResult::Fail("a self-calling table must not succeed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window
+);
+
+/// `ATOM_CT_PS_PTR` is byte 5 of a command table and `ATOM_CT_PS_MASK` is
+/// 0x7F, so the top bit of that byte is not part of the parameter size.
+fn smoke_amdgpu_atombios_cmd_table_ps_size() -> TestResult {
+    use crate::amdgpu_atombios::{ATOM_CT_CODE_PTR, ATOM_CT_PS_MASK, ATOM_CT_PS_PTR};
+    if ATOM_CT_PS_PTR != 5 || ATOM_CT_PS_MASK != 0x7F || ATOM_CT_CODE_PTR != 6 {
+        return TestResult::Fail("the command-table prelude is ws at 4, ps at 5, code at 6");
+    }
+    // 0x8C masked by 0x7F is 0x0C, which is three dwords — reading the byte
+    // whole would give 0x8C / 4 = 35.
+    if ((0x8Cu8 & ATOM_CT_PS_MASK) as usize) / 4 != 3 {
+        return TestResult::Fail("the parameter size is the low seven bits, in dwords");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atombios_cmd_table_ps_size
+);
+
 // ── amdgpu/smu ─────────────────────────────────────────────────────
 //
 // SMU mailbox-protocol smokes. The actual MP1 register reads
