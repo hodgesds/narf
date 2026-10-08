@@ -259,8 +259,8 @@ pub fn sys_poll(ctx: &mut dyn TrapContext) {
 /// the poll core with `sys_poll`.
 pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let timeout: i64 = if args.arg2 == 0 {
-        -1
+    let (timeout, _seconds, _nanoseconds): (i64, u64, u64) = if args.arg2 == 0 {
+        (-1, 0, 0)
     } else {
         // SAFETY: `arg2` is a user `timespec*` in-pointer; copy_from_user_vec
         // range-validates the 16-byte read.
@@ -275,7 +275,11 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
                     ctx.set_return(to_ret(EINVAL));
                     return;
                 }
-                secs.saturating_mul(1000).saturating_add(nsec / 1_000_000) as i64
+                (
+                    secs.saturating_mul(1000).saturating_add(nsec / 1_000_000) as i64,
+                    secs,
+                    nsec,
+                )
             }
             Err(_) => {
                 ctx.set_return(to_ret(EFAULT));
@@ -283,6 +287,8 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
             }
         }
     };
+    #[cfg(feature = "syscall-trace")]
+    crate::syscall::syscall_trace_account_ppoll_timeout(args.arg2 == 0, _seconds, _nanoseconds);
     let mut old_mask = None;
     if args.arg3 != 0 {
         if args.arg4 != 8 {
@@ -930,6 +936,12 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     // one with no task context (early boot) still takes the one-shot busy path.
     let can_park = timeout != 0 && uctx_opt.is_some();
     if !can_park {
+        #[cfg(feature = "syscall-trace")]
+        if timeout != 0 && uctx_opt.is_none() {
+            crate::syscall::syscall_trace_account_park(
+                crate::syscall::SyscallTraceParkEvent::NoContext,
+            );
+        }
         let n = do_poll(task, &mut fds, timeout);
         // SAFETY: same pointer/length as the parse step; user AS still active.
         unsafe { write_pollfds(ptr, &fds) };
@@ -1063,6 +1075,8 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
 
     // Park: register the net-I/O waker + a timer fallback, re-execute on wake.
     if let Some(hook) = crate::user_task::yield_hook() {
+        #[cfg(feature = "syscall-trace")]
+        crate::syscall::syscall_trace_account_park(crate::syscall::SyscallTraceParkEvent::Enter);
         // A pending unblocked signal interrupts the wait with -EINTR.
         if let Some(h) = crate::signal_delivery_hook() {
             if h(ctx, crate::Syscall::Poll.raw()) {
@@ -1084,24 +1098,32 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
         // park — disarm, re-scan, and return, exactly like the epoll
         // ready-after-registration path. No-op while no fd has migrated
         // (`readiness()` still `None` everywhere → `any_ready == false`).
-        let arms = if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
+        let mut arms = if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
             arm_readiness_cells(task, &fds, &w)
         } else {
             ReadinessArms::NONE
         };
         if arms.any_ready {
             disarm_readiness_cells(task, &fds);
-            // SAFETY: clearing this task's own park deadlines.
-            unsafe {
-                (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
-                (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
-                clear_poll_wait_record(task, &*uctx_ptr);
-            }
             let n = poll_scan(task, &mut fds);
-            // SAFETY: same pointer/length as the parse step.
-            unsafe { write_pollfds(ptr, &fds) };
-            ctx.set_return(SyscallReturn::ok(n as u64));
-            return;
+            if n != 0 {
+                // SAFETY: clearing this task's own park deadlines.
+                unsafe {
+                    (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                    (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                    clear_poll_wait_record(task, &*uctx_ptr);
+                }
+                // SAFETY: same pointer/length as the parse step.
+                unsafe { write_pollfds(ptr, &fds) };
+                ctx.set_return(SyscallReturn::ok(n as u64));
+                return;
+            }
+            // A readiness edge can be consumed between `poll_scan` and the
+            // registration recheck. We just disarmed every cell, so returning
+            // zero here would turn that benign race into a userspace busy loop.
+            // Mirror `poll_wait_kernel`: retain the deadline and park using the
+            // generic wake source for this cycle instead.
+            arms = ReadinessArms::NONE;
         }
         // SAFETY: in-flight task's UserTaskCtx; we park exactly this task.
         unsafe {
@@ -1138,6 +1160,8 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     }
 
     // No yield hook (early boot): can't block — report nothing ready.
+    #[cfg(feature = "syscall-trace")]
+    crate::syscall::syscall_trace_account_park(crate::syscall::SyscallTraceParkEvent::NoHook);
     // SAFETY: same pointer/length.
     unsafe { write_pollfds(ptr, &fds) };
     ctx.set_return(SyscallReturn::ok(0));

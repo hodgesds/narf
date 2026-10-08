@@ -3577,6 +3577,8 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     let raw_n = syscall_number(num);
     if let Some(variant) = Syscall::from_raw(raw_n) {
         #[cfg(feature = "syscall-trace")]
+        syscall_trace_account(variant);
+        #[cfg(feature = "syscall-trace")]
         if syscall_trace_relevant(variant) {
             use core::fmt::Write as _;
             let a = ctx.args();
@@ -3678,6 +3680,105 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
 static TRACE_COMM: narf_lib::sync::OnceLock<alloc::string::String> =
     narf_lib::sync::OnceLock::new();
 
+/// Counts-only mode for `syscall-trace`.  A `trace_comm=counts:<selectors>`
+/// cmdline selector turns the otherwise per-call trace into an interval report.
+/// This is deliberately a separate mode because serialising every syscall can
+/// change the scheduling behaviour of the desktop process being measured.
+#[cfg(feature = "syscall-trace")]
+static TRACE_COUNTS_ONLY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Counter indices for the low-overhead syscall-rate trace.
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_CALLS: usize = 0;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_IOCTL: usize = 1;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_WAIT: usize = 2;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PPOLL_INFINITE: usize = 3;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PPOLL_ZERO: usize = 4;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PPOLL_SUB_MILLISECOND: usize = 5;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PPOLL_TIMED: usize = 6;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_ENTER: usize = 7;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_BLOCK: usize = 8;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_RESUME_IO: usize = 9;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_DEADLINE: usize = 10;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_IO_LATCH: usize = 11;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_POLL_RECHECK: usize = 12;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_TIMER_FULL: usize = 13;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_NO_CONTEXT: usize = 14;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_PARK_NO_HOOK: usize = 15;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_VARIANT_BASE: usize = 16;
+/// One counter for every canonical syscall variant. This is intentionally
+/// keyed by the stable-in-this-build enum discriminant rather than Linux's
+/// sparse wire number, so the per-CPU bank stays compact while the interval
+/// reporter can name the hottest calls without serialising the hot path.
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_VARIANTS: usize = Syscall::IoCancel as usize + 1;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_COUNTERS: usize = TRACE_RATE_VARIANT_BASE + TRACE_RATE_VARIANTS;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_TOP_VARIANTS: usize = 4;
+#[cfg(feature = "syscall-trace")]
+const TRACE_RATE_INTERVAL_MS: u64 = 1_000;
+
+/// Per-CPU, cache-line-padded syscall counters.  Each CPU updates only its
+/// own counter bank with a relaxed load/store; the once-per-second reader
+/// takes a snapshot and reports its delta from the preceding snapshot.
+#[cfg(feature = "syscall-trace")]
+static TRACE_RATE: narf_lib::percpu::PerCpuCounterBank<TRACE_RATE_COUNTERS> =
+    narf_lib::percpu::PerCpuCounterBank::new();
+
+/// Aggregate snapshot retained by the interval reporter.  These are touched
+/// only once per interval, not by the syscall fast path.
+#[cfg(feature = "syscall-trace")]
+static TRACE_RATE_LAST: [core::sync::atomic::AtomicU64; TRACE_RATE_COUNTERS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; TRACE_RATE_COUNTERS];
+
+/// Scheduler task ids whose comm matched the `counts:` selector at naming
+/// time.  The map is populated by `set_proc_comm` before desktop processes
+/// start; it keeps the syscall hot path to bounded atomic loads rather than a
+/// `PROC_COMM` lock lookup on every entry.
+#[cfg(feature = "syscall-trace")]
+const TRACE_COUNTS_TARGETS: usize = 32;
+#[cfg(feature = "syscall-trace")]
+static TRACE_COUNTS_TASKS: [core::sync::atomic::AtomicU64; TRACE_COUNTS_TARGETS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; TRACE_COUNTS_TARGETS];
+
+/// Start timestamp for the current interval. It is advanced by the timer-tick
+/// hook, never by the syscall hot path.
+#[cfg(feature = "syscall-trace")]
+static TRACE_RATE_WINDOW_START_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Elapsed interval awaiting emission from a safe executor-context pump.
+/// Timer IRQ context only publishes this value: console I/O and the relaxed
+/// cross-CPU snapshot are deliberately deferred out of the interrupt path.
+#[cfg(feature = "syscall-trace")]
+static TRACE_RATE_REPORT_PENDING_MS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Whether the safe-context reporter pump has been registered. Boot command
+/// line processing configures the trace once, but keep this robust to an
+/// accidental repeat without consuming another fixed scheduler pump slot.
+#[cfg(feature = "syscall-trace")]
+static TRACE_RATE_PUMP_REGISTERED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// syscall-trace park-dedup: `(tid<<12 | raw_num)` of the syscall the last
 /// traced park re-executed, or 0. A blocking syscall RIP-rewinds and
 /// re-executes on every ~10 ms backstop tick; this suppresses the identical
@@ -3697,14 +3798,24 @@ fn trace_park_key(num: u32) -> u64 {
 }
 
 /// Install the comm-prefix filter for the syscall trace (see `TRACE_COMM`).
-/// A comma-separated list matches any of the listed prefixes.
+/// A comma-separated list matches any of the listed prefixes.  Prefixing the
+/// selector with `counts:` enables the low-observer-effect interval counter
+/// instead of the normal per-call serial trace.
 #[cfg(feature = "syscall-trace")]
 pub fn set_trace_comm(prefix: &str) {
     // boot-init configures this once, before it starts userspace. Keep the
     // first value if a test or an accidental second call repeats setup: the
     // read path must remain lock-free so unmatched tasks do not perturb the
     // workload being diagnosed.
-    let _ = TRACE_COMM.set(alloc::string::String::from(prefix));
+    let (counts_only, selectors) = match prefix.strip_prefix("counts:") {
+        Some(selectors) => (true, selectors),
+        None => (false, prefix),
+    };
+    TRACE_COUNTS_ONLY.store(counts_only, core::sync::atomic::Ordering::Relaxed);
+    let _ = TRACE_COMM.set(alloc::string::String::from(selectors));
+    if counts_only && !TRACE_RATE_PUMP_REGISTERED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        narf_scheduler::sleep_pumps::register(syscall_trace_report_pump);
+    }
 }
 
 /// Whether a UNIXENQ/UNIXACC connect→accept latency line for a task whose comm
@@ -3807,7 +3918,13 @@ fn is_sandbox_syscall(name: Option<&str>) -> bool {
 /// entry with no matching return names the syscall a hung service blocks on.
 #[cfg(feature = "syscall-trace")]
 fn syscall_trace_relevant(_v: Syscall) -> bool {
-    syscall_trace_target_task()
+    !trace_counts_only() && syscall_trace_target_task()
+}
+
+#[cfg(feature = "syscall-trace")]
+#[inline]
+fn trace_counts_only() -> bool {
+    TRACE_COUNTS_ONLY.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Shared predicate for syscall, exec, and exit diagnostics. Matches when the
@@ -3820,6 +3937,348 @@ pub fn syscall_trace_target_task() -> bool {
         .map(alloc::string::String::as_str)
         .unwrap_or("systemd-executo");
     crate::handlers::proc_comm_of_task_matches(crate::handlers::current_task_id(), filter)
+}
+
+/// Register (or remove) a task in the low-overhead counts-only filter when
+/// its comm changes.  `set_proc_comm` calls this while userspace is being
+/// constructed, before the selected desktop processes begin their hot paths.
+/// The resulting task-id cache makes every later syscall test lock-free.
+#[cfg(feature = "syscall-trace")]
+pub(crate) fn syscall_trace_note_comm(task: u64, comm: &str) {
+    if !trace_counts_only() || task == 0 {
+        return;
+    }
+    let filter = TRACE_COMM
+        .get()
+        .map(alloc::string::String::as_str)
+        .unwrap_or("systemd-executo");
+    if crate::handlers::comm_matches_selectors(comm, filter) {
+        for slot in &TRACE_COUNTS_TASKS {
+            if slot.load(core::sync::atomic::Ordering::Relaxed) == task {
+                return;
+            }
+        }
+        for slot in &TRACE_COUNTS_TASKS {
+            if slot
+                .compare_exchange(
+                    0,
+                    task,
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+    } else {
+        for slot in &TRACE_COUNTS_TASKS {
+            let _ = slot.compare_exchange(
+                task,
+                0,
+                core::sync::atomic::Ordering::Relaxed,
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Whether the current task was selected for counts-only tracing.  This is a
+/// bounded lock-free lookup; `syscall_trace_note_comm` populated the table
+/// before the task entered its syscall-heavy desktop loop.
+#[cfg(feature = "syscall-trace")]
+#[inline]
+fn syscall_trace_counts_target_task() -> bool {
+    let task = crate::handlers::current_task_id();
+    task != 0
+        && TRACE_COUNTS_TASKS
+            .iter()
+            .any(|slot| slot.load(core::sync::atomic::Ordering::Relaxed) == task)
+}
+
+/// Account one syscall in the interval trace, when that mode is active. This
+/// stays cheap: selected processes perform only per-CPU relaxed increments;
+/// all other processes pay the mode-flag load and a bounded target-id scan.
+#[cfg(feature = "syscall-trace")]
+#[inline]
+fn syscall_trace_account(variant: Syscall) {
+    if !trace_counts_only() || !syscall_trace_counts_target_task() {
+        return;
+    }
+
+    TRACE_RATE.increment(TRACE_RATE_CALLS);
+    TRACE_RATE.increment(TRACE_RATE_VARIANT_BASE + variant as usize);
+    match variant {
+        Syscall::Ioctl => TRACE_RATE.increment(TRACE_RATE_IOCTL),
+        Syscall::Poll
+        | Syscall::Ppoll
+        | Syscall::Select
+        | Syscall::Pselect6
+        | Syscall::EpollWait
+        | Syscall::EpollPwait
+        | Syscall::EpollPwait2 => TRACE_RATE.increment(TRACE_RATE_WAIT),
+        _ => {}
+    }
+}
+
+/// The decision points of a selected `poll(2)`/`ppoll(2)` park.  These are
+/// deliberately separate from syscall-entry counts: a hot loop can either
+/// return before blocking, or park successfully and be spuriously re-woken.
+/// The distinction identifies the responsible wake path without serialising
+/// every syscall to the console.
+#[cfg(feature = "syscall-trace")]
+#[derive(Copy, Clone)]
+pub(crate) enum SyscallTraceParkEvent {
+    Enter,
+    Block,
+    ResumeIo,
+    Deadline,
+    IoLatch,
+    PollRecheck,
+    TimerFull,
+    NoContext,
+    NoHook,
+}
+
+#[cfg(feature = "syscall-trace")]
+impl SyscallTraceParkEvent {
+    const fn counter(self) -> usize {
+        match self {
+            Self::Enter => TRACE_RATE_PARK_ENTER,
+            Self::Block => TRACE_RATE_PARK_BLOCK,
+            Self::ResumeIo => TRACE_RATE_PARK_RESUME_IO,
+            Self::Deadline => TRACE_RATE_PARK_DEADLINE,
+            Self::IoLatch => TRACE_RATE_PARK_IO_LATCH,
+            Self::PollRecheck => TRACE_RATE_PARK_POLL_RECHECK,
+            Self::TimerFull => TRACE_RATE_PARK_TIMER_FULL,
+            Self::NoContext => TRACE_RATE_PARK_NO_CONTEXT,
+            Self::NoHook => TRACE_RATE_PARK_NO_HOOK,
+        }
+    }
+}
+
+/// Record one selected poll-park transition in the per-CPU interval bank.
+#[cfg(feature = "syscall-trace")]
+#[inline]
+pub(crate) fn syscall_trace_account_park(event: SyscallTraceParkEvent) {
+    if trace_counts_only() && syscall_trace_counts_target_task() {
+        TRACE_RATE.increment(event.counter());
+    }
+}
+
+/// Advance the interval clock from the architecture's user-mode timer hook.
+///
+/// This intentionally keeps both the clock read and interval arbitration out
+/// of the syscall path. The timer hook may run in IRQ context, so it only
+/// publishes elapsed time; [`syscall_trace_report_pump`] performs the counter
+/// snapshot and console output later from executor context.
+#[cfg(feature = "syscall-trace")]
+pub(crate) fn syscall_trace_timer_tick() {
+    if !trace_counts_only() {
+        return;
+    }
+
+    let now_ms = narf_scheduler::narf_time::monotonic_ns() / 1_000_000;
+    let start = TRACE_RATE_WINDOW_START_MS.load(core::sync::atomic::Ordering::Relaxed);
+    if start == 0 {
+        let _ = TRACE_RATE_WINDOW_START_MS.compare_exchange(
+            0,
+            now_ms,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        return;
+    }
+    let elapsed_ms = now_ms.saturating_sub(start);
+    if elapsed_ms < TRACE_RATE_INTERVAL_MS {
+        return;
+    }
+    if TRACE_RATE_WINDOW_START_MS
+        .compare_exchange(
+            start,
+            now_ms,
+            core::sync::atomic::Ordering::Relaxed,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        TRACE_RATE_REPORT_PENDING_MS.store(elapsed_ms, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Deferred reporter for [`syscall_trace_timer_tick`]. Registered only in
+/// `counts:` mode and called by the scheduler's existing I/O/timer pump, where
+/// serial output and a cross-CPU snapshot are safe.
+#[cfg(feature = "syscall-trace")]
+fn syscall_trace_report_pump() {
+    let elapsed_ms = TRACE_RATE_REPORT_PENDING_MS.swap(0, core::sync::atomic::Ordering::AcqRel);
+    if elapsed_ms != 0 {
+        emit_syscall_trace_counts(elapsed_ms);
+    }
+}
+
+/// Record the timeout shape of a selected process's `ppoll(2)` call.  This
+/// separates a genuine blocking wait from an explicit zero-timeout probe, and
+/// highlights sub-millisecond requests that the millisecond poll core cannot
+/// represent exactly.  It is deliberately a few relaxed per-CPU increments,
+/// keeping the diagnostic safe to use on a desktop hot loop.
+#[cfg(feature = "syscall-trace")]
+#[inline]
+pub(crate) fn syscall_trace_account_ppoll_timeout(
+    timeout_is_null: bool,
+    seconds: u64,
+    nanoseconds: u64,
+) {
+    if !trace_counts_only() || !syscall_trace_counts_target_task() {
+        return;
+    }
+
+    let counter = if timeout_is_null {
+        TRACE_RATE_PPOLL_INFINITE
+    } else if seconds == 0 && nanoseconds == 0 {
+        TRACE_RATE_PPOLL_ZERO
+    } else if seconds == 0 && nanoseconds < 1_000_000 {
+        TRACE_RATE_PPOLL_SUB_MILLISECOND
+    } else {
+        TRACE_RATE_PPOLL_TIMED
+    };
+    TRACE_RATE.increment(counter);
+}
+
+/// Emit an aggregate snapshot delta.  Counter banks are monotonic; no syscall
+/// writer ever contends with an interval reset.
+#[cfg(feature = "syscall-trace")]
+fn emit_syscall_trace_counts(elapsed_ms: u64) {
+    use core::fmt::Write as _;
+
+    let snapshot = TRACE_RATE.snapshot();
+    let calls = snapshot.get(TRACE_RATE_CALLS);
+    let ioctl = snapshot.get(TRACE_RATE_IOCTL);
+    let wait = snapshot.get(TRACE_RATE_WAIT);
+    let ppoll_infinite = snapshot.get(TRACE_RATE_PPOLL_INFINITE);
+    let ppoll_zero = snapshot.get(TRACE_RATE_PPOLL_ZERO);
+    let ppoll_sub_millisecond = snapshot.get(TRACE_RATE_PPOLL_SUB_MILLISECOND);
+    let ppoll_timed = snapshot.get(TRACE_RATE_PPOLL_TIMED);
+    let park_enter = snapshot.get(TRACE_RATE_PARK_ENTER);
+    let park_block = snapshot.get(TRACE_RATE_PARK_BLOCK);
+    let park_resume_io = snapshot.get(TRACE_RATE_PARK_RESUME_IO);
+    let park_deadline = snapshot.get(TRACE_RATE_PARK_DEADLINE);
+    let park_io_latch = snapshot.get(TRACE_RATE_PARK_IO_LATCH);
+    let park_poll_recheck = snapshot.get(TRACE_RATE_PARK_POLL_RECHECK);
+    let park_timer_full = snapshot.get(TRACE_RATE_PARK_TIMER_FULL);
+    let park_no_context = snapshot.get(TRACE_RATE_PARK_NO_CONTEXT);
+    let park_no_hook = snapshot.get(TRACE_RATE_PARK_NO_HOOK);
+    let calls = calls.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_CALLS].swap(calls, core::sync::atomic::Ordering::Relaxed),
+    );
+    let ioctl = ioctl.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_IOCTL].swap(ioctl, core::sync::atomic::Ordering::Relaxed),
+    );
+    let wait = wait.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_WAIT].swap(wait, core::sync::atomic::Ordering::Relaxed),
+    );
+    let ppoll_infinite = ppoll_infinite.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PPOLL_INFINITE]
+            .swap(ppoll_infinite, core::sync::atomic::Ordering::Relaxed),
+    );
+    let ppoll_zero = ppoll_zero.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PPOLL_ZERO]
+            .swap(ppoll_zero, core::sync::atomic::Ordering::Relaxed),
+    );
+    let ppoll_sub_millisecond = ppoll_sub_millisecond.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PPOLL_SUB_MILLISECOND]
+            .swap(ppoll_sub_millisecond, core::sync::atomic::Ordering::Relaxed),
+    );
+    let ppoll_timed = ppoll_timed.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PPOLL_TIMED]
+            .swap(ppoll_timed, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_enter = park_enter.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_ENTER]
+            .swap(park_enter, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_block = park_block.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_BLOCK]
+            .swap(park_block, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_resume_io = park_resume_io.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_RESUME_IO]
+            .swap(park_resume_io, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_deadline = park_deadline.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_DEADLINE]
+            .swap(park_deadline, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_io_latch = park_io_latch.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_IO_LATCH]
+            .swap(park_io_latch, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_poll_recheck = park_poll_recheck.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_POLL_RECHECK]
+            .swap(park_poll_recheck, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_timer_full = park_timer_full.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_TIMER_FULL]
+            .swap(park_timer_full, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_no_context = park_no_context.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_NO_CONTEXT]
+            .swap(park_no_context, core::sync::atomic::Ordering::Relaxed),
+    );
+    let park_no_hook = park_no_hook.wrapping_sub(
+        TRACE_RATE_LAST[TRACE_RATE_PARK_NO_HOOK]
+            .swap(park_no_hook, core::sync::atomic::Ordering::Relaxed),
+    );
+    if calls != 0 {
+        let mut top = [(usize::MAX, 0u64); TRACE_RATE_TOP_VARIANTS];
+        for variant_index in 0..TRACE_RATE_VARIANTS {
+            let counter_index = TRACE_RATE_VARIANT_BASE + variant_index;
+            let total = snapshot.get(counter_index);
+            let delta = total.wrapping_sub(
+                TRACE_RATE_LAST[counter_index].swap(total, core::sync::atomic::Ordering::Relaxed),
+            );
+            if delta <= top[TRACE_RATE_TOP_VARIANTS - 1].1 {
+                continue;
+            }
+            let mut slot = TRACE_RATE_TOP_VARIANTS - 1;
+            while slot > 0 && delta > top[slot - 1].1 {
+                top[slot] = top[slot - 1];
+                slot -= 1;
+            }
+            top[slot] = (variant_index, delta);
+        }
+        let other = calls.saturating_sub(ioctl.saturating_add(wait));
+        let filter = TRACE_COMM
+            .get()
+            .map(alloc::string::String::as_str)
+            .unwrap_or("systemd-executo");
+        let _ = writeln!(
+            narf_console::ConsoleOnlyWriter,
+            "SYSCALLRATE dt_ms={elapsed_ms} comm={filter:?} calls={calls} ioctl={ioctl} wait={wait} ppoll=[inf:{ppoll_infinite} zero:{ppoll_zero} subms:{ppoll_sub_millisecond} timed:{ppoll_timed}] park=[enter:{park_enter} block:{park_block} resume_io:{park_resume_io} deadline:{park_deadline} io_latch:{park_io_latch} recheck:{park_poll_recheck} timer_full:{park_timer_full} noctx:{park_no_context} nohook:{park_no_hook}] other={other} hot=[{}:{} {}:{} {}:{} {}:{}]",
+            trace_rate_syscall_name(top[0].0), top[0].1,
+            trace_rate_syscall_name(top[1].0), top[1].1,
+            trace_rate_syscall_name(top[2].0), top[2].1,
+            trace_rate_syscall_name(top[3].0), top[3].1,
+        );
+    }
+}
+
+/// Resolve an enum discriminant for the slow, once-per-interval diagnostic
+/// output. The syscall hot path never reads the table or takes a lock.
+#[cfg(feature = "syscall-trace")]
+fn trace_rate_syscall_name(variant_index: usize) -> &'static str {
+    let table = GLOBAL_TABLE.load(Ordering::Acquire);
+    if table.is_null() {
+        return "?";
+    }
+    // SAFETY: the installed syscall table is leaked for the kernel lifetime;
+    // this is the same publication contract as `kernel_syscall_entry`.
+    unsafe { &*table }
+        .names
+        .iter()
+        .find(|(variant, _)| *variant as usize == variant_index)
+        .map(|(_, name)| *name)
+        .unwrap_or("?")
 }
 
 /// Decode and print the path-string arguments of the path-taking syscalls,
@@ -3950,6 +4409,8 @@ pub fn kernel_syscall_entry_plain_with_state(
     // installed, so the `&SyscallTable` is valid for this dispatch.
     // SAFETY: Valid memory or trusted environment
     let table = unsafe { &*p };
+    #[cfg(feature = "syscall-trace")]
+    syscall_trace_account(n);
     // In errors-only mode still surface exit_group/exit ENTRY lines: a systemd
     // executor that fails sandbox setup calls exit_group(<EXIT_* category>)
     // instead of execve()'ing the service binary, so this one line names the

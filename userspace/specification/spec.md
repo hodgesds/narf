@@ -39,6 +39,16 @@ EAGAIN (11), ENOTTY (25) and EFAULT
 See [sound §3.1](../../drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi)
 for implemented requests and compatibility limits.
 
+An inotify descriptor implements `FIONREAD` / `TIOCINQ` (`0x541b`), returning
+the bounded `int` byte count of its unread serialized event records. This is
+the size a caller must be able to read without splitting an event; it remains
+level-readable until those records are consumed.
+`INOTIFY_IOC_SETNEXTWD` (`_IOW('I', 0, __s32)`, `0x40044900`) is available for
+checkpoint/restore: its scalar ioctl argument sets the positive cursor for the
+next new watch descriptor, with occupied values skipped cyclically. Zero or a
+value above `INT_MAX` is `EINVAL`; other inotify-specific ioctl numbers are
+`ENOTTY`. Generic `FIONBIO` remains the VFS-wide nonblocking flag operation.
+
 `SocketFile::delegate_netlink_admin` accepts route and generic netlink
 sockets in the delegated interface's namespace. Generic-family requests
 receive that stored handle through `net::netlink_generic::RequestContext`;

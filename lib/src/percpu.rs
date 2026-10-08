@@ -22,7 +22,7 @@
 //! only exposes the data.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Upper bound on CPU count for Stage 2/3. Resize when SMP scales beyond.
 pub const MAX_CPUS: usize = 64;
@@ -124,6 +124,142 @@ pub fn current_cpu() -> usize {
     narf_arch_cpu_id_hook()
 }
 
+/// Cache-line-padded, monotonically increasing counters with one bank per
+/// CPU.  The owner CPU updates only its own bank using relaxed load/store, so
+/// an increment does not issue a locked RMW or bounce a cache line between
+/// cores.  Readers take an eventually consistent snapshot and derive a
+/// measurement interval with [`PerCpuCounterSnapshot::delta_since`].
+///
+/// This is suitable for diagnostics and telemetry, not for exact
+/// cross-CPU accounting or admission control.  Counter values wrap naturally
+/// at `u64::MAX`; `delta_since` deliberately uses wrapping subtraction so a
+/// long-running counter still has a correct interval delta.
+pub struct PerCpuCounterBank<const N: usize> {
+    cells: [PerCpuCounterCell<N>; MAX_CPUS],
+}
+
+/// Keep each CPU's counter array on separate cache lines.  An array of these
+/// cells has a stride that is a multiple of the alignment, so adjacent CPUs
+/// cannot false-share a counter cache line.
+#[repr(align(64))]
+struct PerCpuCounterCell<const N: usize> {
+    values: [AtomicU64; N],
+}
+
+impl<const N: usize> PerCpuCounterCell<N> {
+    const fn new() -> Self {
+        Self {
+            values: [const { AtomicU64::new(0) }; N],
+        }
+    }
+}
+
+impl<const N: usize> PerCpuCounterBank<N> {
+    /// Construct a zeroed, fixed-size counter bank.
+    pub const fn new() -> Self {
+        Self {
+            cells: [const { PerCpuCounterCell::new() }; MAX_CPUS],
+        }
+    }
+
+    /// Increment `counter` in the calling CPU's bank.  Invalid counter
+    /// indices are ignored: instrumentation must not introduce a failure path
+    /// into the code it is observing.
+    #[inline]
+    pub fn increment(&self, counter: usize) {
+        self.add(counter, 1);
+    }
+
+    /// Add `value` to `counter` in the calling CPU's bank.
+    ///
+    /// Only the owning CPU writes a bank, so a relaxed load followed by a
+    /// relaxed store is sufficient and avoids the cost of a locked `fetch_add`.
+    /// Concurrent snapshot readers may observe either value, which is the
+    /// intended eventually-consistent telemetry contract.
+    #[inline]
+    pub fn add(&self, counter: usize, value: u64) {
+        if counter >= N {
+            return;
+        }
+        let cpu = current_cpu().min(MAX_CPUS - 1);
+        let slot = &self.cells[cpu].values[counter];
+        slot.store(
+            slot.load(Ordering::Relaxed).wrapping_add(value),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Aggregate a relaxed snapshot across every CPU's counter bank.
+    pub fn snapshot(&self) -> PerCpuCounterSnapshot<N> {
+        let mut snapshot = PerCpuCounterSnapshot::zero();
+        for cell in &self.cells {
+            for (index, value) in cell.values.iter().enumerate() {
+                snapshot.values[index] =
+                    snapshot.values[index].wrapping_add(value.load(Ordering::Relaxed));
+            }
+        }
+        snapshot
+    }
+
+    /// Snapshot one CPU's counter bank without cross-CPU aggregation.  An
+    /// invalid CPU index selects the BSP bank, matching [`PerCpu::this_cpu`]'s
+    /// defensive clamping of an invalid architecture CPU id.
+    pub fn snapshot_cpu(&self, cpu: usize) -> PerCpuCounterSnapshot<N> {
+        let cell = &self.cells[cpu.min(MAX_CPUS - 1)];
+        let mut snapshot = PerCpuCounterSnapshot::zero();
+        for (index, value) in cell.values.iter().enumerate() {
+            snapshot.values[index] = value.load(Ordering::Relaxed);
+        }
+        snapshot
+    }
+}
+
+impl<const N: usize> Default for PerCpuCounterBank<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> core::fmt::Debug for PerCpuCounterBank<N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PerCpuCounterBank")
+            .field("counters_per_cpu", &N)
+            .field("max_cpus", &MAX_CPUS)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A point-in-time view of a [`PerCpuCounterBank`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct PerCpuCounterSnapshot<const N: usize> {
+    values: [u64; N],
+}
+
+impl<const N: usize> PerCpuCounterSnapshot<N> {
+    /// A zero-valued snapshot.
+    pub const fn zero() -> Self {
+        Self { values: [0; N] }
+    }
+
+    /// Value of one counter, or zero for an invalid index.
+    #[inline]
+    pub fn get(&self, counter: usize) -> u64 {
+        self.values.get(counter).copied().unwrap_or(0)
+    }
+
+    /// Per-counter delta since `previous`, using wrapping subtraction so it
+    /// remains valid when a monotonic counter wraps around `u64::MAX`.
+    pub fn delta_since(self, previous: Self) -> Self {
+        let mut values = [0; N];
+        let mut index = 0;
+        while index < N {
+            values[index] = self.values[index].wrapping_sub(previous.values[index]);
+            index += 1;
+        }
+        Self { values }
+    }
+}
+
 #[cfg(test)]
 mod host_tests {
     use super::*;
@@ -138,6 +274,24 @@ mod host_tests {
         let cells = PerCpu::new(17u32);
         assert_eq!(*cells.this_cpu(), 17);
         assert_eq!(cells.iter().count(), MAX_CPUS);
+    }
+
+    #[test]
+    fn counter_bank_snapshot_and_delta_are_monotonic() {
+        let counters = PerCpuCounterBank::<3>::new();
+        counters.increment(0);
+        counters.add(1, 4);
+        let before = counters.snapshot();
+        assert_eq!(before.get(0), 1);
+        assert_eq!(before.get(1), 4);
+        assert_eq!(before.get(2), 0);
+
+        counters.add(0, 9);
+        counters.increment(2);
+        let delta = counters.snapshot().delta_since(before);
+        assert_eq!(delta.get(0), 9);
+        assert_eq!(delta.get(1), 0);
+        assert_eq!(delta.get(2), 1);
     }
 }
 

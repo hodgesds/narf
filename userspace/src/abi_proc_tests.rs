@@ -3850,6 +3850,11 @@ kernel_test_in!(
 fn smoke_abi_proc_task_dir_is_named_by_tid() -> TestResult {
     const AT_FDCWD: u64 = (-100i64) as u64;
     const O_DIRECTORY: u64 = 0o200000;
+    // This bare syscall smoke passes formatted kernel-heap paths to openat.
+    // Opt into the ABI harness's kernel-buffer range validation, just as
+    // `with_setup` tests do; aarch64 otherwise correctly rejects the pointer
+    // as outside the user address space before procfs sees it.
+    let _kernel_buffers = crate::handlers::kernel_buffers_guard();
 
     // Same harness caveat as above: with no pid registration `gettid` has no
     // task to name, and `/proc/self/task` cannot be reached either.

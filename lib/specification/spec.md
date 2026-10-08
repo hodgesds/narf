@@ -181,6 +181,34 @@ RFLAGS.IF / DAIF.I read to expose `is_sleepable()` and the
 Storage: `[AtomicU32; MAX_CPUS]` indexed by `current_cpu()`.
 Lock-free; only the owning CPU writes its cell.
 
+### 3.6.1 Per-CPU telemetry counters
+
+```rust
+pub struct PerCpuCounterBank<const N: usize>;
+pub struct PerCpuCounterSnapshot<const N: usize>;
+
+impl<const N: usize> PerCpuCounterBank<N> {
+    pub const fn new() -> Self;
+    pub fn increment(&self, counter: usize);
+    pub fn add(&self, counter: usize, value: u64);
+    pub fn snapshot(&self) -> PerCpuCounterSnapshot<N>;
+    pub fn snapshot_cpu(&self, cpu: usize) -> PerCpuCounterSnapshot<N>;
+}
+impl<const N: usize> Default for PerCpuCounterBank<N> {
+    fn default() -> Self;
+}
+impl<const N: usize> PerCpuCounterSnapshot<N> {
+    pub fn get(&self, counter: usize) -> u64;
+    pub fn delta_since(self, previous: Self) -> Self;
+}
+```
+
+`PerCpuCounterBank` is the low-overhead telemetry primitive: the CPU that
+records an event only writes its own cache-line-padded counter array with a
+relaxed load/store, avoiding locked RMW and cross-CPU cache-line bouncing.
+Snapshots are intentionally eventually consistent; callers measure an interval
+by taking two snapshots and applying wrapping `delta_since`.
+
 ### 3.7 Durable readiness
 
 ```rust

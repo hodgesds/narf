@@ -1160,6 +1160,16 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 ctx.set_return(errno_ret(EOPNOTSUPP));
                 return;
             }
+            if ops.inotify_instance().is_some() {
+                // `inotify_ioctl` handles its small command set directly and
+                // returns ENOTTY for every other request, irrespective of
+                // that request's `_IOC` direction/size bits. Do this before
+                // the generic filesystem ioctl relay: decoding an arbitrary
+                // unknown request there can instead fault its invented input
+                // buffer and incorrectly turn ENOTTY into EINVAL/EFAULT.
+                ctx.set_return(errno_ret(ENOTTY));
+                return;
+            }
             if ops.stat().mode.file_type == narf_filesystem::FileType::Fifo {
                 // pipe_ioctl's -ENOIOCTLCMD is translated by vfs_ioctl to
                 // ENOTTY. Do this before the generic filesystem-ioctl relay:
