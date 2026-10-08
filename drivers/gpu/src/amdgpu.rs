@@ -779,14 +779,6 @@ impl AmdGpu {
         }
     }
 
-    /// Per-family GFX `mmCP_VERSION` byte offset.
-    fn cp_version_offset(&self) -> u32 {
-        match self.chip.family {
-            Family::Phoenix => crate::amdgpu_gfx::CP_VERSION_REL_GFX11,
-            _ => crate::amdgpu_gfx::CP_VERSION_REL_GFX9,
-        }
-    }
-
     /// Resolve the GC IP block base from discovery. None on
     /// pre-discovery silicon or when the discovery blob didn't
     /// land a GC entry.
@@ -810,21 +802,6 @@ impl AmdGpu {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let raw = unsafe { mm_read(&self.regs, off) };
         Some(crate::amdgpu_gfx::GrbmStatus { raw })
-    }
-
-    /// Read `mmCP_VERSION`. None when GC base unresolvable. Real
-    /// silicon: a small non-zero value (CP microcode version,
-    /// e.g. 0x00BEEF12 once firmware loaded). Pre-firmware: any of
-    /// 0, the BIOS-loaded version, or sentinel 0xFFFF_FFFF — the
-    /// presence test in `bring_up` already filters sentinel.
-    ///
-    /// # Safety
-    /// Caller owns BAR5 exclusively.
-    pub unsafe fn read_cp_version(&self) -> Option<u32> {
-        let gc_base = self.gc_base()?;
-        let off = gc_base + self.cp_version_offset();
-        // SAFETY: same as `read_grbm_status`.
-        Some(unsafe { mm_read(&self.regs, off) })
     }
 
     /// Write `mmGRBM_GFX_INDEX` to target a specific SE/SH/instance

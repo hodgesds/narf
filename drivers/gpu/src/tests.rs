@@ -4404,6 +4404,9 @@ fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxError, GfxStep};
 
     const GC: u32 = 0x0003_0000;
+    // GC base window 1, a different base address — `GRBM_GFX_CNTL` is
+    // BASE_IDX 1 and must be addressed from here, not from `GC`.
+    const GC1: u32 = 0x0005_0000;
     const RING: u64 = 0x1_0000_0000;
     const BYTES: u64 = 4096;
     const RPTR: u64 = 0x2_DEAD_0000;
@@ -4413,7 +4416,7 @@ fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
     // read-modify-write is visible.
     const GRBM: u32 = 0xA5A5_A5A2;
 
-    let seq = match build_gfx11_ring_init(GC, GRBM, RING, BYTES, DOORBELL, true, RPTR, WPTR) {
+    let seq = match build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, DOORBELL, true, RPTR, WPTR) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("a valid GFX11 ring config was refused"),
     };
@@ -4487,8 +4490,13 @@ fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
 
     // The pipe select is a read-modify-write of the caller's live value: only
     // PIPEID (bits 1:0) changes.
-    if seq.first_write_to(GC, 0x0900) != Some(GRBM & !0x3) {
+    // Addressed from window 1, and NOT present in window 0 — the pipe select
+    // landing in the wrong window would write an unrelated register.
+    if seq.first_write_to(GC1, 0x0900) != Some(GRBM & !0x3) {
         return TestResult::Fail("GRBM_GFX_CNTL should keep every bit but PIPEID");
+    }
+    if seq.first_write_to(GC, 0x0900).is_some() {
+        return TestResult::Fail("GRBM_GFX_CNTL must not be written in base window 0");
     }
     // And the two registers zeroed first.
     if seq.first_write_to(GC, 0x0f61) != Some(0) {
@@ -4514,29 +4522,40 @@ fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
         return TestResult::Fail("the doorbell control register is wrong");
     }
     // No doorbell: the register stays at its reset value.
-    let nodoor = match build_gfx11_ring_init(GC, GRBM, RING, BYTES, DOORBELL, false, RPTR, WPTR) {
-        Ok(s) => s,
-        Err(_) => return TestResult::Fail("a ring without a doorbell was refused"),
-    };
+    let nodoor =
+        match build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, DOORBELL, false, RPTR, WPTR) {
+            Ok(s) => s,
+            Err(_) => return TestResult::Fail("a ring without a doorbell was refused"),
+        };
     if nodoor.first_write_to(GC, 0x1e8d) != Some(0) {
         return TestResult::Fail("no doorbell means DOORBELL_EN stays clear");
     }
 
     // Validation.
     if !matches!(
-        build_gfx11_ring_init(GC, GRBM, RING, 3000, DOORBELL, true, RPTR, WPTR),
+        build_gfx11_ring_init(GC, GC1, GRBM, RING, 3000, DOORBELL, true, RPTR, WPTR),
         Err(GfxError::BadRingSize)
     ) {
         return TestResult::Fail("a non-power-of-two ring size must be refused");
     }
     if !matches!(
-        build_gfx11_ring_init(GC, GRBM, RING + 0xFF, BYTES, DOORBELL, true, RPTR, WPTR),
+        build_gfx11_ring_init(
+            GC,
+            GC1,
+            GRBM,
+            RING + 0xFF,
+            BYTES,
+            DOORBELL,
+            true,
+            RPTR,
+            WPTR
+        ),
         Err(GfxError::UnalignedRingPhys)
     ) {
         return TestResult::Fail("a ring base that is not 256-byte aligned must be refused");
     }
     if !matches!(
-        build_gfx11_ring_init(GC, GRBM, RING, BYTES, DOORBELL, true, RPTR + 1, WPTR),
+        build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, DOORBELL, true, RPTR + 1, WPTR),
         Err(GfxError::UnalignedRptrWriteback)
     ) {
         return TestResult::Fail("an unaligned rptr writeback must be refused");
@@ -6590,37 +6609,84 @@ kernel_test_in!(
     smoke_amdgpu_foundations_grbm_gfx_index_encoding
 );
 
+/// The GFX register offsets, against the AMD headers they are supposed to
+/// come from.
+///
+/// The version of this test it replaces asserted `GRBM_STATUS = 0x0DA0` and
+/// `CP_VERSION = 0x0867` and said they "must match the documented
+/// gc_9_0_offset.h dwords". Neither does. `mmGRBM_STATUS` is 0x0004 on GFX9
+/// and 0x0da4 on GFX11, and there is no `CP_VERSION` register in any AMD
+/// header — the probe that read it has been removed rather than pointed
+/// somewhere plausible.
+///
+/// An offset test can only restate a number, so what it buys is a tripwire:
+/// changing one of these now requires saying which header line justifies it.
 fn smoke_amdgpu_foundations_gfx_per_family_register_offsets_distinct() -> TestResult {
-    // GFX9 (Renoir, Cezanne) and GFX11 (Phoenix HawkPoint1, Strix)
-    // place GRBM_STATUS and CP_VERSION at different byte offsets;
-    // confirm so the per-family branch in
-    // `AmdGpu::grbm_status_offset` / `cp_version_offset` actually
-    // does work.
     use crate::amdgpu_gfx::{
-        CP_VERSION_REL_GFX11, CP_VERSION_REL_GFX9, GRBM_STATUS_REL_GFX11, GRBM_STATUS_REL_GFX9,
+        CP_ME_CNTL_REL, CP_RB0_BASE_HI_REL, CP_RB0_BASE_REL, CP_RB0_CNTL_REL,
+        CP_RB0_RPTR_ADDR_HI_REL, CP_RB0_RPTR_ADDR_REL, CP_RB0_WPTR_HI_REL, CP_RB0_WPTR_REL,
+        CP_RB_DOORBELL_CONTROL_REL, CP_RB_DOORBELL_RANGE_LOWER_REL, CP_RB_DOORBELL_RANGE_UPPER_REL,
+        GRBM_GFX_INDEX_REL, GRBM_STATUS_REL_GFX11, GRBM_STATUS_REL_GFX9,
     };
+
+    // `gc_9_0_offset.h`, dword ids.
+    let gfx9: &[(&str, u32, u32)] = &[
+        ("mmCP_ME_CNTL", CP_ME_CNTL_REL, 0x01B6),
+        ("mmCP_RB0_BASE", CP_RB0_BASE_REL, 0x1040),
+        ("mmCP_RB0_CNTL", CP_RB0_CNTL_REL, 0x1041),
+        ("mmCP_RB0_RPTR_ADDR", CP_RB0_RPTR_ADDR_REL, 0x1043),
+        ("mmCP_RB0_RPTR_ADDR_HI", CP_RB0_RPTR_ADDR_HI_REL, 0x1044),
+        ("mmCP_RB0_WPTR", CP_RB0_WPTR_REL, 0x1054),
+        ("mmCP_RB0_WPTR_HI", CP_RB0_WPTR_HI_REL, 0x1055),
+        (
+            "mmCP_RB_DOORBELL_CONTROL",
+            CP_RB_DOORBELL_CONTROL_REL,
+            0x1059,
+        ),
+        (
+            "mmCP_RB_DOORBELL_RANGE_LOWER",
+            CP_RB_DOORBELL_RANGE_LOWER_REL,
+            0x105A,
+        ),
+        (
+            "mmCP_RB_DOORBELL_RANGE_UPPER",
+            CP_RB_DOORBELL_RANGE_UPPER_REL,
+            0x105B,
+        ),
+        ("mmCP_RB0_BASE_HI", CP_RB0_BASE_HI_REL, 0x10B1),
+        ("mmGRBM_STATUS", GRBM_STATUS_REL_GFX9, 0x0004),
+        ("mmGRBM_GFX_INDEX", GRBM_GFX_INDEX_REL, 0x2200),
+    ];
+    for (name, got, want_dword) in gfx9.iter().copied() {
+        let _ = name;
+        if got != want_dword * 4 {
+            return TestResult::Fail("a GFX9 register offset is not its gc_9_0_offset.h value");
+        }
+    }
+
+    // `gc_11_0_0_offset.h`.
+    if GRBM_STATUS_REL_GFX11 != 0x0DA4 * 4 {
+        return TestResult::Fail("GFX11 GRBM_STATUS is regGRBM_STATUS = 0x0da4");
+    }
+    // The per-family branch in `AmdGpu::grbm_status_offset` only earns its
+    // keep if the two differ.
     if GRBM_STATUS_REL_GFX9 == GRBM_STATUS_REL_GFX11 {
-        return TestResult::Fail("GRBM_STATUS offsets must differ GFX9 vs GFX11");
+        return TestResult::Fail("GRBM_STATUS moved between GFX9 and GFX11");
     }
-    if CP_VERSION_REL_GFX9 == CP_VERSION_REL_GFX11 {
-        return TestResult::Fail("CP_VERSION offsets must differ GFX9 vs GFX11");
+
+    // No two distinct registers may share an offset — a transposed digit
+    // usually collides, and a collision means one register's writes land on
+    // another's.
+    let mut offsets: alloc::vec::Vec<u32> = gfx9.iter().map(|(_, o, _)| *o).collect();
+    offsets.push(GRBM_STATUS_REL_GFX11);
+    let before = offsets.len();
+    offsets.sort_unstable();
+    offsets.dedup();
+    if offsets.len() != before {
+        return TestResult::Fail("two register offsets collide");
     }
-    // GFX9 values must match the documented gc_9_0_offset.h dwords
-    // (byte addr = dword index * 4):
-    //   mmGRBM_STATUS = 0x0DA0  -> byte 0x3680
-    //   mmCP_VERSION  = 0x0867  -> byte 0x219C
-    if GRBM_STATUS_REL_GFX9 != 0x0DA0 * 4 {
-        return TestResult::Fail("GFX9 GRBM_STATUS byte offset must be 0x0DA0*4");
-    }
-    if CP_VERSION_REL_GFX9 != 0x0867 * 4 {
-        return TestResult::Fail("GFX9 CP_VERSION byte offset must be 0x0867*4");
-    }
-    // All four register byte offsets must be 4-aligned.
-    if GRBM_STATUS_REL_GFX9 & 0x3 != 0
-        || GRBM_STATUS_REL_GFX11 & 0x3 != 0
-        || CP_VERSION_REL_GFX9 & 0x3 != 0
-        || CP_VERSION_REL_GFX11 & 0x3 != 0
-    {
+    // And all are dword aligned.
+    if offsets.iter().any(|o| o & 3 != 0) {
         return TestResult::Fail("register byte offsets must be 4-aligned");
     }
     TestResult::Pass

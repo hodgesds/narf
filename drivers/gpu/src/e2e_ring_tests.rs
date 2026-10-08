@@ -826,7 +826,10 @@ fn smoke_amdgpu_gfx11_ring_init_sequence() -> TestResult {
     use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxStep};
 
     const GC: u32 = 0;
-    let seq = match build_gfx11_ring_init(GC, 0, 0x4_0000, 4096, 4, true, 0x5000, 0x6000) {
+    // GC base window 1, distinct from window 0 so the pipe select is
+    // distinguishable from the rest of the sequence.
+    const GC1: u32 = 0x1_0000;
+    let seq = match build_gfx11_ring_init(GC, GC1, 0, 0x4_0000, 4096, 4, true, 0x5000, 0x6000) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("build_gfx11_ring_init failed"),
     };
@@ -845,14 +848,14 @@ fn smoke_amdgpu_gfx11_ring_init_sequence() -> TestResult {
         Some(active),
         Some(doorbell),
     ) = (
-        at(0x1df1), // CP_RB_VMID
-        at(0x0900), // GRBM_GFX_CNTL
-        at(0x1de1), // CP_RB0_CNTL
-        at(0x1de4), // CP_RB0_RPTR_ADDR_HI
-        at(0x1e8b), // CP_RB_WPTR_POLL_ADDR_LO
-        at(0x1de0), // CP_RB0_BASE
-        at(0x1f40), // CP_RB_ACTIVE
-        at(0x1e8d), // CP_RB_DOORBELL_CONTROL
+        at(0x1df1),                      // CP_RB_VMID
+        seq.index_of_write(GC1, 0x0900), // GRBM_GFX_CNTL, base window 1
+        at(0x1de1),                      // CP_RB0_CNTL
+        at(0x1de4),                      // CP_RB0_RPTR_ADDR_HI
+        at(0x1e8b),                      // CP_RB_WPTR_POLL_ADDR_LO
+        at(0x1de0),                      // CP_RB0_BASE
+        at(0x1f40),                      // CP_RB_ACTIVE
+        at(0x1e8d),                      // CP_RB_DOORBELL_CONTROL
     )
     else {
         return TestResult::Fail("a register the ordering depends on is never written");

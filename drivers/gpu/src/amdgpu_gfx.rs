@@ -52,34 +52,48 @@ use narf_driver_runtime::{alloc_coherent, DmaBuffer, DomainId};
 use crate::amdgpu_pm4::{Pm4Builder, Pm4Error};
 use crate::amdgpu_ring::{Ring, RingError};
 
-// ── CP register offsets (GFX9, relative to GC block base) ──────────
+// ── CP register offsets (GFX9, relative to GC block base 0) ────────
 //
-// Values from `gc/gc_9_0_offset.h` shipped in Linux's
-// `drivers/gpu/drm/amd/include/asic_reg/`. These are the
-// dword-indexed register IDs; the BAR5 byte offset is `id * 4`.
+// Every value here is the dword register id from `gc/gc_9_0_offset.h`, times
+// four for the byte offset. They were ALL wrong — not off by a base, but
+// naming other real registers: `CP_ME_CNTL` was 0x103D, which is
+// `mmCPC_UTCL1_CNTL`, and `CP_RB0_BASE` was 0x107E, which is
+// `mmGB_EDC_MODE`. The old header comment claimed they came from
+// `gc_9_0_offset.h`; they match no AMD header of any generation (GFX9 has
+// CP_RB0_BASE at 0x1040, GFX10 and GFX11 at 0x1de0). So `build_gfx9_ring_init`
+// was writing ring configuration into the memory-error-detection and UTCL1
+// cache-control registers.
+//
+// ## Base windows
+//
+// A SOC15-era register is addressed as `reg_offset[GC][0][BASE_IDX] + id`,
+// and `BASE_IDX` is per register. Everything in this block is BASE_IDX 0, so
+// one `gc_base` addresses them all; the two constants below that are
+// BASE_IDX 1 say so, because adding them to the wrong window lands on an
+// unrelated register.
 
-/// `mmCP_ME_CNTL` — halt / unhalt the three CP engines.
-pub const CP_ME_CNTL_REL: u32 = 0x103D * 4;
-/// `mmCP_RB0_BASE` — low 32 bits of ring phys.
-pub const CP_RB0_BASE_REL: u32 = 0x107E * 4;
-/// `mmCP_RB0_BASE_HI` — high 32 bits of ring phys.
-pub const CP_RB0_BASE_HI_REL: u32 = 0x117C * 4;
-/// `mmCP_RB0_CNTL` — ring size + block size config.
-pub const CP_RB0_CNTL_REL: u32 = 0x1080 * 4;
-/// `mmCP_RB0_RPTR_ADDR` — host rptr-writeback buffer lo.
-pub const CP_RB0_RPTR_ADDR_REL: u32 = 0x107A * 4;
-/// `mmCP_RB0_RPTR_ADDR_HI` — host rptr-writeback buffer hi.
-pub const CP_RB0_RPTR_ADDR_HI_REL: u32 = 0x107B * 4;
-/// `mmCP_RB0_WPTR` — host writeable wptr lo.
-pub const CP_RB0_WPTR_REL: u32 = 0x1084 * 4;
-/// `mmCP_RB0_WPTR_HI` — host writeable wptr hi.
-pub const CP_RB0_WPTR_HI_REL: u32 = 0x1085 * 4;
-/// `mmCP_RB_DOORBELL_CONTROL` — enable + offset of the doorbell.
-pub const CP_RB_DOORBELL_CONTROL_REL: u32 = 0x1170 * 4;
-/// `mmCP_RB_DOORBELL_RANGE_LOWER` — lower clamp on the doorbell window.
-pub const CP_RB_DOORBELL_RANGE_LOWER_REL: u32 = 0x1171 * 4;
-/// `mmCP_RB_DOORBELL_RANGE_UPPER` — upper clamp on the doorbell window.
-pub const CP_RB_DOORBELL_RANGE_UPPER_REL: u32 = 0x1172 * 4;
+/// `mmCP_ME_CNTL` (0x01b6, BASE_IDX 0) — halt / unhalt the three CP engines.
+pub const CP_ME_CNTL_REL: u32 = 0x01B6 * 4;
+/// `mmCP_RB0_BASE` (0x1040, BASE_IDX 0) — ring address, shifted right by 8.
+pub const CP_RB0_BASE_REL: u32 = 0x1040 * 4;
+/// `mmCP_RB0_BASE_HI` (0x10b1, BASE_IDX 0).
+pub const CP_RB0_BASE_HI_REL: u32 = 0x10B1 * 4;
+/// `mmCP_RB0_CNTL` (0x1041, BASE_IDX 0) — ring size + block size.
+pub const CP_RB0_CNTL_REL: u32 = 0x1041 * 4;
+/// `mmCP_RB0_RPTR_ADDR` (0x1043, BASE_IDX 0) — rptr writeback, low.
+pub const CP_RB0_RPTR_ADDR_REL: u32 = 0x1043 * 4;
+/// `mmCP_RB0_RPTR_ADDR_HI` (0x1044, BASE_IDX 0) — rptr writeback, high 16.
+pub const CP_RB0_RPTR_ADDR_HI_REL: u32 = 0x1044 * 4;
+/// `mmCP_RB0_WPTR` (0x1054, BASE_IDX 0).
+pub const CP_RB0_WPTR_REL: u32 = 0x1054 * 4;
+/// `mmCP_RB0_WPTR_HI` (0x1055, BASE_IDX 0).
+pub const CP_RB0_WPTR_HI_REL: u32 = 0x1055 * 4;
+/// `mmCP_RB_DOORBELL_CONTROL` (0x1059, BASE_IDX 0).
+pub const CP_RB_DOORBELL_CONTROL_REL: u32 = 0x1059 * 4;
+/// `mmCP_RB_DOORBELL_RANGE_LOWER` (0x105a, BASE_IDX 0).
+pub const CP_RB_DOORBELL_RANGE_LOWER_REL: u32 = 0x105A * 4;
+/// `mmCP_RB_DOORBELL_RANGE_UPPER` (0x105b, BASE_IDX 0).
+pub const CP_RB_DOORBELL_RANGE_UPPER_REL: u32 = 0x105B * 4;
 
 // ── Field encodings ────────────────────────────────────────────────
 
@@ -142,19 +156,36 @@ pub const CP_RB_DOORBELL_OFFSET_SHIFT: u32 = 2;
 // All offsets are relative to the GC IP block window
 // (`HW_ID_GC` instance 0 from discovery).
 
-/// GFX9 `mmGRBM_STATUS` byte offset — busy bitfield over CP/RLC/SE.
-pub const GRBM_STATUS_REL_GFX9: u32 = 0x0DA0 * 4;
-/// GFX11 `mmGRBM_STATUS` byte offset.
-pub const GRBM_STATUS_REL_GFX11: u32 = 0x1A40 * 4;
-/// `mmGRBM_GFX_INDEX` byte offset — SE/SH/CU broadcast mask.
-/// Identical dword index on both GFX9 and GFX11 per the public
-/// PPR tables (the register is part of the GFX hub block that
-/// didn't move between generations).
-pub const GRBM_GFX_INDEX_REL: u32 = 0x2A00 * 4;
-/// GFX9 `mmCP_VERSION` byte offset.
-pub const CP_VERSION_REL_GFX9: u32 = 0x0867 * 4;
-/// GFX11 `mmCP_VERSION` byte offset.
-pub const CP_VERSION_REL_GFX11: u32 = 0x0C8C * 4;
+/// GFX9 `mmGRBM_STATUS` (0x0004, BASE_IDX 0) — busy bitfield over CP/RLC/SE.
+///
+/// Was 0x0DA0, which is not `GRBM_STATUS` on GFX9 — 0x0da4 is its GFX11
+/// offset, so this looks like the GFX11 value transcribed four short and then
+/// applied to the wrong generation.
+pub const GRBM_STATUS_REL_GFX9: u32 = 0x0004 * 4;
+/// GFX11 `regGRBM_STATUS` (0x0da4, BASE_IDX 0).
+///
+/// Was 0x1A40, which is `regSPI_SHADER_USER_DATA_GS_20` — a shader
+/// user-data register. The chip-liveness probe that reads this was therefore
+/// reading shader state and calling it a GRBM status word.
+pub const GRBM_STATUS_REL_GFX11: u32 = 0x0DA4 * 4;
+/// `GRBM_GFX_INDEX` (0x2200) — SE/SH/CU broadcast mask. Same id on GFX9 and
+/// GFX11, as the old comment claimed; the VALUE was 0x2A00, which on GFX11 is
+/// `regCP_GFX_CNTL`.
+///
+/// **BASE_IDX 1.** Adding this to the GC window used for every other constant
+/// in this file lands somewhere else entirely; see [`GC_BASE_IDX_1`].
+pub const GRBM_GFX_INDEX_REL: u32 = 0x2200 * 4;
+
+/// Marker for the registers above that live in GC base window **1** rather
+/// than 0, and so cannot be reached from the same `gc_base`.
+///
+/// LINUX-GAP: nothing in this file resolves window 1. A SOC15 register is
+/// addressed as `reg_offset[GC][0][BASE_IDX] + id`, and IP discovery supplies
+/// both windows in `IpBlock::base_addrs`, but the helpers here take a single
+/// `gc_base`. The two BASE_IDX 1 registers are declared so a caller cannot
+/// use one by accident believing it is reachable; wiring the second window
+/// through is the fix.
+pub const GC_BASE_IDX_1: &[&str] = &["GRBM_GFX_INDEX", "CP_GFX_CNTL", "GRBM_GFX_CNTL"];
 
 // ── GRBM_STATUS bit decode ─────────────────────────────────────────
 //
@@ -239,14 +270,22 @@ pub const fn grbm_gfx_index_for(se: u8, sh: u8, instance: u8) -> u32 {
 
 // ── CP register offsets (GFX11 — Phoenix HawkPoint1 / Strix) ───────
 //
-// Values from gc/gc_11_0_0_offset.h. Most ring registers keep the
-// same dword IDs as GFX9; the key delta is that CP_ME_CNTL is
-// replaced by CP_GFX_CNTL with reshuffled halt-bit positions.
-
-/// `mmCP_GFX_CNTL` (GFX11) — replaces CP_ME_CNTL for halt/unhalt.
-pub const CP_GFX_CNTL_REL: u32 = 0x103E * 4;
+// Values from `gc/gc_11_0_0_offset.h`.
+//
+// The comment here used to say "most ring registers keep the same dword IDs
+// as GFX9". They do not: `CP_RB0_BASE` is 0x1040 on GFX9 and 0x1de0 on GFX11,
+// and `CP_ME_CNTL` moves from 0x01b6 to 0x0803. The GFX11 sequence therefore
+// carries its own offset block (see `GFX11_*` further down) rather than
+// reusing the GFX9 `*_REL` constants.
 
 // CP_GFX_CNTL halt bits — distinct positions from CP_ME_CNTL on GFX9.
+
+/// `regCP_GFX_CNTL` (0x2a00, **BASE_IDX 1**) — the GFX11 CP halt register.
+///
+/// Was 0x103E in base window 0, which is neither this register nor that
+/// window. See [`GC_BASE_IDX_1`]: reaching it needs the second GC window,
+/// which nothing here resolves yet, so no caller may use it until that lands.
+pub const CP_GFX_CNTL_REL: u32 = 0x2A00 * 4;
 
 /// `CP_GFX_CNTL` — halt the FE (front-end fetch).
 pub const CP_GFX_CNTL_FE_HALT: u32 = 1 << 0;
@@ -679,6 +718,11 @@ impl Gfx11Sequence {
 /// field. Read-modify-write needs the live value, which a sequence cannot
 /// carry, so `grbm_gfx_cntl` is passed in — the caller reads it once.
 ///
+/// `GRBM_GFX_CNTL` is also the one register here in GC base window **1**
+/// (BASE_IDX 1); everything else is window 0. Both windows are therefore
+/// parameters, because a single `gc_base` silently puts the pipe select on
+/// whatever register sits at that offset in the other window.
+///
 /// LINUX-GAP: ring 1 on pipe 1 is not emitted. Linux brings it up when
 /// `num_gfx_rings > 1`; one ring is enough to submit, and a second doubles the
 /// bring-up surface for no gain until the first works.
@@ -689,6 +733,11 @@ impl Gfx11Sequence {
 #[allow(clippy::too_many_arguments)]
 pub fn build_gfx11_ring_init(
     gc_base: u32,
+    // `gc_base_1` is GC base window 1, where `GRBM_GFX_CNTL` lives. Every
+    // other register in this sequence is BASE_IDX 0 and uses `gc_base`.
+    // Passing `gc_base` for both would put the pipe select on an unrelated
+    // register — a mistake this parameter exists to make visible.
+    gc_base_1: u32,
     grbm_gfx_cntl: u32,
     ring_phys: u64,
     ring_size_bytes: u64,
@@ -718,8 +767,14 @@ pub fn build_gfx11_ring_init(
 
     // Select pipe 0. Read-modify-write of the caller's live value: PIPEID is
     // bits 1:0, and pipe 0 means clearing them.
+    //
+    // `GRBM_GFX_CNTL` is BASE_IDX **1**, so it is addressed from the second
+    // GC window. This was emitted against `gc_base` when the sequence was
+    // first written; the two windows are different base addresses and the
+    // write would have landed on whatever register sits at that offset in
+    // window 0.
     let pipe0 = grbm_gfx_cntl & !0x3;
-    seq.write(gc_base, GFX11_GRBM_GFX_CNTL, pipe0);
+    seq.write(gc_base_1, GFX11_GRBM_GFX_CNTL, pipe0);
 
     // `rb_bufsz = order_base_2(ring_size / 8)`.
     //
