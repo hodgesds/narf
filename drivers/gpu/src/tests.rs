@@ -9171,3 +9171,118 @@ kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
     smoke_amdgpu_smu_mailbox_offsets_match_mp13
 );
+
+/// The DCN register offsets against the dword ids in the AMD headers.
+///
+/// Every DCN test in this suite composed its expected addresses from the same
+/// constants it was checking, so changing a constant changed both sides and
+/// nothing could fail. This one carries the header values literally.
+///
+/// The deltas are all relative to the first register of each block, which is
+/// how the tables are written: `regOTG0_OTG_H_TOTAL` (0x1b2a),
+/// `regHUBP0_DCHUBP_CNTL` (0x05f3), `regOPP_PIPE0_OPP_PIPE_CONTROL` (0x188c).
+fn smoke_amdgpu_dcn_offsets_match_headers() -> TestResult {
+    use crate::amdgpu_dcn::*;
+
+    // `dcn_2_0_0_offset.h` and `dcn_3_1_4_offset.h` agree on all seven OTG
+    // registers. The block is NOT a contiguous run — the gaps are the point.
+    const OTG_H_TOTAL: u32 = 0x1b2a;
+    let otg_314: &[(u32, u32, u32)] = &[
+        (OTG_H_TOTAL_REL, 0x1b2a, DCN20_OTG_H_TOTAL_REL),
+        (OTG_H_BLANK_START_END_REL, 0x1b2b, DCN20_OTG_H_BLANK_REL),
+        (OTG_H_SYNC_A_REL, 0x1b2c, DCN20_OTG_H_SYNC_A_REL),
+        (OTG_V_TOTAL_REL, 0x1b2f, DCN20_OTG_V_TOTAL_REL),
+        (OTG_V_BLANK_START_END_REL, 0x1b36, DCN20_OTG_V_BLANK_REL),
+        (OTG_V_SYNC_A_REL, 0x1b37, DCN20_OTG_V_SYNC_A_REL),
+        (OTG_CONTROL_REL, 0x1b41, DCN20_OTG_CONTROL_REL),
+    ];
+    for (generic, dword, dcn20) in otg_314.iter().copied() {
+        let want = (dword - OTG_H_TOTAL) * 4;
+        if generic != want {
+            return TestResult::Fail("a generic OTG offset is not its header delta");
+        }
+        if dcn20 != want {
+            return TestResult::Fail("a DCN 2.0 OTG offset is not its header delta");
+        }
+    }
+
+    // `dcn_3_5_0_offset.h` moves three of them, which is why Phoenix must NOT
+    // use this table: V_BLANK 0x1b38, V_SYNC_A 0x1b39, OTG_CONTROL 0x1b43.
+    let otg_35: &[(u32, u32)] = &[
+        (DCN35_OTG_H_TOTAL_REL, 0x1b2a),
+        (DCN35_OTG_H_BLANK_REL, 0x1b2b),
+        (DCN35_OTG_H_SYNC_A_REL, 0x1b2c),
+        (DCN35_OTG_V_TOTAL_REL, 0x1b2f),
+        (DCN35_OTG_V_BLANK_REL, 0x1b38),
+        (DCN35_OTG_V_SYNC_A_REL, 0x1b39),
+        (DCN35_OTG_CONTROL_REL, 0x1b43),
+    ];
+    for (got, dword) in otg_35.iter().copied() {
+        if got != (dword - OTG_H_TOTAL) * 4 {
+            return TestResult::Fail("a DCN 3.5 OTG offset is not its header delta");
+        }
+    }
+    // And the two generations must genuinely differ where the headers do, or
+    // the Phoenix-vs-Strix distinction this commit draws is meaningless.
+    if DCN35_OTG_V_BLANK_REL == DCN20_OTG_V_BLANK_REL
+        || DCN35_OTG_CONTROL_REL == DCN20_OTG_CONTROL_REL
+    {
+        return TestResult::Fail("DCN 3.5's vertical timing registers moved; the tables must too");
+    }
+
+    // HUBP. The surface registers are in the HUBPREQ sub-block, so their ids
+    // do not continue from DCHUBP_CNTL, and LOW is below HIGH.
+    const HUBP_CNTL: u32 = 0x05f3;
+    let hubp: &[(u32, u32, u32)] = &[
+        (HUBP_DCHUBP_CNTL_REL, 0x05f3, DCN20_HUBP_BLANK_EN_REL),
+        (
+            HUBP_PRIMARY_SURFACE_PITCH_REL,
+            0x0607,
+            DCN20_HUBP_SURFACE_PITCH_REL,
+        ),
+        (
+            HUBP_PRIMARY_SURFACE_ADDRESS_REL,
+            0x060a,
+            DCN20_HUBP_PRI_ADDR_LO_REL,
+        ),
+        (
+            HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL,
+            0x060b,
+            DCN20_HUBP_PRI_ADDR_HI_REL,
+        ),
+    ];
+    for (generic, dword, dcn20) in hubp.iter().copied() {
+        let want = (dword - HUBP_CNTL) * 4;
+        if generic != want || dcn20 != want {
+            return TestResult::Fail("a HUBP offset is not its header delta");
+        }
+    }
+    // The address halves must be in the right order — swapped, every scanout
+    // address is assembled from the wrong two registers.
+    if HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL <= HUBP_PRIMARY_SURFACE_ADDRESS_REL {
+        return TestResult::Fail("the surface address HIGH half is above the LOW half");
+    }
+    // Blanking is a field of DCHUBP_CNTL, so its "offset" is the register's.
+    if DCN20_HUBP_BLANK_EN_REL != HUBP_DCHUBP_CNTL_REL {
+        return TestResult::Fail("HUBP_BLANK_EN is a field of DCHUBP_CNTL, not its own register");
+    }
+
+    // Per-pipe strides, from the difference between pipe 0 and pipe 1.
+    for (got, p0, p1) in [
+        (DCN20_OTG_STRIDE, 0x1b2a, 0x1baa),
+        (DCN20_HUBP_STRIDE, 0x05f3, 0x06cf),
+        (DCN20_OPP_STRIDE, 0x188c, 0x18e6),
+    ] {
+        if got != (p1 - p0) * 4 {
+            return TestResult::Fail("a per-pipe stride is not the header's pipe delta");
+        }
+    }
+    if DCN35_HUBP_STRIDE != DCN20_HUBP_STRIDE || DCN35_OPP_STRIDE != DCN20_OPP_STRIDE {
+        return TestResult::Fail("the pipe strides do not change between these DCN revisions");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_dcn",
+    smoke_amdgpu_dcn_offsets_match_headers
+);

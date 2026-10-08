@@ -55,9 +55,7 @@ use alloc::vec::Vec;
 
 use crate::amdgpu::Family;
 use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayPath};
-use crate::amdgpu_dcn::{
-    dcn20_modeset_sequence, dcn35_modeset_sequence, timing_for_mode, DcnWrite, ModeTiming,
-};
+use crate::amdgpu_dcn::{dcn20_modeset_sequence, timing_for_mode, DcnWrite, ModeTiming};
 
 // ── Connector ────────────────────────────────────────────────────
 
@@ -380,7 +378,16 @@ pub fn plan_modeset(
     let crtc_idx = conn.bound_crtc.ok_or(KmsError::NoCrtc)?;
     let timing = timing_for_mode(width, height, refresh_hz).ok_or(KmsError::UnsupportedMode)?;
     let writes = match family {
-        Family::Phoenix => dcn35_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
+        // Phoenix is DCN **3.1.4**, not 3.5 — and the two differ exactly
+        // where it matters: `regOTG0_OTG_V_BLANK_START_END` is 0x1b36 on
+        // 3.1.4 and 0x1b38 on 3.5, `V_SYNC_A` 0x1b37 against 0x1b39, and
+        // `OTG_CONTROL` 0x1b41 against 0x1b43. DCN 3.1.4 agrees with DCN 2.0
+        // on all seven OTG registers, so the 2.0 sequence is the correct one
+        // for it. Selecting the 3.5 sequence here put every vertical timing
+        // register and the master enable two dwords past where they live.
+        //
+        // `dcn35_modeset_sequence` is kept for Strix, which really is 3.5.
+        Family::Phoenix => dcn20_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
         _ => dcn20_modeset_sequence(&timing, surface_phys, stride_pixels, dcn_base),
     };
     Ok(ModesetPlan {

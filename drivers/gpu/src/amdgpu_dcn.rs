@@ -78,16 +78,34 @@ use crate::amdgpu_offsets;
 // base, the codec returns `None` rather than poking the wrong
 // register window.
 
-/// HUBP_BLANK control. Bit 0 = 1 forces the pipe blank.
-pub const HUBP_BLANK_REL: u32 = 0x0064;
-/// HUBP primary surface address (low 32 bits).
-pub const HUBP_PRIMARY_SURFACE_ADDRESS_REL: u32 = 0x00A4;
-/// HUBP primary surface address (high 32 bits).
-pub const HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL: u32 = 0x00A0;
-/// HUBP primary surface pitch.
-pub const HUBP_PRIMARY_SURFACE_PITCH_REL: u32 = 0x00A8;
+// The within-block offsets below are derived from the dword ids in
+// `dcn/dcn_3_1_4_offset.h` (DCN 2.0 and 3.1.4 agree on every one of them),
+// relative to `regHUBP0_DCHUBP_CNTL` at dword 0x05f3:
+//
+//   regHUBP0_DCHUBP_CNTL                             0x05f3   +0
+//   regHUBPREQ0_DCSURF_SURFACE_PITCH                 0x0607   +0x50
+//   regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS       0x060a   +0x5C
+//   regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH  0x060b   +0x60
+//
+// Two things the old values got wrong. The surface registers are in the
+// **HUBPREQ** sub-block, not HUBP, which is why their ids do not continue
+// from `DCHUBP_CNTL`; and the ADDRESS / ADDRESS_HIGH pair was ordered with
+// HIGH *below* LOW (0x00A0 against 0x00A4), where the header has LOW at
+// 0x060a and HIGH at 0x060b — so the two halves of every scanout address
+// were swapped.
 
-/// HUBP_BLANK[0] — force-blank.
+/// `regHUBP0_DCHUBP_CNTL` — the blank control is a FIELD of this register
+/// (`HUBP0_DCHUBP_CNTL__HUBP_BLANK_EN`, bit 0), not a register of its own.
+/// It had its own offset, 0x0064, which names no register here.
+pub const HUBP_DCHUBP_CNTL_REL: u32 = 0x0000;
+/// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS`.
+pub const HUBP_PRIMARY_SURFACE_ADDRESS_REL: u32 = 0x005C;
+/// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH`.
+pub const HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL: u32 = 0x0060;
+/// `regHUBPREQ0_DCSURF_SURFACE_PITCH`.
+pub const HUBP_PRIMARY_SURFACE_PITCH_REL: u32 = 0x0050;
+
+/// `HUBP0_DCHUBP_CNTL__HUBP_BLANK_EN`, bit 0.
 pub const HUBP_BLANK_FORCE: u32 = 1 << 0;
 
 // ── OPP register offsets (AMD DCN1+ register reference) ──────────
@@ -102,17 +120,37 @@ pub const OPP_PIPE_ENABLE: u32 = 1 << 0;
 
 // ── OTG register offsets (AMD DCN1+ register reference) ──────────
 
-/// OTG_H_TOTAL — bits[15:0] = h_total - 1.
+// Relative to `regOTG0_OTG_H_TOTAL` at dword 0x1b2a. The OTG block is NOT a
+// contiguous run of the registers a modeset needs, and both tables in this
+// file assumed it was — walking them 4 bytes at a time in the order
+// H_TOTAL, V_TOTAL, H_BLANK, V_BLANK, H_SYNC, V_SYNC. The header:
+//
+//   regOTG0_OTG_H_TOTAL            0x1b2a   +0
+//   regOTG0_OTG_H_BLANK_START_END  0x1b2b   +0x04
+//   regOTG0_OTG_H_SYNC_A           0x1b2c   +0x08
+//   regOTG0_OTG_V_TOTAL            0x1b2f   +0x14
+//   regOTG0_OTG_V_BLANK_START_END  0x1b36   +0x30
+//   regOTG0_OTG_V_SYNC_A           0x1b37   +0x34
+//   regOTG0_OTG_CONTROL            0x1b41   +0x5C
+//
+// So every vertical timing register, both sync registers and the master
+// enable went somewhere else, and H_BLANK and H_SYNC were swapped with each
+// other. DCN 2.0 and DCN 3.1.4 agree on all seven ids.
+
+/// `regOTG0_OTG_H_TOTAL` — bits[15:0] = h_total - 1.
 pub const OTG_H_TOTAL_REL: u32 = 0x0000;
-/// OTG_V_TOTAL — bits[15:0] = v_total - 1.
-pub const OTG_V_TOTAL_REL: u32 = 0x0004;
-/// OTG_H_BLANK_START_END — bits[15:0]=start, bits[31:16]=end.
-pub const OTG_H_BLANK_START_END_REL: u32 = 0x0008;
-pub const OTG_V_BLANK_START_END_REL: u32 = 0x000C;
-pub const OTG_H_SYNC_A_REL: u32 = 0x0010;
-pub const OTG_V_SYNC_A_REL: u32 = 0x0014;
-/// OTG_MASTER_EN — bit 0 = 1 starts scanout.
-pub const OTG_CONTROL_REL: u32 = 0x0040;
+/// `regOTG0_OTG_H_BLANK_START_END` — bits[15:0]=start, [31:16]=end.
+pub const OTG_H_BLANK_START_END_REL: u32 = 0x0004;
+/// `regOTG0_OTG_H_SYNC_A`.
+pub const OTG_H_SYNC_A_REL: u32 = 0x0008;
+/// `regOTG0_OTG_V_TOTAL` — bits[15:0] = v_total - 1.
+pub const OTG_V_TOTAL_REL: u32 = 0x0014;
+/// `regOTG0_OTG_V_BLANK_START_END`.
+pub const OTG_V_BLANK_START_END_REL: u32 = 0x0030;
+/// `regOTG0_OTG_V_SYNC_A`.
+pub const OTG_V_SYNC_A_REL: u32 = 0x0034;
+/// `regOTG0_OTG_CONTROL` — bit 0 (`OTG_MASTER_EN`) starts scanout.
+pub const OTG_CONTROL_REL: u32 = 0x005C;
 
 pub const OTG_MASTER_EN: u32 = 1 << 0;
 
@@ -216,7 +254,7 @@ pub fn build_modeset(
 
     // Disable: blank HUBP and stop OTG before reprogramming.
     seq.disable[0] = Some(DcnWrite {
-        addr: hubp_base + HUBP_BLANK_REL,
+        addr: hubp_base + HUBP_DCHUBP_CNTL_REL,
         value: HUBP_BLANK_FORCE,
     });
     seq.disable[1] = Some(DcnWrite {
@@ -278,7 +316,7 @@ pub fn build_modeset(
 
     // Enable: unblank HUBP, start OTG.
     seq.enable[0] = Some(DcnWrite {
-        addr: hubp_base + HUBP_BLANK_REL,
+        addr: hubp_base + HUBP_DCHUBP_CNTL_REL,
         value: 0,
     });
     seq.enable[1] = Some(DcnWrite {
@@ -313,10 +351,13 @@ pub fn build_modeset(
 /// Stride between successive HUBP instances. Per `dcn20_resource.c`
 /// in Linux's `dc/dcn20/`, HUBP[i] sits at `HUBP0 + i *
 /// DCN20_HUBP_STRIDE`.
-pub const DCN20_HUBP_STRIDE: u32 = 0x0200;
+// regHUBP1_DCHUBP_CNTL 0x06cf - regHUBP0_ 0x05f3 = 0xDC dwords. Was 0x0200.
+pub const DCN20_HUBP_STRIDE: u32 = 0x0370;
 /// Same idea for OPP.
-pub const DCN20_OPP_STRIDE: u32 = 0x0100;
+// regOPP_PIPE1_OPP_PIPE_CONTROL 0x18e6 - OPP_PIPE0_ 0x188c = 0x5A dwords. Was 0x0100.
+pub const DCN20_OPP_STRIDE: u32 = 0x0168;
 /// Same idea for OTG (OPTC).
+// regOTG1_OTG_H_TOTAL 0x1baa - OTG0_ 0x1b2a = 0x80 dwords. This one was already right.
 pub const DCN20_OTG_STRIDE: u32 = 0x0200;
 
 /// HUBP0 byte offset from the DCN base.
@@ -347,14 +388,18 @@ pub const DCN20_OTG0_REL: u32 = 0x2180;
 // byte offset from the block base above.
 
 /// `HUBP_BLANK_EN[0]` — force the pipe blank.
-pub const DCN20_HUBP_BLANK_EN_REL: u32 = 0x0014;
+// HUBP_BLANK_EN is bit 0 of regHUBP0_DCHUBP_CNTL, not its own register.
+pub const DCN20_HUBP_BLANK_EN_REL: u32 = 0x0000;
 /// `HUBP_PRIMARY_SURFACE_ADDRESS` (low 32 bits).
-pub const DCN20_HUBP_PRI_ADDR_LO_REL: u32 = 0x009C;
+// regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS 0x060a, +0x5C from regHUBP0_DCHUBP_CNTL 0x05f3.
+pub const DCN20_HUBP_PRI_ADDR_LO_REL: u32 = 0x005C;
 /// `HUBP_PRIMARY_SURFACE_ADDRESS_HIGH`.
-pub const DCN20_HUBP_PRI_ADDR_HI_REL: u32 = 0x0098;
+// regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH 0x060b. HIGH is ABOVE LOW; the two were swapped.
+pub const DCN20_HUBP_PRI_ADDR_HI_REL: u32 = 0x0060;
 /// `HUBP_DCSURF_SURFACE_PITCH`. Bits[12:0] = stride in pixels - 1
 /// for the linear case Stage-3 programs.
-pub const DCN20_HUBP_SURFACE_PITCH_REL: u32 = 0x00A0;
+// regHUBPREQ0_DCSURF_SURFACE_PITCH 0x0607.
+pub const DCN20_HUBP_SURFACE_PITCH_REL: u32 = 0x0050;
 
 /// `OPP_PIPE_CONTROL[0]` — pipe enable.
 pub const DCN20_OPP_PIPE_CONTROL_REL: u32 = 0x0030;
@@ -362,21 +407,28 @@ pub const DCN20_OPP_PIPE_CONTROL_REL: u32 = 0x0030;
 pub const DCN20_OPP_GRPH_PASSTHROUGH_REL: u32 = 0x0034;
 
 /// `OTG_H_TOTAL`. Bits[15:0] = h_total - 1.
+// regOTG0_OTG_H_TOTAL 0x1b2a.
 pub const DCN20_OTG_H_TOTAL_REL: u32 = 0x0000;
 /// `OTG_V_TOTAL`.
-pub const DCN20_OTG_V_TOTAL_REL: u32 = 0x0010;
+// regOTG0_OTG_V_TOTAL 0x1b2f. Was 0x0010.
+pub const DCN20_OTG_V_TOTAL_REL: u32 = 0x0014;
 /// `OTG_H_BLANK_START_END`. (end << 16) | start.
-pub const DCN20_OTG_H_BLANK_REL: u32 = 0x0008;
+// regOTG0_OTG_H_BLANK_START_END 0x1b2b. Was 0x0008, swapped with H_SYNC_A.
+pub const DCN20_OTG_H_BLANK_REL: u32 = 0x0004;
 /// `OTG_V_BLANK_START_END`.
-pub const DCN20_OTG_V_BLANK_REL: u32 = 0x001C;
+// regOTG0_OTG_V_BLANK_START_END 0x1b36. Was 0x001C.
+pub const DCN20_OTG_V_BLANK_REL: u32 = 0x0030;
 /// `OTG_H_SYNC_A`.
-pub const DCN20_OTG_H_SYNC_A_REL: u32 = 0x0004;
+// regOTG0_OTG_H_SYNC_A 0x1b2c. Was 0x0004.
+pub const DCN20_OTG_H_SYNC_A_REL: u32 = 0x0008;
 /// `OTG_V_SYNC_A`.
-pub const DCN20_OTG_V_SYNC_A_REL: u32 = 0x0014;
+// regOTG0_OTG_V_SYNC_A 0x1b37. Was 0x0014.
+pub const DCN20_OTG_V_SYNC_A_REL: u32 = 0x0034;
 /// `OTG_INTERRUPT_CONTROL` — masked during reprogram.
 pub const DCN20_OTG_INTERRUPT_CONTROL_REL: u32 = 0x00C0;
 /// `OTG_CONTROL` — bit 0 is OTG_MASTER_EN.
-pub const DCN20_OTG_CONTROL_REL: u32 = 0x0040;
+// regOTG0_OTG_CONTROL 0x1b41. Was 0x0040.
+pub const DCN20_OTG_CONTROL_REL: u32 = 0x005C;
 /// `OTG_STATUS` — VBLANK reflected in bit 0 in DCN 2.0.
 pub const DCN20_OTG_STATUS_REL: u32 = 0x0080;
 /// `OTG_STATUS.OTG_VBLANK` mask.
@@ -652,8 +704,8 @@ pub fn dcn20_modeset_sequence(
 /// HUBP / OPP / OTG strides on DCN 3.5. Same per-instance stride
 /// as DCN 2.0 — the per-pipe block layouts didn't grow between
 /// the two IP versions; only the within-OTG layout shifted.
-pub const DCN35_HUBP_STRIDE: u32 = 0x0200;
-pub const DCN35_OPP_STRIDE: u32 = 0x0100;
+pub const DCN35_HUBP_STRIDE: u32 = 0x0370;
+pub const DCN35_OPP_STRIDE: u32 = 0x0168;
 pub const DCN35_OTG_STRIDE: u32 = 0x0200;
 
 /// HUBP0 / OPP0 / OTG0 byte offsets from the DCN base. Inherited
@@ -670,10 +722,10 @@ pub const DCN35_OTG0_REL: u32 = 0x2180;
 // registers are stable across DCN20→DCN35; the OTG block has the
 // shifts called out in the table above.
 
-pub const DCN35_HUBP_BLANK_EN_REL: u32 = 0x0014;
-pub const DCN35_HUBP_PRI_ADDR_LO_REL: u32 = 0x009C;
-pub const DCN35_HUBP_PRI_ADDR_HI_REL: u32 = 0x0098;
-pub const DCN35_HUBP_SURFACE_PITCH_REL: u32 = 0x00A0;
+pub const DCN35_HUBP_BLANK_EN_REL: u32 = 0x0000;
+pub const DCN35_HUBP_PRI_ADDR_LO_REL: u32 = 0x005C;
+pub const DCN35_HUBP_PRI_ADDR_HI_REL: u32 = 0x0060;
+pub const DCN35_HUBP_SURFACE_PITCH_REL: u32 = 0x0050;
 
 pub const DCN35_OPP_PIPE_CONTROL_REL: u32 = 0x0030;
 pub const DCN35_OPP_GRPH_PASSTHROUGH_REL: u32 = 0x0034;
@@ -691,7 +743,9 @@ pub const DCN35_OTG_V_SYNC_A_REL: u32 = 0x003C;
 /// `OTG_INTERRUPT_CONTROL` shifted +4 B (dword 0x1B5A on DCN 3.5).
 pub const DCN35_OTG_INTERRUPT_CONTROL_REL: u32 = 0x00C4;
 /// `OTG_CONTROL` shifted +8 B (dword 0x1B43 on DCN 3.5).
-pub const DCN35_OTG_CONTROL_REL: u32 = 0x0048;
+// regOTG0_OTG_CONTROL 0x1b43 in `dcn_3_5_0_offset.h`, +0x19 dwords from
+// regOTG0_OTG_H_TOTAL 0x1b2a. Was 0x0048.
+pub const DCN35_OTG_CONTROL_REL: u32 = 0x0064;
 /// `OTG_STATUS` (dword 0x1B49) — same as DCN 2.0.
 pub const DCN35_OTG_STATUS_REL: u32 = 0x0084;
 pub const DCN35_OTG_STATUS_VBLANK: u32 = 1 << 0;
@@ -916,7 +970,7 @@ pub mod tests {
             return TestResult::Fail("empty sequence");
         }
         // First write must be HUBP blank.
-        if writes[0].addr != 0x0000_3000 + HUBP_BLANK_REL {
+        if writes[0].addr != 0x0000_3000 + HUBP_DCHUBP_CNTL_REL {
             return TestResult::Fail("first write should be HUBP blank");
         }
         if writes[0].value & HUBP_BLANK_FORCE == 0 {

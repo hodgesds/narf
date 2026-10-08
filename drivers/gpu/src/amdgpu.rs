@@ -748,7 +748,31 @@ impl AmdGpu {
     /// discovery is empty (older silicon, QEMU) or the requested
     /// `(hw_id, instance)` isn't present.
     pub fn ip_block_base(&self, hw_id: u16, instance: u8) -> Option<u32> {
-        amdgpu_discovery::find_ip(&self.ip_blocks, hw_id, instance).map(|b| b.base_addrs[0])
+        self.ip_block_base_idx(hw_id, instance, 0)
+    }
+
+    /// An IP block's base address in window `base_idx`.
+    ///
+    /// A SOC15 register is addressed as `reg_offset[IP][inst][BASE_IDX] +
+    /// dword_id`, and `BASE_IDX` is a property of the REGISTER, not of the
+    /// block: within GC, `CP_RB0_BASE` is window 0 while `GRBM_GFX_INDEX`,
+    /// `CP_GFX_CNTL` and `GRBM_GFX_CNTL` are window 1, and the whole MP1
+    /// mailbox is window 1 on Phoenix.
+    ///
+    /// Everything here used `base_addrs[0]` unconditionally, so a window-1
+    /// register was addressed from window 0 — a different base entirely, so
+    /// the write landed on whatever register sits at that offset there. The
+    /// offsets were right and the window was not.
+    ///
+    /// `None` when the block was not discovered or declares fewer bases than
+    /// asked for: a caller must not silently fall back to window 0, which is
+    /// the behaviour being fixed.
+    pub fn ip_block_base_idx(&self, hw_id: u16, instance: u8, base_idx: usize) -> Option<u32> {
+        let block = amdgpu_discovery::find_ip(&self.ip_blocks, hw_id, instance)?;
+        if base_idx >= block.num_bases as usize {
+            return None;
+        }
+        block.base_addrs.get(base_idx).copied()
     }
 
     pub fn chip_info(&self) -> ChipInfo {
@@ -784,6 +808,12 @@ impl AmdGpu {
     /// land a GC entry.
     pub fn gc_base(&self) -> Option<u32> {
         self.ip_block_base(amdgpu_discovery::HW_ID_GC, 0)
+    }
+
+    /// GC base window 1 — where `GRBM_GFX_INDEX`, `CP_GFX_CNTL` and
+    /// `GRBM_GFX_CNTL` live. See [`AmdGpu::ip_block_base_idx`].
+    pub fn gc_base_1(&self) -> Option<u32> {
+        self.ip_block_base_idx(amdgpu_discovery::HW_ID_GC, 0, 1)
     }
 
     /// Read `mmGRBM_STATUS`. Returns None when the GC base isn't
@@ -1176,7 +1206,9 @@ impl AmdGpu {
             Err(_) => return Err(AmdgpuError::FirmwareLoadFailed),
         };
         let view = narf_firmware::view_of(&cap).map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
-        let mp1_base = self.mp1_base().ok_or(AmdgpuError::SmuBringUpFailed)?;
+        let mp1_base = self
+            .mp1_mailbox_base()
+            .ok_or(AmdgpuError::SmuBringUpFailed)?;
         let phys = view.phys;
         let size = view.bytes.len() as u32;
 
@@ -1428,6 +1460,16 @@ impl AmdGpu {
         self.ip_block_base(amdgpu_discovery::HW_ID_MP1, 0)
     }
 
+    /// MP1 base window 1 — where the SMU mailbox registers live on Phoenix
+    /// (`mp_13_0_4_offset.h` gives `regMP1_SMN_C2PMSG_66_BASE_IDX` as 1).
+    ///
+    /// Every `amdgpu_smu` call takes an `mp1_base`; they were being handed
+    /// window 0, so the mailbox writes went to the wrong window even once the
+    /// offsets were corrected.
+    pub fn mp1_mailbox_base(&self) -> Option<u32> {
+        self.ip_block_base_idx(amdgpu_discovery::HW_ID_MP1, 0, 1)
+    }
+
     /// SMU driver-interface schema version this driver was
     /// compiled to talk to, per family. Renoir = SMU 12.0,
     /// Phoenix = SMU 13.0.4. Other families don't have an SMU
@@ -1466,7 +1508,9 @@ impl AmdGpu {
         // 2. SMU bring-up handshake. The MP1 base + expected
         //    driver-IF version are family-specific; both must
         //    resolve or we can't safely talk to the SMU.
-        let mp1_base = self.mp1_base().ok_or(AmdgpuError::SmuBringUpFailed)?;
+        let mp1_base = self
+            .mp1_mailbox_base()
+            .ok_or(AmdgpuError::SmuBringUpFailed)?;
         let expected_ifv = self
             .expected_smu_driver_if_version()
             .ok_or(AmdgpuError::SmuBringUpFailed)?;
@@ -1955,7 +1999,7 @@ fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendEr
     //    haven't stashed). Modern AMI BIOSes preserve TMR across
     //    S3 so this is the right shape for the bring-up targets.
     let _ = with_controller(|d| {
-        let mp1_base = match d.mp1_base() {
+        let mp1_base = match d.mp1_mailbox_base() {
             Some(b) => b,
             None => return,
         };
@@ -1979,7 +2023,7 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     //    just need to confirm the mailbox is alive before the
     //    next bring-up step issues real commands.
     let _ = with_controller(|d| {
-        let mp1_base = d.mp1_base()?;
+        let mp1_base = d.mp1_mailbox_base()?;
         let mut adapter = SmuRegsAdapter { regs: &d.regs };
         crate::amdgpu_smu::send_message_get(
             &mut adapter,
@@ -1992,7 +2036,7 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     // 2. Tell SMU to power-up GFX before DCN re-init touches
     //    display clocks. Inverse of the PowerDownGfx above.
     let _ = with_controller(|d| {
-        let mp1_base = d.mp1_base()?;
+        let mp1_base = d.mp1_mailbox_base()?;
         let mut adapter = SmuRegsAdapter { regs: &d.regs };
         crate::amdgpu_smu::send_message_void(
             &mut adapter,
