@@ -375,7 +375,14 @@ async fn queue_pump(
 
 async fn tx_pump(device: Arc<I40eNic>, mut tx: Consumer<Frame, TX_RING_N>) {
     while let Ok(frame) = tx.recv().await {
+        // Zero-copy (P-F): hand the frame's own DMA buffer to the ring instead
+        // of copying its payload into a freshly-allocated one. The buffer is
+        // threaded through the retry loop and handed back on a ring-full so a
+        // retry never loses it; it is retained by the ring on success.
         let queue = device.rss.tx_queue(frame.payload(), device.queues);
+        let meta = frame.tx_meta();
+        let (mut buf, off, flen) = frame.into_parts_with_offset();
+        let (off, flen) = (off as usize, flen as usize);
         let mut deadline = narf_time::Deadline::after_ms(250);
         let mut generation = 0;
         loop {
@@ -396,17 +403,20 @@ async fn tx_pump(device: Arc<I40eNic>, mut tx: Consumer<Frame, TX_RING_N>) {
                 hw.irq().queue_vector(queue),
                 narf_time::Deadline::after_ms(10),
             );
-            match hw.transmit_with_meta(frame.payload(), frame.tx_meta(), queue) {
+            match hw.transmit_frame(buf, off, flen, meta, queue) {
                 Ok(()) => break,
-                Err(I40eError::TxRingFull) => {
+                Err((I40eError::TxRingFull, returned)) => {
+                    buf = returned;
                     if deadline.expired() {
                         hw.irq().fail();
                     } else {
                         let _ = activity.await;
                     }
                 }
-                Err(I40eError::DeviceFailed | I40eError::InvalidTxHead) => {}
-                Err(_) => {
+                Err((I40eError::DeviceFailed | I40eError::InvalidTxHead, returned)) => {
+                    buf = returned;
+                }
+                Err((_, _dropped)) => {
                     device.tx_rejected.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
