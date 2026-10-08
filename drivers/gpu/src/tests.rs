@@ -6814,31 +6814,54 @@ kernel_test_in!(
 
 // ── Foundations wave — register-surface offsets stable ─────────────
 
+/// The MC aperture registers, against the headers.
+///
+/// This test used to lock 0x6B0F, 0x6B10, 0x6B0C, 0x6B17, 0x6B18 and 0x2004,
+/// introduced with the comment: "Lock the MC register dword indices so an
+/// accidental rename doesn't drift them silently — these are facts about the
+/// silicon, not creative choices." Every one of those values was invented.
+/// `0x6B0F` appears in no AMD header for any `MC_VM_FB_LOCATION_BASE`
+/// variant, of any generation. The test was defending fabrication while
+/// asserting it was fact, which is a worse state than having no test.
+///
+/// The values below are from `gc_9_0_offset.h` (GFX9, GC block, BASE_IDX 0)
+/// and `gc_11_0_0_offset.h` (GFX11).
 fn smoke_amdgpu_foundations_mc_register_offsets_stable() -> TestResult {
-    // Lock the MC register dword indices so an accidental rename
-    // doesn't drift them silently — these are facts about the
-    // silicon, not creative choices.
-    use crate::amdgpu_gmc::{
-        MC_SHARED_CHMAP, MC_VM_AGP_BASE, MC_VM_FB_LOCATION_BASE, MC_VM_FB_LOCATION_TOP,
-        MC_VM_SYSTEM_APERTURE_HIGH_ADDR, MC_VM_SYSTEM_APERTURE_LOW_ADDR,
-    };
-    if MC_VM_FB_LOCATION_BASE != 0x6B0F {
-        return TestResult::Fail("MC_VM_FB_LOCATION_BASE drift");
+    use crate::amdgpu_gmc::*;
+
+    // GFX9: `mmMC_VM_*`, read by `gfxhub_v1_0.c`.
+    let gfx9: &[(u32, u32)] = &[
+        (MC_VM_FB_LOCATION_BASE, 0x0980),
+        (MC_VM_FB_LOCATION_TOP, 0x0981),
+        (MC_VM_AGP_TOP, 0x0982),
+        (MC_VM_AGP_BOT, 0x0983),
+        (MC_VM_AGP_BASE, 0x0984),
+        (MC_VM_SYSTEM_APERTURE_LOW_ADDR, 0x0985),
+        (MC_VM_SYSTEM_APERTURE_HIGH_ADDR, 0x0986),
+        (MC_VM_FB_OFFSET, 0x096B),
+        (MC_SHARED_CHMAP, 0x0801),
+        (MC_SHARED_CHREMAP, 0x0802),
+    ];
+    for (got, want) in gfx9.iter().copied() {
+        if got != want {
+            return TestResult::Fail("a GFX9 MC register offset is not its header dword id");
+        }
     }
-    if MC_VM_FB_LOCATION_TOP != 0x6B10 {
-        return TestResult::Fail("MC_VM_FB_LOCATION_TOP drift");
+
+    // GFX11 reads a DIFFERENT register, `regGCMC_VM_FB_LOCATION_BASE`, not
+    // the same one at a different offset (`gfxhub_v3_0.c`).
+    if GCMC_VM_FB_LOCATION_BASE_GFX11 != 0x1678 || GCMC_VM_FB_LOCATION_TOP_GFX11 != 0x1679 {
+        return TestResult::Fail("the GFX11 framebuffer-location registers are 0x1678 / 0x1679");
     }
-    if MC_VM_AGP_BASE != 0x6B0C {
-        return TestResult::Fail("MC_VM_AGP_BASE drift");
+    if GCMC_VM_FB_LOCATION_BASE_GFX11 == MC_VM_FB_LOCATION_BASE {
+        return TestResult::Fail("GFX9 and GFX11 use different registers here");
     }
-    if MC_VM_SYSTEM_APERTURE_LOW_ADDR != 0x6B17 {
-        return TestResult::Fail("MC_VM_SYSTEM_APERTURE_LOW_ADDR drift");
-    }
-    if MC_VM_SYSTEM_APERTURE_HIGH_ADDR != 0x6B18 {
-        return TestResult::Fail("MC_VM_SYSTEM_APERTURE_HIGH_ADDR drift");
-    }
-    if MC_SHARED_CHMAP != 0x2004 {
-        return TestResult::Fail("MC_SHARED_CHMAP drift");
+
+    // The AGP triple ascends TOP, BOT, BASE — not the intuitive BASE, BOT,
+    // TOP, which is the order the old constants assumed and so had wrong
+    // relative to each other as well as absolutely.
+    if !(MC_VM_AGP_TOP < MC_VM_AGP_BOT && MC_VM_AGP_BOT < MC_VM_AGP_BASE) {
+        return TestResult::Fail("the AGP registers ascend TOP, BOT, BASE");
     }
     TestResult::Pass
 }

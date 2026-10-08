@@ -169,12 +169,32 @@ const MM_INDEX: u64 = 0x0000;
 /// `MM_DATA` — register-window data port.
 const MM_DATA: u64 = 0x0004;
 
-/// MC (Memory Controller) framebuffer-location registers in the
-/// register-bus address space. Read through MM_INDEX/MM_DATA to
-/// learn the visible-VRAM phys range. Same offsets across Vega +
-/// Navi families per the public AMD MC IP block docs.
-const MC_VM_FB_LOCATION_BASE: u32 = 0x0000_6B0F;
-const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
+// The framebuffer-location registers, read through MM_INDEX/MM_DATA to learn
+// the visible-VRAM range. Canonical values live in `amdgpu_gmc`; these were a
+// duplicate pair reading 0x6B0F / 0x6B10, which appear in no AMD header for
+// any `MC_VM_FB_LOCATION_BASE` variant of any generation.
+//
+// The old comment claimed "same offsets across Vega + Navi families". They
+// are not the same: GFX9 reads `mmMC_VM_FB_LOCATION_BASE` (0x0980) and GFX11
+// reads `regGCMC_VM_FB_LOCATION_BASE` (0x1678) — a different register, not
+// just a different offset (`gfxhub_v1_0.c` against `gfxhub_v3_0.c`).
+//
+// This matters more than most of the table: `read_vram_info` feeds
+// `vram.size`, and the IP-discovery blob is read from
+// `vram.size - DISCOVERY_TMR_OFFSET`. A wrong aperture means discovery reads
+// the wrong place, which means no IP bases, which means nothing downstream
+// resolves — the firmware load, the DCN bring-up and the SMU handshake all
+// take their addresses from it.
+//
+// LINUX-GAP: `mm_read` puts the value straight into MM_INDEX, so these are
+// absolute register-bus dword addresses rather than block-relative ones. The
+// header ids are block-relative (GC, BASE_IDX 0), and the GC base comes from
+// IP discovery — which cannot have run yet, since discovery needs the VRAM
+// size this function is computing. Linux avoids the circularity by taking the
+// size from elsewhere (`amdgpu_discovery_init` uses a VRAM size in MiB
+// obtained before the register bases are built). Resolving that properly is
+// the next step; what is fixed here is that the ids are now the real ones for
+// the family.
 
 // ── PSP (Platform Security Processor) MP0 mailbox protocol ────────
 //
@@ -702,7 +722,7 @@ impl AmdGpu {
         // SAFETY: identity-mapped MMIO; MM_INDEX/MM_DATA are a
         // sequential pair with no side effects beyond the access.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let vram = unsafe { read_vram_info(&regs) };
+        let vram = unsafe { read_vram_info(&regs, chip.family) };
 
         // Try to parse the on-die IP discovery table. Lives in
         // the top `DISCOVERY_TMR_OFFSET` bytes of the VRAM
@@ -1670,14 +1690,26 @@ pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
 ///
 /// # Safety
 /// Caller owns BAR5 exclusively.
-unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
+unsafe fn read_vram_info(regs: &MmioRegion, family: Family) -> VramInfo {
+    // GFX11 uses a different register from GFX9, not merely a different
+    // offset. Picking by family, as `grbm_status_offset` already does.
+    let (base_reg, top_reg) = match family {
+        Family::Phoenix => (
+            crate::amdgpu_gmc::GCMC_VM_FB_LOCATION_BASE_GFX11,
+            crate::amdgpu_gmc::GCMC_VM_FB_LOCATION_TOP_GFX11,
+        ),
+        _ => (
+            crate::amdgpu_gmc::MC_VM_FB_LOCATION_BASE,
+            crate::amdgpu_gmc::MC_VM_FB_LOCATION_TOP,
+        ),
+    };
     // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair.
-    let base_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_BASE) };
+    let base_field = unsafe { mm_read(regs, base_reg) };
     // SAFETY: caller-asserted exclusive ownership of BAR5 (`read_vram_info`
     // contract); `MC_VM_FB_LOCATION_TOP` is a read-only MC aperture register
     // accessed through the same MM_INDEX/MM_DATA latch pair.
     // SAFETY: Valid MMIO bounds or trusted driver environment
-    let top_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_TOP) };
+    let top_field = unsafe { mm_read(regs, top_reg) };
     // Bits[23:0] are the FB location; high bits are reserved.
     let base = (base_field as u64 & 0x00FF_FFFF) << 24;
     let top = (top_field as u64 & 0x00FF_FFFF) << 24;
