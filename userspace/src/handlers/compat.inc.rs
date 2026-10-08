@@ -12036,6 +12036,8 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
 struct ScmSendAncillary {
     fds: alloc::vec::Vec<crate::socket::ScmRightsFile>,
     cred: Option<crate::socket::Ucred>,
+    /// Source-address override from an `IP_PKTINFO` / `IPV6_PKTINFO` cmsg.
+    src_override: Option<crate::socket::SendPktInfo>,
 }
 
 /// Parse Linux `SOL_SOCKET` send control messages. `SCM_RIGHTS` descriptors
@@ -12053,6 +12055,7 @@ fn parse_scm_send_ancillary(
     let mut out = ScmSendAncillary {
         fds: alloc::vec::Vec::new(),
         cred: None,
+        src_override: None,
     };
     if ctrl_len == 0 {
         return Ok(out);
@@ -12124,6 +12127,27 @@ fn parse_scm_send_ancillary(
                     out.cred = Some(validate_scm_ucred(supplied)?);
                 }
                 _ => return Err(EINVAL),
+            }
+        } else if level == 0 && ctype == 8 {
+            // SOL_IP / IP_PKTINFO: struct in_pktinfo { int ipi_ifindex;
+            // in_addr ipi_spec_dst; in_addr ipi_addr; } = 12 bytes. The source
+            // override is `ipi_spec_dst`; a zero spec_dst means "no override".
+            if cmsg_len >= 16 + 12 {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&ctrl[off + 20..off + 24]);
+                if addr[..4] != [0, 0, 0, 0] {
+                    out.src_override = Some(crate::socket::SendPktInfo { v6: false, addr });
+                }
+            }
+        } else if level == 41 && ctype == 50 {
+            // SOL_IPV6 / IPV6_PKTINFO: struct in6_pktinfo { in6_addr ipi6_addr;
+            // int ipi6_ifindex; } = 20 bytes. Source override is `ipi6_addr`.
+            if cmsg_len >= 16 + 20 {
+                let mut addr = [0u8; 16];
+                addr.copy_from_slice(&ctrl[off + 16..off + 32]);
+                if addr != [0u8; 16] {
+                    out.src_override = Some(crate::socket::SendPktInfo { v6: true, addr });
+                }
             }
         }
         // Advance to the next cmsg (CMSG_ALIGN to 8 bytes).

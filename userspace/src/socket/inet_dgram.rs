@@ -869,10 +869,16 @@ impl SocketFile {
         if self.sk_shutdown() & SEND_SHUTDOWN != 0 {
             return SocketOpResult::Err(SockError::Pipe);
         }
-        let from = if local_addr == INADDR_ANY {
-            src
-        } else {
-            local_addr
+        // An IP_PKTINFO ipi_spec_dst (sendmsg) overrides the source address for
+        // this datagram — both the looped-back copy and the wire send — so a
+        // reply leaves from the address the peer saw (QUIC source pinning).
+        let src_override = self.take_send_pktinfo().and_then(|pi| {
+            (!pi.v6).then(|| u32::from_be_bytes([pi.addr[0], pi.addr[1], pi.addr[2], pi.addr[3]]))
+        });
+        let from = match src_override {
+            Some(a) => a,
+            None if local_addr == INADDR_ANY => src,
+            None => local_addr,
         };
 
         // A local destination is looped back in-process; everything else
@@ -929,6 +935,7 @@ impl SocketFile {
                 ip_ttl: ip_ttl.min(255) as u8,
                 ip_tos: ip_tos.min(255) as u8,
                 ip_pmtudisc,
+                ip_src_override: src_override.map(|a| a.to_be_bytes()),
                 sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
                 ..Default::default()
             };

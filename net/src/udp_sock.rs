@@ -83,6 +83,10 @@ pub struct UdpOptions {
     /// default), `DO`(2), `PROBE`(3) set it. QUIC sets `IP_PMTUDISC_DO` so its
     /// probes are never fragmented. Linux `ip_sockglue.c` / `ip_select_fb_ident`.
     pub ip_pmtudisc: i32,
+    /// Per-send source-address override from an `IP_PKTINFO` cmsg
+    /// (`ipi_spec_dst`). `None` ⇒ use the egress interface's address. QUIC
+    /// uses it to pin a reply's source to the address the peer saw.
+    pub ip_src_override: Option<[u8; 4]>,
 }
 
 impl Default for UdpOptions {
@@ -98,6 +102,7 @@ impl Default for UdpOptions {
             ip_ttl: 0, // 0 = use system default (64)
             ip_tos: 0,
             ip_pmtudisc: 1, // IP_PMTUDISC_WANT: DF set (NARF's prior default)
+            ip_src_override: None,
         }
     }
 }
@@ -511,7 +516,8 @@ fn udp_send_inner(
     } else {
         iface::for_dst_in(net_ns_id, dst.ip).ok_or(UdpError::NoInterface)?
     };
-    let src_ip = iface.ipv4;
+    // IP_PKTINFO ipi_spec_dst overrides the egress interface's source address.
+    let src_ip = options.ip_src_override.unwrap_or(iface.ipv4);
     let dst_ip = dst.ip;
     let dst_port = dst.port;
 
@@ -1802,3 +1808,46 @@ fn smoke_udp_pmtudisc_controls_df() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/udp", smoke_udp_pmtudisc_controls_df);
+
+/// `ip_src_override` (an IP_PKTINFO `ipi_spec_dst` on send) replaces the egress
+/// interface's address as the datagram's source — QUIC source pinning (Fix 2).
+fn smoke_udp_ip_src_override() -> TestResult {
+    const IFACE: &str = "udpsrc0";
+    const LOCAL: [u8; 4] = [10, 95, 0, 2];
+    const OVERRIDE: [u8; 4] = [10, 95, 0, 7];
+    const PEER: [u8; 4] = [10, 95, 0, 9];
+    const PEER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0x95, 9];
+    iface::register(IFACE, [0x02, 0, 0, 0, 0x95, 2], wire_capture_send);
+    iface::set_iface_ipv4(IFACE, LOCAL, LOCAL);
+    iface::add_addr(IFACE, LOCAL, 24);
+    crate::arp_cache::insert(IFACE, PEER, PEER_MAC);
+    crate::tcp_stack::__arp_insert_legacy(PEER, PEER_MAC);
+    WIRE_CAPTURE.lock().clear();
+
+    let opts = UdpOptions {
+        ip_src_override: Some(OVERRIDE),
+        ..UdpOptions::default()
+    };
+    let sock = match udp_bind(SocketAddrV4::new(LOCAL, 59050), opts) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("bind failed"),
+    };
+    let sent = udp_send(&sock, b"src", Some(SocketAddrV4::new(PEER, 5353)));
+    udp_close(&sock);
+    if sent != Ok(3) {
+        return TestResult::Fail("send failed");
+    }
+    let frames = core::mem::take(&mut *WIRE_CAPTURE.lock());
+    let Some(f) = frames.first() else {
+        return TestResult::Fail("no frame reached the interface");
+    };
+    let ip = &f[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN];
+    if ip[12..16] != OVERRIDE {
+        return TestResult::Fail("source IP was not the ip_src_override address");
+    }
+    if ip_checksum(ip) != 0 {
+        return TestResult::Fail("IPv4 header checksum does not verify after override");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_udp_ip_src_override);

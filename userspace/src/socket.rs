@@ -832,6 +832,16 @@ pub(crate) struct ExtSockError {
     pub offender_ip: [u8; 4],
 }
 
+/// A source-address override supplied by an `IP_PKTINFO` / `IPV6_PKTINFO`
+/// send control message (`sendmsg`). QUIC uses it to pin a reply's source
+/// address to the one the peer saw. `addr` holds an IPv4 `ipi_spec_dst` in its
+/// first 4 bytes, or a full IPv6 `ipi6_addr`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SendPktInfo {
+    pub v6: bool,
+    pub addr: [u8; 16],
+}
+
 // ── SocketFile (FileOps impl, lives in fd table) ────────────────
 
 pub struct SocketFile {
@@ -869,6 +879,9 @@ pub struct SocketFile {
     /// to the `recvmsg` cmsg builder (keyed by task, like the RX ancillary
     /// stash).
     inet_err_ancillary: IrqSafeSpinLock<BTreeMap<u64, ExtSockError>>,
+    /// Per-send handoff of an `IP_PKTINFO`/`IPV6_PKTINFO` source override from
+    /// the `sendmsg` cmsg parser to the datagram send path (keyed by task).
+    send_pktinfo: IrqSafeSpinLock<BTreeMap<u64, SendPktInfo>>,
     /// `sk_shutdown`: `RCV_SHUTDOWN` / `SEND_SHUTDOWN` bits set by
     /// shutdown(2). Read by the AF_INET datagram path.
     sk_shutdown: AtomicU8,
@@ -1891,6 +1904,7 @@ impl SocketFile {
             pending_error: IrqSafeSpinLock::new(None),
             inet_err_queue: IrqSafeSpinLock::new(VecDeque::new()),
             inet_err_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
+            send_pktinfo: IrqSafeSpinLock::new(BTreeMap::new()),
             sk_shutdown: AtomicU8::new(0),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
             icmp_echo: IrqSafeSpinLock::new(IcmpEchoState::default()),
@@ -2949,6 +2963,21 @@ impl SocketFile {
     /// Take this task's stashed extended error (the `recvmsg` cmsg builder).
     pub(crate) fn take_inet_err_ancillary(&self) -> Option<ExtSockError> {
         self.inet_err_ancillary
+            .lock()
+            .remove(&crate::handlers::current_task_id())
+    }
+
+    /// Stash a per-send `IP_PKTINFO`/`IPV6_PKTINFO` source override for this
+    /// task's in-flight `sendmsg`, consumed by the datagram send path.
+    pub(crate) fn stash_send_pktinfo(&self, pi: SendPktInfo) {
+        self.send_pktinfo
+            .lock()
+            .insert(crate::handlers::current_task_id(), pi);
+    }
+
+    /// Take this task's stashed send source override (the datagram send path).
+    pub(crate) fn take_send_pktinfo(&self) -> Option<SendPktInfo> {
+        self.send_pktinfo
             .lock()
             .remove(&crate::handlers::current_task_id())
     }
