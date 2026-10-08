@@ -198,19 +198,20 @@ const MM_DATA: u64 = 0x0004;
 
 // ── PSP (Platform Security Processor) MP0 mailbox protocol ────────
 //
-// Firmware-load handshake per AMD public PSP-protocol docs:
+// LINUX-GAP: a firmware-load handshake was described here —
 //
-//   MP0_C2PMSG_64 = phys lo  (image base, low 32 bits)
-//   MP0_C2PMSG_67 = phys hi  (image base, high 32 bits)
-//   MP0_C2PMSG_69 = (CMD_LOAD_TA = 5) | (image_size << 8)
-//   poll MP0_C2PMSG_64 — bit31 set → done; bits[30:0] = status code.
-//   status == 0 → success.
+//   MP0_C2PMSG_64 = phys lo, _67 = phys hi,
+//   MP0_C2PMSG_69 = cmd | (image_size << 8), poll _64 for bit 31
 //
-// All three message slots are register-bus addresses computed
-// against the per-family `Family::mp0_base()` offset.
+// — "per AMD public PSP-protocol docs". It appears in no `psp_v*.c`; see the
+// gap note on `amdgpu_psp::send_command`. The real mailbox loads a bootloader
+// component through C2PMSG_36/_35 and creates a ring through C2PMSG_69..71 and
+// _64; IP firmware travels in the GPCOM ring that `amdgpu_psp_ring` builds.
 //
-// `MP0_C2PMSG_N = mp0_base + 0x29C + N*4`. The 0x29C offset is
-// constant; only the `mp0_base` shifts per family.
+// `MP0_C2PMSG_N` is at `mp0_base + 0x100 + N * 4` —
+// `regMP0_SMN_C2PMSG_0` is dword 0x0040 at BASE_IDX 1. The stale `0x29C` that
+// stood here is corrected in `amdgpu_psp::MP0_C2PMSG_REL`; only `mp0_base`
+// shifts per family.
 
 // PSP MP0 register / command / status constants live in
 // `amdgpu_psp` (canonically named LOAD_IP_FW for the value 0x05

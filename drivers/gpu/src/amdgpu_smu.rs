@@ -159,10 +159,16 @@ pub const PPSMC_MSG_PREPARE_MP1_FOR_UNLOAD: u32 = 0x35;
 //      numeric id with different semantics per chip).
 //   5. Poll RESP for OK / error code.
 //
-// MP1_C2PMSG_64 / 65 sit at offset 0x29C + 64*4 / + 65*4 in the
-// MP1 register window. Slot 64 doubles as the PMFW-phys-lo input
-// + the response status when an LoadMicrocode call completes —
-// same dual-use shape as PSP's MP0_C2PMSG_64.
+// MP1_C2PMSG_64 / 65 are dwords 0x240 + 64 and 0x240 + 65 in the MP1 window —
+// see `mp1_c2pmsg`. (An earlier note here said `0x29C + N * 4`, which is the
+// same stale base the offsets table carried.)
+//
+// LINUX-GAP: `PPSMC_MSG_LoadMicrocode` appears in none of the
+// `pmfw_if/*_ppsmc.h` headers, so the id below has no in-tree source and the
+// "0x02 on smu_v14" attribution cannot be checked. It does not matter for the
+// roster — both audited families are APUs whose PMFW is BIOS-resident, and
+// `FwEntry::smu_pmfw` is dead code for exactly that reason — but a discrete
+// bring-up must source this before using it.
 
 /// MP1_C2PMSG_64 — PMFW phys-lo on input; never used for other
 /// SMU messages so collisions with `send_message_*` are
