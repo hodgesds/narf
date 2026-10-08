@@ -92,9 +92,18 @@ pub const CP_ME_CNTL_ME_HALT: u32 = 1 << 28;
 /// Combined: halt all three CP engines.
 pub const CP_ME_CNTL_HALT_ALL: u32 = CP_ME_CNTL_PFP_HALT | CP_ME_CNTL_CE_HALT | CP_ME_CNTL_ME_HALT;
 
-/// `CP_RB0_RPTR_ADDR_HI` — gate the writeback DMA through the
-/// L2 cache (bit 0) and snoop coherent (bit 1). Linux ORs both.
-pub const RPTR_WRITEBACK_COHERENT: u32 = 0x3;
+/// `CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK` — the writeback address's
+/// high half, 16 bits of a 48-bit address.
+///
+/// This constant was `RPTR_WRITEBACK_COHERENT = 0x3`, documented as "gate the
+/// writeback DMA through the L2 cache (bit 0) and snoop coherent (bit 1),
+/// Linux ORs both". Linux does not: `gfx_v9_0_cp_gfx_resume` and
+/// `gfx_v11_0_cp_gfx_resume` both MASK this register with
+/// `CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK`, and the register has exactly
+/// one field — bits 15:0, the address. There are no cache bits to set, so
+/// ORing 0x3 set address bits 32 and 33 and pointed the writeback DMA at the
+/// wrong page.
+pub const RPTR_ADDR_HI_MASK: u32 = 0x0000_FFFF;
 
 /// `CP_RB_DOORBELL_CONTROL` — enable the per-queue doorbell.
 pub const CP_RB_DOORBELL_EN: u32 = 1 << 30;
@@ -249,70 +258,6 @@ pub const CP_GFX_CNTL_ME_HALT_GFX11: u32 = 1 << 8;
 pub const CP_GFX_CNTL_HALT_ALL: u32 =
     CP_GFX_CNTL_FE_HALT | CP_GFX_CNTL_PFP_HALT_GFX11 | CP_GFX_CNTL_ME_HALT_GFX11;
 
-/// Validate the ring config + emit the CP ring-init sequence for a
-/// GFX11 device (Phoenix HawkPoint1 / Strix Point). Structurally
-/// identical to `build_gfx9_ring_init` — same disable/wptr-reset/
-/// rptr-writeback/base/size/doorbell/unhalt ordering — but the
-/// halt/unhalt writes go to mmCP_GFX_CNTL with different bit
-/// positions, and the ME_CNTL register doesn't exist on GFX11.
-/// Per Linux drivers/gpu/drm/amd/amdgpu/gfx_v11_0.c::
-/// gfx_v11_0_cp_gfx_resume + gfx_v11_0_cp_gfx_enable.
-pub fn build_gfx11_ring_init(
-    gc_base: u32,
-    ring_phys: u64,
-    ring_size_dw: u32,
-    doorbell_idx: u32,
-    rptr_writeback_phys: u64,
-) -> Result<GfxRingInitSequence, GfxError> {
-    if !ring_size_dw.is_power_of_two() || !(8..=(1 << 20)).contains(&ring_size_dw) {
-        return Err(GfxError::BadRingSize);
-    }
-    if ring_phys & 0xFF != 0 {
-        return Err(GfxError::UnalignedRingPhys);
-    }
-    if rptr_writeback_phys & 0x7 != 0 {
-        return Err(GfxError::UnalignedRptrWriteback);
-    }
-
-    let mut seq = GfxRingInitSequence::default();
-
-    // Step 1: halt the CP engines via CP_GFX_CNTL (NOT CP_ME_CNTL).
-    seq.push(gc_base + CP_GFX_CNTL_REL, CP_GFX_CNTL_HALT_ALL);
-
-    // Step 2: reset wptr.
-    seq.push(gc_base + CP_RB0_WPTR_REL, 0);
-    seq.push(gc_base + CP_RB0_WPTR_HI_REL, 0);
-
-    // Step 3: rptr writeback (same coherent-bits-OR-into-hi rule).
-    seq.push(gc_base + CP_RB0_RPTR_ADDR_REL, rptr_writeback_phys as u32);
-    seq.push(
-        gc_base + CP_RB0_RPTR_ADDR_HI_REL,
-        ((rptr_writeback_phys >> 32) as u32) | RPTR_WRITEBACK_COHERENT,
-    );
-
-    // Step 4: ring base.
-    seq.push(gc_base + CP_RB0_BASE_REL, ring_phys as u32);
-    seq.push(gc_base + CP_RB0_BASE_HI_REL, (ring_phys >> 32) as u32);
-
-    // Step 5: ring size.
-    let log2_size = ring_size_dw.trailing_zeros();
-    let blksz: u32 = 6;
-    seq.push(gc_base + CP_RB0_CNTL_REL, log2_size | (blksz << 8));
-
-    // Step 6: doorbell.
-    seq.push(
-        gc_base + CP_RB_DOORBELL_CONTROL_REL,
-        CP_RB_DOORBELL_EN | (doorbell_idx << CP_RB_DOORBELL_OFFSET_SHIFT),
-    );
-    seq.push(gc_base + CP_RB_DOORBELL_RANGE_LOWER_REL, doorbell_idx);
-    seq.push(gc_base + CP_RB_DOORBELL_RANGE_UPPER_REL, doorbell_idx + 1);
-
-    // Step 7: unhalt — clear CP_GFX_CNTL (engines start fetching).
-    seq.push(gc_base + CP_GFX_CNTL_REL, 0);
-
-    Ok(seq)
-}
-
 // ── Sequence shape ─────────────────────────────────────────────────
 
 /// Errors building the ring-init sequence.
@@ -397,16 +342,23 @@ pub fn build_gfx9_ring_init(
     seq.push(gc_base + CP_RB0_WPTR_REL, 0);
     seq.push(gc_base + CP_RB0_WPTR_HI_REL, 0);
 
-    // Step 3: rptr writeback address (with coherent bits set on hi).
+    // Step 3: rptr writeback address. The high half is MASKED to 16 bits —
+    // `upper_32_bits(rptr_addr) & CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK`.
+    // It used to have 0x3 OR'd into it; see `RPTR_ADDR_HI_MASK`.
     seq.push(gc_base + CP_RB0_RPTR_ADDR_REL, rptr_writeback_phys as u32);
     seq.push(
         gc_base + CP_RB0_RPTR_ADDR_HI_REL,
-        ((rptr_writeback_phys >> 32) as u32) | RPTR_WRITEBACK_COHERENT,
+        ((rptr_writeback_phys >> 32) as u32) & RPTR_ADDR_HI_MASK,
     );
 
-    // Step 4: ring base.
-    seq.push(gc_base + CP_RB0_BASE_REL, ring_phys as u32);
-    seq.push(gc_base + CP_RB0_BASE_HI_REL, (ring_phys >> 32) as u32);
+    // Step 4: ring base, SHIFTED RIGHT BY 8 — `rb_addr = ring->gpu_addr >> 8`
+    // in both `gfx_v9_0_cp_gfx_resume` and `gfx_v11_0_cp_gfx_resume`. The
+    // register holds a 256-byte granule, which is exactly why the 256-byte
+    // alignment check above exists; the check was here and the shift was not,
+    // so the CP was pointed 256x too high.
+    let rb_addr = ring_phys >> 8;
+    seq.push(gc_base + CP_RB0_BASE_REL, rb_addr as u32);
+    seq.push(gc_base + CP_RB0_BASE_HI_REL, (rb_addr >> 32) as u32);
 
     // Step 5: ring size. log2(size_dw) in bits[5:0]; BLKSZ in [13:8].
     // 256-byte (= 64-dword) block size — Linux default.
@@ -615,4 +567,233 @@ impl GfxContext {
             core::ptr::write_volatile(self.fence_buf.cpu_mut_ptr::<u32>(), seq);
         }
     }
+}
+
+// ── GFX11 CP ring bring-up ──────────────────────────────────────────
+
+// Register offsets from `gc_11_0_0_offset.h`, in DWORD address space — the
+// `GfxWrite.addr` convention elsewhere in this file is a byte address, so
+// each is shifted when emitted.
+const GFX11_GRBM_GFX_CNTL: u32 = 0x0900;
+const GFX11_CP_RB_WPTR_DELAY: u32 = 0x0f61;
+const GFX11_CP_RB0_BASE: u32 = 0x1de0;
+const GFX11_CP_RB0_CNTL: u32 = 0x1de1;
+const GFX11_CP_RB0_RPTR_ADDR: u32 = 0x1de3;
+const GFX11_CP_RB0_RPTR_ADDR_HI: u32 = 0x1de4;
+const GFX11_CP_RB_VMID: u32 = 0x1df1;
+const GFX11_CP_RB0_WPTR: u32 = 0x1df4;
+const GFX11_CP_RB0_WPTR_HI: u32 = 0x1df5;
+const GFX11_CP_RB_DOORBELL_RANGE_LOWER: u32 = 0x1dfa;
+const GFX11_CP_RB_DOORBELL_RANGE_UPPER: u32 = 0x1dfb;
+const GFX11_CP_RB0_BASE_HI: u32 = 0x1e51;
+const GFX11_CP_RB_WPTR_POLL_ADDR_LO: u32 = 0x1e8b;
+const GFX11_CP_RB_WPTR_POLL_ADDR_HI: u32 = 0x1e8c;
+const GFX11_CP_RB_DOORBELL_CONTROL: u32 = 0x1e8d;
+const GFX11_CP_RB_ACTIVE: u32 = 0x1f40;
+
+/// `CP_RB_RPTR_ADDR_HI__RB_RPTR_ADDR_HI_MASK` — the writeback address is
+/// 48-bit, so its high half keeps 16 bits.
+const GFX11_RPTR_ADDR_HI_MASK: u32 = 0x0000_FFFF;
+/// `CP_RB_DOORBELL_RANGE_UPPER__DOORBELL_RANGE_UPPER_MASK`. Linux writes the
+/// whole mask, opening the range to its maximum rather than to one entry.
+const GFX11_DOORBELL_RANGE_UPPER_MASK: u32 = 0x0000_0FFC;
+const GFX11_DOORBELL_RANGE_LOWER_SHIFT: u32 = 2;
+const GFX11_DOORBELL_OFFSET_SHIFT: u32 = 2;
+const GFX11_DOORBELL_EN: u32 = 1 << 30;
+
+/// One step of a bring-up sequence: a write, or a wait the hardware needs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GfxStep {
+    /// Write `value` to the byte address `addr`.
+    Write { addr: u32, value: u32 },
+    /// Wait at least `us` microseconds before continuing.
+    ///
+    /// Modelled rather than performed, so a sequence is a value a test can
+    /// inspect. `gfx_v11_0_cp_gfx_resume`'s `mdelay(1)` is here because
+    /// dropping it is invisible in review and the second `CP_RB0_CNTL` write
+    /// that follows exists only because of it.
+    Delay { us: u32 },
+}
+
+/// An ordered GFX11 bring-up sequence.
+#[derive(Default, Debug)]
+pub struct Gfx11Sequence {
+    pub steps: Vec<GfxStep>,
+}
+
+impl Gfx11Sequence {
+    fn write(&mut self, gc_base: u32, dword_reg: u32, value: u32) {
+        self.steps.push(GfxStep::Write {
+            addr: gc_base + (dword_reg << 2),
+            value,
+        });
+    }
+    fn delay(&mut self, us: u32) {
+        self.steps.push(GfxStep::Delay { us });
+    }
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+    /// The value written to `dword_reg`, counting from the start. `None` if
+    /// the sequence never writes it.
+    pub fn first_write_to(&self, gc_base: u32, dword_reg: u32) -> Option<u32> {
+        let want = gc_base + (dword_reg << 2);
+        self.steps.iter().find_map(|s| match s {
+            GfxStep::Write { addr, value } if *addr == want => Some(*value),
+            _ => None,
+        })
+    }
+    /// Every value written to `dword_reg`, in order.
+    pub fn writes_to(&self, gc_base: u32, dword_reg: u32) -> Vec<u32> {
+        let want = gc_base + (dword_reg << 2);
+        self.steps
+            .iter()
+            .filter_map(|s| match s {
+                GfxStep::Write { addr, value } if *addr == want => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Index of the first write to `dword_reg`.
+    pub fn index_of_write(&self, gc_base: u32, dword_reg: u32) -> Option<usize> {
+        let want = gc_base + (dword_reg << 2);
+        self.steps.iter().position(|s| match s {
+            GfxStep::Write { addr, .. } => *addr == want,
+            _ => false,
+        })
+    }
+}
+
+/// `gfx_v11_0_cp_gfx_resume` for graphics ring 0 on pipe 0 —
+/// the register sequence that points the GFX11 command processor at a ring.
+///
+/// This is NOT the GFX9 sequence in [`build_gfx9_ring_init`]: GFX11 reaches
+/// the same registers through different offsets and in a different order, and
+/// adds the write-pointer poll address and `CP_RB_ACTIVE` that GFX9 has no
+/// equivalent of.
+///
+/// `gfx_v11_0_cp_gfx_switch_pipe` reads `GRBM_GFX_CNTL` and sets its PIPEID
+/// field. Read-modify-write needs the live value, which a sequence cannot
+/// carry, so `grbm_gfx_cntl` is passed in — the caller reads it once.
+///
+/// LINUX-GAP: ring 1 on pipe 1 is not emitted. Linux brings it up when
+/// `num_gfx_rings > 1`; one ring is enough to submit, and a second doubles the
+/// bring-up surface for no gain until the first works.
+///
+/// LINUX-GAP: `gfx_v11_0_cp_gfx_start` is not part of this. It writes a PM4
+/// `CONTEXT_CONTROL` / `CLEAR_STATE` preamble INTO the ring and rings the
+/// doorbell, which needs a live ring object rather than a register list.
+#[allow(clippy::too_many_arguments)]
+pub fn build_gfx11_ring_init(
+    gc_base: u32,
+    grbm_gfx_cntl: u32,
+    ring_phys: u64,
+    ring_size_bytes: u64,
+    doorbell_idx: u32,
+    use_doorbell: bool,
+    rptr_writeback_phys: u64,
+    wptr_poll_phys: u64,
+) -> Result<Gfx11Sequence, GfxError> {
+    // `order_base_2(ring_size / 8)` underflows below 8 bytes, and a
+    // non-power-of-two size cannot be described by a log2 field.
+    if ring_size_bytes < 8 || !ring_size_bytes.is_power_of_two() {
+        return Err(GfxError::BadRingSize);
+    }
+    // The base register holds the address shifted right by 8.
+    if ring_phys & 0xFF != 0 {
+        return Err(GfxError::UnalignedRingPhys);
+    }
+    if rptr_writeback_phys & 0x7 != 0 {
+        return Err(GfxError::UnalignedRptrWriteback);
+    }
+
+    let mut seq = Gfx11Sequence::default();
+
+    // The write-pointer delay and the ring's VMID, both to zero.
+    seq.write(gc_base, GFX11_CP_RB_WPTR_DELAY, 0);
+    seq.write(gc_base, GFX11_CP_RB_VMID, 0);
+
+    // Select pipe 0. Read-modify-write of the caller's live value: PIPEID is
+    // bits 1:0, and pipe 0 means clearing them.
+    let pipe0 = grbm_gfx_cntl & !0x3;
+    seq.write(gc_base, GFX11_GRBM_GFX_CNTL, pipe0);
+
+    // `rb_bufsz = order_base_2(ring_size / 8)`.
+    //
+    // Note this is spelled differently from the MQD's
+    // `order_base_2(queue_size / 4) - 1` and means the SAME number — log2 of
+    // a quarter is one more than log2 of an eighth. Transcribing one in place
+    // of the other produces a ring the hardware believes is twice or half its
+    // real size, which is why both are written out as Linux writes them
+    // rather than factored into a shared helper.
+    let rb_bufsz = (ring_size_bytes / 8).trailing_zeros();
+    let cntl = rb_bufsz | (rb_bufsz.wrapping_sub(2) << 8);
+    seq.write(gc_base, GFX11_CP_RB0_CNTL, cntl);
+
+    // Write pointer to zero.
+    seq.write(gc_base, GFX11_CP_RB0_WPTR, 0);
+    seq.write(gc_base, GFX11_CP_RB0_WPTR_HI, 0);
+
+    // Read-pointer writeback, high half masked to 16 bits.
+    seq.write(gc_base, GFX11_CP_RB0_RPTR_ADDR, rptr_writeback_phys as u32);
+    seq.write(
+        gc_base,
+        GFX11_CP_RB0_RPTR_ADDR_HI,
+        ((rptr_writeback_phys >> 32) as u32) & GFX11_RPTR_ADDR_HI_MASK,
+    );
+
+    // Where the CP polls for the host's write pointer. GFX9 has no equivalent.
+    seq.write(
+        gc_base,
+        GFX11_CP_RB_WPTR_POLL_ADDR_LO,
+        wptr_poll_phys as u32,
+    );
+    seq.write(
+        gc_base,
+        GFX11_CP_RB_WPTR_POLL_ADDR_HI,
+        (wptr_poll_phys >> 32) as u32,
+    );
+
+    // `mdelay(1)` and then CP_RB0_CNTL AGAIN, with the same value. Linux does
+    // this deliberately; the second write latches the configuration after the
+    // addresses are in place. Dropping it looks like removing a redundant
+    // line.
+    seq.delay(1000);
+    seq.write(gc_base, GFX11_CP_RB0_CNTL, cntl);
+
+    // The ring base, shifted right by 8.
+    let rb_addr = ring_phys >> 8;
+    seq.write(gc_base, GFX11_CP_RB0_BASE, rb_addr as u32);
+    seq.write(gc_base, GFX11_CP_RB0_BASE_HI, (rb_addr >> 32) as u32);
+
+    // The ring is live.
+    seq.write(gc_base, GFX11_CP_RB_ACTIVE, 1);
+
+    // `gfx_v11_0_cp_gfx_set_doorbell`. The control register is a
+    // read-modify-write in Linux; its reset value is zero and nothing earlier
+    // in this sequence touches it, so composing from zero is the same result.
+    let mut doorbell = 0u32;
+    if use_doorbell {
+        doorbell |= doorbell_idx << GFX11_DOORBELL_OFFSET_SHIFT;
+        doorbell |= GFX11_DOORBELL_EN;
+    }
+    seq.write(gc_base, GFX11_CP_RB_DOORBELL_CONTROL, doorbell);
+    seq.write(
+        gc_base,
+        GFX11_CP_RB_DOORBELL_RANGE_LOWER,
+        doorbell_idx << GFX11_DOORBELL_RANGE_LOWER_SHIFT,
+    );
+    // Linux writes the whole mask here, not `index + 1` — the range is opened
+    // to its maximum. The GFX9 sequence in this file writes `index + 1`,
+    // which is that era's convention and not this one's.
+    seq.write(
+        gc_base,
+        GFX11_CP_RB_DOORBELL_RANGE_UPPER,
+        GFX11_DOORBELL_RANGE_UPPER_MASK,
+    );
+
+    Ok(seq)
 }

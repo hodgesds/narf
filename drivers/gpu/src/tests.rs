@@ -2599,7 +2599,7 @@ fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
         CP_RB0_BASE_REL, CP_RB0_CNTL_REL, CP_RB0_RPTR_ADDR_HI_REL, CP_RB0_RPTR_ADDR_REL,
         CP_RB0_WPTR_HI_REL, CP_RB0_WPTR_REL, CP_RB_DOORBELL_CONTROL_REL, CP_RB_DOORBELL_EN,
         CP_RB_DOORBELL_OFFSET_SHIFT, CP_RB_DOORBELL_RANGE_LOWER_REL,
-        CP_RB_DOORBELL_RANGE_UPPER_REL, RPTR_WRITEBACK_COHERENT,
+        CP_RB_DOORBELL_RANGE_UPPER_REL, RPTR_ADDR_HI_MASK,
     };
     let gc_base: u32 = 0x0003_0000;
     let ring_phys: u64 = 0x0000_0001_0000_0000;
@@ -2633,12 +2633,18 @@ fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
         (gc_base + CP_RB0_WPTR_REL, 0),
         (gc_base + CP_RB0_WPTR_HI_REL, 0),
         (gc_base + CP_RB0_RPTR_ADDR_REL, rptr_phys as u32),
+        // The high half is MASKED to 16 bits, not OR'd with cache bits —
+        // the register has one field and the bits that used to be set here
+        // were address bits 32 and 33.
         (
             gc_base + CP_RB0_RPTR_ADDR_HI_REL,
-            ((rptr_phys >> 32) as u32) | RPTR_WRITEBACK_COHERENT,
+            ((rptr_phys >> 32) as u32) & RPTR_ADDR_HI_MASK,
         ),
-        (gc_base + CP_RB0_BASE_REL, ring_phys as u32),
-        (gc_base + CP_RB0_BASE_HI_REL, (ring_phys >> 32) as u32),
+        // The base is the address SHIFTED RIGHT BY 8: the register holds a
+        // 256-byte granule. This used to assert the raw address, which is
+        // what the builder wrote — so the test agreed with the bug.
+        (gc_base + CP_RB0_BASE_REL, (ring_phys >> 8) as u32),
+        (gc_base + CP_RB0_BASE_HI_REL, (ring_phys >> 8 >> 32) as u32),
         (
             gc_base + CP_RB0_CNTL_REL,
             ring_size_dw.trailing_zeros() | (6u32 << 8),
@@ -4389,109 +4395,157 @@ kernel_test_in!(
 
 // ── amdgpu/gfx (GFX11 Phoenix delta) ───────────────────────────────
 
-fn smoke_amdgpu_gfx11_ring_init_emits_canonical_order() -> TestResult {
-    use crate::amdgpu_gfx::{
-        build_gfx11_ring_init, CP_GFX_CNTL_HALT_ALL, CP_GFX_CNTL_REL, CP_RB0_BASE_REL,
-        CP_RB0_CNTL_REL, CP_RB_DOORBELL_CONTROL_REL, CP_RB_DOORBELL_EN,
-        CP_RB_DOORBELL_OFFSET_SHIFT,
-    };
-    let gc_base: u32 = 0x0003_0000;
-    let ring_phys: u64 = 0x0000_0001_5000_0000;
-    let ring_size_dw: u32 = 2048;
-    let doorbell_idx: u32 = 8;
-    let rptr_phys: u64 = 0x0000_0002_0000_0000;
+/// `gfx_v11_0_cp_gfx_resume`, step for step.
+///
+/// The function this replaces claimed to follow it and did not: it was the
+/// GFX9 sequence with a different halt register. What it got wrong is listed
+/// in the commit; what this test pins is each thing it got wrong.
+fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
+    use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxError, GfxStep};
 
-    let seq = match build_gfx11_ring_init(gc_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys)
-    {
+    const GC: u32 = 0x0003_0000;
+    const RING: u64 = 0x1_0000_0000;
+    const BYTES: u64 = 4096;
+    const RPTR: u64 = 0x2_DEAD_0000;
+    const WPTR: u64 = 0x3_BEEF_0000;
+    const DOORBELL: u32 = 5;
+    // `GRBM_GFX_CNTL` with a non-zero PIPEID and other bits set, so the
+    // read-modify-write is visible.
+    const GRBM: u32 = 0xA5A5_A5A2;
+
+    let seq = match build_gfx11_ring_init(GC, GRBM, RING, BYTES, DOORBELL, true, RPTR, WPTR) {
         Ok(s) => s,
-        Err(_) => return TestResult::Fail("build_gfx11_ring_init failed on valid input"),
+        Err(_) => return TestResult::Fail("a valid GFX11 ring config was refused"),
     };
-    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
 
-    // First write: halt via CP_GFX_CNTL (NOT CP_ME_CNTL — that's GFX9).
-    if w.first().map(|x| (x.addr, x.value))
-        != Some((gc_base + CP_GFX_CNTL_REL, CP_GFX_CNTL_HALT_ALL))
-    {
-        return TestResult::Fail("first write must halt CP via CP_GFX_CNTL");
+    // The ring base is the address SHIFTED RIGHT BY 8 — the register holds a
+    // 256-byte granule. The replaced function wrote the raw address, pointing
+    // the command processor 256x too high, and its 256-byte alignment check
+    // existed precisely because of the shift it never applied.
+    let rb = RING >> 8;
+    if seq.first_write_to(GC, 0x1de0) != Some(rb as u32) {
+        return TestResult::Fail("CP_RB0_BASE must be the address shifted right by 8");
     }
-    // Last write: unhalt (CP_GFX_CNTL = 0).
-    if w.last().map(|x| (x.addr, x.value)) != Some((gc_base + CP_GFX_CNTL_REL, 0)) {
-        return TestResult::Fail("last write must unhalt CP_GFX_CNTL");
+    if seq.first_write_to(GC, 0x1e51) != Some((rb >> 32) as u32) {
+        return TestResult::Fail("CP_RB0_BASE_HI must be the shifted address's high half");
     }
-    // Body writes must include base, size encoding, doorbell.
-    if !w
-        .iter()
-        .any(|x| x.addr == gc_base + CP_RB0_BASE_REL && x.value == ring_phys as u32)
-    {
-        return TestResult::Fail("ring base lo not programmed");
-    }
-    let expect_cntl = ring_size_dw.trailing_zeros() | (6u32 << 8);
-    if !w
-        .iter()
-        .any(|x| x.addr == gc_base + CP_RB0_CNTL_REL && x.value == expect_cntl)
-    {
-        return TestResult::Fail("ring size encoding wrong");
-    }
-    if !w.iter().any(|x| {
-        x.addr == gc_base + CP_RB_DOORBELL_CONTROL_REL
-            && x.value == (CP_RB_DOORBELL_EN | (doorbell_idx << CP_RB_DOORBELL_OFFSET_SHIFT))
-    }) {
-        return TestResult::Fail("doorbell control not programmed");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu/amdgpu/gfx",
-    smoke_amdgpu_gfx11_ring_init_emits_canonical_order
-);
 
-fn smoke_amdgpu_gfx11_uses_distinct_halt_register() -> TestResult {
-    use crate::amdgpu_gfx::{
-        CP_GFX_CNTL_HALT_ALL, CP_GFX_CNTL_ME_HALT_GFX11, CP_GFX_CNTL_PFP_HALT_GFX11,
-        CP_GFX_CNTL_REL, CP_ME_CNTL_HALT_ALL, CP_ME_CNTL_ME_HALT, CP_ME_CNTL_PFP_HALT,
-        CP_ME_CNTL_REL,
+    // `rb_bufsz = order_base_2(ring_size / 8)`, with RB_BLKSZ at that minus 2.
+    // 4096 bytes / 8 = 512, log2 = 9. The replaced function used
+    // log2(size_in_dwords) = 10 and a hardcoded BLKSZ of 6 — both fields
+    // wrong, describing a ring twice its real size.
+    let cntl = seq.writes_to(GC, 0x1de1);
+    if cntl.is_empty() {
+        return TestResult::Fail("CP_RB0_CNTL was never written");
+    }
+    if cntl[0] & 0x3F != 9 {
+        return TestResult::Fail("RB_BUFSZ should be order_base_2(bytes / 8)");
+    }
+    if (cntl[0] >> 8) & 0x3F != 7 {
+        return TestResult::Fail("RB_BLKSZ should be RB_BUFSZ - 2");
+    }
+    // And it is written TWICE with the same value, side by side with a delay.
+    // Linux's `mdelay(1)` then re-writes it; the second write latches the
+    // configuration after the addresses are in place.
+    if cntl.len() != 2 || cntl[0] != cntl[1] {
+        return TestResult::Fail("CP_RB0_CNTL is written twice with the same value");
+    }
+    let Some(first) = seq.index_of_write(GC, 0x1de1) else {
+        return TestResult::Fail("CP_RB0_CNTL index not found");
     };
-    // GFX11's CP_GFX_CNTL must live at a different offset from GFX9's CP_ME_CNTL.
-    if CP_GFX_CNTL_REL == CP_ME_CNTL_REL {
-        return TestResult::Fail("GFX11 CP_GFX_CNTL must differ from GFX9 CP_ME_CNTL");
+    let delay_after = seq.steps[first..]
+        .iter()
+        .position(|s| matches!(s, GfxStep::Delay { .. }));
+    let second = seq.steps[first + 1..]
+        .iter()
+        .position(|s| matches!(s, GfxStep::Write { addr, .. } if *addr == GC + (0x1de1 << 2)));
+    match (delay_after, second) {
+        (Some(d), Some(w)) if d <= w + 1 => {}
+        _ => return TestResult::Fail("the delay must fall between the two CNTL writes"),
     }
-    // Halt-bit positions must differ — GFX9 uses bits {24, 26, 28};
-    // GFX11 uses bits {0, 4, 8}.
-    if CP_GFX_CNTL_PFP_HALT_GFX11 == CP_ME_CNTL_PFP_HALT
-        || CP_GFX_CNTL_ME_HALT_GFX11 == CP_ME_CNTL_ME_HALT
-    {
-        return TestResult::Fail("GFX11 halt bits must differ from GFX9");
-    }
-    // Composite masks must differ.
-    if CP_GFX_CNTL_HALT_ALL == CP_ME_CNTL_HALT_ALL {
-        return TestResult::Fail("HALT_ALL composites must differ between GFX9/GFX11");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu/amdgpu/gfx",
-    smoke_amdgpu_gfx11_uses_distinct_halt_register
-);
 
-fn smoke_amdgpu_gfx11_ring_init_validation_rejects_bad_inputs() -> TestResult {
-    use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxError};
-    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_0000, 1000, 0, 0x2_0000_0000) {
-        Err(GfxError::BadRingSize) => {}
-        _ => return TestResult::Fail("non-pow2 ring size must be rejected"),
+    // The rptr writeback high half is MASKED to 16 bits, never OR'd with
+    // cache bits — the register has one field and 0x3 set address bits 32:33.
+    if seq.first_write_to(GC, 0x1de4) != Some(((RPTR >> 32) as u32) & 0xFFFF) {
+        return TestResult::Fail("CP_RB0_RPTR_ADDR_HI must be masked to 16 bits");
     }
-    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_00FF, 1024, 0, 0x2_0000_0000) {
-        Err(GfxError::UnalignedRingPhys) => {}
-        _ => return TestResult::Fail("unaligned ring phys must be rejected"),
+
+    // The write-pointer poll address, which the replaced function never wrote
+    // at all — without it the CP has no idea where the host's wptr lives.
+    if seq.first_write_to(GC, 0x1e8b) != Some(WPTR as u32) {
+        return TestResult::Fail("CP_RB_WPTR_POLL_ADDR_LO was not programmed");
     }
-    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_0000, 1024, 0, 0x2_0000_0001) {
-        Err(GfxError::UnalignedRptrWriteback) => {}
-        _ => return TestResult::Fail("unaligned rptr-writeback must be rejected"),
+    if seq.first_write_to(GC, 0x1e8c) != Some((WPTR >> 32) as u32) {
+        return TestResult::Fail("CP_RB_WPTR_POLL_ADDR_HI was not programmed");
+    }
+
+    // CP_RB_ACTIVE, also absent before. A ring the CP does not consider
+    // active is never fetched from.
+    if seq.first_write_to(GC, 0x1f40) != Some(1) {
+        return TestResult::Fail("CP_RB_ACTIVE must be set");
+    }
+
+    // The pipe select is a read-modify-write of the caller's live value: only
+    // PIPEID (bits 1:0) changes.
+    if seq.first_write_to(GC, 0x0900) != Some(GRBM & !0x3) {
+        return TestResult::Fail("GRBM_GFX_CNTL should keep every bit but PIPEID");
+    }
+    // And the two registers zeroed first.
+    if seq.first_write_to(GC, 0x0f61) != Some(0) {
+        return TestResult::Fail("CP_RB_WPTR_DELAY should be zeroed");
+    }
+    if seq.first_write_to(GC, 0x1df1) != Some(0) {
+        return TestResult::Fail("CP_RB_VMID should be zeroed");
+    }
+    if seq.first_write_to(GC, 0x1df4) != Some(0) || seq.first_write_to(GC, 0x1df5) != Some(0) {
+        return TestResult::Fail("both halves of the write pointer should be zeroed");
+    }
+
+    // The doorbell range UPPER is the whole mask, not `index + 1` — that is
+    // the GFX9 convention, and the replaced function used it here.
+    if seq.first_write_to(GC, 0x1dfb) != Some(0x0000_0FFC) {
+        return TestResult::Fail("DOORBELL_RANGE_UPPER is the field's full mask on GFX11");
+    }
+    if seq.first_write_to(GC, 0x1dfa) != Some(DOORBELL << 2) {
+        return TestResult::Fail("DOORBELL_RANGE_LOWER holds the index at bit 2");
+    }
+    let door = seq.first_write_to(GC, 0x1e8d).unwrap_or(0);
+    if door & (1 << 30) == 0 || (door >> 2) & 0x03FF_FFFF != DOORBELL {
+        return TestResult::Fail("the doorbell control register is wrong");
+    }
+    // No doorbell: the register stays at its reset value.
+    let nodoor = match build_gfx11_ring_init(GC, GRBM, RING, BYTES, DOORBELL, false, RPTR, WPTR) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("a ring without a doorbell was refused"),
+    };
+    if nodoor.first_write_to(GC, 0x1e8d) != Some(0) {
+        return TestResult::Fail("no doorbell means DOORBELL_EN stays clear");
+    }
+
+    // Validation.
+    if !matches!(
+        build_gfx11_ring_init(GC, GRBM, RING, 3000, DOORBELL, true, RPTR, WPTR),
+        Err(GfxError::BadRingSize)
+    ) {
+        return TestResult::Fail("a non-power-of-two ring size must be refused");
+    }
+    if !matches!(
+        build_gfx11_ring_init(GC, GRBM, RING + 0xFF, BYTES, DOORBELL, true, RPTR, WPTR),
+        Err(GfxError::UnalignedRingPhys)
+    ) {
+        return TestResult::Fail("a ring base that is not 256-byte aligned must be refused");
+    }
+    if !matches!(
+        build_gfx11_ring_init(GC, GRBM, RING, BYTES, DOORBELL, true, RPTR + 1, WPTR),
+        Err(GfxError::UnalignedRptrWriteback)
+    ) {
+        return TestResult::Fail("an unaligned rptr writeback must be refused");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
-    smoke_amdgpu_gfx11_ring_init_validation_rejects_bad_inputs
+    smoke_amdgpu_gfx11_ring_init_matches_linux
 );
 
 // ── amdgpu (initialize orchestrator) ───────────────────────────────
