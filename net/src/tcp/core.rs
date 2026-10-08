@@ -343,10 +343,49 @@ pub struct CachedEgress {
     pub dev: iface::NetIfaceSnapshot,
 }
 
+/// The TX offload metadata for a frame emitted on `dev`: TSO (which implies L4
+/// checksum) when `tso_mss` is set and the device supports it, else L4 checksum
+/// alone when advertised, else none. Must agree with the `offload_csum`
+/// argument the frame was built with.
+fn offload_meta(dev: &iface::NetIfaceSnapshot, tso_mss: Option<u16>) -> crate::TxMeta {
+    match tso_mss {
+        Some(mss) if dev.offloads.max_tso_bytes > 0 => crate::TxMeta::with_tso(mss),
+        _ if dev.offloads.tx_checksum => crate::TxMeta::with_csum(crate::L4CsumKind::Tcp),
+        _ => crate::TxMeta::plain(),
+    }
+}
+
+/// An egress frame the stack built, either as a plain `Vec` (classic copy TX)
+/// or directly in a DMA buffer from the iface's TX pool (zero-copy TX, P-F).
+/// `emit_tcb_frame` dispatches each to the matching driver hand-off.
+enum TxFrame {
+    Owned(Vec<u8>),
+    Dma(crate::Frame),
+}
+
+impl TxFrame {
+    fn len(&self) -> usize {
+        match self {
+            TxFrame::Owned(v) => v.len(),
+            TxFrame::Dma(f) => f.len() as usize,
+        }
+    }
+
+    /// Mutable view of the frame bytes — the TX netfilter hook rewrites these
+    /// in place for both buffer kinds.
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            TxFrame::Owned(v) => v.as_mut_slice(),
+            TxFrame::Dma(f) => f.payload_mut(),
+        }
+    }
+}
+
 fn emit_tcb_frame(
     arc: &Arc<IrqSafeSpinLock<Tcb>>,
     dev: &iface::NetIfaceSnapshot,
-    mut frame: Vec<u8>,
+    mut frame: TxFrame,
+    meta: crate::TxMeta,
 ) {
     let iface_name = dev.name.as_str();
     let (net_ns_id, is_ipv6) = {
@@ -356,14 +395,21 @@ fn emit_tcb_frame(
     if frame.len() < crate::pkt::ETH_HDR_LEN {
         return;
     }
-    if is_ipv6
+    let accepted = is_ipv6
         || crate::tcp_stack::nf_tx_filter_in(
             net_ns_id,
             iface_name,
-            &mut frame[crate::pkt::ETH_HDR_LEN..],
-        ) == crate::netfilter::Verdict::Accept
-    {
-        let _ = dev.xmit(&frame);
+            &mut frame.bytes_mut()[crate::pkt::ETH_HDR_LEN..],
+        ) == crate::netfilter::Verdict::Accept;
+    if accepted {
+        match frame {
+            TxFrame::Owned(v) => {
+                let _ = dev.xmit_meta(&v, meta);
+            }
+            TxFrame::Dma(f) => {
+                let _ = dev.xmit_frame(f, meta);
+            }
+        }
     }
 }
 
@@ -1925,7 +1971,18 @@ pub fn set_congestion_control<C: CongestionControl>(
 
 /// Construct the bytes for an Ethernet+IPv4+TCP frame carrying
 /// `payload`. Used by every outbound path.
-fn build_frame(
+/// Total bytes an IPv4 TCP frame with `opt_len` option bytes and `payload_len`
+/// data occupies — the size to allocate / acquire before building.
+fn ipv4_frame_len(opt_len: usize, payload_len: usize) -> usize {
+    ETH_HDR_LEN + IPV4_HDR_LEN + TCP_HDR_MIN + opt_len + payload_len
+}
+
+/// Build a complete Ethernet/IPv4/TCP frame into `out` (which must be at least
+/// [`ipv4_frame_len`] bytes). The zero-copy TX path builds straight into a DMA
+/// buffer's payload here; the `Vec`-returning [`build_frame`] wraps it.
+#[allow(clippy::too_many_arguments)]
+fn build_frame_into(
+    out: &mut [u8],
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
     src_ip: [u8; 4],
@@ -1938,13 +1995,14 @@ fn build_frame(
     window: u16,
     options: Vec<u8>,
     payload: &[u8],
-) -> Vec<u8> {
+    offload_csum: bool,
+) {
     let opt_len = options.len();
     let tcp_hdr_len = TCP_HDR_MIN + opt_len;
-    let total = ETH_HDR_LEN + IPV4_HDR_LEN + tcp_hdr_len + payload.len();
-    let mut frame = vec![0u8; total];
+    let total = ipv4_frame_len(opt_len, payload.len());
+    let frame = &mut out[..total];
     let ip_total = (IPV4_HDR_LEN + tcp_hdr_len + payload.len()) as u16;
-    let _ = write_eth_header(&mut frame, dst_mac, src_mac, ETHERTYPE_IPV4);
+    let _ = write_eth_header(frame, dst_mac, src_mac, ETHERTYPE_IPV4);
     let _ = write_ipv4_header(
         &mut frame[ETH_HDR_LEN..],
         ip_total,
@@ -1969,16 +2027,129 @@ fn build_frame(
     let bytes = hdr.encode();
     frame[tcp_off..tcp_off + bytes.len()].copy_from_slice(&bytes);
     frame[tcp_off + bytes.len()..tcp_off + bytes.len() + payload.len()].copy_from_slice(payload);
-    let segment = &frame[tcp_off..tcp_off + tcp_hdr_len + payload.len()];
-    // Patch the 2-byte TCP checksum in place (it lives at offset 16 of the
-    // TCP header, after src/dst port + seq + ack + dataoff/flags + window)
-    // rather than re-encoding the whole header into a fresh Vec and copying
-    // it back — saves one heap alloc + a full-header copy per outbound
-    // segment. The checksum was computed over the header with this field
-    // zeroed (as encoded above), which is the required pseudo-header form.
-    let cs = ipv4_pseudo_checksum(src_ip, dst_ip, segment);
+    // Patch the 2-byte TCP checksum in place (offset 16 of the TCP header).
+    // With checksum offload (egress advertises tx_checksum), write only the
+    // cheap pseudo-header seed and let hardware fold in the payload sum; the
+    // field then satisfies `ip_checksum(segment_with_seed) == full checksum`.
+    // Otherwise compute the full software checksum over the whole segment.
+    let cs = if offload_csum {
+        crate::pkt_tcp::ipv4_tcp_pseudo_seed(src_ip, dst_ip, (tcp_hdr_len + payload.len()) as u16)
+    } else {
+        let segment = &frame[tcp_off..tcp_off + tcp_hdr_len + payload.len()];
+        ipv4_pseudo_checksum(src_ip, dst_ip, segment)
+    };
     frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&cs.to_be_bytes());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_frame(
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: Vec<u8>,
+    payload: &[u8],
+    offload_csum: bool,
+) -> Vec<u8> {
+    let mut frame = vec![0u8; ipv4_frame_len(options.len(), payload.len())];
+    build_frame_into(
+        &mut frame,
+        src_mac,
+        dst_mac,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+        window,
+        options,
+        payload,
+        offload_csum,
+    );
     frame
+}
+
+/// Total bytes an Ethernet/IPv6/TCP frame occupies — the size to allocate /
+/// acquire before building.
+fn ipv6_frame_len(opt_len: usize, payload_len: usize) -> usize {
+    ETH_HDR_LEN + crate::pkt_ipv6::IPV6_HDR_LEN + TCP_HDR_MIN + opt_len + payload_len
+}
+
+/// Build a complete Ethernet/IPv6/TCP frame into `out` (≥ [`ipv6_frame_len`]
+/// bytes) — the IPv6 counterpart to [`build_frame_into`]. Writes the L2 header,
+/// the IPv6 fixed header, then the TCP header + payload, and patches the TCP
+/// checksum over the segment. The zero-copy TX path builds straight into a DMA
+/// buffer here; [`build_frame6`] wraps it for the `Vec` path.
+#[allow(clippy::too_many_arguments)]
+fn build_frame6_into(
+    out: &mut [u8],
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    options: Vec<u8>,
+    payload: &[u8],
+    offload_csum: bool,
+) {
+    use crate::pkt_ipv6::{Ipv6Header, IPV6_HDR_LEN, NEXT_HEADER_TCP};
+    let tcp_hdr_len = TCP_HDR_MIN + options.len();
+    let seg_len = tcp_hdr_len + payload.len();
+    let total = ETH_HDR_LEN + IPV6_HDR_LEN + seg_len;
+    let frame = &mut out[..total];
+    let _ = write_eth_header(frame, dst_mac, src_mac, crate::pkt::ETHERTYPE_IPV6);
+    let ip = Ipv6Header {
+        version: 6,
+        traffic_class: 0,
+        flow_label: 0,
+        payload_length: seg_len as u16,
+        next_header: NEXT_HEADER_TCP,
+        hop_limit: 64,
+        src_ip,
+        dst_ip,
+    };
+    frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN].copy_from_slice(&ip.encode());
+    let seg_off = ETH_HDR_LEN + IPV6_HDR_LEN;
+    let hdr = TcpHeader {
+        src_port,
+        dst_port,
+        sequence: seq,
+        acknowledgement: ack,
+        header_len: tcp_hdr_len as u8,
+        flags,
+        window,
+        checksum: 0,
+        urgent_ptr: 0,
+        options,
+    };
+    let bytes = hdr.encode();
+    frame[seg_off..seg_off + bytes.len()].copy_from_slice(&bytes);
+    frame[seg_off + bytes.len()..seg_off + bytes.len() + payload.len()].copy_from_slice(payload);
+    // See `build_frame_into`: offload writes only the pseudo-header seed.
+    let checksum = if offload_csum {
+        crate::pkt_ipv6::pseudo_seed(src_ip, dst_ip, NEXT_HEADER_TCP, seg_len as u32)
+    } else {
+        crate::pkt_ipv6::pseudo_checksum(
+            src_ip,
+            dst_ip,
+            NEXT_HEADER_TCP,
+            &frame[seg_off..seg_off + seg_len],
+        )
+    };
+    frame[seg_off + 16..seg_off + 18].copy_from_slice(&checksum.to_be_bytes());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1995,41 +2166,24 @@ fn build_frame6(
     window: u16,
     options: Vec<u8>,
     payload: &[u8],
+    offload_csum: bool,
 ) -> Vec<u8> {
-    let tcp_hdr_len = TCP_HDR_MIN + options.len();
-    let hdr = TcpHeader {
-        src_port,
-        dst_port,
-        sequence: seq,
-        acknowledgement: ack,
-        header_len: tcp_hdr_len as u8,
-        flags,
-        window,
-        checksum: 0,
-        urgent_ptr: 0,
-        options,
-    };
-    let mut segment = hdr.encode();
-    segment.extend_from_slice(payload);
-    let checksum = crate::pkt_ipv6::pseudo_checksum(
+    let mut frame = vec![0u8; ipv6_frame_len(options.len(), payload.len())];
+    build_frame6_into(
+        &mut frame,
+        src_mac,
+        dst_mac,
         src_ip,
         dst_ip,
-        crate::pkt_ipv6::NEXT_HEADER_TCP,
-        &segment,
-    );
-    segment[16..18].copy_from_slice(&checksum.to_be_bytes());
-    let mut frame = Vec::new();
-    crate::ipv6_stack::build_frame(
-        &mut frame,
-        crate::ipv6_stack::Ipv6FrameSpec {
-            src_mac,
-            dst_mac,
-            src_ip,
-            dst_ip,
-            next_header: crate::pkt_ipv6::NEXT_HEADER_TCP,
-            hop_limit: 64,
-            body: &segment,
-        },
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        flags,
+        window,
+        options,
+        payload,
+        offload_csum,
     );
     frame
 }
@@ -2049,6 +2203,7 @@ fn iface_for_tcb(t: &Tcb) -> Option<crate::iface::NetIfaceSnapshot> {
 
 #[allow(clippy::too_many_arguments)]
 fn build_tcb_frame(
+    dev: &iface::NetIfaceSnapshot,
     t: &Tcb,
     src_mac: [u8; 6],
     seq: u32,
@@ -2057,9 +2212,60 @@ fn build_tcb_frame(
     window: u16,
     options: Vec<u8>,
     payload: &[u8],
-) -> Vec<u8> {
+    offload_csum: bool,
+) -> TxFrame {
+    // When the egress iface offers zero-copy TX and a pool buffer is big
+    // enough for this frame, build straight into it — no copy before the DMA.
+    // A TSO super-frame larger than the pool buffer, or a non-zero-copy iface,
+    // falls through to the `Vec` path (byte-for-byte the pre-P-F behaviour).
+    // Both v4 and v6 take the zero-copy path; they differ only in the builder.
+    let total = if t.is_ipv6 {
+        ipv6_frame_len(options.len(), payload.len())
+    } else {
+        ipv4_frame_len(options.len(), payload.len())
+    };
+    if dev.zero_copy_tx() {
+        if let Some(mut f) = iface::tx_acquire(&dev.name, total) {
+            if t.is_ipv6 {
+                build_frame6_into(
+                    f.payload_mut(),
+                    src_mac,
+                    t.remote_mac,
+                    t.local_addr6,
+                    t.remote_addr6,
+                    t.local_port,
+                    t.remote_port,
+                    seq,
+                    ack,
+                    flags,
+                    window,
+                    options,
+                    payload,
+                    offload_csum,
+                );
+            } else {
+                build_frame_into(
+                    f.payload_mut(),
+                    src_mac,
+                    t.remote_mac,
+                    t.local_addr,
+                    t.remote_addr,
+                    t.local_port,
+                    t.remote_port,
+                    seq,
+                    ack,
+                    flags,
+                    window,
+                    options,
+                    payload,
+                    offload_csum,
+                );
+            }
+            return TxFrame::Dma(f);
+        }
+    }
     if t.is_ipv6 {
-        build_frame6(
+        TxFrame::Owned(build_frame6(
             src_mac,
             t.remote_mac,
             t.local_addr6,
@@ -2072,9 +2278,10 @@ fn build_tcb_frame(
             window,
             options,
             payload,
-        )
+            offload_csum,
+        ))
     } else {
-        build_frame(
+        TxFrame::Owned(build_frame(
             src_mac,
             t.remote_mac,
             t.local_addr,
@@ -2087,7 +2294,8 @@ fn build_tcb_frame(
             window,
             options,
             payload,
-        )
+            offload_csum,
+        ))
     }
 }
 
@@ -2138,6 +2346,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         FLAG_SYN
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         our_iss,
@@ -2146,8 +2355,9 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         65535,
         opts,
         &[],
+        iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
     // Track SYN in the retransmit queue so a missed SYN-ACK
     // re-triggers retransmit.
     let mut t = arc.lock();
@@ -2173,6 +2383,7 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         (t.snd_nxt, t.rcv_nxt, window, opts)
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -2181,8 +2392,9 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         window,
         opt_bytes,
         &[],
+        iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
 }
 
 fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool) {
@@ -2195,8 +2407,19 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
     } else {
         FLAG_RST
     };
-    let frame = build_tcb_frame(&arc.lock(), iface.mac, seq, ack, flags, 0, Vec::new(), &[]);
-    emit_tcb_frame(arc, &iface, frame);
+    let frame = build_tcb_frame(
+        &iface,
+        &arc.lock(),
+        iface.mac,
+        seq,
+        ack,
+        flags,
+        0,
+        Vec::new(),
+        &[],
+        iface.offloads.tx_checksum,
+    );
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
 }
 
 /// Build & send one data segment carrying `payload` from sequence
@@ -2208,6 +2431,7 @@ fn send_data(
     payload: &[u8],
     extra_flags: u8,
     record_retx: bool,
+    tso_mss: Option<u16>,
 ) {
     if !payload.is_empty() {
         rxtx_note_tx();
@@ -2243,7 +2467,13 @@ fn send_data(
         t.unacked_data_segments = 0;
         (t.rcv_nxt, window, opts)
     };
+    // TSO super-frame: only when this is a multi-MSS payload AND the egress
+    // can segment it. TSO implies L4 checksum offload, so the frame carries
+    // the checksum seed in either offload case.
+    let tso = tso_mss.filter(|_| egress.dev.offloads.max_tso_bytes > 0);
+    let csum_off = tso.is_some() || egress.dev.offloads.tx_checksum;
     let frame = build_tcb_frame(
+        &egress.dev,
         &arc.lock(),
         egress.mac,
         seq,
@@ -2252,8 +2482,9 @@ fn send_data(
         window,
         opt_bytes,
         payload,
+        csum_off,
     );
-    emit_tcb_frame(arc, &egress.dev, frame);
+    emit_tcb_frame(arc, &egress.dev, frame, offload_meta(&egress.dev, tso));
     if record_retx {
         let mut t = arc.lock();
         let payload_len = payload.len() as u32;
@@ -2470,6 +2701,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         None => return,
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -2478,8 +2710,9 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         window,
         opt_bytes,
         &payload,
+        iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
     {
         let mut t = arc.lock();
         // The buffer was rewound to snd_una: advance past what we resent so
@@ -2538,6 +2771,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         (seq, window, opts, t.rcv_nxt)
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -2546,8 +2780,9 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         window,
         opt_bytes,
         &[],
+        iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
 }
 
 fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -2599,6 +2834,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         (t.snd_una.wrapping_sub(1), window, opts, t.rcv_nxt)
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -2607,8 +2843,9 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         window,
         opt_bytes,
         &[],
+        iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
 }
 
 fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -2633,10 +2870,24 @@ fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 /// window / MSS. Called on each `tcp_send` and after each ACK.
 pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     loop {
-        let (chunks, seq, fin_flag, mss, drained_all) = {
+        let (chunks, seq, fin_flag, tso_arg, drained_all) = {
             let mut t = arc.lock();
             let usable = t.usable_send_window();
             let mss = t.opts.peer_mss as u32;
+            // TSO: if the memoized egress can segment, build one super-frame of
+            // up to `max_tso_bytes` (less header headroom) per emit and let the
+            // NIC cut it into MSS segments; otherwise emit MSS segments as
+            // before. `tso_arg` carries the MSS down to `send_data`.
+            let tso_max = t
+                .egress
+                .as_ref()
+                .map_or(0u32, |e| e.dev.offloads.max_tso_bytes);
+            let seg_cap = if tso_max > 0 {
+                tso_max.saturating_sub(128).max(mss)
+            } else {
+                mss
+            };
+            let tso_arg = if tso_max > 0 { Some(mss as u16) } else { None };
             if usable == 0 {
                 // Arm persist only when the RECEIVER's window is closed.
                 // Running out of cwnd (or filling a still-open window) is
@@ -2663,7 +2914,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                     let seq = t.fin_seq;
                     let flags = FLAG_FIN;
                     t.snd_nxt = t.snd_nxt.wrapping_add(1);
-                    (Vec::<Vec<u8>>::new(), seq, flags, mss, true)
+                    (Vec::<Vec<u8>>::new(), seq, flags, None, true)
                 } else {
                     break;
                 }
@@ -2672,7 +2923,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                 let mut remaining = unsent.min(usable);
                 let starting_seq = t.send_buf.seq_at_sent_offset();
                 while remaining > 0 {
-                    let take = remaining.min(mss);
+                    let take = remaining.min(seg_cap);
                     let (a, b) = t.send_buf.unsent_slices(take as usize);
                     let mut chunk = Vec::with_capacity(take as usize);
                     chunk.extend_from_slice(a);
@@ -2695,7 +2946,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
                     chunks,
                     starting_seq,
                     if attach_fin { FLAG_FIN } else { 0 },
-                    mss,
+                    tso_arg,
                     drained,
                 )
             }
@@ -2703,7 +2954,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         if chunks.is_empty() {
             if fin_flag != 0 {
                 // Pure FIN segment.
-                send_data(arc, seq, &[], FLAG_FIN, true);
+                send_data(arc, seq, &[], FLAG_FIN, true, None);
                 break;
             }
             break;
@@ -2716,10 +2967,14 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             } else {
                 FLAG_PSH
             };
-            send_data(arc, cur_seq, c, extra, true);
+            // A chunk larger than one MSS is a TSO super-frame; `send_data`
+            // requests hardware segmentation. `tso_arg` is `Some(mss)` only
+            // for a TSO-capable egress, so a single-MSS chunk or a non-TSO
+            // egress sends normally.
+            let seg_tso = tso_arg.filter(|&m| c.len() > m as usize);
+            send_data(arc, cur_seq, c, extra, true, seg_tso);
             cur_seq = cur_seq.wrapping_add(c.len() as u32);
         }
-        let _ = mss;
         let _ = drained_all;
         if fin_flag != 0 {
             break;
@@ -2831,6 +3086,7 @@ fn send_stateless_rst6(
         0,
         Vec::new(),
         &[],
+        false,
     );
     let _ = iface.xmit(&frame);
 }
@@ -2891,6 +3147,7 @@ fn send_stateless_rst(
         0,
         Vec::new(),
         &[],
+        false,
     );
     if crate::tcp_stack::nf_tx_filter_in(
         net_ns_id,
@@ -3660,6 +3917,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         None => return,
     };
     let frame = build_tcb_frame(
+        &iface,
         &arc.lock(),
         iface.mac,
         seq,
@@ -3668,8 +3926,9 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         window,
         opt_bytes,
         &payload,
+        iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame);
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
     let mut t = arc.lock();
     // Karn: no RTT sample from any record covering the resent range.
     let end = seq.wrapping_add(payload.len() as u32);

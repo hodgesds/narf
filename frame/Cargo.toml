@@ -283,6 +283,7 @@ kernel-test  = [
     "narf-drivers-fingerprint/kernel-test",
     "narf-drivers-serial/kernel-test",
     "narf-drivers-spi/kernel-test",
+    "narf-net/kernel-test",
     "narf-wireless/kernel-test",
     "narf-drivers-wireless/kernel-test",
     "narf-accel/kernel-test",

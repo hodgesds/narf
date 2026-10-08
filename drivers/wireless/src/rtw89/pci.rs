@@ -362,7 +362,7 @@ fn rtw89_isr() {
 }
 
 /// SendFn registered with `narf_net::iface` at probe time.
-pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
+pub fn send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     with_controller(|dev| {
         use crate::rtw89::datapath::*;
         use crate::rtw89::dma::*;

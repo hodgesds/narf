@@ -217,6 +217,31 @@ pub fn ipv4_pseudo_checksum(src: [u8; 4], dst: [u8; 4], segment: &[u8]) -> u16 {
     ip_checksum(&buf)
 }
 
+/// The IPv4 TCP checksum-offload *seed*: the one's-complement sum of the
+/// pseudo-header (src, dst, proto, TCP length) only. The stack writes this
+/// into the TCP checksum field and advertises `TxMeta::csum_l4`; hardware then
+/// sums the TCP header+payload (which includes this seeded field) and stores
+/// the result — i.e. `ip_checksum(segment_with_seed)` equals the full
+/// `ipv4_pseudo_checksum`, so the per-byte payload sum moves off the CPU.
+/// `tcp_len` is the TCP header + payload length in bytes.
+pub fn ipv4_tcp_pseudo_seed(src: [u8; 4], dst: [u8; 4], tcp_len: u16) -> u16 {
+    let ph = [
+        src[0],
+        src[1],
+        src[2],
+        src[3],
+        dst[0],
+        dst[1],
+        dst[2],
+        dst[3],
+        0,
+        crate::pkt::IP_PROTO_TCP,
+        (tcp_len >> 8) as u8,
+        tcp_len as u8,
+    ];
+    !ip_checksum(&ph)
+}
+
 /// Verify the TCP segment checksum against the IPv4 pseudo-header.
 pub fn verify_ipv4(src: [u8; 4], dst: [u8; 4], segment: &[u8]) -> Result<(), TcpError> {
     if segment.len() < TCP_HDR_MIN {

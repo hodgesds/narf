@@ -135,6 +135,16 @@ pub fn pseudo_checksum(src: [u8; 16], dst: [u8; 16], next_header: u8, body: &[u8
     ip_checksum(&buf)
 }
 
+/// The IPv6 upper-layer checksum-offload *seed*: the one's-complement sum of
+/// the IPv6 pseudo-header only (src, dst, upper-layer length, next header).
+/// The stack seeds the L4 checksum field with this and advertises
+/// `TxMeta::csum_l4`; hardware sums the L4 header+payload (including the seeded
+/// field) so `ip_checksum(segment_with_seed)` equals the full
+/// [`pseudo_checksum`]. `body_len` is the upper-layer (TCP/UDP) length.
+pub fn pseudo_seed(src: [u8; 16], dst: [u8; 16], next_header: u8, body_len: u32) -> u16 {
+    !ip_checksum(&ipv6_pseudo_header(src, dst, body_len, next_header))
+}
+
 // ── ICMPv6 (RFC 4443 §2.1) ────────────────────────────────────────
 
 pub const ICMPV6_HDR_LEN: usize = 4;

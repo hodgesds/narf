@@ -79,7 +79,7 @@ fn first_errno(replies: &[Vec<u8>]) -> Option<i64> {
 
 // ── rtnetlink helpers ───────────────────────────────────────────────
 
-fn discard(_: &[u8]) -> Result<(), ()> {
+fn discard(_: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     Ok(())
 }
 

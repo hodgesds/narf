@@ -229,7 +229,7 @@ static DRAIN_INSTALLED: AtomicBool = AtomicBool::new(false);
 static FORCED_RTOS: AtomicU32 = AtomicU32::new(0);
 
 /// `SendFn` of the test interface: log the frame, apply the fault, queue it.
-fn wire_send(frame: &[u8]) -> Result<(), ()> {
+fn wire_send(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     let mut w = WIRE.lock();
     let Some(mut seg) = parse_seg(frame) else {
         // Non-TCP (e.g. ARP) — deliver untouched.

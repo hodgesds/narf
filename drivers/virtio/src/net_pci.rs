@@ -62,6 +62,7 @@ use alloc::vec::Vec;
 
 use narf_bus::{BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
+use narf_io::pool::DmaPool;
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
@@ -297,14 +298,16 @@ pub struct VirtioNetPci {
     /// transmit returns its 4 KiB buffer here instead of freeing it, and
     /// `tx_buf_acquire` pops from here instead of `alloc_coherent` — keeping
     /// the coherent/buddy allocator off the per-frame TX hot path. Capped at
-    /// `TX_POOL_CAP`; overflow drops (frees) the buffer.
-    tx_pool: IrqSafeSpinLock<Vec<DmaBuffer>>,
+    /// `TX_POOL_CAP`; overflow drops (frees) the buffer. `Arc` so zero-copy TX
+    /// (P-F) can share this exact pool with the iface layer: the stack's
+    /// `tx_acquire` draws from it and this driver's TX reaper recycles into it.
+    tx_pool: Arc<DmaPool>,
     /// Recycled RX DMA buffers (the RX frame/`skb` pool). The forwarder returns
     /// each fully-consumed RX buffer here instead of freeing it, and
     /// `rx_take_on` pops from here for the replacement it posts back to the
     /// device — keeping the buddy allocator off the per-frame RX hot path.
-    /// Capped at `RX_POOL_CAP`.
-    rx_pool: IrqSafeSpinLock<Vec<DmaBuffer>>,
+    /// Capped at `RX_POOL_CAP`. Shared `DmaPool`.
+    rx_pool: DmaPool,
 }
 
 /// Control-queue runtime state. `ctrl_buf` holds back-to-back
@@ -716,8 +719,8 @@ impl VirtioNetPci {
             ctrl_qidx,
             ctrl,
             cfg_phys,
-            tx_pool: IrqSafeSpinLock::new(Vec::new()),
-            rx_pool: IrqSafeSpinLock::new(Vec::new()),
+            tx_pool: Arc::new(DmaPool::new(4096, DomainId::DRIVER_0, TX_POOL_CAP)),
+            rx_pool: DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP),
         };
 
         // VirtIO 1.2 §5.1.6.5.5: after DRIVER_OK, tell the device
@@ -925,19 +928,13 @@ impl VirtioNetPci {
     /// Take a 4 KiB TX DMA buffer — recycled from `tx_pool` if available,
     /// else a fresh coherent allocation. Pairs with `tx_buf_release`.
     fn tx_buf_acquire(&self) -> Option<DmaBuffer> {
-        if let Some(b) = self.tx_pool.lock().pop() {
-            return Some(b);
-        }
-        alloc_coherent(4096, DomainId::DRIVER_0).ok()
+        self.tx_pool.acquire()
     }
 
     /// Return a completed TX DMA buffer to `tx_pool` for reuse, or drop it
     /// (freeing) when the pool is already at `TX_POOL_CAP`.
     fn tx_buf_release(&self, buf: DmaBuffer) {
-        let mut pool = self.tx_pool.lock();
-        if pool.len() < TX_POOL_CAP {
-            pool.push(buf);
-        }
+        self.tx_pool.release(buf);
     }
 
     /// Take a 4 KiB RX DMA buffer — recycled from the RX frame pool if
@@ -945,19 +942,13 @@ impl VirtioNetPci {
     /// whole buffer on receive, so a recycled (un-zeroed) buffer is fine.
     /// Pairs with [`Self::rx_buf_release`].
     pub fn rx_buf_acquire(&self) -> Option<DmaBuffer> {
-        if let Some(b) = self.rx_pool.lock().pop() {
-            return Some(b);
-        }
-        alloc_coherent(4096, DomainId::DRIVER_0).ok()
+        self.rx_pool.acquire()
     }
 
     /// Return a fully-consumed RX DMA buffer to the RX frame pool for reuse,
     /// or drop it (freeing) when the pool is already at `RX_POOL_CAP`.
     pub fn rx_buf_release(&self, buf: DmaBuffer) {
-        let mut pool = self.rx_pool.lock();
-        if pool.len() < RX_POOL_CAP {
-            pool.push(buf);
-        }
+        self.rx_pool.release(buf);
     }
 
     pub fn tx_dma(&self, buf: DmaBuffer, frame_len: u32) -> Result<(), VirtioPciError> {
@@ -1597,6 +1588,12 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         // `virtnet_get_drvinfo`: driver "virtio_net", VIRTNET_DRIVER_VERSION.
         narf_net::iface::set_driver_info(name, "virtio_net", Some("1.0.0"), bus_info);
         *PRIMARY_IFNAME.lock() = Some(name);
+        // Opt into zero-copy TX (P-F), sharing this controller's own TX pool so
+        // the stack's `tx_acquire` and the TX reaper use one free-list. 12-byte
+        // head-room for the virtio-net header `tx_dma` writes in front.
+        if let Some(pool) = with_at(idx, |c| c.tx_pool.clone()) {
+            narf_net::iface::enable_zero_copy_tx_pool(name, vnet0_send_frame_zc, pool, 12);
+        }
         name.into()
     } else {
         narf_net::iface::reserve_name("eth%d").into()
@@ -1778,7 +1775,12 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                                     return;
                                 }
                                 Err(narf_ipc::TrySendError::Full(_)) => {
-                                    // Frame dropped on scope exit.
+                                    // The driver→stack ring is full: the stack
+                                    // isn't draining fast enough. Frame is
+                                    // dropped on scope exit — count it so the
+                                    // loss is observable (rx_dropped) instead
+                                    // of silent.
+                                    narf_net::iface::note_rx_drop(primary_iface_name(), 1);
                                 }
                             }
                         }
@@ -1788,6 +1790,15 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                     // round has no next take — release it here (≤1 with_at/round).
                     if let Some(b) = to_recycle.take() {
                         with_at(idx, |c| c.rx_buf_release(b));
+                    }
+                    // NAPI-complete for this pair: the RX ring drained this round,
+                    // so flush any TCP segments GRO coalesced for the frames just
+                    // delivered. Only pair/idx 0 feeds GRO (it owns the synchronous
+                    // tap into the stack), so only it needs draining. This runs on
+                    // the forwarder's own CPU — the same CPU the offers ran on — so
+                    // it drains that CPU's per-CPU coalescer. No-op when GRO is off.
+                    if idx == 0 {
+                        narf_net::tcp_stack::gro_flush();
                     }
                     // Adapt cadence: reset to fast-poll if this round drained
                     // anything (per-queue), else step toward the slow fallback.
@@ -1944,7 +1955,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
 /// the fire-and-forget tx_dma path. tx_dma takes the buffer BY VALUE
 /// and keeps it alive (in the per-pair in-flight table) until the
 /// device completes the transmit, so we must NOT drop it here.
-fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
+fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     if frame.is_empty() || frame.len() > MAX_FRAME - 12 {
         return Err(());
     }
@@ -1969,6 +1980,28 @@ fn vnet0_send_fn(frame: &[u8]) -> Result<(), ()> {
         // `tx_dma` consumed `buf` (the closure moved it in). On the
         // None branch (no controller) the closure never ran and `buf`
         // would have been dropped inside `with_controller`'s map.
+        _ => Err(()),
+    }
+}
+
+/// Zero-copy `iface::SendFrameFn` (P-F). The stack built the Ethernet frame
+/// directly into a buffer drawn from this controller's own TX pool, at the
+/// 12-byte head-room `enable_zero_copy_tx_pool` requested — exactly the layout
+/// `tx_dma` expects (body at offset 12, header space in front). So hand the
+/// buffer straight to the fire-and-forget `tx_dma` with no copy; the TX reaper
+/// recycles it back into the shared pool on completion. Replaces the
+/// slice-into-`buf[12..]` memcpy `vnet0_send_fn` does.
+fn vnet0_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Result<(), ()> {
+    let len = frame.len() as usize;
+    if len == 0 || len > MAX_FRAME - 12 {
+        return Err(());
+    }
+    // `tx_acquire` built this via `Frame::with_offset(buf, 12, len)`, so the
+    // body is at `buf[12..12 + len]` and `buf[0..12]` is the header space.
+    // Discard the offset/len view and give `tx_dma` the whole buffer.
+    let (buf, _off, _len) = frame.into_parts_with_offset();
+    match with_controller(|c| c.tx_dma(buf, len as u32)) {
+        Some(Ok(())) => Ok(()),
         _ => Err(()),
     }
 }

@@ -369,7 +369,7 @@ static CAPTURED: IrqSafeSpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>> =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 static REJECT_SEND: AtomicBool = AtomicBool::new(false);
 
-fn capture_send(frame: &[u8]) -> Result<(), ()> {
+fn capture_send(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     CAPTURED.lock().push(frame.to_vec());
     if REJECT_SEND.load(Ordering::Acquire) {
         Err(())

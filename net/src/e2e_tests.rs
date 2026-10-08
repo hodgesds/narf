@@ -68,7 +68,7 @@ use crate::udp_sock::{
 
 static TX_CAPTURE: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
 
-fn capture_send(frame: &[u8]) -> Result<(), ()> {
+fn capture_send(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     TX_CAPTURE.lock().push(frame.to_vec());
     Ok(())
 }
@@ -1449,7 +1449,7 @@ fn smoke_e2e_iface_unregister_cleanup() -> TestResult {
     // In production, a real `unregister` fn would call `retain`.
     // Since only the test suite needs this, we directly verify the
     // `register` idempotency (re-register with same name, different MAC).
-    iface::register(IFACE, [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01], |_| Ok(()));
+    iface::register(IFACE, [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01], |_, _| Ok(()));
 
     // After re-register with same name: only one entry should exist for IFACE.
     let counters_after = iface::snapshot_counters();
@@ -1490,7 +1490,7 @@ kernel_test_in!("net/e2e", smoke_e2e_iface_unregister_cleanup);
 /// frame went through capture_send instead.
 static PRIMARY_TX_COUNT: IrqSafeSpinLock<usize> = IrqSafeSpinLock::new(0);
 
-fn primary_send(_frame: &[u8]) -> Result<(), ()> {
+fn primary_send(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     *PRIMARY_TX_COUNT.lock() += 1;
     Ok(())
 }

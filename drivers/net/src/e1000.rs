@@ -292,6 +292,9 @@ const REG_IMS: u64 = 0x00D0;
 const REG_IMC: u64 = 0x00D8;
 const REG_RCTL: u64 = 0x0100;
 const REG_TCTL: u64 = 0x0400;
+/// Missed Packets Count — RX frames dropped for want of a descriptor
+/// (receive-FIFO overrun). Clears on read. 8254x SDM §13.
+const REG_MPC: u64 = 0x4010;
 const REG_RDBAL: u64 = 0x2800;
 const REG_RDBAH: u64 = 0x2804;
 const REG_RDLEN: u64 = 0x2808;
@@ -1331,6 +1334,58 @@ impl E1000 {
         Ok(slot)
     }
 
+    /// Zero-copy transmit (P-F): post a TX descriptor pointing straight at
+    /// `buf_phys` (the DMA address of a buffer the stack built the frame into)
+    /// and poll DD, with NO copy into a per-slot buffer — unlike [`Self::tx`],
+    /// which copies the caller's slice. The caller owns the backing buffer and
+    /// must keep it alive until this returns (it does: the call is
+    /// synchronous). Same 250 ms DD budget and lock discipline as `tx`.
+    pub fn tx_dma_frame(&self, buf_phys: u64, len: usize) -> Result<(), E1000Error> {
+        if len == 0 || len > 1518 {
+            return Err(E1000Error::FrameTooLong);
+        }
+        let mut tail_g = self.tx_tail.lock();
+        let slot = (*tail_g) as usize % TX_RING_LEN;
+        let ring_phys = self.tx_ring.dma_addr().raw();
+        let desc_addr = ring_phys + (slot * 16) as u64;
+        let desc = TxDesc {
+            addr: buf_phys,
+            length: len as u16,
+            cso: 0,
+            cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
+            status: 0,
+            css: 0,
+            special: 0,
+        };
+        // SAFETY: identity-mapped DMA ring page; slot < TX_RING_LEN.
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
+                desc,
+            );
+        }
+        let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_TDT, next_tail);
+        }
+        *tail_g = next_tail;
+        drop(tail_g);
+
+        // Poll for DD (same budget as `tx`); the device reads `buf_phys`
+        // directly during this window.
+        let done = narf_scheduler::responsive_spin_until(
+            // SAFETY: coherent DMA via the kernel direct map.
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u8>()) } & TXD_STAT_DD != 0,
+            narf_time::Deadline::after_ms(250),
+        );
+        if !done {
+            return Err(E1000Error::TxTimeout);
+        }
+        Ok(())
+    }
+
     /// Drain one received frame from the RX ring, copying it into
     /// `out` and returning the number of bytes. Returns 0 if no
     /// frame is currently pending. After consuming, the descriptor
@@ -1392,6 +1447,65 @@ impl E1000 {
         len
     }
 
+    /// Process one received frame **in place** from its RX DMA page — zero
+    /// copy — then re-arm the descriptor. The device has set DD (it is done
+    /// writing the page) and we re-arm the slot only after `f` returns, so
+    /// processing can never race a device write: because e1000's RX is
+    /// synchronous no replacement buffer is needed (unlike virtio, which must
+    /// swap in a fresh buffer before handing the filled one upward). This is
+    /// the P-F zero-copy RX path; it replaces the per-frame byte copy `rx_recv`
+    /// does into a scratch buffer. Returns `true` iff a frame was processed.
+    pub fn rx_recv_in_place<F: FnMut(&mut [u8])>(&self, mut f: F) -> bool {
+        let mut head_g = self.rx_head.lock();
+        let head = (*head_g) as usize;
+        let ring_phys = self.rx_ring.dma_addr().raw();
+        let desc_addr = ring_phys + (head * 16) as u64;
+        // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
+        let desc = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
+        };
+        if desc.status & RXD_STAT_DD == 0 {
+            return false;
+        }
+        let len = (desc.length as usize).min(RX_BUF_LEN);
+        // Descriptor `head` is backed by `rx_pool[head]` at probe and re-armed
+        // in place (the buffer address never changes), so the pairing is stable
+        // for the device's lifetime. Hand the stack a mutable slice straight
+        // into that identity-mapped page.
+        // SAFETY: the page is device-filled (DD set) and not concurrently
+        // written (we re-arm only after `f` returns); it is identity-mapped and
+        // `len <= RX_BUF_LEN <= page size`, so the slice stays within the
+        // buffer. An XDP rewrite in `f` writes the page we own until re-arm.
+        let frame = unsafe {
+            core::slice::from_raw_parts_mut(self.rx_pool[head].cpu_mut_ptr_at::<u8>(0), len)
+        };
+        f(frame);
+        // Re-arm the descriptor: clear status, keep the same buffer address.
+        let new_desc = RxDesc {
+            addr: desc.addr,
+            length: 0,
+            csum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        // SAFETY: identity-mapped DMA ring.
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                new_desc,
+            );
+        }
+        let new_head = ((head + 1) % RX_RING_LEN) as u32;
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(REG_RDT, head as u32);
+        }
+        *head_g = new_head;
+        true
+    }
+
     /// `true` if at least one RX descriptor has its DD bit set.
     /// Cheaper than `rx_recv` when callers want to poll without
     /// consuming.
@@ -1416,6 +1530,15 @@ impl E1000 {
     pub fn read_status(&self) -> u32 {
         // SAFETY: identity-mapped MMIO.
         unsafe { self.mmio.read32(REG_STATUS) }
+    }
+
+    /// Read + clear the Missed Packets Count — frames the MAC dropped because
+    /// no RX descriptor was available (receive-FIFO overrun). e1000 statistics
+    /// registers clear on read, so each call returns the count accumulated
+    /// since the previous read.
+    pub fn read_mpc(&self) -> u32 {
+        // SAFETY: MPC (0x4010) is within the mapped BAR0 register window.
+        unsafe { self.mmio.read32(REG_MPC) }
     }
 
     /// Read IMS (Interrupt Mask Set/Read, 8254x SDM §13.4.20). A
@@ -1489,6 +1612,11 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     narf_net::iface::set_link_metadata(&name, carrier, speed_mbps, duplex);
     *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
     narf_net::iface::install_rx_drain(rx_pump_step);
+    // Opt into zero-copy TX (P-F): the stack builds egress frames straight into
+    // a pooled DMA buffer and hands it to `e1000_send_frame_zc`, which DMAs it
+    // without the per-frame slice copy `e1000_send_frame` does. 2 KiB buffers
+    // (max Ethernet frame 1518 < 2048); a TX-ring-deep recycling pool.
+    narf_net::iface::enable_zero_copy_tx(e1000_ifname(), e1000_send_frame_zc, 2048, TX_RING_LEN);
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -1551,8 +1679,14 @@ async fn e1000_rx_pump(device: Arc<E1000>, mut rx_prod: Producer<Frame, RX_RING_
             // Recently active: tight re-poll for low RX latency.
             narf_scheduler::yield_now().await;
         } else {
-            // Idle: park ~1 ms on the timer wheel so the executor can
-            // halt instead of spinning this empty poll every round.
+            // Idle: fold any receive-FIFO overruns accumulated during the
+            // prior burst into the interface counters (MPC is clear-on-read)
+            // so the loss is observable, then park ~1 ms on the timer wheel
+            // so the executor can halt instead of spinning this empty poll.
+            let missed = device.read_mpc();
+            if missed > 0 {
+                narf_net::iface::note_rx_overrun(e1000_ifname(), missed as u64);
+            }
             narf_time::sleep_cycles(idle_park_cycles).await;
         }
     }
@@ -1566,7 +1700,7 @@ async fn e1000_tx_pump(device: Arc<E1000>, mut tx_cons: Consumer<Frame, TX_RING_
 
 /// SendFn registered with `narf_net::iface` at probe time. Routes
 /// the kernel-side TCP stack's outbound frames through E1000::tx.
-fn e1000_send_frame(frame: &[u8]) -> Result<(), ()> {
+fn e1000_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     // Clone the Arc out rather than holding the IRQ-masking CONTROLLER
     // lock across `tx`, which busy-polls the DD bit for up to 250 ms.
     // Holding it here masked interrupts on this CPU for the whole
@@ -1577,30 +1711,43 @@ fn e1000_send_frame(frame: &[u8]) -> Result<(), ()> {
     ctrl.tx(frame).map_err(|_| ())
 }
 
+/// Zero-copy `SendFrameFn` (P-F): the stack built this frame directly into a
+/// DMA buffer from the iface TX pool, so DMA it straight from that buffer with
+/// no copy, then recycle the buffer back to the pool. e1000 TX is synchronous
+/// (`tx_dma_frame` polls DD before returning), so the device is done reading
+/// the buffer the moment the call returns — the recycle is safe immediately,
+/// on both success and failure.
+fn e1000_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Result<(), ()> {
+    // `Frame::new` built it at offset 0, so `into_parts` gives the payload at
+    // the buffer origin — exactly what the device DMAs.
+    let (buf, len) = frame.into_parts();
+    let phys = buf.dma_addr().raw();
+    let result = match probed_controller() {
+        Some(c) => c.tx_dma_frame(phys, len as usize).map_err(|_| ()),
+        None => Err(()),
+    };
+    narf_net::iface::tx_release(e1000_ifname(), buf);
+    result
+}
+
 /// Drain one frame from the RX ring + dispatch it through the
 /// network stack's RX handler. Returns true iff a frame was
 /// processed. Called from a kernel-side polling task spawned at
 /// boot.
 pub fn rx_pump_step() -> bool {
-    let mut buf = [0u8; 1600];
-    // Same shape as `e1000_send_frame`: don't hold CONTROLLER across the
-    // ring drain, or a TX stuck in its 250 ms DD poll under the same
-    // lock stalls RX (and vice versa) with interrupts masked. `rx_recv`
-    // serializes against other RX consumers on the controller's own
-    // `rx_head` lock.
-    let n = match probed_controller() {
-        Some(c) => c.rx_recv(&mut buf),
-        None => 0,
-    };
-    if n == 0 {
-        return false;
+    // Zero-copy: dispatch the frame straight out of its RX DMA page rather than
+    // copying it into a scratch buffer first (P-F). Same lock discipline as
+    // `e1000_send_frame` — `rx_recv_in_place` holds only the controller's
+    // `rx_head` lock across the synchronous stack dispatch, never CONTROLLER,
+    // so a TX stuck in its 250 ms DD poll cannot stall RX. An attached XDP
+    // program rewriting header bytes writes the DMA page directly, which the
+    // driver owns until it re-arms the slot after dispatch returns.
+    match probed_controller() {
+        Some(c) => c.rx_recv_in_place(|frame| {
+            narf_net::iface::on_rx_frame_from(e1000_ifname(), frame);
+        }),
+        None => false,
     }
-    // `&mut`: an attached XDP program may rewrite header bytes in place. `buf`
-    // is this function's own stack scratch buffer holding a copy of the RX
-    // descriptor's payload, so mutating it before the stack parses it out is
-    // sound and never touches the live DMA ring.
-    narf_net::iface::on_rx_frame_from(e1000_ifname(), &mut buf[..n]);
-    true
 }
 
 /// Every Intel device id this driver claims. Kept as a single

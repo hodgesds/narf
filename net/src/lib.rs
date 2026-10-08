@@ -67,10 +67,14 @@ pub fn release_network_namespace(net_ns_id: u64) {
 
 pub mod arp;
 pub mod arp_cache;
+#[cfg(any(test, feature = "kernel-test"))]
+mod bench;
 pub mod bypass;
 pub mod cbpf;
 pub mod dhcp;
 pub mod dns;
+pub mod gro;
+pub mod gso;
 pub mod http;
 pub mod http2;
 pub mod icmp_sock;
@@ -82,6 +86,7 @@ pub mod ipv4;
 pub mod ipv6;
 pub mod ipv6_stack;
 pub mod mqtt;
+pub mod napi;
 pub mod netfilter;
 pub mod netlink_audit;
 pub mod netlink_diag;
@@ -108,6 +113,7 @@ pub mod raw_sock;
 pub mod readiness;
 pub mod resolv_conf;
 pub mod route;
+pub mod rss;
 pub mod stack;
 pub mod stun;
 pub mod tcp;
@@ -121,13 +127,23 @@ pub use stack::{
     AdminIpv6Route, AttachError, StackAttach, StackAttachReply, StackDaemon,
 };
 
+// In-kernel test suites: compiled only under the `kernel-test` feature (or
+// host `cfg(test)`), so production kernels carry no test code.
+#[cfg(any(test, feature = "kernel-test"))]
 mod dhcp_dns_e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod errno_linux_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod ipv6_e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod protocol_coverage_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tcp_e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tcp_timer_e2e_tests;
+#[cfg(any(test, feature = "kernel-test"))]
 mod tests;
 
 use alloc::boxed::Box;
@@ -147,10 +163,16 @@ use narf_lib::sync::IrqSafeSpinLock;
 // virtio-net's typical default split. `pub const` so tests and the
 // Stage-4 virtio binding can refer to the same number.
 
-/// RX ring depth (inbound frames from interface to consumer).
-pub const RX_RING_N: usize = 64;
-/// TX ring depth (outbound frames from consumer to interface).
-pub const TX_RING_N: usize = 64;
+/// RX ring depth (inbound frames from interface to consumer). Deep enough to
+/// absorb a 10G+ burst between NAPI poll rounds without the driver→stack
+/// handoff becoming the drop point (a 64-deep ring overflowed under any
+/// sustained RX). The ring is heap-constructed (see `narf_ipc::channel`), so a
+/// deep ring costs only ~48 KB of heap per interface, not stack. Must stay a
+/// power of two.
+pub const RX_RING_N: usize = 1024;
+/// TX ring depth (outbound frames from consumer to interface). Matched to
+/// [`RX_RING_N`] so a bursty sender isn't throttled by a shallow TX ring.
+pub const TX_RING_N: usize = 1024;
 
 // ── Frame ───────────────────────────────────────────────────────────
 
@@ -375,6 +397,34 @@ pub trait Interface: Send + Sync {
     /// TX producer half. Caller `lock().take()`s the producer to push
     /// outbound frames.
     fn tx_ring(&self) -> &IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>;
+
+    // ── Multi-queue + RSS (first-class; single-queue by default) ─────
+    //
+    // Every accessor defaults to the single-queue case, so a driver that does
+    // not do multi-queue is unchanged. A device that spreads flows across RX
+    // queues overrides `num_rx_queues` + `rss` (so the stack steers TX to the
+    // same queue a flow's RX hashes to) and `queue_affinity` (so one NAPI
+    // poller per queue pins to the queue's core — the flow stays L1/L2-local,
+    // no cross-core bouncing or reordering).
+
+    /// Number of RX queues the device exposes. 1 ⇒ no multi-queue.
+    fn num_rx_queues(&self) -> u16 {
+        1
+    }
+    /// Number of TX queues. 1 ⇒ no multi-queue.
+    fn num_tx_queues(&self) -> u16 {
+        1
+    }
+    /// RSS configuration (Toeplitz key + indirection table) when the device
+    /// steers flows across RX queues; `None` for a single-queue device.
+    fn rss(&self) -> Option<crate::rss::RssConfig> {
+        None
+    }
+    /// Preferred CPU / IRQ binding for queue `q`. Default binds every queue to
+    /// the boot CPU with no dedicated vector (the single-queue case).
+    fn queue_affinity(&self, _q: u16) -> crate::rss::QueueAffinity {
+        crate::rss::QueueAffinity::default()
+    }
 }
 
 // ── Registry ────────────────────────────────────────────────────────
@@ -870,6 +920,12 @@ pub struct RxMeta {
     /// `true` if the hardware verified the L4 (TCP/UDP) checksum
     /// and found it valid.
     pub csum_l4: bool,
+    /// Number of wire segments coalesced into this frame by GRO (software) or
+    /// LRO (hardware). 0 or 1 means the frame was not coalesced.
+    pub gro_segs: u16,
+    /// Flow hash the device (RSS) or software computed over the 4-tuple, for
+    /// queue steering. 0 = none provided.
+    pub rx_hash: u32,
 }
 
 /// Capabilities of the frame-ring offload path, not just the underlying silicon.

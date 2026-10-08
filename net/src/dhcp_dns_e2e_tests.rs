@@ -82,7 +82,7 @@ use crate::route;
 
 static DHCP_DNS_TX: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
 
-fn dhcp_dns_capture(frame: &[u8]) -> Result<(), ()> {
+fn dhcp_dns_capture(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     DHCP_DNS_TX.lock().push(frame.to_vec());
     Ok(())
 }

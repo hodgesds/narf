@@ -245,7 +245,7 @@ pub unsafe fn bring_up(device: &BusDevice) -> Result<RtlwifiDevice, ProbeError> 
     })
 }
 
-pub fn send_frame_unimpl(_frame: &[u8]) -> Result<(), ()> {
+pub fn send_frame_unimpl(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     Err(())
 }
 

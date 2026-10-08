@@ -278,7 +278,34 @@ impl<T, const N: usize> Drop for Ring<T, N> {
 
 /// Allocate a fresh ring and split it into a `(Producer, Consumer)` pair.
 pub fn channel<T: Send + 'static + Retag, const N: usize>() -> (Producer<T, N>, Consumer<T, N>) {
-    let ring = Arc::new(Ring::<T, N>::new());
+    // Build the ring directly in its heap allocation. Constructing
+    // `Ring::<T, N>::new()` by value would materialise the entire
+    // `[MaybeUninit<T>; N]` slot array as a stack temporary before the move
+    // into `Arc`, which overflows a kernel stack for deep rings (a 1024-slot
+    // Frame ring is ~48 KB). The slot array needs no initialisation (it is
+    // `MaybeUninit`), so we allocate uninitialised and write only the header
+    // fields in place.
+    let () = Ring::<T, N>::POW2_GUARD;
+    let mut arc: Arc<MaybeUninit<Ring<T, N>>> = Arc::new_uninit();
+    // SAFETY: a freshly-created `Arc::new_uninit` is uniquely owned, so
+    // `get_mut` yields the sole mutable reference to the allocation.
+    let slot = Arc::get_mut(&mut arc).expect("fresh Arc<_> is unique");
+    let ptr = slot.as_mut_ptr();
+    // SAFETY: `ptr` addresses allocated-but-uninitialised storage for a
+    // `Ring<T, N>`. We initialise every header field exactly once via
+    // `addr_of_mut` (no read of the uninitialised old value), and leave the
+    // `slots` field as `MaybeUninit`, which is its valid uninitialised state
+    // (producers populate individual slots before publishing them).
+    unsafe {
+        core::ptr::addr_of_mut!((*ptr).head).write(Align64(AtomicU64::new(0)));
+        core::ptr::addr_of_mut!((*ptr).tail).write(Align64(AtomicU64::new(0)));
+        core::ptr::addr_of_mut!((*ptr).closed).write(AtomicBool::new(false));
+        core::ptr::addr_of_mut!((*ptr).producer_waker).write(SpinLock::new(None));
+        core::ptr::addr_of_mut!((*ptr).consumer_waker).write(IrqSafeSpinLock::new(None));
+    }
+    // SAFETY: all header fields are initialised above and `slots` is a
+    // `MaybeUninit` array that requires none; the ring is fully initialised.
+    let ring: Arc<Ring<T, N>> = unsafe { arc.assume_init() };
     (
         Producer {
             ring: ring.clone(),

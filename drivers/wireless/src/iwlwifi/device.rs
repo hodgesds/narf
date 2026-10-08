@@ -815,7 +815,7 @@ impl WirelessNetIface for Device {
 // owner alive; the PCI function remains bound until kernel shutdown.
 static ACTIVE: IrqSafeSpinLock<Option<Arc<Device>>> = IrqSafeSpinLock::new(None);
 
-fn send_frame(bytes: &[u8]) -> Result<(), ()> {
+fn send_frame(bytes: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     let device = ACTIVE.lock().clone().ok_or(())?;
     if !device.link_up() {
         return Err(());

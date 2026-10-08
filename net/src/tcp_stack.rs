@@ -281,17 +281,106 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
     {
         crate::raw_sock::netif_receive(&dev, frame);
     }
+
+    // Software GRO coalesces in-order TCP segments into one large frame before
+    // L3 dispatch, cutting per-segment stack work on the receive side. It holds
+    // state across frames, so two paths bypass it and dispatch inline — a
+    // byte-for-byte match for the pre-GRO code:
+    //   * loopback, which has no poll loop to flush held flows; and
+    //   * the disabled default (GRO stays opt-in until exercised on real
+    //     multi-queue hardware).
+    // Linux ref: `napi_gro_receive` sits exactly here — after the `packet_rcv`
+    // AF_PACKET taps and before the protocol handlers.
+    if gro_rx::enabled() && iface_name != "lo" {
+        gro_rx::offer(iface_name, net_ns_id, frame);
+    } else {
+        dispatch_l3(_iface_name, net_ns_id, frame);
+    }
+}
+
+/// Parse L2 and hand the frame to the ARP or IPv4 protocol handler. Split out
+/// of `rx_handler` so the GRO path can dispatch a coalesced frame through the
+/// identical sequence.
+fn dispatch_l3(iface_name: Option<&str>, net_ns_id: u64, frame: &[u8]) {
     let (eth, body) = match parse_eth_header(frame) {
         Some(t) => t,
         None => return,
     };
     match eth.ethertype {
-        ETHERTYPE_ARP => handle_arp_on_in(body, net_ns_id, _iface_name),
+        ETHERTYPE_ARP => handle_arp_on_in(body, net_ns_id, iface_name),
         ETHERTYPE_IPV4 => {
-            handle_ipv4(body, net_ns_id, _iface_name.unwrap_or(""));
+            handle_ipv4(body, net_ns_id, iface_name.unwrap_or(""));
         }
         _ => {}
     }
+}
+
+/// Per-CPU software GRO (receive-side coalescing). Off by default; enabling
+/// changes what the protocol stack observes, so it is opt-in until exercised
+/// on real multi-queue hardware. One coalescer per CPU keeps the receive flow
+/// of data L1/L2-local and lock-free across cores; the per-CPU lock guards
+/// against a mid-poll task migration or a nested RX only.
+mod gro_rx {
+    use super::{dispatch_l3, iface, IrqSafeSpinLock};
+    use crate::gro::Gro;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    const MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
+    static TABLES: [IrqSafeSpinLock<Gro>; MAX_CPUS] =
+        [const { IrqSafeSpinLock::new(Gro::new()) }; MAX_CPUS];
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    fn cpu() -> usize {
+        narf_lib::percpu::current_cpu().min(MAX_CPUS - 1)
+    }
+
+    pub fn set_enabled(on: bool) {
+        ENABLED.store(on, Ordering::Relaxed);
+    }
+
+    pub fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Offer one received frame to this CPU's coalescer and dispatch whatever
+    /// it releases now (0 when the frame was merged/held, 1–2 on a flush). The
+    /// lock is dropped before dispatch so the protocol handlers never run under
+    /// it. Released frames all carry the ingress iface they were offered under,
+    /// so the current `net_ns_id` applies to every one.
+    pub fn offer(iface_name: &str, net_ns_id: u64, frame: &[u8]) {
+        let released = TABLES[cpu()].lock().offer(iface_name, frame.to_vec());
+        for (_tag, f) in released {
+            dispatch_l3(Some(iface_name), net_ns_id, &f);
+        }
+    }
+
+    /// Drain every held flow on this CPU (NAPI-complete / RX-pump park). Each
+    /// frame is re-resolved to its own ingress iface's namespace since a drain
+    /// can span flows from several ifaces handled on this core.
+    pub fn flush() {
+        let drained = TABLES[cpu()].lock().flush();
+        for (tag, f) in drained {
+            let net_ns_id = iface::lookup(&tag).map_or(0, |e| e.net_ns_id);
+            dispatch_l3(Some(&tag), net_ns_id, &f);
+        }
+    }
+}
+
+/// Enable or disable software GRO (receive coalescing). Off by default.
+pub fn set_gro(on: bool) {
+    gro_rx::set_enabled(on);
+}
+
+/// Whether software GRO is currently enabled.
+pub fn gro_enabled() -> bool {
+    gro_rx::enabled()
+}
+
+/// Flush this CPU's held GRO flows. Drivers call this at NAPI-complete / when
+/// the RX pump parks, so coalesced data is never stranded waiting for the next
+/// segment that may not arrive.
+pub fn gro_flush() {
+    gro_rx::flush();
 }
 
 /// ARP handler with optional ingress-iface context. When `iface_name`

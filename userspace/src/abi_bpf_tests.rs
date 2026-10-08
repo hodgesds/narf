@@ -5380,7 +5380,7 @@ fn smoke_bpf_syscall_link_close_detaches_xdp() -> TestResult {
         // A NIC of this test's own. `iface::register` de-dups by name, so a
         // re-run replaces rather than accumulating.
         const IFACE: &str = "bpf-abi-xdp0";
-        fn discard(_frame: &[u8]) -> Result<(), ()> {
+        fn discard(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
             Ok(())
         }
         narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0xB9, 1], discard);
@@ -6273,7 +6273,7 @@ kernel_test_in!("bpf", smoke_bpf_syscall_link_by_id_still_detaches);
 fn smoke_bpf_syscall_link_info_xdp() -> TestResult {
     with_setup(|| {
         const IFACE: &str = "bpf-abi-xdp1";
-        fn discard(_frame: &[u8]) -> Result<(), ()> {
+        fn discard(_frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
             Ok(())
         }
         narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0xB9, 2], discard);

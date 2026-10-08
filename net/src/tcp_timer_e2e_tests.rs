@@ -80,7 +80,7 @@ use crate::tcp::state_machine::{Shutdown, TcpState};
 
 static TIMER_TX_CAPTURE: IrqSafeSpinLock<Vec<Vec<u8>>> = IrqSafeSpinLock::new(Vec::new());
 
-fn timer_capture_send(frame: &[u8]) -> Result<(), ()> {
+fn timer_capture_send(frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
     TIMER_TX_CAPTURE.lock().push(frame.to_vec());
     Ok(())
 }
