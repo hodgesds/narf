@@ -589,6 +589,62 @@ impl Ixgbe {
         Ok(())
     }
 
+    /// Zero-copy transmit (P-F): post the TX descriptor pointing straight at
+    /// the `Frame`'s own DMA buffer — no copy into a per-slot buffer, unlike
+    /// [`Self::tx`]. The stack built the frame into that buffer, so DMA it in
+    /// place. Honors the frame's `TxMeta` (TSO / checksum offload). ixgbe TX is
+    /// synchronous (polls DD), so the device is done the moment this returns
+    /// and the caller may drop or recycle the buffer immediately.
+    pub fn tx_frame(&self, frame: &Frame) -> Result<(), IxgbeError> {
+        let len = frame.len() as usize;
+        if len == 0 || len > 1518 {
+            return Err(IxgbeError::FrameTooLong);
+        }
+        let phys = frame.buf().dma_addr_at(frame.offset() as u64).raw();
+        let meta = frame.tx_meta();
+        let mut tail_g = self.tx_tail.lock();
+        let slot = (*tail_g) as usize % TX_RING_LEN;
+        let ring_phys = self.tx_ring.dma_addr().raw();
+        let desc_addr = ring_phys + (slot * 16) as u64;
+        let desc = if let Some(mss) = meta.tso_mss {
+            AdvTxDesc::with_tso(phys, len as u16, mss)
+        } else if meta.csum_l4.is_some() {
+            AdvTxDesc::with_csum(phys, len as u16)
+        } else {
+            AdvTxDesc {
+                addr: phys,
+                cmd_type_len: AdvTxDesc::ctrl_word(len as u16),
+                olinfo: (len as u32) << 14,
+            }
+        };
+        // SAFETY: identity-mapped DMA ring.
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvTxDesc>(),
+                desc,
+            );
+        }
+        let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO.
+        unsafe {
+            self.mmio.write32(TX_TDT, next_tail);
+        }
+        *tail_g = next_tail;
+        drop(tail_g);
+
+        // Poll DD; the device reads the frame's buffer directly in this window.
+        let done = narf_scheduler::responsive_spin_until(
+            // SAFETY: identity-mapped DMA.
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u32>()) } & ADVTXD_STAT_DD != 0,
+            narf_time::Deadline::after_ms(250),
+        );
+        if !done {
+            return Err(IxgbeError::TxTimeout);
+        }
+        Ok(())
+    }
+
     /// Drain one RX frame into `out`. Returns 0 if nothing pending.
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
         let mut head_g = self.rx_head.lock();
@@ -949,8 +1005,11 @@ async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_
 }
 
 async fn ixgbe_tx_pump(device: Arc<Ixgbe>, mut tx_cons: Consumer<Frame, TX_RING_N>) {
+    // Zero-copy (P-F): DMA each frame straight out of its own buffer and honor
+    // the TxMeta the stack set, instead of copying the payload into a per-slot
+    // buffer and forcing plain metadata.
     while let Ok(frame) = tx_cons.recv().await {
-        let _ = device.tx(frame.payload(), &TxMeta::plain());
+        let _ = device.tx_frame(&frame);
     }
 }
 
