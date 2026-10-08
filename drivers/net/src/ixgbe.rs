@@ -311,11 +311,11 @@ pub struct Ixgbe {
     /// on return). Indexed by descriptor slot.
     pub(crate) tx_pool: Vec<DmaBuffer>,
     pub(crate) rx_ring: DmaBuffer,
-    /// Held to keep the per-descriptor DMA buffers alive for the
-    /// lifetime of the controller; addresses live inside the RX
-    /// descriptors themselves.
-    #[allow(dead_code)]
-    pub(crate) rx_pool: Vec<DmaBuffer>,
+    /// The DMA buffer currently armed in each RX descriptor slot. Zero-copy RX
+    /// (`rx_recv_frame`) hands a filled buffer to the stack as a `Frame` and
+    /// swaps a fresh buffer into its slot, so the set rotates rather than
+    /// staying fixed — hence the lock (the RX pump mutates it).
+    pub(crate) rx_slots: IrqSafeSpinLock<Vec<DmaBuffer>>,
     pub(crate) tx_tail: IrqSafeSpinLock<u32>,
     pub(crate) rx_head: IrqSafeSpinLock<u32>,
     /// MAC read from the EEPROM at bring-up.
@@ -506,7 +506,7 @@ impl Ixgbe {
             tx_ring,
             tx_pool,
             rx_ring,
-            rx_pool,
+            rx_slots: IrqSafeSpinLock::new(rx_pool),
             tx_tail: IrqSafeSpinLock::new(0),
             rx_head: IrqSafeSpinLock::new(0),
             mac,
@@ -695,6 +695,59 @@ impl Ixgbe {
         *head_g = new_head;
         let _ = RXD_STAT_EOP;
         len
+    }
+
+    /// Zero-copy receive (P-F): hand the descriptor's own DMA buffer to the
+    /// stack as a `Frame` and swap a fresh buffer into its slot — no copy into
+    /// a scratch buffer and then into a freshly-allocated frame, unlike the
+    /// pump's old `rx_recv` + `Frame::new` + `copy_from_slice`. Returns `None`
+    /// when no frame is pending, or when the refill allocation fails — in which
+    /// case the received frame is left in its descriptor (head not advanced) to
+    /// be retried, rather than dropped with no buffer to replace it.
+    pub fn rx_recv_frame(&self) -> Option<Frame> {
+        let mut head_g = self.rx_head.lock();
+        let head = (*head_g) as usize;
+        let ring_phys = self.rx_ring.dma_addr().raw();
+        let desc_addr = ring_phys + (head * 16) as u64;
+        // SAFETY: identity-mapped DMA ring.
+        let desc = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
+        };
+        if desc.status & RXD_STAT_DD == 0 {
+            return None;
+        }
+        let len = (desc.length as usize).min(RX_BUF_LEN);
+        // Refill before handing the filled buffer up, so the device never sees
+        // an empty slot. On allocation failure, bail without advancing — the
+        // frame stays in the ring for the next poll.
+        let replacement = alloc_coherent(4096, DomainId::DRIVER_0).ok()?;
+        let repl_phys = replacement.dma_addr().raw();
+        let filled = {
+            let mut slots = self.rx_slots.lock();
+            core::mem::replace(&mut slots[head], replacement)
+        };
+        let new_desc = RxDesc {
+            addr: repl_phys,
+            length: 0,
+            csum: 0,
+            status: 0,
+            errors: 0,
+            special: 0,
+        };
+        // SAFETY: identity-mapped DMA ring.
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                new_desc,
+            );
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: MMIO.
+        unsafe {
+            self.mmio.write32(RX_RDT, head as u32);
+        }
+        *head_g = ((head + 1) % RX_RING_LEN) as u32;
+        Some(Frame::new(filled, len as u32))
     }
 
     pub fn rx_has_pending(&self) -> bool {
@@ -991,16 +1044,16 @@ fn spawn_pumps(
 }
 
 async fn ixgbe_rx_pump(device: Arc<Ixgbe>, mut rx_prod: Producer<Frame, RX_RING_N>) {
-    let mut buf = [0u8; 2048];
+    // Zero-copy (P-F): take the device-filled DMA buffer straight out of the RX
+    // descriptor as a Frame (refilling the slot), with no copy through a scratch
+    // buffer + freshly-allocated frame.
     loop {
-        let n = device.rx_recv(&mut buf);
-        if n > 0 {
-            let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
-            let mut frame = Frame::new(dma_buf, n as u32);
-            frame.payload_mut().copy_from_slice(&buf[..n]);
-            let _ = rx_prod.send(frame).await;
+        match device.rx_recv_frame() {
+            Some(frame) => {
+                let _ = rx_prod.send(frame).await;
+            }
+            None => narf_scheduler::yield_now().await,
         }
-        narf_scheduler::yield_now().await;
     }
 }
 
