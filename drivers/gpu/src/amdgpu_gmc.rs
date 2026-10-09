@@ -185,6 +185,16 @@ pub const MC_VM_AGP_TOP: u32 = 0x0000_0982;
 pub const MC_VM_AGP_BOT: u32 = 0x0000_0983;
 /// `mmMC_VM_AGP_BASE` (0x0984) — GFX9.
 pub const MC_VM_AGP_BASE: u32 = 0x0000_0984;
+/// `regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR` (0x167d) — GFX11 / Phoenix, GC
+/// BASE_IDX 0.
+///
+/// A different register from GFX9's `mmMC_VM_SYSTEM_APERTURE_LOW_ADDR`, the
+/// same way `GCMC_VM_FB_LOCATION_BASE` is a different register from
+/// `MC_VM_FB_LOCATION_BASE` — not one register at two offsets.
+pub const GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11: u32 = 0x0000_167D;
+/// `regGCMC_VM_SYSTEM_APERTURE_HIGH_ADDR` (0x167e) — GFX11 / Phoenix.
+pub const GCMC_VM_SYSTEM_APERTURE_HIGH_ADDR_GFX11: u32 = 0x0000_167E;
+
 /// `mmMC_VM_SYSTEM_APERTURE_LOW_ADDR` (0x0985) — GFX9.
 pub const MC_VM_SYSTEM_APERTURE_LOW_ADDR: u32 = 0x0000_0985;
 /// `mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR` (0x0986) — GFX9.

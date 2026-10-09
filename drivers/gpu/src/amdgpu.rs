@@ -165,36 +165,45 @@ const BAR_REGS: u8 = 5;
 
 /// `MM_INDEX` — register-window address latch. Write a 32-bit
 /// register-bus address here, then access `MM_DATA`.
+/// `mmRCC_CONFIG_MEMSIZE` — the VRAM size in MiB, as an ABSOLUTE dword
+/// address with no IP base.
+///
+/// `amdgpu_discovery.c:142` defines it alongside `mmIP_DISCOVERY_VERSION` and
+/// `mmMP0_SMN_C2PMSG_33` under the comment "Note: These registers are
+/// consistent across all the SOCs" — they are the handful that must be
+/// readable before the discovery blob has been parsed and so before any IP
+/// base exists.
+pub(crate) const RCC_CONFIG_MEMSIZE: u32 = 0x0de3;
+
 const MM_INDEX: u64 = 0x0000;
 /// `MM_DATA` — register-window data port.
 const MM_DATA: u64 = 0x0004;
 
-// The framebuffer-location registers, read through MM_INDEX/MM_DATA to learn
-// the visible-VRAM range. Canonical values live in `amdgpu_gmc`; these were a
-// duplicate pair reading 0x6B0F / 0x6B10, which appear in no AMD header for
-// any `MC_VM_FB_LOCATION_BASE` variant of any generation.
+// Pre-discovery VRAM sizing. This is the most load-bearing read in the
+// driver: `vram.size` locates the IP-discovery blob at
+// `vram.size - DISCOVERY_TMR_OFFSET`, and every IP base — the firmware load,
+// the DCN bring-up, the SMU handshake — comes out of that blob.
 //
-// The old comment claimed "same offsets across Vega + Navi families". They
-// are not the same: GFX9 reads `mmMC_VM_FB_LOCATION_BASE` (0x0980) and GFX11
-// reads `regGCMC_VM_FB_LOCATION_BASE` (0x1678) — a different register, not
-// just a different offset (`gfxhub_v1_0.c` against `gfxhub_v3_0.c`).
+// It used to read framebuffer-location registers, and got three things wrong
+// in sequence. First a duplicate pair at 0x6B0F / 0x6B10, which appear in no
+// AMD header for any `MC_VM_FB_LOCATION_BASE` variant. Then the right ids for
+// the family — GFX9's `mmMC_VM_FB_LOCATION_BASE` 0x0980 and GFX11's
+// `regGCMC_VM_FB_LOCATION_BASE` 0x1678, which are different registers rather
+// than one register at two offsets (`gfxhub_v1_0.c` against `gfxhub_v3_0.c`) —
+// but still with no IP base added, because there was none to add: resolving a
+// base needs the discovery blob this read is trying to locate.
 //
-// This matters more than most of the table: `read_vram_info` feeds
-// `vram.size`, and the IP-discovery blob is read from
-// `vram.size - DISCOVERY_TMR_OFFSET`. A wrong aperture means discovery reads
-// the wrong place, which means no IP bases, which means nothing downstream
-// resolves — the firmware load, the DCN bring-up and the SMU handshake all
-// take their addresses from it.
+// That circularity was recorded as the remaining gap, and this is its answer.
+// Linux does not break the cycle, it avoids it: `amdgpu_discovery.c:142`
+// defines `mmRCC_CONFIG_MEMSIZE` as the absolute dword 0xde3, under the
+// comment "Note: These registers are consistent across all the SOCs", and
+// reads the VRAM size in MiB from it with a bare `RREG32` at line 312. The
+// aperture BASE is not a register read at all — `gmc_v11_0_mc_init` takes
+// `pci_resource_start(adev->pdev, 0)`, BAR0's physical address.
 //
-// LINUX-GAP: `mm_read` puts the value straight into MM_INDEX, so these are
-// absolute register-bus dword addresses rather than block-relative ones. The
-// header ids are block-relative (GC, BASE_IDX 0), and the GC base comes from
-// IP discovery — which cannot have run yet, since discovery needs the VRAM
-// size this function is computing. Linux avoids the circularity by taking the
-// size from elsewhere (`amdgpu_discovery_init` uses a VRAM size in MiB
-// obtained before the register bases are built). Resolving that properly is
-// the next step; what is fixed here is that the ids are now the real ones for
-// the family.
+// So `read_vram_info` needs no IP base and the FB-location registers are not
+// part of this path. They remain correct in `amdgpu_gmc` for the
+// post-discovery aperture reads that can address them properly.
 
 // ── PSP (Platform Security Processor) MP0 mailbox protocol ────────
 //
@@ -609,7 +618,8 @@ pub enum AmdgpuError {
 
 // ── Driver state ───────────────────────────────────────────────────
 
-/// VRAM aperture parameters read from MC_VM_FB_LOCATION_BASE/TOP.
+/// The CPU-visible VRAM carve-out: BAR0's base and the size
+/// `RCC_CONFIG_MEMSIZE` reports. See [`read_vram_info`].
 #[derive(Copy, Clone, Debug, Default)]
 pub struct VramInfo {
     /// Phys base of the visible VRAM aperture.
@@ -713,15 +723,12 @@ impl AmdGpu {
             return Err(AmdgpuError::DeviceGone);
         }
 
-        // Read the VRAM aperture through MM_INDEX/MM_DATA. Both
-        // base and top live in the MC IP block at register-bus
-        // offsets 0x6B0F / 0x6B10. Each value is in 24-byte-shifted
-        // units (the MC's natural granularity); the visible
-        // aperture is `[base << 24, ((top + 1) << 24))`.
+        // Size the VRAM carve-out. This runs BEFORE discovery — the discovery
+        // blob lives at the top of this aperture — so it cannot use any
+        // register that needs an IP base.
         // SAFETY: identity-mapped MMIO; MM_INDEX/MM_DATA are a
         // sequential pair with no side effects beyond the access.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let vram = unsafe { read_vram_info(&regs, chip.family) };
+        let vram = unsafe { read_vram_info(&regs, &fb_bar) };
 
         // Try to parse the on-die IP discovery table. Lives in
         // the top `DISCOVERY_TMR_OFFSET` bytes of the VRAM
@@ -945,31 +952,40 @@ impl AmdGpu {
     ///
     /// # Safety
     /// Caller owns BAR5 exclusively.
-    pub unsafe fn read_aperture_layout(&self) -> crate::amdgpu_gmc::ApertureLayout {
-        // VRAM: use the cached probe-time read so the wave doesn't
-        // re-bounce through MM_INDEX for the canonical answer.
-        // SAFETY: caller-asserted BAR5 ownership.
-        let sys_low_field = unsafe {
-            mm_read(
-                &self.regs,
+    pub unsafe fn read_aperture_layout(&self) -> Option<crate::amdgpu_gmc::ApertureLayout> {
+        // LINUX-GAP: this read GFX9's `mmMC_VM_SYSTEM_APERTURE_LOW_ADDR`
+        // (0x0985) on every family, with no IP base added. Two errors: Phoenix
+        // uses `regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR` (0x167d), a different
+        // register — and both are SOC15 registers addressed as
+        // `reg_offset[GC][0][0] + dword_id`, so a bare id names something
+        // else. Unlike `read_vram_info` this runs after discovery, so the
+        // base is available; the function returns `None` rather than reading
+        // an unbased address when it is not.
+        let (low, high) = match self.gfx_generation() {
+            crate::amdgpu_gfx::GfxGeneration::Gfx11 => (
+                crate::amdgpu_gmc::GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11,
+                crate::amdgpu_gmc::GCMC_VM_SYSTEM_APERTURE_HIGH_ADDR_GFX11,
+            ),
+            crate::amdgpu_gfx::GfxGeneration::Gfx9 => (
                 crate::amdgpu_gmc::MC_VM_SYSTEM_APERTURE_LOW_ADDR,
-            )
-        };
-        // SAFETY: same.
-        let sys_high_field = unsafe {
-            mm_read(
-                &self.regs,
                 crate::amdgpu_gmc::MC_VM_SYSTEM_APERTURE_HIGH_ADDR,
-            )
+            ),
         };
+        let base = self.ip_block_base(amdgpu_discovery::HW_ID_GC, 0)?;
+        // VRAM comes from the cached probe-time read; only the system
+        // aperture is re-read here.
+        // SAFETY: caller-asserted BAR5 ownership.
+        let sys_low_field = unsafe { mm_read(&self.regs, base + low) };
+        // SAFETY: same.
+        let sys_high_field = unsafe { mm_read(&self.regs, base + high) };
         let (sys_low, sys_high) =
             crate::amdgpu_gmc::decode_system_aperture(sys_low_field, sys_high_field);
-        crate::amdgpu_gmc::ApertureLayout {
+        Some(crate::amdgpu_gmc::ApertureLayout {
             vram_base: self.vram.base,
             vram_size: self.vram.size,
             system_low: sys_low,
             system_high: sys_high,
-        }
+        })
     }
     pub fn current_mode(&self) -> Option<Mode> {
         // If `set_mode` has run, return what it programmed.
@@ -1685,47 +1701,44 @@ pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
     }
 }
 
-/// Read the visible-VRAM aperture from the MC IP block.
+/// Size and locate the CPU-visible VRAM carve-out, before discovery has run.
 ///
-/// MC_VM_FB_LOCATION_BASE / TOP are both in 16-MiB units (low 24
-/// bits of the address are implicit zero). The visible aperture
-/// is `[base, top + 16 MiB)`.
+/// Mirrors `gmc_v11_0_mc_init` plus the pre-discovery path in
+/// `amdgpu_discovery.c`:
 ///
-/// On Phoenix / Strix iGPUs (UMA), VRAM is carved from system
-/// DRAM and the aperture covers the whole carve-out. On discrete
-/// cards, it's the GPU's local memory.
+///   * the size comes from `RCC_CONFIG_MEMSIZE`, in MiB
+///     (`adev->nbio.funcs->get_memsize(adev) * 1024 * 1024`);
+///   * the base is BAR0's physical address
+///     (`adev->gmc.aper_base = pci_resource_start(adev->pdev, 0)`).
 ///
-/// # Safety
-/// Caller owns BAR5 exclusively.
-unsafe fn read_vram_info(regs: &MmioRegion, family: Family) -> VramInfo {
-    // GFX11 uses a different register from GFX9, not merely a different
-    // offset. Picking by family, as `grbm_status_offset` already does.
-    let (base_reg, top_reg) = match family {
-        Family::Phoenix => (
-            crate::amdgpu_gmc::GCMC_VM_FB_LOCATION_BASE_GFX11,
-            crate::amdgpu_gmc::GCMC_VM_FB_LOCATION_TOP_GFX11,
-        ),
-        _ => (
-            crate::amdgpu_gmc::MC_VM_FB_LOCATION_BASE,
-            crate::amdgpu_gmc::MC_VM_FB_LOCATION_TOP,
-        ),
-    };
-    // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair.
-    let base_field = unsafe { mm_read(regs, base_reg) };
-    // SAFETY: caller-asserted exclusive ownership of BAR5 (`read_vram_info`
-    // contract); `MC_VM_FB_LOCATION_TOP` is a read-only MC aperture register
-    // accessed through the same MM_INDEX/MM_DATA latch pair.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let top_field = unsafe { mm_read(regs, top_reg) };
-    // Bits[23:0] are the FB location; high bits are reserved.
-    let base = (base_field as u64 & 0x00FF_FFFF) << 24;
-    let top = (top_field as u64 & 0x00FF_FFFF) << 24;
-    let size = if top >= base {
-        top - base + (1u64 << 24) // top is inclusive, last 16 MiB unit
-    } else {
+/// LINUX-GAP: this read `MC_VM_FB_LOCATION_BASE`/`_TOP` — 0x0980/0x0981 on
+/// GFX9, 0x1678/0x1679 on GFX11 — with **no IP base added**. Those are SOC15
+/// registers addressed as `reg_offset[IP][0][BASE_IDX] + dword_id`, so a bare
+/// 0x1678 names an unrelated register; and at this point in probe there is no
+/// base to add, because resolving one needs the discovery blob that lives at
+/// the top of the aperture this function is sizing. Linux breaks that cycle
+/// with `RREG32(mmRCC_CONFIG_MEMSIZE)` — `amdgpu_discovery.c:142` defines it
+/// as the absolute dword 0xde3 with the comment "These registers are
+/// consistent across all the SOCs", precisely because it must be readable
+/// before any IP base is known. Post-discovery the same value is
+/// `regRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE` 0x00c3 on NBIO BASE_IDX 2.
+///
+/// `VramInfo { size: 0 }` when the register reads `U32_MAX` (no device) or 0,
+/// which `amdgpu_discovery.c:314-317` treats as "TMR is in system memory" —
+/// either way there is no VRAM-resident discovery blob to find.
+unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion) -> VramInfo {
+    // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair, and this
+    // register is absolute by design (no IP base).
+    let memsize_mb = unsafe { mm_read(regs, RCC_CONFIG_MEMSIZE) };
+    let size = if memsize_mb == u32::MAX {
         0
+    } else {
+        u64::from(memsize_mb) << 20
     };
-    VramInfo { base, size }
+    VramInfo {
+        base: fb_bar.phys.raw(),
+        size,
+    }
 }
 
 /// Read the on-die IP discovery blob from the top of the VRAM

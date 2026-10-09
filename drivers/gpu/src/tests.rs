@@ -7646,6 +7646,34 @@ fn smoke_amdgpu_foundations_mc_register_offsets_stable() -> TestResult {
     if !(MC_VM_AGP_TOP < MC_VM_AGP_BOT && MC_VM_AGP_BOT < MC_VM_AGP_BASE) {
         return TestResult::Fail("the AGP registers ascend TOP, BOT, BASE");
     }
+
+    // The system aperture splits the same way: `gfxhub_v3_0.c:161-163` writes
+    // regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR 0x167d and _HIGH_ADDR 0x167e.
+    if GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11 != 0x167D
+        || GCMC_VM_SYSTEM_APERTURE_HIGH_ADDR_GFX11 != 0x167E
+    {
+        return TestResult::Fail("the GFX11 system-aperture registers are 0x167d / 0x167e");
+    }
+    if GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11 == MC_VM_SYSTEM_APERTURE_LOW_ADDR {
+        return TestResult::Fail("GFX9 and GFX11 use different system-aperture registers");
+    }
+
+    // The one register the probe path may read with no IP base:
+    // `amdgpu_discovery.c:142` defines mmRCC_CONFIG_MEMSIZE as 0xde3,
+    // absolute, because it has to be readable before any base exists.
+    if crate::amdgpu::RCC_CONFIG_MEMSIZE != 0x0DE3 {
+        return TestResult::Fail("mmRCC_CONFIG_MEMSIZE is the absolute dword 0xde3");
+    }
+    // It is not a GC-block id: every constant above is block-relative and
+    // would need `reg_offset[GC][0][0]` added, which the probe path does not
+    // have yet.
+    if crate::amdgpu::RCC_CONFIG_MEMSIZE == MC_VM_FB_LOCATION_BASE
+        || crate::amdgpu::RCC_CONFIG_MEMSIZE == GCMC_VM_FB_LOCATION_BASE_GFX11
+    {
+        return TestResult::Fail(
+            "the pre-discovery size register is not a framebuffer-location one",
+        );
+    }
     TestResult::Pass
 }
 kernel_test_in!(
