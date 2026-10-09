@@ -695,10 +695,23 @@ pub struct MesQueue {
     ring: MesRing,
     /// The ring itself, in GPU-visible sysmem.
     backing: DmaBuffer,
-    /// Writeback page: the per-command status slot, the ring fence slot and
-    /// the wptr shadow, at [`WB_STATUS_OFFSET`], [`WB_FENCE_OFFSET`] and
-    /// [`WB_WPTR_OFFSET`].
+    /// Writeback page: the per-command status slot, the ring fence slot, the
+    /// wptr shadow, and the two addresses `SET_HW_RSRC` names — at
+    /// [`WB_STATUS_OFFSET`], [`WB_FENCE_OFFSET`], [`WB_WPTR_OFFSET`],
+    /// [`WB_SCH_CTX_OFFSET`] and [`WB_QUERY_STATUS_FENCE_OFFSET`].
+    ///
+    /// The last two are in here rather than in buffers of their own because
+    /// that is what they are in Linux: `amdgpu_mes_init` takes both from
+    /// `amdgpu_wb_get`, the same allocator a ring's rptr slot comes from.
     wb: DmaBuffer,
+    /// This pipe's queue descriptor, which the firmware reads and keeps queue
+    /// state in.
+    mqd: DmaBuffer,
+    /// This pipe's end-of-pipe buffer, [`crate::amdgpu_mqd::MES_EOP_BYTES`].
+    eop: DmaBuffer,
+    /// `ring->doorbell_index`, kept so the descriptor and the HQD registers
+    /// can be derived from the queue rather than re-supplied.
+    doorbell_index: u32,
     /// Monotonic submission sequence, the value the status query waits on.
     /// `mes_v11_0_submit_pkt_and_poll_completion` uses `++ring->fence_drv
     /// .sync_seq`, so it starts at 1.
@@ -709,7 +722,18 @@ pub struct MesQueue {
 pub const WB_STATUS_OFFSET: u64 = 0;
 pub const WB_FENCE_OFFSET: u64 = crate::amdgpu_gfx::WB_SLOT_BYTES;
 pub const WB_WPTR_OFFSET: u64 = 2 * crate::amdgpu_gfx::WB_SLOT_BYTES;
-const WB_BYTES: usize = 3 * crate::amdgpu_gfx::WB_SLOT_BYTES as usize;
+/// `mes->sch_ctx_gpu_addr[pipe]` — the scheduler context `SET_HW_RSRC` names.
+/// A writeback slot, not a buffer: `amdgpu_mes_init` gets it from
+/// `amdgpu_wb_get` exactly as it gets a ring's rptr slot, so it is eight bytes
+/// at the same 32-byte spacing and lives in this page.
+pub const WB_SCH_CTX_OFFSET: u64 = 3 * crate::amdgpu_gfx::WB_SLOT_BYTES;
+/// `mes->query_status_fence_gpu_addr[pipe]`, the next `amdgpu_wb_get` after it.
+pub const WB_QUERY_STATUS_FENCE_OFFSET: u64 = 4 * crate::amdgpu_gfx::WB_SLOT_BYTES;
+/// Five slots: status, fence, wptr, scheduler context, query-status fence.
+const WB_BYTES: usize = 5 * crate::amdgpu_gfx::WB_SLOT_BYTES as usize;
+
+/// The MES pipe's queue descriptor, 512 dwords like any `v11_compute_mqd`.
+const MES_MQD_BYTES: usize = crate::amdgpu_mqd::COMPUTE_MQD_DWORDS * 4;
 
 /// Iteration cap on the fence poll. Linux allows 2100 ms
 /// (`timeout = 2100000` µs in `mes_v11_0_submit_pkt_and_poll_completion`).
@@ -734,13 +758,119 @@ impl MesQueue {
                 core::ptr::write_volatile(wb.cpu_mut_ptr_at::<u64>(offset), 0);
             }
         }
+        let mqd =
+            alloc_coherent(MES_MQD_BYTES, DomainId::DRIVER_0).map_err(|_| MesError::NoMemory)?;
+        let eop = alloc_coherent(
+            crate::amdgpu_mqd::MES_EOP_BYTES as usize,
+            DomainId::DRIVER_0,
+        )
+        .map_err(|_| MesError::NoMemory)?;
+        // Both zeroed: every descriptor field `mes_mqd_init` does not set is
+        // meant to read zero, and the firmware's first completion record
+        // should not be whatever the page held.
+        // SAFETY: identity-mapped DMA pages this queue owns.
+        unsafe {
+            for offset in (0..MES_MQD_BYTES as u64).step_by(8) {
+                core::ptr::write_volatile(mqd.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+            for offset in (0..crate::amdgpu_mqd::MES_EOP_BYTES).step_by(8) {
+                core::ptr::write_volatile(eop.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+        }
         let ring = MesRing::new(backing.dma_addr().raw(), bytes as u32, doorbell_index)?;
         Ok(Self {
             ring,
             backing,
             wb,
+            mqd,
+            eop,
+            doorbell_index,
             seq: 0,
         })
+    }
+
+    /// GPU address of this pipe's queue descriptor.
+    pub fn mqd_phys(&self) -> u64 {
+        self.mqd.dma_addr().raw()
+    }
+    /// GPU address of this pipe's end-of-pipe buffer.
+    pub fn eop_phys(&self) -> u64 {
+        self.eop.dma_addr().raw()
+    }
+    /// GPU address of the scheduler context, for `SET_HW_RSRC`.
+    pub fn sch_ctx_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_SCH_CTX_OFFSET
+    }
+    /// GPU address of the query-status fence, for `SET_HW_RSRC`.
+    pub fn query_status_fence_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_QUERY_STATUS_FENCE_OFFSET
+    }
+
+    /// One dword of the queue descriptor, by its `v11_compute_mqd` index.
+    pub fn mqd_dword(&self, index: usize) -> u32 {
+        if index >= crate::amdgpu_mqd::COMPUTE_MQD_DWORDS {
+            return 0;
+        }
+        // SAFETY: identity-mapped page this queue owns, index bounded above.
+        unsafe { core::ptr::read_volatile(self.mqd.cpu_ptr_at::<u32>((index * 4) as u64)) }
+    }
+
+    /// Build this pipe's descriptor from the queue's own addresses and write it
+    /// into the page the firmware reads.
+    ///
+    /// Derived here rather than from a passed-in [`crate::amdgpu_mqd::MqdProp`]
+    /// for the same reason [`crate::amdgpu_gfx::GfxContext::write_mqd`] is: the
+    /// ring base, the two writeback addresses, the descriptor's own address and
+    /// the doorbell appear in both the descriptor and the HQD registers, and a
+    /// caller filling them twice can fill them differently.
+    pub fn write_mqd(&self) -> Result<(), MesError> {
+        let prop = crate::amdgpu_mqd::MqdProp {
+            mqd_gpu_addr: self.mqd_phys(),
+            hqd_base_gpu_addr: self.ring_phys(),
+            // The MES reports its read pointer into the status slot's page and
+            // polls the wptr shadow, the same two slots the submit protocol
+            // uses.
+            rptr_gpu_addr: self.wb.dma_addr().raw() + WB_STATUS_OFFSET,
+            wptr_gpu_addr: self.wptr_phys(),
+            queue_size: u64::from(self.ring.ring_size_bytes),
+            doorbell_index: self.doorbell_index,
+            use_doorbell: true,
+            kernel_queue: true,
+            tmz_queue: false,
+            priority: crate::amdgpu_mqd::QueuePriority::Normal,
+            shadow_addr: 0,
+            gds_bkup_addr: 0,
+            csa_addr: 0,
+            fence_address: 0,
+        };
+        let mqd = crate::amdgpu_mqd::mes_mqd_init(&prop, self.eop_phys())
+            .map_err(|_| MesError::BadRingSize)?;
+        // SAFETY: identity-mapped page this queue owns; `mqd` is exactly
+        // COMPUTE_MQD_DWORDS dwords and the allocation is MES_MQD_BYTES.
+        unsafe {
+            for (i, dw) in mqd.iter().enumerate() {
+                core::ptr::write_volatile(self.mqd.cpu_mut_ptr_at::<u32>((i * 4) as u64), *dw);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fill a `SET_HW_RSRC` payload: the topology-derived masks from
+    /// [`crate::amdgpu_mes_hw::fill_hw_resources`], plus this queue's own two
+    /// context addresses and the flags `mes_v11_0_set_hw_resources` sets.
+    ///
+    /// The IP bases and the GDS size stay the caller's — those come from
+    /// discovery, not from the queue.
+    pub fn hw_resources(&self, topo: &crate::amdgpu_mes_hw::MesTopology) -> MesHwResources {
+        let mut res = MesHwResources {
+            sch_ctx_gpu_addr: self.sch_ctx_phys(),
+            query_status_fence_gpu_addr: self.query_status_fence_phys(),
+            flags: hw_rsrc_flags::DEFAULTS,
+            oversubscription_timer: DEFAULT_OVERSUBSCRIPTION_TIMER,
+            ..MesHwResources::default()
+        };
+        crate::amdgpu_mes_hw::fill_hw_resources(&mut res, topo);
+        res
     }
 
     /// GPU address of the ring, for `SET_HW_RESOURCES`.
@@ -758,6 +888,13 @@ impl MesQueue {
     /// GPU address of the wptr shadow MES polls.
     pub fn wptr_phys(&self) -> u64 {
         self.wb.dma_addr().raw() + WB_WPTR_OFFSET
+    }
+    /// Base of the writeback page, so a test can check the slot layout.
+    ///
+    /// Ungated for the same reason the other accessors are: the kernel-test
+    /// modules compile in the plain build too.
+    pub fn wb_phys_for_test(&self) -> u64 {
+        self.wb.dma_addr().raw()
     }
     pub fn mapped_queues(&self) -> u32 {
         self.ring.mapped_queues
@@ -880,6 +1017,35 @@ impl MesQueue {
         Ok(())
     }
 
+    /// The register sequence that pushes this pipe's descriptor into the live
+    /// HQD registers. See [`crate::amdgpu_mes_hw::build_mes_queue_init_register`].
+    ///
+    /// Reads the descriptor back out of the page rather than taking an array,
+    /// so the registers carry what the firmware will actually find there — a
+    /// descriptor written and then not flushed, or written to the wrong page,
+    /// shows up as a sequence of zeros rather than as a working-looking one.
+    pub fn queue_init_sequence(
+        &self,
+        gc_base_idx0: u32,
+        gc_base_idx1: u32,
+        pipe: u32,
+        live_vmid: u32,
+        live_doorbell: u32,
+    ) -> crate::amdgpu_gfx::Gfx11Sequence {
+        let mut mqd = [0u32; crate::amdgpu_mqd::COMPUTE_MQD_DWORDS];
+        for (i, slot) in mqd.iter_mut().enumerate() {
+            *slot = self.mqd_dword(i);
+        }
+        crate::amdgpu_mes_hw::build_mes_queue_init_register(
+            gc_base_idx0,
+            gc_base_idx1,
+            pipe,
+            &mqd,
+            live_vmid,
+            live_doorbell,
+        )
+    }
+
     /// Bind a kernel ring the driver programmed itself. See
     /// [`build_map_legacy_queue`] — this is the GFX11 kernel graphics ring's
     /// path, not [`MesQueue::add_queue`] with fewer arguments.
@@ -923,6 +1089,128 @@ impl MesQueue {
 mod smoke_tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// The MES pipe describes itself: descriptor, EOP, and the two
+    /// `SET_HW_RSRC` addresses all come from the queue's own allocations.
+    ///
+    /// Same shape as the graphics queue's consistency test, and for the same
+    /// reason: the ring base, the writeback addresses, the descriptor address
+    /// and the doorbell appear in both the descriptor and the HQD registers,
+    /// and the failure when they disagree is a scheduler that maps and never
+    /// runs.
+    fn smoke_mes_pipe_describes_itself() -> TestResult {
+        use crate::amdgpu_mqd as m;
+
+        let q = match MesQueue::new(4, 0x10) {
+            Ok(q) => q,
+            Err(_) => return TestResult::Fail("MesQueue::new failed"),
+        };
+        if q.write_mqd().is_err() {
+            return TestResult::Fail("the derived MES descriptor was refused");
+        }
+
+        // Five writeback slots, all distinct, at Linux's 32-byte spacing.
+        let page = q.wb_phys_for_test();
+        let slots = [
+            page + WB_STATUS_OFFSET,
+            page + WB_FENCE_OFFSET,
+            page + WB_WPTR_OFFSET,
+            q.sch_ctx_phys(),
+            q.query_status_fence_phys(),
+        ];
+        for (i, a) in slots.iter().enumerate() {
+            for b in slots.iter().skip(i + 1) {
+                if a == b {
+                    return TestResult::Fail("two writeback slots overlap");
+                }
+            }
+        }
+        if q.sch_ctx_phys() != page + 3 * crate::amdgpu_gfx::WB_SLOT_BYTES
+            || q.query_status_fence_phys() != page + 4 * crate::amdgpu_gfx::WB_SLOT_BYTES
+        {
+            return TestResult::Fail("the two SET_HW_RSRC slots are the fourth and fifth");
+        }
+        // And the descriptor, the EOP and the ring are separate allocations:
+        // the firmware owns the descriptor between a map and an unmap.
+        for (a, b) in [
+            (q.mqd_phys(), q.ring_phys()),
+            (q.mqd_phys(), q.eop_phys()),
+            (q.eop_phys(), q.ring_phys()),
+            (q.mqd_phys(), page),
+        ] {
+            if a == b {
+                return TestResult::Fail("the descriptor, EOP, ring and writeback must not share");
+            }
+        }
+
+        // The descriptor names this queue's ring, shifted right by 8.
+        let base = (u64::from(q.mqd_dword(m::C_CP_HQD_PQ_BASE_HI)) << 32)
+            | u64::from(q.mqd_dword(m::C_CP_HQD_PQ_BASE_LO));
+        if base << 8 != q.ring_phys() {
+            return TestResult::Fail("the descriptor does not name this queue's ring");
+        }
+        // And this queue's EOP, also shifted right by 8 — the defect the
+        // compute path had.
+        let eop = (u64::from(q.mqd_dword(m::C_CP_HQD_EOP_BASE_ADDR_HI)) << 32)
+            | u64::from(q.mqd_dword(m::C_CP_HQD_EOP_BASE_ADDR_LO));
+        if eop << 8 != q.eop_phys() {
+            return TestResult::Fail("the descriptor does not name this queue's EOP buffer");
+        }
+        // Active, which is what distinguishes this descriptor from a compute
+        // queue's — nothing maps the scheduler.
+        if q.mqd_dword(m::C_CP_HQD_ACTIVE) != 1 {
+            return TestResult::Fail("the MES pipe's descriptor says active");
+        }
+        // The doorbell MesQueue::new was given, in the dword space.
+        if (q.mqd_dword(m::C_CP_HQD_PQ_DOORBELL_CONTROL) >> 2) & 0x03FF_FFFF != 0x10 {
+            return TestResult::Fail("the descriptor carries this queue's doorbell");
+        }
+
+        // The register sequence reads the descriptor back out of the page, so
+        // the two cannot disagree.
+        const GC0: u32 = 0x0003_0000;
+        const GC1: u32 = 0x0005_0000;
+        let seq = q.queue_init_sequence(GC0, GC1, crate::amdgpu_mes_hw::MES_SCHED_PIPE, 0, 0);
+        use crate::amdgpu_mes_hw as hw;
+        if seq.first_write_to(GC0, hw::CP_HQD_PQ_BASE) != Some(q.mqd_dword(m::C_CP_HQD_PQ_BASE_LO))
+        {
+            return TestResult::Fail("the sequence does not carry the descriptor's ring base");
+        }
+        if seq.first_write_to(GC0, hw::CP_MQD_BASE_ADDR)
+            != Some(q.mqd_dword(m::C_CP_MQD_BASE_ADDR_LO))
+        {
+            return TestResult::Fail("the sequence does not carry the descriptor's own address");
+        }
+        if seq.first_write_to(GC0, hw::CP_HQD_ACTIVE) != Some(1) {
+            return TestResult::Fail("the sequence activates the queue");
+        }
+
+        // `SET_HW_RSRC`: this queue's two context addresses, the five flags
+        // `mes_v11_0_set_hw_resources` sets, and the topology's masks.
+        let res = q.hw_resources(&hw::PHOENIX_TOPOLOGY);
+        if res.sch_ctx_gpu_addr != q.sch_ctx_phys() {
+            return TestResult::Fail("SET_HW_RSRC must name this queue's scheduler context");
+        }
+        if res.query_status_fence_gpu_addr != q.query_status_fence_phys() {
+            return TestResult::Fail("SET_HW_RSRC must name this queue's query-status fence");
+        }
+        if res.flags != hw_rsrc_flags::DEFAULTS {
+            return TestResult::Fail("the five unconditional flags must be set");
+        }
+        if res.oversubscription_timer != DEFAULT_OVERSUBSCRIPTION_TIMER {
+            return TestResult::Fail("the oversubscription timer is 50");
+        }
+        if res.gfx_hqd_mask[0] != 0x2 || res.compute_hqd_mask[0] != 0xC {
+            return TestResult::Fail("the topology's masks must reach the payload");
+        }
+        // The packet the payload becomes still round-trips.
+        let pkt = build_set_hw_resources(&res);
+        if pkt.len() != MES_API_FRAME_DWORDS {
+            return TestResult::Fail("the SET_HW_RSRC frame is 64 dwords");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_mes_pipe_describes_itself);
 
     fn smoke_mes_header_layout() -> TestResult {
         let h = make_api_header(MesApiOpcode::AddQueue, MES_API_FRAME_DWORDS as u32);
