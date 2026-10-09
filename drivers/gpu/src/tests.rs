@@ -7854,6 +7854,100 @@ kernel_test_in!(
     smoke_amdgpu_gfx11_compute_enable_and_doorbell_range
 );
 
+/// `gfx_v11_0_ring_test_ring` — the only evidence that bring-up worked.
+///
+/// The offset in the packet is the register's **resolved** address minus the
+/// UCONFIG aperture base, not the register id. `regSCRATCH_REG0` is 0x2040 and
+/// GC BASE_IDX 1 is 0xA000, so the resolved address is 0xC040 and the packet
+/// carries 0x40. A version built from the bare id would carry 0x2040 — a
+/// number still inside no aperture at all, naming nothing the CP would accept.
+fn smoke_amdgpu_gfx11_ring_test_packet() -> TestResult {
+    use crate::amdgpu_gfx::{
+        build_ring_test_packet, ring_test_scratch_dword, GFX11_SCRATCH_REG0, RING_TEST_EXPECT,
+        RING_TEST_SEED,
+    };
+    use crate::amdgpu_pm4_defs as pm4;
+
+    // GC BASE_IDX 1 on every SOC15-style part with this layout
+    // (`GC_BASE__INST0_SEG1`).
+    const GC1: u32 = 0x0000_A000;
+
+    if GFX11_SCRATCH_REG0 != 0x2040 {
+        return TestResult::Fail("regSCRATCH_REG0 is dword 0x2040");
+    }
+    // The two sentinels must differ from each other, from zero, and from
+    // all-ones — a register that does not exist reads as all-ones, and that
+    // must not pass.
+    if RING_TEST_SEED == RING_TEST_EXPECT {
+        return TestResult::Fail("the seed and the expected value must differ");
+    }
+    for v in [RING_TEST_SEED, RING_TEST_EXPECT] {
+        if v == 0 || v == u32::MAX {
+            return TestResult::Fail("a sentinel must not be 0 or all-ones");
+        }
+    }
+
+    let pkt = match build_ring_test_packet(GC1) {
+        Some(p) => p,
+        None => return TestResult::Fail("a resolvable scratch register was refused"),
+    };
+    // PACKET3(SET_UCONFIG_REG, 1): opcode 0x79, count field 1 — so the packet
+    // is a header plus two dwords.
+    if pkt[0] != pm4::packet3(pm4::PACKET3_SET_UCONFIG_REG, 1) {
+        return TestResult::Fail("the header is SET_UCONFIG_REG with count 1");
+    }
+    if pm4::PACKET3_SET_UCONFIG_REG != 0x79 {
+        return TestResult::Fail("SET_UCONFIG_REG is opcode 0x79");
+    }
+    // 0xA000 + 0x2040 - 0xC000 = 0x40, worked out rather than recomputed.
+    if pkt[1] != 0x40 {
+        return TestResult::Fail("the offset is the resolved address less the aperture base");
+    }
+    if pkt[1] == GFX11_SCRATCH_REG0 {
+        return TestResult::Fail("the packet must not carry the bare register id");
+    }
+    if pkt[2] != RING_TEST_EXPECT {
+        return TestResult::Fail("the packet writes the expected sentinel");
+    }
+
+    // The host's own addressing of the same register is the FULL resolved
+    // dword, not the aperture-relative offset. Conflating them leaves the poll
+    // watching a register the packet never wrote.
+    if ring_test_scratch_dword(GC1) != Some(0xC040) {
+        return TestResult::Fail("the host reaches SCRATCH_REG0 at its resolved address");
+    }
+    if ring_test_scratch_dword(GC1) == Some(pkt[1]) {
+        return TestResult::Fail("the host address and the packet offset are different things");
+    }
+
+    // A base that puts the register outside the UCONFIG aperture is refused,
+    // not silently wrapped: the subtraction would still yield a number.
+    //
+    // The aperture is [0xc000, 0xc400), so SCRATCH_REG0 at +0x2040 only fits
+    // for bases in [0x9fc0, 0xa3c0).
+    for bad in [0x0000_0000u32, 0x0000_9000, 0x0000_B000, 0x0003_0000] {
+        if build_ring_test_packet(bad).is_some() {
+            return TestResult::Fail("a base outside the UCONFIG aperture must be refused");
+        }
+    }
+    // The edges of the window that does fit.
+    if build_ring_test_packet(0x9FC0).is_none() || build_ring_test_packet(0xA3BF).is_none() {
+        return TestResult::Fail("the bases that do resolve inside the aperture must be accepted");
+    }
+    if build_ring_test_packet(0x9FBF).is_some() || build_ring_test_packet(0xA3C0).is_some() {
+        return TestResult::Fail("one past either edge must be refused");
+    }
+    // And an overflowing base cannot panic.
+    if build_ring_test_packet(u32::MAX).is_some() {
+        return TestResult::Fail("an overflowing base must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx11_ring_test_packet
+);
+
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION

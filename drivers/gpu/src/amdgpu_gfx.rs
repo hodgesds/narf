@@ -1371,3 +1371,76 @@ pub fn build_gfx11_ring_init(
 
     Ok(seq)
 }
+
+// ── Ring test ──────────────────────────────────────────────────────
+
+/// `regSCRATCH_REG0` — dword 0x2040 on GC BASE_IDX **1**.
+///
+/// The ring test's whole mechanism: the host writes a sentinel here, the ring
+/// carries a packet that overwrites it, and the host polls for the new value.
+/// If the second value appears, the command processor fetched from the ring,
+/// executed a packet and reached a register — which is the only evidence that
+/// any of the bring-up above worked.
+pub const GFX11_SCRATCH_REG0: u32 = 0x2040;
+
+/// `0xCAFEDEAD` — what the host writes before submitting.
+///
+/// It matters that this is not zero and not the value the packet writes: a
+/// register that reads back the expected value because it was never written,
+/// or because the register does not exist and reads as all-ones, must not look
+/// like a pass.
+pub const RING_TEST_SEED: u32 = 0xCAFE_DEAD;
+/// `0xDEADBEEF` — what the packet writes and the host polls for.
+pub const RING_TEST_EXPECT: u32 = 0xDEAD_BEEF;
+
+/// `gfx_v11_0_ring_test_ring`'s packet: set `SCRATCH_REG0` to
+/// [`RING_TEST_EXPECT`].
+///
+/// Three dwords — `PACKET3(SET_UCONFIG_REG, 1)`, the register's offset within
+/// the UCONFIG aperture, and the value.
+///
+/// **The offset is base-dependent, and that is the trap.** Linux writes
+/// `SOC15_REG_OFFSET(GC, 0, regSCRATCH_REG0) - PACKET3_SET_UCONFIG_REG_START`:
+/// the register's *resolved* dword address minus the aperture base, both in the
+/// same absolute space. `regSCRATCH_REG0` alone is 0x2040 and means nothing to
+/// the CP. With GC BASE_IDX 1 at 0xA000 the resolved address is 0xC040 and the
+/// packet carries 0x40 — the same shape as the tile-steering register in
+/// [`crate::amdgpu_clearstate::build_preamble`], and the same reason this takes
+/// a base rather than a constant.
+///
+/// Returns `None` when the resolved address falls outside
+/// `[SET_UCONFIG_REG_START, SET_UCONFIG_REG_END)`. Outside that range the
+/// subtraction still produces a number, and the packet would name some other
+/// register entirely — so a bad base is a refusal rather than a write to an
+/// address nobody chose.
+///
+/// Linux reserves **5** dwords for a 3-dword packet. That is not padding
+/// inside the packet: `amdgpu_ring_commit` pads the *ring* up to the engine's
+/// fetch granule, which for every GFX11 ring is `align_mask = 0xff` — 256
+/// dwords. The reservation just has to cover the packet plus whatever that
+/// padding adds. [`crate::amdgpu_ring::Ring`] has the alignment helper; the
+/// packet itself is exactly these three dwords.
+pub fn build_ring_test_packet(gc_base_idx1: u32) -> Option<[u32; 3]> {
+    use crate::amdgpu_pm4_defs as pm4;
+    let resolved = gc_base_idx1.checked_add(GFX11_SCRATCH_REG0)?;
+    if !(pm4::PACKET3_SET_UCONFIG_REG_START..pm4::PACKET3_SET_UCONFIG_REG_END).contains(&resolved) {
+        return None;
+    }
+    Some([
+        pm4::packet3(pm4::PACKET3_SET_UCONFIG_REG, 1),
+        resolved - pm4::PACKET3_SET_UCONFIG_REG_START,
+        RING_TEST_EXPECT,
+    ])
+}
+
+/// The resolved dword address of `SCRATCH_REG0`, for the host-side write and
+/// poll that bracket the packet.
+///
+/// Separate from [`build_ring_test_packet`] because the host reaches the
+/// register directly through MM_INDEX while the CP reaches it through the
+/// aperture-relative offset in the packet — two different addressings of one
+/// register, and conflating them is how the poll ends up watching something
+/// the packet never wrote.
+pub fn ring_test_scratch_dword(gc_base_idx1: u32) -> Option<u32> {
+    gc_base_idx1.checked_add(GFX11_SCRATCH_REG0)
+}
