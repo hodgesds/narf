@@ -107,6 +107,18 @@ pub const SET_RESOURCES_VMID_MASK_SHIFT: u32 = 0;
 pub const SET_RESOURCES_UNMAP_LATENCY_SHIFT: u32 = 16;
 pub const SET_RESOURCES_QUEUE_TYPE_SHIFT: u32 = 29;
 
+// ── PACKET3_UNMAP_QUEUES field shifts (`nvd.h:626-646`) ──────────
+//
+// `ACTION` and `QUEUE_SEL` are different fields four bits apart, which is
+// worth naming: the builder below used to put the action in under a comment
+// claiming it was the queue selector.
+
+pub const UNMAP_QUEUES_ACTION_SHIFT: u32 = 0;
+pub const UNMAP_QUEUES_QUEUE_SEL_SHIFT: u32 = 4;
+pub const UNMAP_QUEUES_ENGINE_SEL_SHIFT: u32 = 26;
+pub const UNMAP_QUEUES_NUM_QUEUES_SHIFT: u32 = 29;
+pub const UNMAP_QUEUES_DOORBELL_OFFSET_SHIFT: u32 = 2;
+
 // ── Ring kind ────────────────────────────────────────────────────
 
 /// Ring kind — bound for which engine selector. PACKET3_MAP_QUEUES
@@ -204,51 +216,73 @@ pub fn build_map_queue(
     ]
 }
 
-/// PACKET3_UNMAP_QUEUES action enum. Linux's
-/// `amdgpu_unmap_queues_action`.
+/// PACKET3_UNMAP_QUEUES action, from `enum amdgpu_unmap_queues_action`
+/// (`amdgpu_gfx.h:131-136`).
+///
+/// LINUX-GAP: the last two were swapped — `PreemptNoUnmap` was 2 and
+/// `DisableProcessQueues` 3, where the enum declares
+/// `DISABLE_PROCESS_QUEUES` second and `PREEMPT_QUEUES_NO_UNMAP` last. So
+/// asking to preempt a queue and leave it mapped would have disabled every
+/// queue the process owns, and asking to disable a process's queues would
+/// have preempted one and left it mapped. The two most destructive values in
+/// the enum, exchanged.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum UnmapAction {
-    /// Drain pending work, then unmap.
+    /// `PREEMPT_QUEUES` — drain pending work, then unmap.
     Preempt = 0,
-    /// Force immediate unmap (drop in-flight work).
+    /// `RESET_QUEUES` — force immediate unmap, dropping in-flight work.
     Reset = 1,
-    /// Preempt + leave the queue mapped (used for context switch).
-    PreemptNoUnmap = 2,
-    /// Drain all queues.
-    DisableProcessQueues = 3,
+    /// `DISABLE_PROCESS_QUEUES` — every queue belonging to the process.
+    DisableProcessQueues = 2,
+    /// `PREEMPT_QUEUES_NO_UNMAP` — preempt but leave the queue mapped, for a
+    /// context switch.
+    PreemptNoUnmap = 3,
 }
 
-/// Build an UNMAP_QUEUES packet.
+/// Build an UNMAP_QUEUES packet, per `gfx11_kiq_unmap_queues`.
+///
+/// `action` goes in `ACTION` at bit 0, not `QUEUE_SEL` — those are separate
+/// fields (`PACKET3_UNMAP_QUEUES_ACTION(x) = x << 0`,
+/// `..._QUEUE_SEL(x) = x << 4`), and Linux leaves `QUEUE_SEL` zero. The old
+/// comment labelled the one as the other.
 pub fn build_unmap_queue(ring_kind: RingKind, doorbell_off: u32, action: UnmapAction) -> Vec<u32> {
     let header = packet3(PACKET3_UNMAP_QUEUES, 4);
-    let cfg = (action as u32)                    // QUEUE_SEL
-        | (ring_kind.engine_sel() << 26)
-        | (1u32 << 29); // NUM_QUEUES
-    let dbell = doorbell_off << 2;
+    let cfg = ((action as u32) << UNMAP_QUEUES_ACTION_SHIFT)
+        | (0u32 << UNMAP_QUEUES_QUEUE_SEL_SHIFT)
+        | (ring_kind.engine_sel() << UNMAP_QUEUES_ENGINE_SEL_SHIFT)
+        | (1u32 << UNMAP_QUEUES_NUM_QUEUES_SHIFT);
+    let dbell = doorbell_off << UNMAP_QUEUES_DOORBELL_OFFSET_SHIFT;
     alloc::vec![header, cfg, dbell, 0, 0, 0]
 }
 
-/// PACKET3 INDIRECT_BUFFER — chain into a user IB.
+/// PACKET3 INDIRECT_BUFFER for a COMPUTE queue, per
+/// `gfx_v11_0_ring_emit_ib_compute`.
 ///
-/// `ib_phys` is the IB's base; the low 30 bits go into IB_BASE_LO
-/// (shifted left by 2). `size_dws` is in dwords; max 20-bit.
+/// The address goes out as two plain halves — `lower_32_bits(ib->gpu_addr)`
+/// then `upper_32_bits(ib->gpu_addr)` — and must be dword aligned
+/// (`WARN_ON(ib->gpu_addr & 0x3)`).
 ///
-/// `vmid` is the per-process VMID the IB will be evaluated under.
-/// `vmid = 0` is the kernel-owned VMID.
+/// LINUX-GAP: the high dword was `hi | (lo & 0xC000_0000u32.wrapping_shr(2))`,
+/// which is `hi | (lo & 0x30000000)` — two bits of the LOW half OR'd into the
+/// high half, corrupting any address with bit 28 or 29 set. Linux ORs nothing
+/// into it. The comment above claimed the low 30 bits are "shifted left by 2",
+/// which is also not what any generation does.
+///
+/// The control dword's `INDIRECT_BUFFER_VALID` (bit 23, `nvd.h:225`) is
+/// deliberately here and deliberately absent from `amdgpu_pm4`'s GFX-ring
+/// version: `gfx_v11_0_ring_emit_ib_compute` sets it and
+/// `gfx_v11_0_ring_emit_ib_gfx` does not. The two builders differ because the
+/// two engines do.
 pub fn build_indirect_buffer(ib_phys: u64, size_dws: u32, vmid: u8) -> Vec<u32> {
     let header = packet3(PACKET3_INDIRECT_BUFFER, 2);
-    let lo = (ib_phys & 0xFFFF_FFFF) as u32;
-    let hi = (ib_phys >> 32) as u32;
     let size_field = size_dws & 0xF_FFFF;
-    let attr = size_field | (1u32 << 23) | ((vmid as u32) << 24);
-    alloc::vec![
-        header,
-        lo,
-        hi | (lo & 0xC000_0000_u32.wrapping_shr(2)),
-        attr
-    ]
+    let attr = size_field | INDIRECT_BUFFER_VALID | ((vmid as u32 & 0xF) << 24);
+    alloc::vec![header, ib_phys as u32, (ib_phys >> 32) as u32, attr]
 }
+
+/// `INDIRECT_BUFFER_VALID` (`nvd.h:225`). Set on compute-queue IBs only.
+pub const INDIRECT_BUFFER_VALID: u32 = 1 << 23;
 
 // ── Compute queue state ──────────────────────────────────────────
 
@@ -663,25 +697,82 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_map_queue_packet_shape);
 
+    /// `enum amdgpu_unmap_queues_action` (`amdgpu_gfx.h:131-136`) declares
+    /// PREEMPT_QUEUES, RESET_QUEUES, DISABLE_PROCESS_QUEUES,
+    /// PREEMPT_QUEUES_NO_UNMAP — in that order. The literals below are those
+    /// positions, not this module's discriminants, because reading the value
+    /// back through `action as u32` passes whatever the enum happens to say.
     fn smoke_unmap_queue_actions() -> TestResult {
-        for action in [
-            UnmapAction::Preempt,
-            UnmapAction::Reset,
-            UnmapAction::PreemptNoUnmap,
-            UnmapAction::DisableProcessQueues,
+        for (action, want) in [
+            (UnmapAction::Preempt, 0u32),
+            (UnmapAction::Reset, 1),
+            (UnmapAction::DisableProcessQueues, 2),
+            (UnmapAction::PreemptNoUnmap, 3),
         ] {
+            if action as u32 != want {
+                return TestResult::Fail("an unmap action is not its enum position");
+            }
             let p = build_unmap_queue(RingKind::Compute, 0x200, action);
             if p.len() != 6 {
                 return TestResult::Fail("UNMAP_QUEUES should be 6 dwords");
             }
-            // Action lives in the low 4 bits of the cfg field.
-            if p[1] & 0xF != action as u32 {
+            // ACTION is bits[3:0]; QUEUE_SEL is a separate field at bit 4 and
+            // Linux leaves it zero.
+            if p[1] & 0xF != want {
                 return TestResult::Fail("action encoding wrong");
+            }
+            if p[1] & (0xF << 4) != 0 {
+                return TestResult::Fail("QUEUE_SEL must stay zero");
+            }
+            // ENGINE_SEL at 26 and NUM_QUEUES at 29, so ENGINE_SEL is three
+            // bits wide, not four — a four-bit read picks up NUM_QUEUES.
+            if (p[1] >> 26) & 0x7 != RingKind::Compute.engine_sel() || (p[1] >> 29) & 0x7 != 1 {
+                return TestResult::Fail("engine select or queue count");
+            }
+            if p[2] != 0x200 << 2 {
+                return TestResult::Fail("doorbell offset");
             }
         }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_unmap_queue_actions);
+
+    /// A compute-queue IB, against `gfx_v11_0_ring_emit_ib_compute`.
+    fn smoke_compute_indirect_buffer_packet() -> TestResult {
+        // An address with bits 28 and 29 set in its LOW half: the old builder
+        // OR'd exactly those two into the high dword.
+        let ib = 0x0000_0007_3000_0004u64;
+        let p = build_indirect_buffer(ib, 0x40, 3);
+        if p.len() != 4 {
+            return TestResult::Fail("header plus three dwords");
+        }
+        // PACKET3(PACKET3_INDIRECT_BUFFER, 2): count field 2, opcode 0x3f.
+        if (p[0] >> 30) != 3 || (p[0] >> 16) & 0x3FFF != 2 || (p[0] >> 8) & 0xFF != 0x3F {
+            return TestResult::Fail("IB header");
+        }
+        // Both halves go out plain.
+        if p[1] != 0x3000_0004 {
+            return TestResult::Fail("IB base low");
+        }
+        if p[2] != 0x0000_0007 {
+            return TestResult::Fail("the high dword must carry no bits from the low one");
+        }
+        // control = INDIRECT_BUFFER_VALID | length_dw | (vmid << 24).
+        if p[3] & 0xF_FFFF != 0x40 {
+            return TestResult::Fail("IB size");
+        }
+        if p[3] & INDIRECT_BUFFER_VALID == 0 {
+            return TestResult::Fail("a compute IB sets INDIRECT_BUFFER_VALID");
+        }
+        if INDIRECT_BUFFER_VALID != 1 << 23 {
+            return TestResult::Fail("INDIRECT_BUFFER_VALID is bit 23");
+        }
+        if (p[3] >> 24) & 0xF != 3 {
+            return TestResult::Fail("IB vmid");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_compute_indirect_buffer_packet);
 
     fn smoke_kiq_scheduler_lifecycle() -> TestResult {
         let mut k = KiqScheduler::new();
