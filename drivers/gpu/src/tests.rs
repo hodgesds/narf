@@ -7494,6 +7494,106 @@ kernel_test_in!(
     smoke_amdgpu_gfx_writeback_slots_are_separate
 );
 
+/// The three consumers of a queue's addresses must agree.
+///
+/// A GFX11 kernel graphics ring is described three times over: in the
+/// descriptor the CP firmware reads, in the CP's own registers, and in the MES
+/// mapping packet. The ring base, the rptr writeback, the wptr shadow, the
+/// descriptor's address and the doorbell index appear in more than one of
+/// those, and a caller assembling them by hand can give two of the three a
+/// different answer. The failure mode is a queue the firmware accepts and that
+/// never runs, which is the worst kind to debug, so the addresses come from
+/// one place.
+fn smoke_amdgpu_gfx_queue_description_is_consistent() -> TestResult {
+    use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxContext, MQD_BYTES};
+    use crate::amdgpu_mqd::{CP_GFX_HQD_BASE, CP_GFX_HQD_BASE_HI, MQD_DWORDS};
+
+    if MQD_BYTES != MQD_DWORDS * 4 || MQD_BYTES != 2048 {
+        return TestResult::Fail("struct v11_gfx_mqd is 512 dwords");
+    }
+
+    // AMDGPU_NAVI10_DOORBELL_GFX_RING0.
+    let ctx = match GfxContext::new(0x08B) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("GfxContext::new failed"),
+    };
+    if ctx.write_mqd().is_err() {
+        return TestResult::Fail("the derived MQD properties were refused");
+    }
+
+    // The descriptor records the ring base shifted right by 8, so read it back
+    // and reconstruct the address the firmware will use.
+    let base_lo = ctx.mqd_dword(CP_GFX_HQD_BASE);
+    let base_hi = ctx.mqd_dword(CP_GFX_HQD_BASE_HI);
+    let from_mqd = ((u64::from(base_hi) << 32) | u64::from(base_lo)) << 8;
+    if from_mqd != ctx.ring_phys() {
+        return TestResult::Fail("the descriptor does not name this context's ring");
+    }
+
+    // The MES packet must name the same descriptor, the same wptr shadow and
+    // the same doorbell as the descriptor and the registers do.
+    let args = ctx.map_legacy_args(0, 0);
+    if args.mqd_addr != ctx.mqd_phys() {
+        return TestResult::Fail("the mapping packet names a different descriptor");
+    }
+    if args.wptr_addr != ctx.wptr_phys() {
+        return TestResult::Fail("the mapping packet names a different wptr shadow");
+    }
+    // 0x08B << 1 — the dword index space, which is what both the packet and
+    // the CP's DOORBELL_OFFSET field carry.
+    if args.doorbell_offset != 0x116 {
+        return TestResult::Fail("the mapping packet's doorbell is not the dword index");
+    }
+    if u64::from(args.doorbell_offset) * 4 != ctx.doorbell_offset() {
+        return TestResult::Fail("the packet's doorbell and the BAR2 offset disagree");
+    }
+    if args.queue_type != crate::amdgpu_mes::MesQueueType::Gfx {
+        return TestResult::Fail("a graphics ring maps as a GFX queue");
+    }
+
+    // And the register sequence, built from the same accessors, points the CP
+    // at the same ring and the same writeback addresses.
+    const GC: u32 = 0x0003_0000;
+    const GC1: u32 = 0x0005_0000;
+    let seq = match build_gfx11_ring_init(
+        GC,
+        GC1,
+        0,
+        ctx.ring_phys(),
+        crate::amdgpu_ring::RING_SIZE_DW as u64 * 4,
+        args.doorbell_offset,
+        true,
+        ctx.rptr_phys(),
+        ctx.wptr_phys(),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("the ring init sequence was refused"),
+    };
+    // regCP_RB0_BASE 0x1de0 holds the base >> 8, and regCP_RB0_BASE_HI 0x1e51
+    // its high half.
+    let reg_lo = seq.first_write_to(GC, 0x1de0).unwrap_or(0);
+    let reg_hi = seq.first_write_to(GC, 0x1e51).unwrap_or(0);
+    let from_regs = ((u64::from(reg_hi) << 32) | u64::from(reg_lo)) << 8;
+    if from_regs != ctx.ring_phys() {
+        return TestResult::Fail("the CP registers do not name this context's ring");
+    }
+    if from_regs != from_mqd {
+        return TestResult::Fail("the descriptor and the registers name different rings");
+    }
+    // regCP_RB0_RPTR_ADDR 0x1de3 and regCP_RB_WPTR_POLL_ADDR_LO 0x1e8b.
+    if seq.first_write_to(GC, 0x1de3) != Some(ctx.rptr_phys() as u32) {
+        return TestResult::Fail("the CP's rptr writeback is not this context's slot");
+    }
+    if seq.first_write_to(GC, 0x1e8b) != Some(ctx.wptr_phys() as u32) {
+        return TestResult::Fail("the CP's wptr poll address is not this context's shadow");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx_queue_description_is_consistent
+);
+
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION

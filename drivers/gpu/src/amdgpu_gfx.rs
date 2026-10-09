@@ -49,6 +49,7 @@ use core::sync::atomic::{compiler_fence, Ordering};
 
 use narf_driver_runtime::{alloc_coherent, DmaBuffer, DomainId};
 
+use crate::amdgpu_mqd::MqdProp;
 use crate::amdgpu_pm4::{Pm4Builder, Pm4Error};
 use crate::amdgpu_ring::{Ring, RingError};
 
@@ -587,6 +588,19 @@ pub const WB_FENCE_OFFSET: u64 = 2 * WB_SLOT_BYTES;
 /// Three slots: rptr, wptr, fence.
 pub const WB_BYTES: usize = 3 * WB_SLOT_BYTES as usize;
 
+/// The queue descriptor's size: `struct v11_gfx_mqd` is 512 dwords.
+pub const MQD_BYTES: usize = crate::amdgpu_mqd::MQD_DWORDS * 4;
+
+/// Why [`GfxContext::write_mqd`] refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MqdError {
+    /// `gfx_mqd_init` rejected the derived properties. Reachable only if the
+    /// ring size stops being a power of two or the ring base stops being
+    /// 256-byte aligned, both of which `Ring::new` guarantees today — so this
+    /// is the arm that catches a change to either.
+    BadProp,
+}
+
 /// Per-queue GFX submission context. Owns its ring and a host-memory
 /// writeback page. Caller is responsible for binding the ring's
 /// `phys_addr()`, `rptr_phys()` and `wptr_phys()` into the CP via
@@ -605,6 +619,11 @@ pub struct GfxContext {
     /// cannot share: the CP overwrites rptr continuously while the fence has
     /// to survive until the host reads it.
     wb: DmaBuffer,
+    /// The memory queue descriptor the CP firmware reads: 512 dwords, one per
+    /// `struct v11_gfx_mqd` field. Separate from the ring and from the
+    /// writeback page because the firmware owns it between a map and an unmap
+    /// and keeps queue state in it across a preemption.
+    mqd: DmaBuffer,
     /// Next sequence number to publish.
     next_seq: u64,
 }
@@ -651,7 +670,7 @@ impl GfxContext {
         unsafe { self.ring.ring_doorbell(bar2) };
     }
 
-    /// Allocate a fresh GFX context: ring + writeback page.
+    /// Allocate a fresh GFX context: ring + writeback page + queue descriptor.
     pub fn new(queue_idx: u16) -> Result<Self, RingError> {
         // A GFX ring: the doorbell carries the dword wptr as a quadword.
         let ring = Ring::new(queue_idx, crate::amdgpu_ring::DoorbellKind::Gfx)?;
@@ -664,11 +683,115 @@ impl GfxContext {
                 core::ptr::write_volatile(wb.cpu_mut_ptr_at::<u64>(offset), 0);
             }
         }
+        let mqd = alloc_coherent(MQD_BYTES, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
+        // Zero the descriptor. Every field `gfx_mqd_init` does not set is
+        // meant to read zero, and what the page held before is not zero.
+        // SAFETY: identity-mapped, exclusive owner, bounded by MQD_BYTES.
+        unsafe {
+            for offset in (0..MQD_BYTES as u64).step_by(8) {
+                core::ptr::write_volatile(mqd.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+        }
         Ok(Self {
             ring,
             wb,
+            mqd,
             next_seq: 0,
         })
+    }
+
+    /// Phys address of the queue descriptor.
+    pub fn mqd_phys(&self) -> u64 {
+        self.mqd.dma_addr().raw()
+    }
+
+    /// One dword of the queue descriptor, by its `v11_gfx_mqd` index.
+    ///
+    /// Reads back what [`GfxContext::write_mqd`] put there, so a test can
+    /// check the firmware's copy rather than the array it was built from.
+    ///
+    /// Ungated for the same reason [`GfxContext::ring_rptr`] is: the
+    /// kernel-test modules compile in the plain build too.
+    pub fn mqd_dword(&self, index: usize) -> u32 {
+        if index >= crate::amdgpu_mqd::MQD_DWORDS {
+            return 0;
+        }
+        // SAFETY: identity-mapped page this context owns, index bounded above.
+        unsafe { core::ptr::read_volatile(self.mqd.cpu_ptr_at::<u32>((index * 4) as u64)) }
+    }
+
+    /// Build this queue's descriptor from this context's own addresses and
+    /// write it into the page the firmware reads.
+    ///
+    /// The point of deriving it here rather than taking an [`MqdProp`] is that
+    /// the ring base, the rptr writeback, the wptr shadow, the descriptor's
+    /// own address and the doorbell index all have to agree between three
+    /// consumers — the descriptor, the CP's registers
+    /// ([`build_gfx11_ring_init`]) and the MES mapping packet
+    /// ([`GfxContext::map_legacy_args`]). A caller assembling them by hand can
+    /// hand two of the three a different answer, and the failure is a queue
+    /// the firmware accepts and that never runs.
+    pub fn write_mqd(&self) -> Result<(), MqdError> {
+        let prop = MqdProp {
+            mqd_gpu_addr: self.mqd_phys(),
+            hqd_base_gpu_addr: self.ring_phys(),
+            rptr_gpu_addr: self.rptr_phys(),
+            wptr_gpu_addr: self.wptr_phys(),
+            queue_size: crate::amdgpu_ring::RING_SIZE_DW as u64 * 4,
+            doorbell_index: self.ring.doorbell_index_dw(),
+            use_doorbell: true,
+            // A kernel ring, so privileged packets are allowed. `kernel_queue`
+            // is what clears `PRIV_STATE` in the MQD's `CP_GFX_HQD_CNTL`.
+            kernel_queue: true,
+            // `amdgpu_ring_to_mqd_prop` memsets the whole prop and then
+            // assigns the fields above; everything below is a zero it leaves
+            // alone for a kernel graphics ring, written out rather than
+            // defaulted so each one is a decision on the page.
+            //
+            // Not a TMZ queue: there is no secure-memory path.
+            tmz_queue: false,
+            // Ring 0 is not a high-priority graphics queue
+            // (`amdgpu_gfx_is_high_priority_graphics_queue` is false for it),
+            // so both priority fields stay at their normal level.
+            priority: crate::amdgpu_mqd::QueuePriority::Normal,
+            // The GFX11 user-queue areas. A kernel ring has no shadow, no GDS
+            // backup, no CSA and no separate fence page — its fence lives in
+            // the writeback slot the `WRITE_DATA` packet targets, which is not
+            // this field.
+            shadow_addr: 0,
+            gds_bkup_addr: 0,
+            csa_addr: 0,
+            fence_address: 0,
+        };
+        let mqd = crate::amdgpu_mqd::gfx_mqd_init(&prop).map_err(|_| MqdError::BadProp)?;
+        // SAFETY: identity-mapped page this context owns; `mqd` is exactly
+        // MQD_DWORDS dwords and the allocation is MQD_BYTES.
+        unsafe {
+            for (i, dw) in mqd.iter().enumerate() {
+                core::ptr::write_volatile(self.mqd.cpu_mut_ptr_at::<u32>((i * 4) as u64), *dw);
+            }
+        }
+        Ok(())
+    }
+
+    /// The MES legacy-queue mapping for this context, on `pipe`/`queue`.
+    ///
+    /// Built from the same three addresses [`GfxContext::write_mqd`] put in
+    /// the descriptor, for the reason given there. `doorbell_offset` is
+    /// `ring->doorbell_index` — the dword space, not the assignment slot.
+    pub fn map_legacy_args(
+        &self,
+        pipe: u32,
+        queue: u32,
+    ) -> crate::amdgpu_mes::MesMapLegacyQueueArgs {
+        crate::amdgpu_mes::MesMapLegacyQueueArgs {
+            pipe_id: pipe,
+            queue_id: queue,
+            doorbell_offset: self.ring.doorbell_index_dw(),
+            mqd_addr: self.mqd_phys(),
+            wptr_addr: self.wptr_phys(),
+            queue_type: crate::amdgpu_mes::MesQueueType::Gfx,
+        }
     }
 
     /// Phys address of the ring's first dword — feed this into
