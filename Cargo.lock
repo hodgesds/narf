@@ -912,6 +912,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-driver-macros"
+version = "0.0.0"
+
+[[package]]
 name = "narf-driver-runtime"
 version = "0.0.0"
 dependencies = [
@@ -1307,8 +1311,366 @@ dependencies = [
  "narf-console",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-drivers-net-atheros",
+ "narf-drivers-net-bnxt",
+ "narf-drivers-net-core",
+ "narf-drivers-net-cxgb4",
+ "narf-drivers-net-e1000",
+ "narf-drivers-net-enic",
+ "narf-drivers-net-forcedeth",
+ "narf-drivers-net-i40e",
+ "narf-drivers-net-igc",
+ "narf-drivers-net-ixgbe",
+ "narf-drivers-net-mlx5",
+ "narf-drivers-net-realtek",
+ "narf-drivers-net-rtl8139",
+ "narf-drivers-net-tg3",
+ "narf-drivers-net-vmxnet3",
  "narf-firmware",
  "narf-init",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-atheros"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-bnxt"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-core"
+version = "0.0.0"
+dependencies = [
+ "narf-ipc",
+ "narf-lib",
+ "narf-net",
+]
+
+[[package]]
+name = "narf-drivers-net-cxgb4"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-e1000"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-enic"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-forcedeth"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-i40e"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-igc"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-ixgbe"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-mlx5"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-realtek"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-rtl8139"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-tg3"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-vmxnet3"
+version = "0.0.0"
+dependencies = [
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-firmware",
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
@@ -1485,9 +1847,186 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-driver-macros",
  "narf-drivers",
+ "narf-drivers-storage-ahci",
+ "narf-drivers-storage-core",
+ "narf-drivers-storage-megaraid",
+ "narf-drivers-storage-mpt3sas",
+ "narf-drivers-storage-rtsx",
+ "narf-drivers-storage-sdhci",
+ "narf-drivers-storage-smartpqi",
+ "narf-drivers-storage-vmd",
  "narf-filesystem",
  "narf-init",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-ahci"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-core"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+]
+
+[[package]]
+name = "narf-drivers-storage-megaraid"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-mpt3sas"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-rtsx"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-sdhci"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-smartpqi"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-vmd"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
  "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
@@ -2049,6 +2588,7 @@ name = "narf-modules"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-bus",
  "narf-capabilities",
  "narf-console",
  "narf-crypto",

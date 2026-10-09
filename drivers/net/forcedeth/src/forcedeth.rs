@@ -371,7 +371,7 @@ pub enum NicError {
 /// flags + length packed together.
 #[repr(C, align(8))]
 #[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct Desc {
+pub struct Desc {
     pub buf: u32,
     pub flaglen: u32,
 }

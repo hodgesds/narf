@@ -1,0 +1,18 @@
+# Shared helpers for NARF storage drivers (SD/MMC protocol, UFS, request gate).
+# Leaf modules with no driver deps; per-driver crates depend on this, not on
+# the narf-drivers-storage facade (no cycle). Mirrors narf-drivers-net-core.
+[package]
+name         = "narf-drivers-storage-core"
+description  = "Shared helpers for NARF storage drivers (emmc/sd_proto/ufs/req_gate)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+[lib]
+name = "narf_drivers_storage_core"
+path = "src/lib.rs"
+[dependencies]
+narf-lib = { path = "../../../lib" }
+[lints]
+workspace = true

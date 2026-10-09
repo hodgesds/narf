@@ -123,17 +123,17 @@ pub(crate) const ADVTXD_STAT_DD: u32 = 1 << 0;
 
 // TX context / TSO descriptor bits.
 // Source: Linux ixgbe_type.h §7.2.3.2.2 / ixgbe_main.c.
-pub(crate) const ADVTXD_DTYP_CTXT: u32 = 0x2 << 20;
-pub(crate) const ADVTXD_DCMD_TSE: u32 = 1 << 31;
-pub(crate) const ADVTXD_POPTS_IXSM: u32 = 0x0100;
-pub(crate) const ADVTXD_POPTS_TXSM: u32 = 0x0200;
+pub const ADVTXD_DTYP_CTXT: u32 = 0x2 << 20;
+pub const ADVTXD_DCMD_TSE: u32 = 1 << 31;
+pub const ADVTXD_POPTS_IXSM: u32 = 0x0100;
+pub const ADVTXD_POPTS_TXSM: u32 = 0x0200;
 pub(crate) const ADVTXD_PAYLEN_SHIFT: u32 = 14;
-pub(crate) const ADVTXD_TUCMD_IPV4: u32 = 0x400;
-pub(crate) const ADVTXD_TUCMD_L4T_TCP: u32 = 0x800;
+pub const ADVTXD_TUCMD_IPV4: u32 = 0x400;
+pub const ADVTXD_TUCMD_L4T_TCP: u32 = 0x800;
 #[allow(dead_code)]
 pub(crate) const ADVTXD_TUCMD_L4T_UDP: u32 = 0x000;
 pub(crate) const ADVTXD_L4LEN_SHIFT: u32 = 8;
-pub(crate) const ADVTXD_MSS_SHIFT: u32 = 16;
+pub const ADVTXD_MSS_SHIFT: u32 = 16;
 pub(crate) const ADVTXD_MACLEN_SHIFT: u32 = 9;
 
 /// RX checksum verification result decoded from a legacy ixgbe RxDesc.
@@ -172,7 +172,7 @@ pub(crate) const RX_BUF_LEN: usize = 2048;
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct AdvTxDesc {
+pub struct AdvTxDesc {
     pub addr: u64,
     pub cmd_type_len: u32,
     pub olinfo: u32,

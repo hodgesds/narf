@@ -1,0 +1,32 @@
+# NARF driver authoring macros.
+#
+# A dependency-free declarative-macro crate. `narf_driver!` lets a driver
+# declare its identity + registration ONCE and compile either as a built-in
+# (linked into the kernel, registered from an initcall) or as a loadable `.ko`
+# (with `narf_module_init`, `.modinfo` and a `#[panic_handler]`).
+#
+# `[dependencies]` is intentionally EMPTY: this crate must be linkable into a
+# `.ko` whose only undefined symbols are the kernel's C-ABI exports. A decl
+# macro emits no object code of its own and references only whatever the
+# driver crate's `cfg` selects, so a module driver can depend on this crate
+# without dragging a single kernel crate into its image. (A proc-macro crate
+# would instead pull syn/quote and compile host-side — the wrong tool for a
+# pure token-pasting expansion used across ~100 driver crates.)
+
+[package]
+name         = "narf-driver-macros"
+description  = "Declarative macros for dual-build (built-in or loadable .ko) NARF drivers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_driver_macros"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

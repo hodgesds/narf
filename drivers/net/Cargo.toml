@@ -25,12 +25,64 @@ narf-arch         = { path = "../../arch" }
 narf-acpi         = { path = "../../acpi" }
 narf-aml          = { path = "../../aml" }
 narf-drivers      = { path = "../" }
+narf-drivers-net-core = { path = "core" }
+# Per-driver crates — each an optional dependency behind a same-named feature.
+narf-drivers-net-atheros   = { path = "atheros", optional = true }
+narf-drivers-net-bnxt      = { path = "bnxt", optional = true }
+narf-drivers-net-cxgb4     = { path = "cxgb4", optional = true }
+narf-drivers-net-e1000     = { path = "e1000", optional = true }
+narf-drivers-net-enic      = { path = "enic", optional = true }
+narf-drivers-net-forcedeth = { path = "forcedeth", optional = true }
+narf-drivers-net-i40e      = { path = "i40e", optional = true }
+narf-drivers-net-igc       = { path = "igc", optional = true }
+narf-drivers-net-ixgbe     = { path = "ixgbe", optional = true }
+narf-drivers-net-mlx5      = { path = "mlx5", optional = true }
+narf-drivers-net-realtek   = { path = "realtek", optional = true }
+narf-drivers-net-rtl8139   = { path = "rtl8139", optional = true }
+narf-drivers-net-tg3       = { path = "tg3", optional = true }
+narf-drivers-net-vmxnet3   = { path = "vmxnet3", optional = true }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
 narf-firmware    = { path = "../../firmware" }
 narf-scheduler   = { path = "../../scheduler" }
 narf-time        = { path = "../../time" }
+
+[features]
+# Each NIC driver is a selectable crate. `default` enables them all, so the
+# built kernel compiles the same driver set it did before the split. Drop one
+# (e.g. `--no-default-features --features e1000,igc`) to build a leaner kernel,
+# or add an out-of-tree driver crate the same way.
+default = [
+    "atheros",
+    "bnxt",
+    "cxgb4",
+    "e1000",
+    "enic",
+    "forcedeth",
+    "i40e",
+    "igc",
+    "ixgbe",
+    "mlx5",
+    "realtek",
+    "rtl8139",
+    "tg3",
+    "vmxnet3",
+]
+atheros = ["dep:narf-drivers-net-atheros"]
+bnxt = ["dep:narf-drivers-net-bnxt"]
+cxgb4 = ["dep:narf-drivers-net-cxgb4"]
+e1000 = ["dep:narf-drivers-net-e1000"]
+enic = ["dep:narf-drivers-net-enic"]
+forcedeth = ["dep:narf-drivers-net-forcedeth"]
+i40e = ["dep:narf-drivers-net-i40e"]
+igc = ["dep:narf-drivers-net-igc"]
+ixgbe = ["dep:narf-drivers-net-ixgbe"]
+mlx5 = ["dep:narf-drivers-net-mlx5"]
+realtek = ["dep:narf-drivers-net-realtek"]
+rtl8139 = ["dep:narf-drivers-net-rtl8139"]
+tg3 = ["dep:narf-drivers-net-tg3"]
+vmxnet3 = ["dep:narf-drivers-net-vmxnet3"]
 
 [lints]
 workspace = true

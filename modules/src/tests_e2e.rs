@@ -844,6 +844,96 @@ fn e2e_real_rust_module_loads_raw_and_compressed() -> TestResult {
 }
 kernel_test_in!("modules/e2e", e2e_real_rust_module_loads_raw_and_compressed);
 
+// ── Smoke 9: a real dual-build driver `.ko` loads and REGISTERS ────────
+
+/// The capstone of the loadable-driver work: load the rustc-built
+/// `narf-drivers-net-e1000` `.ko` (the same crate the kernel links as a
+/// built-in) and prove it registers a PCI driver through the
+/// `narf_register_pci_driver` KSYMTAB export.
+///
+/// Registration-only: the module's probe thunk returns `-ENOSYS` because the
+/// device datapath ABI is not yet exported. So this proves the loadable-driver
+/// *mechanism* end-to-end — build → load → `narf_module_init` → the bus
+/// records the module's probe thunk — not a bound NIC from a `.ko`.
+///
+/// Observing `MODULE_THUNKS` (via `__module_thunk_for_test`) is collision-free:
+/// only a *module* registration populates it, so a match left by the built-in
+/// e1000 (which uses a real `PciProbeFn`) can never be mistaken for this.
+fn e2e_driver_module_registers_pci_match() -> TestResult {
+    const E1000_VENDOR: u16 = 0x8086;
+    const E1000_DEV_82540EM: u16 = 0x100E;
+
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return TestResult::Skip("no staged initramfs for driver module smoke");
+    };
+    let Some((_, staged)) = initramfs
+        .iter_files()
+        .find(|(name, _)| *name == "lib/modules/narf_drivers_net_e1000.ko")
+    else {
+        return TestResult::Skip("narf_drivers_net_e1000.ko was not staged");
+    };
+
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::AcceptAll));
+    let abi = crate::symbols::compute_abi_hash();
+    crate::symbols::set_kernel_abi(abi);
+    // Start the bus match table clean so the assertion sees only this load.
+    narf_bus::driver_match::__reset_for_test();
+
+    // Stamp the live ABI over xtask's zero placeholder, as the loader expects.
+    let mut image = staged.to_vec();
+    const PLACEHOLDER: &[u8] = b"kernel_abi=0x00000000";
+    let Some(value_at) = image
+        .windows(PLACEHOLDER.len())
+        .position(|window| window == PLACEHOLDER)
+        .map(|start| start + b"kernel_abi=0x".len())
+    else {
+        return TestResult::Fail("driver module has no ABI placeholder");
+    };
+    let stamped = format!("{abi:08x}");
+    image[value_at..value_at + 8].copy_from_slice(stamped.as_bytes());
+
+    let module = match sys_init_module(&image) {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("driver module failed to load or run init"),
+    };
+    if module.name() != "e1000" {
+        return TestResult::Fail("driver module manifest name mismatch");
+    }
+    if module.domain != narf_lib::id::DomainId::DRIVER_0 {
+        return TestResult::Fail("target_domain=net was not placed in DRIVER_0");
+    }
+    if *module.state.lock() != crate::lifecycle::ModuleState::Live {
+        return TestResult::Fail("driver module did not reach Live");
+    }
+
+    // narf_module_init ran register() -> narf_register_pci_driver, so the bus
+    // recorded the module's probe thunk for (vendor, device). Calling it yields
+    // the registration-only -ENOSYS.
+    match narf_bus::driver_match::__module_thunk_for_test(E1000_VENDOR, E1000_DEV_82540EM) {
+        Some(thunk) => {
+            if thunk(0, 0) != -38 {
+                return TestResult::Fail("module probe thunk did not return -ENOSYS");
+            }
+        }
+        None => return TestResult::Fail("driver module did not register its PCI match"),
+    }
+
+    // Drop the bus registration FIRST so no trampoline references the module's
+    // probe thunk, then unload — this is the ordering a future deregistration
+    // path must enforce, and it keeps the unload free of a dangling thunk.
+    narf_bus::driver_match::__reset_for_test();
+    drop(module);
+    if sys_delete_module("e1000").is_err() {
+        return TestResult::Fail("driver module failed to unload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/e2e", e2e_driver_module_registers_pci_match);
+
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.
 #[allow(dead_code)]

@@ -1,0 +1,82 @@
+# e1000 — Intel 8254x/8257x NIC driver, dual-build.
+#
+# The first per-driver crate and the reference shape for the rest. It builds
+# two ways from one source, selected by cargo feature:
+#
+#   * `builtin` (default): an rlib dependency of the `narf-drivers-net` facade,
+#     registered from the kernel's Stage::Subsys initcall. The real driver
+#     (BAR map, DMA rings, MSI-X, net-stack registration) lives here.
+#   * `module`: built to a relocatable `.ko` via
+#     `cargo xtask build-module -p narf-drivers-net-e1000 --no-default-features
+#     --features module`. The kernel crates are dropped from the graph and the
+#     driver registers through the `narf_register_pci_driver` KSYMTAB export.
+#     Registration-only until the device datapath ABI is exported (the probe
+#     thunk returns -ENOSYS), so this proves the loadable-driver *mechanism*.
+
+[package]
+name         = "narf-drivers-net-e1000"
+description  = "Intel 8254x/8257x (e1000/e1000e) NIC driver — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name       = "narf_drivers_net_e1000"
+path       = "src/lib.rs"
+# rlib, for the built-in facade dependency and the kernel link (which supplies
+# the allocator + panic handler). The `.ko` build overrides this to `staticlib`
+# with `cargo rustc --crate-type staticlib` in `xtask build-module`, so the
+# standalone staticlib — which WOULD need its own allocator/panic handler — is
+# only ever produced in the `module` config, where it does not allocate and the
+# macro supplies the panic handler.
+
+[features]
+default = ["builtin"]
+# Built-in: pull the real kernel crates. The driver body only compiles here.
+builtin = [
+    "dep:narf-drivers-net-core",
+    "dep:narf-bus",
+    "dep:narf-capabilities",
+    "dep:narf-io",
+    "dep:narf-ipc",
+    "dep:narf-lib",
+    "dep:narf-net",
+    "dep:narf-scheduler",
+    "dep:narf-drivers",
+    "dep:narf-interrupts",
+    "dep:narf-memory",
+    "dep:narf-arch",
+    "dep:narf-acpi",
+    "dep:narf-aml",
+    "dep:narf-time",
+]
+# Module: NO kernel crates. The only undefined symbols in the `.ko` are the
+# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
+module = []
+
+[dependencies]
+# Always present: a decl-macro crate with no object code of its own, so it is
+# safe to link into the `.ko`.
+narf-driver-macros = { path = "../../../driver-macros" }
+
+# Real kernel crates — present for `builtin`, absent for `module`.
+narf-drivers-net-core = { path = "../core", optional = true }
+narf-bus          = { path = "../../../bus", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-io           = { path = "../../../io", optional = true }
+narf-ipc          = { path = "../../../ipc", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-net          = { path = "../../../net", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-drivers      = { path = "../..", optional = true }
+narf-interrupts   = { path = "../../../interrupts", optional = true }
+narf-memory       = { path = "../../../memory", optional = true }
+narf-arch         = { path = "../../../arch", optional = true }
+narf-acpi         = { path = "../../../acpi", optional = true }
+narf-aml          = { path = "../../../aml", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+
+[lints]
+workspace = true

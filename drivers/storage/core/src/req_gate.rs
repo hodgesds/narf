@@ -24,14 +24,15 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 /// RAII holder for a device's request gate. See the module docs for
 /// why this replaces holding the controller spinlock across I/O.
-pub(crate) struct ReqGate<'a>(&'a AtomicBool);
+#[derive(Debug)]
+pub struct ReqGate<'a>(&'a AtomicBool);
 
 impl<'a> ReqGate<'a> {
     /// Spin until the gate is ours. Interrupts keep their
     /// caller-supplied state — the whole point — so timer ticks, RCU
     /// quiescent states and the sleep pumps continue to run on this
     /// CPU while we wait.
-    pub(crate) fn acquire(flag: &'a AtomicBool) -> ReqGate<'a> {
+    pub fn acquire(flag: &'a AtomicBool) -> ReqGate<'a> {
         let mut spins: u32 = 0;
         while flag
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)

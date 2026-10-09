@@ -341,9 +341,149 @@ impl<'a> core::fmt::Write for TruncatingWriter<'a> {
 /// this through `tracing/` once the trace probe IDs land.
 fn log_probe_failure(_m: &PciMatch, _d: &BusDevice, _e: ProbeError) {}
 
+// ── Loadable-module PCI drivers ──────────────────────────────────
+//
+// A driver built as a `.ko` cannot be handed a `PciProbeFn`: its probe is a
+// separately-compiled C-ABI thunk, and `BusDevice` / `Cap` are `repr(Rust)`
+// and cannot cross an ABI boundary. So a module registers through
+// `register_module_pci_driver` (reached from the kernel-ABI export
+// `narf_register_pci_driver`), which records the thunk in a side table keyed
+// by `(vendor, device)` and installs ONE shared `PciProbeFn` —
+// `module_probe_trampoline` — against the match. At probe time the trampoline
+// looks the thunk back up by the discovered device's IDs and calls it with a
+// stable device token. The in-tree `PciMatch` probe path above is untouched.
+
+/// C-ABI probe thunk a loadable module supplies. `dev_token` encodes the
+/// device's bus address (see [`addr_token`]); `reserved` is 0 today and will
+/// carry a device-authority handle once the datapath ABI lands. A `0` return
+/// means the module bound the device; a negative errno means it did not.
+pub type ModuleProbeFn = extern "C" fn(dev_token: u64, reserved: u64) -> i32;
+
+struct ModuleThunk {
+    vendor: u16,
+    device: u16,
+    thunk: ModuleProbeFn,
+}
+
+static MODULE_THUNKS: IrqSafeSpinLock<Vec<ModuleThunk>> = IrqSafeSpinLock::new(Vec::new());
+
+/// Kernel-owned intern table for module-supplied driver names. A module's
+/// `.rodata` is unmapped on unload, so a `&str` borrowed from it cannot be
+/// stored `'static` in the registry; interning copies it into a kernel-owned
+/// allocation that outlives the module. Dedups so repeated registrations of
+/// the same name don't grow the table without bound.
+static INTERNED_NAMES: IrqSafeSpinLock<Vec<&'static str>> = IrqSafeSpinLock::new(Vec::new());
+
+fn intern_name(name: &str) -> &'static str {
+    let mut g = INTERNED_NAMES.lock();
+    if let Some(found) = g.iter().copied().find(|n| *n == name) {
+        return found;
+    }
+    let leaked: &'static str = alloc::string::String::from(name).leak();
+    g.push(leaked);
+    leaked
+}
+
+/// Encode a bus address into a stable 64-bit device token for the module ABI.
+/// PCIe packs segment/bus/device/function; MMIO passes its physical base.
+/// Opaque to the module today.
+fn addr_token(addr: crate::addr::BusAddr) -> u64 {
+    match addr {
+        crate::addr::BusAddr::Pcie(a) => {
+            ((a.segment as u64) << 24)
+                | ((a.bus as u64) << 16)
+                | ((a.device as u64) << 8)
+                | (a.function as u64)
+        }
+        crate::addr::BusAddr::Mmio(p) => p.raw(),
+    }
+}
+
+/// The single `PciProbeFn` installed for every module-registered match.
+/// Dispatches to the module's thunk by the discovered device's IDs.
+fn module_probe_trampoline(
+    device: BusDevice,
+    _cap: Cap<BusDeviceCap, Write>,
+) -> Result<(), ProbeError> {
+    let (vid, did) = (device.id.vendor, device.id.device);
+    let thunk = MODULE_THUNKS
+        .lock()
+        .iter()
+        .find(|t| t.vendor == vid && t.device == did)
+        .map(|t| t.thunk);
+    match thunk {
+        // 0 => the module bound the device. A negative errno => it declined;
+        // surfaced as a typed error so the probe trace records it without a
+        // more-specific driver being implied.
+        Some(f) => match f(addr_token(device.addr), 0) {
+            0 => Ok(()),
+            _ => Err(ProbeError::Other("module probe declined")),
+        },
+        None => Err(ProbeError::NotForThisDriver),
+    }
+}
+
+/// Register a PCI driver supplied by a loadable module. Reached from the
+/// `narf_register_pci_driver` kernel-ABI export. `probe` is a [`ModuleProbeFn`]
+/// passed as a raw address. Returns 0, or `-EINVAL` for a null probe.
+///
+/// # Safety
+/// `probe` must be a valid [`ModuleProbeFn`] pointer that stays mapped for as
+/// long as the match is registered.
+pub unsafe fn register_module_pci_driver(
+    name: &str,
+    vendor: u16,
+    device: u16,
+    probe: usize,
+) -> i32 {
+    if probe == 0 {
+        return -22; // -EINVAL
+    }
+    // SAFETY: the caller promises `probe` is a valid `ModuleProbeFn` address;
+    // mirrors the `set_probe_log_hook` round-trip in this file.
+    let thunk: ModuleProbeFn = unsafe { core::mem::transmute(probe) };
+    let name = intern_name(name);
+    {
+        // Dedup on `(vendor, device)` so a re-registration replaces the thunk
+        // rather than growing the table (mirrors `register`'s idempotency).
+        let mut g = MODULE_THUNKS.lock();
+        if let Some(pos) = g
+            .iter()
+            .position(|t| t.vendor == vendor && t.device == device)
+        {
+            g[pos].thunk = thunk;
+        } else {
+            g.push(ModuleThunk {
+                vendor,
+                device,
+                thunk,
+            });
+        }
+    }
+    register(PciMatch {
+        name,
+        kind: MatchKind::VendorDevice { vendor, device },
+        probe: module_probe_trampoline,
+    });
+    0
+}
+
+#[doc(hidden)]
+/// Test-only: look up a module-registered thunk, so a smoke can confirm the
+/// registration round-trip reaches the module's probe.
+pub fn __module_thunk_for_test(vendor: u16, device: u16) -> Option<ModuleProbeFn> {
+    MODULE_THUNKS
+        .lock()
+        .iter()
+        .find(|t| t.vendor == vendor && t.device == device)
+        .map(|t| t.thunk)
+}
+
 #[doc(hidden)]
 /// Test-only: reset the registry between smokes. Keeps tests
 /// hermetic without exposing a public clear path.
 pub fn __reset_for_test() {
     REGISTRY.lock().clear();
+    MODULE_THUNKS.lock().clear();
+    INTERNED_NAMES.lock().clear();
 }

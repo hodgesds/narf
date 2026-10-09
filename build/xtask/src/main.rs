@@ -2340,6 +2340,19 @@ struct BuildModuleArgs {
     #[arg(long, default_value = "narf-test-module")]
     package: String,
 
+    /// Cargo features to enable for the module build (comma-separated or
+    /// repeated). A dual-build driver crate builds as a `.ko` with
+    /// `--no-default-features --features module`.
+    #[arg(long, value_delimiter = ',')]
+    features: Vec<String>,
+
+    /// Do not enable the crate's default features. Paired with
+    /// `--features module` for a dual-build driver crate, so the `builtin`
+    /// default (which pulls real kernel crates) is dropped and the module
+    /// links against KSYMTAB instead.
+    #[arg(long)]
+    no_default_features: bool,
+
     /// Where to write the `.ko`. Defaults to
     /// `target/<triple>/release/<package>.ko`.
     #[arg(long)]
@@ -2794,24 +2807,42 @@ fn module_linker(root: &Path) -> Result<(String, Vec<String>)> {
 
 fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     let triple = args.arch.triple();
-    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+    let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    // `cargo rustc … --crate-type staticlib`, not `cargo build`: a dual-build
+    // driver crate declares `crate-type = ["rlib"]` so the built-in path and
+    // standalone clippy never try to emit a staticlib (which, outside the
+    // kernel link, would need its own allocator + panic handler). The `.ko`
+    // build overrides the crate type here, in the `module` config where the
+    // crate does not allocate and the `narf_driver!` macro supplies the panic
+    // handler. A crate that already declares `staticlib` (the reference
+    // test-module) is unaffected — the override names the same type.
+    cargo
         .current_dir(root)
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS")
-        .arg("build")
+        .arg("rustc")
         .arg("-p")
         .arg(&args.package)
         .arg("--release")
         .arg("--target")
         .arg(triple)
+        .arg("--crate-type")
+        .arg("staticlib")
         .arg("-Z")
         .arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z")
-        .arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128")
+        .arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128");
+    if args.no_default_features {
+        cargo.arg("--no-default-features");
+    }
+    if !args.features.is_empty() {
+        cargo.arg("--features").arg(args.features.join(","));
+    }
+    let status = cargo
         .status()
         .with_context(|| format!("failed to spawn cargo for {}", args.package))?;
     if !status.success() {
-        bail!("cargo build -p {} failed", args.package);
+        bail!("cargo rustc -p {} failed", args.package);
     }
 
     let stem = args.package.replace('-', "_");
@@ -2885,6 +2916,15 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     }
     let _ = std::fs::remove_dir_all(&work);
 
+    // A correct `.ko` has only the kernel's C-ABI exports undefined — the
+    // loader resolves them through KSYMTAB. If the crate accidentally pulled a
+    // real kernel crate into its image (e.g. a dual-build driver built without
+    // `--no-default-features`, so the `builtin` deps came along), the object
+    // would instead carry a flood of mangled `_ZN…` references no KSYMTAB can
+    // satisfy. Catch that here with a clear message, rather than at load time
+    // with an opaque MissingSymbol.
+    check_module_undefined_symbols(&out, root)?;
+
     if let Some(raw) = &args.kernel_abi {
         let hex = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
         let value = u32::from_str_radix(hex, 16)
@@ -2911,6 +2951,102 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         members.len()
     );
     Ok(out)
+}
+
+/// Build a dual-build driver crate as a loadable `.ko` (`--no-default-features
+/// --features module`) and return its bytes. Used to stage a real driver
+/// module into the guest for the loadable-driver e2e smoke.
+fn build_module_fixture(package: &str, arch: Arch, root: &Path) -> Result<Vec<u8>> {
+    let ko_args = BuildModuleArgs {
+        arch,
+        package: package.into(),
+        out: None,
+        features: vec!["module".into()],
+        no_default_features: true,
+        kernel_abi: None,
+        compress: false,
+        signature: None,
+        public_key: None,
+    };
+    let ko = build_module(&ko_args, root)?;
+    Ok(std::fs::read(&ko)?)
+}
+
+/// The kernel-ABI export names a `.ko` is allowed to leave undefined, read
+/// from the `kernel_abi! { … }` block in `modules/src/kabi.rs` so the gate
+/// can never drift from the surface it guards. Every export there is a
+/// `narf_`-prefixed C-ABI function, declared `fn narf_…(` one per line.
+fn allowed_kabi_exports(root: &Path) -> Result<Vec<String>> {
+    let path = root.join("modules").join("src").join("kabi.rs");
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("fn narf_") {
+            if let Some(end) = rest.find('(') {
+                let ident = &rest[..end];
+                if !ident.is_empty()
+                    && ident
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    names.push(format!("narf_{ident}"));
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        bail!("found no kernel-ABI exports in {}", path.display());
+    }
+    Ok(names)
+}
+
+/// List a relocatable object's undefined symbols via `nm`/`llvm-nm`. `nm`
+/// reads any architecture's ELF symbol table, so this works for a foreign-arch
+/// `.ko` on the host (unlike the linker, which is arch-bound).
+fn module_undefined_symbols(ko: &Path) -> Result<Vec<String>> {
+    for nm in ["nm", "llvm-nm"] {
+        match Command::new(nm).arg("-u").arg(ko).output() {
+            Ok(o) if o.status.success() => {
+                return Ok(String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|l| l.trim().rsplit(char::is_whitespace).next())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+                    .collect());
+            }
+            _ => continue,
+        }
+    }
+    bail!("could not run `nm -u` (install binutils or llvm-tools)")
+}
+
+/// Fail the build if the `.ko` leaves any symbol undefined that is not a
+/// kernel-ABI export. See the call site for why.
+fn check_module_undefined_symbols(ko: &Path, root: &Path) -> Result<()> {
+    let allowed = allowed_kabi_exports(root)?;
+    let undefined = module_undefined_symbols(ko)?;
+    let offenders: Vec<&String> = undefined
+        .iter()
+        .filter(|s| !allowed.iter().any(|a| a == *s))
+        .collect();
+    if !offenders.is_empty() {
+        bail!(
+            "{} leaves {} symbol(s) undefined that KSYMTAB cannot resolve: {}\n\
+             a dual-build driver must be built with `--no-default-features --features module` \
+             so no kernel crate is linked in; only the C-ABI exports in modules/src/kabi.rs \
+             may be left undefined",
+            ko.display(),
+            offenders.len(),
+            offenders
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Canonical kernel rustflags per arch, mirroring `.cargo/config.toml`.
@@ -3166,6 +3302,8 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
                 arch: args.arch,
                 package: "narf-test-module".into(),
                 out: None,
+                features: Vec::new(),
+                no_default_features: false,
                 kernel_abi: None,
                 compress,
                 signature: None,
@@ -3181,6 +3319,11 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         match build_fixture(true) {
             Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko.lz4", bytes)),
             Err(e) => println!("xtask: compressed test module unavailable ({e})"),
+        }
+        // A real dual-build driver `.ko` for the loadable-driver e2e smoke.
+        match build_module_fixture("narf-drivers-net-e1000", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/narf_drivers_net_e1000.ko", bytes)),
+            Err(e) => println!("xtask: e1000 driver module unavailable ({e})"),
         }
 
         if !fixtures.is_empty() {
@@ -9096,6 +9239,8 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
             arch: args.arch,
             package: "narf-test-module".into(),
             out: None,
+            features: Vec::new(),
+            no_default_features: false,
             kernel_abi: None,
             compress: false,
             signature: None,
