@@ -297,7 +297,7 @@ unsafe fn run_droppers(mut list: *mut DeferHdr) -> usize {
 
 /// Hand `ready` (owned, grace period elapsed) to the worker, or run it inline
 /// when no worker hook is installed.
-fn offload_or_run(ready: *mut DeferHdr) {
+pub(super) fn offload_or_run(ready: *mut DeferHdr) {
     if ready.is_null() {
         return;
     }

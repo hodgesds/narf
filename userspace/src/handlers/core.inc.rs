@@ -18438,11 +18438,6 @@ fn current_shm_ipc_ns() -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
     crate::namespaces::current_ipc_namespace(current_task_id())
 }
 
-#[cfg(feature = "container")]
-fn current_shm_ipc_ns_id() -> u64 {
-    crate::namespaces::current_ipc_namespace_id(current_task_id())
-}
-
 #[cfg(not(feature = "container"))]
 fn current_shm_ipc_ns_id() -> u64 {
     0

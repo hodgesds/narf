@@ -131,16 +131,19 @@ fn smoke_rcu_retire_box_advance_epoch_reclaims() -> TestResult {
 }
 kernel_test_in!("rcu", smoke_rcu_retire_box_advance_epoch_reclaims);
 
-/// With a reclaim worker installed, a quiescent report must NOT run
-/// grace-period-expired destructors inline: it hands them to the worker and
-/// wakes it. `report_quiescent` is reached from arbitrary places (a nested
-/// executor round inside a driver wait, an idle path) whose frame may hold
-/// driver gates or locks; a destructor that freed a VirGL buffer re-took the
-/// GPU request gate its caller held and spun forever. Linux runs RCU
-/// callbacks from softirq / the rcuo kthreads, never inline in such a caller.
-/// The explicit grace-period wait (`sync`) keeps its contract: everything
-/// retired before it is dropped when it returns.
-fn smoke_rcu_quiescent_offloads_destructors_to_worker() -> TestResult {
+/// A grace-period-ready destructor must hand off to the reclaim worker rather
+/// than run inline. The QSBR drain reaches this handoff from arbitrary places
+/// (a nested executor round inside a driver wait, an idle path) whose frame
+/// may hold driver gates or locks; a freed VirGL buffer re-taking the GPU
+/// request gate there spun forever. Linux runs RCU callbacks from softirq /
+/// the rcuo kthreads, never inline in such a caller.
+///
+/// This test supplies an already-ready node directly to the handoff. A local
+/// epoch advance alone cannot make a node ready on SMP: every active CPU must
+/// publish the later epoch. The `sync` smokes cover that cross-CPU
+/// grace-period invariant; relying on it here made the worker test race the
+/// aarch64 AP's next scheduler boundary.
+fn smoke_rcu_ready_destructors_offload_to_worker() -> TestResult {
     use alloc::boxed::Box;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -158,11 +161,12 @@ fn smoke_rcu_quiescent_offloads_destructors_to_worker() -> TestResult {
 
     DROPS.store(0, Ordering::Relaxed);
     WAKES.store(0, Ordering::Relaxed);
-    crate::report_quiescent();
     crate::set_reclaim_offload(wake);
-    crate::retire_box(Box::new(Canary));
-    crate::advance_epoch_if_pending();
-    crate::report_quiescent();
+    // `alloc_node` creates an owned, live `DeferNode`; passing it directly to
+    // the handoff models exactly the node list `drain_local_bucket` owns once
+    // it has proved the grace period elapsed.
+    let ready = crate::alloc_node(Box::new(Canary));
+    crate::qsbr::offload_or_run(ready.cast());
     let inline_drops = DROPS.load(Ordering::Relaxed);
     let wakes = WAKES.load(Ordering::Relaxed);
     let ran = crate::run_offloaded_reclaim();
@@ -184,7 +188,10 @@ fn smoke_rcu_quiescent_offloads_destructors_to_worker() -> TestResult {
     if wakes == 0 {
         return TestResult::Fail("offloaded destructors without waking the worker");
     }
-    if ran != 1 || worker_drops != 1 {
+    // Other CPUs may hand already-ready callbacks to the same worker while
+    // this smoke runs, so `ran` is a batch count rather than this Canary's
+    // identity. The Canary count is the exact-once assertion.
+    if ran == 0 || worker_drops != 1 {
         return TestResult::Fail("worker did not run the offloaded destructor exactly once");
     }
     if synced_drops != 2 {
@@ -192,7 +199,7 @@ fn smoke_rcu_quiescent_offloads_destructors_to_worker() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("rcu", smoke_rcu_quiescent_offloads_destructors_to_worker);
+kernel_test_in!("rcu", smoke_rcu_ready_destructors_offload_to_worker);
 
 /// Retiring far more objects than the old fixed bucket held must reclaim
 /// EVERY one of them.

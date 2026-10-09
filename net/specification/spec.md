@@ -220,7 +220,8 @@ every other device takes the next unused ifindex when it registers
 (`dev_new_index`) and keeps it for its lifetime, including across a
 re-registration under the same name; a device known only to the frame-ring
 registry gets one from the same counter on first sight. The link dump,
-`SIOCGIFINDEX`, `/sys/class/net/<dev>/ifindex`, the BPF XDP attach path and
+`SIOCGIFINDEX`, its inverse `SIOCGIFNAME`, `/sys/class/net/<dev>/ifindex`, the
+BPF XDP attach path and
 `iface::send_on_ifindex` all use that one number. A name containing `%d` takes
 the lowest unused number (`dev_alloc_name`): e1000 and virtio-net register as
 `eth%d` and wireless drivers as `wlan%d`, each device under one name in both

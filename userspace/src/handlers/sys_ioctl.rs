@@ -1347,7 +1347,8 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::NotFound)
             if matches!(
                 cmd,
-                0x8913
+                0x8910
+                    | 0x8913
                     | 0x8914
                     | 0x8915
                     | 0x891b
@@ -1369,7 +1370,8 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::InvalidData)
             if matches!(
                 cmd,
-                0x8913
+                0x8910
+                    | 0x8913
                     | 0x8914
                     | 0x8915
                     | 0x891b

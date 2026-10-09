@@ -1600,6 +1600,13 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
     };
     let (tx_prod, mut tx_cons) = narf_ipc::channel::<Frame, TX_RING_N>();
     let (rx_prod, rx_cons) = narf_ipc::channel::<Frame, RX_RING_N>();
+    // Keep the legacy L3 registry -- which is what rtnetlink and
+    // NetworkManager consume -- in lockstep with the ring interface.  Without
+    // this, `register_static` correctly creates eth0 administratively down,
+    // but also leaves its physical carrier at the default false.  QEMU has
+    // already told us its virtio-net link is up, so NetworkManager sees an
+    // unavailable device and never starts DHCP.
+    narf_net::iface::set_link_metadata(&name, link_up, None, None);
     let iface = narf_net::virtio_net::VirtioNet::new(name, mac, mtu, link_up, tx_prod, rx_cons);
     let authority = narf_net::bootstrap_authority();
     // Registration failure leaks the iface (returned by-value into

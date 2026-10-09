@@ -1438,8 +1438,11 @@ nest the reservation lock, but the reservation layer never enters either
 family table, providing a fixed lock order without an IPv4/IPv6 ABBA path.
 
 Internet sockets implement the legacy network-device ioctl ABI for
-`SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFMTU`,
-`SIOCGIFHWADDR`, and `SIOCGIFINDEX`. Each consumes and returns the native
+`SIOCGIFNAME`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFMTU`,
+`SIOCGIFHWADDR`, and `SIOCGIFINDEX`. `SIOCGIFNAME` consumes `ifr_ifindex` and
+writes the matching NUL-terminated interface name; an absent or nonpositive
+index is `ENODEV`. The other getters consume the interface name. Each consumes
+and returns the native
 64-bit 40-byte `struct ifreq`, resolves the interface in the socket's network
 namespace, returns `ENODEV` for an unknown name and `EFAULT` for an invalid
 ifreq pointer, and reports the same registry fields used by rtnetlink.

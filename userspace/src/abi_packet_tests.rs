@@ -74,6 +74,7 @@ const MSG_WAITALL: u64 = 0x100;
 const MSG_ERRQUEUE: u64 = 0x2000;
 const MSG_NOSIGNAL: u64 = 0x4000;
 const FIONREAD: u64 = 0x541B;
+const SIOCGIFNAME: u64 = 0x8910;
 const SIOCGIFFLAGS: u64 = 0x8913;
 const SIOCGIFINDEX: u64 = 0x8933;
 const SIOCGIFHWADDR: u64 = 0x8927;
@@ -1926,8 +1927,9 @@ kernel_test_in!(
 );
 
 /// The generic socket ioctls work on a packet socket (`packet_ioctl` falls
-/// through to `dev_ioctl`): SIOCGIFINDEX and SIOCGIFHWADDR, which DHCP
-/// clients use to fill `sockaddr_ll`.
+/// through to `dev_ioctl`): the SIOCGIFINDEX/SIOCGIFNAME inverse pair and
+/// SIOCGIFHWADDR, which DHCP clients and systemd-resolved use to identify an
+/// interface from packet-socket state.
 fn smoke_abi_packet_device_ioctls() -> TestResult {
     with_setup(|| {
         let ifindex = nic(true)?;
@@ -1945,6 +1947,16 @@ fn smoke_abi_packet_device_ioctls() -> TestResult {
             i32::from_ne_bytes(ifr[16..20].try_into().unwrap()) == ifindex,
             "ifr_ifindex",
         )?;
+        // `if_indextoname` puts the input index in the ifreq union and must
+        // overwrite a stale name with the matching namespace-local device.
+        ifr[..16].fill(0xa5);
+        ifr[16..20].copy_from_slice(&ifindex.to_ne_bytes());
+        expect(
+            sys(Syscall::Ioctl, a2(fd, SIOCGIFNAME, ifr.as_mut_ptr() as u64)) == Some(0),
+            "SIOCGIFNAME",
+        )?;
+        let name_end = ifr[..16].iter().position(|b| *b == 0).unwrap_or(16);
+        expect(&ifr[..name_end] == NIC.as_bytes(), "ifr_name from ifindex")?;
         expect(
             sys(
                 Syscall::Ioctl,
