@@ -33,15 +33,22 @@
 //! LINUX-GAP: a validated submission is **not queued**. The pieces it would
 //! need now all exist separately — the GFX11 and compute queue descriptors
 //! (`amdgpu_mqd`), the ring with its doorbell and writeback slots
-//! (`amdgpu_ring`), the MES `ADD_QUEUE` transport (`amdgpu_mes`), the CP's
-//! clear-state preamble (`amdgpu_clearstate`), and materialised page tables
-//! (`amdgpu_vm`) — but nothing assembles them: no bring-up path allocates a
-//! ring and an MQD, registers the queue with the MES, and hands this module
-//! somewhere to write. `gfx_mqd_init` and `compute_mqd_init` are called by
-//! tests and by nothing else. So there is still no ring an engine is reading,
-//! and a fence handle returned for work that will never run is worse than a
-//! refusal, because a client waits on it forever. A well-formed request
-//! therefore parses, validates, and then reports ENODEV.
+//! (`amdgpu_ring`), the MES `ADD_QUEUE` transport in both its process and its
+//! legacy-kernel-queue shapes (`amdgpu_mes`), the CP's clear-state preamble
+//! (`amdgpu_clearstate`), and materialised page tables (`amdgpu_vm`).
+//! `GfxContext` assembles the descriptions — it owns the ring, the writeback
+//! page and the queue descriptor, and derives the register sequence's
+//! arguments and the MES mapping from the same addresses — and
+//! `apply_gfx11_sequence` executes the register half.
+//!
+//! What is missing is the MES itself. Registering the queue needs a live
+//! `MesQueue`, which needs the MES microcode loaded and `SET_HW_RSRC` issued
+//! against hardware, and no bring-up path does either: `build_set_hw_resources`
+//! and `MesQueue::new` are called by tests and by nothing else. Until that
+//! runs, nothing tells the firmware the queue exists, so there is still no ring
+//! an engine is reading — and a fence handle returned for work that will never
+//! run is worse than a refusal, because a client waits on it forever. A
+//! well-formed request therefore parses, validates, and then reports ENODEV.
 //! `AMDGPU_INFO_ACCEL_WORKING` reports false for the same reason, so no Mesa
 //! client reaches this ioctl at all; it is reachable only by something that
 //! ignored that answer.

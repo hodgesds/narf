@@ -7594,6 +7594,117 @@ kernel_test_in!(
     smoke_amdgpu_gfx_queue_description_is_consistent
 );
 
+/// Applying a sequence performs every step, in order, including the wait.
+///
+/// The builders were values nothing executed. What an applier has to get right
+/// is narrow and silent when wrong: the order (two writes to the same register
+/// with a wait between them are not interchangeable), and that the wait
+/// happens at all — `gfx_v11_0_cp_gfx_resume`'s `mdelay(1)` is why the second
+/// `CP_RB0_CNTL` write exists, so a sequence applied without it writes the
+/// same value twice for no reason and the ring-size field may not have
+/// settled.
+fn smoke_amdgpu_gfx11_sequence_applies_in_order() -> TestResult {
+    use crate::amdgpu_cp_fw::CpFwMmio;
+    use crate::amdgpu_gfx::{apply_gfx11_sequence, build_gfx11_ring_init, GfxStep};
+    use alloc::vec::Vec;
+
+    /// Records what it is asked to do, in order.
+    struct Recorder {
+        writes: Vec<(u32, u32)>,
+    }
+    impl CpFwMmio for Recorder {
+        fn read(&mut self, _byte_off: u32) -> u32 {
+            0
+        }
+        fn write(&mut self, byte_off: u32, value: u32) {
+            self.writes.push((byte_off, value));
+        }
+    }
+
+    const GC: u32 = 0x0003_0000;
+    const GC1: u32 = 0x0005_0000;
+    const RING: u64 = 0x1_0000_0000;
+    let seq = match build_gfx11_ring_init(
+        GC,
+        GC1,
+        0xA5A5_A5A2,
+        RING,
+        4096,
+        0x116,
+        true,
+        0x2_DEAD_0000,
+        0x3_BEEF_0000,
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("the sequence was refused"),
+    };
+
+    let mut rec = Recorder { writes: Vec::new() };
+    let mut delays: Vec<u32> = Vec::new();
+    apply_gfx11_sequence(&mut rec, &seq, &mut |us| delays.push(us));
+
+    // Every write in the sequence reached the mock, and nothing else did.
+    let expected: Vec<(u32, u32)> = seq
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            GfxStep::Write { addr, value } => Some((*addr, *value)),
+            GfxStep::Delay { .. } => None,
+        })
+        .collect();
+    if rec.writes != expected {
+        return TestResult::Fail("the applied writes are not the sequence's writes in order");
+    }
+    if rec.writes.is_empty() {
+        return TestResult::Fail("the sequence should have writes to apply");
+    }
+
+    // The waits were performed, with the durations the sequence asked for.
+    let expected_delays: Vec<u32> = seq
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            GfxStep::Delay { us } => Some(*us),
+            GfxStep::Write { .. } => None,
+        })
+        .collect();
+    if delays != expected_delays {
+        return TestResult::Fail("the applied delays are not the sequence's delays");
+    }
+    if delays.is_empty() {
+        return TestResult::Fail("gfx_v11_0_cp_gfx_resume's mdelay(1) must be one of the steps");
+    }
+
+    // And the order across kinds: regCP_RB0_CNTL 0x1de1 is written twice with
+    // the wait between them. Counting writes before the first delay is how a
+    // reordering shows up — a drop-in that applied all writes and then all
+    // delays would pass both checks above.
+    let cntl = GC + (0x1de1 << 2);
+    let delay_pos = seq
+        .steps
+        .iter()
+        .position(|s| matches!(s, GfxStep::Delay { .. }));
+    let Some(delay_pos) = delay_pos else {
+        return TestResult::Fail("no delay step to position against");
+    };
+    let before = seq.steps[..delay_pos]
+        .iter()
+        .filter(|s| matches!(s, GfxStep::Write { addr, .. } if *addr == cntl))
+        .count();
+    let after = seq.steps[delay_pos..]
+        .iter()
+        .filter(|s| matches!(s, GfxStep::Write { addr, .. } if *addr == cntl))
+        .count();
+    if before != 1 || after != 1 {
+        return TestResult::Fail("CP_RB0_CNTL is written once on each side of the wait");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx11_sequence_applies_in_order
+);
+
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION

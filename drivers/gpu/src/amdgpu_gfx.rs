@@ -904,7 +904,11 @@ impl GfxContext {
 // Register offsets from `gc_11_0_0_offset.h`, in DWORD address space — the
 // `GfxWrite.addr` convention elsewhere in this file is a byte address, so
 // each is shifted when emitted.
-const GFX11_GRBM_GFX_CNTL: u32 = 0x0900;
+/// `regGRBM_GFX_CNTL` — dword 0x0900 on GC BASE_IDX **1**. Public because
+/// [`build_gfx11_ring_init`] takes its live value as an argument, so a caller
+/// has to be able to read it, and reading it from the wrong window is the
+/// mistake the parameter exists to prevent.
+pub const GFX11_GRBM_GFX_CNTL: u32 = 0x0900;
 const GFX11_CP_RB_WPTR_DELAY: u32 = 0x0f61;
 const GFX11_CP_RB0_BASE: u32 = 0x1de0;
 const GFX11_CP_RB0_CNTL: u32 = 0x1de1;
@@ -952,6 +956,38 @@ pub enum GfxStep {
     /// dropping it is invisible in review and the second `CP_RB0_CNTL` write
     /// that follows exists only because of it.
     Delay { us: u32 },
+}
+
+/// Perform a sequence's writes and its waits, in order.
+///
+/// [`build_gfx11_ring_init`] and [`build_gfx9_ring_init`] return values rather
+/// than touching hardware, so a whole bring-up is inspectable without a GPU.
+/// This is the other half: the part that executes one. It is generic over
+/// [`crate::amdgpu_cp_fw::CpFwMmio`] — the same trait the CP firmware load
+/// uses — so a test drives it against a recording mock, and so the byte-offset
+/// addresses the sequence carries are converted to MM_INDEX's dword addresses
+/// in exactly one place, the adapter, rather than once per caller.
+///
+/// `delay` performs a [`GfxStep::Delay`]. It is a parameter because a wait is
+/// the one step a mock cannot usefully perform and the one a test must be able
+/// to observe.
+///
+/// `gfx_v11_0_cp_gfx_resume`'s `mdelay(1)` is load-bearing: the ring-size
+/// field has to settle before the second `CP_RB0_CNTL` write, and that second
+/// write exists only because of the wait. Dropping the wait while keeping the
+/// write looks like a working sequence and is not one, which is why
+/// [`GfxStep::Delay`] is a step at all rather than a comment.
+pub fn apply_gfx11_sequence<M: crate::amdgpu_cp_fw::CpFwMmio>(
+    mmio: &mut M,
+    seq: &Gfx11Sequence,
+    delay: &mut dyn FnMut(u32),
+) {
+    for step in &seq.steps {
+        match *step {
+            GfxStep::Write { addr, value } => mmio.write(addr, value),
+            GfxStep::Delay { us } => delay(us),
+        }
+    }
 }
 
 /// An ordered GFX11 bring-up sequence.

@@ -19,9 +19,9 @@
 //!
 //! LINUX-GAP: `ACCEL_WORKING` reports **false**. Not because the pieces are
 //! absent — `AMDGPU_CS` parses and validates, the rings and their doorbells
-//! exist, the MQDs are built, the page tables are materialised — but because
-//! nothing yet puts a validated submission on a ring an engine is reading, so
-//! no submitted work executes. That is the honest answer and it is also the
+//! exist, the MQDs are built and written, the page tables are materialised —
+//! but because the MES has not been brought up, so no queue is registered with
+//! the firmware and no submitted work executes. That is the honest answer and it is also the
 //! useful one: Mesa declines the device cleanly at initialisation instead of
 //! coming up and failing at first draw. Flipping this flag is the milestone
 //! marker for the last link in the submission path landing, and the reason it

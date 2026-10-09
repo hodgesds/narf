@@ -945,6 +945,26 @@ impl AmdGpu {
         )
     }
 
+    /// Apply a GFX11 ring-init sequence: perform its writes and its waits.
+    ///
+    /// [`crate::amdgpu_gfx::build_gfx11_ring_init`] returns a value rather
+    /// than touching hardware, so the whole sequence is inspectable without a
+    /// GPU. Nothing executed it. This does, through the same `CpFwMmio`
+    /// adapter the firmware load uses — which is where the sequence's **byte**
+    /// offsets become the dword addresses MM_INDEX wants.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively for the whole sequence: MM_INDEX is a
+    /// shared latch, and a concurrent reader between the index and the data
+    /// write lands on a different register.
+    pub unsafe fn apply_gfx11_sequence(&self, seq: &crate::amdgpu_gfx::Gfx11Sequence) {
+        // SAFETY: caller-asserted BAR5 ownership, held for the adapter's
+        // whole lifetime — it borrows `self.regs` and never outlives this
+        // frame.
+        let mut mmio = CpRegsAdapter { regs: &self.regs };
+        crate::amdgpu_gfx::apply_gfx11_sequence(&mut mmio, seq, &mut delay_us);
+    }
+
     /// Read the full `ApertureLayout` (VRAM + system aperture)
     /// through the MC register block. VRAM aperture mirrors what
     /// `vram_info()` returns; system aperture is fresh from the
@@ -1717,6 +1737,24 @@ unsafe fn mm_read(regs: &MmioRegion, addr: u32) -> u32 {
 /// [`AmdGpu::read_grbm_status`] were doing.
 pub(crate) const fn mm_dword(rel_bytes: u32) -> u32 {
     rel_bytes / 4
+}
+
+/// Busy-wait `us` microseconds of wall-clock time.
+///
+/// `narf_time::calibrate_clocks` returns the TSC frequency, or 0 when every
+/// calibration path failed. The spin fallback is the same shape `ixgbe`'s
+/// reset handshake uses, and it is a fallback rather than the primary path
+/// because a spin count's duration is whatever the CPU clock makes it, while
+/// the hardware waits this stands in for are specified in time.
+fn delay_us(us: u32) {
+    let hz = narf_time::calibrate_clocks();
+    if hz > 0 {
+        narf_time::busy_wait_cycles((hz / 1_000_000).max(1) * u64::from(us));
+    } else {
+        for _ in 0..(u64::from(us) * 1000) {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
