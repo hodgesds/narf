@@ -321,6 +321,7 @@ pub const C_CP_HQD_PQ_WPTR_POLL_ADDR_HI: usize = 142;
 pub const C_CP_HQD_PQ_DOORBELL_CONTROL: usize = 143;
 pub const C_CP_HQD_PQ_CONTROL: usize = 145;
 pub const C_CP_HQD_IB_CONTROL: usize = 149;
+pub const C_CP_HQD_IQ_TIMER: usize = 150;
 pub const C_CP_HQD_DEQUEUE_REQUEST: usize = 152;
 pub const C_CP_MQD_CONTROL: usize = 162;
 pub const C_CP_HQD_EOP_BASE_ADDR_LO: usize = 165;
@@ -344,6 +345,8 @@ const CP_HQD_PQ_RPTR_DEFAULT: u32 = 0x0000_0000;
 const CP_HQD_PERSISTENT_STATE_DEFAULT: u32 = 0x0be0_5501;
 const CP_HQD_IB_CONTROL_DEFAULT: u32 = 0x0030_0000;
 const CP_MQD_CONTROL_DEFAULT: u32 = 0x0000_0100;
+const CP_HQD_IQ_TIMER_DEFAULT: u32 = 0x0000_0000;
+const CP_HQD_QUANTUM_DEFAULT: u32 = 0x0000_0000;
 
 const EOP_SIZE_MASK: u32 = 0x0000_003F;
 const C_DOORBELL_OFFSET_MASK: u32 = 0x0FFF_FFFC;
@@ -357,6 +360,7 @@ const PQ_TUNNEL_DISPATCH: u32 = 0x2000_0000;
 const PQ_PRIV_STATE: u32 = 0x4000_0000;
 const PQ_KMD_QUEUE: u32 = 0x8000_0000;
 const PQ_TMZ: u32 = 0x0040_0000;
+const PQ_NO_UPDATE_RPTR: u32 = 0x0800_0000;
 const PERSISTENT_PRELOAD_SIZE_MASK: u32 = 0x0003_FF00;
 const IB_MIN_IB_AVAIL_SIZE_MASK: u32 = 0x0030_0000;
 const QUANTUM_EN: u32 = 0x0000_0001;
@@ -420,8 +424,18 @@ pub fn compute_mqd_init(
 
     // End-of-pipe buffer. `EOP_SIZE` is log2(bytes / 4) - 1, so the register
     // describes 2^(EOP_SIZE+1) dwords.
-    mqd[C_CP_HQD_EOP_BASE_ADDR_LO] = eop_gpu_addr as u32;
-    mqd[C_CP_HQD_EOP_BASE_ADDR_HI] = (eop_gpu_addr >> 32) as u32;
+    //
+    // LINUX-GAP: the address was written unshifted here, and the test asserted
+    // that — "EOP buffer: address plain", and a later comment saying the ring
+    // base is "shifted right by 8, unlike the EOP and MQD addresses". Only the
+    // MQD address is plain. `gfx_v11_0_compute_mqd_init:4350` computes
+    // `eop_base_addr = prop->eop_gpu_addr >> 8` and writes both halves of
+    // THAT, exactly as it does for the ring base. Unshifted, the register
+    // names an address 256 times further out, and the MEC writes its
+    // completion records there.
+    let eop = eop_gpu_addr >> 8;
+    mqd[C_CP_HQD_EOP_BASE_ADDR_LO] = eop as u32;
+    mqd[C_CP_HQD_EOP_BASE_ADDR_HI] = (eop >> 32) as u32;
     let eop_size = log2_minus_one(MEC_HPD_BYTES / 4).ok_or(FsError::InvalidData)?;
     mqd[C_CP_HQD_EOP_CONTROL] = put_field(CP_HQD_EOP_CONTROL_DEFAULT, EOP_SIZE_MASK, eop_size);
 
@@ -504,6 +518,179 @@ pub fn compute_mqd_init(
 
     mqd[C_FENCE_ADDRESS_LO] = prop.fence_address as u32;
     mqd[C_FENCE_ADDRESS_HI] = (prop.fence_address >> 32) as u32;
+    Ok(mqd)
+}
+
+/// `MES_EOP_SIZE` (`mes_v11_0.c`) — the MES pipe's end-of-pipe buffer. The
+/// same 2048 bytes a MEC queue gets, but a separate constant because they are
+/// separate definitions and either could move.
+pub const MES_EOP_BYTES: u64 = 2048;
+
+/// `PRELOAD_SIZE` for a MES pipe's queue. Also 0x55, like the compute path.
+const MES_PRELOAD_SIZE: u32 = 0x55;
+
+/// Fill the MES pipe's own queue descriptor, following `mes_v11_0_mqd_init`.
+///
+/// The MES scheduler reads its command packets out of a ring like any other
+/// queue, and that ring is described by a `v11_compute_mqd` — the same 512
+/// dwords [`compute_mqd_init`] fills. **It is not the same descriptor with a
+/// different doorbell.** `mes_v11_0_mqd_init` and
+/// `gfx_v11_0_compute_mqd_init` differ in fourteen places, and writing one
+/// where the other belongs produces a scheduler that is mapped and does not
+/// run. Each difference is marked below, so the two can be read side by side.
+///
+/// `eop_gpu_addr` is the pipe's end-of-pipe buffer, [`MES_EOP_BYTES`] long.
+pub fn mes_mqd_init(
+    prop: &MqdProp,
+    eop_gpu_addr: u64,
+) -> Result<[u32; COMPUTE_MQD_DWORDS], FsError> {
+    if prop.queue_size < 8 || !prop.queue_size.is_power_of_two() {
+        return Err(FsError::InvalidData);
+    }
+    if prop.hqd_base_gpu_addr & 0xFF != 0 {
+        return Err(FsError::InvalidData);
+    }
+
+    let mut mqd = [0u32; COMPUTE_MQD_DWORDS];
+
+    // Identical to the compute path.
+    mqd[C_HEADER] = COMPUTE_MQD_HEADER;
+    mqd[C_COMPUTE_PIPELINESTAT_ENABLE] = 1;
+    for index in [
+        C_COMPUTE_STATIC_THREAD_MGMT_SE0,
+        C_COMPUTE_STATIC_THREAD_MGMT_SE1,
+        C_COMPUTE_STATIC_THREAD_MGMT_SE2,
+        C_COMPUTE_STATIC_THREAD_MGMT_SE3,
+    ] {
+        mqd[index] = u32::MAX;
+    }
+    mqd[C_COMPUTE_MISC_RESERVED] = COMPUTE_MISC_RESERVED;
+
+    // DIFFERENCE 1: the EOP buffer is sized from `MES_EOP_SIZE`, not
+    // `GFX11_MEC_HPD_SIZE`. Both are 2048 today, so this is the one difference
+    // that is currently invisible — which is exactly why it gets its own
+    // constant rather than sharing.
+    //
+    // DIFFERENCE 2: the base address is written AFTER the control value is
+    // computed rather than before. No observable effect; noted so a reader
+    // diffing the two functions does not go looking for one.
+    let eop = eop_gpu_addr >> 8;
+    mqd[C_CP_HQD_EOP_BASE_ADDR_LO] = eop as u32;
+    mqd[C_CP_HQD_EOP_BASE_ADDR_HI] = (eop >> 32) as u32;
+    let eop_size = log2_minus_one(MES_EOP_BYTES / 4).ok_or(FsError::InvalidData)?;
+    mqd[C_CP_HQD_EOP_CONTROL] = put_field(CP_HQD_EOP_CONTROL_DEFAULT, EOP_SIZE_MASK, eop_size);
+
+    // DIFFERENCE 3: `cp_hqd_dequeue_request` is not written at all. The
+    // compute path assigns it 0 after a `memset`, so the result is the same.
+    mqd[C_CP_HQD_PQ_RPTR] = 0;
+    mqd[C_CP_HQD_PQ_WPTR_LO] = 0;
+    mqd[C_CP_HQD_PQ_WPTR_HI] = 0;
+
+    mqd[C_CP_MQD_BASE_ADDR_LO] = (prop.mqd_gpu_addr & 0xffff_fffc) as u32;
+    mqd[C_CP_MQD_BASE_ADDR_HI] = (prop.mqd_gpu_addr >> 32) as u32;
+    mqd[C_CP_MQD_CONTROL] = put_field(CP_MQD_CONTROL_DEFAULT, MQD_VMID_MASK, 0);
+
+    let pq = prop.hqd_base_gpu_addr >> 8;
+    mqd[C_CP_HQD_PQ_BASE_LO] = pq as u32;
+    mqd[C_CP_HQD_PQ_BASE_HI] = (pq >> 32) as u32;
+
+    mqd[C_CP_HQD_PQ_RPTR_REPORT_ADDR_LO] = (prop.rptr_gpu_addr & 0xffff_fffc) as u32;
+    mqd[C_CP_HQD_PQ_RPTR_REPORT_ADDR_HI] = ((prop.rptr_gpu_addr >> 32) as u32) & 0xffff;
+
+    // DIFFERENCE 4: the write-pointer poll address is masked to **eight**
+    // bytes here (0xfffffff8), not four. The MES polls a quadword.
+    mqd[C_CP_HQD_PQ_WPTR_POLL_ADDR_LO] = (prop.wptr_gpu_addr & 0xffff_fff8) as u32;
+    mqd[C_CP_HQD_PQ_WPTR_POLL_ADDR_HI] = ((prop.wptr_gpu_addr >> 32) as u32) & 0xffff;
+
+    let mut pq_control = CP_HQD_PQ_CONTROL_DEFAULT;
+    let queue_size = log2_minus_one(prop.queue_size / 4).ok_or(FsError::InvalidData)?;
+    pq_control = put_field(pq_control, PQ_QUEUE_SIZE_MASK, queue_size);
+
+    // DIFFERENCE 5, and the one worth stopping on. Linux writes:
+    //
+    //     REG_SET_FIELD(tmp, CP_HQD_PQ_CONTROL, RPTR_BLOCK_SIZE,
+    //                   ((order_base_2(AMDGPU_GPU_PAGE_SIZE / 4) - 1) << 8))
+    //
+    // `REG_SET_FIELD` already shifts by the field's own shift, which for
+    // `RPTR_BLOCK_SIZE` is 8. So the value is shifted **twice**: 9 becomes
+    // 0x900, then 0x90000, and the field's mask is 0x3F00 — nothing survives.
+    // The field ends up **zero**, clearing the 5 the register default carries.
+    //
+    // The compute path has no second shift and lands on 9.
+    //
+    // This is almost certainly unintended in Linux, and it is transcribed
+    // anyway. The MES firmware has only ever run against a descriptor with
+    // this field cleared; "correcting" it to 9 would make this the only driver
+    // in existence programming the scheduler differently from the one the
+    // firmware was tested against. Written as an explicit zero rather than by
+    // reproducing the double shift, because a double shift in Rust reads as a
+    // typo someone will quietly fix.
+    pq_control = put_field(pq_control, PQ_RPTR_BLOCK_SIZE_MASK, 0);
+
+    pq_control |= PQ_UNORD_DISPATCH;
+    // DIFFERENCE 6: tunnelling is cleared unconditionally; the compute path
+    // takes it from the queue's properties.
+    pq_control &= !PQ_TUNNEL_DISPATCH;
+    // DIFFERENCE 7: privileged and KMD are set unconditionally. The compute
+    // path sets them only for a kernel queue — and the MES pipe's ring always
+    // is one, so `prop.kernel_queue` is not consulted.
+    pq_control |= PQ_PRIV_STATE | PQ_KMD_QUEUE;
+    // DIFFERENCE 8: `NO_UPDATE_RPTR`, which the compute path never sets. The
+    // MES maintains its own read pointer.
+    pq_control |= PQ_NO_UPDATE_RPTR;
+    // DIFFERENCE 9: no TMZ. The MES pipe's ring is never a secure queue, so
+    // `prop.tmz_queue` is not consulted either.
+    mqd[C_CP_HQD_PQ_CONTROL] = pq_control;
+
+    // DIFFERENCE 10: the doorbell control is composed from **zero**, not from
+    // `regCP_HQD_PQ_DOORBELL_CONTROL_DEFAULT`. That default is 0 on GFX11, so
+    // there is no difference in the value — but the compute path's reliance on
+    // it is a thing that could change under us and this one cannot.
+    let mut doorbell = 0u32;
+    if prop.use_doorbell {
+        doorbell = put_field(doorbell, C_DOORBELL_OFFSET_MASK, prop.doorbell_index);
+        doorbell |= C_DOORBELL_EN;
+        doorbell &= !(C_DOORBELL_SOURCE | C_DOORBELL_HIT);
+    } else {
+        doorbell &= !C_DOORBELL_EN;
+    }
+    mqd[C_CP_HQD_PQ_DOORBELL_CONTROL] = doorbell;
+
+    mqd[C_CP_HQD_VMID] = 0;
+
+    // DIFFERENCE 11: active is **1**. A compute queue is handed to the
+    // scheduler inactive and the scheduler activates it; the scheduler's own
+    // queue has nobody to do that for it, so the descriptor says active and
+    // `mes_v11_0_queue_init_register` writes `CP_HQD_ACTIVE` straight from
+    // here. A zero would leave the MES mapped and never running, which is the
+    // failure this whole function exists to avoid.
+    mqd[C_CP_HQD_ACTIVE] = 1;
+
+    mqd[C_CP_HQD_PERSISTENT_STATE] = put_field(
+        CP_HQD_PERSISTENT_STATE_DEFAULT,
+        PERSISTENT_PRELOAD_SIZE_MASK,
+        MES_PRELOAD_SIZE,
+    );
+
+    // DIFFERENCE 12: `MIN_IB_AVAIL_SIZE` is NOT forced to 3 — the register
+    // default is taken as-is. Which turns out to be the same value:
+    // `regCP_HQD_IB_CONTROL_DEFAULT` is 0x00300000 and `MIN_IB_AVAIL_SIZE` is
+    // two bits at shift 20, so the default already encodes 3 and the compute
+    // path's assignment is a no-op. Another invisible difference, kept
+    // separate because the next header revision could make it visible.
+    mqd[C_CP_HQD_IB_CONTROL] = CP_HQD_IB_CONTROL_DEFAULT;
+    // DIFFERENCE 13: `cp_hqd_iq_timer` is written, which the compute path
+    // leaves at zero. The default happens to be zero, so this is another
+    // currently-invisible difference kept explicit.
+    mqd[C_CP_HQD_IQ_TIMER] = CP_HQD_IQ_TIMER_DEFAULT;
+    // DIFFERENCE 14: quantum is the register default (zero — so quantum
+    // scheduling is OFF) rather than the compute path's composed
+    // EN | SCALE | DURATION=1. The scheduler is not time-sliced by the CP.
+    mqd[C_CP_HQD_QUANTUM] = CP_HQD_QUANTUM_DEFAULT;
+
+    // And three fields the compute path sets that this one does not touch at
+    // all: the pipe and queue priorities, the user-queue fence address, and
+    // the CU mask. All stay zero.
     Ok(mqd)
 }
 

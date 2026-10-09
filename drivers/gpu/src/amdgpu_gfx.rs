@@ -997,13 +997,20 @@ pub struct Gfx11Sequence {
 }
 
 impl Gfx11Sequence {
-    fn write(&mut self, gc_base: u32, dword_reg: u32, value: u32) {
+    /// Append a write to `dword_reg` in the window based at `gc_base`.
+    ///
+    /// Public so other blocks' bring-up sequences can be built out of the same
+    /// type and executed by the same [`apply_gfx11_sequence`]. The type is
+    /// named for GFX because that is where it started; it carries nothing
+    /// GFX-specific.
+    pub fn write(&mut self, gc_base: u32, dword_reg: u32, value: u32) {
         self.steps.push(GfxStep::Write {
             addr: gc_base + (dword_reg << 2),
             value,
         });
     }
-    fn delay(&mut self, us: u32) {
+    /// Append a wait of at least `us` microseconds.
+    pub fn delay(&mut self, us: u32) {
         self.steps.push(GfxStep::Delay { us });
     }
     pub fn len(&self) -> usize {

@@ -10496,12 +10496,19 @@ fn smoke_amdgpu_mqd_compute_matches_linux() -> TestResult {
         }
     }
 
-    // EOP buffer: address plain, and EOP_SIZE = log2(2048/4) - 1 = 8 in
-    // bits[5:0] over the 0x00000006 default.
-    if mqd[C_CP_HQD_EOP_BASE_ADDR_LO] != eop as u32
-        || mqd[C_CP_HQD_EOP_BASE_ADDR_HI] != (eop >> 32) as u32
-    {
-        return TestResult::Fail("EOP base");
+    // EOP buffer: the address shifted right by 8, like the ring base, and
+    // EOP_SIZE = log2(2048/4) - 1 = 8 in bits[5:0] over the 0x00000006
+    // default.
+    //
+    // This read `!= eop as u32` and said "address plain". It is not plain:
+    // `gfx_v11_0_compute_mqd_init:4350` shifts it. A test built from the same
+    // misreading as the code cannot see the difference, so the literals below
+    // are written out rather than recomputed from `eop`.
+    if mqd[C_CP_HQD_EOP_BASE_ADDR_LO] != 0x0900_0000 || mqd[C_CP_HQD_EOP_BASE_ADDR_HI] != 0 {
+        return TestResult::Fail("EOP base is the address shifted right by eight");
+    }
+    if eop != 0x9_0000_0000 {
+        return TestResult::Fail("the EOP literal above assumes this address");
     }
     if MEC_HPD_BYTES != 2048 {
         return TestResult::Fail("GFX11_MEC_HPD_SIZE is 2048");
@@ -10536,7 +10543,8 @@ fn smoke_amdgpu_mqd_compute_matches_linux() -> TestResult {
         return TestResult::Fail("DOORBELL_EN must be clear without a doorbell");
     }
 
-    // The ring base is shifted right by 8, unlike the EOP and MQD addresses.
+    // The ring base is shifted right by 8 — as is the EOP base above. The MQD
+    // address is the plain one, masked to a dword rather than shifted.
     let pq = base.hqd_base_gpu_addr >> 8;
     if mqd[C_CP_HQD_PQ_BASE_LO] != pq as u32 || mqd[C_CP_HQD_PQ_BASE_HI] != (pq >> 32) as u32 {
         return TestResult::Fail("PQ base must be the address shifted by eight");
@@ -10673,6 +10681,205 @@ fn smoke_amdgpu_mqd_compute_matches_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu_mqd",
     smoke_amdgpu_mqd_compute_matches_linux
+);
+
+/// The MES pipe's own descriptor, as the DELTA from the compute one.
+///
+/// `mes_v11_0_mqd_init` and `gfx_v11_0_compute_mqd_init` fill the same
+/// `v11_compute_mqd` image and differ in fourteen places. The test builds both
+/// from identical properties and asserts the difference — every dword that
+/// must differ does, and no dword that must not differ does. Written this way
+/// because the failure the MES descriptor produces is a scheduler that maps
+/// successfully and never runs, and a copy of the compute path would look
+/// entirely plausible.
+fn smoke_amdgpu_mqd_mes_differs_from_compute() -> TestResult {
+    use crate::amdgpu_mqd::*;
+
+    let base = MqdProp {
+        mqd_gpu_addr: 0x1_0000_1006,
+        hqd_base_gpu_addr: 0x2_0000_0000,
+        rptr_gpu_addr: 0x0003_0000_0006,
+        // Deliberately 4-mod-8, so the two paths' masks differ visibly: the
+        // compute path keeps it, the MES path rounds it down to 8.
+        wptr_gpu_addr: 0x0004_0000_000C,
+        queue_size: 8192,
+        doorbell_index: 0x42,
+        use_doorbell: true,
+        // Both are claimed, and the MES path must ignore both: it sets
+        // PRIV_STATE / KMD_QUEUE unconditionally and never sets TMZ.
+        kernel_queue: true,
+        tmz_queue: true,
+        priority: QueuePriority::Maximum,
+        shadow_addr: 0,
+        gds_bkup_addr: 0,
+        csa_addr: 0,
+        // Both halves non-zero, so "the compute path writes it" is checkable
+        // on either dword.
+        fence_address: 0x8_0000_1234,
+    };
+    let eop = 0x9_0000_0000u64;
+    let mes = match mes_mqd_init(&base, eop) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a well-formed MES queue was refused"),
+    };
+    let comp = match compute_mqd_init(&base, eop) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("the compute comparison was refused"),
+    };
+
+    // ── the write-pointer poll address is quadword-aligned here ──
+    if comp[C_CP_HQD_PQ_WPTR_POLL_ADDR_LO] != 0x0000_000C {
+        return TestResult::Fail("the compute path masks the poll address to four bytes");
+    }
+    if mes[C_CP_HQD_PQ_WPTR_POLL_ADDR_LO] != 0x0000_0008 {
+        return TestResult::Fail("the MES path masks the poll address to eight bytes");
+    }
+
+    // ── CP_HQD_PQ_CONTROL, field by field ──
+    let c = comp[C_CP_HQD_PQ_CONTROL];
+    let m = mes[C_CP_HQD_PQ_CONTROL];
+    // NO_UPDATE_RPTR (bit 27) is set only by the MES path.
+    if m & 0x0800_0000 == 0 {
+        return TestResult::Fail("the MES descriptor sets NO_UPDATE_RPTR");
+    }
+    if c & 0x0800_0000 != 0 {
+        return TestResult::Fail("the compute descriptor must not set NO_UPDATE_RPTR");
+    }
+    // RPTR_BLOCK_SIZE (0x3F00). Linux's MES path shifts the value twice, so
+    // nothing survives the field mask and it clears the register default's 5.
+    // The compute path lands on 9 — log2(4096/4) - 1.
+    if (c & 0x0000_3F00) >> 8 != 9 {
+        return TestResult::Fail("the compute RPTR_BLOCK_SIZE is log2(page/4) - 1");
+    }
+    if m & 0x0000_3F00 != 0 {
+        return TestResult::Fail("the MES RPTR_BLOCK_SIZE is cleared by Linux's double shift");
+    }
+    // `regCP_HQD_PQ_CONTROL_DEFAULT` is 0x00308509, whose RPTR_BLOCK_SIZE
+    // field holds 5 — so a MES descriptor that simply left the field alone
+    // would read 5, not 0. The clear has to be written, and the rest of
+    // CP_HQD_PQ_CONTROL_DEFAULT must still be there to prove it was the field
+    // that was cleared and not the register that was composed from zero.
+    // Bits 15, 20 and 21 of that default are set and no field either path
+    // writes overlaps them, so they survive in both and prove the register was
+    // started from its default rather than composed from zero.
+    if m & 0x0030_8000 != 0x0030_8000 || c & 0x0030_8000 != 0x0030_8000 {
+        return TestResult::Fail("both paths must start from the register default");
+    }
+    // PRIV_STATE | KMD_QUEUE unconditional, TMZ never — with a prop that asks
+    // for TMZ and gets it from the compute path.
+    if m & 0xC000_0000 != 0xC000_0000 {
+        return TestResult::Fail("the MES descriptor is always privileged and KMD");
+    }
+    if c & 0x0040_0000 == 0 {
+        return TestResult::Fail("the compute path honours tmz_queue");
+    }
+    if m & 0x0040_0000 != 0 {
+        return TestResult::Fail("the MES descriptor is never a TMZ queue");
+    }
+
+    // ── active ──
+    if mes[C_CP_HQD_ACTIVE] != 1 {
+        return TestResult::Fail("the MES queue's descriptor says active");
+    }
+    if comp[C_CP_HQD_ACTIVE] != 0 {
+        return TestResult::Fail("a compute queue is activated by the scheduler, not here");
+    }
+
+    // ── the three register defaults taken as-is ──
+    if mes[C_CP_HQD_IB_CONTROL] != 0x0030_0000 {
+        return TestResult::Fail("the MES path takes regCP_HQD_IB_CONTROL_DEFAULT unchanged");
+    }
+    // The two agree here, and that is the finding rather than an omission:
+    // `regCP_HQD_IB_CONTROL_DEFAULT` is 0x00300000 and `MIN_IB_AVAIL_SIZE` is
+    // a 2-bit field at shift 20, so the default ALREADY encodes 3 and the
+    // compute path's REG_SET_FIELD is a no-op. Asserted so that if either the
+    // default or the field moves, this stops being true loudly.
+    if comp[C_CP_HQD_IB_CONTROL] != mes[C_CP_HQD_IB_CONTROL] {
+        return TestResult::Fail("the IB control default already encodes MIN_IB_AVAIL_SIZE 3");
+    }
+    if mes[C_CP_HQD_QUANTUM] != 0 {
+        return TestResult::Fail("quantum scheduling is off for the MES pipe");
+    }
+    if comp[C_CP_HQD_QUANTUM] == 0 {
+        return TestResult::Fail("the compute path composes a non-zero quantum");
+    }
+    if mes[C_CP_HQD_IQ_TIMER] != 0 {
+        return TestResult::Fail("regCP_HQD_IQ_TIMER_DEFAULT is zero");
+    }
+
+    // ── the fields the MES path does not touch ──
+    if comp[C_CP_HQD_PIPE_PRIORITY] != 1 || comp[C_CP_HQD_QUEUE_PRIORITY] != 1 {
+        return TestResult::Fail("the compute path takes the requested priority");
+    }
+    if mes[C_CP_HQD_PIPE_PRIORITY] != 0 || mes[C_CP_HQD_QUEUE_PRIORITY] != 0 {
+        return TestResult::Fail("the MES path leaves the priorities alone");
+    }
+    if comp[C_FENCE_ADDRESS_LO] != 0x0000_1234 || comp[C_FENCE_ADDRESS_HI] != 8 {
+        return TestResult::Fail("the compute path writes the user-queue fence address");
+    }
+    if mes[C_FENCE_ADDRESS_LO] != 0 || mes[C_FENCE_ADDRESS_HI] != 0 {
+        return TestResult::Fail("the MES path has no user-queue fence address");
+    }
+
+    // ── and everything that must be IDENTICAL ──
+    // The header and the thread-management words in particular: a MES
+    // descriptor without the PM4 header is not recognised at all.
+    for (idx, what) in [
+        (C_HEADER, "header"),
+        (C_COMPUTE_PIPELINESTAT_ENABLE, "pipelinestat_enable"),
+        (C_COMPUTE_STATIC_THREAD_MGMT_SE0, "thread mgmt se0"),
+        (C_COMPUTE_STATIC_THREAD_MGMT_SE3, "thread mgmt se3"),
+        (C_COMPUTE_MISC_RESERVED, "misc_reserved"),
+        (C_CP_HQD_EOP_BASE_ADDR_LO, "eop base"),
+        (C_CP_HQD_EOP_CONTROL, "eop control"),
+        (C_CP_MQD_BASE_ADDR_LO, "mqd base"),
+        (C_CP_MQD_CONTROL, "mqd control"),
+        (C_CP_HQD_PQ_BASE_LO, "pq base"),
+        (C_CP_HQD_PQ_RPTR_REPORT_ADDR_LO, "rptr report"),
+        (C_CP_HQD_PQ_DOORBELL_CONTROL, "doorbell control"),
+        (C_CP_HQD_PERSISTENT_STATE, "persistent state"),
+        (C_CP_HQD_VMID, "vmid"),
+    ] {
+        if mes[idx] != comp[idx] {
+            return TestResult::Fail(what);
+        }
+    }
+    if mes[C_HEADER] != 0xC031_0800 {
+        return TestResult::Fail("the MES descriptor carries the same PM4 header");
+    }
+    // The EOP size: both are 2048 bytes, so log2(512) - 1 = 8.
+    if (mes[C_CP_HQD_EOP_CONTROL] & 0x3F) != 8 {
+        return TestResult::Fail("the EOP size describes 2048 bytes");
+    }
+
+    // Validation is the same shape as the compute path's.
+    if mes_mqd_init(
+        &MqdProp {
+            queue_size: 3000,
+            ..base
+        },
+        eop,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("a non-power-of-two ring must be refused");
+    }
+    if mes_mqd_init(
+        &MqdProp {
+            hqd_base_gpu_addr: base.hqd_base_gpu_addr + 0x80,
+            ..base
+        },
+        eop,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("a ring base that is not 256-byte aligned must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_mqd",
+    smoke_amdgpu_mqd_mes_differs_from_compute
 );
 
 /// The SMU mailbox registers, against `mp_13_0_4_offset.h`.
