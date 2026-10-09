@@ -1054,6 +1054,132 @@ impl Gfx11Sequence {
     }
 }
 
+/// `regCP_MEC_DOORBELL_RANGE_LOWER` / `_UPPER` — GC BASE_IDX **0**, unlike
+/// the `CP_MEC_RS64_CNTL` below it.
+pub const GFX11_CP_MEC_DOORBELL_RANGE_LOWER: u32 = 0x1DFC;
+pub const GFX11_CP_MEC_DOORBELL_RANGE_UPPER: u32 = 0x1DFD;
+
+/// `regCP_MEC_RS64_CNTL` — GC BASE_IDX **1**, dword 0x2904.
+///
+/// Its field layout is **identical** to `CP_MES_CNTL`'s: icache-invalidate at
+/// 4, the four resets at 16..19, the four actives at 26..29, halt at 30, step
+/// at 31. Two different engines, two different offsets, one layout — so a
+/// copy-paste that keeps the fields and the wrong offset is invisible, which is
+/// why both offsets are spelled out with their windows next to them.
+pub const GFX11_CP_MEC_RS64_CNTL: u32 = 0x2904;
+/// `regCP_MEC_CNTL` — the pre-RS64 form, also BASE_IDX 1.
+pub const GFX11_CP_MEC_CNTL: u32 = 0x0802;
+
+/// `CP_MEC_RS64_CNTL` fields. Same positions as `amdgpu_mes_hw`'s
+/// `CP_MES_CNTL` set; see [`GFX11_CP_MEC_RS64_CNTL`].
+pub const MEC_RS64_INVALIDATE_ICACHE: u32 = 1 << 4;
+pub const MEC_RS64_PIPE_RESET: [u32; 4] = [1 << 16, 1 << 17, 1 << 18, 1 << 19];
+pub const MEC_RS64_PIPE_ACTIVE: [u32; 4] = [1 << 26, 1 << 27, 1 << 28, 1 << 29];
+pub const MEC_RS64_HALT: u32 = 1 << 30;
+
+/// `CP_MEC_CNTL__MEC_ME1_HALT` and `..._ME2_HALT`. **ME2 is the LOWER bit**
+/// — 0x1c against ME1's 0x1e — so a reader numbering them in name order gets
+/// them backwards.
+pub const MEC_ME1_HALT: u32 = 1 << 30;
+pub const MEC_ME2_HALT: u32 = 1 << 28;
+
+/// `gfx_v11_0_cp_compute_enable` — take the MEC pipes out of reset, or halt
+/// them.
+///
+/// Nothing in this driver reached `CP_MEC_RS64_CNTL` before this. `cp_enable`
+/// clears the halt bits in `CP_ME_CNTL`, which is the **graphics** engine's
+/// register (`gfx_v11_0_cp_gfx_enable`); the MEC is an entirely separate
+/// register and was never written, so the compute pipes stayed halted.
+///
+/// On RS64 — which every GFX11 part with a 2.0 PFP header is, Phoenix
+/// included — eleven fields move together, and the inversion is the thing to
+/// get right: enabling **clears** icache-invalidate and the four resets and
+/// sets the four actives, and halting does the reverse. A read-modify-write,
+/// unlike `mes_v11_0_enable`'s second write, because `cp_compute_enable` keeps
+/// the live value in `data` throughout.
+///
+/// `enable_kiq` is `adev->enable_mes_kiq`, and it is consulted **only** on the
+/// non-RS64 path: there, ME2 is left halted when the MES owns the KIQ. The
+/// RS64 path moves all four pipes regardless.
+///
+/// Returns the value to write; the `udelay(50)` that follows it in Linux is
+/// the caller's, as [`MEC_ENABLE_DELAY_US`].
+pub fn cp_compute_enable_value(live: u32, rs64: bool, enable: bool, enable_kiq: bool) -> u32 {
+    if rs64 {
+        let mut data = live;
+        let reset_and_invalidate =
+            MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_PIPE_RESET.iter().fold(0, |a, b| a | b);
+        let actives = MEC_RS64_PIPE_ACTIVE.iter().fold(0, |a, b| a | b);
+        if enable {
+            data &= !(reset_and_invalidate | MEC_RS64_HALT);
+            data |= actives;
+        } else {
+            data |= reset_and_invalidate | MEC_RS64_HALT;
+            data &= !actives;
+        }
+        data
+    } else {
+        let mut data = live;
+        if enable {
+            data &= !MEC_ME1_HALT;
+            // Only when the MES does not own the KIQ. With MES KIQ enabled,
+            // ME2 stays halted and the scheduler drives it.
+            if !enable_kiq {
+                data &= !MEC_ME2_HALT;
+            }
+        } else {
+            data |= MEC_ME1_HALT | MEC_ME2_HALT;
+        }
+        data
+    }
+}
+
+/// `udelay(50)` at the end of `gfx_v11_0_cp_compute_enable`.
+pub const MEC_ENABLE_DELAY_US: u32 = 50;
+
+/// `gfx_v11_0_cp_set_doorbell_range` — the doorbell windows the CP honours.
+///
+/// Four registers, and the pairs are in **different** GC windows: the RB pair
+/// is window 0 at 0x1dfa/0x1dfb and so is the MEC pair at 0x1dfc/0x1dfd, while
+/// `CP_MEC_RS64_CNTL` beside them is window 1.
+///
+/// Each value is `(assignment_index * 2) << 2` — the doorbell index doubled
+/// into the dword space, then placed at the field's shift of 2. Both of those
+/// factors are easy to lose, and losing either puts the window somewhere else
+/// entirely.
+///
+/// Linux writes these raw rather than through `REG_SET_FIELD`, unlike
+/// `gfx_v11_0_cp_gfx_set_doorbell` two functions away. The field is ten bits at
+/// shift 2 and all four Phoenix values fit it, so masking is a no-op on real
+/// input; it is applied anyway, because a value outside a field is never
+/// intended and the assignment table is the kind of thing that grows.
+pub fn build_cp_set_doorbell_range(gc_base_idx0: u32) -> Gfx11Sequence {
+    use crate::amdgpu_ring::doorbell_assignment as db;
+    let mut seq = Gfx11Sequence::default();
+    let place = |index: u16| ((u32::from(index) * 2) << 2) & GFX11_DOORBELL_RANGE_LOWER_MASK;
+    seq.write(
+        gc_base_idx0,
+        GFX11_CP_RB_DOORBELL_RANGE_LOWER,
+        place(db::GFX_RING0),
+    );
+    seq.write(
+        gc_base_idx0,
+        GFX11_CP_RB_DOORBELL_RANGE_UPPER,
+        place(db::GFX_USERQUEUE_END),
+    );
+    seq.write(
+        gc_base_idx0,
+        GFX11_CP_MEC_DOORBELL_RANGE_LOWER,
+        place(db::KIQ),
+    );
+    seq.write(
+        gc_base_idx0,
+        GFX11_CP_MEC_DOORBELL_RANGE_UPPER,
+        place(db::USERQUEUE_END),
+    );
+    seq
+}
+
 /// `gfx_v11_0_cp_gfx_resume` for graphics ring 0 on pipe 0 —
 /// the register sequence that points the GFX11 command processor at a ring.
 ///
@@ -1061,6 +1187,45 @@ impl Gfx11Sequence {
 /// the same registers through different offsets and in a different order, and
 /// adds the write-pointer poll address and `CP_RB_ACTIVE` that GFX9 has no
 /// equivalent of.
+///
+/// # This is the NON-async path, and the driver carries pieces of both
+///
+/// `gfx_v11_0_cp_resume` forks on the `amdgpu_async_gfx_ring` module
+/// parameter, and the two arms bring a graphics ring up in different ways:
+///
+/// ```text
+///   async_gfx_ring = 0        async_gfx_ring = 1   (Linux's DEFAULT)
+///   ------------------        --------------------------------------
+///   cp_gfx_resume             cp_async_gfx_ring_resume
+///     CP_RB0_* registers        kgq_init_queue      -> the MQD
+///     cp_gfx_set_doorbell       amdgpu_gfx_enable_kgq -> MES ADD_QUEUE
+///     cp_gfx_start                                     (or KIQ MAP_QUEUES)
+///                               cp_gfx_start
+/// ```
+///
+/// **This function is the left column.** The MQD
+/// ([`crate::amdgpu_mqd::gfx_mqd_init`]), the legacy-queue mapping
+/// ([`crate::amdgpu_mes::build_map_legacy_queue`]) and
+/// `GfxContext::map_legacy_args` are the right column. Both exist in this
+/// tree; a caller must pick one arm and not interleave them.
+///
+/// They disagree on the doorbell, which is the trap:
+///
+/// * Left: the per-queue doorbell comes from `CP_RB_DOORBELL_CONTROL`, written
+///   here, and `CP_RB_DOORBELL_RANGE_UPPER` is set to the field's full mask.
+/// * Right: the per-queue doorbell comes from the MQD's
+///   `cp_hqd_pq_doorbell_control`, and the ranges are whatever
+///   [`build_cp_set_doorbell_range`] left — `gfx_v11_0_cp_gfx_set_doorbell` is
+///   reached only from `cp_gfx_resume` and so never runs on the async arm.
+///
+/// So on the async arm the full-mask `RANGE_UPPER` this function writes never
+/// happens, and `(GFX_USERQUEUE_END * 2) << 2` stands instead. Running both
+/// arms would write the ring's address into the CP registers *and* hand the
+/// scheduler a descriptor pointing at the same ring, with two doorbell
+/// configurations layered.
+///
+/// `cp_gfx_start`'s clear-state preamble
+/// ([`crate::amdgpu_clearstate::build_preamble`]) is common to both.
 ///
 /// `gfx_v11_0_cp_gfx_switch_pipe` reads `GRBM_GFX_CNTL` and sets its PIPEID
 /// field. Read-modify-write needs the live value, which a sequence cannot

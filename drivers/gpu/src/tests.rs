@@ -7705,6 +7705,155 @@ kernel_test_in!(
     smoke_amdgpu_gfx11_sequence_applies_in_order
 );
 
+/// `gfx_v11_0_cp_compute_enable` and `gfx_v11_0_cp_set_doorbell_range` — the
+/// two `cp_resume` steps this driver had no form of.
+///
+/// `cp_enable` clears halt bits in `CP_ME_CNTL`, the **graphics** engine's
+/// register. The MEC is `CP_MEC_RS64_CNTL`, a different register in a
+/// different window, and nothing wrote it — so the compute pipes stayed
+/// halted while bring-up reported success.
+fn smoke_amdgpu_gfx11_compute_enable_and_doorbell_range() -> TestResult {
+    use crate::amdgpu_gfx::{
+        build_cp_set_doorbell_range, cp_compute_enable_value, GFX11_CP_MEC_DOORBELL_RANGE_LOWER,
+        GFX11_CP_MEC_DOORBELL_RANGE_UPPER, GFX11_CP_MEC_RS64_CNTL, MEC_ENABLE_DELAY_US,
+        MEC_ME1_HALT, MEC_ME2_HALT, MEC_RS64_HALT, MEC_RS64_INVALIDATE_ICACHE,
+        MEC_RS64_PIPE_ACTIVE, MEC_RS64_PIPE_RESET,
+    };
+    use crate::amdgpu_ring::doorbell_assignment as db;
+
+    // ── register ids and field positions ──
+    if GFX11_CP_MEC_RS64_CNTL != 0x2904 {
+        return TestResult::Fail("regCP_MEC_RS64_CNTL is dword 0x2904");
+    }
+    // Identical layout to CP_MES_CNTL at a different offset — the reason both
+    // are spelled out rather than shared.
+    if MEC_RS64_INVALIDATE_ICACHE != crate::amdgpu_mes_hw::MES_INVALIDATE_ICACHE
+        || MEC_RS64_HALT != crate::amdgpu_mes_hw::MES_HALT
+        || MEC_RS64_PIPE_RESET[0] != crate::amdgpu_mes_hw::MES_PIPE0_RESET
+        || MEC_RS64_PIPE_ACTIVE[0] != crate::amdgpu_mes_hw::MES_PIPE0_ACTIVE
+    {
+        return TestResult::Fail("the MEC and MES control registers share a field layout");
+    }
+    if GFX11_CP_MEC_RS64_CNTL == crate::amdgpu_mes_hw::CP_MES_CNTL {
+        return TestResult::Fail("...but they are NOT the same register");
+    }
+    // ME2 is the LOWER bit, 0x1c against ME1's 0x1e.
+    if MEC_ME2_HALT >= MEC_ME1_HALT {
+        return TestResult::Fail("MEC_ME2_HALT sits below MEC_ME1_HALT");
+    }
+    if (MEC_ME1_HALT, MEC_ME2_HALT) != (1 << 30, 1 << 28) {
+        return TestResult::Fail("MEC_ME1_HALT is bit 30 and ME2 is bit 28");
+    }
+    if MEC_ENABLE_DELAY_US != 50 {
+        return TestResult::Fail("cp_compute_enable waits 50 us");
+    }
+
+    // ── RS64: eleven fields move together, and enabling INVERTS them ──
+    const LIVE: u32 = 0x1234_5678;
+    let resets = MEC_RS64_PIPE_RESET.iter().fold(0u32, |a, b| a | b);
+    let actives = MEC_RS64_PIPE_ACTIVE.iter().fold(0u32, |a, b| a | b);
+    // Enable from the HALTED state, not from an arbitrary word. `LIVE` alone
+    // happens not to have MEC_HALT set, so clearing it would be unobservable
+    // — which is how a mutation that drops the HALT clear survives a test
+    // that looks thorough. Round-tripping through the halt path guarantees
+    // every bit the function owns starts in its opposite position.
+    let halted_live = cp_compute_enable_value(LIVE, true, false, true);
+    if halted_live & MEC_RS64_HALT == 0 {
+        return TestResult::Fail("the halted state must have MEC_HALT set");
+    }
+    let on = cp_compute_enable_value(halted_live, true, true, true);
+    if on & (resets | MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_HALT) != 0 {
+        return TestResult::Fail("enabling must clear the resets, the icache bit and HALT");
+    }
+    if on & actives != actives {
+        return TestResult::Fail("enabling must set all four pipe actives");
+    }
+    let off = cp_compute_enable_value(LIVE, true, false, true);
+    if off & actives != 0 {
+        return TestResult::Fail("halting must clear all four pipe actives");
+    }
+    if off & (resets | MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_HALT)
+        != (resets | MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_HALT)
+    {
+        return TestResult::Fail("halting must set the resets, the icache bit and HALT");
+    }
+    // A read-modify-write: bits in neither set survive both ways.
+    let untouched = !(resets | actives | MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_HALT);
+    if on & untouched != LIVE & untouched || off & untouched != LIVE & untouched {
+        return TestResult::Fail("cp_compute_enable preserves the bits it does not own");
+    }
+    // The RS64 path ignores enable_kiq — all four pipes move regardless.
+    if cp_compute_enable_value(halted_live, true, true, false) != on {
+        return TestResult::Fail("the RS64 path does not consult enable_mes_kiq");
+    }
+
+    // ── pre-RS64: enable_kiq decides whether ME2 is unhalted ──
+    const HALTED: u32 = MEC_ME1_HALT | MEC_ME2_HALT | 0x0000_00FF;
+    let legacy_kiq = cp_compute_enable_value(HALTED, false, true, true);
+    if legacy_kiq & MEC_ME1_HALT != 0 {
+        return TestResult::Fail("ME1 is always unhalted when enabling");
+    }
+    if legacy_kiq & MEC_ME2_HALT == 0 {
+        return TestResult::Fail("with MES KIQ enabled, ME2 stays halted");
+    }
+    let legacy_nokiq = cp_compute_enable_value(HALTED, false, true, false);
+    if legacy_nokiq & MEC_ME2_HALT != 0 {
+        return TestResult::Fail("without MES KIQ, ME2 is unhalted too");
+    }
+    if legacy_nokiq & 0x0000_00FF != 0x0000_00FF {
+        return TestResult::Fail("the legacy path preserves unrelated bits");
+    }
+
+    // ── the doorbell windows ──
+    // AMDGPU_NAVI10_DOORBELL_*: KIQ 0x000, USERQUEUE_END 0x08A,
+    // GFX_RING0 0x08B, GFX_USERQUEUE_END 0x0FF.
+    if (
+        db::KIQ,
+        db::USERQUEUE_END,
+        db::GFX_RING0,
+        db::GFX_USERQUEUE_END,
+    ) != (0x000, 0x08A, 0x08B, 0x0FF)
+    {
+        return TestResult::Fail("the doorbell assignment table is wrong");
+    }
+    const GC: u32 = 0x0003_0000;
+    let seq = build_cp_set_doorbell_range(GC);
+    if seq.len() != 4 {
+        return TestResult::Fail("four range registers");
+    }
+    // `(index * 2) << 2` — doubled into the dword space, then placed at the
+    // field's shift. Worked out by hand: 0x08B*2 = 0x116, <<2 = 0x458.
+    if seq.first_write_to(GC, 0x1dfa) != Some(0x458) {
+        return TestResult::Fail("the RB range starts at GFX_RING0 doubled and shifted");
+    }
+    if seq.first_write_to(GC, 0x1dfb) != Some(0x7F8) {
+        return TestResult::Fail("the RB range ends at GFX_USERQUEUE_END (0x0FF*2<<2)");
+    }
+    if seq.first_write_to(GC, GFX11_CP_MEC_DOORBELL_RANGE_LOWER) != Some(0) {
+        return TestResult::Fail("the MEC range starts at the KIQ, index 0");
+    }
+    if seq.first_write_to(GC, GFX11_CP_MEC_DOORBELL_RANGE_UPPER) != Some(0x450) {
+        return TestResult::Fail("the MEC range ends at USERQUEUE_END (0x08A*2<<2)");
+    }
+    // Every value fits the ten-bit field, so the mask is a no-op on real
+    // input — which is what makes it safe to apply where Linux writes raw.
+    for v in [0x458u32, 0x7F8, 0, 0x450] {
+        if v & !0x0000_0FFC != 0 {
+            return TestResult::Fail("a doorbell range value does not fit its field");
+        }
+    }
+    // The MEC pair is window 0, beside the RB pair — not window 1 where
+    // CP_MEC_RS64_CNTL lives.
+    if GFX11_CP_MEC_DOORBELL_RANGE_LOWER != 0x1dfc || GFX11_CP_MEC_DOORBELL_RANGE_UPPER != 0x1dfd {
+        return TestResult::Fail("the MEC doorbell range pair is 0x1dfc/0x1dfd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx11_compute_enable_and_doorbell_range
+);
+
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
