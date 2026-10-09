@@ -7312,8 +7312,8 @@ fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
         return TestResult::Fail("DB_BUSY is a real GRBM_STATUS busy bit");
     }
     // The register offsets, from the two headers.
-    if GfxGeneration::Gfx9.grbm_status_rel() != 0x0004 * 4
-        || GfxGeneration::Gfx11.grbm_status_rel() != 0x0DA4 * 4
+    if GfxGeneration::Gfx9.grbm_status_rel() != (0x0004 * 4, 0)
+        || GfxGeneration::Gfx11.grbm_status_rel() != (0x0DA4 * 4, 0)
     {
         return TestResult::Fail("GRBM_STATUS is 0x0004 on GFX9 and 0x0da4 on GFX11");
     }
@@ -7336,6 +7336,70 @@ fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_grbm_status_idle_decode
+);
+
+/// The two conventions this driver carries — byte-offset `*_REL` constants and
+/// MM_INDEX's dword port — and which GC window each register needs. Literals
+/// from `gc/gc_11_0_0_offset.h` and `gc_9_0_offset.h`.
+fn smoke_amdgpu_gc_window_and_dword_conversion() -> TestResult {
+    use crate::amdgpu::mm_dword;
+    use crate::amdgpu_cp_fw::{CpEngine, CP_PFP_IC_BASE_LO};
+    use crate::amdgpu_gfx::{GfxGeneration, GRBM_GFX_INDEX_REL, GRBM_STATUS_REL_GFX11};
+
+    // `amdgpu_gfx`'s constants are byte offsets: regGRBM_GFX_INDEX is dword
+    // 0x2200 and regGRBM_STATUS 0x0da4 on GFX11.
+    if GRBM_GFX_INDEX_REL != 0x2200 * 4 || GRBM_STATUS_REL_GFX11 != 0x0DA4 * 4 {
+        return TestResult::Fail("the *_REL constants are byte offsets");
+    }
+    // MM_INDEX takes the dword, so a caller must convert — adding the byte
+    // offset straight to a dword base lands four times further in.
+    if mm_dword(GRBM_GFX_INDEX_REL) != 0x2200 || mm_dword(GRBM_STATUS_REL_GFX11) != 0x0DA4 {
+        return TestResult::Fail("mm_dword must undo the byte scaling");
+    }
+
+    // regGRBM_GFX_INDEX_BASE_IDX is 1 and regGRBM_STATUS_BASE_IDX is 0, so the
+    // two cannot share a base — and the window travels with the offset rather
+    // than being chosen at the call site.
+    for generation in [GfxGeneration::Gfx9, GfxGeneration::Gfx11] {
+        if generation.grbm_gfx_index_rel() != (0x2200 * 4, 1) {
+            return TestResult::Fail("GRBM_GFX_INDEX is dword 0x2200 on GC window 1");
+        }
+        if generation.grbm_status_rel().1 != 0 {
+            return TestResult::Fail("GRBM_STATUS is on GC window 0");
+        }
+        if generation.grbm_gfx_index_rel().1 == generation.grbm_status_rel().1 {
+            return TestResult::Fail("these two registers are in different GC windows");
+        }
+    }
+    //
+    // regCP_PFP_IC_BASE_LO 0x5840 is BASE_IDX 1 too — the whole CP IC block
+    // is, which is why `load_all_cp_fw` takes window 1.
+    if CP_PFP_IC_BASE_LO != 0x5840 {
+        return TestResult::Fail("CP_PFP_IC_BASE_LO is dword 0x5840");
+    }
+    let (base_lo, base_hi, base_cntl, op_cntl) = CpEngine::Pfp.registers();
+    if (base_lo, base_hi, base_cntl, op_cntl) != (0x5840, 0x5841, 0x5842, 0x5843) {
+        return TestResult::Fail("the PFP IC quad is 0x5840..0x5843");
+    }
+
+    // regCP_ME_CNTL is 0x0803 on BASE_IDX 1 for GFX11 but 0x01b6 on BASE_IDX 0
+    // for GFX9, while regCP_STAT is BASE_IDX 0 on both (0x0f40 / 0x01a0) —
+    // which is why `cp_enable` needs two bases rather than one.
+    if GfxGeneration::Gfx11.cp_me_cntl_rel() != (0x0803 * 4, 1)
+        || GfxGeneration::Gfx9.cp_me_cntl_rel() != (0x01B6 * 4, 0)
+    {
+        return TestResult::Fail("CP_ME_CNTL's window is per-generation");
+    }
+    if GfxGeneration::Gfx11.cp_stat_rel() != 0x0F40 * 4
+        || GfxGeneration::Gfx9.cp_stat_rel() != 0x01A0 * 4
+    {
+        return TestResult::Fail("CP_STAT is BASE_IDX 0 on both generations");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gc_window_and_dword_conversion
 );
 
 fn smoke_amdgpu_foundations_grbm_gfx_index_encoding() -> TestResult {

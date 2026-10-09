@@ -41,10 +41,16 @@ use alloc::vec::Vec;
 
 // ── Register offsets (GFX11) ──────────────────────────────────────
 //
-// From gc/gc_11_0_0_offset.h. Each engine's IC block has 4 paired
-// registers. Phoenix uses BASE_IDX=1 (segment 1) — the per-segment
-// offset is applied by the driver-glue layer (`segment_base_for_ip`)
-// before writing.
+// From gc/gc_11_0_0_offset.h. Each engine's IC block has 4 paired registers,
+// and every one of them is **BASE_IDX 1** — the GC block's second window. The
+// `gc_base` these functions take is therefore `ip_block_base_idx(GC, 0, 1)`,
+// which `AmdGpu::gc_base_1()` resolves.
+//
+// LINUX-GAP: this said the per-segment offset was "applied by the driver-glue
+// layer (`segment_base_for_ip`)". No such function exists anywhere in the
+// driver, and nothing implemented `CpFwMmio` outside the test mock, so the
+// whole CP firmware-load path was unreachable. `AmdGpu::start_gfx_cp` is the
+// glue; it resolves both windows and owns the only production adapter.
 //
 // PFP (Pre-Fetch Parser) — head of the GFX queue.
 pub const CP_PFP_IC_BASE_LO: u32 = 0x5840;
@@ -165,6 +171,13 @@ pub enum CpFwError {
 
 // ── Mmio trait ────────────────────────────────────────────────────
 
+/// Register access for the CP firmware path.
+///
+/// `byte_off` is `(base + dword_id) << 2` — the register ids above are dword
+/// ids and the base is a dword base, scaled at each call site. An
+/// implementation over a directly mapped window uses it as-is; one over
+/// MM_INDEX, which is a dword port, shifts it back (see
+/// `AmdGpu::start_gfx_cp`).
 pub trait CpFwMmio {
     fn read(&mut self, byte_off: u32) -> u32;
     fn write(&mut self, byte_off: u32, value: u32);
@@ -183,10 +196,11 @@ pub const CP_FW_POLL_BUDGET: u32 = 1_000_000;
 /// (line 3192-3360).
 pub fn load_cp_engine_fw<M: CpFwMmio>(
     mmio: &mut M,
-    gc_base: u32,
+    gc_base_idx1: u32,
     engine: CpEngine,
     fw_gpu_addr: u64,
 ) -> Result<(), CpFwError> {
+    let gc_base = gc_base_idx1;
     if fw_gpu_addr & 0xFFFF != 0 {
         return Err(CpFwError::UnalignedFwImage);
     }
@@ -251,14 +265,14 @@ pub fn load_cp_engine_fw<M: CpFwMmio>(
 /// state as fatal — the GFX subsystem cannot start.
 pub fn load_all_cp_fw<M: CpFwMmio>(
     mmio: &mut M,
-    gc_base: u32,
+    gc_base_idx1: u32,
     pfp_phys: u64,
     me_phys: u64,
     mec_phys: u64,
 ) -> Result<(), CpFwError> {
-    load_cp_engine_fw(mmio, gc_base, CpEngine::Pfp, pfp_phys)?;
-    load_cp_engine_fw(mmio, gc_base, CpEngine::Me, me_phys)?;
-    load_cp_engine_fw(mmio, gc_base, CpEngine::Mec, mec_phys)?;
+    load_cp_engine_fw(mmio, gc_base_idx1, CpEngine::Pfp, pfp_phys)?;
+    load_cp_engine_fw(mmio, gc_base_idx1, CpEngine::Me, me_phys)?;
+    load_cp_engine_fw(mmio, gc_base_idx1, CpEngine::Mec, mec_phys)?;
     Ok(())
 }
 

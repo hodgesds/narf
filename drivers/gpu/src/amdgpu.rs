@@ -815,11 +815,30 @@ impl AmdGpu {
     /// Per-family GFX `mmGRBM_STATUS` byte offset within the GC IP
     /// block window. GFX9 (Renoir) and GFX11 (Phoenix) place the
     /// register at distinct offsets.
-    fn grbm_status_offset(&self) -> u32 {
+    /// This chip's GFX generation, for the per-generation register tables.
+    fn gfx_generation(&self) -> crate::amdgpu_gfx::GfxGeneration {
         match self.chip.family {
-            Family::Phoenix => crate::amdgpu_gfx::GRBM_STATUS_REL_GFX11,
-            _ => crate::amdgpu_gfx::GRBM_STATUS_REL_GFX9,
+            Family::Phoenix | Family::Navi3 => crate::amdgpu_gfx::GfxGeneration::Gfx11,
+            _ => crate::amdgpu_gfx::GfxGeneration::Gfx9,
         }
+    }
+
+    /// Resolve a `(byte offset, GC window)` register location to the dword
+    /// address MM_INDEX wants.
+    ///
+    /// Two conversions happen here and nowhere else. `amdgpu_gfx`'s `*_REL`
+    /// constants are BYTE offsets — that module's own callers reach registers
+    /// through a directly mapped window and scale with `<< 2` — while
+    /// [`mm_read`] and [`mm_write`] go through MM_INDEX, a DWORD port. And the
+    /// window comes from the register, so it indexes `base_addrs` rather than
+    /// defaulting to 0.
+    ///
+    /// `None` when discovery did not publish that window: a caller must not
+    /// fall back to window 0.
+    fn gc_reg(&self, location: (u32, usize)) -> Option<u32> {
+        let (rel, base_idx) = location;
+        let base = self.ip_block_base_idx(amdgpu_discovery::HW_ID_GC, 0, base_idx)?;
+        Some(base + mm_dword(rel))
     }
 
     /// Resolve the GC IP block base from discovery. None on
@@ -843,8 +862,7 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR5 exclusively (MM_INDEX / MM_DATA latch).
     pub unsafe fn read_grbm_status(&self) -> Option<crate::amdgpu_gfx::GrbmStatus> {
-        let gc_base = self.gc_base()?;
-        let off = gc_base + self.grbm_status_offset();
+        let off = self.gc_reg(self.gfx_generation().grbm_status_rel())?;
         // SAFETY: caller-asserted BAR5 ownership; mm_read uses the
         // MM_INDEX/MM_DATA pair which is a r/w latch with no side
         // effect on the addressed register.
@@ -866,13 +884,58 @@ impl AmdGpu {
     /// SE/SH lanes leave the chip in a misconfigured indexing
     /// state until the next broadcast write.
     pub unsafe fn write_grbm_gfx_index(&self, value: u32) -> Option<()> {
-        let gc_base = self.gc_base()?;
-        let off = gc_base + crate::amdgpu_gfx::GRBM_GFX_INDEX_REL;
+        // `GRBM_GFX_INDEX` is **BASE_IDX 1**, so it is addressed from the GC
+        // block's second window — not `gc_base()`, which is window 0.
+        //
+        // LINUX-GAP: this used `gc_base()` and added `GRBM_GFX_INDEX_REL`
+        // directly. Two errors compounding: the wrong window, and a byte
+        // offset (0x2200 * 4) added to a dword base, so the write went to
+        // dword 0x8800 of window 0. `gc_base_1()` existed and nothing called
+        // it; `GC_BASE_IDX_1` named this register as one that needed it.
+        let off = self.gc_reg(self.gfx_generation().grbm_gfx_index_rel())?;
         // SAFETY: caller-asserted BAR5 ownership.
         unsafe {
             mm_write(&self.regs, off, value);
         }
         Some(())
+    }
+
+    /// Load the GFX CP's three firmware images and un-halt the engines.
+    ///
+    /// This is the glue `amdgpu_cp_fw` documented and did not have. Nothing
+    /// implemented `CpFwMmio` outside that module's test mock, and the IC
+    /// registers are all BASE_IDX 1 while `CP_STAT` is BASE_IDX 0, so neither
+    /// window was reachable from a caller holding one `gc_base`.
+    ///
+    /// `None` when discovery did not publish both GC windows — never a
+    /// fallback to window 0, which would address an unrelated register.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively (MM_INDEX / MM_DATA latch), and the three
+    /// GPU addresses must each name a 64 KiB-aligned, GPU-visible firmware
+    /// image that stays mapped for as long as the CP runs.
+    pub unsafe fn start_gfx_cp(
+        &self,
+        pfp_gpu_addr: u64,
+        me_gpu_addr: u64,
+        mec_gpu_addr: u64,
+    ) -> Option<Result<(), crate::amdgpu_cp_fw::CpFwError>> {
+        let idx0 = self.gc_base()?;
+        let idx1 = self.gc_base_1()?;
+        let generation = self.gfx_generation();
+        // SAFETY: caller-asserted BAR5 ownership, held for the adapter's whole
+        // lifetime — it borrows `self.regs` and never outlives this frame.
+        let mut mmio = CpRegsAdapter { regs: &self.regs };
+        Some(
+            crate::amdgpu_cp_fw::load_all_cp_fw(
+                &mut mmio,
+                idx1,
+                pfp_gpu_addr,
+                me_gpu_addr,
+                mec_gpu_addr,
+            )
+            .and_then(|()| crate::amdgpu_cp_fw::cp_enable(&mut mmio, generation, idx0, idx1)),
+        )
     }
 
     /// Read the full `ApertureLayout` (VRAM + system aperture)
@@ -1534,6 +1597,28 @@ pub struct MultiFwReport {
     pub last_optional_skip: Option<alloc::string::String>,
 }
 
+/// Adapter that implements `CpFwMmio` over MM_INDEX / MM_DATA.
+///
+/// `CpFwMmio` hands out `(base + dword_id) << 2`, a byte offset into a
+/// directly mapped window. MM_INDEX is a dword port, so this shifts it back —
+/// the one place in the driver where the two conventions meet, rather than at
+/// every call site.
+struct CpRegsAdapter<'a> {
+    regs: &'a MmioRegion,
+}
+
+impl<'a> crate::amdgpu_cp_fw::CpFwMmio for CpRegsAdapter<'a> {
+    fn read(&mut self, byte_off: u32) -> u32 {
+        // SAFETY: the adapter is built inside `start_gfx_cp`, whose caller
+        // asserts exclusive BAR5 ownership, and it cannot outlive that frame.
+        unsafe { mm_read(self.regs, byte_off >> 2) }
+    }
+    fn write(&mut self, byte_off: u32, value: u32) {
+        // SAFETY: same.
+        unsafe { mm_write(self.regs, byte_off >> 2, value) }
+    }
+}
+
 /// Adapter that implements `SmuMmio` over the driver's BAR5
 /// region. Lives in the function frame of `initialize` — never
 /// outlives the &mut borrow of AmdGpu, so the unsafe MMIO
@@ -1576,6 +1661,18 @@ unsafe fn mm_read(regs: &MmioRegion, addr: u32) -> u32 {
 ///
 /// # Safety
 /// Same as `mm_read`.
+/// Convert one of `amdgpu_gfx`/`amdgpu_cp_fw`'s byte-offset `*_REL` constants
+/// into the dword address MM_INDEX wants.
+///
+/// The driver carries both conventions on purpose: a module that owns a
+/// directly mapped register window indexes it in bytes, while MM_INDEX is a
+/// dword port. Mixing them silently addresses a register four times further
+/// in, which is what [`AmdGpu::write_grbm_gfx_index`] and
+/// [`AmdGpu::read_grbm_status`] were doing.
+pub(crate) const fn mm_dword(rel_bytes: u32) -> u32 {
+    rel_bytes / 4
+}
+
 pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
     // SAFETY: caller-asserted ownership.
     unsafe {

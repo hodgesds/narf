@@ -229,11 +229,23 @@ pub enum GfxGeneration {
 
 impl GfxGeneration {
     /// `GRBM_STATUS` — 0x0004 on GFX9, 0x0da4 on GFX11, BASE_IDX 0 on both.
-    pub const fn grbm_status_rel(self) -> u32 {
+    ///
+    /// Returns the byte offset and the GC window, the same shape as
+    /// [`GfxGeneration::cp_me_cntl_rel`]. The window is part of a register's
+    /// address, not a property of the block, so it travels with the offset
+    /// rather than being decided at the call site — which is how
+    /// `GRBM_GFX_INDEX` came to be addressed from window 0.
+    pub const fn grbm_status_rel(self) -> (u32, usize) {
         match self {
-            GfxGeneration::Gfx9 => 0x0004 * 4,
-            GfxGeneration::Gfx11 => 0x0DA4 * 4,
+            GfxGeneration::Gfx9 => (0x0004 * 4, 0),
+            GfxGeneration::Gfx11 => (0x0DA4 * 4, 0),
         }
+    }
+
+    /// `GRBM_GFX_INDEX` — 0x2200 on both generations, and **BASE_IDX 1** on
+    /// both. See [`GC_BASE_IDX_1`].
+    pub const fn grbm_gfx_index_rel(self) -> (u32, usize) {
+        (GRBM_GFX_INDEX_REL, 1)
     }
 
     /// `GRBM_STATUS2` — 0x0002 on GFX9, 0x0da2 on GFX11, BASE_IDX 0 on both.
