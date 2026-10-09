@@ -280,3 +280,238 @@ pub fn gfx_mqd_init(prop: &MqdProp) -> Result<[u32; MQD_DWORDS], FsError> {
 
     Ok(mqd)
 }
+
+// ── Compute MQD ────────────────────────────────────────────────────────
+//
+// `struct v11_compute_mqd` is a different register image from
+// `v11_gfx_mqd` — same 512 dwords, different fields at different indices.
+// Every index below is the `// offset:` comment `v11_structs.h:674` carries
+// beside the field, and every default is from `gc_11_0_0_default.h`.
+//
+// Overlaps with the GFX image are coincidental and not to be relied on:
+// `cp_mqd_base_addr_lo`/`_hi` (128/129) and `cp_mqd_control` (162) happen to
+// share indices, while `cp_hqd_pq_wptr_lo` is 182 here against the GFX
+// image's `CP_GFX_HQD_WPTR` at 149.
+
+/// `sizeof(struct v11_compute_mqd) / 4` — the same size as the GFX image.
+pub const COMPUTE_MQD_DWORDS: usize = 512;
+
+pub const C_HEADER: usize = 0;
+pub const C_COMPUTE_PIPELINESTAT_ENABLE: usize = 11;
+pub const C_COMPUTE_STATIC_THREAD_MGMT_SE0: usize = 23;
+pub const C_COMPUTE_STATIC_THREAD_MGMT_SE1: usize = 24;
+pub const C_COMPUTE_STATIC_THREAD_MGMT_SE2: usize = 25;
+pub const C_COMPUTE_STATIC_THREAD_MGMT_SE3: usize = 27;
+pub const C_COMPUTE_MISC_RESERVED: usize = 32;
+pub const C_CP_MQD_BASE_ADDR_LO: usize = 128;
+pub const C_CP_MQD_BASE_ADDR_HI: usize = 129;
+pub const C_CP_HQD_ACTIVE: usize = 130;
+pub const C_CP_HQD_VMID: usize = 131;
+pub const C_CP_HQD_PERSISTENT_STATE: usize = 132;
+pub const C_CP_HQD_PIPE_PRIORITY: usize = 133;
+pub const C_CP_HQD_QUEUE_PRIORITY: usize = 134;
+pub const C_CP_HQD_QUANTUM: usize = 135;
+pub const C_CP_HQD_PQ_BASE_LO: usize = 136;
+pub const C_CP_HQD_PQ_BASE_HI: usize = 137;
+pub const C_CP_HQD_PQ_RPTR: usize = 138;
+pub const C_CP_HQD_PQ_RPTR_REPORT_ADDR_LO: usize = 139;
+pub const C_CP_HQD_PQ_RPTR_REPORT_ADDR_HI: usize = 140;
+pub const C_CP_HQD_PQ_WPTR_POLL_ADDR_LO: usize = 141;
+pub const C_CP_HQD_PQ_WPTR_POLL_ADDR_HI: usize = 142;
+pub const C_CP_HQD_PQ_DOORBELL_CONTROL: usize = 143;
+pub const C_CP_HQD_PQ_CONTROL: usize = 145;
+pub const C_CP_HQD_IB_CONTROL: usize = 149;
+pub const C_CP_HQD_DEQUEUE_REQUEST: usize = 152;
+pub const C_CP_MQD_CONTROL: usize = 162;
+pub const C_CP_HQD_EOP_BASE_ADDR_LO: usize = 165;
+pub const C_CP_HQD_EOP_BASE_ADDR_HI: usize = 166;
+pub const C_CP_HQD_EOP_CONTROL: usize = 167;
+pub const C_CP_HQD_PQ_WPTR_LO: usize = 182;
+pub const C_CP_HQD_PQ_WPTR_HI: usize = 183;
+pub const C_FENCE_ADDRESS_LO: usize = 446;
+pub const C_FENCE_ADDRESS_HI: usize = 447;
+
+/// `mqd->header = 0xC0310800` — a PM4 TYPE3 `SET_SH_REG` header the firmware
+/// expects to find first. Not a value to derive; it is written literally.
+pub const COMPUTE_MQD_HEADER: u32 = 0xC031_0800;
+/// `mqd->compute_misc_reserved = 0x00000007`.
+pub const COMPUTE_MISC_RESERVED: u32 = 0x0000_0007;
+
+const CP_HQD_EOP_CONTROL_DEFAULT: u32 = 0x0000_0006;
+const CP_HQD_PQ_DOORBELL_CONTROL_DEFAULT: u32 = 0x0000_0000;
+const CP_HQD_PQ_CONTROL_DEFAULT: u32 = 0x0030_8509;
+const CP_HQD_PQ_RPTR_DEFAULT: u32 = 0x0000_0000;
+const CP_HQD_PERSISTENT_STATE_DEFAULT: u32 = 0x0be0_5501;
+const CP_HQD_IB_CONTROL_DEFAULT: u32 = 0x0030_0000;
+const CP_MQD_CONTROL_DEFAULT: u32 = 0x0000_0100;
+
+const EOP_SIZE_MASK: u32 = 0x0000_003F;
+const C_DOORBELL_OFFSET_MASK: u32 = 0x0FFF_FFFC;
+const C_DOORBELL_EN: u32 = 0x4000_0000;
+const C_DOORBELL_SOURCE: u32 = 0x1000_0000;
+const C_DOORBELL_HIT: u32 = 0x8000_0000;
+const PQ_QUEUE_SIZE_MASK: u32 = 0x0000_003F;
+const PQ_RPTR_BLOCK_SIZE_MASK: u32 = 0x0000_3F00;
+const PQ_UNORD_DISPATCH: u32 = 0x1000_0000;
+const PQ_TUNNEL_DISPATCH: u32 = 0x2000_0000;
+const PQ_PRIV_STATE: u32 = 0x4000_0000;
+const PQ_KMD_QUEUE: u32 = 0x8000_0000;
+const PQ_TMZ: u32 = 0x0040_0000;
+const PERSISTENT_PRELOAD_SIZE_MASK: u32 = 0x0003_FF00;
+const IB_MIN_IB_AVAIL_SIZE_MASK: u32 = 0x0030_0000;
+const QUANTUM_EN: u32 = 0x0000_0001;
+const QUANTUM_SCALE: u32 = 0x0000_0010;
+const QUANTUM_DURATION_MASK: u32 = 0x0000_3F00;
+const MQD_VMID_MASK: u32 = 0x0000_000F;
+
+/// `GFX11_MEC_HPD_SIZE` (`gfx_v11_0.c:55`) — the end-of-pipe buffer each MEC
+/// queue gets.
+pub const MEC_HPD_BYTES: u64 = 2048;
+/// `AMDGPU_GPU_PAGE_SIZE`, which sets `RPTR_BLOCK_SIZE`.
+const GPU_PAGE_BYTES: u64 = 4096;
+
+/// `PRELOAD_SIZE` is forced to 0x55 rather than left at the register default.
+const PRELOAD_SIZE: u32 = 0x55;
+/// `MIN_IB_AVAIL_SIZE` is forced to 3.
+const MIN_IB_AVAIL_SIZE: u32 = 3;
+
+fn put_field(value: u32, mask: u32, field: u32) -> u32 {
+    (value & !mask) | ((field << mask.trailing_zeros()) & mask)
+}
+
+/// Fill a GFX11 compute MQD, following `gfx_v11_0_compute_mqd_init` field for
+/// field.
+///
+/// `eop_gpu_addr` is the queue's end-of-pipe buffer, [`MEC_HPD_BYTES`] long.
+/// Linux allocates one per queue and the MEC writes completion records there;
+/// the GFX image has no equivalent, which is why it is a separate argument
+/// rather than another `MqdProp` field.
+///
+/// Returns the descriptor rather than writing it, so the caller decides where
+/// it lives and the whole thing is checkable without a GPU.
+pub fn compute_mqd_init(
+    prop: &MqdProp,
+    eop_gpu_addr: u64,
+) -> Result<[u32; COMPUTE_MQD_DWORDS], FsError> {
+    // `order_base_2(queue_size / 4) - 1` underflows below 8 bytes, and a
+    // non-power-of-two ring cannot be described by the size field.
+    if prop.queue_size < 8 || !prop.queue_size.is_power_of_two() {
+        return Err(FsError::InvalidData);
+    }
+    // `cp_hqd_pq_base` holds the ring address shifted right by 8.
+    if prop.hqd_base_gpu_addr & 0xFF != 0 {
+        return Err(FsError::InvalidData);
+    }
+
+    let mut mqd = [0u32; COMPUTE_MQD_DWORDS];
+
+    mqd[C_HEADER] = COMPUTE_MQD_HEADER;
+    mqd[C_COMPUTE_PIPELINESTAT_ENABLE] = 1;
+    // All compute units in every shader engine available to this queue.
+    for index in [
+        C_COMPUTE_STATIC_THREAD_MGMT_SE0,
+        C_COMPUTE_STATIC_THREAD_MGMT_SE1,
+        C_COMPUTE_STATIC_THREAD_MGMT_SE2,
+        C_COMPUTE_STATIC_THREAD_MGMT_SE3,
+    ] {
+        mqd[index] = u32::MAX;
+    }
+    mqd[C_COMPUTE_MISC_RESERVED] = COMPUTE_MISC_RESERVED;
+
+    // End-of-pipe buffer. `EOP_SIZE` is log2(bytes / 4) - 1, so the register
+    // describes 2^(EOP_SIZE+1) dwords.
+    mqd[C_CP_HQD_EOP_BASE_ADDR_LO] = eop_gpu_addr as u32;
+    mqd[C_CP_HQD_EOP_BASE_ADDR_HI] = (eop_gpu_addr >> 32) as u32;
+    let eop_size = log2_minus_one(MEC_HPD_BYTES / 4).ok_or(FsError::InvalidData)?;
+    mqd[C_CP_HQD_EOP_CONTROL] = put_field(CP_HQD_EOP_CONTROL_DEFAULT, EOP_SIZE_MASK, eop_size);
+
+    // Doorbell. `DOORBELL_OFFSET` is the index placed at bit 2, and SOURCE and
+    // HIT are explicitly cleared rather than left at whatever the default
+    // carries.
+    let mut doorbell = CP_HQD_PQ_DOORBELL_CONTROL_DEFAULT;
+    if prop.use_doorbell {
+        doorbell = put_field(doorbell, C_DOORBELL_OFFSET_MASK, prop.doorbell_index);
+        doorbell |= C_DOORBELL_EN;
+        doorbell &= !(C_DOORBELL_SOURCE | C_DOORBELL_HIT);
+    } else {
+        doorbell &= !C_DOORBELL_EN;
+    }
+    mqd[C_CP_HQD_PQ_DOORBELL_CONTROL] = doorbell;
+
+    // A queue being set up is not mid-dequeue and its pointers start at zero.
+    mqd[C_CP_HQD_DEQUEUE_REQUEST] = 0;
+    mqd[C_CP_HQD_PQ_WPTR_LO] = 0;
+    mqd[C_CP_HQD_PQ_WPTR_HI] = 0;
+
+    // The descriptor records its own address, dword-aligned.
+    mqd[C_CP_MQD_BASE_ADDR_LO] = (prop.mqd_gpu_addr & 0xffff_fffc) as u32;
+    mqd[C_CP_MQD_BASE_ADDR_HI] = (prop.mqd_gpu_addr >> 32) as u32;
+    mqd[C_CP_MQD_CONTROL] = put_field(CP_MQD_CONTROL_DEFAULT, MQD_VMID_MASK, 0);
+
+    // The ring, shifted right by 8.
+    let pq = prop.hqd_base_gpu_addr >> 8;
+    mqd[C_CP_HQD_PQ_BASE_LO] = pq as u32;
+    mqd[C_CP_HQD_PQ_BASE_HI] = (pq >> 32) as u32;
+
+    let mut pq_control = CP_HQD_PQ_CONTROL_DEFAULT;
+    let queue_size = log2_minus_one(prop.queue_size / 4).ok_or(FsError::InvalidData)?;
+    pq_control = put_field(pq_control, PQ_QUEUE_SIZE_MASK, queue_size);
+    let rptr_block = log2_minus_one(GPU_PAGE_BYTES / 4).ok_or(FsError::InvalidData)?;
+    pq_control = put_field(pq_control, PQ_RPTR_BLOCK_SIZE_MASK, rptr_block);
+    pq_control |= PQ_UNORD_DISPATCH;
+    pq_control &= !PQ_TUNNEL_DISPATCH;
+    if prop.kernel_queue {
+        pq_control |= PQ_PRIV_STATE | PQ_KMD_QUEUE;
+    }
+    if prop.tmz_queue {
+        pq_control |= PQ_TMZ;
+    }
+    mqd[C_CP_HQD_PQ_CONTROL] = pq_control;
+
+    // Where the engine reports its read pointer, and where it polls for the
+    // host's write pointer. Both dword-aligned, and the high halves are 16-bit
+    // fields.
+    mqd[C_CP_HQD_PQ_RPTR_REPORT_ADDR_LO] = (prop.rptr_gpu_addr & 0xffff_fffc) as u32;
+    mqd[C_CP_HQD_PQ_RPTR_REPORT_ADDR_HI] = ((prop.rptr_gpu_addr >> 32) as u32) & 0xffff;
+    mqd[C_CP_HQD_PQ_WPTR_POLL_ADDR_LO] = (prop.wptr_gpu_addr & 0xffff_fffc) as u32;
+    mqd[C_CP_HQD_PQ_WPTR_POLL_ADDR_HI] = ((prop.wptr_gpu_addr >> 32) as u32) & 0xffff;
+
+    mqd[C_CP_HQD_PQ_RPTR] = CP_HQD_PQ_RPTR_DEFAULT;
+    mqd[C_CP_HQD_VMID] = 0;
+    mqd[C_CP_HQD_PERSISTENT_STATE] = put_field(
+        CP_HQD_PERSISTENT_STATE_DEFAULT,
+        PERSISTENT_PRELOAD_SIZE_MASK,
+        PRELOAD_SIZE,
+    );
+    mqd[C_CP_HQD_IB_CONTROL] = put_field(
+        CP_HQD_IB_CONTROL_DEFAULT,
+        IB_MIN_IB_AVAIL_SIZE_MASK,
+        MIN_IB_AVAIL_SIZE,
+    );
+
+    let priority = match prop.priority {
+        QueuePriority::Maximum => 1,
+        QueuePriority::Normal => 0,
+    };
+    mqd[C_CP_HQD_PIPE_PRIORITY] = priority;
+    mqd[C_CP_HQD_QUEUE_PRIORITY] = priority;
+
+    // Quantum is composed from zero here, not from a register default.
+    mqd[C_CP_HQD_QUANTUM] = put_field(QUANTUM_EN | QUANTUM_SCALE, QUANTUM_DURATION_MASK, 1);
+
+    // The queue is not active until the scheduler maps it.
+    mqd[C_CP_HQD_ACTIVE] = 0;
+
+    mqd[C_FENCE_ADDRESS_LO] = prop.fence_address as u32;
+    mqd[C_FENCE_ADDRESS_HI] = (prop.fence_address >> 32) as u32;
+    Ok(mqd)
+}
+
+/// `order_base_2(n) - 1`, rejecting the values where that underflows or `n`
+/// cannot be described by a log2 field.
+fn log2_minus_one(n: u64) -> Option<u32> {
+    if n < 2 || !n.is_power_of_two() {
+        return None;
+    }
+    Some(n.trailing_zeros() - 1)
+}

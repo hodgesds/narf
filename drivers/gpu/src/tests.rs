@@ -10113,6 +10113,233 @@ kernel_test_in!(
     smoke_amdgpu_mqd_gfx11_matches_linux
 );
 
+/// The GFX11 COMPUTE queue descriptor, against `gfx_v11_0_compute_mqd_init`.
+///
+/// `v11_compute_mqd` is a different register image from `v11_gfx_mqd` — the
+/// indices come from the `// offset:` comments `v11_structs.h:674` carries,
+/// and the values from `gc_11_0_0_default.h` and `gc_11_0_0_sh_mask.h`.
+fn smoke_amdgpu_mqd_compute_matches_linux() -> TestResult {
+    use crate::amdgpu_mqd::*;
+
+    let base = MqdProp {
+        mqd_gpu_addr: 0x1_0000_1006,
+        hqd_base_gpu_addr: 0x2_0000_0000,
+        rptr_gpu_addr: 0x0003_0000_0006,
+        wptr_gpu_addr: 0x0004_0000_000A,
+        queue_size: 8192,
+        doorbell_index: 0x42,
+        use_doorbell: true,
+        kernel_queue: true,
+        tmz_queue: false,
+        priority: QueuePriority::Normal,
+        shadow_addr: 0,
+        gds_bkup_addr: 0,
+        csa_addr: 0,
+        fence_address: 0x8_0000_0000,
+    };
+    let eop = 0x9_0000_0000u64;
+    let mqd = match compute_mqd_init(&base, eop) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a well-formed compute queue was refused"),
+    };
+    if mqd.len() != 512 {
+        return TestResult::Fail("the compute image is 512 dwords");
+    }
+
+    // The literal header `gfx_v11_0_compute_mqd_init` writes first.
+    if mqd[C_HEADER] != 0xC031_0800 {
+        return TestResult::Fail("MQD header");
+    }
+    if mqd[C_COMPUTE_PIPELINESTAT_ENABLE] != 1 || mqd[C_COMPUTE_MISC_RESERVED] != 0x7 {
+        return TestResult::Fail("pipelinestat or misc_reserved");
+    }
+    // All four SE thread-management masks are 0xffffffff. SE2 is at index 25
+    // and SE3 at 27 — NOT 26, which the declaration skips.
+    for index in [23usize, 24, 25, 27] {
+        if mqd[index] != u32::MAX {
+            return TestResult::Fail("a static thread-management mask is not all-ones");
+        }
+    }
+
+    // EOP buffer: address plain, and EOP_SIZE = log2(2048/4) - 1 = 8 in
+    // bits[5:0] over the 0x00000006 default.
+    if mqd[C_CP_HQD_EOP_BASE_ADDR_LO] != eop as u32
+        || mqd[C_CP_HQD_EOP_BASE_ADDR_HI] != (eop >> 32) as u32
+    {
+        return TestResult::Fail("EOP base");
+    }
+    if MEC_HPD_BYTES != 2048 {
+        return TestResult::Fail("GFX11_MEC_HPD_SIZE is 2048");
+    }
+    if mqd[C_CP_HQD_EOP_CONTROL] & 0x3F != 8 {
+        return TestResult::Fail("EOP_SIZE must be log2(bytes/4) - 1");
+    }
+
+    // Doorbell: the index sits in DOORBELL_OFFSET at bit 2 (mask 0x0FFFFFFC),
+    // DOORBELL_EN is bit 30, and SOURCE (28) and HIT (31) are cleared.
+    let db = mqd[C_CP_HQD_PQ_DOORBELL_CONTROL];
+    if (db & 0x0FFF_FFFC) >> 2 != 0x42 {
+        return TestResult::Fail("doorbell offset");
+    }
+    if db & 0x4000_0000 == 0 {
+        return TestResult::Fail("DOORBELL_EN");
+    }
+    if db & (0x1000_0000 | 0x8000_0000) != 0 {
+        return TestResult::Fail("DOORBELL_SOURCE and DOORBELL_HIT must be clear");
+    }
+    let no_db = match compute_mqd_init(
+        &MqdProp {
+            use_doorbell: false,
+            ..base
+        },
+        eop,
+    ) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("doorbell-less queue refused"),
+    };
+    if no_db[C_CP_HQD_PQ_DOORBELL_CONTROL] & 0x4000_0000 != 0 {
+        return TestResult::Fail("DOORBELL_EN must be clear without a doorbell");
+    }
+
+    // The ring base is shifted right by 8, unlike the EOP and MQD addresses.
+    let pq = base.hqd_base_gpu_addr >> 8;
+    if mqd[C_CP_HQD_PQ_BASE_LO] != pq as u32 || mqd[C_CP_HQD_PQ_BASE_HI] != (pq >> 32) as u32 {
+        return TestResult::Fail("PQ base must be the address shifted by eight");
+    }
+
+    // PQ_CONTROL over the 0x00308509 default: QUEUE_SIZE = log2(8192/4) - 1
+    // = 10 in bits[5:0], RPTR_BLOCK_SIZE = log2(4096/4) - 1 = 9 at bit 8,
+    // UNORD_DISPATCH (28) set, TUNNEL_DISPATCH (29) clear, and PRIV_STATE (30)
+    // with KMD_QUEUE (31) for a kernel queue.
+    let pqc = mqd[C_CP_HQD_PQ_CONTROL];
+    if pqc & 0x3F != 10 {
+        return TestResult::Fail("QUEUE_SIZE");
+    }
+    if (pqc & 0x0000_3F00) >> 8 != 9 {
+        return TestResult::Fail("RPTR_BLOCK_SIZE");
+    }
+    if pqc & 0x1000_0000 == 0 || pqc & 0x2000_0000 != 0 {
+        return TestResult::Fail("UNORD_DISPATCH set, TUNNEL_DISPATCH clear");
+    }
+    if pqc & 0x4000_0000 == 0 || pqc & 0x8000_0000 == 0 {
+        return TestResult::Fail("a kernel compute queue is privileged and KMD-owned");
+    }
+    if pqc & 0x0040_0000 != 0 {
+        return TestResult::Fail("TMZ must be off unless asked for");
+    }
+    // A userspace queue gets neither privilege bit — inverted, every user
+    // queue would hold the kernel's authority over the MEC.
+    let user = match compute_mqd_init(
+        &MqdProp {
+            kernel_queue: false,
+            ..base
+        },
+        eop,
+    ) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("userspace queue refused"),
+    };
+    if user[C_CP_HQD_PQ_CONTROL] & (0x4000_0000 | 0x8000_0000) != 0 {
+        return TestResult::Fail("a userspace compute queue must not be privileged");
+    }
+    let tmz = match compute_mqd_init(
+        &MqdProp {
+            tmz_queue: true,
+            ..base
+        },
+        eop,
+    ) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("tmz queue refused"),
+    };
+    if tmz[C_CP_HQD_PQ_CONTROL] & 0x0040_0000 == 0 {
+        return TestResult::Fail("TMZ must be set when asked for");
+    }
+
+    // The report and poll addresses are dword-aligned, and their high halves
+    // are 16-bit fields — the fixture's addresses have bits set in both.
+    if mqd[C_CP_HQD_PQ_RPTR_REPORT_ADDR_LO] != 0x0000_0004 {
+        return TestResult::Fail("the rptr report address must be dword-aligned");
+    }
+    if mqd[C_CP_HQD_PQ_RPTR_REPORT_ADDR_HI] != 0x0003 {
+        return TestResult::Fail("rptr report address high half");
+    }
+    if mqd[C_CP_HQD_PQ_WPTR_POLL_ADDR_LO] != 0x0000_0008 {
+        return TestResult::Fail("the wptr poll address must be dword-aligned");
+    }
+    if mqd[C_CP_HQD_PQ_WPTR_POLL_ADDR_HI] != 0x0004 {
+        return TestResult::Fail("wptr poll address high half");
+    }
+    // The MQD records its own address, also dword-aligned.
+    if mqd[C_CP_MQD_BASE_ADDR_LO] != 0x0000_1004 {
+        return TestResult::Fail("the MQD's own address must be dword-aligned");
+    }
+
+    // PERSISTENT_STATE forces PRELOAD_SIZE to 0x55 at bit 8 over 0x0be05501,
+    // and IB_CONTROL forces MIN_IB_AVAIL_SIZE to 3 at bit 20 over 0x00300000.
+    if (mqd[C_CP_HQD_PERSISTENT_STATE] & 0x0003_FF00) >> 8 != 0x55 {
+        return TestResult::Fail("PRELOAD_SIZE");
+    }
+    if (mqd[C_CP_HQD_IB_CONTROL] & 0x0030_0000) >> 20 != 3 {
+        return TestResult::Fail("MIN_IB_AVAIL_SIZE");
+    }
+
+    // QUANTUM is composed from ZERO, not from a register default:
+    // QUANTUM_EN bit 0, QUANTUM_SCALE bit 4, QUANTUM_DURATION 1 at bit 8.
+    if mqd[C_CP_HQD_QUANTUM] != 0x1 | 0x10 | (1 << 8) {
+        return TestResult::Fail("quantum");
+    }
+
+    // Not active until the scheduler maps it, and its pointers start at zero.
+    if mqd[C_CP_HQD_ACTIVE] != 0 || mqd[C_CP_HQD_DEQUEUE_REQUEST] != 0 {
+        return TestResult::Fail("a fresh queue is inactive and not dequeuing");
+    }
+    if mqd[C_CP_HQD_PQ_WPTR_LO] != 0 || mqd[C_CP_HQD_PQ_WPTR_HI] != 0 {
+        return TestResult::Fail("write pointer starts at zero");
+    }
+    if mqd[C_CP_HQD_VMID] != 0 {
+        return TestResult::Fail("the kernel's VMID is zero");
+    }
+    if mqd[C_FENCE_ADDRESS_LO] != base.fence_address as u32
+        || mqd[C_FENCE_ADDRESS_HI] != (base.fence_address >> 32) as u32
+    {
+        return TestResult::Fail("fence address");
+    }
+
+    // Ring sizes the size field cannot describe are refused rather than
+    // silently truncated.
+    for bad in [0u64, 4, 6, 3000] {
+        if compute_mqd_init(
+            &MqdProp {
+                queue_size: bad,
+                ..base
+            },
+            eop,
+        )
+        .is_ok()
+        {
+            return TestResult::Fail("an unrepresentable ring size must be refused");
+        }
+    }
+    // So is a ring base whose low eight bits would be discarded by the shift.
+    if compute_mqd_init(
+        &MqdProp {
+            hqd_base_gpu_addr: 0x2_0000_0080,
+            ..base
+        },
+        eop,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("a misaligned ring base must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_mqd",
+    smoke_amdgpu_mqd_compute_matches_linux
+);
+
 /// The SMU mailbox registers, against `mp_13_0_4_offset.h`.
 ///
 /// `regMP1_SMN_C2PMSG_N` is dword `0x240 + N`: C2PMSG_64 is 0x0280, 66 is
