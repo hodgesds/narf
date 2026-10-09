@@ -387,16 +387,181 @@ pub fn build_mes_queue_init_register(
     seq
 }
 
-// LINUX-GAP: `mes_v11_0_queue_init_register` is not built. The descriptor
-// itself now is — [`crate::amdgpu_mqd::mes_mqd_init`] — but the function that
-// pushes thirteen of its fields into the live `CP_HQD_*` registers, behind a
-// me-3/pipe selection, is not. It is the MES equivalent of
-// `build_gfx11_ring_init` and the same shape; what it needs that this module
-// does not yet have is the pipe's ring and writeback allocations, the way
-// `GfxContext` holds the graphics ring's.
+// ── What the scheduler is told about the hardware ─────────────────
+
+/// The pipe and queue topology `amdgpu_mes_init` derives its masks from.
+///
+/// `build_set_hw_resources` takes the masks ready-made, and nothing computed
+/// them. They are not free parameters: each one says which hardware queue
+/// slots the scheduler may hand out, and the derivation reserves exactly the
+/// slots the driver's own kernel rings occupy. A mask that is too wide lets
+/// the scheduler place a user queue on top of a kernel ring; too narrow and it
+/// has nowhere to put anything.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MesTopology {
+    /// `adev->gfx.me.num_me`.
+    pub num_me: u32,
+    /// `adev->gfx.me.num_pipe_per_me`.
+    pub num_pipe_per_me: u32,
+    /// `adev->gfx.me.num_queue_per_pipe`.
+    pub num_queue_per_pipe_gfx: u32,
+    /// `adev->gfx.num_gfx_rings` — the kernel graphics rings to reserve for.
+    pub num_gfx_rings: u32,
+    /// `adev->gfx.mec.num_mec`.
+    pub num_mec: u32,
+    /// `adev->gfx.mec.num_pipe_per_mec`.
+    pub num_pipe_per_mec: u32,
+    /// `adev->gfx.mec.num_queue_per_pipe`.
+    pub num_queue_per_pipe_compute: u32,
+    /// `adev->gfx.num_compute_rings`.
+    pub num_compute_rings: u32,
+    /// `adev->sdma.num_instances`, from the discovery table.
+    pub num_sdma_instances: u32,
+    /// `adev->vm_manager.first_kfd_vmid` — VMIDs below this are the driver's.
+    pub first_kfd_vmid: u32,
+    /// `mes->db_start_dw_offset`, the base of the aggregated doorbells.
+    pub db_start_dw_offset: u32,
+}
+
+/// Phoenix, with the stock module parameters.
+///
+/// Every value is traced to where `gfx_v11_0_sw_init` sets it for GC
+/// IP_VERSION(11, 0, 1):
+///
+/// ```text
+/// num_me                  1
+/// num_pipe_per_me         1     rs64_enable is true, so 1 and not 2
+/// num_queue_per_pipe_gfx  2
+/// num_gfx_rings           1     "rs64 only supports one gfx pipe"
+/// num_mec                 1
+/// num_pipe_per_mec        4
+/// num_queue_per_pipe      4
+/// num_compute_rings       8     min(amdgpu_gfx_get_num_kcq() = 8, 8)
+/// first_kfd_vmid          8     gmc_v11_0.c:853, disable_kq being false
+/// ```
+///
+/// `disable_kq` is false because `amdgpu_user_queue` defaults to -1, which
+/// takes `gfx_v11_0_early_init`'s default arm. The `disable_kq` arm would make
+/// `num_gfx_rings` 1 and `num_compute_rings` **0**, which changes both masks —
+/// so this is a per-configuration table, not a per-ASIC one, and it says so.
+///
+/// `num_sdma_instances` is 1 and comes from the discovery table at runtime;
+/// it is here as the Phoenix value for the test, not as something to trust.
+pub const PHOENIX_TOPOLOGY: MesTopology = MesTopology {
+    num_me: 1,
+    num_pipe_per_me: 1,
+    num_queue_per_pipe_gfx: 2,
+    num_gfx_rings: 1,
+    num_mec: 1,
+    num_pipe_per_mec: 4,
+    num_queue_per_pipe_compute: 4,
+    num_compute_rings: 8,
+    num_sdma_instances: 1,
+    first_kfd_vmid: 8,
+    db_start_dw_offset: 0,
+};
+
+/// `mes->sdma_hqd_mask[i] = 0xfc` — a literal in `amdgpu_mes_init`, not
+/// derived from anything. Queues 2..7 of each SDMA instance; 0 and 1 are the
+/// driver's own.
+pub const SDMA_HQD_MASK: u32 = 0xFC;
+
+/// `mes->vmid_mask_mmhub = 0xFF00` — also a literal.
+pub const VMID_MASK_MMHUB: u32 = 0xFF00;
+
+/// `amdgpu_mes_get_hqd_mask` — the hardware queue slots on each pipe that the
+/// scheduler may use.
+///
+/// `num_reserved_hqd` kernel rings are spread across `num_pipe` pipes, so
+/// `ceil(num_reserved_hqd / num_pipe)` slots per pipe are the driver's and the
+/// rest are the scheduler's. The **ceiling** is the part to get right: with 8
+/// compute rings over 4 pipes it reserves 2 per pipe, and with 1 graphics ring
+/// over 1 pipe it reserves 1 — flooring would reserve nothing whenever the
+/// rings do not divide evenly and hand the scheduler a slot a kernel ring is
+/// already on.
+///
+/// Returns 0 for a pipe count of zero, as Linux does, rather than dividing by
+/// it.
+pub const fn hqd_mask(num_pipe: u32, num_hqd_per_pipe: u32, num_reserved_hqd: u32) -> u32 {
+    if num_pipe == 0 {
+        return 0;
+    }
+    let total = ((1u64 << num_hqd_per_pipe) - 1) as u32;
+    let per_pipe = num_reserved_hqd.div_ceil(num_pipe);
+    let reserved = ((1u64 << per_pipe) - 1) as u32;
+    total & !reserved
+}
+
+/// Fill the mask and VMID fields of a `SET_HW_RSRC` payload from `topo`,
+/// following `amdgpu_mes_init`.
+///
+/// Leaves everything else — the context addresses, the flags, the GDS size,
+/// the IP bases — to the caller, because those are allocations and discovery
+/// results rather than topology.
+pub fn fill_hw_resources(res: &mut crate::amdgpu_mes::MesHwResources, topo: &MesTopology) {
+    // `total_vmid_mask` is 16 bits; everything below `first_kfd_vmid` is
+    // reserved for the driver. On Phoenix that leaves VMIDs 8..15, which is
+    // the same 0xFF00 the MMHUB mask is a literal for — a coincidence, since
+    // one is derived and the other is not.
+    let total_vmid_mask: u32 = (1 << 16) - 1;
+    let reserved_vmid_mask: u32 = ((1u64 << topo.first_kfd_vmid) - 1) as u32;
+    res.vmid_mask_mmhub = VMID_MASK_MMHUB;
+    res.vmid_mask_gfxhub = total_vmid_mask & !reserved_vmid_mask;
+
+    let gfx = hqd_mask(
+        topo.num_pipe_per_me,
+        topo.num_queue_per_pipe_gfx,
+        topo.num_gfx_rings,
+    );
+    let compute = hqd_mask(
+        topo.num_pipe_per_mec,
+        topo.num_queue_per_pipe_compute,
+        topo.num_compute_rings,
+    );
+
+    // The same mask goes to every pipe that EXISTS, and the entries past that
+    // stay zero. The bounds differ per block, which is the detail a single
+    // loop would flatten: gfx is bounded by `num_pipe_per_me * num_me`,
+    // compute by `num_pipe_per_mec` ALONE — `amdgpu_mes_init` deliberately
+    // stops at one MEC, "to avoid potential issues" with queue resources
+    // shared with KFD, even though it computed `num_pipe_per_mec * num_mec`
+    // for the warning two lines up.
+    let gfx_pipes = (topo.num_pipe_per_me * topo.num_me) as usize;
+    for (i, slot) in res.gfx_hqd_mask.iter_mut().enumerate() {
+        *slot = if i < gfx_pipes { gfx } else { 0 };
+    }
+    let compute_pipes = topo.num_pipe_per_mec as usize;
+    for (i, slot) in res.compute_hqd_mask.iter_mut().enumerate() {
+        *slot = if i < compute_pipes { compute } else { 0 };
+    }
+    let sdma_pipes = topo.num_sdma_instances as usize;
+    for (i, slot) in res.sdma_hqd_mask.iter_mut().enumerate() {
+        *slot = if i < sdma_pipes { SDMA_HQD_MASK } else { 0 };
+    }
+
+    // `aggregated_doorbells[i] = db_start_dw_offset + i * 2` — two dwords
+    // apart, because each is a 64-bit doorbell.
+    for (i, slot) in res.aggregated_doorbells.iter_mut().enumerate() {
+        *slot = topo.db_start_dw_offset + (i as u32) * 2;
+    }
+}
+
+// LINUX-GAP: the MES pipe has no ring. Every register sequence and every
+// packet `mes_v11_0_hw_init` issues is now expressible — the enable, the
+// descriptor, the HQD registers, `SET_HW_RSRC`'s payload, the submit protocol
+// in `amdgpu_mes` — but nothing allocates the pipe's own ring, writeback and
+// descriptor pages, the way `GfxContext` holds the graphics ring's, and
+// nothing allocates the scheduler-context and query-status-fence buffers
+// `SET_HW_RSRC` names. So nothing here is reachable from a probe: this module
+// builds the sequences and nothing calls them.
 //
-// So nothing here is reachable from a probe yet: this module builds the
-// sequences and nothing calls them.
+// LINUX-GAP: `mes_v11_0_get_fw_version` is not performed, only enabled.
+// [`fw_version_select`] hands a caller the two selector values and
+// [`CP_MES_GP3_LO`] is named, but a read cannot be a [`Gfx11Sequence`] step,
+// so the two-step read is the caller's. The scheduler version it returns is
+// not cosmetic: `enable_legacy_queue_map` is set from `>= 0x47`, which is what
+// decides whether a kernel graphics ring is registered through MES ADD_QUEUE
+// or the KIQ's MAP_QUEUES packet — and only the first of those exists here.
 
 // ── Tests ──────────────────────────────────────────────────────────
 
@@ -811,4 +976,136 @@ mod smoke_tests {
         "drivers/gpu/amdgpu/mes_hw",
         smoke_mes_hw_queue_init_register
     );
+
+    /// `amdgpu_mes_get_hqd_mask`, and the Phoenix masks it produces.
+    ///
+    /// The literals are worked out by hand from `gfx_v11_0_sw_init`'s counts
+    /// rather than recomputed, so the test disagrees with the code if the
+    /// derivation drifts:
+    ///
+    /// ```text
+    /// gfx:     pipes 1, queues/pipe 2, reserved rings 1
+    ///          total     = (1 << 2) - 1            = 0x3
+    ///          per_pipe  = ceil(1 / 1)             = 1
+    ///          reserved  = (1 << 1) - 1            = 0x1
+    ///          mask      = 0x3 & ~0x1              = 0x2
+    /// compute: pipes 4, queues/pipe 4, reserved rings 8
+    ///          total     = (1 << 4) - 1            = 0xF
+    ///          per_pipe  = ceil(8 / 4)             = 2
+    ///          reserved  = (1 << 2) - 1            = 0x3
+    ///          mask      = 0xF & ~0x3              = 0xC
+    /// ```
+    fn smoke_mes_hw_resource_masks() -> TestResult {
+        use crate::amdgpu_mes::{MesHwResources, AMD_PRIORITY_NUM_LEVELS};
+
+        // The derivation itself.
+        if hqd_mask(1, 2, 1) != 0x2 {
+            return TestResult::Fail("the graphics mask should be 0x2");
+        }
+        if hqd_mask(4, 4, 8) != 0xC {
+            return TestResult::Fail("the compute mask should be 0xC");
+        }
+        // No pipes means no mask, not a division by zero.
+        if hqd_mask(0, 4, 8) != 0 {
+            return TestResult::Fail("a pipe count of zero yields no mask");
+        }
+        // Nothing reserved means every slot is the scheduler's.
+        if hqd_mask(4, 4, 0) != 0xF {
+            return TestResult::Fail("with no kernel rings the whole pipe is available");
+        }
+        // The CEILING. Five rings over four pipes reserves two per pipe, not
+        // one: flooring would hand the scheduler a slot a kernel ring is on.
+        if hqd_mask(4, 4, 5) != 0xC {
+            return TestResult::Fail("rings per pipe must round UP");
+        }
+        if hqd_mask(4, 4, 4) != 0xE {
+            return TestResult::Fail("four rings over four pipes reserves one each");
+        }
+
+        // And the whole Phoenix payload.
+        let mut res = MesHwResources::default();
+        fill_hw_resources(&mut res, &PHOENIX_TOPOLOGY);
+
+        if res.vmid_mask_mmhub != 0xFF00 {
+            return TestResult::Fail("vmid_mask_mmhub is the literal 0xFF00");
+        }
+        // `first_kfd_vmid` is 8, so VMIDs 0..7 are the driver's and 8..15 the
+        // scheduler's — which lands on the same value the MMHUB mask is
+        // hardcoded to, by coincidence rather than by construction.
+        if res.vmid_mask_gfxhub != 0xFF00 {
+            return TestResult::Fail("vmid_mask_gfxhub should leave VMIDs 8..15");
+        }
+        // Which is worth pinning as a derivation, not a literal: a part that
+        // reserved a different number of VMIDs would differ here and not in
+        // the MMHUB mask.
+        let mut shifted = MesHwResources::default();
+        fill_hw_resources(
+            &mut shifted,
+            &MesTopology {
+                first_kfd_vmid: 1,
+                ..PHOENIX_TOPOLOGY
+            },
+        );
+        if shifted.vmid_mask_gfxhub != 0xFFFE {
+            return TestResult::Fail("the gfxhub mask follows first_kfd_vmid");
+        }
+        if shifted.vmid_mask_mmhub != 0xFF00 {
+            return TestResult::Fail("the mmhub mask does not follow it");
+        }
+
+        // One graphics pipe gets the mask; the second array entry stays zero.
+        if res.gfx_hqd_mask != [0x2, 0] {
+            return TestResult::Fail("one graphics pipe exists on Phoenix");
+        }
+        // Four compute pipes of eight.
+        if res.compute_hqd_mask != [0xC, 0xC, 0xC, 0xC, 0, 0, 0, 0] {
+            return TestResult::Fail("four compute pipes exist, and four array slots do not");
+        }
+        // One SDMA instance, and the mask is a literal.
+        if res.sdma_hqd_mask != [SDMA_HQD_MASK, 0] || SDMA_HQD_MASK != 0xFC {
+            return TestResult::Fail("one SDMA instance, queues 2..7");
+        }
+
+        // The aggregated doorbells are two dwords apart because each is a
+        // 64-bit doorbell.
+        if res.aggregated_doorbells.len() != AMD_PRIORITY_NUM_LEVELS {
+            return TestResult::Fail("one aggregated doorbell per priority level");
+        }
+        for (i, got) in res.aggregated_doorbells.iter().enumerate() {
+            if *got != (i as u32) * 2 {
+                return TestResult::Fail("the aggregated doorbells step by two dwords");
+            }
+        }
+        let mut based = MesHwResources::default();
+        fill_hw_resources(
+            &mut based,
+            &MesTopology {
+                db_start_dw_offset: 0x40,
+                ..PHOENIX_TOPOLOGY
+            },
+        );
+        if based.aggregated_doorbells[2] != 0x44 {
+            return TestResult::Fail("the aggregated doorbells start at db_start_dw_offset");
+        }
+
+        // The `disable_kq` configuration changes BOTH masks, which is why the
+        // table is per-configuration: no graphics ring reserved, and no
+        // compute rings at all.
+        let mut no_kq = MesHwResources::default();
+        fill_hw_resources(
+            &mut no_kq,
+            &MesTopology {
+                num_compute_rings: 0,
+                ..PHOENIX_TOPOLOGY
+            },
+        );
+        if no_kq.compute_hqd_mask[0] != 0xF {
+            return TestResult::Fail("with no kernel compute rings the pipes are all available");
+        }
+        if no_kq.gfx_hqd_mask[0] != 0x2 {
+            return TestResult::Fail("the graphics mask is independent of the compute rings");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/amdgpu/mes_hw", smoke_mes_hw_resource_masks);
 }
