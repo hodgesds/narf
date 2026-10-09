@@ -1001,70 +1001,68 @@ impl AmdGpu {
         unsafe { self.passive_mode() }
     }
 
-    /// Read the firmware-programmed scanout mode through the OTG
-    /// timing registers. Returns `None` when DCN isn't running
-    /// (HUBP_BLANK = 1) or when the timing registers read garbage.
+    /// Read the firmware-programmed scanout geometry out of DCN.
     ///
-    /// This relies on register offsets being identical across
-    /// Vega/Navi — the HUBP/OTG register-bus offsets are stable in
-    /// the public AMD docs even though MP0 (PSP) offsets shift
-    /// per family. When that assumption stops holding the function
-    /// returns `None` for the unsupported family.
+    /// Returns `None` when no pipe is fetching, when DCN was not discovered,
+    /// or when the registers read back as a vanished device.
+    ///
+    /// LINUX-GAP: this read four constants — 0x5C00, 0x5C04, 0x5C08, 0x5C0C —
+    /// described as "OTG H_TOTAL / V_TOTAL register-bus offsets per the public
+    /// DCN1+ register map". No DCN header defines anything in that range;
+    /// `regOTG0_OTG_H_TOTAL` is dword 0x1b2a. They were also used with no DCN
+    /// base and through MM_INDEX, which takes a dword address, so the reads
+    /// landed on four unrelated registers. The derivation on top was wrong
+    /// too: `h_active` came out as `h_total - (blank_end - blank_start)`, but
+    /// `optc1_program_timing` writes `OTG_H_BLANK_END` BELOW
+    /// `OTG_H_BLANK_START` (end = start - h_active), so that subtraction
+    /// saturated to zero and the function would have reported
+    /// `h_active == h_total`. `stride` was assumed equal to the width.
+    ///
+    /// None of that is needed. The HUBP's own viewport and pitch registers say
+    /// what the pipe is fetching, which is the question being asked —
+    /// `amdgpu_platform::scan_surfaces` reads the same ones to inventory an
+    /// inherited scanout.
     ///
     /// # Safety
     /// Caller owns BAR5 exclusively.
     unsafe fn passive_mode(&self) -> Option<Mode> {
-        // OTG H_TOTAL / V_TOTAL register-bus offsets per the
-        // public DCN1+ register map. Both encode `total - 1`.
-        const OTG_H_TOTAL: u32 = 0x0000_5C00;
-        const OTG_V_TOTAL: u32 = 0x0000_5C04;
-        const OTG_H_BLANK_START_END: u32 = 0x0000_5C08;
-        const OTG_V_BLANK_START_END: u32 = 0x0000_5C0C;
-
-        // SAFETY: caller-asserted exclusive ownership of BAR5.
-        let h_total = unsafe { mm_read(&self.regs, OTG_H_TOTAL) };
-        if h_total == 0 || h_total == 0xFFFF_FFFF {
-            return None;
+        use crate::amdgpu_dcn as dcn;
+        // Every HUBP / HUBPREQ register is BASE_IDX 2.
+        let base = self.ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2)?;
+        for pipe in 0..dcn::DCN_PIPES {
+            let at = |reg: u32| base + dcn::for_pipe(reg, pipe, dcn::HUBP_PIPE_STRIDE);
+            // SAFETY: caller-asserted BAR5 ownership; MM_INDEX/MM_DATA pair,
+            // and these are read-only hub status registers.
+            let cntl = unsafe { mm_read(&self.regs, at(dcn::HUBP0_DCHUBP_CNTL)) };
+            if cntl == u32::MAX {
+                return None;
+            }
+            // `HUBP_BLANK_EN` set means this pipe is not fetching.
+            if cntl & dcn::HUBP_BLANK_FORCE != 0 {
+                continue;
+            }
+            // SAFETY: same bank, same contract.
+            let viewport =
+                unsafe { mm_read(&self.regs, at(dcn::HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION)) };
+            // SAFETY: same.
+            let pitch = unsafe { mm_read(&self.regs, at(dcn::HUBPREQ0_DCSURF_SURFACE_PITCH)) };
+            if viewport == u32::MAX || pitch == u32::MAX {
+                return None;
+            }
+            let width = viewport & dcn::SURFACE_DIMENSION_MASK;
+            let height = (viewport >> 16) & dcn::SURFACE_DIMENSION_MASK;
+            // The pitch register holds one less than the pitch.
+            let stride = (pitch & dcn::SURFACE_DIMENSION_MASK) + 1;
+            if width == 0 || height == 0 || stride < width {
+                return None;
+            }
+            return Some(Mode {
+                width,
+                height,
+                stride,
+            });
         }
-        // SAFETY: caller-asserted exclusive ownership of BAR5; `OTG_V_TOTAL`
-        // is a read-only OTG timing register on the same MMIO BAR.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let v_total = unsafe { mm_read(&self.regs, OTG_V_TOTAL) };
-        if v_total == 0 || v_total == 0xFFFF_FFFF {
-            return None;
-        }
-        // SAFETY: caller-asserted exclusive ownership of BAR5; OTG blank
-        // registers are read-only timing latches on the same MMIO BAR.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let h_blank = unsafe { mm_read(&self.regs, OTG_H_BLANK_START_END) };
-        // SAFETY: caller-asserted exclusive ownership of BAR5; same OTG
-        // blank-register MMIO BAR as above.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let v_blank = unsafe { mm_read(&self.regs, OTG_V_BLANK_START_END) };
-
-        // OTG_H_TOTAL is `total - 1`; bits[15:0] are the value.
-        // H/V_BLANK_START_END pack `(end << 16) | start`.
-        let h_total_val = (h_total & 0xFFFF) + 1;
-        let v_total_val = (v_total & 0xFFFF) + 1;
-        let h_blank_start = h_blank & 0xFFFF;
-        let h_blank_end = (h_blank >> 16) & 0xFFFF;
-        let v_blank_start = v_blank & 0xFFFF;
-        let v_blank_end = (v_blank >> 16) & 0xFFFF;
-        // Active = total - blanking_width.
-        let h_blank_w = h_blank_end.saturating_sub(h_blank_start);
-        let v_blank_w = v_blank_end.saturating_sub(v_blank_start);
-        let h_active = h_total_val.saturating_sub(h_blank_w);
-        let v_active = v_total_val.saturating_sub(v_blank_w);
-        if h_active < 64 || v_active < 64 || h_active > 16384 || v_active > 16384 {
-            // Sanity-bound: 64..16384 covers 720p..16K.
-            return None;
-        }
-        Some(Mode {
-            width: h_active,
-            height: v_active,
-            // Linear scanout: stride = width (no row padding).
-            stride: h_active,
-        })
+        None
     }
 
     /// Stage the chip's firmware blob through `narf-firmware` and

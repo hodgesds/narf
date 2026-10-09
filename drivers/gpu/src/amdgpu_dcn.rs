@@ -122,6 +122,12 @@ pub const HUBP0_DCHUBP_CNTL: u32 = 0x05f3;
 /// **HUBPREQ** sub-block, which is why their ids do not continue from
 /// `DCHUBP_CNTL`.
 pub const HUBPREQ0_DCSURF_SURFACE_PITCH: u32 = 0x0607;
+/// `regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION` — `PRI_VIEWPORT_WIDTH` in
+/// bits[13:0] and `PRI_VIEWPORT_HEIGHT` in bits[29:16], both masked 0x3FFF.
+/// What the pipe actually fetches, so the authority on a running mode's size.
+pub const HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION: u32 = 0x05ea;
+/// The 14-bit viewport and pitch fields' mask.
+pub const SURFACE_DIMENSION_MASK: u32 = 0x3FFF;
 /// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS` — low half, **below** high.
 pub const HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS: u32 = 0x060a;
 /// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH`.

@@ -7341,6 +7341,58 @@ kernel_test_in!(
 /// The two conventions this driver carries — byte-offset `*_REL` constants and
 /// MM_INDEX's dword port — and which GC window each register needs. Literals
 /// from `gc/gc_11_0_0_offset.h` and `gc_9_0_offset.h`.
+/// The registers `passive_mode` reads to recover a running mode's geometry,
+/// and the decode it applies. Literals from `dcn/dcn_3_1_4_offset.h` and
+/// `dcn_3_1_4_sh_mask.h`.
+fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
+    use crate::amdgpu_dcn as dcn;
+    // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
+    // 0x05ea, regHUBPREQ0_DCSURF_SURFACE_PITCH 0x0607 — all BASE_IDX 2.
+    if dcn::HUBP0_DCHUBP_CNTL != 0x05f3
+        || dcn::HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION != 0x05ea
+        || dcn::HUBPREQ0_DCSURF_SURFACE_PITCH != 0x0607
+    {
+        return TestResult::Fail("a hub register id is not its header dword id");
+    }
+    // Nothing in the 0x5c00 range the old code used is a DCN register at all,
+    // and regOTG0_OTG_H_TOTAL — the register it claimed to read — is 0x1b2a.
+    if dcn::OTG0_OTG_H_TOTAL != 0x1b2a {
+        return TestResult::Fail("OTG_H_TOTAL is dword 0x1b2a");
+    }
+    // PRI_VIEWPORT_WIDTH/HEIGHT and PITCH are all 0x3FFF-wide fields.
+    if dcn::SURFACE_DIMENSION_MASK != 0x3FFF {
+        return TestResult::Fail("the viewport and pitch fields are fourteen bits");
+    }
+    // HUBP_BLANK_EN is bit 0: set means the pipe is NOT fetching, which is the
+    // sense `scan_surfaces` uses too.
+    if dcn::HUBP_BLANK_FORCE != 1 {
+        return TestResult::Fail("HUBP_BLANK_EN is bit 0");
+    }
+    // The decode: a 1920x1080 viewport with a 1920-pixel pitch is
+    // 0x0438_0780 in the viewport register and 0x077F in the pitch one, since
+    // the pitch register holds one less.
+    let viewport = 1920u32 | 1080u32 << 16;
+    let pitch_field = 1920u32 - 1;
+    if viewport != 0x0438_0780 || pitch_field != 0x077F {
+        return TestResult::Fail("the fixture does not pack as the registers do");
+    }
+    if viewport & dcn::SURFACE_DIMENSION_MASK != 1920
+        || (viewport >> 16) & dcn::SURFACE_DIMENSION_MASK != 1080
+        || (pitch_field & dcn::SURFACE_DIMENSION_MASK) + 1 != 1920
+    {
+        return TestResult::Fail("viewport or pitch decode");
+    }
+    // The per-pipe stride the scan walks.
+    if dcn::for_pipe(dcn::HUBP0_DCHUBP_CNTL, 1, dcn::HUBP_PIPE_STRIDE) != 0x06cf {
+        return TestResult::Fail("regHUBP1_DCHUBP_CNTL is 0x06cf");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing
+);
+
 fn smoke_amdgpu_gc_window_and_dword_conversion() -> TestResult {
     use crate::amdgpu::mm_dword;
     use crate::amdgpu_cp_fw::{CpEngine, CP_PFP_IC_BASE_LO};
