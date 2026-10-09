@@ -25,6 +25,7 @@ narf-arch         = { path = "../../arch" }
 narf-acpi         = { path = "../../acpi" }
 narf-aml          = { path = "../../aml" }
 narf-drivers      = { path = "../" }
+narf-drivers-net-core = { path = "core" }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }

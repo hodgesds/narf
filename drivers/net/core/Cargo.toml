@@ -1,0 +1,29 @@
+# Shared surface for NARF NIC drivers.
+#
+# The driver-agnostic half of the old `narf-drivers-net` crate: the `HwNic`
+# trait and its supporting types (`NicModel`, `NicCaps`, `NicDescriptor`,
+# `NicError`) plus the Realtek PHY helpers shared across the realtek family.
+# Per-driver crates depend on THIS, not on the `narf-drivers-net` facade, so a
+# driver crate never forms a dependency cycle with the facade that aggregates
+# it.
+
+[package]
+name         = "narf-drivers-net-core"
+description  = "Shared types/traits for NARF NIC drivers (HwNic, NicModel, NicCaps, …) + Realtek PHY helpers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_net_core"
+path = "src/lib.rs"
+
+[dependencies]
+narf-net = { path = "../../../net" }
+narf-ipc = { path = "../../../ipc" }
+narf-lib = { path = "../../../lib" }
+
+[lints]
+workspace = true

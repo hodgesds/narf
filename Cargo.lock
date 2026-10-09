@@ -912,6 +912,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-driver-macros"
+version = "0.0.0"
+
+[[package]]
 name = "narf-driver-runtime"
 version = "0.0.0"
 dependencies = [
@@ -1307,6 +1311,7 @@ dependencies = [
  "narf-console",
  "narf-driver-runtime",
  "narf-drivers",
+ "narf-drivers-net-core",
  "narf-firmware",
  "narf-init",
  "narf-interrupts",
@@ -1318,6 +1323,15 @@ dependencies = [
  "narf-net",
  "narf-scheduler",
  "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-net-core"
+version = "0.0.0"
+dependencies = [
+ "narf-ipc",
+ "narf-lib",
+ "narf-net",
 ]
 
 [[package]]
@@ -2049,6 +2063,7 @@ name = "narf-modules"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-bus",
  "narf-capabilities",
  "narf-console",
  "narf-crypto",

@@ -59,6 +59,7 @@ members = [
     "user-runtime",
     "drivers/nvme",
     "drivers/net",
+    "drivers/net/core",
     "drivers/wireless",
     "drivers/i2c",
     "drivers/gpio",
