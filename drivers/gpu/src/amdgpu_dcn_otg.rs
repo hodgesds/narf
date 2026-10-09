@@ -62,6 +62,18 @@ const VUPDATE_WIDTH_BITS: u32 = 10;
 const OFFSET_BITS: u32 = 16;
 /// `OPTC_SEG*_SRC_SEL` parks a segment with all ones.
 const SEGMENT_PARKED: u32 = 0xf;
+/// `ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK` is 0x00001FFF, so one
+/// OPP segment carries at most 8191 active pixels.
+///
+/// This is the binding limit on a mode's width for this path, and it is
+/// narrower than the timing counters: `optc1_validate_timing` bounds h_total
+/// and v_total at `OTG_H_TOTAL`'s mask plus one, which [`COUNT_BITS`] already
+/// enforces at 32768. The segment is the tighter constraint because
+/// `optc1_set_odm_bypass` puts the whole active width into ONE segment —
+/// splitting a wider mode needs ODM combine, which this pipeline does not do.
+const SEGMENT_WIDTH_BITS: u32 = 13;
+/// The widest active region one OPP segment can carry, inclusive.
+pub const MAX_SEGMENT_WIDTH: u32 = (1 << SEGMENT_WIDTH_BITS) - 1;
 
 /// The global sync positions the detile buffer needs, in pixels and lines. These
 /// come from the mode math, not from the timing.
@@ -228,7 +240,7 @@ impl<I: Io> Engine<I> {
         self.update(
             self.odm(OPTC_WIDTH_CONTROL),
             0x1fff,
-            fits(timing.h_active, 13)?,
+            fits(timing.h_active, SEGMENT_WIDTH_BITS)?,
         )?;
         self.state = State::Programmed;
         Ok(())
