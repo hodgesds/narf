@@ -805,7 +805,16 @@ const GFX11_RPTR_ADDR_HI_MASK: u32 = 0x0000_FFFF;
 /// whole mask, opening the range to its maximum rather than to one entry.
 const GFX11_DOORBELL_RANGE_UPPER_MASK: u32 = 0x0000_0FFC;
 const GFX11_DOORBELL_RANGE_LOWER_SHIFT: u32 = 2;
+/// `CP_RB_DOORBELL_RANGE_LOWER__DOORBELL_RANGE_LOWER_MASK` — **ten** bits at
+/// shift 2, so a doorbell index of 0x400 or more does not fit. Linux places
+/// the field with `REG_SET_FIELD`, which masks; writing the shifted index raw
+/// would spill into the register's reserved bits for any index that large.
+const GFX11_DOORBELL_RANGE_LOWER_MASK: u32 = 0x0000_0FFC;
 const GFX11_DOORBELL_OFFSET_SHIFT: u32 = 2;
+/// `CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK` — 26 bits at shift 2. Wide
+/// enough that no real index overflows it, and masked anyway because that is
+/// what `REG_SET_FIELD` does and the next field up is `DOORBELL_EN`.
+const GFX11_DOORBELL_OFFSET_MASK: u32 = 0x0FFF_FFFC;
 const GFX11_DOORBELL_EN: u32 = 1 << 30;
 
 /// One step of a bring-up sequence: a write, or a wait the hardware needs.
@@ -895,9 +904,11 @@ impl Gfx11Sequence {
 /// `num_gfx_rings > 1`; one ring is enough to submit, and a second doubles the
 /// bring-up surface for no gain until the first works.
 ///
-/// LINUX-GAP: `gfx_v11_0_cp_gfx_start` is not part of this. It writes a PM4
+/// `gfx_v11_0_cp_gfx_start` is deliberately not part of this: it writes a PM4
 /// `CONTEXT_CONTROL` / `CLEAR_STATE` preamble INTO the ring and rings the
-/// doorbell, which needs a live ring object rather than a register list.
+/// doorbell, which needs a live ring object rather than a register list. That
+/// preamble is [`crate::amdgpu_clearstate::build_preamble`], and a caller runs
+/// it after this sequence has been applied.
 #[allow(clippy::too_many_arguments)]
 pub fn build_gfx11_ring_init(
     gc_base: u32,
@@ -909,6 +920,10 @@ pub fn build_gfx11_ring_init(
     grbm_gfx_cntl: u32,
     ring_phys: u64,
     ring_size_bytes: u64,
+    // `ring->doorbell_index` — the DWORD index space, twice the
+    // `AMDGPU_NAVI10_DOORBELL_*` assignment value. `Ring::doorbell_index_dw`
+    // returns it; `Ring::queue_idx` is the other space and would halve both
+    // the control offset and the range.
     doorbell_idx: u32,
     use_doorbell: bool,
     rptr_writeback_phys: u64,
@@ -1000,14 +1015,14 @@ pub fn build_gfx11_ring_init(
     // in this sequence touches it, so composing from zero is the same result.
     let mut doorbell = 0u32;
     if use_doorbell {
-        doorbell |= doorbell_idx << GFX11_DOORBELL_OFFSET_SHIFT;
+        doorbell |= (doorbell_idx << GFX11_DOORBELL_OFFSET_SHIFT) & GFX11_DOORBELL_OFFSET_MASK;
         doorbell |= GFX11_DOORBELL_EN;
     }
     seq.write(gc_base, GFX11_CP_RB_DOORBELL_CONTROL, doorbell);
     seq.write(
         gc_base,
         GFX11_CP_RB_DOORBELL_RANGE_LOWER,
-        doorbell_idx << GFX11_DOORBELL_RANGE_LOWER_SHIFT,
+        (doorbell_idx << GFX11_DOORBELL_RANGE_LOWER_SHIFT) & GFX11_DOORBELL_RANGE_LOWER_MASK,
     );
     // Linux writes the whole mask here, not `index + 1` — the range is opened
     // to its maximum. The GFX9 sequence in this file writes `index + 1`,

@@ -5128,6 +5128,37 @@ fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
         return TestResult::Fail("no doorbell means DOORBELL_EN stays clear");
     }
 
+    // The real GFX ring's index: AMDGPU_NAVI10_DOORBELL_GFX_RING0 is 0x08B and
+    // `ring->doorbell_index` is 0x116, which is what both registers carry.
+    let real = match build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, 0x116, true, RPTR, WPTR) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("the real GFX doorbell index was refused"),
+    };
+    if real.first_write_to(GC, 0x1dfa) != Some(0x458) {
+        return TestResult::Fail("DOORBELL_RANGE_LOWER should hold 0x116 at bit 2");
+    }
+
+    // The two fields are NOT the same width. `DOORBELL_RANGE_LOWER` is ten
+    // bits at shift 2 (mask 0x0FFC) and `DOORBELL_OFFSET` is twenty-six
+    // (0x0FFFFFFC), so an index past 0x3FF is truncated in the range register
+    // and intact in the control register. Linux places both with
+    // `REG_SET_FIELD`, which masks; shifting raw would spill 0x401 into the
+    // range register's reserved bits.
+    let wide = match build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, 0x401, true, RPTR, WPTR) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("a wide doorbell index was refused"),
+    };
+    if wide.first_write_to(GC, 0x1dfa) != Some(0x0000_0004) {
+        return TestResult::Fail("DOORBELL_RANGE_LOWER must be masked to its ten bits");
+    }
+    let wide_ctl = wide.first_write_to(GC, 0x1e8d).unwrap_or(0);
+    if (wide_ctl >> 2) & 0x03FF_FFFF != 0x401 {
+        return TestResult::Fail("DOORBELL_OFFSET is wide enough to hold the whole index");
+    }
+    if wide_ctl & !(0x0FFF_FFFCu32 | (1 << 30)) != 0 {
+        return TestResult::Fail("the doorbell control write must stay inside its two fields");
+    }
+
     // Validation.
     if !matches!(
         build_gfx11_ring_init(GC, GC1, GRBM, RING, 3000, DOORBELL, true, RPTR, WPTR),
