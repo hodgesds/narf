@@ -1756,6 +1756,23 @@ pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
 /// `VramInfo { size: 0 }` when the register reads `U32_MAX` (no device) or 0,
 /// which `amdgpu_discovery.c:314-317` treats as "TMR is in system memory" —
 /// either way there is no VRAM-resident discovery blob to find.
+/// Post-reset liveness probe: does the ASIC answer at all?
+///
+/// `RCC_CONFIG_MEMSIZE` reads back all-ones while the ASIC is still in
+/// reset or off the link, and a real size once it is out. Linux's
+/// `amdgpu_pci_slot_reset` polls exactly this, after the PCI vendor-ID
+/// poll and for exactly this reason: the vendor ID can be answered
+/// before the ASIC itself is back, so the memsize read is the one that
+/// confirms the die rather than the link.
+///
+/// # Safety
+/// Same contract as [`mm_read`]: `regs` maps BAR5 of an AMD GPU and the
+/// caller owns the MM_INDEX latch for the duration.
+pub(crate) unsafe fn config_memsize_alive(regs: &MmioRegion) -> bool {
+    // SAFETY: caller-asserted mapping and latch ownership.
+    unsafe { mm_read(regs, RCC_CONFIG_MEMSIZE) != u32::MAX }
+}
+
 unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion) -> VramInfo {
     // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair, and this
     // register is absolute by design (no IP base).

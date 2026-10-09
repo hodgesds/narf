@@ -128,10 +128,22 @@ pub fn merge_result(orig: PciErsResult, new: PciErsResult) -> PciErsResult {
 /// allocation and blocking are out.
 pub trait ErrorCallback: Send + Sync {
     /// Called immediately after the Root Port detects an error.
-    /// `severity` is the AER classification (Correctable, NonFatal,
-    /// or Fatal). Driver should quiesce any in-flight work and
-    /// return what kind of recovery is needed.
-    fn error_detected(&self, severity: PciErrSeverity) -> PciErsResult;
+    /// Driver should quiesce any in-flight work and return what kind
+    /// of recovery is needed.
+    ///
+    /// `state` is the channel state, and it is the parameter that
+    /// decides the vote: Linux's `pci_error_handlers::error_detected`
+    /// takes **only** `pci_channel_state_t`, and every in-tree driver
+    /// switches on it — `io_normal` → `CanRecover`, `io_frozen` →
+    /// `NeedReset`, `io_perm_failure` → `Disconnect`. A driver that
+    /// keys off `severity` instead has no way to vote `Disconnect`,
+    /// because severity cannot express "the device is gone".
+    ///
+    /// `severity` is the AER classification (Correctable, NonFatal, or
+    /// Fatal) and is extra information Linux does not pass down here;
+    /// it is useful for logging and for the correctable notification,
+    /// which in Linux never reaches `error_detected` at all.
+    fn error_detected(&self, severity: PciErrSeverity, state: PciChannelState) -> PciErsResult;
 
     /// Called after every driver in the affected subtree returned
     /// `CanRecover` — MMIO is back, no slot reset needed. Driver
@@ -271,7 +283,7 @@ pub fn do_recovery(
     let mut status = PciErsResult::CanRecover;
     for (_, cb) in &cbs {
         let vote = match cb {
-            Some(cb) => cb.error_detected(severity),
+            Some(cb) => cb.error_detected(severity, state),
             None => PciErsResult::NoAerDriver,
         };
         status = merge_result(status, vote);

@@ -2358,7 +2358,7 @@ fn smoke_aer_error_detected_to_resume() -> TestResult {
         seq: AtomicU32,
     }
     impl ErrorCallback for FakeDriver {
-        fn error_detected(&self, _s: PciErrSeverity) -> PciErsResult {
+        fn error_detected(&self, _s: PciErrSeverity, _st: PciChannelState) -> PciErsResult {
             // Encode call index into the low byte of seq.
             self.seq.fetch_or(0x01, Ordering::Relaxed);
             PciErsResult::CanRecover
@@ -2434,7 +2434,7 @@ fn smoke_aer_fatal_escalation_path() -> TestResult {
         seq: AtomicU32,
     }
     impl ErrorCallback for ResetWantingDriver {
-        fn error_detected(&self, s: PciErrSeverity) -> PciErsResult {
+        fn error_detected(&self, s: PciErrSeverity, _st: PciChannelState) -> PciErsResult {
             self.seq.fetch_or(0x01, Ordering::Relaxed);
             if s == PciErrSeverity::Fatal {
                 PciErsResult::NeedReset
@@ -2681,7 +2681,7 @@ fn smoke_recovery_no_driver_blocks_subtree() -> TestResult {
         slot_reset_calls: AtomicU32,
     }
     impl ErrorCallback for GoodDriver {
-        fn error_detected(&self, _s: PciErrSeverity) -> PciErsResult {
+        fn error_detected(&self, _s: PciErrSeverity, _st: PciChannelState) -> PciErsResult {
             PciErsResult::CanRecover
         }
         fn slot_reset(&self) -> PciErsResult {
