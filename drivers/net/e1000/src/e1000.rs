@@ -463,7 +463,7 @@ const RX_BUF_LEN: usize = 2048;
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct TxDesc {
+pub struct TxDesc {
     pub addr: u64,
     pub length: u16,
     pub cso: u8,

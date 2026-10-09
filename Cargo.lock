@@ -1312,6 +1312,7 @@ dependencies = [
  "narf-driver-runtime",
  "narf-drivers",
  "narf-drivers-net-core",
+ "narf-drivers-net-e1000",
  "narf-firmware",
  "narf-init",
  "narf-interrupts",
@@ -1332,6 +1333,28 @@ dependencies = [
  "narf-ipc",
  "narf-lib",
  "narf-net",
+]
+
+[[package]]
+name = "narf-drivers-net-e1000"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-net-core",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
 ]
 
 [[package]]

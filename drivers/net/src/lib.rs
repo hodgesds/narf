@@ -33,7 +33,6 @@ extern crate alloc;
 pub mod atheros;
 pub mod bnxt;
 pub mod cxgb4;
-pub mod e1000;
 pub mod enic;
 pub mod forcedeth;
 pub mod i40e;
@@ -48,10 +47,21 @@ pub mod rtl8139;
 pub mod tg3;
 pub mod vmxnet3;
 
+// e1000 is now its own crate (`narf-drivers-net-e1000`). Re-export its driver
+// module so `crate::e1000::…` keeps resolving for the smokes and external
+// callers. Gated on the feature because the crate is an optional dependency.
+#[cfg(feature = "e1000")]
+pub use narf_drivers_net_e1000::e1000;
+
 // Per-driver smoke tests register against `narf-kernel-test` and
 // land in the same `narf.tests` ELF section as the rest of the
 // suite. Kept in its own module so a future `cfg(test_in_tree)`
 // or feature gate can drop them from production binaries.
+//
+// Gated on the extracted-driver features the suite reaches into (e1000 so far,
+// via the re-export above). Each driver split out in turn adds its feature
+// here; `default` enables them all, so standard builds compile the full suite.
+#[cfg(feature = "e1000")]
 mod tests;
 
 // The driver-agnostic surface (HwNic + NicModel/NicCaps/NicDescriptor/NicError)
@@ -83,8 +93,9 @@ pub fn register_initcalls() {
         cxgb4::register_pci_driver();
         InitResult::Ok
     });
+    #[cfg(feature = "e1000")]
     narf_init::register(Stage::Subsys, "e1000", || {
-        e1000::register_pci_driver();
+        narf_drivers_net_e1000::register();
         InitResult::Ok
     });
     narf_init::register(Stage::Subsys, "i40e", || {

@@ -2808,16 +2808,26 @@ fn module_linker(root: &Path) -> Result<(String, Vec<String>)> {
 fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     let triple = args.arch.triple();
     let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    // `cargo rustc … --crate-type staticlib`, not `cargo build`: a dual-build
+    // driver crate declares `crate-type = ["rlib"]` so the built-in path and
+    // standalone clippy never try to emit a staticlib (which, outside the
+    // kernel link, would need its own allocator + panic handler). The `.ko`
+    // build overrides the crate type here, in the `module` config where the
+    // crate does not allocate and the `narf_driver!` macro supplies the panic
+    // handler. A crate that already declares `staticlib` (the reference
+    // test-module) is unaffected — the override names the same type.
     cargo
         .current_dir(root)
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS")
-        .arg("build")
+        .arg("rustc")
         .arg("-p")
         .arg(&args.package)
         .arg("--release")
         .arg("--target")
         .arg(triple)
+        .arg("--crate-type")
+        .arg("staticlib")
         .arg("-Z")
         .arg("build-std=core,compiler_builtins,alloc")
         .arg("-Z")
@@ -2832,7 +2842,7 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         .status()
         .with_context(|| format!("failed to spawn cargo for {}", args.package))?;
     if !status.success() {
-        bail!("cargo build -p {} failed", args.package);
+        bail!("cargo rustc -p {} failed", args.package);
     }
 
     let stem = args.package.replace('-', "_");
@@ -2941,6 +2951,25 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         members.len()
     );
     Ok(out)
+}
+
+/// Build a dual-build driver crate as a loadable `.ko` (`--no-default-features
+/// --features module`) and return its bytes. Used to stage a real driver
+/// module into the guest for the loadable-driver e2e smoke.
+fn build_module_fixture(package: &str, arch: Arch, root: &Path) -> Result<Vec<u8>> {
+    let ko_args = BuildModuleArgs {
+        arch,
+        package: package.into(),
+        out: None,
+        features: vec!["module".into()],
+        no_default_features: true,
+        kernel_abi: None,
+        compress: false,
+        signature: None,
+        public_key: None,
+    };
+    let ko = build_module(&ko_args, root)?;
+    Ok(std::fs::read(&ko)?)
 }
 
 /// The kernel-ABI export names a `.ko` is allowed to leave undefined, read
@@ -3290,6 +3319,11 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         match build_fixture(true) {
             Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko.lz4", bytes)),
             Err(e) => println!("xtask: compressed test module unavailable ({e})"),
+        }
+        // A real dual-build driver `.ko` for the loadable-driver e2e smoke.
+        match build_module_fixture("narf-drivers-net-e1000", args.arch, &root) {
+            Ok(bytes) => fixtures.push(("lib/modules/narf_drivers_net_e1000.ko", bytes)),
+            Err(e) => println!("xtask: e1000 driver module unavailable ({e})"),
         }
 
         if !fixtures.is_empty() {

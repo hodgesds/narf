@@ -60,6 +60,7 @@ members = [
     "drivers/nvme",
     "drivers/net",
     "drivers/net/core",
+    "drivers/net/e1000",
     "drivers/wireless",
     "drivers/i2c",
     "drivers/gpio",

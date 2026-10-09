@@ -26,12 +26,21 @@ narf-acpi         = { path = "../../acpi" }
 narf-aml          = { path = "../../aml" }
 narf-drivers      = { path = "../" }
 narf-drivers-net-core = { path = "core" }
+narf-drivers-net-e1000 = { path = "e1000", optional = true }
 narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-driver-runtime = { path = "../runtime", default-features = false, features = ["kernel"] }
 narf-firmware    = { path = "../../firmware" }
 narf-scheduler   = { path = "../../scheduler" }
 narf-time        = { path = "../../time" }
+
+[features]
+# Each per-driver crate is selectable. `default` keeps the full set the kernel
+# compiled before the split, so the built kernel is unchanged. A per-driver
+# crate extracted into its own crate becomes an optional dependency here; the
+# rest remain in-crate modules until they are split out in turn.
+default = ["e1000"]
+e1000 = ["dep:narf-drivers-net-e1000"]
 
 [lints]
 workspace = true
