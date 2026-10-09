@@ -305,6 +305,21 @@ mod add_queue {
     pub const VM_CONTEXT_CNTL: usize = 35;
     pub const FLAGS: usize = 36;
     pub const API_STATUS: usize = 37;
+    // Everything below sits AFTER `api_status`, which is 16 bytes / 4 dwords
+    // wide. Easy to miss when reading `union MESAPI__ADD_QUEUE` top to
+    // bottom and assuming the status block ends the payload: it does not, and
+    // `pipe_id` / `queue_id` out here are the two fields the legacy
+    // kernel-queue mapping is built from.
+    pub const TMA_ADDR: usize = 41;
+    pub const SCH_ID: usize = 43;
+    pub const TIMESTAMP: usize = 44;
+    pub const PROCESS_CONTEXT_ARRAY_INDEX: usize = 46;
+    pub const GANG_CONTEXT_ARRAY_INDEX: usize = 47;
+    pub const PIPE_ID: usize = 48;
+    pub const QUEUE_ID: usize = 49;
+    pub const ALIGNMENT_MODE_SETTING: usize = 50;
+    pub const FULL_SH_MEM_CONFIG_DATA: usize = 51;
+    pub const UNMAP_FLAG_ADDR: usize = 52;
 }
 
 /// The `MESAPI__ADD_QUEUE` flag bits. `debug_vmid` is **four** bits wide and
@@ -362,6 +377,64 @@ pub fn build_add_queue(args: &MesAddQueueArgs) -> Vec<u32> {
         | (args.debug_vmid << add_queue_flags::DEBUG_VMID_SHIFT) & add_queue_flags::DEBUG_VMID_MASK;
     put64(&mut dws, f::API_STATUS, args.api_completion_fence_addr);
     put64(&mut dws, f::API_STATUS + 2, args.api_completion_fence_value);
+    // Past the status block, and set by `mes_v11_0_add_hw_queue` just like
+    // everything above it.
+    put64(&mut dws, f::TMA_ADDR, args.tma_addr);
+    dws[f::PROCESS_CONTEXT_ARRAY_INDEX] = args.process_context_array_index;
+    dws[f::GANG_CONTEXT_ARRAY_INDEX] = args.gang_context_array_index;
+    dws
+}
+
+/// Arguments for [`build_map_legacy_queue`].
+///
+/// Six fields, which is the whole packet. See that function for why.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct MesMapLegacyQueueArgs {
+    /// `ring->pipe`.
+    pub pipe_id: u32,
+    /// `ring->queue`.
+    pub queue_id: u32,
+    /// `ring->doorbell_index` — the **DWORD** index space, so twice the
+    /// `AMDGPU_NAVI10_DOORBELL_*` assignment value. See
+    /// `amdgpu_ring::DOORBELL_STRIDE_BYTES` for the two spaces.
+    pub doorbell_offset: u32,
+    pub mqd_addr: u64,
+    pub wptr_addr: u64,
+    pub queue_type: MesQueueType,
+}
+
+/// `MES_SCH_API_ADD_QUEUE` with `map_legacy_kq` — bind a **kernel** ring that
+/// the driver programmed itself, as `mes_v11_0_map_legacy_queue` does.
+///
+/// This is the path a GFX11 kernel graphics ring actually takes, and it is not
+/// [`build_add_queue`] with different arguments. `amdgpu_gfx_enable_kgq` splits
+/// on `adev->mes.enable_legacy_queue_map`, which `mes_v11_0_late_init` sets
+/// for any scheduler firmware at version 0x47 or newer, and then calls
+/// `amdgpu_mes_map_legacy_queue` rather than the KIQ's `MAP_QUEUES` PM4
+/// packet. The same opcode arrives carrying **six** fields and one flag:
+///
+/// ```text
+///   pipe_id  queue_id  doorbell_offset  mqd_addr  wptr_addr  queue_type
+///   map_legacy_kq = 1
+/// ```
+///
+/// Everything [`build_add_queue`] fills — the process and gang contexts, the
+/// quantums, the page-table base, the VA window, the priorities, the GDS and
+/// GWS windows, `vm_context_cntl` — is left zero, because MES is not being
+/// asked to schedule a process here. It is being told that a queue the driver
+/// has already placed on a pipe exists, and where its descriptor and write
+/// pointer live. Sending the full process form for a kernel queue would hand
+/// the scheduler a process with a null page-table base.
+pub fn build_map_legacy_queue(args: &MesMapLegacyQueueArgs) -> Vec<u32> {
+    use add_queue as f;
+    let mut dws = frame(MesApiOpcode::AddQueue);
+    dws[f::PIPE_ID] = args.pipe_id;
+    dws[f::QUEUE_ID] = args.queue_id;
+    dws[f::DOORBELL_OFFSET] = args.doorbell_offset;
+    put64(&mut dws, f::MQD_ADDR, args.mqd_addr);
+    put64(&mut dws, f::WPTR_ADDR, args.wptr_addr);
+    dws[f::QUEUE_TYPE] = args.queue_type as u32;
+    dws[f::FLAGS] = add_queue_flags::MAP_LEGACY_KQ;
     dws
 }
 
@@ -387,6 +460,11 @@ pub struct MesAddQueueArgs {
     pub h_queue: u64,
     pub queue_type: MesQueueType,
     pub gds_base: u32,
+    /// Also the queue size. `mes_v11_0_add_hw_queue` assigns
+    /// `mes_add_queue_pkt.gds_size = input->queue_size` under the comment
+    /// "For KFD, gds_size is re-used for queue size (needed in MES for AQL
+    /// queues)", so a caller that wants a GDS window and an AQL queue cannot
+    /// have both and the firmware decides which it reads.
     pub gds_size: u32,
     pub gws_base: u32,
     pub gws_size: u32,
@@ -399,6 +477,11 @@ pub struct MesAddQueueArgs {
     pub debug_vmid: u32,
     pub api_completion_fence_addr: u64,
     pub api_completion_fence_value: u64,
+    /// Trap memory address. Past `api_status` in the packet; set by
+    /// `mes_v11_0_add_hw_queue` from `input->tma_addr`.
+    pub tma_addr: u64,
+    pub process_context_array_index: u32,
+    pub gang_context_array_index: u32,
 }
 
 // ── MESAPI__REMOVE_QUEUE ──────────────────────────────────────────
@@ -797,6 +880,25 @@ impl MesQueue {
         Ok(())
     }
 
+    /// Bind a kernel ring the driver programmed itself. See
+    /// [`build_map_legacy_queue`] — this is the GFX11 kernel graphics ring's
+    /// path, not [`MesQueue::add_queue`] with fewer arguments.
+    ///
+    /// # Safety
+    /// As [`MesQueue::submit`]. `args.mqd_addr` and `args.wptr_addr` must name
+    /// GPU-visible memory that stays mapped while the queue is.
+    pub unsafe fn map_legacy_queue(
+        &mut self,
+        args: &MesMapLegacyQueueArgs,
+        bar2: &MmioRegion,
+    ) -> Result<(), MesError> {
+        let mut packet = build_map_legacy_queue(args);
+        // SAFETY: delegated.
+        unsafe { self.submit(&mut packet, add_queue::API_STATUS, bar2) }?;
+        self.ring.mapped_queues += 1;
+        Ok(())
+    }
+
     /// Unmap a queue through MES.
     ///
     /// # Safety
@@ -954,6 +1056,9 @@ mod smoke_tests {
             debug_vmid: 0xd,
             api_completion_fence_addr: 0xFACE_0000,
             api_completion_fence_value: 7,
+            tma_addr: 0x0A0B_0C0D_0E0F_1011,
+            process_context_array_index: 0xB1,
+            gang_context_array_index: 0xB2,
         };
         let p = build_add_queue(&args);
         if p.len() != 64 {
@@ -997,9 +1102,134 @@ mod smoke_tests {
         if p[37] != 0xFACE_0000 || p[39] != 7 {
             return TestResult::Fail("api_status is four dwords at 37");
         }
+        // The payload does NOT end at api_status. Four more dwords of status
+        // and then tma_addr, which is why these sit at 41 and not 37.
+        if p[41] != 0x0E0F_1011 || p[42] != 0x0A0B_0C0D {
+            return TestResult::Fail("tma_addr is dword 41, past the status block");
+        }
+        if p[46] != 0xB1 || p[47] != 0xB2 {
+            return TestResult::Fail("the context array indices are dwords 46 and 47");
+        }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_add_queue_field_placement);
+
+    /// `mes_v11_0_map_legacy_queue` — the GFX11 kernel graphics ring's actual
+    /// registration, which is the same opcode carrying six fields.
+    ///
+    /// The two that matter most are `pipe_id` and `queue_id`, because they sit
+    /// PAST `api_status` at dwords 48 and 49. A reading of
+    /// `union MESAPI__ADD_QUEUE` that stops at the status block does not know
+    /// they exist, and a packet without them names pipe 0 queue 0 whatever
+    /// queue the caller meant.
+    fn smoke_map_legacy_queue_is_not_add_queue() -> TestResult {
+        let args = MesMapLegacyQueueArgs {
+            pipe_id: 3,
+            queue_id: 2,
+            // `AMDGPU_NAVI10_DOORBELL_GFX_RING0 << 1` — the dword space.
+            doorbell_offset: 0x08B << 1,
+            mqd_addr: 0x1111_2222_3333_4444,
+            wptr_addr: 0x5555_6666_7777_8888,
+            queue_type: MesQueueType::Gfx,
+        };
+        let p = build_map_legacy_queue(&args);
+        if p.len() != 64 {
+            return TestResult::Fail("frame must be 64 dwords");
+        }
+        let (ty, op, dwsize) = decode_api_header(p[0]);
+        if ty != MES_API_TYPE_SCHEDULER
+            || op != MesApiOpcode::AddQueue as u32
+            || dwsize != MES_API_FRAME_DWORDS as u32
+        {
+            return TestResult::Fail("the legacy mapping is an ADD_QUEUE packet");
+        }
+        if p[48] != 3 || p[49] != 2 {
+            return TestResult::Fail("pipe_id at 48 and queue_id at 49, past api_status");
+        }
+        if p[18] != 0x116 {
+            return TestResult::Fail("doorbell_offset at 18, in the dword index space");
+        }
+        if p[19] != 0x3333_4444 || p[20] != 0x1111_2222 {
+            return TestResult::Fail("mqd_addr at 19");
+        }
+        if p[21] != 0x7777_8888 || p[22] != 0x5555_6666 {
+            return TestResult::Fail("wptr_addr at 21");
+        }
+        if p[27] != MesQueueType::Gfx as u32 {
+            return TestResult::Fail("queue_type at 27");
+        }
+        if p[36] != add_queue_flags::MAP_LEGACY_KQ {
+            return TestResult::Fail("map_legacy_kq is the only flag set");
+        }
+        // The process form's fields must all be zero: MES is not being asked
+        // to schedule a process, and a null page-table base inside a real
+        // process descriptor is worse than an absent one.
+        for (idx, what) in [
+            (1usize, "process_id"),
+            (2, "page_table_base_addr"),
+            (4, "process_va_start"),
+            (6, "process_va_end"),
+            (8, "process_quantum"),
+            (10, "process_context_addr"),
+            (12, "gang_quantum"),
+            (14, "gang_context_addr"),
+            (16, "inprocess_gang_priority"),
+            (17, "gang_global_priority_level"),
+            (23, "h_context"),
+            (25, "h_queue"),
+            (28, "gds_base"),
+            (29, "gds_size"),
+            (33, "trap_handler_addr"),
+            (35, "vm_context_cntl"),
+            (37, "api_status"),
+            (41, "tma_addr"),
+        ] {
+            if p[idx] != 0 {
+                let _ = what;
+                return TestResult::Fail("a process-form field leaked into the legacy mapping");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_map_legacy_queue_is_not_add_queue);
+
+    /// The whole `union MESAPI__ADD_QUEUE` tail, against `offsetof` run by
+    /// gcc on `mes_v11_api_def.h` under its own `#pragma pack(push, 4)`.
+    ///
+    /// The fields past `api_status` are not all used, and the unused ones are
+    /// exactly the ones a later packet shape would reach for — so they are
+    /// recorded, and recorded means checked. The union is 64 dwords total, so
+    /// every index here has to be inside it.
+    fn smoke_add_queue_tail_offsets() -> TestResult {
+        use super::add_queue as f;
+        for (got, want, _name) in [
+            (f::API_STATUS, 37usize, "api_status"),
+            (f::TMA_ADDR, 41, "tma_addr"),
+            (f::SCH_ID, 43, "sch_id"),
+            (f::TIMESTAMP, 44, "timestamp"),
+            (
+                f::PROCESS_CONTEXT_ARRAY_INDEX,
+                46,
+                "process_context_array_index",
+            ),
+            (f::GANG_CONTEXT_ARRAY_INDEX, 47, "gang_context_array_index"),
+            (f::PIPE_ID, 48, "pipe_id"),
+            (f::QUEUE_ID, 49, "queue_id"),
+            (f::ALIGNMENT_MODE_SETTING, 50, "alignment_mode_setting"),
+            (f::FULL_SH_MEM_CONFIG_DATA, 51, "full_sh_mem_config_data"),
+            (f::UNMAP_FLAG_ADDR, 52, "unmap_flag_addr"),
+        ] {
+            if got != want {
+                return TestResult::Fail("an ADD_QUEUE tail offset disagrees with the header");
+            }
+            // `unmap_flag_addr` is 64-bit, so it needs its second dword too.
+            if got + 1 >= MES_API_FRAME_DWORDS {
+                return TestResult::Fail("a tail field does not fit inside the 64-dword frame");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_add_queue_tail_offsets);
 
     /// Dword indices from `offsetof` on `union MESAPI__REMOVE_QUEUE`.
     fn smoke_remove_queue_field_placement() -> TestResult {

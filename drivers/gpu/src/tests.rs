@@ -3047,6 +3047,23 @@ fn smoke_amdgpu_ring_doorbell_index_space_and_payload() -> TestResult {
         if ring.doorbell_offset() != (u64::from(slot) << 1) * 4 {
             return TestResult::Fail("the two doorbell index spaces disagree");
         }
+        // `ring->doorbell_index` itself — the value every ring setup writes
+        // and the one the MES legacy-queue mapping and the CP's
+        // `*_DOORBELL_CONTROL` OFFSET field carry. Doubled, not the slot.
+        if ring.doorbell_index_dw() != u32::from(slot) << 1 {
+            return TestResult::Fail("doorbell_index_dw must be the doubled assignment slot");
+        }
+        if u64::from(ring.doorbell_index_dw()) * 4 != ring.doorbell_offset() {
+            return TestResult::Fail("the dword index and the byte offset must agree");
+        }
+    }
+    // Spelled out once so the doubling cannot be satisfied by an identity:
+    // AMDGPU_NAVI10_DOORBELL_GFX_RING0 is 0x08B and the GFX ring's
+    // `doorbell_index` is 0x116.
+    match Ring::new(0x08B, DoorbellKind::Gfx) {
+        Ok(r) if r.doorbell_index_dw() == 0x116 => {}
+        Ok(_) => return TestResult::Fail("the GFX ring's doorbell_index is 0x116, not 0x08B"),
+        Err(_) => return TestResult::Fail("Ring::new failed"),
     }
 
     // gfx_v11_0_ring_set_wptr_gfx: WDOORBELL64(idx, ring->wptr) — dwords.

@@ -282,6 +282,17 @@ impl Ring {
         self.doorbell_off
     }
 
+    /// `ring->doorbell_index` — this queue's doorbell in the **DWORD** index
+    /// space, which is twice the `AMDGPU_NAVI10_DOORBELL_*` assignment value
+    /// [`Ring::new`] was given. Every ring setup in Linux writes
+    /// `adev->doorbell_index.<ring> << 1` into this field, and it is the value
+    /// the MES legacy-queue mapping and the CP's `*_DOORBELL_CONTROL`
+    /// `OFFSET` field both carry — not the assignment value. See
+    /// [`DOORBELL_STRIDE_BYTES`] for why there are two spaces at all.
+    pub fn doorbell_index_dw(&self) -> u32 {
+        u32::from(self.queue_idx) << 1
+    }
+
     /// Append `packet` (already-formatted dwords) to the ring.
     /// Returns the new wptr in dwords.
     ///
