@@ -38,6 +38,7 @@ members = [
     "build/cargo-narf",
     "abi",
     "io",
+    "driver-macros",
     "drivers",
     "drivers/runtime",
     "drivers/virtio",
