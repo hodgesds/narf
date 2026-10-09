@@ -45,6 +45,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use narf_driver_runtime::{alloc_coherent, DmaBuffer, DomainId, MmioRegion};
 
 // ── API constants verbatim from mes_v11_api_def.h ──────────────────
 
@@ -438,6 +439,73 @@ pub fn build_remove_queue(
     dws
 }
 
+// ── Status-query packet and submission pairing ─────────────────────
+
+/// `union MESAPI__QUERY_MES_STATUS` field positions.
+///
+/// NOTE the `api_status` block is at dword **2**, not 1: an
+/// `enum MES_API_QUERY_MES_OPCODE subopcode` sits between it and the header.
+/// Every other packet in this file has `api_status` directly after its own
+/// payload, so this is the one case where the obvious offset is wrong.
+/// Confirmed by compiling `mes_v11_api_def.h:551-566` under
+/// `#pragma pack(push, 4)`: header 0, subopcode 1, api_status 2, with
+/// `api_completion_fence_value` at dword 4.
+pub mod query_mes_status {
+    pub const SUBOPCODE: usize = 1;
+    pub const API_STATUS: usize = 2;
+}
+
+/// Build the `QUERY_SCHEDULER_STATUS` packet that follows every command.
+///
+/// Linux reuses `MESAPI__QUERY_MES_STATUS`'s layout with
+/// `header.opcode = MES_SCH_API_QUERY_SCHEDULER_STATUS` (11) — there is no
+/// separate union for that opcode — and leaves `subopcode` zeroed.
+pub fn build_query_mes_status(fence_addr: u64, fence_value: u64) -> Vec<u32> {
+    let mut dws = frame(MesApiOpcode::QuerySchedulerStatus);
+    put64(&mut dws, query_mes_status::API_STATUS, fence_addr);
+    put64(&mut dws, query_mes_status::API_STATUS + 2, fence_value);
+    dws
+}
+
+/// Stamp a command's completion fence and pair it with a status query, giving
+/// the two frames that go on the ring together.
+///
+/// This is the protocol `mes_v11_0_submit_pkt_and_poll_completion` runs, and
+/// it uses TWO fences for one command:
+///
+///   * the command's own `api_status` points at a status slot the caller has
+///     zeroed, with value **1** — MES writes it when that command completes,
+///     and a zero there afterwards means the command failed rather than timed
+///     out;
+///   * a trailing `QUERY_SCHEDULER_STATUS` points at the ring's fence with the
+///     submission's sequence number — that is what makes the wait bounded,
+///     because MES answers it after draining everything before it.
+///
+/// Polling only the first would hang on a command MES never acknowledges;
+/// polling only the second would report success for a command that failed.
+pub fn pair_with_status_query(
+    packet: &mut [u32],
+    api_status_dw: usize,
+    status_addr: u64,
+    ring_fence_addr: u64,
+    seq: u64,
+) -> Result<Vec<u32>, MesError> {
+    if packet.len() != MES_API_FRAME_DWORDS || api_status_dw + 4 > MES_API_FRAME_DWORDS {
+        return Err(MesError::BadDwsize);
+    }
+    put64(packet, api_status_dw, status_addr);
+    put64(packet, api_status_dw + 2, MES_COMMAND_COMPLETE);
+    let mut out = Vec::with_capacity(2 * MES_API_FRAME_DWORDS);
+    out.extend_from_slice(packet);
+    out.extend_from_slice(&build_query_mes_status(ring_fence_addr, seq));
+    Ok(out)
+}
+
+/// The value MES writes into a command's own status slot on completion.
+/// `mes_v11_0_submit_pkt_and_poll_completion` sets
+/// `api_completion_fence_value = 1` and then treats `!*status_ptr` as failure.
+pub const MES_COMMAND_COMPLETE: u64 = 1;
+
 // ── MES ring ───────────────────────────────────────────────────────
 
 /// Host-side mirror of the MES command ring (similar to KIQ ring,
@@ -464,6 +532,14 @@ pub enum MesError {
     BadRingSize,
     RingFull,
     BadDwsize,
+    /// A DMA allocation for the ring or its writeback page failed.
+    NoMemory,
+    /// The scheduler drained past this command but left its status slot zero,
+    /// which `mes_v11_0_submit_pkt_and_poll_completion` reports as a failure
+    /// to respond rather than a timeout.
+    Rejected,
+    /// The ring fence never reached this submission's sequence number.
+    Timeout,
 }
 
 impl MesRing {
@@ -516,6 +592,226 @@ impl MesRing {
     /// signals the fence (api_completion_fence).
     pub fn drain(&mut self, n_dw: u32) {
         self.rptr_dw = self.rptr_dw.wrapping_add(n_dw) & self.ring_mask();
+    }
+}
+
+// ── A MES command queue with its memory ────────────────────────────
+
+/// A MES command ring with its backing, its fence page and the sequence
+/// counter the status query uses.
+///
+/// [`MesRing`] is the pointer model and owns nothing; this owns the memory and
+/// does the writes. Keeping them apart is deliberate — the pointer arithmetic
+/// stays unit-testable without a device, which is where the wrap bugs live.
+///
+/// LINUX-GAP: before this, `MesRing::push_frame` advanced `wptr_dw` and wrote
+/// no dwords anywhere, nothing rang the doorbell, and nothing waited on a
+/// fence. The builders produced correct packets that had no way onto the ring.
+#[derive(Debug)]
+pub struct MesQueue {
+    ring: MesRing,
+    /// The ring itself, in GPU-visible sysmem.
+    backing: DmaBuffer,
+    /// Writeback page: the per-command status slot, the ring fence slot and
+    /// the wptr shadow, at [`WB_STATUS_OFFSET`], [`WB_FENCE_OFFSET`] and
+    /// [`WB_WPTR_OFFSET`].
+    wb: DmaBuffer,
+    /// Monotonic submission sequence, the value the status query waits on.
+    /// `mes_v11_0_submit_pkt_and_poll_completion` uses `++ring->fence_drv
+    /// .sync_seq`, so it starts at 1.
+    seq: u64,
+}
+
+/// Writeback slots, at the same 32-byte spacing `amdgpu_wb_get` hands out.
+pub const WB_STATUS_OFFSET: u64 = 0;
+pub const WB_FENCE_OFFSET: u64 = crate::amdgpu_gfx::WB_SLOT_BYTES;
+pub const WB_WPTR_OFFSET: u64 = 2 * crate::amdgpu_gfx::WB_SLOT_BYTES;
+const WB_BYTES: usize = 3 * crate::amdgpu_gfx::WB_SLOT_BYTES as usize;
+
+/// Iteration cap on the fence poll. Linux allows 2100 ms
+/// (`timeout = 2100000` µs in `mes_v11_0_submit_pkt_and_poll_completion`).
+pub const MES_POLL_BUDGET: u32 = 2_100_000;
+
+impl MesQueue {
+    /// Allocate a MES command ring of `frames` 64-dword frames, plus its
+    /// writeback page.
+    pub fn new(frames: usize, doorbell_index: u32) -> Result<Self, MesError> {
+        let dwords = frames
+            .checked_mul(MES_API_FRAME_DWORDS)
+            .ok_or(MesError::BadRingSize)?;
+        let bytes = dwords
+            .checked_mul(4)
+            .filter(|b| *b > 0 && b.is_power_of_two())
+            .ok_or(MesError::BadRingSize)?;
+        let backing = alloc_coherent(bytes, DomainId::DRIVER_0).map_err(|_| MesError::NoMemory)?;
+        let wb = alloc_coherent(WB_BYTES, DomainId::DRIVER_0).map_err(|_| MesError::NoMemory)?;
+        // SAFETY: identity-mapped DMA pages this queue owns.
+        unsafe {
+            for offset in (0..WB_BYTES as u64).step_by(8) {
+                core::ptr::write_volatile(wb.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+        }
+        let ring = MesRing::new(backing.dma_addr().raw(), bytes as u32, doorbell_index)?;
+        Ok(Self {
+            ring,
+            backing,
+            wb,
+            seq: 0,
+        })
+    }
+
+    /// GPU address of the ring, for `SET_HW_RESOURCES`.
+    pub fn ring_phys(&self) -> u64 {
+        self.backing.dma_addr().raw()
+    }
+    /// GPU address of the ring's fence slot.
+    pub fn fence_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_FENCE_OFFSET
+    }
+    /// GPU address of the per-command status slot.
+    pub fn status_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_STATUS_OFFSET
+    }
+    /// GPU address of the wptr shadow MES polls.
+    pub fn wptr_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_WPTR_OFFSET
+    }
+    pub fn mapped_queues(&self) -> u32 {
+        self.ring.mapped_queues
+    }
+
+    /// Write `dws` into the ring at the current write pointer, wrapping, and
+    /// advance it. Does not publish — [`MesQueue::commit`] does that.
+    fn write_frames(&mut self, dws: &[u32]) -> Result<(), MesError> {
+        let mask = (self.ring.ring_size_bytes / 4) - 1;
+        let free = mask.wrapping_sub(self.ring.in_flight_dw());
+        if dws.len() as u32 > free {
+            return Err(MesError::RingFull);
+        }
+        for (i, word) in dws.iter().enumerate() {
+            let index = (self.ring.wptr_dw.wrapping_add(i as u32)) & mask;
+            // SAFETY: the index is masked into the ring's own allocation and
+            // this queue is the sole writer.
+            unsafe {
+                core::ptr::write_volatile(
+                    self.backing.cpu_mut_ptr_at::<u32>(u64::from(index) * 4),
+                    *word,
+                );
+            }
+        }
+        self.ring.wptr_dw = self.ring.wptr_dw.wrapping_add(dws.len() as u32) & mask;
+        Ok(())
+    }
+
+    /// Publish the write pointer to the shadow and ring the doorbell.
+    ///
+    /// The MES doorbell carries the dword wptr as a quadword, like GFX's
+    /// (`mes_v11_0.c:87` is a plain `WDOORBELL64(ring->doorbell_index,
+    /// ring->wptr)`).
+    ///
+    /// # Safety
+    /// `bar2` must map this GPU's doorbell window and the caller owns this
+    /// queue's doorbell.
+    pub unsafe fn commit(&self, bar2: &MmioRegion) {
+        let wptr = u64::from(self.ring.wptr_dw);
+        // SAFETY: the queue's own writeback page.
+        unsafe {
+            core::ptr::write_volatile(self.wb.cpu_mut_ptr_at::<u64>(WB_WPTR_OFFSET), wptr);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let off = u64::from(self.ring.doorbell_index) * crate::amdgpu_ring::DOORBELL_STRIDE_BYTES;
+        // SAFETY: caller-asserted doorbell ownership; one aligned 64-bit store.
+        unsafe { bar2.write64(off, wptr) };
+    }
+
+    /// Submit one command frame and wait for MES to answer it.
+    ///
+    /// `api_status_dw` is where that packet keeps its `MES_API_STATUS` block —
+    /// `add_queue::API_STATUS` for an ADD_QUEUE, and so on. The two-fence
+    /// protocol is described on [`pair_with_status_query`].
+    ///
+    /// # Safety
+    /// `bar2` must map this GPU's doorbell window, MES must be running, and
+    /// the caller owns this queue.
+    pub unsafe fn submit(
+        &mut self,
+        packet: &mut [u32],
+        api_status_dw: usize,
+        bar2: &MmioRegion,
+    ) -> Result<(), MesError> {
+        // Zero the status slot first: a nonzero left over from a previous
+        // command would read as instant success.
+        // SAFETY: the queue's own writeback page.
+        unsafe {
+            core::ptr::write_volatile(self.wb.cpu_mut_ptr_at::<u64>(WB_STATUS_OFFSET), 0);
+        }
+        self.seq += 1;
+        let frames = pair_with_status_query(
+            packet,
+            api_status_dw,
+            self.status_phys(),
+            self.fence_phys(),
+            self.seq,
+        )?;
+        self.write_frames(&frames)?;
+        // SAFETY: delegated to this function's contract.
+        unsafe { self.commit(bar2) };
+
+        for _ in 0..MES_POLL_BUDGET {
+            // SAFETY: the queue's own writeback page; MES is the other writer.
+            let fence =
+                unsafe { core::ptr::read_volatile(self.wb.cpu_ptr_at::<u64>(WB_FENCE_OFFSET)) };
+            if fence >= self.seq {
+                // The scheduler has drained past this command. Now ask whether
+                // the command itself succeeded.
+                // SAFETY: same page.
+                let status = unsafe {
+                    core::ptr::read_volatile(self.wb.cpu_ptr_at::<u64>(WB_STATUS_OFFSET))
+                };
+                self.ring.drain(frames.len() as u32);
+                return if status == MES_COMMAND_COMPLETE {
+                    Ok(())
+                } else {
+                    Err(MesError::Rejected)
+                };
+            }
+        }
+        Err(MesError::Timeout)
+    }
+
+    /// Map a queue through MES. `args.api_completion_fence_addr` and `_value`
+    /// are overwritten by the submit protocol.
+    ///
+    /// # Safety
+    /// As [`MesQueue::submit`]. The MQD, context and wptr addresses in `args`
+    /// must name GPU-visible memory that stays mapped while the queue is.
+    pub unsafe fn add_queue(
+        &mut self,
+        args: &MesAddQueueArgs,
+        bar2: &MmioRegion,
+    ) -> Result<(), MesError> {
+        let mut packet = build_add_queue(args);
+        // SAFETY: delegated.
+        unsafe { self.submit(&mut packet, add_queue::API_STATUS, bar2) }?;
+        self.ring.mapped_queues += 1;
+        Ok(())
+    }
+
+    /// Unmap a queue through MES.
+    ///
+    /// # Safety
+    /// As [`MesQueue::submit`].
+    pub unsafe fn remove_queue(
+        &mut self,
+        doorbell_offset: u32,
+        gang_context_addr: u64,
+        bar2: &MmioRegion,
+    ) -> Result<(), MesError> {
+        let mut packet = build_remove_queue(doorbell_offset, gang_context_addr, 0, 0, 0);
+        // SAFETY: delegated.
+        unsafe { self.submit(&mut packet, remove_queue::API_STATUS, bar2) }?;
+        self.ring.mapped_queues = self.ring.mapped_queues.saturating_sub(1);
+        Ok(())
     }
 }
 
@@ -797,4 +1093,132 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_mes_ring_full);
+    /// The status-query packet's layout and the two-fence pairing, against
+    /// `mes_v11_api_def.h:551-566` compiled under `#pragma pack(push, 4)` and
+    /// `mes_v11_0_submit_pkt_and_poll_completion`.
+    fn smoke_mes_status_query_and_fence_pairing() -> TestResult {
+        // header 0, subopcode 1, api_status 2 — api_status is NOT at dword 1,
+        // which is where every other packet in this file keeps it.
+        if query_mes_status::SUBOPCODE != 1 || query_mes_status::API_STATUS != 2 {
+            return TestResult::Fail("MESAPI__QUERY_MES_STATUS puts api_status at dword 2");
+        }
+        let q = build_query_mes_status(0x1122_3344_5566_7788, 0x99);
+        if q.len() != MES_API_FRAME_DWORDS {
+            return TestResult::Fail("the status query is a full 64-dword frame");
+        }
+        // Opcode 11, type 1 (MES_API_TYPE_SCHEDULER), dwsize 64.
+        if decode_api_header(q[0]) != (1, 11, MES_API_FRAME_DWORDS as u32) {
+            return TestResult::Fail("status query header");
+        }
+        // subopcode stays zero, as Linux's memset leaves it.
+        if q[query_mes_status::SUBOPCODE] != 0 {
+            return TestResult::Fail("subopcode must be zero");
+        }
+        if q[2] != 0x5566_7788 || q[3] != 0x1122_3344 {
+            return TestResult::Fail("fence address halves");
+        }
+        if q[4] != 0x99 || q[5] != 0 {
+            return TestResult::Fail("fence value halves");
+        }
+
+        // Pairing: the command's own fence gets the status slot and value 1,
+        // and the trailing query gets the ring fence and the sequence number.
+        // Polling only one of the two cannot distinguish "MES never answered"
+        // from "the command failed".
+        let mut packet = build_add_queue(&MesAddQueueArgs::default());
+        let frames = match pair_with_status_query(
+            &mut packet,
+            add_queue::API_STATUS,
+            0xAAAA_0000,
+            0xBBBB_0000,
+            7,
+        ) {
+            Ok(f) => f,
+            Err(_) => return TestResult::Fail("pairing rejected a valid packet"),
+        };
+        if frames.len() != 2 * MES_API_FRAME_DWORDS {
+            return TestResult::Fail("two frames go on the ring together");
+        }
+        let s = add_queue::API_STATUS;
+        if frames[s] != 0xAAAA_0000 || frames[s + 2] != MES_COMMAND_COMPLETE as u32 {
+            return TestResult::Fail("the command's fence must be the status slot, value 1");
+        }
+        if MES_COMMAND_COMPLETE != 1 {
+            return TestResult::Fail("MES writes 1 on completion");
+        }
+        // The second frame is the query, pointing at the ring fence.
+        let base = MES_API_FRAME_DWORDS;
+        if decode_api_header(frames[base]).1 != 11 {
+            return TestResult::Fail("the second frame must be the status query");
+        }
+        if frames[base + 2] != 0xBBBB_0000 || frames[base + 4] != 7 {
+            return TestResult::Fail("the query must carry the ring fence and sequence");
+        }
+        // The two fences must be different addresses, or the command's own
+        // completion would be indistinguishable from the drain.
+        if frames[s] == frames[base + 2] {
+            return TestResult::Fail("the two fences must not share a slot");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_mes_status_query_and_fence_pairing);
+
+    /// The owning queue: real backing, distinct writeback slots, and frames
+    /// that actually land in the ring.
+    fn smoke_mes_queue_writes_frames_into_its_ring() -> TestResult {
+        let mut q = match MesQueue::new(4, 0x10) {
+            Ok(q) => q,
+            Err(_) => return TestResult::Fail("MesQueue::new failed"),
+        };
+        // Three writeback slots, 32 bytes apart, none overlapping.
+        if q.status_phys() == q.fence_phys()
+            || q.fence_phys() == q.wptr_phys()
+            || q.status_phys() == q.wptr_phys()
+        {
+            return TestResult::Fail("the status, fence and wptr slots must be distinct");
+        }
+        if q.fence_phys() - q.status_phys() != crate::amdgpu_gfx::WB_SLOT_BYTES {
+            return TestResult::Fail("slots are one 32-byte allocation apart");
+        }
+        // The ring is four 64-dword frames.
+        if q.ring.ring_size_bytes != (4 * MES_API_FRAME_DWORDS * 4) as u32 {
+            return TestResult::Fail("ring size");
+        }
+        // Writing a frame advances the pointer AND puts the dwords in memory —
+        // the old push_frame did only the former.
+        let frames = build_query_mes_status(0xDEAD_BEEF, 1);
+        if q.write_frames(&frames).is_err() {
+            return TestResult::Fail("write_frames rejected one frame");
+        }
+        if q.ring.wptr_dw != MES_API_FRAME_DWORDS as u32 {
+            return TestResult::Fail("the write pointer must advance by the frame");
+        }
+        // SAFETY: the queue's own identity-mapped backing.
+        let first = unsafe { core::ptr::read_volatile(q.backing.cpu_ptr_at::<u32>(0)) };
+        if first != frames[0] {
+            return TestResult::Fail("the frame's header did not reach the ring");
+        }
+        // SAFETY: same, within the four-frame allocation.
+        let last = unsafe {
+            core::ptr::read_volatile(
+                q.backing
+                    .cpu_ptr_at::<u32>((MES_API_FRAME_DWORDS as u64 - 1) * 4),
+            )
+        };
+        if last != frames[MES_API_FRAME_DWORDS - 1] {
+            return TestResult::Fail("the frame's tail did not reach the ring");
+        }
+        // A ring too small for the frames it is handed refuses rather than
+        // wrapping over what the scheduler has not read.
+        let mut tiny = match MesQueue::new(1, 0) {
+            Ok(q) => q,
+            Err(_) => return TestResult::Fail("MesQueue::new(1) failed"),
+        };
+        let pair = [0u32; 2 * MES_API_FRAME_DWORDS];
+        if tiny.write_frames(&pair).is_ok() {
+            return TestResult::Fail("a one-frame ring cannot hold a command and its query");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_mes_queue_writes_frames_into_its_ring);
 }
