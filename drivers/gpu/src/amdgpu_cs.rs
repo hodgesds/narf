@@ -30,14 +30,21 @@
 //!
 //! ## What this does not do
 //!
-//! LINUX-GAP: a validated submission is **not queued**. There is no ring the
-//! engine is reading — the GFX11 queue descriptor the firmware consumes has
-//! not been built, so nothing would execute — and a fence handle returned for
-//! work that will never run is worse than a refusal, because a client waits on
-//! it forever. A well-formed request therefore parses, validates, and then
-//! reports ENODEV. `AMDGPU_INFO_ACCEL_WORKING` reports false for the same
-//! reason, so no Mesa client reaches this ioctl at all; it is reachable only
-//! by something that ignored that answer.
+//! LINUX-GAP: a validated submission is **not queued**. The pieces it would
+//! need now all exist separately — the GFX11 and compute queue descriptors
+//! (`amdgpu_mqd`), the ring with its doorbell and writeback slots
+//! (`amdgpu_ring`), the MES `ADD_QUEUE` transport (`amdgpu_mes`), the CP's
+//! clear-state preamble (`amdgpu_clearstate`), and materialised page tables
+//! (`amdgpu_vm`) — but nothing assembles them: no bring-up path allocates a
+//! ring and an MQD, registers the queue with the MES, and hands this module
+//! somewhere to write. `gfx_mqd_init` and `compute_mqd_init` are called by
+//! tests and by nothing else. So there is still no ring an engine is reading,
+//! and a fence handle returned for work that will never run is worse than a
+//! refusal, because a client waits on it forever. A well-formed request
+//! therefore parses, validates, and then reports ENODEV.
+//! `AMDGPU_INFO_ACCEL_WORKING` reports false for the same reason, so no Mesa
+//! client reaches this ioctl at all; it is reachable only by something that
+//! ignored that answer.
 //!
 //! LINUX-GAP: only `AMDGPU_CHUNK_ID_IB` is accepted. The dependency and
 //! synchronisation chunks — `DEPENDENCIES`, `SYNCOBJ_IN`/`_OUT`,

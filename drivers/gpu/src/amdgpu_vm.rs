@@ -23,14 +23,20 @@
 //!
 //! ## What this module does not do yet
 //!
-//! LINUX-GAP: page tables are **described, not materialised**. There is no
-//! per-context VM object, so nothing allocates a root page directory, writes
-//! PDEs and PTEs into it, or invalidates the TLB. That needs `AMDGPU_CTX` and
-//! the VM-hub invalidation sequence, and it is the next piece. What exists is
-//! the layer every part of that will be written against, plus `AMDGPU_GEM_VA`'s
-//! validation and bookkeeping — so a client's mapping requests are accepted,
-//! checked and recorded, and the addresses it is told it has are addresses the
-//! hardware could actually be programmed with.
+//! LINUX-GAP: nothing **binds** an address space to a submission. The tables
+//! themselves are real: `VmState::materialise` allocates a root directory
+//! and the hierarchy beneath it, writes PDEs and PTEs, and [`activate`]
+//! programs both hubs' page-table base, aperture and context-control
+//! registers and then invalidates the TLB. What is missing is above that —
+//! `AMDGPU_CTX` does not own a `VmState`, so no VMID is bound on behalf of a
+//! client and no submission runs under one. `AMDGPU_GEM_VA`'s requests are
+//! accepted, checked, recorded, and written into tables the hardware could be
+//! pointed at; nothing points it at them for a client's work.
+//!
+//! LINUX-GAP: an unmap tears down the entries but does not invalidate the
+//! TLB, because invalidation needs the MMIO handles [`activate`] is given and
+//! `dematerialise` is not. Stale translations after an unmap are only safe
+//! while nothing submits.
 //!
 //! LINUX-GAP: `AMDGPU_VM_PAGE_PRT` (partially-resident textures) is validated
 //! but refused. PRT maps a range with no backing at all and relies on the
@@ -230,6 +236,49 @@ impl Geometry {
             self.max_pfn * GPU_PAGE_SIZE - VA_RESERVED_TOP,
         )
     }
+
+    /// The VA window `AMDGPU_INFO_DEV_INFO` reports, derived the way
+    /// `amdgpu_kms.c` derives it rather than restated.
+    ///
+    /// The address space has a hole in its non-canonical middle, so the window
+    /// is two ranges: `[low_offset, low_max)` below it and
+    /// `[high_offset, high_max)` above. Linux reports the high pair only when
+    /// the space is actually bigger than the hole's start, which on GMC 11 it
+    /// is — 256 TiB against the hole at 128 TiB.
+    ///
+    /// `amdgpu_kms.c` has one clamp this does not: a VCE firmware older than
+    /// 53.45 can only address 40 bits, and `vm_size` is clamped for it. No
+    /// part this driver supports has a VCE block at all — VCE was replaced by
+    /// VCN, and Phoenix is VCN 4.0.2 — so `adev->vce.fw_version` is zero and
+    /// the clamp never fires.
+    pub fn va_info(&self) -> VaInfo {
+        let (low_offset, vm_size) = self.usable();
+        let (high_offset, high_max) = if vm_size > GMC_HOLE_START {
+            (GMC_HOLE_END, GMC_HOLE_END | vm_size)
+        } else {
+            (0, 0)
+        };
+        VaInfo {
+            low_offset,
+            low_max: vm_size.min(GMC_HOLE_START),
+            high_offset,
+            high_max,
+            pte_fragment_size: self.fragment_bytes(),
+        }
+    }
+}
+
+/// The five `DEV_INFO` fields that describe the usable GPU address space.
+/// See [`Geometry::va_info`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VaInfo {
+    pub low_offset: u64,
+    pub low_max: u64,
+    /// Zero when the address space does not reach past the hole, which is how
+    /// Linux leaves the pair it did not fill in.
+    pub high_offset: u64,
+    pub high_max: u64,
+    pub pte_fragment_size: u64,
 }
 
 /// `AMDGPU_VA_RESERVED_BOTTOM` — 64 KiB, so a null GPU address faults.

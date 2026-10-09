@@ -8325,6 +8325,22 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
     if d.gart_page_size != 4096 || d.virtual_address_alignment != 4096 {
         return TestResult::Fail("page size / VA alignment should be 4 KiB");
     }
+    // The address space. Mesa's `amdgpu_winsys` takes its VA allocator's
+    // range straight from these, so a zero here is not a harmless omission —
+    // it is an allocator with nothing to hand out.
+    let va = crate::amdgpu_vm::Geometry::GMC11.va_info();
+    if d.virtual_address_offset != va.low_offset || d.virtual_address_max != va.low_max {
+        return TestResult::Fail("the low VA range did not reach DEV_INFO");
+    }
+    if d.high_va_offset != va.high_offset || d.high_va_max != va.high_max {
+        return TestResult::Fail("the high VA range did not reach DEV_INFO");
+    }
+    if u64::from(d.pte_fragment_size) != va.pte_fragment_size {
+        return TestResult::Fail("pte_fragment_size did not reach DEV_INFO");
+    }
+    if d.virtual_address_max == 0 || d.pte_fragment_size == 0 {
+        return TestResult::Fail("the VA window must not be reported as zero");
+    }
 
     // ACCEL_WORKING is FALSE, and deliberately so: with no AMDGPU_CS, Mesa
     // must decline the device at init rather than fail at first draw.
@@ -8771,6 +8787,66 @@ fn smoke_amdgpu_vm_gmc11_geometry() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc11_geometry);
+
+/// The five `DEV_INFO` fields describing the address space, against the
+/// literals `amdgpu_kms.c`'s arithmetic produces on a GMC 11 part.
+///
+/// Worked out by hand rather than re-derived, so the test disagrees with the
+/// code if the code's derivation drifts:
+///
+/// ```text
+/// VA_RESERVED_TOP = (1<<16) + (2<<20) + (2<<20)      = 0x0041_0000
+/// vm_size         = (1<<36) * 4096 - VA_RESERVED_TOP = 0x0000_ffff_ffbf_0000
+/// low_offset      = AMDGPU_VA_RESERVED_BOTTOM        = 0x0000_0000_0001_0000
+/// low_max         = min(vm_size, HOLE_START)         = 0x0000_8000_0000_0000
+/// vm_size > HOLE_START, so the high pair is reported:
+/// high_offset     = HOLE_END                         = 0xffff_8000_0000_0000
+/// high_max        = HOLE_END | vm_size               = 0xffff_ffff_ffbf_0000
+/// ```
+fn smoke_amdgpu_vm_dev_info_va_window() -> TestResult {
+    use crate::amdgpu_vm::Geometry;
+    let va = Geometry::GMC11.va_info();
+    if va.low_offset != 0x0000_0000_0001_0000 {
+        return TestResult::Fail("virtual_address_offset should be the reserved bottom");
+    }
+    if va.low_max != 0x0000_8000_0000_0000 {
+        return TestResult::Fail("virtual_address_max should stop at the hole");
+    }
+    if va.high_offset != 0xffff_8000_0000_0000 {
+        return TestResult::Fail("high_va_offset should be the far side of the hole");
+    }
+    if va.high_max != 0xffff_ffff_ffbf_0000 {
+        return TestResult::Fail("high_va_max should be the hole end ORed with vm_size");
+    }
+    if va.pte_fragment_size != 2 * 1024 * 1024 {
+        return TestResult::Fail("pte_fragment_size should be 2 MiB");
+    }
+    // The low range must not reach into the hole, and the high range must not
+    // start inside it. Reporting either would hand a client an address
+    // `validate_va` then refuses.
+    if va.low_max > crate::amdgpu_vm::GMC_HOLE_START {
+        return TestResult::Fail("the low range must stop at or before the hole");
+    }
+    if va.high_offset < crate::amdgpu_vm::GMC_HOLE_END {
+        return TestResult::Fail("the high range must start at or after the hole");
+    }
+
+    // A space smaller than the hole reports no high range at all, which is
+    // how Linux leaves the pair it never assigns.
+    let small = Geometry {
+        max_pfn: 1 << 20,
+        ..Geometry::GMC11
+    };
+    let sva = small.va_info();
+    if sva.high_offset != 0 || sva.high_max != 0 {
+        return TestResult::Fail("a space below the hole must report no high range");
+    }
+    if sva.low_max != (1u64 << 20) * 4096 - 0x0041_0000 {
+        return TestResult::Fail("a space below the hole reports its whole size");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_dev_info_va_window);
 
 /// PTE composition, including the bits `gmc_v11_0_get_vm_pte` CLEARS.
 ///

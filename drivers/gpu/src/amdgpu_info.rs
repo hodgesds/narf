@@ -17,19 +17,20 @@
 //! query is indistinguishable from an unsupported one, and never a zero that
 //! userspace would believe.
 //!
-//! LINUX-GAP: `ACCEL_WORKING` reports **false**, because there is no command
-//! submission — no `AMDGPU_CS`, no rings, no fences. That is the honest answer
-//! and it is also the useful one: Mesa declines the device cleanly at
-//! initialisation instead of coming up and failing at first draw. Flipping
-//! this flag is the milestone marker for the submission path landing.
+//! LINUX-GAP: `ACCEL_WORKING` reports **false**. Not because the pieces are
+//! absent — `AMDGPU_CS` parses and validates, the rings and their doorbells
+//! exist, the MQDs are built, the page tables are materialised — but because
+//! nothing yet puts a validated submission on a ring an engine is reading, so
+//! no submitted work executes. That is the honest answer and it is also the
+//! useful one: Mesa declines the device cleanly at initialisation instead of
+//! coming up and failing at first draw. Flipping this flag is the milestone
+//! marker for the last link in the submission path landing, and the reason it
+//! is still a gap is in `amdgpu_cs`.
 //!
 //! LINUX-GAP: the queries that need subsystems this driver has not built are
 //! refused rather than guessed — TIMESTAMP (no GFX clock-counter read),
 //! FW_VERSION (loaded microcode versions are parsed during the PSP sequence
-//! but not retained), READ_MMR_REG (no register whitelist), and everything
-//! behind the VM manager: `virtual_address_offset`/`_max`, `high_va_*`,
-//! `pte_fragment_size`. Those report zero inside DEV_INFO, matching what
-//! Linux reports on a device whose VM manager has not initialised.
+//! but not retained) and READ_MMR_REG (no register whitelist).
 //!
 //! LINUX-GAP: clocks (`max/min_engine_clock`, `max/min_memory_clock`,
 //! `gpu_counter_freq`) need an SMU metrics read, and `vram_type` /
@@ -141,6 +142,10 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     // The shader geometry is not guessable. Refusing is better than reporting
     // a topology that would mis-compile shaders.
     let gc = snap.gc.ok_or(FsError::InvalidData)?;
+    // Every GMC 11 part has the same VM layout; it comes out of
+    // `gmc_v11_0_sw_init`'s `amdgpu_vm_adjust_size` arguments, not out of
+    // anything the VM manager has to have initialised first.
+    let va = crate::amdgpu_vm::Geometry::GMC11.va_info();
 
     let info = uapi::DrmAmdgpuInfoDevice {
         device_id: snap.did,
@@ -158,6 +163,13 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
         // Both are `max(PAGE_SIZE, AMDGPU_GPU_PAGE_SIZE)`, 4 KiB here.
         virtual_address_alignment: AMDGPU_GPU_PAGE_SIZE,
         gart_page_size: AMDGPU_GPU_PAGE_SIZE,
+        // The address space, from the VM geometry. Two ranges, because the
+        // space has a hole in its non-canonical middle.
+        virtual_address_offset: va.low_offset,
+        virtual_address_max: va.low_max,
+        high_va_offset: va.high_offset,
+        high_va_max: va.high_max,
+        pte_fragment_size: va.pte_fragment_size as u32,
         // Straight from the GC table.
         wave_front_size: gc.wave_size,
         num_shader_visible_vgprs: gc.num_gprs,
