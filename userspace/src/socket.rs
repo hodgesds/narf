@@ -3628,6 +3628,7 @@ impl FileOps for SocketFile {
                 _ => {}
             }
         }
+        const SIOCGIFNAME: u32 = 0x8910;
         const SIOCGIFFLAGS: u32 = 0x8913;
         const SIOCSIFFLAGS: u32 = 0x8914;
         const SIOCGIFADDR: u32 = 0x8915;
@@ -3639,7 +3640,8 @@ impl FileOps for SocketFile {
         const SIOCGIFINDEX: u32 = 0x8933;
         if matches!(
             cmd,
-            SIOCGIFFLAGS
+            SIOCGIFNAME
+                | SIOCGIFFLAGS
                 | SIOCSIFFLAGS
                 | SIOCGIFADDR
                 | SIOCGIFNETMASK
@@ -3654,6 +3656,30 @@ impl FileOps for SocketFile {
             // name field is input and the selected union member is output.
             if unsafe { crate::handlers::copy_from_user(&mut ifreq, arg as u64) }.is_err() {
                 return Err(FsError::InvalidData);
+            }
+            // `dev_ifname`: unlike the other ifreq requests, SIOCGIFNAME
+            // takes an ifindex from the union and writes the corresponding
+            // name into the common 16-byte field. systemd-resolved uses this
+            // through if_indextoname() before accepting DNS learned for a
+            // NetworkManager-managed interface.
+            if cmd == SIOCGIFNAME {
+                let index = i32::from_ne_bytes(ifreq[16..20].try_into().unwrap());
+                let iface = u32::try_from(index)
+                    .ok()
+                    .and_then(|index| narf_net::iface::by_index_in(self.net_ns_id(), index))
+                    .ok_or(FsError::NoDevice)?;
+                if iface.name.len() >= 16 {
+                    // `register_netdevice` caps names at IFNAMSIZ - 1, so a
+                    // larger registry entry cannot be represented by ifreq.
+                    return Err(FsError::InvalidData);
+                }
+                ifreq[..16].fill(0);
+                ifreq[..iface.name.len()].copy_from_slice(iface.name.as_bytes());
+                // SAFETY: the same validated fixed-size ifreq is copied back.
+                if unsafe { crate::handlers::copy_to_user(arg as u64, &ifreq) }.is_err() {
+                    return Err(FsError::InvalidData);
+                }
+                return Ok(0);
             }
             let name_len = ifreq[..16].iter().position(|byte| *byte == 0).unwrap_or(16);
             let name = String::from(

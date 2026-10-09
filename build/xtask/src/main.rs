@@ -1106,12 +1106,6 @@ impl Arch {
                     // QEMU smoke harness exercises the full
                     // xHCI → HID-boot-keyboard → narf_input pipeline.
                     args.extend_from_slice(&["-device".into(), "usb-kbd,bus=xhci0.0".into()]);
-                    args.extend_from_slice(&["-vga".into(), "none".into()]);
-                    // VirGL must be the only display adapter.  Leaving the
-                    // Bochs fallback attached gives KWin two DRM devices;
-                    // its libdrm probe can then associate card0's render
-                    // path with the 1234:1111 fallback instead of the
-                    // 1af4:1050 virtio-gpu transport.
                     if gpu_backend != GpuBackend::Virgl {
                         args.extend_from_slice(&[
                             "-device".into(),
@@ -1132,6 +1126,16 @@ impl Arch {
                 }
 
                 if virtio {
+                    // VirGL must be the only display adapter. Leaving QEMU's
+                    // default Bochs VGA attached gives KWin two DRM devices;
+                    // its libdrm probe can then associate card0's render path
+                    // with the 1234:1111 fallback instead of the 1af4:1050
+                    // virtio-gpu transport. This applies to VirtioOnly too;
+                    // it formerly sat in the legacy fixture block, so a
+                    // single-NIC desktop had no usable KDE display.
+                    if gpu_backend == GpuBackend::Virgl {
+                        args.extend_from_slice(&["-vga".into(), "none".into()]);
+                    }
                     args.extend_from_slice(&[
                         "-drive".into(),
                         format!(
@@ -8404,6 +8408,37 @@ mod kernel_test_feature_tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn virgl_disables_default_vga_in_every_virtio_x86_fixture() {
+        use super::{Arch, GpuBackend, HwProfile};
+
+        for profile in [HwProfile::Full, HwProfile::VirtioOnly] {
+            let args = Arch::X86_64.qemu_args(
+                std::path::Path::new("kernel"),
+                "gtk,gl=on",
+                profile,
+                GpuBackend::Virgl,
+            );
+            assert!(
+                args.windows(2).any(|pair| pair == ["-vga", "none"]),
+                "{profile:?} VirGL fixture must not expose QEMU's default Bochs VGA"
+            );
+        }
+
+        for profile in [HwProfile::LegacyOnly, HwProfile::Minimal] {
+            let args = Arch::X86_64.qemu_args(
+                std::path::Path::new("kernel"),
+                "gtk,gl=on",
+                profile,
+                GpuBackend::Virgl,
+            );
+            assert!(
+                !args.windows(2).any(|pair| pair == ["-vga", "none"]),
+                "{profile:?} has no virtio GPU to own the display"
+            );
         }
     }
 

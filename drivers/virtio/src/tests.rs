@@ -806,6 +806,10 @@ fn smoke_virtio_net_pci_legacy_iface_registered() -> TestResult {
     if vnet.mac != ctrl_mac {
         return TestResult::Fail("legacy iface MAC doesn't match controller mac()");
     }
+    let ctrl_link = net_pci::with_controller(|c| c.link_up()).unwrap_or(false);
+    if vnet.carrier != ctrl_link {
+        return TestResult::Fail("legacy iface carrier doesn't match controller link state");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
