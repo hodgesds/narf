@@ -1203,11 +1203,20 @@ pub fn build_cp_set_doorbell_range(gc_base_idx0: u32) -> Gfx11Sequence {
 ///                               cp_gfx_start
 /// ```
 ///
-/// **This function is the left column.** The MQD
+/// **This function is the left column, and the left column is NOT the arm this
+/// driver targets.** `amdgpu_async_gfx_ring` defaults to 1, so the right
+/// column is what Linux runs on a stock Phoenix, and it is the arm
+/// [`crate::amdgpu_bringup::CP_RESUME_ASYNC`] plans. The MQD
 /// ([`crate::amdgpu_mqd::gfx_mqd_init`]), the legacy-queue mapping
 /// ([`crate::amdgpu_mes::build_map_legacy_queue`]) and
-/// `GfxContext::map_legacy_args` are the right column. Both exist in this
-/// tree; a caller must pick one arm and not interleave them.
+/// `GfxContext::map_legacy_args` are the right column.
+///
+/// This arm is kept rather than deleted because it is the shorter path to a
+/// first submission — it needs no MES at all — and so is the better thing to
+/// reach for if the scheduler turns out to be the part that does not come up.
+/// But it is the fallback, and a caller choosing it is choosing to diverge
+/// from what the firmware is usually exercised against. Pick one arm; do not
+/// interleave them.
 ///
 /// They disagree on the doorbell, which is the trap:
 ///
