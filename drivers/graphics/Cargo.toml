@@ -11,14 +11,28 @@ repository.workspace   = true
 name = "narf_graphics_driver"
 path = "src/lib.rs"
 
+[features]
+# Dual-build: built-in (rlib, linked into the kernel) or a loadable `.ko`.
+# `default = builtin` so the built kernel is unchanged. The `.ko` build
+# (`--no-default-features --features module`) drops every kernel crate and
+# registers through the narf_register_pci_driver KSYMTAB export.
+default = ["builtin"]
+builtin = [
+    "dep:narf-lib", "dep:narf-graphics", "dep:narf-bus",
+    "dep:narf-capabilities", "dep:narf-memory", "dep:narf-drivers",
+    "dep:narf-init",
+]
+module = []
+
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-graphics     = { path = "../../graphics" }
-narf-bus          = { path = "../../bus" }
-narf-capabilities = { path = "../../capabilities" }
-narf-memory       = { path = "../../memory" }
-narf-drivers      = { path = "../../drivers" }
-narf-init         = { path = "../../init" }
+narf-driver-macros = { path = "../../driver-macros" }
+narf-lib          = { path = "../../lib", optional = true }
+narf-graphics     = { path = "../../graphics", optional = true }
+narf-bus          = { path = "../../bus", optional = true }
+narf-capabilities = { path = "../../capabilities", optional = true }
+narf-memory       = { path = "../../memory", optional = true }
+narf-drivers      = { path = "../../drivers", optional = true }
+narf-init         = { path = "../../init", optional = true }
 
 [lints]
 workspace = true

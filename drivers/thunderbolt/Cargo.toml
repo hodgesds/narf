@@ -12,25 +12,37 @@ name = "narf_drivers_thunderbolt"
 path = "src/lib.rs"
 
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-bus          = { path = "../../bus" }
-narf-capabilities = { path = "../../capabilities" }
-narf-console      = { path = "../../console" }
-narf-drivers      = { path = "../" }
-narf-init         = { path = "../../init" }
-narf-memory       = { path = "../../memory" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
-narf-io           = { path = "../../io" }
-narf-interrupts   = { path = "../../interrupts" }
-narf-scheduler    = { path = "../../scheduler" }
-narf-time         = { path = "../../time" }
-narf-aml          = { path = "../../aml" }
-narf-power        = { path = "../../power" }
+narf-driver-macros = { path = "../../driver-macros" }
+narf-lib          = { path = "../../lib", optional = true }
+narf-bus          = { path = "../../bus", optional = true }
+narf-capabilities = { path = "../../capabilities", optional = true }
+narf-console      = { path = "../../console", optional = true }
+narf-drivers      = { path = "../", optional = true }
+narf-init         = { path = "../../init", optional = true }
+narf-memory       = { path = "../../memory", optional = true }
+narf-kernel-test  = { path = "../../verification/kernel-test", optional = true }
+narf-io           = { path = "../../io", optional = true }
+narf-interrupts   = { path = "../../interrupts", optional = true }
+narf-scheduler    = { path = "../../scheduler", optional = true }
+narf-time         = { path = "../../time", optional = true }
+narf-aml          = { path = "../../aml", optional = true }
+narf-power        = { path = "../../power", optional = true }
 
 [features]
-# Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't trip
-# the unexpected_cfgs lint. Gating is at the source level; the
-# harness pulls these crates regardless.
+# Dual-build: built-in (rlib) or loadable `.ko`. `default = builtin` keeps the
+# kernel unchanged; the `.ko` build drops every kernel crate and registers via
+# the narf_register_pci_driver KSYMTAB export.
+default = ["builtin"]
+builtin = [
+    "dep:narf-lib", "dep:narf-bus", "dep:narf-capabilities", "dep:narf-console",
+    "dep:narf-drivers", "dep:narf-init", "dep:narf-memory",
+    "dep:narf-kernel-test", "dep:narf-io", "dep:narf-interrupts",
+    "dep:narf-scheduler", "dep:narf-time", "dep:narf-aml", "dep:narf-power",
+]
+module = []
+# Declared so `#[cfg(feature = "kernel-test")]` in src/ doesn't trip the
+# unexpected_cfgs lint. Gating is at the source level; the harness pulls these
+# crates regardless.
 kernel-test = []
 
 [lints]

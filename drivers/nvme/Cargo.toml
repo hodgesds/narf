@@ -11,21 +11,35 @@ repository.workspace   = true
 name = "narf_drivers_nvme"
 path = "src/lib.rs"
 
+[features]
+# Dual-build: built-in (rlib) or loadable `.ko`. `default = builtin` keeps the
+# kernel unchanged; the `.ko` build drops every kernel crate and registers via
+# the narf_register_pci_driver KSYMTAB export.
+default = ["builtin"]
+builtin = [
+    "dep:narf-lib", "dep:narf-capabilities", "dep:narf-io", "dep:narf-memory",
+    "dep:narf-block", "dep:narf-bus", "dep:narf-interrupts",
+    "dep:narf-scheduler", "dep:narf-time", "dep:narf-drivers", "dep:narf-init",
+    "dep:narf-kernel-test", "dep:narf-arch", "dep:narf-power",
+]
+module = []
+
 [dependencies]
-narf-lib          = { path = "../../lib" }
-narf-capabilities = { path = "../../capabilities" }
-narf-io           = { path = "../../io" }
-narf-memory       = { path = "../../memory" }
-narf-block        = { path = "../../block" }
-narf-bus          = { path = "../../bus" }
-narf-interrupts   = { path = "../../interrupts" }
-narf-scheduler    = { path = "../../scheduler" }
-narf-time         = { path = "../../time" }
-narf-drivers      = { path = "../../drivers" }
-narf-init         = { path = "../../init" }
-narf-kernel-test  = { path = "../../verification/kernel-test" }
-narf-arch         = { path = "../../arch" }
-narf-power        = { path = "../../power" }
+narf-driver-macros = { path = "../../driver-macros" }
+narf-lib          = { path = "../../lib", optional = true }
+narf-capabilities = { path = "../../capabilities", optional = true }
+narf-io           = { path = "../../io", optional = true }
+narf-memory       = { path = "../../memory", optional = true }
+narf-block        = { path = "../../block", optional = true }
+narf-bus          = { path = "../../bus", optional = true }
+narf-interrupts   = { path = "../../interrupts", optional = true }
+narf-scheduler    = { path = "../../scheduler", optional = true }
+narf-time         = { path = "../../time", optional = true }
+narf-drivers      = { path = "../../drivers", optional = true }
+narf-init         = { path = "../../init", optional = true }
+narf-kernel-test  = { path = "../../verification/kernel-test", optional = true }
+narf-arch         = { path = "../../arch", optional = true }
+narf-power        = { path = "../../power", optional = true }
 
 [lints]
 workspace = true

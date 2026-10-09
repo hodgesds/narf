@@ -1717,6 +1717,7 @@ dependencies = [
  "narf-block",
  "narf-bus",
  "narf-capabilities",
+ "narf-driver-macros",
  "narf-drivers",
  "narf-init",
  "narf-interrupts",
@@ -2044,6 +2045,7 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-driver-macros",
  "narf-drivers",
  "narf-init",
  "narf-interrupts",
@@ -2425,6 +2427,7 @@ version = "0.0.0"
 dependencies = [
  "narf-bus",
  "narf-capabilities",
+ "narf-driver-macros",
  "narf-drivers",
  "narf-graphics",
  "narf-init",
