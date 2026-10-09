@@ -221,6 +221,43 @@ kernel_abi! {
     fn narf_monotonic_ns() -> u64 {
         narf_time::monotonic_ns()
     }
+
+    /// Register a PCI driver match from a loadable module.
+    ///
+    /// The first export that lets a `.ko` *be a driver*. `name`/`name_len`
+    /// name the driver; the bytes are copied into a kernel-owned intern table,
+    /// so the module may later unmap its `.rodata`. `vendor`/`device` are the
+    /// PCI IDs to claim. `probe` is a `ModuleProbeFn` — an
+    /// `extern "C" fn(dev_token: u64, reserved: u64) -> i32` — passed as a raw
+    /// address, because `PciProbeFn`'s `BusDevice`/`Cap` arguments are
+    /// `repr(Rust)` and cannot cross this boundary. The kernel installs a
+    /// trampoline that dispatches matching devices to the thunk. Returns 0, or
+    /// `-EINVAL` for a null/empty name, a non-UTF-8 name, or a null probe.
+    ///
+    /// # Safety
+    /// `name` must name `name_len` readable bytes valid for the call. `probe`
+    /// must be a valid `ModuleProbeFn` pointer that stays mapped for as long
+    /// as the driver is registered (i.e. until the module unloads, which is
+    /// not yet supported for modules that register a match).
+    fn narf_register_pci_driver(
+        name: *const u8,
+        name_len: usize,
+        vendor: u16,
+        device: u16,
+        probe: usize,
+    ) -> i32 {
+        if name.is_null() || name_len == 0 || probe == 0 {
+            return -22; // -EINVAL
+        }
+        // SAFETY: the module promises `name` names `name_len` readable bytes.
+        let bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+        let Ok(name) = core::str::from_utf8(bytes) else {
+            return -22;
+        };
+        // SAFETY: `probe` is non-null (checked) and the module promises it is a
+        // valid `ModuleProbeFn` for as long as the match is registered.
+        unsafe { narf_bus::register_module_pci_driver(name, vendor, device, probe) }
+    }
 }
 
 // ── In-kernel smokes ───────────────────────────────────────────────────
@@ -366,3 +403,69 @@ fn smoke_kabi_kmalloc_round_trip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_kmalloc_round_trip);
+
+/// `narf_register_pci_driver` must register a module driver's match in the
+/// bus registry and wire its probe thunk through the trampoline. This is the
+/// unit-level half of the e1000-as-a-`.ko` proof: the full `.ko` load path is
+/// exercised by the loader e2e smoke, but the registration mechanism the
+/// export funnels into is proven here without any hardware.
+///
+/// A unique, device-free `(vendor, device)` is used so the entry is harmless
+/// if left registered (no such device exists, so the trampoline never fires
+/// against a real probe walk).
+extern "C" fn kabi_smoke_probe_thunk(_dev_token: u64, _reserved: u64) -> i32 {
+    -38 // -ENOSYS: registration-only; the datapath ABI is deferred.
+}
+
+fn smoke_kabi_register_pci_driver_round_trips() -> TestResult {
+    const VENDOR: u16 = 0xFEED;
+    const DEVICE: u16 = 0xFACE;
+    let name = b"narf-kabi-smoke-drv";
+
+    // SAFETY: `name` names its bytes for the call; the thunk pointer is a
+    // valid `extern "C"` fn for the program's lifetime.
+    let rc = unsafe {
+        narf_register_pci_driver(
+            name.as_ptr(),
+            name.len(),
+            VENDOR,
+            DEVICE,
+            kabi_smoke_probe_thunk as usize,
+        )
+    };
+    if rc != 0 {
+        return TestResult::Fail("narf_register_pci_driver rejected a valid registration");
+    }
+
+    // A null probe is -EINVAL and must NOT register anything.
+    // SAFETY: documented invalid input; nothing is dereferenced.
+    let bad = unsafe { narf_register_pci_driver(name.as_ptr(), name.len(), VENDOR, DEVICE, 0) };
+    if bad != -22 {
+        return TestResult::Fail("narf_register_pci_driver accepted a null probe");
+    }
+
+    // The match is now in the bus registry under the interned name.
+    let present = narf_bus::registered_pci_drivers().into_iter().any(|m| {
+        m.name == "narf-kabi-smoke-drv"
+            && m.kind
+                == narf_bus::MatchKind::VendorDevice {
+                    vendor: VENDOR,
+                    device: DEVICE,
+                }
+    });
+    if !present {
+        return TestResult::Fail("module match did not appear in the bus registry");
+    }
+
+    // The trampoline dispatches to the module's thunk, which returns -ENOSYS.
+    match narf_bus::driver_match::__module_thunk_for_test(VENDOR, DEVICE) {
+        Some(f) => {
+            if f(0, 0) != -38 {
+                return TestResult::Fail("registered thunk did not reach the module probe");
+            }
+        }
+        None => return TestResult::Fail("module thunk was not recorded for dispatch"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_register_pci_driver_round_trips);

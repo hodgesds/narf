@@ -70,9 +70,9 @@ pub use bar::{
 };
 pub use device::{BusDevice, BusKind, DeviceId};
 pub use driver_match::{
-    probe_all as probe_all_pci, register as register_pci_driver,
-    registered as registered_pci_drivers, set_probe_log, set_probe_log_hook, MatchKind, PciMatch,
-    PciProbeFn, ProbeError,
+    probe_all as probe_all_pci, register as register_pci_driver, register_module_pci_driver,
+    registered as registered_pci_drivers, set_probe_log, set_probe_log_hook, MatchKind,
+    ModuleProbeFn, PciMatch, PciProbeFn, ProbeError,
 };
 pub use hotplug::{dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener};
 pub use msix::{enable_msix, MsixError, MsixTable, MsixVector};
