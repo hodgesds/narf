@@ -1847,9 +1847,186 @@ dependencies = [
  "narf-bus",
  "narf-capabilities",
  "narf-console",
+ "narf-driver-macros",
  "narf-drivers",
+ "narf-drivers-storage-ahci",
+ "narf-drivers-storage-core",
+ "narf-drivers-storage-megaraid",
+ "narf-drivers-storage-mpt3sas",
+ "narf-drivers-storage-rtsx",
+ "narf-drivers-storage-sdhci",
+ "narf-drivers-storage-smartpqi",
+ "narf-drivers-storage-vmd",
  "narf-filesystem",
  "narf-init",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-ahci"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-core"
+version = "0.0.0"
+dependencies = [
+ "narf-lib",
+]
+
+[[package]]
+name = "narf-drivers-storage-megaraid"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-mpt3sas"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-rtsx"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-sdhci"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-smartpqi"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
+ "narf-interrupts",
+ "narf-io",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-time",
+]
+
+[[package]]
+name = "narf-drivers-storage-vmd"
+version = "0.0.0"
+dependencies = [
+ "narf-acpi",
+ "narf-aml",
+ "narf-block",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-drivers",
+ "narf-drivers-storage-core",
+ "narf-filesystem",
  "narf-interrupts",
  "narf-io",
  "narf-kernel-test",
