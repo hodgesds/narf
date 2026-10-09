@@ -36,6 +36,9 @@ const DP_MSA_TIMING_PARAM3: u64 = 0x214e;
 const DP_MSA_TIMING_PARAM4: u64 = 0x214f;
 const STRIDE: u64 = 0x100;
 const LAST_REG: u32 = (DP_MSA_TIMING_PARAM4 + 4 * STRIDE) as u32;
+/// Stream encoders, not pixel pipes: `res_cap_dcn314.num_stream_encoder` is 5
+/// where `num_video_plane` is 4. Kept distinct from
+/// [`crate::amdgpu_dcn::DCN_PIPES`] for that reason.
 const INSTANCES: u8 = 5;
 
 /// `DP_PIXEL_ENCODING_TYPE_RGB444`.

@@ -52,7 +52,8 @@ const ODM_STRIDE: u64 = 0x10;
 const VTG_CONTROL: u64 = 0x052d;
 /// The highest register this module touches, for the bank bound.
 const LAST_REG: u32 = (OTG_VREADY_PARAM + 3 * OTG_STRIDE) as u32;
-const INSTANCES: u8 = 4;
+/// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
+const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 
 /// Totals, blank and sync positions are 15-bit; VSTARTUP is 10-bit and the
 /// VUPDATE width 10-bit. Programming a mode whose counts do not fit is refused.

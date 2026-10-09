@@ -58,7 +58,8 @@ const REF_FREQ_TO_PIX_FREQ: u64 = 0x065d;
 const HUBPRET_CONTROL: u64 = 0x066c;
 const STRIDE: u64 = 0xdc;
 const LAST_REG: u32 = (HUBPRET_CONTROL + 3 * STRIDE) as u32;
-const INSTANCES: u8 = 4;
+/// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
+const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 
 /// `DC_SW_LINEAR`. No other swizzle is modelled by the mode math.
 const SW_MODE_LINEAR: u32 = 0;

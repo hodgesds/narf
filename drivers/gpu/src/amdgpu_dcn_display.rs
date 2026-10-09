@@ -44,7 +44,7 @@ const PITCH_ALIGN: u32 = 256;
 /// Vertically it is the 14-bit `RECOUT_HEIGHT` / `DPG_ACTIVE_HEIGHT` fields
 /// `amdgpu_dcn_plane` programs, which bound the plane at 16383 lines.
 const MAX_WIDTH: u32 = crate::amdgpu_dcn_otg::MAX_SEGMENT_WIDTH;
-const MAX_HEIGHT: u32 = (1 << 14) - 1;
+const MAX_HEIGHT: u32 = crate::amdgpu_dcn_plane::MAX_DIMENSION;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

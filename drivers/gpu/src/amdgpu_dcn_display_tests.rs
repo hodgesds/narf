@@ -338,6 +338,14 @@ fn display_mode_bounds_are_the_ones_the_blocks_enforce() -> TestResult {
     if MAX_HEIGHT != 16383 {
         return TestResult::Fail("the plane's height fields are fourteen bits");
     }
+    if MAX_HEIGHT != crate::amdgpu_dcn_plane::MAX_DIMENSION {
+        return TestResult::Fail("the height bound must be the plane's own field width");
+    }
+    // One pipe count, shared: res_cap_dcn314 gives num_timing_generator,
+    // num_opp and num_video_plane all as 4.
+    if crate::amdgpu_dcn::DCN_PIPES != 4 {
+        return TestResult::Fail("DCN 3.1.4 has four pixel pipes");
+    }
 
     // A mode exactly at each bound is accepted, and one past it refused — at
     // this stage, rather than several blocks later.

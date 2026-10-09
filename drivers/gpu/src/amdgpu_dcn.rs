@@ -105,7 +105,14 @@ use crate::amdgpu_offsets;
 pub const HUBP_PIPE_STRIDE: u32 = 0xDC;
 pub const OPP_PIPE_STRIDE: u32 = 0x5A;
 pub const OTG_PIPE_STRIDE: u32 = 0x80;
-/// DCN 3.1.4 has four of each (`dcn314_resource.c`).
+/// How many pixel pipes DCN 3.1.4 has: `res_cap_dcn314` in
+/// `dcn314_resource.c` gives `num_timing_generator`, `num_opp` and
+/// `num_video_plane` all as 4, so the HUBP, DPP, MPCC, OPP and OTG blocks and
+/// the DCCG's per-pipe dividers are all four deep.
+///
+/// This is the one place that count lives. The DIG side is a different number
+/// — `num_stream_encoder` and `num_dig_link_enc` are both 5 — and is named
+/// separately in `amdgpu_dcn_stream` and `amdgpu_dcn_inventory`.
 pub const DCN_PIPES: u8 = 4;
 
 /// `regHUBP0_DCHUBP_CNTL`. The blank control is a FIELD of this register

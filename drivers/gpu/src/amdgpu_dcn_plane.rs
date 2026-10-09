@@ -53,7 +53,18 @@ const MPC_OUT_STRIDE: u64 = 4;
 const DPP_LAST_REG: u32 = (MPC_SIZE + 3 * DPP_STRIDE) as u32;
 const OPP_LAST_REG: u32 = (OPP_PIPE_CONTROL + 3 * OPP_STRIDE) as u32;
 const MPC_LAST_REG: u32 = (MPC_OUT_MUX + 3 * MPC_OUT_STRIDE) as u32;
-const INSTANCES: u8 = 4;
+/// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
+const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
+/// The widest and tallest region these blocks can describe.
+///
+/// `DSCL0_RECOUT_SIZE`'s `RECOUT_WIDTH`/`RECOUT_HEIGHT`, `DSCL0_MPC_SIZE`'s
+/// `MPC_WIDTH`/`MPC_HEIGHT` and `DPG0_DPG_DIMENSIONS`'s
+/// `DPG_ACTIVE_WIDTH`/`DPG_ACTIVE_HEIGHT` are all 14-bit fields (0x00003FFF
+/// and 0x3FFF0000), so every dimension this module programs tops out here.
+/// `amdgpu_dcn_display::MAX_HEIGHT` is the same bound, checked where the mode
+/// is validated; the width is bounded tighter still by the OTG's
+/// `OPTC_SEGMENT_WIDTH`, so this is the backstop rather than the gate.
+pub(crate) const MAX_DIMENSION: u32 = (1 << 14) - 1;
 
 /// `DSCL_MODE_SCALING_444_BYPASS`: an unscaled RGB plane takes no scaler taps.
 /// `DSCL_MODE_SCALING_444_BYPASS` from `enum dscl_mode_sel`
@@ -216,7 +227,7 @@ impl<I: Io> Block<I> {
     /// size match the active area because nothing is scaled and nothing is
     /// blended beside it.
     fn dpp_program(&mut self, format: Format, width: u32, height: u32) -> Result<(), Error> {
-        if width == 0 || height == 0 || width > 0x3fff || height > 0x3fff {
+        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
             return Err(Error::Invalid);
         }
         let reg = self.dpp(DPP_CONTROL);
@@ -283,7 +294,7 @@ impl<I: Io> Block<I> {
     /// Program the output formatter. Truncation and dithering stay off, so the
     /// formatter passes the plane's depth through untouched.
     fn opp_program(&mut self, encoding: Encoding, width: u32, height: u32) -> Result<(), Error> {
-        if width == 0 || height == 0 || width > 0x3fff || height > 0x3fff {
+        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
             return Err(Error::Invalid);
         }
         let reg = self.opp(OPP_PIPE_CONTROL);

@@ -33,8 +33,8 @@ const DPPCLK0_DTO_PARAM: u64 = 0x0099;
 const DPPCLK_DTO_CTRL: u64 = 0x00b6;
 /// The highest DCCG register this module touches, for the bank bound.
 const LAST_REG: u32 = DPPCLK_DTO_CTRL as u32;
-/// Four DPP pipes, four OTGs and four DPIAs on DCN314 (`dcn314_resource.c`).
-const INSTANCES: u8 = 4;
+/// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
+const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 /// `dccg2_update_dpp_dto` always divides against a full 8-bit modulo.
 const DTO_MODULO: u32 = 0xff;
 
