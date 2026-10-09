@@ -18,13 +18,21 @@
 //!
 //! ## What this does not do
 //!
-//! LINUX-GAP: filling an MQD is not bringing a queue up. The firmware has to
-//! be running first (IMU, RLC, then PFP/ME/MEC through the PSP), the doorbell
-//! aperture has to be routed, and on GFX11 the queue is then handed to the MES
-//! firmware with an `ADD_QUEUE` packet rather than by writing CP registers
-//! directly. Each of those is a handshake with a running engine, and none of
-//! it can be verified anywhere but on silicon. What is here is the part with a
-//! documented layout and a checkable answer.
+//! LINUX-GAP: filling a descriptor is not bringing a queue up. The firmware
+//! has to be running first (IMU, RLC, then PFP/ME/MEC through the PSP), the
+//! doorbell aperture has to be routed, and on GFX11 the queue is then handed
+//! to the MES rather than programmed into CP registers directly.
+//!
+//! The steps around this file now exist and are checkable:
+//! `amdgpu_mes_hw::build_mes_enable` takes the scheduler out of reset,
+//! `build_mes_queue_init_register` pushes a descriptor into the live HQD
+//! registers, `amdgpu_mes::build_map_legacy_queue` is the `ADD_QUEUE` shape a
+//! kernel graphics ring is registered with, and `GfxContext`/`MesQueue` own
+//! the pages all of it names. What is still missing is a **caller** — nothing
+//! runs them in order, so no descriptor built here has reached firmware.
+//!
+//! The handshakes themselves cannot be verified anywhere but on silicon. What
+//! is here is the part with a documented layout and a checkable answer.
 
 use narf_filesystem::FsError;
 

@@ -279,6 +279,19 @@ pub fn build_set_hw_resources(res: &MesHwResources) -> Vec<u32> {
 // ── MESAPI__ADD_QUEUE ─────────────────────────────────────────────
 
 /// Dword indices within `union MESAPI__ADD_QUEUE`, from `offsetof`.
+///
+/// The record is deliberately **complete**, not limited to the fields a
+/// builder writes today. It used to stop at `API_STATUS`, and that is why
+/// `pipe_id` and `queue_id` were unreachable and the legacy kernel-queue
+/// mapping could not be built at all — a packet from the truncated table would
+/// have named pipe 0, queue 0 whatever queue the caller meant.
+///
+/// `allow(dead_code)` because the five fields no builder writes yet are
+/// asserted by `smoke_add_queue_tail_offsets`, which only compiles on the
+/// x86_64 kernel target; on aarch64 they are unreferenced. Dropping them to
+/// silence that would restore the hazard above, so the attribute is the
+/// narrower fix.
+#[allow(dead_code)]
 mod add_queue {
     pub const PROCESS_ID: usize = 1;
     pub const PAGE_TABLE_BASE_ADDR: usize = 2;

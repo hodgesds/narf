@@ -180,12 +180,17 @@ pub const GRBM_GFX_INDEX_REL: u32 = 0x2200 * 4;
 /// Marker for the registers above that live in GC base window **1** rather
 /// than 0, and so cannot be reached from the same `gc_base`.
 ///
-/// LINUX-GAP: nothing in this file resolves window 1. A SOC15 register is
-/// addressed as `reg_offset[GC][0][BASE_IDX] + id`, and IP discovery supplies
-/// both windows in `IpBlock::base_addrs`, but the helpers here take a single
-/// `gc_base`. The two BASE_IDX 1 registers are declared so a caller cannot
-/// use one by accident believing it is reachable; wiring the second window
-/// through is the fix.
+/// A SOC15 register is addressed as `reg_offset[GC][0][BASE_IDX] + id`, and
+/// **BASE_IDX is a property of the register, not of the block** — so these
+/// three cannot be reached from the `gc_base` the rest of the file uses.
+///
+/// Window 1 is resolved now: `AmdGpu::gc_base_1`,
+/// [`build_gfx11_ring_init`]'s `gc_base_1` parameter,
+/// [`GfxGeneration::grbm_gfx_index_rel`]'s base-index return, and
+/// `cp_enable`'s two bases. The list stays because it is the inventory a
+/// reviewer checks a new register against before deciding which base to pass,
+/// and because passing the wrong one addresses whatever sits at that offset in
+/// the other window — which is a silent write, not a fault.
 pub const GC_BASE_IDX_1: &[&str] = &["GRBM_GFX_INDEX", "CP_GFX_CNTL", "GRBM_GFX_CNTL"];
 
 // ── GRBM_STATUS bit decode ─────────────────────────────────────────

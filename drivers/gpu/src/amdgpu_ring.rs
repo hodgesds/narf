@@ -42,11 +42,20 @@
 //! fills with `PACKET3(PACKET3_NOP, 0x3FFF)` (`gfx_v11_0.c`'s `.nop`), and so
 //! does this.
 //!
-//! LINUX-GAP: the GPU's `rptr` is passed in by the caller rather than read
-//! back. Linux has the engine write it to a host page (`ring->rptr_gpu_addr`)
-//! and reads it from there; wiring that up needs the queue descriptor the
-//! firmware consumes, which needs firmware. Until then a caller that does not
-//! know the real `rptr` must pass 0 and treat the ring as write-once.
+//! [`Ring`] takes the GPU's `rptr` as a parameter rather than reading it. That
+//! is the layering, not a gap: the slot the engine reports into belongs to
+//! whoever owns the writeback page, and `Ring` does not.
+//! [`crate::amdgpu_gfx::GfxContext`] owns one and
+//! `GfxContext::ring_rptr` reads the dword the CP writes there
+//! (`gfx_v11_0_ring_get_rptr_gfx` — "gfx11 is 32bit rptr"), passing it in on
+//! every submit; [`crate::amdgpu_mes::MesQueue`] does the same for the
+//! scheduler's ring.
+//!
+//! A caller with no writeback page of its own must pass 0, which makes the
+//! ring behave as write-once — `submit` starts refusing with
+//! [`RingError::Full`] after a ring's worth of dwords. That is the safe
+//! direction: the alternative is wrapping over commands the engine has not
+//! consumed.
 
 use core::sync::atomic::{compiler_fence, Ordering};
 
