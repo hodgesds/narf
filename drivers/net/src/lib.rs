@@ -1,96 +1,124 @@
-//! narf-drivers-net — hardware NIC drivers skeleton.
+//! narf-drivers-net — hardware NIC driver facade.
 //!
-//! Spec: `drivers/net/specification/spec.md` (Stage-4 primary).
-//! The real drivers (e1000 / igb / ixgbe / mlx5) each need:
+//! Each NIC driver is its own crate (see `narf-drivers-net-e1000` for the
+//! dual-build pattern): buildable as a built-in (linked into the kernel) or a
+//! loadable `.ko` from one source. This facade aggregates them behind
+//! per-driver cargo features — all enabled by `default`, so the built kernel is
+//! unchanged — re-exports each driver module so `narf_drivers_net::<driver>`
+//! and `crate::<driver>::…` keep resolving for the smokes and external callers,
+//! and wires every enabled driver's registration into the boot initcalls.
 //!
-//! - PCIe-device claim + BAR0/2 MMIO mapping.
-//! - DMA-ring setup (RX descriptors + TX descriptors).
-//! - MSI-X vector binding per RX / TX queue.
-//! - Link-state change interrupt handling.
-//! - Feature negotiation (TSO, checksum offload, RSS).
-//!
-//! What lands here at this Stage-4 skeleton pass:
-//!
-//! - `NicModel` enum of supported chipsets.
-//! - `NicCaps` feature-bitmap mirroring the `BlockFeature` pattern.
-//! - `NicDescriptor` — a single RX/TX descriptor shape that all
-//!   drivers can produce.
-//! - `HwNic` trait for per-chipset drivers to implement; the
-//!   surface matches `narf_net::Interface` (name/mac/mtu/link_up/
-//!   rx_ring/tx_ring) so the net registry can consume
-//!   chipset-specific drivers uniformly.
-//!
-//! No actual driver body — the first real driver (e1000, simplest
-//! of the modern line) lands when the BAR mapping + MSI-X binding
-//! integration with `bus/` is complete.
+//! The driver-agnostic surface (`HwNic`, `NicModel`, `NicCaps`,
+//! `NicDescriptor`, `NicError`) and the Realtek PHY helpers live in
+//! `narf-drivers-net-core`, re-exported here.
 
 #![no_std]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(missing_debug_implementations)]
 
+// The smokes in `tests` use `alloc`.
 extern crate alloc;
 
-pub mod atheros;
-pub mod bnxt;
-pub mod cxgb4;
-pub mod enic;
-pub mod forcedeth;
-pub mod i40e;
-pub mod igc;
-pub mod ixgbe;
-pub mod mlx5;
-pub mod r8169;
-pub mod rtl8125;
-pub mod rtl8126;
-pub mod rtl8127;
-pub mod rtl8139;
-pub mod tg3;
-pub mod vmxnet3;
-
-// e1000 is now its own crate (`narf-drivers-net-e1000`). Re-export its driver
-// module so `crate::e1000::…` keeps resolving for the smokes and external
-// callers. Gated on the feature because the crate is an optional dependency.
+// Per-driver module re-exports. Each is an optional dependency selected by a
+// same-named feature; `default` enables them all.
+#[cfg(feature = "atheros")]
+pub use narf_drivers_net_atheros::atheros;
+#[cfg(feature = "bnxt")]
+pub use narf_drivers_net_bnxt::bnxt;
+#[cfg(feature = "cxgb4")]
+pub use narf_drivers_net_cxgb4::cxgb4;
 #[cfg(feature = "e1000")]
 pub use narf_drivers_net_e1000::e1000;
+#[cfg(feature = "enic")]
+pub use narf_drivers_net_enic::enic;
+#[cfg(feature = "forcedeth")]
+pub use narf_drivers_net_forcedeth::forcedeth;
+#[cfg(feature = "i40e")]
+pub use narf_drivers_net_i40e::i40e;
+#[cfg(feature = "igc")]
+pub use narf_drivers_net_igc::igc;
+#[cfg(feature = "ixgbe")]
+pub use narf_drivers_net_ixgbe::ixgbe;
+#[cfg(feature = "mlx5")]
+pub use narf_drivers_net_mlx5::mlx5;
+// The Realtek family ships as one crate (dependency chain + shared rtl_phy).
+#[cfg(feature = "realtek")]
+pub use narf_drivers_net_realtek::{r8169, rtl8125, rtl8126, rtl8127};
+#[cfg(feature = "rtl8139")]
+pub use narf_drivers_net_rtl8139::rtl8139;
+#[cfg(feature = "tg3")]
+pub use narf_drivers_net_tg3::tg3;
+#[cfg(feature = "vmxnet3")]
+pub use narf_drivers_net_vmxnet3::vmxnet3;
 
-// Per-driver smoke tests register against `narf-kernel-test` and
-// land in the same `narf.tests` ELF section as the rest of the
-// suite. Kept in its own module so a future `cfg(test_in_tree)`
-// or feature gate can drop them from production binaries.
-//
-// Gated on the extracted-driver features the suite reaches into (e1000 so far,
-// via the re-export above). Each driver split out in turn adds its feature
-// here; `default` enables them all, so standard builds compile the full suite.
-#[cfg(feature = "e1000")]
-mod tests;
-
-// The driver-agnostic surface (HwNic + NicModel/NicCaps/NicDescriptor/NicError)
-// and the Realtek PHY helpers now live in `narf-drivers-net-core`; re-export
-// them so `narf_drivers_net::HwNic`, `crate::NicModel`, `crate::rtl_phy`, …
-// keep resolving for the driver modules and external callers alike.
 pub use narf_drivers_net_core::*;
+
+// Per-driver smoke tests register against `narf-kernel-test` and land in the
+// same `narf.tests` ELF section. They reach into the driver modules via the
+// re-exports above, so the suite compiles only when every driver crate is
+// present — gate on all driver features. `default` enables them all, so
+// standard builds compile the full suite.
+#[cfg(all(
+    feature = "atheros",
+    feature = "bnxt",
+    feature = "cxgb4",
+    feature = "e1000",
+    feature = "enic",
+    feature = "forcedeth",
+    feature = "i40e",
+    feature = "igc",
+    feature = "ixgbe",
+    feature = "mlx5",
+    feature = "realtek",
+    feature = "rtl8139",
+    feature = "tg3",
+    feature = "vmxnet3"
+))]
+mod tests;
 
 /// Register the late PHY-firmware pass.
 ///
-/// Kept out of [`register_initcalls`] because it must run after the
-/// firmware registry has been populated, and `Stage::Late` initcalls
-/// run in registration order — this crate registers before
-/// `narf-firmware` does. `bare_main` calls this after
-/// `narf_firmware::register_initcalls()`, which is what puts it after
-/// the initramfs and rootfs firmware scans.
+/// Kept out of [`register_initcalls`] because it must run after the firmware
+/// registry has been populated, and `Stage::Late` initcalls run in
+/// registration order — this crate registers before `narf-firmware` does.
+/// `bare_main` calls this after `narf_firmware::register_initcalls()`, which is
+/// what puts it after the initramfs and rootfs firmware scans.
 pub fn register_late_firmware_initcalls() {
-    use narf_init::{InitResult, Stage};
-    narf_init::register(Stage::Late, "rtl8127-phy-firmware", || {
-        rtl8127::configure_phy_late();
-        InitResult::Ok
-    });
+    #[cfg(feature = "realtek")]
+    {
+        use narf_init::{InitResult, Stage};
+        narf_init::register(Stage::Late, "rtl8127-phy-firmware", || {
+            narf_drivers_net_realtek::configure_rtl8127_phy_late();
+            InitResult::Ok
+        });
+    }
 }
 
-/// Stage::Subsys initcalls for this driver crate.
+/// Stage::Subsys initcalls for this driver crate. Each enabled driver crate's
+/// `register()` registers its PCI match(es); the Realtek family registers all
+/// four of its drivers from one entry.
 pub fn register_initcalls() {
+    #[cfg(any(
+        feature = "atheros",
+        feature = "bnxt",
+        feature = "cxgb4",
+        feature = "e1000",
+        feature = "enic",
+        feature = "forcedeth",
+        feature = "i40e",
+        feature = "igc",
+        feature = "ixgbe",
+        feature = "mlx5",
+        feature = "realtek",
+        feature = "rtl8139",
+        feature = "tg3",
+        feature = "vmxnet3"
+    ))]
     use narf_init::{InitResult, Stage};
+
+    #[cfg(feature = "cxgb4")]
     narf_init::register(Stage::Subsys, "cxgb4", || {
-        cxgb4::register_pci_driver();
+        narf_drivers_net_cxgb4::register();
         InitResult::Ok
     });
     #[cfg(feature = "e1000")]
@@ -98,64 +126,64 @@ pub fn register_initcalls() {
         narf_drivers_net_e1000::register();
         InitResult::Ok
     });
+    #[cfg(feature = "i40e")]
     narf_init::register(Stage::Subsys, "i40e", || {
-        i40e::register_pci_driver();
+        narf_drivers_net_i40e::register();
         InitResult::Ok
     });
-    narf_init::register(Stage::Subsys, "r8169", || {
-        r8169::register_pci_driver();
+    #[cfg(feature = "realtek")]
+    narf_init::register(Stage::Subsys, "realtek", || {
+        narf_drivers_net_realtek::register();
         InitResult::Ok
     });
-    narf_init::register(Stage::Subsys, "rtl8125", || {
-        rtl8125::register_pci_driver();
-        InitResult::Ok
-    });
-    narf_init::register(Stage::Subsys, "rtl8126", || {
-        rtl8126::register_pci_driver();
-        InitResult::Ok
-    });
-    narf_init::register(Stage::Subsys, "rtl8127", || {
-        rtl8127::register_pci_driver();
-        InitResult::Ok
-    });
+    #[cfg(feature = "mlx5")]
     narf_init::register(Stage::Subsys, "mlx5", || {
-        mlx5::register_pci_driver();
+        narf_drivers_net_mlx5::register();
         InitResult::Ok
     });
+    #[cfg(feature = "ixgbe")]
     narf_init::register(Stage::Subsys, "ixgbe", || {
-        ixgbe::register_pci_driver();
+        narf_drivers_net_ixgbe::register();
         InitResult::Ok
     });
+    #[cfg(feature = "igc")]
     narf_init::register(Stage::Subsys, "igc", || {
-        igc::register_pci_driver();
+        narf_drivers_net_igc::register();
         InitResult::Ok
     });
+    #[cfg(feature = "rtl8139")]
     narf_init::register(Stage::Subsys, "rtl8139", || {
-        rtl8139::register_pci_driver();
+        narf_drivers_net_rtl8139::register();
         InitResult::Ok
     });
+    #[cfg(feature = "atheros")]
     narf_init::register(Stage::Subsys, "atheros", || {
-        atheros::register_pci_driver();
+        narf_drivers_net_atheros::register();
         InitResult::Ok
     });
+    #[cfg(feature = "tg3")]
     narf_init::register(Stage::Subsys, "tg3", || {
-        tg3::register_pci_driver();
+        narf_drivers_net_tg3::register();
         InitResult::Ok
     });
+    #[cfg(feature = "vmxnet3")]
     narf_init::register(Stage::Subsys, "vmxnet3", || {
-        vmxnet3::register_pci_driver();
+        narf_drivers_net_vmxnet3::register();
         InitResult::Ok
     });
+    #[cfg(feature = "forcedeth")]
     narf_init::register(Stage::Subsys, "forcedeth", || {
-        forcedeth::register_pci_driver();
+        narf_drivers_net_forcedeth::register();
         InitResult::Ok
     });
+    #[cfg(feature = "bnxt")]
     narf_init::register(Stage::Subsys, "bnxt", || {
-        bnxt::register_pci_driver();
+        narf_drivers_net_bnxt::register();
         InitResult::Ok
     });
+    #[cfg(feature = "enic")]
     narf_init::register(Stage::Subsys, "enic", || {
-        enic::register_pci_driver();
+        narf_drivers_net_enic::register();
         InitResult::Ok
     });
 }

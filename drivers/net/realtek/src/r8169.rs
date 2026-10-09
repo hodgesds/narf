@@ -125,7 +125,7 @@ const INT_RDU: u16 = 1 << 4;
 const INT_TDU: u16 = 1 << 7;
 
 // PHYStatus bits.
-const PHYSTAT_LINKSTS: u8 = 1 << 1;
+pub const PHYSTAT_LINKSTS: u8 = 1 << 1;
 
 // TX descriptor flags (word0 high bits).
 const TXD_OWN: u32 = 1 << 31;
@@ -239,7 +239,7 @@ pub enum NicError {
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
-pub(crate) struct Desc {
+pub struct Desc {
     /// Bits [31..14] are flags (OWN/EOR/FS/LS/... in TX; OWN/EOR/... +
     /// frame length in RX status), bits [13..0] are buffer size or
     /// frame length depending on direction.

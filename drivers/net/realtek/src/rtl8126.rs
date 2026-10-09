@@ -140,11 +140,11 @@ pub(crate) const INT32_SYS_ERR: u32 = 1 << 15;
 
 // PHYStatus bits (shared with rtl8125; no dedicated 5G bit in this
 // byte — 5G speed requires PHYAR access, deferred to PHY-config stage).
-pub(crate) const PHYSTAT_LINKSTS: u8 = 1 << 1;
-pub(crate) const PHYSTAT_FULLDUP: u8 = 1 << 0;
+pub const PHYSTAT_LINKSTS: u8 = 1 << 1;
+pub const PHYSTAT_FULLDUP: u8 = 1 << 0;
 pub(crate) const PHYSTAT_10BPS: u8 = 1 << 2;
-pub(crate) const PHYSTAT_100BPS: u8 = 1 << 3;
-pub(crate) const PHYSTAT_1000BPSF: u8 = 1 << 4;
+pub const PHYSTAT_100BPS: u8 = 1 << 3;
+pub const PHYSTAT_1000BPSF: u8 = 1 << 4;
 pub(crate) const PHYSTAT_RXFLOWCTRL: u8 = 1 << 5;
 pub(crate) const PHYSTAT_TXFLOWCTRL: u8 = 1 << 6;
 /// `TBI_Enable` bit in PHYStatus (bit 7). On legacy chips this signals
@@ -152,7 +152,7 @@ pub(crate) const PHYSTAT_TXFLOWCTRL: u8 = 1 << 6;
 /// 5 Gbps. Linux defers 5G speed decoding entirely to the PHY
 /// subsystem via `phy_print_status`; the NARF PHY-config stage will do
 /// likewise via PHYAR access.
-pub(crate) const PHYSTAT_TBI_OR_5G: u8 = 1 << 7;
+pub const PHYSTAT_TBI_OR_5G: u8 = 1 << 7;
 
 /// Decoded PHYStatus register for the RTL8126. Adds `speed_5g` which
 /// is set when `TBI_Enable` (bit 7) reads 1 — the only in-band

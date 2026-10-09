@@ -165,11 +165,11 @@ pub(crate) const INT32_TDU: u32 = 1 << 7;
 pub(crate) const INT32_SYS_ERR: u32 = 1 << 15;
 
 // PHYStatus bits.
-pub(crate) const PHYSTAT_LINKSTS: u8 = 1 << 1;
-pub(crate) const PHYSTAT_FULLDUP: u8 = 1 << 0;
+pub const PHYSTAT_LINKSTS: u8 = 1 << 1;
+pub const PHYSTAT_FULLDUP: u8 = 1 << 0;
 pub(crate) const PHYSTAT_10BPS: u8 = 1 << 2;
-pub(crate) const PHYSTAT_100BPS: u8 = 1 << 3;
-pub(crate) const PHYSTAT_1000BPSF: u8 = 1 << 4;
+pub const PHYSTAT_100BPS: u8 = 1 << 3;
+pub const PHYSTAT_1000BPSF: u8 = 1 << 4;
 pub(crate) const PHYSTAT_RXFLOWCTRL: u8 = 1 << 5;
 pub(crate) const PHYSTAT_TXFLOWCTRL: u8 = 1 << 6;
 
