@@ -4241,6 +4241,8 @@ kernel_test_in!(
 fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
     use crate::amdgpu_sdma::build_sdma6_ring_init;
     let base: u32 = 0x0007_0000;
+    // regSDMA0_F32_CNTL 0x589a is GC BASE_IDX 1; everything else is 0.
+    let base_idx1: u32 = 0x000B_0000;
     let ring_phys: u64 = 0x0000_0001_2000_0000;
     let ring_size_dw: u32 = 2048;
     let doorbell_idx: u32 = 4;
@@ -4249,6 +4251,7 @@ fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
 
     let seq = match build_sdma6_ring_init(
         base,
+        base_idx1,
         ring_phys,
         ring_size_dw,
         doorbell_idx,
@@ -4286,10 +4289,13 @@ fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
     if cntl_no_enable & 0x0000_0100 != 0 {
         return TestResult::Fail("WPTR_POLL_ENABLE must stay clear");
     }
-    // Last write: IB_CNTL, after RB_ENABLE. Without it the ring runs but every
+    // IB_CNTL comes after RB_ENABLE. Without it the ring runs but every
     // indirect buffer on it is refused.
-    if w.last().map(|x| (x.addr, x.value)) != Some((base + 0x8A * 4, 0x0000_0001)) {
-        return TestResult::Fail("last write must enable IB_CNTL");
+    if !w
+        .iter()
+        .any(|x| x.addr == base + 0x8A * 4 && x.value == 0x0000_0001)
+    {
+        return TestResult::Fail("IB_CNTL must be enabled");
     }
     let want = [
         (base + 0xB3 * 4, wptr_poll_phys as u32),
@@ -4309,6 +4315,15 @@ fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
         if !w.iter().any(|x| x.addr == addr && x.value == value) {
             return TestResult::Fail("missing expected v6 ring-init write");
         }
+    }
+    // Last write: F32_CNTL through the OTHER window, clearing HALT 0x00000001
+    // and TH1_RESET 0x00002000 — `sdma_v6_0_gfx_resume_instance` does this
+    // after IB_CNTL, and it cannot be reached from the BASE_IDX-0 base.
+    if w.last().map(|x| (x.addr, x.value)) != Some((base_idx1 + 0x589A * 4, 0)) {
+        return TestResult::Fail("F32_CNTL must be last, through GC window 1");
+    }
+    if w.iter().any(|x| x.addr == base + 0x589A * 4) {
+        return TestResult::Fail("F32_CNTL must not be addressed from window 0");
     }
     // MINOR_PTR_UPDATE brackets the wptr write: set before, cleared after.
     let minor = base + 0xB5 * 4;

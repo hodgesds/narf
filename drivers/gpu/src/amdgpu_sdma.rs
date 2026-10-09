@@ -248,6 +248,17 @@ pub const SDMA6_QUEUE0_RB_WPTR_POLL_ADDR_HI_REL: u32 = 0xB2 * 4;
 pub const SDMA6_QUEUE0_RB_WPTR_POLL_ADDR_LO_REL: u32 = 0xB3 * 4;
 /// `regSDMA0_QUEUE0_MINOR_PTR_UPDATE` (0x00b5).
 pub const SDMA6_QUEUE0_MINOR_PTR_UPDATE_REL: u32 = 0xB5 * 4;
+/// `regSDMA0_F32_CNTL` (0x589a) — on **GC BASE_IDX 1**, not the BASE_IDX 0
+/// every `QUEUE0_*` register above uses.
+///
+/// `sdma_v6_0_get_reg_offset` picks `reg_offset[GC][0][1]` for the `HYP_DEC`
+/// range this register falls in, and `reg_offset[GC][0][0]` for everything
+/// else, which is why the sequence builder takes two bases.
+pub const SDMA6_F32_CNTL_REL: u32 = 0x589A * 4;
+/// `SDMA0_F32_CNTL__HALT` (0x00000001) — clearing it starts the engine's F32.
+pub const SDMA_F32_HALT: u32 = 1 << 0;
+/// `SDMA0_F32_CNTL__TH1_RESET` (0x00002000).
+pub const SDMA_F32_TH1_RESET: u32 = 1 << 13;
 
 /// Build the SDMA v6.0 ring-init sequence for queue 0 of one instance.
 ///
@@ -274,21 +285,24 @@ pub const SDMA6_QUEUE0_MINOR_PTR_UPDATE_REL: u32 = 0xB5 * 4;
 /// all missing, so the ring would have come up unprivileged, with no wptr
 /// shadow, and refusing every indirect buffer submitted to it.
 ///
-/// LINUX-GAP: three groups of writes Linux also makes are not here.
-/// `SDMA0_F32_CNTL` (`HALT = 0`, `TH1_RESET = 0`) is `regSDMA0_F32_CNTL`
-/// 0x589a on **BASE_IDX 1**, while every `QUEUE0_*` register above is
-/// BASE_IDX 0 — `sdma_v6_0_get_reg_offset` picks the second GC segment for
-/// that range — so it cannot be addressed from this function's single
-/// `sdma_base`, and un-halting the engine belongs with firmware load anyway.
+/// LINUX-GAP: two groups of writes Linux also makes are not here.
 /// `WATCHDOG_CNTL` and `UTCL1_CNTL`/`UTCL1_PAGE` are timeout and
-/// address-translation tuning left at their reset values. `RB_SWAP_ENABLE` and
+/// address-translation tuning left at their reset values; `RB_SWAP_ENABLE` and
 /// `IB_SWAP_ENABLE` are big-endian only.
 ///
-/// `sdma_base` is the GC IP block's BASE_IDX-0 base, in bytes
-/// (`adev->reg_offset[GC_HWIP][0][0]` — SDMA 6 registers live in the GC
-/// block). Instance 1 would add `SDMA1_REG_OFFSET` 0x600 dwords.
+/// `SDMA0_F32_CNTL` used to be in that list, as unaddressable from a single
+/// base. It is `regSDMA0_F32_CNTL` 0x589a on **GC BASE_IDX 1** while every
+/// `QUEUE0_*` register is BASE_IDX 0, so the builder now takes both windows
+/// and clears `HALT` and `TH1_RESET` last, as
+/// `sdma_v6_0_gfx_resume_instance` does.
+///
+/// `sdma_base` is the GC IP block's BASE_IDX-0 base and `sdma_base_idx1` its
+/// BASE_IDX-1 base, both in bytes (`adev->reg_offset[GC_HWIP][0][0]` and
+/// `[1]` — SDMA 6 registers live in the GC block). Instance 1 would add
+/// `SDMA1_REG_OFFSET` 0x600 dwords.
 pub fn build_sdma6_ring_init(
     sdma_base: u32,
+    sdma_base_idx1: u32,
     ring_phys: u64,
     ring_size_dw: u32,
     doorbell_idx: u32,
@@ -359,6 +373,8 @@ pub fn build_sdma6_ring_init(
         cntl_no_enable | SDMA_RB_ENABLE,
     );
     seq.push(sdma_base + SDMA6_QUEUE0_IB_CNTL_REL, SDMA_IB_ENABLE);
+    // Last: un-halt the engine's F32, through the OTHER GC window.
+    seq.push(sdma_base_idx1 + SDMA6_F32_CNTL_REL, 0);
     Ok(seq)
 }
 
