@@ -7344,6 +7344,93 @@ kernel_test_in!(
 /// The registers `passive_mode` reads to recover a running mode's geometry,
 /// and the decode it applies. Literals from `dcn/dcn_3_1_4_offset.h` and
 /// `dcn_3_1_4_sh_mask.h`.
+/// The writeback page: three slots at Linux's 32-byte spacing, each with a
+/// distinct owner, and `rptr` actually read back from it.
+/// The HPD status register, and the gap between the cookie's connector space
+/// and the registers this ASIC actually has.
+fn smoke_amdgpu_hpd_status_register_window() -> TestResult {
+    use crate::amdgpu_dcn as dcn;
+    // regHPD0_DC_HPD_INT_STATUS 0x1f14 and regHPD1_... 0x1f1c, BASE_IDX 2.
+    if dcn::HPD0_DC_HPD_INT_STATUS != 0x1f14 || dcn::HPD_STRIDE != 8 {
+        return TestResult::Fail("the HPD status registers are 0x1f14, eight apart");
+    }
+    // regHPD4_DC_HPD_INT_STATUS 0x1f34 is the last the header defines.
+    if dcn::HPD_BLOCKS != 5 {
+        return TestResult::Fail("DCN 3.1.4 instantiates five HPD blocks");
+    }
+    if dcn::for_pipe(
+        dcn::HPD0_DC_HPD_INT_STATUS,
+        dcn::HPD_BLOCKS - 1,
+        dcn::HPD_STRIDE,
+    ) != 0x1f34
+    {
+        return TestResult::Fail("the last HPD block is 0x1f34");
+    }
+    // DC_HPD_SENSE_DELAYED 0x00000010 is the debounced pin `hw_hpd.c` reads in
+    // interrupt mode; DC_HPD_SENSE 0x00000002 is the raw one.
+    if dcn::DC_HPD_SENSE_DELAYED != 0x10 || dcn::DC_HPD_SENSE != 0x02 {
+        return TestResult::Fail("the sense bits are 0x10 delayed and 0x02 raw");
+    }
+    // The cookie space is WIDER than the register space: CTXID__DC_HPD6_INT is
+    // 5, so a cookie can name a connector with no HPD register on this part.
+    if crate::amdgpu_ih::HPD_CONNECTORS <= dcn::HPD_BLOCKS {
+        return TestResult::Fail("the cookie names more connectors than this ASIC has blocks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_hpd_status_register_window
+);
+
+fn smoke_amdgpu_gfx_writeback_slots_are_separate() -> TestResult {
+    use crate::amdgpu_gfx::{
+        GfxContext, WB_BYTES, WB_FENCE_OFFSET, WB_RPTR_OFFSET, WB_SLOT_BYTES, WB_WPTR_OFFSET,
+    };
+    // `amdgpu_wb_get` returns `offset << 3` as a dword offset, so consecutive
+    // writeback allocations are 32 bytes apart — enough for the 8-byte
+    // atomic64 the wptr shadow needs.
+    if WB_SLOT_BYTES != 32 {
+        return TestResult::Fail("a writeback slot is 32 bytes");
+    }
+    if (WB_RPTR_OFFSET, WB_WPTR_OFFSET, WB_FENCE_OFFSET) != (0, 32, 64) {
+        return TestResult::Fail("the three slots are one apart each");
+    }
+    if WB_BYTES != 96 {
+        return TestResult::Fail("three slots is 96 bytes");
+    }
+
+    let ctx = match GfxContext::new(7) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("GfxContext::new failed"),
+    };
+    // The fence target and the rptr writeback address must not be the same
+    // place: the CP overwrites rptr continuously, and the fence has to
+    // survive until the host reads it. They used to be one 8-byte buffer.
+    if ctx.fence_phys() == ctx.rptr_phys() {
+        return TestResult::Fail("the fence and rptr slots must not overlap");
+    }
+    if ctx.wptr_phys() == ctx.rptr_phys() || ctx.wptr_phys() == ctx.fence_phys() {
+        return TestResult::Fail("the wptr shadow needs its own slot");
+    }
+    // And each is where the layout says, relative to the page.
+    let page = ctx.rptr_phys();
+    if ctx.wptr_phys() != page + WB_WPTR_OFFSET || ctx.fence_phys() != page + WB_FENCE_OFFSET {
+        return TestResult::Fail("a slot is not at its documented offset");
+    }
+    // Zeroed at allocation, so a read before the CP has run gives 0 rather
+    // than whatever the page held — which keeps the ring write-once instead
+    // of letting it wrap over unconsumed commands.
+    if ctx.ring_rptr() != 0 {
+        return TestResult::Fail("the rptr slot must start zeroed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx_writeback_slots_are_separate
+);
+
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION

@@ -569,59 +569,105 @@ impl From<Pm4Error> for SubmitError {
     }
 }
 
-/// Per-queue GFX submission context. Owns its ring and a
-/// host-coherent fence dword. Caller is responsible for binding
-/// the ring's `phys_addr()` into the CP via
-/// [`build_gfx9_ring_init`] before the first submission lands.
+/// Size of one host-memory writeback slot.
+///
+/// Linux keeps a single writeback page per device and hands slots out of it;
+/// `amdgpu_wb_get` returns `offset << 3` as a DWORD offset, so consecutive
+/// allocations are 32 bytes apart. That is why an 8-byte `atomic64` wptr fits
+/// in what the code calls one "slot" — see `amdgpu_wb.c:95-110`.
+pub const WB_SLOT_BYTES: u64 = 32;
+/// Byte offset of the `rptr` slot. The CP writes a 32-bit value here on GFX11
+/// (`gfx_v11_0_ring_get_rptr_gfx`: "gfx11 is 32bit rptr").
+pub const WB_RPTR_OFFSET: u64 = 0;
+/// Byte offset of the `wptr` shadow. The HOST writes this one, as a 64-bit
+/// store, and the CP polls it (`CP_RB_WPTR_POLL_ADDR_LO`/`_HI`).
+pub const WB_WPTR_OFFSET: u64 = WB_SLOT_BYTES;
+/// Byte offset of the fence slot the `WRITE_DATA` packet targets.
+pub const WB_FENCE_OFFSET: u64 = 2 * WB_SLOT_BYTES;
+/// Three slots: rptr, wptr, fence.
+pub const WB_BYTES: usize = 3 * WB_SLOT_BYTES as usize;
+
+/// Per-queue GFX submission context. Owns its ring and a host-memory
+/// writeback page. Caller is responsible for binding the ring's
+/// `phys_addr()`, `rptr_phys()` and `wptr_phys()` into the CP via
+/// [`build_gfx9_ring_init`] or [`build_gfx11_ring_init`] before the first
+/// submission lands.
 #[derive(Debug)]
 pub struct GfxContext {
     ring: Ring,
-    /// Single DMA-coherent dword the GPU writes the most-recent
-    /// retired sequence number into via WRITE_DATA. Host polls it.
-    fence_buf: DmaBuffer,
+    /// The writeback page: rptr (CP writes), wptr shadow (host writes, CP
+    /// polls) and the fence dword the `WRITE_DATA` packet targets, at
+    /// [`WB_RPTR_OFFSET`], [`WB_WPTR_OFFSET`] and [`WB_FENCE_OFFSET`].
+    ///
+    /// This used to be an 8-byte buffer serving as both the fence target and
+    /// the rptr writeback address — "the CP uses the same buffer for RPTR
+    /// writeback in this minimal scaffold; production splits them". They
+    /// cannot share: the CP overwrites rptr continuously while the fence has
+    /// to survive until the host reads it.
+    wb: DmaBuffer,
     /// Next sequence number to publish.
     next_seq: u64,
-    /// The engine's ring read pointer, as last reported.
-    ///
-    /// LINUX-GAP: nothing reports it. Linux has the command processor write
-    /// `rptr` into a host page it named at queue setup
-    /// (`ring->rptr_gpu_addr`), and reads it from there to decide whether a
-    /// submission fits. That needs the queue descriptor the firmware consumes.
-    /// Until then this stays 0, which makes the ring effectively write-once:
-    /// `submit` starts refusing with `Full` after a ring's worth of dwords,
-    /// which is the SAFE direction — the alternative is overwriting commands
-    /// the engine may still be executing.
-    ring_rptr_dw: u64,
 }
 
 impl GfxContext {
     /// Tell the context how far the engine has consumed its ring.
     ///
-    /// For the firmware path to call once it can read `rptr` back, and for
-    /// tests to drive the wrap. Without it the ring fills and stays full.
-    pub fn set_ring_rptr(&mut self, rptr_dw: u64) {
-        self.ring_rptr_dw = rptr_dw;
+    /// How far the CP has consumed this ring, read back from the writeback
+    /// page it was given at queue setup.
+    ///
+    /// GFX11's rptr is 32 bits (`gfx_v11_0_ring_get_rptr_gfx`), so the slot
+    /// holds a dword. Before the CP has run it reads 0, which makes the ring
+    /// behave as write-once — `submit` starts refusing with `Full` after a
+    /// ring's worth of dwords, which is the safe direction.
+    pub fn ring_rptr(&self) -> u64 {
+        // SAFETY: identity-mapped DMA-coherent page owned by this context;
+        // the slot is within it and the CP only ever writes this dword.
+        let rptr: u32 =
+            unsafe { core::ptr::read_volatile(self.wb.cpu_ptr_at::<u32>(WB_RPTR_OFFSET)) };
+        u64::from(rptr)
     }
 
-    /// Allocate a fresh GFX context: ring + fence buffer.
+    /// Publish the host write pointer to the shadow the CP polls, then ring
+    /// the doorbell.
+    ///
+    /// Linux does exactly this pair in `*_ring_set_wptr`:
+    /// `atomic64_set(ring->wptr_cpu_addr, wptr)` and then `WDOORBELL64`. The
+    /// shadow is what the CP reads when the doorbell is not in use, and what
+    /// MES reads when it is scheduling the queue.
+    ///
+    /// # Safety
+    /// `bar2` must map the doorbell window of this GPU, and the caller owns
+    /// the doorbell range for this queue.
+    pub unsafe fn commit(&self, bar2: &narf_driver_runtime::MmioRegion) {
+        let payload = self.ring.doorbell_payload();
+        // SAFETY: identity-mapped page this context owns; one aligned 64-bit
+        // store, matching Linux's atomic64.
+        unsafe {
+            core::ptr::write_volatile(self.wb.cpu_mut_ptr_at::<u64>(WB_WPTR_OFFSET), payload);
+        }
+        // The shadow has to be visible before the doorbell announces it.
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: caller-asserted doorbell ownership.
+        unsafe { self.ring.ring_doorbell(bar2) };
+    }
+
+    /// Allocate a fresh GFX context: ring + writeback page.
     pub fn new(queue_idx: u16) -> Result<Self, RingError> {
         // A GFX ring: the doorbell carries the dword wptr as a quadword.
         let ring = Ring::new(queue_idx, crate::amdgpu_ring::DoorbellKind::Gfx)?;
-        // 8 bytes is enough — single u64 sequence number. Hardware
-        // requires 8-byte alignment for the WRITE_DATA target
-        // anyway, and DMA pages are 4-KiB aligned so this is fine.
-        let fence_buf = alloc_coherent(8, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
-        // Zero the fence buffer so reads-before-completion return 0,
-        // not garbage.
-        // SAFETY: identity-mapped, exclusive owner.
+        let wb = alloc_coherent(WB_BYTES, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
+        // Zero all three slots: a read before the CP has written must give 0,
+        // not whatever the page held.
+        // SAFETY: identity-mapped, exclusive owner, bounded by WB_BYTES.
         unsafe {
-            core::ptr::write_volatile(fence_buf.cpu_mut_ptr::<u64>(), 0);
+            for offset in (0..WB_BYTES as u64).step_by(8) {
+                core::ptr::write_volatile(wb.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
         }
         Ok(Self {
             ring,
-            fence_buf,
+            wb,
             next_seq: 0,
-            ring_rptr_dw: 0,
         })
     }
 
@@ -631,12 +677,21 @@ impl GfxContext {
         self.ring.phys_addr()
     }
 
-    /// Phys address of the fence-writeback buffer — feed this
-    /// into [`build_gfx9_ring_init`] as `rptr_writeback_phys`. The
-    /// CP uses the same buffer for RPTR writeback in this minimal
-    /// scaffold; production splits them.
+    /// Phys address of the fence slot — the `WRITE_DATA` target.
     pub fn fence_phys(&self) -> u64 {
-        self.fence_buf.dma_addr().raw()
+        self.wb.dma_addr().raw() + WB_FENCE_OFFSET
+    }
+
+    /// Phys address of the rptr slot — feed this into the ring init as
+    /// `rptr_writeback_phys`, so the CP has somewhere to report from.
+    pub fn rptr_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_RPTR_OFFSET
+    }
+
+    /// Phys address of the wptr shadow — feed this into
+    /// [`build_gfx11_ring_init`] as `wptr_poll_phys`.
+    pub fn wptr_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_WPTR_OFFSET
     }
 
     /// Doorbell offset for the BAR2 doorbell write that kicks the
@@ -683,7 +738,7 @@ impl GfxContext {
 
         // SAFETY: caller-promised ring exclusivity.
         unsafe {
-            self.ring.submit(&staging, self.ring_rptr_dw)?;
+            self.ring.submit(&staging, self.ring_rptr())?;
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -698,7 +753,7 @@ impl GfxContext {
     pub fn fence_completed(&self, fence: &Fence) -> bool {
         let observed: u32 =
             // SAFETY: identity-mapped DMA backing, exclusive owner.
-            unsafe { core::ptr::read_volatile(self.fence_buf.cpu_ptr::<u32>()) };
+            unsafe { core::ptr::read_volatile(self.wb.cpu_ptr_at::<u32>(WB_FENCE_OFFSET)) };
         (observed as u64) >= fence.seq
     }
 
@@ -716,7 +771,7 @@ impl GfxContext {
     pub fn set_fence_for_test(&self, seq: u32) {
         // SAFETY: identity-mapped DMA backing, exclusive owner.
         unsafe {
-            core::ptr::write_volatile(self.fence_buf.cpu_mut_ptr::<u32>(), seq);
+            core::ptr::write_volatile(self.wb.cpu_mut_ptr_at::<u32>(WB_FENCE_OFFSET), seq);
         }
     }
 }

@@ -128,6 +128,25 @@ pub const HUBPREQ0_DCSURF_SURFACE_PITCH: u32 = 0x0607;
 pub const HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION: u32 = 0x05ea;
 /// The 14-bit viewport and pitch fields' mask.
 pub const SURFACE_DIMENSION_MASK: u32 = 0x3FFF;
+
+/// `regHPD0_DC_HPD_INT_STATUS` (0x1f14, BASE_IDX 2) — the hot-plug pin's
+/// state.
+pub const HPD0_DC_HPD_INT_STATUS: u32 = 0x1f14;
+/// Dword distance between HPD blocks: `regHPD1_DC_HPD_INT_STATUS` is 0x1f1c.
+pub const HPD_STRIDE: u32 = 8;
+/// How many HPD blocks DCN 3.1.4 instantiates — `regHPD4_DC_HPD_INT_STATUS`
+/// 0x1f34 is the last one the header defines.
+///
+/// NOT the same as the six connectors the interrupt cookie can name:
+/// `irqsrcs_dcn_1_0.h` defines `CTXID__DC_HPD6_INT` = 5, so a cookie may
+/// identify a connector this part has no HPD register for. The cookie space
+/// is generic across DCN; the register instances are per-ASIC.
+pub const HPD_BLOCKS: u8 = 5;
+/// `DC_HPD_INT_STATUS__DC_HPD_SENSE_DELAYED` (0x00000010) — the debounced
+/// sense bit, which is the one `dal_hw_hpd_get_value` reads in interrupt mode.
+pub const DC_HPD_SENSE_DELAYED: u32 = 1 << 4;
+/// `DC_HPD_INT_STATUS__DC_HPD_SENSE` (0x00000002) — the raw, undebounced pin.
+pub const DC_HPD_SENSE: u32 = 1 << 1;
 /// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS` — low half, **below** high.
 pub const HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS: u32 = 0x060a;
 /// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH`.

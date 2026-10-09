@@ -1001,6 +1001,38 @@ impl AmdGpu {
         unsafe { self.passive_mode() }
     }
 
+    /// Is a display connected on `connector`?
+    ///
+    /// Reads `DC_HPD_INT_STATUS.DC_HPD_SENSE_DELAYED`, the debounced sense
+    /// bit `dal_hw_hpd_get_value` returns in interrupt mode
+    /// (`gpio/hw_hpd.c:65-81`). This is the read `amdgpu_hpd` needs for
+    /// `HpdEvent::from_ih_cookie`'s `asserted` argument: the interrupt cookie
+    /// says which connector fired and whether it was a plug event or a sink
+    /// IRQ, but not whether the result is connected or disconnected — Linux
+    /// calls `dc_link_detect` to go and look, and this is that look.
+    ///
+    /// `None` when DCN was not discovered or `connector` is past the HPD
+    /// blocks this ASIC has. Note the cookie space is wider than the register
+    /// space: see [`crate::amdgpu_dcn::HPD_BLOCKS`].
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively.
+    pub unsafe fn hpd_asserted(&self, connector: u8) -> Option<bool> {
+        use crate::amdgpu_dcn as dcn;
+        if connector >= dcn::HPD_BLOCKS {
+            return None;
+        }
+        let base = self.ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2)?;
+        let reg = base + dcn::for_pipe(dcn::HPD0_DC_HPD_INT_STATUS, connector, dcn::HPD_STRIDE);
+        // SAFETY: caller-asserted BAR5 ownership; a read-only status register
+        // reached through the MM_INDEX/MM_DATA pair.
+        let status = unsafe { mm_read(&self.regs, reg) };
+        if status == u32::MAX {
+            return None;
+        }
+        Some(status & dcn::DC_HPD_SENSE_DELAYED != 0)
+    }
+
     /// Read the firmware-programmed scanout geometry out of DCN.
     ///
     /// Returns `None` when no pipe is fetching, when DCN was not discovered,

@@ -138,8 +138,11 @@ impl HpdEvent {
     /// than something decoded out of the dword, and the cookie's own 0..11
     /// context id supplies the connector and the plug/sink-IRQ split.
     ///
-    /// Nothing reads the HPD status register back yet, so no caller can supply
-    /// `asserted` from hardware; that read is the remaining gap.
+    /// `AmdGpu::hpd_asserted` is that read: it returns
+    /// `DC_HPD_INT_STATUS.DC_HPD_SENSE_DELAYED` for a connector, which is what
+    /// `dal_hw_hpd_get_value` reports in interrupt mode. Note the pin it reads
+    /// is already hardware-debounced, so the software window below is a second
+    /// filter rather than the only one.
     pub fn from_ih_cookie(ctxid: u8, asserted: bool, tsc: u64) -> Option<Self> {
         let (index, kind) = match crate::amdgpu_ih::decode_hpd_ctxid(ctxid)? {
             crate::amdgpu_ih::HpdEvent::Plug(i) if asserted => (i, HpdEventKind::LongPulseConnect),
