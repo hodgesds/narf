@@ -34,6 +34,14 @@ pub struct Atombios<'a> {
     n_cmd_tables: u16,
 }
 
+/// `ATOM_CT_WS_PTR` / `ATOM_CT_PS_PTR` / `ATOM_CT_PS_MASK` / `ATOM_CT_CODE_PTR`
+/// from `atom.h:59-63`. The working-scratch byte is at 4, the parameter byte
+/// at 5 with only its low seven bits counting, and the bytecode starts at 6.
+pub const ATOM_CT_WS_PTR: usize = 4;
+pub const ATOM_CT_PS_PTR: usize = 5;
+pub const ATOM_CT_PS_MASK: u8 = 0x7F;
+pub const ATOM_CT_CODE_PTR: usize = 6;
+
 impl<'a> fmt::Debug for Atombios<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Atombios")
@@ -163,11 +171,24 @@ impl<'a> Atombios<'a> {
     /// skip per Linux `atom.c::amdgpu_atom_execute_table_locked`
     /// (lines 1232-1235).
     pub fn cmd_table_body(&self, table_id: u16) -> Result<&'a [u8], AtomError> {
+        self.cmd_table_body_and_ps(table_id).map(|(body, _)| body)
+    }
+
+    /// The bytecode body plus the parameter size the table's own header
+    /// declares, in dwords.
+    ///
+    /// `ATOM_CT_PS_PTR` is offset 5 and `ATOM_CT_PS_MASK` is 0x7F — the top
+    /// bit of that byte is not part of the size. `atom.c:1255` divides by four
+    /// to get `ectx.ps_shift`, which `atom.c:650` adds to the parameter
+    /// pointer when a table calls another. Returning the body alone leaves the
+    /// VM no way to compute it, so these travel together.
+    pub fn cmd_table_body_and_ps(&self, table_id: u16) -> Result<(&'a [u8], usize), AtomError> {
         let full = self.cmd_table(table_id)?;
         if full.len() < 6 {
             return Err(AtomError::BadTablePointer);
         }
-        Ok(&full[6..])
+        let ps_bytes = (full[5] & ATOM_CT_PS_MASK) as usize;
+        Ok((&full[6..], ps_bytes / 4))
     }
 }
 

@@ -11,6 +11,95 @@ use core::future::Future;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+/// The DCN versions the register ids in this module describe. The DIG and DP
+/// link blocks move wholesale on DCN 3.5 (`dcn_3_5_0_offset.h`):
+/// `regDIG0_DIG_BE_CNTL` 0x20b1→0x20bc, `regDIG0_DIG_BE_EN_CNTL`
+/// 0x20b2→0x20bd, `regDP0_DP_LINK_CNTL` 0x2108→0x211e — the same +0x16 shift
+/// `amdgpu_dcn_stream` sees on the stream half. Another generation needs its
+/// own ids, selected per version the way `amdgpu_platform::SURFACE_WINDOWS`
+/// does it.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
+// ── The DIG / DP link window ──────────────────────────────────────
+//
+// Every id is `dcn/dcn_3_1_4_offset.h` at DCN base index 2, and every mask is
+// the one `dcn_3_1_4_sh_mask.h` gives for the named field. Instance N is
+// `+ N * DIG_STRIDE`, which is why the bank bound is `DP4_DP_DPHY_SCRAM_CNTL`.
+
+/// `regDIG0_DIG_BE_CNTL`.
+const DIG_BE_CNTL: u64 = 0x20b1;
+/// `regDIG0_DIG_BE_EN_CNTL`.
+const DIG_BE_EN_CNTL: u64 = 0x20b2;
+/// `regDP0_DP_LINK_CNTL`.
+const DP_LINK_CNTL: u64 = 0x2108;
+/// `regDP0_DP_CONFIG`.
+const DP_CONFIG: u64 = 0x210b;
+/// `regDP0_DP_DPHY_INTERNAL_CTRL` — the eDP alternate-scrambler-reset pair,
+/// which `setup_panel_mode` writes whole: 0 for `DP_PANEL_MODE_DEFAULT`, 0x1
+/// for eDP, 0x11 for the special panel mode.
+const DP_DPHY_INTERNAL_CTRL: u64 = 0x210f;
+/// `regDP0_DP_LINK_FRAMING_CNTL`.
+const DP_LINK_FRAMING_CNTL: u64 = 0x2113;
+/// `regDP0_DP_DPHY_CNTL`.
+const DP_DPHY_CNTL: u64 = 0x2117;
+/// `regDP0_DP_DPHY_TRAINING_PATTERN_SEL`.
+const DP_DPHY_TRAINING_PATTERN_SEL: u64 = 0x2118;
+/// `regDP0_DP_DPHY_PRBS_CNTL`.
+const DP_DPHY_PRBS_CNTL: u64 = 0x211d;
+/// `regDP0_DP_DPHY_SCRAM_CNTL`.
+const DP_DPHY_SCRAM_CNTL: u64 = 0x211e;
+/// Dword distance between DIG instances. `regDIG1_DIG_BE_CNTL` is 0x21b1
+/// against DIG0's 0x20b1.
+const DIG_STRIDE: u64 = 0x100;
+/// `regDP4_DP_DPHY_SCRAM_CNTL` 0x251e — the highest dword this module touches,
+/// and so the bank bound: `DP_DPHY_SCRAM_CNTL` + 4 × `DIG_STRIDE`.
+const LAST_REG: u32 = (DP_DPHY_SCRAM_CNTL + 4 * DIG_STRIDE) as u32;
+
+/// `DIG_BE_EN_CNTL__DIG_ENABLE`.
+const DIG_ENABLE: u32 = 0x0000_0001;
+/// `DIG_BE_CNTL__DIG_FE_SOURCE_SELECT` — a ONE-HOT over the front ends, not an
+/// index: `DCN10_DIG_FE_SOURCE_SELECT_DIGA` is 0x1, DIGB 0x2, DIGC 0x4.
+const DIG_FE_SOURCE_SELECT: u32 = 0x0000_7F00;
+const DIG_FE_SOURCE_SELECT_SHIFT: u32 = 8;
+/// `DIG_BE_CNTL__DIG_MODE`. `dcn10_link_encoder_setup` writes 0 for DP SST, 1
+/// LVDS, 2 TMDS-DVI, 3 TMDS-HDMI, 5 DP MST — so DP SST is this field cleared.
+const DIG_MODE: u32 = 0x0007_0000;
+/// `DP_LINK_CNTL__DP_LINK_TRAINING_COMPLETE`.
+const DP_LINK_TRAINING_COMPLETE: u32 = 0x0000_0010;
+/// `DP_CONFIG__DP_UDI_LANES` — lane count minus one.
+const DP_UDI_LANES: u32 = 0x0000_0003;
+/// `DP_LINK_FRAMING_CNTL__DP_IDLE_BS_INTERVAL` (0x0003FFFF) |
+/// `DP_VBID_DISABLE` (0x01000000) | `DP_VID_ENHANCED_FRAME_MODE` (0x10000000).
+const DP_LINK_FRAMING_FIELDS: u32 = 0x1103_FFFF;
+/// `DP_IDLE_BS_INTERVAL` for ordinary operation, per
+/// `set_dp_phy_pattern_passthrough_mode`. (The HBR2 compliance path uses 0xFC.)
+const DP_IDLE_BS_INTERVAL_NORMAL: u32 = 0x2000;
+/// `DP_LINK_FRAMING_CNTL__DP_VID_ENHANCED_FRAME_MODE`.
+///
+/// LINUX-GAP: Linux writes this field only in its two test-pattern paths and
+/// forces it to 1 there. We drive it from the sink's own
+/// `MAX_LANE_COUNT.ENHANCED_FRAME_CAP` (DPCD 0x0002 bit 7), the same flag
+/// `amdgpu_dp_training` puts in `LANE_COUNT_SET.ENHANCED_FRAME_EN` (DPCD 0x0101
+/// bit 7). The two ends must agree, so deriving both from one capability bit is
+/// deliberate rather than a transcription of Linux's constant.
+const DP_VID_ENHANCED_FRAME_MODE: u32 = 0x1000_0000;
+/// `DP_DPHY_SCRAM_CNTL__DPHY_SCRAMBLER_BS_COUNT`, and the 0x1FF ordinary
+/// operation uses (`set_dp_phy_pattern_passthrough_mode`; the HBR2 compliance
+/// path uses 0, "swap every BS with SR").
+const DPHY_SCRAMBLER_BS_COUNT: u32 = 0x0003_FF00;
+const DPHY_SCRAMBLER_BS_COUNT_NORMAL: u32 = 0x1FF << 8;
+/// `DP_DPHY_SCRAM_CNTL__DPHY_SCRAMBLER_ADVANCE`.
+const DPHY_SCRAMBLER_ADVANCE: u32 = 0x0000_0010;
+/// `DP_DPHY_TRAINING_PATTERN_SEL__DPHY_TRAINING_PATTERN_SEL`.
+const DPHY_TRAINING_PATTERN_SEL: u32 = 0x0000_0003;
+/// `DP_DPHY_CNTL__DPHY_BYPASS`.
+const DPHY_BYPASS: u32 = 0x0001_0000;
+/// `DP_DPHY_CNTL__DPHY_FEC_EN` | `DPHY_FEC_READY_SHADOW`. An 8b/10b SST link
+/// runs without forward error correction.
+const DPHY_FEC_FIELDS: u32 = 0x0000_0030;
+/// `DP_DPHY_PRBS_CNTL__DPHY_PRBS_EN`.
+const DPHY_PRBS_EN: u32 = 0x0000_0001;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Route {
     pub channel: Channel,
@@ -147,9 +236,9 @@ impl Encoder<Mmio> {
         let base = crate::amdgpu_psp_ring::bank(
             gpu,
             crate::amdgpu_discovery::HW_ID_DCN,
-            &[(3, 1, 4)],
+            DCN_VERSIONS,
             2,
-            0x251e,
+            LAST_REG,
         )
         .map_err(|_| Error::Source)?;
         let mut source = Self {
@@ -162,7 +251,7 @@ impl Encoder<Mmio> {
             state: State::Disabled,
             settings: None,
         };
-        if source.read(0x20b2)? & 1 != 0 {
+        if source.read(DIG_BE_EN_CNTL)? & DIG_ENABLE != 0 {
             return Err(Error::Source);
         }
         Ok(source)
@@ -180,11 +269,11 @@ impl<I: Io> Encoder<I> {
         self.cap.invoke(Op(|| f(io))).map_err(|_| Error::Source)
     }
     fn read(&mut self, reg: u64) -> Result<u32, Error> {
-        let reg = reg + self.route.backend as u64 * 0x100;
+        let reg = reg + self.route.backend as u64 * DIG_STRIDE;
         self.access(|io| io.read(reg))
     }
     fn update(&mut self, reg: u64, mask: u32, value: u32) -> Result<(), Error> {
-        let reg = reg + self.route.backend as u64 * 0x100;
+        let reg = reg + self.route.backend as u64 * DIG_STRIDE;
         self.access(|io| {
             let old = io.read(reg);
             if old == u32::MAX {
@@ -199,15 +288,32 @@ impl<I: Io> Encoder<I> {
     }
     fn pattern(&mut self, pattern: u8) -> Result<(), Error> {
         if pattern == 0 {
-            self.update(0x210f, u32::MAX, 0)?; // ordinary DP, not embedded panel mode
+            // `setup_panel_mode(DP_PANEL_MODE_DEFAULT)`: the whole register,
+            // not a field update, and 0 is ordinary DP rather than eDP.
+            self.update(DP_DPHY_INTERNAL_CTRL, u32::MAX, 0)?;
             let enhanced = self.settings.ok_or(Error::Source)?.enhanced;
+            // `DP_IDLE_BS_INTERVAL` 0x2000 with `DP_VBID_DISABLE` cleared,
+            // per `set_dp_phy_pattern_passthrough_mode`.
             self.update(
-                0x2113,
-                0x1103ffff,
-                0x2000 | if enhanced { 1 << 28 } else { 0 },
+                DP_LINK_FRAMING_CNTL,
+                DP_LINK_FRAMING_FIELDS,
+                DP_IDLE_BS_INTERVAL_NORMAL
+                    | if enhanced {
+                        DP_VID_ENHANCED_FRAME_MODE
+                    } else {
+                        0
+                    },
             )?;
-            self.update(0x211e, 0x3ff00, 0x1ff00)?;
-            self.update(0x2108, 0x10, 0x10)?;
+            self.update(
+                DP_DPHY_SCRAM_CNTL,
+                DPHY_SCRAMBLER_BS_COUNT,
+                DPHY_SCRAMBLER_BS_COUNT_NORMAL,
+            )?;
+            self.update(
+                DP_LINK_CNTL,
+                DP_LINK_TRAINING_COMPLETE,
+                DP_LINK_TRAINING_COMPLETE,
+            )?;
         } else {
             let index = match pattern {
                 1 => 0,
@@ -216,11 +322,16 @@ impl<I: Io> Encoder<I> {
                 7 => 3,
                 _ => return Err(Error::Invalid),
             };
-            self.update(0x2118, 3, index)?;
-            self.update(0x2108, 0x10, 0)?;
+            self.update(
+                DP_DPHY_TRAINING_PATTERN_SEL,
+                DPHY_TRAINING_PATTERN_SEL,
+                index,
+            )?;
+            self.update(DP_LINK_CNTL, DP_LINK_TRAINING_COMPLETE, 0)?;
         }
-        self.update(0x2117, 1 << 16, 0)?;
-        self.update(0x211d, 1, 0)
+        // `enable_phy_bypass_mode(false)` then `disable_prbs_mode`.
+        self.update(DP_DPHY_CNTL, DPHY_BYPASS, 0)?;
+        self.update(DP_DPHY_PRBS_CNTL, DPHY_PRBS_EN, 0)
     }
     async fn train(
         &mut self,
@@ -258,10 +369,10 @@ impl<I: Io> Encoder<I> {
             enhanced: false,
         });
         phy.command(phy_command(self.route, settings, 0, 0)).await?;
-        if self.read(0x20b2)? & 1 != 0 {
+        if self.read(DIG_BE_EN_CNTL)? & DIG_ENABLE != 0 {
             return Err(Error::Source);
         }
-        self.update(0x20b1, 0x7f00, 0)?;
+        self.update(DIG_BE_CNTL, DIG_FE_SOURCE_SELECT, 0)?;
         self.settings = None;
         self.state = State::Disabled;
         Ok(())
@@ -347,15 +458,24 @@ impl<I: Io, P: Phy> LinkIo for Adapter<'_, I, P> {
     async fn configure(&mut self, settings: Settings) -> Result<(), Error> {
         let source = &mut *self.source;
         source.settings = Some(settings);
-        source.update(0x20b1, 0x77f00, (1u32 << source.route.frontend) << 8)?;
-        source.update(0x210b, 3, settings.lanes as u32 - 1)?;
-        source.update(0x211e, 0x10, 0x10)?;
+        // One-hot front end plus `DIG_MODE` cleared, which is DP SST.
+        source.update(
+            DIG_BE_CNTL,
+            DIG_FE_SOURCE_SELECT | DIG_MODE,
+            (1u32 << source.route.frontend) << DIG_FE_SOURCE_SELECT_SHIFT,
+        )?;
+        source.update(DP_CONFIG, DP_UDI_LANES, settings.lanes as u32 - 1)?;
+        source.update(
+            DP_DPHY_SCRAM_CNTL,
+            DPHY_SCRAMBLER_ADVANCE,
+            DPHY_SCRAMBLER_ADVANCE,
+        )?;
         // FEC is not negotiated for this uncompressed 8b/10b SST path.
-        source.update(0x2117, 0x30, 0)?;
+        source.update(DP_DPHY_CNTL, DPHY_FEC_FIELDS, 0)?;
         self.phy
             .command(phy_command(source.route, settings, 1, 0))
             .await?;
-        if source.read(0x20b2)? & 1 == 0 {
+        if source.read(DIG_BE_EN_CNTL)? & DIG_ENABLE == 0 {
             return Err(Error::Source);
         }
         Ok(())

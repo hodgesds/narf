@@ -398,10 +398,14 @@ fn smoke_amdgpu_gfx9_ring_init_sequence() -> TestResult {
         .find(|w| w.addr == gc_base + CP_RB0_BASE_HI_REL);
     match (base_lo, base_hi) {
         (Some(lo), Some(hi)) => {
-            if lo.value != ring_phys as u32 {
+            // `rb_addr = ring->gpu_addr >> 8`: the register holds a 256-byte
+            // granule, which is why the builder requires 256-byte alignment.
+            // This used to assert the raw address.
+            let rb = ring_phys >> 8;
+            if lo.value != rb as u32 {
                 return TestResult::Fail("CP_RB0_BASE lo does not match ring_phys lo");
             }
-            if hi.value != (ring_phys >> 32) as u32 {
+            if hi.value != (rb >> 32) as u32 {
                 return TestResult::Fail("CP_RB0_BASE_HI does not match ring_phys hi");
             }
         }

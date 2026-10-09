@@ -248,3 +248,70 @@ kernel_test_in!(
     "drivers/gpu/dml-regs",
     dml_regs_refuse_values_a_field_cannot_hold
 );
+
+/// Field widths against the `_MASK` definitions in `dcn_3_1_4_sh_mask.h`.
+///
+/// `Registers` does not expose the widths, so this checks them through the
+/// behaviour they produce: for each field, the largest value it can hold and
+/// the smallest it cannot. A width that is too wide accepts a value the
+/// hardware will truncate; one that is too narrow refuses a mode DML accepts.
+fn dml_regs_field_widths_match_the_header_masks() -> TestResult {
+    use crate::amdgpu_dml_regs::*;
+    let config = config_1080p();
+    let geometry = config.geometry().unwrap();
+    let clocks = clocks();
+    let wm = config.watermarks(&memory(), &clocks).unwrap();
+    let prefetch = config.prefetch(&geometry, &clocks, &wm).unwrap();
+    let r = Registers::new(&config, &geometry, &clocks, &wm, &prefetch, 100_000).unwrap();
+
+    // The declared widths, against the `_MASK` definitions in
+    // `dcn_3_1_4_sh_mask.h`. Comparing widths directly rather than inferring
+    // them from produced values: a 1080p60 mode does not come near most of
+    // these boundaries, so a field that is too *wide* is invisible in its
+    // output and only shows up as silent truncation on some other mode.
+    for (mask, width) in [
+        (0x001F_FFFFu32, W_REF_FREQ_TO_PIX_FREQ),
+        (0x001F_FFFF, W_REFCYC_PER_HTOTAL),
+        (0x0000_1FFF, W_REFCYC_H_BLANK_END),
+        (0x0000_7FFF, W_DLG_VBLANK_END),
+        (0x0003_FFFF, W_MIN_DST_Y_NEXT_START),
+        (0x0000_1FFF, W_REFCYC_X_AFTER_SCALER),
+        (0x0000_0007, W_DST_Y_AFTER_SCALER),
+        (0x0000_00FF, W_DST_Y_PREFETCH),
+        (0x003F_FFFF, W_VRATIO_PREFETCH),
+        (0x0000_007F, W_DST_Y_PER_VM_VBLANK),
+        (0x0000_003F, W_DST_Y_PER_ROW_VBLANK),
+        (0x0001_FFFF, W_DST_Y_PER_PTE_ROW_NOM_L),
+        (0x007F_FFFF, W_REFCYC_PER_PTE_GROUP_NOM_L),
+        (0x007F_FFFF, W_REFCYC_PER_PTE_GROUP_VBLANK_L),
+        (0x0000_1FFF, W_REFCYC_PER_LINE_DELIVERY),
+        (0x00FF_FFFF, W_MIN_TTU_VBLANK),
+        (0x0000_3FFF, W_QOS_LEVEL_WM),
+        (0x007F_FFFF, W_REFCYC_PER_REQ_DELIVERY),
+    ] {
+        if mask.count_ones() != width || mask.trailing_ones() != width {
+            return TestResult::Fail("a field width disagrees with its header mask");
+        }
+    }
+
+    // Every encoded value must fit the field the header declares.    // `dst_y_per_row_vblank` is six bits while `dst_y_per_vm_vblank`, its
+    // neighbour in VBLANK_PARAMETERS_0, is seven. The two are not the same
+    // width, which is the mistake a shared literal invites.
+    if r.dlg.dst_y_per_row_vblank > 0x3F {
+        return TestResult::Fail("dst_y_per_row_vblank is six bits, not seven");
+    }
+
+    // The two fields that were too *narrow*: a 1080p60 mode must encode, and
+    // under a 13-bit limit `refcyc_per_pte_group_vblank_l` would not.
+    if r.dlg.refcyc_per_pte_group_vblank_l == 0 {
+        return TestResult::Fail("refcyc_per_pte_group_vblank_l should be non-zero here");
+    }
+    if r.ttu.refcyc_per_req_delivery_l == 0 {
+        return TestResult::Fail("refcyc_per_req_delivery_l should be non-zero here");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dml-regs",
+    dml_regs_field_widths_match_the_header_masks
+);

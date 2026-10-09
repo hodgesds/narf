@@ -3,25 +3,20 @@
 //! Modern AMD laptop iGPUs drive the panel backlight through a
 //! PWM block inside the DCN display window. The host programs:
 //!
-//! - **BL_PWM_PERIOD_CNTL** — PWM period (in 16-bit clock units).
-//!   1 kHz is the typical panel-friendly frequency; the period
-//!   register reads `(ref_clk_khz * 1000 / 1000) = ref_clk_khz`
-//!   units for that frequency.
-//! - **BL_PWM_CNTL** — PWM enable + grp1-source-select +
-//!   override-enable bits.
-//! - **BL_PWM_USER_LEVEL** — 16-bit duty-cycle target. 0 =
-//!   fully off (panel dark); 0xFFFF = fully on. Linear scale
-//!   per VESA EDID-DDC; the laptop's panel response is usually
-//!   gamma-corrected by the SMU's per-panel calibration table.
-//! - **BL_PWM_GRP1_REG_LOCK** — lock bit. The host clears this
-//!   bit before writing PERIOD/USER_LEVEL and re-asserts it so
-//!   the DCN treats the next vsync as a single atomic update.
+//! - **BL_PWM_PERIOD_CNTL** — a sixteen-bit period plus a four-bit
+//!   `BL_PWM_PERIOD_BITCNT` that scales it. VBIOS programs this;
+//!   the driver reads it back and scales the duty against it.
+//! - **BL_PWM_CNTL** — enable at bit 31, fractional enable at 30,
+//!   and the sixteen-bit active duty count at 15:0. The duty and
+//!   the enable share one register.
+//! - **BL_PWM_GRP1_REG_LOCK** — lock at bit 0, update-pending at 8,
+//!   master-lock bypass at 31. The host takes the lock, writes the
+//!   duty, releases it, then waits for update-pending to clear.
 //!
-//! Linux references (post 2026-05-20 GPL relicense — direct
-//! citation allowed):
+//! Linux references:
 //! - `drivers/gpu/drm/amd/display/dc/dce/dce_panel_cntl.c`
-//! - `drivers/gpu/drm/amd/display/dc/dcn31/dcn31_panel_cntl.c`
-//!   (Phoenix delta — same shape, different stride)
+//!   (`dce_panel_cntl_set_backlight_level`, `dce_panel_cntl_hw_init`)
+//! - Register ids and fields from `dcn_3_1_4_offset.h` / `_sh_mask.h`.
 
 extern crate alloc;
 
@@ -29,120 +24,192 @@ use alloc::vec::Vec;
 
 use crate::amdgpu_dcn::DcnWrite;
 
-// ── BL_PWM register offsets (relative to PANEL_CNTL block) ────────
+// ── BL_PWM registers (DCN 3.1.4) ─────────────────────────────────
 //
-// On DCN 2.0 (Renoir) the BL_PWM regs live in the DCE-derived
-// PANEL_CNTL block within the DCN MMIO window. Values from
-// `dce_panel_cntl.c`'s register tables.
+// Absolute dword ids from `dcn_3_1_4_offset.h`, BASE_IDX 2. The block is
+// `PWRSEQ`, one instance per panel, and the four registers are consecutive
+// dwords. `dce_panel_cntl.c` is the sequencer.
 
-/// `BL_PWM_PERIOD_CNTL` — PWM frequency setting.
-pub const BL_PWM_PERIOD_CNTL_REL: u32 = 0x4B6C;
-/// `BL_PWM_CNTL` — enable + grp1 source.
-pub const BL_PWM_CNTL_REL: u32 = 0x4B5C;
-/// `BL_PWM_USER_LEVEL` — 16-bit duty-cycle target.
-pub const BL_PWM_USER_LEVEL_REL: u32 = 0x4B64;
-/// `BL_PWM_GRP1_REG_LOCK` — atomic-update lock bit.
-pub const BL_PWM_GRP1_REG_LOCK_REL: u32 = 0x4B70;
+/// `regPWRSEQ0_BL_PWM_CNTL`. Holds **both** the enable and the duty cycle:
+/// `BL_ACTIVE_INT_FRAC_CNT` is the sixteen-bit active count, and
+/// `BL_PWM_EN` is bit 31.
+pub const BL_PWM_CNTL: u32 = 0x2f19;
+/// `regPWRSEQ0_BL_PWM_CNTL2`, the override controls.
+pub const BL_PWM_CNTL2: u32 = 0x2f1a;
+/// `regPWRSEQ0_BL_PWM_PERIOD_CNTL`.
+pub const BL_PWM_PERIOD_CNTL: u32 = 0x2f1b;
+/// `regPWRSEQ0_BL_PWM_GRP1_REG_LOCK`.
+pub const BL_PWM_GRP1_REG_LOCK: u32 = 0x2f1c;
+/// `regPWRSEQ1_BL_PWM_CNTL` is 0x2f85, so the per-panel stride is 0x6c.
+pub const PWRSEQ_STRIDE: u32 = 0x6c;
+/// DCN 3.1.4 has two power sequencers.
+pub const PWRSEQ_INSTANCES: u8 = 2;
 
-// ── Field encodings ────────────────────────────────────────────────
+/// LINUX-GAP: there is no `BL_PWM_USER_LEVEL` in this path. The duty cycle
+/// goes into `BL_PWM_CNTL.BL_ACTIVE_INT_FRAC_CNT`.
+/// `regABM0_BL1_PWM_USER_LEVEL` does exist, but it is 0x0e7b at **BASE_IDX 3**
+/// in the ABM (adaptive backlight management) block — a different engine, not
+/// a fifth register of this group. The old table placed a `USER_LEVEL` in the
+/// middle of this run and wrote the duty there.
+pub const ABM0_BL1_PWM_USER_LEVEL: u32 = 0x0e7b;
 
-/// `BL_PWM_CNTL` — enable the PWM output.
-pub const BL_PWM_CNTL_EN: u32 = 1 << 0;
-/// `BL_PWM_CNTL` — select group 1 as the PWM source (the path
-/// PERIOD_CNTL + USER_LEVEL feed).
-pub const BL_PWM_CNTL_GRP1_FRAC_BL_EN: u32 = 1 << 24;
-/// `BL_PWM_CNTL` — disable PWM source override (let group 1 drive
-/// the output without forcing 0/1 from the override path).
-pub const BL_PWM_CNTL_OVERRIDE_DISABLE: u32 = 0;
+/// The dword id of `reg` for power sequencer `instance`.
+pub const fn for_pwrseq(reg: u32, instance: u8) -> u32 {
+    reg + (instance as u32) * PWRSEQ_STRIDE
+}
 
-/// `BL_PWM_GRP1_REG_LOCK` — lock asserted; pending writes
-/// accumulate until clear.
-pub const BL_PWM_GRP1_LOCK: u32 = 1 << 31;
+// ── Field encodings (`dcn_3_1_4_sh_mask.h`) ───────────────────────
 
-/// Default PWM period in DCN ref-clock units for the canonical
-/// 200 Hz panel-friendly frequency on Renoir's 100 MHz ref clock:
-/// period = ref_clk_hz / target_hz = 100_000_000 / 200 = 500_000.
-/// Stays inside the 24-bit period field.
-pub const BL_PWM_PERIOD_200HZ_RENOIR: u32 = 500_000;
+/// `BL_PWM_CNTL.BL_ACTIVE_INT_FRAC_CNT`, bits 15:0 — the active duty count.
+pub const BL_ACTIVE_INT_FRAC_CNT_MASK: u32 = 0x0000_FFFF;
+/// `BL_PWM_CNTL.BL_PWM_FRACTIONAL_EN`, bit **30**.
+pub const BL_PWM_FRACTIONAL_EN: u32 = 1 << 30;
+/// `BL_PWM_CNTL.BL_PWM_EN`, bit **31**. Bit 0 is the low bit of the duty
+/// count, so the old `1 << 0` enable wrote a duty of one instead.
+pub const BL_PWM_EN: u32 = 1 << 31;
+
+/// `BL_PWM_PERIOD_CNTL.BL_PWM_PERIOD`, bits 15:0 — **sixteen** bits, not the
+/// twenty-four the old guard allowed.
+pub const BL_PWM_PERIOD_MASK: u32 = 0x0000_FFFF;
+/// `BL_PWM_PERIOD_CNTL.BL_PWM_PERIOD_BITCNT`, bits 19:16. Zero means sixteen
+/// (`dce_panel_cntl.c`: "if (pwm_period_bitcnt == 0) bit_count = 16").
+pub const BL_PWM_PERIOD_BITCNT_SHIFT: u32 = 16;
+pub const BL_PWM_PERIOD_BITCNT_MASK: u32 = 0x000F_0000;
+
+/// `BL_PWM_GRP1_REG_LOCK.BL_PWM_GRP1_REG_LOCK`, bit **0** — the lock itself.
+pub const BL_PWM_GRP1_REG_LOCK_BIT: u32 = 1 << 0;
+/// `..._REG_UPDATE_PENDING`, bit 8: read-only, polled after unlock.
+pub const BL_PWM_GRP1_REG_UPDATE_PENDING: u32 = 1 << 8;
+/// `..._UPDATE_AT_FRAME_START`, bit 16.
+pub const BL_PWM_GRP1_UPDATE_AT_FRAME_START: u32 = 1 << 16;
+/// `..._IGNORE_MASTER_LOCK_EN`, bit **31**. The old `BL_PWM_GRP1_LOCK` was
+/// this bit, so "lock" set the master-lock bypass and never took the lock.
+pub const BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN: u32 = 1 << 31;
+
+/// A PWM period for roughly 200 Hz off a 100 MHz reference needs
+/// 100_000_000 / 200 = 500_000 counts, which does **not** fit the sixteen-bit
+/// field — the old `BL_PWM_PERIOD_200HZ_RENOIR` was eight times over, and the
+/// guard let it through by checking twenty-four bits.
+///
+/// The hardware reaches low frequencies through `BL_PWM_PERIOD_BITCNT`
+/// instead: the duty is shifted right by the bit count, so the period is
+/// expressed in `2^bitcnt` units. Linux never computes a period at all — it
+/// reads back whatever VBIOS programmed and scales the duty against it, which
+/// is what [`active_duty_count`] now does.
+pub const BL_PWM_PERIOD_MAX: u32 = BL_PWM_PERIOD_MASK;
 
 // ── Errors ──────────────────────────────────────────────────────────
 
 /// Errors building a backlight programming sequence.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BacklightError {
-    /// PWM period would exceed the 24-bit field.
+    /// PWM period would exceed the sixteen-bit field.
     PeriodOverflow,
+    /// Power-sequencer instance beyond the two DCN 3.1.4 has.
+    BadInstance,
 }
 
 // ── Sequence builders ──────────────────────────────────────────────
 
-/// Convert a percentage (0–100) to a 16-bit BL_PWM_USER_LEVEL.
-/// Saturating: >100 clamps to 0xFFFF; 0 → 0 (panel dark, but most
-/// panels won't fully extinguish — the SMU's brightness-floor
-/// calibration table sits between).
+/// Convert a percentage (0–100) to the 16.16 fixed-point brightness Linux
+/// passes as `backlight_pwm_u16_16`. Saturating: >100 clamps to full on.
 pub fn user_level_for_percent(pct: u8) -> u16 {
     let p = pct.min(100) as u32;
     ((p * 0xFFFF) / 100) as u16
 }
 
-/// Build the one-shot PWM init sequence: lock → program period
-/// + cntl + initial duty → unlock. Caller writes it via DCN's
-///   `execute_modeset` (the same MMIO writer the modeset uses).
+/// `dce_panel_cntl_set_backlight_level`'s duty-cycle arithmetic.
+///
+/// The register does not take a brightness: it takes an active count scaled
+/// against the period VBIOS programmed. `period_cntl` is the raw
+/// `BL_PWM_PERIOD_CNTL` read back.
+///
+///   bit_count       = BITCNT, or 16 when BITCNT is zero
+///   masked_period   = PERIOD & ((1 << bit_count) - 1)
+///   active          = brightness * masked_period
+///   count           = ((active >> bit_count) & 0xFFFF)
+///                     + ((active >> (bit_count - 1)) & 1)
+///
+/// The trailing term is the rounding bit taken from the MSB of the discarded
+/// fraction. Writing the brightness straight into the register, as this
+/// module used to, ignores the period entirely and lands at full scale for
+/// any period below 0x10000.
+pub fn active_duty_count(brightness_u16: u16, period_cntl: u32) -> u32 {
+    let bitcnt = (period_cntl & BL_PWM_PERIOD_BITCNT_MASK) >> BL_PWM_PERIOD_BITCNT_SHIFT;
+    let bit_count = if bitcnt == 0 { 16 } else { bitcnt };
+    let period = period_cntl & BL_PWM_PERIOD_MASK;
+    let masked_period = if bit_count >= 32 {
+        period
+    } else {
+        period & ((1u32 << bit_count) - 1)
+    };
+    let active = brightness_u16 as u64 * masked_period as u64;
+    let count = ((active >> bit_count) as u32) & BL_ACTIVE_INT_FRAC_CNT_MASK;
+    count + ((active >> (bit_count - 1)) as u32 & 1)
+}
+
+/// Build the one-shot PWM init sequence for `instance`: program the period,
+/// then enable the PWM.
+///
+/// LINUX-GAP: `dce_panel_cntl_hw_init` also drives `BL_PWM_CNTL2`'s override
+/// bits and the panel power sequencer's own enables, and it does not program
+/// a period — VBIOS owns that. This keeps the period parameter for callers
+/// that genuinely need to set one, but bounds it to the real field.
 pub fn build_backlight_init(
-    panel_cntl_base: u32,
+    instance: u8,
     period_units: u32,
-    initial_user_level: u16,
+    initial_brightness: u16,
 ) -> Result<Vec<DcnWrite>, BacklightError> {
-    if period_units & !0x00FF_FFFF != 0 {
+    if instance >= PWRSEQ_INSTANCES {
+        return Err(BacklightError::BadInstance);
+    }
+    if period_units & !BL_PWM_PERIOD_MASK != 0 {
         return Err(BacklightError::PeriodOverflow);
     }
+    let period_cntl = period_units;
     let writes = alloc::vec![
-        // Lock — pending writes won't take effect until unlock.
+        // Period first: the duty count is computed against it.
         DcnWrite {
-            addr: panel_cntl_base + BL_PWM_GRP1_REG_LOCK_REL,
-            value: BL_PWM_GRP1_LOCK,
+            addr: for_pwrseq(BL_PWM_PERIOD_CNTL, instance),
+            value: period_cntl,
         },
-        // Program period (sets PWM frequency).
+        // Enable, carrying the initial duty in the same register.
         DcnWrite {
-            addr: panel_cntl_base + BL_PWM_PERIOD_CNTL_REL,
-            value: period_units,
-        },
-        // Enable PWM with grp1 source, no override.
-        DcnWrite {
-            addr: panel_cntl_base + BL_PWM_CNTL_REL,
-            value: BL_PWM_CNTL_EN | BL_PWM_CNTL_GRP1_FRAC_BL_EN,
-        },
-        // Initial duty cycle.
-        DcnWrite {
-            addr: panel_cntl_base + BL_PWM_USER_LEVEL_REL,
-            value: initial_user_level as u32,
-        },
-        // Unlock — DCN latches the new period + duty on next vsync.
-        DcnWrite {
-            addr: panel_cntl_base + BL_PWM_GRP1_REG_LOCK_REL,
-            value: 0,
+            addr: for_pwrseq(BL_PWM_CNTL, instance),
+            value: BL_PWM_EN | active_duty_count(initial_brightness, period_cntl),
         },
     ];
     Ok(writes)
 }
 
-/// Build the hot-path "set brightness" sequence used after init:
-/// just lock → write USER_LEVEL → unlock. Programs the next vsync.
-pub fn build_set_user_level(panel_cntl_base: u32, user_level: u16) -> Vec<DcnWrite> {
-    alloc::vec![
+/// Build the hot-path brightness update, as
+/// `dce_panel_cntl_set_backlight_level` sequences it: take the group lock
+/// *with* the master-lock bypass, write the duty into `BL_PWM_CNTL`, release
+/// the lock. The caller then polls `BL_PWM_GRP1_REG_UPDATE_PENDING` for zero.
+///
+/// `period_cntl` is the value read back from `BL_PWM_PERIOD_CNTL`.
+pub fn build_set_user_level(
+    instance: u8,
+    brightness: u16,
+    period_cntl: u32,
+) -> Result<Vec<DcnWrite>, BacklightError> {
+    if instance >= PWRSEQ_INSTANCES {
+        return Err(BacklightError::BadInstance);
+    }
+    Ok(alloc::vec![
         DcnWrite {
-            addr: panel_cntl_base + BL_PWM_GRP1_REG_LOCK_REL,
-            value: BL_PWM_GRP1_LOCK,
+            addr: for_pwrseq(BL_PWM_GRP1_REG_LOCK, instance),
+            value: BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN | BL_PWM_GRP1_REG_LOCK_BIT,
         },
         DcnWrite {
-            addr: panel_cntl_base + BL_PWM_USER_LEVEL_REL,
-            value: user_level as u32,
+            addr: for_pwrseq(BL_PWM_CNTL, instance),
+            value: BL_PWM_EN | active_duty_count(brightness, period_cntl),
         },
         DcnWrite {
-            addr: panel_cntl_base + BL_PWM_GRP1_REG_LOCK_REL,
-            value: 0,
+            addr: for_pwrseq(BL_PWM_GRP1_REG_LOCK, instance),
+            value: BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN,
         },
-    ]
+    ])
 }
 
 // ── eDP T1..T8 power sequence ─────────────────────────────────────
@@ -351,31 +418,6 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_user_level_pct_round_trip);
-
-    fn smoke_backlight_init_sequence() -> TestResult {
-        let writes = build_backlight_init(0x10000, 500_000, 0x8000).expect("init");
-        if writes.len() != 5 {
-            return TestResult::Fail("expected 5 writes");
-        }
-        // First + last are the lock + unlock around the body.
-        if writes[0].addr != 0x10000 + BL_PWM_GRP1_REG_LOCK_REL || writes[0].value == 0 {
-            return TestResult::Fail("first write not lock-on");
-        }
-        if writes[4].addr != 0x10000 + BL_PWM_GRP1_REG_LOCK_REL || writes[4].value != 0 {
-            return TestResult::Fail("last write not lock-off");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!("drivers/gpu", smoke_backlight_init_sequence);
-
-    fn smoke_backlight_init_rejects_period_overflow() -> TestResult {
-        let r = build_backlight_init(0x10000, 0x0100_0000, 0);
-        if r != Err(BacklightError::PeriodOverflow) {
-            return TestResult::Fail("overflow not rejected");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!("drivers/gpu", smoke_backlight_init_rejects_period_overflow);
 
     /// Mock eDP HW that records GPIO + PWM + delay calls.
     struct MockEdpHw {

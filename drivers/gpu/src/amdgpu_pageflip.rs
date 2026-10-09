@@ -10,13 +10,16 @@
 //!
 //! - Linux `drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hubp.c`
 //!   (`hubp2_program_surface_flip_and_addr`)
-//! - Linux `drivers/gpu/drm/amd/display/dc/dcn35/dcn35_hubp.c`
-//!   (`hubp35_program_surface_flip_and_addr` — same shape, DCN35
-//!   register-bus offsets)
+//! - Register ids are `dcn_3_1_4_offset.h`/`_sh_mask.h`. Phoenix is
+//!   DCN 3.1.4, so dcn35's offsets do not apply.
 //! - Linux `drivers/gpu/drm/amd/display/amdgpu_dm.c::amdgpu_dm_commit_planes`
 //!   — atomic-commit entry the KMS surface calls into.
-//! - Linux `drivers/gpu/drm/amd/display/dc/dcn20/dcn20_dpp.c` —
-//!   cursor planes live in DPP, not HUBP.
+//! - Linux `drivers/gpu/drm/amd/display/dc/hubp/dcn20/dcn20_hubp.c`
+//!   (`hubp2_cursor_set_attributes`, `hubp2_cursor_set_position`) —
+//!   the cursor's address, size, position and control are HUBP
+//!   registers, in the `CURSOR0_n` block beside the surface
+//!   addresses. Only its colour keying
+//!   (`CNVC_CUR0_CURSOR0_CONTROL`) is in DPP.
 //!
 //! GPL-2.0-or-later; structural patterns adapted directly.
 //!
@@ -25,8 +28,8 @@
 //! - **Primary plane flip** — atomic surface update producing a
 //!   `(addr_lo, addr_hi)` write pair the driver writes to BAR5
 //!   at the right register-bus offsets.
-//! - **Cursor plane** — DCN's cursor sits in DPP (per-pipe) and
-//!   carries position + size + a small format enum.
+//! - **Cursor plane** — per-pipe, in HUBP's `CURSOR0_n` block,
+//!   carrying address, size, position and a packed control word.
 //! - **Flip queue** — a per-CRTC ring of pending flips; the
 //!   FLIP_DONE IRQ retires the head. Triple-buffering is
 //!   represented by a queue length of 3.
@@ -39,38 +42,89 @@ use alloc::vec::Vec;
 
 use crate::amdgpu_dcn::DcnWrite;
 
-// ── HUBP / DPP register offsets ──────────────────────────────────
+// ── HUBP register dword ids (DCN 3.1.4) ──────────────────────────
 //
-// HUBP_PRIMARY_SURFACE_ADDRESS lives at offset 0x00A4 from
-// the per-pipe HUBP base (DCN1+; identical through DCN35 with
-// only the *base* shifted per IP version).
+// Absolute dword ids from `dcn_3_1_4_offset.h`, the way the headers express
+// them and the way the live DCN modules address them, with the per-pipe
+// stride applied here.
 //
-// DPP cursor offsets in DCN2 / DCN3 (per public reference):
-//   CURSOR_CONTROL       — bits[0] = enable, bits[3:1] = format
-//   CURSOR_POSITION      — packed (Y << 16) | X
-//   CURSOR_SIZE          — packed (H << 16) | W
-//   CURSOR_SURFACE_ADDR  — low 32 bits of cursor's surface phys
-//   CURSOR_SURFACE_ADDR_HI — high 32 bits
+// LINUX-GAP: `DcnWrite::addr` carries a block-relative *byte* offset
+// everywhere else in `amdgpu_dcn`, against per-block base constants that
+// match no header dword id. The writes built here are absolute dword ids
+// instead, because that is what can be checked against the header. The two
+// conventions are reconciled when `amdgpu_dcn`'s addressing is restructured.
 
-/// HUBP primary surface address (low) — relative to HUBP base.
-pub const HUBP_PRIMARY_SURFACE_ADDRESS_REL: u32 = 0x00A4;
-/// HUBP primary surface address (high) — relative to HUBP base.
-pub const HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL: u32 = 0x00A0;
-/// DPP cursor control — bit 0 enable.
-pub const DPP_CURSOR_CONTROL_REL: u32 = 0x00B0;
-/// DPP cursor position — `(Y << 16) | X`.
-pub const DPP_CURSOR_POSITION_REL: u32 = 0x00B4;
-/// DPP cursor size — `(H << 16) | W`. Caps at 256x256 in DCN.
-pub const DPP_CURSOR_SIZE_REL: u32 = 0x00B8;
-/// DPP cursor surface address (low).
-pub const DPP_CURSOR_SURFACE_ADDR_REL: u32 = 0x00BC;
-/// DPP cursor surface address (high).
-pub const DPP_CURSOR_SURFACE_ADDR_HI_REL: u32 = 0x00C0;
+/// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS` and `_HIGH`, BASE_IDX 2. Low
+/// is **below** high, as it is for every HUBP address pair.
+pub const DCSURF_PRIMARY_SURFACE_ADDRESS: u32 = 0x060a;
+pub const DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH: u32 = 0x060b;
 
-/// Cursor enable bit.
-pub const DPP_CURSOR_ENABLE: u32 = 1 << 0;
-/// Cursor format: ARGB8888 (the only format we care about).
-pub const DPP_CURSOR_FORMAT_ARGB8888: u32 = 0x4 << 1;
+/// The cursor is **not** in DPP. `CURSOR_CONTROL`, the surface address pair,
+/// `CURSOR_SIZE` and `CURSOR_POSITION` are the `CURSOR0_n` block alongside
+/// HUBP, which is why `dcn20_hubp.c` programs them. Only the cursor's colour
+/// keying (`CNVC_CUR0_CURSOR0_CONTROL`, 0x0cf1) lives in DPP, and this does
+/// not touch it.
+///
+/// Their order is CONTROL, ADDRESS, ADDRESS_HIGH, SIZE, POSITION — the
+/// address pair sits between the control and the geometry, not after it.
+pub const CURSOR_CONTROL: u32 = 0x0678;
+pub const CURSOR_SURFACE_ADDRESS: u32 = 0x0679;
+pub const CURSOR_SURFACE_ADDRESS_HIGH: u32 = 0x067a;
+pub const CURSOR_SIZE: u32 = 0x067b;
+pub const CURSOR_POSITION: u32 = 0x067c;
+
+/// Pipe stride, 0xDC dwords: `regHUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS` is
+/// 0x06e6 and `regCURSOR0_1_CURSOR_CONTROL` is 0x0754, both 0xDC above pipe
+/// zero's.
+pub const HUBP_PIPE_STRIDE: u32 = 0xDC;
+/// DCN 3.1.4 has four HUBPs (`dcn314_resource.c`).
+pub const HUBP_PIPES: u8 = 4;
+
+// `CURSOR_CONTROL` fields (`dcn_3_1_4_sh_mask.h`).
+pub const CURSOR_ENABLE: u32 = 1 << 0;
+pub const CURSOR_2X_MAGNIFY: u32 = 1 << 4;
+/// `CURSOR_MODE` is three bits at **8** (mask 0x700), not three bits at 1.
+pub const CURSOR_MODE_SHIFT: u32 = 8;
+pub const CURSOR_MODE_MASK: u32 = 0x0000_0700;
+/// `enum dc_cursor_color_format`: MONO 0, COLOR_1BIT_AND 1,
+/// COLOR_PRE_MULTIPLIED_ALPHA 2 — the mode an ARGB8888 cursor uses.
+pub const CURSOR_MODE_COLOR_PRE_MULTIPLIED_ALPHA: u32 = 2;
+/// `CURSOR_PITCH` is two bits at 16, and the encoding is not the pitch:
+/// `enum cursor_pitch` is 0 for 64 pixels, 1 for 128, 2 for 256
+/// (`hubp1_get_cursor_pitch`).
+pub const CURSOR_PITCH_SHIFT: u32 = 16;
+pub const CURSOR_PITCH_64_PIXELS: u32 = 0;
+pub const CURSOR_PITCH_128_PIXELS: u32 = 1;
+pub const CURSOR_PITCH_256_PIXELS: u32 = 2;
+/// `CURSOR_LINES_PER_CHUNK`, bits 27:24.
+///
+/// LINUX-GAP: `hubp2_cursor_set_attributes` also programs this, from a
+/// width-and-format table, and writes `CURSOR_SETTINGS` (0x065c) with the
+/// cursor's HDL schedule. Neither is written here, so the cursor fetch is
+/// left at whatever the firmware set.
+pub const CURSOR_LINES_PER_CHUNK_SHIFT: u32 = 24;
+
+/// `CURSOR_SIZE`: width is bits 24:16 (mask `0x01FF0000`), height bits 8:0 —
+/// **width high, height low**. Nine bits each, so 256 fits and 512 does not.
+pub const CURSOR_WIDTH_SHIFT: u32 = 16;
+/// `CURSOR_POSITION`: X is bits 29:16 (mask `0x3FFF0000`), Y bits 13:0 —
+/// **X high, Y low**.
+pub const CURSOR_X_POSITION_SHIFT: u32 = 16;
+
+/// The dword id of `reg` for `pipe`.
+pub const fn for_pipe(reg: u32, pipe: u8) -> u32 {
+    reg + (pipe as u32) * HUBP_PIPE_STRIDE
+}
+
+/// `hubp1_get_cursor_pitch`: the field holds an encoding, and an unrecognised
+/// pitch falls back to the 64-pixel encoding rather than being passed through.
+pub const fn cursor_pitch_encoding(width: u16) -> u32 {
+    match width {
+        128 => CURSOR_PITCH_128_PIXELS,
+        256 => CURSOR_PITCH_256_PIXELS,
+        _ => CURSOR_PITCH_64_PIXELS,
+    }
+}
 
 // ── Pixel format ─────────────────────────────────────────────────
 
@@ -141,18 +195,23 @@ pub enum FlipError {
     SpuriousFlipDone,
 }
 
-/// Build the MMIO writes that retire `req` on the next vsync of
-/// `hubp_base`'s pipe.
+/// Build the MMIO writes that retire `req` on the next vsync of `pipe`.
 ///
 /// Two-write sequence:
-///   1. `HUBP_PRIMARY_SURFACE_ADDRESS_HIGH = phys[63:32]`
-///   2. `HUBP_PRIMARY_SURFACE_ADDRESS      = phys[31:0]`
+///   1. `DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH = phys[63:32]`
+///   2. `DCSURF_PRIMARY_SURFACE_ADDRESS      = phys[31:0]`
 ///
-/// Order matters: writing HIGH first then LOW arms the
-/// double-buffer with the full 64-bit address; the latch
-/// happens when the LOW write retires. The next OTG vsync
-/// flips the pipe.
-pub fn build_flip(hubp_base: u32, req: &PageFlipRequest) -> Result<PageFlipWrites, FlipError> {
+/// Order matters: writing HIGH first then LOW arms the double-buffer with the
+/// full 64-bit address; the latch happens when the LOW write retires, which
+/// is why the low half is the register that sits lower in the map and is
+/// written last. The next OTG vsync flips the pipe.
+///
+/// `DcnWrite::addr` is an absolute dword id here, not a block-relative byte
+/// offset — see the register block above.
+pub fn build_flip(pipe: u8, req: &PageFlipRequest) -> Result<PageFlipWrites, FlipError> {
+    if pipe >= HUBP_PIPES {
+        return Err(FlipError::BadSurface);
+    }
     if !req.format.validate_stride(req.stride_bytes) {
         return Err(FlipError::BadStride);
     }
@@ -161,11 +220,11 @@ pub fn build_flip(hubp_base: u32, req: &PageFlipRequest) -> Result<PageFlipWrite
     }
     let writes = alloc::vec![
         DcnWrite {
-            addr: hubp_base + HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL,
+            addr: for_pipe(DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH, pipe),
             value: (req.surface_phys >> 32) as u32,
         },
         DcnWrite {
-            addr: hubp_base + HUBP_PRIMARY_SURFACE_ADDRESS_REL,
+            addr: for_pipe(DCSURF_PRIMARY_SURFACE_ADDRESS, pipe),
             value: req.surface_phys as u32,
         },
     ];
@@ -323,39 +382,43 @@ impl CursorState {
     }
 }
 
-/// Build the cursor-program writes for `dpp_base`'s pipe.
-pub fn build_cursor(dpp_base: u32, st: &CursorState) -> Result<Vec<DcnWrite>, FlipError> {
-    if !st.validate() {
+/// Build the cursor-program writes for `pipe`, in `hubp2_cursor_set_attributes`
+/// order: address high, address, size, then control.
+pub fn build_cursor(pipe: u8, st: &CursorState) -> Result<Vec<DcnWrite>, FlipError> {
+    if pipe >= HUBP_PIPES || !st.validate() {
         return Err(FlipError::BadSurface);
     }
     let mut writes = Vec::with_capacity(5);
     if st.enabled {
-        // Surface address (HI / LO) first — register order matches
-        // DCN's per-pipe cursor latch.
         writes.push(DcnWrite {
-            addr: dpp_base + DPP_CURSOR_SURFACE_ADDR_HI_REL,
+            addr: for_pipe(CURSOR_SURFACE_ADDRESS_HIGH, pipe),
             value: (st.surface_phys >> 32) as u32,
         });
         writes.push(DcnWrite {
-            addr: dpp_base + DPP_CURSOR_SURFACE_ADDR_REL,
+            addr: for_pipe(CURSOR_SURFACE_ADDRESS, pipe),
             value: st.surface_phys as u32,
         });
+        // Width occupies the high half and height the low half, not the
+        // other way round.
         writes.push(DcnWrite {
-            addr: dpp_base + DPP_CURSOR_SIZE_REL,
-            value: ((st.height as u32) << 16) | (st.width as u32),
+            addr: for_pipe(CURSOR_SIZE, pipe),
+            value: ((st.width as u32) << CURSOR_WIDTH_SHIFT) | (st.height as u32),
+        });
+        // Likewise X high, Y low.
+        writes.push(DcnWrite {
+            addr: for_pipe(CURSOR_POSITION, pipe),
+            value: ((st.x as u16 as u32) << CURSOR_X_POSITION_SHIFT) | (st.y as u16 as u32),
         });
         writes.push(DcnWrite {
-            addr: dpp_base + DPP_CURSOR_POSITION_REL,
-            value: ((st.y as u16 as u32) << 16) | (st.x as u16 as u32),
-        });
-        writes.push(DcnWrite {
-            addr: dpp_base + DPP_CURSOR_CONTROL_REL,
-            value: DPP_CURSOR_ENABLE | DPP_CURSOR_FORMAT_ARGB8888,
+            addr: for_pipe(CURSOR_CONTROL, pipe),
+            value: CURSOR_ENABLE
+                | (CURSOR_MODE_COLOR_PRE_MULTIPLIED_ALPHA << CURSOR_MODE_SHIFT)
+                | (cursor_pitch_encoding(st.width) << CURSOR_PITCH_SHIFT),
         });
     } else {
-        // Disabling — only flip the control bit. Position survives.
+        // Disabling — only clear the enable bit. Position survives.
         writes.push(DcnWrite {
-            addr: dpp_base + DPP_CURSOR_CONTROL_REL,
+            addr: for_pipe(CURSOR_CONTROL, pipe),
             value: 0,
         });
     }
@@ -376,19 +439,22 @@ mod smoke_tests {
             stride_bytes: 1920 * 4,
             generation: 42,
         };
-        let r = build_flip(0x4000, &req).expect("build_flip");
+        // Pipe 2, so the stride is exercised rather than cancelling out.
+        let r = build_flip(2, &req).expect("build_flip");
         if r.writes.len() != 2 {
             return TestResult::Fail("flip should emit 2 writes");
         }
-        // HIGH first, LOW second — the latch fires on LOW.
-        if r.writes[0].addr != 0x4000 + HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL {
-            return TestResult::Fail("first write should be HIGH");
+        // HIGH first, LOW second — the latch fires on LOW. Dword ids from
+        // `dcn_3_1_4_offset.h`: pipe 0 is 0x060a/0x060b, pipe 2 is 0xDC * 2
+        // above, which the header spells regHUBPREQ2_… 0x07c2/0x07c3.
+        if r.writes[0].addr != 0x07c3 {
+            return TestResult::Fail("first write should be the HIGH half, at 0x07c3");
         }
         if r.writes[0].value != 1 {
             return TestResult::Fail("HIGH value wrong");
         }
-        if r.writes[1].addr != 0x4000 + HUBP_PRIMARY_SURFACE_ADDRESS_REL {
-            return TestResult::Fail("second write should be LOW");
+        if r.writes[1].addr != 0x07c2 {
+            return TestResult::Fail("second write should be LOW, the register below HIGH");
         }
         if r.writes[1].value != 0x0000_0100 {
             return TestResult::Fail("LOW value wrong");
@@ -504,43 +570,57 @@ mod smoke_tests {
             height: 64,
             surface_phys: 0x1_0000_2000,
         };
-        let w = build_cursor(0x6000, &st).expect("build_cursor enabled");
+        // A 48-pixel-tall cursor so width and height are distinguishable.
+        let st = CursorState { height: 48, ..st };
+        let w = build_cursor(1, &st).expect("build_cursor enabled");
         if w.len() != 5 {
             return TestResult::Fail("enabled cursor should emit 5 writes");
         }
-        // Last write is CONTROL — enable + format.
-        let last = w.last().unwrap();
-        if last.addr != 0x6000 + DPP_CURSOR_CONTROL_REL {
-            return TestResult::Fail("last write should be CONTROL");
+        // Dword ids from `dcn_3_1_4_offset.h`, pipe 1 = pipe 0 + 0xDC:
+        // CONTROL 0x0754, ADDRESS 0x0755, ADDRESS_HIGH 0x0756, SIZE 0x0757,
+        // POSITION 0x0758. The address pair sits between control and
+        // geometry; these are HUBP registers, not DPP.
+        if w[0].addr != 0x0756 || w[1].addr != 0x0755 {
+            return TestResult::Fail("cursor address pair is 0x0755/0x0756 on pipe 1");
         }
-        if last.value & DPP_CURSOR_ENABLE == 0 {
+        let last = w.last().unwrap();
+        if last.addr != 0x0754 {
+            return TestResult::Fail("last write should be CURSOR_CONTROL at 0x0754");
+        }
+        if last.value & 1 == 0 {
             return TestResult::Fail("CONTROL missing enable bit");
         }
-        if last.value & DPP_CURSOR_FORMAT_ARGB8888 == 0 {
-            return TestResult::Fail("CONTROL missing format");
+        // CURSOR_MODE is three bits at 8, and premultiplied-alpha ARGB is 2.
+        if last.value & 0x0000_0700 != 2 << 8 {
+            return TestResult::Fail("CURSOR_MODE is bits 10:8, value 2 for premultiplied ARGB");
         }
-        // POSITION encodes (Y << 16) | X.
-        let pos = w
-            .iter()
-            .find(|w| w.addr == 0x6000 + DPP_CURSOR_POSITION_REL)
-            .unwrap();
-        if pos.value != (200 << 16) | 100 {
-            return TestResult::Fail("position encoding wrong");
+        // CURSOR_PITCH is two bits at 16, and 64 pixels encodes as zero.
+        if last.value & 0x0003_0000 != 0 {
+            return TestResult::Fail("a 64-pixel-wide cursor encodes pitch zero");
         }
-        // SIZE encodes (H << 16) | W.
-        let sz = w
-            .iter()
-            .find(|w| w.addr == 0x6000 + DPP_CURSOR_SIZE_REL)
-            .unwrap();
-        if sz.value != (64 << 16) | 64 {
-            return TestResult::Fail("size encoding wrong");
+        // POSITION packs X high, Y low.
+        let pos = w.iter().find(|w| w.addr == 0x0758).unwrap();
+        if pos.value != (100 << 16) | 200 {
+            return TestResult::Fail("CURSOR_POSITION is X at 16 and Y at 0");
+        }
+        // SIZE packs width high, height low.
+        let sz = w.iter().find(|w| w.addr == 0x0757).unwrap();
+        if sz.value != (64 << 16) | 48 {
+            return TestResult::Fail("CURSOR_SIZE is width at 16 and height at 0");
+        }
+        // A 256-wide cursor takes the 256-pixel pitch encoding, which is 2 —
+        // the field holds an encoding, not the pitch.
+        let wide = CursorState { width: 256, ..st };
+        let w2 = build_cursor(1, &wide).expect("build_cursor wide");
+        if w2.last().unwrap().value & 0x0003_0000 != 2 << 16 {
+            return TestResult::Fail("a 256-pixel-wide cursor encodes pitch two");
         }
         // Disabled cursor → only CONTROL = 0.
         let disabled = CursorState {
             enabled: false,
             ..st
         };
-        let w = build_cursor(0x6000, &disabled).expect("build_cursor disabled");
+        let w = build_cursor(1, &disabled).expect("build_cursor disabled");
         if w.len() != 1 {
             return TestResult::Fail("disabled should emit only 1 write");
         }
@@ -549,10 +629,48 @@ mod smoke_tests {
         }
         // Validate gates oversized cursors.
         let oversized = CursorState { width: 512, ..st };
-        if build_cursor(0x6000, &oversized) != Err(FlipError::BadSurface) {
+        if build_cursor(1, &oversized) != Err(FlipError::BadSurface) {
             return TestResult::Fail("oversized cursor not rejected");
         }
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_cursor_build_writes_and_disable);
+
+    /// The per-pipe stride and the register ids, as `dcn_3_1_4_offset.h`
+    /// spells them for each of the four pipes.
+    fn smoke_pageflip_pipe_stride_matches_header() -> TestResult {
+        // regHUBPREQ{0..3}_DCSURF_PRIMARY_SURFACE_ADDRESS.
+        let surface = [0x060a, 0x06e6, 0x07c2, 0x089e];
+        // regCURSOR0_{0..3}_CURSOR_CONTROL.
+        let cursor = [0x0678, 0x0754, 0x0830, 0x090c];
+        for pipe in 0..HUBP_PIPES {
+            if for_pipe(DCSURF_PRIMARY_SURFACE_ADDRESS, pipe) != surface[pipe as usize] {
+                return TestResult::Fail("HUBPREQ surface address stride");
+            }
+            if for_pipe(CURSOR_CONTROL, pipe) != cursor[pipe as usize] {
+                return TestResult::Fail("CURSOR0 control stride");
+            }
+        }
+        // The cursor block sits above the surface addresses in the same
+        // per-pipe window, which is why one stride serves both.
+        if HUBP_PIPE_STRIDE != 0xDC {
+            return TestResult::Fail("the per-pipe stride is 0xDC dwords");
+        }
+        // A pipe beyond the four DCN314 has is refused rather than
+        // addressing the next block along.
+        let req = PageFlipRequest {
+            surface_phys: 0x1000,
+            format: PixelFormat::Xrgb8888,
+            stride_bytes: 1024,
+            generation: 0,
+        };
+        if build_flip(HUBP_PIPES, &req).is_ok() {
+            return TestResult::Fail("out-of-range pipe accepted");
+        }
+        if build_cursor(HUBP_PIPES, &CursorState::default()).is_ok() {
+            return TestResult::Fail("out-of-range cursor pipe accepted");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_pageflip_pipe_stride_matches_header);
 }

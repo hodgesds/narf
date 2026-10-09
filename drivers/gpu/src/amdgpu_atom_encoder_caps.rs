@@ -1,6 +1,8 @@
 //! ATOM encoder capability table walker — clean-room.
 //!
-//! Reference: AMD `AtomBios.h` (MIT-licensed structure shape).
+//! Reference: `atomfirmware.h` — `enum atom_object_record_type_id`,
+//! `struct atom_common_record_header`, `struct atom_encoder_caps_record`,
+//! `enum atom_encoder_caps_def`.
 //! The encoder-caps record (`ATOM_ENCODER_CAP_RECORD`) describes
 //! what each encoder block supports — max DP link rate, max
 //! HBR2/HBR3 lanes, eDP backlight control, output color bit
@@ -17,11 +19,9 @@
 //! +0x02   payload                         (size - 2 bytes)
 //! ```
 //!
-//! Record types (ATOM_OBJECT_RECORD_TYPE_*) we care about:
-//!   - 0x06 = `ATOM_ENCODER_CAP_RECORD` (the one this walker decodes)
-//!   - 0x09 = `ATOM_DP_CONN_CHANNEL_MAPPING_RECORD`
-//!   - others (HPD ID, I2C ID, …) are documented but not yet
-//!     consumed.
+//! Record types are `enum atom_object_record_type_id`; see
+//! [`ATOM_ENCODER_CAP_RECORD_TYPE`] and its neighbours. The one this walker
+//! decodes is 20.
 //!
 //! ## Stage-9 scope
 //!
@@ -35,43 +35,98 @@ use core::fmt;
 pub enum EncoderCapError {
     Truncated,
     UnknownRecordType(u8),
-    /// `ucRecordSize` < 2 — record header itself is 2 bytes.
+    /// `record_size` < 2 — the record header itself is 2 bytes.
     BadRecordSize,
 }
 
-/// Discriminator for a record TLV.
-pub const ATOM_RECORD_TYPE_HPD_INT_ID: u8 = 0x01;
-pub const ATOM_RECORD_TYPE_I2C_ID: u8 = 0x02;
-pub const ATOM_RECORD_TYPE_CONNECTOR_DEVICE: u8 = 0x05;
-pub const ATOM_RECORD_TYPE_ENCODER_CAP: u8 = 0x06;
-pub const ATOM_RECORD_TYPE_DP_CONN_CHANNEL_MAP: u8 = 0x09;
-pub const ATOM_RECORD_TYPE_END: u8 = 0xFF;
+/// `enum atom_object_record_type_id` (`atomfirmware.h`).
+///
+/// LINUX-GAP: the set that stood here was `HPD_INT_ID = 0x01`, `I2C_ID = 0x02`,
+/// `CONNECTOR_DEVICE = 0x05`, `ENCODER_CAP = 0x06`,
+/// `DP_CONN_CHANNEL_MAP = 0x09`, cited as `ATOM_OBJECT_RECORD_TYPE_*` from
+/// `AtomBios.h`. Against the real enum:
+///
+///   * I²C and HPD were **swapped** — I²C is 1 and HPD-int is 2.
+///   * `ENCODER_CAP` is **20**, not 6. 6 is not a record type at all, so a
+///     walk looking for encoder caps never matched and
+///     [`find_encoder_caps`] always returned `None`.
+///   * There is no `CONNECTOR_DEVICE` record; 3 is `CONNECTOR_CAP` and 4 is
+///     `CONNECTOR_SPEED_UPTO`.
+///   * There is no DP-channel-map record; 9 is `OBJECT_GPIO_CNTL`.
+///
+/// `amdgpu_dcn_inventory` carries `RECORD_HPD_INT = 2` and audited clean, so
+/// this was the second of two copies and the wrong one.
+pub const ATOM_I2C_RECORD_TYPE: u8 = 1;
+pub const ATOM_HPD_INT_RECORD_TYPE: u8 = 2;
+pub const ATOM_CONNECTOR_CAP_RECORD_TYPE: u8 = 3;
+pub const ATOM_CONNECTOR_SPEED_UPTO: u8 = 4;
+pub const ATOM_OBJECT_GPIO_CNTL_RECORD_TYPE: u8 = 9;
+pub const ATOM_CONNECTOR_HPDPIN_LUT_RECORD_TYPE: u8 = 16;
+pub const ATOM_CONNECTOR_AUXDDC_LUT_RECORD_TYPE: u8 = 17;
+pub const ATOM_ENCODER_CAP_RECORD_TYPE: u8 = 20;
+pub const ATOM_BRACKET_LAYOUT_RECORD_TYPE: u8 = 21;
+pub const ATOM_CONNECTOR_FORCED_TMDS_CAP_RECORD_TYPE: u8 = 22;
+pub const ATOM_DISP_CONNECTOR_CAPS_RECORD_TYPE: u8 = 23;
+pub const ATOM_BRACKET_LAYOUT_V2_RECORD_TYPE: u8 = 25;
+pub const ATOM_RECORD_END_TYPE: u8 = 0xFF;
 
-/// Decoded `ATOM_ENCODER_CAP_RECORD` payload. `usEncoderCap` is
-/// a 16-bit bitmap; we surface decoded booleans for the fields
-/// modeset paths need.
-#[derive(Copy, Clone, Debug)]
+/// `enum atom_encoder_caps_def`. The field is `encodercaps`, a **u32**.
+///
+/// LINUX-GAP: the previous decode read a `u16` and gave bits 0..4 the meanings
+/// `hbr2`, `hbr3`, `dp_8b10b_loopback`, `10bpc`, `ycbcr420`. Only bit 0 is
+/// close, and even that is the retired pre-SI reading — from SI onward bit 0
+/// is `MST_EN`. HBR3 is bit **3**, and `dp_8b10b_loopback`, `10bpc` and
+/// `ycbcr420` are not encoder-cap bits at all. Reading sixteen bits also
+/// truncates `USB_C_TYPE`, which is bit 8 and the bit that says a DP connector
+/// is a USB-C port — the one Phoenix's DPIA path cares about most.
+pub const ATOM_ENCODER_CAP_RECORD_MST_EN: u32 = 0x001;
+pub const ATOM_ENCODER_CAP_RECORD_HBR2_EN: u32 = 0x002;
+pub const ATOM_ENCODER_CAP_RECORD_HDMI6GBPS_EN: u32 = 0x004;
+pub const ATOM_ENCODER_CAP_RECORD_HBR3_EN: u32 = 0x008;
+pub const ATOM_ENCODER_CAP_RECORD_DP2: u32 = 0x010;
+pub const ATOM_ENCODER_CAP_RECORD_UHBR10_EN: u32 = 0x020;
+pub const ATOM_ENCODER_CAP_RECORD_UHBR13_5_EN: u32 = 0x040;
+pub const ATOM_ENCODER_CAP_RECORD_UHBR20_EN: u32 = 0x080;
+pub const ATOM_ENCODER_CAP_RECORD_USB_C_TYPE: u32 = 0x100;
+
+/// Decoded `struct atom_encoder_caps_record` payload: a single `u32`
+/// `encodercaps` field after the two-byte record header.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct EncoderCaps {
-    pub raw_caps: u16,
+    pub raw_caps: u32,
 }
 
 impl EncoderCaps {
+    /// Bit 0. Named `HBR2` before SI and `MST_EN` from SI onward; on anything
+    /// this driver targets it is the MST enable.
+    pub fn mst_enabled(self) -> bool {
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_MST_EN != 0
+    }
     pub fn supports_hbr2(self) -> bool {
-        self.raw_caps & (1 << 0) != 0
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_HBR2_EN != 0
+    }
+    pub fn supports_hdmi_6gbps(self) -> bool {
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_HDMI6GBPS_EN != 0
     }
     pub fn supports_hbr3(self) -> bool {
-        self.raw_caps & (1 << 1) != 0
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_HBR3_EN != 0
     }
-    pub fn supports_dp_8b10b_loopback(self) -> bool {
-        self.raw_caps & (1 << 2) != 0
+    pub fn supports_dp2(self) -> bool {
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_DP2 != 0
     }
-    /// 1 → encoder can drive 10-bit per channel HDR.
-    pub fn supports_10bpc(self) -> bool {
-        self.raw_caps & (1 << 3) != 0
+    pub fn supports_uhbr10(self) -> bool {
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_UHBR10_EN != 0
     }
-    /// 1 → encoder supports YCbCr 4:2:0 sub-sampling.
-    pub fn supports_ycbcr420(self) -> bool {
-        self.raw_caps & (1 << 4) != 0
+    pub fn supports_uhbr13_5(self) -> bool {
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_UHBR13_5_EN != 0
+    }
+    pub fn supports_uhbr20(self) -> bool {
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_UHBR20_EN != 0
+    }
+    /// Bit 8: this DP connector is a USB-C port, so its output is a DPIA
+    /// tunnel rather than a native DP PHY.
+    pub fn is_usb_c(self) -> bool {
+        self.raw_caps & ATOM_ENCODER_CAP_RECORD_USB_C_TYPE != 0
     }
 }
 
@@ -115,7 +170,7 @@ impl<'a> Iterator for RecordIter<'a> {
         }
         let kind = self.raw[self.cursor];
         let size = self.raw[self.cursor + 1] as usize;
-        if kind == ATOM_RECORD_TYPE_END {
+        if kind == ATOM_RECORD_END_TYPE {
             return None;
         }
         if size < 2 {
@@ -130,14 +185,13 @@ impl<'a> Iterator for RecordIter<'a> {
     }
 }
 
-/// Decode an `ATOM_ENCODER_CAP_RECORD` payload (the bytes after
-/// the TLV header). The record carries `usEncoderCap` (u16) at
-/// offset 0; some revisions add a u8 caps_extension at offset 2.
+/// Decode a `struct atom_encoder_caps_record` payload (the bytes after the
+/// two-byte TLV header): one `u32` `encodercaps`.
 pub fn decode_encoder_caps(payload: &[u8]) -> Result<EncoderCaps, EncoderCapError> {
-    if payload.len() < 2 {
+    if payload.len() < 4 {
         return Err(EncoderCapError::Truncated);
     }
-    let raw_caps = u16::from_le_bytes([payload[0], payload[1]]);
+    let raw_caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     Ok(EncoderCaps { raw_caps })
 }
 
@@ -145,7 +199,7 @@ pub fn decode_encoder_caps(payload: &[u8]) -> Result<EncoderCaps, EncoderCapErro
 /// Returns `Ok(None)` when the path has no encoder-cap record.
 pub fn find_encoder_caps(tail: &[u8]) -> Result<Option<EncoderCaps>, EncoderCapError> {
     for r in RecordIter::new(tail) {
-        if r.kind == ATOM_RECORD_TYPE_ENCODER_CAP {
+        if r.kind == ATOM_ENCODER_CAP_RECORD_TYPE {
             return Ok(Some(decode_encoder_caps(r.payload)?));
         }
     }

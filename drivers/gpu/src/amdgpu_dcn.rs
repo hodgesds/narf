@@ -71,50 +71,153 @@ use crate::amdgpu::Family;
 use crate::amdgpu_discovery::{self, IpBlock};
 use crate::amdgpu_offsets;
 
-// ── HUBP register offsets (AMD DCN1+ register reference) ─────────
+// ── DCN 3.1.4 register dword ids ─────────────────────────────────
 //
-// Offsets are *relative* to the per-family `dcn_hubp_base`
-// registered through `amdgpu_offsets`. Without a registered
-// base, the codec returns `None` rather than poking the wrong
-// register window.
+// Absolute dword ids from `dcn/dcn_3_1_4_offset.h`, with per-pipe strides, the
+// way the headers express them.
+//
+// LINUX-GAP: this file used to carry per-block **byte** bases —
+// `DCN20_HUBP0_REL = 0x1700`, `DCN20_OPP0_REL = 0x1B80`,
+// `DCN20_OTG0_REL = 0x2180` — with byte offsets inside each. Two things were
+// wrong with that beyond the values.
+//
+// The unit. `DcnWrite::addr` is written straight into **MM_INDEX**, which
+// takes a dword register address: `reg_offset[IP][inst][BASE_IDX] + dword_id`,
+// the same sum `SOC15_REG_OFFSET` forms, and `ip_block_base` returns that
+// dword base unshifted out of the discovery blob. Every byte offset was
+// therefore four times the register it named, before any question of the
+// value.
+//
+// The bases. None of the three named a register. The DCN 3.5 block in this
+// file even documented `regHUBP0_DCHUBP_CNTL = 0x05F3 (= byte 0x17CC, inside
+// the [0x1700..0x1900) block)` — it had the right dword id, converted it
+// correctly, and then kept a base 0xCC bytes below it with the register at
+// offset zero.
+//
+// The within-block offsets were corrected against the header in an earlier
+// pass and were right; they are now expressed as the absolute ids they were
+// derived from, so there is no base left to be wrong.
 
-/// HUBP_BLANK control. Bit 0 = 1 forces the pipe blank.
-pub const HUBP_BLANK_REL: u32 = 0x0064;
-/// HUBP primary surface address (low 32 bits).
-pub const HUBP_PRIMARY_SURFACE_ADDRESS_REL: u32 = 0x00A4;
-/// HUBP primary surface address (high 32 bits).
-pub const HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL: u32 = 0x00A0;
-/// HUBP primary surface pitch.
-pub const HUBP_PRIMARY_SURFACE_PITCH_REL: u32 = 0x00A8;
+/// Per-pipe strides, in dwords. `regHUBP1_DCHUBP_CNTL` is 0x06cf against
+/// HUBP0's 0x05f3, `regHUBPREQ1_DCSURF_SURFACE_PITCH` 0x06e3 against 0x0607,
+/// `regOPP_PIPE1_OPP_PIPE_CONTROL` 0x18e6 against 0x188c, and
+/// `regOTG1_OTG_H_TOTAL` 0x1baa against 0x1b2a.
+pub const HUBP_PIPE_STRIDE: u32 = 0xDC;
+pub const OPP_PIPE_STRIDE: u32 = 0x5A;
+pub const OTG_PIPE_STRIDE: u32 = 0x80;
+/// How many pixel pipes DCN 3.1.4 has: `res_cap_dcn314` in
+/// `dcn314_resource.c` gives `num_timing_generator`, `num_opp` and
+/// `num_video_plane` all as 4, so the HUBP, DPP, MPCC, OPP and OTG blocks and
+/// the DCCG's per-pipe dividers are all four deep.
+///
+/// This is the one place that count lives. The DIG side is a different number
+/// — `num_stream_encoder` and `num_dig_link_enc` are both 5 — and is named
+/// separately in `amdgpu_dcn_stream` and `amdgpu_dcn_inventory`.
+pub const DCN_PIPES: u8 = 4;
 
-/// HUBP_BLANK[0] — force-blank.
+/// `regHUBP0_DCHUBP_CNTL`. The blank control is a FIELD of this register
+/// (`HUBP_BLANK_EN`, bit 0), not a register of its own.
+pub const HUBP0_DCHUBP_CNTL: u32 = 0x05f3;
+/// `regHUBPREQ0_DCSURF_SURFACE_PITCH`. The surface registers are in the
+/// **HUBPREQ** sub-block, which is why their ids do not continue from
+/// `DCHUBP_CNTL`.
+pub const HUBPREQ0_DCSURF_SURFACE_PITCH: u32 = 0x0607;
+/// `regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION` — `PRI_VIEWPORT_WIDTH` in
+/// bits[13:0] and `PRI_VIEWPORT_HEIGHT` in bits[29:16], both masked 0x3FFF.
+/// What the pipe actually fetches, so the authority on a running mode's size.
+pub const HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION: u32 = 0x05ea;
+/// The 14-bit viewport and pitch fields' mask.
+pub const SURFACE_DIMENSION_MASK: u32 = 0x3FFF;
+
+/// `regHPD0_DC_HPD_INT_STATUS` (0x1f14, BASE_IDX 2) — the hot-plug pin's
+/// state.
+pub const HPD0_DC_HPD_INT_STATUS: u32 = 0x1f14;
+/// Dword distance between HPD blocks: `regHPD1_DC_HPD_INT_STATUS` is 0x1f1c.
+pub const HPD_STRIDE: u32 = 8;
+/// How many HPD blocks DCN 3.1.4 instantiates — `regHPD4_DC_HPD_INT_STATUS`
+/// 0x1f34 is the last one the header defines.
+///
+/// NOT the same as the six connectors the interrupt cookie can name:
+/// `irqsrcs_dcn_1_0.h` defines `CTXID__DC_HPD6_INT` = 5, so a cookie may
+/// identify a connector this part has no HPD register for. The cookie space
+/// is generic across DCN; the register instances are per-ASIC.
+pub const HPD_BLOCKS: u8 = 5;
+/// `DC_HPD_INT_STATUS__DC_HPD_SENSE_DELAYED` (0x00000010) — the debounced
+/// sense bit, which is the one `dal_hw_hpd_get_value` reads in interrupt mode.
+pub const DC_HPD_SENSE_DELAYED: u32 = 1 << 4;
+/// `DC_HPD_INT_STATUS__DC_HPD_SENSE` (0x00000002) — the raw, undebounced pin.
+pub const DC_HPD_SENSE: u32 = 1 << 1;
+/// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS` — low half, **below** high.
+pub const HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS: u32 = 0x060a;
+/// `regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH`.
+pub const HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH: u32 = 0x060b;
+
+/// `HUBP0_DCHUBP_CNTL__HUBP_BLANK_EN`, bit 0.
 pub const HUBP_BLANK_FORCE: u32 = 1 << 0;
 
-// ── OPP register offsets (AMD DCN1+ register reference) ──────────
+/// `regOPP_PIPE0_OPP_PIPE_CONTROL` — the only register in the `OPP_PIPE0`
+/// block.
+///
+/// LINUX-GAP: two further OPP registers were named here,
+/// `OPP_PIPE_TOP_GAMMA_REL`/`DCN20_OPP_GRPH_PASSTHROUGH_REL` at +0x04, said to
+/// toggle gamma passthrough. `OPP_PIPE0` has exactly one register in
+/// `dcn_3_1_4_offset.h`, so the second write landed on
+/// `regOPP_PIPE1_OPP_PIPE_CONTROL`'s neighbourhood with a zero — disabling
+/// whatever it hit. Gamma passthrough is a DPP concern
+/// (`regDPP0_CM_*`), which this scaffold does not program.
+pub const OPP_PIPE0_OPP_PIPE_CONTROL: u32 = 0x188c;
 
-/// OPP_PIPE_CONTROL — top-level pipe enable + format.
-pub const OPP_PIPE_CONTROL_REL: u32 = 0x0040;
-/// OPP top-of-gamma passthrough toggle (0 = pass linear).
-pub const OPP_PIPE_TOP_GAMMA_REL: u32 = 0x0044;
-
-/// OPP_PIPE_CONTROL[0] — pipe enable.
+/// `OPP_PIPE_CONTROL[0]` — pipe enable.
 pub const OPP_PIPE_ENABLE: u32 = 1 << 0;
 
-// ── OTG register offsets (AMD DCN1+ register reference) ──────────
+// The OTG block is NOT a contiguous run of the registers a modeset needs.
+// `dcn_3_1_4_offset.h`, with DCN 2.0 agreeing on all of them:
+//
+//   regOTG0_OTG_H_TOTAL             0x1b2a
+//   regOTG0_OTG_H_BLANK_START_END   0x1b2b
+//   regOTG0_OTG_H_SYNC_A            0x1b2c
+//   regOTG0_OTG_V_TOTAL             0x1b2f
+//   regOTG0_OTG_V_BLANK_START_END   0x1b36
+//   regOTG0_OTG_V_SYNC_A            0x1b37
+//   regOTG0_OTG_CONTROL             0x1b41
+//   regOTG0_OTG_STATUS              0x1b49
+//   regOTG0_OTG_INTERRUPT_CONTROL   0x1b59
 
-/// OTG_H_TOTAL — bits[15:0] = h_total - 1.
-pub const OTG_H_TOTAL_REL: u32 = 0x0000;
-/// OTG_V_TOTAL — bits[15:0] = v_total - 1.
-pub const OTG_V_TOTAL_REL: u32 = 0x0004;
-/// OTG_H_BLANK_START_END — bits[15:0]=start, bits[31:16]=end.
-pub const OTG_H_BLANK_START_END_REL: u32 = 0x0008;
-pub const OTG_V_BLANK_START_END_REL: u32 = 0x000C;
-pub const OTG_H_SYNC_A_REL: u32 = 0x0010;
-pub const OTG_V_SYNC_A_REL: u32 = 0x0014;
-/// OTG_MASTER_EN — bit 0 = 1 starts scanout.
-pub const OTG_CONTROL_REL: u32 = 0x0040;
+/// `regOTG0_OTG_H_TOTAL` — bits[15:0] = h_total - 1.
+pub const OTG0_OTG_H_TOTAL: u32 = 0x1b2a;
+/// `regOTG0_OTG_H_BLANK_START_END` — bits[15:0]=start, [31:16]=end.
+pub const OTG0_OTG_H_BLANK_START_END: u32 = 0x1b2b;
+/// `regOTG0_OTG_H_SYNC_A`.
+pub const OTG0_OTG_H_SYNC_A: u32 = 0x1b2c;
+/// `regOTG0_OTG_V_TOTAL` — bits[15:0] = v_total - 1.
+pub const OTG0_OTG_V_TOTAL: u32 = 0x1b2f;
+/// `regOTG0_OTG_V_BLANK_START_END`.
+pub const OTG0_OTG_V_BLANK_START_END: u32 = 0x1b36;
+/// `regOTG0_OTG_V_SYNC_A`.
+pub const OTG0_OTG_V_SYNC_A: u32 = 0x1b37;
+/// `regOTG0_OTG_CONTROL` — bit 0 (`OTG_MASTER_EN`) starts scanout.
+pub const OTG0_OTG_CONTROL: u32 = 0x1b41;
+/// `regOTG0_OTG_STATUS`.
+///
+/// LINUX-GAP: carried as block offset 0x0080, i.e. +0x20 dwords from H_TOTAL,
+/// where the header puts it at +0x1f (0x1b49). One dword past
+/// `OTG_STATUS` is `OTG_STATUS_POSITION`, so a vblank poll read the raster
+/// position instead and its bit 0 means nothing.
+pub const OTG0_OTG_STATUS: u32 = 0x1b49;
+/// `regOTG0_OTG_INTERRUPT_CONTROL`.
+///
+/// LINUX-GAP: carried as 0x00C0, i.e. +0x30 dwords, where the header puts it
+/// at +0x2f (0x1b59). Both off-by-ones are the same mistake: a byte offset
+/// rounded to a multiple of 0x10 rather than taken from the id.
+pub const OTG0_OTG_INTERRUPT_CONTROL: u32 = 0x1b59;
 
 pub const OTG_MASTER_EN: u32 = 1 << 0;
+pub const OTG_STATUS_VBLANK: u32 = 1 << 0;
+
+/// The dword id of `reg` for `pipe`, given that block's stride.
+pub const fn for_pipe(reg: u32, pipe: u8, stride: u32) -> u32 {
+    reg + (pipe as u32) * stride
+}
 
 // ── Codec error type ─────────────────────────────────────────────
 
@@ -197,10 +300,15 @@ pub fn build_modeset(
     surface_addr: u64,
     stride_bytes: u32,
 ) -> Result<ModesetSequence, DcnError> {
+    // One DCN base suffices now that the register ids are absolute: the block
+    // each belongs to is part of the id. The three separate per-block bases
+    // this used to take from `amdgpu_offsets` were never registered by
+    // anything, so every call returned `OffsetsUnregistered`.
     let regs = amdgpu_offsets::offsets_of(family);
-    let hubp_base = regs.dcn_hubp_base.ok_or(DcnError::OffsetsUnregistered)?;
-    let opp_base = regs.dcn_opp_base.ok_or(DcnError::OffsetsUnregistered)?;
-    let otg_base = regs.dcn_otg_base.ok_or(DcnError::OffsetsUnregistered)?;
+    let dcn_base = regs
+        .dcn_hubp_base
+        .or(regs.dcn_otg_base)
+        .ok_or(DcnError::OffsetsUnregistered)?;
 
     if timing.htotal < 64 || timing.vtotal < 64 || timing.htotal > 16384 || timing.vtotal > 16384 {
         return Err(DcnError::BadTiming);
@@ -216,11 +324,11 @@ pub fn build_modeset(
 
     // Disable: blank HUBP and stop OTG before reprogramming.
     seq.disable[0] = Some(DcnWrite {
-        addr: hubp_base + HUBP_BLANK_REL,
+        addr: dcn_base + HUBP0_DCHUBP_CNTL,
         value: HUBP_BLANK_FORCE,
     });
     seq.disable[1] = Some(DcnWrite {
-        addr: otg_base + OTG_CONTROL_REL,
+        addr: dcn_base + OTG0_OTG_CONTROL,
         value: 0,
     });
 
@@ -228,61 +336,57 @@ pub fn build_modeset(
     let surf_lo = surface_addr as u32;
     let surf_hi = (surface_addr >> 32) as u32;
     seq.program[0] = Some(DcnWrite {
-        addr: hubp_base + HUBP_PRIMARY_SURFACE_ADDRESS_HIGH_REL,
+        addr: dcn_base + HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH,
         value: surf_hi,
     });
     seq.program[1] = Some(DcnWrite {
-        addr: hubp_base + HUBP_PRIMARY_SURFACE_ADDRESS_REL,
+        addr: dcn_base + HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS,
         value: surf_lo,
     });
     seq.program[2] = Some(DcnWrite {
-        addr: hubp_base + HUBP_PRIMARY_SURFACE_PITCH_REL,
+        addr: dcn_base + HUBPREQ0_DCSURF_SURFACE_PITCH,
         value: stride_bytes,
     });
 
-    // Program: OPP — gamma passthrough (linear scanout).
+    // Program: OPP — pipe enable.
     seq.program[3] = Some(DcnWrite {
-        addr: opp_base + OPP_PIPE_CONTROL_REL,
+        addr: dcn_base + OPP_PIPE0_OPP_PIPE_CONTROL,
         value: OPP_PIPE_ENABLE,
-    });
-    seq.program[4] = Some(DcnWrite {
-        addr: opp_base + OPP_PIPE_TOP_GAMMA_REL,
-        value: 0,
     });
 
     // Program: OTG H/V totals + blank/sync.
     seq.program[5] = Some(DcnWrite {
-        addr: otg_base + OTG_H_TOTAL_REL,
+        addr: dcn_base + OTG0_OTG_H_TOTAL,
         value: (timing.htotal - 1) as u32,
     });
     seq.program[6] = Some(DcnWrite {
-        addr: otg_base + OTG_V_TOTAL_REL,
+        addr: dcn_base + OTG0_OTG_V_TOTAL,
         value: (timing.vtotal - 1) as u32,
     });
     seq.program[7] = Some(DcnWrite {
-        addr: otg_base + OTG_H_BLANK_START_END_REL,
+        addr: dcn_base + OTG0_OTG_H_BLANK_START_END,
         value: pack_pair(timing.hblank_end, timing.hblank_start),
     });
     seq.program[8] = Some(DcnWrite {
-        addr: otg_base + OTG_V_BLANK_START_END_REL,
+        addr: dcn_base + OTG0_OTG_V_BLANK_START_END,
         value: pack_pair(timing.vblank_end, timing.vblank_start),
     });
     seq.program[9] = Some(DcnWrite {
-        addr: otg_base + OTG_H_SYNC_A_REL,
+        addr: dcn_base + OTG0_OTG_H_SYNC_A,
         value: pack_pair(timing.hsync_end, timing.hsync_start),
     });
     seq.program[10] = Some(DcnWrite {
-        addr: otg_base + OTG_V_SYNC_A_REL,
+        addr: dcn_base + OTG0_OTG_V_SYNC_A,
         value: pack_pair(timing.vsync_end, timing.vsync_start),
     });
 
     // Enable: unblank HUBP, start OTG.
     seq.enable[0] = Some(DcnWrite {
-        addr: hubp_base + HUBP_BLANK_REL,
+        addr: dcn_base + HUBP0_DCHUBP_CNTL,
         value: 0,
     });
     seq.enable[1] = Some(DcnWrite {
-        addr: otg_base + OTG_CONTROL_REL,
+        addr: dcn_base + OTG0_OTG_CONTROL,
         value: OTG_MASTER_EN,
     });
 
@@ -310,77 +414,16 @@ pub fn build_modeset(
 // per-instance strides (`DCN20_HUBP_STRIDE` etc.) — Stage-3 only
 // programs pipe 0 (the primary plane the firmware left active).
 
-/// Stride between successive HUBP instances. Per `dcn20_resource.c`
-/// in Linux's `dc/dcn20/`, HUBP[i] sits at `HUBP0 + i *
-/// DCN20_HUBP_STRIDE`.
-pub const DCN20_HUBP_STRIDE: u32 = 0x0200;
-/// Same idea for OPP.
-pub const DCN20_OPP_STRIDE: u32 = 0x0100;
-/// Same idea for OTG (OPTC).
-pub const DCN20_OTG_STRIDE: u32 = 0x0200;
+// LINUX-GAP: a second copy of the register table lived here, as per-block
+// byte bases plus byte offsets. It is gone: the absolute dword ids at the top
+// of this file serve both sequence builders, so there is one table and no base
+// to be wrong. The aliases below keep the `DCN20_*` names the smokes and
+// `amdgpu_modeset` use, pointing at that one table.
 
-/// HUBP0 byte offset from the DCN base.
-///
-/// Per `dcn_2_0_3_offset.h`: `mmHUBP0_HUBP_BLANK_EN` lives at dword
-/// 0x05C5 ⇒ byte 0x1714 from the DCN window start. The HUBP block
-/// occupies bytes `[0x1700 .. 0x1900)` for pipe 0; the `_BLANK_EN`
-/// register is at relative byte offset 0x0014.
-pub const DCN20_HUBP0_REL: u32 = 0x1700;
-
-/// OPP0 byte offset from the DCN base.
-///
-/// Per `dcn_2_0_3_offset.h`: `mmOPP_PIPE0_OPP_PIPE_CONTROL` at
-/// dword 0x06EC ⇒ byte 0x1BB0. The OPP_PIPE block occupies
-/// `[0x1B80 .. 0x1C80)` for pipe 0.
-pub const DCN20_OPP0_REL: u32 = 0x1B80;
-
-/// OTG0 (OPTC0) byte offset from the DCN base.
-///
-/// Per `dcn_2_0_3_offset.h`: `mmOTG0_OTG_H_TOTAL` at dword 0x0860 ⇒
-/// byte 0x2180. The OTG block occupies `[0x2180 .. 0x2380)` for
-/// pipe 0.
-pub const DCN20_OTG0_REL: u32 = 0x2180;
-
-// ── DCN 2.0 register offsets relative to each per-pipe block ─────
-//
-// Names + offsets transcribed from `dcn_2_0_3_offset.h`. Each is a
-// byte offset from the block base above.
-
-/// `HUBP_BLANK_EN[0]` — force the pipe blank.
-pub const DCN20_HUBP_BLANK_EN_REL: u32 = 0x0014;
-/// `HUBP_PRIMARY_SURFACE_ADDRESS` (low 32 bits).
-pub const DCN20_HUBP_PRI_ADDR_LO_REL: u32 = 0x009C;
-/// `HUBP_PRIMARY_SURFACE_ADDRESS_HIGH`.
-pub const DCN20_HUBP_PRI_ADDR_HI_REL: u32 = 0x0098;
-/// `HUBP_DCSURF_SURFACE_PITCH`. Bits[12:0] = stride in pixels - 1
-/// for the linear case Stage-3 programs.
-pub const DCN20_HUBP_SURFACE_PITCH_REL: u32 = 0x00A0;
-
-/// `OPP_PIPE_CONTROL[0]` — pipe enable.
-pub const DCN20_OPP_PIPE_CONTROL_REL: u32 = 0x0030;
-/// `OPP_GRPH_PASSTHROUGH` — gamma-LUT passthrough; 0 = linear.
-pub const DCN20_OPP_GRPH_PASSTHROUGH_REL: u32 = 0x0034;
-
-/// `OTG_H_TOTAL`. Bits[15:0] = h_total - 1.
-pub const DCN20_OTG_H_TOTAL_REL: u32 = 0x0000;
-/// `OTG_V_TOTAL`.
-pub const DCN20_OTG_V_TOTAL_REL: u32 = 0x0010;
-/// `OTG_H_BLANK_START_END`. (end << 16) | start.
-pub const DCN20_OTG_H_BLANK_REL: u32 = 0x0008;
-/// `OTG_V_BLANK_START_END`.
-pub const DCN20_OTG_V_BLANK_REL: u32 = 0x001C;
-/// `OTG_H_SYNC_A`.
-pub const DCN20_OTG_H_SYNC_A_REL: u32 = 0x0004;
-/// `OTG_V_SYNC_A`.
-pub const DCN20_OTG_V_SYNC_A_REL: u32 = 0x0014;
-/// `OTG_INTERRUPT_CONTROL` — masked during reprogram.
-pub const DCN20_OTG_INTERRUPT_CONTROL_REL: u32 = 0x00C0;
-/// `OTG_CONTROL` — bit 0 is OTG_MASTER_EN.
-pub const DCN20_OTG_CONTROL_REL: u32 = 0x0040;
-/// `OTG_STATUS` — VBLANK reflected in bit 0 in DCN 2.0.
-pub const DCN20_OTG_STATUS_REL: u32 = 0x0080;
-/// `OTG_STATUS.OTG_VBLANK` mask.
-pub const DCN20_OTG_STATUS_VBLANK: u32 = 1 << 0;
+pub use self::{
+    HUBP_PIPE_STRIDE as DCN20_HUBP_STRIDE, OPP_PIPE_STRIDE as DCN20_OPP_STRIDE,
+    OTG_PIPE_STRIDE as DCN20_OTG_STRIDE, OTG_STATUS_VBLANK as DCN20_OTG_STATUS_VBLANK,
+};
 
 /// Full DCN 2.0 mode timing. Mirrors what Linux's
 /// `dc_crtc_timing` carries for the parts this driver programs:
@@ -532,21 +575,19 @@ pub fn dcn20_modeset_sequence(
 ) -> alloc::vec::Vec<DcnWrite> {
     let mut writes = alloc::vec::Vec::with_capacity(16);
 
-    let hubp = dcn_base + DCN20_HUBP0_REL;
-    let opp = dcn_base + DCN20_OPP0_REL;
-    let otg = dcn_base + DCN20_OTG0_REL;
+    let (hubp, opp, otg) = (dcn_base, dcn_base, dcn_base);
 
     // 1. Disable scanout.
     writes.push(DcnWrite {
-        addr: hubp + DCN20_HUBP_BLANK_EN_REL,
+        addr: hubp + HUBP0_DCHUBP_CNTL,
         value: HUBP_BLANK_FORCE,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_INTERRUPT_CONTROL_REL,
+        addr: otg + OTG0_OTG_INTERRUPT_CONTROL,
         value: 0,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_CONTROL_REL,
+        addr: otg + OTG0_OTG_CONTROL,
         value: 0,
     });
 
@@ -554,64 +595,60 @@ pub fn dcn20_modeset_sequence(
     let surf_lo = surface_addr_bytes as u32;
     let surf_hi = (surface_addr_bytes >> 32) as u32;
     writes.push(DcnWrite {
-        addr: hubp + DCN20_HUBP_PRI_ADDR_HI_REL,
+        addr: hubp + HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH,
         value: surf_hi,
     });
     writes.push(DcnWrite {
-        addr: hubp + DCN20_HUBP_PRI_ADDR_LO_REL,
+        addr: hubp + HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS,
         value: surf_lo,
     });
     // Linear-tiling pitch encodes `pixels - 1` in bits[12:0]
     // (`DCSURF_SURFACE_PITCH.PITCH`).
     let pitch_field = stride_pixels.saturating_sub(1) & 0x1FFF;
     writes.push(DcnWrite {
-        addr: hubp + DCN20_HUBP_SURFACE_PITCH_REL,
+        addr: hubp + HUBPREQ0_DCSURF_SURFACE_PITCH,
         value: pitch_field,
     });
 
     // 3. OPP pipe enable + linear gamma.
     writes.push(DcnWrite {
-        addr: opp + DCN20_OPP_PIPE_CONTROL_REL,
+        addr: opp + OPP_PIPE0_OPP_PIPE_CONTROL,
         value: OPP_PIPE_ENABLE,
-    });
-    writes.push(DcnWrite {
-        addr: opp + DCN20_OPP_GRPH_PASSTHROUGH_REL,
-        value: 0,
     });
 
     // 4. OTG timing.
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_H_TOTAL_REL,
+        addr: otg + OTG0_OTG_H_TOTAL,
         value: (timing.h_total - 1) as u32,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_V_TOTAL_REL,
+        addr: otg + OTG0_OTG_V_TOTAL,
         value: (timing.v_total - 1) as u32,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_H_BLANK_REL,
+        addr: otg + OTG0_OTG_H_BLANK_START_END,
         value: pack_pair(timing.h_blank_end, timing.h_blank_start),
     });
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_V_BLANK_REL,
+        addr: otg + OTG0_OTG_V_BLANK_START_END,
         value: pack_pair(timing.v_blank_end, timing.v_blank_start),
     });
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_H_SYNC_A_REL,
+        addr: otg + OTG0_OTG_H_SYNC_A,
         value: pack_pair(timing.h_sync_end, timing.h_sync_start),
     });
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_V_SYNC_A_REL,
+        addr: otg + OTG0_OTG_V_SYNC_A,
         value: pack_pair(timing.v_sync_end, timing.v_sync_start),
     });
 
     // 5. Re-enable scanout.
     writes.push(DcnWrite {
-        addr: hubp + DCN20_HUBP_BLANK_EN_REL,
+        addr: hubp + HUBP0_DCHUBP_CNTL,
         value: 0,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN20_OTG_CONTROL_REL,
+        addr: otg + OTG0_OTG_CONTROL,
         value: OTG_MASTER_EN,
     });
 
@@ -649,52 +686,37 @@ pub fn dcn20_modeset_sequence(
 // reprogram surface/pitch → enable OPP pipe → write OTG timing →
 // assert OTG_MASTER_EN last.
 
-/// HUBP / OPP / OTG strides on DCN 3.5. Same per-instance stride
-/// as DCN 2.0 — the per-pipe block layouts didn't grow between
-/// the two IP versions; only the within-OTG layout shifted.
-pub const DCN35_HUBP_STRIDE: u32 = 0x0200;
-pub const DCN35_OPP_STRIDE: u32 = 0x0100;
-pub const DCN35_OTG_STRIDE: u32 = 0x0200;
-
-/// HUBP0 / OPP0 / OTG0 byte offsets from the DCN base. Inherited
-/// unchanged from DCN 2.0; verified against
-/// `dcn_3_5_0_offset.h::regHUBP0_DCHUBP_CNTL` = 0x05F3 (= byte
-/// 0x17CC, inside the [0x1700..0x1900) block).
-pub const DCN35_HUBP0_REL: u32 = 0x1700;
-pub const DCN35_OPP0_REL: u32 = 0x1B80;
-pub const DCN35_OTG0_REL: u32 = 0x2180;
-
-// ── DCN 3.5 in-block register offsets ────────────────────────────
-//
-// Byte offsets from each per-pipe block base above. HUBP / OPP
-// registers are stable across DCN20→DCN35; the OTG block has the
-// shifts called out in the table above.
-
-pub const DCN35_HUBP_BLANK_EN_REL: u32 = 0x0014;
-pub const DCN35_HUBP_PRI_ADDR_LO_REL: u32 = 0x009C;
-pub const DCN35_HUBP_PRI_ADDR_HI_REL: u32 = 0x0098;
-pub const DCN35_HUBP_SURFACE_PITCH_REL: u32 = 0x00A0;
-
-pub const DCN35_OPP_PIPE_CONTROL_REL: u32 = 0x0030;
-pub const DCN35_OPP_GRPH_PASSTHROUGH_REL: u32 = 0x0034;
-
-pub const DCN35_OTG_H_TOTAL_REL: u32 = 0x0000;
-pub const DCN35_OTG_H_BLANK_REL: u32 = 0x0004;
-pub const DCN35_OTG_H_SYNC_A_REL: u32 = 0x0008;
-pub const DCN35_OTG_V_TOTAL_REL: u32 = 0x0014;
-/// `OTG_V_BLANK_START_END` shifted +8 B on DCN 3.5 vs DCN 2.0.
-/// DCN20 had it at dword 0x1B36 (rel 0x0030 inside the OTG block);
-/// DCN35 puts it at dword 0x1B38 (rel 0x0038).
-pub const DCN35_OTG_V_BLANK_REL: u32 = 0x0038;
-/// `OTG_V_SYNC_A` shifted +8 B (dword 0x1B39 on DCN 3.5).
-pub const DCN35_OTG_V_SYNC_A_REL: u32 = 0x003C;
-/// `OTG_INTERRUPT_CONTROL` shifted +4 B (dword 0x1B5A on DCN 3.5).
-pub const DCN35_OTG_INTERRUPT_CONTROL_REL: u32 = 0x00C4;
-/// `OTG_CONTROL` shifted +8 B (dword 0x1B43 on DCN 3.5).
-pub const DCN35_OTG_CONTROL_REL: u32 = 0x0048;
-/// `OTG_STATUS` (dword 0x1B49) — same as DCN 2.0.
-pub const DCN35_OTG_STATUS_REL: u32 = 0x0084;
-pub const DCN35_OTG_STATUS_VBLANK: u32 = 1 << 0;
+/// DCN 3.5 register dword ids, from `dcn_3_5_0_offset.h`.
+///
+/// HUBP, HUBPREQ and OPP are identical to DCN 3.1.4 — `regHUBP0_DCHUBP_CNTL`
+/// 0x05f3, the HUBPREQ trio 0x0607/0x060a/0x060b,
+/// `regOPP_PIPE0_OPP_PIPE_CONTROL` 0x188c — and so are the pipe strides, so
+/// those names are shared with the 3.1.4 table above rather than duplicated.
+///
+/// Four OTG registers moved:
+///
+///   reg                      3.1.4    3.5
+///   OTG_V_BLANK_START_END    0x1b36   0x1b38
+///   OTG_V_SYNC_A             0x1b37   0x1b39
+///   OTG_CONTROL              0x1b41   0x1b43
+///   OTG_INTERRUPT_CONTROL    0x1b59   0x1b5a
+///
+/// H_TOTAL, H_BLANK, H_SYNC_A, V_TOTAL and OTG_STATUS did not.
+///
+/// LINUX-GAP: nothing can select this path. `STRIX_POINT` maps to
+/// `Family::Phoenix`, so there is no family value that reaches
+/// `dcn35_modeset_sequence`, and Phoenix itself is DCN 3.1.4. It is kept
+/// because the register deltas above are real and a Strix bring-up will need
+/// them — but a Strix family has to exist first.
+pub const DCN35_OTG0_OTG_H_TOTAL: u32 = 0x1b2a;
+pub const DCN35_OTG0_OTG_H_BLANK_START_END: u32 = 0x1b2b;
+pub const DCN35_OTG0_OTG_H_SYNC_A: u32 = 0x1b2c;
+pub const DCN35_OTG0_OTG_V_TOTAL: u32 = 0x1b2f;
+pub const DCN35_OTG0_OTG_V_BLANK_START_END: u32 = 0x1b38;
+pub const DCN35_OTG0_OTG_V_SYNC_A: u32 = 0x1b39;
+pub const DCN35_OTG0_OTG_CONTROL: u32 = 0x1b43;
+pub const DCN35_OTG0_OTG_STATUS: u32 = 0x1b49;
+pub const DCN35_OTG0_OTG_INTERRUPT_CONTROL: u32 = 0x1b5a;
 
 /// DCN 3.5 modeset sequence. Same prologue/body/epilogue shape
 /// as `dcn20_modeset_sequence`; absolute addresses fold against
@@ -713,21 +735,19 @@ pub fn dcn35_modeset_sequence(
 ) -> alloc::vec::Vec<DcnWrite> {
     let mut writes = alloc::vec::Vec::with_capacity(16);
 
-    let hubp = dcn_base + DCN35_HUBP0_REL;
-    let opp = dcn_base + DCN35_OPP0_REL;
-    let otg = dcn_base + DCN35_OTG0_REL;
+    let (hubp, opp, otg) = (dcn_base, dcn_base, dcn_base);
 
     // 1. Disable scanout.
     writes.push(DcnWrite {
-        addr: hubp + DCN35_HUBP_BLANK_EN_REL,
+        addr: hubp + HUBP0_DCHUBP_CNTL,
         value: HUBP_BLANK_FORCE,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_INTERRUPT_CONTROL_REL,
+        addr: otg + DCN35_OTG0_OTG_INTERRUPT_CONTROL,
         value: 0,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_CONTROL_REL,
+        addr: otg + DCN35_OTG0_OTG_CONTROL,
         value: 0,
     });
 
@@ -735,64 +755,60 @@ pub fn dcn35_modeset_sequence(
     let surf_lo = surface_addr_bytes as u32;
     let surf_hi = (surface_addr_bytes >> 32) as u32;
     writes.push(DcnWrite {
-        addr: hubp + DCN35_HUBP_PRI_ADDR_HI_REL,
+        addr: hubp + HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH,
         value: surf_hi,
     });
     writes.push(DcnWrite {
-        addr: hubp + DCN35_HUBP_PRI_ADDR_LO_REL,
+        addr: hubp + HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS,
         value: surf_lo,
     });
     let pitch_field = stride_pixels.saturating_sub(1) & 0x1FFF;
     writes.push(DcnWrite {
-        addr: hubp + DCN35_HUBP_SURFACE_PITCH_REL,
+        addr: hubp + HUBPREQ0_DCSURF_SURFACE_PITCH,
         value: pitch_field,
     });
 
     // 3. OPP pipe enable + linear gamma.
     writes.push(DcnWrite {
-        addr: opp + DCN35_OPP_PIPE_CONTROL_REL,
+        addr: opp + OPP_PIPE0_OPP_PIPE_CONTROL,
         value: OPP_PIPE_ENABLE,
-    });
-    writes.push(DcnWrite {
-        addr: opp + DCN35_OPP_GRPH_PASSTHROUGH_REL,
-        value: 0,
     });
 
     // 4. OTG timing — H/V_TOTAL, H/V_BLANK, H/V_SYNC. The V_*
     // registers are at DCN 3.5-shifted offsets relative to DCN 2.0.
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_H_TOTAL_REL,
+        addr: otg + DCN35_OTG0_OTG_H_TOTAL,
         value: (timing.h_total - 1) as u32,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_V_TOTAL_REL,
+        addr: otg + DCN35_OTG0_OTG_V_TOTAL,
         value: (timing.v_total - 1) as u32,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_H_BLANK_REL,
+        addr: otg + DCN35_OTG0_OTG_H_BLANK_START_END,
         value: pack_pair(timing.h_blank_end, timing.h_blank_start),
     });
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_V_BLANK_REL,
+        addr: otg + DCN35_OTG0_OTG_V_BLANK_START_END,
         value: pack_pair(timing.v_blank_end, timing.v_blank_start),
     });
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_H_SYNC_A_REL,
+        addr: otg + DCN35_OTG0_OTG_H_SYNC_A,
         value: pack_pair(timing.h_sync_end, timing.h_sync_start),
     });
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_V_SYNC_A_REL,
+        addr: otg + DCN35_OTG0_OTG_V_SYNC_A,
         value: pack_pair(timing.v_sync_end, timing.v_sync_start),
     });
 
     // 5. Re-enable scanout. OTG_MASTER_EN must land on the DCN 3.5
     // OTG_CONTROL offset (dword 0x1B43), NOT the DCN 2.0 slot.
     writes.push(DcnWrite {
-        addr: hubp + DCN35_HUBP_BLANK_EN_REL,
+        addr: hubp + HUBP0_DCHUBP_CNTL,
         value: 0,
     });
     writes.push(DcnWrite {
-        addr: otg + DCN35_OTG_CONTROL_REL,
+        addr: otg + DCN35_OTG0_OTG_CONTROL,
         value: OTG_MASTER_EN,
     });
 
@@ -828,7 +844,7 @@ pub fn build_modeset_from_discovery(
 /// Walks `seq` and writes each `(addr, value)` pair through the
 /// indexed `MM_INDEX / MM_DATA` access path used by the rest of
 /// the amdgpu driver. After the sequence the caller should poll
-/// `OTG_STATUS.VBLANK` (offset `DCN20_OTG_STATUS_REL`) to confirm
+/// `OTG_STATUS.VBLANK` (offset `OTG0_OTG_STATUS`) to confirm
 /// the timing generator latched the new mode, but this function
 /// returns once the writes have been issued — polling is the
 /// caller's responsibility because the spin needs to integrate
@@ -916,16 +932,19 @@ pub mod tests {
             return TestResult::Fail("empty sequence");
         }
         // First write must be HUBP blank.
-        if writes[0].addr != 0x0000_3000 + HUBP_BLANK_REL {
-            return TestResult::Fail("first write should be HUBP blank");
+        // regHUBP0_DCHUBP_CNTL is dword 0x05f3; the ids are absolute, so the
+        // base is added once and no per-block base is involved.
+        if writes[0].addr != 0x0000_3000 + 0x05f3 {
+            return TestResult::Fail("first write should be HUBP blank at dword 0x05f3");
         }
         if writes[0].value & HUBP_BLANK_FORCE == 0 {
             return TestResult::Fail("HUBP blank not forced");
         }
         // Last enable write must assert OTG_MASTER_EN.
         let last = writes.last().copied().unwrap();
-        if last.addr != 0x0000_5000 + OTG_CONTROL_REL || last.value != OTG_MASTER_EN {
-            return TestResult::Fail("last write should enable OTG master");
+        // regOTG0_OTG_CONTROL is dword 0x1b41, reached from the same base.
+        if last.addr != 0x0000_3000 + 0x1b41 || last.value != OTG_MASTER_EN {
+            return TestResult::Fail("last write should enable OTG master at dword 0x1b41");
         }
         TestResult::Pass
     }

@@ -368,3 +368,97 @@ kernel_test_in!(
     "drivers/gpu/dio",
     dio_train_clamps_type_c_lanes_and_retries_deferred_aux
 );
+
+/// Every literal is read off `dcn/dcn_3_1_4_offset.h` and
+/// `dcn_3_1_4_sh_mask.h`, never off the constant it checks. This is the only
+/// defence these ids have: the register writes above are field updates on a
+/// mock, so a wrong offset or mask is invisible to them.
+fn dio_register_window_matches_the_amd_headers() -> TestResult {
+    // regDIG0_DIG_BE_CNTL 0x20b1, regDIG0_DIG_BE_EN_CNTL 0x20b2,
+    // regDP0_DP_LINK_CNTL 0x2108, regDP0_DP_CONFIG 0x210b,
+    // regDP0_DP_DPHY_INTERNAL_CTRL 0x210f, regDP0_DP_LINK_FRAMING_CNTL 0x2113,
+    // regDP0_DP_DPHY_CNTL 0x2117, regDP0_DP_DPHY_TRAINING_PATTERN_SEL 0x2118,
+    // regDP0_DP_DPHY_PRBS_CNTL 0x211d, regDP0_DP_DPHY_SCRAM_CNTL 0x211e.
+    for (got, want) in [
+        (DIG_BE_CNTL, 0x20b1u64),
+        (DIG_BE_EN_CNTL, 0x20b2),
+        (DP_LINK_CNTL, 0x2108),
+        (DP_CONFIG, 0x210b),
+        (DP_DPHY_INTERNAL_CTRL, 0x210f),
+        (DP_LINK_FRAMING_CNTL, 0x2113),
+        (DP_DPHY_CNTL, 0x2117),
+        (DP_DPHY_TRAINING_PATTERN_SEL, 0x2118),
+        (DP_DPHY_PRBS_CNTL, 0x211d),
+        (DP_DPHY_SCRAM_CNTL, 0x211e),
+    ] {
+        if got != want {
+            return TestResult::Fail("a DIO register id does not match dcn_3_1_4_offset.h");
+        }
+    }
+    // regDIG1_DIG_BE_CNTL 0x21b1 against DIG0's 0x20b1, and
+    // regDP4_DP_DPHY_SCRAM_CNTL 0x251e is the bank's upper bound.
+    if DIG_STRIDE != 0x100 || DIG_BE_CNTL + DIG_STRIDE != 0x21b1 {
+        return TestResult::Fail("the DIG per-instance stride is 0x100");
+    }
+    if LAST_REG != 0x251e {
+        return TestResult::Fail("the bank bound is DP4_DP_DPHY_SCRAM_CNTL");
+    }
+    // Field masks.
+    for (got, want) in [
+        (DIG_ENABLE, 0x0000_0001u32),
+        (DIG_FE_SOURCE_SELECT, 0x0000_7F00),
+        (DIG_MODE, 0x0007_0000),
+        (DP_LINK_TRAINING_COMPLETE, 0x0000_0010),
+        (DP_UDI_LANES, 0x0000_0003),
+        (DPHY_SCRAMBLER_BS_COUNT, 0x0003_FF00),
+        (DPHY_SCRAMBLER_ADVANCE, 0x0000_0010),
+        (DPHY_TRAINING_PATTERN_SEL, 0x0000_0003),
+        (DPHY_BYPASS, 0x0001_0000),
+        (DPHY_PRBS_EN, 0x0000_0001),
+        (DP_VID_ENHANCED_FRAME_MODE, 0x1000_0000),
+    ] {
+        if got != want {
+            return TestResult::Fail("a DIO field mask does not match dcn_3_1_4_sh_mask.h");
+        }
+    }
+    // DPHY_FEC_EN 0x10 | DPHY_FEC_READY_SHADOW 0x20.
+    if DPHY_FEC_FIELDS != 0x0000_0030 {
+        return TestResult::Fail("the FEC fields are DPHY_FEC_EN and DPHY_FEC_READY_SHADOW");
+    }
+    // DP_IDLE_BS_INTERVAL 0x0003FFFF | DP_VBID_DISABLE 0x01000000 |
+    // DP_VID_ENHANCED_FRAME_MODE 0x10000000 — and NOT
+    // DP_BACK_TO_BACK_BS_AVOIDANCE_ENABLE 0x00100000, which this path leaves be.
+    if DP_LINK_FRAMING_FIELDS != 0x0003_FFFF | 0x0100_0000 | 0x1000_0000 {
+        return TestResult::Fail("the LINK_FRAMING_CNTL mask is not those three fields");
+    }
+    if DP_LINK_FRAMING_FIELDS & 0x0010_0000 != 0 {
+        return TestResult::Fail("BACK_TO_BACK_BS_AVOIDANCE must stay outside the mask");
+    }
+    // The values `set_dp_phy_pattern_passthrough_mode` uses: IDLE_BS_INTERVAL
+    // 0x2000 (the HBR2 compliance path uses 0xFC) and BS_COUNT 0x1FF (which
+    // that path sets to 0 instead).
+    if DP_IDLE_BS_INTERVAL_NORMAL != 0x2000 {
+        return TestResult::Fail("ordinary operation uses DP_IDLE_BS_INTERVAL 0x2000");
+    }
+    if DPHY_SCRAMBLER_BS_COUNT_NORMAL != 0x1FF << 8
+        || DPHY_SCRAMBLER_BS_COUNT_NORMAL & !DPHY_SCRAMBLER_BS_COUNT != 0
+    {
+        return TestResult::Fail("BS_COUNT 0x1FF must sit inside its own field");
+    }
+    // DIG_FE_SOURCE_SELECT is a one-hot: DCN10_DIG_FE_SOURCE_SELECT_DIGA 0x1,
+    // DIGB 0x2, DIGC 0x4, DIGD 0x8 — placed at bit 8.
+    if DIG_FE_SOURCE_SELECT_SHIFT != 8 {
+        return TestResult::Fail("DIG_FE_SOURCE_SELECT is at bit 8");
+    }
+    for frontend in 0..4u32 {
+        let placed = (1u32 << frontend) << DIG_FE_SOURCE_SELECT_SHIFT;
+        if placed & !DIG_FE_SOURCE_SELECT != 0 || placed.count_ones() != 1 {
+            return TestResult::Fail("a front-end selector must be one bit inside the field");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dio",
+    dio_register_window_matches_the_amd_headers
+);

@@ -143,6 +143,22 @@ mod user_rt {
                 core::ptr::write_volatile(self._va.add(offset as usize) as *mut u32, value);
             }
         }
+        /// # Safety
+        /// `offset + 8 <= len`, 8-byte aligned.
+        pub unsafe fn read64(&self, offset: u64) -> u64 {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe { core::ptr::read_volatile(self._va.add(offset as usize) as *const u64) }
+        }
+        /// One 64-bit access, for a register the device latches whole.
+        ///
+        /// # Safety
+        /// `offset + 8 <= len`, 8-byte aligned.
+        pub unsafe fn write64(&self, offset: u64, value: u64) {
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe {
+                core::ptr::write_volatile(self._va.add(offset as usize) as *mut u64, value);
+            }
+        }
     }
 
     /// DMA-coherent buffer. Userspace impl gets these from a

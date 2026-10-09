@@ -14,6 +14,14 @@ use crate::{
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+/// The DCN versions these offsets describe. Twelve of the fourteen registers
+/// below move on DCN 3.5 (`dcn_3_5_0_offset.h`): the whole DP stream-encoder
+/// block shifts up 0x16 dwords, `DP_PIXEL_FORMAT` 0x2109→0x211f through
+/// `DP_MSA_TIMING_PARAM4` 0x214f→0x2165. Another generation needs its own
+/// offset table, selected per version the way
+/// `amdgpu_platform::SURFACE_WINDOWS` does it.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const DP_PIXEL_FORMAT: u64 = 0x2109;
 const DP_MSA_COLORIMETRY: u64 = 0x210a;
 const DP_VID_STREAM_CNTL: u64 = 0x210c;
@@ -28,10 +36,27 @@ const DP_MSA_TIMING_PARAM3: u64 = 0x214e;
 const DP_MSA_TIMING_PARAM4: u64 = 0x214f;
 const STRIDE: u64 = 0x100;
 const LAST_REG: u32 = (DP_MSA_TIMING_PARAM4 + 4 * STRIDE) as u32;
+/// Stream encoders, not pixel pipes: `res_cap_dcn314.num_stream_encoder` is 5
+/// where `num_video_plane` is 4. Kept distinct from
+/// [`crate::amdgpu_dcn::DCN_PIPES`] for that reason.
 const INSTANCES: u8 = 5;
 
 /// `DP_PIXEL_ENCODING_TYPE_RGB444`.
 const PIXEL_ENCODING_RGB: u32 = 0;
+
+// `DP0_DP_PIXEL_FORMAT` fields, from `dcn_3_1_4_sh_mask.h`:
+//
+//   DP_PIXEL_ENCODING                  0x00000007
+//   DP_COMPONENT_DEPTH                 0x07000000
+//   DP_PIXEL_PER_CYCLE_PROCESSING_MODE 0x40000000
+//
+// LINUX-GAP: the last was masked `0x3 << 30`, one bit wider than the single bit
+// it is, so the update also cleared reserved bit 31. The field is written with a
+// one-bit value everywhere Linux touches it (`odm_combine` in
+// `dcn314_dio_stream_encoder.c:101`, `two_pixel_per_cyle ? 1 : 0` in dcn32's).
+const DP_PIXEL_ENCODING: u32 = 0x0000_0007;
+const DP_COMPONENT_DEPTH: u32 = 0x0700_0000;
+const DP_PIXEL_PER_CYCLE_PROCESSING_MODE: u32 = 0x4000_0000;
 /// The M/N generator measures against a fixed N, which Linux seeds at 0x8000
 /// because auto-measurement needs a full symbol cycle to take over.
 const N_VID: u32 = 0x8000;
@@ -184,8 +209,8 @@ impl<I: Io> Engine<I> {
 
         self.update(
             DP_PIXEL_FORMAT,
-            0x7 | 0x7 << 24 | 0x3 << 30,
-            PIXEL_ENCODING_RGB | depth.code() << 24,
+            DP_PIXEL_ENCODING | DP_COMPONENT_DEPTH | DP_PIXEL_PER_CYCLE_PROCESSING_MODE,
+            PIXEL_ENCODING_RGB | depth.code() << DP_COMPONENT_DEPTH.trailing_zeros(),
         )?;
         // MISC0: colorimetry depth in bits 7:5, full-range RGB elsewhere.
         self.set(DP_MSA_COLORIMETRY, depth.colorimetry() << 5 << 24)?;
@@ -227,7 +252,7 @@ impl<I: Io> Engine<I> {
         self.set(DP_VID_M, m_vid as u32)?;
         // One pixel per container, so no N multiplier.
         self.update(DP_VID_TIMING, 1 << 8 | 0x3 << 10, 1 << 8)?;
-        self.update(DP_PIXEL_FORMAT, 0x3 << 30, 0)
+        self.update(DP_PIXEL_FORMAT, DP_PIXEL_PER_CYCLE_PROCESSING_MODE, 0)
     }
     /// `enc314_stream_encoder_dp_unblank`: stop the stream, reset the steering
     /// FIFO so a mode transition's overflow cannot persist, let the logic prime,
@@ -300,7 +325,7 @@ impl Stream {
             return Err(Error::Invalid);
         }
         let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, LAST_REG)
+            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 2, LAST_REG)
                 .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine {
             io: Mmio {

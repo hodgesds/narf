@@ -149,37 +149,56 @@ pub const GART_PTES_PER_PAGE: usize = 4096 / 8;
 // `drivers/gpu/drm/amd/include/asic_reg/gc/gc_9_0_offset.h` for
 // the MC_VM_* / MC_SHARED_* names.
 
-/// `mmMC_VM_FB_LOCATION_BASE` — visible-VRAM aperture base, in
-/// 16-MiB units. Bits[23:0] are the field; aperture covers
-/// `[base << 24, (top + 1) << 24)`. Already consumed by
-/// `read_vram_info` in `amdgpu.rs` via the duplicate constant
-/// there; this is the canonical home.
-pub const MC_VM_FB_LOCATION_BASE: u32 = 0x0000_6B0F;
-/// `mmMC_VM_FB_LOCATION_TOP` — visible-VRAM aperture top (inclusive
-/// 16-MiB unit).
-pub const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
+// Aperture bases are in 16-MiB units: bits[23:0] are the field, and the
+// aperture covers `[base << 24, (top + 1) << 24)`.
+//
+// The GFX9 values are `mm*` dword ids from `gc_9_0_offset.h`, all in the GC
+// block (BASE_IDX 0) — not a separate "MC" block, which is where the old
+// values' magnitude suggested they came from. `0x6B0F` appears in no AMD
+// header for any `MC_VM_FB_LOCATION_BASE` variant, of any generation.
+//
+// Phoenix needs different registers entirely: GFX11 reads
+// `regGCMC_VM_FB_LOCATION_BASE` (0x1678) and `_TOP` (0x1679) from the GC
+// block (`gfxhub_v3_0.c`), where GFX9 reads `mmMC_VM_FB_LOCATION_BASE`
+// (0x0980) and `_TOP` (0x0981) (`gfxhub_v1_0.c`). Both are provided; the
+// caller picks by family, as it already does for GRBM_STATUS.
+//
+// The AGP triple is also ordered TOP, BOT, BASE ascending (0x0982, 0x0983,
+// 0x0984) — not BASE, BOT, TOP. The old constants assumed the intuitive
+// order and so had all three wrong relative to each other as well as
+// absolutely.
 
-/// `mmMC_VM_FB_OFFSET` — offset added to GPU-virtual frame-buffer
-/// references before they hit the MC. Zero on most bring-up configs.
-pub const MC_VM_FB_OFFSET: u32 = 0x0000_6B11;
+/// `mmMC_VM_FB_LOCATION_BASE` (0x0980) — GFX9. Visible-VRAM aperture base
+/// in 16-MiB units.
+pub const MC_VM_FB_LOCATION_BASE: u32 = 0x0000_0980;
+/// `mmMC_VM_FB_LOCATION_TOP` (0x0981) — GFX9.
+pub const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_0981;
+/// `regGCMC_VM_FB_LOCATION_BASE` (0x1678) — GFX11 / Phoenix.
+pub const GCMC_VM_FB_LOCATION_BASE_GFX11: u32 = 0x0000_1678;
+/// `regGCMC_VM_FB_LOCATION_TOP` (0x1679) — GFX11 / Phoenix.
+pub const GCMC_VM_FB_LOCATION_TOP_GFX11: u32 = 0x0000_1679;
+/// `mmMC_VM_FB_OFFSET` (0x096b) — GFX9.
+pub const MC_VM_FB_OFFSET: u32 = 0x0000_096B;
+/// `mmMC_VM_AGP_TOP` (0x0982) — GFX9. Note TOP is the LOWEST of the three.
+pub const MC_VM_AGP_TOP: u32 = 0x0000_0982;
+/// `mmMC_VM_AGP_BOT` (0x0983) — GFX9.
+pub const MC_VM_AGP_BOT: u32 = 0x0000_0983;
+/// `mmMC_VM_AGP_BASE` (0x0984) — GFX9.
+pub const MC_VM_AGP_BASE: u32 = 0x0000_0984;
+/// `regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR` (0x167d) — GFX11 / Phoenix, GC
+/// BASE_IDX 0.
+///
+/// A different register from GFX9's `mmMC_VM_SYSTEM_APERTURE_LOW_ADDR`, the
+/// same way `GCMC_VM_FB_LOCATION_BASE` is a different register from
+/// `MC_VM_FB_LOCATION_BASE` — not one register at two offsets.
+pub const GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11: u32 = 0x0000_167D;
+/// `regGCMC_VM_SYSTEM_APERTURE_HIGH_ADDR` (0x167e) — GFX11 / Phoenix.
+pub const GCMC_VM_SYSTEM_APERTURE_HIGH_ADDR_GFX11: u32 = 0x0000_167E;
 
-/// `mmMC_VM_AGP_BASE` — base of the AGP aperture (legacy GART
-/// alternative). On modern chips this is the bottom of the
-/// GPU-virtual-address window the host can map. 16-MiB units.
-pub const MC_VM_AGP_BASE: u32 = 0x0000_6B0C;
-/// `mmMC_VM_AGP_BOT` — bottom of AGP aperture; 16-MiB units.
-pub const MC_VM_AGP_BOT: u32 = 0x0000_6B0D;
-/// `mmMC_VM_AGP_TOP` — top of AGP aperture; 16-MiB units.
-pub const MC_VM_AGP_TOP: u32 = 0x0000_6B0E;
-
-/// `mmMC_VM_SYSTEM_APERTURE_LOW_ADDR` — low bound of the system
-/// memory aperture (where the MC translates GPU accesses to PCIe
-/// host reads). Stored in 4-KiB units; on x86 this covers all host
-/// DRAM the GPU is allowed to touch.
-pub const MC_VM_SYSTEM_APERTURE_LOW_ADDR: u32 = 0x0000_6B17;
-/// `mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR` — high bound (inclusive),
-/// 4-KiB units.
-pub const MC_VM_SYSTEM_APERTURE_HIGH_ADDR: u32 = 0x0000_6B18;
+/// `mmMC_VM_SYSTEM_APERTURE_LOW_ADDR` (0x0985) — GFX9.
+pub const MC_VM_SYSTEM_APERTURE_LOW_ADDR: u32 = 0x0000_0985;
+/// `mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR` (0x0986) — GFX9.
+pub const MC_VM_SYSTEM_APERTURE_HIGH_ADDR: u32 = 0x0000_0986;
 /// `mmMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB` — low 32 bits of the
 /// phys address the MC uses when a GPU access falls outside both
 /// VRAM and system apertures. Pre-firmware this is the GART
@@ -193,9 +212,11 @@ pub const MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB: u32 = 0x0000_6B1A;
 /// Foundations wave reads it as part of chip-ID corroboration
 /// (channel count corroborates VRAM family) and hands it to the
 /// memory bring-up wave for interleave programming.
-pub const MC_SHARED_CHMAP: u32 = 0x0000_2004;
+/// `mmMC_SHARED_CHMAP` (0x0801). Was 0x2004.
+pub const MC_SHARED_CHMAP: u32 = 0x0000_0801;
 /// `mmMC_SHARED_CHREMAP` — companion remap table for CHMAP.
-pub const MC_SHARED_CHREMAP: u32 = 0x0000_2005;
+/// `mmMC_SHARED_CHREMAP` (0x0802). Was 0x2005.
+pub const MC_SHARED_CHREMAP: u32 = 0x0000_0802;
 
 // ── Aperture decode ────────────────────────────────────────────────
 

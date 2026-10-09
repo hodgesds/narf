@@ -1,7 +1,7 @@
 //! SMU 13.0.4 (Phoenix / HawkPoint1) per-version opcode table.
 //!
 //! SMU 13.0.4 is the power-management firmware variant shipped on
-//! Phoenix / HawkPoint1 silicon (PCI 1002:1900, Family 0x1A). The
+//! Phoenix / HawkPoint1 silicon (PCI 1002:15BF, GFX 11.0.1). The
 //! message-id space is completely distinct from SMU 12 (Renoir); even
 //! messages that exist on both chips carry different numeric ids.
 //!

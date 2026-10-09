@@ -213,22 +213,83 @@ kernel_test_in!(
 fn hubp_pacing_registers_carry_the_derived_deadlines() -> TestResult {
     let mut hubp = engine(0);
     let regs = registers();
+    // Seed the two HUBPRET_CONTROL bits this path must not disturb:
+    // PACK_3TO2_ELEMENT_DISABLE 0x00008000, which no DCN hubp code in Linux
+    // writes, and CROSSBAR_SRC_ALPHA 0x00030000 / CROSSBAR_SRC_Y_G 0x000C0000,
+    // which `hubp2_program_pixel_format` leaves alone (it is a REG_UPDATE_2
+    // over CB_B and CR_R only).
+    hubp.io.values[HUBPRET_CONTROL as usize] = 0x0000_8000 | 0x0004_0000;
     if hubp.program_pacing(&regs).is_err() {
         return TestResult::Fail("pacing rejected");
     }
+    let pret = hubp.io.values[HUBPRET_CONTROL as usize];
+    if pret & 0x0000_8000 == 0 {
+        return TestResult::Fail("PACK_3TO2_ELEMENT_DISABLE is not ours to clear");
+    }
+    if pret & 0x0003_0000 != 0x0000_0000 || pret & 0x000C_0000 != 0x0004_0000 {
+        return TestResult::Fail("the alpha and Y/G crossbar fields must survive");
+    }
+    // regHUBPRET0_HUBPRET_CONTROL__DET_BUF_PLANE1_BASE_ADDRESS_MASK is
+    // 0x00001FF0 — nine bits at 4, not twelve. There is no second detile plane
+    // on this path, so the field lands zero.
+    if pret & 0x0000_1FF0 != 0 {
+        return TestResult::Fail("no second detile plane means a zero base address");
+    }
+    // CROSSBAR_SRC_CR_R 0x00C00000 = 3 and CROSSBAR_SRC_CB_B 0x00300000 = 2 —
+    // `red_bar`/`blue_bar` for a non-byte-swapped A*GB surface.
+    if (pret & 0x00C0_0000) >> 22 != 3 || (pret & 0x0030_0000) >> 20 != 2 {
+        return TestResult::Fail("the RGB crossbar is not straight through");
+    }
     let v = &hubp.io.values;
-    // Request sizes, packed by their documented shifts.
-    if v[DCHUBP_REQ_SIZE_CONFIG as usize]
-        != regs.rq.swath_height
-            | regs.rq.pte_row_height_linear << 4
-            | regs.rq.chunk_size << 8
-            | regs.rq.min_chunk_size << 11
-            | regs.rq.meta_chunk_size << 14
-            | regs.rq.min_meta_chunk_size << 17
-            | regs.rq.dpte_group_size << 20
-            | regs.rq.mpte_group_size << 24
-    {
-        return TestResult::Fail("request size config");
+    // Request sizes. The shifts are the ones `dcn_3_1_4_sh_mask.h` gives, not
+    // the ones this module carries: SWATH_HEIGHT 0x00000007,
+    // PTE_ROW_HEIGHT_LINEAR 0x00000070, CHUNK_SIZE 0x00000700, MIN_CHUNK_SIZE
+    // 0x00001800, META_CHUNK_SIZE 0x00030000, MIN_META_CHUNK_SIZE 0x000C0000,
+    // DPTE_GROUP_SIZE 0x00700000, VM_GROUP_SIZE 0x07000000. Note the three
+    // unused bits between MIN_CHUNK_SIZE and META_CHUNK_SIZE — the run is not
+    // evenly spaced, which is what the old expectation assumed.
+    let req = v[DCHUBP_REQ_SIZE_CONFIG as usize];
+    let field = |mask: u32| (req & mask) >> mask.trailing_zeros();
+    for (mask, want, name) in [
+        (0x0000_0007u32, regs.rq.swath_height, "SWATH_HEIGHT"),
+        (
+            0x0000_0070,
+            regs.rq.pte_row_height_linear,
+            "PTE_ROW_HEIGHT_LINEAR",
+        ),
+        (0x0000_0700, regs.rq.chunk_size, "CHUNK_SIZE"),
+        (0x0000_1800, regs.rq.min_chunk_size, "MIN_CHUNK_SIZE"),
+        (0x0003_0000, regs.rq.meta_chunk_size, "META_CHUNK_SIZE"),
+        (
+            0x000C_0000,
+            regs.rq.min_meta_chunk_size,
+            "MIN_META_CHUNK_SIZE",
+        ),
+        (0x0070_0000, regs.rq.dpte_group_size, "DPTE_GROUP_SIZE"),
+        (0x0700_0000, regs.rq.mpte_group_size, "VM_GROUP_SIZE"),
+    ] {
+        if field(mask) != want {
+            let _ = name;
+            return TestResult::Fail("request size config field in the wrong place");
+        }
+    }
+    // Nothing may land outside the eight fields: bits 15:13, 19, 23 and 31:27
+    // are reserved, and the old shifts put META_CHUNK_SIZE's value in 15:14.
+    let defined = 0x0000_0007u32
+        | 0x0000_0070
+        | 0x0000_0700
+        | 0x0000_1800
+        | 0x0003_0000
+        | 0x000C_0000
+        | 0x0070_0000
+        | 0x0700_0000;
+    if req & !defined != 0 {
+        return TestResult::Fail("request size config wrote a reserved bit");
+    }
+    // The two meta fields are the ones that were misplaced, and both are
+    // non-zero here, so a wrong shift is visible rather than latent.
+    if regs.rq.meta_chunk_size == 0 || regs.rq.min_meta_chunk_size == 0 {
+        return TestResult::Fail("this fixture must exercise the meta fields");
     }
     // Expansion modes are not in the order the fields are named.
     if v[DCN_EXPANSION_MODE as usize]

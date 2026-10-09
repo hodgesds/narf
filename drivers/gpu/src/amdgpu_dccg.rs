@@ -8,17 +8,25 @@
 //!
 //! ## What this module ships
 //!
-//! - `PllAssignment` — which PLL backs which pipe. Phoenix has 4 PLLs.
+//! - `PllAssignment` — which PLL backs which pipe. Phoenix has 4.
 //! - `assign_plls` — runs the matrix algorithm: cluster pixel-clocks
 //!   into integer-related families; allocate one PLL per family with
 //!   the highest pixel-clock divisor count.
-//! - `program_dtbclk_dto` — produces the DCCG DTO register
-//!   programming for a single PLL→pipe assignment.
+//! - `program_pipe_dto` — produces the DCCG DTO register programming
+//!   for a single PLL→pipe assignment.
+//!
+//! LINUX-GAP: `dccg314_set_dtbclk_dto` asks the DTO for `pixclk / 4`
+//! unconditionally — the DTO output rate is a quarter of the pixel rate on
+//! this generation, with the remaining factor taken by `OTG_PIXEL_RATE_DIV`.
+//! `compute_dto_pair` ratios against the pixel clock itself, so the clock it
+//! synthesises is four times what the OTG expects. Nothing calls this module
+//! yet; the live path is [`crate::amdgpu_dcn_dccg`], which does divide by four.
 //!
 //! ## References
 //!
-//! - Linux drivers/gpu/drm/amd/display/dc/dccg/dcn35/dcn35_dccg.c
-//!   (dccg35_set_dtbclk_p_src / dccg35_set_dtbclk_dto).
+//! - Linux drivers/gpu/drm/amd/display/dc/dccg/dcn314/dcn314_dccg.c
+//!   (dccg314_set_dtbclk_p_src / dccg314_set_dtbclk_dto) — Phoenix is
+//!   DCN 3.1.4, so dcn314 is the binding implementation, not dcn35.
 //! - Linux drivers/gpu/drm/amd/display/dc/inc/hw/dccg.h
 //!
 //! GPL-2.0-or-later post-relicense.
@@ -29,9 +37,14 @@ use alloc::vec::Vec;
 
 // ── DCCG PLL inventory ────────────────────────────────────────────
 
-/// Phoenix DCN 3.5 has 4 PLLs available to the display engine
-/// (plus a fixed REFCLK source). Older DCN (2.0 / 3.0) had 5;
-/// DCN 3.5 dropped one with the iGPU integration.
+/// Phoenix (DCN 3.1.4) has 4 DTBCLK_P muxes available to the display engine,
+/// plus a fixed DPREFCLK source — four because `DTBCLK_P_CNTL` carries exactly
+/// four three-bit groups (`dcn_3_1_4_sh_mask.h`).
+///
+/// This is not a count that shrank over generations: `DTBCLK_P_CNTL` does not
+/// exist in `dcn_2_0_0_sh_mask.h` or `dcn_3_0_0_sh_mask.h` at all, arriving
+/// with DCN 3.1 alongside the HPO stream encoders, and DCN 3.5 has the same
+/// four.
 pub const N_DCCG_PLLS: usize = 4;
 
 /// One PLL's assignment. `freq_khz` is the PLL's target output
@@ -120,25 +133,39 @@ pub fn assign_plls(requests: &[PixelClockRequest]) -> Result<Vec<PllAssignment>,
 
 // ── DCCG register programming ─────────────────────────────────────
 
-/// DCCG DTO register offsets (relative to DCCG block base, Phoenix
-/// dcn35). The DTO drives the per-pipe pixel-clock divider; phase +
-/// module form a ratio that synthesises the final clock from the
-/// PLL's source frequency.
-pub const DCCG_DTBCLK_P_CNTL_BASE: u32 = 0x0150;
-pub const DCCG_DTBCLK_DTO_MODULE_BASE: u32 = 0x0200;
-pub const DCCG_DTBCLK_DTO_PHASE_BASE: u32 = 0x0204;
-pub const DCCG_PIXCLK_DTO_STRIDE: u32 = 0x10;
+/// DCCG DTBCLK register dword ids, from `dcn_3_1_4_offset.h`. The DTO drives
+/// the per-pipe pixel-clock divider; phase + modulo form a ratio that
+/// synthesises the final clock from the PLL's source frequency.
+///
+/// Phase and modulo are two separate four-element arrays, seven dwords apart,
+/// with phase *below* modulo — not one interleaved pair. Each array strides by
+/// a single dword per OTG instance.
+///
+/// `regDTBCLK_P_CNTL` lives at BASE_IDX 1 while the DTO registers are at
+/// BASE_IDX 2, so the two cannot be addressed from one block base; the
+/// instance base belongs with the register, not the block.
+pub const DTBCLK_P_CNTL: u32 = 0x0068;
+pub const DTBCLK_DTO0_PHASE: u32 = 0x0018;
+pub const DTBCLK_DTO0_MODULO: u32 = 0x001f;
+pub const DTBCLK_DTO_STRIDE: u32 = 1;
+/// `DTBCLK_P_CNTL` packs all four muxes into one dword: three bits per PLL,
+/// a two-bit `DTBCLK_P<n>_SRC_SEL` then a one-bit `DTBCLK_P<n>_EN`
+/// (`dcn_3_1_4_sh_mask.h`). Hence [`N_DCCG_PLLS`].
+pub const DTBCLK_P_CNTL_BITS_PER_PLL: u32 = 3;
+pub const DTBCLK_P_CNTL_EN_BIT: u32 = 2;
 
 pub trait DccgMmio {
-    fn read(&mut self, byte_off: u32) -> u32;
-    fn write(&mut self, byte_off: u32, value: u32);
+    fn read(&mut self, reg: u32) -> u32;
+    fn write(&mut self, reg: u32, value: u32);
 }
 
-/// Compute a (phase, module) DTO pair for a target pixel clock from
-/// a source PLL frequency. The pair forms a ratio: actual rate =
-/// pll_khz * phase / module. We use a phase = pixel_khz and module
-/// = pll_khz to get a unity gain; larger modulus gives finer
-/// granularity but the dword field is 24 bits so we cap accordingly.
+/// Compute a (phase, modulo) DTO pair for a target pixel clock from a source
+/// PLL frequency. The pair forms a ratio: actual rate = pll_khz * phase /
+/// modulo, so phase = target and modulo = source is exact and needs no
+/// rounding. Both fields are the full 32 bits of their dword
+/// (`DTBCLK_DTO0_PHASE_MASK` is `0xFFFFFFFF`), so there is nothing to cap;
+/// `dccg31_set_dtbclk_dto` scales the same ratio by 1000 only to keep
+/// resolution for its divided ODM cases, which this does not yet handle.
 pub fn compute_dto_pair(pll_khz: u32, target_khz: u32) -> Option<(u32, u32)> {
     if pll_khz == 0 || target_khz == 0 || target_khz > pll_khz {
         return None;
@@ -147,9 +174,16 @@ pub fn compute_dto_pair(pll_khz: u32, target_khz: u32) -> Option<(u32, u32)> {
     Some((target_khz, pll_khz))
 }
 
-/// Program one pipe's DTBCLK DTO with the (phase, module) pair.
-/// Adapted from `dccg35_set_dtbclk_dto`. Per-pipe stride is
-/// `DCCG_PIXCLK_DTO_STRIDE`.
+/// Program one pipe's DTBCLK DTO with the (phase, modulo) pair, modulo first
+/// as `dccg31_set_dtbclk_dto` does.
+///
+/// LINUX-GAP: Linux brackets these two writes with `OTG<n>_PIXEL_RATE_CNTL`
+/// (0x0080, BASE_IDX 1, stride 4): it clears `DTBCLK_DTO<n>_ENABLE` and sets
+/// the ODM divider first, sets enable after the ratio is in, polls
+/// `DTBCLKDTO<n>_ENABLE_STATUS`, and only then points `PIPE<n>_DTO_SRC_SEL` at
+/// the DTO — the comment in `dccg31_set_dtbclk_dto` is explicit that the
+/// source select must come last. None of that bracketing is here, so the ratio
+/// lands in a DTO nothing is switched onto.
 pub fn program_pipe_dto<M: DccgMmio>(
     mmio: &mut M,
     dccg_base: u32,
@@ -157,9 +191,9 @@ pub fn program_pipe_dto<M: DccgMmio>(
     phase: u32,
     module: u32,
 ) {
-    let stride = (pipe_idx as u32) * DCCG_PIXCLK_DTO_STRIDE;
-    mmio.write(dccg_base + DCCG_DTBCLK_DTO_MODULE_BASE + stride, module);
-    mmio.write(dccg_base + DCCG_DTBCLK_DTO_PHASE_BASE + stride, phase);
+    let stride = (pipe_idx as u32) * DTBCLK_DTO_STRIDE;
+    mmio.write(dccg_base + DTBCLK_DTO0_MODULO + stride, module);
+    mmio.write(dccg_base + DTBCLK_DTO0_PHASE + stride, phase);
 }
 
 /// Program every pipe in a PllAssignment list. After this, each
@@ -312,18 +346,23 @@ mod smoke_tests {
         }
     }
 
+    /// The dword ids are spelled out rather than built from the constants
+    /// under test, so that a wrong constant fails here instead of being
+    /// restated. From `dcn_3_1_4_offset.h`: phase 0x0018..0x001b, modulo
+    /// 0x001f..0x0022. OTG 2 is therefore phase 0x001a and modulo 0x0021.
     fn smoke_program_pipe_dto_writes_module_then_phase() -> TestResult {
         let mut m = MockDccg { writes: Vec::new() };
-        program_pipe_dto(&mut m, 0x10000, 2, 0x123, 0x456);
+        program_pipe_dto(&mut m, 0, 2, 0x123, 0x456);
         if m.writes.len() != 2 {
             return TestResult::Fail("expected 2 writes");
         }
-        let stride = 2 * DCCG_PIXCLK_DTO_STRIDE;
-        if m.writes[0] != (0x10000 + DCCG_DTBCLK_DTO_MODULE_BASE + stride, 0x456) {
-            return TestResult::Fail("module wrong");
+        if m.writes[0] != (0x0021, 0x456) {
+            return TestResult::Fail(
+                "modulo should be regDTBCLK_DTO2_MODULO 0x0021, written first",
+            );
         }
-        if m.writes[1] != (0x10000 + DCCG_DTBCLK_DTO_PHASE_BASE + stride, 0x123) {
-            return TestResult::Fail("phase wrong");
+        if m.writes[1] != (0x001a, 0x123) {
+            return TestResult::Fail("phase should be regDTBCLK_DTO2_PHASE 0x001a, written second");
         }
         TestResult::Pass
     }
@@ -331,6 +370,33 @@ mod smoke_tests {
         "drivers/gpu",
         smoke_program_pipe_dto_writes_module_then_phase
     );
+
+    /// Phase sits *below* modulo, and both arrays stride by one dword per
+    /// instance. A table that interleaved the pair, or strided by four, would
+    /// have the phase of one pipe land on another pipe's modulo.
+    fn smoke_dccg_dtbclk_dto_arrays_are_disjoint() -> TestResult {
+        if DTBCLK_DTO0_PHASE >= DTBCLK_DTO0_MODULO {
+            return TestResult::Fail("regDTBCLK_DTO0_PHASE 0x0018 is below _MODULO 0x001f");
+        }
+        if DTBCLK_DTO_STRIDE != 1 {
+            return TestResult::Fail("consecutive DTO instances are one dword apart");
+        }
+        // Four instances per array, and the phase array must end before the
+        // modulo array begins.
+        let last_phase = DTBCLK_DTO0_PHASE + (N_DCCG_PLLS as u32 - 1) * DTBCLK_DTO_STRIDE;
+        if last_phase >= DTBCLK_DTO0_MODULO {
+            return TestResult::Fail("phase array overruns the modulo array");
+        }
+        // One dword holds every mux: four PLLs x three bits must fit.
+        if N_DCCG_PLLS as u32 * DTBCLK_P_CNTL_BITS_PER_PLL > 32 {
+            return TestResult::Fail("DTBCLK_P_CNTL cannot hold that many muxes");
+        }
+        if DTBCLK_P_CNTL_EN_BIT >= DTBCLK_P_CNTL_BITS_PER_PLL {
+            return TestResult::Fail("EN is the third bit of each three-bit group");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu", smoke_dccg_dtbclk_dto_arrays_are_disjoint);
 
     fn smoke_program_assignments_writes_each_pipe() -> TestResult {
         let mut m = MockDccg { writes: Vec::new() };
@@ -345,7 +411,7 @@ mod smoke_tests {
             },
         ];
         let plls = assign_plls(&reqs).expect("assign");
-        program_assignments(&mut m, 0x10000, &reqs, &plls);
+        program_assignments(&mut m, 0, &reqs, &plls);
         // 2 pipes × 2 writes (module + phase) = 4.
         if m.writes.len() != 4 {
             return TestResult::Fail("expected 4 writes");

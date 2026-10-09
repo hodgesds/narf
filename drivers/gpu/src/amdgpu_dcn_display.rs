@@ -31,9 +31,20 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// Scanout surfaces are fetched in 256-byte requests, so the pitch is rounded
 /// out to one; the base is page aligned because the pool allocates pages.
 const PITCH_ALIGN: u32 = 256;
-/// The widest mode this single-pipe linear path will drive, which is the DML
-/// linear swath ceiling.
-const MAX_WIDTH: u32 = 8192;
+/// The widest and tallest mode this single-pipe path will drive, taken from the
+/// blocks that have to carry them rather than restated here.
+///
+/// Horizontally that is [`crate::amdgpu_dcn_otg::MAX_SEGMENT_WIDTH`] — 8191,
+/// the `OPTC_SEGMENT_WIDTH` field, since this path bypasses ODM and so puts
+/// the whole active width into one OPP segment. It used to be 8192, described
+/// as "the DML linear swath ceiling", which is neither the right number nor the
+/// right reason: the OTG then refused the one extra column, so a 8192-wide
+/// sink was accepted here and rejected three steps later.
+///
+/// Vertically it is the 14-bit `RECOUT_HEIGHT` / `DPG_ACTIVE_HEIGHT` fields
+/// `amdgpu_dcn_plane` programs, which bound the plane at 16383 lines.
+const MAX_WIDTH: u32 = crate::amdgpu_dcn_otg::MAX_SEGMENT_WIDTH;
+const MAX_HEIGHT: u32 = crate::amdgpu_dcn_plane::MAX_DIMENSION;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -94,6 +105,7 @@ pub fn timing_from_edid(detailed: &DetailedTiming) -> Result<Timing, Error> {
     if h_active == 0
         || v_active == 0
         || h_active > MAX_WIDTH
+        || v_active > MAX_HEIGHT
         || timing.pixel_clock_khz == 0
         || h_total <= h_active
         || v_total <= v_active
@@ -495,8 +507,11 @@ impl Pipeline {
         self.dccg
             .set_pixel_rate_div(self.pipe, Divider::By1, Divider::By4)?;
         if self.route.channel == crate::amdgpu_dmub::Channel::Dpia {
-            self.dccg
-                .set_dp_stream_clock(self.route.aux, crate::amdgpu_dcn_dccg::StreamClock::Dtbclk)?;
+            self.dccg.set_dp_stream_clock(
+                self.route.aux,
+                self.pipe,
+                crate::amdgpu_dcn_dccg::StreamClock::Dtbclk,
+            )?;
         }
 
         // 2. Timing, with the global sync the prefetch schedule settled on.
@@ -596,6 +611,7 @@ impl Pipeline {
                 self.dccg
                     .set_dp_stream_clock(
                         self.route.aux,
+                        self.pipe,
                         crate::amdgpu_dcn_dccg::StreamClock::Disabled,
                     )
                     .map_err(Error::Hardware),

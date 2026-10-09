@@ -51,14 +51,39 @@
 
 extern crate alloc;
 
-// ── Register offsets (relative to MP1 IP-block base) ───────────────
+// ── Register offsets (relative to the MP1 IP-block base) ───────────
+//
+// `regMP1_SMN_C2PMSG_N` is dword `0x240 + N`, which the headers bear out:
+// C2PMSG_64 is 0x0280, 65 is 0x0281, 66 is 0x0282, 82 is 0x0292 and 90 is
+// 0x029a. The byte offset is that times four.
+//
+// These were `0x29C + N * 4`, a formula that is neither the dword id nor a
+// byte offset derived from one: it put the argument register at byte 0x3A4
+// where C2PMSG_66 is at 0xA08. Every SMU message — the version handshake,
+// GFX power up and down, the DPM frequency calls — went to the wrong
+// register, and the response was read from another wrong one.
+//
+// LINUX-GAP: on Phoenix (`mp_13_0_4_offset.h`) these are **BASE_IDX 1**, so
+// they are addressed from the MP1 block's second window. `mp1_base` here is
+// a single value and the callers pass window 0, which is the same shape of
+// gap recorded for the GC registers in `amdgpu_gfx`. Resolving the second
+// window is the fix; until then an SMU message lands in the wrong window
+// even with the right offset.
 
-/// MP1_C2PMSG_66 — argument register (host → SMU).
-pub const MP1_C2PMSG_ARG_REL: u32 = 0x29C + 66 * 4;
-/// MP1_C2PMSG_82 — message-id register (host → SMU).
-pub const MP1_C2PMSG_MSG_REL: u32 = 0x29C + 82 * 4;
-/// MP1_C2PMSG_90 — response register (SMU → host).
-pub const MP1_C2PMSG_RESP_REL: u32 = 0x29C + 90 * 4;
+/// Dword id of `regMP1_SMN_C2PMSG_0`, from which the rest follow.
+const MP1_C2PMSG_BASE_DWORD: u32 = 0x240;
+
+/// Byte offset of `regMP1_SMN_C2PMSG_<n>` within the MP1 window.
+const fn mp1_c2pmsg(n: u32) -> u32 {
+    (MP1_C2PMSG_BASE_DWORD + n) * 4
+}
+
+/// `MP1_SMN_C2PMSG_66` — argument register (host → SMU).
+pub const MP1_C2PMSG_ARG_REL: u32 = mp1_c2pmsg(66);
+/// `MP1_SMN_C2PMSG_82` — message-id register (host → SMU).
+pub const MP1_C2PMSG_MSG_REL: u32 = mp1_c2pmsg(82);
+/// `MP1_SMN_C2PMSG_90` — response register (SMU → host).
+pub const MP1_C2PMSG_RESP_REL: u32 = mp1_c2pmsg(90);
 
 // ── Response codes ──────────────────────────────────────────────────
 
@@ -134,17 +159,23 @@ pub const PPSMC_MSG_PREPARE_MP1_FOR_UNLOAD: u32 = 0x35;
 //      numeric id with different semantics per chip).
 //   5. Poll RESP for OK / error code.
 //
-// MP1_C2PMSG_64 / 65 sit at offset 0x29C + 64*4 / + 65*4 in the
-// MP1 register window. Slot 64 doubles as the PMFW-phys-lo input
-// + the response status when an LoadMicrocode call completes —
-// same dual-use shape as PSP's MP0_C2PMSG_64.
+// MP1_C2PMSG_64 / 65 are dwords 0x240 + 64 and 0x240 + 65 in the MP1 window —
+// see `mp1_c2pmsg`. (An earlier note here said `0x29C + N * 4`, which is the
+// same stale base the offsets table carried.)
+//
+// LINUX-GAP: `PPSMC_MSG_LoadMicrocode` appears in none of the
+// `pmfw_if/*_ppsmc.h` headers, so the id below has no in-tree source and the
+// "0x02 on smu_v14" attribution cannot be checked. It does not matter for the
+// roster — both audited families are APUs whose PMFW is BIOS-resident, and
+// `FwEntry::smu_pmfw` is dead code for exactly that reason — but a discrete
+// bring-up must source this before using it.
 
 /// MP1_C2PMSG_64 — PMFW phys-lo on input; never used for other
 /// SMU messages so collisions with `send_message_*` are
 /// structurally impossible (those use slot 90).
-pub const MP1_C2PMSG_PMFW_LO_REL: u32 = 0x29C + 64 * 4;
+pub const MP1_C2PMSG_PMFW_LO_REL: u32 = mp1_c2pmsg(64);
 /// MP1_C2PMSG_65 — PMFW phys-hi.
-pub const MP1_C2PMSG_PMFW_HI_REL: u32 = 0x29C + 65 * 4;
+pub const MP1_C2PMSG_PMFW_HI_REL: u32 = mp1_c2pmsg(65);
 
 /// `PPSMC_MSG_LoadMicrocode` — Phoenix-class only (smu_v14+).
 /// Tells the MP1 ROM to start consuming the PMFW image at the
@@ -305,26 +336,124 @@ pub fn set_clock_range<M: SmuMmio>(
     Ok(())
 }
 
-// ── Thermal ────────────────────────────────────────────────────────
+// ── Metrics table ──────────────────────────────────────────────────
+//
+// LINUX-GAP: there is no `GetCurrentTemperature` message. What stood here was
+// `PPSMC_MSG_GET_CURRENT_TEMPERATURE = 0x36`, described as "the value Linux
+// uses on Renoir; Phoenix renumbers a few SMU messages but this one is
+// stable". On SMU 12 (Renoir) 0x36 is `PPSMC_MSG_UpdatePmeRestore`, marked
+// "Moved to VBIOS"; on SMU 13.0.4 (Phoenix) the message space ends at
+// `PPSMC_Message_Count = 0x31`, so 0x36 is out of range and the SMU would
+// answer `PPSMC_Result_UnknownCmd`. No PPSMC message returns a temperature on
+// either generation.
+//
+// Temperature, power, activity and per-core data all come from the metrics
+// table: the driver publishes a DRAM address with
+// `PPSMC_MSG_SetDriverDramAddrHigh`/`Low` and then asks for
+// `PPSMC_MSG_TransferTableSmu2Dram`, after which `SmuMetrics_t` is readable
+// from that buffer. `smu_v13_0_4_ppt.c::smu_v13_0_4_get_smu_metrics_data`
+// is the reader.
+//
+// The DMA buffer and the transfer handshake are not wired up yet. The decoder
+// below is, so that when they are, the field offsets are not guessed: they
+// come from `offsetof` on `SmuMetrics_t` in `smu13_driver_if_v13_0_4.h`.
 
-/// `PPSMC_MSG_GetCurrentTemperature` — returns the GPU package
-/// temperature in tenths-of-a-degree Celsius (d°C) via ARG. The
-/// concrete ID below is the value Linux uses on Renoir; Phoenix
-/// renumbers a few SMU messages but this one is stable.
-pub const PPSMC_MSG_GET_CURRENT_TEMPERATURE: u32 = 0x36;
+/// `sizeof(SmuMetrics_t)` for SMU 13.0.4. The transfer buffer must be at
+/// least this large, and a shorter slice is rejected rather than decoded.
+pub const SMU_METRICS_V13_0_4_BYTES: usize = 160;
 
-/// Read the GPU package temperature in milli-degrees Celsius.
-/// The SMU reports tenths (d°C); we scale by 100 to land in m°C
-/// so the value composes with k10temp's reading without unit drift.
-pub fn read_gpu_temperature_millicelsius<M: SmuMmio>(
-    mmio: &mut M,
-    mp1_base: u32,
-) -> Result<i32, SmuError> {
-    let raw = send_message_get(mmio, mp1_base, PPSMC_MSG_GET_CURRENT_TEMPERATURE, 0)?;
-    // d°C → m°C: multiply by 100. Cast to i32 — the SMU never
-    // returns negative temps in operation but the OS surface
-    // wants a signed type for consistency with k10temp.
-    Ok((raw as i32) * 100)
+/// Byte offsets within `SmuMetrics_t`. Every field below is `uint16_t`; the
+/// two `uint32_t` power fields sit at 0x5c and 0x60.
+mod metrics_off {
+    pub const GFXCLK_FREQUENCY: usize = 0x00;
+    pub const SOCCLK_FREQUENCY: usize = 0x02;
+    pub const MEMCLK_FREQUENCY: usize = 0x08;
+    pub const GFX_ACTIVITY: usize = 0x0c;
+    pub const UVD_ACTIVITY: usize = 0x0e;
+    /// `Voltage[2]`, indexed VDDCR_VDD then VDDCR_SOC.
+    pub const VOLTAGE: usize = 0x10;
+    pub const L3_TEMPERATURE: usize = 0x4e;
+    pub const GFX_TEMPERATURE: usize = 0x50;
+    pub const SOC_TEMPERATURE: usize = 0x52;
+    pub const THROTTLER_STATUS: usize = 0x54;
+    pub const CURRENT_SOCKET_POWER: usize = 0x56;
+    pub const APU_POWER: usize = 0x5c;
+    pub const AVERAGE_SOCKET_POWER: usize = 0x88;
+}
+
+/// The subset of `SmuMetrics_t` this driver reads. Units are the firmware's
+/// own, converted at the edge.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SmuMetrics {
+    pub gfxclk_mhz: u16,
+    pub socclk_mhz: u16,
+    pub memclk_mhz: u16,
+    /// Activity in centi-percent, as the firmware's `//[centi]` comment says:
+    /// `smu_v13_0_4_ppt.c` divides by 100 to get a percentage.
+    pub gfx_activity_centi_percent: u16,
+    pub vcn_activity_centi_percent: u16,
+    /// `Voltage[0]` / `Voltage[1]`: VDDCR_VDD and VDDCR_SOC, in millivolts.
+    pub vddgfx_mv: u16,
+    pub vddsoc_mv: u16,
+    /// Temperatures in **centi**-Celsius. `METRICS_TEMPERATURE_EDGE` divides
+    /// `GfxTemperature` by 100 and then scales to milli-Celsius, so the raw
+    /// unit is hundredths of a degree — not the tenths this used to assume.
+    pub gfx_temperature_centi_c: u16,
+    pub soc_temperature_centi_c: u16,
+    pub l3_temperature_centi_c: u16,
+    pub throttler_status: u16,
+    /// Milliwatts.
+    pub current_socket_power_mw: u16,
+    pub average_socket_power_mw: u16,
+    pub apu_power_mw: u32,
+}
+
+/// Decode a transferred `SmuMetrics_t`. Returns `None` for a buffer shorter
+/// than the structure.
+pub fn parse_metrics(table: &[u8]) -> Option<SmuMetrics> {
+    use metrics_off as f;
+    if table.len() < SMU_METRICS_V13_0_4_BYTES {
+        return None;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([table[o], table[o + 1]]);
+    let u32_at =
+        |o: usize| u32::from_le_bytes([table[o], table[o + 1], table[o + 2], table[o + 3]]);
+    Some(SmuMetrics {
+        gfxclk_mhz: u16_at(f::GFXCLK_FREQUENCY),
+        socclk_mhz: u16_at(f::SOCCLK_FREQUENCY),
+        memclk_mhz: u16_at(f::MEMCLK_FREQUENCY),
+        gfx_activity_centi_percent: u16_at(f::GFX_ACTIVITY),
+        vcn_activity_centi_percent: u16_at(f::UVD_ACTIVITY),
+        vddgfx_mv: u16_at(f::VOLTAGE),
+        vddsoc_mv: u16_at(f::VOLTAGE + 2),
+        gfx_temperature_centi_c: u16_at(f::GFX_TEMPERATURE),
+        soc_temperature_centi_c: u16_at(f::SOC_TEMPERATURE),
+        l3_temperature_centi_c: u16_at(f::L3_TEMPERATURE),
+        throttler_status: u16_at(f::THROTTLER_STATUS),
+        current_socket_power_mw: u16_at(f::CURRENT_SOCKET_POWER),
+        average_socket_power_mw: u16_at(f::AVERAGE_SOCKET_POWER),
+        apu_power_mw: u32_at(f::APU_POWER),
+    })
+}
+
+impl SmuMetrics {
+    /// Edge temperature in milli-Celsius, the unit the OS thermal surface
+    /// wants. `METRICS_TEMPERATURE_EDGE` is `GfxTemperature / 100 *
+    /// SMU_TEMPERATURE_UNITS_PER_CENTIGRADES`, so centi-Celsius times ten —
+    /// the conversion a tenths-of-a-degree reading would have got wrong by a
+    /// factor of ten.
+    pub fn edge_temperature_milli_c(&self) -> i32 {
+        self.gfx_temperature_centi_c as i32 * 10
+    }
+    /// Hotspot temperature in milli-Celsius (`METRICS_TEMPERATURE_HOTSPOT`
+    /// reads `SocTemperature`).
+    pub fn hotspot_temperature_milli_c(&self) -> i32 {
+        self.soc_temperature_centi_c as i32 * 10
+    }
+    /// Activity as a whole percentage.
+    pub fn gfx_activity_percent(&self) -> u16 {
+        self.gfx_activity_centi_percent / 100
+    }
 }
 
 /// Read the highest DPM-level frequency for `clk_id` (in MHz).
@@ -761,19 +890,6 @@ pub fn get_fw_version<M: SmuMmio>(
 ) -> Result<SmuFwVersion, SmuError> {
     let raw = send_msg(mmio, mp1_base, version, PpsmcMsg::GetSmuVersion, 0)?;
     Ok(SmuFwVersion::from_raw(raw))
-}
-
-/// Read the GPU temperature in milli-degrees Celsius.
-///
-/// The SMU reports temperature in tenths-of-a-degree (d°C) via the
-/// `GetCurrentTemperature` message. We scale by 100 to land in m°C
-/// so the value composes with k10temp readings without unit drift.
-///
-/// NOTE: this uses the existing raw `PPSMC_MSG_GET_CURRENT_TEMPERATURE`
-/// constant (0x36) which is stable across SMU12 and SMU13. If future
-/// silicon renumbers it, promote it into the per-version tables.
-pub fn get_temperature_milli_c<M: SmuMmio>(mmio: &mut M, mp1_base: u32) -> Result<i32, SmuError> {
-    read_gpu_temperature_millicelsius(mmio, mp1_base)
 }
 
 /// Read the current clock frequency for `domain` in MHz.

@@ -138,7 +138,11 @@ kernel_test_in!(
 
 fn vbios_vfct_matches_function_and_rejects_ambiguity() -> TestResult {
     let table = vfct(&[image()]);
-    for offset in [0, 4, 8, 12, 14, 16, 18] {
+    // The identity fields `amdgpu_acpi_vfct_match` requires: slot (4),
+    // function (8), vendor (12), device (14), and the two subsystem ids.
+    // The bus at offset 0 is deliberately absent — it is a preference, see
+    // `smoke_vfct_bus_number_is_a_preference_not_a_requirement`.
+    for offset in [4, 8, 12, 14, 16, 18] {
         let mut other = table.clone();
         other[VFCT_HEADER + offset] ^= 1;
         checksum(&mut other);
@@ -288,4 +292,51 @@ fn vbios_shadow_requires_pcir_and_live_authority() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vbios",
     vbios_shadow_requires_pcir_and_live_authority
+);
+
+/// `amdgpu_acpi_vfct_match`: vendor, device, slot and function must match;
+/// the bus number is a preference. A kernel that renumbers PCI buses leaves
+/// the POST-time bus in the table disagreeing with the runtime one, and Linux
+/// deliberately accepts that rather than losing the VBIOS.
+fn smoke_vfct_bus_number_is_a_preference_not_a_requirement() -> TestResult {
+    // One image recorded on a different bus than the device now sits on.
+    let mut table = vfct(&[image()]);
+    put32(&mut table, VFCT_HEADER, 0x11);
+    checksum(&mut table);
+    if Vbios::from_vfct(&table, &device()).is_err() {
+        return TestResult::Fail("an identity match with a stale bus must still be accepted");
+    }
+
+    // Two images, one on the right bus and one not: the exact match wins
+    // rather than being reported as ambiguous.
+    let mut table = vfct(&[image(), image()]);
+    put32(&mut table, VFCT_HEADER, 0x11);
+    checksum(&mut table);
+    if Vbios::from_vfct(&table, &device()).is_err() {
+        return TestResult::Fail("an exact bus match must win over a stale one");
+    }
+
+    // Identity still has to match: a different device id is not our VBIOS,
+    // whatever bus it claims.
+    let mut table = vfct(&[image()]);
+    put16(&mut table, VFCT_HEADER + 14, 0x1901);
+    checksum(&mut table);
+    if Vbios::from_vfct(&table, &device()).err() != Some(Error::NotFound) {
+        return TestResult::Fail("a foreign device id must not match");
+    }
+
+    // Two equally stale entries are genuinely ambiguous.
+    let mut table = vfct(&[image(), image()]);
+    put32(&mut table, VFCT_HEADER, 0x11);
+    let second = VFCT_HEADER + IMAGE_HEADER + image().len();
+    put32(&mut table, second, 0x12);
+    checksum(&mut table);
+    if Vbios::from_vfct(&table, &device()).err() != Some(Error::Ambiguous) {
+        return TestResult::Fail("two stale matches are ambiguous");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vbios",
+    smoke_vfct_bus_number_is_a_preference_not_a_requirement
 );

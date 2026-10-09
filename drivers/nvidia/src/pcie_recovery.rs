@@ -31,7 +31,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_bus::pcie_recovery::{
-    register_error_callback, ErrorCallback, PciErrSeverity, PciErsResult,
+    register_error_callback, ErrorCallback, PciChannelState, PciErrSeverity, PciErsResult,
 };
 use narf_bus::BusAddr;
 
@@ -62,14 +62,17 @@ impl CardRecovery {
 }
 
 impl ErrorCallback for CardRecovery {
-    fn error_detected(&self, severity: PciErrSeverity) -> PciErsResult {
+    fn error_detected(&self, _severity: PciErrSeverity, state: PciChannelState) -> PciErsResult {
         self.error_detected_count.fetch_add(1, Ordering::SeqCst);
-        // Mirrors `nouveau_pci_error_detected`. Fatal → bus crate
-        // will execute the link reset and then call `slot_reset`.
-        match severity {
-            PciErrSeverity::Correctable => PciErsResult::CanRecover,
-            PciErrSeverity::NonFatal => PciErsResult::CanRecover,
-            PciErrSeverity::Fatal => PciErsResult::NeedReset,
+        // The channel state is what decides this, as in every in-tree
+        // driver's `error_detected` (e.g. `nvme_error_detected`,
+        // `e1000_io_error_detected`). Frozen → the bus crate executes
+        // the link reset and then calls `slot_reset`; PermFailure means
+        // the device is gone and no reset will bring it back.
+        match state {
+            PciChannelState::Normal => PciErsResult::CanRecover,
+            PciChannelState::Frozen => PciErsResult::NeedReset,
+            PciChannelState::PermFailure => PciErsResult::Disconnect,
         }
     }
 

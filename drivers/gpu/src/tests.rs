@@ -166,8 +166,10 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
     let regs = registered_pci_drivers();
     let want: &[(u16, u16)] = &[
         (amdgpu::AMD_VENDOR, amdgpu::PHOENIX_HAWKPOINT1),
-        (amdgpu::AMD_VENDOR, amdgpu::PHOENIX_DISCRETE),
+        (amdgpu::AMD_VENDOR, amdgpu::PHOENIX1),
+        (amdgpu::AMD_VENDOR, amdgpu::PHOENIX2),
         (amdgpu::AMD_VENDOR, amdgpu::STRIX_POINT),
+        (amdgpu::AMD_VENDOR, amdgpu::REMBRANDT),
         (amdgpu::AMD_VENDOR, amdgpu::RAPHAEL),
         (amdgpu::AMD_VENDOR, amdgpu::CEZANNE),
         (amdgpu::AMD_VENDOR, amdgpu::RENOIR),
@@ -380,8 +382,10 @@ fn smoke_amdgpu_pm4_write_data_fence_packet() -> TestResult {
 kernel_test_in!("drivers/gpu", smoke_amdgpu_pm4_write_data_fence_packet);
 
 fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
-    use crate::amdgpu_ring::{Ring, DOORBELL_STRIDE_BYTES, RING_SIZE_DW};
-    let mut ring = match Ring::new(7) {
+    use crate::amdgpu_ring::{
+        DoorbellKind, Ring, RingError, DOORBELL_STRIDE_BYTES, NOP_DW, RING_SIZE_DW,
+    };
+    let mut ring = match Ring::new(7, DoorbellKind::Gfx) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("Ring::new failed"),
     };
@@ -394,21 +398,109 @@ fn smoke_amdgpu_ring_submit_advances_wptr() -> TestResult {
     if ring.wptr() != 0 {
         return TestResult::Fail("fresh ring should have wptr=0");
     }
+    // A fresh ring is filled with the NOP PACKET, not zeros. A zero dword is
+    // a PM4 TYPE0 header naming register 0, so an engine that ran past the
+    // written region would write into register 0 rather than idle.
+    for i in [0u64, 1, 511, (RING_SIZE_DW as u64) - 1] {
+        // SAFETY: the ring's backing is alive for the test.
+        if unsafe { ring.peek(i) } != NOP_DW {
+            return TestResult::Fail("a fresh ring must be filled with NOP packets");
+        }
+    }
+
     let pkt = [0xDEAD_BEEFu32, 0x1234_5678, 0xAAAA_5555, 0x0000_0001];
     // SAFETY: smoke harness owns the ring exclusively.
-    let new_wptr = match unsafe { ring.submit(&pkt) } {
+    let new_wptr = match unsafe { ring.submit(&pkt, 0) } {
         Ok(w) => w,
         Err(_) => return TestResult::Fail("submit rejected 4-dword packet"),
     };
     if new_wptr != 4 || ring.wptr() != 4 {
         return TestResult::Fail("wptr didn't advance by 4 dwords");
     }
-    // Trying to submit a packet that would overflow the ring's
-    // contiguous tail returns NotEnoughRoomBeforeWrap.
+    for (i, want) in pkt.iter().enumerate() {
+        // SAFETY: as above.
+        if unsafe { ring.peek(i as u64) } != *want {
+            return TestResult::Fail("a submitted dword is not in the ring");
+        }
+    }
+
+    // Space is measured against what the GPU has CONSUMED, not against the
+    // end of the buffer — a packet may straddle the wrap freely.
+    if ring.used_dw(0) != 4 || ring.free_dw(0) != RING_SIZE_DW as u64 - 4 {
+        return TestResult::Fail("used/free accounting is wrong");
+    }
+    // With rptr caught up, the whole ring is free again even though wptr is
+    // not at the base.
+    if ring.free_dw(4) != RING_SIZE_DW as u64 {
+        return TestResult::Fail("a fully consumed ring should be entirely free");
+    }
+
+    // Writing more than the GPU has consumed must be refused: overwriting
+    // unconsumed dwords corrupts a command the engine is still executing.
     let huge = alloc::vec![0u32; RING_SIZE_DW];
     // SAFETY: same.
-    if unsafe { ring.submit(&huge) }.is_ok() {
-        return TestResult::Fail("oversized packet should fail");
+    if !matches!(unsafe { ring.submit(&huge, 0) }, Err(RingError::Full)) {
+        return TestResult::Fail("a packet larger than the free space must be Full");
+    }
+    // Larger than the ring can ever hold is a different answer — no amount of
+    // waiting would make it fit.
+    let enormous = alloc::vec![0u32; RING_SIZE_DW + 1];
+    if !matches!(
+        // SAFETY: smoke harness owns the ring exclusively.
+        unsafe { ring.submit(&enormous, 0) },
+        Err(RingError::TooLarge)
+    ) {
+        return TestResult::Fail("a packet larger than the ring must be TooLarge");
+    }
+
+    // ── the wrap ──
+    // Fill to four dwords short of the end, then submit an 8-dword packet so
+    // it straddles the boundary. The old implementation refused this outright.
+    let mut consumed = 0u64;
+    while ring.wptr() < RING_SIZE_DW as u64 - 4 {
+        // SAFETY: as above; rptr is advanced in step so there is always room.
+        if unsafe { ring.insert_nop(4, consumed) }.is_err() {
+            return TestResult::Fail("filling the ring with NOPs failed");
+        }
+        consumed = ring.wptr().saturating_sub(16);
+    }
+    let straddle: [u32; 8] = [0x1111_1111, 2, 3, 4, 5, 6, 7, 0x8888_8888];
+    let before = ring.wptr();
+    // SAFETY: as above.
+    if unsafe { ring.submit(&straddle, before) }.is_err() {
+        return TestResult::Fail("a packet straddling the wrap should be accepted");
+    }
+    if ring.wptr() != before + 8 {
+        return TestResult::Fail("the wrapping submit did not advance wptr by 8");
+    }
+    // The first four landed at the end of the buffer and the last four at the
+    // start — which is what a circular ring means.
+    for (i, want) in straddle.iter().enumerate() {
+        // SAFETY: as above.
+        if unsafe { ring.peek(before + i as u64) } != *want {
+            return TestResult::Fail("a straddling packet's dwords are misplaced");
+        }
+    }
+    // SAFETY: as above.
+    if unsafe { ring.peek(0) } != straddle[4] {
+        return TestResult::Fail("the wrapped tail should land at the ring base");
+    }
+
+    // ── alignment padding ──
+    let rptr = ring.wptr();
+    // SAFETY: as above.
+    if unsafe { ring.align_to(8, rptr) }.is_err() {
+        return TestResult::Fail("align_to failed");
+    }
+    if ring.wptr() % 8 != 0 {
+        return TestResult::Fail("align_to did not reach the alignment");
+    }
+    // Already aligned: a no-op, not a whole extra period of padding.
+    let aligned = ring.wptr();
+    // SAFETY: as above.
+    let _ = unsafe { ring.align_to(8, rptr) };
+    if ring.wptr() != aligned {
+        return TestResult::Fail("align_to padded an already-aligned ring");
     }
     TestResult::Pass
 }
@@ -482,101 +574,99 @@ fn smoke_dp_aux_native_write_encodes_payload() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_dp_aux_native_write_encodes_payload);
 
+/// Offsets spelled out from `offsetof` on `struct atom_firmware_info_v3_4`.
 fn smoke_amdgpu_atom_fwinfo_v3_round_trip() -> TestResult {
-    use crate::amdgpu_atom_fwinfo::{parse, FwInfoError};
-    let mut t = alloc::vec![0u8; 0x80];
-    // ATOM_COMMON_TABLE_HEADER: usSize=0x80, fmt=4, content=0x34
-    t[0..2].copy_from_slice(&0x80u16.to_le_bytes());
-    t[2] = 4;
-    t[3] = 0x34;
-    // firmware_revision = 0x0000_1234
-    t[0x04..0x08].copy_from_slice(&0x1234u32.to_le_bytes());
-    // engine clock = 1500 MHz = 150_000 (10kHz units)
-    t[0x08..0x0C].copy_from_slice(&150_000u32.to_le_bytes());
-    // memory clock = 6400 MHz = 640_000
-    t[0x0C..0x10].copy_from_slice(&640_000u32.to_le_bytes());
-    // max pixel clock = 1188 MHz = 118_800
-    t[0x20..0x24].copy_from_slice(&118_800u32.to_le_bytes());
-    // bootup VDDC = 950 mV
-    t[0x2E..0x30].copy_from_slice(&950u16.to_le_bytes());
-    // memory module id = 7, cooling solution id = 2
-    t[0x59] = 7;
-    t[0x5A] = 2;
+    use crate::amdgpu_atom_fwinfo::{
+        parse, FwInfoError, ATOM_FIRMWARE_CAP_FIRMWARE_POSTED, FWINFO_V3_1_BYTES, FWINFO_V3_4_BYTES,
+    };
+    if FWINFO_V3_1_BYTES != 72 || FWINFO_V3_4_BYTES != 108 {
+        return TestResult::Fail("v3.1 is 72 bytes and v3.4 is 108");
+    }
+    let mut t = alloc::vec![0u8; FWINFO_V3_4_BYTES];
+    // atom_common_table_header: structuresize u16, format_revision u8,
+    // content_revision u8. The major is 3 and the minor a whole byte — not a
+    // nibble pair, which is what `content_revision >> 4` assumed.
+    t[0..2].copy_from_slice(&(FWINFO_V3_4_BYTES as u16).to_le_bytes());
+    t[2] = 3;
+    t[3] = 4;
+    t[0x04..0x08].copy_from_slice(&0x1234u32.to_le_bytes()); // firmware_revision
+    t[0x08..0x0c].copy_from_slice(&150_000u32.to_le_bytes()); // bootup_sclk, 1500 MHz
+    t[0x0c..0x10].copy_from_slice(&640_000u32.to_le_bytes()); // bootup_mclk, 6400 MHz
+                                                              // firmware_capability is a full dword at 0x10, not a u16 at 0x51.
+    t[0x10..0x14].copy_from_slice(&ATOM_FIRMWARE_CAP_FIRMWARE_POSTED.to_le_bytes());
+    t[0x14..0x18].copy_from_slice(&0xDEAD_0000u32.to_le_bytes()); // main_call_parser_entry
+    t[0x18..0x1c].copy_from_slice(&0x0000_1F00u32.to_le_bytes()); // bios_scratch_reg_startaddr
+    t[0x1c..0x1e].copy_from_slice(&950u16.to_le_bytes()); // bootup_vddc_mv
+    t[0x1e..0x20].copy_from_slice(&900u16.to_le_bytes()); // bootup_vddci_mv
+    t[0x20..0x22].copy_from_slice(&1350u16.to_le_bytes()); // bootup_mvddc_mv
+    t[0x22..0x24].copy_from_slice(&800u16.to_le_bytes()); // bootup_vddgfx_mv
+    t[0x24] = 7; // mem_module_id
+    t[0x25] = 2; // coolingsolution_id
+    t[0x28..0x2c].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // mc_baseaddr_high
+    t[0x2c..0x30].copy_from_slice(&0x8000_0000u32.to_le_bytes()); // mc_baseaddr_low
+    t[0x3c..0x40].copy_from_slice(&0x55u32.to_le_bytes()); // pplib_pptable_id
+
     let info = match parse(&t) {
         Ok(i) => i,
-        Err(_) => return TestResult::Fail("FwInfo parse rejected synthetic table"),
+        Err(_) => return TestResult::Fail("FwInfo parse rejected a valid v3.4 table"),
     };
-    if info.format_revision != 4 || info.content_revision != 0x34 {
-        return TestResult::Fail("revision fields wrong");
+    if info.format_revision != 3 || info.content_revision != 4 {
+        return TestResult::Fail("the major is 3 and the minor 4");
     }
     if info.firmware_revision != 0x1234 {
         return TestResult::Fail("firmware_revision round-trip");
     }
-    if info.default_engine_mhz() != 1500 {
-        return TestResult::Fail("engine clock MHz conversion");
+    if info.bootup_sclk_mhz() != 1500 || info.bootup_mclk_mhz() != 6400 {
+        return TestResult::Fail("clock MHz conversion");
     }
-    if info.default_memory_mhz() != 6400 {
-        return TestResult::Fail("memory clock MHz conversion");
+    // The capability dword sits where the old parser read an SPLL frequency.
+    if !info.firmware_posted() || info.firmware_capability != 1 {
+        return TestResult::Fail("firmware_capability is a dword at 0x10");
     }
-    if info.max_pixel_clock_pll_10khz != 118_800 {
-        return TestResult::Fail("max pixel clock");
+    if info.main_call_parser_entry != 0xDEAD_0000 || info.bios_scratch_reg_startaddr != 0x1F00 {
+        return TestResult::Fail("parser entry at 0x14, scratch start at 0x18");
     }
-    if info.bootup_vddc_mv != 950 {
-        return TestResult::Fail("bootup VDDC");
+    // Four voltages in a row from 0x1c. The old parser read bootup_vddc from
+    // 0x2e, which is the top half of mc_baseaddr_low.
+    if info.bootup_vddc_mv != 950
+        || info.bootup_vddci_mv != 900
+        || info.bootup_mvddc_mv != 1350
+        || info.bootup_vddgfx_mv != 800
+    {
+        return TestResult::Fail("the voltage quartet starts at 0x1c");
     }
-    if info.memory_module_id != 7 || info.cooling_solution_id != 2 {
-        return TestResult::Fail("memory/cooling ids");
+    if info.mem_module_id != 7 || info.coolingsolution_id != 2 {
+        return TestResult::Fail("the ids are at 0x24 and 0x25, not 0x59 and 0x5a");
     }
-    // V2.x rejected.
+    if info.mc_baseaddr_high != 1 || info.mc_baseaddr_low != 0x8000_0000 {
+        return TestResult::Fail("mc_baseaddr pair at 0x28/0x2c");
+    }
+    if info.pplib_pptable_id != Some(0x55) {
+        return TestResult::Fail("pplib_pptable_id is at 0x3c on v3.4");
+    }
+
+    // A v3.1 table is 72 bytes and stops before pplib_pptable_id. The old
+    // guard demanded 0x5B and would have rejected it outright.
+    let short = &t[..FWINFO_V3_1_BYTES];
+    match parse(short) {
+        Ok(i) if i.pplib_pptable_id.is_none() => {}
+        Ok(_) => return TestResult::Fail("a 72-byte table has no pplib_pptable_id"),
+        Err(_) => return TestResult::Fail("a 72-byte v3.1 table is valid"),
+    }
+    if parse(&t[..FWINFO_V3_1_BYTES - 1]).is_err() {
+        // Shorter than the smallest v3 structure.
+    } else {
+        return TestResult::Fail("a table below 72 bytes must be rejected");
+    }
+    // A major other than 3 is refused.
     let mut bad = t.clone();
-    bad[3] = 0x24; // content rev V2.4
-    if !matches!(parse(&bad), Err(FwInfoError::UnsupportedVersion(_))) {
-        return TestResult::Fail("V2 should be rejected");
+    bad[2] = 2;
+    if !matches!(parse(&bad), Err(FwInfoError::UnsupportedVersion(2))) {
+        return TestResult::Fail("format_revision 2 must be rejected");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_fwinfo_v3_round_trip);
-
-fn smoke_amdgpu_ucode_header_round_trip() -> TestResult {
-    use crate::amdgpu_ucode::{parse, payload, UcodeError, UCODE_MAGIC};
-    // Build a 1024-byte synthetic blob: 4-byte magic + 32-byte
-    // common header at offset 4 + zero-fill to 256, then a
-    // 768-byte fake payload starting at offset 256.
-    let mut blob = alloc::vec![0u8; 1024];
-    blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
-    blob[4..8].copy_from_slice(&256u32.to_le_bytes()); // start_offset
-    blob[8..12].copy_from_slice(&768u32.to_le_bytes()); // payload_size
-    blob[12..16].copy_from_slice(&0x0001_0203u32.to_le_bytes()); // version
-    blob[16..20].copy_from_slice(&0x0042u32.to_le_bytes()); // feature ver
-    let hdr = match parse(&blob) {
-        Ok(h) => h,
-        Err(_) => return TestResult::Fail("ucode parse rejected synthetic blob"),
-    };
-    if hdr.start_offset != 256 || hdr.payload_size != 768 {
-        return TestResult::Fail("offsets round-trip");
-    }
-    if hdr.version != 0x0001_0203 || hdr.feature_version != 0x0042 {
-        return TestResult::Fail("version round-trip");
-    }
-    let p = payload(&blob, &hdr);
-    if p.len() != 768 {
-        return TestResult::Fail("payload length");
-    }
-    // Bad magic.
-    let mut bad = blob.clone();
-    bad[0] ^= 0xFF;
-    if !matches!(parse(&bad), Err(UcodeError::BadMagic)) {
-        return TestResult::Fail("bad magic should reject");
-    }
-    // Payload-out-of-bounds.
-    let mut bad = blob.clone();
-    bad[8..12].copy_from_slice(&2000u32.to_le_bytes()); // size > blob
-    if !matches!(parse(&bad), Err(UcodeError::PayloadOutOfBounds)) {
-        return TestResult::Fail("oversize payload should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/gpu", smoke_amdgpu_ucode_header_round_trip);
 
 fn smoke_dp_link_training_completes_against_stub() -> TestResult {
     // Stub AUX channel that simulates a healthy 2-lane sink: CR
@@ -666,61 +756,37 @@ fn smoke_dp_link_training_completes_against_stub() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_dp_link_training_completes_against_stub);
 
-fn smoke_amdgpu_pptable_v11_directory_round_trip() -> TestResult {
-    use crate::amdgpu_pptable::{PpTable, PpTableError, Subtable};
-    let mut t = alloc::vec![0u8; 80];
-    // Header: usSize=80, fmt=11, content=0
-    t[0..2].copy_from_slice(&80u16.to_le_bytes());
-    t[2] = 11;
-    t[3] = 0;
-    // Set a subset of offsets.
-    // Subtable::PlatformDescriptor (idx 0) → 0x100
-    t[4..8].copy_from_slice(&0x100u32.to_le_bytes());
-    // Subtable::FanTable (idx 4) → 0x200
-    t[20..24].copy_from_slice(&0x200u32.to_le_bytes());
-    // Subtable::SocClockDependency (idx 6) → 0x300
-    t[28..32].copy_from_slice(&0x300u32.to_le_bytes());
-    let pp = match PpTable::parse(&t) {
-        Ok(p) => p,
-        Err(_) => return TestResult::Fail("PpTable parse rejected V11.0"),
-    };
-    if pp.format_revision != 11 {
-        return TestResult::Fail("format revision");
-    }
-    if pp.present_count() != 3 {
-        return TestResult::Fail("present_count != 3");
-    }
-    if pp.offset(Subtable::PlatformDescriptor) != Ok(0x100) {
-        return TestResult::Fail("PlatformDescriptor offset");
-    }
-    if pp.offset(Subtable::FanTable) != Ok(0x200) {
-        return TestResult::Fail("FanTable offset");
-    }
-    if !matches!(
-        pp.offset(Subtable::OverdriveTable8),
-        Err(PpTableError::TableAbsent)
-    ) {
-        return TestResult::Fail("absent subtable should fail");
-    }
-    // V8 rejected.
-    let mut bad = t.clone();
-    bad[2] = 8;
-    if !matches!(
-        PpTable::parse(&bad),
-        Err(PpTableError::UnsupportedVersion(_))
-    ) {
-        return TestResult::Fail("V8 should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_v11_directory_round_trip);
+// LINUX-GAP: four PowerPlay-table smokes stood here, exercising
+// `amdgpu_pptable` and `amdgpu_pptable_subtables`. Both modules are gone.
+//
+// The directory they decoded was sixteen `u32` pointers from offset 0x04, with
+// names like `ulPlatformDescriptorOffset`, `ulOverdriveTable8Offset`,
+// `ulVdciClockDependencyTableOffset` and `ulSrambitTableOffset`, cited as
+// "V11.0 — Vega+ baseline". The real Vega+ table is
+// `ATOM_Vega10_POWERPLAYTABLE`: a four-byte common header, then
+// `ucTableRevision` at 0x04 and `usTableSize` at 0x05 — so the first
+// "pointer" straddled two scalars — and its subtable offsets are **u16**,
+// living at 0x30..0x4e. Not one of the sixteen field names appears in any AMD
+// header, the pointer width is wrong, and the base offset is wrong.
+//
+// The table id was wrong too: the module read `data_table(0x32)`, and the
+// master data table has around thirty-five entries.
+//
+// And neither chip in this driver's roster has a PowerPlay table at all.
+// `renoir_ppt.c` and `smu_v13_0_4_ppt.c` define no `setup_pptable`: an APU's
+// power limits live in PMFW, not in VBIOS. There is nothing here to parse on
+// the hardware this driver targets, so the modules are deleted rather than
+// rewritten against a table that would still never be read.
 
 fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     use crate::amdgpu_atom_displayobj::{ConnectorKind, DisplayObjError, DisplayObjectTable};
-    // Build a synthetic display-object table with 3 paths:
-    //   path 0: DP connector (object id 0x13), instance 0
-    //   path 1: HDMI-A (0x0C), instance 1
-    //   path 2: eDP   (0x14), instance 0
+    // Build a synthetic display-object table with 3 paths. An object id is
+    // type at 15:12, enum id at 11:8, object id at 7:0 — so a connector is
+    // 0x3 in the top nibble, the instance next, and the
+    // `CONNECTOR_OBJECT_ID_*` in the low byte:
+    //   path 0: DP     (0x13) enum 1
+    //   path 1: HDMI-A (0x0C) enum 2
+    //   path 2: eDP    (0x14) enum 1
     let mut t = alloc::vec![0u8; 8 + 3 * 8];
     // Header.
     t[0..2].copy_from_slice(&((8u16 + 3 * 8).to_le_bytes()));
@@ -730,9 +796,9 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
     t[6] = 3; // num_paths
               // Paths start at 8.
     let paths = [
-        (0x0001u16, (0x13u16 << 8), 0x1100u16),        // DP
-        (0x0002u16, (0x0Cu16 << 8) | 1u16, 0x1101u16), // HDMI-A
-        (0x0004u16, (0x14u16 << 8), 0x1102u16),        // eDP
+        (0x0001u16, 0x3113u16, 0x1100u16), // DP, enum 1
+        (0x0002u16, 0x320Cu16, 0x1101u16), // HDMI-A, enum 2
+        (0x0004u16, 0x3114u16, 0x1102u16), // eDP, enum 1
     ];
     for (i, (tag, conn, gpu)) in paths.iter().enumerate() {
         let off = 8 + i * 8;
@@ -756,8 +822,8 @@ fn smoke_amdgpu_atom_displayobj_iter_paths() -> TestResult {
         return TestResult::Fail("path 0 not DP");
     }
     let p1 = tbl.next().expect("second path");
-    if p1.connector_kind != ConnectorKind::HdmiA || p1.connector_index != 1 {
-        return TestResult::Fail("path 1 not HDMI-A.1");
+    if p1.connector_kind != ConnectorKind::HdmiA || p1.connector_index != 2 {
+        return TestResult::Fail("path 1 not HDMI-A enum 2");
     }
     let p2 = tbl.next().expect("third path");
     if p2.connector_kind != ConnectorKind::Edp {
@@ -920,202 +986,130 @@ kernel_test_in!(
     smoke_amdgpu_offsets_runtime_registry_overrides_compile_time
 );
 
-fn smoke_amdgpu_atom_dcn_init_data_round_trip() -> TestResult {
-    use crate::amdgpu_atom_dcn::{parse, DcnInitError};
-    let mut t = alloc::vec![0u8; 0x20];
-    t[0..2].copy_from_slice(&0x1Au16.to_le_bytes());
-    t[2] = 1;
-    t[3] = 0;
-    t[0x04] = 4; // max_disp_engines
-    t[0x05] = 2; // max_active
-    t[0x06] = 6; // max_ppll
-    t[0x07] = 1; // core_ref_clk_source
-                 // disp_clk_used = 600 MHz = 60_000 (10 kHz units)
-    t[0x08..0x0C].copy_from_slice(&60_000u32.to_le_bytes());
-    // max_disp_clk = 1500 MHz
-    t[0x0C..0x10].copy_from_slice(&150_000u32.to_le_bytes());
-    // boot mode 1920x1080 @ 148.5 MHz
-    t[0x10..0x12].copy_from_slice(&1920u16.to_le_bytes());
-    t[0x12..0x14].copy_from_slice(&1080u16.to_le_bytes());
-    t[0x14..0x18].copy_from_slice(&14_850u32.to_le_bytes());
-    t[0x18] = 0; // XRGB8888
-    let info = match parse(&t) {
-        Ok(i) => i,
-        Err(_) => return TestResult::Fail("parse rejected"),
-    };
-    if info.format_revision != 1 {
-        return TestResult::Fail("format revision");
-    }
-    if info.max_disp_engines != 4 || info.max_active_engines != 2 {
-        return TestResult::Fail("engine counts");
-    }
-    if info.boot_h_active != 1920 || info.boot_v_active != 1080 {
-        return TestResult::Fail("boot mode resolution");
-    }
-    if info.boot_pixel_clock_10khz != 14_850 {
-        return TestResult::Fail("boot pixel clock");
-    }
-    if info.max_disp_clk_10khz != 150_000 {
-        return TestResult::Fail("max disp clock");
-    }
-    // V2 rejected.
-    let mut bad = t.clone();
-    bad[2] = 2;
-    if !matches!(parse(&bad), Err(DcnInitError::UnsupportedVersion(_))) {
-        return TestResult::Fail("V2 should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_dcn_init_data_round_trip);
+// LINUX-GAP: `smoke_amdgpu_atom_dcn_init_data_round_trip` stood here,
+// exercising an `ATOM_DCN_INIT_DATA` parser at data-table index 0x14. No such
+// table exists: index 0x14 of `atom_master_list_of_data_tables_v2_1` is
+// `sw_datatable20`, a software-reserved slot, and none of the fields that
+// parser decoded — `ulMaxDispEngineNum`, `ulMaxPPLLNum`,
+// `ulBootDispMode_pixel_clock` — appear in `atomfirmware.h`. The real
+// per-board display-engine parameters are `atom_display_controller_info_v4_x`
+// at index 27, which `amdgpu_dcn_inventory` reads and which audited clean. The
+// module and this test are both gone rather than pointed at a second copy of
+// that work.
 
+/// An object id packs type at 15:12, enum id at 11:8 and the object's own id
+/// at 7:0 (`displayobject.h`). Values spelled out from `ObjectID.h`.
 fn smoke_amdgpu_displayobj_object_chain_walker() -> TestResult {
     use crate::amdgpu_atom_displayobj::{
-        DisplayObjectTable, ATOM_OBJECT_TYPE_CLOCK_SRC, ATOM_OBJECT_TYPE_ENCODER,
-        ATOM_OBJECT_TYPE_TRANSMITTER,
+        ConnectorKind, DisplayObjectTable, ObjectLink, ENUM_ID_MASK, ENUM_ID_SHIFT,
+        GRAPH_OBJECT_TYPE_CONNECTOR, GRAPH_OBJECT_TYPE_ENCODER, GRAPH_OBJECT_TYPE_GPU,
+        GRAPH_OBJECT_TYPE_ROUTER, OBJECT_ID_MASK, OBJECT_TYPE_MASK, OBJECT_TYPE_SHIFT,
     };
-    // Path-with-chain layout: 8-byte header + 6 bytes of chain
-    // (3 × u16 — encoder, transmitter, sentinel). One path,
-    // size = 14 bytes total.
+    // `enum object_id_bit`: four bits of type at 12, four of enum id at 8.
+    if OBJECT_ID_MASK != 0x00FF
+        || ENUM_ID_MASK != 0x0F00
+        || ENUM_ID_SHIFT != 8
+        || OBJECT_TYPE_MASK != 0xF000
+        || OBJECT_TYPE_SHIFT != 12
+    {
+        return TestResult::Fail("object-id field positions");
+    }
+    // `GRAPH_OBJECT_TYPE_*` are 0..7, so nothing in this field can equal the
+    // 0x21/0x22/0x23 the old constants compared against.
+    if GRAPH_OBJECT_TYPE_GPU != 1
+        || GRAPH_OBJECT_TYPE_ENCODER != 2
+        || GRAPH_OBJECT_TYPE_CONNECTOR != 3
+        || GRAPH_OBJECT_TYPE_ROUTER != 4
+    {
+        return TestResult::Fail("GRAPH_OBJECT_TYPE values");
+    }
+    // Encoder type 2, enum id 1, ENCODER_OBJECT_ID_INTERNAL_UNIPHY1 (0x20).
+    let enc = ObjectLink::from_raw(0x2120);
+    if enc.kind != GRAPH_OBJECT_TYPE_ENCODER || enc.enum_id != 1 || enc.instance != 0x20 {
+        return TestResult::Fail("0x2120 is encoder, enum 1, object 0x20");
+    }
+    if !enc.is_encoder() || enc.is_connector() || enc.is_router() {
+        return TestResult::Fail("encoder predicate");
+    }
+    // Connector type 3, enum id 1, CONNECTOR_OBJECT_ID_DISPLAYPORT (0x13).
+    let conn = ObjectLink::from_raw(0x3113);
+    if !conn.is_connector() || conn.instance != 0x13 {
+        return TestResult::Fail("0x3113 is connector, object 0x13");
+    }
+
+    // Path-with-chain layout: 8-byte header + 6 bytes of chain (encoder,
+    // connector, sentinel). One path, 14 bytes.
     let mut t = alloc::vec![0u8; 8 + 14];
-    // Header.
     t[0..2].copy_from_slice(&((8u16 + 14).to_le_bytes()));
     t[2] = 1;
     t[3] = 0;
     t[4..6].copy_from_slice(&0u16.to_le_bytes());
     t[6] = 1;
-    // Path 0 header (8 bytes):
     let off = 8;
     t[off..off + 2].copy_from_slice(&0x0001u16.to_le_bytes()); // device_tag
     t[off + 2..off + 4].copy_from_slice(&14u16.to_le_bytes()); // path size
-    t[off + 4..off + 6].copy_from_slice(&(0x13u16 << 8).to_le_bytes()); // DP/0
+                                                               // Connector object id: type 3, enum 1, DISPLAYPORT 0x13.
+    t[off + 4..off + 6].copy_from_slice(&0x3113u16.to_le_bytes());
     t[off + 6..off + 8].copy_from_slice(&0x1100u16.to_le_bytes()); // GPU obj
-                                                                   // Chain: encoder/0 (0x21<<8), transmitter/2 (0x22<<8 | 2), sentinel.
-    t[off + 8..off + 10].copy_from_slice(&((ATOM_OBJECT_TYPE_ENCODER as u16) << 8).to_le_bytes());
-    t[off + 10..off + 12]
-        .copy_from_slice(&((ATOM_OBJECT_TYPE_TRANSMITTER as u16) << 8 | 2u16).to_le_bytes());
-    t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes());
+    t[off + 8..off + 10].copy_from_slice(&0x2120u16.to_le_bytes()); // encoder
+    t[off + 10..off + 12].copy_from_slice(&0x3113u16.to_le_bytes()); // connector
+    t[off + 12..off + 14].copy_from_slice(&0u16.to_le_bytes()); // sentinel
 
     let mut tbl = match DisplayObjectTable::parse(&t) {
         Ok(p) => p,
         Err(_) => return TestResult::Fail("path parse"),
     };
-    let _path = tbl.next().expect("first path");
-    // Walk the chain following that path.
+    let path = tbl.next().expect("first path");
+    if path.connector_kind != ConnectorKind::Dp {
+        return TestResult::Fail("0x13 in the low byte is DisplayPort");
+    }
     let mut chain = tbl.chain_at(8, 14);
     let l1 = chain.next().expect("link 1");
-    if l1.kind != ATOM_OBJECT_TYPE_ENCODER || l1.instance != 0 {
-        return TestResult::Fail("link 1 not encoder/0");
+    if !l1.is_encoder() || l1.enum_id != 1 || l1.instance != 0x20 {
+        return TestResult::Fail("link 1 not encoder enum 1 object 0x20");
     }
     let l2 = chain.next().expect("link 2");
-    if l2.kind != ATOM_OBJECT_TYPE_TRANSMITTER || l2.instance != 2 {
-        return TestResult::Fail("link 2 not transmitter/2");
+    if !l2.is_connector() || l2.instance != 0x13 {
+        return TestResult::Fail("link 2 not connector 0x13");
     }
     if chain.next().is_some() {
         return TestResult::Fail("sentinel didn't terminate chain");
     }
-    let _ = ATOM_OBJECT_TYPE_CLOCK_SRC; // referenced for visibility check
+
+    // Connector object ids, from ObjectID.h. VGA is 0x05 — 0x01 is
+    // single-link DVI-I — and 0x17 is USBC, which Phoenix's DPIA presents as.
+    for (id, want) in [
+        (0x01u8, ConnectorKind::DviI),
+        (0x02, ConnectorKind::DviI),
+        (0x03, ConnectorKind::DviD),
+        (0x04, ConnectorKind::DviD),
+        (0x05, ConnectorKind::Vga),
+        (0x0C, ConnectorKind::HdmiA),
+        (0x0D, ConnectorKind::HdmiB),
+        (0x0E, ConnectorKind::Lvds),
+        (0x13, ConnectorKind::Dp),
+        (0x14, ConnectorKind::Edp),
+        (0x16, ConnectorKind::Edp),
+        (0x17, ConnectorKind::Usbc),
+    ] {
+        let objid = 0x3000u16 | 0x0100 | id as u16;
+        let mut t2 = t.clone();
+        t2[off + 4..off + 6].copy_from_slice(&objid.to_le_bytes());
+        let mut tbl2 = DisplayObjectTable::parse(&t2).expect("parse");
+        if tbl2.next().expect("path").connector_kind != want {
+            return TestResult::Fail("connector object id mapping");
+        }
+    }
+    // 0x15 is MXM, not DSI — there is no DSI connector object id.
+    let mut t2 = t.clone();
+    t2[off + 4..off + 6].copy_from_slice(&0x3115u16.to_le_bytes());
+    let mut tbl2 = DisplayObjectTable::parse(&t2).expect("parse");
+    if tbl2.next().expect("path").connector_kind != ConnectorKind::Unknown(0x15) {
+        return TestResult::Fail("0x15 is MXM and must not decode as a panel");
+    }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_displayobj_object_chain_walker);
-
-fn smoke_amdgpu_pptable_fan_table_round_trip() -> TestResult {
-    use crate::amdgpu_pptable_subtables::{FanTable, PpSubtableError};
-    let mut t = alloc::vec![0u8; 0x40];
-    // Header: usSize=0x40, fmt=11, content=0
-    t[0..2].copy_from_slice(&0x40u16.to_le_bytes());
-    t[2] = 11;
-    t[3] = 0;
-    // Body.
-    t[4] = 9; // rev_id
-    t[5] = 30; // thyst
-    t[6..8].copy_from_slice(&3_000u16.to_le_bytes()); // t_min = 30.00 C
-    t[8..10].copy_from_slice(&6_000u16.to_le_bytes()); // t_med = 60.00 C
-    t[10..12].copy_from_slice(&8_000u16.to_le_bytes()); // t_high = 80.00 C
-    t[12..14].copy_from_slice(&50u16.to_le_bytes()); // pwm_min
-    t[14..16].copy_from_slice(&128u16.to_le_bytes()); // pwm_med
-    t[16..18].copy_from_slice(&200u16.to_le_bytes()); // pwm_high
-    t[18..20].copy_from_slice(&9_500u16.to_le_bytes()); // t_max = 95.00 C
-    t[20] = 1; // fan_control_mode
-    t[21..23].copy_from_slice(&255u16.to_le_bytes()); // fan_pwm_max
-    t[31] = 80; // target_temperature (whole C)
-    t[51] = 1; // enable_zero_rpm
-    t[52] = 50; // fan_stop_temperature (whole C)
-    t[53] = 60; // fan_start_temperature (whole C)
-
-    let fan = match FanTable::parse(&t) {
-        Ok(f) => f,
-        Err(_) => return TestResult::Fail("FanTable parse rejected"),
-    };
-    if fan.rev_id != 9 {
-        return TestResult::Fail("rev_id");
-    }
-    if fan.t_min != 3_000 || fan.t_max != 9_500 {
-        return TestResult::Fail("temperature range");
-    }
-    if fan.pwm_min != 50 || fan.fan_pwm_max != 255 {
-        return TestResult::Fail("pwm values");
-    }
-    if fan.target_temperature != 80 || fan.fan_stop_temperature != 50 {
-        return TestResult::Fail("target/stop temps");
-    }
-    if fan.enable_zero_rpm != 1 {
-        return TestResult::Fail("zero_rpm");
-    }
-    // rev_id 11 rejected.
-    let mut bad = t.clone();
-    bad[4] = 11;
-    if !matches!(
-        FanTable::parse(&bad),
-        Err(PpSubtableError::UnsupportedRevision(11))
-    ) {
-        return TestResult::Fail("rev 11 should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!("drivers/gpu", smoke_amdgpu_pptable_fan_table_round_trip);
-
-fn smoke_amdgpu_pptable_powertune_table_round_trip() -> TestResult {
-    use crate::amdgpu_pptable_subtables::{PowerTuneTable, PpSubtableError};
-    let mut t = alloc::vec![0u8; 0x40];
-    t[0..2].copy_from_slice(&0x40u16.to_le_bytes());
-    t[2] = 11;
-    t[3] = 0;
-    t[4] = 1; // rev_id
-              // TDP = 80 W = 640 (Q5.3).
-    t[5..7].copy_from_slice(&640u16.to_le_bytes());
-    t[7..9].copy_from_slice(&720u16.to_le_bytes()); // configurable_tdp = 90 W
-    t[9..11].copy_from_slice(&20_480u16.to_le_bytes()); // tdc = 80 A in Q8.8
-    t[21..23].copy_from_slice(&10_000u16.to_le_bytes()); // tj_max = 100.00 C
-    t[27..29].copy_from_slice(&10_500u16.to_le_bytes()); // shutdown = 105.00 C
-
-    let pt = match PowerTuneTable::parse(&t) {
-        Ok(p) => p,
-        Err(_) => return TestResult::Fail("PowerTuneTable parse rejected"),
-    };
-    if pt.tdp_watts() != 80 {
-        return TestResult::Fail("TDP watts conversion");
-    }
-    if pt.tj_max_celsius() != 100 {
-        return TestResult::Fail("TjMax celsius conversion");
-    }
-    if pt.software_shutdown_temp != 10_500 {
-        return TestResult::Fail("shutdown temp round-trip");
-    }
-    // rev_id 6 rejected (>5).
-    let mut bad = t.clone();
-    bad[4] = 6;
-    if !matches!(
-        PowerTuneTable::parse(&bad),
-        Err(PpSubtableError::UnsupportedRevision(6))
-    ) {
-        return TestResult::Fail("rev 6 should reject");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu",
-    smoke_amdgpu_pptable_powertune_table_round_trip
-);
 
 fn smoke_amdgpu_atombios_command_table_directory() -> TestResult {
     // Symmetric to the data-table directory smoke from Stage 3
@@ -1176,93 +1170,195 @@ kernel_test_in!(
     smoke_amdgpu_atombios_command_table_directory
 );
 
-fn smoke_amdgpu_rlc_header_and_autoload_round_trip() -> TestResult {
-    use crate::amdgpu_rlc::{autoload_iter, looks_like_rlc, parse};
-    use crate::amdgpu_ucode::UCODE_MAGIC;
-    // Build a 1024-byte synthetic RLC blob:
-    //   - 4-byte magic + common ucode header (version etc.)
-    //   - RLC extension at offset 0x24
-    //   - autoload offset table at 0x100, 3 × 12 byte entries
-    //   - payload at 0x200 (24-byte filler — autoload entries
-    //     point into it)
-    let mut blob = alloc::vec![0u8; 1024];
-    blob[0..4].copy_from_slice(&UCODE_MAGIC.to_le_bytes());
-    blob[4..8].copy_from_slice(&256u32.to_le_bytes()); // start_offset
-    blob[8..12].copy_from_slice(&512u32.to_le_bytes()); // payload_size
-    blob[12..16].copy_from_slice(&1u32.to_le_bytes()); // version
-                                                       // RLC extension fields.
-    blob[0x58..0x5C].copy_from_slice(&0x100u32.to_le_bytes()); // autoload offset
-    blob[0x5C..0x60].copy_from_slice(&36u32.to_le_bytes()); // autoload size
-                                                            // Autoload entries: 3 × 12 bytes.
-    let entries = [
-        (0x10u32, 0x200u32, 8u32),
-        (0x11u32, 0x208u32, 8u32),
-        (0x12u32, 0x210u32, 8u32),
-    ];
-    for (i, (id, off, sz)) in entries.iter().enumerate() {
-        let base = 0x100 + i * 12;
-        blob[base..base + 4].copy_from_slice(&id.to_le_bytes());
-        blob[base + 4..base + 8].copy_from_slice(&off.to_le_bytes());
-        blob[base + 8..base + 12].copy_from_slice(&sz.to_le_bytes());
-    }
-    let header = match parse(&blob) {
+/// The header offsets and the TOC bitfield layout are both spelled out as
+/// literals here rather than built from the module's constants: `offsetof` on
+/// the Linux structures is the authority, so a wrong constant has to fail
+/// rather than be restated.
+fn smoke_amdgpu_rlc_header_v2_2_round_trip() -> TestResult {
+    use crate::amdgpu_rlc::{parse, region, RlcError};
+    // A v2.2 blob: common header, the v2.0/v2.1/v2.2 tails, and three
+    // payload regions the header points at.
+    let mut blob = alloc::vec![0u8; 0x400];
+    let put = |b: &mut alloc::vec::Vec<u8>, o: usize, v: u32| {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes())
+    };
+    put(&mut blob, 0x00, 0x400); // size_bytes == blob length
+    put(&mut blob, 0x04, 0xac); // header_size_bytes
+    blob[0x08..0x0a].copy_from_slice(&2u16.to_le_bytes()); // major
+    blob[0x0a..0x0c].copy_from_slice(&2u16.to_le_bytes()); // minor
+    put(&mut blob, 0x14, 0x100); // ucode_size_bytes
+    put(&mut blob, 0x18, 0x100); // ucode_array_offset_bytes
+    put(&mut blob, 0x20, 0x42); // ucode_feature_version
+    put(&mut blob, 0x24, 0x8); // jt_offset, dwords
+    put(&mut blob, 0x28, 0x4); // jt_size, dwords
+    put(&mut blob, 0x30, 0x1234); // clear_state_descriptor_offset
+    put(&mut blob, 0x48, 0x40); // reg_list_format size
+    put(&mut blob, 0x4c, 0x200); //                  offset
+    put(&mut blob, 0x74, 0x10); // save_restore_list_cntl size
+    put(&mut blob, 0x78, 0x240); //                        offset
+    put(&mut blob, 0x9c, 0x20); // iram size
+    put(&mut blob, 0xa0, 0x250); //      offset
+    blob[0x200] = 0xAA;
+    blob[0x250] = 0xBB;
+
+    let h = match parse(&blob) {
         Ok(h) => h,
-        Err(_) => return TestResult::Fail("RLC parse"),
+        Err(_) => return TestResult::Fail("v2.2 RLC header rejected"),
     };
-    if header.autoload_offset_table_offset != 0x100 || header.autoload_offset_table_size != 36 {
-        return TestResult::Fail("autoload table fields");
+    if h.minor != 2 || h.ucode_feature_version != 0x42 {
+        return TestResult::Fail("common/feature fields");
     }
-    let walked: alloc::vec::Vec<_> = match autoload_iter(&blob, &header) {
-        Ok(it) => it.collect(),
-        Err(_) => return TestResult::Fail("autoload_iter"),
-    };
-    if walked.len() != 3 {
-        return TestResult::Fail("autoload entry count");
+    // 0x24 is jt_offset, not a save/restore list offset, and it is a dword
+    // count rather than a byte offset.
+    if h.jt_offset_dw != 8 || h.jt_size_dw != 4 {
+        return TestResult::Fail("jump table is at 0x24/0x28, in dwords");
     }
-    if walked[0].firmware_id != 0x10 || walked[0].offset != 0x200 || walked[0].size != 8 {
-        return TestResult::Fail("autoload entry 0");
+    if h.clear_state_descriptor_offset != 0x1234 {
+        return TestResult::Fail("clear_state_descriptor_offset is at 0x30");
     }
-    if walked[2].firmware_id != 0x12 {
-        return TestResult::Fail("autoload entry 2 id");
+    if h.reg_list_format.offset_bytes != 0x200 || h.reg_list_format.size_bytes != 0x40 {
+        return TestResult::Fail("reg_list_format region is size at 0x48, offset at 0x4c");
     }
-    if !looks_like_rlc(&blob) {
-        return TestResult::Fail("looks_like_rlc rejected synthetic blob");
+    match h.save_restore_list_cntl {
+        Some(r) if r.offset_bytes == 0x240 && r.size_bytes == 0x10 => {}
+        _ => return TestResult::Fail("save_restore_list_cntl region is at 0x74/0x78"),
     }
-    let bogus = [0u8; 1024];
-    if looks_like_rlc(&bogus) {
-        return TestResult::Fail("looks_like_rlc accepted zeroed blob");
+    match h.iram {
+        Some(r) if r.offset_bytes == 0x250 && r.size_bytes == 0x20 => {}
+        _ => return TestResult::Fail("iram region is at 0x9c/0xa0"),
+    }
+    // v2.2 stops before the RLCP/RLCV pair; those must not be read.
+    if h.rlcp.is_some() || h.rlcv.is_some() {
+        return TestResult::Fail("v2.2 must not decode v2.3 fields");
+    }
+    if region(&blob, &h.reg_list_format).map(|s| s[0]) != Some(0xAA) {
+        return TestResult::Fail("reg_list_format slice");
+    }
+    if h.iram.and_then(|r| region(&blob, &r)).map(|s| s[0]) != Some(0xBB) {
+        return TestResult::Fail("iram slice");
+    }
+
+    // Validation is `fw->size == hdr->size_bytes`; there is no magic word.
+    let mut bad = blob.clone();
+    put(&mut bad, 0x00, 0x401);
+    if !matches!(parse(&bad), Err(RlcError::BadCommonHeader)) {
+        return TestResult::Fail("size_bytes disagreement should reject");
+    }
+    // A region pointing past the blob must be caught, not sliced later.
+    let mut bad = blob.clone();
+    put(&mut bad, 0xa0, 0x3f0);
+    if !matches!(parse(&bad), Err(RlcError::OutOfBounds)) {
+        return TestResult::Fail("out-of-bounds iram should reject");
+    }
+    // Only the v2 chain is described.
+    let mut bad = blob.clone();
+    bad[0x08..0x0a].copy_from_slice(&1u16.to_le_bytes());
+    if !matches!(parse(&bad), Err(RlcError::UnsupportedMajor(1))) {
+        return TestResult::Fail("major 1 should reject");
+    }
+    // A v2.1 blob truncated to the v2.0 length is short of its own fields.
+    let mut short = alloc::vec![0u8; 0x80];
+    put(&mut short, 0x00, 0x80);
+    short[0x08..0x0a].copy_from_slice(&2u16.to_le_bytes());
+    short[0x0a..0x0c].copy_from_slice(&1u16.to_le_bytes());
+    if !matches!(parse(&short), Err(RlcError::Truncated)) {
+        return TestResult::Fail("v2.1 shorter than 0x9c should reject");
     }
     TestResult::Pass
 }
-kernel_test_in!(
-    "drivers/gpu",
-    smoke_amdgpu_rlc_header_and_autoload_round_trip
-);
+kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_header_v2_2_round_trip);
 
+fn smoke_amdgpu_rlc_autoload_toc_bitfields() -> TestResult {
+    use crate::amdgpu_rlc::{autoload_iter, autoload_total_size};
+    // Four 16-byte entries, the last with an out-of-range id so the walk
+    // terminates on it. Dwords are composed by hand from the bitfield
+    // positions: offset bits 24:0, id bits 31:25, size bits 31:14.
+    let mut toc = alloc::vec![0u8; 16 * 4];
+    let put = |b: &mut alloc::vec::Vec<u8>, o: usize, v: u32| {
+        b[o..o + 4].copy_from_slice(&v.to_le_bytes())
+    };
+    // id 1 (RLC_G_UCODE), offset 0x40 dwords, size 0x10 dwords, load_at_boot.
+    put(&mut toc, 0x00, 1 << 25 | 0x40);
+    put(&mut toc, 0x04, 0x10 << 14 | 1);
+    // id 13 (CP_PFP), offset 0x50 dwords, size 0x20 dwords, signed_source,
+    // memory_destination 2.
+    put(&mut toc, 0x10, 13 << 25 | 0x50);
+    put(&mut toc, 0x14, 0x20 << 14 | 1 << 13 | 2 << 3);
+    // id 36, the highest valid id below MAX.
+    put(&mut toc, 0x20, 36 << 25 | 0x70);
+    put(&mut toc, 0x24, 0x8 << 14);
+    // id 37 == SOC21_FIRMWARE_ID_MAX ends the walk.
+    put(&mut toc, 0x30, 37 << 25 | 0x90);
+    put(&mut toc, 0x34, 0x8 << 14);
+
+    let walked: alloc::vec::Vec<_> = autoload_iter(&toc).collect();
+    if walked.len() != 3 {
+        return TestResult::Fail("walk must stop at the first id outside (INVALID, MAX)");
+    }
+    // Both offset and size are dword counts in the blob and bytes here.
+    if walked[0].firmware_id != 1 || walked[0].offset != 0x100 || walked[0].size != 0x40 {
+        return TestResult::Fail("entry 0: id in bits 31:25, offset and size scaled by four");
+    }
+    if !walked[0].load_at_boot || walked[0].signed_source {
+        return TestResult::Fail("entry 0 DW1 flags");
+    }
+    if walked[1].firmware_id != 13 || walked[1].offset != 0x140 || walked[1].size != 0x80 {
+        return TestResult::Fail("entry 1 fields");
+    }
+    if !walked[1].signed_source || walked[1].memory_destination != 2 {
+        return TestResult::Fail("entry 1: signed_source is bit 13, memdst bits 4:3");
+    }
+    if walked[2].firmware_id != 36 {
+        return TestResult::Fail("id 36 is below MAX and must be walked");
+    }
+    // An id of zero terminates just as MAX does.
+    let zeroed = alloc::vec![0u8; 16 * 4];
+    if autoload_iter(&zeroed).count() != 0 {
+        return TestResult::Fail("a zero id is INVALID and ends the walk");
+    }
+    // Sum of sizes is 0x40 + 0x80 + 0x20 = 0xe0, but the last region ends at
+    // 0x1c0 + 0x20 = 0x1e0, so the padded bound wins.
+    if autoload_total_size(&toc) != 0x1e0 {
+        return TestResult::Fail("total size must cover padded offsets");
+    }
+    // Partial trailing bytes are not half an entry.
+    if autoload_iter(&toc[..16 + 8]).count() != 1 {
+        return TestResult::Fail("a partial entry must not be decoded");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_rlc_autoload_toc_bitfields);
+
+/// Entry layout from `struct atom_gpio_pin_assignment`: a 32-bit register
+/// index, then three bytes and a reserved one.
 fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
-    use crate::amdgpu_atom_gpiopin::{GpioId, GpioPinLut};
-    // Synthetic LUT: header + 4 pin assignments
-    //   pin 0: DDC SCL (id 0x0A) on byte 0x10 mask 0x01
-    //   pin 1: DDC SDA (0x0B)    on byte 0x11 mask 0x02
-    //   pin 2: HPD     (0x01)    on byte 0x20 mask 0x10
-    //   pin 3: Backlight (0x03)  on byte 0x40 mask 0x80
-    let mut t = alloc::vec![0u8; 4 + 4 * 8];
-    t[0..2].copy_from_slice(&((4u16 + 4 * 8).to_le_bytes()));
-    t[2] = 1;
-    t[3] = 0;
-    let pins = [
-        (0x000Au16, 0u8, 1u8, 0x10u8, 0x01u8),
-        (0x000Bu16, 0u8, 1u8, 0x11u8, 0x02u8),
-        (0x0001u16, 1u8, 0u8, 0x20u8, 0x10u8),
-        (0x0003u16, 2u8, 1u8, 0x40u8, 0x80u8),
+    use crate::amdgpu_atom_gpiopin::{
+        GpioPinLut, GPIO_PIN_ASSIGNMENT_BYTES, I2C_HW_CAP, PP_AC_DC_SWITCH_GPIO_PINID,
+        TABLE_HEADER_BYTES,
+    };
+    if GPIO_PIN_ASSIGNMENT_BYTES != 8 || TABLE_HEADER_BYTES != 4 {
+        return TestResult::Fail("an entry is 8 bytes after a 4-byte header");
+    }
+    // Four entries: an I²C pair on engine 2 (clock then data, lane 0 and 1),
+    // a generic AC/DC switch pin, and another generic one.
+    let entries: [(u32, u8, u8, u8); 4] = [
+        (0x0000_1234, 3, 11, I2C_HW_CAP | (2 << 4)),
+        (0x0000_1235, 5, 13, I2C_HW_CAP | (2 << 4) | 1),
+        (0x0000_2000, 7, 15, PP_AC_DC_SWITCH_GPIO_PINID),
+        (0x0000_3000, 1, 9, 42),
     ];
-    for (i, (id, idx, ty, off, mask)) in pins.iter().enumerate() {
-        let p = 4 + i * 8;
-        t[p..p + 2].copy_from_slice(&id.to_le_bytes());
-        t[p + 2] = *idx;
-        t[p + 3] = *ty;
-        t[p + 4] = *off;
-        t[p + 5] = *mask;
+    let mut t = alloc::vec![0u8; TABLE_HEADER_BYTES + entries.len() * GPIO_PIN_ASSIGNMENT_BYTES];
+    let size = t.len() as u16;
+    t[0..2].copy_from_slice(&size.to_le_bytes());
+    t[2] = 1;
+    t[3] = 1;
+    for (i, (reg, bitshift, mask_bitshift, id)) in entries.iter().enumerate() {
+        let p = TABLE_HEADER_BYTES + i * GPIO_PIN_ASSIGNMENT_BYTES;
+        t[p..p + 4].copy_from_slice(&reg.to_le_bytes());
+        t[p + 4] = *bitshift;
+        t[p + 5] = *mask_bitshift;
+        t[p + 6] = *id;
+        // byte 7 is reserved and stays zero.
     }
     let mut lut = match GpioPinLut::parse(&t) {
         Ok(l) => l,
@@ -1271,41 +1367,77 @@ fn smoke_amdgpu_atom_gpio_pin_lut_round_trip() -> TestResult {
     if lut.pin_count() != 4 {
         return TestResult::Fail("pin_count != 4");
     }
-    let scl = lut.find(GpioId::DdcScl).expect("DDC SCL");
-    if scl.gpio_byte_offset != 0x10 || scl.gpio_mask != 0x01 {
-        return TestResult::Fail("DDC SCL byte/mask");
+    let all: alloc::vec::Vec<_> = lut.by_ref().collect();
+    // The register index is a full dword at offset 0 — reading a u16 id there
+    // instead, as the old decode did, would make 0x1234 the "gpio id".
+    if all[0].data_a_reg_index != 0x1234 || all[1].data_a_reg_index != 0x1235 {
+        return TestResult::Fail("data_a_reg_index is a dword at offset 0");
     }
-    let sda = lut.find(GpioId::DdcSda).expect("DDC SDA");
-    if sda.gpio_byte_offset != 0x11 || sda.gpio_mask != 0x02 {
-        return TestResult::Fail("DDC SDA byte/mask");
+    if all[0].gpio_bitshift != 3 || all[0].gpio_mask_bitshift != 11 {
+        return TestResult::Fail("the two bit shifts are bytes 4 and 5");
     }
-    let hpd = lut.find(GpioId::Hpd).expect("HPD");
-    if hpd.pin_type != 0 {
-        return TestResult::Fail("HPD pin_type != 0 (input)");
+    if all[0].bit_mask() != 1 << 3 {
+        return TestResult::Fail("bit_mask is 1 << gpio_bitshift");
     }
-    if lut.find(GpioId::PanelPower).is_some() {
-        return TestResult::Fail("PanelPower should be absent");
+    // gpio_id is one byte at offset 6.
+    if all[2].gpio_id != PP_AC_DC_SWITCH_GPIO_PINID || all[3].gpio_id != 42 {
+        return TestResult::Fail("gpio_id is a byte at offset 6");
+    }
+    // An I²C line is identified by bit 7, with the engine in bits 6:4 and the
+    // lane mux in 3:0 — not by a DDC-SCL/DDC-SDA id, which does not exist.
+    if !all[0].is_i2c() || !all[1].is_i2c() {
+        return TestResult::Fail("I2C_HW_CAP marks an I2C pin");
+    }
+    if all[0].i2c_engine_id() != 2 || all[1].i2c_engine_id() != 2 {
+        return TestResult::Fail("the engine id is bits 6:4");
+    }
+    if all[0].i2c_lane_mux() != 0 || all[1].i2c_lane_mux() != 1 {
+        return TestResult::Fail("the lane mux is bits 3:0");
+    }
+    if all[2].is_i2c() || all[3].is_i2c() {
+        return TestResult::Fail("a generic GPIO has bit 7 clear");
+    }
+    // The pair lookup returns them in table order.
+    let (scl, sda) = match lut.find_i2c_engine(2) {
+        Some(p) => p,
+        None => return TestResult::Fail("engine 2 pair not found"),
+    };
+    if scl.data_a_reg_index != 0x1234 || sda.data_a_reg_index != 0x1235 {
+        return TestResult::Fail("the pair comes back clock then data");
+    }
+    if lut.find_i2c_engine(3).is_some() {
+        return TestResult::Fail("engine 3 has no pins");
+    }
+    if lut.find_id(PP_AC_DC_SWITCH_GPIO_PINID).is_none() {
+        return TestResult::Fail("exact-id lookup");
     }
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu", smoke_amdgpu_atom_gpio_pin_lut_round_trip);
 
+/// Record types from `enum atom_object_record_type_id` and cap bits from
+/// `enum atom_encoder_caps_def`, both spelled out.
 fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
     use crate::amdgpu_atom_encoder_caps::{
-        find_encoder_caps, RecordIter, ATOM_RECORD_TYPE_ENCODER_CAP, ATOM_RECORD_TYPE_END,
-        ATOM_RECORD_TYPE_HPD_INT_ID,
+        find_encoder_caps, RecordIter, ATOM_ENCODER_CAP_RECORD_TYPE, ATOM_HPD_INT_RECORD_TYPE,
+        ATOM_I2C_RECORD_TYPE, ATOM_RECORD_END_TYPE,
     };
-    // Build a TLV tail with three records:
-    //   HPD_INT_ID (kind 1, len 4) — payload "AB"
-    //   ENCODER_CAP (kind 6, len 4) — caps = HBR2|HBR3|10bpc = 0x0B
-    //   END (kind 0xFF, len 2) — sentinel
+    // I²C is 1 and HPD-int is 2 — the pair that was swapped — and encoder caps
+    // is 20, not 6.
+    if ATOM_I2C_RECORD_TYPE != 1 || ATOM_HPD_INT_RECORD_TYPE != 2 {
+        return TestResult::Fail("I2C is record type 1 and HPD-int is 2");
+    }
+    if ATOM_ENCODER_CAP_RECORD_TYPE != 20 || ATOM_RECORD_END_TYPE != 0xFF {
+        return TestResult::Fail("encoder caps is record type 20");
+    }
+    // A TLV tail: HPD-int (4 bytes), encoder caps (6 bytes: 2-byte header plus
+    // a u32), then the sentinel. caps = MST_EN | HBR3_EN | USB_C_TYPE = 0x109,
+    // which needs the ninth bit and so cannot survive a u16 read.
     let mut tail = alloc::vec::Vec::new();
-    tail.extend_from_slice(&[ATOM_RECORD_TYPE_HPD_INT_ID, 4, b'A', b'B']);
-    tail.extend_from_slice(&[ATOM_RECORD_TYPE_ENCODER_CAP, 4, 0x0B, 0x00]);
-    tail.extend_from_slice(&[ATOM_RECORD_TYPE_END, 2]);
-    // Iterator should yield 2 records (HPD + caps), stopping at END.
-    let count = RecordIter::new(&tail).count();
-    if count != 2 {
+    tail.extend_from_slice(&[ATOM_HPD_INT_RECORD_TYPE, 4, b'A', b'B']);
+    tail.extend_from_slice(&[ATOM_ENCODER_CAP_RECORD_TYPE, 6, 0x09, 0x01, 0x00, 0x00]);
+    tail.extend_from_slice(&[ATOM_RECORD_END_TYPE, 2]);
+    if RecordIter::new(&tail).count() != 2 {
         return TestResult::Fail("expected 2 records before END");
     }
     let caps = match find_encoder_caps(&tail) {
@@ -1313,14 +1445,31 @@ fn smoke_amdgpu_encoder_caps_record_iter() -> TestResult {
         Ok(None) => return TestResult::Fail("encoder caps record not found"),
         Err(_) => return TestResult::Fail("decode error"),
     };
-    if !caps.supports_hbr2() || !caps.supports_hbr3() {
-        return TestResult::Fail("HBR2/HBR3 bits");
+    if caps.raw_caps != 0x109 {
+        return TestResult::Fail("encodercaps is a u32, so bit 8 must survive");
     }
-    if !caps.supports_10bpc() {
-        return TestResult::Fail("10bpc bit");
+    // Bit 0 is MST_EN, bit 3 is HBR3 — not bit 1, which is HBR2.
+    if !caps.mst_enabled() || !caps.supports_hbr3() {
+        return TestResult::Fail("MST_EN is bit 0 and HBR3_EN bit 3");
     }
-    if caps.supports_ycbcr420() {
-        return TestResult::Fail("YCbCr420 bit unexpectedly set");
+    if caps.supports_hbr2() || caps.supports_hdmi_6gbps() || caps.supports_dp2() {
+        return TestResult::Fail("HBR2, HDMI 6Gbps and DP2 bits are clear here");
+    }
+    // Bit 8: the USB-C marker, which a sixteen-bit read would lose.
+    if !caps.is_usb_c() {
+        return TestResult::Fail("USB_C_TYPE is bit 8");
+    }
+    // A four-byte payload is the minimum; a two-byte one is truncated.
+    let short = [
+        ATOM_ENCODER_CAP_RECORD_TYPE,
+        4,
+        0x01,
+        0x00,
+        ATOM_RECORD_END_TYPE,
+        2,
+    ];
+    if find_encoder_caps(&short).is_ok() {
+        return TestResult::Fail("a two-byte caps payload must be refused");
     }
     TestResult::Pass
 }
@@ -1838,6 +1987,94 @@ kernel_test_in!(
     smoke_amdgpu_atom_vm_reg_write_via_closure
 );
 
+/// `atom.c:650`: `amdgpu_atom_execute_table_locked(ctx, idx, ctx->ps +
+/// ctx->ps_shift, ctx->ps_size - ctx->ps_shift)`. A callee gets the parameter
+/// window *above* the caller's own, not the caller's window again.
+fn smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window() -> TestResult {
+    use crate::amdgpu_atom_vm::{execute_table, AtomError, AtomState, ResolvedTable};
+    use alloc::boxed::Box;
+
+    // Table 1: MOVE PS[0] <- 0xAA, then CALLTABLE 2, then EOT. Declares two
+    // dwords of parameters, so its callee's window starts at ps[2].
+    const CALLER: &[u8] = &[
+        2, 0x05, 0, 0xAA, 0, 0, 0, // MOVE PS[0] <- 0xAA
+        82, 2,  // CALLTABLE 2
+        91, // EOT
+    ];
+    // Table 2: MOVE PS[0] <- 0xBB, EOT. Its PS[0] must be the caller's ps[2].
+    const CALLEE: &[u8] = &[2, 0x05, 0, 0xBB, 0, 0, 0, 91];
+
+    let mut state = AtomState::new(8, 4);
+    state.table_resolver = Box::new(|id| match id {
+        1 => Some(ResolvedTable {
+            body: CALLER,
+            ps_dwords: 2,
+        }),
+        2 => Some(ResolvedTable {
+            body: CALLEE,
+            ps_dwords: 1,
+        }),
+        _ => None,
+    });
+    let mut ps = [0u32; 4];
+    if execute_table(&mut state, 1, &mut ps).is_err() {
+        return TestResult::Fail("nested table execution errored");
+    }
+    if ps[0] != 0xAA {
+        return TestResult::Fail("the caller's own PS[0] write did not land");
+    }
+    if ps[2] != 0xBB {
+        return TestResult::Fail("the callee's PS[0] must be the caller's ps[2]");
+    }
+    // The defect this replaces: the callee wrote over ps[0], so the caller's
+    // 0xAA was replaced by 0xBB and ps[2] stayed zero.
+    if ps[1] != 0 || ps[3] != 0 {
+        return TestResult::Fail("nothing else in the window should be touched");
+    }
+
+    // A table that calls itself must be refused, not recursed: VBIOS bytecode
+    // is data read off the card. `ATOM_EXECUTE_MAX_DEPTH` is 32.
+    const LOOP: &[u8] = &[82, 1, 91];
+    let mut state = AtomState::new(8, 4);
+    state.table_resolver = Box::new(|id| match id {
+        1 => Some(ResolvedTable {
+            body: LOOP,
+            ps_dwords: 0,
+        }),
+        _ => None,
+    });
+    let mut ps = [0u32; 4];
+    match execute_table(&mut state, 1, &mut ps) {
+        Err(AtomError::CallTableTooDeep) => {}
+        Err(_) => return TestResult::Fail("a self-calling table must be CallTableTooDeep"),
+        Ok(()) => return TestResult::Fail("a self-calling table must not succeed"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atom_vm_calltable_shifts_the_parameter_window
+);
+
+/// `ATOM_CT_PS_PTR` is byte 5 of a command table and `ATOM_CT_PS_MASK` is
+/// 0x7F, so the top bit of that byte is not part of the parameter size.
+fn smoke_amdgpu_atombios_cmd_table_ps_size() -> TestResult {
+    use crate::amdgpu_atombios::{ATOM_CT_CODE_PTR, ATOM_CT_PS_MASK, ATOM_CT_PS_PTR};
+    if ATOM_CT_PS_PTR != 5 || ATOM_CT_PS_MASK != 0x7F || ATOM_CT_CODE_PTR != 6 {
+        return TestResult::Fail("the command-table prelude is ws at 4, ps at 5, code at 6");
+    }
+    // 0x8C masked by 0x7F is 0x0C, which is three dwords — reading the byte
+    // whole would give 0x8C / 4 = 35.
+    if ((0x8Cu8 & ATOM_CT_PS_MASK) as usize) / 4 != 3 {
+        return TestResult::Fail("the parameter size is the low seven bits, in dwords");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/atom-vm",
+    smoke_amdgpu_atombios_cmd_table_ps_size
+);
+
 // ── amdgpu/smu ─────────────────────────────────────────────────────
 //
 // SMU mailbox-protocol smokes. The actual MP1 register reads
@@ -1977,9 +2214,7 @@ fn smoke_dcn20_build_modeset_from_discovery_produces_seq() -> TestResult {
     // The very first write must blank HUBP — the DCN 2.0 prologue
     // requires disabling scanout before reprogramming.
     let first = seq[0];
-    let expected_blank = 0x0001_2000
-        + crate::amdgpu_dcn::DCN20_HUBP0_REL
-        + crate::amdgpu_dcn::DCN20_HUBP_BLANK_EN_REL;
+    let expected_blank = 0x0001_2000 + crate::amdgpu_dcn::HUBP0_DCHUBP_CNTL;
     if first.addr != expected_blank || first.value & crate::amdgpu_dcn::HUBP_BLANK_FORCE == 0 {
         return TestResult::Fail("prologue should force HUBP blank first");
     }
@@ -2066,9 +2301,8 @@ kernel_test_in!(
 
 fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{
-        dcn20_modeset_sequence, timing_for_mode, DCN20_HUBP0_REL, DCN20_HUBP_BLANK_EN_REL,
-        DCN20_OTG0_REL, DCN20_OTG_CONTROL_REL, DCN20_OTG_H_TOTAL_REL, HUBP_BLANK_FORCE,
-        OTG_MASTER_EN,
+        dcn20_modeset_sequence, timing_for_mode, HUBP0_DCHUBP_CNTL, HUBP_BLANK_FORCE,
+        OTG0_OTG_CONTROL, OTG0_OTG_H_TOTAL, OTG_MASTER_EN,
     };
     let timing = match timing_for_mode(1920, 1080, 60) {
         Some(t) => t,
@@ -2077,9 +2311,9 @@ fn smoke_dcn20_modeset_seq_contains_expected_offsets() -> TestResult {
     let dcn_base: u32 = 0x0010_0000;
     let seq = dcn20_modeset_sequence(&timing, 0x1000_0000, 1920, dcn_base);
 
-    let want_blank = dcn_base + DCN20_HUBP0_REL + DCN20_HUBP_BLANK_EN_REL;
-    let want_h_total = dcn_base + DCN20_OTG0_REL + DCN20_OTG_H_TOTAL_REL;
-    let want_master = dcn_base + DCN20_OTG0_REL + DCN20_OTG_CONTROL_REL;
+    let want_blank = dcn_base + HUBP0_DCHUBP_CNTL;
+    let want_h_total = dcn_base + OTG0_OTG_H_TOTAL;
+    let want_master = dcn_base + OTG0_OTG_CONTROL;
 
     // HUBP_BLANK must appear (twice — once forced in prologue,
     // once cleared in epilogue).
@@ -2113,9 +2347,8 @@ kernel_test_in!(
 
 fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
     use crate::amdgpu_dcn::{
-        dcn35_modeset_sequence, timing_for_mode, DCN35_HUBP0_REL, DCN35_HUBP_BLANK_EN_REL,
-        DCN35_OTG0_REL, DCN35_OTG_CONTROL_REL, DCN35_OTG_H_TOTAL_REL, DCN35_OTG_V_BLANK_REL,
-        HUBP_BLANK_FORCE, OTG_MASTER_EN,
+        dcn35_modeset_sequence, timing_for_mode, DCN35_OTG0_OTG_CONTROL, DCN35_OTG0_OTG_H_TOTAL,
+        DCN35_OTG0_OTG_V_BLANK_START_END, HUBP0_DCHUBP_CNTL, HUBP_BLANK_FORCE, OTG_MASTER_EN,
     };
     let timing = match timing_for_mode(1920, 1080, 60) {
         Some(t) => t,
@@ -2124,10 +2357,10 @@ fn smoke_dcn35_modeset_seq_contains_expected_offsets() -> TestResult {
     let dcn_base: u32 = 0x0010_0000;
     let seq = dcn35_modeset_sequence(&timing, 0x1000_0000, 1920, dcn_base);
 
-    let want_blank = dcn_base + DCN35_HUBP0_REL + DCN35_HUBP_BLANK_EN_REL;
-    let want_h_total = dcn_base + DCN35_OTG0_REL + DCN35_OTG_H_TOTAL_REL;
-    let want_v_blank = dcn_base + DCN35_OTG0_REL + DCN35_OTG_V_BLANK_REL;
-    let want_master = dcn_base + DCN35_OTG0_REL + DCN35_OTG_CONTROL_REL;
+    let want_blank = dcn_base + HUBP0_DCHUBP_CNTL;
+    let want_h_total = dcn_base + DCN35_OTG0_OTG_H_TOTAL;
+    let want_v_blank = dcn_base + DCN35_OTG0_OTG_V_BLANK_START_END;
+    let want_master = dcn_base + DCN35_OTG0_OTG_CONTROL;
 
     // HUBP_BLANK_EN forced in prologue, cleared in epilogue.
     let blank_forced = seq
@@ -2175,25 +2408,25 @@ kernel_test_in!(
 
 fn smoke_dcn35_uses_different_offsets_than_dcn20() -> TestResult {
     use crate::amdgpu_dcn::{
-        DCN20_OTG_CONTROL_REL, DCN20_OTG_INTERRUPT_CONTROL_REL, DCN20_OTG_V_BLANK_REL,
-        DCN20_OTG_V_SYNC_A_REL, DCN35_OTG_CONTROL_REL, DCN35_OTG_INTERRUPT_CONTROL_REL,
-        DCN35_OTG_V_BLANK_REL, DCN35_OTG_V_SYNC_A_REL,
+        DCN35_OTG0_OTG_CONTROL, DCN35_OTG0_OTG_INTERRUPT_CONTROL, DCN35_OTG0_OTG_V_BLANK_START_END,
+        DCN35_OTG0_OTG_V_SYNC_A, OTG0_OTG_CONTROL, OTG0_OTG_INTERRUPT_CONTROL,
+        OTG0_OTG_V_BLANK_START_END, OTG0_OTG_V_SYNC_A,
     };
     // Phoenix's DCN 3.5 shifted V_BLANK / V_SYNC / OTG_CONTROL /
     // INTERRUPT_CONTROL inside the OTG block vs DCN 2.0 (Renoir).
     // If any of these ever drift to match the DCN 2.0 value the
     // Phoenix path would silently program the wrong register on
     // real hardware — pin the invariant.
-    if DCN20_OTG_V_BLANK_REL == DCN35_OTG_V_BLANK_REL {
+    if OTG0_OTG_V_BLANK_START_END == DCN35_OTG0_OTG_V_BLANK_START_END {
         return TestResult::Fail("DCN35 V_BLANK offset must differ from DCN20");
     }
-    if DCN20_OTG_V_SYNC_A_REL == DCN35_OTG_V_SYNC_A_REL {
+    if OTG0_OTG_V_SYNC_A == DCN35_OTG0_OTG_V_SYNC_A {
         return TestResult::Fail("DCN35 V_SYNC_A offset must differ from DCN20");
     }
-    if DCN20_OTG_CONTROL_REL == DCN35_OTG_CONTROL_REL {
+    if OTG0_OTG_CONTROL == DCN35_OTG0_OTG_CONTROL {
         return TestResult::Fail("DCN35 OTG_CONTROL offset must differ from DCN20");
     }
-    if DCN20_OTG_INTERRUPT_CONTROL_REL == DCN35_OTG_INTERRUPT_CONTROL_REL {
+    if OTG0_OTG_INTERRUPT_CONTROL == DCN35_OTG0_OTG_INTERRUPT_CONTROL {
         return TestResult::Fail("DCN35 INTERRUPT_CONTROL offset must differ from DCN20");
     }
     TestResult::Pass
@@ -2205,81 +2438,220 @@ kernel_test_in!(
 
 // ── amdgpu/psp ─────────────────────────────────────────────────────
 //
-// PSP MP0 mailbox smokes. The real PSP firmware-load handshake
-// goes through `AmdGpu::load_firmware` which the tests can't
-// execute (needs BAR5 + a real registry blob). The protocol
-// primitive lives in `amdgpu_psp::send_command` and is testable
-// against a `MockPsp` that scripts the canonical sequence.
+// MP0 mailbox smokes. The mailbox carries three operations: the sign-of-life
+// read, the bootloader component load, and ring create/control. Firmware
+// images go through the GPCOM ring instead — `amdgpu_psp_ring` — so there is
+// no mailbox image-load sequence to test.
+//
+// Register offsets are literals here, from `mp_13_0_4_offset.h`: C2PMSG_N is
+// dword 0x40 + N, so byte 0x100 + N * 4 within the MP0 window.
 
-fn smoke_amdgpu_psp_send_command_drives_canonical_sequence() -> TestResult {
+fn smoke_amdgpu_psp_mailbox_register_offsets() -> TestResult {
     use crate::amdgpu_psp::{
-        send_command, MockPsp, MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL,
-        PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
+        MP0_C2PMSG_35_REL, MP0_C2PMSG_36_REL, MP0_C2PMSG_64_REL, MP0_C2PMSG_69_REL,
+        MP0_C2PMSG_70_REL, MP0_C2PMSG_71_REL, MP0_C2PMSG_81_REL, PSP_STATUS_CODE_MASK,
+        PSP_STATUS_DONE_BIT,
     };
-    let mp0_base = 0x000B_0000;
-    let lo = mp0_base + MP0_C2PMSG_64_REL;
-    let hi = mp0_base + MP0_C2PMSG_67_REL;
-    let trig = mp0_base + MP0_C2PMSG_69_REL;
-
-    let mut m = MockPsp::new();
-    // Step 4: poll — PSP reports DONE + status 0.
-    m.stage_read(lo, PSP_STATUS_DONE_BIT);
-
-    let phys: u64 = 0x1_2345_6789;
-    let size: u32 = 0x4000; // 16 KiB image
-    match send_command(&mut m, mp0_base, PSP_CMD_LOAD_IP_FW, phys, size) {
-        Ok(0) => {}
-        Ok(other) => {
-            let _ = other;
-            return TestResult::Fail("expected status 0 on happy path");
-        }
-        Err(e) => {
-            let _ = e;
-            return TestResult::Fail("send_command errored on happy path");
-        }
+    // regMP0_SMN_C2PMSG_35 = 0x0063 dwords -> 0x18c bytes, and so on.
+    if MP0_C2PMSG_35_REL != 0x18c || MP0_C2PMSG_36_REL != 0x190 {
+        return TestResult::Fail("bootloader slots are C2PMSG_35/36 at dwords 0x63/0x64");
     }
-
-    // Captured writes (in order): phys lo, phys hi, trigger word.
-    if m.writes.len() != 3 {
-        return TestResult::Fail("expected exactly 3 mailbox writes");
+    if MP0_C2PMSG_64_REL != 0x200 {
+        return TestResult::Fail("C2PMSG_64 is dword 0x80, byte 0x200");
     }
-    if m.writes[0] != (lo, phys as u32) {
-        return TestResult::Fail("phys-lo write missing or wrong");
+    if MP0_C2PMSG_69_REL != 0x214 || MP0_C2PMSG_70_REL != 0x218 || MP0_C2PMSG_71_REL != 0x21c {
+        return TestResult::Fail("ring address/size slots are C2PMSG_69..71");
     }
-    if m.writes[1] != (hi, (phys >> 32) as u32) {
-        return TestResult::Fail("phys-hi write missing or wrong");
+    if MP0_C2PMSG_81_REL != 0x244 {
+        return TestResult::Fail("sign of life is C2PMSG_81 at dword 0xa1");
     }
-    let expect_trigger = (PSP_CMD_LOAD_IP_FW & 0xFF) | (size << 8);
-    if m.writes[2] != (trig, expect_trigger) {
-        return TestResult::Fail("trigger word missing or wrong");
+    // GFX_CMD_RESPONSE_MASK and GFX_CMD_STATUS_MASK. The status code is the
+    // low sixteen bits; GFX_CMD_RESERVED_MASK covers 0x7FF00000 between them,
+    // so a 30:0 status mask would read reserved bits as a failure.
+    if PSP_STATUS_DONE_BIT != 0x8000_0000 || PSP_STATUS_CODE_MASK != 0x0000_FFFF {
+        return TestResult::Fail("response flag is bit 31, status is bits 15:0");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
-    smoke_amdgpu_psp_send_command_drives_canonical_sequence
+    smoke_amdgpu_psp_mailbox_register_offsets
+);
+
+fn smoke_amdgpu_psp_bootloader_load_shifts_address_by_twenty() -> TestResult {
+    use crate::amdgpu_psp::{
+        bootloader_cmd, bootloader_load_component, is_sos_alive, MockPsp, PspError,
+        MP0_C2PMSG_35_REL, MP0_C2PMSG_36_REL, MP0_C2PMSG_81_REL, PSP_STATUS_DONE_BIT,
+    };
+    let mp0_base = 0x000B_0000;
+    let mut m = MockPsp::new();
+
+    // Sign of life: any non-zero value means sOS is already up.
+    if is_sos_alive(&mut m, mp0_base) {
+        return TestResult::Fail("a zero sign-of-life register means sOS is not up");
+    }
+    m.stage_read(mp0_base + MP0_C2PMSG_81_REL, 0x1);
+    if !is_sos_alive(&mut m, mp0_base) {
+        return TestResult::Fail("a non-zero sign-of-life register means sOS is up");
+    }
+
+    // Completion is polled on the command register itself, C2PMSG_35.
+    m.stage_read(mp0_base + MP0_C2PMSG_35_REL, PSP_STATUS_DONE_BIT);
+    let phys: u64 = 0x1_2340_0000; // 1 MiB aligned
+    if bootloader_load_component(
+        &mut m,
+        mp0_base,
+        bootloader_cmd::LOAD_KEY_DATABASE,
+        phys,
+        0x4000,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("bootloader load errored on happy path");
+    }
+    // Two writes: the shifted address, then the command. No high half, no
+    // size — the mailbox has neither.
+    if m.writes.len() != 2 {
+        return TestResult::Fail("expected exactly two mailbox writes");
+    }
+    if m.writes[0] != (mp0_base + MP0_C2PMSG_36_REL, 0x1234) {
+        return TestResult::Fail("address goes to C2PMSG_36 shifted right by twenty");
+    }
+    // PSP_BL__LOAD_KEY_DATABASE is 0x80000, written whole — not a low byte.
+    if m.writes[1] != (mp0_base + MP0_C2PMSG_35_REL, 0x0008_0000) {
+        return TestResult::Fail("command goes to C2PMSG_35 unshifted and unmasked");
+    }
+
+    // The shift discards the low twenty bits, so a misaligned address is
+    // refused rather than silently truncated.
+    let mut m = MockPsp::new();
+    match bootloader_load_component(
+        &mut m,
+        mp0_base,
+        bootloader_cmd::LOAD_SOSDRV,
+        0x1_2345_6789,
+        0x1000,
+    ) {
+        Err(PspError::Misaligned) => {}
+        _ => return TestResult::Fail("a misaligned component must be refused"),
+    }
+    if !m.writes.is_empty() {
+        return TestResult::Fail("a refused load must not touch the mailbox");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/psp",
+    smoke_amdgpu_psp_bootloader_load_shifts_address_by_twenty
+);
+
+fn smoke_amdgpu_psp_ring_create_sequence() -> TestResult {
+    use crate::amdgpu_psp::{
+        gfx_ctrl_cmd_id, ring_control, ring_create, MockPsp, PspError, MP0_C2PMSG_64_REL,
+        MP0_C2PMSG_69_REL, MP0_C2PMSG_70_REL, MP0_C2PMSG_71_REL, PSP_STATUS_DONE_BIT,
+    };
+    let mp0_base = 0x000B_0000;
+    let ready = mp0_base + MP0_C2PMSG_64_REL;
+    let mut m = MockPsp::new();
+    // One read for the sOS-ready wait, one for the command completion; the
+    // mock serves staged reads per offset in order.
+    m.stage_read(ready, PSP_STATUS_DONE_BIT);
+    m.stage_read(ready, PSP_STATUS_DONE_BIT);
+
+    let ring_phys: u64 = 0xDEAD_BEEF_0000_1000;
+    if ring_create(&mut m, mp0_base, ring_phys, 0x1000, 1).is_err() {
+        return TestResult::Fail("ring create errored on happy path");
+    }
+    if m.writes.len() != 4 {
+        return TestResult::Fail("expected address lo, hi, size, then the command");
+    }
+    if m.writes[0] != (mp0_base + MP0_C2PMSG_69_REL, 0x0000_1000) {
+        return TestResult::Fail("ring address low half goes to C2PMSG_69");
+    }
+    if m.writes[1] != (mp0_base + MP0_C2PMSG_70_REL, 0xDEAD_BEEF) {
+        return TestResult::Fail("ring address high half goes to C2PMSG_70");
+    }
+    if m.writes[2] != (mp0_base + MP0_C2PMSG_71_REL, 0x1000) {
+        return TestResult::Fail("ring size in bytes goes to C2PMSG_71");
+    }
+    // The ring type is shifted into bits 31:16.
+    if m.writes[3] != (ready, 0x0001_0000) {
+        return TestResult::Fail("ring type is written to C2PMSG_64 shifted left sixteen");
+    }
+
+    // GFX_CTRL_CMD_ID values are already positioned in bits 31:16, so a
+    // control command is written whole.
+    let mut m = MockPsp::new();
+    m.stage_read(ready, PSP_STATUS_DONE_BIT);
+    if ring_control(&mut m, mp0_base, gfx_ctrl_cmd_id::DESTROY_RINGS).is_err() {
+        return TestResult::Fail("ring control errored");
+    }
+    if m.writes.len() != 1 || m.writes[0] != (ready, 0x0003_0000) {
+        return TestResult::Fail("GFX_CTRL_CMD_ID_DESTROY_RINGS is 0x00030000");
+    }
+
+    // Nothing ready: the wait must time out rather than publish the ring.
+    let mut m = MockPsp::new();
+    match ring_create(&mut m, mp0_base, 0x1000, 0x1000, 1) {
+        Err(PspError::Timeout) => {}
+        _ => return TestResult::Fail("expected a timeout when sOS never signals ready"),
+    }
+    if !m.writes.is_empty() {
+        return TestResult::Fail("the ring must not be published before sOS is ready");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/psp",
+    smoke_amdgpu_psp_ring_create_sequence
 );
 
 fn smoke_amdgpu_psp_surfaces_rejection_status() -> TestResult {
     use crate::amdgpu_psp::{
-        send_command, MockPsp, PspError, MP0_C2PMSG_64_REL, PSP_CMD_LOAD_IP_FW, PSP_STATUS_DONE_BIT,
+        bootloader_cmd, bootloader_load_component, MockPsp, PspError, MP0_C2PMSG_35_REL,
+        PSP_STATUS_DONE_BIT,
     };
     let mp0_base = 0x000B_0000;
-    let lo = mp0_base + MP0_C2PMSG_64_REL;
-
     let mut m = MockPsp::new();
-    // PSP set DONE but with a non-zero status code (sig fail).
+    // DONE set with a non-zero status code in the low sixteen bits.
     let rejected_code: u32 = 0x0000_0042;
-    m.stage_read(lo, PSP_STATUS_DONE_BIT | rejected_code);
-
-    match send_command(&mut m, mp0_base, PSP_CMD_LOAD_IP_FW, 0x1000, 0x1000) {
-        Err(PspError::Rejected(code)) if code == rejected_code => TestResult::Pass,
+    m.stage_read(
+        mp0_base + MP0_C2PMSG_35_REL,
+        PSP_STATUS_DONE_BIT | rejected_code,
+    );
+    match bootloader_load_component(
+        &mut m,
+        mp0_base,
+        bootloader_cmd::LOAD_SOSDRV,
+        0x10_0000,
+        0x1000,
+    ) {
+        Err(PspError::Rejected(code)) if code == rejected_code => {}
         Err(other) => {
             let _ = other;
-            TestResult::Fail("expected PspError::Rejected(0x42)")
+            return TestResult::Fail("expected PspError::Rejected(0x42)");
         }
-        Ok(_) => TestResult::Fail("PSP rejection silently passed"),
+        Ok(_) => return TestResult::Fail("PSP rejection silently passed"),
     }
+    // Reserved bits are not a status code. GFX_CMD_RESERVED_MASK is
+    // 0x7FF00000, which a bits-30:0 status mask would have read as failure.
+    let mut m = MockPsp::new();
+    m.stage_read(
+        mp0_base + MP0_C2PMSG_35_REL,
+        PSP_STATUS_DONE_BIT | 0x7FF0_0000,
+    );
+    if bootloader_load_component(
+        &mut m,
+        mp0_base,
+        bootloader_cmd::LOAD_SOSDRV,
+        0x10_0000,
+        0x1000,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("reserved bits must not read as a failure code");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
@@ -2287,10 +2659,16 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_psp_timeout_when_done_never_sets() -> TestResult {
-    use crate::amdgpu_psp::{send_command, MockPsp, PspError, PSP_CMD_LOAD_IP_FW};
-    // Stage nothing — mock returns 0 (DONE not set) on every read.
+    use crate::amdgpu_psp::{bootloader_cmd, bootloader_load_component, MockPsp, PspError};
+    // Stage nothing — the mock returns 0 (DONE never set) on every read.
     let mut m = MockPsp::new();
-    match send_command(&mut m, 0x000B_0000, PSP_CMD_LOAD_IP_FW, 0x1000, 0x1000) {
+    match bootloader_load_component(
+        &mut m,
+        0x000B_0000,
+        bootloader_cmd::LOAD_SYSDRV,
+        0x10_0000,
+        0x1000,
+    ) {
         Err(PspError::Timeout) => TestResult::Pass,
         _ => TestResult::Fail("expected PspError::Timeout when DONE never sets"),
     }
@@ -2300,34 +2678,32 @@ kernel_test_in!(
     smoke_amdgpu_psp_timeout_when_done_never_sets
 );
 
-fn smoke_amdgpu_psp_rejects_empty_or_oversize_image() -> TestResult {
-    use crate::amdgpu_psp::{
-        send_command, MockPsp, PspError, PSP_CMD_LOAD_IP_FW, PSP_MAX_IMAGE_SIZE,
-    };
+/// The command ids for loading firmware are ring commands, not mailbox
+/// commands, and the mailbox entry point must refuse them rather than write a
+/// sequence that appears in no `psp_v*.c`.
+fn smoke_amdgpu_psp_image_load_is_not_a_mailbox_command() -> TestResult {
+    use crate::amdgpu_psp::{gfx_cmd_id, load_ip_firmware, MockPsp, PspError};
     let mut m = MockPsp::new();
-    match send_command(&mut m, 0x000B_0000, PSP_CMD_LOAD_IP_FW, 0x1000, 0) {
-        Err(PspError::EmptyImage) => {}
-        _ => return TestResult::Fail("zero-size image must be rejected"),
+    match load_ip_firmware(&mut m, 0x000B_0000, 0x10_0000, 0x4000) {
+        Err(PspError::NotAMailboxCommand) => {}
+        _ => return TestResult::Fail("an image load through the mailbox must be refused"),
     }
-    match send_command(
-        &mut m,
-        0x000B_0000,
-        PSP_CMD_LOAD_IP_FW,
-        0x1000,
-        PSP_MAX_IMAGE_SIZE + 1,
-    ) {
-        Err(PspError::ImageTooLarge) => {}
-        _ => return TestResult::Fail("oversize image must be rejected"),
-    }
-    // Neither rejected path should have touched the mailbox.
     if !m.writes.is_empty() {
-        return TestResult::Fail("rejected images must not write mailbox");
+        return TestResult::Fail("a refused command must not touch the mailbox");
+    }
+    // The ring command ids themselves, from `enum psp_gfx_cmd_id`. LOAD_IP_FW
+    // is 0x06; an earlier scaffold had it at 0x05, which is SETUP_TMR.
+    if gfx_cmd_id::LOAD_IP_FW != 0x06 || gfx_cmd_id::SETUP_TMR != 0x05 {
+        return TestResult::Fail("LOAD_IP_FW is 0x06 and SETUP_TMR is 0x05");
+    }
+    if gfx_cmd_id::LOAD_TOC != 0x20 || gfx_cmd_id::AUTOLOAD_RLC != 0x21 {
+        return TestResult::Fail("LOAD_TOC is 0x20 and AUTOLOAD_RLC is 0x21");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/psp",
-    smoke_amdgpu_psp_rejects_empty_or_oversize_image
+    smoke_amdgpu_psp_image_load_is_not_a_mailbox_command
 );
 
 // ── amdgpu/smu (bring_up) ──────────────────────────────────────────
@@ -2509,7 +2885,7 @@ fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
         CP_RB0_BASE_REL, CP_RB0_CNTL_REL, CP_RB0_RPTR_ADDR_HI_REL, CP_RB0_RPTR_ADDR_REL,
         CP_RB0_WPTR_HI_REL, CP_RB0_WPTR_REL, CP_RB_DOORBELL_CONTROL_REL, CP_RB_DOORBELL_EN,
         CP_RB_DOORBELL_OFFSET_SHIFT, CP_RB_DOORBELL_RANGE_LOWER_REL,
-        CP_RB_DOORBELL_RANGE_UPPER_REL, RPTR_WRITEBACK_COHERENT,
+        CP_RB_DOORBELL_RANGE_UPPER_REL, RPTR_ADDR_HI_MASK,
     };
     let gc_base: u32 = 0x0003_0000;
     let ring_phys: u64 = 0x0000_0001_0000_0000;
@@ -2543,12 +2919,18 @@ fn smoke_amdgpu_gfx9_ring_init_emits_canonical_order() -> TestResult {
         (gc_base + CP_RB0_WPTR_REL, 0),
         (gc_base + CP_RB0_WPTR_HI_REL, 0),
         (gc_base + CP_RB0_RPTR_ADDR_REL, rptr_phys as u32),
+        // The high half is MASKED to 16 bits, not OR'd with cache bits —
+        // the register has one field and the bits that used to be set here
+        // were address bits 32 and 33.
         (
             gc_base + CP_RB0_RPTR_ADDR_HI_REL,
-            ((rptr_phys >> 32) as u32) | RPTR_WRITEBACK_COHERENT,
+            ((rptr_phys >> 32) as u32) & RPTR_ADDR_HI_MASK,
         ),
-        (gc_base + CP_RB0_BASE_REL, ring_phys as u32),
-        (gc_base + CP_RB0_BASE_HI_REL, (ring_phys >> 32) as u32),
+        // The base is the address SHIFTED RIGHT BY 8: the register holds a
+        // 256-byte granule. This used to assert the raw address, which is
+        // what the builder wrote — so the test agreed with the bug.
+        (gc_base + CP_RB0_BASE_REL, (ring_phys >> 8) as u32),
+        (gc_base + CP_RB0_BASE_HI_REL, (ring_phys >> 8 >> 32) as u32),
         (
             gc_base + CP_RB0_CNTL_REL,
             ring_size_dw.trailing_zeros() | (6u32 << 8),
@@ -2637,11 +3019,86 @@ kernel_test_in!(
 // dwords. The unit tests already cover Pm4Builder and Ring
 // individually; this one verifies they compose.
 
+/// Every literal is from `amdgpu_doorbell.h` or from the `*_ring_set_wptr`
+/// function named beside it, never from the constant it checks.
+fn smoke_amdgpu_ring_doorbell_index_space_and_payload() -> TestResult {
+    use crate::amdgpu_ring::{doorbell_payload_for, DoorbellKind, Ring, DOORBELL_STRIDE_BYTES};
+
+    // `amdgpu_doorbell.h` above `AMDGPU_DOORBELL64_ASSIGNMENT`: "64bit
+    // doorbell, offset are in QWORD". So an assignment-enum slot is 8 bytes.
+    if DOORBELL_STRIDE_BYTES != 8 {
+        return TestResult::Fail("an assignment-enum doorbell slot is a quadword");
+    }
+    // AMDGPU_NAVI10_DOORBELL_GFX_RING0 = 0x08B, AMDGPU_NAVI10_DOORBELL_MEC_RING0
+    // = 0x003, AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 = 0x100. Linux doubles each
+    // into the dword space (`ring->doorbell_index = ... << 1`, gfx_v11_0.c:1178)
+    // and `amdgpu_mm_wdoorbell64` indexes a `uint32_t *`, so the byte offset is
+    // the enum value times eight.
+    for (slot, want) in [(0x08Bu16, 0x458u64), (0x003, 0x018), (0x100, 0x800)] {
+        let ring = match Ring::new(slot, DoorbellKind::Gfx) {
+            Ok(r) => r,
+            Err(_) => return TestResult::Fail("Ring::new failed"),
+        };
+        if ring.doorbell_offset() != want {
+            return TestResult::Fail("doorbell byte offset is not the QWORD slot times eight");
+        }
+        // The same number the other way round: Linux's dword index, scaled by
+        // the four bytes a `uint32_t *` step covers.
+        if ring.doorbell_offset() != (u64::from(slot) << 1) * 4 {
+            return TestResult::Fail("the two doorbell index spaces disagree");
+        }
+        // `ring->doorbell_index` itself — the value every ring setup writes
+        // and the one the MES legacy-queue mapping and the CP's
+        // `*_DOORBELL_CONTROL` OFFSET field carry. Doubled, not the slot.
+        if ring.doorbell_index_dw() != u32::from(slot) << 1 {
+            return TestResult::Fail("doorbell_index_dw must be the doubled assignment slot");
+        }
+        if u64::from(ring.doorbell_index_dw()) * 4 != ring.doorbell_offset() {
+            return TestResult::Fail("the dword index and the byte offset must agree");
+        }
+    }
+    // Spelled out once so the doubling cannot be satisfied by an identity:
+    // AMDGPU_NAVI10_DOORBELL_GFX_RING0 is 0x08B and the GFX ring's
+    // `doorbell_index` is 0x116.
+    match Ring::new(0x08B, DoorbellKind::Gfx) {
+        Ok(r) if r.doorbell_index_dw() == 0x116 => {}
+        Ok(_) => return TestResult::Fail("the GFX ring's doorbell_index is 0x116, not 0x08B"),
+        Err(_) => return TestResult::Fail("Ring::new failed"),
+    }
+
+    // gfx_v11_0_ring_set_wptr_gfx: WDOORBELL64(idx, ring->wptr) — dwords.
+    // sdma_v6_0_ring_set_wptr:     WDOORBELL64(idx, ring->wptr << 2) — bytes.
+    // vcn_v4_0_unified_ring_set_wptr: WDOORBELL32(idx, lower_32_bits(wptr)).
+    if doorbell_payload_for(DoorbellKind::Gfx, 6) != 6 {
+        return TestResult::Fail("a GFX doorbell carries the dword wptr");
+    }
+    if doorbell_payload_for(DoorbellKind::Sdma, 6) != 24 {
+        return TestResult::Fail("an SDMA doorbell carries the BYTE wptr");
+    }
+    // A rolled-over pointer: VCN's doorbell is only 32 bits wide, so it drops
+    // the high half, while GFX and SDMA carry it.
+    let rolled = 0x1_0000_0005u64;
+    if doorbell_payload_for(DoorbellKind::Vcn, rolled) != 5 {
+        return TestResult::Fail("a VCN doorbell is 32 bits wide");
+    }
+    if doorbell_payload_for(DoorbellKind::Gfx, rolled) != rolled {
+        return TestResult::Fail("a GFX doorbell carries the whole 64-bit wptr");
+    }
+    if doorbell_payload_for(DoorbellKind::Sdma, rolled) != rolled << 2 {
+        return TestResult::Fail("an SDMA doorbell carries the whole byte pointer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_ring_doorbell_index_space_and_payload
+);
+
 fn smoke_amdgpu_gfx_pm4_write_data_lands_in_ring() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
-    use crate::amdgpu_ring::Ring;
+    use crate::amdgpu_ring::{DoorbellKind, Ring};
 
-    let mut ring = match Ring::new(11) {
+    let mut ring = match Ring::new(11, DoorbellKind::Gfx) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("Ring::new failed"),
     };
@@ -2662,7 +3119,7 @@ fn smoke_amdgpu_gfx_pm4_write_data_lands_in_ring() -> TestResult {
 
     // Submit to the ring and verify wptr advanced.
     // SAFETY: smoke owns the ring exclusively.
-    let new_wptr = match unsafe { ring.submit(&staging) } {
+    let new_wptr = match unsafe { ring.submit(&staging, 0) } {
         Ok(w) => w,
         Err(_) => return TestResult::Fail("ring rejected fence packet"),
     };
@@ -2710,7 +3167,7 @@ fn smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring() -> TestResult {
     use crate::amdgpu_pm4::Pm4Builder;
     use crate::amdgpu_ring::Ring;
 
-    let mut ring = match Ring::new(12) {
+    let mut ring = match Ring::new(12, crate::amdgpu_ring::DoorbellKind::Gfx) {
         Ok(r) => r,
         Err(_) => return TestResult::Fail("Ring::new failed"),
     };
@@ -2738,7 +3195,7 @@ fn smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring() -> TestResult {
 
     // Submit and verify wptr.
     // SAFETY: smoke owns the ring.
-    let new_wptr = match unsafe { ring.submit(&staging[..11]) } {
+    let new_wptr = match unsafe { ring.submit(&staging[..11], 0) } {
         Ok(w) => w,
         Err(_) => return TestResult::Fail("ring rejected composite IB"),
     };
@@ -3061,10 +3518,10 @@ kernel_test_in!(
 // degenerate inputs (empty / oversize copy).
 
 fn smoke_amdgpu_sdma_packet_copy_linear_layout() -> TestResult {
-    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_COPY, SDMA_SUBOP_COPY_LINEAR};
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration};
     let mut buf = [0u32; 7];
     let bytes_written = {
-        let mut b = SdmaBuilder::new(&mut buf);
+        let mut b = SdmaBuilder::new(&mut buf, SdmaGeneration::V6);
         let src: u64 = 0x1111_2222_3333_4400;
         let dst: u64 = 0x5555_6666_7777_8800;
         if b.copy_linear(src, dst, 0x4000).is_err() {
@@ -3076,9 +3533,10 @@ fn smoke_amdgpu_sdma_packet_copy_linear_layout() -> TestResult {
         return TestResult::Fail("copy_linear should emit 7 dwords");
     }
 
-    // Header: OP=COPY << 24, SUB_OP=LINEAR << 16.
-    let want_hdr = (SDMA_OP_COPY << 24) | (SDMA_SUBOP_COPY_LINEAR << 16);
-    if buf[0] != want_hdr {
+    // `sdma_v6_0_0_pkt_open.h`: op is bits[7:0] and sub_op bits[15:8], so
+    // SDMA_OP_COPY 1 with SDMA_SUBOP_COPY_LINEAR 0 is the literal 0x00000001 —
+    // NOT 0x01000000.
+    if buf[0] != 0x0000_0001 {
         return TestResult::Fail("copy header dword wrong");
     }
     // Count = bytes - 1.
@@ -3110,20 +3568,22 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_sdma_packet_fence_layout() -> TestResult {
-    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_FENCE};
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration, SdmaPktError};
     let mut buf = [0u32; 4];
-    let dst: u64 = 0xAAAA_BBBB_CCCC_DDDD;
+    // Dword-aligned: `sdma_v6_0_ring_emit_fence` WARN_ONs `addr & 0x3`.
+    let dst: u64 = 0xAAAA_BBBB_CCCC_DDDC;
     {
-        let mut b = SdmaBuilder::new(&mut buf);
+        let mut b = SdmaBuilder::new(&mut buf, SdmaGeneration::V6);
         if b.fence(dst, 42).is_err() {
             return TestResult::Fail("fence emit failed");
         }
     }
-    let want_hdr = SDMA_OP_FENCE << 24;
-    if buf[0] != want_hdr {
+    // SDMA_OP_FENCE 5 in bits[7:0], plus SDMA_PKT_FENCE_HEADER_MTYPE(0x3) at
+    // shift 16 — the Ucached type `sdma_v6_0_ring_emit_fence` writes.
+    if buf[0] != 0x0003_0005 {
         return TestResult::Fail("fence header dword wrong");
     }
-    if buf[1] != 0xCCCC_DDDD {
+    if buf[1] != 0xCCCC_DDDC {
         return TestResult::Fail("fence dst lo wrong");
     }
     if buf[2] != 0xAAAA_BBBB {
@@ -3131,6 +3591,24 @@ fn smoke_amdgpu_sdma_packet_fence_layout() -> TestResult {
     }
     if buf[3] != 42 {
         return TestResult::Fail("fence value wrong");
+    }
+    // v4 has no MTYPE field: `sdma_v4_0_ring_emit_fence` writes a bare op.
+    let mut v4 = [0u32; 4];
+    {
+        let mut b = SdmaBuilder::new(&mut v4, SdmaGeneration::V4);
+        if b.fence(dst, 42).is_err() {
+            return TestResult::Fail("v4 fence emit failed");
+        }
+    }
+    if v4[0] != 0x0000_0005 {
+        return TestResult::Fail("a v4 fence header carries no MTYPE");
+    }
+    // A misaligned target would publish the fence somewhere else.
+    let mut bad = [0u32; 4];
+    let mut b = SdmaBuilder::new(&mut bad, SdmaGeneration::V6);
+    match b.fence(0x1002, 42) {
+        Err(SdmaPktError::UnalignedFence) => {}
+        _ => return TestResult::Fail("a misaligned fence target must be rejected"),
     }
     TestResult::Pass
 }
@@ -3140,19 +3618,35 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_sdma_packet_rejects_empty_and_oversize_copy() -> TestResult {
-    use crate::amdgpu_sdma::{SdmaBuilder, SdmaPktError, SDMA_COPY_MAX_BYTES};
-    let mut buf = [0u32; 7];
-    let mut b = SdmaBuilder::new(&mut buf);
-    match b.copy_linear(0x1000, 0x2000, 0) {
-        Err(SdmaPktError::EmptyCopy) => {}
-        _ => return TestResult::Fail("zero-byte copy must be rejected"),
-    }
-    match b.copy_linear(0x1000, 0x2000, SDMA_COPY_MAX_BYTES + 1) {
-        Err(SdmaPktError::CopyTooLarge) => {}
-        _ => return TestResult::Fail("oversized copy must be rejected"),
-    }
-    if b.bytes_written() != 0 {
-        return TestResult::Fail("rejected calls must not advance pos");
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration, SdmaPktError};
+    // `sdma_v4_0.c:2612` .copy_max_bytes = 1 << 22 (COUNT mask 0x003FFFFF);
+    // `sdma_v6_0.c:1861` .copy_max_bytes = 1 << 30 (COUNT mask 0x3FFFFFFF).
+    // COUNT holds byte_count - 1, so the limit is the power of two itself.
+    for (generation, max) in [
+        (SdmaGeneration::V4, 1u32 << 22),
+        (SdmaGeneration::V6, 1u32 << 30),
+    ] {
+        if generation.copy_max_bytes() != max {
+            return TestResult::Fail("copy_max_bytes is not this generation's COUNT width");
+        }
+        let mut buf = [0u32; 7];
+        let mut b = SdmaBuilder::new(&mut buf, generation);
+        match b.copy_linear(0x1000, 0x2000, 0) {
+            Err(SdmaPktError::EmptyCopy) => {}
+            _ => return TestResult::Fail("zero-byte copy must be rejected"),
+        }
+        match b.copy_linear(0x1000, 0x2000, max + 1) {
+            Err(SdmaPktError::CopyTooLarge) => {}
+            _ => return TestResult::Fail("oversized copy must be rejected"),
+        }
+        if b.bytes_written() != 0 {
+            return TestResult::Fail("rejected calls must not advance pos");
+        }
+        // The limit itself is legal, and v6's is four orders larger than v4's:
+        // a scaffold stuck on v4's width would refuse a 4 MiB copy here.
+        if b.copy_linear(0x1000, 0x2000, max).is_err() {
+            return TestResult::Fail("a copy of exactly copy_max_bytes is legal");
+        }
     }
     TestResult::Pass
 }
@@ -3162,10 +3656,10 @@ kernel_test_in!(
 );
 
 fn smoke_amdgpu_sdma_packet_nop_and_trap() -> TestResult {
-    use crate::amdgpu_sdma::{SdmaBuilder, SDMA_OP_NOP, SDMA_OP_TRAP};
+    use crate::amdgpu_sdma::{SdmaBuilder, SdmaGeneration};
     let mut buf = [0u32; 3];
     {
-        let mut b = SdmaBuilder::new(&mut buf);
+        let mut b = SdmaBuilder::new(&mut buf, SdmaGeneration::V6);
         if b.nop().is_err() {
             return TestResult::Fail("nop emit failed");
         }
@@ -3176,13 +3670,16 @@ fn smoke_amdgpu_sdma_packet_nop_and_trap() -> TestResult {
             return TestResult::Fail("expected 3 dwords (nop=1 + trap=2)");
         }
     }
-    if buf[0] != (SDMA_OP_NOP << 24) {
+    // SDMA_OP_NOP 0 and SDMA_OP_TRAP 6, in bits[7:0].
+    if buf[0] != 0x0000_0000 {
         return TestResult::Fail("NOP header wrong");
     }
-    if buf[1] != (SDMA_OP_TRAP << 24) {
+    if buf[1] != 0x0000_0006 {
         return TestResult::Fail("TRAP header wrong");
     }
-    if buf[2] != 0xC0DE_F00D {
+    // `SDMA_PKT_TRAP_INT_CONTEXT_int_context_mask` is 0x0FFFFFFF, so the top
+    // four bits of the argument are not part of the field.
+    if buf[2] != 0x00DE_F00D {
         return TestResult::Fail("TRAP ack wrong");
     }
     TestResult::Pass
@@ -3232,6 +3729,48 @@ fn smoke_amdgpu_pm4_acquire_mem_full_invalidate_layout() -> TestResult {
     }
     if buf[6] != 4 {
         return TestResult::Fail("poll_interval wrong");
+    }
+    // The bit positions, spelled out from soc15d.h's
+    // PACKET3_ACQUIRE_MEM_CP_COHER_CNTL_* setters.
+    use crate::amdgpu_pm4::{
+        ACQUIRE_DB_DEST_BASE_ENA, ACQUIRE_SH_ICACHE_ACTION_ENA, ACQUIRE_SH_KCACHE_ACTION_ENA,
+        ACQUIRE_TCL1_ACTION_ENA, ACQUIRE_TC_ACTION_ENA, ACQUIRE_TC_WB_ACTION_ENA,
+    };
+    if ACQUIRE_TC_WB_ACTION_ENA != 1 << 18
+        || ACQUIRE_TCL1_ACTION_ENA != 1 << 22
+        || ACQUIRE_TC_ACTION_ENA != 1 << 23
+        || ACQUIRE_SH_KCACHE_ACTION_ENA != 1 << 27
+        || ACQUIRE_SH_ICACHE_ACTION_ENA != 1 << 29
+        || ACQUIRE_DB_DEST_BASE_ENA != 1 << 14
+    {
+        return TestResult::Fail("CP_COHER_CNTL bit positions");
+    }
+
+    // GFX10+ puts cache invalidation in a seventh payload dword, GCR_CNTL,
+    // so the packet is one dword longer and COHER_CNTL carries none of the
+    // bits above.
+    let mut buf = [0u32; 8];
+    {
+        let mut b = Pm4Builder::new(&mut buf);
+        if b.acquire_mem_gfx11(
+            0,
+            0,
+            !0u64,
+            4,
+            crate::amdgpu_pm4::GCR_FULL_SHADER_INVALIDATE,
+        )
+        .is_err()
+        {
+            return TestResult::Fail("acquire_mem_gfx11 emit failed");
+        }
+    }
+    if ((buf[0] >> 16) & 0x3FFF) != 6 {
+        return TestResult::Fail("the GFX11 form has seven data dwords, so count-1 is 6");
+    }
+    // GLI_INV=1 at 0, GLM_WB/INV at 4/5, GLK_WB/INV at 6/7, GLV_INV at 8,
+    // GL1_INV at 9, GL2_INV/WB at 14/15. Literal, from nvd.h.
+    if buf[7] != 0x0000_C3F1 {
+        return TestResult::Fail("GCR_CNTL full-invalidate encoding");
     }
     TestResult::Pass
 }
@@ -3388,29 +3927,96 @@ kernel_test_in!(
     smoke_amdgpu_ih4_validation_rejects_bad_inputs
 );
 
+/// Every number here is quoted from `soc15_ih_clientid.h`,
+/// `ivsrcid/dcn/irqsrcs_dcn_1_0.h` or `irq_service_dcn314.c` — not from the
+/// constant it checks. A cookie decode composed from its own constants
+/// round-trips whatever it holds, which is why this one does not.
 fn smoke_amdgpu_ih_cookie_header_round_trip() -> TestResult {
-    use crate::amdgpu_ih::{IhCookieHeader, CLIENT_ID_DCN, SOURCE_ID_DCN_VBLANK};
-    // Synthesize a "DCN VBlank on controller 1" cookie header.
+    use crate::amdgpu_ih::{
+        dcn_vblank_source_id, decode_hpd_ctxid, HpdEvent, IhCookieHeader, CLIENT_ID_ATHUB,
+        CLIENT_ID_DCN, CLIENT_ID_GFX, CLIENT_ID_IH, CLIENT_ID_MP0, CLIENT_ID_MP1, CLIENT_ID_RLC,
+        CLIENT_ID_SDMA0, CLIENT_ID_SDMA1, CLIENT_ID_UTCL2, CLIENT_ID_VCN, CLIENT_ID_VMC,
+        SOURCE_ID_DCN_HPD,
+    };
+    // `enum soc15_ih_clientid` is a flat table, so a wrong value is always some
+    // other real client: 0x05 is ISP, 0x06 is PCIE0, 0x09 is SDMA1.
+    for (got, want, name) in [
+        (CLIENT_ID_IH, 0x00, "IH"),
+        (CLIENT_ID_ATHUB, 0x02, "ATHUB"),
+        (CLIENT_ID_DCN, 0x04, "DCE"),
+        (CLIENT_ID_RLC, 0x07, "RLC"),
+        (CLIENT_ID_SDMA0, 0x08, "SDMA0"),
+        (CLIENT_ID_SDMA1, 0x09, "SDMA1"),
+        (CLIENT_ID_VCN, 0x10, "VCN/UVD"),
+        (CLIENT_ID_VMC, 0x12, "VMC"),
+        (CLIENT_ID_GFX, 0x14, "GRBM_CP"),
+        (CLIENT_ID_UTCL2, 0x1B, "UTCL2"),
+        (CLIENT_ID_MP0, 0x1E, "MP0"),
+        (CLIENT_ID_MP1, 0x1F, "MP1"),
+    ] {
+        if got != want {
+            let _ = name;
+            return TestResult::Fail("a SOC15 IH client id does not match the header");
+        }
+    }
+    // No two of them may collide — VMC was 0x09, the same as SDMA1.
+    let ids = [
+        CLIENT_ID_IH,
+        CLIENT_ID_ATHUB,
+        CLIENT_ID_DCN,
+        CLIENT_ID_RLC,
+        CLIENT_ID_SDMA0,
+        CLIENT_ID_SDMA1,
+        CLIENT_ID_VCN,
+        CLIENT_ID_VMC,
+        CLIENT_ID_GFX,
+        CLIENT_ID_UTCL2,
+        CLIENT_ID_MP0,
+        CLIENT_ID_MP1,
+    ];
+    for (i, a) in ids.iter().enumerate() {
+        if ids[i + 1..].contains(a) {
+            return TestResult::Fail("two distinct IH clients share an id");
+        }
+    }
+    // `DC_D1..D6_OTG_VSTARTUP` = 0x3C..0x41, which is what
+    // `to_dal_irq_source_dcn314` maps to DC_IRQ_SOURCE_VBLANK1..6. The pipe is
+    // in the source id, not in src_data.
+    for (pipe, want) in [(0u8, 0x3Cu8), (1, 0x3D), (2, 0x3E), (3, 0x3F)] {
+        if dcn_vblank_source_id(pipe) != want {
+            return TestResult::Fail("DCN vblank source ids are 0x3c..0x41, one per pipe");
+        }
+    }
+    // `DCN_1_0__SRCID__DC_HPD1_INT` = 9 for every connector and both kinds.
+    if SOURCE_ID_DCN_HPD != 0x09 {
+        return TestResult::Fail("every HPD event shares source id 9");
+    }
+    // CTXID 0..5 are DC_HPD1..6_INT, 6..11 are DC_HPD1..6_RX_INT.
+    if decode_hpd_ctxid(0) != Some(HpdEvent::Plug(0))
+        || decode_hpd_ctxid(5) != Some(HpdEvent::Plug(5))
+        || decode_hpd_ctxid(6) != Some(HpdEvent::SinkIrq(0))
+        || decode_hpd_ctxid(11) != Some(HpdEvent::SinkIrq(5))
+        || decode_hpd_ctxid(12).is_some()
+    {
+        return TestResult::Fail("HPD context ids split 0..5 plug and 6..11 sink-IRQ");
+    }
+
+    // A real cookie: DCE client, pipe 1's vblank.
     let hdr = IhCookieHeader {
         client_id: CLIENT_ID_DCN,
-        source_id: SOURCE_ID_DCN_VBLANK,
+        source_id: dcn_vblank_source_id(1),
         ring_id: 0,
         reserved: 0,
     };
     let dw = hdr.to_dword();
-    let back = IhCookieHeader::from_dword(dw);
-    if back != hdr {
+    if IhCookieHeader::from_dword(dw) != hdr {
         return TestResult::Fail("cookie header round-trip mismatch");
     }
-    if back.client_id != CLIENT_ID_DCN || back.source_id != SOURCE_ID_DCN_VBLANK {
-        return TestResult::Fail("decoded client/source ids wrong");
-    }
-    // Cross-check bit layout against the public AMD docs:
-    //   client_id in bits[7:0], source_id in [15:8].
-    if (dw & 0xFF) != CLIENT_ID_DCN as u32 {
+    // client_id in bits[7:0], source_id in [15:8].
+    if (dw & 0xFF) != 0x04 {
         return TestResult::Fail("client_id not in dw[7:0]");
     }
-    if ((dw >> 8) & 0xFF) != SOURCE_ID_DCN_VBLANK as u32 {
+    if ((dw >> 8) & 0xFF) != 0x3D {
         return TestResult::Fail("source_id not in dw[15:8]");
     }
     TestResult::Pass
@@ -3650,56 +4256,100 @@ kernel_test_in!(
 // ── amdgpu/sdma (v6.0 Phoenix) ─────────────────────────────────────
 
 fn smoke_amdgpu_sdma6_ring_init_phoenix_delta() -> TestResult {
-    use crate::amdgpu_sdma::{
-        build_sdma6_ring_init, SDMA6_QUEUE0_DOORBELL_OFFSET_REL, SDMA6_QUEUE0_DOORBELL_REL,
-        SDMA6_QUEUE0_RB_BASE_HI_REL, SDMA6_QUEUE0_RB_BASE_REL, SDMA6_QUEUE0_RB_CNTL_REL,
-        SDMA_DOORBELL_ENABLE, SDMA_RB_ENABLE, SDMA_RB_RPTR_WRITEBACK_ENABLE, SDMA_RB_SIZE_SHIFT,
-    };
-    let sdma_base: u32 = 0x0007_0000;
+    use crate::amdgpu_sdma::build_sdma6_ring_init;
+    let base: u32 = 0x0007_0000;
+    // regSDMA0_F32_CNTL 0x589a is GC BASE_IDX 1; everything else is 0.
+    let base_idx1: u32 = 0x000B_0000;
     let ring_phys: u64 = 0x0000_0001_2000_0000;
     let ring_size_dw: u32 = 2048;
     let doorbell_idx: u32 = 4;
     let rptr_phys: u64 = 0x0000_0002_3000_0000;
+    let wptr_poll_phys: u64 = 0x0000_0002_3000_1000;
 
-    let seq =
-        match build_sdma6_ring_init(sdma_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys) {
-            Ok(s) => s,
-            Err(_) => return TestResult::Fail("build_sdma6_ring_init failed on valid input"),
-        };
+    let seq = match build_sdma6_ring_init(
+        base,
+        base_idx1,
+        ring_phys,
+        ring_size_dw,
+        doorbell_idx,
+        rptr_phys,
+        wptr_poll_phys,
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("build_sdma6_ring_init failed on valid input"),
+    };
     let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
-    // First write: CNTL = 0.
-    if w.first().map(|x| (x.addr, x.value)) != Some((sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, 0)) {
+
+    // Every register id is `gc/gc_11_0_0_offset.h`, byte-scaled, and the CNTL
+    // value is composed from `gc_11_0_0_sh_mask.h`'s own masks — not from this
+    // module's constants.
+    //
+    //   regSDMA0_QUEUE0_RB_CNTL             0x0080   MINOR_PTR_UPDATE  0x00b5
+    //   regSDMA0_QUEUE0_RB_BASE             0x0081   DOORBELL          0x0092
+    //   regSDMA0_QUEUE0_RB_BASE_HI          0x0082   DOORBELL_OFFSET   0x00ab
+    //   regSDMA0_QUEUE0_RB_WPTR_POLL_ADDR_HI 0x00b2  IB_CNTL           0x008a
+    //   regSDMA0_QUEUE0_RB_WPTR_POLL_ADDR_LO 0x00b3
+    //
+    //   RB_SIZE 0x0000003E (shift 1)   RPTR_WRITEBACK_ENABLE 0x00001000
+    //   RB_PRIV 0x00800000             F32_WPTR_POLL_ENABLE  0x00000800
+    //   WPTR_POLL_ENABLE 0x00000100    RB_ENABLE             0x00000001
+    //   DOORBELL ENABLE 0x10000000     IB_ENABLE             0x00000001
+    let cntl = base + 0x80 * 4;
+    let cntl_no_enable = (11 << 1) | 0x0080_0000 | 0x0000_1000 | 0x0000_0800;
+    if ring_size_dw.trailing_zeros() != 11 {
+        return TestResult::Fail("2048 dwords is log2 11");
+    }
+    if w.first().map(|x| (x.addr, x.value)) != Some((cntl, 0)) {
         return TestResult::Fail("first write must disable CNTL");
     }
-    // Last write: CNTL | RB_ENABLE.
-    let expected_en = (ring_size_dw.trailing_zeros() << SDMA_RB_SIZE_SHIFT)
-        | SDMA_RB_RPTR_WRITEBACK_ENABLE
-        | SDMA_RB_ENABLE;
-    if w.last().map(|x| (x.addr, x.value))
-        != Some((sdma_base + SDMA6_QUEUE0_RB_CNTL_REL, expected_en))
-    {
-        return TestResult::Fail("last write must enable CNTL");
+    // The legacy wptr poll stays off; Linux enables the F32 one instead.
+    if cntl_no_enable & 0x0000_0100 != 0 {
+        return TestResult::Fail("WPTR_POLL_ENABLE must stay clear");
     }
-    // Body writes hit the v6 QUEUE0_ namespace, NOT the v4 GFX_ namespace.
+    // IB_CNTL comes after RB_ENABLE. Without it the ring runs but every
+    // indirect buffer on it is refused.
+    if !w
+        .iter()
+        .any(|x| x.addr == base + 0x8A * 4 && x.value == 0x0000_0001)
+    {
+        return TestResult::Fail("IB_CNTL must be enabled");
+    }
     let want = [
-        (
-            sdma_base + SDMA6_QUEUE0_RB_BASE_REL,
-            (ring_phys >> 8) as u32,
-        ),
-        (
-            sdma_base + SDMA6_QUEUE0_RB_BASE_HI_REL,
-            (ring_phys >> 40) as u32,
-        ),
-        (
-            sdma_base + SDMA6_QUEUE0_DOORBELL_OFFSET_REL,
-            doorbell_idx << 2,
-        ),
-        (sdma_base + SDMA6_QUEUE0_DOORBELL_REL, SDMA_DOORBELL_ENABLE),
+        (base + 0xB3 * 4, wptr_poll_phys as u32),
+        (base + 0xB2 * 4, (wptr_poll_phys >> 32) as u32),
+        (base + 0x89 * 4, rptr_phys as u32 & 0xFFFF_FFFC),
+        (base + 0x88 * 4, (rptr_phys >> 32) as u32),
+        (cntl, cntl_no_enable),
+        (base + 0x81 * 4, (ring_phys >> 8) as u32),
+        (base + 0x82 * 4, (ring_phys >> 40) as u32),
+        (base + 0xB5 * 4, 1),
+        (base + 0xAB * 4, doorbell_idx << 2),
+        (base + 0x92 * 4, 0x1000_0000),
+        (base + 0xB5 * 4, 0),
+        (cntl, cntl_no_enable | 0x0000_0001),
     ];
     for (addr, value) in want {
         if !w.iter().any(|x| x.addr == addr && x.value == value) {
             return TestResult::Fail("missing expected v6 ring-init write");
         }
+    }
+    // Last write: F32_CNTL through the OTHER window, clearing HALT 0x00000001
+    // and TH1_RESET 0x00002000 — `sdma_v6_0_gfx_resume_instance` does this
+    // after IB_CNTL, and it cannot be reached from the BASE_IDX-0 base.
+    if w.last().map(|x| (x.addr, x.value)) != Some((base_idx1 + 0x589A * 4, 0)) {
+        return TestResult::Fail("F32_CNTL must be last, through GC window 1");
+    }
+    if w.iter().any(|x| x.addr == base + 0x589A * 4) {
+        return TestResult::Fail("F32_CNTL must not be addressed from window 0");
+    }
+    // MINOR_PTR_UPDATE brackets the wptr write: set before, cleared after.
+    let minor = base + 0xB5 * 4;
+    let set = w.iter().position(|x| x.addr == minor && x.value == 1);
+    let cleared = w.iter().rposition(|x| x.addr == minor && x.value == 0);
+    let wptr = w.iter().position(|x| x.addr == base + 0x85 * 4);
+    match (set, cleared, wptr) {
+        (Some(a), Some(b), Some(_)) if a < b => {}
+        _ => return TestResult::Fail("MINOR_PTR_UPDATE must bracket the wptr write"),
     }
     TestResult::Pass
 }
@@ -3708,26 +4358,69 @@ kernel_test_in!(
     smoke_amdgpu_sdma6_ring_init_phoenix_delta
 );
 
-fn smoke_amdgpu_sdma6_uses_different_offsets_than_v4() -> TestResult {
-    use crate::amdgpu_sdma::{
-        SDMA6_QUEUE0_RB_BASE_REL, SDMA6_QUEUE0_RB_CNTL_REL, SDMA_GFX_RB_BASE_REL,
-        SDMA_GFX_RB_CNTL_REL,
-    };
-    // Ensure the Phoenix delta actually shifted offsets — if these
-    // ever drift to match v4 numerically, smokes that exercise
-    // both paths against shared register fixtures will silently
-    // collide. Pin the invariant.
-    if SDMA_GFX_RB_CNTL_REL == SDMA6_QUEUE0_RB_CNTL_REL {
-        return TestResult::Fail("v4 and v6 RB_CNTL offsets must differ");
+/// SDMA 6.0's ring registers sit at the SAME offsets as SDMA 4.0's.
+///
+/// Only the names changed — `mmSDMA0_GFX_*` became `regSDMA0_QUEUE0_*`, and
+/// the block moved from `sdma0/sdma0_4_0_offset.h` into
+/// `gc/gc_11_0_0_offset.h`. A reader comparing the two headers by name finds
+/// nothing in common and can conclude the numbers moved. They did not.
+///
+/// The test this replaces asserted the opposite — "ensure the Phoenix delta
+/// actually shifted offsets ... pin the invariant" — and so defended a table
+/// that matched neither generation (0x1F..0x2D against a real 0x80..0xAB).
+/// Asserting that two things differ is only ever as good as the reason they
+/// should, and there was none.
+fn smoke_amdgpu_sdma_v4_and_v6_share_offsets() -> TestResult {
+    use crate::amdgpu_sdma::*;
+
+    // Dword ids from `sdma0_4_0_offset.h` and `gc_11_0_0_offset.h`, which
+    // agree on every one.
+    let pairs: &[(u32, u32, u32)] = &[
+        (SDMA_GFX_RB_CNTL_REL, SDMA6_QUEUE0_RB_CNTL_REL, 0x80),
+        (SDMA_GFX_RB_BASE_REL, SDMA6_QUEUE0_RB_BASE_REL, 0x81),
+        (SDMA_GFX_RB_BASE_HI_REL, SDMA6_QUEUE0_RB_BASE_HI_REL, 0x82),
+        (SDMA_GFX_RB_RPTR_REL, SDMA6_QUEUE0_RB_RPTR_REL, 0x83),
+        (SDMA_GFX_RB_RPTR_HI_REL, SDMA6_QUEUE0_RB_RPTR_HI_REL, 0x84),
+        (SDMA_GFX_RB_WPTR_REL, SDMA6_QUEUE0_RB_WPTR_REL, 0x85),
+        (SDMA_GFX_RB_WPTR_HI_REL, SDMA6_QUEUE0_RB_WPTR_HI_REL, 0x86),
+        // 0x87 is WPTR_POLL_CNTL — the run is not contiguous here, which is
+        // what the previous values got wrong by assuming it was.
+        (
+            SDMA_GFX_RB_RPTR_ADDR_HI_REL,
+            SDMA6_QUEUE0_RB_RPTR_ADDR_HI_REL,
+            0x88,
+        ),
+        (
+            SDMA_GFX_RB_RPTR_ADDR_LO_REL,
+            SDMA6_QUEUE0_RB_RPTR_ADDR_LO_REL,
+            0x89,
+        ),
+        (SDMA_GFX_DOORBELL_REL, SDMA6_QUEUE0_DOORBELL_REL, 0x92),
+        (
+            SDMA_GFX_DOORBELL_OFFSET_REL,
+            SDMA6_QUEUE0_DOORBELL_OFFSET_REL,
+            0xAB,
+        ),
+    ];
+    for (v4, v6, dword) in pairs.iter().copied() {
+        if v4 != dword * 4 {
+            return TestResult::Fail("an SDMA 4.0 offset is not its header dword id");
+        }
+        if v6 != dword * 4 {
+            return TestResult::Fail("an SDMA 6.0 offset is not its header dword id");
+        }
     }
-    if SDMA_GFX_RB_BASE_REL == SDMA6_QUEUE0_RB_BASE_REL {
-        return TestResult::Fail("v4 and v6 RB_BASE offsets must differ");
+    // The gap at 0x87 is the whole point: RPTR_ADDR_HI does not follow
+    // WPTR_HI, and treating the block as one contiguous run put the
+    // writeback address into the write-pointer poll control register.
+    if SDMA_GFX_RB_RPTR_ADDR_HI_REL == SDMA_GFX_RB_WPTR_HI_REL + 4 {
+        return TestResult::Fail("RPTR_ADDR_HI must not immediately follow WPTR_HI");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/sdma",
-    smoke_amdgpu_sdma6_uses_different_offsets_than_v4
+    smoke_amdgpu_sdma_v4_and_v6_share_offsets
 );
 // ─── amdgpu_ddc: EDID-read transport scaffold ────────────────────
 
@@ -4299,109 +4992,207 @@ kernel_test_in!(
 
 // ── amdgpu/gfx (GFX11 Phoenix delta) ───────────────────────────────
 
-fn smoke_amdgpu_gfx11_ring_init_emits_canonical_order() -> TestResult {
-    use crate::amdgpu_gfx::{
-        build_gfx11_ring_init, CP_GFX_CNTL_HALT_ALL, CP_GFX_CNTL_REL, CP_RB0_BASE_REL,
-        CP_RB0_CNTL_REL, CP_RB_DOORBELL_CONTROL_REL, CP_RB_DOORBELL_EN,
-        CP_RB_DOORBELL_OFFSET_SHIFT,
-    };
-    let gc_base: u32 = 0x0003_0000;
-    let ring_phys: u64 = 0x0000_0001_5000_0000;
-    let ring_size_dw: u32 = 2048;
-    let doorbell_idx: u32 = 8;
-    let rptr_phys: u64 = 0x0000_0002_0000_0000;
+/// `gfx_v11_0_cp_gfx_resume`, step for step.
+///
+/// The function this replaces claimed to follow it and did not: it was the
+/// GFX9 sequence with a different halt register. What it got wrong is listed
+/// in the commit; what this test pins is each thing it got wrong.
+fn smoke_amdgpu_gfx11_ring_init_matches_linux() -> TestResult {
+    use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxError, GfxStep};
 
-    let seq = match build_gfx11_ring_init(gc_base, ring_phys, ring_size_dw, doorbell_idx, rptr_phys)
-    {
+    const GC: u32 = 0x0003_0000;
+    // GC base window 1, a different base address — `GRBM_GFX_CNTL` is
+    // BASE_IDX 1 and must be addressed from here, not from `GC`.
+    const GC1: u32 = 0x0005_0000;
+    const RING: u64 = 0x1_0000_0000;
+    const BYTES: u64 = 4096;
+    const RPTR: u64 = 0x2_DEAD_0000;
+    const WPTR: u64 = 0x3_BEEF_0000;
+    const DOORBELL: u32 = 5;
+    // `GRBM_GFX_CNTL` with a non-zero PIPEID and other bits set, so the
+    // read-modify-write is visible.
+    const GRBM: u32 = 0xA5A5_A5A2;
+
+    let seq = match build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, DOORBELL, true, RPTR, WPTR) {
         Ok(s) => s,
-        Err(_) => return TestResult::Fail("build_gfx11_ring_init failed on valid input"),
+        Err(_) => return TestResult::Fail("a valid GFX11 ring config was refused"),
     };
-    let w: alloc::vec::Vec<_> = seq.iter().copied().collect();
 
-    // First write: halt via CP_GFX_CNTL (NOT CP_ME_CNTL — that's GFX9).
-    if w.first().map(|x| (x.addr, x.value))
-        != Some((gc_base + CP_GFX_CNTL_REL, CP_GFX_CNTL_HALT_ALL))
-    {
-        return TestResult::Fail("first write must halt CP via CP_GFX_CNTL");
+    // The ring base is the address SHIFTED RIGHT BY 8 — the register holds a
+    // 256-byte granule. The replaced function wrote the raw address, pointing
+    // the command processor 256x too high, and its 256-byte alignment check
+    // existed precisely because of the shift it never applied.
+    let rb = RING >> 8;
+    if seq.first_write_to(GC, 0x1de0) != Some(rb as u32) {
+        return TestResult::Fail("CP_RB0_BASE must be the address shifted right by 8");
     }
-    // Last write: unhalt (CP_GFX_CNTL = 0).
-    if w.last().map(|x| (x.addr, x.value)) != Some((gc_base + CP_GFX_CNTL_REL, 0)) {
-        return TestResult::Fail("last write must unhalt CP_GFX_CNTL");
+    if seq.first_write_to(GC, 0x1e51) != Some((rb >> 32) as u32) {
+        return TestResult::Fail("CP_RB0_BASE_HI must be the shifted address's high half");
     }
-    // Body writes must include base, size encoding, doorbell.
-    if !w
-        .iter()
-        .any(|x| x.addr == gc_base + CP_RB0_BASE_REL && x.value == ring_phys as u32)
-    {
-        return TestResult::Fail("ring base lo not programmed");
-    }
-    let expect_cntl = ring_size_dw.trailing_zeros() | (6u32 << 8);
-    if !w
-        .iter()
-        .any(|x| x.addr == gc_base + CP_RB0_CNTL_REL && x.value == expect_cntl)
-    {
-        return TestResult::Fail("ring size encoding wrong");
-    }
-    if !w.iter().any(|x| {
-        x.addr == gc_base + CP_RB_DOORBELL_CONTROL_REL
-            && x.value == (CP_RB_DOORBELL_EN | (doorbell_idx << CP_RB_DOORBELL_OFFSET_SHIFT))
-    }) {
-        return TestResult::Fail("doorbell control not programmed");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu/amdgpu/gfx",
-    smoke_amdgpu_gfx11_ring_init_emits_canonical_order
-);
 
-fn smoke_amdgpu_gfx11_uses_distinct_halt_register() -> TestResult {
-    use crate::amdgpu_gfx::{
-        CP_GFX_CNTL_HALT_ALL, CP_GFX_CNTL_ME_HALT_GFX11, CP_GFX_CNTL_PFP_HALT_GFX11,
-        CP_GFX_CNTL_REL, CP_ME_CNTL_HALT_ALL, CP_ME_CNTL_ME_HALT, CP_ME_CNTL_PFP_HALT,
-        CP_ME_CNTL_REL,
+    // `rb_bufsz = order_base_2(ring_size / 8)`, with RB_BLKSZ at that minus 2.
+    // 4096 bytes / 8 = 512, log2 = 9. The replaced function used
+    // log2(size_in_dwords) = 10 and a hardcoded BLKSZ of 6 — both fields
+    // wrong, describing a ring twice its real size.
+    let cntl = seq.writes_to(GC, 0x1de1);
+    if cntl.is_empty() {
+        return TestResult::Fail("CP_RB0_CNTL was never written");
+    }
+    if cntl[0] & 0x3F != 9 {
+        return TestResult::Fail("RB_BUFSZ should be order_base_2(bytes / 8)");
+    }
+    if (cntl[0] >> 8) & 0x3F != 7 {
+        return TestResult::Fail("RB_BLKSZ should be RB_BUFSZ - 2");
+    }
+    // And it is written TWICE with the same value, side by side with a delay.
+    // Linux's `mdelay(1)` then re-writes it; the second write latches the
+    // configuration after the addresses are in place.
+    if cntl.len() != 2 || cntl[0] != cntl[1] {
+        return TestResult::Fail("CP_RB0_CNTL is written twice with the same value");
+    }
+    let Some(first) = seq.index_of_write(GC, 0x1de1) else {
+        return TestResult::Fail("CP_RB0_CNTL index not found");
     };
-    // GFX11's CP_GFX_CNTL must live at a different offset from GFX9's CP_ME_CNTL.
-    if CP_GFX_CNTL_REL == CP_ME_CNTL_REL {
-        return TestResult::Fail("GFX11 CP_GFX_CNTL must differ from GFX9 CP_ME_CNTL");
+    let delay_after = seq.steps[first..]
+        .iter()
+        .position(|s| matches!(s, GfxStep::Delay { .. }));
+    let second = seq.steps[first + 1..]
+        .iter()
+        .position(|s| matches!(s, GfxStep::Write { addr, .. } if *addr == GC + (0x1de1 << 2)));
+    match (delay_after, second) {
+        (Some(d), Some(w)) if d <= w + 1 => {}
+        _ => return TestResult::Fail("the delay must fall between the two CNTL writes"),
     }
-    // Halt-bit positions must differ — GFX9 uses bits {24, 26, 28};
-    // GFX11 uses bits {0, 4, 8}.
-    if CP_GFX_CNTL_PFP_HALT_GFX11 == CP_ME_CNTL_PFP_HALT
-        || CP_GFX_CNTL_ME_HALT_GFX11 == CP_ME_CNTL_ME_HALT
-    {
-        return TestResult::Fail("GFX11 halt bits must differ from GFX9");
-    }
-    // Composite masks must differ.
-    if CP_GFX_CNTL_HALT_ALL == CP_ME_CNTL_HALT_ALL {
-        return TestResult::Fail("HALT_ALL composites must differ between GFX9/GFX11");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu/amdgpu/gfx",
-    smoke_amdgpu_gfx11_uses_distinct_halt_register
-);
 
-fn smoke_amdgpu_gfx11_ring_init_validation_rejects_bad_inputs() -> TestResult {
-    use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxError};
-    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_0000, 1000, 0, 0x2_0000_0000) {
-        Err(GfxError::BadRingSize) => {}
-        _ => return TestResult::Fail("non-pow2 ring size must be rejected"),
+    // The rptr writeback high half is MASKED to 16 bits, never OR'd with
+    // cache bits — the register has one field and 0x3 set address bits 32:33.
+    if seq.first_write_to(GC, 0x1de4) != Some(((RPTR >> 32) as u32) & 0xFFFF) {
+        return TestResult::Fail("CP_RB0_RPTR_ADDR_HI must be masked to 16 bits");
     }
-    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_00FF, 1024, 0, 0x2_0000_0000) {
-        Err(GfxError::UnalignedRingPhys) => {}
-        _ => return TestResult::Fail("unaligned ring phys must be rejected"),
+
+    // The write-pointer poll address, which the replaced function never wrote
+    // at all — without it the CP has no idea where the host's wptr lives.
+    if seq.first_write_to(GC, 0x1e8b) != Some(WPTR as u32) {
+        return TestResult::Fail("CP_RB_WPTR_POLL_ADDR_LO was not programmed");
     }
-    match build_gfx11_ring_init(0x0003_0000, 0x1_0000_0000, 1024, 0, 0x2_0000_0001) {
-        Err(GfxError::UnalignedRptrWriteback) => {}
-        _ => return TestResult::Fail("unaligned rptr-writeback must be rejected"),
+    if seq.first_write_to(GC, 0x1e8c) != Some((WPTR >> 32) as u32) {
+        return TestResult::Fail("CP_RB_WPTR_POLL_ADDR_HI was not programmed");
+    }
+
+    // CP_RB_ACTIVE, also absent before. A ring the CP does not consider
+    // active is never fetched from.
+    if seq.first_write_to(GC, 0x1f40) != Some(1) {
+        return TestResult::Fail("CP_RB_ACTIVE must be set");
+    }
+
+    // The pipe select is a read-modify-write of the caller's live value: only
+    // PIPEID (bits 1:0) changes.
+    // Addressed from window 1, and NOT present in window 0 — the pipe select
+    // landing in the wrong window would write an unrelated register.
+    if seq.first_write_to(GC1, 0x0900) != Some(GRBM & !0x3) {
+        return TestResult::Fail("GRBM_GFX_CNTL should keep every bit but PIPEID");
+    }
+    if seq.first_write_to(GC, 0x0900).is_some() {
+        return TestResult::Fail("GRBM_GFX_CNTL must not be written in base window 0");
+    }
+    // And the two registers zeroed first.
+    if seq.first_write_to(GC, 0x0f61) != Some(0) {
+        return TestResult::Fail("CP_RB_WPTR_DELAY should be zeroed");
+    }
+    if seq.first_write_to(GC, 0x1df1) != Some(0) {
+        return TestResult::Fail("CP_RB_VMID should be zeroed");
+    }
+    if seq.first_write_to(GC, 0x1df4) != Some(0) || seq.first_write_to(GC, 0x1df5) != Some(0) {
+        return TestResult::Fail("both halves of the write pointer should be zeroed");
+    }
+
+    // The doorbell range UPPER is the whole mask, not `index + 1` — that is
+    // the GFX9 convention, and the replaced function used it here.
+    if seq.first_write_to(GC, 0x1dfb) != Some(0x0000_0FFC) {
+        return TestResult::Fail("DOORBELL_RANGE_UPPER is the field's full mask on GFX11");
+    }
+    if seq.first_write_to(GC, 0x1dfa) != Some(DOORBELL << 2) {
+        return TestResult::Fail("DOORBELL_RANGE_LOWER holds the index at bit 2");
+    }
+    let door = seq.first_write_to(GC, 0x1e8d).unwrap_or(0);
+    if door & (1 << 30) == 0 || (door >> 2) & 0x03FF_FFFF != DOORBELL {
+        return TestResult::Fail("the doorbell control register is wrong");
+    }
+    // No doorbell: the register stays at its reset value.
+    let nodoor =
+        match build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, DOORBELL, false, RPTR, WPTR) {
+            Ok(s) => s,
+            Err(_) => return TestResult::Fail("a ring without a doorbell was refused"),
+        };
+    if nodoor.first_write_to(GC, 0x1e8d) != Some(0) {
+        return TestResult::Fail("no doorbell means DOORBELL_EN stays clear");
+    }
+
+    // The real GFX ring's index: AMDGPU_NAVI10_DOORBELL_GFX_RING0 is 0x08B and
+    // `ring->doorbell_index` is 0x116, which is what both registers carry.
+    let real = match build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, 0x116, true, RPTR, WPTR) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("the real GFX doorbell index was refused"),
+    };
+    if real.first_write_to(GC, 0x1dfa) != Some(0x458) {
+        return TestResult::Fail("DOORBELL_RANGE_LOWER should hold 0x116 at bit 2");
+    }
+
+    // The two fields are NOT the same width. `DOORBELL_RANGE_LOWER` is ten
+    // bits at shift 2 (mask 0x0FFC) and `DOORBELL_OFFSET` is twenty-six
+    // (0x0FFFFFFC), so an index past 0x3FF is truncated in the range register
+    // and intact in the control register. Linux places both with
+    // `REG_SET_FIELD`, which masks; shifting raw would spill 0x401 into the
+    // range register's reserved bits.
+    let wide = match build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, 0x401, true, RPTR, WPTR) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("a wide doorbell index was refused"),
+    };
+    if wide.first_write_to(GC, 0x1dfa) != Some(0x0000_0004) {
+        return TestResult::Fail("DOORBELL_RANGE_LOWER must be masked to its ten bits");
+    }
+    let wide_ctl = wide.first_write_to(GC, 0x1e8d).unwrap_or(0);
+    if (wide_ctl >> 2) & 0x03FF_FFFF != 0x401 {
+        return TestResult::Fail("DOORBELL_OFFSET is wide enough to hold the whole index");
+    }
+    if wide_ctl & !(0x0FFF_FFFCu32 | (1 << 30)) != 0 {
+        return TestResult::Fail("the doorbell control write must stay inside its two fields");
+    }
+
+    // Validation.
+    if !matches!(
+        build_gfx11_ring_init(GC, GC1, GRBM, RING, 3000, DOORBELL, true, RPTR, WPTR),
+        Err(GfxError::BadRingSize)
+    ) {
+        return TestResult::Fail("a non-power-of-two ring size must be refused");
+    }
+    if !matches!(
+        build_gfx11_ring_init(
+            GC,
+            GC1,
+            GRBM,
+            RING + 0xFF,
+            BYTES,
+            DOORBELL,
+            true,
+            RPTR,
+            WPTR
+        ),
+        Err(GfxError::UnalignedRingPhys)
+    ) {
+        return TestResult::Fail("a ring base that is not 256-byte aligned must be refused");
+    }
+    if !matches!(
+        build_gfx11_ring_init(GC, GC1, GRBM, RING, BYTES, DOORBELL, true, RPTR + 1, WPTR),
+        Err(GfxError::UnalignedRptrWriteback)
+    ) {
+        return TestResult::Fail("an unaligned rptr writeback must be refused");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/gfx",
-    smoke_amdgpu_gfx11_ring_init_validation_rejects_bad_inputs
+    smoke_amdgpu_gfx11_ring_init_matches_linux
 );
 
 // ── amdgpu (initialize orchestrator) ───────────────────────────────
@@ -4493,119 +5284,263 @@ kernel_test_in!(
     smoke_amdgpu_backlight_user_level_for_percent
 );
 
-fn smoke_amdgpu_backlight_init_sequence_locks_around_writes() -> TestResult {
-    use crate::amdgpu_backlight::{
-        build_backlight_init, BL_PWM_CNTL_EN, BL_PWM_CNTL_GRP1_FRAC_BL_EN, BL_PWM_CNTL_REL,
-        BL_PWM_GRP1_LOCK, BL_PWM_GRP1_REG_LOCK_REL, BL_PWM_PERIOD_200HZ_RENOIR,
-        BL_PWM_PERIOD_CNTL_REL, BL_PWM_USER_LEVEL_REL,
-    };
-    let dcn_base: u32 = 0x0008_0000;
-    let writes = match build_backlight_init(dcn_base, BL_PWM_PERIOD_200HZ_RENOIR, 0x7FFF) {
-        Ok(w) => w,
-        Err(_) => return TestResult::Fail("build_backlight_init failed on valid input"),
-    };
-    if writes.len() != 5 {
-        return TestResult::Fail("init must emit exactly 5 writes");
-    }
-    // First write: lock asserted.
-    if writes[0].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[0].value != BL_PWM_GRP1_LOCK
+/// Register ids and field positions are literals from
+/// `dcn_3_1_4_offset.h`/`_sh_mask.h`.
+fn smoke_amdgpu_backlight_registers_and_fields() -> TestResult {
+    use crate::amdgpu_backlight::*;
+    // regPWRSEQ0_BL_PWM_CNTL 0x2f19, then CNTL2, PERIOD_CNTL, GRP1_REG_LOCK —
+    // four consecutive dwords, with no USER_LEVEL among them.
+    if BL_PWM_CNTL != 0x2f19
+        || BL_PWM_CNTL2 != 0x2f1a
+        || BL_PWM_PERIOD_CNTL != 0x2f1b
+        || BL_PWM_GRP1_REG_LOCK != 0x2f1c
     {
-        return TestResult::Fail("first write must assert GRP1 lock");
+        return TestResult::Fail("the PWRSEQ0 BL_PWM block is 0x2f19..0x2f1c");
     }
-    // Last write: lock cleared.
-    if writes[4].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[4].value != 0 {
-        return TestResult::Fail("last write must clear GRP1 lock");
+    // regPWRSEQ1_BL_PWM_CNTL is 0x2f85.
+    if for_pwrseq(BL_PWM_CNTL, 1) != 0x2f85 || PWRSEQ_STRIDE != 0x6c {
+        return TestResult::Fail("the per-sequencer stride is 0x6c");
     }
-    // Body writes (in order): period, cntl, user_level.
-    if writes[1].addr != dcn_base + BL_PWM_PERIOD_CNTL_REL
-        || writes[1].value != BL_PWM_PERIOD_200HZ_RENOIR
+    // The ABM user-level register is a different block at a different base
+    // index, not a member of this run.
+    if ABM0_BL1_PWM_USER_LEVEL != 0x0e7b {
+        return TestResult::Fail("regABM0_BL1_PWM_USER_LEVEL is 0x0e7b at BASE_IDX 3");
+    }
+    // BL_PWM_EN is bit 31 and the duty count occupies 15:0, so an enable at
+    // bit 0 would be a duty of one.
+    if BL_PWM_EN != 1 << 31 || BL_PWM_FRACTIONAL_EN != 1 << 30 {
+        return TestResult::Fail("BL_PWM_EN is bit 31, FRACTIONAL_EN bit 30");
+    }
+    if BL_ACTIVE_INT_FRAC_CNT_MASK != 0x0000_FFFF {
+        return TestResult::Fail("the duty count is bits 15:0");
+    }
+    if BL_PWM_EN & BL_ACTIVE_INT_FRAC_CNT_MASK != 0 {
+        // Trivially true, but states the property the old table violated.
+        return TestResult::Fail("the enable must not overlap the duty count");
+    }
+    // The lock is bit 0; bit 31 is the master-lock bypass.
+    if BL_PWM_GRP1_REG_LOCK_BIT != 1
+        || BL_PWM_GRP1_REG_UPDATE_PENDING != 1 << 8
+        || BL_PWM_GRP1_UPDATE_AT_FRAME_START != 1 << 16
+        || BL_PWM_GRP1_IGNORE_MASTER_LOCK_EN != 1 << 31
     {
-        return TestResult::Fail("period write missing or wrong");
+        return TestResult::Fail("GRP1_REG_LOCK fields are 0, 8, 16, 31");
     }
-    if writes[2].addr != dcn_base + BL_PWM_CNTL_REL
-        || writes[2].value != (BL_PWM_CNTL_EN | BL_PWM_CNTL_GRP1_FRAC_BL_EN)
-    {
-        return TestResult::Fail("CNTL write missing or wrong");
-    }
-    if writes[3].addr != dcn_base + BL_PWM_USER_LEVEL_REL || writes[3].value != 0x7FFF {
-        return TestResult::Fail("USER_LEVEL write missing or wrong");
+    // The period is sixteen bits with a four-bit BITCNT above it.
+    if BL_PWM_PERIOD_MASK != 0x0000_FFFF || BL_PWM_PERIOD_BITCNT_MASK != 0x000F_0000 {
+        return TestResult::Fail("period is 15:0 and BITCNT 19:16");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
-    smoke_amdgpu_backlight_init_sequence_locks_around_writes
+    smoke_amdgpu_backlight_registers_and_fields
 );
 
-fn smoke_amdgpu_backlight_set_user_level_is_lock_write_unlock() -> TestResult {
-    use crate::amdgpu_backlight::{
-        build_set_user_level, BL_PWM_GRP1_LOCK, BL_PWM_GRP1_REG_LOCK_REL, BL_PWM_USER_LEVEL_REL,
+/// `dce_panel_cntl_set_backlight_level`'s own worked example: with a masked
+/// period of 0x24 and a bit count of 6, a brightness of 0xEFF0 gives an
+/// active product of 0x21BDC0 and a duty of 0x86F7.
+fn smoke_amdgpu_backlight_duty_scales_against_period() -> TestResult {
+    use crate::amdgpu_backlight::active_duty_count;
+    // BITCNT 6 in bits 19:16, period 0x24. The header's own arithmetic:
+    // 0xEFF0 * 0x24 = 0x21BDC0, >> 6 = 0x86F7 after the 16-bit mask and the
+    // rounding bit.
+    let period_cntl = (6u32 << 16) | 0x24;
+    if active_duty_count(0xEFF0, period_cntl) != 0x86F7 {
+        return TestResult::Fail("the duty must be the brightness scaled by the period");
+    }
+    // A BITCNT of zero means sixteen, not a zero shift: 0xFFFF * 0xFFFF is
+    // 0xFFFE0001, which shifted right sixteen is 0xFFFE. A zero shift would
+    // mask to 0x0001 instead.
+    if active_duty_count(0xFFFF, 0xFFFF) != 0xFFFE {
+        return TestResult::Fail("a BITCNT of zero means a shift of sixteen");
+    }
+    // Writing the brightness through unscaled, as the old builder did, would
+    // give 0x8000 here instead.
+    let half = active_duty_count(0x8000, (6u32 << 16) | 0x24);
+    if half >= 0x8000 {
+        return TestResult::Fail("a short period must scale the duty down");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/backlight",
+    smoke_amdgpu_backlight_duty_scales_against_period
+);
+
+fn smoke_amdgpu_backlight_set_user_level_locks_then_unlocks() -> TestResult {
+    use crate::amdgpu_backlight::*;
+    let period_cntl = (6u32 << 16) | 0x24;
+    let writes = match build_set_user_level(1, 0xEFF0, period_cntl) {
+        Ok(w) => w,
+        Err(_) => return TestResult::Fail("sequencer 1 rejected"),
     };
-    let dcn_base: u32 = 0x0008_0000;
-    let writes = build_set_user_level(dcn_base, 0xABCD);
     if writes.len() != 3 {
         return TestResult::Fail("hot-path set must be exactly 3 writes");
     }
-    if writes[0].value != BL_PWM_GRP1_LOCK {
-        return TestResult::Fail("first write must lock");
+    // Lock taken with the master-lock bypass, both bits set.
+    if writes[0].addr != 0x2f88 || writes[0].value != (1 << 31 | 1) {
+        return TestResult::Fail("the lock takes bit 0 together with the bypass at 31");
     }
-    if writes[1].addr != dcn_base + BL_PWM_USER_LEVEL_REL || writes[1].value != 0xABCD {
-        return TestResult::Fail("USER_LEVEL write missing or wrong");
+    // The duty and the enable are the same register.
+    if writes[1].addr != 0x2f85 || writes[1].value != (1 << 31) | 0x86F7 {
+        return TestResult::Fail("the duty goes into BL_PWM_CNTL beside the enable");
     }
-    if writes[2].addr != dcn_base + BL_PWM_GRP1_REG_LOCK_REL || writes[2].value != 0 {
-        return TestResult::Fail("last write must unlock");
+    // Release clears the lock but keeps the bypass.
+    if writes[2].addr != 0x2f88 || writes[2].value != 1 << 31 {
+        return TestResult::Fail("release clears bit 0 only");
+    }
+    if build_set_user_level(PWRSEQ_INSTANCES, 0, 0).is_ok() {
+        return TestResult::Fail("out-of-range sequencer accepted");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
-    smoke_amdgpu_backlight_set_user_level_is_lock_write_unlock
+    smoke_amdgpu_backlight_set_user_level_locks_then_unlocks
 );
 
 fn smoke_amdgpu_backlight_init_rejects_period_overflow() -> TestResult {
-    use crate::amdgpu_backlight::{build_backlight_init, BacklightError};
-    // 25-bit period overflows the 24-bit field.
-    match build_backlight_init(0x0008_0000, 1u32 << 25, 0x7FFF) {
-        Err(BacklightError::PeriodOverflow) => TestResult::Pass,
-        _ => TestResult::Fail("period overflow must be rejected"),
+    use crate::amdgpu_backlight::{build_backlight_init, BacklightError, BL_PWM_PERIOD_MAX};
+    // The field is sixteen bits, so the 200 Hz-at-100 MHz period of 500_000
+    // that this module used to ship as a default does not fit.
+    if BL_PWM_PERIOD_MAX != 0xFFFF {
+        return TestResult::Fail("the period field is sixteen bits");
     }
+    match build_backlight_init(0, 500_000, 0x7FFF) {
+        Err(BacklightError::PeriodOverflow) => {}
+        _ => return TestResult::Fail("500_000 does not fit a sixteen-bit period"),
+    }
+    match build_backlight_init(0, 1u32 << 16, 0x7FFF) {
+        Err(BacklightError::PeriodOverflow) => {}
+        _ => return TestResult::Fail("a seventeen-bit period must be rejected"),
+    }
+    if build_backlight_init(0, 0xFFFF, 0x7FFF).is_err() {
+        return TestResult::Fail("a full sixteen-bit period is valid");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/backlight",
     smoke_amdgpu_backlight_init_rejects_period_overflow
 );
 
-// ── amdgpu/smu (thermal) ───────────────────────────────────────────
+// ── amdgpu/smu (metrics table) ─────────────────────────────────────
 
-fn smoke_amdgpu_smu_read_gpu_temperature_decodes_decicelsius() -> TestResult {
-    use crate::amdgpu_smu::{
-        read_gpu_temperature_millicelsius, MockSmu, MP1_C2PMSG_ARG_REL, MP1_C2PMSG_RESP_REL,
-        SMU_RESP_OK,
+/// Field offsets are literals from `offsetof` on `SmuMetrics_t` in
+/// `smu13_driver_if_v13_0_4.h`, not the module's own constants.
+fn smoke_amdgpu_smu_metrics_table_decode() -> TestResult {
+    use crate::amdgpu_smu::{parse_metrics, SMU_METRICS_V13_0_4_BYTES};
+    if SMU_METRICS_V13_0_4_BYTES != 160 {
+        return TestResult::Fail("sizeof(SmuMetrics_t) is 160 bytes on SMU 13.0.4");
+    }
+    let mut t = alloc::vec![0u8; SMU_METRICS_V13_0_4_BYTES];
+    let put16 = |t: &mut alloc::vec::Vec<u8>, o: usize, v: u16| {
+        t[o..o + 2].copy_from_slice(&v.to_le_bytes())
     };
-    let mp1_base = 0x16000;
-    let resp = mp1_base + MP1_C2PMSG_RESP_REL;
-    let arg = mp1_base + MP1_C2PMSG_ARG_REL;
-
-    let mut m = MockSmu::new();
-    m.stage_read(resp, 1); // handshake idle
-    m.stage_read(resp, SMU_RESP_OK);
-    // SMU reports temperature in d°C — 612 = 61.2 °C.
-    m.stage_read(arg, 612);
-
-    let mc = match read_gpu_temperature_millicelsius(&mut m, mp1_base) {
-        Ok(t) => t,
-        Err(_) => return TestResult::Fail("temperature read errored on happy path"),
+    let put32 = |t: &mut alloc::vec::Vec<u8>, o: usize, v: u32| {
+        t[o..o + 4].copy_from_slice(&v.to_le_bytes())
     };
-    // d°C → m°C: 612 * 100 = 61_200.
-    if mc != 61_200 {
-        return TestResult::Fail("decode of d°C → m°C wrong");
+    put16(&mut t, 0x00, 2200); // GfxclkFrequency
+    put16(&mut t, 0x02, 900); // SocclkFrequency
+    put16(&mut t, 0x08, 3200); // MemclkFrequency
+    put16(&mut t, 0x0c, 4250); // GfxActivity, centi-percent
+    put16(&mut t, 0x0e, 0); // UvdActivity
+    put16(&mut t, 0x10, 1050); // Voltage[0] = VDDCR_VDD
+    put16(&mut t, 0x12, 950); // Voltage[1] = VDDCR_SOC
+    put16(&mut t, 0x4e, 5500); // L3Temperature
+    put16(&mut t, 0x50, 6120); // GfxTemperature, centi-Celsius
+    put16(&mut t, 0x52, 6480); // SocTemperature
+    put16(&mut t, 0x54, 0x0003); // ThrottlerStatus
+    put16(&mut t, 0x56, 15_000); // CurrentSocketPower, mW
+    put32(&mut t, 0x5c, 12_500); // ApuPower, mW
+    put16(&mut t, 0x88, 14_200); // AverageSocketPower
+
+    let m = match parse_metrics(&t) {
+        Some(m) => m,
+        None => return TestResult::Fail("a full-size table must decode"),
+    };
+    if m.gfxclk_mhz != 2200 || m.socclk_mhz != 900 || m.memclk_mhz != 3200 {
+        return TestResult::Fail("clock fields at 0x00, 0x02, 0x08");
+    }
+    if m.gfx_activity_centi_percent != 4250 || m.gfx_activity_percent() != 42 {
+        return TestResult::Fail("activity is centi-percent at 0x0c");
+    }
+    // Voltage is an array; the SOC entry must not be read as a separate
+    // scalar at some other offset.
+    if m.vddgfx_mv != 1050 || m.vddsoc_mv != 950 {
+        return TestResult::Fail("Voltage[2] at 0x10 indexes VDD then SOC");
+    }
+    if m.gfx_temperature_centi_c != 6120 || m.soc_temperature_centi_c != 6480 {
+        return TestResult::Fail("temperatures at 0x50 and 0x52");
+    }
+    if m.l3_temperature_centi_c != 5500 {
+        return TestResult::Fail("L3Temperature is at 0x4e, just below GfxTemperature");
+    }
+    // Centi-Celsius to milli-Celsius is a factor of ten. Reading the field as
+    // tenths of a degree would give 612_000 here instead of 61_200.
+    if m.edge_temperature_milli_c() != 61_200 {
+        return TestResult::Fail("GfxTemperature is centi-Celsius, so milli-C is x10");
+    }
+    if m.hotspot_temperature_milli_c() != 64_800 {
+        return TestResult::Fail("hotspot comes from SocTemperature");
+    }
+    if m.throttler_status != 3 || m.current_socket_power_mw != 15_000 {
+        return TestResult::Fail("throttler at 0x54, socket power at 0x56");
+    }
+    // ApuPower is one of the two uint32_t fields; a uint16_t read here would
+    // clip anything above 65535 and misplace dGpuPower.
+    if m.apu_power_mw != 12_500 || m.average_socket_power_mw != 14_200 {
+        return TestResult::Fail("ApuPower is a u32 at 0x5c; AverageSocketPower is at 0x88");
+    }
+    // A short buffer is rejected rather than decoded out of bounds.
+    if parse_metrics(&t[..SMU_METRICS_V13_0_4_BYTES - 1]).is_some() {
+        return TestResult::Fail("a short table must be rejected");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/smu",
-    smoke_amdgpu_smu_read_gpu_temperature_decodes_decicelsius
+    smoke_amdgpu_smu_metrics_table_decode
 );
+
+/// The SMU 13.0.4 message ids, spelled out from
+/// `smu_v13_0_4_ppsmc.h`. The whole table checks out; this pins the ones the
+/// bring-up path depends on, and the message-count bound that showed the
+/// temperature message to be fabricated.
+fn smoke_amdgpu_smu_v13_message_ids() -> TestResult {
+    use crate::amdgpu_smu_v13::*;
+    if V13_MSG_TEST != 0x01 || V13_MSG_GET_PMFW_VERSION != 0x02 || V13_MSG_GET_DRIVER_IF != 0x03 {
+        return TestResult::Fail("TestMessage/GetPmfwVersion/GetDriverIfVersion are 0x01..0x03");
+    }
+    if V13_MSG_SET_DRAM_ADDR_HI != 0x0D
+        || V13_MSG_SET_DRAM_ADDR_LO != 0x0E
+        || V13_MSG_XFER_SMU2DRAM != 0x0F
+        || V13_MSG_XFER_DRAM2SMU != 0x10
+    {
+        return TestResult::Fail("the metrics-table transfer quartet is 0x0D..0x10");
+    }
+    if V13_MSG_ALLOW_GFX_OFF != 0x19 || V13_MSG_DISALLOW_GFX_OFF != 0x1A {
+        return TestResult::Fail("GFXOFF control is 0x19/0x1A on SMU13, not 0x07/0x08");
+    }
+    // The hard/soft min/max messages are not laid out in a block: SOCCLK's
+    // hard min is 0x13 while FCLK's is 0x23, and the soft mins are 0x24 and
+    // 0x14 respectively. Nothing here can be derived from a neighbour.
+    if V13_MSG_SET_HARD_MIN_SOCCLK != 0x13
+        || V13_MSG_SET_SOFT_MIN_FCLK != 0x14
+        || V13_MSG_SET_HARD_MIN_FCLK != 0x23
+        || V13_MSG_SET_SOFT_MIN_SOCCLK != 0x24
+    {
+        return TestResult::Fail("the clock min messages are interleaved, not contiguous");
+    }
+    // PPSMC_Message_Count is 0x31; anything at or above it is not a message.
+    // 0x36 was being sent as GetCurrentTemperature.
+    if V13_MSG_SET_SOFT_MIN_SOCCLK >= 0x31 {
+        return TestResult::Fail("message ids must be below PPSMC_Message_Count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu/smu", smoke_amdgpu_smu_v13_message_ids);
 
 // ── DMA-buf smokes ────────────────────────────────────────────────────
 
@@ -6388,7 +7323,7 @@ fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
     if !s.idle() {
         return TestResult::Fail("raw=0 must decode as idle");
     }
-    if s.any_busy() || s.cp_busy() || s.rlc_busy() {
+    if s.any_busy() || s.cp_busy() {
         return TestResult::Fail("raw=0 must not be busy");
     }
     if s.is_sentinel() {
@@ -6406,11 +7341,478 @@ fn smoke_amdgpu_foundations_grbm_status_idle_decode() -> TestResult {
     if !s3.is_sentinel() {
         return TestResult::Fail("0xFFFFFFFF must be sentinel");
     }
+    // The RLC's busy bit is NOT in this register. `gc_9_0_sh_mask.h` and
+    // `gc_11_0_0_sh_mask.h` both define `GRBM_STATUS2__RLC_BUSY` and neither
+    // defines a `GRBM_STATUS__RLC_BUSY`; bit 26 of GRBM_STATUS is `DB_BUSY`
+    // (0x04000000). And the GRBM_STATUS2 bit moves: 0x04000000 on GFX9,
+    // 0x01000000 on GFX11.
+    use crate::amdgpu_gfx::{GfxGeneration, GrbmStatus2};
+    if GfxGeneration::Gfx9.grbm_status2_rlc_busy() != 0x0400_0000
+        || GfxGeneration::Gfx11.grbm_status2_rlc_busy() != 0x0100_0000
+    {
+        return TestResult::Fail("GRBM_STATUS2__RLC_BUSY moved between the two headers");
+    }
+    if GfxGeneration::Gfx9.grbm_status2_rel() != 0x0002 * 4
+        || GfxGeneration::Gfx11.grbm_status2_rel() != 0x0DA2 * 4
+    {
+        return TestResult::Fail("GRBM_STATUS2 is 0x0002 on GFX9 and 0x0da2 on GFX11");
+    }
+    // A GFX11 part reporting RLC busy must not be read with GFX9's bit, and
+    // vice versa — that is the whole reason this is per-generation.
+    let rlc11 = GrbmStatus2 { raw: 0x0100_0000 };
+    if !rlc11.rlc_busy(GfxGeneration::Gfx11) || rlc11.rlc_busy(GfxGeneration::Gfx9) {
+        return TestResult::Fail("GFX11's RLC_BUSY is bit 24");
+    }
+    let rlc9 = GrbmStatus2 { raw: 0x0400_0000 };
+    if !rlc9.rlc_busy(GfxGeneration::Gfx9) || rlc9.rlc_busy(GfxGeneration::Gfx11) {
+        return TestResult::Fail("GFX9's RLC_BUSY is bit 26");
+    }
+    // That same bit 26, in GRBM_STATUS, is DB_BUSY — and it does count as busy.
+    let db = GrbmStatus {
+        raw: crate::amdgpu_gfx::GRBM_STATUS_DB_BUSY,
+    };
+    if db.idle() {
+        return TestResult::Fail("DB_BUSY is a real GRBM_STATUS busy bit");
+    }
+    // The register offsets, from the two headers.
+    if GfxGeneration::Gfx9.grbm_status_rel() != (0x0004 * 4, 0)
+        || GfxGeneration::Gfx11.grbm_status_rel() != (0x0DA4 * 4, 0)
+    {
+        return TestResult::Fail("GRBM_STATUS is 0x0004 on GFX9 and 0x0da4 on GFX11");
+    }
+    // regCP_ME_CNTL: 0x01b6 on BASE_IDX 0 for GFX9, 0x0803 on BASE_IDX 1 for
+    // GFX11 — the window changes with the generation.
+    if GfxGeneration::Gfx9.cp_me_cntl_rel() != (0x01B6 * 4, 0)
+        || GfxGeneration::Gfx11.cp_me_cntl_rel() != (0x0803 * 4, 1)
+    {
+        return TestResult::Fail("CP_ME_CNTL's offset and base index are per-generation");
+    }
+    // CP_ME_CNTL__ME_HALT 0x10000000, __PFP_HALT 0x04000000, __CE_HALT
+    // 0x01000000. GFX10 dropped the constant engine, so GFX11 drives only two.
+    if GfxGeneration::Gfx9.cp_me_cntl_halt_all() != 0x1500_0000
+        || GfxGeneration::Gfx11.cp_me_cntl_halt_all() != 0x1400_0000
+    {
+        return TestResult::Fail("GFX11 has no constant engine to halt");
+    }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_grbm_status_idle_decode
+);
+
+/// The two conventions this driver carries — byte-offset `*_REL` constants and
+/// MM_INDEX's dword port — and which GC window each register needs. Literals
+/// from `gc/gc_11_0_0_offset.h` and `gc_9_0_offset.h`.
+/// The registers `passive_mode` reads to recover a running mode's geometry,
+/// and the decode it applies. Literals from `dcn/dcn_3_1_4_offset.h` and
+/// `dcn_3_1_4_sh_mask.h`.
+/// The writeback page: three slots at Linux's 32-byte spacing, each with a
+/// distinct owner, and `rptr` actually read back from it.
+/// The HPD status register, and the gap between the cookie's connector space
+/// and the registers this ASIC actually has.
+fn smoke_amdgpu_hpd_status_register_window() -> TestResult {
+    use crate::amdgpu_dcn as dcn;
+    // regHPD0_DC_HPD_INT_STATUS 0x1f14 and regHPD1_... 0x1f1c, BASE_IDX 2.
+    if dcn::HPD0_DC_HPD_INT_STATUS != 0x1f14 || dcn::HPD_STRIDE != 8 {
+        return TestResult::Fail("the HPD status registers are 0x1f14, eight apart");
+    }
+    // regHPD4_DC_HPD_INT_STATUS 0x1f34 is the last the header defines.
+    if dcn::HPD_BLOCKS != 5 {
+        return TestResult::Fail("DCN 3.1.4 instantiates five HPD blocks");
+    }
+    if dcn::for_pipe(
+        dcn::HPD0_DC_HPD_INT_STATUS,
+        dcn::HPD_BLOCKS - 1,
+        dcn::HPD_STRIDE,
+    ) != 0x1f34
+    {
+        return TestResult::Fail("the last HPD block is 0x1f34");
+    }
+    // DC_HPD_SENSE_DELAYED 0x00000010 is the debounced pin `hw_hpd.c` reads in
+    // interrupt mode; DC_HPD_SENSE 0x00000002 is the raw one.
+    if dcn::DC_HPD_SENSE_DELAYED != 0x10 || dcn::DC_HPD_SENSE != 0x02 {
+        return TestResult::Fail("the sense bits are 0x10 delayed and 0x02 raw");
+    }
+    // The cookie space is WIDER than the register space: CTXID__DC_HPD6_INT is
+    // 5, so a cookie can name a connector with no HPD register on this part.
+    if crate::amdgpu_ih::HPD_CONNECTORS <= dcn::HPD_BLOCKS {
+        return TestResult::Fail("the cookie names more connectors than this ASIC has blocks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_hpd_status_register_window
+);
+
+fn smoke_amdgpu_gfx_writeback_slots_are_separate() -> TestResult {
+    use crate::amdgpu_gfx::{
+        GfxContext, WB_BYTES, WB_FENCE_OFFSET, WB_RPTR_OFFSET, WB_SLOT_BYTES, WB_WPTR_OFFSET,
+    };
+    // `amdgpu_wb_get` returns `offset << 3` as a dword offset, so consecutive
+    // writeback allocations are 32 bytes apart — enough for the 8-byte
+    // atomic64 the wptr shadow needs.
+    if WB_SLOT_BYTES != 32 {
+        return TestResult::Fail("a writeback slot is 32 bytes");
+    }
+    if (WB_RPTR_OFFSET, WB_WPTR_OFFSET, WB_FENCE_OFFSET) != (0, 32, 64) {
+        return TestResult::Fail("the three slots are one apart each");
+    }
+    if WB_BYTES != 96 {
+        return TestResult::Fail("three slots is 96 bytes");
+    }
+
+    let ctx = match GfxContext::new(7) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("GfxContext::new failed"),
+    };
+    // The fence target and the rptr writeback address must not be the same
+    // place: the CP overwrites rptr continuously, and the fence has to
+    // survive until the host reads it. They used to be one 8-byte buffer.
+    if ctx.fence_phys() == ctx.rptr_phys() {
+        return TestResult::Fail("the fence and rptr slots must not overlap");
+    }
+    if ctx.wptr_phys() == ctx.rptr_phys() || ctx.wptr_phys() == ctx.fence_phys() {
+        return TestResult::Fail("the wptr shadow needs its own slot");
+    }
+    // And each is where the layout says, relative to the page.
+    let page = ctx.rptr_phys();
+    if ctx.wptr_phys() != page + WB_WPTR_OFFSET || ctx.fence_phys() != page + WB_FENCE_OFFSET {
+        return TestResult::Fail("a slot is not at its documented offset");
+    }
+    // Zeroed at allocation, so a read before the CP has run gives 0 rather
+    // than whatever the page held — which keeps the ring write-once instead
+    // of letting it wrap over unconsumed commands.
+    if ctx.ring_rptr() != 0 {
+        return TestResult::Fail("the rptr slot must start zeroed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx_writeback_slots_are_separate
+);
+
+/// The three consumers of a queue's addresses must agree.
+///
+/// A GFX11 kernel graphics ring is described three times over: in the
+/// descriptor the CP firmware reads, in the CP's own registers, and in the MES
+/// mapping packet. The ring base, the rptr writeback, the wptr shadow, the
+/// descriptor's address and the doorbell index appear in more than one of
+/// those, and a caller assembling them by hand can give two of the three a
+/// different answer. The failure mode is a queue the firmware accepts and that
+/// never runs, which is the worst kind to debug, so the addresses come from
+/// one place.
+fn smoke_amdgpu_gfx_queue_description_is_consistent() -> TestResult {
+    use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxContext, MQD_BYTES};
+    use crate::amdgpu_mqd::{CP_GFX_HQD_BASE, CP_GFX_HQD_BASE_HI, MQD_DWORDS};
+
+    if MQD_BYTES != MQD_DWORDS * 4 || MQD_BYTES != 2048 {
+        return TestResult::Fail("struct v11_gfx_mqd is 512 dwords");
+    }
+
+    // AMDGPU_NAVI10_DOORBELL_GFX_RING0.
+    let ctx = match GfxContext::new(0x08B) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("GfxContext::new failed"),
+    };
+    if ctx.write_mqd().is_err() {
+        return TestResult::Fail("the derived MQD properties were refused");
+    }
+
+    // The descriptor records the ring base shifted right by 8, so read it back
+    // and reconstruct the address the firmware will use.
+    let base_lo = ctx.mqd_dword(CP_GFX_HQD_BASE);
+    let base_hi = ctx.mqd_dword(CP_GFX_HQD_BASE_HI);
+    let from_mqd = ((u64::from(base_hi) << 32) | u64::from(base_lo)) << 8;
+    if from_mqd != ctx.ring_phys() {
+        return TestResult::Fail("the descriptor does not name this context's ring");
+    }
+
+    // The MES packet must name the same descriptor, the same wptr shadow and
+    // the same doorbell as the descriptor and the registers do.
+    let args = ctx.map_legacy_args(0, 0);
+    if args.mqd_addr != ctx.mqd_phys() {
+        return TestResult::Fail("the mapping packet names a different descriptor");
+    }
+    if args.wptr_addr != ctx.wptr_phys() {
+        return TestResult::Fail("the mapping packet names a different wptr shadow");
+    }
+    // 0x08B << 1 — the dword index space, which is what both the packet and
+    // the CP's DOORBELL_OFFSET field carry.
+    if args.doorbell_offset != 0x116 {
+        return TestResult::Fail("the mapping packet's doorbell is not the dword index");
+    }
+    if u64::from(args.doorbell_offset) * 4 != ctx.doorbell_offset() {
+        return TestResult::Fail("the packet's doorbell and the BAR2 offset disagree");
+    }
+    if args.queue_type != crate::amdgpu_mes::MesQueueType::Gfx {
+        return TestResult::Fail("a graphics ring maps as a GFX queue");
+    }
+
+    // And the register sequence, built from the same accessors, points the CP
+    // at the same ring and the same writeback addresses.
+    const GC: u32 = 0x0003_0000;
+    const GC1: u32 = 0x0005_0000;
+    let seq = match build_gfx11_ring_init(
+        GC,
+        GC1,
+        0,
+        ctx.ring_phys(),
+        crate::amdgpu_ring::RING_SIZE_DW as u64 * 4,
+        args.doorbell_offset,
+        true,
+        ctx.rptr_phys(),
+        ctx.wptr_phys(),
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("the ring init sequence was refused"),
+    };
+    // regCP_RB0_BASE 0x1de0 holds the base >> 8, and regCP_RB0_BASE_HI 0x1e51
+    // its high half.
+    let reg_lo = seq.first_write_to(GC, 0x1de0).unwrap_or(0);
+    let reg_hi = seq.first_write_to(GC, 0x1e51).unwrap_or(0);
+    let from_regs = ((u64::from(reg_hi) << 32) | u64::from(reg_lo)) << 8;
+    if from_regs != ctx.ring_phys() {
+        return TestResult::Fail("the CP registers do not name this context's ring");
+    }
+    if from_regs != from_mqd {
+        return TestResult::Fail("the descriptor and the registers name different rings");
+    }
+    // regCP_RB0_RPTR_ADDR 0x1de3 and regCP_RB_WPTR_POLL_ADDR_LO 0x1e8b.
+    if seq.first_write_to(GC, 0x1de3) != Some(ctx.rptr_phys() as u32) {
+        return TestResult::Fail("the CP's rptr writeback is not this context's slot");
+    }
+    if seq.first_write_to(GC, 0x1e8b) != Some(ctx.wptr_phys() as u32) {
+        return TestResult::Fail("the CP's wptr poll address is not this context's shadow");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx_queue_description_is_consistent
+);
+
+/// Applying a sequence performs every step, in order, including the wait.
+///
+/// The builders were values nothing executed. What an applier has to get right
+/// is narrow and silent when wrong: the order (two writes to the same register
+/// with a wait between them are not interchangeable), and that the wait
+/// happens at all — `gfx_v11_0_cp_gfx_resume`'s `mdelay(1)` is why the second
+/// `CP_RB0_CNTL` write exists, so a sequence applied without it writes the
+/// same value twice for no reason and the ring-size field may not have
+/// settled.
+fn smoke_amdgpu_gfx11_sequence_applies_in_order() -> TestResult {
+    use crate::amdgpu_cp_fw::CpFwMmio;
+    use crate::amdgpu_gfx::{apply_gfx11_sequence, build_gfx11_ring_init, GfxStep};
+    use alloc::vec::Vec;
+
+    /// Records what it is asked to do, in order.
+    struct Recorder {
+        writes: Vec<(u32, u32)>,
+    }
+    impl CpFwMmio for Recorder {
+        fn read(&mut self, _byte_off: u32) -> u32 {
+            0
+        }
+        fn write(&mut self, byte_off: u32, value: u32) {
+            self.writes.push((byte_off, value));
+        }
+    }
+
+    const GC: u32 = 0x0003_0000;
+    const GC1: u32 = 0x0005_0000;
+    const RING: u64 = 0x1_0000_0000;
+    let seq = match build_gfx11_ring_init(
+        GC,
+        GC1,
+        0xA5A5_A5A2,
+        RING,
+        4096,
+        0x116,
+        true,
+        0x2_DEAD_0000,
+        0x3_BEEF_0000,
+    ) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("the sequence was refused"),
+    };
+
+    let mut rec = Recorder { writes: Vec::new() };
+    let mut delays: Vec<u32> = Vec::new();
+    apply_gfx11_sequence(&mut rec, &seq, &mut |us| delays.push(us));
+
+    // Every write in the sequence reached the mock, and nothing else did.
+    let expected: Vec<(u32, u32)> = seq
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            GfxStep::Write { addr, value } => Some((*addr, *value)),
+            GfxStep::Delay { .. } => None,
+        })
+        .collect();
+    if rec.writes != expected {
+        return TestResult::Fail("the applied writes are not the sequence's writes in order");
+    }
+    if rec.writes.is_empty() {
+        return TestResult::Fail("the sequence should have writes to apply");
+    }
+
+    // The waits were performed, with the durations the sequence asked for.
+    let expected_delays: Vec<u32> = seq
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            GfxStep::Delay { us } => Some(*us),
+            GfxStep::Write { .. } => None,
+        })
+        .collect();
+    if delays != expected_delays {
+        return TestResult::Fail("the applied delays are not the sequence's delays");
+    }
+    if delays.is_empty() {
+        return TestResult::Fail("gfx_v11_0_cp_gfx_resume's mdelay(1) must be one of the steps");
+    }
+
+    // And the order across kinds: regCP_RB0_CNTL 0x1de1 is written twice with
+    // the wait between them. Counting writes before the first delay is how a
+    // reordering shows up — a drop-in that applied all writes and then all
+    // delays would pass both checks above.
+    let cntl = GC + (0x1de1 << 2);
+    let delay_pos = seq
+        .steps
+        .iter()
+        .position(|s| matches!(s, GfxStep::Delay { .. }));
+    let Some(delay_pos) = delay_pos else {
+        return TestResult::Fail("no delay step to position against");
+    };
+    let before = seq.steps[..delay_pos]
+        .iter()
+        .filter(|s| matches!(s, GfxStep::Write { addr, .. } if *addr == cntl))
+        .count();
+    let after = seq.steps[delay_pos..]
+        .iter()
+        .filter(|s| matches!(s, GfxStep::Write { addr, .. } if *addr == cntl))
+        .count();
+    if before != 1 || after != 1 {
+        return TestResult::Fail("CP_RB0_CNTL is written once on each side of the wait");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx11_sequence_applies_in_order
+);
+
+fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
+    use crate::amdgpu_dcn as dcn;
+    // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
+    // 0x05ea, regHUBPREQ0_DCSURF_SURFACE_PITCH 0x0607 — all BASE_IDX 2.
+    if dcn::HUBP0_DCHUBP_CNTL != 0x05f3
+        || dcn::HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION != 0x05ea
+        || dcn::HUBPREQ0_DCSURF_SURFACE_PITCH != 0x0607
+    {
+        return TestResult::Fail("a hub register id is not its header dword id");
+    }
+    // Nothing in the 0x5c00 range the old code used is a DCN register at all,
+    // and regOTG0_OTG_H_TOTAL — the register it claimed to read — is 0x1b2a.
+    if dcn::OTG0_OTG_H_TOTAL != 0x1b2a {
+        return TestResult::Fail("OTG_H_TOTAL is dword 0x1b2a");
+    }
+    // PRI_VIEWPORT_WIDTH/HEIGHT and PITCH are all 0x3FFF-wide fields.
+    if dcn::SURFACE_DIMENSION_MASK != 0x3FFF {
+        return TestResult::Fail("the viewport and pitch fields are fourteen bits");
+    }
+    // HUBP_BLANK_EN is bit 0: set means the pipe is NOT fetching, which is the
+    // sense `scan_surfaces` uses too.
+    if dcn::HUBP_BLANK_FORCE != 1 {
+        return TestResult::Fail("HUBP_BLANK_EN is bit 0");
+    }
+    // The decode: a 1920x1080 viewport with a 1920-pixel pitch is
+    // 0x0438_0780 in the viewport register and 0x077F in the pitch one, since
+    // the pitch register holds one less.
+    let viewport = 1920u32 | 1080u32 << 16;
+    let pitch_field = 1920u32 - 1;
+    if viewport != 0x0438_0780 || pitch_field != 0x077F {
+        return TestResult::Fail("the fixture does not pack as the registers do");
+    }
+    if viewport & dcn::SURFACE_DIMENSION_MASK != 1920
+        || (viewport >> 16) & dcn::SURFACE_DIMENSION_MASK != 1080
+        || (pitch_field & dcn::SURFACE_DIMENSION_MASK) + 1 != 1920
+    {
+        return TestResult::Fail("viewport or pitch decode");
+    }
+    // The per-pipe stride the scan walks.
+    if dcn::for_pipe(dcn::HUBP0_DCHUBP_CNTL, 1, dcn::HUBP_PIPE_STRIDE) != 0x06cf {
+        return TestResult::Fail("regHUBP1_DCHUBP_CNTL is 0x06cf");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing
+);
+
+fn smoke_amdgpu_gc_window_and_dword_conversion() -> TestResult {
+    use crate::amdgpu::mm_dword;
+    use crate::amdgpu_cp_fw::{CpEngine, CP_PFP_IC_BASE_LO};
+    use crate::amdgpu_gfx::{GfxGeneration, GRBM_GFX_INDEX_REL, GRBM_STATUS_REL_GFX11};
+
+    // `amdgpu_gfx`'s constants are byte offsets: regGRBM_GFX_INDEX is dword
+    // 0x2200 and regGRBM_STATUS 0x0da4 on GFX11.
+    if GRBM_GFX_INDEX_REL != 0x2200 * 4 || GRBM_STATUS_REL_GFX11 != 0x0DA4 * 4 {
+        return TestResult::Fail("the *_REL constants are byte offsets");
+    }
+    // MM_INDEX takes the dword, so a caller must convert — adding the byte
+    // offset straight to a dword base lands four times further in.
+    if mm_dword(GRBM_GFX_INDEX_REL) != 0x2200 || mm_dword(GRBM_STATUS_REL_GFX11) != 0x0DA4 {
+        return TestResult::Fail("mm_dword must undo the byte scaling");
+    }
+
+    // regGRBM_GFX_INDEX_BASE_IDX is 1 and regGRBM_STATUS_BASE_IDX is 0, so the
+    // two cannot share a base — and the window travels with the offset rather
+    // than being chosen at the call site.
+    for generation in [GfxGeneration::Gfx9, GfxGeneration::Gfx11] {
+        if generation.grbm_gfx_index_rel() != (0x2200 * 4, 1) {
+            return TestResult::Fail("GRBM_GFX_INDEX is dword 0x2200 on GC window 1");
+        }
+        if generation.grbm_status_rel().1 != 0 {
+            return TestResult::Fail("GRBM_STATUS is on GC window 0");
+        }
+        if generation.grbm_gfx_index_rel().1 == generation.grbm_status_rel().1 {
+            return TestResult::Fail("these two registers are in different GC windows");
+        }
+    }
+    //
+    // regCP_PFP_IC_BASE_LO 0x5840 is BASE_IDX 1 too — the whole CP IC block
+    // is, which is why `load_all_cp_fw` takes window 1.
+    if CP_PFP_IC_BASE_LO != 0x5840 {
+        return TestResult::Fail("CP_PFP_IC_BASE_LO is dword 0x5840");
+    }
+    let (base_lo, base_hi, base_cntl, op_cntl) = CpEngine::Pfp.registers();
+    if (base_lo, base_hi, base_cntl, op_cntl) != (0x5840, 0x5841, 0x5842, 0x5843) {
+        return TestResult::Fail("the PFP IC quad is 0x5840..0x5843");
+    }
+
+    // regCP_ME_CNTL is 0x0803 on BASE_IDX 1 for GFX11 but 0x01b6 on BASE_IDX 0
+    // for GFX9, while regCP_STAT is BASE_IDX 0 on both (0x0f40 / 0x01a0) —
+    // which is why `cp_enable` needs two bases rather than one.
+    if GfxGeneration::Gfx11.cp_me_cntl_rel() != (0x0803 * 4, 1)
+        || GfxGeneration::Gfx9.cp_me_cntl_rel() != (0x01B6 * 4, 0)
+    {
+        return TestResult::Fail("CP_ME_CNTL's window is per-generation");
+    }
+    if GfxGeneration::Gfx11.cp_stat_rel() != 0x0F40 * 4
+        || GfxGeneration::Gfx9.cp_stat_rel() != 0x01A0 * 4
+    {
+        return TestResult::Fail("CP_STAT is BASE_IDX 0 on both generations");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gc_window_and_dword_conversion
 );
 
 fn smoke_amdgpu_foundations_grbm_gfx_index_encoding() -> TestResult {
@@ -6446,37 +7848,84 @@ kernel_test_in!(
     smoke_amdgpu_foundations_grbm_gfx_index_encoding
 );
 
+/// The GFX register offsets, against the AMD headers they are supposed to
+/// come from.
+///
+/// The version of this test it replaces asserted `GRBM_STATUS = 0x0DA0` and
+/// `CP_VERSION = 0x0867` and said they "must match the documented
+/// gc_9_0_offset.h dwords". Neither does. `mmGRBM_STATUS` is 0x0004 on GFX9
+/// and 0x0da4 on GFX11, and there is no `CP_VERSION` register in any AMD
+/// header — the probe that read it has been removed rather than pointed
+/// somewhere plausible.
+///
+/// An offset test can only restate a number, so what it buys is a tripwire:
+/// changing one of these now requires saying which header line justifies it.
 fn smoke_amdgpu_foundations_gfx_per_family_register_offsets_distinct() -> TestResult {
-    // GFX9 (Renoir, Cezanne) and GFX11 (Phoenix HawkPoint1, Strix)
-    // place GRBM_STATUS and CP_VERSION at different byte offsets;
-    // confirm so the per-family branch in
-    // `AmdGpu::grbm_status_offset` / `cp_version_offset` actually
-    // does work.
     use crate::amdgpu_gfx::{
-        CP_VERSION_REL_GFX11, CP_VERSION_REL_GFX9, GRBM_STATUS_REL_GFX11, GRBM_STATUS_REL_GFX9,
+        CP_ME_CNTL_REL, CP_RB0_BASE_HI_REL, CP_RB0_BASE_REL, CP_RB0_CNTL_REL,
+        CP_RB0_RPTR_ADDR_HI_REL, CP_RB0_RPTR_ADDR_REL, CP_RB0_WPTR_HI_REL, CP_RB0_WPTR_REL,
+        CP_RB_DOORBELL_CONTROL_REL, CP_RB_DOORBELL_RANGE_LOWER_REL, CP_RB_DOORBELL_RANGE_UPPER_REL,
+        GRBM_GFX_INDEX_REL, GRBM_STATUS_REL_GFX11, GRBM_STATUS_REL_GFX9,
     };
+
+    // `gc_9_0_offset.h`, dword ids.
+    let gfx9: &[(&str, u32, u32)] = &[
+        ("mmCP_ME_CNTL", CP_ME_CNTL_REL, 0x01B6),
+        ("mmCP_RB0_BASE", CP_RB0_BASE_REL, 0x1040),
+        ("mmCP_RB0_CNTL", CP_RB0_CNTL_REL, 0x1041),
+        ("mmCP_RB0_RPTR_ADDR", CP_RB0_RPTR_ADDR_REL, 0x1043),
+        ("mmCP_RB0_RPTR_ADDR_HI", CP_RB0_RPTR_ADDR_HI_REL, 0x1044),
+        ("mmCP_RB0_WPTR", CP_RB0_WPTR_REL, 0x1054),
+        ("mmCP_RB0_WPTR_HI", CP_RB0_WPTR_HI_REL, 0x1055),
+        (
+            "mmCP_RB_DOORBELL_CONTROL",
+            CP_RB_DOORBELL_CONTROL_REL,
+            0x1059,
+        ),
+        (
+            "mmCP_RB_DOORBELL_RANGE_LOWER",
+            CP_RB_DOORBELL_RANGE_LOWER_REL,
+            0x105A,
+        ),
+        (
+            "mmCP_RB_DOORBELL_RANGE_UPPER",
+            CP_RB_DOORBELL_RANGE_UPPER_REL,
+            0x105B,
+        ),
+        ("mmCP_RB0_BASE_HI", CP_RB0_BASE_HI_REL, 0x10B1),
+        ("mmGRBM_STATUS", GRBM_STATUS_REL_GFX9, 0x0004),
+        ("mmGRBM_GFX_INDEX", GRBM_GFX_INDEX_REL, 0x2200),
+    ];
+    for (name, got, want_dword) in gfx9.iter().copied() {
+        let _ = name;
+        if got != want_dword * 4 {
+            return TestResult::Fail("a GFX9 register offset is not its gc_9_0_offset.h value");
+        }
+    }
+
+    // `gc_11_0_0_offset.h`.
+    if GRBM_STATUS_REL_GFX11 != 0x0DA4 * 4 {
+        return TestResult::Fail("GFX11 GRBM_STATUS is regGRBM_STATUS = 0x0da4");
+    }
+    // The per-family branch in `AmdGpu::grbm_status_offset` only earns its
+    // keep if the two differ.
     if GRBM_STATUS_REL_GFX9 == GRBM_STATUS_REL_GFX11 {
-        return TestResult::Fail("GRBM_STATUS offsets must differ GFX9 vs GFX11");
+        return TestResult::Fail("GRBM_STATUS moved between GFX9 and GFX11");
     }
-    if CP_VERSION_REL_GFX9 == CP_VERSION_REL_GFX11 {
-        return TestResult::Fail("CP_VERSION offsets must differ GFX9 vs GFX11");
+
+    // No two distinct registers may share an offset — a transposed digit
+    // usually collides, and a collision means one register's writes land on
+    // another's.
+    let mut offsets: alloc::vec::Vec<u32> = gfx9.iter().map(|(_, o, _)| *o).collect();
+    offsets.push(GRBM_STATUS_REL_GFX11);
+    let before = offsets.len();
+    offsets.sort_unstable();
+    offsets.dedup();
+    if offsets.len() != before {
+        return TestResult::Fail("two register offsets collide");
     }
-    // GFX9 values must match the documented gc_9_0_offset.h dwords
-    // (byte addr = dword index * 4):
-    //   mmGRBM_STATUS = 0x0DA0  -> byte 0x3680
-    //   mmCP_VERSION  = 0x0867  -> byte 0x219C
-    if GRBM_STATUS_REL_GFX9 != 0x0DA0 * 4 {
-        return TestResult::Fail("GFX9 GRBM_STATUS byte offset must be 0x0DA0*4");
-    }
-    if CP_VERSION_REL_GFX9 != 0x0867 * 4 {
-        return TestResult::Fail("GFX9 CP_VERSION byte offset must be 0x0867*4");
-    }
-    // All four register byte offsets must be 4-aligned.
-    if GRBM_STATUS_REL_GFX9 & 0x3 != 0
-        || GRBM_STATUS_REL_GFX11 & 0x3 != 0
-        || CP_VERSION_REL_GFX9 & 0x3 != 0
-        || CP_VERSION_REL_GFX11 & 0x3 != 0
-    {
+    // And all are dword aligned.
+    if offsets.iter().any(|o| o & 3 != 0) {
         return TestResult::Fail("register byte offsets must be 4-aligned");
     }
     TestResult::Pass
@@ -6561,31 +8010,82 @@ kernel_test_in!(
 
 // ── Foundations wave — register-surface offsets stable ─────────────
 
+/// The MC aperture registers, against the headers.
+///
+/// This test used to lock 0x6B0F, 0x6B10, 0x6B0C, 0x6B17, 0x6B18 and 0x2004,
+/// introduced with the comment: "Lock the MC register dword indices so an
+/// accidental rename doesn't drift them silently — these are facts about the
+/// silicon, not creative choices." Every one of those values was invented.
+/// `0x6B0F` appears in no AMD header for any `MC_VM_FB_LOCATION_BASE`
+/// variant, of any generation. The test was defending fabrication while
+/// asserting it was fact, which is a worse state than having no test.
+///
+/// The values below are from `gc_9_0_offset.h` (GFX9, GC block, BASE_IDX 0)
+/// and `gc_11_0_0_offset.h` (GFX11).
 fn smoke_amdgpu_foundations_mc_register_offsets_stable() -> TestResult {
-    // Lock the MC register dword indices so an accidental rename
-    // doesn't drift them silently — these are facts about the
-    // silicon, not creative choices.
-    use crate::amdgpu_gmc::{
-        MC_SHARED_CHMAP, MC_VM_AGP_BASE, MC_VM_FB_LOCATION_BASE, MC_VM_FB_LOCATION_TOP,
-        MC_VM_SYSTEM_APERTURE_HIGH_ADDR, MC_VM_SYSTEM_APERTURE_LOW_ADDR,
-    };
-    if MC_VM_FB_LOCATION_BASE != 0x6B0F {
-        return TestResult::Fail("MC_VM_FB_LOCATION_BASE drift");
+    use crate::amdgpu_gmc::*;
+
+    // GFX9: `mmMC_VM_*`, read by `gfxhub_v1_0.c`.
+    let gfx9: &[(u32, u32)] = &[
+        (MC_VM_FB_LOCATION_BASE, 0x0980),
+        (MC_VM_FB_LOCATION_TOP, 0x0981),
+        (MC_VM_AGP_TOP, 0x0982),
+        (MC_VM_AGP_BOT, 0x0983),
+        (MC_VM_AGP_BASE, 0x0984),
+        (MC_VM_SYSTEM_APERTURE_LOW_ADDR, 0x0985),
+        (MC_VM_SYSTEM_APERTURE_HIGH_ADDR, 0x0986),
+        (MC_VM_FB_OFFSET, 0x096B),
+        (MC_SHARED_CHMAP, 0x0801),
+        (MC_SHARED_CHREMAP, 0x0802),
+    ];
+    for (got, want) in gfx9.iter().copied() {
+        if got != want {
+            return TestResult::Fail("a GFX9 MC register offset is not its header dword id");
+        }
     }
-    if MC_VM_FB_LOCATION_TOP != 0x6B10 {
-        return TestResult::Fail("MC_VM_FB_LOCATION_TOP drift");
+
+    // GFX11 reads a DIFFERENT register, `regGCMC_VM_FB_LOCATION_BASE`, not
+    // the same one at a different offset (`gfxhub_v3_0.c`).
+    if GCMC_VM_FB_LOCATION_BASE_GFX11 != 0x1678 || GCMC_VM_FB_LOCATION_TOP_GFX11 != 0x1679 {
+        return TestResult::Fail("the GFX11 framebuffer-location registers are 0x1678 / 0x1679");
     }
-    if MC_VM_AGP_BASE != 0x6B0C {
-        return TestResult::Fail("MC_VM_AGP_BASE drift");
+    if GCMC_VM_FB_LOCATION_BASE_GFX11 == MC_VM_FB_LOCATION_BASE {
+        return TestResult::Fail("GFX9 and GFX11 use different registers here");
     }
-    if MC_VM_SYSTEM_APERTURE_LOW_ADDR != 0x6B17 {
-        return TestResult::Fail("MC_VM_SYSTEM_APERTURE_LOW_ADDR drift");
+
+    // The AGP triple ascends TOP, BOT, BASE — not the intuitive BASE, BOT,
+    // TOP, which is the order the old constants assumed and so had wrong
+    // relative to each other as well as absolutely.
+    if !(MC_VM_AGP_TOP < MC_VM_AGP_BOT && MC_VM_AGP_BOT < MC_VM_AGP_BASE) {
+        return TestResult::Fail("the AGP registers ascend TOP, BOT, BASE");
     }
-    if MC_VM_SYSTEM_APERTURE_HIGH_ADDR != 0x6B18 {
-        return TestResult::Fail("MC_VM_SYSTEM_APERTURE_HIGH_ADDR drift");
+
+    // The system aperture splits the same way: `gfxhub_v3_0.c:161-163` writes
+    // regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR 0x167d and _HIGH_ADDR 0x167e.
+    if GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11 != 0x167D
+        || GCMC_VM_SYSTEM_APERTURE_HIGH_ADDR_GFX11 != 0x167E
+    {
+        return TestResult::Fail("the GFX11 system-aperture registers are 0x167d / 0x167e");
     }
-    if MC_SHARED_CHMAP != 0x2004 {
-        return TestResult::Fail("MC_SHARED_CHMAP drift");
+    if GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11 == MC_VM_SYSTEM_APERTURE_LOW_ADDR {
+        return TestResult::Fail("GFX9 and GFX11 use different system-aperture registers");
+    }
+
+    // The one register the probe path may read with no IP base:
+    // `amdgpu_discovery.c:142` defines mmRCC_CONFIG_MEMSIZE as 0xde3,
+    // absolute, because it has to be readable before any base exists.
+    if crate::amdgpu::RCC_CONFIG_MEMSIZE != 0x0DE3 {
+        return TestResult::Fail("mmRCC_CONFIG_MEMSIZE is the absolute dword 0xde3");
+    }
+    // It is not a GC-block id: every constant above is block-relative and
+    // would need `reg_offset[GC][0][0]` added, which the probe path does not
+    // have yet.
+    if crate::amdgpu::RCC_CONFIG_MEMSIZE == MC_VM_FB_LOCATION_BASE
+        || crate::amdgpu::RCC_CONFIG_MEMSIZE == GCMC_VM_FB_LOCATION_BASE_GFX11
+    {
+        return TestResult::Fail(
+            "the pre-discovery size register is not a framebuffer-location one",
+        );
     }
     TestResult::Pass
 }
@@ -6644,4 +8144,2867 @@ fn smoke_amdgpu_foundations_discovery_resolves_load_bearing_blocks() -> TestResu
 kernel_test_in!(
     "drivers/gpu/amdgpu/foundations",
     smoke_amdgpu_foundations_discovery_resolves_load_bearing_blocks
+);
+
+/// The Phoenix PCI ids and firmware bundle, against the two sources of truth
+/// that can actually settle them.
+///
+/// Device ids come from the PCI SIG database (`pci.ids`, vendor 1002) because
+/// modern amdgpu matches APUs by IP-discovery version and carries no id table
+/// for them — so a wrong constant cannot be caught by reading the driver, only
+/// by booting the machine it is wrong about. Firmware names come from the
+/// `MODULE_FIRMWARE` declarations of the IP modules Linux binds for GFX 11.0.1.
+///
+/// Three constants were wrong before this test existed:
+///   * `0x15BF` was labelled Strix Point. It is Phoenix1 — the Radeon 780M —
+///     so every 780M asked the PSP for Strix firmware.
+///   * `0x1681` was labelled a "Phoenix discrete sibling". It is Rembrandt,
+///     RDNA2 (GFX 10.3.6), an architecture earlier.
+///   * `PHOENIX_FW` held the Strix bundle outright (GFX 11.5, DCN 3.5,
+///     PSP 14.0.1), under a doc comment that said so.
+fn smoke_amdgpu_phoenix_identity_matches_linux() -> TestResult {
+    use crate::amdgpu;
+    // pci.ids, vendor 1002.
+    if amdgpu::PHOENIX1 != 0x15BF || amdgpu::PHOENIX2 != 0x15C8 {
+        return TestResult::Fail("Phoenix1/Phoenix2 device ids disagree with pci.ids");
+    }
+    if amdgpu::STRIX_POINT != 0x150E {
+        return TestResult::Fail("Strix Point is 0x150E, not a Phoenix id");
+    }
+    if amdgpu::REMBRANDT != 0x1681 {
+        return TestResult::Fail("Rembrandt is 0x1681");
+    }
+    if amdgpu::PHOENIX_HAWKPOINT1 != 0x1900 {
+        return TestResult::Fail("HawkPoint1 is 0x1900");
+    }
+
+    // The 780M must resolve to the Phoenix family and the Phoenix bundle.
+    let Some(info) = amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, amdgpu::PHOENIX1)
+    else {
+        return TestResult::Fail("the Radeon 780M's device id resolves to no chip");
+    };
+    if info.family != amdgpu::Family::Phoenix {
+        return TestResult::Fail("the 780M should resolve to Family::Phoenix");
+    }
+
+    // `MODULE_FIRMWARE` for the IP modules Linux binds at GFX 11.0.1.
+    // In `enum AMDGPU_UCODE_ID` order, which is the order
+    // `psp_load_non_psp_fw` sends them in. The separate order assertions
+    // below say WHY each position matters; this one pins the names.
+    let want: &[&str] = &[
+        "amdgpu/psp_13_0_4_toc.bin",
+        "amdgpu/sdma_6_0_1.bin",
+        "amdgpu/gc_11_0_1_pfp.bin",
+        "amdgpu/gc_11_0_1_me.bin",
+        "amdgpu/gc_11_0_1_mec.bin",
+        "amdgpu/gc_11_0_1_mes.bin",
+        "amdgpu/gc_11_0_1_mes_2.bin",
+        "amdgpu/gc_11_0_1_mes1.bin",
+        "amdgpu/gc_11_0_1_imu.bin",
+        "amdgpu/gc_11_0_1_rlc.bin",
+        "amdgpu/vcn_4_0_2.bin",
+        "amdgpu/dcn_3_1_4_dmcub.bin",
+        "amdgpu/psp_13_0_4_ta.bin",
+    ];
+    if info.fw_list.len() != want.len() {
+        return TestResult::Fail("the Phoenix firmware bundle changed size");
+    }
+    for (entry, expected) in info.fw_list.iter().zip(want) {
+        if entry.name != *expected {
+            return TestResult::Fail("a Phoenix firmware blob name is not Linux's");
+        }
+    }
+
+    // The load ORDER is Linux's, not a preference. `psp_load_non_psp_fw`
+    // walks `adev->firmware.ucode[]`, indexed by `enum AMDGPU_UCODE_ID`, so
+    // the enum order IS the load order — and the PSP processes each load
+    // against the state the previous ones left.
+    //
+    // The two constraints that matter, both from `psp_load_non_psp_fw`:
+    //   * RLC is the LAST graphics blob. The autoload state machine starts
+    //     the moment it lands ("start rlc autoload after psp received all the
+    //     gfx firmware"), so every CP and MES blob must already be in.
+    //   * The non-graphics blobs (VCN, DMCUB) come after it.
+    let position = |needle: &str| info.fw_list.iter().position(|e| e.name.contains(needle));
+    let (Some(rlc), Some(sdma), Some(pfp), Some(mec), Some(mes), Some(imu)) = (
+        position("_rlc.bin"),
+        position("sdma_"),
+        position("_pfp.bin"),
+        position("_mec.bin"),
+        position("_mes.bin"),
+        position("_imu.bin"),
+    ) else {
+        return TestResult::Fail("a firmware blob the order depends on is missing");
+    };
+    for (what, at) in [
+        ("sdma", sdma),
+        ("pfp", pfp),
+        ("mec", mec),
+        ("mes", mes),
+        ("imu", imu),
+    ] {
+        let _ = what;
+        if at > rlc {
+            return TestResult::Fail("RLC must be the last graphics blob: autoload starts on it");
+        }
+    }
+    // SDMA is first of the IP firmwares, as its enum id is lowest.
+    if sdma > pfp {
+        return TestResult::Fail("SDMA loads before the CP engines");
+    }
+    // IMU sits between MES and RLC (enum ids 36/37 against MES 32-35, RLC 52).
+    if !(mes < imu && imu < rlc) {
+        return TestResult::Fail("IMU loads after MES and before RLC");
+    }
+    // And the non-graphics blobs trail RLC.
+    for tail in ["vcn_", "dmcub"] {
+        match position(tail) {
+            Some(at) if at > rlc => {}
+            _ => return TestResult::Fail("a non-graphics blob should load after RLC"),
+        }
+    }
+    // The TOC is first: the PSP needs the table of contents before any image.
+    if !info.fw_list[0].name.contains("_toc.bin") {
+        return TestResult::Fail("the TOC must be sent first");
+    }
+
+    // No SMU blob: Phoenix is an APU whose PMFW is BIOS-resident, and
+    // linux-firmware ships `smu_*.bin` for discrete parts only. The entry
+    // this table used to carry named a file that exists nowhere.
+    if info
+        .fw_list
+        .iter()
+        .any(|e| e.cmd == amdgpu::SMU_LOAD_PMFW_MP1)
+    {
+        return TestResult::Fail("an APU bundle must not carry an SMU PMFW blob");
+    }
+
+    // Silicon with no bring-up must not borrow another family's firmware.
+    for did in [amdgpu::STRIX_POINT, amdgpu::REMBRANDT] {
+        match amdgpu::__test_chip_info_for_pci_id(amdgpu::AMD_VENDOR, did) {
+            Some(info) if info.fw_list.is_empty() => {}
+            Some(_) => return TestResult::Fail("unaudited silicon was given a firmware bundle"),
+            None => return TestResult::Fail("an id in the match table resolves to no chip"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_phoenix_identity_matches_linux);
+
+/// Build a discovery blob carrying a `gc_info` v1.2 table describing a
+/// Radeon 780M: 1 shader engine, 2 shader arrays, 3 WGPs per bank per array.
+///
+/// 1 SE x 2 SA x (2 x (3 + 3)) CU = 24 — wait, the 780M has 12 CUs, so the
+/// banks are 3 and 0: `2 * (3 + 0) = 6` CU per SA, x 2 SA x 1 SE = 12.
+/// That asymmetry is the point of v1 having two WGP banks at all.
+fn build_gc_info_blob(version_minor: u16, fields: &[u32]) -> alloc::vec::Vec<u8> {
+    use crate::amdgpu_discovery as d;
+    let mut blob = alloc::vec![0u8; 0x400];
+    let gc_off: usize = 0x200;
+    let size = 12 + fields.len() * 4;
+
+    // Outer binary_header: signature + the GC directory entry. The GC parser
+    // does not re-verify the outer frame, so only the directory matters.
+    blob[0..4].copy_from_slice(&d::BINARY_SIGNATURE.to_le_bytes());
+    let entry = 12 + d::TABLE_GC * 8;
+    blob[entry..entry + 2].copy_from_slice(&(gc_off as u16).to_le_bytes());
+    blob[entry + 4..entry + 6].copy_from_slice(&(size as u16).to_le_bytes());
+
+    // gpu_info_header: table_id, version_major, version_minor, size.
+    blob[gc_off..gc_off + 4].copy_from_slice(&1u32.to_le_bytes());
+    blob[gc_off + 4..gc_off + 6].copy_from_slice(&1u16.to_le_bytes());
+    blob[gc_off + 6..gc_off + 8].copy_from_slice(&version_minor.to_le_bytes());
+    blob[gc_off + 8..gc_off + 12].copy_from_slice(&(size as u32).to_le_bytes());
+    for (i, v) in fields.iter().enumerate() {
+        let at = gc_off + 12 + i * 4;
+        blob[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    // The table's checksum, over exactly `size` bytes from its own start.
+    let csum = blob[gc_off..gc_off + size]
+        .iter()
+        .fold(0u16, |a, &b| a.wrapping_add(b as u16));
+    blob[entry + 2..entry + 4].copy_from_slice(&csum.to_le_bytes());
+    blob
+}
+
+/// The graphics-core topology comes from the discovery binary, not from a
+/// per-ASIC table in the driver.
+///
+/// This matters because `AMDGPU_INFO_DEV_INFO` reports most of it straight to
+/// userspace and Mesa makes shader-compilation decisions from the CU count,
+/// wave size and LDS size. Linux reads it from `table_list[GC]` for exactly
+/// this reason (`amdgpu_discovery_get_gfx_info`): a 780M and a 760M are both
+/// GFX 11.0.1 and differ in CU count, so anything hardcoded per IP version
+/// would be wrong for one of them.
+fn smoke_amdgpu_gc_info_reports_the_tables_topology() -> TestResult {
+    use crate::amdgpu_discovery::{parse_gc_info, DiscoveryError};
+
+    // v1 field order, through v1.2's cache geometry. 780M-shaped: one shader
+    // engine, two shader arrays, WGP banks of 3 and 0, wave32.
+    let v1: &[u32] = &[
+        1,       //  0 gc_num_se
+        3,       //  1 gc_num_wgp0_per_sa
+        0,       //  2 gc_num_wgp1_per_sa
+        2,       //  3 gc_num_rb_per_se
+        4,       //  4 gc_num_gl2c
+        1024,    //  5 gc_num_gprs
+        32,      //  6 gc_num_max_gs_thds
+        32,      //  7 gc_gs_table_depth
+        1792,    //  8 gc_gsprim_buff_depth
+        1024,    //  9 gc_parameter_cache_depth
+        1024,    // 10 gc_double_offchip_lds_buffer
+        32,      // 11 gc_wave_size
+        16,      // 12 gc_max_waves_per_simd
+        256,     // 13 gc_max_scratch_slots_per_cu
+        65536,   // 14 gc_lds_size
+        1,       // 15 gc_num_sc_per_se
+        2,       // 16 gc_num_sa_per_se
+        1,       // 17 gc_num_packer_per_sc
+        2,       // 18 gc_num_gl2a
+        16,      // 19 gc_num_tcp_per_sa
+        1,       // 20 gc_num_sdp_interface
+        16,      // 21 gc_num_tcps
+        4,       // 22 gc_num_tcp_per_wpg
+        16384,   // 23 gc_tcp_l1_size
+        2,       // 24 gc_num_sqc_per_wgp
+        32768,   // 25 gc_l1_instruction_cache_size_per_sqc
+        16384,   // 26 gc_l1_data_cache_size_per_sqc
+        1,       // 27 gc_gl1c_per_sa
+        131072,  // 28 gc_gl1c_size_per_instance
+        4194304, // 29 gc_gl2c_per_gpu
+    ];
+    let info = match parse_gc_info(&build_gc_info_blob(2, v1)) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("a valid gc_info v1.2 table was rejected"),
+    };
+    if info.num_se != 1 || info.num_sa_per_se != 2 {
+        return TestResult::Fail("shader engine / array counts did not decode");
+    }
+    // A WGP is two CUs, banked: 2 * (3 + 0) = 6 per shader array.
+    if info.num_cu_per_sa != 6 {
+        return TestResult::Fail("v1 should fold WGP banks into CUs per array");
+    }
+    // 1 SE x 2 SA x 6 CU = 12, which is the 780M's CU count.
+    if info.total_cus() != 12 {
+        return TestResult::Fail("total CU count is not the product of the geometry");
+    }
+    if info.wave_size != 32 {
+        return TestResult::Fail("RDNA is wave32 and Mesa branches on it");
+    }
+    if info.num_tccs != 4 || info.lds_size != 65536 {
+        return TestResult::Fail("L2 slice count / LDS size did not decode");
+    }
+    // v1.2's cache geometry, which DEV_INFO reports verbatim.
+    if info.tcp_l1_size != 16384 || info.num_sqc_per_wgp != 2 {
+        return TestResult::Fail("v1.2 cache geometry did not decode");
+    }
+    if info.gl1c_size_per_instance != 131072 || info.gl2c_per_gpu != 4194304 {
+        return TestResult::Fail("v1.2 GL1/GL2 sizes did not decode");
+    }
+
+    // A v1.0 table stops after field 18. The later fields must read as zero,
+    // not as whatever follows the table in the blob — DEV_INFO reports zero
+    // for them on older silicon too.
+    let short = parse_gc_info(&build_gc_info_blob(0, &v1[..19]));
+    match short {
+        Ok(i) if i.num_cu_per_sa == 6 && i.tcp_l1_size == 0 && i.gl2c_per_gpu == 0 => {}
+        Ok(_) => return TestResult::Fail("a v1.0 table leaked fields it does not carry"),
+        Err(_) => return TestResult::Fail("a valid v1.0 table was rejected"),
+    }
+
+    // v2 (GFX9) counts CUs per array directly rather than in WGP banks.
+    let v2: &[u32] = &[
+        1, 8, 1, 2, 4, 1024, 32, 32, 1792, 1024, 1024, 64, 10, 256, 65536, 1, 1,
+    ];
+    let mut blob = build_gc_info_blob(0, v2);
+    blob[0x200 + 4..0x200 + 6].copy_from_slice(&2u16.to_le_bytes());
+    let size = 12 + v2.len() * 4;
+    let csum = blob[0x200..0x200 + size]
+        .iter()
+        .fold(0u16, |a, &b| a.wrapping_add(b as u16));
+    let entry = 12 + crate::amdgpu_discovery::TABLE_GC * 8;
+    blob[entry + 2..entry + 4].copy_from_slice(&csum.to_le_bytes());
+    match parse_gc_info(&blob) {
+        Ok(i) if i.num_cu_per_sa == 8 && i.num_sa_per_se == 1 && i.wave_size == 64 => {}
+        Ok(_) => return TestResult::Fail("v2's field order was read as v1's"),
+        Err(_) => return TestResult::Fail("a valid gc_info v2.0 table was rejected"),
+    }
+
+    // A corrupted table is refused rather than believed. A wrong CU count is
+    // wrong shader codegen, so this must fail closed.
+    let mut bad = build_gc_info_blob(2, v1);
+    bad[0x200 + 12] ^= 0xFF;
+    if !matches!(parse_gc_info(&bad), Err(DiscoveryError::BadGcTableChecksum)) {
+        return TestResult::Fail("a GC table failing its checksum was accepted");
+    }
+
+    // No GC table at all is the QEMU and pre-discovery case, and it is a
+    // distinct answer from a corrupt one: the caller may fall back.
+    let mut none = build_gc_info_blob(2, v1);
+    let entry = 12 + crate::amdgpu_discovery::TABLE_GC * 8;
+    none[entry..entry + 2].copy_from_slice(&0u16.to_le_bytes());
+    if !matches!(parse_gc_info(&none), Err(DiscoveryError::NoGcTable)) {
+        return TestResult::Fail("an absent GC table should be NoGcTable");
+    }
+
+    // An unknown major version is refused by version, not guessed at.
+    let mut v9 = build_gc_info_blob(0, v1);
+    v9[0x200 + 4..0x200 + 6].copy_from_slice(&9u16.to_le_bytes());
+    match parse_gc_info(&v9) {
+        Err(DiscoveryError::UnknownGcVersion(9)) | Err(DiscoveryError::BadGcTableChecksum) => {}
+        _ => return TestResult::Fail("an unknown gc_info major version was decoded anyway"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/discovery",
+    smoke_amdgpu_gc_info_reports_the_tables_topology
+);
+
+/// `AMDGPU_INFO` reports the device Mesa will actually compile for.
+///
+/// An "it returned success" test would be worthless here. `libdrm_amdgpu`'s
+/// `amdgpu_device_initialize` runs DEV_INFO and MEMORY before it will hand
+/// Mesa a device, and radeonsi reads the CU count, wave size and cache
+/// geometry out of DEV_INFO to make shader-compilation decisions — so what
+/// matters is the VALUES, and that they came from the GC table rather than
+/// from a guess. The replies are decoded back through the mirrored structs,
+/// whose layout is pinned against the C header separately.
+fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
+    use crate::amdgpu::Family;
+    use crate::amdgpu_discovery::{GcInfo, IpBlock, HW_ID_GC, HW_ID_SDMA0, MAX_BASE_ADDRS};
+    use crate::amdgpu_info::{query_against, Snapshot};
+    use crate::amdgpu_uapi as u;
+    use narf_filesystem::FsError;
+
+    fn ip(hw_id: u16, major: u8, minor: u8, revision: u8) -> IpBlock {
+        IpBlock {
+            hw_id,
+            instance: 0,
+            major,
+            minor,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: [0; MAX_BASE_ADDRS],
+            num_bases: 1,
+        }
+    }
+
+    // A Radeon 780M as the GC table describes it: 1 SE, 2 SA, 6 CU per SA.
+    let gc = GcInfo {
+        version_major: 1,
+        version_minor: 2,
+        num_se: 1,
+        num_sa_per_se: 2,
+        num_cu_per_sa: 6,
+        num_rb_per_se: 2,
+        num_tccs: 4,
+        num_gprs: 1024,
+        wave_size: 32,
+        lds_size: 65536,
+        gs_table_depth: 32,
+        gsprim_buff_depth: 1792,
+        num_max_gs_thds: 32,
+        double_offchip_lds_buffer: 1024,
+        tcp_l1_size: 16384,
+        num_sqc_per_wgp: 2,
+        sqc_inst_cache_size: 32768,
+        sqc_data_cache_size: 16384,
+        gl1c_size_per_instance: 131072,
+        gl1c_per_sa: 2,
+        gl2c_per_gpu: 4194304,
+        ..GcInfo::default()
+    };
+    let snap = Snapshot {
+        did: 0x15BF,
+        family: Family::Phoenix,
+        vram_size: 512 * 1024 * 1024,
+        gc: Some(gc),
+        ip_blocks: alloc::vec![ip(HW_ID_GC, 11, 0, 1), ip(HW_ID_SDMA0, 6, 0, 1)],
+    };
+
+    let decode = |bytes: &[u8]| -> u::DrmAmdgpuInfoDevice {
+        let mut d = u::DrmAmdgpuInfoDevice::default();
+        let n = core::mem::size_of::<u::DrmAmdgpuInfoDevice>().min(bytes.len());
+        // SAFETY: writing `n` bytes into a `#[repr(C)]` plain-data struct of
+        // at least `n` bytes; both sides are byte-addressable POD.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                &mut d as *mut u::DrmAmdgpuInfoDevice as *mut u8,
+                n,
+            );
+        }
+        d
+    };
+
+    let bytes = match query_against(&snap, u::AMDGPU_INFO_DEV_INFO, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("DEV_INFO was refused for a fully described device"),
+    };
+    if bytes.len() != core::mem::size_of::<u::DrmAmdgpuInfoDevice>() {
+        return TestResult::Fail("DEV_INFO reply is not the size of its struct");
+    }
+    let d = decode(&bytes);
+    if d.device_id != 0x15BF {
+        return TestResult::Fail("DEV_INFO did not report the PCI device id");
+    }
+    // Mesa keys ASIC behaviour off this; GFX 11.0.1 is family 148.
+    if d.family != u::AMDGPU_FAMILY_GC_11_0_1 {
+        return TestResult::Fail("Phoenix must report AMDGPU_FAMILY_GC_11_0_1");
+    }
+    if d.num_shader_engines != 1 || d.num_shader_arrays_per_engine != 2 {
+        return TestResult::Fail("shader geometry did not come from the GC table");
+    }
+    if d.num_cu_per_sh != 6 || d.cu_active_number != 12 {
+        return TestResult::Fail("CU counts are not the GC table's");
+    }
+    // Wave32 vs wave64 changes the shaders Mesa emits.
+    if d.wave_front_size != 32 {
+        return TestResult::Fail("wave_front_size must be the GC table's wave size");
+    }
+    if d.num_tcc_blocks != 4 || d.num_rb_pipes != 2 {
+        return TestResult::Fail("L2 slice / RB pipe counts are wrong");
+    }
+    // `gl1c_cache_size` is a PRODUCT in Linux, not a field copy:
+    // gc_gl1c_size_per_instance * gc_gl1c_per_sa = 131072 * 2.
+    if d.gl1c_cache_size != 262144 {
+        return TestResult::Fail("gl1c_cache_size must be size-per-instance times per-SA count");
+    }
+    if d.gl2c_cache_size != 4194304 || d.tcp_cache_size != 16384 {
+        return TestResult::Fail("cache geometry did not reach DEV_INFO");
+    }
+    // An APU, and nothing else claimed: PREEMPTION / TMZ / GANG_SUBMIT are
+    // submission-path capabilities and there is no submission path.
+    if d.ids_flags != u64::from(u::AMDGPU_IDS_FLAGS_FUSION) {
+        return TestResult::Fail("ids_flags should claim FUSION and nothing more");
+    }
+    if d.gart_page_size != 4096 || d.virtual_address_alignment != 4096 {
+        return TestResult::Fail("page size / VA alignment should be 4 KiB");
+    }
+    // The address space. Mesa's `amdgpu_winsys` takes its VA allocator's
+    // range straight from these, so a zero here is not a harmless omission —
+    // it is an allocator with nothing to hand out.
+    let va = crate::amdgpu_vm::Geometry::GMC11.va_info();
+    if d.virtual_address_offset != va.low_offset || d.virtual_address_max != va.low_max {
+        return TestResult::Fail("the low VA range did not reach DEV_INFO");
+    }
+    if d.high_va_offset != va.high_offset || d.high_va_max != va.high_max {
+        return TestResult::Fail("the high VA range did not reach DEV_INFO");
+    }
+    if u64::from(d.pte_fragment_size) != va.pte_fragment_size {
+        return TestResult::Fail("pte_fragment_size did not reach DEV_INFO");
+    }
+    if d.virtual_address_max == 0 || d.pte_fragment_size == 0 {
+        return TestResult::Fail("the VA window must not be reported as zero");
+    }
+
+    // ACCEL_WORKING is FALSE, and deliberately so: with no AMDGPU_CS, Mesa
+    // must decline the device at init rather than fail at first draw.
+    match query_against(&snap, u::AMDGPU_INFO_ACCEL_WORKING, [0; 4]) {
+        Ok(b) if b.len() == 4 && u32::from_le_bytes(b[..4].try_into().unwrap()) == 0 => {}
+        _ => return TestResult::Fail("ACCEL_WORKING must report false while there is no CS path"),
+    }
+
+    // MEMORY: three heaps. VRAM twice (the aperture is CPU-visible), GTT
+    // zero because no system-memory heap manager exists.
+    let mem = match query_against(&snap, u::AMDGPU_INFO_MEMORY, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("MEMORY was refused"),
+    };
+    if mem.len() != 96 {
+        return TestResult::Fail("MEMORY should be three 32-byte heap_info structs");
+    }
+    let total = u64::from_le_bytes(mem[0..8].try_into().unwrap());
+    let max_alloc = u64::from_le_bytes(mem[24..32].try_into().unwrap());
+    let gtt_total = u64::from_le_bytes(mem[64..72].try_into().unwrap());
+    if total != 512 * 1024 * 1024 {
+        return TestResult::Fail("VRAM heap total is not the probed aperture");
+    }
+    if max_alloc != total / 4 * 3 {
+        return TestResult::Fail("max_allocation should be three quarters of the heap");
+    }
+    if gtt_total != 0 {
+        return TestResult::Fail("GTT must report zero while no GART manager exists");
+    }
+
+    // HW_IP_INFO carries the discovered IP version and a ZERO ring mask —
+    // "present, unusable" rather than an error, which is how Linux reports
+    // an IP whose ring has not come up.
+    let hw = match query_against(
+        &snap,
+        u::AMDGPU_INFO_HW_IP_INFO,
+        [u::AMDGPU_HW_IP_GFX, 0, 0, 0],
+    ) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("HW_IP_INFO(GFX) was refused"),
+    };
+    if u32::from_le_bytes(hw[0..4].try_into().unwrap()) != 11
+        || u32::from_le_bytes(hw[4..8].try_into().unwrap()) != 0
+    {
+        return TestResult::Fail("HW_IP_INFO should report the discovered GC version");
+    }
+    if u32::from_le_bytes(hw[24..28].try_into().unwrap()) != 0 {
+        return TestResult::Fail("available_rings must be zero: no ring has been brought up");
+    }
+
+    // A device whose GC table was absent or corrupt cannot answer DEV_INFO.
+    // Refusing is the point — a zeroed topology would mis-compile shaders.
+    let blind = Snapshot {
+        gc: None,
+        ..snap.clone()
+    };
+    if !matches!(
+        query_against(&blind, u::AMDGPU_INFO_DEV_INFO, [0; 4]),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("DEV_INFO must be refused when the shader topology is unknown");
+    }
+    // MEMORY does not depend on the GC table and must still answer.
+    if query_against(&blind, u::AMDGPU_INFO_MEMORY, [0; 4]).is_err() {
+        return TestResult::Fail("MEMORY should not depend on the GC table");
+    }
+
+    // Silicon with no bring-up has no family id to report, so DEV_INFO is
+    // refused rather than answered with a family whose Mesa path is untried.
+    let unknown = Snapshot {
+        family: Family::Navi2,
+        ..snap.clone()
+    };
+    if query_against(&unknown, u::AMDGPU_INFO_DEV_INFO, [0; 4]).is_ok() {
+        return TestResult::Fail("an unaudited family should not be given a family id");
+    }
+
+    // An unknown query is EINVAL, as `amdgpu_info_ioctl`'s default arm is.
+    if !matches!(
+        query_against(&snap, 0xDEAD, [0; 4]),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("an unknown INFO query should be EINVAL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu", smoke_amdgpu_info_reports_the_sourced_device);
+
+/// The amdgpu GEM lifecycle, and the isolation that makes per-open handles
+/// worth having.
+///
+/// `GEM_CREATE` → `GEM_MMAP` → resolve the offset to frames → `GEM_OP` reads
+/// the creation parameters back → `GEM_CLOSE`. Plus the validations Linux runs
+/// before allocating anything, which are the part a client can reach with
+/// hostile input.
+fn smoke_amdgpu_gem_lifecycle_and_handle_isolation() -> TestResult {
+    use crate::amdgpu_gem::{dispatch, GemState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::{ioc_nr, DRM_COMMAND_BASE};
+    use narf_filesystem::FsError;
+
+    // The dispatcher reads only the command number out of the ioctl word, and
+    // `ioc_nr` takes it from the low bits — so a bare nr is a valid command
+    // word here. On the test path the arg pointer is kernel-owned, which
+    // `copy_in`/`copy_out` tolerate.
+    let gem_cmd = |n: u32| DRM_COMMAND_BASE + n;
+    let close_cmd = 0x09u32;
+    // Guard the assumption the helper rests on.
+    if ioc_nr(gem_cmd(u::DRM_AMDGPU_GEM_CREATE)) != DRM_COMMAND_BASE {
+        return TestResult::Fail("test helper does not encode the ioctl nr the dispatcher reads");
+    }
+
+    let state = GemState::new();
+
+    // ── create ──
+    let mut req = [0u8; 32];
+    req[0..8].copy_from_slice(&8192u64.to_le_bytes()); // bo_size
+    req[8..16].copy_from_slice(&4096u64.to_le_bytes()); // alignment
+    req[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_VRAM as u64).to_le_bytes());
+    req[24..32].copy_from_slice(&(u::AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED as u64).to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_CREATE),
+        req.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_CREATE of an 8 KiB VRAM buffer failed");
+    }
+    let handle = u32::from_le_bytes(req[0..4].try_into().unwrap());
+    // Handles come from a high base so they cannot alias a dumb-buffer handle.
+    if handle < 0x4000_0000 {
+        return TestResult::Fail("a GEM handle must not fall in the dumb-handle space");
+    }
+
+    // ── mmap offset, and that it resolves to real distinct frames ──
+    let mut m = [0u8; 16];
+    m[0..4].copy_from_slice(&handle.to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_MMAP),
+        m.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_MMAP of a live handle failed");
+    }
+    let offset = u64::from_le_bytes(m[8..16].try_into().unwrap());
+    let frames = match state.mmap_frames(offset, 8192) {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("the GEM_MMAP offset did not resolve to frames"),
+    };
+    if frames.len() != 2 {
+        return TestResult::Fail("8 KiB should resolve to two 4 KiB frames");
+    }
+    if frames[1] != frames[0] + 4096 {
+        return TestResult::Fail("the allocation should be physically contiguous");
+    }
+    if frames[0] == 0 || frames[0] % 4096 != 0 {
+        return TestResult::Fail("frame address is not a plausible page-aligned physical page");
+    }
+    // Zeroed before userspace sees it: these pages came from the kernel's own
+    // allocator and could hold anything.
+    // SAFETY: the frames were just allocated for this object and are
+    // kernel-mapped; reading 8192 bytes stays inside them.
+    let leaked = unsafe {
+        core::slice::from_raw_parts(
+            narf_memory::PhysAddr::new(frames[0]).kernel_ptr::<u8>(),
+            8192,
+        )
+    }
+    .iter()
+    .any(|b| *b != 0);
+    if leaked {
+        return TestResult::Fail("a GEM buffer handed to userspace was not zeroed");
+    }
+    // A longer map than the object must be refused, or a client reads past it.
+    if state.mmap_frames(offset, 8192 + 4096).is_ok() {
+        return TestResult::Fail("mapping more than the object's size was allowed");
+    }
+
+    // ── GEM_OP reports back what was asked for, not what we did ──
+    let mut info = [0u8; 32];
+    let mut opreq = [0u8; 24];
+    opreq[0..4].copy_from_slice(&handle.to_le_bytes());
+    opreq[4..8].copy_from_slice(&u::AMDGPU_GEM_OP_GET_GEM_CREATE_INFO.to_le_bytes());
+    opreq[8..16].copy_from_slice(&(info.as_mut_ptr() as u64).to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_OP),
+        opreq.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_OP GET_GEM_CREATE_INFO failed");
+    }
+    if u64::from_le_bytes(info[0..8].try_into().unwrap()) != 8192 {
+        return TestResult::Fail("GEM_OP did not report the page-rounded size");
+    }
+    if u64::from_le_bytes(info[16..24].try_into().unwrap()) != u::AMDGPU_GEM_DOMAIN_VRAM as u64 {
+        return TestResult::Fail("GEM_OP must report the domain the client asked for");
+    }
+
+    // SET_PLACEMENT needs a migration path there isn't one of, and must be
+    // refused rather than accepted-and-ignored.
+    let mut setp = [0u8; 24];
+    setp[0..4].copy_from_slice(&handle.to_le_bytes());
+    setp[4..8].copy_from_slice(&u::AMDGPU_GEM_OP_SET_PLACEMENT.to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_OP),
+        setp.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("SET_PLACEMENT should be refused while nothing can migrate");
+    }
+
+    // ── isolation: a second open's table does not see this handle ──
+    let other = GemState::new();
+    if other.owns(handle) {
+        return TestResult::Fail("a handle leaked across opens");
+    }
+    let mut m2 = [0u8; 16];
+    m2[0..4].copy_from_slice(&handle.to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_MMAP),
+        m2.as_mut_ptr() as usize,
+        &other,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("another open could mmap a handle it does not hold");
+    }
+    if other.mmap_frames(offset, 4096).is_ok() {
+        return TestResult::Fail("another open could resolve a foreign GEM offset to frames");
+    }
+
+    // ── GEM_CLOSE belongs to the owning table only ──
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    // The foreign table must decline it, so the generic dumb path still gets
+    // its chance at a handle that is not ours.
+    if !matches!(
+        dispatch(close_cmd, c.as_mut_ptr() as usize, &other),
+        Err(FsError::Unsupported)
+    ) {
+        return TestResult::Fail("GEM_CLOSE of a foreign handle should fall through, not fail");
+    }
+    if dispatch(close_cmd, c.as_mut_ptr() as usize, &state).is_err() {
+        return TestResult::Fail("GEM_CLOSE of our own handle failed");
+    }
+    if state.owns(handle) {
+        return TestResult::Fail("the handle survived GEM_CLOSE");
+    }
+    // A low handle is a dumb handle: fall through rather than claiming it.
+    let mut low = [0u8; 8];
+    low[0..4].copy_from_slice(&3u32.to_le_bytes());
+    if !matches!(
+        dispatch(close_cmd, low.as_mut_ptr() as usize, &state),
+        Err(FsError::Unsupported)
+    ) {
+        return TestResult::Fail("a dumb-buffer handle must fall through to the generic path");
+    }
+
+    // ── the validations, each reachable from userspace ──
+    let create = |size: u64, domains: u64, flags: u64| {
+        let mut r = [0u8; 32];
+        r[0..8].copy_from_slice(&size.to_le_bytes());
+        r[16..24].copy_from_slice(&domains.to_le_bytes());
+        r[24..32].copy_from_slice(&flags.to_le_bytes());
+        dispatch(
+            gem_cmd(u::DRM_AMDGPU_GEM_CREATE),
+            r.as_mut_ptr() as usize,
+            &state,
+        )
+    };
+    // An undefined create flag is EINVAL: accepting one would let a client
+    // believe it got a property it did not.
+    if create(4096, u::AMDGPU_GEM_DOMAIN_GTT as u64, 1 << 31).is_ok() {
+        return TestResult::Fail("an unsettable create flag was accepted");
+    }
+    // VRAM_CONTIGUOUS looks settable and is not — the kernel sets it.
+    if create(
+        4096,
+        u::AMDGPU_GEM_DOMAIN_GTT as u64,
+        u::AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS as u64,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("VRAM_CONTIGUOUS is not in SETTABLE_MASK");
+    }
+    // Encryption cannot be honoured without TMZ, and a client that asked for
+    // a secure buffer must not be given a plain one.
+    if create(
+        4096,
+        u::AMDGPU_GEM_DOMAIN_GTT as u64,
+        u::AMDGPU_GEM_CREATE_ENCRYPTED as u64,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("ENCRYPTED should be refused with no TMZ engine");
+    }
+    if create(4096, 0x8000, 0).is_ok() {
+        return TestResult::Fail("a domain outside AMDGPU_GEM_DOMAIN_MASK was accepted");
+    }
+    // The special domains are exclusive: never two at once, never mixed with
+    // CPU/GTT/VRAM (`amdgpu_gem_are_domains_valid`).
+    if create(
+        4096,
+        (u::AMDGPU_GEM_DOMAIN_GDS | u::AMDGPU_GEM_DOMAIN_GWS) as u64,
+        0,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("two special domains at once should be invalid");
+    }
+    if create(
+        4096,
+        (u::AMDGPU_GEM_DOMAIN_GDS | u::AMDGPU_GEM_DOMAIN_VRAM) as u64,
+        0,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("a special domain mixed with VRAM should be invalid");
+    }
+    if create(0, u::AMDGPU_GEM_DOMAIN_GTT as u64, 0).is_ok() {
+        return TestResult::Fail("a zero-sized buffer should be refused");
+    }
+
+    // A live GTT buffer, closed, so the test leaves no allocation behind.
+    let mut keep = [0u8; 32];
+    keep[0..8].copy_from_slice(&4096u64.to_le_bytes());
+    keep[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_CREATE),
+        keep.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_CREATE in the GTT domain failed");
+    }
+    let h2 = u32::from_le_bytes(keep[0..4].try_into().unwrap());
+    // WAIT_IDLE reports idle: nothing can be busy without a submission path.
+    let mut w = [0u8; 16];
+    w[0..4].copy_from_slice(&h2.to_le_bytes());
+    if dispatch(
+        gem_cmd(u::DRM_AMDGPU_GEM_WAIT_IDLE),
+        w.as_mut_ptr() as usize,
+        &state,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("GEM_WAIT_IDLE failed on a live handle");
+    }
+    let mut c2 = [0u8; 8];
+    c2[0..4].copy_from_slice(&h2.to_le_bytes());
+    let _ = dispatch(close_cmd, c2.as_mut_ptr() as usize, &state);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_amdgpu_gem_lifecycle_and_handle_isolation
+);
+
+/// The GMC 11 address-space geometry, derived rather than asserted from memory.
+///
+/// Every number here follows from `gmc_v11_0_sw_init`'s one call,
+/// `amdgpu_vm_adjust_size(adev, 256 * 1024, 9, 3, 48)`, through the arithmetic
+/// in `amdgpu_vm_adjust_size` and `amdgpu_vm_pt_level_shift`. The test
+/// recomputes the decomposition independently of the module so a transcription
+/// slip in either shows up as a disagreement: a wrong level shift walks the GPU
+/// into the wrong page table.
+fn smoke_amdgpu_vm_gmc11_geometry() -> TestResult {
+    use crate::amdgpu_vm::{Geometry, Level, GPU_PAGE_SHIFT};
+
+    let g = Geometry::GMC11;
+    // vm_size = 1 << (48 - 30) GiB, max_pfn = vm_size << 18 = 2^36 pages.
+    if g.max_pfn != 1 << 36 {
+        return TestResult::Fail("max_pfn should be 2^36 pages (256 TiB at 4 KiB)");
+    }
+    // num_level 3 → root PDB2; block_size 9 because num_level > 1.
+    if g.root_level != Level::Pdb2 || g.block_size != 9 {
+        return TestResult::Fail("GMC11 roots at PDB2 with block_size 9");
+    }
+    // `amdgpu_vm_pt_level_shift`: 9 * (PDB0 - level) + block_size, PTB = 0.
+    // Recomputed from the formula rather than restated as four numbers, so a
+    // transcription slip in the module cannot be matched by the same slip here.
+    for (i, level) in [Level::Pdb2, Level::Pdb1, Level::Pdb0]
+        .into_iter()
+        .enumerate()
+    {
+        let steps = 2 - i as u32; // PDB0 - level
+        if g.level_shift(level) != 9 * steps + g.block_size {
+            return TestResult::Fail("a level shift disagrees with amdgpu_vm_pt_level_shift");
+        }
+    }
+    if g.level_shift(Level::Ptb) != 0 {
+        return TestResult::Fail("the leaf level shift is zero");
+    }
+    // Four levels walked, root first.
+    let walked: alloc::vec::Vec<Level> = g.levels().collect();
+    if walked != alloc::vec![Level::Pdb2, Level::Pdb1, Level::Pdb0, Level::Ptb] {
+        return TestResult::Fail("the walked levels are not PDB2..PTB");
+    }
+    // Root sized to cover max_pfn exactly: 2^36 >> 27 = 512. Leaf 1<<9.
+    for level in walked.iter().copied() {
+        if g.entries_at(level) != 512 {
+            return TestResult::Fail("every GMC11 level should hold 512 entries");
+        }
+    }
+    // 4 levels x 9 bits + 12 page bits = 48, which is the max_bits passed in.
+    let covered: u32 = GPU_PAGE_SHIFT + 9 * 4;
+    if 1u64 << covered != g.max_pfn * 4096 {
+        return TestResult::Fail("the level geometry does not cover max_pfn exactly");
+    }
+
+    // Index decomposition: VA bits 47:39 → PDB2, 38:30 → PDB1, 29:21 → PDB0,
+    // 20:12 → PTB. Build an address with a distinct index at each level.
+    let va = (0x1A2u64 << 39) | (0x0B3 << 30) | (0x1C4 << 21) | (0x0D5 << 12);
+    for (level, want) in [
+        (Level::Pdb2, 0x1A2u64),
+        (Level::Pdb1, 0x0B3),
+        (Level::Pdb0, 0x1C4),
+        (Level::Ptb, 0x0D5),
+    ] {
+        if g.index_at(va, level) != want {
+            return TestResult::Fail("a VA did not decompose into the expected indices");
+        }
+    }
+    // `DEV_INFO`'s pte_fragment_size: (1 << 9) * 4096 = 2 MiB.
+    if g.fragment_bytes() != 2 * 1024 * 1024 {
+        return TestResult::Fail("the fragment size should be 2 MiB");
+    }
+    // The usable window excludes the bottom 64 KiB and the top CSA/seq64/trap.
+    let (bottom, top) = g.usable();
+    if bottom != 1 << 16 {
+        return TestResult::Fail("the first 64 KiB is reserved so a null GPU pointer faults");
+    }
+    if top != g.max_pfn * 4096 - ((1 << 16) + (2 << 20) + (2 << 20)) {
+        return TestResult::Fail("the top reservation is trap + seq64 + CSA");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_gmc11_geometry);
+
+/// The five `DEV_INFO` fields describing the address space, against the
+/// literals `amdgpu_kms.c`'s arithmetic produces on a GMC 11 part.
+///
+/// Worked out by hand rather than re-derived, so the test disagrees with the
+/// code if the code's derivation drifts:
+///
+/// ```text
+/// VA_RESERVED_TOP = (1<<16) + (2<<20) + (2<<20)      = 0x0041_0000
+/// vm_size         = (1<<36) * 4096 - VA_RESERVED_TOP = 0x0000_ffff_ffbf_0000
+/// low_offset      = AMDGPU_VA_RESERVED_BOTTOM        = 0x0000_0000_0001_0000
+/// low_max         = min(vm_size, HOLE_START)         = 0x0000_8000_0000_0000
+/// vm_size > HOLE_START, so the high pair is reported:
+/// high_offset     = HOLE_END                         = 0xffff_8000_0000_0000
+/// high_max        = HOLE_END | vm_size               = 0xffff_ffff_ffbf_0000
+/// ```
+fn smoke_amdgpu_vm_dev_info_va_window() -> TestResult {
+    use crate::amdgpu_vm::Geometry;
+    let va = Geometry::GMC11.va_info();
+    if va.low_offset != 0x0000_0000_0001_0000 {
+        return TestResult::Fail("virtual_address_offset should be the reserved bottom");
+    }
+    if va.low_max != 0x0000_8000_0000_0000 {
+        return TestResult::Fail("virtual_address_max should stop at the hole");
+    }
+    if va.high_offset != 0xffff_8000_0000_0000 {
+        return TestResult::Fail("high_va_offset should be the far side of the hole");
+    }
+    if va.high_max != 0xffff_ffff_ffbf_0000 {
+        return TestResult::Fail("high_va_max should be the hole end ORed with vm_size");
+    }
+    if va.pte_fragment_size != 2 * 1024 * 1024 {
+        return TestResult::Fail("pte_fragment_size should be 2 MiB");
+    }
+    // The low range must not reach into the hole, and the high range must not
+    // start inside it. Reporting either would hand a client an address
+    // `validate_va` then refuses.
+    if va.low_max > crate::amdgpu_vm::GMC_HOLE_START {
+        return TestResult::Fail("the low range must stop at or before the hole");
+    }
+    if va.high_offset < crate::amdgpu_vm::GMC_HOLE_END {
+        return TestResult::Fail("the high range must start at or after the hole");
+    }
+
+    // A space smaller than the hole reports no high range at all, which is
+    // how Linux leaves the pair it never assigns.
+    let small = Geometry {
+        max_pfn: 1 << 20,
+        ..Geometry::GMC11
+    };
+    let sva = small.va_info();
+    if sva.high_offset != 0 || sva.high_max != 0 {
+        return TestResult::Fail("a space below the hole must report no high range");
+    }
+    if sva.low_max != (1u64 << 20) * 4096 - 0x0041_0000 {
+        return TestResult::Fail("a space below the hole reports its whole size");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/amdgpu_vm", smoke_amdgpu_vm_dev_info_va_window);
+
+/// PTE composition, including the bits `gmc_v11_0_get_vm_pte` CLEARS.
+///
+/// The negative cases are the point. Linux clears `EXECUTABLE` and `NOALLOC`
+/// when a request does not ask for them rather than leaving whatever the base
+/// flags held, and PRT clears `VALID` — a PRT entry is deliberately not a valid
+/// translation. A transcription that only ORed the positive cases would look
+/// right and grant execute permission on every mapping.
+fn smoke_amdgpu_vm_pte_flags_match_gmc11() -> TestResult {
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::*;
+
+    // System memory, as every buffer is until there is VRAM placement.
+    let base = base_flags(true);
+    if base & PTE_VALID == 0 || base & PTE_SNOOPED == 0 || base & PTE_SYSTEM == 0 {
+        return TestResult::Fail("a system mapping is VALID | SNOOPED | SYSTEM");
+    }
+
+    // A plain read/write mapping: no execute, no noalloc, memory type NC.
+    let rw = pte_flags(
+        base,
+        u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE,
+        false,
+    );
+    if rw & PTE_READABLE == 0 || rw & PTE_WRITEABLE == 0 {
+        return TestResult::Fail("READABLE|WRITEABLE did not reach the PTE");
+    }
+    if rw & PTE_EXECUTABLE != 0 {
+        return TestResult::Fail("EXECUTABLE must be cleared when not requested");
+    }
+    if rw & PTE_NOALLOC != 0 {
+        return TestResult::Fail("NOALLOC must be cleared when not requested");
+    }
+    if rw & MTYPE_MASK != MTYPE_NC << MTYPE_SHIFT {
+        return TestResult::Fail("the default memory type is NC");
+    }
+
+    // Starting from flags that already have EXECUTABLE set, a request without
+    // it must come back without it.
+    let cleared = pte_flags(base | PTE_EXECUTABLE, u::AMDGPU_VM_PAGE_READABLE, false);
+    if cleared & PTE_EXECUTABLE != 0 {
+        return TestResult::Fail("EXECUTABLE survived a request that omitted it");
+    }
+
+    // The memory type lives at bits 50:48 on GFX10/11 — NOT 58:57 (GFX9) or
+    // 55:54 (GFX12). Using the wrong macro would collide with NOALLOC at 58.
+    for (vm_mtype, want) in [
+        (u::AMDGPU_VM_MTYPE_WC, MTYPE_WC),
+        (u::AMDGPU_VM_MTYPE_CC, MTYPE_CC),
+        (u::AMDGPU_VM_MTYPE_UC, MTYPE_UC),
+        (u::AMDGPU_VM_MTYPE_NC, MTYPE_NC),
+        (u::AMDGPU_VM_MTYPE_DEFAULT, MTYPE_NC),
+    ] {
+        let f = pte_flags(base, u::AMDGPU_VM_PAGE_READABLE | vm_mtype, false);
+        if (f & MTYPE_MASK) >> MTYPE_SHIFT != want {
+            return TestResult::Fail("a memory type did not land in bits 50:48");
+        }
+        if f & (1 << 57) != 0 || f & (1 << 58) != 0 {
+            return TestResult::Fail("the memory type spilled into bit 57 or 58");
+        }
+    }
+
+    // A COHERENT/UNCACHED buffer overrides the request's memory type, and is
+    // applied last for that reason.
+    let overridden = pte_flags(
+        base,
+        u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_MTYPE_WC,
+        true,
+    );
+    if (overridden & MTYPE_MASK) >> MTYPE_SHIFT != MTYPE_UC {
+        return TestResult::Fail("an uncached BO must override the requested memory type");
+    }
+
+    // PRT: sets PRT|SNOOPED|LOG|SYSTEM and clears VALID.
+    let prt = pte_flags(base, u::AMDGPU_VM_PAGE_PRT, false);
+    if prt & PTE_PRT == 0 || prt & PTE_LOG == 0 || prt & PTE_SYSTEM == 0 {
+        return TestResult::Fail("a PRT entry sets PRT | LOG | SYSTEM");
+    }
+    if prt & PTE_VALID != 0 {
+        return TestResult::Fail("a PRT entry must NOT be a valid translation");
+    }
+
+    // The leaf entry carries the physical address in bits 47:12, so a
+    // misaligned or out-of-range address must be refused rather than allowed
+    // to spill into the flags.
+    if make_pte(0x1000, rw).is_err() {
+        return TestResult::Fail("a page-aligned address should compose");
+    }
+    if make_pte(0x1001, rw).is_ok() {
+        return TestResult::Fail("a misaligned physical address must be refused");
+    }
+    if make_pte(1u64 << 48, rw).is_ok() {
+        return TestResult::Fail("an address beyond 48 bits must be refused");
+    }
+    let pte = make_pte(0xABCD_E000, rw).unwrap_or(0);
+    if pte & GMC_HOLE_MASK & !0xFFF != 0xABCD_E000 {
+        return TestResult::Fail("the physical address did not survive composition");
+    }
+
+    // The canonical hole: the hardware is programmed as if it does not exist.
+    if strip_hole(0xFFFF_8000_0000_1000) != 0x0000_8000_0000_1000 {
+        return TestResult::Fail("strip_hole should drop the sign-extension bits");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_pte_flags_match_gmc11
+);
+
+/// `AMDGPU_GEM_VA`'s validation and bookkeeping.
+fn smoke_amdgpu_vm_gem_va_maps_and_validates() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState, GMC_HOLE_START, VA_RESERVED_BOTTOM};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let va_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA;
+
+    // A 16 KiB buffer to map.
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&16384u64.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+
+    let req = |op: u32, flags: u32, va: u64, offset: u64, size: u64| {
+        let mut r = [0u8; 40];
+        r[0..4].copy_from_slice(&handle.to_le_bytes());
+        r[8..12].copy_from_slice(&op.to_le_bytes());
+        r[12..16].copy_from_slice(&flags.to_le_bytes());
+        r[16..24].copy_from_slice(&va.to_le_bytes());
+        r[24..32].copy_from_slice(&offset.to_le_bytes());
+        r[32..40].copy_from_slice(&size.to_le_bytes());
+        vm::dispatch(va_cmd, r.as_mut_ptr() as usize, &state, &gem)
+    };
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    const BASE_VA: u64 = 0x1_0000_0000;
+
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, 16384).is_err() {
+        return TestResult::Fail("a valid MAP was refused");
+    }
+    match state.lookup(BASE_VA + 4096) {
+        Some(m) if m.gem_handle == handle && m.va == BASE_VA && m.size == 16384 => {}
+        _ => return TestResult::Fail("the mapping was not recorded over its whole range"),
+    }
+    if state.lookup(BASE_VA + 16384).is_some() {
+        return TestResult::Fail("the mapping leaked past its end");
+    }
+
+    // An overlapping MAP is EINVAL; REPLACE is the op that asks for one to go.
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA + 4096, 0, 4096).is_ok() {
+        return TestResult::Fail("an overlapping MAP should be refused");
+    }
+    if req(u::AMDGPU_VA_OP_REPLACE, RW, BASE_VA + 4096, 0, 4096).is_err() {
+        return TestResult::Fail("REPLACE over a live range should succeed");
+    }
+    if state.lookup(BASE_VA).is_some() {
+        return TestResult::Fail("REPLACE should have dropped the mapping it covered");
+    }
+
+    // UNMAP names a mapping exactly; a partial range is EINVAL and an absent
+    // one is ENOENT, which are different answers a client can act on.
+    if !matches!(
+        req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA + 4096, 0, 8192),
+        Err(FsError::InvalidData)
+    ) {
+        return TestResult::Fail("UNMAP of a partial range should be EINVAL");
+    }
+    if !matches!(
+        req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA + 0x10_0000, 0, 4096),
+        Err(FsError::NotFound)
+    ) {
+        return TestResult::Fail("UNMAP of an absent mapping should be ENOENT");
+    }
+    if req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA + 4096, 0, 4096).is_err() {
+        return TestResult::Fail("UNMAP of an exact mapping should succeed");
+    }
+    if state.mapping_count() != 0 {
+        return TestResult::Fail("the address space should be empty again");
+    }
+
+    // ── validation, in Linux's order ──
+    // Below VA_RESERVED_BOTTOM: a null GPU pointer must fault, so the first
+    // 64 KiB is never mappable.
+    if req(u::AMDGPU_VA_OP_MAP, RW, VA_RESERVED_BOTTOM - 4096, 0, 4096).is_ok() {
+        return TestResult::Fail("the bottom reserved region must not be mappable");
+    }
+    // Inside the canonical hole.
+    if req(u::AMDGPU_VA_OP_MAP, RW, GMC_HOLE_START, 0, 4096).is_ok() {
+        return TestResult::Fail("an address inside the VA hole must be refused");
+    }
+    // Past the top reservation.
+    let (_, top) = state.geometry().usable();
+    if req(u::AMDGPU_VA_OP_MAP, RW, top - 4096, 0, 8192).is_ok() {
+        return TestResult::Fail("a range crossing the top reservation must be refused");
+    }
+    // PRT cannot be combined with ordinary page permissions — the two flag
+    // sets are alternatives, not a union.
+    if req(
+        u::AMDGPU_VA_OP_MAP,
+        RW | u::AMDGPU_VM_PAGE_PRT,
+        BASE_VA,
+        0,
+        4096,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("PRT mixed with page permissions is an invalid combination");
+    }
+    // An undefined flag.
+    if req(u::AMDGPU_VA_OP_MAP, RW | (1 << 20), BASE_VA, 0, 4096).is_ok() {
+        return TestResult::Fail("an undefined VM flag should be refused");
+    }
+    // An unknown operation.
+    if req(99, RW, BASE_VA, 0, 4096).is_ok() {
+        return TestResult::Fail("an unknown VA operation should be refused");
+    }
+    // Mapping more of the buffer than it holds would map pages it does not own.
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 8192, 16384).is_ok() {
+        return TestResult::Fail("offset + size past the buffer's end must be refused");
+    }
+    // Misalignment, in each of the three fields.
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA + 1, 0, 4096).is_ok() {
+        return TestResult::Fail("an unaligned VA must be refused");
+    }
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, 4095).is_ok() {
+        return TestResult::Fail("an unaligned size must be refused");
+    }
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 1, 4096).is_ok() {
+        return TestResult::Fail("an unaligned buffer offset must be refused");
+    }
+    // A handle this open does not hold.
+    let mut foreign = [0u8; 40];
+    foreign[0..4].copy_from_slice(&0x4000_9999u32.to_le_bytes());
+    foreign[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    foreign[12..16].copy_from_slice(&RW.to_le_bytes());
+    foreign[16..24].copy_from_slice(&BASE_VA.to_le_bytes());
+    foreign[32..40].copy_from_slice(&4096u64.to_le_bytes());
+    if vm::dispatch(va_cmd, foreign.as_mut_ptr() as usize, &state, &gem).is_ok() {
+        return TestResult::Fail("a VA map naming a foreign GEM handle must be refused");
+    }
+
+    // CLEAR drops whatever intersects, and succeeds on an empty range.
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, 16384).is_err() {
+        return TestResult::Fail("re-MAP after the validation cases failed");
+    }
+    if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA + 4096, 0, 4096).is_err() {
+        return TestResult::Fail("CLEAR should succeed");
+    }
+    if state.mapping_count() != 0 {
+        return TestResult::Fail("CLEAR should have dropped the intersecting mapping");
+    }
+    if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA, 0, 4096).is_err() {
+        return TestResult::Fail("CLEAR of an empty range should still succeed");
+    }
+
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_gem_va_maps_and_validates
+);
+
+/// Page tables are really built: the entries are read back out of the memory
+/// the GPU would walk.
+///
+/// This is the first test in the VM series that touches hardware-format memory
+/// rather than pure functions. What it checks is that a mapping produces a
+/// walkable chain — root PDE → PDB1 PDE → PDB0 PDE → leaf PTE — with the
+/// physical address and flags at each step, and that unmapping restores the
+/// invalid pattern and frees the directories that are left empty.
+fn smoke_amdgpu_vm_page_tables_are_walkable() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, Level, VmState, GPU_PAGE_SIZE};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let g = state.geometry();
+
+    // Nothing mapped: no root directory, no tables.
+    if state.root_phys().is_some() || state.table_count() != 0 {
+        return TestResult::Fail("an unused address space should allocate nothing");
+    }
+
+    // A 3-page buffer, so the mapping spans more than one leaf entry.
+    const PAGES: u64 = 3;
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&(PAGES * GPU_PAGE_SIZE).to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let Some(object) = gem.object(handle) else {
+        return TestResult::Fail("setup: the created object is not in the table");
+    };
+    let phys = object.phys;
+
+    let va_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA;
+    let req = |op: u32, flags: u32, va: u64, offset: u64, size: u64| {
+        let mut r = [0u8; 40];
+        r[0..4].copy_from_slice(&handle.to_le_bytes());
+        r[8..12].copy_from_slice(&op.to_le_bytes());
+        r[12..16].copy_from_slice(&flags.to_le_bytes());
+        r[16..24].copy_from_slice(&va.to_le_bytes());
+        r[24..32].copy_from_slice(&offset.to_le_bytes());
+        r[32..40].copy_from_slice(&size.to_le_bytes());
+        vm::dispatch(va_cmd, r.as_mut_ptr() as usize, &state, &gem)
+    };
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    // An address with a distinct index at every level, so a swapped shift
+    // would land the entry in the wrong table.
+    const BASE_VA: u64 = (0x11u64 << 39) | (0x22 << 30) | (0x33 << 21) | (0x44 << 12);
+
+    if req(u::AMDGPU_VA_OP_MAP, RW, BASE_VA, 0, PAGES * GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("MAP of a 3-page buffer failed");
+    }
+
+    // Root plus one table at each of PDB1, PDB0 and PTB: four in all, since
+    // the three pages share a leaf table.
+    if state.table_count() != 4 {
+        return TestResult::Fail("a 3-page map in one leaf should need exactly four tables");
+    }
+    let Some(root) = state.root_phys() else {
+        return TestResult::Fail("the root page directory was not allocated");
+    };
+    if root % GPU_PAGE_SIZE != 0 {
+        return TestResult::Fail("the root directory must be page aligned");
+    }
+
+    // Each directory entry must be a valid, system, snooped pointer at a
+    // page-aligned child — and must NOT carry PDE_PTE, which would mark it a
+    // leaf mapping a huge page instead of a pointer to a table.
+    for level in [Level::Pdb2, Level::Pdb1, Level::Pdb0] {
+        let Some(pde) = state.directory_entry(BASE_VA, level) else {
+            return TestResult::Fail("a directory entry on the mapped path is missing");
+        };
+        if pde & vm::PTE_VALID == 0 {
+            return TestResult::Fail("a directory entry on the mapped path is not valid");
+        }
+        if pde & vm::PTE_SYSTEM == 0 || pde & vm::PTE_SNOOPED == 0 {
+            return TestResult::Fail("a table in system memory needs SYSTEM | SNOOPED");
+        }
+        if pde & vm::PDE_PTE != 0 {
+            return TestResult::Fail("a pointer PDE must not be marked as a leaf");
+        }
+        // `gmc_v11_0_get_vm_pde`'s `BUG_ON(*addr & 0xFFFF00000000003F)` is on
+        // the ADDRESS, before the flags are folded in — and VALID|SYSTEM|
+        // SNOOPED are bits 0:2, inside that mask. So the composed entry is
+        // checked differently: bits 63:48 must be clear, and the low 12 bits
+        // must be exactly those three flags, which is only possible if the
+        // address underneath them is page aligned.
+        if pde & 0xFFFF_0000_0000_0000 != 0 {
+            return TestResult::Fail("a PDE carries bits above the 48-bit address space");
+        }
+        if pde & 0xFFF != vm::PTE_VALID | vm::PTE_SYSTEM | vm::PTE_SNOOPED {
+            return TestResult::Fail("a PDE's low bits are not exactly its three flags");
+        }
+    }
+
+    // The leaves: one per page, each pointing at its own frame.
+    for page in 0..PAGES {
+        let va = BASE_VA + page * GPU_PAGE_SIZE;
+        let Some(pte) = state.leaf_entry(va) else {
+            return TestResult::Fail("a leaf entry on the mapped path is missing");
+        };
+        if pte & vm::PTE_VALID == 0 {
+            return TestResult::Fail("a mapped page's PTE is not valid");
+        }
+        if pte & !0xFFFu64 & vm::GMC_HOLE_MASK != phys + page * GPU_PAGE_SIZE {
+            return TestResult::Fail("a PTE does not point at the buffer's frame");
+        }
+        if pte & vm::PTE_READABLE == 0 || pte & vm::PTE_WRITEABLE == 0 {
+            return TestResult::Fail("the mapping's permissions did not reach the PTE");
+        }
+        if pte & vm::PTE_EXECUTABLE != 0 {
+            return TestResult::Fail("execute was not requested and must not be granted");
+        }
+    }
+    // One page past the mapping must be invalid, not merely absent from the
+    // bookkeeping — this is what stops a shader reading past the buffer.
+    match state.leaf_entry(BASE_VA + PAGES * GPU_PAGE_SIZE) {
+        Some(pte) if pte & vm::PTE_VALID == 0 => {}
+        Some(_) => return TestResult::Fail("the page after the mapping is a valid translation"),
+        None => {
+            return TestResult::Fail("the leaf table past the mapping should exist and be invalid")
+        }
+    }
+
+    // A second mapping far away needs its own PDB1/PDB0/PTB but shares the
+    // root, so three more tables.
+    const FAR_VA: u64 = BASE_VA + (1u64 << 39);
+    if req(u::AMDGPU_VA_OP_MAP, RW, FAR_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("a second, distant MAP failed");
+    }
+    if state.table_count() != 7 {
+        return TestResult::Fail("a distant map should add three tables, sharing the root");
+    }
+
+    // Unmapping the far one frees its three tables and leaves the near one.
+    if req(u::AMDGPU_VA_OP_UNMAP, RW, FAR_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("UNMAP of the distant mapping failed");
+    }
+    if state.table_count() != 4 {
+        return TestResult::Fail("an emptied subtree should be freed");
+    }
+    if state.leaf_entry(FAR_VA).is_some() {
+        return TestResult::Fail("the freed subtree is still walkable");
+    }
+    if state.leaf_entry(BASE_VA).is_none() {
+        return TestResult::Fail("freeing one subtree disturbed another");
+    }
+
+    // Unmapping the last mapping releases everything, root included.
+    if req(u::AMDGPU_VA_OP_UNMAP, RW, BASE_VA, 0, PAGES * GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("UNMAP of the first mapping failed");
+    }
+    if state.table_count() != 0 || state.root_phys().is_some() {
+        return TestResult::Fail("the last unmap should release the root directory too");
+    }
+
+    // An executable mapping gets the bit; the same range re-mapped read-only
+    // must not keep it. This is the clearing behaviour gmc_v11_0_get_vm_pte
+    // relies on, seen through the real tables.
+    const X: u32 = RW | u::AMDGPU_VM_PAGE_EXECUTABLE;
+    if req(u::AMDGPU_VA_OP_MAP, X, BASE_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("an executable MAP failed");
+    }
+    match state.leaf_entry(BASE_VA) {
+        Some(pte) if pte & vm::PTE_EXECUTABLE != 0 => {}
+        _ => return TestResult::Fail("EXECUTABLE did not reach the PTE"),
+    }
+    if req(u::AMDGPU_VA_OP_REPLACE, RW, BASE_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("REPLACE over an executable mapping failed");
+    }
+    match state.leaf_entry(BASE_VA) {
+        Some(pte) if pte & vm::PTE_EXECUTABLE == 0 && pte & vm::PTE_VALID != 0 => {}
+        _ => return TestResult::Fail("REPLACE left the execute bit set"),
+    }
+
+    // CLEAR tears down whatever it covers.
+    if req(u::AMDGPU_VA_OP_CLEAR, RW, BASE_VA, 0, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("CLEAR failed");
+    }
+    if state.table_count() != 0 {
+        return TestResult::Fail("CLEAR should have released the tables");
+    }
+
+    let _ = g;
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_page_tables_are_walkable
+);
+
+/// `AMDGPU_CTX`, including the capability that gates an above-normal priority.
+///
+/// Mesa allocates a context per GL/Vulkan context and names it on every
+/// submission, so this is the last ioctl between opening the device and
+/// submitting work. The interesting part is the priority gate: NORMAL and
+/// below are open to everyone, above needs CAP_SYS_NICE or DRM master, and
+/// garbage in the field is DELIBERATELY not an error.
+fn smoke_amdgpu_ctx_alloc_query_and_priority_gate() -> TestResult {
+    use crate::amdgpu_ctx::{dispatch, CtxState};
+    use crate::amdgpu_uapi as u;
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+
+    let state = CtxState::new();
+    let ctx_cmd = DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX;
+    let call = |op: u32, flags: u32, id: u32, priority: i32, master: bool| {
+        // Exactly `sizeof(union drm_amdgpu_ctx)`, so a dispatch that asked for
+        // more would over-read this buffer rather than silently find stack.
+        let mut r = [0u8; core::mem::size_of::<u::DrmAmdgpuCtx>()];
+        r[0..4].copy_from_slice(&op.to_le_bytes());
+        r[4..8].copy_from_slice(&flags.to_le_bytes());
+        r[8..12].copy_from_slice(&id.to_le_bytes());
+        r[12..16].copy_from_slice(&priority.to_le_bytes());
+        let rc = dispatch(ctx_cmd, r.as_mut_ptr() as usize, &state, master);
+        (rc, u32::from_le_bytes(r[0..4].try_into().unwrap()))
+    };
+
+    // ── alloc at NORMAL, which anyone may do ──
+    let (rc, id) = call(
+        u::AMDGPU_CTX_OP_ALLOC_CTX,
+        0,
+        0,
+        u::AMDGPU_CTX_PRIORITY_NORMAL,
+        false,
+    );
+    if rc.is_err() {
+        return TestResult::Fail("ALLOC_CTX at NORMAL priority failed");
+    }
+    if id == 0 {
+        return TestResult::Fail("context ids start at 1 so a zeroed field names nothing");
+    }
+    match state.get(id) {
+        Some(c) if c.priority == u::AMDGPU_CTX_PRIORITY_NORMAL => {}
+        _ => return TestResult::Fail("the context did not record its priority"),
+    }
+
+    // ── garbage priority is NOT an error ──
+    // Linux: "For backwards compatibility, we need to accept ioctls with
+    // garbage in the priority field", and such a request becomes NORMAL.
+    // Refusing it would break clients that never initialised the field.
+    for bogus in [u::AMDGPU_CTX_PRIORITY_UNSET, 12345, -7] {
+        let (rc, gid) = call(u::AMDGPU_CTX_OP_ALLOC_CTX, 0, 0, bogus, false);
+        if rc.is_err() {
+            return TestResult::Fail("a garbage priority must be accepted, not refused");
+        }
+        match state.get(gid) {
+            Some(c) if c.priority == u::AMDGPU_CTX_PRIORITY_NORMAL => {}
+            _ => return TestResult::Fail("a garbage priority should become NORMAL"),
+        }
+        let _ = call(u::AMDGPU_CTX_OP_FREE_CTX, 0, gid, 0, false);
+    }
+
+    // ── the priority gate ──
+    // The harness task holds the full boot capability set, so without this
+    // the unprivileged branch would never be reached and the gate would look
+    // like it worked while refusing nobody.
+    let saved = narf_filesystem::__test_swap_caller_capable_hook(Some(|_| false));
+
+    // No CAP_SYS_NICE and not master: refused.
+    for high in [
+        u::AMDGPU_CTX_PRIORITY_HIGH,
+        u::AMDGPU_CTX_PRIORITY_VERY_HIGH,
+    ] {
+        if !matches!(
+            call(u::AMDGPU_CTX_OP_ALLOC_CTX, 0, 0, high, false).0,
+            Err(FsError::PermissionDenied)
+        ) {
+            return TestResult::Fail("an above-normal priority needs CAP_SYS_NICE or master");
+        }
+    }
+    // Below NORMAL is open to everyone — a client may always deprioritise
+    // itself, and refusing that would be nonsense.
+    for low in [u::AMDGPU_CTX_PRIORITY_LOW, u::AMDGPU_CTX_PRIORITY_VERY_LOW] {
+        let (rc, lid) = call(u::AMDGPU_CTX_OP_ALLOC_CTX, 0, 0, low, false);
+        if rc.is_err() {
+            return TestResult::Fail("a below-normal priority should need no privilege");
+        }
+        let _ = call(u::AMDGPU_CTX_OP_FREE_CTX, 0, lid, 0, false);
+    }
+    // DRM master is the second arm: a compositor may prioritise its own work
+    // without holding a capability.
+    let (rc, mid) = call(
+        u::AMDGPU_CTX_OP_ALLOC_CTX,
+        0,
+        0,
+        u::AMDGPU_CTX_PRIORITY_HIGH,
+        true,
+    );
+    if rc.is_err() {
+        return TestResult::Fail("DRM master should be permitted an above-normal priority");
+    }
+    let _ = call(u::AMDGPU_CTX_OP_FREE_CTX, 0, mid, 0, false);
+
+    // And CAP_SYS_NICE is the other arm: granted it, a non-master gets in.
+    narf_filesystem::__test_swap_caller_capable_hook(Some(|cap| cap == 23));
+    let (rc, nid) = call(
+        u::AMDGPU_CTX_OP_ALLOC_CTX,
+        0,
+        0,
+        u::AMDGPU_CTX_PRIORITY_VERY_HIGH,
+        false,
+    );
+    if rc.is_err() {
+        return TestResult::Fail("CAP_SYS_NICE should permit an above-normal priority");
+    }
+    let _ = call(u::AMDGPU_CTX_OP_FREE_CTX, 0, nid, 0, false);
+    narf_filesystem::__test_swap_caller_capable_hook(saved);
+
+    // ── query ──
+    // A query naming no context is ENOENT, not a zeroed answer that would
+    // read as "healthy".
+    for op in [u::AMDGPU_CTX_OP_QUERY_STATE, u::AMDGPU_CTX_OP_QUERY_STATE2] {
+        if !matches!(call(op, 0, 999_999, 0, false).0, Err(FsError::NotFound)) {
+            return TestResult::Fail("a query naming no context should be ENOENT");
+        }
+        if call(op, 0, id, 0, false).0.is_err() {
+            return TestResult::Fail("a query on a live context failed");
+        }
+    }
+
+    // ── stable pstate ──
+    match call(u::AMDGPU_CTX_OP_GET_STABLE_PSTATE, 0, id, 0, false) {
+        (Ok(_), v) if v == u::AMDGPU_CTX_STABLE_PSTATE_NONE => {}
+        _ => return TestResult::Fail("a fresh context should report pstate NONE"),
+    }
+    if call(
+        u::AMDGPU_CTX_OP_SET_STABLE_PSTATE,
+        u::AMDGPU_CTX_STABLE_PSTATE_PEAK,
+        id,
+        0,
+        false,
+    )
+    .0
+    .is_err()
+    {
+        return TestResult::Fail("SET_STABLE_PSTATE to PEAK failed");
+    }
+    match call(u::AMDGPU_CTX_OP_GET_STABLE_PSTATE, 0, id, 0, false) {
+        (Ok(_), v) if v == u::AMDGPU_CTX_STABLE_PSTATE_PEAK => {}
+        _ => return TestResult::Fail("the set pstate did not read back"),
+    }
+    // The mask is four bits but only 0..=PEAK are defined, so the range check
+    // is separate from the mask check and both must bite.
+    if call(u::AMDGPU_CTX_OP_SET_STABLE_PSTATE, 5, id, 0, false)
+        .0
+        .is_ok()
+    {
+        return TestResult::Fail("a pstate above PEAK should be refused");
+    }
+    if call(u::AMDGPU_CTX_OP_SET_STABLE_PSTATE, 1 << 8, id, 0, false)
+        .0
+        .is_ok()
+    {
+        return TestResult::Fail("a flag outside the pstate mask should be refused");
+    }
+
+    // ── flags must be zero on every op but SET_STABLE_PSTATE ──
+    // Forward compatibility: a client setting an unknown flag is refused, not
+    // silently served without the behaviour it asked for.
+    for op in [
+        u::AMDGPU_CTX_OP_ALLOC_CTX,
+        u::AMDGPU_CTX_OP_FREE_CTX,
+        u::AMDGPU_CTX_OP_QUERY_STATE,
+        u::AMDGPU_CTX_OP_QUERY_STATE2,
+        u::AMDGPU_CTX_OP_GET_STABLE_PSTATE,
+    ] {
+        if call(op, 1, id, 0, false).0.is_ok() {
+            return TestResult::Fail("a non-zero flags field should be refused");
+        }
+    }
+
+    // ── free ──
+    if call(u::AMDGPU_CTX_OP_FREE_CTX, 0, id, 0, false).0.is_err() {
+        return TestResult::Fail("FREE_CTX of a live context failed");
+    }
+    if !matches!(
+        call(u::AMDGPU_CTX_OP_FREE_CTX, 0, id, 0, false).0,
+        Err(FsError::NotFound)
+    ) {
+        return TestResult::Fail("a double free should be ENOENT");
+    }
+    // Every context this test allocated has been freed, including the ones
+    // the refused-flags cases did NOT create.
+    if state.count() != 0 {
+        return TestResult::Fail("a context outlived its free");
+    }
+    // An unknown operation.
+    if call(99, 0, id, 0, false).0.is_ok() {
+        return TestResult::Fail("an unknown CTX operation should be refused");
+    }
+
+    // Contexts are per-open: a second table does not see this one's ids.
+    let other = CtxState::new();
+    if other.get(id).is_some() {
+        return TestResult::Fail("a context id leaked across opens");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_ctx",
+    smoke_amdgpu_ctx_alloc_query_and_priority_gate
+);
+
+/// Activating an address space programs both hubs and then invalidates.
+///
+/// The ordering is the property: base and bounds before the context is
+/// enabled, TLB invalidated after. A forgotten invalidate means the MMU keeps
+/// serving translations cached for whatever previously held the VMID — one
+/// process reading another's memory, silently.
+fn smoke_amdgpu_vm_activate_programs_both_hubs() -> TestResult {
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, ActivateError, VmState, GPU_PAGE_SIZE};
+    use crate::amdgpu_vmhub_regs::{
+        test_support::MockVmHubMmio, GFXHUB_V3_0, MMHUB_V3_0, TLB_POLL_BUDGET,
+    };
+    use crate::amdgpu_vmid::{Pasid, VmidPool};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let mut pool = VmidPool::new(crate::amdgpu_vmid::VmHub::Gfx);
+
+    // An address space with nothing mapped has no root directory, and binding
+    // a VMID to address 0 would point the MMU at physical page 0.
+    let mut g0 = MockVmHubMmio::new();
+    let mut m0 = MockVmHubMmio::new();
+    if !matches!(
+        vm::activate(
+            &state,
+            &mut pool,
+            1 as Pasid,
+            &mut g0,
+            &GFXHUB_V3_0,
+            &mut m0,
+            &MMHUB_V3_0,
+        ),
+        Err(ActivateError::NoPageTables)
+    ) {
+        return TestResult::Fail("activating an empty address space must be refused");
+    }
+    if !g0.writes.is_empty() || !m0.writes.is_empty() {
+        return TestResult::Fail("a refused activation must touch no register");
+    }
+
+    // Map something so a root directory exists.
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let mut map = [0u8; 40];
+    map[0..4].copy_from_slice(&handle.to_le_bytes());
+    map[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+    map[12..16]
+        .copy_from_slice(&(u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE).to_le_bytes());
+    map[16..24].copy_from_slice(&0x1_0000_0000u64.to_le_bytes());
+    map[32..40].copy_from_slice(&GPU_PAGE_SIZE.to_le_bytes());
+    if vm::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+        map.as_mut_ptr() as usize,
+        &state,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: MAP failed");
+    }
+    let Some(root) = state.root_phys() else {
+        return TestResult::Fail("setup: no root directory after a map");
+    };
+
+    // The invalidate polls an ACK; stage it so the poll terminates.
+    let mut gfx = MockVmHubMmio::new();
+    let mut mm = MockVmHubMmio::new();
+    // The invalidate polls an ACK register; make it answer on the first poll
+    // so the budget is not spent.
+    // The poll waits for the VMID's own bit in the ACK; all-ones satisfies it
+    // whichever VMID the pool hands out.
+    gfx.auto_ack_after = Some((GFXHUB_V3_0.inv_eng0_ack << 2, u32::MAX));
+    mm.auto_ack_after = Some((MMHUB_V3_0.inv_eng0_ack << 2, u32::MAX));
+
+    let vmid = match vm::activate(
+        &state,
+        &mut pool,
+        1 as Pasid,
+        &mut gfx,
+        &GFXHUB_V3_0,
+        &mut mm,
+        &MMHUB_V3_0,
+    ) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("activation of a mapped address space failed"),
+    };
+    if vmid == 0 {
+        return TestResult::Fail("a user address space must not be given the kernel VMID");
+    }
+
+    // Both hubs were programmed — a VMID bound in one and not the other
+    // translates for the shader engines and faults for display, or vice versa.
+    for (writes, regs, name) in [
+        (&gfx.writes, &GFXHUB_V3_0, "gfx"),
+        (&mm.writes, &MMHUB_V3_0, "mm"),
+    ] {
+        let _ = name;
+        let at = |dword: u32| -> Option<u32> {
+            writes
+                .iter()
+                .find(|(off, _)| *off == dword << 2)
+                .map(|(_, v)| *v)
+        };
+        let stride = regs.ctx_addr_distance * (vmid as u32);
+        // Page-table base: the low half holds the root's low 32 bits.
+        match at(regs.ctx0_pt_base_lo + stride) {
+            Some(v) if v == root as u32 => {}
+            _ => return TestResult::Fail("the page-table base was not programmed"),
+        }
+        // Bounds: start 0, end max_pfn - 1. Left at a cold-boot zero the
+        // context would bound its address space to nothing.
+        match at(regs.ctx0_pt_start_lo + stride) {
+            Some(0) => {}
+            _ => return TestResult::Fail("the page-table start bound was not programmed"),
+        }
+        match at(regs.ctx0_pt_end_lo + stride) {
+            Some(v) if v == (state.geometry().max_pfn - 1) as u32 => {}
+            _ => return TestResult::Fail("the page-table end bound was not programmed"),
+        }
+        // Context control: enabled, depth 3, every fault report on.
+        let cntl = match at(regs.ctx0_cntl + regs.ctx_distance * (vmid as u32)) {
+            Some(v) => v,
+            None => return TestResult::Fail("the context was never enabled"),
+        };
+        use crate::amdgpu_vmhub_regs as hub;
+        if cntl & hub::CTX_CNTL_ENABLE_CONTEXT == 0 {
+            return TestResult::Fail("the context-enable bit is clear");
+        }
+        if (cntl >> hub::CTX_CNTL_PT_DEPTH_SHIFT) & hub::CTX_CNTL_PT_DEPTH_MASK != 3 {
+            return TestResult::Fail("PAGE_TABLE_DEPTH should be num_level, which is 3");
+        }
+        if cntl & hub::CTX_CNTL_FAULT_ENABLE_DEFAULTS != hub::CTX_CNTL_FAULT_ENABLE_DEFAULTS {
+            return TestResult::Fail("a protection-fault report is disabled");
+        }
+    }
+
+    // The TLB invalidate happened, and it happened AFTER the context was
+    // enabled: its request register is written later than the cntl register.
+    let cntl_at = gfx.writes.iter().position(|(off, _)| {
+        *off == (GFXHUB_V3_0.ctx0_cntl + GFXHUB_V3_0.ctx_distance * (vmid as u32)) << 2
+    });
+    let inv_at = gfx
+        .writes
+        .iter()
+        .position(|(off, _)| *off == GFXHUB_V3_0.inv_eng0_req << 2);
+    match (cntl_at, inv_at) {
+        (Some(c), Some(i)) if i > c => {}
+        (_, None) => return TestResult::Fail("no TLB invalidate was issued"),
+        _ => return TestResult::Fail("the TLB was invalidated before the context was enabled"),
+    }
+    let _ = TLB_POLL_BUDGET;
+
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_vm",
+    smoke_amdgpu_vm_activate_programs_both_hubs
+);
+
+/// `AMDGPU_CS`'s parser against the input a hostile client would send.
+///
+/// The IB's CONTENTS are not validated — not here and not in Linux, where
+/// `parse_cs` is NULL for GFX11 — because the command processor executes an
+/// IB through the submitting client's own page tables, and those are the
+/// boundary. What this file must get right is narrower: it follows
+/// user-controlled pointers three levels deep, with two user-controlled counts
+/// bounding them, and it decides whether an address the client named is one it
+/// actually owns.
+fn smoke_amdgpu_cs_parser_rejects_hostile_input() -> TestResult {
+    use crate::amdgpu_cs::{parse, Ib};
+    use crate::amdgpu_ctx::{dispatch as ctx_dispatch, CtxState};
+    use crate::amdgpu_gem::GemState;
+    use crate::amdgpu_uapi as u;
+    use crate::amdgpu_vm::{self as vm, VmState, GPU_PAGE_SIZE};
+    use crate::drm_uapi::DRM_COMMAND_BASE;
+    use narf_filesystem::FsError;
+
+    let gem = GemState::new();
+    let state = VmState::new();
+    let ctx = CtxState::new();
+
+    // A context to submit against, sized at the union exactly.
+    let mut ctx_req = [0u8; core::mem::size_of::<u::DrmAmdgpuCtx>()];
+    ctx_req[0..4].copy_from_slice(&u::AMDGPU_CTX_OP_ALLOC_CTX.to_le_bytes());
+    if ctx_dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_CTX,
+        ctx_req.as_mut_ptr() as usize,
+        &ctx,
+        false,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: context alloc failed");
+    }
+    let ctx_id = u32::from_le_bytes(ctx_req[0..4].try_into().unwrap());
+
+    // A 2-page buffer mapped read/write at a known GPU address.
+    const IB_VA: u64 = 0x2_0000_0000;
+    const MAPPED: u64 = 2 * GPU_PAGE_SIZE;
+    let mut create = [0u8; 32];
+    create[0..8].copy_from_slice(&MAPPED.to_le_bytes());
+    create[16..24].copy_from_slice(&(u::AMDGPU_GEM_DOMAIN_GTT as u64).to_le_bytes());
+    if crate::amdgpu_gem::dispatch(
+        DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_CREATE,
+        create.as_mut_ptr() as usize,
+        &gem,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("setup: GEM_CREATE failed");
+    }
+    let handle = u32::from_le_bytes(create[0..4].try_into().unwrap());
+    let do_map = |flags: u32, va: u64, size: u64| {
+        let mut m = [0u8; 40];
+        m[0..4].copy_from_slice(&handle.to_le_bytes());
+        m[8..12].copy_from_slice(&u::AMDGPU_VA_OP_MAP.to_le_bytes());
+        m[12..16].copy_from_slice(&flags.to_le_bytes());
+        m[16..24].copy_from_slice(&va.to_le_bytes());
+        m[32..40].copy_from_slice(&size.to_le_bytes());
+        vm::dispatch(
+            DRM_COMMAND_BASE + u::DRM_AMDGPU_GEM_VA,
+            m.as_mut_ptr() as usize,
+            &state,
+            &gem,
+        )
+    };
+    const RW: u32 = u::AMDGPU_VM_PAGE_READABLE | u::AMDGPU_VM_PAGE_WRITEABLE;
+    if do_map(RW, IB_VA, MAPPED).is_err() {
+        return TestResult::Fail("setup: MAP failed");
+    }
+
+    // Build a chunk array: one IB chunk describing `ib_bytes` at `va`.
+    // The layout is the real one — an array of pointers to chunk headers,
+    // each pointing at its own body.
+    struct Req {
+        body: [u32; 8],
+        header: [u32; 4],
+        pointers: [u64; 1],
+    }
+    let build = |va: u64, ib_bytes: u32, ip_type: u32, flags: u32| -> alloc::boxed::Box<Req> {
+        let mut r = alloc::boxed::Box::new(Req {
+            body: [0; 8],
+            header: [0; 4],
+            pointers: [0; 1],
+        });
+        r.body[1] = flags;
+        r.body[2] = va as u32;
+        r.body[3] = (va >> 32) as u32;
+        r.body[4] = ib_bytes;
+        r.body[5] = ip_type;
+        let body_ptr = r.body.as_ptr() as u64;
+        r.header[0] = u::AMDGPU_CHUNK_ID_IB;
+        r.header[1] = 8; // length_dw
+        r.header[2] = body_ptr as u32;
+        r.header[3] = (body_ptr >> 32) as u32;
+        r.pointers[0] = r.header.as_ptr() as u64;
+        r
+    };
+    let run = |r: &Req| parse(ctx_id, 1, r.pointers.as_ptr() as u64, &state, &ctx);
+
+    // ── the happy path ──
+    let good = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    match run(&good) {
+        Ok(s) if s.ctx_id == ctx_id && s.ibs.len() == 1 => {
+            let want = Ib {
+                va_start: IB_VA,
+                length_dw: 64,
+                ip_type: u::AMDGPU_HW_IP_GFX,
+                ip_instance: 0,
+                ring: 0,
+                flags: 0,
+            };
+            if s.ibs[0] != want {
+                return TestResult::Fail("a valid IB did not parse to its fields");
+            }
+        }
+        _ => return TestResult::Fail("a well-formed submission was refused"),
+    }
+
+    // ── the address checks, which are the point ──
+    // An IB at an address the client never mapped.
+    if run(&build(IB_VA + 0x1000_0000, 256, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB at an unmapped address was accepted");
+    }
+    // An IB that STARTS inside the mapping and runs past its end. This is the
+    // one a naive check misses: the start address is perfectly valid.
+    if run(&build(IB_VA + MAPPED - 64, 256, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB running past the end of its mapping was accepted");
+    }
+    // Exactly reaching the end is fine — an off-by-one here would reject
+    // legitimate work.
+    if run(&build(IB_VA + MAPPED - 256, 256, u::AMDGPU_HW_IP_GFX, 0)).is_err() {
+        return TestResult::Fail("an IB ending exactly at the mapping's end was refused");
+    }
+    // An address that overflows when the length is added.
+    if run(&build(u64::MAX - 16, 256, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB whose end overflows was accepted");
+    }
+    // A write-only mapping cannot be fetched from: the fetch itself faults.
+    const WO: u32 = u::AMDGPU_VM_PAGE_WRITEABLE;
+    if do_map(WO, IB_VA + 0x1000_0000, GPU_PAGE_SIZE).is_err() {
+        return TestResult::Fail("setup: write-only MAP failed");
+    }
+    if !matches!(
+        run(&build(IB_VA + 0x1000_0000, 64, u::AMDGPU_HW_IP_GFX, 0)),
+        Err(FsError::PermissionDenied)
+    ) {
+        return TestResult::Fail("an IB in an unreadable mapping should be EACCES");
+    }
+
+    // ── the field checks ──
+    if run(&build(IB_VA, 0, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("a zero-length IB names no work and must be refused");
+    }
+    if run(&build(IB_VA, 255, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB that is not a whole number of dwords must be refused");
+    }
+    if run(&build(IB_VA, 0xFFFF_FFFC, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("an IB beyond the packet-size maximum must be refused");
+    }
+    if run(&build(IB_VA + 2, 256, u::AMDGPU_HW_IP_GFX, 0)).is_ok() {
+        return TestResult::Fail("a misaligned IB address must be refused");
+    }
+    // An engine this driver has no ring for.
+    if run(&build(IB_VA, 256, u::AMDGPU_HW_IP_VCE, 0)).is_ok() {
+        return TestResult::Fail("an IB for an absent engine must be refused");
+    }
+    // The constant engine is blocked on modern amdgpu behind a debug knob,
+    // and there is no knob here.
+    if run(&build(
+        IB_VA,
+        256,
+        u::AMDGPU_HW_IP_GFX,
+        u::AMDGPU_IB_FLAG_CE,
+    ))
+    .is_ok()
+    {
+        return TestResult::Fail("a CE submission must be refused");
+    }
+    if run(&build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 1 << 20)).is_ok() {
+        return TestResult::Fail("an undefined IB flag must be refused");
+    }
+
+    // ── the pointer walk ──
+    let g = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    // A null chunk array.
+    if !matches!(parse(ctx_id, 1, 0, &state, &ctx), Err(FsError::BadAddress)) {
+        return TestResult::Fail("a null chunk array should be EFAULT");
+    }
+    // A null pointer INSIDE the array — the second level.
+    let mut null_inner = [0u64; 1];
+    if !matches!(
+        parse(ctx_id, 1, null_inner.as_mut_ptr() as u64, &state, &ctx),
+        Err(FsError::BadAddress)
+    ) {
+        return TestResult::Fail("a null chunk pointer should be EFAULT");
+    }
+    // A chunk count the client inflated. Unbounded, this sizes a read.
+    if parse(ctx_id, 100_000, g.pointers.as_ptr() as u64, &state, &ctx).is_ok() {
+        return TestResult::Fail("an absurd chunk count must be refused");
+    }
+    if parse(ctx_id, 0, g.pointers.as_ptr() as u64, &state, &ctx).is_ok() {
+        return TestResult::Fail("a submission with no chunks must be refused");
+    }
+    // A `length_dw` the client inflated, which sizes the third read.
+    //
+    // Two values, deliberately. 0xFFFF_FFFF is rejected by `copy_in`'s own
+    // 1 MiB cap whatever this parser does — so on its own it proves nothing
+    // about the parser's bound, which a mutation test showed: removing that
+    // bound left this case still passing. 1000 dwords is 4 KiB, comfortably
+    // inside `copy_in`'s cap, so only the parser's own limit refuses it.
+    let mut inflated = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    inflated.header[1] = 0xFFFF_FFFF;
+    if run(&inflated).is_ok() {
+        return TestResult::Fail("an absurd chunk length must be refused");
+    }
+    let mut over_bound = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    over_bound.header[1] = 1000;
+    if run(&over_bound).is_ok() {
+        return TestResult::Fail("a chunk length past the parser's own bound must be refused");
+    }
+    // A chunk shorter than the IB struct it claims to be.
+    let mut short = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    short.header[1] = 4;
+    if run(&short).is_ok() {
+        return TestResult::Fail("a chunk shorter than drm_amdgpu_cs_chunk_ib must be refused");
+    }
+
+    // ── chunks that are refused rather than ignored ──
+    // A dropped ordering constraint is a race, not an error.
+    for id in [
+        u::AMDGPU_CHUNK_ID_DEPENDENCIES,
+        u::AMDGPU_CHUNK_ID_SYNCOBJ_IN,
+        u::AMDGPU_CHUNK_ID_SYNCOBJ_OUT,
+        u::AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT,
+        u::AMDGPU_CHUNK_ID_FENCE,
+        u::AMDGPU_CHUNK_ID_BO_HANDLES,
+    ] {
+        let mut other = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+        other.header[0] = id;
+        if !matches!(run(&other), Err(FsError::Unsupported)) {
+            return TestResult::Fail("a synchronisation chunk must be refused, never ignored");
+        }
+    }
+    // An unknown chunk id.
+    let mut unknown = build(IB_VA, 256, u::AMDGPU_HW_IP_GFX, 0);
+    unknown.header[0] = 0xDEAD;
+    if !matches!(run(&unknown), Err(FsError::InvalidData)) {
+        return TestResult::Fail("an unknown chunk id must be EINVAL");
+    }
+
+    // ── the context ──
+    if parse(ctx_id + 999, 1, g.pointers.as_ptr() as u64, &state, &ctx).is_ok() {
+        return TestResult::Fail("a submission naming no context must be refused");
+    }
+    // Contexts are per-open, so another open's table does not resolve this id.
+    let other_ctx = CtxState::new();
+    if parse(ctx_id, 1, g.pointers.as_ptr() as u64, &state, &other_ctx).is_ok() {
+        return TestResult::Fail("a context id must not resolve in another open's table");
+    }
+
+    let _ = &mut null_inner;
+    let mut c = [0u8; 8];
+    c[0..4].copy_from_slice(&handle.to_le_bytes());
+    let _ = crate::amdgpu_gem::dispatch(0x09, c.as_mut_ptr() as usize, &gem);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_cs",
+    smoke_amdgpu_cs_parser_rejects_hostile_input
+);
+
+/// The GFX11 queue descriptor, field by field against `gfx_v11_0_gfx_mqd_init`.
+///
+/// Every index was generated by compiling `v11_structs.h` on the build host
+/// and printing `offsetof(field) / 4`, so what this test adds is the VALUES:
+/// the register defaults they build on, the shifts, and the two fields whose
+/// sense is easy to invert.
+fn smoke_amdgpu_mqd_gfx11_matches_linux() -> TestResult {
+    use crate::amdgpu_mqd::*;
+
+    let base = MqdProp {
+        mqd_gpu_addr: 0x1_0000_1000,
+        hqd_base_gpu_addr: 0x2_0000_0000,
+        rptr_gpu_addr: 0x3_0000_0004,
+        wptr_gpu_addr: 0x4_0000_0008,
+        queue_size: 4096,
+        doorbell_index: 0x42,
+        use_doorbell: true,
+        kernel_queue: true,
+        tmz_queue: false,
+        priority: QueuePriority::Normal,
+        shadow_addr: 0x5_0000_0000,
+        gds_bkup_addr: 0x6_0000_0000,
+        csa_addr: 0x7_0000_0000,
+        fence_address: 0x8_0000_0000,
+    };
+    let mqd = match gfx_mqd_init(&base) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a well-formed queue was refused"),
+    };
+    if mqd.len() != MQD_DWORDS {
+        return TestResult::Fail("the MQD is 512 dwords");
+    }
+
+    // ── addresses ──
+    // The ring base is stored shifted right by 8: the register holds a
+    // 256-byte granule.
+    let hqd = base.hqd_base_gpu_addr >> 8;
+    if mqd[CP_GFX_HQD_BASE] != hqd as u32 || mqd[CP_GFX_HQD_BASE_HI] != (hqd >> 32) as u32 {
+        return TestResult::Fail("the ring base is not the address shifted right by 8");
+    }
+    // A ring base with low bits set would lose them silently — 256 bytes out
+    // of place — so it is refused instead.
+    if gfx_mqd_init(&MqdProp {
+        hqd_base_gpu_addr: base.hqd_base_gpu_addr + 0x80,
+        ..base
+    })
+    .is_ok()
+    {
+        return TestResult::Fail("a ring base that is not 256-byte aligned must be refused");
+    }
+    // The writeback addresses keep only 16 bits of their high half: the
+    // hardware takes a 48-bit address.
+    if mqd[CP_GFX_HQD_RPTR_ADDR] != (base.rptr_gpu_addr & 0xffff_fffc) as u32 {
+        return TestResult::Fail("the rptr writeback address is wrong");
+    }
+    if mqd[CP_GFX_HQD_RPTR_ADDR_HI] != ((base.rptr_gpu_addr >> 32) as u32) & 0xffff {
+        return TestResult::Fail("the rptr writeback high half is not masked to 16 bits");
+    }
+    if mqd[CP_RB_WPTR_POLL_ADDR_LO] != (base.wptr_gpu_addr & 0xffff_fffc) as u32 {
+        return TestResult::Fail("the wptr poll address is wrong");
+    }
+    // The MQD records its own address, dword aligned.
+    if mqd[CP_MQD_BASE_ADDR] != (base.mqd_gpu_addr & 0xffff_fffc) as u32 {
+        return TestResult::Fail("the MQD does not record its own address");
+    }
+
+    // ── ring size ──
+    // `rb_bufsz = order_base_2(queue_size / 4) - 1`; 4096 bytes is 1024
+    // dwords, so log2(1024) - 1 = 9, and RB_BLKSZ is that minus 2.
+    if mqd[CP_GFX_HQD_CNTL] & 0x3F != 9 {
+        return TestResult::Fail("RB_BUFSZ should be order_base_2(size/4) - 1");
+    }
+    if (mqd[CP_GFX_HQD_CNTL] >> 8) & 0x3F != 7 {
+        return TestResult::Fail("RB_BLKSZ should be RB_BUFSZ - 2");
+    }
+    // The expression underflows below 8 bytes and the field cannot describe a
+    // non-power-of-two ring, so both are refused rather than encoded wrongly.
+    for bad in [0u64, 4, 3000, 5000] {
+        if gfx_mqd_init(&MqdProp {
+            queue_size: bad,
+            ..base
+        })
+        .is_ok()
+        {
+            return TestResult::Fail("an unrepresentable ring size must be refused");
+        }
+    }
+
+    // ── the two fields whose sense is easy to invert ──
+    // RB_NON_PRIV marks a queue whose packets are NOT privileged, so Linux
+    // sets it for a queue that is not the kernel's. Inverted, every userspace
+    // queue would get the kernel's authority over the command processor.
+    if mqd[CP_GFX_HQD_CNTL] & (1 << 15) != 0 {
+        return TestResult::Fail("a kernel queue must not be marked non-privileged");
+    }
+    let user = match gfx_mqd_init(&MqdProp {
+        kernel_queue: false,
+        ..base
+    }) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a userspace queue was refused"),
+    };
+    if user[CP_GFX_HQD_CNTL] & (1 << 15) == 0 {
+        return TestResult::Fail("a userspace queue MUST be marked non-privileged");
+    }
+    // PRIV_STATE on the MQD control is the opposite sense and is always set:
+    // the firmware fetches the descriptor itself through the kernel's address
+    // space whatever the queue's own privilege is.
+    if mqd[CP_GFX_MQD_CONTROL] & (1 << 8) == 0 {
+        return TestResult::Fail("the MQD fetch is always privileged");
+    }
+    if user[CP_GFX_MQD_CONTROL] & (1 << 8) == 0 {
+        return TestResult::Fail("a userspace queue's MQD fetch is still privileged");
+    }
+
+    // ── defaults are built on, not replaced ──
+    // `regCP_GFX_HQD_QUANTUM_DEFAULT` is 0x0a01 and the enable bit is added
+    // to it; starting from zero would drop the quantum's reserved value.
+    if mqd[CP_GFX_HQD_QUANTUM] != 0x0a01 | 1 {
+        return TestResult::Fail("the quantum should be its reset value plus QUANTUM_EN");
+    }
+    // `regCP_GFX_HQD_CNTL_DEFAULT` is 0x00a00000 and those bits survive.
+    if mqd[CP_GFX_HQD_CNTL] & 0x00a0_0000 != 0x00a0_0000 {
+        return TestResult::Fail("the cntl register's reset bits were discarded");
+    }
+    // `regCP_GFX_MQD_CONTROL_DEFAULT` is 0x100 — which IS the PRIV_STATE bit.
+    if mqd[CP_GFX_MQD_CONTROL] & 0xF != 0 {
+        return TestResult::Fail("VMID should be cleared in the MQD control");
+    }
+
+    // ── doorbell ──
+    if mqd[CP_RB_DOORBELL_CONTROL] & (1 << 30) == 0 {
+        return TestResult::Fail("DOORBELL_EN should be set when a doorbell is used");
+    }
+    if (mqd[CP_RB_DOORBELL_CONTROL] >> 2) & 0x03FF_FFFF != 0x42 {
+        return TestResult::Fail("the doorbell index did not land at bit 2");
+    }
+    let nodoor = match gfx_mqd_init(&MqdProp {
+        use_doorbell: false,
+        ..base
+    }) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a queue without a doorbell was refused"),
+    };
+    if nodoor[CP_RB_DOORBELL_CONTROL] != 0 {
+        return TestResult::Fail("no doorbell means the whole control register stays at reset");
+    }
+
+    // ── priority, TMZ, and the pointers ──
+    if mqd[CP_GFX_HQD_QUEUE_PRIORITY] != 0 {
+        return TestResult::Fail("normal priority is level 0");
+    }
+    let hi = match gfx_mqd_init(&MqdProp {
+        priority: QueuePriority::Maximum,
+        ..base
+    }) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a maximum-priority queue was refused"),
+    };
+    if hi[CP_GFX_HQD_QUEUE_PRIORITY] & 1 != 1 {
+        return TestResult::Fail("AMDGPU_GFX_QUEUE_PRIORITY_MAXIMUM is level 1");
+    }
+    let tmz = match gfx_mqd_init(&MqdProp {
+        tmz_queue: true,
+        ..base
+    }) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a TMZ queue was refused"),
+    };
+    if tmz[CP_GFX_HQD_CNTL] & (1 << 7) == 0 {
+        return TestResult::Fail("TMZ_MATCH should be set for a TMZ queue");
+    }
+    if mqd[CP_GFX_HQD_WPTR] != 0 || mqd[CP_GFX_HQD_RPTR] != 0 {
+        return TestResult::Fail("a fresh queue starts with both pointers at zero");
+    }
+    if mqd[CP_GFX_HQD_ACTIVE] != 1 {
+        return TestResult::Fail("the descriptor should mark the queue active");
+    }
+    if mqd[CP_GFX_HQD_VMID] != 0 {
+        return TestResult::Fail("the ring's VMID starts at the kernel's");
+    }
+
+    // ── the user-queue areas, which live at the two ends of the structure ──
+    if mqd[SHADOW_BASE_LO] != base.shadow_addr as u32 || mqd[SHADOW_BASE_HI] != 5 {
+        return TestResult::Fail("the shadow area address is wrong");
+    }
+    if mqd[FENCE_ADDRESS_HI] != 8 || mqd[FENCE_ADDRESS_LO] != 0 {
+        return TestResult::Fail("the fence address is wrong");
+    }
+    if mqd[FW_WORK_AREA_BASE_HI] != 7 || mqd[GDS_BKUP_BASE_HI] != 6 {
+        return TestResult::Fail("a user-queue area address is wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_mqd",
+    smoke_amdgpu_mqd_gfx11_matches_linux
+);
+
+/// The GFX11 COMPUTE queue descriptor, against `gfx_v11_0_compute_mqd_init`.
+///
+/// `v11_compute_mqd` is a different register image from `v11_gfx_mqd` — the
+/// indices come from the `// offset:` comments `v11_structs.h:674` carries,
+/// and the values from `gc_11_0_0_default.h` and `gc_11_0_0_sh_mask.h`.
+fn smoke_amdgpu_mqd_compute_matches_linux() -> TestResult {
+    use crate::amdgpu_mqd::*;
+
+    let base = MqdProp {
+        mqd_gpu_addr: 0x1_0000_1006,
+        hqd_base_gpu_addr: 0x2_0000_0000,
+        rptr_gpu_addr: 0x0003_0000_0006,
+        wptr_gpu_addr: 0x0004_0000_000A,
+        queue_size: 8192,
+        doorbell_index: 0x42,
+        use_doorbell: true,
+        kernel_queue: true,
+        tmz_queue: false,
+        priority: QueuePriority::Normal,
+        shadow_addr: 0,
+        gds_bkup_addr: 0,
+        csa_addr: 0,
+        fence_address: 0x8_0000_0000,
+    };
+    let eop = 0x9_0000_0000u64;
+    let mqd = match compute_mqd_init(&base, eop) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a well-formed compute queue was refused"),
+    };
+    if mqd.len() != 512 {
+        return TestResult::Fail("the compute image is 512 dwords");
+    }
+
+    // The literal header `gfx_v11_0_compute_mqd_init` writes first.
+    if mqd[C_HEADER] != 0xC031_0800 {
+        return TestResult::Fail("MQD header");
+    }
+    if mqd[C_COMPUTE_PIPELINESTAT_ENABLE] != 1 || mqd[C_COMPUTE_MISC_RESERVED] != 0x7 {
+        return TestResult::Fail("pipelinestat or misc_reserved");
+    }
+    // All four SE thread-management masks are 0xffffffff. SE2 is at index 25
+    // and SE3 at 27 — NOT 26, which the declaration skips.
+    for index in [23usize, 24, 25, 27] {
+        if mqd[index] != u32::MAX {
+            return TestResult::Fail("a static thread-management mask is not all-ones");
+        }
+    }
+
+    // EOP buffer: the address shifted right by 8, like the ring base, and
+    // EOP_SIZE = log2(2048/4) - 1 = 8 in bits[5:0] over the 0x00000006
+    // default.
+    //
+    // This read `!= eop as u32` and said "address plain". It is not plain:
+    // `gfx_v11_0_compute_mqd_init:4350` shifts it. A test built from the same
+    // misreading as the code cannot see the difference, so the literals below
+    // are written out rather than recomputed from `eop`.
+    if mqd[C_CP_HQD_EOP_BASE_ADDR_LO] != 0x0900_0000 || mqd[C_CP_HQD_EOP_BASE_ADDR_HI] != 0 {
+        return TestResult::Fail("EOP base is the address shifted right by eight");
+    }
+    if eop != 0x9_0000_0000 {
+        return TestResult::Fail("the EOP literal above assumes this address");
+    }
+    if MEC_HPD_BYTES != 2048 {
+        return TestResult::Fail("GFX11_MEC_HPD_SIZE is 2048");
+    }
+    if mqd[C_CP_HQD_EOP_CONTROL] & 0x3F != 8 {
+        return TestResult::Fail("EOP_SIZE must be log2(bytes/4) - 1");
+    }
+
+    // Doorbell: the index sits in DOORBELL_OFFSET at bit 2 (mask 0x0FFFFFFC),
+    // DOORBELL_EN is bit 30, and SOURCE (28) and HIT (31) are cleared.
+    let db = mqd[C_CP_HQD_PQ_DOORBELL_CONTROL];
+    if (db & 0x0FFF_FFFC) >> 2 != 0x42 {
+        return TestResult::Fail("doorbell offset");
+    }
+    if db & 0x4000_0000 == 0 {
+        return TestResult::Fail("DOORBELL_EN");
+    }
+    if db & (0x1000_0000 | 0x8000_0000) != 0 {
+        return TestResult::Fail("DOORBELL_SOURCE and DOORBELL_HIT must be clear");
+    }
+    let no_db = match compute_mqd_init(
+        &MqdProp {
+            use_doorbell: false,
+            ..base
+        },
+        eop,
+    ) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("doorbell-less queue refused"),
+    };
+    if no_db[C_CP_HQD_PQ_DOORBELL_CONTROL] & 0x4000_0000 != 0 {
+        return TestResult::Fail("DOORBELL_EN must be clear without a doorbell");
+    }
+
+    // The ring base is shifted right by 8 — as is the EOP base above. The MQD
+    // address is the plain one, masked to a dword rather than shifted.
+    let pq = base.hqd_base_gpu_addr >> 8;
+    if mqd[C_CP_HQD_PQ_BASE_LO] != pq as u32 || mqd[C_CP_HQD_PQ_BASE_HI] != (pq >> 32) as u32 {
+        return TestResult::Fail("PQ base must be the address shifted by eight");
+    }
+
+    // PQ_CONTROL over the 0x00308509 default: QUEUE_SIZE = log2(8192/4) - 1
+    // = 10 in bits[5:0], RPTR_BLOCK_SIZE = log2(4096/4) - 1 = 9 at bit 8,
+    // UNORD_DISPATCH (28) set, TUNNEL_DISPATCH (29) clear, and PRIV_STATE (30)
+    // with KMD_QUEUE (31) for a kernel queue.
+    let pqc = mqd[C_CP_HQD_PQ_CONTROL];
+    if pqc & 0x3F != 10 {
+        return TestResult::Fail("QUEUE_SIZE");
+    }
+    if (pqc & 0x0000_3F00) >> 8 != 9 {
+        return TestResult::Fail("RPTR_BLOCK_SIZE");
+    }
+    if pqc & 0x1000_0000 == 0 || pqc & 0x2000_0000 != 0 {
+        return TestResult::Fail("UNORD_DISPATCH set, TUNNEL_DISPATCH clear");
+    }
+    if pqc & 0x4000_0000 == 0 || pqc & 0x8000_0000 == 0 {
+        return TestResult::Fail("a kernel compute queue is privileged and KMD-owned");
+    }
+    if pqc & 0x0040_0000 != 0 {
+        return TestResult::Fail("TMZ must be off unless asked for");
+    }
+    // A userspace queue gets neither privilege bit — inverted, every user
+    // queue would hold the kernel's authority over the MEC.
+    let user = match compute_mqd_init(
+        &MqdProp {
+            kernel_queue: false,
+            ..base
+        },
+        eop,
+    ) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("userspace queue refused"),
+    };
+    if user[C_CP_HQD_PQ_CONTROL] & (0x4000_0000 | 0x8000_0000) != 0 {
+        return TestResult::Fail("a userspace compute queue must not be privileged");
+    }
+    let tmz = match compute_mqd_init(
+        &MqdProp {
+            tmz_queue: true,
+            ..base
+        },
+        eop,
+    ) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("tmz queue refused"),
+    };
+    if tmz[C_CP_HQD_PQ_CONTROL] & 0x0040_0000 == 0 {
+        return TestResult::Fail("TMZ must be set when asked for");
+    }
+
+    // The report and poll addresses are dword-aligned, and their high halves
+    // are 16-bit fields — the fixture's addresses have bits set in both.
+    if mqd[C_CP_HQD_PQ_RPTR_REPORT_ADDR_LO] != 0x0000_0004 {
+        return TestResult::Fail("the rptr report address must be dword-aligned");
+    }
+    if mqd[C_CP_HQD_PQ_RPTR_REPORT_ADDR_HI] != 0x0003 {
+        return TestResult::Fail("rptr report address high half");
+    }
+    if mqd[C_CP_HQD_PQ_WPTR_POLL_ADDR_LO] != 0x0000_0008 {
+        return TestResult::Fail("the wptr poll address must be dword-aligned");
+    }
+    if mqd[C_CP_HQD_PQ_WPTR_POLL_ADDR_HI] != 0x0004 {
+        return TestResult::Fail("wptr poll address high half");
+    }
+    // The MQD records its own address, also dword-aligned.
+    if mqd[C_CP_MQD_BASE_ADDR_LO] != 0x0000_1004 {
+        return TestResult::Fail("the MQD's own address must be dword-aligned");
+    }
+
+    // PERSISTENT_STATE forces PRELOAD_SIZE to 0x55 at bit 8 over 0x0be05501,
+    // and IB_CONTROL forces MIN_IB_AVAIL_SIZE to 3 at bit 20 over 0x00300000.
+    if (mqd[C_CP_HQD_PERSISTENT_STATE] & 0x0003_FF00) >> 8 != 0x55 {
+        return TestResult::Fail("PRELOAD_SIZE");
+    }
+    if (mqd[C_CP_HQD_IB_CONTROL] & 0x0030_0000) >> 20 != 3 {
+        return TestResult::Fail("MIN_IB_AVAIL_SIZE");
+    }
+
+    // QUANTUM is composed from ZERO, not from a register default:
+    // QUANTUM_EN bit 0, QUANTUM_SCALE bit 4, QUANTUM_DURATION 1 at bit 8.
+    if mqd[C_CP_HQD_QUANTUM] != 0x1 | 0x10 | (1 << 8) {
+        return TestResult::Fail("quantum");
+    }
+
+    // Not active until the scheduler maps it, and its pointers start at zero.
+    if mqd[C_CP_HQD_ACTIVE] != 0 || mqd[C_CP_HQD_DEQUEUE_REQUEST] != 0 {
+        return TestResult::Fail("a fresh queue is inactive and not dequeuing");
+    }
+    if mqd[C_CP_HQD_PQ_WPTR_LO] != 0 || mqd[C_CP_HQD_PQ_WPTR_HI] != 0 {
+        return TestResult::Fail("write pointer starts at zero");
+    }
+    if mqd[C_CP_HQD_VMID] != 0 {
+        return TestResult::Fail("the kernel's VMID is zero");
+    }
+    if mqd[C_FENCE_ADDRESS_LO] != base.fence_address as u32
+        || mqd[C_FENCE_ADDRESS_HI] != (base.fence_address >> 32) as u32
+    {
+        return TestResult::Fail("fence address");
+    }
+
+    // Ring sizes the size field cannot describe are refused rather than
+    // silently truncated.
+    for bad in [0u64, 4, 6, 3000] {
+        if compute_mqd_init(
+            &MqdProp {
+                queue_size: bad,
+                ..base
+            },
+            eop,
+        )
+        .is_ok()
+        {
+            return TestResult::Fail("an unrepresentable ring size must be refused");
+        }
+    }
+    // So is a ring base whose low eight bits would be discarded by the shift.
+    if compute_mqd_init(
+        &MqdProp {
+            hqd_base_gpu_addr: 0x2_0000_0080,
+            ..base
+        },
+        eop,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("a misaligned ring base must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_mqd",
+    smoke_amdgpu_mqd_compute_matches_linux
+);
+
+/// The MES pipe's own descriptor, as the DELTA from the compute one.
+///
+/// `mes_v11_0_mqd_init` and `gfx_v11_0_compute_mqd_init` fill the same
+/// `v11_compute_mqd` image and differ in fourteen places. The test builds both
+/// from identical properties and asserts the difference — every dword that
+/// must differ does, and no dword that must not differ does. Written this way
+/// because the failure the MES descriptor produces is a scheduler that maps
+/// successfully and never runs, and a copy of the compute path would look
+/// entirely plausible.
+fn smoke_amdgpu_mqd_mes_differs_from_compute() -> TestResult {
+    use crate::amdgpu_mqd::*;
+
+    let base = MqdProp {
+        mqd_gpu_addr: 0x1_0000_1006,
+        hqd_base_gpu_addr: 0x2_0000_0000,
+        rptr_gpu_addr: 0x0003_0000_0006,
+        // Deliberately 4-mod-8, so the two paths' masks differ visibly: the
+        // compute path keeps it, the MES path rounds it down to 8.
+        wptr_gpu_addr: 0x0004_0000_000C,
+        queue_size: 8192,
+        doorbell_index: 0x42,
+        use_doorbell: true,
+        // Both are claimed, and the MES path must ignore both: it sets
+        // PRIV_STATE / KMD_QUEUE unconditionally and never sets TMZ.
+        kernel_queue: true,
+        tmz_queue: true,
+        priority: QueuePriority::Maximum,
+        shadow_addr: 0,
+        gds_bkup_addr: 0,
+        csa_addr: 0,
+        // Both halves non-zero, so "the compute path writes it" is checkable
+        // on either dword.
+        fence_address: 0x8_0000_1234,
+    };
+    let eop = 0x9_0000_0000u64;
+    let mes = match mes_mqd_init(&base, eop) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("a well-formed MES queue was refused"),
+    };
+    let comp = match compute_mqd_init(&base, eop) {
+        Ok(m) => m,
+        Err(_) => return TestResult::Fail("the compute comparison was refused"),
+    };
+
+    // ── the write-pointer poll address is quadword-aligned here ──
+    if comp[C_CP_HQD_PQ_WPTR_POLL_ADDR_LO] != 0x0000_000C {
+        return TestResult::Fail("the compute path masks the poll address to four bytes");
+    }
+    if mes[C_CP_HQD_PQ_WPTR_POLL_ADDR_LO] != 0x0000_0008 {
+        return TestResult::Fail("the MES path masks the poll address to eight bytes");
+    }
+
+    // ── CP_HQD_PQ_CONTROL, field by field ──
+    let c = comp[C_CP_HQD_PQ_CONTROL];
+    let m = mes[C_CP_HQD_PQ_CONTROL];
+    // NO_UPDATE_RPTR (bit 27) is set only by the MES path.
+    if m & 0x0800_0000 == 0 {
+        return TestResult::Fail("the MES descriptor sets NO_UPDATE_RPTR");
+    }
+    if c & 0x0800_0000 != 0 {
+        return TestResult::Fail("the compute descriptor must not set NO_UPDATE_RPTR");
+    }
+    // RPTR_BLOCK_SIZE (0x3F00). Linux's MES path shifts the value twice, so
+    // nothing survives the field mask and it clears the register default's 5.
+    // The compute path lands on 9 — log2(4096/4) - 1.
+    if (c & 0x0000_3F00) >> 8 != 9 {
+        return TestResult::Fail("the compute RPTR_BLOCK_SIZE is log2(page/4) - 1");
+    }
+    if m & 0x0000_3F00 != 0 {
+        return TestResult::Fail("the MES RPTR_BLOCK_SIZE is cleared by Linux's double shift");
+    }
+    // `regCP_HQD_PQ_CONTROL_DEFAULT` is 0x00308509, whose RPTR_BLOCK_SIZE
+    // field holds 5 — so a MES descriptor that simply left the field alone
+    // would read 5, not 0. The clear has to be written, and the rest of
+    // CP_HQD_PQ_CONTROL_DEFAULT must still be there to prove it was the field
+    // that was cleared and not the register that was composed from zero.
+    // Bits 15, 20 and 21 of that default are set and no field either path
+    // writes overlaps them, so they survive in both and prove the register was
+    // started from its default rather than composed from zero.
+    if m & 0x0030_8000 != 0x0030_8000 || c & 0x0030_8000 != 0x0030_8000 {
+        return TestResult::Fail("both paths must start from the register default");
+    }
+    // PRIV_STATE | KMD_QUEUE unconditional, TMZ never — with a prop that asks
+    // for TMZ and gets it from the compute path.
+    if m & 0xC000_0000 != 0xC000_0000 {
+        return TestResult::Fail("the MES descriptor is always privileged and KMD");
+    }
+    if c & 0x0040_0000 == 0 {
+        return TestResult::Fail("the compute path honours tmz_queue");
+    }
+    if m & 0x0040_0000 != 0 {
+        return TestResult::Fail("the MES descriptor is never a TMZ queue");
+    }
+
+    // ── active ──
+    if mes[C_CP_HQD_ACTIVE] != 1 {
+        return TestResult::Fail("the MES queue's descriptor says active");
+    }
+    if comp[C_CP_HQD_ACTIVE] != 0 {
+        return TestResult::Fail("a compute queue is activated by the scheduler, not here");
+    }
+
+    // ── the three register defaults taken as-is ──
+    if mes[C_CP_HQD_IB_CONTROL] != 0x0030_0000 {
+        return TestResult::Fail("the MES path takes regCP_HQD_IB_CONTROL_DEFAULT unchanged");
+    }
+    // The two agree here, and that is the finding rather than an omission:
+    // `regCP_HQD_IB_CONTROL_DEFAULT` is 0x00300000 and `MIN_IB_AVAIL_SIZE` is
+    // a 2-bit field at shift 20, so the default ALREADY encodes 3 and the
+    // compute path's REG_SET_FIELD is a no-op. Asserted so that if either the
+    // default or the field moves, this stops being true loudly.
+    if comp[C_CP_HQD_IB_CONTROL] != mes[C_CP_HQD_IB_CONTROL] {
+        return TestResult::Fail("the IB control default already encodes MIN_IB_AVAIL_SIZE 3");
+    }
+    if mes[C_CP_HQD_QUANTUM] != 0 {
+        return TestResult::Fail("quantum scheduling is off for the MES pipe");
+    }
+    if comp[C_CP_HQD_QUANTUM] == 0 {
+        return TestResult::Fail("the compute path composes a non-zero quantum");
+    }
+    if mes[C_CP_HQD_IQ_TIMER] != 0 {
+        return TestResult::Fail("regCP_HQD_IQ_TIMER_DEFAULT is zero");
+    }
+
+    // ── the fields the MES path does not touch ──
+    if comp[C_CP_HQD_PIPE_PRIORITY] != 1 || comp[C_CP_HQD_QUEUE_PRIORITY] != 1 {
+        return TestResult::Fail("the compute path takes the requested priority");
+    }
+    if mes[C_CP_HQD_PIPE_PRIORITY] != 0 || mes[C_CP_HQD_QUEUE_PRIORITY] != 0 {
+        return TestResult::Fail("the MES path leaves the priorities alone");
+    }
+    if comp[C_FENCE_ADDRESS_LO] != 0x0000_1234 || comp[C_FENCE_ADDRESS_HI] != 8 {
+        return TestResult::Fail("the compute path writes the user-queue fence address");
+    }
+    if mes[C_FENCE_ADDRESS_LO] != 0 || mes[C_FENCE_ADDRESS_HI] != 0 {
+        return TestResult::Fail("the MES path has no user-queue fence address");
+    }
+
+    // ── and everything that must be IDENTICAL ──
+    // The header and the thread-management words in particular: a MES
+    // descriptor without the PM4 header is not recognised at all.
+    for (idx, what) in [
+        (C_HEADER, "header"),
+        (C_COMPUTE_PIPELINESTAT_ENABLE, "pipelinestat_enable"),
+        (C_COMPUTE_STATIC_THREAD_MGMT_SE0, "thread mgmt se0"),
+        (C_COMPUTE_STATIC_THREAD_MGMT_SE3, "thread mgmt se3"),
+        (C_COMPUTE_MISC_RESERVED, "misc_reserved"),
+        (C_CP_HQD_EOP_BASE_ADDR_LO, "eop base"),
+        (C_CP_HQD_EOP_CONTROL, "eop control"),
+        (C_CP_MQD_BASE_ADDR_LO, "mqd base"),
+        (C_CP_MQD_CONTROL, "mqd control"),
+        (C_CP_HQD_PQ_BASE_LO, "pq base"),
+        (C_CP_HQD_PQ_RPTR_REPORT_ADDR_LO, "rptr report"),
+        (C_CP_HQD_PQ_DOORBELL_CONTROL, "doorbell control"),
+        (C_CP_HQD_PERSISTENT_STATE, "persistent state"),
+        (C_CP_HQD_VMID, "vmid"),
+    ] {
+        if mes[idx] != comp[idx] {
+            return TestResult::Fail(what);
+        }
+    }
+    if mes[C_HEADER] != 0xC031_0800 {
+        return TestResult::Fail("the MES descriptor carries the same PM4 header");
+    }
+    // The EOP size: both are 2048 bytes, so log2(512) - 1 = 8.
+    if (mes[C_CP_HQD_EOP_CONTROL] & 0x3F) != 8 {
+        return TestResult::Fail("the EOP size describes 2048 bytes");
+    }
+
+    // Validation is the same shape as the compute path's.
+    if mes_mqd_init(
+        &MqdProp {
+            queue_size: 3000,
+            ..base
+        },
+        eop,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("a non-power-of-two ring must be refused");
+    }
+    if mes_mqd_init(
+        &MqdProp {
+            hqd_base_gpu_addr: base.hqd_base_gpu_addr + 0x80,
+            ..base
+        },
+        eop,
+    )
+    .is_ok()
+    {
+        return TestResult::Fail("a ring base that is not 256-byte aligned must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_mqd",
+    smoke_amdgpu_mqd_mes_differs_from_compute
+);
+
+/// The SMU mailbox registers, against `mp_13_0_4_offset.h`.
+///
+/// `regMP1_SMN_C2PMSG_N` is dword `0x240 + N`: C2PMSG_64 is 0x0280, 66 is
+/// 0x0282, 82 is 0x0292, 90 is 0x029a. The offsets here were `0x29C + N * 4`,
+/// which is neither the dword id nor a byte offset derived from one — it put
+/// the argument register at byte 0x3A4 where C2PMSG_66 is at 0xA08. Every SMU
+/// message went to the wrong register and every response was read from
+/// another.
+fn smoke_amdgpu_smu_mailbox_offsets_match_mp13() -> TestResult {
+    use crate::amdgpu_smu::{
+        MP1_C2PMSG_ARG_REL, MP1_C2PMSG_MSG_REL, MP1_C2PMSG_PMFW_HI_REL, MP1_C2PMSG_PMFW_LO_REL,
+        MP1_C2PMSG_RESP_REL,
+    };
+    // (byte offset, header dword id)
+    let want: &[(u32, u32)] = &[
+        (MP1_C2PMSG_PMFW_LO_REL, 0x0280), // C2PMSG_64
+        (MP1_C2PMSG_PMFW_HI_REL, 0x0281), // C2PMSG_65
+        (MP1_C2PMSG_ARG_REL, 0x0282),     // C2PMSG_66
+        (MP1_C2PMSG_MSG_REL, 0x0292),     // C2PMSG_82
+        (MP1_C2PMSG_RESP_REL, 0x029A),    // C2PMSG_90
+    ];
+    for (got, dword) in want.iter().copied() {
+        if got != dword * 4 {
+            return TestResult::Fail("an SMU mailbox offset is not its header dword id");
+        }
+    }
+    // The three mailbox registers must be distinct, or a message would be
+    // written over its own argument or read back as its own response.
+    if MP1_C2PMSG_ARG_REL == MP1_C2PMSG_MSG_REL
+        || MP1_C2PMSG_MSG_REL == MP1_C2PMSG_RESP_REL
+        || MP1_C2PMSG_ARG_REL == MP1_C2PMSG_RESP_REL
+    {
+        return TestResult::Fail("the SMU mailbox registers must be distinct");
+    }
+    // The firmware-load pair is adjacent — C2PMSG_64 and 65 — and below the
+    // argument register, which the spacing confirms.
+    if MP1_C2PMSG_PMFW_HI_REL != MP1_C2PMSG_PMFW_LO_REL + 4 {
+        return TestResult::Fail("the PMFW address halves are adjacent registers");
+    }
+    if MP1_C2PMSG_ARG_REL != MP1_C2PMSG_PMFW_HI_REL + 4 {
+        return TestResult::Fail("C2PMSG_66 follows C2PMSG_65");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/smu",
+    smoke_amdgpu_smu_mailbox_offsets_match_mp13
+);
+
+/// The DCN register ids against the AMD headers, as absolute dwords.
+///
+/// LINUX-GAP: an earlier version of this test checked each table's *deltas*
+/// from the first register of its block, which is what the tables stored. That
+/// verified the offsets and left two things it structurally could not see: the
+/// per-block bases those offsets were added to, and the unit — `DcnWrite::addr`
+/// goes into MM_INDEX, which takes a dword address, while the tables were in
+/// bytes. The ids are absolute now and this checks them directly.
+fn smoke_amdgpu_dcn_offsets_match_headers() -> TestResult {
+    use crate::amdgpu_dcn::*;
+
+    // `dcn_2_0_0_offset.h` and `dcn_3_1_4_offset.h` agree on all nine OTG
+    // registers. The block is NOT a contiguous run — the gaps are the point,
+    // and two of them were previously rounded to a multiple of 0x10.
+    if OTG0_OTG_H_TOTAL != 0x1b2a
+        || OTG0_OTG_H_BLANK_START_END != 0x1b2b
+        || OTG0_OTG_H_SYNC_A != 0x1b2c
+        || OTG0_OTG_V_TOTAL != 0x1b2f
+        || OTG0_OTG_V_BLANK_START_END != 0x1b36
+        || OTG0_OTG_V_SYNC_A != 0x1b37
+        || OTG0_OTG_CONTROL != 0x1b41
+    {
+        return TestResult::Fail("an OTG timing register id disagrees with the header");
+    }
+    // OTG_STATUS is +0x1f from H_TOTAL and INTERRUPT_CONTROL +0x2f, not the
+    // +0x20 and +0x30 the byte table carried.
+    if OTG0_OTG_STATUS != 0x1b49 || OTG0_OTG_INTERRUPT_CONTROL != 0x1b59 {
+        return TestResult::Fail("regOTG0_OTG_STATUS is 0x1b49 and _INTERRUPT_CONTROL 0x1b59");
+    }
+    if OTG0_OTG_STATUS - OTG0_OTG_H_TOTAL == 0x20
+        || OTG0_OTG_INTERRUPT_CONTROL - OTG0_OTG_H_TOTAL == 0x30
+    {
+        return TestResult::Fail("neither offset is a round multiple of 0x10");
+    }
+
+    // HUBP. The surface registers are in the HUBPREQ sub-block, so their ids
+    // do not continue from DCHUBP_CNTL, and LOW is below HIGH.
+    if HUBP0_DCHUBP_CNTL != 0x05f3
+        || HUBPREQ0_DCSURF_SURFACE_PITCH != 0x0607
+        || HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS != 0x060a
+        || HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH != 0x060b
+    {
+        return TestResult::Fail("a HUBP register id disagrees with the header");
+    }
+    if HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH <= HUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS {
+        return TestResult::Fail("the surface address HIGH half is above the LOW half");
+    }
+
+    // OPP_PIPE0 has exactly one register.
+    if OPP_PIPE0_OPP_PIPE_CONTROL != 0x188c {
+        return TestResult::Fail("regOPP_PIPE0_OPP_PIPE_CONTROL is 0x188c");
+    }
+
+    // Per-pipe strides, in dwords, from the difference between pipe 0 and
+    // pipe 1 in the header.
+    for (got, p0, p1) in [
+        (OTG_PIPE_STRIDE, 0x1b2a, 0x1baa),
+        (HUBP_PIPE_STRIDE, 0x05f3, 0x06cf),
+        (OPP_PIPE_STRIDE, 0x188c, 0x18e6),
+    ] {
+        if got != p1 - p0 {
+            return TestResult::Fail("a per-pipe stride is not the header's pipe delta");
+        }
+    }
+    // HUBPREQ strides with HUBP: 0x06e3 - 0x0607.
+    if for_pipe(HUBPREQ0_DCSURF_SURFACE_PITCH, 1, HUBP_PIPE_STRIDE) != 0x06e3 {
+        return TestResult::Fail("HUBPREQ pipe 1 pitch is 0x06e3");
+    }
+    if for_pipe(OTG0_OTG_H_TOTAL, 3, OTG_PIPE_STRIDE) != 0x1caa {
+        return TestResult::Fail("regOTG3_OTG_H_TOTAL is 0x1caa");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu_dcn",
+    smoke_amdgpu_dcn_offsets_match_headers
 );

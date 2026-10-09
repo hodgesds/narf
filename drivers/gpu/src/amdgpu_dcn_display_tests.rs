@@ -320,3 +320,62 @@ kernel_test_in!(
     "drivers/gpu/dcn-display",
     display_scanout_observer_sees_both_edges
 );
+
+/// The widest mode this path accepts must be exactly the widest the timing
+/// generator will program — not one column more, which is what an independent
+/// `8192` here gave.
+fn display_mode_bounds_are_the_ones_the_blocks_enforce() -> TestResult {
+    // `ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK` is 0x00001FFF, so one
+    // OPP segment carries 8191 active pixels, and this path bypasses ODM.
+    if crate::amdgpu_dcn_otg::MAX_SEGMENT_WIDTH != 8191 {
+        return TestResult::Fail("OPTC_SEGMENT_WIDTH is thirteen bits");
+    }
+    if MAX_WIDTH != crate::amdgpu_dcn_otg::MAX_SEGMENT_WIDTH {
+        return TestResult::Fail("the mode bound must be the segment the OTG programs");
+    }
+    // `DSCL0_RECOUT_SIZE__RECOUT_HEIGHT_MASK` and
+    // `DPG0_DPG_DIMENSIONS__DPG_ACTIVE_HEIGHT_MASK` are both 0x3FFF.
+    if MAX_HEIGHT != 16383 {
+        return TestResult::Fail("the plane's height fields are fourteen bits");
+    }
+    if MAX_HEIGHT != crate::amdgpu_dcn_plane::MAX_DIMENSION {
+        return TestResult::Fail("the height bound must be the plane's own field width");
+    }
+    // One pipe count, shared: res_cap_dcn314 gives num_timing_generator,
+    // num_opp and num_video_plane all as 4.
+    if crate::amdgpu_dcn::DCN_PIPES != 4 {
+        return TestResult::Fail("DCN 3.1.4 has four pixel pipes");
+    }
+
+    // A mode exactly at each bound is accepted, and one past it refused — at
+    // this stage, rather than several blocks later.
+    let at_width = DetailedTiming {
+        h_active: 8191,
+        h_blanking: 280,
+        ..detailed()
+    };
+    if timing_from_edid(&at_width).is_err() {
+        return TestResult::Fail("a mode at the segment width must be accepted");
+    }
+    let over_width = DetailedTiming {
+        h_active: 8192,
+        h_blanking: 280,
+        ..detailed()
+    };
+    if timing_from_edid(&over_width).is_ok() {
+        return TestResult::Fail("a mode one column past the segment width must be refused");
+    }
+    let over_height = DetailedTiming {
+        v_active: 16384,
+        v_blanking: 45,
+        ..detailed()
+    };
+    if timing_from_edid(&over_height).is_ok() {
+        return TestResult::Fail("a mode past the plane's height fields must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-display",
+    display_mode_bounds_are_the_ones_the_blocks_enforce
+);

@@ -182,6 +182,8 @@ pub enum AtomError {
     /// EOT. Matches the Linux 20-second wall-clock guard but
     /// without a wall clock.
     Stuck,
+    /// CALLTABLE nested deeper than [`ATOM_EXECUTE_MAX_DEPTH`].
+    CallTableTooDeep,
     /// CALLTABLE / SETDATABLOCK reached but the caller's resolver
     /// returned an empty table.
     UnknownTable(u8),
@@ -197,13 +199,34 @@ pub enum AtomError {
 pub type RegRead = Box<dyn FnMut(u32) -> u32>;
 pub type RegWrite = Box<dyn FnMut(u32, u32)>;
 
-/// CALLTABLE / SETDATABLOCK resolver: given a sub-table id, return
-/// the byte slice for that table. `None` means "no such table",
+/// One resolved command table: the bytecode body with its
+/// `ATOM_COMMON_TABLE_HEADER` and prelude already stripped, plus the
+/// parameter-space size the table's own header declares.
+///
+/// `ps_dwords` is `(CU8(base + ATOM_CT_PS_PTR) & ATOM_CT_PS_MASK) / 4` —
+/// `atom.c:1255`'s `ectx.ps_shift`. It is needed because CALLTABLE hands the
+/// callee the parameter window *above* the caller's own: `ctx->ps +
+/// ctx->ps_shift` (`atom.c:650`). Resolving the body alone leaves no way to
+/// compute it, which is why this is a pair.
+#[derive(Copy, Clone, Debug)]
+pub struct ResolvedTable<'a> {
+    pub body: &'a [u8],
+    pub ps_dwords: usize,
+}
+
+/// CALLTABLE / SETDATABLOCK resolver: given a sub-table id, return that
+/// table's body and declared parameter size. `None` means "no such table",
 /// which the VM converts to `AtomError::UnknownTable`.
 ///
 /// The caller usually backs this with a closure that delegates into
-/// `amdgpu_atombios::Atombios::cmd_table` / `data_table_offset`.
-pub type TableResolver<'a> = Box<dyn FnMut(u8) -> Option<&'a [u8]> + 'a>;
+/// `amdgpu_atombios::Atombios::cmd_table_body_and_ps`.
+pub type TableResolver<'a> = Box<dyn FnMut(u8) -> Option<ResolvedTable<'a>> + 'a>;
+
+/// `ATOM_EXECUTE_MAX_DEPTH` (`atom.c:62`). Linux added this bound
+/// deliberately: "Limit ATOM command table recursion (calltable) to avoid
+/// kernel stack overflow". VBIOS bytecode is data read off the card, so a
+/// table whose CALLTABLE chain loops must be refused rather than recursed.
+pub const ATOM_EXECUTE_MAX_DEPTH: u32 = 32;
 
 // ── VM state ─────────────────────────────────────────────────────
 
@@ -347,12 +370,12 @@ struct Frame<'b, 'c> {
     code: &'b [u8],
     /// Parameter space.
     ps: &'c mut [u32],
-    /// PS shift (table header carries a PS-mask; Linux divides by
-    /// 4 to skip the input-only prefix on entry). Carried through
-    /// the dispatch loop so CALLTABLE can replay it; not consumed
-    /// yet in this Stage-9 cut.
-    #[allow(dead_code)]
+    /// This table's declared parameter size in dwords — `atom.c`'s
+    /// `ectx.ps_shift`. CALLTABLE hands the callee `ps[ps_shift..]`, so the
+    /// callee's parameters begin where this table's end.
     ps_shift: usize,
+    /// CALLTABLE nesting depth, bounded by [`ATOM_EXECUTE_MAX_DEPTH`].
+    depth: u32,
 }
 
 impl<'b, 'c> Frame<'b, 'c> {
@@ -835,14 +858,26 @@ fn op_calltable(
 ) -> Result<(), AtomError> {
     let idx = frame.u8_at(*ptr)?;
     *ptr += 1;
+    if frame.depth + 1 >= ATOM_EXECUTE_MAX_DEPTH {
+        return Err(AtomError::CallTableTooDeep);
+    }
     let sub = match (state.table_resolver)(idx) {
         Some(s) => s,
         None => return Err(AtomError::UnknownTable(idx)),
     };
-    // Recursively execute the sub-table. We pass the *current*
-    // PS-shifted view as the new PS, mirroring atom.c:642.
-    let shift = 0; // sub-table's own PS shift, ignored on synthetic tables
-    execute_bytes(state, sub, frame.ps, shift)
+    // `atom.c:650`: the callee gets `ps + ps_shift`, sized
+    // `ps_size - ps_shift` — the window *above* this table's own parameters,
+    // not this table's parameters over again. A callee handed the caller's
+    // window reads the caller's inputs as its own and writes its outputs over
+    // them.
+    let shift = frame.ps_shift.min(frame.ps.len());
+    run_table(
+        state,
+        sub.body,
+        &mut frame.ps[shift..],
+        sub.ps_dwords,
+        frame.depth + 1,
+    )
 }
 
 fn op_setport(
@@ -1314,10 +1349,21 @@ pub fn execute_bytes(
     params: &mut [u32],
     ps_shift: usize,
 ) -> Result<(), AtomError> {
+    run_table(state, code, params, ps_shift, 0)
+}
+
+fn run_table(
+    state: &mut AtomState,
+    code: &[u8],
+    params: &mut [u32],
+    ps_shift: usize,
+    depth: u32,
+) -> Result<(), AtomError> {
     let mut frame = Frame {
         code,
         ps: params,
         ps_shift,
+        depth,
     };
     let mut ptr = 0usize;
     let mut steps: u32 = 0;
@@ -1356,8 +1402,8 @@ pub fn execute_table(
     table_id: u8,
     params: &mut [u32],
 ) -> Result<(), AtomError> {
-    let code = match (state.table_resolver)(table_id) {
-        Some(s) => s,
+    let table = match (state.table_resolver)(table_id) {
+        Some(t) => t,
         None => return Err(AtomError::UnknownTable(table_id)),
     };
     // Reset per-execute state — atom.c:1296-1306.
@@ -1368,7 +1414,10 @@ pub fn execute_table(
     state.divmul = [0, 0];
     state.last_jump_addr = 0;
     state.last_jump_count = 0;
-    execute_bytes(state, code, params, 0)
+    // `atom.c:1255` takes the entry table's own declared parameter size, not
+    // zero: a zero shift makes every CALLTABLE from this table hand the callee
+    // this table's own parameter window.
+    run_table(state, table.body, params, table.ps_dwords, 0)
 }
 
 #[cfg(test)]

@@ -21,9 +21,10 @@
 //! ## Reference
 //!
 //! - Linux `drivers/gpu/drm/amd/display/dc/core/dc.c` — top
-//!   level. Functions: `dc_commit_streams`, `dc_validate_global_state`.
+//!   level. Function: `dc_commit_streams`.
 //! - Linux `drivers/gpu/drm/amd/display/dc/core/dc_resource.c` —
-//!   resource pool + pipe_ctx allocation.
+//!   resource pool + pipe_ctx allocation, and
+//!   `dc_validate_global_state` (which is here, not in `dc.c`).
 //! - Linux `drivers/gpu/drm/amd/display/dc/core/dc_state.c` —
 //!   state lifecycle.
 //! - Linux `drivers/gpu/drm/amd/display/dc/dc_stream.h` — stream
@@ -48,9 +49,9 @@
 //! ```
 //!
 //! Each block has an IP-version-specific register layout; the
-//! state machine here is generation-agnostic. Per-version
-//! register writes live in [`crate::amdgpu_dcn`] and the
-//! future `amdgpu_dc/dcn20.rs` / `amdgpu_dc/dcn35.rs` modules.
+//! state machine here is generation-agnostic. Every per-version
+//! register write lives in [`crate::amdgpu_dcn`], which carries the
+//! DCN 3.1.4 and DCN 3.5 tables side by side.
 //!
 //! ## Scope
 //!
@@ -82,16 +83,24 @@ pub enum PlaneKind {
     Cursor,
 }
 
-/// Pixel encoding the plane carries. Mirrors DCN's
-/// `dc_pixel_encoding` (RGB, YCbCr 4:4:4 / 4:2:2 / 4:2:0).
+/// Pixel encoding the plane carries. The variants are in the order
+/// `enum dc_pixel_encoding` lists them (Linux
+/// `display/dc/dc_hw_types.h:805-812`), which puts 4:2:2 before 4:4:4.
+///
+/// These are NOT hardware values and must not be cast to one: that
+/// enum starts at `PIXEL_ENCODING_UNDEFINED = 0`, so `PIXEL_ENCODING_RGB`
+/// is 1, and the register fields (`DP_PIXEL_ENCODING` in
+/// `regDP0_DP_PIXEL_FORMAT`, `PIXEL_ENCODING` in the FMT block) use a
+/// third numbering again. Conversion belongs with the register write, as
+/// `amdgpu_dcn_stream::PIXEL_ENCODING_RGB` does it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PixelEncoding {
     /// 8-bpc / 10-bpc / 12-bpc RGB. Default for desktop scanout.
     Rgb,
-    /// YCbCr 4:4:4 — full color resolution.
-    Ycbcr444,
     /// YCbCr 4:2:2 — chroma subsampled horizontally.
     Ycbcr422,
+    /// YCbCr 4:4:4 — full color resolution.
+    Ycbcr444,
     /// YCbCr 4:2:0 — chroma subsampled horizontally + vertically.
     /// Required for 4K60 over single-link HDMI 2.0.
     Ycbcr420,
@@ -108,8 +117,13 @@ pub enum ColorDepth {
 }
 
 impl ColorDepth {
-    /// Wire bits per component (matches DCN
-    /// `OUTPUT_FORMAT_COLOR_DEPTH` encoding).
+    /// Wire bits per component — a count, not a register value.
+    ///
+    /// LINUX-GAP: this was documented as matching a DCN
+    /// `OUTPUT_FORMAT_COLOR_DEPTH` encoding. No field of that name exists
+    /// anywhere in Linux's AMD tree, and no DCN depth field is encoded as
+    /// the bit count: writing 6/8/10/12/16 into one selects a different
+    /// depth or a reserved value. [`ColorDepth::code`] is the encoding.
     pub const fn bpc(self) -> u8 {
         match self {
             ColorDepth::Bpc6 => 6,
@@ -117,6 +131,20 @@ impl ColorDepth {
             ColorDepth::Bpc10 => 10,
             ColorDepth::Bpc12 => 12,
             ColorDepth::Bpc16 => 16,
+        }
+    }
+
+    /// `DP_COMPONENT_DEPTH` as `enum dp_component_depth` encodes it —
+    /// `DP_COMPONENT_PIXEL_DEPTH_6BPC` = 0 through `_16BPC` = 4, Linux
+    /// `display/dc/inc/hw/stream_encoder.h:47-53`. This is what
+    /// `dcn10_stream_encoder.c:321-343` writes.
+    pub const fn code(self) -> u32 {
+        match self {
+            ColorDepth::Bpc6 => 0,
+            ColorDepth::Bpc8 => 1,
+            ColorDepth::Bpc10 => 2,
+            ColorDepth::Bpc12 => 3,
+            ColorDepth::Bpc16 => 4,
         }
     }
 }
@@ -396,9 +424,26 @@ pub fn diff_state(old: &DcState, new: &DcState) -> Vec<PipelineAction> {
                         });
                     }
                 }
-                // Plane composition changed (count or non-prim
-                // delta) → MPC reprogram.
-                if old_s.planes.len() != new_s.planes.len() {
+                // Plane composition changed → MPC reprogram. This only
+                // compared plane COUNTS, so a cursor that moved to another
+                // buffer, or a primary whose geometry or encoding changed,
+                // produced no action at all. Anything but a bare primary
+                // address delta — which the page flip above already
+                // carries — needs the tree reprogrammed.
+                let composition_changed = old_s.planes.len() != new_s.planes.len()
+                    || old_s
+                        .planes
+                        .iter()
+                        .zip(&new_s.planes)
+                        .any(|(old_p, new_p)| {
+                            let mut old_p = *old_p;
+                            if old_p.kind == PlaneKind::Primary && new_p.kind == PlaneKind::Primary
+                            {
+                                old_p.surface_phys = new_p.surface_phys;
+                            }
+                            old_p != *new_p
+                        });
+                if composition_changed {
                     actions.push(PipelineAction::PlanesChanged {
                         stream_idx: new_idx,
                     });
@@ -598,6 +643,88 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu", smoke_dc_diff_add_remove_flip);
+
+    /// The literals are `enum dp_component_depth` in Linux
+    /// `display/dc/inc/hw/stream_encoder.h:47-53`, not this module's values.
+    fn smoke_dc_color_depth_encoding_is_not_the_bit_count() -> TestResult {
+        for (depth, code, bpc) in [
+            (ColorDepth::Bpc6, 0, 6),
+            (ColorDepth::Bpc8, 1, 8),
+            (ColorDepth::Bpc10, 2, 10),
+            (ColorDepth::Bpc12, 3, 12),
+            (ColorDepth::Bpc16, 4, 16),
+        ] {
+            if depth.code() != code {
+                return TestResult::Fail("DP_COMPONENT_DEPTH is a 0..=4 selector");
+            }
+            if depth.bpc() != bpc {
+                return TestResult::Fail("bpc() is the wire bit count");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_dc_color_depth_encoding_is_not_the_bit_count
+    );
+
+    fn smoke_dc_diff_sees_a_cursor_move_and_not_a_bare_flip() -> TestResult {
+        let cursor = Plane {
+            kind: PlaneKind::Cursor,
+            surface_phys: 0x4000_0000,
+            stride_pixels: 64,
+            width: 64,
+            height: 64,
+            encoding: PixelEncoding::Rgb,
+            color_depth: ColorDepth::Bpc8,
+        };
+        let mut old = DcState::new(4);
+        let mut base = make_stream(0, 0, 0x1000_0000);
+        base.planes.push(cursor);
+        old.add_stream(base.clone()).expect("base");
+
+        // A bare primary address change is the page flip, not a reprogram.
+        let mut flipped = DcState::new(4);
+        let mut only_flipped = base.clone();
+        only_flipped.planes[0].surface_phys = 0x1500_0000;
+        flipped.add_stream(only_flipped).expect("flipped");
+        if diff_state(&old, &flipped)
+            .iter()
+            .any(|a| matches!(a, PipelineAction::PlanesChanged { .. }))
+        {
+            return TestResult::Fail("a bare primary flip is not a composition change");
+        }
+
+        // A cursor pointed at another buffer needs the tree reprogrammed, and
+        // comparing plane counts alone never saw it.
+        let mut moved = DcState::new(4);
+        let mut cursor_moved = base.clone();
+        cursor_moved.planes[1].surface_phys = 0x4100_0000;
+        moved.add_stream(cursor_moved).expect("cursor moved");
+        if !diff_state(&old, &moved)
+            .iter()
+            .any(|a| matches!(a, PipelineAction::PlanesChanged { .. }))
+        {
+            return TestResult::Fail("a cursor move is a composition change");
+        }
+
+        // So does a primary whose geometry changed under the same address.
+        let mut resized = DcState::new(4);
+        let mut restrided = base.clone();
+        restrided.planes[0].stride_pixels = 2048;
+        resized.add_stream(restrided).expect("restrided");
+        if !diff_state(&old, &resized)
+            .iter()
+            .any(|a| matches!(a, PipelineAction::PlanesChanged { .. }))
+        {
+            return TestResult::Fail("a stride change is a composition change");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu",
+        smoke_dc_diff_sees_a_cursor_move_and_not_a_bare_flip
+    );
 
     fn smoke_dc_diff_timing_change() -> TestResult {
         let mut old = DcState::new(4);

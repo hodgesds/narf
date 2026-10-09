@@ -54,6 +54,14 @@ const MAX_HPD: u8 = 6;
 /// `num_dig_link_enc` for DCN314, and its four tunnelling endpoints.
 pub const DIG_COUNT: u8 = 5;
 pub const DPIA_COUNT: u8 = 4;
+/// The DCN versions the DIG window below describes. `regDIG0_DIG_BE_EN_CNTL`
+/// moves 0x20b2→0x20bd on DCN 3.5 and the per-DIG stride goes 0x100→0x124
+/// (`regDIG1_DIG_BE_EN_CNTL` 0x21b2 against 0x21e1), so another generation
+/// needs its own pair, selected per version the way
+/// `amdgpu_platform::SURFACE_WINDOWS` does it. The ATOM tables this module
+/// parses are version-agnostic; only this register window is not.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 /// `DIG0_DIG_BE_EN_CNTL`, per-DIG stride 0x100, at DCN base index 2. Bit zero
 /// says the backend is already driving a link.
 const DIG_BE_EN_CNTL: u64 = 0x20b2;
@@ -394,7 +402,7 @@ pub unsafe fn transmitter_busy(
     let base = crate::amdgpu_psp_ring::bank(
         gpu,
         crate::amdgpu_discovery::HW_ID_DCN,
-        &[(3, 1, 4)],
+        DCN_VERSIONS,
         2,
         (DIG_BE_EN_CNTL + (DIG_COUNT as u64 - 1) * DIG_STRIDE) as u32,
     )

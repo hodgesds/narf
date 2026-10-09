@@ -12,15 +12,29 @@ use core::future::Future;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+/// The DCN versions this module drives. Unusually, every offset below is
+/// identical on DCN 3.5 at the same base index 1 — `DPSTREAMCLK_CNTL` 0x004a,
+/// `DTBCLK_P_CNTL` 0x0068, `DENTIST_DISPCLK_CNTL` 0x0064,
+/// `OTG_PIXEL_RATE_DIV` 0x006f, `DPPCLK0_DTO_PARAM` 0x0099 and
+/// `DPPCLK_DTO_CTRL` 0x00b6 all match — so this table is portable where the
+/// other DCN modules' are not.
+///
+/// The entry is still one, because the SEQUENCE is not portable: this follows
+/// `dcn314_dccg.c`, and DCN 3.5 has its own `dcn35_dccg.c` with different root
+/// clock gating and DTBCLK handling. Matching register ids are not a licence to
+/// drive another generation; check the sequencer before adding a row.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const DPSTREAMCLK_CNTL: u64 = 0x004a;
+const DTBCLK_P_CNTL: u64 = 0x0068;
 const DENTIST_DISPCLK_CNTL: u64 = 0x0064;
 const OTG_PIXEL_RATE_DIV: u64 = 0x006f;
 const DPPCLK0_DTO_PARAM: u64 = 0x0099;
 const DPPCLK_DTO_CTRL: u64 = 0x00b6;
 /// The highest DCCG register this module touches, for the bank bound.
 const LAST_REG: u32 = DPPCLK_DTO_CTRL as u32;
-/// Four DPP pipes, four OTGs and four DPIAs on DCN314 (`dcn314_resource.c`).
-const INSTANCES: u8 = 4;
+/// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
+const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 /// `dccg2_update_dpp_dto` always divides against a full 8-bit modulo.
 const DTO_MODULO: u32 = 0xff;
 
@@ -146,16 +160,38 @@ impl<I: Io> Engine<I> {
             (k1.code() | k2.code() << 1) << shift,
         )
     }
-    /// Route a DPIA's stream clock, or park it.
-    fn set_dp_stream_clock(&mut self, dpia: u8, source: StreamClock) -> Result<(), Error> {
-        if dpia >= INSTANCES {
+    /// Point one OTG's `DTBCLK_P` mux at DTBCLK0, or park it on DPREFCLK.
+    /// `dccg314_set_dtbclk_p_src`: the source select is 2 for DTBCLK0 — zero
+    /// selects DPREFCLK, so an enable alone routes the wrong clock. Three bits
+    /// per OTG, a two-bit select then the enable.
+    fn set_dtbclk_p_src(&mut self, otg: u8, source: StreamClock) -> Result<(), Error> {
+        if otg >= INSTANCES {
             return Err(Error::Invalid);
         }
+        let shift = otg as u32 * 3;
+        let value = match source {
+            StreamClock::Disabled => 0,
+            StreamClock::Dtbclk => 2 | 1 << 2,
+        };
+        self.update(DTBCLK_P_CNTL, 0x7 << shift, value << shift)
+    }
+    /// Route a DPIA's stream clock from one OTG's DTBCLK_P, or park it.
+    ///
+    /// `dccg314_set_dpstreamclk` does two things, in this order: it points the
+    /// OTG's `DTBCLK_P` mux at DTBCLK0, then selects that OTG as the DPIA's
+    /// stream-clock source. Without the first the mux stays on DPREFCLK and
+    /// the DPIA is clocked by whatever that happens to be; without the second
+    /// every DPIA takes OTG 0, so a stream on any other pipe runs at the wrong
+    /// pixel rate. Four bits per DPIA, a three-bit OTG select then the enable.
+    fn set_dp_stream_clock(&mut self, dpia: u8, otg: u8, source: StreamClock) -> Result<(), Error> {
+        if dpia >= INSTANCES || otg >= INSTANCES {
+            return Err(Error::Invalid);
+        }
+        self.set_dtbclk_p_src(otg, source)?;
         let shift = dpia as u32 * 4;
         let value = match source {
             StreamClock::Disabled => 0,
-            // Source select zero with the enable bit set takes DTBCLK.
-            StreamClock::Dtbclk => 1 << 3,
+            StreamClock::Dtbclk => otg as u32 | 1 << 3,
         };
         self.update(DPSTREAMCLK_CNTL, 0xf << shift, value << shift)
     }
@@ -184,7 +220,7 @@ impl Dccg {
     /// and must not let another client reprogram the same dividers.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
         let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 1, LAST_REG)
+            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 1, LAST_REG)
                 .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine {
             io: Mmio {
@@ -198,8 +234,13 @@ impl Dccg {
     pub fn set_pixel_rate_div(&mut self, otg: u8, k1: Divider, k2: Divider) -> Result<(), Error> {
         self.0.set_pixel_rate_div(otg, k1, k2)
     }
-    pub fn set_dp_stream_clock(&mut self, dpia: u8, source: StreamClock) -> Result<(), Error> {
-        self.0.set_dp_stream_clock(dpia, source)
+    pub fn set_dp_stream_clock(
+        &mut self,
+        dpia: u8,
+        otg: u8,
+        source: StreamClock,
+    ) -> Result<(), Error> {
+        self.0.set_dp_stream_clock(dpia, otg, source)
     }
     /// The DISPCLK divider DENTIST has applied, and the one requested.
     pub fn dispclk_dividers(&mut self) -> Result<(u32, u32), Error> {

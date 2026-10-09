@@ -469,8 +469,11 @@ fn smoke_amdgpu_gfx9_ring_init_executes_and_rptr_zero() -> TestResult {
         mmio.bar0_w32(w.addr as usize, w.value);
     }
 
-    // CP_RB0_BASE round-trip.
-    if mmio.bar0_r32(CP_RB0_BASE_REL as usize) != ring_phys as u32 {
+    // CP_RB0_BASE round-trip. The register holds the address SHIFTED RIGHT
+    // BY 8 (`rb_addr = ring->gpu_addr >> 8` in `gfx_v9_0_cp_gfx_resume`);
+    // this used to assert the raw address, agreeing with a builder that
+    // never applied the shift.
+    if mmio.bar0_r32(CP_RB0_BASE_REL as usize) != (ring_phys >> 8) as u32 {
         return TestResult::Fail("CP_RB0_BASE not committed");
     }
     if mmio.bar0_r32(CP_RB0_BASE_HI_REL as usize) != 0 {
@@ -810,84 +813,88 @@ kernel_test_in!(
 // Smoke 10: GFX11 ring-init register sequence (Phoenix) — golden trace
 // ─────────────────────────────────────────────────────────────────────
 
+/// The GFX11 bring-up sequence's ORDER, which the per-field test does not
+/// cover: the configuration has to be in place before the latch, the ring has
+/// to be declared active after its base, and the doorbell comes last.
+///
+/// This test used to assert a halt of `CP_GFX_CNTL` first and an unhalt last,
+/// framing the whole thing. `gfx_v11_0_cp_gfx_resume` does neither — halting
+/// the CP engines is `gfx_v11_0_cp_gfx_enable`, called separately around it —
+/// so the framing was invented, and asserting it kept a sequence that did not
+/// match Linux looking correct.
 fn smoke_amdgpu_gfx11_ring_init_sequence() -> TestResult {
-    use crate::amdgpu_gfx::{
-        build_gfx11_ring_init, CP_GFX_CNTL_HALT_ALL, CP_GFX_CNTL_REL, CP_RB0_BASE_HI_REL,
-        CP_RB0_BASE_REL, CP_RB0_WPTR_HI_REL, CP_RB0_WPTR_REL,
-    };
+    use crate::amdgpu_gfx::{build_gfx11_ring_init, GfxStep};
 
-    let gc_base: u32 = 0;
-    let ring_phys: u64 = 0x4_0000;
-    let ring_size_dw: u32 = 1024;
-    let seq = match build_gfx11_ring_init(gc_base, ring_phys, ring_size_dw, 4, 0x5000) {
+    const GC: u32 = 0;
+    // GC base window 1, distinct from window 0 so the pipe select is
+    // distinguishable from the rest of the sequence.
+    const GC1: u32 = 0x1_0000;
+    let seq = match build_gfx11_ring_init(GC, GC1, 0, 0x4_0000, 4096, 4, true, 0x5000, 0x6000) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("build_gfx11_ring_init failed"),
     };
-
     if seq.is_empty() {
         return TestResult::Fail("GFX11 sequence empty");
     }
 
-    // First write: CP_GFX_CNTL with HALT_ALL — distinct from GFX9's
-    // CP_ME_CNTL.
-    let w0 = seq.writes[0];
-    if w0.addr != gc_base + CP_GFX_CNTL_REL {
-        return TestResult::Fail("GFX11 first write is not CP_GFX_CNTL");
-    }
-    if w0.value != CP_GFX_CNTL_HALT_ALL {
-        return TestResult::Fail("GFX11 halt bits wrong");
-    }
+    let at = |dword: u32| seq.index_of_write(GC, dword);
+    let (
+        Some(vmid),
+        Some(pipe),
+        Some(cntl),
+        Some(rptr_hi),
+        Some(wptr_poll),
+        Some(base),
+        Some(active),
+        Some(doorbell),
+    ) = (
+        at(0x1df1),                      // CP_RB_VMID
+        seq.index_of_write(GC1, 0x0900), // GRBM_GFX_CNTL, base window 1
+        at(0x1de1),                      // CP_RB0_CNTL
+        at(0x1de4),                      // CP_RB0_RPTR_ADDR_HI
+        at(0x1e8b),                      // CP_RB_WPTR_POLL_ADDR_LO
+        at(0x1de0),                      // CP_RB0_BASE
+        at(0x1f40),                      // CP_RB_ACTIVE
+        at(0x1e8d),                      // CP_RB_DOORBELL_CONTROL
+    )
+    else {
+        return TestResult::Fail("a register the ordering depends on is never written");
+    };
 
-    // WPTR reset to 0.
-    let w1 = seq.writes[1];
-    let w2 = seq.writes[2];
-    if w1.addr != gc_base + CP_RB0_WPTR_REL || w1.value != 0 {
-        return TestResult::Fail("GFX11 CP_RB0_WPTR reset wrong");
+    // The pipe is selected before anything pipe-specific is programmed.
+    if !(vmid < pipe && pipe < cntl) {
+        return TestResult::Fail("the pipe must be selected before the ring is configured");
     }
-    if w2.addr != gc_base + CP_RB0_WPTR_HI_REL || w2.value != 0 {
-        return TestResult::Fail("GFX11 CP_RB0_WPTR_HI reset wrong");
-    }
-
-    // RING_BASE encodes ring_phys.
-    let base_lo = seq
-        .writes
+    // Both writeback addresses land before the second CNTL write latches them.
+    let latch = seq.steps[cntl + 1..]
         .iter()
-        .find(|w| w.addr == gc_base + CP_RB0_BASE_REL);
-    let base_hi = seq
-        .writes
-        .iter()
-        .find(|w| w.addr == gc_base + CP_RB0_BASE_HI_REL);
-    match (base_lo, base_hi) {
-        (Some(lo), Some(hi)) => {
-            if lo.value != ring_phys as u32 {
-                return TestResult::Fail("GFX11 CP_RB0_BASE lo wrong");
-            }
-            if hi.value != (ring_phys >> 32) as u32 {
-                return TestResult::Fail("GFX11 CP_RB0_BASE hi wrong");
-            }
-        }
-        _ => return TestResult::Fail("GFX11 base lo/hi missing"),
+        .position(|s| matches!(s, GfxStep::Write { addr, .. } if *addr == GC + (0x1de1 << 2)))
+        .map(|i| cntl + 1 + i);
+    let Some(latch) = latch else {
+        return TestResult::Fail("CP_RB0_CNTL is written twice");
+    };
+    if !(rptr_hi < latch && wptr_poll < latch) {
+        return TestResult::Fail("the writeback addresses must precede the latching CNTL write");
+    }
+    // The base follows the latch, and the ring is declared active after it.
+    if !(latch < base && base < active) {
+        return TestResult::Fail("CP_RB_ACTIVE must come after the ring base");
+    }
+    // The doorbell is last: it is what lets the host wake the engine, so
+    // nothing should be unconfigured when it is enabled.
+    if doorbell < active {
+        return TestResult::Fail("the doorbell should be enabled after the ring is active");
     }
 
-    // Final unhalt write = CP_GFX_CNTL = 0.
-    let last = seq.writes[seq.len() - 1];
-    if last.addr != gc_base + CP_GFX_CNTL_REL {
-        return TestResult::Fail("GFX11 last write is not CP_GFX_CNTL");
-    }
-    if last.value != 0 {
-        return TestResult::Fail("GFX11 unhalt value != 0");
-    }
-
-    // GFX11 must NOT touch the legacy CP_ME_CNTL register.
+    // GFX11 must not touch the legacy GFX9 halt register.
     use crate::amdgpu_gfx::CP_ME_CNTL_REL;
     if seq
-        .writes
+        .steps
         .iter()
-        .any(|w| w.addr == gc_base + CP_ME_CNTL_REL)
+        .any(|s| matches!(s, GfxStep::Write { addr, .. } if *addr == GC + CP_ME_CNTL_REL))
     {
         return TestResult::Fail("GFX11 sequence unexpectedly writes CP_ME_CNTL");
     }
-
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/e2e", smoke_amdgpu_gfx11_ring_init_sequence);
@@ -948,8 +955,8 @@ kernel_test_in!(
 #[allow(unused_assignments)]
 fn smoke_amdgpu_mes_startup_set_hw_resources() -> TestResult {
     use crate::amdgpu_mes::{
-        build_set_hw_resources, decode_api_header, MesApiOpcode, MesRing, MES_API_FRAME_DWORDS,
-        MES_API_TYPE_SCHEDULER,
+        build_set_hw_resources, decode_api_header, hw_rsrc_flags, MesApiOpcode, MesHwResources,
+        MesRing, MES_API_FRAME_DWORDS, MES_API_TYPE_SCHEDULER,
     };
 
     // Fake state machine: Reset → Configured → Ready.
@@ -963,7 +970,15 @@ fn smoke_amdgpu_mes_startup_set_hw_resources() -> TestResult {
 
     let mut ring = MesRing::new(0x10_0000, 8 * 1024, 0x80).expect("MES ring");
 
-    let pkt = build_set_hw_resources(0xFFFE, 0xFFFE, 0xFFFF_FFFE, 0x01, 0x01, true);
+    let pkt = build_set_hw_resources(&MesHwResources {
+        vmid_mask_mmhub: 0xFFFE,
+        vmid_mask_gfxhub: 0xFFFE,
+        compute_hqd_mask: [0xFFFF_FFFE, 0, 0, 0, 0, 0, 0, 0],
+        gfx_hqd_mask: [0x01, 0],
+        sdma_hqd_mask: [0x01, 0],
+        flags: hw_rsrc_flags::DEFAULTS,
+        ..MesHwResources::default()
+    });
     if pkt.len() != MES_API_FRAME_DWORDS {
         return TestResult::Fail("SET_HW_RSRC frame not padded");
     }

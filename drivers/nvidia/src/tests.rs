@@ -3743,20 +3743,27 @@ kernel_test_in!(
 
 fn smoke_pcie_recovery_callback_vote_table() -> TestResult {
     use crate::pcie_recovery::CardRecovery;
-    use narf_bus::pcie_recovery::{ErrorCallback, PciErrSeverity, PciErsResult};
+    use narf_bus::pcie_recovery::{ErrorCallback, PciChannelState, PciErrSeverity, PciErsResult};
     let r = CardRecovery::new(
         0,
         narf_bus::BusAddr::Pcie(narf_bus::addr::PcieAddr::new(0, 0, 0, 0)),
     );
-    // Correctable + NonFatal vote CanRecover; Fatal needs reset.
-    if r.error_detected(PciErrSeverity::Correctable) != PciErsResult::CanRecover {
-        return TestResult::Fail("Correctable must yield CanRecover");
+    // The channel state decides the vote, as in Linux's
+    // `pci_error_handlers::error_detected`: a working channel can
+    // recover in place, a frozen one needs the slot reset, and a
+    // permanently failed one gets disconnected whatever the severity.
+    if r.error_detected(PciErrSeverity::NonFatal, PciChannelState::Normal)
+        != PciErsResult::CanRecover
+    {
+        return TestResult::Fail("a normal channel must yield CanRecover");
     }
-    if r.error_detected(PciErrSeverity::NonFatal) != PciErsResult::CanRecover {
-        return TestResult::Fail("NonFatal must yield CanRecover");
+    if r.error_detected(PciErrSeverity::Fatal, PciChannelState::Frozen) != PciErsResult::NeedReset {
+        return TestResult::Fail("a frozen channel must yield NeedReset");
     }
-    if r.error_detected(PciErrSeverity::Fatal) != PciErsResult::NeedReset {
-        return TestResult::Fail("Fatal must yield NeedReset");
+    if r.error_detected(PciErrSeverity::Fatal, PciChannelState::PermFailure)
+        != PciErsResult::Disconnect
+    {
+        return TestResult::Fail("a permanently failed channel must yield Disconnect");
     }
     // Three calls observed via the counter.
     if r.error_detected_count

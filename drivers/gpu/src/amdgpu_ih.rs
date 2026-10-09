@@ -140,22 +140,110 @@ impl IhCookieHeader {
 // the bring-up arc cares about. Phoenix adds a few new clients
 // (MES, MMHUB1) but the ones below are stable across families.
 
-/// `SOC15_IH_CLIENTID_GRBM_CP` — GFX command processor.
-pub const CLIENT_ID_GFX: u8 = 0x05;
+// LINUX-GAP: three of the five client ids here were wrong, and `enum
+// soc15_ih_clientid` is a flat table with no gaps, so each wrong value named a
+// real but unrelated client. `CLIENT_ID_GFX` was 0x05, which is `ISP`;
+// `CLIENT_ID_DCN` was 0x06, which is `PCIE0` (and `VMC1`); `CLIENT_ID_VMC` was
+// 0x09, which is `SDMA1` — so it collided with the constant right above it and
+// a page fault would have demuxed as an SDMA completion. Every value below is
+// now quoted from `soc15_ih_clientid.h`.
+
+/// `SOC15_IH_CLIENTID_IH` — the interrupt handler's own errors.
+pub const CLIENT_ID_IH: u8 = 0x00;
+/// `SOC15_IH_CLIENTID_ATHUB`.
+pub const CLIENT_ID_ATHUB: u8 = 0x02;
 /// `SOC15_IH_CLIENTID_DCE` — Display Core Engine (DCN).
-pub const CLIENT_ID_DCN: u8 = 0x06;
+pub const CLIENT_ID_DCN: u8 = 0x04;
+/// `SOC15_IH_CLIENTID_RLC`.
+pub const CLIENT_ID_RLC: u8 = 0x07;
 /// `SOC15_IH_CLIENTID_SDMA0` — first SDMA instance.
 pub const CLIENT_ID_SDMA0: u8 = 0x08;
 /// `SOC15_IH_CLIENTID_SDMA1` — second SDMA instance (Renoir/Vega).
 pub const CLIENT_ID_SDMA1: u8 = 0x09;
+/// `SOC15_IH_CLIENTID_VCN` — aliased to `SOC15_IH_CLIENTID_UVD`.
+pub const CLIENT_ID_VCN: u8 = 0x10;
 /// `SOC15_IH_CLIENTID_VMC` — page faults from the memory controller.
-pub const CLIENT_ID_VMC: u8 = 0x09;
+pub const CLIENT_ID_VMC: u8 = 0x12;
+/// `SOC15_IH_CLIENTID_GRBM_CP` — GFX command processor.
+pub const CLIENT_ID_GFX: u8 = 0x14;
+/// `SOC15_IH_CLIENTID_UTCL2` — the L2 translation cache.
+pub const CLIENT_ID_UTCL2: u8 = 0x1B;
+/// `SOC15_IH_CLIENTID_MP0` — PSP.
+pub const CLIENT_ID_MP0: u8 = 0x1E;
+/// `SOC15_IH_CLIENTID_MP1` — SMU.
+pub const CLIENT_ID_MP1: u8 = 0x1F;
 
-/// DCN-side source id: VBlank rising-edge on a controller. Adds
-/// the controller index in the source-data field.
-pub const SOURCE_ID_DCN_VBLANK: u8 = 0x07;
-/// DCN-side source id: HPD (hot-plug detect) on a connector.
-pub const SOURCE_ID_DCN_HPD: u8 = 0x2A;
+// ── DCN source ids (`ivsrcid/dcn/irqsrcs_dcn_1_0.h`) ──────────────
+//
+// How a DCN cookie is demuxed, per `amdgpu_dm_irq_handler`: it calls
+// `dc_interrupt_to_irq_source(dc, entry->src_id, entry->src_data[0])`, so the
+// pair that identifies an event is (source id, src_data[0]). The second is the
+// "ext id"; `irq_service_dcn314.c::to_dal_irq_source_dcn314` is the table for
+// the part we target.
+
+/// DCN-side source id for pipe 0's vblank: `DCN_1_0__SRCID__DC_D1_OTG_VSTARTUP`
+/// = 0x3C, with the next five pipes at 0x3D..0x41. Use
+/// [`dcn_vblank_source_id`].
+///
+/// LINUX-GAP: this was one constant, 0x07, documented as taking "the controller
+/// index in the source-data field". Both halves were wrong. 0x07 is
+/// `DPDBG_FIFO_OVERFLOW_INT`, a DisplayPort debug FIFO overflow. And the pipe
+/// is in the SOURCE ID for vblank, not in src_data: `to_dal_irq_source_dcn314`
+/// maps `DC_D1..D6_OTG_VSTARTUP` to `DC_IRQ_SOURCE_VBLANK1..6` with ext_id
+/// unused. (The older `DC_Dn_VBLANK` ids 0x23/0x24/0x25 are what DCE-era
+/// services match; DCN 3.1.4 raises VSTARTUP instead, which is why its own
+/// service table lists those.)
+pub const SOURCE_ID_DCN_VBLANK_PIPE0: u8 = 0x3C;
+
+/// The vblank source id for `pipe`, which DCN 3.1.4 has four of.
+pub const fn dcn_vblank_source_id(pipe: u8) -> u8 {
+    SOURCE_ID_DCN_VBLANK_PIPE0 + pipe
+}
+
+/// DCN-side source id for every HPD event: `DCN_1_0__SRCID__DC_HPD1_INT` = 9.
+///
+/// All six connectors and both event kinds share this one source id —
+/// `irq_service_dcn314.c` calls it "generic src_id for all HPD and HPDRX
+/// interrupts" — so the connector and the kind come from `src_data[0]`; see
+/// [`HPD_CTXID_PLUG_PIPE0`] and [`HPD_CTXID_RX_PIPE0`].
+///
+/// LINUX-GAP: this was 0x2A, which is `DPP6_PERFCOUNTER_INT0_STATUS` — a
+/// display-pipe perfmon counter. Nothing would ever have reported a hotplug,
+/// and a perfmon counter would have been handled as one.
+pub const SOURCE_ID_DCN_HPD: u8 = 0x09;
+
+/// `DCN_1_0__CTXID__DC_HPD1_INT` = 0: plug/unplug on connector 1, with
+/// connectors 2..6 at 1..5.
+pub const HPD_CTXID_PLUG_PIPE0: u8 = 0;
+/// `DCN_1_0__CTXID__DC_HPD1_RX_INT` = 6: the DisplayPort sink-IRQ short pulse
+/// on connector 1, with connectors 2..6 at 7..11.
+///
+/// A different event from a plug: it means the sink raised `IRQ_VECTOR` in its
+/// DPCD and wants servicing, not that a cable moved.
+pub const HPD_CTXID_RX_PIPE0: u8 = 6;
+/// How many connectors the HPD context-id space covers.
+pub const HPD_CONNECTORS: u8 = 6;
+
+/// What an HPD cookie's `src_data[0]` means.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HpdEvent {
+    /// A plug or unplug on this connector index.
+    Plug(u8),
+    /// A DisplayPort sink IRQ (short pulse) on this connector index.
+    SinkIrq(u8),
+}
+
+/// Decode an HPD cookie's context id. `None` for a value outside 0..=11, which
+/// `to_dal_irq_source_dcn314` returns `DC_IRQ_SOURCE_INVALID` for.
+pub const fn decode_hpd_ctxid(ctxid: u8) -> Option<HpdEvent> {
+    if ctxid < HPD_CTXID_RX_PIPE0 {
+        Some(HpdEvent::Plug(ctxid - HPD_CTXID_PLUG_PIPE0))
+    } else if ctxid < HPD_CTXID_RX_PIPE0 + HPD_CONNECTORS {
+        Some(HpdEvent::SinkIrq(ctxid - HPD_CTXID_RX_PIPE0))
+    } else {
+        None
+    }
+}
 
 // ── Sequence shape ─────────────────────────────────────────────────
 

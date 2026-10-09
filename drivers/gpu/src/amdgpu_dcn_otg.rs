@@ -14,6 +14,18 @@ use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // OTG instance block, stride 0x80.
+/// The DCN versions these offsets describe. One entry, and widening it is not
+/// the way to add a display generation: nine of the twenty-three registers
+/// below move on DCN 3.5 (`dcn_3_5_0_offset.h`) — `OTG_V_BLANK_START_END`
+/// 0x1b36→0x1b38, `OTG_V_SYNC_A` 0x1b37→0x1b39, `OTG_V_SYNC_A_CNTL`
+/// 0x1b38→0x1b3a, `OTG_CONTROL` 0x1b41→0x1b43, `OTG_CLOCK_CONTROL`
+/// 0x1b85→0x1b84, `OTG_VSTARTUP_PARAM`, `OTG_VUPDATE_PARAM` and
+/// `OTG_VREADY_PARAM` each down one, and `VTG0_CONTROL` 0x052d→0x0537.
+/// Another generation needs its own offset table, selected per version the way
+/// `amdgpu_platform::SURFACE_WINDOWS` does it; `amdgpu_dcn` already carries the
+/// DCN 3.5 OTG ids for the modeset scaffold.
+const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+
 const OTG_H_TOTAL: u64 = 0x1b2a;
 const OTG_H_BLANK_START_END: u64 = 0x1b2b;
 const OTG_H_SYNC_A: u64 = 0x1b2c;
@@ -40,7 +52,8 @@ const ODM_STRIDE: u64 = 0x10;
 const VTG_CONTROL: u64 = 0x052d;
 /// The highest register this module touches, for the bank bound.
 const LAST_REG: u32 = (OTG_VREADY_PARAM + 3 * OTG_STRIDE) as u32;
-const INSTANCES: u8 = 4;
+/// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
+const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 
 /// Totals, blank and sync positions are 15-bit; VSTARTUP is 10-bit and the
 /// VUPDATE width 10-bit. Programming a mode whose counts do not fit is refused.
@@ -50,6 +63,18 @@ const VUPDATE_WIDTH_BITS: u32 = 10;
 const OFFSET_BITS: u32 = 16;
 /// `OPTC_SEG*_SRC_SEL` parks a segment with all ones.
 const SEGMENT_PARKED: u32 = 0xf;
+/// `ODM0_OPTC_WIDTH_CONTROL__OPTC_SEGMENT_WIDTH_MASK` is 0x00001FFF, so one
+/// OPP segment carries at most 8191 active pixels.
+///
+/// This is the binding limit on a mode's width for this path, and it is
+/// narrower than the timing counters: `optc1_validate_timing` bounds h_total
+/// and v_total at `OTG_H_TOTAL`'s mask plus one, which [`COUNT_BITS`] already
+/// enforces at 32768. The segment is the tighter constraint because
+/// `optc1_set_odm_bypass` puts the whole active width into ONE segment —
+/// splitting a wider mode needs ODM combine, which this pipeline does not do.
+const SEGMENT_WIDTH_BITS: u32 = 13;
+/// The widest active region one OPP segment can carry, inclusive.
+pub const MAX_SEGMENT_WIDTH: u32 = (1 << SEGMENT_WIDTH_BITS) - 1;
 
 /// The global sync positions the detile buffer needs, in pixels and lines. These
 /// come from the mode math, not from the timing.
@@ -216,7 +241,7 @@ impl<I: Io> Engine<I> {
         self.update(
             self.odm(OPTC_WIDTH_CONTROL),
             0x1fff,
-            fits(timing.h_active, 13)?,
+            fits(timing.h_active, SEGMENT_WIDTH_BITS)?,
         )?;
         self.state = State::Programmed;
         Ok(())
@@ -312,7 +337,7 @@ impl Otg {
             return Err(Error::Invalid);
         }
         let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, LAST_REG)
+            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 2, LAST_REG)
                 .map_err(|_| Error::Unsupported)?;
         Ok(Self(Engine {
             io: Mmio {

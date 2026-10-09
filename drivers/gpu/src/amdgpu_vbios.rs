@@ -78,7 +78,18 @@ impl Vbios {
         if offset < VFCT_HEADER || offset >= end || end > length {
             return Err(Error::InvalidTable);
         }
-        let mut selected = None;
+        // `amdgpu_acpi_vfct_match`: vendor, device, slot and function must
+        // match; the bus number is a **preference**, not a requirement.
+        // "VFCT entries contain the PCI bus number as recorded during BIOS
+        // POST. On systems where the kernel renumbers PCI buses (e.g.
+        // pci=realloc or resource conflicts), the runtime bus number may
+        // differ from the POST value."
+        //
+        // LINUX-GAP: this used to require an exact bus match, so on a machine
+        // that renumbers buses no image matched and the VFCT path reported
+        // NotFound — falling through to the VRAM shadow, or to nothing.
+        let mut exact = None;
+        let mut by_identity = None;
         while offset < end {
             let header_end = offset
                 .checked_add(IMAGE_HEADER)
@@ -92,22 +103,28 @@ impl Vbios {
             if next > end {
                 return Err(Error::InvalidTable);
             }
-            if size != 0
-                && u32_at(header, 0) == addr.bus as u32
+            let identity = size != 0
                 && u32_at(header, 4) == addr.device as u32
                 && u32_at(header, 8) == addr.function as u32
                 && u16_at(header, 12) == device.id.vendor
                 && u16_at(header, 14) == device.id.device
                 && subsystem_matches(u16_at(header, 16), device.id.subsystem_vendor)
-                && subsystem_matches(u16_at(header, 18), device.id.subsystem_id)
-            {
-                if selected.is_some() {
+                && subsystem_matches(u16_at(header, 18), device.id.subsystem_id);
+            if identity {
+                let slot = if u32_at(header, 0) == addr.bus as u32 {
+                    &mut exact
+                } else {
+                    &mut by_identity
+                };
+                if slot.is_some() {
                     return Err(Error::Ambiguous);
                 }
-                selected = Some(header_end..next);
+                *slot = Some(header_end..next);
             }
             offset = next;
         }
+        // An exact bus match wins; otherwise accept a unique identity match.
+        let selected = exact.or(by_identity);
         let image = &table[selected.ok_or(Error::NotFound)?];
         validate(image, device, false)?;
         let mut bytes = Vec::new();

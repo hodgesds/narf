@@ -50,11 +50,15 @@ use crate::amdgpu::Family;
 /// are in the BAR5 register-window byte address space.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FamilyOffsets {
-    /// MP0 (PSP) register block base. Used by the PSP firmware-
-    /// load handshake (`MP0_C2PMSG_64/_67/_69` are at
-    /// `mp0_base + 0x29C + N*4`).
-    /// Source: AMD PPR §"Microcontroller Firmware Loading", per
-    /// SoC.
+    /// MP0 (PSP) register block base. `MP0_C2PMSG_N` is at
+    /// `mp0_base + 0x100 + N * 4` — `regMP0_SMN_C2PMSG_0` is dword 0x0040 at
+    /// BASE_IDX 1 (`mp_13_0_4_offset.h`); see
+    /// [`crate::amdgpu_psp::MP0_C2PMSG_REL`].
+    ///
+    /// LINUX-GAP: this said 0x29C, matching the base `amdgpu_psp` carried
+    /// before it was corrected against the header. The registers it named
+    /// (`_64`/`_67`/`_69`) were also the invented image-load trio rather than
+    /// the mailbox's real slots.
     pub mp0_base: Option<u32>,
     /// DCN HUBP (Hub Pixel Pipe) block base — primary surface
     /// address / pitch / blanking control registers.

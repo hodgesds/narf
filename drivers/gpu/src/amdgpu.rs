@@ -86,12 +86,33 @@ use crate::amdgpu_discovery::{self, IpBlock};
 /// Advanced Micro Devices, Inc. (PCI Special Interest Group ID).
 pub const AMD_VENDOR: u16 = 0x1002;
 
-/// Phoenix HawkPoint1 — the user's Ryzen 7 PRO 8840HS iGPU.
+// The APU device ids below are checked against the PCI SIG id database
+// (`/usr/share/hwdata/pci.ids`, vendor 1002), not against amdgpu — modern
+// amdgpu matches APUs by IP-discovery version and carries no id table for
+// them, so a wrong constant here cannot be caught by reading the driver.
+//
+// Three of these were wrong and each sent a real machine down a path built
+// for different silicon; the comments record what they were.
+
+/// Phoenix HawkPoint1 (Ryzen 8040 series iGPU). GFX 11.0.1.
 pub const PHOENIX_HAWKPOINT1: u16 = 0x1900;
-/// Phoenix discrete sibling.
-pub const PHOENIX_DISCRETE: u16 = 0x1681;
-/// Strix Point.
-pub const STRIX_POINT: u16 = 0x15BF;
+/// Phoenix1 — **Radeon 780M**, Ryzen 7040 series. GFX 11.0.1, DCN 3.1.4.
+///
+/// Was labelled `STRIX_POINT` and mapped to the Strix firmware bundle. Strix
+/// is 0x150E; 0x15BF is Phoenix, so every 780M laptop asked the PSP for
+/// `psp_14_0_4_toc.bin` and failed firmware open before reaching DCN.
+pub const PHOENIX1: u16 = 0x15BF;
+/// Phoenix2 — the cut-down Phoenix die (Ryzen 7x40U low end). Same IP set.
+pub const PHOENIX2: u16 = 0x15C8;
+/// Strix Point (Radeon 880M / 890M). GFX **11.5.0**, DCN **3.5**,
+/// PSP 14.0.1 — a different IP stack from Phoenix, not a Phoenix variant.
+pub const STRIX_POINT: u16 = 0x150E;
+/// Rembrandt (Radeon 680M, Ryzen 6000 series). GFX **10.3.6**, DCN 3.1.2 —
+/// RDNA2, one whole architecture before Phoenix.
+///
+/// Was labelled `PHOENIX_DISCRETE` and mapped to the Phoenix family and
+/// firmware. It is neither discrete nor Phoenix.
+pub const REMBRANDT: u16 = 0x1681;
 /// Raphael.
 pub const RAPHAEL: u16 = 0x164E;
 /// Lucienne — Renoir refresh / low-cost variant (Ryzen 5000U some
@@ -144,41 +165,69 @@ const BAR_REGS: u8 = 5;
 
 /// `MM_INDEX` — register-window address latch. Write a 32-bit
 /// register-bus address here, then access `MM_DATA`.
+/// `mmRCC_CONFIG_MEMSIZE` — the VRAM size in MiB, as an ABSOLUTE dword
+/// address with no IP base.
+///
+/// `amdgpu_discovery.c:142` defines it alongside `mmIP_DISCOVERY_VERSION` and
+/// `mmMP0_SMN_C2PMSG_33` under the comment "Note: These registers are
+/// consistent across all the SOCs" — they are the handful that must be
+/// readable before the discovery blob has been parsed and so before any IP
+/// base exists.
+pub(crate) const RCC_CONFIG_MEMSIZE: u32 = 0x0de3;
+
 const MM_INDEX: u64 = 0x0000;
 /// `MM_DATA` — register-window data port.
 const MM_DATA: u64 = 0x0004;
 
-/// MC (Memory Controller) framebuffer-location registers in the
-/// register-bus address space. Read through MM_INDEX/MM_DATA to
-/// learn the visible-VRAM phys range. Same offsets across Vega +
-/// Navi families per the public AMD MC IP block docs.
-const MC_VM_FB_LOCATION_BASE: u32 = 0x0000_6B0F;
-const MC_VM_FB_LOCATION_TOP: u32 = 0x0000_6B10;
+// Pre-discovery VRAM sizing. This is the most load-bearing read in the
+// driver: `vram.size` locates the IP-discovery blob at
+// `vram.size - DISCOVERY_TMR_OFFSET`, and every IP base — the firmware load,
+// the DCN bring-up, the SMU handshake — comes out of that blob.
+//
+// It used to read framebuffer-location registers, and got three things wrong
+// in sequence. First a duplicate pair at 0x6B0F / 0x6B10, which appear in no
+// AMD header for any `MC_VM_FB_LOCATION_BASE` variant. Then the right ids for
+// the family — GFX9's `mmMC_VM_FB_LOCATION_BASE` 0x0980 and GFX11's
+// `regGCMC_VM_FB_LOCATION_BASE` 0x1678, which are different registers rather
+// than one register at two offsets (`gfxhub_v1_0.c` against `gfxhub_v3_0.c`) —
+// but still with no IP base added, because there was none to add: resolving a
+// base needs the discovery blob this read is trying to locate.
+//
+// That circularity was recorded as the remaining gap, and this is its answer.
+// Linux does not break the cycle, it avoids it: `amdgpu_discovery.c:142`
+// defines `mmRCC_CONFIG_MEMSIZE` as the absolute dword 0xde3, under the
+// comment "Note: These registers are consistent across all the SOCs", and
+// reads the VRAM size in MiB from it with a bare `RREG32` at line 312. The
+// aperture BASE is not a register read at all — `gmc_v11_0_mc_init` takes
+// `pci_resource_start(adev->pdev, 0)`, BAR0's physical address.
+//
+// So `read_vram_info` needs no IP base and the FB-location registers are not
+// part of this path. They remain correct in `amdgpu_gmc` for the
+// post-discovery aperture reads that can address them properly.
 
 // ── PSP (Platform Security Processor) MP0 mailbox protocol ────────
 //
-// Firmware-load handshake per AMD public PSP-protocol docs:
+// LINUX-GAP: a firmware-load handshake was described here —
 //
-//   MP0_C2PMSG_64 = phys lo  (image base, low 32 bits)
-//   MP0_C2PMSG_67 = phys hi  (image base, high 32 bits)
-//   MP0_C2PMSG_69 = (CMD_LOAD_TA = 5) | (image_size << 8)
-//   poll MP0_C2PMSG_64 — bit31 set → done; bits[30:0] = status code.
-//   status == 0 → success.
+//   MP0_C2PMSG_64 = phys lo, _67 = phys hi,
+//   MP0_C2PMSG_69 = cmd | (image_size << 8), poll _64 for bit 31
 //
-// All three message slots are register-bus addresses computed
-// against the per-family `Family::mp0_base()` offset.
+// — "per AMD public PSP-protocol docs". It appears in no `psp_v*.c`; see the
+// gap note on `amdgpu_psp::send_command`. The real mailbox loads a bootloader
+// component through C2PMSG_36/_35 and creates a ring through C2PMSG_69..71 and
+// _64; IP firmware travels in the GPCOM ring that `amdgpu_psp_ring` builds.
 //
-// `MP0_C2PMSG_N = mp0_base + 0x29C + N*4`. The 0x29C offset is
-// constant; only the `mp0_base` shifts per family.
+// `MP0_C2PMSG_N` is at `mp0_base + 0x100 + N * 4` —
+// `regMP0_SMN_C2PMSG_0` is dword 0x0040 at BASE_IDX 1. The stale `0x29C` that
+// stood here is corrected in `amdgpu_psp::MP0_C2PMSG_REL`; only `mp0_base`
+// shifts per family.
 
 // PSP MP0 register / command / status constants live in
 // `amdgpu_psp` (canonically named LOAD_IP_FW for the value 0x05
 // that pre-relicense scaffold mislabelled LOAD_TA). Re-export
 // the names load_firmware uses inline below.
 use crate::amdgpu_psp::{
-    MP0_C2PMSG_64_REL, MP0_C2PMSG_67_REL, MP0_C2PMSG_69_REL, PSP_CMD_AUTOLOAD_RLC,
-    PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC, PSP_STATUS_CODE_MASK,
-    PSP_STATUS_DONE_BIT,
+    PSP_CMD_AUTOLOAD_RLC, PSP_CMD_LOAD_ASD, PSP_CMD_LOAD_IP_FW, PSP_CMD_LOAD_TA, PSP_CMD_LOAD_TOC,
 };
 
 // ── Chip-info table ────────────────────────────────────────────────
@@ -314,6 +363,11 @@ impl FwEntry {
     /// SMU PMFW via MP1 mailbox (Phoenix-class). The `cmd` field
     /// here is the SMU sentinel, NOT a PSP cmd id — the dispatch
     /// loop routes accordingly.
+    // Unused while the only audited families are APUs, whose PMFW is
+    // BIOS-resident. Kept because a discrete bring-up needs it and because
+    // deleting it would invite the next table to reach for `ip_fw` instead,
+    // which loads at a different point in the PSP sequence.
+    #[allow(dead_code)]
     const fn smu_pmfw(name: &'static str) -> Self {
         Self {
             name,
@@ -338,41 +392,87 @@ impl FwEntry {
 // (gfx11+; gfx9 APU SMU lives in BIOS) → IP firmwares (SDMA →
 // CP → MES → RLC → IMU → VCN → DMCUB) → TAs.
 
-/// Phoenix / Phoenix2 / HawkPoint — GFX 11.5 + DCN 3.5 +
-/// PSP 14.0.1 + SDMA 6.1 + VCN 4.0.5 + SMU 14.0.1.
+/// Phoenix1 / Phoenix2 / HawkPoint — GFX **11.0.1**, DCN **3.1.4**,
+/// PSP **13.0.4**, SDMA 6.0.1, VCN 4.0.2.
+///
+/// Every name here is the one Linux declares for this IP set:
+/// `psp_v13_0_4.c`, `imu_v11_0.c`, `gfx_v11_0.c`, `mes_v11_0.c`,
+/// `sdma_v6_0.c`, `amdgpu_vcn.c` (`FIRMWARE_VCN4_0_2`) and
+/// `amdgpu_dm_dmub.h` (`FIRMWARE_DCN_314_DMUB`).
+///
+/// This table previously held the **Strix** bundle — GFX 11.5, DCN 3.5,
+/// PSP 14.0.1 — under a doc comment that said so. Phoenix is RDNA3 and
+/// Strix is RDNA3.5; they share no firmware file.
+///
+/// There is deliberately **no SMU entry**. Phoenix is an APU and its PMFW
+/// is BIOS-resident, loaded by the PSP — exactly as `RENOIR_FW` notes for
+/// GFX9 APUs. linux-firmware ships `smu_*.bin` only for discrete parts
+/// (13_0_0, 13_0_6, 13_0_7, 13_0_10, 13_0_14, 14_0_2, 14_0_3); neither
+/// `smu_13_0_4.bin` nor `smu_14_0_1.bin` exists anywhere, so the entry this
+/// table used to carry could never have opened.
+/// The ORDER is Linux's, and it is a hardware contract rather than a
+/// preference. `psp_load_non_psp_fw` walks `adev->firmware.ucode[]`, which is
+/// indexed by `enum AMDGPU_UCODE_ID`, so the enum's order IS the load order:
+/// SDMA, then the CP engines (PFP, ME, MEC), then MES, then IMU, then RLC,
+/// and only then the non-graphics blobs (VCN, DMCUB).
+///
+/// This table was in a different order — IMU first, SDMA near the end, RLC
+/// before MES — which is one more variable between here and a GPU that comes
+/// up. The PSP processes each load against state the previous ones left.
 static PHOENIX_FW: &[FwEntry] = &[
+    FwEntry::toc("amdgpu/psp_13_0_4_toc.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_0_1.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_pfp.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_me.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_mec.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_mes.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_mes_2.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_mes1.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_imu.bin"),
+    // RLC last of the graphics firmwares: the PSP's autoload state machine
+    // starts the moment this one lands, and it expects every other graphics
+    // blob to have been received already.
+    FwEntry::ip_fw("amdgpu/gc_11_0_1_rlc.bin"),
+    FwEntry::ip_fw("amdgpu/vcn_4_0_2.bin"),
+    FwEntry::ip_fw("amdgpu/dcn_3_1_4_dmcub.bin"),
+    FwEntry::ta("amdgpu/psp_13_0_4_ta.bin"),
+];
+
+/// Whether `name` is the RLC blob, which is what triggers the PSP's autoload.
+///
+/// Matched by name because `FwEntry` carries no ucode id — the names are
+/// Linux's own `MODULE_FIRMWARE` strings and a `_rlc.bin` suffix identifies
+/// the blob across every family in this file.
+fn is_rlc_blob(name: &str) -> bool {
+    name.ends_with("_rlc.bin")
+}
+
+/// Strix Point — GFX **11.5.0**, DCN **3.5**, PSP **14.0.1**, SDMA 6.1.0,
+/// VCN 4.0.5. This is the bundle that used to sit in `PHOENIX_FW`.
+///
+/// No SMU entry, for the same reason Phoenix has none: Strix is an APU and
+/// `smu_14_0_1.bin` does not exist in linux-firmware.
+///
+/// Reaching this table does not mean Strix is supported — see the mapping,
+/// which routes Strix to `UNAUDITED_FW`. Its DCN 3.5 display path, SMU 14
+/// interface and GFX 11.5 differences have had no bring-up. The table is
+/// kept correct so that work starts from facts rather than from this file.
+// Unused: the mapping routes Strix to `UNAUDITED_FW` until it has a real
+// bring-up. Kept correct so that work does not start by re-deriving it.
+#[allow(dead_code)]
+static STRIX_FW: &[FwEntry] = &[
     FwEntry::toc("amdgpu/psp_14_0_1_toc.bin"),
-    FwEntry::smu_pmfw("amdgpu/smu_14_0_1.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
+    FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_mec.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_mes_2.bin"),
     FwEntry::ip_fw("amdgpu/gc_11_5_0_mes1.bin"),
-    FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
+    FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
     FwEntry::ip_fw("amdgpu/vcn_4_0_5.bin"),
     FwEntry::ip_fw("amdgpu/dcn_3_5_dmcub.bin"),
     FwEntry::ta("amdgpu/psp_14_0_1_ta.bin"),
-];
-
-/// Strix Point — GFX 11.5 same gc_11_5_0_* but with strix-suffixed
-/// PSP/SMU/DCN per Linux's `cfg/ip_versions.c`. Currently treated
-/// as Phoenix-equivalent until we have a real Strix bring-up.
-static STRIX_FW: &[FwEntry] = &[
-    FwEntry::toc("amdgpu/psp_14_0_4_toc.bin"),
-    FwEntry::smu_pmfw("amdgpu/smu_14_0_4.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_imu.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_pfp.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_me.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_mec.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_rlc.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_mes_2.bin"),
-    FwEntry::ip_fw("amdgpu/gc_11_5_0_mes1.bin"),
-    FwEntry::ip_fw("amdgpu/sdma_6_1_0.bin"),
-    FwEntry::ip_fw("amdgpu/vcn_4_0_5.bin"),
-    FwEntry::ip_fw("amdgpu/dcn_3_5_dmcub.bin"),
-    FwEntry::ta("amdgpu/psp_14_0_4_ta.bin"),
 ];
 
 /// Renoir — GFX9, DCN 2.0, PSP 12.0. APU; SMU PMFW is BIOS-
@@ -414,17 +514,51 @@ static GREEN_SARDINE_FW: &[FwEntry] = &[
 /// the pre-multi-IP behaviour for those chips.
 static UNAUDITED_FW: &[FwEntry] = &[];
 
+/// Test hook for [`chip_info_for_pci_id`] — the id-to-firmware mapping is
+/// the one thing here that cannot be checked by reading amdgpu, so it is
+/// checked against `pci.ids` and `MODULE_FIRMWARE` by a kernel test instead.
+#[doc(hidden)]
+pub fn __test_chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
+    chip_info_for_pci_id(vid, did)
+}
+
 /// Look up family + asic + firmware name for a known PCI ID.
 fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
     if vid != AMD_VENDOR {
         return None;
     }
     let (family, asic, fw_name, fw_list) = match did {
-        // Phoenix / HawkPoint / Strix all carry RDNA3.5 iGPU →
-        // DCN 3.5 display IP; they take the DCN 3.5 modeset path.
-        PHOENIX_HAWKPOINT1 => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
-        PHOENIX_DISCRETE => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
-        STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", STRIX_FW),
+        // Phoenix1 / Phoenix2 / HawkPoint are RDNA3: GFX 11.0.1 with
+        // **DCN 3.1.4**. The comment that used to stand here said all three
+        // of these plus Strix "carry RDNA3.5 iGPU → DCN 3.5", which is the
+        // error the firmware tables were built on. Strix is RDNA3.5; these
+        // are not, and the live display path (`amdgpu_platform::start` →
+        // DCN314) has always agreed with that.
+        PHOENIX_HAWKPOINT1 => (
+            Family::Phoenix,
+            "hawkpoint",
+            "amdgpu/phoenix.bin",
+            PHOENIX_FW,
+        ),
+        PHOENIX1 => (Family::Phoenix, "phoenix", "amdgpu/phoenix.bin", PHOENIX_FW),
+        PHOENIX2 => (
+            Family::Phoenix,
+            "phoenix2",
+            "amdgpu/phoenix.bin",
+            PHOENIX_FW,
+        ),
+        // Strix is a different IP stack (GFX 11.5 / DCN 3.5 / PSP 14.0.1)
+        // and has had no bring-up. Claiming it by handing it the Phoenix
+        // family would put DCN 3.1.4 register sequences on DCN 3.5 silicon.
+        STRIX_POINT => (Family::Phoenix, "strix", "amdgpu/strix.bin", UNAUDITED_FW),
+        // Rembrandt is RDNA2 (GFX 10.3.6 / DCN 3.1.2) — not Phoenix, and
+        // not a generation this driver has any path for.
+        REMBRANDT => (
+            Family::Navi2,
+            "rembrandt",
+            "amdgpu/rembrandt.bin",
+            UNAUDITED_FW,
+        ),
         RAPHAEL => (Family::Navi3, "raphael", "amdgpu/raphael.bin", UNAUDITED_FW),
         CEZANNE => (
             Family::Renoir,
@@ -484,7 +618,8 @@ pub enum AmdgpuError {
 
 // ── Driver state ───────────────────────────────────────────────────
 
-/// VRAM aperture parameters read from MC_VM_FB_LOCATION_BASE/TOP.
+/// The CPU-visible VRAM carve-out: BAR0's base and the size
+/// `RCC_CONFIG_MEMSIZE` reports. See [`read_vram_info`].
 #[derive(Copy, Clone, Debug, Default)]
 pub struct VramInfo {
     /// Phys base of the visible VRAM aperture.
@@ -520,6 +655,14 @@ pub struct AmdGpu {
     /// garbage (typical on QEMU / older chips); callers fall
     /// back to the hardcoded `Family::mp0_base()` table.
     pub ip_blocks: Vec<IpBlock>,
+    /// Graphics-core topology from the same discovery binary's
+    /// `table_list[GC]`. `None` when the silicon publishes no GC table
+    /// (pre-discovery parts, and QEMU), or when it failed its checksum —
+    /// a wrong CU count is wrong shader code generation, so this fails
+    /// closed rather than defaulting.
+    ///
+    /// `AMDGPU_INFO_DEV_INFO` reports most of it to userspace verbatim.
+    pub gc_info: Option<crate::amdgpu_discovery::GcInfo>,
     /// Immutable platform VBIOS captured at probe, when available.
     pub vbios: Option<crate::amdgpu_vbios::Vbios>,
 }
@@ -580,15 +723,12 @@ impl AmdGpu {
             return Err(AmdgpuError::DeviceGone);
         }
 
-        // Read the VRAM aperture through MM_INDEX/MM_DATA. Both
-        // base and top live in the MC IP block at register-bus
-        // offsets 0x6B0F / 0x6B10. Each value is in 24-byte-shifted
-        // units (the MC's natural granularity); the visible
-        // aperture is `[base << 24, ((top + 1) << 24))`.
+        // Size the VRAM carve-out. This runs BEFORE discovery — the discovery
+        // blob lives at the top of this aperture — so it cannot use any
+        // register that needs an IP base.
         // SAFETY: identity-mapped MMIO; MM_INDEX/MM_DATA are a
         // sequential pair with no side effects beyond the access.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let vram = unsafe { read_vram_info(&regs) };
+        let vram = unsafe { read_vram_info(&regs, &fb_bar) };
 
         // Try to parse the on-die IP discovery table. Lives in
         // the top `DISCOVERY_TMR_OFFSET` bytes of the VRAM
@@ -601,7 +741,9 @@ impl AmdGpu {
         // SAFETY: BAR0 mapped, exclusive owner; the discovery
         // blob is read-only from the host side.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let ip_blocks = unsafe { read_ip_discovery(&fb_bar, &vram) };
+        // One read of the discovery blob answers both questions.
+        // SAFETY: as above.
+        let (ip_blocks, gc_info) = unsafe { read_discovery(&fb_bar, &vram) };
 
         Ok(Self {
             fb_bar,
@@ -610,6 +752,7 @@ impl AmdGpu {
             vram,
             mode: None,
             fw_loaded: false,
+            gc_info,
             ip_blocks,
             vbios: None,
         })
@@ -631,7 +774,31 @@ impl AmdGpu {
     /// discovery is empty (older silicon, QEMU) or the requested
     /// `(hw_id, instance)` isn't present.
     pub fn ip_block_base(&self, hw_id: u16, instance: u8) -> Option<u32> {
-        amdgpu_discovery::find_ip(&self.ip_blocks, hw_id, instance).map(|b| b.base_addrs[0])
+        self.ip_block_base_idx(hw_id, instance, 0)
+    }
+
+    /// An IP block's base address in window `base_idx`.
+    ///
+    /// A SOC15 register is addressed as `reg_offset[IP][inst][BASE_IDX] +
+    /// dword_id`, and `BASE_IDX` is a property of the REGISTER, not of the
+    /// block: within GC, `CP_RB0_BASE` is window 0 while `GRBM_GFX_INDEX`,
+    /// `CP_GFX_CNTL` and `GRBM_GFX_CNTL` are window 1, and the whole MP1
+    /// mailbox is window 1 on Phoenix.
+    ///
+    /// Everything here used `base_addrs[0]` unconditionally, so a window-1
+    /// register was addressed from window 0 — a different base entirely, so
+    /// the write landed on whatever register sits at that offset there. The
+    /// offsets were right and the window was not.
+    ///
+    /// `None` when the block was not discovered or declares fewer bases than
+    /// asked for: a caller must not silently fall back to window 0, which is
+    /// the behaviour being fixed.
+    pub fn ip_block_base_idx(&self, hw_id: u16, instance: u8, base_idx: usize) -> Option<u32> {
+        let block = amdgpu_discovery::find_ip(&self.ip_blocks, hw_id, instance)?;
+        if base_idx >= block.num_bases as usize {
+            return None;
+        }
+        block.base_addrs.get(base_idx).copied()
     }
 
     pub fn chip_info(&self) -> ChipInfo {
@@ -655,19 +822,30 @@ impl AmdGpu {
     /// Per-family GFX `mmGRBM_STATUS` byte offset within the GC IP
     /// block window. GFX9 (Renoir) and GFX11 (Phoenix) place the
     /// register at distinct offsets.
-    fn grbm_status_offset(&self) -> u32 {
+    /// This chip's GFX generation, for the per-generation register tables.
+    fn gfx_generation(&self) -> crate::amdgpu_gfx::GfxGeneration {
         match self.chip.family {
-            Family::Phoenix => crate::amdgpu_gfx::GRBM_STATUS_REL_GFX11,
-            _ => crate::amdgpu_gfx::GRBM_STATUS_REL_GFX9,
+            Family::Phoenix | Family::Navi3 => crate::amdgpu_gfx::GfxGeneration::Gfx11,
+            _ => crate::amdgpu_gfx::GfxGeneration::Gfx9,
         }
     }
 
-    /// Per-family GFX `mmCP_VERSION` byte offset.
-    fn cp_version_offset(&self) -> u32 {
-        match self.chip.family {
-            Family::Phoenix => crate::amdgpu_gfx::CP_VERSION_REL_GFX11,
-            _ => crate::amdgpu_gfx::CP_VERSION_REL_GFX9,
-        }
+    /// Resolve a `(byte offset, GC window)` register location to the dword
+    /// address MM_INDEX wants.
+    ///
+    /// Two conversions happen here and nowhere else. `amdgpu_gfx`'s `*_REL`
+    /// constants are BYTE offsets — that module's own callers reach registers
+    /// through a directly mapped window and scale with `<< 2` — while
+    /// [`mm_read`] and [`mm_write`] go through MM_INDEX, a DWORD port. And the
+    /// window comes from the register, so it indexes `base_addrs` rather than
+    /// defaulting to 0.
+    ///
+    /// `None` when discovery did not publish that window: a caller must not
+    /// fall back to window 0.
+    fn gc_reg(&self, location: (u32, usize)) -> Option<u32> {
+        let (rel, base_idx) = location;
+        let base = self.ip_block_base_idx(amdgpu_discovery::HW_ID_GC, 0, base_idx)?;
+        Some(base + mm_dword(rel))
     }
 
     /// Resolve the GC IP block base from discovery. None on
@@ -675,6 +853,12 @@ impl AmdGpu {
     /// land a GC entry.
     pub fn gc_base(&self) -> Option<u32> {
         self.ip_block_base(amdgpu_discovery::HW_ID_GC, 0)
+    }
+
+    /// GC base window 1 — where `GRBM_GFX_INDEX`, `CP_GFX_CNTL` and
+    /// `GRBM_GFX_CNTL` live. See [`AmdGpu::ip_block_base_idx`].
+    pub fn gc_base_1(&self) -> Option<u32> {
+        self.ip_block_base_idx(amdgpu_discovery::HW_ID_GC, 0, 1)
     }
 
     /// Read `mmGRBM_STATUS`. Returns None when the GC base isn't
@@ -685,29 +869,13 @@ impl AmdGpu {
     /// # Safety
     /// Caller owns BAR5 exclusively (MM_INDEX / MM_DATA latch).
     pub unsafe fn read_grbm_status(&self) -> Option<crate::amdgpu_gfx::GrbmStatus> {
-        let gc_base = self.gc_base()?;
-        let off = gc_base + self.grbm_status_offset();
+        let off = self.gc_reg(self.gfx_generation().grbm_status_rel())?;
         // SAFETY: caller-asserted BAR5 ownership; mm_read uses the
         // MM_INDEX/MM_DATA pair which is a r/w latch with no side
         // effect on the addressed register.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let raw = unsafe { mm_read(&self.regs, off) };
         Some(crate::amdgpu_gfx::GrbmStatus { raw })
-    }
-
-    /// Read `mmCP_VERSION`. None when GC base unresolvable. Real
-    /// silicon: a small non-zero value (CP microcode version,
-    /// e.g. 0x00BEEF12 once firmware loaded). Pre-firmware: any of
-    /// 0, the BIOS-loaded version, or sentinel 0xFFFF_FFFF — the
-    /// presence test in `bring_up` already filters sentinel.
-    ///
-    /// # Safety
-    /// Caller owns BAR5 exclusively.
-    pub unsafe fn read_cp_version(&self) -> Option<u32> {
-        let gc_base = self.gc_base()?;
-        let off = gc_base + self.cp_version_offset();
-        // SAFETY: same as `read_grbm_status`.
-        Some(unsafe { mm_read(&self.regs, off) })
     }
 
     /// Write `mmGRBM_GFX_INDEX` to target a specific SE/SH/instance
@@ -723,13 +891,78 @@ impl AmdGpu {
     /// SE/SH lanes leave the chip in a misconfigured indexing
     /// state until the next broadcast write.
     pub unsafe fn write_grbm_gfx_index(&self, value: u32) -> Option<()> {
-        let gc_base = self.gc_base()?;
-        let off = gc_base + crate::amdgpu_gfx::GRBM_GFX_INDEX_REL;
+        // `GRBM_GFX_INDEX` is **BASE_IDX 1**, so it is addressed from the GC
+        // block's second window — not `gc_base()`, which is window 0.
+        //
+        // LINUX-GAP: this used `gc_base()` and added `GRBM_GFX_INDEX_REL`
+        // directly. Two errors compounding: the wrong window, and a byte
+        // offset (0x2200 * 4) added to a dword base, so the write went to
+        // dword 0x8800 of window 0. `gc_base_1()` existed and nothing called
+        // it; `GC_BASE_IDX_1` named this register as one that needed it.
+        let off = self.gc_reg(self.gfx_generation().grbm_gfx_index_rel())?;
         // SAFETY: caller-asserted BAR5 ownership.
         unsafe {
             mm_write(&self.regs, off, value);
         }
         Some(())
+    }
+
+    /// Load the GFX CP's three firmware images and un-halt the engines.
+    ///
+    /// This is the glue `amdgpu_cp_fw` documented and did not have. Nothing
+    /// implemented `CpFwMmio` outside that module's test mock, and the IC
+    /// registers are all BASE_IDX 1 while `CP_STAT` is BASE_IDX 0, so neither
+    /// window was reachable from a caller holding one `gc_base`.
+    ///
+    /// `None` when discovery did not publish both GC windows — never a
+    /// fallback to window 0, which would address an unrelated register.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively (MM_INDEX / MM_DATA latch), and the three
+    /// GPU addresses must each name a 64 KiB-aligned, GPU-visible firmware
+    /// image that stays mapped for as long as the CP runs.
+    pub unsafe fn start_gfx_cp(
+        &self,
+        pfp_gpu_addr: u64,
+        me_gpu_addr: u64,
+        mec_gpu_addr: u64,
+    ) -> Option<Result<(), crate::amdgpu_cp_fw::CpFwError>> {
+        let idx0 = self.gc_base()?;
+        let idx1 = self.gc_base_1()?;
+        let generation = self.gfx_generation();
+        // SAFETY: caller-asserted BAR5 ownership, held for the adapter's whole
+        // lifetime — it borrows `self.regs` and never outlives this frame.
+        let mut mmio = CpRegsAdapter { regs: &self.regs };
+        Some(
+            crate::amdgpu_cp_fw::load_all_cp_fw(
+                &mut mmio,
+                idx1,
+                pfp_gpu_addr,
+                me_gpu_addr,
+                mec_gpu_addr,
+            )
+            .and_then(|()| crate::amdgpu_cp_fw::cp_enable(&mut mmio, generation, idx0, idx1)),
+        )
+    }
+
+    /// Apply a GFX11 ring-init sequence: perform its writes and its waits.
+    ///
+    /// [`crate::amdgpu_gfx::build_gfx11_ring_init`] returns a value rather
+    /// than touching hardware, so the whole sequence is inspectable without a
+    /// GPU. Nothing executed it. This does, through the same `CpFwMmio`
+    /// adapter the firmware load uses — which is where the sequence's **byte**
+    /// offsets become the dword addresses MM_INDEX wants.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively for the whole sequence: MM_INDEX is a
+    /// shared latch, and a concurrent reader between the index and the data
+    /// write lands on a different register.
+    pub unsafe fn apply_gfx11_sequence(&self, seq: &crate::amdgpu_gfx::Gfx11Sequence) {
+        // SAFETY: caller-asserted BAR5 ownership, held for the adapter's
+        // whole lifetime — it borrows `self.regs` and never outlives this
+        // frame.
+        let mut mmio = CpRegsAdapter { regs: &self.regs };
+        crate::amdgpu_gfx::apply_gfx11_sequence(&mut mmio, seq, &mut delay_us);
     }
 
     /// Read the full `ApertureLayout` (VRAM + system aperture)
@@ -739,31 +972,40 @@ impl AmdGpu {
     ///
     /// # Safety
     /// Caller owns BAR5 exclusively.
-    pub unsafe fn read_aperture_layout(&self) -> crate::amdgpu_gmc::ApertureLayout {
-        // VRAM: use the cached probe-time read so the wave doesn't
-        // re-bounce through MM_INDEX for the canonical answer.
-        // SAFETY: caller-asserted BAR5 ownership.
-        let sys_low_field = unsafe {
-            mm_read(
-                &self.regs,
+    pub unsafe fn read_aperture_layout(&self) -> Option<crate::amdgpu_gmc::ApertureLayout> {
+        // LINUX-GAP: this read GFX9's `mmMC_VM_SYSTEM_APERTURE_LOW_ADDR`
+        // (0x0985) on every family, with no IP base added. Two errors: Phoenix
+        // uses `regGCMC_VM_SYSTEM_APERTURE_LOW_ADDR` (0x167d), a different
+        // register — and both are SOC15 registers addressed as
+        // `reg_offset[GC][0][0] + dword_id`, so a bare id names something
+        // else. Unlike `read_vram_info` this runs after discovery, so the
+        // base is available; the function returns `None` rather than reading
+        // an unbased address when it is not.
+        let (low, high) = match self.gfx_generation() {
+            crate::amdgpu_gfx::GfxGeneration::Gfx11 => (
+                crate::amdgpu_gmc::GCMC_VM_SYSTEM_APERTURE_LOW_ADDR_GFX11,
+                crate::amdgpu_gmc::GCMC_VM_SYSTEM_APERTURE_HIGH_ADDR_GFX11,
+            ),
+            crate::amdgpu_gfx::GfxGeneration::Gfx9 => (
                 crate::amdgpu_gmc::MC_VM_SYSTEM_APERTURE_LOW_ADDR,
-            )
-        };
-        // SAFETY: same.
-        let sys_high_field = unsafe {
-            mm_read(
-                &self.regs,
                 crate::amdgpu_gmc::MC_VM_SYSTEM_APERTURE_HIGH_ADDR,
-            )
+            ),
         };
+        let base = self.ip_block_base(amdgpu_discovery::HW_ID_GC, 0)?;
+        // VRAM comes from the cached probe-time read; only the system
+        // aperture is re-read here.
+        // SAFETY: caller-asserted BAR5 ownership.
+        let sys_low_field = unsafe { mm_read(&self.regs, base + low) };
+        // SAFETY: same.
+        let sys_high_field = unsafe { mm_read(&self.regs, base + high) };
         let (sys_low, sys_high) =
             crate::amdgpu_gmc::decode_system_aperture(sys_low_field, sys_high_field);
-        crate::amdgpu_gmc::ApertureLayout {
+        Some(crate::amdgpu_gmc::ApertureLayout {
             vram_base: self.vram.base,
             vram_size: self.vram.size,
             system_low: sys_low,
             system_high: sys_high,
-        }
+        })
     }
     pub fn current_mode(&self) -> Option<Mode> {
         // If `set_mode` has run, return what it programmed.
@@ -779,70 +1021,100 @@ impl AmdGpu {
         unsafe { self.passive_mode() }
     }
 
-    /// Read the firmware-programmed scanout mode through the OTG
-    /// timing registers. Returns `None` when DCN isn't running
-    /// (HUBP_BLANK = 1) or when the timing registers read garbage.
+    /// Is a display connected on `connector`?
     ///
-    /// This relies on register offsets being identical across
-    /// Vega/Navi — the HUBP/OTG register-bus offsets are stable in
-    /// the public AMD docs even though MP0 (PSP) offsets shift
-    /// per family. When that assumption stops holding the function
-    /// returns `None` for the unsupported family.
+    /// Reads `DC_HPD_INT_STATUS.DC_HPD_SENSE_DELAYED`, the debounced sense
+    /// bit `dal_hw_hpd_get_value` returns in interrupt mode
+    /// (`gpio/hw_hpd.c:65-81`). This is the read `amdgpu_hpd` needs for
+    /// `HpdEvent::from_ih_cookie`'s `asserted` argument: the interrupt cookie
+    /// says which connector fired and whether it was a plug event or a sink
+    /// IRQ, but not whether the result is connected or disconnected — Linux
+    /// calls `dc_link_detect` to go and look, and this is that look.
+    ///
+    /// `None` when DCN was not discovered or `connector` is past the HPD
+    /// blocks this ASIC has. Note the cookie space is wider than the register
+    /// space: see [`crate::amdgpu_dcn::HPD_BLOCKS`].
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively.
+    pub unsafe fn hpd_asserted(&self, connector: u8) -> Option<bool> {
+        use crate::amdgpu_dcn as dcn;
+        if connector >= dcn::HPD_BLOCKS {
+            return None;
+        }
+        let base = self.ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2)?;
+        let reg = base + dcn::for_pipe(dcn::HPD0_DC_HPD_INT_STATUS, connector, dcn::HPD_STRIDE);
+        // SAFETY: caller-asserted BAR5 ownership; a read-only status register
+        // reached through the MM_INDEX/MM_DATA pair.
+        let status = unsafe { mm_read(&self.regs, reg) };
+        if status == u32::MAX {
+            return None;
+        }
+        Some(status & dcn::DC_HPD_SENSE_DELAYED != 0)
+    }
+
+    /// Read the firmware-programmed scanout geometry out of DCN.
+    ///
+    /// Returns `None` when no pipe is fetching, when DCN was not discovered,
+    /// or when the registers read back as a vanished device.
+    ///
+    /// LINUX-GAP: this read four constants — 0x5C00, 0x5C04, 0x5C08, 0x5C0C —
+    /// described as "OTG H_TOTAL / V_TOTAL register-bus offsets per the public
+    /// DCN1+ register map". No DCN header defines anything in that range;
+    /// `regOTG0_OTG_H_TOTAL` is dword 0x1b2a. They were also used with no DCN
+    /// base and through MM_INDEX, which takes a dword address, so the reads
+    /// landed on four unrelated registers. The derivation on top was wrong
+    /// too: `h_active` came out as `h_total - (blank_end - blank_start)`, but
+    /// `optc1_program_timing` writes `OTG_H_BLANK_END` BELOW
+    /// `OTG_H_BLANK_START` (end = start - h_active), so that subtraction
+    /// saturated to zero and the function would have reported
+    /// `h_active == h_total`. `stride` was assumed equal to the width.
+    ///
+    /// None of that is needed. The HUBP's own viewport and pitch registers say
+    /// what the pipe is fetching, which is the question being asked —
+    /// `amdgpu_platform::scan_surfaces` reads the same ones to inventory an
+    /// inherited scanout.
     ///
     /// # Safety
     /// Caller owns BAR5 exclusively.
     unsafe fn passive_mode(&self) -> Option<Mode> {
-        // OTG H_TOTAL / V_TOTAL register-bus offsets per the
-        // public DCN1+ register map. Both encode `total - 1`.
-        const OTG_H_TOTAL: u32 = 0x0000_5C00;
-        const OTG_V_TOTAL: u32 = 0x0000_5C04;
-        const OTG_H_BLANK_START_END: u32 = 0x0000_5C08;
-        const OTG_V_BLANK_START_END: u32 = 0x0000_5C0C;
-
-        // SAFETY: caller-asserted exclusive ownership of BAR5.
-        let h_total = unsafe { mm_read(&self.regs, OTG_H_TOTAL) };
-        if h_total == 0 || h_total == 0xFFFF_FFFF {
-            return None;
+        use crate::amdgpu_dcn as dcn;
+        // Every HUBP / HUBPREQ register is BASE_IDX 2.
+        let base = self.ip_block_base_idx(amdgpu_discovery::HW_ID_DCN, 0, 2)?;
+        for pipe in 0..dcn::DCN_PIPES {
+            let at = |reg: u32| base + dcn::for_pipe(reg, pipe, dcn::HUBP_PIPE_STRIDE);
+            // SAFETY: caller-asserted BAR5 ownership; MM_INDEX/MM_DATA pair,
+            // and these are read-only hub status registers.
+            let cntl = unsafe { mm_read(&self.regs, at(dcn::HUBP0_DCHUBP_CNTL)) };
+            if cntl == u32::MAX {
+                return None;
+            }
+            // `HUBP_BLANK_EN` set means this pipe is not fetching.
+            if cntl & dcn::HUBP_BLANK_FORCE != 0 {
+                continue;
+            }
+            // SAFETY: same bank, same contract.
+            let viewport =
+                unsafe { mm_read(&self.regs, at(dcn::HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION)) };
+            // SAFETY: same.
+            let pitch = unsafe { mm_read(&self.regs, at(dcn::HUBPREQ0_DCSURF_SURFACE_PITCH)) };
+            if viewport == u32::MAX || pitch == u32::MAX {
+                return None;
+            }
+            let width = viewport & dcn::SURFACE_DIMENSION_MASK;
+            let height = (viewport >> 16) & dcn::SURFACE_DIMENSION_MASK;
+            // The pitch register holds one less than the pitch.
+            let stride = (pitch & dcn::SURFACE_DIMENSION_MASK) + 1;
+            if width == 0 || height == 0 || stride < width {
+                return None;
+            }
+            return Some(Mode {
+                width,
+                height,
+                stride,
+            });
         }
-        // SAFETY: caller-asserted exclusive ownership of BAR5; `OTG_V_TOTAL`
-        // is a read-only OTG timing register on the same MMIO BAR.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let v_total = unsafe { mm_read(&self.regs, OTG_V_TOTAL) };
-        if v_total == 0 || v_total == 0xFFFF_FFFF {
-            return None;
-        }
-        // SAFETY: caller-asserted exclusive ownership of BAR5; OTG blank
-        // registers are read-only timing latches on the same MMIO BAR.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let h_blank = unsafe { mm_read(&self.regs, OTG_H_BLANK_START_END) };
-        // SAFETY: caller-asserted exclusive ownership of BAR5; same OTG
-        // blank-register MMIO BAR as above.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let v_blank = unsafe { mm_read(&self.regs, OTG_V_BLANK_START_END) };
-
-        // OTG_H_TOTAL is `total - 1`; bits[15:0] are the value.
-        // H/V_BLANK_START_END pack `(end << 16) | start`.
-        let h_total_val = (h_total & 0xFFFF) + 1;
-        let v_total_val = (v_total & 0xFFFF) + 1;
-        let h_blank_start = h_blank & 0xFFFF;
-        let h_blank_end = (h_blank >> 16) & 0xFFFF;
-        let v_blank_start = v_blank & 0xFFFF;
-        let v_blank_end = (v_blank >> 16) & 0xFFFF;
-        // Active = total - blanking_width.
-        let h_blank_w = h_blank_end.saturating_sub(h_blank_start);
-        let v_blank_w = v_blank_end.saturating_sub(v_blank_start);
-        let h_active = h_total_val.saturating_sub(h_blank_w);
-        let v_active = v_total_val.saturating_sub(v_blank_w);
-        if h_active < 64 || v_active < 64 || h_active > 16384 || v_active > 16384 {
-            // Sanity-bound: 64..16384 covers 720p..16K.
-            return None;
-        }
-        Some(Mode {
-            width: h_active,
-            height: v_active,
-            // Linear scanout: stride = width (no row padding).
-            stride: h_active,
-        })
+        None
     }
 
     /// Stage the chip's firmware blob through `narf-firmware` and
@@ -896,59 +1168,21 @@ impl AmdGpu {
             return Err(AmdgpuError::FirmwareLoadFailed);
         }
 
-        // Step 2-3: program phys + size + command.
-        // SAFETY: BAR5 mapped, exclusive owner; mp0_base + offsets
-        // are valid register-bus addresses for this family.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
-            mm_write(
-                &self.regs,
-                mp0_base + MP0_C2PMSG_67_REL,
-                (phys >> 32) as u32,
-            );
-        }
-        compiler_fence(Ordering::SeqCst);
-        let cmd = PSP_CMD_LOAD_IP_FW | (size << 8);
-        // SAFETY: same.
-        unsafe {
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, cmd);
-        }
-
-        // Step 4-5: poll MP0_C2PMSG_64 for the done bit. PSP
-        // typically responds within ~50 ms; bound the spin so a
-        // wedged controller surfaces as FirmwareLoadFailed.
-        // responsive_spin_until ticks sleep_pumps so cursor/FB stay
-        // alive during this multi-millisecond wait. 500 ms wedge
-        // threshold (10x typical PSP TA-load latency).
-        let _ = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) } & PSP_STATUS_DONE_BIT != 0,
-            narf_time::Deadline::after_ms(500),
-        );
-        // SAFETY: identity-mapped MMIO.
-        let last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
-        if last & PSP_STATUS_DONE_BIT == 0 {
-            return Err(AmdgpuError::FirmwareLoadFailed);
-        }
-        if last & PSP_STATUS_CODE_MASK != 0 {
-            // PSP rejected the image. Status codes are
-            // ASIC-specific; surface them so callers can log.
-            return Err(AmdgpuError::FirmwareLoadFailed);
-        }
-
-        // Step 6: record the version coupling.
-        narf_drivers::set_bound_firmware(
-            "amdgpu",
-            narf_drivers::BoundFirmware {
-                blob_name: alloc::string::String::from(self.chip.fw_name),
-                sha256: view.sha256,
-                signer: view.signer,
-                version: None,
-            },
-        );
-        self.fw_loaded = true;
-        Ok(())
+        // LINUX-GAP: there is no MP0 mailbox command that loads a firmware
+        // image. What stood here wrote `phys` lo/hi to C2PMSG_64 and _67, a
+        // `cmd | size << 8` trigger to C2PMSG_69, and polled C2PMSG_64 for a
+        // completion — a sequence that appears in no `psp_v*.c`. C2PMSG_67 is
+        // never addressed by the driver, no command word packs a size, and
+        // the register polled for completion is always the one the command
+        // was written to. `GFX_CMD_ID_LOAD_IP_FW` is the `cmd_id` of a
+        // `psp_gfx_cmd_resp` placed in the GPCOM ring buffer, which
+        // `amdgpu_psp_ring` builds and the live bring-up path uses.
+        //
+        // Fail closed rather than write that to live registers. Rewiring this
+        // scaffold onto the ring, and recording `BoundFirmware` when it
+        // succeeds, is the follow-up.
+        let _ = (mp0_base, phys, size, view.sha256, view.signer);
+        Err(AmdgpuError::UnsupportedFirmwareLoad)
     }
 
     /// Dispatch one firmware blob through the PSP mailbox using
@@ -999,57 +1233,13 @@ impl AmdGpu {
             return Err(AmdgpuError::FirmwareLoadFailed);
         }
 
-        // SAFETY: BAR5 mapped, exclusive owner; mp0_base + offsets
-        // are valid register-bus addresses for this family.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_64_REL, phys as u32);
-            mm_write(
-                &self.regs,
-                mp0_base + MP0_C2PMSG_67_REL,
-                (phys >> 32) as u32,
-            );
-        }
-        compiler_fence(Ordering::SeqCst);
-        let trigger = (entry.cmd & 0xFF) | (size << 8);
-        // SAFETY: same.
-        unsafe {
-            mm_write(&self.regs, mp0_base + MP0_C2PMSG_69_REL, trigger);
-        }
-
-        // Poll for done bit. 500 ms wedge threshold matches per-IP
-        // load latency (PSP TA-load is the slowest at ~50 ms typical).
-        let _ = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped MMIO.
-            || unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) }
-                & PSP_STATUS_DONE_BIT
-                != 0,
-            narf_time::Deadline::after_ms(500),
-        );
-        // SAFETY: identity-mapped MMIO.
-        let last = unsafe { mm_read(&self.regs, mp0_base + MP0_C2PMSG_64_REL) };
-        if last & PSP_STATUS_DONE_BIT == 0 {
-            return Err(AmdgpuError::FirmwareLoadFailed);
-        }
-        if last & PSP_STATUS_CODE_MASK != 0 {
-            return Err(AmdgpuError::FirmwareLoadFailed);
-        }
-
-        // Record the version coupling. set_bound_firmware overwrites
-        // the previous entry per driver, so the LAST blob loaded
-        // surfaces in the inventory — which is what an operator
-        // wants (the most-recent PSP transaction's signer/sha).
-        // Full multi-blob history is a follow-up if we ever need it.
-        narf_drivers::set_bound_firmware(
-            "amdgpu",
-            narf_drivers::BoundFirmware {
-                blob_name: alloc::string::String::from(entry.name),
-                sha256: view.sha256,
-                signer: view.signer,
-                version: None,
-            },
-        );
-        Ok(true)
+        // LINUX-GAP: as in `load_firmware` — the mailbox carries no image
+        // load, so there is nothing correct to write here. Every `FwEntry`
+        // command in `chip.fw_list` (`LOAD_IP_FW`, `LOAD_TA`, `LOAD_ASD`,
+        // `LOAD_TOC`) is a GPCOM ring `cmd_id`, which `amdgpu_psp_ring`
+        // submits. Fail closed until this is rewired onto that ring.
+        let _ = (mp0_base, phys, size, entry.cmd, view.sha256, view.signer);
+        Err(AmdgpuError::UnsupportedFirmwareLoad)
     }
 
     /// Dispatch an SMU PMFW blob via the MP1 mailbox. Phoenix-class
@@ -1082,7 +1272,9 @@ impl AmdGpu {
             Err(_) => return Err(AmdgpuError::FirmwareLoadFailed),
         };
         let view = narf_firmware::view_of(&cap).map_err(|_| AmdgpuError::FirmwareLoadFailed)?;
-        let mp1_base = self.mp1_base().ok_or(AmdgpuError::SmuBringUpFailed)?;
+        let mp1_base = self
+            .mp1_mailbox_base()
+            .ok_or(AmdgpuError::SmuBringUpFailed)?;
         let phys = view.phys;
         let size = view.bytes.len() as u32;
 
@@ -1152,6 +1344,7 @@ impl AmdGpu {
         let mut skipped_optional = 0usize;
         let mut last_optional_skip: Option<alloc::string::String> = None;
 
+        let autoload = matches!(self.chip.family, Family::Phoenix);
         for entry in self.chip.fw_list {
             // SAFETY: caller-asserted exclusive BAR5; mp0_base
             // is resolved live (not stale).
@@ -1162,26 +1355,46 @@ impl AmdGpu {
                     skipped_optional += 1;
                     last_optional_skip = Some(alloc::string::String::from(entry.name));
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // Name the blob. A family's list is a dozen entries and
+                    // "firmware load failed" says nothing about which one, nor
+                    // whether the file was missing, malformed, or rejected by
+                    // the PSP — three problems with three different fixes.
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: firmware load failed at {} (cmd {:#x}): {e:?}",
+                        entry.name,
+                        entry.cmd
+                    );
+                    return Err(e);
+                }
             }
-        }
 
-        // GFX11+ (Phoenix/Strix) kicks the PSP-managed RLC autoload
-        // after the IP-firmware loop. `AUTOLOAD_RLC = 0x21` is a
-        // control command (no image), so we send it via the same
-        // mailbox with size=0-style trigger — PSP recognises the
-        // command and runs its autoload state machine over the
-        // already-staged firmwares. GFX9 (Renoir family) starts
-        // RLC by MMIO kick instead, so we skip the call there.
-        if matches!(self.chip.family, Family::Phoenix) {
-            // SAFETY: caller-asserted exclusive BAR5.
-            let r = unsafe { psp_send_control_command(&self.regs, mp0_base, PSP_CMD_AUTOLOAD_RLC) };
-            if r.is_err() {
-                // Non-fatal: log via the report. RLC autoload
-                // failure means the GFX ring won't come up, but
-                // it doesn't unwind the loads above — let the
-                // caller decide.
-                return Err(AmdgpuError::FirmwareLoadFailed);
+            // `psp_load_non_psp_fw`: "Start rlc autoload after psp received
+            // all the gfx firmware" — fired the moment RLC lands, which is
+            // why RLC is last among the graphics blobs in the table. This
+            // used to run after the WHOLE list, so VCN and DMCUB had been
+            // sent first; the PSP's state machine expects otherwise.
+            //
+            // GFX9 (the Renoir family) starts RLC by MMIO kick instead, so it
+            // is skipped there.
+            if autoload && is_rlc_blob(entry.name) {
+                // SAFETY: caller-asserted exclusive BAR5.
+                let r =
+                    unsafe { psp_send_control_command(&self.regs, mp0_base, PSP_CMD_AUTOLOAD_RLC) };
+                if let Err(e) = r {
+                    // Fatal, as it is in Linux: `psp_rlc_autoload_start`
+                    // failing returns the error from `psp_load_non_psp_fw`.
+                    // A comment here used to call it non-fatal while the code
+                    // returned an error — the code was right.
+                    use core::fmt::Write as _;
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: PSP RLC autoload failed: {e:?}; the GFX ring will not come up"
+                    );
+                    return Err(AmdgpuError::FirmwareLoadFailed);
+                }
             }
         }
 
@@ -1253,20 +1466,18 @@ impl AmdGpu {
         // header for the per-register shifts). Everything else with
         // a discoverable DCN block today is DCN 2.0 (Renoir,
         // Cezanne, Lucienne).
-        let seq = match self.chip.family {
-            Family::Phoenix => crate::amdgpu_dcn::dcn35_modeset_sequence(
-                &timing,
-                self.vram.base,
-                mode.stride,
-                dcn_base,
-            ),
-            _ => crate::amdgpu_dcn::dcn20_modeset_sequence(
-                &timing,
-                self.vram.base,
-                mode.stride,
-                dcn_base,
-            ),
-        };
+        // LINUX-GAP: this selected `dcn35_modeset_sequence` for Phoenix.
+        // Phoenix is DCN **3.1.4**, which agrees with DCN 2.0 on all nine OTG
+        // registers; DCN 3.5 moves four of them. `amdgpu_modeset` was
+        // corrected to the 2.0 sequence in an earlier pass and this call site
+        // was not, so the two modeset paths disagreed — and this is the one
+        // `set_mode` uses, which is what the PM resume path re-runs.
+        let seq = crate::amdgpu_dcn::dcn20_modeset_sequence(
+            &timing,
+            self.vram.base,
+            mode.stride,
+            dcn_base,
+        );
 
         // Drive the sequencer.
         // SAFETY: caller-asserted exclusive ownership of BAR5.
@@ -1296,12 +1507,29 @@ impl AmdGpu {
         let dcn_base = self
             .ip_block_base(amdgpu_discovery::HW_ID_DCN, 0)
             .ok_or(AmdgpuError::UnknownAsic)?;
-        let user_level = crate::amdgpu_backlight::user_level_for_percent(percent);
-        let writes = crate::amdgpu_backlight::build_set_user_level(dcn_base, user_level);
+        let brightness = crate::amdgpu_backlight::user_level_for_percent(percent);
+        // The duty count is the brightness scaled against the period VBIOS
+        // programmed, so the period has to be read back first — it is not a
+        // value this driver chooses.
+        // SAFETY: caller-asserted BAR5 ownership; the register is inside the
+        // DCN window `ip_block_base` resolved.
+        // `mm_read`/`mm_write` drive MM_INDEX, which takes a **dword**
+        // register address — `reg_offset[IP][inst][BASE_IDX] + dword_id`, the
+        // same sum `SOC15_REG_OFFSET` forms. `ip_block_base` returns that
+        // dword base straight out of the discovery blob, so the dword id is
+        // added to it unshifted.
+        let period_cntl = unsafe {
+            mm_read(
+                &self.regs,
+                dcn_base + crate::amdgpu_backlight::BL_PWM_PERIOD_CNTL,
+            )
+        };
+        let writes = crate::amdgpu_backlight::build_set_user_level(0, brightness, period_cntl)
+            .map_err(|_| AmdgpuError::UnknownAsic)?;
         // SAFETY: caller-asserted BAR5 ownership.
         unsafe {
             for w in &writes {
-                mm_write(&self.regs, w.addr, w.value);
+                mm_write(&self.regs, dcn_base + w.addr, w.value);
             }
         }
         Ok(())
@@ -1311,6 +1539,16 @@ impl AmdGpu {
     /// pre-discovery silicon doesn't expose SMU bring-up here.
     pub fn mp1_base(&self) -> Option<u32> {
         self.ip_block_base(amdgpu_discovery::HW_ID_MP1, 0)
+    }
+
+    /// MP1 base window 1 — where the SMU mailbox registers live on Phoenix
+    /// (`mp_13_0_4_offset.h` gives `regMP1_SMN_C2PMSG_66_BASE_IDX` as 1).
+    ///
+    /// Every `amdgpu_smu` call takes an `mp1_base`; they were being handed
+    /// window 0, so the mailbox writes went to the wrong window even once the
+    /// offsets were corrected.
+    pub fn mp1_mailbox_base(&self) -> Option<u32> {
+        self.ip_block_base_idx(amdgpu_discovery::HW_ID_MP1, 0, 1)
     }
 
     /// SMU driver-interface schema version this driver was
@@ -1351,7 +1589,9 @@ impl AmdGpu {
         // 2. SMU bring-up handshake. The MP1 base + expected
         //    driver-IF version are family-specific; both must
         //    resolve or we can't safely talk to the SMU.
-        let mp1_base = self.mp1_base().ok_or(AmdgpuError::SmuBringUpFailed)?;
+        let mp1_base = self
+            .mp1_mailbox_base()
+            .ok_or(AmdgpuError::SmuBringUpFailed)?;
         let expected_ifv = self
             .expected_smu_driver_if_version()
             .ok_or(AmdgpuError::SmuBringUpFailed)?;
@@ -1385,35 +1625,13 @@ unsafe fn psp_send_control_command(
     mp0_base: u32,
     cmd: u32,
 ) -> Result<(), AmdgpuError> {
-    // Per psp_gfx_if.h, control commands occupy the same mailbox
-    // slot family as image-load commands. Lo/hi phys slots get
-    // zero (or harmless prior contents — PSP ignores them for the
-    // commands that don't consume an image).
-    // SAFETY: caller-asserted exclusive MMIO.
-    unsafe {
-        mm_write(regs, mp0_base + MP0_C2PMSG_64_REL, 0);
-        mm_write(regs, mp0_base + MP0_C2PMSG_67_REL, 0);
-    }
-    compiler_fence(Ordering::SeqCst);
-    let trigger = cmd & 0xFF;
-    // SAFETY: same.
-    unsafe {
-        mm_write(regs, mp0_base + MP0_C2PMSG_69_REL, trigger);
-    }
-    let _ = narf_scheduler::responsive_spin_until(
-        // SAFETY: identity-mapped MMIO.
-        || unsafe { mm_read(regs, mp0_base + MP0_C2PMSG_64_REL) } & PSP_STATUS_DONE_BIT != 0,
-        narf_time::Deadline::after_ms(500),
-    );
-    // SAFETY: identity-mapped MMIO.
-    let last = unsafe { mm_read(regs, mp0_base + MP0_C2PMSG_64_REL) };
-    if last & PSP_STATUS_DONE_BIT == 0 {
-        return Err(AmdgpuError::FirmwareLoadFailed);
-    }
-    if last & PSP_STATUS_CODE_MASK != 0 {
-        return Err(AmdgpuError::FirmwareLoadFailed);
-    }
-    Ok(())
+    // LINUX-GAP: `AUTOLOAD_RLC`, `BOOT_CFG` and the rest of `psp_gfx_cmd_id`
+    // are GPCOM ring commands, not mailbox commands. The MP0 mailbox accepts
+    // only `psp_bootloader_cmd` values on C2PMSG_35 and `psp_gfx_ctrl_cmd_id`
+    // values on C2PMSG_64; `amdgpu_psp::ring_control` is the entry point for
+    // the latter, and `amdgpu_psp_ring` carries the former kind.
+    let _ = (regs, mp0_base, cmd);
+    Err(AmdgpuError::UnsupportedFirmwareLoad)
 }
 
 /// Per-initialize report — what the host learned about the chip
@@ -1443,6 +1661,28 @@ pub struct MultiFwReport {
     /// The most recent optional blob that was skipped, for log
     /// breadcrumbs.
     pub last_optional_skip: Option<alloc::string::String>,
+}
+
+/// Adapter that implements `CpFwMmio` over MM_INDEX / MM_DATA.
+///
+/// `CpFwMmio` hands out `(base + dword_id) << 2`, a byte offset into a
+/// directly mapped window. MM_INDEX is a dword port, so this shifts it back —
+/// the one place in the driver where the two conventions meet, rather than at
+/// every call site.
+struct CpRegsAdapter<'a> {
+    regs: &'a MmioRegion,
+}
+
+impl<'a> crate::amdgpu_cp_fw::CpFwMmio for CpRegsAdapter<'a> {
+    fn read(&mut self, byte_off: u32) -> u32 {
+        // SAFETY: the adapter is built inside `start_gfx_cp`, whose caller
+        // asserts exclusive BAR5 ownership, and it cannot outlive that frame.
+        unsafe { mm_read(self.regs, byte_off >> 2) }
+    }
+    fn write(&mut self, byte_off: u32, value: u32) {
+        // SAFETY: same.
+        unsafe { mm_write(self.regs, byte_off >> 2, value) }
+    }
 }
 
 /// Adapter that implements `SmuMmio` over the driver's BAR5
@@ -1487,6 +1727,36 @@ unsafe fn mm_read(regs: &MmioRegion, addr: u32) -> u32 {
 ///
 /// # Safety
 /// Same as `mm_read`.
+/// Convert one of `amdgpu_gfx`/`amdgpu_cp_fw`'s byte-offset `*_REL` constants
+/// into the dword address MM_INDEX wants.
+///
+/// The driver carries both conventions on purpose: a module that owns a
+/// directly mapped register window indexes it in bytes, while MM_INDEX is a
+/// dword port. Mixing them silently addresses a register four times further
+/// in, which is what [`AmdGpu::write_grbm_gfx_index`] and
+/// [`AmdGpu::read_grbm_status`] were doing.
+pub(crate) const fn mm_dword(rel_bytes: u32) -> u32 {
+    rel_bytes / 4
+}
+
+/// Busy-wait `us` microseconds of wall-clock time.
+///
+/// `narf_time::calibrate_clocks` returns the TSC frequency, or 0 when every
+/// calibration path failed. The spin fallback is the same shape `ixgbe`'s
+/// reset handshake uses, and it is a fallback rather than the primary path
+/// because a spin count's duration is whatever the CPU clock makes it, while
+/// the hardware waits this stands in for are specified in time.
+fn delay_us(us: u32) {
+    let hz = narf_time::calibrate_clocks();
+    if hz > 0 {
+        narf_time::busy_wait_cycles((hz / 1_000_000).max(1) * u64::from(us));
+    } else {
+        for _ in 0..(u64::from(us) * 1000) {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
     // SAFETY: caller-asserted ownership.
     unsafe {
@@ -1499,35 +1769,61 @@ pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
     }
 }
 
-/// Read the visible-VRAM aperture from the MC IP block.
+/// Size and locate the CPU-visible VRAM carve-out, before discovery has run.
 ///
-/// MC_VM_FB_LOCATION_BASE / TOP are both in 16-MiB units (low 24
-/// bits of the address are implicit zero). The visible aperture
-/// is `[base, top + 16 MiB)`.
+/// Mirrors `gmc_v11_0_mc_init` plus the pre-discovery path in
+/// `amdgpu_discovery.c`:
 ///
-/// On Phoenix / Strix iGPUs (UMA), VRAM is carved from system
-/// DRAM and the aperture covers the whole carve-out. On discrete
-/// cards, it's the GPU's local memory.
+///   * the size comes from `RCC_CONFIG_MEMSIZE`, in MiB
+///     (`adev->nbio.funcs->get_memsize(adev) * 1024 * 1024`);
+///   * the base is BAR0's physical address
+///     (`adev->gmc.aper_base = pci_resource_start(adev->pdev, 0)`).
+///
+/// LINUX-GAP: this read `MC_VM_FB_LOCATION_BASE`/`_TOP` — 0x0980/0x0981 on
+/// GFX9, 0x1678/0x1679 on GFX11 — with **no IP base added**. Those are SOC15
+/// registers addressed as `reg_offset[IP][0][BASE_IDX] + dword_id`, so a bare
+/// 0x1678 names an unrelated register; and at this point in probe there is no
+/// base to add, because resolving one needs the discovery blob that lives at
+/// the top of the aperture this function is sizing. Linux breaks that cycle
+/// with `RREG32(mmRCC_CONFIG_MEMSIZE)` — `amdgpu_discovery.c:142` defines it
+/// as the absolute dword 0xde3 with the comment "These registers are
+/// consistent across all the SOCs", precisely because it must be readable
+/// before any IP base is known. Post-discovery the same value is
+/// `regRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE` 0x00c3 on NBIO BASE_IDX 2.
+///
+/// `VramInfo { size: 0 }` when the register reads `U32_MAX` (no device) or 0,
+/// which `amdgpu_discovery.c:314-317` treats as "TMR is in system memory" —
+/// either way there is no VRAM-resident discovery blob to find.
+/// Post-reset liveness probe: does the ASIC answer at all?
+///
+/// `RCC_CONFIG_MEMSIZE` reads back all-ones while the ASIC is still in
+/// reset or off the link, and a real size once it is out. Linux's
+/// `amdgpu_pci_slot_reset` polls exactly this, after the PCI vendor-ID
+/// poll and for exactly this reason: the vendor ID can be answered
+/// before the ASIC itself is back, so the memsize read is the one that
+/// confirms the die rather than the link.
 ///
 /// # Safety
-/// Caller owns BAR5 exclusively.
-unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
-    // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair.
-    let base_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_BASE) };
-    // SAFETY: caller-asserted exclusive ownership of BAR5 (`read_vram_info`
-    // contract); `MC_VM_FB_LOCATION_TOP` is a read-only MC aperture register
-    // accessed through the same MM_INDEX/MM_DATA latch pair.
-    // SAFETY: Valid MMIO bounds or trusted driver environment
-    let top_field = unsafe { mm_read(regs, MC_VM_FB_LOCATION_TOP) };
-    // Bits[23:0] are the FB location; high bits are reserved.
-    let base = (base_field as u64 & 0x00FF_FFFF) << 24;
-    let top = (top_field as u64 & 0x00FF_FFFF) << 24;
-    let size = if top >= base {
-        top - base + (1u64 << 24) // top is inclusive, last 16 MiB unit
-    } else {
+/// Same contract as [`mm_read`]: `regs` maps BAR5 of an AMD GPU and the
+/// caller owns the MM_INDEX latch for the duration.
+pub(crate) unsafe fn config_memsize_alive(regs: &MmioRegion) -> bool {
+    // SAFETY: caller-asserted mapping and latch ownership.
+    unsafe { mm_read(regs, RCC_CONFIG_MEMSIZE) != u32::MAX }
+}
+
+unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion) -> VramInfo {
+    // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair, and this
+    // register is absolute by design (no IP base).
+    let memsize_mb = unsafe { mm_read(regs, RCC_CONFIG_MEMSIZE) };
+    let size = if memsize_mb == u32::MAX {
         0
+    } else {
+        u64::from(memsize_mb) << 20
     };
-    VramInfo { base, size }
+    VramInfo {
+        base: fb_bar.phys.raw(),
+        size,
+    }
 }
 
 /// Read the on-die IP discovery blob from the top of the VRAM
@@ -1546,10 +1842,13 @@ unsafe fn read_vram_info(regs: &MmioRegion) -> VramInfo {
 /// `fb_bar` must map BAR0 of an AMD GPU; the caller must hold
 /// exclusive ownership of the framebuffer aperture for the
 /// duration of the read.
-unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock> {
+unsafe fn read_discovery(
+    fb_bar: &MmioRegion,
+    vram: &VramInfo,
+) -> (Vec<IpBlock>, Option<crate::amdgpu_discovery::GcInfo>) {
     // No aperture → no discovery.
     if vram.size < amdgpu_discovery::DISCOVERY_TMR_OFFSET {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let off_in_vram = vram.size - amdgpu_discovery::DISCOVERY_TMR_OFFSET;
     // Cap the read at whatever the aperture actually exposes
@@ -1576,7 +1875,26 @@ unsafe fn read_ip_discovery(fb_bar: &MmioRegion, vram: &VramInfo) -> Vec<IpBlock
         buf[i + 3] = bytes[3];
         i += 4;
     }
-    amdgpu_discovery::parse_discovery(&buf).unwrap_or_default()
+    // The GC table is parsed from the same bytes. Its absence is ordinary
+    // (QEMU, pre-discovery silicon) and is not worth reporting; a blob that
+    // parsed but whose GC table is corrupt is worth reporting, because the
+    // topology it would have carried is not guessable.
+    let gc_info = match amdgpu_discovery::parse_gc_info(&buf) {
+        Ok(info) => Some(info),
+        Err(amdgpu_discovery::DiscoveryError::NoGcTable) => None,
+        Err(error) => {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: discovery GC table unusable ({error:?}); shader topology unknown"
+            );
+            None
+        }
+    };
+    (
+        amdgpu_discovery::parse_discovery(&buf).unwrap_or_default(),
+        gc_info,
+    )
 }
 
 // ── VBIOS image acquisition ────────────────────────────────────────────────
@@ -1720,8 +2038,26 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     dev.vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) }.ok();
     let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
     let is_apu = matches!(dev.chip.family, Family::Renoir | Family::Phoenix);
+    // Captured before the move into CONTROLLER; both are Copy.
+    let (bound_asic, bound_family) = (dev.chip.asic, dev.chip.family);
     *PCI_AUTHORITY.lock() = Some(cap);
     *CONTROLLER.lock() = Some(dev);
+    // One identity line, before anything can fail. On a machine that gets no
+    // picture this is what says whether the driver bound at all, which ASIC
+    // table it chose, and therefore which firmware bundle it is about to ask
+    // the PSP for — the question a wrong PCI-id constant makes unanswerable.
+    {
+        use core::fmt::Write as _;
+        let _ = writeln!(
+            narf_console::Writer,
+            "amdgpu: bound {:04x}:{:04x} asic={} family={:?} vbios={}",
+            device.id.vendor,
+            device.id.device,
+            bound_asic,
+            bound_family,
+            vbios_version.as_deref().unwrap_or("<none>"),
+        );
+    }
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from("amdgpu"),
         kind: narf_drivers::BoundKind::Graphics,
@@ -1800,7 +2136,7 @@ fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendEr
     //    haven't stashed). Modern AMI BIOSes preserve TMR across
     //    S3 so this is the right shape for the bring-up targets.
     let _ = with_controller(|d| {
-        let mp1_base = match d.mp1_base() {
+        let mp1_base = match d.mp1_mailbox_base() {
             Some(b) => b,
             None => return,
         };
@@ -1824,7 +2160,7 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     //    just need to confirm the mailbox is alive before the
     //    next bring-up step issues real commands.
     let _ = with_controller(|d| {
-        let mp1_base = d.mp1_base()?;
+        let mp1_base = d.mp1_mailbox_base()?;
         let mut adapter = SmuRegsAdapter { regs: &d.regs };
         crate::amdgpu_smu::send_message_get(
             &mut adapter,
@@ -1837,7 +2173,7 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
     // 2. Tell SMU to power-up GFX before DCN re-init touches
     //    display clocks. Inverse of the PowerDownGfx above.
     let _ = with_controller(|d| {
-        let mp1_base = d.mp1_base()?;
+        let mp1_base = d.mp1_mailbox_base()?;
         let mut adapter = SmuRegsAdapter { regs: &d.regs };
         crate::amdgpu_smu::send_message_void(
             &mut adapter,
@@ -1870,9 +2206,11 @@ fn amdgpu_resume_handler() -> Result<(), narf_power::device_pm::DeviceSuspendErr
 /// listed.
 pub fn register_pci_driver() {
     let exact: &[(&'static str, u16, u16)] = &[
-        ("amdgpu-phoenix", AMD_VENDOR, PHOENIX_HAWKPOINT1),
-        ("amdgpu-phoenix-d", AMD_VENDOR, PHOENIX_DISCRETE),
+        ("amdgpu-hawkpoint", AMD_VENDOR, PHOENIX_HAWKPOINT1),
+        ("amdgpu-phoenix1", AMD_VENDOR, PHOENIX1),
+        ("amdgpu-phoenix2", AMD_VENDOR, PHOENIX2),
         ("amdgpu-strix", AMD_VENDOR, STRIX_POINT),
+        ("amdgpu-rembrandt", AMD_VENDOR, REMBRANDT),
         ("amdgpu-raphael", AMD_VENDOR, RAPHAEL),
         ("amdgpu-cezanne", AMD_VENDOR, CEZANNE),
         ("amdgpu-renoir", AMD_VENDOR, RENOIR),

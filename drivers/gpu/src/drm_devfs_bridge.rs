@@ -124,6 +124,18 @@ pub struct DriCardFile {
     /// GETPARAM/GET_CAPS/CONTEXT_INIT there. Kept even for a non-virtio card;
     /// the dispatcher is gated on the card's advertised driver name.
     virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState,
+    /// Per-open amdgpu GEM handle table. Linux keeps GEM handles in
+    /// `struct drm_file` for a reason that matters on a render node every GL
+    /// client opens: handle 3 in one client's fd must not name another
+    /// client's buffer. Kept even for a non-AMD card; the dispatcher is gated
+    /// on the card's advertised driver name.
+    amdgpu_gem: crate::amdgpu_gem::GemState,
+    /// Per-open GPU address space. Linux keeps one `amdgpu_vm` per DRM file
+    /// for the same reason handles are per-file: one client's GPU addresses
+    /// must not resolve in another's page tables.
+    amdgpu_vm: crate::amdgpu_vm::VmState,
+    /// Per-open submission contexts (`fpriv->ctx_mgr`).
+    amdgpu_ctx: crate::amdgpu_ctx::CtxState,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
     /// Per-open flip-complete queue. The event's opaque `user_data` belongs to
@@ -167,6 +179,9 @@ impl DriCardFile {
             open_id,
             metadata,
             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
+            amdgpu_gem: crate::amdgpu_gem::GemState::new(),
+            amdgpu_vm: crate::amdgpu_vm::VmState::new(),
+            amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
             events: narf_lib::sync::IrqSafeSpinLock::new(crate::drm::card::DrmEventQueue::new()),
             pending_out_fences: narf_lib::sync::IrqSafeSpinLock::new(Vec::new()),
@@ -385,6 +400,39 @@ impl FileOps for DriCardFile {
                 result => return result,
             }
         }
+        // The amdgpu private UAPI is answered on the card node too: a client
+        // that opened card0 rather than renderD128 asks `AMDGPU_INFO` there,
+        // and Linux serves it from both (the INFO ioctl carries neither
+        // DRM_AUTH nor DRM_MASTER in amdgpu's table).
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_cs::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_ctx) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_ctx::dispatch(
+                cmd,
+                arg,
+                &self.amdgpu_ctx,
+                // `drm_is_current_master(filp)`: whether THIS open holds it.
+                crate::drm_registry::mode_state(self.index)
+                    .is_some_and(|m| m.lock().is_master(self.open_id)),
+            ) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_info::dispatch(cmd, arg) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+        }
         crate::drm_ioctl_bridge::dispatch_card_for_file(
             self.index,
             self.open_id,
@@ -435,6 +483,10 @@ impl FileOps for DriCardFile {
             Err(dumb_miss) => {
                 if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
                     crate::drm_ioctl_bridge::dispatch_virtgpu_mmap(&self.virtgpu, offset, len)
+                } else if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+                    // An amdgpu GEM offset, from this open's table only — a
+                    // client cannot map a buffer it does not hold a handle to.
+                    self.amdgpu_gem.mmap_frames(offset, len)
                 } else {
                     Err(dumb_miss)
                 }
@@ -727,6 +779,18 @@ pub struct DriRenderFile {
     /// Per-open virtio-gpu resource namespace. Kept even for a non-virtio
     /// card; its dispatcher is selected by the DRM driver's advertised name.
     virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState,
+    /// Per-open amdgpu GEM handle table. Linux keeps GEM handles in
+    /// `struct drm_file` for a reason that matters on a render node every GL
+    /// client opens: handle 3 in one client's fd must not name another
+    /// client's buffer. Kept even for a non-AMD card; the dispatcher is gated
+    /// on the card's advertised driver name.
+    amdgpu_gem: crate::amdgpu_gem::GemState,
+    /// Per-open GPU address space. Linux keeps one `amdgpu_vm` per DRM file
+    /// for the same reason handles are per-file: one client's GPU addresses
+    /// must not resolve in another's page tables.
+    amdgpu_vm: crate::amdgpu_vm::VmState,
+    /// Per-open submission contexts (`fpriv->ctx_mgr`).
+    amdgpu_ctx: crate::amdgpu_ctx::CtxState,
     /// Per-open SET_CLIENT_CAP state, matching Linux `struct drm_file`.
     client_caps: crate::drm_ioctl_bridge::DrmClientCaps,
 }
@@ -827,6 +891,40 @@ impl FileOps for DriRenderFile {
                 result => return result,
             }
         }
+        // The amdgpu private UAPI, on the render node. `AMDGPU_INFO` is what
+        // `libdrm_amdgpu`'s `amdgpu_device_initialize` calls first, and it
+        // calls it on whichever node it opened — Mesa uses the render node.
+        // Unimplemented commands return `Unsupported` and fall through to the
+        // generic DRM path, as the virtio-gpu dispatcher above does.
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            match crate::amdgpu_gem::dispatch(cmd, arg, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_vm::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_gem) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_cs::dispatch(cmd, arg, &self.amdgpu_vm, &self.amdgpu_ctx) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_ctx::dispatch(
+                cmd,
+                arg,
+                &self.amdgpu_ctx,
+                // A render node never holds DRM master, so a client here needs
+                // CAP_SYS_NICE for an above-normal priority.
+                false,
+            ) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+            match crate::amdgpu_info::dispatch(cmd, arg) {
+                Err(FsError::Unsupported) => {}
+                result => return result,
+            }
+        }
         crate::drm_ioctl_bridge::dispatch_card_for_file(
             self.index,
             NO_MASTER_OPEN_ID,
@@ -895,6 +993,10 @@ impl FileOps for DriRenderFile {
         if crate::drm_registry::driver_name(self.index) == Some("virtio_gpu") {
             return crate::drm_ioctl_bridge::dispatch_virtgpu_mmap(&self.virtgpu, offset, len);
         }
+        if crate::drm_registry::driver_name(self.index) == Some("amdgpu") {
+            // As on the card node: this open's GEM table and no other.
+            return self.amdgpu_gem.mmap_frames(offset, len);
+        }
         Err(FsError::Unsupported)
     }
 
@@ -942,6 +1044,9 @@ impl DirOps for DriDir {
                             index: idx,
                             metadata,
                             virtgpu: crate::drm_ioctl_bridge::VirtGpuRenderState::new(),
+                            amdgpu_gem: crate::amdgpu_gem::GemState::new(),
+                            amdgpu_vm: crate::amdgpu_vm::VmState::new(),
+                            amdgpu_ctx: crate::amdgpu_ctx::CtxState::new(),
                             client_caps: crate::drm_ioctl_bridge::DrmClientCaps::new(),
                         }));
                     }

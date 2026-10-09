@@ -441,144 +441,169 @@ pub enum AudioError {
 //      drives the DTO.
 //   2. DCCG_AUDIO_DTO0_MODULE / _PHASE — clock_info.audio_dto_module
 //      and audio_dto_phase from the SAD pair.
-//   3. AZ_F0_CODEC_FUNCTION_GROUP — programs the codec verb
-//      (12-bit nid | 8-bit verb | 12-bit payload) for the path /
-//      stream-format / mixer association.
-//   4. DCIO routing — binds the codec to the active CRTC's stream
-//      via the DCIO_AUDIO_STREAM_CONTROL register.
+//   3. The codec's endpoint registers, reached indirectly through an
+//      index/data pair.
 //
-// Register offsets are PER-CHIP; on Phoenix (DCN 3.5) they live in
-// the DCE register window at:
-//
-//   DCCG_AUDIO_DTO_SOURCE      = 0x0035  (DCCG block + 0x00d4)
-//   DCCG_AUDIO_DTO0_MODULE     = 0x0036
-//   DCCG_AUDIO_DTO0_PHASE      = 0x0037
-//
-// On Renoir (DCN 2.0) different offsets — but the protocol is
-// the same. References:
-//   - Linux drivers/gpu/drm/amd/display/dc/dce/dce_audio.c:1102-1148
-//     (dce_set_audio_dto — DTO register program)
-//   - Linux drivers/gpu/drm/amd/display/dc/dce/dce_audio.c::
-//     dce_aud_az_configure (AZALIA codec verb programming)
+// References:
+//   - Linux drivers/gpu/drm/amd/display/dc/dce/dce_audio.c
+//     (dce_aud_wall_dto_setup, write_indirect_azalia_reg)
+//   - Register ids from dcn/dcn_3_1_4_offset.h and _sh_mask.h. Phoenix is
+//     DCN 3.1.4; dcn35's offsets do not apply.
 
-pub const DCCG_AUDIO_DTO_SOURCE_REL: u32 = 0x00d4;
-pub const DCCG_AUDIO_DTO0_MODULE_REL: u32 = 0x00d8;
-pub const DCCG_AUDIO_DTO0_PHASE_REL: u32 = 0x00dc;
-pub const DCCG_AUDIO_DTO1_MODULE_REL: u32 = 0x00e0;
-pub const DCCG_AUDIO_DTO1_PHASE_REL: u32 = 0x00e4;
+/// `regDCCG_AUDIO_DTO_SOURCE`, BASE_IDX 1. `DCCG_AUDIO_DTO0_SOURCE_SEL` is
+/// three bits at **0** and `DCCG_AUDIO_DTO_SEL` two bits at 4 — the source
+/// select is the low field, not the one at 4.
+pub const DCCG_AUDIO_DTO_SOURCE: u32 = 0x00ab;
+pub const DCCG_AUDIO_DTO0_SOURCE_SEL_SHIFT: u32 = 0;
+pub const DCCG_AUDIO_DTO0_SOURCE_SEL_MASK: u32 = 0x0000_0007;
+pub const DCCG_AUDIO_DTO_SEL_SHIFT: u32 = 4;
 
-/// `AZALIA_F0_CODEC_VERB_*` — the codec verb interface used to
-/// program the Audio Z (Azalia) codec function group. The host
-/// writes a 32-bit verb (4-bit cad | 8-bit nid | 20-bit verb +
-/// payload) to F0_CODEC_FUNCTION_CONTROL_CODEC_DATA and then bumps
-/// a trigger bit.
-pub const AZ_F0_CODEC_FUNCTION_CONTROL_CODEC_DATA_REL: u32 = 0x0040;
-pub const AZ_F0_CODEC_FUNCTION_CONTROL_RESPONSE_DATA_REL: u32 = 0x0044;
-pub const AZ_F0_CODEC_PIN_CONTROL_RESPONSE_PIN_WIDGET_CONTROL_REL: u32 = 0x0048;
+/// The DTO phase/module pairs. **Phase is below module** for both instances,
+/// and the two pairs are interleaved phase-then-module rather than grouped:
+/// 0x00ac phase0, 0x00ad module0, 0x00ae phase1, 0x00af module1.
+pub const DCCG_AUDIO_DTO0_PHASE: u32 = 0x00ac;
+pub const DCCG_AUDIO_DTO0_MODULE: u32 = 0x00ad;
+pub const DCCG_AUDIO_DTO1_PHASE: u32 = 0x00ae;
+pub const DCCG_AUDIO_DTO1_MODULE: u32 = 0x00af;
 
-/// DCIO audio stream-control register — binds a codec instance to
-/// a CRTC's pixel-stream output (selects which OPP delivers
-/// timestamps for sample-rate sync).
-pub const DCIO_AUDIO_STREAM_CONTROL_REL: u32 = 0x0050;
+/// The Azalia codec's per-endpoint state is **not** directly mapped. Each
+/// endpoint has an index/data pair — `regAZF0ENDPOINTn_AZALIA_F0_CODEC_
+/// ENDPOINT_INDEX` and `_DATA` — and `write_indirect_azalia_reg` writes the
+/// `ix…` index first, then the value (`dce_audio.c`). BASE_IDX 2.
+pub const AZF0ENDPOINT0_CODEC_ENDPOINT_INDEX: u32 = 0x0386;
+pub const AZF0ENDPOINT0_CODEC_ENDPOINT_DATA: u32 = 0x0387;
+/// Six dwords per endpoint, eight endpoints: endpoint 7's index is 0x03b0.
+pub const AZF0ENDPOINT_STRIDE: u32 = 6;
+pub const AZF0ENDPOINTS: u8 = 8;
+/// `AZALIA_ENDPOINT_REG_INDEX` is fourteen bits; a wider index would spill
+/// into the reserved bits above it.
+pub const AZALIA_ENDPOINT_REG_INDEX_MASK: u32 = 0x0000_3FFF;
+
+/// The indirect indices this module programs, from `ixAZALIA_F0_CODEC_
+/// PIN_CONTROL_*`. These are endpoint-register indices written into
+/// `..._ENDPOINT_INDEX`, not register offsets.
+pub const IX_PIN_CONTROL_CHANNEL_SPEAKER: u32 = 0x0025;
+pub const IX_PIN_CONTROL_AUDIO_DESCRIPTOR0: u32 = 0x0028;
+pub const IX_PIN_CONTROL_MULTICHANNEL_ENABLE: u32 = 0x0036;
+pub const IX_PIN_CONTROL_SINK_INFO0: u32 = 0x003A;
+pub const IX_PIN_CONTROL_HOT_PLUG_CONTROL: u32 = 0x0054;
+
+/// The dword id of `reg` for `endpoint`.
+pub const fn for_endpoint(reg: u32, endpoint: u8) -> u32 {
+    reg + (endpoint as u32) * AZF0ENDPOINT_STRIDE
+}
 
 pub trait DcnAudioMmio {
-    fn read(&mut self, byte_off: u32) -> u32;
-    fn write(&mut self, byte_off: u32, value: u32);
+    /// `reg` is an absolute DCN dword id, as the headers spell them.
+    fn read(&mut self, reg: u32) -> u32;
+    fn write(&mut self, reg: u32, value: u32);
 }
 
 /// Program the DCCG audio DTO for an active stream.
 ///
-/// Mirrors `dce_audio.c::dce_set_audio_dto` lines 1102-1148:
-///   1. Select source engine (DTO0 or DTO1) via DTO_SOURCE.
-///   2. Write the module + phase from the stream's DTO pair.
-pub fn program_audio_dto<M: DcnAudioMmio>(
-    mmio: &mut M,
-    dccg_base: u32,
-    stream: &ActiveAudioStream,
-    src_sel: u32,
-) {
-    // DTO source select (DTO0_SOURCE_SEL = src_sel; DTO_SEL = 0).
-    let src_val = (src_sel & 0xF) << 4;
-    mmio.write(dccg_base + DCCG_AUDIO_DTO_SOURCE_REL, src_val);
+/// `dce_aud_wall_dto_setup`: the source select and DTO select go first,
+/// because "these bits must be programmed before DTO modulo and DTO phase",
+/// then module, then phase.
+pub fn program_audio_dto<M: DcnAudioMmio>(mmio: &mut M, stream: &ActiveAudioStream, src_sel: u32) {
+    // DTO0_SOURCE_SEL is the low three bits; DTO_SEL at 4 stays zero to pick
+    // DTO0.
+    let src_val = (src_sel << DCCG_AUDIO_DTO0_SOURCE_SEL_SHIFT) & DCCG_AUDIO_DTO0_SOURCE_SEL_MASK;
+    mmio.write(DCCG_AUDIO_DTO_SOURCE, src_val);
 
     let (phase, module) = stream.dto;
-    mmio.write(dccg_base + DCCG_AUDIO_DTO0_MODULE_REL, module);
-    mmio.write(dccg_base + DCCG_AUDIO_DTO0_PHASE_REL, phase);
+    mmio.write(DCCG_AUDIO_DTO0_MODULE, module);
+    mmio.write(DCCG_AUDIO_DTO0_PHASE, phase);
 }
 
-/// Encode an Azalia codec verb. Layout per the HDA spec:
-///   bits[31:28] — codec address (CAD), typically 0.
-///   bits[27:20] — node ID (NID).
-///   bits[19:0]  — verb + payload (often 4-bit verb id at [19:16] +
-///                 16-bit payload at [15:0]).
-pub fn encode_azalia_verb(cad: u8, nid: u8, verb_payload: u32) -> u32 {
-    (((cad as u32) & 0xF) << 28) | (((nid as u32) & 0xFF) << 20) | (verb_payload & 0xF_FFFF)
-}
-
-/// Issue an Azalia codec verb. Writes the verb to the codec-data
-/// register; the codec FW services it asynchronously and the
-/// response shows up in the response-data register.
+/// Write one of the codec's indirect endpoint registers.
 ///
-/// Caller polls the response register if the verb expects a response;
-/// for set-style verbs the codec just acks via a dummy read.
-pub fn write_azalia_verb<M: DcnAudioMmio>(
+/// `write_indirect_azalia_reg`: the endpoint-register index goes to
+/// `..._ENDPOINT_INDEX`, then the value to `..._ENDPOINT_DATA`. The index is
+/// one of the `IX_*` constants above.
+///
+/// LINUX-GAP: what stood here encoded an HDA verb — `cad << 28 | nid << 20 |
+/// payload` — and wrote it to `AZ_F0_CODEC_FUNCTION_CONTROL_CODEC_DATA`,
+/// polling `..._RESPONSE_DATA` for a reply. Neither register exists: the
+/// header has no `regAZ_F0_CODEC_*` at all, the real prefix being
+/// `regAZALIA_F0_CODEC_*`, and nothing in it carries a verb or a response.
+/// The display driver never speaks HDA verbs; the HDA controller on the GPU's
+/// separate PCI audio function does, and what the display side programs is
+/// this indirect endpoint space.
+pub fn write_endpoint_reg<M: DcnAudioMmio>(
     mmio: &mut M,
-    az_base: u32,
-    cad: u8,
-    nid: u8,
-    verb_payload: u32,
-) {
-    let verb = encode_azalia_verb(cad, nid, verb_payload);
-    mmio.write(az_base + AZ_F0_CODEC_FUNCTION_CONTROL_CODEC_DATA_REL, verb);
+    endpoint: u8,
+    index: u32,
+    value: u32,
+) -> bool {
+    if endpoint >= AZF0ENDPOINTS {
+        return false;
+    }
+    mmio.write(
+        for_endpoint(AZF0ENDPOINT0_CODEC_ENDPOINT_INDEX, endpoint),
+        index & AZALIA_ENDPOINT_REG_INDEX_MASK,
+    );
+    mmio.write(
+        for_endpoint(AZF0ENDPOINT0_CODEC_ENDPOINT_DATA, endpoint),
+        value,
+    );
+    true
 }
 
-/// Bind a codec instance to a CRTC's stream via the DCIO routing
-/// register. `crtc_idx` is encoded in bits[3:0]; `connector_idx`
-/// in bits[11:8]; bit 31 is the enable.
-pub fn bind_codec_to_crtc<M: DcnAudioMmio>(
-    mmio: &mut M,
-    dcio_base: u32,
-    crtc_idx: u8,
-    connector_idx: u8,
-) {
-    let val = (1u32 << 31) | ((connector_idx as u32 & 0xF) << 8) | (crtc_idx as u32 & 0xF);
-    mmio.write(dcio_base + DCIO_AUDIO_STREAM_CONTROL_REL, val);
+/// Read one of the codec's indirect endpoint registers.
+pub fn read_endpoint_reg<M: DcnAudioMmio>(mmio: &mut M, endpoint: u8, index: u32) -> Option<u32> {
+    if endpoint >= AZF0ENDPOINTS {
+        return None;
+    }
+    mmio.write(
+        for_endpoint(AZF0ENDPOINT0_CODEC_ENDPOINT_INDEX, endpoint),
+        index & AZALIA_ENDPOINT_REG_INDEX_MASK,
+    );
+    Some(mmio.read(for_endpoint(AZF0ENDPOINT0_CODEC_ENDPOINT_DATA, endpoint)))
 }
 
-/// Unbind any active codec stream from a CRTC (clears the
-/// stream-control enable bit). Idempotent.
-pub fn unbind_codec_from_crtc<M: DcnAudioMmio>(mmio: &mut M, dcio_base: u32) {
-    mmio.write(dcio_base + DCIO_AUDIO_STREAM_CONTROL_REL, 0);
-}
+// LINUX-GAP: `bind_codec_to_crtc` wrote a `DCIO_AUDIO_STREAM_CONTROL`
+// register at a "dcio_base + 0x0050", with a CRTC index in bits 3:0, a
+// connector index in 11:8 and an enable at 31. No register of that name
+// exists in any DCN header. Binding a codec endpoint to a stream is done in
+// the stream encoder (`dce110_stream_encoder.c::dce110_se_audio_mute_control`
+// and the `AFMT_*` / `HDMI_*` blocks), which this module does not model, so
+// the binding is simply absent rather than fabricated.
 
-/// Live HPD → audio binding driver: once a new stream is built
-/// in [`AudioEngine::start_stream`], the host-glue calls this to
-/// push the bindings into silicon. Combines DTO + AZALIA verb +
-/// DCIO bind in the right order:
-///   1. DTO first — codec needs the sample clock running before
-///      it can lock to the stream.
-///   2. AZALIA verb — programs the codec's converter widget +
-///      pin widget for the requested format.
-///   3. DCIO bind — connects the codec to the active CRTC's stream.
-pub fn route_active_stream<M: DcnAudioMmio>(
-    mmio: &mut M,
-    dccg_base: u32,
-    az_base: u32,
-    dcio_base: u32,
-    stream: &ActiveAudioStream,
-) {
-    // Step 1: DTO.
-    program_audio_dto(mmio, dccg_base, stream, stream.connector_idx as u32);
+/// Live HPD → audio binding driver: once a new stream is built in
+/// [`AudioEngine::start_stream`], the host glue calls this to push the
+/// bindings into silicon.
+///
+/// `dce_aud_wall_dto_setup` first, so the codec has its sample clock before
+/// anything locks to the stream, then the codec's channel-count and
+/// multichannel-enable endpoint registers.
+///
+/// LINUX-GAP: the third step was a `DCIO_AUDIO_STREAM_CONTROL` write that has
+/// no register behind it, and the second was an HDA verb written to a register
+/// that does not exist. The stream-encoder side of the binding — the `AFMT`
+/// audio packet setup and the encoder's audio enable — is not modelled here,
+/// so a real HDMI audio path still needs that work; what this does is the
+/// DCCG DTO and the indirect endpoint writes, both of which can be checked
+/// against the header.
+pub fn route_active_stream<M: DcnAudioMmio>(mmio: &mut M, stream: &ActiveAudioStream) -> bool {
+    // Step 1: the DTO, with the source select carrying the connector.
+    program_audio_dto(mmio, stream, stream.connector_idx as u32);
 
-    // Step 2: codec verb — set converter format (verb 0x2 = SET_CONVERTER_FORMAT).
-    // Payload layout per HDA: 16-bit format word (bit 14 = type, bits
-    // [13:11] = sample rate base, [10:8] = mult, [7:4] = div,
-    // [3:0] = bits/sample - 1).
-    let fmt_word = encode_format_word(stream.sample_rate_hz, 16, stream.channel_count);
-    write_azalia_verb(mmio, az_base, 0, stream.crtc_idx + 2, 0x2_0000 | fmt_word);
-
-    // Step 3: DCIO bind.
-    bind_codec_to_crtc(mmio, dcio_base, stream.crtc_idx, stream.connector_idx);
+    // Step 2: the codec endpoint. One endpoint per connector.
+    let channels = stream.channel_count.max(1) as u32;
+    if !write_endpoint_reg(
+        mmio,
+        stream.connector_idx,
+        IX_PIN_CONTROL_CHANNEL_SPEAKER,
+        channels - 1,
+    ) {
+        return false;
+    }
+    write_endpoint_reg(
+        mmio,
+        stream.connector_idx,
+        IX_PIN_CONTROL_MULTICHANNEL_ENABLE,
+        u32::from(channels > 2),
+    )
 }
 
 /// Encode an HDA stream-format word. Sample-rate base bits per
@@ -837,6 +862,8 @@ mod smoke_tests {
         }
     }
 
+    /// Dword ids spelled out from `dcn_3_1_4_offset.h`: DTO_SOURCE 0x00ab,
+    /// then **phase 0x00ac below module 0x00ad**.
     fn smoke_program_audio_dto_writes_source_module_phase() -> TestResult {
         let mut m = MockDcnAudioMmio {
             writes: alloc::vec![],
@@ -849,19 +876,27 @@ mod smoke_tests {
             channel_count: 2,
             dto: (0x12345, 0xABCDEF),
         };
-        program_audio_dto(&mut m, 0x10000, &s, 3);
-        // 3 writes: SOURCE, MODULE, PHASE.
+        program_audio_dto(&mut m, &s, 3);
+        // Three writes: SOURCE, then MODULE, then PHASE — the source select
+        // must land before the ratio, per the comment in
+        // `dce_aud_wall_dto_setup`.
         if m.writes.len() != 3 {
             return TestResult::Fail("expected 3 DTO writes");
         }
-        if m.writes[0].0 != 0x10000 + DCCG_AUDIO_DTO_SOURCE_REL {
-            return TestResult::Fail("source reg wrong");
+        // DCCG_AUDIO_DTO0_SOURCE_SEL is three bits at 0, so a source select
+        // of 3 is the literal value 3 — not 3 << 4, which is DTO_SEL.
+        if m.writes[0] != (0x00ab, 3) {
+            return TestResult::Fail("DTO_SOURCE is 0x00ab, SOURCE_SEL the low three bits");
         }
-        if m.writes[1] != (0x10000 + DCCG_AUDIO_DTO0_MODULE_REL, 0xABCDEF) {
-            return TestResult::Fail("module wrong");
+        if m.writes[1] != (0x00ad, 0xABCDEF) {
+            return TestResult::Fail("regDCCG_AUDIO_DTO0_MODULE is 0x00ad");
         }
-        if m.writes[2] != (0x10000 + DCCG_AUDIO_DTO0_PHASE_REL, 0x12345) {
-            return TestResult::Fail("phase wrong");
+        if m.writes[2] != (0x00ac, 0x12345) {
+            return TestResult::Fail("regDCCG_AUDIO_DTO0_PHASE is 0x00ac, below module");
+        }
+        // And the DTO1 pair follows the same phase-then-module order.
+        if DCCG_AUDIO_DTO1_PHASE != 0x00ae || DCCG_AUDIO_DTO1_MODULE != 0x00af {
+            return TestResult::Fail("the DTO1 pair is 0x00ae phase, 0x00af module");
         }
         TestResult::Pass
     }
@@ -870,43 +905,49 @@ mod smoke_tests {
         smoke_program_audio_dto_writes_source_module_phase
     );
 
-    fn smoke_azalia_verb_encoding() -> TestResult {
-        // CAD=0, NID=4, verb_payload=0x2_0011.
-        let v = encode_azalia_verb(0, 4, 0x2_0011);
-        // bits[27:20] = 4, bits[19:0] = 0x2_0011.
-        if (v >> 20) & 0xFF != 4 {
-            return TestResult::Fail("NID wrong");
-        }
-        if v & 0xF_FFFF != 0x2_0011 {
-            return TestResult::Fail("payload wrong");
-        }
-        TestResult::Pass
-    }
-    kernel_test_in!("drivers/gpu", smoke_azalia_verb_encoding);
-
-    fn smoke_bind_codec_to_crtc_writes_enable() -> TestResult {
+    /// The codec's endpoint space is indirect: index then data, two writes,
+    /// at `regAZF0ENDPOINTn_AZALIA_F0_CODEC_ENDPOINT_INDEX`/`_DATA`.
+    fn smoke_azalia_endpoint_is_indirect() -> TestResult {
         let mut m = MockDcnAudioMmio {
             writes: alloc::vec![],
         };
-        bind_codec_to_crtc(&mut m, 0x20000, 3, 2);
-        if m.writes.len() != 1 {
-            return TestResult::Fail("expected 1 write");
+        // Endpoint 2: 0x0386 + 2 * 6 = 0x0392, which the header spells
+        // regAZF0ENDPOINT2_….
+        if !write_endpoint_reg(&mut m, 2, IX_PIN_CONTROL_HOT_PLUG_CONTROL, 0x1) {
+            return TestResult::Fail("endpoint 2 rejected");
         }
-        let val = m.writes[0].1;
-        if val & (1 << 31) == 0 {
-            return TestResult::Fail("enable bit not set");
+        if m.writes.len() != 2 {
+            return TestResult::Fail("an indirect write is index then data");
         }
-        if val & 0xF != 3 {
-            return TestResult::Fail("crtc_idx wrong");
+        if m.writes[0] != (0x0392, 0x0054) {
+            return TestResult::Fail("the ixAZALIA_… index goes to 0x0392 on endpoint 2");
         }
-        if (val >> 8) & 0xF != 2 {
-            return TestResult::Fail("connector_idx wrong");
+        if m.writes[1] != (0x0393, 0x1) {
+            return TestResult::Fail("the value goes to the DATA register above it");
+        }
+        // Endpoint 7 is the last; 8 is not addressable.
+        if for_endpoint(AZF0ENDPOINT0_CODEC_ENDPOINT_INDEX, 7) != 0x03b0 {
+            return TestResult::Fail("endpoint 7's index register is 0x03b0");
+        }
+        if write_endpoint_reg(&mut m, AZF0ENDPOINTS, 0, 0) {
+            return TestResult::Fail("endpoint 8 accepted");
+        }
+        // The indirect indices are endpoint-register indices, not offsets,
+        // and are not ordered by what they do: hot-plug control at 0x0054
+        // sits above the sink-info block at 0x003a.
+        if IX_PIN_CONTROL_CHANNEL_SPEAKER != 0x0025
+            || IX_PIN_CONTROL_AUDIO_DESCRIPTOR0 != 0x0028
+            || IX_PIN_CONTROL_MULTICHANNEL_ENABLE != 0x0036
+            || IX_PIN_CONTROL_SINK_INFO0 != 0x003A
+            || IX_PIN_CONTROL_HOT_PLUG_CONTROL != 0x0054
+        {
+            return TestResult::Fail("ixAZALIA_F0_CODEC_PIN_CONTROL_* indices");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_bind_codec_to_crtc_writes_enable);
+    kernel_test_in!("drivers/gpu", smoke_azalia_endpoint_is_indirect);
 
-    fn smoke_route_active_stream_three_phase() -> TestResult {
+    fn smoke_route_active_stream_dto_then_endpoint() -> TestResult {
         let mut m = MockDcnAudioMmio {
             writes: alloc::vec![],
         };
@@ -915,21 +956,33 @@ mod smoke_tests {
             connector_idx: 2,
             format: AudioFormat::LinearPcm,
             sample_rate_hz: 48000,
-            channel_count: 2,
+            channel_count: 6,
             dto: (0x100, 0x200),
         };
-        route_active_stream(&mut m, 0x10000, 0x20000, 0x30000, &s);
-        // 3 DTO writes + 1 AZ codec data write + 1 DCIO bind = 5.
-        if m.writes.len() != 5 {
-            return TestResult::Fail("expected 5 writes");
+        if !route_active_stream(&mut m, &s) {
+            return TestResult::Fail("routing rejected");
         }
-        // Last write is the DCIO bind.
-        if m.writes[4].0 != 0x30000 + DCIO_AUDIO_STREAM_CONTROL_REL {
-            return TestResult::Fail("DCIO bind not last");
+        // Three DTO writes, then two indirect endpoint writes of two each.
+        if m.writes.len() != 7 {
+            return TestResult::Fail("expected 3 DTO writes and two indirect writes");
+        }
+        if m.writes[0].0 != 0x00ab {
+            return TestResult::Fail("the DTO comes first");
+        }
+        // Connector 2 selects endpoint 2.
+        if m.writes[3] != (0x0392, IX_PIN_CONTROL_CHANNEL_SPEAKER) {
+            return TestResult::Fail("channel count goes to the connector's endpoint");
+        }
+        if m.writes[4] != (0x0393, 5) {
+            return TestResult::Fail("CHANNEL_SPEAKER carries channels minus one");
+        }
+        // Six channels is multichannel.
+        if m.writes[6] != (0x0393, 1) {
+            return TestResult::Fail("six channels must enable multichannel");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_route_active_stream_three_phase);
+    kernel_test_in!("drivers/gpu", smoke_route_active_stream_dto_then_endpoint);
 
     fn smoke_encode_format_word_48khz_lpcm_stereo_16bit() -> TestResult {
         let f = encode_format_word(48000, 16, 2);

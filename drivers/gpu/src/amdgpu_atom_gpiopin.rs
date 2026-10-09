@@ -32,8 +32,6 @@
 //! pull-up/down configuration) lands when a real DCN-AUX
 //! transport needs it.
 
-use core::fmt;
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GpioPinError {
     Truncated,
@@ -42,63 +40,82 @@ pub enum GpioPinError {
     UnknownPinType(u8),
 }
 
-/// Documented `usGpioID` discriminants per AtomBios.h.
+/// `enum atom_gpio_pin_assignment_gpio_id`. There is no DDC-SCL or DDC-SDA
+/// id: an I²C pin **pair** is identified by bit 7 of `gpio_id`
+/// (`I2C_HW_CAP`), with the engine id in bits 6:4 (`I2C_HW_ENGINE_ID_MASK`)
+/// and the lane mux in bits 3:0 (`I2C_HW_LANE_MUX`). Everything without bit 7
+/// is a generic GPIO, and the handful of pre-defined ones are board-control
+/// pins in the fifties and sixties.
+///
+/// LINUX-GAP: the enum that stood here was `DdcScl = 0x000A`, `DdcSda = 0x000B`,
+/// `Hpd = 0x0001`, `PanelPower = 0x0002`, `BacklightPwm = 0x0003`,
+/// `FanTach = 0x000C`, described as "Documented `usGpioID` discriminants per
+/// AtomBios.h". None of those values or names appear in any AMD header, and
+/// `gpio_id` is one byte, not a `u16`. The DDC lines in particular are not
+/// found by id at all — `amdgpu_atombios_i2c_init` walks the LUT for entries
+/// with `I2C_HW_CAP` set and reads the register index out of each.
+pub const I2C_HW_CAP: u8 = 0x80;
+pub const I2C_HW_ENGINE_ID_MASK: u8 = 0x70;
+pub const I2C_HW_ENGINE_ID_SHIFT: u8 = 4;
+pub const I2C_HW_LANE_MUX: u8 = 0x0f;
+pub const PCIE_VDDC_CONTROL_GPIO_PINID: u8 = 56;
+pub const PP_AC_DC_SWITCH_GPIO_PINID: u8 = 60;
+pub const VDDC_VRHOT_GPIO_PINID: u8 = 61;
+pub const VDDC_PCC_GPIO_PINID: u8 = 62;
+pub const EFUSE_CUT_ENABLE_GPIO_PINID: u8 = 63;
+pub const DRAM_SELF_REFRESH_GPIO_PINID: u8 = 64;
+pub const THERMAL_INT_OUTPUT_GPIO_PINID: u8 = 65;
+
+/// `sizeof(struct atom_gpio_pin_assignment)`.
+pub const GPIO_PIN_ASSIGNMENT_BYTES: usize = 8;
+/// `sizeof(struct atom_common_table_header)` — the LUT's entries follow it.
+pub const TABLE_HEADER_BYTES: usize = 4;
+
+/// One pin-assignment entry, `struct atom_gpio_pin_assignment`:
+///
+/// ```text
+/// +0x00  data_a_reg_index    u32
+/// +0x04  gpio_bitshift       u8
+/// +0x05  gpio_mask_bitshift  u8
+/// +0x06  gpio_id             u8
+/// +0x07  reserved            u8
+/// ```
+///
+/// LINUX-GAP: the previous decode read a `u16` id at 0x00, an `index` at 0x02,
+/// a `pin_type` at 0x03, then named 0x04..0x07 `gpio_byte_offset`,
+/// `gpio_mask`, `gpio_pin_value` and `simulation_flag`. Every field was
+/// displaced, `pin_type`/`gpio_pin_value`/`simulation_flag` do not exist, and
+/// `data_a_reg_index` — the register the pin actually lives in, which is the
+/// reason the table exists — was never read at all. The 8-byte stride was the
+/// one thing right about it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum GpioId {
-    /// DDC clock line (I²C SCL for EDID DDC reads).
-    DdcScl,
-    /// DDC data line (I²C SDA).
-    DdcSda,
-    /// Hot-plug-detect input.
-    Hpd,
-    /// Panel power enable (eDP).
-    PanelPower,
-    /// Backlight PWM output.
-    BacklightPwm,
-    /// Fan tach input.
-    FanTach,
-    /// Catch-all for un-recognised IDs; preserves the raw u16.
-    Other(u16),
-}
-
-impl GpioId {
-    fn from_raw(raw: u16) -> Self {
-        match raw {
-            0x000A => GpioId::DdcScl,
-            0x000B => GpioId::DdcSda,
-            0x0001 => GpioId::Hpd,
-            0x0002 => GpioId::PanelPower,
-            0x0003 => GpioId::BacklightPwm,
-            0x000C => GpioId::FanTach,
-            other => GpioId::Other(other),
-        }
-    }
-}
-
-/// One pin-assignment entry from the GPIO pin LUT.
-#[derive(Copy, Clone)]
 pub struct GpioPin {
-    pub id: GpioId,
-    /// Per-pin index within the GPIO controller block.
-    pub index: u8,
-    /// `ucGPIO_PinType` — 0 = input, 1 = output, others
-    /// vendor-specific.
-    pub pin_type: u8,
-    pub gpio_byte_offset: u8,
-    pub gpio_mask: u8,
-    pub gpio_pin_value: u8,
-    pub simulation_flag: u8,
+    /// Dword index of the GPIO's data-A register.
+    pub data_a_reg_index: u32,
+    /// Bit position of this pin within that register.
+    pub gpio_bitshift: u8,
+    /// Bit position of this pin's mask within the paired mask register.
+    pub gpio_mask_bitshift: u8,
+    pub gpio_id: u8,
 }
 
-impl fmt::Debug for GpioPin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GpioPin")
-            .field("id", &self.id)
-            .field("index", &self.index)
-            .field("type", &self.pin_type)
-            .field("byte_off", &self.gpio_byte_offset)
-            .field("mask", &self.gpio_mask)
-            .finish_non_exhaustive()
+impl GpioPin {
+    /// `true` when `gpio_id` has `I2C_HW_CAP` set, meaning this entry is one
+    /// line of an I²C pair rather than a generic GPIO.
+    pub fn is_i2c(&self) -> bool {
+        self.gpio_id & I2C_HW_CAP != 0
+    }
+    /// The I²C engine id, bits 6:4. Meaningless unless [`Self::is_i2c`].
+    pub fn i2c_engine_id(&self) -> u8 {
+        (self.gpio_id & I2C_HW_ENGINE_ID_MASK) >> I2C_HW_ENGINE_ID_SHIFT
+    }
+    /// The I²C lane mux, bits 3:0. Meaningless unless [`Self::is_i2c`].
+    pub fn i2c_lane_mux(&self) -> u8 {
+        self.gpio_id & I2C_HW_LANE_MUX
+    }
+    /// Mask of this pin within its data-A register.
+    pub fn bit_mask(&self) -> u32 {
+        1u32 << self.gpio_bitshift
     }
 }
 
@@ -122,15 +139,15 @@ impl<'a> GpioPinLut<'a> {
         if format_revision != 1 {
             return Err(GpioPinError::UnsupportedVersion(format_revision));
         }
-        let body_bytes = raw.len().saturating_sub(4);
-        let n_pins = body_bytes / 8;
-        if 4 + n_pins * 8 > raw.len() {
-            return Err(GpioPinError::Truncated);
-        }
+        // "the real number of this included in the structure is calculated by
+        // using the (whole structure size - the header size) / size of
+        // atom_gpio_pin_lut" — the comment on `atom_gpio_pin_lut_v2_1`.
+        let body_bytes = raw.len().saturating_sub(TABLE_HEADER_BYTES);
+        let n_pins = body_bytes / GPIO_PIN_ASSIGNMENT_BYTES;
         Ok(Self {
             raw,
             n_pins,
-            cursor: 4,
+            cursor: TABLE_HEADER_BYTES,
         })
     }
 
@@ -141,35 +158,46 @@ impl<'a> GpioPinLut<'a> {
 
     /// Reset iterator cursor to the first pin.
     pub fn rewind(&mut self) {
-        self.cursor = 4;
+        self.cursor = TABLE_HEADER_BYTES;
     }
 
-    /// Look up the first entry whose `id` matches. Useful for
-    /// "give me the DDC SCL pin for connector 0".
-    pub fn find(&mut self, want: GpioId) -> Option<GpioPin> {
+    /// Look up the first entry whose `gpio_id` matches exactly.
+    pub fn find_id(&mut self, want: u8) -> Option<GpioPin> {
         self.rewind();
-        Iterator::find(self, |p| p.id == want)
+        Iterator::find(self, |p| p.gpio_id == want)
+    }
+
+    /// The I²C pin pair for `engine_id`, as `amdgpu_atombios_i2c_init` finds
+    /// it: entries with `I2C_HW_CAP` set, matched on the engine id in bits
+    /// 6:4. Returns them in table order; a pair is two consecutive entries,
+    /// clock then data.
+    pub fn find_i2c_engine(&mut self, engine_id: u8) -> Option<(GpioPin, GpioPin)> {
+        self.rewind();
+        let first = Iterator::find(self, |p| p.is_i2c() && p.i2c_engine_id() == engine_id)?;
+        let second = Iterator::find(self, |p| p.is_i2c() && p.i2c_engine_id() == engine_id)?;
+        Some((first, second))
     }
 }
 
 impl<'a> Iterator for GpioPinLut<'a> {
     type Item = GpioPin;
     fn next(&mut self) -> Option<GpioPin> {
-        if self.cursor + 8 > self.raw.len() {
+        if self.cursor + GPIO_PIN_ASSIGNMENT_BYTES > self.raw.len() {
             return None;
         }
         let off = self.cursor;
-        let raw_id = u16::from_le_bytes([self.raw[off], self.raw[off + 1]]);
         let pin = GpioPin {
-            id: GpioId::from_raw(raw_id),
-            index: self.raw[off + 2],
-            pin_type: self.raw[off + 3],
-            gpio_byte_offset: self.raw[off + 4],
-            gpio_mask: self.raw[off + 5],
-            gpio_pin_value: self.raw[off + 6],
-            simulation_flag: self.raw[off + 7],
+            data_a_reg_index: u32::from_le_bytes([
+                self.raw[off],
+                self.raw[off + 1],
+                self.raw[off + 2],
+                self.raw[off + 3],
+            ]),
+            gpio_bitshift: self.raw[off + 4],
+            gpio_mask_bitshift: self.raw[off + 5],
+            gpio_id: self.raw[off + 6],
         };
-        self.cursor += 8;
+        self.cursor += GPIO_PIN_ASSIGNMENT_BYTES;
         Some(pin)
     }
 }

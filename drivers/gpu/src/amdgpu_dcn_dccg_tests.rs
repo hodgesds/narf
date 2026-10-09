@@ -120,23 +120,42 @@ kernel_test_in!(
 
 fn dccg_stream_clock_and_dentist_resync() -> TestResult {
     let mut dccg = dccg();
-    if dccg.set_dp_stream_clock(2, StreamClock::Dtbclk).is_err() {
+    // DPIA 2 fed from OTG 1, the case that distinguishes a correct source
+    // select from an enable alone.
+    if dccg.set_dp_stream_clock(2, 1, StreamClock::Dtbclk).is_err() {
         return TestResult::Fail("DPIA stream clock rejected");
     }
-    // Four bits per DPIA; the enable sits above the three source-select bits.
-    if dccg.io.values[DPSTREAMCLK_CNTL as usize] != 1 << (2 * 4 + 3) {
-        return TestResult::Fail("DPIA stream clock encoding");
+    // Four bits per DPIA; the enable sits above the three source-select bits,
+    // and the select carries the OTG instance. Literal so that a wrong field
+    // layout fails rather than being restated.
+    if dccg.io.values[DPSTREAMCLK_CNTL as usize] != 0x0900 {
+        return TestResult::Fail("DPIA stream clock must select its own OTG, not OTG 0");
     }
-    if dccg.set_dp_stream_clock(2, StreamClock::Disabled).is_err()
+    // The OTG's DTBCLK_P mux has to be pointed at DTBCLK0 first, and source
+    // select 2 is DTBCLK0 — zero would leave it on DPREFCLK. Three bits per
+    // OTG, so OTG 1 occupies bits 5:3: select 2, enable set.
+    if dccg.io.values[DTBCLK_P_CNTL as usize] != 0x0030 {
+        return TestResult::Fail("DTBCLK_P mux not pointed at DTBCLK0 for the OTG");
+    }
+    if dccg
+        .set_dp_stream_clock(2, 1, StreamClock::Disabled)
+        .is_err()
         || dccg.io.values[DPSTREAMCLK_CNTL as usize] != 0
+        || dccg.io.values[DTBCLK_P_CNTL as usize] != 0
     {
         return TestResult::Fail("DPIA stream clock not parked");
     }
     if dccg
-        .set_dp_stream_clock(INSTANCES, StreamClock::Dtbclk)
+        .set_dp_stream_clock(INSTANCES, 0, StreamClock::Dtbclk)
         .is_ok()
     {
         return TestResult::Fail("out-of-range DPIA accepted");
+    }
+    if dccg
+        .set_dp_stream_clock(0, INSTANCES, StreamClock::Dtbclk)
+        .is_ok()
+    {
+        return TestResult::Fail("out-of-range OTG accepted");
     }
     // A resync copies the divider DENTIST is really running into the request
     // field, so the DIO FIFOs restart against the live divider.

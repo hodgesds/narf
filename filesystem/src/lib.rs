@@ -3802,6 +3802,26 @@ pub fn install_caller_capable_hook(f: fn(u32) -> bool) {
     CALLER_CAPABLE_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
 }
 
+/// Swap the caller-capability hook, returning the previous one.
+///
+/// For tests that need to exercise the UNPRIVILEGED branch of a check. The
+/// kernel-test harness task runs with the full boot capability set, so a test
+/// that simply called a gated path would only ever see the privileged answer —
+/// which is the failure mode this exists to prevent, not a hypothetical one.
+/// Restore the returned value before finishing.
+#[doc(hidden)]
+pub fn __test_swap_caller_capable_hook(f: Option<fn(u32) -> bool>) -> Option<fn(u32) -> bool> {
+    let new = f.map_or(0, |f| f as usize);
+    let old = CALLER_CAPABLE_HOOK.swap(new, core::sync::atomic::Ordering::AcqRel);
+    if old == 0 {
+        None
+    } else {
+        // SAFETY: a non-zero slot was stored as a `fn(u32) -> bool` pointer by
+        // this function or by `install_caller_capable_hook`.
+        Some(unsafe { core::mem::transmute::<usize, fn(u32) -> bool>(old) })
+    }
+}
+
 /// Whether the process this work is being done for holds `cap`, in the
 /// INITIAL user namespace — the question Linux's `capable()` asks.
 ///

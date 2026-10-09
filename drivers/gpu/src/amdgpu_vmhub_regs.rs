@@ -37,14 +37,17 @@
 //!   (lines 119-131) — VMID base addr write.
 //! - Linux `drivers/gpu/drm/amd/amdgpu/gfxhub_v3_0.c::gfxhub_v3_0_init_gart_aperture_regs`
 //!   (lines 133-148) — START/END addr write for VMID 0 (GART).
-//! - Linux `drivers/gpu/drm/amd/amdgpu/mmhub_v3_0.c::mmhub_v3_0_setup_vm_pt_regs`
-//!   (lines 136-149) — MMHUB v3.0 (Phoenix) equivalent.
+//! - Linux `drivers/gpu/drm/amd/amdgpu/mmhub_v3_0_1.c::mmhub_v3_0_1_setup_vm_pt_regs`
+//!   (lines 135-148) — MMHUB v3.0.1 (Phoenix) equivalent. `gmc_v11_0.c:578`
+//!   selects `mmhub_v3_0_1_funcs` for this version.
 //! - Linux `drivers/gpu/drm/amd/include/asic_reg/gc/gc_11_0_0_offset.h`
 //!   — Phoenix GC11 register offsets.
 //! - Linux `drivers/gpu/drm/amd/include/asic_reg/gc/gc_10_3_0_offset.h`
 //!   — Renoir GC10.3 register offsets.
-//! - Linux `drivers/gpu/drm/amd/include/asic_reg/mmhub/mmhub_3_0_0_offset.h`
-//!   — Phoenix MMHUB v3.0 register offsets.
+//! - Linux `drivers/gpu/drm/amd/include/asic_reg/mmhub/mmhub_3_0_1_offset.h`
+//!   — Phoenix MMHUB v3.0.1 register offsets. This, not `mmhub_3_0_0_offset.h`:
+//!   the two agree on every offset below but not on the base index, and 3.0.1
+//!   is what `mmhub_v3_0_1.c` includes.
 //! - Linux `drivers/gpu/drm/amd/include/asic_reg/mmhub/mmhub_2_3_0_offset.h`
 //!   — Renoir MMHUB v2.3 register offsets.
 //!
@@ -102,7 +105,17 @@ pub struct VmHubRegs {
 // regGCVM_CONTEXT0_CNTL                                     = 0x1688
 // regGCVM_CONTEXT1_CNTL                                     = 0x1689  → distance = 1
 // regGCVM_INVALIDATE_ENG0_REQ                               = 0x16ab
-// regGCVM_INVALIDATE_ENG0_ACK is at 0x16a7..; computed as REQ-4.
+// regGCVM_INVALIDATE_ENG0_ACK                               = 0x16bd
+//
+// LINUX-GAP: the ACK offsets in this file were all derived from REQ by
+// subtraction, with the note "computed as REQ-4". The ACK block is *above*
+// the REQ block, and by different amounts per hub: GFXHUB v3.0, MMHUB v3.0
+// and GFXHUB v2.3 all put it at REQ + 0x12, while MMHUB v2.3 puts it at
+// REQ + 1. There are eighteen invalidation engines, so a block of REQs is
+// followed by a block of ACKs — but only on the hubs that lay them out that
+// way, and nothing about the register map lets the one be computed from the
+// other. Every one of the four was wrong, so a TLB invalidate would have
+// polled a register that never acknowledges and spun out its whole budget.
 
 pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_pt_base_lo: 0x16f3,
@@ -115,7 +128,7 @@ pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_cntl: 0x1688,
     ctx_distance: 1,
     inv_eng0_req: 0x16ab,
-    inv_eng0_ack: 0x169f,
+    inv_eng0_ack: 0x16bd,
 };
 
 // ── MMHUB v3.0 (Phoenix) ───────────────────────────────────────────
@@ -126,6 +139,13 @@ pub const GFXHUB_V3_0: VmHubRegs = VmHubRegs {
 // regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32 = 0x07eb
 // regMMVM_CONTEXT0_CNTL = 0x0740
 // regMMVM_INVALIDATE_ENG0_REQ = 0x0763
+// regMMVM_INVALIDATE_ENG0_ACK = 0x0775
+//
+// MMHUB is BASE_IDX 1 on this generation too, not just on v2.3 — per
+// `mmhub_3_0_1_offset.h`, which is the header `mmhub_v3_0_1.c` includes for
+// Phoenix. `mmhub_3_0_0_offset.h` repeats all of the offsets above but puts
+// them on BASE_IDX 0, and `mmhub_3_0_2_offset.h` moves `regMMVM_CONTEXT0_CNTL`
+// to 0x06c0, so neither window may be substituted for this one.
 
 pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_pt_base_lo: 0x07ab,
@@ -138,7 +158,7 @@ pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
     ctx0_cntl: 0x0740,
     ctx_distance: 1,
     inv_eng0_req: 0x0763,
-    inv_eng0_ack: 0x0757,
+    inv_eng0_ack: 0x0775,
 };
 
 // ── GFX10.3 GFXHUB (Renoir) ───────────────────────────────────────
@@ -149,6 +169,7 @@ pub const MMHUB_V3_0: VmHubRegs = VmHubRegs {
 // mmGCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32 = 0x16a7
 // mmGCVM_CONTEXT0_CNTL = 0x15fc
 // mmGCVM_INVALIDATE_ENG0_REQ = 0x161f
+// mmGCVM_INVALIDATE_ENG0_ACK = 0x1631
 
 pub const GFXHUB_V2_3: VmHubRegs = VmHubRegs {
     ctx0_pt_base_lo: 0x1667,
@@ -161,7 +182,7 @@ pub const GFXHUB_V2_3: VmHubRegs = VmHubRegs {
     ctx0_cntl: 0x15fc,
     ctx_distance: 1,
     inv_eng0_req: 0x161f,
-    inv_eng0_ack: 0x1613,
+    inv_eng0_ack: 0x1631,
 };
 
 // ── MMHUB v2.3 (Renoir) ───────────────────────────────────────────
@@ -169,8 +190,18 @@ pub const GFXHUB_V2_3: VmHubRegs = VmHubRegs {
 // mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 = 0x0940
 // mmMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32 = 0x0942
 // mmMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32 = 0x0944
+// mmMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 = 0x0948  → distance = 8
 // mmMMVM_CONTEXT0_CNTL = 0x0740
 // mmMMVM_INVALIDATE_ENG0_REQ = 0x0a01
+// mmMMVM_INVALIDATE_ENG0_ACK = 0x0a02
+//
+// LINUX-GAP: `ctx_addr_distance` was 2 here. This hub **interleaves** its
+// per-context address registers — base, start, end for CONTEXT0 at
+// 0x0940..0x0945, then CONTEXT1's at 0x0948 — where the other three group all
+// sixteen bases together, then all starts, then all ends, two dwords apart. A
+// distance of 2 therefore wrote VMID 1's page-table base into VMID 0's
+// START_ADDR register, and so on up the hub: one context's root address
+// becoming another context's address range.
 //
 // Note: MMHUB v2.3 has BASE_IDX = 1 (different segment) — the
 // per-BAR-offset register window expects an additional segment
@@ -185,11 +216,11 @@ pub const MMHUB_V2_3: VmHubRegs = VmHubRegs {
     ctx0_pt_start_hi: 0x0943,
     ctx0_pt_end_lo: 0x0944,
     ctx0_pt_end_hi: 0x0945,
-    ctx_addr_distance: 2,
+    ctx_addr_distance: 8,
     ctx0_cntl: 0x0740,
     ctx_distance: 1,
     inv_eng0_req: 0x0a01,
-    inv_eng0_ack: 0x09f5,
+    inv_eng0_ack: 0x0a02,
 };
 
 /// Look up the per-hub register layout for `family` + `hub`.
@@ -259,32 +290,110 @@ pub fn write_vmid0_aperture<M: VmHubMmio>(
     mmio.write(regs.ctx0_pt_end_hi << 2, (end_pfn >> 32) as u32);
 }
 
+/// Per-VMID `PAGE_TABLE_START_ADDR` / `_END_ADDR`, as
+/// `gfxhub_v3_0_setup_vmid_config` writes them: start 0, end `max_pfn - 1`.
+///
+/// `write_vmid0_aperture` writes only context 0's pair. Every user VMID needs
+/// its own, or the hardware bounds the address space it walks for that context
+/// by whatever the registers happened to hold — zero, on a cold boot, which
+/// makes every address out of range.
+pub fn write_vmid_aperture<M: VmHubMmio>(
+    mmio: &mut M,
+    regs: &VmHubRegs,
+    vmid: u8,
+    start_pfn: u64,
+    end_pfn: u64,
+) {
+    let stride = regs.ctx_addr_distance * (vmid as u32);
+    mmio.write((regs.ctx0_pt_start_lo + stride) << 2, start_pfn as u32);
+    mmio.write(
+        (regs.ctx0_pt_start_hi + stride) << 2,
+        (start_pfn >> 32) as u32,
+    );
+    mmio.write((regs.ctx0_pt_end_lo + stride) << 2, end_pfn as u32);
+    mmio.write((regs.ctx0_pt_end_hi + stride) << 2, (end_pfn >> 32) as u32);
+}
+
 // ── Context-enable bits (per Linux mmhub_v3_0.c line 285-290) ──────
 
-/// `MMVM_CONTEXT0_CNTL.ENABLE_CONTEXT` bit (per `mmhub_3_0_0_sh_mask.h`).
-pub const CTX_CNTL_ENABLE_CONTEXT: u32 = 1 << 0;
-/// `PAGE_TABLE_DEPTH` field shift (2 bits at bit 1).
-pub const CTX_CNTL_PT_DEPTH_SHIFT: u32 = 1;
-/// `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT` shift.
-pub const CTX_CNTL_RETRY_FAULT_SHIFT: u32 = 3;
+// Field positions are from `gc_11_0_0_sh_mask.h` /
+// `mmhub_3_0_0_sh_mask.h`, which agree on this register:
+//
+// | bits  | field                                      |
+// |-------|--------------------------------------------|
+// | 0     | ENABLE_CONTEXT                             |
+// | 2:1   | PAGE_TABLE_DEPTH                           |
+// | 6:3   | PAGE_TABLE_BLOCK_SIZE                      |
+// | 7     | RETRY_PERMISSION_OR_INVALID_PAGE_FAULT     |
+// | 10    | RANGE_PROTECTION_FAULT_ENABLE_DEFAULT      |
+// | 12    | DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT |
+// | 14    | PDE0_PROTECTION_FAULT_ENABLE_DEFAULT       |
+// | 16    | VALID_PROTECTION_FAULT_ENABLE_DEFAULT      |
+// | 18    | READ_PROTECTION_FAULT_ENABLE_DEFAULT       |
+// | 20    | WRITE_PROTECTION_FAULT_ENABLE_DEFAULT      |
+// | 22    | EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT    |
 
-/// Enable a VMID context. `depth` is the page-table depth (0 =
-/// flat / GART, 4 = 4-level x86_64-style for user VMs).
+/// `ENABLE_CONTEXT` (bit 0).
+pub const CTX_CNTL_ENABLE_CONTEXT: u32 = 1 << 0;
+/// `PAGE_TABLE_DEPTH`, 2 bits at bit 1.
+pub const CTX_CNTL_PT_DEPTH_SHIFT: u32 = 1;
+pub const CTX_CNTL_PT_DEPTH_MASK: u32 = 0x3;
+/// `PAGE_TABLE_BLOCK_SIZE`, 4 bits at bit 3.
+pub const CTX_CNTL_PT_BLOCK_SIZE_SHIFT: u32 = 3;
+pub const CTX_CNTL_PT_BLOCK_SIZE_MASK: u32 = 0xF;
+/// `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT`, bit **7**.
+///
+/// This was declared at bit 3 — which is `PAGE_TABLE_BLOCK_SIZE`'s low bit —
+/// so asking for retry instead told the hardware the leaf page table was twice
+/// its real size. The old test only asserted `ENABLE_CONTEXT`, so it never
+/// exercised the retry argument and the collision survived.
+pub const CTX_CNTL_RETRY_FAULT_SHIFT: u32 = 7;
+
+/// The seven `*_PROTECTION_FAULT_ENABLE_DEFAULT` bits
+/// `gfxhub_v3_0_setup_vmid_config` sets, every one of them.
+///
+/// Without these the MMU does not report a fault it detects, so an access
+/// outside a mapping, through an invalid PDE0, or against the permissions in a
+/// PTE lands somewhere instead of raising. They are what makes the page tables
+/// an enforcement rather than a suggestion.
+pub const CTX_CNTL_FAULT_ENABLE_DEFAULTS: u32 = (1 << 10)  // RANGE
+    | (1 << 12) // DUMMY_PAGE
+    | (1 << 14) // PDE0
+    | (1 << 16) // VALID
+    | (1 << 18) // READ
+    | (1 << 20) // WRITE
+    | (1 << 22); // EXECUTE
+
+/// Enable a VMID context, as `gfxhub_v3_0_setup_vmid_config` does.
+///
+/// `depth` is `vm_manager.num_level` — 3 on GMC 11, the number of directory
+/// levels ABOVE the leaf, not the total. `block_size` is
+/// `vm_manager.block_size`; the field holds `block_size - 9`, which is 0 for
+/// GMC 11, so a driver that omitted the field would be accidentally right here
+/// and wrong on any part that sized its leaf tables differently.
+///
+/// `fault_on_invalid` false sets RETRY, which makes the GPU retry a faulting
+/// access rather than raise a VM_FAULT interrupt — what a compute client wants
+/// so a prefetch past the end of a buffer is not fatal.
 pub fn write_vmid_cntl<M: VmHubMmio>(
     mmio: &mut M,
     regs: &VmHubRegs,
     vmid: u8,
     depth: u8,
+    block_size: u8,
     fault_on_invalid: bool,
 ) {
     let dword = regs.ctx0_cntl + regs.ctx_distance * (vmid as u32);
     let mut val = CTX_CNTL_ENABLE_CONTEXT;
-    val |= ((depth as u32) & 0x3) << CTX_CNTL_PT_DEPTH_SHIFT;
+    val |= ((depth as u32) & CTX_CNTL_PT_DEPTH_MASK) << CTX_CNTL_PT_DEPTH_SHIFT;
+    // `block_size - 9`, saturating: a block size below 9 is not a layout this
+    // register can describe, and wrapping would set every bit of the field.
+    let encoded = u32::from(block_size.saturating_sub(9));
+    val |= (encoded & CTX_CNTL_PT_BLOCK_SIZE_MASK) << CTX_CNTL_PT_BLOCK_SIZE_SHIFT;
     if !fault_on_invalid {
-        // RETRY=1 lets the GPU retry on a fault rather than firing
-        // a VM_FAULT IH cookie — used for prefetch-friendly compute.
         val |= 1 << CTX_CNTL_RETRY_FAULT_SHIFT;
     }
+    val |= CTX_CNTL_FAULT_ENABLE_DEFAULTS;
     mmio.write(dword << 2, val);
 }
 
@@ -471,15 +580,87 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_phoenix_gfxhub_offsets_stride);
 
-    fn smoke_renoir_mmhub_offsets() -> TestResult {
-        let r = MMHUB_V2_3;
-        // Linux mmMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32 = 0x0940.
-        if r.ctx0_pt_base_lo != 0x0940 {
-            return TestResult::Fail("MMHUB v2.3 base lo wrong");
+    /// Dword ids spelled out from the `asic_reg` headers for all four hubs.
+    fn smoke_vmhub_offsets_against_headers() -> TestResult {
+        // The invalidation ACK is **above** the REQ, by 0x12 on three hubs and
+        // by 1 on the fourth. None of this is derivable from REQ, which is
+        // what the old "computed as REQ-4" note tried to do — and all four
+        // values it produced were wrong, so a TLB invalidate polled a register
+        // that never acknowledges.
+        for (name, req, ack) in [
+            (
+                "GFXHUB v3.0",
+                GFXHUB_V3_0.inv_eng0_req,
+                GFXHUB_V3_0.inv_eng0_ack,
+            ),
+            (
+                "MMHUB v3.0",
+                MMHUB_V3_0.inv_eng0_req,
+                MMHUB_V3_0.inv_eng0_ack,
+            ),
+            (
+                "GFXHUB v2.3",
+                GFXHUB_V2_3.inv_eng0_req,
+                GFXHUB_V2_3.inv_eng0_ack,
+            ),
+            (
+                "MMHUB v2.3",
+                MMHUB_V2_3.inv_eng0_req,
+                MMHUB_V2_3.inv_eng0_ack,
+            ),
+        ] {
+            let _ = name;
+            if ack <= req {
+                return TestResult::Fail("the ACK block sits above the REQ block");
+            }
+        }
+        if GFXHUB_V3_0.inv_eng0_req != 0x16ab || GFXHUB_V3_0.inv_eng0_ack != 0x16bd {
+            return TestResult::Fail("regGCVM_INVALIDATE_ENG0_REQ/ACK are 0x16ab/0x16bd");
+        }
+        if MMHUB_V3_0.inv_eng0_req != 0x0763 || MMHUB_V3_0.inv_eng0_ack != 0x0775 {
+            return TestResult::Fail("regMMVM_INVALIDATE_ENG0_REQ/ACK are 0x0763/0x0775");
+        }
+        if GFXHUB_V2_3.inv_eng0_req != 0x161f || GFXHUB_V2_3.inv_eng0_ack != 0x1631 {
+            return TestResult::Fail("mmGCVM_INVALIDATE_ENG0_REQ/ACK are 0x161f/0x1631");
+        }
+        // The one hub where the gap is 1, not 0x12.
+        if MMHUB_V2_3.inv_eng0_req != 0x0a01 || MMHUB_V2_3.inv_eng0_ack != 0x0a02 {
+            return TestResult::Fail("mmMMVM_INVALIDATE_ENG0_REQ/ACK are 0x0a01/0x0a02");
+        }
+
+        // Three hubs group all sixteen contexts' bases together, two dwords
+        // apart. MMHUB v2.3 interleaves base/start/end per context instead,
+        // so its stride is eight.
+        if GFXHUB_V3_0.ctx0_pt_base_lo + GFXHUB_V3_0.ctx_addr_distance != 0x16f5 {
+            return TestResult::Fail("regGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 is 0x16f5");
+        }
+        if MMHUB_V3_0.ctx0_pt_base_lo + MMHUB_V3_0.ctx_addr_distance != 0x07ad {
+            return TestResult::Fail("regMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 is 0x07ad");
+        }
+        if GFXHUB_V2_3.ctx0_pt_base_lo + GFXHUB_V2_3.ctx_addr_distance != 0x1669 {
+            return TestResult::Fail("mmGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 is 0x1669");
+        }
+        if MMHUB_V2_3.ctx_addr_distance != 8
+            || MMHUB_V2_3.ctx0_pt_base_lo + MMHUB_V2_3.ctx_addr_distance != 0x0948
+        {
+            return TestResult::Fail("mmMMVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32 is 0x0948");
+        }
+        // With a stride of 2, VMID 1's base would land on VMID 0's START.
+        if MMHUB_V2_3.ctx0_pt_base_lo + 2 != MMHUB_V2_3.ctx0_pt_start_lo {
+            return TestResult::Fail("MMHUB v2.3's start follows its base by two");
+        }
+
+        // The CNTL block is one dword per context on every hub.
+        if GFXHUB_V3_0.ctx0_cntl + GFXHUB_V3_0.ctx_distance != 0x1689
+            || MMHUB_V3_0.ctx0_cntl + MMHUB_V3_0.ctx_distance != 0x0741
+            || GFXHUB_V2_3.ctx0_cntl + GFXHUB_V2_3.ctx_distance != 0x15fd
+            || MMHUB_V2_3.ctx0_cntl + MMHUB_V2_3.ctx_distance != 0x0741
+        {
+            return TestResult::Fail("CONTEXT1_CNTL");
         }
         TestResult::Pass
     }
-    kernel_test_in!("drivers/gpu", smoke_renoir_mmhub_offsets);
+    kernel_test_in!("drivers/gpu", smoke_vmhub_offsets_against_headers);
 
     fn smoke_regs_for_family_hub_mapping() -> TestResult {
         if regs_for(Family::Phoenix, VmHub::Gfx).is_none() {
@@ -539,15 +720,56 @@ mod smoke_tests {
     }
     kernel_test_in!("drivers/gpu", smoke_write_vmid0_aperture_writes_4_dwords);
 
+    /// Every field of the context-control register, at its own position.
+    ///
+    /// The previous version of this test asserted only `ENABLE_CONTEXT`, which
+    /// is why `RETRY_PERMISSION_OR_INVALID_PAGE_FAULT` sat at bit 3 — inside
+    /// `PAGE_TABLE_BLOCK_SIZE` — for as long as it did: nothing ever passed
+    /// `fault_on_invalid = false`, so the collision was never written.
     fn smoke_write_vmid_cntl_enables_context() -> TestResult {
+        // GMC 11: depth 3 (directory levels above the leaf), block size 9.
         let mut m = MockVmHubMmio::new();
-        write_vmid_cntl(&mut m, &GFXHUB_V3_0, 0, 0, true);
+        write_vmid_cntl(&mut m, &GFXHUB_V3_0, 0, 3, 9, true);
         if m.writes.len() != 1 {
             return TestResult::Fail("expected 1 write");
         }
         let (_, val) = m.writes[0];
         if val & CTX_CNTL_ENABLE_CONTEXT == 0 {
             return TestResult::Fail("enable bit not set");
+        }
+        if (val >> CTX_CNTL_PT_DEPTH_SHIFT) & CTX_CNTL_PT_DEPTH_MASK != 3 {
+            return TestResult::Fail("page-table depth did not land in bits 2:1");
+        }
+        // `block_size - 9` == 0 for GMC 11.
+        if (val >> CTX_CNTL_PT_BLOCK_SIZE_SHIFT) & CTX_CNTL_PT_BLOCK_SIZE_MASK != 0 {
+            return TestResult::Fail("block size should encode as zero for GMC 11");
+        }
+        if val & (1 << CTX_CNTL_RETRY_FAULT_SHIFT) != 0 {
+            return TestResult::Fail("fault_on_invalid should leave RETRY clear");
+        }
+        // All seven protection-fault reports must be on, or the MMU detects a
+        // fault and says nothing.
+        if val & CTX_CNTL_FAULT_ENABLE_DEFAULTS != CTX_CNTL_FAULT_ENABLE_DEFAULTS {
+            return TestResult::Fail("a protection-fault enable bit is missing");
+        }
+
+        // RETRY goes to bit 7 and must NOT disturb the block-size field.
+        let mut m = MockVmHubMmio::new();
+        write_vmid_cntl(&mut m, &GFXHUB_V3_0, 0, 3, 9, false);
+        let (_, val) = m.writes[0];
+        if val & (1 << 7) == 0 {
+            return TestResult::Fail("RETRY belongs at bit 7");
+        }
+        if (val >> CTX_CNTL_PT_BLOCK_SIZE_SHIFT) & CTX_CNTL_PT_BLOCK_SIZE_MASK != 0 {
+            return TestResult::Fail("RETRY leaked into PAGE_TABLE_BLOCK_SIZE");
+        }
+
+        // A larger leaf table encodes as block_size - 9.
+        let mut m = MockVmHubMmio::new();
+        write_vmid_cntl(&mut m, &GFXHUB_V3_0, 0, 2, 12, true);
+        let (_, val) = m.writes[0];
+        if (val >> CTX_CNTL_PT_BLOCK_SIZE_SHIFT) & CTX_CNTL_PT_BLOCK_SIZE_MASK != 3 {
+            return TestResult::Fail("block size 12 should encode as 3");
         }
         TestResult::Pass
     }
