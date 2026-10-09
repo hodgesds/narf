@@ -1444,3 +1444,198 @@ pub fn build_ring_test_packet(gc_base_idx1: u32) -> Option<[u32; 3]> {
 pub fn ring_test_scratch_dword(gc_base_idx1: u32) -> Option<u32> {
     gc_base_idx1.checked_add(GFX11_SCRATCH_REG0)
 }
+
+// ── Compute queue context ──────────────────────────────────────────
+
+/// Why [`ComputeContext::new`] or [`ComputeContext::write_mqd`] refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ComputeCtxError {
+    /// Allocation failed.
+    NoMemory,
+    /// `Ring::new` refused.
+    Ring(RingError),
+    /// `compute_mqd_init` rejected the derived properties.
+    BadProp,
+    /// The (mec, pipe, queue) coordinate is outside what the MEC has.
+    BadCoordinate,
+}
+
+impl From<RingError> for ComputeCtxError {
+    fn from(e: RingError) -> Self {
+        ComputeCtxError::Ring(e)
+    }
+}
+
+/// Per-queue compute submission context: ring, writeback page, queue
+/// descriptor and end-of-pipe buffer.
+///
+/// The compute side had no owner. [`crate::amdgpu_compute::ComputeQueue`] is
+/// bookkeeping — it records an `(me, pipe, queue)` coordinate and an
+/// `mqd_phys` some caller supplies — so nothing allocated the ring, the
+/// descriptor or the EOP buffer, exactly as nothing allocated the graphics
+/// descriptor before [`GfxContext`] took it on.
+#[derive(Debug)]
+pub struct ComputeContext {
+    ring: Ring,
+    wb: DmaBuffer,
+    mqd: DmaBuffer,
+    /// End-of-pipe buffer. Linux allocates **one** region for every compute
+    /// ring and carves it at `ring_id * GFX11_MEC_HPD_SIZE`; one per context
+    /// here, because a context owns its own pages and the carve is only a
+    /// consequence of the shared allocation.
+    eop: DmaBuffer,
+    /// `ring->me`, which is **`mec + 1`** — `gfx_v11_0_compute_ring_init`
+    /// comments "mec0 is me1". The graphics ME is 0, so the first MEC's queues
+    /// report 1, and a coordinate built with `me = mec` names the graphics
+    /// engine's pipe instead.
+    me: u32,
+    pipe: u32,
+    queue: u32,
+}
+
+/// `v11_compute_mqd` is 512 dwords, like the graphics image.
+pub const COMPUTE_MQD_BYTES: usize = crate::amdgpu_mqd::COMPUTE_MQD_DWORDS * 4;
+
+impl ComputeContext {
+    /// Allocate a compute context for ring `ring_id` on `(mec, pipe, queue)`.
+    ///
+    /// `ring_id` picks the doorbell: `AMDGPU_NAVI10_DOORBELL_MEC_RING0 +
+    /// ring_id`, which is the assignment-enum space [`Ring::new`] takes.
+    pub fn new(ring_id: u32, mec: u32, pipe: u32, queue: u32) -> Result<Self, ComputeCtxError> {
+        use crate::amdgpu_ring::doorbell_assignment as db;
+        // The assignment table is 16-bit and the MEC block is small; a
+        // ring_id that walks off it would collide with another engine's
+        // doorbell rather than fail.
+        let slot = u32::from(db::MEC_RING0)
+            .checked_add(ring_id)
+            .filter(|s| *s < u32::from(db::USERQUEUE_END))
+            .ok_or(ComputeCtxError::BadCoordinate)?;
+
+        // A compute doorbell carries the dword wptr as a quadword, the same
+        // protocol the GFX ring and the MES use.
+        let ring = Ring::new(slot as u16, crate::amdgpu_ring::DoorbellKind::Gfx)?;
+        let wb =
+            alloc_coherent(WB_BYTES, DomainId::DRIVER_0).map_err(|_| ComputeCtxError::NoMemory)?;
+        let mqd = alloc_coherent(COMPUTE_MQD_BYTES, DomainId::DRIVER_0)
+            .map_err(|_| ComputeCtxError::NoMemory)?;
+        let eop = alloc_coherent(
+            crate::amdgpu_mqd::MEC_HPD_BYTES as usize,
+            DomainId::DRIVER_0,
+        )
+        .map_err(|_| ComputeCtxError::NoMemory)?;
+        // SAFETY: identity-mapped DMA pages this context owns.
+        unsafe {
+            for offset in (0..WB_BYTES as u64).step_by(8) {
+                core::ptr::write_volatile(wb.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+            for offset in (0..COMPUTE_MQD_BYTES as u64).step_by(8) {
+                core::ptr::write_volatile(mqd.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+            for offset in (0..crate::amdgpu_mqd::MEC_HPD_BYTES).step_by(8) {
+                core::ptr::write_volatile(eop.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+        }
+        Ok(Self {
+            ring,
+            wb,
+            mqd,
+            eop,
+            // mec0 is me1.
+            me: mec + 1,
+            pipe,
+            queue,
+        })
+    }
+
+    pub fn ring_phys(&self) -> u64 {
+        self.ring.phys_addr()
+    }
+    pub fn mqd_phys(&self) -> u64 {
+        self.mqd.dma_addr().raw()
+    }
+    pub fn eop_phys(&self) -> u64 {
+        self.eop.dma_addr().raw()
+    }
+    pub fn rptr_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_RPTR_OFFSET
+    }
+    pub fn wptr_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_WPTR_OFFSET
+    }
+    pub fn fence_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_FENCE_OFFSET
+    }
+    /// `(me, pipe, queue)` — with `me` already `mec + 1`.
+    pub fn coordinate(&self) -> (u32, u32, u32) {
+        (self.me, self.pipe, self.queue)
+    }
+    pub fn doorbell_index_dw(&self) -> u32 {
+        self.ring.doorbell_index_dw()
+    }
+    pub fn doorbell_offset(&self) -> u64 {
+        self.ring.doorbell_offset()
+    }
+
+    /// One dword of the descriptor, by its `v11_compute_mqd` index.
+    pub fn mqd_dword(&self, index: usize) -> u32 {
+        if index >= crate::amdgpu_mqd::COMPUTE_MQD_DWORDS {
+            return 0;
+        }
+        // SAFETY: identity-mapped page this context owns, index bounded above.
+        unsafe { core::ptr::read_volatile(self.mqd.cpu_ptr_at::<u32>((index * 4) as u64)) }
+    }
+
+    /// Build this queue's descriptor from the context's own addresses and
+    /// write it into the page the firmware reads.
+    ///
+    /// No [`crate::amdgpu_mqd::MqdProp`] parameter, for the reason
+    /// [`GfxContext::write_mqd`] has none: the addresses appear in the
+    /// descriptor, the mapping packet and (on the KIQ path) the HQD registers,
+    /// and a caller filling them separately can fill them differently.
+    pub fn write_mqd(&self) -> Result<(), ComputeCtxError> {
+        let prop = MqdProp {
+            mqd_gpu_addr: self.mqd_phys(),
+            hqd_base_gpu_addr: self.ring_phys(),
+            rptr_gpu_addr: self.rptr_phys(),
+            wptr_gpu_addr: self.wptr_phys(),
+            queue_size: crate::amdgpu_ring::RING_SIZE_DW as u64 * 4,
+            doorbell_index: self.ring.doorbell_index_dw(),
+            use_doorbell: true,
+            kernel_queue: true,
+            tmz_queue: false,
+            // Ring 0 is not a high-priority compute queue, so neither
+            // priority field is raised.
+            priority: crate::amdgpu_mqd::QueuePriority::Normal,
+            shadow_addr: 0,
+            gds_bkup_addr: 0,
+            csa_addr: 0,
+            fence_address: 0,
+        };
+        let mqd = crate::amdgpu_mqd::compute_mqd_init(&prop, self.eop_phys())
+            .map_err(|_| ComputeCtxError::BadProp)?;
+        // SAFETY: identity-mapped page this context owns; `mqd` is exactly
+        // COMPUTE_MQD_DWORDS dwords and the allocation is COMPUTE_MQD_BYTES.
+        unsafe {
+            for (i, dw) in mqd.iter().enumerate() {
+                core::ptr::write_volatile(self.mqd.cpu_mut_ptr_at::<u32>((i * 4) as u64), *dw);
+            }
+        }
+        Ok(())
+    }
+
+    /// The MES legacy-queue mapping for this compute queue.
+    ///
+    /// `queue_type` is `Compute`, not `Gfx` — the scheduler places the queue
+    /// on a MEC pipe from that field, and the graphics value would send it to
+    /// the wrong engine with an otherwise valid-looking packet.
+    pub fn map_legacy_args(&self) -> crate::amdgpu_mes::MesMapLegacyQueueArgs {
+        crate::amdgpu_mes::MesMapLegacyQueueArgs {
+            pipe_id: self.pipe,
+            queue_id: self.queue,
+            doorbell_offset: self.ring.doorbell_index_dw(),
+            mqd_addr: self.mqd_phys(),
+            wptr_addr: self.wptr_phys(),
+            queue_type: crate::amdgpu_mes::MesQueueType::Compute,
+        }
+    }
+}

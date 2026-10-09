@@ -101,6 +101,8 @@ pub mod doorbell_assignment {
     /// The KIQ sits at index 0, which is why a "no doorbell" value cannot be
     /// 0 for compute.
     pub const KIQ: u16 = 0x000;
+    /// First compute (MEC) ring. Ring `n` is `MEC_RING0 + n`.
+    pub const MEC_RING0: u16 = 0x003;
     /// Last index available to user queues on the compute/MEC side.
     pub const USERQUEUE_END: u16 = 0x08A;
     /// Graphics ring 0.

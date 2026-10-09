@@ -7948,6 +7948,154 @@ kernel_test_in!(
     smoke_amdgpu_gfx11_ring_test_packet
 );
 
+/// `ComputeContext` — the compute ring finally has an owner.
+///
+/// Two things it must get right that the graphics side does not have to:
+/// `ring->me` is **`mec + 1`** (`gfx_v11_0_compute_ring_init`: "mec0 is me1"),
+/// and the mapping packet's `queue_type` is `Compute`. Both produce a packet
+/// that looks entirely valid and sends the queue to the wrong engine.
+fn smoke_amdgpu_compute_context_describes_itself() -> TestResult {
+    use crate::amdgpu_compute::ComputeQueue;
+    use crate::amdgpu_gfx::{ComputeContext, COMPUTE_MQD_BYTES};
+    use crate::amdgpu_mqd as m;
+    use crate::amdgpu_ring::doorbell_assignment as db;
+
+    if COMPUTE_MQD_BYTES != 2048 {
+        return TestResult::Fail("v11_compute_mqd is 512 dwords");
+    }
+    if db::MEC_RING0 != 0x003 {
+        return TestResult::Fail("AMDGPU_NAVI10_DOORBELL_MEC_RING0 is 0x003");
+    }
+
+    // Ring 0 on mec 0, pipe 0, queue 0.
+    let ctx = match ComputeContext::new(0, 0, 0, 0) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ComputeContext::new failed"),
+    };
+    if ctx.write_mqd().is_err() {
+        return TestResult::Fail("the derived compute descriptor was refused");
+    }
+
+    // mec0 is me1. A coordinate of me 0 would name the graphics engine.
+    if ctx.coordinate() != (1, 0, 0) {
+        return TestResult::Fail("mec 0 reports me 1");
+    }
+    let (me, _, _) = ComputeContext::new(1, 1, 2, 3)
+        .map(|c| c.coordinate())
+        .unwrap_or((0, 0, 0));
+    if me != 2 {
+        return TestResult::Fail("mec 1 reports me 2");
+    }
+
+    // The doorbell: MEC_RING0 + ring_id in the assignment space, doubled for
+    // `ring->doorbell_index`. Ring 0 is slot 3, index 6.
+    if ctx.doorbell_index_dw() != 6 {
+        return TestResult::Fail("compute ring 0's doorbell_index is (0x003 + 0) << 1");
+    }
+    let ring2 = match ComputeContext::new(2, 0, 0, 0) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ring 2 was refused"),
+    };
+    if ring2.doorbell_index_dw() != (3 + 2) << 1 {
+        return TestResult::Fail("ring n's doorbell is (MEC_RING0 + n) << 1");
+    }
+    if u64::from(ctx.doorbell_index_dw()) * 4 != ctx.doorbell_offset() {
+        return TestResult::Fail("the dword index and the byte offset must agree");
+    }
+    // A ring_id that would walk out of the MEC doorbell block is refused
+    // rather than colliding with another engine's doorbell.
+    if ComputeContext::new(0x200, 0, 0, 0).is_ok() {
+        return TestResult::Fail("a ring_id past the MEC block must be refused");
+    }
+
+    // Four separate allocations.
+    for (a, b) in [
+        (ctx.mqd_phys(), ctx.ring_phys()),
+        (ctx.mqd_phys(), ctx.eop_phys()),
+        (ctx.eop_phys(), ctx.ring_phys()),
+        (ctx.mqd_phys(), ctx.rptr_phys()),
+    ] {
+        if a == b {
+            return TestResult::Fail("the descriptor, EOP, ring and writeback must not share");
+        }
+    }
+    if ctx.rptr_phys() == ctx.wptr_phys() || ctx.wptr_phys() == ctx.fence_phys() {
+        return TestResult::Fail("the three writeback slots must not overlap");
+    }
+
+    // The descriptor names this context's ring and EOP, both shifted right
+    // by 8.
+    let base = (u64::from(ctx.mqd_dword(m::C_CP_HQD_PQ_BASE_HI)) << 32)
+        | u64::from(ctx.mqd_dword(m::C_CP_HQD_PQ_BASE_LO));
+    if base << 8 != ctx.ring_phys() {
+        return TestResult::Fail("the descriptor does not name this context's ring");
+    }
+    let eop = (u64::from(ctx.mqd_dword(m::C_CP_HQD_EOP_BASE_ADDR_HI)) << 32)
+        | u64::from(ctx.mqd_dword(m::C_CP_HQD_EOP_BASE_ADDR_LO));
+    if eop << 8 != ctx.eop_phys() {
+        return TestResult::Fail("the descriptor does not name this context's EOP buffer");
+    }
+    // A compute queue is handed over INACTIVE — the scheduler activates it.
+    // That is the opposite of the MES pipe's own descriptor.
+    if ctx.mqd_dword(m::C_CP_HQD_ACTIVE) != 0 {
+        return TestResult::Fail("a compute queue is activated by the scheduler, not here");
+    }
+
+    // The mapping packet: compute, this coordinate, this descriptor.
+    let args = ctx.map_legacy_args();
+    if args.queue_type != crate::amdgpu_mes::MesQueueType::Compute {
+        return TestResult::Fail("a compute ring maps as a COMPUTE queue");
+    }
+    if args.queue_type == crate::amdgpu_mes::MesQueueType::Gfx {
+        return TestResult::Fail("...and not as a graphics one");
+    }
+    if (args.pipe_id, args.queue_id) != (0, 0) {
+        return TestResult::Fail("the packet carries this context's pipe and queue");
+    }
+    if args.mqd_addr != ctx.mqd_phys() || args.wptr_addr != ctx.wptr_phys() {
+        return TestResult::Fail("the packet names this context's own pages");
+    }
+    if args.doorbell_offset != ctx.doorbell_index_dw() {
+        return TestResult::Fail("the packet carries the dword doorbell index");
+    }
+    // The coordinate the packet carries is pipe/queue — NOT me. `me` selects
+    // the engine through the MES queue_type and, on the KIQ path, through
+    // MAP_QUEUES' ME field; it is not an ADD_QUEUE field at all.
+    let deep = match ComputeContext::new(1, 0, 3, 2) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("pipe 3 queue 2 was refused"),
+    };
+    if (
+        deep.map_legacy_args().pipe_id,
+        deep.map_legacy_args().queue_id,
+    ) != (3, 2)
+    {
+        return TestResult::Fail("the packet follows the context's coordinate");
+    }
+
+    // And the bookkeeping struct can now be filled from a context that owns
+    // the pages, rather than from an mqd_phys the caller invented.
+    let book = ComputeQueue {
+        me: ctx.coordinate().0 as u8,
+        pipe: ctx.coordinate().1 as u8,
+        queue: ctx.coordinate().2 as u8,
+        doorbell_off: ctx.doorbell_index_dw(),
+        mqd_phys: ctx.mqd_phys(),
+        vmid: None,
+        mapped: false,
+        priority: crate::amdgpu_compute::ComputePriority::Normal,
+        cwsr: None,
+    };
+    if book.mqd_phys != ctx.mqd_phys() || book.me != 1 {
+        return TestResult::Fail("the bookkeeping entry should mirror the context");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_compute_context_describes_itself
+);
+
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
