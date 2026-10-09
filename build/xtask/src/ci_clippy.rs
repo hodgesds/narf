@@ -16,6 +16,15 @@ pub struct Args {
     /// Print commands without running Clippy (metadata is still resolved).
     #[arg(long)]
     dry_run: bool,
+
+    /// Lint the selected crates in their loadable-`module` configuration —
+    /// `--no-default-features --features module` on the kernel target —
+    /// instead of the frame-unified built-in feature contexts. Use this for
+    /// dual-build driver crates, whose `#[cfg(feature = "module")]` glue
+    /// (`narf_module_init`, the `.modinfo` statics, the panic handler) is not
+    /// compiled — and therefore not linted — in the default `builtin` build.
+    #[arg(long)]
+    module_config: bool,
 }
 
 const CONTEXTS: &[&str] = &[
@@ -113,6 +122,37 @@ pub fn run(args: &Args, root: &Path) -> Result<()> {
         return Ok(());
     }
     let target = format!("{}-unknown-none", args.arch);
+
+    // Module-config pass: lint the loadable-`.ko` build directly. There is no
+    // frame to unify features through here (a module is not linked into the
+    // kernel), so bypass the planning loop and pin the exact feature set the
+    // `xtask build-module` path uses.
+    if args.module_config {
+        let mut module_args = vec![
+            "clippy".to_string(),
+            "--locked".to_string(),
+            "--no-deps".to_string(),
+            "--target".to_string(),
+            target.clone(),
+            "-Zbuild-std=core,compiler_builtins,alloc".to_string(),
+            "-Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128".to_string(),
+            "--no-default-features".to_string(),
+            "--features".to_string(),
+            "module".to_string(),
+        ];
+        for package in &selected {
+            module_args.extend(["-p".to_string(), package.clone()]);
+        }
+        module_args.extend(["--".to_string(), "-D".to_string(), "warnings".to_string()]);
+        let mut cmd = Command::new("cargo");
+        cmd.current_dir(root).args(&module_args);
+        eprintln!("clippy-changed (module): {cmd:?}");
+        if !args.dry_run && !cmd.status().context("run module-config Clippy")?.success() {
+            bail!("module-config Clippy failed");
+        }
+        return Ok(());
+    }
+
     let metadata = read_json(Command::new("cargo").current_dir(root).args([
         "metadata",
         "--locked",
