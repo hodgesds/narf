@@ -995,7 +995,7 @@ mod tests {
                 class_high: 0x04,
             },
         ];
-        let out = isolation_blockers("12", &members, &[gpu.clone()]);
+        let out = isolation_blockers("12", &members, std::slice::from_ref(&gpu));
         assert_eq!(out.len(), 1);
         assert!(
             matches!(&out[0], Blocker::GroupNotIsolated { stranger, stranger_driver, .. }

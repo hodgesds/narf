@@ -86,6 +86,12 @@ pub struct Snapshot {
     pub family: Family,
     /// Visible VRAM aperture, in bytes.
     pub vram_size: u64,
+    /// The part of VRAM the CPU can reach. Equal to `vram_size` on an APU;
+    /// BAR0's length on a discrete card. See `VramInfo::visible_size`.
+    pub visible_vram_size: u64,
+    /// Whether this part is an APU, which is what `AMDGPU_IDS_FLAGS_FUSION`
+    /// reports.
+    pub is_apu: bool,
     pub gc: Option<GcInfo>,
     pub ip_blocks: Vec<crate::amdgpu_discovery::IpBlock>,
 }
@@ -95,6 +101,8 @@ fn snapshot() -> Option<Snapshot> {
         did: gpu.chip.did as u32,
         family: gpu.chip.family,
         vram_size: gpu.vram.size,
+        visible_vram_size: gpu.vram.visible_size,
+        is_apu: gpu.vram.fully_visible(),
         gc: gpu.gc_info,
         ip_blocks: gpu.ip_blocks.clone(),
     })
@@ -155,11 +163,20 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
         cu_active_number: gc.total_cus(),
         num_rb_pipes: gc.num_rb_per_se.saturating_mul(gc.num_se),
         num_hw_gfx_contexts: GFX11_HW_CONTEXTS,
-        // Every part this driver supports is an APU, which is what
-        // AMDGPU_IDS_FLAGS_FUSION means. PREEMPTION, TMZ and GANG_SUBMIT are
-        // deliberately NOT claimed: each is a submission-path capability and
-        // there is no submission path.
-        ids_flags: u64::from(uapi::AMDGPU_IDS_FLAGS_FUSION),
+        // FUSION means the GPU shares the CPU's memory — an APU. It used to
+        // be claimed unconditionally, on the premise that "every part this
+        // driver supports is an APU". A discrete card is not, and userspace
+        // uses this to decide whether a buffer in system memory is as good as
+        // one in VRAM.
+        //
+        // PREEMPTION, TMZ and GANG_SUBMIT are still deliberately NOT claimed:
+        // each is a submission-path capability and there is no submission
+        // path.
+        ids_flags: if snap.is_apu {
+            u64::from(uapi::AMDGPU_IDS_FLAGS_FUSION)
+        } else {
+            0
+        },
         // Both are `max(PAGE_SIZE, AMDGPU_GPU_PAGE_SIZE)`, 4 KiB here.
         virtual_address_alignment: AMDGPU_GPU_PAGE_SIZE,
         gart_page_size: AMDGPU_GPU_PAGE_SIZE,
@@ -193,14 +210,15 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
 
 /// `AMDGPU_INFO_MEMORY` → `struct drm_amdgpu_memory_info`.
 ///
-/// The aperture read at probe is the visible VRAM, so VRAM and
-/// CPU-accessible VRAM are the same number on these APUs. GTT is zero: there
-/// is no GART or system-memory heap manager, and claiming a size for a heap
-/// nothing can allocate from would be worse than reporting none.
+/// VRAM and CPU-accessible VRAM are the same number only on an APU. On a
+/// discrete card the second is BAR0's length — 256 MiB against however many
+/// gigabytes the card has, unless Resizable BAR is sized to VRAM. GTT is
+/// zero: there is no GART or system-memory heap manager, and claiming a size
+/// for a heap nothing can allocate from would be worse than reporting none.
 fn memory_info(snap: &Snapshot) -> Vec<u8> {
     as_bytes(&uapi::DrmAmdgpuMemoryInfo {
         vram: heap_info(snap.vram_size),
-        cpu_accessible_vram: heap_info(snap.vram_size),
+        cpu_accessible_vram: heap_info(snap.visible_vram_size),
         gtt: heap_info(0),
     })
 }
@@ -209,7 +227,7 @@ fn memory_info(snap: &Snapshot) -> Vec<u8> {
 fn vram_gtt(snap: &Snapshot) -> Vec<u8> {
     as_bytes(&uapi::DrmAmdgpuInfoVramGtt {
         vram_size: snap.vram_size,
-        vram_cpu_accessible_size: snap.vram_size,
+        vram_cpu_accessible_size: snap.visible_vram_size,
         gtt_size: 0,
     })
 }

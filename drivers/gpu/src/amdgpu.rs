@@ -255,6 +255,86 @@ pub enum Family {
     Phoenix,
 }
 
+/// Whether a part is an APU, keyed on its **GC IP version**.
+///
+/// This is `amdgpu_discovery.c`'s own switch, transcribed. Modern Linux does
+/// not take APU-ness from the PCI id: the `AMD_IS_APU` flag in the PCI table
+/// survives only for pre-discovery parts, and every discovery part gets the
+/// flag from this list instead.
+///
+/// The list is the authority on a question that changes real behaviour:
+///
+/// * VRAM. An APU's is carved from system memory and entirely CPU-visible;
+///   a discrete card's sits behind a BAR aperture that is normally much
+///   smaller than the card. See [`VramInfo::visible_size`].
+/// * `AMDGPU_IDS_FLAGS_FUSION`, which userspace reads to decide whether the
+///   GPU shares the CPU's memory.
+/// * The MEC count — a discrete part has two, an APU one.
+///
+/// GC 10.3.2, the RX 6700/6750's Navi 22, is **absent**: discrete. GC 11.0.1,
+/// Phoenix, is present.
+pub const APU_GC_VERSIONS: &[(u8, u8, u8)] = &[
+    (9, 1, 0),
+    (9, 2, 2),
+    (9, 3, 0),
+    (10, 1, 3),
+    (10, 1, 4),
+    (10, 3, 1),
+    (10, 3, 3),
+    (10, 3, 6),
+    (10, 3, 7),
+    (11, 0, 1),
+    (11, 0, 4),
+    (11, 5, 0),
+    (11, 5, 1),
+    (11, 5, 2),
+    (11, 5, 3),
+    (11, 5, 4),
+    (11, 5, 6),
+    (11, 7, 0),
+    (11, 7, 1),
+];
+
+/// Is `(major, minor, revision)` a GC version that belongs to an APU?
+///
+/// Absence means discrete, as it does in Linux: the switch has no `default`
+/// that sets the flag. So an unknown future part reads as discrete, which is
+/// the conservative answer — a discrete misread as an APU would claim the
+/// whole of VRAM is CPU-visible.
+pub const fn gc_version_is_apu(major: u8, minor: u8, revision: u8) -> bool {
+    let mut i = 0;
+    while i < APU_GC_VERSIONS.len() {
+        let (a, b, c) = APU_GC_VERSIONS[i];
+        if a == major && b == minor && c == revision {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+impl Family {
+    /// Whether this family's parts are APUs, for the window before discovery
+    /// has been parsed.
+    ///
+    /// [`gc_version_is_apu`] is the authority and this is the fallback, which
+    /// the ordering forces: the VRAM aperture has to be sized before the
+    /// discovery blob can be read, because the blob lives at the top of that
+    /// aperture. At that point the only thing known about the chip is its PCI
+    /// id, so the answer comes from the family — which is what Linux's PCI
+    /// table flag encoded before discovery existed.
+    ///
+    /// `Navi1`/`Navi2`/`Navi3` are the discrete families; `Vega` covers both
+    /// discrete Vega 10/12/20 and is treated as discrete for that reason,
+    /// with the Vega-derived APUs living in `Renoir`.
+    pub const fn is_apu(self) -> bool {
+        match self {
+            Family::Renoir | Family::Phoenix => true,
+            Family::Vega | Family::Navi1 | Family::Navi2 | Family::Navi3 => false,
+        }
+    }
+}
+
 impl Family {
     /// MP0 (PSP) register block base, in BAR5 register-bus
     /// address space. Resolution order:
@@ -622,11 +702,31 @@ pub enum AmdgpuError {
 /// `RCC_CONFIG_MEMSIZE` reports. See [`read_vram_info`].
 #[derive(Copy, Clone, Debug, Default)]
 pub struct VramInfo {
-    /// Phys base of the visible VRAM aperture.
+    /// Phys base of the CPU-visible VRAM aperture — `gmc.aper_base`.
     pub base: u64,
-    /// Aperture size in bytes (TOP - BASE + 1, scaled by the
-    /// MC's natural granularity of 4 KiB).
+    /// **Real** VRAM size: `gmc.real_vram_size`, every byte the memory
+    /// controller has, whether the CPU can see it or not.
     pub size: u64,
+    /// **Visible** VRAM size: `gmc.visible_vram_size`, the part reachable
+    /// through the aperture at [`VramInfo::base`].
+    ///
+    /// On an APU this equals [`VramInfo::size`] — VRAM is carved out of
+    /// system memory and all of it is addressable. On a **discrete** card it
+    /// is BAR0's length, which without Resizable BAR is 256 MiB against
+    /// however many gigabytes the card has: a 12 GiB RX 6750 XT shows 256
+    /// MiB here. Reporting the two as one number tells userspace it may CPU
+    /// map all 12 GiB, and the mapping that results is of nothing.
+    pub visible_size: u64,
+}
+
+impl VramInfo {
+    /// Does the CPU aperture cover the whole of VRAM?
+    ///
+    /// True on an APU and on a discrete card with Resizable BAR sized to
+    /// VRAM; false on a stock discrete card.
+    pub fn fully_visible(&self) -> bool {
+        self.visible_size >= self.size
+    }
 }
 
 /// Scanout mode the driver programs into DCN.
@@ -725,10 +825,13 @@ impl AmdGpu {
 
         // Size the VRAM carve-out. This runs BEFORE discovery — the discovery
         // blob lives at the top of this aperture — so it cannot use any
-        // register that needs an IP base.
+        // register that needs an IP base, and it cannot consult the GC IP
+        // version either. `Family::is_apu` is the pre-discovery fallback;
+        // [`gc_version_is_apu`] is the authority and cross-checks it below
+        // once the blob has been parsed.
         // SAFETY: identity-mapped MMIO; MM_INDEX/MM_DATA are a
         // sequential pair with no side effects beyond the access.
-        let vram = unsafe { read_vram_info(&regs, &fb_bar) };
+        let vram = unsafe { read_vram_info(&regs, &fb_bar, chip.family.is_apu()) };
 
         // Try to parse the on-die IP discovery table. Lives in
         // the top `DISCOVERY_TMR_OFFSET` bytes of the VRAM
@@ -744,6 +847,50 @@ impl AmdGpu {
         // One read of the discovery blob answers both questions.
         // SAFETY: as above.
         let (ip_blocks, gc_info) = unsafe { read_discovery(&fb_bar, &vram) };
+
+        // Now that the GC IP version is known, re-decide APU-ness from it —
+        // this is the answer modern Linux uses — and resize the visible
+        // aperture if the pre-discovery guess was wrong.
+        //
+        // Disagreement is not a soft thing. Reading a discrete card as an
+        // APU claims every byte of VRAM is CPU-visible, so a client maps
+        // past the aperture and gets nothing; reading an APU as discrete
+        // hides most of its VRAM. Either way the family table is what needs
+        // correcting, so the mismatch is recorded rather than smoothed over.
+        let mut vram = vram;
+        let mut apu_disagreement = None;
+        if let Some(gc) = ip_blocks
+            .iter()
+            .find(|b| b.hw_id == amdgpu_discovery::HW_ID_GC && b.instance == 0)
+        {
+            let from_gc = gc_version_is_apu(gc.major, gc.minor, gc.revision);
+            if from_gc != chip.family.is_apu() {
+                apu_disagreement = Some((gc.major, gc.minor, gc.revision));
+            }
+            vram.visible_size = if from_gc { vram.size } else { fb_bar.len };
+        }
+        if let Some((a, b, c)) = apu_disagreement {
+            use core::fmt::Write as _;
+            let _ = writeln!(
+                narf_console::Writer,
+                "amdgpu: {}: GC {}.{}.{} says {} but the family table says {}; \
+                 trusting the GC version",
+                chip.asic,
+                a,
+                b,
+                c,
+                if gc_version_is_apu(a, b, c) {
+                    "APU"
+                } else {
+                    "discrete"
+                },
+                if chip.family.is_apu() {
+                    "APU"
+                } else {
+                    "discrete"
+                },
+            );
+        }
 
         Ok(Self {
             fb_bar,
@@ -1858,7 +2005,7 @@ pub(crate) unsafe fn config_memsize_alive(regs: &MmioRegion) -> bool {
     unsafe { mm_read(regs, RCC_CONFIG_MEMSIZE) != u32::MAX }
 }
 
-unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion) -> VramInfo {
+unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion, is_apu: bool) -> VramInfo {
     // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair, and this
     // register is absolute by design (no IP base).
     let memsize_mb = unsafe { mm_read(regs, RCC_CONFIG_MEMSIZE) };
@@ -1867,9 +2014,32 @@ unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion) -> VramInfo {
     } else {
         u64::from(memsize_mb) << 20
     };
+    // `gmc_v10_0_mc_init` / `gmc_v11_0_mc_init`:
+    //
+    //   aper_base = pci_resource_start(pdev, 0)
+    //   aper_size = pci_resource_len(pdev, 0)
+    //   if (APU && !passthrough) { aper_base = gfxhub FB offset;
+    //                              aper_size = real_vram_size; }
+    //   visible_vram_size = aper_size
+    //
+    // So the visible size is BAR0's **length** on a discrete card, and the
+    // whole of VRAM on an APU. A 12 GiB card with no Resizable BAR reports
+    // 256 MiB visible, and the gap is not cosmetic: it is the difference
+    // between memory the CPU may map and memory only the GPU can reach.
+    //
+    // LINUX-GAP: the APU override takes the base from
+    // `gfxhub.funcs->get_mc_fb_offset` rather than from BAR0, and is
+    // skipped under passthrough (`!amdgpu_passthrough(adev)`) because the
+    // hypervisor's BAR is then the only usable aperture. This keeps BAR0's
+    // base in both cases, which is what the override would compute for a
+    // bare-metal APU anyway and is what passthrough requires — but it is
+    // not the same read, and a part whose FB offset is not BAR0 would
+    // differ here.
+    let visible_size = if is_apu { size } else { fb_bar.len };
     VramInfo {
         base: fb_bar.phys.raw(),
         size,
+        visible_size,
     }
 }
 

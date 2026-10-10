@@ -8096,6 +8096,192 @@ kernel_test_in!(
     smoke_amdgpu_compute_context_describes_itself
 );
 
+/// The APU / discrete axis, and the three answers it changes.
+///
+/// Every part this driver had supported was an APU, and three places said so
+/// unconditionally: `AMDGPU_IDS_FLAGS_FUSION`, and VRAM / CPU-accessible VRAM
+/// reported as one number in both `MEMORY` and `VRAM_GTT`. A discrete card is
+/// none of those things, and the second is not cosmetic — a 12 GiB RX 6750 XT
+/// exposes 256 MiB through BAR0, so claiming 12 GiB is CPU-visible hands a
+/// client a mapping of nothing.
+fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
+    use crate::amdgpu::{gc_version_is_apu, Family, APU_GC_VERSIONS};
+    use crate::amdgpu_discovery::{GcInfo, IpBlock, HW_ID_GC, MAX_BASE_ADDRS};
+    use crate::amdgpu_info::{query_against, Snapshot};
+    use crate::amdgpu_uapi as u;
+
+    fn ip(hw_id: u16, major: u8, minor: u8, revision: u8) -> IpBlock {
+        IpBlock {
+            hw_id,
+            instance: 0,
+            major,
+            minor,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: [0; MAX_BASE_ADDRS],
+            num_bases: 1,
+        }
+    }
+
+    // ── the table, against amdgpu_discovery.c's switch ──
+    // Phoenix's GC 11.0.1 is in it; Navi 22's GC 10.3.2 is not. Those two
+    // are the parts this branch cares about, so both are spelled out.
+    if !gc_version_is_apu(11, 0, 1) {
+        return TestResult::Fail("GC 11.0.1 (Phoenix) is an APU");
+    }
+    if gc_version_is_apu(10, 3, 2) {
+        return TestResult::Fail("GC 10.3.2 (Navi 22) is discrete");
+    }
+    // The neighbours of 10.3.2 ARE APUs, which is exactly why the version
+    // and not the major.minor decides it: 10.3.1 is Van Gogh and 10.3.3 is
+    // Yellow Carp, both APUs, with the discrete Navi 22 between them.
+    if !gc_version_is_apu(10, 3, 1) || !gc_version_is_apu(10, 3, 3) {
+        return TestResult::Fail("10.3.1 and 10.3.3 are APUs either side of 10.3.2");
+    }
+    // And the other discrete RDNA2 parts: Navi 21 is 10.3.0, Navi 23 10.3.4,
+    // Navi 24 10.3.5.
+    for rev in [0u8, 2, 4, 5] {
+        if gc_version_is_apu(10, 3, rev) {
+            return TestResult::Fail("the discrete RDNA2 parts are not APUs");
+        }
+    }
+    // Absence means discrete, as it does in Linux — the switch has no
+    // default that sets the flag. An unknown future part therefore reads as
+    // discrete, which is the conservative direction.
+    if gc_version_is_apu(99, 9, 9) {
+        return TestResult::Fail("an unknown GC version must read as discrete");
+    }
+    if APU_GC_VERSIONS.len() != 19 {
+        return TestResult::Fail("the APU list has 19 entries");
+    }
+
+    // ── the pre-discovery fallback ──
+    // The VRAM aperture must be sized before the discovery blob can be read,
+    // because the blob lives at the top of that aperture, so the family
+    // answers first and the GC version corrects it.
+    if !Family::Phoenix.is_apu() || !Family::Renoir.is_apu() {
+        return TestResult::Fail("Phoenix and Renoir are the APU families");
+    }
+    for f in [Family::Vega, Family::Navi1, Family::Navi2, Family::Navi3] {
+        if f.is_apu() {
+            return TestResult::Fail("the Navi and Vega families are discrete");
+        }
+    }
+    // The fallback must agree with the authority for the parts we have, or
+    // the probe would log a disagreement on every boot.
+    if Family::Phoenix.is_apu() != gc_version_is_apu(11, 0, 1) {
+        return TestResult::Fail("the Phoenix fallback disagrees with its GC version");
+    }
+    if Family::Navi2.is_apu() != gc_version_is_apu(10, 3, 2) {
+        return TestResult::Fail("the Navi2 fallback disagrees with Navi 22's GC version");
+    }
+
+    // ── what it changes, through the ioctls ──
+    let gc = GcInfo {
+        num_se: 2,
+        num_sa_per_se: 2,
+        num_rb_per_se: 2,
+        num_cu_per_sa: 8,
+        wave_size: 32,
+        num_gprs: 1024,
+        num_tccs: 4,
+        ..GcInfo::default()
+    };
+    // A discrete card: 12 GiB of VRAM behind a 256 MiB aperture, which is an
+    // RX 6750 XT with Resizable BAR off.
+    //
+    // The `family` is Phoenix and the `did` is Navi 22's, which is a
+    // deliberate mismatch. `DEV_INFO` refuses a family with no audited
+    // family id, and `Family::Navi2`'s is not audited — so pinning the
+    // family here would test that refusal instead of the thing under test,
+    // which is that APU-ness is carried by its own flag and not inferred
+    // from the family. The VRAM queries below do not consult the family at
+    // all.
+    const VRAM: u64 = 12 * 1024 * 1024 * 1024;
+    const VISIBLE: u64 = 256 * 1024 * 1024;
+    let discrete = Snapshot {
+        did: 0x73DF,
+        family: Family::Phoenix,
+        vram_size: VRAM,
+        visible_vram_size: VISIBLE,
+        is_apu: false,
+        gc: Some(gc),
+        ip_blocks: alloc::vec![ip(HW_ID_GC, 10, 3, 2)],
+    };
+
+    // VRAM_GTT reports both, and they differ.
+    let vg = match query_against(&discrete, u::AMDGPU_INFO_VRAM_GTT, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("VRAM_GTT was refused"),
+    };
+    let vram_size = u64::from_le_bytes(vg[0..8].try_into().unwrap());
+    let visible = u64::from_le_bytes(vg[8..16].try_into().unwrap());
+    if vram_size != VRAM {
+        return TestResult::Fail("VRAM_GTT must report the real VRAM size");
+    }
+    if visible != VISIBLE {
+        return TestResult::Fail("VRAM_GTT's cpu-accessible size is the aperture, not VRAM");
+    }
+    if visible == vram_size {
+        return TestResult::Fail("on a discrete card the two must not be equal");
+    }
+
+    // MEMORY's second heap is the visible one.
+    let mem = match query_against(&discrete, u::AMDGPU_INFO_MEMORY, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("MEMORY was refused"),
+    };
+    let heap_total = |i: usize| u64::from_le_bytes(mem[i * 32..i * 32 + 8].try_into().unwrap());
+    if heap_total(0) != VRAM || heap_total(1) != VISIBLE {
+        return TestResult::Fail("the VRAM and cpu-accessible heaps must differ");
+    }
+
+    // And FUSION is not claimed.
+    let dev = match query_against(&discrete, u::AMDGPU_INFO_DEV_INFO, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("DEV_INFO was refused for a discrete part"),
+    };
+    let mut d = u::DrmAmdgpuInfoDevice::default();
+    let n = core::mem::size_of::<u::DrmAmdgpuInfoDevice>().min(dev.len());
+    // SAFETY: writing `n` bytes into a `#[repr(C)]` plain-data struct of at
+    // least `n` bytes; both sides are byte-addressable POD.
+    unsafe {
+        core::ptr::copy_nonoverlapping(dev.as_ptr(), (&raw mut d).cast::<u8>(), n);
+    }
+    if d.ids_flags & u64::from(u::AMDGPU_IDS_FLAGS_FUSION) != 0 {
+        return TestResult::Fail("a discrete card must not claim FUSION");
+    }
+    if d.ids_flags != 0 {
+        return TestResult::Fail("no other capability is claimed either");
+    }
+
+    // The same snapshot as an APU does claim it, so the flag follows the
+    // part rather than having been deleted.
+    let apu = Snapshot {
+        visible_vram_size: VRAM,
+        is_apu: true,
+        ..discrete.clone()
+    };
+    let dev = match query_against(&apu, u::AMDGPU_INFO_DEV_INFO, [0; 4]) {
+        Ok(b) => b,
+        Err(_) => return TestResult::Fail("DEV_INFO was refused for an APU"),
+    };
+    let mut d2 = u::DrmAmdgpuInfoDevice::default();
+    // SAFETY: as above.
+    unsafe {
+        core::ptr::copy_nonoverlapping(dev.as_ptr(), (&raw mut d2).cast::<u8>(), n);
+    }
+    if d2.ids_flags & u64::from(u::AMDGPU_IDS_FLAGS_FUSION) == 0 {
+        return TestResult::Fail("an APU must claim FUSION");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_discrete_is_not_an_apu
+);
+
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
@@ -8912,6 +9098,9 @@ fn smoke_amdgpu_info_reports_the_sourced_device() -> TestResult {
         did: 0x15BF,
         family: Family::Phoenix,
         vram_size: 512 * 1024 * 1024,
+        // Phoenix is an APU: all of VRAM is CPU-visible.
+        visible_vram_size: 512 * 1024 * 1024,
+        is_apu: true,
         gc: Some(gc),
         ip_blocks: alloc::vec![ip(HW_ID_GC, 11, 0, 1), ip(HW_ID_SDMA0, 6, 0, 1)],
     };
