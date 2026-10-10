@@ -217,3 +217,171 @@ kernel_test_in!(
     "drivers/gpu/psp-ring",
     psp_navi22_graphics_cancel_revoke_and_timeout
 );
+
+fn psp_navi22_rlc_boot_requires_accepted_autoload_and_both_statuses() -> TestResult {
+    let firmware = firmware();
+    let images = firmware.images().unwrap();
+    let (pool, mut s) = prepared();
+    if run(s.wait_gfx_boot()) != Err(Error::Busy) || s.engine.io.gfx_reads != 0 {
+        return TestResult::Fail("RLC checked before autoload acceptance");
+    }
+    run(s.load_gfx(&images)).unwrap();
+    s.engine.io.gfx_samples = vec![
+        GfxBootStatus {
+            cp_stat: 1,
+            rlc_bootload: 1 << 31,
+        },
+        GfxBootStatus {
+            cp_stat: 0,
+            rlc_bootload: 0x7fffffff,
+        },
+        GfxBootStatus {
+            cp_stat: 0,
+            rlc_bootload: 0x80000005,
+        },
+    ];
+    let writes = s.engine.io.writes.len();
+    let commands = s.engine.io.submissions.len();
+    let available = pool.available();
+    let result = GfxBootStatus {
+        cp_stat: 0,
+        rlc_bootload: 0x80000005,
+    };
+    if run(s.wait_gfx_boot()) != Ok(result)
+        || s.gfx_status != Some(result)
+        || s.gfx_state != GfxLoadState::BootComplete
+        || s.engine.io.gfx_reads != 3
+        || s.engine.io.writes.len() != writes
+        || s.engine.io.submissions.len() != commands
+        || pool.available() != available
+        || run(s.wait_gfx_boot()) != Err(Error::Busy)
+    {
+        return TestResult::Fail("RLC status check ignored CP/bit31 or changed ownership/hardware");
+    }
+    // SAFETY: no real firmware consumers in the model.
+    unsafe { run(s.stop()) }.unwrap();
+    drop(s);
+    if pool.available() != 16 << 20 {
+        return TestResult::Fail("completed RLC session leaked after verified stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi22_rlc_boot_requires_accepted_autoload_and_both_statuses
+);
+
+fn psp_navi22_rlc_boot_removal_timeout_and_revocation() -> TestResult {
+    let firmware = firmware();
+    let images = firmware.images().unwrap();
+    for (status, expected) in [
+        (
+            GfxBootStatus {
+                cp_stat: u32::MAX,
+                rlc_bootload: 1 << 31,
+            },
+            Error::DeviceGone,
+        ),
+        (
+            GfxBootStatus {
+                cp_stat: 0,
+                rlc_bootload: u32::MAX,
+            },
+            Error::DeviceGone,
+        ),
+        (
+            GfxBootStatus {
+                cp_stat: 0,
+                rlc_bootload: 0,
+            },
+            Error::Timeout,
+        ),
+        (
+            GfxBootStatus {
+                cp_stat: 1,
+                rlc_bootload: 1 << 31,
+            },
+            Error::Timeout,
+        ),
+    ] {
+        let (pool, mut s) = prepared();
+        run(s.load_gfx(&images)).unwrap();
+        s.engine.io.gfx_samples = vec![status];
+        if run(s.wait_gfx_boot()) != Err(expected)
+            || s.gfx_state != GfxLoadState::Failed
+            || s.gfx_status != Some(status)
+            || run(s.wait_gfx_boot()) != Err(Error::Busy)
+        {
+            return TestResult::Fail("RLC removal/timeout lost failure or last sample");
+        }
+        drop(s);
+        if pool.available() != (16 << 20) - BUFFER_SIZE - (4 << 20) {
+            return TestResult::Fail("RLC failure recycled running firmware memory");
+        }
+    }
+    let (_, mut s) = prepared();
+    run(s.load_gfx(&images)).unwrap();
+    s.engine.authority.revoke();
+    if run(s.wait_gfx_boot()) != Err(Error::Revoked)
+        || s.engine.io.gfx_reads != 0
+        || s.gfx_status.is_some()
+    {
+        return TestResult::Fail("revoked status check performed MMIO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi22_rlc_boot_removal_timeout_and_revocation
+);
+
+fn psp_navi22_rlc_boot_cancellation_keeps_tmr_owned() -> TestResult {
+    let firmware = firmware();
+    let images = firmware.images().unwrap();
+    for revoke in [false, true] {
+        let (pool, mut s) = prepared();
+        run(s.load_gfx(&images)).unwrap();
+        s.engine.io.gfx_samples = vec![GfxBootStatus {
+            cp_stat: 0,
+            rlc_bootload: 0,
+        }];
+        let authority = s.engine.authority;
+        {
+            let mut future = core::pin::pin!(s.wait_gfx_boot());
+            if future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail("pending RLC boot completed");
+            }
+            if revoke {
+                authority.revoke();
+                if run(future) != Err(Error::Revoked) {
+                    return TestResult::Fail("RLC poll ignored revocation");
+                }
+            }
+        }
+        if s.gfx_state
+            != if revoke {
+                GfxLoadState::Failed
+            } else {
+                GfxLoadState::Checking
+            }
+            || s.engine.io.gfx_reads != 1
+            || run(s.wait_gfx_boot()) != Err(Error::Busy)
+            || run(s.load_gfx(&images)) != Err(Error::Busy)
+        {
+            return TestResult::Fail("cancelled RLC poll retried or continued MMIO");
+        }
+        drop(s);
+        if pool.available() != (16 << 20) - BUFFER_SIZE - (4 << 20) {
+            return TestResult::Fail("cancelled RLC poll released running firmware memory");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi22_rlc_boot_cancellation_keeps_tmr_owned
+);

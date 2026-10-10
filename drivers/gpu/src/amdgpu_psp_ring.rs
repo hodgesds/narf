@@ -85,6 +85,7 @@ trait Io {
     fn setup_hdp(&mut self) -> bool;
     fn flush(&mut self);
     fn invalidate(&mut self);
+    fn gfx_boot_status(&mut self) -> Result<GfxBootStatus, Error>;
 }
 #[derive(Debug)]
 struct Mmio {
@@ -93,6 +94,7 @@ struct Mmio {
     nbio: u64,
     invalidate_reg: Option<u64>,
     memory: MmioRegion,
+    gfx_status_regs: Option<(u64, u64)>,
 }
 impl Io for Mmio {
     fn read(&mut self, reg: u32) -> u32 {
@@ -137,6 +139,17 @@ impl Io for Mmio {
             }
         }
         fence(Ordering::SeqCst);
+    }
+    fn gfx_boot_status(&mut self) -> Result<GfxBootStatus, Error> {
+        let (cp, rlc) = self.gfx_status_regs.ok_or(Error::Unsupported)?;
+        // SAFETY: Layout resolved/bounded both GC10.3.2 register banks. These
+        // are read-only status samples, with reset/PM excluded by the owner.
+        Ok(unsafe {
+            GfxBootStatus {
+                cp_stat: self.regs.read32(cp),
+                rlc_bootload: self.regs.read32(rlc),
+            }
+        })
     }
 }
 #[derive(Debug)]
@@ -322,13 +335,22 @@ enum SmcState {
     Loaded,
     Failed,
 }
-/// PSP acknowledgement of the graphics set, not proof of running engines.
+/// Progress from PSP acknowledgement through GC's autoload status check.
+/// BootComplete is not proof of functioning queues, SDMA or acceleration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GfxLoadState {
     Absent,
     Loading,
     Accepted,
+    Checking,
+    BootComplete,
     Failed,
+}
+/// Last paired GC status sample; useful even when boot times out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GfxBootStatus {
+    pub cp_stat: u32,
+    pub rlc_bootload: u32,
 }
 #[derive(Debug)]
 struct Session<I: Io> {
@@ -339,6 +361,7 @@ struct Session<I: Io> {
     tmr_ready: bool,
     smc_state: SmcState,
     gfx_state: GfxLoadState,
+    gfx_status: Option<GfxBootStatus>,
     fb_base: u64,
     fb_offset: u64,
 }
@@ -352,6 +375,7 @@ struct Layout {
     fb_base: u64,
     fb_top: u64,
     fb_offset: u64,
+    gfx_status_regs: Option<(u64, u64)>,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu, kind: Kind) -> Result<Self, Error> {
@@ -424,6 +448,14 @@ impl Layout {
         if kind == Kind::Navi22 && (ip.major, ip.minor) != (5, 0) {
             return Err(Error::Unsupported);
         }
+        let gfx_status_regs = if kind == Kind::Navi22 {
+            // Linux gc_10_1_0_offset.h: CP_STAT index 0, RLC status index 1.
+            let cp = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 0, 0xf40)?;
+            let rlc = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 1, 0x4e8d)?;
+            Some((cp + 0xf40 * 4, rlc + 0x4e8d * 4))
+        } else {
+            None
+        };
         Ok(Self {
             mp0,
             nbio,
@@ -432,8 +464,14 @@ impl Layout {
             fb_base,
             fb_top,
             fb_offset,
+            gfx_status_regs,
         })
     }
+}
+/// Preflight used by the coordinated Navi22 bootstrap before uploading SOS.
+/// Resolves all banks without MMIO or allocating device-owned memory.
+pub(crate) fn validate_navi22_layout(gpu: &AmdGpu) -> Result<(), Error> {
+    Layout::resolve(gpu, Kind::Navi22).map(|_| ())
 }
 /// One IP version's register window, for a caller whose register ids are only
 /// valid on some of the versions an IP reports.
@@ -590,6 +628,7 @@ impl Psp {
                         nbio: layout.nbio,
                         invalidate_reg: layout.invalidate_reg,
                         memory: memory.mapping(),
+                        gfx_status_regs: layout.gfx_status_regs,
                     },
                     authority,
                     memory,
@@ -602,6 +641,7 @@ impl Psp {
                 tmr_ready: false,
                 smc_state: SmcState::Absent,
                 gfx_state: GfxLoadState::Absent,
+                gfx_status: None,
                 fb_base,
                 fb_offset,
             },
@@ -673,6 +713,17 @@ impl Psp {
     /// Graphics upload state; remains Absent for Phoenix sessions.
     pub fn gfx_load_state(&self) -> GfxLoadState {
         self.session.gfx_state
+    }
+    pub fn gfx_boot_status(&self) -> Option<GfxBootStatus> {
+        self.session.gfx_status
+    }
+    /// Wait for idle CP and RLC BOOTLOAD_COMPLETE after this session's accepted
+    /// autoload. No GC writes, queue initialization or fw_loaded publication.
+    pub async fn wait_gfx_boot_navi22(&mut self) -> Result<GfxBootStatus, Error> {
+        if self.kind != Kind::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        self.session.wait_gfx_boot().await
     }
     /// # Safety
     /// Every engine using the TMR must have verified reset. Ring destruction
@@ -844,6 +895,40 @@ impl<I: Io> Session<I> {
         }
         self.engine.submit(&command(0x21, &[])).await.map(|_| ())
     }
+    async fn wait_gfx_boot(&mut self) -> Result<GfxBootStatus, Error> {
+        if self.gfx_state != GfxLoadState::Accepted
+            || self.engine.state != State::Ready
+            || !self.tmr_ready
+            || self.smc_state != SmcState::Loaded
+        {
+            return Err(Error::Busy);
+        }
+        self.gfx_state = GfxLoadState::Checking;
+        let result = self.wait_gfx_boot_inner().await;
+        self.gfx_state = if result.is_ok() {
+            GfxLoadState::BootComplete
+        } else {
+            GfxLoadState::Failed
+        };
+        result
+    }
+    async fn wait_gfx_boot_inner(&mut self) -> Result<GfxBootStatus, Error> {
+        let deadline = narf_time::Deadline::after_ms(1000);
+        loop {
+            let status = self.engine.access(|io| io.gfx_boot_status())??;
+            self.gfx_status = Some(status);
+            if status.cp_stat == u32::MAX || status.rlc_bootload == u32::MAX {
+                return Err(Error::DeviceGone);
+            }
+            if status.cp_stat == 0 && status.rlc_bootload & (1 << 31) != 0 {
+                return Ok(status);
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay(1).await;
+        }
+    }
     /// # Safety
     /// Every engine using this TMR (including DMUB) must have verified reset.
     /// Ring destruction alone does not stop instruction fetches from the TMR.
@@ -870,6 +955,7 @@ impl<I: Io> Session<I> {
         }
         self.smc_state = SmcState::Absent;
         self.gfx_state = GfxLoadState::Absent;
+        self.gfx_status = None;
         Ok(())
     }
 }

@@ -337,4 +337,4 @@ impl Bootloader {
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_psp_boot_tests.rs"]
-mod tests;
+pub(crate) mod tests;

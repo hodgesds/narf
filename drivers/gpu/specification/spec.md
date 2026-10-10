@@ -124,8 +124,8 @@ PSP 11.0.11 GPCOM ring under the exclusive ownership, trained-VRAM and permanent
 mapping requirements of the bootstrap. A bootstrap owner must reach `Ready`
 and be dropped before claiming the ring; failed/cancelled bootstrap requires
 independent reset/recovery. PCI ID `1002:73df`, GC 10.3.2, MP1 11.0.11 and
-SDMA0 5.2.2 are required;
-register banks are pinned to MP0 index 0, NBIO 2.3/3.3 index 2 and HDP 5.0
+SDMA0 5.2.2 are required; register banks are pinned to MP0 index 0,
+NBIO 2.3/3.3 index 2 and HDP 5.0
 index 0. NBIO remaps the HDP flush hole at BAR5 `0x7f000`; HDP read-cache
 invalidation precedes fence/reply reads. The remap must verify before any ring
 address is published. Missing/duplicate IPs and truncated windows reject the
@@ -233,8 +233,53 @@ reset of every firmware consumer before TMR destruction.
 
 `Accepted` means PSP acknowledged autoload. It does not prove GC/SDMA readiness,
 configure memory hubs, queues or board power, install video/display firmware,
-or set `AmdGpu::fw_loaded`. The API remains explicit: platform boot integration,
-RLC runtime readiness and real-card validation are separate work.
+or set `AmdGpu::fw_loaded`.
+
+`Psp::wait_gfx_boot_navi22().await` requires this session's acknowledged autoload
+and checks GC 10.3.2 `CP_STAT` (base index 0, dword `0x0f40`) together with
+`RLC_RLCS_BOOTLOAD_STATUS` (base index 1, dword `0x4e8d`). Both banks must fit the
+BAR5 mapping at construction. Each paired sample checks live PCI authority;
+both registers are read without GC writes. Success requires `CP_STAT == 0`
+and `BOOTLOAD_COMPLETE` (bit 31). All-ones reads indicate removal, never success.
+The wait uses 1 ms timer futures with a 1 s deadline. State progresses from
+`Accepted → Checking → BootComplete | Failed`; cancellation retains `Checking`
+and blocks replay. `gfx_boot_status()` retains the last `GfxBootStatus
+{ cp_stat, rlc_bootload }` sample for timeout/removal diagnostics. No sample is
+produced when authority is already revoked. Waiting never releases ring/TMR
+ownership; verified consumer reset remains mandatory for teardown.
+`BootComplete` does not initialize queues, enable SDMA or establish acceleration.
+
+### Coordinated Navi 22 firmware bring-up
+
+`amdgpu_navi22_boot::Firmware::open(gpu, registry_cap)` validates every required
+register bank and prepares the SOS, SMC and SDMA/CP/RLC firmware sets before any
+device operation. Missing required firmware or an invalid layout prevents the
+entire sequence from starting. `unsafe ColdBoot::new(gpu, pci_cap, pool, firmware)`
+requires exclusive ownership of the physical GPU, its PSP/MP1/GC/HDP and reset/PM
+controls, permanently mapped and already trained VRAM, no active queues, and an
+owned pool excluding all firmware/scanout/discovery/training/TMR reservations.
+Construction reserves bootstrap staging but performs no MMIO. This is one
+cold-boot attempt, not an attach, resume or firmware-reload operation.
+
+`ColdBoot::run().await` executes SOS bootstrap → ring creation → trusted-memory
+setup → SMC upload → SMU version handshake → graphics upload/autoload → RLC boot
+check. The bootstrap owner is dropped only after SOS success, before claiming
+the GPCOM ring. The ring and SMU owners are stored in the session before awaiting
+their hardware operations. State is `Prepared`, `Running(Stage)`,
+`FirmwareReady(Report)`, `Failed { stage, error }`, or `Released`. Failure records
+the exact stage and underlying error; cancellation preserves `Running(stage)`.
+Every attempt prevents replay, and no failure automatically resets hardware or
+destroys device-owned memory. Dropping a session quarantines any memory still
+owned by hardware through the underlying owners' existing rules.
+
+Success returns `Report { smu: Versions, gfx: GfxBootStatus }`. The session must
+stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
+GPU initialization after full success; that changes state to `Released` and
+prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
+GC sample before transfer, including on failure. These observations do not set
+`AmdGpu::fw_loaded`. Automatic platform invocation, VRAM training/reservation
+discovery, board power setup, GMC/queues, video/display firmware and real-card
+validation remain separate work.
 
 ### AMD platform VBIOS
 

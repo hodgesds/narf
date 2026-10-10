@@ -166,6 +166,7 @@ pub mod amdgpu_mes_hw;
 pub mod amdgpu_modeset;
 pub mod amdgpu_mqd;
 pub mod amdgpu_mst;
+pub mod amdgpu_navi22_boot;
 pub mod amdgpu_offsets;
 pub mod amdgpu_pageflip;
 pub mod amdgpu_pcie_recovery;

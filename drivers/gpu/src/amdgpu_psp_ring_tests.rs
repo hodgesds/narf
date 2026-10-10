@@ -23,6 +23,8 @@ struct Fake {
     stall_command: Option<u32>,
     stall_type: Option<u32>,
     fail_hdp: bool,
+    gfx_samples: Vec<GfxBootStatus>,
+    gfx_reads: usize,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -86,6 +88,11 @@ impl Io for Fake {
         self.dirty = false;
     }
     fn invalidate(&mut self) {}
+    fn gfx_boot_status(&mut self) -> Result<GfxBootStatus, Error> {
+        let index = self.gfx_reads.min(self.gfx_samples.len() - 1);
+        self.gfx_reads += 1;
+        Ok(self.gfx_samples[index])
+    }
 }
 fn fixture() -> (Pool, Engine<Fake>) {
     let map = MmioRegion {
@@ -114,6 +121,11 @@ fn fixture() -> (Pool, Engine<Fake>) {
         stall_command: None,
         stall_type: None,
         fail_hdp: false,
+        gfx_samples: vec![GfxBootStatus {
+            cp_stat: 0,
+            rlc_bootload: 1 << 31,
+        }],
+        gfx_reads: 0,
     };
     io.regs[CTRL as usize] = RESPONSE;
     io.regs[SOS as usize] = 1;

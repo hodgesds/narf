@@ -253,4 +253,4 @@ impl Smu {
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_smu_navi22_tests.rs"]
-mod tests;
+pub(crate) mod tests;

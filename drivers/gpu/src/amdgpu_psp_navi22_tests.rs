@@ -36,6 +36,7 @@ fn session() -> (Pool, Session<Fake>) {
             tmr_ready: false,
             smc_state: SmcState::Absent,
             gfx_state: GfxLoadState::Absent,
+            gfx_status: None,
             fb_base: 0x8_0000_0000,
             fb_offset: 0x1_0000_0000,
         },
@@ -400,6 +401,9 @@ kernel_test_in!(
 fn ip(id: u16, version: (u8, u8, u8), index: usize, base: u32) -> discovery::IpBlock {
     let mut bases = [0x20000; discovery::MAX_BASE_ADDRS];
     bases[index] = base;
+    if id == discovery::HW_ID_GC {
+        bases[1] = 0x4000;
+    }
     discovery::IpBlock {
         hw_id: id,
         instance: 0,
@@ -458,6 +462,8 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
     regs[0x2000 + 0x16fc] = 0x800;
     regs[0x2000 + 0x16fd] = 0xaff;
     regs[0x2000 + 0x16e7] = 0x100;
+    regs[0x2000 + 0xf40] = 0x1234;
+    regs[0x4000 + 0x4e8d] = 1 << 31;
     let (pool, s) = session();
     drop(s);
     let before = regs.clone();
@@ -467,11 +473,25 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
     if mmio.mp0 != 0x40000
         || mmio.nbio != 0x3480
         || mmio.invalidate_reg != Some(0x2f44)
+        || mmio.gfx_status_regs != Some(((0x2000 + 0xf40) * 4, (0x4000 + 0x4e8d) * 4))
         || psp.session.fb_base != 0x8_0000_0000
         || psp.session.fb_offset != 0x1_0000_0000
         || regs != before
     {
         return TestResult::Fail("wrong PSP/NBIO/HDP/GMC bank or constructor performed writes");
+    }
+    if psp
+        .session
+        .engine
+        .access(|io| io.gfx_boot_status())
+        .unwrap()
+        .unwrap()
+        != (GfxBootStatus {
+            cp_stat: 0x1234,
+            rlc_bootload: 1 << 31,
+        })
+    {
+        return TestResult::Fail("GC status used the wrong discovery base index");
     }
     if run(psp.setup_tmr(&[])) != Err(Error::Unsupported)
         || run(psp.load_dmub(&[1])) != Err(Error::Unsupported)
@@ -480,7 +500,7 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
         return TestResult::Fail("Navi22 accepted a Phoenix firmware operation");
     }
     drop(psp);
-    for case in 0..12 {
+    for case in 0..14 {
         let mut bad = self::gpu(&mut regs);
         match case {
             0 => bad.ip_blocks[0].revision = 7,
@@ -494,7 +514,9 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
             8 => bad.ip_blocks[4].revision = 7,
             9 => bad.ip_blocks.push(bad.ip_blocks[4]),
             10 => bad.ip_blocks[5].revision = 0,
-            _ => bad.ip_blocks.push(bad.ip_blocks[5]),
+            11 => bad.ip_blocks.push(bad.ip_blocks[5]),
+            12 => bad.ip_blocks[3].num_bases = 1,
+            _ => bad.ip_blocks[3].base_addrs[1] = 0x20000 - 0x4e8d,
         }
         if Layout::resolve(&bad, Kind::Navi22).is_ok() {
             return TestResult::Fail("unaudited IP/register window accepted");

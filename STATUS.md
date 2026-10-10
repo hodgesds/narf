@@ -262,10 +262,14 @@ interface and running firmware version using its discrete-GPU mailbox layout.
 The graphics firmware path now prepares the complete SDMA/CP/RLC set, separates
 MEC jump tables and RLC subimages, and submits PSP autoload only after all
 required payloads complete. Partial load failures/cancellation prevent replay
-and preserve device-owned VRAM. PSP acknowledgement is not GC/SDMA readiness.
+and preserve device-owned VRAM. A bounded CP-idle/RLC-boot-complete check now
+follows PSP acknowledgement and retains raw status for failed-boot diagnostics.
+An explicit `ColdBoot` session prepares all required firmware, owns the entire
+SOS → PSP/TMR → SMC/SMU → graphics/RLC sequence, and can transfer its live PSP
+owner after success. Failure/cancellation records the stage and prevents replay.
 These are software-tested foundations; automatic platform wiring, VRAM training,
 video/display firmware, board power/clock setup, hardware boot, GMC/GFX10
-initialization, RLC runtime readiness and DCN3.0 modesetting remain open. See the
+queue initialization, SDMA startup and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix

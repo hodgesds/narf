@@ -1,0 +1,301 @@
+use super::*;
+use alloc::{sync::Arc, vec, vec::Vec};
+use core::{
+    future::Future,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Waker},
+};
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+fn report() -> Report {
+    Report {
+        smu: smu::Versions {
+            firmware: 0x413f00,
+            interface: 0xe,
+        },
+        gfx: psp::GfxBootStatus {
+            cp_stat: 0,
+            rlc_bootload: 1 << 31,
+        },
+    }
+}
+struct Fake {
+    fail: Option<Stage>,
+    stall: Option<Stage>,
+    calls: Vec<Stage>,
+    missing_report: bool,
+    _owned: crate::amdgpu_vram::Reservation,
+    dropped: Arc<AtomicBool>,
+}
+impl Drop for Fake {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+impl Backend for Fake {
+    async fn step(&mut self, stage: Stage) -> Result<(), Error> {
+        self.calls.push(stage);
+        if self.fail == Some(stage) {
+            return Err(Error::Psp(psp::Error::Rejected(7)));
+        }
+        if self.stall == Some(stage) {
+            core::future::pending::<()>().await;
+        }
+        Ok(())
+    }
+    fn report(&self) -> Result<Report, Error> {
+        if self.missing_report {
+            Err(Error::Invalid)
+        } else {
+            Ok(report())
+        }
+    }
+}
+fn pool(len: u64) -> Pool {
+    // SAFETY: bookkeeping-only tests never dereference this VRAM mapping.
+    unsafe {
+        Pool::from_owned_range(
+            narf_bus::MmioRegion {
+                phys: narf_memory::PhysAddr::new(0),
+                virt: 0,
+                len,
+                kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+            },
+            0x8_0000_0000,
+        )
+    }
+    .unwrap()
+}
+fn sequence() -> (Pool, Arc<AtomicBool>, Sequence<Fake>) {
+    let pool = pool(8192);
+    let mut owned = pool.reserve(4096).unwrap();
+    owned.publish();
+    let dropped = Arc::new(AtomicBool::new(false));
+    let fake = Fake {
+        fail: None,
+        stall: None,
+        calls: Vec::new(),
+        missing_report: false,
+        _owned: owned,
+        dropped: dropped.clone(),
+    };
+    (
+        pool,
+        dropped,
+        Sequence {
+            backend: fake,
+            state: State::Prepared,
+        },
+    )
+}
+fn run<T>(future: impl Future<Output = T>) -> T {
+    narf_scheduler::block_on_spin(future)
+}
+
+fn navi22_boot_orders_stages_and_keeps_successful_owners() -> TestResult {
+    let (pool, dropped, mut sequence) = sequence();
+    if run(sequence.run()) != Ok(report())
+        || sequence.state != State::FirmwareReady(report())
+        || sequence.backend.calls != STAGES
+        || dropped.load(Ordering::SeqCst)
+        || pool.available() != 4096
+    {
+        return TestResult::Fail("wrong bring-up order/report or premature owner destruction");
+    }
+    if run(sequence.run()) != Err(Error::Busy) || sequence.backend.calls.len() != STAGES.len() {
+        return TestResult::Fail("successful cold boot replayed");
+    }
+    drop(sequence);
+    if !dropped.load(Ordering::SeqCst) || pool.available() != 4096 {
+        return TestResult::Fail("drop failed to quarantine published memory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_orders_stages_and_keeps_successful_owners
+);
+
+fn navi22_boot_failure_stops_at_each_stage_without_cleanup_or_replay() -> TestResult {
+    for (index, stage) in STAGES.into_iter().enumerate() {
+        let (pool, dropped, mut sequence) = sequence();
+        sequence.backend.fail = Some(stage);
+        let error = Error::Psp(psp::Error::Rejected(7));
+        if run(sequence.run()) != Err(error)
+            || sequence.state != (State::Failed { stage, error })
+            || sequence.backend.calls != STAGES[..=index]
+            || dropped.load(Ordering::SeqCst)
+            || run(sequence.run()) != Err(Error::Busy)
+            || pool.available() != 4096
+        {
+            return TestResult::Fail(
+                "stage failure continued/replayed or discarded its hardware owner",
+            );
+        }
+        drop(sequence);
+        if pool.available() != 4096 {
+            return TestResult::Fail("failed bring-up recycled device-owned memory");
+        }
+    }
+    let (_, _, mut sequence) = sequence();
+    sequence.backend.missing_report = true;
+    if run(sequence.run()) != Err(Error::Invalid)
+        || matches!(sequence.state, State::FirmwareReady(_))
+    {
+        return TestResult::Fail("missing firmware observations published readiness");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_failure_stops_at_each_stage_without_cleanup_or_replay
+);
+
+fn navi22_boot_cancel_at_each_stage_retains_session_and_ownership() -> TestResult {
+    for (index, stage) in STAGES.into_iter().enumerate() {
+        let (pool, dropped, mut sequence) = sequence();
+        sequence.backend.stall = Some(stage);
+        {
+            let mut future = core::pin::pin!(sequence.run());
+            if future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail("blocked stage completed");
+            }
+        }
+        if sequence.state != State::Running(stage)
+            || sequence.backend.calls != STAGES[..=index]
+            || dropped.load(Ordering::SeqCst)
+            || pool.available() != 4096
+            || run(sequence.run()) != Err(Error::Busy)
+            || sequence.backend.calls.len() != index + 1
+        {
+            return TestResult::Fail("cancel lost progress/owner or resumed the sequence");
+        }
+        drop(sequence);
+        if !dropped.load(Ordering::SeqCst) || pool.available() != 4096 {
+            return TestResult::Fail("cancelled owner was not quarantined on drop");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_cancel_at_each_stage_retains_session_and_ownership
+);
+
+fn gpu() -> AmdGpu {
+    use crate::amdgpu_discovery as d;
+    let map = narf_bus::MmioRegion {
+        phys: narf_memory::PhysAddr::new(0),
+        virt: 0,
+        len: 0x80000,
+        kind: narf_bus::BarKind::Mmio32 {
+            prefetchable: false,
+        },
+    };
+    let ip = |id, v: (u8, u8, u8)| d::IpBlock {
+        hw_id: id,
+        instance: 0,
+        major: v.0,
+        minor: v.1,
+        revision: v.2,
+        sub_revision: 0,
+        variant: 0,
+        base_addrs: [0; d::MAX_BASE_ADDRS],
+        num_bases: 3,
+    };
+    AmdGpu {
+        regs: map,
+        fb_bar: narf_bus::MmioRegion {
+            len: 16 << 20,
+            ..map
+        },
+        chip: crate::amdgpu::__test_chip_info_for_pci_id(
+            crate::amdgpu::AMD_VENDOR,
+            crate::amdgpu::NAVI22,
+        )
+        .unwrap(),
+        vram: crate::amdgpu::VramInfo {
+            base: 0,
+            size: 12 << 30,
+            visible_size: 16 << 20,
+        },
+        mode: None,
+        fw_loaded: false,
+        gc_info: None,
+        vbios: None,
+        ip_blocks: vec![
+            ip(d::HW_ID_GC, (10, 3, 2)),
+            ip(d::HW_ID_MP0, (11, 0, 11)),
+            ip(d::HW_ID_MP1, (11, 0, 11)),
+            ip(d::HW_ID_SDMA0, (5, 2, 2)),
+            ip(d::HW_ID_NBIF, (3, 3, 0)),
+            ip(d::HW_ID_HDP, (5, 0, 2)),
+        ],
+    }
+}
+fn firmware() -> Firmware {
+    Firmware {
+        sos: sos::tests::firmware(),
+        smc: smu::tests::firmware(),
+        graphics: gfx::tests::fixture(),
+    }
+}
+fn navi22_boot_preflight_and_real_backend_revocation() -> TestResult {
+    let registry = Cap::bootstrap();
+    registry.revoke();
+    let gpu = gpu();
+    if !matches!(
+        Firmware::open(&gpu, &registry),
+        Err(Error::Sos(sos::Error::Revoked))
+    ) {
+        return TestResult::Fail("coordinated firmware preparation bypassed registry authority");
+    }
+    let mut bad = self::gpu();
+    bad.ip_blocks[0].num_bases = 1;
+    if !matches!(
+        Firmware::open(&bad, &registry),
+        Err(Error::Psp(psp::Error::Unsupported))
+    ) {
+        return TestResult::Fail("missing RLC register bank reached firmware registry");
+    }
+    let pool = pool(16 << 20);
+    let authority = Cap::bootstrap();
+    authority.revoke();
+    // SAFETY: constructor is bookkeeping-only; revoked authority must prevent
+    // every MMIO in run. Firmware is synthetic and no hardware consumes it.
+    let mut boot = unsafe { ColdBoot::new(&gpu, authority, &pool, firmware()) }.unwrap();
+    if boot.state() != State::Prepared
+        || pool.available() != 15 << 20
+        || boot.gfx_boot_status().is_some()
+        || !matches!(boot.take_psp(), Err(Error::Busy))
+    {
+        return TestResult::Fail("constructor touched hardware or released incomplete PSP owner");
+    }
+    let error = Error::Sos(sos::Error::Revoked);
+    if run(boot.run()) != Err(error)
+        || boot.state()
+            != (State::Failed {
+                stage: Stage::Sos,
+                error,
+            })
+        || run(boot.run()) != Err(Error::Busy)
+        || !matches!(boot.take_psp(), Err(Error::Busy))
+        || boot.sequence.backend.psp.is_some()
+        || gpu.fw_loaded
+    {
+        return TestResult::Fail("revoked SOS continued to PSP or published acceleration");
+    }
+    drop(boot);
+    if pool.available() != 16 << 20 {
+        return TestResult::Fail("unpublished bootstrap allocation leaked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_preflight_and_real_backend_revocation
+);

@@ -9,6 +9,9 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 fn put(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
+pub(crate) fn firmware() -> Firmware {
+    Firmware { bytes: container() }
+}
 fn container() -> Vec<u8> {
     let mut bytes = vec![0; 278];
     for (offset, value) in [
