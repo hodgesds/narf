@@ -52,6 +52,14 @@ fn psp_sos_container_versions_and_boundaries() -> TestResult {
     for minor in 0..=3 {
         let bytes = container(minor);
         let image = Image::parse(&bytes).unwrap();
+        let toc = if minor == 1 || minor == 3 {
+            Some(&bytes[276..280])
+        } else {
+            None
+        };
+        if image.toc() != toc {
+            return TestResult::Fail("embedded TOC incorrectly selected");
+        }
         let parts: Vec<_> = image.components().collect();
         let count = if minor == 0 {
             2

@@ -1,5 +1,6 @@
-//! Phoenix PSP 13.0.4 GPCOM ring. Wire layouts and MMIO sequencing follow
-//! Linux psp_gfx_if.h, psp_v13_0_4.c, amdgpu_psp.c and hdp_v5_0.c.
+//! Phoenix PSP 13.0.4 and Navi22 PSP 11.0.11 GPCOM rings. Wire layouts and
+//! sequencing follow Linux psp_gfx_if.h, psp_v{11_0,13_0_4}.c, amdgpu_psp.c,
+//! nbio_v2_3.c, gfxhub_v2_1.c and hdp_v5_0.c.
 //! All addresses on the ring are GPU addresses, not host physical addresses.
 use crate::{
     amdgpu::AmdGpu,
@@ -22,19 +23,9 @@ const DESTROY: u32 = 3 << 16;
 const COMMAND: u64 = 4096;
 const FENCE: u64 = 8192;
 const BUFFER_SIZE: u64 = 12288;
-/// `regDCN_VM_FB_LOCATION_BASE` / `_TOP` / `_OFFSET`, dwords 0x0475..0x0477 at
-/// DCN base index 2 — where the hub believes the frame buffer is.
-const DCN_VM_FB_LOCATION_BASE: u64 = 0x0475;
-const DCN_VM_FB_OFFSET: u32 = 0x0477;
-/// The DCN versions this three-register window describes. All three ids and
-/// their base index are identical on DCN 3.5 (`dcn_3_5_0_offset.h`), so unlike
-/// the other DCN windows in this driver this one is portable and a row may be
-/// added without a second table. The constructor's real gate is PSP: MP0 is
-/// pinned to 13.0.4 below, and a DCN 3.5 part pairs with 13.0.11.
-const DCN_FB_LOCATION_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
-
 const HDP_HOLE: u64 = 0x7f000;
 const MAX_IMAGE: usize = 16 * 1024 * 1024;
+const DEFAULT_TMR_SIZE: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -86,6 +77,11 @@ trait Io {
     fn write(&mut self, reg: u32, value: u32);
     fn read_mem(&mut self, offset: u64) -> u32;
     fn write_mem(&mut self, offset: u64, value: u32);
+    fn write_payload(&mut self, map: MmioRegion, offset: u64, value: u32) {
+        // SAFETY: Session::stage supplies an exclusive, permanently mapped
+        // reservation and bounds every aligned write to its page-rounded size.
+        unsafe { map.write32(offset, value) };
+    }
     fn setup_hdp(&mut self) -> bool;
     fn flush(&mut self);
     fn invalidate(&mut self);
@@ -196,8 +192,7 @@ impl<I: Io> Engine<I> {
         self.response(false).await?;
         self.state = State::Starting;
         let address = self.memory.address();
-        self.memory.publish();
-        self.access(|io| {
+        let preparation = self.access(|io| {
             if !io.setup_hdp() {
                 return Err(Error::Invalid);
             }
@@ -205,13 +200,20 @@ impl<I: Io> Engine<I> {
                 io.write_mem(offset, 0);
             }
             io.flush();
+            Ok(())
+        });
+        if let Err(error) = preparation.and_then(|result| result) {
+            self.state = State::Failed;
+            return Err(error);
+        }
+        self.memory.publish();
+        self.access(|io| {
             io.write(RING_LO, address as u32);
             io.write(RING_HI, (address >> 32) as u32);
             io.write(RING_SIZE, 4096);
             io.write(CTRL, CREATE);
-            Ok(())
-        })??;
-        // PSP13.0.4 requires the handshake delay even for a fast response.
+        })?;
+        // Both PSP11 and PSP13 require this delay, even for a fast response.
         delay(20).await;
         let result = self.response(false).await;
         self.state = if result.is_ok() {
@@ -301,17 +303,117 @@ impl<I: Io> Engine<I> {
     }
 }
 
-/// Owns a single Phoenix PSP ring and any TMR installed through it. Dropping
+/// Owns a single PSP ring and any TMR installed through it. Dropping
 /// without verified shutdown quarantines published memory, including payloads.
 #[derive(Debug)]
 pub struct Psp {
-    engine: Engine<Mmio>,
+    session: Session<Mmio>,
+    kind: Kind,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Phoenix,
+    Navi22,
+}
+#[derive(Debug)]
+struct Session<I: Io> {
+    engine: Engine<I>,
     pool: Pool,
     payload: Option<Reservation>,
     tmr: Option<Reservation>,
     tmr_ready: bool,
     fb_base: u64,
     fb_offset: u64,
+}
+
+/// Absolute BAR5 byte addresses, resolved before any MMIO or allocation.
+#[derive(Debug)]
+struct Layout {
+    mp0: u64,
+    nbio: u64,
+    invalidate_reg: Option<u64>,
+    fb_base: u64,
+    fb_top: u64,
+    fb_offset: u64,
+}
+impl Layout {
+    fn resolve(gpu: &AmdGpu, kind: Kind) -> Result<Self, Error> {
+        if gpu.regs.len < HDP_HOLE + 4096 {
+            return Err(Error::Invalid);
+        }
+        let (mp0, nbio, fb_base, fb_top, fb_offset) = match kind {
+            Kind::Phoenix => {
+                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 4)], 1, SOS)?;
+                let nbio = bank(
+                    gpu,
+                    discovery::HW_ID_NBIF,
+                    &[(4, 3, 0), (4, 3, 1), (7, 7, 0), (7, 7, 1)],
+                    2,
+                    0x12d,
+                )?;
+                let dcn = bank(gpu, discovery::HW_ID_DCN, &[(3, 1, 4)], 2, 0x477)?;
+                (mp0, nbio, dcn + 0x475 * 4, dcn + 0x476 * 4, dcn + 0x477 * 4)
+            }
+            Kind::Navi22 => {
+                if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
+                    || gpu.chip.did != crate::amdgpu::NAVI22
+                {
+                    return Err(Error::Unsupported);
+                }
+                let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)?;
+                // Linux nv.c uses nbio_v2_3 for these revisions; MEMSIZE and
+                // REMAP_HDP_MEM_FLUSH_CNTL are at index 2, 0xc3 and 0x12d.
+                let nbio = bank(
+                    gpu,
+                    discovery::HW_ID_NBIF,
+                    &[
+                        (2, 3, 0),
+                        (2, 3, 1),
+                        (2, 3, 2),
+                        (3, 3, 0),
+                        (3, 3, 1),
+                        (3, 3, 2),
+                        (3, 3, 3),
+                    ],
+                    2,
+                    0x12d,
+                )?;
+                // GMC10 location/offset, not DCN314's similarly named registers.
+                // This also pins the GC and works without an active display.
+                let gc = bank(gpu, discovery::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd)?;
+                (mp0, nbio, gc + 0x16fc * 4, gc + 0x16fd * 4, gc + 0x16e7 * 4)
+            }
+        };
+        let hdp = bank(
+            gpu,
+            discovery::HW_ID_HDP,
+            &[
+                (5, 0, 0),
+                (5, 0, 1),
+                (5, 0, 2),
+                (5, 0, 3),
+                (5, 0, 4),
+                (5, 2, 0),
+                (5, 2, 1),
+            ],
+            0,
+            0xd1,
+        )?;
+        let ip = discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_HDP, 0)
+            .ok_or(Error::Unsupported)?;
+        if kind == Kind::Navi22 && (ip.major, ip.minor) != (5, 0) {
+            return Err(Error::Unsupported);
+        }
+        Ok(Self {
+            mp0,
+            nbio,
+            invalidate_reg: ((ip.major, ip.minor, ip.revision) != (5, 2, 1))
+                .then_some(hdp + 0xd1 * 4),
+            fb_base,
+            fb_top,
+            fb_offset,
+        })
+    }
 }
 /// One IP version's register window, for a caller whose register ids are only
 /// valid on some of the versions an IP reports.
@@ -389,6 +491,7 @@ pub(crate) fn bank(
     Ok(base)
 }
 impl Psp {
+    /// Claim the Phoenix PSP13 ring. Navi22 uses `new_navi22` instead.
     /// # Safety
     /// Caller owns this physical GPU (not an SR-IOV VF), PSP/PM/HDP exclusively,
     /// with permanent mappings and this GPU's exclusively free VRAM pool. No
@@ -399,49 +502,38 @@ impl Psp {
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
     ) -> Result<Self, Error> {
-        let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 4)], 1, SOS)?;
-        let nbio = bank(
-            gpu,
-            discovery::HW_ID_NBIF,
-            &[(4, 3, 0), (4, 3, 1), (7, 7, 0), (7, 7, 1)],
-            2,
-            0x12d,
-        )?;
-        let hdp = bank(
-            gpu,
-            discovery::HW_ID_HDP,
-            &[
-                (5, 0, 0),
-                (5, 0, 1),
-                (5, 0, 2),
-                (5, 0, 3),
-                (5, 0, 4),
-                (5, 2, 0),
-                (5, 2, 1),
-            ],
-            0,
-            0xd1,
-        )?;
-        let hdp_ip = discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_HDP, 0)
-            .ok_or(Error::Unsupported)?;
-        if gpu.regs.len < HDP_HOLE + 4096 {
-            return Err(Error::Invalid);
-        }
-        let dcn = bank(
-            gpu,
-            discovery::HW_ID_DCN,
-            DCN_FB_LOCATION_VERSIONS,
-            2,
-            DCN_VM_FB_OFFSET,
-        )?;
+        // SAFETY: forwarded exclusive device/mapping/pool contract.
+        unsafe { Self::with_kind(gpu, authority, pool, Kind::Phoenix) }
+    }
+    /// Claim the Navi22 PSP11 ring after SOS bootstrap (or verified resident SOS).
+    /// Validates GMC10 GPU VRAM addresses against the caller's BAR0 pool.
+    ///
+    /// # Safety
+    /// `new`'s exclusive GPU, PSP, HDP, reset/PM and pool contract applies.
+    /// VRAM must already be trained. This neither trains VRAM nor resets SOS.
+    pub unsafe fn new_navi22(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        // SAFETY: same exclusive ownership and initialized VRAM contract.
+        unsafe { Self::with_kind(gpu, authority, pool, Kind::Navi22) }
+    }
+    unsafe fn with_kind(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        kind: Kind,
+    ) -> Result<Self, Error> {
+        let layout = Layout::resolve(gpu, kind)?;
         let (base, top, offset) = authority
             .invoke(Op(|| {
-                // SAFETY: constructor bounds the discovered DCN bank.
+                // SAFETY: constructor bounds the selected DCN/GMC register bank.
                 unsafe {
                     (
-                        gpu.regs.read32(dcn + DCN_VM_FB_LOCATION_BASE * 4),
-                        gpu.regs.read32(dcn + (DCN_VM_FB_LOCATION_BASE + 1) * 4),
-                        gpu.regs.read32(dcn + u64::from(DCN_VM_FB_OFFSET) * 4),
+                        gpu.regs.read32(layout.fb_base),
+                        gpu.regs.read32(layout.fb_top),
+                        gpu.regs.read32(layout.fb_offset),
                     )
                 }
             }))
@@ -454,13 +546,14 @@ impl Psp {
         let fb_offset = (offset as u64 & 0xffffff) << 24;
         let pool_offset = pool.address().checked_sub(fb_base).ok_or(Error::Invalid)?;
         let mapping = pool.mapping();
-        if pool
-            .address()
-            .checked_add(mapping.len)
-            .is_none_or(|end| end > fb_end)
+        if fb_base >= fb_end
+            || pool
+                .address()
+                .checked_add(mapping.len)
+                .is_none_or(|end| end > fb_end)
             || pool_offset
                 .checked_add(mapping.len)
-                .is_none_or(|end| end > gpu.fb_bar.len)
+                .is_none_or(|end| end > gpu.fb_bar.len.min(gpu.vram.visible_size))
             || gpu.fb_bar.virt.checked_add(pool_offset) != Some(mapping.virt)
             || gpu.fb_bar.phys.raw().checked_add(pool_offset) != Some(mapping.phys.raw())
         {
@@ -468,34 +561,75 @@ impl Psp {
         }
         let memory = pool.reserve(BUFFER_SIZE).map_err(|_| Error::Allocation)?;
         Ok(Self {
-            engine: Engine {
-                io: Mmio {
-                    regs: gpu.regs,
-                    mp0,
-                    nbio,
-                    invalidate_reg: ((hdp_ip.major, hdp_ip.minor, hdp_ip.revision) != (5, 2, 1))
-                        .then_some(hdp + 0xd1 * 4),
-                    memory: memory.mapping(),
+            kind,
+            session: Session {
+                engine: Engine {
+                    io: Mmio {
+                        regs: gpu.regs,
+                        mp0: layout.mp0,
+                        nbio: layout.nbio,
+                        invalidate_reg: layout.invalidate_reg,
+                        memory: memory.mapping(),
+                    },
+                    authority,
+                    memory,
+                    state: State::Prepared,
+                    sequence: 0,
                 },
-                authority,
-                memory,
-                state: State::Prepared,
-                sequence: 0,
+                pool: pool.clone(),
+                payload: None,
+                tmr: None,
+                tmr_ready: false,
+                fb_base,
+                fb_offset,
             },
-            pool: pool.clone(),
-            payload: None,
-            tmr: None,
-            tmr_ready: false,
-            fb_base,
-            fb_offset,
         })
     }
     pub fn state(&self) -> State {
-        self.engine.state
+        self.session.engine.state
     }
     pub async fn start(&mut self) -> Result<(), Error> {
-        self.engine.start().await
+        self.session.engine.start().await
     }
+    /// Phoenix's standalone authenticated TOC container. Navi22 uses the
+    /// embedded TOC from the SOS container through `setup_tmr_navi22`.
+    pub async fn setup_tmr(&mut self, toc: &[u8]) -> Result<(), Error> {
+        if self.kind != Kind::Phoenix {
+            return Err(Error::Unsupported);
+        }
+        self.session
+            .setup_tmr_payload(Some(toc_payload(toc)?))
+            .await
+    }
+    /// Use the validated SOS container's embedded TOC, or PSP11's 4 MiB default
+    /// if no TOC is present. The allocation remains owned until verified stop.
+    pub async fn setup_tmr_navi22(
+        &mut self,
+        firmware: &crate::amdgpu_psp_boot::Firmware,
+    ) -> Result<(), Error> {
+        if self.kind != Kind::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        let image = firmware.image().map_err(|_| Error::Invalid)?;
+        self.session.setup_tmr_payload(image.toc()).await
+    }
+    /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
+    /// The DCN314 loader is the currently audited consumer of this operation.
+    pub async fn load_dmub(&mut self, signed_instructions: &[u8]) -> Result<(), Error> {
+        if self.kind != Kind::Phoenix {
+            return Err(Error::Unsupported);
+        }
+        self.session.load_dmub(signed_instructions).await
+    }
+    /// # Safety
+    /// Every engine using the TMR must have verified reset. Ring destruction
+    /// alone does not stop instruction fetches from trusted memory.
+    pub async unsafe fn stop(&mut self) -> Result<(), Error> {
+        // SAFETY: caller guarantees quiescence of every TMR consumer.
+        unsafe { self.session.stop().await }
+    }
+}
+impl<I: Io> Session<I> {
     async fn stage(&mut self, bytes: &[u8]) -> Result<(u64, u32), Error> {
         if self.engine.state != State::Ready || self.payload.is_some() {
             return Err(Error::Busy);
@@ -511,14 +645,15 @@ impl Psp {
         let map = allocation.mapping();
         self.payload = Some(allocation);
         for (index, chunk) in bytes.chunks(4096).enumerate() {
-            self.engine.access(|_| {
+            self.engine.access(|io| {
                 for (i, word) in chunk.chunks(4).enumerate() {
                     let mut padded = [0u8; 4];
                     padded[..word.len()].copy_from_slice(word);
-                    // SAFETY: exclusive payload reservation, rounded up to a page.
-                    unsafe {
-                        map.write32((index * 4096 + i * 4) as u64, u32::from_le_bytes(padded));
-                    }
+                    io.write_payload(
+                        map,
+                        (index * 4096 + i * 4) as u64,
+                        u32::from_le_bytes(padded),
+                    );
                 }
             })?;
             narf_scheduler::yield_now().await;
@@ -537,20 +672,22 @@ impl Psp {
             }
         }
     }
-    /// TOC is the authenticated PSP firmware container, not its filename or
-    /// an arbitrary buffer. Load its payload, then reserve the returned TMR size.
-    pub async fn setup_tmr(&mut self, toc: &[u8]) -> Result<(), Error> {
-        if self.tmr.is_some() {
+    /// TOC bytes have already been selected from a validated firmware container.
+    async fn setup_tmr_payload(&mut self, toc: Option<&[u8]>) -> Result<(), Error> {
+        if self.tmr.is_some() || self.payload.is_some() || self.engine.state != State::Ready {
             return Err(Error::Busy);
         }
-        let payload = toc_payload(toc)?;
-        let (address, size) = self.stage(payload).await?;
-        let result = self
-            .engine
-            .submit(&load_command(0x20, address, size, 0))
-            .await;
-        self.release_payload();
-        let size = result?.tmr_size as u64;
+        let size = if let Some(payload) = toc {
+            let (address, size) = self.stage(payload).await?;
+            let result = self
+                .engine
+                .submit(&load_command(0x20, address, size, 0))
+                .await;
+            self.release_payload();
+            result?.tmr_size as u64
+        } else {
+            DEFAULT_TMR_SIZE
+        };
         if size == 0 || size > 64 * 1024 * 1024 || size % 4096 != 0 {
             return Err(Error::Invalid);
         }
@@ -585,7 +722,7 @@ impl Psp {
     /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
     /// PSP installs the secure instruction/stack windows; callers must preserve
     /// those windows when configuring the remaining DMUB mailboxes.
-    pub async fn load_dmub(&mut self, signed_instructions: &[u8]) -> Result<(), Error> {
+    async fn load_dmub(&mut self, signed_instructions: &[u8]) -> Result<(), Error> {
         if !self.tmr_ready {
             return Err(Error::Busy);
         }
@@ -600,7 +737,7 @@ impl Psp {
     /// # Safety
     /// Every engine using this TMR (including DMUB) must have verified reset.
     /// Ring destruction alone does not stop instruction fetches from the TMR.
-    pub async unsafe fn stop(&mut self) -> Result<(), Error> {
+    async unsafe fn stop(&mut self) -> Result<(), Error> {
         if self.tmr.is_some() {
             if self.engine.state != State::Ready {
                 return Err(Error::Busy);

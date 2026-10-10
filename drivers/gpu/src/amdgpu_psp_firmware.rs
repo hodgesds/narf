@@ -35,6 +35,7 @@ impl Component {
 pub struct Image<'a> {
     components: [Option<(Component, &'a [u8])>; 4],
     version: u32,
+    toc: Option<&'a [u8]>,
 }
 fn word(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
@@ -103,6 +104,7 @@ impl<'a> Image<'a> {
             let (offset, len) = ranges[index];
             (len != 0).then(|| (kind, &payload[offset..offset + len]))
         };
+        let (toc_offset, toc_size) = ranges[2];
         Ok(Self {
             components: [
                 part(3, Component::KeyDatabase),
@@ -111,10 +113,16 @@ impl<'a> Image<'a> {
                 part(1, Component::SecureOs),
             ],
             version: word(bytes, 16),
+            toc: (toc_size != 0).then(|| &payload[toc_offset..toc_offset + toc_size]),
         })
     }
     pub fn version(&self) -> u32 {
         self.version
+    }
+    /// Payload of the optional embedded TOC used by GPCOM LOAD_TOC. v1.0 and
+    /// v1.2 have no TOC; their TMR uses the PSP11 default size instead.
+    pub fn toc(&self) -> Option<&'a [u8]> {
+        self.toc
     }
     /// Linux PSP11 boot order, omitting optional absent KDB/SPL components.
     pub fn components(&self) -> impl Iterator<Item = (Component, &'a [u8])> + '_ {

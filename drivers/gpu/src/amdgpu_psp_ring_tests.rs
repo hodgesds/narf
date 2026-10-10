@@ -16,6 +16,10 @@ struct Fake {
     dirty: bool,
     violation: bool,
     submissions: Vec<[u32; 256]>,
+    payload: Vec<u8>,
+    tmr_size: u32,
+    stall_command: Option<u32>,
+    fail_hdp: bool,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -39,10 +43,11 @@ impl Io for Fake {
             let seq = frame[5];
             self.submissions
                 .push(self.memory[1024..1280].try_into().unwrap());
-            if self.complete {
+            let id = self.memory[1026];
+            if self.complete && self.stall_command != Some(id) {
                 self.memory[(FENCE / 4) as usize] = seq;
                 self.memory[(COMMAND / 4) as usize + 216] = self.reject;
-                self.memory[(COMMAND / 4) as usize + 220] = 4 * 1024 * 1024;
+                self.memory[(COMMAND / 4) as usize + 220] = self.tmr_size;
             }
         }
     }
@@ -54,7 +59,15 @@ impl Io for Fake {
         self.memory[(offset / 4) as usize] = value;
     }
     fn setup_hdp(&mut self) -> bool {
-        true
+        !self.fail_hdp
+    }
+    fn write_payload(&mut self, _: MmioRegion, offset: u64, value: u32) {
+        self.dirty = true;
+        let offset = offset as usize;
+        if self.payload.len() < offset + 4 {
+            self.payload.resize(offset + 4, 0xff);
+        }
+        self.payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     fn flush(&mut self) {
         self.dirty = false;
@@ -81,6 +94,10 @@ fn fixture() -> (Pool, Engine<Fake>) {
         dirty: false,
         violation: false,
         submissions: Vec::new(),
+        payload: Vec::new(),
+        tmr_size: DEFAULT_TMR_SIZE as u32,
+        stall_command: None,
+        fail_hdp: false,
     };
     io.regs[CTRL as usize] = RESPONSE;
     io.regs[SOS as usize] = 1;
@@ -237,3 +254,6 @@ fn psp_tmr_gpu_alignment_and_padding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/psp-ring", psp_tmr_gpu_alignment_and_padding);
+
+#[path = "amdgpu_psp_navi22_tests.rs"]
+mod navi22;

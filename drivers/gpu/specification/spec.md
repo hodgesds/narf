@@ -114,9 +114,46 @@ cancellation. No implicit reset or recovery reuses that memory.
 Success proves only SOS liveness, not the identity/version of a previously
 running SOS or availability of graphics acceleration. It does not set
 `AmdGpu::fw_loaded`. The legacy single/multi-blob loaders reject Navi 22;
-automatic platform wiring, VRAM training, PSP11 GPCOM/TMR setup and IP/SMC
-firmware loading remain follow-up work. The current PSP13 ring constructor
-is not used for this device.
+automatic platform wiring, VRAM training and IP/SMC firmware loading remain
+follow-up work. The PSP11 ring constructor below is used for this device.
+
+### Navi 22 PSP command ring and trusted memory
+
+`unsafe amdgpu_psp_ring::Psp::new_navi22(gpu, pci_cap, pool)` claims the sole
+PSP 11.0.11 GPCOM ring under the exclusive ownership, trained-VRAM and permanent
+mapping requirements of the bootstrap. A bootstrap owner must reach `Ready`
+and be dropped before claiming the ring; failed/cancelled bootstrap requires
+independent reset/recovery. PCI ID `1002:73df` and GC 10.3.2 are required;
+register banks are pinned to MP0 index 0, NBIO 2.3/3.3 index 2 and HDP 5.0
+index 0. NBIO remaps the HDP flush hole at BAR5 `0x7f000`; HDP read-cache
+invalidation precedes fence/reply reads. The remap must verify before any ring
+address is published. Missing/duplicate IPs and truncated windows reject the
+constructor. No DCN/display discovery is needed.
+
+The constructor reads GMC10 `GCMC_VM_FB_LOCATION_BASE/TOP` and `FB_OFFSET`
+at GC index 0, dwords `0x16fc/0x16fd` and `0x16e7`, under the PCI capability.
+It checks the owned pool's GPU addresses and CPU mapping against both the
+framebuffer range and visible BAR0 size before allocating the ring. Ring and
+payload addresses are GPU MC addresses. TMR's additional physical address is
+`gpu_address - framebuffer_base + framebuffer_offset`, as seen by the GPU;
+the host PCI BAR address is never substituted.
+
+`start().await` uses the same bounded PF GPCOM wire protocol and 20 ms handshake
+as the Phoenix transport. `setup_tmr_navi22(&amdgpu_psp_boot::Firmware).await`
+uses `Image::toc()` from the validated SOS container, submits `LOAD_TOC`, and
+allocates the PSP-reported TMR size (nonzero, page-aligned, at most 64 MiB).
+Containers without a TOC use PSP11's 4 MiB default. TMR allocations are aligned
+to 1 MiB; `SETUP_TMR` carries both GPU and GPU-physical addresses with flags=2.
+Readiness requires a successful matching-fence completion. TOC staging is
+released only after completion or verified ring destruction; uncertain TMR
+installation retains the reservation and prevents retry. `unsafe stop().await`
+requires every TMR consumer to be quiescent and destroys TMR before the ring.
+Rejected teardown and cancellation retain device-owned memory.
+
+`Psp::new` and the standalone `setup_tmr`/`load_dmub` methods remain Phoenix
+operations and reject a Navi22 session. This adds the PSP transport and TMR
+allocation path; it does not submit Navi22 IP/SMC firmware or enable graphics,
+and still requires real-card validation and platform boot integration.
 
 ### AMD platform VBIOS
 

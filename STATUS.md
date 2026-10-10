@@ -252,10 +252,12 @@ for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
 and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the
 Navi 22 userspace family query. The `navy_flounder_sos.bin` parser and an
 explicit PSP 11.0.11 asynchronous bootstrap now handle KDB/SPL/system/SOS
-using owned, aligned VRAM with cancellation quarantine. These are
-software-tested foundations; automatic platform wiring, VRAM training,
-PSP11 GPCOM/TMR and IP firmware loading, hardware boot, GMC/GFX10
-initialization and DCN3.0 modesetting remain open. See the
+using owned, aligned VRAM with cancellation quarantine. The PSP11 GPCOM ring
+now resolves Navi22's register banks and GMC10 address ranges, installs trusted
+memory from the SOS container's embedded TOC, and preserves device-owned
+reservations through cancellation or failed teardown. These are software-tested
+foundations; automatic platform wiring, VRAM training, IP firmware loading,
+hardware boot, GMC/GFX10 initialization and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix
