@@ -255,9 +255,13 @@ explicit PSP 11.0.11 asynchronous bootstrap now handle KDB/SPL/system/SOS
 using owned, aligned VRAM with cancellation quarantine. The PSP11 GPCOM ring
 now resolves Navi22's register banks and GMC10 address ranges, installs trusted
 memory from the SOS container's embedded TOC, and preserves device-owned
-reservations through cancellation or failed teardown. These are software-tested
-foundations; automatic platform wiring, VRAM training, IP firmware loading,
-hardware boot, GMC/GFX10 initialization and DCN3.0 modesetting remain open. See the
+reservations through cancellation or failed teardown. A bounded SMC v2.0 parser
+now separates microcode from PowerPlay metadata; the ring can load that SMC
+once after TMR setup. An explicit SMU11 cold-start handshake checks Navi22's
+interface and running firmware version using its discrete-GPU mailbox layout.
+These are software-tested foundations; automatic platform wiring, VRAM training,
+remaining IP firmware loads, board power/clock setup, hardware boot, GMC/GFX10
+initialization and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix

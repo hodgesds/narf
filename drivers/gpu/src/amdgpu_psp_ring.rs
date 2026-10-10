@@ -315,6 +315,13 @@ enum Kind {
     Phoenix,
     Navi22,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmcState {
+    Absent,
+    Pending,
+    Loaded,
+    Failed,
+}
 #[derive(Debug)]
 struct Session<I: Io> {
     engine: Engine<I>,
@@ -322,6 +329,7 @@ struct Session<I: Io> {
     payload: Option<Reservation>,
     tmr: Option<Reservation>,
     tmr_ready: bool,
+    smc_state: SmcState,
     fb_base: u64,
     fb_offset: u64,
 }
@@ -361,6 +369,8 @@ impl Layout {
                     return Err(Error::Unsupported);
                 }
                 let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)?;
+                // Navi22's cold-boot SMC path requires this exact MP1 mailbox.
+                bank(gpu, discovery::HW_ID_MP1, &[(11, 0, 11)], 0, 0x29a)?;
                 // Linux nv.c uses nbio_v2_3 for these revisions; MEMSIZE and
                 // REMAP_HDP_MEM_FLUSH_CNTL are at index 2, 0xc3 and 0x12d.
                 let nbio = bank(
@@ -580,6 +590,7 @@ impl Psp {
                 payload: None,
                 tmr: None,
                 tmr_ready: false,
+                smc_state: SmcState::Absent,
                 fb_base,
                 fb_offset,
             },
@@ -619,7 +630,21 @@ impl Psp {
         if self.kind != Kind::Phoenix {
             return Err(Error::Unsupported);
         }
-        self.session.load_dmub(signed_instructions).await
+        self.session.load_ip(signed_instructions, 51).await
+    }
+    /// Load Navi22 SMC once during cold boot, after trusted memory setup and
+    /// before other IP firmware. Only microcode is sent, never the header/PPT.
+    /// Completion means PSP accepted it; use Smu::after_upload/verify to check
+    /// runtime responsiveness. This does not implement BACO/resume/reload.
+    pub async fn load_smc_navi22(
+        &mut self,
+        firmware: &crate::amdgpu_smu_navi22::Firmware,
+    ) -> Result<(), Error> {
+        if self.kind != Kind::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        let image = firmware.image().map_err(|_| Error::Invalid)?;
+        self.session.load_smc(image.payload()).await
     }
     /// # Safety
     /// Every engine using the TMR must have verified reset. Ring destruction
@@ -719,20 +744,35 @@ impl<I: Io> Session<I> {
         self.tmr_ready = true;
         Ok(())
     }
-    /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
-    /// PSP installs the secure instruction/stack windows; callers must preserve
-    /// those windows when configuring the remaining DMUB mailboxes.
-    async fn load_dmub(&mut self, signed_instructions: &[u8]) -> Result<(), Error> {
+    /// Shared LOAD_IP_FW transport; public entry points select the image/type.
+    async fn load_ip(&mut self, bytes: &[u8], firmware_type: u32) -> Result<(), Error> {
         if !self.tmr_ready {
             return Err(Error::Busy);
         }
-        let (address, size) = self.stage(signed_instructions).await?;
+        let (address, size) = self.stage(bytes).await?;
         let result = self
             .engine
-            .submit(&load_command(6, address, size, 51))
+            .submit(&load_command(6, address, size, firmware_type))
             .await;
         self.release_payload();
         result.map(|_| ())
+    }
+    async fn load_smc(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.smc_state != SmcState::Absent
+            || !self.tmr_ready
+            || self.engine.state != State::Ready
+            || self.payload.is_some()
+        {
+            return Err(Error::Busy);
+        }
+        self.smc_state = SmcState::Pending;
+        let result = self.load_ip(bytes, 18).await; // GFX_FW_TYPE_SMU
+        self.smc_state = if result.is_ok() {
+            SmcState::Loaded
+        } else {
+            SmcState::Failed
+        };
+        result
     }
     /// # Safety
     /// Every engine using this TMR (including DMUB) must have verified reset.
@@ -758,6 +798,7 @@ impl<I: Io> Session<I> {
                 payload.stopped();
             }
         }
+        self.smc_state = SmcState::Absent;
         Ok(())
     }
 }

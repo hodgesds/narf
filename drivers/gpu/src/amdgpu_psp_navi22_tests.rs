@@ -31,6 +31,7 @@ fn session() -> (Pool, Session<Fake>) {
             payload: None,
             tmr: None,
             tmr_ready: false,
+            smc_state: SmcState::Absent,
             fb_base: 0x8_0000_0000,
             fb_offset: 0x1_0000_0000,
         },
@@ -245,6 +246,153 @@ kernel_test_in!(
     psp_hdp_failure_precedes_ring_publication
 );
 
+fn psp_navi22_smc_payload_type_and_one_upload() -> TestResult {
+    let (pool, mut s) = session();
+    let bytes = [0xa5; 16];
+    if run(s.load_smc(&bytes)) != Err(Error::Busy) || s.smc_state != SmcState::Absent {
+        return TestResult::Fail("SMC accepted before ring/TMR readiness");
+    }
+    run(s.engine.start()).unwrap();
+    if run(s.load_smc(&bytes)) != Err(Error::Busy) || s.payload.is_some() {
+        return TestResult::Fail("SMC staged without trusted memory");
+    }
+    run(s.setup_tmr_payload(None)).unwrap();
+    if run(s.load_smc(&bytes)).is_err() || s.smc_state != SmcState::Loaded {
+        return TestResult::Fail("SMC load failed");
+    }
+    let cmd = s.engine.io.submissions[1];
+    if cmd[2] != 6
+        || cmd[7..11] != [0x6000, 8, 16, 18]
+        || cmd[11..].iter().any(|v| *v != 0)
+        || s.engine.io.payload != bytes
+        || s.engine.io.violation
+        || s.payload.is_some()
+        || pool.available() != (16 << 20) - BUFFER_SIZE - (4 << 20)
+    {
+        return TestResult::Fail(
+            "wrong SMC command/address/type, unflushed payload or retained staging",
+        );
+    }
+    if run(s.load_smc(&bytes)) != Err(Error::Busy) || s.engine.io.submissions.len() != 2 {
+        return TestResult::Fail("SMC reloaded without resetting consumers");
+    }
+    // SAFETY: fake SMU has no running firmware consumers.
+    unsafe { run(s.stop()) }.unwrap();
+    drop(s);
+    if pool.available() != 16 << 20 {
+        return TestResult::Fail("stopped SMC session leaked memory");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi22_smc_payload_type_and_one_upload
+);
+
+fn psp_navi22_smc_rejection_and_timeout() -> TestResult {
+    for timeout in [false, true] {
+        let (pool, mut s) = session();
+        run(s.engine.start()).unwrap();
+        run(s.setup_tmr_payload(None)).unwrap();
+        s.engine.io.reject = 0xffff000a;
+        s.engine.io.stall_command = timeout.then_some(6);
+        let expected = if timeout {
+            Error::Timeout
+        } else {
+            Error::Rejected(0xffff000a)
+        };
+        if run(s.load_smc(&[1, 2, 3, 4])) != Err(expected)
+            || s.smc_state != SmcState::Failed
+            || run(s.load_smc(&[1, 2, 3, 4])) != Err(Error::Busy)
+        {
+            return TestResult::Fail("failed SMC acknowledged or allowed replay");
+        }
+        if timeout {
+            // SAFETY: fake has no consumers, but incomplete PSP command prevents teardown.
+            if unsafe { run(s.stop()) } != Err(Error::Busy) || s.payload.is_none() {
+                return TestResult::Fail("timed out SMC lost device ownership");
+            }
+            drop(s);
+            if pool.available() != (16 << 20) - BUFFER_SIZE - (4 << 20) - 4096 {
+                return TestResult::Fail("timeout recycled PSP-owned ring/TMR/SMC payload");
+            }
+        } else {
+            if s.payload.is_some() {
+                return TestResult::Fail("fenced rejection retained SMC staging");
+            }
+            s.engine.io.reject = 0;
+            // SAFETY: no real consumers and PSP teardown succeeds in this model.
+            unsafe { run(s.stop()) }.unwrap();
+            drop(s);
+            if pool.available() != 16 << 20 {
+                return TestResult::Fail("rejected SMC cleanup leaked memory");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/psp-ring", psp_navi22_smc_rejection_and_timeout);
+
+fn psp_navi22_smc_cancellation_and_revocation() -> TestResult {
+    for published in [false, true] {
+        for revoke in [false, true] {
+            let (pool, mut s) = session();
+            run(s.engine.start()).unwrap();
+            run(s.setup_tmr_payload(None)).unwrap();
+            s.engine.io.stall_command = Some(6);
+            let authority = s.engine.authority;
+            {
+                let mut future = core::pin::pin!(s.load_smc(&[1, 2, 3, 4]));
+                for _ in 0..if published { 3 } else { 1 } {
+                    if future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                    {
+                        return TestResult::Fail("stalled SMC completed");
+                    }
+                }
+                if revoke {
+                    authority.revoke();
+                    if run(future) != Err(Error::Revoked) {
+                        return TestResult::Fail("revoked SMC continued");
+                    }
+                }
+            }
+            let expected_state = if revoke {
+                SmcState::Failed
+            } else {
+                SmcState::Pending
+            };
+            if s.smc_state != expected_state
+                || run(s.load_smc(&[1, 2, 3, 4])) != Err(Error::Busy)
+                || s.engine.io.submissions.len() != if published { 2 } else { 1 }
+            {
+                return TestResult::Fail("cancel/revoke lost state or sent extra commands");
+            }
+            if !published && !revoke {
+                // SAFETY: payload was never published, no modeled TMR consumers.
+                unsafe { run(s.stop()) }.unwrap();
+                drop(s);
+                if pool.available() != 16 << 20 {
+                    return TestResult::Fail("unpublished SMC leaked after stop");
+                }
+            } else {
+                drop(s);
+                let retained = BUFFER_SIZE + (4 << 20) + if published { 4096 } else { 0 };
+                if pool.available() != (16 << 20) - retained {
+                    return TestResult::Fail("cancel/revoke recycled device-owned SMC memory");
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi22_smc_cancellation_and_revocation
+);
+
 fn ip(id: u16, version: (u8, u8, u8), index: usize, base: u32) -> discovery::IpBlock {
     let mut bases = [0x20000; discovery::MAX_BASE_ADDRS];
     bases[index] = base;
@@ -295,6 +443,7 @@ fn gpu(regs: &mut [u32]) -> AmdGpu {
             ip(discovery::HW_ID_NBIF, (3, 3, 0), 2, 0xd20),
             ip(discovery::HW_ID_HDP, (5, 0, 2), 0, 0xb00),
             ip(discovery::HW_ID_GC, (10, 3, 2), 0, 0x2000),
+            ip(discovery::HW_ID_MP1, (11, 0, 11), 0, 0x11000),
         ],
     }
 }
@@ -326,7 +475,7 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
         return TestResult::Fail("Navi22 accepted a Phoenix firmware operation");
     }
     drop(psp);
-    for case in 0..8 {
+    for case in 0..10 {
         let mut bad = self::gpu(&mut regs);
         match case {
             0 => bad.ip_blocks[0].revision = 7,
@@ -336,7 +485,9 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
             4 => bad.ip_blocks.push(bad.ip_blocks[0]),
             5 => bad.ip_blocks[0].num_bases = 0,
             6 => bad.regs.len -= 4,
-            _ => bad.chip.did = crate::amdgpu::PHOENIX1,
+            7 => bad.chip.did = crate::amdgpu::PHOENIX1,
+            8 => bad.ip_blocks[4].revision = 7,
+            _ => bad.ip_blocks.push(bad.ip_blocks[4]),
         }
         if Layout::resolve(&bad, Kind::Navi22).is_ok() {
             return TestResult::Fail("unaudited IP/register window accepted");

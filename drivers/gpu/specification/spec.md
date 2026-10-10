@@ -114,8 +114,8 @@ cancellation. No implicit reset or recovery reuses that memory.
 Success proves only SOS liveness, not the identity/version of a previously
 running SOS or availability of graphics acceleration. It does not set
 `AmdGpu::fw_loaded`. The legacy single/multi-blob loaders reject Navi 22;
-automatic platform wiring, VRAM training and IP/SMC firmware loading remain
-follow-up work. The PSP11 ring constructor below is used for this device.
+automatic platform wiring, VRAM training and the remaining IP firmware loads
+remain follow-up work. The PSP11 ring and SMC loader below are explicit APIs.
 
 ### Navi 22 PSP command ring and trusted memory
 
@@ -123,7 +123,7 @@ follow-up work. The PSP11 ring constructor below is used for this device.
 PSP 11.0.11 GPCOM ring under the exclusive ownership, trained-VRAM and permanent
 mapping requirements of the bootstrap. A bootstrap owner must reach `Ready`
 and be dropped before claiming the ring; failed/cancelled bootstrap requires
-independent reset/recovery. PCI ID `1002:73df` and GC 10.3.2 are required;
+independent reset/recovery. PCI ID `1002:73df`, GC 10.3.2 and MP1 11.0.11 are required;
 register banks are pinned to MP0 index 0, NBIO 2.3/3.3 index 2 and HDP 5.0
 index 0. NBIO remaps the HDP flush hole at BAR5 `0x7f000`; HDP read-cache
 invalidation precedes fence/reply reads. The remap must verify before any ring
@@ -151,9 +151,45 @@ requires every TMR consumer to be quiescent and destroys TMR before the ring.
 Rejected teardown and cancellation retain device-owned memory.
 
 `Psp::new` and the standalone `setup_tmr`/`load_dmub` methods remain Phoenix
-operations and reject a Navi22 session. This adds the PSP transport and TMR
-allocation path; it does not submit Navi22 IP/SMC firmware or enable graphics,
+operations and reject a Navi22 session. This transport does not enable graphics
 and still requires real-card validation and platform boot integration.
+
+### Navi 22 SMC firmware and SMU version handshake
+
+`amdgpu_smu_navi22::Firmware::open(gpu, registry_cap)` reads
+`amdgpu/navy_flounder_smc.bin` through live registry/blob capabilities and
+keeps an immutable, bounded copy. It requires PCI ID `1002:73df`, GC 10.3.2
+and MP1 11.0.11, with unique instance-zero IPs and a complete MP1 register
+window. `amdgpu_smc_firmware::Image::parse` accepts SMC header v2.0 / IP 11.0,
+checks the declared file size, aligned nonempty microcode range and disjoint
+file-relative PowerPlay table range. Limits are 2 MiB per container and 1 MiB
+of microcode. It exposes `payload()`, `version()` and optional `powerplay()`;
+the SRAM start address is metadata, never a host/GPU DMA address. Structural
+validation does not authenticate the image or select board power policy.
+
+`Psp::load_smc_navi22(&Firmware).await` requires a Navi22 ring with acknowledged
+TMR setup. It stages only the microcode and submits `LOAD_IP_FW` (6), firmware
+type SMU (18), using the GPU address and exact payload length. Matching-fence
+completion releases staging; missing completion retains device-owned memory.
+SMC loading is attempted once per session: success, failure or cancellation
+all prevent another upload. Verified stop/reset is required before a new
+session. This is a cold-boot operation before other IP loads, not a firmware
+reload, attach, BACO or resume path. PSP completion alone does not prove that
+the SMU is responsive.
+
+`unsafe amdgpu_smu_navi22::Smu::after_upload(gpu, pci_cap)` requires exclusive
+MP1/reset/power ownership, permanent mappings, successful cold-boot SMC upload
+and no outstanding mailbox command. Construction does no MMIO.
+`verify().await` sends only `GetDriverIfVersion` (3) and `GetSmuVersion` (2),
+using MP1 base index 0: C2PMSG66 message, C2PMSG82 argument and C2PMSG90 response.
+The cold-start response may be zero. Each command clears response/argument
+before publication and uses timer futures with a 1 s deadline. Every I/O batch
+checks current PCI authority. Success returns `Versions { firmware, interface }`
+with interface `0x0e` and a nonzero firmware version; all-ones reads, rejection,
+timeout, revocation and interface mismatch fail closed. State moves from
+`Prepared` to `Querying` to `Ready` or `Failed`; cancellation retains `Querying`
+and prohibits replay. The API does not program clocks, voltages, fans or
+PowerPlay tables, enable DPM/graphics or set `AmdGpu::fw_loaded`.
 
 ### AMD platform VBIOS
 
