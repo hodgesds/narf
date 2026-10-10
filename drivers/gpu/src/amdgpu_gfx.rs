@@ -1054,6 +1054,132 @@ impl Gfx11Sequence {
     }
 }
 
+/// `regCP_MEC_DOORBELL_RANGE_LOWER` / `_UPPER` — GC BASE_IDX **0**, unlike
+/// the `CP_MEC_RS64_CNTL` below it.
+pub const GFX11_CP_MEC_DOORBELL_RANGE_LOWER: u32 = 0x1DFC;
+pub const GFX11_CP_MEC_DOORBELL_RANGE_UPPER: u32 = 0x1DFD;
+
+/// `regCP_MEC_RS64_CNTL` — GC BASE_IDX **1**, dword 0x2904.
+///
+/// Its field layout is **identical** to `CP_MES_CNTL`'s: icache-invalidate at
+/// 4, the four resets at 16..19, the four actives at 26..29, halt at 30, step
+/// at 31. Two different engines, two different offsets, one layout — so a
+/// copy-paste that keeps the fields and the wrong offset is invisible, which is
+/// why both offsets are spelled out with their windows next to them.
+pub const GFX11_CP_MEC_RS64_CNTL: u32 = 0x2904;
+/// `regCP_MEC_CNTL` — the pre-RS64 form, also BASE_IDX 1.
+pub const GFX11_CP_MEC_CNTL: u32 = 0x0802;
+
+/// `CP_MEC_RS64_CNTL` fields. Same positions as `amdgpu_mes_hw`'s
+/// `CP_MES_CNTL` set; see [`GFX11_CP_MEC_RS64_CNTL`].
+pub const MEC_RS64_INVALIDATE_ICACHE: u32 = 1 << 4;
+pub const MEC_RS64_PIPE_RESET: [u32; 4] = [1 << 16, 1 << 17, 1 << 18, 1 << 19];
+pub const MEC_RS64_PIPE_ACTIVE: [u32; 4] = [1 << 26, 1 << 27, 1 << 28, 1 << 29];
+pub const MEC_RS64_HALT: u32 = 1 << 30;
+
+/// `CP_MEC_CNTL__MEC_ME1_HALT` and `..._ME2_HALT`. **ME2 is the LOWER bit**
+/// — 0x1c against ME1's 0x1e — so a reader numbering them in name order gets
+/// them backwards.
+pub const MEC_ME1_HALT: u32 = 1 << 30;
+pub const MEC_ME2_HALT: u32 = 1 << 28;
+
+/// `gfx_v11_0_cp_compute_enable` — take the MEC pipes out of reset, or halt
+/// them.
+///
+/// Nothing in this driver reached `CP_MEC_RS64_CNTL` before this. `cp_enable`
+/// clears the halt bits in `CP_ME_CNTL`, which is the **graphics** engine's
+/// register (`gfx_v11_0_cp_gfx_enable`); the MEC is an entirely separate
+/// register and was never written, so the compute pipes stayed halted.
+///
+/// On RS64 — which every GFX11 part with a 2.0 PFP header is, Phoenix
+/// included — eleven fields move together, and the inversion is the thing to
+/// get right: enabling **clears** icache-invalidate and the four resets and
+/// sets the four actives, and halting does the reverse. A read-modify-write,
+/// unlike `mes_v11_0_enable`'s second write, because `cp_compute_enable` keeps
+/// the live value in `data` throughout.
+///
+/// `enable_kiq` is `adev->enable_mes_kiq`, and it is consulted **only** on the
+/// non-RS64 path: there, ME2 is left halted when the MES owns the KIQ. The
+/// RS64 path moves all four pipes regardless.
+///
+/// Returns the value to write; the `udelay(50)` that follows it in Linux is
+/// the caller's, as [`MEC_ENABLE_DELAY_US`].
+pub fn cp_compute_enable_value(live: u32, rs64: bool, enable: bool, enable_kiq: bool) -> u32 {
+    if rs64 {
+        let mut data = live;
+        let reset_and_invalidate =
+            MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_PIPE_RESET.iter().fold(0, |a, b| a | b);
+        let actives = MEC_RS64_PIPE_ACTIVE.iter().fold(0, |a, b| a | b);
+        if enable {
+            data &= !(reset_and_invalidate | MEC_RS64_HALT);
+            data |= actives;
+        } else {
+            data |= reset_and_invalidate | MEC_RS64_HALT;
+            data &= !actives;
+        }
+        data
+    } else {
+        let mut data = live;
+        if enable {
+            data &= !MEC_ME1_HALT;
+            // Only when the MES does not own the KIQ. With MES KIQ enabled,
+            // ME2 stays halted and the scheduler drives it.
+            if !enable_kiq {
+                data &= !MEC_ME2_HALT;
+            }
+        } else {
+            data |= MEC_ME1_HALT | MEC_ME2_HALT;
+        }
+        data
+    }
+}
+
+/// `udelay(50)` at the end of `gfx_v11_0_cp_compute_enable`.
+pub const MEC_ENABLE_DELAY_US: u32 = 50;
+
+/// `gfx_v11_0_cp_set_doorbell_range` — the doorbell windows the CP honours.
+///
+/// Four registers, and the pairs are in **different** GC windows: the RB pair
+/// is window 0 at 0x1dfa/0x1dfb and so is the MEC pair at 0x1dfc/0x1dfd, while
+/// `CP_MEC_RS64_CNTL` beside them is window 1.
+///
+/// Each value is `(assignment_index * 2) << 2` — the doorbell index doubled
+/// into the dword space, then placed at the field's shift of 2. Both of those
+/// factors are easy to lose, and losing either puts the window somewhere else
+/// entirely.
+///
+/// Linux writes these raw rather than through `REG_SET_FIELD`, unlike
+/// `gfx_v11_0_cp_gfx_set_doorbell` two functions away. The field is ten bits at
+/// shift 2 and all four Phoenix values fit it, so masking is a no-op on real
+/// input; it is applied anyway, because a value outside a field is never
+/// intended and the assignment table is the kind of thing that grows.
+pub fn build_cp_set_doorbell_range(gc_base_idx0: u32) -> Gfx11Sequence {
+    use crate::amdgpu_ring::doorbell_assignment as db;
+    let mut seq = Gfx11Sequence::default();
+    let place = |index: u16| ((u32::from(index) * 2) << 2) & GFX11_DOORBELL_RANGE_LOWER_MASK;
+    seq.write(
+        gc_base_idx0,
+        GFX11_CP_RB_DOORBELL_RANGE_LOWER,
+        place(db::GFX_RING0),
+    );
+    seq.write(
+        gc_base_idx0,
+        GFX11_CP_RB_DOORBELL_RANGE_UPPER,
+        place(db::GFX_USERQUEUE_END),
+    );
+    seq.write(
+        gc_base_idx0,
+        GFX11_CP_MEC_DOORBELL_RANGE_LOWER,
+        place(db::KIQ),
+    );
+    seq.write(
+        gc_base_idx0,
+        GFX11_CP_MEC_DOORBELL_RANGE_UPPER,
+        place(db::USERQUEUE_END),
+    );
+    seq
+}
+
 /// `gfx_v11_0_cp_gfx_resume` for graphics ring 0 on pipe 0 —
 /// the register sequence that points the GFX11 command processor at a ring.
 ///
@@ -1061,6 +1187,54 @@ impl Gfx11Sequence {
 /// the same registers through different offsets and in a different order, and
 /// adds the write-pointer poll address and `CP_RB_ACTIVE` that GFX9 has no
 /// equivalent of.
+///
+/// # This is the NON-async path, and the driver carries pieces of both
+///
+/// `gfx_v11_0_cp_resume` forks on the `amdgpu_async_gfx_ring` module
+/// parameter, and the two arms bring a graphics ring up in different ways:
+///
+/// ```text
+///   async_gfx_ring = 0        async_gfx_ring = 1   (Linux's DEFAULT)
+///   ------------------        --------------------------------------
+///   cp_gfx_resume             cp_async_gfx_ring_resume
+///     CP_RB0_* registers        kgq_init_queue      -> the MQD
+///     cp_gfx_set_doorbell       amdgpu_gfx_enable_kgq -> MES ADD_QUEUE
+///     cp_gfx_start                                     (or KIQ MAP_QUEUES)
+///                               cp_gfx_start
+/// ```
+///
+/// **This function is the left column, and the left column is NOT the arm this
+/// driver targets.** `amdgpu_async_gfx_ring` defaults to 1, so the right
+/// column is what Linux runs on a stock Phoenix, and it is the arm
+/// [`crate::amdgpu_bringup::CP_RESUME_ASYNC`] plans. The MQD
+/// ([`crate::amdgpu_mqd::gfx_mqd_init`]), the legacy-queue mapping
+/// ([`crate::amdgpu_mes::build_map_legacy_queue`]) and
+/// `GfxContext::map_legacy_args` are the right column.
+///
+/// This arm is kept rather than deleted because it is the shorter path to a
+/// first submission — it needs no MES at all — and so is the better thing to
+/// reach for if the scheduler turns out to be the part that does not come up.
+/// But it is the fallback, and a caller choosing it is choosing to diverge
+/// from what the firmware is usually exercised against. Pick one arm; do not
+/// interleave them.
+///
+/// They disagree on the doorbell, which is the trap:
+///
+/// * Left: the per-queue doorbell comes from `CP_RB_DOORBELL_CONTROL`, written
+///   here, and `CP_RB_DOORBELL_RANGE_UPPER` is set to the field's full mask.
+/// * Right: the per-queue doorbell comes from the MQD's
+///   `cp_hqd_pq_doorbell_control`, and the ranges are whatever
+///   [`build_cp_set_doorbell_range`] left — `gfx_v11_0_cp_gfx_set_doorbell` is
+///   reached only from `cp_gfx_resume` and so never runs on the async arm.
+///
+/// So on the async arm the full-mask `RANGE_UPPER` this function writes never
+/// happens, and `(GFX_USERQUEUE_END * 2) << 2` stands instead. Running both
+/// arms would write the ring's address into the CP registers *and* hand the
+/// scheduler a descriptor pointing at the same ring, with two doorbell
+/// configurations layered.
+///
+/// `cp_gfx_start`'s clear-state preamble
+/// ([`crate::amdgpu_clearstate::build_preamble`]) is common to both.
 ///
 /// `gfx_v11_0_cp_gfx_switch_pipe` reads `GRBM_GFX_CNTL` and sets its PIPEID
 /// field. Read-modify-write needs the live value, which a sequence cannot
@@ -1205,4 +1379,272 @@ pub fn build_gfx11_ring_init(
     );
 
     Ok(seq)
+}
+
+// ── Ring test ──────────────────────────────────────────────────────
+
+/// `regSCRATCH_REG0` — dword 0x2040 on GC BASE_IDX **1**.
+///
+/// The ring test's whole mechanism: the host writes a sentinel here, the ring
+/// carries a packet that overwrites it, and the host polls for the new value.
+/// If the second value appears, the command processor fetched from the ring,
+/// executed a packet and reached a register — which is the only evidence that
+/// any of the bring-up above worked.
+pub const GFX11_SCRATCH_REG0: u32 = 0x2040;
+
+/// `0xCAFEDEAD` — what the host writes before submitting.
+///
+/// It matters that this is not zero and not the value the packet writes: a
+/// register that reads back the expected value because it was never written,
+/// or because the register does not exist and reads as all-ones, must not look
+/// like a pass.
+pub const RING_TEST_SEED: u32 = 0xCAFE_DEAD;
+/// `0xDEADBEEF` — what the packet writes and the host polls for.
+pub const RING_TEST_EXPECT: u32 = 0xDEAD_BEEF;
+
+/// `gfx_v11_0_ring_test_ring`'s packet: set `SCRATCH_REG0` to
+/// [`RING_TEST_EXPECT`].
+///
+/// Three dwords — `PACKET3(SET_UCONFIG_REG, 1)`, the register's offset within
+/// the UCONFIG aperture, and the value.
+///
+/// **The offset is base-dependent, and that is the trap.** Linux writes
+/// `SOC15_REG_OFFSET(GC, 0, regSCRATCH_REG0) - PACKET3_SET_UCONFIG_REG_START`:
+/// the register's *resolved* dword address minus the aperture base, both in the
+/// same absolute space. `regSCRATCH_REG0` alone is 0x2040 and means nothing to
+/// the CP. With GC BASE_IDX 1 at 0xA000 the resolved address is 0xC040 and the
+/// packet carries 0x40 — the same shape as the tile-steering register in
+/// [`crate::amdgpu_clearstate::build_preamble`], and the same reason this takes
+/// a base rather than a constant.
+///
+/// Returns `None` when the resolved address falls outside
+/// `[SET_UCONFIG_REG_START, SET_UCONFIG_REG_END)`. Outside that range the
+/// subtraction still produces a number, and the packet would name some other
+/// register entirely — so a bad base is a refusal rather than a write to an
+/// address nobody chose.
+///
+/// Linux reserves **5** dwords for a 3-dword packet. That is not padding
+/// inside the packet: `amdgpu_ring_commit` pads the *ring* up to the engine's
+/// fetch granule, which for every GFX11 ring is `align_mask = 0xff` — 256
+/// dwords. The reservation just has to cover the packet plus whatever that
+/// padding adds. [`crate::amdgpu_ring::Ring`] has the alignment helper; the
+/// packet itself is exactly these three dwords.
+pub fn build_ring_test_packet(gc_base_idx1: u32) -> Option<[u32; 3]> {
+    use crate::amdgpu_pm4_defs as pm4;
+    let resolved = gc_base_idx1.checked_add(GFX11_SCRATCH_REG0)?;
+    if !(pm4::PACKET3_SET_UCONFIG_REG_START..pm4::PACKET3_SET_UCONFIG_REG_END).contains(&resolved) {
+        return None;
+    }
+    Some([
+        pm4::packet3(pm4::PACKET3_SET_UCONFIG_REG, 1),
+        resolved - pm4::PACKET3_SET_UCONFIG_REG_START,
+        RING_TEST_EXPECT,
+    ])
+}
+
+/// The resolved dword address of `SCRATCH_REG0`, for the host-side write and
+/// poll that bracket the packet.
+///
+/// Separate from [`build_ring_test_packet`] because the host reaches the
+/// register directly through MM_INDEX while the CP reaches it through the
+/// aperture-relative offset in the packet — two different addressings of one
+/// register, and conflating them is how the poll ends up watching something
+/// the packet never wrote.
+pub fn ring_test_scratch_dword(gc_base_idx1: u32) -> Option<u32> {
+    gc_base_idx1.checked_add(GFX11_SCRATCH_REG0)
+}
+
+// ── Compute queue context ──────────────────────────────────────────
+
+/// Why [`ComputeContext::new`] or [`ComputeContext::write_mqd`] refused.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ComputeCtxError {
+    /// Allocation failed.
+    NoMemory,
+    /// `Ring::new` refused.
+    Ring(RingError),
+    /// `compute_mqd_init` rejected the derived properties.
+    BadProp,
+    /// The (mec, pipe, queue) coordinate is outside what the MEC has.
+    BadCoordinate,
+}
+
+impl From<RingError> for ComputeCtxError {
+    fn from(e: RingError) -> Self {
+        ComputeCtxError::Ring(e)
+    }
+}
+
+/// Per-queue compute submission context: ring, writeback page, queue
+/// descriptor and end-of-pipe buffer.
+///
+/// The compute side had no owner. [`crate::amdgpu_compute::ComputeQueue`] is
+/// bookkeeping — it records an `(me, pipe, queue)` coordinate and an
+/// `mqd_phys` some caller supplies — so nothing allocated the ring, the
+/// descriptor or the EOP buffer, exactly as nothing allocated the graphics
+/// descriptor before [`GfxContext`] took it on.
+#[derive(Debug)]
+pub struct ComputeContext {
+    ring: Ring,
+    wb: DmaBuffer,
+    mqd: DmaBuffer,
+    /// End-of-pipe buffer. Linux allocates **one** region for every compute
+    /// ring and carves it at `ring_id * GFX11_MEC_HPD_SIZE`; one per context
+    /// here, because a context owns its own pages and the carve is only a
+    /// consequence of the shared allocation.
+    eop: DmaBuffer,
+    /// `ring->me`, which is **`mec + 1`** — `gfx_v11_0_compute_ring_init`
+    /// comments "mec0 is me1". The graphics ME is 0, so the first MEC's queues
+    /// report 1, and a coordinate built with `me = mec` names the graphics
+    /// engine's pipe instead.
+    me: u32,
+    pipe: u32,
+    queue: u32,
+}
+
+/// `v11_compute_mqd` is 512 dwords, like the graphics image.
+pub const COMPUTE_MQD_BYTES: usize = crate::amdgpu_mqd::COMPUTE_MQD_DWORDS * 4;
+
+impl ComputeContext {
+    /// Allocate a compute context for ring `ring_id` on `(mec, pipe, queue)`.
+    ///
+    /// `ring_id` picks the doorbell: `AMDGPU_NAVI10_DOORBELL_MEC_RING0 +
+    /// ring_id`, which is the assignment-enum space [`Ring::new`] takes.
+    pub fn new(ring_id: u32, mec: u32, pipe: u32, queue: u32) -> Result<Self, ComputeCtxError> {
+        use crate::amdgpu_ring::doorbell_assignment as db;
+        // The assignment table is 16-bit and the MEC block is small; a
+        // ring_id that walks off it would collide with another engine's
+        // doorbell rather than fail.
+        let slot = u32::from(db::MEC_RING0)
+            .checked_add(ring_id)
+            .filter(|s| *s < u32::from(db::USERQUEUE_END))
+            .ok_or(ComputeCtxError::BadCoordinate)?;
+
+        // A compute doorbell carries the dword wptr as a quadword, the same
+        // protocol the GFX ring and the MES use.
+        let ring = Ring::new(slot as u16, crate::amdgpu_ring::DoorbellKind::Gfx)?;
+        let wb =
+            alloc_coherent(WB_BYTES, DomainId::DRIVER_0).map_err(|_| ComputeCtxError::NoMemory)?;
+        let mqd = alloc_coherent(COMPUTE_MQD_BYTES, DomainId::DRIVER_0)
+            .map_err(|_| ComputeCtxError::NoMemory)?;
+        let eop = alloc_coherent(
+            crate::amdgpu_mqd::MEC_HPD_BYTES as usize,
+            DomainId::DRIVER_0,
+        )
+        .map_err(|_| ComputeCtxError::NoMemory)?;
+        // SAFETY: identity-mapped DMA pages this context owns.
+        unsafe {
+            for offset in (0..WB_BYTES as u64).step_by(8) {
+                core::ptr::write_volatile(wb.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+            for offset in (0..COMPUTE_MQD_BYTES as u64).step_by(8) {
+                core::ptr::write_volatile(mqd.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+            for offset in (0..crate::amdgpu_mqd::MEC_HPD_BYTES).step_by(8) {
+                core::ptr::write_volatile(eop.cpu_mut_ptr_at::<u64>(offset), 0);
+            }
+        }
+        Ok(Self {
+            ring,
+            wb,
+            mqd,
+            eop,
+            // mec0 is me1.
+            me: mec + 1,
+            pipe,
+            queue,
+        })
+    }
+
+    pub fn ring_phys(&self) -> u64 {
+        self.ring.phys_addr()
+    }
+    pub fn mqd_phys(&self) -> u64 {
+        self.mqd.dma_addr().raw()
+    }
+    pub fn eop_phys(&self) -> u64 {
+        self.eop.dma_addr().raw()
+    }
+    pub fn rptr_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_RPTR_OFFSET
+    }
+    pub fn wptr_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_WPTR_OFFSET
+    }
+    pub fn fence_phys(&self) -> u64 {
+        self.wb.dma_addr().raw() + WB_FENCE_OFFSET
+    }
+    /// `(me, pipe, queue)` — with `me` already `mec + 1`.
+    pub fn coordinate(&self) -> (u32, u32, u32) {
+        (self.me, self.pipe, self.queue)
+    }
+    pub fn doorbell_index_dw(&self) -> u32 {
+        self.ring.doorbell_index_dw()
+    }
+    pub fn doorbell_offset(&self) -> u64 {
+        self.ring.doorbell_offset()
+    }
+
+    /// One dword of the descriptor, by its `v11_compute_mqd` index.
+    pub fn mqd_dword(&self, index: usize) -> u32 {
+        if index >= crate::amdgpu_mqd::COMPUTE_MQD_DWORDS {
+            return 0;
+        }
+        // SAFETY: identity-mapped page this context owns, index bounded above.
+        unsafe { core::ptr::read_volatile(self.mqd.cpu_ptr_at::<u32>((index * 4) as u64)) }
+    }
+
+    /// Build this queue's descriptor from the context's own addresses and
+    /// write it into the page the firmware reads.
+    ///
+    /// No [`crate::amdgpu_mqd::MqdProp`] parameter, for the reason
+    /// [`GfxContext::write_mqd`] has none: the addresses appear in the
+    /// descriptor, the mapping packet and (on the KIQ path) the HQD registers,
+    /// and a caller filling them separately can fill them differently.
+    pub fn write_mqd(&self) -> Result<(), ComputeCtxError> {
+        let prop = MqdProp {
+            mqd_gpu_addr: self.mqd_phys(),
+            hqd_base_gpu_addr: self.ring_phys(),
+            rptr_gpu_addr: self.rptr_phys(),
+            wptr_gpu_addr: self.wptr_phys(),
+            queue_size: crate::amdgpu_ring::RING_SIZE_DW as u64 * 4,
+            doorbell_index: self.ring.doorbell_index_dw(),
+            use_doorbell: true,
+            kernel_queue: true,
+            tmz_queue: false,
+            // Ring 0 is not a high-priority compute queue, so neither
+            // priority field is raised.
+            priority: crate::amdgpu_mqd::QueuePriority::Normal,
+            shadow_addr: 0,
+            gds_bkup_addr: 0,
+            csa_addr: 0,
+            fence_address: 0,
+        };
+        let mqd = crate::amdgpu_mqd::compute_mqd_init(&prop, self.eop_phys())
+            .map_err(|_| ComputeCtxError::BadProp)?;
+        // SAFETY: identity-mapped page this context owns; `mqd` is exactly
+        // COMPUTE_MQD_DWORDS dwords and the allocation is COMPUTE_MQD_BYTES.
+        unsafe {
+            for (i, dw) in mqd.iter().enumerate() {
+                core::ptr::write_volatile(self.mqd.cpu_mut_ptr_at::<u32>((i * 4) as u64), *dw);
+            }
+        }
+        Ok(())
+    }
+
+    /// The MES legacy-queue mapping for this compute queue.
+    ///
+    /// `queue_type` is `Compute`, not `Gfx` — the scheduler places the queue
+    /// on a MEC pipe from that field, and the graphics value would send it to
+    /// the wrong engine with an otherwise valid-looking packet.
+    pub fn map_legacy_args(&self) -> crate::amdgpu_mes::MesMapLegacyQueueArgs {
+        crate::amdgpu_mes::MesMapLegacyQueueArgs {
+            pipe_id: self.pipe,
+            queue_id: self.queue,
+            doorbell_offset: self.ring.doorbell_index_dw(),
+            mqd_addr: self.mqd_phys(),
+            wptr_addr: self.wptr_phys(),
+            queue_type: crate::amdgpu_mes::MesQueueType::Compute,
+        }
+    }
 }

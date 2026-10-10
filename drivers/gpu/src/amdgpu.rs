@@ -965,6 +965,53 @@ impl AmdGpu {
         crate::amdgpu_gfx::apply_gfx11_sequence(&mut mmio, seq, &mut delay_us);
     }
 
+    /// `mes_v11_0_get_fw_version` — read each MES pipe's firmware version.
+    ///
+    /// Returns `(scheduler, kiq)`. A read cannot be part of a
+    /// [`crate::amdgpu_gfx::Gfx11Sequence`], so this is the one bring-up step
+    /// that has to be a function: select me 3 / the pipe, read
+    /// `CP_MES_GP3_LO`, and restore the selection.
+    ///
+    /// **Restoring the selection is not optional.** `GRBM_GFX_CNTL` is a
+    /// latch; leaving the MES selected sends the next block's register writes
+    /// to it. `mes_v11_0_get_fw_version` restores it to all-zero and so does
+    /// this, including on the error path.
+    ///
+    /// Both reads go through the same two registers, so the pipe selection is
+    /// the only thing distinguishing them — which is why a version read that
+    /// forgot to re-select would return the scheduler's version twice and look
+    /// entirely plausible.
+    ///
+    /// # Safety
+    /// Caller owns BAR5 exclusively: `GRBM_GFX_CNTL` and MM_INDEX are both
+    /// shared latches, and a concurrent accessor between the select and the
+    /// read lands on another engine's register.
+    pub unsafe fn read_mes_fw_versions(
+        &self,
+    ) -> Option<(
+        crate::amdgpu_mes_hw::MesVersion,
+        crate::amdgpu_mes_hw::MesVersion,
+    )> {
+        use crate::amdgpu_mes_hw as hw;
+        let idx1 = self.gc_base_1()?;
+        let cntl = idx1 + hw::GRBM_GFX_CNTL;
+        let gp3 = idx1 + hw::CP_MES_GP3_LO;
+
+        // SAFETY: caller-asserted exclusive BAR5 ownership. Each read is
+        // bracketed by the selection it needs, and the selection is restored
+        // below before anything else can use the latch.
+        let read_pipe = |pipe: u32| unsafe {
+            mm_write(&self.regs, cntl, hw::fw_version_select(pipe));
+            let raw = mm_read(&self.regs, gp3);
+            hw::MesVersion::decode(raw)
+        };
+        let sched = read_pipe(hw::MES_SCHED_PIPE);
+        let kiq = read_pipe(hw::MES_KIQ_PIPE);
+        // SAFETY: as above.
+        unsafe { mm_write(&self.regs, cntl, hw::grbm_select(0, 0, 0, 0)) };
+        Some((sched, kiq))
+    }
+
     /// Read the full `ApertureLayout` (VRAM + system aperture)
     /// through the MC register block. VRAM aperture mirrors what
     /// `vram_info()` returns; system aperture is fresh from the

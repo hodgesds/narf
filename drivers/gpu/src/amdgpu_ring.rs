@@ -88,6 +88,29 @@ use narf_driver_runtime::{alloc_coherent, DmaBuffer, DomainId, MmioRegion};
 /// doubled.
 pub const DOORBELL_STRIDE_BYTES: u64 = 8;
 
+/// `enum AMDGPU_NAVI10_DOORBELL_ASSIGNMENT` (`amdgpu_doorbell.h`), which
+/// `soc21.c` installs for every GFX11 part.
+///
+/// These are the **QWORD** assignment values — the space [`Ring::new`] takes.
+/// `ring->doorbell_index` is each of these doubled; see
+/// [`Ring::doorbell_index_dw`].
+///
+/// They had been literals in comments and tests, which is how a doorbell
+/// window ends up bounded by a number nobody checked.
+pub mod doorbell_assignment {
+    /// The KIQ sits at index 0, which is why a "no doorbell" value cannot be
+    /// 0 for compute.
+    pub const KIQ: u16 = 0x000;
+    /// First compute (MEC) ring. Ring `n` is `MEC_RING0 + n`.
+    pub const MEC_RING0: u16 = 0x003;
+    /// Last index available to user queues on the compute/MEC side.
+    pub const USERQUEUE_END: u16 = 0x08A;
+    /// Graphics ring 0.
+    pub const GFX_RING0: u16 = 0x08B;
+    /// Last index available to graphics user queues.
+    pub const GFX_USERQUEUE_END: u16 = 0x0FF;
+}
+
 /// Which engine's doorbell protocol a ring speaks. The payload is NOT uniform
 /// across AMD engines, so a ring has to know:
 ///

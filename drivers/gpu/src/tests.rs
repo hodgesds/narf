@@ -7705,6 +7705,397 @@ kernel_test_in!(
     smoke_amdgpu_gfx11_sequence_applies_in_order
 );
 
+/// `gfx_v11_0_cp_compute_enable` and `gfx_v11_0_cp_set_doorbell_range` — the
+/// two `cp_resume` steps this driver had no form of.
+///
+/// `cp_enable` clears halt bits in `CP_ME_CNTL`, the **graphics** engine's
+/// register. The MEC is `CP_MEC_RS64_CNTL`, a different register in a
+/// different window, and nothing wrote it — so the compute pipes stayed
+/// halted while bring-up reported success.
+fn smoke_amdgpu_gfx11_compute_enable_and_doorbell_range() -> TestResult {
+    use crate::amdgpu_gfx::{
+        build_cp_set_doorbell_range, cp_compute_enable_value, GFX11_CP_MEC_DOORBELL_RANGE_LOWER,
+        GFX11_CP_MEC_DOORBELL_RANGE_UPPER, GFX11_CP_MEC_RS64_CNTL, MEC_ENABLE_DELAY_US,
+        MEC_ME1_HALT, MEC_ME2_HALT, MEC_RS64_HALT, MEC_RS64_INVALIDATE_ICACHE,
+        MEC_RS64_PIPE_ACTIVE, MEC_RS64_PIPE_RESET,
+    };
+    use crate::amdgpu_ring::doorbell_assignment as db;
+
+    // ── register ids and field positions ──
+    if GFX11_CP_MEC_RS64_CNTL != 0x2904 {
+        return TestResult::Fail("regCP_MEC_RS64_CNTL is dword 0x2904");
+    }
+    // Identical layout to CP_MES_CNTL at a different offset — the reason both
+    // are spelled out rather than shared.
+    if MEC_RS64_INVALIDATE_ICACHE != crate::amdgpu_mes_hw::MES_INVALIDATE_ICACHE
+        || MEC_RS64_HALT != crate::amdgpu_mes_hw::MES_HALT
+        || MEC_RS64_PIPE_RESET[0] != crate::amdgpu_mes_hw::MES_PIPE0_RESET
+        || MEC_RS64_PIPE_ACTIVE[0] != crate::amdgpu_mes_hw::MES_PIPE0_ACTIVE
+    {
+        return TestResult::Fail("the MEC and MES control registers share a field layout");
+    }
+    if GFX11_CP_MEC_RS64_CNTL == crate::amdgpu_mes_hw::CP_MES_CNTL {
+        return TestResult::Fail("...but they are NOT the same register");
+    }
+    // ME2 is the LOWER bit, 0x1c against ME1's 0x1e.
+    if MEC_ME2_HALT >= MEC_ME1_HALT {
+        return TestResult::Fail("MEC_ME2_HALT sits below MEC_ME1_HALT");
+    }
+    if (MEC_ME1_HALT, MEC_ME2_HALT) != (1 << 30, 1 << 28) {
+        return TestResult::Fail("MEC_ME1_HALT is bit 30 and ME2 is bit 28");
+    }
+    if MEC_ENABLE_DELAY_US != 50 {
+        return TestResult::Fail("cp_compute_enable waits 50 us");
+    }
+
+    // ── RS64: eleven fields move together, and enabling INVERTS them ──
+    const LIVE: u32 = 0x1234_5678;
+    let resets = MEC_RS64_PIPE_RESET.iter().fold(0u32, |a, b| a | b);
+    let actives = MEC_RS64_PIPE_ACTIVE.iter().fold(0u32, |a, b| a | b);
+    // Enable from the HALTED state, not from an arbitrary word. `LIVE` alone
+    // happens not to have MEC_HALT set, so clearing it would be unobservable
+    // — which is how a mutation that drops the HALT clear survives a test
+    // that looks thorough. Round-tripping through the halt path guarantees
+    // every bit the function owns starts in its opposite position.
+    let halted_live = cp_compute_enable_value(LIVE, true, false, true);
+    if halted_live & MEC_RS64_HALT == 0 {
+        return TestResult::Fail("the halted state must have MEC_HALT set");
+    }
+    let on = cp_compute_enable_value(halted_live, true, true, true);
+    if on & (resets | MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_HALT) != 0 {
+        return TestResult::Fail("enabling must clear the resets, the icache bit and HALT");
+    }
+    if on & actives != actives {
+        return TestResult::Fail("enabling must set all four pipe actives");
+    }
+    let off = cp_compute_enable_value(LIVE, true, false, true);
+    if off & actives != 0 {
+        return TestResult::Fail("halting must clear all four pipe actives");
+    }
+    if off & (resets | MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_HALT)
+        != (resets | MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_HALT)
+    {
+        return TestResult::Fail("halting must set the resets, the icache bit and HALT");
+    }
+    // A read-modify-write: bits in neither set survive both ways.
+    let untouched = !(resets | actives | MEC_RS64_INVALIDATE_ICACHE | MEC_RS64_HALT);
+    if on & untouched != LIVE & untouched || off & untouched != LIVE & untouched {
+        return TestResult::Fail("cp_compute_enable preserves the bits it does not own");
+    }
+    // The RS64 path ignores enable_kiq — all four pipes move regardless.
+    if cp_compute_enable_value(halted_live, true, true, false) != on {
+        return TestResult::Fail("the RS64 path does not consult enable_mes_kiq");
+    }
+
+    // ── pre-RS64: enable_kiq decides whether ME2 is unhalted ──
+    const HALTED: u32 = MEC_ME1_HALT | MEC_ME2_HALT | 0x0000_00FF;
+    let legacy_kiq = cp_compute_enable_value(HALTED, false, true, true);
+    if legacy_kiq & MEC_ME1_HALT != 0 {
+        return TestResult::Fail("ME1 is always unhalted when enabling");
+    }
+    if legacy_kiq & MEC_ME2_HALT == 0 {
+        return TestResult::Fail("with MES KIQ enabled, ME2 stays halted");
+    }
+    let legacy_nokiq = cp_compute_enable_value(HALTED, false, true, false);
+    if legacy_nokiq & MEC_ME2_HALT != 0 {
+        return TestResult::Fail("without MES KIQ, ME2 is unhalted too");
+    }
+    if legacy_nokiq & 0x0000_00FF != 0x0000_00FF {
+        return TestResult::Fail("the legacy path preserves unrelated bits");
+    }
+
+    // ── the doorbell windows ──
+    // AMDGPU_NAVI10_DOORBELL_*: KIQ 0x000, USERQUEUE_END 0x08A,
+    // GFX_RING0 0x08B, GFX_USERQUEUE_END 0x0FF.
+    if (
+        db::KIQ,
+        db::USERQUEUE_END,
+        db::GFX_RING0,
+        db::GFX_USERQUEUE_END,
+    ) != (0x000, 0x08A, 0x08B, 0x0FF)
+    {
+        return TestResult::Fail("the doorbell assignment table is wrong");
+    }
+    const GC: u32 = 0x0003_0000;
+    let seq = build_cp_set_doorbell_range(GC);
+    if seq.len() != 4 {
+        return TestResult::Fail("four range registers");
+    }
+    // `(index * 2) << 2` — doubled into the dword space, then placed at the
+    // field's shift. Worked out by hand: 0x08B*2 = 0x116, <<2 = 0x458.
+    if seq.first_write_to(GC, 0x1dfa) != Some(0x458) {
+        return TestResult::Fail("the RB range starts at GFX_RING0 doubled and shifted");
+    }
+    if seq.first_write_to(GC, 0x1dfb) != Some(0x7F8) {
+        return TestResult::Fail("the RB range ends at GFX_USERQUEUE_END (0x0FF*2<<2)");
+    }
+    if seq.first_write_to(GC, GFX11_CP_MEC_DOORBELL_RANGE_LOWER) != Some(0) {
+        return TestResult::Fail("the MEC range starts at the KIQ, index 0");
+    }
+    if seq.first_write_to(GC, GFX11_CP_MEC_DOORBELL_RANGE_UPPER) != Some(0x450) {
+        return TestResult::Fail("the MEC range ends at USERQUEUE_END (0x08A*2<<2)");
+    }
+    // Every value fits the ten-bit field, so the mask is a no-op on real
+    // input — which is what makes it safe to apply where Linux writes raw.
+    for v in [0x458u32, 0x7F8, 0, 0x450] {
+        if v & !0x0000_0FFC != 0 {
+            return TestResult::Fail("a doorbell range value does not fit its field");
+        }
+    }
+    // The MEC pair is window 0, beside the RB pair — not window 1 where
+    // CP_MEC_RS64_CNTL lives.
+    if GFX11_CP_MEC_DOORBELL_RANGE_LOWER != 0x1dfc || GFX11_CP_MEC_DOORBELL_RANGE_UPPER != 0x1dfd {
+        return TestResult::Fail("the MEC doorbell range pair is 0x1dfc/0x1dfd");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx11_compute_enable_and_doorbell_range
+);
+
+/// `gfx_v11_0_ring_test_ring` — the only evidence that bring-up worked.
+///
+/// The offset in the packet is the register's **resolved** address minus the
+/// UCONFIG aperture base, not the register id. `regSCRATCH_REG0` is 0x2040 and
+/// GC BASE_IDX 1 is 0xA000, so the resolved address is 0xC040 and the packet
+/// carries 0x40. A version built from the bare id would carry 0x2040 — a
+/// number still inside no aperture at all, naming nothing the CP would accept.
+fn smoke_amdgpu_gfx11_ring_test_packet() -> TestResult {
+    use crate::amdgpu_gfx::{
+        build_ring_test_packet, ring_test_scratch_dword, GFX11_SCRATCH_REG0, RING_TEST_EXPECT,
+        RING_TEST_SEED,
+    };
+    use crate::amdgpu_pm4_defs as pm4;
+
+    // GC BASE_IDX 1 on every SOC15-style part with this layout
+    // (`GC_BASE__INST0_SEG1`).
+    const GC1: u32 = 0x0000_A000;
+
+    if GFX11_SCRATCH_REG0 != 0x2040 {
+        return TestResult::Fail("regSCRATCH_REG0 is dword 0x2040");
+    }
+    // The two sentinels must differ from each other, from zero, and from
+    // all-ones — a register that does not exist reads as all-ones, and that
+    // must not pass.
+    if RING_TEST_SEED == RING_TEST_EXPECT {
+        return TestResult::Fail("the seed and the expected value must differ");
+    }
+    for v in [RING_TEST_SEED, RING_TEST_EXPECT] {
+        if v == 0 || v == u32::MAX {
+            return TestResult::Fail("a sentinel must not be 0 or all-ones");
+        }
+    }
+
+    let pkt = match build_ring_test_packet(GC1) {
+        Some(p) => p,
+        None => return TestResult::Fail("a resolvable scratch register was refused"),
+    };
+    // PACKET3(SET_UCONFIG_REG, 1): opcode 0x79, count field 1 — so the packet
+    // is a header plus two dwords.
+    if pkt[0] != pm4::packet3(pm4::PACKET3_SET_UCONFIG_REG, 1) {
+        return TestResult::Fail("the header is SET_UCONFIG_REG with count 1");
+    }
+    if pm4::PACKET3_SET_UCONFIG_REG != 0x79 {
+        return TestResult::Fail("SET_UCONFIG_REG is opcode 0x79");
+    }
+    // 0xA000 + 0x2040 - 0xC000 = 0x40, worked out rather than recomputed.
+    if pkt[1] != 0x40 {
+        return TestResult::Fail("the offset is the resolved address less the aperture base");
+    }
+    if pkt[1] == GFX11_SCRATCH_REG0 {
+        return TestResult::Fail("the packet must not carry the bare register id");
+    }
+    if pkt[2] != RING_TEST_EXPECT {
+        return TestResult::Fail("the packet writes the expected sentinel");
+    }
+
+    // The host's own addressing of the same register is the FULL resolved
+    // dword, not the aperture-relative offset. Conflating them leaves the poll
+    // watching a register the packet never wrote.
+    if ring_test_scratch_dword(GC1) != Some(0xC040) {
+        return TestResult::Fail("the host reaches SCRATCH_REG0 at its resolved address");
+    }
+    if ring_test_scratch_dword(GC1) == Some(pkt[1]) {
+        return TestResult::Fail("the host address and the packet offset are different things");
+    }
+
+    // A base that puts the register outside the UCONFIG aperture is refused,
+    // not silently wrapped: the subtraction would still yield a number.
+    //
+    // The aperture is [0xc000, 0xc400), so SCRATCH_REG0 at +0x2040 only fits
+    // for bases in [0x9fc0, 0xa3c0).
+    for bad in [0x0000_0000u32, 0x0000_9000, 0x0000_B000, 0x0003_0000] {
+        if build_ring_test_packet(bad).is_some() {
+            return TestResult::Fail("a base outside the UCONFIG aperture must be refused");
+        }
+    }
+    // The edges of the window that does fit.
+    if build_ring_test_packet(0x9FC0).is_none() || build_ring_test_packet(0xA3BF).is_none() {
+        return TestResult::Fail("the bases that do resolve inside the aperture must be accepted");
+    }
+    if build_ring_test_packet(0x9FBF).is_some() || build_ring_test_packet(0xA3C0).is_some() {
+        return TestResult::Fail("one past either edge must be refused");
+    }
+    // And an overflowing base cannot panic.
+    if build_ring_test_packet(u32::MAX).is_some() {
+        return TestResult::Fail("an overflowing base must be refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_gfx11_ring_test_packet
+);
+
+/// `ComputeContext` — the compute ring finally has an owner.
+///
+/// Two things it must get right that the graphics side does not have to:
+/// `ring->me` is **`mec + 1`** (`gfx_v11_0_compute_ring_init`: "mec0 is me1"),
+/// and the mapping packet's `queue_type` is `Compute`. Both produce a packet
+/// that looks entirely valid and sends the queue to the wrong engine.
+fn smoke_amdgpu_compute_context_describes_itself() -> TestResult {
+    use crate::amdgpu_compute::ComputeQueue;
+    use crate::amdgpu_gfx::{ComputeContext, COMPUTE_MQD_BYTES};
+    use crate::amdgpu_mqd as m;
+    use crate::amdgpu_ring::doorbell_assignment as db;
+
+    if COMPUTE_MQD_BYTES != 2048 {
+        return TestResult::Fail("v11_compute_mqd is 512 dwords");
+    }
+    if db::MEC_RING0 != 0x003 {
+        return TestResult::Fail("AMDGPU_NAVI10_DOORBELL_MEC_RING0 is 0x003");
+    }
+
+    // Ring 0 on mec 0, pipe 0, queue 0.
+    let ctx = match ComputeContext::new(0, 0, 0, 0) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ComputeContext::new failed"),
+    };
+    if ctx.write_mqd().is_err() {
+        return TestResult::Fail("the derived compute descriptor was refused");
+    }
+
+    // mec0 is me1. A coordinate of me 0 would name the graphics engine.
+    if ctx.coordinate() != (1, 0, 0) {
+        return TestResult::Fail("mec 0 reports me 1");
+    }
+    let (me, _, _) = ComputeContext::new(1, 1, 2, 3)
+        .map(|c| c.coordinate())
+        .unwrap_or((0, 0, 0));
+    if me != 2 {
+        return TestResult::Fail("mec 1 reports me 2");
+    }
+
+    // The doorbell: MEC_RING0 + ring_id in the assignment space, doubled for
+    // `ring->doorbell_index`. Ring 0 is slot 3, index 6.
+    if ctx.doorbell_index_dw() != 6 {
+        return TestResult::Fail("compute ring 0's doorbell_index is (0x003 + 0) << 1");
+    }
+    let ring2 = match ComputeContext::new(2, 0, 0, 0) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("ring 2 was refused"),
+    };
+    if ring2.doorbell_index_dw() != (3 + 2) << 1 {
+        return TestResult::Fail("ring n's doorbell is (MEC_RING0 + n) << 1");
+    }
+    if u64::from(ctx.doorbell_index_dw()) * 4 != ctx.doorbell_offset() {
+        return TestResult::Fail("the dword index and the byte offset must agree");
+    }
+    // A ring_id that would walk out of the MEC doorbell block is refused
+    // rather than colliding with another engine's doorbell.
+    if ComputeContext::new(0x200, 0, 0, 0).is_ok() {
+        return TestResult::Fail("a ring_id past the MEC block must be refused");
+    }
+
+    // Four separate allocations.
+    for (a, b) in [
+        (ctx.mqd_phys(), ctx.ring_phys()),
+        (ctx.mqd_phys(), ctx.eop_phys()),
+        (ctx.eop_phys(), ctx.ring_phys()),
+        (ctx.mqd_phys(), ctx.rptr_phys()),
+    ] {
+        if a == b {
+            return TestResult::Fail("the descriptor, EOP, ring and writeback must not share");
+        }
+    }
+    if ctx.rptr_phys() == ctx.wptr_phys() || ctx.wptr_phys() == ctx.fence_phys() {
+        return TestResult::Fail("the three writeback slots must not overlap");
+    }
+
+    // The descriptor names this context's ring and EOP, both shifted right
+    // by 8.
+    let base = (u64::from(ctx.mqd_dword(m::C_CP_HQD_PQ_BASE_HI)) << 32)
+        | u64::from(ctx.mqd_dword(m::C_CP_HQD_PQ_BASE_LO));
+    if base << 8 != ctx.ring_phys() {
+        return TestResult::Fail("the descriptor does not name this context's ring");
+    }
+    let eop = (u64::from(ctx.mqd_dword(m::C_CP_HQD_EOP_BASE_ADDR_HI)) << 32)
+        | u64::from(ctx.mqd_dword(m::C_CP_HQD_EOP_BASE_ADDR_LO));
+    if eop << 8 != ctx.eop_phys() {
+        return TestResult::Fail("the descriptor does not name this context's EOP buffer");
+    }
+    // A compute queue is handed over INACTIVE — the scheduler activates it.
+    // That is the opposite of the MES pipe's own descriptor.
+    if ctx.mqd_dword(m::C_CP_HQD_ACTIVE) != 0 {
+        return TestResult::Fail("a compute queue is activated by the scheduler, not here");
+    }
+
+    // The mapping packet: compute, this coordinate, this descriptor.
+    let args = ctx.map_legacy_args();
+    if args.queue_type != crate::amdgpu_mes::MesQueueType::Compute {
+        return TestResult::Fail("a compute ring maps as a COMPUTE queue");
+    }
+    if args.queue_type == crate::amdgpu_mes::MesQueueType::Gfx {
+        return TestResult::Fail("...and not as a graphics one");
+    }
+    if (args.pipe_id, args.queue_id) != (0, 0) {
+        return TestResult::Fail("the packet carries this context's pipe and queue");
+    }
+    if args.mqd_addr != ctx.mqd_phys() || args.wptr_addr != ctx.wptr_phys() {
+        return TestResult::Fail("the packet names this context's own pages");
+    }
+    if args.doorbell_offset != ctx.doorbell_index_dw() {
+        return TestResult::Fail("the packet carries the dword doorbell index");
+    }
+    // The coordinate the packet carries is pipe/queue — NOT me. `me` selects
+    // the engine through the MES queue_type and, on the KIQ path, through
+    // MAP_QUEUES' ME field; it is not an ADD_QUEUE field at all.
+    let deep = match ComputeContext::new(1, 0, 3, 2) {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("pipe 3 queue 2 was refused"),
+    };
+    if (
+        deep.map_legacy_args().pipe_id,
+        deep.map_legacy_args().queue_id,
+    ) != (3, 2)
+    {
+        return TestResult::Fail("the packet follows the context's coordinate");
+    }
+
+    // And the bookkeeping struct can now be filled from a context that owns
+    // the pages, rather than from an mqd_phys the caller invented.
+    let book = ComputeQueue {
+        me: ctx.coordinate().0 as u8,
+        pipe: ctx.coordinate().1 as u8,
+        queue: ctx.coordinate().2 as u8,
+        doorbell_off: ctx.doorbell_index_dw(),
+        mqd_phys: ctx.mqd_phys(),
+        vmid: None,
+        mapped: false,
+        priority: crate::amdgpu_compute::ComputePriority::Normal,
+        cwsr: None,
+    };
+    if book.mqd_phys != ctx.mqd_phys() || book.me != 1 {
+        return TestResult::Fail("the bookkeeping entry should mirror the context");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/foundations",
+    smoke_amdgpu_compute_context_describes_itself
+);
+
 fn smoke_amdgpu_passive_mode_reads_the_hub_not_the_timing() -> TestResult {
     use crate::amdgpu_dcn as dcn;
     // regHUBP0_DCHUBP_CNTL 0x05f3, regHUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
