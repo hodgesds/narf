@@ -151,6 +151,69 @@ pub const fn fw_version_select(pipe: u32) -> u32 {
     grbm_select(MES_ME_ID, pipe, 0, 0)
 }
 
+// ── Firmware version, and what it decides ──────────────────
+
+/// `AMDGPU_MES_VERSION_MASK` — the scheduler version in the low twelve bits
+/// of `CP_MES_GP3_LO`.
+pub const MES_VERSION_MASK: u32 = 0x0000_0FFF;
+/// `AMDGPU_MES_API_VERSION_MASK` and `_SHIFT`.
+pub const MES_API_VERSION_MASK: u32 = 0x00FF_F000;
+pub const MES_API_VERSION_SHIFT: u32 = 12;
+/// `AMDGPU_MES_FEAT_VERSION_MASK`.
+pub const MES_FEAT_VERSION_MASK: u32 = 0xFF00_0000;
+
+/// The scheduler version at which `mes_v11_0_late_init` sets
+/// `enable_legacy_queue_map`.
+///
+/// Below it, a kernel ring is registered by writing a `MAP_QUEUES` PM4 packet
+/// to the KIQ ring; at or above it, by sending MES `ADD_QUEUE` with
+/// `map_legacy_kq`. **Only the second exists in this driver**, so a part
+/// reporting an older scheduler has no path to a mapped kernel queue here and
+/// must be refused rather than silently sent down a path that does not exist.
+pub const MES_LEGACY_QUEUE_MAP_VERSION: u32 = 0x47;
+
+/// The API version at which `mes_v11_0_add_hw_queue` switches `wptr_addr` from
+/// `input->wptr_addr` to `input->wptr_mc_addr`.
+///
+/// Not used by the legacy-kernel-queue mapping, which carries the one address
+/// either way — recorded because it is the other thing this register decides.
+pub const MES_API_VERSION_WPTR_MC: u32 = 2;
+
+/// One pipe's firmware version word, decoded.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MesVersion {
+    pub raw: u32,
+    pub version: u32,
+    pub api_version: u32,
+    pub feature_version: u32,
+}
+
+impl MesVersion {
+    /// Decode a `CP_MES_GP3_LO` read.
+    pub const fn decode(raw: u32) -> Self {
+        Self {
+            raw,
+            version: raw & MES_VERSION_MASK,
+            api_version: (raw & MES_API_VERSION_MASK) >> MES_API_VERSION_SHIFT,
+            feature_version: (raw & MES_FEAT_VERSION_MASK) >> 24,
+        }
+    }
+
+    /// Whether a kernel ring is mapped with MES `ADD_QUEUE` rather than the
+    /// KIQ's `MAP_QUEUES` packet. See [`MES_LEGACY_QUEUE_MAP_VERSION`].
+    pub const fn enable_legacy_queue_map(&self) -> bool {
+        self.version >= MES_LEGACY_QUEUE_MAP_VERSION
+    }
+
+    /// A zero word is not a version. `CP_MES_GP3_LO` reads zero before the
+    /// pipe has run its microcode, so a decode of 0 means "the MES has not
+    /// started", not "version 0" — and treating it as a version would read as
+    /// an old scheduler and take a path this driver does not implement.
+    pub const fn is_running(&self) -> bool {
+        self.raw != 0
+    }
+}
+
 /// `mes_v11_0_kiq_setting` — tell the RLC which queue is the KIQ.
 ///
 /// `live` is the current `RLC_CP_SCHEDULERS`; its low byte is replaced and
@@ -1108,4 +1171,82 @@ mod smoke_tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/gpu/amdgpu/mes_hw", smoke_mes_hw_resource_masks);
+
+    /// `CP_MES_GP3_LO` decoded, and what the version gates.
+    ///
+    /// The threshold is the point: below 0x47 a kernel ring is mapped with the
+    /// KIQ's `MAP_QUEUES` PM4 packet, which this driver does not have at all.
+    /// So the version is not a diagnostic — it decides whether bring-up can
+    /// proceed, and a misread that lands above the threshold sends the driver
+    /// down a path the firmware will not answer.
+    fn smoke_mes_hw_version_decode() -> TestResult {
+        if (
+            MES_VERSION_MASK,
+            MES_API_VERSION_MASK,
+            MES_FEAT_VERSION_MASK,
+        ) != (0x0000_0FFF, 0x00FF_F000, 0xFF00_0000)
+        {
+            return TestResult::Fail("the three version fields are 12/12/8 bits");
+        }
+        if MES_API_VERSION_SHIFT != 12 {
+            return TestResult::Fail("AMDGPU_MES_API_VERSION_SHIFT is 12");
+        }
+        // The three fields tile the word exactly, so a value cannot fall
+        // between them.
+        if MES_VERSION_MASK | MES_API_VERSION_MASK | MES_FEAT_VERSION_MASK != u32::MAX {
+            return TestResult::Fail("the version fields must cover the whole word");
+        }
+
+        // A word with a distinct value in each field, so a shift error moves
+        // a recognisable number.
+        let v = MesVersion::decode(0xAB_CDE_047);
+        if v.version != 0x047 {
+            return TestResult::Fail("the scheduler version is the low twelve bits");
+        }
+        if v.api_version != 0xCDE {
+            return TestResult::Fail("the API version is bits 23:12");
+        }
+        if v.feature_version != 0xAB {
+            return TestResult::Fail("the feature version is the top byte");
+        }
+        if v.raw != 0xAB_CDE_047 {
+            return TestResult::Fail("the raw word is kept");
+        }
+
+        // The threshold, and both sides of it.
+        if MES_LEGACY_QUEUE_MAP_VERSION != 0x47 {
+            return TestResult::Fail("enable_legacy_queue_map turns on at 0x47");
+        }
+        if !MesVersion::decode(0x47).enable_legacy_queue_map() {
+            return TestResult::Fail("0x47 itself enables the legacy mapping");
+        }
+        if MesVersion::decode(0x46).enable_legacy_queue_map() {
+            return TestResult::Fail("0x46 does not");
+        }
+        // The feature and API fields must not leak into the comparison: a
+        // high feature version with an old scheduler is still an old
+        // scheduler.
+        if MesVersion::decode(0xFF_FFF_046).enable_legacy_queue_map() {
+            return TestResult::Fail("only the low twelve bits decide the mapping path");
+        }
+        if !MesVersion::decode(0x00_000_FFF).enable_legacy_queue_map() {
+            return TestResult::Fail("a high scheduler version with no other field set qualifies");
+        }
+
+        // Zero is "has not started", not "version 0". Treating it as a
+        // version reads as an old scheduler and takes the path this driver
+        // does not implement.
+        let dead = MesVersion::decode(0);
+        if dead.is_running() {
+            return TestResult::Fail("a zero word means the MES has not started");
+        }
+        if dead.enable_legacy_queue_map() {
+            return TestResult::Fail("a stopped MES must not look like a mappable one");
+        }
+        if !MesVersion::decode(1).is_running() {
+            return TestResult::Fail("any non-zero word is a started MES");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/amdgpu/mes_hw", smoke_mes_hw_version_decode);
 }

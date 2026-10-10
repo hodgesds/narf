@@ -85,11 +85,12 @@ pub const CP_RESUME_ASYNC: &[BringupStep] = &[
     step(
         "mes_fw_version",
         "mes_v11_0_get_fw_version",
-        // The selector values and the register are named; the read itself is
-        // a read-modify-read a sequence cannot carry, and nothing performs it.
-        // It decides `enable_legacy_queue_map`, i.e. which of the two
-        // queue-mapping paths the two `map_queue` steps below take.
-        Implemented::Missing("a two-step MMIO read; selector in fw_version_select"),
+        // A read cannot be a sequence step, so this one is a function. It
+        // decides `enable_legacy_queue_map` — which of the two queue-mapping
+        // paths the `map_queue` steps below take — and only one of those two
+        // exists here, so the answer gates the rest of the plan rather than
+        // merely informing it.
+        Implemented::By("AmdGpu::read_mes_fw_versions"),
     ),
     step(
         "kiq_setting",
@@ -291,9 +292,11 @@ mod smoke_tests {
     /// appearing, fails here rather than being found by booting.
     fn smoke_bringup_declared_gaps() -> TestResult {
         let gaps: alloc::vec::Vec<&str> = missing(CP_RESUME_ASYNC).map(|s| s.name).collect();
-        // Exactly one step has no implementation: the firmware-version read
-        // that decides which queue-mapping path applies.
-        if gaps != ["mes_fw_version"] {
+        // Every step of the async arm now has an implementation. What is
+        // missing is no longer a step — it is the executor that runs them in
+        // this order, which is a different kind of gap and is recorded in the
+        // module docs rather than here.
+        if !gaps.is_empty() {
             return TestResult::Fail("the set of unimplemented bring-up steps has changed");
         }
         // Everything else names a builder, and the name is not empty.
