@@ -54,7 +54,7 @@ fn smoke_nvme_samsung_pci_matches() -> TestResult {
 kernel_test_in!("drivers/nvme", smoke_nvme_samsung_pci_matches);
 
 fn smoke_nvme_cap_register_decode() -> TestResult {
-    use crate::NvmeCaps;
+    use super::NvmeCaps;
     // CAP layout: MQES[0..=15], DSTRD[32..=35], MPSMIN[48..=51],
     // MPSMAX[52..=55]. Craft a value with MQES=0x3FF, DSTRD=2,
     // MPSMIN=0, MPSMAX=4 and check the decoder.
@@ -72,7 +72,7 @@ fn smoke_nvme_cap_register_decode() -> TestResult {
 kernel_test_in!("drivers/nvme", smoke_nvme_cap_register_decode);
 
 fn smoke_nvme_probe_stub_surfaces_not_implemented() -> TestResult {
-    use crate::{Controller, NvmeError};
+    use super::{Controller, NvmeError};
     use narf_capabilities::{Cap, Write};
     let mut ctrl = Controller::new(0x8000_0000);
     let cap: Cap<narf_bus::BusDeviceCap, Write> = Cap::bootstrap();
@@ -94,7 +94,7 @@ kernel_test_in!(
 fn smoke_nvme_admin_identify_controller() -> TestResult {
     // End-to-end NVMe admin-queue bring-up against the QEMU NVMe
     // device (vendor 0x1B36 / device 0x0010).
-    use crate::Controller;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: ECAM is identity-mapped; bus::init is idempotent.
@@ -136,7 +136,7 @@ kernel_test_in!("drivers/nvme", smoke_nvme_admin_identify_controller);
 fn smoke_nvme_io_round_trip() -> TestResult {
     // End-to-end NVMe I/O: bring up, create one I/O queue pair,
     // write a 512-byte pattern at LBA 0, read it back, compare.
-    use crate::Controller;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_io::alloc_coherent;
@@ -220,7 +220,7 @@ fn smoke_nvme_io_multipage_round_trip() -> TestResult {
     // 8-KiB transfer (16 LBAs at 512 B) across a 2-page PRP-list:
     // exercises the PRP1 + PRP2 = pages[1] short-list path. Ensures
     // the controller correctly DMA-reads/writes both pages.
-    use crate::Controller;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_io::alloc_coherent;
@@ -328,7 +328,7 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
     // through `NvmeBlockDevice` (the `block::BlockDevice` impl) and
     // confirm we get back the bytes we wrote. Exercises the
     // cap-resolution path that the VFS / filesystem stack will use.
-    use crate::{Controller, NvmeBlockDevice};
+    use super::{Controller, NvmeBlockDevice};
     use core::future::Future;
     use core::pin::Pin;
     use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -375,7 +375,7 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
         // `install_controller` leaks the previous slot rather than
         // dropping it, so any reference an I/O path might still hold
         // stays valid — see its doc comment.
-        crate::install_controller(ctrl);
+        super::install_controller(ctrl);
     }
 
     // Build a 4-KiB DMA buffer, hand it to the I/O registry to mint a
@@ -505,7 +505,7 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
     // one vector wired to a fresh IDT slot, create the I/O queue
     // with IEN=1, do a write+read round trip, assert IRQ dispatch
     // observed ≥1 MSI delivery.
-    use crate::{Controller, IoOpcode};
+    use super::{Controller, IoOpcode};
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_io::alloc_coherent;
@@ -624,7 +624,7 @@ fn smoke_nvme_multi_queue_granted() -> TestResult {
     // QEMU grants up to its `-num-queues` (default 64), so the
     // assertion is that we got at least 2 pairs — anything past 1
     // proves the multi-queue plumbing works.
-    use crate::{Controller, NVME_MAX_IO_QUEUE_PAIRS};
+    use super::{Controller, NVME_MAX_IO_QUEUE_PAIRS};
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: ECAM is identity-mapped; bus::init is idempotent.
@@ -709,7 +709,7 @@ kernel_test_in!("drivers/nvme", smoke_nvme_pick_queue_round_robins);
 
 fn smoke_nvme_params_typed_round_trip() -> TestResult {
     // Drive the typed driver-parameter surface end-to-end.
-    use crate::{LogLevel, NvmeUpdate, PARAMS};
+    use super::{LogLevel, NvmeUpdate, PARAMS};
     use narf_bus::driver_match::__reset_for_test;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
@@ -729,7 +729,7 @@ fn smoke_nvme_params_typed_round_trip() -> TestResult {
     }
     __reset_for_test();
     PARAMS.__reset_for_test();
-    crate::register_pci_driver();
+    super::register_pci_driver();
     let authority = bootstrap_registry_authority();
     if probe_all_pci(&authority).is_err() {
         return TestResult::Fail("probe_all_pci failed");
@@ -772,7 +772,7 @@ kernel_test_in!("drivers/nvme", smoke_nvme_params_typed_round_trip);
 // ── NVMe-MI message framing smokes ─────────────────────────────────
 
 fn smoke_mi_nmh_round_trip() -> TestResult {
-    use crate::mi::{Nmh, MET_OUT_OF_BAND, NMIMT_MI_COMMAND};
+    use super::mi::{Nmh, MET_OUT_OF_BAND, NMIMT_MI_COMMAND};
     let nmh = Nmh {
         mctp_ic: true,
         command_slot: false,
@@ -796,7 +796,7 @@ fn smoke_mi_nmh_round_trip() -> TestResult {
 kernel_test_in!("drivers/nvme/mi", smoke_mi_nmh_round_trip);
 
 fn smoke_mi_mic_crc32_matches_known_vector() -> TestResult {
-    use crate::mi::mic;
+    use super::mi::mic;
     // CRC-32/Ethernet of "123456789" is 0xCBF43926 (well-known).
     let r = mic(b"123456789");
     if r != 0xCBF4_3926 {
@@ -807,7 +807,7 @@ fn smoke_mi_mic_crc32_matches_known_vector() -> TestResult {
 kernel_test_in!("drivers/nvme/mi", smoke_mi_mic_crc32_matches_known_vector);
 
 fn smoke_mi_build_and_decode_command_round_trip() -> TestResult {
-    use crate::mi::{
+    use super::mi::{
         build_command, decode_message, read_data_structure, Nmh, DTYPE_CONTROLLER_LIST,
         MI_OPCODE_READ_DATA_STRUCTURE, NMIMT_MI_COMMAND,
     };
@@ -845,7 +845,7 @@ kernel_test_in!(
 );
 
 fn smoke_mi_bad_mic_rejected() -> TestResult {
-    use crate::mi::{
+    use super::mi::{
         build_command, decode_message, read_data_structure, MiError, Nmh, NMIMT_MI_COMMAND,
     };
     let nmh = Nmh {
@@ -864,7 +864,7 @@ fn smoke_mi_bad_mic_rejected() -> TestResult {
 kernel_test_in!("drivers/nvme/mi", smoke_mi_bad_mic_rejected);
 
 fn smoke_mi_subsystem_health_status_poll_clear_bit() -> TestResult {
-    use crate::mi::{subsystem_health_status_poll, MI_OPCODE_NVM_SUBSYSTEM_HEALTH_STATUS_POLL};
+    use super::mi::{subsystem_health_status_poll, MI_OPCODE_NVM_SUBSYSTEM_HEALTH_STATUS_POLL};
     let cmd = subsystem_health_status_poll(true);
     if cmd.opcode != MI_OPCODE_NVM_SUBSYSTEM_HEALTH_STATUS_POLL {
         return TestResult::Fail("opcode 0x01 expected");
@@ -884,7 +884,7 @@ kernel_test_in!(
 );
 
 fn smoke_mi_subsystem_health_parse() -> TestResult {
-    use crate::mi::SubsystemHealth;
+    use super::mi::SubsystemHealth;
     // 8-byte response data: NSS=0x02 (CFS), warnings=0x10, temp=0x2A,
     // pct_used=0x05, composite controller status (LE) = 0x0007.
     let buf = [0x02u8, 0x10, 0x2A, 0x05, 0x07, 0x00, 0x00, 0x00];
@@ -905,7 +905,7 @@ kernel_test_in!("drivers/nvme/mi", smoke_mi_subsystem_health_parse);
 // ── NVMe admin-command builder smokes ──────────────────────────────
 
 fn smoke_admin_sqe_cdw0_packs_opcode_and_cid() -> TestResult {
-    use crate::admin::{AdminSqe, OPC_IDENTIFY};
+    use super::admin::{AdminSqe, OPC_IDENTIFY};
     let mut sqe = AdminSqe::new(OPC_IDENTIFY);
     sqe.cid = 0x1234;
     let cdw0 = sqe.cdw0();
@@ -923,7 +923,7 @@ kernel_test_in!(
 );
 
 fn smoke_admin_sqe_encode_is_64_bytes() -> TestResult {
-    use crate::admin::AdminSqe;
+    use super::admin::AdminSqe;
     let sqe = AdminSqe::new(0x06);
     let bytes = sqe.encode();
     if bytes.len() != 64 {
@@ -938,7 +938,7 @@ fn smoke_admin_sqe_encode_is_64_bytes() -> TestResult {
 kernel_test_in!("drivers/nvme/admin", smoke_admin_sqe_encode_is_64_bytes);
 
 fn smoke_admin_format_nvm_cdw10_layout() -> TestResult {
-    use crate::admin::{format_nvm, OPC_FORMAT_NVM, SES_CRYPTO_ERASE};
+    use super::admin::{format_nvm, OPC_FORMAT_NVM, SES_CRYPTO_ERASE};
     let sqe = format_nvm(7, 1, 0x03, SES_CRYPTO_ERASE);
     if sqe.opcode != OPC_FORMAT_NVM {
         return TestResult::Fail("opcode = 0x80 for Format NVM");
@@ -958,7 +958,7 @@ fn smoke_admin_format_nvm_cdw10_layout() -> TestResult {
 kernel_test_in!("drivers/nvme/admin", smoke_admin_format_nvm_cdw10_layout);
 
 fn smoke_admin_sanitize_block_erase_layout() -> TestResult {
-    use crate::admin::{sanitize, OPC_SANITIZE, SANACT_BLOCK_ERASE};
+    use super::admin::{sanitize, OPC_SANITIZE, SANACT_BLOCK_ERASE};
     let sqe = sanitize(11, SANACT_BLOCK_ERASE, true, 0, false, 0xDEAD_BEEF);
     if sqe.opcode != OPC_SANITIZE {
         return TestResult::Fail("opcode = 0x84 for Sanitize");
@@ -980,7 +980,7 @@ kernel_test_in!(
 );
 
 fn smoke_admin_get_log_page_smart_layout() -> TestResult {
-    use crate::admin::{get_smart_log, LID_SMART_HEALTH, OPC_GET_LOG_PAGE};
+    use super::admin::{get_smart_log, LID_SMART_HEALTH, OPC_GET_LOG_PAGE};
     let sqe = get_smart_log(2, 0xCAFE_F000_0000_0000);
     if sqe.opcode != OPC_GET_LOG_PAGE {
         return TestResult::Fail("opcode = 0x02 for Get Log Page");
@@ -1000,7 +1000,7 @@ fn smoke_admin_get_log_page_smart_layout() -> TestResult {
 kernel_test_in!("drivers/nvme/admin", smoke_admin_get_log_page_smart_layout);
 
 fn smoke_admin_set_features_number_of_queues() -> TestResult {
-    use crate::admin::{set_features_number_of_queues, FID_NUMBER_OF_QUEUES, OPC_SET_FEATURES};
+    use super::admin::{set_features_number_of_queues, FID_NUMBER_OF_QUEUES, OPC_SET_FEATURES};
     let sqe = set_features_number_of_queues(0, 7, 5);
     if sqe.opcode != OPC_SET_FEATURES {
         return TestResult::Fail("opcode = 0x09 for Set Features");
@@ -1022,7 +1022,7 @@ kernel_test_in!(
 );
 
 fn smoke_admin_smart_log_round_trip() -> TestResult {
-    use crate::admin::{encode_smart_log, SmartLog};
+    use super::admin::{encode_smart_log, SmartLog};
     let s = SmartLog {
         critical_warning: 0x02,
         composite_temperature_k: 313,
@@ -1046,7 +1046,7 @@ fn smoke_admin_smart_log_round_trip() -> TestResult {
 kernel_test_in!("drivers/nvme/admin", smoke_admin_smart_log_round_trip);
 
 fn smoke_admin_set_features_boot_partition_wp_layout() -> TestResult {
-    use crate::admin::{set_features_boot_partition_wp, FID_BOOT_PARTITION_WRITE_PROTECTION};
+    use super::admin::{set_features_boot_partition_wp, FID_BOOT_PARTITION_WRITE_PROTECTION};
     let sqe = set_features_boot_partition_wp(0, 1, 0x02);
     if (sqe.cdw10 & 0xFF) != FID_BOOT_PARTITION_WRITE_PROTECTION as u32 {
         return TestResult::Fail("FID = 0x1A for Boot Partition WP");
@@ -1089,7 +1089,7 @@ fn smoke_admin_identify_controller_data_parse() -> TestResult {
     // Unit-decode: build a minimal IDENTIFY CONTROLLER buffer with
     // known field values, parse with IdentifyControllerData::parse,
     // confirm all fields round-trip.
-    use crate::admin::{encode_identify_controller, IdentifyControllerData};
+    use super::admin::{encode_identify_controller, IdentifyControllerData};
     let mut mn = [b' '; 40];
     mn[..4].copy_from_slice(b"QEMU");
     let d = IdentifyControllerData {
@@ -1143,7 +1143,7 @@ kernel_test_in!(
 fn smoke_admin_identify_namespace_data_parse() -> TestResult {
     // Build an IDENTIFY NAMESPACE buffer with two LBAF entries and
     // active format = index 1 (4 KiB LBAs), confirm decode.
-    use crate::admin::{encode_identify_namespace, IdentifyNamespaceData, LbaFormat};
+    use super::admin::{encode_identify_namespace, IdentifyNamespaceData, LbaFormat};
     let mut d = IdentifyNamespaceData {
         nsze: 131072, // 64 MiB at 512 B/sector
         ncap: 131072,
@@ -1198,7 +1198,7 @@ kernel_test_in!(
 fn smoke_admin_get_features_cdw10_layout() -> TestResult {
     // Verify that get_features encodes FID + SEL into CDW10 correctly.
     // SEL=0x01 (Default), FID=0x07 (Number of Queues).
-    use crate::admin::{get_features, FID_NUMBER_OF_QUEUES, OPC_GET_FEATURES};
+    use super::admin::{get_features, FID_NUMBER_OF_QUEUES, OPC_GET_FEATURES};
     let sqe = get_features(3, FID_NUMBER_OF_QUEUES, 0x01);
     if sqe.opcode != OPC_GET_FEATURES {
         return TestResult::Fail("opcode = 0x0A for Get Features");
@@ -1215,7 +1215,7 @@ kernel_test_in!("drivers/nvme/admin", smoke_admin_get_features_cdw10_layout);
 
 fn smoke_admin_set_features_power_management_layout() -> TestResult {
     // Power state 3, workload hint 2 → CDW11 = (wh<<5)|ps.
-    use crate::admin::{set_features_power_management, FID_POWER_MANAGEMENT, OPC_SET_FEATURES};
+    use super::admin::{set_features_power_management, FID_POWER_MANAGEMENT, OPC_SET_FEATURES};
     let sqe = set_features_power_management(0, 3, 2);
     if sqe.opcode != OPC_SET_FEATURES {
         return TestResult::Fail("opcode should be 0x09");
@@ -1238,7 +1238,7 @@ kernel_test_in!(
 
 fn smoke_admin_set_features_async_event_config_layout() -> TestResult {
     // AEC bitmap: bits 0+1+2 set → CDW11 = 0x07.
-    use crate::admin::{set_features_async_event_config, FID_ASYNC_EVENT_CONFIG, OPC_SET_FEATURES};
+    use super::admin::{set_features_async_event_config, FID_ASYNC_EVENT_CONFIG, OPC_SET_FEATURES};
     let sqe = set_features_async_event_config(0, 0x07);
     if sqe.opcode != OPC_SET_FEATURES {
         return TestResult::Fail("opcode should be 0x09");
@@ -1259,7 +1259,7 @@ kernel_test_in!(
 fn smoke_admin_async_event_completion_decode() -> TestResult {
     // Verify AsyncEventCompletion::from_cdw0 bit-extracts correctly.
     // Type=1 (SMART), info=0x02 (spare below threshold), log=0x02.
-    use crate::admin::AsyncEventCompletion;
+    use super::admin::AsyncEventCompletion;
     // CDW0: type=1, info=0x02 at bits[15:8], log=0x02 at bits[31:24].
     let cdw0: u32 = (0x02u32 << 24) | (0x02u32 << 8) | 0x01;
     let ev = AsyncEventCompletion::from_cdw0(cdw0);
@@ -1281,7 +1281,7 @@ kernel_test_in!(
 
 fn smoke_admin_identify_namespace_list_builder() -> TestResult {
     // Structural: identify_namespace_list(CNS=0x02) SQE layout.
-    use crate::admin::{identify_namespace_list, CNS_NAMESPACE_LIST, OPC_IDENTIFY};
+    use super::admin::{identify_namespace_list, CNS_NAMESPACE_LIST, OPC_IDENTIFY};
     let sqe = identify_namespace_list(5, 0x0000_0001, 0xDEAD_BEEF_0000_0000);
     if sqe.opcode != OPC_IDENTIFY {
         return TestResult::Fail("opcode should be 0x06 for Identify");
@@ -1305,7 +1305,7 @@ kernel_test_in!(
 fn smoke_admin_ns_enumerate_qemu() -> TestResult {
     // End-to-end: bring up the QEMU NVMe controller, enumerate
     // active namespaces, confirm NSID=1 is in the list.
-    use crate::Controller;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: kernel-test runs at boot with the allocator online and the
@@ -1345,8 +1345,8 @@ kernel_test_in!("drivers/nvme", smoke_admin_ns_enumerate_qemu);
 fn smoke_admin_get_set_features_power_qemu() -> TestResult {
     // End-to-end: bring up, Get Features PM to read current PS,
     // Set Features PM back to PS=0, confirm no error.
-    use crate::admin::FID_POWER_MANAGEMENT;
-    use crate::Controller;
+    use super::admin::FID_POWER_MANAGEMENT;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: kernel-test runs at boot with the allocator online and the
@@ -1404,7 +1404,7 @@ fn smoke_admin_aer_post_qemu() -> TestResult {
     // AER requests outstanding. AERL is capped to 4 by spec; QEMU
     // reports 0 (1 slot) but accepts up to 3 before returning "Cmd
     // Limit Exceeded" on the 4th. We cap at min(3, ADMIN_Q_DEPTH-1).
-    use crate::Controller;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: kernel-test runs at boot with the allocator online and the
@@ -1501,7 +1501,7 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
     // physical address of the first PRP-list page, which in turn
     // contains the physical addresses of the remaining data pages
     // (pages[1..]) in order.
-    use crate::Controller;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     use narf_io::alloc_coherent;
@@ -1733,7 +1733,7 @@ fn smoke_nvme_aer_drain_dispatch() -> TestResult {
     // 0 — the admin CQ has no pending completions with the right
     // phase tag. If it returns > 0, something is unexpectedly present
     // in the admin CQ, which is a structural error in the bring-up.
-    use crate::Controller;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: kernel-test runs at boot with the allocator online and the
@@ -1774,7 +1774,7 @@ fn smoke_nvme_per_queue_lock_count_matches() -> TestResult {
     // After `create_io_queue`, `io_queue_lock_count()` must equal
     // `io_queue_count()`. Both vecs are populated together; this
     // verifies the lock vec was not forgotten.
-    use crate::Controller;
+    use super::Controller;
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
     // SAFETY: kernel-test runs at boot with the allocator online and the
@@ -1834,7 +1834,7 @@ fn smoke_security_send_sqe_encoding() -> TestResult {
     // Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit:
     //   cmd.common.cdw10 = cpu_to_le32(((u32)secp)<<24 | ((u32)spsp)<<8)
     //   cmd.common.cdw11 = cpu_to_le32(len)
-    use crate::admin::{security_send, OPC_SECURITY_SEND, SECP_TCG_OPAL, SPSP_L0_DISCOVERY};
+    use super::admin::{security_send, OPC_SECURITY_SEND, SECP_TCG_OPAL, SPSP_L0_DISCOVERY};
 
     let sqe = security_send(
         0,
@@ -1875,7 +1875,7 @@ fn smoke_security_receive_sqe_encoding() -> TestResult {
     // AL (Allocation Length) instead of TL.
     //
     // Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit
-    use crate::admin::{security_receive, OPC_SECURITY_RECEIVE, SECP_TCG_OPAL, SPSP_L0_DISCOVERY};
+    use super::admin::{security_receive, OPC_SECURITY_RECEIVE, SECP_TCG_OPAL, SPSP_L0_DISCOVERY};
 
     let al: u32 = 2048;
     let sqe = security_receive(
@@ -1921,7 +1921,7 @@ fn smoke_opal_discovery_header_decode() -> TestResult {
     // Linux ref (GPL-2.0-or-later):
     //   block/sed-opal.c:opal_discovery0_end,
     //   block/opal_proto.h:d0_header / d0_tper_features / d0_locking_features
-    use crate::admin::{encode_opal_discovery, OpalDiscovery, FC_LOCKING, FC_OPALV200, FC_TPER};
+    use super::admin::{encode_opal_discovery, OpalDiscovery, FC_LOCKING, FC_OPALV200, FC_TPER};
 
     // TPer features byte: sync=bit0, async=bit1 => 0x03.
     let tper_feat: &[u8] = &[
@@ -1985,7 +1985,7 @@ fn smoke_security_send_receive_round_trip_qemu() -> TestResult {
     // with CommandFailed; those cases Skip rather than Fail.
     //
     // Linux ref (GPL-2.0-or-later): drivers/nvme/host/core.c:nvme_sec_submit
-    use crate::{Controller, NvmeError};
+    use super::{Controller, NvmeError};
     use narf_bus::x86_64::ECAM_DEFAULT_BASE;
     use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
 
@@ -2015,8 +2015,8 @@ fn smoke_security_send_receive_round_trip_qemu() -> TestResult {
 
     let payload = alloc::vec![0u8; 512];
     match ctrl.security_send(
-        crate::admin::SECP_TCG_OPAL,
-        crate::admin::SPSP_L0_DISCOVERY,
+        super::admin::SECP_TCG_OPAL,
+        super::admin::SPSP_L0_DISCOVERY,
         &payload,
     ) {
         Ok(()) => {}
@@ -2028,8 +2028,8 @@ fn smoke_security_send_receive_round_trip_qemu() -> TestResult {
 
     let mut recv_buf = alloc::vec![0u8; 512];
     match ctrl.security_receive(
-        crate::admin::SECP_TCG_OPAL,
-        crate::admin::SPSP_L0_DISCOVERY,
+        super::admin::SECP_TCG_OPAL,
+        super::admin::SPSP_L0_DISCOVERY,
         &mut recv_buf,
     ) {
         Ok(n) => {
