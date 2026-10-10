@@ -933,7 +933,7 @@ kernel_test_in!("drivers/gpu", smoke_dp_edid_over_aux_round_trip);
 fn smoke_amdgpu_offsets_runtime_registry_overrides_compile_time() -> TestResult {
     use crate::amdgpu::Family;
     use crate::amdgpu_offsets::{
-        FamilyOffsets, __reset_for_test, offsets_of, register_family_offsets, registered_count,
+        __reset_for_test, offsets_of, register_family_offsets, registered_count, FamilyOffsets,
     };
     __reset_for_test();
     if registered_count() != 0 {
@@ -1577,7 +1577,7 @@ kernel_test_in!("drivers/gpu", smoke_dp_link_training_fallback_walks_ladder);
 /// Build a synthetic IP-discovery blob with one die enumerating
 /// two IPs (GC and MP0). Returns the bytes + the (mp0_base,
 /// gc_base) values the parser should observe.
-fn build_synthetic_discovery_blob() -> (alloc::vec::Vec<u8>, u32, u32) {
+pub(crate) fn build_synthetic_discovery_blob() -> (alloc::vec::Vec<u8>, u32, u32) {
     use crate::amdgpu_discovery as d;
     let mut blob = alloc::vec![0u8; 0x200];
 
@@ -8191,18 +8191,11 @@ fn smoke_amdgpu_discrete_is_not_an_apu() -> TestResult {
     // A discrete card: 12 GiB of VRAM behind a 256 MiB aperture, which is an
     // RX 6750 XT with Resizable BAR off.
     //
-    // The `family` is Phoenix and the `did` is Navi 22's, which is a
-    // deliberate mismatch. `DEV_INFO` refuses a family with no audited
-    // family id, and `Family::Navi2`'s is not audited — so pinning the
-    // family here would test that refusal instead of the thing under test,
-    // which is that APU-ness is carried by its own flag and not inferred
-    // from the family. The VRAM queries below do not consult the family at
-    // all.
     const VRAM: u64 = 12 * 1024 * 1024 * 1024;
     const VISIBLE: u64 = 256 * 1024 * 1024;
     let discrete = Snapshot {
         did: 0x73DF,
-        family: Family::Phoenix,
+        family: Family::Navi2,
         vram_size: VRAM,
         visible_vram_size: VISIBLE,
         is_apu: false,

@@ -44,6 +44,80 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### AMD discrete PCIe probe and VRAM
+
+`AmdGpu::bring_up` supports discovery outside the CPU-visible BAR0 aperture.
+The default discovery table is a 10 KiB read beginning 64 KiB below the end
+of **physical VRAM**, sized from the absolute `RCC_CONFIG_MEMSIZE` register
+(BAR5 byte offset `0x378c`, value in MiB). The read uses BAR0 only within its
+mapped length, then BAR5's MM_INDEX/MM_INDEX_HI/MM_DATA memory access ports.
+Memory indices use byte addresses and a 31-bit split, including addresses
+above 4 GiB. Reads validate alignment, arithmetic, physical VRAM bounds and
+register-window capacity before accessing the device. They preserve the
+index latches and never write the memory data port or resize a BAR. Probe
+holds exclusive mapping/latch ownership and checks live PCI authority for
+sizing and discovery. Missing or invalid tables leave discovery unavailable.
+
+`VramInfo::size` is physical VRAM; `visible_size` is the smaller of that size
+and the mapped BAR0 length. A 12 GiB RX 6750 XT with a 256 MiB BAR therefore
+reports 12 GiB total and 256 MiB CPU-accessible; a 16 GiB Resizable BAR reports
+12 GiB for both. This mapping bound also applies to APUs under passthrough.
+Zero/absent VRAM has no visible heap and `fully_visible()` returns false.
+The bare-metal APU aperture expansion and relocated/system-memory discovery
+tables remain unimplemented.
+
+`AmdGpu::is_apu()` uses the discovered GC version, falling back to
+`ChipInfo::is_apu()` before discovery. The PCI fallback includes Rembrandt
+and Raphael despite their coarse Navi register-family assignment. BAR size
+never determines APU identity. `AMDGPU_INFO_MEMORY` and `VRAM_GTT` expose
+the two memory sizes, and `DEV_INFO` sets FUSION only for an APU.
+Navi 22 (`1002:73df`, GC 10.3.2) reports `AMDGPU_FAMILY_NV` and the GMC10
+48-bit VA geometry, which matches GMC11's geometry. A missing or mismatched
+GC version rejects its `DEV_INFO`. This identifies the device; acceleration
+continues to report unavailable. Navi 22 firmware, GMC/GFX10 execution and
+DCN3.0 display bring-up are not enabled by this probe path.
+
+### Navi 22 PSP secure-OS bootstrap
+
+`amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects
+`amdgpu/navy_flounder_sos.bin` only for `1002:73df`, GC 10.3.2 and MP0
+11.0.11. Duplicate/missing IP instances and undersized register banks reject
+the path. The registry and blob are read inside `Cap::invoke`; a bounded,
+validated copy outlives those invocations. `amdgpu_psp_firmware::Image::parse`
+supports PSP 11.0 container headers v1.0–v1.3, validates file/payload sizes
+and descriptor bounds/overlap, and exposes KDB, SPL, system driver and SOS
+in boot order. Parsing is structural validation; authentication remains with
+the firmware registry and PSP. Optional KDB/SPL may be absent. TOC/RL and
+alternate images are validated but not submitted by this bootstrap.
+
+`unsafe amdgpu_psp_boot::Bootloader::new(gpu, pci_cap, pool)` requires an
+exclusively owned physical GPU, permanent mappings, already trained VRAM,
+and an owned `amdgpu_vram::Pool` with valid GPU addresses and exclusions
+for firmware/scanout/discovery/training/TMR. It checks the pool's CPU mapping
+against the visible BAR0 aperture and reserves a 1 MiB buffer aligned to
+1 MiB in GPU address space. Construction performs no MMIO. The caller must
+exclude other PSP clients, reset, memory training and power transitions.
+
+`Bootloader::load(&Firmware).await` clears and copies each signed component
+in cooperative 4 KiB chunks, drains posted VRAM writes, then supplies the
+**GPU** address shifted by 20 to C2PMSG36 and the boot command to C2PMSG35.
+These registers use MP0 base index 0. Each I/O batch checks current PCI
+authority. Response waits use timer futures with 1 s deadlines; SOS startup
+includes the required 20 ms delay and a changing, nonzero C2PMSG81 heartbeat.
+An already running SOS is checked without upload. All-ones reads, rejection,
+timeout and revocation fail closed. The object transitions
+`Prepared → Loading → Ready | Failed`; a cancelled future remains `Loading`
+and cannot be retried. Dropping an unpublished/completed staging reservation
+releases it; uncertain device ownership quarantines it, including after
+cancellation. No implicit reset or recovery reuses that memory.
+
+Success proves only SOS liveness, not the identity/version of a previously
+running SOS or availability of graphics acceleration. It does not set
+`AmdGpu::fw_loaded`. The legacy single/multi-blob loaders reject Navi 22;
+automatic platform wiring, VRAM training, PSP11 GPCOM/TMR setup and IP/SMC
+firmware loading remain follow-up work. The current PSP13 ring constructor
+is not used for this device.
+
 ### AMD platform VBIOS
 
 `atombios::header::parse_rom_header` and `amdgpu_atombios::Atombios::parse`

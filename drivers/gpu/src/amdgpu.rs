@@ -75,6 +75,7 @@
 use core::sync::atomic::{compiler_fence, Ordering};
 
 use alloc::vec::Vec;
+use narf_capabilities::{CapError, CapOp};
 use narf_driver_runtime::{
     map_bar, BusDevice, BusDeviceCap, Cap, Lock as IrqSafeSpinLock, MmioRegion, Write,
 };
@@ -314,25 +315,22 @@ pub const fn gc_version_is_apu(major: u8, minor: u8, revision: u8) -> bool {
 }
 
 impl Family {
-    /// Whether this family's parts are APUs, for the window before discovery
-    /// has been parsed.
-    ///
-    /// [`gc_version_is_apu`] is the authority and this is the fallback, which
-    /// the ordering forces: the VRAM aperture has to be sized before the
-    /// discovery blob can be read, because the blob lives at the top of that
-    /// aperture. At that point the only thing known about the chip is its PCI
-    /// id, so the answer comes from the family — which is what Linux's PCI
-    /// table flag encoded before discovery existed.
-    ///
-    /// `Navi1`/`Navi2`/`Navi3` are the discrete families; `Vega` covers both
-    /// discrete Vega 10/12/20 and is treated as discrete for that reason,
-    /// with the Vega-derived APUs living in `Renoir`.
+    /// Coarse family default. Use `ChipInfo::is_apu` for the PCI fallback:
+    /// some APU IDs share the Navi register-family buckets. Once discovery
+    /// is available, `AmdGpu::is_apu` uses the exact GC version instead.
     pub const fn is_apu(self) -> bool {
         match self {
             Family::Renoir | Family::Phoenix => true,
             Family::Vega | Family::Navi1 | Family::Navi2 | Family::Navi3 => false,
         }
     }
+}
+
+/// APU identity is independent of BAR sizing, including Resizable BAR.
+pub(crate) fn device_is_apu(chip: &ChipInfo, blocks: &[IpBlock]) -> bool {
+    amdgpu_discovery::find_ip(blocks, amdgpu_discovery::HW_ID_GC, 0)
+        .map(|gc| gc_version_is_apu(gc.major, gc.minor, gc.revision))
+        .unwrap_or_else(|| chip.is_apu())
 }
 
 impl Family {
@@ -386,6 +384,14 @@ pub struct ChipInfo {
     /// the matching `gc_*`, `dcn_*`, `psp_*`, `sdma_*`, `vcn_*`,
     /// `smu_*` IP versions.
     pub fw_list: &'static [FwEntry],
+}
+
+impl ChipInfo {
+    /// Pre-discovery identity. Rembrandt and Raphael are APUs even though
+    /// their coarse register families also contain discrete Navi parts.
+    pub fn is_apu(&self) -> bool {
+        matches!(self.did, REMBRANDT | RAPHAEL) || self.family.is_apu()
+    }
 }
 
 /// One firmware blob in a chip's bring-up sequence: its canonical
@@ -656,7 +662,12 @@ fn chip_info_for_pci_id(vid: u16, did: u16) -> Option<ChipInfo> {
             GREEN_SARDINE_FW,
         ),
         RENOIR => (Family::Renoir, "renoir", "amdgpu/renoir.bin", RENOIR_FW),
-        NAVI22 => (Family::Navi2, "navi22", "amdgpu/navi22.bin", UNAUDITED_FW),
+        NAVI22 => (
+            Family::Navi2,
+            "navi22",
+            crate::amdgpu_psp_firmware::NAVI22_SOS,
+            UNAUDITED_FW,
+        ),
         NAVI31 => (Family::Navi3, "navi31", "amdgpu/navi31.bin", UNAUDITED_FW),
         _ => return None,
     };
@@ -710,9 +721,9 @@ pub struct VramInfo {
     /// **Visible** VRAM size: `gmc.visible_vram_size`, the part reachable
     /// through the aperture at [`VramInfo::base`].
     ///
-    /// On an APU this equals [`VramInfo::size`] — VRAM is carved out of
-    /// system memory and all of it is addressable. On a **discrete** card it
-    /// is BAR0's length, which without Resizable BAR is 256 MiB against
+    /// Bounded by both real VRAM and the mapped BAR0 length, including on
+    /// APUs under passthrough. On a **discrete** card without Resizable BAR
+    /// this is commonly 256 MiB against
     /// however many gigabytes the card has: a 12 GiB RX 6750 XT shows 256
     /// MiB here. Reporting the two as one number tells userspace it may CPU
     /// map all 12 GiB, and the mapping that results is of nothing.
@@ -722,10 +733,10 @@ pub struct VramInfo {
 impl VramInfo {
     /// Does the CPU aperture cover the whole of VRAM?
     ///
-    /// True on an APU and on a discrete card with Resizable BAR sized to
-    /// VRAM; false on a stock discrete card.
+    /// Requires nonzero VRAM and a mapping covering it all; this is not an
+    /// APU identity test. A discrete card with Resizable BAR can also qualify.
     pub fn fully_visible(&self) -> bool {
-        self.visible_size >= self.size
+        self.size != 0 && self.visible_size >= self.size
     }
 }
 
@@ -776,6 +787,15 @@ impl core::fmt::Debug for AmdGpu {
     }
 }
 
+/// Execute synchronous probe I/O only after the PCI epoch check.
+struct ProbeOp<F>(F);
+impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for ProbeOp<F> {
+    type Output = T;
+    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+        Ok((self.0)())
+    }
+}
+
 impl AmdGpu {
     /// Map BAR0 + BAR5, identify the chip, run a presence test
     /// against MM_INDEX. Real bring-up (PSP firmware load + DCN
@@ -785,7 +805,7 @@ impl AmdGpu {
     /// Caller owns BAR0 + BAR5 exclusively for the duration of probe.
     pub unsafe fn bring_up(
         device: &BusDevice,
-        _cap: &Cap<BusDeviceCap, Write>,
+        cap: &Cap<BusDeviceCap, Write>,
     ) -> Result<Self, AmdgpuError> {
         let chip = chip_info_for_pci_id(device.id.vendor, device.id.device)
             .ok_or(AmdgpuError::UnknownAsic)?;
@@ -797,83 +817,83 @@ impl AmdGpu {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let regs = unsafe { map_bar(device, BAR_REGS) }.map_err(|_| AmdgpuError::BarMapFailed)?;
 
-        // Presence test: MM_INDEX is read/write; write a sentinel,
-        // read it back, restore. A wedged controller reads
-        // 0xFFFFFFFF or fails to round-trip.
-        // SAFETY: identity-mapped MMIO; MM_INDEX is a register
-        // latch with no side effects when the data port isn't
-        // touched.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let prev = unsafe { regs.read32(MM_INDEX) };
-        if prev == 0xFFFF_FFFF {
-            return Err(AmdgpuError::DeviceGone);
+        if regs.len < MM_INDEX + 4 {
+            return Err(AmdgpuError::BarMapFailed);
         }
-        // SAFETY: same.
-        unsafe {
-            regs.write32(MM_INDEX, 0xCAFE_F00D);
-        }
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: same.
-        let echo = unsafe { regs.read32(MM_INDEX) };
-        // SAFETY: restore prior value.
-        unsafe {
-            regs.write32(MM_INDEX, prev);
-        }
-        if echo != 0xCAFE_F00D {
-            return Err(AmdgpuError::DeviceGone);
-        }
+        cap.invoke(ProbeOp(|| {
+            // Presence test: MM_INDEX is read/write; write a sentinel,
+            // read it back, restore. A wedged controller reads
+            // 0xFFFFFFFF or fails to round-trip.
+            // SAFETY: identity-mapped MMIO; MM_INDEX is a register
+            // latch with no side effects when the data port isn't
+            // touched.
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            let prev = unsafe { regs.read32(MM_INDEX) };
+            if prev == 0xFFFF_FFFF {
+                return Err(AmdgpuError::DeviceGone);
+            }
+            // SAFETY: same.
+            unsafe {
+                regs.write32(MM_INDEX, 0xCAFE_F00D);
+            }
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: same.
+            let echo = unsafe { regs.read32(MM_INDEX) };
+            // SAFETY: restore prior value.
+            unsafe {
+                regs.write32(MM_INDEX, prev);
+            }
+            if echo != 0xCAFE_F00D {
+                return Err(AmdgpuError::DeviceGone);
+            }
 
-        // Size the VRAM carve-out. This runs BEFORE discovery — the discovery
-        // blob lives at the top of this aperture — so it cannot use any
-        // register that needs an IP base, and it cannot consult the GC IP
-        // version either. `Family::is_apu` is the pre-discovery fallback;
-        // [`gc_version_is_apu`] is the authority and cross-checks it below
-        // once the blob has been parsed.
-        // SAFETY: identity-mapped MMIO; MM_INDEX/MM_DATA are a
-        // sequential pair with no side effects beyond the access.
-        let vram = unsafe { read_vram_info(&regs, &fb_bar, chip.family.is_apu()) };
+            Ok(())
+        }))
+        .map_err(|_| AmdgpuError::DeviceGone)??;
+
+        // RCC_CONFIG_MEMSIZE is absolute and needs no discovered IP base.
+        // SAFETY: both mappings belong to this exclusively owned device;
+        // the operation runs under live PCI authority.
+        let vram = cap
+            .invoke(ProbeOp(|| unsafe { read_vram_info(&regs, &fb_bar) }))
+            .map_err(|_| AmdgpuError::DeviceGone)?;
 
         // Try to parse the on-die IP discovery table. Lives in
-        // the top `DISCOVERY_TMR_OFFSET` bytes of the VRAM
-        // aperture; reachable through the BAR0 framebuffer
-        // window. On QEMU the read yields all-ones / garbage and
+        // last `DISCOVERY_TMR_OFFSET` bytes of VRAM. A discrete card's
+        // discovery table usually lies outside BAR0; the reader uses the
+        // BAR5 memory index/data ports for that range.
+        // On QEMU the read yields all-ones / garbage and
         // discovery fails closed with `BadSignature` — log and
         // continue using the hardcoded `Family::mp0_base()`
         // table.
         //
-        // SAFETY: BAR0 mapped, exclusive owner; the discovery
-        // blob is read-only from the host side.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        // One read of the discovery blob answers both questions.
-        // SAFETY: as above.
-        let (ip_blocks, gc_info) = unsafe { read_discovery(&fb_bar, &vram) };
+        let (ip_blocks, gc_info) = cap
+            .invoke(ProbeOp(|| {
+                // SAFETY: current PCI authority; probe exclusively owns both
+                // mappings and the shared index latch for the whole read.
+                let mut reader =
+                    unsafe { crate::amdgpu_vram_access::MmioReader::new(&fb_bar, &regs) };
+                read_discovery(&mut reader, vram.size)
+            }))
+            .map_err(|_| AmdgpuError::DeviceGone)?;
 
-        // Now that the GC IP version is known, re-decide APU-ness from it —
-        // this is the answer modern Linux uses — and resize the visible
-        // aperture if the pre-discovery guess was wrong.
-        //
-        // Disagreement is not a soft thing. Reading a discrete card as an
-        // APU claims every byte of VRAM is CPU-visible, so a client maps
-        // past the aperture and gets nothing; reading an APU as discrete
-        // hides most of its VRAM. Either way the family table is what needs
-        // correcting, so the mismatch is recorded rather than smoothed over.
-        let mut vram = vram;
+        // Cross-check the pre-discovery identity. The actual BAR mapping,
+        // rather than APU identity, always bounds CPU-visible VRAM.
         let mut apu_disagreement = None;
         if let Some(gc) = ip_blocks
             .iter()
             .find(|b| b.hw_id == amdgpu_discovery::HW_ID_GC && b.instance == 0)
         {
             let from_gc = gc_version_is_apu(gc.major, gc.minor, gc.revision);
-            if from_gc != chip.family.is_apu() {
+            if from_gc != chip.is_apu() {
                 apu_disagreement = Some((gc.major, gc.minor, gc.revision));
             }
-            vram.visible_size = if from_gc { vram.size } else { fb_bar.len };
         }
         if let Some((a, b, c)) = apu_disagreement {
             use core::fmt::Write as _;
             let _ = writeln!(
                 narf_console::Writer,
-                "amdgpu: {}: GC {}.{}.{} says {} but the family table says {}; \
+                "amdgpu: {}: GC {}.{}.{} says {} but the PCI table says {}; \
                  trusting the GC version",
                 chip.asic,
                 a,
@@ -884,11 +904,7 @@ impl AmdGpu {
                 } else {
                     "discrete"
                 },
-                if chip.family.is_apu() {
-                    "APU"
-                } else {
-                    "discrete"
-                },
+                if chip.is_apu() { "APU" } else { "discrete" },
             );
         }
 
@@ -953,6 +969,10 @@ impl AmdGpu {
     }
     pub fn vram_info(&self) -> VramInfo {
         self.vram
+    }
+    /// Discovered GC identity, or the PCI fallback when discovery is absent.
+    pub fn is_apu(&self) -> bool {
+        device_is_apu(&self.chip, &self.ip_blocks)
     }
     pub fn is_ready(&self) -> bool {
         self.fw_loaded
@@ -1336,7 +1356,9 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<(), AmdgpuError> {
-        if self.chip.family == Family::Phoenix {
+        if self.chip.family == Family::Phoenix || self.chip.did == NAVI22 {
+            // Navi22 SOS uses amdgpu_psp_boot and an owned GPU VRAM staging
+            // buffer; this legacy entry point cannot satisfy that contract.
             return Err(AmdgpuError::UnsupportedFirmwareLoad);
         }
         if crate::amdgpu_usbc::firmware_busy() {
@@ -1514,7 +1536,7 @@ impl AmdGpu {
         &mut self,
         fw_authority: &Cap<narf_firmware::FirmwareRegistry, narf_capabilities::Read>,
     ) -> Result<MultiFwReport, AmdgpuError> {
-        if self.chip.family == Family::Phoenix {
+        if self.chip.family == Family::Phoenix || self.chip.did == NAVI22 {
             return Err(AmdgpuError::UnsupportedFirmwareLoad);
         }
         if crate::amdgpu_usbc::firmware_busy() {
@@ -1963,134 +1985,65 @@ pub(crate) unsafe fn mm_write(regs: &MmioRegion, addr: u32, value: u32) {
     }
 }
 
-/// Size and locate the CPU-visible VRAM carve-out, before discovery has run.
-///
-/// Mirrors `gmc_v11_0_mc_init` plus the pre-discovery path in
-/// `amdgpu_discovery.c`:
-///
-///   * the size comes from `RCC_CONFIG_MEMSIZE`, in MiB
-///     (`adev->nbio.funcs->get_memsize(adev) * 1024 * 1024`);
-///   * the base is BAR0's physical address
-///     (`adev->gmc.aper_base = pci_resource_start(adev->pdev, 0)`).
-///
-/// LINUX-GAP: this read `MC_VM_FB_LOCATION_BASE`/`_TOP` — 0x0980/0x0981 on
-/// GFX9, 0x1678/0x1679 on GFX11 — with **no IP base added**. Those are SOC15
-/// registers addressed as `reg_offset[IP][0][BASE_IDX] + dword_id`, so a bare
-/// 0x1678 names an unrelated register; and at this point in probe there is no
-/// base to add, because resolving one needs the discovery blob that lives at
-/// the top of the aperture this function is sizing. Linux breaks that cycle
-/// with `RREG32(mmRCC_CONFIG_MEMSIZE)` — `amdgpu_discovery.c:142` defines it
-/// as the absolute dword 0xde3 with the comment "These registers are
-/// consistent across all the SOCs", precisely because it must be readable
-/// before any IP base is known. Post-discovery the same value is
-/// `regRCC_DEV0_EPF0_RCC_CONFIG_MEMSIZE` 0x00c3 on NBIO BASE_IDX 2.
-///
-/// `VramInfo { size: 0 }` when the register reads `U32_MAX` (no device) or 0,
-/// which `amdgpu_discovery.c:314-317` treats as "TMR is in system memory" —
-/// either way there is no VRAM-resident discovery blob to find.
-/// Post-reset liveness probe: does the ASIC answer at all?
-///
-/// `RCC_CONFIG_MEMSIZE` reads back all-ones while the ASIC is still in
-/// reset or off the link, and a real size once it is out. Linux's
-/// `amdgpu_pci_slot_reset` polls exactly this, after the PCI vendor-ID
-/// poll and for exactly this reason: the vendor ID can be answered
-/// before the ASIC itself is back, so the memsize read is the one that
-/// confirms the die rather than the link.
-///
+/// Read the absolute VRAM-size register through BAR5's direct register window.
 /// # Safety
-/// Same contract as [`mm_read`]: `regs` maps BAR5 of an AMD GPU and the
-/// caller owns the MM_INDEX latch for the duration.
-pub(crate) unsafe fn config_memsize_alive(regs: &MmioRegion) -> bool {
-    // SAFETY: caller-asserted mapping and latch ownership.
-    unsafe { mm_read(regs, RCC_CONFIG_MEMSIZE) != u32::MAX }
+/// `regs` is a live, exclusively owned AMD GPU BAR5 mapping.
+unsafe fn read_config_memsize(regs: &MmioRegion) -> u32 {
+    let offset = u64::from(RCC_CONFIG_MEMSIZE) * 4;
+    if regs.len < offset + 4 {
+        return u32::MAX;
+    }
+    // SAFETY: validated DWORD bounds; caller owns the mapping.
+    unsafe { regs.read32(offset) }
 }
 
-unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion, is_apu: bool) -> VramInfo {
-    // SAFETY: caller-asserted ownership; MM_INDEX/MM_DATA pair, and this
-    // register is absolute by design (no IP base).
-    let memsize_mb = unsafe { mm_read(regs, RCC_CONFIG_MEMSIZE) };
+/// Post-reset liveness: the ASIC must answer beyond PCI configuration space.
+/// # Safety
+/// Same live BAR5 mapping contract as `read_config_memsize`.
+pub(crate) unsafe fn config_memsize_alive(regs: &MmioRegion) -> bool {
+    // SAFETY: caller supplies the live, exclusively owned register mapping.
+    unsafe { read_config_memsize(regs) != u32::MAX }
+}
+
+/// Total VRAM from RCC_CONFIG_MEMSIZE; CPU visibility from the mapped BAR0.
+/// # Safety
+/// Caller owns both live mappings of the same GPU.
+pub(crate) unsafe fn read_vram_info(regs: &MmioRegion, fb_bar: &MmioRegion) -> VramInfo {
+    // RCC_CONFIG_MEMSIZE is an absolute DWORD register ID. It is within
+    // BAR5's directly mapped window, which is addressed in BYTES.
+    // SAFETY: caller owns the live BAR5 mapping.
+    let memsize_mb = unsafe { read_config_memsize(regs) };
     let size = if memsize_mb == u32::MAX {
         0
     } else {
         u64::from(memsize_mb) << 20
     };
-    // `gmc_v10_0_mc_init` / `gmc_v11_0_mc_init`:
-    //
-    //   aper_base = pci_resource_start(pdev, 0)
-    //   aper_size = pci_resource_len(pdev, 0)
-    //   if (APU && !passthrough) { aper_base = gfxhub FB offset;
-    //                              aper_size = real_vram_size; }
-    //   visible_vram_size = aper_size
-    //
-    // So the visible size is BAR0's **length** on a discrete card, and the
-    // whole of VRAM on an APU. A 12 GiB card with no Resizable BAR reports
-    // 256 MiB visible, and the gap is not cosmetic: it is the difference
-    // between memory the CPU may map and memory only the GPU can reach.
-    //
-    // LINUX-GAP: the APU override takes the base from
-    // `gfxhub.funcs->get_mc_fb_offset` rather than from BAR0, and is
-    // skipped under passthrough (`!amdgpu_passthrough(adev)`) because the
-    // hypervisor's BAR is then the only usable aperture. This keeps BAR0's
-    // base in both cases, which is what the override would compute for a
-    // bare-metal APU anyway and is what passthrough requires — but it is
-    // not the same read, and a part whose FB offset is not BAR0 would
-    // differ here.
-    let visible_size = if is_apu { size } else { fb_bar.len };
+    // Use only the aperture actually mapped. This also covers APUs behind
+    // passthrough and ReBAR apertures rounded up beyond physical VRAM.
+    // LINUX-GAP: bare-metal APU expansion via get_mc_fb_offset is not mapped
+    // here; until it is, advertising more than BAR0 would promise invalid CPU
+    // mappings. Indexed discovery does not require that expansion.
     VramInfo {
         base: fb_bar.phys.raw(),
         size,
-        visible_size,
+        visible_size: fb_bar.len.min(size),
     }
 }
 
-/// Read the on-die IP discovery blob from the top of the VRAM
-/// aperture and parse it into a flat `Vec<IpBlock>`. Returns an
-/// empty Vec on any failure (signature mismatch from QEMU
-/// garbage, truncated blob, checksum fail) — discovery is an
-/// optimisation, not a load-bearing path, so we fail soft.
-///
-/// The blob lives at `vram_size - DISCOVERY_TMR_OFFSET` per
-/// `amdgpu_discovery.c` line 332. We slurp `DISCOVERY_TMR_SIZE`
-/// bytes (or whatever fits inside the aperture, whichever is
-/// smaller) into a heap buffer so the parser sees a contiguous
-/// byte slice independent of the MMIO access width.
-///
-/// # Safety
-/// `fb_bar` must map BAR0 of an AMD GPU; the caller must hold
-/// exclusive ownership of the framebuffer aperture for the
-/// duration of the read.
-unsafe fn read_discovery(
-    fb_bar: &MmioRegion,
-    vram: &VramInfo,
+/// Read the default 10 KiB discovery table 64 KiB below the end of real VRAM.
+/// BAR0 reads stop at its mapped extent; BAR5 indexed memory reads cover the
+/// remainder. Missing/corrupt discovery leaves the IP inventory unavailable.
+/// LINUX-GAP: newer firmware's relocated/system-memory TMR is not handled.
+pub(crate) fn read_discovery(
+    io: &mut impl crate::amdgpu_vram_access::ReadIo,
+    vram_size: u64,
 ) -> (Vec<IpBlock>, Option<crate::amdgpu_discovery::GcInfo>) {
-    // No aperture → no discovery.
-    if vram.size < amdgpu_discovery::DISCOVERY_TMR_OFFSET {
+    let Some(offset) = vram_size.checked_sub(amdgpu_discovery::DISCOVERY_TMR_OFFSET) else {
         return (Vec::new(), None);
-    }
-    let off_in_vram = vram.size - amdgpu_discovery::DISCOVERY_TMR_OFFSET;
-    // Cap the read at whatever the aperture actually exposes
-    // (BAR0 may be smaller than the visible VRAM on systems with
-    // a resizable BAR turned off).
-    let max =
-        amdgpu_discovery::DISCOVERY_TMR_SIZE.min(amdgpu_discovery::DISCOVERY_TMR_OFFSET as usize);
-    let mut buf = alloc::vec![0u8; max];
-    // Read in 4-byte chunks via the MMIO accessor. The BAR's
-    // size guard is enforced by `MmioRegion::read32` (returns
-    // garbage / panics on out-of-bounds depending on the
-    // runtime); we conservatively walk only `max` bytes here.
-    let mut i = 0;
-    while i + 4 <= max {
-        // SAFETY: caller-asserted ownership of BAR0; the
-        // aperture covers `[0, vram.size)` and we've bounded
-        // `off_in_vram + i` against `vram.size`.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        let word = unsafe { fb_bar.read32(off_in_vram + i as u64) };
-        let bytes = word.to_le_bytes();
-        buf[i] = bytes[0];
-        buf[i + 1] = bytes[1];
-        buf[i + 2] = bytes[2];
-        buf[i + 3] = bytes[3];
-        i += 4;
+    };
+    let mut buf = alloc::vec![0u8; amdgpu_discovery::DISCOVERY_TMR_SIZE];
+    if crate::amdgpu_vram_access::read(io, vram_size, offset, &mut buf).is_err() {
+        return (Vec::new(), None);
     }
     // The GC table is parsed from the same bytes. Its absence is ordinary
     // (QEMU, pre-discovery silicon) and is not worth reporting; a blob that
@@ -2254,7 +2207,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // SAFETY: probe owns the GPU mappings; boot ACPI tables remain mapped.
     dev.vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) }.ok();
     let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
-    let is_apu = matches!(dev.chip.family, Family::Renoir | Family::Phoenix);
+    let is_apu = dev.is_apu();
     // Captured before the move into CONTROLLER; both are Copy.
     let (bound_asic, bound_family) = (dev.chip.asic, dev.chip.family);
     *PCI_AUTHORITY.lock() = Some(cap);

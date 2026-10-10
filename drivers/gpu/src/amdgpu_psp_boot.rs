@@ -1,0 +1,340 @@
+//! Navi 22 / PSP 11.0.11 secure-OS bootstrap. Protocol follows Linux
+//! `psp_v11_0.c`: C2PMSG35 command/status, C2PMSG36 GPU address in MiB,
+//! C2PMSG81 SOS heartbeat, all at MP0 base index **0** (not PSP13's index 1).
+//! This requires initialized VRAM; it does not perform memory training,
+//! create a GPCOM ring, allocate a TMR, or load graphics/SMC firmware.
+use crate::{
+    amdgpu::{AmdGpu, AMD_VENDOR, NAVI22},
+    amdgpu_discovery as discovery,
+    amdgpu_psp_firmware::{self as firmware, Component, Image, STAGING_SIZE},
+    amdgpu_vram::{Pool, Reservation},
+};
+use alloc::vec::Vec;
+use core::sync::atomic::{fence, Ordering};
+use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_capabilities::{Cap, CapError, CapOp, Read, Write};
+
+const STATUS: u32 = 0x63;
+const ADDRESS: u32 = 0x64;
+const SOS: u32 = 0x91;
+const DONE: u32 = 1 << 31;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    Unsupported,
+    Invalid,
+    Allocation,
+    Revoked,
+    Busy,
+    Timeout,
+    DeviceGone,
+    Rejected(u32),
+    Image(firmware::Error),
+    Registry(narf_firmware::FirmwareError),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Prepared,
+    Loading,
+    Ready,
+    Failed,
+}
+
+/// Immutable container copied inside live registry/blob capability invocations.
+#[derive(Debug)]
+pub struct Firmware {
+    bytes: Vec<u8>,
+}
+struct OpenFirmware;
+impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenFirmware {
+    type Output = Result<Vec<u8>, Error>;
+    fn execute(
+        self,
+        cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self::Output, CapError> {
+        let blob = match narf_firmware::open(firmware::NAVI22_SOS, cap) {
+            Ok(blob) => blob,
+            Err(error) => return Ok(Err(Error::Registry(error))),
+        };
+        blob.invoke(CopyFirmware)
+    }
+}
+struct CopyFirmware;
+impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyFirmware {
+    type Output = Result<Vec<u8>, Error>;
+    fn execute(
+        self,
+        cap: &Cap<narf_firmware::FirmwareBlob, Read>,
+    ) -> Result<Self::Output, CapError> {
+        Ok((|| {
+            let view = narf_firmware::view_of(cap).map_err(Error::Registry)?;
+            Image::parse(view.bytes).map_err(Error::Image)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(view.bytes.len())
+                .map_err(|_| Error::Allocation)?;
+            bytes.extend_from_slice(view.bytes);
+            Ok(bytes)
+        })())
+    }
+}
+fn mp0_bank(gpu: &AmdGpu) -> Result<u64, Error> {
+    if gpu.chip.vid != AMD_VENDOR || gpu.chip.did != NAVI22 {
+        return Err(Error::Unsupported);
+    }
+    let mut gc = gpu
+        .ip_blocks
+        .iter()
+        .filter(|ip| ip.hw_id == discovery::HW_ID_GC && ip.instance == 0);
+    let ip = gc.next().ok_or(Error::Unsupported)?;
+    if gc.next().is_some() || (ip.major, ip.minor, ip.revision) != (10, 3, 2) {
+        return Err(Error::Unsupported);
+    }
+    crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS).map_err(
+        |error| match error {
+            crate::amdgpu_psp_ring::Error::Invalid => Error::Invalid,
+            _ => Error::Unsupported,
+        },
+    )
+}
+impl Firmware {
+    pub fn open(
+        gpu: &AmdGpu,
+        authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
+    ) -> Result<Self, Error> {
+        mp0_bank(gpu)?;
+        Ok(Self {
+            bytes: authority
+                .invoke(OpenFirmware)
+                .map_err(|_| Error::Revoked)??,
+        })
+    }
+    pub fn image(&self) -> Result<Image<'_>, Error> {
+        Image::parse(&self.bytes).map_err(Error::Image)
+    }
+}
+
+struct Op<F>(F);
+impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
+    type Output = T;
+    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+        Ok((self.0)())
+    }
+}
+trait Io {
+    fn read(&mut self, reg: u32) -> u32;
+    fn write(&mut self, reg: u32, value: u32);
+    fn write_mem(&mut self, offset: usize, value: u32);
+    fn finish_upload(&mut self);
+}
+#[derive(Debug)]
+struct Mmio {
+    regs: MmioRegion,
+    base: u64,
+    memory: MmioRegion,
+}
+impl Io for Mmio {
+    fn read(&mut self, reg: u32) -> u32 {
+        // SAFETY: constructor bounds the exact PSP11 MP0 window.
+        unsafe { self.regs.read32(self.base + u64::from(reg) * 4) }
+    }
+    fn write(&mut self, reg: u32, value: u32) {
+        // SAFETY: same bounded window; owner excludes all other PSP clients.
+        unsafe { self.regs.write32(self.base + u64::from(reg) * 4, value) };
+    }
+    fn write_mem(&mut self, offset: usize, value: u32) {
+        // SAFETY: staging writes are aligned and strictly within the reservation.
+        unsafe { self.memory.write32(offset as u64, value) };
+    }
+    fn finish_upload(&mut self) {
+        fence(Ordering::SeqCst);
+        // Drain posted BAR0 writes before ringing the BAR5 mailbox. Linux's
+        // psp_copy_fw likewise copies to the VRAM staging BO before the command.
+        // SAFETY: last dword of the permanently owned, fully written mapping.
+        unsafe { self.memory.read32(STAGING_SIZE as u64 - 4) };
+        fence(Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct Engine<I: Io> {
+    io: I,
+    authority: Cap<BusDeviceCap, Write>,
+    memory: Reservation,
+    state: State,
+}
+async fn delay(ms: u64) {
+    narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant()).await;
+}
+impl<I: Io> Engine<I> {
+    fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
+        let io = &mut self.io;
+        self.authority
+            .invoke(Op(|| f(io)))
+            .map_err(|_| Error::Revoked)
+    }
+    fn heartbeat(&mut self) -> Result<u32, Error> {
+        match self.access(|io| io.read(SOS))? {
+            u32::MAX => Err(Error::DeviceGone),
+            value => Ok(value),
+        }
+    }
+    async fn response(&mut self) -> Result<(), Error> {
+        let deadline = narf_time::Deadline::after_ms(1000);
+        loop {
+            let value = self.access(|io| io.read(STATUS))?;
+            if value == u32::MAX {
+                return Err(Error::DeviceGone);
+            }
+            if value & DONE != 0 {
+                return if value & 0xffff == 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Rejected(value & 0xffff))
+                };
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay(1).await;
+        }
+    }
+    async fn alive(&mut self) -> Result<(), Error> {
+        // A nonzero but frozen register is insufficient proof that SOS boots.
+        let initial = self.heartbeat()?;
+        let deadline = narf_time::Deadline::after_ms(1000);
+        loop {
+            let value = self.heartbeat()?;
+            if value != 0 && value != initial {
+                return Ok(());
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay(1).await;
+        }
+    }
+    async fn upload(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        for start in (0..STAGING_SIZE).step_by(4096) {
+            self.access(|io| {
+                for offset in (start..start + 4096).step_by(4) {
+                    let mut word = [0u8; 4];
+                    if offset < bytes.len() {
+                        let count = (bytes.len() - offset).min(4);
+                        word[..count].copy_from_slice(&bytes[offset..offset + count]);
+                    }
+                    io.write_mem(offset, u32::from_le_bytes(word));
+                }
+            })?;
+            narf_scheduler::yield_now().await;
+        }
+        self.access(|io| io.finish_upload())
+    }
+    async fn load_inner(&mut self, image: &Image<'_>) -> Result<(), Error> {
+        if self.heartbeat()? != 0 {
+            // BIOS/previous driver already started SOS. Verify liveness without
+            // touching the bootloader or overwriting its firmware.
+            return self.alive().await;
+        }
+        for (kind, bytes) in image.components() {
+            self.response().await?;
+            self.upload(bytes).await?;
+            let address = (self.memory.address() >> 20) as u32;
+            // Publication precedes both mailbox writes. Cancellation/revocation
+            // can never return memory whose device ownership is uncertain.
+            self.memory.publish();
+            self.access(|io| {
+                io.write(ADDRESS, address);
+                io.write(STATUS, kind.command());
+            })?;
+            if kind == Component::SecureOs {
+                delay(20).await;
+                self.alive().await?;
+            } else {
+                self.response().await?;
+            }
+            // SAFETY: successful bootloader completion (or running SOS) proves
+            // the copy has been consumed; PSP no longer reads this staging BO.
+            unsafe { self.memory.stopped() };
+        }
+        Ok(())
+    }
+    async fn load(&mut self, image: &Image<'_>) -> Result<(), Error> {
+        if self.state != State::Prepared {
+            return Err(Error::Busy);
+        }
+        self.state = State::Loading;
+        let result = self.load_inner(image).await;
+        self.state = if result.is_ok() {
+            State::Ready
+        } else {
+            State::Failed
+        };
+        result
+    }
+}
+
+#[derive(Debug)]
+pub struct Bootloader {
+    engine: Engine<Mmio>,
+}
+impl Bootloader {
+    /// Reserve a 1 MiB staging BO at a 1 MiB-aligned **GPU** address. No hardware
+    /// writes occur until `load`; the BAR's host physical address is never sent.
+    ///
+    /// # Safety
+    /// Caller exclusively owns this physical GPU (not an SR-IOV VF), its PSP,
+    /// reset/power controls and permanent mappings. VRAM must already be trained
+    /// and accessible, with the pool's GPU address mapping valid for this GPU.
+    /// The pool excludes firmware, scanout, discovery, training and TMR ranges.
+    /// No memory training/reset or other PSP client may run during this object's
+    /// lifetime. Retain quarantined memory after failure/cancellation until an
+    /// independently verified device reset; dropping this object does not reset.
+    pub unsafe fn new(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        let base = mp0_bank(gpu)?;
+        let map = pool.mapping();
+        let offset = map
+            .phys
+            .raw()
+            .checked_sub(gpu.fb_bar.phys.raw())
+            .ok_or(Error::Invalid)?;
+        if gpu.fb_bar.virt.checked_add(offset) != Some(map.virt)
+            || offset
+                .checked_add(map.len)
+                .is_none_or(|end| end > gpu.fb_bar.len.min(gpu.vram.visible_size))
+        {
+            return Err(Error::Invalid);
+        }
+        let memory = pool
+            .reserve_aligned(STAGING_SIZE as u64, STAGING_SIZE as u64)
+            .map_err(|_| Error::Allocation)?;
+        Ok(Self {
+            engine: Engine {
+                io: Mmio {
+                    regs: gpu.regs,
+                    base,
+                    memory: memory.mapping(),
+                },
+                authority,
+                memory,
+                state: State::Prepared,
+            },
+        })
+    }
+    pub fn state(&self) -> State {
+        self.engine.state
+    }
+    /// Boot authenticated container components, or verify an already running SOS.
+    /// A dropped future leaves Loading and cannot be retried through this object.
+    /// Success proves SOS liveness only; it does not set `AmdGpu::fw_loaded`.
+    pub async fn load(&mut self, firmware: &Firmware) -> Result<(), Error> {
+        self.engine.load(&firmware.image()?).await
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_psp_boot_tests.rs"]
+mod tests;

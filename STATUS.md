@@ -247,6 +247,17 @@ interfaces and limits.
 
 ## Current work
 
+The `feat/amdgpu-navi22-passthrough` branch adds discrete PCIe probe support
+for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
+and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the
+Navi 22 userspace family query. The `navy_flounder_sos.bin` parser and an
+explicit PSP 11.0.11 asynchronous bootstrap now handle KDB/SPL/system/SOS
+using owned, aligned VRAM with cancellation quarantine. These are
+software-tested foundations; automatic platform wiring, VRAM training,
+PSP11 GPCOM/TMR and IP firmware loading, hardware boot, GMC/GFX10
+initialization and DCN3.0 modesetting remain open. See the
+[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
+
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix
    HawkPoint1; exercise native AMDGPU modeset, keyboard and touchpad,
    Wi-Fi, and persistent NVMe storage. AMDGPU, ACPI EC, I²C-HID,

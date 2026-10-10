@@ -55,19 +55,26 @@ const AMDGPU_GPU_PAGE_SIZE: u32 = 4096;
 
 /// `adev->gfx.config.max_hw_contexts`. Unlike the shader geometry this IS a
 /// per-IP-version constant in Linux, and `gfx_v11_0_gpu_early_init` sets 8 for
-/// every GFX 11 variant including 11.0.1.
-const GFX11_HW_CONTEXTS: u32 = 8;
+/// every GFX 11 variant including 11.0.1. `gfx_v10_0_gpu_early_init`
+/// also sets 8 for Navi 22 (GC 10.3.2).
+const GFX_HW_CONTEXTS: u32 = 8;
 
 /// `adev->family` — the `AMDGPU_FAMILY_*` value userspace matches on.
 ///
 /// Mesa keys ASIC behaviour off this plus the device id, so a wrong value here
 /// selects a different code path in the userspace driver.
-fn family_id(family: Family) -> Option<u32> {
-    match family {
+fn family_id(snap: &Snapshot) -> Option<u32> {
+    match snap.family {
         // Phoenix / Phoenix2 / HawkPoint are GFX 11.0.1.
         Family::Phoenix => Some(uapi::AMDGPU_FAMILY_GC_11_0_1),
         // Renoir / Cezanne / Lucienne / Barcelo are the Raven family line.
         Family::Renoir => Some(uapi::AMDGPU_FAMILY_RV),
+        // The Navi2 bucket also contains Rembrandt, whose UAPI family is
+        // different. Admit Navi 22 only with the matching discovery version.
+        Family::Navi2 if snap.did == u32::from(crate::amdgpu::NAVI22) => {
+            let gc = amdgpu_discovery::find_ip(&snap.ip_blocks, amdgpu_discovery::HW_ID_GC, 0)?;
+            ((gc.major, gc.minor, gc.revision) == (10, 3, 2)).then_some(uapi::AMDGPU_FAMILY_NV)
+        }
         // Anything else has had no bring-up; refusing is better than naming a
         // family whose userspace path we have not exercised.
         _ => None,
@@ -84,10 +91,10 @@ fn family_id(family: Family) -> Option<u32> {
 pub struct Snapshot {
     pub did: u32,
     pub family: Family,
-    /// Visible VRAM aperture, in bytes.
+    /// Total physical VRAM, in bytes.
     pub vram_size: u64,
-    /// The part of VRAM the CPU can reach. Equal to `vram_size` on an APU;
-    /// BAR0's length on a discrete card. See `VramInfo::visible_size`.
+    /// VRAM the CPU can reach, bounded by the mapped BAR0 and real size.
+    /// See `VramInfo::visible_size`.
     pub visible_vram_size: u64,
     /// Whether this part is an APU, which is what `AMDGPU_IDS_FLAGS_FUSION`
     /// reports.
@@ -97,15 +104,21 @@ pub struct Snapshot {
 }
 
 fn snapshot() -> Option<Snapshot> {
-    crate::amdgpu::with_controller(|gpu| Snapshot {
-        did: gpu.chip.did as u32,
-        family: gpu.chip.family,
-        vram_size: gpu.vram.size,
-        visible_vram_size: gpu.vram.visible_size,
-        is_apu: gpu.vram.fully_visible(),
-        gc: gpu.gc_info,
-        ip_blocks: gpu.ip_blocks.clone(),
-    })
+    crate::amdgpu::with_controller(Snapshot::from_gpu)
+}
+
+impl Snapshot {
+    pub(crate) fn from_gpu(gpu: &crate::amdgpu::AmdGpu) -> Self {
+        Self {
+            did: gpu.chip.did as u32,
+            family: gpu.chip.family,
+            vram_size: gpu.vram.size,
+            visible_vram_size: gpu.vram.visible_size,
+            is_apu: gpu.is_apu(),
+            gc: gpu.gc_info,
+            ip_blocks: gpu.ip_blocks.clone(),
+        }
+    }
 }
 
 /// A `#[repr(C)]` reply struct as the bytes the ioctl copies out.
@@ -146,13 +159,13 @@ fn heap_info(total: u64) -> uapi::DrmAmdgpuHeapInfo {
 /// with a plausible number, because Mesa makes code-generation decisions from
 /// several of them and a wrong value is worse than an absent one.
 fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
-    let family = family_id(snap.family).ok_or(FsError::InvalidData)?;
+    let family = family_id(snap).ok_or(FsError::InvalidData)?;
     // The shader geometry is not guessable. Refusing is better than reporting
     // a topology that would mis-compile shaders.
     let gc = snap.gc.ok_or(FsError::InvalidData)?;
-    // Every GMC 11 part has the same VM layout; it comes out of
-    // `gmc_v11_0_sw_init`'s `amdgpu_vm_adjust_size` arguments, not out of
-    // anything the VM manager has to have initialised first.
+    // Navi 22's gmc_v10_0_sw_init and gmc_v11_0_sw_init use the same
+    // amdgpu_vm_adjust_size(256 * 1024, 9, 3, 48) geometry. Reusing these
+    // address limits does not enable the GMC11 hardware programming path.
     let va = crate::amdgpu_vm::Geometry::GMC11.va_info();
 
     let info = uapi::DrmAmdgpuInfoDevice {
@@ -162,7 +175,7 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
         num_shader_arrays_per_engine: gc.num_sa_per_se,
         cu_active_number: gc.total_cus(),
         num_rb_pipes: gc.num_rb_per_se.saturating_mul(gc.num_se),
-        num_hw_gfx_contexts: GFX11_HW_CONTEXTS,
+        num_hw_gfx_contexts: GFX_HW_CONTEXTS,
         // FUSION means the GPU shares the CPU's memory — an APU. It used to
         // be claimed unconditionally, on the premise that "every part this
         // driver supports is an APU". A discrete card is not, and userspace
