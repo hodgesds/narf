@@ -123,7 +123,8 @@ remain follow-up work. The PSP11 ring and SMC loader below are explicit APIs.
 PSP 11.0.11 GPCOM ring under the exclusive ownership, trained-VRAM and permanent
 mapping requirements of the bootstrap. A bootstrap owner must reach `Ready`
 and be dropped before claiming the ring; failed/cancelled bootstrap requires
-independent reset/recovery. PCI ID `1002:73df`, GC 10.3.2 and MP1 11.0.11 are required;
+independent reset/recovery. PCI ID `1002:73df`, GC 10.3.2, MP1 11.0.11 and
+SDMA0 5.2.2 are required;
 register banks are pinned to MP0 index 0, NBIO 2.3/3.3 index 2 and HDP 5.0
 index 0. NBIO remaps the HDP flush hole at BAR5 `0x7f000`; HDP read-cache
 invalidation precedes fence/reply reads. The remap must verify before any ring
@@ -190,6 +191,50 @@ timeout, revocation and interface mismatch fail closed. State moves from
 `Prepared` to `Querying` to `Ready` or `Failed`; cancellation retains `Querying`
 and prohibits replay. The API does not program clocks, voltages, fans or
 PowerPlay tables, enable DPM/graphics or set `AmdGpu::fw_loaded`.
+
+### Navi 22 graphics firmware and PSP autoload
+
+`amdgpu_gfx_navi22::Firmware::open(gpu, registry_cap)` prepares the complete
+`navy_flounder_{sdma,ce,pfp,me,mec,mec2,rlc}.bin` set through live registry/blob
+capabilities before any device I/O. Device gating requires PCI `1002:73df`,
+GC 10.3.2, MP1 11.0.11 and SDMA0 5.2.2, with unique instance-zero records.
+Only MEC2 may be absent, and only a registry `NotFound` result is optional;
+signature, parsing, allocation and authority failures propagate. Immutable
+copies outlive the capability invocations. `images()` returns validated views
+in upload order.
+
+`amdgpu_gfx_firmware::Image::parse(Source, bytes)` supports CP header v1.0 /
+IP 10.3, SDMA v1.0 / IP 5.2, and RLC v2.2–v2.4 / IP 10.3. Each container is
+bounded to 4 MiB and each referenced range to 2 MiB. Declared file/header sizes,
+aligned ranges, descriptor bounds and RLC section overlap are checked. This
+path rejects incorrect declared sizes rather than using Linux's RLC size
+workaround. `source()`, `version()` and `payloads()` expose the selected image;
+each payload provides immutable `bytes()` and its PSP `firmware_type()`.
+Parsing alone neither authenticates a blob nor permits hardware loading.
+
+SDMA/CE/PFP/ME use the full common-header microcode range. MEC/MEC2 use only
+the prefix before the trailing jump table: the table must be nonempty and end
+exactly at the microcode boundary. Separate MEC jump-table uploads and repeated
+SDMA instance uploads are omitted for PSP11 autoload. RLC arrays use file-relative
+byte offsets. Upload order is tap-delay sections (v2.4), restore control/GPM/SRM,
+IRAM/DRAM, P/V (v2.3), then RLC_G. Empty optional sections are omitted; register
+list metadata is validated but never submitted as firmware. Nonempty P/V fields
+in v2.4 are rejected because Linux does not load them in that revision.
+
+`Psp::load_gfx_navi22(&Firmware).await` requires an acknowledged TMR and successful
+SMC upload. It validates the whole set/order before loading any member, sends
+bounded/fenced `LOAD_IP_FW` commands through owned VRAM staging, then submits
+`AUTOLOAD_RLC` (`0x21`) only after every graphics payload succeeds. The public
+`gfx_load_state()` transitions `Absent → Loading → Accepted | Failed`;
+cancellation retains `Loading`. Success, error and cancellation all prevent
+replay in that session. Exact fence completion releases staging; incomplete
+commands quarantine staging/ring/TMR, and teardown still requires independent
+reset of every firmware consumer before TMR destruction.
+
+`Accepted` means PSP acknowledged autoload. It does not prove GC/SDMA readiness,
+configure memory hubs, queues or board power, install video/display firmware,
+or set `AmdGpu::fw_loaded`. The API remains explicit: platform boot integration,
+RLC runtime readiness and real-card validation are separate work.
 
 ### AMD platform VBIOS
 

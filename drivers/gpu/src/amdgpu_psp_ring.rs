@@ -322,6 +322,14 @@ enum SmcState {
     Loaded,
     Failed,
 }
+/// PSP acknowledgement of the graphics set, not proof of running engines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GfxLoadState {
+    Absent,
+    Loading,
+    Accepted,
+    Failed,
+}
 #[derive(Debug)]
 struct Session<I: Io> {
     engine: Engine<I>,
@@ -330,6 +338,7 @@ struct Session<I: Io> {
     tmr: Option<Reservation>,
     tmr_ready: bool,
     smc_state: SmcState,
+    gfx_state: GfxLoadState,
     fb_base: u64,
     fb_offset: u64,
 }
@@ -371,6 +380,7 @@ impl Layout {
                 let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS)?;
                 // Navi22's cold-boot SMC path requires this exact MP1 mailbox.
                 bank(gpu, discovery::HW_ID_MP1, &[(11, 0, 11)], 0, 0x29a)?;
+                bank(gpu, discovery::HW_ID_SDMA0, &[(5, 2, 2)], 0, 0)?;
                 // Linux nv.c uses nbio_v2_3 for these revisions; MEMSIZE and
                 // REMAP_HDP_MEM_FLUSH_CNTL are at index 2, 0xc3 and 0x12d.
                 let nbio = bank(
@@ -591,6 +601,7 @@ impl Psp {
                 tmr: None,
                 tmr_ready: false,
                 smc_state: SmcState::Absent,
+                gfx_state: GfxLoadState::Absent,
                 fb_base,
                 fb_offset,
             },
@@ -645,6 +656,23 @@ impl Psp {
         }
         let image = firmware.image().map_err(|_| Error::Invalid)?;
         self.session.load_smc(image.payload()).await
+    }
+    /// Load the complete Navi22 SDMA/CP/RLC set once, after SMC. Successful
+    /// return acknowledges AUTOLOAD_RLC; GC/SDMA readiness, reset/golden-register
+    /// programming and queue setup remain separate hardware bring-up steps.
+    pub async fn load_gfx_navi22(
+        &mut self,
+        firmware: &crate::amdgpu_gfx_navi22::Firmware,
+    ) -> Result<(), Error> {
+        if self.kind != Kind::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        let images = firmware.images().map_err(|_| Error::Invalid)?;
+        self.session.load_gfx(&images).await
+    }
+    /// Graphics upload state; remains Absent for Phoenix sessions.
+    pub fn gfx_load_state(&self) -> GfxLoadState {
+        self.session.gfx_state
     }
     /// # Safety
     /// Every engine using the TMR must have verified reset. Ring destruction
@@ -774,6 +802,48 @@ impl<I: Io> Session<I> {
         };
         result
     }
+    async fn load_gfx(
+        &mut self,
+        images: &[Option<crate::amdgpu_gfx_firmware::Image<'_>>; 7],
+    ) -> Result<(), Error> {
+        use crate::amdgpu_gfx_firmware::Source;
+        if self.gfx_state != GfxLoadState::Absent
+            || self.smc_state != SmcState::Loaded
+            || !self.tmr_ready
+            || self.engine.state != State::Ready
+            || self.payload.is_some()
+        {
+            return Err(Error::Busy);
+        }
+        // Validate completeness/order before publishing any part of the set.
+        for (image, source) in images.iter().zip(Source::ORDER) {
+            match image {
+                Some(image) if image.source() == source => {}
+                None if source == Source::Mec2 => {}
+                _ => return Err(Error::Invalid),
+            }
+        }
+        self.gfx_state = GfxLoadState::Loading;
+        let result = self.load_gfx_inner(images).await;
+        self.gfx_state = if result.is_ok() {
+            GfxLoadState::Accepted
+        } else {
+            GfxLoadState::Failed
+        };
+        result
+    }
+    async fn load_gfx_inner(
+        &mut self,
+        images: &[Option<crate::amdgpu_gfx_firmware::Image<'_>>; 7],
+    ) -> Result<(), Error> {
+        for image in images.iter().flatten() {
+            for payload in image.payloads() {
+                self.load_ip(payload.bytes(), payload.firmware_type())
+                    .await?;
+            }
+        }
+        self.engine.submit(&command(0x21, &[])).await.map(|_| ())
+    }
     /// # Safety
     /// Every engine using this TMR (including DMUB) must have verified reset.
     /// Ring destruction alone does not stop instruction fetches from the TMR.
@@ -799,6 +869,7 @@ impl<I: Io> Session<I> {
             }
         }
         self.smc_state = SmcState::Absent;
+        self.gfx_state = GfxLoadState::Absent;
         Ok(())
     }
 }

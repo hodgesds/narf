@@ -259,9 +259,13 @@ reservations through cancellation or failed teardown. A bounded SMC v2.0 parser
 now separates microcode from PowerPlay metadata; the ring can load that SMC
 once after TMR setup. An explicit SMU11 cold-start handshake checks Navi22's
 interface and running firmware version using its discrete-GPU mailbox layout.
+The graphics firmware path now prepares the complete SDMA/CP/RLC set, separates
+MEC jump tables and RLC subimages, and submits PSP autoload only after all
+required payloads complete. Partial load failures/cancellation prevent replay
+and preserve device-owned VRAM. PSP acknowledgement is not GC/SDMA readiness.
 These are software-tested foundations; automatic platform wiring, VRAM training,
-remaining IP firmware loads, board power/clock setup, hardware boot, GMC/GFX10
-initialization and DCN3.0 modesetting remain open. See the
+video/display firmware, board power/clock setup, hardware boot, GMC/GFX10
+initialization, RLC runtime readiness and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix

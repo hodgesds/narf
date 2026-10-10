@@ -154,6 +154,8 @@ pub mod amdgpu_dp_tunnel;
 pub mod amdgpu_dpm;
 pub mod amdgpu_gem;
 pub mod amdgpu_gfx;
+pub mod amdgpu_gfx_firmware;
+pub mod amdgpu_gfx_navi22;
 pub mod amdgpu_gmc;
 pub mod amdgpu_hdmi_audio;
 pub mod amdgpu_hpd;

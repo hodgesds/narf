@@ -7,6 +7,9 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+#[path = "amdgpu_psp_gfx_tests.rs"]
+mod gfx;
+
 fn session() -> (Pool, Session<Fake>) {
     let (_, engine) = fixture();
     // Deliberately unaligned GPU pool start, different from the PCI BAR address
@@ -32,6 +35,7 @@ fn session() -> (Pool, Session<Fake>) {
             tmr: None,
             tmr_ready: false,
             smc_state: SmcState::Absent,
+            gfx_state: GfxLoadState::Absent,
             fb_base: 0x8_0000_0000,
             fb_offset: 0x1_0000_0000,
         },
@@ -444,6 +448,7 @@ fn gpu(regs: &mut [u32]) -> AmdGpu {
             ip(discovery::HW_ID_HDP, (5, 0, 2), 0, 0xb00),
             ip(discovery::HW_ID_GC, (10, 3, 2), 0, 0x2000),
             ip(discovery::HW_ID_MP1, (11, 0, 11), 0, 0x11000),
+            ip(discovery::HW_ID_SDMA0, (5, 2, 2), 0, 0x12000),
         ],
     }
 }
@@ -475,7 +480,7 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
         return TestResult::Fail("Navi22 accepted a Phoenix firmware operation");
     }
     drop(psp);
-    for case in 0..10 {
+    for case in 0..12 {
         let mut bad = self::gpu(&mut regs);
         match case {
             0 => bad.ip_blocks[0].revision = 7,
@@ -487,7 +492,9 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
             6 => bad.regs.len -= 4,
             7 => bad.chip.did = crate::amdgpu::PHOENIX1,
             8 => bad.ip_blocks[4].revision = 7,
-            _ => bad.ip_blocks.push(bad.ip_blocks[4]),
+            9 => bad.ip_blocks.push(bad.ip_blocks[4]),
+            10 => bad.ip_blocks[5].revision = 0,
+            _ => bad.ip_blocks.push(bad.ip_blocks[5]),
         }
         if Layout::resolve(&bad, Kind::Navi22).is_ok() {
             return TestResult::Fail("unaudited IP/register window accepted");

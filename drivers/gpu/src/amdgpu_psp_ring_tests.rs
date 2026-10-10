@@ -12,6 +12,8 @@ struct Fake {
     writes: Vec<(u32, u32)>,
     complete: bool,
     reject: u32,
+    reject_command: Option<u32>,
+    reject_type: Option<u32>,
     destroy: bool,
     dirty: bool,
     violation: bool,
@@ -19,6 +21,7 @@ struct Fake {
     payload: Vec<u8>,
     tmr_size: u32,
     stall_command: Option<u32>,
+    stall_type: Option<u32>,
     fail_hdp: bool,
 }
 impl Io for Fake {
@@ -44,9 +47,19 @@ impl Io for Fake {
             self.submissions
                 .push(self.memory[1024..1280].try_into().unwrap());
             let id = self.memory[1026];
-            if self.complete && self.stall_command != Some(id) {
+            let kind = self.memory[1034];
+            let stalled = self.stall_command == Some(id)
+                && (id != 6 || self.stall_type.is_none_or(|t| t == kind));
+            if self.complete && !stalled {
                 self.memory[(FENCE / 4) as usize] = seq;
-                self.memory[(COMMAND / 4) as usize + 216] = self.reject;
+                self.memory[(COMMAND / 4) as usize + 216] =
+                    if self.reject_command.is_none_or(|c| c == id)
+                        && self.reject_type.is_none_or(|t| id == 6 && t == kind)
+                    {
+                        self.reject
+                    } else {
+                        0
+                    };
                 self.memory[(COMMAND / 4) as usize + 220] = self.tmr_size;
             }
         }
@@ -90,6 +103,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
         writes: Vec::new(),
         complete: true,
         reject: 0,
+        reject_command: None,
+        reject_type: None,
         destroy: true,
         dirty: false,
         violation: false,
@@ -97,6 +112,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         payload: Vec::new(),
         tmr_size: DEFAULT_TMR_SIZE as u32,
         stall_command: None,
+        stall_type: None,
         fail_hdp: false,
     };
     io.regs[CTRL as usize] = RESPONSE;
