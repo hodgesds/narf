@@ -99,11 +99,20 @@ impl CsprngInner {
     /// (Re)seed from a 32-byte entropy buffer.
     ///
     /// On initial seeding:  install key, derive nonce from the last 8 bytes
-    /// of the entropy buffer, and reset the counter.
+    /// of the entropy buffer. The counter starts at 0 (from `uninit`).
     ///
     /// On reseed: XOR the new entropy into the existing key (same discipline
-    /// as Linux's `crng_reseed` — mix, don't replace), re-derive nonce from
-    /// the high 8 bytes, and reset counter.
+    /// as Linux's `crng_reseed` — mix, don't replace) and re-derive nonce from
+    /// the high 8 bytes.
+    ///
+    /// The block counter is **never reset here** — it only advances (via
+    /// `advance_counter`) and wraps at 2^64. Resetting it on reseed would, if
+    /// a reseed's fresh entropy happened to net no change to the key/nonce
+    /// (e.g. a hardware source that momentarily returns zeros), replay the
+    /// exact `(key, nonce, counter)` of a prior block and reproduce its
+    /// keystream — a keystream-reuse flaw. Keeping the counter monotonic means
+    /// post-reseed output can never collide with anything already emitted,
+    /// regardless of entropy quality.
     fn seed(&mut self, entropy: &[u8; 32]) {
         // Mix new entropy into key via XOR.
         for (k, &e) in self.key.iter_mut().zip(entropy.iter()) {
@@ -117,7 +126,6 @@ impl CsprngInner {
         // Bytes 8..12 of nonce stay 0 (the ChaCha20 RFC nonce model uses
         // a 96-bit nonce; we use the lower 64 bits for boot entropy and
         // leave the upper 32 bits as 0 to keep counter-in-state clean).
-        self.counter = 0;
         self.bytes_since_reseed = 0;
         self.block_pos = 64; // invalidate buffer
         self.rebuild_state();
