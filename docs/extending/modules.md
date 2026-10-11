@@ -115,3 +115,16 @@ remain. There is no complete `modprobe`-style dependency/alias manager yet,
 and the current lack of a full SMP text-unmap grace period makes production
 unload experimental. See the design document's live limitations before
 depending on unload in an availability-sensitive system.
+
+Boot-time loading is available for drivers that must register a match before
+the ordinary device probe. Put ABI-stamped images in the initramfs and select
+them from the trusted kernel command line:
+
+```text
+modules_load=lib/modules/e1000.ko modules_domain=driver2
+```
+
+Paths are comma-separated. The optional domain is an operator override applied
+to each listed image; normal signature, ABI, dependency, capability, and
+non-`FRAME` placement checks still run. This is an explicit image list, not a
+dependency or PCI-alias autoloader.

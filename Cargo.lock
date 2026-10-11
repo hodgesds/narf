@@ -2593,6 +2593,7 @@ name = "narf-modules"
 version = "0.0.0"
 dependencies = [
  "narf-arch",
+ "narf-boot",
  "narf-bus",
  "narf-capabilities",
  "narf-console",

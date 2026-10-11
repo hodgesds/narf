@@ -52,6 +52,12 @@ and CI compiler-cache integration.
 - `cargo xtask test --arch=x86_64 --subsystem userspace` — run that subsystem
   and its `/`-delimited children, then perform the normal whole-kernel boot
   smoke. Comma-separated filters select the union of those subtrees.
+- `cargo xtask net-smoke --arch=x86_64` runs live host-to-guest TCP and UDP
+  echoes plus a guest-originated DNS query over virtio-net. `cargo xtask
+  e1000-module-net-smoke --arch=x86_64` runs the identical exchanges over an
+  exclusively module-owned QEMU 82540EM: xtask builds and ABI-stamps
+  `e1000.ko`, stages it in an initramfs, selects `driver2` at boot load, and
+  suppresses the built-in e1000 registration for that fixture.
 - `cargo xtask affected --base REF --head REF --event EVENT` computes CI jobs,
   directly changed packages, reverse-dependent packages, and kernel subsystem
   filters from Cargo metadata and Rust registration tokens. PRs use their head

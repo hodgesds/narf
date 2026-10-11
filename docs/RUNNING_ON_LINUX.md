@@ -267,13 +267,16 @@ dispatch + `CR4.OSFXSR`.
 
 ```sh
 cargo xtask net-smoke   --arch=x86_64   # TCP + UDP + guest DNS through SLIRP
+cargo xtask e1000-module-net-smoke --arch=x86_64 # same over module-owned e1000
 cargo xtask redis-smoke --arch=x86_64   # unmodified redis-server, host SET/GET
 ```
 
-Both force `boot-init` + `firmware-allow-unsigned` + `qemu-net` on.
+All force `boot-init` + `firmware-allow-unsigned` + `qemu-net` on.
 `net-smoke` verifies host-to-guest TCP and UDP plus a guest DNS lookup through
-the SLIRP resolver; `redis-smoke` opens a real host TCP socket and performs a
-SET/GET round-trip. See §6 for how the forwarding works.
+the SLIRP resolver. `e1000-module-net-smoke` runs the identical protocol checks
+after building, ABI-stamping, and pre-probe loading `e1000.ko` into `driver2`
+with the built-in e1000 claimant disabled. `redis-smoke` opens a real host TCP
+socket and performs a SET/GET round-trip. See §6 for how the forwarding works.
 
 ---
 
@@ -408,6 +411,10 @@ QEMU `hostfwd`.
 - **`net-smoke`** sets `XTASK_QEMU_HOSTFWD=tcp:127.0.0.1:17777-:7777`,
   boots the auto-spawned `netserve` echo server on guest `:7777`, and
   round-trips a line from host `127.0.0.1:17777`.
+- **`e1000-module-net-smoke`** uses the legacy QEMU netdev's equivalent
+  forwarding, stages `e1000.ko` in an initramfs, autoloads it before PCI
+  probing with `modules_domain=driver2`, and requires its exclusive 82540EM
+  datapath to pass the same TCP, UDP, and DNS checks.
 - **`redis-smoke`** forwards host `16379` → guest `6379`, waits for the
   unmodified `redis-server` to print `Ready to accept connections`, then
   does RESP `SET`/`GET` from the host.

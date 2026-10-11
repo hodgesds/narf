@@ -45,6 +45,7 @@ x86_64-only:
 cargo xtask run-interactive --arch=x86_64 \
   --cmd "echo hello world" --expect "hello world"
 cargo xtask net-smoke --arch=x86_64
+cargo xtask e1000-module-net-smoke --arch=x86_64
 ```
 
 For a faster focused cycle, kernel test names are prefix-filtered:
@@ -134,6 +135,14 @@ cargo xtask build-module --package narf-drivers-net-e1000 \
 built-in path uses `DomainId::DRIVER_0`; its `.ko` manifest defaults to
 `target_domain=net`, which an authorized loader may override with, for
 example, `domain=driver3`.
+
+For a driver that must own hardware during the ordinary boot probe, stage the
+ABI-stamped image in the initramfs and boot with, for example,
+`modules_load=lib/modules/e1000.ko modules_domain=driver2`. Autoload runs after
+KABI/trust initialization and before `Stage::Device`; the e1000 facade's
+`e1000-module-only` profile suppresses its built-in PCI registration for this
+fixture. `cargo xtask e1000-module-net-smoke --arch=x86_64` is the executable
+reference for that complete path.
 
 The module manifest declares identity, ABI hash, dependencies, required
 capabilities, and the default target domain. Build-time `.narf_kparams` entries

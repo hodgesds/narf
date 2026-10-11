@@ -58,12 +58,18 @@ See:
     `R_AARCH64_CALL26` (veneered) on aarch64.
 
 Boot integration: `frame/src/bare_main.rs` calls
-`narf_modules::register_initcalls()`, which contributes two initcalls:
+`narf_modules::register_initcalls()`, which contributes three initcalls:
 
   * `modules-abi` at `Stage::Subsys` — registers the driver-domain name
     aliases, registers the kernel ABI surface with KSYMTAB, derives and
     publishes the kernel ABI hash from that surface, and installs the
     fail-closed Ed25519 verifier and build-time trust roots.
+  * `modules-initramfs-autoload` immediately after `modules-abi` — when the
+    bootloader-supplied command line contains `modules_load=`, loads those
+    comma-separated initramfs paths before `Stage::Device` probes hardware.
+    `modules_domain=<name>` applies the operator's placement override to every
+    listed module. Signature, ABI, capability, and non-`FRAME` checks are the
+    same as for `init_module(2)`; without `modules_load=` this is a no-op.
   * `modules-sysfs` at `Stage::Fs` — installs `/proc/modules` and
     `/sys/kernel/abi_hash`.
 

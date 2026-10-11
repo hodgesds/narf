@@ -371,6 +371,21 @@ Or from userspace via the system call (post-syscall-wiring):
 modprobe rtl9999 domain=driver3
 ```
 
+Drivers that must register their hardware match before the boot-time device
+probe can be staged in the initramfs and selected on the bootloader-supplied
+kernel command line:
+
+```text
+modules_load=lib/modules/rtl9999.ko modules_domain=driver3
+```
+
+`modules_load=` accepts comma-separated archive paths. Autoload runs after the
+kernel ABI and trust roots exist but before `Stage::Device`. The optional
+`modules_domain=` value is the administrator's placement decision and
+overrides each image's `target_domain=` author hint. Runtime-loaded text can
+never be placed in `FRAME`; normal signature, ABI-hash, and required-capability
+checks still apply.
+
 To unload:
 
 ```rust

@@ -44,6 +44,15 @@ bring-up and passes carrier, negotiated Mbps, and duplex to the central net
 registry; sysfs and rtnetlink do not infer those values from the fact that an
 administrator opened the interface.
 
+The e1000 crate supports two mutually exclusive ownership profiles from the
+same source. The default `e1000` facade feature registers the built-in probe at
+`Stage::Subsys`; `e1000-module-only` keeps the implementation linked for shared
+types/tests but suppresses that registration so an initramfs-loaded `e1000.ko`
+can be the device's sole owner. The developer/CI-only `qemu-static-ipv4`
+feature assigns the first registered NIC QEMU SLIRP's `10.0.2.15/24` lease and
+`10.0.2.2` gateway at `Stage::Late`; production networking leaves address
+selection to userspace.
+
 ### 3.1 i40e runtime profile
 
 Each X710/XL710/XXV710/X722 PF negotiates 1–8 64-entry TX/RX pairs.

@@ -57,10 +57,14 @@ For a live network check, use:
 
 ```sh
 cargo xtask net-smoke --arch=x86_64
+cargo xtask e1000-module-net-smoke --arch=x86_64
 ```
 
-It verifies host-to-guest TCP, host-to-guest UDP, and a guest DNS query through
-QEMU SLIRP. `redis-smoke` adds an unmodified application TCP check. These
+Both network commands verify host-to-guest TCP, host-to-guest UDP, and a guest
+DNS query through QEMU SLIRP. The second command builds and ABI-stamps
+`e1000.ko`, loads it into `driver2` before PCI probing, suppresses the built-in
+e1000 claimant for that boot, and requires the module-owned NIC to carry all
+three exchanges. `redis-smoke` adds an unmodified application TCP check. These
 commands validate the virtual test topology, not every physical NIC or
 production network configuration. The current network contracts and legacy
 in-kernel IPv4 path are described in
@@ -104,6 +108,18 @@ boundary). Module dependencies listed in `depends=` must already be live:
 there is no kernel dependency autoloader. A userspace `insmod`/`rmmod` client
 may drive these syscalls, but do not assume a complete Linux `modprobe` policy
 and alias database exists.
+
+Boot-critical drivers can instead be named from the initramfs on the
+bootloader-supplied kernel command line:
+
+```text
+modules_load=lib/modules/e1000.ko modules_domain=driver2
+```
+
+The comma-separated `modules_load=` list is processed before PCI device
+probing. `modules_domain=` is the administrator's placement override for those
+images. It does not bypass signatures, ABI matching, declared capability
+checks, or the rule that runtime-loaded text cannot enter `FRAME`.
 
 The manifest's `target_domain=` is the author's default. The authorized caller
 can pass `domain=net`, `block`, `graphics`, `input`, `crypto`, `bpf`,

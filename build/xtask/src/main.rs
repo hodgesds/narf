@@ -124,6 +124,11 @@ enum Cmd {
     /// server, and require the guest to resolve `example.com` through SLIRP's
     /// DNS proxy. Proves bidirectional TCP/UDP and DNS over virtio-net.
     NetSmoke(BuildArgs),
+    /// The same live TCP/UDP/DNS smoke over an exclusively module-driven
+    /// QEMU e1000. Builds and ABI-stamps e1000.ko, stages it in an initramfs,
+    /// loads it into an operator-selected driver frame before PCI probing,
+    /// and leaves the built-in e1000 registration disabled for this boot.
+    E1000ModuleNetSmoke(BuildArgs),
     /// Off-box redis smoke. Boot with `qemu-net` + a QEMU `hostfwd`,
     /// wait for the auto-spawned unmodified `redis-server` to print
     /// `Ready to accept connections`, then open a real host TCP socket to
@@ -1082,9 +1087,13 @@ impl Arch {
                         "-device".into(),
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
+                    let n1 = match std::env::var("XTASK_QEMU_LEGACY_HOSTFWD") {
+                        Ok(fwd) if !fwd.is_empty() => format!("user,id=n1,hostfwd={fwd}"),
+                        _ => "user,id=n1".into(),
+                    };
                     args.extend_from_slice(&[
                         "-netdev".into(),
-                        "user,id=n1".into(),
+                        n1,
                         "-device".into(),
                         "e1000,netdev=n1".into(),
                     ]);
@@ -1305,9 +1314,13 @@ impl Arch {
                         "-device".into(),
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
+                    let n1 = match std::env::var("XTASK_QEMU_LEGACY_HOSTFWD") {
+                        Ok(fwd) if !fwd.is_empty() => format!("user,id=n1,hostfwd={fwd}"),
+                        _ => "user,id=n1".into(),
+                    };
                     args.extend_from_slice(&[
                         "-netdev".into(),
-                        "user,id=n1".into(),
+                        n1,
                         "-device".into(),
                         "e1000,netdev=n1".into(),
                     ]);
@@ -2955,19 +2968,121 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
 /// --features module`) and return its bytes. Used to stage a real driver
 /// module into the guest for the loadable-driver e2e smoke.
 fn build_module_fixture(package: &str, arch: Arch, root: &Path) -> Result<Vec<u8>> {
+    build_module_fixture_with_abi(package, arch, root, None)
+}
+
+fn build_module_fixture_with_abi(
+    package: &str,
+    arch: Arch,
+    root: &Path,
+    kernel_abi: Option<u32>,
+) -> Result<Vec<u8>> {
     let ko_args = BuildModuleArgs {
         arch,
         package: package.into(),
         out: None,
         features: vec!["module".into()],
         no_default_features: true,
-        kernel_abi: None,
+        kernel_abi: kernel_abi.map(|hash| format!("0x{hash:08x}")),
         compress: false,
         signature: None,
         public_key: None,
     };
     let ko = build_module(&ko_args, root)?;
     Ok(std::fs::read(&ko)?)
+}
+
+/// Compute exactly the ABI hash that `modules/src/kabi.rs` publishes.
+///
+/// The signature CRCs are built from `stringify!($type)` inside the kernel's
+/// `kernel_abi!` macro. Reimplementing Rust token stringification in xtask
+/// would be a second, subtly different ABI definition, so this helper extracts
+/// the real macro invocation and feeds it to a tiny host-side macro with the
+/// same matcher and hash expressions. Function bodies remain unexpanded token
+/// trees, which means the helper needs none of the kernel crate graph.
+fn kernel_abi_hash_from_source(root: &Path) -> Result<u32> {
+    let path = root.join("modules").join("src").join("kabi.rs");
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading kernel ABI source {}", path.display()))?;
+    let start = text
+        .find("kernel_abi! {")
+        .ok_or_else(|| anyhow!("{} has no kernel_abi! invocation", path.display()))?;
+    let marker = "\n// ── In-kernel smokes";
+    let end = text[start..]
+        .find(marker)
+        .map(|offset| start + offset)
+        .ok_or_else(|| anyhow!("{} has no end marker after kernel_abi!", path.display()))?;
+
+    let mut helper = String::from(
+        r#"
+macro_rules! kernel_abi {
+    ($(
+        $(#[$meta:meta])*
+        $(requires $required_cap:expr;)?
+        fn $name:ident ( $($arg:ident : $aty:ty),* $(,)? ) $(-> $ret:ty)? $body:block
+    )*) => {
+        fn fnv(bytes: &[u8]) -> u32 {
+            let mut hash = 0x811c_9dc5u32;
+            for byte in bytes {
+                hash ^= *byte as u32;
+                hash = hash.wrapping_mul(0x0100_0193);
+            }
+            hash
+        }
+        fn main() {
+            let mut abi = 0u32;
+            $(
+                let crc = fnv(concat!(
+                    stringify!($name),
+                    "(",
+                    $(stringify!($aty), ",",)*
+                    ")",
+                    $("->", stringify!($ret),)?
+                ).as_bytes());
+                let mut bytes = Vec::from(stringify!($name).as_bytes());
+                bytes.extend_from_slice(&crc.to_le_bytes());
+                abi = abi.wrapping_add(fnv(&bytes));
+            )*
+            println!("{abi:08x}");
+        }
+    };
+}
+"#,
+    );
+    helper.push_str(&text[start..end]);
+
+    let scratch = root.join("target").join("xtask-kabi-hash");
+    std::fs::create_dir_all(&scratch).with_context(|| format!("creating {}", scratch.display()))?;
+    let suffix = std::process::id();
+    let source = scratch.join(format!("kabi-hash-{suffix}.rs"));
+    let binary = scratch.join(format!("kabi-hash-{suffix}"));
+    std::fs::write(&source, helper).with_context(|| format!("writing {}", source.display()))?;
+
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let compiled = Command::new(&rustc)
+        .arg("--edition=2024")
+        .arg("--crate-name")
+        .arg("narf_kabi_hash")
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .with_context(|| format!("running {rustc} for the kernel ABI helper"))?;
+    if !compiled.status.success() {
+        bail!(
+            "kernel ABI helper did not compile:\n{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+    }
+    let output = Command::new(&binary)
+        .output()
+        .with_context(|| format!("running {}", binary.display()))?;
+    if !output.status.success() {
+        bail!("kernel ABI helper exited with {}", output.status);
+    }
+    let raw = String::from_utf8(output.stdout)?.trim().to_string();
+    u32::from_str_radix(&raw, 16)
+        .with_context(|| format!("kernel ABI helper returned invalid hash `{raw}`"))
 }
 
 /// The kernel-ABI export names a `.ko` is allowed to leave undefined, read
@@ -5400,18 +5515,36 @@ fn run_interactive_boot(
     Ok(transcript)
 }
 
-/// Live network-stack smoke — see [`Cmd::NetSmoke`]. Boots with the
-/// `qemu-net` static config + QEMU TCP/UDP `hostfwd` rules, drives genuine
-/// host-to-guest TCP and UDP echo round-trips, and requires a guest-originated
-/// DNS query/reply through the SLIRP resolver.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum NetSmokeNic {
+    Virtio,
+    E1000Module,
+}
+
+/// Live network-stack smoke — see [`Cmd::NetSmoke`] and
+/// [`Cmd::E1000ModuleNetSmoke`]. Both variants drive the same host-to-guest
+/// TCP/UDP echo and guest-to-SLIRP DNS checks; only the NIC ownership and QEMU
+/// backend differ.
 fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    net_smoke_cmd_with_nic(args, NetSmokeNic::Virtio)
+}
+
+fn e1000_module_net_smoke_cmd(args: &BuildArgs) -> Result<()> {
+    net_smoke_cmd_with_nic(args, NetSmokeNic::E1000Module)
+}
+
+fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     use std::io::{Read, Write};
     use std::net::{TcpStream, UdpSocket};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    let smoke_name = match nic {
+        NetSmokeNic::Virtio => "net-smoke",
+        NetSmokeNic::E1000Module => "e1000-module-net-smoke",
+    };
     if !matches!(args.arch, Arch::X86_64) {
-        bail!("xtask net-smoke: only x86_64 is wired (boot-init is x86_64-only)");
+        bail!("xtask {smoke_name}: only x86_64 is wired (boot-init is x86_64-only)");
     }
 
     let tcp_host_port: u16 = 17777;
@@ -5425,6 +5558,27 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     ensure_feature(&mut build.features, "qemu-net");
 
     let root = workspace_root()?;
+    if nic == NetSmokeNic::E1000Module {
+        build.hw_profile = HwProfile::LegacyOnly;
+        ensure_feature(&mut build.features, "module-allow-unsigned");
+        ensure_feature(&mut build.features, "narf-drivers-net/e1000-module-only");
+        ensure_feature(&mut build.features, "narf-drivers-net/qemu-static-ipv4");
+
+        let abi = kernel_abi_hash_from_source(&root)?;
+        let module =
+            build_module_fixture_with_abi("narf-drivers-net-e1000", build.arch, &root, Some(abi))?;
+        let cpio = encode_cpio_newc(&[("lib/modules/e1000.ko", module.as_slice())]);
+        let initrd = root
+            .join("target")
+            .join("e1000-module-net-smoke-initramfs.cpio");
+        std::fs::write(&initrd, cpio).with_context(|| format!("writing {}", initrd.display()))?;
+        *TEST_INITRD
+            .lock()
+            .map_err(|_| anyhow!("e1000 module smoke initramfs state is poisoned"))? = Some(initrd);
+        println!(
+            "xtask e1000-module-net-smoke: staged ABI 0x{abi:08x} e1000.ko for pre-probe autoload"
+        );
+    }
     let out_dir = cargo_build(&build, &root)?;
     let kernel = out_dir.join(&build.package);
     if !kernel.exists() {
@@ -5437,13 +5591,14 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     // Set in THIS process's env: `qemu_args` (called below, in-process)
     // reads it to splice `hostfwd` into the user-mode netdev. Setting it
     // on the child Command would be too late — the arg list is built here.
-    std::env::set_var(
-        "XTASK_QEMU_HOSTFWD",
-        format!(
-            "tcp:127.0.0.1:{tcp_host_port}-:{tcp_guest_port},\
-             hostfwd=udp:127.0.0.1:{udp_host_port}-:{udp_guest_port}"
-        ),
+    let forwards = format!(
+        "tcp:127.0.0.1:{tcp_host_port}-:{tcp_guest_port},\
+         hostfwd=udp:127.0.0.1:{udp_host_port}-:{udp_guest_port}"
     );
+    match nic {
+        NetSmokeNic::Virtio => std::env::set_var("XTASK_QEMU_HOSTFWD", forwards),
+        NetSmokeNic::E1000Module => std::env::set_var("XTASK_QEMU_LEGACY_HOSTFWD", forwards),
+    }
     // Suppress the redis-server auto-spawn: net-smoke only exercises
     // netserve, and redis's heavy multi-threaded startup starves
     // netserve's RX forwarder on a single (CI) vcpu under TCG, dragging
@@ -5452,10 +5607,16 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     // Preserve any caller-provided kernel cmdline.
     {
         let existing = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+        let extra = match nic {
+            NetSmokeNic::Virtio => "no_redis",
+            NetSmokeNic::E1000Module => {
+                "no_redis modules_load=lib/modules/e1000.ko modules_domain=driver2"
+            }
+        };
         let combined = if existing.is_empty() {
-            "no_redis".to_string()
+            extra.to_string()
         } else {
-            format!("{existing} no_redis")
+            format!("{existing} {extra}")
         };
         std::env::set_var("XTASK_QEMU_APPEND", combined);
     }
@@ -5472,7 +5633,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     cmd.stderr(Stdio::piped());
 
     println!(
-        "xtask net-smoke: launching {} {} (TCP 127.0.0.1:{tcp_host_port} -> guest :{tcp_guest_port}; UDP 127.0.0.1:{udp_host_port} -> guest :{udp_guest_port})",
+        "xtask {smoke_name}: launching {} {} (TCP 127.0.0.1:{tcp_host_port} -> guest :{tcp_guest_port}; UDP 127.0.0.1:{udp_host_port} -> guest :{udp_guest_port})",
         qemu,
         kernel.display()
     );
@@ -5582,6 +5743,47 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         false
     };
 
+    if nic == NetSmokeNic::E1000Module
+        && !wait_for(
+            b"e1000(.ko): DMA rings + copy-mode netif live in selected frame",
+            timeout_secs,
+        )
+    {
+        let panic = panic_flag.lock().ok().and_then(|g| g.clone());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = reader.join();
+        if let Some(p) = panic {
+            bail!("xtask {smoke_name}: kernel panic before module probe — '{p}'");
+        }
+        bail!(
+            "xtask {smoke_name}: e1000.ko did not reach its live datapath within {timeout_secs}s"
+        );
+    }
+    if nic == NetSmokeNic::E1000Module {
+        let transcript = captured
+            .lock()
+            .map_err(|_| anyhow!("xtask {smoke_name}: serial transcript state is poisoned"))?;
+        let placed_in_driver2 = transcript
+            .windows(b"modules: autoloaded e1000 from lib/modules/e1000.ko in DomainId(11)".len())
+            .any(|window| {
+                window == b"modules: autoloaded e1000 from lib/modules/e1000.ko in DomainId(11)"
+            });
+        let builtin_registered = transcript
+            .windows(b"init: subsys / e1000 ...".len())
+            .any(|window| window == b"init: subsys / e1000 ...");
+        drop(transcript);
+        if !placed_in_driver2 || builtin_registered {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            if !placed_in_driver2 {
+                bail!("xtask {smoke_name}: autoload did not confirm placement in driver2");
+            }
+            bail!("xtask {smoke_name}: built-in e1000 registration was not suppressed");
+        }
+    }
+
     // 1. Wait for the auto-spawned server to announce it is listening.
     if !wait_for(b"netserve: listening", timeout_secs) {
         let panic = panic_flag.lock().ok().and_then(|g| g.clone());
@@ -5589,14 +5791,14 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         let _ = child.wait();
         let _ = reader.join();
         if let Some(p) = panic {
-            bail!("xtask net-smoke: kernel panic before listen — '{p}'");
+            bail!("xtask {smoke_name}: kernel panic before listen — '{p}'");
         }
         bail!(
-            "xtask net-smoke: guest server did not print `netserve: listening` within {timeout_secs}s"
+            "xtask {smoke_name}: guest server did not print `netserve: listening` within {timeout_secs}s"
         );
     }
     println!(
-        "\nxtask net-smoke: guest TCP is listening; connecting from host to 127.0.0.1:{tcp_host_port}..."
+        "\nxtask {smoke_name}: guest TCP is listening; connecting from host to 127.0.0.1:{tcp_host_port}..."
     );
 
     // 2. Connect from the host, retrying — SLIRP forwarding + the guest
@@ -5617,7 +5819,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("xtask net-smoke: could not connect to 127.0.0.1:{tcp_host_port} within 20s");
+            bail!("xtask {smoke_name}: could not connect to 127.0.0.1:{tcp_host_port} within 20s");
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
@@ -5627,7 +5829,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     if stream.write_all(payload).is_err() {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask net-smoke: host write failed");
+        bail!("xtask {smoke_name}: host write failed");
     }
     let _ = stream.flush();
     let mut got = Vec::new();
@@ -5648,13 +5850,13 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
         bail!(
-            "xtask net-smoke: echo mismatch — sent {:?}, got {:?}",
+            "xtask {smoke_name}: echo mismatch — sent {:?}, got {:?}",
             String::from_utf8_lossy(payload),
             String::from_utf8_lossy(&got)
         );
     }
     println!(
-        "xtask net-smoke: host received the echo ({:?})",
+        "xtask {smoke_name}: host received the echo ({:?})",
         String::from_utf8_lossy(&got)
     );
 
@@ -5662,12 +5864,12 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     if !wait_for(b"netserve-tcp-ok", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask net-smoke: guest did not confirm the TCP round-trip");
+        bail!("xtask {smoke_name}: guest did not confirm the TCP round-trip");
     }
     if !wait_for(b"netserve: udp listening", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask net-smoke: guest UDP server did not become ready");
+        bail!("xtask {smoke_name}: guest UDP server did not become ready");
     }
 
     // 5. Round-trip a datagram through QEMU's independent UDP forwarding
@@ -5677,19 +5879,19 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("xtask net-smoke: could not bind the host UDP socket: {e}");
+            bail!("xtask {smoke_name}: could not bind the host UDP socket: {e}");
         }
     };
     if let Err(e) = udp.set_read_timeout(Some(Duration::from_secs(20))) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask net-smoke: could not set the host UDP timeout: {e}");
+        bail!("xtask {smoke_name}: could not set the host UDP timeout: {e}");
     }
     let udp_payload = b"hello-narf-udp\n";
     if let Err(e) = udp.send_to(udp_payload, ("127.0.0.1", udp_host_port)) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask net-smoke: host UDP send failed: {e}");
+        bail!("xtask {smoke_name}: host UDP send failed: {e}");
     }
     let mut udp_buf = [0u8; 256];
     let (udp_len, _) = match udp.recv_from(&mut udp_buf) {
@@ -5697,46 +5899,50 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("xtask net-smoke: host UDP receive failed: {e}");
+            bail!("xtask {smoke_name}: host UDP receive failed: {e}");
         }
     };
     if &udp_buf[..udp_len] != udp_payload {
         let _ = child.kill();
         let _ = child.wait();
         bail!(
-            "xtask net-smoke: UDP echo mismatch — sent {:?}, got {:?}",
+            "xtask {smoke_name}: UDP echo mismatch — sent {:?}, got {:?}",
             String::from_utf8_lossy(udp_payload),
             String::from_utf8_lossy(&udp_buf[..udp_len])
         );
     }
     println!(
-        "xtask net-smoke: host received the UDP echo ({:?})",
+        "xtask {smoke_name}: host received the UDP echo ({:?})",
         String::from_utf8_lossy(&udp_buf[..udp_len])
     );
     if !wait_for(b"netserve-udp-ok", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask net-smoke: guest did not confirm the UDP round-trip");
+        bail!("xtask {smoke_name}: guest did not confirm the UDP round-trip");
     }
 
     // 6. The guest now issues a real DNS query to SLIRP's 10.0.2.3 proxy.
     if !wait_for(b"netserve-dns-ok", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask net-smoke: guest DNS query did not return a valid answer");
+        bail!("xtask {smoke_name}: guest DNS query did not return a valid answer");
     }
 
     // 7. Require the aggregate guest verdict as well as each path token.
     if !wait_for(b"netserve-ok", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("xtask net-smoke: guest did not print `netserve-ok` within {timeout_secs}s");
+        bail!("xtask {smoke_name}: guest did not print `netserve-ok` within {timeout_secs}s");
     }
 
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
-    println!("xtask net-smoke: ok — live TCP, UDP, and DNS passed over virtio-net");
+    let transport = match nic {
+        NetSmokeNic::Virtio => "virtio-net",
+        NetSmokeNic::E1000Module => "module-owned e1000",
+    };
+    println!("xtask {smoke_name}: ok — live TCP, UDP, and DNS passed over {transport}");
     Ok(())
 }
 
@@ -10985,6 +11191,7 @@ fn main() -> Result<()> {
         Cmd::SystemdPid1(args) => systemd_pid1_cmd(&args),
         Cmd::RunInteractive(args) => run_interactive_cmd(&args),
         Cmd::NetSmoke(args) => net_smoke_cmd(&args),
+        Cmd::E1000ModuleNetSmoke(args) => e1000_module_net_smoke_cmd(&args),
         Cmd::RedisSmoke(args) => redis_smoke_cmd(&args),
         Cmd::RedisBench(args) => redis_bench_cmd(&args),
         Cmd::StressBench(args) => stress_bench_cmd(&args),

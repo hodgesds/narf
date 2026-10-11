@@ -264,10 +264,13 @@ tearing it down per module would invalidate other users of the same BAR.
    completion. Because the normal kernel-test boot already owns the same NIC
    with the built-in driver, the RX half injects a device-shaped completion
    into the module-owned coherent ring and proves copy-out, gated stack
-   ingress, callback scheduling, and descriptor rearm deterministically. A
-   module-only boot remains the correct fixture for an exclusive on-wire RX
-   round trip. e1000 stays built-in by default; the `.ko` path is the reference
-   ABI proof.
+   ingress, callback scheduling, and descriptor rearm deterministically.
+   `cargo xtask e1000-module-net-smoke --arch=x86_64` supplies the exclusive
+   proof: it suppresses the built-in claimant, ABI-stamps and initramfs-loads
+   `e1000.ko` before PCI probing with `modules_domain=driver2`, then carries
+   live host-forwarded TCP and UDP exchanges plus a guest DNS query over the
+   module-owned 82540EM. e1000 stays built-in by default; the `.ko` path is the
+   reference ABI proof.
 
 Each stage is independently reviewable and testable; we stop/reassess after any.
 

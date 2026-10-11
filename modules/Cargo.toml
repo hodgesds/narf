@@ -17,6 +17,7 @@ narf-arch         = { path = "../arch" }
 narf-scheduler    = { path = "../scheduler" }
 narf-memory       = { path = "../memory" }
 narf-console      = { path = "../console" }
+narf-boot         = { path = "../boot" }
 narf-init         = { path = "../init" }
 narf-time         = { path = "../time" }
 narf-capabilities = { path = "../capabilities" }

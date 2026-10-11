@@ -21,6 +21,11 @@ Network device drivers. Exports frames via the `HwNic` trait and the
 | `iwlwifi` | Intel Wi-Fi 6 / 6E (AX200 / AX201 / AX210 / AX211) | structural probe only — operational register map (CSR/PRPH offsets, firmware loader, TFD/RBD descriptors, host-command opcodes) is not in any public Intel doc. [`specification/iwlwifi.md`](./specification/iwlwifi.md) documents the wall. |
 | `qcnfa765` | Qualcomm WCN6855 (NFA765) Wi-Fi 6E | scaffolding only. |
 
+E1000 is the reference dual-build driver. The default facade feature claims
+its PCI ids as a built-in; `e1000-module-only` suppresses that claim so an
+initramfs-loaded `e1000.ko` can own the device exclusively. Run `cargo xtask
+e1000-module-net-smoke --arch=x86_64` for the live TCP/UDP/DNS acceptance path.
+
 ## Conventions
 
 - Each driver lives in `src/<name>.rs` (or `src/<name>/` directory
