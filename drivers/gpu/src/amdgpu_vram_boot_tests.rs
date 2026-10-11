@@ -7,6 +7,103 @@ use narf_memory::PhysAddr;
 const MIB: u64 = 1024 * 1024;
 const GPU_BASE: u64 = 0x2_0000_0000;
 const BAR_BASE: u64 = 0x6000_0000;
+fn navi22_plan(visible: u64, image: &[u8], clients: &[Range<u64>]) -> Result<Plan, Error> {
+    let size = 12 << 30;
+    let mut plan = snapshot_with_fields(
+        mapping(visible),
+        image,
+        None,
+        clients,
+        [
+            (GPU_BASE >> 24) as u32,
+            ((GPU_BASE + size) >> 24) as u32 - 1,
+            0x80,
+        ],
+        |_| 0,
+    )?;
+    plan.reserve_training(image)?;
+    Ok(plan)
+}
+fn navi22_vram_training_reservations_survive_bar_clipping() -> TestResult {
+    let mut image = bios();
+    put32(&mut image, 0x110, 0x400);
+    let size = 12 << 30;
+    for visible in [256 * MIB, size] {
+        let plan = navi22_plan(visible, &image, &[]).unwrap();
+        let t = plan.training().unwrap();
+        if t != (Training {
+            p2c: size - 0x8000,
+            c2p: size - 9 * MIB,
+            size: 4096,
+        }) || plan.vram_size() != size
+            || plan.visible_size() != visible
+        {
+            return TestResult::Fail(
+                "training buffers located relative to BAR rather than physical VRAM",
+            );
+        }
+        let exclusions = plan.protected.clone();
+        // SAFETY: model-only allocator; no hardware memory is accessed.
+        let pool = unsafe { plan.into_pool() }.unwrap();
+        let mut allocations = Vec::new();
+        while let Ok(r) = pool.reserve(MIB) {
+            let start = r.address() - GPU_BASE;
+            if exclusions
+                .iter()
+                .any(|e| start < e.range.end && e.range.start < start + r.size())
+            {
+                return TestResult::Fail("allocator reused firmware/training/client memory");
+            }
+            allocations.push(r);
+        }
+    }
+    if navi22_plan(256 * MIB, &bios(), &[])
+        .unwrap()
+        .training()
+        .is_some()
+    {
+        return TestResult::Fail("training inferred without firmware capability");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vram",
+    navi22_vram_training_reservations_survive_bar_clipping
+);
+
+fn navi22_vram_training_rejects_collisions_and_bounds() -> TestResult {
+    let mut image = bios();
+    put32(&mut image, 0x110, 0x400);
+    let c2p = GPU_BASE + (12 << 30) - 9 * MIB;
+    if navi22_plan(256 * MIB, &image, core::slice::from_ref(&(c2p..c2p + 1))).err()
+        != Some(Error::Invalid)
+    {
+        return TestResult::Fail("training exchange overlaps another client");
+    }
+    // Non-MiB-aligned firmware tails round the C2P address upwards; the 4 KiB
+    // exchange must fit below the tail and above the VGA/scanout prefix.
+    put32(&mut image, 0x154, 8193);
+    let p = navi22_plan(256 * MIB, &image, &[]).unwrap();
+    if p.training().unwrap().c2p != (12 << 30) - 9 * MIB {
+        return TestResult::Fail("training C2P alignment differs from PSP ABI");
+    }
+    put32(&mut image, 0x154, 12 * 1024 * 1024);
+    if navi22_plan(256 * MIB, &image, &[]).err() != Some(Error::Invalid) {
+        return TestResult::Fail("training reservation underflow accepted");
+    }
+    for reg in [0x19e, 0x19f, 0x1a0, 0x1a4] {
+        let mut regs = registers();
+        regs[reg] = ENABLE | 4095;
+        if plan(128 * MIB, &bios(), &regs, &[]).err() != Some(Error::Unsupported) {
+            return TestResult::Fail("unknown live DMUB region omitted from inventory");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vram",
+    navi22_vram_training_rejects_collisions_and_bounds
+);
 fn put16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -329,6 +426,85 @@ fn vram_boot_revalidates_pci_authority_before_mmio() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/vram",
     vram_boot_revalidates_pci_authority_before_mmio
+);
+
+fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
+    use crate::amdgpu::{ChipInfo, Family, VramInfo, NAVI22};
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, HW_ID_GC, MAX_BASE_ADDRS};
+    let mut regs = vec![0; 0x2000];
+    regs[0x16fc] = (GPU_BASE >> 24) as u32;
+    regs[0x16fd] = ((GPU_BASE + (12 << 30)) >> 24) as u32 - 1;
+    regs[0x16e7] = 0x80;
+    regs[0x475] = regs[0x16fc];
+    regs[0x476] = regs[0x16fd];
+    regs[0x477] = regs[0x16e7];
+    let before = regs.clone();
+    let mut gpu = AmdGpu {
+        fb_bar: mapping(256 * MIB),
+        regs: MmioRegion {
+            virt: regs.as_mut_ptr() as u64,
+            len: regs.len() as u64 * 4,
+            ..mapping(0)
+        },
+        chip: ChipInfo {
+            vid: 0x1002,
+            did: NAVI22,
+            family: Family::Navi2,
+            asic: "navi22",
+            fw_name: "",
+            fw_list: &[],
+        },
+        vram: VramInfo {
+            base: BAR_BASE,
+            size: 12 << 30,
+            visible_size: 256 * MIB,
+        },
+        mode: None,
+        fw_loaded: false,
+        gc_info: None,
+        ip_blocks: [(HW_ID_GC, 10, 3, 2), (HW_ID_DCN, 3, 0, 0)]
+            .iter()
+            .map(|&(hw_id, major, minor, revision)| IpBlock {
+                hw_id,
+                instance: 0,
+                major,
+                minor,
+                revision,
+                sub_revision: 0,
+                variant: 0,
+                base_addrs: [0; MAX_BASE_ADDRS],
+                num_bases: 3,
+            })
+            .collect(),
+        vbios: Some(crate::amdgpu_vbios::tests::with_image(bios())),
+    };
+    let cap = Cap::bootstrap();
+    // SAFETY: owned RAM registers; BAR0 is never dereferenced by inventory.
+    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.is_err() || regs != before {
+        return TestResult::Fail("GMC10/DCN30 inventory modified hardware or rejected a valid map");
+    }
+    regs[0x477] += 1;
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
+        return TestResult::Fail("inconsistent GMC/DCN translation accepted");
+    }
+    regs[0x477] -= 1;
+    gpu.vram.size -= 16 * MIB;
+    // SAFETY: same RAM-only read fixture.
+    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {
+        return TestResult::Fail("GMC aperture not checked against physical memory");
+    }
+    cap.revoke();
+    gpu.regs.virt = 0;
+    // SAFETY: revoked authority must reject before dereferencing null MMIO.
+    if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.err() != Some(Error::Revoked) {
+        return TestResult::Fail("Navi22 inventory bypassed capability invocation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/vram",
+    navi22_vram_checks_gmc_dcn_size_and_authority
 );
 
 fn vram_boot_loader_construction_does_not_modify_hardware() -> TestResult {

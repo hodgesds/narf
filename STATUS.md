@@ -267,6 +267,10 @@ follows PSP acknowledgement and retains raw status for failed-boot diagnostics.
 An explicit `ColdBoot` session prepares all required firmware, owns the entire
 SOS → PSP/TMR → SMC/SMU → graphics/RLC sequence, and can transfer its live PSP
 owner after success. Failure/cancellation records the stage and prevents replay.
+Navi22 now has a read-only GMC10/DCN3.0 VRAM plan, including full-aperture
+firmware tails, inherited DMUB windows and the two GDDR6 training exchange
+buffers. It validates the two address translations and clips exclusions only
+when creating the CPU-visible allocator; secondary GPUs need no boot framebuffer.
 These are software-tested foundations; automatic platform wiring, VRAM training,
 video/display firmware, board power/clock setup, hardware boot, GMC/GFX10
 queue initialization, SDMA startup and DCN3.0 modesetting remain open. See the

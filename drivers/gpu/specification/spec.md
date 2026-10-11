@@ -374,6 +374,20 @@ PSP/GART buffers and existing pools, own the unprotected memory, and serialize
 future GPU reconfiguration. An inventory alone is not ownership authority.
 No hardware is modified while gathering reservations or creating the pool.
 
+`unsafe Plan::read_navi22(gpu, pci_cap, boot_framebuffer, other_clients)`
+provides the equivalent inventory for physical 1002:73df / GC10.3.2 / DCN3.0.0.
+It reads GMC10 base/top/offset, verifies that the full aperture matches the
+probe's physical VRAM size and that DCN's address translation agrees, and
+retains the same firmware, boot and DMUB exclusions. An optional boot framebuffer
+permits a secondary/headless GPU; other live surfaces still require explicit
+client ranges. Unhandled enabled DMUB Region0/1/2/7 also reject provisioning.
+FirmwareInfo's two-stage BIST capability additionally reserves a 4 KiB C2P
+exchange at `ALIGN(vram_size - firmware_tail_size - 1 MiB, 1 MiB)` and a 4 KiB
+P2C exchange 32 KiB below physical VRAM end. C2P must not overlap any client or
+firmware reservation. `Plan::training()` reports these VRAM-relative offsets;
+it does not attest completed training or authorize a training command. Exclusions
+remain correct with a small BAR0 or Resizable BAR exposing all 12 GiB.
+
 `amdgpu_dmub_boot::Loader::new` validates exact DCN314 discovery, the PCI
 capability, register bounds and the pool's CPU/GPU address correspondence,
 reserves its image storage, and claims exclusive DMUB/PM ownership. Its unsafe
