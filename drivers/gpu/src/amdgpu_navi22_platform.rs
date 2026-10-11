@@ -33,6 +33,7 @@ pub struct Diagnostics {
     pub state: boot::State,
     pub training: Option<crate::amdgpu_gddr6::State>,
     pub gfx: Option<crate::amdgpu_psp_ring::GfxBootStatus>,
+    pub dmub: Option<crate::amdgpu_dmub_navi22::MailboxState>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -42,6 +43,7 @@ pub fn status() -> Status {
                 state: boot.state(),
                 training: boot.training_state(),
                 gfx: boot.gfx_boot_status(),
+                dmub: boot.dmub_mailbox_state(),
             })
         }),
     }
@@ -190,6 +192,37 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
 pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
     owner.as_mut().ok_or(boot::Error::Invalid)?.run().await
+}
+
+/// Serialized native HPD query. Requires the completed, retained cold boot.
+pub async fn dmub_hpd(instance: u8) -> Result<bool, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .dmub_hpd(instance)
+        .await
+}
+/// Serialized native AUX/I2C-over-AUX transaction, at most 16 bytes.
+pub async fn dmub_aux(
+    instance: u8,
+    action: u8,
+    address: u32,
+    data: &mut [u8],
+) -> Result<(), boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .dmub_aux(instance, action, address, data)
+        .await
+}
+pub async fn dmub_notification() -> Result<Option<[u8; 64]>, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .dmub_notification()
 }
 
 #[cfg(feature = "kernel-test")]

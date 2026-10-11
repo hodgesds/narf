@@ -324,8 +324,14 @@ VBIOS/mailbox/trace/state storage and await a fresh firmware-ready status.
 Navi22's reset registers are checked independently from Phoenix's. Unsupported
 firmware layouts, invalid secure-window bounds, stop/boot timeouts, revocation
 and cancellation refuse further startup without reclaiming published storage.
+The retained owner now also drives DCN3.0 inbox1/outbox1: startup verifies the
+running firmware version and queries capabilities, with HDP flush/invalidation
+around PCIe VRAM traffic. Serialized native HPD and AUX/I2C-over-AUX operations
+preserve unrelated notifications and reject stale replies. Software models
+cover ring wraparound, cache ordering, malformed pointers/replies, cancellation,
+timeouts, revocation and notification overflow; real-card validation is pending.
 These are software-tested foundations; training resume,
-VCN startup, DMUB runtime transport, display-aware DPM and OS thermal interrupt handling,
+VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production
 SDMA submissions/interrupts and DCN3.0
 modesetting remain open. See the

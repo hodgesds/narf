@@ -252,6 +252,37 @@ fn firmware() -> Firmware {
         dmub: None,
     }
 }
+fn navi22_runtime_commands_require_completed_boot_and_retained_tmr() -> TestResult {
+    let pool = pool(16 << 20);
+    let authority = Cap::bootstrap();
+    // SAFETY: constructor performs no I/O, and every runtime entry must fail
+    // before touching these intentionally unmapped GPU addresses.
+    let mut boot = unsafe { ColdBoot::new(&gpu(), authority, &pool, firmware()) }.unwrap();
+    for state in [
+        State::Prepared,
+        State::Running(Stage::DmubStart),
+        State::Failed {
+            stage: Stage::DmubStart,
+            error: Error::Invalid,
+        },
+        State::FirmwareReady(report()), // no live PSP/TMR in this fixture
+        State::Released,
+    ] {
+        boot.sequence.state = state;
+        if run(boot.dmub_hpd(0)) != Err(Error::Busy)
+            || run(boot.dmub_aux(0, 0x90, 0x202, &mut [0; 6])) != Err(Error::Busy)
+            || boot.dmub_notification() != Err(Error::Busy)
+            || boot.dmub_mailbox_state().is_some()
+        {
+            return TestResult::Fail("runtime command escaped boot/TMR ownership gate");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_runtime_commands_require_completed_boot_and_retained_tmr
+);
 fn navi22_boot_outlives_the_controller_lock() -> TestResult {
     fn send_static<T: Send + 'static>(_: &T) {}
     fn send_future<T: Send>(_: &T) {}

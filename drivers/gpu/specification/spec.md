@@ -392,8 +392,8 @@ combined Navy Flounder DMCUB image and stages ordinary RAM before device I/O.
 `Image::prepare_dcn30` requires IP 3.0, cached-inbox firmware newer than 1.10.0,
 and no separate BSS/shared-state mapping. It uses the existing bounded layout
 builder; legacy/unsupported layouts fail before any hardware operation.
-`unsafe Dmub::new(gpu, pci_cap, pool, prepared)` bounds DCN3.0 base index 2 and
-NBIO, then reserves owned VRAM. It requires exclusive physical-GPU ownership,
+`unsafe Dmub::new(gpu, pci_cap, pool, prepared)` bounds DCN3.0 base index 2,
+NBIO and HDP 5.0.x, then reserves owned VRAM. It requires exclusive physical-GPU ownership,
 permanent mappings, and firmware/VBIOS belonging to this board.
 
 `quiesce().await` checks the DMUB enable fuse, requests `STOP_FW` when inherited
@@ -411,13 +411,49 @@ PSP/TMR for DMUB's lifetime, with trained VRAM, ready memory hubs and protected
 power. Nonsecure VBIOS/mailbox/trace/state windows use owned GPU VRAM addresses.
 The uploaded backing is flushed before publication; mailbox rings are 8 KiB
 each. Startup skips panel power sequencing, requires a fresh DAL/mailbox-ready
-status within 1 s, and reports `Status { firmware_version, boot_status, inbox,
-outbox }`. This does not yet provide runtime mailbox commands or native modeset.
+status within 1 s, then proves the runtime transport before returning success.
+It requires `GET_FW_VERSION` GPINT acknowledgement within 100 ms and a version
+matching the prepared image metadata. It sends `QUERY_FEATURE_CAPS` through
+inbox1 and reports `Status { firmware_version, boot_status, inbox, outbox,
+capabilities: Option<FeatureCaps> }`. `FeatureCaps` retains the packed 14-byte
+Linux ABI without enabling any advertised feature. As in Linux's
+`dc_dmub_srv_query_caps_cmd`, firmware must clear the request's `ret_status`
+bit to acknowledge this query; an unchanged bit leaves capabilities absent.
+This does not initialize a native mode.
 
 Every I/O batch checks live authority. State is `Prepared`, `Stopping`, `Reset`,
 `Starting`, `Running` or `Failed`. Cancellation preserves the in-progress state
 and prevents replay. Published storage stays quarantined on failure/drop;
 unpublished storage can return to its pool. No destructor changes hardware.
+
+`Dmub::hpd(instance).await` queries a native DCN30 AUX/HPD instance (0..6),
+not a connector index. `aux(instance, action, address, data).await` supports
+native AUX and I2C-over-AUX with at most 16 bytes, 20-bit addresses, and the
+actions defined by `dmub_cmd.h`. AUX enables outbox1 notifications on first
+use; there is no automatic NACK/DEFER retry. These methods do not perform link
+training, infer board routing or expose arbitrary firmware commands.
+`poll_notification()` returns at most one validated raw 64-byte outbox slot.
+Up to 16 unrelated notifications are retained while awaiting AUX; overflow
+fails explicitly. A stale or wrong-instance AUX reply fails the transport,
+because this ABI has no usable request ID for disambiguating late replies.
+
+The owner uses two fixed 8-KiB rings inside its retained reservation. Before
+each command it verifies CW4, ring bases/sizes, shadow pointers, firmware-ready
+state and HDP remapping. Pointers are byte offsets aligned to 64 within the
+ring. One command is outstanding; only its exact read-pointer advance completes
+it. CPU writes are flushed through HDP before publishing the inbox write
+pointer; firmware replies are read only after HDP read-cache invalidation.
+All MMIO and VRAM batches invoke the live PCI capability. Replies must retain
+their type/subtype and payload size and cannot assert batched/register commands
+or reserved header bits. Inbox and AUX completion each have a 200-ms bound.
+
+`mailbox_state()` is `Dormant`, `Ready`, `InFlight` or `Failed`. Dropping an
+operation retains `InFlight` outside the future and blocks replay. Protocol
+errors, timeouts, removal, revocation and notification overflow leave `Failed`;
+fully consumed AUX NACK/DEFER or firmware rejection returns an error while
+leaving the transport ready. Caller validation errors perform no I/O. No
+failure resets the device or reclaims published storage. The lifecycle state
+and immutable boot report do not replace this live transport diagnostic.
 
 ### Coordinated Navi 22 firmware bring-up
 
@@ -453,6 +489,7 @@ identifies a failure in this stage, with the SDMA error retained.
 construction; `ColdBoot::prepare_dmub()` reserves its VRAM after memory hubs
 are prepared. Production boot requires both calls. This places `DmubQuiesce`
 before any PSP DMCUB upload and `DmubStart` after memory-hub/SDMA startup.
+`DmubStart` includes the runtime version/capability handshake above.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
 session is constructed; production boot requires it, while explicit
 firmware-only callers may omit it. The bootstrap owner is dropped only
@@ -474,8 +511,13 @@ GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
 `AmdGpu::fw_loaded`. Display-aware memory/link DPM, OS thermal interrupts,
-general GPU mappings/queues, VCN startup, DMUB runtime transport and real-card validation remain
+general GPU mappings/queues, VCN startup and real-card validation remain
 separate work.
+
+`ColdBoot::dmub_hpd`, `dmub_aux` and `dmub_notification` expose the typed runtime
+operations only after `FirmwareReady` and while PSP/TMR remains retained.
+They refuse access after `take_psp()`. `dmub_mailbox_state()` also reports failed
+or cancelled transport attempts without accessing hardware.
 
 ### Navi 22 boot ownership and framebuffer handoff
 
@@ -499,8 +541,11 @@ return `None`; DRM identity/memory queries use a separate immutable snapshot.
 runs the retained session once. The owner survives return or cancellation;
 there is no automatic retry, release or reset. `status()` returns `Absent`,
 `Running` while locked, or `Retained(Diagnostics)` with the session state,
-training state and last raw GC boot-status sample. Failure identifies its exact
+training state, last raw GC boot-status sample and DMUB mailbox state. Failure identifies its exact
 stage and underlying error. Firmware readiness never advertises acceleration or a native mode.
+`dmub_hpd(instance).await`, `dmub_aux(instance, action, address, data).await`
+and `dmub_notification().await` serialize runtime access through the same async
+owner mutex; no controller spinlock or escaping DMUB/PSP owner is needed.
 Navi22 is excluded from the DCN314 USB-C startup path. Its suspend handler
 returns `NotImplemented` before changing PM state or issuing commands; discrete
 GPUs cannot resolve the legacy APU SMU mailbox through `mp1_mailbox_base`.

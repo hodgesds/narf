@@ -562,6 +562,40 @@ impl ColdBoot {
     pub async fn run(&mut self) -> Result<Report, Error> {
         self.sequence.run().await
     }
+    fn dmub_mut(&mut self) -> Result<&mut crate::amdgpu_dmub_navi22::Dmub, Error> {
+        if !matches!(self.sequence.state, State::FirmwareReady(_))
+            || self.sequence.backend.psp.is_none()
+        {
+            return Err(Error::Busy);
+        }
+        self.sequence.backend.dmub.as_mut().ok_or(Error::Invalid)
+    }
+    pub fn dmub_mailbox_state(&self) -> Option<crate::amdgpu_dmub_navi22::MailboxState> {
+        self.sequence
+            .backend
+            .dmub
+            .as_ref()
+            .map(|d| d.mailbox_state())
+    }
+    /// Native DCN30 AUX/HPD instance, not a connector index.
+    pub async fn dmub_hpd(&mut self, instance: u8) -> Result<bool, Error> {
+        self.dmub_mut()?.hpd(instance).await.map_err(Error::Dmub)
+    }
+    pub async fn dmub_aux(
+        &mut self,
+        instance: u8,
+        action: u8,
+        address: u32,
+        data: &mut [u8],
+    ) -> Result<(), Error> {
+        self.dmub_mut()?
+            .aux(instance, action, address, data)
+            .await
+            .map_err(Error::Dmub)
+    }
+    pub fn dmub_notification(&mut self) -> Result<Option<[u8; 64]>, Error> {
+        self.dmub_mut()?.poll_notification().map_err(Error::Dmub)
+    }
     /// Transfer the live ring/TMR owner after full firmware success. It must
     /// remain alive for subsequent GPU initialization; dropping it quarantines
     /// device-owned VRAM. Reset all consumers before calling its unsafe stop.

@@ -6,8 +6,11 @@ use core::{
     task::{Context, Waker},
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
+#[path = "amdgpu_dmub_navi22_mailbox_tests.rs"]
+mod mailbox_tests;
 const DCN: u64 = 0x10000;
 const NBIO: u64 = 0x30000;
+const HDP: u64 = 0x50000;
 struct Fake {
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
@@ -18,6 +21,93 @@ struct Fake {
     released: Arc<AtomicBool>,
     reject: Option<u32>,
     revoke: Option<(u32, Cap<BusDeviceCap, Write>)>,
+    mailbox: usize,
+    invalidated: bool,
+    gpint: bool,
+    version: u32,
+    commands: bool,
+    caps: bool,
+    aux: bool,
+    aux_status: u8,
+    notify: bool,
+    corrupt: Option<(usize, u8)>,
+    aux_corrupt: Option<(usize, u8)>,
+    complete_pointer: Option<u32>,
+}
+impl Fake {
+    fn slot(&self, offset: usize) -> [u8; 64] {
+        let mut bytes = [0; 64];
+        for (i, word) in bytes.chunks_exact_mut(4).enumerate() {
+            word.copy_from_slice(&self.bytes[offset / 4 + i].to_le_bytes());
+        }
+        bytes
+    }
+    fn put_slot(&mut self, offset: usize, bytes: [u8; 64]) {
+        for (i, word) in bytes.chunks_exact(4).enumerate() {
+            self.bytes[offset / 4 + i] = u32::from_le_bytes(word.try_into().unwrap());
+        }
+        self.invalidated = false;
+    }
+    fn event(&mut self, event: [u8; 64]) {
+        let wp = self.regs[&(DCN + 0x1de * 4)] as usize;
+        self.put_slot(self.mailbox + 8192 + wp, event);
+        self.regs.insert(DCN + 0x1de * 4, ((wp + 64) % 8192) as u32);
+    }
+    fn execute(&mut self, next: u32) {
+        assert!(!self.dirty, "inbox published before HDP flush");
+        let rp = self.regs[&(DCN + 0x1d7 * 4)] as usize;
+        assert_eq!(next as usize, (rp + 64) % 8192);
+        let offset = self.mailbox + rp;
+        let mut request = self.slot(offset);
+        match request[0] {
+            6 if self.caps => {
+                assert_eq!(&request[..4], &[6, 0, 1, 14]);
+                request[2] = 0;
+                request[4] = 1;
+                request[5] = 0x21;
+                request[16] = 1;
+            }
+            82 => {
+                assert_eq!(request[3], 12);
+                assert_eq!(&request[8..12], &[0; 4]);
+                request[5] = 1;
+                request[12..16].fill(0);
+            }
+            70 if self.aux => {
+                assert_eq!(request[3], 36);
+                assert_eq!(&request[8..10], &4000u16.to_le_bytes());
+                assert_eq!(&request[12..16], &[0; 4]);
+                assert!(request[18] <= 16);
+                if self.notify {
+                    let mut event = [0; 64];
+                    event[..8].copy_from_slice(&[2, 0, 0, 4, request[4], 0, 1, 0]);
+                    self.event(event);
+                }
+                let mut reply = [0; 64];
+                reply[0] = 1;
+                reply[3] = 28;
+                reply[8] = request[4];
+                reply[12] = self.aux_status;
+                if request[17] & 0x10 != 0 {
+                    reply[13] = request[18];
+                    for i in 0..request[18] as usize {
+                        reply[16 + i] = 0x40 + i as u8;
+                    }
+                }
+                if let Some((index, value)) = self.aux_corrupt {
+                    reply[index] = value;
+                }
+                self.event(reply);
+            }
+            _ => {}
+        }
+        if let Some((index, value)) = self.corrupt {
+            request[index] = value;
+        }
+        self.put_slot(offset, request);
+        self.regs
+            .insert(DCN + 0x1d7 * 4, self.complete_pointer.unwrap_or(next));
+    }
 }
 impl Io for Fake {
     fn read(&mut self, address: u64) -> u32 {
@@ -36,6 +126,20 @@ impl Io for Fake {
         }
         if address == 0x7f000 {
             self.dirty = false;
+        }
+        if address == HDP + 0xd1 * 4 {
+            assert_eq!(value, 1);
+            self.invalidated = true;
+        }
+        if address == DCN + 0x1f8 * 4 && value == 0x10010000 && self.gpint {
+            self.regs.insert(address, 0x10000);
+            self.regs.insert(DCN + 0x1ea * 4, self.version);
+        }
+        if address == DCN + 0x1d6 * 4
+            && self.commands
+            && self.regs.get(&(DCN + 0x1e3 * 4)) == Some(&3)
+        {
+            self.execute(value);
         }
         if address == DCN + 0x1f8 * 4 && value == 0x10020000 && self.stop {
             self.regs.insert(address, 0x20000);
@@ -57,6 +161,13 @@ impl Io for Fake {
     fn upload(&mut self, _: MmioRegion, offset: u64, value: u32) {
         self.dirty = true;
         self.bytes[offset as usize / 4] = value;
+    }
+    fn download(&mut self, _: MmioRegion, offset: u64) -> u32 {
+        assert!(
+            self.invalidated,
+            "firmware reply read without HDP invalidation"
+        );
+        self.bytes[offset as usize / 4]
     }
 }
 fn image() -> Vec<u8> {
@@ -108,16 +219,30 @@ fn fixture() -> (Pool, Engine<Fake>) {
             released: Arc::new(AtomicBool::new(false)),
             reject: None,
             revoke: None,
+            mailbox: prepared.layout.region(fw::Window::Mailbox).offset as usize,
+            invalidated: false,
+            gpint: true,
+            version: 0x02022280,
+            commands: true,
+            caps: true,
+            aux: true,
+            aux_status: 0,
+            notify: false,
+            corrupt: None,
+            aux_corrupt: None,
+            complete_pointer: None,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
             dcn: DCN,
             nbio: NBIO,
+            hdp: HDP,
         },
         memory: pool.reserve(bytes).unwrap(),
         prepared,
         state: State::Prepared,
         status: None,
+        mailbox: mailbox::Mailbox::new(),
     };
     (pool, engine)
 }

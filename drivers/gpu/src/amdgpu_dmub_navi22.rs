@@ -1,6 +1,6 @@
 //! DCN3.0 DMUB lifecycle after PSP authentication. Linux dmub_dcn20.c reset,
 //! dmub_dcn30.c windows and dmub_srv.c layout. No secure-window writes,
-//! direct firmware loading, native modeset, runtime commands or implicit reset.
+//! direct firmware loading, native modeset or implicit reset.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_dmub_firmware as fw,
@@ -22,6 +22,9 @@ const GPINT: u32 = 0x1f8;
 const STOP: u32 = 0x10020000;
 const STATUS: u32 = 0x1e3;
 const MASK: u32 = 0x1fffffff;
+#[path = "amdgpu_dmub_navi22_mailbox.rs"]
+mod mailbox;
+pub use mailbox::{FeatureCaps, MailboxState};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -32,6 +35,11 @@ pub enum Error {
     DeviceGone,
     StopTimeout,
     BootTimeout,
+    CommandTimeout,
+    Protocol,
+    NotificationOverflow,
+    CommandRejected(u32),
+    Aux(u8),
     Readback,
     Firmware(fw::Error),
 }
@@ -50,6 +58,8 @@ pub struct Status {
     pub boot_status: u32,
     pub inbox: u64,
     pub outbox: u64,
+    /// Present only when firmware acknowledges QUERY_FEATURE_CAPS.
+    pub capabilities: Option<FeatureCaps>,
 }
 /// Immutable ordinary-RAM preparation. No device I/O or implied VRAM ownership.
 #[derive(Debug)]
@@ -83,6 +93,7 @@ impl Prepared {
 struct Layout {
     dcn: u64,
     nbio: u64,
+    hdp: u64,
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -111,6 +122,14 @@ impl Layout {
                 0x12d,
             )
             .map_err(|_| Error::Unsupported)?,
+            hdp: bank(
+                gpu,
+                ip::HW_ID_HDP,
+                &[(5, 0, 0), (5, 0, 1), (5, 0, 2), (5, 0, 3), (5, 0, 4)],
+                0,
+                0xd1,
+            )
+            .map_err(|_| Error::Unsupported)?,
         })
     }
 }
@@ -118,6 +137,7 @@ trait Io {
     fn read(&mut self, address: u64) -> u32;
     fn write(&mut self, address: u64, value: u32);
     fn upload(&mut self, map: MmioRegion, offset: u64, value: u32);
+    fn download(&mut self, map: MmioRegion, offset: u64) -> u32;
 }
 #[derive(Debug)]
 struct Mmio(MmioRegion);
@@ -133,8 +153,13 @@ impl Io for Mmio {
     }
     fn upload(&mut self, map: MmioRegion, offset: u64, value: u32) {
         // SAFETY: prepared layout bounds these dwords to the retained owned
-        // allocation. DMUB is held in reset until the upload is flushed.
+        // allocation. Firmware receives each mailbox slot only after flushing.
         unsafe { map.write32(offset, value) };
+    }
+    fn download(&mut self, map: MmioRegion, offset: u64) -> u32 {
+        // SAFETY: fixed mailbox slots are bounded by the retained allocation;
+        // live authority and HDP invalidation precede each reply read.
+        unsafe { map.read32(offset) }
     }
 }
 struct Op<F>(F);
@@ -174,6 +199,7 @@ struct Engine<I: Io> {
     prepared: Prepared,
     state: State,
     status: Option<Status>,
+    mailbox: mailbox::Mailbox,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -398,6 +424,7 @@ impl<I: Io> Engine<I> {
                     boot_status,
                     inbox: placement.inbox(),
                     outbox: placement.outbox(),
+                    capabilities: None,
                 });
             }
             if deadline.expired() {
@@ -436,6 +463,7 @@ impl Dmub {
                 prepared,
                 state: State::Prepared,
                 status: None,
+                mailbox: mailbox::Mailbox::new(),
             },
         })
     }
@@ -451,7 +479,12 @@ impl Dmub {
     /// after failure or cancellation without independent recovery.
     pub async unsafe fn start(&mut self, psp: &Psp) -> Result<Status, Error> {
         let tmr = psp.dmub_tmr().map_err(|_| Error::Invalid)?;
-        self.engine.start(tmr).await
+        self.engine.start(tmr).await?;
+        if let Err(error) = self.engine.initialize_mailbox().await {
+            self.engine.state = State::Failed;
+            return Err(error);
+        }
+        self.engine.status.ok_or(Error::Invalid)
     }
     pub fn state(&self) -> State {
         self.engine.state

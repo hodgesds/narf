@@ -424,7 +424,7 @@ fn header(kind: u8, sub: u8, length: u8) -> [u8; 64] {
     command[3] = length;
     command
 }
-fn aux_command(
+pub(crate) fn aux_command(
     channel: Channel,
     instance: u8,
     action: u8,
@@ -451,7 +451,7 @@ fn aux_command(
     }
     Ok(command)
 }
-fn aux_reply(reply: &[u8; 64], action: u8, data: &mut [u8]) -> Result<(), Error> {
+pub(crate) fn aux_reply(reply: &[u8; 64], action: u8, data: &mut [u8]) -> Result<(), Error> {
     if reply[3] < 28 || reply[3] > 60 {
         return Err(Error::Invalid);
     }
