@@ -59,9 +59,20 @@ API path because the kernel refuses to wire the pointer in.
 
 ### 2. Domain placement
 
-Every NARF module declares a `target_domain=<name>` in its manifest. The
-loader resolves it before mapping and records the resulting `DomainId` on the
-image. `invoke_init` / `invoke_exit` bracket module code with that domain.
+Every NARF module declares a `target_domain=<name>` author hint in its
+manifest. A caller holding `CAP_SYS_MODULE` may override the hint with
+`domain=<name>` in the load-parameter string. The loader resolves the
+effective value before mapping, rejects `DomainId::FRAME` unconditionally for
+runtime-loaded text, and records the resulting `DomainId` on the image.
+Statically linked drivers retain their compile-time Frame placement.
+
+`invoke_init` / `invoke_exit` bracket lifecycle code with that domain. Bus
+callbacks go through an owner-aware call gate that looks the module up by its
+non-reused `ModuleId`, pins it while Live, enters the same domain, records the
+per-CPU callback owner for handle checks, invokes the C-ABI thunk, and restores
+both contexts. IRQ module text is deferred to an executor task through this
+gate; network TX also enters through the same lifecycle/domain discipline.
+Module text never runs in the FRAME hard-IRQ handler.
 
 **Status on x86_64: enforced, in one direction.** Every image page carries
 the selected protection key. Entry dispatches through the active
@@ -81,8 +92,9 @@ kernel call a module makes — and the cost has to be measured before it
 is anyone's default. It is the remaining half of this section, not a
 detail.
 
-The scope is entered per module entry (init, exit), not per exported-kernel
-call, and restores unconditionally.
+The scope is entered per module entry (init, exit, probe, deferred IRQ, poll,
+and network TX callbacks), not per exported-kernel call, and restores
+unconditionally.
 
 **aarch64 enforces allocation domains, not executable-image tags.** With MTE
 present, `narf_kmalloc` uses the per-domain heap, entry clears `PSTATE.TCO`
@@ -235,7 +247,8 @@ veneer is needed. If the window ever moves further, Linux's
                 └────────┬────────┘
                          ▼
                 ┌─────────────────┐
-                │ domain::resolve │  target_domain → DomainId
+                │ domain::resolve │  domain= override, else target_domain
+                │                 │  → DomainId; reject FRAME
                 └────────┬────────┘
                          ▼
                 ┌─────────────────┐
@@ -323,6 +336,10 @@ There are three trust tiers:
      this section once described is not wired, and is a smaller gap than
      it sounds: Linux draws the line at CAP_SYS_MODULE too, so nothing
      about module loading is currently *less* gated than Linux.
+
+  4. **Operator-placed.** The signed `target_domain=` field is an author hint,
+     not self-granted trust. `domain=<name>` in the load parameters selects
+     the effective isolation frame, subject to the hard `FRAME` exclusion.
 
 ## W^X enforcement
 

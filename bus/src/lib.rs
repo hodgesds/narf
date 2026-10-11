@@ -70,9 +70,16 @@ pub use bar::{
 };
 pub use device::{BusDevice, BusKind, DeviceId};
 pub use driver_match::{
+    module_bar_map, module_dma_addr, module_dma_alloc, module_dma_free, module_dma_read,
+    module_dma_wait8, module_dma_write, module_irq_set_handler, module_mmio_read32,
+    module_mmio_wait32, module_mmio_write32, module_msix_claim, module_msix_enable,
+    module_netif_register, module_netif_rx, module_pci_enable, module_spawn_poller,
     probe_all as probe_all_pci, register as register_pci_driver, register_module_pci_driver,
-    registered as registered_pci_drivers, set_probe_log, set_probe_log_hook, MatchKind,
-    ModuleProbeFn, PciMatch, PciProbeFn, ProbeError,
+    registered as registered_pci_drivers, set_module_callback_call_gate,
+    set_module_probe_call_gate, set_module_tx_call_gate, set_probe_log, set_probe_log_hook,
+    unregister_module_pci_drivers, MatchKind, ModuleCallbackCallGate, ModuleCallbackFn,
+    ModuleProbeCallGate, ModuleProbeFn, ModuleTxCallGate, ModuleTxFn, PciMatch, PciProbeFn,
+    ProbeError,
 };
 pub use hotplug::{dispatch_event, register_listener, HotplugError, HotplugEvent, HotplugListener};
 pub use msix::{enable_msix, MsixError, MsixTable, MsixVector};

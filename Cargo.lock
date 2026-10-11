@@ -832,9 +832,11 @@ dependencies = [
  "narf-capabilities",
  "narf-event-bus",
  "narf-interrupts",
+ "narf-io",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-net",
  "narf-scheduler",
  "narf-time",
 ]

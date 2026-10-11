@@ -23,7 +23,7 @@
 
 use alloc::vec::Vec;
 
-use narf_capabilities::{Cap, Grant, Write};
+use narf_capabilities::{Cap, CapError, CapOp, Grant, Write};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::device::{BusDevice, BusKind};
@@ -354,12 +354,91 @@ fn log_probe_failure(_m: &PciMatch, _d: &BusDevice, _e: ProbeError) {}
 // stable device token. The in-tree `PciMatch` probe path above is untouched.
 
 /// C-ABI probe thunk a loadable module supplies. `dev_token` encodes the
-/// device's bus address (see [`addr_token`]); `reserved` is 0 today and will
-/// carry a device-authority handle once the datapath ABI lands. A `0` return
-/// means the module bound the device; a negative errno means it did not.
+/// device's bus address (see [`addr_token`]); `reserved` is 0 today. A `0`
+/// return means the module bound the device; a negative errno means it did not.
 pub type ModuleProbeFn = extern "C" fn(dev_token: u64, reserved: u64) -> i32;
 
+/// Kernel-installed call gate for entering the effective isolation domain of
+/// `owner` before invoking module text. `bus` deliberately knows module
+/// owners only as opaque ids; the module subsystem owns the id -> domain map.
+pub type ModuleProbeCallGate = fn(u64, ModuleProbeFn, u64, u64) -> i32;
+
+/// Synchronous module callback used by the IRQ and timer-poller bridges. The
+/// callback itself is never invoked from hard-IRQ context: an in-tree task
+/// observes the interrupt/timer and enters module text through the call gate.
+pub type ModuleCallbackFn = extern "C" fn(cookie: u64) -> i32;
+
+/// Kernel-installed gate that pins a live module and enters its effective
+/// load-time domain before calling a non-probe callback.
+pub type ModuleCallbackCallGate = fn(u64, ModuleCallbackFn, u64) -> i32;
+
+/// Module transmit callback. The frame pointer is borrowed only for the
+/// duration of the call and names kernel-owned, read-only bytes.
+pub type ModuleTxFn = extern "C" fn(frame: *const u8, len: usize) -> i32;
+
+/// Domain/lifecycle gate for network-stack transmit callbacks.
+pub type ModuleTxCallGate = fn(u64, ModuleTxFn, &[u8]) -> i32;
+
+static MODULE_PROBE_CALL_GATE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static MODULE_CALLBACK_CALL_GATE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static MODULE_TX_CALL_GATE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the module subsystem's probe call gate. Idempotent; boot and test
+/// reset paths may publish the same function repeatedly.
+pub fn set_module_probe_call_gate(gate: ModuleProbeCallGate) {
+    MODULE_PROBE_CALL_GATE.store(gate as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Install the module subsystem's task-context callback gate. Idempotent for
+/// the same reason as [`set_module_probe_call_gate`].
+pub fn set_module_callback_call_gate(gate: ModuleCallbackCallGate) {
+    MODULE_CALLBACK_CALL_GATE.store(gate as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Install the module subsystem's network transmit call gate.
+pub fn set_module_tx_call_gate(gate: ModuleTxCallGate) {
+    MODULE_TX_CALL_GATE.store(gate as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn call_module_probe(owner: u64, thunk: ModuleProbeFn, dev_token: u64, reserved: u64) -> i32 {
+    let gate = MODULE_PROBE_CALL_GATE.load(core::sync::atomic::Ordering::Acquire);
+    if gate == 0 {
+        return -19; // -ENODEV: never execute module text without its gate.
+    }
+    // SAFETY: only `set_module_probe_call_gate` writes this atomic and it
+    // stores exactly a `ModuleProbeCallGate` function address.
+    let gate: ModuleProbeCallGate = unsafe { core::mem::transmute(gate) };
+    gate(owner, thunk, dev_token, reserved)
+}
+
+fn call_module_callback(owner: u64, callback: ModuleCallbackFn, cookie: u64) -> i32 {
+    let gate = MODULE_CALLBACK_CALL_GATE.load(core::sync::atomic::Ordering::Acquire);
+    if gate == 0 {
+        return -19;
+    }
+    // SAFETY: only `set_module_callback_call_gate` writes this atomic and it
+    // stores exactly a `ModuleCallbackCallGate` function address.
+    let gate: ModuleCallbackCallGate = unsafe { core::mem::transmute(gate) };
+    gate(owner, callback, cookie)
+}
+
+fn call_module_tx(owner: u64, callback: ModuleTxFn, frame: &[u8]) -> i32 {
+    let gate = MODULE_TX_CALL_GATE.load(core::sync::atomic::Ordering::Acquire);
+    if gate == 0 {
+        return -19;
+    }
+    // SAFETY: only `set_module_tx_call_gate` writes this atomic and stores a
+    // `ModuleTxCallGate` function address.
+    let gate: ModuleTxCallGate = unsafe { core::mem::transmute(gate) };
+    gate(owner, callback, frame)
+}
+
 struct ModuleThunk {
+    owner: u64,
+    name: &'static str,
     vendor: u16,
     device: u16,
     thunk: ModuleProbeFn,
@@ -399,27 +478,972 @@ fn addr_token(addr: crate::addr::BusAddr) -> u64 {
     }
 }
 
+// ── Device datapath context (datapath C-ABI, Stages 0–4) ─────────────
+//
+// For the module's probe to actually DRIVE the device (not just register), the
+// kernel keeps the rich objects — the per-device `Cap<BusDeviceCap, Write>` and
+// the mapped BAR `MmioRegion`s — and hands the module only opaque `u64`
+// handles. Every datapath export (below) looks the context up by the device
+// token, re-validates the cap by using it, and performs the hardware op in the
+// kernel. The module never holds a kernel pointer or a `repr(Rust)` object.
+//
+// The context is installed by the trampoline before the module's probe runs
+// and removed if the probe declines; on success it persists (the module now
+// owns the device) until unload tears it down.
+struct DeviceCtx {
+    owner: u64,
+    token: u64,
+    device: BusDevice,
+    /// The per-device authority minted for the probe. Held so every datapath
+    /// op can go through the cap-gated `bus::pci` / `bus::bar` entry points.
+    cap: Cap<BusDeviceCap, Write>,
+    /// Mapped BARs; the module refers to them by 1-based handle (index + 1).
+    bars: Vec<crate::bar::MmioRegion>,
+    /// Coherent DMA buffers retained behind revocable capabilities. Slots stay
+    /// stable for the lifetime of the context and are never reused, so a
+    /// handle remains stale after free instead of aliasing a later allocation.
+    dmabufs: Vec<Option<Cap<narf_io::DmaBuffer, Write>>>,
+    /// MSI-X objects remain kernel-owned; modules see only bounded vector
+    /// numbers and callback cookies.
+    msix: Option<crate::msix::MsixTable>,
+    irqs: Vec<ModuleIrq>,
+    /// At most one periodic poller per device. A unique id prevents a task
+    /// from an old registration from matching a replacement.
+    poller: Option<ModulePoller>,
+    net_iface: Option<ModuleNetIface>,
+    next_callback_id: u64,
+    callback_invocations: u64,
+    callback_failures: u64,
+    net_tx_callbacks: u64,
+    net_tx_failures: u64,
+    net_rx_frames: u64,
+    /// Command-register bits enabled through this context. Teardown clears
+    /// them before dropping the device capability.
+    enabled_bits: u16,
+}
+
+#[derive(Copy, Clone)]
+struct ModuleIrq {
+    table_idx: u16,
+    vector: u8,
+    callback: Option<ModuleCallbackFn>,
+    cookie: u64,
+    callback_id: u64,
+}
+
+#[derive(Copy, Clone)]
+struct ModulePoller {
+    callback: ModuleCallbackFn,
+    cookie: u64,
+    callback_id: u64,
+}
+
+struct ModuleNetIface {
+    name: alloc::string::String,
+    ifindex: u32,
+    tx_callback: ModuleTxFn,
+}
+
+const MODULE_IRQ_HANDLER_NAME: &str = "module-msix";
+
+fn module_irq_claim_stub(_cookie: u64) -> narf_interrupts::IrqStatus {
+    // Dispatch has already advanced fire_count and woken waiters. Module code
+    // is deliberately deferred to a normal executor task.
+    narf_interrupts::IrqStatus::Handled
+}
+
+struct DeviceOp<F>(F);
+
+impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for DeviceOp<F> {
+    type Output = T;
+
+    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+        Ok((self.0)())
+    }
+}
+
+struct DmaOp<F>(F);
+
+impl<F: FnOnce(&narf_io::DmaBuffer) -> T, T> CapOp<narf_io::DmaBuffer, Write> for DmaOp<F> {
+    type Output = T;
+
+    fn execute(self, cap: &Cap<narf_io::DmaBuffer, Write>) -> Result<Self::Output, CapError> {
+        let buffer = narf_io::resolve(cap.slot().index).ok_or(CapError::Revoked)?;
+        Ok((self.0)(&buffer))
+    }
+}
+
+static DEVICE_CTXS: IrqSafeSpinLock<Vec<DeviceCtx>> = IrqSafeSpinLock::new(Vec::new());
+
+fn install_device_ctx(owner: u64, token: u64, device: BusDevice, cap: Cap<BusDeviceCap, Write>) {
+    // A reprobe replaces the old ownership record only after disabling the
+    // command bits it enabled.
+    remove_device_ctx(token);
+    let mut g = DEVICE_CTXS.lock();
+    g.push(DeviceCtx {
+        owner,
+        token,
+        device,
+        cap,
+        bars: Vec::new(),
+        dmabufs: Vec::new(),
+        msix: None,
+        irqs: Vec::new(),
+        poller: None,
+        net_iface: None,
+        next_callback_id: 1,
+        callback_invocations: 0,
+        callback_failures: 0,
+        net_tx_callbacks: 0,
+        net_tx_failures: 0,
+        net_rx_frames: 0,
+        enabled_bits: 0,
+    });
+}
+
+fn remove_device_ctx(token: u64) {
+    let removed = {
+        let mut g = DEVICE_CTXS.lock();
+        g.iter()
+            .position(|c| c.token == token)
+            .map(|idx| g.remove(idx))
+    };
+    if let Some(ctx) = removed {
+        teardown_device_ctx(ctx);
+    }
+}
+
+fn teardown_device_ctx(mut ctx: DeviceCtx) {
+    if let Some(iface) = ctx.net_iface.take() {
+        let _ = narf_net::iface::unregister(&iface.name);
+    }
+    // Stop new MSI-X delivery before detaching handlers. The module lifecycle
+    // gate has already rejected new callbacks when unload reaches here.
+    if let Some(msix) = ctx.msix.as_mut() {
+        for irq in &ctx.irqs {
+            // SAFETY: this context exclusively owns the table and the index
+            // was allocated from this exact table.
+            let _ = unsafe { msix.mask_vector(irq.table_idx) };
+        }
+        // SAFETY: same exclusive config-space ownership; every allocated
+        // entry was function-masked above.
+        unsafe { msix.disable() };
+    }
+    if ctx.enabled_bits != 0 {
+        // Best effort: a revoked cap already prevents further access, which
+        // is precisely when clearing config space is no longer possible.
+        let _ = ctx.cap.invoke(DeviceOp(|| {
+            crate::pci::clear_command(&ctx.cap, &ctx.device, ctx.enabled_bits)
+        }));
+    }
+    for irq in &ctx.irqs {
+        narf_interrupts::disable_irq(irq.vector);
+        let _ = narf_interrupts::remove_handler(irq.vector, MODULE_IRQ_HANDLER_NAME, ctx.token);
+        narf_interrupts::synchronize_irq(irq.vector);
+        let _ = narf_interrupts::vector::free(irq.vector);
+    }
+    // Bus mastering and MSI-X are off before backing frames are returned.
+    // Full DMA-ring teardown must additionally drain device-owned descriptors
+    // once a module begins submitting them to hardware.
+    for cap in ctx.dmabufs.iter().flatten().copied() {
+        narf_io::unregister(cap);
+    }
+    // Epoch revocation invalidates every copied token retained after this
+    // device context is removed.
+    ctx.cap.revoke();
+}
+
+/// Enable PCI command bits (e.g. MEM_SPACE | BUS_MASTER) on a module-owned
+/// device. Reached from the `narf_pci_enable` kernel-ABI export. Returns 0, or
+/// a negative errno. The op is cap-gated through the context's device cap.
+pub fn module_pci_enable(owner: u64, token: u64, bits: u16) -> i32 {
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        return -19; // -ENODEV
+    };
+    match ctx.cap.invoke(DeviceOp(|| {
+        crate::pci::set_command(&ctx.cap, &ctx.device, bits)
+    })) {
+        Ok(Ok(_)) => {
+            ctx.enabled_bits |= bits;
+            0
+        }
+        _ => -5, // -EIO
+    }
+}
+
+/// Map a BAR of a module-owned device and return a 1-based handle (0 = fail).
+/// Reached from `narf_bar_map`.
+pub fn module_bar_map(owner: u64, token: u64, idx: u8) -> u64 {
+    // Resolve the device under the lock, then map OUTSIDE it (ioremap may take
+    // other locks / allocate page tables).
+    let (device, cap) = {
+        let g = DEVICE_CTXS.lock();
+        match g.iter().find(|c| c.owner == owner && c.token == token) {
+            Some(c) => (c.device, c.cap),
+            None => return 0,
+        }
+    };
+    // SAFETY: the module owns this device — its live `Cap<BusDeviceCap, Write>`
+    // is held in the context, giving the exclusive cfg-space ownership
+    // `map_bar` requires.
+    let region = match cap.invoke(DeviceOp(|| {
+        // SAFETY: the live device cap gates the exclusive cfg-space ownership
+        // required by `map_bar`.
+        unsafe { crate::bar::map_bar(&device, idx) }
+    })) {
+        Ok(Ok(region)) => region,
+        _ => return 0,
+    };
+    let mut g = DEVICE_CTXS.lock();
+    match g.iter_mut().find(|c| c.owner == owner && c.token == token) {
+        Some(c) => {
+            c.bars.push(region);
+            c.bars.len() as u64
+        }
+        None => 0,
+    }
+}
+
+fn with_bar<R>(
+    owner: u64,
+    token: u64,
+    handle: u64,
+    f: impl FnOnce(&crate::bar::MmioRegion) -> R,
+) -> Option<R> {
+    let (cap, region) = {
+        let g = DEVICE_CTXS.lock();
+        let ctx = g.iter().find(|c| c.owner == owner && c.token == token)?;
+        let idx = handle.checked_sub(1)? as usize;
+        (ctx.cap, *ctx.bars.get(idx)?)
+    };
+    cap.invoke(DeviceOp(|| f(&region))).ok()
+}
+
+/// Read a 32-bit device register from a mapped BAR of a module-owned device.
+/// Reached from `narf_mmio_read32`. `None` on a bad token/handle/offset.
+pub fn module_mmio_read32(owner: u64, token: u64, handle: u64, off: u64) -> Option<u32> {
+    with_bar(owner, token, handle, |region| {
+        if off.checked_add(4)? > region.len {
+            return None;
+        }
+        // SAFETY: offset bounds-checked against the mapped region length; the
+        // region was produced by `map_bar` for this device.
+        Some(unsafe { region.read32(off) })
+    })
+    .flatten()
+}
+
+/// Write a 32-bit device register to a mapped BAR of a module-owned device.
+/// Reached from `narf_mmio_write32`. Returns 0 or a negative errno.
+pub fn module_mmio_write32(owner: u64, token: u64, handle: u64, off: u64, val: u32) -> i32 {
+    with_bar(owner, token, handle, |region| {
+        if off.checked_add(4).map(|e| e > region.len).unwrap_or(true) {
+            return -22; // -EINVAL
+        }
+        // SAFETY: offset bounds-checked against the mapped region length.
+        unsafe { region.write32(off, val) };
+        0
+    })
+    .unwrap_or(-22)
+}
+
+/// Responsively wait until `(read32(off) & mask) == expected`, bounded by a
+/// wall-clock timeout. This keeps wait-loop policy in the kernel scheduler
+/// instead of asking separately compiled drivers to hand-roll register spins.
+pub fn module_mmio_wait32(
+    owner: u64,
+    token: u64,
+    handle: u64,
+    off: u64,
+    mask: u32,
+    expected: u32,
+    timeout_ns: u64,
+) -> i32 {
+    if timeout_ns == 0 || timeout_ns > 1_000_000_000 {
+        return -22;
+    }
+    with_bar(owner, token, handle, |region| {
+        if off
+            .checked_add(4)
+            .map(|end| end > region.len)
+            .unwrap_or(true)
+        {
+            return -22;
+        }
+        let ready = narf_scheduler::responsive_spin_until(
+            || {
+                // SAFETY: the offset was bounds-checked above; the caller owns
+                // this device and selected a register safe to poll.
+                (unsafe { region.read32(off) } & mask) == expected
+            },
+            narf_time::Deadline::after_ns(timeout_ns),
+        );
+        if ready {
+            0
+        } else {
+            -110
+        } // -ETIMEDOUT
+    })
+    .unwrap_or(-19)
+}
+
+/// Allocate coherent DMA memory in the module's effective domain and return a
+/// 1-based opaque handle (`0` on failure). The module never receives the CPU
+/// pointer; subsequent copies go through the bounded accessors below.
+pub fn module_dma_alloc(owner: u64, token: u64, len: usize, domain: narf_lib::id::DomainId) -> u64 {
+    let device_cap = {
+        let g = DEVICE_CTXS.lock();
+        match g.iter().find(|c| c.owner == owner && c.token == token) {
+            Some(ctx) => ctx.cap,
+            None => return 0,
+        }
+    };
+    if device_cap.invoke(DeviceOp(|| ())).is_err() {
+        return 0;
+    }
+    let buffer = match narf_io::alloc_coherent(len, domain) {
+        Ok(buffer) => buffer,
+        Err(_) => return 0,
+    };
+    let dma_cap = narf_io::register_with_cap(buffer);
+
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        narf_io::unregister(dma_cap);
+        return 0;
+    };
+    ctx.dmabufs.push(Some(dma_cap));
+    ctx.dmabufs.len() as u64
+}
+
+fn with_dma<R>(
+    owner: u64,
+    token: u64,
+    handle: u64,
+    f: impl FnOnce(&narf_io::DmaBuffer) -> R,
+) -> Option<R> {
+    // Copy both caps out and release the IRQ-safe context lock before a
+    // potentially large memcpy. A concurrent free/unload revokes the copied
+    // cap; if it races after resolution, the registry's Arc keeps the backing
+    // allocation live until this operation returns.
+    let (device_cap, dma_cap) = {
+        let g = DEVICE_CTXS.lock();
+        let ctx = g.iter().find(|c| c.owner == owner && c.token == token)?;
+        let idx = handle.checked_sub(1)? as usize;
+        (ctx.cap, *ctx.dmabufs.get(idx)?.as_ref()?)
+    };
+    device_cap
+        .invoke(DeviceOp(|| dma_cap.invoke(DmaOp(f))))
+        .ok()?
+        .ok()
+}
+
+/// Resolve a byte offset in a module-owned DMA buffer to the address the
+/// device must consume. Returns `None` for stale handles or out-of-range
+/// offsets.
+pub fn module_dma_addr(owner: u64, token: u64, handle: u64, off: u64) -> Option<u64> {
+    with_dma(owner, token, handle, |buffer| {
+        if off >= buffer.len() as u64 {
+            return None;
+        }
+        Some(buffer.dma_addr_at(off).raw())
+    })
+    .flatten()
+}
+
+/// Copy bytes from module memory into a coherent DMA buffer. Returns 0 or a
+/// negative errno; the entire range is checked before any byte is written.
+pub fn module_dma_write(owner: u64, token: u64, handle: u64, off: u64, src: &[u8]) -> i32 {
+    with_dma(owner, token, handle, |buffer| {
+        let Some(start) = usize::try_from(off).ok() else {
+            return -22;
+        };
+        let Some(end) = start.checked_add(src.len()) else {
+            return -22;
+        };
+        if end > buffer.len() {
+            return -22;
+        }
+        // SAFETY: `[start, end)` was checked against the live buffer length;
+        // `src` is a disjoint module slice for the duration of this call.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), buffer.as_mut_ptr().add(start), src.len())
+        };
+        0
+    })
+    .unwrap_or(-22)
+}
+
+/// Copy bytes from a coherent DMA buffer into module memory. Returns 0 or a
+/// negative errno; the entire range is checked before any byte is read.
+pub fn module_dma_read(owner: u64, token: u64, handle: u64, off: u64, dst: &mut [u8]) -> i32 {
+    with_dma(owner, token, handle, |buffer| {
+        let Some(start) = usize::try_from(off).ok() else {
+            return -22;
+        };
+        let Some(end) = start.checked_add(dst.len()) else {
+            return -22;
+        };
+        if end > buffer.len() {
+            return -22;
+        }
+        // SAFETY: `[start, end)` was checked against the live buffer length;
+        // `dst` is a disjoint module slice for the duration of this call.
+        unsafe {
+            core::ptr::copy_nonoverlapping(buffer.as_ptr().add(start), dst.as_mut_ptr(), dst.len())
+        };
+        0
+    })
+    .unwrap_or(-22)
+}
+
+/// Responsively wait for one device-owned DMA status byte. Used for bounded
+/// synchronous TX completion without exposing the CPU mapping to the module.
+pub fn module_dma_wait8(
+    owner: u64,
+    token: u64,
+    handle: u64,
+    off: u64,
+    mask: u8,
+    expected: u8,
+    timeout_ns: u64,
+) -> i32 {
+    if timeout_ns == 0 || timeout_ns > 1_000_000_000 {
+        return -22;
+    }
+    with_dma(owner, token, handle, |buffer| {
+        let Some(offset) = usize::try_from(off).ok().filter(|off| *off < buffer.len()) else {
+            return -22;
+        };
+        let ready = narf_scheduler::responsive_spin_until(
+            || {
+                // SAFETY: `offset < buffer.len()` above and the allocation is
+                // retained by the resolved DMA-cap Arc for this whole wait.
+                (unsafe { buffer.as_ptr().add(offset).read_volatile() } & mask) == expected
+            },
+            narf_time::Deadline::after_ns(timeout_ns),
+        );
+        if ready {
+            0
+        } else {
+            -110
+        }
+    })
+    .unwrap_or(-22)
+}
+
+/// Revoke and free one module-owned DMA buffer. Handles are 1-based and their
+/// slots are never reused during this device context's lifetime, so stale
+/// handles cannot alias a later allocation.
+pub fn module_dma_free(owner: u64, token: u64, handle: u64) -> i32 {
+    let cap = {
+        let mut g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+            return -19; // -ENODEV
+        };
+        if ctx.cap.invoke(DeviceOp(|| ())).is_err() {
+            return -19;
+        }
+        let Some(idx) = handle
+            .checked_sub(1)
+            .and_then(|idx| usize::try_from(idx).ok())
+        else {
+            return -22;
+        };
+        let Some(slot) = ctx.dmabufs.get_mut(idx) else {
+            return -22;
+        };
+        let Some(cap) = slot.take() else {
+            return -22;
+        };
+        cap
+    };
+    narf_io::unregister(cap);
+    0
+}
+
+/// Discover and retain the MSI-X table for a module-owned device.
+pub fn module_msix_enable(owner: u64, token: u64) -> i32 {
+    let (device, cap) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return -19; // -ENODEV
+        };
+        if ctx.msix.is_some() {
+            return 0;
+        }
+        (ctx.device, ctx.cap)
+    };
+    let table = match cap.invoke(DeviceOp(|| crate::msix::enable_msix(&cap, &device))) {
+        Ok(Ok(table)) => table,
+        Ok(Err(crate::msix::MsixError::CapabilityNotFound | crate::msix::MsixError::NotPcie)) => {
+            return -95; // -EOPNOTSUPP
+        }
+        _ => return -5, // -EIO
+    };
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        return -19;
+    };
+    if ctx.msix.is_none() {
+        ctx.msix = Some(table);
+    }
+    0
+}
+
+fn restore_msix_table(owner: u64, token: u64, table: crate::msix::MsixTable) {
+    let mut g = DEVICE_CTXS.lock();
+    if let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) {
+        if ctx.msix.is_none() {
+            ctx.msix = Some(table);
+        }
+    }
+}
+
+/// Allocate an interrupt vector, program one MSI-X table entry, install the
+/// in-tree hard-IRQ stub, and enable MSI-X. Returns the kernel vector number.
+pub fn module_msix_claim(owner: u64, token: u64) -> Result<u16, i32> {
+    let (cap, mut table) = {
+        let mut g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+            return Err(-19);
+        };
+        let Some(table) = ctx.msix.take() else {
+            return Err(-22);
+        };
+        (ctx.cap, table)
+    };
+
+    let vector = match narf_interrupts::vector::alloc() {
+        Ok(vector) => vector,
+        Err(_) => {
+            restore_msix_table(owner, token, table);
+            return Err(-28); // -ENOSPC
+        }
+    };
+    let Some(entry) = table.alloc_vector() else {
+        let _ = narf_interrupts::vector::free(vector);
+        restore_msix_table(owner, token, table);
+        return Err(-28);
+    };
+
+    let programmed = cap.invoke(DeviceOp(|| {
+        let was_enabled = table.is_enabled();
+        // Function-mask the table before writing an unmasked entry. This is
+        // required on the second and later claims because `program_vector`
+        // writes vector-control last; otherwise the device could target the
+        // new vector before its hard handler exists.
+        // SAFETY: the context exclusively owns device config space.
+        unsafe { table.disable() };
+        // SAFETY: the context exclusively owns the MSI-X table; `entry` came
+        // from this table and the vector allocator owns `vector`.
+        (was_enabled, unsafe {
+            table.program_vector(entry.vector, 0, vector)
+        })
+    }));
+    match programmed {
+        Ok((_, Ok(_))) => {}
+        Ok((was_enabled, Err(_))) => {
+            if was_enabled {
+                let _ = cap.invoke(DeviceOp(|| {
+                    // SAFETY: restore the pre-claim global enable state.
+                    unsafe { table.enable() }
+                }));
+            }
+            let _ = narf_interrupts::vector::free(vector);
+            restore_msix_table(owner, token, table);
+            return Err(-5);
+        }
+        Err(_) => {
+            let _ = narf_interrupts::vector::free(vector);
+            restore_msix_table(owner, token, table);
+            return Err(-5);
+        }
+    }
+
+    narf_interrupts::install_handler_named(
+        vector,
+        MODULE_IRQ_HANDLER_NAME,
+        token,
+        module_irq_claim_stub,
+    );
+    let enabled = cap.invoke(DeviceOp(|| {
+        // SAFETY: the table entry and hard handler are installed before
+        // delivery is enabled, and this context owns device config space.
+        unsafe { table.enable() }
+    }));
+    if !matches!(enabled, Ok(Ok(()))) {
+        narf_interrupts::disable_irq(vector);
+        let _ = narf_interrupts::remove_handler(vector, MODULE_IRQ_HANDLER_NAME, token);
+        narf_interrupts::synchronize_irq(vector);
+        let _ = narf_interrupts::vector::free(vector);
+        restore_msix_table(owner, token, table);
+        return Err(-5);
+    }
+
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        drop(g);
+        // SAFETY: we still exclusively own this detached table.
+        unsafe { table.disable() };
+        narf_interrupts::disable_irq(vector);
+        let _ = narf_interrupts::remove_handler(vector, MODULE_IRQ_HANDLER_NAME, token);
+        narf_interrupts::synchronize_irq(vector);
+        let _ = narf_interrupts::vector::free(vector);
+        return Err(-19);
+    };
+    ctx.irqs.push(ModuleIrq {
+        table_idx: entry.vector,
+        vector,
+        callback: None,
+        cookie: 0,
+        callback_id: 0,
+    });
+    ctx.msix = Some(table);
+    Ok(vector as u16)
+}
+
+fn irq_callback_is_live(
+    owner: u64,
+    token: u64,
+    vector: u8,
+    callback: ModuleCallbackFn,
+    cookie: u64,
+    callback_id: u64,
+) -> bool {
+    let cap = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return false;
+        };
+        let live = ctx.irqs.iter().any(|irq| {
+            irq.vector == vector
+                && irq.callback.map(|cb| cb as usize) == Some(callback as usize)
+                && irq.cookie == cookie
+                && irq.callback_id == callback_id
+        });
+        if !live {
+            return false;
+        }
+        ctx.cap
+    };
+    cap.invoke(DeviceOp(|| ())).is_ok()
+}
+
+fn poller_is_live(
+    owner: u64,
+    token: u64,
+    callback: ModuleCallbackFn,
+    cookie: u64,
+    callback_id: u64,
+) -> bool {
+    let cap = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter().find(|c| c.owner == owner && c.token == token) else {
+            return false;
+        };
+        let live = ctx.poller.is_some_and(|poller| {
+            poller.callback as usize == callback as usize
+                && poller.cookie == cookie
+                && poller.callback_id == callback_id
+        });
+        if !live {
+            return false;
+        }
+        ctx.cap
+    };
+    cap.invoke(DeviceOp(|| ())).is_ok()
+}
+
+fn record_callback_result(owner: u64, token: u64, result: i32) {
+    if let Some(ctx) = DEVICE_CTXS
+        .lock()
+        .iter_mut()
+        .find(|c| c.owner == owner && c.token == token)
+    {
+        ctx.callback_invocations = ctx.callback_invocations.saturating_add(1);
+        if result < 0 {
+            ctx.callback_failures = ctx.callback_failures.saturating_add(1);
+        }
+    }
+}
+
+fn clear_poller(owner: u64, token: u64, callback_id: u64) {
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        return;
+    };
+    if ctx.poller.map(|p| p.callback_id) == Some(callback_id) {
+        ctx.poller = None;
+    }
+}
+
+fn clear_irq_callback(owner: u64, token: u64, vector: u8, callback_id: u64) {
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+        return;
+    };
+    let Some(irq) = ctx
+        .irqs
+        .iter_mut()
+        .find(|irq| irq.vector == vector && irq.callback_id == callback_id)
+    else {
+        return;
+    };
+    irq.callback = None;
+    irq.cookie = 0;
+    irq.callback_id = 0;
+}
+
+/// Attach a task-context callback to a vector claimed from this device's
+/// MSI-X table. The hard handler only accounts/wakes; module code runs here.
+pub fn module_irq_set_handler(
+    owner: u64,
+    token: u64,
+    vector: u16,
+    callback: ModuleCallbackFn,
+    cookie: u64,
+) -> i32 {
+    let Ok(vector) = u8::try_from(vector) else {
+        return -22;
+    };
+    let callback_id = {
+        let mut g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+            return -19;
+        };
+        if ctx.cap.invoke(DeviceOp(|| ())).is_err() {
+            return -19;
+        }
+        let Some(irq_idx) = ctx.irqs.iter().position(|irq| irq.vector == vector) else {
+            return -22;
+        };
+        if ctx.irqs[irq_idx].callback.is_some() {
+            return -16;
+        }
+        let callback_id = ctx.next_callback_id;
+        ctx.next_callback_id = ctx.next_callback_id.saturating_add(1);
+        ctx.irqs[irq_idx].callback = Some(callback);
+        ctx.irqs[irq_idx].cookie = cookie;
+        ctx.irqs[irq_idx].callback_id = callback_id;
+        callback_id
+    };
+
+    narf_scheduler::spawn(async move {
+        let mut observed = narf_interrupts::fire_count(vector);
+        loop {
+            if !irq_callback_is_live(owner, token, vector, callback, cookie, callback_id) {
+                return;
+            }
+            let current = narf_interrupts::fire_count(vector);
+            if current != observed {
+                observed = current;
+                let result = call_module_callback(owner, callback, cookie);
+                record_callback_result(owner, token, result);
+                if result != 0 {
+                    clear_irq_callback(owner, token, vector, callback_id);
+                    return;
+                }
+                continue;
+            }
+            // The timeout bounds teardown latency. An IRQ racing between the
+            // sample and waiter construction is noticed by the next sample.
+            let _ = narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(10))
+                .await;
+        }
+    });
+    0
+}
+
+/// Spawn one periodic task-context callback for a module-owned device. It
+/// polls immediately, then roughly every 1 ms while the callback returns zero.
+/// A non-zero return retires the poller.
+pub fn module_spawn_poller(owner: u64, token: u64, callback: ModuleCallbackFn, cookie: u64) -> i32 {
+    let callback_id = {
+        let mut g = DEVICE_CTXS.lock();
+        let Some(ctx) = g.iter_mut().find(|c| c.owner == owner && c.token == token) else {
+            return -19;
+        };
+        if ctx.cap.invoke(DeviceOp(|| ())).is_err() {
+            return -19;
+        }
+        if ctx.poller.is_some() {
+            return -16;
+        }
+        let callback_id = ctx.next_callback_id;
+        ctx.next_callback_id = ctx.next_callback_id.saturating_add(1);
+        ctx.poller = Some(ModulePoller {
+            callback,
+            cookie,
+            callback_id,
+        });
+        callback_id
+    };
+
+    narf_scheduler::spawn(async move {
+        loop {
+            if !poller_is_live(owner, token, callback, cookie, callback_id) {
+                return;
+            }
+            let result = call_module_callback(owner, callback, cookie);
+            record_callback_result(owner, token, result);
+            if result != 0 {
+                clear_poller(owner, token, callback_id);
+                return;
+            }
+            narf_time::sleep_cycles(narf_time::ns_to_cycles(1_000_000)).await;
+        }
+    });
+    0
+}
+
+fn module_net_tx_bridge(token: u64, frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
+    // The first module ABI advertises no offloads. Receiving non-plain metadata
+    // would mean the net registry and module contract drifted.
+    if meta != narf_net::TxMeta::plain() {
+        return Err(());
+    }
+    let (owner, cap, callback) = {
+        let g = DEVICE_CTXS.lock();
+        let ctx = g.iter().find(|ctx| ctx.token == token).ok_or(())?;
+        let iface = ctx.net_iface.as_ref().ok_or(())?;
+        (ctx.owner, ctx.cap, iface.tx_callback)
+    };
+    if cap.invoke(DeviceOp(|| ())).is_err() {
+        return Err(());
+    }
+    let result = call_module_tx(owner, callback, frame);
+    if let Some(ctx) = DEVICE_CTXS
+        .lock()
+        .iter_mut()
+        .find(|ctx| ctx.owner == owner && ctx.token == token)
+    {
+        ctx.net_tx_callbacks = ctx.net_tx_callbacks.saturating_add(1);
+        if result != 0 {
+            ctx.net_tx_failures = ctx.net_tx_failures.saturating_add(1);
+        }
+    }
+    match result {
+        0 => Ok(()),
+        _ => Err(()),
+    }
+}
+
+/// Register one copy-mode Ethernet interface for a module-owned device. The
+/// permanent in-tree send trampoline carries `token` back to this context and
+/// enters module text only through the lifecycle/domain gate.
+pub fn module_netif_register(
+    owner: u64,
+    token: u64,
+    mac: [u8; 6],
+    tx_callback: ModuleTxFn,
+) -> Result<u32, i32> {
+    let cap = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g
+            .iter()
+            .find(|ctx| ctx.owner == owner && ctx.token == token)
+        else {
+            return Err(-19);
+        };
+        if ctx.net_iface.is_some() {
+            return Err(-16);
+        }
+        ctx.cap
+    };
+    if cap.invoke(DeviceOp(|| ())).is_err() {
+        return Err(-19);
+    }
+
+    let name = narf_net::iface::register_with_context("eth%d", mac, token, module_net_tx_bridge);
+    let Some(ifindex) = narf_net::iface::ifindex_of(&name) else {
+        let _ = narf_net::iface::unregister(&name);
+        return Err(-5);
+    };
+
+    let mut g = DEVICE_CTXS.lock();
+    let Some(ctx) = g
+        .iter_mut()
+        .find(|ctx| ctx.owner == owner && ctx.token == token)
+    else {
+        drop(g);
+        let _ = narf_net::iface::unregister(&name);
+        return Err(-19);
+    };
+    if ctx.net_iface.is_some() {
+        drop(g);
+        let _ = narf_net::iface::unregister(&name);
+        return Err(-16);
+    }
+    ctx.net_iface = Some(ModuleNetIface {
+        name,
+        ifindex,
+        tx_callback,
+    });
+    Ok(ifindex)
+}
+
+/// Deliver one copied receive frame from module memory into the kernel stack.
+pub fn module_netif_rx(owner: u64, token: u64, ifindex: u32, frame: &mut [u8]) -> i32 {
+    let (cap, name) = {
+        let g = DEVICE_CTXS.lock();
+        let Some(ctx) = g
+            .iter()
+            .find(|ctx| ctx.owner == owner && ctx.token == token)
+        else {
+            return -19;
+        };
+        let Some(iface) = ctx
+            .net_iface
+            .as_ref()
+            .filter(|iface| iface.ifindex == ifindex)
+        else {
+            return -22;
+        };
+        (ctx.cap, iface.name.clone())
+    };
+    if cap.invoke(DeviceOp(|| ())).is_err() {
+        return -19;
+    }
+    narf_net::iface::on_rx_frame_from(&name, frame);
+    if let Some(ctx) = DEVICE_CTXS
+        .lock()
+        .iter_mut()
+        .find(|ctx| ctx.owner == owner && ctx.token == token)
+    {
+        ctx.net_rx_frames = ctx.net_rx_frames.saturating_add(1);
+    }
+    0
+}
+
 /// The single `PciProbeFn` installed for every module-registered match.
 /// Dispatches to the module's thunk by the discovered device's IDs.
 fn module_probe_trampoline(
     device: BusDevice,
-    _cap: Cap<BusDeviceCap, Write>,
+    cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), ProbeError> {
     let (vid, did) = (device.id.vendor, device.id.device);
     let thunk = MODULE_THUNKS
         .lock()
         .iter()
         .find(|t| t.vendor == vid && t.device == did)
-        .map(|t| t.thunk);
-    match thunk {
-        // 0 => the module bound the device. A negative errno => it declined;
-        // surfaced as a typed error so the probe trace records it without a
-        // more-specific driver being implied.
-        Some(f) => match f(addr_token(device.addr), 0) {
-            0 => Ok(()),
-            _ => Err(ProbeError::Other("module probe declined")),
-        },
-        None => Err(ProbeError::NotForThisDriver),
+        .map(|t| (t.owner, t.thunk));
+    let Some((owner, f)) = thunk else {
+        return Err(ProbeError::NotForThisDriver);
+    };
+    // Install the datapath context (device + cap) so the module's probe can
+    // drive the device through the datapath exports, then call the thunk.
+    let token = addr_token(device.addr);
+    install_device_ctx(owner, token, device, cap);
+    // 0 => the module bound the device; keep the context (module owns it). A
+    // negative errno => it declined; release the context + cap.
+    match call_module_probe(owner, f, token, 0) {
+        0 => Ok(()),
+        _ => {
+            remove_device_ctx(token);
+            Err(ProbeError::Other("module probe declined"))
+        }
     }
 }
 
@@ -431,6 +1455,7 @@ fn module_probe_trampoline(
 /// `probe` must be a valid [`ModuleProbeFn`] pointer that stays mapped for as
 /// long as the match is registered.
 pub unsafe fn register_module_pci_driver(
+    owner: u64,
     name: &str,
     vendor: u16,
     device: u16,
@@ -445,15 +1470,22 @@ pub unsafe fn register_module_pci_driver(
     let name = intern_name(name);
     {
         // Dedup on `(vendor, device)` so a re-registration replaces the thunk
-        // rather than growing the table (mirrors `register`'s idempotency).
+        // and its owner rather than growing the table.
         let mut g = MODULE_THUNKS.lock();
         if let Some(pos) = g
             .iter()
             .position(|t| t.vendor == vendor && t.device == device)
         {
+            if g[pos].owner != owner {
+                return -16; // -EBUSY: another module owns this match.
+            }
+            g[pos].owner = owner;
+            g[pos].name = name;
             g[pos].thunk = thunk;
         } else {
             g.push(ModuleThunk {
+                owner,
+                name,
                 vendor,
                 device,
                 thunk,
@@ -468,6 +1500,53 @@ pub unsafe fn register_module_pci_driver(
     0
 }
 
+/// Remove every PCI match, callback and device context owned by one loadable
+/// module. The caller must run the module's exit hook first so it can quiesce
+/// hardware while its resources are still reachable, and must call this
+/// before unmapping module text.
+pub fn unregister_module_pci_drivers(owner: u64) {
+    let owned_matches = {
+        let mut thunks = MODULE_THUNKS.lock();
+        let mut owned = Vec::new();
+        for thunk in thunks.iter().filter(|t| t.owner == owner) {
+            owned.push((thunk.name, thunk.vendor, thunk.device));
+        }
+        thunks.retain(|t| t.owner != owner);
+        owned
+    };
+
+    if !owned_matches.is_empty() {
+        REGISTRY.lock().retain(|entry| {
+            !owned_matches.iter().any(|(name, vendor, device)| {
+                entry.name == *name
+                    && entry.kind
+                        == (MatchKind::VendorDevice {
+                            vendor: *vendor,
+                            device: *device,
+                        })
+                    && entry.probe as usize == module_probe_trampoline as usize
+            })
+        });
+    }
+
+    let contexts = {
+        let mut all = DEVICE_CTXS.lock();
+        let mut owned = Vec::new();
+        let mut idx = 0;
+        while idx < all.len() {
+            if all[idx].owner == owner {
+                owned.push(all.remove(idx));
+            } else {
+                idx += 1;
+            }
+        }
+        owned
+    };
+    for ctx in contexts {
+        teardown_device_ctx(ctx);
+    }
+}
+
 #[doc(hidden)]
 /// Test-only: look up a module-registered thunk, so a smoke can confirm the
 /// registration round-trip reaches the module's probe.
@@ -480,9 +1559,132 @@ pub fn __module_thunk_for_test(vendor: u16, device: u16) -> Option<ModuleProbeFn
 }
 
 #[doc(hidden)]
+pub fn __module_device_context_count_for_test(owner: u64) -> usize {
+    DEVICE_CTXS
+        .lock()
+        .iter()
+        .filter(|ctx| ctx.owner == owner)
+        .count()
+}
+
+#[doc(hidden)]
+pub fn __module_dma_buffer_count_for_test(owner: u64) -> usize {
+    DEVICE_CTXS
+        .lock()
+        .iter()
+        .filter(|ctx| ctx.owner == owner)
+        .map(|ctx| ctx.dmabufs.iter().flatten().count())
+        .sum()
+}
+
+#[doc(hidden)]
+pub fn __module_callback_invocation_count_for_test(owner: u64) -> u64 {
+    DEVICE_CTXS
+        .lock()
+        .iter()
+        .filter(|ctx| ctx.owner == owner)
+        .map(|ctx| ctx.callback_invocations)
+        .sum()
+}
+
+#[doc(hidden)]
+pub fn __module_callback_failure_count_for_test(owner: u64) -> u64 {
+    DEVICE_CTXS
+        .lock()
+        .iter()
+        .filter(|ctx| ctx.owner == owner)
+        .map(|ctx| ctx.callback_failures)
+        .sum()
+}
+
+#[doc(hidden)]
+pub fn __module_irq_vector_count_for_test(owner: u64) -> usize {
+    DEVICE_CTXS
+        .lock()
+        .iter()
+        .filter(|ctx| ctx.owner == owner)
+        .map(|ctx| ctx.irqs.len())
+        .sum()
+}
+
+#[doc(hidden)]
+pub fn __module_netif_count_for_test(owner: u64) -> usize {
+    DEVICE_CTXS
+        .lock()
+        .iter()
+        .filter(|ctx| ctx.owner == owner && ctx.net_iface.is_some())
+        .count()
+}
+
+#[doc(hidden)]
+pub fn __module_netif_stats_for_test(owner: u64) -> (u64, u64, u64) {
+    let g = DEVICE_CTXS.lock();
+    g.iter()
+        .filter(|ctx| ctx.owner == owner)
+        .fold((0, 0, 0), |(tx, tx_err, rx), ctx| {
+            (
+                tx.saturating_add(ctx.net_tx_callbacks),
+                tx_err.saturating_add(ctx.net_tx_failures),
+                rx.saturating_add(ctx.net_rx_frames),
+            )
+        })
+}
+
+#[doc(hidden)]
+pub fn __module_netif_mac_for_test(owner: u64) -> Option<[u8; 6]> {
+    let name = {
+        let g = DEVICE_CTXS.lock();
+        g.iter()
+            .find(|ctx| ctx.owner == owner)
+            .and_then(|ctx| ctx.net_iface.as_ref())
+            .map(|iface| iface.name.clone())
+    };
+    narf_net::iface::lookup(&name?).map(|iface| iface.mac)
+}
+
+#[doc(hidden)]
+pub fn __module_dma_read_for_test(owner: u64, handle: u64, offset: u64, dst: &mut [u8]) -> bool {
+    let token = DEVICE_CTXS
+        .lock()
+        .iter()
+        .find(|ctx| ctx.owner == owner)
+        .map(|ctx| ctx.token);
+    token.is_some_and(|token| module_dma_read(owner, token, handle, offset, dst) == 0)
+}
+
+#[doc(hidden)]
+pub fn __module_dma_write_for_test(owner: u64, handle: u64, offset: u64, src: &[u8]) -> bool {
+    let token = DEVICE_CTXS
+        .lock()
+        .iter()
+        .find(|ctx| ctx.owner == owner)
+        .map(|ctx| ctx.token);
+    token.is_some_and(|token| module_dma_write(owner, token, handle, offset, src) == 0)
+}
+
+#[doc(hidden)]
+pub fn __module_netif_send_for_test(owner: u64, frame: &[u8]) -> bool {
+    let ifindex = {
+        let g = DEVICE_CTXS.lock();
+        g.iter()
+            .find(|ctx| ctx.owner == owner)
+            .and_then(|ctx| ctx.net_iface.as_ref())
+            .map(|iface| iface.ifindex)
+    };
+    ifindex.is_some_and(|ifindex| narf_net::iface::send_on_ifindex(ifindex, frame).is_ok())
+}
+
+#[doc(hidden)]
 /// Test-only: reset the registry between smokes. Keeps tests
 /// hermetic without exposing a public clear path.
 pub fn __reset_for_test() {
+    let contexts = {
+        let mut contexts = DEVICE_CTXS.lock();
+        core::mem::take(&mut *contexts)
+    };
+    for ctx in contexts {
+        teardown_device_ctx(ctx);
+    }
     REGISTRY.lock().clear();
     MODULE_THUNKS.lock().clear();
     INTERNED_NAMES.lock().clear();

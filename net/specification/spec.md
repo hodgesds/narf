@@ -59,6 +59,30 @@ The capability-gated interface registry is the canonical hardware inventory
 for the control plane. Compatibility views include every driver-backed entry,
 even when an interface has not also joined the legacy kernel IPv4 data path.
 
+The legacy in-kernel IPv4 path also supports unload-safe, context-bearing send
+dispatch for separately compiled drivers:
+
+```rust
+pub type SendFn = fn(&[u8], TxMeta) -> Result<(), ()>;
+pub type SendCtxFn = fn(u64, &[u8], TxMeta) -> Result<(), ()>;
+
+pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String;
+pub fn register_with_context(
+    name: &str,
+    mac: [u8; 6],
+    cookie: u64,
+    send: SendCtxFn,
+) -> String;
+pub fn unregister(name: &str) -> bool;
+```
+
+`register_with_context` stores only an opaque cookie and a permanent in-tree
+trampoline. It never stores module text directly. A snapshot may outlive
+`unregister`; invoking such a snapshot must fail closed when its cookie no
+longer resolves to a live owner/device context. Dispatch copies the hook out
+under the registry lock and invokes it after releasing the lock, matching the
+re-entry rules of `register`.
+
 ### 3.2 Frame rings
 
 ```rust
@@ -396,6 +420,14 @@ payload over `UDP_MAX_PAYLOAD` (65507) regardless of `SO_SNDBUF`, require
 `SO_BROADCAST` for exactly those broadcast destinations, drop an arriving
 datagram when the receive queue is full, and drop received datagrams whose
 length field is shorter than the header or longer than the segment.
+An IPv4 UDP send to an unresolved next hop retains the complete post-netfilter
+frame in a namespace/interface/neighbor-scoped bounded queue, starts ARP, and
+reports success without blocking. Learning the neighbor MAC patches and
+transmits every matching queued frame after releasing the queue lock. The
+queue is bounded to 256 packets and 1 MiB; overflow is `UdpError::QueueFull`
+and the Linux socket ABI reports `ENOBUFS`. Interface unregister, interface
+movement between network namespaces, and network namespace teardown discard
+their pending frames.
 ICMP errors quoting a UDP datagram reach sockets bound to the exact source
 address or to `INADDR_ANY` (`__udp4_lib_lookup`), and Parameter Problem is
 delivered like Destination Unreachable and Time Exceeded.

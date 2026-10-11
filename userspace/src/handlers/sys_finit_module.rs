@@ -14,7 +14,8 @@ pub(crate) fn sys_finit_module(ctx: &mut dyn TrapContext) {
     }
 
     let fd = args.arg0 as u32;
-    // arg1 = params_ptr, arg2 = flags — both ignored in Phase 1.
+    let params_ptr = args.arg1;
+    // arg2 = flags — no NARF-specific flags are defined yet.
     // Read the file via the fd table.
     let task = current_task_id();
     let resolved = fd::with_table(task, |t| {
@@ -42,9 +43,22 @@ pub(crate) fn sys_finit_module(ctx: &mut dyn TrapContext) {
         Ok(accum)
     });
     match outcome {
-        Some(Ok(bytes)) => ctx.set_return(SyscallReturn::ok(init_module_result(
-            narf_modules::syscalls::sys_finit_module(&bytes),
-        ))),
+        Some(Ok(bytes)) => {
+            let params = if params_ptr == 0 {
+                alloc::string::String::new()
+            } else {
+                match copy_user_cstr_checked(params_ptr, 4096) {
+                    Ok(params) => params,
+                    Err(errno) => {
+                        ctx.set_return(errno_ret(errno));
+                        return;
+                    }
+                }
+            };
+            ctx.set_return(SyscallReturn::ok(init_module_result(
+                narf_modules::syscalls::sys_finit_module_with_params(&bytes, &params),
+            )));
+        }
         _ => ctx.set_return(errno_ret(EBADF)),
     }
 }

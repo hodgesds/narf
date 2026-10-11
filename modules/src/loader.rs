@@ -43,6 +43,8 @@ pub enum LoadError {
     Manifest(ManifestError),
     /// `target_domain=` references an unknown domain.
     Domain(crate::domain::DomainError),
+    /// An operator-supplied `domain=` load parameter was rejected.
+    DomainOverride(crate::domain::DomainError),
     /// Symbol table missing or empty.
     NoSymbols,
     /// Required modular ELF invariants violated (e.g. SHF_EXECINSTR +
@@ -164,6 +166,20 @@ impl Module {
 /// Top-level load entry point. Walks the image through every stage
 /// and returns the populated Module on success.
 pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
+    load_image_with_domain(image, None)
+}
+
+/// Load a module with an optional operator-selected isolation domain.
+///
+/// `target_domain=` in `.modinfo` is an author hint.  A caller holding module
+/// load authority may override it at load time; the effective value still
+/// passes through [`domain::resolve_module`], which never permits module text
+/// in `DomainId::FRAME`.  Built-in drivers do not use this path: their frame
+/// placement remains a compile-time property of the kernel image.
+pub fn load_image_with_domain(
+    image: &[u8],
+    target_domain: Option<&str>,
+) -> Result<Arc<Module>, LoadError> {
     let stored_size = image.len();
 
     if crate::compression::is_compressed(image) {
@@ -175,7 +191,7 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         let compressed = sign::payload_after_verify(image).map_err(LoadError::SignatureRejected)?;
         let elf = crate::compression::decompress(compressed)?;
         let (hdr, manifest) = identify_elf(&elf)?;
-        return load_identified_elf(&elf, stored_size, hdr, manifest);
+        return load_identified_elf(&elf, stored_size, hdr, manifest, target_domain);
     }
 
     // Raw ELF retains the Linux-compatibility distinction: minimally identify
@@ -184,7 +200,7 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
     let (hdr, manifest) = identify_elf(image)?;
     verify_recognized_image(image)?;
     let elf = sign::payload_after_verify(image).map_err(LoadError::SignatureRejected)?;
-    load_identified_elf(elf, stored_size, hdr, manifest)
+    load_identified_elf(elf, stored_size, hdr, manifest, target_domain)
 }
 
 fn verify_recognized_image(image: &[u8]) -> Result<(), LoadError> {
@@ -221,10 +237,14 @@ fn load_identified_elf(
     stored_size: usize,
     hdr: Elf64Header,
     manifest: Manifest,
+    target_domain: Option<&str>,
 ) -> Result<Arc<Module>, LoadError> {
     // Authentication has completed before this point. Only now may
     // authority-bearing manifest fields affect allocation or execution.
-    let domain_id = domain::resolve(&manifest.target_domain)?;
+    let domain_id = match target_domain {
+        Some(name) => domain::resolve_module(name).map_err(LoadError::DomainOverride)?,
+        None => domain::resolve_module(&manifest.target_domain).map_err(LoadError::Domain)?,
+    };
 
     // W^X invariant check on every loadable section.
     for (i, shdr, name) in enumerate_sections(image, &hdr) {
@@ -784,12 +804,14 @@ pub unsafe fn invoke_init(module: &Module) -> Result<(), crate::lifecycle::Lifec
 /// The module must be in state Live (or Going if a previous attempt
 /// re-entered this function partway).
 pub unsafe fn invoke_exit(module: &Module) -> Result<(), crate::lifecycle::LifecycleError> {
+    let mut state = module.state.lock();
     if !module.refcount.is_zero() {
         return Err(crate::lifecycle::LifecycleError::Busy(
             module.refcount.snapshot(),
         ));
     }
-    *module.state.lock() = ModuleState::Going;
+    *state = ModuleState::Going;
+    drop(state);
     if let Some(exit_addr) = module.exit_addr {
         // SAFETY: `exit_addr` is the runtime address of the module's
         // `cleanup_module` symbol, resolved from the relocated image during

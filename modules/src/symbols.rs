@@ -74,6 +74,17 @@ pub fn alloc_module_id() -> ModuleId {
 
 static CURRENT_INIT_MODULE_ID: AtomicU64 = AtomicU64::new(KERNEL_MODULE_ID.0);
 
+/// Module whose non-lifecycle callback is executing through a kernel call
+/// gate. Datapath exports use this owner id to keep opaque device handles from
+/// becoming ambient authority shared by every loaded module.
+static CURRENT_EXECUTION_MODULE_ID: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(KERNEL_MODULE_ID.0) }; narf_lib::percpu::MAX_CPUS];
+
+fn execution_context_slot() -> &'static AtomicU64 {
+    &CURRENT_EXECUTION_MODULE_ID
+        [narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)]
+}
+
 /// Set the module-init attribution context. Called by `loader::invoke_init`
 /// immediately before the module's init function runs.
 pub fn set_init_context(id: ModuleId) {
@@ -84,6 +95,17 @@ pub fn set_init_context(id: ModuleId) {
 /// or `KERNEL_MODULE_ID` if no init is in progress.
 pub fn current_init_id() -> ModuleId {
     ModuleId(CURRENT_INIT_MODULE_ID.load(Ordering::Acquire))
+}
+
+/// Replace the current callback owner and return the previous value so nested
+/// kernel-to-module calls can restore it exactly.
+pub fn swap_execution_context(id: ModuleId) -> ModuleId {
+    ModuleId(execution_context_slot().swap(id.0, Ordering::AcqRel))
+}
+
+/// Owner of the module callback currently running through a call gate.
+pub fn current_execution_id() -> ModuleId {
+    ModuleId(execution_context_slot().load(Ordering::Acquire))
 }
 
 // ── KernelExport ─────────────────────────────────────────────────────
@@ -298,6 +320,9 @@ pub fn export_count() -> usize {
 pub fn __reset_for_test() {
     KSYMTAB.lock().clear();
     CURRENT_INIT_MODULE_ID.store(KERNEL_MODULE_ID.0, Ordering::Release);
+    for owner in &CURRENT_EXECUTION_MODULE_ID {
+        owner.store(KERNEL_MODULE_ID.0, Ordering::Release);
+    }
     // Reset to the BOOT state, not to an empty table. Since `kabi` began
     // registering a real ABI surface at `Stage::Subsys`, clearing outright
     // would leave every subsequent module load in this boot unable to resolve

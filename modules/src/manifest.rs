@@ -11,8 +11,8 @@
 //!   * `required_caps=NetIface:Write,DmaRegion:Invoke` — cap requirements
 //!     enforced by the relocator when the module imports a cap-typed
 //!     export.
-//!   * `target_domain=net` — the PKS-isolated domain in which the
-//!     module's text and data are placed.
+//!   * `target_domain=net` — the author's default PKS-isolated placement.
+//!     A load-authority holder may override it with `domain=` at load time.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;

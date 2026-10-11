@@ -32,9 +32,7 @@ pub(crate) fn sys_init_module(ctx: &mut dyn TrapContext) {
 
     let ptr = args.arg0;
     let len = args.arg1 as usize;
-    // arg2 = params_ptr — parsed/used by `narf_modules::loader` once the
-    // param string parser lands. Phase 1 ignores user-supplied params;
-    // modules read static `.narf_kparams` from their ELF.
+    let params_ptr = args.arg2;
 
     // `copy_module_from_user`: `if (info->len < sizeof(*(info->hdr))) return
     // -ENOEXEC;`. Too short to hold an Elf64 header is a malformed image, not
@@ -68,7 +66,21 @@ pub(crate) fn sys_init_module(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // Linux accepts a NUL-terminated parameter string. NARF consumes
+    // `domain=<name>` here to select the module's effective isolation frame;
+    // NULL means no override and preserves the signed manifest hint.
+    let params = if params_ptr == 0 {
+        alloc::string::String::new()
+    } else {
+        match copy_user_cstr_checked(params_ptr, 4096) {
+            Ok(params) => params,
+            Err(errno) => {
+                ctx.set_return(fail(errno));
+                return;
+            }
+        }
+    };
     ctx.set_return(SyscallReturn::ok(init_module_result(
-        narf_modules::syscalls::sys_init_module(&owned),
+        narf_modules::syscalls::sys_init_module_with_params(&owned, &params),
     )));
 }

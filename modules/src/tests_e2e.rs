@@ -41,7 +41,9 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 use crate::elf::header::{ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB};
 use crate::elf::symbols::{SHN_ABS, STB_GLOBAL, STT_FUNC};
-use crate::syscalls::{sys_delete_module, sys_init_module, ModuleSyscallError};
+use crate::syscalls::{
+    sys_delete_module, sys_init_module, sys_init_module_with_params, ModuleSyscallError,
+};
 
 // ── Observable side-effects ─────────────────────────────────────────
 //
@@ -422,6 +424,41 @@ fn e2e_load_to_live() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/e2e", e2e_load_to_live);
+
+/// The load-authority holder, rather than the module author, selects the
+/// effective isolation frame. The manifest remains an author hint and FRAME
+/// itself remains reserved for statically linked TCB code.
+fn e2e_load_time_domain_override() -> TestResult {
+    let abi = fresh_abi();
+    fresh_state(abi);
+    let elf = standard_test_elf("e2e_domain_override", abi);
+
+    let module = match sys_init_module_with_params(&elf, "domain=driver3") {
+        Ok(module) => module,
+        Err(_) => return TestResult::Fail("valid load-time domain override was rejected"),
+    };
+    if module.manifest.target_domain != "scratch" {
+        return TestResult::Fail("load-time override mutated the signed manifest hint");
+    }
+    if module.domain != narf_lib::id::DomainId::DRIVER_3 {
+        return TestResult::Fail("load-time override did not select DRIVER_3");
+    }
+    drop(module);
+    if sys_delete_module("e2e_domain_override").is_err() {
+        return TestResult::Fail("domain-override module failed to unload");
+    }
+
+    // Even a later alias registration cannot make FRAME a legal runtime
+    // target for separately loaded text.
+    crate::domain::register_domain("frame-test", narf_lib::id::DomainId::FRAME);
+    match sys_init_module_with_params(&elf, "domain=frame-test") {
+        Err(ModuleSyscallError::Load(crate::loader::LoadError::DomainOverride(
+            crate::domain::DomainError::FrameReserved,
+        ))) => TestResult::Pass,
+        _ => TestResult::Fail("runtime module was allowed into the FRAME domain"),
+    }
+}
+kernel_test_in!("modules/e2e", e2e_load_time_domain_override);
 
 // ── Smoke 2: module-published export visible ────────────────────────
 //
@@ -844,22 +881,21 @@ fn e2e_real_rust_module_loads_raw_and_compressed() -> TestResult {
 }
 kernel_test_in!("modules/e2e", e2e_real_rust_module_loads_raw_and_compressed);
 
-// ── Smoke 9: a real dual-build driver `.ko` loads and REGISTERS ────────
+// ── Smoke 9: a real dual-build driver `.ko` loads and DRIVES the device ──
 
 /// The capstone of the loadable-driver work: load the rustc-built
 /// `narf-drivers-net-e1000` `.ko` (the same crate the kernel links as a
-/// built-in) and prove it registers a PCI driver through the
-/// `narf_register_pci_driver` KSYMTAB export.
+/// built-in) and prove it (a) registers through the `narf_register_pci_driver`
+/// KSYMTAB export, and (b) actually **drives the real QEMU e1000** through the
+/// device-datapath C-ABI — the module's `probe_c` enables the device, maps
+/// BAR0, and reads STATUS + the MAC off the silicon, all via exports, holding
+/// only an opaque device token + BAR handle.
 ///
-/// Registration-only: the module's probe thunk returns `-ENOSYS` because the
-/// device datapath ABI is not yet exported. So this proves the loadable-driver
-/// *mechanism* end-to-end — build → load → `narf_module_init` → the bus
-/// records the module's probe thunk — not a bound NIC from a `.ko`.
-///
-/// Observing `MODULE_THUNKS` (via `__module_thunk_for_test`) is collision-free:
-/// only a *module* registration populates it, so a match left by the built-in
-/// e1000 (which uses a real `PciProbeFn`) can never be mistaken for this.
-fn e2e_driver_module_registers_pci_match() -> TestResult {
+/// On a VM without an e1000 the datapath half is skipped but the registration +
+/// bogus-token-rejection halves still run. `MODULE_THUNKS`
+/// (`__module_thunk_for_test`) is collision-free: only a *module* registration
+/// populates it, so the built-in e1000's `PciProbeFn` can't be mistaken for it.
+fn e2e_driver_module_drives_device() -> TestResult {
     const E1000_VENDOR: u16 = 0x8086;
     const E1000_DEV_82540EM: u16 = 0x100E;
 
@@ -880,7 +916,7 @@ fn e2e_driver_module_registers_pci_match() -> TestResult {
     crate::sign::install_verifier(alloc::boxed::Box::new(crate::sign::AcceptAll));
     let abi = crate::symbols::compute_abi_hash();
     crate::symbols::set_kernel_abi(abi);
-    // Start the bus match table clean so the assertion sees only this load.
+    // Start the bus match table clean so probe_all sees only this module.
     narf_bus::driver_match::__reset_for_test();
 
     // Stamp the live ABI over xtask's zero placeholder, as the loader expects.
@@ -896,43 +932,212 @@ fn e2e_driver_module_registers_pci_match() -> TestResult {
     let stamped = format!("{abi:08x}");
     image[value_at..value_at + 8].copy_from_slice(stamped.as_bytes());
 
-    let module = match sys_init_module(&image) {
+    // The module advertises `target_domain=net` (DRIVER_0), but the holder of
+    // module-load authority places this instance in DRIVER_2. A built-in
+    // e1000 keeps its compile-time registration path and never consumes this
+    // loader parameter.
+    let module = match sys_init_module_with_params(&image, "domain=driver2") {
         Ok(module) => module,
         Err(_) => return TestResult::Fail("driver module failed to load or run init"),
     };
     if module.name() != "e1000" {
         return TestResult::Fail("driver module manifest name mismatch");
     }
-    if module.domain != narf_lib::id::DomainId::DRIVER_0 {
-        return TestResult::Fail("target_domain=net was not placed in DRIVER_0");
+    if module.domain != narf_lib::id::DomainId::DRIVER_2 {
+        return TestResult::Fail("load-time domain did not override target_domain=net");
     }
     if *module.state.lock() != crate::lifecycle::ModuleState::Live {
         return TestResult::Fail("driver module did not reach Live");
     }
 
     // narf_module_init ran register() -> narf_register_pci_driver, so the bus
-    // recorded the module's probe thunk for (vendor, device). Calling it yields
-    // the registration-only -ENOSYS.
+    // recorded the module's probe thunk for (vendor, device).
     match narf_bus::driver_match::__module_thunk_for_test(E1000_VENDOR, E1000_DEV_82540EM) {
         Some(thunk) => {
-            if thunk(0, 0) != -38 {
-                return TestResult::Fail("module probe thunk did not return -ENOSYS");
+            // A bogus token (no device context) must be rejected, not claimed.
+            if thunk(0, 0) == 0 {
+                return TestResult::Fail("module probe_c claimed success for an unknown device");
             }
         }
         None => return TestResult::Fail("driver module did not register its PCI match"),
     }
 
-    // Drop the bus registration FIRST so no trampoline references the module's
-    // probe thunk, then unload — this is the ordering a future deregistration
-    // path must enforce, and it keeps the unload free of a dangling thunk.
-    narf_bus::driver_match::__reset_for_test();
+    // Drive the real device: run the PCI probe so the trampoline installs the
+    // datapath context and calls probe_c, which enables + MMIO-reads the e1000.
+    #[cfg(target_arch = "x86_64")]
+    {
+        use narf_bus::{bootstrap_registry_authority, devices, probe_all_pci, BusKind};
+        // SAFETY: ECAM_DEFAULT_BASE is the q35 MMCONFIG window the harness maps;
+        // `init` only walks that ECAM region and is idempotent on re-entry.
+        let _ = unsafe { narf_bus::init(narf_bus::x86_64::ECAM_DEFAULT_BASE) };
+        let has_e1000 = devices().iter().any(|d| {
+            matches!(&d.kind, BusKind::Pcie { .. })
+                && d.id.vendor == E1000_VENDOR
+                && d.id.device == E1000_DEV_82540EM
+        });
+        if has_e1000 {
+            let authority = bootstrap_registry_authority();
+            match probe_all_pci(&authority) {
+                // Only the module's match is registered (we reset the table), so
+                // a bind means the module's probe_c drove the device and returned 0.
+                Ok(n) if n >= 1 => {}
+                Ok(_) => {
+                    narf_bus::driver_match::__reset_for_test();
+                    return TestResult::Fail(
+                        "probe_all bound 0 — module probe_c did not drive the e1000",
+                    );
+                }
+                Err(_) => {
+                    narf_bus::driver_match::__reset_for_test();
+                    return TestResult::Fail("probe_all_pci failed");
+                }
+            }
+            // Two descriptor rings + 8 TX buffers + 256 RX buffers. The
+            // Stage-2 scratch allocation was freed before ring bring-up.
+            if narf_bus::driver_match::__module_dma_buffer_count_for_test(module.id.0) != 266 {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail(
+                    "module probe did not retain the expected DMA rings/buffers",
+                );
+            }
+            // The poller calls module text only from executor context through
+            // the lifecycle/domain gate. Its first poll is immediate; later
+            // polls remain live as the legacy-IRQ fallback for this NIC.
+            let _ = narf_scheduler::poll_one_round();
+            if narf_bus::driver_match::__module_callback_invocation_count_for_test(module.id.0) == 0
+            {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("module task-context poll callback did not run");
+            }
+            if narf_bus::driver_match::__module_callback_failure_count_for_test(module.id.0) != 0 {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("module task-context poll callback returned an error");
+            }
+            if narf_bus::driver_match::__module_dma_buffer_count_for_test(module.id.0) != 266 {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("poll callback changed the persistent DMA buffer set");
+            }
+            if narf_bus::driver_match::__module_netif_count_for_test(module.id.0) != 1 {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("module did not register exactly one network interface");
+            }
+
+            // Send a real ARP request through the registered interface. The
+            // in-tree context trampoline enters module text, the module posts
+            // a TX descriptor, and waits through the bounded DMA primitive
+            // until QEMU reports hardware completion. RX is exercised
+            // separately below because this test boot has already bound the
+            // same physical device to the built-in driver.
+            let Some(source_mac) = narf_bus::driver_match::__module_netif_mac_for_test(module.id.0)
+            else {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("module network interface lost its hardware MAC");
+            };
+            let mut arp = [0u8; 42];
+            arp[..6].fill(0xff);
+            arp[6..12].copy_from_slice(&source_mac);
+            arp[12..14].copy_from_slice(&[0x08, 0x06]);
+            arp[14..22].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]);
+            arp[22..28].copy_from_slice(&source_mac);
+            arp[28..32].copy_from_slice(&[10, 0, 2, 15]);
+            arp[38..42].copy_from_slice(&[10, 0, 2, 2]);
+            if !narf_bus::driver_match::__module_netif_send_for_test(module.id.0, &arp) {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("module network interface failed ARP transmit");
+            }
+            let (tx, tx_err, _) =
+                narf_bus::driver_match::__module_netif_stats_for_test(module.id.0);
+            if tx != 1 || tx_err != 0 {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("module TX callback accounting mismatch");
+            }
+            // This guest boot already bound the built-in e1000 before the
+            // module smoke runs. A production module-only build has exclusive
+            // device ownership; rebinding the live test NIC leaves the old
+            // driver's background state attached. Keep the real TX/completion
+            // proof above, then emulate one device RX completion in the
+            // module-owned coherent ring so the RX copy, callback gate, stack
+            // delivery, and descriptor-rearm path are deterministic.
+            let mut reply = [0u8; 64];
+            reply[..6].copy_from_slice(&source_mac);
+            reply[6..12].copy_from_slice(&[0x52, 0x55, 10, 0, 2, 2]);
+            reply[12..14].copy_from_slice(&[0x08, 0x06]);
+            reply[14..22].copy_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x02]);
+            reply[22..28].copy_from_slice(&[0x52, 0x55, 10, 0, 2, 2]);
+            reply[28..32].copy_from_slice(&[10, 0, 2, 2]);
+            reply[32..38].copy_from_slice(&source_mac);
+            reply[38..42].copy_from_slice(&[10, 0, 2, 15]);
+
+            // Handle 1 was the freed Stage-2 scratch buffer and must never be
+            // reused. The persistent layout is therefore TX ring = 2, RX ring
+            // = 3, eight TX buffers = 4..11, RX[0] = 12.
+            let owner = module.id.0;
+            let mut rx_desc = [0u8; 16];
+            if !narf_bus::driver_match::__module_dma_read_for_test(owner, 3, 0, &mut rx_desc)
+                || !narf_bus::driver_match::__module_dma_write_for_test(owner, 12, 0, &reply)
+            {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("could not stage module RX descriptor completion");
+            }
+            rx_desc[8..10].copy_from_slice(&(reply.len() as u16).to_le_bytes());
+            rx_desc[12] = 0x03; // legacy RX DD | EOP
+            rx_desc[13] = 0;
+            if !narf_bus::driver_match::__module_dma_write_for_test(owner, 3, 0, &rx_desc) {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("could not publish module RX descriptor completion");
+            }
+
+            let callbacks_before_rx =
+                narf_bus::driver_match::__module_callback_invocation_count_for_test(owner);
+            let received = narf_scheduler::responsive_spin_until(
+                || {
+                    // Kernel tests run outside the executor's main loop. Pump
+                    // it explicitly so the module's periodic RX callback can
+                    // observe the asynchronous reply from QEMU's SLIRP peer.
+                    let _ = narf_scheduler::poll_one_round();
+                    narf_bus::driver_match::__module_netif_stats_for_test(owner).2 > 0
+                },
+                narf_time::Deadline::after_ms(100),
+            );
+            if !received {
+                let callbacks_after_rx =
+                    narf_bus::driver_match::__module_callback_invocation_count_for_test(
+                        module.id.0,
+                    );
+                narf_bus::driver_match::__reset_for_test();
+                if callbacks_after_rx <= callbacks_before_rx {
+                    return TestResult::Fail("module periodic RX callback was not rescheduled");
+                }
+                return TestResult::Fail("module RX ring did not receive the ARP reply");
+            }
+            let mut rearmed = [0u8; 16];
+            if !narf_bus::driver_match::__module_dma_read_for_test(owner, 3, 0, &mut rearmed)
+                || rearmed[12] != 0
+            {
+                narf_bus::driver_match::__reset_for_test();
+                return TestResult::Fail("module RX callback did not rearm its descriptor");
+            }
+        }
+    }
+
+    // Unload itself must tear down the registration + cap-bearing datapath
+    // context before freeing module text; a test-only registry reset here
+    // would hide a dangling callback.
+    let owner = module.id.0;
     drop(module);
     if sys_delete_module("e1000").is_err() {
         return TestResult::Fail("driver module failed to unload");
     }
+    if narf_bus::driver_match::__module_thunk_for_test(E1000_VENDOR, E1000_DEV_82540EM).is_some() {
+        return TestResult::Fail("driver module unload left a PCI probe callback");
+    }
+    if narf_bus::driver_match::__module_device_context_count_for_test(owner) != 0 {
+        return TestResult::Fail("driver module unload left a device context");
+    }
+    narf_bus::driver_match::__reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!("modules/e2e", e2e_driver_module_registers_pci_match);
+kernel_test_in!("modules/e2e", e2e_driver_module_drives_device);
 
 // ── Helper kept around so the test harness sees a use of `String`
 // even on toolchains that elide unused imports during macro expansion.

@@ -23,6 +23,7 @@
 extern crate alloc;
 
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -349,6 +350,85 @@ pub enum UdpError {
     IcmpError,
     /// ARP resolution for the destination failed.
     NetworkUnreachable,
+    /// The bounded unresolved-neighbor transmit queue is full.
+    QueueFull,
+}
+
+/// An IPv4 UDP frame retained while ARP resolves its next hop.
+///
+/// Linux queues the skb on the neighbor entry (`neigh_resolve_output`) and
+/// reports a successful send. Keeping the complete post-netfilter frame here
+/// gives NARF the same first-datagram behavior without blocking `sendto(2)`.
+#[derive(Debug)]
+struct PendingUdp4 {
+    net_ns_id: u64,
+    iface: String,
+    neighbor: [u8; 4],
+    frame: Vec<u8>,
+}
+
+const MAX_PENDING_UDP4_PACKETS: usize = 256;
+const MAX_PENDING_UDP4_BYTES: usize = 1024 * 1024;
+static PENDING_UDP4: IrqSafeSpinLock<VecDeque<PendingUdp4>> = IrqSafeSpinLock::new(VecDeque::new());
+
+fn queue_udp4(packet: PendingUdp4) -> Result<(), UdpError> {
+    let mut queue = PENDING_UDP4.lock();
+    let bytes: usize = queue.iter().map(|entry| entry.frame.len()).sum();
+    if queue.len() >= MAX_PENDING_UDP4_PACKETS
+        || bytes.saturating_add(packet.frame.len()) > MAX_PENDING_UDP4_BYTES
+    {
+        return Err(UdpError::QueueFull);
+    }
+    queue.push_back(packet);
+    Ok(())
+}
+
+/// Flush UDP frames waiting for this neighbor after an ARP packet teaches us
+/// its MAC address. The queue lock is released before any driver callback.
+pub(crate) fn neighbor_resolved(net_ns_id: u64, iface_name: &str, neighbor: [u8; 4], mac: [u8; 6]) {
+    let mut ready = Vec::new();
+    {
+        let mut queue = PENDING_UDP4.lock();
+        let mut retained = VecDeque::new();
+        while let Some(packet) = queue.pop_front() {
+            if packet.net_ns_id == net_ns_id
+                && packet.iface == iface_name
+                && packet.neighbor == neighbor
+            {
+                ready.push(packet);
+            } else {
+                retained.push_back(packet);
+            }
+        }
+        *queue = retained;
+    }
+    let Some(iface) = iface::lookup_in(net_ns_id, iface_name) else {
+        return;
+    };
+    for mut packet in ready {
+        packet.frame[..6].copy_from_slice(&mac);
+        let _ = iface.xmit(&packet.frame);
+    }
+}
+
+pub(crate) fn remove_interface(iface_name: &str) {
+    PENDING_UDP4
+        .lock()
+        .retain(|packet| packet.iface != iface_name);
+}
+
+#[doc(hidden)]
+pub fn __pending_udp4_test_count(net_ns_id: u64) -> usize {
+    PENDING_UDP4
+        .lock()
+        .iter()
+        .filter(|packet| packet.net_ns_id == net_ns_id)
+        .count()
+}
+
+#[doc(hidden)]
+pub fn __reset_pending_udp4_for_test() {
+    PENDING_UDP4.lock().clear();
 }
 
 /// Bind a new UDP socket to `local`. If `local.port == 0`, an
@@ -521,33 +601,36 @@ fn udp_send_inner(
     let dst_ip = dst.ip;
     let dst_port = dst.port;
 
-    // Resolve the destination MAC.  For broadcast, use ff:ff:ff:ff:ff:ff.
-    let dst_mac = if is_broadcast {
-        [0xFF; 6]
+    // Resolve the route's NEXT HOP, not the destination. Linux's
+    // `ip_neigh_for_gw()` (include/net/route.h) uses the route's gateway when
+    // it has one and the destination only when it does not (`rt_nexthop()`).
+    let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(dst_ip))
+        .map(|r| r.nexthop.0)
+        .unwrap_or(dst_ip);
+    // `arp_timeout_ms == 0` is the userspace-send path: never block sendto on
+    // neighbor discovery. Build the complete frame with a placeholder MAC,
+    // queue it below, and let the ARP RX path patch + transmit it.
+    let pending_neighbor = if is_broadcast {
+        None
+    } else if let Some(mac) = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop) {
+        Some(Ok(mac))
+    } else if arp_timeout_ms == 0 {
+        if crate::arp_cache::resolution_failed(&iface.name, nexthop) {
+            return Err(UdpError::NetworkUnreachable);
+        }
+        Some(Err(nexthop))
     } else {
-        // `arp_timeout_ms == 0` means "do not wait": `ip_finish_output2`
-        // hands an unresolved destination to `neigh_output`, which queues
-        // the skb, fires an ARP request and returns — `sendmsg` never
-        // blocks on resolution. Blocking a caller for a second inside
-        // sendto is the one behaviour Linux definitely does not have.
-        //
-        // NARF has no neighbour queue, so an unresolved first datagram is
-        // dropped rather than held. That IS a divergence, and a smaller one
-        // than stalling the caller: the ARP request still goes out, so the
-        // next datagram resolves.
-        // Resolve the route's NEXT HOP, not the destination. Linux's
-        // `ip_neigh_for_gw()` (include/net/route.h) uses the route's gateway
-        // when it has one and the destination only when it does not, which is
-        // `rt_nexthop()`. ARPing an off-link destination asks the local link
-        // about a host that is not on it, so it can never resolve and every
-        // off-link datagram failed `NetworkUnreachable`. Correct for an
-        // on-link peer, where the next hop IS the destination, which is why
-        // every existing smoke passed.
-        let nexthop = crate::route::route_lookup_in(net_ns_id, crate::ipv4::Ipv4Addr(dst_ip))
-            .map(|r| r.nexthop.0)
-            .unwrap_or(dst_ip);
-        crate::tcp_stack::arp_resolve_in(net_ns_id, nexthop, arp_timeout_ms)
-            .map_err(|_| UdpError::NetworkUnreachable)?
+        Some(Ok(crate::tcp_stack::arp_resolve_in(
+            net_ns_id,
+            nexthop,
+            arp_timeout_ms,
+        )
+        .map_err(|_| UdpError::NetworkUnreachable)?))
+    };
+    let dst_mac = match pending_neighbor {
+        None => [0xFF; 6],
+        Some(Ok(mac)) => mac,
+        Some(Err(_)) => [0; 6],
     };
 
     let udp_len = UDP_HDR_LEN + payload.len();
@@ -618,6 +701,21 @@ fn udp_send_inner(
     {
         return Ok(payload.len());
     }
+    if let Some(Err(neighbor)) = pending_neighbor {
+        queue_udp4(PendingUdp4 {
+            net_ns_id,
+            iface: iface.name.clone(),
+            neighbor,
+            frame,
+        })?;
+        // Queue before starting ARP so an immediate reply cannot race past
+        // the pending frame. If another sender resolved it between our cache
+        // lookup and this call, flush synchronously with the returned MAC.
+        if let Ok(mac) = crate::tcp_stack::arp_resolve_in(net_ns_id, neighbor, 0) {
+            neighbor_resolved(net_ns_id, &iface.name, neighbor, mac);
+        }
+        return Ok(payload.len());
+    }
     iface.xmit(&frame).map_err(|_| UdpError::NoInterface)?;
     Ok(payload.len())
 }
@@ -661,6 +759,9 @@ pub(crate) fn remove_namespace(net_ns_id: u64) {
             .lock()
             .retain(|(_, socket)| socket.net_ns_id != net_ns_id);
     }
+    PENDING_UDP4
+        .lock()
+        .retain(|packet| packet.net_ns_id != net_ns_id);
 }
 
 // ── RX dispatch ────────────────────────────────────────────────────
