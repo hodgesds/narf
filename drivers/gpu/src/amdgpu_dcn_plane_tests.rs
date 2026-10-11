@@ -28,8 +28,33 @@ fn block(instance: u8, size: u32) -> Block<Fake> {
         io: Fake::new(size),
         authority: Cap::bootstrap(),
         instance,
+        profile: Profile::Dcn314,
     }
 }
+fn plane_navi22_routes_sixth_dpp_and_opp() -> TestResult {
+    let mut mpc = block(5, 0x0594);
+    mpc.profile = Profile::Navi22;
+    mpc.mpc_mux_plane(5, 5).unwrap();
+    if mpc.io.values[0xa0] & 0xf != 5
+        || mpc.io.values[0xa1] & 0xf != 15
+        || mpc.io.values[0xa2] & 0xf != 5
+        || mpc.io.values[0x594] & 0xf != 5
+    {
+        return TestResult::Fail("DCN30 sixth plane mux");
+    }
+    let count = mpc.io.writes.len();
+    if mpc.mpc_mux_plane(6, 0) != Err(Error::Invalid)
+        || mpc.mpc_mux_plane(0, 6) != Err(Error::Invalid)
+        || mpc.io.writes.len() != count
+    {
+        return TestResult::Fail("DCN30 instance limit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-plane",
+    plane_navi22_routes_sixth_dpp_and_opp
+);
 
 fn plane_dpp_bypasses_the_scaler_for_an_unscaled_plane() -> TestResult {
     // Drive the same register writes the public Dpp performs, on instance 1.

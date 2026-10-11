@@ -140,6 +140,7 @@ pub mod amdgpu_dcn_hubp;
 pub mod amdgpu_dcn_inventory;
 pub mod amdgpu_dcn_otg;
 pub mod amdgpu_dcn_plane;
+mod amdgpu_dcn_profile;
 pub mod amdgpu_dcn_stream;
 pub mod amdgpu_ddc;
 pub mod amdgpu_dio;

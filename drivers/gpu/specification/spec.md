@@ -457,6 +457,24 @@ and immutable boot report do not replace this live transport diagnostic.
 
 ### Coordinated Navi 22 firmware bring-up
 
+The shared `Otg`, `Hubp`, `Dpp`, `Mpc`, `Opp`, `Stream` and `Dccg` constructors
+also resolve an exact Navi22/DCN 3.0.0 profile, with six pipes/stream encoders.
+Other DCN revisions remain unsupported unless already covered by the Phoenix
+profile. Discovery must identify a unique DCN instance and each selected bank
+must include the last register of all supported instances; no I/O occurs during
+construction. Clock-rate and mode-math ownership remain separate prerequisites.
+
+Navi22 OTG uses its shifted clock/global-sync registers, VTG base `0x0528`,
+ODM segment selectors starting at bit 8, and DCN20's disable-point code 3.
+Disable follows `optc1_disable_crtc`, preserving ODM routing while retiring the
+generator. HUBP's detile-plane field is bits 0..11 and preserves the adjacent
+pack-control bit. DCN30 stream unblank resets `DIG_FE_CNTL.DIG_START` before
+the steering FIFO, and preserves the pixel-format bit that exists only on
+DCN314. DPP/OPP/MPC ids, strides and used fields match the two Linux headers.
+DCCG supports all six DPP DTOs and the shared DENTIST divider read/resync;
+Phoenix-only pixel-rate and DPIA mux methods return `Unsupported` before I/O
+on Navi22. These blocks do not by themselves establish a native display mode.
+
 `amdgpu_navi22_boot::Firmware::open(gpu, registry_cap)` validates every required
 register bank and prepares the SOS, SMC and SDMA/CP/RLC firmware sets before any
 device operation. Missing required firmware or an invalid layout prevents the

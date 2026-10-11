@@ -330,6 +330,11 @@ around PCIe VRAM traffic. Serialized native HPD and AUX/I2C-over-AUX operations
 preserve unrelated notifications and reject stale replies. Software models
 cover ring wraparound, cache ordering, malformed pointers/replies, cancellation,
 timeouts, revocation and notification overflow; real-card validation is pending.
+Native display block owners now resolve Navi22's six-pipe DCN3.0 profile,
+including its OTG/ODM field differences, HUBP detile field and DisplayPort DIG
+reset sequence. The DPP/OPP/MPC and shared DCCG paths retain explicit bounds;
+Phoenix-only pixel/DPIA clock muxes are refused on Navi22. Native display clock
+policy, GDDR6 mode calculations and full modeset coordination are still pending.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production

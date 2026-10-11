@@ -1,4 +1,4 @@
-//! DCN 3.1.4 hub pixel pipe. Programs the surface a pipe fetches and the
+//! Navi22 DCN3.0 and Phoenix DCN3.1.4 hub pixel pipe. Programs the surface a pipe fetches and the
 //! request, latency and throttle registers that pace that fetch. Offsets and
 //! fields are `dcn_3_1_4_offset.h`/`dcn_3_1_4_sh_mask.h` at DCN base index 2;
 //! sequencing follows Linux `dcn20_hubp.c` (`hubp2_program_requestor`,
@@ -8,23 +8,15 @@
 //! The pacing values come from [`crate::amdgpu_dml_regs`], never from constants:
 //! a HUBP programmed with someone else's deadlines underflows.
 use crate::{
-    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_discovery as discovery, amdgpu_dml::Format,
+    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Format,
     amdgpu_dml_regs::Registers,
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // HUBP block, stride 0xdc.
-/// The DCN versions these offsets describe. Seventeen of the thirty registers
-/// below move on DCN 3.5 (`dcn_3_5_0_offset.h`): the whole HUBPREQ pacing block
-/// shifts down one dword, from `DCN_EXPANSION_MODE` 0x0629→0x0628 through
-/// `REF_FREQ_TO_PIX_FREQ` 0x065d→0x065c, because 3.1.4's
-/// `DCSURF_SURFACE_FLIP_INTERRUPT` is gone. A HUBP programmed with a
-/// neighbouring generation's deadline ids underflows, so another generation
-/// needs its own offset table, selected per version the way
-/// `amdgpu_platform::SURFACE_WINDOWS` does it.
-const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
-
+// Profile selects DCN30 or DCN314; shared ids below were compared against
+// both Linux offset and mask headers. Generation differences stay explicit.
 const DCSURF_SURFACE_CONFIG: u64 = 0x05e5;
 const DCSURF_TILING_CONFIG: u64 = 0x05e7;
 const DCSURF_PRI_VIEWPORT_START: u64 = 0x05e9;
@@ -57,10 +49,8 @@ const REF_FREQ_TO_PIX_FREQ: u64 = 0x065d;
 // HUBPRET block, same stride.
 const HUBPRET_CONTROL: u64 = 0x066c;
 const STRIDE: u64 = 0xdc;
+#[cfg(feature = "kernel-test")]
 const LAST_REG: u32 = (HUBPRET_CONTROL + 3 * STRIDE) as u32;
-/// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
-const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
-
 /// `DC_SW_LINEAR`. No other swizzle is modelled by the mode math.
 const SW_MODE_LINEAR: u32 = 0;
 
@@ -173,6 +163,7 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     instance: u8,
     blanked: bool,
+    profile: Profile,
 }
 impl<I: Io> Engine<I> {
     fn reg(&self, reg: u64) -> u64 {
@@ -208,7 +199,11 @@ impl<I: Io> Engine<I> {
         let ttu = &registers.ttu;
         self.update(
             HUBPRET_CONTROL,
-            DET_BUF_PLANE1_BASE_ADDRESS | CROSSBAR_CB_B_AND_CR_R,
+            (if self.profile == Profile::Navi22 {
+                0x00000fff
+            } else {
+                DET_BUF_PLANE1_BASE_ADDRESS
+            }) | CROSSBAR_CB_B_AND_CR_R,
             // No second detile plane, and the RGB crossbar is straight through.
             CROSSBAR_SRC_CR_R_ARGB << CROSSBAR_SRC_CR_R_SHIFT
                 | CROSSBAR_SRC_CB_B_ARGB << CROSSBAR_SRC_CB_B_SHIFT,
@@ -351,7 +346,7 @@ impl<I: Io> Engine<I> {
     }
 }
 
-/// One owned DCN314 hub pixel pipe.
+/// One owned DCN30/DCN314 hub pixel pipe.
 #[derive(Debug)]
 pub struct Hubp(Engine<Mmio>);
 impl Hubp {
@@ -364,12 +359,15 @@ impl Hubp {
         authority: Cap<BusDeviceCap, Write>,
         instance: u8,
     ) -> Result<Self, Error> {
-        if instance >= INSTANCES {
+        let profile = Profile::resolve(gpu)?;
+        if instance >= profile.pipes() {
             return Err(Error::Invalid);
         }
-        let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 2, LAST_REG)
-                .map_err(|_| Error::Unsupported)?;
+        let base = profile.bank(
+            gpu,
+            2,
+            (HUBPRET_CONTROL + u64::from(profile.pipes() - 1) * STRIDE) as u32,
+        )?;
         Ok(Self(Engine {
             io: Mmio {
                 regs: gpu.regs,
@@ -378,6 +376,7 @@ impl Hubp {
             authority,
             instance,
             blanked: true,
+            profile,
         }))
     }
     pub fn instance(&self) -> u8 {

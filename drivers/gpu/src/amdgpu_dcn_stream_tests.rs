@@ -36,6 +36,7 @@ fn engine(instance: u8) -> Engine<Fake> {
         authority: Cap::bootstrap(),
         instance,
         state: State::Idle,
+        profile: Profile::Dcn314,
     }
 }
 fn timing() -> Timing {
@@ -56,6 +57,44 @@ fn timing() -> Timing {
 fn run<T>(future: impl core::future::Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(future)
 }
+fn stream_navi22_resets_dig_and_preserves_reserved_pixel_bit() -> TestResult {
+    let mut stream = engine(0);
+    stream.profile = Profile::Navi22;
+    stream.instance = 5;
+    stream.io.values.resize(0x2650, 0);
+    stream.io.values[0x2609] = 1 << 30;
+    stream.program(&timing(), Depth::Bpc8).unwrap();
+    stream.program_rate(148_500, 0x14).unwrap();
+    run(stream.unblank()).unwrap();
+    if stream.io.values[0x2609] & (1 << 30) == 0 {
+        return TestResult::Fail("reserved DCN30 pixel bit changed");
+    }
+    let writes = &stream.io.writes;
+    let reset = writes
+        .iter()
+        .position(|&(r, v)| r == 0x258b && v & 0x400 != 0)
+        .unwrap();
+    let release = writes
+        .iter()
+        .position(|&(r, v)| r == 0x258b && v & 0x400 == 0)
+        .unwrap();
+    let steer = writes
+        .iter()
+        .position(|&(r, v)| r == 0x260d && v & 1 != 0)
+        .unwrap();
+    let enable = writes
+        .iter()
+        .position(|&(r, v)| r == 0x260c && v & 1 != 0)
+        .unwrap();
+    if !(reset < release && release < steer && steer < enable) {
+        return TestResult::Fail("DCN20 DIG/steering reset sequence");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-stream",
+    stream_navi22_resets_dig_and_preserves_reserved_pixel_bit
+);
 
 fn stream_main_attributes_describe_the_timing_to_the_sink() -> TestResult {
     let mut stream = engine(1);

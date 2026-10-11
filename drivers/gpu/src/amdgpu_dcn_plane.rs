@@ -1,4 +1,4 @@
-//! DCN 3.1.4 plane path: the display pipe processor, the multiple-pipe/plane
+//! Navi22 DCN3.0 and Phoenix DCN3.1.4 plane path: the display pipe processor, the multiple-pipe/plane
 //! combiner and the output pixel processor. Offsets and fields are
 //! `dcn_3_1_4_offset.h`/`dcn_3_1_4_sh_mask.h`; the DPP and OPP banks are DCN base
 //! index 2 while the MPC bank is index 3. Sequencing follows Linux
@@ -10,20 +10,14 @@
 //! stream is blanked here, by the OPP's pattern generator, rather than at the
 //! timing generator.
 use crate::{
-    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_discovery as discovery, amdgpu_dml::Format,
+    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Format,
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // DPP block (base index 2), stride 0x16b.
-/// The DCN versions these offsets describe. The DPP, DSCL, FMT, DPG and OPP
-/// ids below are identical on DCN 3.5, but the MPC bank is reorganised:
-/// `MPC_OUT_MUX` moves 0x0580→0x03d8 and the per-MPCC stride goes 0x20→0x15
-/// (`regMPCC1_MPCC_TOP_SEL` 0x0020 against 0x0015). So this is not one entry
-/// short of portable — another generation needs its own MPC ids and stride,
-/// selected per version the way `amdgpu_platform::SURFACE_WINDOWS` does it.
-const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
-
+// Profile selects DCN30 or DCN314; shared ids below were compared against
+// both Linux offset and mask headers. Generation differences stay explicit.
 const DPP_CONTROL: u64 = 0x0cc5;
 const CNVC_SURFACE_PIXEL_FORMAT: u64 = 0x0ccf;
 const SCL_MODE: u64 = 0x0cfb;
@@ -50,10 +44,14 @@ const MPCC_STRIDE: u64 = 0x20;
 const MPC_OUT_MUX: u64 = 0x0580;
 const MPC_OUT_STRIDE: u64 = 4;
 
+#[cfg(feature = "kernel-test")]
 const DPP_LAST_REG: u32 = (MPC_SIZE + 3 * DPP_STRIDE) as u32;
+#[cfg(feature = "kernel-test")]
 const OPP_LAST_REG: u32 = (OPP_PIPE_CONTROL + 3 * OPP_STRIDE) as u32;
+#[cfg(feature = "kernel-test")]
 const MPC_LAST_REG: u32 = (MPC_OUT_MUX + 3 * MPC_OUT_STRIDE) as u32;
 /// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
+#[cfg(feature = "kernel-test")]
 const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 /// The widest and tallest region these blocks can describe.
 ///
@@ -191,6 +189,7 @@ struct Block<I: Io> {
     io: I,
     authority: Cap<BusDeviceCap, Write>,
     instance: u8,
+    profile: Profile,
 }
 impl<I: Io> Block<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -247,7 +246,7 @@ impl<I: Io> Block<I> {
     /// `mpc1_mux_plane`: bind this MPCC to a DPP and an OPP and route the OPP's
     /// output mux to it. Opaque passthrough, no bottom layer.
     fn mpc_mux_plane(&mut self, dpp: u8, opp: u8) -> Result<(), Error> {
-        if dpp >= INSTANCES || opp >= INSTANCES {
+        if dpp >= self.profile.pipes() || opp >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
         let reg = self.mpcc(MPCC_TOP_SEL);
@@ -280,7 +279,7 @@ impl<I: Io> Block<I> {
         self.update(reg, 0xf, instance)
     }
     fn mpc_release(&mut self, opp: u8) -> Result<(), Error> {
-        if opp >= INSTANCES {
+        if opp >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
         let reg = MPC_OUT_MUX + opp as u64 * MPC_OUT_STRIDE;
@@ -326,11 +325,6 @@ impl<I: Io> Block<I> {
     }
 }
 
-fn bank(gpu: &AmdGpu, index: usize, last: u32) -> Result<u64, Error> {
-    crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, index, last)
-        .map_err(|_| Error::Unsupported)
-}
-
 /// One owned display pipe processor, with the scaler bypassed.
 #[derive(Debug)]
 pub struct Dpp(Block<Mmio>);
@@ -343,16 +337,22 @@ impl Dpp {
         authority: Cap<BusDeviceCap, Write>,
         instance: u8,
     ) -> Result<Self, Error> {
-        if instance >= INSTANCES {
+        let profile = Profile::resolve(gpu)?;
+        if instance >= profile.pipes() {
             return Err(Error::Invalid);
         }
         Ok(Self(Block {
             io: Mmio {
                 regs: gpu.regs,
-                base: bank(gpu, 2, DPP_LAST_REG)?,
+                base: profile.bank(
+                    gpu,
+                    2,
+                    (MPC_SIZE + u64::from(profile.pipes() - 1) * DPP_STRIDE) as u32,
+                )?,
             },
             authority,
             instance,
+            profile,
         }))
     }
     pub fn program(&mut self, format: Format, width: u32, height: u32) -> Result<(), Error> {
@@ -373,16 +373,22 @@ impl Mpc {
         authority: Cap<BusDeviceCap, Write>,
         mpcc: u8,
     ) -> Result<Self, Error> {
-        if mpcc >= INSTANCES {
+        let profile = Profile::resolve(gpu)?;
+        if mpcc >= profile.pipes() {
             return Err(Error::Invalid);
         }
         Ok(Self(Block {
             io: Mmio {
                 regs: gpu.regs,
-                base: bank(gpu, 3, MPC_LAST_REG)?,
+                base: profile.bank(
+                    gpu,
+                    3,
+                    (MPC_OUT_MUX + u64::from(profile.pipes() - 1) * MPC_OUT_STRIDE) as u32,
+                )?,
             },
             authority,
             instance: mpcc,
+            profile,
         }))
     }
     pub fn mux_plane(&mut self, dpp: u8, opp: u8) -> Result<(), Error> {
@@ -410,17 +416,23 @@ impl Opp {
         authority: Cap<BusDeviceCap, Write>,
         instance: u8,
     ) -> Result<Self, Error> {
-        if instance >= INSTANCES {
+        let profile = Profile::resolve(gpu)?;
+        if instance >= profile.pipes() {
             return Err(Error::Invalid);
         }
         Ok(Self {
             block: Block {
                 io: Mmio {
                     regs: gpu.regs,
-                    base: bank(gpu, 2, OPP_LAST_REG)?,
+                    base: profile.bank(
+                        gpu,
+                        2,
+                        (OPP_PIPE_CONTROL + u64::from(profile.pipes() - 1) * OPP_STRIDE) as u32,
+                    )?,
                 },
                 authority,
                 instance,
+                profile,
             },
             blanked: true,
         })

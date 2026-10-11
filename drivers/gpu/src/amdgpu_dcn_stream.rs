@@ -1,4 +1,4 @@
-//! DCN 3.1.4 DisplayPort stream encoder: the main stream attributes a sink
+//! Navi22 DCN3.0 and Phoenix DCN3.1.4 DisplayPort stream encoder: the main stream attributes a sink
 //! needs to interpret the pixels, the M/N rate ratio, and the video stream
 //! enable. Offsets and fields are `dcn_3_1_4_offset.h`/`dcn_3_1_4_sh_mask.h` at
 //! DCN base index 2 with the 0x100 per-instance stride the DIG blocks use;
@@ -9,19 +9,13 @@
 //! This is the stream (front-end) half of the DIO. The link half — transmitter
 //! enable, training patterns and drive levels — is [`crate::amdgpu_dio`].
 use crate::{
-    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_discovery as discovery, amdgpu_dml::Timing,
+    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Timing,
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-/// The DCN versions these offsets describe. Twelve of the fourteen registers
-/// below move on DCN 3.5 (`dcn_3_5_0_offset.h`): the whole DP stream-encoder
-/// block shifts up 0x16 dwords, `DP_PIXEL_FORMAT` 0x2109→0x211f through
-/// `DP_MSA_TIMING_PARAM4` 0x214f→0x2165. Another generation needs its own
-/// offset table, selected per version the way
-/// `amdgpu_platform::SURFACE_WINDOWS` does it.
-const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
-
+// Profile selects DCN30 or DCN314; shared ids below were compared against
+// both Linux offset and mask headers. Generation differences stay explicit.
 const DP_PIXEL_FORMAT: u64 = 0x2109;
 const DP_MSA_COLORIMETRY: u64 = 0x210a;
 const DP_VID_STREAM_CNTL: u64 = 0x210c;
@@ -35,12 +29,8 @@ const DP_MSA_TIMING_PARAM2: u64 = 0x214d;
 const DP_MSA_TIMING_PARAM3: u64 = 0x214e;
 const DP_MSA_TIMING_PARAM4: u64 = 0x214f;
 const STRIDE: u64 = 0x100;
+#[cfg(feature = "kernel-test")]
 const LAST_REG: u32 = (DP_MSA_TIMING_PARAM4 + 4 * STRIDE) as u32;
-/// Stream encoders, not pixel pipes: `res_cap_dcn314.num_stream_encoder` is 5
-/// where `num_video_plane` is 4. Kept distinct from
-/// [`crate::amdgpu_dcn::DCN_PIPES`] for that reason.
-const INSTANCES: u8 = 5;
-
 /// `DP_PIXEL_ENCODING_TYPE_RGB444`.
 const PIXEL_ENCODING_RGB: u32 = 0;
 
@@ -142,6 +132,7 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     instance: u8,
     state: State,
+    profile: Profile,
 }
 impl<I: Io> Engine<I> {
     fn reg(&self, reg: u64) -> u64 {
@@ -209,7 +200,13 @@ impl<I: Io> Engine<I> {
 
         self.update(
             DP_PIXEL_FORMAT,
-            DP_PIXEL_ENCODING | DP_COMPONENT_DEPTH | DP_PIXEL_PER_CYCLE_PROCESSING_MODE,
+            DP_PIXEL_ENCODING
+                | DP_COMPONENT_DEPTH
+                | if self.profile == Profile::Dcn314 {
+                    DP_PIXEL_PER_CYCLE_PROCESSING_MODE
+                } else {
+                    0
+                },
             PIXEL_ENCODING_RGB | depth.code() << DP_COMPONENT_DEPTH.trailing_zeros(),
         )?;
         // MISC0: colorimetry depth in bits 7:5, full-range RGB elsewhere.
@@ -252,7 +249,10 @@ impl<I: Io> Engine<I> {
         self.set(DP_VID_M, m_vid as u32)?;
         // One pixel per container, so no N multiplier.
         self.update(DP_VID_TIMING, 1 << 8 | 0x3 << 10, 1 << 8)?;
-        self.update(DP_PIXEL_FORMAT, DP_PIXEL_PER_CYCLE_PROCESSING_MODE, 0)
+        if self.profile == Profile::Dcn314 {
+            self.update(DP_PIXEL_FORMAT, DP_PIXEL_PER_CYCLE_PROCESSING_MODE, 0)?;
+        }
+        Ok(())
     }
     /// `enc314_stream_encoder_dp_unblank`: stop the stream, reset the steering
     /// FIFO so a mode transition's overflow cannot persist, let the logic prime,
@@ -276,6 +276,12 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Timeout);
             }
             delay_us(1000).await;
+        }
+        if self.profile == Profile::Navi22 {
+            // enc2_stream_encoder_dp_unblank also resets the DIG frontend.
+            self.update(0x208b, 1 << 10, 1 << 10)?; // DIG_FE_CNTL.DIG_START
+            delay_us(1).await;
+            self.update(0x208b, 1 << 10, 0)?;
         }
         self.update(DP_STEER_FIFO, 1, 1)?;
         delay_us(10).await;
@@ -308,7 +314,7 @@ impl<I: Io> Engine<I> {
     }
 }
 
-/// One owned DCN314 DisplayPort stream encoder.
+/// One owned DCN30/DCN314 DisplayPort stream encoder.
 #[derive(Debug)]
 pub struct Stream(Engine<Mmio>);
 impl Stream {
@@ -321,12 +327,15 @@ impl Stream {
         authority: Cap<BusDeviceCap, Write>,
         instance: u8,
     ) -> Result<Self, Error> {
-        if instance >= INSTANCES {
+        let profile = Profile::resolve(gpu)?;
+        if instance >= profile.streams() {
             return Err(Error::Invalid);
         }
-        let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 2, LAST_REG)
-                .map_err(|_| Error::Unsupported)?;
+        let base = profile.bank(
+            gpu,
+            2,
+            (DP_MSA_TIMING_PARAM4 + u64::from(profile.streams() - 1) * STRIDE) as u32,
+        )?;
         Ok(Self(Engine {
             io: Mmio {
                 regs: gpu.regs,
@@ -335,6 +344,7 @@ impl Stream {
             authority,
             instance,
             state: State::Idle,
+            profile,
         }))
     }
     pub fn state(&self) -> State {

@@ -1,4 +1,4 @@
-//! DCN 3.1.4 output timing generator (OPTC). Register offsets and field layouts
+//! Navi22 DCN3.0 and Phoenix DCN3.1.4 output timing generator (OPTC). Register offsets and field layouts
 //! are `dcn_3_1_4_offset.h`/`dcn_3_1_4_sh_mask.h` at DCN base index 2;
 //! sequencing follows Linux `dcn10_optc.c::optc1_program_timing`,
 //! `optc1_program_global_sync`, `dcn30_optc.c::optc3_set_odm_bypass` and
@@ -8,24 +8,14 @@
 //! OPP's display pattern generator, not by the timing generator, so this module
 //! only starts and stops the timing itself.
 use crate::{
-    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_discovery as discovery, amdgpu_dml::Timing,
+    amdgpu::AmdGpu, amdgpu_dcn_clk::Error, amdgpu_dcn_profile::Profile, amdgpu_dml::Timing,
 };
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 // OTG instance block, stride 0x80.
-/// The DCN versions these offsets describe. One entry, and widening it is not
-/// the way to add a display generation: nine of the twenty-three registers
-/// below move on DCN 3.5 (`dcn_3_5_0_offset.h`) — `OTG_V_BLANK_START_END`
-/// 0x1b36→0x1b38, `OTG_V_SYNC_A` 0x1b37→0x1b39, `OTG_V_SYNC_A_CNTL`
-/// 0x1b38→0x1b3a, `OTG_CONTROL` 0x1b41→0x1b43, `OTG_CLOCK_CONTROL`
-/// 0x1b85→0x1b84, `OTG_VSTARTUP_PARAM`, `OTG_VUPDATE_PARAM` and
-/// `OTG_VREADY_PARAM` each down one, and `VTG0_CONTROL` 0x052d→0x0537.
-/// Another generation needs its own offset table, selected per version the way
-/// `amdgpu_platform::SURFACE_WINDOWS` does it; `amdgpu_dcn` already carries the
-/// DCN 3.5 OTG ids for the modeset scaffold.
-const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
-
+// Profile selects DCN30 or DCN314; shared ids below were compared against
+// both Linux offset and mask headers. Generation differences stay explicit.
 const OTG_H_TOTAL: u64 = 0x1b2a;
 const OTG_H_BLANK_START_END: u64 = 0x1b2b;
 const OTG_H_SYNC_A: u64 = 0x1b2c;
@@ -51,10 +41,8 @@ const ODM_STRIDE: u64 = 0x10;
 // Vertical timing generator, stride 1.
 const VTG_CONTROL: u64 = 0x052d;
 /// The highest register this module touches, for the bank bound.
+#[cfg(feature = "kernel-test")]
 const LAST_REG: u32 = (OTG_VREADY_PARAM + 3 * OTG_STRIDE) as u32;
-/// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
-const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
-
 /// Totals, blank and sync positions are 15-bit; VSTARTUP is 10-bit and the
 /// VUPDATE width 10-bit. Programming a mode whose counts do not fit is refused.
 const COUNT_BITS: u32 = 15;
@@ -135,10 +123,25 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     instance: u8,
     state: State,
+    profile: Profile,
 }
 impl<I: Io> Engine<I> {
     fn otg(&self, reg: u64) -> u64 {
+        // DCN30 inserts a register before CLOCK_CONTROL, moving the clock
+        // and global-sync quartet by one dword. Earlier timing ids match.
         reg + self.instance as u64 * OTG_STRIDE
+            + u64::from(self.profile == Profile::Navi22 && reg >= OTG_CLOCK_CONTROL)
+    }
+    fn segment_shift(&self) -> u32 {
+        if self.profile == Profile::Navi22 {
+            8
+        } else {
+            16
+        }
+    }
+    fn segments(&self, first: u32) -> u32 {
+        (first | SEGMENT_PARKED << 4 | SEGMENT_PARKED << 8 | SEGMENT_PARKED << 12)
+            << self.segment_shift()
     }
     fn odm(&self, reg: u64) -> u64 {
         reg + self.instance as u64 * ODM_STRIDE
@@ -231,10 +234,7 @@ impl<I: Io> Engine<I> {
         // and no horizontal timing division.
         self.set(
             self.odm(OPTC_DATA_SOURCE_SELECT),
-            (self.instance as u32) << 16
-                | SEGMENT_PARKED << 20
-                | SEGMENT_PARKED << 24
-                | SEGMENT_PARKED << 28,
+            self.segments(self.instance as u32),
         )?;
         self.update(self.otg(OTG_H_TIMING_CNTL), 0x3, 0)?;
         self.set(self.odm(OPTC_MEMORY_CONFIG), 0)?;
@@ -247,7 +247,12 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     fn otg_vtg(&self) -> u64 {
-        VTG_CONTROL + self.instance as u64
+        let base = if self.profile == Profile::Navi22 {
+            0x0528
+        } else {
+            VTG_CONTROL
+        };
+        base + self.instance as u64
     }
     /// `optc1_program_global_sync`. A zero VStartup would mean the detile
     /// buffer is never given time to prefetch.
@@ -277,26 +282,34 @@ impl<I: Io> Engine<I> {
         }
         self.update(
             self.odm(OPTC_DATA_SOURCE_SELECT),
-            0xf << 16,
-            (self.instance as u32) << 16,
+            0xf << self.segment_shift(),
+            (self.instance as u32) << self.segment_shift(),
         )?;
         self.update(self.otg_vtg(), 1 << 31, 1 << 31)?;
-        self.update(self.otg(OTG_CONTROL), 0x301, 2 << 8 | 1)?;
+        let disable_point = if self.profile == Profile::Navi22 {
+            3
+        } else {
+            2
+        };
+        self.update(self.otg(OTG_CONTROL), 0x301, disable_point << 8 | 1)?;
         self.state = State::Running;
         Ok(())
     }
     /// `optc31_disable_crtc`: park every segment, drop the master enable, stop
     /// the vertical timing generator and wait for the block to go idle.
     async fn disable(&mut self) -> Result<(), Error> {
-        self.set(
-            self.odm(OPTC_DATA_SOURCE_SELECT),
-            SEGMENT_PARKED << 16
-                | SEGMENT_PARKED << 20
-                | SEGMENT_PARKED << 24
-                | SEGMENT_PARKED << 28,
-        )?;
-        self.set(self.odm(OPTC_MEMORY_CONFIG), 0)?;
-        self.update(self.otg(OTG_CONTROL), 1, 0)?;
+        if self.profile == Profile::Dcn314 {
+            self.set(
+                self.odm(OPTC_DATA_SOURCE_SELECT),
+                self.segments(SEGMENT_PARKED),
+            )?;
+            self.set(self.odm(OPTC_MEMORY_CONFIG), 0)?;
+            self.update(self.otg(OTG_CONTROL), 1, 0)?;
+        } else {
+            // DCN30 uses optc1_disable_crtc: retire at the first blank line
+            // before changing ODM routing, rather than cutting the live mux.
+            self.update(self.otg(OTG_CONTROL), 0x301, 3 << 8)?;
+        }
         self.update(self.otg_vtg(), 1 << 31, 0)?;
         let clock_control = self.otg(OTG_CLOCK_CONTROL);
         let deadline = narf_time::Deadline::after_ms(100);
@@ -317,7 +330,7 @@ impl<I: Io> Engine<I> {
     }
 }
 
-/// One owned DCN314 timing generator. Programming it does not light a panel:
+/// One owned DCN30/DCN314 timing generator. Programming it does not light a panel:
 /// the stream still has to be unblanked by the OPP and carried by the stream
 /// encoder.
 #[derive(Debug)]
@@ -333,12 +346,14 @@ impl Otg {
         authority: Cap<BusDeviceCap, Write>,
         instance: u8,
     ) -> Result<Self, Error> {
-        if instance >= INSTANCES {
+        let profile = Profile::resolve(gpu)?;
+        if instance >= profile.pipes() {
             return Err(Error::Invalid);
         }
-        let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 2, LAST_REG)
-                .map_err(|_| Error::Unsupported)?;
+        let last = OTG_VREADY_PARAM
+            + u64::from(profile == Profile::Navi22)
+            + u64::from(profile.pipes() - 1) * OTG_STRIDE;
+        let base = profile.bank(gpu, 2, last as u32)?;
         Ok(Self(Engine {
             io: Mmio {
                 regs: gpu.regs,
@@ -347,6 +362,7 @@ impl Otg {
             authority,
             instance,
             state: State::Idle,
+            profile,
         }))
     }
     pub fn state(&self) -> State {

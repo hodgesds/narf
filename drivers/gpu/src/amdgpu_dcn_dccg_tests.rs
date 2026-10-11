@@ -33,8 +33,31 @@ fn dccg() -> Engine<Fake> {
         io: Fake::new(),
         authority: Cap::bootstrap(),
         reference_dppclk_khz: 0,
+        profile: Profile::Dcn314,
     }
 }
+fn dccg_navi22_has_six_dtos_and_no_phoenix_pixel_mux() -> TestResult {
+    let mut dccg = dccg();
+    dccg.profile = Profile::Navi22;
+    dccg.reference_dppclk_khz = 600_000;
+    dccg.dpp_dto(5, 300_000).unwrap();
+    if dccg.io.values[0x9e] != 0x00ff0080 || dccg.io.values[0xb6] & 0x300000 != 0x100000 {
+        return TestResult::Fail("DCN30 sixth DPP DTO");
+    }
+    let count = dccg.io.writes.len();
+    if dccg.set_pixel_rate_div(0, Divider::By1, Divider::By4) != Err(Error::Unsupported)
+        || dccg.set_dp_stream_clock(0, 0, StreamClock::Dtbclk) != Err(Error::Unsupported)
+        || dccg.dpp_dto(6, 300_000) != Err(Error::Invalid)
+        || dccg.io.writes.len() != count
+    {
+        return TestResult::Fail("Phoenix mux used on DCN30");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-dccg",
+    dccg_navi22_has_six_dtos_and_no_phoenix_pixel_mux
+);
 fn dccg_pixel_rate_dividers_are_per_otg_three_bit_fields() -> TestResult {
     let mut dccg = dccg();
     // DisplayPort 8b/10b, one pixel per container, no ODM: divide by 1 then 4.
