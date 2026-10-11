@@ -430,7 +430,7 @@ kernel_test_in!(
 
 fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
     use crate::amdgpu::{ChipInfo, Family, VramInfo, NAVI22};
-    use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, HW_ID_GC, MAX_BASE_ADDRS};
+    use crate::amdgpu_discovery::{IpBlock, HW_ID_DCN, HW_ID_GC, HW_ID_MMHUB, MAX_BASE_ADDRS};
     let mut regs = vec![0; 0x2000];
     regs[0x16fc] = (GPU_BASE >> 24) as u32;
     regs[0x16fd] = ((GPU_BASE + (12 << 30)) >> 24) as u32 - 1;
@@ -438,6 +438,9 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
     regs[0x475] = regs[0x16fc];
     regs[0x476] = regs[0x16fd];
     regs[0x477] = regs[0x16e7];
+    for pipe in 0..6 {
+        regs[0x5f3 + pipe * 0xdc] = 1;
+    }
     let before = regs.clone();
     let mut gpu = AmdGpu {
         fb_bar: mapping(256 * MIB),
@@ -462,20 +465,30 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
         mode: None,
         fw_loaded: false,
         gc_info: None,
-        ip_blocks: [(HW_ID_GC, 10, 3, 2), (HW_ID_DCN, 3, 0, 0)]
-            .iter()
-            .map(|&(hw_id, major, minor, revision)| IpBlock {
-                hw_id,
-                instance: 0,
-                major,
-                minor,
-                revision,
-                sub_revision: 0,
-                variant: 0,
-                base_addrs: [0; MAX_BASE_ADDRS],
-                num_bases: 3,
-            })
-            .collect(),
+        ip_blocks: [
+            (HW_ID_GC, 10, 3, 2),
+            (HW_ID_DCN, 3, 0, 0),
+            (HW_ID_MMHUB, 2, 1, 0),
+        ]
+        .iter()
+        .map(|&(hw_id, major, minor, revision)| IpBlock {
+            hw_id,
+            instance: 0,
+            major,
+            minor,
+            revision,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: {
+                let mut bases = [0; MAX_BASE_ADDRS];
+                if hw_id == HW_ID_MMHUB {
+                    bases[0] = 0x1000;
+                }
+                bases
+            },
+            num_bases: 3,
+        })
+        .collect(),
         vbios: Some(crate::amdgpu_vbios::tests::with_image(bios())),
     };
     let cap = Cap::bootstrap();
@@ -483,6 +496,29 @@ fn navi22_vram_checks_gmc_dcn_size_and_authority() -> TestResult {
     if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.is_err() || regs != before {
         return TestResult::Fail("GMC10/DCN30 inventory modified hardware or rejected a valid map");
     }
+    for reg in [0x15fc, 0x160b, 0x16c0, 0x16cf] {
+        regs[reg] = 1;
+        // SAFETY: private RAM model; an active inherited VM must prevent allocation.
+        if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.err() != Some(Error::Busy) {
+            return TestResult::Fail("live GFXHUB/MMHUB context admitted into boot pool");
+        }
+        regs[reg] = 0;
+    }
+    // The final cursor must be excluded even when caller supplies no clients.
+    regs[0xac4] = 1 | (2 << 8);
+    regs[0xac5] = 24 * MIB as u32;
+    regs[0xac6] = 2;
+    regs[0xac7] = (64 << 16) | 64;
+    // SAFETY: same read-only fixture; no BAR0 dereference occurs.
+    let plan = unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.unwrap();
+    if !plan
+        .protected()
+        .iter()
+        .any(|r| r.range == (24 * MIB..24 * MIB + 16384))
+    {
+        return TestResult::Fail("inherited sixth-pipe cursor omitted from automatic exclusions");
+    }
+    regs[0xac4] = 0;
     regs[0x477] += 1;
     // SAFETY: same RAM-only read fixture.
     if unsafe { Plan::read_navi22(&gpu, &cap, None, &[]) }.err() != Some(Error::Invalid) {

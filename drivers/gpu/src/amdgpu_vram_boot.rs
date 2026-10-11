@@ -20,6 +20,7 @@ pub enum Error {
     MissingMetadata,
     Revoked,
     Allocation,
+    Busy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +62,9 @@ pub struct Training {
 impl Plan {
     /// Inventory a physical Navi22 using GMC10's full VRAM range and DCN3.0's
     /// inherited DMUB windows. `None` means this GPU has no boot framebuffer;
-    /// every other live surface/client must still appear in `other_clients`.
+    /// all six supported linear scanouts/cursors are included automatically.
+    /// Active GFXHUB/MMHUB VM contexts and unsupported surfaces reject the
+    /// inventory. Every additional client must appear in `other_clients`.
     ///
     /// # Safety
     /// Same exclusive GPU, stable mappings, authority and complete client
@@ -81,6 +84,7 @@ impl Plan {
         let dcn =
             bank(gpu, ip::HW_ID_DCN, &[(3, 0, 0)], 2, 0x477).map_err(|_| Error::Unsupported)?;
         let vbios = gpu.vbios.as_ref().ok_or(Error::MissingVbios)?;
+        let inherited = crate::amdgpu_platform::boot_clients(gpu, authority)?;
         authority
             .invoke(ReadOp(|| {
                 // SAFETY: exact discovered banks bounded above, live authority.
@@ -113,6 +117,9 @@ impl Plan {
                 // BAR0 may describe only a small CPU-visible prefix of it.
                 if plan.vram_size != gpu.vram.size {
                     return Err(Error::Invalid);
+                }
+                for range in &inherited {
+                    plan.protect_gpu(Owner::OtherClient, range.start, range.end - range.start)?;
                 }
                 plan.reserve_training(vbios.bytes())?;
                 Ok(plan)

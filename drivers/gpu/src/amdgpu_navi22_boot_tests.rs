@@ -244,6 +244,40 @@ fn firmware() -> Firmware {
         graphics: gfx::tests::fixture(),
     }
 }
+fn navi22_boot_outlives_the_controller_lock() -> TestResult {
+    fn send_static<T: Send + 'static>(_: &T) {}
+    fn send_future<T: Send>(_: &T) {}
+    let pool = pool(16 << 20);
+    let cap = Cap::bootstrap();
+    cap.revoke();
+    let mut boot = {
+        let gpu = narf_lib::sync::IrqSafeSpinLock::new(gpu());
+        let guard = gpu.lock();
+        // SAFETY: bookkeeping-only constructor; revoked authority will reject
+        // all I/O. This descriptor has no backing GPU and no live owner.
+        unsafe { ColdBoot::new(&guard, cap, &pool, firmware()) }.unwrap()
+    };
+    send_static(&boot);
+    let result = {
+        let future = boot.run();
+        send_future(&future);
+        run(future)
+    };
+    if result != Err(Error::Sos(sos::Error::Revoked)) {
+        return TestResult::Fail(
+            "owned boot session could not run after releasing controller lock",
+        );
+    }
+    drop(boot);
+    if pool.available() != 16 << 20 {
+        return TestResult::Fail("unpublished snapshot session leaked staging");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_outlives_the_controller_lock
+);
 fn navi22_boot_training_failure_prevents_sos_publication() -> TestResult {
     let mut gpu = gpu();
     gpu.fb_bar.len = 64 << 20;

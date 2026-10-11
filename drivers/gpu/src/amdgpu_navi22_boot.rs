@@ -12,6 +12,7 @@ use narf_capabilities::{Cap, Read, Write};
 pub enum Error {
     Busy,
     Invalid,
+    Allocation,
     Sos(sos::Error),
     Psp(psp::Error),
     Smu(smu::Error),
@@ -113,8 +114,10 @@ impl<B: Backend> Sequence<B> {
     }
 }
 #[derive(Debug)]
-struct Hardware<'a> {
-    gpu: &'a AmdGpu,
+struct Hardware {
+    // Private immutable register/identity snapshot; physical authority still
+    // belongs exclusively to ColdBoot. No controller guard spans an await.
+    gpu: AmdGpu,
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
     firmware: Firmware,
@@ -125,7 +128,7 @@ struct Hardware<'a> {
     versions: Option<smu::Versions>,
     gfx_status: Option<psp::GfxBootStatus>,
 }
-impl Backend for Hardware<'_> {
+impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
         match stage {
             Stage::MemoryTraining => {
@@ -138,7 +141,7 @@ impl Backend for Hardware<'_> {
                     // SAFETY: explicit training finished before claiming PSP
                     // bootstrap ownership; its idle owner retains only data.
                     self.bootstrap = Some(
-                        unsafe { sos::Bootloader::new(self.gpu, self.authority, &self.pool) }
+                        unsafe { sos::Bootloader::new(&self.gpu, self.authority, &self.pool) }
                             .map_err(Error::Sos)?,
                     );
                 }
@@ -156,7 +159,7 @@ impl Backend for Hardware<'_> {
                 // SAFETY: ColdBoot owns the physical GPU/pool and SOS completed;
                 // the bootstrap owner was dropped. Mappings remain permanent.
                 self.psp = Some(
-                    unsafe { psp::Psp::new_navi22(self.gpu, self.authority, &self.pool) }
+                    unsafe { psp::Psp::new_navi22(&self.gpu, self.authority, &self.pool) }
                         .map_err(Error::Psp)?,
                 );
                 self.psp
@@ -184,7 +187,7 @@ impl Backend for Hardware<'_> {
                 // SAFETY: SMC upload completed for this cold boot. ColdBoot owns
                 // MP1/reset/PM and excludes all other SMU clients.
                 self.smu = Some(
-                    unsafe { smu::Smu::after_upload(self.gpu, self.authority) }
+                    unsafe { smu::Smu::after_upload(&self.gpu, self.authority) }
                         .map_err(Error::Smu)?,
                 );
                 self.versions = Some(
@@ -224,10 +227,30 @@ impl Backend for Hardware<'_> {
     }
 }
 #[derive(Debug)]
-pub struct ColdBoot<'a> {
-    sequence: Sequence<Hardware<'a>>,
+pub struct ColdBoot {
+    sequence: Sequence<Hardware>,
 }
-impl<'a> ColdBoot<'a> {
+/// Copy only the immutable layout consumed by firmware owners. VBIOS,
+/// userspace topology and live driver state remain with the controller.
+fn snapshot(gpu: &AmdGpu) -> Result<AmdGpu, Error> {
+    let mut blocks = alloc::vec::Vec::new();
+    blocks
+        .try_reserve_exact(gpu.ip_blocks.len())
+        .map_err(|_| Error::Allocation)?;
+    blocks.extend_from_slice(&gpu.ip_blocks);
+    Ok(AmdGpu {
+        fb_bar: gpu.fb_bar,
+        regs: gpu.regs,
+        chip: gpu.chip,
+        vram: gpu.vram,
+        ip_blocks: blocks,
+        gc_info: None,
+        vbios: None,
+        mode: None,
+        fw_loaded: false,
+    })
+}
+impl ColdBoot {
     /// # Safety
     /// Caller exclusively owns this physical Navi22 GPU (not an SR-IOV VF), its
     /// PSP/MP1/GC/HDP mailboxes and reset/power controls. Mappings are permanent,
@@ -240,15 +263,16 @@ impl<'a> ColdBoot<'a> {
     /// ownership may be transferred via take_psp; all its safety contracts
     /// continue to apply to that caller.
     pub unsafe fn new(
-        gpu: &'a AmdGpu,
+        gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
         firmware: Firmware,
     ) -> Result<Self, Error> {
         psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        let gpu = snapshot(gpu)?;
         // SAFETY: forwarded trained-VRAM/exclusive-device/mapping/pool contract.
         let bootstrap =
-            unsafe { sos::Bootloader::new(gpu, authority, pool) }.map_err(Error::Sos)?;
+            unsafe { sos::Bootloader::new(&gpu, authority, pool) }.map_err(Error::Sos)?;
         Ok(Self {
             sequence: Sequence {
                 backend: Hardware {
@@ -278,15 +302,16 @@ impl<'a> ColdBoot<'a> {
     /// operation. Exchange buffers must be from this GPU's current boot Plan.
     /// Firmware must have provided a readable initial VRAM mapping for backup.
     pub unsafe fn new_with_training(
-        gpu: &'a AmdGpu,
+        gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
         firmware: Firmware,
         exchange: crate::amdgpu_vram_boot::Training,
     ) -> Result<Self, Error> {
+        let gpu = snapshot(gpu)?;
         // SAFETY: caller owns all mappings/clients and reserves both exchanges.
         let training =
-            unsafe { gddr6::Trainer::new(gpu, authority, exchange) }.map_err(Error::Training)?;
+            unsafe { gddr6::Trainer::new(&gpu, authority, exchange) }.map_err(Error::Training)?;
         Ok(Self {
             sequence: Sequence {
                 backend: Hardware {

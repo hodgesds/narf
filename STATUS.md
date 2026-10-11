@@ -280,6 +280,9 @@ Probe now retains a validated Navi22 VBIOS from the SMUIO ROM read registers
 when VFCT has no image, preserving the index latch and checking authority per
 chunk. This supplies the board's reservation metadata without enabling a PCI
 ROM BAR; acquisition failures are identified on the console.
+The Navi22 pool plan now inventories all six DCN3.0 pipes and rejects inherited
+active GFXHUB/MMHUB contexts. The cold-boot session owns its register metadata
+and can run after releasing the controller spinlock, including in a spawned task.
 These are software-tested foundations; automatic platform wiring and framebuffer
 ownership handoff, training resume,
 video/display firmware, board power/clock setup, hardware boot, GMC/GFX10

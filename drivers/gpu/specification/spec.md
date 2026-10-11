@@ -260,10 +260,16 @@ controls, permanently mapped and already trained VRAM, no active queues, and an
 owned pool excluding all firmware/scanout/discovery/training/TMR reservations.
 Construction reserves bootstrap staging but performs no MMIO. This is one
 cold-boot attempt, not an attach, resume or firmware-reload operation.
+The session owns an immutable copy of its register/identity metadata, so it
+does not borrow `AmdGpu` or require a controller guard across any await. Both
+constructors return a `Send + 'static` owner which may leave `with_controller`
+before `run` is polled. This copies no physical ownership: callers must still
+exclude reset/PM/other clients and retain permanent mappings for the session.
 
-`ColdBoot::run().await` executes optional memory training → SOS bootstrap → ring creation → trusted-memory
-setup → SMC upload → SMU version handshake → graphics upload/autoload → RLC boot
-check. The bootstrap owner is dropped only after SOS success, before claiming
+`ColdBoot::run().await` executes optional memory training → SOS bootstrap →
+ring creation → trusted-memory setup → SMC upload → SMU version handshake →
+graphics upload/autoload → RLC boot check. The bootstrap owner is dropped only
+after SOS success, before claiming
 the GPCOM ring. The ring and SMU owners are stored in the session before awaiting
 their hardware operations. State is `Prepared`, `Running(Stage)`,
 `FirmwareReady(Report)`, `Failed { stage, error }`, or `Released`. Failure records
@@ -423,8 +429,13 @@ provides the equivalent inventory for physical 1002:73df / GC10.3.2 / DCN3.0.0.
 It reads GMC10 base/top/offset, verifies that the full aperture matches the
 probe's physical VRAM size and that DCN's address translation agrees, and
 retains the same firmware, boot and DMUB exclusions. An optional boot framebuffer
-permits a secondary/headless GPU; other live surfaces still require explicit
-client ranges. Unhandled enabled DMUB Region0/1/2/7 also reject provisioning.
+permits a secondary/headless GPU. All six DCN3.0 pipes' programmed and latched
+linear RGB scanouts and supported cursors are inventoried automatically using
+their own register window. Unknown/tiled/DCC/VM surfaces fail closed. All sixteen
+GC10.3.2 and MMHUB2.1.0 VM contexts must be disabled; a live context, initialized
+firmware or programmed NARF mode returns `Busy`. Additional clients still
+require explicit GPU-address ranges. Unhandled enabled DMUB Region0/1/2/7 also
+reject provisioning.
 The PSP runtime database (64 KiB at VRAM-end minus 1 MiB) remains reserved even
 if FirmwareInfo reports a smaller firmware tail or disables two-stage training.
 FirmwareInfo's two-stage BIST capability additionally reserves a 4 KiB C2P
