@@ -338,7 +338,10 @@ owner now reads board limits and the display PLL, enables bounded display DPM
 through the retained SMU, pins memory/fabric clocks and programs DENTIST only
 after every stream retires. Register models cover rounding, rejection,
 revocation, cancellation and divider completion. GDDR6 mode calculations and
-full modeset coordination are still pending.
+full modeset coordination are still pending. Native routing now resolves
+AUX and HPD independently through the board GPIO LUT, follows display-table
+relative record offsets, and rejects ambiguous routes. The Navi22 backend probe
+uses the DCN30 enable register and includes the sixth transmitter.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production

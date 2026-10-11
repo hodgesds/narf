@@ -333,8 +333,9 @@ impl Pipeline {
         vbios: &[u8],
         sink: &crate::amdgpu_usbc::Sink,
     ) -> Result<Self, Error> {
-        let paths = inventory::display_paths(vbios).map_err(Error::Inventory)?;
-        let routes = inventory::routes_for_sink(&paths, sink, pipe).map_err(Error::Inventory)?;
+        let paths = inventory::display_paths(gpu, vbios).map_err(Error::Inventory)?;
+        let routes =
+            inventory::routes_for_sink(gpu, &paths, sink, pipe).map_err(Error::Inventory)?;
         // A native sink has exactly one route; a tunnelled one borrows a
         // transmitter, so the candidates are tried in preference order. The busy
         // probe comes first because building a pipeline reserves pool memory, and

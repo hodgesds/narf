@@ -1087,14 +1087,19 @@ dividers can produce, so a plausible guess at any of them yields a picture that
 tears under load rather than an error. A table that is missing, the wrong
 revision or self-inconsistent fails closed.
 
-`display_paths` walks `display_object_info_table_v1_4`, decoding each path's
-connector kind and instance, the transmitter its first encoder drives — UNIPHY
-and its numbered siblings each carry two, selected by the enum id — and the
-hot-plug line from the connector's record list. A path whose encoder or connector
-is not one this drives is skipped, since a board may wire other things alongside
-its DisplayPort connectors, but a table with nothing readable is refused. The
-record walk is bounded and fails closed to "unassigned" on a truncated, cyclic or
-out-of-range list rather than inventing a line. `memory_config` takes the type
+`display_paths(gpu, vbios)` walks `display_object_info_table_v1_4`, resolving
+an exact DCN314 or Navi22/DCN3.0 profile from discovery. It decodes each path's
+connector and UNIPHY transmitter separately from its hardware AUX and HPD lines.
+Connector record offsets are relative to the display-object table. The I2C and
+HPD record IDs are keys into `atom_gpio_pin_lut_v2_1`; the GPIO register and bit
+are matched against the discovered DCN bank to obtain the AUX channel and
+one-based ATOM HPD selector. `Path::aux` is `None` when absent; `hpd` is zero
+when unassigned. A present malformed, duplicate or unmappable record is an error.
+No GPIO ID, connector ordinal or transmitter number substitutes for an AUX or
+HPD index. Unknown encoders and paths requiring an external bridge are skipped;
+a table with no usable paths is refused. Record and GPIO walks are bounded.
+
+`memory_config` takes the type
 and channel count from `atom_integrated_system_info_v2_*` and the data rate from
 the firmware's own DPM table, deriving the channel width from the memory type as
 Linux does; a zero channel count is refused rather than replaced with Linux's
@@ -1105,19 +1110,21 @@ as 8.16 fixed point against the 48 MHz DFS reference; the CLK block is absent
 from the IP discovery table so its base is hardcoded as Linux hardcodes it, which
 is exactly why the result is range-checked before being believed.
 
-`routes_for_sink` derives link routes and validates them against the board rather
-than trusting the sink's index. A native sink's DMUB link instance *is* its
-transmitter, so the topology confirms that transmitter is wired to a DisplayPort
-connector — a USB-C port carrying DP alt-mode appears as one — and supplies its
-hot-plug line; a transmitter the board wired to something else is refused, and
-there is exactly one route.
+`routes_for_sink(gpu, paths, sink, frontend)` matches a native sink by its
+hardware AUX channel. Its transmitter and HPD selector come from that path;
+the caller assigns the stream frontend independently. Shared AUX channels or
+transmitters require a mux/bridge owner and are refused instead of selecting the
+first connector. Only DisplayPort/eDP paths may produce native routes. Profile
+bounds admit all six Navi22 transmitters and frontends. Navi22 rejects DPIA
+routes; the Phoenix profile retains its five DIG candidates.
 
 A tunnelled sink has no board-wired transmitter, so it borrows one. All five DIGs
 are candidates, ordered so that transmitters the board wired to no connector come
 first: borrowing one of those cannot deprive a later native plug of its fixed
 transmitter. A wired transmitter is still usable while its own connector is idle,
 which the hardware itself decides — `transmitter_busy` reads the backend enable
-bit, and the link encoder re-checks the same bit when the transmitter is actually
+bit (DCN30 `0x20b1`, DCN314 `0x20b2`, stride `0x100`), and the link encoder
+re-checks the same bit when the transmitter is actually
 claimed, closing the gap between the two. The probe comes before any pipeline is
 built, because building one reserves pool memory and a rejected candidate must
 not cost any. A tunnelled route carries no hot-plug line, since the tunnel

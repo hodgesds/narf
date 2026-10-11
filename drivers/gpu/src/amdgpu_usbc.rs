@@ -13,6 +13,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sink {
     pub channel: Channel,
+    /// Hardware AUX channel for Legacy, tunnelling endpoint for DPIA.
+    /// A native transmitter and HPD line must be resolved from board wiring.
     pub instance: u8,
     pub dpcd: [u8; 16],
     pub edid: Vec<u8>,
