@@ -25,7 +25,28 @@ use crate::registry;
 /// user pointer first (this function is the kernel-side wrapper, not
 /// the syscall trap directly).
 pub fn sys_init_module(bytes: &[u8]) -> Result<Arc<Module>, ModuleSyscallError> {
-    let module = loader::load_image(bytes).map_err(ModuleSyscallError::Load)?;
+    sys_init_module_with_params(bytes, "")
+}
+
+/// Load an in-memory module while applying Linux-shaped load parameters.
+///
+/// The first datapath-relevant parameter is `domain=<name>`: it selects the
+/// module's effective isolation frame and overrides the author's
+/// `target_domain=` manifest hint. Other parameters remain available for the
+/// existing module-parameter work and are ignored here for now.
+pub fn sys_init_module_with_params(
+    bytes: &[u8],
+    params: &str,
+) -> Result<Arc<Module>, ModuleSyscallError> {
+    // The normal boot initcall installs this before userspace can load a
+    // module; repeat it here so isolated loader tests exercise the same
+    // fail-closed callback path.
+    crate::install_bus_call_gate();
+    let domain = params
+        .split_ascii_whitespace()
+        .filter_map(|param| param.strip_prefix("domain="))
+        .next_back();
+    let module = loader::load_image_with_domain(bytes, domain).map_err(ModuleSyscallError::Load)?;
 
     // Claim the name atomically. A `contains` check followed by a separate
     // insert lets two concurrent loads of the same name both observe
@@ -51,6 +72,7 @@ pub fn sys_init_module(bytes: &[u8]) -> Result<Arc<Module>, ModuleSyscallError> 
     let invoke = unsafe { loader::invoke_init(&module) };
     if let Err(e) = invoke {
         drop_dependency_refs(&module);
+        narf_bus::unregister_module_pci_drivers(module.id.0);
         let _removed = crate::symbols::unregister_exports_of(module.id);
         registry::remove(module.name());
         // SAFETY: init failed, so the module is not Live; its exports are
@@ -94,6 +116,15 @@ pub fn sys_finit_module(bytes: &[u8]) -> Result<Arc<Module>, ModuleSyscallError>
     sys_init_module(bytes)
 }
 
+/// File-backed load variant with the same parameter semantics as
+/// [`sys_init_module_with_params`].
+pub fn sys_finit_module_with_params(
+    bytes: &[u8],
+    params: &str,
+) -> Result<Arc<Module>, ModuleSyscallError> {
+    sys_init_module_with_params(bytes, params)
+}
+
 /// `sys_delete_module(name, flags)` — unload `name` if its refcount
 /// is zero. Linux's `flags` carries `O_NONBLOCK` etc.; NARF ignores
 /// those today (we never block).
@@ -116,6 +147,11 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     // provider stays pinned for as long as the exit handler might still call
     // into it.
     drop_dependency_refs(&module);
+
+    // Module exit has had its chance to quiesce the device. Remove bus
+    // callbacks and cap-bearing datapath contexts before the module's text is
+    // made unreachable or unmapped.
+    narf_bus::unregister_module_pci_drivers(module.id.0);
 
     // Sweep all KSYMTAB entries registered by this module during its
     // init.  Must happen before the Arc is dropped so that if the
@@ -173,7 +209,9 @@ impl ModuleSyscallError {
             self,
             ModuleSyscallError::Load(LoadError::Header(_))
                 | ModuleSyscallError::Load(LoadError::Manifest(_))
-                | ModuleSyscallError::Load(LoadError::Domain(_))
+                | ModuleSyscallError::Load(LoadError::Domain(
+                    crate::domain::DomainError::Unknown(_),
+                ))
                 | ModuleSyscallError::Load(LoadError::NoSymbols)
                 | ModuleSyscallError::Load(LoadError::BadSection(_))
                 | ModuleSyscallError::Load(LoadError::MissingInit)
@@ -203,6 +241,7 @@ impl ModuleSyscallError {
             ModuleSyscallError::Load(LoadError::Header(_)) => -8,
             ModuleSyscallError::Load(LoadError::Manifest(_)) => -22,
             ModuleSyscallError::Load(LoadError::Domain(_)) => -22,
+            ModuleSyscallError::Load(LoadError::DomainOverride(_)) => -22,
             ModuleSyscallError::Load(LoadError::NoSymbols) => -22,
             ModuleSyscallError::Load(LoadError::BadSection(_)) => -22,
             ModuleSyscallError::Load(LoadError::Relocator(_)) => -8,

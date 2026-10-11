@@ -1,10 +1,11 @@
 //! Domain placement for loaded modules.
 //!
-//! Every NARF module declares a `target_domain=<name>` in its
-//! manifest. x86_64 image pages carry that domain's protection key and entry
-//! activates PKS or PCID isolation. On MTE-capable aarch64, executable image
-//! pages remain plain Normal memory while module-owned heap allocations carry
-//! the resolved domain tag.
+//! Every NARF module declares a `target_domain=<name>` author hint in its
+//! manifest. A load-authority holder may override it with `domain=<name>`;
+//! runtime-loaded text is never allowed into `FRAME`. x86_64 image pages carry
+//! the effective domain's protection key and entry activates PKS or PCID
+//! isolation. On MTE-capable aarch64, executable image pages remain plain
+//! Normal memory while module-owned heap allocations carry the resolved tag.
 //!
 //! Concretely, the kernel maintains a `name -> DomainId` table that
 //! drivers populate at boot. The loader consults the table to pick
@@ -25,6 +26,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub enum DomainError {
     /// `target_domain` references an unregistered name.
     Unknown(String),
+    /// Runtime-loaded modules may not join the Frame's TCB domain.
+    FrameReserved,
 }
 
 /// One registered driver domain. The kernel boot path registers all
@@ -96,6 +99,20 @@ pub fn resolve(name: &str) -> Result<DomainId, DomainError> {
         return Ok(DomainId::SCRATCH);
     }
     lookup_domain(name).ok_or_else(|| DomainError::Unknown(name.to_string()))
+}
+
+/// Resolve the effective placement for a runtime-loaded module.
+///
+/// The name can come from the signed manifest or from an operator-supplied
+/// `domain=` load parameter.  Keeping the final policy check here means a
+/// subsequently registered alias cannot accidentally make `FRAME` available
+/// to untrusted module text.
+pub fn resolve_module(name: &str) -> Result<DomainId, DomainError> {
+    let id = resolve(name)?;
+    if id == DomainId::FRAME {
+        return Err(DomainError::FrameReserved);
+    }
+    Ok(id)
 }
 
 // ── Running module code inside its domain ──────────────────────────────

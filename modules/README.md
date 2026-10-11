@@ -23,13 +23,24 @@ the writable linear-map alias of the text closed. The window sits within
 the arch's call range of kernel text, which is what lets rustc's
 PC-relative call relocations resolve; see that module's docs.
 
-`target_domain=` is enforced at module entry. On x86_64, image pages carry
-the selected protection key and entry dispatches through the active PKS or
-PCID backend. On MTE-capable aarch64, module-owned heap allocations are
-tagged and checked while the scope is active; the executable image itself is
-plain Normal memory because PC-relative code/rodata references cannot carry
-allocation tags. Kernel core remains reachable so exported calls work; see
-DESIGN.md §2 for the exact boundary.
+`target_domain=` is the author's default placement hint. A holder of module
+load authority may override it with the `domain=<name>` parameter to
+`init_module` / `finit_module`; the effective domain is recorded on the
+module and `FRAME` is always rejected for runtime-loaded text. On x86_64,
+image pages carry the selected protection key and entry/callback dispatches
+through the active PKS or PCID backend. On MTE-capable aarch64, module-owned
+heap allocations are tagged and checked while the scope is active; the
+executable image itself is plain Normal memory because PC-relative
+code/rodata references cannot carry allocation tags. Statically linked
+drivers retain their compile-time Frame placement. See DESIGN.md §2.
+
+The loadable-driver datapath covers PCI command control, bounded BAR MMIO,
+responsive register waits, coherent DMA through opaque owner-scoped handles,
+MSI-X/deferred callbacks, periodic polling, and copy-mode network-interface
+registration. DMA CPU pointers never cross into module code; bounded copy
+exports move descriptor and payload bytes, and unload unregisters interfaces,
+quiesces IRQs, then revokes every retained DMA capability after disabling bus
+mastering.
 
 See:
 
@@ -67,6 +78,14 @@ computes each one's CRC from its signature at compile time. That surface
 is deliberately small — Rust has no stable ABI, so only `extern "C"` over
 primitives and `repr(C)` can safely cross into a separately compiled
 module, and every addition is a promise.
+
+The device-datapath subset now also covers unload-safe network registration and
+full copy-mode e1000 RX/TX rings. Rich Rust objects stay in kernel-owned device
+contexts; probe, deferred IRQ, poller, and TX callbacks all run through the
+lifecycle/domain gate, never directly in hard-IRQ context. The e1000 `.ko`
+uses only this primitive C ABI to reset the NIC, allocate/program rings,
+transmit a real frame, and deliver completed RX descriptors into the network
+stack. Zero-copy module DMA remains a later IOMMU-backed optimization.
 
 Subsystems needing an export outside that surface call `narf_export!`:
 

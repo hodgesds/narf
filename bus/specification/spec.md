@@ -147,6 +147,104 @@ Hot-plug paths:
 - **virtio-mmio / platform-bus injection** — handled the same way
   for virtio transports presented after boot.
 
+### 3.6 Loadable-driver PCI bridge
+
+Separately compiled modules cross the bus boundary through C-ABI callbacks
+and opaque integers; `BusDevice`, `MmioRegion`, `DmaBuffer`, and their typed
+capabilities remain kernel-owned Rust objects.
+
+```rust
+pub type ModuleProbeFn = extern "C" fn(dev_token: u64, reserved: u64) -> i32;
+pub type ModuleCallbackFn = extern "C" fn(cookie: u64) -> i32;
+pub type ModuleTxFn = extern "C" fn(frame: *const u8, len: usize) -> i32;
+
+pub unsafe fn register_module_pci_driver(
+    owner: u64,
+    name: &str,
+    vendor: u16,
+    device: u16,
+    probe: usize,
+) -> i32;
+
+pub fn set_module_probe_call_gate(gate: ModuleProbeCallGate);
+pub fn set_module_callback_call_gate(gate: ModuleCallbackCallGate);
+pub fn set_module_tx_call_gate(gate: ModuleTxCallGate);
+pub fn unregister_module_pci_drivers(owner: u64);
+
+pub fn module_pci_enable(owner: u64, dev: u64, bits: u16) -> i32;
+pub fn module_bar_map(owner: u64, dev: u64, bar: u8) -> u64;
+pub fn module_mmio_read32(owner: u64, dev: u64, bar: u64, off: u64) -> Option<u32>;
+pub fn module_mmio_write32(owner: u64, dev: u64, bar: u64, off: u64, val: u32) -> i32;
+pub fn module_mmio_wait32(
+    owner: u64,
+    dev: u64,
+    bar: u64,
+    off: u64,
+    mask: u32,
+    expected: u32,
+    timeout_ns: u64,
+) -> i32;
+pub fn module_dma_alloc(owner: u64, dev: u64, len: usize, domain: DomainId) -> u64;
+pub fn module_dma_addr(owner: u64, dev: u64, dma: u64, off: u64) -> Option<u64>;
+pub fn module_dma_write(owner: u64, dev: u64, dma: u64, off: u64, src: &[u8]) -> i32;
+pub fn module_dma_read(owner: u64, dev: u64, dma: u64, off: u64, dst: &mut [u8]) -> i32;
+pub fn module_dma_wait8(
+    owner: u64,
+    dev: u64,
+    dma: u64,
+    off: u64,
+    mask: u8,
+    expected: u8,
+    timeout_ns: u64,
+) -> i32;
+pub fn module_dma_free(owner: u64, dev: u64, dma: u64) -> i32;
+pub fn module_msix_enable(owner: u64, dev: u64) -> i32;
+pub fn module_msix_claim(owner: u64, dev: u64) -> Result<u16, i32>;
+pub fn module_irq_set_handler(
+    owner: u64,
+    dev: u64,
+    vector: u16,
+    callback: ModuleCallbackFn,
+    cookie: u64,
+) -> i32;
+pub fn module_spawn_poller(
+    owner: u64,
+    dev: u64,
+    callback: ModuleCallbackFn,
+    cookie: u64,
+) -> i32;
+pub fn module_netif_register(
+    owner: u64,
+    dev: u64,
+    mac: [u8; 6],
+    tx_callback: ModuleTxFn,
+) -> Result<u32, i32>;
+pub fn module_netif_rx(
+    owner: u64,
+    dev: u64,
+    ifindex: u32,
+    frame: &mut [u8],
+) -> i32;
+```
+
+The module subsystem installs all three call gates. They resolve `owner` to the
+module's load-time domain and enter that domain before invoking module text.
+Datapath contexts retain the per-device capability and reject every operation
+whose per-CPU callback owner does not match. Unload runs the module exit hook,
+then removes all matches, callbacks, and contexts for `owner` before module
+text is unmapped. DMA handles are revocable, bounds checked, and allocated in
+the effective load-time domain; the module never receives their CPU mapping.
+MSI-X hard handlers remain in FRAME and only claim/account the interrupt; an
+in-tree executor task observes `fire_count` and invokes module callbacks
+through the domain/lifecycle gate. Poller callbacks use the same task-context
+path. Teardown function-masks and disables MSI-X, clears command-register
+bits, disables and detaches each handler, calls `synchronize_irq`, frees
+vectors, unregisters the module netif, and only then revokes/frees DMA and
+device capabilities. MMIO/DMA wait helpers use the scheduler's responsive,
+deadline-bounded polling primitive rather than module-local spin loops.
+Network TX crosses a permanent in-tree trampoline and the TX call gate; RX is
+a synchronous bounded copy into the named interface's stack ingress path.
+
 ## 4. Invariants & safety properties
 
 - The device registry is read-mostly and uses RCU for lookups.

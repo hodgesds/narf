@@ -13,6 +13,8 @@
 //!     `narf_module_init` entry point the loader calls, the `.modinfo`
 //!     key=value lines it parses, and the module's own `#[panic_handler]` —
 //!     exactly the shape of `modules/test-module/`.
+//!     `target_domain` is emitted as the author's default; the load-authority
+//!     holder may replace it with a `domain=` parameter at runtime.
 //!
 //! The two builds are made mutually exclusive by `compile_error!` guards the
 //! macro expands into the driver crate, so a misconfigured feature set fails
@@ -72,6 +74,7 @@ macro_rules! __modinfo_line {
 ///         author: "narf",
 ///         description: "Intel 8254x/8257x NIC",
 ///         target_domain: "net",
+///         required_caps: "DmaBuffer:Write",
 ///     },
 ///     register: crate::register_pci_driver,
 /// }
@@ -98,7 +101,8 @@ macro_rules! narf_driver {
             license: $license:literal,
             author: $author:literal,
             description: $description:literal,
-            target_domain: $domain:literal $(,)?
+            target_domain: $domain:literal,
+            $(required_caps: $required_caps:literal,)?
         },
         register: $register:path $(,)?
     ) => {
@@ -123,6 +127,7 @@ macro_rules! narf_driver {
             $crate::__modinfo_line!("author" = $author);
             $crate::__modinfo_line!("description" = $description);
             $crate::__modinfo_line!("target_domain" = $domain);
+            $($crate::__modinfo_line!("required_caps" = $required_caps);)?
             // Overwritten in place by `xtask build-module` with the running
             // kernel's `/sys/kernel/abi_hash`; a mismatch is rejected at load.
             $crate::__modinfo_line!("kernel_abi" = "0x00000000");

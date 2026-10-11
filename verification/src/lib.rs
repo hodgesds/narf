@@ -5510,8 +5510,8 @@ define_smoke_elf!(
     "NARF_OCI_SMOKE_ELF_X86_64",
     "NARF_OCI_SMOKE_ELF_AARCH64"
 );
-// Off-box network serving smoke: a TCP echo server bound to 0.0.0.0,
-// reached from the host via QEMU `hostfwd`.
+// Live network-stack smoke: TCP and UDP echo servers reached from the host
+// via QEMU `hostfwd`, plus a guest-originated query to SLIRP DNS.
 define_smoke_elf!(
     NARF_NETSERVE_SMOKE_ELF,
     "NARF_NETSERVE_SMOKE_ELF_X86_64",

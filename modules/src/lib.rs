@@ -66,7 +66,59 @@ mod tests_smoke;
 mod tests_e2e;
 
 pub use lifecycle::ModuleState;
-pub use loader::{load_image, Module};
+pub use loader::{load_image, load_image_with_domain, Module};
+
+/// Enter a loaded module's effective isolation frame before the bus invokes
+/// its separately compiled probe callback. The bus stores only the opaque
+/// module id and delegates placement policy back here.
+fn call_in_module_context(owner: u64, call: impl FnOnce() -> i32) -> i32 {
+    if owner == symbols::KERNEL_MODULE_ID.0 {
+        return call();
+    }
+    let Some(module) = registry::lookup_by_id(symbols::ModuleId(owner)) else {
+        return -19; // -ENODEV: owner disappeared or was never registered.
+    };
+    // Pin while holding the lifecycle lock. This makes "Live -> Going" and
+    // "admit a new callback" mutually exclusive: unload either observes the
+    // reference and returns Busy, or the callback observes Going and refuses
+    // to enter module text.
+    let state = module.state.lock();
+    if *state != lifecycle::ModuleState::Live {
+        return -19;
+    }
+    module.refcount.get();
+    drop(state);
+    let previous_owner = symbols::swap_execution_context(module.id);
+    let scope = domain::enter(module.domain);
+    let rc = call();
+    domain::exit(scope);
+    symbols::swap_execution_context(previous_owner);
+    module.refcount.put();
+    rc
+}
+
+fn module_pci_probe_call_gate(
+    owner: u64,
+    probe: narf_bus::ModuleProbeFn,
+    dev_token: u64,
+    reserved: u64,
+) -> i32 {
+    call_in_module_context(owner, || probe(dev_token, reserved))
+}
+
+fn module_callback_call_gate(owner: u64, callback: narf_bus::ModuleCallbackFn, cookie: u64) -> i32 {
+    call_in_module_context(owner, || callback(cookie))
+}
+
+fn module_tx_call_gate(owner: u64, callback: narf_bus::ModuleTxFn, frame: &[u8]) -> i32 {
+    call_in_module_context(owner, || callback(frame.as_ptr(), frame.len()))
+}
+
+fn install_bus_call_gate() {
+    narf_bus::set_module_probe_call_gate(module_pci_probe_call_gate);
+    narf_bus::set_module_callback_call_gate(module_callback_call_gate);
+    narf_bus::set_module_tx_call_gate(module_tx_call_gate);
+}
 
 /// Per-name registry of loaded modules. Acts as the single source
 /// of truth for `/proc/modules` + `/sys/module/`.
@@ -172,6 +224,7 @@ pub fn register_initcalls() {
 
     narf_init::register(Stage::Subsys, "modules-abi", || {
         domain::install_standard_domains();
+        install_bus_call_gate();
         kabi::register_all();
         symbols::set_kernel_abi(symbols::compute_abi_hash());
         sign::install_build_trusted_signers();

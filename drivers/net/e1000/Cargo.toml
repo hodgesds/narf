@@ -10,8 +10,9 @@
 #     `cargo xtask build-module -p narf-drivers-net-e1000 --no-default-features
 #     --features module`. The kernel crates are dropped from the graph and the
 #     driver registers through the `narf_register_pci_driver` KSYMTAB export.
-#     Registration-only until the device datapath ABI is exported (the probe
-#     thunk returns -ENOSYS), so this proves the loadable-driver *mechanism*.
+#     The loader assigns its isolation frame at runtime; the current datapath
+#     slice resets the NIC, programs persistent copy-mode RX/TX rings,
+#     registers a network interface, and runs TX/RX callbacks in task context.
 
 [package]
 name         = "narf-drivers-net-e1000"

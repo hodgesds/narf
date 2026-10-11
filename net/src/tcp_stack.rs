@@ -401,6 +401,7 @@ pub fn handle_arp_on_in(body: &[u8], net_ns_id: u64, iface_name: Option<&str>) {
     // Per-iface cache: record on the ingress interface if known.
     if let Some(name) = iface_name {
         arp_cache::insert(name, arp.spa, arp.sha);
+        crate::udp_sock::neighbor_resolved(net_ns_id, name, arp.spa, arp.sha);
     }
     if arp.op == ARP_OP_REQUEST {
         // Answer from whichever iface actually owns the requested

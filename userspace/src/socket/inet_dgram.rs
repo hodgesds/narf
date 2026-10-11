@@ -957,6 +957,9 @@ impl SocketFile {
                 Err(narf_net::udp_sock::UdpError::NetworkUnreachable) => {
                     SocketOpResult::Ok(buf.len() as u64)
                 }
+                Err(narf_net::udp_sock::UdpError::QueueFull) => {
+                    SocketOpResult::Err(SockError::NoBufs)
+                }
                 Err(_) => SocketOpResult::Err(SockError::NetUnreach),
             };
         }
@@ -1110,6 +1113,7 @@ impl SocketFile {
             Err(narf_net::udp_sock::UdpError::NetworkUnreachable) => {
                 SocketOpResult::Ok(buf.len() as u64)
             }
+            Err(narf_net::udp_sock::UdpError::QueueFull) => SocketOpResult::Err(SockError::NoBufs),
             Err(_) => SocketOpResult::Err(SockError::NetUnreach),
         }
     }

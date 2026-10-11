@@ -21,6 +21,26 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// ignores the argument. Returns Ok on enqueue, Err on driver failure.
 pub type SendFn = fn(&[u8], crate::TxMeta) -> Result<(), ()>;
 
+/// Send hook with an opaque kernel-owned context value. Loadable drivers use
+/// this form because one permanent in-tree trampoline must dispatch to many
+/// independently unloadable module/device instances.
+pub type SendCtxFn = fn(u64, &[u8], crate::TxMeta) -> Result<(), ()>;
+
+#[derive(Copy, Clone, Debug)]
+enum SendDispatch {
+    Plain(SendFn),
+    Context { cookie: u64, send: SendCtxFn },
+}
+
+impl SendDispatch {
+    fn call(self, frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
+        match self {
+            Self::Plain(send) => send(frame, meta),
+            Self::Context { cookie, send } => send(cookie, frame, meta),
+        }
+    }
+}
+
 /// Zero-copy transmit hook (P-F). A driver that opts in via
 /// [`enable_zero_copy_tx`] supplies this: it takes ownership of a
 /// [`crate::Frame`] the stack built directly into a DMA buffer drawn from the
@@ -42,6 +62,7 @@ pub struct NetIfaceEntry {
     pub name: String,
     pub mac: [u8; 6],
     pub send: SendFn,
+    send_context: Option<(u64, SendCtxFn)>,
     /// The interface's primary IPv4 address (the stack's source address),
     /// `0.0.0.0` while it has none. [`add_addr`] / [`del_addr`] keep it on
     /// the first address configured, as Linux's primary `ifa_list` entry.
@@ -406,6 +427,27 @@ pub fn register_loopback_iface() {
 /// pattern the name `dev_alloc_name` chose. Drivers address their device by
 /// the returned name afterwards.
 pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
+    register_inner(name, mac, send, None)
+}
+
+fn context_send_placeholder(_frame: &[u8], _meta: crate::TxMeta) -> Result<(), ()> {
+    Err(())
+}
+
+/// Register an interface whose send path needs an opaque dispatch cookie.
+/// The cookie and function are copied out under the registry lock and invoked
+/// after releasing it, with the same deadlock/re-entry guarantees as
+/// [`register`]'s plain hook.
+pub fn register_with_context(name: &str, mac: [u8; 6], cookie: u64, send: SendCtxFn) -> String {
+    register_inner(name, mac, context_send_placeholder, Some((cookie, send)))
+}
+
+fn register_inner(
+    name: &str,
+    mac: [u8; 6],
+    send: SendFn,
+    send_context: Option<(u64, SendCtxFn)>,
+) -> String {
     let enumerated_name = name.contains("%d");
     let mut g = IFACES.lock();
     let v = g.get_or_insert_with(Vec::new);
@@ -483,6 +525,7 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
         name: name.clone(),
         mac,
         send,
+        send_context,
         ipv4,
         gateway,
         mtu,
@@ -532,6 +575,24 @@ pub fn register(name: &str, mac: [u8; 6], send: SendFn) -> String {
     // this lock.
     dev_conf_register(&name);
     name
+}
+
+/// Remove a registered interface by name. Any snapshots copied before this
+/// call retain only the permanent in-tree dispatch trampoline; their cookie
+/// resolves fail-closed once the owning device context is removed.
+pub fn unregister(name: &str) -> bool {
+    let mut g = IFACES.lock();
+    let Some(entries) = g.as_mut() else {
+        return false;
+    };
+    let before = entries.len();
+    entries.retain(|entry| entry.name != name);
+    let removed = entries.len() != before;
+    drop(g);
+    if removed {
+        crate::udp_sock::remove_interface(name);
+    }
+    removed
 }
 
 /// Number of registered interfaces.
@@ -752,6 +813,13 @@ pub fn note_rx_overrun(name: &str, n: u64) {
     });
 }
 
+fn send_dispatch(entry: &NetIfaceEntry) -> SendDispatch {
+    match entry.send_context {
+        Some((cookie, send)) => SendDispatch::Context { cookie, send },
+        None => SendDispatch::Plain(entry.send),
+    }
+}
+
 /// Send a complete Ethernet frame out the interface named `iface_name`.
 /// Returns `Err` if no such iface is registered or the driver failed.
 ///
@@ -762,13 +830,13 @@ pub fn note_rx_overrun(name: &str, n: u64) {
 /// deadlock. The classifier is the sole XDP caller and invokes this only after
 /// its own `XDP_PROGS` lock is released, so no BPF-side lock is held here.
 pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
-    let (send_fn, name) = {
+    let (send, name) = {
         let g = IFACES.lock();
         let v = g.as_ref().ok_or(())?;
         let e = v.iter().find(|e| e.name == iface_name).ok_or(())?;
-        (e.send, e.name.clone())
+        (send_dispatch(e), e.name.clone())
     };
-    let result = send_fn(frame, crate::TxMeta::plain());
+    let result = send.call(frame, crate::TxMeta::plain());
     record_tx_result(&name, frame.len(), result.is_ok());
     result
 }
@@ -782,13 +850,13 @@ pub fn send_on(iface_name: &str, frame: &[u8]) -> Result<(), ()> {
 /// turn a program's `bpf_redirect(ifindex)` into an egress NIC. Returns `Err`
 /// if the ifindex names no registered iface or the driver failed.
 pub fn send_on_ifindex(ifindex: u32, frame: &[u8]) -> Result<(), ()> {
-    let (send_fn, name) = {
+    let (send, name) = {
         let g = IFACES.lock();
         let v = g.as_ref().ok_or(())?;
         let entry = v.iter().find(|e| e.ifindex == ifindex).ok_or(())?;
-        (entry.send, entry.name.clone())
+        (send_dispatch(entry), entry.name.clone())
     };
-    let result = send_fn(frame, crate::TxMeta::plain());
+    let result = send.call(frame, crate::TxMeta::plain());
     record_tx_result(&name, frame.len(), result.is_ok());
     result
 }
@@ -848,6 +916,11 @@ pub(crate) fn set_net_ns(name: &str, net_ns_id: u64) -> bool {
     // `dev_change_net_namespace` unregisters the device from its old
     // namespace (NETDEV_UNREGISTER there).
     if old_ns != net_ns_id {
+        // A frame built in the old namespace must never cross the ownership
+        // boundary after ARP completes in the new one. It also cannot be
+        // resolved there because pending entries include the old namespace,
+        // so retaining it would leak queue capacity until teardown.
+        crate::udp_sock::remove_interface(name);
         crate::raw_sock::netdev_unregister_moved(old_ns, &moved);
     }
     true
@@ -906,7 +979,7 @@ pub struct NetIfaceSnapshot {
     pub mac: [u8; 6],
     /// The driver's transmit hook. Private: every kernel transmit goes
     /// through [`NetIfaceSnapshot::xmit`] so packet taps see it.
-    driver_send: SendFn,
+    driver_send: SendDispatch,
     pub ipv4: [u8; 4],
     pub gateway: [u8; 4],
     pub mtu: u32,
@@ -970,7 +1043,7 @@ impl NetIfaceSnapshot {
         );
         let result = match self.send_frame {
             Some(send_frame) => send_frame(frame, meta),
-            None => (self.driver_send)(frame.payload(), meta),
+            None => self.driver_send.call(frame.payload(), meta),
         };
         record_tx_result(&self.name, len, result.is_ok());
         result
@@ -998,7 +1071,7 @@ impl NetIfaceSnapshot {
     /// fully-formed frame and [`crate::TxMeta::plain`].
     pub fn xmit_meta(&self, frame: &[u8], meta: crate::TxMeta) -> Result<(), ()> {
         crate::raw_sock::dev_queue_xmit_nit(self, frame, crate::raw_sock::tx_protocol(frame), None);
-        let result = (self.driver_send)(frame, meta);
+        let result = self.driver_send.call(frame, meta);
         record_tx_result(&self.name, frame.len(), result.is_ok());
         result
     }
@@ -1014,7 +1087,7 @@ impl NetIfaceSnapshot {
         origin: Option<&crate::raw_sock::PacketSock>,
     ) -> Result<(), ()> {
         crate::raw_sock::dev_queue_xmit_nit(self, frame, protocol, origin);
-        let result = (self.driver_send)(frame, crate::TxMeta::plain());
+        let result = self.driver_send.call(frame, crate::TxMeta::plain());
         record_tx_result(&self.name, frame.len(), result.is_ok());
         result
     }
@@ -1022,7 +1095,7 @@ impl NetIfaceSnapshot {
     /// `dev_direct_xmit`: hand the frame straight to the driver, with no
     /// packet taps (`PACKET_QDISC_BYPASS`).
     pub fn xmit_direct(&self, frame: &[u8]) -> Result<(), ()> {
-        let result = (self.driver_send)(frame, crate::TxMeta::plain());
+        let result = self.driver_send.call(frame, crate::TxMeta::plain());
         record_tx_result(&self.name, frame.len(), result.is_ok());
         result
     }
@@ -1032,7 +1105,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
     NetIfaceSnapshot {
         name: entry.name.clone(),
         mac: entry.mac,
-        driver_send: entry.send,
+        driver_send: send_dispatch(entry),
         ipv4: entry.ipv4,
         gateway: entry.gateway,
         mtu: entry.mtu,

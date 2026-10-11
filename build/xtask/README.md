@@ -41,7 +41,8 @@ events) force a full run. Its pure core is unit-tested.
 QEMU user-networking and a host-forwarded port, then open a real TCP
 socket *from the host* to a guest server (NARF's `netserve`, or an
 unmodified `redis-server`) and round-trip traffic — proving a guest
-daemon is reachable off-box over virtio-net. `systemd-pid1` boots a
+daemon is reachable off-box over virtio-net; the same smoke now checks a UDP
+echo and a guest DNS query through SLIRP. `systemd-pid1` boots a
 mounted distro rootfs's `/lib/systemd/systemd` as real PID 1 with the
 QEMU user-network configuration, optionally asserting the network works
 end-to-end through SLIRP.

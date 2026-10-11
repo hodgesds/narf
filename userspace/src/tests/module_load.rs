@@ -118,6 +118,9 @@ fn smoke_module_load_real_ko_round_trip() -> TestResult {
                 E::Load(LoadError::Header(_)) => "sys_init_module: ELF header rejected",
                 E::Load(LoadError::Manifest(_)) => "sys_init_module: .modinfo rejected",
                 E::Load(LoadError::Domain(_)) => "sys_init_module: unknown target_domain",
+                E::Load(LoadError::DomainOverride(_)) => {
+                    "sys_init_module: invalid domain= override"
+                }
                 E::Load(LoadError::SignatureRejected(_)) => "sys_init_module: signature rejected",
                 E::Load(LoadError::Compression(_)) => {
                     "sys_init_module: compressed envelope rejected"

@@ -148,6 +148,33 @@ allowlist exceptions. Adding a new symbol to the SDK is an
 **Interface-class PR** per `process/` §4 — explicit ABI design
 review.
 
+### 3.4 Dual-build placement and the current module bridge
+
+An in-tree dual-build driver declares one static registration path for the
+kernel image and one C-ABI registration path for a `.ko`. Built-in code and
+resource placement remain compile-time choices (e1000 assigns coherent rings
+to `DomainId::DRIVER_0`); no loader parameter can change them. For a runtime-loaded module,
+`target_domain=` is an author hint and the holder of `CAP_SYS_MODULE` may pass
+`domain=<name>` to `init_module` / `finit_module` to choose the effective
+driver domain. The loader rejects `DomainId::FRAME` for every runtime module.
+
+The current staged device ABI uses opaque `u64` handles. Kernel-owned contexts
+hold the real device capability, BAR mappings, and owner `ModuleId`; no
+`repr(Rust)` object crosses the module boundary. Kernel-to-module callbacks
+must use the module call gate, which enters the effective load-time domain and
+publishes the owner in per-CPU state. Module-to-kernel datapath calls validate
+that owner before using the retained capability. The current e1000 slice
+exposes PCI command enable, bounded 32-bit BAR MMIO, and opaque coherent-DMA
+handles with bounded copy access. It also exposes kernel-owned MSI-X discovery,
+vector allocation, deferred IRQ callbacks, and a 1-ms task-context poller.
+Hard IRQ handling stays in FRAME; module callbacks are admitted only while the
+module is Live, pinned for the call, and entered in the operator-selected
+domain. The e1000 module path now programs persistent copy-mode RX/TX rings,
+registers an unload-safe Ethernet interface, sends through a domain-gated TX
+callback, and delivers copied RX frames through a cap-gated ingress export.
+Responsive MMIO/DMA wait exports keep reset and descriptor-completion polling
+inside the scheduler bridge rather than in module-local spin loops.
+
 ## 4. ABI versioning
 
 Modelled directly on `userspace/syscall.rs`'s syscall versioning

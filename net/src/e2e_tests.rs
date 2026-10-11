@@ -92,6 +92,7 @@ fn full_reset(iface_name: &'static str, local_ip: [u8; 4], gateway: [u8; 4]) {
     arp_cache::__reset_for_test();
     crate::ifaddr::__reset_for_test();
     crate::bypass::__reset_for_test();
+    crate::udp_sock::__reset_pending_udp4_for_test();
     // netfilter and the ipv4 sysctls are process-global too, and `full_reset`
     // used to leave them alone — so a prior case's leaked OUTPUT drop rule or a
     // cleared `send_redirects` silently reached across test boundaries. That is
@@ -2574,6 +2575,109 @@ fn smoke_udp_offlink_resolves_gateway_mac() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("net/e2e", smoke_udp_offlink_resolves_gateway_mac);
+
+// A non-blocking userspace UDP send to a fresh on-link neighbor must retain
+// the first datagram while ARP resolves it. Linux's neigh_resolve_output
+// queues that skb; dropping it made a one-shot DNS query time out even though
+// the ARP reply arrived immediately afterward.
+fn smoke_udp_first_datagram_flushes_after_arp_reply() -> TestResult {
+    const IFACE: &str = "e2e-udp-arp";
+    const LOCAL_IP: [u8; 4] = [10, 23, 0, 15];
+    const GATEWAY: [u8; 4] = [10, 23, 0, 2];
+    const DNS_IP: [u8; 4] = [10, 23, 0, 3];
+    const DNS_MAC: [u8; 6] = [0x52, 0x55, 0x0a, 0x17, 0x00, 0x03];
+    const SRC_PORT: u16 = 49153;
+    const DST_PORT: u16 = 53;
+
+    full_reset(IFACE, LOCAL_IP, GATEWAY);
+    drain_captured();
+    let payload = b"one-shot-dns";
+    let sent = crate::udp_sock::udp_send_from(
+        0,
+        SRC_PORT,
+        SocketAddrV4::new(DNS_IP, DST_PORT),
+        payload,
+        &UdpOptions::default(),
+        0,
+    );
+    if sent != Ok(payload.len()) {
+        return TestResult::Fail("non-blocking UDP send did not accept the queued datagram");
+    }
+    let discovery = drain_captured();
+    if !discovery.iter().any(|frame| {
+        frame.len() >= ETH_HDR_LEN + 28 && frame[12..14] == crate::pkt::ETHERTYPE_ARP.to_be_bytes()
+    }) {
+        return TestResult::Fail("UDP cache miss did not emit an ARP request");
+    }
+    if crate::udp_sock::__pending_udp4_test_count(0) != 1 {
+        return TestResult::Fail("first UDP datagram was not retained during ARP");
+    }
+
+    // Feed the exact ARP reply the NIC would receive. The common RX handler
+    // learns the mapping and must synchronously flush the retained datagram.
+    let local_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x05];
+    let mut reply = [0u8; 28];
+    reply[0..2].copy_from_slice(&1u16.to_be_bytes());
+    reply[2..4].copy_from_slice(&crate::pkt::ETHERTYPE_IPV4.to_be_bytes());
+    reply[4] = 6;
+    reply[5] = 4;
+    reply[6..8].copy_from_slice(&2u16.to_be_bytes());
+    reply[8..14].copy_from_slice(&DNS_MAC);
+    reply[14..18].copy_from_slice(&DNS_IP);
+    reply[18..24].copy_from_slice(&local_mac);
+    reply[24..28].copy_from_slice(&LOCAL_IP);
+    crate::tcp_stack::handle_arp_on_in(&reply, 0, Some(IFACE));
+
+    let frames = drain_captured();
+    let Some(frame) = frames.iter().find(|frame| {
+        frame.len() >= ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + payload.len()
+            && frame[ETH_HDR_LEN + 9] == IP_PROTO_UDP
+    }) else {
+        return TestResult::Fail("ARP reply did not flush the first UDP datagram");
+    };
+    let udp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
+    if frame[..6] != DNS_MAC
+        || frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20] != DNS_IP
+        || frame[udp_off + UDP_HDR_LEN..] != *payload
+    {
+        return TestResult::Fail("flushed UDP datagram was altered or misaddressed");
+    }
+    if crate::udp_sock::__pending_udp4_test_count(0) != 0 {
+        return TestResult::Fail("ARP-resolved UDP datagram remained queued");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_udp_first_datagram_flushes_after_arp_reply);
+
+fn smoke_udp_pending_datagram_dropped_on_iface_namespace_move() -> TestResult {
+    const IFACE: &str = "e2e-udp-netns-move";
+    const LOCAL_IP: [u8; 4] = [10, 24, 0, 15];
+
+    full_reset(IFACE, LOCAL_IP, [10, 24, 0, 2]);
+    drain_captured();
+    let sent = crate::udp_sock::udp_send_from(
+        0,
+        49154,
+        SocketAddrV4::new([10, 24, 0, 3], 53),
+        b"pending-before-move",
+        &UdpOptions::default(),
+        0,
+    );
+    if sent != Ok(19) || crate::udp_sock::__pending_udp4_test_count(0) != 1 {
+        return TestResult::Fail("UDP datagram was not pending before namespace move");
+    }
+    if !crate::iface::set_net_ns(IFACE, 0x24) {
+        return TestResult::Fail("could not move the test interface");
+    }
+    if crate::udp_sock::__pending_udp4_test_count(0) != 0 {
+        return TestResult::Fail("namespace move retained an old-namespace UDP datagram");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "net/e2e",
+    smoke_udp_pending_datagram_dropped_on_iface_namespace_move
+);
 
 // ── net.ipv4.tcp_{window_scaling,timestamps,sack} ───────────────────────────
 //

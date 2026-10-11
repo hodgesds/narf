@@ -118,13 +118,11 @@ enum Cmd {
     /// keystrokes → narf_input ring → /dev/console → sys_read fd 0 →
     /// shell parser → echo built-in → sys_write fd 1 → UART.
     RunInteractive(RunInteractiveArgs),
-    /// Off-box network serving smoke. Boot with `qemu-net` (statically
-    /// configures the virtio NIC with the SLIRP lease) + a QEMU `hostfwd`, wait
-    /// for the auto-spawned `netserve` echo server to print
-    /// `netserve: listening`, then open a real TCP socket FROM THE HOST
-    /// to the forwarded port, round-trip a line, and assert the echo +
-    /// the guest's `netserve-ok`. Proves a guest server is reachable
-    /// from outside the VM over virtio-net.
+    /// Live TCP/UDP/DNS network-stack smoke. Boot with `qemu-net` (statically
+    /// configures the virtio NIC with the SLIRP lease) + TCP and UDP QEMU
+    /// `hostfwd` rules, round-trip payloads from the host through the guest
+    /// server, and require the guest to resolve `example.com` through SLIRP's
+    /// DNS proxy. Proves bidirectional TCP/UDP and DNS over virtio-net.
     NetSmoke(BuildArgs),
     /// Off-box redis smoke. Boot with `qemu-net` + a QEMU `hostfwd`,
     /// wait for the auto-spawned unmodified `redis-server` to print
@@ -5402,14 +5400,13 @@ fn run_interactive_boot(
     Ok(transcript)
 }
 
-/// Off-box network serving smoke — see [`Cmd::NetSmoke`]. Boots with the
-/// `qemu-net` static config + a QEMU `hostfwd`, waits for the auto-
-/// spawned guest echo server to announce itself, then opens a real TCP
-/// socket from the host to the forwarded port and asserts the round-trip
-/// (plus the guest's `netserve-ok`).
+/// Live network-stack smoke — see [`Cmd::NetSmoke`]. Boots with the
+/// `qemu-net` static config + QEMU TCP/UDP `hostfwd` rules, drives genuine
+/// host-to-guest TCP and UDP echo round-trips, and requires a guest-originated
+/// DNS query/reply through the SLIRP resolver.
 fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     use std::io::{Read, Write};
-    use std::net::TcpStream;
+    use std::net::{TcpStream, UdpSocket};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -5417,8 +5414,10 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         bail!("xtask net-smoke: only x86_64 is wired (boot-init is x86_64-only)");
     }
 
-    let host_port: u16 = 17777;
-    let guest_port: u16 = 7777;
+    let tcp_host_port: u16 = 17777;
+    let tcp_guest_port: u16 = 7777;
+    let udp_host_port: u16 = 17778;
+    let udp_guest_port: u16 = 7778;
 
     let mut build = args.clone();
     ensure_feature(&mut build.features, "boot-init");
@@ -5440,7 +5439,10 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     // on the child Command would be too late — the arg list is built here.
     std::env::set_var(
         "XTASK_QEMU_HOSTFWD",
-        format!("tcp:127.0.0.1:{host_port}-:{guest_port}"),
+        format!(
+            "tcp:127.0.0.1:{tcp_host_port}-:{tcp_guest_port},\
+             hostfwd=udp:127.0.0.1:{udp_host_port}-:{udp_guest_port}"
+        ),
     );
     // Suppress the redis-server auto-spawn: net-smoke only exercises
     // netserve, and redis's heavy multi-threaded startup starves
@@ -5470,7 +5472,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     cmd.stderr(Stdio::piped());
 
     println!(
-        "xtask net-smoke: launching {} {} (hostfwd 127.0.0.1:{host_port} -> guest :{guest_port})",
+        "xtask net-smoke: launching {} {} (TCP 127.0.0.1:{tcp_host_port} -> guest :{tcp_guest_port}; UDP 127.0.0.1:{udp_host_port} -> guest :{udp_guest_port})",
         qemu,
         kernel.display()
     );
@@ -5566,6 +5568,14 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
                 if g.windows(needle.len()).any(|w| w == needle) {
                     return true;
                 }
+                // A userspace fixture failure is terminal too. Without this,
+                // net-smoke waited for the full boot timeout after the guest
+                // had already printed an exact failure and exited.
+                if g.windows(b"netserve-fail:".len())
+                    .any(|w| w == b"netserve-fail:")
+                {
+                    return false;
+                }
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -5586,7 +5596,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         );
     }
     println!(
-        "\nxtask net-smoke: guest is listening; connecting from host to 127.0.0.1:{host_port}..."
+        "\nxtask net-smoke: guest TCP is listening; connecting from host to 127.0.0.1:{tcp_host_port}..."
     );
 
     // 2. Connect from the host, retrying — SLIRP forwarding + the guest
@@ -5594,7 +5604,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     let mut stream: Option<TcpStream> = None;
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(20) {
-        match TcpStream::connect(("127.0.0.1", host_port)) {
+        match TcpStream::connect(("127.0.0.1", tcp_host_port)) {
             Ok(s) => {
                 stream = Some(s);
                 break;
@@ -5607,7 +5617,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("xtask net-smoke: could not connect to 127.0.0.1:{host_port} within 20s");
+            bail!("xtask net-smoke: could not connect to 127.0.0.1:{tcp_host_port} within 20s");
         }
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
@@ -5648,7 +5658,75 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
         String::from_utf8_lossy(&got)
     );
 
-    // 4. Wait for the guest's clean-round-trip confirmation.
+    // 4. Wait until the guest has completed TCP and is ready for UDP.
+    if !wait_for(b"netserve-tcp-ok", timeout_secs) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask net-smoke: guest did not confirm the TCP round-trip");
+    }
+    if !wait_for(b"netserve: udp listening", timeout_secs) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask net-smoke: guest UDP server did not become ready");
+    }
+
+    // 5. Round-trip a datagram through QEMU's independent UDP forwarding
+    // path. Exact bytes and length matter: UDP must preserve message framing.
+    let udp = match UdpSocket::bind(("127.0.0.1", 0)) {
+        Ok(socket) => socket,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("xtask net-smoke: could not bind the host UDP socket: {e}");
+        }
+    };
+    if let Err(e) = udp.set_read_timeout(Some(Duration::from_secs(20))) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask net-smoke: could not set the host UDP timeout: {e}");
+    }
+    let udp_payload = b"hello-narf-udp\n";
+    if let Err(e) = udp.send_to(udp_payload, ("127.0.0.1", udp_host_port)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask net-smoke: host UDP send failed: {e}");
+    }
+    let mut udp_buf = [0u8; 256];
+    let (udp_len, _) = match udp.recv_from(&mut udp_buf) {
+        Ok(received) => received,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("xtask net-smoke: host UDP receive failed: {e}");
+        }
+    };
+    if &udp_buf[..udp_len] != udp_payload {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!(
+            "xtask net-smoke: UDP echo mismatch — sent {:?}, got {:?}",
+            String::from_utf8_lossy(udp_payload),
+            String::from_utf8_lossy(&udp_buf[..udp_len])
+        );
+    }
+    println!(
+        "xtask net-smoke: host received the UDP echo ({:?})",
+        String::from_utf8_lossy(&udp_buf[..udp_len])
+    );
+    if !wait_for(b"netserve-udp-ok", timeout_secs) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask net-smoke: guest did not confirm the UDP round-trip");
+    }
+
+    // 6. The guest now issues a real DNS query to SLIRP's 10.0.2.3 proxy.
+    if !wait_for(b"netserve-dns-ok", timeout_secs) {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("xtask net-smoke: guest DNS query did not return a valid answer");
+    }
+
+    // 7. Require the aggregate guest verdict as well as each path token.
     if !wait_for(b"netserve-ok", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
@@ -5658,7 +5736,7 @@ fn net_smoke_cmd(args: &BuildArgs) -> Result<()> {
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
-    println!("xtask net-smoke: ok — guest server echoed an off-box client over virtio-net");
+    println!("xtask net-smoke: ok — live TCP, UDP, and DNS passed over virtio-net");
     Ok(())
 }
 

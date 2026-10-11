@@ -49,6 +49,15 @@
 use alloc::alloc::{alloc, dealloc};
 use core::alloc::Layout;
 
+macro_rules! register_kernel_abi_export {
+    ($name:ident, $crc:expr) => {
+        crate::symbols::export(stringify!($name), $name as usize, $crc)
+    };
+    ($name:ident, $crc:expr, $required_cap:expr) => {
+        crate::symbols::export_with_cap(stringify!($name), $name as usize, $crc, $required_cap)
+    };
+}
+
 /// FNV-1a over a signature string, evaluated at compile time.
 ///
 /// Not a real CRC despite the field name it feeds; the property that matters
@@ -74,6 +83,7 @@ pub const fn crc_for_signature(sig: &str) -> u32 {
 macro_rules! kernel_abi {
     ($(
         $(#[$meta:meta])*
+        $(requires $required_cap:expr;)?
         fn $name:ident ( $($arg:ident : $aty:ty),* $(,)? ) $(-> $ret:ty)? $body:block
     )*) => {
         $(
@@ -99,16 +109,16 @@ macro_rules! kernel_abi {
         pub fn register_all() {
             $(
                 if !crate::symbols::is_exported(stringify!($name)) {
-                crate::symbols::export(
-                    stringify!($name),
-                    $name as usize,
+                register_kernel_abi_export!(
+                    $name,
                     crc_for_signature(concat!(
                         stringify!($name),
                         "(",
                         $(stringify!($aty), ",",)*
                         ")",
                         $("->", stringify!($ret),)?
-                    )),
+                    ))
+                    $(, $required_cap)?
                 );
                 }
             )*
@@ -237,8 +247,8 @@ kernel_abi! {
     /// # Safety
     /// `name` must name `name_len` readable bytes valid for the call. `probe`
     /// must be a valid `ModuleProbeFn` pointer that stays mapped for as long
-    /// as the driver is registered (i.e. until the module unloads, which is
-    /// not yet supported for modules that register a match).
+    /// as the driver is registered. Module unload removes the callback and
+    /// its device contexts before unmapping the owner's text.
     fn narf_register_pci_driver(
         name: *const u8,
         name_len: usize,
@@ -256,7 +266,320 @@ kernel_abi! {
         };
         // SAFETY: `probe` is non-null (checked) and the module promises it is a
         // valid `ModuleProbeFn` for as long as the match is registered.
-        unsafe { narf_bus::register_module_pci_driver(name, vendor, device, probe) }
+        let owner = crate::symbols::current_init_id().0;
+        // SAFETY: the validated callback remains owned by `owner`; the module
+        // unload path removes it before that owner's text is unmapped.
+        unsafe { narf_bus::register_module_pci_driver(owner, name, vendor, device, probe) }
+    }
+
+    // ── Device datapath: PCI/MMIO (Stage 1) + coherent DMA (Stage 2) ───────
+    //
+    // These let a module's probe actually drive the device it was handed. The
+    // kernel keeps the device cap + mapped BARs in a per-device context keyed
+    // by `dev` (the token the probe received); the module holds only the `dev`
+    // token and 1-based BAR handles. Every op is cap-gated through the stored
+    // device authority. `dev` is the `dev_token` the `ModuleProbeFn` was called
+    // with.
+
+    /// Enable PCI command bits (e.g. `MEM_SPACE | BUS_MASTER`) on the module's
+    /// device so its BARs respond. Returns 0, or `-ENODEV`/`-EIO`.
+    ///
+    /// # Safety
+    /// `dev` must be the token the module's probe was invoked with.
+    fn narf_pci_enable(dev: u64, cmd_bits: u16) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_pci_enable(owner, dev, cmd_bits)
+    }
+
+    /// Map BAR `bar_idx` of the module's device; returns a 1-based BAR handle,
+    /// or 0 on failure.
+    ///
+    /// # Safety
+    /// `dev` must be the token the module's probe was invoked with.
+    fn narf_bar_map(dev: u64, bar_idx: u8) -> u64 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_bar_map(owner, dev, bar_idx)
+    }
+
+    /// Read a 32-bit device register at `off` in BAR handle `bar`, storing it
+    /// through `out`. Returns 0, or `-EINVAL` for a bad handle/offset/pointer.
+    ///
+    /// # Safety
+    /// `out` must point to a writable `u32`. `dev`/`bar` identify a mapped BAR.
+    fn narf_mmio_read32(dev: u64, bar: u64, off: u64, out: *mut u32) -> i32 {
+        if out.is_null() {
+            return -22; // -EINVAL
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_mmio_read32(owner, dev, bar, off) {
+            Some(v) => {
+                // SAFETY: `out` is non-null; the module promises it is writable.
+                unsafe { out.write(v) };
+                0
+            }
+            None => -22,
+        }
+    }
+
+    /// Write `val` to the 32-bit device register at `off` in BAR handle `bar`.
+    /// Returns 0, or `-EINVAL` for a bad handle/offset.
+    ///
+    /// # Safety
+    /// `dev`/`bar` identify a mapped BAR of the module's device.
+    fn narf_mmio_write32(dev: u64, bar: u64, off: u64, val: u32) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_mmio_write32(owner, dev, bar, off, val)
+    }
+
+    /// Responsively wait until `(read32(off) & mask) == expected`, bounded by
+    /// `timeout_ns` (1 ns through 1 s). Returns `-ETIMEDOUT` on expiry.
+    ///
+    /// # Safety
+    /// `dev`/`bar` identify a mapped BAR and `off` names a register safe to
+    /// poll repeatedly.
+    fn narf_mmio_wait32(
+        dev: u64,
+        bar: u64,
+        off: u64,
+        mask: u32,
+        expected: u32,
+        timeout_ns: u64,
+    ) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_mmio_wait32(owner, dev, bar, off, mask, expected, timeout_ns)
+    }
+
+    /// Allocate a coherent DMA buffer in the module's effective isolation
+    /// domain. Returns a 1-based opaque handle, or 0 on failure.
+    ///
+    /// # Safety
+    /// `dev` must be the token the module's probe was invoked with. The caller
+    /// must not use the returned handle after `narf_dma_free` or unload.
+    requires narf_capabilities::CapKind::DmaBuffer;
+    fn narf_dma_alloc(dev: u64, len: usize) -> u64 {
+        let owner = crate::symbols::current_execution_id().0;
+        let domain = narf_lib::assert::current_domain();
+        if owner == crate::symbols::KERNEL_MODULE_ID.0 || domain == narf_lib::id::DomainId::FRAME {
+            return 0;
+        }
+        narf_bus::module_dma_alloc(owner, dev, len, domain)
+    }
+
+    /// Return the device-visible address of byte `off` in a DMA buffer.
+    /// Returns 0 on success or `-EINVAL` for a stale handle, bad offset, or
+    /// null output pointer.
+    ///
+    /// # Safety
+    /// `out` must point to writable `u64` storage for the call's duration.
+    requires narf_capabilities::CapKind::DmaBuffer;
+    fn narf_dma_addr(dev: u64, dma: u64, off: u64, out: *mut u64) -> i32 {
+        if out.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_dma_addr(owner, dev, dma, off) {
+            Some(addr) => {
+                // SAFETY: `out` is non-null and the caller promises writable
+                // storage for one `u64`.
+                unsafe { out.write(addr) };
+                0
+            }
+            None => -22,
+        }
+    }
+
+    /// Copy module bytes into a coherent DMA buffer. The kernel checks the
+    /// complete range before copying and never exposes the CPU mapping.
+    ///
+    /// # Safety
+    /// `src` must name `len` readable bytes. `dev`/`dma` must identify a live
+    /// buffer owned by the current module callback.
+    requires narf_capabilities::CapKind::DmaBuffer;
+    fn narf_dma_write(dev: u64, dma: u64, off: u64, src: *const u8, len: usize) -> i32 {
+        if src.is_null() {
+            return -22;
+        }
+        // SAFETY: the module promises `src` names `len` readable bytes. The
+        // bus bridge validates the destination range before copying.
+        let src = unsafe { core::slice::from_raw_parts(src, len) };
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_dma_write(owner, dev, dma, off, src)
+    }
+
+    /// Copy coherent DMA bytes into module memory. The kernel checks the
+    /// complete range before copying and never exposes the CPU mapping.
+    ///
+    /// # Safety
+    /// `dst` must name `len` writable bytes. `dev`/`dma` must identify a live
+    /// buffer owned by the current module callback.
+    requires narf_capabilities::CapKind::DmaBuffer;
+    fn narf_dma_read(dev: u64, dma: u64, off: u64, dst: *mut u8, len: usize) -> i32 {
+        if dst.is_null() {
+            return -22;
+        }
+        // SAFETY: the module promises `dst` names `len` writable bytes. The
+        // bus bridge validates the source range before copying.
+        let dst = unsafe { core::slice::from_raw_parts_mut(dst, len) };
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_dma_read(owner, dev, dma, off, dst)
+    }
+
+    /// Responsively wait until one DMA status byte matches. This is the
+    /// synchronous completion primitive for copy-mode module TX paths.
+    ///
+    /// # Safety
+    /// `dev`/`dma` identify a live DMA handle and `off` names a device-owned
+    /// status byte safe to sample repeatedly.
+    requires narf_capabilities::CapKind::DmaBuffer;
+    fn narf_dma_wait8(
+        dev: u64,
+        dma: u64,
+        off: u64,
+        mask: u8,
+        expected: u8,
+        timeout_ns: u64,
+    ) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_dma_wait8(owner, dev, dma, off, mask, expected, timeout_ns)
+    }
+
+    /// Revoke and release a coherent DMA buffer. Returns 0, `-ENODEV`, or
+    /// `-EINVAL`; a second free of the same handle is rejected.
+    ///
+    /// # Safety
+    /// `dev`/`dma` must be opaque handles returned to this module.
+    requires narf_capabilities::CapKind::DmaBuffer;
+    fn narf_dma_free(dev: u64, dma: u64) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_dma_free(owner, dev, dma)
+    }
+
+    // ── Device datapath: MSI-X + task-context callbacks (Stage 3) ────
+
+    /// Discover and retain the device's MSI-X table. Returns 0,
+    /// `-EOPNOTSUPP` when the function has no MSI-X capability, or another
+    /// negative errno for a stale device/configuration failure.
+    ///
+    /// # Safety
+    /// `dev` must be the live token supplied to the current module callback.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_msix_enable(dev: u64) -> i32 {
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_msix_enable(owner, dev)
+    }
+
+    /// Allocate and program one MSI-X vector, writing its kernel vector number
+    /// through `out_vector`.
+    ///
+    /// # Safety
+    /// `out_vector` must point to writable `u16` storage for the call.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_msix_claim(dev: u64, out_vector: *mut u16) -> i32 {
+        if out_vector.is_null() {
+            return -22;
+        }
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_msix_claim(owner, dev) {
+            Ok(vector) => {
+                // SAFETY: non-null above; the module promises writable storage.
+                unsafe { out_vector.write(vector) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Attach a synchronous module callback to a claimed vector. The callback
+    /// runs from an executor task in the module's effective domain, never from
+    /// the hard-IRQ handler. Returning non-zero stops the callback pump.
+    ///
+    /// # Safety
+    /// `callback` must be a valid `extern "C" fn(u64) -> i32` address that
+    /// remains mapped until device teardown.
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_irq_set_handler(dev: u64, vector: u16, callback: usize, cookie: u64) -> i32 {
+        if callback == 0 {
+            return -22;
+        }
+        // SAFETY: the module supplies the documented C callback address and
+        // unload removes the binding before its text is unmapped.
+        let callback: narf_bus::ModuleCallbackFn = unsafe { core::mem::transmute(callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_irq_set_handler(owner, dev, vector, callback, cookie)
+    }
+
+    /// Spawn one 1-ms periodic task-context callback for this device. The
+    /// first poll is immediate; returning non-zero retires the poller.
+    ///
+    /// # Safety
+    /// `callback` has the same lifetime/signature contract as
+    /// [`narf_irq_set_handler`].
+    requires narf_capabilities::CapKind::BusDevice;
+    fn narf_spawn_poller(dev: u64, callback: usize, cookie: u64) -> i32 {
+        if callback == 0 {
+            return -22;
+        }
+        // SAFETY: same callback contract as `narf_irq_set_handler`.
+        let callback: narf_bus::ModuleCallbackFn = unsafe { core::mem::transmute(callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_spawn_poller(owner, dev, callback, cookie)
+    }
+
+
+    // ── Device datapath: copy-mode network interface (Stage 4) ──────
+
+    /// Register one Ethernet interface for the device and return its ifindex.
+    /// `tx_callback` is an `extern "C" fn(*const u8, usize) -> i32`; it runs in
+    /// the module's effective domain and must consume the borrowed frame before
+    /// returning.
+    ///
+    /// # Safety
+    /// `mac` names six readable bytes, `out_ifindex` names writable `u32`
+    /// storage, and `tx_callback` remains valid until device teardown.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_netif_register(
+        dev: u64,
+        mac: *const u8,
+        tx_callback: usize,
+        out_ifindex: *mut u32,
+    ) -> i32 {
+        if mac.is_null() || tx_callback == 0 || out_ifindex.is_null() {
+            return -22;
+        }
+        // SAFETY: the module promises six readable bytes.
+        let mut mac_bytes = [0u8; 6];
+        // SAFETY: the module promises six readable bytes.
+        mac_bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(mac, 6) });
+        // SAFETY: the callback address has the documented C signature and the
+        // bus context removes it before module text is unmapped.
+        let tx_callback: narf_bus::ModuleTxFn = unsafe { core::mem::transmute(tx_callback) };
+        let owner = crate::symbols::current_execution_id().0;
+        match narf_bus::module_netif_register(owner, dev, mac_bytes, tx_callback) {
+            Ok(ifindex) => {
+                // SAFETY: non-null above; caller promises writable storage.
+                unsafe { out_ifindex.write(ifindex) };
+                0
+            }
+            Err(errno) => errno,
+        }
+    }
+
+    /// Deliver one copied Ethernet frame from a module RX ring into the kernel
+    /// stack. The stack may rewrite bytes in place for XDP before the call
+    /// returns; the module retains ownership of the backing storage.
+    ///
+    /// # Safety
+    /// `frame` names `len` writable bytes for the duration of the call.
+    requires narf_capabilities::CapKind::NetIface;
+    fn narf_netif_rx(dev: u64, ifindex: u32, frame: *mut u8, len: usize) -> i32 {
+        if frame.is_null() || len == 0 || len > u16::MAX as usize {
+            return -22;
+        }
+        // SAFETY: the module promises this writable range; the stack borrows
+        // it only synchronously and never retains the pointer.
+        let frame = unsafe { core::slice::from_raw_parts_mut(frame, len) };
+        let owner = crate::symbols::current_execution_id().0;
+        narf_bus::module_netif_rx(owner, dev, ifindex, frame)
     }
 }
 
@@ -277,6 +600,69 @@ fn smoke_kabi_surface_is_registered() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("modules/kabi", smoke_kabi_surface_is_registered);
+
+/// DMA access is privileged at link time as well as at handle invocation.
+/// A module that omits `required_caps=DmaBuffer:*` must never receive the
+/// function address to call in the first place.
+fn smoke_kabi_dma_exports_require_cap() -> TestResult {
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    match crate::symbols::resolve("narf_dma_alloc", None, &denied) {
+        Err(crate::symbols::ResolveError::CapMissing(narf_capabilities::CapKind::DmaBuffer)) => {}
+        _ => return TestResult::Fail("DMA export resolved without DmaBuffer cap declaration"),
+    }
+
+    let mut allowed = crate::manifest::Manifest::default();
+    allowed.required_caps.push(crate::manifest::RequiredCap {
+        kind: narf_capabilities::CapKind::DmaBuffer,
+        right: <narf_capabilities::Write as narf_capabilities::Rights>::BITS,
+    });
+    if crate::symbols::resolve("narf_dma_alloc", None, &allowed).is_err() {
+        return TestResult::Fail("DMA export stayed hidden with DmaBuffer cap declaration");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_dma_exports_require_cap);
+
+fn smoke_kabi_irq_exports_require_cap() -> TestResult {
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    match crate::symbols::resolve("narf_spawn_poller", None, &denied) {
+        Err(crate::symbols::ResolveError::CapMissing(narf_capabilities::CapKind::BusDevice)) => {}
+        _ => return TestResult::Fail("IRQ export resolved without BusDevice cap declaration"),
+    }
+
+    let mut allowed = crate::manifest::Manifest::default();
+    allowed.required_caps.push(crate::manifest::RequiredCap {
+        kind: narf_capabilities::CapKind::BusDevice,
+        right: <narf_capabilities::Write as narf_capabilities::Rights>::BITS,
+    });
+    if crate::symbols::resolve("narf_spawn_poller", None, &allowed).is_err() {
+        return TestResult::Fail("IRQ export stayed hidden with BusDevice cap declaration");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_irq_exports_require_cap);
+
+fn smoke_kabi_netif_exports_require_cap() -> TestResult {
+    register_all();
+    let denied = crate::manifest::Manifest::default();
+    match crate::symbols::resolve("narf_netif_register", None, &denied) {
+        Err(crate::symbols::ResolveError::CapMissing(narf_capabilities::CapKind::NetIface)) => {}
+        _ => return TestResult::Fail("netif export resolved without NetIface cap declaration"),
+    }
+
+    let mut allowed = crate::manifest::Manifest::default();
+    allowed.required_caps.push(crate::manifest::RequiredCap {
+        kind: narf_capabilities::CapKind::NetIface,
+        right: <narf_capabilities::Write as narf_capabilities::Rights>::BITS,
+    });
+    if crate::symbols::resolve("narf_netif_register", None, &allowed).is_err() {
+        return TestResult::Fail("netif export stayed hidden with NetIface cap declaration");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/kabi", smoke_kabi_netif_exports_require_cap);
 
 /// Registration is idempotent: a second call must not duplicate entries,
 /// because the ABI hash sums over the table and would change.
@@ -414,7 +800,7 @@ kernel_test_in!("modules/kabi", smoke_kabi_kmalloc_round_trip);
 /// if left registered (no such device exists, so the trampoline never fires
 /// against a real probe walk).
 extern "C" fn kabi_smoke_probe_thunk(_dev_token: u64, _reserved: u64) -> i32 {
-    -38 // -ENOSYS: registration-only; the datapath ABI is deferred.
+    -38 // -ENOSYS: this synthetic match deliberately declines probing.
 }
 
 fn smoke_kabi_register_pci_driver_round_trips() -> TestResult {
@@ -457,7 +843,7 @@ fn smoke_kabi_register_pci_driver_round_trips() -> TestResult {
         return TestResult::Fail("module match did not appear in the bus registry");
     }
 
-    // The trampoline dispatches to the module's thunk, which returns -ENOSYS.
+    // The trampoline records the exact module thunk supplied above.
     match narf_bus::driver_match::__module_thunk_for_test(VENDOR, DEVICE) {
         Some(f) => {
             if f(0, 0) != -38 {

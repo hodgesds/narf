@@ -64,7 +64,6 @@ use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTa
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
 use narf_ipc::{channel, Consumer, Producer};
-use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, RX_RING_N, TX_RING_N};
 
@@ -958,12 +957,14 @@ impl E1000 {
         //    frame buffers. The buffers outlive any single tx()
         //    call so a delayed DMA write (AMD-Vi turn-around
         //    latency) can't land on a freed page.
-        let tx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
+        let tx_ring =
+            alloc_coherent(4096, crate::BUILTIN_DOMAIN).map_err(|_| E1000Error::NoMemory)?;
         // Device-side handle; CPU access goes through `tx_ring.cpu_*` below.
         let tx_ring_dma = tx_ring.dma_addr();
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(TX_RING_LEN);
         for _ in 0..TX_RING_LEN {
-            let b = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
+            let b =
+                alloc_coherent(4096, crate::BUILTIN_DOMAIN).map_err(|_| E1000Error::NoMemory)?;
             tx_pool.push(b);
         }
         // Zero the ring (alloc_coherent guarantees fresh memory but
@@ -992,11 +993,13 @@ impl E1000 {
         }
 
         // 5b. Allocate RX descriptor ring + buffer pool.
-        let rx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
+        let rx_ring =
+            alloc_coherent(4096, crate::BUILTIN_DOMAIN).map_err(|_| E1000Error::NoMemory)?;
         let rx_ring_dma = rx_ring.dma_addr();
         let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RX_RING_LEN);
         for i in 0..RX_RING_LEN {
-            let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
+            let buf =
+                alloc_coherent(4096, crate::BUILTIN_DOMAIN).map_err(|_| E1000Error::NoMemory)?;
             // The descriptor carries the DEVICE address of the buffer.
             let buf_dma = buf.dma_addr();
             let desc = RxDesc {
@@ -1668,7 +1671,7 @@ async fn e1000_rx_pump(device: Arc<E1000>, mut rx_prod: Producer<Frame, RX_RING_
         if n > 0 {
             idle_rounds = 0;
             // Push to network stack.
-            let dma_buf = alloc_coherent(n, DomainId::DRIVER_0).expect("Frame alloc failed");
+            let dma_buf = alloc_coherent(n, crate::BUILTIN_DOMAIN).expect("Frame alloc failed");
             let mut frame = Frame::new(dma_buf, n as u32);
             frame.payload_mut().copy_from_slice(&buf[..n]);
             let _ = rx_prod.send(frame).await;

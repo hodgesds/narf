@@ -109,7 +109,7 @@ license=GPL-2.0-or-later
 author=Some Author
 description=RTL9999 vendor driver
 target_domain=net
-required_caps=NetIface:Write,DmaBuffer:Invoke
+required_caps=DmaBuffer:Write,BusDevice:Write,NetIface:Write
 depends=narf-pci,narf-io
 kernel_abi=0xCAFEBEEF      # see DESIGN.md §3
 ```
@@ -134,14 +134,15 @@ The format is one `key=value` per line. Recognised keys:
   * `license=` — SPDX identifier. Must be GPL-compatible.
   * `author=` — free-form.
   * `description=` — free-form.
-  * `target_domain=` — name of the PKS-isolated driver domain
-    where the module's text + data land. Known names: `net`,
+  * `target_domain=` — author's default PKS-isolated driver-domain hint.
+    The system owner may override it at load with `domain=<name>`; a runtime
+    module can never select `FRAME`. Known names: `net`,
     `block`, `graphics`, `input`, `crypto`, `misc`, `scratch`,
-    `driver0`..`driver5`. If absent, defaults to `scratch`.
+    `driver0`..`driver4`. If absent, defaults to `scratch`.
   * `required_caps=` — comma-separated list of `Kind:Right`
     capability specs. The kernel refuses to load if the module
     references a cap-gated export it didn't declare. Example:
-    `required_caps=NetIface:Write,DmaBuffer:Invoke`.
+    `required_caps=DmaBuffer:Write,BusDevice:Write,NetIface:Write`.
   * `depends=` — comma-separated list of module names this module
     needs loaded first. Phase 1 doesn't auto-load deps; modprobe
     is expected to.
@@ -169,6 +170,24 @@ So the surface is small and grows deliberately. Today:
 | `narf_kmalloc` | `(usize, usize) -> *mut u8` | size, align; null on failure or invalid layout |
 | `narf_kfree` | `(*mut u8, usize, usize) -> ()` | must repeat the exact size and align |
 | `narf_monotonic_ns` | `() -> u64` | monotonic clock |
+| `narf_register_pci_driver` | `(*const u8, usize, u16, u16, usize) -> i32` | register a PCI ID and C-ABI probe callback |
+| `narf_pci_enable` | `(u64, u16) -> i32` | enable command bits on the callback's device |
+| `narf_bar_map` | `(u64, u8) -> u64` | map a BAR and return an opaque handle |
+| `narf_mmio_read32` | `(u64, u64, u64, *mut u32) -> i32` | bounded BAR read |
+| `narf_mmio_write32` | `(u64, u64, u64, u32) -> i32` | bounded BAR write |
+| `narf_mmio_wait32` | `(u64, u64, u64, u32, u32, u64) -> i32` | responsive masked register wait; 1 ns–1 s |
+| `narf_dma_alloc` | `(u64, usize) -> u64` | coherent allocation in the selected domain; requires `DmaBuffer` |
+| `narf_dma_addr` | `(u64, u64, u64, *mut u64) -> i32` | device-visible address at a checked offset |
+| `narf_dma_write` | `(u64, u64, u64, *const u8, usize) -> i32` | bounded copy into DMA memory |
+| `narf_dma_read` | `(u64, u64, u64, *mut u8, usize) -> i32` | bounded copy out of DMA memory |
+| `narf_dma_wait8` | `(u64, u64, u64, u8, u8, u64) -> i32` | responsive masked DMA-status wait; 1 ns–1 s |
+| `narf_dma_free` | `(u64, u64) -> i32` | revoke and release a DMA handle |
+| `narf_msix_enable` | `(u64) -> i32` | discover/retain MSI-X; `-95` when unsupported; requires `BusDevice` |
+| `narf_msix_claim` | `(u64, *mut u16) -> i32` | allocate/program one kernel IRQ vector |
+| `narf_irq_set_handler` | `(u64, u16, usize, u64) -> i32` | attach `extern "C" fn(u64) -> i32`; callback runs in task context |
+| `narf_spawn_poller` | `(u64, usize, u64) -> i32` | immediate then 1-ms task-context callback; non-zero return retires it |
+| `narf_netif_register` | `(u64, *const u8, usize, *mut u32) -> i32` | register a copy-mode Ethernet interface and TX callback; requires `NetIface` |
+| `narf_netif_rx` | `(u64, u32, *mut u8, usize) -> i32` | synchronously deliver copied RX bytes to the registered interface |
 
 Declare them as you would any foreign function:
 
@@ -178,6 +197,30 @@ unsafe extern "C" {
     fn narf_monotonic_ns() -> u64;
 }
 ```
+
+DMA exports are link-time cap gated. A dual-build driver using them emits
+`required_caps=DmaBuffer:Write` in `.modinfo` (the `narf_driver!` macro accepts
+the corresponding optional `required_caps` literal); the loader refuses to
+resolve those imports when the declaration is absent. MSI-X, IRQ, and poller
+exports likewise require `BusDevice` (for example,
+`required_caps=DmaBuffer:Write,BusDevice:Write`). Network registration and RX
+require `NetIface`; a driver using the full device path normally declares all
+three. The retained per-device cap is still checked on every invocation; the
+manifest declaration only controls whether the imports can link.
+
+IRQ callbacks never run in hard-IRQ context. The FRAME handler accounts and
+wakes an in-tree task, which pins the Live module, enters its effective
+load-time domain, and then calls the supplied function. A callback returning
+non-zero stops its pump. Device teardown removes the binding before module
+text is unmapped.
+
+Do not hand-roll register or descriptor-status spin loops in a module. Use
+`narf_mmio_wait32` or `narf_dma_wait8`: the in-tree implementation applies a
+wall-clock deadline and pumps the scheduler's responsiveness hooks. The TX
+callback passed to `narf_netif_register` borrows its frame only until return;
+copy or DMA it synchronously. The RX buffer passed to `narf_netif_rx` is also
+borrowed synchronously and may be rewritten in place by the stack before the
+call returns.
 
 These stay undefined in the object you build; the loader resolves them
 against KSYMTAB and patches the call sites. A name the kernel does not
@@ -315,17 +358,17 @@ Once compiled and `objcopy`'d into a `.ko`, load it via the
 syscall:
 
 ```rust
-use narf_modules::syscalls::sys_init_module;
+use narf_modules::syscalls::sys_init_module_with_params;
 
 let bytes: Vec<u8> = std::fs::read("rtl9999.ko").unwrap();
-let module = sys_init_module(&bytes).expect("load");
+let module = sys_init_module_with_params(&bytes, "domain=driver3").expect("load");
 ```
 
 Or from userspace via the system call (post-syscall-wiring):
 
 ```sh
-# Once `narf-libc` ships the `init_module` wrapper:
-modprobe rtl9999
+# The loader-facing equivalent passes `domain=driver3` as the module params.
+modprobe rtl9999 domain=driver3
 ```
 
 To unload:
