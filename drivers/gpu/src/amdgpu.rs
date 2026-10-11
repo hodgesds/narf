@@ -2205,7 +2205,27 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     // SAFETY: probe owns the GPU mappings; boot ACPI tables remain mapped.
-    dev.vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) }.ok();
+    let vbios = unsafe { crate::amdgpu_vbios::discover(&dev, &device, &cap) };
+    if device.id.device == NAVI22 {
+        use core::fmt::Write as _;
+        match &vbios {
+            Ok(image) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 VBIOS {:?}, {} bytes",
+                    image.source(),
+                    image.bytes().len()
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi22 VBIOS unavailable: {error:?}"
+                );
+            }
+        }
+    }
+    dev.vbios = vbios.ok();
     let vbios_version = dev.vbios.as_ref().and_then(|bios| bios.version());
     let is_apu = dev.is_apu();
     // Captured before the move into CONTROLLER; both are Copy.
@@ -2235,17 +2255,18 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         pci_did: Some(device.id.device),
         domain: narf_drivers::BoundKind::Graphics.default_domain(),
     });
-    // APUs use the retained VFCT/VRAM image. Preserve the existing ROM-version
-    // fallback for discrete GPUs; that path is not used as a loader image.
-    let vbios_version: Option<alloc::string::String> = if vbios_version.is_some() || is_apu {
-        vbios_version
-    } else {
-        // SAFETY: caller-authority over the device. ROM BAR is read-only
-        // from the CPU side once the phys address is known.
-        // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { read_vbios_version_from_rom(&cap, &device) }
-    };
+    // APUs and Navi22 use their retained, capability-checked image. The legacy
+    // ROM-version-only path remains for other discrete GPUs.
+    let vbios_version: Option<alloc::string::String> =
+        if vbios_version.is_some() || is_apu || device.id.device == NAVI22 {
+            vbios_version
+        } else {
+            // SAFETY: caller-authority over the device. ROM BAR is read-only
+            // from the CPU side once the phys address is known.
+            // Linux ref: amdgpu_bios.c::amdgpu_read_bios (lines 101-140).
+            // SAFETY: Valid MMIO bounds or trusted driver environment
+            unsafe { read_vbios_version_from_rom(&cap, &device) }
+        };
 
     // Register with the DRM card registry so /sys/class/drm/card<N>/
     // and /dev/dri/card<N> appear after Stage::Late.

@@ -337,6 +337,17 @@ validate structure and identity, not cryptographic authenticity.
 GPU probe retains this snapshot in `AmdGpu::vbios`. If VFCT has no image,
 Renoir/Phoenix APUs may use the firmware shadow in the first 256 KiB of the
 mapped framebuffer BAR, requiring a matching PCIR vendor/device record.
+Navi22 uses a bounded SMUIO11 ROM-register fallback and retains the complete
+declared ATOM image as `Source::RomRegisters`. Discovery must identify
+1002:73df / GC10.3.2, NBIO v2.3-compatible hardware (zero ROM offset), and a
+supported SMUIO11 register window. ROM_INDEX/ROM_DATA use base index zero.
+Each capability-checked read chunk saves/restores ROM_INDEX and reads at most
+4 KiB through ROM_DATA's dword autoincrement. The ROM/AMD signatures, nonzero
+512-byte-block image length, matching PCIR identity and all ATOM directories
+must validate; the full image's header must agree with the initial snapshot.
+Probe reports the retained source/size or acquisition error. Navi22 no longer
+uses the old ROM-BAR version-only fallback. No PCI ROM decoding, flash writes,
+reset or ATOM execution is performed by this read path.
 Malformed or ambiguous VFCT data does not trigger fallback. Reads use live
 PCI authority through `Cap::invoke`; shadow reads recheck it per 4 KiB.
 The new path never enables an expansion ROM or writes VRAM. Failed discovery

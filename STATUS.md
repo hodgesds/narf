@@ -276,6 +276,10 @@ VRAM, honors PSP runtime training policy, waits with a three-second deadline, re
 completion, and validates/caches the P2C result. The firmware coordinator can
 run this before SOS; cancelled/failed training prevents replay and retains the
 preimage. CPU framebuffer writers must remain stopped during this path.
+Probe now retains a validated Navi22 VBIOS from the SMUIO ROM read registers
+when VFCT has no image, preserving the index latch and checking authority per
+chunk. This supplies the board's reservation metadata without enabling a PCI
+ROM BAR; acquisition failures are identified on the console.
 These are software-tested foundations; automatic platform wiring and framebuffer
 ownership handoff, training resume,
 video/display firmware, board power/clock setup, hardware boot, GMC/GFX10
