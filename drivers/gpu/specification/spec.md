@@ -323,6 +323,36 @@ produced when authority is already revoked. Waiting never releases ring/TMR
 ownership; verified consumer reset remains mandatory for teardown.
 `BootComplete` does not initialize queues, enable SDMA or establish acceleration.
 
+### Navi 22 VRAM-only memory hubs
+
+`unsafe amdgpu_gmc_navi22::Gmc::new(gpu, pci_cap, pool)` validates the physical
+Navi22 GC 10.3.2, MMHUB 2.1.0 and NBIO register banks and reserves four VRAM
+pages without I/O. The caller owns the hubs, VRAM, HDP and reset/PM controls,
+excludes all queues and VMs, and retains permanent mappings. Initialization
+requires trained VRAM, completed PSP/RLC boot and disabled automatic gating.
+`unsafe initialize().await` checks both hubs' framebuffer geometry and that
+all 16 contexts are disabled before writing either registers or backing pages.
+The HDP flush remap must already match the PSP-installed byte offset `0x7f000`.
+
+The first page holds a flat VMID0 table; only two PTEs are valid, mapping the
+owned source/destination pages in a 2 MiB aperture above the framebuffer range.
+The second owned page is the fault/default backing. PDEs/PTEs contain GPU
+physical VRAM addresses derived from framebuffer base/offset, never PCI BAR
+addresses; SYSTEM is clear. System-aperture bounds use 256 KiB units. User
+VMIDs, identity mapping, fault IRQs and retry remain disabled. Fault fallback
+targets owned VRAM, not system memory. This introduces no host DMA mapping.
+Both hubs invalidate all page-table caches for VMID0 using engine 17; MMHUB's
+semaphore is acquired first and released only after acknowledgement. Every
+sample checks live authority and waits through timer futures with a 100 ms
+deadline. Removal, revocation, cancellation and timeout prevent replay and
+retain all published memory; no implicit reset or semaphore release is tried.
+
+`state()` reports `Prepared`, `Programming`, `Invalidating(Hub)`, `Ready` or
+`Failed`; `aperture()` returns published `Aperture { start, size, source,
+destination }` address metadata, including after a started failure. Only
+`Ready` confirms both TLB acknowledgements. Keep the owner alive while a
+consumer uses these translations; this stage alone does not prove GPU access.
+
 ### Coordinated Navi 22 firmware bring-up
 
 `amdgpu_navi22_boot::Firmware::open(gpu, registry_cap)` validates every required
@@ -345,7 +375,10 @@ exclude reset/PM/other clients and retain permanent mappings for the session.
 `ColdBoot::run().await` executes optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
 optional board PowerPlay upload → graphics upload/autoload → RLC boot check →
-optional board calibration/protected GFX DPM setup.
+optional board calibration/protected GFX DPM setup → optional memory hubs.
+`ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing before run;
+it requires a prepared board power policy and performs no I/O. Production boot
+always calls it. Explicit firmware-only callers may omit this stage.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
 session is constructed; production boot requires it, while explicit
 firmware-only callers may omit it. The bootstrap owner is dropped only
@@ -359,14 +392,16 @@ destroys device-owned memory. Dropping a session quarantines any memory still
 owned by hardware through the underlying owners' existing rules.
 
 Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
-power_status: Option<PowerStatus>, media_firmware: MediaFirmware }`;
+power_status: Option<PowerStatus>, media_firmware: MediaFirmware,
+memory_aperture: Option<Aperture> }`;
 `power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
 `AmdGpu::fw_loaded`. Display-aware memory/link DPM, OS thermal interrupts,
-GMC/queues, VCN/DMUB startup and real-card validation remain separate work.
+general GPU mappings/queues, VCN/DMUB startup and real-card validation remain
+separate work.
 
 ### Navi 22 boot ownership and framebuffer handoff
 

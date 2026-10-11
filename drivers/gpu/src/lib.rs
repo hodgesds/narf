@@ -158,6 +158,7 @@ pub mod amdgpu_gfx;
 pub mod amdgpu_gfx_firmware;
 pub mod amdgpu_gfx_navi22;
 pub mod amdgpu_gmc;
+pub mod amdgpu_gmc_navi22;
 pub mod amdgpu_hdmi_audio;
 pub mod amdgpu_hpd;
 pub mod amdgpu_ih;

@@ -308,9 +308,14 @@ RLC autoload, and their reported entry addresses must lie inside the retained
 TMR. Missing/malformed media images prevent startup before device writes;
 partial upload failures preserve ownership and prevent replay. Firmware load
 does not yet start VCN queues or relocate/start DMUB.
+Production cold boot now initializes GC/MMHUB VMID0 with a bounded VRAM-only
+test aperture after the protected power policy is active. Both hubs validate
+idle contexts and matching framebuffer geometry, use owned VRAM page tables
+and fault fallback, and wait for bounded TLB acknowledgements. User VMIDs and
+host DMA stay disabled; failed/cancelled starts retain the backing pages.
 These are software-tested foundations; training resume,
 VCN/DMUB startup, display-aware DPM and OS thermal interrupt handling,
-hardware boot, GMC/GFX10 queue initialization, SDMA startup and DCN3.0
+hardware boot, general GPU mappings/GFX10 queue initialization, SDMA startup and DCN3.0
 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 

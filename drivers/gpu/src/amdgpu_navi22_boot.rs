@@ -19,6 +19,7 @@ pub enum Error {
     Graphics(gfx::Error),
     Training(gddr6::Error),
     Power(power::Error),
+    MemoryHubs(crate::amdgpu_gmc_navi22::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -68,8 +69,9 @@ pub enum Stage {
     Graphics,
     RlcBoot,
     PowerSetup,
+    MemoryHubs,
 }
-const STAGES: [Stage; 10] = [
+const STAGES: [Stage; 11] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -80,9 +82,10 @@ const STAGES: [Stage; 10] = [
     Stage::Graphics,
     Stage::RlcBoot,
     Stage::PowerSetup,
+    Stage::MemoryHubs,
 ];
-/// Firmware/power observations only: queues, memory hubs, SDMA startup
-/// and display are not initialized by this sequence.
+/// Firmware/power observations and optional VMID0 aperture. Queues, SDMA
+/// startup and display are not initialized by this sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
     pub smu: smu::Versions,
@@ -90,6 +93,7 @@ pub struct Report {
     pub power: Option<power::Info>,
     pub power_status: Option<smu::PowerStatus>,
     pub media_firmware: psp::MediaFirmware,
+    pub memory_aperture: Option<crate::amdgpu_gmc_navi22::Aperture>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -152,6 +156,7 @@ struct Hardware {
     versions: Option<smu::Versions>,
     gfx_status: Option<psp::GfxBootStatus>,
     power_status: Option<smu::PowerStatus>,
+    gmc: Option<crate::amdgpu_gmc_navi22::Gmc>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -271,6 +276,13 @@ impl Backend for Hardware {
                     );
                 }
             }
+            Stage::MemoryHubs => {
+                if let Some(gmc) = self.gmc.as_mut() {
+                    // SAFETY: firmware/RLC are ready, VRAM is trained, queues
+                    // remain idle and the boot power policy excludes gating.
+                    unsafe { gmc.initialize().await }.map_err(Error::MemoryHubs)?;
+                }
+            }
         }
         Ok(())
     }
@@ -281,6 +293,10 @@ impl Backend for Hardware {
             power: self.firmware.power.as_ref().map(power::Prepared::info),
             power_status: self.power_status,
             media_firmware: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
+            memory_aperture: self
+                .gmc
+                .as_ref()
+                .and_then(crate::amdgpu_gmc_navi22::Gmc::aperture),
         })
     }
 }
@@ -347,6 +363,7 @@ impl ColdBoot {
                     versions: None,
                     gfx_status: None,
                     power_status: None,
+                    gmc: None,
                 },
                 state: State::Prepared,
             },
@@ -387,6 +404,7 @@ impl ColdBoot {
                     versions: None,
                     gfx_status: None,
                     power_status: None,
+                    gmc: None,
                 },
                 state: State::Prepared,
             },
@@ -398,6 +416,31 @@ impl ColdBoot {
             .training
             .as_ref()
             .map(gddr6::Trainer::state)
+    }
+    /// Reserve the native VMID0 backing pages before run. Production boot calls
+    /// this; explicit firmware-only callers can leave memory hubs untouched.
+    /// The whole-GPU ownership contract established by new continues to apply.
+    pub fn prepare_memory_hubs(&mut self) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.gmc.is_some() {
+            return Err(Error::Busy);
+        }
+        if self.sequence.backend.firmware.power.is_none() {
+            return Err(Error::Invalid);
+        }
+        let hardware = &mut self.sequence.backend;
+        // SAFETY: the cold-boot constructor owns the physical GPU/pool and all
+        // clients. This constructor reserves pages but performs no hardware I/O.
+        hardware.gmc = Some(
+            unsafe {
+                crate::amdgpu_gmc_navi22::Gmc::new(
+                    &hardware.gpu,
+                    hardware.authority,
+                    &hardware.pool,
+                )
+            }
+            .map_err(Error::MemoryHubs)?,
+        );
+        Ok(())
     }
     pub fn training_data(&self) -> Option<&[u8]> {
         self.sequence

@@ -151,7 +151,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         let pool = unsafe { plan.into_pool() }.map_err(Error::Memory)?;
         // Constructors allocate host state/reservations only. The framebuffer
         // handoff has already stopped CPU writers before entering prepare().
-        let prepared = match training {
+        let mut prepared = match training {
             Some(exchange) => {
                 // SAFETY: exclusive GPU/pool as above; run's caller stops CPU
                 // VRAM clients before accessing the training hardware.
@@ -166,6 +166,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             }
         }
         .map_err(Error::Firmware)?;
+        prepared.prepare_memory_hubs().map_err(Error::Firmware)?;
         *owner = Some(prepared);
         Ok(Some(affected))
     })
