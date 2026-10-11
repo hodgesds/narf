@@ -1,9 +1,9 @@
-//! Ordered cold-boot firmware bring-up for Navi22. The caller supplies trained
-//! VRAM and an exclusive pool; no implicit device reset, pool carving, platform
+//! Ordered cold-boot firmware bring-up for Navi22. The caller supplies an
+//! exclusive pool and trained VRAM or an explicit training inventory. No implicit reset, pool carving, platform
 //! initcall, modeset or acceleration publication happens here.
 use crate::{
-    amdgpu::AmdGpu, amdgpu_gfx_navi22 as gfx, amdgpu_psp_boot as sos, amdgpu_psp_ring as psp,
-    amdgpu_smu_navi22 as smu, amdgpu_vram::Pool,
+    amdgpu::AmdGpu, amdgpu_gddr6 as gddr6, amdgpu_gfx_navi22 as gfx, amdgpu_psp_boot as sos,
+    amdgpu_psp_ring as psp, amdgpu_smu_navi22 as smu, amdgpu_vram::Pool,
 };
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, Read, Write};
@@ -16,6 +16,7 @@ pub enum Error {
     Psp(psp::Error),
     Smu(smu::Error),
     Graphics(gfx::Error),
+    Training(gddr6::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -39,6 +40,7 @@ impl Firmware {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    MemoryTraining,
     Sos,
     Ring,
     TrustedMemory,
@@ -47,7 +49,8 @@ pub enum Stage {
     Graphics,
     RlcBoot,
 }
-const STAGES: [Stage; 7] = [
+const STAGES: [Stage; 8] = [
+    Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
     Stage::TrustedMemory,
@@ -115,6 +118,7 @@ struct Hardware<'a> {
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
     firmware: Firmware,
+    training: Option<gddr6::Trainer>,
     bootstrap: Option<sos::Bootloader>,
     psp: Option<psp::Psp>,
     smu: Option<smu::Smu>,
@@ -124,7 +128,20 @@ struct Hardware<'a> {
 impl Backend for Hardware<'_> {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
         match stage {
+            Stage::MemoryTraining => {
+                if let Some(training) = self.training.as_mut() {
+                    training.run().await.map_err(Error::Training)?;
+                }
+            }
             Stage::Sos => {
+                if self.bootstrap.is_none() {
+                    // SAFETY: explicit training finished before claiming PSP
+                    // bootstrap ownership; its idle owner retains only data.
+                    self.bootstrap = Some(
+                        unsafe { sos::Bootloader::new(self.gpu, self.authority, &self.pool) }
+                            .map_err(Error::Sos)?,
+                    );
+                }
                 self.bootstrap
                     .as_mut()
                     .ok_or(Error::Invalid)?
@@ -239,6 +256,7 @@ impl<'a> ColdBoot<'a> {
                     authority,
                     pool: pool.clone(),
                     firmware,
+                    training: None,
                     bootstrap: Some(bootstrap),
                     psp: None,
                     smu: None,
@@ -248,6 +266,58 @@ impl<'a> ColdBoot<'a> {
                 state: State::Prepared,
             },
         })
+    }
+    /// Add long GDDR6 training before SOS, retaining its preimage/cache for
+    /// diagnostics and eventual resume support. All firmware must be prepared
+    /// before constructing this session.
+    ///
+    /// # Safety
+    /// All `new` ownership/mapping/exclusion contracts apply except that final
+    /// memory training is performed here. In addition, satisfy `Trainer::new`:
+    /// stop CPU framebuffer writers and every other VRAM client for the whole
+    /// operation. Exchange buffers must be from this GPU's current boot Plan.
+    /// Firmware must have provided a readable initial VRAM mapping for backup.
+    pub unsafe fn new_with_training(
+        gpu: &'a AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+        firmware: Firmware,
+        exchange: crate::amdgpu_vram_boot::Training,
+    ) -> Result<Self, Error> {
+        // SAFETY: caller owns all mappings/clients and reserves both exchanges.
+        let training =
+            unsafe { gddr6::Trainer::new(gpu, authority, exchange) }.map_err(Error::Training)?;
+        Ok(Self {
+            sequence: Sequence {
+                backend: Hardware {
+                    gpu,
+                    authority,
+                    pool: pool.clone(),
+                    firmware,
+                    training: Some(training),
+                    bootstrap: None,
+                    psp: None,
+                    smu: None,
+                    versions: None,
+                    gfx_status: None,
+                },
+                state: State::Prepared,
+            },
+        })
+    }
+    pub fn training_state(&self) -> Option<gddr6::State> {
+        self.sequence
+            .backend
+            .training
+            .as_ref()
+            .map(gddr6::Trainer::state)
+    }
+    pub fn training_data(&self) -> Option<&[u8]> {
+        self.sequence
+            .backend
+            .training
+            .as_ref()
+            .and_then(gddr6::Trainer::training_data)
     }
     pub fn state(&self) -> State {
         self.sequence.state

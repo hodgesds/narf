@@ -152,6 +152,7 @@ pub mod amdgpu_dmub_firmware;
 pub mod amdgpu_dp_training;
 pub mod amdgpu_dp_tunnel;
 pub mod amdgpu_dpm;
+pub mod amdgpu_gddr6;
 pub mod amdgpu_gem;
 pub mod amdgpu_gfx;
 pub mod amdgpu_gfx_firmware;

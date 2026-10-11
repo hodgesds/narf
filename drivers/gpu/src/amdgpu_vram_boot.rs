@@ -31,6 +31,7 @@ pub enum Owner {
     Dmub,
     OtherClient,
     MemoryTraining,
+    FirmwareRuntime,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Protected {
@@ -124,6 +125,9 @@ impl Plan {
     }
 
     fn reserve_training(&mut self, vbios: &[u8]) -> Result<(), Error> {
+        // PSP's runtime database is a 64 KiB window 1 MiB below the physical
+        // VRAM end, independent of the discovery blob and training capability.
+        self.protect(Owner::FirmwareRuntime, self.vram_size - (1 << 20), 0x10000)?;
         let header = atombios::header::parse_rom_header(vbios).map_err(|_| Error::Invalid)?;
         let directory =
             atombios::tables::MasterDataTable::parse(vbios, &header).map_err(|_| Error::Invalid)?;

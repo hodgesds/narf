@@ -271,7 +271,13 @@ Navi22 now has a read-only GMC10/DCN3.0 VRAM plan, including full-aperture
 firmware tails, inherited DMUB windows and the two GDDR6 training exchange
 buffers. It validates the two address translations and clips exclusions only
 when creating the CPU-visible allocator; secondary GPUs need no boot framebuffer.
-These are software-tested foundations; automatic platform wiring, VRAM training,
+An explicit GDDR6 cold-training owner now preserves the affected 32 MiB of
+VRAM, honors PSP runtime training policy, waits with a three-second deadline, restores only after terminal PSP
+completion, and validates/caches the P2C result. The firmware coordinator can
+run this before SOS; cancelled/failed training prevents replay and retains the
+preimage. CPU framebuffer writers must remain stopped during this path.
+These are software-tested foundations; automatic platform wiring and framebuffer
+ownership handoff, training resume,
 video/display firmware, board power/clock setup, hardware boot, GMC/GFX10
 queue initialization, SDMA startup and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).

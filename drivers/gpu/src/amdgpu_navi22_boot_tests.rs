@@ -244,6 +244,63 @@ fn firmware() -> Firmware {
         graphics: gfx::tests::fixture(),
     }
 }
+fn navi22_boot_training_failure_prevents_sos_publication() -> TestResult {
+    let mut gpu = gpu();
+    gpu.fb_bar.len = 64 << 20;
+    gpu.vram.visible_size = 64 << 20;
+    let mut regs = vec![0; gpu.regs.len as usize / 4];
+    regs[0x91] = u32::MAX;
+    gpu.regs.virt = regs.as_mut_ptr() as u64;
+    let original = regs.clone();
+    let pool = pool(16 << 20);
+    let authority = Cap::bootstrap();
+    let exchange = crate::amdgpu_vram_boot::Training {
+        p2c: (12 << 30) - 0x8000,
+        c2p: (12 << 30) - (9 << 20),
+        size: 4096,
+    };
+    // SAFETY: private RAM register fixture, absent SOS aborts before accessing
+    // the intentionally unmapped BAR0 or publishing any PSP reservation.
+    let mut boot =
+        unsafe { ColdBoot::new_with_training(&gpu, authority, &pool, firmware(), exchange) }
+            .unwrap();
+    if regs != original
+        || pool.available() != 16 << 20
+        || boot.training_state() != Some(gddr6::State::Prepared)
+    {
+        return TestResult::Fail("training constructor changed MMIO or claimed the SOS mailbox");
+    }
+    let error = Error::Training(gddr6::Error::DeviceGone);
+    if run(boot.run()) != Err(error)
+        || boot.state()
+            != (State::Failed {
+                stage: Stage::MemoryTraining,
+                error,
+            })
+        || regs != original
+        || boot.sequence.backend.bootstrap.is_some()
+        || boot.training_data().is_some()
+        || run(boot.run()) != Err(Error::Busy)
+    {
+        return TestResult::Fail(
+            "training failure reached firmware bootstrap or lost failure state",
+        );
+    }
+    drop(boot);
+    authority.revoke();
+    gpu.regs.virt = 0;
+    // SAFETY: constructor must reject revoked PCI authority before any I/O.
+    if unsafe { ColdBoot::new_with_training(&gpu, authority, &pool, firmware(), exchange) }.err()
+        != Some(Error::Training(gddr6::Error::Revoked))
+    {
+        return TestResult::Fail("training preparation bypassed PCI authority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi22-boot",
+    navi22_boot_training_failure_prevents_sos_publication
+);
 fn navi22_boot_preflight_and_real_backend_revocation() -> TestResult {
     let registry = Cap::bootstrap();
     registry.revoke();

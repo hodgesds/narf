@@ -261,7 +261,7 @@ owned pool excluding all firmware/scanout/discovery/training/TMR reservations.
 Construction reserves bootstrap staging but performs no MMIO. This is one
 cold-boot attempt, not an attach, resume or firmware-reload operation.
 
-`ColdBoot::run().await` executes SOS bootstrap → ring creation → trusted-memory
+`ColdBoot::run().await` executes optional memory training → SOS bootstrap → ring creation → trusted-memory
 setup → SMC upload → SMU version handshake → graphics upload/autoload → RLC boot
 check. The bootstrap owner is dropped only after SOS success, before claiming
 the GPCOM ring. The ring and SMU owners are stored in the session before awaiting
@@ -277,9 +277,42 @@ stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
-`AmdGpu::fw_loaded`. Automatic platform invocation, VRAM training/reservation
-discovery, board power setup, GMC/queues, video/display firmware and real-card
+`AmdGpu::fw_loaded`. Automatic platform invocation, VRAM ownership handoff,
+board power setup, GMC/queues, video/display firmware and real-card
 validation remain separate work.
+
+`unsafe ColdBoot::new_with_training(..., exchange)` additionally owns a
+`amdgpu_gddr6::Trainer` and runs it before constructing the SOS owner. Exchange
+offsets come from `Plan::training()`. It inherits `ColdBoot::new`'s contracts
+except that final GDDR6 training is performed by this session, and requires
+all CPU framebuffer writers/pumps and other VRAM clients stopped throughout.
+Firmware must provide initially readable VRAM for the preimage. Training
+failure prevents all firmware uploads. `training_state()` and `training_data()`
+expose its progress and successful cache without replaying a command.
+
+`unsafe amdgpu_gddr6::Trainer::new(gpu, pci_cap, exchange)` validates Navi22's
+PSP11/NBIO/HDP5 layout, exchange bounds and at least 32 MiB of visible VRAM,
+and allocates a 32 MiB system-memory preimage plus a 4 KiB result cache before
+I/O. `run().await` skips training for a nonzero resident SOS heartbeat or a
+PSP runtime boot configuration that disables two-stage training. The runtime
+DB v1.0 window is bounded to 64 KiB, 1 MiB below VRAM end; unknown versions,
+duplicate boot entries and malformed ranges fail closed. An absent DB or boot
+entry preserves Linux's enabled default. Otherwise it waits for bootloader
+readiness, verifies HDP remapping, copies the VRAM
+prefix in 4 KiB cooperative chunks, sends long training (`0x100000`) with the
+VRAM-relative C2P MiB address, and waits up to three seconds using scheduler
+timers. Only terminal completion permits restoring the prefix and flushing HDP.
+A terminal rejection still restores the prefix before returning its error;
+timeout, removal or revocation never races a potentially active PSP writer.
+Successful completion copies P2C through bounded direct/indexed VRAM access
+and requires its BIST signature. `training_data()` is available only in `Ready`.
+
+Training state is `Prepared`, `Saving`, `Training`, `Restoring`, `SavingResult`,
+`Ready`, `ResidentSos`, `Disabled` or `Failed`. Any started run prevents replay. Cancellation
+retains the active state, preimage and cache outside the future. After failure
+or cancellation the owner must remain retained and VRAM clients stopped until
+independent reset/recovery; drop never restores VRAM or resets the GPU. No
+short-training/resume command or automatic framebuffer pause is exposed yet.
 
 ### AMD platform VBIOS
 
@@ -381,6 +414,8 @@ probe's physical VRAM size and that DCN's address translation agrees, and
 retains the same firmware, boot and DMUB exclusions. An optional boot framebuffer
 permits a secondary/headless GPU; other live surfaces still require explicit
 client ranges. Unhandled enabled DMUB Region0/1/2/7 also reject provisioning.
+The PSP runtime database (64 KiB at VRAM-end minus 1 MiB) remains reserved even
+if FirmwareInfo reports a smaller firmware tail or disables two-stage training.
 FirmwareInfo's two-stage BIST capability additionally reserves a 4 KiB C2P
 exchange at `ALIGN(vram_size - firmware_tail_size - 1 MiB, 1 MiB)` and a 4 KiB
 P2C exchange 32 KiB below physical VRAM end. C2P must not overlap any client or
