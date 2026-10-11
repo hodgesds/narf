@@ -353,6 +353,38 @@ destination }` address metadata, including after a started failure. Only
 `Ready` confirms both TLB acknowledgements. Keep the owner alive while a
 consumer uses these translations; this stage alone does not prove GPU access.
 
+### Navi 22 SDMA0 execution proof
+
+`unsafe amdgpu_sdma_navi22::Sdma::new(gpu, pci_cap, pool)` validates SDMA 5.2.2,
+GC 10.3.2, HDP 5.0 and NBIO, then reserves a 4 KiB ring and 4 KiB writeback page
+without I/O. SDMA0 registers come from GC base index zero, not the standalone
+SDMA discovery bank. The caller exclusively owns this physical GPU and its
+permanent mappings, VRAM pool, queues and reset/PM controls.
+`unsafe initialize(&mut Gmc).await` requires completed PSP/RLC/SDMA firmware
+loading, trained VRAM, disabled power gating and the same GPU's ready GMC.
+Preflight checks the framebuffer range, HDP remap, idle SDMA0, no outstanding
+GRBM reset and disabled GFX/PAGE/RLC0/RLC1 rings before any writes.
+
+Startup asserts only SDMA0's GRBM reset, waits at least 50 us, releases it and
+waits another 50 us using timer futures. It programs a privileged VMID0 direct
+ring with byte-addressed pointers, VRAM read-pointer writeback and write-pointer
+shadow polling, UTC L1, and the primary driver's cache policy. Doorbells,
+indirect buffers, context switching/preemption and interrupt delivery remain
+disabled. The single submission writes 16 distinct dwords through GMC's source
+virtual address, copies 64 bytes to its destination, emits an uncached fence
+at the destination page's end, and pads to 16 dwords. HDP flush precedes the
+write-pointer kick; HDP read-cache invalidation precedes CPU observations.
+Success requires the fence, both MMIO and VRAM read pointers at 128 bytes, and
+an exact comparison of all source/destination words. No host DMA is introduced.
+
+`state()` reports `Prepared`, `ResetAsserted`, `ResetReleased`, `Programming`,
+`Submitted`, `Verified` or `Failed`. `proof()` retains `Proof { copied_bytes,
+fence, read_pointer }` only after full success. Each I/O batch checks current
+authority; completion has a 1 s deadline. Revocation, cancellation, removal,
+timeout or corrupted data prevents replay. Ring/writeback memory is published
+before reset and retained on every started path; no destructor resets hardware.
+This is one boot execution test, not a general submission or acceleration API.
+
 ### Coordinated Navi 22 firmware bring-up
 
 `amdgpu_navi22_boot::Firmware::open(gpu, registry_cap)` validates every required
@@ -375,10 +407,14 @@ exclude reset/PM/other clients and retain permanent mappings for the session.
 `ColdBoot::run().await` executes optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
 optional board PowerPlay upload → graphics upload/autoload → RLC boot check →
-optional board calibration/protected GFX DPM setup → optional memory hubs.
+optional board calibration/protected GFX DPM setup → optional memory hubs →
+optional SDMA execution test.
 `ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing before run;
 it requires a prepared board power policy and performs no I/O. Production boot
 always calls it. Explicit firmware-only callers may omit this stage.
+`ColdBoot::prepare_sdma()` reserves the SDMA ring/writeback before run and
+requires prepared memory hubs. Production boot also calls it. `Stage::SdmaTest`
+identifies a failure in this final stage, with the SDMA error retained.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
 session is constructed; production boot requires it, while explicit
 firmware-only callers may omit it. The bootstrap owner is dropped only
@@ -393,7 +429,7 @@ owned by hardware through the underlying owners' existing rules.
 
 Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
 power_status: Option<PowerStatus>, media_firmware: MediaFirmware,
-memory_aperture: Option<Aperture> }`;
+memory_aperture: Option<Aperture>, sdma: Option<Proof> }`;
 `power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and

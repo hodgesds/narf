@@ -313,9 +313,15 @@ test aperture after the protected power policy is active. Both hubs validate
 idle contexts and matching framebuffer geometry, use owned VRAM page tables
 and fault fallback, and wait for bounded TLB acknowledgements. User VMIDs and
 host DMA stay disabled; failed/cancelled starts retain the backing pages.
+SDMA0 now has a cold-start path on GC 10.3.2 and an owned VRAM ring. Production
+boot runs a translated WRITE/COPY/FENCE test after GMC setup and checks both
+read-pointer paths and all copied words. Reset and completion waits are bounded;
+fault/cancel paths retain the ring and prevent replay. Software models exercise
+packet decoding, register units, corruption, revocation and reset cancellation.
 These are software-tested foundations; training resume,
 VCN/DMUB startup, display-aware DPM and OS thermal interrupt handling,
-hardware boot, general GPU mappings/GFX10 queue initialization, SDMA startup and DCN3.0
+hardware boot, general GPU mappings/GFX10 queue initialization, production
+SDMA submissions/interrupts and DCN3.0
 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 

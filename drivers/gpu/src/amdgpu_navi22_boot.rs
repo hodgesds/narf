@@ -20,6 +20,7 @@ pub enum Error {
     Training(gddr6::Error),
     Power(power::Error),
     MemoryHubs(crate::amdgpu_gmc_navi22::Error),
+    Sdma(crate::amdgpu_sdma_navi22::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -70,8 +71,9 @@ pub enum Stage {
     RlcBoot,
     PowerSetup,
     MemoryHubs,
+    SdmaTest,
 }
-const STAGES: [Stage; 11] = [
+const STAGES: [Stage; 12] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -83,9 +85,10 @@ const STAGES: [Stage; 11] = [
     Stage::RlcBoot,
     Stage::PowerSetup,
     Stage::MemoryHubs,
+    Stage::SdmaTest,
 ];
-/// Firmware/power observations and optional VMID0 aperture. Queues, SDMA
-/// startup and display are not initialized by this sequence.
+/// Firmware/power observations, optional VMID0 and SDMA execution proof.
+/// This does not publish acceleration or initialize native display.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
     pub smu: smu::Versions,
@@ -94,6 +97,7 @@ pub struct Report {
     pub power_status: Option<smu::PowerStatus>,
     pub media_firmware: psp::MediaFirmware,
     pub memory_aperture: Option<crate::amdgpu_gmc_navi22::Aperture>,
+    pub sdma: Option<crate::amdgpu_sdma_navi22::Proof>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -157,6 +161,7 @@ struct Hardware {
     gfx_status: Option<psp::GfxBootStatus>,
     power_status: Option<smu::PowerStatus>,
     gmc: Option<crate::amdgpu_gmc_navi22::Gmc>,
+    sdma: Option<crate::amdgpu_sdma_navi22::Sdma>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -276,6 +281,17 @@ impl Backend for Hardware {
                     );
                 }
             }
+            Stage::SdmaTest => {
+                if let Some(sdma) = self.sdma.as_mut() {
+                    // SAFETY: firmware, protected power and both hubs are ready.
+                    // The same exclusive owner retains TMR and VRAM backing.
+                    unsafe {
+                        sdma.initialize(self.gmc.as_mut().ok_or(Error::Invalid)?)
+                            .await
+                    }
+                    .map_err(Error::Sdma)?;
+                }
+            }
             Stage::MemoryHubs => {
                 if let Some(gmc) = self.gmc.as_mut() {
                     // SAFETY: firmware/RLC are ready, VRAM is trained, queues
@@ -293,6 +309,10 @@ impl Backend for Hardware {
             power: self.firmware.power.as_ref().map(power::Prepared::info),
             power_status: self.power_status,
             media_firmware: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
+            sdma: self
+                .sdma
+                .as_ref()
+                .and_then(crate::amdgpu_sdma_navi22::Sdma::proof),
             memory_aperture: self
                 .gmc
                 .as_ref()
@@ -364,6 +384,7 @@ impl ColdBoot {
                     gfx_status: None,
                     power_status: None,
                     gmc: None,
+                    sdma: None,
                 },
                 state: State::Prepared,
             },
@@ -405,6 +426,7 @@ impl ColdBoot {
                     gfx_status: None,
                     power_status: None,
                     gmc: None,
+                    sdma: None,
                 },
                 state: State::Prepared,
             },
@@ -439,6 +461,23 @@ impl ColdBoot {
                 )
             }
             .map_err(Error::MemoryHubs)?,
+        );
+        Ok(())
+    }
+    /// Reserve SDMA0 ring/writeback storage before run, after memory hubs have
+    /// been prepared. This performs no I/O and exposes no submission API.
+    pub fn prepare_sdma(&mut self) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.sdma.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        if h.gmc.is_none() {
+            return Err(Error::Invalid);
+        }
+        // SAFETY: forwarded whole-GPU/pool ownership; constructor has no I/O.
+        h.sdma = Some(
+            unsafe { crate::amdgpu_sdma_navi22::Sdma::new(&h.gpu, h.authority, &h.pool) }
+                .map_err(Error::Sdma)?,
         );
         Ok(())
     }

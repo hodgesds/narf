@@ -185,6 +185,7 @@ pub mod amdgpu_reset;
 pub mod amdgpu_ring;
 pub mod amdgpu_rlc;
 pub mod amdgpu_sdma;
+pub mod amdgpu_sdma_navi22;
 pub mod amdgpu_smc_firmware;
 pub mod amdgpu_smu;
 pub mod amdgpu_smu_navi22;

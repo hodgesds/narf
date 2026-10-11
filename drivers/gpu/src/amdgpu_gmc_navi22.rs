@@ -389,6 +389,18 @@ impl Gmc {
     pub fn aperture(&self) -> Option<Aperture> {
         self.engine.aperture
     }
+    pub(crate) fn test_mapping(&mut self) -> Option<MmioRegion> {
+        if self.state() != State::Ready {
+            return None;
+        }
+        let map = self.engine.memory.mapping();
+        Some(MmioRegion {
+            phys: narf_memory::PhysAddr::new(map.phys.raw() + 8192),
+            virt: map.virt + 8192,
+            len: 8192,
+            kind: map.kind,
+        })
+    }
 }
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_gmc_navi22_tests.rs"]

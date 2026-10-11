@@ -21,6 +21,7 @@ fn report() -> Report {
         power_status: None,
         media_firmware: psp::MediaFirmware::default(),
         memory_aperture: None,
+        sdma: None,
     }
 }
 struct Fake {

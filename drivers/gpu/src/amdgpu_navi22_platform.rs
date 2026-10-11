@@ -167,6 +167,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         }
         .map_err(Error::Firmware)?;
         prepared.prepare_memory_hubs().map_err(Error::Firmware)?;
+        prepared.prepare_sdma().map_err(Error::Firmware)?;
         *owner = Some(prepared);
         Ok(Some(affected))
     })
