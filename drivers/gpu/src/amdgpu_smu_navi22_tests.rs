@@ -100,6 +100,8 @@ struct Fake {
     staged: Vec<u8>,
     stage_error: Option<Error>,
     revoke_on: Option<(u32, Cap<BusDeviceCap, Write>)>,
+    running: u64,
+    gfx_limits: (u32, u32),
 }
 impl Io for Fake {
     fn stage_power(
@@ -133,7 +135,7 @@ impl Io for Fake {
                 assert_eq!(self.response, 0);
                 if matches!(value, SET_DRIVER_HIGH | SET_DRIVER_LOW | TRANSFER_TABLE) {
                     assert_eq!(self.staged.len(), crate::amdgpu_power_navi22::SMC_BYTES);
-                } else {
+                } else if !matches!(value, ALLOWED_HIGH | ALLOWED_LOW) {
                     assert_eq!(self.argument, 0);
                 }
                 if let Some((message, cap)) = self.revoke_on {
@@ -150,6 +152,11 @@ impl Io for Fake {
                         GET_INTERFACE => self.interface,
                         GET_VERSION => self.firmware,
                         SET_DRIVER_HIGH | SET_DRIVER_LOW | TRANSFER_TABLE => self.argument,
+                        RUN_DC_BTC | ALLOWED_HIGH | ALLOWED_LOW | ENABLE_FEATURES => 0,
+                        RUNNING_LOW => self.running as u32,
+                        RUNNING_HIGH => (self.running >> 32) as u32,
+                        MIN_DPM_FREQ => self.gfx_limits.0,
+                        MAX_DPM_FREQ => self.gfx_limits.1,
                         _ => panic!("unexpected SMU command"),
                     };
                 }
@@ -172,10 +179,15 @@ fn engine() -> Engine<Fake> {
             staged: Vec::new(),
             stage_error: None,
             revoke_on: None,
+            running: crate::amdgpu_power_navi22::BootPolicy::from_features(u64::MAX)
+                .unwrap()
+                .allowed(),
+            gfx_limits: (500, 2600),
         },
         authority: Cap::bootstrap(),
         state: State::Prepared,
         power_memory: None,
+        power_policy: None,
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
@@ -594,4 +606,126 @@ fn smu_navi22_scpm_runtime_policy_fails_closed() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
     smu_navi22_scpm_runtime_policy_fails_closed
+);
+
+fn uploaded_engine() -> (Engine<Fake>, crate::amdgpu_vram::Pool) {
+    let mut engine = ready_engine();
+    let pool = power_pool();
+    run(engine.upload(&vec![0; crate::amdgpu_power_navi22::SMC_BYTES], &pool)).unwrap();
+    engine.power_policy =
+        Some(crate::amdgpu_power_navi22::BootPolicy::from_features(u64::MAX).unwrap());
+    engine.io.writes.clear();
+    (engine, pool)
+}
+fn smu_navi22_calibrates_protects_and_reports_board_limits() -> TestResult {
+    let (mut engine, _pool) = uploaded_engine();
+    let status = run(engine.configure_power()).unwrap();
+    let commands: Vec<_> = engine
+        .io
+        .writes
+        .chunks_exact(3)
+        .map(|writes| (writes[2].1, writes[1].1))
+        .collect();
+    if commands
+        != [
+            (0x36, 0),
+            (5, (status.allowed >> 32) as u32),
+            (4, status.allowed as u32),
+            (6, 0),
+            (0xc, 0),
+            (0xd, 0),
+            (0x1d, 0),
+            (0x1e, 0),
+        ]
+        || status.enabled != status.allowed
+        || status.gfx_min_mhz != 500
+        || status.gfx_max_mhz != 2600
+        || engine.state != State::PowerReady
+        || run(engine.configure_power()) != Err(Error::Busy)
+    {
+        return TestResult::Fail("calibration/feature policy/clock limit protocol");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_calibrates_protects_and_reports_board_limits
+);
+
+fn smu_navi22_power_setup_faults_never_replay_or_release() -> TestResult {
+    for (index, message) in [0x36, 5, 4, 6, 0xc, 0xd, 0x1d, 0x1e]
+        .into_iter()
+        .enumerate()
+    {
+        for fault in 0..3 {
+            let (mut engine, pool) = uploaded_engine();
+            match fault {
+                0 => {
+                    engine.io.reject = Some((message, 0xfd));
+                    if run(engine.configure_power()) != Err(Error::Rejected(0xfd)) {
+                        return TestResult::Fail("power setup rejection ignored");
+                    }
+                }
+                1 => {
+                    engine.io.stall = Some(message);
+                    let mut future = core::pin::pin!(engine.configure_power());
+                    if future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                    {
+                        return TestResult::Fail("stalled power setup finished");
+                    }
+                }
+                _ => {
+                    engine.io.revoke_on = Some((message, engine.authority));
+                    if run(engine.configure_power()) != Err(Error::Revoked) {
+                        return TestResult::Fail("power setup bypassed revocation");
+                    }
+                }
+            }
+            let writes = engine.io.writes.len();
+            if writes != (index + 1) * 3
+                || run(engine.configure_power()) != Err(Error::Busy)
+                || engine.io.writes.len() != writes
+            {
+                return TestResult::Fail("power setup continued or replayed after a fault");
+            }
+            drop(engine);
+            if pool.reserve(4096).is_ok() {
+                return TestResult::Fail("SMU driver buffer released after power setup fault");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_power_setup_faults_never_replay_or_release
+);
+
+fn smu_navi22_power_setup_rejects_unprotected_dpm_and_bad_limits() -> TestResult {
+    for case in 0..6 {
+        let (mut engine, _pool) = uploaded_engine();
+        match case {
+            0 => engine.io.running &= !(1 << 33), // thermal protection absent
+            1 => engine.io.running |= 1 << 3,     // UCLK transitions unowned
+            2 => engine.io.running = u64::MAX,
+            3 => engine.io.gfx_limits = (0, 2600),
+            4 => engine.io.gfx_limits = (2600, 500),
+            _ => engine.io.gfx_limits = (500, u32::MAX),
+        }
+        if run(engine.configure_power()).is_ok() || engine.state != State::Failed {
+            return TestResult::Fail("bad feature acknowledgement or clock limits accepted");
+        }
+    }
+    let mut engine = ready_engine();
+    if run(engine.configure_power()) != Err(Error::Busy) || !engine.io.writes.is_empty() {
+        return TestResult::Fail("power setup ran before table upload");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_power_setup_rejects_unprotected_dpm_and_bad_limits
 );

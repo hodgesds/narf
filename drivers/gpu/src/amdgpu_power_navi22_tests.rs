@@ -174,3 +174,49 @@ kernel_test_in!(
     "drivers/gpu/power-navi22",
     navi22_power_oem_quirks_match_exact_pci_identity
 );
+
+fn navi22_boot_power_policy_preserves_display_and_protection() -> TestResult {
+    let policy = BootPolicy::from_features(u64::MAX).unwrap();
+    // Independent SMU feature numbers: memory/link/display clocks, deep sleep,
+    // GFXOFF/BACO, multimedia/hub gating and unassigned bits must stay off.
+    let forbidden = (1 << 3)
+        | (1 << 4)
+        | (1 << 5)
+        | (1 << 7)
+        | (1 << 8)
+        | (0x3ff << 12)
+        | (1 << 22)
+        | (1 << 34)
+        | (1 << 40)
+        | (1 << 41)
+        | (1 << 45)
+        | (1 << 63);
+    if policy.allowed() & forbidden != 0 || !policy.validate_enabled(policy.allowed()) {
+        return TestResult::Fail("boot policy changes unowned display/memory power state");
+    }
+    for required in [1, 24, 25, 31, 32, 33] {
+        if BootPolicy::from_features(u64::MAX & !(1 << required)).is_ok()
+            || policy.validate_enabled(policy.allowed() & !(1 << required))
+        {
+            return TestResult::Fail("GFX DPM accepted without autonomous protection");
+        }
+    }
+    for optional in [0, 29, 37, 38, 42] {
+        let board = u64::MAX & !(1 << optional);
+        if BootPolicy::from_features(board).unwrap().allowed() & (1 << optional) != 0 {
+            return TestResult::Fail("driver enabled a feature absent from board policy");
+        }
+    }
+    if policy.validate_enabled(policy.allowed() | (1 << 3)) {
+        return TestResult::Fail("unexpected UCLK DPM accepted");
+    }
+    // Actual Navy Flounder SKU FeaturesToRun from firmware, as numeric metadata.
+    if BootPolicy::from_features(0x3767a37ffdff).is_err() {
+        return TestResult::Fail("Navy Flounder feature set refused");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/power-navi22",
+    navi22_boot_power_policy_preserves_display_and_protection
+);

@@ -50,7 +50,9 @@ impl Firmware {
             .vbios
             .as_ref()
             .ok_or(Error::Power(power::Error::MissingVbios))?;
-        self.power = Some(power::Prepared::new(vbios, &self.smc, identity).map_err(Error::Power)?);
+        let prepared = power::Prepared::new(vbios, &self.smc, identity).map_err(Error::Power)?;
+        prepared.boot_policy().map_err(Error::Power)?;
+        self.power = Some(prepared);
         Ok(())
     }
 }
@@ -65,8 +67,9 @@ pub enum Stage {
     PowerTable,
     Graphics,
     RlcBoot,
+    PowerSetup,
 }
-const STAGES: [Stage; 9] = [
+const STAGES: [Stage; 10] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -76,14 +79,16 @@ const STAGES: [Stage; 9] = [
     Stage::PowerTable,
     Stage::Graphics,
     Stage::RlcBoot,
+    Stage::PowerSetup,
 ];
-/// Firmware observations only: queues, memory hubs, SDMA startup, power policy
+/// Firmware/power observations only: queues, memory hubs, SDMA startup
 /// and display are not initialized by this sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
     pub smu: smu::Versions,
     pub gfx: psp::GfxBootStatus,
     pub power: Option<power::Info>,
+    pub power_status: Option<smu::PowerStatus>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -123,7 +128,7 @@ impl<B: Backend> Sequence<B> {
             }
             Err(error) => {
                 self.state = State::Failed {
-                    stage: Stage::RlcBoot,
+                    stage: STAGES[STAGES.len() - 1],
                     error,
                 };
                 Err(error)
@@ -145,6 +150,7 @@ struct Hardware {
     smu: Option<smu::Smu>,
     versions: Option<smu::Versions>,
     gfx_status: Option<psp::GfxBootStatus>,
+    power_status: Option<smu::PowerStatus>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -248,6 +254,22 @@ impl Backend for Hardware {
                         .map_err(Error::Psp)?,
                 );
             }
+            Stage::PowerSetup => {
+                if self.firmware.power.is_some() {
+                    // SAFETY: retained exclusive SMU/VRAM owner, confirmed
+                    // RLC boot, and no queues have been enabled yet.
+                    self.power_status = Some(
+                        unsafe {
+                            self.smu
+                                .as_mut()
+                                .ok_or(Error::Invalid)?
+                                .configure_power()
+                                .await
+                        }
+                        .map_err(Error::Smu)?,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -256,6 +278,7 @@ impl Backend for Hardware {
             smu: self.versions.ok_or(Error::Invalid)?,
             gfx: self.gfx_status.ok_or(Error::Invalid)?,
             power: self.firmware.power.as_ref().map(power::Prepared::info),
+            power_status: self.power_status,
         })
     }
 }
@@ -321,6 +344,7 @@ impl ColdBoot {
                     smu: None,
                     versions: None,
                     gfx_status: None,
+                    power_status: None,
                 },
                 state: State::Prepared,
             },
@@ -360,6 +384,7 @@ impl ColdBoot {
                     smu: None,
                     versions: None,
                     gfx_status: None,
+                    power_status: None,
                 },
                 state: State::Prepared,
             },

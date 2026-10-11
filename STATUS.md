@@ -296,8 +296,15 @@ table through an owned, flushed VRAM buffer and retains the published buffer
 across success, rejection and cancellation. PSP SCPM ownership or malformed
 runtime policy refuses this transfer before SMU commands; policy delegation
 is not implemented.
+After RLC boot, the coordinator now runs board calibration and enables a
+restricted GFX DPM policy with firmware power/current/temperature protection
+and automatic fan control. It verifies the enabled feature mask and reports
+the board's GFX frequency limits. Missing protections fail preflight; unexpected
+enabled features, rejection or cancellation prevent further bring-up/replay.
+Memory/display/link DPM and deep power states remain disabled until their
+owners can supply display and lifecycle constraints.
 These are software-tested foundations; training resume,
-video/display firmware, DPM feature policy/calibration and thermal setup,
+video/display firmware, display-aware DPM and OS thermal interrupt handling,
 hardware boot, GMC/GFX10 queue initialization, SDMA startup and DCN3.0
 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).

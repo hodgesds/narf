@@ -1,8 +1,8 @@
 //! Navi22 SMC preparation and a cold-start SMU11 version handshake. Linux
 //! `smu_v11_0.c`, `sienna_cichlid_ppt.c`, `smu_v11_0_7_ppsmc.h` and
 //! `mp_11_0_offset.h`: MP1 index 0, message=66, argument=82, response=90.
-//! Board tables use a retained VRAM transfer buffer; no DPM feature enable,
-//! calibration, voltage/clock override or fan programming is exposed here.
+//! Board tables use a retained VRAM transfer buffer. Cold-boot power setup
+//! enables a restricted GFX DPM and autonomous protection policy.
 use crate::{amdgpu::AmdGpu, amdgpu_discovery as discovery, amdgpu_smc_firmware as firmware};
 use alloc::vec::Vec;
 use narf_bus::{BusDeviceCap, MmioRegion};
@@ -16,6 +16,14 @@ const GET_INTERFACE: u32 = 3;
 const SET_DRIVER_HIGH: u32 = 0xe;
 const SET_DRIVER_LOW: u32 = 0xf;
 const TRANSFER_TABLE: u32 = 0x13;
+const RUN_DC_BTC: u32 = 0x36;
+const ALLOWED_HIGH: u32 = 5;
+const ALLOWED_LOW: u32 = 4;
+const ENABLE_FEATURES: u32 = 6;
+const RUNNING_LOW: u32 = 0xc;
+const RUNNING_HIGH: u32 = 0xd;
+const MIN_DPM_FREQ: u32 = 0x1d;
+const MAX_DPM_FREQ: u32 = 0x1e;
 pub const DRIVER_INTERFACE: u32 = 0x0e;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +40,7 @@ pub enum Error {
     Image(firmware::Error),
     Registry(narf_firmware::FirmwareError),
     PowerPolicy(u32),
+    Features { allowed: u64, enabled: u64 },
 }
 pub(crate) fn mp1_bank(gpu: &AmdGpu) -> Result<u64, Error> {
     if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI22 {
@@ -113,12 +122,22 @@ pub enum State {
     Ready,
     UploadingPowerTable,
     PowerTableReady,
+    ConfiguringPower,
+    PowerReady,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Versions {
     pub firmware: u32,
     pub interface: u32,
+}
+/// Observed SMU policy and board frequency limits, not a clock override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PowerStatus {
+    pub allowed: u64,
+    pub enabled: u64,
+    pub gfx_min_mhz: u16,
+    pub gfx_max_mhz: u16,
 }
 struct Op<F>(F);
 impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
@@ -217,6 +236,7 @@ struct Engine<I: Io> {
     // SMU retains DriverDramAddr even after acknowledgement. Keep this buffer
     // for the lifetime of the owner; Drop quarantines published allocations.
     power_memory: Option<crate::amdgpu_vram::Reservation>,
+    power_policy: Option<crate::amdgpu_power_navi22::BootPolicy>,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -319,6 +339,49 @@ impl<I: Io> Engine<I> {
         };
         result
     }
+    async fn configure_power(&mut self) -> Result<PowerStatus, Error> {
+        if self.state != State::PowerTableReady {
+            return Err(Error::Busy);
+        }
+        let policy = self.power_policy.ok_or(Error::Invalid)?;
+        self.state = State::ConfiguringPower;
+        let result = async {
+            self.command(RUN_DC_BTC, 0).await?;
+            self.command(ALLOWED_HIGH, (policy.allowed() >> 32) as u32)
+                .await?;
+            self.command(ALLOWED_LOW, policy.allowed() as u32).await?;
+            self.command(ENABLE_FEATURES, 0).await?;
+            let low = self.command(RUNNING_LOW, 0).await?;
+            let high = self.command(RUNNING_HIGH, 0).await?;
+            let enabled = u64::from(low) | (u64::from(high) << 32);
+            if !policy.validate_enabled(enabled) {
+                return Err(Error::Features {
+                    allowed: policy.allowed(),
+                    enabled,
+                });
+            }
+            // PPCLK_GFXCLK == 0 in the upper 16 bits. Read only: leave the
+            // board's frequency/voltage limits intact and use automatic DPM.
+            let min = self.command(MIN_DPM_FREQ, 0).await?;
+            let max = self.command(MAX_DPM_FREQ, 0).await?;
+            if min == 0 || min > max || max > u32::from(u16::MAX) {
+                return Err(Error::Invalid);
+            }
+            Ok(PowerStatus {
+                allowed: policy.allowed(),
+                enabled,
+                gfx_min_mhz: min as u16,
+                gfx_max_mhz: max as u16,
+            })
+        }
+        .await;
+        self.state = if result.is_ok() {
+            State::PowerReady
+        } else {
+            State::Failed
+        };
+        result
+    }
 }
 #[derive(Debug)]
 pub struct Smu {
@@ -365,6 +428,7 @@ impl Smu {
                 authority,
                 state: State::Prepared,
                 power_memory: None,
+                power_policy: None,
             },
         })
     }
@@ -387,7 +451,20 @@ impl Smu {
         table: &crate::amdgpu_power_navi22::Prepared,
         pool: &crate::amdgpu_vram::Pool,
     ) -> Result<(), Error> {
-        self.engine.upload(table.bytes(), pool).await
+        let policy = table.boot_policy().map_err(|_| Error::Unsupported)?;
+        self.engine.upload(table.bytes(), pool).await?;
+        self.engine.power_policy = Some(policy);
+        Ok(())
+    }
+    /// Run board calibration and enable the uploaded table's restricted boot
+    /// policy once. Retains the owner/buffer on error or cancellation.
+    ///
+    /// # Safety
+    /// All upload ownership contracts still apply. RLC autoload must have
+    /// completed and queues must remain idle. This must precede any workload.
+    /// Native DCN clock policy and OS thermal interrupt handling are separate.
+    pub async unsafe fn configure_power(&mut self) -> Result<PowerStatus, Error> {
+        self.engine.configure_power().await
     }
     /// Query the interface and running firmware version once. Cancellation
     /// retains Querying and prevents replay. Success does not enable DPM.

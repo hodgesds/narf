@@ -18,6 +18,44 @@ const BOARD_END: usize = 1636; // after BoardReserved[11], before MmHubPadding
 const GFX_CLOCKS: usize = 524; // FreqTableGfx[16]
 const BOARD_RESERVED: usize = 1592;
 
+// smu11_driver_if_sienna_cichlid.h. Retain posted display/memory/link clocks
+// until DCN owns their constraints. No deep sleep, BACO, hub gating or GFXOFF.
+const BOOT_ALLOWED: u64 = (1 << 0)
+    | (1 << 1)
+    | (1 << 24)
+    | (1 << 25)
+    | (1 << 29)
+    | (1 << 31)
+    | (1 << 32)
+    | (1 << 33)
+    | (1 << 37)
+    | (1 << 38)
+    | (1 << 42);
+const BOOT_REQUIRED: u64 = (1 << 1) | (1 << 24) | (1 << 25) | (1 << 31) | (1 << 32) | (1 << 33);
+
+/// Board-supported GFX DPM and autonomous power/fan/thermal protection only.
+/// Memory, link and display clock transitions require a later DCN policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootPolicy {
+    allowed: u64,
+}
+impl BootPolicy {
+    pub fn allowed(self) -> u64 {
+        self.allowed
+    }
+    pub(crate) fn from_features(features: u64) -> Result<Self, Error> {
+        if features & BOOT_REQUIRED != BOOT_REQUIRED {
+            return Err(Error::Unsupported);
+        }
+        Ok(Self {
+            allowed: features & BOOT_ALLOWED,
+        })
+    }
+    pub(crate) fn validate_enabled(self, enabled: u64) -> bool {
+        enabled & BOOT_REQUIRED == BOOT_REQUIRED && enabled & !self.allowed == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -99,6 +137,15 @@ impl Prepared {
     pub fn info(&self) -> Info {
         self.info
     }
+    /// Validate a restricted cold-boot policy before hardware is claimed.
+    /// The table's own feature bits remain an upper bound on driver policy.
+    pub fn boot_policy(&self) -> Result<BootPolicy, Error> {
+        boot_policy(&self.bytes)
+    }
+}
+fn boot_policy(bytes: &[u8]) -> Result<BootPolicy, Error> {
+    let features = u64::from_le_bytes(bytes.get(4..12).ok_or(Error::Invalid)?.try_into().unwrap());
+    BootPolicy::from_features(features)
 }
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())

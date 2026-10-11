@@ -18,6 +18,7 @@ fn report() -> Report {
             rlc_bootload: 1 << 31,
         },
         power: None,
+        power_status: None,
     }
 }
 struct Fake {

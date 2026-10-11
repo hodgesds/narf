@@ -230,8 +230,29 @@ State moves from `Ready` to `UploadingPowerTable` to `PowerTableReady` or
 cancellation prevent replay. The owner retains the published allocation even
 after acknowledgement because the SMU retains its address; dropping it
 quarantines the allocation. Prepublication failures release their reservation.
-Table upload does not enable DPM features, run boot calibration (BTC), install
-thermal handling, set clocks/voltages/fans or establish graphics readiness.
+Table upload alone does not enable DPM features or establish graphics readiness.
+`Prepared::boot_policy()` validates that the board enables GFX DPM together
+with PPT/TDC limits, firmware critical-temperature protection, automatic fans
+and thermal throttling. Production preparation requires these before claiming
+hardware. The immutable `BootPolicy` intersects board features with the driver
+allowlist; it cannot enable a feature absent from the board table.
+
+`unsafe Smu::configure_power().await` requires the uploaded board table and
+confirmed RLC autoload, exclusive ownership and idle queues. It sends `RunDcBtc`,
+sets the high/low allowed feature words, enables SMU features, verifies both
+running feature words, and reads the board's minimum/maximum GFX DPM frequencies.
+Missing required protection, unexpected enabled features or invalid frequency
+limits fail closed. `PowerStatus` reports allowed/enabled masks and the observed
+MHz range. State is `ConfiguringPower` until `PowerReady` or `Failed`; dropping
+the future retains the in-progress state and prevents replay. No failure resets
+hardware or releases its transfer buffer.
+
+The boot allowlist includes GFX DPM/prefetch, PPT/TDC, VR0HOT, firmware critical
+temperature, fan/thermal control, GFX spread spectrum, out-of-band monitoring
+and APCC DFLL when present in the board table. UCLK/FCLK/SOC/display/PCIe DPM,
+memory-voltage scaling, deep sleep, GFXOFF, BACO and hub/media gating remain
+disabled until their owners supply constraints. This does not install OS
+thermal interrupts or override board frequencies, voltages or fan curves.
 
 ### Navi 22 graphics firmware and PSP autoload
 
@@ -311,7 +332,8 @@ exclude reset/PM/other clients and retain permanent mappings for the session.
 
 `ColdBoot::run().await` executes optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
-optional board PowerPlay upload → graphics upload/autoload → RLC boot check.
+optional board PowerPlay upload → graphics upload/autoload → RLC boot check →
+optional board calibration/protected GFX DPM setup.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
 session is constructed; production boot requires it, while explicit
 firmware-only callers may omit it. The bootstrap owner is dropped only
@@ -324,14 +346,15 @@ Every attempt prevents replay, and no failure automatically resets hardware or
 destroys device-owned memory. Dropping a session quarantines any memory still
 owned by hardware through the underlying owners' existing rules.
 
-Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info> }`;
+Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
+power_status: Option<PowerStatus> }`;
 `power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
-`AmdGpu::fw_loaded`. DPM feature policy/calibration, GMC/queues, video/display
-firmware and real-card validation remain separate work.
+`AmdGpu::fw_loaded`. Display-aware memory/link DPM, OS thermal interrupts,
+GMC/queues, video/display firmware and real-card validation remain separate work.
 
 ### Navi 22 boot ownership and framebuffer handoff
 
