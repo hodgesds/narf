@@ -6,15 +6,18 @@ network stack after your PCI probe has brought the device up.
 Source: `net/src/lib.rs`. Reference driver: `drivers/net/src/rtl8139.rs`
 (smallest real NIC), plus the loopback in `net/src/lib.rs` itself.
 
-The seam is cleanly out-of-tree: implement `Interface`, then
-`narf_net::registry().register(&authority, your_iface)`.
+For a driver linked into the kernel, implement `Interface`, then call
+`narf_net::registry().register(&authority, your_iface)`. Runtime-loaded
+drivers use the copy-mode `narf_netif_register`/`narf_netif_rx` C KABI instead;
+see [modules.md](modules.md).
 
 ---
 
 ## 1. The `Interface` trait — implement this
 
-`Interface` (`net/src/lib.rs:285`) is the netdev seam. All six methods are
-required (no defaults); the type must be `Send + Sync + 'static`:
+`Interface` is the netdev seam. The identity, state, and ring accessors below
+are required; the trait also provides default queue, RSS, affinity, loopback,
+and offload-reporting methods. The type must be `Send + Sync + 'static`:
 
 ```rust
 pub trait Interface: Send + Sync {                          // net/src/lib.rs:285
@@ -37,8 +40,8 @@ The last two are the crux. NARF moves packets over **Narf-Ring** IPC
 - `tx_ring()` exposes the **producer** half of an outbound-frame ring. The stack
   `lock().take()`s the producer to push frames for your driver to transmit.
 
-`Frame` is `net/src/lib.rs:132`; ring depth is `RX_RING_N = 64`
-(`net/src/lib.rs:115`) and `TX_RING_N = 64` (`net/src/lib.rs:117`). The
+`Frame` is defined in `net/src/lib.rs`; both `RX_RING_N` and `TX_RING_N` are
+currently 1024. The
 `Option<...>` is so ownership can be `take`n exactly once (Stage-3 drivers hand
 it out and don't take it back).
 

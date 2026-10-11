@@ -1,7 +1,7 @@
 # Extending NARF: Drivers & the Bus/Device Model
 
-This is the anchor document for writing an **out-of-tree driver** for NARF. It
-covers the two mechanisms every driver leans on:
+This is the anchor document for writing a **built-in driver crate** for NARF.
+It covers the two mechanisms that path leans on:
 
 1. **The initcall registry** (`narf-init`) — how you get your code run at the
    right point in boot without touching `main`/`bare_main`.
@@ -27,6 +27,11 @@ Every API below was verified against the tree; `path:line` citations are exact
 at the time of writing. If a signature has drifted, trust the source over this
 doc and please update the citation.
 
+For a separately compiled `.ko`, use the narrower
+[runtime-module path](modules.md). Runtime modules do not call these Rust
+traits directly. The e1000 crate demonstrates both configurations from one
+source tree.
+
 ---
 
 ## 0. The shape of a NARF driver crate
@@ -43,8 +48,7 @@ A driver is an ordinary Rust crate that:
 
 The in-tree drivers (`drivers/virtio`, `drivers/net`, `drivers/gpu`, `audio`,
 `drivers/i2c`, `drivers/usb`, `drivers/fs/*`) are the reference implementations.
-None of them are "special": they use exactly the same public registration
-functions an out-of-tree crate would.
+They use the same public registration functions a linked external crate would.
 
 > **Framekernel note.** NARF drivers run inside PKS/MTE-isolated *domains*, not
 > a flat Ring 0 (see `DESIGN.md` §1). Nothing you write here manages that
@@ -164,10 +168,10 @@ pub fn register_initcalls() {
 }
 ```
 
-The kernel's boot code must call `my_driver::register_initcalls()` once. For a
-*truly* out-of-tree crate this is the single wiring line that has to exist in a
-kernel-side aggregator; everything else is your crate. See
-[§5, out-of-tree limits](#5-what-is-and-isnt-cleanly-out-of-tree).
+The kernel's boot code must call `my_driver::register_initcalls()` once. A
+built-in external crate therefore needs a kernel-side retention/wiring line.
+A runtime-loaded driver avoids that line but can use only the stable module
+KABI; see [modules.md](modules.md).
 
 ---
 
@@ -457,10 +461,10 @@ These bite every driver author, so they live here rather than repeated per doc:
 
 ---
 
-## 5. What is (and isn't) cleanly out-of-tree
+## 5. Built-in versus runtime-loaded extension
 
-**Cleanly out-of-tree** (implement a trait / call a `pub` register fn in your
-own crate, no core-crate edits):
+The following are clean source-level seams for a crate that is linked into the
+kernel (implement a trait or call a public registration function):
 
 | Bus / subsystem | Register with                              | Doc |
 |-----------------|--------------------------------------------|-----|
@@ -478,12 +482,10 @@ own crate, no core-crate edits):
 | Power source    | `narf_power::register_source`              | [§6](#6-briefly-power-crypto-tracing-observability) |
 | Tracing probe   | `narf_tracing::table().register`           | [§6](#6-briefly-power-crypto-tracing-observability) |
 
-**Not cleanly out-of-tree today** (would require editing a core crate):
+For a linked crate, these still require kernel integration or a core change:
 
-- **The initcall wiring line.** A kernel-side aggregator has to call your
-  crate's `register_initcalls()` once. NARF has no dynamic module loader that
-  discovers crates at boot, so this one line is unavoidable for a genuinely
-  external crate. Everything downstream of it is yours.
+- **The initcall wiring line.** A kernel-side aggregator has to retain the
+  dependency and call the crate's `register_initcalls()` once.
 - **Platform (non-discoverable) devices** have no shared `platform_driver`
   trait — you fold discovery + subsystem-registration into a `Stage::Device`
   initcall instead (§3.4). Workable, but not a single seam.
@@ -494,6 +496,14 @@ own crate, no core-crate edits):
   small `filesystem/src/devfs.rs` edit; the four existing patterns
   (static node / dynamic hook / directory delegate / auto-block) cover almost
   everything (see [chardev.md](chardev.md)).
+
+NARF also has a runtime ELF module loader. It removes the link-time wiring
+requirement, but it is not a dynamic bridge to arbitrary Rust APIs. A `.ko`
+may import only the primitive C functions registered in KSYMTAB, with manifest
+capability checks and per-symbol ABI CRCs. The current device subset supports
+PCI, bounded MMIO, DMA handles, MSI-X/task-context callbacks, pollers, and
+copy-mode network interfaces. See [modules.md](modules.md); e1000 is the
+reference dual-build driver.
 
 ---
 

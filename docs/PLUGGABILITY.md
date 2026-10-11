@@ -1,15 +1,21 @@
 # Pluggability — how core policies are swapped
 
-NARF's core subsystems are *framework + policy*: the framework is in
-tree and stable; the policy is a runtime-installable backend behind a
-trait. A downstream consumer (research kernel fork, custom workload,
-hardware bring-up tooling) can replace the policy without forking the
-core. This document describes the single shape every pluggable
-subsystem follows.
+Several NARF core subsystems split mechanism from replaceable policy: the
+mechanism stays in-tree while a capability-gated trait implementation can be
+installed after that subsystem initializes. A downstream consumer (research
+kernel fork, custom workload, hardware bring-up tooling) can replace those
+published policies without forking their mechanism. This document describes
+that source-level policy seam; it does not claim that every subsystem is
+pluggable.
+
+This is also distinct from a runtime-loadable native binary. A policy crate
+linked into the kernel can use Rust traits. A `.ko` can cross only the curated
+primitive C KABI. See [runtime modules](extending/modules.md) for module crate,
+manifest, signing, load/unload, and domain-placement rules.
 
 ## The shape
 
-Every pluggable subsystem in NARF follows one pattern:
+Most globally installed policies follow this pattern:
 
 1. **A trait** that describes the policy surface.
 

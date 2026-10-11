@@ -5,8 +5,8 @@ NARF is: what runs, what doesn't, and the precise ABI details a reader needs
 to reason about porting or debugging a Linux binary on NARF.
 
 It is a snapshot of the code in this tree. Where a claim could not be verified
-from source it is marked **(unverified)**. All citations are `path:line` into
-this worktree.
+from source it is marked **(unverified)**. Paths and symbols are preferred over
+fragile line numbers; the source remains authoritative.
 
 Companion docs: [`STATUS.md`](../STATUS.md) (progress),
 [`COMPARISON.md`](../COMPARISON.md) (design-space positioning),
@@ -28,22 +28,23 @@ loader, the same `struct stat`, the same signal frames, the same auxv.
 
 - **Syscall-ABI compatible.** A user program issues the `syscall` instruction
   (or `int 0x80`) with Linux wire numbers in `rax`; NARF dispatches through a
-  per-arch `LINUX_TABLE` (`userspace/src/syscall.rs:2184` for x86_64,
-  `:2537` for aarch64) that maps Linux numbers → NARF handlers.
+  per-arch `LINUX_TABLE` in `userspace/src/syscall.rs` that maps Linux numbers
+  to NARF handlers.
 - **Runs unmodified binaries.** musl (static + dynamic PIE), Debian-13 glibc
-  (static-PIE + dynamic), BusyBox, redis, stress-ng, and — in progress —
-  systemd 257 all load and execute without recompilation. See §4.
+  (static-PIE + dynamic), BusyBox, redis, stress-ng, and Fedora systemd all
+  load and execute without recompilation. See §4 for the differing proof
+  levels.
 - **NARF-native extensions live out of the way.** NARF's own syscalls occupy
-  the `0x4000..=0x40FF` range (`userspace/src/syscall.rs:2839`), so they never
+  the `0x4000..=0x40FF` range, so they never
   collide with a Linux wire number.
 
 **Confidence level.** The core process/mem/fs/signal/socket surface is
-genuinely implemented and exercised by ~120 in-tree smoke programs that run on
-every CI push (§4, §7). It is a *functional* Linux ABI, not an exhaustive one:
+genuinely implemented and exercised by a large set of in-tree smoke programs
+and CI gates (§4, §7). It is a *functional* Linux ABI, not an exhaustive one:
 some syscalls are intentional no-ops, some are feature-gated (and become
-`ENOSYS`/invalid when the feature is off), and whole subsystems (io_uring, BPF)
-are deliberately absent (§6). Treat this as "runs a large, growing set of real
-Linux userland," not "passes LTP."
+`ENOSYS`/invalid when the feature is off), and interfaces remain partial or
+absent (`io_uring` is absent; BPF is partial). Treat this as "runs a large,
+growing set of real Linux userland," not "passes LTP."
 
 ---
 
@@ -55,19 +56,16 @@ via `table.install_raw(Syscall::Variant, "name", RawFnHandler(sys_fn))`. The
 Linux-number → variant mapping lives in `LINUX_TABLE`
 (`userspace/src/syscall.rs:2184` x86_64, `:2537` aarch64).
 
-Counts (approximate, from this tree):
+Table size (from this tree; an entry is not by itself proof that every flag and
+edge case is implemented):
 
-- **~200+** Linux syscalls mapped in the x86_64 `LINUX_TABLE`.
-- **~180** handlers installed unconditionally (core I/O, process, memory,
-  sockets, signals, credentials, VFS, poll/epoll, time).
-- **~50** handlers gated behind `linux-compat` (POSIX timers, full SysV IPC,
-  inotify/fanotify, Landlock, LSM self-attr, keyrings, new mount API, xattrs,
-  `statx`, `perf_event_open`).
-- **3** gated behind `container` (SysV `*get` id-by-key when `linux-compat`
-  is off; `pivot_root`).
-- **~5** intentional no-op stubs (`utime`/`utimes` timestamp write,
-  `set_robust_list`/`get_robust_list`).
-- **19** NARF-native extensions in `0x4000+` (not Linux syscalls).
+- **351** entries in the x86_64 `LINUX_TABLE`.
+- **312** entries in the aarch64 `LINUX_TABLE`.
+- **39** NARF-native extension entries in `0x4000+` (not Linux syscalls).
+
+Handler availability still depends on Cargo features. Some operations are
+intentionally partial or compatibility no-ops, so consult the category tables
+and executable smokes rather than treating these counts as coverage scores.
 
 ### 2.0 The cfg-gating sharp edge (read this first)
 
@@ -125,7 +123,7 @@ handler exists. Both directions are real; when in doubt, check both the table
 | `dup`/`dup2`/`dup3`, `fcntl`, `ioctl`, `pipe`/`pipe2` | implemented | — | pipes EOF on writer exit; fds released on task exit |
 | `copy_file_range`, `sendfile`, `splice`, `tee`, `vmsplice` | implemented | — | |
 | xattr: `[l|f]setxattr`, `[l|f]getxattr`, `[l|f]listxattr`, `[l|f]removexattr` | implemented | `linux-compat` | `handlers.rs:~21797` |
-| `utime`/`utimes` | **no-op** (accept, no mtime write) | `linux-compat` | `sys_utime_noop`, `handlers.rs:~21840` |
+| `utime`/`utimes` | implemented | `linux-compat` | parse Linux `utimbuf`/`timeval[2]` and update path timestamps through `do_utimes` |
 | `utimensat` | implemented | — | |
 | `chroot` | implemented | table entry gated `linux-compat` (`syscall.rs:2430`) | applied exactly once (single resolve point) |
 | `mount`, `umount2`, `pivot_root`, `unshare`, `setns`, `move_mount`, `open_tree`, `fspick`, `mount_setattr` | implemented | `pivot_root` needs `linux-compat`+`container` (`syscall.rs:2432`); new mount API needs `linux-compat` | `mount` no-ops `MS_SLAVE`/`MS_PRIVATE`/`MS_SHARED` propagation flags (systemd generator sandbox) |
@@ -145,9 +143,11 @@ handler exists. Both directions are real; when in doubt, check both the table
 | `getsockname`/`getpeername`, `getsockopt`/`setsockopt` | implemented | — | `SO_REUSEPORT` flow distribution |
 | `sock_register_buf`, `sock_send_zc` | implemented | — | zero-copy send path |
 
-The TCP/IP stack itself lives in userspace by design (see `COMPARISON.md`); the
-kernel ships the frame-ring contract + NIC drivers. redis serves off-box over
-virtio-net (`redis-smoke`, `net-smoke`).
+The primary architecture keeps the L3/L4 daemon behind the frame-ring contract,
+but the current tree also retains an in-kernel IPv4/TCP/UDP/DNS path used by
+Linux socket compatibility and the live QEMU smokes. `net-smoke` covers
+host-to-guest TCP and UDP plus guest DNS; redis serves off-box over virtio-net
+through `redis-smoke`. See `net/specification/spec.md` for the canonical split.
 
 ### 2.5 Signals
 
@@ -180,7 +180,7 @@ Delivery model and mask width are detailed in §3.2.
 | SysV msg: `msgget`, `msgsnd`, `msgrcv`, `msgctl` | implemented | as above | |
 | SysV shm: `shmget`, `shmat`, `shmdt`, `shmctl` | implemented | as above (`shmget` table entry `syscall.rs:2508`) | |
 | POSIX mq + mqueuefs: `mq_open`, `mq_unlink`, `mq_timedsend`, `mq_timedreceive`, `mq_notify`, `mq_getsetattr`; mounted queue namespace | implemented | `linux-compat`; SIGEV_SIGNAL/NONE (SIGEV_THREAD netlink remains) | `filesystem/src/mqueuefs.rs`, `userspace/src/mqueue.rs` |
-| `set_robust_list`/`get_robust_list` | **structural no-op** | — | accepted, does nothing (`handlers.rs:~21766`) |
+| `set_robust_list`/`get_robust_list` | implemented | — | stores/returns the per-task head; exit walks it and marks owned futexes `FUTEX_OWNER_DIED` |
 
 ### 2.8 cgroup v2 / namespaces / misc
 
@@ -190,7 +190,7 @@ Delivery model and mask width are detailed in §3.2.
 | `sethostname`/`setdomainname`, `uname`, `gethostname` | implemented | — | |
 | `getrandom` | implemented | — | ChaCha20 CSPRNG |
 | `perf_event_open` | implemented | `linux-compat` | `handlers.rs:~21949` |
-| `init_module`/`finit_module`/`delete_module` | present | — | NARF has no out-of-tree module model; treat as stubs unless verified **(unverified)** |
+| `init_module`/`finit_module`/`delete_module` | implemented | — | load in-memory or fd-backed relocatable modules, apply domain override, and refuse busy unloads; gated by module-load authority. See `modules/` and [runtime modules](extending/modules.md) |
 | `io_uring_setup`/`enter`/`register` | **not present** | — | intentional non-goal (§6) |
 | `bpf` | partial | — | x86_64 321 / aarch64 280. Programs (`PROG_LOAD`, `PROG_TEST_RUN`), maps (`MAP_CREATE`, `MAP_{LOOKUP,UPDATE,DELETE}_ELEM`, `MAP_GET_NEXT_KEY`), BTF (`BTF_LOAD`), introspection (`OBJ_GET_INFO_BY_FD`, `{PROG,MAP,LINK,BTF}_GET_NEXT_ID`, `{PROG,MAP,LINK,BTF}_GET_FD_BY_ID`), bpffs pinning (`OBJ_PIN`, `OBJ_GET`), attach (`PROG_{ATTACH,DETACH}`, `LINK_{CREATE,UPDATE,DETACH}`). `ENOTSUP`: `PROG_QUERY`, `TASK_FD_QUERY`, the `MAP_*_BATCH` commands, `BPF_TOKEN_CREATE` (NARF has no delegable token — the privilege gate is a credential check), `BPF_ITER_CREATE` (needs a seq_file-shaped read surface no NARF fd provides). `handlers/sys_bpf.rs` |
 
@@ -307,11 +307,11 @@ is handed to userspace via `AT_SYSINFO_EHDR`. The `vvar` page carries a seqlock
 
 ## 4. Proven userland
 
-Everything in the "musl-demo" column runs on **every CI push** through the
-`cargo xtask musl-demo` harness (x86_64), which drives ~120 stock-musl / libdrm
-/ libwayland smoke programs through the live shell → `execve` → ELF loader →
-syscall dispatch and asserts an output token. The case list is authoritative:
-`build/xtask/src/main.rs:1738`–`1984`.
+The `cargo xtask musl-demo` harness (x86_64) drives stock-musl, libdrm, and
+libwayland smoke programs through the live shell → `execve` → ELF loader →
+syscall dispatch and asserts output tokens. CI runs the applicable shards when
+those paths are affected. The case list in `build/xtask/src/main.rs` is
+authoritative.
 
 | Program | Status | How it's exercised |
 |---|---|---|
@@ -324,7 +324,7 @@ syscall dispatch and asserts an output token. The case list is authoritative:
 | **glibc, static-PIE** (Debian 13) | loads + executes | manual; ELF/auxv/TLS ready. Runs under KVM; AVX/AVX-512 state is saved when enabled in XCR0 |
 | **glibc, dynamic** (Debian 13 + systemd libs) | runs under KVM | manual; landed with DT_RELR opt-in, COW-private vDSO, `clone(stack=0)` fork |
 | **stress-ng** (musl dyn-PIE via alpine-chroot) | runs | `chroot_run` / probe harness; boots near-native under KVM; vector ISA selection follows the enabled XCR0 mask |
-| **systemd 257** | **in progress** | `--version` prints rc=0; `--test` fully inits the manager, loads all units, computes the boot transaction (`cgroup-all` build). As PID 1 it boots and reaches early init. Remaining: readlink-EINVAL on unit symlinks, teardown `rm_rf`. See `notes`/memory `narf-systemd-bringup` |
+| **Fedora 43 systemd** | runs as PID 1 in the local Fedora image | units/targets, journal, D-Bus, udev, seats, and a user manager run; image is generated locally and the gate is marker-based, not an automatic CI case. See [desktop plan](DESKTOP_LINUX_PLAN.md) |
 | **OCI container demo** (`oci_smoke`) | runs | `xtask musl-demo` default (chroot rootfs isolation); nightly `--features container` adds a real UTS namespace (`nightly-oci.yml`) |
 | **BusyBox chroot** (`chroot_run`) | runs | chroot into an alpine rootfs; `verification/data/musl-demo/chroot_run_x86_64` |
 | **libdrm / libwayland / weston-class GUI** (modetest, wl_* compositor cases) | runs | `xtask musl-demo` GUI cases (`main.rs:1975`), fresh-boot per case |
@@ -477,9 +477,11 @@ FUSE and virtio-fs/9p give a userspace-filesystem escape hatch.
   the subset that maps cleanly onto the new data model; the rest returns
   `ENOTSUP` with a `// LINUX-GAP` note. See `bpf/specification/spec.md`.
   systemd still degrades gracefully without it.
-- **Out-of-tree binary drivers** — no module ABI for third-party blobs. All
-  drivers are in-tree Rust. `init_module`/`finit_module` are present but should
-  be treated as non-functional for real modules **(unverified)**.
+- **Linux's internal module ABI.** NARF loads its own relocatable `.ko` format,
+  but it does not provide Linux's unstable internal C ABI or support third-party
+  Linux binary blobs. NARF modules use a curated primitive C KABI, signed
+  manifests, declared capabilities, and isolated domains; see
+  [runtime modules](extending/modules.md).
 - **Real uid/root authority** — NARF has no root user; the `*uid`/`*gid`
   syscalls track values but authority is capability-based, not DAC/ambient.
 

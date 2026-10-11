@@ -1,11 +1,12 @@
 # Road to Desktop Linux on NARF (QEMU)
 
 Goal: run **unmodified Linux graphical software** on NARF under QEMU,
-building incrementally toward a desktop. NARF is not Linux — it has a
-partial Linux-compatible syscall surface (enough today for musl
-busybox/coreutils/redis + an OCI container). A full DE (Xorg/Wayland +
-GNOME/KDE + Mesa) is years out; this plan is the **dependency-ordered
-ladder of runnable milestones** that gets us there one rung at a time.
+building incrementally toward a desktop. NARF is not Linux, but its partial
+Linux-compatible syscall surface now runs musl/glibc applications, stock
+Fedora systemd, PipeWire/WirePlumber, and a developing KDE Plasma Wayland
+session under QEMU. Hardware-accelerated Mesa and a stable desktop session
+remain unfinished. This plan is the **dependency-ordered ladder of runnable
+milestones** used to get there.
 
 Each rung ends in something that *boots and runs under `qemu`*, so we
 never accumulate unverifiable work.
@@ -240,10 +241,6 @@ never accumulate unverifiable work.
   now keeps writing the real frames in both parent and child — essential for
   the compositor-forks-client architecture. Caught by Rung 10's KMS readback.
 
-- **`fork` keeps `MAP_SHARED` regions shared** (was COWing them): a process
-  that mmaps a device (framebuffer, DRM dumb buffer) or POSIX shm then forks
-  now keeps writing the real frames in both parent and child — essential for
-  the compositor-forks-client architecture. Caught by Rung 10's KMS readback.
 - **`/dev/uinput`** virtual-input device (`UI_DEV_CREATE`/`UI_SET_*BIT` +
   24-byte event injection via `write`), registering a device with the evdev
   router so it appears as `/dev/input/eventN`. Enables userspace input

@@ -1,12 +1,15 @@
 # Task lifetime redesign — Linux-style reference counting
 
-Status: DESIGN + full teardown/signal audit (2026-07-02).
+Status: IMPLEMENTED DESIGN RECORD. The audit baseline below is dated
+2026-07-02; stages 1–3 and the listed stage-4 signal/timer follow-ups have
+landed. It is retained to explain the invariants and failure class, not as a
+description of the current task implementation.
 Goal: eliminate the task-teardown use-after-free class and the ~40-table
 stale-state swamp behind the intermittent boot hangs, and give
 multithreaded processes (weston, Qt/KDE apps) correct exit/signal
 semantics. Hard cutover — no compat shims.
 
-## 1. Current lifetime model (audited)
+## 1. Historical lifetime model (audit baseline)
 
 Ownership chain, all-or-nothing:
 
@@ -19,8 +22,8 @@ Ownership chain, all-or-nothing:
                         ├── JmpBuf
                         └── UserProcess    (Arc<AddressSpace>, entry, …)
 
-Dropping the slot frees EVERYTHING at once. Meanwhile these hold raw
-pointers or ids into that box:
+At the time of the audit, dropping the slot freed everything at once while
+these holders retained raw pointers or ids into that box:
 
 | Holder | What | Guard |
 |---|---|---|
@@ -36,7 +39,11 @@ after the pid space wraps. Wakers are `Arc<WakeCell>` — firing a
 dead task's waker is memory-safe. Signal sends never write target
 memory (bit-set + wake; victim self-delivers on its own trap return).
 
-## 2. Confirmed hazards (from the 3-way audit)
+## 2. Historical confirmed hazards (from the 3-way audit)
+
+The bullets in this section are the defects that motivated the redesign. They
+are not an open-bug list; consult [STATUS.md](../STATUS.md) and current tests
+for present status.
 
 ### Memory safety (UAF class)
 - **H1 (the trap):** `run_until_empty`/`poll_one_round` drop a slot on
@@ -229,16 +236,21 @@ set by the new image), and sweeps FD_CLOEXEC.
    rt_sigaction oldact write-back, tgkill (tgid,tid) check,
    sigaltstack + robust-list + clear_child_tid cleared on execve,
    FD_CLOEXEC sweep on execve, pgrp-delivery wakes parked targets.
-4. **remaining parity (follow-up)**: RT-signal queue depth (still
-   coalesces), ITIMER_VIRTUAL/PROF (only ITIMER_REAL fires), full
-   "any thread may dequeue a process-directed signal" shared-pending
-   set, orphaned-pgrp SIGHUP. Pinned in §5.
+4. **remaining parity follow-ups** — MOSTLY DONE. RT signals now queue
+   independently with payload/FIFO ordering, ITIMER_VIRTUAL/PROF fire from CPU
+   accounting, and process-directed signals use a retargetable thread-group
+   shared-pending set. Orphaned stopped-process-group SIGHUP/SIGCONT remains a
+   distinct job-control follow-up.
 5. Regression tests per stage (abi_signal/process_e2e suites) + boot
    smoke + full kernel-test run (KVM + TCG).
 
-## 5. Linux-parity matrix (all in scope — brought to parity, not pinned)
+## 5. Linux-parity audit matrix
 
-| Area | Linux behaviour | NARF today | Fix stage |
+“Audit baseline” records the defect as it existed on 2026-07-02; it is not the
+current implementation status. The implementation-stage notes above describe
+the landing, and executable signal/process tests are authoritative now.
+
+| Area | Linux behaviour | Audit baseline (2026-07-02) | Fix stage |
 |---|---|---|---|
 | exit_group | kills all threads, group exit code | alias of exit | 3 |
 | CLONE_SIGHAND/THREAD | shared sighand, inherited mask, shared pending | discarded; empty tables | 3 |
@@ -259,12 +271,13 @@ set by the new image), and sweeps FD_CLOEXEC.
 
 ptrace interactions remain out of scope for this redesign.
 
-## 6. Per-task table inventory (cleanup matrix)
+## 6. Historical per-task table inventory (cleanup matrix)
 
 Keyed by tid unless noted. "Sweep" = to be purged in
-`release_task_tables` (stage 2). Today-status from the audit:
+`release_task_tables` (stage 2). The middle column is the audit baseline, not
+the current tree:
 
-| Table | Today | Plan |
+| Table | Audit baseline | Plan |
 |---|---|---|
 | fd TABLES, advisory locks | cleaned (fd::detach) | keep |
 | TASK_STOPPED | cleaned | keep |

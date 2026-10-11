@@ -58,11 +58,13 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   qemu-system-x86 \
   qemu-system-arm \
+  qemu-efi-aarch64 \
   cpio \
   mtools \
   dosfstools \
   e2fsprogs \
-  ovmf
+  ovmf \
+  xorriso
 ```
 
 What each is for:
@@ -71,10 +73,15 @@ What each is for:
 |---|---|---|
 | `qemu-system-x86` | `qemu-system-x86_64` | every x86_64 boot/run/test command |
 | `qemu-system-arm` | `qemu-system-aarch64` | `--arch=aarch64` runs |
+| `qemu-efi-aarch64` | AAVMF firmware | aarch64 UEFI ISO boots |
 | `cpio` | (also built in-process) | initramfs firmware CPIO |
 | `mtools` / `dosfstools` | FAT tooling | `xtask image` / `iso-boot` (ESP) |
 | `e2fsprogs` | `mke2fs`, `debugfs` | building/editing the ext2 rootfs image |
 | `ovmf` | OVMF UEFI firmware | `xtask iso-boot` (UEFI boot path) |
+| `xorriso` | ISO authoring | removable-media ISO construction |
+
+Linux-compatibility fixture regeneration and some CI smokes additionally use
+`musl-tools`, `clang`, `lld`, and `linux-libc-dev`.
 
 On Arch the equivalents are `qemu-full` (or `qemu-system-x86` +
 `qemu-system-aarch64`), `cpio`, `mtools`, `dosfstools`, `e2fsprogs`,
@@ -104,7 +111,7 @@ force an accelerator with `XTASK_QEMU_ACCEL` (see §7).
 git clone <your-narf-remote> narf
 cd narf
 
-# Cross-compile the kernel (default: narf-frame, x86_64-unknown-none, debug)
+# Cross-compile the kernel (default: narf-frame, x86_64-unknown-none, release)
 cargo xtask build --arch=x86_64
 ```
 
@@ -113,19 +120,20 @@ cargo xtask build --arch=x86_64
 
 ```sh
 cargo build -p narf-frame --target x86_64-unknown-none \
+  --release \
   -Z build-std=core,compiler_builtins,alloc \
   -Z build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128
 ```
 
 The kernel ELF lands at `target/<triple>/<profile>/narf-frame`
-(e.g. `target/x86_64-unknown-none/debug/narf-frame`).
+(e.g. `target/x86_64-unknown-none/release/narf-frame`).
 
 `BuildArgs` (shared by most subcommands) knobs:
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--arch` | `x86_64` | `x86_64` or `aarch64` |
-| `--release` | off | build with `--release` |
+| `--debug` | off | use a debug build instead of the release default |
 | `--package` | `narf-frame` | crate to build |
 | `--features` | *(empty)* | comma-separated cargo features |
 | `--display` | `none` | QEMU display (`none`, `gtk`, …) |
@@ -147,8 +155,7 @@ cargo xtask run --arch=x86_64
 This builds the kernel and launches `qemu-system-x86_64` with a q35
 machine, `-cpu max`, a NUMA/HMAT topology, serial on stdio, and the
 full virtio + legacy device set (see `qemu_args` in main.rs). Without
-`boot-init`, the kernel runs the async demo and halts. There's a 600s
-watchdog (`XTASK_QEMU_TIMEOUT_SECS`) that kills a hung boot.
+`boot-init`, the kernel runs the async demo and halts.
 
 ### 3.2 The interactive shell + login
 
@@ -214,7 +221,8 @@ cargo xtask run-interactive --arch=x86_64 \
 cargo xtask test --arch=x86_64
 ```
 
-`Cmd::Test` runs two phases:
+By default `Cmd::Test` runs the kernel suite and then the production-path
+postflight checks:
 
 1. **Kernel-test phase** — forces the `kernel-test` feature on, boots,
    and runs every in-kernel smoke. The runner calls `exit_kernel(0)`
@@ -224,6 +232,12 @@ cargo xtask test --arch=x86_64
    your Alpine rootfs.
 2. **Boot-smoke phase** — re-boots *without* `kernel-test` (real init
    flow) and scans serial output for panic markers + success markers.
+3. **Host interoperability phase** — checks the generated btrfs image with
+   the host tooling.
+
+Use `--subsystem net,ipc` to prefix-filter the in-kernel tests. Use
+`--kernel-tests-only` only for a focused iteration; it deliberately skips both
+postflight checks.
 
 ### 4.2 Real-init boot smoke
 
@@ -252,13 +266,14 @@ dispatch + `CR4.OSFXSR`.
 ### 4.4 Off-box network smokes
 
 ```sh
-cargo xtask net-smoke   --arch=x86_64   # guest TCP echo server, host round-trip
+cargo xtask net-smoke   --arch=x86_64   # TCP + UDP + guest DNS through SLIRP
 cargo xtask redis-smoke --arch=x86_64   # unmodified redis-server, host SET/GET
 ```
 
-Both force `boot-init` + `firmware-allow-unsigned` + `qemu-net` on, add
-a QEMU hostfwd, wait for the auto-spawned server, then open a real host
-TCP socket and round-trip. See §6 for how the forwarding works.
+Both force `boot-init` + `firmware-allow-unsigned` + `qemu-net` on.
+`net-smoke` verifies host-to-guest TCP and UDP plus a guest DNS lookup through
+the SLIRP resolver; `redis-smoke` opens a real host TCP socket and performs a
+SET/GET round-trip. See §6 for how the forwarding works.
 
 ---
 
@@ -494,7 +509,7 @@ them, run on a KVM host or use `XTASK_QEMU_ACCEL=tcg,thread=multi` with a
 CPU model that exposes x2APIC.
 
 **Boot hangs.** `run` kills a hung QEMU after `XTASK_QEMU_TIMEOUT_SECS`
-(default 600). For a live debug session, attach gdb with
+(default 2400 seconds). For a live debug session, attach gdb with
 `NARF_QEMU_EXTRA="-gdb tcp::1234 -S"`.
 
 ---
