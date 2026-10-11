@@ -732,6 +732,16 @@ impl Psp {
     pub fn media_firmware(&self) -> MediaFirmware {
         self.session.media_firmware
     }
+    pub(crate) fn dmub_tmr(&self) -> Result<core::ops::Range<u64>, Error> {
+        if self.kind != Kind::Navi22
+            || !self.session.tmr_ready
+            || self.session.media_firmware.dmcub.is_none()
+        {
+            return Err(Error::Invalid);
+        }
+        let tmr = self.session.tmr.as_ref().ok_or(Error::Invalid)?;
+        Ok(tmr.address()..tmr.address() + tmr.size())
+    }
     /// Wait for idle CP and RLC BOOTLOAD_COMPLETE after this session's accepted
     /// autoload. No GC writes, queue initialization or fw_loaded publication.
     pub async fn wait_gfx_boot_navi22(&mut self) -> Result<GfxBootStatus, Error> {

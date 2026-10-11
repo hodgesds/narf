@@ -19,6 +19,10 @@ static OWNER: Mutex<Option<boot::ColdBoot>> = Mutex::new(None);
 
 /// Firmware progress only, never an acceleration-ready indication.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "diagnostic snapshots must remain allocation-free"
+)]
 pub enum Status {
     Absent,
     Running,
@@ -131,6 +135,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         firmware
             .prepare_power(gpu, identity)
             .map_err(Error::Firmware)?;
+        firmware.prepare_dmub(gpu).map_err(Error::Firmware)?;
         let end = gpu
             .vram
             .base
@@ -168,6 +173,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         .map_err(Error::Firmware)?;
         prepared.prepare_memory_hubs().map_err(Error::Firmware)?;
         prepared.prepare_sdma().map_err(Error::Firmware)?;
+        prepared.prepare_dmub().map_err(Error::Firmware)?;
         *owner = Some(prepared);
         Ok(Some(affected))
     })

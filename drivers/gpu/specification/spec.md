@@ -385,6 +385,40 @@ timeout or corrupted data prevents replay. Ring/writeback memory is published
 before reset and retained on every started path; no destructor resets hardware.
 This is one boot execution test, not a general submission or acceleration API.
 
+### Navi 22 DCN3.0 DMUB startup
+
+`amdgpu_dmub_navi22::Prepared::new(image, vbios, psp_version)` parses the
+combined Navy Flounder DMCUB image and stages ordinary RAM before device I/O.
+`Image::prepare_dcn30` requires IP 3.0, cached-inbox firmware newer than 1.10.0,
+and no separate BSS/shared-state mapping. It uses the existing bounded layout
+builder; legacy/unsupported layouts fail before any hardware operation.
+`unsafe Dmub::new(gpu, pci_cap, pool, prepared)` bounds DCN3.0 base index 2 and
+NBIO, then reserves owned VRAM. It requires exclusive physical-GPU ownership,
+permanent mappings, and firmware/VBIOS belonging to this board.
+
+`quiesce().await` checks the DMUB enable fuse, requests `STOP_FW` when inherited
+firmware runs, and requires both matching GPINT acknowledgement and stop reply
+within 100 ms. Timeout leaves the attempt failed without forced recovery.
+It holds DCN3.0 `DMCUB_CNTL.SOFT_RESET` (bit 17) and `MMHUBBUB_SOFT_RESET`
+(dword `0x341`, bit 8), disables execution, and clears mailbox pointers/status.
+It never uses DCN31's separate CNTL2 reset or dword `0x342` hub reset.
+
+After PSP loads DMCUB, `unsafe start(&Psp).await` validates that execution is
+still reset, security reset is released, and both PSP instruction/stack windows
+are enabled and wholly inside the retained TMR after GPU-physical translation.
+Those secure registers are preserved verbatim. The caller retains the matching
+PSP/TMR for DMUB's lifetime, with trained VRAM, ready memory hubs and protected
+power. Nonsecure VBIOS/mailbox/trace/state windows use owned GPU VRAM addresses.
+The uploaded backing is flushed before publication; mailbox rings are 8 KiB
+each. Startup skips panel power sequencing, requires a fresh DAL/mailbox-ready
+status within 1 s, and reports `Status { firmware_version, boot_status, inbox,
+outbox }`. This does not yet provide runtime mailbox commands or native modeset.
+
+Every I/O batch checks live authority. State is `Prepared`, `Stopping`, `Reset`,
+`Starting`, `Running` or `Failed`. Cancellation preserves the in-progress state
+and prevents replay. Published storage stays quarantined on failure/drop;
+unpublished storage can return to its pool. No destructor changes hardware.
+
 ### Coordinated Navi 22 firmware bring-up
 
 `amdgpu_navi22_boot::Firmware::open(gpu, registry_cap)` validates every required
@@ -406,15 +440,19 @@ exclude reset/PM/other clients and retain permanent mappings for the session.
 
 `ColdBoot::run().await` executes optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
-optional board PowerPlay upload → graphics upload/autoload → RLC boot check →
+optional board PowerPlay upload → optional DMUB quiesce → graphics upload/autoload → RLC boot check →
 optional board calibration/protected GFX DPM setup → optional memory hubs →
-optional SDMA execution test.
+optional SDMA execution test → optional DMUB start.
 `ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing before run;
 it requires a prepared board power policy and performs no I/O. Production boot
 always calls it. Explicit firmware-only callers may omit this stage.
 `ColdBoot::prepare_sdma()` reserves the SDMA ring/writeback before run and
 requires prepared memory hubs. Production boot also calls it. `Stage::SdmaTest`
-identifies a failure in this final stage, with the SDMA error retained.
+identifies a failure in this stage, with the SDMA error retained.
+`Firmware::prepare_dmub(gpu)` prepares board-specific DMUB backing before
+construction; `ColdBoot::prepare_dmub()` reserves its VRAM after memory hubs
+are prepared. Production boot requires both calls. This places `DmubQuiesce`
+before any PSP DMCUB upload and `DmubStart` after memory-hub/SDMA startup.
 `Firmware::prepare_power(gpu, Identity)` prepares the board table before the
 session is constructed; production boot requires it, while explicit
 firmware-only callers may omit it. The bootstrap owner is dropped only
@@ -429,14 +467,14 @@ owned by hardware through the underlying owners' existing rules.
 
 Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
 power_status: Option<PowerStatus>, media_firmware: MediaFirmware,
-memory_aperture: Option<Aperture>, sdma: Option<Proof> }`;
+memory_aperture: Option<Aperture>, sdma: Option<Proof>, dmub: Option<Status> }`;
 `power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
 `AmdGpu::fw_loaded`. Display-aware memory/link DPM, OS thermal interrupts,
-general GPU mappings/queues, VCN/DMUB startup and real-card validation remain
+general GPU mappings/queues, VCN startup, DMUB runtime transport and real-card validation remain
 separate work.
 
 ### Navi 22 boot ownership and framebuffer handoff

@@ -149,6 +149,7 @@ pub mod amdgpu_dml_regs;
 pub mod amdgpu_dmub;
 pub mod amdgpu_dmub_boot;
 pub mod amdgpu_dmub_firmware;
+pub mod amdgpu_dmub_navi22;
 pub mod amdgpu_dp_training;
 pub mod amdgpu_dp_tunnel;
 pub mod amdgpu_dpm;

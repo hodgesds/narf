@@ -21,6 +21,7 @@ pub enum Error {
     Power(power::Error),
     MemoryHubs(crate::amdgpu_gmc_navi22::Error),
     Sdma(crate::amdgpu_sdma_navi22::Error),
+    Dmub(crate::amdgpu_dmub_navi22::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -29,6 +30,7 @@ pub struct Firmware {
     smc: smu::Firmware,
     graphics: gfx::Firmware,
     power: Option<power::Prepared>,
+    dmub: Option<crate::amdgpu_dmub_navi22::Prepared>,
 }
 impl Firmware {
     pub fn open(
@@ -41,7 +43,22 @@ impl Firmware {
             smc: smu::Firmware::open(gpu, registry).map_err(Error::Smu)?,
             graphics: gfx::Firmware::open(gpu, registry).map_err(Error::Graphics)?,
             power: None,
+            dmub: None,
         })
+    }
+    /// Prepare DCN3.0's nonsecure DMUB storage before starting any hardware.
+    pub fn prepare_dmub(&mut self, gpu: &AmdGpu) -> Result<(), Error> {
+        psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        let vbios = gpu.vbios.as_ref().ok_or(Error::Invalid)?;
+        self.dmub = Some(
+            crate::amdgpu_dmub_navi22::Prepared::new(
+                self.graphics.dmcub_bytes().map_err(Error::Graphics)?,
+                vbios.bytes(),
+                self.sos.image().map_err(Error::Sos)?.version(),
+            )
+            .map_err(Error::Dmub)?,
+        );
+        Ok(())
     }
     /// Prepare this board's power table before any device writes. Production
     /// platform boot always calls this; explicit firmware-only callers may
@@ -67,13 +84,15 @@ pub enum Stage {
     Smc,
     SmuVersions,
     PowerTable,
+    DmubQuiesce,
     Graphics,
     RlcBoot,
     PowerSetup,
     MemoryHubs,
     SdmaTest,
+    DmubStart,
 }
-const STAGES: [Stage; 12] = [
+const STAGES: [Stage; 14] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -81,11 +100,13 @@ const STAGES: [Stage; 12] = [
     Stage::Smc,
     Stage::SmuVersions,
     Stage::PowerTable,
+    Stage::DmubQuiesce,
     Stage::Graphics,
     Stage::RlcBoot,
     Stage::PowerSetup,
     Stage::MemoryHubs,
     Stage::SdmaTest,
+    Stage::DmubStart,
 ];
 /// Firmware/power observations, optional VMID0 and SDMA execution proof.
 /// This does not publish acceleration or initialize native display.
@@ -98,6 +119,7 @@ pub struct Report {
     pub media_firmware: psp::MediaFirmware,
     pub memory_aperture: Option<crate::amdgpu_gmc_navi22::Aperture>,
     pub sdma: Option<crate::amdgpu_sdma_navi22::Proof>,
+    pub dmub: Option<crate::amdgpu_dmub_navi22::Status>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -162,6 +184,7 @@ struct Hardware {
     power_status: Option<smu::PowerStatus>,
     gmc: Option<crate::amdgpu_gmc_navi22::Gmc>,
     sdma: Option<crate::amdgpu_sdma_navi22::Sdma>,
+    dmub: Option<crate::amdgpu_dmub_navi22::Dmub>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -281,6 +304,19 @@ impl Backend for Hardware {
                     );
                 }
             }
+            Stage::DmubQuiesce => {
+                if let Some(dmub) = self.dmub.as_mut() {
+                    dmub.quiesce().await.map_err(Error::Dmub)?;
+                }
+            }
+            Stage::DmubStart => {
+                if let Some(dmub) = self.dmub.as_mut() {
+                    // SAFETY: same exclusive GPU; trained VRAM, both hubs and
+                    // protected power are ready. PSP/TMR remain retained here.
+                    unsafe { dmub.start(self.psp.as_ref().ok_or(Error::Invalid)?).await }
+                        .map_err(Error::Dmub)?;
+                }
+            }
             Stage::SdmaTest => {
                 if let Some(sdma) = self.sdma.as_mut() {
                     // SAFETY: firmware, protected power and both hubs are ready.
@@ -309,6 +345,10 @@ impl Backend for Hardware {
             power: self.firmware.power.as_ref().map(power::Prepared::info),
             power_status: self.power_status,
             media_firmware: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
+            dmub: self
+                .dmub
+                .as_ref()
+                .and_then(crate::amdgpu_dmub_navi22::Dmub::status),
             sdma: self
                 .sdma
                 .as_ref()
@@ -385,6 +425,7 @@ impl ColdBoot {
                     power_status: None,
                     gmc: None,
                     sdma: None,
+                    dmub: None,
                 },
                 state: State::Prepared,
             },
@@ -427,6 +468,7 @@ impl ColdBoot {
                     power_status: None,
                     gmc: None,
                     sdma: None,
+                    dmub: None,
                 },
                 state: State::Prepared,
             },
@@ -478,6 +520,24 @@ impl ColdBoot {
         h.sdma = Some(
             unsafe { crate::amdgpu_sdma_navi22::Sdma::new(&h.gpu, h.authority, &h.pool) }
                 .map_err(Error::Sdma)?,
+        );
+        Ok(())
+    }
+    /// Reserve DCN3.0 DMUB backing. Firmware preparation and memory hubs must
+    /// precede this call; quiesce/start remain part of the ordered run.
+    pub fn prepare_dmub(&mut self) -> Result<(), Error> {
+        if self.sequence.state != State::Prepared || self.sequence.backend.dmub.is_some() {
+            return Err(Error::Busy);
+        }
+        let h = &mut self.sequence.backend;
+        if h.gmc.is_none() {
+            return Err(Error::Invalid);
+        }
+        let prepared = h.firmware.dmub.take().ok_or(Error::Invalid)?;
+        // SAFETY: the whole GPU/pool belongs to this owner; no I/O here.
+        h.dmub = Some(
+            unsafe { crate::amdgpu_dmub_navi22::Dmub::new(&h.gpu, h.authority, &h.pool, prepared) }
+                .map_err(Error::Dmub)?,
         );
         Ok(())
     }

@@ -93,6 +93,14 @@ fn optional(source: Source, result: Result<Vec<u8>, Error>) -> Result<Option<Vec
     }
 }
 impl Firmware {
+    pub(crate) fn dmcub_bytes(&self) -> Result<&[u8], Error> {
+        self.bytes
+            .iter()
+            .zip(Source::ORDER)
+            .find(|(_, source)| *source == Source::Dmcub)
+            .and_then(|(bytes, _)| bytes.as_deref())
+            .ok_or(Error::Invalid)
+    }
     pub fn open(
         gpu: &AmdGpu,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,

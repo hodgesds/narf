@@ -307,7 +307,7 @@ The required firmware set now includes VCN and DMCUB. PSP receives those after
 RLC autoload, and their reported entry addresses must lie inside the retained
 TMR. Missing/malformed media images prevent startup before device writes;
 partial upload failures preserve ownership and prevent replay. Firmware load
-does not yet start VCN queues or relocate/start DMUB.
+does not yet start VCN queues.
 Production cold boot now initializes GC/MMHUB VMID0 with a bounded VRAM-only
 test aperture after the protected power policy is active. Both hubs validate
 idle contexts and matching framebuffer geometry, use owned VRAM page tables
@@ -318,8 +318,14 @@ boot runs a translated WRITE/COPY/FENCE test after GMC setup and checks both
 read-pointer paths and all copied words. Reset and completion waits are bounded;
 fault/cancel paths retain the ring and prevent replay. Software models exercise
 packet decoding, register units, corruption, revocation and reset cancellation.
+DCN3.0 DMUB now has an owned lifecycle: stop inherited firmware before PSP
+upload, retain its authenticated instruction/stack windows, program owned
+VBIOS/mailbox/trace/state storage and await a fresh firmware-ready status.
+Navi22's reset registers are checked independently from Phoenix's. Unsupported
+firmware layouts, invalid secure-window bounds, stop/boot timeouts, revocation
+and cancellation refuse further startup without reclaiming published storage.
 These are software-tested foundations; training resume,
-VCN/DMUB startup, display-aware DPM and OS thermal interrupt handling,
+VCN startup, DMUB runtime transport, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production
 SDMA submissions/interrupts and DCN3.0
 modesetting remain open. See the

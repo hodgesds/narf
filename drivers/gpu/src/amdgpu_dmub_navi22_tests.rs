@@ -1,0 +1,382 @@
+use super::*;
+use alloc::{collections::BTreeMap, sync::Arc, vec};
+use core::{
+    future::Future,
+    sync::atomic::AtomicBool,
+    task::{Context, Waker},
+};
+use narf_kernel_test::{kernel_test_in, TestResult};
+const DCN: u64 = 0x10000;
+const NBIO: u64 = 0x30000;
+struct Fake {
+    regs: BTreeMap<u64, u32>,
+    writes: Vec<(u64, u32)>,
+    bytes: Vec<u32>,
+    dirty: bool,
+    stop: bool,
+    boot: bool,
+    released: Arc<AtomicBool>,
+    reject: Option<u32>,
+    revoke: Option<(u32, Cap<BusDeviceCap, Write>)>,
+}
+impl Io for Fake {
+    fn read(&mut self, address: u64) -> u32 {
+        *self.regs.get(&address).unwrap_or(&0)
+    }
+    fn write(&mut self, address: u64, value: u32) {
+        // Secure instruction/stack windows and security state belong to PSP.
+        for reg in [
+            0x1a5, 0x1a6, 0x1ad, 0x1ae, 0x1b5, 0x1b6, 0x1b7, 0x1b8, 0x1ce,
+        ] {
+            assert_ne!(address, DCN + reg * 4, "DMUB overwrote PSP secure window");
+        }
+        self.writes.push((address, value));
+        if self.reject.map(|reg| DCN + u64::from(reg) * 4) != Some(address) {
+            self.regs.insert(address, value);
+        }
+        if address == 0x7f000 {
+            self.dirty = false;
+        }
+        if address == DCN + 0x1f8 * 4 && value == 0x10020000 && self.stop {
+            self.regs.insert(address, 0x20000);
+            self.regs.insert(DCN + 0x1ea * 4, 0xdeaddead);
+        }
+        if address == DCN + 0x1f6 * 4 && value & 0x30000 == 0x10000 {
+            assert!(!self.dirty, "released with unflushed storage");
+            self.released.store(true, Ordering::SeqCst);
+            if self.boot {
+                self.regs.insert(DCN + 0x1e3 * 4, 3);
+            }
+        }
+        if let Some((reg, cap)) = self.revoke {
+            if address == DCN + u64::from(reg) * 4 {
+                cap.revoke();
+            }
+        }
+    }
+    fn upload(&mut self, _: MmioRegion, offset: u64, value: u32) {
+        self.dirty = true;
+        self.bytes[offset as usize / 4] = value;
+    }
+}
+fn image() -> Vec<u8> {
+    let mut b = fw::tests::combined(256, 0);
+    b[14] = 0;
+    let offset = b.len() - 256 - 64 + 12;
+    b[offset..offset + 4].copy_from_slice(&0x0202_2280u32.to_le_bytes());
+    b
+}
+fn fixture() -> (Pool, Engine<Fake>) {
+    let prepared = Prepared::new(&image(), &[0x55, 0xaa, 0x42, 0x43], 0x00110023).unwrap();
+    let bytes = prepared.layout.size() as u64;
+    let map = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0x90400000),
+        virt: 0,
+        len: bytes,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: fake owns I/O; this inert mapping is never dereferenced.
+    let pool = unsafe { Pool::from_owned_range(map, 0x8_0040_0000) }.unwrap();
+    let mut regs = BTreeMap::new();
+    for (reg, value) in [
+        (0x1f6, 0x10000),
+        (0x341, 0),
+        (0xca, 0x10000),
+        (0x475, 0x800),
+        (0x476, 0xaff),
+        (0x477, 0x100),
+        (0x1a5, 0x60000000),
+        (0x1ad, 0x800001ff),
+        (0x1b5, 0x01000000),
+        (0x1b6, 1),
+        (0x1a6, 0x61000000),
+        (0x1ae, 0x8109ffff),
+        (0x1b7, 0x01100000),
+        (0x1b8, 1),
+    ] {
+        regs.insert(DCN + reg * 4, value);
+    }
+    regs.insert(NBIO + 0x12d * 4, 0x7f000);
+    let engine = Engine {
+        io: Fake {
+            regs,
+            writes: Vec::new(),
+            bytes: vec![u32::MAX; bytes as usize / 4],
+            dirty: false,
+            stop: true,
+            boot: true,
+            released: Arc::new(AtomicBool::new(false)),
+            reject: None,
+            revoke: None,
+        },
+        authority: Cap::bootstrap(),
+        layout: Layout {
+            dcn: DCN,
+            nbio: NBIO,
+        },
+        memory: pool.reserve(bytes).unwrap(),
+        prepared,
+        state: State::Prepared,
+        status: None,
+    };
+    (pool, engine)
+}
+fn tmr() -> Range<u64> {
+    0x8_0100_0000..0x8_0200_0000
+}
+fn run<T>(f: impl Future<Output = T>) -> T {
+    narf_scheduler::block_on_spin(f)
+}
+fn dmub_navi22_preserves_psp_windows_and_starts_dcn30() -> TestResult {
+    let (pool, mut engine) = fixture();
+    let secure = engine.io.regs.clone();
+    run(engine.quiesce()).unwrap();
+    if engine.state != State::Reset
+        || engine.io.regs[&(DCN + 0x1f6 * 4)] != 0x20000
+        || engine.io.regs[&(DCN + 0x341 * 4)] != 0x100
+    {
+        return TestResult::Fail("wrong DCN30 reset registers");
+    }
+    let report = run(engine.start(tmr())).unwrap();
+    if report.firmware_version != 0x02022280
+        || report.boot_status != 3
+        || report.outbox != report.inbox + 8192
+        || engine.state != State::Running
+    {
+        return TestResult::Fail("DMUB boot report");
+    }
+    for (reg, value) in [
+        (0x1f6, 0x90000),
+        (0x341, 0),
+        (0x1d4, 0x64000000),
+        (0x1d5, 8192),
+        (0x1dc, 0x64002000),
+        (0x1dd, 8192),
+        (0x1d8, 0xa0000010),
+        (0x1f1, 0x20),
+        (0x1f2, 0x110023),
+        (0x1bd, report.inbox as u32),
+        (0x1be, 8),
+    ] {
+        if engine.io.regs.get(&(DCN + reg * 4)).copied() != Some(value) {
+            return TestResult::Fail("window/mailbox address units or reset encoding");
+        }
+    }
+    for reg in [0x1a5, 0x1a6, 0x1ad, 0x1ae, 0x1b5, 0x1b6, 0x1b7, 0x1b8] {
+        if engine.io.regs.get(&(DCN + reg * 4)) != secure.get(&(DCN + reg * 4)) {
+            return TestResult::Fail("secure window changed");
+        }
+    }
+    let bios = engine.prepared.layout.region(fw::Window::Vbios);
+    if engine.io.bytes[bios.offset as usize / 4] != 0x4342aa55 {
+        return TestResult::Fail("board VBIOS not staged");
+    }
+    if engine
+        .io
+        .writes
+        .iter()
+        .any(|(reg, _)| *reg == DCN + 0x200 * 4 || *reg == DCN + 0x342 * 4)
+    {
+        return TestResult::Fail("Phoenix reset used on Navi22");
+    }
+    let writes = engine.io.writes.len();
+    if run(engine.start(tmr())) != Err(Error::Busy)
+        || run(engine.quiesce()) != Err(Error::Busy)
+        || engine.io.writes.len() != writes
+    {
+        return TestResult::Fail("DMUB replay");
+    }
+    drop(engine);
+    if pool.available() != 0 {
+        return TestResult::Fail("running DMUB storage recycled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_preserves_psp_windows_and_starts_dcn30
+);
+fn dmub_navi22_rejects_untrusted_windows_before_upload() -> TestResult {
+    for case in 0..6 {
+        let (pool, mut engine) = fixture();
+        let bytes = engine.memory.size();
+        run(engine.quiesce()).unwrap();
+        match case {
+            0 => {
+                engine.io.regs.insert(DCN + 0x1b6 * 4, 8);
+            }
+            1 => {
+                engine.io.regs.insert(DCN + 0x1ae * 4, 0x0109ffff);
+            }
+            2 => {
+                engine.io.regs.insert(DCN + 0x1ad * 4, 0x9fffffff);
+            }
+            3 => {
+                engine.io.regs.insert(DCN + 0x475 * 4, u32::MAX);
+            }
+            4 => {
+                engine.io.regs.insert(DCN + 0x1ce * 4, 1 << 16);
+            }
+            _ => {
+                engine.authority.revoke();
+            }
+        }
+        let writes = engine.io.writes.len();
+        if run(engine.start(tmr())).is_ok()
+            || engine.io.bytes[0] != u32::MAX
+            || engine.io.writes.len() != writes
+            || engine.io.released.load(Ordering::SeqCst)
+        {
+            return TestResult::Fail("untrusted DMUB start touched memory/windows");
+        }
+        drop(engine);
+        if pool.available() != bytes {
+            return TestResult::Fail("unpublished storage leaked");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_rejects_untrusted_windows_before_upload
+);
+fn dmub_navi22_stop_boot_timeout_readback_and_revocation() -> TestResult {
+    for case in 0..4 {
+        let (pool, mut engine) = fixture();
+        if case == 0 {
+            engine.io.stop = false;
+            if run(engine.quiesce()) != Err(Error::StopTimeout) || engine.io.writes.len() != 1 {
+                return TestResult::Fail("unacknowledged STOP forced reset");
+            }
+        } else {
+            run(engine.quiesce()).unwrap();
+            let error = match case {
+                1 => {
+                    engine.io.boot = false;
+                    Error::BootTimeout
+                }
+                2 => {
+                    engine.io.reject = Some(0x1bd);
+                    Error::Readback
+                }
+                _ => {
+                    engine.io.revoke = Some((0x1f6, engine.authority));
+                    Error::Revoked
+                }
+            };
+            if run(engine.start(tmr())) != Err(error) || engine.status.is_some() {
+                return TestResult::Fail("bad DMUB start accepted");
+            }
+        }
+        if engine.state != State::Failed {
+            return TestResult::Fail("failed DMUB state");
+        }
+        let size = engine.memory.size();
+        drop(engine);
+        if pool.available() != if case == 0 { size } else { 0 } {
+            return TestResult::Fail("wrong DMUB storage lifetime after fault");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_stop_boot_timeout_readback_and_revocation
+);
+fn dmub_navi22_cancellation_preserves_stage_and_storage() -> TestResult {
+    for boot in [false, true] {
+        let (pool, mut engine) = fixture();
+        let bytes = engine.memory.size();
+        if boot {
+            run(engine.quiesce()).unwrap();
+            engine.io.boot = false;
+            let released = engine.io.released.clone();
+            {
+                let mut future = core::pin::pin!(engine.start(tmr()));
+                for _ in 0..1024 {
+                    if future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                    {
+                        return TestResult::Fail("stalled start completed");
+                    }
+                    if released.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
+            if !released.load(Ordering::SeqCst)
+                || engine.state != State::Starting
+                || run(engine.start(tmr())) != Err(Error::Busy)
+            {
+                return TestResult::Fail("cancelled boot replayed");
+            }
+        } else {
+            engine.io.stop = false;
+            {
+                let mut future = core::pin::pin!(engine.quiesce());
+                if future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+                {
+                    return TestResult::Fail("stalled stop completed");
+                }
+            }
+            if engine.state != State::Stopping || run(engine.quiesce()) != Err(Error::Busy) {
+                return TestResult::Fail("cancelled stop replayed");
+            }
+        }
+        drop(engine);
+        if pool.available() != if boot { 0 } else { bytes } {
+            return TestResult::Fail("cancelled DMUB backing lifetime");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_cancellation_preserves_stage_and_storage
+);
+fn dmub_navi22_preparation_and_layout_are_generation_specific() -> TestResult {
+    let bytes = image();
+    for case in 0..4 {
+        let mut bad = bytes.clone();
+        match case {
+            0 => bad[14] = 1,
+            1 => {
+                let o = bad.len() - 256 - 64 + 12;
+                bad[o..o + 4].copy_from_slice(&0x010a0000u32.to_le_bytes());
+            }
+            2 => {
+                let o = bad.len() - 256 - 64 + 20;
+                bad[o..o + 4].copy_from_slice(&4096u32.to_le_bytes());
+            }
+            _ => bad.truncate(bad.len() - 1),
+        }
+        if Prepared::new(&bad, &[0x55, 0xaa], 0).is_ok() {
+            return TestResult::Fail("unsupported DMUB layout accepted");
+        }
+    }
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    let mut dcn = gpu.ip_blocks[0];
+    dcn.hw_id = ip::HW_ID_DCN;
+    dcn.major = 3;
+    dcn.minor = 0;
+    dcn.revision = 0;
+    dcn.base_addrs[2] = 0x4000;
+    gpu.ip_blocks.push(dcn);
+    if Layout::resolve(&gpu).unwrap().dcn != DCN {
+        return TestResult::Fail("wrong DCN bank index");
+    }
+    gpu.ip_blocks.last_mut().unwrap().minor = 1;
+    if Layout::resolve(&gpu).is_ok() {
+        return TestResult::Fail("DCN31 accepted as DCN30");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi22",
+    dmub_navi22_preparation_and_layout_are_generation_specific
+);

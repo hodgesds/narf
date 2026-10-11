@@ -22,6 +22,7 @@ fn report() -> Report {
         media_firmware: psp::MediaFirmware::default(),
         memory_aperture: None,
         sdma: None,
+        dmub: None,
     }
 }
 struct Fake {
@@ -248,6 +249,7 @@ fn firmware() -> Firmware {
         smc: smu::tests::firmware(),
         graphics: gfx::tests::fixture(),
         power: None,
+        dmub: None,
     }
 }
 fn navi22_boot_outlives_the_controller_lock() -> TestResult {
