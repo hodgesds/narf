@@ -46,6 +46,8 @@ mod tests;
 pub use client::{allocate_singleton_ring, FbClient};
 pub use cmd_ring::{DrawCmd, DrawRing, RING_DEPTH, TAG_BLIT, TAG_FILL, TAG_FLUSH};
 pub use drain_task::{drain_once, stats as drain_stats, DrainTask};
+
+mod amdgpu_boot;
 pub use registry::{
     connect as registry_connect, disconnect as registry_disconnect,
     disconnect_all_for_pid as registry_disconnect_all_for_pid, ConnectError,
@@ -552,6 +554,9 @@ impl FbScanout for GenericScanout {
 /// (no other path mutates the slot), the resulting `&'static`
 /// stays valid until clear_test_scanout runs.
 pub fn select_active() -> Option<&'static dyn FbScanout> {
+    if amdgpu_boot::paused() {
+        return None;
+    }
     {
         let g = TEST_SCANOUT.lock();
         if let Some(s) = g.as_ref() {
@@ -760,6 +765,9 @@ impl FbWriter {
 
     /// Validate cap is still live; returns `Err` if revoked.
     fn check_live(&self) -> Result<(), FbWriteError> {
+        if amdgpu_boot::paused() {
+            return Err(FbWriteError::NoActiveScanout);
+        }
         self.cap
             .check_live()
             .map_err(|_| FbWriteError::NoActiveScanout)
@@ -942,6 +950,9 @@ impl PumpWriterCell {
 /// Reads the boot-cached writer and runs one drain pass; cheap
 /// on empty rings.
 fn fb_drain_pump() {
+    if amdgpu_boot::paused() {
+        return;
+    }
     // SAFETY: PUMP_WRITER is initialised once at boot before any
     // user task calls sys_sleep (the FB-drain initcall runs in
     // Stage::Late which precedes user-task spawn). After that
@@ -983,6 +994,9 @@ fn init_pump_writer(writer: FbWriter) {
 /// active. Used by the cursor sleep-pump tick to avoid minting a
 /// fresh `Cap::bootstrap()` per call.
 pub(crate) fn pump_writer_ref() -> Option<&'static FbWriter> {
+    if amdgpu_boot::paused() {
+        return None;
+    }
     // SAFETY: PUMP_WRITER is initialised once at boot; subsequent
     // accesses are read-only. The returned reference is valid for
     // the lifetime of the static.
@@ -1027,6 +1041,18 @@ impl FbWriter {
 /// an mmap'd DrawRing; only the page-source differs.
 pub fn register_initcalls() {
     use narf_init::{InitResult, Stage};
+    // Register the actual handoff during Subsys so it follows the firmware
+    // scans, console installation and other statically registered Late calls.
+    // It still runs before executor polling and all userspace framebuffer maps.
+    narf_init::register(Stage::Subsys, "fb-amdgpu-handoff-register", || {
+        narf_init::register_with_budget(
+            Stage::Late,
+            "amdgpu-navi22-firmware",
+            amdgpu_boot::start,
+            30_000,
+        );
+        InitResult::Ok
+    });
     // Install the userspace FB syscall vtable now so a userspace
     // process can SYS_FB_CONNECT as soon as it runs. (Stage::Subsys
     // runs before Stage::Late, but install_core_syscalls also

@@ -39,3 +39,12 @@ GPU drivers for backends, and on `narf-capabilities`, `narf-ipc`,
 device filesystem, and the userspace draw path. A `kernel-test`
 feature lets it suppress live status-panel repaints while a test
 installs a synthetic scanout.
+
+For Navi22, a final synchronous boot initcall pauses the early console and
+cached writers while the GPU firmware owner trains GDDR6 and boots firmware.
+It is registered during Subsys so firmware scans and ordinary Late setup run
+first; it completes before executor polling or userspace framebuffer mappings.
+Preflight failures restore access. Once hardware startup begins, a failure on
+the primary GPU leaves framebuffer access unavailable pending recovery; serial
+logging continues. This boot-only handoff cannot revoke runtime mmap writers.
+See the [GPU handoff contract](../drivers/gpu/specification/spec.md#navi-22-boot-ownership-and-framebuffer-handoff).

@@ -115,6 +115,9 @@ fn change_signature() -> u64 {
 /// the most useful diagnostic signal for input bring-up (kbd /
 /// mouse / pump / report / key-push counts).
 pub fn paint(fb: &FbWriter) {
+    if fb.check_live().is_err() {
+        return;
+    }
     use core::sync::atomic::Ordering;
     let w = fb.width();
     let h = fb.height();

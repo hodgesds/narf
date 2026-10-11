@@ -283,9 +283,48 @@ stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
-`AmdGpu::fw_loaded`. Automatic platform invocation, VRAM ownership handoff,
-board power setup, GMC/queues, video/display firmware and real-card
-validation remain separate work.
+`AmdGpu::fw_loaded`. Board power setup, GMC/queues, video/display firmware and
+real-card validation remain separate work.
+
+### Navi 22 boot ownership and framebuffer handoff
+
+`amdgpu_navi22_platform::prepare(physical_boot_framebuffer)` is an unsafe,
+single-CPU boot-only entry. It requires a posted physical GPU, permanent probe
+mappings, no NARF VRAM allocations/queues, and stopped CPU framebuffer writers.
+It validates every required firmware file before reading the live VRAM plan,
+constructs the exclusive pool and optional training owner, and retains the
+complete `ColdBoot` in a static async mutex. A GOP range wholly outside this
+GPU's aperture denotes a secondary GPU; partial overlap, overflow and invalid
+geometry are refused. Preparation errors issue no device writes and preserve
+controller access. When training is requested, live firmware/DMUB reservations
+in the overwritten 32 MiB prefix also refuse startup; allocator exclusions
+alone cannot protect them. Inventoried display/cursor readers may remain live
+and can show transient training pixels. Success permanently claims MMIO ownership before releasing
+the controller spinlock. `with_controller` and `with_controller_mut` then
+return `None`; DRM identity/memory queries use a separate immutable snapshot.
+
+`unsafe amdgpu_navi22_platform::run().await` requires CPU writers stopped and
+runs the retained session once. The owner survives return or cancellation;
+there is no automatic retry, release or reset. `status()` returns `Absent`,
+`Running` while locked, or `Retained(Diagnostics)` with the session state,
+training state and last raw GC boot-status sample. Failure identifies its exact
+stage and underlying error. Firmware readiness never advertises acceleration or a native mode.
+Navi22 is excluded from the DCN314 USB-C startup path. Its suspend handler
+returns `NotImplemented` before changing PM state or issuing commands; discrete
+GPUs cannot resolve the legacy APU SMU mailbox through `mp1_mailbox_base`.
+
+`narf-fb` registers `amdgpu-navi22-firmware` during Subsys, appending it after
+the statically registered Late firmware scans and framebuffer initialization.
+This synchronous boot call runs before executor polling and userspace mmap.
+It pauses cached writers, scanout/fbdev discovery, drain/cursor/status pumps,
+and takes the early console under its lock to drain its current writer.
+`block_on_spin` then polls the timer/self-waking firmware future with no IRQ
+spinlock held. Preparation failure resumes the console. After a started run,
+success restores access; failure on the primary GPU leaves framebuffer access
+quarantined and serial logging available. Failure on a secondary GPU restores
+the unrelated boot framebuffer. This is **not** a runtime pause mechanism and
+does not revoke existing userspace mappings. Training resume/reset support is
+required before exposing such a mechanism.
 
 `unsafe ColdBoot::new_with_training(..., exchange)` additionally owns a
 `amdgpu_gddr6::Trainer` and runs it before constructing the SOS owner. Exchange
@@ -318,7 +357,8 @@ Training state is `Prepared`, `Saving`, `Training`, `Restoring`, `SavingResult`,
 retains the active state, preimage and cache outside the future. After failure
 or cancellation the owner must remain retained and VRAM clients stopped until
 independent reset/recovery; drop never restores VRAM or resets the GPU. No
-short-training/resume command or automatic framebuffer pause is exposed yet.
+short-training/resume command is exposed yet. The boot-only framebuffer handoff
+above supplies the initial CPU-writer exclusion.
 
 ### AMD platform VBIOS
 

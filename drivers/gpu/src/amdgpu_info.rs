@@ -104,7 +104,7 @@ pub struct Snapshot {
 }
 
 fn snapshot() -> Option<Snapshot> {
-    crate::amdgpu::with_controller(Snapshot::from_gpu)
+    crate::amdgpu::info_snapshot()
 }
 
 impl Snapshot {

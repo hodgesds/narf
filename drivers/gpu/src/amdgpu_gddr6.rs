@@ -331,8 +331,11 @@ impl Trainer {
     /// reset/power controls and permanent mappings. Exchange buffers must come
     /// from this GPU's current boot Plan and remain permanently excluded from
     /// every allocator. Stop every other GPU/CPU VRAM writer (including the
-    /// framebuffer console/pumps) before run; no client may use the bottom
-    /// 32 MiB until successful completion. This is a cold boot, not resume or
+    /// framebuffer console/pumps) before run; no software client may read the
+    /// bottom 32 MiB until successful completion. Inventoried scanout/cursor
+    /// readers may remain active but can display transient training pixels.
+    /// Live firmware code/data must not overlap this prefix. This follows the
+    /// PSP11 cold-training-before-display-init ordering; it is not resume or
     /// arbitrary retraining. On failure/cancellation retain this owner and
     /// require independent reset/recovery before handing memory back to clients.
     /// Drop never restores memory, resets hardware or retries a command.

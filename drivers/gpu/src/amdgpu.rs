@@ -1764,6 +1764,11 @@ impl AmdGpu {
     /// window 0, so the mailbox writes went to the wrong window even once the
     /// offsets were corrected.
     pub fn mp1_mailbox_base(&self) -> Option<u32> {
+        // Discrete SMU11 has its own message map and owner. Never hand its
+        // register window to the APU PowerUp/PowerDownGfx helpers.
+        if !self.is_apu() {
+            return None;
+        }
         self.ip_block_base_idx(amdgpu_discovery::HW_ID_MP1, 0, 1)
     }
 
@@ -2175,6 +2180,9 @@ unsafe fn read_vbios_version_from_rom(
 // ── Driver-match registration ───────────────────────────────────────
 
 static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> = IrqSafeSpinLock::new(None);
+// Set under CONTROLLER before the boot owner leaves that lock. It stays set
+// through success, failure and cancellation: only that owner may access MMIO.
+static NAVI22_OWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static PCI_AUTHORITY: IrqSafeSpinLock<Option<Cap<BusDeviceCap, Write>>> =
     IrqSafeSpinLock::new(None);
 pub(crate) fn pci_authority() -> Option<Cap<BusDeviceCap, Write>> {
@@ -2305,6 +2313,11 @@ static SAVED_MODE: narf_lib::sync::IrqSafeSpinLock<Option<Mode>> =
 static PM_SUSPENDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn amdgpu_suspend_handler() -> Result<(), narf_power::device_pm::DeviceSuspendError> {
+    if is_navi22() {
+        // No Navi22 TMR teardown, training-cache restore or SMU11 resume yet.
+        // Refuse before modifying PM state or sending an APU mailbox command.
+        return Err(narf_power::device_pm::DeviceSuspendError::NotImplemented);
+    }
     if !is_probed() {
         return Ok(());
     }
@@ -2435,12 +2448,99 @@ pub fn is_probed() -> bool {
     CONTROLLER.lock().is_some()
 }
 
+pub(crate) fn is_navi22() -> bool {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .is_some_and(|gpu| gpu.chip.did == NAVI22)
+}
+
+/// Synchronous preparation under the controller lock, followed by permanent
+/// transfer of MMIO ownership on success. Errors leave the controller usable.
+pub(crate) fn claim_navi22<R, E>(
+    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
+) -> Option<Result<R, E>> {
+    let controller = CONTROLLER.lock();
+    let gpu = controller.as_ref()?;
+    if gpu.chip.did != NAVI22 || NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let result = prepare(gpu);
+    if result.is_ok() {
+        NAVI22_OWNED.store(true, core::sync::atomic::Ordering::Release);
+    }
+    Some(result)
+}
+
+/// Immutable discovery data only; deliberately does not expose GPU registers.
+pub(crate) fn info_snapshot() -> Option<crate::amdgpu_info::Snapshot> {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .map(crate::amdgpu_info::Snapshot::from_gpu)
+}
+
+/// Returns None after Navi22's boot owner claims the hardware. Its immutable
+/// DRM discovery snapshot remains available independently of this MMIO access.
 pub fn with_controller<R>(f: impl FnOnce(&AmdGpu) -> R) -> Option<R> {
-    CONTROLLER.lock().as_ref().map(f)
+    let controller = CONTROLLER.lock();
+    if NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    controller.as_ref().map(f)
 }
 
 /// `&mut` variant of `with_controller`. Used by `set_mode` and other
 /// state-mutating bring-up paths.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut AmdGpu) -> R) -> Option<R> {
-    CONTROLLER.lock().as_mut().map(f)
+    let mut controller = CONTROLLER.lock();
+    if NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    controller.as_mut().map(f)
+}
+
+#[cfg(feature = "kernel-test")]
+mod navi22_ownership_tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi22_boot_claim_excludes_legacy_access_and_suspend() -> TestResult {
+        if is_probed() {
+            return TestResult::Skip("real controller owns the global slot");
+        }
+        // Fake metadata uses null MMIO: any accidental legacy suspend access
+        // faults rather than making this test appear to pass through zeros.
+        let gpu = crate::amdgpu_navi22_boot::tests::gpu();
+        let mailbox_blocked = gpu.mp1_mailbox_base().is_none();
+        *CONTROLLER.lock() = Some(gpu);
+        let prior_pm = PM_SUSPENDED.swap(false, Ordering::AcqRel);
+        let failed_prepare: Option<Result<(), ()>> = claim_navi22(|_| Err(()));
+        let failure_released =
+            failed_prepare == Some(Err(())) && with_controller(|_| true) == Some(true);
+        let pm_refused = amdgpu_suspend_handler()
+            == Err(narf_power::device_pm::DeviceSuspendError::NotImplemented)
+            && !PM_SUSPENDED.load(Ordering::Acquire);
+        let claimed: Option<Result<(), ()>> = claim_navi22(|_| Ok(()));
+        let exclusive = claimed == Some(Ok(()))
+            && with_controller(|_| true).is_none()
+            && with_controller_mut(|_| true).is_none()
+            && claim_navi22(|_| Ok::<_, ()>(())).is_none()
+            && info_snapshot().is_some_and(|info| info.did == u32::from(NAVI22))
+            && is_probed()
+            && amdgpu_suspend_handler()
+                == Err(narf_power::device_pm::DeviceSuspendError::NotImplemented);
+        *CONTROLLER.lock() = None;
+        NAVI22_OWNED.store(false, Ordering::Release);
+        PM_SUSPENDED.store(prior_pm, Ordering::Release);
+        if !(mailbox_blocked && failure_released && pm_refused && exclusive) {
+            return TestResult::Fail("Navi22 owner/PM exclusion or failed-preflight rollback");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi22",
+        navi22_boot_claim_excludes_legacy_access_and_suspend
+    );
 }

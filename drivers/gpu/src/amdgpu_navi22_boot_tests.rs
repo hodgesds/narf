@@ -186,7 +186,7 @@ kernel_test_in!(
     navi22_boot_cancel_at_each_stage_retains_session_and_ownership
 );
 
-fn gpu() -> AmdGpu {
+pub(crate) fn gpu() -> AmdGpu {
     use crate::amdgpu_discovery as d;
     let map = narf_bus::MmioRegion {
         phys: narf_memory::PhysAddr::new(0),

@@ -283,8 +283,13 @@ ROM BAR; acquisition failures are identified on the console.
 The Navi22 pool plan now inventories all six DCN3.0 pipes and rejects inherited
 active GFXHUB/MMHUB contexts. The cold-boot session owns its register metadata
 and can run after releasing the controller spinlock, including in a spawned task.
-These are software-tested foundations; automatic platform wiring and framebuffer
-ownership handoff, training resume,
+The final boot framebuffer initcall now prepares and runs the firmware sequence
+after firmware discovery, before executor/userspace startup. It pauses console
+and pump writes, retains the entire owner, and quarantines the primary
+framebuffer after a started failure. A successful claim excludes legacy MMIO
+access while retaining DRM identity queries. Navi22 refuses the APU suspend
+path until a discrete resume sequence exists.
+These are software-tested foundations; training resume,
 video/display firmware, board power/clock setup, hardware boot, GMC/GFX10
 queue initialization, SDMA startup and DCN3.0 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
