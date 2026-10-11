@@ -97,8 +97,25 @@ struct Fake {
     reject: Option<(u32, u32)>,
     writes: Vec<(u32, u32)>,
     reads: usize,
+    staged: Vec<u8>,
+    stage_error: Option<Error>,
+    revoke_on: Option<(u32, Cap<BusDeviceCap, Write>)>,
 }
 impl Io for Fake {
+    fn stage_power(
+        &mut self,
+        _memory: &crate::amdgpu_vram::Reservation,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        if bytes.len() != crate::amdgpu_power_navi22::SMC_BYTES {
+            return Err(Error::Invalid);
+        }
+        if let Some(error) = self.stage_error {
+            return Err(error);
+        }
+        self.staged.extend_from_slice(bytes);
+        Ok(())
+    }
     fn read(&mut self, register: u32) -> u32 {
         self.reads += 1;
         match register {
@@ -114,7 +131,16 @@ impl Io for Fake {
             ARGUMENT => self.argument = value,
             MESSAGE => {
                 assert_eq!(self.response, 0);
-                assert_eq!(self.argument, 0);
+                if matches!(value, SET_DRIVER_HIGH | SET_DRIVER_LOW | TRANSFER_TABLE) {
+                    assert_eq!(self.staged.len(), crate::amdgpu_power_navi22::SMC_BYTES);
+                } else {
+                    assert_eq!(self.argument, 0);
+                }
+                if let Some((message, cap)) = self.revoke_on {
+                    if message == value {
+                        cap.revoke();
+                    }
+                }
                 if self.stall != Some(value) {
                     self.response = self
                         .reject
@@ -123,6 +149,7 @@ impl Io for Fake {
                     self.argument = match value {
                         GET_INTERFACE => self.interface,
                         GET_VERSION => self.firmware,
+                        SET_DRIVER_HIGH | SET_DRIVER_LOW | TRANSFER_TABLE => self.argument,
                         _ => panic!("unexpected SMU command"),
                     };
                 }
@@ -142,9 +169,13 @@ fn engine() -> Engine<Fake> {
             reject: None,
             writes: Vec::new(),
             reads: 0,
+            staged: Vec::new(),
+            stage_error: None,
+            revoke_on: None,
         },
         authority: Cap::bootstrap(),
         state: State::Prepared,
+        power_memory: None,
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
@@ -376,4 +407,191 @@ fn smu_navi22_exact_ip_selection_and_revoked_firmware_open() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu-navi22",
     smu_navi22_exact_ip_selection_and_revoked_firmware_open
+);
+
+fn power_pool() -> crate::amdgpu_vram::Pool {
+    // SAFETY: fake IO only; address bookkeeping never dereferences this map.
+    unsafe {
+        crate::amdgpu_vram::Pool::from_owned_range(
+            narf_bus::MmioRegion {
+                phys: narf_memory::PhysAddr::new(0x9000_0000),
+                virt: 0,
+                len: 4096,
+                kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+            },
+            0x12_3456_0000,
+        )
+        .unwrap()
+    }
+}
+fn ready_engine() -> Engine<Fake> {
+    let mut engine = engine();
+    run(engine.verify()).unwrap();
+    engine.io.writes.clear();
+    engine
+}
+fn smu_navi22_power_upload_orders_addresses_and_retains_buffer() -> TestResult {
+    let mut engine = ready_engine();
+    let pool = power_pool();
+    let table = vec![0xa5; crate::amdgpu_power_navi22::SMC_BYTES];
+    if run(engine.upload(&table, &pool)) != Ok(())
+        || engine.state != State::PowerTableReady
+        || engine.io.staged != table
+        || engine.io.writes
+            != [
+                (RESPONSE, 0),
+                (ARGUMENT, 0x12),
+                (MESSAGE, SET_DRIVER_HIGH),
+                (RESPONSE, 0),
+                (ARGUMENT, 0x3456_0000),
+                (MESSAGE, SET_DRIVER_LOW),
+                (RESPONSE, 0),
+                (ARGUMENT, 0),
+                (MESSAGE, TRANSFER_TABLE),
+            ]
+        || engine
+            .power_memory
+            .as_ref()
+            .is_none_or(|memory| memory.reusable_for_test())
+        || run(engine.upload(&table, &pool)) != Err(Error::Busy)
+    {
+        return TestResult::Fail("SMU table publication/address/command ordering");
+    }
+    drop(engine);
+    if pool.reserve(4096).is_ok() {
+        return TestResult::Fail("SMU's retained driver address was recycled");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_power_upload_orders_addresses_and_retains_buffer
+);
+
+fn smu_navi22_power_upload_faults_quarantine_every_published_address() -> TestResult {
+    let table = vec![0; crate::amdgpu_power_navi22::SMC_BYTES];
+    for (index, command) in [SET_DRIVER_HIGH, SET_DRIVER_LOW, TRANSFER_TABLE]
+        .into_iter()
+        .enumerate()
+    {
+        for cancel in [false, true] {
+            let mut engine = ready_engine();
+            let pool = power_pool();
+            if cancel {
+                engine.io.stall = Some(command);
+                let mut future = core::pin::pin!(engine.upload(&table, &pool));
+                let mut context = Context::from_waker(Waker::noop());
+                if future.as_mut().poll(&mut context).is_ready() {
+                    return TestResult::Fail("stalled SMU command completed");
+                }
+            } else {
+                engine.io.reject = Some((command, 0xfe));
+                if run(engine.upload(&table, &pool)) != Err(Error::Rejected(0xfe)) {
+                    return TestResult::Fail("SMU table rejection ignored");
+                }
+            }
+            let writes = engine.io.writes.len();
+            if writes != (index + 1) * 3
+                || engine.power_memory.is_none()
+                || run(engine.upload(&table, &pool)) != Err(Error::Busy)
+                || engine.io.writes.len() != writes
+            {
+                return TestResult::Fail("cancelled/failed SMU upload replayed");
+            }
+            drop(engine);
+            if pool.reserve(4096).is_ok() {
+                return TestResult::Fail("failed SMU address publication reused");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_power_upload_faults_quarantine_every_published_address
+);
+
+fn smu_navi22_power_upload_policy_and_revocation_precede_commands() -> TestResult {
+    let table = vec![0; crate::amdgpu_power_navi22::SMC_BYTES];
+    for revoked in [false, true] {
+        let mut engine = ready_engine();
+        let pool = power_pool();
+        let error = if revoked {
+            engine.authority.revoke();
+            Error::Revoked
+        } else {
+            engine.io.stage_error = Some(Error::PowerPolicy(1));
+            Error::PowerPolicy(1)
+        };
+        if run(engine.upload(&table, &pool)) != Err(error)
+            || !engine.io.writes.is_empty()
+            || engine.power_memory.is_some()
+            || pool.reserve(4096).is_err()
+        {
+            return TestResult::Fail("policy/revocation published an SMU address");
+        }
+    }
+    let mut engine = ready_engine();
+    let pool = power_pool();
+    engine.io.revoke_on = Some((SET_DRIVER_HIGH, engine.authority));
+    if run(engine.upload(&table, &pool)) != Err(Error::Revoked) || engine.io.writes.len() != 3 {
+        return TestResult::Fail("revoked transfer continued after first address command");
+    }
+    drop(engine);
+    if pool.reserve(4096).is_ok() {
+        return TestResult::Fail("revoked transfer buffer freed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_power_upload_policy_and_revocation_precede_commands
+);
+
+fn smu_navi22_scpm_runtime_policy_fails_closed() -> TestResult {
+    let mut db = vec![0u8; 64];
+    let read = |bytes: &[u8]| {
+        power_policy(|offset, out| {
+            out.copy_from_slice(
+                bytes
+                    .get(offset..offset + out.len())
+                    .ok_or(crate::amdgpu_gddr6::Error::Invalid)?,
+            );
+            Ok(())
+        })
+    };
+    if read(&db) != Ok(()) {
+        return TestResult::Fail("absent runtime DB refused");
+    }
+    db[..8].copy_from_slice(&[0xd5, 0xe, 0, 1, 1, 0, 0, 0]);
+    db[8..16].copy_from_slice(&[6, 0, 0, 0, 32, 0, 4, 0]);
+    for policy in [0, 1, 2, u32::MAX] {
+        put(&mut db, 32, policy);
+        let want = if policy == 0 {
+            Ok(())
+        } else {
+            Err(Error::PowerPolicy(policy))
+        };
+        if read(&db) != want {
+            return TestResult::Fail("PSP power ownership ignored");
+        }
+    }
+    for (offset, value) in [(2, 1), (4, 64), (12, 8), (12, 33), (14, 3)] {
+        let mut bad = db.clone();
+        bad[offset] = value;
+        if read(&bad) != Err(Error::Invalid) {
+            return TestResult::Fail("malformed runtime policy accepted");
+        }
+    }
+    db[4] = 2;
+    let entry = db[8..16].to_vec();
+    db[16..24].copy_from_slice(&entry);
+    if read(&db) != Err(Error::Invalid) {
+        return TestResult::Fail("duplicate SCPM entries accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_scpm_runtime_policy_fails_closed
 );

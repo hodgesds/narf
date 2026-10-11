@@ -1,7 +1,8 @@
 //! Navi22 SMC preparation and a cold-start SMU11 version handshake. Linux
 //! `smu_v11_0.c`, `sienna_cichlid_ppt.c`, `smu_v11_0_7_ppsmc.h` and
 //! `mp_11_0_offset.h`: MP1 index 0, message=66, argument=82, response=90.
-//! No voltage, clock, fan or PowerPlay programming is exposed here.
+//! Board tables use a retained VRAM transfer buffer; no DPM feature enable,
+//! calibration, voltage/clock override or fan programming is exposed here.
 use crate::{amdgpu::AmdGpu, amdgpu_discovery as discovery, amdgpu_smc_firmware as firmware};
 use alloc::vec::Vec;
 use narf_bus::{BusDeviceCap, MmioRegion};
@@ -12,6 +13,9 @@ const ARGUMENT: u32 = 0x292;
 const RESPONSE: u32 = 0x29a;
 const GET_VERSION: u32 = 2;
 const GET_INTERFACE: u32 = 3;
+const SET_DRIVER_HIGH: u32 = 0xe;
+const SET_DRIVER_LOW: u32 = 0xf;
+const TRANSFER_TABLE: u32 = 0x13;
 pub const DRIVER_INTERFACE: u32 = 0x0e;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +31,7 @@ pub enum Error {
     InterfaceMismatch(u32),
     Image(firmware::Error),
     Registry(narf_firmware::FirmwareError),
+    PowerPolicy(u32),
 }
 pub(crate) fn mp1_bank(gpu: &AmdGpu) -> Result<u64, Error> {
     if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI22 {
@@ -106,6 +111,8 @@ pub enum State {
     Prepared,
     Querying,
     Ready,
+    UploadingPowerTable,
+    PowerTableReady,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,11 +130,19 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
 trait Io {
     fn read(&mut self, register: u32) -> u32;
     fn write(&mut self, register: u32, value: u32);
+    fn stage_power(
+        &mut self,
+        memory: &crate::amdgpu_vram::Reservation,
+        bytes: &[u8],
+    ) -> Result<(), Error>;
 }
 #[derive(Debug)]
 struct Mmio {
     regs: MmioRegion,
     base: u64,
+    vram: MmioRegion,
+    vram_size: u64,
+    nbio: Option<u64>,
 }
 impl Io for Mmio {
     fn read(&mut self, register: u32) -> u32 {
@@ -141,12 +156,67 @@ impl Io for Mmio {
                 .write32(self.base + u64::from(register) * 4, value)
         };
     }
+    fn stage_power(
+        &mut self,
+        memory: &crate::amdgpu_vram::Reservation,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let nbio = self.nbio.ok_or(Error::Unsupported)?;
+        let base = self.vram_size.checked_sub(1 << 20).ok_or(Error::Invalid)?;
+        // SAFETY: exclusive GPU/index-latch ownership inherited from the SMU
+        // constructor and uploader; this entire method runs in Cap::invoke.
+        let mut reader =
+            unsafe { crate::amdgpu_vram_access::MmioReader::new(&self.vram, &self.regs) };
+        power_policy(|offset, out| {
+            crate::amdgpu_vram_access::read(&mut reader, self.vram_size, base + offset as u64, out)
+                .map_err(|_| crate::amdgpu_gddr6::Error::Invalid)
+        })?;
+        // PSP ring startup already installed this exact HDP flush remapping.
+        // Refuse a changed mapping instead of racing another HDP owner.
+        // SAFETY: nbio and remap hole were bounded at construction.
+        if unsafe { self.regs.read32(nbio + 0x12d * 4) } != 0x7f000 {
+            return Err(Error::Invalid);
+        }
+        let mapping = memory.mapping();
+        for (index, word) in bytes.chunks_exact(4).enumerate() {
+            // SAFETY: the owned reservation is larger than this validated
+            // table; its permanent mapping belongs to this GPU's VRAM pool.
+            unsafe {
+                mapping.write32(
+                    index as u64 * 4,
+                    u32::from_le_bytes(word.try_into().unwrap()),
+                )
+            };
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // SAFETY: verified remap; MEMSIZE read drains the posted flush write.
+        unsafe {
+            self.regs.write32(0x7f000, 0);
+            self.regs.read32(nbio + 0xc3 * 4);
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+fn power_policy(
+    read: impl FnMut(usize, &mut [u8]) -> Result<(), crate::amdgpu_gddr6::Error>,
+) -> Result<(), Error> {
+    let scpm = crate::amdgpu_gddr6::runtime_entry::<4>(read, 6)
+        .map_err(|_| Error::Invalid)?
+        .map_or(0, u32::from_le_bytes);
+    if scpm != 0 {
+        return Err(Error::PowerPolicy(scpm));
+    }
+    Ok(())
 }
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
     authority: Cap<BusDeviceCap, Write>,
     state: State,
+    // SMU retains DriverDramAddr even after acknowledgement. Keep this buffer
+    // for the lifetime of the owner; Drop quarantines published allocations.
+    power_memory: Option<crate::amdgpu_vram::Reservation>,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -156,6 +226,9 @@ impl<I: Io> Engine<I> {
             .map_err(|_| Error::Revoked)
     }
     async fn query(&mut self, message: u32) -> Result<u32, Error> {
+        self.command(message, 0).await
+    }
+    async fn command(&mut self, message: u32, parameter: u32) -> Result<u32, Error> {
         self.access(|io| {
             if io.read(RESPONSE) == u32::MAX {
                 return Err(Error::DeviceGone);
@@ -163,7 +236,7 @@ impl<I: Io> Engine<I> {
             // A freshly loaded SMU may leave response=0. Linux's first message
             // skips pre-poll; after that we own and complete every command.
             io.write(RESPONSE, 0);
-            io.write(ARGUMENT, 0);
+            io.write(ARGUMENT, parameter);
             io.write(MESSAGE, message);
             Ok(())
         })??;
@@ -215,6 +288,37 @@ impl<I: Io> Engine<I> {
         };
         result
     }
+    async fn upload(&mut self, bytes: &[u8], pool: &crate::amdgpu_vram::Pool) -> Result<(), Error> {
+        if self.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        if bytes.len() != crate::amdgpu_power_navi22::SMC_BYTES {
+            return Err(Error::Invalid);
+        }
+        let mut memory = pool
+            .reserve(bytes.len() as u64)
+            .map_err(|_| Error::Allocation)?;
+        self.state = State::UploadingPowerTable;
+        let result = async {
+            self.access(|io| io.stage_power(&memory, bytes))??;
+            let address = memory.address();
+            memory.publish();
+            self.power_memory = Some(memory);
+            self.command(SET_DRIVER_HIGH, (address >> 32) as u32)
+                .await?;
+            self.command(SET_DRIVER_LOW, address as u32).await?;
+            // TABLE_PPTABLE == 0; upper 16 bits (table argument) also zero.
+            self.command(TRANSFER_TABLE, 0).await?;
+            Ok(())
+        }
+        .await;
+        self.state = if result.is_ok() {
+            State::PowerTableReady
+        } else {
+            State::Failed
+        };
+        result
+    }
 }
 #[derive(Debug)]
 pub struct Smu {
@@ -235,14 +339,55 @@ impl Smu {
                 io: Mmio {
                     regs: gpu.regs,
                     base: mp1_bank(gpu)?,
+                    vram: gpu.fb_bar,
+                    vram_size: gpu.vram.size,
+                    nbio: if gpu.regs.len >= 0x7f004 {
+                        crate::amdgpu_psp_ring::bank(
+                            gpu,
+                            discovery::HW_ID_NBIF,
+                            &[
+                                (2, 3, 0),
+                                (2, 3, 1),
+                                (2, 3, 2),
+                                (3, 3, 0),
+                                (3, 3, 1),
+                                (3, 3, 2),
+                                (3, 3, 3),
+                            ],
+                            2,
+                            0x12d,
+                        )
+                        .ok()
+                    } else {
+                        None
+                    },
                 },
                 authority,
                 state: State::Prepared,
+                power_memory: None,
             },
         })
     }
     pub fn state(&self) -> State {
         self.engine.state
+    }
+    /// Send the prepared board table once after the version handshake. This
+    /// does not enable DPM or run BTC. Nonzero/invalid PSP SCPM policy refuses
+    /// the transfer before publishing an address or writing SMU commands.
+    ///
+    /// # Safety
+    /// Caller owns this GPU's CPU-visible pool, HDP remap and VRAM index latch,
+    /// with trained VRAM and completed PSP startup. The pool must use this
+    /// GPU's GMC addresses and permanent mappings with all clients excluded.
+    /// The table must come from this GPU's VBIOS, SMC image and PCI identity.
+    /// Retain the SMU owner through failure/cancellation; do not reset or
+    /// reuse its transfer buffer without independent hardware recovery.
+    pub async unsafe fn upload_power_table(
+        &mut self,
+        table: &crate::amdgpu_power_navi22::Prepared,
+        pool: &crate::amdgpu_vram::Pool,
+    ) -> Result<(), Error> {
+        self.engine.upload(table.bytes(), pool).await
     }
     /// Query the interface and running firmware version once. Cancellation
     /// retains Querying and prevents replay. Success does not enable DPM.

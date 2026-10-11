@@ -189,8 +189,49 @@ checks current PCI authority. Success returns `Versions { firmware, interface }`
 with interface `0x0e` and a nonzero firmware version; all-ones reads, rejection,
 timeout, revocation and interface mismatch fail closed. State moves from
 `Prepared` to `Querying` to `Ready` or `Failed`; cancellation retains `Querying`
-and prohibits replay. The API does not program clocks, voltages, fans or
-PowerPlay tables, enable DPM/graphics or set `AmdGpu::fw_loaded`.
+and prohibits replay. The handshake does not program board power, enable
+DPM/graphics or set `AmdGpu::fw_loaded`.
+
+### Navi 22 board PowerPlay preparation and upload
+
+`amdgpu_power_navi22::Prepared::new(vbios, smc_firmware, Identity)` builds an
+immutable board table without device I/O. `Identity` contains the PCI revision
+and subsystem IDs; production reads them under live PCI authority. ATOM master
+data revision 2.1 and FirmwareInfo 3.4/3.5 select the source: table ID zero uses
+the VBIOS PowerPlay table, while a nonzero ID uses the SMC v2.0 container's
+single embedded table. A missing or invalid selected source fails without
+fallback. Supported Navy Flounder tables are exactly 2470 bytes, revision
+16.0 / format `0x81`, with an 802-byte driver prefix and a 1668-byte SMC
+version-1 payload. Other wire layouts are refused.
+
+Preparation overlays the 292 bytes after the ATOM SMC_DPM_INFO 4.9 header onto
+the payload's `I2cControllers` through `BoardReserved` region, preserving SKU
+data and final SMU padding. The Linux ASUS revision-C3 quirks apply only to
+subsystem vendor `1043`, devices `16c2`/`133c`: clamp GFX table entries to
+2500 MHz, and set `BoardReserved[0]` to 1387 only for `16c2`. `bytes()` exposes
+the immutable SMC payload; `info()` reports source/table ID, platform flags,
+thermal-controller metadata, software shutdown temperature and quirk use.
+Preparation does not execute ATOM commands or apply user clock overrides.
+
+`unsafe Smu::upload_power_table(&Prepared, &Pool).await` requires the successful
+version handshake, a table prepared for this GPU, exclusive trained VRAM/HDP
+and index-latch ownership, and completed PSP startup. Before staging, it reads
+the bounded PSP runtime database's SCPM entry. Nonzero SCPM policy refuses the
+transfer with `PowerPolicy(value)`; malformed policy also fails before any SMU
+command or address publication. This path does not delegate table control to
+PSP. The uploader verifies the existing HDP flush remap, copies the payload to
+an owned CPU-visible VRAM reservation, flushes it, then sends
+`SetDriverDramAddrHigh`, `SetDriverDramAddrLow`, and `TransferTableDram2Smu`
+for table zero, using the reservation's GPU address. Each command checks live
+authority and has a one-second timer deadline.
+
+State moves from `Ready` to `UploadingPowerTable` to `PowerTableReady` or
+`Failed`; cancellation retains `UploadingPowerTable`. Success, rejection and
+cancellation prevent replay. The owner retains the published allocation even
+after acknowledgement because the SMU retains its address; dropping it
+quarantines the allocation. Prepublication failures release their reservation.
+Table upload does not enable DPM features, run boot calibration (BTC), install
+thermal handling, set clocks/voltages/fans or establish graphics readiness.
 
 ### Navi 22 graphics firmware and PSP autoload
 
@@ -258,6 +299,8 @@ entire sequence from starting. `unsafe ColdBoot::new(gpu, pci_cap, pool, firmwar
 requires exclusive ownership of the physical GPU, its PSP/MP1/GC/HDP and reset/PM
 controls, permanently mapped and already trained VRAM, no active queues, and an
 owned pool excluding all firmware/scanout/discovery/training/TMR reservations.
+Firmware and any prepared power table must belong to this GPU's board; exclusive
+ownership includes its VRAM index latch.
 Construction reserves bootstrap staging but performs no MMIO. This is one
 cold-boot attempt, not an attach, resume or firmware-reload operation.
 The session owns an immutable copy of its register/identity metadata, so it
@@ -268,7 +311,10 @@ exclude reset/PM/other clients and retain permanent mappings for the session.
 
 `ColdBoot::run().await` executes optional memory training → SOS bootstrap →
 ring creation → trusted-memory setup → SMC upload → SMU version handshake →
-graphics upload/autoload → RLC boot check. The bootstrap owner is dropped only
+optional board PowerPlay upload → graphics upload/autoload → RLC boot check.
+`Firmware::prepare_power(gpu, Identity)` prepares the board table before the
+session is constructed; production boot requires it, while explicit
+firmware-only callers may omit it. The bootstrap owner is dropped only
 after SOS success, before claiming
 the GPCOM ring. The ring and SMU owners are stored in the session before awaiting
 their hardware operations. State is `Prepared`, `Running(Stage)`,
@@ -278,20 +324,22 @@ Every attempt prevents replay, and no failure automatically resets hardware or
 destroys device-owned memory. Dropping a session quarantines any memory still
 owned by hardware through the underlying owners' existing rules.
 
-Success returns `Report { smu: Versions, gfx: GfxBootStatus }`. The session must
+Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info> }`;
+`power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
-`AmdGpu::fw_loaded`. Board power setup, GMC/queues, video/display firmware and
-real-card validation remain separate work.
+`AmdGpu::fw_loaded`. DPM feature policy/calibration, GMC/queues, video/display
+firmware and real-card validation remain separate work.
 
 ### Navi 22 boot ownership and framebuffer handoff
 
 `amdgpu_navi22_platform::prepare(physical_boot_framebuffer)` is an unsafe,
 single-CPU boot-only entry. It requires a posted physical GPU, permanent probe
 mappings, no NARF VRAM allocations/queues, and stopped CPU framebuffer writers.
-It validates every required firmware file before reading the live VRAM plan,
+It reads the PCI board identity and validates every required firmware file and
+the prepared board PowerPlay table before reading the live VRAM plan,
 constructs the exclusive pool and optional training owner, and retains the
 complete `ColdBoot` in a static async mutex. A GOP range wholly outside this
 GPU's aperture denotes a secondary GPU; partial overlap, overflow and invalid

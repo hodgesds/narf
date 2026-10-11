@@ -2185,6 +2185,10 @@ static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> = IrqSafeSpinLock::new(None);
 static NAVI22_OWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static PCI_AUTHORITY: IrqSafeSpinLock<Option<Cap<BusDeviceCap, Write>>> =
     IrqSafeSpinLock::new(None);
+static PCI_DEVICE: IrqSafeSpinLock<Option<BusDevice>> = IrqSafeSpinLock::new(None);
+pub(crate) fn pci_device() -> Option<BusDevice> {
+    *PCI_DEVICE.lock()
+}
 pub(crate) fn pci_authority() -> Option<Cap<BusDeviceCap, Write>> {
     *PCI_AUTHORITY.lock()
 }
@@ -2239,6 +2243,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // Captured before the move into CONTROLLER; both are Copy.
     let (bound_asic, bound_family) = (dev.chip.asic, dev.chip.family);
     *PCI_AUTHORITY.lock() = Some(cap);
+    *PCI_DEVICE.lock() = Some(device);
     *CONTROLLER.lock() = Some(dev);
     // One identity line, before anything can fail. On a machine that gets no
     // picture this is what says whether the driver bound at all, which ASIC

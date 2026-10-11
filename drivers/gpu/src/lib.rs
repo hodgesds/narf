@@ -175,6 +175,7 @@ pub mod amdgpu_pcie_recovery;
 pub mod amdgpu_platform;
 pub mod amdgpu_pm4;
 pub mod amdgpu_pm4_defs;
+pub mod amdgpu_power_navi22;
 pub mod amdgpu_psp;
 pub mod amdgpu_psp_boot;
 pub mod amdgpu_psp_firmware;

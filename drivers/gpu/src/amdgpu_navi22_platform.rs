@@ -117,6 +117,9 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         return Err(Error::Busy);
     }
     let authority = amdgpu::pci_authority().ok_or(Error::Authority)?;
+    let device = amdgpu::pci_device().ok_or(Error::Authority)?;
+    let identity = crate::amdgpu_power_navi22::Identity::read(&device, &authority)
+        .map_err(|error| Error::Firmware(boot::Error::Power(error)))?;
     let registry: Cap<narf_firmware::FirmwareRegistry, Read> =
         narf_firmware::trusted_loader_authority()
             .ok_or(Error::Authority)?
@@ -124,7 +127,10 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
             .map_err(|_| Error::Authority)?;
     amdgpu::claim_navi22(|gpu| {
         // Validate/copy every file before inspecting hardware or claiming VRAM.
-        let firmware = boot::Firmware::open(gpu, &registry).map_err(Error::Firmware)?;
+        let mut firmware = boot::Firmware::open(gpu, &registry).map_err(Error::Firmware)?;
+        firmware
+            .prepare_power(gpu, identity)
+            .map_err(Error::Firmware)?;
         let end = gpu
             .vram
             .base

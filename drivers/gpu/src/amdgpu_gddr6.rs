@@ -255,14 +255,20 @@ impl<I: Io> Engine<I> {
 /// PSP runtime DB v1.0, amdgpu_psp.h: 4-byte header, padded u16 count,
 /// then at most 63 eight-byte directory entries. Unknown/malformed versions
 /// fail closed; absent DB/boot config preserves the Linux enable default.
-fn training_policy(
+fn training_policy(read: impl FnMut(usize, &mut [u8]) -> Result<(), Error>) -> Result<bool, Error> {
+    let entry = runtime_entry::<8>(read, 5)?;
+    Ok(entry.is_none_or(|entry| u32::from_le_bytes(entry[..4].try_into().unwrap()) & 2 != 0))
+}
+/// Bounded PSP runtime DB lookup shared by training and SMU power policy.
+pub(crate) fn runtime_entry<const N: usize>(
     mut read: impl FnMut(usize, &mut [u8]) -> Result<(), Error>,
-) -> Result<bool, Error> {
+    kind: u32,
+) -> Result<Option<[u8; N]>, Error> {
     let mut header = [0; 8];
     read(0, &mut header)?;
     let word = |bytes: &[u8]| u16::from_le_bytes(bytes.try_into().unwrap()) as usize;
     if word(&header[..2]) != 0xed5 {
-        return Ok(true);
+        return Ok(None);
     }
     if word(&header[2..4]) != 0x100 {
         return Err(Error::Unsupported);
@@ -276,23 +282,23 @@ fn training_policy(
     read(8, &mut directory[..count * 8])?;
     let mut boot = None;
     for entry in directory[..count * 8].chunks_exact(8) {
-        if u32::from_le_bytes(entry[..4].try_into().unwrap()) != 5 {
+        if u32::from_le_bytes(entry[..4].try_into().unwrap()) != kind {
             continue;
         }
         let offset = word(&entry[4..6]);
         let size = word(&entry[6..8]);
-        if boot.is_some() || offset < end || offset % 4 != 0 || size < 8 || offset + size > 0x10000
+        if boot.is_some() || offset < end || offset % 4 != 0 || size < N || offset + size > 0x10000
         {
             return Err(Error::Invalid);
         }
         boot = Some(offset);
     }
     let Some(offset) = boot else {
-        return Ok(true);
+        return Ok(None);
     };
-    let mut entry = [0; 8];
+    let mut entry = [0; N];
     read(offset, &mut entry)?;
-    Ok(u32::from_le_bytes(entry[..4].try_into().unwrap()) & 2 != 0)
+    Ok(Some(entry))
 }
 fn buffer(size: usize) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();

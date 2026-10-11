@@ -2,8 +2,8 @@
 //! exclusive pool and trained VRAM or an explicit training inventory. No implicit reset, pool carving, platform
 //! initcall, modeset or acceleration publication happens here.
 use crate::{
-    amdgpu::AmdGpu, amdgpu_gddr6 as gddr6, amdgpu_gfx_navi22 as gfx, amdgpu_psp_boot as sos,
-    amdgpu_psp_ring as psp, amdgpu_smu_navi22 as smu, amdgpu_vram::Pool,
+    amdgpu::AmdGpu, amdgpu_gddr6 as gddr6, amdgpu_gfx_navi22 as gfx, amdgpu_power_navi22 as power,
+    amdgpu_psp_boot as sos, amdgpu_psp_ring as psp, amdgpu_smu_navi22 as smu, amdgpu_vram::Pool,
 };
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, Read, Write};
@@ -18,6 +18,7 @@ pub enum Error {
     Smu(smu::Error),
     Graphics(gfx::Error),
     Training(gddr6::Error),
+    Power(power::Error),
 }
 /// All files are validated and copied before the first device operation.
 #[derive(Debug)]
@@ -25,6 +26,7 @@ pub struct Firmware {
     sos: sos::Firmware,
     smc: smu::Firmware,
     graphics: gfx::Firmware,
+    power: Option<power::Prepared>,
 }
 impl Firmware {
     pub fn open(
@@ -36,7 +38,20 @@ impl Firmware {
             sos: sos::Firmware::open(gpu, registry).map_err(Error::Sos)?,
             smc: smu::Firmware::open(gpu, registry).map_err(Error::Smu)?,
             graphics: gfx::Firmware::open(gpu, registry).map_err(Error::Graphics)?,
+            power: None,
         })
+    }
+    /// Prepare this board's power table before any device writes. Production
+    /// platform boot always calls this; explicit firmware-only callers may
+    /// omit it, in which case Report::power is None and no table is sent.
+    pub fn prepare_power(&mut self, gpu: &AmdGpu, identity: power::Identity) -> Result<(), Error> {
+        psp::validate_navi22_layout(gpu).map_err(Error::Psp)?;
+        let vbios = gpu
+            .vbios
+            .as_ref()
+            .ok_or(Error::Power(power::Error::MissingVbios))?;
+        self.power = Some(power::Prepared::new(vbios, &self.smc, identity).map_err(Error::Power)?);
+        Ok(())
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,16 +62,18 @@ pub enum Stage {
     TrustedMemory,
     Smc,
     SmuVersions,
+    PowerTable,
     Graphics,
     RlcBoot,
 }
-const STAGES: [Stage; 8] = [
+const STAGES: [Stage; 9] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
     Stage::TrustedMemory,
     Stage::Smc,
     Stage::SmuVersions,
+    Stage::PowerTable,
     Stage::Graphics,
     Stage::RlcBoot,
 ];
@@ -66,6 +83,7 @@ const STAGES: [Stage; 8] = [
 pub struct Report {
     pub smu: smu::Versions,
     pub gfx: psp::GfxBootStatus,
+    pub power: Option<power::Info>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -206,6 +224,20 @@ impl Backend for Hardware {
                 .load_gfx_navi22(&self.firmware.graphics)
                 .await
                 .map_err(Error::Psp)?,
+            Stage::PowerTable => {
+                if let Some(table) = self.firmware.power.as_ref() {
+                    // SAFETY: this coordinator retains the same exclusive
+                    // GPU/pool/HDP/index latch after PSP startup and training.
+                    unsafe {
+                        self.smu
+                            .as_mut()
+                            .ok_or(Error::Invalid)?
+                            .upload_power_table(table, &self.pool)
+                            .await
+                    }
+                    .map_err(Error::Smu)?;
+                }
+            }
             Stage::RlcBoot => {
                 self.gfx_status = Some(
                     self.psp
@@ -223,6 +255,7 @@ impl Backend for Hardware {
         Ok(Report {
             smu: self.versions.ok_or(Error::Invalid)?,
             gfx: self.gfx_status.ok_or(Error::Invalid)?,
+            power: self.firmware.power.as_ref().map(power::Prepared::info),
         })
     }
 }
@@ -257,6 +290,8 @@ impl ColdBoot {
     /// VRAM already trained, and the pool contains only exclusively free VRAM
     /// with correct GPU addresses and firmware/scanout/discovery/training/TMR
     /// exclusions. This is one cold-boot attempt, not attach, resume or reload.
+    /// Firmware and any prepared power table must belong to this GPU's board,
+    /// including its VBIOS and PCI identity. The VRAM index latch is exclusive.
     /// No active queues/other firmware clients may run. After failure or
     /// cancellation, do not create another owner or reuse quarantined memory
     /// until independent reset/recovery. Drop never resets hardware. Successful

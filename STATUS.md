@@ -289,9 +289,17 @@ and pump writes, retains the entire owner, and quarantines the primary
 framebuffer after a started failure. A successful claim excludes legacy MMIO
 access while retaining DRM identity queries. Navi22 refuses the APU suspend
 path until a discrete resume sequence exists.
+Board PowerPlay preparation now selects the VBIOS or SMC table according to
+FirmwareInfo, overlays the ATOM board wiring and applies the exact ASUS C3
+quirks before startup. After the SMU handshake, the boot sequence uploads that
+table through an owned, flushed VRAM buffer and retains the published buffer
+across success, rejection and cancellation. PSP SCPM ownership or malformed
+runtime policy refuses this transfer before SMU commands; policy delegation
+is not implemented.
 These are software-tested foundations; training resume,
-video/display firmware, board power/clock setup, hardware boot, GMC/GFX10
-queue initialization, SDMA startup and DCN3.0 modesetting remain open. See the
+video/display firmware, DPM feature policy/calibration and thermal setup,
+hardware boot, GMC/GFX10 queue initialization, SDMA startup and DCN3.0
+modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
 
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix

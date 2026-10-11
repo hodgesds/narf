@@ -17,6 +17,7 @@ fn report() -> Report {
             cp_stat: 0,
             rlc_bootload: 1 << 31,
         },
+        power: None,
     }
 }
 struct Fake {
@@ -242,6 +243,7 @@ fn firmware() -> Firmware {
         sos: sos::tests::firmware(),
         smc: smu::tests::firmware(),
         graphics: gfx::tests::fixture(),
+        power: None,
     }
 }
 fn navi22_boot_outlives_the_controller_lock() -> TestResult {
