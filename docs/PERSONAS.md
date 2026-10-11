@@ -64,8 +64,8 @@ narf-frame = { path = "...", features = ["linux-compat"] }
 
 or on the command line:
 
-```
-cargo build --features linux-compat
+```sh
+cargo xtask build --features linux-compat
 ```
 
 ---
@@ -161,8 +161,8 @@ for an init system that manages resources via the cgroup hierarchy.
 
 ## Implementation status
 
-Both features are **live** as of Wave 77.  The implementation landed
-across Waves 62–77:
+The three profiles are live. The historical landing sequence through Wave 77
+was:
 
 - Wave 62 established the feature flags and stub modules.
 - Wave 63 — dyn-linker aux vector (`AT_PHDR` / `AT_PHENT` / `AT_PHNUM`

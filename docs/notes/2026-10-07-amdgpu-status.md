@@ -1,4 +1,4 @@
-# AMDGPU status (2026-10-07)
+# AMDGPU status (2026-10-07; updated 2026-10-11)
 
 Supersedes [`2026-05-20-amdgpu-audit.md`](2026-05-20-amdgpu-audit.md), which
 is now wrong in its central claim: it names IP discovery as "the keystone
@@ -6,17 +6,18 @@ gap", and IP discovery landed, along with almost everything it listed as
 downstream.
 
 Scope of this note: what exists, what it is wired to, and what "full amdgpu
-support" would still mean. Compared against `/usr/src/linux` (7.3.0-rc4).
+support" would still mean. The render/UAPI section was updated after the
+original snapshot because that area changed materially.
 
 ## Size
 
 | | |
 |---|---|
-| NARF `drivers/gpu/src/amdgpu*.rs` | 31,403 LOC across 82 modules (37,086 with tests) |
+| NARF `drivers/gpu/src/amdgpu*.rs` | 51,772 LOC across 91 files |
 | Linux `drivers/gpu/drm/amd/amdgpu` | 383,431 LOC |
 | Linux `drivers/gpu/drm/amd` (all) | 6,510,582 LOC |
 
-611 kernel tests live under `drivers/gpu`.
+More than 660 kernel-test registrations live under `drivers/gpu`.
 
 ## What is implemented and wired to boot
 
@@ -52,9 +53,17 @@ from the board's own tables and **fails closed** when a table is missing, the
 wrong revision, or self-inconsistent — it is never defaulted, because the
 memory configuration multiplies into every watermark.
 
-## What is absent
+## Render/UAPI status
 
-**No render path at all.** Linux's amdgpu ioctl table has 21 entries:
+The original version of this note said there was no render path and no amdgpu
+dispatch. That became stale. Card and render-node opens now carry per-open GEM,
+VM, and context state, and `drm_devfs_bridge.rs` dispatches implemented amdgpu
+private ioctls on both node types. Current pieces include GEM create/mmap/wait
+and operations, GPU-VA validation/mapping state, context operations, and core
+`AMDGPU_INFO` queries. The lower-level tree also has GMC/VMID/page-table, MES,
+MQD, PM4, GFX, ring, and firmware bring-up machinery.
+
+Linux's amdgpu ioctl table has 21 entries:
 
 ```
 AMDGPU_GEM_CREATE  AMDGPU_CTX  AMDGPU_VM  AMDGPU_SCHED  AMDGPU_BO_LIST
@@ -65,11 +74,13 @@ AMDGPU_USERQ_SIGNAL  AMDGPU_USERQ_WAIT  AMDGPU_GEM_LIST_HANDLES
 AMDGPU_PROC_OPTIONS
 ```
 
-NARF dispatches none — `drm_ioctl_bridge.rs` does not contain the string
-`amdgpu`. The modules they need (`amdgpu_cs`, `amdgpu_bo`, `amdgpu_ttm`,
-`amdgpu_fence`, `amdgpu_sched`, `amdgpu_ib`) do not exist. Mesa's radeonsi
-calls `AMDGPU_INFO` as its first act, so there is no path to GL or Vulkan on
-AMD, and no `libdrm_amdgpu` consumer can open the render node.
+This is not yet an accelerated Mesa path. `AMDGPU_INFO_ACCEL_WORKING` reports
+false, and `AMDGPU_CS` validates the submitted chunk/context/VA shape but
+returns an error because it does not yet enqueue work on a hardware engine or
+return a real completion fence. Dependency chunks, BO residency lists,
+syncobjs/fences, and the rest of the production submission lifetime remain
+incomplete. A successful ioctl parse is therefore not evidence that GL or
+Vulkan renders on AMD hardware.
 
 **`AmdgpuCard` is metadata-only.** The `DrmCard` trait
 (`drm_registry.rs:33`) is nine methods — name, driver, PCI ids, VBIOS
@@ -92,9 +103,11 @@ is silicon."
    back the KMS object model with the DCN pipeline so `GETRESOURCES` /
    `SETCRTC` / `PAGE_FLIP` reach real connectors and planes, and then run the
    Stage 5 laptop gate. Bounded.
-2. **Accelerated desktop** — the GEM/VA/CS/fence/scheduler stack plus those
-   21 ioctls plus `libdrm_amdgpu` compatibility. A long arc, and not required
-   for a software-rendered desktop.
+2. **Accelerated desktop** — finish the existing GEM/VA/context/CS foundation:
+   connect validated submissions to the MES/GFX engine path, manage residency
+   and fences/syncobjs, complete the required ioctl set, and validate
+   `libdrm_amdgpu`/Mesa on silicon. A long arc, and not required for a
+   software-rendered desktop.
 
 ## Corrections to the 2026-05-20 note
 
@@ -106,4 +119,7 @@ is silicon."
    reason about; see the live path above. It carries a three-entry timing
    table (1920x1080, 1366x768, 1280x720 @60) that the live path does not use,
    since `timing_from_edid` derives timing from the sink.
-4. "~3,400 LOC across 11 files" — now 31,403 across 82.
+4. "~3,400 LOC across 11 files" — now 51,772 across 91 `amdgpu*.rs` files.
+5. "No render path at all" — superseded by the GEM/VM/context/info UAPI
+   foundation described above. Hardware command submission and acceleration
+   still do not work end to end.

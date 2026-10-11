@@ -1,21 +1,19 @@
 # Extending NARF — developer reference
 
 This directory documents the **standard extension interfaces** for NARF's
-core subsystems: the public traits and registration hooks you implement in
-your **own** crate to extend or replace core functionality *without editing
-a core crate*.
+core subsystems: public traits and registration hooks for built-in crates, and
+the smaller C ABI available to runtime-loaded modules. For checkout setup and
+the normal review loop, begin with the [developer guide](../DEVELOPER_GUIDE.md).
 
 The philosophy is the one described in [`../PLUGGABILITY.md`](../PLUGGABILITY.md):
-core subsystems are *framework + policy*. The framework is in-tree and
-stable; the policy is a runtime-installable backend behind a trait. This
-reference goes one level deeper: for each subsystem it quotes the **real**
-trait signatures (with `path:line`), the **real** registration entry points,
-and a **minimal worked skeleton** for a third-party crate.
+many core subsystems separate mechanism from replaceable policy. This reference
+goes one level deeper: it identifies the real trait surfaces, registration
+entry points, and minimal worked skeletons for an extension crate.
 
-Every signature cited here was copied from the tree and carries a
-`path:line`. Where the "extend via custom crate" story is *not* cleanly
-possible today (i.e. extension requires editing a core crate), the doc says
-so plainly.
+Where the "extend via custom crate" story is not cleanly possible today (for
+example, because the built-in crate still needs link-time wiring), the relevant
+doc says so plainly. Paths and symbol names are navigation aids; the current
+source and subsystem specification remain authoritative.
 
 ## Workspace layout
 
@@ -30,6 +28,7 @@ crate. The subsystems this reference covers:
 | `narf-ipc`            | `ipc/`          | [ipc.md](ipc.md) |
 | `narf-capabilities` / `narf-security` | `capabilities/`, `security/` | [capabilities.md](capabilities.md) |
 | syscall table         | `userspace/`    | [syscalls.md](syscalls.md) |
+| runtime modules       | `modules/`      | [modules.md](modules.md) |
 
 > `security-model/` is a spec-only crate (README + `specification/` +
 > `research/`; no `src/`). The runtime security code lives in `security/`
@@ -37,15 +36,15 @@ crate. The subsystems this reference covers:
 
 ## Drivers & peripheral subsystems
 
-Writing an **out-of-tree driver** (a new crate that adds a device driver or
-extends a peripheral subsystem without editing a core crate) is documented
-separately. Start with [drivers.md](drivers.md) — the initcall registry
-(`narf-init`: `Stage`, `register`, `InitResult`) and the bus/device match
-model (PCIe / virtio / I2C / USB / platform) — then the per-subsystem guides:
+Writing a driver starts with a choice: link it into the kernel and use the Rust
+subsystem traits, or build it as a runtime `.ko` against the curated primitive
+C ABI. Start with [drivers.md](drivers.md) for the built-in initcall and bus
+model, and [modules.md](modules.md) for the runtime path.
 
 | Subsystem      | Extension doc | Seam |
 | -------------- | ------------- | ---- |
 | Driver model / buses | [drivers.md](drivers.md) | `narf_init::register(Stage, …)` + bus match |
+| Runtime modules | [modules.md](modules.md) | `.ko` manifest + stable C KABI |
 | Block devices  | [block.md](block.md)      | `narf-block` + `root_mount` FS factory |
 | Network        | [net.md](net.md)          | `narf_net::Interface` |
 | Input / HID    | [input.md](input.md)      | evdev `ROUTER.register_device` + `hid` parser |
@@ -53,17 +52,17 @@ model (PCIe / virtio / I2C / USB / platform) — then the per-subsystem guides:
 | Sound          | [sound.md](sound.md)      | `AudioStream` + HDA registration |
 | Char devices   | [chardev.md](chardev.md)  | `FileOps` + devfs publication hooks |
 
-Places where clean out-of-tree extension is **not** possible today are
-flagged in the relevant doc: the initcall wiring line (a kernel-side
-aggregator must call your `register_initcalls()`), platform (non-discoverable)
-devices (no unified `platform_driver` trait), the crypto algorithm registry,
-and the framebuffer / audio backend pickers (`fb::select_active` /
-`audio::select_active_playback` are hard-coded over a fixed backend set). See
-[drivers.md](drivers.md) for the details and the clean paths around them.
+Places where clean extension is **not** possible today are flagged in the
+relevant doc. A built-in crate still needs link-time retention/wiring. A
+runtime module avoids that line but is limited to the symbols actually exported
+by `modules/src/kabi.rs`; most internal Rust traits are deliberately not a
+binary ABI. Platform-device discovery, crypto algorithms, and several backend
+pickers also remain closed sets. See [drivers.md](drivers.md) and
+[modules.md](modules.md) for the precise boundary.
 
-## The two extension patterns
+## The three extension patterns
 
-NARF exposes extension seams in two shapes. Knowing which one a subsystem
+NARF exposes extension seams in three shapes. Knowing which one a subsystem
 uses tells you what your crate must do.
 
 ### 1. Cap-gated global install (policy backends)
@@ -86,6 +85,13 @@ directly.
 Used by: **filesystem** (`FsInstance`/`DirOps`/`FileOps` — you `mount_arc`
 your instance), **ipc** (`RingTransport` — monomorphised per channel, no
 install slot by design).
+
+### 3. Runtime-loaded native module
+
+A separately compiled `.ko` declares metadata, required capabilities, and
+dependencies, then resolves only stable `extern "C"` KSYMTAB imports. It cannot
+pass Rust traits or `repr(Rust)` types across the boundary. See
+[modules.md](modules.md); the dual-build e1000 crate is the current reference.
 
 ### The syscall table and capabilities are special cases
 
@@ -121,6 +127,5 @@ gotchas.
 
 ## Accuracy note
 
-If you find an API referenced here that no longer matches the tree, the tree
-wins — these docs cite `path:line` precisely so drift is easy to catch. Open
-a fix rather than trusting the prose.
+If an API here no longer matches the tree, the tree and its subsystem
+specification win. Open a documentation fix rather than trusting stale prose.
