@@ -81,6 +81,12 @@ production boot and host interoperability postflight.
 - Three outcome channels: success (QEMU exit 0x10), failure (0x11),
   timeout (harness kill).
 - Runs on `x86_64` and `aarch64` targets on every PR.
+- Driver-specific live acceptance can add a host harness to this boot. The
+  x86_64 `e1000-module-net-smoke` gate requires pre-probe initramfs loading in
+  an operator-selected driver frame, exclusive ownership of QEMU's 82540EM,
+  and successful off-box TCP, UDP, and DNS traffic through the resulting
+  module datapath. Synthetic descriptor injection is not sufficient for this
+  gate.
 - Each test declares:
   - Required features (e.g. PKS, MTE). Skipped on archs without them
     unless the test is specifically an arch check.

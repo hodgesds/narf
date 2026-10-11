@@ -68,6 +68,76 @@ mod tests_e2e;
 pub use lifecycle::ModuleState;
 pub use loader::{load_image, load_image_with_domain, Module};
 
+fn canonical_initramfs_name(name: &str) -> &str {
+    let name = name.strip_prefix("./").unwrap_or(name);
+    name.strip_prefix('/').unwrap_or(name)
+}
+
+/// Load the comma-separated initramfs paths named by `modules_load=`.
+///
+/// This runs after the KABI table is finalized but before `Stage::Device`, so
+/// a driver module can register its PCI match before the ordinary bus probe.
+/// `modules_domain=` is an operator-selected placement override applied to
+/// every module in the list; the loader still rejects `FRAME` and enforces the
+/// module signature, ABI hash, and capability manifest normally. Both values
+/// come from the bootloader-supplied command line.
+fn autoload_initramfs_modules() -> narf_init::InitResult {
+    use core::fmt::Write as _;
+
+    let Some(requested) = narf_boot::args().value("modules_load") else {
+        return narf_init::InitResult::NotPresent;
+    };
+    let Some(initramfs) = narf_initramfs::staged() else {
+        return narf_init::InitResult::Error("modules_load requires an initramfs");
+    };
+    let params = narf_boot::args()
+        .value("modules_domain")
+        .map(|domain| alloc::format!("domain={domain}"))
+        .unwrap_or_default();
+    let mut loaded = 0usize;
+
+    for requested_path in requested.split(',').filter(|path| !path.is_empty()) {
+        let requested_path = canonical_initramfs_name(requested_path);
+        let Some((_, bytes)) = initramfs
+            .iter_files()
+            .find(|(name, _)| canonical_initramfs_name(name) == requested_path)
+        else {
+            let _ = writeln!(
+                narf_console::Writer,
+                "  modules: autoload path not found: {requested_path}"
+            );
+            return narf_init::InitResult::Error("module autoload path not found");
+        };
+        match syscalls::sys_init_module_with_params(bytes, &params) {
+            Ok(module) => {
+                loaded += 1;
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  modules: autoloaded {} from {} in {:?}",
+                    module.name(),
+                    requested_path,
+                    module.domain,
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "  modules: autoload failed for {}: {:?}",
+                    requested_path,
+                    error,
+                );
+                return narf_init::InitResult::Error("module autoload failed");
+            }
+        }
+    }
+
+    if loaded == 0 {
+        narf_init::InitResult::NotPresent
+    } else {
+        narf_init::InitResult::Ok
+    }
+}
+
 /// Enter a loaded module's effective isolation frame before the bus invokes
 /// its separately compiled probe callback. The bus stores only the opaque
 /// module id and delegates placement policy back here.
@@ -231,6 +301,12 @@ pub fn register_initcalls() {
         sign::install_verifier(alloc::boxed::Box::new(sign::Ed25519Verifier));
         InitResult::Ok
     });
+
+    narf_init::register(
+        Stage::Subsys,
+        "modules-initramfs-autoload",
+        autoload_initramfs_modules,
+    );
 
     narf_init::register(Stage::Fs, "modules-sysfs", || {
         proc_modules::install_proc_modules();

@@ -37,12 +37,16 @@ can touch — emitting JSON or GitHub Actions outputs. Hub-crate,
 build-infrastructure, or unknown-path changes (and push-to-main / nightly
 events) force a full run. Its pure core is unit-tested.
 
-**Networking and server smokes.** `net-smoke` and `redis-smoke` boot with
+**Networking and server smokes.** `net-smoke`, `e1000-module-net-smoke`, and
+`redis-smoke` boot with
 QEMU user-networking and a host-forwarded port, then open a real TCP
 socket *from the host* to a guest server (NARF's `netserve`, or an
 unmodified `redis-server`) and round-trip traffic — proving a guest
-daemon is reachable off-box over virtio-net; the same smoke now checks a UDP
-echo and a guest DNS query through SLIRP. `systemd-pid1` boots a
+daemon is reachable off-box. Both network-stack smokes check TCP, UDP, and a
+guest DNS query through SLIRP. The e1000 variant additionally builds and
+ABI-stamps `e1000.ko`, autoloads it in an operator-selected driver frame before
+PCI probing, disables the built-in e1000 claimant for that boot, and requires
+the module-owned NIC to carry every live exchange. `systemd-pid1` boots a
 mounted distro rootfs's `/lib/systemd/systemd` as real PID 1 with the
 QEMU user-network configuration, optionally asserting the network works
 end-to-end through SLIRP.
@@ -59,7 +63,9 @@ number.
 **Modules.** `build-module` cross-compiles a kernel-module crate (such as
 `modules/test-module`) into a single relocatable object — NARF's
 equivalent of a `.ko` — and `attach-module-signature` appends a verified
-Ed25519 trailer to a built module image.
+Ed25519 trailer to a built module image. The e1000 module smoke derives the
+running kernel ABI hash from the canonical `kernel_abi!` declaration with
+Rust's own token stringification before staging the image.
 
 **Firmware.** `pack-firmware` wraps a raw firmware payload in the NARF
 trailer (optionally with a detached Ed25519 signature), and

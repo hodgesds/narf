@@ -14,6 +14,17 @@ current test results.
 | 4 · Compatibility | In-tree shell gate met; compatibility continues | Interactive `echo hello world` follows serial IRQ → input ring → shell → UART. Linux-compatible musl programs, storage, networking, and graphics have additional QEMU proofs. The original relibc-specific criterion is not the closure proof. |
 | 5 · Silicon | In progress | Driver and diagnostic foundations exist; the selected AMD laptop end-to-end gate has not been demonstrated. |
 
+## Loadable e1000 datapath
+
+The copy-mode module ABI now has an exclusive live-wire proof. `cargo xtask
+e1000-module-net-smoke --arch=x86_64` builds and ABI-stamps `e1000.ko`, stages
+it in the initramfs, loads it into the operator-selected `driver2` frame before
+PCI probing, and suppresses the built-in e1000 registration for that fixture.
+The module-owned QEMU 82540EM passes host-to-guest TCP and UDP echoes plus a
+guest-originated DNS query through SLIRP. The ordinary kernel-test module suite
+continues to cover load/unload, capability gates, domain placement, DMA handle
+lifetime, and deterministic descriptor injection.
+
 ## i40e recovery, RSS and offloads
 
 The i40e runtime negotiates up to eight queue pairs with separate completion

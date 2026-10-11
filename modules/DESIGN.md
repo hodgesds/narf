@@ -66,6 +66,15 @@ effective value before mapping, rejects `DomainId::FRAME` unconditionally for
 runtime-loaded text, and records the resulting `DomainId` on the image.
 Statically linked drivers retain their compile-time Frame placement.
 
+Boot-critical modules use the same loader and policy path. The
+bootloader-supplied command line may name comma-separated initramfs images with
+`modules_load=` and apply one operator placement override with
+`modules_domain=`. The autoload initcall runs after KSYMTAB and trust-root
+initialization but before `Stage::Device`, allowing a module to register its
+hardware match before PCI probing. It is an explicit image list, not a
+dependency or device-alias resolver; signatures, ABI and capability checks,
+and the runtime-text ban on `FRAME` remain unchanged.
+
 `invoke_init` / `invoke_exit` bracket lifecycle code with that domain. Bus
 callbacks go through an owner-aware call gate that looks the module up by its
 non-reused `ModuleId`, pins it while Live, enters the same domain, records the

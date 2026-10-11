@@ -92,6 +92,30 @@ pub fn register_late_firmware_initcalls() {
             InitResult::Ok
         });
     }
+
+    #[cfg(feature = "qemu-static-ipv4")]
+    {
+        use core::fmt::Write as _;
+        use narf_init::{InitResult, Stage};
+
+        narf_init::register(Stage::Late, "qemu-static-ipv4", || {
+            let Some(iface) = narf_net::iface::primary() else {
+                return InitResult::Error("qemu static IPv4 found no interface");
+            };
+            let name = iface.name;
+            if !narf_net::iface::set_link_state(&name, true) {
+                return InitResult::Error("qemu static IPv4 configuration failed");
+            }
+            narf_net::iface::add_addr(&name, [10, 0, 2, 15], 24);
+            narf_net::iface::set_iface_ipv4(&name, [10, 0, 2, 15], [10, 0, 2, 2]);
+            let _ = writeln!(
+                narf_console::Writer,
+                "  net: qemu static config — {} = 10.0.2.15/24 gw 10.0.2.2",
+                name,
+            );
+            InitResult::Ok
+        });
+    }
 }
 
 /// Stage::Subsys initcalls for this driver crate. Each enabled driver crate's
@@ -121,7 +145,7 @@ pub fn register_initcalls() {
         narf_drivers_net_cxgb4::register();
         InitResult::Ok
     });
-    #[cfg(feature = "e1000")]
+    #[cfg(all(feature = "e1000", not(feature = "e1000-module-only")))]
     narf_init::register(Stage::Subsys, "e1000", || {
         narf_drivers_net_e1000::register();
         InitResult::Ok

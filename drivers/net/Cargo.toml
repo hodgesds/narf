@@ -73,6 +73,12 @@ atheros = ["dep:narf-drivers-net-atheros"]
 bnxt = ["dep:narf-drivers-net-bnxt"]
 cxgb4 = ["dep:narf-drivers-net-cxgb4"]
 e1000 = ["dep:narf-drivers-net-e1000"]
+# Keep the e1000 implementation linked but leave its PCI ids unclaimed so an
+# early-loaded e1000.ko can be the device's sole owner.
+e1000-module-only = ["e1000"]
+# Developer/CI QEMU profile: put the first registered NIC on SLIRP's static
+# 10.0.2.15/24 lease. Production networking remains userspace-configured.
+qemu-static-ipv4 = []
 enic = ["dep:narf-drivers-net-enic"]
 forcedeth = ["dep:narf-drivers-net-forcedeth"]
 i40e = ["dep:narf-drivers-net-i40e"]
