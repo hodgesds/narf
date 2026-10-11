@@ -257,16 +257,19 @@ thermal interrupts or override board frequencies, voltages or fan curves.
 ### Navi 22 graphics firmware and PSP autoload
 
 `amdgpu_gfx_navi22::Firmware::open(gpu, registry_cap)` prepares the complete
-`navy_flounder_{sdma,ce,pfp,me,mec,mec2,rlc}.bin` set through live registry/blob
+`navy_flounder_{sdma,ce,pfp,me,mec,mec2,rlc,vcn,dmcub}.bin` set through live registry/blob
 capabilities before any device I/O. Device gating requires PCI `1002:73df`,
-GC 10.3.2, MP1 11.0.11 and SDMA0 5.2.2, with unique instance-zero records.
+GC 10.3.2, MP1 11.0.11, SDMA0 5.2.2 and DCN 3.0.0, with unique instance-zero
+records, plus a single VCN 3.0.0/3.0.64/3.0.192 instance. Other media layouts
+are refused; VCN 3.0.16 uses different firmware and is not Navy Flounder.
 Only MEC2 may be absent, and only a registry `NotFound` result is optional;
 signature, parsing, allocation and authority failures propagate. Immutable
 copies outlive the capability invocations. `images()` returns validated views
 in upload order.
 
 `amdgpu_gfx_firmware::Image::parse(Source, bytes)` supports CP header v1.0 /
-IP 10.3, SDMA v1.0 / IP 5.2, and RLC v2.2–v2.4 / IP 10.3. Each container is
+IP 10.3, SDMA v1.0 / IP 5.2, RLC v2.2–v2.4 / IP 10.3, and VCN/DMCUB v1.0 /
+IP 3.0. Each container is
 bounded to 4 MiB and each referenced range to 2 MiB. Declared file/header sizes,
 aligned ranges, descriptor bounds and RLC section overlap are checked. This
 path rejects incorrect declared sizes rather than using Linux's RLC size
@@ -282,20 +285,29 @@ byte offsets. Upload order is tap-delay sections (v2.4), restore control/GPM/SRM
 IRAM/DRAM, P/V (v2.3), then RLC_G. Empty optional sections are omitted; register
 list metadata is validated but never submitted as firmware. Nonempty P/V fields
 in v2.4 are rejected because Linux does not load them in that revision.
+VCN submits the complete common-header microcode payload as PSP type 13.
+DMCUB submits only `inst_const_bytes` as type 51, retaining PSP packaging and
+excluding BSS/data; its instruction/data sizes must exactly cover the payload.
+Both media payloads must end at the declared file boundary.
 
 `Psp::load_gfx_navi22(&Firmware).await` requires an acknowledged TMR and successful
 SMC upload. It validates the whole set/order before loading any member, sends
-bounded/fenced `LOAD_IP_FW` commands through owned VRAM staging, then submits
-`AUTOLOAD_RLC` (`0x21`) only after every graphics payload succeeds. The public
+bounded/fenced `LOAD_IP_FW` commands through owned VRAM staging, and submits
+`AUTOLOAD_RLC` (`0x21`) immediately after RLC_G succeeds, before VCN and DMCUB.
+It validates the entire set before publishing any payload. The public
 `gfx_load_state()` transitions `Absent → Loading → Accepted | Failed`;
 cancellation retains `Loading`. Success, error and cancellation all prevent
 replay in that session. Exact fence completion releases staging; incomplete
 commands quarantine staging/ring/TMR, and teardown still requires independent
 reset of every firmware consumer before TMR destruction.
 
-`Accepted` means PSP acknowledged autoload. It does not prove GC/SDMA readiness,
-configure memory hubs, queues or board power, install video/display firmware,
-or set `AmdGpu::fw_loaded`.
+`Accepted` means PSP acknowledged autoload and both media uploads.
+`media_firmware()` returns `MediaFirmware { vcn, dmcub }` GPU entry addresses
+from completed PSP replies; each must be dword aligned and inside this
+session's retained TMR. Partial failures retain any earlier valid address for
+diagnostics. These are not CPU pointers or proof that the media engines have
+started. Consumers must keep TMR alive. The API does not configure memory hubs,
+queues, VCN/DMUB windows or board power, or set `AmdGpu::fw_loaded`.
 
 `Psp::wait_gfx_boot_navi22().await` requires this session's acknowledged autoload
 and checks GC 10.3.2 `CP_STAT` (base index 0, dword `0x0f40`) together with
@@ -347,14 +359,14 @@ destroys device-owned memory. Dropping a session quarantines any memory still
 owned by hardware through the underlying owners' existing rules.
 
 Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
-power_status: Option<PowerStatus> }`;
+power_status: Option<PowerStatus>, media_firmware: MediaFirmware }`;
 `power` is populated only when the prepared table was uploaded. The session must
 stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
 GPU initialization after full success; that changes state to `Released` and
 prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
 GC sample before transfer, including on failure. These observations do not set
 `AmdGpu::fw_loaded`. Display-aware memory/link DPM, OS thermal interrupts,
-GMC/queues, video/display firmware and real-card validation remain separate work.
+GMC/queues, VCN/DMUB startup and real-card validation remain separate work.
 
 ### Navi 22 boot ownership and framebuffer handoff
 

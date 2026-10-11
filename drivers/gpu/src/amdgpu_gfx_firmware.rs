@@ -14,10 +14,12 @@ pub enum Source {
     Mec,
     Mec2,
     Rlc,
+    Vcn,
+    Dmcub,
 }
 impl Source {
     /// Linux UCODE_ID order, not numeric PSP firmware-type order.
-    pub const ORDER: [Self; 7] = [
+    pub const ORDER: [Self; 9] = [
         Self::Sdma,
         Self::Ce,
         Self::Pfp,
@@ -25,6 +27,8 @@ impl Source {
         Self::Mec,
         Self::Mec2,
         Self::Rlc,
+        Self::Vcn,
+        Self::Dmcub,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -35,6 +39,8 @@ impl Source {
             Self::Mec => "amdgpu/navy_flounder_mec.bin",
             Self::Mec2 => "amdgpu/navy_flounder_mec2.bin",
             Self::Rlc => "amdgpu/navy_flounder_rlc.bin",
+            Self::Vcn => "amdgpu/navy_flounder_vcn.bin",
+            Self::Dmcub => "amdgpu/navy_flounder_dmcub.bin",
         }
     }
 }
@@ -105,12 +111,14 @@ fn record(ranges: &mut [Span; 17], count: &mut usize, next: Span) -> Result<(), 
 }
 impl<'a> Image<'a> {
     pub fn parse(source: Source, bytes: &'a [u8]) -> Result<Self, Error> {
-        if bytes.len() < 44 || bytes.len() > MAX_CONTAINER {
+        if bytes.len() < 32 || bytes.len() > MAX_CONTAINER {
             return Err(Error::Invalid);
         }
         let version = word(bytes, 8);
         let minor = (version >> 16) as usize;
         let header = match source {
+            Source::Vcn if version == 1 && word(bytes, 12) == 3 => 32,
+            Source::Dmcub if version == 1 && word(bytes, 12) == 3 => 40,
             Source::Sdma if version == 1 && word(bytes, 12) == 0x20005 => 48,
             Source::Rlc
                 if version & 0xffff == 2
@@ -140,6 +148,23 @@ impl<'a> Image<'a> {
             payloads: [None; 13],
             count: 0,
         };
+        if matches!(source, Source::Vcn | Source::Dmcub) {
+            // VCN uses the entire common-header payload. DMCUB sends only
+            // inst_const_bytes, including its PSP packaging, never BSS/data.
+            if main.end != bytes.len() {
+                return Err(Error::Invalid);
+            }
+            if source == Source::Dmcub {
+                let inst = word(bytes, 32);
+                let data = word(bytes, 36);
+                if inst == 0 || inst.checked_add(data) != Some(word(bytes, 20)) {
+                    return Err(Error::Invalid);
+                }
+                main = span(bytes, header, word(bytes, 24), inst)?;
+            }
+            image.push(bytes, main, if source == Source::Vcn { 13 } else { 51 });
+            return Ok(image);
+        }
         if source != Source::Rlc {
             let jt_field = if source == Source::Sdma { 40 } else { 36 };
             let jt_start = (word(bytes, jt_field) as usize)
@@ -166,7 +191,7 @@ impl<'a> Image<'a> {
                 Source::Pfp => 2,
                 Source::Me => 1,
                 Source::Mec | Source::Mec2 => 4,
-                Source::Rlc => unreachable!(),
+                Source::Rlc | Source::Vcn | Source::Dmcub => unreachable!(),
             };
             image.push(bytes, main, kind);
             return Ok(image);

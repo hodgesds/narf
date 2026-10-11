@@ -25,6 +25,8 @@ struct Fake {
     fail_hdp: bool,
     gfx_samples: Vec<GfxBootStatus>,
     gfx_reads: usize,
+    media_address: Option<u64>,
+    tmr_address: u64,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -50,6 +52,10 @@ impl Io for Fake {
                 .push(self.memory[1024..1280].try_into().unwrap());
             let id = self.memory[1026];
             let kind = self.memory[1034];
+            if id == 5 {
+                self.tmr_address =
+                    u64::from(self.memory[1031]) | (u64::from(self.memory[1032]) << 32);
+            }
             let stalled = self.stall_command == Some(id)
                 && (id != 6 || self.stall_type.is_none_or(|t| t == kind));
             if self.complete && !stalled {
@@ -63,6 +69,13 @@ impl Io for Fake {
                         0
                     };
                 self.memory[(COMMAND / 4) as usize + 220] = self.tmr_size;
+                if id == 6 && matches!(kind, 13 | 51) {
+                    let address = self
+                        .media_address
+                        .unwrap_or(self.tmr_address + if kind == 13 { 0x1000 } else { 0x100000 });
+                    self.memory[(COMMAND / 4) as usize + 218] = address as u32;
+                    self.memory[(COMMAND / 4) as usize + 219] = (address >> 32) as u32;
+                }
             }
         }
     }
@@ -126,6 +139,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
             rlc_bootload: 1 << 31,
         }],
         gfx_reads: 0,
+        media_address: None,
+        tmr_address: 0,
     };
     io.regs[CTRL as usize] = RESPONSE;
     io.regs[SOS as usize] = 1;

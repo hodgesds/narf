@@ -10,6 +10,8 @@ pub(crate) fn container(source: Source) -> Vec<u8> {
     let (header, version, ip) = match source {
         Source::Sdma => (48, 1, 0x20005),
         Source::Rlc => (244, 0x40002, 0x3000a),
+        Source::Vcn => (32, 1, 3),
+        Source::Dmcub => (40, 1, 3),
         _ => (44, 1, 0x3000a),
     };
     for (field, value) in [
@@ -36,6 +38,13 @@ pub(crate) fn container(source: Source) -> Vec<u8> {
             put(&mut bytes, field + 4, start as u32);
             bytes[start..start + 4].fill(index as u8 + 1);
         }
+    } else if matches!(source, Source::Vcn | Source::Dmcub) {
+        bytes.truncate(272);
+        put(&mut bytes, 0, 272);
+        if source == Source::Dmcub {
+            put(&mut bytes, 32, 12);
+            put(&mut bytes, 36, 4);
+        }
     } else {
         let field = if source == Source::Sdma { 40 } else { 36 };
         put(&mut bytes, field, 3);
@@ -45,7 +54,10 @@ pub(crate) fn container(source: Source) -> Vec<u8> {
     bytes
 }
 fn navi22_cp_sdma_container_bounds_and_mec_split() -> TestResult {
-    for source in Source::ORDER.into_iter().filter(|s| *s != Source::Rlc) {
+    for source in Source::ORDER
+        .into_iter()
+        .filter(|s| !matches!(s, Source::Rlc | Source::Vcn | Source::Dmcub))
+    {
         let bytes = container(source);
         let image = Image::parse(source, &bytes).unwrap();
         let payload = image.payloads().next().unwrap();
@@ -215,4 +227,77 @@ fn navi22_rlc_rejects_overlap_header_and_descriptor_errors() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/gfx-firmware",
     navi22_rlc_rejects_overlap_header_and_descriptor_errors
+);
+
+fn navi22_media_firmware_bounds_and_signed_instruction_selection() -> TestResult {
+    for (source, kind, size) in [(Source::Vcn, 13, 16), (Source::Dmcub, 51, 12)] {
+        let bytes = container(source);
+        let image = Image::parse(source, &bytes).unwrap();
+        let payload = image.payloads().next().unwrap();
+        if image.payloads().count() != 1
+            || payload.firmware_type() != kind
+            || payload.bytes() != &bytes[256..256 + size]
+        {
+            return TestResult::Fail("media firmware included header/BSS or wrong PSP type");
+        }
+        for len in 0..bytes.len() {
+            if Image::parse(source, &bytes[..len]).is_ok() {
+                return TestResult::Fail("truncated media firmware accepted");
+            }
+        }
+        for (field, value) in [
+            (0, 0),
+            (4, 44),
+            (8, 2),
+            (12, 4),
+            (20, 0),
+            (20, 12),
+            (20, u32::MAX),
+            (24, 0),
+            (24, 255),
+            (24, u32::MAX),
+        ] {
+            let mut bad = bytes.clone();
+            put(&mut bad, field, value);
+            if Image::parse(source, &bad).is_ok() {
+                return TestResult::Fail("invalid media descriptor accepted");
+            }
+        }
+        if source == Source::Dmcub {
+            for (field, value) in [
+                (32, 0),
+                (32, 13),
+                (32, 20),
+                (32, u32::MAX),
+                (36, 0),
+                (36, u32::MAX),
+            ] {
+                let mut bad = bytes.clone();
+                put(&mut bad, field, value);
+                if Image::parse(source, &bad).is_ok() {
+                    return TestResult::Fail("bad DMCUB instruction/BSS split accepted");
+                }
+            }
+            // Current Navy Flounder format combines all data in instructions.
+            let mut combined = bytes;
+            put(&mut combined, 32, 16);
+            put(&mut combined, 36, 0);
+            if Image::parse(source, &combined)
+                .unwrap()
+                .payloads()
+                .next()
+                .unwrap()
+                .bytes()
+                .len()
+                != 16
+            {
+                return TestResult::Fail("combined DMCUB layout refused");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx-firmware",
+    navi22_media_firmware_bounds_and_signed_instruction_selection
 );

@@ -303,8 +303,13 @@ the board's GFX frequency limits. Missing protections fail preflight; unexpected
 enabled features, rejection or cancellation prevent further bring-up/replay.
 Memory/display/link DPM and deep power states remain disabled until their
 owners can supply display and lifecycle constraints.
+The required firmware set now includes VCN and DMCUB. PSP receives those after
+RLC autoload, and their reported entry addresses must lie inside the retained
+TMR. Missing/malformed media images prevent startup before device writes;
+partial upload failures preserve ownership and prevent replay. Firmware load
+does not yet start VCN queues or relocate/start DMUB.
 These are software-tested foundations; training resume,
-video/display firmware, display-aware DPM and OS thermal interrupt handling,
+VCN/DMUB startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, GMC/GFX10 queue initialization, SDMA startup and DCN3.0
 modesetting remain open. See the
 [PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).

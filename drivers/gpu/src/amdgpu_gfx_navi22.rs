@@ -20,11 +20,31 @@ pub enum Error {
 }
 #[derive(Debug)]
 pub struct Firmware {
-    bytes: [Option<Vec<u8>>; 7],
+    bytes: [Option<Vec<u8>>; Source::ORDER.len()],
 }
 pub(crate) fn check_device(gpu: &AmdGpu) -> Result<(), Error> {
     crate::amdgpu_smu_navi22::mp1_bank(gpu).map_err(|_| Error::Unsupported)?;
     crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_SDMA0, &[(5, 2, 2)], 0, 0)
+        .map_err(|_| Error::Unsupported)?;
+    // amdgpu_ucode_ip_version_decode: 3.0.16 is Dimgrey Cavefish, not Navy.
+    crate::amdgpu_psp_ring::bank(
+        gpu,
+        discovery::HW_ID_VCN,
+        &[(3, 0, 0), (3, 0, 64), (3, 0, 192)],
+        0,
+        0,
+    )
+    .map_err(|_| Error::Unsupported)?;
+    if gpu
+        .ip_blocks
+        .iter()
+        .filter(|ip| ip.hw_id == discovery::HW_ID_VCN)
+        .count()
+        != 1
+    {
+        return Err(Error::Unsupported);
+    }
+    crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, &[(3, 0, 0)], 0, 0)
         .map_err(|_| Error::Unsupported)?;
     Ok(())
 }
@@ -88,8 +108,8 @@ impl Firmware {
         Ok(Self { bytes })
     }
     /// Validated views in upload order. MEC2 alone may be absent.
-    pub fn images(&self) -> Result<[Option<Image<'_>>; 7], Error> {
-        let mut images = [None; 7];
+    pub fn images(&self) -> Result<[Option<Image<'_>>; Source::ORDER.len()], Error> {
+        let mut images = [None; Source::ORDER.len()];
         for ((slot, bytes), source) in images.iter_mut().zip(&self.bytes).zip(Source::ORDER) {
             if let Some(bytes) = bytes {
                 *slot = Some(Image::parse(source, bytes).map_err(|e| Error::Image(source, e))?);

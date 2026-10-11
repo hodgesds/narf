@@ -9,7 +9,7 @@ pub(crate) fn fixture() -> Firmware {
     }
 }
 fn navi22_graphics_set_requires_all_images_except_missing_mec2() -> TestResult {
-    for i in 0..7 {
+    for i in 0..Source::ORDER.len() {
         let mut firmware = fixture();
         firmware.bytes[i] = None;
         if firmware.images().is_ok() != (Source::ORDER[i] == Source::Mec2) {
@@ -86,11 +86,13 @@ fn gpu() -> AmdGpu {
             ip(discovery::HW_ID_GC, (10, 3, 2)),
             ip(discovery::HW_ID_MP1, (11, 0, 11)),
             ip(discovery::HW_ID_SDMA0, (5, 2, 2)),
+            ip(discovery::HW_ID_VCN, (3, 0, 0)),
+            ip(discovery::HW_ID_DCN, (3, 0, 0)),
         ],
     }
 }
 fn navi22_graphics_set_checks_ip_and_live_registry_authority() -> TestResult {
-    for case in 0..6 {
+    for case in 0..10 {
         let mut bad = gpu();
         match case {
             0 => bad.chip.did = crate::amdgpu::PHOENIX1,
@@ -98,6 +100,10 @@ fn navi22_graphics_set_checks_ip_and_live_registry_authority() -> TestResult {
             2 => bad.ip_blocks[1].revision = 7,
             3 => bad.ip_blocks[2].revision = 0,
             4 => bad.ip_blocks.push(bad.ip_blocks[2]),
+            5 => bad.ip_blocks[3].revision = 16,
+            6 => bad.ip_blocks.push(bad.ip_blocks[3]),
+            7 => bad.ip_blocks[4].minor = 1,
+            8 => bad.ip_blocks.push(bad.ip_blocks[4]),
             _ => bad.ip_blocks.pop().map(|_| ()).unwrap(),
         }
         if check_device(&bad).is_ok() {

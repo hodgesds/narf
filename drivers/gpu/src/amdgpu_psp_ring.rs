@@ -323,6 +323,13 @@ pub struct Psp {
     session: Session<Mmio>,
     kind: Kind,
 }
+/// PSP-reported locations inside this session's retained trusted memory.
+/// These are GPU addresses, not CPU mappings; consumers must keep TMR alive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MediaFirmware {
+    pub vcn: Option<u64>,
+    pub dmcub: Option<u64>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Phoenix,
@@ -362,6 +369,7 @@ struct Session<I: Io> {
     smc_state: SmcState,
     gfx_state: GfxLoadState,
     gfx_status: Option<GfxBootStatus>,
+    media_firmware: MediaFirmware,
     fb_base: u64,
     fb_offset: u64,
 }
@@ -642,6 +650,7 @@ impl Psp {
                 smc_state: SmcState::Absent,
                 gfx_state: GfxLoadState::Absent,
                 gfx_status: None,
+                media_firmware: MediaFirmware::default(),
                 fb_base,
                 fb_offset,
             },
@@ -681,7 +690,10 @@ impl Psp {
         if self.kind != Kind::Phoenix {
             return Err(Error::Unsupported);
         }
-        self.session.load_ip(signed_instructions, 51).await
+        self.session
+            .load_ip(signed_instructions, 51)
+            .await
+            .map(|_| ())
     }
     /// Load Navi22 SMC once during cold boot, after trusted memory setup and
     /// before other IP firmware. Only microcode is sent, never the header/PPT.
@@ -716,6 +728,9 @@ impl Psp {
     }
     pub fn gfx_boot_status(&self) -> Option<GfxBootStatus> {
         self.session.gfx_status
+    }
+    pub fn media_firmware(&self) -> MediaFirmware {
+        self.session.media_firmware
     }
     /// Wait for idle CP and RLC BOOTLOAD_COMPLETE after this session's accepted
     /// autoload. No GC writes, queue initialization or fw_loaded publication.
@@ -824,7 +839,7 @@ impl<I: Io> Session<I> {
         Ok(())
     }
     /// Shared LOAD_IP_FW transport; public entry points select the image/type.
-    async fn load_ip(&mut self, bytes: &[u8], firmware_type: u32) -> Result<(), Error> {
+    async fn load_ip(&mut self, bytes: &[u8], firmware_type: u32) -> Result<Reply, Error> {
         if !self.tmr_ready {
             return Err(Error::Busy);
         }
@@ -834,7 +849,7 @@ impl<I: Io> Session<I> {
             .submit(&load_command(6, address, size, firmware_type))
             .await;
         self.release_payload();
-        result.map(|_| ())
+        result
     }
     async fn load_smc(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if self.smc_state != SmcState::Absent
@@ -845,7 +860,7 @@ impl<I: Io> Session<I> {
             return Err(Error::Busy);
         }
         self.smc_state = SmcState::Pending;
-        let result = self.load_ip(bytes, 18).await; // GFX_FW_TYPE_SMU
+        let result = self.load_ip(bytes, 18).await.map(|_| ()); // GFX_FW_TYPE_SMU
         self.smc_state = if result.is_ok() {
             SmcState::Loaded
         } else {
@@ -855,7 +870,8 @@ impl<I: Io> Session<I> {
     }
     async fn load_gfx(
         &mut self,
-        images: &[Option<crate::amdgpu_gfx_firmware::Image<'_>>; 7],
+        images: &[Option<crate::amdgpu_gfx_firmware::Image<'_>>;
+             crate::amdgpu_gfx_firmware::Source::ORDER.len()],
     ) -> Result<(), Error> {
         use crate::amdgpu_gfx_firmware::Source;
         if self.gfx_state != GfxLoadState::Absent
@@ -885,15 +901,43 @@ impl<I: Io> Session<I> {
     }
     async fn load_gfx_inner(
         &mut self,
-        images: &[Option<crate::amdgpu_gfx_firmware::Image<'_>>; 7],
+        images: &[Option<crate::amdgpu_gfx_firmware::Image<'_>>;
+             crate::amdgpu_gfx_firmware::Source::ORDER.len()],
     ) -> Result<(), Error> {
         for image in images.iter().flatten() {
             for payload in image.payloads() {
-                self.load_ip(payload.bytes(), payload.firmware_type())
+                let reply = self
+                    .load_ip(payload.bytes(), payload.firmware_type())
                     .await?;
+                if matches!(
+                    image.source(),
+                    crate::amdgpu_gfx_firmware::Source::Vcn
+                        | crate::amdgpu_gfx_firmware::Source::Dmcub
+                ) {
+                    let tmr = self.tmr.as_ref().ok_or(Error::Invalid)?;
+                    let offset = reply
+                        .address
+                        .checked_sub(tmr.address())
+                        .ok_or(Error::Invalid)?;
+                    // Bound the reported entry point, not a guessed unpacked
+                    // image size. PSP removes its signed container packaging.
+                    if reply.address % 4 != 0 || offset >= tmr.mapping().len {
+                        return Err(Error::Invalid);
+                    }
+                    if image.source() == crate::amdgpu_gfx_firmware::Source::Vcn {
+                        self.media_firmware.vcn = Some(reply.address);
+                    } else {
+                        self.media_firmware.dmcub = Some(reply.address);
+                    }
+                }
+            }
+            if image.source() == crate::amdgpu_gfx_firmware::Source::Rlc {
+                // Linux starts RLC immediately after RLC_G, before the later
+                // VCN and DMCUB uploads. Never delay/replay autoload for media.
+                self.engine.submit(&command(0x21, &[])).await?;
             }
         }
-        self.engine.submit(&command(0x21, &[])).await.map(|_| ())
+        Ok(())
     }
     async fn wait_gfx_boot(&mut self) -> Result<GfxBootStatus, Error> {
         if self.gfx_state != GfxLoadState::Accepted

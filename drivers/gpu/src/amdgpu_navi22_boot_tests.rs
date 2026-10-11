@@ -19,6 +19,7 @@ fn report() -> Report {
         },
         power: None,
         power_status: None,
+        media_firmware: psp::MediaFirmware::default(),
     }
 }
 struct Fake {

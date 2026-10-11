@@ -89,6 +89,7 @@ pub struct Report {
     pub gfx: psp::GfxBootStatus,
     pub power: Option<power::Info>,
     pub power_status: Option<smu::PowerStatus>,
+    pub media_firmware: psp::MediaFirmware,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -279,6 +280,7 @@ impl Backend for Hardware {
             gfx: self.gfx_status.ok_or(Error::Invalid)?,
             power: self.firmware.power.as_ref().map(power::Prepared::info),
             power_status: self.power_status,
+            media_firmware: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
         })
     }
 }
