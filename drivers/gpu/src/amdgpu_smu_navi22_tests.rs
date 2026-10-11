@@ -729,3 +729,79 @@ kernel_test_in!(
     "drivers/gpu/smu-navi22",
     smu_navi22_power_setup_rejects_unprotected_dpm_and_bad_limits
 );
+
+fn smu_navi22_display_policy_requires_retained_protected_power() -> TestResult {
+    let (mut e, _pool) = uploaded_engine();
+    if run(e.enable_display_power()) != Err(Error::Busy) {
+        return TestResult::Fail("display DPM before boot power");
+    }
+    run(e.configure_power()).unwrap();
+    let allowed = e.power_policy.unwrap().display_allowed().unwrap();
+    e.io.running = allowed;
+    e.io.writes.clear();
+    run(e.enable_display_power()).unwrap();
+    let commands: Vec<_> =
+        e.io.writes
+            .chunks_exact(3)
+            .map(|w| (w[2].1, w[1].1))
+            .collect();
+    if commands
+        != [
+            (5, (allowed >> 32) as u32),
+            (4, allowed as u32),
+            (6, 0),
+            (12, 0),
+            (13, 0),
+        ]
+        || e.state != State::DisplayPowerReady
+    {
+        return TestResult::Fail("display power transition protocol");
+    }
+    let n = e.io.writes.len();
+    if run(e.enable_display_power()).is_err() || e.io.writes.len() != n {
+        return TestResult::Fail("display power replayed");
+    }
+    e.authority.revoke();
+    if run(e.enable_display_power()) != Err(Error::Revoked) {
+        return TestResult::Fail("revoked power token accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_display_policy_requires_retained_protected_power
+);
+fn smu_navi22_display_policy_failure_and_cancellation_are_terminal() -> TestResult {
+    for fault in 0..5 {
+        let (mut e, _pool) = uploaded_engine();
+        run(e.configure_power()).unwrap();
+        e.io.running = e.power_policy.unwrap().display_allowed().unwrap();
+        match fault {
+            0 => e.io.reject = Some((ENABLE_FEATURES, 0xfd)),
+            1 => e.io.running &= !(1 << 8),
+            2 => e.io.running |= 1 << 17,
+            3 => e.io.revoke_on = Some((ALLOWED_LOW, e.authority)),
+            _ => e.io.stall = Some(ENABLE_FEATURES),
+        }
+        if fault == 4 {
+            let mut f = core::pin::pin!(e.enable_display_power());
+            if f.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+            {
+                return TestResult::Fail("stalled display DPM did not pend");
+            }
+        } else if run(e.enable_display_power()).is_ok() {
+            return TestResult::Fail("bad display DPM accepted");
+        }
+        let n = e.io.writes.len();
+        if run(e.enable_display_power()) != Err(Error::Busy) || e.io.writes.len() != n {
+            return TestResult::Fail("uncertain display power replayed");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi22",
+    smu_navi22_display_policy_failure_and_cancellation_are_terminal
+);

@@ -32,12 +32,17 @@ const BOOT_ALLOWED: u64 = (1 << 0)
     | (1 << 38)
     | (1 << 42);
 const BOOT_REQUIRED: u64 = (1 << 1) | (1 << 24) | (1 << 25) | (1 << 31) | (1 << 32) | (1 << 33);
+// DPM_UCLK/FCLK/SOCCLK/DCEFCLK plus board-supported memory rail scaling.
+// Deep sleep, link DPM, BACO and clock/power gating stay excluded.
+const DISPLAY_REQUIRED: u64 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 8);
+const DISPLAY_ALLOWED: u64 = DISPLAY_REQUIRED | (1 << 10) | (1 << 11);
 
 /// Board-supported GFX DPM and autonomous power/fan/thermal protection only.
 /// Memory, link and display clock transitions require a later DCN policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BootPolicy {
     allowed: u64,
+    board_features: u64,
 }
 impl BootPolicy {
     pub fn allowed(self) -> u64 {
@@ -49,10 +54,22 @@ impl BootPolicy {
         }
         Ok(Self {
             allowed: features & BOOT_ALLOWED,
+            board_features: features,
         })
     }
     pub(crate) fn validate_enabled(self, enabled: u64) -> bool {
         enabled & BOOT_REQUIRED == BOOT_REQUIRED && enabled & !self.allowed == 0
+    }
+    pub(crate) fn display_allowed(self) -> Result<u64, Error> {
+        if self.board_features & DISPLAY_REQUIRED != DISPLAY_REQUIRED {
+            return Err(Error::Unsupported);
+        }
+        Ok(self.allowed | (self.board_features & DISPLAY_ALLOWED))
+    }
+    pub(crate) fn validate_display(self, enabled: u64) -> bool {
+        let required = BOOT_REQUIRED | DISPLAY_REQUIRED;
+        self.display_allowed()
+            .is_ok_and(|allowed| enabled & required == required && enabled & !allowed == 0)
     }
 }
 

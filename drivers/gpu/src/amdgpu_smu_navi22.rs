@@ -124,6 +124,8 @@ pub enum State {
     PowerTableReady,
     ConfiguringPower,
     PowerReady,
+    EnablingDisplayPower,
+    DisplayPowerReady,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,12 +384,49 @@ impl<I: Io> Engine<I> {
         };
         result
     }
+    async fn enable_display_power(&mut self) -> Result<(), Error> {
+        if self.state == State::DisplayPowerReady {
+            return self.access(|_| ());
+        }
+        if self.state != State::PowerReady {
+            return Err(Error::Busy);
+        }
+        let policy = self.power_policy.ok_or(Error::Invalid)?;
+        let allowed = policy.display_allowed().map_err(|_| Error::Unsupported)?;
+        self.state = State::EnablingDisplayPower;
+        let result = async {
+            self.command(ALLOWED_HIGH, (allowed >> 32) as u32).await?;
+            self.command(ALLOWED_LOW, allowed as u32).await?;
+            self.command(ENABLE_FEATURES, 0).await?;
+            let low = self.command(RUNNING_LOW, 0).await?;
+            let high = self.command(RUNNING_HIGH, 0).await?;
+            let enabled = u64::from(low) | u64::from(high) << 32;
+            if !policy.validate_display(enabled) {
+                return Err(Error::Features { allowed, enabled });
+            }
+            Ok(())
+        }
+        .await;
+        self.state = if result.is_ok() {
+            State::DisplayPowerReady
+        } else {
+            State::Failed
+        };
+        result
+    }
 }
 #[derive(Debug)]
 pub struct Smu {
     engine: Engine<Mmio>,
 }
 impl Smu {
+    /// # Safety
+    /// Every display pipe and stream on this physical GPU must be retired.
+    /// The exclusive DCN owner must install memory/fabric/display floors before
+    /// enabling another stream. Cancellation retains EnablingDisplayPower.
+    pub(crate) async unsafe fn enable_display_power(&mut self) -> Result<(), Error> {
+        self.engine.enable_display_power().await
+    }
     /// # Safety
     /// Caller owns this physical GPU's MP1 mailbox and reset/power controls
     /// exclusively, with permanent mappings. PSP must have successfully loaded

@@ -206,6 +206,41 @@ impl<I: Io> Engine<I> {
         let (_, read_divider) = self.dispclk_dividers()?;
         self.update(DENTIST_DISPCLK_CNTL, 0x7f, read_divider)
     }
+
+    async fn dentist(&mut self, disp: u8, dpp: u8) -> Result<(), Error> {
+        if self.profile != Profile::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        if !(8..=127).contains(&disp) || !(8..=127).contains(&dpp) {
+            return Err(Error::Invalid);
+        }
+        // dcn20_update_clocks_update_dentist. The caller has retired every
+        // stream, so the DID127 FIFO add/drop-pixel loops have no consumers.
+        // These are requests, not ordinary readback registers: wait for both
+        // the completion bit and the actual DISP divider to settle.
+        for (mask, value, done, timeout_us, interval_us) in [
+            (0x7f, u32::from(disp), 1 << 19, 100_000, 50),
+            (0x7f00_0000, u32::from(dpp) << 24, 1 << 20, 500, 5),
+        ] {
+            self.update(DENTIST_DISPCLK_CNTL, mask, value)?;
+            let deadline = narf_time::Deadline::after_us(timeout_us);
+            loop {
+                let reg = self.access(|io| io.read(DENTIST_DISPCLK_CNTL))?;
+                if reg == u32::MAX {
+                    return Err(Error::DeviceGone);
+                }
+                if reg & done != 0 && (done != 1 << 19 || (reg >> 8) & 0x7f == u32::from(disp)) {
+                    break;
+                }
+                if deadline.expired() {
+                    return Err(Error::Timeout);
+                }
+                narf_time::SleepUntil::new(narf_time::Deadline::after_us(interval_us).as_instant())
+                    .await;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The sole owner of the DCN314 clock generator. Holding it does not grant the
@@ -259,6 +294,12 @@ impl Dccg {
     }
     pub fn update_dpp_dto(&mut self, pipe: u8, requested_khz: u32) -> Result<(), Error> {
         self.0.dpp_dto(pipe, requested_khz)
+    }
+    /// Called only by the Navi22 clock owner after checking all six OTGs and
+    /// stream encoders are idle. Its persistent InFlight state excludes a
+    /// second operation if this future is cancelled during a divider change.
+    pub(crate) async fn navi22_dentist(&mut self, disp: u8, dpp: u8) -> Result<(), Error> {
+        self.0.dentist(disp, dpp).await
     }
 }
 

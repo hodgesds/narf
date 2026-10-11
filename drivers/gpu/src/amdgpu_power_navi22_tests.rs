@@ -220,3 +220,40 @@ kernel_test_in!(
     "drivers/gpu/power-navi22",
     navi22_boot_power_policy_preserves_display_and_protection
 );
+
+fn navi22_display_dpm_respects_board_features_and_excludes_sleep() -> TestResult {
+    let p = BootPolicy::from_features(u64::MAX).unwrap();
+    let allowed = p.display_allowed().unwrap();
+    if allowed & !p.allowed() != 0xd38
+        || !p.validate_display(allowed)
+        || p.validate_display(allowed | (1 << 17))
+        || p.validate_display(allowed & !(1 << 31))
+    {
+        return TestResult::Fail("display DPM mask or protection validation");
+    }
+    for bit in [3, 4, 5, 8] {
+        if BootPolicy::from_features(u64::MAX & !(1 << bit))
+            .unwrap()
+            .display_allowed()
+            .is_ok()
+        {
+            return TestResult::Fail("board-missing display DPM feature invented");
+        }
+    }
+    for bit in [10, 11] {
+        if BootPolicy::from_features(u64::MAX & !(1 << bit))
+            .unwrap()
+            .display_allowed()
+            .unwrap()
+            & (1 << bit)
+            != 0
+        {
+            return TestResult::Fail("unsupported memory rail scaling enabled");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/power-navi22",
+    navi22_display_dpm_respects_board_features_and_excludes_sleep
+);

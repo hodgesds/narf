@@ -475,6 +475,27 @@ DCCG supports all six DPP DTOs and the shared DENTIST divider read/resync;
 Phoenix-only pixel-rate and DPIA mux methods return `Unsupported` before I/O
 on Navi22. These blocks do not by themselves establish a native display mode.
 
+`amdgpu_dcn30_clk::ClockManager` owns Navi22's separate DAL mailbox and DCCG.
+Its unsafe constructor requires the same exclusive physical GPU ownership as
+the retained SMU passed to `start`. Before enabling display DPM, it verifies
+that all six OTGs and DP streams have retired. SMU then extends its board-bounded
+boot policy with UCLK/FCLK/SOCCLK/DCEFCLK and supported memory rail scaling;
+autonomous thermal/power/fan protection remains required. Deep sleep, link DPM,
+BACO and gating remain excluded. Both owners retain in-flight state across
+cancellation and reject replay after incomplete or failed transitions.
+
+`start(smu)` reads the CLK02 PLL at dword `0x17010` and scalar DAL clock levels
+(including fine-grained min/max endpoints). It requires message-header version
+1 and records the driver-table version without assuming Sienna's table layout.
+`Levels::plan` rounds DISP/DPP requests to DENTIST frequencies within board
+limits; `ceiling` supplies their highest representable rates. `prepare(plan)`
+requires every stream idle, pins memory/fabric/SOC at their upper board states,
+sets the display count and DCF/PIX/DISP floors, checks firmware responses, then
+waits for DISP and DPP divider completion. No running stream changes clocks.
+`pipe_clock` programs a DTO only after successful preparation. No default PLL,
+clock table, voltage or memory bandwidth is invented. A failed modeset leaves
+floors retained. GDDR6 mode math and the full native pipeline remain separate.
+
 `amdgpu_navi22_boot::Firmware::open(gpu, registry_cap)` validates every required
 register bank and prepares the SOS, SMC and SDMA/CP/RLC firmware sets before any
 device operation. Missing required firmware or an invalid layout prevents the

@@ -333,8 +333,12 @@ timeouts, revocation and notification overflow; real-card validation is pending.
 Native display block owners now resolve Navi22's six-pipe DCN3.0 profile,
 including its OTG/ODM field differences, HUBP detile field and DisplayPort DIG
 reset sequence. The DPP/OPP/MPC and shared DCCG paths retain explicit bounds;
-Phoenix-only pixel/DPIA clock muxes are refused on Navi22. Native display clock
-policy, GDDR6 mode calculations and full modeset coordination are still pending.
+Phoenix-only pixel/DPIA clock muxes are refused on Navi22. The Navi22 DAL clock
+owner now reads board limits and the display PLL, enables bounded display DPM
+through the retained SMU, pins memory/fabric clocks and programs DENTIST only
+after every stream retires. Register models cover rounding, rejection,
+revocation, cancellation and divider completion. GDDR6 mode calculations and
+full modeset coordination are still pending.
 These are software-tested foundations; training resume,
 VCN startup, display-aware DPM and OS thermal interrupt handling,
 hardware boot, general GPU mappings/GFX10 queue initialization, production

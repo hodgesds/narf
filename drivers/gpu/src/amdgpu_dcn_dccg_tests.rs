@@ -6,6 +6,7 @@ struct Fake {
     values: Vec<u32>,
     writes: Vec<(u64, u32)>,
     gone: bool,
+    acknowledge: bool,
 }
 impl Fake {
     fn new() -> Self {
@@ -13,6 +14,7 @@ impl Fake {
             values: vec![0; LAST_REG as usize + 1],
             writes: Vec::new(),
             gone: false,
+            acknowledge: false,
         }
     }
 }
@@ -26,6 +28,9 @@ impl Io for Fake {
     fn write(&mut self, reg: u64, value: u32) {
         self.writes.push((reg, value));
         self.values[reg as usize] = value;
+        if self.acknowledge && reg == 0x64 {
+            self.values[reg as usize] = (value & !0x7f00) | (value & 0x7f) << 8 | 0x180000;
+        }
     }
 }
 fn dccg() -> Engine<Fake> {
@@ -221,4 +226,42 @@ fn dccg_single_pipe_consumer_tracks_the_global_clock() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-dccg",
     dccg_single_pipe_consumer_tracks_the_global_clock
+);
+
+fn dccg_navi22_dentist_waits_for_both_clock_changes() -> TestResult {
+    let mut e = dccg();
+    if narf_scheduler::block_on_spin(e.dentist(0x51, 0x52)) != Err(Error::Unsupported) {
+        return TestResult::Fail("Navi22 DENTIST used on Phoenix");
+    }
+    e.profile = Profile::Navi22;
+    e.io.acknowledge = true;
+    narf_scheduler::block_on_spin(e.dentist(0x51, 0x52)).unwrap();
+    if e.io.writes != [(0x64, 0x51), (0x64, 0x52185151)] {
+        return TestResult::Fail("DISP completion not observed before DPP request");
+    }
+    let n = e.io.writes.len();
+    if narf_scheduler::block_on_spin(e.dentist(7, 0x52)) != Err(Error::Invalid)
+        || e.io.writes.len() != n
+    {
+        return TestResult::Fail("invalid DENTIST id written");
+    }
+    e.io.acknowledge = false;
+    e.io.values[0x64] = 0;
+    if narf_scheduler::block_on_spin(e.dentist(0x51, 0x52)) != Err(Error::Timeout)
+        || e.io.writes.len() != n + 1
+    {
+        return TestResult::Fail("stalled DISP change advanced to DPP");
+    }
+    e.authority.revoke();
+    let n = e.io.writes.len();
+    if narf_scheduler::block_on_spin(e.dentist(0x51, 0x52)) != Err(Error::Revoked)
+        || e.io.writes.len() != n
+    {
+        return TestResult::Fail("revoked DENTIST write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-dccg",
+    dccg_navi22_dentist_waits_for_both_clock_changes
 );
