@@ -425,6 +425,22 @@ pub async unsafe fn retire_display_dp_encoder(
     unsafe { boot.retire_display_dp_encoder(stream).await }
 }
 
+/// Retire one OTG and its clocks while retaining TMDS transmitters.
+/// # Safety
+/// Fulfil `Otg::retire_tmds_timing` frontend/audio/metadata/HDCP retirement
+/// and writer-exclusion obligations. Retain all memory and translations;
+/// future PHY shutdown needs fresh checks of every timing and clock user.
+pub async unsafe fn retire_display_tmds_timing(
+    pipe: u8,
+) -> Result<crate::amdgpu_dcn401_otg::TmdsTimingRetired, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: retained serialized owner; caller fulfils the documented obligations.
+    unsafe { boot.retire_display_tmds_timing(pipe).await }
+}
+
 /// Retire a native TMDS HDMI frontend while retaining backend/PHY/OTG clocks.
 /// # Safety
 /// Fulfil `Otg::retire_hdmi_tmds_encoder` sink/SCDC/retimer, audio/metadata/HDCP

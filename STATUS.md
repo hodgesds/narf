@@ -363,7 +363,12 @@ stream attributes and stops the FIFO/frontend with DISPCLK/SYMCLK/TMDS clock-off
 witnesses before disconnecting selected routes. Live audio/metadata, ambiguous
 routing and pending transactions reject before writes; failures and cancellation
 quarantine the owner. Backend/PHY/OTG clocks stay retained for the TMDS timing
-symclk dependency. HDMI FRL, TMDS backend/PHY shutdown, eDP, sink/MST/audio teardown
+symclk dependency. A separate TMDS timing-retirement operation now requires
+all frontends detached, validates stable TMDS backend/PHY state, stops one OTG,
+clears latched underflow and acknowledges its OTG/input clocks off. It preserves
+other timing generators and every PHY; fresh consumer checks remain mandatory
+before transmitter shutdown. Failure/cancellation retain and quarantine the owner.
+HDMI FRL, TMDS backend/PHY shutdown, eDP, sink/MST/audio teardown
 and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths

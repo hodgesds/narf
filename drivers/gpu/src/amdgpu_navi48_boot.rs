@@ -869,6 +869,27 @@ impl ColdBoot {
         // SAFETY: caller retains scanout memory; matching exclusive display owner.
         unsafe { self.otg.as_mut().map_err(|e| *e)?.retire(pipe).await }
     }
+    /// Retire one OTG and its clocks while retaining TMDS transmitters.
+    /// # Safety
+    /// Fulfil `Otg::retire_tmds_timing` frontend/audio/metadata/HDCP retirement
+    /// and writer-exclusion obligations. Retain all memory and translations;
+    /// future PHY shutdown needs fresh checks of every timing and clock user.
+    pub async unsafe fn retire_display_tmds_timing(
+        &mut self,
+        pipe: u8,
+    ) -> Result<otg::TmdsTimingRetired, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: matching retained owner; caller fulfils the documented obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .retire_tmds_timing(pipe)
+                .await
+        }
+    }
     /// Disconnect all inherited native planes while retaining their resources.
     /// # Safety
     /// Stop CPU writers, exclude concurrent surface/cursor/metadata/LUT, MPC,

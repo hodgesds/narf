@@ -51,7 +51,7 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    fn hdmi_packets_stopped(&mut self, s: u8) -> Result<(), Error> {
+    pub(super) fn hdmi_packets_stopped(&mut self, s: u8) -> Result<(), Error> {
         for (reg, mask) in [
             (PACKETS, u32::MAX),
             (PACKETS_HIGH, u32::MAX),

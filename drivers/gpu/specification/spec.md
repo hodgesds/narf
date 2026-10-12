@@ -661,6 +661,28 @@ Failure after starting enters `Failed`; cancellation retains
 `RetiringHdmiTmds(stream)`. Both block owner/clock/mailbox reuse until an
 independent reset. HDMI FRL and complete TMDS backend/PHY shutdown remain open.
 
+`unsafe ColdBoot::retire_display_tmds_timing(pipe).await` and its serialized
+platform wrapper break the TMDS timing/PHY-clock shutdown dependency. Unlike
+general timing retirement, this operation allows live TMDS backends and PHYs;
+all frontends, FIFO/stream clocks, HPO/FRL links, audio and metadata must already
+be stopped, and every backend frontend route detached. Live retained outputs
+must have HDMI backend mode and legacy PHY muxing, without pending PHY
+handshakes or backend resets. The operation snapshots backend routing, enable,
+clocks, PHY muxes and lane/clock state across all four transmitters.
+It disconnects the selected ODM inputs, stops OTG/VTG, waits for current-master
+and busy acknowledgements, clears latched input underflow through the native
+W1C command, then gates OTG followed by input clocks and waits for both to stop.
+Retained link state and producer quiescence are rechecked before clock gating
+and after completion. Other timing generators and all backend/PHY clocks remain
+untouched. Pending master/input updates and resets reject before writes.
+Success records `TmdsTimingRetired { pipe, retained_transmitters }` in
+`Otg::Status::tmds_timing_retired`; it retires only that timing/clock consumer,
+never HUBP fetches, PHYs or memory. Failure enters `Failed`; cancellation retains
+`RetiringTmdsTiming(pipe)`. Both prohibit reuse until independent reset. Callers
+must retain all allocations/translations and exclude CPU/firmware/FAMS and
+concurrent display/link/clock/power writers. Future PHY shutdown must check all
+live timing and clock users independently of this historical result.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

@@ -324,6 +324,7 @@ fn engine() -> Engine<Fake> {
             hpo_link_retired: None,
             hpo_dp_disabled: None,
             hdmi_tmds_retired: None,
+            tmds_timing_retired: None,
             retired: 0,
         },
     }
@@ -1050,3 +1051,6 @@ mod link;
 
 #[path = "amdgpu_dcn401_hdmi_tests.rs"]
 mod hdmi;
+
+#[path = "amdgpu_dcn401_tmds_timing_tests.rs"]
+mod tmds_timing;
