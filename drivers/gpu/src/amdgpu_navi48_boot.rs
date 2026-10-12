@@ -832,6 +832,33 @@ impl ColdBoot {
             .prepare_blank(clocks, dccg, request)
             .await
     }
+    /// Start internal black timing after the drained kernel queue proofs.
+    /// # Safety
+    /// Stop CPU scanout writers, exclude other fetcher/cursor/metadata writers
+    /// and retain all inherited and owned surfaces, page tables, HUBP and OPP
+    /// resources. Completion does not authorize freeing them or starting links.
+    pub async unsafe fn start_display_blank(
+        &mut self,
+        pipe: u8,
+    ) -> Result<otg::BlankRunning, otg::Error> {
+        if self.state() != State::MemoryReady
+            || self.queue_state() != Some(queues::State::InterruptVerified)
+            || self.sdma_state() != Some(sdma::State::InterruptVerified)
+        {
+            return Err(otg::Error::Busy);
+        }
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        // SAFETY: caller retains scanout resources and excludes other writers;
+        // retained matching owners serialize native timing and clocks.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_blank(clocks, dccg, pipe)
+                .await
+        }
+    }
     /// # Safety
     /// All associated scanout resources remain retained and CPU writers have
     /// stopped. This retires timing only, never HUBP fetches or surface memory.

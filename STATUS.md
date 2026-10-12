@@ -316,9 +316,16 @@ ownership and block clock changes; timing retirement never releases scanout
 memory. The retained timing owner also stages native OPP full-range RGB
 formatting at 8/10/12 bpc and a black DPG pattern, clears inherited color offsets,
 and requires OPP clock acknowledgement. It records pending double-buffer state
-without claiming active blanking while timing is disabled. PHY/link and plane
-programming, timing/blank completion and scanout enable, active-stream
-transitions, bandwidth/watermarks and complete native modesetting remain open.
+without claiming active blanking while timing is disabled. An explicit internal
+black-timing start now requires positive stopped-fetcher witnesses on every
+HUBP and live clock/timing/formatter readback. Native VTG-before-OTG sequencing
+waits for current-master acknowledgement, blank-buffer latching and a fresh
+frame-counter transition under one bounded deadline. Running timing blocks
+clock changes until acknowledged retirement; failure/cancellation quarantine
+the owner and retain every scanout allocation. TMDS still needs a native PHY
+PLL proof. Inherited plane retirement, PHY/link and plane programming, surface
+scanout enable, active-stream transitions, bandwidth/watermarks and complete
+native modesetting remain open. This path has model tests, not silicon validation.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
 C layouts. Its retained unified-firmware owner starts both pipes, configures

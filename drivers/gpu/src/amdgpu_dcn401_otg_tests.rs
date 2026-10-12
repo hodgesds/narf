@@ -10,12 +10,15 @@ const BASE: u64 = 0x10000;
 struct Fake {
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
-    stall: u8, // input clock, OTG clock, current master, busy, OPP clock
+    // input clock, OTG clock, retire master/busy, OPP clock, enable master,
+    // DPG latch, FMT latch, frame progress
+    stall: u16,
     retiring: [bool; 4],
     delay: [u8; 4],
     reject: Option<usize>,
     gone: Option<usize>,
     revoke: Option<(usize, Cap<BusDeviceCap, Write>)>,
+    after_enable: Option<(u64, u32)>,
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
@@ -36,6 +39,20 @@ impl Io for Fake {
             }
             if at == opp && old & 1 == 1 && self.stall & 16 == 0 {
                 self.regs.insert(at, old | 2);
+            }
+            if self.regs.get(&ctrl).copied().unwrap_or(0) & 1 != 0 {
+                if at == ctrl && self.stall & 32 == 0 {
+                    self.regs.insert(at, old | 0x10000);
+                }
+                if at == BASE + (0x185b + 0x5a * p) * 4 && self.stall & 64 == 0 {
+                    self.regs.insert(at, old & !1);
+                }
+                if at == BASE + (0x1840 + 0x5a * p) * 4 && self.stall & 128 == 0 {
+                    self.regs.insert(at, old & !0x1000000);
+                }
+                if at == BASE + (0x1b4d + 0x80 * p) * 4 && self.stall & 256 == 0 {
+                    self.regs.insert(at, old.wrapping_add(1) & 0xffffff);
+                }
             }
             if self.retiring[p as usize] && (at == ctrl || at == clock) {
                 if self.delay[p as usize] != 0 {
@@ -60,8 +77,13 @@ impl Io for Fake {
             if at == BASE + (0x1854 + 0x5a * p) * 4 {
                 self.regs.insert(BASE + (0x185b + 0x5a * p) * 4, 1);
             }
-            if at == BASE + (0x1b43 + 0x80 * p) * 4 && value & 1 == 0 {
-                self.retiring[p as usize] = true;
+            if at == BASE + (0x1b43 + 0x80 * p) * 4 {
+                self.retiring[p as usize] = value & 1 == 0;
+                if value & 1 != 0 {
+                    if let Some((at, value)) = self.after_enable.take() {
+                        self.regs.insert(at, value);
+                    }
+                }
             }
         }
         if let Some((n, cap)) = self.revoke {
@@ -100,6 +122,7 @@ fn engine() -> Engine<Fake> {
             reject: None,
             gone: None,
             revoke: None,
+            after_enable: None,
         },
         authority: Cap::bootstrap(),
         layout: Layout::resolve(&gpu).unwrap(),
@@ -107,6 +130,7 @@ fn engine() -> Engine<Fake> {
             state: State::Ready,
             pipes: [None; 4],
             blanks: [None; 4],
+            running_blank: None,
             retired: 0,
         },
     }
@@ -814,3 +838,6 @@ kernel_test_in!(
     "drivers/gpu/dcn401-opp",
     dcn401_opp_partial_failures_and_cancellation_block_clock_reuse
 );
+
+#[path = "amdgpu_dcn401_blank_tests.rs"]
+mod blank;

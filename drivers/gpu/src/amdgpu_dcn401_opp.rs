@@ -2,6 +2,10 @@
 //! Linux uses dcn10_opp.c/dcn20_opp.c with native DCN4 register banks.
 use super::*;
 
+#[path = "amdgpu_dcn401_blank.rs"]
+mod blank;
+pub use blank::BlankRunning;
+
 const EXPANSION: u64 = 0x183f;
 const FMT: u64 = 0x1840;
 const DEPTH: u64 = 0x1841;
@@ -47,6 +51,37 @@ impl ColorDepth {
 pub struct BlankRequest {
     pub pipe: u8,
     pub depth: ColorDepth,
+}
+impl BlankRequest {
+    fn registers(self, t: Timing) -> [(u64, u32, u32); 14] {
+        [
+            (EDGE, 1, 0), // no chroma filter extra pixel for RGB
+            // Explicit truncation, no spatial/temporal dithering or randomization.
+            (DEPTH, 0x1ff33, self.depth.truncate()),
+            // Clear RGB/YUV offsets as well as the inactive dither seeds.
+            (SEED_R, 0xffff00ff, 0),
+            (SEED_G, 0xffff00ff, 0),
+            (SEED_B, 0xffff00ff, 0),
+            (FMT, 0x2f3f00, 0),  // RGB, frame counter/randomization off
+            (CLAMP, 0x70001, 1), // full range
+            (
+                EXPANSION,
+                0x11,
+                if self.depth == ColorDepth::Bpc8 {
+                    0x11
+                } else {
+                    1
+                },
+            ),
+            (DIMENSIONS, 0x3fff3fff, t.h_active << 16 | t.v_active),
+            (OFFSET, 0x3fff3fff, 0),
+            (BLUE, u32::MAX, 0),
+            (GREEN, u32::MAX, 0),
+            (RED, u32::MAX, 0),
+            // Equal black bars; clear range/resolution/field-polarity.
+            (DPG, 0x01ff3171, 0x41 | self.depth.dpg() << 12),
+        ]
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlankApplied {
@@ -94,36 +129,9 @@ impl<I: Io> Engine<I> {
         }
         self.update(at(PIPE), 1, 1)?;
         self.wait(at(PIPE), 2, 2, 1000).await?;
-        // No chroma filter extra pixel for RGB.
-        self.update(at(EDGE), 1, 0)?;
-        // Explicit truncation, no spatial/temporal dithering or randomization.
-        // Inactive temporal selectors are preserved.
-        self.update(at(DEPTH), 0x1ff33, request.depth.truncate())?;
-        // These registers also contain color offsets. Clear inherited YCbCr
-        // offsets even though RGB dithering itself is disabled.
-        for r in [SEED_R, SEED_G, SEED_B] {
-            self.update(at(r), 0xffff00ff, 0)?;
+        for (r, mask, value) in request.registers(timing.request.timing) {
+            self.update(at(r), mask, value)?;
         }
-        self.update(at(FMT), 0x2f3f00, 0)?; // RGB, frame counter/randomization off
-        self.update(at(CLAMP), 0x70001, 1)?; // full range
-        self.update(
-            at(EXPANSION),
-            0x11,
-            if request.depth == ColorDepth::Bpc8 {
-                0x11
-            } else {
-                1
-            },
-        )?;
-        let t = timing.request.timing;
-        self.update(at(DIMENSIONS), 0x3fff3fff, t.h_active << 16 | t.v_active)?;
-        self.update(at(OFFSET), 0x3fff3fff, 0)?;
-        for r in [BLUE, GREEN, RED] {
-            self.update(at(r), u32::MAX, 0)?;
-        }
-        // Equal black color0/color1 make horizontal bars a solid blank.
-        // Clear inherited range/resolution/field-polarity; program actual bpc.
-        self.update(at(DPG), 0x01ff3171, 0x41 | request.depth.dpg() << 12)?;
         let pending = self.read(at(PENDING))? & 1 != 0;
         Ok(BlankApplied {
             request,

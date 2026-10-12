@@ -350,6 +350,22 @@ pub async fn prepare_display_blank(
         .await
 }
 
+/// Start internal black timing while fetchers and external streams stay stopped.
+/// # Safety
+/// Stop CPU scanout writers, exclude other fetcher/cursor/metadata writers and
+/// retain all associated surfaces, page tables, HUBP and OPP resources. Success
+/// does not permit freeing resources or enabling a plane/link.
+pub async unsafe fn start_display_blank(
+    pipe: u8,
+) -> Result<crate::amdgpu_dcn401_otg::BlankRunning, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: owner serializes display/PM; caller retains memory and excludes writers.
+    unsafe { boot.start_display_blank(pipe).await }
+}
+
 /// # Safety
 /// Stop scanout CPU writers and retain every associated surface, page table,
 /// HUBP and OPP resource. Completion proves timing retirement only.

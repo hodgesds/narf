@@ -371,8 +371,8 @@ programming tagged with its clock snapshot; changing clocks invalidates it.
 `ColdBoot::prepare_display_timing`/`unsafe retire_display_timing` and matching
 platform wrappers serialize these operations after the drained kernel proofs.
 `display_timing_status`/platform `display_timing` report retained state. None of
-these operations runs automatically during boot. Plane/OPP setup, bandwidth and
-watermarks, link/PHY programming and scanout enable remain required.
+these operations runs automatically during boot. Plane setup, bandwidth and
+watermarks, link/PHY programming and surface scanout enable remain required.
 
 The same timing owner also exposes
 `prepare_blank(&mut ClockManager, &mut Dccg, BlankRequest).await` for native
@@ -389,12 +389,44 @@ dither-seed registers, and programs full-range clamping and dynamic expansion.
 DPG stages equal black color values with the prepared active dimensions,
 zero offset and the selected component depth. Every field is read back.
 `BlankApplied::pending` captures DPG's double-buffer state; it is diagnostic,
-not proof that blanking is active. Native blank completion must be checked
-after future timing enable. `PreparingBlank(pipe)`/failure block replay and
+not proof that blanking is active. Native blank completion is checked
+after timing enable by `start_blank`. `PreparingBlank(pipe)`/failure block replay and
 platform clock changes; `BlankPrepared` records only successful staging in
 `Status::blanks`. Reprogramming or retiring a pipe clears its staged record.
 `ColdBoot::prepare_display_blank` and the matching platform wrapper retain the
 same clock/PM/timing ownership. They do not enable timing, a plane or a link.
+
+`unsafe start_blank(&mut ClockManager, &mut Dccg, pipe).await` starts that
+prepared internal black pattern on one OTG. It requires stopped CPU scanout
+writers, exclusive fetcher/cursor/metadata ownership and retention of all
+associated surfaces, page tables, HUBP and OPP resources, including inherited
+ones. All other timing generators and every external stream/link clock must
+remain stopped. Each of the four HUBPs must positively acknowledge no outstanding
+requests, with blank and TTU-disable asserted, soft reset clear, fetch clock
+disabled, cursor disabled, and no enabled/queued dynamic-metadata fetch. Zero
+reads do not satisfy these conditions. This operation cannot retire an inherited
+plane; it returns `Busy` when those prerequisites are absent.
+
+Startup verifies matching retained timing/blank snapshots, current native DTO
+clocks and live timing/OPP/formatter programming. TMDS returns `Unsupported`
+until a native PHY PLL owner exists. Native sequencing selects the OPP, enables
+VTG first (the DCN401 workaround), then enables OTG at disable point 2. Success
+requires current-master acknowledgement, cleared DPG and FMT double-buffer
+pending bits, and a subsequent fresh 24-bit frame-counter transition (including
+wrap). One shared deadline allows three frame periods plus 5 ms; modes requiring
+more than 1 second are rejected before writes. Final readback rechecks the black
+pattern, timing, stopped fetchers and external consumers.
+
+`BlankRunning` records the staged pattern and two observed frame counts in
+`Status::running_blank`. `RunningBlank(pipe)` blocks preparation and platform
+clock changes until acknowledged `retire(pipe)` clears that record. Only the
+running pipe can be retired in this state. Failure records `Failed`; cancellation
+retains `StartingBlank(pipe)`, preventing replay and ordinary retirement until
+independent reset. No outcome releases scanout allocations. Successful internal
+blank timing proves neither physical link output nor plane/bandwidth readiness.
+`unsafe ColdBoot::start_display_blank` and its platform wrapper preserve the same
+ownership and require the drained GC12/SDMA interrupt proofs; startup remains an
+explicit operation, not part of boot's framebuffer handoff.
 
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,

@@ -1,7 +1,7 @@
 //! Native DCN401 timing preparation and retirement. Register layout comes
 //! from dcn_4_1_0; sequencing from Linux dcn401_optc.c/dcn10_optc.c.
-//! Progressive RGB, fixed refresh and one OPP per OTG only. No scanout enable:
-//! link, plane, bandwidth and watermark owners must precede that operation.
+//! Progressive RGB, fixed refresh and one OPP per OTG only. Internal black
+//! timing can run with fetchers stopped; surface/link scanout needs its owners.
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn401_clk as clocks, amdgpu_dcn401_dccg as dccg,
     amdgpu_discovery as ip, amdgpu_dml::Timing,
@@ -11,7 +11,7 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 #[path = "amdgpu_dcn401_opp.rs"]
 mod opp;
-pub use opp::{BlankApplied, BlankRequest, ColorDepth};
+pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -57,6 +57,8 @@ pub enum State {
     Prepared,
     PreparingBlank(u8),
     BlankPrepared,
+    StartingBlank(u8),
+    RunningBlank(u8),
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -117,6 +119,9 @@ pub struct Status {
     pub pipes: [Option<Applied>; 4],
     /// Staged OPP/FMT programming; never a proof of active blanking.
     pub blanks: [Option<BlankApplied>; 4],
+    /// Historical internal blank completion, valid only in RunningBlank.
+    /// Does not prove link output or authorize scanout allocation reuse.
+    pub running_blank: Option<BlankRunning>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -126,6 +131,42 @@ struct Plan {
     h_blank: u32,
     v_blank: u32,
     vtg: u32,
+}
+impl Plan {
+    fn registers(self) -> [(u64, u32, u32); 16] {
+        let Request {
+            timing: t,
+            sync: s,
+            signal,
+            ..
+        } = self.request;
+        [
+            (H_TOTAL, 0x7fff, t.h_total - 1),
+            (H_SYNC, 0x7fff7fff, t.h_sync_width << 16),
+            (H_BLANK, 0x7fff7fff, self.h_blank),
+            (H_POL, 1, u32::from(!t.h_sync_positive)),
+            (V_TOTAL, 0x7fff, t.v_total - 1),
+            (V_MIN, 0x7fff, t.v_total - 1),
+            (V_MAX, 0x7fff, t.v_total - 1),
+            (V_SYNC, 0x7fff7fff, t.v_sync_width << 16),
+            (V_BLANK, 0x7fff7fff, self.v_blank),
+            (V_POL, 1, u32::from(!t.v_sync_positive)),
+            (INTERLACE, 1, 0),
+            (CONTROL, 0x303000, signal.control()),
+            (STARTUP, 0x3ff, s.vstartup),
+            (UPDATE, 0x3ffffff, s.vupdate_offset | s.vupdate_width << 16),
+            (READY, 0xffff, s.vready_offset),
+            (PSTATE, 0x7fff, s.pstate_keepout),
+        ]
+    }
+    fn h_divider(self) -> u32 {
+        ((self.request.timing.h_total
+            | self.request.timing.h_sync_width
+            | self.h_blank
+            | (self.h_blank >> 16))
+            & 1)
+            << 8
+    }
 }
 impl Request {
     fn plan(self) -> Result<Plan, Error> {
@@ -278,7 +319,9 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     fn preflight(&mut self, pipe: u8, retire: bool) -> Result<(), Error> {
-        if !self.status.state.reusable() {
+        if !(self.status.state.reusable()
+            || retire && self.status.state == State::RunningBlank(pipe))
+        {
             return Err(Error::Busy);
         }
         if pipe >= 4 {
@@ -313,12 +356,7 @@ impl<I: Io> Engine<I> {
     }
     async fn program(&mut self, plan: Plan) -> Result<(), Error> {
         let l = self.layout;
-        let Request {
-            pipe,
-            timing: t,
-            sync: s,
-            signal,
-        } = plan.request;
+        let pipe = plan.request.pipe;
         let odm = |r| l.odm(pipe, r);
         let otg = |r| l.otg(pipe, r);
         self.update(odm(INPUT_CLOCK), 3, 3)?;
@@ -331,30 +369,12 @@ impl<I: Io> Engine<I> {
         self.update(odm(SOURCE), u32::MAX, 0xfff00000 | u32::from(pipe) << 16)?;
         // Native HW may select divide-by-two automatically only if every
         // horizontal boundary is even. Odd timings require manual no-divide.
-        let manual = (t.h_total | t.h_sync_width | plan.h_blank | (plan.h_blank >> 16)) & 1;
-        self.update(otg(H_TIMING), 0x103, manual << 8)?;
+        self.update(otg(H_TIMING), 0x103, plan.h_divider())?;
         self.update(odm(MEMORY), 0xffff, 0)?;
         // Fixed refresh; clear inherited DRR selectors before setting equal
         // total/min/max. No DMUB FAMS delegation is active under this owner.
         self.update(otg(V_CONTROL), 0xffff0013, 0)?;
-        for (r, mask, value) in [
-            (H_TOTAL, 0x7fff, t.h_total - 1),
-            (H_SYNC, 0x7fff7fff, t.h_sync_width << 16),
-            (H_BLANK, 0x7fff7fff, plan.h_blank),
-            (H_POL, 1, u32::from(!t.h_sync_positive)),
-            (V_TOTAL, 0x7fff, t.v_total - 1),
-            (V_MIN, 0x7fff, t.v_total - 1),
-            (V_MAX, 0x7fff, t.v_total - 1),
-            (V_SYNC, 0x7fff7fff, t.v_sync_width << 16),
-            (V_BLANK, 0x7fff7fff, plan.v_blank),
-            (V_POL, 1, u32::from(!t.v_sync_positive)),
-            (INTERLACE, 1, 0),
-            (CONTROL, 0x303000, signal.control()),
-            (STARTUP, 0x3ff, s.vstartup),
-            (UPDATE, 0x3ffffff, s.vupdate_offset | s.vupdate_width << 16),
-            (READY, 0xffff, s.vready_offset),
-            (PSTATE, 0x7fff, s.pstate_keepout),
-        ] {
+        for (r, mask, value) in plan.registers() {
             self.update(otg(r), mask, value)?;
         }
         self.update(l.vtg(pipe), 0x7fff7fff, plan.vtg)?;
@@ -397,6 +417,7 @@ impl<I: Io> Engine<I> {
             Ok(()) => {
                 self.status.pipes[usize::from(pipe)] = None;
                 self.status.blanks[usize::from(pipe)] = None;
+                self.status.running_blank = None;
                 self.status.retired |= 1 << pipe;
                 self.status.state = State::Retired;
                 Ok(())
@@ -427,6 +448,7 @@ impl Otg {
                 state: State::Ready,
                 pipes: [None; 4],
                 blanks: [None; 4],
+                running_blank: None,
                 retired: 0,
             },
         }))
