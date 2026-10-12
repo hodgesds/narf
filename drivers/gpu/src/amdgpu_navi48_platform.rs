@@ -123,6 +123,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         return Err(Error::Busy);
     }
     let authority = amdgpu::pci_authority().ok_or(Error::Authority)?;
+    let pci = amdgpu::pci_device().ok_or(Error::Authority)?;
     let registry: Cap<narf_firmware::FirmwareRegistry, Read> =
         narf_firmware::trusted_loader_authority()
             .ok_or(Error::Authority)?
@@ -133,7 +134,7 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         let firmware = boot::Firmware::open(
             gpu,
             &registry,
-            crate::amdgpu_navi48_firmware::MesMode::Separate,
+            crate::amdgpu_navi48_firmware::MesMode::Unified,
         )
         .map_err(Error::Firmware)?;
         let end = gpu
@@ -156,8 +157,9 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
         let pool = unsafe { plan.into_pool() }.map_err(Error::Memory)?;
         // SAFETY: inventory covers every inherited client and CPU framebuffer
         // writers are paused. Construction performs bounded reads, never writes.
-        let prepared = unsafe { boot::ColdBoot::new(gpu, authority, &pool, firmware, training) }
-            .map_err(Error::Firmware)?;
+        let prepared =
+            unsafe { boot::ColdBoot::new(gpu, pci, authority, &pool, firmware, training) }
+                .map_err(Error::Firmware)?;
         *owner = Some(prepared);
         Ok(Some(affected))
     })

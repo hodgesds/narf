@@ -288,7 +288,11 @@ segmented EDID discovery, including bounded DEFER retries, per-port errors and
 cancellation quarantine. HDMI DDC and native link/scanout programming remain open.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
-C layouts. Live MES12 queue ownership and doorbell submission remain open.
+C layouts. Its retained unified-firmware owner starts both pipes, configures
+PCIe BAR2 doorbells, maps the scheduler through KIQ and verifies native command
+completion plus full ring drain. The boot sequence includes this firmware-queue
+handshake; it grants no application queues or user VMIDs yet. Cancellation and
+failure retain all published queue memory and prevent replay.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer

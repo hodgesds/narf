@@ -1,0 +1,443 @@
+use super::*;
+use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use core::{
+    future::Future,
+    sync::atomic::AtomicU32,
+    task::{Context, Waker},
+};
+use narf_kernel_test::{kernel_test_in, TestResult};
+const GC: u64 = 0x10000;
+const HYP: u64 = 0x40000;
+const NBIO: u64 = 0x60000;
+const GPU: u64 = 0x8_0000_4000;
+const INDEX: u64 = 0x42400;
+
+struct Fake {
+    index: u32,
+    regs: BTreeMap<(u32, u64), u32>,
+    memory: Vec<u32>,
+    writes: Vec<(u32, u64, u32)>,
+    frames: Vec<(usize, u8)>,
+    tails: [u64; 2],
+    dirty: bool,
+    active: [bool; 2],
+    complete: bool,
+    reject: bool,
+    drain_only: bool,
+    rptr_stuck: bool,
+    bad_version: bool,
+    refuse: Option<u64>,
+    progress: Arc<AtomicU32>,
+    revoke: Option<Cap<BusDeviceCap, Write>>,
+}
+impl Fake {
+    fn slot(&self, address: u64) -> usize {
+        match address {
+            0x17ea4..=0x17f2c | 0x4a000 | 0x4a274 => self.index as usize,
+            _ => 0,
+        }
+    }
+    fn put(&mut self, address: u64, value: u64) {
+        assert!((GPU..GPU + 40960 - 7).contains(&address));
+        assert_eq!(address % 8, 0);
+        let n = ((address - GPU) / 4) as usize;
+        self.memory[n] = value as u32;
+        self.memory[n + 1] = (value >> 32) as u32;
+    }
+    fn get(&self, at: usize) -> u64 {
+        u64::from(self.memory[at]) | (u64::from(self.memory[at + 1]) << 32)
+    }
+    fn execute(&mut self, pipe: usize, tail: u64) {
+        assert!(self.active[pipe], "doorbell before queue activation");
+        assert!(!self.dirty, "doorbell before HDP flush");
+        let off = pipe * 5120;
+        assert_eq!(self.get(off + 3074), tail, "writeback before doorbell");
+        assert_eq!(tail - self.tails[pipe], 128);
+        for frame in 0..2 {
+            let n = off + ((self.tails[pipe] as usize + frame * 64) % 1024);
+            let words: [u32; 64] = self.memory[n..n + 64].try_into().unwrap();
+            assert_eq!(words[0] & 0xfffff00f, 0x40001);
+            let op = ((words[0] >> 4) & 0xff) as u8;
+            let ptr = |at| u64::from(words[at]) | (u64::from(words[at + 1]) << 32);
+            let status = match op {
+                0 => {
+                    assert_eq!(
+                        &words[1..17],
+                        &[0; 16],
+                        "must not delegate application resources"
+                    );
+                    assert_eq!(words[54], 0x100447);
+                    assert_eq!(words[55], 50);
+                    assert_eq!(ptr(22), GPU + pipe as u64 * 20480 + 12320);
+                    assert_eq!(ptr(24), GPU + pipe as u64 * 20480 + 12328);
+                    50
+                }
+                19 => {
+                    assert_eq!(words[13], 10);
+                    assert_eq!(ptr(16), GPU + pipe as u64 * 20480 + 16384);
+                    2
+                }
+                2 => {
+                    assert_eq!(pipe, 1);
+                    assert_eq!(words[18], 22);
+                    assert_eq!(words[19], 0);
+                    assert_eq!(ptr(20), GPU + 4096);
+                    assert_eq!(ptr(22), GPU + 12296);
+                    assert_eq!(words[28], 3);
+                    assert_eq!(words[37], 1 << 13);
+                    assert_eq!(&words[50..52], &[0, 0]);
+                    self.active[0] = true;
+                    38
+                }
+                11 => 2,
+                _ => panic!("unexpected MES12 opcode"),
+            };
+            if frame == 1 {
+                assert_eq!(op, 11);
+            }
+            if frame == 0 {
+                self.frames.push((pipe, op));
+                assert_eq!(ptr(status + 2), 1);
+                if !self.drain_only {
+                    self.put(
+                        ptr(status),
+                        if self.reject { 0x800b020300000000 } else { 1 },
+                    );
+                }
+            } else {
+                self.put(ptr(status), ptr(status + 2));
+            }
+        }
+        if !self.rptr_stuck {
+            self.put(GPU + pipe as u64 * 20480 + 12288, tail);
+        }
+        self.tails[pipe] = tail;
+    }
+}
+impl Io for Fake {
+    fn read(&mut self, address: u64) -> u32 {
+        match address {
+            INDEX => self.index,
+            0x15850 => 0x800,
+            0x15854 => 0xbff,
+            0x604b4 => 0x7f000,
+            0x4a124 => {
+                assert!(self.index == 12 || self.index == 13);
+                assert!(self.active[(self.index - 12) as usize]);
+                if self.bad_version {
+                    0x2040
+                } else {
+                    0x308b
+                }
+            }
+            _ => *self
+                .regs
+                .get(&(self.slot(address) as u32, address))
+                .unwrap_or(&0),
+        }
+    }
+    fn write(&mut self, address: u64, value: u32) {
+        self.writes.push((self.index, address, value));
+        if self.refuse == Some(address) {
+            return;
+        }
+        if address == INDEX {
+            self.index = value;
+            return;
+        }
+        if address == 0x7f000 {
+            self.dirty = false;
+            return;
+        }
+        assert!(
+            matches!(address, 0x60300 | 0x6072c | 0x60738 | 0x177e8..=0x177f4 | 0x42628 |
+            0x4a000 | 0x4a274 | 0x4a01c | 0x17ea4..=0x17f2c |
+            0x42200 | 0x4a0f0..=0x4a100 | 0x17a7c),
+            "unexpected register write {address:x}"
+        );
+        self.regs
+            .insert((self.slot(address) as u32, address), value);
+        if address == 0x17eac && value == 1 {
+            assert_eq!(self.index, 13);
+            assert_eq!(self.regs[&(13, 0x17f2c)], 0);
+            assert_eq!(self.regs[&(13, 0x17ea4)], (GPU + 20480 + 4096) as u32);
+            assert_eq!(self.regs[&(13, 0x17ec4)], ((GPU + 20480) >> 8) as u32);
+            assert_eq!(self.regs[&(13, 0x17ee0)], 0x40000060);
+            self.active[1] = true;
+        }
+    }
+    fn memory_write(&mut self, _: MmioRegion, offset: u64, value: u32) {
+        self.dirty = true;
+        self.memory[(offset / 4) as usize] = value;
+    }
+    fn memory_read64(&mut self, _: MmioRegion, offset: u64) -> u64 {
+        assert!(!self.dirty);
+        self.get((offset / 4) as usize)
+    }
+    fn doorbell(&mut self, _: MmioRegion, dword: u32, value: u64) {
+        assert!(dword == 22 || dword == 24);
+        self.progress.store(2, Ordering::SeqCst);
+        if self.complete {
+            self.execute(((dword - 22) / 2) as usize, value);
+        }
+        if let Some(cap) = self.revoke {
+            cap.revoke();
+        }
+    }
+    async fn delay(&mut self, _: u64) {
+        assert_eq!(self.index, 0x32, "GRBM selector held across await");
+        if self.progress.load(Ordering::SeqCst) == 0 {
+            self.progress.store(1, Ordering::SeqCst);
+        }
+        narf_scheduler::yield_now().await;
+    }
+}
+fn fixture() -> (Pool, Engine<Fake>) {
+    let map = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0x90004000),
+        virt: 0,
+        len: 40960,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: model intercepts all memory accesses; this mapping is bookkeeping only.
+    let pool = unsafe { Pool::from_owned_range(map, GPU) }.unwrap();
+    let io = Fake {
+        index: 0x32,
+        regs: BTreeMap::new(),
+        memory: vec![u32::MAX; 10240],
+        writes: Vec::new(),
+        frames: Vec::new(),
+        tails: [0; 2],
+        dirty: false,
+        active: [false; 2],
+        complete: true,
+        reject: false,
+        drain_only: false,
+        rptr_stuck: false,
+        bad_version: false,
+        refuse: None,
+        progress: Arc::new(AtomicU32::new(0)),
+        revoke: None,
+    };
+    let engine = Engine {
+        io,
+        authority: Cap::bootstrap(),
+        layout: Layout {
+            gc: GC,
+            hyp: HYP,
+            nbio: NBIO,
+            nbif_routing: false,
+            bases: api::Bases {
+                gc: [0x4000, 0x10000, 0, 0, 0],
+                mmhub: [0x8000, 0, 0, 0, 0],
+                osssys: [0xc000, 0, 0, 0, 0],
+            },
+        },
+        doorbells: map,
+        memory: pool.reserve(40960).unwrap(),
+        starts: [0x100_00004000, 0x100_00004000],
+        state: State::Prepared,
+        versions: [0; 2],
+        tails: [0; 2],
+        completed: [0; 2],
+    };
+    (pool, engine)
+}
+fn run<T>(f: impl Future<Output = T>) -> T {
+    narf_scheduler::block_on_spin(f)
+}
+fn mes12_hw_starts_both_pipes_and_wraps_native_commands() -> TestResult {
+    let (pool, mut e) = fixture();
+    assert_eq!(
+        run(e.start()),
+        Ok(Report {
+            versions: [0x308b; 2],
+            completed: [3, 3]
+        })
+    );
+    assert_eq!(e.state, State::Ready);
+    assert_eq!(
+        e.io.frames,
+        [(1, 0), (1, 19), (1, 2), (0, 0), (0, 19), (0, 11)]
+    );
+    assert_eq!(e.io.index, 0x32);
+    for pipe in [12, 13] {
+        assert_eq!(e.io.regs[&(pipe, 0x4a000)], 0x1000);
+        assert_eq!(e.io.regs[&(pipe, 0x4a274)], 0x40);
+    }
+    assert_eq!(e.io.regs[&(0, 0x42628)], 0xe8);
+    assert_eq!(e.io.regs[&(0, 0x60300)], 1);
+    for _ in 0..18 {
+        assert_eq!(run(e.submit(0, api::query_status())), Ok(()));
+    }
+    assert_eq!(e.completed, [21, 3]);
+    assert_eq!(e.tails, [2688, 384]);
+    assert_eq!(run(e.start()), Err(Error::Busy));
+    drop(e);
+    assert_eq!(pool.available(), 0, "live queues released");
+    let (_, mut e) = fixture();
+    e.layout.nbif_routing = true;
+    assert!(run(e.start()).is_ok());
+    assert_eq!(e.io.regs[&(0, 0x6072c)], 0x30000007);
+    assert_eq!(e.io.regs[&(0, 0x60738)], 0x3000000d);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_starts_both_pipes_and_wraps_native_commands
+);
+
+fn mes12_hw_refuses_inherited_execution_before_publication() -> TestResult {
+    for pipe in [None, Some(12), Some(13)] {
+        let (pool, mut e) = fixture();
+        match pipe {
+            None => {
+                e.io.regs.insert((0, 0x4a01c), 0x04000000);
+            }
+            Some(p) => {
+                e.io.regs.insert((p, 0x17eac), 1);
+            }
+        }
+        assert_eq!(run(e.start()), Err(Error::Busy));
+        assert_eq!(e.io.index, 0x32);
+        assert!(e.io.writes.iter().all(|w| w.1 == INDEX));
+        assert!(e.memory.reusable_for_test());
+        drop(e);
+        assert_eq!(pool.available(), 40960);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_refuses_inherited_execution_before_publication
+);
+
+fn mes12_hw_retains_failed_queues_and_requires_both_fences_and_rptr() -> TestResult {
+    for case in 0..6 {
+        let (pool, mut e) = fixture();
+        let expected = match case {
+            0 => {
+                e.io.reject = true;
+                Error::FirmwareRejected(api::Rejection {
+                    code: 3,
+                    opcode: 2,
+                    misc: 11,
+                    category: 0,
+                })
+            }
+            1 => {
+                e.io.drain_only = true;
+                Error::Protocol
+            }
+            2 => {
+                e.io.revoke = Some(e.authority);
+                Error::Revoked
+            }
+            3 => {
+                e.io.rptr_stuck = true;
+                Error::Timeout
+            }
+            4 => {
+                e.io.bad_version = true;
+                Error::Unsupported
+            }
+            _ => {
+                e.io.refuse = Some(0x4a274);
+                Error::Readback
+            }
+        };
+        assert_eq!(run(e.start()), Err(expected));
+        assert_eq!(e.state, State::Failed(expected));
+        assert_eq!(e.io.index, 0x32);
+        let writes = e.io.writes.len();
+        assert_eq!(run(e.start()), Err(Error::Busy));
+        assert_eq!(e.io.writes.len(), writes);
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_retains_failed_queues_and_requires_both_fences_and_rptr
+);
+
+fn mes12_hw_cancellation_cannot_replay_or_reclaim_firmware_memory() -> TestResult {
+    for phase in [1, 2] {
+        let (pool, mut e) = fixture();
+        e.io.complete = false;
+        let progress = e.io.progress.clone();
+        {
+            let mut f = core::pin::pin!(e.start());
+            let mut cx = Context::from_waker(Waker::noop());
+            while progress.load(Ordering::SeqCst) < phase {
+                assert!(f.as_mut().poll(&mut cx).is_pending());
+            }
+        }
+        assert_ne!(e.state, State::Prepared);
+        assert_ne!(e.state, State::Ready);
+        assert_eq!(run(e.start()), Err(Error::Busy));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_cancellation_cannot_replay_or_reclaim_firmware_memory
+);
+
+fn mes12_hw_validates_discovery_and_refuses_separate_kiq_firmware() -> TestResult {
+    let mut regs = vec![0; 0x80000 / 4];
+    let mut gpu = crate::amdgpu_gmc_navi48::tests::descriptor(&mut regs);
+    gpu.ip_blocks[0].base_addrs[1] = 0x10000;
+    let mut ih = gpu.ip_blocks[0];
+    ih.hw_id = ip::HW_ID_OSSSYS;
+    ih.major = 7;
+    ih.minor = 0;
+    ih.revision = 0;
+    ih.num_bases = 1;
+    ih.base_addrs = [0x12000, 0, 0, 0, 0];
+    gpu.ip_blocks.push(ih);
+    assert!(Layout::resolve(&gpu).is_ok());
+    (
+        gpu.ip_blocks[2].major,
+        gpu.ip_blocks[2].minor,
+        gpu.ip_blocks[2].revision,
+    ) = (6, 3, 1);
+    assert!(Layout::resolve(&gpu).unwrap().nbif_routing);
+    (
+        gpu.ip_blocks[2].major,
+        gpu.ip_blocks[2].minor,
+        gpu.ip_blocks[2].revision,
+    ) = (7, 7, 0);
+    for case in 0..7 {
+        let mut g = gpu.ip_blocks.clone();
+        match case {
+            0 => g[0].major = 11,
+            1 => g[0].num_bases = 1,
+            2 => g[0].base_addrs[1] = 0x20000 - 0x289d,
+            3 => g[1].minor = 0,
+            4 => g[2].revision = 2,
+            5 => g[5].num_bases = 6,
+            _ => g.push(ih),
+        }
+        core::mem::swap(&mut gpu.ip_blocks, &mut g);
+        assert!(Layout::resolve(&gpu).is_err());
+        core::mem::swap(&mut gpu.ip_blocks, &mut g);
+    }
+    let (pool, e) = fixture();
+    let authority = e.authority;
+    let doorbells = e.doorbells;
+    drop(e);
+    // SAFETY: preparation must reject the wrong firmware ABI before mapping
+    // access or allocation; neither bookkeeping-only mapping is dereferenced.
+    let result = unsafe { Mes::new(&gpu, authority, &pool, &fw::fixture(), doorbells) };
+    assert!(matches!(result, Err(Error::Unsupported)));
+    assert_eq!(pool.available(), 40960);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_validates_discovery_and_refuses_separate_kiq_firmware
+);

@@ -250,11 +250,11 @@ RS64 program counters → initial power policy → harvested GC12 topology.
 DCN4 stop requires STOP_FW acknowledgement and PWAIT,
 uses CNTL2 reset, verifies disabled/reset readback and leaves PSP's secure
 windows untouched. Every stage is observable through `State`; failure or
-cancellation prevents replay. The sequence then initializes GMC12 and SDMA7
-as described below; `MemoryReady` reports firmware/media/power status, the
-VMID0 aperture and verified DMA proof. It then starts DMUB and validates its
-version/capability mailbox handshake. User queues, native display, probe
-integration and physical validation are separate gates;
+cancellation prevents replay. The sequence then initializes GMC12 and SDMA7,
+starts unified MES12's firmware queues, and starts DMUB with a validated
+version/capability handshake. `MemoryReady` reports firmware/media/power status,
+the VMID0 aperture, verified DMA proof and MES queue report. User queues,
+native display and physical validation remain separate gates;
 `fw_loaded` is not set by this API.
 
 `amdgpu_gfx12_rs64::Rs64` prepares immutable PFP/ME/MEC entry points from the
@@ -275,8 +275,31 @@ trailing query fence drains. Native MQDs use `v12_compute_mqd`, including
 `DB_UPDATED_MSG_EN`, privileged VMID0 and the MES-owned read pointer. Descriptor,
 ring, EOP and pointer ranges must be aligned, disjoint and within 48 bits;
 resources never delegate VMID0 to the scheduler. `tests/mes12_layout.c` checks
-these offsets against installed Linux headers. This is the command/descriptor
-ABI; the MES12 hardware/doorbell owner must still initialize and run it.
+these offsets against installed Linux headers.
+
+`unsafe amdgpu_mes12_hw::Mes::new` requires exact Navi48 GC12.0.1, MMHUB4.1,
+OSSSYS7 and NBIO7.7/NBIF6.3.1 discovery, matching **unified** MES firmware,
+exclusive GRBM/queue ownership and a permanently mapped, uncached BAR2.
+It reserves 40 KiB of inventoried VRAM for two rings, native descriptors, EOPs,
+pointer/fence slots and separate cleaner-fence pages. `unsafe start().await`
+requires successful PSP/RLC/RS64/GMC setup and the translated DMA proof. It
+refuses inherited MES execution, enables the PCIe aperture, programs soc24
+doorbell ranges and RLC's KIQ selection, starts both firmware pipes, and
+initializes KIQ pipe 1 through MMIO. Live versions must support kernel queue
+mapping and memory write pointers. Separate MES1 PM4 firmware is never sent
+MES API frames.
+
+The owner sends KIQ resource commands, maps scheduler pipe 0 through KIQ,
+configures scheduler resources and aggregated doorbells, then queries its
+status. Every submission is a native frame followed by a query frame; success
+requires the API result, exact query sequence and full read-pointer drain.
+Owned ring slots wrap without exposing caller-supplied addresses. All device
+access batches invoke current PCI authority; finite indexed batches restore
+GRBM before awaiting. Version/command waits have 2.1-second deadlines using
+scheduler timers. Publication quarantines every firmware-visible allocation
+through cancellation or failure and prevents replay. `State`/`Report` expose
+firmware progress, live versions and completed commands, **not** application
+acceleration. No graphics/compute/SDMA queue or user VMID is delegated yet.
 
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
@@ -358,6 +381,10 @@ single-CPU boot handoff. It prepares immutable firmware, inventories VRAM and
 refuses training over live firmware in the overwritten prefix, then claims
 exclusive controller access and retains `ColdBoot` in an async mutex. Errors
 before the claim perform no hardware writes and release all reservations.
+Preparation now selects unified MES and retains the matching PCI function.
+After the DMA proof, startup maps BAR2 as Device memory (failing instead of
+falling back to an unmapped physical address), starts MES12 and records its
+report before starting DMUB. BAR sizing is deferred until after the handoff.
 `unsafe run().await` requires CPU framebuffer writers to remain stopped; its
 owner persists across success, failure and cancellation. `status` exposes the
 stage and successful report without waiting. HPD/AUX/notification wrappers

@@ -10,6 +10,10 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 }
 fn report() -> Report {
     Report {
+        mes: mes::Report {
+            versions: [0x308b; 2],
+            completed: [3, 3],
+        },
         rs64: rs64::Starts {
             pfp: 0x1000,
             me: 0x2000,

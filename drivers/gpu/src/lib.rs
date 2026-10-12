@@ -196,6 +196,7 @@ pub mod amdgpu_ih;
 pub mod amdgpu_info;
 pub mod amdgpu_mes;
 pub mod amdgpu_mes12;
+pub mod amdgpu_mes12_hw;
 pub mod amdgpu_mes_hw;
 pub mod amdgpu_modeset;
 pub mod amdgpu_mqd;

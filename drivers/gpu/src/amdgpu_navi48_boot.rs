@@ -1,6 +1,7 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
 use crate::amdgpu_gfx12_rs64 as rs64;
+use crate::amdgpu_mes12_hw as mes;
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_dmub_navi48 as dmub, amdgpu_gddr6 as training,
     amdgpu_gfx12_topology as topology, amdgpu_gmc_navi48 as gmc, amdgpu_navi48_firmware as gfx,
@@ -29,9 +30,10 @@ pub enum Stage {
     ReadTopology,
     MemoryTranslation,
     DmaProof,
+    StartMes,
     StartDmub,
 }
-const STAGES: [Stage; 17] = [
+const STAGES: [Stage; 18] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -48,6 +50,7 @@ const STAGES: [Stage; 17] = [
     Stage::ReadTopology,
     Stage::MemoryTranslation,
     Stage::DmaProof,
+    Stage::StartMes,
     Stage::StartDmub,
 ];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +72,7 @@ pub enum Error {
     Topology(topology::Error),
     Display(display::Error),
     Rs64(rs64::Error),
+    Mes(mes::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -88,6 +92,7 @@ pub struct Report {
     pub dmub: dmub::Status,
     pub topology: topology::Topology,
     pub rs64: rs64::Starts,
+    pub mes: mes::Report,
 }
 #[derive(Debug)]
 pub struct Firmware {
@@ -148,6 +153,7 @@ impl<B: Backend> Sequence<B> {
 #[derive(Debug)]
 struct Hardware {
     gpu: AmdGpu,
+    pci: narf_bus::BusDevice,
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
     firmware: Firmware,
@@ -163,6 +169,7 @@ struct Hardware {
     rs64: rs64::Rs64,
     gmc: Option<gmc::Gmc>,
     sdma: Option<sdma::Sdma>,
+    mes: Option<mes::Mes>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -303,6 +310,30 @@ impl Backend for Hardware {
                 unsafe { self.sdma.as_mut().unwrap().initialize(gmc).await }
                     .map_err(Error::Sdma)?;
             }
+            Stage::StartMes => {
+                // SAFETY: the constructor ties this function to the retained
+                // GPU; no config or doorbell access can race the boot owner.
+                let doorbells = unsafe { mes::map_doorbells(&self.pci, &self.authority) }
+                    .map_err(Error::Mes)?;
+                // SAFETY: PSP/RLC/RS64/GMC and the translated DMA proof completed;
+                // this owner retains the exact unified firmware, mappings and pool.
+                self.mes = Some(
+                    unsafe {
+                        mes::Mes::new(
+                            &self.gpu,
+                            self.authority,
+                            &self.pool,
+                            &self.firmware.gfx,
+                            doorbells,
+                        )
+                    }
+                    .map_err(Error::Mes)?,
+                );
+                // SAFETY: same exclusive completed cold-start prerequisites.
+                unsafe { self.mes.as_mut().unwrap().start() }
+                    .await
+                    .map_err(Error::Mes)?;
+            }
             Stage::StartDmub => {
                 let psp = self.psp.as_ref().ok_or(Error::Invalid)?;
                 // SAFETY: this GPU's PSP/TMR and GMC remain retained, with
@@ -321,6 +352,11 @@ impl Backend for Hardware {
             dmub: self.dmub.status().ok_or(Error::Invalid)?,
             topology: self.topology.ok_or(Error::Invalid)?,
             rs64: self.rs64.starts().ok_or(Error::Invalid)?,
+            mes: self
+                .mes
+                .as_ref()
+                .and_then(mes::Mes::report)
+                .ok_or(Error::Invalid)?,
             aperture: self
                 .gmc
                 .as_ref()
@@ -349,13 +385,23 @@ impl ColdBoot {
     /// quiescence/preimage contract, including stopping CPU framebuffer writers.
     /// Retain this owner after run, failure or cancellation; independent reset
     /// is required before reusing quarantined resources. No queues may run.
+    /// `pci` must identify this GPU's exclusively owned physical PCI function,
+    /// including its BAR2 doorbells. Firmware must use unified MES for both pipes.
     pub unsafe fn new(
         gpu: &AmdGpu,
+        pci: narf_bus::BusDevice,
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
         mut firmware: Firmware,
         exchange: Option<Training>,
     ) -> Result<Self, Error> {
+        if firmware.gfx.mes_mode() != gfx::MesMode::Unified
+            || pci.id.vendor != gpu.chip.vid
+            || pci.id.device != gpu.chip.did
+            || !matches!(pci.kind, narf_bus::BusKind::Pcie { .. })
+        {
+            return Err(Error::Unsupported);
+        }
         let layout = psp::navi48_layout(gpu).map_err(Error::Psp)?;
         layout
             .validate_pool(gpu, &authority, pool)
@@ -413,6 +459,7 @@ impl ColdBoot {
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
+                    pci,
                     authority,
                     pool: pool.clone(),
                     firmware,
@@ -428,6 +475,7 @@ impl ColdBoot {
                     rs64,
                     gmc: None,
                     sdma: None,
+                    mes: None,
                 },
                 state: State::Prepared,
             },
@@ -466,8 +514,8 @@ impl ColdBoot {
             .await
             .map_err(Error::Display)
     }
-    /// MemoryReady proves firmware, power, an owned VMID0 SDMA write/copy
-    /// and the DMUB version/capability mailbox handshake.
+    /// MemoryReady proves firmware, power, an owned VMID0 SDMA write/copy,
+    /// the unified MES12 firmware queues and the DMUB capability handshake.
     /// It does not establish userspace queues or a native display mode.
     pub async fn run(&mut self) -> Result<Report, Error> {
         self.sequence.run().await
