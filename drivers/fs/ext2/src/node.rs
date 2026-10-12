@@ -827,24 +827,26 @@ impl<B: BlockDevice + 'static> FileOps for Ext2Node<B> {
     /// `filemap_fault`: expose the same canonical folio used by read/write.
     /// The mapping is conservatively dirty from its first fault because NARF
     /// does not yet collect hardware PTE dirty bits for filesystem writeback.
-    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {
-        if offset % PAGE_SIZE as u64 != 0 || offset >= self.stat().size {
-            return Err(FsError::InvalidData);
-        }
-        let page = offset / PAGE_SIZE as u64;
-        loop {
-            let folio = narf_scheduler::block_on_spin(self.file_page(page))?;
-            // A concurrent shrink publishes its new i_size before removing
-            // folios. Never install a newly-obsolete page after that point.
-            if offset >= self.stat().size {
+    fn mmap_fault_async<'a>(&'a self, offset: u64) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            if offset % PAGE_SIZE as u64 != 0 || offset >= self.stat().size {
                 return Err(FsError::InvalidData);
             }
-            if !folio.published() {
-                continue;
+            let page = offset / PAGE_SIZE as u64;
+            loop {
+                let folio = self.file_page(page).await?;
+                // A concurrent shrink publishes its new i_size before removing
+                // folios. Never install a newly-obsolete page after that point.
+                if offset >= self.stat().size {
+                    return Err(FsError::InvalidData);
+                }
+                if !folio.published() {
+                    continue;
+                }
+                assert!(self.mapping.mark_dirty(page));
+                return Ok(folio.mmap_frame());
             }
-            assert!(self.mapping.mark_dirty(page));
-            return Ok(folio.mmap_frame());
-        }
+        })
     }
 
     fn ino(&self) -> u64 {

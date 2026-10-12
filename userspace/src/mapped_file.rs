@@ -915,7 +915,13 @@ pub(crate) fn demand_frame(vaddr: u64) -> Result<u64, FileFaultError> {
         return Ok(phys.raw());
     }
     if !generic_fallback {
-        return ops.mmap_fault(offset).map_err(fault_error);
+        // `filemap_fault`: an I/O-backed direct provider returns Pending with
+        // this task's executor waker registered on its cache fill. The common
+        // synchronous bridge parks the faulting own-stack task until that
+        // waker fires; it does not spin on a folio owned by another task.
+        return crate::handlers::poll_io_to_completion(ops.mmap_fault_async(offset))
+            .ok_or(FileFaultError::Bus)?
+            .map_err(fault_error);
     }
 
     // Linux filemap_fault first looks in the inode page cache, then reads a

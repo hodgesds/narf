@@ -1490,10 +1490,10 @@ pub trait FileOps: Send + Sync {
         false
     }
 
-    /// Whether [`FileOps::mmap_fault`] is a supported backing path.
+    /// Whether [`FileOps::mmap_fault_async`] is a supported backing path.
     ///
     /// This is an explicit capability rather than a speculative call to
-    /// `mmap_fault`: a fault outside the current EOF is a valid refusal, not
+    /// `mmap_fault_async`: a fault outside the current EOF is a valid refusal, not
     /// evidence that the file cannot supply cache folios for other offsets.
     fn supports_mmap_fault(&self) -> bool {
         false
@@ -1553,19 +1553,34 @@ pub trait FileOps: Send + Sync {
     /// as long as any mapping of the file can exist — which is what the
     /// syscall layer's mapping-held `Arc<dyn FileOps>` guarantees.
     ///
-    /// Called from the demand-paging arm of the trap handler, i.e. with no
-    /// address-space lock held and in a context that may allocate — but *not*
-    /// one that may await, so an implementation must be synchronous.
+    /// Called from the demand-paging arm of the trap handler with no
+    /// address-space lock held. The compatibility layer drives this future
+    /// with the faulting stackful task's real executor waker: `Pending` parks
+    /// that task until the provider wakes it, then the fault retries with the
+    /// same pinned future. Providers therefore must not busy-poll another
+    /// task's page-cache fill from the synchronous compatibility boundary.
     ///
     /// **Must be idempotent per offset**: two calls for the same offset must
     /// return the same frame. Two CPUs can fault the same page concurrently,
     /// and the address space keeps whichever answer it records first — a
     /// second, different frame would simply be dropped on the floor.
     ///
-    /// The default returns [`FsError::Unsupported`]. Implementations must
-    /// also return `true` from [`FileOps::supports_mmap_fault`]; the syscall
-    /// layer uses that side-effect-free capability check when creating the
-    /// initially unbacked VMA.
+    /// The default adapts the legacy synchronous [`FileOps::mmap_fault`]
+    /// hook. An I/O-backed provider overrides this method and awaits its
+    /// canonical cache fill directly. Implementations must also return `true`
+    /// from [`FileOps::supports_mmap_fault`]; the syscall layer uses that
+    /// side-effect-free capability check when creating the initially unbacked
+    /// VMA.
+    fn mmap_fault_async<'a>(&'a self, offset: u64) -> FsFuture<'a, u64> {
+        Box::pin(async move { self.mmap_fault(offset) })
+    }
+
+    /// Legacy immediate form of [`FileOps::mmap_fault_async`].
+    ///
+    /// RAM- and device-backed files may override this directly. Filesystems
+    /// whose page fault can wait for I/O should instead override
+    /// `mmap_fault_async`, so the common fault path can park the caller rather
+    /// than spin.
     fn mmap_fault(&self, _offset: u64) -> Result<u64, FsError> {
         Err(FsError::Unsupported)
     }

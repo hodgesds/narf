@@ -278,7 +278,8 @@ pub trait FileOps {
     fn mmap_is_ram(&self) -> bool;
     fn supports_mmap_fault(&self) -> bool;
     fn mmap_backing_identity(&self) -> usize;
-    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError>;
+    fn mmap_fault_async(&self, offset: u64) -> FsFuture<'_, u64>;
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError>; // legacy immediate adapter
     fn mmap_cache_generation(&self) -> Option<u64>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
     fn open_instance_checked(&self, write: bool) -> Result<Option<Arc<dyn FileOps>>, FsError>;
@@ -842,12 +843,16 @@ reference, never discards a dirty page, and files returning `None` retain the
 conservative final-unmap reclamation behavior.
 
 `supports_mmap_fault` is the side-effect-free capability check for direct
-demand backing. It is deliberately separate from `mmap_fault`: a refusal at
-an offset beyond the current EOF must not make `mmap(2)` select the generic
-copy fallback for the whole VMA. A filesystem shrinking such a direct-mapped
-file calls `unmap_mapping_range` before retiring its cache folios; userspace
-installs the VMA-owning hook during common boot, while standalone filesystem
-tests with no userspace mappings safely observe a no-op.
+demand backing. It is deliberately separate from `mmap_fault_async`: a
+refusal at an offset beyond the current EOF must not make `mmap(2)` select the
+generic copy fallback for the whole VMA. `mmap_fault_async` is driven with the
+faulting stackful task's executor waker; an I/O-backed implementation awaits
+its canonical cache fill, and the common fault bridge parks until that waker
+fires rather than spin-polling. The default adapter wraps the legacy immediate
+`mmap_fault` hook for RAM/device providers. A filesystem shrinking such a
+direct-mapped file calls `unmap_mapping_range` before retiring its cache
+folios; userspace installs the VMA-owning hook during common boot, while
+standalone filesystem tests with no userspace mappings safely observe a no-op.
 `mmap_backing_identity` identifies the live object owning those pages;
 forwarding wrappers preserve the underlying value so a truncate issued by the
 backing filesystem still finds and revokes VMAs owned by the wrapper.
