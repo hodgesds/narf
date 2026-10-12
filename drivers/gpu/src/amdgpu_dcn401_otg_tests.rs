@@ -7,6 +7,8 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 const BASE: u64 = 0x10000;
+#[path = "amdgpu_dcn401_dp_phy_tests.rs"]
+mod dp_phy;
 const MPC_BASE: u64 = 0x30000;
 struct Fake {
     regs: BTreeMap<u64, u32>,
@@ -158,7 +160,7 @@ impl Io for Fake {
                     [
                         0x2094, 0x2095, 0x209b, 0x209e, 0x20a5, 0x20a6, 0x20a9, 0x20aa, 0x20ab,
                         0x20ac, 0x20ad, 0x20ae, 0x20af, 0x20b0, 0x20bc, 0x211e, 0x2122, 0x2123,
-                        0x2125, 0x212e,
+                        0x2125, 0x212e, 0x20bb, 0x20bd, 0x2121, 0x2134,
                     ]
                     .iter()
                     .any(|r| at == BASE + (r + p * 0x124) * 4)
@@ -325,6 +327,7 @@ fn engine() -> Engine<Fake> {
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,
+            dp_phy_ready: None,
             hpo_link_retired: None,
             hpo_dp_disabled: None,
             hdmi_tmds_retired: None,

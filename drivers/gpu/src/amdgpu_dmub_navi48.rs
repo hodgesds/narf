@@ -37,6 +37,20 @@ pub enum DpSignal {
     Sst,
     Mst,
 }
+/// Legacy 8b/10b PHY request. The caller validates board/sink/cable limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpPhySettings {
+    pub lanes: u8,
+    pub rate: crate::dp_link_training::LinkRate,
+}
+impl DpPhySettings {
+    pub(crate) fn validate(self) -> Result<(), Error> {
+        if !matches!(self.lanes, 1 | 2 | 4) {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -467,8 +481,15 @@ impl Dmub {
             && self.engine.layout.dcn == base
     }
 
-    // Only the retained native display owner may issue this narrow VBIOS
-    // operation. Inbox consumption proves transport completion, not PHY-off.
+    // Only the retained native display owner may issue these narrow VBIOS
+    // operations. Inbox consumption alone cannot prove PHY readiness/shutdown.
+    pub(crate) async fn enable_dp_sst(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        settings: DpPhySettings,
+    ) -> Result<(), Error> {
+        self.engine.enable_dp_sst(path, settings).await
+    }
     pub(crate) async fn disable_dp_sst(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
@@ -556,6 +577,34 @@ impl Dmub {
     }
 }
 impl<I: Io> Engine<I> {
+    async fn enable_dp_sst(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        settings: DpPhySettings,
+    ) -> Result<(), Error> {
+        settings.validate()?;
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::DisplayPort
+            || path.transmitter >= 4
+            || !(1..=4).contains(&path.hpd)
+        {
+            return Err(Error::Invalid);
+        }
+        // Native dcn10_link_encoder_enable_dp_output -> transmitter_control_v1_7.
+        // Unlike DISABLE, this zero-initialized caller leaves connector_obj_id
+        // zero. DCE112+ digfe_sel is also zero; host programming owns routing.
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&[128, 1, 0, 60]);
+        request[4] = path.transmitter;
+        request[5] = 1; // TRANSMITTER_CONTROL_ENABLE
+        request[7] = settings.lanes;
+        let clock_10khz = (settings.rate as u32) * 2700;
+        request[8..12].copy_from_slice(&clock_10khz.to_le_bytes());
+        request[12] = path.hpd;
+        request[15] = 244; // zero engine id minus HPO_DP_0(12), as u8
+        self.begin_mailbox()?;
+        let result = self.command(request).await.map(|_| ());
+        self.finish_mailbox(result)
+    }
     async fn disable_dp_sst(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,

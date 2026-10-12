@@ -18,6 +18,95 @@ fn dp_path(phy: u8, hpd: u8) -> crate::amdgpu_dcn_inventory::Path {
         device_tag: 8,
     }
 }
+fn dmub_navi48_dp_enable_uses_native_lane_rate_and_zero_connector_fields() -> TestResult {
+    use crate::dp_link_training::LinkRate;
+    for phy in 0..4 {
+        for hpd in 1..=4 {
+            for lanes in [1, 2, 4] {
+                for (rate, clock) in [
+                    (LinkRate::Rbr, 16200u32),
+                    (LinkRate::Hbr, 27000),
+                    (LinkRate::Hbr2, 54000),
+                    (LinkRate::Hbr3, 81000),
+                ] {
+                    let (_pool, mut e) = ready();
+                    let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+                    run(e.enable_dp_sst(dp_path(phy, hpd), DpPhySettings { lanes, rate })).unwrap();
+                    let mut golden = [0; 64];
+                    golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+                    golden[4] = phy;
+                    golden[5] = 1;
+                    golden[7] = lanes;
+                    golden[8..12].copy_from_slice(&clock.to_le_bytes());
+                    golden[12] = hpd;
+                    golden[15] = 244;
+                    assert_eq!(e.io.slot(offset), golden);
+                    assert_eq!(e.mailbox.state, MailboxState::Ready);
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_dp_enable_uses_native_lane_rate_and_zero_connector_fields
+);
+fn dmub_navi48_dp_enable_validates_before_submission_and_retains_cancelled_transport() -> TestResult
+{
+    let (_pool, mut e) = ready();
+    for (phy, hpd, lanes, dp) in [
+        (4, 1, 4, true),
+        (2, 0, 4, true),
+        (2, 5, 4, true),
+        (2, 1, 0, true),
+        (2, 1, 3, true),
+        (2, 1, 8, true),
+        (2, 1, 4, false),
+    ] {
+        let mut path = dp_path(phy, hpd);
+        if !dp {
+            path.connector = crate::amdgpu_dcn_inventory::Connector::HdmiTypeA;
+        }
+        let bytes = e.io.bytes.clone();
+        let writes = e.io.writes.len();
+        assert_eq!(
+            run(e.enable_dp_sst(
+                path,
+                DpPhySettings {
+                    lanes,
+                    rate: crate::dp_link_training::LinkRate::Hbr3
+                }
+            )),
+            Err(Error::Invalid)
+        );
+        assert_eq!(e.io.bytes, bytes);
+        assert_eq!(e.io.writes.len(), writes);
+    }
+    e.io.commands = false;
+    let settings = DpPhySettings {
+        lanes: 2,
+        rate: crate::dp_link_training::LinkRate::Hbr2,
+    };
+    {
+        let mut future = core::pin::pin!(e.enable_dp_sst(dp_path(0, 1), settings));
+        assert!(future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.mailbox.state, MailboxState::InFlight);
+    assert_eq!(
+        run(e.enable_dp_sst(dp_path(0, 1), settings)),
+        Err(Error::Busy)
+    );
+    assert_eq!(run(e.disable_dp_sst(dp_path(0, 1))), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_dp_enable_validates_before_submission_and_retains_cancelled_transport
+);
 fn dmub_navi48_tmds_disable_uses_native_hdmi_mode_connector_and_hpo_default() -> TestResult {
     for phy in 0..4 {
         for hpd in 1..=4 {

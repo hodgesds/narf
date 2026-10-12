@@ -398,6 +398,16 @@ timing and pending transitions reject before commands. Live DTB/DPREF timing,
 forced input clocks and other outputs remain retained. Already-stopped PHYs
 skip firmware replay; late changes, failure and cancellation quarantine the
 owner. This proves lane/clock shutdown, not analog power gating or memory reuse.
+Direct external legacy DP SST now has a native untrained PHY enable operation
+with 1/2/4 lanes at RBR through HBR3, after matching applied display clocks.
+Native backend setup and board HPD/mux routing precede firmware ENABLE.
+Independent physical lane, TX-clock and backend-clock witnesses are required;
+lane reversal is supported and unused lanes must remain disabled. A matching
+shutdown operation verifies this owner's unchanged untrained PHY and waits for
+backend/lane/clock stop before cleanup. Active consumers, stale routes and
+incomplete hardware transitions reject; cancellation/failure retain ownership
+and block replay. Model tests cover routes, rates, lane mappings and failures.
+This does not power the sink, train the link, start scanout or verify silicon.
 eDP, sink/MST/audio teardown
 and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,

@@ -425,6 +425,37 @@ pub async unsafe fn retire_display_dp_encoder(
     unsafe { boot.retire_display_dp_encoder(stream).await }
 }
 
+/// Enable an untrained external legacy DP PHY after display clock preparation.
+/// # Safety
+/// Fulfil `Otg::enable_dp_phy` board/sink/cable limits, direct-port, producer and
+/// writer-exclusion obligations. Retain memory/translations. No training/scanout.
+pub async unsafe fn enable_display_dp_phy(
+    port: usize,
+    settings: crate::amdgpu_dcn401_otg::DpPhySettings,
+) -> Result<crate::amdgpu_dcn401_otg::DpPhyReady, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller fulfils the documented obligations.
+    unsafe { boot.enable_display_dp_phy(port, settings).await }
+}
+
+/// Disable only the retained owner's matching, still-untrained DP PHY.
+/// # Safety
+/// Fulfil the same direct-port, producer/writer exclusion and retention
+/// obligations as `enable_display_dp_phy`. No analog power or memory release.
+pub async unsafe fn disable_display_dp_phy(
+    port: usize,
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller fulfils the documented obligations.
+    unsafe { boot.disable_display_dp_phy(port).await }
+}
+
 /// Disable the direct FRL PHY after frontend and digital-link retirement.
 /// # Safety
 /// Fulfil `Otg::disable_frl` direct-port, sink/SCDC/retimer, producer and

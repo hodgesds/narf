@@ -718,6 +718,46 @@ and other outputs, and proves no PHY, sink or memory retirement. Failure enters
 until independent reset. Shared clock guards also reject an enabled FRL
 character-clock root after digital-link retirement.
 
+`unsafe ColdBoot::enable_display_dp_phy(port, DpPhySettings { lanes, rate }).await`,
+its serialized platform wrapper and `Otg::enable_dp_phy` start one untrained
+legacy 8b/10b DP SST PHY. The board path must be direct external DP, without
+USB-C/ACPI interlocks or SSC workarounds. The caller validates board/sink/cable
+limits and excludes sink/audio/metadata/HDCP/FEC producers, firmware/FAMS and
+concurrent display/link/clock/power/reset writers. All allocations/translations
+remain retained. Applied global clocks from the matching retained clock owner
+are mandatory. Supported requests are 1/2/4 lanes at RBR/HBR/HBR2/HBR3.
+
+Live preflight requires stopped outputs, detached selected frontend routing,
+all selected PHY lanes disabled, no lane/TX clock activity, no PHY-fed clock
+consumers and no pending training, test, FEC or panel state. Prepared stopped
+timing may retain clocks only through acknowledged DPREF/DTB pixel DTOs. Native
+setup selects legacy PHY muxing and board HPD, enables DP backend mode/clock/
+backend, writes the lane count and advances the scrambler. Unrelated mux and
+scrambler fields are preserved. Fresh controls and lane-off checks precede the
+firmware command. The native DMUB v1.7 ENABLE packet uses board PHY/HPD, lane
+count and symbol clock in 10 kHz units; its zero-initialized connector and HPO
+fields follow Linux's DP enable caller, independently of the DISABLE packet.
+
+Mailbox consumption is only transport completion. Bounded 100 ms waits require
+exactly the requested number of physical lanes clock-ready without reset,
+disable or REQ/ACK activity, with every unused lane disabled, matching lane/TX
+clock requests and TX clock-on, and backend symclk-on. Physical lane reversal
+is allowed; DATA_EN on used lanes is not a training witness. Fresh final
+control/consumer/lane/clock checks precede `DpPhyReady(transmitter)` and historical
+`Status::dp_phy_ready: Option<DpPhyReady>` containing path, settings and observed
+physical lane mask. This state blocks general display/clock/raw-mailbox reuse.
+It proves no sink power, link training, measured link rate, stream or scanout.
+
+`unsafe ColdBoot::disable_display_dp_phy(port).await` and its platform wrapper
+only stop this owner's matching still-untrained ready PHY. Fresh control and
+lane/clock evidence precede native DMUB DISABLE; independent bounded waits
+require backend, all lanes and TX clocks off before native training/panel
+cleanup. Success enters reusable `DpPhyDisabled`, preserving the historical
+ready record without granting analog power-gating or memory-reuse authority.
+Failures enter `Failed`; cancellation retains `EnablingDpPhy`/`DisablingDpPhy`.
+Incomplete transitions retain all owners and block replay until independent
+recovery; unfinished firmware commands additionally quarantine the mailbox.
+
 `unsafe ColdBoot::disable_display_frl(port).await`, its serialized platform
 wrapper and `Otg::disable_frl` disable a validated direct external HDMI FRL PHY
 after frontend and digital-link retirement. The caller fulfils the same sink,

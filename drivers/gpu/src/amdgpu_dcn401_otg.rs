@@ -21,6 +21,9 @@ pub use stream::{DpBlanked, DpEncoderRetired, DpStream};
 #[path = "amdgpu_dcn401_link.rs"]
 mod link;
 pub use link::DpSstDisabled;
+#[path = "amdgpu_dcn401_dp_phy.rs"]
+mod dp_phy;
+pub use dp_phy::{DpPhyReady, DpPhySettings};
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
 pub use hpo_link::{HpoDpDisabled, HpoLinkRetired};
@@ -90,6 +93,10 @@ pub enum State {
     DpEncoderRetired,
     DisablingDpSst(u8),
     DpSstDisabled,
+    EnablingDpPhy(u8),
+    DpPhyReady(u8),
+    DisablingDpPhy(u8),
+    DpPhyDisabled,
     RetiringHpoLink(u8),
     HpoLinkRetired,
     DisablingHpoDp(u8),
@@ -124,6 +131,7 @@ impl State {
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
+                | Self::DpPhyDisabled
                 | Self::HpoLinkRetired
                 | Self::HpoDpDisabled
                 | Self::HdmiTmdsRetired
@@ -196,6 +204,9 @@ pub struct Status {
     /// Historical legacy DP firmware-disable/backend-off evidence only.
     /// Does not prove analog PHY power gating, sink or memory retirement.
     pub dp_sst_disabled: Option<DpSstDisabled>,
+    /// Historical untrained PHY evidence; valid only in DpPhyReady. No sink,
+    /// training, stream or scanout completion is implied.
+    pub dp_phy_ready: Option<DpPhyReady>,
     /// Historical HPO digital-link stop only; PHY and its root clock remain owned.
     pub hpo_link_retired: Option<HpoLinkRetired>,
     /// Historical lane-disable/TX-clock/root-route evidence, not analog power gating.
@@ -564,6 +575,7 @@ impl Otg {
                 dp_blanked: None,
                 dp_encoder_retired: None,
                 dp_sst_disabled: None,
+                dp_phy_ready: None,
                 hpo_link_retired: None,
                 hpo_dp_disabled: None,
                 hdmi_tmds_retired: None,

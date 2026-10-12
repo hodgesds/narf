@@ -986,6 +986,63 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Enable an untrained external legacy DP PHY after display clock preparation.
+    /// # Safety
+    /// Fulfil `Otg::enable_dp_phy` board/sink/cable limits, direct-port, producer
+    /// and writer-exclusion obligations. Retain all memory/translations. Sink
+    /// power, link training and scanout are separate operations.
+    pub async unsafe fn enable_display_dp_phy(
+        &mut self,
+        port: usize,
+        settings: otg::DpPhySettings,
+    ) -> Result<otg::DpPhyReady, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: validated board route and matching retained owners; caller
+        // establishes link limits, platform interlocks and resource obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .enable_dp_phy(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    &mut self.sequence.backend.dmub,
+                    path,
+                    settings,
+                )
+                .await
+        }
+    }
+    /// Disable only this owner's matching, still-untrained DP PHY.
+    /// # Safety
+    /// Fulfil the same direct-port, producer/writer exclusion and retention
+    /// obligations as `enable_display_dp_phy`. No analog power or memory release.
+    pub async unsafe fn disable_display_dp_phy(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained owner; caller fulfils the documented obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .disable_dp_phy(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
+    fn dp_phy_path(&self, port: usize) -> Result<inventory::Path, otg::Error> {
+        if self.display_retirement_busy()
+            || self.display_state() != Ok(display::State::Ready)
+            || self
+                .ddc
+                .as_ref()
+                .is_ok_and(|d| d.state() != ddc::State::Ready)
+        {
+            return Err(otg::Error::Busy);
+        }
+        self.display_paths()
+            .map_err(|_| otg::Error::Invalid)?
+            .get(port)
+            .copied()
+            .ok_or(otg::Error::Invalid)
+    }
     /// Disable a board-routed legacy DP SST transmitter before frontend retirement.
     /// # Safety
     /// Select a direct external DP port without USB-C/ACPI PHY interlocks or
