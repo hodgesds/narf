@@ -23,6 +23,11 @@ the writable linear-map alias of the text closed. The window sits within
 the arch's call range of kernel text, which is what lets rustc's
 PC-relative call relocations resolve; see that module's docs.
 
+The aarch64 relocator accepts the page-relative address pairs emitted by
+rustc/LLVM for module globals, including 32-bit and 64-bit scaled load/store
+low-12 relocations. Real driver fixtures exercise these forms in addition to
+the minimal reference module's branch relocations.
+
 `target_domain=` is the author's default placement hint. A holder of module
 load authority may override it with the `domain=<name>` parameter to
 `init_module` / `finit_module`; the effective domain is recorded on the
