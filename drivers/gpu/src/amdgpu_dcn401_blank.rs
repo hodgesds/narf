@@ -4,10 +4,6 @@ use super::*;
 
 const FRAME_COUNT: u64 = 0x1b4d;
 const FRAME_MASK: u32 = 0xffffff;
-const HUBP_CONTROL: u64 = 0x5f4;
-const HUBP_CLOCK: u64 = 0x5f5;
-const CURSOR_CONTROL: u64 = 0x679;
-const DMDATA_CONTROL: u64 = 0x685;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlankRunning {
@@ -17,37 +13,10 @@ pub struct BlankRunning {
     pub frame_before: u32,
     pub frame_after: u32,
 }
-impl Layout {
-    fn hubp(self, pipe: u8, reg: u64) -> u64 {
-        self.base + (reg + u64::from(pipe) * 0xdc) * 4
-    }
-}
 impl<I: Io> Engine<I> {
     fn expect(&mut self, at: u64, mask: u32, value: u32) -> Result<(), Error> {
         if self.read(at)? & mask != value {
             return Err(Error::Readback(at));
-        }
-        Ok(())
-    }
-    fn fetchers_stopped(&mut self) -> Result<(), Error> {
-        // Starting VTG must not wake inherited surface, cursor or metadata DMA.
-        // Require positive no-outstanding-request acknowledgement, blank and
-        // TTU disable on every HUBP, plus disabled fetch clocks/cursors/metadata.
-        // Zero reads from a powered-off block do not satisfy this condition.
-        // This is deliberately a precondition, not an inherited-plane teardown.
-        let l = self.layout;
-        for pipe in 0..4 {
-            let at = |r| l.hubp(pipe, r);
-            for (r, mask, value) in [
-                (HUBP_CONTROL, 0x1007, 0x1003),
-                (HUBP_CLOCK, 1, 0),
-                (CURSOR_CONTROL, 1, 0),
-                (DMDATA_CONTROL, 0x0fff0007, 0),
-            ] {
-                if self.read(at(r))? & mask != value {
-                    return Err(Error::Busy);
-                }
-            }
         }
         Ok(())
     }

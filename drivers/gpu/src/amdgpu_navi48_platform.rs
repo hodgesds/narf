@@ -378,6 +378,21 @@ pub async unsafe fn retire_display_timing(pipe: u8) -> Result<(), crate::amdgpu_
     unsafe { boot.retire_display_timing(pipe).await }
 }
 
+/// Disconnect all native MPC planes and stop drained HUBP fetch clocks.
+/// # Safety
+/// Stop CPU scanout writers and exclude all surface/cursor/metadata/LUT, MPC,
+/// firmware/FAMS and power writers. Retain all associated allocations and
+/// translations; completion does not permit freeing or reusing them.
+pub async unsafe fn retire_display_planes(
+) -> Result<crate::amdgpu_dcn401_otg::PlanesRetired, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller excludes writers and retains memory.
+    unsafe { boot.retire_display_planes().await }
+}
+
 /// Consume bounded diagnostic history from the independent IH service.
 /// Hardware draining and CPU interrupt waits never hold the display-owner lock.
 pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> {

@@ -401,11 +401,16 @@ prepared internal black pattern on one OTG. It requires stopped CPU scanout
 writers, exclusive fetcher/cursor/metadata ownership and retention of all
 associated surfaces, page tables, HUBP and OPP resources, including inherited
 ones. All other timing generators and every external stream/link clock must
-remain stopped. Each of the four HUBPs must positively acknowledge no outstanding
-requests, with blank and TTU-disable asserted, soft reset clear, fetch clock
-disabled, cursor disabled, and no enabled/queued dynamic-metadata fetch. Zero
-reads do not satisfy these conditions. This operation cannot retire an inherited
-plane; it returns `Busy` when those prerequisites are absent.
+remain stopped. Each powered HUBP must positively acknowledge no outstanding
+requests, with blank asserted, soft reset clear, fetch clock and cursor disabled,
+and no enabled/queued dynamic-metadata, enabled 3D-LUT fetch or MALL prefetch
+mode. TTU-disable may
+be clear: native DCN401 uses `hubp2_set_blank_regs`, not `hubp1_disconnect`.
+An already powered-off HUBP instead requires a power-gate request with force-on
+clear and PGFSM OFF acknowledgement; its inaccessible registers are skipped.
+Transitional/contradictory power states and zero HUBP reads without power-off
+evidence do not satisfy these conditions. Startup itself does not retire planes;
+it returns `Busy` when those prerequisites are absent.
 
 Startup verifies matching retained timing/blank snapshots, current native DTO
 clocks and live timing/OPP/formatter programming. TMDS returns `Unsupported`
@@ -427,6 +432,38 @@ blank timing proves neither physical link output nor plane/bandwidth readiness.
 `unsafe ColdBoot::start_display_blank` and its platform wrapper preserve the same
 ownership and require the drained GC12/SDMA interrupt proofs; startup remains an
 explicit operation, not part of boot's framebuffer handoff.
+
+`unsafe Otg::retire_planes().await` disconnects all four MPC outputs and MPCCs,
+including inherited cross-routes and blending trees, under the timing owner's
+exclusive display/clock/PM lifetime. The constructor validates native MPC bank 3
+through output mux 3; it still writes nothing. Callers must stop CPU scanout
+writers, exclude firmware/FAMS and every surface/cursor/metadata/LUT, MPC, power
+and timing writer, and retain all associated allocations and translations.
+External streams/link clocks must already be stopped; timing may remain running
+to latch disconnection. Active update locks, pending flips, GSL synchronization,
+MALL prefetch mode, metadata/LUT loads and uncertain power states reject before
+writes. This path does not abort those independent transactions.
+
+Retirement parks output muxes first, then every MPCC top/bottom/OPP/update-lock
+selector, and disables cursors on powered HUBPs. A shared 100 ms deadline bounds
+all drain waits. Each MPCC must acknowledge IDLE or DISABLED with BUSY clear;
+every powered HUBP must acknowledge no outstanding requests before any blanking
+or clock gating. Native HUBP blanking asserts blank and clears TTU-disable;
+MALL selection and surface GSL are cleared. Drain is checked again before fetch
+clocks are disabled, followed by final power/route/lock/consumer readback.
+Already-off HUBPs are identified through native DOMAIN0–3 PGFSM state and are
+never accessed. No power domain is changed and DPP clocks/timing stay retained.
+
+`PlanesRetired::{blanked,powered_off}` reports the two HUBP masks in
+`Status::planes_retired`. Success enters `PlanesRetired`, allowing subsequent
+timing/clock preparation subject to their live checks. This snapshot never
+grants allocation reuse and proves nothing about GPUVM, writeback or other
+engines. Cancellation retains `RetiringPlanes`; errors after writes enter
+`Failed`, blocking replay, timing retirement and clock changes until independent
+reset. `RunningBlank` must first retire its timing before plane retirement.
+`unsafe ColdBoot::retire_display_planes` and the matching platform wrapper
+serialize the operation after drained GC12/SDMA proofs. No automatic firmware
+display takeover or visible link output is introduced.
 
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,

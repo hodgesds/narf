@@ -7,6 +7,7 @@ use core::{
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 const BASE: u64 = 0x10000;
+const MPC_BASE: u64 = 0x30000;
 struct Fake {
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
@@ -19,6 +20,10 @@ struct Fake {
     gone: Option<usize>,
     revoke: Option<(usize, Cap<BusDeviceCap, Write>)>,
     after_enable: Option<(u64, u32)>,
+    after_write: Option<(usize, u64, u32)>,
+    disconnecting: bool,
+    forbidden_hubps: u8,
+    plane_delay: [u8; 4],
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
@@ -26,6 +31,37 @@ impl Io for Fake {
             return u32::MAX;
         }
         for p in 0..4 {
+            assert!(
+                self.forbidden_hubps & (1 << p) == 0
+                    || !(BASE + (0x5f4 + p * 0xdc) * 4..=BASE + (0x68d + p * 0xdc) * 4)
+                        .contains(&at)
+            );
+            let top = MPC_BASE + p * 0x15 * 4;
+            let disconnected = self.disconnecting
+                && [0, 1, 2, 5]
+                    .iter()
+                    .all(|r| self.regs.get(&(top + r * 4)).copied().unwrap_or(0) & 0xf == 0xf);
+            if disconnected && at == top + 0xe * 4 && self.stall & 512 == 0 {
+                if self.plane_delay[p as usize] == 0 {
+                    self.regs.insert(at, 1);
+                } else {
+                    self.plane_delay[p as usize] -= 1;
+                }
+            }
+            if disconnected
+                && at == BASE + (0x5f4 + p * 0xdc) * 4
+                && self.stall & 1024 == 0
+                && !(self.stall & 2048 != 0 && self.regs.get(&at).copied().unwrap_or(0) & 1 != 0)
+                && self
+                    .regs
+                    .get(&(BASE + (0x679 + p * 0xdc) * 4))
+                    .copied()
+                    .unwrap_or(0)
+                    & 1
+                    == 0
+            {
+                *self.regs.entry(at).or_default() |= 2;
+            }
             let ctrl = BASE + (0x1b43 + 0x80 * p) * 4;
             let clock = BASE + (0x1b84 + 0x80 * p) * 4;
             let input = BASE + (0x1ad0 + 0x10 * p) * 4;
@@ -67,13 +103,27 @@ impl Io for Fake {
         *self.regs.get(&at).unwrap_or(&0)
     }
     fn write(&mut self, at: u64, value: u32) {
-        assert!((BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at));
+        assert!(
+            (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
+                || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
+        );
         self.writes.push((at, value));
         if self.reject == Some(self.writes.len()) {
             return;
         }
         self.regs.insert(at, value);
+        if (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at) {
+            self.disconnecting = true;
+        }
         for p in 0..4 {
+            assert!(
+                self.forbidden_hubps & (1 << p) == 0
+                    || !(BASE + (0x5f4 + p * 0xdc) * 4..=BASE + (0x68d + p * 0xdc) * 4)
+                        .contains(&at)
+            );
+            if at == BASE + (0x5f4 + p * 0xdc) * 4 && value & 1 != 0 && self.stall & 2048 != 0 {
+                self.regs.insert(at, value & !2);
+            }
             if at == BASE + (0x1854 + 0x5a * p) * 4 {
                 self.regs.insert(BASE + (0x185b + 0x5a * p) * 4, 1);
             }
@@ -89,6 +139,11 @@ impl Io for Fake {
         if let Some((n, cap)) = self.revoke {
             if n == self.writes.len() {
                 cap.revoke();
+            }
+        }
+        if let Some((n, at, value)) = self.after_write {
+            if n == self.writes.len() {
+                self.regs.insert(at, value);
             }
         }
     }
@@ -123,6 +178,10 @@ fn engine() -> Engine<Fake> {
             gone: None,
             revoke: None,
             after_enable: None,
+            after_write: None,
+            disconnecting: false,
+            forbidden_hubps: 0,
+            plane_delay: [0; 4],
         },
         authority: Cap::bootstrap(),
         layout: Layout::resolve(&gpu).unwrap(),
@@ -131,6 +190,7 @@ fn engine() -> Engine<Fake> {
             pipes: [None; 4],
             blanks: [None; 4],
             running_blank: None,
+            planes_retired: None,
             retired: 0,
         },
     }
@@ -841,3 +901,6 @@ kernel_test_in!(
 
 #[path = "amdgpu_dcn401_blank_tests.rs"]
 mod blank;
+
+#[path = "amdgpu_dcn401_fetch_tests.rs"]
+mod fetch;

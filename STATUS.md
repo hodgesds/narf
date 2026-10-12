@@ -323,9 +323,15 @@ waits for current-master acknowledgement, blank-buffer latching and a fresh
 frame-counter transition under one bounded deadline. Running timing blocks
 clock changes until acknowledged retirement; failure/cancellation quarantine
 the owner and retain every scanout allocation. TMDS still needs a native PHY
-PLL proof. Inherited plane retirement, PHY/link and plane programming, surface
-scanout enable, active-stream transitions, bandwidth/watermarks and complete
-native modesetting remain open. This path has model tests, not silicon validation.
+PLL proof. Native inherited-plane retirement now disconnects all MPC routes,
+waits for MPCC/HUBP drain, blanks powered planes and disables their fetch clocks.
+Already-off HUBPs require native PGFSM acknowledgement and remain untouched.
+Blank startup accepts native TTU behavior and checks the independent 3D-LUT
+fetcher. Pending flips, synchronization, metadata/LUT loads and uncertain power
+states block retirement before writes; failure/cancellation retain resources.
+PHY/link and plane programming, surface scanout enable, active-stream transitions,
+bandwidth/watermarks and complete native modesetting remain open. These paths
+have model tests, not silicon validation.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
 C layouts. Its retained unified-firmware owner starts both pipes, configures

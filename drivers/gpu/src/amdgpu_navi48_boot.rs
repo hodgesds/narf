@@ -863,7 +863,27 @@ impl ColdBoot {
     /// All associated scanout resources remain retained and CPU writers have
     /// stopped. This retires timing only, never HUBP fetches or surface memory.
     pub async unsafe fn retire_display_timing(&mut self, pipe: u8) -> Result<(), otg::Error> {
-        if self.state() != State::MemoryReady
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: caller retains scanout memory; matching exclusive display owner.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.retire(pipe).await }
+    }
+    /// Disconnect all inherited native planes while retaining their resources.
+    /// # Safety
+    /// Stop CPU writers, exclude concurrent surface/cursor/metadata/LUT, MPC,
+    /// firmware/FAMS and power writers, and retain every associated allocation
+    /// and translation. Completion does not permit freeing or reusing memory.
+    pub async unsafe fn retire_display_planes(&mut self) -> Result<otg::PlanesRetired, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: matching retained display owner; caller retains all resources
+        // and excludes writers, including firmware and inherited scanout users.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.retire_planes().await }
+    }
+    fn display_retirement_busy(&self) -> bool {
+        self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)
             || self.sdma_state() != Some(sdma::State::InterruptVerified)
             || self.dccg.as_ref().is_ok_and(|d| {
@@ -875,11 +895,6 @@ impl ColdBoot {
                     clocks::State::Prepared | clocks::State::Ready | clocks::State::Applied
                 )
             })
-        {
-            return Err(otg::Error::Busy);
-        }
-        // SAFETY: caller retains scanout memory; matching exclusive display owner.
-        unsafe { self.otg.as_mut().map_err(|e| *e)?.retire(pipe).await }
     }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display

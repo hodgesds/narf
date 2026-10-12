@@ -12,6 +12,9 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 #[path = "amdgpu_dcn401_opp.rs"]
 mod opp;
 pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
+#[path = "amdgpu_dcn401_fetch.rs"]
+mod fetch;
+pub use fetch::PlanesRetired;
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -59,6 +62,8 @@ pub enum State {
     BlankPrepared,
     StartingBlank(u8),
     RunningBlank(u8),
+    RetiringPlanes,
+    PlanesRetired,
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -67,7 +72,11 @@ impl State {
     pub(crate) fn reusable(self) -> bool {
         matches!(
             self,
-            Self::Ready | Self::Prepared | Self::BlankPrepared | Self::Retired
+            Self::Ready
+                | Self::Prepared
+                | Self::BlankPrepared
+                | Self::Retired
+                | Self::PlanesRetired
         )
     }
 }
@@ -122,6 +131,9 @@ pub struct Status {
     /// Historical internal blank completion, valid only in RunningBlank.
     /// Does not prove link output or authorize scanout allocation reuse.
     pub running_blank: Option<BlankRunning>,
+    /// Historical fetch-stop evidence. Never grants allocation reuse or proves
+    /// retirement of GPUVM, writeback, or other GPU engines.
+    pub planes_retired: Option<PlanesRetired>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -232,6 +244,7 @@ impl Request {
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     base: u64,
+    mpc_base: u64,
     idle: [(u64, u32); 31],
 }
 impl Layout {
@@ -247,6 +260,14 @@ impl Layout {
         .map_err(|_| Error::Unsupported)?;
         Ok(Self {
             base,
+            mpc_base: crate::amdgpu_psp_ring::bank(
+                gpu,
+                ip::HW_ID_DCN,
+                &[(4, 0, 1), (4, 1, 0)],
+                3,
+                0x2fe,
+            )
+            .map_err(|_| Error::Unsupported)?,
             idle: display.idle_registers(),
         })
     }
@@ -449,6 +470,7 @@ impl Otg {
                 pipes: [None; 4],
                 blanks: [None; 4],
                 running_blank: None,
+                planes_retired: None,
                 retired: 0,
             },
         }))

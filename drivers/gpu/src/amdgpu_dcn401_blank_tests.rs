@@ -84,7 +84,6 @@ fn dcn401_blank_requires_positive_stopped_fetchers_on_every_pipe() -> TestResult
             (0x5f4, 0),      // powered-off/zero-filled MMIO is not retirement
             (0x5f4, 0x1002), // no blank
             (0x5f4, 0x1001), // outstanding requests
-            (0x5f4, 0x0003), // TTU still enabled
             (0x5f4, 0x1007), // soft reset
             (0x5f5, 1),      // fetch clock enabled
             (0x679, 1),      // cursor
@@ -92,6 +91,8 @@ fn dcn401_blank_requires_positive_stopped_fetchers_on_every_pipe() -> TestResult
             (0x685, 2),
             (0x685, 4),
             (0x685, 1 << 16),
+            (0x68a, 1),    // independent native 3D-LUT fetch
+            (0x5f7, 0x10), // independent MALL prefetch mode
         ] {
             let mut e = staged(0, Signal::HpoDisplayPort);
             e.io.regs.insert(BASE + (r + pipe * 0xdc) * 4, value);
@@ -261,6 +262,8 @@ fn dcn401_blank_rechecks_fetchers_streams_and_pattern_after_enable() -> TestResu
         (0x5f4, 0x1001, Error::Busy),
         (0x679, 1, Error::Busy),
         (0x685, 4, Error::Busy),
+        (0x68a, 1, Error::Busy),
+        (0x5f7, 0x10, Error::Busy),
         (0x20bd, 1, Error::Busy),
         (0x1854, 0x1040, Error::Readback(BASE + 0x1854 * 4)),
         (0x530, 1121 << 16 | 1, Error::Readback(BASE + 0x530 * 4)),
