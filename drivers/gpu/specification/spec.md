@@ -842,7 +842,12 @@ activation succeeds, through `amdgpu_dcn_display::publish_external`. The
 published `GenericFb` is the surface's bus-physical BAR address, visible size
 and byte pitch (`Otg::scanout_framebuffer`, which requires `ScanoutRunning`
 for that pipe and the owned surface). The fb layer's existing observer moves
-the console onto it. The scanout carries a flush: CPU writes through the BAR
+the console onto it. Adoption maps the published physical range
+(write-combining on x86_64, Device on aarch64) and installs that kernel
+mapping, cached per range and never unmapped. The fb layer previously stored
+the physical address itself, which `GenericFb::framebuffer` dereferences, for
+both AMD external scanouts and the boot framebuffer restore. The scanout
+carries a flush: CPU writes through the BAR
 pass HDP, so `GenericScanout::flush` calls `flush_active_scanout`, and the
 platform hook try-locks the owner and issues the native HDP flush
 (`Otg::flush_scanout_writes`). It never waits; a skipped flush still drains,

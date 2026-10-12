@@ -451,12 +451,58 @@ pub fn adopt_external_scanout() -> bool {
     };
     adopt(fb)
 }
+/// Kernel mappings made for adopted scanouts, as (phys, len, va). Never
+/// unmapped: a writer that read the previous `GENERIC_FB` may still be drawing
+/// through it, and every provider retains the memory behind what it published.
+static ADOPTED_MAPS: narf_lib::sync::IrqSafeSpinLock<[Option<(u64, u64, u64)>; 8]> =
+    narf_lib::sync::IrqSafeSpinLock::new([None; 8]);
+
+/// A dereferenceable view of a scanout published by its bus-physical address
+/// (the convention of the boot framebuffer and the AMD external scanouts).
+/// `GenericFb::framebuffer` casts `addr` to a pointer, so installing the
+/// physical address itself would write through an unmapped address.
+fn map_scanout(
+    fb: narf_graphics_driver::generic::GenericFb,
+) -> Option<narf_graphics_driver::generic::GenericFb> {
+    use narf_memory::ioremap::{ioremap, MmioAttrs};
+    let len = (u64::from(fb.pitch) * u64::from(fb.height) + 0xfff) & !0xfff;
+    let cached = ADOPTED_MAPS
+        .lock()
+        .iter()
+        .flatten()
+        .find(|&&(phys, mapped, _)| phys == fb.addr && mapped >= len)
+        .map(|&(_, _, va)| va);
+    let va = match cached {
+        Some(va) => va,
+        None => {
+            #[cfg(target_arch = "x86_64")]
+            let attrs = MmioAttrs::WriteCombining;
+            #[cfg(not(target_arch = "x86_64"))]
+            let attrs = MmioAttrs::Device;
+            // SAFETY: the publisher retains this device/boot framebuffer range
+            // for as long as it is published and beyond; it is never RAM the
+            // allocator could hand out. The mapping is kept for good.
+            let m = unsafe { ioremap(fb.addr, len, attrs) }.ok()?;
+            let mut maps = ADOPTED_MAPS.lock();
+            if let Some(slot) = maps.iter_mut().find(|m| m.is_none()) {
+                *slot = Some((fb.addr, len, m.va()));
+            }
+            m.va()
+        }
+    };
+    Some(narf_graphics_driver::generic::GenericFb::new(
+        va, fb.width, fb.height, fb.pitch, fb.bpp,
+    ))
+}
 fn adopt(fb: narf_graphics_driver::generic::GenericFb) -> bool {
     if fb.addr == 0 || fb.width == 0 || fb.height == 0 || fb.pitch == 0 {
         return false;
     }
+    let Some(mapped) = map_scanout(fb) else {
+        return false;
+    };
     GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
-    *GENERIC_FB.lock() = Some(fb);
+    *GENERIC_FB.lock() = Some(mapped);
     true
 }
 /// Put the console back on the framebuffer it booted with. Used when an adopted

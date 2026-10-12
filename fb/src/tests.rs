@@ -1274,3 +1274,40 @@ fn smoke_fbdev_mmap_frames() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("fb", smoke_fbdev_mmap_frames);
+
+/// An adopted scanout is published by bus-physical address; the installed
+/// view must be its kernel mapping, reused for the same range, never the
+/// physical address itself.
+fn smoke_fb_adopted_scanout_is_installed_through_its_mapping() -> TestResult {
+    use narf_graphics_driver::generic::GenericFb;
+    const PHYS: u64 = 0x7f_0000_0000;
+    const VA: u64 = 0xffff_c000_dead_0000;
+    let fb = GenericFb::new(PHYS, 640, 480, 640 * 4, 32);
+    {
+        let mut maps = crate::ADOPTED_MAPS.lock();
+        let Some(slot) = maps.iter_mut().find(|m| m.is_none()) else {
+            return TestResult::Skip("adoption mapping cache full");
+        };
+        *slot = Some((PHYS, 640 * 480 * 4, VA));
+    }
+    let mapped = crate::map_scanout(fb);
+    let reused = mapped.map(|m| (m.addr, m.width, m.height, m.pitch));
+    crate::ADOPTED_MAPS
+        .lock()
+        .iter_mut()
+        .filter(|m| m.is_some_and(|(p, _, _)| p == PHYS))
+        .for_each(|m| *m = None);
+    if reused != Some((VA, 640, 480, 640 * 4)) {
+        return TestResult::Fail("cached mapping not used for the same range");
+    }
+    if crate::adopt(GenericFb::new(0, 640, 480, 640 * 4, 32))
+        || crate::adopt(GenericFb::new(PHYS, 0, 480, 640 * 4, 32))
+    {
+        return TestResult::Fail("degenerate scanout adopted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb",
+    smoke_fb_adopted_scanout_is_installed_through_its_mapping
+);

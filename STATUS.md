@@ -410,6 +410,9 @@ reports it, after which every retained report moves to the new front.
 `amdgpu.native_display` opts the boot handoff into retiring the GOP's DP SST
 output and running the native modeset; it is off by default because no board
 has validated it.
+Adopting an external scanout (DCN314 or Navi48), or restoring the boot
+framebuffer, now installs a kernel mapping of the published physical range
+instead of dereferencing the physical address.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
