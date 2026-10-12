@@ -305,7 +305,7 @@ an integer plus fractional Hz ratio, source mux and required clock gates,
 preserving neighboring fields. TMDS disables DP DTO and selects divide-by-two
 or four. Changed TMDS dividers retrigger DENTIST and await its completion with
 a 100 ms bound, following the native DIG FIFO workaround. This does not
-program an HDMI PLL, route a stream clock or turn on transmission.
+program an HDMI PLL or turn on transmission.
 Disabled pipes park their DPP and pixel clocks; shared root gates remain on.
 
 Readback verifies every programmed field. Partial failure records a terminal
@@ -316,6 +316,22 @@ snapshot. No stream may use a stale snapshot after global clocks change.
 matching owners after drained engine proofs. `display_pipe_clock_status` and
 platform diagnostics expose progress. An uncertain DCCG transition also blocks
 subsequent platform global-clock changes.
+
+`Dccg::route_stream(&mut ClockManager, StreamRoute)` connects one of four HPO
+DP stream clocks or the single FRL stream clock to a prepared pixel pipe;
+`pipe: None` parks that stream on REFCLK. DP and FRL require matching pixel
+signal types and the same current acknowledged global-clock snapshot. Divider,
+source mux and enable readback (including current DPREFCLK for DP) must still
+match the prepared pipe. A mismatch is terminal before any routing writes.
+Routes preserve other stream fields and never change the DTO reference source.
+Every stream remains retired; this does not enable a PHY, encoder or video FIFO.
+
+Before reprogramming a pixel DTO, the owner reads all actual stream-clock muxes
+and parks every route selecting that pipe, including inherited routes without
+software history. Unrelated routes remain intact. Successful parking/routing
+is retained in `Status::routes`; partial failures share the terminal DCCG state.
+`ColdBoot::route_display_stream_clock` and the platform async wrapper serialize
+this operation with clock and engine owners after drained kernel proofs.
 
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,

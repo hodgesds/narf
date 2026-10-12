@@ -310,6 +310,18 @@ pub async fn prepare_display_pipe_clocks(
         .await
 }
 
+/// Connect a prepared native pixel clock to a retired HPO DP or FRL stream.
+pub async fn route_display_stream_clock(
+    route: crate::amdgpu_dcn401_dccg::StreamRoute,
+) -> Result<(), crate::amdgpu_dcn401_dccg::Error> {
+    OWNER
+        .lock()
+        .await
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_dccg::Error::Busy)?
+        .route_display_stream_clock(route)
+}
+
 /// Consume bounded diagnostic history from the independent IH service.
 /// Hardware draining and CPU interrupt waits never hold the display-owner lock.
 pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> {

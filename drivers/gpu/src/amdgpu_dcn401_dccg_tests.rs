@@ -30,7 +30,8 @@ impl Io for Fake {
     }
     fn write(&mut self, at: u64, value: u32) {
         assert!(
-            (BASE..=BASE + 0xa8 * 4).contains(&at) || at == 0x10000 + 0x5a * 4,
+            (BASE..=BASE + 0xa8 * 4).contains(&at)
+                || [0x10000 + 0x59 * 4, 0x10000 + 0x5a * 4].contains(&at),
             "write outside DCCG"
         );
         self.writes.push((at, value));
@@ -87,6 +88,7 @@ fn engine() -> Engine<Fake> {
         status: Status {
             state: State::Ready,
             pipes: [None; 4],
+            routes: [None; 5],
         },
     }
 }
@@ -426,4 +428,262 @@ fn dcn401_dccg_constructor_and_matching_global_owner_are_required() -> TestResul
 kernel_test_in!(
     "drivers/gpu/dcn401-dccg",
     dcn401_dccg_constructor_and_matching_global_owner_are_required
+);
+
+fn dcn401_stream_routes_use_prepared_pipe_without_changing_its_reference() -> TestResult {
+    for pipe in 0..4 {
+        for stream in [
+            Stream::HpoDp(0),
+            Stream::HpoDp(1),
+            Stream::HpoDp(2),
+            Stream::HpoDp(3),
+            Stream::HdmiFrl,
+        ] {
+            let mut e = engine();
+            let mut req = request(pipe);
+            if stream == Stream::HdmiFrl {
+                req.pixel = PixelClock::HdmiFrl {
+                    pixel_hz: 148_500_000,
+                };
+            }
+            let plan = run(e.prepare(req, clocks())).unwrap();
+            e.io.writes.clear();
+            let route = StreamRoute {
+                stream,
+                pipe: Some(pipe),
+            };
+            e.route(route, clocks()).unwrap();
+            if let Stream::HpoDp(i) = stream {
+                assert_eq!(
+                    e.io.writes,
+                    [
+                        (BASE + 0x69 * 4, (1 << pipe) | (3 << (6 + 2 * i))),
+                        (BASE + 0x4a * 4, (8 | u32::from(pipe)) << (4 * i)),
+                    ]
+                );
+            } else {
+                assert_eq!(e.io.writes, [(0x10000 + 0x59 * 4, 8 | u32::from(pipe))]);
+            }
+            assert_eq!(e.status.routes[stream.slot().unwrap()], Some(route));
+            assert_eq!(e.status.pipes[usize::from(pipe)], Some(plan));
+            e.io.writes.clear();
+            let parked = StreamRoute { stream, pipe: None };
+            e.route(parked, clocks()).unwrap();
+            let (at, shift) = e.route_register(stream).unwrap();
+            assert_eq!((e.io.regs[&at] >> shift) & 15, u32::from(pipe));
+            assert_eq!(e.status.routes[stream.slot().unwrap()], Some(parked));
+            assert!(
+                !e.io.writes.iter().any(|&(at, _)| at == BASE + 0x68 * 4),
+                "route changed DPREF to DTB"
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_stream_routes_use_prepared_pipe_without_changing_its_reference
+);
+
+fn dcn401_stream_routes_reject_stale_or_changed_sources() -> TestResult {
+    for case in 0..13 {
+        let mut e = engine();
+        run(e.prepare(request(2), clocks())).unwrap();
+        e.io.writes.clear();
+        let mut route = StreamRoute {
+            stream: Stream::HpoDp(1),
+            pipe: Some(2),
+        };
+        let mut g = clocks();
+        match case {
+            0 => route.stream = Stream::HpoDp(4),
+            1 => route.pipe = Some(4),
+            2 => route.pipe = Some(1),
+            3 => route.stream = Stream::HdmiFrl,
+            4 => g.dpp_khz += 1,
+            5 => {
+                e.io.regs.insert(BASE + (0x99 + 2) * 4, 0);
+            }
+            6 => {
+                e.io.regs.insert(BASE + 0xa8 * 4, 0);
+            }
+            7 => {
+                e.io.regs.insert(BASE + 0x68 * 4, 6 << 6);
+            }
+            8 => {
+                e.io.regs.insert(BASE + (0x81 + 8) * 4, 0);
+            }
+            9 => {
+                e.io.regs.insert(BASE + (0x82 + 8) * 4, 0);
+            }
+            10 => {
+                e.io.regs.insert(BASE + 0x6f * 4, 2 << 11);
+            }
+            11 => {
+                e.io.regs.insert(BASE + (0x80 + 8) * 4, 0);
+            }
+            _ => {
+                e.io.regs.insert(DPREF, 26);
+            }
+        }
+        let err = e.route(route, g).unwrap_err();
+        if case <= 4 {
+            assert_eq!(err, Error::Invalid);
+            assert_eq!(e.status.state, State::Applied);
+        } else {
+            assert!(matches!(err, Error::Readback(_)));
+            assert_eq!(e.status.state, State::Failed(err));
+        }
+        assert!(e.io.writes.is_empty());
+        assert_eq!(e.status.routes, [None; 5]);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_stream_routes_reject_stale_or_changed_sources
+);
+
+fn dcn401_changing_pixel_clock_parks_all_matching_inherited_routes_first() -> TestResult {
+    for pipe in 0..4 {
+        let mut e = engine();
+        let other = (pipe + 1) % 4;
+        let dp = 0x4000_0000
+            | (8 | u32::from(pipe))
+            | ((8 | u32::from(other)) << 4)
+            | ((8 | u32::from(pipe)) << 8);
+        e.io.regs.insert(BASE + 0x4a * 4, dp);
+        e.io.regs.insert(BASE + 0x69 * 4, 0x4000_3fc0);
+        e.io.regs
+            .insert(0x10000 + 0x59 * 4, 0x4000_0008 | u32::from(pipe));
+        run(e.prepare(request(pipe), clocks())).unwrap();
+        assert_eq!(
+            &e.io.writes[..6],
+            &[
+                (BASE + 0x4a * 4, dp & !8),
+                (BASE + 0x69 * 4, 0x4000_3f00),
+                (BASE + 0x4a * 4, dp & !0x808),
+                (BASE + 0x69 * 4, 0x4000_3300),
+                (0x10000 + 0x59 * 4, 0x4000_0000 | u32::from(pipe)),
+                (BASE + (0x99 + u64::from(pipe)) * 4, 0xff006c),
+            ]
+        );
+        assert_eq!(reg(&e, 0x4a), dp & !0x808);
+        assert_eq!(e.status.routes[1], None, "unrelated route disturbed");
+        for (slot, stream) in [
+            (0, Stream::HpoDp(0)),
+            (2, Stream::HpoDp(2)),
+            (4, Stream::HdmiFrl),
+        ] {
+            assert_eq!(
+                e.status.routes[slot],
+                Some(StreamRoute { stream, pipe: None })
+            );
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_changing_pixel_clock_parks_all_matching_inherited_routes_first
+);
+
+fn dcn401_routing_failure_or_revocation_prevents_clock_reuse() -> TestResult {
+    for stream in [Stream::HpoDp(2), Stream::HdmiFrl] {
+        let steps = if stream == Stream::HdmiFrl { 1 } else { 2 };
+        for step in 1..=steps {
+            for revoke in [false, true] {
+                let mut e = engine();
+                let mut req = request(3);
+                if stream == Stream::HdmiFrl {
+                    req.pixel = PixelClock::HdmiFrl {
+                        pixel_hz: 148_500_000,
+                    };
+                }
+                run(e.prepare(req, clocks())).unwrap();
+                e.io.writes.clear();
+                if revoke {
+                    e.io.revoke = Some((step, e.authority));
+                } else {
+                    e.io.reject = Some(step);
+                }
+                let route = StreamRoute {
+                    stream,
+                    pipe: Some(3),
+                };
+                let err = e.route(route, clocks()).unwrap_err();
+                assert!(if revoke {
+                    err == Error::Revoked
+                } else {
+                    matches!(err, Error::Readback(_))
+                });
+                assert_eq!(e.status.state, State::Failed(err));
+                assert_eq!(e.status.routes, [None; 5]);
+                assert_eq!(e.io.writes.len(), step);
+                assert_eq!(run(e.prepare(req, clocks())), Err(Error::Busy));
+                assert_eq!(e.route(route, clocks()), Err(Error::Busy));
+                assert_eq!(e.io.writes.len(), step);
+            }
+        }
+    }
+    let idle = engine().layout.idle;
+    for (at, mask) in idle {
+        let mut e = engine();
+        run(e.prepare(request(0), clocks())).unwrap();
+        e.io.writes.clear();
+        e.io.regs.insert(at, mask);
+        assert_eq!(
+            e.route(
+                StreamRoute {
+                    stream: Stream::HpoDp(0),
+                    pipe: Some(0)
+                },
+                clocks()
+            ),
+            Err(Error::Busy)
+        );
+        assert!(e.io.writes.is_empty());
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_routing_failure_or_revocation_prevents_clock_reuse
+);
+
+fn dcn401_inherited_route_retirement_failure_stops_before_dto_writes() -> TestResult {
+    for step in 1..=5 {
+        for revoke in [false, true] {
+            let mut e = engine();
+            e.io.regs.insert(BASE + 0x4a * 4, 0x808);
+            e.io.regs.insert(BASE + 0x69 * 4, 0x3fc0);
+            e.io.regs.insert(0x10000 + 0x59 * 4, 8);
+            if revoke {
+                e.io.revoke = Some((step, e.authority));
+            } else {
+                e.io.reject = Some(step);
+            }
+            let err = run(e.prepare(request(0), clocks())).unwrap_err();
+            assert!(if revoke {
+                err == Error::Revoked
+            } else {
+                matches!(err, Error::Readback(_))
+            });
+            assert_eq!(e.status.state, State::Failed(err));
+            assert_eq!(e.io.writes.len(), step);
+            assert_eq!(e.status.pipes, [None; 4]);
+            assert!(!e
+                .io
+                .writes
+                .iter()
+                .any(|&(at, _)| (BASE + 0x80 * 4..=BASE + 0xa8 * 4).contains(&at)));
+            assert_eq!(run(e.prepare(request(0), clocks())), Err(Error::Busy));
+            assert_eq!(e.io.writes.len(), step);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_inherited_route_retirement_failure_stops_before_dto_writes
 );

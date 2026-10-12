@@ -756,6 +756,23 @@ impl ColdBoot {
             .prepare(clocks, request)
             .await
     }
+    /// Connect a prepared pixel DTO to a retired HPO DP or FRL stream clock.
+    pub fn route_display_stream_clock(
+        &mut self,
+        route: dccg::StreamRoute,
+    ) -> Result<(), dccg::Error> {
+        if self.state() != State::MemoryReady
+            || self.queue_state() != Some(queues::State::InterruptVerified)
+            || self.sdma_state() != Some(sdma::State::InterruptVerified)
+        {
+            return Err(dccg::Error::Busy);
+        }
+        let clocks = self.clocks.as_mut().map_err(|e| dccg::Error::Clocks(*e))?;
+        self.dccg
+            .as_mut()
+            .map_err(|e| *e)?
+            .route_stream(clocks, route)
+    }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display
             .as_ref()

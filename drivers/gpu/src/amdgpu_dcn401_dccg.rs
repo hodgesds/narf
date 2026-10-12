@@ -5,6 +5,8 @@ use crate::{amdgpu::AmdGpu, amdgpu_dcn401_clk as clocks, amdgpu_discovery as ip}
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+const DP_STREAM: u64 = 0x4a; // DCN bank 1
+const HDMI_STREAM: u64 = 0x59; // DCN bank 2
 const GATE3: u64 = 0x5a;
 const DENTIST: u64 = 0x64;
 const DTB_P: u64 = 0x68;
@@ -73,11 +75,33 @@ pub struct Applied {
     pub phase: u32,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    HpoDp(u8),
+    HdmiFrl,
+}
+impl Stream {
+    fn slot(self) -> Result<usize, Error> {
+        match self {
+            Self::HpoDp(i @ 0..=3) => Ok(usize::from(i)),
+            Self::HdmiFrl => Ok(4),
+            _ => Err(Error::Invalid),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamRoute {
+    pub stream: Stream,
+    /// None parks the stream on REFCLK, preserving its remembered mux.
+    pub pipe: Option<u8>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Status {
     pub state: State,
     /// Historical successful programming, each tagged with its global clocks.
     /// Failed/in-flight operations must never be treated as a usable pipe.
     pub pipes: [Option<Applied>; 4],
+    /// Last successful routing operations. None means no routing proof.
+    pub routes: [Option<StreamRoute>; 5],
 }
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -254,6 +278,129 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
+    fn route_register(&self, stream: Stream) -> Result<(u64, u32), Error> {
+        stream.slot()?;
+        Ok(match stream {
+            Stream::HpoDp(i) => (self.layout.reg(DP_STREAM), 4 * u32::from(i)),
+            Stream::HdmiFrl => (self.layout.dio + HDMI_STREAM * 4, 0),
+        })
+    }
+    fn program_route(&mut self, route: StreamRoute) -> Result<(), Error> {
+        let (at, shift) = self.route_register(route.stream)?;
+        if let Some(pipe) = route.pipe {
+            if let Stream::HpoDp(i) = route.stream {
+                let gates = 3 << (6 + 2 * i);
+                self.update(GATE5, gates, gates)?;
+            }
+            self.update_at(at, 15 << shift, (8 | u32::from(pipe)) << shift)?;
+        } else {
+            self.update_at(at, 8 << shift, 0)?;
+            if let Stream::HpoDp(i) = route.stream {
+                self.update(GATE5, 3 << (6 + 2 * i), 0)?;
+            }
+        }
+        self.status.routes[route.stream.slot()?] = Some(route);
+        Ok(())
+    }
+    fn park_pipe_routes(&mut self, pipe: u8) -> Result<(), Error> {
+        // Inspect actual muxes, including inherited routes with no software
+        // history. Do not leave any stream clock fed by a changing pixel DTO.
+        let dp = self.read(self.layout.reg(DP_STREAM))?;
+        let hdmi = self.read(self.layout.dio + HDMI_STREAM * 4)?;
+        for i in 0..4 {
+            if (dp >> (4 * i)) & 15 == 8 | u32::from(pipe) {
+                self.program_route(StreamRoute {
+                    stream: Stream::HpoDp(i),
+                    pipe: None,
+                })?;
+            }
+        }
+        if hdmi & 15 == 8 | u32::from(pipe) {
+            self.program_route(StreamRoute {
+                stream: Stream::HdmiFrl,
+                pipe: None,
+            })?;
+        }
+        Ok(())
+    }
+    fn verify_pipe(&mut self, plan: Applied) -> Result<(), Error> {
+        let pipe = plan.request.pipe;
+        let pixel = PIXEL + 4 * u64::from(pipe);
+        let source = if matches!(plan.request.pixel, PixelClock::HdmiFrl { .. }) {
+            6
+        } else {
+            4
+        };
+        for (index, mask, value) in [
+            (
+                DPP_PARAM + u64::from(pipe),
+                u32::MAX,
+                u32::from(plan.dpp_phase) | 0xff << 16,
+            ),
+            (DPP_ENABLE, 1 << (3 * pipe), 1 << (3 * pipe)),
+            (DTB_P, 7 << (3 * pipe), source << (3 * pipe)),
+            (pixel + 1, u32::MAX, plan.phase),
+            (pixel + 2, u32::MAX, plan.reference_hz),
+            (
+                PIXEL_DIV,
+                15 << (5 * pipe + 1),
+                u32::from(plan.integer) << (5 * pipe + 1),
+            ),
+            (pixel, 0x1010, 0x1010),
+        ] {
+            let at = self.layout.reg(index);
+            if self.read(at)? & mask != value {
+                return Err(Error::Readback(at));
+            }
+        }
+        if matches!(plan.request.pixel, PixelClock::DisplayPort { .. })
+            && dpref_hz(self.read(PLL)?, self.read(DPREF)?)? != plan.reference_hz
+        {
+            return Err(Error::Readback(DPREF));
+        }
+        Ok(())
+    }
+    fn route(&mut self, route: StreamRoute, global: clocks::Applied) -> Result<(), Error> {
+        if !matches!(self.status.state, State::Ready | State::Applied) {
+            return Err(Error::Busy);
+        }
+        route.stream.slot()?;
+        let plan = match route.pipe {
+            Some(pipe) => {
+                let plan = self
+                    .status
+                    .pipes
+                    .get(usize::from(pipe))
+                    .copied()
+                    .flatten()
+                    .ok_or(Error::Invalid)?;
+                if plan.global != global
+                    || !matches!(
+                        (route.stream, plan.request.pixel),
+                        (Stream::HpoDp(_), PixelClock::DisplayPort { .. })
+                            | (Stream::HdmiFrl, PixelClock::HdmiFrl { .. })
+                    )
+                {
+                    return Err(Error::Invalid);
+                }
+                Some(plan)
+            }
+            None => None,
+        };
+        self.idle()?;
+        self.status.state = State::Applying;
+        let result = (|| {
+            if let Some(plan) = plan {
+                self.verify_pipe(plan)?;
+            }
+            self.program_route(route)
+        })();
+        self.status.state = match result {
+            Ok(()) => State::Applied,
+            Err(e) => State::Failed(e),
+        };
+        result
+    }
     async fn tmds_divider(&mut self, pipe: u8, divider: TmdsDivider) -> Result<(), Error> {
         let mask = 1 << (5 * pipe);
         let value = if divider == TmdsDivider::By4 { mask } else { 0 };
@@ -283,6 +430,7 @@ impl<I: Io> Engine<I> {
     async fn program(&mut self, plan: Applied) -> Result<(), Error> {
         let pipe = plan.request.pipe;
         let pixel = PIXEL + 4 * u64::from(pipe);
+        self.park_pipe_routes(pipe)?;
         if plan.dpp_phase != 0 {
             self.update(
                 DPP_PARAM + u64::from(pipe),
@@ -373,6 +521,7 @@ impl Dccg {
             status: Status {
                 state: State::Ready,
                 pipes: [None; 4],
+                routes: [None; 5],
             },
         }))
     }
@@ -388,6 +537,17 @@ impl Dccg {
     ) -> Result<Applied, Error> {
         let global = clocks.pipe_clocks(self.0.io.0).map_err(Error::Clocks)?;
         self.0.prepare(request, global).await
+    }
+    /// Route a prepared pixel clock to a retired HPO DP or FRL stream. Refuses
+    /// stale global clocks, wrong signal types and changed divider readback.
+    /// This does not start a PHY, encoder, video FIFO or stream transmission.
+    pub fn route_stream(
+        &mut self,
+        clocks: &mut clocks::ClockManager,
+        route: StreamRoute,
+    ) -> Result<(), Error> {
+        let global = clocks.pipe_clocks(self.0.io.0).map_err(Error::Clocks)?;
+        self.0.route(route, global)
     }
 }
 #[cfg(feature = "kernel-test")]

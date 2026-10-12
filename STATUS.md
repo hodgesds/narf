@@ -303,8 +303,12 @@ serialized after the kernel engine proofs. Native DCCG now prepares all four
 DPP dividers, DPREF-derived DP pixel DTOs, DTB-derived FRL DTOs, and TMDS
 dividers with the bounded DENTIST FIFO workaround. Matching global clocks,
 retired consumers and readback are required; partial failures retain ownership
-and block global-clock changes. Stream routing, active-stream transitions,
-bandwidth/watermarks and complete native modesetting remain open.
+and block global-clock changes. Native HPO DP/FRL stream-clock routing now
+requires matching current pipe clocks and divider readback, preserving each
+DTO's reference. Reprogramming a pipe first parks all actual routes feeding
+from it, including inherited routes. PHY/link and scanout programming,
+active-stream transitions, bandwidth/watermarks and complete native modesetting
+remain open.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
 C layouts. Its retained unified-firmware owner starts both pipes, configures
