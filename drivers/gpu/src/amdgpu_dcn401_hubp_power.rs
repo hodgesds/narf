@@ -12,14 +12,14 @@ pub struct HubpPower {
 }
 
 impl<I: Io> Engine<I> {
-    fn hubp_transactions_stopped(&mut self, pipe: u8) -> Result<(), Error> {
+    fn hubp_transactions_stopped(&mut self, pipe: u8, staged: bool) -> Result<(), Error> {
         let l = self.layout;
         self.auxiliary_fetchers_stopped(pipe)?;
         for (r, mask) in [
             (HUBP_CONTROL, 4), // SOFT_RESET, not TTU_DISABLE
             (HUBP_CLOCK, 1),
             (CURSOR, 1),
-            (FLIP, 0x301),
+            (FLIP, if staged { 0x201 } else { 0x301 }),
             (FLIP2, 0x100),
         ] {
             if self.read(l.hubp(pipe, r))? & mask != 0 {
@@ -28,7 +28,12 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    fn hubp_power_tree_stopped(&mut self) -> Result<(), Error> {
+    pub(super) fn hubp_power_tree_stopped(&mut self) -> Result<(), Error> {
+        self.hubp_tree_stopped(None)
+    }
+    // Only a caller retaining the selected staged address may tolerate its
+    // pending flip. Blank/drain/clock/lock and unrelated pipes stay strict.
+    pub(super) fn hubp_tree_stopped(&mut self, staged: Option<u8>) -> Result<(), Error> {
         let l = self.layout;
         for (at, mask) in l.idle {
             if self.read(at)? & mask != 0 {
@@ -59,7 +64,7 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
             if self.hubp_powered(p)? {
-                self.hubp_transactions_stopped(p)?;
+                self.hubp_transactions_stopped(p, staged == Some(p))?;
             }
         }
         self.fetchers_stopped()
@@ -95,7 +100,7 @@ impl<I: Io> Engine<I> {
         if request.powered {
             // No surfaces, timing or MPC routes have been enabled. Reject
             // unexpected auxiliary activity before enabling the fetch clock.
-            self.hubp_transactions_stopped(p)?;
+            self.hubp_transactions_stopped(p, false)?;
             self.update(l.hubp(p, HUBP_CLOCK), 1, 1)?;
             self.wait(l.hubp(p, HUBP_CONTROL), 2, 2, 100_000).await?;
             self.update(l.hubp(p, HUBP_CONTROL), 0x1001, 1)?;
@@ -132,6 +137,7 @@ impl<I: Io> Engine<I> {
             self.status.state = State::ChangingHubpPower(pipe);
             self.status.planes_retired = None;
             self.status.hubp_power[usize::from(pipe)] = None;
+            self.status.surfaces[usize::from(pipe)] = None;
             if let Err(e) = self.change_hubp_power(request).await {
                 self.status.state = State::Failed(e);
                 return Err(e);

@@ -410,6 +410,39 @@ pub async unsafe fn set_display_hubp_power(
     unsafe { boot.set_display_hubp_power(pipe, powered).await }
 }
 
+/// Stage an owned linear framebuffer while pixel fetch stays disabled.
+/// # Safety
+/// Exclude firmware/FAMS and concurrent display/HDP/clock/power writers;
+/// retain the owner and inherited resources on every outcome.
+pub async unsafe fn prepare_display_surface(
+    request: crate::amdgpu_dcn401_otg::SurfaceRequest,
+) -> Result<crate::amdgpu_dcn401_otg::SurfaceApplied, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller excludes external writers.
+    unsafe { boot.prepare_display_surface(request).await }
+}
+
+/// Upload a visible row segment of a staged, stopped framebuffer.
+/// # Safety
+/// Exclude firmware/FAMS and concurrent display/HDP/clock/power writers;
+/// retain the owner and inherited resources on every outcome.
+pub async unsafe fn upload_display_surface(
+    pipe: u8,
+    x: u32,
+    y: u32,
+    pixels: &[u32],
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; upload checks bounds and live state.
+    unsafe { boot.upload_display_surface(pipe, x, y, pixels) }
+}
+
 /// Blank one legacy or HPO DisplayPort video stream, retaining timing/link clocks.
 /// # Safety
 /// Stop CPU scanout writers and exclude firmware/FAMS and concurrent display,

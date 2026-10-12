@@ -15,7 +15,7 @@ mod opp;
 pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
-pub use fetch::{HubpPower, PlanesRetired};
+pub use fetch::{HubpPower, PlanesRetired, SurfaceApplied, SurfaceFormat, SurfaceRequest};
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
 pub use stream::{DpBlanked, DpEncoderRetired, DpStream};
@@ -73,6 +73,7 @@ const MEMORY: u64 = 0x1ad1;
 pub enum Error {
     Unsupported,
     Invalid,
+    Allocation,
     Busy,
     Revoked,
     DeviceGone,
@@ -131,6 +132,8 @@ pub enum State {
     PlanesRetired,
     ChangingHubpPower(u8),
     HubpPowerChanged,
+    PreparingSurface(u8),
+    SurfacePrepared,
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -145,6 +148,7 @@ impl State {
                 | Self::Retired
                 | Self::PlanesRetired
                 | Self::HubpPowerChanged
+                | Self::SurfacePrepared
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
@@ -216,6 +220,8 @@ pub struct Status {
     pub planes_retired: Option<PlanesRetired>,
     /// Historical domain power evidence, never memory-reuse or scanout authority.
     pub hubp_power: [Option<HubpPower>; 4],
+    /// Staged owned surfaces, not evidence of a latched flip or active scanout.
+    pub surfaces: [Option<SurfaceApplied>; 4],
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -361,6 +367,7 @@ impl Request {
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     base: u64,
+    nbio: u64,
     mpc_base: u64,
     link_clock: u64,
     dio_clock: u64,
@@ -368,6 +375,9 @@ struct Layout {
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
+        if gpu.regs.len < 0x7f004 {
+            return Err(Error::Unsupported);
+        }
         let display = clocks::Layout::resolve(gpu).map_err(Error::Clocks)?;
         let base = crate::amdgpu_psp_ring::bank(
             gpu,
@@ -379,6 +389,14 @@ impl Layout {
         .map_err(|_| Error::Unsupported)?;
         Ok(Self {
             base,
+            nbio: crate::amdgpu_psp_ring::bank(
+                gpu,
+                ip::HW_ID_NBIF,
+                &[(7, 7, 0), (7, 7, 1), (6, 3, 1)],
+                2,
+                0x12d,
+            )
+            .map_err(|_| Error::Unsupported)?,
             link_clock: display.hpo_link_clock(),
             dio_clock: crate::amdgpu_psp_ring::bank(
                 gpu,
@@ -580,7 +598,7 @@ impl<I: Io> Engine<I> {
     }
 }
 #[derive(Debug)]
-pub struct Otg(Engine<Mmio>);
+pub struct Otg(Engine<Mmio>, fetch::Surfaces);
 impl Otg {
     /// # Safety
     /// Retain permanent mappings and exclusive display/PM/reset ownership.
@@ -590,35 +608,39 @@ impl Otg {
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu)?;
         authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
-        Ok(Self(Engine {
-            io: Mmio(gpu.regs),
-            authority,
-            layout,
-            status: Status {
-                state: State::Ready,
-                pipes: [None; 4],
-                blanks: [None; 4],
-                running_blank: None,
-                planes_retired: None,
-                hubp_power: [None; 4],
-                dp_blanked: None,
-                dp_encoder_retired: None,
-                dp_sst_disabled: None,
-                dp_phy_ready: None,
-                dp_link_trained: None,
-                dp_frontend_ready: None,
-                dp_video_running: None,
-                hpo_link_retired: None,
-                hpo_dp_disabled: None,
-                hdmi_tmds_retired: None,
-                tmds_timing_retired: None,
-                tmds_disabled: None,
-                frl_encoder_retired: None,
-                frl_link_retired: None,
-                frl_disabled: None,
-                retired: 0,
+        Ok(Self(
+            Engine {
+                io: Mmio(gpu.regs),
+                authority,
+                layout,
+                status: Status {
+                    state: State::Ready,
+                    pipes: [None; 4],
+                    blanks: [None; 4],
+                    running_blank: None,
+                    planes_retired: None,
+                    hubp_power: [None; 4],
+                    surfaces: [None; 4],
+                    dp_blanked: None,
+                    dp_encoder_retired: None,
+                    dp_sst_disabled: None,
+                    dp_phy_ready: None,
+                    dp_link_trained: None,
+                    dp_frontend_ready: None,
+                    dp_video_running: None,
+                    hpo_link_retired: None,
+                    hpo_dp_disabled: None,
+                    hdmi_tmds_retired: None,
+                    tmds_timing_retired: None,
+                    tmds_disabled: None,
+                    frl_encoder_retired: None,
+                    frl_link_retired: None,
+                    frl_disabled: None,
+                    retired: 0,
+                },
             },
-        }))
+            fetch::Surfaces::new(),
+        ))
     }
     pub fn status(&self) -> Status {
         self.0.status

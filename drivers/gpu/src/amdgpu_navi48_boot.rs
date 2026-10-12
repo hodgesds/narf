@@ -925,6 +925,48 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Allocate and stage an owned linear framebuffer without enabling fetch.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/HDP/clock/power writers;
+    /// retain the owner and inherited resources on every outcome.
+    pub async unsafe fn prepare_display_surface(
+        &mut self,
+        request: otg::SurfaceRequest,
+    ) -> Result<otg::SurfaceApplied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: this boot owner retains its validated pool and serializes access.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_surface(&self.sequence.backend.pool, request)
+                .await
+        }
+    }
+    /// Upload a visible row segment into a staged, stopped framebuffer.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/HDP/clock/power writers;
+    /// retain the owner and inherited resources on every outcome.
+    pub unsafe fn upload_display_surface(
+        &mut self,
+        pipe: u8,
+        x: u32,
+        y: u32,
+        pixels: &[u32],
+    ) -> Result<(), otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: retained owner serializes access; upload checks bounds and live state.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .upload_surface(pipe, x, y, pixels)
+        }
+    }
     /// Blank one native DP video stream before separate encoder/PHY retirement.
     /// # Safety
     /// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,

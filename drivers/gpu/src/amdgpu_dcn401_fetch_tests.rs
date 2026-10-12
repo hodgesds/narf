@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "amdgpu_dcn401_hubp_power_tests.rs"]
 mod power;
+#[path = "amdgpu_dcn401_surface_tests.rs"]
+mod surface;
 
 fn planes(off: u8) -> Engine<Fake> {
     let mut e = engine();

@@ -337,6 +337,14 @@ disabled; power-off requires fresh drain evidence. Pending fetch transactions,
 uncertain power, lost writes and cancellation block reuse. All backing memory
 stays retained. Surface/VM/bandwidth preparation and framebuffer scanout remain
 open; these power transitions still require validation on the physical card.
+Native DCN4 surface staging now allocates and retains linear XRGB/XBGR8888
+framebuffers, clears row/page padding cooperatively, and programs native pitch,
+format, crossbar and viewport fields. Address publication follows an HDP flush
+and writes the high address before the low flip trigger. Fetch stays blank and
+drained; a pending flip is not reported as completed scanout. Bounded row uploads
+check live configuration and flush CPU writes. Partial failures retain published
+backing and block reuse. DCN VM/apertures, bandwidth/deadline/watermark programming,
+DPP/MPC composition and visible framebuffer activation remain open.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

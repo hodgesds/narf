@@ -494,6 +494,50 @@ and translations even after successful power-off. The matching
 `unsafe ColdBoot::set_display_hubp_power` and platform wrapper serialize this
 under the retained owner after the kernel engine proofs.
 
+`unsafe Otg::prepare_surface(pool, SurfaceRequest).await` stages one retained
+linear framebuffer per HUBP. The pool must belong to this GPU's correctly mapped,
+exclusively owned VRAM; the matching ColdBoot/platform
+`prepare_display_surface` wrappers use the boot owner's validated pool after
+the kernel engine proofs. Requests select pipe 0–3, nonzero 14-bit dimensions
+and packed `SurfaceFormat::{Xrgb8888,Xbgr8888}`. Rows are padded to 256 bytes;
+backing is page-rounded and wholly cleared, including padding. Clearing yields
+between 64 KiB chunks and invokes current authority for each chunk. Native CPU
+HDP flush verifies NBIO's remap, fences stores, writes the flush aperture and
+drains PCIe writes through the native NBIO read before address publication.
+
+Preparation requires a reusable owner, every consumer stopped and MPC route
+detached, and a powered, blank, drained selected HUBP with native 2D tiling
+dimension. Active flips/locks, cursor/metadata/LUT fetches or uncertain power
+reject before allocation or writes. Preconditions are rechecked after clearing.
+The allocation is retained and marked published before register programming;
+the fetch clock is temporarily enabled while blank. Native DCN4 programming
+sets uncompressed RGB8888, pixel pitch minus one, red/blue crossbar, primary and
+secondary viewports, empty chroma viewports, VMID0 and normal non-stereo flip
+controls. It does not touch the obsolete address-config fields. The high GPU
+address precedes the low address which publishes the flip. Final drain, clock
+disable and complete geometry/address/consumer readback are required. Only this
+owned selected flip may remain pending; completion is not fabricated while
+timing is stopped. Drain waits use the normal bounded asynchronous primitive.
+
+`SurfaceApplied::{request,address,pitch_bytes,bytes}` in `Status::surfaces`
+describes staged programming, not an active/latched framebuffer. Success enters
+reusable `SurfacePrepared`; error enters `Failed` and cancellation retains
+`PreparingSurface(pipe)`, blocking replay and clock changes. A HUBP power
+transition invalidates its staged report without releasing its allocation.
+Replacement and release are refused until an explicit retirement protocol
+exists. Published backing remains excluded even if the owner is dropped;
+unpublished backing is releasable because no address reached hardware.
+
+`unsafe Otg::upload_surface(pipe,x,y,pixels)` and the matching
+ColdBoot/platform `upload_display_surface` wrapper upload a bounded visible
+row segment of a staged, stopped surface, rechecking geometry, address, power,
+blanking and consumers and issuing the HDP flush. No CPU pointer escapes.
+Bounds errors or stale configuration reject before memory writes; errors after
+writes invalidate the report and quarantine the owner. All operations exclude
+firmware/FAMS and concurrent display/HDP/clock/power writers and retain inherited
+resources. VM/aperture configuration, DML2 request/deadline/watermark calculation,
+DPP/MPC setup, live flips and visible scanout activation remain separate work.
+
 `unsafe Otg::blank_dp_stream(DpStream::{Dio,Hpo}(instance)).await` blanks one
 of the four native legacy or four HPO DisplayPort stream encoders. Stream
 instances are independent of OTG/transmitter routing; this operation never
