@@ -10,6 +10,12 @@ pub use vm::MemoryApplied;
 #[path = "amdgpu_dcn401_dpp.rs"]
 mod dpp;
 pub use dpp::DppApplied;
+#[path = "amdgpu_dcn401_mpc.rs"]
+mod mpc;
+pub use mpc::MpcApplied;
+#[path = "amdgpu_dcn401_requestor.rs"]
+mod requestor;
+pub use requestor::RequestorApplied;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFormat {

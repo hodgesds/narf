@@ -17,8 +17,8 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{
-    DppApplied, HubpPower, MemoryApplied, PlanesRetired, SurfaceApplied, SurfaceFormat,
-    SurfaceRequest,
+    DppApplied, HubpPower, MemoryApplied, MpcApplied, PlanesRetired, RequestorApplied,
+    SurfaceApplied, SurfaceFormat, SurfaceRequest,
 };
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
@@ -143,6 +143,10 @@ pub enum State {
     MemoryPrepared,
     PreparingDpp(u8),
     DppPrepared,
+    PreparingMpc(u8),
+    MpcPrepared,
+    PreparingRequestor(u8),
+    RequestorPrepared,
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -160,6 +164,8 @@ impl State {
                 | Self::SurfacePrepared
                 | Self::MemoryPrepared
                 | Self::DppPrepared
+                | Self::MpcPrepared
+                | Self::RequestorPrepared
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
@@ -237,6 +243,10 @@ pub struct Status {
     pub memory: [Option<MemoryApplied>; 4],
     /// Staged RGB conversion/scaler state, never a latch or scanout proof.
     pub dpps: [Option<DppApplied>; 4],
+    /// Staged opaque RGB composition; selectors remain detached, not latched.
+    pub mpcs: [Option<MpcApplied>; 4],
+    /// Native single-pipe storage/request geometry. Not bandwidth admission.
+    pub requestor: Option<RequestorApplied>,
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -572,6 +582,8 @@ impl<I: Io> Engine<I> {
         self.preflight(request.pipe, false)?;
         self.status.state = State::Preparing(request.pipe);
         self.status.dpps[usize::from(request.pipe)] = None;
+        self.status.mpcs[usize::from(request.pipe)] = None;
+        self.status.requestor = None;
         match self.program(plan).await {
             Ok(()) => {
                 let applied = Applied { request, clock };
@@ -600,6 +612,8 @@ impl<I: Io> Engine<I> {
         self.preflight(pipe, true)?;
         self.status.state = State::Retiring(pipe);
         self.status.dpps[usize::from(pipe)] = None;
+        self.status.mpcs[usize::from(pipe)] = None;
+        self.status.requestor = None;
         match self.disable(pipe).await {
             Ok(()) => {
                 self.status.pipes[usize::from(pipe)] = None;
@@ -642,6 +656,8 @@ impl Otg {
                     surfaces: [None; 4],
                     memory: [None; 4],
                     dpps: [None; 4],
+                    mpcs: [None; 4],
+                    requestor: None,
                     dp_blanked: None,
                     dp_encoder_retired: None,
                     dp_sst_disabled: None,

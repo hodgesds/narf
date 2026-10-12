@@ -151,6 +151,8 @@ impl Io for Fake {
         assert!(
             (BASE + 0x475 * 4..=BASE + 0x47a * 4).contains(&at)
                 || (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
+                || (BASE + 0x4ba * 4..=BASE + 0x4be * 4).contains(&at)
+                || at == BASE + 0x4c4 * 4
                 || (0x162a0 * 4..=0x162a3 * 4).contains(&at)
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || at == BASE + 0x4a * 4 // native FRL character-clock root
@@ -158,7 +160,12 @@ impl Io for Fake {
                 || at == 0x7f000 // native HDP flush remap
                 || (0..4).any(|p| at == BASE + (0x80 + 2 * p) * 4)
                 || (BASE + 0x1f0d * 4..=BASE + 0x1f10 * 4).contains(&at)
-                || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
+                || (MPC_BASE..=MPC_BASE + 0x301 * 4).contains(&at)
+                || (0..4).any(|p| {
+                    at == MPC_BASE + (0x30b + p * 0xd) * 4
+                        || [0x453, 0x48a, 0x493, 0x4de, 0x4ec].iter()
+                            .any(|r| at == MPC_BASE + (r + p * 0xb0) * 4)
+                })
                 || (MPC_BASE + 0x8d3 * 4..=MPC_BASE + 0x8f0 * 4).contains(&at)
                 || [0x95b, 0x95c, 0x965, 0x966].iter().any(|&r| at == MPC_BASE + r * 4)
                 || (0..4).any(|p| {
@@ -335,6 +342,8 @@ fn engine() -> Engine<Fake> {
             surfaces: [None; 4],
             memory: [None; 4],
             dpps: [None; 4],
+            mpcs: [None; 4],
+            requestor: None,
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,

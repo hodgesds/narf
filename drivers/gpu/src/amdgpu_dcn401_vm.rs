@@ -47,6 +47,8 @@ impl Surfaces {
         engine.status.state = State::PreparingMemory(pipe);
         engine.status.memory = [None; 4]; // global aperture/context will change
         engine.status.dpps = [None; 4];
+        engine.status.mpcs = [None; 4];
+        engine.status.requestor = None;
         let result = engine.program_memory(pipe, config).await;
         let result = result.and_then(|()| {
             if context()? != config {

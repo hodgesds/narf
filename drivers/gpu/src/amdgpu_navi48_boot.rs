@@ -1014,6 +1014,51 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Stage opaque RGB composition for the retained full-frame surface.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/hub/VM/clock/reset/power
+    /// writers; retain every owner and inherited resource on every outcome.
+    pub unsafe fn prepare_display_mpc(&mut self, pipe: u8) -> Result<otg::MpcApplied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg.as_mut().map_err(|e| *e)?.prepare_mpc(
+                self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                gmc,
+                pipe,
+            )
+        }
+    }
+    /// Stage bounded requests and native single-pipe display-buffer allocation.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/hub/VM/IRQ/clock/reset/power
+    /// writers; retain every owner and resource on every outcome, including cancellation.
+    pub async unsafe fn prepare_display_requestor(
+        &mut self,
+        pipe: u8,
+    ) -> Result<otg::RequestorApplied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_requestor(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                )
+                .await
+        }
+    }
     /// Blank one native DP video stream before separate encoder/PHY retirement.
     /// # Safety
     /// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,

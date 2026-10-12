@@ -9,7 +9,10 @@ pub use power::HubpPower;
 #[path = "amdgpu_dcn401_surface.rs"]
 mod surface;
 pub(super) use surface::Surfaces;
-pub use surface::{DppApplied, MemoryApplied, SurfaceApplied, SurfaceFormat, SurfaceRequest};
+pub use surface::{
+    DppApplied, MemoryApplied, MpcApplied, RequestorApplied, SurfaceApplied, SurfaceFormat,
+    SurfaceRequest,
+};
 
 const HUBP_CONTROL: u64 = 0x5f4;
 const HUBP_CLOCK: u64 = 0x5f5;

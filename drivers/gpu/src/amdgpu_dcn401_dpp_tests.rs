@@ -1,4 +1,6 @@
 use super::*;
+#[path = "amdgpu_dcn401_mpc_tests.rs"]
+mod mpc;
 
 fn d(p: u8, r: u64) -> u64 {
     BASE + (r + u64::from(p) * 0x16b) * 4
@@ -117,6 +119,12 @@ impl Io for DppIo {
     }
 }
 fn ready(p: u8) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
+    ready_depth(p, ColorDepth::Bpc8)
+}
+fn ready_depth(
+    p: u8,
+    depth: ColorDepth,
+) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
     let (backing, pool, mut e, mut surfaces) = staged(p);
     run(surfaces.prepare_memory(&mut e, p, || Ok(config()))).unwrap();
     let mut t = request(p);
@@ -124,14 +132,7 @@ fn ready(p: u8) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
     t.timing.v_active = 3;
     let clock = clock(t);
     run(e.prepare(t, clock)).unwrap();
-    run(e.prepare_blank(
-        BlankRequest {
-            pipe: p,
-            depth: ColorDepth::Bpc8,
-        },
-        clock,
-    ))
-    .unwrap();
+    run(e.prepare_blank(BlankRequest { pipe: p, depth }, clock)).unwrap();
     for (r, value) in RGB {
         e.io.surface
             .inner

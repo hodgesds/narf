@@ -138,7 +138,7 @@ impl<I: Io> Engine<I> {
         self.update(l.dpp(p, DPP_CLOCK), 0x10, 0)?;
         Ok(())
     }
-    fn verify_dpp(&mut self, applied: DppApplied) -> Result<(), Error> {
+    pub(super) fn verify_dpp(&mut self, applied: DppApplied) -> Result<(), Error> {
         let p = applied.surface.request.pipe;
         self.dpp_stopped(p, false)?;
         for (r, mask, value) in registers(applied).into_iter().chain([

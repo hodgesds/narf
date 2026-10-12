@@ -357,8 +357,19 @@ surface, VM, clock and timing owners. Scaler/iSHARP memory wake waits are bounde
 pending double-buffer updates are recorded without claiming a latch. DPP clock
 and HUBP fetch remain disabled and MPC stays detached. Lost writes, revoked
 authority, stale configuration and cancellation quarantine the owner. Native
-bandwidth/deadline/watermark programming, MPC composition, visible framebuffer
+bandwidth/deadline/watermark programming, MPC route activation, visible framebuffer
 activation and physical-card validation remain open.
+Native opaque RGB MPC preparation now binds to the retained surface/DPP/VM and
+timing owners, selects global opaque alpha and unity gains, bypasses inherited
+output and movable color transforms, and matches the OPP output depth. Current
+color selectors are recorded without claiming they latched; routes stay detached.
+Native requestor preparation stages bounded physical-RGB fetch geometry and
+partitions the 21-segment display return buffer into the native 320-KiB DET
+default plus 1-MiB compbuf. Shrinks acknowledge CURRENT before any growth;
+timeouts, cancellation, stale owners and lost writes retain every allocation
+and quarantine the owner. All four pipes use native DCN4 request fields,
+8-KiB chunks, no MALL, and disabled fetch after setup. This establishes storage
+and request geometry; DLG/TTU/watermarks and visible scanout are still pending.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

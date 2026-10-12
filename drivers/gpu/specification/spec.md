@@ -591,8 +591,8 @@ and rechecks stopped consumers after each wait. Native RGB8888 conversion uses
 zero expansion and an identity CNVC crossbar; red/blue selection remains in the
 HUBP. FCNV bias/scale and HDR multiplication are identity, pre-degamma/post-CSC/
 gamma/keying/de-alpha are bypassed, and the encoded RGB values pass through.
-The unused source alpha is not used by the line buffer; future MPC composition
-must select opaque blending. Scaler autocal is disabled, recout begins at zero,
+The unused source alpha is not used by the line buffer; MPC preparation below
+selects opaque blending. Scaler autocal is disabled, recout begins at zero,
 and recout/MPC dimensions match the surface. Native `SCALING_444_BYPASS` (mode 0)
 still configures a floating-point line buffer; mode 6 full bypass is not used.
 Line-buffer configurations 1, 2, then 0 are selected using native capacities
@@ -614,8 +614,77 @@ invalidate dependent reports. Errors enter `Failed`; cancellation retains
 `PreparingDpp(pipe)`, blocking replay/clock changes without speculative rollback.
 All owners and allocations remain retained. Callers exclude firmware/FAMS and
 concurrent display/hub/VM/clock/reset/power writers. `tests/dcn401_dpp.c` checks
-the native header contract. MPC composition, bandwidth/request/deadline setup,
-scanout activation and physical-card validation remain required.
+the native header contract. MPC and requestor preparation are described below;
+bandwidth/deadline admission, route activation and physical-card validation
+remain required.
+
+`unsafe Otg::prepare_mpc(&mut clocks, &mut dccg, &mut gmc, pipe)` stages
+opaque full-frame RGB composition for an owned DPP/surface. ColdBoot exposes
+synchronous `prepare_display_mpc(pipe)`; the platform wrapper is asynchronous
+only to acquire its owner mutex. Preparation checks the retained surface, VM,
+DPP, current clock and timing owners, matching OPP format, blank/drained HUBP,
+disabled DPP/fetch clocks, and every disconnected MPC route before writing.
+It programs native top-layer-only mode, global opaque alpha, unity top/bottom
+gains and black background, with stereo disabled. XRGB/XBGR's unused alpha byte
+does not affect coverage. OGAM, its gamut remap, MCM shaper/3D LUT/post-1D LUT,
+both MCM gamut remaps and output CSC are explicitly bypassed. Movable color
+management is placed before blending. Denormalization follows the owned OPP's
+8/10/12-bit depth, with unclipped full-range 12-bit clamp limits. Bypass does
+not write LUT RAM, coefficients, power policy or shared coefficient formats.
+All top/bottom/OPP/update-lock/output selectors remain detached.
+
+Each masked write is checked, followed by complete source/owner and MPC
+readback. `MpcApplied` records the DPP, output depth and nine historical
+non-bypass CURRENT-selector bits in `Status::mpcs[pipe]`. A bypass request
+readback is not a hardware latch: nonzero CURRENT fields are recorded while
+timing is stopped. Success enters reusable `MpcPrepared`; repeated preparation
+rejects until dependent state is invalidated. Timing preparation/retirement,
+OPP preparation, HUBP power transitions and global VM preparation invalidate
+dependent reports. Any programming/readback failure enters sticky `Failed`,
+with no speculative rollback or allocation release.
+
+`unsafe Otg::prepare_requestor(&mut clocks, &mut dccg, &mut gmc, pipe).await`
+stages bounded physical-RGB requests and the native default single-pipe buffer
+allocation after MPC preparation. ColdBoot/platform expose asynchronous
+`prepare_display_requestor(pipe)`. This binds to the same owned surface,
+memory, DPP, MPC, timing and clocks. It partitions DCN401's 21 64-KiB CRB
+segments into five for the selected pipe's DET (320 KiB), zero for other DETs,
+and sixteen for compbuf (1 MiB). The owned pitch must fit at least two rows in
+DET. This is a storage policy, not proof that a mode meets its fetch deadlines.
+
+Preflight rejects inherited in-progress allocations, overcommit, compbuf
+configuration errors, enabled allocation IRQs and pending acknowledgement
+writes. The read-only compbuf DONE status is preserved even when set with its
+IRQ disabled. Every shrinking allocation must acknowledge CURRENT before any
+allocation grows; requested and current totals never exceed the native CRB
+capacity. The driver uses bounded asynchronous waits and rechecks the full
+allocation, retained sources and current owners after each acknowledgement.
+Timeout, cancellation, revocation, removal, late changes and dropped writes
+leave resources retained in `Failed` or `PreparingRequestor(pipe)`; neither
+state permits replay or ordinary clock changes.
+
+The requestor uses native DCN4 six-field RGB/five-field chroma layouts, 8-KiB
+chunks with a 1-KiB minimum, one-line linear swaths and zero VM/PTE groups for
+the physical framebuffer aperture. DET plane-one base is zero. Expansion modes
+are DRQ=2 and PRQ/MRQ/CRQ=1. The selected HUBP uses its matching VTG, bounded
+requests and no MALL surface/cursor/prefetch; the native early cursor-request
+mode is set while the cursor remains disabled. Compbuf reserved space is 256
+units of 64 bytes, from native `pixel_chunk_size / 32`. The HUBP clock is enabled
+only around request programming, with blank/drain rechecked, and disabled again
+before final source and register verification. Existing HUBP allocation,
+timeout and underflow errors and timeout-IRQ ownership reject preparation.
+
+Success enters reusable `RequestorPrepared` and records the surface and byte
+sizes in `Status::requestor`; timing/OPP/MPC changes, HUBP power transitions and
+global VM setup invalidate this shared report. Callers retain all owners and
+inherited resources on every outcome and exclude firmware/FAMS and concurrent
+display/hub/VM/IRQ/clock/reset/power writers. Native header contracts are in
+`tests/dcn401_mpc.c` and `tests/dcn401_requestor.c`; MMIO models cover all four
+pipes, all supported RGB depths, transient buffer usage, delayed CURRENT
+acknowledgements, cancellation, lost writes and stale owners. DLG/TTU and
+watermark calculation/admission, MPC route connection, visible framebuffer
+activation, live flips and physical RX 9070 XT validation remain open. Neither
+preparation API starts fetch or publishes an active framebuffer.
 
 `unsafe Otg::blank_dp_stream(DpStream::{Dio,Hpo}(instance)).await` blanks one
 of the four native legacy or four HPO DisplayPort stream encoders. Stream
