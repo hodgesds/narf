@@ -401,6 +401,9 @@ proven. These paths are model-tested only; no sink has shown the image.
 clocks, surface fill and every preparation through DP training to visible
 scanout, with `stop_modeset` reversing it. Only the selection is model-tested;
 the chain itself still needs a board, and inherited GOP retirement is separate.
+A successful platform modeset publishes the live surface as the external
+scanout; the console adopts it and flushes CPU writes through HDP via a
+published, non-blocking hook. Stop withdraws it before any teardown.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

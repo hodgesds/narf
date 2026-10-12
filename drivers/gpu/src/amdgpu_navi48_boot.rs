@@ -1171,6 +1171,20 @@ impl ColdBoot {
                 .await
         }
     }
+    /// The live scanout as a CPU framebuffer (bus-physical BAR address).
+    pub fn display_scanout_framebuffer(
+        &self,
+        pipe: u8,
+    ) -> Result<narf_graphics_driver::generic::GenericFb, otg::Error> {
+        self.otg.as_ref().map_err(|e| *e)?.scanout_framebuffer(pipe)
+    }
+    /// HDP-flush CPU writes to the live scanout surface.
+    pub fn flush_display_scanout(&mut self) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        self.otg.as_mut().map_err(|e| *e)?.flush_scanout_writes()
+    }
     /// Return a live pipe to black video with fetch drained and clocks gated.
     /// # Safety
     /// As for `start_display_scanout`; on failure the surface stays allocated.

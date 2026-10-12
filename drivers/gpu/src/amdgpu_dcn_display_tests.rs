@@ -321,6 +321,57 @@ kernel_test_in!(
     display_scanout_observer_sees_both_edges
 );
 
+/// An externally owned scanout carries its flush only while published, and a
+/// withdrawal removes the flush before any observer moves writers away.
+fn display_external_scanout_flush_follows_publication() -> TestResult {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static FLUSHES: AtomicU32 = AtomicU32::new(0);
+    static FLUSH_AT_WITHDRAW: AtomicU32 = AtomicU32::new(u32::MAX);
+    fn flush() {
+        FLUSHES.fetch_add(1, Ordering::AcqRel);
+    }
+    fn observer(scanout: Option<GenericFb>) {
+        if scanout.is_none() {
+            // A writer told to flush now must reach nobody.
+            let before = FLUSHES.load(Ordering::Acquire);
+            flush_active_scanout();
+            FLUSH_AT_WITHDRAW.store(FLUSHES.load(Ordering::Acquire) - before, Ordering::Release);
+        }
+    }
+    FLUSHES.store(0, Ordering::Release);
+    let previous = swap_scanout_observer_for_test(Some(observer));
+    let restore = |result: TestResult| {
+        publish_external(None, None);
+        swap_scanout_observer_for_test(previous);
+        result
+    };
+    flush_active_scanout();
+    if FLUSHES.load(Ordering::Acquire) != 0 {
+        return restore(TestResult::Fail("flush without a published scanout"));
+    }
+    let fb = GenericFb::new(0x40_0000_0000, 2560, 1440, 2560 * 4, 32);
+    publish_external(Some(fb), Some(flush));
+    flush_active_scanout();
+    if FLUSHES.load(Ordering::Acquire) != 1
+        || active_scanout().map(|f| (f.addr, f.width)) != Some((fb.addr, fb.width))
+    {
+        return restore(TestResult::Fail("published flush not reached"));
+    }
+    publish_external(None, None);
+    flush_active_scanout();
+    if FLUSH_AT_WITHDRAW.load(Ordering::Acquire) != 0
+        || FLUSHES.load(Ordering::Acquire) != 1
+        || active_scanout().is_some()
+    {
+        return restore(TestResult::Fail("flush outlived its scanout"));
+    }
+    restore(TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-display",
+    display_external_scanout_flush_follows_publication
+);
+
 /// The widest mode this path accepts must be exactly the widest the timing
 /// generator will program — not one column more, which is what an independent
 /// `8192` here gave.

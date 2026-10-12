@@ -342,3 +342,16 @@ kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_underflow_returns_to_black_with_diagnostics
 );
+
+fn dcn401_scanout_framebuffer_requires_live_owned_scanout() -> TestResult {
+    let e = staged(0);
+    let surfaces = Surfaces::new();
+    if !matches!(surfaces.scanout_framebuffer(&e, 0), Err(Error::Invalid)) {
+        return TestResult::Fail("framebuffer without scanout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_framebuffer_requires_live_owned_scanout
+);

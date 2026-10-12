@@ -530,8 +530,19 @@ pub async unsafe fn prepare_display_deadlines(
     unsafe { boot.prepare_display_deadlines(pipe, &plan).await }
 }
 
+/// Flush hook published with the live scanout. Never waits: if the owner is
+/// busy the HDP write buffer still drains by itself, only later.
+fn flush_scanout() {
+    if let Some(mut owner) = OWNER.try_lock() {
+        if let Some(boot) = owner.as_mut() {
+            let _ = boot.flush_display_scanout();
+        }
+    }
+}
+
 /// Light the first answering DP SST sink at its preferred mode on `pipe`,
-/// filling each visible row with `fill(y, row)` before fetch starts.
+/// filling each visible row with `fill(y, row)` before fetch starts, then
+/// publish the live surface as the active external scanout.
 /// # Safety
 /// Inherited display consumers must be retired. Exclude firmware/FAMS and
 /// concurrent display/hub/VM/IRQ/clock/reset/power/link writers.
@@ -539,28 +550,31 @@ pub async unsafe fn modeset_display(
     pipe: u8,
     fill: impl FnMut(u32, &mut [u32]),
 ) -> Result<crate::amdgpu_navi48_boot::Modeset, crate::amdgpu_navi48_boot::ModesetError> {
-    let mut owner = OWNER.lock().await;
-    let boot = owner
-        .as_mut()
-        .ok_or(crate::amdgpu_navi48_boot::ModesetError::Boot(
-            crate::amdgpu_navi48_boot::Error::Busy,
-        ))?;
-    // SAFETY: serialized retained owners; caller excludes external writers.
-    unsafe { boot.modeset_display(pipe, fill).await }
+    use crate::amdgpu_navi48_boot::{Error as BootError, ModesetError};
+    let (modeset, fb) = {
+        let mut owner = OWNER.lock().await;
+        let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+        // SAFETY: serialized retained owners; caller excludes external writers.
+        let modeset = unsafe { boot.modeset_display(pipe, fill).await }?;
+        (modeset, boot.display_scanout_framebuffer(pipe)?)
+    };
+    // Outside the owner lock: the observer may move the console here at once.
+    crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
+    Ok(modeset)
 }
 
-/// Reverse a successful modeset to a disabled PHY with timing and planes retired.
+/// Withdraw the published scanout, then reverse a successful modeset to a
+/// disabled PHY with timing and planes retired. The surface stays allocated,
+/// so a console write already in flight lands in retained memory.
 /// # Safety
-/// As for `modeset_display`; stop every CPU writer of the surface first.
+/// As for `modeset_display`.
 pub async unsafe fn stop_modeset(
     modeset: &crate::amdgpu_navi48_boot::Modeset,
 ) -> Result<(), crate::amdgpu_navi48_boot::ModesetError> {
+    use crate::amdgpu_navi48_boot::{Error as BootError, ModesetError};
+    crate::amdgpu_dcn_display::publish_external(None, None);
     let mut owner = OWNER.lock().await;
-    let boot = owner
-        .as_mut()
-        .ok_or(crate::amdgpu_navi48_boot::ModesetError::Boot(
-            crate::amdgpu_navi48_boot::Error::Busy,
-        ))?;
+    let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
     // SAFETY: serialized retained owners; caller excludes external writers.
     unsafe { boot.stop_modeset(modeset).await }
 }

@@ -9,6 +9,7 @@
 use super::*;
 use crate::amdgpu_dcn401_dml as dml;
 use crate::amdgpu_gmc_navi48::{DisplayContext, Gmc};
+use narf_graphics_driver::generic::GenericFb;
 
 const DPP_CONTROL: u64 = 0xcc5; // DPP_TOP, stride 0x16b
 const DPP_CLOCK_ENABLE: u32 = 0x10;
@@ -611,6 +612,36 @@ impl Surfaces {
         }
     }
 }
+impl Surfaces {
+    /// CPU view of the live scanout: bus-physical BAR address of the owned
+    /// surface, its visible size and byte pitch, for console adoption.
+    pub(in crate::amdgpu_dcn401_otg) fn scanout_framebuffer<I: Io>(
+        &self,
+        e: &Engine<I>,
+        pipe: u8,
+    ) -> Result<GenericFb, Error> {
+        let running = e.status.scanout.ok_or(Error::Invalid)?;
+        if e.status.state != State::ScanoutRunning(pipe) || running.pipe != pipe {
+            return Err(Error::Busy);
+        }
+        let surface = self
+            .0
+            .get(usize::from(pipe))
+            .and_then(Option::as_ref)
+            .ok_or(Error::Invalid)?;
+        let a = surface.applied;
+        if a.address != running.address || a.request.format != SurfaceFormat::Xrgb8888 {
+            return Err(Error::Invalid);
+        }
+        Ok(GenericFb::new(
+            surface.memory.mapping().phys.raw(),
+            a.request.width,
+            a.request.height,
+            a.pitch_bytes,
+            32,
+        ))
+    }
+}
 impl Otg {
     /// Make the staged surface the visible scanout source of a pipe whose
     /// legacy DP SST stream already carries black video, after re-binding the
@@ -663,6 +694,18 @@ impl Otg {
                 ))
             })
             .await
+    }
+    /// The live scanout as a CPU framebuffer for console adoption.
+    pub fn scanout_framebuffer(&self, pipe: u8) -> Result<GenericFb, Error> {
+        self.1.scanout_framebuffer(&self.0, pipe)
+    }
+    /// Make CPU writes to the live surface visible to display fetch: the
+    /// native HDP flush used by staged uploads.
+    pub fn flush_scanout_writes(&mut self) -> Result<(), Error> {
+        if !matches!(self.0.status.state, State::ScanoutRunning(_)) {
+            return Err(Error::Busy);
+        }
+        self.0.flush_surface_writes()
     }
     /// Return a live pipe to black video with fetch drained, routes detached
     /// and clocks gated, ready to start again. Allocations stay retained.

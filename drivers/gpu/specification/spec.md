@@ -837,6 +837,22 @@ otherwise. Failures leave every owner where it stopped. `stop_modeset`
 reverses a success down to a disabled PHY with timing and planes retired; the
 surface allocation remains bound to its pipe.
 
+The platform `modeset_display` publishes the live surface only after
+activation succeeds, through `amdgpu_dcn_display::publish_external`. The
+published `GenericFb` is the surface's bus-physical BAR address, visible size
+and byte pitch (`Otg::scanout_framebuffer`, which requires `ScanoutRunning`
+for that pipe and the owned surface). The fb layer's existing observer moves
+the console onto it. The scanout carries a flush: CPU writes through the BAR
+pass HDP, so `GenericScanout::flush` calls `flush_active_scanout`, and the
+platform hook try-locks the owner and issues the native HDP flush
+(`Otg::flush_scanout_writes`). It never waits; a skipped flush still drains,
+only later. The policy is single-buffered front-buffer rendering: tearing is
+possible and no vblank synchronisation is claimed. The platform `stop_modeset`
+withdraws the scanout first, clearing the flush before observers run, so the
+console returns to the boot framebuffer. That range stays excluded from the
+VRAM pool for its lifetime and therefore remains valid memory. The surface is
+retained, so a console write already in flight lands in owned memory.
+
 `tests/dcn401_scanout.c` checks the native registers, including the MPC block's
 DCN bank 3. Physical presentation on the sink remains unverified.
 

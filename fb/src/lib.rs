@@ -529,7 +529,11 @@ impl FbScanout for GenericScanout {
     fn name(&self) -> &'static str {
         "generic-fb"
     }
-    fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {}
+    fn flush(&self, _x: u32, _y: u32, _w: u32, _h: u32) {
+        // An adopted Navi48 scanout is written through the BAR and HDP; its
+        // owner publishes the flush. Boot/GOP and DCN314 scanouts have none.
+        narf_drivers_gpu::amdgpu_dcn_display::flush_active_scanout();
+    }
     unsafe fn framebuffer(&self) -> Framebuffer {
         GENERIC_FB
             .lock()

@@ -241,6 +241,29 @@ pub(crate) fn swap_scanout_observer_for_test(
     *OBSERVER.lock() = observer;
     previous
 }
+/// Makes CPU writes to the active scanout visible to display fetch, for owners
+/// whose CPU path is buffered (Navi48 BAR writes pass through HDP).
+pub type ScanoutFlush = fn();
+static FLUSH: IrqSafeSpinLock<Option<ScanoutFlush>> = IrqSafeSpinLock::new(None);
+/// Best effort: the owner's flush may be skipped while it is busy, in which
+/// case buffered writes still drain on their own, just not promptly.
+pub fn flush_active_scanout() {
+    let flush = *FLUSH.lock();
+    if let Some(flush) = flush {
+        flush();
+    }
+}
+/// Publish a scanout owned outside this module, with its flush. Clearing the
+/// flush first means no writer is told to flush a surface being withdrawn.
+pub(crate) fn publish_external(scanout: Option<GenericFb>, flush: Option<ScanoutFlush>) {
+    if scanout.is_none() {
+        *FLUSH.lock() = None;
+        publish(None);
+    } else {
+        publish(scanout);
+        *FLUSH.lock() = flush;
+    }
+}
 #[cfg(feature = "kernel-test")]
 pub(crate) fn publish_for_test(scanout: Option<GenericFb>) {
     publish(scanout);
