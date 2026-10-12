@@ -9982,7 +9982,7 @@ interface_resolution: 1024x768
          \x20 probes.\n\
          \x20 -cpu max is required: the kernel uses RDTSCP / RDSEED / etc. that the\n\
          \x20 default qemu64 model doesn't expose.\n\
-         \x20 -m 1024M leaves room for the kernel image (~52 MiB at LOAD_BASE 16 MiB)\n\
+         \x20 -m 1024M leaves room for the kernel image (~52 MiB at LOAD_BASE 32 MiB)\n\
          \x20 + UEFI's reservations + the 32 MiB static heap arena."
     );
     Ok(())
