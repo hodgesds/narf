@@ -4,6 +4,8 @@ use crate::{
 };
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU8, Ordering};
+#[path = "amdgpu_dcn401_dp_training_tests.rs"]
+mod training;
 
 fn dio(p: u8, reg: u64) -> u64 {
     BASE + (reg + u64::from(p) * 0x124) * 4

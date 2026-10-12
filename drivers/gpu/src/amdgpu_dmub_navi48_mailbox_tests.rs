@@ -18,6 +18,105 @@ fn dp_path(phy: u8, hpd: u8) -> crate::amdgpu_dcn_inventory::Path {
         device_tag: 8,
     }
 }
+fn dmub_navi48_dp_drive_preserves_native_v17_zero_signal_encoding() -> TestResult {
+    use crate::dp_link_training::LinkRate;
+    for phy in 0..4 {
+        for lanes in [1, 2, 4] {
+            for (rate, clock) in [
+                (LinkRate::Rbr, 16200u32),
+                (LinkRate::Hbr, 27000),
+                (LinkRate::Hbr2, 54000),
+                (LinkRate::Hbr3, 81000),
+            ] {
+                for swing in 0..4 {
+                    for pre_emphasis in 0..=3 - swing {
+                        let (_pool, mut e) = ready();
+                        let path = dp_path(phy, (phy + 2) % 4 + 1);
+                        let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+                        run(e.set_dp_drive(
+                            path,
+                            DpPhySettings { lanes, rate },
+                            DpDriveSettings {
+                                swing,
+                                pre_emphasis,
+                            },
+                        ))
+                        .unwrap();
+                        let mut golden = [0; 64];
+                        golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+                        golden[4] = phy;
+                        golden[5] = 11;
+                        golden[6] = swing | pre_emphasis << 3; // no MAX flags in VBIOS packet
+                        golden[7] = lanes;
+                        golden[8..12].copy_from_slice(&clock.to_le_bytes());
+                        golden[12] = path.hpd;
+                        golden[14] = 19;
+                        golden[15] = 246; // signal defaults to NONE, unlike ENABLE's DP
+                        for lane in 0..lanes {
+                            assert_eq!(e.io.slot(offset + usize::from(lane) * 64), golden);
+                        }
+                        assert_eq!(e.mailbox.state, MailboxState::Ready);
+                    }
+                }
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_dp_drive_preserves_native_v17_zero_signal_encoding
+);
+fn dmub_navi48_dp_drive_validates_electrical_levels_and_quarantines_cancellation() -> TestResult {
+    let (_pool, mut e) = ready();
+    let settings = DpPhySettings {
+        lanes: 4,
+        rate: crate::dp_link_training::LinkRate::Hbr3,
+    };
+    for drive in [
+        DpDriveSettings {
+            swing: 4,
+            pre_emphasis: 0,
+        },
+        DpDriveSettings {
+            swing: 0,
+            pre_emphasis: 255,
+        },
+        DpDriveSettings {
+            swing: 2,
+            pre_emphasis: 2,
+        },
+    ] {
+        let bytes = e.io.bytes.clone();
+        let writes = e.io.writes.len();
+        assert_eq!(
+            run(e.set_dp_drive(dp_path(2, 1), settings, drive)),
+            Err(Error::Invalid)
+        );
+        assert_eq!(e.io.bytes, bytes);
+        assert_eq!(e.io.writes.len(), writes);
+    }
+    e.io.commands = false;
+    {
+        let mut f =
+            core::pin::pin!(e.set_dp_drive(dp_path(2, 1), settings, DpDriveSettings::default()));
+        assert!(f
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.mailbox.state, MailboxState::InFlight);
+    assert_eq!(run(e.disable_dp_sst(dp_path(2, 1))), Err(Error::Busy));
+    assert_eq!(
+        run(e.set_dp_drive(dp_path(2, 1), settings, DpDriveSettings::default())),
+        Err(Error::Busy)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_dp_drive_validates_electrical_levels_and_quarantines_cancellation
+);
 fn dmub_navi48_dp_enable_uses_native_lane_rate_and_zero_connector_fields() -> TestResult {
     use crate::dp_link_training::LinkRate;
     for phy in 0..4 {

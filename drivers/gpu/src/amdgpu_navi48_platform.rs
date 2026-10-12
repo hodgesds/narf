@@ -456,6 +456,34 @@ pub async unsafe fn disable_display_dp_phy(
     unsafe { boot.disable_display_dp_phy(port).await }
 }
 
+/// Train the retained legacy DP PHY at its current lane count and rate.
+/// # Safety
+/// Fulfil `Otg::train_dp_link` direct-port, board SSC, producer/writer exclusion
+/// and memory-retention obligations. No scanout or automatic rate fallback.
+pub async unsafe fn train_display_dp_link(
+    port: usize,
+    downspread: bool,
+) -> Result<crate::amdgpu_dcn401_otg::DpLinkTrained, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller fulfils documented obligations.
+    unsafe { boot.train_display_dp_link(port, downspread).await }
+}
+/// Request sink D3 and stop the matching trained, streamless legacy DP PHY.
+/// # Safety
+/// Fulfil `Otg::stop_dp_link` direct-port and writer/resource obligations.
+pub async unsafe fn stop_display_dp_link(
+    port: usize,
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller fulfils documented obligations.
+    unsafe { boot.stop_display_dp_link(port).await }
+}
 /// Disable the direct FRL PHY after frontend and digital-link retirement.
 /// # Safety
 /// Fulfil `Otg::disable_frl` direct-port, sink/SCDC/retimer, producer and

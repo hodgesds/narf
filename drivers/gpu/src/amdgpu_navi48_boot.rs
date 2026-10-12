@@ -1043,6 +1043,41 @@ impl ColdBoot {
             .copied()
             .ok_or(otg::Error::Invalid)
     }
+    /// Train the retained legacy DP PHY at its current lane count and rate.
+    /// # Safety
+    /// Fulfil `Otg::train_dp_link` direct-port, board SSC, producer/writer
+    /// exclusion and memory-retention obligations. No scanout or rate fallback.
+    pub async unsafe fn train_display_dp_link(
+        &mut self,
+        port: usize,
+        downspread: bool,
+    ) -> Result<otg::DpLinkTrained, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained board path and serialized owners; caller
+        // establishes physical topology, SSC setting and lifetime obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .train_dp_link(&mut self.sequence.backend.dmub, path, downspread)
+                .await
+        }
+    }
+    /// Request sink D3 and stop this owner's trained, streamless legacy DP PHY.
+    /// # Safety
+    /// Fulfil `Otg::stop_dp_link` direct-port and writer/resource obligations.
+    pub async unsafe fn stop_display_dp_link(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained board path/owners; caller excludes writers
+        // and retains all allocations/translations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_dp_link(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
     /// Disable a board-routed legacy DP SST transmitter before frontend retirement.
     /// # Safety
     /// Select a direct external DP port without USB-C/ACPI PHY interlocks or

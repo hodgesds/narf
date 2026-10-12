@@ -407,12 +407,22 @@ shutdown operation verifies this owner's unchanged untrained PHY and waits for
 backend/lane/clock stop before cleanup. Active consumers, stale routes and
 incomplete hardware transitions reject; cancellation/failure retain ownership
 and block replay. Model tests cover routes, rates, lane mappings and failures.
-This does not power the sink, train the link, start scanout or verify silicon.
-eDP, sink/MST/audio teardown
-and USB-C/ACPI PHY interlocks still need their sequences.
-PHY/link and plane programming, surface scanout enable, active-stream transitions,
-bandwidth/watermarks and complete native modesetting remain open. These paths
-have model tests, not silicon validation.
+Native direct DP SST training now requests and verifies sink D0, reads live
+base/extended capabilities and drives source TPS1/TPS2/3/4 plus matching sink
+training over the board AUX channel. Firmware applies uniform clamped voltage/
+pre-emphasis requests; bounded CR/EQ loops require every active lane and interlane
+alignment. Source/PHY checks and fresh sink configuration/power/link status after
+5 ms of native idle prevent stale completion. Matching trained-link shutdown
+acknowledges sink D3 before PHY retirement. Cancellation/failure retain ownership
+and block replay; known CR/EQ failures exit training when transport remains sound.
+Model tests cover routing, patterns, rates, lane counts, adjustment/retry limits,
+every await cancellation, lost writes and late changes. No native scanout or
+silicon validation is claimed. Automatic rate/lane fallback, LTTPRs, MST/FEC,
+fixed-drive retimers and board-specific SSC control remain open.
+eDP, remaining sink/MST/audio teardown and USB-C/ACPI PHY interlocks still need
+their sequences. Remaining PHY/link and plane programming, surface scanout
+enable, active-stream transitions, bandwidth/watermarks and complete native
+modesetting remain open. Implemented paths have model tests, not silicon validation.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
 C layouts. Its retained unified-firmware owner starts both pipes, configures

@@ -51,6 +51,20 @@ impl DpPhySettings {
         Ok(())
     }
 }
+/// Common drive level for all active legacy DP lanes, as required by native DC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DpDriveSettings {
+    pub swing: u8,
+    pub pre_emphasis: u8,
+}
+impl DpDriveSettings {
+    pub(crate) fn validate(self) -> Result<(), Error> {
+        if self.swing > 3 || self.pre_emphasis > 3 || self.swing + self.pre_emphasis > 3 {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -483,6 +497,14 @@ impl Dmub {
 
     // Only the retained native display owner may issue these narrow VBIOS
     // operations. Inbox consumption alone cannot prove PHY readiness/shutdown.
+    pub(crate) async fn set_dp_drive(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        settings: DpPhySettings,
+        drive: DpDriveSettings,
+    ) -> Result<(), Error> {
+        self.engine.set_dp_drive(path, settings, drive).await
+    }
     pub(crate) async fn enable_dp_sst(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
@@ -577,6 +599,44 @@ impl Dmub {
     }
 }
 impl<I: Io> Engine<I> {
+    async fn set_dp_drive(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        settings: DpPhySettings,
+        drive: DpDriveSettings,
+    ) -> Result<(), Error> {
+        settings.validate()?;
+        drive.validate()?;
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::DisplayPort
+            || path.transmitter >= 4
+            || !(1..=4).contains(&path.hpd)
+        {
+            return Err(Error::Invalid);
+        }
+        // dcn10_link_encoder_dp_set_lane_settings: signal and HPO engine stay
+        // zero, so v1.7 encodes HPO_0 subtraction (246), not HPO_DP_0 (244).
+        // v1.7 has no legacy lane_select field. Native DC maximizes VS/PE across
+        // lanes and issues the same native packet once per active lane.
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&[128, 1, 0, 60]);
+        request[4] = path.transmitter;
+        request[5] = 11; // SET_VOLTAGE_AND_PREEMPASIS
+        request[6] = drive.swing | drive.pre_emphasis << 3;
+        request[7] = settings.lanes;
+        request[8..12].copy_from_slice(&((settings.rate as u32) * 2700).to_le_bytes());
+        request[12] = path.hpd;
+        request[14] = 19;
+        request[15] = 246;
+        self.begin_mailbox()?;
+        let result = async {
+            for _ in 0..settings.lanes {
+                self.command(request).await?;
+            }
+            Ok(())
+        }
+        .await;
+        self.finish_mailbox(result)
+    }
     async fn enable_dp_sst(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,

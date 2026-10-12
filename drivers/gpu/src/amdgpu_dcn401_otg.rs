@@ -23,7 +23,7 @@ mod link;
 pub use link::DpSstDisabled;
 #[path = "amdgpu_dcn401_dp_phy.rs"]
 mod dp_phy;
-pub use dp_phy::{DpPhyReady, DpPhySettings};
+pub use dp_phy::{DpDriveSettings, DpLinkTrained, DpPhyReady, DpPhySettings, DpTrainingError};
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
 pub use hpo_link::{HpoDpDisabled, HpoLinkRetired};
@@ -77,6 +77,7 @@ pub enum Error {
     Clocks(clocks::Error),
     PipeClocks(dccg::Error),
     Firmware(crate::amdgpu_dmub_navi48::Error),
+    DpTraining(DpTrainingError),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -97,6 +98,9 @@ pub enum State {
     DpPhyReady(u8),
     DisablingDpPhy(u8),
     DpPhyDisabled,
+    TrainingDp(u8),
+    DpLinkTrained(u8),
+    StoppingDpLink(u8),
     RetiringHpoLink(u8),
     HpoLinkRetired,
     DisablingHpoDp(u8),
@@ -207,6 +211,9 @@ pub struct Status {
     /// Historical untrained PHY evidence; valid only in DpPhyReady. No sink,
     /// training, stream or scanout completion is implied.
     pub dp_phy_ready: Option<DpPhyReady>,
+    /// Historical source/sink training evidence; current only in DpLinkTrained.
+    /// Video, timing and scanout remain stopped.
+    pub dp_link_trained: Option<DpLinkTrained>,
     /// Historical HPO digital-link stop only; PHY and its root clock remain owned.
     pub hpo_link_retired: Option<HpoLinkRetired>,
     /// Historical lane-disable/TX-clock/root-route evidence, not analog power gating.
@@ -576,6 +583,7 @@ impl Otg {
                 dp_encoder_retired: None,
                 dp_sst_disabled: None,
                 dp_phy_ready: None,
+                dp_link_trained: None,
                 hpo_link_retired: None,
                 hpo_dp_disabled: None,
                 hdmi_tmds_retired: None,

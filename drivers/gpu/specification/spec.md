@@ -758,6 +758,60 @@ Failures enter `Failed`; cancellation retains `EnablingDpPhy`/`DisablingDpPhy`.
 Incomplete transitions retain all owners and block replay until independent
 recovery; unfinished firmware commands additionally quarantine the mailbox.
 
+`unsafe ColdBoot::train_display_dp_link(port, downspread).await`, its serialized
+platform wrapper and `Otg::train_dp_link` train only the matching retained
+`DpPhyReady` legacy SST link at its current lane count and rate. The caller
+fulfils the PHY operation's direct-port, writer-exclusion and memory-retention
+obligations, excludes fixed-drive retimers/LTTPRs, eDP, USB-C and MST/FEC work,
+and supplies the actual board/firmware PHY downspread setting. This boolean
+describes existing SSC; training does not reprogram its source. No automatic
+rate/lane fallback, stream enable or scanout is implied.
+
+Training enters `TrainingDp(transmitter)` before the first AUX transaction.
+It requires DPCD 1.1 or later, requests sink D0, waits at least 1 ms and checks
+power readback, then reads live base/extended capabilities on the board AUX
+channel. Malformed/insufficient lane/rate/coding/framing capabilities, branches,
+advertised repeaters, enabled MST or FEC-ready sinks reject. An optional LTTPR
+capability-block NACK is absence; timeout, protocol failure and exhausted DEFER
+are errors. Native AUX retries DEFER at most six times with 1 ms delays.
+The owner sets and checks 8b/10b coding, enhanced framing, lane count, link rate
+and sink downspread, without granting post-training adjustment requests.
+
+TPS1 clock recovery and capability-selected TPS2/3/4 equalization program both
+the source's native pattern/complete/bypass/PRBS registers and sink training
+registers. HBR3 requires TPS4 support. Each first pattern update bursts the
+pattern and all active lane settings together. Subsequent updates change only
+lane settings. TPS1/2/3 disable sink scrambling; TPS4 retains it. Native DMUB
+v1.7 drive commands use uniform maximum requested swing/pre-emphasis across
+active lanes, clamp pre-emphasis to `3 - swing`, and follow the native caller's
+zero signal/HPO encoding. DPCD maximum-level flags are separate from the VBIOS
+drive byte. Fresh PHY lane-handshake and source/consumer checks surround drive
+changes and AUX waits. Non-training AUX traffic is excluded during training.
+
+Clock recovery stops after five unchanged swing requests, maximum swing, or
+100 total attempts. Equalization allows six attempts and requires retained CR,
+per-lane EQ/symbol lock and interlane alignment. Native base-DPCD training
+intervals are honored asynchronously, including extended-capability indication
+and interval encodings through 64 ms. Confirmed CR/EQ failure exits to native
+idle when transport and source state remain trustworthy, then quarantines the
+owner; uncertain I/O errors issue no speculative cleanup. Successful training
+disables sink training, programs native source passthrough/idle framing and
+scrambler BS count, and waits 5 ms before fresh sink configuration/power/status
+and source/PHY checks. Post-LT adjustment-in-progress cannot complete training.
+
+Success enters `DpLinkTrained(transmitter)` and records historical
+`Status::dp_link_trained: Option<DpLinkTrained>` with PHY/settings, EQ pattern,
+drive levels, downspread and CR/EQ attempt counts. It blocks general owner,
+clock and raw-mailbox reuse; all frontends, video and scanout remain stopped.
+`unsafe ColdBoot::stop_display_dp_link(port).await` and its platform wrapper
+accept only this matching streamless trained state. Sink D3 acknowledgement
+precedes firmware PHY disable, independent backend/lane/TX-clock-off waits and
+native training/panel cleanup. Success returns to reusable `DpPhyDisabled`,
+preserving historical training records without releasing memory. Failure enters
+`Failed`; cancellation retains `TrainingDp` or `StoppingDpLink`. Both retain
+owners and block replay until independent recovery. These are software-model
+proofs, with physical link operation still requiring silicon validation.
+
 `unsafe ColdBoot::disable_display_frl(port).await`, its serialized platform
 wrapper and `Otg::disable_frl` disable a validated direct external HDMI FRL PHY
 after frontend and digital-link retirement. The caller fulfils the same sink,

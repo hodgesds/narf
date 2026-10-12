@@ -7,6 +7,9 @@ use crate::{
 };
 use core::future::Future;
 pub use dmub::DpPhySettings;
+#[path = "amdgpu_dcn401_dp_training.rs"]
+pub(super) mod training;
+pub use training::{DpDriveSettings, DpLinkTrained, DpTrainingError};
 
 const LANES_MASK: u32 = 0x3e3e3e3e;
 const LANES_OFF: u32 = 0x02020202;
@@ -94,12 +97,7 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
-        for (reg, mask) in [
-            (0x211e, 0x10),
-            (0x2125, 0x11),
-            (0x212d, 0x010101ff),
-            (0x212e, 3),
-        ] {
+        for (reg, mask) in [(0x2125, 0x11), (0x212d, 0x010101ff)] {
             if self.read(at(reg))? & mask != 0 {
                 return Err(Error::Busy);
             }
@@ -135,6 +133,18 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     fn dp_phy_controls(&mut self, plan: DpPhyReady) -> Result<(), Error> {
+        self.dp_phy_untrained(plan.path.transmitter)?;
+        self.dp_phy_configuration(plan)
+    }
+    fn dp_phy_untrained(&mut self, phy: u8) -> Result<(), Error> {
+        for (reg, mask) in [(0x211e, 0x10), (0x212e, 3), (0x2133, 1)] {
+            if self.read(DpStream::Dio(phy).at(self.layout, reg))? & mask != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        Ok(())
+    }
+    fn dp_phy_configuration(&mut self, plan: DpPhyReady) -> Result<(), Error> {
         self.dp_phy_consumers(plan.path.transmitter)?;
         for ((at, mask), expected) in plan.registers(self.layout).into_iter().zip(plan.controls) {
             if self.read(at)? & mask != expected {
@@ -181,6 +191,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         self.dp_phy_consumers(path.transmitter)?;
+        self.dp_phy_untrained(path.transmitter)?;
         self.dp_phy_off(path.transmitter)?;
         let mut plan = DpPhyReady {
             path,
@@ -256,6 +267,9 @@ impl<I: Io> Engine<I> {
     }
     fn dp_phy_on(&mut self, plan: DpPhyReady) -> Result<(), Error> {
         self.dp_phy_controls(plan)?;
+        self.dp_phy_witnesses(plan)
+    }
+    fn dp_phy_witnesses(&mut self, plan: DpPhyReady) -> Result<(), Error> {
         let l = self.layout;
         let phy = plan.path.transmitter;
         let lanes = phy_at(l, phy, 0x2943);
@@ -307,6 +321,8 @@ impl<I: Io> Engine<I> {
         &mut self,
         firmware: &mut impl Firmware,
         mut plan: DpPhyReady,
+        pattern: u32,
+        complete: u32,
     ) -> Result<(), Error> {
         firmware.disable(plan.path).await.map_err(Error::Firmware)?;
         let l = self.layout;
@@ -326,7 +342,16 @@ impl<I: Io> Engine<I> {
             .await?;
         plan.controls[2] = 0;
         plan.controls[3] = 0;
-        self.dp_phy_controls(plan)?;
+        self.dp_phy_configuration(plan)?;
+        for (reg, mask, expected) in [
+            (0x212e, 3, pattern),
+            (0x211e, 0x10, complete),
+            (0x2133, 1, 0),
+        ] {
+            if self.read(at(reg))? & mask != expected {
+                return Err(Error::Readback(at(reg)));
+            }
+        }
         self.dp_phy_off(phy)?;
         // Native disable_output cleanup after the backend stops.
         for (r, mask) in [(0x212e, 3), (0x211e, 0x10), (0x2125, 0x11)] {
@@ -349,7 +374,7 @@ impl<I: Io> Engine<I> {
         }
         self.dp_phy_on(plan)?;
         self.status.state = State::DisablingDpPhy(path.transmitter);
-        match self.dp_phy_stop(firmware, plan).await {
+        match self.dp_phy_stop(firmware, plan, 0, 0).await {
             Ok(()) => {
                 self.status.state = State::DpPhyDisabled;
                 Ok(())
