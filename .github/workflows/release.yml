@@ -63,7 +63,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: kernel
-          path: target/x86_64-unknown-none/release
+          path: target
       - run: ${{ matrix.install }}
       - env:
           VERSION: ${{ needs.validate.outputs.version }}
@@ -84,11 +84,18 @@ jobs:
         uses: ./.github/actions/setup-rust-cache
         with:
           components: rust-src llvm-tools-preview
+      - name: Install Limine
+        uses: ./.github/actions/setup-limine
       - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask build --arch=x86_64
+      - run: |
+          mkdir -p target/narf-uefi
+          cp "$LIMINE_PATH/BOOTX64.EFI" target/narf-uefi/BOOTX64.EFI
       - uses: actions/upload-artifact@v4
         with:
           name: kernel
-          path: target/x86_64-unknown-none/release/narf-frame
+          path: |
+            target/x86_64-unknown-none/release/narf-frame
+            target/narf-uefi/BOOTX64.EFI
 
   iso-test:
     needs: validate

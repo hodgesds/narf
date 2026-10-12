@@ -1,0 +1,339 @@
+#!/bin/sh
+# Install the package-owned NARF UEFI payload on a mounted EFI System
+# Partition. The loader, kernel, and primary config are isolated under
+# EFI/NARF. boot/limine/limine.conf is a marked fallback for GRUB chainloads
+# that do not preserve the EFI application's original file path.
+set -eu
+
+usage() {
+    echo "usage: narf-uefi install|remove|status [--esp PATH] [--source PATH] [--no-manager-hooks] [--quiet]" >&2
+    exit 2
+}
+
+command_name=${1:-}
+[ -n "$command_name" ] || usage
+shift
+
+esp_override=
+source_dir=${NARF_UEFI_SOURCE_DIR:-/usr/lib/narf/uefi}
+state_dir=${NARF_UEFI_STATE_DIR:-/var/lib/narf}
+manager_hooks=1
+quiet=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --esp)
+            [ "$#" -ge 2 ] || usage
+            esp_override=$2
+            shift 2
+            ;;
+        --source)
+            [ "$#" -ge 2 ] || usage
+            source_dir=$2
+            shift 2
+            ;;
+        --no-manager-hooks)
+            manager_hooks=0
+            shift
+            ;;
+        --quiet)
+            quiet=1
+            shift
+            ;;
+        *) usage ;;
+    esac
+done
+
+case "$command_name" in
+    install|remove|status) ;;
+    *) usage ;;
+esac
+
+say() {
+    [ "$quiet" -eq 1 ] || echo "narf-uefi: $*"
+}
+
+warn() {
+    echo "narf-uefi: warning: $*" >&2
+}
+
+state_file=$state_dir/esp-path
+
+fat_mount() {
+    candidate=$1
+    [ -d "$candidate" ] || return 1
+    command -v findmnt >/dev/null 2>&1 || return 1
+    fstype=$(findmnt -n -o FSTYPE --target "$candidate" 2>/dev/null || true)
+    case "$fstype" in
+        vfat|fat|msdos) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+detect_esp() {
+    if [ -n "$esp_override" ]; then
+        [ -d "$esp_override" ] || {
+            echo "narf-uefi: --esp is not a directory: $esp_override" >&2
+            return 1
+        }
+        if [ "${NARF_UEFI_ALLOW_NON_ESP:-0}" != 1 ] && ! fat_mount "$esp_override"; then
+            echo "narf-uefi: --esp is not a mounted FAT filesystem: $esp_override" >&2
+            return 1
+        fi
+        printf '%s\n' "$esp_override"
+        return 0
+    fi
+
+    if [ -n "${NARF_ESP_PATH:-}" ]; then
+        [ -d "$NARF_ESP_PATH" ] || {
+            echo "narf-uefi: NARF_ESP_PATH is not a directory: $NARF_ESP_PATH" >&2
+            return 1
+        }
+        if [ "${NARF_UEFI_ALLOW_NON_ESP:-0}" != 1 ] && ! fat_mount "$NARF_ESP_PATH"; then
+            echo "narf-uefi: NARF_ESP_PATH is not a mounted FAT filesystem: $NARF_ESP_PATH" >&2
+            return 1
+        fi
+        printf '%s\n' "$NARF_ESP_PATH"
+        return 0
+    fi
+
+    if [ -f "$state_file" ]; then
+        saved=$(sed -n '1p' "$state_file")
+        if [ -n "$saved" ] && fat_mount "$saved"; then
+            printf '%s\n' "$saved"
+            return 0
+        fi
+        if [ -n "$saved" ]; then
+            warn "recorded ESP is not mounted at $saved"
+            return 1
+        fi
+    fi
+
+    # UAPI.9 prefers /efi, then /boot. CachyOS also commonly mounts a
+    # separate ESP below an ext-family /boot at /boot/efi.
+    for candidate in /efi /boot /boot/efi; do
+        if fat_mount "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if esp=$(detect_esp); then
+    :
+else
+    if [ -n "$esp_override" ] || [ -n "${NARF_ESP_PATH:-}" ]; then
+        exit 1
+    fi
+    if [ "$command_name" = remove ] && [ -f "$state_file" ]; then
+        echo "narf-uefi: mount the recorded ESP before removing the payload" >&2
+        exit 1
+    fi
+    if [ "$command_name" = status ]; then
+        echo "narf-uefi: no mounted EFI System Partition found" >&2
+        exit 1
+    fi
+    say "no mounted EFI System Partition found; skipped (run again with --esp PATH)"
+    exit 0
+fi
+
+efi_dir=$esp/EFI/NARF
+loader=$efi_dir/narf.efi
+kernel=$efi_dir/narf-frame
+config=$efi_dir/limine.conf
+grub_fallback_dir=$esp/boot/limine
+grub_fallback_config=$grub_fallback_dir/limine.conf
+bls_entry=$esp/loader/entries/narf.conf
+config_marker='# Managed by narf-uefi'
+
+has_other_limine() {
+    for efi_candidate in "$esp"/EFI/*/*.efi "$esp"/EFI/*/*.EFI; do
+        [ -f "$efi_candidate" ] || continue
+        [ "$efi_candidate" = "$loader" ] && continue
+        if grep -aFq 'Limine ' "$efi_candidate"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+remove_limine_entry() {
+    [ "$manager_hooks" -eq 1 ] || return 0
+    if command -v limine-entry-tool >/dev/null 2>&1 && [ -f /boot/limine.conf ]; then
+        if ! limine-entry-tool --remove-efi-path "$loader" --quiet >/dev/null 2>&1; then
+            warn "could not remove the CachyOS Limine menu entry"
+        fi
+    fi
+}
+
+case "$command_name" in
+    status)
+        missing=0
+        for path in "$loader" "$kernel" "$config" "$bls_entry"; do
+            if [ ! -f "$path" ]; then
+                echo "missing: $path"
+                missing=1
+            fi
+        done
+        if [ "$missing" -ne 0 ]; then
+            exit 1
+        fi
+        version=$(sed -n 's/^version //p' "$bls_entry" 2>/dev/null || true)
+        current=1
+        if ! grep -Fqx '    path: boot():/EFI/NARF/narf-frame' "$config" ||
+            ! grep -Fqx 'efi /EFI/NARF/narf.efi' "$bls_entry"; then
+            echo "stale: installed UEFI configuration is not the package layout"
+            current=0
+        fi
+        if [ -f "$source_dir/version" ]; then
+            packaged_version=$(sed -n '1p' "$source_dir/version")
+            if [ "$version" != "$packaged_version" ] ||
+                ! cmp -s "$source_dir/narf.efi" "$loader" ||
+                ! cmp -s "$source_dir/narf-frame" "$kernel"; then
+                echo "stale: ESP payload does not match packaged NARF $packaged_version"
+                current=0
+            fi
+        fi
+        echo "ESP: $esp"
+        echo "loader: $loader"
+        echo "kernel: $kernel"
+        echo "version: ${version:-unknown}"
+        if [ -f "$grub_fallback_config" ] &&
+            grep -Fqx "$config_marker" "$grub_fallback_config"; then
+            echo "GRUB fallback: $grub_fallback_config"
+        elif has_other_limine; then
+            echo "GRUB fallback: existing Limine boot policy"
+        else
+            warn "GRUB-chainload fallback config is unavailable at $grub_fallback_config"
+        fi
+        [ "$current" -eq 1 ] || exit 1
+        exit 0
+        ;;
+    remove)
+        remove_limine_entry
+        rm -f "$loader" "$kernel" "$config"
+        rmdir "$efi_dir" 2>/dev/null || true
+        if [ -f "$bls_entry" ] && grep -Fq 'efi /EFI/NARF/narf.efi' "$bls_entry"; then
+            rm -f "$bls_entry"
+        fi
+        if [ -f "$grub_fallback_config" ] &&
+            grep -Fqx "$config_marker" "$grub_fallback_config"; then
+            rm -f "$grub_fallback_config"
+            rmdir "$grub_fallback_dir" 2>/dev/null || true
+        fi
+        rm -f "$state_file"
+        rmdir "$state_dir" 2>/dev/null || true
+        say "removed NARF UEFI payload from $esp"
+        exit 0
+        ;;
+esac
+
+source_loader=$source_dir/narf.efi
+source_kernel=$source_dir/narf-frame
+source_version=$source_dir/version
+for path in "$source_loader" "$source_kernel" "$source_version"; do
+    [ -f "$path" ] || {
+        echo "narf-uefi: package payload is missing: $path" >&2
+        exit 1
+    }
+done
+
+magic=$(dd if="$source_loader" bs=2 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+pe_offset=$(od -An -tu4 -j60 -N4 "$source_loader" | tr -d ' \n')
+case "$pe_offset" in
+    ''|*[!0-9]*) pe_header= ;;
+    *)
+        if [ "$pe_offset" -le 1048576 ]; then
+            pe_header=$(dd if="$source_loader" bs=1 skip="$pe_offset" count=6 2>/dev/null |
+                od -An -tx1 | tr -d ' \n')
+        else
+            pe_header=
+        fi
+        ;;
+esac
+[ "$magic" = 4d5a ] && [ "$pe_header" = 504500006486 ] || {
+    echo "narf-uefi: $source_loader is not an x86_64 PE/COFF EFI executable" >&2
+    exit 1
+}
+
+version=$(sed -n '1p' "$source_version")
+case "$version" in
+    ''|*[!0-9A-Za-z._+-]*)
+        echo "narf-uefi: invalid packaged version: ${version:-<empty>}" >&2
+        exit 1
+        ;;
+esac
+
+umask 022
+mkdir -p "$efi_dir" "$esp/loader/entries" "$state_dir"
+manage_grub_fallback=1
+if [ -f "$grub_fallback_config" ] &&
+    ! grep -Fqx "$config_marker" "$grub_fallback_config"; then
+    manage_grub_fallback=0
+    warn "$grub_fallback_config is managed by another installation; UEFI GRUB must use that Limine configuration"
+elif has_other_limine; then
+    manage_grub_fallback=0
+    warn "an existing Limine EFI application owns boot policy; not replacing it with NARF's GRUB fallback config"
+else
+    mkdir -p "$grub_fallback_dir"
+fi
+tmp_loader=$efi_dir/.narf.efi.$$
+tmp_kernel=$efi_dir/.narf-frame.$$
+tmp_config=$efi_dir/.limine.conf.$$
+tmp_grub_fallback=
+if [ "$manage_grub_fallback" -eq 1 ]; then
+    tmp_grub_fallback=$grub_fallback_dir/.limine.conf.$$
+fi
+tmp_bls=$esp/loader/entries/.narf.conf.$$
+trap 'rm -f "$tmp_loader" "$tmp_kernel" "$tmp_config" ${tmp_grub_fallback:+"$tmp_grub_fallback"} "$tmp_bls"' EXIT HUP INT TERM
+
+install -m 0644 "$source_loader" "$tmp_loader"
+install -m 0644 "$source_kernel" "$tmp_kernel"
+cat >"$tmp_config" <<EOF
+$config_marker
+timeout: 5
+serial: yes
+verbose: yes
+quiet: no
+default_entry: 1
+
+/NARF $version
+    protocol: multiboot2
+    path: boot():/EFI/NARF/narf-frame
+EOF
+if [ "$manage_grub_fallback" -eq 1 ]; then
+    install -m 0644 "$tmp_config" "$tmp_grub_fallback"
+fi
+cat >"$tmp_bls" <<EOF
+title NARF
+version $version
+sort-key narf
+architecture x64
+efi /EFI/NARF/narf.efi
+EOF
+chmod 0644 "$tmp_config" "$tmp_bls"
+
+# Publish the kernel and its config before the discoverable EFI/BLS entry
+# points. A power loss can leave harmless dot-temporaries, but no new entry
+# points at an absent kernel.
+mv -f "$tmp_kernel" "$kernel"
+mv -f "$tmp_config" "$config"
+if [ "$manage_grub_fallback" -eq 1 ]; then
+    mv -f "$tmp_grub_fallback" "$grub_fallback_config"
+fi
+mv -f "$tmp_loader" "$loader"
+mv -f "$tmp_bls" "$bls_entry"
+printf '%s\n' "$esp" >"$state_file"
+
+if [ "$manager_hooks" -eq 1 ] && command -v limine-entry-tool >/dev/null 2>&1 && [ -f /boot/limine.conf ]; then
+    if ! limine-entry-tool --add-efi "NARF" "$loader" \
+        --comment "NARF framekernel $version" --priority 20 --overwrite --quiet; then
+        warn "could not add the CachyOS Limine menu entry; the EFI payload is still installed"
+    fi
+fi
+
+say "installed NARF $version UEFI payload on $esp"
+say "systemd-boot: $bls_entry"
+say "rEFInd: auto-discovers $loader"
+say "GRUB: regenerate grub.cfg so 42_narf can chainload $loader"

@@ -8,6 +8,8 @@ Start with the guide that matches the job at hand:
   boot, operating limits, storage/network basics, and runtime modules.
 - [Running on Linux](RUNNING_ON_LINUX.md) — detailed workstation and QEMU
   walkthrough.
+- [Booting from CachyOS](BOOTING_ON_CACHYOS.md) — safe QEMU, USB, and GRUB
+  workflows plus the current boundary for booting a CachyOS rootfs.
 - [Build personalities](PERSONAS.md) — `linux-compat`, container, and cgroup
   feature composition.
 - [Extension guide](extending/README.md) — public traits and registration

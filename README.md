@@ -114,11 +114,12 @@ sudo dnf install ./narf-kernel-${VERSION}-*.x86_64.rpm
 sudo pacman -U "./narf-kernel-${VERSION}-1-x86_64.pkg.tar.zst"
 ```
 
-The package installs a versioned kernel in `/boot`, adds a GRUB menu generator,
-and refreshes the GRUB configuration when the host provides the usual update
-tool. Reboot and select **NARF &lt;version&gt;** from the GRUB menu. Keep your
-distribution kernel installed and configured as the default until you have
-validated NARF on the machine.
+The package installs a versioned kernel in `/boot` and an isolated UEFI
+payload on the mounted EFI System Partition. It integrates with UEFI GRUB,
+systemd-boot/BLS, rEFInd, and CachyOS Limine; the GRUB generator retains a
+direct Multiboot2 path for legacy BIOS. Run `sudo narf-uefi status` before
+rebooting. Keep your distribution kernel installed and configured as the
+default until you have validated NARF on the machine.
 
 To build and install a native package from a NARF checkout, install the optional
 Cargo frontend and let it detect the host package manager:
@@ -134,11 +135,18 @@ cargo narf install --version 0.5.0
 `apt`/`dpkg`, `dnf`/`rpm`, or `pacman`; it never copies files directly into
 `/boot`. Gentoo output is generated as an overlay-ready ebuild rather than
 installed automatically because overlay registration is host policy.
+The packager reuses Limine from `LIMINE_PATH`, common system locations, or a
+previous x86_64 image build; otherwise pass
+`--limine-efi /path/to/BOOTX64.EFI` explicitly.
 
-Current native packages target x86_64 GRUB systems with Multiboot2. Native
-aarch64 installation, systemd-boot/kernel-install, and Secure Boot are not yet
-supported. See [packaging/README.md](packaging/README.md) for package creation,
-Gentoo setup, removal commands, artifact contents, and current limitations.
+Current native packages target x86_64 UEFI and legacy-BIOS machines. Native
+aarch64 installation and Secure Boot signing/key enrollment are not yet
+supported. See [packaging/README.md](packaging/README.md) for ESP detection,
+boot-manager integration, package creation, removal, and recovery commands.
+CachyOS users should also read
+[Booting NARF from CachyOS](docs/BOOTING_ON_CACHYOS.md): it separates the
+supported QEMU/USB and GRUB alternate-boot workflows from the not-yet-supported
+goal of running the installed CachyOS root as NARF userspace.
 
 ---
 
@@ -172,13 +180,13 @@ cargo xtask run-interactive --arch=x86_64 --cmd "oci_smoke" --expect "oci-smoke-
 cargo xtask net-smoke --arch=x86_64
 
 # Boot via Limine ISO + OVMF UEFI and require a clean boot marker
-cargo xtask iso-boot --arch=x86_64 --release
+cargo xtask iso-boot --arch=x86_64
 
 # Boot the AA64 fallback loader + ESP under AAVMF
-cargo xtask iso-boot --arch=aarch64 --release
+cargo xtask iso-boot --arch=aarch64
 
 # Build the ISO without booting
-cargo xtask image --arch=x86_64 --release
+cargo xtask image --arch=x86_64
 
 # Build a GRUB bundle (direct BIOS Multiboot2 + UEFI chainload assets)
 cargo xtask grub-image --arch=x86_64

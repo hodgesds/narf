@@ -194,13 +194,18 @@ and CI compiler-cache integration.
   Limine EFI app from `target/grub-x86_64/esp/`, which also contains the
   canonical kernel, initramfs, and Limine configuration for installation to
   the ESP.
-- `packaging/build-release.sh --version X.Y.Z` — wrap the canonical
-  Multiboot2 kernel ELF in native distribution packages and emit a
-  checksummed release manifest.
+- `packaging/build-release.sh --version X.Y.Z [--limine-efi FILE]` — wrap the
+  canonical Multiboot2 kernel ELF and reviewed Limine x86_64 EFI application
+  in native distribution packages, install an isolated `/EFI/NARF` payload,
+  the marked Limine GRUB fallback configuration, and a BLS Type #1 entry
+  through `narf-uefi`, retain direct legacy-BIOS GRUB boot, and emit a
+  checksummed release manifest. UEFI GRUB chainloads the payload; systemd-boot,
+  rEFInd, and CachyOS Limine consume their native discovery/registration paths.
 - `cargo install --path build/cargo-narf` installs the optional source-tree
   frontend. `cargo narf package` drives reproducible native package generation;
-  `cargo narf install` delegates the resulting artifact to apt/dpkg, dnf/rpm,
-  or pacman rather than writing `/boot` directly.
+  both package/install commands accept `--limine-efi FILE`; `cargo narf install`
+  delegates the resulting artifact to apt/dpkg, dnf/rpm, or pacman rather than
+  writing `/boot` or the ESP directly.
 - Kernel ELFs on both architectures carry a deterministic SHA-1 GNU build-ID;
   linker symbols `__build_id_note_start` and `__build_id_note_end` delimit the
   retained note for `/sys/kernel/notes`.

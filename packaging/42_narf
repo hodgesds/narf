@@ -7,7 +7,24 @@ for kernel in "$boot_dir"/narf-kernel-*; do
     version=${kernel##*/narf-kernel-}
     cat <<EOF
 menuentry 'NARF $version' --class narf --class os {
-    multiboot2 /narf-kernel-$version
+    if [ "\${grub_platform}" = "efi" ]; then
+        if search --no-floppy --file --set=narf_esp /EFI/NARF/narf.efi; then
+            set root=\$narf_esp
+            chainloader /EFI/NARF/narf.efi
+        else
+            echo 'NARF UEFI payload is missing; run narf-uefi install from the host'
+            sleep 5
+        fi
+    else
+        if search --no-floppy --file --set=narf_root /narf-kernel-$version; then
+            multiboot2 (\$narf_root)/narf-kernel-$version
+        elif search --no-floppy --file --set=narf_root /boot/narf-kernel-$version; then
+            multiboot2 (\$narf_root)/boot/narf-kernel-$version
+        else
+            echo 'NARF kernel is missing from /boot'
+            sleep 5
+        fi
+    fi
 }
 EOF
 done
