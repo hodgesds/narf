@@ -1,6 +1,7 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
 use crate::amdgpu_gfx12_rs64 as rs64;
+use crate::amdgpu_gfx12_setup as setup;
 use crate::amdgpu_mes12_hw as mes;
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_dmub_navi48 as dmub, amdgpu_gddr6 as training,
@@ -30,10 +31,11 @@ pub enum Stage {
     ReadTopology,
     MemoryTranslation,
     DmaProof,
+    SetupGraphics,
     StartMes,
     StartDmub,
 }
-const STAGES: [Stage; 18] = [
+const STAGES: [Stage; 19] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -50,6 +52,7 @@ const STAGES: [Stage; 18] = [
     Stage::ReadTopology,
     Stage::MemoryTranslation,
     Stage::DmaProof,
+    Stage::SetupGraphics,
     Stage::StartMes,
     Stage::StartDmub,
 ];
@@ -73,6 +76,7 @@ pub enum Error {
     Display(display::Error),
     Rs64(rs64::Error),
     Mes(mes::Error),
+    Setup(setup::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -93,6 +97,7 @@ pub struct Report {
     pub topology: topology::Topology,
     pub rs64: rs64::Starts,
     pub mes: mes::Report,
+    pub setup: setup::Report,
 }
 #[derive(Debug)]
 pub struct Firmware {
@@ -167,6 +172,7 @@ struct Hardware {
     power: Option<smu::PowerStatus>,
     topology: Option<topology::Topology>,
     rs64: rs64::Rs64,
+    setup: setup::Setup,
     gmc: Option<gmc::Gmc>,
     sdma: Option<sdma::Sdma>,
     mes: Option<mes::Mes>,
@@ -310,6 +316,13 @@ impl Backend for Hardware {
                 unsafe { self.sdma.as_mut().unwrap().initialize(gmc).await }
                     .map_err(Error::Sdma)?;
             }
+            Stage::SetupGraphics => {
+                // SAFETY: matching authenticated RS64/RLC, restricted power,
+                // owned GMC translations and SDMA proof; no CP/MES queue is active.
+                unsafe { self.setup.initialize() }
+                    .await
+                    .map_err(Error::Setup)?;
+            }
             Stage::StartMes => {
                 // SAFETY: the constructor ties this function to the retained
                 // GPU; no config or doorbell access can race the boot owner.
@@ -352,6 +365,7 @@ impl Backend for Hardware {
             dmub: self.dmub.status().ok_or(Error::Invalid)?,
             topology: self.topology.ok_or(Error::Invalid)?,
             rs64: self.rs64.starts().ok_or(Error::Invalid)?,
+            setup: self.setup.report().ok_or(Error::Invalid)?,
             mes: self
                 .mes
                 .as_ref()
@@ -411,6 +425,8 @@ impl ColdBoot {
         // SAFETY: same exclusive GPU/register ownership; this only prepares.
         let rs64 =
             unsafe { rs64::Rs64::new(gpu, authority, &firmware.gfx) }.map_err(Error::Rs64)?;
+        // SAFETY: same exclusive ownership; reserves a page without publishing it.
+        let setup = unsafe { setup::Setup::new(gpu, authority, pool) }.map_err(Error::Setup)?;
         let mp0 = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
         if target != firmware.gfx.target() || !firmware.sos.is_psp14(mp0.revision) {
             return Err(Error::Unsupported);
@@ -473,6 +489,7 @@ impl ColdBoot {
                     power: None,
                     topology: None,
                     rs64,
+                    setup,
                     gmc: None,
                     sdma: None,
                     mes: None,

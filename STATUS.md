@@ -281,6 +281,9 @@ GFX/thermal policy; GC12 harvested CU/SA/RB inventory and device-query reporting
 GMC12/MMHUB4.1 owned VMID0 translations; SDMA7 translated
 VRAM write/copy/fence verification; and DCN4 DMUB shared state, authenticated
 window validation, startup and version/capability/HPD/AUX mailbox support.
+GC12 setup now retains the native RLC clear-state image, applies ASIC-revision
+golden settings, configures VMID0 shader/context controls and starts RS64
+processors with inactive-queue checks and bounded idle confirmation.
 DCN4 board routing reads ATOM v1.4/v1.5, preserves distinct AUX/HPD/transmitter
 identities and bounds the four channels using DCN4 backend register geometry.
 The retained owner supports native DP/eDP DPCD/extended-capability and complete

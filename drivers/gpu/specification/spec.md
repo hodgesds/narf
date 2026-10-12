@@ -251,7 +251,8 @@ DCN4 stop requires STOP_FW acknowledgement and PWAIT,
 uses CNTL2 reset, verifies disabled/reset readback and leaves PSP's secure
 windows untouched. Every stage is observable through `State`; failure or
 cancellation prevents replay. The sequence then initializes GMC12 and SDMA7,
-starts unified MES12's firmware queues, and starts DMUB with a validated
+configures GC12/RLC and unhalts RS64, starts unified MES12's firmware queues,
+and starts DMUB with a validated
 version/capability handshake. `MemoryReady` reports firmware/media/power status,
 the VMID0 aperture, verified DMA proof and MES queue report. User queues,
 native display and physical validation remain separate gates;
@@ -266,6 +267,20 @@ and restores the GRBM selector on errors as well as success. A single live
 capability invocation covers the finite indexed sequence, with write readback.
 Failure prevents replay. `Report::rs64` records completed configuration; this
 does not activate queues, unhalt command processors or prove graphics execution.
+
+`unsafe amdgpu_gfx12_setup::Setup::new` reserves an owned RLC clear-state page.
+After RS64, restricted power, GMC and the SDMA proof, `unsafe initialize().await`
+requires inactive CP/MES queues and applies GC12 golden settings. It reads the
+ASIC strap using the NBIO7.7 or NBIF6.3.1 offset; revision-zero workarounds do
+not affect later revisions. Shader-engine broadcast and queue/VMID selectors
+are restored on every exit. Constants configure VMID0 shader access, the
+single graphics pipe, eight hardware contexts and disabled GUI-idle IRQs.
+The RLC image contains the six GC12 clusters (75 dwords), checked independently
+against Linux's clear-state table by `tests/gfx12_clearstate.c`. Publication
+retains the page through cancellation/failure; the driver programs CSIB and
+enables RLC save/restore before activating four MEC stacks and unhalting PFP/ME.
+An async bounded idle wait must succeed before `Report::setup` becomes valid.
+This stage makes command processors available but publishes no application queue.
 
 `amdgpu_mes12` serializes MES12's 64-dword frames using its eight-byte C
 alignment, separately from MES11's four-byte alignment. It provides bounded

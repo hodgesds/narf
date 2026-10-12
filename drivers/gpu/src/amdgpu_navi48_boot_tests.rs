@@ -10,6 +10,11 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 }
 fn report() -> Report {
     Report {
+        setup: setup::Report {
+            revision: 0,
+            clear_state_address: 0x800300000,
+            clear_state_dwords: 75,
+        },
         mes: mes::Report {
             versions: [0x308b; 2],
             completed: [3, 3],
