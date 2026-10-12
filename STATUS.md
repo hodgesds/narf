@@ -391,7 +391,14 @@ restoring compression. Partial inherited shutdown, shared routing and late
 producer/configuration changes reject; failure/cancellation quarantine ownership.
 PHY output, root clocks, timing and unrelated outputs stay retained. The FRL
 character-clock root independently blocks shared clock changes after link stop.
-HDMI FRL PHY shutdown, eDP, sink/MST/audio teardown
+Direct external FRL PHY shutdown now uses the native firmware FRL mode and
+requires all four lane-disable and TX-clock-off witnesses before parking the
+character-clock root. Shared PHY clock consumers, unacknowledged DTOs, TMDS
+timing and pending transitions reject before commands. Live DTB/DPREF timing,
+forced input clocks and other outputs remain retained. Already-stopped PHYs
+skip firmware replay; late changes, failure and cancellation quarantine the
+owner. This proves lane/clock shutdown, not analog power gating or memory reuse.
+eDP, sink/MST/audio teardown
 and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths

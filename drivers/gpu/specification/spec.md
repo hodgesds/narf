@@ -718,6 +718,36 @@ and other outputs, and proves no PHY, sink or memory retirement. Failure enters
 until independent reset. Shared clock guards also reject an enabled FRL
 character-clock root after digital-link retirement.
 
+`unsafe ColdBoot::disable_display_frl(port).await`, its serialized platform
+wrapper and `Otg::disable_frl` disable a validated direct external HDMI FRL PHY
+after frontend and digital-link retirement. The caller fulfils the same sink,
+SCDC/retimer, audio/metadata/HDCP and writer-exclusion obligations, without ACPI
+PHY interlocks or SSC workarounds, and retains all allocations/translations.
+Live checks require the complete native digital-off state, unique board mux,
+quiet selected legacy backend, no PHY handshake and matching retained root
+routes. Shared HPO link roots, inherited enabled HPO stream roots and frontend
+symclk consumers of this PHY reject before commands. Live timing must use an
+acknowledged DPREFCLK/DTBCLK DTO, without pixel add/drop, reset or buffered timing
+transactions; PHY-fed TMDS timing rejects. Consumer routes and configuration
+are checked again across firmware/hardware waits and root parking.
+
+The native DMUB v1.7 DISABLE packet uses FRL mode 4, HDMI connector ID, board
+PHY/HPD and the zero-initialized caller's HPO encoding. Mailbox consumption
+only completes transport. Independent waits of up to 100 ms each require all
+four RDPCS lanes disabled with CLK_RDY/DATA_EN/REQ/ACK clear, then all lane/TX
+clock requests and TX clock-on clear. Only then is the character-clock root's
+enable/source cleared. The host never writes firmware-owned lane/TX witnesses.
+Inherited fully stopped PHYs skip the command; retained root parking still
+requires fresh consumer checks. Native forced PHY input clocks remain retained,
+as do DTOs, timing and unrelated outputs. This proves no analog power gating,
+sink, memory or translation retirement.
+
+Success enters `FrlDisabled` and records historical
+`FrlDisabled { path, command_sent }` in `Status::frl_disabled`. Failure enters
+`Failed`; cancellation retains `DisablingFrl(transmitter)`. Both prevent owner,
+clock and mailbox reuse until independent reset; unfinished firmware transport
+also retains its own mailbox quarantine.
+
 `unsafe ColdBoot::retire_display_tmds_timing(pipe).await` and its serialized
 platform wrapper break the TMDS timing/PHY-clock shutdown dependency. Unlike
 general timing retirement, this operation allows live TMDS backends and PHYs;

@@ -2,6 +2,9 @@
 //! then restore RC compression. PHY firmware and root-clock shutdown are separate.
 use super::*;
 use crate::amdgpu_dcn_inventory::{Connector, Path};
+#[path = "amdgpu_dcn401_frl_phy.rs"]
+pub(in super::super) mod phy;
+pub use phy::FrlDisabled;
 
 const LINK_CONTROL: u64 = 0x95b;
 const LINK_CLOCK: u64 = 0x95c;

@@ -2,8 +2,8 @@
 //! followed by hpo_enc401_blank. Link/PHY, timing and memory remain owned.
 use super::*;
 #[path = "amdgpu_dcn401_frl_link.rs"]
-mod link;
-pub use link::FrlLinkRetired;
+pub(super) mod link;
+pub use link::{FrlDisabled, FrlLinkRetired};
 
 const CLOCK: u64 = 0x8d3;
 const SOURCE: u64 = 0x8d5;

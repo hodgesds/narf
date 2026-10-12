@@ -39,6 +39,64 @@ fn dmub_navi48_tmds_disable_uses_native_hdmi_mode_connector_and_hpo_default() ->
     }
     TestResult::Pass
 }
+fn dmub_navi48_frl_disable_uses_native_frl_mode_and_zero_engine_encoding() -> TestResult {
+    for phy in 0..4 {
+        for hpd in 1..=4 {
+            let (_pool, mut e) = ready();
+            let mut path = dp_path(phy, hpd);
+            path.connector = crate::amdgpu_dcn_inventory::Connector::HdmiTypeA;
+            let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+            run(e.disable_frl(path)).unwrap();
+            let mut golden = [0; 64];
+            golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+            golden[4] = phy;
+            golden[6] = 4; // DCE112 HDMI_FRL, distinct from TMDS mode 3
+            golden[12] = hpd;
+            golden[14] = 12;
+            golden[15] = 246; // zero-initialized DIGA minus HPO_0
+            assert_eq!(e.io.slot(offset), golden);
+            assert_eq!(e.mailbox.state, MailboxState::Ready);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_frl_disable_uses_native_frl_mode_and_zero_engine_encoding
+);
+
+fn dmub_navi48_frl_disable_validates_path_and_retains_cancelled_mailbox() -> TestResult {
+    let (_pool, mut e) = ready();
+    for (phy, hpd, hdmi) in [(4, 1, true), (2, 0, true), (2, 5, true), (2, 1, false)] {
+        let mut path = dp_path(phy, hpd);
+        if hdmi {
+            path.connector = crate::amdgpu_dcn_inventory::Connector::HdmiTypeA;
+        }
+        let bytes = e.io.bytes.clone();
+        let writes = e.io.writes.len();
+        assert_eq!(run(e.disable_frl(path)), Err(Error::Invalid));
+        assert_eq!(e.io.bytes, bytes);
+        assert_eq!(e.io.writes.len(), writes);
+    }
+    let mut path = dp_path(2, 1);
+    path.connector = crate::amdgpu_dcn_inventory::Connector::HdmiTypeA;
+    e.io.commands = false;
+    {
+        let mut f = core::pin::pin!(e.disable_frl(path));
+        assert!(f
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.mailbox.state, MailboxState::InFlight);
+    assert_eq!(run(e.disable_frl(path)), Err(Error::Busy));
+    assert_eq!(run(e.disable_tmds(path)), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_frl_disable_validates_path_and_retains_cancelled_mailbox
+);
 kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_tmds_disable_uses_native_hdmi_mode_connector_and_hpo_default

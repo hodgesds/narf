@@ -488,6 +488,12 @@ impl Dmub {
     ) -> Result<(), Error> {
         self.engine.disable_tmds(path).await
     }
+    pub(crate) async fn disable_frl(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+    ) -> Result<(), Error> {
+        self.engine.disable_frl(path).await
+    }
     /// Validate the VRAM pool and reserve nonsecure DMUB storage without writes.
     /// # Safety
     /// Caller exclusively owns this physical Navi48 GPU, DCN/PSP/PM/reset,
@@ -584,6 +590,14 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         self.disable_transmitter(path, 3, 12, 246).await
+    }
+    async fn disable_frl(&mut self, path: crate::amdgpu_dcn_inventory::Path) -> Result<(), Error> {
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::HdmiTypeA {
+            return Err(Error::Invalid);
+        }
+        // DCE112+ signal_type_to_atom_dig_mode maps HDMI_FRL to literal 4.
+        // dcn10_link_encoder_disable_output leaves the HPO engine id zero.
+        self.disable_transmitter(path, 4, 12, 246).await
     }
     async fn disable_transmitter(
         &mut self,

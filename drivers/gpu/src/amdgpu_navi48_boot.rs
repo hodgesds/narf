@@ -1073,6 +1073,39 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Disable the direct FRL PHY after frontend and digital-link retirement.
+    /// # Safety
+    /// Fulfil `Otg::disable_frl` direct-port, sink/SCDC/retimer, producer and
+    /// writer-exclusion obligations. Retain every allocation and translation;
+    /// forced input clocks, timing and analog power remain owned.
+    pub async unsafe fn disable_display_frl(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::FrlDisabled, otg::Error> {
+        if self.display_retirement_busy()
+            || self.display_state() != Ok(display::State::Ready)
+            || self
+                .ddc
+                .as_ref()
+                .is_ok_and(|d| d.state() != ddc::State::Ready)
+        {
+            return Err(otg::Error::Busy);
+        }
+        let path = *self
+            .display_paths()
+            .map_err(|_| otg::Error::Invalid)?
+            .get(port)
+            .ok_or(otg::Error::Invalid)?;
+        // SAFETY: validated board path and retained matching owners; caller
+        // establishes platform interlocks, producer exclusion and memory lifetime.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .disable_frl(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
     /// Disable an HPO PHY after digital-link retirement, then park its root route.
     /// # Safety
     /// Signal matches the inherited link. Use a direct external DP port without
