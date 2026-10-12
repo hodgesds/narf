@@ -61,8 +61,10 @@ batch. It retains a bounded polling fallback for lost or unavailable
 interrupts. The shared completion vector starts with the legacy e1000 Linux
 policy of 20,000 interrupts/second (ITR/EITR0 interval 195, about 50
 microseconds) instead of generating an interrupt for every received frame.
-Registering an e1000 enables the stack's bounded software GRO path; the driver
-flushes held flows at RX-ring quiescence.
+Registering an e1000 opts that interface into the stack's bounded software GRO
+path; the driver flushes held flows at RX-ring quiescence. GRO selection is
+per-interface, so another NIC sharing the CPU bypasses GRO unless its own RX
+poll loop also opts in and supplies a completion flush.
 
 For Ethernet/IPv4/TCP, e1000 advertises a bounded 64 KiB TSO frame. The public
 `TxContextDesc::ipv4_tso` constructor encodes the 8254x context descriptor;
@@ -80,6 +82,16 @@ can be the device's sole owner. The developer/CI-only `qemu-static-ipv4`
 feature assigns the first registered NIC QEMU SLIRP's `10.0.2.15/24` lease and
 `10.0.2.2` gateway at `Stage::Late`; production networking leaves address
 selection to userspace.
+
+IGC uses the I225/I226 extended interrupt block (`ICR` 0x1500, `EIMS`/`EIMC`,
+`EIAC`/`EIAM`, `EITR0`, `IVAR0` and `IVAR_MISC`) rather than the legacy e1000
+interrupt aliases. Its current single queue has 256 RX descriptors. Queue-0
+RX, TX and other causes share MSI-X entry 0; the initial EITR interval is 648
+256-ns units (Linux's approximately 6,000 interrupts/second starting point).
+The RX worker snapshots its IRQ waiter before checking descriptors, drains at
+most 64 frames per round, rearms all consumed descriptors with one RDT write,
+then reenables and rechecks the vector before parking. A 10-ms lost-interrupt
+deadline and 1-ms no-vector polling fallback preserve forward progress.
 
 ### 3.1 i40e runtime profile
 

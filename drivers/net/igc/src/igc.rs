@@ -26,7 +26,11 @@
 //! | 0x0008  | STATUS | Device Status                      |
 //! | 0x0010  | EEC  | EEPROM/Flash Control (I225 specific) |
 //! | 0x0014  | EERD | EEPROM Read                          |
-//! | 0x00D0  | IMS  | Interrupt Mask Set/Read              |
+//! | 0x1500  | ICR  | Interrupt Cause Read                  |
+//! | 0x1508  | IMS  | Interrupt Mask Set/Read               |
+//! | 0x1524  | EIMS | Extended Interrupt Mask Set/Read      |
+//! | 0x1680  | EITR0 | Interrupt Throttle, vector 0         |
+//! | 0x1700  | IVAR0 | Queue interrupt-vector allocation    |
 //! | 0x0100  | RCTL | Receive Control                      |
 //! | 0x0400  | TCTL | Transmit Control                     |
 //! | 0x2800  | RDBAL/H/LEN/H/T as e1000              |
@@ -36,7 +40,7 @@
 
 use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
 use narf_io::{alloc_coherent, DmaBuffer};
@@ -96,15 +100,24 @@ pub const IGC_I221_V: u16 = 0x125E;
 const REG_CTRL: u64 = 0x0000;
 const REG_STATUS: u64 = 0x0008;
 /// IGC ICR — Interrupt Cause Read. Reading clears all pending cause
-/// bits (Linux `drivers/net/ethernet/intel/igc/igc_defines.h::IGC_ICR`).
-const REG_ICR: u64 = 0x00C0;
-const REG_IMS: u64 = 0x00D0;
+/// bits (Linux `drivers/net/ethernet/intel/igc/igc_regs.h::IGC_ICR`).
+const REG_ICR: u64 = 0x1500;
+const REG_IMS: u64 = 0x1508;
 /// IGC IMC — Interrupt Mask Clear (write-1-to-clear).
-const REG_IMC: u64 = 0x00D8;
+const REG_IMC: u64 = 0x150C;
+/// Extended MSI-X interrupt mask registers.
+const REG_EIMS: u64 = 0x1524;
+const REG_EIMC: u64 = 0x1528;
+const REG_EIAC: u64 = 0x152C;
+const REG_EIAM: u64 = 0x1530;
 /// IGC GPIE — General Purpose Interrupt Enable. Bit 4 (NSICR) +
 /// bit 31 (PBA_support) tell the chip to deliver IRQs as MSI-X
 /// rather than legacy IMS (Linux `igc_defines.h::IGC_GPIE`).
 const REG_GPIE: u64 = 0x1514;
+/// Per-vector interrupt-throttle register for MSI-X table entry 0.
+const REG_EITR0: u64 = 0x1680;
+/// Queue-0 RX/TX interrupt-vector allocation register.
+const REG_IVAR0: u64 = 0x1700;
 /// IGC IVAR_MISC — table mapping "other" causes to MSI-X vector
 /// number (Linux: `IGC_IVAR_MISC`). We pin the "other" causes to
 /// vector index 0 in single-vector MSI-X mode.
@@ -156,6 +169,22 @@ pub const IMS_RXDMT0: u32 = 1 << 4;
 pub const IMS_RXT0: u32 = 1 << 7;
 pub const IMS_DEFAULT: u32 = IMS_TXDW | IMS_LSC | IMS_RXO | IMS_RXDMT0 | IMS_RXT0;
 
+/// One shared MSI-X table/vector entry handles RX0, TX0, and other causes.
+const MSIX_VECTOR0_MASK: u32 = 1;
+const IVAR_VALID: u32 = 0x80;
+/// Linux starts igc queue vectors at 648 256-ns units (~6,000 IRQ/s).
+const EITR_START: u32 = 648;
+const EITR_CNT_IGNR: u32 = 1 << 31;
+
+const fn ivar0_shared_vector(vector: u8) -> u32 {
+    let entry = (vector as u32) | IVAR_VALID;
+    entry | (entry << 8)
+}
+
+const fn ivar_misc_shared_vector(vector: u8) -> u32 {
+    ((vector as u32) | IVAR_VALID) << 8
+}
+
 // GPIE bits. Single-vector MSI-X needs GPIE.NSICR set so the chip
 // stops auto-clearing the entire ICR on read (we want the "extended"
 // MSI-X cause encoding) and GPIE.MULTIPLE_MSIX set so the chip
@@ -183,8 +212,12 @@ const TXD_STAT_DD: u8 = 1 << 0;
 // Ring sizes — small but valid (must be a multiple of 8 per
 // I225 datasheet §7.2.7).
 const TX_RING_LEN: usize = 8;
-const RX_RING_LEN: usize = 8;
+const RX_RING_LEN: usize = 256;
 const FRAME_SIZE: usize = 2048;
+
+fn previous_rx_slot(next_head: usize) -> usize {
+    (next_head + RX_RING_LEN - 1) % RX_RING_LEN
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum IgcError {
@@ -518,13 +551,14 @@ impl Igc {
             return Err(IgcError::ResetTimeout);
         }
 
-        // 2. Mask all interrupt causes during bring-up. IMC is
-        //    write-1-to-clear (Linux: IGC_IMC); writing all-ones
-        //    leaves IMS = 0 and prevents stale IRQs while we program
-        //    the rings. Re-enabled in step 8 once MSI-X is bound.
+        // 2. Mask legacy and extended interrupt causes during bring-up.
+        //    I225/I226 place these registers in the 0x1500 extended block,
+        //    not at the legacy e1000 0x00c0 aliases. Re-enabled after MSI-X
+        //    routing is fully programmed.
         // SAFETY: same.
         unsafe {
             mmio.write32(REG_IMC, !0u32);
+            mmio.write32(REG_EIMC, !0u32);
             // Clear any pending causes by reading ICR (read-to-clear).
             let _ = mmio.read32(REG_ICR);
         }
@@ -644,12 +678,11 @@ impl Igc {
             narf_interrupts::install_handler(v, igc_isr);
         }
 
-        // 9. Program GPIE for single-vector MSI-X delivery. Linux:
-        //    `igc_configure_msix` — sets GPIE.NSICR + MULTIPLE_MSIX +
-        //    EIAME + PBA so MSI-X delivery + ICR semantics agree.
-        //    Then unmask the standard RX/TX/LSC/RXO cause set in IMS.
-        //    Skip if no IRQ vector was bound — keep "all masked" so
-        //    polled callers don't see spurious cause bits.
+        // 9. Program the I225/I226 extended interrupt block. Queue 0 RX and
+        //    TX occupy IVAR0 bytes 0 and 1; "other" causes occupy IVAR_MISC
+        //    byte 1. All three target MSI-X table entry 0. EIAC/EIAM make the
+        //    vector auto-clear + auto-mask on delivery; the RX pump writes
+        //    EIMS after it drains and rechecks the ring.
         if irq_vector.is_some() {
             // SAFETY: identity-mapped MMIO.
             unsafe {
@@ -657,11 +690,12 @@ impl Igc {
                     REG_GPIE,
                     GPIE_NSICR | GPIE_MULTIPLE_MSIX | GPIE_EIAME | GPIE_PBA,
                 );
-                // Route the "other" causes (link-status etc) to MSI-X
-                // table[0]. Single-vector mode pins everything at
-                // index 0. IVAR_MISC bit 7 is the valid bit for the
-                // low byte; vector index lives in bits[6:0].
-                mmio.write32(REG_IVAR_MISC, 0x0000_0080);
+                mmio.write32(REG_IVAR0, ivar0_shared_vector(0));
+                mmio.write32(REG_IVAR_MISC, ivar_misc_shared_vector(0));
+                mmio.write32(REG_EITR0, EITR_START | EITR_CNT_IGNR);
+                mmio.write32(REG_EIAC, MSIX_VECTOR0_MASK);
+                mmio.write32(REG_EIAM, MSIX_VECTOR0_MASK);
+                mmio.write32(REG_EIMS, MSIX_VECTOR0_MASK);
                 mmio.write32(REG_IMS, IMS_DEFAULT);
             }
             // INTX_DISABLE is already set by the probe path (igc has
@@ -711,13 +745,15 @@ impl Igc {
         let mut msix = enable_msix(cap, device).map_err(|_| IgcError::BarMapFailed)?;
         let v = narf_interrupts::vector::alloc().map_err(|_| IgcError::BarMapFailed)?;
         let _ = msix.alloc_vector().ok_or(IgcError::BarMapFailed)?;
-        // Deliver to APIC id 0 (BSP). On aarch64 this routes through
-        // the GIC ITS doorbell with EventID=v.
+        // Route to the CPU performing probe. On aarch64 the helper returns
+        // the ITS collection target used by the bus MSI layer.
+        // SAFETY: interrupt topology is initialized before subsystem probes.
+        let target = unsafe { narf_interrupts::current_cpu_target_id() };
         // SAFETY: caller holds the BusDeviceCap; we own the MSI-X
         // table (no other writer); we issue this write before the
         // global enable so the device can't fire stale data.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let _ = unsafe { msix.program_vector(0, 0, v) }.map_err(|_| IgcError::BarMapFailed)?;
+        let _ = unsafe { msix.program_vector(0, target, v) }.map_err(|_| IgcError::BarMapFailed)?;
         // SAFETY: cfg-space write to a known cap-list offset.
         unsafe { msix.enable() }.map_err(|_| IgcError::BarMapFailed)?;
         Ok((msix, v))
@@ -930,49 +966,87 @@ impl Igc {
         len
     }
 
-    /// Zero-copy receive (P-F): hand the descriptor's own DMA buffer to the
-    /// stack as a `Frame` and swap a fresh buffer into its slot — no copy into
-    /// a scratch buffer and then a freshly-allocated frame, unlike the pump's
-    /// old `rx` + `Frame::new` + `copy_from_slice`. Returns `None` when no
-    /// frame is pending, or when the refill allocation fails (the frame is then
-    /// left in its descriptor for the next poll rather than dropped).
-    pub fn rx_recv_frame(&self) -> Option<Frame> {
+    /// Drain up to `budget` completed RX descriptors, swapping a fresh DMA
+    /// buffer into each slot and publishing the whole rearmed run with one RDT
+    /// write. The returned frames own the device-filled buffers.
+    fn rx_drain_frames(&self, budget: usize) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        let limit = budget.min(RX_RING_LEN);
+        if limit == 0 {
+            return frames;
+        }
         let mut head = self.rx_head.lock();
-        let idx = *head as usize;
+        let mut idx = *head as usize;
         let ring_phys = self.rx_ring_buf.dma_addr().raw();
-        let desc_ptr = narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64)
-            .kernel_mut_ptr::<AdvRxDescWb>();
+        while frames.len() < limit {
+            let desc_ptr = narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64)
+                .kernel_mut_ptr::<AdvRxDescWb>();
+            // SAFETY: identity-mapped DMA; idx < RX_RING_LEN.
+            let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
+            if desc.status_error & ADV_RXD_STAT_DD == 0 {
+                break;
+            }
+            let len = (desc.length as usize).min(FRAME_SIZE);
+            // Refill before handing the filled buffer up so the chip never
+            // sees an empty slot. On allocation failure, leave this descriptor
+            // completed and retry it on the next pump pass.
+            let replacement = match alloc_coherent(FRAME_SIZE, DomainId::DRIVER_0) {
+                Ok(replacement) => replacement,
+                Err(_) => break,
+            };
+            let repl_phys = replacement.dma_addr().raw();
+            let filled = {
+                let mut slots = self.rx_buf_pool.lock();
+                core::mem::replace(&mut slots[idx], replacement)
+            };
+            let read_form = AdvRxDescRead {
+                pkt_addr: repl_phys,
+                hdr_addr: 0,
+            };
+            // SAFETY: identity-mapped DMA; AdvRxDescRead is the same 16 bytes
+            // as AdvRxDescWb and `idx` is ring-bounded.
+            unsafe {
+                core::ptr::write_volatile(desc_ptr as *mut AdvRxDescRead, read_form);
+            }
+            frames.push(Frame::new(filled, len as u32));
+            idx = (idx + 1) % RX_RING_LEN;
+        }
+        if !frames.is_empty() {
+            *head = idx as u16;
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: identity-mapped MMIO; every descriptor through this
+            // final slot has been returned to read form above.
+            unsafe {
+                self.mmio.write32(REG_RDT, previous_rx_slot(idx) as u32);
+            }
+        }
+        frames
+    }
+
+    /// Zero-copy single-frame receive compatibility wrapper.
+    pub fn rx_recv_frame(&self) -> Option<Frame> {
+        self.rx_drain_frames(1).into_iter().next()
+    }
+
+    /// Whether queue 0 has a completed descriptor at the software head.
+    fn rx_has_pending(&self) -> bool {
+        let idx = *self.rx_head.lock() as usize;
+        let ring_phys = self.rx_ring_buf.dma_addr().raw();
+        let desc_ptr =
+            narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64).kernel_ptr::<AdvRxDescWb>();
         // SAFETY: identity-mapped DMA; idx < RX_RING_LEN.
-        let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
-        if desc.status_error & ADV_RXD_STAT_DD == 0 {
-            return None;
+        unsafe { core::ptr::read_volatile(desc_ptr) }.status_error & ADV_RXD_STAT_DD != 0
+    }
+
+    /// Re-enable the shared MSI-X vector after a NAPI-style drain.
+    fn rearm_msix(&self) {
+        if self.irq_vector.is_some() {
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: mapped BAR0; vector 0 is the only configured entry.
+            unsafe {
+                self.mmio.write32(REG_EIMS, MSIX_VECTOR0_MASK);
+            }
         }
-        let len = (desc.length as usize).min(FRAME_SIZE);
-        // Refill before handing the filled buffer up so the chip never sees an
-        // empty slot. On allocation failure, bail without advancing.
-        let replacement = alloc_coherent(FRAME_SIZE, DomainId::DRIVER_0).ok()?;
-        let repl_phys = replacement.dma_addr().raw();
-        let filled = {
-            let mut slots = self.rx_buf_pool.lock();
-            core::mem::replace(&mut slots[idx], replacement)
-        };
-        // Re-hand the slot in the read form (hdr_addr = 0 clears the wb DD bit).
-        let read_form = AdvRxDescRead {
-            pkt_addr: repl_phys,
-            hdr_addr: 0,
-        };
-        // SAFETY: identity-mapped DMA; AdvRxDescRead is the same 16 bytes as
-        // AdvRxDescWb (the chip selects interpretation via SRRCTL.DESCTYPE).
-        unsafe {
-            core::ptr::write_volatile(desc_ptr as *mut AdvRxDescRead, read_form);
-        }
-        *head = ((idx + 1) % RX_RING_LEN) as u16;
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_RDT, (idx % RX_RING_LEN) as u32);
-        }
-        Some(Frame::new(filled, len as u32))
     }
 }
 
@@ -1172,15 +1246,46 @@ fn spawn_pumps(
 }
 
 async fn igc_rx_pump(device: Arc<Igc>, mut rx_prod: Producer<Frame, RX_RING_N>) {
-    // Zero-copy (P-F): take the device-filled DMA buffer straight out of the RX
-    // descriptor as a Frame (refilling the slot), with no copy through a scratch
-    // buffer + freshly-allocated frame.
+    const RX_DRAIN_BUDGET: usize = 64;
+    const IRQ_FALLBACK_MS: u64 = 10;
+    let poll_fallback_cycles = narf_time::ns_to_cycles(1_000_000);
+
+    // Snapshot the IRQ fire count before the final descriptor check so an edge
+    // racing the empty-ring transition cannot be lost. Under load, drain a
+    // bounded burst and publish its RDT once; on quiescence, rearm MSI-X,
+    // recheck DD, then park on the prebuilt waiter. Systems without a usable
+    // vector retain a bounded 1-ms polling fallback.
     loop {
-        match device.rx_recv_frame() {
-            Some(frame) => {
-                let _ = rx_prod.send(frame).await;
+        let irq_waiter = device.irq_vector.map(|vector| {
+            narf_interrupts::wait_for_irq_until(
+                vector,
+                narf_time::Deadline::after_ms(IRQ_FALLBACK_MS),
+            )
+        });
+        let frames = device.rx_drain_frames(RX_DRAIN_BUDGET);
+        let drained = frames.len();
+        for frame in frames {
+            if rx_prod.send(frame).await.is_err() {
+                return;
             }
-            None => narf_scheduler::yield_now().await,
+        }
+        if drained == RX_DRAIN_BUDGET {
+            narf_scheduler::yield_now().await;
+            continue;
+        }
+
+        device.rearm_msix();
+        if device.rx_has_pending() {
+            // Either a frame raced the rearm or refill allocation temporarily
+            // failed. Let peers run once before retrying the bounded drain.
+            narf_scheduler::yield_now().await;
+            continue;
+        }
+        match irq_waiter {
+            Some(waiter) => {
+                let _ = waiter.await;
+            }
+            None => narf_time::sleep_cycles(poll_fallback_cycles).await,
         }
     }
 }
@@ -1192,4 +1297,48 @@ async fn igc_tx_pump(device: Arc<Igc>, mut tx_cons: Consumer<Frame, TX_RING_N>) 
     while let Ok(frame) = tx_cons.recv().await {
         let _ = device.tx_frame(&frame);
     }
+}
+
+#[cfg(any(test, feature = "builtin"))]
+mod tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::{
+        ivar0_shared_vector, ivar_misc_shared_vector, previous_rx_slot, EITR_CNT_IGNR, EITR_START,
+        REG_EIAC, REG_EIAM, REG_EIMC, REG_EIMS, REG_EITR0, REG_ICR, REG_IMC, REG_IMS, REG_IVAR0,
+        REG_IVAR_MISC, RX_RING_LEN,
+    };
+
+    fn smoke_igc_extended_interrupt_layout() -> TestResult {
+        if REG_ICR != 0x1500
+            || REG_IMS != 0x1508
+            || REG_IMC != 0x150c
+            || REG_EIMS != 0x1524
+            || REG_EIMC != 0x1528
+            || REG_EIAC != 0x152c
+            || REG_EIAM != 0x1530
+            || REG_EITR0 != 0x1680
+            || REG_IVAR0 != 0x1700
+            || REG_IVAR_MISC != 0x1740
+        {
+            return TestResult::Fail("igc extended interrupt register offset drift");
+        }
+        if ivar0_shared_vector(0) != 0x0000_8080 || ivar_misc_shared_vector(0) != 0x0000_8000 {
+            return TestResult::Fail("igc queue/other causes do not target shared vector 0");
+        }
+        if EITR_START != 648 || EITR_CNT_IGNR != 1 << 31 {
+            return TestResult::Fail("igc initial interrupt throttle drift");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igc", smoke_igc_extended_interrupt_layout);
+
+    fn smoke_igc_batched_rx_tail_wrap() -> TestResult {
+        if RX_RING_LEN != 256 || previous_rx_slot(1) != 0 || previous_rx_slot(0) != RX_RING_LEN - 1
+        {
+            return TestResult::Fail("igc batched RDT publication wraps incorrectly");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/net/igc", smoke_igc_batched_rx_tail_wrap);
 }
