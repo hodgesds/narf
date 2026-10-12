@@ -240,9 +240,34 @@ version/board transfer → DMUB stop → graphics autoload → RLC readiness →
 initial power policy. DCN4 stop requires STOP_FW acknowledgement and PWAIT,
 uses CNTL2 reset, verifies disabled/reset readback and leaves PSP's secure
 windows untouched. Every stage is observable through `State`; failure or
-cancellation prevents replay. `FirmwareReady` reports firmware/media/power
-status only. GMC, queues, DMUB restart, native display, probe integration and
-physical validation are separate gates; `fw_loaded` is not set by this API.
+cancellation prevents replay. The sequence then initializes GMC12 and SDMA7
+as described below; `MemoryReady` reports firmware/media/power status, the
+VMID0 aperture and verified DMA proof. User queues, DMUB restart, native
+display, probe integration and physical validation are separate gates;
+`fw_loaded` is not set by this API.
+
+`unsafe amdgpu_gmc_navi48::Gmc::new` validates GC12.0.1/MMHUB4.1/NBIO banks
+and the pool's BAR0/GPU mapping. `initialize().await` requires retained
+firmware and trained VRAM with both hubs idle. It creates a flat VMID0 table
+mapping only two owned VRAM pages in a 2 MiB aperture above physical VRAM.
+Page-table and fault-default backing also lives in the owned pool; no host
+DMA or user VMIDs are enabled. Both hubs must agree on framebuffer geometry.
+Programming uses the GC12 fault-response fields, disables fault interrupts,
+invalidates engine 17 in both hubs and the MMHUB private cache, and retains
+published backing across errors/cancellation. `Ready` follows both bounded
+acknowledgements, not merely table publication.
+
+`unsafe amdgpu_sdma_navi48::Sdma::new` selects SDMA7.0.0/1 on GC12.0.1,
+with queue registers in GC bank zero and MCU control in bank one. Its owned
+VRAM ring/writeback allocation is validated against BAR0. `initialize(gmc)`
+requires the same GPU's ready GMC owner and rejects all eight inherited
+SDMA0 queues. Cold start halts the MCU without a GRBM reset, preserves PSP's
+firmware, programs a privileged VMID0 direct ring and submits write, copy
+and uncached fence packets. Success requires matching source/destination
+bytes, fence, hardware read pointer and read-pointer writeback. HDP6 uses
+generic posted-write flushing with no HDP5 invalidate access. A failed or
+cancelled attempt cannot replay and retains its published allocation.
+The cold-boot owner retains GMC and SDMA throughout their consumers' lives.
 
 ### Navi 22 PSP secure-OS bootstrap
 

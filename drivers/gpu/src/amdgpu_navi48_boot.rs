@@ -1,9 +1,10 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
 use crate::{
-    amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_gddr6 as training,
+    amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_gddr6 as training, amdgpu_gmc_navi48 as gmc,
     amdgpu_navi48_firmware as gfx, amdgpu_psp_boot as sos, amdgpu_psp_ring as psp,
-    amdgpu_smu_navi48 as smu, amdgpu_vram::Pool, amdgpu_vram_boot::Training,
+    amdgpu_sdma_navi48 as sdma, amdgpu_smu_navi48 as smu, amdgpu_vram::Pool,
+    amdgpu_vram_boot::Training,
 };
 use alloc::vec::Vec;
 use narf_bus::{BusDeviceCap, MmioRegion};
@@ -22,8 +23,10 @@ pub enum Stage {
     Graphics,
     RlcBoot,
     PowerSetup,
+    MemoryTranslation,
+    DmaProof,
 }
-const STAGES: [Stage; 12] = [
+const STAGES: [Stage; 14] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -36,6 +39,8 @@ const STAGES: [Stage; 12] = [
     Stage::Graphics,
     Stage::RlcBoot,
     Stage::PowerSetup,
+    Stage::MemoryTranslation,
+    Stage::DmaProof,
 ];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -52,12 +57,14 @@ pub enum Error {
     Psp(psp::Error),
     Smu(smu::Error),
     Firmware(gfx::Error),
+    Gmc(gmc::Error),
+    Sdma(sdma::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     Prepared,
     Running(Stage),
-    FirmwareReady,
+    MemoryReady,
     Failed(Stage, Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +73,8 @@ pub struct Report {
     pub graphics: psp::GfxBootStatus,
     pub power: smu::PowerStatus,
     pub media: psp::MediaFirmware,
+    pub aperture: gmc::Aperture,
+    pub dma: sdma::Proof,
 }
 #[derive(Debug)]
 pub struct Firmware {
@@ -106,9 +115,9 @@ impl<B: Backend> Sequence<B> {
             }
         }
         let report = self.backend.report().inspect_err(|&e| {
-            self.state = State::Failed(Stage::PowerSetup, e);
+            self.state = State::Failed(Stage::DmaProof, e);
         })?;
-        self.state = State::FirmwareReady;
+        self.state = State::MemoryReady;
         Ok(report)
     }
 }
@@ -210,6 +219,8 @@ struct Hardware {
     versions: Option<smu::Versions>,
     graphics: Option<psp::GfxBootStatus>,
     power: Option<smu::PowerStatus>,
+    gmc: Option<gmc::Gmc>,
+    sdma: Option<sdma::Sdma>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -325,6 +336,27 @@ impl Backend for Hardware {
                         .map_err(Error::Smu)?,
                 )
             }
+            Stage::MemoryTranslation => {
+                // SAFETY: the owned pool, trained VRAM and accepted firmware
+                // persist; automatic gating and all queues are off.
+                self.gmc = Some(
+                    unsafe { gmc::Gmc::new(&self.gpu, self.authority, &self.pool) }
+                        .map_err(Error::Gmc)?,
+                );
+                // SAFETY: same retained owners and exclusive hub access.
+                unsafe { self.gmc.as_mut().unwrap().initialize().await }.map_err(Error::Gmc)?;
+            }
+            Stage::DmaProof => {
+                // SAFETY: prior stages retain firmware, memory and both hubs.
+                self.sdma = Some(
+                    unsafe { sdma::Sdma::new(&self.gpu, self.authority, &self.pool) }
+                        .map_err(Error::Sdma)?,
+                );
+                let gmc = self.gmc.as_mut().ok_or(Error::Invalid)?;
+                // SAFETY: GMC belongs to this same GPU and remains retained.
+                unsafe { self.sdma.as_mut().unwrap().initialize(gmc).await }
+                    .map_err(Error::Sdma)?;
+            }
         }
         Ok(())
     }
@@ -334,6 +366,16 @@ impl Backend for Hardware {
             graphics: self.graphics.ok_or(Error::Invalid)?,
             power: self.power.ok_or(Error::Invalid)?,
             media: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
+            aperture: self
+                .gmc
+                .as_ref()
+                .and_then(gmc::Gmc::aperture)
+                .ok_or(Error::Invalid)?,
+            dma: self
+                .sdma
+                .as_ref()
+                .and_then(sdma::Sdma::proof)
+                .ok_or(Error::Invalid)?,
         })
     }
 }
@@ -410,6 +452,8 @@ impl ColdBoot {
                     versions: None,
                     graphics: None,
                     power: None,
+                    gmc: None,
+                    sdma: None,
                 },
                 state: State::Prepared,
             },
@@ -418,8 +462,8 @@ impl ColdBoot {
     pub fn state(&self) -> State {
         self.sequence.state
     }
-    /// FirmwareReady proves accepted firmware, RLC readiness and SMU power.
-    /// It does not prove GMC/SDMA/queue readiness or a native display mode.
+    /// MemoryReady proves firmware, power and an owned VMID0 SDMA write/copy.
+    /// It does not establish userspace queues or a native display mode.
     pub async fn run(&mut self) -> Result<Report, Error> {
         self.sequence.run().await
     }

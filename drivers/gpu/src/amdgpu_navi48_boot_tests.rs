@@ -28,6 +28,17 @@ fn report() -> Report {
             vcn: Some(0x800100000),
             dmcub: Some(0x800200000),
         },
+        aperture: gmc::Aperture {
+            start: 0xc00000000,
+            size: 2 << 20,
+            source: 0xc00000000,
+            destination: 0xc00001000,
+        },
+        dma: sdma::Proof {
+            copied_bytes: 64,
+            fence: 0x90700048,
+            read_pointer: 128,
+        },
     }
 }
 struct FakeBoot {
@@ -63,7 +74,7 @@ fn sequence(fail: Option<Stage>, stall: Option<Stage>) -> Sequence<FakeBoot> {
 }
 fn navi48_boot_order_failure_and_cancellation() -> TestResult {
     let mut s = sequence(None, None);
-    if run(s.run()) != Ok(report()) || s.backend.log != STAGES || s.state != State::FirmwareReady {
+    if run(s.run()) != Ok(report()) || s.backend.log != STAGES || s.state != State::MemoryReady {
         return TestResult::Fail("Navi48 firmware boot order/report");
     }
     if run(s.run()) != Err(Error::Busy) || s.backend.log.len() != STAGES.len() {
@@ -113,9 +124,7 @@ impl Display {
     fn new(running: bool) -> Self {
         let mut regs = [0; 0x201];
         regs[0x1f6] = if running { 1 << 16 } else { 0 };
-        for r in 0x1af..=0x1b4 {
-            regs[r] = 0x80003456;
-        }
+        regs[0x1af..=0x1b4].fill(0x80003456);
         Self {
             regs,
             writes: Vec::new(),

@@ -289,6 +289,10 @@ An explicit cold-boot coordinator retains all firmware owners and sequences
 training, PSP/SMU, DCN4 DMUB stop, graphics autoload and initial power setup.
 Native memory/queue/display integration and physical-card validation remain
 open; firmware readiness does not advertise working acceleration.
+GMC12/MMHUB4.1 VMID0 translation and the SDMA7 owned-VRAM write/copy/fence
+path now form the last two explicit cold-boot stages. The returned proof
+covers those kernel-owned pages only; userspace graphics/compute queues,
+native display and real-card validation remain open.
 
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
