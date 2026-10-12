@@ -1,6 +1,8 @@
 //! One retained Navi48 firmware owner, entered by the framebuffer boot handoff.
 //! Preparation is read-only; the caller stops CPU writers before entering it.
+use crate::amdgpu_navi48_display as display;
 use crate::{amdgpu, amdgpu_navi48_boot as boot, amdgpu_vram_boot as vram};
+use alloc::vec::Vec;
 use core::ops::Range;
 use narf_capabilities::{Cap, Read};
 use narf_graphics_driver::generic::GenericFb;
@@ -32,6 +34,7 @@ pub enum Status {
 pub struct Diagnostics {
     pub state: boot::State,
     pub report: Option<boot::Report>,
+    pub display: Result<display::State, display::Error>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -40,6 +43,7 @@ pub fn status() -> Status {
             Status::Retained(Diagnostics {
                 state: boot.state(),
                 report: boot.report(),
+                display: boot.display_state(),
             })
         }),
     }
@@ -207,6 +211,32 @@ pub async fn dmub_notification() -> Result<Option<[u8; 64]>, boot::Error> {
         .dmub()?
         .poll_notification()
         .map_err(boot::Error::Dmub)
+}
+
+/// Board routing copied before exclusive controller handoff. No device I/O.
+pub async fn display_paths() -> Result<Vec<crate::amdgpu_dcn_inventory::Path>, boot::Error> {
+    let owner = OWNER.lock().await;
+    let paths = owner
+        .as_ref()
+        .ok_or(boot::Error::Invalid)?
+        .display_paths()
+        .map_err(boot::Error::Display)?;
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(paths.len())
+        .map_err(|_| boot::Error::Allocation)?;
+    result.extend_from_slice(paths);
+    Ok(result)
+}
+/// Serialized DPCD/EDID discovery on board-routed native DisplayPort ports.
+/// Includes per-port failures; fatal transport failures stop the scan.
+pub async fn scan_display() -> Result<Vec<display::Port>, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .scan_display()
+        .await
 }
 
 #[cfg(feature = "kernel-test")]

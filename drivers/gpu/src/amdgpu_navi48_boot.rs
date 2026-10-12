@@ -6,6 +6,7 @@ use crate::{
     amdgpu_psp_boot as sos, amdgpu_psp_ring as psp, amdgpu_sdma_navi48 as sdma,
     amdgpu_smu_navi48 as smu, amdgpu_vram::Pool, amdgpu_vram_boot::Training,
 };
+use crate::{amdgpu_dcn_inventory as inventory, amdgpu_navi48_display as display};
 use alloc::vec::Vec;
 use narf_bus::BusDeviceCap;
 use narf_capabilities::{Cap, Read, Write};
@@ -63,6 +64,7 @@ pub enum Error {
     Sdma(sdma::Error),
     Dmub(dmub::Error),
     Topology(topology::Error),
+    Display(display::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -323,6 +325,7 @@ impl Backend for Hardware {
 #[derive(Debug)]
 pub struct ColdBoot {
     sequence: Sequence<Hardware>,
+    display: Result<display::Probe, display::Error>,
 }
 impl ColdBoot {
     /// # Safety
@@ -352,6 +355,15 @@ impl ColdBoot {
             return Err(Error::Unsupported);
         }
         psp::bank(gpu, ip::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, 0x9a).map_err(Error::Psp)?;
+        // Record a display inventory error without blocking non-display engine
+        // bring-up. This immutable board copy survives the legacy-owner handoff.
+        let display = gpu
+            .vbios
+            .as_ref()
+            .ok_or(inventory::Error::Missing)
+            .and_then(|bios| inventory::display_paths(gpu, bios.bytes()))
+            .map_err(display::Error::Inventory)
+            .and_then(display::Probe::new);
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(gpu.ip_blocks.len())
@@ -382,6 +394,7 @@ impl ColdBoot {
         let dmub =
             unsafe { dmub::Dmub::new(&saved, authority, pool, prepared) }.map_err(Error::Dmub)?;
         Ok(Self {
+            display,
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -411,6 +424,31 @@ impl ColdBoot {
         (self.state() == State::MemoryReady)
             .then(|| self.sequence.backend.report().ok())
             .flatten()
+    }
+    pub fn display_state(&self) -> Result<display::State, display::Error> {
+        self.display
+            .as_ref()
+            .map(display::Probe::state)
+            .map_err(|e| *e)
+    }
+    pub fn display_paths(&self) -> Result<&[inventory::Path], display::Error> {
+        self.display
+            .as_ref()
+            .map(display::Probe::paths)
+            .map_err(|e| *e)
+    }
+    /// Read routed native DisplayPort sinks while retaining the DMUB and any
+    /// incomplete I2C transaction. Cancellation prevents this scanner's reuse.
+    pub async fn scan_display(&mut self) -> Result<Vec<display::Port>, Error> {
+        if self.state() != State::MemoryReady {
+            return Err(Error::Busy);
+        }
+        self.display
+            .as_mut()
+            .map_err(|e| Error::Display(*e))?
+            .scan(&mut self.sequence.backend.dmub)
+            .await
+            .map_err(Error::Display)
     }
     /// MemoryReady proves firmware, power, an owned VMID0 SDMA write/copy
     /// and the DMUB version/capability mailbox handshake.

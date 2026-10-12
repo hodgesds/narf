@@ -267,6 +267,23 @@ inventory functions do not enable any DCN3 timing/plane/link programming.
 DCE-info v4.5 supplies the unchanged reference-clock field. The DCN4 DMUB
 mailbox likewise refuses native AUX/HPD channel indices outside `0..4`.
 
+`amdgpu_navi48_display::Probe` retains board routing and the native DP/eDP
+scan transaction. `scan(&mut Dmub)` reads DPCD, uses advertised extended receiver
+caps at `0x2200` when at least as new, then reads complete E-EDID with segment
+pointer writes, 16-byte transfers and STOP at each block. It validates the
+base header and every checksum, bounds EDID at 32 blocks and DEFER at seven
+attempts with scheduler delays, and terminates I2C MOT after recoverable sink
+errors. `Port` preserves independent board identities and per-port errors;
+a NACK is not reported as an HPD disconnect. Fatal transport errors stop the
+scan. Cancellation leaves `State::Scanning` and forbids reuse until reset.
+HDMI paths are retained but require a separate DDC path.
+
+`ColdBoot` keeps this scanner and any routing-preparation error independently
+of engine startup. `display_paths` and `display_state` expose its inventory
+and diagnostics; `scan_display` requires completed firmware/DMUB startup.
+`amdgpu_navi48_platform` serializes these operations through the retained owner.
+This discovery API does not train a link or program a scanout mode.
+
 `unsafe amdgpu_gmc_navi48::Gmc::new` validates GC12.0.1/MMHUB4.1/NBIO banks
 and the pool's BAR0/GPU mapping. `initialize().await` requires retained
 firmware and trained VRAM with both hubs idle. It creates a flat VMID0 table

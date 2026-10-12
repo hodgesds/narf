@@ -282,6 +282,9 @@ VRAM write/copy/fence verification; and DCN4 DMUB shared state, authenticated
 window validation, startup and version/capability/HPD/AUX mailbox support.
 DCN4 board routing reads ATOM v1.4/v1.5, preserves distinct AUX/HPD/transmitter
 identities and bounds the four channels using DCN4 backend register geometry.
+The retained owner supports native DP/eDP DPCD/extended-capability and complete
+segmented EDID discovery, including bounded DEFER retries, per-port errors and
+cancellation quarantine. HDMI DDC and native link/scanout programming remain open.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
