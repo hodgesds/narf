@@ -11191,6 +11191,24 @@ pub(crate) fn page_fault_si_code(addr: u64) -> i32 {
     if mapped { 2 /* SEGV_ACCERR */ } else { 1 /* SEGV_MAPERR */ }
 }
 
+/// Serial output is line-locked, but a `writeln!` is assembled through several
+/// `fmt::Write` calls.  Two simultaneous user crashes can therefore weave
+/// their register files together byte-for-byte, destroying the evidence we
+/// need to diagnose the first one.  Keep exactly one fatal diagnostic active;
+/// a concurrent fatal still gets its normal signal termination but skips the
+/// best-effort report.  This is fatal-path-only and never participates in page
+/// fault handling or scheduling.
+static FATAL_DIAGNOSTIC_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+struct FatalDiagnosticGuard;
+
+impl Drop for FatalDiagnosticGuard {
+    fn drop(&mut self) {
+        FATAL_DIAGNOSTIC_ACTIVE.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
 pub fn default_sync_signal_delivery(
     ctx: &mut dyn TrapContext,
     vector: u64,
@@ -11220,7 +11238,16 @@ pub fn default_sync_signal_delivery(
             // crash can be symbolized against the process's mmap layout —
             // RIP alone is ambiguous across the many shared libraries a
             // desktop app maps (kwin, Qt, Mesa, glibc/musl, ...).
+            if FATAL_DIAGNOSTIC_ACTIVE
+                .compare_exchange(
+                    false,
+                    true,
+                    core::sync::atomic::Ordering::Acquire,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
             {
+                let _diagnostic_guard = FatalDiagnosticGuard;
                 use core::fmt::Write;
                 let pid = task_to_pid_raw(task).unwrap_or(task);
                 let comm = proc_comm_of(pid).unwrap_or_else(|| alloc::string::String::from("?"));

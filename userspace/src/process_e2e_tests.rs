@@ -4072,7 +4072,34 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     const PARENT: u64 = 0xF0_65;
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
+    crate::fd::__test_reset();
     setup_process_state(PARENT);
+
+    // Seed a live non-stdio descriptor before the real clone3 path.  Chromium
+    // keeps a process-wide ownership bitmap and deliberately crashes if an
+    // `open()` in a CLONE_FILES sibling reuses a descriptor that is still
+    // live.  The older smoke only checked CLONE_VM, so a regression between
+    // flag decoding and fd::share could pass every clone test yet surface as
+    // that Chromium crash.
+    let seeded = crate::fd::with_table(PARENT, |table| {
+        let ops = table.get(0)?.ops.clone();
+        table.set(
+            3,
+            crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags: crate::fd::O_RDONLY,
+            },
+        );
+        Some(())
+    })
+    .flatten();
+    if seeded.is_none() {
+        teardown_process_state();
+        crate::fd::__test_reset();
+        return TestResult::Fail("could not seed parent fd table before clone3");
+    }
 
     // SAFETY: `new_for_user` only requires paging to be enabled; these
     // smokes run after kernel boot has installed the page tables.
@@ -4168,10 +4195,39 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     if !Arc::ptr_eq(&child_as, &parent_as) {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
+        crate::fd::__test_reset();
         return TestResult::Fail("CLONE_VM child does not share parent AS");
     }
 
-    // (3) Thread-group binding: child's visible PID matches parent's.
+    // (3) CLONE_FILES reaches the actual syscall path: the child sees the
+    // parent's open fd 3 and allocating from the child neither reuses that
+    // live number nor creates a private table.  This is the descriptor-table
+    // invariant Chromium's sandbox enforces in OpenProc().
+    let child_sees_parent_fd =
+        crate::fd::with_table(child_task_raw, |table| table.get(3).is_some()).unwrap_or(false);
+    let child_new_fd = crate::fd::with_table(child_task_raw, |table| {
+        let ops = table.get(0)?.ops.clone();
+        table.open(crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: crate::fd::O_RDONLY,
+        })
+    })
+    .flatten();
+    let parent_sees_child_fd = child_new_fd.is_some_and(|fd| {
+        crate::fd::with_table(PARENT, |table| table.get(fd).is_some()).unwrap_or(false)
+    });
+    if !child_sees_parent_fd || child_new_fd != Some(4) || !parent_sees_child_fd {
+        crate::fd::detach(child_task_raw);
+        crate::fd::detach(PARENT);
+        narf_scheduler::__reset_queues_for_test();
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("clone3(CLONE_FILES) did not preserve live fd allocation");
+    }
+
+    // (4) Thread-group binding: child's visible PID matches parent's.
     // The map stores (visible_pid → TaskId). For CLONE_THREAD the
     // visible_pid == parent_pid, so PID→TaskId for parent's PID now
     // resolves to the child's TaskId — which is what we want for
@@ -4181,6 +4237,9 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     // matters is that the child's TaskId is registered and the AS
     // share holds.)
 
+    crate::fd::detach(child_task_raw);
+    crate::fd::detach(PARENT);
+    narf_scheduler::__reset_queues_for_test();
     teardown_process_state();
     *PROC_PARENT_AS.lock() = None;
     TestResult::Pass

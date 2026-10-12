@@ -185,6 +185,24 @@ fn smoke_ppoll_eventfd_empty_returns_zero() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_ppoll_eventfd_empty_returns_zero);
 
+/// A positive `ppoll(2)` timespec must stay a positive deadline. In
+/// particular, KWin commonly requests frame waits shorter than one
+/// millisecond; flooring those to the millisecond `poll(2)` ABI turns the
+/// request into an immediate poll and burns a CPU in the event loop.
+fn smoke_ppoll_preserves_submillisecond_timeout() -> TestResult {
+    if crate::poll::ppoll_timeout_ns(0, 1) != 1 {
+        return TestResult::Fail("ppoll lost a one-nanosecond timeout");
+    }
+    if crate::poll::ppoll_timeout_ns(0, 999_999) != 999_999 {
+        return TestResult::Fail("ppoll truncated a sub-millisecond timeout to zero");
+    }
+    if crate::poll::ppoll_timeout_ns(2, 345_678_901) != 2_345_678_901 {
+        return TestResult::Fail("ppoll did not preserve mixed seconds and nanoseconds");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_ppoll_preserves_submillisecond_timeout);
+
 /// poll: invalid fd gives POLLNVAL in revents, returns 1
 fn smoke_poll_invalid_fd_returns_pollnval() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and

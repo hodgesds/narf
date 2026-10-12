@@ -56,6 +56,16 @@ pub fn do_poll(task_id: u64, fds: &mut [PollFd], timeout_ms: i64) -> usize {
         None // infinite
     };
 
+    do_poll_until(task_id, fds, deadline_ns)
+}
+
+/// Core readiness loop with an already-resolved absolute deadline.
+///
+/// `Some(0)` is the non-blocking sentinel, a non-zero value is an absolute
+/// monotonic deadline, and `None` is an infinite wait. Keeping this separate
+/// from [`do_poll`] lets `ppoll(2)` preserve its `timespec` nanoseconds rather
+/// than truncating them to the millisecond `poll(2)` ABI.
+fn do_poll_until(task_id: u64, fds: &mut [PollFd], deadline_ns: Option<u64>) -> usize {
     loop {
         // --- one pass: query every fd ---
         // Snapshot each open fd's `Arc<dyn FileOps>` under the fd-table lock,
@@ -245,22 +255,36 @@ use crate::syscall::{SyscallReturn, TrapContext};
 /// Linux ref: `fs/select.c`:do_sys_poll (GPL-2.0-or-later, kernel.org).
 pub fn sys_poll(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    poll_common(
-        ctx,
-        args.arg0 as *mut u8,
-        args.arg1 as usize,
-        args.arg2 as i64,
-    );
+    let timeout_ms = args.arg2 as i64;
+    let timeout_ns = if timeout_ms < 0 {
+        None
+    } else {
+        Some((timeout_ms as u64).saturating_mul(1_000_000))
+    };
+    poll_common(ctx, args.arg0 as *mut u8, args.arg1 as usize, timeout_ns);
+}
+
+/// Convert a validated `ppoll(2)` timespec to its exact relative timeout.
+///
+/// The wire ABI supplies nanoseconds.  It is tempting to reuse the
+/// millisecond `poll(2)` timeout by flooring this value, but a positive
+/// sub-millisecond duration would then become a non-blocking poll and can
+/// make compositor frame-deadline loops spin.
+#[inline]
+pub(crate) fn ppoll_timeout_ns(seconds: u64, nanoseconds: u64) -> u64 {
+    seconds
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nanoseconds)
 }
 
 /// `ppoll(fds, nfds, timespec*, sigmask, sigsetsize)` — poll with a
-/// `timespec` timeout (NULL = block indefinitely) and an ignored
-/// sigmask. Converts the timespec to a millisecond timeout and shares
-/// the poll core with `sys_poll`.
+/// `timespec` timeout (NULL = block indefinitely) and an ignored sigmask.
+/// Unlike `poll(2)`, its timeout retains nanosecond precision through the
+/// parked-poll deadline.
 pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let (timeout, _seconds, _nanoseconds): (i64, u64, u64) = if args.arg2 == 0 {
-        (-1, 0, 0)
+    let (timeout_ns, _seconds, _nanoseconds): (Option<u64>, u64, u64) = if args.arg2 == 0 {
+        (None, 0, 0)
     } else {
         // SAFETY: `arg2` is a user `timespec*` in-pointer; copy_from_user_vec
         // range-validates the 16-byte read.
@@ -275,11 +299,7 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
                     ctx.set_return(to_ret(EINVAL));
                     return;
                 }
-                (
-                    secs.saturating_mul(1000).saturating_add(nsec / 1_000_000) as i64,
-                    secs,
-                    nsec,
-                )
+                (Some(ppoll_timeout_ns(secs, nsec)), secs, nsec)
             }
             Err(_) => {
                 ctx.set_return(to_ret(EFAULT));
@@ -308,7 +328,7 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
         }
     }
 
-    poll_common(ctx, args.arg0 as *mut u8, args.arg1 as usize, timeout);
+    poll_common(ctx, args.arg0 as *mut u8, args.arg1 as usize, timeout_ns);
 
     if let Some(old) = old_mask {
         crate::handlers::set_signal_mask_for_task(current_task_id(), old);
@@ -846,7 +866,7 @@ pub(crate) fn poll_wait_kernel(
     KernelPollWait::Parked
 }
 
-fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i64) {
+fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout_ns: Option<u64>) {
     use core::sync::atomic::Ordering;
     // `fs/select.c::do_sys_poll` answers an over-large nfds with -EINVAL and a
     // faulting `struct pollfd[]` with -EFAULT. The old `-1` sentinel reached
@@ -934,15 +954,22 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     // fd is caught by `poll_scan`'s POLLNVAL on the first pass below (immediate
     // return, no park). Only a non-blocking poll or
     // one with no task context (early boot) still takes the one-shot busy path.
-    let can_park = timeout != 0 && uctx_opt.is_some();
+    let can_park = timeout_ns != Some(0) && uctx_opt.is_some();
     if !can_park {
         #[cfg(feature = "syscall-trace")]
-        if timeout != 0 && uctx_opt.is_none() {
+        if timeout_ns != Some(0) && uctx_opt.is_none() {
             crate::syscall::syscall_trace_account_park(
                 crate::syscall::SyscallTraceParkEvent::NoContext,
             );
         }
-        let n = do_poll(task, &mut fds, timeout);
+        let deadline_ns = timeout_ns.map(|duration| {
+            if duration == 0 {
+                0
+            } else {
+                narf_scheduler::narf_time::monotonic_ns().saturating_add(duration)
+            }
+        });
+        let n = do_poll_until(task, &mut fds, deadline_ns);
         // SAFETY: same pointer/length as the parse step; user AS still active.
         unsafe { write_pollfds(ptr, &fds) };
         ctx.set_return(SyscallReturn::ok(n as u64));
@@ -978,20 +1005,19 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     let deadline_ns: Option<u64> = {
         // SAFETY: as above.
         let uctx = unsafe { &*uctx_ptr };
-        if timeout > 0 {
+        if let Some(duration) = timeout_ns {
             let persisted = uctx.blocking_deadline_ns.load(Ordering::Acquire);
             let d = if persisted != 0 {
                 persisted
             } else {
-                let d = narf_scheduler::narf_time::monotonic_ns()
-                    .saturating_add((timeout as u64) * 1_000_000);
+                let d = narf_scheduler::narf_time::monotonic_ns().saturating_add(duration);
                 uctx.blocking_deadline_ns.store(d, Ordering::Release);
                 d
             };
             uctx.sleep_deadline_ns.store(d, Ordering::Release);
             Some(d)
         } else {
-            // Infinite (timeout < 0).
+            // Infinite wait.
             uctx.sleep_deadline_ns.store(u64::MAX, Ordering::Release);
             None
         }
