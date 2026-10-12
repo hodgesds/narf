@@ -153,6 +153,7 @@ impl Io for Fake {
                 || (0x162a0 * 4..=0x162a3 * 4).contains(&at)
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || at == BASE + 0x4a * 4 // native FRL character-clock root
+                || (BASE + 0x1f0d * 4..=BASE + 0x1f10 * 4).contains(&at)
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
                 || (MPC_BASE + 0x8d3 * 4..=MPC_BASE + 0x8f0 * 4).contains(&at)
                 || [0x95b, 0x95c, 0x965, 0x966].iter().any(|&r| at == MPC_BASE + r * 4)
@@ -161,6 +162,7 @@ impl Io for Fake {
                         0x2094, 0x2095, 0x209b, 0x209e, 0x20a5, 0x20a6, 0x20a9, 0x20aa, 0x20ab,
                         0x20ac, 0x20ad, 0x20ae, 0x20af, 0x20b0, 0x20bc, 0x211e, 0x2122, 0x2123,
                         0x2125, 0x212e, 0x20bb, 0x20bd, 0x2121, 0x2134, 0x212d, 0x2133, 0x2129,
+                        0x2093, 0x211f, 0x2120, 0x2124, 0x2162, 0x2163, 0x2164, 0x2165, 0x2146,
                     ]
                     .iter()
                     .any(|r| at == BASE + (r + p * 0x124) * 4)
@@ -329,6 +331,7 @@ fn engine() -> Engine<Fake> {
             dp_sst_disabled: None,
             dp_phy_ready: None,
             dp_link_trained: None,
+            dp_frontend_ready: None,
             hpo_link_retired: None,
             hpo_dp_disabled: None,
             hdmi_tmds_retired: None,

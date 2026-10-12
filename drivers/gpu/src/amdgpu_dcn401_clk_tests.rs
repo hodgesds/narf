@@ -592,18 +592,22 @@ fn dcn401_pipe_references_require_current_matching_idle_authority() -> TestResul
             Err(Error::Busy),
             "historical clocks escaped"
         );
+        assert_eq!(c.retained_pipe_clocks(g.regs), Err(Error::Busy));
     }
     c.0.status.state = State::Applied;
     let mut other = g.regs;
     other.phys = narf_memory::PhysAddr::new(g.regs.phys.raw() + 4096);
     assert_eq!(c.pipe_clocks(other), Err(Error::Invalid));
+    assert_eq!(c.retained_pipe_clocks(other), Err(Error::Invalid));
     assert_eq!(c.pipe_clocks(g.regs), Ok(applied));
     let (at, mask) = c.0.layout.idle_registers()[0];
     words[at as usize / 4] = mask;
     assert_eq!(c.pipe_clocks(g.regs), Err(Error::Busy));
+    assert_eq!(c.retained_pipe_clocks(g.regs), Ok(applied));
     words[at as usize / 4] = 0;
     cap.revoke();
     assert_eq!(c.pipe_clocks(g.regs), Err(Error::Revoked));
+    assert_eq!(c.retained_pipe_clocks(g.regs), Err(Error::Revoked));
     TestResult::Pass
 }
 kernel_test_in!(

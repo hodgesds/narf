@@ -378,6 +378,10 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     fn current_pipe(&mut self, pipe: u8, global: clocks::Applied) -> Result<Applied, Error> {
+        self.idle()?;
+        self.retained_pipe(pipe, global)
+    }
+    fn retained_pipe(&mut self, pipe: u8, global: clocks::Applied) -> Result<Applied, Error> {
         if !matches!(self.status.state, State::Ready | State::Applied) {
             return Err(Error::Busy);
         }
@@ -391,7 +395,6 @@ impl<I: Io> Engine<I> {
         if plan.global != global || plan.request.pixel == PixelClock::Disabled {
             return Err(Error::Invalid);
         }
-        self.idle()?;
         if let Err(e) = self.verify_pipe(plan) {
             self.status.state = State::Failed(e);
             return Err(e);
@@ -579,6 +582,20 @@ impl Dccg {
         }
         let global = clocks.pipe_clocks(regs).map_err(Error::Clocks)?;
         self.0.current_pipe(pipe, global)
+    }
+    /// Read-only clock validation while the matching display owner retains a
+    /// live PHY/frontend. All programming paths still require idle consumers.
+    pub(crate) fn retained_timing_clock(
+        &mut self,
+        regs: MmioRegion,
+        clocks: &mut clocks::ClockManager,
+        pipe: u8,
+    ) -> Result<Applied, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        let global = clocks.retained_pipe_clocks(regs).map_err(Error::Clocks)?;
+        self.0.retained_pipe(pipe, global)
     }
     /// Program a retired pipe against current acknowledged global clocks.
     /// Every consumer must be idle; partial failure/cancellation blocks replay.

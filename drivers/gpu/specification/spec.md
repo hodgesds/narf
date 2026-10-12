@@ -812,6 +812,48 @@ preserving historical training records without releasing memory. Failure enters
 owners and block replay until independent recovery. These are software-model
 proofs, with physical link operation still requiring silicon validation.
 
+`unsafe ColdBoot::prepare_display_dp_frontend(port, DpFrontendRequest { stream,
+pipe }).await`, its serialized platform wrapper and `Otg::prepare_dp_frontend`
+prepare a native legacy SST frontend for the matching trained link and staged
+full-range RGB OPP black pattern. Frontend, OTG and board PHY indices are
+independent; none may be inferred from another. Callers fulfil the training
+operation's topology, external-writer exclusion and resource-retention contract,
+and retain exclusive timing/clock/OPP ownership. Timing and video remain stopped.
+
+Preflight requires the matching `DpLinkTrained`, current applied clock owners,
+live divider/reference readback, matching prepared DP timing/OPP depth and no
+inherited packet/audio/metadata, format-buffer or reset work. Read-only retained
+clock references may validate a live PHY; clock programming and ordinary idle
+references keep their existing all-consumers-stopped checks. A payload ceiling
+rejects impossible RGB modes but is not DML admission or a watermark proof.
+Native pixel packing selects 1/2/4/8 pixels per cycle from pixel rate and DPREF.
+
+`PreparingDpFrontend(stream)` is set before the first AUX wait. Fresh sink
+configuration, D0 and per-lane/alignment checks precede writes and completion.
+Setup routes the frontend symbol clock to the actual PHY, selects OTG/stereo
+sources, programs uncompressed 8/10/12-bpc full-range RGB and native MSA totals,
+starts, sync widths/polarities and active sizes, and disables SDP splitting.
+It connects only this frontend to the trained backend, enables the native
+frontend, waits for DISPCLK/SYMCLK acknowledgement, programs the independent
+contiguous stream mapper, sets pixel packing/read-start level and acknowledges
+both resync FIFO reset transitions before FIFO enable. Source, routes, stopped
+timing and unrelated consumers are rechecked around transitions. No steering
+reset release, M/N generation, video enable, timing start or scanout occurs.
+
+Success enters `DpFrontendReady(stream)` and records historical
+`Status::dp_frontend_ready: Option<DpFrontendReady>` containing the request,
+trained-link snapshot, staged blank timing/depth and pixel packing. This state
+blocks trained-link shutdown and all general owner reuse.
+`unsafe ColdBoot::stop_display_dp_frontend(port).await` and its wrapper accept
+only the matching blank frontend. Native FIFO/frontend/clock disable precedes
+independent clock-off acknowledgement, backend detachment and symbol-clock
+route parking. Fresh restored streamless-link evidence returns the owner to
+`DpLinkTrained`, permitting its existing sink-D3/PHY shutdown. Historical
+frontend records remain, without granting memory reuse. Failure enters `Failed`;
+cancellation retains `PreparingDpFrontend` or `StoppingDpFrontend`. Both prevent
+replay and retain resources until independent recovery. Silicon validation and
+native video/scanout startup remain separate work.
+
 `unsafe ColdBoot::disable_display_frl(port).await`, its serialized platform
 wrapper and `Otg::disable_frl` disable a validated direct external HDMI FRL PHY
 after frontend and digital-link retirement. The caller fulfils the same sink,

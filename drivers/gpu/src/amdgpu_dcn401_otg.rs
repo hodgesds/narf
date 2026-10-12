@@ -23,7 +23,10 @@ mod link;
 pub use link::DpSstDisabled;
 #[path = "amdgpu_dcn401_dp_phy.rs"]
 mod dp_phy;
-pub use dp_phy::{DpDriveSettings, DpLinkTrained, DpPhyReady, DpPhySettings, DpTrainingError};
+pub use dp_phy::{
+    DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkTrained, DpPhyReady, DpPhySettings,
+    DpTrainingError,
+};
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
 pub use hpo_link::{HpoDpDisabled, HpoLinkRetired};
@@ -101,6 +104,9 @@ pub enum State {
     TrainingDp(u8),
     DpLinkTrained(u8),
     StoppingDpLink(u8),
+    PreparingDpFrontend(u8),
+    DpFrontendReady(u8),
+    StoppingDpFrontend(u8),
     RetiringHpoLink(u8),
     HpoLinkRetired,
     DisablingHpoDp(u8),
@@ -214,6 +220,9 @@ pub struct Status {
     /// Historical source/sink training evidence; current only in DpLinkTrained.
     /// Video, timing and scanout remain stopped.
     pub dp_link_trained: Option<DpLinkTrained>,
+    /// Historical blank frontend setup; current only in DpFrontendReady.
+    /// Timing, video and scanout remain stopped.
+    pub dp_frontend_ready: Option<DpFrontendReady>,
     /// Historical HPO digital-link stop only; PHY and its root clock remain owned.
     pub hpo_link_retired: Option<HpoLinkRetired>,
     /// Historical lane-disable/TX-clock/root-route evidence, not analog power gating.
@@ -584,6 +593,7 @@ impl Otg {
                 dp_sst_disabled: None,
                 dp_phy_ready: None,
                 dp_link_trained: None,
+                dp_frontend_ready: None,
                 hpo_link_retired: None,
                 hpo_dp_disabled: None,
                 hdmi_tmds_retired: None,

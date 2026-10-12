@@ -20,7 +20,7 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    fn verify_blank(
+    pub(in crate::amdgpu_dcn401_otg) fn verify_blank(
         &mut self,
         blank: BlankApplied,
         plan: Plan,

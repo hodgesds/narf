@@ -419,6 +419,13 @@ Model tests cover routing, patterns, rates, lane counts, adjustment/retry limits
 every await cancellation, lost writes and late changes. No native scanout or
 silicon validation is claimed. Automatic rate/lane fallback, LTTPRs, MST/FEC,
 fixed-drive retimers and board-specific SSC control remain open.
+Native blank legacy DP frontend setup now uses independent OTG/frontend/PHY
+routes, RGB MSA attributes at 8/10/12 bpc, DPREF-derived pixel packing and native
+frontend/FIFO reset acknowledgements. It checks retained live clock references,
+source/OPP state and fresh sink lock before reporting readiness. Matching
+frontend shutdown waits for clocks off before detaching routes and returning
+to the trained link; cancellation/failure retain ownership and block replay.
+Video enable, M/N generation, running timing and surface scanout are still open.
 eDP, remaining sink/MST/audio teardown and USB-C/ACPI PHY interlocks still need
 their sequences. Remaining PHY/link and plane programming, surface scanout
 enable, active-stream transitions, bandwidth/watermarks and complete native

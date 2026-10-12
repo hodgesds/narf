@@ -484,6 +484,34 @@ pub async unsafe fn stop_display_dp_link(
     // SAFETY: serialized retained owner; caller fulfils documented obligations.
     unsafe { boot.stop_display_dp_link(port).await }
 }
+/// Prepare a native legacy DP frontend for matching staged RGB black timing.
+/// # Safety
+/// Fulfil `Otg::prepare_dp_frontend` direct-port, exclusive writer/clock/timing
+/// and resource-retention obligations. Video and scanout remain stopped.
+pub async unsafe fn prepare_display_dp_frontend(
+    port: usize,
+    request: crate::amdgpu_dcn401_otg::DpFrontendRequest,
+) -> Result<crate::amdgpu_dcn401_otg::DpFrontendReady, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller fulfils documented obligations.
+    unsafe { boot.prepare_display_dp_frontend(port, request).await }
+}
+/// Stop the matching blank frontend while retaining its trained DP PHY.
+/// # Safety
+/// Fulfil `Otg::stop_dp_frontend` writer/resource and stopped-video obligations.
+pub async unsafe fn stop_display_dp_frontend(
+    port: usize,
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller fulfils documented obligations.
+    unsafe { boot.stop_display_dp_frontend(port).await }
+}
 /// Disable the direct FRL PHY after frontend and digital-link retirement.
 /// # Safety
 /// Fulfil `Otg::disable_frl` direct-port, sink/SCDC/retimer, producer and

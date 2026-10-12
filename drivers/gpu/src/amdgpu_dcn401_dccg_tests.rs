@@ -190,6 +190,45 @@ fn dcn401_dccg_timing_references_check_live_dividers_and_state() -> TestResult {
     assert_eq!(e.current_pipe(0, clocks()), Err(Error::Invalid));
     TestResult::Pass
 }
+
+fn dcn401_dccg_retained_references_validate_live_clocks_without_granting_writes() -> TestResult {
+    for (changed, bit) in [
+        (0x80, 0x10),
+        (0x81, 1),
+        (0x82, 1),
+        (0x68, 1),
+        (0x6f, 2),
+        (0xa8, 1),
+        (0x99, 1),
+    ] {
+        let mut e = engine();
+        let a = run(e.prepare(request(0), clocks())).unwrap();
+        // A trained backend blocks all existing programming and ordinary
+        // idle-only references, but permits a read-only retained reference.
+        e.io.regs.insert(e.layout.idle[2].0, 1);
+        let writes = e.io.writes.len();
+        assert_eq!(e.current_pipe(0, clocks()), Err(Error::Busy));
+        assert_eq!(run(e.prepare(request(0), clocks())), Err(Error::Busy));
+        assert_eq!(e.retained_pipe(0, clocks()), Ok(a));
+        assert_eq!(e.io.writes.len(), writes);
+        *e.io.regs.entry(BASE + changed * 4).or_default() ^= bit;
+        assert!(matches!(
+            e.retained_pipe(0, clocks()),
+            Err(Error::Readback(_))
+        ));
+        assert!(matches!(e.status.state, State::Failed(_)));
+        assert_eq!(e.retained_pipe(0, clocks()), Err(Error::Busy));
+    }
+    let mut e = engine();
+    run(e.prepare(request(0), clocks())).unwrap();
+    e.authority.revoke();
+    assert_eq!(e.retained_pipe(0, clocks()), Err(Error::Revoked));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_dccg_retained_references_validate_live_clocks_without_granting_writes
+);
 kernel_test_in!(
     "drivers/gpu/dcn401-dccg",
     dcn401_dccg_timing_references_check_live_dividers_and_state

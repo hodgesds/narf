@@ -9,7 +9,9 @@ use core::future::Future;
 pub use dmub::DpPhySettings;
 #[path = "amdgpu_dcn401_dp_training.rs"]
 pub(super) mod training;
-pub use training::{DpDriveSettings, DpLinkTrained, DpTrainingError};
+pub use training::{
+    DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkTrained, DpTrainingError,
+};
 
 const LANES_MASK: u32 = 0x3e3e3e3e;
 const LANES_OFF: u32 = 0x02020202;
@@ -78,6 +80,9 @@ fn active_lanes(value: u32, count: u8) -> Option<u8> {
 }
 impl<I: Io> Engine<I> {
     fn dp_phy_consumers(&mut self, phy: u8) -> Result<(), Error> {
+        self.dp_phy_consumers_owned(phy, None)
+    }
+    fn dp_phy_consumers_owned(&mut self, phy: u8, frontend: Option<u8>) -> Result<(), Error> {
         let l = self.layout;
         let at = |r| DpStream::Dio(phy).at(l, r);
         // All outputs must be stopped, except the selected backend/PHY whose
@@ -90,6 +95,11 @@ impl<I: Io> Engine<I> {
                 phy_at(l, phy, 0x2931),
             ]
             .contains(&reg)
+                || frontend.is_some_and(|f| {
+                    [0x2094, 0x2095, 0x209b]
+                        .iter()
+                        .any(|&r| reg == DpStream::Dio(f).at(l, r))
+                })
             {
                 continue;
             }
@@ -110,9 +120,11 @@ impl<I: Io> Engine<I> {
         let bank1 = l.link_clock - 0x66 * 4;
         let sources = self.read(bank1 + 0x68 * 4)?;
         for p in 0..4 {
-            self.dp_encoder_quiet(DpStream::Dio(p))?;
+            if frontend != Some(p) {
+                self.dp_encoder_quiet(DpStream::Dio(p))?;
+            }
             self.dp_encoder_quiet(DpStream::Hpo(p))?;
-            if self.read(l.dio_clock + u64::from(p) * 4)? & 0x10 != 0
+            if (frontend != Some(p) && self.read(l.dio_clock + u64::from(p) * 4)? & 0x10 != 0)
                 || self.read(l.otg(p, LOCK))? & 0x101 != 0
                 || self.read(l.otg(p, CLOCK))? & 0x10 != 0
             {
@@ -145,7 +157,14 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     fn dp_phy_configuration(&mut self, plan: DpPhyReady) -> Result<(), Error> {
-        self.dp_phy_consumers(plan.path.transmitter)?;
+        self.dp_phy_configuration_owned(plan, None)
+    }
+    fn dp_phy_configuration_owned(
+        &mut self,
+        plan: DpPhyReady,
+        frontend: Option<u8>,
+    ) -> Result<(), Error> {
+        self.dp_phy_consumers_owned(plan.path.transmitter, frontend)?;
         for ((at, mask), expected) in plan.registers(self.layout).into_iter().zip(plan.controls) {
             if self.read(at)? & mask != expected {
                 return Err(Error::Readback(at));

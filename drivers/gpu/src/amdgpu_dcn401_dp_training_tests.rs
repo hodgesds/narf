@@ -3,6 +3,8 @@ use super::*;
 use crate::dp_link_training::TrainingPattern;
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU32, AtomicU64};
+#[path = "amdgpu_dcn401_dp_frontend_tests.rs"]
+mod frontend;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Event {

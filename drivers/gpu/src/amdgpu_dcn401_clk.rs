@@ -497,13 +497,20 @@ impl ClockManager {
     /// Only the matching retained DCCG owner may consume these references.
     /// Historical success after a failed/in-flight transition is insufficient.
     pub(crate) fn pipe_clocks(&mut self, regs: MmioRegion) -> Result<Applied, Error> {
+        let applied = self.retained_pipe_clocks(regs)?;
+        self.0.idle()?;
+        Ok(applied)
+    }
+    /// Read-only reference for an exclusive display owner with live consumers.
+    /// Does not grant clock programming or replace that owner's consumer checks.
+    pub(crate) fn retained_pipe_clocks(&mut self, regs: MmioRegion) -> Result<Applied, Error> {
         if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
             return Err(Error::Invalid);
         }
         if self.0.status.state != State::Applied {
             return Err(Error::Busy);
         }
-        self.0.idle()?;
+        self.0.access(|_| Ok(()))?;
         self.0.status.applied.ok_or(Error::Invalid)
     }
     /// # Safety

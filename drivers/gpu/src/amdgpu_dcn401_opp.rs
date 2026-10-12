@@ -98,7 +98,11 @@ impl Layout {
     }
 }
 impl<I: Io> Engine<I> {
-    fn blank_timing(&self, request: BlankRequest, clock: dccg::Applied) -> Result<Applied, Error> {
+    pub(super) fn blank_timing(
+        &self,
+        request: BlankRequest,
+        clock: dccg::Applied,
+    ) -> Result<Applied, Error> {
         let timing = self
             .status
             .pipes

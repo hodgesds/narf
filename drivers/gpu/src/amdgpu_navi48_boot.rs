@@ -1063,6 +1063,46 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Prepare a blank frontend for the retained trained DP link and staged OPP.
+    /// # Safety
+    /// Fulfil `Otg::prepare_dp_frontend` direct-port, clock/timing ownership and
+    /// writer/resource obligations. This does not enable video or scanout.
+    pub async unsafe fn prepare_display_dp_frontend(
+        &mut self,
+        port: usize,
+        request: otg::DpFrontendRequest,
+    ) -> Result<otg::DpFrontendReady, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained owners and board path; caller excludes
+        // external producers/writers and keeps all resources alive.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_dp_frontend(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    &mut self.sequence.backend.dmub,
+                    path,
+                    request,
+                )
+                .await
+        }
+    }
+    /// Stop the matching blank frontend and return to the trained DP link.
+    /// # Safety
+    /// Fulfil `Otg::stop_dp_frontend` writer/resource and stopped-video obligations.
+    pub async unsafe fn stop_display_dp_frontend(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained owner; caller fulfils documented obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_dp_frontend(path)
+                .await
+        }
+    }
     /// Request sink D3 and stop this owner's trained, streamless legacy DP PHY.
     /// # Safety
     /// Fulfil `Otg::stop_dp_link` direct-port and writer/resource obligations.
