@@ -160,6 +160,7 @@ pub mod amdgpu_dcn;
 pub mod amdgpu_dcn30_clk;
 pub mod amdgpu_dcn401_clk;
 pub mod amdgpu_dcn401_dccg;
+pub mod amdgpu_dcn401_dml;
 pub mod amdgpu_dcn401_otg;
 pub mod amdgpu_dcn_clk;
 pub mod amdgpu_dcn_dccg;

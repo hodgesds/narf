@@ -370,6 +370,15 @@ timeouts, cancellation, stale owners and lost writes retain every allocation
 and quarantine the owner. All four pipes use native DCN4 request fields,
 8-KiB chunks, no MALL, and disabled fetch after setup. This establishes storage
 and request geometry; DLG/TTU/watermarks and visible scanout are still pending.
+Native single-pipe scanout admission ports Linux DML21's DCN4 mode-support
+and mode-programming path to fixed point for the implemented shape (one DP SST
+timing, one full-frame linear 32-bpp surface, 320-KiB DET, UCLK switching
+disabled, Linux's stutter blank reservation kept). It derives DISPCLK/DPPCLK
+minimums, global sync, HUBP DLG/TTU values, watermarks and arbiter values, or
+names the failing check. A host harness builds Linux DML21 and verifies 126
+shared vectors, which kernel tests also check; three deliberate divergences
+reject modes Linux would program beyond hardware limits. Plans are not yet
+bound to live owners or programmed, and board inputs are not yet read from PMFW.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

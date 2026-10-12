@@ -686,6 +686,49 @@ watermark calculation/admission, MPC route connection, visible framebuffer
 activation, live flips and physical RX 9070 XT validation remain open. Neither
 preparation API starts fetch or publishes an active framebuffer.
 
+`amdgpu_dcn401_dml::admit(&Soc, &Mode) -> Result<Plan, Error>` is the native
+single-pipe scanout admission calculation: Linux DML21's DCN4 mode-support and
+mode-programming path, evaluated in fixed point with no hardware access. It
+admits only the shape the native path implements: one progressive DP SST
+timing and one unscaled, unrotated, full-frame linear 32-bpp surface (pitch a
+multiple of 64 pixels) on one pipe with the staged 320-KiB DET. GPUVM/HostVM,
+DCC, MALL/SubVP, cursor, tdlut, dynamic metadata, writeback, ODM/MPC combine,
+DSC and immediate flip are excluded rather than approximated.
+
+`Soc` carries the board state DML depends on: the pinned UCLK, FCLK/DCFCLK DPM
+ranges, minimum SOCCLK, DISPCLK/DPPCLK maxima, the UMC channel count, DENTIST
+VCO and DCHUB reference clock. Constants come from `dml2_socbb_dcn401`, the
+DCN4 variant-A QoS table and `dml2_dcn401_max_ip_caps`. The calculation applies
+DCN4's min-clock-table derivation for the single UCLK level, checks bandwidth
+against the maximum clocks and latency/programming at the derived state, and
+reproduces DPMM's DISPCLK/DPPREFCLK/DPPCLK rounding. UCLK switching is
+disabled by native policy, so PMO pstate strategies are never searched; the
+UCLK watermark is still the real blackout-plus-urgent value. PMO's stutter
+phase is kept: 54 us of blank is reserved for self-refresh when the nominal
+blank is at least three times that and the mode still passes.
+
+A `Plan` records its inputs, minimum clocks (DML's DCFCLK/FCLK/UCLK state is
+below the pinned floors), `GlobalSync`, the nonzero HUBP DLG/TTU fields, the
+DCHUBBUB watermark set Linux programs into sets A and B, arbiter values, DET
+size and stutter reservation. `Error` names the first failing check: invalid
+inputs, unmodeled shape, unavailable clock state, pixel clock, buffers,
+outstanding-request/ROB latency, prefetch, urgent latency hiding, bandwidth,
+GDDR6 temperature-read blackout, or a DLG/TTU value outside the register width
+DML asserts. The result is deterministic; a plan is not yet bound to clock,
+memory or timing owners and no API programs it.
+
+The port deliberately diverges from Linux where Linux would program something
+the hardware cannot honour: it enforces the Tpre > max(Turg, Ttrip) + Tex
+prefetch check Linux compiles out (`#if 0`), which matters precisely because
+the VM/row stages sit at their quarter-line minimum here; rejects a DISPCLK
+needing a DFS divider below 2.0; and rejects register-range overflows DML only
+asserts. `tests/dcn401_dml21/check.sh` builds Linux DML21 on the host (stock and
+with that check enabled) and verifies every line of `tests/dcn401_dml21/
+vectors.txt`, which the kernel tests also consume. Plans match exactly except
+for +-1 truncation in deep-sleep DCFCLK and the urgent-bandwidth fractions.
+DPPREFCLK is the DFS output mode programming uses; Linux's informative copy
+can read 1 kHz lower.
+
 `unsafe Otg::blank_dp_stream(DpStream::{Dio,Hpo}(instance)).await` blanks one
 of the four native legacy or four HPO DisplayPort stream encoders. Stream
 instances are independent of OTG/transmitter routing; this operation never
