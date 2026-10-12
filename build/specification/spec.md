@@ -106,8 +106,10 @@ and CI compiler-cache integration.
   interoperability postflight; the default remains the full two-phase gate.
 - Successful kernel-test and boot-smoke QEMU phases keep serial output
   captured and print concise summaries. A failure or timeout emits a bounded
-  64-KiB diagnostic tail. Child timeouts use polling rather than process-wide
-  signal handlers, so sandboxed runners remain supported.
+  64-KiB diagnostic tail. Abnormal emulator termination is reported with the
+  platform exit-status description (including the Unix signal when present),
+  not only the optional numeric exit code. Child timeouts use polling rather
+  than process-wide signal handlers, so sandboxed runners remain supported.
 - `cargo xtask boot-smoke --arch=<arch>` accepts success only when the guest
   emits its clean-exit marker and QEMU then exits naturally with status zero
   through ACPI S5 on x86_64 or PSCI `SYSTEM_OFF` on aarch64. The x86

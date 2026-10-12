@@ -1,18 +1,17 @@
 name: "Set up newer QEMU"
 description: >
   Build (and cache) a qemu-system-x86_64 newer than Ubuntu's, then prepend
-  it to PATH. Ubuntu 24.04 ships QEMU 8.2, which has an MTTCG re-entrant-BQL
-  bug (`qemu_mutex_lock_iothread_impl: assertion failed`) that aborts under
-  NARF's virtio-net + user-mode-SLIRP traffic. It is fixed in QEMU >= 9.0
-  (the BQL rework); this action provides a version past it so the guest can
-  run under real MTTCG (thread=multi). xtask resolves `qemu-system-x86_64`
-  via PATH, so no xtask change is needed.
+  it to PATH. Ubuntu 24.04's QEMU 8.2 has an MTTCG re-entrant-BQL abort, and
+  QEMU 9.2 can SIGSEGV when an outstanding NVMe AER is cancelled by a
+  controller reset. QEMU 10.2 clears both failures. This action supplies that
+  version so the guest can run under real MTTCG (thread=multi). xtask resolves
+  `qemu-system-x86_64` via PATH, so no xtask change is needed.
 
 inputs:
   version:
-    description: "QEMU release to build (must be >= 9.0 to clear the BQL bug)"
+    description: "QEMU release to build (must be >= 10.2 to clear the CI crashes)"
     required: false
-    default: "9.2.0"
+    default: "10.2.3"
 
 runs:
   using: "composite"

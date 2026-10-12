@@ -3676,8 +3676,8 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             emit_serial_tail(&serial);
             bail!(
                 "xtask test: kernel-test suite reported failures — QEMU exited \
-                 {:?} (all-pass is {:?} on {}). See the `── summary` / `── failing \
-                 tests ──` lines above.",
+                 with {status} (status code {:?}; all-pass is {:?} on {}). See the \
+                 `── summary` / `── failing tests ──` lines above.",
                 status.code(),
                 expected,
                 args.arch.triple(),
