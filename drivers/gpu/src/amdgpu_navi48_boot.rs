@@ -580,8 +580,8 @@ impl ColdBoot {
             .then(|| self.sequence.backend.report().ok())
             .flatten()
     }
-    /// Bounded native interrupt-vector draining; CPU MSI delivery is not yet
-    /// enabled by this bootstrap. The caller must service `Batch::pending`.
+    /// Bounded native interrupt-vector draining before service handoff (MSI is
+    /// still disabled). Afterwards use the service's diagnostic history API.
     pub fn poll_interrupts(&mut self) -> Result<ih::Batch, Error> {
         if self.state() != State::MemoryReady {
             return Err(Error::Busy);
@@ -614,6 +614,37 @@ impl ColdBoot {
             self.sequence.state = State::Failed(Stage::InterruptRings, error);
             error
         })
+    }
+    pub fn queue_state(&self) -> Option<queues::State> {
+        self.sequence
+            .backend
+            .queues
+            .as_ref()
+            .map(queues::Queues::state)
+    }
+    pub fn queue_interrupts(&self) -> Option<Result<queues::InterruptProof, queues::Error>> {
+        self.sequence
+            .backend
+            .queues
+            .as_ref()
+            .and_then(queues::Queues::interrupt_result)
+    }
+    /// # Safety
+    /// Run from an executor task after service handoff, with all kernel queues,
+    /// test pages and reset/PM still exclusively owned. Masked CPU IRQs cause
+    /// the MSI proof to fail before submission.
+    pub(crate) async unsafe fn prove_queue_interrupts(
+        &mut self,
+    ) -> Result<queues::InterruptProof, queues::Error> {
+        if self.state() != State::MemoryReady || self.sequence.backend.ih.is_some() {
+            return Err(queues::Error::Busy);
+        }
+        let hardware = &mut self.sequence.backend;
+        let queues = hardware.queues.as_mut().ok_or(queues::Error::Invalid)?;
+        let gmc = hardware.gmc.as_mut().ok_or(queues::Error::Invalid)?;
+        // SAFETY: matching retained owners and independent interrupt service;
+        // the platform serializes all other accesses while this is pending.
+        unsafe { queues.prove_interrupts(gmc).await }
     }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display

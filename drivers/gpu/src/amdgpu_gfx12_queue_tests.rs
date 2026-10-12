@@ -15,6 +15,9 @@ struct Fake {
     dirty: bool,
     mapped: Arc<AtomicU32>,
     progress: Arc<AtomicU32>,
+    eop: Arc<[AtomicU32; 3]>,
+    emit_eop: bool,
+    emit_cpu: bool,
     bells: Vec<u32>,
     complete: bool,
     corrupt: bool,
@@ -24,7 +27,7 @@ struct Fake {
     regs: BTreeMap<u64, u32>,
 }
 impl Fake {
-    fn execute(&mut self, pipe: usize) {
+    fn execute(&mut self, pipe: usize, tail: u32) {
         assert!(!self.dirty);
         assert_eq!(self.mapped.load(Ordering::SeqCst) & (1 << pipe), 1 << pipe);
         let off = pipe * 3072;
@@ -40,15 +43,15 @@ impl Fake {
         assert_eq!(m[145], if pipe == 0 { 0x00a00709 } else { 0xd0308909 });
         assert_eq!(m[162], 0x100);
         assert_eq!(m[184], 0);
-        assert_eq!(self.memory[off + 2562], 256);
-        let mut cursor = 0;
+        assert_eq!(self.memory[off + 2562], tail);
+        let mut cursor = self.memory[off + 2560] as usize;
         let mut writes = 0;
-        while cursor < 256 {
+        while cursor < tail as usize {
             let words = &self.memory[off + cursor..];
             let header = words[0];
             assert_eq!(header >> 30, 3);
             let length = ((header >> 16) & 0x3fff) as usize + 2;
-            assert!(cursor + length <= 256);
+            assert!(cursor + length <= tail as usize);
             match (header >> 8) & 255 {
                 0x37 => {
                     assert_eq!(words[1], 0x100500);
@@ -61,16 +64,37 @@ impl Fake {
                     writes += length - 4;
                 }
                 0x10 => {}
+                0x49 => {
+                    assert_eq!(length, 8);
+                    assert_eq!(words[1], 0x06600514);
+                    assert_eq!(words[2], 0x22000000);
+                    let address = u64::from(words[3]) | (u64::from(words[4]) << 32);
+                    assert_eq!(address, VA + pipe as u64 * 4096 + 4088);
+                    assert_eq!(words[5], if pipe == 0 { 0x90701234 } else { 0x90705678 });
+                    assert_eq!(&words[6..8], &[0, 0]);
+                    assert_eq!(
+                        self.regs[&if pipe == 0 { 0x17828 } else { 0x17894 }] & 0x84000000,
+                        0x84000000
+                    );
+                    self.target[((address - VA) / 4) as usize] = words[5] ^ u32::from(self.corrupt);
+                    if self.emit_eop {
+                        self.eop[pipe].fetch_add(1, Ordering::SeqCst);
+                    }
+                    if self.emit_cpu {
+                        self.eop[2].fetch_add(1, Ordering::SeqCst);
+                    }
+                    writes += 1;
+                }
                 _ => panic!("unexpected bootstrap PM4 opcode"),
             }
             cursor += length;
         }
-        assert_eq!(writes, 17);
+        assert_eq!(writes, if tail == 256 { 17 } else { 1 });
         if self.corrupt {
             self.target[pipe * 1024 + 7] ^= 1;
         }
         if !self.rptr_stuck {
-            self.memory[off + 2560] = 256;
+            self.memory[off + 2560] = tail;
         }
         // GC12 updates only the low 32 bits of its RPTR writeback.
         self.memory[off + 2561] = u32::MAX;
@@ -91,6 +115,9 @@ impl Io for Fake {
         match at {
             0x42400 => self.index = v,
             0x7f000 => self.dirty = false,
+            0x17828 | 0x17894 => {
+                self.regs.insert(at, v);
+            }
             _ => panic!("unexpected CP register write"),
         }
     }
@@ -111,7 +138,7 @@ impl Io for Fake {
         }
     }
     fn doorbell(&mut self, _: MmioRegion, offset: u32, v: u64) {
-        assert_eq!(v, 256);
+        assert!(v == 256 || v == 512);
         let pipe = match offset {
             0x116 => 0,
             6 => 1,
@@ -120,7 +147,7 @@ impl Io for Fake {
         self.bells.push(offset);
         self.progress.store(1, Ordering::SeqCst);
         if self.complete {
-            self.execute(pipe);
+            self.execute(pipe, v as u32);
         }
         if let Some(cap) = self.revoked {
             cap.revoke();
@@ -175,6 +202,9 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             dirty: false,
             mapped: mapped.clone(),
             progress: Arc::new(AtomicU32::new(0)),
+            eop: Arc::new(core::array::from_fn(|_| AtomicU32::new(0))),
+            emit_eop: true,
+            emit_cpu: true,
             bells: Vec::new(),
             complete: true,
             corrupt: false,
@@ -193,6 +223,7 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
         memory: pool.reserve(24576).unwrap(),
         state: State::Prepared,
         proof: None,
+        interrupt_result: None,
     };
     let mes = FakeMes {
         mapped,
@@ -350,4 +381,172 @@ fn gfx12_kernel_queue_cancellation_retains_pending_maps_and_submissions() -> Tes
 kernel_test_in!(
     "drivers/gpu/gfx12",
     gfx12_kernel_queue_cancellation_retains_pending_maps_and_submissions
+);
+
+struct FakeObserver {
+    counters: Arc<[AtomicU32; 3]>,
+    msi: bool,
+    stall: bool,
+    reject: bool,
+}
+impl FakeObserver {
+    fn new(e: &Engine<Fake>) -> Self {
+        Self {
+            counters: e.io.eop.clone(),
+            msi: true,
+            stall: false,
+            reject: false,
+        }
+    }
+}
+impl Observer for FakeObserver {
+    async fn sample(
+        &mut self,
+        pipe: usize,
+    ) -> Result<interrupts::Sample, crate::amdgpu_ih7::Error> {
+        if self.stall {
+            core::future::pending::<()>().await;
+        }
+        if self.reject {
+            return Err(crate::amdgpu_ih7::Error::Protocol);
+        }
+        Ok(interrupts::Sample {
+            pipe,
+            count: self.counters[pipe].load(Ordering::SeqCst).into(),
+            cpu: self.counters[2].load(Ordering::SeqCst).into(),
+            vector: self.msi.then_some(0x60),
+        })
+    }
+    async fn observed(
+        &mut self,
+        sample: interrupts::Sample,
+    ) -> Result<bool, crate::amdgpu_ih7::Error> {
+        Ok(
+            u64::from(self.counters[sample.pipe].load(Ordering::SeqCst)) == sample.count + 1
+                && (!self.msi || u64::from(self.counters[2].load(Ordering::SeqCst)) != sample.cpu),
+        )
+    }
+}
+fn gfx12_eop_proof_requires_each_engine_fence_vector_and_cpu_delivery() -> TestResult {
+    for msi in [true, false] {
+        let (pool, mut e, mut mes, aperture, target) = fixture();
+        run(e.initialize(&mut mes, aperture, target)).unwrap();
+        let mut observer = FakeObserver::new(&e);
+        observer.msi = msi;
+        e.io.emit_cpu = msi;
+        e.io.regs.insert(0x17828, 0x00100000);
+        e.io.regs.insert(0x17894, 0x00200000);
+        let expected = Ok(InterruptProof {
+            fences: [0x90701234, 0x90705678],
+            msi_verified: msi,
+        });
+        assert_eq!(
+            run(e.prove_interrupts(&mut observer, aperture, target)),
+            expected
+        );
+        assert_eq!(e.interrupt_result, Some(expected));
+        assert_eq!(e.state, State::InterruptVerified);
+        assert_eq!(e.io.bells, [0x116, 6, 0x116, 6]);
+        assert_eq!(e.io.regs[&0x17828], 0x84100000);
+        assert_eq!(e.io.regs[&0x17894], 0x84200000);
+        assert_eq!(
+            run(e.prove_interrupts(&mut observer, aperture, target)),
+            Err(Error::Busy)
+        );
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_eop_proof_requires_each_engine_fence_vector_and_cpu_delivery
+);
+
+fn gfx12_eop_missing_evidence_faults_and_revocation_never_report_success() -> TestResult {
+    for case in 0..7 {
+        let (pool, mut e, mut mes, mut aperture, target) = fixture();
+        run(e.initialize(&mut mes, aperture, target)).unwrap();
+        let mut observer = FakeObserver::new(&e);
+        let expected = match case {
+            0 => {
+                e.io.emit_eop = false;
+                Error::Timeout
+            }
+            1 => {
+                e.io.emit_cpu = false;
+                Error::Timeout
+            }
+            2 => {
+                e.io.corrupt = true;
+                Error::Timeout
+            }
+            3 => {
+                e.io.rptr_stuck = true;
+                Error::Timeout
+            }
+            4 => {
+                e.io.revoked = Some(e.authority);
+                Error::Revoked
+            }
+            5 => {
+                observer.reject = true;
+                Error::Interrupts(crate::amdgpu_ih7::Error::Protocol)
+            }
+            _ => {
+                aperture.start = u64::MAX;
+                aperture.source = u64::MAX;
+                Error::Invalid
+            }
+        };
+        assert_eq!(
+            run(e.prove_interrupts(&mut observer, aperture, target)),
+            Err(expected)
+        );
+        assert_eq!(e.interrupt_result, Some(Err(expected)));
+        assert_eq!(e.state, State::Failed(expected));
+        assert_eq!(e.io.bells.len(), if case >= 5 { 2 } else { 3 });
+        assert_eq!(
+            run(e.prove_interrupts(&mut observer, aperture, target)),
+            Err(Error::Busy)
+        );
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_eop_missing_evidence_faults_and_revocation_never_report_success
+);
+
+fn gfx12_eop_cancellation_retains_sources_queues_and_prevents_replay() -> TestResult {
+    for before_submit in [true, false] {
+        let (pool, mut e, mut mes, aperture, target) = fixture();
+        run(e.initialize(&mut mes, aperture, target)).unwrap();
+        let mut observer = FakeObserver::new(&e);
+        observer.stall = before_submit;
+        e.io.complete = false;
+        {
+            let mut f = core::pin::pin!(e.prove_interrupts(&mut observer, aperture, target));
+            assert!(f
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert_eq!(e.state, State::InterruptSubmitted(0));
+        assert_eq!(e.interrupt_result, None);
+        assert_eq!(e.io.bells.len(), if before_submit { 2 } else { 3 });
+        assert_eq!(
+            run(e.prove_interrupts(&mut observer, aperture, target)),
+            Err(Error::Busy)
+        );
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gfx12",
+    gfx12_eop_cancellation_retains_sources_queues_and_prevents_replay
 );

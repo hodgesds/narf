@@ -14,6 +14,7 @@ pub struct Status {
     pub evicted: u64,
     pub vm_faults: u64,
     pub last_fault: Option<ih::Event>,
+    pub kernel_eop: [u64; 2],
 }
 #[derive(Debug)]
 struct History {
@@ -24,6 +25,7 @@ struct History {
     evicted: u64,
     vm_faults: u64,
     last_fault: Option<ih::Event>,
+    kernel_eop: [u64; 2],
 }
 impl History {
     fn new() -> Self {
@@ -35,10 +37,28 @@ impl History {
             evicted: 0,
             vm_faults: 0,
             last_fault: None,
+            kernel_eop: [0; 2],
         }
     }
     fn push(&mut self, event: ih::Event) {
         self.received = self.received.saturating_add(1);
+        // Linux gfx_v12_0_eop_irq resolves kernel queues by exact ME/pipe/queue,
+        // not the doorbell payload used for user queues. VMID/PASID must also
+        // name this bootstrap's kernel context.
+        if event.vector.client == 0x0a
+            && event.vector.source == 181
+            && event.vector.vmid == 0
+            && event.vector.pasid == 0
+        {
+            let pipe = match event.vector.ring & 0x7f {
+                0 => Some(0),
+                4 => Some(1),
+                _ => None,
+            };
+            if let Some(pipe) = pipe {
+                self.kernel_eop[pipe] = self.kernel_eop[pipe].saturating_add(1);
+            }
+        }
         if matches!(event.vector.client, 0x0a | 0x12) && event.vector.source == 0 {
             self.vm_faults = self.vm_faults.saturating_add(1);
             self.last_fault = Some(event);
@@ -78,6 +98,7 @@ impl Service {
             evicted: self.history.evicted,
             vm_faults: self.history.vm_faults,
             last_fault: self.history.last_fault,
+            kernel_eop: self.history.kernel_eop,
         }
     }
     fn drain(&mut self) -> Result<bool, ih::Error> {
@@ -188,6 +209,70 @@ pub async fn poll() -> Result<ih::Batch, ih::Error> {
         .as_mut()
         .map(|s| s.history.pop())
         .ok_or(ih::Error::Busy)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sample {
+    pub pipe: usize,
+    pub count: u64,
+    pub cpu: u64,
+    pub vector: Option<u8>,
+}
+impl Sample {
+    fn observed(
+        self,
+        count: u64,
+        vector: Option<u8>,
+        cpu: u64,
+        pending: bool,
+        faults: u64,
+    ) -> Result<bool, ih::Error> {
+        let expected = self.count.checked_add(1).ok_or(ih::Error::Invalid)?;
+        if vector != self.vector || count > expected || faults != 0 {
+            return Err(ih::Error::Protocol);
+        }
+        // Drain all already-published IVs before declaring success: a later
+        // batch may contain a duplicate EOP or VM fault for this submission.
+        Ok(!pending && count == expected && (vector.is_none() || cpu != self.cpu))
+    }
+}
+pub(crate) async fn sample(pipe: usize) -> Result<Sample, ih::Error> {
+    if pipe >= 2 {
+        return Err(ih::Error::Invalid);
+    }
+    let mut slot = SERVICE.lock().await;
+    let service = slot.as_mut().ok_or(ih::Error::Busy)?;
+    if service.drain()? {
+        return Err(ih::Error::Busy);
+    }
+    if service.history.vm_faults != 0 {
+        return Err(ih::Error::Protocol);
+    }
+    let vector = service.routing.ok().flatten();
+    if vector.is_some() && !narf_arch::interrupts_enabled() {
+        return Err(ih::Error::Busy);
+    }
+    let count = service.history.kernel_eop[pipe];
+    count.checked_add(1).ok_or(ih::Error::Invalid)?;
+    Ok(Sample {
+        pipe,
+        count,
+        cpu: vector.map_or(0, narf_interrupts::fire_count),
+        vector,
+    })
+}
+pub(crate) async fn observed(sample: Sample) -> Result<bool, ih::Error> {
+    let mut slot = SERVICE.lock().await;
+    let service = slot.as_mut().ok_or(ih::Error::Busy)?;
+    let pending = service.drain()?;
+    let vector = service.routing.ok().flatten();
+    sample.observed(
+        service.history.kernel_eop[sample.pipe],
+        vector,
+        vector.map_or(0, narf_interrupts::fire_count),
+        pending,
+        service.history.vm_faults,
+    )
 }
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_interrupts_tests.rs"]

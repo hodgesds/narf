@@ -314,12 +314,18 @@ retains uncertain routes/vectors. The service snapshots IRQ counts before
 draining and uses a watchdog; unsupported routing uses timer-driven polling.
 ARM hardware MSI awaits real ITS ITT backing. Bounded diagnostic history records
 evictions and sticky VM-fault data; it does not complete user fences.
+An executor task now follows boot with native graphics/compute RELEASE_MEM
+proofs, requiring a fresh fence, full RPTR drain and exactly one matching
+kernel-context EOP vector per queue. Configured MSI additionally requires CPU
+delivery for each proof; polling is reported separately. Faults, cancellation
+and missing evidence leave retained diagnostic state and prevent replay.
+This path has software models; physical MSI delivery remains unverified.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
 on incomplete startup. Read-only preparation failures restore CPU writers.
 
-Still open: physical MSI delivery verification/source dispatch, GC12 rendering and shader
+Still open: physical MSI delivery verification/full fault-source dispatch, GC12 rendering and shader
 dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, reset/suspend/resume, and physical RX 9070 XT testing.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver

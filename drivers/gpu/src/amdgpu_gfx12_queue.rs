@@ -1,8 +1,9 @@
 //! Two retained VMID0 GC12 kernel queues, with a bounded translated-memory
-//! WRITE_DATA proof. No user IBs, draws, shader dispatch, interrupts or reset.
+//! WRITE_DATA and native EOP-interrupt proofs. No user IBs, draws, shaders or reset.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc, amdgpu_mes12 as api, amdgpu_mes12_hw as mes,
+    amdgpu_navi48_interrupts as interrupts,
     amdgpu_psp_ring::bank,
     amdgpu_vram::{Pool, Reservation},
 };
@@ -31,6 +32,7 @@ pub enum Error {
     Timeout,
     DataMismatch,
     Mes(mes::Error),
+    Interrupts(crate::amdgpu_ih7::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -38,6 +40,8 @@ pub enum State {
     Mapping(u8),
     Submitted(u8),
     Verified,
+    InterruptSubmitted(u8),
+    InterruptVerified,
     Failed(Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +49,53 @@ pub struct Proof {
     pub graphics_fence: u32,
     pub compute_fence: u32,
     pub written_bytes: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptProof {
+    pub fences: [u32; 2],
+    /// True only when both EOPs also advanced the configured CPU MSI counter.
+    pub msi_verified: bool,
+}
+const IRQ_FENCES: [u32; 2] = [0x90701234, 0x90705678];
+fn interrupt_packets(address: u64, pipe: usize) -> [u32; 256] {
+    let mut words = [0; 256];
+    // Linux gfx_v12_0_ring_emit_fence: RELEASE_MEM, GL2 writeback + sequence,
+    // bypass cache, CACHE_FLUSH_AND_INV_TS_EVENT/index5, confirmed 32-bit EOP.
+    words[..8].copy_from_slice(&[
+        0xc0064900,
+        0x06600514,
+        0x22000000,
+        address as u32,
+        (address >> 32) as u32,
+        IRQ_FENCES[pipe],
+        0,
+        0,
+    ]);
+    words[8] = 0xc0f61000; // 248-dword NOP aligns the new WPTR to 512.
+    words
+}
+trait Observer {
+    async fn sample(&mut self, pipe: usize)
+        -> Result<interrupts::Sample, crate::amdgpu_ih7::Error>;
+    async fn observed(
+        &mut self,
+        sample: interrupts::Sample,
+    ) -> Result<bool, crate::amdgpu_ih7::Error>;
+}
+struct NativeObserver;
+impl Observer for NativeObserver {
+    async fn sample(
+        &mut self,
+        pipe: usize,
+    ) -> Result<interrupts::Sample, crate::amdgpu_ih7::Error> {
+        interrupts::sample(pipe).await
+    }
+    async fn observed(
+        &mut self,
+        sample: interrupts::Sample,
+    ) -> Result<bool, crate::amdgpu_ih7::Error> {
+        interrupts::observed(sample).await
+    }
 }
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -220,6 +271,7 @@ struct Engine<I: Io> {
     memory: Reservation,
     state: State,
     proof: Option<Proof>,
+    interrupt_result: Option<Result<InterruptProof, Error>>,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -367,6 +419,98 @@ impl<I: Io> Engine<I> {
             written_bytes: 128,
         })
     }
+    async fn prove_interrupts(
+        &mut self,
+        observer: &mut impl Observer,
+        aperture: gmc::Aperture,
+        target: MmioRegion,
+    ) -> Result<InterruptProof, Error> {
+        if self.state != State::Verified {
+            return Err(Error::Busy);
+        }
+        self.state = State::InterruptSubmitted(0);
+        let result = self.interrupt_inner(observer, aperture, target).await;
+        self.interrupt_result = Some(result);
+        self.state = match result {
+            Ok(_) => State::InterruptVerified,
+            Err(e) => State::Failed(e),
+        };
+        result
+    }
+    async fn interrupt_inner(
+        &mut self,
+        observer: &mut impl Observer,
+        aperture: gmc::Aperture,
+        target: MmioRegion,
+    ) -> Result<InterruptProof, Error> {
+        let l = self.layout;
+        let map = self.memory.mapping();
+        let db = self.doorbells;
+        if aperture.start >= (1 << 48) - (2 << 20)
+            || aperture.start % (2 << 20) != 0
+            || aperture.source != aperture.start
+            || aperture.destination != aperture.start + 4096
+            || aperture.size != 2 << 20
+            || target.len != 8192
+        {
+            return Err(Error::Invalid);
+        }
+        let mut msi_verified = true;
+        for pipe in 0..2 {
+            self.state = State::InterruptSubmitted(pipe as u8);
+            let sample = observer.sample(pipe).await.map_err(Error::Interrupts)?;
+            msi_verified &= sample.vector.is_some();
+            let off = pipe as u64 * PIPE_BYTES;
+            let control = l.gc + if pipe == 0 { 0x1e0a * 4 } else { 0x1e25 * 4 };
+            self.access(|io| {
+                flush(io, l);
+                if io.memory_read(map, off + RPTR) != 256
+                    || io.memory_read(map, off + WPTR) != 256
+                    || io.memory_read(map, off + WPTR + 4) != 0
+                {
+                    return Err(Error::Busy);
+                }
+                let value = checked(io.read(control))? | 0x84000000;
+                io.write(control, value);
+                if checked(io.read(control))? != value {
+                    return Err(Error::Readback);
+                }
+                io.memory_write(target, pipe as u64 * 4096 + 4088, 0);
+                let address = aperture.source + pipe as u64 * 4096 + 4088;
+                for (i, word) in interrupt_packets(address, pipe).into_iter().enumerate() {
+                    io.memory_write(map, off + 1024 + i as u64 * 4, word);
+                }
+                io.memory_write(map, off + WPTR, 512);
+                flush(io, l);
+                io.doorbell(db, BELLS[pipe], 512);
+                Ok(())
+            })?;
+            let deadline = narf_time::Deadline::after_us(2_100_000);
+            loop {
+                let memory_done = self.access(|io| {
+                    flush(io, l);
+                    let rptr = io.memory_read(map, off + RPTR);
+                    if rptr > 512 {
+                        return Err(Error::DataMismatch);
+                    }
+                    Ok(rptr == 512
+                        && io.memory_read(target, pipe as u64 * 4096 + 4088) == IRQ_FENCES[pipe])
+                })?;
+                let event_done = observer.observed(sample).await.map_err(Error::Interrupts)?;
+                if memory_done && event_done {
+                    break;
+                }
+                if deadline.expired() {
+                    return Err(Error::Timeout);
+                }
+                self.io.delay().await;
+            }
+        }
+        Ok(InterruptProof {
+            fences: IRQ_FENCES,
+            msi_verified,
+        })
+    }
 }
 #[derive(Debug)]
 pub struct Queues(Engine<Mmio>);
@@ -389,6 +533,7 @@ impl Queues {
             memory: pool.reserve(BYTES).map_err(|_| Error::Allocation)?,
             state: State::Prepared,
             proof: None,
+            interrupt_result: None,
         }))
     }
     /// # Safety
@@ -406,6 +551,23 @@ impl Queues {
     }
     pub fn state(&self) -> State {
         self.0.state
+    }
+    /// # Safety
+    /// Same retained GMC proof pages/queues and independent IH service. No other
+    /// submissions may use either HQD. Masked CPU IRQs fail the MSI proof before
+    /// submission.
+    pub async unsafe fn prove_interrupts(
+        &mut self,
+        gmc: &mut gmc::Gmc,
+    ) -> Result<InterruptProof, Error> {
+        let aperture = gmc.aperture().ok_or(Error::Invalid)?;
+        let map = gmc.test_mapping().ok_or(Error::Invalid)?;
+        self.0
+            .prove_interrupts(&mut NativeObserver, aperture, map)
+            .await
+    }
+    pub fn interrupt_result(&self) -> Option<Result<InterruptProof, Error>> {
+        self.0.interrupt_result
     }
     pub fn proof(&self) -> Option<Proof> {
         self.0.proof

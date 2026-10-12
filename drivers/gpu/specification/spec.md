@@ -340,6 +340,27 @@ prevents replay. The cold-boot coordinator retains these queues and both GMC
 pages, recording the proof before DMUB startup. This proves kernel command
 transport and translated writes, not rendering, shader dispatch or user IBs.
 
+After IH service handoff, `unsafe Queues::prove_interrupts(gmc).await` submits
+one native RELEASE_MEM EOP per retained kernel queue. It enables the native
+graphics/compute timestamp and generic interrupt sources, preserving other
+control bits, and advances each ring from 256 to 512 dwords. Success requires
+the fresh confirmed fence, full RPTR drain and exactly one matching IH EOP
+since the pre-submission snapshot. With MSI configured, both submissions must
+also advance the CPU vector's fire count; polling alone returns an
+`InterruptProof` with `msi_verified=false`. Existing/new VM faults, changed
+routing, duplicate EOPs, revoked authority, malformed apertures or a 2.1-second
+timeout cannot report success. No command accepts user addresses or data.
+Cancellation retains the `InterruptSubmitted` state, sources and all backing;
+failure retains `Failed` and its error, and neither permits replay. Success
+records `InterruptVerified`. `interrupt_result` and the original write proof
+remain separate, so the latter cannot imply interrupt delivery.
+
+The platform schedules this second proof as an executor task after boot,
+because framebuffer initialization may run with CPU IRQs masked. The proof
+refuses MSI submission if IRQs are still masked. Diagnostics expose
+`queue_state` and `queue_interrupts` separately from the historical cold-boot
+report; while their owner lock is held, platform status is `Running`.
+
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
 tables v1.4/v1.5 supply independently resolved transmitter, AUX and HPD
@@ -463,8 +484,12 @@ is explicitly refused until ITS has real ITT backing; register models still
 run on both architectures. Fatal draining disables/masks CPU delivery without
 recycling a possibly in-flight vector.
 
-`Status` exposes the IH state/report, MSI setup outcome, receive/eviction counts
-and sticky last VM-fault vector. A 64-entry diagnostic history records complete
+`Status` exposes the IH state/report, MSI setup outcome, receive/eviction counts,
+sticky last VM-fault vector and two kernel EOP counters. EOP classification
+requires SOC21 GC/source 181, VMID/PASID zero and exact ME/pipe/queue identity:
+0/0/0 for graphics or 1/0/0 for compute. Doorbell payload is not used to select
+kernel queues; reserved ring bit 7 is ignored as in Linux. The counters survive
+history consumption/eviction. A 64-entry diagnostic history records complete
 raw events; overwrites increment `evicted` and do not erase sticky fault data.
 Platform `poll_interrupts` consumes up to 32 history entries, independently of
 hardware draining. This history is not an application completion queue.

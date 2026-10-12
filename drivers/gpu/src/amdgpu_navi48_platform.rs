@@ -36,6 +36,9 @@ pub struct Diagnostics {
     pub report: Option<boot::Report>,
     pub display: Result<display::State, display::Error>,
     pub interrupts: Option<crate::amdgpu_navi48_interrupts::Status>,
+    pub queue_state: Option<crate::amdgpu_gfx12_queue::State>,
+    pub queue_interrupts:
+        Option<Result<crate::amdgpu_gfx12_queue::InterruptProof, crate::amdgpu_gfx12_queue::Error>>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -46,6 +49,8 @@ pub fn status() -> Status {
                 report: boot.report(),
                 display: boot.display_state(),
                 interrupts: crate::amdgpu_navi48_interrupts::status(),
+                queue_state: boot.queue_state(),
+                queue_interrupts: boot.queue_interrupts(),
             })
         }),
     }
@@ -185,7 +190,20 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     if let Some(live) = crate::amdgpu_navi48_interrupts::status().and_then(|s| s.report) {
         report.interrupts = live;
     }
+    // Boot's block_on_spin may have IF=0. Defer the CPU-delivery proof to the
+    // executor; the IRQ service keeps running independently of OWNER.
+    narf_scheduler::spawn(prove_queue_interrupts());
     Ok(report)
+}
+
+async fn prove_queue_interrupts() {
+    let mut owner = OWNER.lock().await;
+    if let Some(boot) = owner.as_mut() {
+        // SAFETY: the platform retains matching owners and excludes reset/PM.
+        // The proof checks CPU IRQ state before submitting any command. Its
+        // result/cancellation state remains visible in the retained queues.
+        let _ = unsafe { boot.prove_queue_interrupts().await };
+    }
 }
 
 /// Serialized native HPD query. Requires the completed, retained cold boot.
