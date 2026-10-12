@@ -6,6 +6,7 @@ use crate::amdgpu_gfx12_rs64 as rs64;
 use crate::amdgpu_gfx12_setup as setup;
 use crate::amdgpu_ih7 as ih;
 use crate::amdgpu_mes12_hw as mes;
+use crate::amdgpu_navi48_msi as msi;
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_dmub_navi48 as dmub, amdgpu_gddr6 as training,
     amdgpu_gfx12_topology as topology, amdgpu_gmc_navi48 as gmc, amdgpu_navi48_firmware as gfx,
@@ -184,7 +185,9 @@ struct Hardware {
     topology: Option<topology::Topology>,
     rs64: rs64::Rs64,
     setup: setup::Setup,
-    ih: ih::Rings,
+    ih: Option<ih::Rings>,
+    interrupt_report: Option<ih::Report>,
+    interrupt_route: Option<Result<msi::Route, msi::Error>>,
     gmc: Option<gmc::Gmc>,
     sdma: Option<sdma::Sdma>,
     mes: Option<mes::Mes>,
@@ -322,7 +325,10 @@ impl Backend for Hardware {
                 let gmc = self.gmc.as_ref().ok_or(Error::Invalid)?;
                 // SAFETY: same retained GMC/firmware/pool and exclusive IH;
                 // preparation refused inherited rings before memory training.
-                unsafe { self.ih.initialize(gmc) }.map_err(Error::Interrupts)?;
+                self.interrupt_report = Some(
+                    unsafe { self.ih.as_mut().ok_or(Error::Invalid)?.initialize(gmc) }
+                        .map_err(Error::Interrupts)?,
+                );
             }
             Stage::DmaProof => {
                 // SAFETY: prior stages retain firmware, memory and both hubs.
@@ -395,7 +401,12 @@ impl Backend for Hardware {
             graphics: self.graphics.ok_or(Error::Invalid)?,
             power: self.power.ok_or(Error::Invalid)?,
             media: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
-            interrupts: self.ih.report().ok_or(Error::Invalid)?,
+            interrupts: self
+                .ih
+                .as_ref()
+                .and_then(ih::Rings::report)
+                .or(self.interrupt_report)
+                .ok_or(Error::Invalid)?,
             dmub: self.dmub.status().ok_or(Error::Invalid)?,
             topology: self.topology.ok_or(Error::Invalid)?,
             rs64: self.rs64.starts().ok_or(Error::Invalid)?,
@@ -470,6 +481,10 @@ impl ColdBoot {
         // SAFETY: same exclusive ownership. Read-only preparation also refuses
         // inherited IH writers before any training or firmware mutation.
         let ih = unsafe { ih::Rings::new(gpu, authority, pool) }.map_err(Error::Interrupts)?;
+        // SAFETY: same physical PCI function, exact banks and exclusive config
+        // ownership. MSI preparation errors remain visible to the later service;
+        // they do not prevent retained polled IH operation.
+        let interrupt_route = unsafe { msi::Route::new(gpu, &pci, authority) };
         let mp0 = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
         if target != firmware.gfx.target() || !firmware.sos.is_psp14(mp0.revision) {
             return Err(Error::Unsupported);
@@ -545,7 +560,9 @@ impl ColdBoot {
                     topology: None,
                     rs64,
                     setup,
-                    ih,
+                    ih: Some(ih),
+                    interrupt_report: None,
+                    interrupt_route: Some(interrupt_route),
                     gmc: None,
                     sdma: None,
                     mes: None,
@@ -569,7 +586,34 @@ impl ColdBoot {
         if self.state() != State::MemoryReady {
             return Err(Error::Busy);
         }
-        self.sequence.backend.ih.drain().map_err(Error::Interrupts)
+        self.sequence
+            .backend
+            .ih
+            .as_mut()
+            .ok_or(Error::Busy)?
+            .drain()
+            .map_err(Error::Interrupts)
+    }
+    /// # Safety
+    /// CPU IRQ control and executor are initialized; continue to exclude all
+    /// reset/PM transitions after transferring IH to its permanent service.
+    pub(crate) unsafe fn start_interrupt_service(&mut self) -> Result<(), Error> {
+        if self.state() != State::MemoryReady {
+            return Err(Error::Busy);
+        }
+        let hardware = &mut self.sequence.backend;
+        // SAFETY: same retained objects and exclusive post-boot handoff.
+        unsafe {
+            crate::amdgpu_navi48_interrupts::install(
+                &mut hardware.ih,
+                &mut hardware.interrupt_route,
+            )
+        }
+        .map_err(|e| {
+            let error = Error::Interrupts(e);
+            self.sequence.state = State::Failed(Stage::InterruptRings, error);
+            error
+        })
     }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display

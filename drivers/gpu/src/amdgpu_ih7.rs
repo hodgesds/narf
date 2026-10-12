@@ -84,6 +84,9 @@ pub struct Batch {
     pub pending: bool,
 }
 impl Batch {
+    pub(crate) fn from_entries(entries: [Option<Event>; 32], pending: bool) -> Self {
+        Self { entries, pending }
+    }
     pub fn events(&self) -> impl Iterator<Item = &Event> {
         self.entries.iter().flatten()
     }
@@ -213,6 +216,20 @@ fn pointer(io: &mut impl Io, l: Layout, ring: usize) -> Result<u32, Error> {
     }
     Ok(offset)
 }
+fn host_control(io: &mut impl Io, l: Layout, enabled: bool) -> Result<(), Error> {
+    if enabled {
+        update(io, l.at(0xaa), 1 << 18, 1 << 18)?;
+        update(io, l.at(0xd5), 8, 8)?;
+        update(io, l.at(0xf1), 0xfff, 3)?;
+    }
+    update(io, l.at(0xc1), 0x11f, if enabled { 0x108 } else { 8 })?;
+    update(
+        io,
+        l.at(CNTL[0]),
+        0x220000,
+        if enabled { 0x220000 } else { 0 },
+    )
+}
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
@@ -222,6 +239,7 @@ struct Engine<I: Io> {
     state: State,
     rptr: [u32; 2],
     consumed: [u64; 2],
+    host_interrupts: bool,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -305,7 +323,7 @@ impl<I: Io> Engine<I> {
             ring_addresses: OFFSETS.map(|at| self.memory.address() + at),
             ring_bytes: SIZES,
             consumed: self.consumed,
-            host_interrupts: false,
+            host_interrupts: self.host_interrupts,
         }
     }
     fn drain(&mut self) -> Result<Batch, Error> {
@@ -368,6 +386,7 @@ impl<I: Io> Engine<I> {
             }
             Err(e) => {
                 self.state = State::Failed(e);
+                self.host_interrupts = false;
                 // Stop owned writers when authority is still valid. A revoked
                 // cap performs no further accesses; the backing remains retained.
                 let _ = self.access(|io| {
@@ -405,6 +424,7 @@ impl Rings {
             state: State::Prepared,
             rptr: [0; 2],
             consumed: [0; 2],
+            host_interrupts: false,
         }))
     }
     /// # Safety
@@ -418,6 +438,21 @@ impl Rings {
     }
     pub fn state(&self) -> State {
         self.0.state
+    }
+    /// # Safety
+    /// Enabling requires an installed CPU handler/route for this same physical
+    /// function and a retained consumer. Serialize PCI route and IH changes.
+    pub(crate) unsafe fn host_interrupts(&mut self, enabled: bool) -> Result<(), Error> {
+        if self.0.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        let l = self.0.layout;
+        let result = self.0.access(|io| host_control(io, l, enabled));
+        match result {
+            Ok(()) => self.0.host_interrupts = enabled,
+            Err(e) => self.0.state = State::Failed(e),
+        }
+        result
     }
     pub fn report(&self) -> Option<Report> {
         (self.0.state == State::Ready).then(|| self.0.report())

@@ -430,10 +430,46 @@ published memory, and forbids replay; revoked authority performs no MMIO.
 `Report` records addresses, sizes and consumed counts without implying MSI.
 
 Cold boot prepares IH before training and initializes it immediately after
-GMC, before command queues. `ColdBoot::poll_interrupts` and the serialized
-platform wrapper expose bounded polling after completed boot. CPU MSI routing,
-source-specific fault/fence dispatch and a background service remain separate
-work; receipt of a raw vector alone never completes a user fence.
+GMC, before command queues. Standalone `ColdBoot::poll_interrupts` provides
+bounded polling while that object still owns the rings. The platform handoff
+transfers them to the permanent service below after completed boot; subsequent
+direct ColdBoot polling is refused. Source-specific fault recovery and fence
+dispatch remain separate work; receipt of a raw vector never completes a user fence.
+
+`unsafe amdgpu_navi48_msi::Route::new` prepares a checked MSI capability and
+NBIO interrupt-control address without writes/vector allocation. It supports
+32/64-bit MSI with optional masking, bounds the complete capability and rejects
+overlap, inherited enabled MSI/MSI-X, an unposted PCI function or mismatched
+identity. `enable(&mut Rings)` reads the current initialized CPU's actual APIC
+ID, refuses IDs beyond legacy MSI addressing and reserves a fresh vector
+excluding the fixed `0xf0` TLB vector. It installs the named handler before
+programming, selects one message, masks while programming when supported,
+checks readback, disables INTx and enables MSI last. PCI Command writes are
+16-bit so W1C Status is untouched. NBIO7.7 uses bank5 `0x8e11`; NBIF6.3.1 uses
+bank2 `0xf1`. VRAM rings use nonsnoop requests; dummy host reads are explicitly
+disabled rather than supplied an invented DMA address. IH storm controls,
+ring1 self-IV updates and ring0 rearm/delivery are enabled only after PCI setup.
+Every config/register batch invokes current PCI authority. Failed/published
+routes retain their vector/handler until independent quiescence.
+
+`amdgpu_navi48_interrupts` owns the transferred rings and route behind a separate
+async mutex. The final framebuffer handoff starts its executor task; HDMI scans
+and firmware/display owner locks cannot delay its draining. The worker snapshots
+the IRQ counter before draining, releases its lock before all waits/yields, and
+uses a 100 ms watchdog drain in MSI mode. Unsupported/unavailable MSI keeps
+diagnosed polling at 1 ms. Partial setup is disabled where authority permits;
+an IH arming error fails the handoff with its owners retained. ARM hardware MSI
+is explicitly refused until ITS has real ITT backing; register models still
+run on both architectures. Fatal draining disables/masks CPU delivery without
+recycling a possibly in-flight vector.
+
+`Status` exposes the IH state/report, MSI setup outcome, receive/eviction counts
+and sticky last VM-fault vector. A 64-entry diagnostic history records complete
+raw events; overwrites increment `evicted` and do not erase sticky fault data.
+Platform `poll_interrupts` consumes up to 32 history entries, independently of
+hardware draining. This history is not an application completion queue.
+Platform diagnostics include this live service state separately from boot's
+startup report. Hardware MSI delivery still requires a physical-card test.
 
 `unsafe amdgpu_sdma_navi48::Sdma::new` selects SDMA7.0.0/1 on GC12.0.1,
 with queue registers in GC bank zero and MCU control in bank one. Its owned

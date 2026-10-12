@@ -307,14 +307,19 @@ Native OSSSYS7 interrupt rings now retain their own VRAM, reject inherited
 writers before training, and initialize after GMC. Bounded fair draining
 decodes full SOC21 vectors, handles wraparound and detects overflow before
 acknowledging entries; errors quarantine backing and stop owned writers when
-authority permits. CPU MSI delivery remains disabled pending host routing and
-source dispatch. The platform exposes serialized polling of both IH rings.
+authority permits. The final boot handoff now transfers IH to an independent
+async service, so display work cannot block draining. A checked x86 MSI route
+uses the actual APIC ID, enables delivery after handler/config readback, and
+retains uncertain routes/vectors. The service snapshots IRQ counts before
+draining and uses a watchdog; unsupported routing uses timer-driven polling.
+ARM hardware MSI awaits real ITS ITT backing. Bounded diagnostic history records
+evictions and sticky VM-fault data; it does not complete user fences.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
 on incomplete startup. Read-only preparation failures restore CPU writers.
 
-Still open: CPU interrupt delivery/source dispatch, GC12 rendering and shader
+Still open: physical MSI delivery verification/source dispatch, GC12 rendering and shader
 dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, reset/suspend/resume, and physical RX 9070 XT testing.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver

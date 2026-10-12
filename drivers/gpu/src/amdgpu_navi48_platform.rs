@@ -35,6 +35,7 @@ pub struct Diagnostics {
     pub state: boot::State,
     pub report: Option<boot::Report>,
     pub display: Result<display::State, display::Error>,
+    pub interrupts: Option<crate::amdgpu_navi48_interrupts::Status>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -44,6 +45,7 @@ pub fn status() -> Status {
                 state: boot.state(),
                 report: boot.report(),
                 display: boot.display_state(),
+                interrupts: crate::amdgpu_navi48_interrupts::status(),
             })
         }),
     }
@@ -175,7 +177,15 @@ pub unsafe fn prepare(framebuffer: Option<GenericFb>) -> Result<Option<bool>, Er
 /// Continue to satisfy `prepare`'s exclusive hardware ownership contract.
 pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     let mut owner = OWNER.lock().await;
-    owner.as_mut().ok_or(boot::Error::Invalid)?.run().await
+    let boot = owner.as_mut().ok_or(boot::Error::Invalid)?;
+    let mut report = boot.run().await?;
+    // SAFETY: final boot handoff has CPU IRQ/executor initialization and keeps
+    // all device reset/PM access excluded. The service owns IH independently.
+    unsafe { boot.start_interrupt_service() }?;
+    if let Some(live) = crate::amdgpu_navi48_interrupts::status().and_then(|s| s.report) {
+        report.interrupts = live;
+    }
+    Ok(report)
 }
 
 /// Serialized native HPD query. Requires the completed, retained cold boot.
@@ -241,15 +251,12 @@ pub async fn scan_display() -> Result<Vec<display::Port>, boot::Error> {
         .await
 }
 
-/// Drain a bounded batch from both native IH7 rings under the retained owner.
-/// Call again after yielding when pending is set; this does not enable MSI.
+/// Consume bounded diagnostic history from the independent IH service.
+/// Hardware draining and CPU interrupt waits never hold the display-owner lock.
 pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> {
-    OWNER
-        .lock()
+    crate::amdgpu_navi48_interrupts::poll()
         .await
-        .as_mut()
-        .ok_or(boot::Error::Invalid)?
-        .poll_interrupts()
+        .map_err(boot::Error::Interrupts)
 }
 
 #[cfg(feature = "kernel-test")]

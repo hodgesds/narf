@@ -31,7 +31,7 @@ impl Io for Fake {
         }
         assert!(!self.dirty, "published IH addresses before VRAM flush");
         match (at - OSS) / 4 {
-            0x80..=0x87 | 0x8c..=0x90 | 0x93 | 0xc1 | 0x183 | 0x184 => {}
+            0x80..=0x87 | 0x8c..=0x90 | 0x93 | 0xc1 | 0x183 | 0x184 | 0xaa | 0xd5 | 0xf1 => {}
             _ => panic!("wrong native IH7 register {at:x}"),
         }
         self.regs.insert(at, value);
@@ -86,6 +86,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         state: State::Prepared,
         rptr: [0; 2],
         consumed: [0; 2],
+        host_interrupts: false,
     };
     (pool, e)
 }
@@ -289,4 +290,30 @@ fn ih7_publication_and_revocation_retain_backing_without_unauthorized_io() -> Te
 kernel_test_in!(
     "drivers/gpu/ih7",
     ih7_publication_and_revocation_retain_backing_without_unauthorized_io
+);
+
+fn ih7_host_delivery_arms_last_and_preserves_ring_configuration() -> TestResult {
+    let (_pool, mut e) = fixture();
+    e.initialize().unwrap();
+    let before = e.io.regs[&(OSS + 0x80 * 4)];
+    e.io.regs.insert(OSS + 0xaa * 4, 0x55);
+    e.io.regs.insert(OSS + 0xd5 * 4, 0x83);
+    e.io.regs.insert(OSS + 0xf1 * 4, 0x800000ff);
+    host_control(&mut e.io, e.layout, true).unwrap();
+    assert_eq!(e.io.regs[&(OSS + 0xaa * 4)], 0x40055);
+    assert_eq!(e.io.regs[&(OSS + 0xd5 * 4)], 0x8b);
+    assert_eq!(e.io.regs[&(OSS + 0xf1 * 4)], 0x80000003);
+    assert_eq!(
+        e.io.writes.last(),
+        Some(&(OSS + 0x80 * 4, before | 0x220000))
+    );
+    assert_eq!(e.io.regs[&(OSS + 0xc1 * 4)] & 0x11f, 0x108);
+    host_control(&mut e.io, e.layout, false).unwrap();
+    assert_eq!(e.io.regs[&(OSS + 0x80 * 4)], before);
+    assert_eq!(e.io.regs[&(OSS + 0xc1 * 4)] & 0x11f, 8);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/ih7",
+    ih7_host_delivery_arms_last_and_preserves_ring_configuration
 );

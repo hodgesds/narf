@@ -5,6 +5,9 @@
 #include "asic_reg/oss/osssys_7_0_0_offset.h"
 #include "asic_reg/oss/osssys_7_0_0_sh_mask.h"
 #include "soc15_ih_clientid.h"
+#include "asic_reg/nbio/nbio_7_7_0_offset.h"
+#include "asic_reg/nbio/nbio_7_7_0_sh_mask.h"
+#include "ivsrcid/vmc/irqsrcs_vmc_1_0.h"
 #define EQ(name, value) _Static_assert((name) == (value), #name)
 #define REG(name, value) EQ(reg##name, value); EQ(reg##name##_BASE_IDX, 0)
 REG(IH_RB_CNTL, 0x80);
@@ -43,4 +46,17 @@ EQ(IH_CNTL2__SELF_IV_FORCE_WPTR_UPDATE_TIMEOUT_MASK, 0x1f);
 EQ(IH_RING1_CLIENT_CFG_INDEX__INDEX_MASK, 7);
 EQ(IH_RING1_CLIENT_CFG_DATA__SOURCE_ID_MATCH_ENABLE_MASK, 0x10000);
 EQ(IH_STATUS__IDLE_MASK | IH_STATUS__BUFFER_IDLE_MASK | IH_STATUS__MC_WR_IDLE_MASK, 0x45);
+EQ(IH_STORM_CLIENT_LIST_CNTL__CLIENT18_IS_STORM_CLIENT_MASK, 0x40000);
+EQ(IH_INT_FLOOD_CNTL__FLOOD_CNTL_ENABLE_MASK, 8);
+EQ(IH_MSI_STORM_CTRL__DELAY_MASK, 0xfff);
+EQ(IH_RB_CNTL__RPTR_REARM_MASK, 0x200000);
+EQ(regBIF_BX0_INTERRUPT_CNTL, 0xf1);
+EQ(regBIF_BX0_INTERRUPT_CNTL_BASE_IDX, 2);
+EQ(regBIF_BX1_INTERRUPT_CNTL, 0x8e11);
+EQ(regBIF_BX1_INTERRUPT_CNTL_BASE_IDX, 5);
+EQ(BIF_BX1_INTERRUPT_CNTL__IH_DUMMY_RD_OVERRIDE_MASK, 1);
+EQ(BIF_BX1_INTERRUPT_CNTL__IH_DUMMY_RD_EN_MASK, 2);
+EQ(BIF_BX1_INTERRUPT_CNTL__IH_REQ_NONSNOOP_EN_MASK, 8);
+EQ(UTCL2_1_0__SRCID__FAULT, 0);
+EQ(VMC_1_0__SRCID__VM_FAULT, 0);
 int main(void) { return 0; }

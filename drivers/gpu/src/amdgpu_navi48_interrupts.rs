@@ -1,0 +1,194 @@
+//! Retained interrupt service, independent of the firmware/display owner lock.
+//! Raw events remain diagnostic until their engine provides a validated fence
+//! or fault consumer. No user fence is completed from an unchecked IV payload.
+use crate::{amdgpu_ih7 as ih, amdgpu_navi48_msi as msi};
+use narf_lib::mutex::Mutex;
+
+static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub state: ih::State,
+    pub report: Option<ih::Report>,
+    pub route: Result<Option<u8>, msi::Error>,
+    pub received: u64,
+    pub evicted: u64,
+    pub vm_faults: u64,
+    pub last_fault: Option<ih::Event>,
+}
+#[derive(Debug)]
+struct History {
+    entries: [Option<ih::Event>; 64],
+    head: usize,
+    len: usize,
+    received: u64,
+    evicted: u64,
+    vm_faults: u64,
+    last_fault: Option<ih::Event>,
+}
+impl History {
+    fn new() -> Self {
+        Self {
+            entries: [None; 64],
+            head: 0,
+            len: 0,
+            received: 0,
+            evicted: 0,
+            vm_faults: 0,
+            last_fault: None,
+        }
+    }
+    fn push(&mut self, event: ih::Event) {
+        self.received = self.received.saturating_add(1);
+        if matches!(event.vector.client, 0x0a | 0x12) && event.vector.source == 0 {
+            self.vm_faults = self.vm_faults.saturating_add(1);
+            self.last_fault = Some(event);
+        }
+        if self.len == self.entries.len() {
+            self.head = (self.head + 1) % self.entries.len();
+            self.len -= 1;
+            self.evicted = self.evicted.saturating_add(1);
+        }
+        self.entries[(self.head + self.len) % self.entries.len()] = Some(event);
+        self.len += 1;
+    }
+    fn pop(&mut self) -> ih::Batch {
+        let mut entries = [None; 32];
+        for slot in entries.iter_mut().take(self.len.min(32)) {
+            *slot = self.entries[self.head].take();
+            self.head = (self.head + 1) % self.entries.len();
+            self.len -= 1;
+        }
+        ih::Batch::from_entries(entries, self.len != 0)
+    }
+}
+#[derive(Debug)]
+struct Service {
+    rings: ih::Rings,
+    route: Option<msi::Route>,
+    routing: Result<Option<u8>, msi::Error>,
+    history: History,
+}
+impl Service {
+    fn status(&self) -> Status {
+        Status {
+            state: self.rings.state(),
+            report: self.rings.report(),
+            route: self.routing,
+            received: self.history.received,
+            evicted: self.history.evicted,
+            vm_faults: self.history.vm_faults,
+            last_fault: self.history.last_fault,
+        }
+    }
+    fn drain(&mut self) -> Result<bool, ih::Error> {
+        match self.rings.drain() {
+            Ok(batch) => {
+                for event in batch.events() {
+                    self.history.push(*event);
+                }
+                Ok(batch.pending)
+            }
+            Err(e) => {
+                if let Some(route) = &mut self.route {
+                    self.routing = route.disable().map(|()| None);
+                }
+                Err(e)
+            }
+        }
+    }
+}
+/// # Safety
+/// Called once after cold boot with initialized CPU interrupt control/executor.
+/// All objects describe the same exclusively owned physical GPU. Ownership is
+/// transferred only after claiming the permanent service slot; errors before
+/// that leave the caller's owners intact. No future GPU reset/PM may race it.
+pub(crate) unsafe fn install(
+    rings: &mut Option<ih::Rings>,
+    route: &mut Option<Result<msi::Route, msi::Error>>,
+) -> Result<(), ih::Error> {
+    let mut slot = SERVICE.try_lock().ok_or(ih::Error::Busy)?;
+    if slot.is_some() || rings.as_ref().is_none_or(|r| r.state() != ih::State::Ready) {
+        return Err(ih::Error::Busy);
+    }
+    let prepared = route.take().ok_or(ih::Error::Invalid)?;
+    let (route, routing) = match prepared {
+        Ok(r) => (Some(r), Ok(None)),
+        Err(e) => (None, Err(e)),
+    };
+    *slot = Some(Service {
+        rings: rings.take().unwrap(),
+        route,
+        routing,
+        history: History::new(),
+    });
+    let service = slot.as_mut().unwrap();
+    if let Some(route) = &mut service.route {
+        // SAFETY: service slot already retains both owners and the consumer is
+        // spawned below. It drains first, so an early IRQ is not lost.
+        service.routing = unsafe { route.enable(&mut service.rings) }.map(Some);
+        if service.routing.is_err() && route.state() != msi::State::Prepared {
+            // Keep the original setup error visible, but disable any partial
+            // MSI programming. Unsupported untouched routes simply use polling.
+            let _ = route.disable();
+        }
+    }
+    let state = service.rings.state();
+    drop(slot);
+    if let ih::State::Failed(e) = state {
+        return Err(e);
+    }
+    narf_scheduler::spawn(worker());
+    Ok(())
+}
+async fn worker() {
+    loop {
+        let vector = {
+            let slot = SERVICE.lock().await;
+            let Some(service) = slot.as_ref() else {
+                return;
+            };
+            service.routing.ok().flatten()
+        };
+        // Snapshot the IRQ counter BEFORE draining. An IRQ arriving while we
+        // drain or before the first wait poll will then make the wait ready.
+        let wait = vector.map(narf_interrupts::wait_for_irq);
+        let pending = {
+            let mut slot = SERVICE.lock().await;
+            let Some(service) = slot.as_mut() else {
+                return;
+            };
+            match service.drain() {
+                Ok(pending) => pending,
+                Err(_) => return,
+            }
+        };
+        if pending {
+            narf_scheduler::yield_now().await;
+            continue;
+        }
+        if let Some(wait) = wait {
+            // A watchdog drain also covers an unexpectedly lost device MSI.
+            let _ = narf_time::timeout(narf_time::Deadline::after_ms(100), wait).await;
+        } else {
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+        }
+    }
+}
+/// None means absent or currently draining. Diagnostic history is bounded and
+/// evictions are counted; this is not a completion queue for user submissions.
+pub fn status() -> Option<Status> {
+    SERVICE.try_lock()?.as_ref().map(Service::status)
+}
+/// Consume retained diagnostic history without stealing hardware entries from
+/// the service. Sticky fault information survives history reads and eviction.
+pub async fn poll() -> Result<ih::Batch, ih::Error> {
+    SERVICE
+        .lock()
+        .await
+        .as_mut()
+        .map(|s| s.history.pop())
+        .ok_or(ih::Error::Busy)
+}
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_navi48_interrupts_tests.rs"]
+mod tests;
