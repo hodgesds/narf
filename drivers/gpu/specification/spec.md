@@ -818,6 +818,25 @@ status to stay clear with fetch blanked, rebinds the owners and returns to
 `DpVideoRunning`. If that cannot be proven, the pipe is `Failed`. Other start
 failures quarantine without recovery.
 
+`unsafe ColdBoot::modeset_display(pipe, fill).await` (platform
+`modeset_display`) orchestrates the above on one legacy DP SST connector. It
+scans the routed sinks, selects the first DisplayPort port whose sink answered
+with DPCD and an EDID preferred mode that `timing_from_edid` accepts, and links
+it at the sink's maximum lanes and rate. A sink that cannot carry the mode's
+8-bpc payload is skipped (`ModesetError::Link` if nothing else fits). There is
+no rate fallback or alternative mode yet. The first clock request (clamped to
+each minimum) starts PMFW so admission can read live levels. The admitted
+plan's DISPCLK/DPPREFCLK are then requested, and the pipe DTO gets its DPPCLK
+and pixel clock. Planes are retired, the HUBP is powered and the surface is
+staged and filled row by row by `fill(y, row)` while fetch is stopped. Then
+memory, timing (with the plan's global sync), blank, DPP, MPC, requestor and
+deadlines are prepared before the PHY is enabled, trained, given its frontend
+(stream index = pipe), started on black video and switched to scanout.
+Inherited GOP consumers must already be retired; the clock owners refuse
+otherwise. Failures leave every owner where it stopped. `stop_modeset`
+reverses a success down to a disabled PHY with timing and planes retired; the
+surface allocation remains bound to its pipe.
+
 `tests/dcn401_scanout.c` checks the native registers, including the MPC block's
 DCN bank 3. Physical presentation on the sink remains unverified.
 

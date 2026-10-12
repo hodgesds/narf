@@ -530,6 +530,41 @@ pub async unsafe fn prepare_display_deadlines(
     unsafe { boot.prepare_display_deadlines(pipe, &plan).await }
 }
 
+/// Light the first answering DP SST sink at its preferred mode on `pipe`,
+/// filling each visible row with `fill(y, row)` before fetch starts.
+/// # Safety
+/// Inherited display consumers must be retired. Exclude firmware/FAMS and
+/// concurrent display/hub/VM/IRQ/clock/reset/power/link writers.
+pub async unsafe fn modeset_display(
+    pipe: u8,
+    fill: impl FnMut(u32, &mut [u32]),
+) -> Result<crate::amdgpu_navi48_boot::Modeset, crate::amdgpu_navi48_boot::ModesetError> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_navi48_boot::ModesetError::Boot(
+            crate::amdgpu_navi48_boot::Error::Busy,
+        ))?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.modeset_display(pipe, fill).await }
+}
+
+/// Reverse a successful modeset to a disabled PHY with timing and planes retired.
+/// # Safety
+/// As for `modeset_display`; stop every CPU writer of the surface first.
+pub async unsafe fn stop_modeset(
+    modeset: &crate::amdgpu_navi48_boot::Modeset,
+) -> Result<(), crate::amdgpu_navi48_boot::ModesetError> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_navi48_boot::ModesetError::Boot(
+            crate::amdgpu_navi48_boot::Error::Busy,
+        ))?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.stop_modeset(modeset).await }
+}
+
 /// Make the staged surface the visible source of the pipe's running black video.
 /// # Safety
 /// The surface must stay allocated until a successful stop. Exclude firmware/FAMS

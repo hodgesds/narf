@@ -1,0 +1,124 @@
+use super::*;
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// One-block EDID 1.4 whose preferred mode is CEA 1920x1080@60 (148.5 MHz).
+fn edid_1080p() -> Vec<u8> {
+    let mut e = alloc::vec![0u8; 128];
+    e[..8].copy_from_slice(&[0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0]);
+    e[8..10].copy_from_slice(&[0x10, 0xac]);
+    (e[18], e[19], e[20]) = (1, 4, 0xa5);
+    e[54..72].copy_from_slice(&[
+        0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c, 0x45, 0, 0, 0, 0, 0, 0, 0x1e,
+    ]);
+    e[127] = narf_edid::compute_checksum(&e);
+    e
+}
+fn path(connector: inventory::Connector, transmitter: u8) -> inventory::Path {
+    inventory::Path {
+        connector,
+        connector_instance: transmitter + 1,
+        transmitter,
+        aux: Some(transmitter),
+        hpd: transmitter + 1,
+        device_tag: 0,
+    }
+}
+/// DPCD with MAX_LINK_RATE and MAX_LANE_COUNT (enhanced framing set).
+fn dpcd(rate: u8, lanes: u8) -> Option<[u8; 16]> {
+    let mut d = [0u8; 16];
+    (d[0], d[1], d[2]) = (0x14, rate, 0x80 | lanes);
+    Some(d)
+}
+fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display::Port {
+    display::Port {
+        path,
+        sink: Ok(display::Sink { dpcd, edid }),
+    }
+}
+
+fn navi48_modeset_selects_first_answering_dp_sink_by_board_path() -> TestResult {
+    use inventory::Connector::{DisplayPort as Dp, HdmiTypeA as Hdmi};
+    let paths = [path(Hdmi, 0), path(Dp, 1), path(Dp, 2), path(Dp, 3)];
+    let ports = [
+        port(paths[0], None, edid_1080p()),
+        display::Port {
+            path: paths[1],
+            sink: Err(display::Error::InvalidDpcd),
+        },
+        port(paths[2], None, edid_1080p()),
+        port(paths[3], dpcd(0x14, 4), edid_1080p()),
+    ];
+    let Ok(s) = select(&paths, &ports) else {
+        return TestResult::Fail("no selection");
+    };
+    let t = s.timing;
+    if s.port != 3
+        || (s.lanes, s.rate) != (4, LinkRate::Hbr2)
+        || (
+            t.pixel_clock_khz,
+            t.h_active,
+            t.h_total,
+            t.v_active,
+            t.v_total,
+        ) != (148_500, 1920, 2200, 1080, 1125)
+        || !(t.h_sync_positive && t.v_sync_positive)
+    {
+        return TestResult::Fail("selection");
+    }
+    // A sink without a usable preferred mode or with unknown link caps is
+    // skipped; none left means no sink.
+    let mut bad = edid_1080p();
+    bad[127] ^= 1;
+    let ports = [
+        port(paths[3], dpcd(0x14, 4), bad),
+        port(paths[2], dpcd(0x15, 4), edid_1080p()),
+        port(paths[1], dpcd(0x14, 3), edid_1080p()),
+    ];
+    if select(&paths, &ports) != Err(ModesetError::NoSink) {
+        return TestResult::Fail("unusable sinks selected");
+    }
+    // A port missing from the board inventory is never addressed.
+    let stray = path(Dp, 4);
+    if select(&paths, &[port(stray, dpcd(0x14, 4), edid_1080p())]) != Err(ModesetError::NoSink) {
+        return TestResult::Fail("unrouted port selected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_selects_first_answering_dp_sink_by_board_path
+);
+
+fn navi48_modeset_requires_link_payload_and_aligns_pitch() -> TestResult {
+    use inventory::Connector::DisplayPort as Dp;
+    let paths = [path(Dp, 0), path(Dp, 1)];
+    // 148.5 MHz * 24 bpp needs 3.564 Gb/s of payload: 1-lane RBR is short,
+    // 2-lane HBR (4.32) suffices. A short first sink falls through.
+    let short = [port(paths[0], dpcd(0x06, 1), edid_1080p())];
+    if select(&paths, &short) != Err(ModesetError::Link) {
+        return TestResult::Fail("short link accepted");
+    }
+    let ports = [
+        port(paths[0], dpcd(0x06, 1), edid_1080p()),
+        port(paths[1], dpcd(0x0a, 2), edid_1080p()),
+    ];
+    let Ok(s) = select(&paths, &ports) else {
+        return TestResult::Fail("fitting sink rejected");
+    };
+    if s.port != 1
+        || !link_fits(&s.timing, 2, LinkRate::Hbr)
+        || link_fits(&s.timing, 1, LinkRate::Hbr)
+    {
+        return TestResult::Fail("payload ceiling");
+    }
+    let mut odd = s.timing;
+    odd.h_active = 1366;
+    if mode(s.timing).pitch != 1920 || mode(odd).pitch != 1408 {
+        return TestResult::Fail("pitch alignment");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_requires_link_payload_and_aligns_pitch
+);

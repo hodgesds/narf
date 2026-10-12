@@ -397,6 +397,10 @@ it can restart. A read-only health check recognises exactly the owned live
 fetch while every other HUBP stays stopped; underflow is recorded and returns
 the pipe to black through the same drain, or quarantines it if that cannot be
 proven. These paths are model-tested only; no sink has shown the image.
+`ColdBoot::modeset_display` now chains EDID/DPCD sink selection, admission,
+clocks, surface fill and every preparation through DP training to visible
+scanout, with `stop_modeset` reversing it. Only the selection is model-tested;
+the chain itself still needs a board, and inherited GOP retirement is separate.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
