@@ -406,6 +406,35 @@ invalidates engine 17 in both hubs and the MMHUB private cache, and retains
 published backing across errors/cancellation. `Ready` follows both bounded
 acknowledgements, not merely table publication.
 
+`unsafe amdgpu_ih7::Rings::new` prepares native OSSSYS7.0.0 rings with exact
+GC12/NBIO discovery banks. It rejects inherited enabled rings, enabled host
+delivery or non-idle IH before allocating; preparation never writes hardware.
+`initialize(&Gmc)` requires the same GPU's ready VMID0/MMHUB and exclusive
+firmware/reset/source ownership. It publishes retained 256 KiB main and
+16 KiB secondary rings plus a writeback page in owned VRAM, using VMID0 GPU
+addresses rather than host physical DMA. It configures the native register
+order, redirects GC retry vectors to ring1, restores the indexed selector,
+and enables both rings with **host interrupt delivery disabled**.
+
+`drain()` returns an allocation-free `Batch` with at most sixteen `Event`s
+from each ring. `Vector` decodes the native 32-byte IV: client/source/ring/VMID
+and VMID source in dword0, 48-bit timestamp and its source in dwords1–2,
+PASID/node in dword3 and four source payload dwords. SOC21 GC client is `0x0a`.
+Pointers are byte offsets; partial vectors, out-of-range/undefined bits and
+unexpected read pointers are errors. The consumer checks overflow both before
+and after copying, flushes HDP visibility, and acknowledges only complete
+vectors. `Batch::pending` requires another bounded drain after yielding.
+Overflow is a fatal event-loss condition, not silently discarded history.
+Failed draining stops owned writers if authority is still live, retains all
+published memory, and forbids replay; revoked authority performs no MMIO.
+`Report` records addresses, sizes and consumed counts without implying MSI.
+
+Cold boot prepares IH before training and initializes it immediately after
+GMC, before command queues. `ColdBoot::poll_interrupts` and the serialized
+platform wrapper expose bounded polling after completed boot. CPU MSI routing,
+source-specific fault/fence dispatch and a background service remain separate
+work; receipt of a raw vector alone never completes a user fence.
+
 `unsafe amdgpu_sdma_navi48::Sdma::new` selects SDMA7.0.0/1 on GC12.0.1,
 with queue registers in GC bank zero and MCU control in bank one. Its owned
 VRAM ring/writeback allocation is validated against BAR0. `initialize(gmc)`

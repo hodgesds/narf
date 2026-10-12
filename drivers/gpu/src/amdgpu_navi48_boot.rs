@@ -4,6 +4,7 @@ use crate::amdgpu_ddc_navi48 as ddc;
 use crate::amdgpu_gfx12_queue as queues;
 use crate::amdgpu_gfx12_rs64 as rs64;
 use crate::amdgpu_gfx12_setup as setup;
+use crate::amdgpu_ih7 as ih;
 use crate::amdgpu_mes12_hw as mes;
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_dmub_navi48 as dmub, amdgpu_gddr6 as training,
@@ -32,13 +33,14 @@ pub enum Stage {
     PowerSetup,
     ReadTopology,
     MemoryTranslation,
+    InterruptRings,
     DmaProof,
     SetupGraphics,
     StartMes,
     KernelQueueProof,
     StartDmub,
 }
-const STAGES: [Stage; 20] = [
+const STAGES: [Stage; 21] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -54,6 +56,7 @@ const STAGES: [Stage; 20] = [
     Stage::PowerSetup,
     Stage::ReadTopology,
     Stage::MemoryTranslation,
+    Stage::InterruptRings,
     Stage::DmaProof,
     Stage::SetupGraphics,
     Stage::StartMes,
@@ -82,6 +85,7 @@ pub enum Error {
     Mes(mes::Error),
     Setup(setup::Error),
     Queues(queues::Error),
+    Interrupts(ih::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -104,6 +108,7 @@ pub struct Report {
     pub mes: mes::Report,
     pub setup: setup::Report,
     pub queues: queues::Proof,
+    pub interrupts: ih::Report,
 }
 #[derive(Debug)]
 pub struct Firmware {
@@ -179,6 +184,7 @@ struct Hardware {
     topology: Option<topology::Topology>,
     rs64: rs64::Rs64,
     setup: setup::Setup,
+    ih: ih::Rings,
     gmc: Option<gmc::Gmc>,
     sdma: Option<sdma::Sdma>,
     mes: Option<mes::Mes>,
@@ -312,6 +318,12 @@ impl Backend for Hardware {
                 // completed; this boot owns GRBM and all inactive CP queues.
                 unsafe { self.rs64.configure() }.map_err(Error::Rs64)?;
             }
+            Stage::InterruptRings => {
+                let gmc = self.gmc.as_ref().ok_or(Error::Invalid)?;
+                // SAFETY: same retained GMC/firmware/pool and exclusive IH;
+                // preparation refused inherited rings before memory training.
+                unsafe { self.ih.initialize(gmc) }.map_err(Error::Interrupts)?;
+            }
             Stage::DmaProof => {
                 // SAFETY: prior stages retain firmware, memory and both hubs.
                 self.sdma = Some(
@@ -383,6 +395,7 @@ impl Backend for Hardware {
             graphics: self.graphics.ok_or(Error::Invalid)?,
             power: self.power.ok_or(Error::Invalid)?,
             media: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
+            interrupts: self.ih.report().ok_or(Error::Invalid)?,
             dmub: self.dmub.status().ok_or(Error::Invalid)?,
             topology: self.topology.ok_or(Error::Invalid)?,
             rs64: self.rs64.starts().ok_or(Error::Invalid)?,
@@ -454,6 +467,9 @@ impl ColdBoot {
             unsafe { rs64::Rs64::new(gpu, authority, &firmware.gfx) }.map_err(Error::Rs64)?;
         // SAFETY: same exclusive ownership; reserves a page without publishing it.
         let setup = unsafe { setup::Setup::new(gpu, authority, pool) }.map_err(Error::Setup)?;
+        // SAFETY: same exclusive ownership. Read-only preparation also refuses
+        // inherited IH writers before any training or firmware mutation.
+        let ih = unsafe { ih::Rings::new(gpu, authority, pool) }.map_err(Error::Interrupts)?;
         let mp0 = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
         if target != firmware.gfx.target() || !firmware.sos.is_psp14(mp0.revision) {
             return Err(Error::Unsupported);
@@ -529,6 +545,7 @@ impl ColdBoot {
                     topology: None,
                     rs64,
                     setup,
+                    ih,
                     gmc: None,
                     sdma: None,
                     mes: None,
@@ -545,6 +562,14 @@ impl ColdBoot {
         (self.state() == State::MemoryReady)
             .then(|| self.sequence.backend.report().ok())
             .flatten()
+    }
+    /// Bounded native interrupt-vector draining; CPU MSI delivery is not yet
+    /// enabled by this bootstrap. The caller must service `Batch::pending`.
+    pub fn poll_interrupts(&mut self) -> Result<ih::Batch, Error> {
+        if self.state() != State::MemoryReady {
+            return Err(Error::Busy);
+        }
+        self.sequence.backend.ih.drain().map_err(Error::Interrupts)
     }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display

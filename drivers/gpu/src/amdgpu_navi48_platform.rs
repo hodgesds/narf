@@ -241,6 +241,17 @@ pub async fn scan_display() -> Result<Vec<display::Port>, boot::Error> {
         .await
 }
 
+/// Drain a bounded batch from both native IH7 rings under the retained owner.
+/// Call again after yielding when pending is set; this does not enable MSI.
+pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> {
+    OWNER
+        .lock()
+        .await
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .poll_interrupts()
+}
+
 #[cfg(feature = "kernel-test")]
 mod tests {
     use super::*;

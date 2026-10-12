@@ -196,6 +196,7 @@ pub mod amdgpu_gmc_navi48;
 pub mod amdgpu_hdmi_audio;
 pub mod amdgpu_hpd;
 pub mod amdgpu_ih;
+pub mod amdgpu_ih7;
 pub mod amdgpu_info;
 pub mod amdgpu_mes;
 pub mod amdgpu_mes12;

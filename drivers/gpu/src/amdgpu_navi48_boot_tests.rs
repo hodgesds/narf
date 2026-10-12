@@ -10,6 +10,12 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 }
 fn report() -> Report {
     Report {
+        interrupts: ih::Report {
+            ring_addresses: [0x800500000, 0x800540000],
+            ring_bytes: [256 * 1024, 16 * 1024],
+            consumed: [0; 2],
+            host_interrupts: false,
+        },
         queues: queues::Proof {
             graphics_fence: 0x9070cafe,
             compute_fence: 0x9070beef,
