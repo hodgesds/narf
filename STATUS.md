@@ -280,6 +280,8 @@ GFX/thermal policy; GC12 harvested CU/SA/RB inventory and device-query reporting
 GMC12/MMHUB4.1 owned VMID0 translations; SDMA7 translated
 VRAM write/copy/fence verification; and DCN4 DMUB shared state, authenticated
 window validation, startup and version/capability/HPD/AUX mailbox support.
+DCN4 board routing reads ATOM v1.4/v1.5, preserves distinct AUX/HPD/transmitter
+identities and bounds the four channels using DCN4 backend register geometry.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer

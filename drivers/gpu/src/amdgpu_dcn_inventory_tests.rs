@@ -687,3 +687,81 @@ kernel_test_in!(
     "drivers/gpu/dcn-inventory",
     inventory_routing_rejects_ambiguous_pins_bridges_and_truncation
 );
+
+fn inventory_navi48_v15_routes_and_backend_stride() -> TestResult {
+    let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+    let dcn = gpu.ip_blocks.last_mut().unwrap();
+    dcn.num_bases = 3;
+    dcn.base_addrs[2] = DCN_BASE;
+    let mut regs = vec![0u32; (DCN_BASE + 0x28f6) as usize];
+    gpu.regs.virt = regs.as_mut_ptr() as u64;
+    gpu.regs.len = regs.len() as u64 * 4;
+    let mut image = Image::new();
+    image.paths(&[(0x3105, 0x2202)]);
+    image.0[DISPLAY_OBJECT + 3] = 5;
+    // v1.5's reserved USB-C word must not become a v1.4 external encoder.
+    image.0[DISPLAY_OBJECT + PATHS_OFFSET + 6] = 1;
+    image.0[RECORDS + 2] = 0x41;
+    image.0[RECORDS + 6] = 0x81;
+    image.0[DCE + 3] = 5;
+    let paths = super::display_paths(&gpu, image.bytes()).unwrap();
+    let sink = crate::amdgpu_usbc::Sink {
+        channel: crate::amdgpu_dmub::Channel::Legacy,
+        instance: 1,
+        dpcd: [0; 16],
+        edid: Vec::new(),
+    };
+    let routes = super::routes_for_sink(&gpu, &paths, &sink, 2).unwrap();
+    if routes[0].aux != 1
+        || routes[0].backend != 3
+        || routes[0].hpd != 2
+        || routes[0].frontend != 2
+        || dchub_refclk_khz(image.bytes()) != Ok(27_000)
+        || Profile::resolve(&gpu).is_ok()
+    {
+        return TestResult::Fail("DCN4 routing confused identities or enabled DCN3 programming");
+    }
+    let cap = Cap::bootstrap();
+    // SAFETY: owned register model, with the actual DCN4 addresses as oracle.
+    unsafe {
+        for (instance, reg) in [0x20bd, 0x21e1, 0x2305, 0x2429].into_iter().enumerate() {
+            regs[(DCN_BASE + reg) as usize] = 1;
+            if transmitter_busy(&gpu, &cap, instance as u8) != Ok(true) {
+                return TestResult::Fail("DCN4 transmitter offset/stride");
+            }
+            regs[(DCN_BASE + reg) as usize] = 0;
+            if transmitter_busy(&gpu, &cap, instance as u8) != Ok(false) {
+                return TestResult::Fail("DCN4 inactive transmitter misreported");
+            }
+        }
+        if transmitter_busy(&gpu, &cap, 4) != Err(Error::Invalid) {
+            return TestResult::Fail("fifth DCN4 transmitter accepted");
+        }
+        cap.revoke();
+        if transmitter_busy(&gpu, &cap, 0) != Err(Error::Revoked) {
+            return TestResult::Fail("revoked DCN4 inventory access");
+        }
+    }
+    if super::routes_for_sink(&gpu, &paths, &sink, 4) != Err(Error::Invalid) {
+        return TestResult::Fail("fifth DCN4 frontend accepted");
+    }
+    image.0[RECORDS + 6] = 0x84;
+    if super::display_paths(&gpu, image.bytes()) != Err(Error::Unsupported) {
+        return TestResult::Fail("fifth DCN4 AUX accepted");
+    }
+    image.0[RECORDS + 6] = 0x81;
+    image.0[RECORDS + 2] = 0x44;
+    if super::display_paths(&gpu, image.bytes()) != Err(Error::Unsupported) {
+        return TestResult::Fail("fifth DCN4 HPD accepted");
+    }
+    image.0[RECORDS + 2] = 0x41;
+    gpu.ip_blocks.last_mut().unwrap().revision = 2;
+    if super::display_paths(&gpu, image.bytes()) != Err(Error::Unsupported) {
+        return TestResult::Fail("foreign DCN4 revision accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_navi48_v15_routes_and_backend_stride
+);

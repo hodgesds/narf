@@ -256,6 +256,17 @@ version/capability mailbox handshake. User queues, native display, probe
 integration and physical validation are separate gates;
 `fw_loaded` is not set by this API.
 
+The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
+GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
+tables v1.4/v1.5 supply independently resolved transmitter, AUX and HPD
+identities; v1.5's reserved USB-C word is not treated as an external encoder.
+DCN4 exposes four native AUX/transmitter/frontend instances and no DPIA route
+through this interface. `transmitter_busy` reads DCN4's `0x20bd + n*0x124`
+registers. Ambiguous wiring and unsupported channels are refused; these
+inventory functions do not enable any DCN3 timing/plane/link programming.
+DCE-info v4.5 supplies the unchanged reference-clock field. The DCN4 DMUB
+mailbox likewise refuses native AUX/HPD channel indices outside `0..4`.
+
 `unsafe amdgpu_gmc_navi48::Gmc::new` validates GC12.0.1/MMHUB4.1/NBIO banks
 and the pool's BAR0/GPU mapping. `initialize().await` requires retained
 firmware and trained VRAM with both hubs idle. It creates a flat VMID0 table
@@ -1331,8 +1342,8 @@ dividers can produce, so a plausible guess at any of them yields a picture that
 tears under load rather than an error. A table that is missing, the wrong
 revision or self-inconsistent fails closed.
 
-`display_paths(gpu, vbios)` walks `display_object_info_table_v1_4`, resolving
-an exact DCN314 or Navi22/DCN3.0 profile from discovery. It decodes each path's
+`display_paths(gpu, vbios)` walks `display_object_info_table_v1_4/v1_5`, resolving
+DCN314, Navi22/DCN3.0 or Navi48/DCN4.0.1 from discovery. It decodes each path's
 connector and UNIPHY transmitter separately from its hardware AUX and HPD lines.
 Connector record offsets are relative to the display-object table. The I2C and
 HPD record IDs are keys into `atom_gpio_pin_lut_v2_1`; the GPIO register and bit
@@ -1359,8 +1370,8 @@ hardware AUX channel. Its transmitter and HPD selector come from that path;
 the caller assigns the stream frontend independently. Shared AUX channels or
 transmitters require a mux/bridge owner and are refused instead of selecting the
 first connector. Only DisplayPort/eDP paths may produce native routes. Profile
-bounds admit all six Navi22 transmitters and frontends. Navi22 rejects DPIA
-routes; the Phoenix profile retains its five DIG candidates.
+bounds admit all six Navi22 or four Navi48 transmitters and frontends. Both
+discrete profiles reject DPIA routes; Phoenix retains its five DIG candidates.
 
 A tunnelled sink has no board-wired transmitter, so it borrows one. All five DIGs
 are candidates, ordered so that transmitters the board wired to no connector come

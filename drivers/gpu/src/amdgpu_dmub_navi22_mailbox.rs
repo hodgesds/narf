@@ -300,7 +300,7 @@ impl<I: Io> Engine<I> {
         self.finish_mailbox(result)
     }
     pub(super) async fn hpd(&mut self, instance: u8) -> Result<bool, Error> {
-        if instance >= 6 {
+        if instance >= NATIVE_CHANNELS {
             return Err(Error::Invalid);
         }
         self.begin_mailbox()?;
@@ -335,7 +335,7 @@ impl<I: Io> Engine<I> {
         data: &mut [u8],
     ) -> Result<(), Error> {
         use crate::amdgpu_dmub::{aux_command, Channel};
-        if instance >= 6 {
+        if instance >= NATIVE_CHANNELS {
             return Err(Error::Invalid);
         }
         let request = aux_command(Channel::Legacy, instance, action, address, data)
@@ -394,7 +394,7 @@ impl Dmub {
     pub fn mailbox_state(&self) -> MailboxState {
         self.engine.mailbox.state
     }
-    /// Query a native DCN30 AUX/HPD instance (0..6), not a connector index.
+    /// Query a native AUX/HPD instance within this generation's channel count.
     pub async fn hpd(&mut self, instance: u8) -> Result<bool, Error> {
         self.engine.hpd(instance).await
     }

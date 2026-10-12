@@ -1,4 +1,4 @@
-//! Board routing for Navi22/DCN3.0 and Phoenix/DCN3.1.4, plus the APU memory
+//! Board routing for Navi22/DCN3.0, Phoenix/DCN3.1.4 and Navi48/DCN4.0.1, plus the APU memory
 //! and reference-clock inventory. AUX, HPD and transmitter identities are
 //! independently decoded from connector records and the GPIO pin LUT.
 //!
@@ -65,6 +65,72 @@ const HPD_SHIFTS: [u8; 6] = [0, 8, 16, 24, 26, 28];
 /// says the backend is already driving a link.
 const DIG_BE_EN_CNTL: u64 = 0x20b2;
 const DIG_STRIDE: u64 = 0x100;
+
+/// Routing compatibility does not grant access to DCN3 plane/timing methods.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Routing {
+    Legacy(Profile),
+    Navi48,
+}
+impl From<Profile> for Routing {
+    fn from(profile: Profile) -> Self {
+        Self::Legacy(profile)
+    }
+}
+impl Routing {
+    fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
+        if gpu.chip.vid == crate::amdgpu::AMD_VENDOR && gpu.chip.did == crate::amdgpu::NAVI48 {
+            crate::amdgpu_psp_ring::bank(
+                gpu,
+                crate::amdgpu_discovery::HW_ID_GC,
+                &[(12, 0, 1)],
+                0,
+                0,
+            )
+            .map_err(|_| Error::Unsupported)?;
+            Self::Navi48.bank(gpu, GPIO_HPD_A)?;
+            Ok(Self::Navi48)
+        } else {
+            Profile::resolve(gpu)
+                .map(Self::Legacy)
+                .map_err(|_| Error::Unsupported)
+        }
+    }
+    fn streams(self) -> u8 {
+        match self {
+            Self::Legacy(p) => p.streams(),
+            Self::Navi48 => 4,
+        }
+    }
+    fn hpd_count(self) -> u8 {
+        if self == Self::Navi48 {
+            4
+        } else {
+            6
+        }
+    }
+    fn bank(self, gpu: &AmdGpu, last: u32) -> Result<u64, Error> {
+        match self {
+            Self::Legacy(p) => p.bank(gpu, 2, last).map_err(|_| Error::Unsupported),
+            Self::Navi48 => crate::amdgpu_psp_ring::bank(
+                gpu,
+                crate::amdgpu_discovery::HW_ID_DCN,
+                &[(4, 0, 1), (4, 1, 0)],
+                2,
+                last,
+            )
+            .map_err(|_| Error::Unsupported),
+        }
+    }
+    fn backend(self) -> (u64, u64) {
+        match self {
+            Self::Legacy(Profile::Navi22) => (DIG_BE_EN_CNTL - 1, DIG_STRIDE),
+            Self::Legacy(Profile::Dcn314) => (DIG_BE_EN_CNTL, DIG_STRIDE),
+            // dcn_4_1_0_offset.h DIG0..3_DIG_BE_EN_CNTL.
+            Self::Navi48 => (0x20bd, 0x124),
+        }
+    }
+}
 /// `atom_dmi_t17_mem_type_def`: DDR5 is 34 and LPDDR5 is 35.
 const MEM_TYPE_DDR5: u8 = 34;
 const MEM_TYPE_LPDDR5: u8 = 35;
@@ -72,7 +138,7 @@ const MEM_TYPE_LPDDR5: u8 = 35;
 const DDR5_CHANNEL_WIDTH_BYTES: u32 = 8;
 const LPDDR5_CHANNEL_WIDTH_BYTES: u32 = 4;
 /// `atom_display_controller_info_v4_*` places `dce_refclk_10khz` here, in every
-/// content revision from 4.1 to 4.4.
+/// content revision from 4.1 to 4.5.
 const DCE_REFCLK_OFFSET: usize = 12;
 /// `atom_integrated_system_info_v2_*` field offsets, the same in v2.1 and v2.2.
 const MEMORY_TYPE_OFFSET: usize = 26;
@@ -281,20 +347,21 @@ fn hpd_selector(vbios: &[u8], uid: u8, dcn: u32) -> Result<u8, Error> {
         .ok_or(Error::Unsupported)
 }
 
-/// Walk `display_object_info_table_v1_4`. Paths whose encoder or connector this
+/// Walk `display_object_info_table_v1_4/v1_5`. Paths whose encoder or connector this
 /// does not understand are skipped rather than failing the whole table: a board
 /// may wire something alongside the DisplayPort connectors we care about.
 pub fn display_paths(gpu: &AmdGpu, vbios: &[u8]) -> Result<Vec<Path>, Error> {
-    let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
-    let dcn = profile
-        .bank(gpu, 2, GPIO_HPD_A)
-        .map_err(|_| Error::Unsupported)?
-        / 4;
-    display_paths_at(
+    let profile = Routing::resolve(gpu)?;
+    let dcn = profile.bank(gpu, GPIO_HPD_A)? / 4;
+    let paths = display_paths_at(
         vbios,
         u32::try_from(dcn).map_err(|_| Error::Invalid)?,
         profile.streams(),
-    )
+    )?;
+    if paths.iter().any(|path| path.hpd > profile.hpd_count()) {
+        return Err(Error::Unsupported);
+    }
+    Ok(paths)
 }
 fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, Error> {
     let info = table(vbios, TABLE_DISPLAY_OBJECT_INFO)?;
@@ -303,7 +370,7 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
             .table_offset(TABLE_DISPLAY_OBJECT_INFO)
             .ok_or(Error::Missing)?,
     );
-    header(info, 1, &[4])?;
+    header(info, 1, &[4, 5])?;
     if info.len() < PATHS_OFFSET {
         return Err(Error::Invalid);
     }
@@ -324,7 +391,9 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
         };
         // An external encoder needs a separate bridge driver; the downstream
         // id cannot be treated as an on-chip transmitter.
-        if u16_at(entry, 6) != 0 || transmitter >= dig_count {
+        // v1.5 keeps the field positions but replaces extencoderobjid with a
+        // reserved USB-C field. It no longer describes an external encoder.
+        if (info[3] == 4 && u16_at(entry, 6) != 0) || transmitter >= dig_count {
             continue;
         }
         let pins = wiring(
@@ -363,7 +432,7 @@ fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, 
 /// documented reference rather than a guess at this board's wiring.
 pub fn dchub_refclk_khz(vbios: &[u8]) -> Result<u32, Error> {
     let info = table(vbios, TABLE_DCE_INFO)?;
-    header(info, 4, &[1, 2, 3, 4])?;
+    header(info, 4, &[1, 2, 3, 4, 5])?;
     if (u16_at(info, 0) as usize) < DCE_REFCLK_OFFSET + 2 {
         return Err(Error::Invalid);
     }
@@ -415,19 +484,15 @@ pub fn routes_for_sink(
     sink: &crate::amdgpu_usbc::Sink,
     frontend: u8,
 ) -> Result<Vec<crate::amdgpu_dio::Route>, Error> {
-    routes_for_profile(
-        Profile::resolve(gpu).map_err(|_| Error::Unsupported)?,
-        paths,
-        sink,
-        frontend,
-    )
+    routes_for_profile(Routing::resolve(gpu)?, paths, sink, frontend)
 }
 fn routes_for_profile(
-    profile: Profile,
+    profile: impl Into<Routing>,
     paths: &[Path],
     sink: &crate::amdgpu_usbc::Sink,
     frontend: u8,
 ) -> Result<Vec<crate::amdgpu_dio::Route>, Error> {
+    let profile = profile.into();
     if frontend >= profile.streams() {
         return Err(Error::Invalid);
     }
@@ -452,7 +517,7 @@ fn routes_for_profile(
             {
                 return Err(Error::Invalid);
             }
-            if path.transmitter >= profile.streams() || path.hpd > 6 {
+            if path.transmitter >= profile.streams() || path.hpd > profile.hpd_count() {
                 return Err(Error::Invalid);
             }
             if !matches!(
@@ -471,7 +536,7 @@ fn routes_for_profile(
             });
         }
         crate::amdgpu_dmub::Channel::Dpia => {
-            if profile != Profile::Dcn314 {
+            if profile != Routing::Legacy(Profile::Dcn314) {
                 return Err(Error::Unsupported);
             }
             if sink.instance >= DPIA_COUNT {
@@ -523,21 +588,17 @@ pub unsafe fn transmitter_busy(
     authority: &Cap<BusDeviceCap, Write>,
     dig: u8,
 ) -> Result<bool, Error> {
-    let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+    let profile = Routing::resolve(gpu)?;
     if dig >= profile.streams() {
         return Err(Error::Invalid);
     }
-    // DCN30 DIG_BE_EN_CNTL is one dword before Phoenix's register.
-    let enable = DIG_BE_EN_CNTL - u64::from(profile == Profile::Navi22);
-    let base = profile
-        .bank(
-            gpu,
-            2,
-            (enable + (u64::from(profile.streams()) - 1) * DIG_STRIDE) as u32,
-        )
-        .map_err(|_| Error::Unsupported)?;
+    let (enable, stride) = profile.backend();
+    let base = profile.bank(
+        gpu,
+        (enable + (u64::from(profile.streams()) - 1) * stride) as u32,
+    )?;
     let regs: MmioRegion = gpu.regs;
-    let offset = base + (enable + u64::from(dig) * DIG_STRIDE) * 4;
+    let offset = base + (enable + u64::from(dig) * stride) * 4;
     let value = authority
         .invoke(Op(|| {
             // SAFETY: the bank bounds every DIG instance.

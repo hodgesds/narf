@@ -20,7 +20,7 @@ fn dmub_navi48_mailbox_proves_version_caps_and_wraparound() -> TestResult {
     }
     // Cross the 8-KiB inbox boundary twice, including the final slot reply.
     for i in 0..260u32 {
-        if run(engine.hpd((i % 6) as u8)) != Ok(true) {
+        if run(engine.hpd((i % 4) as u8)) != Ok(true) {
             return TestResult::Fail("HPD or inbox wraparound");
         }
     }
@@ -186,8 +186,8 @@ fn dmub_navi48_mailbox_rejects_bad_replies_and_invalid_requests() -> TestResult 
     }
     let (_pool, mut engine) = ready();
     let writes = engine.io.writes.len();
-    if run(engine.hpd(6)) != Err(Error::Invalid)
-        || run(engine.aux(6, 0x90, 0x202, &mut [0])) != Err(Error::Invalid)
+    if run(engine.hpd(4)) != Err(Error::Invalid)
+        || run(engine.aux(4, 0x90, 0x202, &mut [0])) != Err(Error::Invalid)
         || run(engine.aux(0, 0x91, 0x202, &mut [0])) != Err(Error::Invalid)
         || run(engine.aux(0, 0x90, 0x100000, &mut [0])) != Err(Error::Invalid)
         || run(engine.aux(0, 0x90, 0x202, &mut [])) != Err(Error::Invalid)
