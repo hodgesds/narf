@@ -93,8 +93,13 @@ mcopy -s -i "$tmp/esp.img@@1048576" "$tmp/esp/EFI" ::/
 mcopy -s -i "$tmp/esp.img@@1048576" "$tmp/esp/boot" ::/
 mcopy -s -i "$tmp/esp.img@@1048576" "$tmp/esp/loader" ::/
 
+# --enroll-cert sets up PK/KEK but Ubuntu's virt-firmware otherwise leaves db
+# with its default Microsoft certificates. Keep this test policy isolated and
+# add the ephemeral signer explicitly so OVMF may execute the signed loader.
 virt-fw-vars --input "$secure_vars" --output "$tmp/enrolled-vars.fd" \
-    --enroll-cert "$tmp/db.crt" --secure-boot
+    --enroll-cert "$tmp/db.crt" --no-microsoft \
+    --add-db 8c8b13fd-3c1f-4dce-92d9-2a76e88d9fe8 "$tmp/db.crt" \
+    --secure-boot
 
 boot_image() {
     local image=$1 vars=$2 log=$3 timeout_secs=$4
