@@ -391,6 +391,11 @@ impl ColdBoot {
     pub fn state(&self) -> State {
         self.sequence.state
     }
+    pub fn report(&self) -> Option<Report> {
+        (self.state() == State::MemoryReady)
+            .then(|| self.sequence.backend.report().ok())
+            .flatten()
+    }
     /// MemoryReady proves firmware, power, an owned VMID0 SDMA write/copy
     /// and the DMUB version/capability mailbox handshake.
     /// It does not establish userspace queues or a native display mode.

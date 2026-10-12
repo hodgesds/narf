@@ -1047,7 +1047,7 @@ pub fn register_initcalls() {
     narf_init::register(Stage::Subsys, "fb-amdgpu-handoff-register", || {
         narf_init::register_with_budget(
             Stage::Late,
-            "amdgpu-navi22-firmware",
+            "amdgpu-discrete-firmware",
             amdgpu_boot::start,
             30_000,
         );

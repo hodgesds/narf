@@ -268,35 +268,28 @@ interfaces and limits.
 
 ## Current work
 
-The `feat/amdgpu-navi48-bringup` branch starts RX 9070 XT / Navi48 support
-from the Navi22 work below. The September 2026 Steam PC survey identifies it
-as the leading named AMD card (1.42%). PCI ID `1002:7550` now has a distinct
-RDNA4 family, discovery-checked DRM identity, bounded PCIe VRAM accounting
-and an SMUIO14.0.2 ROM snapshot path. Legacy firmware/engine/display and
-APU power paths reject this generation before accessing hardware. An explicit
-PSP14 SOS bootstrap now validates the descriptor-based signed containers,
-pins firmware to the discovered PSP revision, uploads all boot components
-in Linux's order and retains published staging memory on cancellation or
-failure. It requires caller-owned, trained VRAM.
-The explicit PSP14 GPCOM/TMR transport and cancellation-safe GDDR6 long-training
-owner now support GMC12 address validation and HDP6 flush semantics. TOC setup
-rejects cross-revision firmware. The complete capability-backed Navi48 firmware set, RS64/MES/IMU/RLC payload
-selection, PSP autoload and GC12 readiness check are implemented. Automatic
-Navi48 boot ownership, GMC12/SDMA7 queues and DCN4 modesetting remain in
-progress. GMC12/DCN4 boot VRAM inventory and the SMU14 handshake, firmware-owned
-board-table transfer and bounded initial GFX/protection policy are implemented.
-An explicit cold-boot coordinator retains all firmware owners and sequences
-training, PSP/SMU, DCN4 DMUB stop, graphics autoload and initial power setup.
-Native memory/queue/display integration and physical-card validation remain
-open; firmware readiness does not advertise working acceleration.
-GMC12/MMHUB4.1 VMID0 translation and the SDMA7 owned-VRAM write/copy/fence
-path now form the last two explicit cold-boot stages. The returned proof
-covers those kernel-owned pages only; userspace graphics/compute queues,
-native display and real-card validation remain open.
-DCN4 DMUB shared-state allocation, CNTL2/DMUIF reset, authenticated-window
-validation, startup and version/capability/HPD/AUX mailbox support are now
-implemented and included in cold boot. Native scanout/link programming,
-graphics/compute/media queues and automatic platform ownership remain open.
+The `feat/amdgpu-navi48-bringup` branch targets RX 9070 XT / Navi48, the
+leading named AMD card in the September 2026 Steam PC survey (1.42%). PCI
+`1002:7550` has distinct RDNA4 identity, discovery-checked IP selection,
+separate physical/CPU-visible VRAM accounting and SMUIO14 ROM access. Legacy
+APU/engine/display paths refuse this generation before touching hardware.
+
+Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
+firmware parsing, upload and autoload; SMU14 board-table transfer and initial
+GFX/thermal policy; GMC12/MMHUB4.1 owned VMID0 translations; SDMA7 translated
+VRAM write/copy/fence verification; and DCN4 DMUB shared state, authenticated
+window validation, startup and version/capability/HPD/AUX mailbox support.
+The boot coordinator retains all hardware owners through failures and
+cancellation. The final framebuffer handoff selects Navi48, blocks legacy
+controller/PM access after preparation and quarantines the primary framebuffer
+on incomplete startup. Read-only preparation failures restore CPU writers.
+
+Still open: GC12/MES12 graphics and compute queue execution, production GPU VM
+and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
+and scanout programming, reset/suspend/resume, and physical RX 9070 XT testing.
+The verified DMA proof covers only two kernel-owned VRAM pages. The driver
+continues to report acceleration unavailable; model/QEMU tests do not prove
+working silicon, native modesetting or Mesa/Vulkan support.
 
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total

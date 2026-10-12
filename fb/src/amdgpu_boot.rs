@@ -1,7 +1,8 @@
-//! Boot-only CPU framebuffer handoff for Navi22 GDDR6 training. This is not a
+//! Boot-only CPU framebuffer handoff for discrete AMD GDDR6 training. This is not a
 //! runtime pause API: mmap writers cannot be stopped by a software flag.
 use core::sync::atomic::{AtomicBool, Ordering};
 use narf_drivers_gpu::amdgpu_navi22_platform as platform;
+use narf_drivers_gpu::amdgpu_navi48_platform as navi48;
 use narf_init::InitResult;
 
 static PAUSED: AtomicBool = AtomicBool::new(false);
@@ -35,25 +36,31 @@ pub(super) fn start() -> InitResult {
         return InitResult::NotPresent;
     }
     let framebuffer = *super::BOOT_GENERIC.lock();
+    let navi48 = narf_drivers_gpu::amdgpu::with_controller(|g| {
+        g.chip.did == narf_drivers_gpu::amdgpu::NAVI48
+    })
+    .unwrap_or(false);
+    let generation = if navi48 { "navi48" } else { "navi22" };
     let pause = Pause::new();
     // SAFETY: final synchronous boot initcall, before executor/user startup.
     // No NARF GPU queues/VRAM allocations exist. Console and sleep-pump writes
     // are stopped above, and the original physical GOP geometry is retained.
-    let prepared = unsafe { platform::prepare(framebuffer) };
+    let prepared = if navi48 {
+        // SAFETY: same final boot handoff and paused writers described above.
+        unsafe { navi48::prepare(framebuffer) }.map_err(|e| refused(generation, e))
+    } else {
+        // SAFETY: same final boot handoff and paused writers described above.
+        unsafe { platform::prepare(framebuffer) }.map_err(|e| refused(generation, e))
+    };
     let affected = match prepared {
         Ok(None) => {
             pause.resume();
             return InitResult::NotPresent;
         }
-        Err(error) => {
+        Err(()) => {
             // Preparation has issued no device writes and owns no hardware.
             pause.resume();
-            use core::fmt::Write;
-            let _ = writeln!(
-                narf_console::Writer,
-                "amdgpu: navi22 preflight refused: {error:?}"
-            );
-            return InitResult::Error("Navi22 firmware preflight");
+            return InitResult::Error("AMD PCIe firmware preflight");
         }
         Ok(Some(affected)) => affected,
     };
@@ -61,23 +68,47 @@ pub(super) fn start() -> InitResult {
     // pumps, not the executor. No spinlock guard is held; spin works even if
     // this boot profile has not enabled interrupts yet.
     // SAFETY: all CPU writers remain paused until successful terminal return.
-    let result = narf_scheduler::block_on_spin(unsafe { platform::run() });
-    if result.is_ok() || !affected {
+    let ok = if navi48 {
+        // SAFETY: the retained prepared owner and paused CPU writers persist.
+        let result = narf_scheduler::block_on_spin(unsafe { navi48::run() });
+        completed(generation, result, navi48::status());
+        result.is_ok()
+    } else {
+        // SAFETY: the retained prepared owner and paused CPU writers persist.
+        let result = narf_scheduler::block_on_spin(unsafe { platform::run() });
+        completed(generation, result, platform::status());
+        result.is_ok()
+    };
+    if ok || !affected {
         // A secondary GPU cannot affect the boot framebuffer on another BAR.
         pause.resume();
     }
     use core::fmt::Write;
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: navi22 firmware {:?}; retained {:?}; framebuffer {}",
-        result,
-        platform::status(),
+        "amdgpu: {generation} framebuffer {}",
         if paused() { "quarantined" } else { "available" }
     );
-    match result {
-        Ok(_) => InitResult::Ok,
-        Err(_) => InitResult::Error("Navi22 firmware startup (owner retained)"),
+    if ok {
+        InitResult::Ok
+    } else {
+        InitResult::Error("AMD PCIe firmware startup (owner retained)")
     }
+}
+
+fn refused(generation: &str, error: impl core::fmt::Debug) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: {generation} preflight refused: {error:?}"
+    );
+}
+fn completed(generation: &str, result: impl core::fmt::Debug, status: impl core::fmt::Debug) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: {generation} firmware {result:?}; retained {status:?}"
+    );
 }
 
 #[cfg(feature = "kernel-test")]

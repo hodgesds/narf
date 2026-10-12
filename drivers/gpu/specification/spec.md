@@ -294,6 +294,24 @@ cold-boot firmware bundle includes DMUB preparation, and `ColdBoot::dmub`
 exposes the mailbox only after the complete boot sequence succeeds while
 retaining PSP/TMR. This proves firmware communication, not native scanout.
 
+`unsafe amdgpu_navi48_platform::prepare(physical_boot_framebuffer)` is the
+single-CPU boot handoff. It prepares immutable firmware, inventories VRAM and
+refuses training over live firmware in the overwritten prefix, then claims
+exclusive controller access and retains `ColdBoot` in an async mutex. Errors
+before the claim perform no hardware writes and release all reservations.
+`unsafe run().await` requires CPU framebuffer writers to remain stopped; its
+owner persists across success, failure and cancellation. `status` exposes the
+stage and successful report without waiting. HPD/AUX/notification wrappers
+serialize access to the live DMUB mailbox. Normal controller and legacy PM
+entry points cannot access either claimed discrete generation; immutable DRM
+discovery remains available and acceleration is still unadvertised.
+
+The final `narf-fb` `amdgpu-discrete-firmware` initcall selects Navi22 or Navi48,
+pauses CPU console/framebuffer writers before preparation, and runs startup
+without a spinlock or executor poll on the stack. A preflight error resumes
+writers. A started failure/cancellation on the primary GPU keeps them stopped;
+an unrelated secondary GPU cannot quarantine another device's framebuffer.
+
 ### Navi 22 PSP secure-OS bootstrap
 
 `amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects
@@ -806,7 +824,7 @@ Navi22 is excluded from the DCN314 USB-C startup path. Its suspend handler
 returns `NotImplemented` before changing PM state or issuing commands; discrete
 GPUs cannot resolve the legacy APU SMU mailbox through `mp1_mailbox_base`.
 
-`narf-fb` registers `amdgpu-navi22-firmware` during Subsys, appending it after
+`narf-fb` registers `amdgpu-discrete-firmware` during Subsys, appending it after
 the statically registered Late firmware scans and framebuffer initialization.
 This synchronous boot call runs before executor polling and userspace mmap.
 It pauses cached writers, scanout/fbdev discovery, drain/cursor/status pumps,

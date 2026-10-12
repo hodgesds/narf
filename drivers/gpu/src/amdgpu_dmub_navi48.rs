@@ -23,7 +23,10 @@ const GPINT: u32 = 0x1f8;
 const STOP: u32 = 0x10020000;
 const STATUS: u32 = 0x1e3;
 const MASK: u32 = 0x1fffffff;
-#[allow(clippy::duplicate_mod, reason = "instantiate the shared protocol against each generation's private Engine and register accessors")]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "instantiate the shared protocol against each generation's private Engine and register accessors"
+)]
 #[path = "amdgpu_dmub_navi22_mailbox.rs"]
 mod mailbox;
 pub use mailbox::{FeatureCaps, MailboxState};

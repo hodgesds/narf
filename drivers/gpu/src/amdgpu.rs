@@ -2209,7 +2209,7 @@ unsafe fn read_vbios_version_from_rom(
 static CONTROLLER: IrqSafeSpinLock<Option<AmdGpu>> = IrqSafeSpinLock::new(None);
 // Set under CONTROLLER before the boot owner leaves that lock. It stays set
 // through success, failure and cancellation: only that owner may access MMIO.
-static NAVI22_OWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DISCRETE_OWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static PCI_AUTHORITY: IrqSafeSpinLock<Option<Cap<BusDeviceCap, Write>>> =
     IrqSafeSpinLock::new(None);
 static PCI_DEVICE: IrqSafeSpinLock<Option<BusDevice>> = IrqSafeSpinLock::new(None);
@@ -2499,14 +2499,32 @@ pub(crate) fn is_navi22() -> bool {
 pub(crate) fn claim_navi22<R, E>(
     prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
 ) -> Option<Result<R, E>> {
+    claim_discrete(NAVI22, prepare)
+}
+
+pub(crate) fn is_navi48() -> bool {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .is_some_and(|gpu| gpu.chip.did == NAVI48)
+}
+pub(crate) fn claim_navi48<R, E>(
+    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
+) -> Option<Result<R, E>> {
+    claim_discrete(NAVI48, prepare)
+}
+fn claim_discrete<R, E>(
+    did: u16,
+    prepare: impl FnOnce(&AmdGpu) -> Result<R, E>,
+) -> Option<Result<R, E>> {
     let controller = CONTROLLER.lock();
     let gpu = controller.as_ref()?;
-    if gpu.chip.did != NAVI22 || NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+    if gpu.chip.did != did || DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {
         return None;
     }
     let result = prepare(gpu);
     if result.is_ok() {
-        NAVI22_OWNED.store(true, core::sync::atomic::Ordering::Release);
+        DISCRETE_OWNED.store(true, core::sync::atomic::Ordering::Release);
     }
     Some(result)
 }
@@ -2519,11 +2537,11 @@ pub(crate) fn info_snapshot() -> Option<crate::amdgpu_info::Snapshot> {
         .map(crate::amdgpu_info::Snapshot::from_gpu)
 }
 
-/// Returns None after Navi22's boot owner claims the hardware. Its immutable
+/// Returns None after a discrete GPU boot owner claims the hardware. Its immutable
 /// DRM discovery snapshot remains available independently of this MMIO access.
 pub fn with_controller<R>(f: impl FnOnce(&AmdGpu) -> R) -> Option<R> {
     let controller = CONTROLLER.lock();
-    if NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+    if DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {
         return None;
     }
     controller.as_ref().map(f)
@@ -2533,7 +2551,7 @@ pub fn with_controller<R>(f: impl FnOnce(&AmdGpu) -> R) -> Option<R> {
 /// state-mutating bring-up paths.
 pub fn with_controller_mut<R>(f: impl FnOnce(&mut AmdGpu) -> R) -> Option<R> {
     let mut controller = CONTROLLER.lock();
-    if NAVI22_OWNED.load(core::sync::atomic::Ordering::Acquire) {
+    if DISCRETE_OWNED.load(core::sync::atomic::Ordering::Acquire) {
         return None;
     }
     controller.as_mut().map(f)
@@ -2544,6 +2562,38 @@ mod navi22_ownership_tests {
     use super::*;
     use core::sync::atomic::Ordering;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn navi48_boot_claim_excludes_legacy_access_and_wrong_owner() -> TestResult {
+        if is_probed() {
+            return TestResult::Skip("real controller owns the global slot");
+        }
+        *CONTROLLER.lock() = Some(crate::amdgpu_navi48_firmware::tests::gpu());
+        let prior_pm = PM_SUSPENDED.swap(false, Ordering::AcqRel);
+        let wrong = claim_navi22(|_| Ok::<_, ()>(())).is_none();
+        let failed: Option<Result<(), ()>> = claim_navi48(|_| Err(()));
+        let released = failed == Some(Err(())) && with_controller(|_| true) == Some(true);
+        let claimed = claim_navi48(|_| Ok::<_, ()>(())) == Some(Ok(()));
+        let exclusive = with_controller(|_| true).is_none()
+            && with_controller_mut(|_| true).is_none()
+            && claim_navi48(|_| Ok::<_, ()>(())).is_none()
+            && info_snapshot().is_some_and(|info| info.did == u32::from(NAVI48))
+            && is_navi48()
+            && amdgpu_suspend_handler()
+                == Err(narf_power::device_pm::DeviceSuspendError::NotImplemented)
+            && !PM_SUSPENDED.load(Ordering::Acquire);
+        *CONTROLLER.lock() = None;
+        DISCRETE_OWNED.store(false, Ordering::Release);
+        PM_SUSPENDED.store(prior_pm, Ordering::Release);
+        if wrong && released && claimed && exclusive {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("Navi48 ownership rollback, exclusivity or PM gating")
+        }
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_boot_claim_excludes_legacy_access_and_wrong_owner
+    );
 
     fn navi22_boot_claim_excludes_legacy_access_and_suspend() -> TestResult {
         if is_probed() {
@@ -2571,7 +2621,7 @@ mod navi22_ownership_tests {
             && amdgpu_suspend_handler()
                 == Err(narf_power::device_pm::DeviceSuspendError::NotImplemented);
         *CONTROLLER.lock() = None;
-        NAVI22_OWNED.store(false, Ordering::Release);
+        DISCRETE_OWNED.store(false, Ordering::Release);
         PM_SUSPENDED.store(prior_pm, Ordering::Release);
         if !(mailbox_blocked && failure_released && pm_refused && exclusive) {
             return TestResult::Fail("Navi22 owner/PM exclusion or failed-preflight rollback");
