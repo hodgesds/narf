@@ -882,6 +882,27 @@ impl ColdBoot {
         // and excludes writers, including firmware and inherited scanout users.
         unsafe { self.otg.as_mut().map_err(|e| *e)?.retire_planes().await }
     }
+    /// Blank one native DP video stream before separate encoder/PHY retirement.
+    /// # Safety
+    /// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,
+    /// audio/packet/link/clock/power writers, and retain all associated memory
+    /// and translations. This proves video blanking only, never memory retirement.
+    pub async unsafe fn blank_display_dp_stream(
+        &mut self,
+        stream: otg::DpStream,
+    ) -> Result<otg::DpBlanked, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: matching retained owner; caller excludes writers and retains memory.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .blank_dp_stream(stream)
+                .await
+        }
+    }
     fn display_retirement_busy(&self) -> bool {
         self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)

@@ -465,6 +465,36 @@ reset. `RunningBlank` must first retire its timing before plane retirement.
 serialize the operation after drained GC12/SDMA proofs. No automatic firmware
 display takeover or visible link output is introduced.
 
+`unsafe Otg::blank_dp_stream(DpStream::{Dio,Hpo}(instance)).await` blanks one
+of the four native legacy or four HPO DisplayPort stream encoders. Stream
+instances are independent of OTG/transmitter routing; this operation never
+infers a board route or changes a PHY. Callers must stop CPU scanout writers,
+exclude firmware/FAMS and concurrent display, audio/packet, link, clock and
+power writers, and retain every associated allocation and translation. The
+retained timing owner serializes the operation; active timing/links may remain
+running. Invalid instances, contradictory frontend modes/clock enables and
+incomplete resets reject before writes.
+
+Legacy DP requests VBLANK-deferred disable and waits for both video enable and
+hardware status to clear, including inherited enable-clear/status-set cases.
+Only then may it assert steering-FIFO reset and require reset-done. HPO DP
+likewise waits for video acknowledgement before disabling SDP and the pixel
+and clock-ramp FIFOs, in native order. Video waits have a 150 ms bound and the
+legacy reset acknowledgement has a 1 ms bound. An already blank disabled
+encoder receives no writes. Final readback checks that frontend enables,
+clock selections/enables and reset state were preserved. Stream, link and
+timing clocks remain retained; DIO audio/secondary packets remain unchanged.
+
+Success enters `DpBlanked` and records `DpBlanked::{stream,was_active}` in
+`Status::dp_blanked`. This is historical video-blank evidence only: it does
+not prove sink power-down, PHY/encoder/timing/memory retirement, MST teardown
+or HDMI blanking. Subsequent timing, plane and clock operations still require
+their own live consumer checks. Cancellation leaves `BlankingDp(stream)`;
+errors after beginning the operation enter `Failed`, blocking all reuse until
+independent reset. No outcome permits allocation reuse. `unsafe
+ColdBoot::blank_display_dp_stream` and the platform wrapper require the
+drained GC12/SDMA interrupt proofs and serialize access to the same owner.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

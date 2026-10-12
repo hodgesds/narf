@@ -393,6 +393,22 @@ pub async unsafe fn retire_display_planes(
     unsafe { boot.retire_display_planes().await }
 }
 
+/// Blank one legacy or HPO DisplayPort video stream, retaining timing/link clocks.
+/// # Safety
+/// Stop CPU scanout writers and exclude firmware/FAMS and concurrent display,
+/// audio/packet/link/clock/power writers. Retain every allocation and translation;
+/// this does not retire the PHY, sink, timing, MST topology or memory.
+pub async unsafe fn blank_display_dp_stream(
+    stream: crate::amdgpu_dcn401_otg::DpStream,
+) -> Result<crate::amdgpu_dcn401_otg::DpBlanked, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller excludes writers and retains memory.
+    unsafe { boot.blank_display_dp_stream(stream).await }
+}
+
 /// Consume bounded diagnostic history from the independent IH service.
 /// Hardware draining and CPU interrupt waits never hold the display-owner lock.
 pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> {

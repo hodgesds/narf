@@ -24,6 +24,9 @@ struct Fake {
     disconnecting: bool,
     forbidden_hubps: u8,
     plane_delay: [u8; 4],
+    dp_written: u8,
+    dp_delay: [u8; 8],
+    dp_stall: u16,
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
@@ -31,6 +34,27 @@ impl Io for Fake {
             return u32::MAX;
         }
         for p in 0..4 {
+            for (slot, reg, stride, status) in
+                [(p, 0x2122, 0x124, 0x10000), (p + 4, 0x3685, 0xd4, 0x100)]
+            {
+                if at == BASE + (reg + p * stride) * 4
+                    && self.dp_written & (1 << slot) != 0
+                    && self.regs.get(&at).copied().unwrap_or(0) & 1 == 0
+                    && self.dp_stall & (1 << slot) == 0
+                {
+                    if self.dp_delay[slot as usize] == 0 {
+                        *self.regs.entry(at).or_default() &= !status;
+                    } else {
+                        self.dp_delay[slot as usize] -= 1;
+                    }
+                }
+            }
+            if at == BASE + (0x2123 + p * 0x124) * 4
+                && self.regs.get(&at).copied().unwrap_or(0) & 2 != 0
+                && self.dp_stall & (1 << (p + 8)) == 0
+            {
+                *self.regs.entry(at).or_default() |= 4;
+            }
             assert!(
                 self.forbidden_hubps & (1 << p) == 0
                     || !(BASE + (0x5f4 + p * 0xdc) * 4..=BASE + (0x68d + p * 0xdc) * 4)
@@ -106,6 +130,14 @@ impl Io for Fake {
         assert!(
             (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
+                || (0..4).any(|p| {
+                    [0x2122, 0x2123]
+                        .iter()
+                        .any(|r| at == BASE + (r + p * 0x124) * 4)
+                        || [0x3626, 0x365e, 0x367b, 0x3685]
+                            .iter()
+                            .any(|r| at == BASE + (r + p * 0xd4) * 4)
+                })
         );
         self.writes.push((at, value));
         if self.reject == Some(self.writes.len()) {
@@ -116,6 +148,38 @@ impl Io for Fake {
             self.disconnecting = true;
         }
         for p in 0..4 {
+            if at == BASE + (0x2122 + p * 0x124) * 4 {
+                self.dp_written |= 1 << p;
+            }
+            if at == BASE + (0x3685 + p * 0xd4) * 4 {
+                self.dp_written |= 1 << (p + 4);
+            }
+            // Fail a model immediately if software cuts a FIFO/SDP before
+            // video acknowledgement; requested disable alone is insufficient.
+            if at == BASE + (0x2123 + p * 0x124) * 4 && value & 2 != 0 {
+                assert_eq!(
+                    self.regs
+                        .get(&(BASE + (0x2122 + p * 0x124) * 4))
+                        .copied()
+                        .unwrap_or(0)
+                        & 0x10001,
+                    0
+                );
+            }
+            if [0x3626, 0x365e, 0x367b]
+                .iter()
+                .any(|r| at == BASE + (r + p * 0xd4) * 4)
+                && value & 1 == 0
+            {
+                assert_eq!(
+                    self.regs
+                        .get(&(BASE + (0x3685 + p * 0xd4) * 4))
+                        .copied()
+                        .unwrap_or(0)
+                        & 0x101,
+                    0
+                );
+            }
             assert!(
                 self.forbidden_hubps & (1 << p) == 0
                     || !(BASE + (0x5f4 + p * 0xdc) * 4..=BASE + (0x68d + p * 0xdc) * 4)
@@ -182,6 +246,9 @@ fn engine() -> Engine<Fake> {
             disconnecting: false,
             forbidden_hubps: 0,
             plane_delay: [0; 4],
+            dp_written: 0,
+            dp_delay: [0; 8],
+            dp_stall: 0,
         },
         authority: Cap::bootstrap(),
         layout: Layout::resolve(&gpu).unwrap(),
@@ -191,6 +258,7 @@ fn engine() -> Engine<Fake> {
             blanks: [None; 4],
             running_blank: None,
             planes_retired: None,
+            dp_blanked: None,
             retired: 0,
         },
     }
@@ -904,3 +972,6 @@ mod blank;
 
 #[path = "amdgpu_dcn401_fetch_tests.rs"]
 mod fetch;
+
+#[path = "amdgpu_dcn401_stream_tests.rs"]
+mod stream;

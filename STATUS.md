@@ -329,6 +329,12 @@ Already-off HUBPs require native PGFSM acknowledgement and remain untouched.
 Blank startup accepts native TTU behavior and checks the independent 3D-LUT
 fetcher. Pending flips, synchronization, metadata/LUT loads and uncertain power
 states block retirement before writes; failure/cancellation retain resources.
+Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
+acknowledgement before resetting or disabling FIFOs. It handles inherited
+disable-in-progress state, keeps timing and link clocks available for PHY
+retirement, and quarantines the owner on timeout, failure or cancellation.
+Per-stream selection does not assume OTG/transmitter routing; HDMI, sink power
+and complete encoder/PHY shutdown still need their own native sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths
 have model tests, not silicon validation.

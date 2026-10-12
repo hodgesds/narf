@@ -15,6 +15,9 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::PlanesRetired;
+#[path = "amdgpu_dcn401_stream.rs"]
+mod stream;
+pub use stream::{DpBlanked, DpStream};
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -62,6 +65,8 @@ pub enum State {
     BlankPrepared,
     StartingBlank(u8),
     RunningBlank(u8),
+    BlankingDp(DpStream),
+    DpBlanked,
     RetiringPlanes,
     PlanesRetired,
     Retiring(u8),
@@ -77,6 +82,7 @@ impl State {
                 | Self::BlankPrepared
                 | Self::Retired
                 | Self::PlanesRetired
+                | Self::DpBlanked
         )
     }
 }
@@ -134,6 +140,8 @@ pub struct Status {
     /// Historical fetch-stop evidence. Never grants allocation reuse or proves
     /// retirement of GPUVM, writeback, or other GPU engines.
     pub planes_retired: Option<PlanesRetired>,
+    /// Historical DP video blanking only; never PHY, timing or memory retirement.
+    pub dp_blanked: Option<DpBlanked>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -471,6 +479,7 @@ impl Otg {
                 blanks: [None; 4],
                 running_blank: None,
                 planes_retired: None,
+                dp_blanked: None,
                 retired: 0,
             },
         }))
