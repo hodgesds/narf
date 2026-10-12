@@ -25,7 +25,7 @@ pub enum Error {
     InvalidSize,
     MetadataMissing,
     InvalidMetadata,
-    /// DCN314's window setup has no separate BSS or shared-state mapping.
+    /// Selected combined-image setup has no separate BSS/shared-state mapping.
     UnsupportedLayout,
     BufferTooSmall,
     InvalidAddress,
@@ -169,6 +169,21 @@ impl<'a> Image<'a> {
     /// belong to this GPU; this method bounds its storage, but does not parse
     /// ATOM tables or authenticate it. No VRAM reservation is implied.
     pub fn prepare_dcn314(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
+        self.prepare_combined(vbios)
+    }
+
+    /// DCN3.0's combined-image layout with cached inbox support. Legacy BSS
+    /// and uncached-inbox images require a separate window layout.
+    pub fn prepare_dcn30(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
+        if (u16_at(self.bytes, 12), u16_at(self.bytes, 14)) != (3, 0)
+            || self.metadata.version <= 0x010a_0000
+        {
+            return Err(Error::UnsupportedLayout);
+        }
+        self.prepare_combined(vbios)
+    }
+
+    fn prepare_combined(self, vbios: &'a [u8]) -> Result<Prepared<'a>, Error> {
         if !self.data.is_empty()
             || self.metadata.shared_state_size != 0
             || self.metadata.shared_state_features != 0
@@ -181,7 +196,7 @@ impl<'a> Image<'a> {
         let sizes = [
             self.instructions.len(),
             (128 + 512) * 1024, // Linux DMUB_STACK_SIZE + DMUB_CONTEXT_SIZE.
-            0,                  // DCN31 setup_windows does not program CW2.
+            0,                  // Combined image has no separate CW2 data.
             vbios.len(),
             RING_SIZE as usize * 2,
             self.metadata.trace_size as usize,

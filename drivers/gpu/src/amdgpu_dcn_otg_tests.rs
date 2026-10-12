@@ -39,6 +39,7 @@ fn engine(instance: u8) -> Engine<Fake> {
         authority: Cap::bootstrap(),
         instance,
         state: State::Idle,
+        profile: Profile::Dcn314,
     }
 }
 fn timing() -> Timing {
@@ -67,6 +68,42 @@ fn sync() -> GlobalSync {
 fn run<T>(future: impl core::future::Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(future)
 }
+fn otg_navi22_uses_dcn30_sync_fields_and_disable_point() -> TestResult {
+    let mut otg = engine(0);
+    otg.profile = Profile::Navi22;
+    otg.instance = 5;
+    otg.io.values.resize(0x1e0a, 0);
+    otg.program_timing(&timing(), &sync()).unwrap();
+    // Literal DCN30 instance-5 register ids and field encodings from Linux.
+    for (reg, value) in [
+        (0x1daa, 2199),
+        (0x1daf, 1124),
+        (0x1e07, 9),
+        (0x1e08, 550 | 247 << 16),
+        (0x1e09, 328),
+        (0x1b1b, 0x00fff500),
+    ] {
+        if otg.io.values[reg] != value {
+            return TestResult::Fail("DCN30 OTG layout");
+        }
+    }
+    otg.enable().unwrap();
+    if otg.io.values[0x052d] != 1 << 31 || otg.io.values[0x1dc1] & 0x301 != 0x301 {
+        return TestResult::Fail("DCN30 VTG or disable point");
+    }
+    run(otg.disable()).unwrap();
+    if otg.io.values[0x052d] & (1 << 31) != 0
+        || otg.io.values[0x1dc1] & 0x301 != 0x300
+        || otg.io.values[0x1b1b] != 0x00fff500
+    {
+        return TestResult::Fail("DCN30 disable cut live ODM routing");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-otg",
+    otg_navi22_uses_dcn30_sync_fields_and_disable_point
+);
 
 fn otg_timing_counters_hold_one_less_than_the_total() -> TestResult {
     let mut otg = engine(0);

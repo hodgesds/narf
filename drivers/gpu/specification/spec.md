@@ -44,6 +44,598 @@ infrastructure (Phase B).
 
 ## 3. Public interface
 
+### AMD discrete PCIe probe and VRAM
+
+`AmdGpu::bring_up` supports discovery outside the CPU-visible BAR0 aperture.
+The default discovery table is a 10 KiB read beginning 64 KiB below the end
+of **physical VRAM**, sized from the absolute `RCC_CONFIG_MEMSIZE` register
+(BAR5 byte offset `0x378c`, value in MiB). The read uses BAR0 only within its
+mapped length, then BAR5's MM_INDEX/MM_INDEX_HI/MM_DATA memory access ports.
+Memory indices use byte addresses and a 31-bit split, including addresses
+above 4 GiB. Reads validate alignment, arithmetic, physical VRAM bounds and
+register-window capacity before accessing the device. They preserve the
+index latches and never write the memory data port or resize a BAR. Probe
+holds exclusive mapping/latch ownership and checks live PCI authority for
+sizing and discovery. Missing or invalid tables leave discovery unavailable.
+
+`VramInfo::size` is physical VRAM; `visible_size` is the smaller of that size
+and the mapped BAR0 length. A 12 GiB RX 6750 XT with a 256 MiB BAR therefore
+reports 12 GiB total and 256 MiB CPU-accessible; a 16 GiB Resizable BAR reports
+12 GiB for both. This mapping bound also applies to APUs under passthrough.
+Zero/absent VRAM has no visible heap and `fully_visible()` returns false.
+The bare-metal APU aperture expansion and relocated/system-memory discovery
+tables remain unimplemented.
+
+`AmdGpu::is_apu()` uses the discovered GC version, falling back to
+`ChipInfo::is_apu()` before discovery. The PCI fallback includes Rembrandt
+and Raphael despite their coarse Navi register-family assignment. BAR size
+never determines APU identity. `AMDGPU_INFO_MEMORY` and `VRAM_GTT` expose
+the two memory sizes, and `DEV_INFO` sets FUSION only for an APU.
+Navi 22 (`1002:73df`, GC 10.3.2) reports `AMDGPU_FAMILY_NV` and the GMC10
+48-bit VA geometry, which matches GMC11's geometry. A missing or mismatched
+GC version rejects its `DEV_INFO`. This identifies the device; acceleration
+continues to report unavailable. Navi 22 firmware, GMC/GFX10 execution and
+DCN3.0 display bring-up are not enabled by this probe path.
+
+### Navi 22 PSP secure-OS bootstrap
+
+`amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects
+`amdgpu/navy_flounder_sos.bin` only for `1002:73df`, GC 10.3.2 and MP0
+11.0.11. Duplicate/missing IP instances and undersized register banks reject
+the path. The registry and blob are read inside `Cap::invoke`; a bounded,
+validated copy outlives those invocations. `amdgpu_psp_firmware::Image::parse`
+supports PSP 11.0 container headers v1.0–v1.3, validates file/payload sizes
+and descriptor bounds/overlap, and exposes KDB, SPL, system driver and SOS
+in boot order. Parsing is structural validation; authentication remains with
+the firmware registry and PSP. Optional KDB/SPL may be absent. TOC/RL and
+alternate images are validated but not submitted by this bootstrap.
+
+`unsafe amdgpu_psp_boot::Bootloader::new(gpu, pci_cap, pool)` requires an
+exclusively owned physical GPU, permanent mappings, already trained VRAM,
+and an owned `amdgpu_vram::Pool` with valid GPU addresses and exclusions
+for firmware/scanout/discovery/training/TMR. It checks the pool's CPU mapping
+against the visible BAR0 aperture and reserves a 1 MiB buffer aligned to
+1 MiB in GPU address space. Construction performs no MMIO. The caller must
+exclude other PSP clients, reset, memory training and power transitions.
+
+`Bootloader::load(&Firmware).await` clears and copies each signed component
+in cooperative 4 KiB chunks, drains posted VRAM writes, then supplies the
+**GPU** address shifted by 20 to C2PMSG36 and the boot command to C2PMSG35.
+These registers use MP0 base index 0. Each I/O batch checks current PCI
+authority. Response waits use timer futures with 1 s deadlines; SOS startup
+includes the required 20 ms delay and a changing, nonzero C2PMSG81 heartbeat.
+An already running SOS is checked without upload. All-ones reads, rejection,
+timeout and revocation fail closed. The object transitions
+`Prepared → Loading → Ready | Failed`; a cancelled future remains `Loading`
+and cannot be retried. Dropping an unpublished/completed staging reservation
+releases it; uncertain device ownership quarantines it, including after
+cancellation. No implicit reset or recovery reuses that memory.
+
+Success proves only SOS liveness, not the identity/version of a previously
+running SOS or availability of graphics acceleration. It does not set
+`AmdGpu::fw_loaded`. The legacy single/multi-blob loaders reject Navi 22;
+automatic platform wiring, VRAM training and the remaining IP firmware loads
+remain follow-up work. The PSP11 ring and SMC loader below are explicit APIs.
+
+### Navi 22 PSP command ring and trusted memory
+
+`unsafe amdgpu_psp_ring::Psp::new_navi22(gpu, pci_cap, pool)` claims the sole
+PSP 11.0.11 GPCOM ring under the exclusive ownership, trained-VRAM and permanent
+mapping requirements of the bootstrap. A bootstrap owner must reach `Ready`
+and be dropped before claiming the ring; failed/cancelled bootstrap requires
+independent reset/recovery. PCI ID `1002:73df`, GC 10.3.2, MP1 11.0.11 and
+SDMA0 5.2.2 are required; register banks are pinned to MP0 index 0,
+NBIO 2.3/3.3 index 2 and HDP 5.0
+index 0. NBIO remaps the HDP flush hole at BAR5 `0x7f000`; HDP read-cache
+invalidation precedes fence/reply reads. The remap must verify before any ring
+address is published. Missing/duplicate IPs and truncated windows reject the
+constructor. No DCN/display discovery is needed.
+
+The constructor reads GMC10 `GCMC_VM_FB_LOCATION_BASE/TOP` and `FB_OFFSET`
+at GC index 0, dwords `0x16fc/0x16fd` and `0x16e7`, under the PCI capability.
+It checks the owned pool's GPU addresses and CPU mapping against both the
+framebuffer range and visible BAR0 size before allocating the ring. Ring and
+payload addresses are GPU MC addresses. TMR's additional physical address is
+`gpu_address - framebuffer_base + framebuffer_offset`, as seen by the GPU;
+the host PCI BAR address is never substituted.
+
+`start().await` uses the same bounded PF GPCOM wire protocol and 20 ms handshake
+as the Phoenix transport. `setup_tmr_navi22(&amdgpu_psp_boot::Firmware).await`
+uses `Image::toc()` from the validated SOS container, submits `LOAD_TOC`, and
+allocates the PSP-reported TMR size (nonzero, page-aligned, at most 64 MiB).
+Containers without a TOC use PSP11's 4 MiB default. TMR allocations are aligned
+to 1 MiB; `SETUP_TMR` carries both GPU and GPU-physical addresses with flags=2.
+Readiness requires a successful matching-fence completion. TOC staging is
+released only after completion or verified ring destruction; uncertain TMR
+installation retains the reservation and prevents retry. `unsafe stop().await`
+requires every TMR consumer to be quiescent and destroys TMR before the ring.
+Rejected teardown and cancellation retain device-owned memory.
+
+`Psp::new` and the standalone `setup_tmr`/`load_dmub` methods remain Phoenix
+operations and reject a Navi22 session. This transport does not enable graphics
+and still requires real-card validation and platform boot integration.
+
+### Navi 22 SMC firmware and SMU version handshake
+
+`amdgpu_smu_navi22::Firmware::open(gpu, registry_cap)` reads
+`amdgpu/navy_flounder_smc.bin` through live registry/blob capabilities and
+keeps an immutable, bounded copy. It requires PCI ID `1002:73df`, GC 10.3.2
+and MP1 11.0.11, with unique instance-zero IPs and a complete MP1 register
+window. `amdgpu_smc_firmware::Image::parse` accepts SMC header v2.0 / IP 11.0,
+checks the declared file size, aligned nonempty microcode range and disjoint
+file-relative PowerPlay table range. Limits are 2 MiB per container and 1 MiB
+of microcode. It exposes `payload()`, `version()` and optional `powerplay()`;
+the SRAM start address is metadata, never a host/GPU DMA address. Structural
+validation does not authenticate the image or select board power policy.
+
+`Psp::load_smc_navi22(&Firmware).await` requires a Navi22 ring with acknowledged
+TMR setup. It stages only the microcode and submits `LOAD_IP_FW` (6), firmware
+type SMU (18), using the GPU address and exact payload length. Matching-fence
+completion releases staging; missing completion retains device-owned memory.
+SMC loading is attempted once per session: success, failure or cancellation
+all prevent another upload. Verified stop/reset is required before a new
+session. This is a cold-boot operation before other IP loads, not a firmware
+reload, attach, BACO or resume path. PSP completion alone does not prove that
+the SMU is responsive.
+
+`unsafe amdgpu_smu_navi22::Smu::after_upload(gpu, pci_cap)` requires exclusive
+MP1/reset/power ownership, permanent mappings, successful cold-boot SMC upload
+and no outstanding mailbox command. Construction does no MMIO.
+`verify().await` sends only `GetDriverIfVersion` (3) and `GetSmuVersion` (2),
+using MP1 base index 0: C2PMSG66 message, C2PMSG82 argument and C2PMSG90 response.
+The cold-start response may be zero. Each command clears response/argument
+before publication and uses timer futures with a 1 s deadline. Every I/O batch
+checks current PCI authority. Success returns `Versions { firmware, interface }`
+with interface `0x0e` and a nonzero firmware version; all-ones reads, rejection,
+timeout, revocation and interface mismatch fail closed. State moves from
+`Prepared` to `Querying` to `Ready` or `Failed`; cancellation retains `Querying`
+and prohibits replay. The handshake does not program board power, enable
+DPM/graphics or set `AmdGpu::fw_loaded`.
+
+### Navi 22 board PowerPlay preparation and upload
+
+`amdgpu_power_navi22::Prepared::new(vbios, smc_firmware, Identity)` builds an
+immutable board table without device I/O. `Identity` contains the PCI revision
+and subsystem IDs; production reads them under live PCI authority. ATOM master
+data revision 2.1 and FirmwareInfo 3.4/3.5 select the source: table ID zero uses
+the VBIOS PowerPlay table, while a nonzero ID uses the SMC v2.0 container's
+single embedded table. A missing or invalid selected source fails without
+fallback. Supported Navy Flounder tables are exactly 2470 bytes, revision
+16.0 / format `0x81`, with an 802-byte driver prefix and a 1668-byte SMC
+version-1 payload. Other wire layouts are refused.
+
+Preparation overlays the 292 bytes after the ATOM SMC_DPM_INFO 4.9 header onto
+the payload's `I2cControllers` through `BoardReserved` region, preserving SKU
+data and final SMU padding. The Linux ASUS revision-C3 quirks apply only to
+subsystem vendor `1043`, devices `16c2`/`133c`: clamp GFX table entries to
+2500 MHz, and set `BoardReserved[0]` to 1387 only for `16c2`. `bytes()` exposes
+the immutable SMC payload; `info()` reports source/table ID, platform flags,
+thermal-controller metadata, software shutdown temperature and quirk use.
+Preparation does not execute ATOM commands or apply user clock overrides.
+
+`unsafe Smu::upload_power_table(&Prepared, &Pool).await` requires the successful
+version handshake, a table prepared for this GPU, exclusive trained VRAM/HDP
+and index-latch ownership, and completed PSP startup. Before staging, it reads
+the bounded PSP runtime database's SCPM entry. Nonzero SCPM policy refuses the
+transfer with `PowerPolicy(value)`; malformed policy also fails before any SMU
+command or address publication. This path does not delegate table control to
+PSP. The uploader verifies the existing HDP flush remap, copies the payload to
+an owned CPU-visible VRAM reservation, flushes it, then sends
+`SetDriverDramAddrHigh`, `SetDriverDramAddrLow`, and `TransferTableDram2Smu`
+for table zero, using the reservation's GPU address. Each command checks live
+authority and has a one-second timer deadline.
+
+State moves from `Ready` to `UploadingPowerTable` to `PowerTableReady` or
+`Failed`; cancellation retains `UploadingPowerTable`. Success, rejection and
+cancellation prevent replay. The owner retains the published allocation even
+after acknowledgement because the SMU retains its address; dropping it
+quarantines the allocation. Prepublication failures release their reservation.
+Table upload alone does not enable DPM features or establish graphics readiness.
+`Prepared::boot_policy()` validates that the board enables GFX DPM together
+with PPT/TDC limits, firmware critical-temperature protection, automatic fans
+and thermal throttling. Production preparation requires these before claiming
+hardware. The immutable `BootPolicy` intersects board features with the driver
+allowlist; it cannot enable a feature absent from the board table.
+
+`unsafe Smu::configure_power().await` requires the uploaded board table and
+confirmed RLC autoload, exclusive ownership and idle queues. It sends `RunDcBtc`,
+sets the high/low allowed feature words, enables SMU features, verifies both
+running feature words, and reads the board's minimum/maximum GFX DPM frequencies.
+Missing required protection, unexpected enabled features or invalid frequency
+limits fail closed. `PowerStatus` reports allowed/enabled masks and the observed
+MHz range. State is `ConfiguringPower` until `PowerReady` or `Failed`; dropping
+the future retains the in-progress state and prevents replay. No failure resets
+hardware or releases its transfer buffer.
+
+The boot allowlist includes GFX DPM/prefetch, PPT/TDC, VR0HOT, firmware critical
+temperature, fan/thermal control, GFX spread spectrum, out-of-band monitoring
+and APCC DFLL when present in the board table. UCLK/FCLK/SOC/display/PCIe DPM,
+memory-voltage scaling, deep sleep, GFXOFF, BACO and hub/media gating remain
+disabled until their owners supply constraints. This does not install OS
+thermal interrupts or override board frequencies, voltages or fan curves.
+
+### Navi 22 graphics firmware and PSP autoload
+
+`amdgpu_gfx_navi22::Firmware::open(gpu, registry_cap)` prepares the complete
+`navy_flounder_{sdma,ce,pfp,me,mec,mec2,rlc,vcn,dmcub}.bin` set through live registry/blob
+capabilities before any device I/O. Device gating requires PCI `1002:73df`,
+GC 10.3.2, MP1 11.0.11, SDMA0 5.2.2 and DCN 3.0.0, with unique instance-zero
+records, plus a single VCN 3.0.0/3.0.64/3.0.192 instance. Other media layouts
+are refused; VCN 3.0.16 uses different firmware and is not Navy Flounder.
+Only MEC2 may be absent, and only a registry `NotFound` result is optional;
+signature, parsing, allocation and authority failures propagate. Immutable
+copies outlive the capability invocations. `images()` returns validated views
+in upload order.
+
+`amdgpu_gfx_firmware::Image::parse(Source, bytes)` supports CP header v1.0 /
+IP 10.3, SDMA v1.0 / IP 5.2, RLC v2.2–v2.4 / IP 10.3, and VCN/DMCUB v1.0 /
+IP 3.0. Each container is
+bounded to 4 MiB and each referenced range to 2 MiB. Declared file/header sizes,
+aligned ranges, descriptor bounds and RLC section overlap are checked. This
+path rejects incorrect declared sizes rather than using Linux's RLC size
+workaround. `source()`, `version()` and `payloads()` expose the selected image;
+each payload provides immutable `bytes()` and its PSP `firmware_type()`.
+Parsing alone neither authenticates a blob nor permits hardware loading.
+
+SDMA/CE/PFP/ME use the full common-header microcode range. MEC/MEC2 use only
+the prefix before the trailing jump table: the table must be nonempty and end
+exactly at the microcode boundary. Separate MEC jump-table uploads and repeated
+SDMA instance uploads are omitted for PSP11 autoload. RLC arrays use file-relative
+byte offsets. Upload order is tap-delay sections (v2.4), restore control/GPM/SRM,
+IRAM/DRAM, P/V (v2.3), then RLC_G. Empty optional sections are omitted; register
+list metadata is validated but never submitted as firmware. Nonempty P/V fields
+in v2.4 are rejected because Linux does not load them in that revision.
+VCN submits the complete common-header microcode payload as PSP type 13.
+DMCUB submits only `inst_const_bytes` as type 51, retaining PSP packaging and
+excluding BSS/data; its instruction/data sizes must exactly cover the payload.
+Both media payloads must end at the declared file boundary.
+
+`Psp::load_gfx_navi22(&Firmware).await` requires an acknowledged TMR and successful
+SMC upload. It validates the whole set/order before loading any member, sends
+bounded/fenced `LOAD_IP_FW` commands through owned VRAM staging, and submits
+`AUTOLOAD_RLC` (`0x21`) immediately after RLC_G succeeds, before VCN and DMCUB.
+It validates the entire set before publishing any payload. The public
+`gfx_load_state()` transitions `Absent → Loading → Accepted | Failed`;
+cancellation retains `Loading`. Success, error and cancellation all prevent
+replay in that session. Exact fence completion releases staging; incomplete
+commands quarantine staging/ring/TMR, and teardown still requires independent
+reset of every firmware consumer before TMR destruction.
+
+`Accepted` means PSP acknowledged autoload and both media uploads.
+`media_firmware()` returns `MediaFirmware { vcn, dmcub }` GPU entry addresses
+from completed PSP replies; each must be dword aligned and inside this
+session's retained TMR. Partial failures retain any earlier valid address for
+diagnostics. These are not CPU pointers or proof that the media engines have
+started. Consumers must keep TMR alive. The API does not configure memory hubs,
+queues, VCN/DMUB windows or board power, or set `AmdGpu::fw_loaded`.
+
+`Psp::wait_gfx_boot_navi22().await` requires this session's acknowledged autoload
+and checks GC 10.3.2 `CP_STAT` (base index 0, dword `0x0f40`) together with
+`RLC_RLCS_BOOTLOAD_STATUS` (base index 1, dword `0x4e8d`). Both banks must fit the
+BAR5 mapping at construction. Each paired sample checks live PCI authority;
+both registers are read without GC writes. Success requires `CP_STAT == 0`
+and `BOOTLOAD_COMPLETE` (bit 31). All-ones reads indicate removal, never success.
+The wait uses 1 ms timer futures with a 1 s deadline. State progresses from
+`Accepted → Checking → BootComplete | Failed`; cancellation retains `Checking`
+and blocks replay. `gfx_boot_status()` retains the last `GfxBootStatus
+{ cp_stat, rlc_bootload }` sample for timeout/removal diagnostics. No sample is
+produced when authority is already revoked. Waiting never releases ring/TMR
+ownership; verified consumer reset remains mandatory for teardown.
+`BootComplete` does not initialize queues, enable SDMA or establish acceleration.
+
+### Navi 22 VRAM-only memory hubs
+
+`unsafe amdgpu_gmc_navi22::Gmc::new(gpu, pci_cap, pool)` validates the physical
+Navi22 GC 10.3.2, MMHUB 2.1.0 and NBIO register banks and reserves four VRAM
+pages without I/O. The caller owns the hubs, VRAM, HDP and reset/PM controls,
+excludes all queues and VMs, and retains permanent mappings. Initialization
+requires trained VRAM, completed PSP/RLC boot and disabled automatic gating.
+`unsafe initialize().await` checks both hubs' framebuffer geometry and that
+all 16 contexts are disabled before writing either registers or backing pages.
+The HDP flush remap must already match the PSP-installed byte offset `0x7f000`.
+
+The first page holds a flat VMID0 table; only two PTEs are valid, mapping the
+owned source/destination pages in a 2 MiB aperture above the framebuffer range.
+The second owned page is the fault/default backing. PDEs/PTEs contain GPU
+physical VRAM addresses derived from framebuffer base/offset, never PCI BAR
+addresses; SYSTEM is clear. System-aperture bounds use 256 KiB units. User
+VMIDs, identity mapping, fault IRQs and retry remain disabled. Fault fallback
+targets owned VRAM, not system memory. This introduces no host DMA mapping.
+Both hubs invalidate all page-table caches for VMID0 using engine 17; MMHUB's
+semaphore is acquired first and released only after acknowledgement. Every
+sample checks live authority and waits through timer futures with a 100 ms
+deadline. Removal, revocation, cancellation and timeout prevent replay and
+retain all published memory; no implicit reset or semaphore release is tried.
+
+`state()` reports `Prepared`, `Programming`, `Invalidating(Hub)`, `Ready` or
+`Failed`; `aperture()` returns published `Aperture { start, size, source,
+destination }` address metadata, including after a started failure. Only
+`Ready` confirms both TLB acknowledgements. Keep the owner alive while a
+consumer uses these translations; this stage alone does not prove GPU access.
+
+### Navi 22 SDMA0 execution proof
+
+`unsafe amdgpu_sdma_navi22::Sdma::new(gpu, pci_cap, pool)` validates SDMA 5.2.2,
+GC 10.3.2, HDP 5.0 and NBIO, then reserves a 4 KiB ring and 4 KiB writeback page
+without I/O. SDMA0 registers come from GC base index zero, not the standalone
+SDMA discovery bank. The caller exclusively owns this physical GPU and its
+permanent mappings, VRAM pool, queues and reset/PM controls.
+`unsafe initialize(&mut Gmc).await` requires completed PSP/RLC/SDMA firmware
+loading, trained VRAM, disabled power gating and the same GPU's ready GMC.
+Preflight checks the framebuffer range, HDP remap, idle SDMA0, no outstanding
+GRBM reset and disabled GFX/PAGE/RLC0/RLC1 rings before any writes.
+
+Startup asserts only SDMA0's GRBM reset, waits at least 50 us, releases it and
+waits another 50 us using timer futures. It programs a privileged VMID0 direct
+ring with byte-addressed pointers, VRAM read-pointer writeback and write-pointer
+shadow polling, UTC L1, and the primary driver's cache policy. Doorbells,
+indirect buffers, context switching/preemption and interrupt delivery remain
+disabled. The single submission writes 16 distinct dwords through GMC's source
+virtual address, copies 64 bytes to its destination, emits an uncached fence
+at the destination page's end, and pads to 16 dwords. HDP flush precedes the
+write-pointer kick; HDP read-cache invalidation precedes CPU observations.
+Success requires the fence, both MMIO and VRAM read pointers at 128 bytes, and
+an exact comparison of all source/destination words. No host DMA is introduced.
+
+`state()` reports `Prepared`, `ResetAsserted`, `ResetReleased`, `Programming`,
+`Submitted`, `Verified` or `Failed`. `proof()` retains `Proof { copied_bytes,
+fence, read_pointer }` only after full success. Each I/O batch checks current
+authority; completion has a 1 s deadline. Revocation, cancellation, removal,
+timeout or corrupted data prevents replay. Ring/writeback memory is published
+before reset and retained on every started path; no destructor resets hardware.
+This is one boot execution test, not a general submission or acceleration API.
+
+### Navi 22 DCN3.0 DMUB startup
+
+`amdgpu_dmub_navi22::Prepared::new(image, vbios, psp_version)` parses the
+combined Navy Flounder DMCUB image and stages ordinary RAM before device I/O.
+`Image::prepare_dcn30` requires IP 3.0, cached-inbox firmware newer than 1.10.0,
+and no separate BSS/shared-state mapping. It uses the existing bounded layout
+builder; legacy/unsupported layouts fail before any hardware operation.
+`unsafe Dmub::new(gpu, pci_cap, pool, prepared)` bounds DCN3.0 base index 2,
+NBIO and HDP 5.0.x, then reserves owned VRAM. It requires exclusive physical-GPU ownership,
+permanent mappings, and firmware/VBIOS belonging to this board.
+
+`quiesce().await` checks the DMUB enable fuse, requests `STOP_FW` when inherited
+firmware runs, and requires both matching GPINT acknowledgement and stop reply
+within 100 ms. Timeout leaves the attempt failed without forced recovery.
+It holds DCN3.0 `DMCUB_CNTL.SOFT_RESET` (bit 17) and `MMHUBBUB_SOFT_RESET`
+(dword `0x341`, bit 8), disables execution, and clears mailbox pointers/status.
+It never uses DCN31's separate CNTL2 reset or dword `0x342` hub reset.
+
+After PSP loads DMCUB, `unsafe start(&Psp).await` validates that execution is
+still reset, security reset is released, and both PSP instruction/stack windows
+are enabled and wholly inside the retained TMR after GPU-physical translation.
+Those secure registers are preserved verbatim. The caller retains the matching
+PSP/TMR for DMUB's lifetime, with trained VRAM, ready memory hubs and protected
+power. Nonsecure VBIOS/mailbox/trace/state windows use owned GPU VRAM addresses.
+The uploaded backing is flushed before publication; mailbox rings are 8 KiB
+each. Startup skips panel power sequencing, requires a fresh DAL/mailbox-ready
+status within 1 s, then proves the runtime transport before returning success.
+It requires `GET_FW_VERSION` GPINT acknowledgement within 100 ms and a version
+matching the prepared image metadata. It sends `QUERY_FEATURE_CAPS` through
+inbox1 and reports `Status { firmware_version, boot_status, inbox, outbox,
+capabilities: Option<FeatureCaps> }`. `FeatureCaps` retains the packed 14-byte
+Linux ABI without enabling any advertised feature. As in Linux's
+`dc_dmub_srv_query_caps_cmd`, firmware must clear the request's `ret_status`
+bit to acknowledge this query; an unchanged bit leaves capabilities absent.
+This does not initialize a native mode.
+
+Every I/O batch checks live authority. State is `Prepared`, `Stopping`, `Reset`,
+`Starting`, `Running` or `Failed`. Cancellation preserves the in-progress state
+and prevents replay. Published storage stays quarantined on failure/drop;
+unpublished storage can return to its pool. No destructor changes hardware.
+
+`Dmub::hpd(instance).await` queries a native DCN30 AUX/HPD instance (0..6),
+not a connector index. `aux(instance, action, address, data).await` supports
+native AUX and I2C-over-AUX with at most 16 bytes, 20-bit addresses, and the
+actions defined by `dmub_cmd.h`. AUX enables outbox1 notifications on first
+use; there is no automatic NACK/DEFER retry. These methods do not perform link
+training, infer board routing or expose arbitrary firmware commands.
+`poll_notification()` returns at most one validated raw 64-byte outbox slot.
+Up to 16 unrelated notifications are retained while awaiting AUX; overflow
+fails explicitly. A stale or wrong-instance AUX reply fails the transport,
+because this ABI has no usable request ID for disambiguating late replies.
+
+The owner uses two fixed 8-KiB rings inside its retained reservation. Before
+each command it verifies CW4, ring bases/sizes, shadow pointers, firmware-ready
+state and HDP remapping. Pointers are byte offsets aligned to 64 within the
+ring. One command is outstanding; only its exact read-pointer advance completes
+it. CPU writes are flushed through HDP before publishing the inbox write
+pointer; firmware replies are read only after HDP read-cache invalidation.
+All MMIO and VRAM batches invoke the live PCI capability. Replies must retain
+their type/subtype and payload size and cannot assert batched/register commands
+or reserved header bits. Inbox and AUX completion each have a 200-ms bound.
+
+`mailbox_state()` is `Dormant`, `Ready`, `InFlight` or `Failed`. Dropping an
+operation retains `InFlight` outside the future and blocks replay. Protocol
+errors, timeouts, removal, revocation and notification overflow leave `Failed`;
+fully consumed AUX NACK/DEFER or firmware rejection returns an error while
+leaving the transport ready. Caller validation errors perform no I/O. No
+failure resets the device or reclaims published storage. The lifecycle state
+and immutable boot report do not replace this live transport diagnostic.
+
+### Coordinated Navi 22 firmware bring-up
+
+The shared `Otg`, `Hubp`, `Dpp`, `Mpc`, `Opp`, `Stream` and `Dccg` constructors
+also resolve an exact Navi22/DCN 3.0.0 profile, with six pipes/stream encoders.
+Other DCN revisions remain unsupported unless already covered by the Phoenix
+profile. Discovery must identify a unique DCN instance and each selected bank
+must include the last register of all supported instances; no I/O occurs during
+construction. Clock-rate and mode-math ownership remain separate prerequisites.
+
+Navi22 OTG uses its shifted clock/global-sync registers, VTG base `0x0528`,
+ODM segment selectors starting at bit 8, and DCN20's disable-point code 3.
+Disable follows `optc1_disable_crtc`, preserving ODM routing while retiring the
+generator. HUBP's detile-plane field is bits 0..11 and preserves the adjacent
+pack-control bit. DCN30 stream unblank resets `DIG_FE_CNTL.DIG_START` before
+the steering FIFO, and preserves the pixel-format bit that exists only on
+DCN314. DPP/OPP/MPC ids, strides and used fields match the two Linux headers.
+DCCG supports all six DPP DTOs and the shared DENTIST divider read/resync;
+Phoenix-only pixel-rate and DPIA mux methods return `Unsupported` before I/O
+on Navi22. These blocks do not by themselves establish a native display mode.
+
+`amdgpu_dcn30_clk::ClockManager` owns Navi22's separate DAL mailbox and DCCG.
+Its unsafe constructor requires the same exclusive physical GPU ownership as
+the retained SMU passed to `start`. Before enabling display DPM, it verifies
+that all six OTGs and DP streams have retired. SMU then extends its board-bounded
+boot policy with UCLK/FCLK/SOCCLK/DCEFCLK and supported memory rail scaling;
+autonomous thermal/power/fan protection remains required. Deep sleep, link DPM,
+BACO and gating remain excluded. Both owners retain in-flight state across
+cancellation and reject replay after incomplete or failed transitions.
+
+`start(smu)` reads the CLK02 PLL at dword `0x17010` and scalar DAL clock levels
+(including fine-grained min/max endpoints). It requires message-header version
+1 and records the driver-table version without assuming Sienna's table layout.
+`Levels::plan` rounds DISP/DPP requests to DENTIST frequencies within board
+limits; `ceiling` supplies their highest representable rates. `prepare(plan)`
+requires every stream idle, pins memory/fabric/SOC at their upper board states,
+sets the display count and DCF/PIX/DISP floors, checks firmware responses, then
+waits for DISP and DPP divider completion. No running stream changes clocks.
+`pipe_clock` programs a DTO only after successful preparation. No default PLL,
+clock table, voltage or memory bandwidth is invented. A failed modeset leaves
+floors retained. GDDR6 mode math and the full native pipeline remain separate.
+
+`amdgpu_navi22_boot::Firmware::open(gpu, registry_cap)` validates every required
+register bank and prepares the SOS, SMC and SDMA/CP/RLC firmware sets before any
+device operation. Missing required firmware or an invalid layout prevents the
+entire sequence from starting. `unsafe ColdBoot::new(gpu, pci_cap, pool, firmware)`
+requires exclusive ownership of the physical GPU, its PSP/MP1/GC/HDP and reset/PM
+controls, permanently mapped and already trained VRAM, no active queues, and an
+owned pool excluding all firmware/scanout/discovery/training/TMR reservations.
+Firmware and any prepared power table must belong to this GPU's board; exclusive
+ownership includes its VRAM index latch.
+Construction reserves bootstrap staging but performs no MMIO. This is one
+cold-boot attempt, not an attach, resume or firmware-reload operation.
+The session owns an immutable copy of its register/identity metadata, so it
+does not borrow `AmdGpu` or require a controller guard across any await. Both
+constructors return a `Send + 'static` owner which may leave `with_controller`
+before `run` is polled. This copies no physical ownership: callers must still
+exclude reset/PM/other clients and retain permanent mappings for the session.
+
+`ColdBoot::run().await` executes optional memory training → SOS bootstrap →
+ring creation → trusted-memory setup → SMC upload → SMU version handshake →
+optional board PowerPlay upload → optional DMUB quiesce → graphics upload/autoload → RLC boot check →
+optional board calibration/protected GFX DPM setup → optional memory hubs →
+optional SDMA execution test → optional DMUB start.
+`ColdBoot::prepare_memory_hubs()` reserves the above VMID0 backing before run;
+it requires a prepared board power policy and performs no I/O. Production boot
+always calls it. Explicit firmware-only callers may omit this stage.
+`ColdBoot::prepare_sdma()` reserves the SDMA ring/writeback before run and
+requires prepared memory hubs. Production boot also calls it. `Stage::SdmaTest`
+identifies a failure in this stage, with the SDMA error retained.
+`Firmware::prepare_dmub(gpu)` prepares board-specific DMUB backing before
+construction; `ColdBoot::prepare_dmub()` reserves its VRAM after memory hubs
+are prepared. Production boot requires both calls. This places `DmubQuiesce`
+before any PSP DMCUB upload and `DmubStart` after memory-hub/SDMA startup.
+`DmubStart` includes the runtime version/capability handshake above.
+`Firmware::prepare_power(gpu, Identity)` prepares the board table before the
+session is constructed; production boot requires it, while explicit
+firmware-only callers may omit it. The bootstrap owner is dropped only
+after SOS success, before claiming
+the GPCOM ring. The ring and SMU owners are stored in the session before awaiting
+their hardware operations. State is `Prepared`, `Running(Stage)`,
+`FirmwareReady(Report)`, `Failed { stage, error }`, or `Released`. Failure records
+the exact stage and underlying error; cancellation preserves `Running(stage)`.
+Every attempt prevents replay, and no failure automatically resets hardware or
+destroys device-owned memory. Dropping a session quarantines any memory still
+owned by hardware through the underlying owners' existing rules.
+
+Success returns `Report { smu: Versions, gfx: GfxBootStatus, power: Option<Info>,
+power_status: Option<PowerStatus>, media_firmware: MediaFirmware,
+memory_aperture: Option<Aperture>, sdma: Option<Proof>, dmub: Option<Status> }`;
+`power` is populated only when the prepared table was uploaded. The session must
+stay alive, or `take_psp()` can transfer its live ring/TMR owner to subsequent
+GPU initialization after full success; that changes state to `Released` and
+prevents a second transfer/run. `gfx_boot_status()` exposes the retained last
+GC sample before transfer, including on failure. These observations do not set
+`AmdGpu::fw_loaded`. Display-aware memory/link DPM, OS thermal interrupts,
+general GPU mappings/queues, VCN startup and real-card validation remain
+separate work.
+
+`ColdBoot::dmub_hpd`, `dmub_aux` and `dmub_notification` expose the typed runtime
+operations only after `FirmwareReady` and while PSP/TMR remains retained.
+They refuse access after `take_psp()`. `dmub_mailbox_state()` also reports failed
+or cancelled transport attempts without accessing hardware.
+
+### Navi 22 boot ownership and framebuffer handoff
+
+`amdgpu_navi22_platform::prepare(physical_boot_framebuffer)` is an unsafe,
+single-CPU boot-only entry. It requires a posted physical GPU, permanent probe
+mappings, no NARF VRAM allocations/queues, and stopped CPU framebuffer writers.
+It reads the PCI board identity and validates every required firmware file and
+the prepared board PowerPlay table before reading the live VRAM plan,
+constructs the exclusive pool and optional training owner, and retains the
+complete `ColdBoot` in a static async mutex. A GOP range wholly outside this
+GPU's aperture denotes a secondary GPU; partial overlap, overflow and invalid
+geometry are refused. Preparation errors issue no device writes and preserve
+controller access. When training is requested, live firmware/DMUB reservations
+in the overwritten 32 MiB prefix also refuse startup; allocator exclusions
+alone cannot protect them. Inventoried display/cursor readers may remain live
+and can show transient training pixels. Success permanently claims MMIO ownership before releasing
+the controller spinlock. `with_controller` and `with_controller_mut` then
+return `None`; DRM identity/memory queries use a separate immutable snapshot.
+
+`unsafe amdgpu_navi22_platform::run().await` requires CPU writers stopped and
+runs the retained session once. The owner survives return or cancellation;
+there is no automatic retry, release or reset. `status()` returns `Absent`,
+`Running` while locked, or `Retained(Diagnostics)` with the session state,
+training state, last raw GC boot-status sample and DMUB mailbox state. Failure identifies its exact
+stage and underlying error. Firmware readiness never advertises acceleration or a native mode.
+`dmub_hpd(instance).await`, `dmub_aux(instance, action, address, data).await`
+and `dmub_notification().await` serialize runtime access through the same async
+owner mutex; no controller spinlock or escaping DMUB/PSP owner is needed.
+Navi22 is excluded from the DCN314 USB-C startup path. Its suspend handler
+returns `NotImplemented` before changing PM state or issuing commands; discrete
+GPUs cannot resolve the legacy APU SMU mailbox through `mp1_mailbox_base`.
+
+`narf-fb` registers `amdgpu-navi22-firmware` during Subsys, appending it after
+the statically registered Late firmware scans and framebuffer initialization.
+This synchronous boot call runs before executor polling and userspace mmap.
+It pauses cached writers, scanout/fbdev discovery, drain/cursor/status pumps,
+and takes the early console under its lock to drain its current writer.
+`block_on_spin` then polls the timer/self-waking firmware future with no IRQ
+spinlock held. Preparation failure resumes the console. After a started run,
+success restores access; failure on the primary GPU leaves framebuffer access
+quarantined and serial logging available. Failure on a secondary GPU restores
+the unrelated boot framebuffer. This is **not** a runtime pause mechanism and
+does not revoke existing userspace mappings. Training resume/reset support is
+required before exposing such a mechanism.
+
+`unsafe ColdBoot::new_with_training(..., exchange)` additionally owns a
+`amdgpu_gddr6::Trainer` and runs it before constructing the SOS owner. Exchange
+offsets come from `Plan::training()`. It inherits `ColdBoot::new`'s contracts
+except that final GDDR6 training is performed by this session, and requires
+all CPU framebuffer writers/pumps and other VRAM clients stopped throughout.
+Firmware must provide initially readable VRAM for the preimage. Training
+failure prevents all firmware uploads. `training_state()` and `training_data()`
+expose its progress and successful cache without replaying a command.
+
+`unsafe amdgpu_gddr6::Trainer::new(gpu, pci_cap, exchange)` validates Navi22's
+PSP11/NBIO/HDP5 layout, exchange bounds and at least 32 MiB of visible VRAM,
+and allocates a 32 MiB system-memory preimage plus a 4 KiB result cache before
+I/O. `run().await` skips training for a nonzero resident SOS heartbeat or a
+PSP runtime boot configuration that disables two-stage training. The runtime
+DB v1.0 window is bounded to 64 KiB, 1 MiB below VRAM end; unknown versions,
+duplicate boot entries and malformed ranges fail closed. An absent DB or boot
+entry preserves Linux's enabled default. Otherwise it waits for bootloader
+readiness, verifies HDP remapping, copies the VRAM
+prefix in 4 KiB cooperative chunks, sends long training (`0x100000`) with the
+VRAM-relative C2P MiB address, and waits up to three seconds using scheduler
+timers. Only terminal completion permits restoring the prefix and flushing HDP.
+A terminal rejection still restores the prefix before returning its error;
+timeout, removal or revocation never races a potentially active PSP writer.
+Successful completion copies P2C through bounded direct/indexed VRAM access
+and requires its BIST signature. `training_data()` is available only in `Ready`.
+
+Training state is `Prepared`, `Saving`, `Training`, `Restoring`, `SavingResult`,
+`Ready`, `ResidentSos`, `Disabled` or `Failed`. Any started run prevents replay. Cancellation
+retains the active state, preimage and cache outside the future. After failure
+or cancellation the owner must remain retained and VRAM clients stopped until
+independent reset/recovery; drop never restores VRAM or resets the GPU. No
+short-training/resume command is exposed yet. The boot-only framebuffer handoff
+above supplies the initial CPU-writer exclusion.
+
 ### AMD platform VBIOS
 
 `atombios::header::parse_rom_header` and `amdgpu_atombios::Atombios::parse`
@@ -67,6 +659,17 @@ validate structure and identity, not cryptographic authenticity.
 GPU probe retains this snapshot in `AmdGpu::vbios`. If VFCT has no image,
 Renoir/Phoenix APUs may use the firmware shadow in the first 256 KiB of the
 mapped framebuffer BAR, requiring a matching PCIR vendor/device record.
+Navi22 uses a bounded SMUIO11 ROM-register fallback and retains the complete
+declared ATOM image as `Source::RomRegisters`. Discovery must identify
+1002:73df / GC10.3.2, NBIO v2.3-compatible hardware (zero ROM offset), and a
+supported SMUIO11 register window. ROM_INDEX/ROM_DATA use base index zero.
+Each capability-checked read chunk saves/restores ROM_INDEX and reads at most
+4 KiB through ROM_DATA's dword autoincrement. The ROM/AMD signatures, nonzero
+512-byte-block image length, matching PCIR identity and all ATOM directories
+must validate; the full image's header must agree with the initial snapshot.
+Probe reports the retained source/size or acquisition error. Navi22 no longer
+uses the old ROM-BAR version-only fallback. No PCI ROM decoding, flash writes,
+reset or ATOM execution is performed by this read path.
 Malformed or ambiguous VFCT data does not trigger fallback. Reads use live
 PCI authority through `Cap::invoke`; shadow reads recheck it per 4 KiB.
 The new path never enables an expansion ROM or writes VRAM. Failed discovery
@@ -136,6 +739,27 @@ It is unsafe: the caller must have included all other scanouts, cursors,
 PSP/GART buffers and existing pools, own the unprotected memory, and serialize
 future GPU reconfiguration. An inventory alone is not ownership authority.
 No hardware is modified while gathering reservations or creating the pool.
+
+`unsafe Plan::read_navi22(gpu, pci_cap, boot_framebuffer, other_clients)`
+provides the equivalent inventory for physical 1002:73df / GC10.3.2 / DCN3.0.0.
+It reads GMC10 base/top/offset, verifies that the full aperture matches the
+probe's physical VRAM size and that DCN's address translation agrees, and
+retains the same firmware, boot and DMUB exclusions. An optional boot framebuffer
+permits a secondary/headless GPU. All six DCN3.0 pipes' programmed and latched
+linear RGB scanouts and supported cursors are inventoried automatically using
+their own register window. Unknown/tiled/DCC/VM surfaces fail closed. All sixteen
+GC10.3.2 and MMHUB2.1.0 VM contexts must be disabled; a live context, initialized
+firmware or programmed NARF mode returns `Busy`. Additional clients still
+require explicit GPU-address ranges. Unhandled enabled DMUB Region0/1/2/7 also
+reject provisioning.
+The PSP runtime database (64 KiB at VRAM-end minus 1 MiB) remains reserved even
+if FirmwareInfo reports a smaller firmware tail or disables two-stage training.
+FirmwareInfo's two-stage BIST capability additionally reserves a 4 KiB C2P
+exchange at `ALIGN(vram_size - firmware_tail_size - 1 MiB, 1 MiB)` and a 4 KiB
+P2C exchange 32 KiB below physical VRAM end. C2P must not overlap any client or
+firmware reservation. `Plan::training()` reports these VRAM-relative offsets;
+it does not attest completed training or authorize a training command. Exclusions
+remain correct with a small BAR0 or Resizable BAR exposing all 12 GiB.
 
 `amdgpu_dmub_boot::Loader::new` validates exact DCN314 discovery, the PCI
 capability, register bounds and the pool's CPU/GPU address correspondence,
@@ -463,14 +1087,19 @@ dividers can produce, so a plausible guess at any of them yields a picture that
 tears under load rather than an error. A table that is missing, the wrong
 revision or self-inconsistent fails closed.
 
-`display_paths` walks `display_object_info_table_v1_4`, decoding each path's
-connector kind and instance, the transmitter its first encoder drives — UNIPHY
-and its numbered siblings each carry two, selected by the enum id — and the
-hot-plug line from the connector's record list. A path whose encoder or connector
-is not one this drives is skipped, since a board may wire other things alongside
-its DisplayPort connectors, but a table with nothing readable is refused. The
-record walk is bounded and fails closed to "unassigned" on a truncated, cyclic or
-out-of-range list rather than inventing a line. `memory_config` takes the type
+`display_paths(gpu, vbios)` walks `display_object_info_table_v1_4`, resolving
+an exact DCN314 or Navi22/DCN3.0 profile from discovery. It decodes each path's
+connector and UNIPHY transmitter separately from its hardware AUX and HPD lines.
+Connector record offsets are relative to the display-object table. The I2C and
+HPD record IDs are keys into `atom_gpio_pin_lut_v2_1`; the GPIO register and bit
+are matched against the discovered DCN bank to obtain the AUX channel and
+one-based ATOM HPD selector. `Path::aux` is `None` when absent; `hpd` is zero
+when unassigned. A present malformed, duplicate or unmappable record is an error.
+No GPIO ID, connector ordinal or transmitter number substitutes for an AUX or
+HPD index. Unknown encoders and paths requiring an external bridge are skipped;
+a table with no usable paths is refused. Record and GPIO walks are bounded.
+
+`memory_config` takes the type
 and channel count from `atom_integrated_system_info_v2_*` and the data rate from
 the firmware's own DPM table, deriving the channel width from the memory type as
 Linux does; a zero channel count is refused rather than replaced with Linux's
@@ -481,19 +1110,21 @@ as 8.16 fixed point against the 48 MHz DFS reference; the CLK block is absent
 from the IP discovery table so its base is hardcoded as Linux hardcodes it, which
 is exactly why the result is range-checked before being believed.
 
-`routes_for_sink` derives link routes and validates them against the board rather
-than trusting the sink's index. A native sink's DMUB link instance *is* its
-transmitter, so the topology confirms that transmitter is wired to a DisplayPort
-connector — a USB-C port carrying DP alt-mode appears as one — and supplies its
-hot-plug line; a transmitter the board wired to something else is refused, and
-there is exactly one route.
+`routes_for_sink(gpu, paths, sink, frontend)` matches a native sink by its
+hardware AUX channel. Its transmitter and HPD selector come from that path;
+the caller assigns the stream frontend independently. Shared AUX channels or
+transmitters require a mux/bridge owner and are refused instead of selecting the
+first connector. Only DisplayPort/eDP paths may produce native routes. Profile
+bounds admit all six Navi22 transmitters and frontends. Navi22 rejects DPIA
+routes; the Phoenix profile retains its five DIG candidates.
 
 A tunnelled sink has no board-wired transmitter, so it borrows one. All five DIGs
 are candidates, ordered so that transmitters the board wired to no connector come
 first: borrowing one of those cannot deprive a later native plug of its fixed
 transmitter. A wired transmitter is still usable while its own connector is idle,
 which the hardware itself decides — `transmitter_busy` reads the backend enable
-bit, and the link encoder re-checks the same bit when the transmitter is actually
+bit (DCN30 `0x20b1`, DCN314 `0x20b2`, stride `0x100`), and the link encoder
+re-checks the same bit when the transmitter is actually
 claimed, closing the gap between the two. The probe comes before any pipeline is
 built, because building one reserves pool memory and a rejected candidate must
 not cost any. A tunnelled route carries no hot-plug line, since the tunnel

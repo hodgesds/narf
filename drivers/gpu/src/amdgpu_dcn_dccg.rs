@@ -1,4 +1,4 @@
-//! DCN 3.1.4 DCCG: the per-DPP clock dividers, the OTG pixel rate dividers and
+//! Navi22 DCN3.0 and Phoenix DCN3.1.4 DCCG: the per-DPP clock dividers, the OTG pixel rate dividers and
 //! the DP stream clock routing a USB4 DPIA needs. Register offsets and fields
 //! are `dcn_3_1_4_offset.h`/`dcn_3_1_4_sh_mask.h` at DCCG base index 1;
 //! sequencing follows Linux `dcn314_dccg.c`, `dcn20_dccg.c` and
@@ -6,25 +6,14 @@
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_dcn_clk::{Clocks, Consumers, Error},
-    amdgpu_discovery as discovery,
+    amdgpu_dcn_profile::Profile,
 };
 use core::future::Future;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
-/// The DCN versions this module drives. Unusually, every offset below is
-/// identical on DCN 3.5 at the same base index 1 — `DPSTREAMCLK_CNTL` 0x004a,
-/// `DTBCLK_P_CNTL` 0x0068, `DENTIST_DISPCLK_CNTL` 0x0064,
-/// `OTG_PIXEL_RATE_DIV` 0x006f, `DPPCLK0_DTO_PARAM` 0x0099 and
-/// `DPPCLK_DTO_CTRL` 0x00b6 all match — so this table is portable where the
-/// other DCN modules' are not.
-///
-/// The entry is still one, because the SEQUENCE is not portable: this follows
-/// `dcn314_dccg.c`, and DCN 3.5 has its own `dcn35_dccg.c` with different root
-/// clock gating and DTBCLK handling. Matching register ids are not a licence to
-/// drive another generation; check the sequencer before adding a row.
-const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
-
+// Profile selects DCN30 or DCN314; shared ids below were compared against
+// both Linux offset and mask headers. Generation differences stay explicit.
 const DPSTREAMCLK_CNTL: u64 = 0x004a;
 const DTBCLK_P_CNTL: u64 = 0x0068;
 const DENTIST_DISPCLK_CNTL: u64 = 0x0064;
@@ -34,6 +23,7 @@ const DPPCLK_DTO_CTRL: u64 = 0x00b6;
 /// The highest DCCG register this module touches, for the bank bound.
 const LAST_REG: u32 = DPPCLK_DTO_CTRL as u32;
 /// One per pixel pipe; see [`crate::amdgpu_dcn::DCN_PIPES`].
+#[cfg(feature = "kernel-test")]
 const INSTANCES: u8 = crate::amdgpu_dcn::DCN_PIPES;
 /// `dccg2_update_dpp_dto` always divides against a full 8-bit modulo.
 const DTO_MODULO: u32 = 0xff;
@@ -95,6 +85,7 @@ struct Engine<I: Io> {
     authority: Cap<BusDeviceCap, Write>,
     /// The global DPPCLK the per-pipe dividers are taken against.
     reference_dppclk_khz: u32,
+    profile: Profile,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -120,7 +111,7 @@ impl<I: Io> Engine<I> {
     /// Program one pipe's DPPCLK divider. `phase / modulo` is the ratio of the
     /// pipe clock to the global clock, rounded up so the pipe is never starved.
     fn dpp_dto(&mut self, pipe: u8, requested_khz: u32) -> Result<(), Error> {
-        if pipe >= INSTANCES {
+        if pipe >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
         let enable = 1 << (pipe as u32 * 4);
@@ -149,7 +140,10 @@ impl<I: Io> Engine<I> {
     /// The OTG pixel rate dividers. A DisplayPort 8b/10b stream with one pixel
     /// per container and no ODM combine divides by one then four.
     fn set_pixel_rate_div(&mut self, otg: u8, k1: Divider, k2: Divider) -> Result<(), Error> {
-        if otg >= INSTANCES {
+        if self.profile == Profile::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        if otg >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
         // K1 is one bit and K2 two, three bits per OTG.
@@ -165,7 +159,10 @@ impl<I: Io> Engine<I> {
     /// selects DPREFCLK, so an enable alone routes the wrong clock. Three bits
     /// per OTG, a two-bit select then the enable.
     fn set_dtbclk_p_src(&mut self, otg: u8, source: StreamClock) -> Result<(), Error> {
-        if otg >= INSTANCES {
+        if self.profile == Profile::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        if otg >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
         let shift = otg as u32 * 3;
@@ -184,7 +181,10 @@ impl<I: Io> Engine<I> {
     /// every DPIA takes OTG 0, so a stream on any other pipe runs at the wrong
     /// pixel rate. Four bits per DPIA, a three-bit OTG select then the enable.
     fn set_dp_stream_clock(&mut self, dpia: u8, otg: u8, source: StreamClock) -> Result<(), Error> {
-        if dpia >= INSTANCES || otg >= INSTANCES {
+        if self.profile == Profile::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        if dpia >= self.profile.pipes() || otg >= self.profile.pipes() {
             return Err(Error::Invalid);
         }
         self.set_dtbclk_p_src(otg, source)?;
@@ -206,6 +206,41 @@ impl<I: Io> Engine<I> {
         let (_, read_divider) = self.dispclk_dividers()?;
         self.update(DENTIST_DISPCLK_CNTL, 0x7f, read_divider)
     }
+
+    async fn dentist(&mut self, disp: u8, dpp: u8) -> Result<(), Error> {
+        if self.profile != Profile::Navi22 {
+            return Err(Error::Unsupported);
+        }
+        if !(8..=127).contains(&disp) || !(8..=127).contains(&dpp) {
+            return Err(Error::Invalid);
+        }
+        // dcn20_update_clocks_update_dentist. The caller has retired every
+        // stream, so the DID127 FIFO add/drop-pixel loops have no consumers.
+        // These are requests, not ordinary readback registers: wait for both
+        // the completion bit and the actual DISP divider to settle.
+        for (mask, value, done, timeout_us, interval_us) in [
+            (0x7f, u32::from(disp), 1 << 19, 100_000, 50),
+            (0x7f00_0000, u32::from(dpp) << 24, 1 << 20, 500, 5),
+        ] {
+            self.update(DENTIST_DISPCLK_CNTL, mask, value)?;
+            let deadline = narf_time::Deadline::after_us(timeout_us);
+            loop {
+                let reg = self.access(|io| io.read(DENTIST_DISPCLK_CNTL))?;
+                if reg == u32::MAX {
+                    return Err(Error::DeviceGone);
+                }
+                if reg & done != 0 && (done != 1 << 19 || (reg >> 8) & 0x7f == u32::from(disp)) {
+                    break;
+                }
+                if deadline.expired() {
+                    return Err(Error::Timeout);
+                }
+                narf_time::SleepUntil::new(narf_time::Deadline::after_us(interval_us).as_instant())
+                    .await;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The sole owner of the DCN314 clock generator. Holding it does not grant the
@@ -219,9 +254,8 @@ impl Dccg {
     /// lifetime, holds matching PCI authority and a permanent register mapping,
     /// and must not let another client reprogram the same dividers.
     pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
-        let base =
-            crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_DCN, DCN_VERSIONS, 1, LAST_REG)
-                .map_err(|_| Error::Unsupported)?;
+        let profile = Profile::resolve(gpu)?;
+        let base = profile.bank(gpu, 1, LAST_REG)?;
         Ok(Self(Engine {
             io: Mmio {
                 regs: gpu.regs,
@@ -229,6 +263,7 @@ impl Dccg {
             },
             authority,
             reference_dppclk_khz: 0,
+            profile,
         }))
     }
     pub fn set_pixel_rate_div(&mut self, otg: u8, k1: Divider, k2: Divider) -> Result<(), Error> {
@@ -259,6 +294,12 @@ impl Dccg {
     }
     pub fn update_dpp_dto(&mut self, pipe: u8, requested_khz: u32) -> Result<(), Error> {
         self.0.dpp_dto(pipe, requested_khz)
+    }
+    /// Called only by the Navi22 clock owner after checking all six OTGs and
+    /// stream encoders are idle. Its persistent InFlight state excludes a
+    /// second operation if this future is cancelled during a divider change.
+    pub(crate) async fn navi22_dentist(&mut self, disp: u8, dpp: u8) -> Result<(), Error> {
+        self.0.dentist(disp, dpp).await
     }
 }
 

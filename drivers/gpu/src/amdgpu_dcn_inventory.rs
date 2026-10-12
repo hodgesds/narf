@@ -1,6 +1,6 @@
-//! The platform inventory the DCN314 bring-up needs: which transmitter a
-//! connector is wired to, how memory is configured, what the DCHUB reference
-//! clock is, and what the DENTIST VCO runs at.
+//! Board routing for Navi22/DCN3.0 and Phoenix/DCN3.1.4, plus the APU memory
+//! and reference-clock inventory. AUX, HPD and transmitter identities are
+//! independently decoded from connector records and the GPIO pin LUT.
 //!
 //! None of it may be defaulted. The memory configuration sets every watermark,
 //! the reference clock scales every latency register, and the VCO decides which
@@ -18,6 +18,7 @@ use crate::{
     amdgpu::AmdGpu,
     amdgpu_dcn_clk::Levels,
     amdgpu_dcn_display::Platform,
+    amdgpu_dcn_profile::Profile,
     amdgpu_dml::{Memory, MemoryKind},
     atombios,
 };
@@ -27,6 +28,7 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 /// Master data table indices from `atom_master_list_of_data_tables_v2_1`.
 const TABLE_DISPLAY_OBJECT_INFO: u16 = 22;
+const TABLE_GPIO_PIN_LUT: u16 = 12;
 const TABLE_DCE_INFO: u16 = 27;
 const TABLE_INTEGRATED_SYSTEM_INFO: u16 = 30;
 
@@ -45,22 +47,19 @@ const TYPE_CONNECTOR: u16 = 0x03;
 /// `atom_common_record_header` is two bytes, and `atom_hpd_int_record` adds the
 /// pin id and its plug state. The list ends with a terminator record type.
 const RECORD_HEADER: usize = 2;
+const RECORD_I2C: u8 = 1;
 const RECORD_HPD_INT: u8 = 2;
 const RECORD_END: u8 = 0xff;
 /// A connector's record list is short; this only bounds a malformed one.
 const MAX_RECORDS: usize = 64;
-/// There are six HPD lines, and the ATOM selector is one-based.
-const MAX_HPD: u8 = 6;
 /// `num_dig_link_enc` for DCN314, and its four tunnelling endpoints.
 pub const DIG_COUNT: u8 = 5;
 pub const DPIA_COUNT: u8 = 4;
-/// The DCN versions the DIG window below describes. `regDIG0_DIG_BE_EN_CNTL`
-/// moves 0x20b2→0x20bd on DCN 3.5 and the per-DIG stride goes 0x100→0x124
-/// (`regDIG1_DIG_BE_EN_CNTL` 0x21b2 against 0x21e1), so another generation
-/// needs its own pair, selected per version the way
-/// `amdgpu_platform::SURFACE_WINDOWS` does it. The ATOM tables this module
-/// parses are version-agnostic; only this register window is not.
-const DCN_VERSIONS: &[(u8, u8, u8)] = &[(3, 1, 4)];
+/// GPIO ids in the VBIOS are keys into the GPIO LUT, not hardware indices.
+/// Both supported DCN generations use these GPIO registers at base index 2.
+const GPIO_DDC1_A: u32 = 0x28d1;
+const GPIO_HPD_A: u32 = 0x28f5;
+const HPD_SHIFTS: [u8; 6] = [0, 8, 16, 24, 26, 28];
 
 /// `DIG0_DIG_BE_EN_CNTL`, per-DIG stride 0x100, at DCN base index 2. Bit zero
 /// says the backend is already driving a link.
@@ -121,6 +120,9 @@ pub struct Path {
     /// One-based instance from the object's enum id, as the table encodes it.
     pub connector_instance: u8,
     pub transmitter: u8,
+    /// Hardware AUX channel resolved from the I2C record and GPIO LUT.
+    /// None means the board supplies no usable native AUX route.
+    pub aux: Option<u8>,
     /// One-based ATOM HPD selector from the connector's record list, or zero
     /// when the board declares none for this connector.
     pub hpd: u8,
@@ -198,37 +200,109 @@ fn connector(objid: u16) -> Result<(Connector, u8), Error> {
     Ok((kind, instance))
 }
 
-/// Walk a connector's record list for its hot-plug line. A list that is absent,
-/// truncated, cyclic or declares a line outside the six that exist yields zero,
-/// which `Route` reads as "this board assigns none" rather than guessing one.
-fn hpd_selector(vbios: &[u8], offset: u16) -> u8 {
-    let mut at = offset as usize;
-    if at == 0 {
-        return 0;
+/// A connector's record offsets are relative to the display-object table.
+/// Preserve absence, but reject malformed/duplicate records instead of turning
+/// corrupted routing metadata into a plausible unassigned pin.
+#[derive(Default)]
+struct Wiring {
+    i2c: Option<u8>,
+    hpd: Option<u8>,
+}
+fn wiring(vbios: &[u8], base: usize, offset: u16, paths_end: usize) -> Result<Wiring, Error> {
+    let mut result = Wiring::default();
+    if offset == 0 {
+        return Ok(result);
+    }
+    let mut at = base
+        .checked_add(usize::from(offset))
+        .ok_or(Error::Invalid)?;
+    if at < paths_end {
+        return Err(Error::Invalid);
     }
     for _ in 0..MAX_RECORDS {
-        if at + RECORD_HEADER > vbios.len() {
-            return 0;
+        let head = vbios.get(at..at + RECORD_HEADER).ok_or(Error::Invalid)?;
+        if head[0] == RECORD_END {
+            return Ok(result);
         }
-        let kind = vbios[at];
-        let size = vbios[at + 1] as usize;
-        if kind == RECORD_END || size < RECORD_HEADER || at + size > vbios.len() {
-            return 0;
+        let size = usize::from(head[1]);
+        if size < RECORD_HEADER {
+            return Err(Error::Invalid);
         }
-        if kind == RECORD_HPD_INT && size >= 4 {
-            let pin = vbios[at + 2];
-            return if (1..=MAX_HPD).contains(&pin) { pin } else { 0 };
+        let record = vbios.get(at..at + size).ok_or(Error::Invalid)?;
+        let field = match head[0] {
+            RECORD_I2C => Some(&mut result.i2c),
+            RECORD_HPD_INT => Some(&mut result.hpd),
+            _ => None,
+        };
+        if let Some(field) = field {
+            if size < 4 || field.replace(record[2]).is_some() {
+                return Err(Error::Invalid);
+            }
         }
         at += size;
     }
-    0
+    Err(Error::Invalid)
+}
+/// atom_gpio_pin_assignment: u32 register index, bit shift, mask shift, id,
+/// reserved. Exact matching follows bios_parser2.c; neither uid nor its low
+/// nibble is assumed to identify the physical AUX/HPD endpoint.
+fn gpio(vbios: &[u8], uid: u8) -> Result<(u32, u8), Error> {
+    let pins = table(vbios, TABLE_GPIO_PIN_LUT)?;
+    header(pins, 2, &[1])?;
+    if pins.len() < 12 || (pins.len() - 4) % 8 != 0 {
+        return Err(Error::Invalid);
+    }
+    let mut matches = pins[4..].chunks_exact(8).filter(|pin| pin[6] == uid);
+    let pin = matches.next().ok_or(Error::Missing)?;
+    if matches.next().is_some() || pin[4] >= 32 {
+        return Err(Error::Invalid);
+    }
+    Ok((u32::from_le_bytes(pin[..4].try_into().unwrap()), pin[4]))
+}
+fn aux_channel(vbios: &[u8], uid: u8, dcn: u32, count: u8) -> Result<u8, Error> {
+    let (register, shift) = gpio(vbios, uid)?;
+    let first = dcn.checked_add(GPIO_DDC1_A).ok_or(Error::Invalid)?;
+    let relative = register.checked_sub(first).ok_or(Error::Unsupported)?;
+    // DC_GPIO_DDCnCLK_A is bit 0. The DATA bit (8) is not a clock pin.
+    if shift != 0 || relative % 4 != 0 || relative / 4 >= u32::from(count) {
+        return Err(Error::Unsupported);
+    }
+    Ok((relative / 4) as u8)
+}
+fn hpd_selector(vbios: &[u8], uid: u8, dcn: u32) -> Result<u8, Error> {
+    let (register, shift) = gpio(vbios, uid)?;
+    if register != dcn.checked_add(GPIO_HPD_A).ok_or(Error::Invalid)? {
+        return Err(Error::Unsupported);
+    }
+    HPD_SHIFTS
+        .iter()
+        .position(|&s| s == shift)
+        .map(|i| i as u8 + 1)
+        .ok_or(Error::Unsupported)
 }
 
 /// Walk `display_object_info_table_v1_4`. Paths whose encoder or connector this
 /// does not understand are skipped rather than failing the whole table: a board
 /// may wire something alongside the DisplayPort connectors we care about.
-pub fn display_paths(vbios: &[u8]) -> Result<Vec<Path>, Error> {
+pub fn display_paths(gpu: &AmdGpu, vbios: &[u8]) -> Result<Vec<Path>, Error> {
+    let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+    let dcn = profile
+        .bank(gpu, 2, GPIO_HPD_A)
+        .map_err(|_| Error::Unsupported)?
+        / 4;
+    display_paths_at(
+        vbios,
+        u32::try_from(dcn).map_err(|_| Error::Invalid)?,
+        profile.streams(),
+    )
+}
+fn display_paths_at(vbios: &[u8], dcn: u32, dig_count: u8) -> Result<Vec<Path>, Error> {
     let info = table(vbios, TABLE_DISPLAY_OBJECT_INFO)?;
+    let base = usize::from(
+        directory(vbios)?
+            .table_offset(TABLE_DISPLAY_OBJECT_INFO)
+            .ok_or(Error::Missing)?,
+    );
     header(info, 1, &[4])?;
     if info.len() < PATHS_OFFSET {
         return Err(Error::Invalid);
@@ -248,11 +322,32 @@ pub fn display_paths(vbios: &[u8]) -> Result<Vec<Path>, Error> {
         let Ok(transmitter) = transmitter(u16_at(entry, 4)) else {
             continue;
         };
+        // An external encoder needs a separate bridge driver; the downstream
+        // id cannot be treated as an on-chip transmitter.
+        if u16_at(entry, 6) != 0 || transmitter >= dig_count {
+            continue;
+        }
+        let pins = wiring(
+            vbios,
+            base,
+            u16_at(entry, 2),
+            base + PATHS_OFFSET + count * PATH_SIZE,
+        )?;
+        let aux = pins
+            .i2c
+            .map(|uid| aux_channel(vbios, uid, dcn, dig_count))
+            .transpose()?;
+        let hpd = pins
+            .hpd
+            .map(|uid| hpd_selector(vbios, uid, dcn))
+            .transpose()?
+            .unwrap_or(0);
         paths.push(Path {
             connector: kind,
             connector_instance: instance,
             transmitter,
-            hpd: hpd_selector(vbios, u16_at(entry, 2)),
+            aux,
+            hpd,
             device_tag: u16_at(entry, 12),
         });
     }
@@ -310,33 +405,62 @@ pub fn memory_config(vbios: &[u8], levels: &Levels) -> Result<Memory, Error> {
 /// Derive the link route for a discovered sink, validated against the board's
 /// own topology rather than assumed from the sink's index.
 ///
-/// A native sink's DMUB link instance *is* its transmitter, so the topology is
-/// used to confirm that transmitter really is wired to a DisplayPort connector —
-/// a USB-C port carrying DP alt-mode appears as one — and to pick up its
-/// hot-plug line. Driving a transmitter the board wired to something else is
-/// refused.
-///
-/// A tunnelled sink is refused: its transmitter is assigned from a link-encoder
-/// pool at stream time rather than fixed by the board, and no such pool exists
-/// here yet. VBIOS cannot answer for it.
+/// A native sink's instance identifies its AUX channel. Its transmitter and
+/// HPD line are independently resolved from the board's connector records.
+/// Ambiguous shared channels are refused; choosing the first path could drive
+/// a different connector. DPIA routing exists only on the Phoenix profile.
 pub fn routes_for_sink(
+    gpu: &AmdGpu,
     paths: &[Path],
     sink: &crate::amdgpu_usbc::Sink,
     frontend: u8,
 ) -> Result<Vec<crate::amdgpu_dio::Route>, Error> {
+    routes_for_profile(
+        Profile::resolve(gpu).map_err(|_| Error::Unsupported)?,
+        paths,
+        sink,
+        frontend,
+    )
+}
+fn routes_for_profile(
+    profile: Profile,
+    paths: &[Path],
+    sink: &crate::amdgpu_usbc::Sink,
+    frontend: u8,
+) -> Result<Vec<crate::amdgpu_dio::Route>, Error> {
+    if frontend >= profile.streams() {
+        return Err(Error::Invalid);
+    }
     let mut routes = Vec::new();
     match sink.channel {
         crate::amdgpu_dmub::Channel::Legacy => {
-            let path = paths
+            if sink.instance >= profile.streams() {
+                return Err(Error::Invalid);
+            }
+            // Include non-DP paths in the ambiguity check too: a shared AUX
+            // needs mux/bridge ownership this native SST path does not have.
+            let mut matches = paths.iter().filter(|path| path.aux == Some(sink.instance));
+            let path = matches.next().ok_or(Error::Unsupported)?;
+            if matches.next().is_some() {
+                return Err(Error::Invalid);
+            }
+            if paths
                 .iter()
-                .find(|path| {
-                    path.transmitter == sink.instance
-                        && matches!(
-                            path.connector,
-                            Connector::DisplayPort | Connector::EmbeddedDisplayPort
-                        )
-                })
-                .ok_or(Error::Unsupported)?;
+                .filter(|other| other.transmitter == path.transmitter)
+                .count()
+                != 1
+            {
+                return Err(Error::Invalid);
+            }
+            if path.transmitter >= profile.streams() || path.hpd > 6 {
+                return Err(Error::Invalid);
+            }
+            if !matches!(
+                path.connector,
+                Connector::DisplayPort | Connector::EmbeddedDisplayPort
+            ) {
+                return Err(Error::Unsupported);
+            }
             routes.try_reserve_exact(1).map_err(|_| Error::Invalid)?;
             routes.push(crate::amdgpu_dio::Route {
                 channel: sink.channel,
@@ -347,6 +471,9 @@ pub fn routes_for_sink(
             });
         }
         crate::amdgpu_dmub::Channel::Dpia => {
+            if profile != Profile::Dcn314 {
+                return Err(Error::Unsupported);
+            }
             if sink.instance >= DPIA_COUNT {
                 return Err(Error::Invalid);
             }
@@ -396,19 +523,21 @@ pub unsafe fn transmitter_busy(
     authority: &Cap<BusDeviceCap, Write>,
     dig: u8,
 ) -> Result<bool, Error> {
-    if dig >= DIG_COUNT {
+    let profile = Profile::resolve(gpu).map_err(|_| Error::Unsupported)?;
+    if dig >= profile.streams() {
         return Err(Error::Invalid);
     }
-    let base = crate::amdgpu_psp_ring::bank(
-        gpu,
-        crate::amdgpu_discovery::HW_ID_DCN,
-        DCN_VERSIONS,
-        2,
-        (DIG_BE_EN_CNTL + (DIG_COUNT as u64 - 1) * DIG_STRIDE) as u32,
-    )
-    .map_err(|_| Error::Unsupported)?;
+    // DCN30 DIG_BE_EN_CNTL is one dword before Phoenix's register.
+    let enable = DIG_BE_EN_CNTL - u64::from(profile == Profile::Navi22);
+    let base = profile
+        .bank(
+            gpu,
+            2,
+            (enable + (u64::from(profile.streams()) - 1) * DIG_STRIDE) as u32,
+        )
+        .map_err(|_| Error::Unsupported)?;
     let regs: MmioRegion = gpu.regs;
-    let offset = (base + (DIG_BE_EN_CNTL + dig as u64 * DIG_STRIDE) * 4) as u64;
+    let offset = base + (enable + u64::from(dig) * DIG_STRIDE) * 4;
     let value = authority
         .invoke(Op(|| {
             // SAFETY: the bank bounds every DIG instance.

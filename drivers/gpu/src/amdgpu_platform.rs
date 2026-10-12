@@ -122,6 +122,12 @@ const GFXHUB_WINDOWS: &[VmWindow] = &[
         base_idx: 0,
         ctx0_cntl: 0x1688,
     },
+    // Navi22, gc_10_3_0_offset.h: CONTEXT0..15 at 0x15fc..0x160b.
+    VmWindow {
+        version: (10, 3, 2),
+        base_idx: 0,
+        ctx0_cntl: 0x15fc,
+    },
 ];
 
 /// The MMHUB 3.0.x headers share no window, which is why this is a table and
@@ -153,6 +159,12 @@ const MMHUB_WINDOWS: &[VmWindow] = &[
     // `mmhub_3_0_2_offset.h` — 3.0.0's base index, but the register moved.
     VmWindow {
         version: (3, 0, 2),
+        base_idx: 0,
+        ctx0_cntl: 0x06c0,
+    },
+    // GMC10's MMHUB2.1 uses mmhub_v2_0 / mmhub_2_0_0_offset.h.
+    VmWindow {
+        version: (2, 1, 0),
         base_idx: 0,
         ctx0_cntl: 0x06c0,
     },
@@ -270,7 +282,14 @@ const DCN_3_5_0: SurfaceWindow = SurfaceWindow {
     ..DCN_3_1_4
 };
 
-const SURFACE_WINDOWS: &[SurfaceWindow] = &[DCN_3_1_4, DCN_3_5_0];
+// dcn_3_0_0_offset.h has the same surface offsets and instance strides as
+// DCN314, but dcn30_resource.c supplies SIX pipes, ending at OTG5 0x1dc1.
+const DCN_3_0_0: SurfaceWindow = SurfaceWindow {
+    version: (3, 0, 0),
+    pipes: 6,
+    ..DCN_3_1_4
+};
+const SURFACE_WINDOWS: &[SurfaceWindow] = &[DCN_3_1_4, DCN_3_5_0, DCN_3_0_0];
 
 // Field masks. `dcn_3_1_4_sh_mask.h` and `dcn_3_5_0_sh_mask.h` agree on every
 // one of these, so they are not part of the per-version window:
@@ -330,6 +349,18 @@ fn inventory(gpu: &AmdGpu, cap: &Cap<BusDeviceCap, Write>) -> Result<Vec<Range<u
         })
     }))
     .map_err(|_| Error::Revoked)?
+}
+pub(crate) fn boot_clients(
+    gpu: &AmdGpu,
+    cap: &Cap<BusDeviceCap, Write>,
+) -> Result<Vec<Range<u64>>, crate::amdgpu_vram_boot::Error> {
+    use crate::amdgpu_vram_boot::Error as MemoryError;
+    inventory(gpu, cap).map_err(|error| match error {
+        Error::Busy => MemoryError::Busy,
+        Error::Revoked => MemoryError::Revoked,
+        Error::Invalid => MemoryError::Invalid,
+        _ => MemoryError::Unsupported,
+    })
 }
 fn scan_surfaces(
     window: &SurfaceWindow,
@@ -892,6 +923,11 @@ mod tests {
                 base_idx: 0,
                 ctx0_cntl: 0x1688,
             },
+            VmWindow {
+                version: (10, 3, 2),
+                base_idx: 0,
+                ctx0_cntl: 0x15fc,
+            },
         ];
         if GFXHUB_WINDOWS != gfxhub_expected {
             return TestResult::Fail("a GFXHUB row does not match gc_11_0_0_offset.h");
@@ -912,6 +948,11 @@ mod tests {
             },
             VmWindow {
                 version: (3, 0, 2),
+                base_idx: 0,
+                ctx0_cntl: 0x06c0,
+            },
+            VmWindow {
+                version: (2, 1, 0),
                 base_idx: 0,
                 ctx0_cntl: 0x06c0,
             },
@@ -964,7 +1005,12 @@ mod tests {
             otg_control: 0x1b43,
             ..dcn314_expected
         };
-        if SURFACE_WINDOWS != [dcn314_expected, dcn350_expected] {
+        let dcn300_expected = SurfaceWindow {
+            version: (3, 0, 0),
+            pipes: 6,
+            ..dcn314_expected
+        };
+        if SURFACE_WINDOWS != [dcn314_expected, dcn350_expected, dcn300_expected] {
             return TestResult::Fail("a DCN row does not match its dcn_x_y_z_offset.h");
         }
         if dcn314_expected.surface_inuse == dcn350_expected.surface_inuse
@@ -989,6 +1035,11 @@ mod tests {
         }
         if DCN_3_5_0.last_reg() != 0x1cc3 {
             return TestResult::Fail("DCN 3.5's bank bound is not its own OTG3_OTG_CONTROL");
+        }
+        if DCN_3_0_0.last_reg() != 0x1dc1
+            || DCN_3_0_0.cursor_size + 5 * DCN_3_0_0.pipe_stride != 0x0ac7
+        {
+            return TestResult::Fail("DCN3.0 inventory stops before the sixth pipe");
         }
         TestResult::Pass
     }
@@ -1045,6 +1096,32 @@ mod tests {
         "drivers/gpu/vram",
         platform_inventory_retains_latched_surfaces_and_cursor
     );
+    fn navi22_inventory_includes_the_sixth_pipe() -> TestResult {
+        let mut regs = vec![0; 0xb00];
+        for pipe in 0..6 {
+            regs[0x5f3 + pipe * 0xdc] = 1;
+        }
+        regs[0xa3f] = 0;
+        regs[0xa31] = 8; // HUBP5 surface format
+        regs[0xa36] = (1080 << 16) | 1920;
+        regs[0xa53] = 1919;
+        regs[0xa56] = 0x800000;
+        regs[0xa57] = 2;
+        regs[0xac4] = 1 | (2 << 8);
+        regs[0xac5] = 0x1800000;
+        regs[0xac6] = 2;
+        regs[0xac7] = (64 << 16) | 64;
+        let ranges = scan_surfaces(&DCN_3_0_0, |r| regs[r as usize]).unwrap();
+        if ranges != [0x2_00800000..0x2_00fe9000, 0x2_01800000..0x2_01804000] {
+            return TestResult::Fail("sixth-pipe scanout/cursor missing or sized incorrectly");
+        }
+        regs[0xa33] = 1;
+        if scan_surfaces(&DCN_3_0_0, |r| regs[r as usize]).is_ok() {
+            return TestResult::Fail("sixth-pipe tiled surface accepted as a linear buffer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("drivers/gpu/vram", navi22_inventory_includes_the_sixth_pipe);
     fn platform_only_claims_a_blanked_and_stopped_pipe() -> TestResult {
         // Pipe 0 is fetching, pipe 1 is blanked but its generator still runs,
         // pipe 2 is genuinely idle.

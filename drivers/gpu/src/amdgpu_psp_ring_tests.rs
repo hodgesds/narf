@@ -12,10 +12,21 @@ struct Fake {
     writes: Vec<(u32, u32)>,
     complete: bool,
     reject: u32,
+    reject_command: Option<u32>,
+    reject_type: Option<u32>,
     destroy: bool,
     dirty: bool,
     violation: bool,
     submissions: Vec<[u32; 256]>,
+    payload: Vec<u8>,
+    tmr_size: u32,
+    stall_command: Option<u32>,
+    stall_type: Option<u32>,
+    fail_hdp: bool,
+    gfx_samples: Vec<GfxBootStatus>,
+    gfx_reads: usize,
+    media_address: Option<u64>,
+    tmr_address: u64,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -39,10 +50,32 @@ impl Io for Fake {
             let seq = frame[5];
             self.submissions
                 .push(self.memory[1024..1280].try_into().unwrap());
-            if self.complete {
+            let id = self.memory[1026];
+            let kind = self.memory[1034];
+            if id == 5 {
+                self.tmr_address =
+                    u64::from(self.memory[1031]) | (u64::from(self.memory[1032]) << 32);
+            }
+            let stalled = self.stall_command == Some(id)
+                && (id != 6 || self.stall_type.is_none_or(|t| t == kind));
+            if self.complete && !stalled {
                 self.memory[(FENCE / 4) as usize] = seq;
-                self.memory[(COMMAND / 4) as usize + 216] = self.reject;
-                self.memory[(COMMAND / 4) as usize + 220] = 4 * 1024 * 1024;
+                self.memory[(COMMAND / 4) as usize + 216] =
+                    if self.reject_command.is_none_or(|c| c == id)
+                        && self.reject_type.is_none_or(|t| id == 6 && t == kind)
+                    {
+                        self.reject
+                    } else {
+                        0
+                    };
+                self.memory[(COMMAND / 4) as usize + 220] = self.tmr_size;
+                if id == 6 && matches!(kind, 13 | 51) {
+                    let address = self
+                        .media_address
+                        .unwrap_or(self.tmr_address + if kind == 13 { 0x1000 } else { 0x100000 });
+                    self.memory[(COMMAND / 4) as usize + 218] = address as u32;
+                    self.memory[(COMMAND / 4) as usize + 219] = (address >> 32) as u32;
+                }
             }
         }
     }
@@ -54,12 +87,25 @@ impl Io for Fake {
         self.memory[(offset / 4) as usize] = value;
     }
     fn setup_hdp(&mut self) -> bool {
-        true
+        !self.fail_hdp
+    }
+    fn write_payload(&mut self, _: MmioRegion, offset: u64, value: u32) {
+        self.dirty = true;
+        let offset = offset as usize;
+        if self.payload.len() < offset + 4 {
+            self.payload.resize(offset + 4, 0xff);
+        }
+        self.payload[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
     fn flush(&mut self) {
         self.dirty = false;
     }
     fn invalidate(&mut self) {}
+    fn gfx_boot_status(&mut self) -> Result<GfxBootStatus, Error> {
+        let index = self.gfx_reads.min(self.gfx_samples.len() - 1);
+        self.gfx_reads += 1;
+        Ok(self.gfx_samples[index])
+    }
 }
 fn fixture() -> (Pool, Engine<Fake>) {
     let map = MmioRegion {
@@ -77,10 +123,24 @@ fn fixture() -> (Pool, Engine<Fake>) {
         writes: Vec::new(),
         complete: true,
         reject: 0,
+        reject_command: None,
+        reject_type: None,
         destroy: true,
         dirty: false,
         violation: false,
         submissions: Vec::new(),
+        payload: Vec::new(),
+        tmr_size: DEFAULT_TMR_SIZE as u32,
+        stall_command: None,
+        stall_type: None,
+        fail_hdp: false,
+        gfx_samples: vec![GfxBootStatus {
+            cp_stat: 0,
+            rlc_bootload: 1 << 31,
+        }],
+        gfx_reads: 0,
+        media_address: None,
+        tmr_address: 0,
     };
     io.regs[CTRL as usize] = RESPONSE;
     io.regs[SOS as usize] = 1;
@@ -237,3 +297,6 @@ fn psp_tmr_gpu_alignment_and_padding() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("drivers/gpu/psp-ring", psp_tmr_gpu_alignment_and_padding);
+
+#[path = "amdgpu_psp_navi22_tests.rs"]
+mod navi22;

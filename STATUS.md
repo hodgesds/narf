@@ -258,6 +258,108 @@ interfaces and limits.
 
 ## Current work
 
+The `feat/amdgpu-navi22-passthrough` branch adds discrete PCIe probe support
+for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
+and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the
+Navi 22 userspace family query. The `navy_flounder_sos.bin` parser and an
+explicit PSP 11.0.11 asynchronous bootstrap now handle KDB/SPL/system/SOS
+using owned, aligned VRAM with cancellation quarantine. The PSP11 GPCOM ring
+now resolves Navi22's register banks and GMC10 address ranges, installs trusted
+memory from the SOS container's embedded TOC, and preserves device-owned
+reservations through cancellation or failed teardown. A bounded SMC v2.0 parser
+now separates microcode from PowerPlay metadata; the ring can load that SMC
+once after TMR setup. An explicit SMU11 cold-start handshake checks Navi22's
+interface and running firmware version using its discrete-GPU mailbox layout.
+The graphics firmware path now prepares the complete SDMA/CP/RLC set, separates
+MEC jump tables and RLC subimages, and submits PSP autoload only after all
+required payloads complete. Partial load failures/cancellation prevent replay
+and preserve device-owned VRAM. A bounded CP-idle/RLC-boot-complete check now
+follows PSP acknowledgement and retains raw status for failed-boot diagnostics.
+An explicit `ColdBoot` session prepares all required firmware, owns the entire
+SOS → PSP/TMR → SMC/SMU → graphics/RLC sequence, and can transfer its live PSP
+owner after success. Failure/cancellation records the stage and prevents replay.
+Navi22 now has a read-only GMC10/DCN3.0 VRAM plan, including full-aperture
+firmware tails, inherited DMUB windows and the two GDDR6 training exchange
+buffers. It validates the two address translations and clips exclusions only
+when creating the CPU-visible allocator; secondary GPUs need no boot framebuffer.
+An explicit GDDR6 cold-training owner now preserves the affected 32 MiB of
+VRAM, honors PSP runtime training policy, waits with a three-second deadline, restores only after terminal PSP
+completion, and validates/caches the P2C result. The firmware coordinator can
+run this before SOS; cancelled/failed training prevents replay and retains the
+preimage. CPU framebuffer writers must remain stopped during this path.
+Probe now retains a validated Navi22 VBIOS from the SMUIO ROM read registers
+when VFCT has no image, preserving the index latch and checking authority per
+chunk. This supplies the board's reservation metadata without enabling a PCI
+ROM BAR; acquisition failures are identified on the console.
+The Navi22 pool plan now inventories all six DCN3.0 pipes and rejects inherited
+active GFXHUB/MMHUB contexts. The cold-boot session owns its register metadata
+and can run after releasing the controller spinlock, including in a spawned task.
+The final boot framebuffer initcall now prepares and runs the firmware sequence
+after firmware discovery, before executor/userspace startup. It pauses console
+and pump writes, retains the entire owner, and quarantines the primary
+framebuffer after a started failure. A successful claim excludes legacy MMIO
+access while retaining DRM identity queries. Navi22 refuses the APU suspend
+path until a discrete resume sequence exists.
+Board PowerPlay preparation now selects the VBIOS or SMC table according to
+FirmwareInfo, overlays the ATOM board wiring and applies the exact ASUS C3
+quirks before startup. After the SMU handshake, the boot sequence uploads that
+table through an owned, flushed VRAM buffer and retains the published buffer
+across success, rejection and cancellation. PSP SCPM ownership or malformed
+runtime policy refuses this transfer before SMU commands; policy delegation
+is not implemented.
+After RLC boot, the coordinator now runs board calibration and enables a
+restricted GFX DPM policy with firmware power/current/temperature protection
+and automatic fan control. It verifies the enabled feature mask and reports
+the board's GFX frequency limits. Missing protections fail preflight; unexpected
+enabled features, rejection or cancellation prevent further bring-up/replay.
+Memory/display/link DPM and deep power states remain disabled until their
+owners can supply display and lifecycle constraints.
+The required firmware set now includes VCN and DMCUB. PSP receives those after
+RLC autoload, and their reported entry addresses must lie inside the retained
+TMR. Missing/malformed media images prevent startup before device writes;
+partial upload failures preserve ownership and prevent replay. Firmware load
+does not yet start VCN queues.
+Production cold boot now initializes GC/MMHUB VMID0 with a bounded VRAM-only
+test aperture after the protected power policy is active. Both hubs validate
+idle contexts and matching framebuffer geometry, use owned VRAM page tables
+and fault fallback, and wait for bounded TLB acknowledgements. User VMIDs and
+host DMA stay disabled; failed/cancelled starts retain the backing pages.
+SDMA0 now has a cold-start path on GC 10.3.2 and an owned VRAM ring. Production
+boot runs a translated WRITE/COPY/FENCE test after GMC setup and checks both
+read-pointer paths and all copied words. Reset and completion waits are bounded;
+fault/cancel paths retain the ring and prevent replay. Software models exercise
+packet decoding, register units, corruption, revocation and reset cancellation.
+DCN3.0 DMUB now has an owned lifecycle: stop inherited firmware before PSP
+upload, retain its authenticated instruction/stack windows, program owned
+VBIOS/mailbox/trace/state storage and await a fresh firmware-ready status.
+Navi22's reset registers are checked independently from Phoenix's. Unsupported
+firmware layouts, invalid secure-window bounds, stop/boot timeouts, revocation
+and cancellation refuse further startup without reclaiming published storage.
+The retained owner now also drives DCN3.0 inbox1/outbox1: startup verifies the
+running firmware version and queries capabilities, with HDP flush/invalidation
+around PCIe VRAM traffic. Serialized native HPD and AUX/I2C-over-AUX operations
+preserve unrelated notifications and reject stale replies. Software models
+cover ring wraparound, cache ordering, malformed pointers/replies, cancellation,
+timeouts, revocation and notification overflow; real-card validation is pending.
+Native display block owners now resolve Navi22's six-pipe DCN3.0 profile,
+including its OTG/ODM field differences, HUBP detile field and DisplayPort DIG
+reset sequence. The DPP/OPP/MPC and shared DCCG paths retain explicit bounds;
+Phoenix-only pixel/DPIA clock muxes are refused on Navi22. The Navi22 DAL clock
+owner now reads board limits and the display PLL, enables bounded display DPM
+through the retained SMU, pins memory/fabric clocks and programs DENTIST only
+after every stream retires. Register models cover rounding, rejection,
+revocation, cancellation and divider completion. GDDR6 mode calculations and
+full modeset coordination are still pending. Native routing now resolves
+AUX and HPD independently through the board GPIO LUT, follows display-table
+relative record offsets, and rejects ambiguous routes. The Navi22 backend probe
+uses the DCN30 enable register and includes the sixth transmitter.
+These are software-tested foundations; training resume,
+VCN startup, display-aware DPM and OS thermal interrupt handling,
+hardware boot, general GPU mappings/GFX10 queue initialization, production
+SDMA submissions/interrupts and DCN3.0
+modesetting remain open. See the
+[PCIe probe contract](drivers/gpu/specification/spec.md#amd-discrete-pcie-probe-and-vram).
+
 1. **Stage 5 laptop proof:** boot from USB on Renoir/Lucienne or Phoenix
    HawkPoint1; exercise native AMDGPU modeset, keyboard and touchpad,
    Wi-Fi, and persistent NVMe storage. AMDGPU, ACPI EC, I²C-HID,

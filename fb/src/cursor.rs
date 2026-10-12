@@ -133,6 +133,9 @@ fn restore(fb: &FbWriter, save: &SavedRect) -> Result<(), crate::FbWriteError> {
 /// Key / AsciiByte / Scroll go to their own consumers via
 /// `narf_input::pop_key` / `pop_ascii_byte` / `pop_scroll`.
 pub fn drain_and_render(fb: &FbWriter) {
+    if fb.check_live().is_err() {
+        return;
+    }
     init_centre(fb);
     // Publish the live scanout size so the absolute-pointer driver
     // (virtio-tablet) maps each axis onto its true on-screen extent

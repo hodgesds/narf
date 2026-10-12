@@ -45,6 +45,7 @@ fn engine(instance: u8) -> Engine<Fake> {
         authority: Cap::bootstrap(),
         instance,
         blanked: true,
+        profile: Profile::Dcn314,
     }
 }
 fn timing() -> Timing {
@@ -112,6 +113,23 @@ fn surface() -> Surface {
 fn run<T>(future: impl core::future::Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(future)
 }
+fn hubp_navi22_preserves_pack_control_and_uses_sixth_pipe() -> TestResult {
+    let mut hubp = engine(0);
+    hubp.profile = Profile::Navi22;
+    hubp.instance = 5;
+    hubp.io.values.resize(0x0ab9, 0);
+    hubp.io.values[0x0ab8] = 0x1fff;
+    hubp.program_pacing(&registers()).unwrap();
+    hubp.program_surface(&surface()).unwrap();
+    if hubp.io.values[0x0ab8] & 0x1fff != 0x1000 || hubp.io.values[0x0a53] != surface().pitch - 1 {
+        return TestResult::Fail("DCN30 DET field clobbered PACK or pipe5 pitch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-hubp",
+    hubp_navi22_preserves_pack_control_and_uses_sixth_pipe
+);
 
 fn hubp_surface_programming_uses_the_owned_instance() -> TestResult {
     let mut hubp = engine(2);

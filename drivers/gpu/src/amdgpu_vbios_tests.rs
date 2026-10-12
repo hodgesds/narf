@@ -4,7 +4,7 @@ use narf_bus::{BarKind, BusKind, DeviceId, PcieAddr};
 use narf_kernel_test::{kernel_test_in, TestResult};
 use narf_memory::PhysAddr;
 
-fn device() -> BusDevice {
+pub(super) fn device() -> BusDevice {
     let addr = PcieAddr::new(0, 0xc4, 0, 0);
     BusDevice {
         addr: BusAddr::Pcie(addr),
@@ -27,7 +27,7 @@ fn put16(bytes: &mut [u8], offset: usize, value: u16) {
 fn put32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
-fn image() -> Vec<u8> {
+pub(super) fn image() -> Vec<u8> {
     let mut bytes = vec![0; 512];
     bytes[..3].copy_from_slice(&[0x55, 0xaa, 1]);
     put16(&mut bytes, 0x48, 0x80);

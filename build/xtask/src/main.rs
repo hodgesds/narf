@@ -32,6 +32,7 @@ mod bpf_bench;
 mod ci_clippy;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
+mod passthrough;
 mod relocs;
 
 #[derive(Parser)]
@@ -70,6 +71,18 @@ enum Cmd {
 
     /// Lint changed packages, without linting their dependencies.
     ClippyChanged(ci_clippy::Args),
+    /// Check the host is set up to pass a PCIe device through to QEMU, and
+    /// print the launch recipe.
+    ///
+    /// Four things have to be true and three of them fail silently: KVM
+    /// available, the host IOMMU on, every device in the card's IOMMU group
+    /// bound to vfio-pci, and the card's BARs inside the physical ranges
+    /// NARF's page tables actually map. The last is specific to this kernel
+    /// — a BAR parked outside those ranges faults on first register access
+    /// and looks exactly like a driver bug.
+    ///
+    /// Checks only; it launches nothing.
+    Passthrough(PassthroughArgs),
     /// Extract the kernel's relocation table for KASLR and report what a
     /// boot-time slide would have to patch. Requires a kernel linked with
     /// `--emit-relocs`.
@@ -11090,6 +11103,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::HostTest => host_test_cmd(),
+        Cmd::Passthrough(args) => passthrough_cmd(&args),
         Cmd::Relocs(args) => {
             let table = if args.patch {
                 let t = relocs::patch(&args.elf)?;
@@ -11493,4 +11507,64 @@ mod dma_addr_source_guard {
             offenders.join("\n")
         );
     }
+}
+
+#[derive(Parser, Debug)]
+struct PassthroughArgs {
+    /// A device to pass through, as `03:00.0` or `0000:03:00.0`. Repeat for
+    /// each function — an AMD GPU is normally two, the GPU and its HD-audio
+    /// function.
+    #[arg(long = "device", short = 'd', required = true)]
+    devices: Vec<String>,
+}
+
+/// `cargo xtask passthrough -d 03:00.0 -d 03:00.1`
+fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
+    use passthrough::{explain, note, preflight, qemu_fragment, Bdf};
+
+    let mut devices = Vec::new();
+    for raw in &args.devices {
+        match Bdf::parse(raw) {
+            Some(b) => devices.push(b),
+            None => bail!("{raw:?} is not a PCI address; expected 03:00.0 or 0000:03:00.0"),
+        }
+    }
+
+    let pf = preflight(&devices);
+    print!("{}", pf.report);
+
+    for a in &pf.advisories {
+        println!("\nnote: {}", note(a));
+    }
+    if !pf.blockers.is_empty() {
+        for b in &pf.blockers {
+            eprintln!("\nblocked: {}", explain(b));
+        }
+        bail!(
+            "{} blocker(s) — the host is not ready to pass these devices through",
+            pf.blockers.len()
+        );
+    }
+
+    // The launch. `XTASK_QEMU_ACCEL` and `NARF_QEMU_EXTRA` are the existing
+    // hooks in `Arch::qemu_args`; passthrough needs no new plumbing, only
+    // the right values, so the recipe uses them rather than adding a third
+    // way to reach the same arguments.
+    //
+    // `phys-bits=40` is already applied to `-cpu max` by
+    // `Arch::clamp_cpu_phys_bits`, and it is what keeps the q35 64-bit PCI
+    // hole — and so the card's BARs — inside the window NARF maps. Do not
+    // override `NARF_QEMU_CPU` with a wider width here.
+    println!(
+        "\nhost is ready. Launch with:\n\n  \
+         XTASK_QEMU_ACCEL=kvm \\\n    \
+         NARF_QEMU_EXTRA={:?} \\\n    \
+         cargo xtask run\n",
+        qemu_fragment(&devices)
+    );
+    println!(
+        "Leave NARF_QEMU_CPU unset: the default `max` is clamped to phys-bits=40,\n\
+         which parks the q35 64-bit PCI hole inside the phys range NARF maps.\n"
+    );
+    Ok(())
 }

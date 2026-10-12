@@ -6,6 +6,7 @@ struct Fake {
     values: Vec<u32>,
     writes: Vec<(u64, u32)>,
     gone: bool,
+    acknowledge: bool,
 }
 impl Fake {
     fn new() -> Self {
@@ -13,6 +14,7 @@ impl Fake {
             values: vec![0; LAST_REG as usize + 1],
             writes: Vec::new(),
             gone: false,
+            acknowledge: false,
         }
     }
 }
@@ -26,6 +28,9 @@ impl Io for Fake {
     fn write(&mut self, reg: u64, value: u32) {
         self.writes.push((reg, value));
         self.values[reg as usize] = value;
+        if self.acknowledge && reg == 0x64 {
+            self.values[reg as usize] = (value & !0x7f00) | (value & 0x7f) << 8 | 0x180000;
+        }
     }
 }
 fn dccg() -> Engine<Fake> {
@@ -33,8 +38,31 @@ fn dccg() -> Engine<Fake> {
         io: Fake::new(),
         authority: Cap::bootstrap(),
         reference_dppclk_khz: 0,
+        profile: Profile::Dcn314,
     }
 }
+fn dccg_navi22_has_six_dtos_and_no_phoenix_pixel_mux() -> TestResult {
+    let mut dccg = dccg();
+    dccg.profile = Profile::Navi22;
+    dccg.reference_dppclk_khz = 600_000;
+    dccg.dpp_dto(5, 300_000).unwrap();
+    if dccg.io.values[0x9e] != 0x00ff0080 || dccg.io.values[0xb6] & 0x300000 != 0x100000 {
+        return TestResult::Fail("DCN30 sixth DPP DTO");
+    }
+    let count = dccg.io.writes.len();
+    if dccg.set_pixel_rate_div(0, Divider::By1, Divider::By4) != Err(Error::Unsupported)
+        || dccg.set_dp_stream_clock(0, 0, StreamClock::Dtbclk) != Err(Error::Unsupported)
+        || dccg.dpp_dto(6, 300_000) != Err(Error::Invalid)
+        || dccg.io.writes.len() != count
+    {
+        return TestResult::Fail("Phoenix mux used on DCN30");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-dccg",
+    dccg_navi22_has_six_dtos_and_no_phoenix_pixel_mux
+);
 fn dccg_pixel_rate_dividers_are_per_otg_three_bit_fields() -> TestResult {
     let mut dccg = dccg();
     // DisplayPort 8b/10b, one pixel per container, no ODM: divide by 1 then 4.
@@ -198,4 +226,42 @@ fn dccg_single_pipe_consumer_tracks_the_global_clock() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn-dccg",
     dccg_single_pipe_consumer_tracks_the_global_clock
+);
+
+fn dccg_navi22_dentist_waits_for_both_clock_changes() -> TestResult {
+    let mut e = dccg();
+    if narf_scheduler::block_on_spin(e.dentist(0x51, 0x52)) != Err(Error::Unsupported) {
+        return TestResult::Fail("Navi22 DENTIST used on Phoenix");
+    }
+    e.profile = Profile::Navi22;
+    e.io.acknowledge = true;
+    narf_scheduler::block_on_spin(e.dentist(0x51, 0x52)).unwrap();
+    if e.io.writes != [(0x64, 0x51), (0x64, 0x52185151)] {
+        return TestResult::Fail("DISP completion not observed before DPP request");
+    }
+    let n = e.io.writes.len();
+    if narf_scheduler::block_on_spin(e.dentist(7, 0x52)) != Err(Error::Invalid)
+        || e.io.writes.len() != n
+    {
+        return TestResult::Fail("invalid DENTIST id written");
+    }
+    e.io.acknowledge = false;
+    e.io.values[0x64] = 0;
+    if narf_scheduler::block_on_spin(e.dentist(0x51, 0x52)) != Err(Error::Timeout)
+        || e.io.writes.len() != n + 1
+    {
+        return TestResult::Fail("stalled DISP change advanced to DPP");
+    }
+    e.authority.revoke();
+    let n = e.io.writes.len();
+    if narf_scheduler::block_on_spin(e.dentist(0x51, 0x52)) != Err(Error::Revoked)
+        || e.io.writes.len() != n
+    {
+        return TestResult::Fail("revoked DENTIST write");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-dccg",
+    dccg_navi22_dentist_waits_for_both_clock_changes
 );

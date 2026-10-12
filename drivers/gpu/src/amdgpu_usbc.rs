@@ -13,6 +13,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sink {
     pub channel: Channel,
+    /// Hardware AUX channel for Legacy, tunnelling endpoint for DPIA.
+    /// A native transmitter and HPD line must be resolved from board wiring.
     pub instance: u8,
     pub dpcd: [u8; 16],
     pub edid: Vec<u8>,
@@ -288,7 +290,7 @@ pub(crate) async fn scan(dmub: &mut Dmub) -> Result<Vec<Sink>, Error> {
     Ok(result)
 }
 pub(crate) fn start() -> narf_init::InitResult {
-    if !super::amdgpu::is_probed() {
+    if !super::amdgpu::is_probed() || super::amdgpu::is_navi22() {
         return narf_init::InitResult::NotPresent;
     }
     if crate::amdgpu_platform::start() {

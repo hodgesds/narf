@@ -7,13 +7,15 @@ const DISPLAY_OBJECT: usize = 0x400;
 const DCE: usize = 0x500;
 const INTEGRATED: usize = 0x600;
 const RECORDS: usize = 0x700;
+const GPIO: usize = 0x800;
+const DCN_BASE: u32 = 0x4000;
 const ENTRIES: usize = 31;
 
-/// A synthetic VBIOS carrying only the three tables the inventory reads.
+/// A synthetic VBIOS carrying the routing and APU inventory tables.
 struct Image(Vec<u8>);
 impl Image {
     fn new() -> Self {
-        let mut image = vec![0u8; 0x800];
+        let mut image = vec![0u8; 0x900];
         image[..2].copy_from_slice(&[0x55, 0xaa]);
         image[0x48..0x4a].copy_from_slice(&0x0100u16.to_le_bytes());
         // ROM header with the ATOM signature and the directory pointer.
@@ -27,12 +29,26 @@ impl Image {
         image[DIR + 3] = 1;
         let mut this = Self(image);
         this.point(TABLE_DISPLAY_OBJECT_INFO, DISPLAY_OBJECT);
+        this.point(TABLE_GPIO_PIN_LUT, GPIO);
+        this.gpios();
         this.point(TABLE_DCE_INFO, DCE);
         this.point(TABLE_INTEGRATED_SYSTEM_INFO, INTEGRATED);
         this.dce(2_700);
         this.integrated(MEM_TYPE_DDR5, 4);
         this.paths(&[(0x3505, 0x2101), (0x3606, 0x2202)]);
         this
+    }
+    fn gpios(&mut self) {
+        self.0[GPIO..GPIO + 4].copy_from_slice(&[100, 0, 2, 1]);
+        for (i, shift) in [0u8, 8, 16, 24, 26, 28].into_iter().enumerate() {
+            let at = GPIO + 4 + i * 8;
+            self.0[at..at + 4].copy_from_slice(&(DCN_BASE + 0x28d1 + i as u32 * 4).to_le_bytes());
+            self.0[at + 6] = 0x80 + i as u8;
+            let at = at + 6 * 8;
+            self.0[at..at + 4].copy_from_slice(&(DCN_BASE + 0x28f5).to_le_bytes());
+            self.0[at + 4] = shift;
+            self.0[at + 6] = 0x40 + i as u8;
+        }
     }
     fn point(&mut self, index: u16, offset: usize) {
         let at = DIR + 4 + index as usize * 2;
@@ -79,16 +95,34 @@ impl Image {
             let at = DISPLAY_OBJECT + PATHS_OFFSET + index * PATH_SIZE;
             self.0[at..at + 2].copy_from_slice(&conn.to_le_bytes());
             // Record list for this path, one per entry.
-            let records = RECORDS + index * 8;
-            self.0[at + 2..at + 4].copy_from_slice(&(records as u16).to_le_bytes());
+            let records = RECORDS + index * 16;
+            self.0[at + 2..at + 4]
+                .copy_from_slice(&((records - DISPLAY_OBJECT) as u16).to_le_bytes());
             self.0[at + 4..at + 6].copy_from_slice(&enc.to_le_bytes());
             self.0[at + 12..at + 14].copy_from_slice(&((index as u16) + 1).to_le_bytes());
-            self.hpd_record(records, index as u8 + 1);
+            self.hpd_record(records, 0x40 + index as u8);
+            self.0[records + 4..records + 8].copy_from_slice(&[
+                1,
+                4,
+                0x80 + transmitter(*enc).unwrap_or(index as u8),
+                0,
+            ]);
+            self.0[records + 8..records + 10].copy_from_slice(&[0xff, 0]);
         }
     }
     fn bytes(&self) -> &[u8] {
         &self.0
     }
+}
+fn display_paths(vbios: &[u8]) -> Result<Vec<Path>, Error> {
+    display_paths_at(vbios, DCN_BASE, 5)
+}
+fn routes_for_sink(
+    paths: &[Path],
+    sink: &crate::amdgpu_usbc::Sink,
+    frontend: u8,
+) -> Result<Vec<crate::amdgpu_dio::Route>, Error> {
+    routes_for_profile(Profile::Dcn314, paths, sink, frontend)
 }
 fn levels() -> Levels {
     Levels {
@@ -125,6 +159,7 @@ fn inventory_display_paths_decode_their_transmitters() -> TestResult {
             connector: Connector::DisplayPort,
             connector_instance: 5,
             transmitter: 0,
+            aux: Some(0),
             hpd: 1,
             device_tag: 1,
         })
@@ -331,54 +366,48 @@ kernel_test_in!(
     inventory_reference_clock_and_vco_are_range_checked
 );
 
-fn inventory_hpd_records_fail_closed_to_unassigned() -> TestResult {
+fn inventory_gpio_ids_are_resolved_and_bad_records_fail_closed() -> TestResult {
     let image = Image::new();
-    // A well-formed record list yields its pin.
-    if hpd_selector(image.bytes(), RECORDS as u16) != 1 {
-        return TestResult::Fail("HPD record not read");
+    for (i, uid) in (0x40..=0x45).enumerate() {
+        if hpd_selector(image.bytes(), uid, DCN_BASE) != Ok(i as u8 + 1) {
+            return TestResult::Fail("HPD GPIO uid not resolved");
+        }
     }
-    // No list at all means the board assigns none.
-    if hpd_selector(image.bytes(), 0) != 0 {
-        return TestResult::Fail("absent record list");
+    // uid 1 is not HPD1; the LUT, not the uid, identifies the hardware line.
+    if hpd_selector(image.bytes(), 1, DCN_BASE) != Err(Error::Missing) {
+        return TestResult::Fail("HPD uid mistaken for selector");
     }
-    // A pin outside the six that exist is not a selector.
-    let mut high = Image::new();
-    high.hpd_record(RECORDS, 7);
-    if hpd_selector(high.bytes(), RECORDS as u16) != 0 {
-        return TestResult::Fail("out-of-range HPD pin accepted");
+    let mut none = Image::new();
+    none.0[DISPLAY_OBJECT + 10..DISPLAY_OBJECT + 12].fill(0);
+    let paths = display_paths(none.bytes()).unwrap();
+    if paths[0].aux.is_some() || paths[0].hpd != 0 {
+        return TestResult::Fail("absent routing invented defaults");
     }
-    let mut zero = Image::new();
-    zero.hpd_record(RECORDS, 0);
-    if hpd_selector(zero.bytes(), RECORDS as u16) != 0 {
-        return TestResult::Fail("zero HPD pin accepted");
-    }
-    // A zero-size record would make the walk stand still; it must stop.
-    let mut stuck = Image::new();
-    stuck.0[RECORDS] = 9;
-    stuck.0[RECORDS + 1] = 0;
-    if hpd_selector(stuck.bytes(), RECORDS as u16) != 0 {
-        return TestResult::Fail("zero-size record accepted");
-    }
-    // A list with no terminator inside the image must stop at the bound.
-    let mut unterminated = Image::new();
-    for offset in RECORDS..unterminated.0.len() {
-        unterminated.0[offset] = 9;
-    }
-    for offset in (RECORDS + 1..unterminated.0.len()).step_by(2) {
-        unterminated.0[offset] = 2;
-    }
-    if hpd_selector(unterminated.bytes(), RECORDS as u16) != 0 {
-        return TestResult::Fail("unterminated record list accepted");
-    }
-    // A record list pointing past the image is not a list.
-    if hpd_selector(image.bytes(), 0x7ff) != 0 {
-        return TestResult::Fail("out-of-bounds record list accepted");
+    for case in 0..9 {
+        let mut bad = Image::new();
+        match case {
+            0 => bad.0[RECORDS + 1] = 0,
+            1 => bad.0[RECORDS + 1] = 3,
+            2 => bad.0[RECORDS + 2] = 1,
+            3 => bad.0[RECORDS + 4] = 2,          // duplicate HPD
+            4 => bad.0[GPIO + 4 + 6 * 8 + 4] = 1, // not an HPD bit
+            5 => bad.0[GPIO + 4 + 4] = 8,         // DDC data, not clock
+            6 => bad.0[GPIO + 4 + 6] = 0x81,      // missing requested GPIO uid
+            7 => bad.0[DISPLAY_OBJECT + 10..DISPLAY_OBJECT + 12]
+                .copy_from_slice(&0xffffu16.to_le_bytes()),
+            _ => {
+                bad.0[DISPLAY_OBJECT + 10..DISPLAY_OBJECT + 12].copy_from_slice(&8u16.to_le_bytes())
+            }
+        }
+        if display_paths(bad.bytes()).is_ok() {
+            return TestResult::Fail("malformed board routing accepted");
+        }
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/dcn-inventory",
-    inventory_hpd_records_fail_closed_to_unassigned
+    inventory_gpio_ids_are_resolved_and_bad_records_fail_closed
 );
 
 fn inventory_route_is_validated_against_the_board() -> TestResult {
@@ -390,8 +419,8 @@ fn inventory_route_is_validated_against_the_board() -> TestResult {
         dpcd: [0; 16],
         edid: Vec::new(),
     };
-    // A native sink's DMUB link instance is its transmitter; the topology
-    // confirms it and supplies the hot-plug line. There is exactly one route.
+    // This fixture happens to wire AUX0 to transmitter A. The crossed-wiring
+    // regression below ensures that identity is not assumed by the driver.
     let routes = match routes_for_sink(&paths, &sink(crate::amdgpu_dmub::Channel::Legacy, 0), 2) {
         Ok(routes) => routes,
         Err(_) => return TestResult::Fail("native route rejected"),
@@ -408,7 +437,7 @@ fn inventory_route_is_validated_against_the_board() -> TestResult {
     }
     // A transmitter the board wired to nothing we can drive is refused rather
     // than driven on the strength of the sink's index alone.
-    for instance in [1u8, 5] {
+    for instance in [1u8, 4] {
         if routes_for_sink(
             &paths,
             &sink(crate::amdgpu_dmub::Channel::Legacy, instance),
@@ -499,4 +528,162 @@ fn inventory_tunnelled_sinks_borrow_an_unwired_transmitter_first() -> TestResult
 kernel_test_in!(
     "drivers/gpu/dcn-inventory",
     inventory_tunnelled_sinks_borrow_an_unwired_transmitter_first
+);
+
+fn inventory_native_route_keeps_aux_hpd_and_transmitter_separate() -> TestResult {
+    let mut image = Image::new();
+    // Transmitter F, AUX3, HPD5; frontend B chosen independently by the caller.
+    image.paths(&[(0x3505, 0x2203)]);
+    image.0[RECORDS + 2] = 0x44;
+    image.0[RECORDS + 6] = 0x83;
+    // A decoy list at the old absolute address must never influence routing.
+    image.0[0x300..0x30a].copy_from_slice(&[2, 4, 0x40, 0, 1, 4, 0x80, 0, 0xff, 0]);
+    let paths = display_paths_at(image.bytes(), DCN_BASE, 6).unwrap();
+    let sink = crate::amdgpu_usbc::Sink {
+        channel: crate::amdgpu_dmub::Channel::Legacy,
+        instance: 3,
+        dpcd: [0; 16],
+        edid: Vec::new(),
+    };
+    let routes = routes_for_profile(Profile::Navi22, &paths, &sink, 1).unwrap();
+    if routes.len() != 1
+        || routes[0].backend != 5
+        || routes[0].aux != 3
+        || routes[0].hpd != 5
+        || routes[0].frontend != 1
+    {
+        return TestResult::Fail("native wiring still assumes identical indices");
+    }
+    let wrong = crate::amdgpu_usbc::Sink {
+        instance: 5,
+        ..sink.clone()
+    };
+    if routes_for_profile(Profile::Navi22, &paths, &wrong, 0) != Err(Error::Unsupported) {
+        return TestResult::Fail("transmitter number accepted as AUX channel");
+    }
+    let mut ambiguous = paths.clone();
+    ambiguous.push(paths[0]);
+    if routes_for_profile(Profile::Navi22, &ambiguous, &sink, 0) != Err(Error::Invalid) {
+        return TestResult::Fail("ambiguous AUX selected the first connector");
+    }
+    let tunnel = crate::amdgpu_usbc::Sink {
+        channel: crate::amdgpu_dmub::Channel::Dpia,
+        ..sink
+    };
+    if routes_for_profile(Profile::Navi22, &paths, &tunnel, 0) != Err(Error::Unsupported) {
+        return TestResult::Fail("Navi22 invented a DPIA route");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_native_route_keeps_aux_hpd_and_transmitter_separate
+);
+
+fn inventory_routes_follow_discovery_and_generation_specific_dig() -> TestResult {
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    let mut dcn = gpu.ip_blocks[0];
+    dcn.hw_id = crate::amdgpu_discovery::HW_ID_DCN;
+    dcn.major = 3;
+    dcn.minor = 0;
+    dcn.revision = 0;
+    dcn.base_addrs[2] = DCN_BASE;
+    gpu.ip_blocks.push(dcn);
+    let mut image = Image::new();
+    image.paths(&[(0x3505, 0x2203)]);
+    image.0[RECORDS + 6] = 0x83;
+    let paths = super::display_paths(&gpu, image.bytes()).unwrap();
+    let sink = crate::amdgpu_usbc::Sink {
+        channel: crate::amdgpu_dmub::Channel::Legacy,
+        instance: 3,
+        dpcd: [0; 16],
+        edid: Vec::new(),
+    };
+    if super::routes_for_sink(&gpu, &paths, &sink, 5).unwrap()[0].backend != 5 {
+        return TestResult::Fail("Navi22 sixth DIG lost");
+    }
+    let mut regs = vec![0u32; (DCN_BASE + 0x28f6) as usize];
+    gpu.regs.virt = regs.as_mut_ptr() as u64;
+    gpu.regs.len = regs.len() as u64 * 4;
+    let cap = Cap::bootstrap();
+    // SAFETY: exclusively owned register model, alive throughout each probe.
+    unsafe {
+        regs[(DCN_BASE + 0x25b1) as usize] = 1;
+        if transmitter_busy(&gpu, &cap, 5) != Ok(true) {
+            return TestResult::Fail("Navi22 BE enable offset");
+        }
+        regs[(DCN_BASE + 0x25b1) as usize] = 0;
+        regs[(DCN_BASE + 0x25b2) as usize] = 1;
+        if transmitter_busy(&gpu, &cap, 5) != Ok(false) {
+            return TestResult::Fail("Navi22 read Phoenix BE offset");
+        }
+        if transmitter_busy(&gpu, &cap, 6) != Err(Error::Invalid) {
+            return TestResult::Fail("seventh DIG admitted");
+        }
+        gpu.ip_blocks.last_mut().unwrap().minor = 1;
+        gpu.ip_blocks.last_mut().unwrap().revision = 4;
+        regs[(DCN_BASE + 0x24b2) as usize] = 1;
+        if transmitter_busy(&gpu, &cap, 4) != Ok(true)
+            || transmitter_busy(&gpu, &cap, 5) != Err(Error::Invalid)
+        {
+            return TestResult::Fail("Phoenix DIG bounds/offset changed");
+        }
+        cap.revoke();
+        if transmitter_busy(&gpu, &cap, 4) != Err(Error::Revoked) {
+            return TestResult::Fail("revoked DIG probe");
+        }
+    }
+    // The LUT's register identity must match this GPU's discovered DCN bank.
+    gpu.ip_blocks.last_mut().unwrap().minor = 0;
+    gpu.ip_blocks.last_mut().unwrap().revision = 0;
+    gpu.ip_blocks.last_mut().unwrap().base_addrs[2] += 4;
+    if super::display_paths(&gpu, image.bytes()).is_ok() {
+        return TestResult::Fail("GPIO registers from another layout accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_routes_follow_discovery_and_generation_specific_dig
+);
+
+fn inventory_routing_rejects_ambiguous_pins_bridges_and_truncation() -> TestResult {
+    let mut image = Image::new();
+    // Duplicate GPIO UID, even when one definition looks usable.
+    let pin = image.0[GPIO + 4..GPIO + 12].to_vec();
+    image.0[GPIO + 12..GPIO + 20].copy_from_slice(&pin);
+    if display_paths(image.bytes()) != Err(Error::Invalid) {
+        return TestResult::Fail("duplicate GPIO uid accepted");
+    }
+    let mut image = Image::new();
+    image.paths(&[(0x3505, 0x2101)]);
+    image.0[DISPLAY_OBJECT + PATHS_OFFSET + 6] = 1;
+    if display_paths(image.bytes()) != Err(Error::Unsupported) {
+        return TestResult::Fail("external encoder silently bypassed");
+    }
+    let image = Image::new();
+    for len in GPIO..GPIO + 100 {
+        if display_paths(&image.bytes()[..len]).is_ok() {
+            return TestResult::Fail("truncated GPIO LUT admitted");
+        }
+    }
+    let mut paths = display_paths(image.bytes()).unwrap();
+    paths[1].transmitter = paths[0].transmitter;
+    let sink = crate::amdgpu_usbc::Sink {
+        channel: crate::amdgpu_dmub::Channel::Legacy,
+        instance: 0,
+        dpcd: [0; 16],
+        edid: Vec::new(),
+    };
+    if routes_for_sink(&paths, &sink, 0) != Err(Error::Invalid) {
+        return TestResult::Fail("shared transmitter lacks mux ownership");
+    }
+    if routes_for_sink(&paths, &sink, 5) != Err(Error::Invalid) {
+        return TestResult::Fail("frontend beyond profile accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-inventory",
+    inventory_routing_rejects_ambiguous_pins_bridges_and_truncation
 );

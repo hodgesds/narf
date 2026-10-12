@@ -1,4 +1,4 @@
-//! DCN314 boot VRAM inventory. References: Linux amdgpu_ttm.c,
+//! Phoenix and Navi22 boot VRAM inventory. References: Linux amdgpu_ttm.c,
 //! amdgpu_atomfirmware.c, atomfirmware.h and DCN 3.1.4 register headers.
 //! Firmware metadata and explicit boot/client ranges precede allocation.
 use alloc::vec::Vec;
@@ -20,6 +20,7 @@ pub enum Error {
     MissingMetadata,
     Revoked,
     Allocation,
+    Busy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +31,8 @@ pub enum Owner {
     BootFramebuffer,
     Dmub,
     OtherClient,
+    MemoryTraining,
+    FirmwareRuntime,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Protected {
@@ -46,8 +49,133 @@ pub struct Plan {
     gpu_base: u64,
     vram_size: u64,
     protected: Vec<Protected>,
+    training: Option<Training>,
+}
+/// Firmware's GDDR6 training exchange buffers, in VRAM-relative bytes.
+/// They are reservations, not evidence that memory training has completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Training {
+    pub p2c: u64,
+    pub c2p: u64,
+    pub size: u64,
 }
 impl Plan {
+    /// Inventory a physical Navi22 using GMC10's full VRAM range and DCN3.0's
+    /// inherited DMUB windows. `None` means this GPU has no boot framebuffer;
+    /// all six supported linear scanouts/cursors are included automatically.
+    /// Active GFXHUB/MMHUB VM contexts and unsupported surfaces reject the
+    /// inventory. Every additional client must appear in `other_clients`.
+    ///
+    /// # Safety
+    /// Same exclusive GPU, stable mappings, authority and complete client
+    /// inventory contract as `read`. No hardware writes are performed.
+    pub unsafe fn read_navi22(
+        gpu: &AmdGpu,
+        authority: &Cap<BusDeviceCap, Write>,
+        boot_framebuffer: Option<Range<u64>>,
+        other_clients: &[Range<u64>],
+    ) -> Result<Self, Error> {
+        use crate::{amdgpu, amdgpu_discovery as ip, amdgpu_psp_ring::bank};
+        if gpu.chip.vid != amdgpu::AMD_VENDOR || gpu.chip.did != amdgpu::NAVI22 {
+            return Err(Error::Unsupported);
+        }
+        let gc =
+            bank(gpu, ip::HW_ID_GC, &[(10, 3, 2)], 0, 0x16fd).map_err(|_| Error::Unsupported)?;
+        let dcn =
+            bank(gpu, ip::HW_ID_DCN, &[(3, 0, 0)], 2, 0x477).map_err(|_| Error::Unsupported)?;
+        let vbios = gpu.vbios.as_ref().ok_or(Error::MissingVbios)?;
+        let inherited = crate::amdgpu_platform::boot_clients(gpu, authority)?;
+        authority
+            .invoke(ReadOp(|| {
+                // SAFETY: exact discovered banks bounded above, live authority.
+                let fields = unsafe {
+                    [
+                        gpu.regs.read32(gc + 0x16fc * 4),
+                        gpu.regs.read32(gc + 0x16fd * 4),
+                        gpu.regs.read32(gc + 0x16e7 * 4),
+                    ]
+                };
+                for (index, field) in fields.iter().enumerate() {
+                    // DMUB's MC translation uses DCN's copy of these fields.
+                    // An inconsistent display aperture cannot be inventoried.
+                    // SAFETY: DCN's entire FB register triplet is bounded above.
+                    let display = unsafe { gpu.regs.read32(dcn + (0x475 + index as u64) * 4) };
+                    if display == u32::MAX || display & 0xff_ffff != field & 0xff_ffff {
+                        return Err(Error::Invalid);
+                    }
+                }
+                let mut plan = snapshot_with_fields(
+                    gpu.fb_bar,
+                    vbios.bytes(),
+                    boot_framebuffer,
+                    other_clients,
+                    fields,
+                    // SAFETY: DCN bank bounds every window register read.
+                    |reg| unsafe { gpu.regs.read32(dcn + reg as u64 * 4) },
+                )?;
+                // The MC aperture must describe precisely the installed VRAM;
+                // BAR0 may describe only a small CPU-visible prefix of it.
+                if plan.vram_size != gpu.vram.size {
+                    return Err(Error::Invalid);
+                }
+                for range in &inherited {
+                    plan.protect_gpu(Owner::OtherClient, range.start, range.end - range.start)?;
+                }
+                plan.reserve_training(vbios.bytes())?;
+                Ok(plan)
+            }))
+            .map_err(|_| Error::Revoked)?
+    }
+
+    pub fn training(&self) -> Option<Training> {
+        self.training
+    }
+
+    fn reserve_training(&mut self, vbios: &[u8]) -> Result<(), Error> {
+        // PSP's runtime database is a 64 KiB window 1 MiB below the physical
+        // VRAM end, independent of the discovery blob and training capability.
+        self.protect(Owner::FirmwareRuntime, self.vram_size - (1 << 20), 0x10000)?;
+        let header = atombios::header::parse_rom_header(vbios).map_err(|_| Error::Invalid)?;
+        let directory =
+            atombios::tables::MasterDataTable::parse(vbios, &header).map_err(|_| Error::Invalid)?;
+        // firmware_reservations has already validated FirmwareInfo 3.4/3.5.
+        let info = directory.table_slice(4).ok_or(Error::MissingMetadata)?;
+        if u32_at(info, 0x10) & 0x400 == 0 {
+            return Ok(());
+        }
+        let tail = self
+            .protected
+            .iter()
+            .find(|r| r.owner == Owner::FirmwareTail)
+            .ok_or(Error::MissingMetadata)?
+            .range
+            .start;
+        // Linux amdgpu_ttm: ALIGN(vram_size - fw_reserve - 1 MiB, 1 MiB).
+        let c2p = tail
+            .checked_sub(1 << 20)
+            .and_then(|n| n.checked_add((1 << 20) - 1))
+            .map(|n| n & !((1 << 20) - 1))
+            .ok_or(Error::Invalid)?;
+        let training = Training {
+            p2c: self.vram_size.checked_sub(0x8000).ok_or(Error::Invalid)?,
+            c2p,
+            size: 0x1000,
+        };
+        let end = c2p.checked_add(training.size).ok_or(Error::Invalid)?;
+        if self
+            .protected
+            .iter()
+            .any(|r| c2p < r.range.end && r.range.start < end)
+        {
+            return Err(Error::Invalid);
+        }
+        self.protect(Owner::MemoryTraining, c2p, training.size)?;
+        // P2C lies in the mandatory discovery/firmware tail, even when the
+        // VBIOS reports no additional reservation.
+        self.protect(Owner::MemoryTraining, training.p2c, training.size)?;
+        self.training = Some(training);
+        Ok(())
+    }
     /// Snapshot firmware reservations and DMUB windows without changing hardware.
     /// `boot_framebuffer` is the PCI/bus-physical byte range from the bootloader;
     /// `other_clients` are GPU-address ranges, including other scanouts/cursors.
@@ -154,13 +282,30 @@ impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for ReadOp<F> {
 }
 
 fn snapshot(
-    mut mapping: MmioRegion,
+    mapping: MmioRegion,
     vbios: &[u8],
     boot_framebuffer: Range<u64>,
     other_clients: &[Range<u64>],
     mut read: impl FnMut(u32) -> u32,
 ) -> Result<Plan, Error> {
     let fields = [read(0x475), read(0x476), read(0x477)];
+    snapshot_with_fields(
+        mapping,
+        vbios,
+        Some(boot_framebuffer),
+        other_clients,
+        fields,
+        read,
+    )
+}
+fn snapshot_with_fields(
+    mut mapping: MmioRegion,
+    vbios: &[u8],
+    boot_framebuffer: Option<Range<u64>>,
+    other_clients: &[Range<u64>],
+    fields: [u32; 3],
+    mut read: impl FnMut(u32) -> u32,
+) -> Result<Plan, Error> {
     if fields.contains(&u32::MAX) {
         return Err(Error::Invalid);
     }
@@ -181,22 +326,28 @@ fn snapshot(
     {
         return Err(Error::Invalid);
     }
-    let fb_start = boot_framebuffer
-        .start
-        .checked_sub(mapping.phys.raw())
-        .ok_or(Error::Invalid)?;
-    let fb_end = boot_framebuffer
-        .end
-        .checked_sub(mapping.phys.raw())
-        .ok_or(Error::Invalid)?;
-    if fb_start >= fb_end || fb_end > mapping.len {
-        return Err(Error::Invalid);
-    }
+    let fb_end = if let Some(boot_framebuffer) = boot_framebuffer {
+        let fb_start = boot_framebuffer
+            .start
+            .checked_sub(mapping.phys.raw())
+            .ok_or(Error::Invalid)?;
+        let fb_end = boot_framebuffer
+            .end
+            .checked_sub(mapping.phys.raw())
+            .ok_or(Error::Invalid)?;
+        if fb_start >= fb_end || fb_end > mapping.len {
+            return Err(Error::Invalid);
+        }
+        fb_end
+    } else {
+        0
+    };
     let mut plan = Plan {
         mapping,
         gpu_base,
         vram_size,
         protected: Vec::new(),
+        training: None,
     };
     // Retain the full prefix, including VGA emulation, firmware shadow and
     // the pre-OS framebuffer. Do not reclaim it while the boot console is live.
@@ -209,6 +360,15 @@ fn snapshot(
             .filter(|size| *size != 0)
             .ok_or(Error::Invalid)?;
         plan.protect_gpu(Owner::OtherClient, range.start, size)?;
+    }
+    for reg in [0x19e, 0x19f, 0x1a0, 0x1a4] {
+        let top = read(reg);
+        if top == u32::MAX {
+            return Err(Error::Invalid);
+        }
+        if top & ENABLE != 0 {
+            return Err(Error::Unsupported);
+        }
     }
     for index in 0..8 {
         let top = read(0x1ad + index);

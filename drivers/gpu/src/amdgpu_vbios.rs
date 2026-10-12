@@ -1,4 +1,4 @@
-//! Owned VBIOS snapshots from ACPI VFCT or an APU's firmware VRAM shadow.
+//! Owned VBIOS snapshots from ACPI VFCT, APU VRAM shadow or Navi22 ROM registers.
 //! Formats and source ordering follow Linux `amdgpu_bios.c` / `atombios.h`.
 //! These reads neither enable a ROM BAR nor execute ATOM command tables.
 use alloc::vec::Vec;
@@ -11,6 +11,9 @@ const MAX_IMAGE: usize = 256 * 1024;
 const MAX_VFCT: usize = 2 * 1024 * 1024;
 const VFCT_HEADER: usize = 76;
 const IMAGE_HEADER: usize = 28;
+
+#[path = "amdgpu_vbios_rom.rs"]
+mod rom;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -27,6 +30,7 @@ pub enum Error {
 pub enum Source {
     Vfct,
     VramShadow,
+    RomRegisters,
 }
 
 /// Structurally validated data, not authority to reset a GPU or execute BIOS
@@ -288,6 +292,10 @@ pub(crate) unsafe fn discover(
         }))
         .map_err(|_| Error::Revoked)?;
     match vfct {
+        Err(Error::NotFound) if gpu.chip.did == crate::amdgpu::NAVI22 => {
+            // SAFETY: probe owns this device, BAR5 and the ROM index latch.
+            unsafe { rom::read_navi22(gpu, device, cap) }
+        }
         Err(Error::NotFound)
             if matches!(
                 gpu.chip.family,

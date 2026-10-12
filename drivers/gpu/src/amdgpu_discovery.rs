@@ -187,17 +187,12 @@ pub const HW_ID_VPE: u16 = 21;
 // — the discovery blob lives at the very top of the VRAM aperture,
 // `DISCOVERY_TMR_OFFSET` bytes below the end. Linux's
 // `amdgpu_discovery.h` defines `DISCOVERY_TMR_OFFSET = 64 << 10`
-// (64 KiB) and `DISCOVERY_TMR_SIZE = 10 << 10` (10 KiB — the
-// driver allocates a larger 4 KiB-multiple buffer up to a few MiB
-// in practice). We keep both names so the wire-up site can pick.
+// (64 KiB) and `DISCOVERY_TMR_SIZE = 10 << 10` (10 KiB).
 
 /// Offset from end of VRAM where the discovery blob starts.
 pub const DISCOVERY_TMR_OFFSET: u64 = 64 * 1024;
-/// Maximum useful discovery blob size — the binary itself is
-/// well under 10 KiB on every chip Linux currently knows about.
-/// We over-allocate to 4 MiB to match the way `amdgpu_discovery.c`
-/// allocates its scratch buffer.
-pub const DISCOVERY_TMR_SIZE: usize = 4 * 1024 * 1024;
+/// Default discovery read size from Linux's `amdgpu_discovery.h`.
+pub const DISCOVERY_TMR_SIZE: usize = 10 * 1024;
 
 // ── Errors ────────────────────────────────────────────────────────
 

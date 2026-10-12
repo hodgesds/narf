@@ -15,9 +15,9 @@
 //!
 //! This module parses both the common header and the GFX v1.0
 //! variant (used by GFX9 — Renoir/Cezanne/Lucienne/Barcelo).
-//! Newer GFX revisions (GFX10+) use different header variants;
-//! parsers for those are follow-ups when those chips' loader
-//! paths are wired.
+//! Navi22 also uses GFX v1.0 containers; its stricter payload
+//! selection (including PSP autoload's MEC split and RLC
+//! subimages) lives in `amdgpu_gfx_firmware`.
 //!
 //! Reference: `drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h` in
 //! Linux 6.10+. The structures are public ABI between the
