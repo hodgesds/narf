@@ -924,6 +924,41 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Disable a board-routed legacy DP SST transmitter before frontend retirement.
+    /// # Safety
+    /// Select a direct external DP port without USB-C/ACPI PHY interlocks or
+    /// SSC workarounds. Independently stop sink/audio/metadata/HDCP/FEC producers,
+    /// exclude CPU/firmware/FAMS and concurrent display/link/clock/power writers,
+    /// and retain every allocation/translation. Success proves firmware disable
+    /// and backend clock-off, not analog power gating or memory retirement.
+    pub async unsafe fn disable_display_dp_sst(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::DpSstDisabled, otg::Error> {
+        if self.display_retirement_busy()
+            || self.display_state() != Ok(display::State::Ready)
+            || self
+                .ddc
+                .as_ref()
+                .is_ok_and(|d| d.state() != ddc::State::Ready)
+        {
+            return Err(otg::Error::Busy);
+        }
+        let path = *self
+            .display_paths()
+            .map_err(|_| otg::Error::Invalid)?
+            .get(port)
+            .ok_or(otg::Error::Invalid)?;
+        // SAFETY: validated retained board route and matching serialized owners;
+        // caller fulfils the sink/platform-interlock and resource obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .disable_dp_sst(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
     fn display_retirement_busy(&self) -> bool {
         self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)
@@ -953,7 +988,12 @@ impl ColdBoot {
     /// Read routed native DP/eDP/HDMI sinks while retaining the DMUB/DDC and any
     /// incomplete I2C transaction. Cancellation prevents this scanner's reuse.
     pub async fn scan_display(&mut self) -> Result<Vec<display::Port>, Error> {
-        if self.state() != State::MemoryReady {
+        if self.state() != State::MemoryReady
+            || self
+                .otg
+                .as_ref()
+                .is_ok_and(|o| !o.status().state.reusable())
+        {
             return Err(Error::Busy);
         }
         let display = self.display.as_mut().map_err(|e| Error::Display(*e))?;
@@ -978,6 +1018,10 @@ impl ColdBoot {
     /// Access the live display mailbox while retaining this session's PSP/TMR.
     pub fn dmub(&mut self) -> Result<&mut dmub::Dmub, Error> {
         if self.state() != State::MemoryReady
+            || self
+                .otg
+                .as_ref()
+                .is_ok_and(|o| !o.status().state.reusable())
             || self
                 .display
                 .as_ref()

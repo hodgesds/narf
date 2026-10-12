@@ -526,6 +526,46 @@ encoders, plus requested or acknowledged frontend/stream clocks; video blanking
 alone cannot authorize clock changes. `unsafe ColdBoot::retire_display_dp_encoder`
 and its platform wrapper retain the same lifetime and drained GC12/SDMA guards.
 
+`unsafe ColdBoot::disable_display_dp_sst(port: usize).await` and its platform
+wrapper disable an inherited direct external legacy DP SST link before frontend
+retirement. The index selects this owner's validated `display_paths()` inventory;
+no caller-supplied transmitter, AUX or HPD substitution is accepted. The matching
+DMUB and timing owners must be ready and the GC12/SDMA interrupt proofs drained.
+USB-C, ACPI PHY transition interlocks and PHY SSC workarounds are outside this
+initial API: callers must establish that the selected direct port needs none.
+Callers independently stop sink, audio/metadata, HDCP and FEC producers, exclude
+CPU/firmware/FAMS and concurrent display/link/clock/power/reset writers, and retain
+every allocation and translation. eDP, MST, HPO and HDMI shutdown are separate.
+
+Live register preflight requires SST mode on both frontend and backend, one
+valid frontend selected by the actual backend route, and agreement with the
+board's HPD selector. Video, packet and metadata producers must be quiet, FEC
+inactive and reset state settled. A live backend requires its frontend still
+enabled. Independent HPO/FRL link consumers reject conservatively until their
+physical muxes have owners; unrelated legacy outputs may remain active.
+
+The private native DMUB operation sends VBIOS transmitter-control v1.7 DISABLE
+(type 128, subtype 1, 60-byte payload). Physical transmitter and one-based HPD
+come from the retained board path; frontend selection is zero as required by
+the DCE112+ command helper, leaving routing to the driver. Native inbox
+consumption alone is insufficient: the display owner waits up to 100 ms each
+for backend enable and requested/acknowledged backend clocks to clear. It then
+revalidates routing and frontend state, clears training-pattern/training-complete
+and alternate-scrambler state, and rechecks all witnesses. It never directly
+gates backend clocks to manufacture firmware completion. A fully disabled
+backend needs no command or cleanup writes. Frontend/FIFO state and unrelated
+backend routes remain unchanged for the subsequent `retire_display_dp_encoder`.
+
+Success enters `DpSstDisabled`, recording `DpSstDisabled::{path,frontend,
+command_sent}` in `Status::dp_sst_disabled`. This historical evidence covers
+firmware disable and digital backend-off only; it proves neither analog PHY
+power gating nor sink, timing, plane or memory retirement. Errors after starting
+enter `Failed`; cancellation retains `DisablingDpSst(transmitter)`. Both block
+display/clock reuse and raw mailbox/scanner access through the retained owner.
+The mailbox independently quarantines incomplete transport. Global/pipe clock
+guards also reject requested or acknowledged backend clocks even if the backend
+enable bit is already clear. No outcome permits allocation reuse.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

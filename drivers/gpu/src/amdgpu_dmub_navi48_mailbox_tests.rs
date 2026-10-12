@@ -7,6 +7,91 @@ fn ready() -> (Pool, Engine<Fake>) {
     run(engine.initialize_mailbox()).unwrap();
     (pool, engine)
 }
+fn dp_path(phy: u8, hpd: u8) -> crate::amdgpu_dcn_inventory::Path {
+    use crate::amdgpu_dcn_inventory::{Connector, Path};
+    Path {
+        connector: Connector::DisplayPort,
+        connector_instance: 1,
+        transmitter: phy,
+        aux: Some((phy + 1) % 4),
+        hpd,
+        device_tag: 8,
+    }
+}
+fn dmub_navi48_native_transmitter_disable_uses_v17_board_fields() -> TestResult {
+    for phy in 0..4 {
+        for hpd in 1..=4 {
+            let (_pool, mut e) = ready();
+            let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+            run(e.disable_dp_sst(dp_path(phy, hpd))).unwrap();
+            let mut golden = [0; 64];
+            golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+            golden[4] = phy;
+            golden[12] = hpd;
+            golden[14] = 19;
+            golden[15] = 244;
+            assert_eq!(e.io.slot(offset), golden);
+            assert_eq!(e.mailbox.state, MailboxState::Ready);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_native_transmitter_disable_uses_v17_board_fields
+);
+
+fn dmub_navi48_native_disable_invalid_or_uncertain_requests_never_replay() -> TestResult {
+    for case in 0..4 {
+        let (_pool, mut e) = ready();
+        let mut path = dp_path(0, 1);
+        match case {
+            0 => path.transmitter = 4,
+            1 => path.hpd = 0,
+            2 => path.hpd = 5,
+            _ => path.connector = crate::amdgpu_dcn_inventory::Connector::HdmiTypeA,
+        }
+        let bytes = e.io.bytes.clone();
+        let writes = e.io.writes.len();
+        assert_eq!(run(e.disable_dp_sst(path)), Err(Error::Invalid));
+        assert_eq!(e.io.bytes, bytes);
+        assert_eq!(e.io.writes.len(), writes);
+        assert_eq!(e.mailbox.state, MailboxState::Ready);
+    }
+    for cancel in [false, true] {
+        let (pool, mut e) = ready();
+        e.io.commands = false;
+        if cancel {
+            let mut future = core::pin::pin!(e.disable_dp_sst(dp_path(0, 1)));
+            assert!(future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        } else {
+            assert_eq!(
+                run(e.disable_dp_sst(dp_path(0, 1))),
+                Err(Error::CommandTimeout)
+            );
+        }
+        assert_eq!(
+            e.mailbox.state,
+            if cancel {
+                MailboxState::InFlight
+            } else {
+                MailboxState::Failed
+            }
+        );
+        assert_eq!(run(e.disable_dp_sst(dp_path(0, 1))), Err(Error::Busy));
+        assert_eq!(run(e.hpd(0)), Err(Error::Busy));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_native_disable_invalid_or_uncertain_requests_never_replay
+);
 fn dmub_navi48_mailbox_proves_version_caps_and_wraparound() -> TestResult {
     let (pool, mut engine) = ready();
     let mut caps = [0; 14];

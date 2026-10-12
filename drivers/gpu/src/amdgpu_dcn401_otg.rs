@@ -18,6 +18,9 @@ pub use fetch::PlanesRetired;
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
 pub use stream::{DpBlanked, DpEncoderRetired, DpStream};
+#[path = "amdgpu_dcn401_link.rs"]
+mod link;
+pub use link::DpSstDisabled;
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -55,6 +58,7 @@ pub enum Error {
     Timeout(u64),
     Clocks(clocks::Error),
     PipeClocks(dccg::Error),
+    Firmware(crate::amdgpu_dmub_navi48::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -69,6 +73,8 @@ pub enum State {
     DpBlanked,
     RetiringDpEncoder(DpStream),
     DpEncoderRetired,
+    DisablingDpSst(u8),
+    DpSstDisabled,
     RetiringPlanes,
     PlanesRetired,
     Retiring(u8),
@@ -86,6 +92,7 @@ impl State {
                 | Self::PlanesRetired
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
+                | Self::DpSstDisabled
         )
     }
 }
@@ -147,6 +154,9 @@ pub struct Status {
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
     pub dp_encoder_retired: Option<DpEncoderRetired>,
+    /// Historical legacy DP firmware-disable/backend-off evidence only.
+    /// Does not prove analog PHY power gating, sink or memory retirement.
+    pub dp_sst_disabled: Option<DpSstDisabled>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -268,7 +278,7 @@ impl Layout {
             ip::HW_ID_DCN,
             &[(4, 0, 1), (4, 1, 0)],
             2,
-            (PSTATE + 3 * 0x80) as u32,
+            0x3931, // includes all four native HPO DPHY status registers
         )
         .map_err(|_| Error::Unsupported)?;
         Ok(Self {
@@ -486,6 +496,7 @@ impl Otg {
                 planes_retired: None,
                 dp_blanked: None,
                 dp_encoder_retired: None,
+                dp_sst_disabled: None,
                 retired: 0,
             },
         }))

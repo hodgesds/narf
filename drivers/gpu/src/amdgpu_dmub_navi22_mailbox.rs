@@ -105,14 +105,14 @@ fn download(io: &mut impl Io, l: Layout, map: MmioRegion, offset: u64) -> [u8; 6
     reply
 }
 impl<I: Io> Engine<I> {
-    fn begin_mailbox(&mut self) -> Result<(), Error> {
+    pub(super) fn begin_mailbox(&mut self) -> Result<(), Error> {
         if self.state != State::Running || self.mailbox.state != MailboxState::Ready {
             return Err(Error::Busy);
         }
         self.mailbox.state = MailboxState::InFlight;
         Ok(())
     }
-    fn finish_mailbox<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+    pub(super) fn finish_mailbox<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
         self.mailbox.state = match &result {
             Ok(_) | Err(Error::CommandRejected(_) | Error::Aux(_)) => MailboxState::Ready,
             _ => MailboxState::Failed,
@@ -198,7 +198,7 @@ impl<I: Io> Engine<I> {
     }
     // Private raw transport: only typed, bounded requests below can reach it.
     // The outer operation holds InFlight across both inbox and AUX completion.
-    async fn command(&mut self, request: [u8; 64]) -> Result<[u8; 64], Error> {
+    pub(super) async fn command(&mut self, request: [u8; 64]) -> Result<[u8; 64], Error> {
         if !valid_header(&request) {
             return Err(Error::Invalid);
         }

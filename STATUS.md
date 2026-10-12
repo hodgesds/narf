@@ -339,8 +339,14 @@ requires connected backends stopped and removes only the selected frontend
 bits; unrelated live outputs stay untouched. Clock programming now rejects
 enabled frontends/FIFOs and outstanding frontend/stream clocks even when video
 is blank. Active packet/metadata work blocks retirement, and partial failures
-or cancellation retain all resources. HDMI, sink/MST/audio teardown and native
-PHY shutdown still need their own sequences.
+or cancellation retain all resources. Direct external legacy DP SST now has a
+board-routed DMUB v1.7 transmitter-disable path. It preserves the frontend until
+firmware clears backend enable and clock-on witnesses, then clears training and
+panel state. Invalid routes, active packet/FEC work and independent HPO/FRL links
+reject before commands. Failure/cancellation retain display and transport
+ownership and block reuse; backend clocks independently block clock programming.
+This proves digital backend-off, not analog PHY power gating. HDMI, HPO, eDP,
+sink/MST/audio teardown and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths
 have model tests, not silicon validation.

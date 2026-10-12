@@ -20,7 +20,7 @@ struct Plan {
     routes: [u32; 4],
 }
 impl<I: Io> Engine<I> {
-    fn dp_encoder_quiet(&mut self, stream: DpStream) -> Result<(), Error> {
+    pub(in super::super) fn dp_encoder_quiet(&mut self, stream: DpStream) -> Result<(), Error> {
         let l = self.layout;
         let at = |r| stream.at(l, r);
         match stream {

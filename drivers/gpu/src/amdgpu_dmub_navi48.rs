@@ -453,6 +453,22 @@ pub struct Dmub {
     engine: Engine<Mmio>,
 }
 impl Dmub {
+    pub(crate) fn matches_display(&self, regs: MmioRegion, base: u64) -> bool {
+        let own = self.engine.io.0;
+        own.phys == regs.phys
+            && own.virt == regs.virt
+            && own.len == regs.len
+            && self.engine.layout.dcn == base
+    }
+
+    // Only the retained native display owner may issue this narrow VBIOS
+    // operation. Inbox consumption proves transport completion, not PHY-off.
+    pub(crate) async fn disable_dp_sst(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+    ) -> Result<(), Error> {
+        self.engine.disable_dp_sst(path).await
+    }
     /// Validate the VRAM pool and reserve nonsecure DMUB storage without writes.
     /// # Safety
     /// Caller exclusively owns this physical Navi48 GPU, DCN/PSP/PM/reset,
@@ -512,6 +528,33 @@ impl Dmub {
     }
     pub fn status(&self) -> Option<Status> {
         self.engine.status
+    }
+}
+impl<I: Io> Engine<I> {
+    async fn disable_dp_sst(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+    ) -> Result<(), Error> {
+        use crate::amdgpu_dcn_inventory::Connector;
+        if path.connector != Connector::DisplayPort
+            || path.transmitter >= 4
+            || !(1..=4).contains(&path.hpd)
+        {
+            return Err(Error::Invalid);
+        }
+        // Linux command_table2.c, transmitter_control_v1_7. DISABLE has no
+        // clock/lane arguments. DCE112+ always leaves digfe_sel zero: routing
+        // belongs to the driver. The zero-initialized legacy caller's HPO id
+        // is DIGA(0) - HPO_DP_0(12), encoded as u8; it is unused in legacy DP.
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&[128, 1, 0, 60]);
+        request[4] = path.transmitter;
+        request[12] = path.hpd;
+        request[14] = 19; // CONNECTOR_ID_DISPLAY_PORT
+        request[15] = 244;
+        self.begin_mailbox()?;
+        let result = self.command(request).await.map(|_| ());
+        self.finish_mailbox(result)
     }
 }
 #[cfg(feature = "kernel-test")]

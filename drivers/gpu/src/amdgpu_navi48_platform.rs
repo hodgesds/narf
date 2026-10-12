@@ -425,6 +425,23 @@ pub async unsafe fn retire_display_dp_encoder(
     unsafe { boot.retire_display_dp_encoder(stream).await }
 }
 
+/// Disable a board-routed legacy DP SST transmitter before retiring its frontend.
+/// # Safety
+/// Select a direct external DP port without USB-C/ACPI PHY interlocks or SSC
+/// workarounds. Stop sink/audio/metadata/HDCP/FEC producers; exclude CPU, firmware,
+/// FAMS and concurrent display/link/clock/power writers. Retain all resources;
+/// success proves backend-off, never analog power gating or memory retirement.
+pub async unsafe fn disable_display_dp_sst(
+    port: usize,
+) -> Result<crate::amdgpu_dcn401_otg::DpSstDisabled, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: retained serialized owners; caller fulfils the platform obligations.
+    unsafe { boot.disable_display_dp_sst(port).await }
+}
+
 /// Consume bounded diagnostic history from the independent IH service.
 /// Hardware draining and CPU interrupt waits never hold the display-owner lock.
 pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> {

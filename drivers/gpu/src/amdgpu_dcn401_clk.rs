@@ -12,7 +12,11 @@ const MESSAGE: u32 = 0x8a; // MP1 C2PMSG74, base index 1
 const ARGUMENT: u32 = 0x73; // C2PMSG51
 const RESPONSE: u32 = 0x74; // C2PMSG52
 const LEVEL_COUNT: usize = 8;
-pub(crate) const IDLE_REG_COUNT: usize = 51;
+pub(crate) const IDLE_REG_COUNT: usize = 55;
+pub(crate) fn backend_clock_mask(instance: u8) -> u32 {
+    // Only DIG0 exposes the HDCP clock-on witness in DCN4.1.0.
+    0x2810 | if instance == 0 { 0x1000 } else { 0 }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -160,16 +164,17 @@ impl Layout {
                 (0x209b, 0x124, 1),       // DIO pixel FIFO enabled
                 (0x3623, 0xd4, 0x11111),  // HPO stream clock request/ON
                 (0x365d, 0xd4, 1),        // HPO SYM32 encoder enabled
+                (0x20bb, 0x124, backend_clock_mask(i as u8)), // backend clocks
             ]
             .into_iter()
             .enumerate()
             {
-                regs[i * 12 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
+                regs[i * 13 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
             }
         }
         // The single FRL stream lives in DCN bank 3, unlike HPO DP's bank 2.
         for (i, reg) in [0x8d3, 0x8d6, 0x8df].into_iter().enumerate() {
-            regs[48 + i] = (self.hpo + reg * 4, 1);
+            regs[52 + i] = (self.hpo + reg * 4, 1);
         }
         regs
     }

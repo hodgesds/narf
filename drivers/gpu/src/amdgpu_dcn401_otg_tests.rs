@@ -150,9 +150,11 @@ impl Io for Fake {
             (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
                 || (0..4).any(|p| {
-                    [0x2094, 0x2095, 0x209b, 0x20bc, 0x2122, 0x2123]
-                        .iter()
-                        .any(|r| at == BASE + (r + p * 0x124) * 4)
+                    [
+                        0x2094, 0x2095, 0x209b, 0x20bc, 0x211e, 0x2122, 0x2123, 0x2125, 0x212e,
+                    ]
+                    .iter()
+                    .any(|r| at == BASE + (r + p * 0x124) * 4)
                         || [0x3623, 0x3626, 0x365d, 0x365e, 0x367b, 0x3685]
                             .iter()
                             .any(|r| at == BASE + (r + p * 0xd4) * 4)
@@ -312,6 +314,7 @@ fn engine() -> Engine<Fake> {
             planes_retired: None,
             dp_blanked: None,
             dp_encoder_retired: None,
+            dp_sst_disabled: None,
             retired: 0,
         },
     }
@@ -1031,3 +1034,5 @@ mod stream;
 
 #[path = "amdgpu_dcn401_encoder_tests.rs"]
 mod encoder;
+#[path = "amdgpu_dcn401_link_tests.rs"]
+mod link;
