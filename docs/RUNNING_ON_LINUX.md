@@ -138,6 +138,7 @@ The kernel ELF lands at `target/<triple>/<profile>/narf-frame`
 | `--features` | *(empty)* | comma-separated cargo features |
 | `--display` | `none` | QEMU display (`none`, `gtk`, …) |
 | `--hw-profile` | `full` | `full` / `minimal` / `virtio-only` / `legacy-only` |
+| `--passthrough-device BDF` | *(none)* | attach an x86_64 host PCI function through VFIO; repeat per function |
 
 The first build is slow (build-std compiles the sysroot crates); later
 builds are incremental.
@@ -156,6 +157,39 @@ This builds the kernel and launches `qemu-system-x86_64` with a q35
 machine, `-cpu max`, a NUMA/HMAT topology, serial on stdio, and the
 full virtio + legacy device set (see `qemu_args` in main.rs). Without
 `boot-init`, the kernel runs the async demo and halts.
+
+### 3.1.1 Pass through a physical PCIe device
+
+PCIe assignment is configured before the guest starts, so this is an xtask
+boot option rather than a NARF kernel command-line parameter. Linux must have
+IOMMU support enabled and must already bind every assigned endpoint to
+`vfio-pci`; xtask deliberately does not detach devices from host drivers.
+For a multifunction GPU, pass both the graphics and audio functions:
+
+```sh
+# Inspect readiness without launching QEMU.
+cargo xtask passthrough -d 03:00.0 -d 03:00.1
+
+# Run the same preflight, then actually attach both functions and boot NARF.
+cargo xtask run --arch=x86_64 \
+  --passthrough-device 03:00.0 \
+  --passthrough-device 03:00.1
+```
+
+The preflight requires usable KVM, non-empty Linux IOMMU groups, `vfio-pci`
+ownership, every non-bridge endpoint in each selected group, and BARs that fit
+NARF's mapped physical-address windows. It also rejects a forced TCG
+accelerator. Leave `NARF_QEMU_CPU` unset unless you know the replacement keeps
+the PCI hole below NARF's 1-TiB physical mapping ceiling; xtask clamps its
+default `max` CPU model to 40 physical-address bits for this reason.
+
+On the Linux host, enable AMD-Vi or VT-d in firmware and use the distribution's
+normal early-boot VFIO configuration (`vfio-pci.ids=vendor:device`, initramfs
+module configuration, or `driver_override`) to claim the device. Prefer
+early-boot binding for a GPU. Runtime-unbinding the adapter driving the host
+desktop can terminate the session or leave the card unable to reset. NARF sees
+the assigned function as an ordinary PCIe device and needs no passthrough flag
+inside the guest.
 
 ### 3.2 The interactive shell + login
 

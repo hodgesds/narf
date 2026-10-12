@@ -43,6 +43,30 @@ passed as a comma-separated `--features` list. Do not enable development-only
 features such as `firmware-allow-unsigned` or `module-allow-unsigned` on a
 production image.
 
+## Assign a host PCIe device to QEMU
+
+On x86_64, `--passthrough-device BDF` assigns a Linux host PCI function through
+VFIO. Repeat it for every function that belongs to the device, such as a GPU
+and its HD-audio function:
+
+```sh
+cargo xtask passthrough -d 03:00.0 -d 03:00.1
+cargo xtask run --arch=x86_64 \
+  --passthrough-device 03:00.0 \
+  --passthrough-device 03:00.1
+```
+
+The first command is a read-only readiness check. The second repeats that
+preflight, injects QEMU `vfio-pci` devices, and boots NARF. The Linux host must
+have KVM and an enabled IOMMU, and every assigned endpoint must already be
+bound to `vfio-pci`. xtask checks IOMMU-group completeness and whether the
+device BARs fit NARF's mapped physical windows, but never rebinds host
+hardware. Prefer the distribution's early-boot VFIO configuration; detaching
+the GPU driving an active desktop can terminate the session and may leave the
+card unable to reset until reboot. See
+[Running on Linux](RUNNING_ON_LINUX.md#311-pass-through-a-physical-pcie-device)
+for the host/guest boundary and troubleshooting details.
+
 ## Userspace, storage, and networking
 
 On x86_64, `boot-init` starts the in-tree init/getty/shell path and can run

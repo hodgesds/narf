@@ -13,6 +13,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// A physical-address range NARF's page tables cover, as
 /// `memory/src/x86_64/mmu.rs` builds them.
@@ -229,7 +230,7 @@ impl Bdf {
         if !seg.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit())) {
             return None;
         }
-        Some(Bdf(long))
+        Some(Bdf(long.to_ascii_lowercase()))
     }
 
     pub fn sysfs(&self) -> PathBuf {
@@ -243,6 +244,16 @@ impl Bdf {
             (Some((a, _)), Some((b, _))) => a == b,
             _ => false,
         }
+    }
+}
+
+impl FromStr for Bdf {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::parse(raw).ok_or_else(|| {
+            format!("{raw:?} is not a PCI address; expected 03:00.0 or 0000:03:00.0")
+        })
     }
 }
 
@@ -419,6 +430,18 @@ pub fn qemu_fragment(devices: &[Bdf]) -> String {
     out
 }
 
+/// Render the typed QEMU argv entries for direct use with
+/// [`std::process::Command`].
+///
+/// Keep this separate from [`qemu_fragment`]: the latter is display text,
+/// while this form never relies on shell quoting or whitespace splitting.
+pub fn qemu_args(devices: &[Bdf]) -> Vec<String> {
+    devices
+        .iter()
+        .flat_map(|device| ["-device".to_string(), format!("vfio-pci,host={}", device.0)])
+        .collect()
+}
+
 // ── Reading the host ───────────────────────────────────
 
 fn read_trim(path: &Path) -> Option<String> {
@@ -503,9 +526,15 @@ pub fn preflight(passing: &[Bdf]) -> Preflight {
     let kvm = Path::new("/dev/kvm");
     if !kvm.exists() {
         blockers.push(Blocker::NoKvm("/dev/kvm does not exist".into()));
-    } else if std::fs::OpenOptions::new().read(true).open(kvm).is_err() {
+    } else if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(kvm)
+        .is_err()
+    {
         blockers.push(Blocker::NoKvm(
-            "/dev/kvm is not readable by this user (add yourself to the kvm group)".into(),
+            "/dev/kvm is not readable and writable by this user (add yourself to the kvm group)"
+                .into(),
         ));
     }
 
@@ -1056,5 +1085,23 @@ mod tests {
         // VGA decode, which would additionally require the host to have
         // released the console.
         assert!(!frag.contains("x-vga"));
+        assert_eq!(
+            qemu_args(&devs),
+            [
+                "-device",
+                "vfio-pci,host=0000:03:00.0",
+                "-device",
+                "vfio-pci,host=0000:03:00.1",
+            ]
+        );
+    }
+
+    #[test]
+    fn bdf_from_str_normalises_case_and_domain() {
+        assert_eq!(
+            "AB:0C.D".parse::<Bdf>().unwrap(),
+            Bdf("0000:ab:0c.d".into())
+        );
+        assert!("not-a-bdf".parse::<Bdf>().is_err());
     }
 }

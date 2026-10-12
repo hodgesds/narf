@@ -18,6 +18,22 @@ architecture (`x86_64`, `aarch64`); `run` builds and boots it under QEMU;
 `image` and `iso-boot` produce bootable UEFI media and boot it under
 OVMF/AAVMF. `demo` boots graphically with the user-mode testbin.
 
+An x86_64 QEMU boot can attach host PCI functions directly through VFIO:
+
+```sh
+cargo xtask run --arch=x86_64 \
+  --passthrough-device 03:00.0 \
+  --passthrough-device 03:00.1
+```
+
+The option is repeatable so a multifunction device (typically a GPU plus its
+HD-audio function) can be assigned together. Before QEMU starts, xtask runs
+the same KVM, IOMMU-group, `vfio-pci`, and BAR-window checks exposed by
+`cargo xtask passthrough -d 03:00.0 -d 03:00.1`. It does not detach a device
+from its Linux driver; host binding remains an explicit administrator action.
+The BDF becomes a QEMU `vfio-pci,host=` device, after which NARF discovers it
+through its ordinary PCIe enumeration path.
+
 **Test gates.** `host-test` is the fast, hardware-independent unit-test
 gate — it deliberately runs an allowlist of crates that need neither the
 kernel linker script, privileged instructions, nor QEMU. `test` boots

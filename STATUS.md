@@ -258,7 +258,7 @@ interfaces and limits.
 
 ## Current work
 
-The `feat/amdgpu-navi22-passthrough` branch adds discrete PCIe probe support
+Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
 and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the
 Navi 22 userspace family query. The `navy_flounder_sos.bin` parser and an

@@ -33,6 +33,14 @@ and CI compiler-cache integration.
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
   builds strip debug-only ELF sections by default while retaining ordinary
   symbols; `--debug` retains full debuginfo for GDB and crash diagnosis.
+- `cargo xtask run --arch=x86_64 --passthrough-device 03:00.0
+  --passthrough-device 03:00.1` — attach host PCI functions to the guest with
+  QEMU `vfio-pci`. The repeatable option is an xtask/QEMU boot option, not a
+  guest kernel command-line parameter. Before launch, xtask requires KVM,
+  active host IOMMU groups, every requested endpoint bound to `vfio-pci`,
+  complete IOMMU-group assignment, and BAR sizes compatible with NARF's mapped
+  physical windows. It never unbinds or rebinds host hardware. PCI passthrough
+  is currently x86_64-only.
 - `cargo xtask run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
   — opt into QEMU's OpenGL-backed virtio-gpu device. The default remains
   `--gpu-backend=auto`: graphical runs prefer VirGL when QEMU advertises the
