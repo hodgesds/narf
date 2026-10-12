@@ -50,6 +50,12 @@ and CI compiler-cache integration.
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
   builds strip debug-only ELF sections by default while retaining ordinary
   symbols; `--debug` retains full debuginfo for GDB and crash diagnosis.
+- `XTASK_STAGE_BIN=/host/path[:guest/path] cargo xtask run-interactive ...`
+  adds one executable host file to the generated initramfs. With no guest path
+  it is installed as `/usr/bin/<basename>`, and the boot shell searches
+  `/bin` followed by `/usr/bin`. Destinations hidden by boot-init mounts (for
+  example `/bin`) are rejected instead of producing a misleading `ENOENT` at
+  `execve`; staged entries retain mode `0755`.
 - `cargo xtask run --arch=x86_64 --passthrough-device 03:00.0
   --passthrough-device 03:00.1` — attach host PCI functions to the guest with
   QEMU `vfio-pci`. The repeatable option is an xtask/QEMU boot option, not a

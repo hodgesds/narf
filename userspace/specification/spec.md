@@ -107,6 +107,12 @@ that same root on the reserved task before making it runnable. This permits a
 dynamic service manager to be the direct PID 1 without a userspace chroot
 launcher.
 
+`narf_user_runtime::execve` does not return on success and returns the kernel's
+positive Linux errno on failure. `narf-libc::execve` publishes that exact value
+through thread-local `errno`; it must not collapse path-resolution failures,
+permission failures, and malformed images into one `ENOEXEC`, because PATH
+search depends on distinguishing `ENOENT` and `ENOTDIR` from terminal errors.
+
 ELF `PT_LOAD` construction follows Linux's BSS split: file-image pages are
 materialized, the unused tail of the final file page is zero-filled, and every
 following full page through `p_memsz` is private anonymous demand-zero memory.
