@@ -1019,22 +1019,46 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
 }
 
 impl Plan {
-    /// The register limits `rq_dlg_get_dlg_reg` asserts. Linux only logs
-    /// them; a plan that cannot be programmed exactly is rejected here.
+    /// Every programmed value must fit its dcn_4_1_0 register field. Linux
+    /// only asserts these; a plan that cannot be programmed exactly is
+    /// rejected here instead of being silently truncated.
     fn check_ranges(&self) -> Result<(), Error> {
-        let (d, t) = (&self.dlg, &self.ttu);
+        let (d, t, w, a) = (&self.dlg, &self.ttu, &self.watermarks, &self.arbiter);
         let limits = [
             (d.refcyc_h_blank_end, 1 << 13),
+            (d.dlg_vblank_end, 1 << 15),
             (d.min_dst_y_next_start, 1 << 18),
+            (d.refcyc_per_htotal, 1 << 21),
             (d.refcyc_x_after_scaler, 1 << 13),
             (d.dst_y_after_scaler, 8),
+            (d.dst_y_prefetch, 1 << 8),
+            (d.dst_y_per_vm_vblank, 1 << 7),
+            (d.dst_y_per_row_vblank, 1 << 6),
+            (d.ref_freq_to_pix_freq, 1 << 21),
+            (d.vratio_prefetch, 1 << 22),
+            (d.vratio_prefetch_c, 1 << 22),
             (d.refcyc_per_line_delivery_pre_l, 1 << 13),
             (d.refcyc_per_line_delivery_l, 1 << 13),
-            (t.refcyc_per_req_delivery_pre_l, 1 << 23),
-            (t.refcyc_per_req_delivery_l, 1 << 23),
             (t.qos_level_high_wm, 1 << 14),
             (t.min_ttu_vblank, 1 << 24),
-            (d.dst_y_prefetch, 1 << 8),
+            (t.qos_level_flip, 1 << 4),
+            (t.refcyc_per_req_delivery_pre_l, 1 << 23),
+            (t.refcyc_per_req_delivery_l, 1 << 23),
+            (t.qos_level_fixed_l, 1 << 4),
+            (w.urgent, 1 << 14),
+            (w.usr, 1 << 14),
+            (w.refcyc_per_trip_to_mem, 1 << 14),
+            (w.refcyc_per_meta_trip_to_mem, 1 << 14),
+            (w.sr_enter, 1 << 16),
+            (w.sr_exit, 1 << 16),
+            (w.uclk_pstate, 1 << 16),
+            (w.fclk_pstate, 1 << 16),
+            (w.temp_read, 1 << 16),
+            (w.frac_urg_bw_nom, 1 << 10),
+            (w.frac_urg_bw_flip, 1 << 10),
+            (w.frac_urg_bw_mall, 1 << 10),
+            (a.sdpif_request_rate_limit, 1 << 12),
+            (a.pstate_stall_threshold, 1 << 27),
         ];
         if limits.iter().any(|&(v, limit)| v >= limit) {
             return Err(Error::Register);

@@ -19,6 +19,8 @@ struct Fake {
     clock: u32,
     ack_delay: usize,
     wrong_ack: bool,
+    dc_limit: [u32; 11],
+    umc_channels: u32,
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
@@ -70,6 +72,11 @@ impl Io for Fake {
                 assert_eq!(arg, 0);
                 0
             }
+            0xc => self.dc_limit[(arg >> 16) as usize],
+            0x1c => {
+                assert_eq!(arg, 0);
+                self.umc_channels
+            }
             _ => panic!("wrong DCN401 DAL message"),
         };
         self.regs.insert(0x589cc, response);
@@ -109,6 +116,8 @@ fn engine() -> Engine<Fake> {
             clock: 0,
             ack_delay: 0,
             wrong_ack: false,
+            dc_limit: [0; 11],
+            umc_channels: 16,
         },
     }
 }
@@ -222,6 +231,57 @@ fn dcn401_dal_refuses_malformed_versions_and_ranges_without_publication() -> Tes
 kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_dal_refuses_malformed_versions_and_ranges_without_publication
+);
+
+fn dcn401_dc_mode_limits_cap_floors_and_umc_channels_are_required() -> TestResult {
+    let mut e = engine();
+    e.io.levels[2] = [500, 1000, 1250, 0, 0, 0, 0, 0];
+    e.io.flags[2] = 3;
+    e.io.dc_limit[2] = 1000; // UCLK capped below the table maximum
+    e.io.dc_limit[6] = 1200; // equal to the table maximum: no limit
+    e.io.dc_limit[9] = 0; // none reported
+    e.io.umc_channels = 12;
+    let levels = start(&mut e);
+    let tail: Vec<_> = e.io.commands[e.io.commands.len() - 6..].to_vec();
+    if tail
+        != [
+            (12, 0x10000),
+            (12, 0x20000),
+            (12, 0x60000),
+            (12, 0x90000),
+            (12, 0xa0000),
+            (0x1c, 0),
+        ]
+    {
+        return TestResult::Fail("DC-mode/UMC query order");
+    }
+    if levels.umc_channels != 12
+        || levels.range(Clock::Memory).mhz() != [500, 1000, 1250]
+        || levels.range(Clock::Memory).max_khz() != 1_000_000
+        || levels.range(Clock::Display).max_khz() != 1_200_000
+        || levels.range(Clock::Dcf).dc_limit_mhz != 0
+    {
+        return TestResult::Fail("DC-mode limit not applied");
+    }
+    // The pinned memory floor honours the cap.
+    let applied = run(e.prepare(request())).unwrap();
+    if applied.memory_floor_khz != 1_000_000 {
+        return TestResult::Fail("memory floor above DC-mode limit");
+    }
+    for channels in [0, 65] {
+        let mut e = engine();
+        e.io.umc_channels = channels;
+        if run(e.start(core::future::ready(Ok(power())))) != Err(Error::Invalid)
+            || e.status.levels.is_some()
+        {
+            return TestResult::Fail("unknown UMC channel count accepted");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_dc_mode_limits_cap_floors_and_umc_channels_are_required
 );
 
 fn dcn401_all_legacy_hpo_and_frl_consumers_block_power_and_clock_writes() -> TestResult {

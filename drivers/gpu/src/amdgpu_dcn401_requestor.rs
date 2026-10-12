@@ -87,7 +87,7 @@ impl<I: Io> Engine<I> {
         *sizes = next;
         Ok(())
     }
-    fn requestor_errors(&mut self, pipe: u8) -> Result<(), Error> {
+    pub(super) fn requestor_errors(&mut self, pipe: u8) -> Result<(), Error> {
         // Keep error/status acknowledgements and timeout IRQ ownership out of
         // the setup RMWs. A pre-existing error requires explicit recovery.
         if self.read(self.layout.hubp(pipe, HUBP_CONTROL))? & 0xfcf00800 != 0 {
@@ -95,7 +95,7 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    fn verify_requestor(&mut self, pipe: u8) -> Result<(), Error> {
+    pub(super) fn verify_requestor(&mut self, pipe: u8) -> Result<(), Error> {
         if self.crb_stable()? != allocation(pipe) {
             return Err(Error::Busy);
         }

@@ -445,6 +445,7 @@ pub struct ColdBoot {
     sequence: Sequence<Hardware>,
     display: Result<display::Probe, display::Error>,
     ddc: Result<ddc::Ddc, display::Error>,
+    crystal: Result<u32, display::Error>,
     clocks: Result<clocks::ClockManager, clocks::Error>,
     dccg: Result<dccg::Dccg, dccg::Error>,
     otg: Result<otg::Otg, otg::Error>,
@@ -510,17 +511,19 @@ impl ColdBoot {
             .and_then(|bios| inventory::display_paths(gpu, bios.bytes()))
             .map_err(display::Error::Inventory)
             .and_then(display::Probe::new);
-        let ddc = gpu
+        // Linux's DCN crystal (`dce_refclk_10khz`), the reference DDC and the
+        // DCHUB global timer both divide.
+        let crystal = gpu
             .vbios
             .as_ref()
             .ok_or(inventory::Error::Missing)
             .and_then(|bios| inventory::dchub_refclk_khz(bios.bytes()))
-            .map_err(display::Error::Inventory)
-            .and_then(|clock| {
-                // SAFETY: same exclusive DCN/pin/reset ownership; preparation
-                // only. All subsequent DDC and DMUB access shares this owner.
-                unsafe { ddc::Ddc::new(gpu, authority, clock) }.map_err(display::Error::Ddc)
-            });
+            .map_err(display::Error::Inventory);
+        let ddc = crystal.and_then(|clock| {
+            // SAFETY: same exclusive DCN/pin/reset ownership; preparation
+            // only. All subsequent DDC and DMUB access shares this owner.
+            unsafe { ddc::Ddc::new(gpu, authority, clock) }.map_err(display::Error::Ddc)
+        });
         // SAFETY: same exclusive display/MP1 ownership, metadata validation
         // only. Optional display failures do not block non-display engines.
         let clocks = unsafe { clocks::ClockManager::new(gpu, authority) };
@@ -560,6 +563,7 @@ impl ColdBoot {
         Ok(Self {
             display,
             ddc,
+            crystal,
             clocks,
             dccg,
             otg,
@@ -1055,6 +1059,65 @@ impl ColdBoot {
                     self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
                     gmc,
                     pipe,
+                )
+                .await
+        }
+    }
+    /// Admit one single-pipe scanout mode against the live board: started
+    /// PMFW levels, the DENTIST VCO, the DCHUB timer and the VBIOS crystal.
+    /// Read-only; the plan's clocks and global sync feed the later requests.
+    pub fn display_admission(
+        &mut self,
+        mode: &crate::amdgpu_dcn401_dml::Mode,
+    ) -> Result<crate::amdgpu_dcn401_dml::Plan, otg::Error> {
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let levels = self
+            .clocks
+            .as_ref()
+            .map_err(|e| otg::Error::Clocks(*e))?
+            .status()
+            .levels
+            .ok_or(otg::Error::Busy)?;
+        let vco = self
+            .dccg
+            .as_mut()
+            .map_err(|e| otg::Error::PipeClocks(*e))?
+            .dentist_vco_khz()
+            .map_err(otg::Error::PipeClocks)?;
+        let soc = self
+            .otg
+            .as_mut()
+            .map_err(|e| *e)?
+            .admission_soc(&levels, vco, crystal)?;
+        crate::amdgpu_dcn401_dml::admit(&soc, mode).map_err(otg::Error::Admission)
+    }
+    /// Program an admitted plan's deadlines and watermarks for the staged pipe.
+    /// The plan is re-admitted and bound to the current owners first.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/hub/VM/IRQ/clock/reset/power
+    /// writers; retain every owner and resource on every outcome, including cancellation.
+    pub async unsafe fn prepare_display_deadlines(
+        &mut self,
+        pipe: u8,
+        plan: &crate::amdgpu_dcn401_dml::Plan,
+    ) -> Result<otg::DeadlinesApplied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_deadlines(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    plan,
+                    crystal,
                 )
                 .await
         }

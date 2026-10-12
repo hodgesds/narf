@@ -49,6 +49,7 @@ impl Surfaces {
         engine.status.dpps = [None; 4];
         engine.status.mpcs = [None; 4];
         engine.status.requestor = None;
+        engine.status.deadlines = None;
         let result = engine.program_memory(pipe, config).await;
         let result = result.and_then(|()| {
             if context()? != config {

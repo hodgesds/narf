@@ -6,13 +6,13 @@ use core::{
 };
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-const BASE: u64 = 0x10000;
+pub(super) const BASE: u64 = 0x10000;
 #[path = "amdgpu_dcn401_dp_phy_tests.rs"]
 mod dp_phy;
 const MPC_BASE: u64 = 0x30000;
-struct Fake {
-    regs: BTreeMap<u64, u32>,
-    writes: Vec<(u64, u32)>,
+pub(super) struct Fake {
+    pub(super) regs: BTreeMap<u64, u32>,
+    pub(super) writes: Vec<(u64, u32)>,
     // input clock, OTG clock, retire master/busy, OPP clock, enable master,
     // DPG latch, FMT latch, frame progress
     stall: u16,
@@ -153,6 +153,8 @@ impl Io for Fake {
                 || (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
                 || (BASE + 0x4ba * 4..=BASE + 0x4be * 4).contains(&at)
                 || at == BASE + 0x4c4 * 4
+                || at == BASE + 0x485 * 4 // SDPIF_REQUEST_RATE_LIMIT
+                || (BASE + 0x4fc * 4..=BASE + 0x523 * 4).contains(&at) // arbiter/watermarks
                 || (0x162a0 * 4..=0x162a3 * 4).contains(&at)
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || at == BASE + 0x4a * 4 // native FRL character-clock root
@@ -305,7 +307,7 @@ fn descriptor(words: &mut [u32]) -> AmdGpu {
     gpu.ip_blocks.extend([mp, dc]);
     gpu
 }
-fn engine() -> Engine<Fake> {
+pub(super) fn engine() -> Engine<Fake> {
     let mut words = vec![0; 0x80000 / 4];
     let gpu = descriptor(&mut words);
     Engine {
@@ -344,6 +346,7 @@ fn engine() -> Engine<Fake> {
             dpps: [None; 4],
             mpcs: [None; 4],
             requestor: None,
+            deadlines: None,
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,
@@ -425,7 +428,7 @@ fn clock(request: Request) -> dccg::Applied {
         phase: 148_500_000,
     }
 }
-fn run<T>(f: impl Future<Output = T>) -> T {
+pub(super) fn run<T>(f: impl Future<Output = T>) -> T {
     narf_scheduler::block_on_spin(f)
 }
 fn reg(e: &Engine<Fake>, index: u64) -> u32 {
@@ -1097,3 +1100,71 @@ mod frl;
 
 #[path = "amdgpu_dcn401_frl_link_tests.rs"]
 mod frl_link;
+
+fn dcn401_admission_inputs_read_live_dchub_timer_and_capped_levels() -> TestResult {
+    // SOC, UCLK, FCLK, DISP, DPP, DCF, DTB in MHz.
+    let levels = clocks::Levels::fine_grained(
+        [
+            [300, 1200],
+            [96, 1250],
+            [300, 2500],
+            [100, 2000],
+            [100, 2000],
+            [200, 1564],
+            [100, 1564],
+        ],
+        16,
+    );
+    let timer = BASE + GLOBAL_TIMER * 4;
+    let mut e = engine();
+    for (value, crystal, want) in [
+        (0x1002, 100_000, Ok(50_000)),
+        (0x1001, 48_000, Ok(48_000)),
+        (0x0002, 100_000, Err(Error::Unsupported)),
+        (0x1001, 100_000, Err(Error::Unsupported)),
+        (0x1002, 27_000, Err(Error::Unsupported)),
+    ] {
+        e.io.regs.insert(timer, value);
+        let writes = e.io.writes.len();
+        if e.dchub_refclk_khz(crystal) != want || e.io.writes.len() != writes {
+            return TestResult::Fail("DCHUB reference derivation");
+        }
+    }
+    e.io.regs.insert(timer, 0x1002);
+    let Ok(soc) = e.admission_soc(&levels, 4_500_000, 100_000) else {
+        return TestResult::Fail("admission inputs rejected");
+    };
+    if soc.uclk_khz != 1_250_000
+        || soc.fclk_khz != [300_000, 2_500_000]
+        || soc.dcfclk_khz != [200_000, 1_564_000]
+        || soc.socclk_khz != 300_000
+        || soc.umc_channels != 16
+        || soc.dchub_refclk_khz != 50_000
+    {
+        return TestResult::Fail("admission inputs");
+    }
+    let mode = dml::Mode {
+        timing: Timing {
+            pixel_clock_khz: 148_500,
+            h_active: 1920,
+            h_total: 2200,
+            h_front_porch: 88,
+            h_sync_width: 44,
+            v_active: 1080,
+            v_total: 1125,
+            v_front_porch: 4,
+            v_sync_width: 5,
+            h_sync_positive: true,
+            v_sync_positive: true,
+        },
+        pitch: 1920,
+    };
+    if dml::admit(&soc, &mode).map(|p| p.clocks.dispclk_khz) != Ok(151_260) {
+        return TestResult::Fail("live inputs do not reproduce the reference plan");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_admission_inputs_read_live_dchub_timer_and_capped_levels
+);

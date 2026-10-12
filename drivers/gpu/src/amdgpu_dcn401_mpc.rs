@@ -161,6 +161,7 @@ impl Surfaces {
         // banks, shared CSC coefficient format or any route selector.
         e.status.state = State::PreparingMpc(pipe);
         e.status.requestor = None;
+        e.status.deadlines = None;
         let result = (|| {
             for (at, mask, value) in e.layout.mpc_rgb(a) {
                 e.update(at, mask, value)?;

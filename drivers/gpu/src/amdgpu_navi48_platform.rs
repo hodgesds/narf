@@ -503,6 +503,33 @@ pub async unsafe fn prepare_display_requestor(
     unsafe { boot.prepare_display_requestor(pipe).await }
 }
 
+/// Admit one single-pipe scanout mode against the live board. Read-only.
+pub async fn display_admission(
+    mode: crate::amdgpu_dcn401_dml::Mode,
+) -> Result<crate::amdgpu_dcn401_dml::Plan, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    boot.display_admission(&mode)
+}
+
+/// Program an admitted plan's deadlines and watermarks for the staged pipe.
+/// # Safety
+/// Exclude firmware/FAMS and concurrent display/hub/VM/IRQ/clock/reset/power writers;
+/// retain the owner and every resource on success, error and cancellation.
+pub async unsafe fn prepare_display_deadlines(
+    pipe: u8,
+    plan: crate::amdgpu_dcn401_dml::Plan,
+) -> Result<crate::amdgpu_dcn401_otg::DeadlinesApplied, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.prepare_display_deadlines(pipe, &plan).await }
+}
+
 /// Blank one legacy or HPO DisplayPort video stream, retaining timing/link clocks.
 /// # Safety
 /// Stop CPU scanout writers and exclude firmware/FAMS and concurrent display,

@@ -74,16 +74,27 @@ pub struct Range {
     pub fine_grained: bool,
     /// Original DPM feature word, including auto/sweep/forced flags.
     pub flags: u32,
+    /// PMFW `GetDcModeMaxDpmFreq` below the table maximum, or zero.
+    pub dc_limit_mhz: u16,
 }
 impl Range {
+    /// The raw PMFW DPM table, before any DC-mode limit.
     pub fn mhz(&self) -> &[u16] {
         &self.mhz[..usize::from(self.count)]
     }
     pub fn min_khz(&self) -> u32 {
         u32::from(*self.mhz().first().unwrap_or(&0)) * 1000
     }
+    /// Highest usable frequency. Like Linux DCN401 (`use_clock_dc_limits`),
+    /// a DC-mode maximum caps the table; floors never request above it.
     pub fn max_khz(&self) -> u32 {
-        u32::from(*self.mhz().last().unwrap_or(&0)) * 1000
+        let table = u32::from(*self.mhz().last().unwrap_or(&0));
+        let limit = u32::from(self.dc_limit_mhz);
+        if limit != 0 && limit < table {
+            limit.max(u32::from(*self.mhz().first().unwrap_or(&0))) * 1000
+        } else {
+            table * 1000
+        }
     }
     fn request(&self, khz: u32) -> Result<u32, Error> {
         if khz == 0 || khz > self.max_khz() {
@@ -95,11 +106,30 @@ impl Range {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Levels {
     ranges: [Range; 7],
+    /// DALSMC `GetNumUmcChannels`: 16-bit memory channels behind the UMCs.
+    pub umc_channels: u32,
     pub firmware: u32,
     pub interface: u32,
     pub header: u32,
 }
 impl Levels {
+    /// Fine-grained `[min, max]` MHz per clock in `CLOCKS` order, for models.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn fine_grained(mhz: [[u16; 2]; 7], umc_channels: u32) -> Self {
+        let mut ranges = [Range::default(); 7];
+        for (range, [min, max]) in ranges.iter_mut().zip(mhz) {
+            range.mhz[..2].copy_from_slice(&[min, max]);
+            range.count = 2;
+            range.fine_grained = true;
+        }
+        Self {
+            ranges,
+            umc_channels,
+            firmware: 1,
+            interface: 1,
+            header: 1,
+        }
+    }
     pub fn range(&self, clock: Clock) -> &Range {
         &self.ranges[CLOCKS.iter().position(|&c| c == clock).unwrap()]
     }
@@ -373,7 +403,29 @@ impl<I: Io> Engine<I> {
             }
             ranges[i] = range;
         }
+        // Linux reads these DC-mode maxima and treats one equal to the table
+        // maximum as no limit. FCLK and DPPCLK have none on DCN401.
+        for (i, clock) in CLOCKS.into_iter().enumerate() {
+            if !matches!(
+                clock,
+                Clock::Dcf | Clock::Soc | Clock::Dtb | Clock::Display | Clock::Memory
+            ) {
+                continue;
+            }
+            let mhz = self.command(0xc, (clock as u32) << 16).await? & 0xffff;
+            let range = &mut ranges[i];
+            if mhz != 0 && mhz < range.max_khz() / 1000 {
+                range.dc_limit_mhz = mhz as u16;
+            }
+        }
+        // Linux falls back to VBIOS when PMFW reports none; every bandwidth
+        // limit scales with this count, so an unknown count is refused.
+        let umc_channels = self.command(0x1c, 0).await?;
+        if umc_channels == 0 || umc_channels > 64 {
+            return Err(Error::Invalid);
+        }
         Ok(Levels {
+            umc_channels,
             ranges,
             firmware,
             interface,

@@ -163,6 +163,7 @@ impl<I: Io> Engine<I> {
         self.status.state = State::PreparingBlank(request.pipe);
         self.status.mpcs[usize::from(request.pipe)] = None;
         self.status.requestor = None;
+        self.status.deadlines = None;
         match self.program_blank(request, timing).await {
             Ok(applied) => {
                 self.status.blanks[usize::from(request.pipe)] = Some(applied);

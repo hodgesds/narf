@@ -713,9 +713,57 @@ DCHUBBUB watermark set Linux programs into sets A and B, arbiter values, DET
 size and stutter reservation. `Error` names the first failing check: invalid
 inputs, unmodeled shape, unavailable clock state, pixel clock, buffers,
 outstanding-request/ROB latency, prefetch, urgent latency hiding, bandwidth,
-GDDR6 temperature-read blackout, or a DLG/TTU value outside the register width
-DML asserts. The result is deterministic; a plan is not yet bound to clock,
-memory or timing owners and no API programs it.
+GDDR6 temperature-read blackout, or a programmed value outside its dcn_4_1_0
+field (DLG/TTU, watermark, fraction, request-limit and stall fields). The
+result is deterministic and is only a calculation until bound and programmed.
+
+`ColdBoot::display_admission(&Mode)` (and the platform's asynchronous
+`display_admission`) builds the `Soc` from live owners and admits the mode
+without writing anything. The started DAL clock owner now also records
+DALSMC `GetNumUmcChannels`, refusing zero or more than 64 channels (Linux
+falls back to VBIOS), and `GetDcModeMaxDpmFreq` for DCFCLK, SOCCLK, DTBCLK,
+DISPCLK and UCLK. As with Linux's `use_clock_dc_limits`, a DC-mode maximum
+below the table maximum caps `Range::max_khz`, and with it the pinned
+DCFCLK/UCLK floors and DISPCLK/DPPCLK/DTBCLK request limits. UCLK is that
+pinned floor. `Dccg::dentist_vco_khz` reads the DENTIST PLL (9.16 FbMult times
+the 100-MHz DFS reference) and refuses a zero VCO rather than assuming
+4.5 GHz. `Otg::admission_soc` derives the DCHUB reference from
+`DCHUBBUB_GLOBAL_TIMER_CNTL` and the VBIOS DCE crystal, which ColdBoot keeps:
+REFDIV 2 halves it. A stopped timer or a reference outside 40-60 MHz is
+unsupported; the timer is never reprogrammed.
+
+`unsafe Otg::prepare_deadlines(&mut clocks, &mut dccg, &mut gmc, pipe, &Plan,
+crystal_khz).await` (ColdBoot/platform `prepare_display_deadlines`) programs
+an admitted plan after requestor preparation. It first re-admits the plan from
+its own inputs and refuses any difference, so an edited or hand-built `Plan`
+is not admission. It then binds the plan to the current owners: the retained
+MPC/DPP/surface/memory/timing sources and requestor allocation verify as for
+the requestor; the timing, global sync and legacy DP SST signal must equal the
+plan; the surface must be full-frame with the plan's pitch and the 320-KiB
+DET; applied DISPCLK, DPPREFCLK and pipe DPPCLK must be at least the plan's;
+the pinned UCLK and DCFCLK floors must equal the ones it assumed; and the live
+DCHUB reference must match. Any mismatch is `Invalid` with no writes.
+
+Programming follows `hubp401_setup`/`setup_interdependent` with fetch
+stopped and the HUBP clock enabled only around the writes. It enters DLG
+mission mode (only that bit must read back, as Linux never reads it), writes
+every nonzero DLG/TTU field and explicitly zeroes the VM/PTE/meta/flip/
+chroma/cursor/3D-LUT fields. `HUBP_VREADY_AT_OR_AFTER_VSYNC` uses Linux's
+hwseq rule, where VREADY before blank start is "before". Watermark sets A and
+B get identical values in the `hubbub401_program_*_watermarks` layout: one
+SR enter/exit pair for all four levels, and the temperature-read watermark in
+both UCLK and FCLK "1" slots. The SDPIF request limit, P-state stall threshold
+and a clear `HW_DEBUG[5]` follow Linux, and USR retraining is not forced.
+Self-refresh is force-disallowed in `DCHUBBUB_ARB_DRAM_STATE_CNTL` until
+stutter is validated, although the plan still budgets its blank. The DCHUB
+pstate force stays released: PMFW keeps UCLK switching disabled, and GDDR6
+temperature reads use the same allow path. Every field is read back after
+the owners are re-verified; `DeadlinesApplied` records the plan and enters
+reusable `DeadlinesPrepared`. Requestor/timing/OPP/MPC/HUBP-power/VM changes
+invalidate it with the requestor report, and failure or cancellation is
+sticky as for the other preparation steps. `tests/dcn401_deadline.c` checks
+the native offsets and masks. Route connection, fetch enable and activation
+remain separate and must rebind the plan.
 
 The port deliberately diverges from Linux where Linux would program something
 the hardware cannot honour: it enforces the Tpre > max(Turg, Ttrip) + Tex

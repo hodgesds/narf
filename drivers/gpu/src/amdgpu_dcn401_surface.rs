@@ -16,6 +16,9 @@ pub use mpc::MpcApplied;
 #[path = "amdgpu_dcn401_requestor.rs"]
 mod requestor;
 pub use requestor::RequestorApplied;
+#[path = "amdgpu_dcn401_deadline.rs"]
+mod deadline;
+pub use deadline::DeadlinesApplied;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFormat {

@@ -379,6 +379,14 @@ names the failing check. A host harness builds Linux DML21 and verifies 126
 shared vectors, which kernel tests also check; three deliberate divergences
 reject modes Linux would program beyond hardware limits. Plans are not yet
 bound to live owners or programmed, and board inputs are not yet read from PMFW.
+Admission inputs now come from the live board: PMFW UMC channel count and
+DC-mode clock caps (which also cap the pinned floors), the DENTIST VCO, and the
+DCHUB reference from the global timer and VBIOS crystal. Deadline preparation
+re-admits a plan, binds it to the current timing, sync, signal, surface, DET,
+clocks and reference, then programs and reads back HUBP DLG/TTU fields, both
+DCHUBBUB watermark sets and arbiter state with fetch stopped. Self-refresh is
+force-disallowed; UCLK switching stays disabled in PMFW. Route connection,
+fetch enable and visible activation remain open.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

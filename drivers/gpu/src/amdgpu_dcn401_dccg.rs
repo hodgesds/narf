@@ -170,8 +170,19 @@ fn checked(v: u32) -> Result<u32, Error> {
         Ok(v)
     }
 }
-fn dpref_hz(pll: u32, did: u32) -> Result<u32, Error> {
+/// DENTIST VCO as `dcn401_get_vco_frequency_from_reg`: the 9.16 FbMult times
+/// the 100 MHz DFS reference. SpineDiv is not part of it. Linux substitutes
+/// 4.5 GHz for a zero readback; that guess is refused here.
+fn vco_khz(pll: u32) -> Result<u32, Error> {
     checked(pll)?;
+    let khz = u64::from(pll & 0x1ff) * 100_000 + u64::from(pll >> 16) * 100_000 / 65536;
+    match u32::try_from(khz) {
+        Ok(khz) if khz != 0 => Ok(khz),
+        _ => Err(Error::Invalid),
+    }
+}
+fn dpref_hz(pll: u32, did: u32) -> Result<u32, Error> {
+    let vco_khz = u64::from(vco_khz(pll)?);
     checked(did)?;
     let divider = match did {
         8..=63 => did,
@@ -181,9 +192,6 @@ fn dpref_hz(pll: u32, did: u32) -> Result<u32, Error> {
         127 => 512,
         _ => return Err(Error::Invalid),
     };
-    // Linux's native PLL has a 100 MHz reference and 9.16 FbMult. SpineDiv
-    // is not part of its VCO calculation. Do not invent fallback frequencies.
-    let vco_khz = u64::from(pll & 0x1ff) * 100_000 + u64::from(pll >> 16) * 100_000 / 65536;
     let khz = 4 * vco_khz / u64::from(divider);
     let hz = u32::try_from(khz * 1000).map_err(|_| Error::Invalid)?;
     if hz == 0 {
@@ -568,6 +576,11 @@ impl Dccg {
     }
     pub fn status(&self) -> Status {
         self.0.status
+    }
+    /// The DENTIST VCO every DISPCLK/DPPREFCLK divider derives from. Read-only.
+    pub fn dentist_vco_khz(&mut self) -> Result<u32, Error> {
+        let pll = self.0.read(PLL)?;
+        vco_khz(pll)
     }
     /// Current, readback-checked clock snapshot for the matching timing owner.
     /// TMDS still requires a separately programmed PHY PLL before transmission.

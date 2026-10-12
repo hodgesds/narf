@@ -5,7 +5,7 @@
 //! surface scanout still needs its owners.
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn401_clk as clocks, amdgpu_dcn401_dccg as dccg,
-    amdgpu_discovery as ip, amdgpu_dml::Timing,
+    amdgpu_dcn401_dml as dml, amdgpu_discovery as ip, amdgpu_dml::Timing,
 };
 use alloc::boxed::Box;
 use narf_bus::{BusDeviceCap, MmioRegion};
@@ -17,8 +17,8 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{
-    DppApplied, HubpPower, MemoryApplied, MpcApplied, PlanesRetired, RequestorApplied,
-    SurfaceApplied, SurfaceFormat, SurfaceRequest,
+    DeadlinesApplied, DppApplied, HubpPower, MemoryApplied, MpcApplied, PlanesRetired,
+    RequestorApplied, SurfaceApplied, SurfaceFormat, SurfaceRequest,
 };
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
@@ -72,6 +72,7 @@ const SOURCE: u64 = 0x1acb;
 const FORMAT: u64 = 0x1acc;
 const INPUT_CLOCK: u64 = 0x1ad0;
 const MEMORY: u64 = 0x1ad1;
+const GLOBAL_TIMER: u64 = 0x527; // DCHUBBUB_GLOBAL_TIMER_CNTL
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -88,6 +89,7 @@ pub enum Error {
     Firmware(crate::amdgpu_dmub_navi48::Error),
     DpTraining(DpTrainingError),
     Memory(crate::amdgpu_gmc_navi48::Error),
+    Admission(dml::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -147,6 +149,8 @@ pub enum State {
     MpcPrepared,
     PreparingRequestor(u8),
     RequestorPrepared,
+    PreparingDeadlines(u8),
+    DeadlinesPrepared,
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -166,6 +170,7 @@ impl State {
                 | Self::DppPrepared
                 | Self::MpcPrepared
                 | Self::RequestorPrepared
+                | Self::DeadlinesPrepared
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
@@ -247,6 +252,9 @@ pub struct Status {
     pub mpcs: [Option<MpcApplied>; 4],
     /// Native single-pipe storage/request geometry. Not bandwidth admission.
     pub requestor: Option<RequestorApplied>,
+    /// Admitted DLG/TTU/watermark programming for the staged requestor.
+    /// Fetch stays stopped; never evidence of activation or presentation.
+    pub deadlines: Option<DeadlinesApplied>,
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -493,6 +501,50 @@ struct Engine<I: Io> {
     status: Box<Status>,
 }
 impl<I: Io> Engine<I> {
+    /// `hubbub2_get_dchub_ref_freq`: the DCHUB global timer divides the DCCG
+    /// reference (the VBIOS crystal on DCN401) by its REFDIV. Firmware set it
+    /// up; this owner never reprograms it. Linux treats a stopped timer or a
+    /// reference outside 40-60 MHz as critical, and so is it refused here.
+    fn dchub_refclk_khz(&mut self, crystal_khz: u32) -> Result<u32, Error> {
+        let timer = self.read(self.layout.base + GLOBAL_TIMER * 4)?;
+        if timer & 0x1000 == 0 {
+            return Err(Error::Unsupported);
+        }
+        let khz = if timer & 0xf == 2 {
+            crystal_khz / 2
+        } else {
+            crystal_khz
+        };
+        if !(40_000..=60_000).contains(&khz) {
+            return Err(Error::Unsupported);
+        }
+        Ok(khz)
+    }
+    fn admission_soc(
+        &mut self,
+        levels: &clocks::Levels,
+        dentist_vco_khz: u32,
+        crystal_khz: u32,
+    ) -> Result<dml::Soc, Error> {
+        let range = |clock| levels.range(clock);
+        Ok(dml::Soc {
+            umc_channels: levels.umc_channels,
+            uclk_khz: range(clocks::Clock::Memory).max_khz(),
+            fclk_khz: [
+                range(clocks::Clock::Fabric).min_khz(),
+                range(clocks::Clock::Fabric).max_khz(),
+            ],
+            dcfclk_khz: [
+                range(clocks::Clock::Dcf).min_khz(),
+                range(clocks::Clock::Dcf).max_khz(),
+            ],
+            socclk_khz: range(clocks::Clock::Soc).min_khz(),
+            dispclk_max_khz: range(clocks::Clock::Display).max_khz(),
+            dppclk_max_khz: range(clocks::Clock::Dpp).max_khz(),
+            dentist_vco_khz,
+            dchub_refclk_khz: self.dchub_refclk_khz(crystal_khz)?,
+        })
+    }
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
         let io = &mut self.io;
         self.authority
@@ -584,6 +636,7 @@ impl<I: Io> Engine<I> {
         self.status.dpps[usize::from(request.pipe)] = None;
         self.status.mpcs[usize::from(request.pipe)] = None;
         self.status.requestor = None;
+        self.status.deadlines = None;
         match self.program(plan).await {
             Ok(()) => {
                 let applied = Applied { request, clock };
@@ -614,6 +667,7 @@ impl<I: Io> Engine<I> {
         self.status.dpps[usize::from(pipe)] = None;
         self.status.mpcs[usize::from(pipe)] = None;
         self.status.requestor = None;
+        self.status.deadlines = None;
         match self.disable(pipe).await {
             Ok(()) => {
                 self.status.pipes[usize::from(pipe)] = None;
@@ -658,6 +712,7 @@ impl Otg {
                     dpps: [None; 4],
                     mpcs: [None; 4],
                     requestor: None,
+                    deadlines: None,
                     dp_blanked: None,
                     dp_encoder_retired: None,
                     dp_sst_disabled: None,
@@ -698,6 +753,18 @@ impl Otg {
             .timing_clock(self.0.io.0, clocks, request.pipe)
             .map_err(Error::PipeClocks)?;
         self.0.prepare(request, clock).await
+    }
+    /// Board inputs for native scanout admission: PMFW DPM ranges with their
+    /// DC-mode caps, the UMC channel count, the DENTIST VCO, and the live
+    /// DCHUB reference. UCLK is the floor `ClockManager::prepare` pins (the
+    /// capped maximum); admission binds the plan to it. Reads one register.
+    pub fn admission_soc(
+        &mut self,
+        levels: &clocks::Levels,
+        dentist_vco_khz: u32,
+        crystal_khz: u32,
+    ) -> Result<dml::Soc, Error> {
+        self.0.admission_soc(levels, dentist_vco_khz, crystal_khz)
     }
     /// Retire one inherited or prepared timing generator after every display
     /// stream/link clock is stopped. Leaves clocks on for later reprogramming.
