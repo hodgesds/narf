@@ -1503,9 +1503,9 @@ pub unsafe fn wait4(pid: i64, status: *mut i32, options: u32, rusage: *mut u8) -
 ///
 /// This call does NOT return on success — control resumes at the
 /// new image's entry point with a fresh GPR file. Returns
-/// `Err(())` on argument validation / ELF parse failure / OOM
-/// (in which case the calling task continues running its old
-/// image and observes the error).
+/// `Err(errno)` on argument validation / path resolution / ELF parse failure /
+/// OOM, where `errno` is the positive Linux errno returned by the kernel (in
+/// which case the calling task continues running its old image).
 ///
 /// # Safety
 /// `path` must be a NUL-terminated C string. `argv` and `envp`
@@ -1517,17 +1517,23 @@ pub unsafe fn execve(
     path: *const u8,
     argv: *const *const u8,
     envp: *const *const u8,
-) -> Result<(), ()> {
+) -> Result<(), i32> {
     // Linux ABI: `int execve(const char *pathname,
     // char *const argv[], char *const envp[])`. The kernel
     // resolves the path through the VFS, reads the ELF file
     // server-side, and never returns to the caller on success.
     // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
     let r = unsafe { syscall3(SYS_EXECVE, path as u64, argv as u64, envp as u64) };
+    let signed = r as i64;
     if r == 0 {
         Ok(())
+    } else if (-4095..=-1).contains(&signed) {
+        Err((-signed) as i32)
     } else {
-        Err(())
+        // A successful exec never returns and the Linux syscall ABI permits
+        // only zero or a negative errno here. Keep an impossible positive
+        // result deterministic instead of exposing it as an errno value.
+        Err(8) // ENOEXEC
     }
 }
 

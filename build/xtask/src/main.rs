@@ -2310,11 +2310,10 @@ fn build_user_binary(
 ///
 /// 110-byte ASCII-hex header per entry followed by NUL-terminated
 /// name (padded to 4-byte boundary including the 110-byte header)
-/// + file data (padded to 4-byte boundary). Mode is 0o100644
-/// (regular file, owner rw, others r). Inode + nlink + mtime are
+/// + file data (padded to 4-byte boundary). Inode + nlink + mtime are
 /// fixed because we only build deterministic archives — anything
 /// else would invalidate ISO checksums on rebuilds.
-fn encode_cpio_newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
+fn encode_cpio_newc_with_modes(entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     fn pad_to_4(out: &mut Vec<u8>) {
         while out.len() % 4 != 0 {
             out.push(0);
@@ -2351,18 +2350,112 @@ fn encode_cpio_newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         entries
             .iter()
-            .map(|(n, d)| 110 + n.len() + 4 + d.len() + 4)
+            .map(|(n, d, _)| 110 + n.len() + 4 + d.len() + 4)
             .sum::<usize>()
             + 256,
     );
-    for (i, (name, data)) in entries.iter().enumerate() {
+    for (i, (name, data, mode)) in entries.iter().enumerate() {
         // Inode 0 is reserved for the trailer; start at 1.
-        write_entry(&mut out, (i + 1) as u32, 0o100644, name, data);
+        write_entry(&mut out, (i + 1) as u32, *mode, name, data);
     }
     // TRAILER!!! sentinel — type fields all zero, name is the
     // literal "TRAILER!!!" (10 bytes + NUL = 11), no data.
     write_entry(&mut out, 0, 0, "TRAILER!!!", &[]);
     out
+}
+
+/// Encode regular, non-executable files. Most initramfs payloads are firmware,
+/// modules, or configuration data; callers that stage programs must opt into
+/// executable mode through [`encode_cpio_newc_with_modes`].
+fn encode_cpio_newc(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let entries = entries
+        .iter()
+        .map(|(name, data)| (*name, *data, 0o100644))
+        .collect::<Vec<_>>();
+    encode_cpio_newc_with_modes(&entries)
+}
+
+/// Parse `XTASK_STAGE_BIN=/host/path[:guest/path]` for `run-interactive`.
+///
+/// The boot-init fixture mounts baked filesystems over a handful of rootfs
+/// paths, most notably `/bin`. A staged initramfs entry below one of those
+/// paths exists in the archive but is unreachable after boot, which used to
+/// look like an ELF-loader failure. Default programs to the unshadowed
+/// `/usr/bin` directory and reject explicit destinations that cannot be seen.
+fn parse_stage_bin_spec(spec: &str) -> Result<(String, String)> {
+    if spec.is_empty() {
+        bail!("XTASK_STAGE_BIN must not be empty");
+    }
+    let (host, guest) = match spec.split_once(':') {
+        Some((host, guest)) => (host.to_string(), guest.to_string()),
+        None => {
+            let name = Path::new(spec)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "staged".into());
+            (spec.to_string(), format!("usr/bin/{name}"))
+        }
+    };
+    if host.is_empty() {
+        bail!("XTASK_STAGE_BIN host path must not be empty");
+    }
+
+    let guest = guest.trim_start_matches('/').to_string();
+    if guest.is_empty()
+        || guest
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        bail!("XTASK_STAGE_BIN guest path must be a normalized non-empty path");
+    }
+
+    const SHADOWED: &[&str] = &["bin", "etc", "lib", "usr/lib", "oci"];
+    if let Some(prefix) = SHADOWED
+        .iter()
+        .find(|prefix| guest == **prefix || guest.starts_with(&format!("{prefix}/")))
+    {
+        bail!(
+            "XTASK_STAGE_BIN guest path /{guest} is hidden by boot-init's /{prefix} mount; use /usr/bin for staged programs"
+        );
+    }
+
+    Ok((host, guest))
+}
+
+#[cfg(test)]
+mod cpio_tests {
+    use super::*;
+
+    fn first_mode(archive: &[u8]) -> u32 {
+        assert_eq!(&archive[..6], b"070701");
+        u32::from_str_radix(core::str::from_utf8(&archive[14..22]).unwrap(), 16).unwrap()
+    }
+
+    #[test]
+    fn default_entries_are_regular_data_files() {
+        let archive = encode_cpio_newc(&[("firmware/blob", b"data")]);
+        assert_eq!(first_mode(&archive), 0o100644);
+    }
+
+    #[test]
+    fn explicitly_executable_entries_keep_their_mode() {
+        let archive = encode_cpio_newc_with_modes(&[("bin/tool", b"elf", 0o100755)]);
+        assert_eq!(first_mode(&archive), 0o100755);
+    }
+
+    #[test]
+    fn staged_binary_defaults_to_visible_usr_bin() {
+        let (host, guest) = parse_stage_bin_spec("/tmp/tool").unwrap();
+        assert_eq!(host, "/tmp/tool");
+        assert_eq!(guest, "usr/bin/tool");
+    }
+
+    #[test]
+    fn staged_binary_rejects_shadowed_boot_mount() {
+        let error = parse_stage_bin_spec("/tmp/tool:/bin/tool").unwrap_err();
+        assert!(error.to_string().contains("hidden by boot-init"));
+    }
 }
 
 fn fat12_set(fat: &mut [u8], idx: u32, val: u16) {
@@ -5201,21 +5294,14 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     // `XTASK_STAGE_BIN=/host/path[:guest/name]` puts an arbitrary host file
     // into the guest's initramfs, so a Linux binary can be driven with
-    // `--cmd` without teaching xtask about that binary. Used for the
-    // stress-ng sweep, where the SAME file has to reach NARF and a real
-    // Linux kernel for the comparison to mean anything.
+    // `--cmd` without teaching xtask about that binary. The default guest path
+    // is `/usr/bin/<basename>` because boot-init mounts baked coreutils over
+    // `/bin`; explicit destinations hidden by a boot mount are rejected.
+    // Used for the stress-ng sweep, where the SAME file has to reach NARF and
+    // a real Linux kernel for the comparison to mean anything.
     let staged: Option<(String, Vec<u8>)> = match std::env::var("XTASK_STAGE_BIN") {
         Ok(spec) if !spec.is_empty() => {
-            let (host, guest) = match spec.split_once(':') {
-                Some((h, g)) => (h.to_string(), g.to_string()),
-                None => {
-                    let name = Path::new(&spec)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "staged".into());
-                    (spec.clone(), format!("bin/{name}"))
-                }
-            };
+            let (host, guest) = parse_stage_bin_spec(&spec)?;
             let bytes =
                 std::fs::read(&host).with_context(|| format!("XTASK_STAGE_BIN: reading {host}"))?;
             println!(
@@ -5229,14 +5315,14 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     let mut cpio_path = None;
     if !fw_initramfs.is_empty() || staged.is_some() {
-        let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
+        let mut cpio_entries: Vec<(&str, &[u8], u32)> = Vec::new();
         for (path, bytes) in &fw_initramfs {
-            cpio_entries.push((path.as_str(), bytes.as_slice()));
+            cpio_entries.push((path.as_str(), bytes.as_slice(), 0o100644));
         }
         if let Some((name, bytes)) = &staged {
-            cpio_entries.push((name.as_str(), bytes.as_slice()));
+            cpio_entries.push((name.as_str(), bytes.as_slice(), 0o100755));
         }
-        let cpio = encode_cpio_newc(&cpio_entries);
+        let cpio = encode_cpio_newc_with_modes(&cpio_entries);
         let p = out_dir.join("initramfs.cpio");
         std::fs::write(&p, &cpio)
             .with_context(|| format!("writing initramfs CPIO to {}", p.display()))?;

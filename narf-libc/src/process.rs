@@ -318,8 +318,11 @@ pub unsafe extern "C" fn execve(
             crate::errno::set_errno(8); // ENOEXEC
             -1
         }
-        Err(()) => {
-            crate::errno::set_errno(8); // ENOEXEC
+        Err(errno) => {
+            // Preserve the kernel's Linux errno. In particular, execvp/PATH
+            // search relies on ENOENT/ENOTDIR to continue to the next
+            // directory and must not see every miss flattened to ENOEXEC.
+            crate::errno::set_errno(errno);
             -1
         }
     }

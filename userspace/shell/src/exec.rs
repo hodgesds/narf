@@ -323,7 +323,9 @@ unsafe fn apply_one_redir(err_fd: i32, redir: &Redir) -> bool {
 
 /// Execute the command in the child: try `execvp`, then exit(127).
 ///
-/// PATH resolution: if argv[0] contains no `/`, prepend `/bin/`.
+/// PATH resolution: if argv[0] contains no `/`, try `/bin/` and then
+/// `/usr/bin/`. Boot mounts its baked coreutils filesystem over `/bin`, while
+/// developer-supplied initramfs programs remain visible below `/usr/bin`.
 unsafe fn exec_child(sc: &SimpleCmd) {
     if sc.argc == 0 {
         return;
@@ -370,6 +372,30 @@ unsafe fn exec_child(sc: &SimpleCmd) {
     let mut full_aptrs = aptrs;
     full_aptrs[0] = resolved_argv0.as_ptr() as *const i8;
     // SAFETY: Valid memory or trusted environment
+    unsafe {
+        libc::execve(path_buf.as_ptr() as *const i8, full_aptrs.as_ptr(), envp.as_ptr());
+    }
+
+    // `/bin` is a separate baked-coreutils mount during boot-init, so a binary
+    // supplied by an initramfs cannot live there. Match the useful subset of
+    // execvp's PATH search: only continue after a missing path/component;
+    // preserve real loader or permission errors from an existing `/bin` file.
+    let errno = libc::errno();
+    if errno != 2 /* ENOENT */ && errno != 20 /* ENOTDIR */ {
+        return;
+    }
+
+    path_buf.fill(0);
+    resolved_argv0.fill(0);
+    let prefix = b"/usr/bin/";
+    let name_len = name.len().min(256 - prefix.len() - 1);
+    path_buf[..prefix.len()].copy_from_slice(prefix);
+    path_buf[prefix.len()..prefix.len() + name_len].copy_from_slice(&name[..name_len]);
+    let rlen = prefix.len() + name_len;
+    resolved_argv0[..rlen].copy_from_slice(&path_buf[..rlen]);
+    full_aptrs[0] = resolved_argv0.as_ptr() as *const i8;
+    // SAFETY: path, argv, and envp are NUL-terminated arrays backed by this
+    // stack frame for the duration of the syscall.
     unsafe {
         libc::execve(path_buf.as_ptr() as *const i8, full_aptrs.as_ptr(), envp.as_ptr());
     }
