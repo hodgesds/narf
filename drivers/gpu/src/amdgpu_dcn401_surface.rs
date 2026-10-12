@@ -4,6 +4,9 @@
 use super::*;
 use crate::amdgpu_vram::{Pool, Reservation};
 use core::sync::atomic::{fence, Ordering};
+#[path = "amdgpu_dcn401_vm.rs"]
+mod vm;
+pub use vm::MemoryApplied;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFormat {

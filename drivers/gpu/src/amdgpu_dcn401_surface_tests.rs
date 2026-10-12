@@ -1,6 +1,8 @@
 use super::*;
 use crate::amdgpu_dcn401_otg::fetch::Surfaces;
 use crate::amdgpu_vram::Pool;
+#[path = "amdgpu_dcn401_vm_tests.rs"]
+mod vm;
 
 fn h(p: u8, r: u64) -> u64 {
     BASE + (r + u64::from(p) * 0xdc) * 4

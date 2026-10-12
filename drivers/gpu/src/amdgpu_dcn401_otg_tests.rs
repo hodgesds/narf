@@ -149,7 +149,8 @@ impl Io for Fake {
     }
     fn write(&mut self, at: u64, value: u32) {
         assert!(
-            (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
+            (BASE + 0x475 * 4..=BASE + 0x47a * 4).contains(&at)
+                || (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
                 || (0x162a0 * 4..=0x162a3 * 4).contains(&at)
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || at == BASE + 0x4a * 4 // native FRL character-clock root
@@ -332,6 +333,7 @@ fn engine() -> Engine<Fake> {
             planes_retired: None,
             hubp_power: [None; 4],
             surfaces: [None; 4],
+            memory: [None; 4],
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,

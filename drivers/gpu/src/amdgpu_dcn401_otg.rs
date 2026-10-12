@@ -15,7 +15,9 @@ mod opp;
 pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
-pub use fetch::{HubpPower, PlanesRetired, SurfaceApplied, SurfaceFormat, SurfaceRequest};
+pub use fetch::{
+    HubpPower, MemoryApplied, PlanesRetired, SurfaceApplied, SurfaceFormat, SurfaceRequest,
+};
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
 pub use stream::{DpBlanked, DpEncoderRetired, DpStream};
@@ -83,6 +85,7 @@ pub enum Error {
     PipeClocks(dccg::Error),
     Firmware(crate::amdgpu_dmub_navi48::Error),
     DpTraining(DpTrainingError),
+    Memory(crate::amdgpu_gmc_navi48::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -134,6 +137,8 @@ pub enum State {
     HubpPowerChanged,
     PreparingSurface(u8),
     SurfacePrepared,
+    PreparingMemory(u8),
+    MemoryPrepared,
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -149,6 +154,7 @@ impl State {
                 | Self::PlanesRetired
                 | Self::HubpPowerChanged
                 | Self::SurfacePrepared
+                | Self::MemoryPrepared
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
@@ -222,6 +228,8 @@ pub struct Status {
     pub hubp_power: [Option<HubpPower>; 4],
     /// Staged owned surfaces, not evidence of a latched flip or active scanout.
     pub surfaces: [Option<SurfaceApplied>; 4],
+    /// Historical aperture/VMID0 setup, never fetch or flip completion evidence.
+    pub memory: [Option<MemoryApplied>; 4],
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -621,6 +629,7 @@ impl Otg {
                     planes_retired: None,
                     hubp_power: [None; 4],
                     surfaces: [None; 4],
+                    memory: [None; 4],
                     dp_blanked: None,
                     dp_encoder_retired: None,
                     dp_sst_disabled: None,

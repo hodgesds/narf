@@ -967,6 +967,27 @@ impl ColdBoot {
                 .upload_surface(pipe, x, y, pixels)
         }
     }
+    /// Prepare DCN framebuffer translation using this boot owner's retained GMC.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent hub/VM/display/clock/reset/power
+    /// writers; retain both owners and all inherited resources on every outcome.
+    pub async unsafe fn prepare_display_memory(
+        &mut self,
+        pipe: u8,
+    ) -> Result<otg::MemoryApplied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners, serialized here; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_memory(gmc, pipe)
+                .await
+        }
+    }
     /// Blank one native DP video stream before separate encoder/PHY retirement.
     /// # Safety
     /// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,

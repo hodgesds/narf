@@ -443,6 +443,21 @@ pub async unsafe fn upload_display_surface(
     unsafe { boot.upload_display_surface(pipe, x, y, pixels) }
 }
 
+/// Prepare DCN framebuffer translation for an owned, staged surface.
+/// # Safety
+/// Exclude firmware/FAMS and concurrent hub/VM/display/clock/reset/power writers;
+/// retain the owner and all inherited resources on every outcome.
+pub async unsafe fn prepare_display_memory(
+    pipe: u8,
+) -> Result<crate::amdgpu_dcn401_otg::MemoryApplied, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.prepare_display_memory(pipe).await }
+}
+
 /// Blank one legacy or HPO DisplayPort video stream, retaining timing/link clocks.
 /// # Safety
 /// Stop CPU scanout writers and exclude firmware/FAMS and concurrent display,

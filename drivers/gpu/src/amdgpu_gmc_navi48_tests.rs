@@ -73,6 +73,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
         vram_size: 16 << 30,
         state: State::Prepared,
         aperture: None,
+        geometry: None,
     };
     (pool, engine)
 }
@@ -147,6 +148,70 @@ fn gmc_navi48_uses_vram_physical_ptes_and_bounds_vmid0() -> TestResult {
     }
     TestResult::Pass
 }
+fn gmc_navi48_display_context_requires_owned_live_geometry_and_root() -> TestResult {
+    let (_pool, mut e) = fixture();
+    assert_eq!(e.display_context(), Err(Error::Busy));
+    run(e.initialize()).unwrap();
+    assert_eq!(
+        e.display_context().unwrap(),
+        DisplayContext {
+            fb_base: 0x8_0000_0000,
+            fb_top: 0xb_ffff_ffff,
+            fb_offset: 0x1_0000_0000,
+            root: 0x1_0000_4001,
+            start: 0xc_0000_0000,
+            end: 0xc_001f_ffff,
+        }
+    );
+    let writes = e.io.writes.len();
+    // Display is prepared after the IRQ service owns VM fault delivery.
+    for (base, r) in e.layout.bases.into_iter().zip([GFX, MM]) {
+        e.io.registers.insert(base + u64::from(r.ctx) * 4, 0xfffc01);
+    }
+    assert!(e.display_context().is_ok());
+    for ((base, r), offset) in e
+        .layout
+        .bases
+        .into_iter()
+        .zip([GFX, MM])
+        .zip([0x15a7, 0x4c7])
+    {
+        for reg in [
+            r.fb_base,
+            r.fb_top,
+            offset,
+            r.ctx,
+            r.agp_base,
+            r.agp_bot,
+            r.agp_top,
+            r.sys_low,
+            r.sys_high,
+            r.pt_base,
+            r.pt_base + 1,
+            r.pt_start,
+            r.pt_start + 1,
+            r.pt_end,
+            r.pt_end + 1,
+        ] {
+            let at = base + u64::from(reg) * 4;
+            let old = e.io.registers[&at];
+            e.io.registers.insert(at, old ^ 1);
+            assert_eq!(e.display_context(), Err(Error::Busy));
+            e.io.registers.insert(at, u32::MAX);
+            assert_eq!(e.display_context(), Err(Error::DeviceGone));
+            e.io.registers.insert(at, old);
+        }
+    }
+    assert_eq!(e.io.writes.len(), writes);
+    e.authority.revoke();
+    assert_eq!(e.display_context(), Err(Error::Revoked));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gmc-navi48",
+    gmc_navi48_display_context_requires_owned_live_geometry_and_root
+);
+
 kernel_test_in!(
     "drivers/gpu/gmc-navi48",
     gmc_navi48_uses_vram_physical_ptes_and_bounds_vmid0

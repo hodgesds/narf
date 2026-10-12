@@ -12,6 +12,9 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 #[path = "amdgpu_gmc_navi48_regs.rs"]
 mod regs;
 use regs::{HubRegs, GFX, MM};
+#[path = "amdgpu_gmc_navi48_display.rs"]
+mod display;
+pub(crate) use display::DisplayContext;
 const BYTES: u64 = 16384; // PT, default page, source page, destination page
 const APERTURE_SIZE: u64 = 2 << 20; // 512 flat PTEs; only two are present
 const LIMIT: u64 = 1 << 48;
@@ -227,6 +230,7 @@ struct Engine<I: Io> {
     vram_size: u64,
     state: State,
     aperture: Option<Aperture>,
+    geometry: Option<Geometry>,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -314,6 +318,7 @@ impl<I: Io> Engine<I> {
         })?;
         self.memory.publish(); // before either hub can retain a PT/default address
         self.aperture = Some(geometry.aperture);
+        self.geometry = Some(geometry);
         self.access(|io| {
             for (base, r) in layout.bases.into_iter().zip([GFX, MM]) {
                 program(io, base, r, geometry, address)?;
@@ -377,6 +382,7 @@ impl Gmc {
                 vram_size: gpu.vram.size,
                 state: State::Prepared,
                 aperture: None,
+                geometry: None,
             },
         })
     }

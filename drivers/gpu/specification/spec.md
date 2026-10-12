@@ -535,8 +535,43 @@ blanking and consumers and issuing the HDP flush. No CPU pointer escapes.
 Bounds errors or stale configuration reject before memory writes; errors after
 writes invalidate the report and quarantine the owner. All operations exclude
 firmware/FAMS and concurrent display/HDP/clock/power writers and retain inherited
-resources. VM/aperture configuration, DML2 request/deadline/watermark calculation,
-DPP/MPC setup, live flips and visible scanout activation remain separate work.
+resources. DML2 request/deadline/watermark calculation, DPP/MPC setup, live flips
+and visible scanout activation remain separate work.
+
+`unsafe Otg::prepare_memory(&mut Gmc, pipe).await` configures DCN's physical
+framebuffer aperture and VMID0 for an already staged owned surface. Matching
+ColdBoot/platform `prepare_display_memory(pipe)` wrappers borrow the retained
+GMC and display owners after the kernel engine proofs. GMC's register mapping
+must match; its saved framebuffer geometry, flat VRAM page-table root and test
+aperture must still match both GC12 and MMHUB4.1. The fault monitor's independently
+owned interrupt-enable bits are allowed; translation, default and retry fields
+remain fixed. The complete surface reservation, including padding, must lie in
+the GPU framebuffer aperture. Its address is translated by FB base/offset;
+the two-page GART test mapping does not back the surface.
+
+The entire display tree must be stopped/detached, with the selected HUBP powered,
+blank and drained and its owned surface programming intact. Global native DCN
+FB base/top/offset use 16 MiB units; AGP is disabled with bottom above top.
+VMID0 uses the retained physical VRAM PDE and logical start/end page numbers,
+flat depth and 4 KiB block size. Root high is written before root low, which
+publishes the context last. The native low-bit readiness wait is asynchronous
+and bounded to 50 ms; address bits must also agree. No new PTEs, host mappings
+or user contexts are created. Then the selected HUBP's fetch clock is briefly
+enabled while blank to configure its 256 KiB system aperture and native L1
+control (enabled, system access mode 3, unmapped access and ADM disabled).
+Final checks require clock-off, stopped consumers, the same owned surface,
+complete DCN register readback and a fresh matching GMC configuration.
+
+Success enters reusable `MemoryPrepared` and records `MemoryApplied` in
+`Status::memory[pipe]`: pipe, framebuffer base/inclusive top/physical offset and
+the physical page-directory entry. This is historical setup evidence, never
+fetch, flip or presentation completion. Reprogramming the global aperture clears
+all prior memory reports; a HUBP power transition clears its report. Error
+enters `Failed`; cancellation retains `PreparingMemory(pipe)`. Both quarantine
+the display owner without speculative rollback or releasing either allocation.
+Callers retain GMC, the display owner and every inherited resource and exclude
+firmware/FAMS and concurrent hub/VM/display/clock/reset/power writers. Native
+header checks live in `tests/dcn401_vm.c`; physical card validation remains open.
 
 `unsafe Otg::blank_dp_stream(DpStream::{Dio,Hpo}(instance)).await` blanks one
 of the four native legacy or four HPO DisplayPort stream encoders. Stream

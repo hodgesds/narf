@@ -343,8 +343,15 @@ format, crossbar and viewport fields. Address publication follows an HDP flush
 and writes the high address before the low flip trigger. Fetch stays blank and
 drained; a pending flip is not reported as completed scanout. Bounded row uploads
 check live configuration and flush CPU writes. Partial failures retain published
-backing and block reuse. DCN VM/apertures, bandwidth/deadline/watermark programming,
-DPP/MPC composition and visible framebuffer activation remain open.
+backing and block reuse.
+Native DCN4 memory preparation now binds framebuffer base/top/offset and VMID0
+to the retained GMC owner, checking both memory hubs before and after setup.
+It uses the owned physical VRAM page-table root, disables AGP, waits for native
+context readiness, and configures the selected blank HUBP's system aperture
+and L1 translation. All scanout backing stays owned; lost writes, revocation,
+timeouts, changed geometry and cancellation cannot report readiness. Fetch
+remains stopped. Bandwidth/deadline/watermark programming, DPP/MPC composition,
+visible framebuffer activation and physical-card validation remain open.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
