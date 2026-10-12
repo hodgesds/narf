@@ -1219,14 +1219,17 @@ impl Arch {
                 }
 
                 if virtio {
-                    // VirGL must be the only display adapter. Leaving QEMU's
-                    // default Bochs VGA attached gives KWin two DRM devices;
-                    // its libdrm probe can then associate card0's render path
-                    // with the 1234:1111 fallback instead of the 1af4:1050
-                    // virtio-gpu transport. This applies to VirtioOnly too;
-                    // it formerly sat in the legacy fixture block, so a
-                    // single-NIC desktop had no usable KDE display.
-                    if gpu_backend == GpuBackend::Virgl {
+                    // A graphical virtio-only fixture must expose virtio-gpu
+                    // as its sole display adapter. Leaving QEMU's default
+                    // Bochs VGA attached gives KWin two DRM devices; on VirGL
+                    // it can associate card0's render path with the 1234:1111
+                    // fallback instead of 1af4:1050, and on 2D QEMU presents
+                    // the legacy VGA text console rather than Plasma's
+                    // virtio-gpu scanout. Full + 2D deliberately retains its
+                    // legacy display fixture coverage.
+                    if gpu_backend == GpuBackend::Virgl
+                        || (matches!(profile, HwProfile::VirtioOnly) && display != "none")
+                    {
                         args.extend_from_slice(&["-vga".into(), "none".into()]);
                     }
                     args.extend_from_slice(&[
@@ -4720,6 +4723,12 @@ fn musl_case_group(cmd: &str) -> &'static str {
     }
 }
 
+// The default musl-demo machine deliberately contains both the legacy Bochs
+// adapter and VirtIO GPU.  Name the VirtIO DRM driver explicitly so the
+// modetest regression covers the 1280x800 transport scanout rather than the
+// legacy adapter's 1024x768 console mode.
+const VIRTIO_MODETEST_CASE: (&str, &str) = ("modetest -M virtio_gpu", "(1280x800)");
+
 /// Boot a single musl-demo case up to `attempts` times, returning true once
 /// it passes. Retries on BOTH an assertion miss and a boot-level error
 /// (e.g. "QEMU EOF before login" — GHA's TCG occasionally dies before the
@@ -4904,17 +4913,16 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // tfd_epoll_smoke's single 120 ms step-F window only tripped on
         // layout-cursed builds ("slab: double free ... class 32 B").
         ("polltmo_hammer", "polltmo-ok"),
-        // modetest (real libdrm) enumerates /dev/dri/card0 end-to-end —
+        // modetest (real libdrm) enumerates the VirtIO DRM node end-to-end —
         // VERSION + GET_CAP + GETRESOURCES + GETCONNECTOR/ENCODER/CRTC +
-        // OBJ_GETPROPERTIES. Anchors on the enumerated 1280x800 mode.
-        ("modetest -M narf-drm", "(1280x800)"),
-        // NOTE: `modetest -s 3@1:1280x800` (set a mode + present an SMPTE
-        // pattern) is NOT an auto case — `modetest -s` holds the mode and
-        // blocks on stdin (interactive), so it never returns to the shell
-        // prompt. The CREATE_DUMB → ADDFB2 → SETCRTC modeset path it exercises
-        // is already covered for CI by `drm_smoke`; run it by hand for a
-        // visual check: `xtask run-interactive --cmd "modetest -M narf-drm -s
-        // 3@1:1280x800" --expect "crtc 1"`.
+        // OBJ_GETPROPERTIES. The full fixture also contains Bochs, whose
+        // 1024x768 scanout is intentionally not this test's target.
+        VIRTIO_MODETEST_CASE,
+        // NOTE: `modetest -s` (set a mode + present an SMPTE pattern) is NOT
+        // an auto case — it holds the mode and blocks on stdin (interactive),
+        // so it never returns to the shell prompt. The CREATE_DUMB → ADDFB2 →
+        // SETCRTC modeset path it exercises is already covered for CI by
+        // `drm_smoke`.
         ("net_smoke", "net-ok"),
         ("net6_smoke", "net6-ok"),
         ("unix_smoke", "unix-ok"),
@@ -6050,7 +6058,12 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     cmd.args(qemu_boot_args(&build, &kernel)?);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    // Serial is captured from stdout for prompt matching.  Keep QEMU's
+    // diagnostics on the invoking terminal: hiding an immediate launch
+    // failure (such as an image lock or unavailable accelerator) behind an
+    // indistinguishable stdout EOF turns a one-line host error into a blind
+    // 120-second test retry.
+    cmd.stderr(Stdio::inherit());
 
     println!(
         "xtask {smoke_name}: launching {} {} (TCP 127.0.0.1:{tcp_host_port} -> guest :{tcp_guest_port}; UDP 127.0.0.1:{udp_host_port} -> guest :{udp_guest_port})",
@@ -8924,9 +8937,14 @@ fn run_interactive_multi(
             }
             Wait::Died(why) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                let status = child.wait().ok();
                 let _ = reader_handle.join();
-                bail!("xtask musl-demo: {why} before login prompt");
+                bail!(
+                    "xtask musl-demo: {why} before login prompt ({})",
+                    status
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "QEMU status unavailable".into())
+                );
             }
         }
         // QEMU's emulated USB keyboard enumerates just after getty prints the
@@ -8968,9 +8986,14 @@ fn run_interactive_multi(
         }
         Wait::Died(why) => {
             let _ = child.kill();
-            let _ = child.wait();
+            let status = child.wait().ok();
             let _ = reader_handle.join();
-            bail!("xtask musl-demo: {why} before first prompt");
+            bail!(
+                "xtask musl-demo: {why} before first prompt ({})",
+                status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "QEMU status unavailable".into())
+            );
         }
     }
     // Late-boot log noise (USB-HID enumeration) can interleave with
@@ -9152,6 +9175,7 @@ fn without_kernel_test_features(features: &str) -> String {
 mod kernel_test_feature_tests {
     use super::{
         legacy_qemu_netdev_from, validate_test_subsystems, without_kernel_test_features, Cli, Cmd,
+        VIRTIO_MODETEST_CASE,
     };
     use clap::Parser;
 
@@ -9252,7 +9276,7 @@ mod kernel_test_feature_tests {
     }
 
     #[test]
-    fn virgl_disables_default_vga_in_every_virtio_x86_fixture() {
+    fn graphical_virtio_gpu_disables_default_vga_when_it_owns_the_display() {
         use super::{Arch, GpuBackend, HwProfile};
 
         for profile in [HwProfile::Full, HwProfile::VirtioOnly] {
@@ -9282,6 +9306,51 @@ mod kernel_test_feature_tests {
                 "{profile:?} has no virtio GPU to own the display"
             );
         }
+
+        let graphical_2d = Arch::X86_64.qemu_args(
+            std::path::Path::new("kernel"),
+            "gtk",
+            HwProfile::VirtioOnly,
+            GpuBackend::Virtio2d,
+            "",
+        );
+        assert!(
+            graphical_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
+            "graphical virtio-only 2D fixtures must scan out virtio-gpu, not default VGA"
+        );
+
+        let headless_2d = Arch::X86_64.qemu_args(
+            std::path::Path::new("kernel"),
+            "none",
+            HwProfile::VirtioOnly,
+            GpuBackend::Virtio2d,
+            "",
+        );
+        assert!(
+            !headless_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
+            "headless 2D fixtures do not need to alter legacy display coverage"
+        );
+
+        let full_2d = Arch::X86_64.qemu_args(
+            std::path::Path::new("kernel"),
+            "gtk",
+            HwProfile::Full,
+            GpuBackend::Virtio2d,
+            "",
+        );
+        assert!(
+            !full_2d.windows(2).any(|pair| pair == ["-vga", "none"]),
+            "full 2D fixtures retain their explicit legacy display coverage"
+        );
+    }
+
+    #[test]
+    fn modetest_regression_targets_virtio_scanout() {
+        assert_eq!(
+            VIRTIO_MODETEST_CASE,
+            ("modetest -M virtio_gpu", "(1280x800)"),
+            "the dual-GPU fixture must not select Bochs while asserting the VirtIO mode"
+        );
     }
 
     #[test]
