@@ -903,6 +903,27 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Retire a blank native DP stream encoder, retaining PHYs and allocations.
+    /// # Safety
+    /// Exclude CPU/firmware/FAMS and concurrent display/audio/link/power writers;
+    /// retain all allocations and translations. Independently retire sink/MST
+    /// bookkeeping and audio/metadata producers. This does not retire memory.
+    pub async unsafe fn retire_display_dp_encoder(
+        &mut self,
+        stream: otg::DpStream,
+    ) -> Result<otg::DpEncoderRetired, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers and retains memory.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .retire_dp_encoder(stream)
+                .await
+        }
+    }
     fn display_retirement_busy(&self) -> bool {
         self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)

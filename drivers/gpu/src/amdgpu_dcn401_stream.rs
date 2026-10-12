@@ -3,6 +3,10 @@
 //! Link, stream and timing clocks remain owned and enabled as inherited.
 use super::*;
 
+#[path = "amdgpu_dcn401_encoder.rs"]
+mod encoder;
+pub use encoder::DpEncoderRetired;
+
 const DIO_CLOCK: u64 = 0x2094;
 const DIO_ENABLE: u64 = 0x2095;
 const DIO_VIDEO: u64 = 0x2122;

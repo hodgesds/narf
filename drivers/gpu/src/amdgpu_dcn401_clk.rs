@@ -12,6 +12,7 @@ const MESSAGE: u32 = 0x8a; // MP1 C2PMSG74, base index 1
 const ARGUMENT: u32 = 0x73; // C2PMSG51
 const RESPONSE: u32 = 0x74; // C2PMSG52
 const LEVEL_COUNT: usize = 8;
+pub(crate) const IDLE_REG_COUNT: usize = 51;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -143,8 +144,8 @@ impl Layout {
                 .map_err(|_| Error::Unsupported)?,
         })
     }
-    pub(crate) fn idle_registers(self) -> [(u64, u32); 31] {
-        let mut regs = [(0, 0); 31];
+    pub(crate) fn idle_registers(self) -> [(u64, u32); IDLE_REG_COUNT] {
+        let mut regs = [(0, 0); IDLE_REG_COUNT];
         for i in 0..4 {
             for (j, (reg, stride, mask)) in [
                 (0x1b43, 0x80, 0x10001),  // OTG_MASTER_EN/current master state
@@ -154,16 +155,21 @@ impl Layout {
                 (0x3685, 0xd4, 0x101),    // HPO DP video enable/status
                 (0x367b, 0xd4, 1),        // HPO DP SDP enable
                 (0x369f, 0xd4, 1),        // HPO DP link clock: no live training
+                (0x2094, 0x124, 0xc10),   // DIO frontend clock request/ON
+                (0x2095, 0x124, 1),       // DIO frontend enabled
+                (0x209b, 0x124, 1),       // DIO pixel FIFO enabled
+                (0x3623, 0xd4, 0x11111),  // HPO stream clock request/ON
+                (0x365d, 0xd4, 1),        // HPO SYM32 encoder enabled
             ]
             .into_iter()
             .enumerate()
             {
-                regs[i * 7 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
+                regs[i * 12 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
             }
         }
         // The single FRL stream lives in DCN bank 3, unlike HPO DP's bank 2.
         for (i, reg) in [0x8d3, 0x8d6, 0x8df].into_iter().enumerate() {
-            regs[28 + i] = (self.hpo + reg * 4, 1);
+            regs[48 + i] = (self.hpo + reg * 4, 1);
         }
         regs
     }

@@ -107,7 +107,7 @@ pub struct Status {
 struct Layout {
     base: u64,
     dio: u64,
-    idle: [(u64, u32); 31],
+    idle: [(u64, u32); clocks::IDLE_REG_COUNT],
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {

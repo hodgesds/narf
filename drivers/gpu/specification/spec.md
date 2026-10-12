@@ -295,7 +295,7 @@ modesetting.
 without register writes. It checks the same display discovery and consumer
 bounds, DCN bank one through `DPPCLK_CTRL`, and the native read-only PLL/DPREF
 aperture. `prepare(&mut ClockManager, Request).await` requires a matching BAR,
-current acknowledged global clocks and all 31 display consumers retired.
+current acknowledged global clocks and all 51 display consumer checks clear.
 `Request` selects a pipe, DPP kHz and disabled, DisplayPort, FRL or TMDS clocks.
 Out-of-range pipes/rates, zero active clocks and oversized DTO ratios fail
 before writes. DPP uses ceil(255 × pipe/global) and the native enable field in
@@ -494,6 +494,37 @@ errors after beginning the operation enter `Failed`, blocking all reuse until
 independent reset. No outcome permits allocation reuse. `unsafe
 ColdBoot::blank_display_dp_stream` and the platform wrapper require the
 drained GC12/SDMA interrupt proofs and serialize access to the same owner.
+
+`unsafe Otg::retire_dp_encoder(DpStream).await` disables one already blank
+native DP frontend. It checks live hardware rather than trusting a previous
+`DpBlanked` snapshot. Video, secondary packet scheduling, DIO GSP8–11 sends
+and metadata transactions must already be stopped; incomplete FIFO resets
+reject before writes. Callers retain all resources, exclude CPU, firmware/FAMS,
+display/audio/packet/link/clock/power writers, and independently retire sink/MST
+bookkeeping and audio/metadata producers. This API does not perform those steps.
+
+DIO retirement resolves all four backend frontend-selection bitmasks. Every
+backend connected to the selected frontend must be disabled first, preserving
+legacy SST shutdown order; this initial path also requires that for MST. Live
+unrelated outputs are allowed. Unsupported frontend selectors reject before
+writes. Native sequencing disables the pixel FIFO, frontend enable and frontend
+clock request, then waits up to 1 ms for both frontend clock-on witnesses to
+clear. It rechecks packets and routing, clears the pixel input mode, and removes
+only this frontend's bit from each connected backend. Unrelated frontend bits,
+HPD selections, backend enables and clocks remain unchanged. HPO retirement
+requires video, SDP and both FIFOs stopped, then disables SYM32 before its stream
+clock request and waits up to 1 ms for all four clock-on witnesses to clear.
+It leaves the independent stream/link mapping and link encoder untouched.
+
+Success enters `DpEncoderRetired` and records
+`DpEncoderRetired::{stream,detached_backends}` in `Status::dp_encoder_retired`.
+Failure after writes or cancellation retains `Failed` or
+`RetiringDpEncoder(stream)` and blocks reuse until independent reset. No result
+proves PHY, sink, timing, VPG/APG/AFMT, HUBP or memory retirement. Global and pipe
+clock owners now also reject enabled DIO frontends/pixel FIFOs and HPO SYM32
+encoders, plus requested or acknowledged frontend/stream clocks; video blanking
+alone cannot authorize clock changes. `unsafe ColdBoot::retire_display_dp_encoder`
+and its platform wrapper retain the same lifetime and drained GC12/SDMA guards.
 
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,

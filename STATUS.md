@@ -333,8 +333,14 @@ Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
 retirement, and quarantines the owner on timeout, failure or cancellation.
-Per-stream selection does not assume OTG/transmitter routing; HDMI, sink power
-and complete encoder/PHY shutdown still need their own native sequences.
+Native DP frontend retirement now shuts down blank DIO/HPO encoders and waits
+for their clock-off witnesses. DIO retirement checks real backend routes,
+requires connected backends stopped and removes only the selected frontend
+bits; unrelated live outputs stay untouched. Clock programming now rejects
+enabled frontends/FIFOs and outstanding frontend/stream clocks even when video
+is blank. Active packet/metadata work blocks retirement, and partial failures
+or cancellation retain all resources. HDMI, sink/MST/audio teardown and native
+PHY shutdown still need their own sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths
 have model tests, not silicon validation.

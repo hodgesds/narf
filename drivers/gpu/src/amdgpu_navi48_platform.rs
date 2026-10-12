@@ -409,6 +409,22 @@ pub async unsafe fn blank_display_dp_stream(
     unsafe { boot.blank_display_dp_stream(stream).await }
 }
 
+/// Retire one blank DP stream encoder and acknowledge its frontend clocks off.
+/// # Safety
+/// Exclude CPU/firmware/FAMS and concurrent display/audio/link/power writers;
+/// retain every allocation and translation. Independently retire sink/MST and
+/// audio/metadata producers. Success does not retire PHYs, timing or memory.
+pub async unsafe fn retire_display_dp_encoder(
+    stream: crate::amdgpu_dcn401_otg::DpStream,
+) -> Result<crate::amdgpu_dcn401_otg::DpEncoderRetired, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller excludes writers and retains memory.
+    unsafe { boot.retire_display_dp_encoder(stream).await }
+}
+
 /// Consume bounded diagnostic history from the independent IH service.
 /// Hardware draining and CPU interrupt waits never hold the display-owner lock.
 pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> {

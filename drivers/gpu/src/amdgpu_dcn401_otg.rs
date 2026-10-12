@@ -17,7 +17,7 @@ mod fetch;
 pub use fetch::PlanesRetired;
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
-pub use stream::{DpBlanked, DpStream};
+pub use stream::{DpBlanked, DpEncoderRetired, DpStream};
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -67,6 +67,8 @@ pub enum State {
     RunningBlank(u8),
     BlankingDp(DpStream),
     DpBlanked,
+    RetiringDpEncoder(DpStream),
+    DpEncoderRetired,
     RetiringPlanes,
     PlanesRetired,
     Retiring(u8),
@@ -83,6 +85,7 @@ impl State {
                 | Self::Retired
                 | Self::PlanesRetired
                 | Self::DpBlanked
+                | Self::DpEncoderRetired
         )
     }
 }
@@ -142,6 +145,8 @@ pub struct Status {
     pub planes_retired: Option<PlanesRetired>,
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
+    /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
+    pub dp_encoder_retired: Option<DpEncoderRetired>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -253,7 +258,7 @@ impl Request {
 struct Layout {
     base: u64,
     mpc_base: u64,
-    idle: [(u64, u32); 31],
+    idle: [(u64, u32); clocks::IDLE_REG_COUNT],
 }
 impl Layout {
     fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
@@ -480,6 +485,7 @@ impl Otg {
                 running_blank: None,
                 planes_retired: None,
                 dp_blanked: None,
+                dp_encoder_retired: None,
                 retired: 0,
             },
         }))

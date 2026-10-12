@@ -27,6 +27,9 @@ struct Fake {
     dp_written: u8,
     dp_delay: [u8; 8],
     dp_stall: u16,
+    encoder_written: u8,
+    encoder_delay: [u8; 8],
+    encoder_stall: u8,
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
@@ -34,6 +37,22 @@ impl Io for Fake {
             return u32::MAX;
         }
         for p in 0..4 {
+            for (slot, reg, stride, enable, on) in [
+                (p, 0x2094, 0x124, 0x10, 0xc00),
+                (p + 4, 0x3623, 0xd4, 1, 0x11110),
+            ] {
+                if at == BASE + (reg + p * stride) * 4
+                    && self.encoder_written & (1 << slot) != 0
+                    && self.encoder_stall & (1 << slot) == 0
+                    && self.regs.get(&at).copied().unwrap_or(0) & enable == 0
+                {
+                    if self.encoder_delay[slot as usize] == 0 {
+                        *self.regs.entry(at).or_default() &= !on;
+                    } else {
+                        self.encoder_delay[slot as usize] -= 1;
+                    }
+                }
+            }
             for (slot, reg, stride, status) in
                 [(p, 0x2122, 0x124, 0x10000), (p + 4, 0x3685, 0xd4, 0x100)]
             {
@@ -131,10 +150,10 @@ impl Io for Fake {
             (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
                 || (0..4).any(|p| {
-                    [0x2122, 0x2123]
+                    [0x2094, 0x2095, 0x209b, 0x20bc, 0x2122, 0x2123]
                         .iter()
                         .any(|r| at == BASE + (r + p * 0x124) * 4)
-                        || [0x3626, 0x365e, 0x367b, 0x3685]
+                        || [0x3623, 0x3626, 0x365d, 0x365e, 0x367b, 0x3685]
                             .iter()
                             .any(|r| at == BASE + (r + p * 0xd4) * 4)
                 })
@@ -148,6 +167,36 @@ impl Io for Fake {
             self.disconnecting = true;
         }
         for p in 0..4 {
+            if at == BASE + (0x2094 + p * 0x124) * 4 {
+                self.encoder_written |= 1 << p;
+                assert_eq!(
+                    self.regs
+                        .get(&(BASE + (0x209b + p * 0x124) * 4))
+                        .copied()
+                        .unwrap_or(0)
+                        & 1,
+                    0
+                );
+                assert_eq!(
+                    self.regs
+                        .get(&(BASE + (0x2095 + p * 0x124) * 4))
+                        .copied()
+                        .unwrap_or(0)
+                        & 1,
+                    0
+                );
+            }
+            if at == BASE + (0x3623 + p * 0xd4) * 4 {
+                self.encoder_written |= 1 << (p + 4);
+                assert_eq!(
+                    self.regs
+                        .get(&(BASE + (0x365d + p * 0xd4) * 4))
+                        .copied()
+                        .unwrap_or(0)
+                        & 1,
+                    0
+                );
+            }
             if at == BASE + (0x2122 + p * 0x124) * 4 {
                 self.dp_written |= 1 << p;
             }
@@ -249,6 +298,9 @@ fn engine() -> Engine<Fake> {
             dp_written: 0,
             dp_delay: [0; 8],
             dp_stall: 0,
+            encoder_written: 0,
+            encoder_delay: [0; 8],
+            encoder_stall: 0,
         },
         authority: Cap::bootstrap(),
         layout: Layout::resolve(&gpu).unwrap(),
@@ -259,6 +311,7 @@ fn engine() -> Engine<Fake> {
             running_blank: None,
             planes_retired: None,
             dp_blanked: None,
+            dp_encoder_retired: None,
             retired: 0,
         },
     }
@@ -975,3 +1028,6 @@ mod fetch;
 
 #[path = "amdgpu_dcn401_stream_tests.rs"]
 mod stream;
+
+#[path = "amdgpu_dcn401_encoder_tests.rs"]
+mod encoder;

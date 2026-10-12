@@ -7,7 +7,7 @@ fn at(stream: DpStream, reg: u64) -> u64 {
     };
     BASE + (reg + u64::from(p) * stride) * 4
 }
-fn live(stream: DpStream) -> Engine<Fake> {
+pub(super) fn live(stream: DpStream) -> Engine<Fake> {
     let mut e = engine();
     let registers: &[(u64, u32)] = match stream {
         DpStream::Dio(_) => &[
