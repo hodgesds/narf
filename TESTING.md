@@ -13,6 +13,9 @@ QEMU boot to a full real-hardware install on a Renoir-class laptop.
 | Run the real-init boot-smoke | `cargo xtask boot-smoke --arch=x86_64` |
 | Build a bootable ISO | `cargo xtask image --arch=x86_64` |
 | ISO + boot under OVMF UEFI | `cargo xtask iso-boot --arch=x86_64` |
+| Installed x86_64 UEFI package | `packaging/test-uefi-boot.sh` |
+| Installed aarch64 UEFI package | `packaging/test-aarch64-package-boot.sh` |
+| Enforced Secure Boot + tamper rejection | `packaging/test-secure-boot.sh` |
 | Demo with user-mode testbin + shell | `cargo xtask demo --arch=x86_64 --display=gtk` |
 | Burn ISO to USB stick | `sudo cargo xtask disk-write --device /dev/sdX` |
 | Lay down GPT + ESP + ext4 install | `sudo cargo xtask disk-write-partitioned --device /dev/sdX --yes` |
@@ -36,6 +39,8 @@ want to exercise the ARM path.
   subcommands need these.
   - Debian / Ubuntu: `apt install xorriso mtools`
   - Arch: `pacman -S libisoburn mtools`
+- **Secure Boot gate** — `sbsigntool`, OpenSSL, and `virt-fw-vars` from
+  virt-firmware. Its key and OVMF variable store are disposable test fixtures.
 
 xtask cross-builds against `x86_64-unknown-none` / `aarch64-unknown-none`
 with `-Z build-std=core,compiler_builtins,alloc`. NVMe disk images and
@@ -214,9 +219,10 @@ running (you'll get an interactive shell at the `narf>` prompt):
 cargo xtask demo --arch=x86_64 --display=gtk
 ```
 
-The ISO uses Limine as the bootloader on x86_64. On aarch64 `xtask
-image` produces a kernel + DTB image bootable via QEMU `-kernel`; no
-ISO is built since the aarch64 boot path is direct-kernel today.
+The ISO uses Limine as the bootloader on x86_64. On aarch64 `xtask image`
+produces a FAT UEFI image with `EFI/BOOT/BOOTAA64.EFI`; `iso-boot` boots it
+under AAVMF with an attached QEMU `virt` DTB. The loader is bound to the exact
+kernel digest before the image is created.
 
 ### What's in the ISO
 

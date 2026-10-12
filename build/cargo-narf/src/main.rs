@@ -39,6 +39,10 @@ struct PackageArgs {
     #[arg(long)]
     version: String,
 
+    /// Kernel and UEFI architecture to package.
+    #[arg(long, value_enum, default_value_t = PackageArch::Auto)]
+    arch: PackageArch,
+
     /// Comma-separated formats: auto, all, deb, rpm, arch, gentoo, or tar.
     #[arg(long, default_value = "auto")]
     formats: String,
@@ -58,6 +62,22 @@ struct PackageArgs {
     /// Limine BOOTX64.EFI to embed in native packages.
     #[arg(long)]
     limine_efi: Option<PathBuf>,
+
+    /// Architecture-matching EFI loader to bind into the package.
+    #[arg(long)]
+    uefi_loader: Option<PathBuf>,
+
+    /// Limine host utility used to enroll the x86_64 config digest.
+    #[arg(long)]
+    limine_tool: Option<PathBuf>,
+
+    /// Private key used by sbsign; requires --secure-boot-cert.
+    #[arg(long, requires = "secure_boot_cert")]
+    secure_boot_key: Option<PathBuf>,
+
+    /// X.509 certificate used by sbsign; requires --secure-boot-key.
+    #[arg(long, requires = "secure_boot_key")]
+    secure_boot_cert: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -65,6 +85,10 @@ struct InstallArgs {
     /// Semantic NARF release version, without a leading `v`.
     #[arg(long)]
     version: String,
+
+    /// Kernel and UEFI architecture to package.
+    #[arg(long, value_enum, default_value_t = PackageArch::Auto)]
+    arch: PackageArch,
 
     /// Native package format. `auto` reads os-release.
     #[arg(long, value_enum, default_value_t = PackageFormat::Auto)]
@@ -85,6 +109,22 @@ struct InstallArgs {
     /// Limine BOOTX64.EFI to embed in the native package.
     #[arg(long)]
     limine_efi: Option<PathBuf>,
+
+    /// Architecture-matching EFI loader to bind into the package.
+    #[arg(long)]
+    uefi_loader: Option<PathBuf>,
+
+    /// Limine host utility used to enroll the x86_64 config digest.
+    #[arg(long)]
+    limine_tool: Option<PathBuf>,
+
+    /// Private key used by sbsign; requires --secure-boot-cert.
+    #[arg(long, requires = "secure_boot_cert")]
+    secure_boot_key: Option<PathBuf>,
+
+    /// X.509 certificate used by sbsign; requires --secure-boot-key.
+    #[arg(long, requires = "secure_boot_key")]
+    secure_boot_cert: Option<PathBuf>,
 
     /// Pass the native package manager's non-interactive confirmation flag.
     #[arg(long)]
@@ -116,6 +156,44 @@ enum PackageFormat {
     Tar,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PackageArch {
+    Auto,
+    #[value(name = "x86_64")]
+    X86_64,
+    #[value(name = "aarch64")]
+    Aarch64,
+}
+
+impl PackageArch {
+    fn resolve(self) -> Result<Self> {
+        match self {
+            Self::Auto => match env::consts::ARCH {
+                "x86_64" => Ok(Self::X86_64),
+                "aarch64" => Ok(Self::Aarch64),
+                arch => bail!("cannot infer NARF package architecture from {arch}; pass --arch"),
+            },
+            arch => Ok(arch),
+        }
+    }
+
+    const fn as_script_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::X86_64 => "x86_64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+
+    const fn deb_name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::X86_64 => "amd64",
+            Self::Aarch64 => "arm64",
+        }
+    }
+}
+
 impl PackageFormat {
     const fn as_script_name(self) -> &'static str {
         match self {
@@ -139,6 +217,20 @@ struct InstallCommand {
     args: Vec<OsString>,
 }
 
+struct PackagerOptions<'a> {
+    version: &'a str,
+    formats: &'a str,
+    output: Option<&'a Path>,
+    skip_build: bool,
+    source_date_epoch: Option<u64>,
+    arch: PackageArch,
+    limine_efi: Option<&'a Path>,
+    uefi_loader: Option<&'a Path>,
+    limine_tool: Option<&'a Path>,
+    secure_boot_key: Option<&'a Path>,
+    secure_boot_cert: Option<&'a Path>,
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -155,19 +247,28 @@ fn run() -> Result<()> {
         NarfCommand::Package(args) => {
             let root = find_repo(cli.repo.as_deref())?;
             let formats = resolve_formats(&args.formats, Path::new("/etc/os-release"))?;
+            let arch = args.arch.resolve()?;
             run_packager(
                 &root,
-                &args.version,
-                &formats,
-                args.output.as_deref(),
-                args.skip_build,
-                args.source_date_epoch,
-                args.limine_efi.as_deref(),
+                PackagerOptions {
+                    version: &args.version,
+                    formats: &formats,
+                    output: args.output.as_deref(),
+                    skip_build: args.skip_build,
+                    source_date_epoch: args.source_date_epoch,
+                    arch,
+                    limine_efi: args.limine_efi.as_deref(),
+                    uefi_loader: args.uefi_loader.as_deref(),
+                    limine_tool: args.limine_tool.as_deref(),
+                    secure_boot_key: args.secure_boot_key.as_deref(),
+                    secure_boot_cert: args.secure_boot_cert.as_deref(),
+                },
             )
         }
         NarfCommand::Install(args) => {
             let root = find_repo(cli.repo.as_deref())?;
             let format = resolve_format(args.format, &args.os_release)?;
+            let arch = args.arch.resolve()?;
             if !format.installable() {
                 bail!(
                     "{} packages are generation-only; install supports deb, rpm, and arch",
@@ -177,14 +278,21 @@ fn run() -> Result<()> {
             let output = absolute_output(&root, args.output.as_deref(), &args.version);
             run_packager(
                 &root,
-                &args.version,
-                format.as_script_name(),
-                Some(&output),
-                args.skip_build,
-                args.source_date_epoch,
-                args.limine_efi.as_deref(),
+                PackagerOptions {
+                    version: &args.version,
+                    formats: format.as_script_name(),
+                    output: Some(&output),
+                    skip_build: args.skip_build,
+                    source_date_epoch: args.source_date_epoch,
+                    arch,
+                    limine_efi: args.limine_efi.as_deref(),
+                    uefi_loader: args.uefi_loader.as_deref(),
+                    limine_tool: args.limine_tool.as_deref(),
+                    secure_boot_key: args.secure_boot_key.as_deref(),
+                    secure_boot_cert: args.secure_boot_cert.as_deref(),
+                },
             )?;
-            let artifact = find_artifact(&output, format, &args.version)?;
+            let artifact = find_artifact(&output, format, &args.version, arch)?;
             let command = native_install_command(format, &artifact, args.yes)?;
             let command = elevate_if_needed(command)?;
             if args.dry_run {
@@ -310,30 +418,36 @@ fn classify_os_release(contents: &str) -> Option<PackageFormat> {
     }
 }
 
-fn run_packager(
-    root: &Path,
-    version: &str,
-    formats: &str,
-    output: Option<&Path>,
-    skip_build: bool,
-    source_date_epoch: Option<u64>,
-    limine_efi: Option<&Path>,
-) -> Result<()> {
+fn run_packager(root: &Path, options: PackagerOptions<'_>) -> Result<()> {
     let mut command = Command::new(root.join("packaging/build-release.sh"));
     command
         .current_dir(root)
-        .args(["--version", version, "--formats", formats]);
-    if let Some(output) = output {
+        .args(["--version", options.version, "--formats", options.formats])
+        .arg("--arch")
+        .arg(options.arch.as_script_name());
+    if let Some(output) = options.output {
         command.arg("--output").arg(output);
     }
-    if skip_build {
+    if options.skip_build {
         command.arg("--skip-build");
     }
-    if let Some(epoch) = source_date_epoch {
+    if let Some(epoch) = options.source_date_epoch {
         command.arg("--source-date-epoch").arg(epoch.to_string());
     }
-    if let Some(limine_efi) = limine_efi {
+    if let Some(limine_efi) = options.limine_efi {
         command.arg("--limine-efi").arg(limine_efi);
+    }
+    if let Some(uefi_loader) = options.uefi_loader {
+        command.arg("--uefi-loader").arg(uefi_loader);
+    }
+    if let Some(limine_tool) = options.limine_tool {
+        command.arg("--limine-tool").arg(limine_tool);
+    }
+    if let Some(key) = options.secure_boot_key {
+        command.arg("--secure-boot-key").arg(key);
+    }
+    if let Some(cert) = options.secure_boot_cert {
+        command.arg("--secure-boot-cert").arg(cert);
     }
     let status = command.status().context("launching native package build")?;
     if !status.success() {
@@ -350,9 +464,16 @@ fn absolute_output(root: &Path, output: Option<&Path>, version: &str) -> PathBuf
     }
 }
 
-fn find_artifact(output: &Path, format: PackageFormat, version: &str) -> Result<PathBuf> {
+fn find_artifact(
+    output: &Path,
+    format: PackageFormat,
+    version: &str,
+    arch: PackageArch,
+) -> Result<PathBuf> {
     let exact = match format {
-        PackageFormat::Deb => Some(output.join(format!("narf-kernel_{version}_amd64.deb"))),
+        PackageFormat::Deb => {
+            Some(output.join(format!("narf-kernel_{version}_{}.deb", arch.deb_name())))
+        }
         _ => None,
     };
     if let Some(path) = exact.filter(|path| path.is_file()) {
@@ -543,6 +664,14 @@ mod tests {
             absolute_output(Path::new("/src/narf"), None, "1.2.3"),
             Path::new("/src/narf/target/release-assets/1.2.3")
         );
+    }
+
+    #[test]
+    fn package_architectures_use_native_names() {
+        assert_eq!(PackageArch::X86_64.as_script_name(), "x86_64");
+        assert_eq!(PackageArch::X86_64.deb_name(), "amd64");
+        assert_eq!(PackageArch::Aarch64.as_script_name(), "aarch64");
+        assert_eq!(PackageArch::Aarch64.deb_name(), "arm64");
     }
 
     #[test]

@@ -29,12 +29,13 @@ cargo xtask disk-write --device /dev/sdX
 That command wipes the selected device. A successful QEMU ISO boot or USB
 write does not prove that NARF supports the target machine. The current
 physical-hardware target is the AMD Renoir/HawkPoint laptop set in
-[STATUS.md](../STATUS.md); Secure Boot and a general installer/upgrade service
-are not finished administration features.
+[STATUS.md](../STATUS.md). Native packages provide upgrades and removal, but
+general disk installation remains a distribution integration task.
 
-## Install beside an existing x86_64 system
+## Install beside an existing system
 
-Native packages install NARF as an additional target. On UEFI they place an
+Native x86_64 and aarch64 packages install NARF as an additional target. On
+UEFI they place an
 isolated loader and kernel under `/EFI/NARF` on the mounted EFI System
 Partition. UEFI GRUB chainloads it, systemd-boot reads the generated BLS entry,
 rEFInd discovers it, and CachyOS Limine is registered when
@@ -55,9 +56,18 @@ sudo narf-uefi install --esp /boot/efi
 
 Use the machine's actual ESP mount point. The command does not change UEFI
 NVRAM or make NARF the default. Keep the distribution kernel as the default
-and recovery target. Secure Boot must remain disabled for NARF until the
-release process provides signed artifacts and a documented enrollment policy.
+and recovery target. If the machine already uses an enrolled `sbctl` policy,
+sign the bound loader and remember that choice for upgrades:
+
+```sh
+sudo narf-uefi install --sign-with-sbctl
+sudo narf-uefi status
+```
+
+The helper never creates or enrolls keys. Distribution package builders can
+instead pass an existing signing key and certificate to the package command.
 See [release packaging](../packaging/README.md) and the
+[Secure Boot guide](SECURE_BOOT.md) before changing firmware keys, and the
 [CachyOS guide](BOOTING_ON_CACHYOS.md) for manager-specific checks.
 
 ## Choose a boot profile

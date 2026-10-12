@@ -87,6 +87,12 @@ production boot and host interoperability postflight.
   and successful off-box TCP, UDP, and DNS traffic through the resulting
   module datapath. Synthetic descriptor injection is not sufficient for this
   gate.
+- Native UEFI package acceptance boots the installed x86_64 layout through
+  OVMF, GRUB, config-bound Limine, and the packaged kernel, and boots the
+  aarch64 layout through AAVMF and NARF's digest-bound loader. Secure Boot
+  acceptance uses an ephemeral enrolled OVMF certificate and a signed loader.
+  Both integrity chains include a negative boot in which one kernel byte is
+  changed and the NARF clean-exit marker must remain unreachable.
 - Each test declares:
   - Required features (e.g. PKS, MTE). Skipped on archs without them
     unless the test is specifically an arch check.

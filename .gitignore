@@ -26,6 +26,9 @@ target/
 !.vscode/extensions.json
 !.vscode/settings.json
 
+# Python bytecode caches
+__pycache__/
+
 # QEMU runtime
 *.qcow2
 serial.log

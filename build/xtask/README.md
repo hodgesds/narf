@@ -114,6 +114,12 @@ Limine EFI app, which loads the canonical kernel and initramfs from that ESP.
 The EFI app must be trusted by the active Secure Boot policy (or Secure Boot
 must be disabled); `grub-image` does not sign it.
 
+The aarch64 image path binds the exact stripped kernel's BLAKE2b-512 digest
+into `BOOTAA64.EFI`. The loader fails closed while that placeholder is unbound
+and verifies the full kernel before parsing any ELF header. Native package
+signing and local `sbctl` policy are documented in
+[`docs/SECURE_BOOT.md`](../../docs/SECURE_BOOT.md).
+
 ## Relationships
 
 `xtask` sits above essentially every other workspace crate: it is how the

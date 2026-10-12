@@ -10401,9 +10401,9 @@ fn build_aarch64_uefi_image(args: &BuildArgs) -> Result<PathBuf> {
     if !status.success() {
         bail!("aarch64 UEFI loader build failed with {status}");
     }
-    let loader = loader_target.join("aarch64-unknown-uefi/release/narf-uefi-loader.efi");
-    if !loader.is_file() {
-        bail!("expected UEFI loader at {}", loader.display());
+    let unbound_loader = loader_target.join("aarch64-unknown-uefi/release/narf-uefi-loader.efi");
+    if !unbound_loader.is_file() {
+        bail!("expected UEFI loader at {}", unbound_loader.display());
     }
 
     // The linked kernel keeps DWARF for crash symbolization, but firmware only
@@ -10437,6 +10437,18 @@ fn build_aarch64_uefi_image(args: &BuildArgs) -> Result<PathBuf> {
             .arg(&kernel)
             .arg(&staged_kernel),
         "stripping aarch64 kernel debug sections for the ESP",
+    )?;
+
+    let payload_dir = root.join("target/narf-uefi-aarch64");
+    std::fs::create_dir_all(&payload_dir)?;
+    let loader = payload_dir.join("narf.efi");
+    run_checked(
+        Command::new("python3")
+            .arg(root.join("packaging/bind-aarch64-uefi.py"))
+            .arg(&unbound_loader)
+            .arg(&staged_kernel)
+            .arg(&loader),
+        "binding the aarch64 kernel digest into the UEFI loader",
     )?;
 
     for tool in ["mformat", "mmd", "mcopy"] {

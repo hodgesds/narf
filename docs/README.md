@@ -10,6 +10,8 @@ Start with the guide that matches the job at hand:
   walkthrough.
 - [Booting from CachyOS](BOOTING_ON_CACHYOS.md) — safe QEMU, USB, and GRUB
   workflows plus the current boundary for booting a CachyOS rootfs.
+- [UEFI Secure Boot](SECURE_BOOT.md) — complete loader-to-kernel trust chains,
+  local `sbctl` signing, distribution signing, and negative boot tests.
 - [Build personalities](PERSONAS.md) — `linux-compat`, container, and cgroup
   feature composition.
 - [Extension guide](extending/README.md) — public traits and registration

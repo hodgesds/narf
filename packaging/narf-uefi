@@ -6,7 +6,7 @@
 set -eu
 
 usage() {
-    echo "usage: narf-uefi install|remove|status [--esp PATH] [--source PATH] [--no-manager-hooks] [--quiet]" >&2
+    echo "usage: narf-uefi install|remove|status [--esp PATH] [--source PATH] [--sign-with-sbctl|--no-sbctl-sign] [--no-manager-hooks] [--quiet]" >&2
     exit 2
 }
 
@@ -19,6 +19,7 @@ source_dir=${NARF_UEFI_SOURCE_DIR:-/usr/lib/narf/uefi}
 state_dir=${NARF_UEFI_STATE_DIR:-/var/lib/narf}
 manager_hooks=1
 quiet=0
+sbctl_sign=auto
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -34,6 +35,14 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-manager-hooks)
             manager_hooks=0
+            shift
+            ;;
+        --sign-with-sbctl)
+            sbctl_sign=yes
+            shift
+            ;;
+        --no-sbctl-sign)
+            sbctl_sign=no
             shift
             ;;
         --quiet)
@@ -58,6 +67,7 @@ warn() {
 }
 
 state_file=$state_dir/esp-path
+sbctl_state_file=$state_dir/sbctl-sign
 
 fat_mount() {
     candidate=$1
@@ -147,6 +157,25 @@ grub_fallback_config=$grub_fallback_dir/limine.conf
 bls_entry=$esp/loader/entries/narf.conf
 config_marker='# Managed by narf-uefi'
 
+payload_arch=x86_64
+loader_kind=limine
+[ ! -f "$source_dir/arch" ] || payload_arch=$(sed -n '1p' "$source_dir/arch")
+[ ! -f "$source_dir/loader-kind" ] || loader_kind=$(sed -n '1p' "$source_dir/loader-kind")
+case "$payload_arch:$loader_kind" in
+    x86_64:limine)
+        pe_machine=6486
+        bls_arch=x64
+        ;;
+    aarch64:narf)
+        pe_machine=64aa
+        bls_arch=aa64
+        ;;
+    *)
+        echo "narf-uefi: unsupported package payload: $payload_arch/$loader_kind" >&2
+        exit 1
+        ;;
+esac
+
 has_other_limine() {
     for efi_candidate in "$esp"/EFI/*/*.efi "$esp"/EFI/*/*.EFI; do
         [ -f "$efi_candidate" ] || continue
@@ -170,26 +199,48 @@ remove_limine_entry() {
 case "$command_name" in
     status)
         missing=0
-        for path in "$loader" "$kernel" "$config" "$bls_entry"; do
+        for path in "$loader" "$kernel" "$bls_entry"; do
             if [ ! -f "$path" ]; then
                 echo "missing: $path"
                 missing=1
             fi
         done
+        if [ "$loader_kind" = limine ] && [ ! -f "$config" ]; then
+            echo "missing: $config"
+            missing=1
+        fi
         if [ "$missing" -ne 0 ]; then
             exit 1
         fi
         version=$(sed -n 's/^version //p' "$bls_entry" 2>/dev/null || true)
         current=1
-        if ! grep -Fqx '    path: boot():/EFI/NARF/narf-frame' "$config" ||
-            ! grep -Fqx 'efi /EFI/NARF/narf.efi' "$bls_entry"; then
+        if ! grep -Fqx 'efi /EFI/NARF/narf.efi' "$bls_entry" ||
+            ! grep -Fqx "architecture $bls_arch" "$bls_entry"; then
             echo "stale: installed UEFI configuration is not the package layout"
+            current=0
+        fi
+        if [ "$loader_kind" = limine ] &&
+            { [ ! -f "$source_dir/limine.conf" ] ||
+                ! cmp -s "$source_dir/limine.conf" "$config"; }; then
+            echo "stale: installed Limine configuration does not match the package"
             current=0
         fi
         if [ -f "$source_dir/version" ]; then
             packaged_version=$(sed -n '1p' "$source_dir/version")
+            loader_matches=0
+            if cmp -s "$source_dir/narf.efi" "$loader"; then
+                loader_matches=1
+            elif [ -f "$sbctl_state_file" ] && command -v sbctl >/dev/null 2>&1; then
+                recorded_loader_hash=$(sed -n '1p' "$sbctl_state_file")
+                installed_loader_hash=$(sha256sum "$loader" | awk '{print $1}')
+                if [ "${#recorded_loader_hash}" -eq 64 ] &&
+                    [ "$recorded_loader_hash" = "$installed_loader_hash" ] &&
+                    sbctl verify "$loader" >/dev/null 2>&1; then
+                    loader_matches=1
+                fi
+            fi
             if [ "$version" != "$packaged_version" ] ||
-                ! cmp -s "$source_dir/narf.efi" "$loader" ||
+                [ "$loader_matches" -ne 1 ] ||
                 ! cmp -s "$source_dir/narf-frame" "$kernel"; then
                 echo "stale: ESP payload does not match packaged NARF $packaged_version"
                 current=0
@@ -199,13 +250,23 @@ case "$command_name" in
         echo "loader: $loader"
         echo "kernel: $kernel"
         echo "version: ${version:-unknown}"
-        if [ -f "$grub_fallback_config" ] &&
-            grep -Fqx "$config_marker" "$grub_fallback_config"; then
-            echo "GRUB fallback: $grub_fallback_config"
-        elif has_other_limine; then
-            echo "GRUB fallback: existing Limine boot policy"
+        echo "architecture: $payload_arch"
+        if [ -f "$sbctl_state_file" ]; then
+            echo "Secure Boot loader: locally signed with sbctl"
+        elif [ "$(sed -n '1p' "$source_dir/secure-boot-signed" 2>/dev/null || true)" = yes ]; then
+            echo "Secure Boot loader: package-signed"
         else
-            warn "GRUB-chainload fallback config is unavailable at $grub_fallback_config"
+            echo "Secure Boot loader: unsigned"
+        fi
+        if [ "$loader_kind" = limine ]; then
+            if [ -f "$grub_fallback_config" ] &&
+                grep -Fqx "$config_marker" "$grub_fallback_config"; then
+                echo "GRUB fallback: $grub_fallback_config"
+            elif has_other_limine; then
+                echo "GRUB fallback: existing Limine boot policy"
+            else
+                warn "GRUB-chainload fallback config is unavailable at $grub_fallback_config"
+            fi
         fi
         [ "$current" -eq 1 ] || exit 1
         exit 0
@@ -223,6 +284,7 @@ case "$command_name" in
             rmdir "$grub_fallback_dir" 2>/dev/null || true
         fi
         rm -f "$state_file"
+        rm -f "$sbctl_state_file"
         rmdir "$state_dir" 2>/dev/null || true
         say "removed NARF UEFI payload from $esp"
         exit 0
@@ -232,12 +294,76 @@ esac
 source_loader=$source_dir/narf.efi
 source_kernel=$source_dir/narf-frame
 source_version=$source_dir/version
-for path in "$source_loader" "$source_kernel" "$source_version"; do
+source_config=$source_dir/limine.conf
+source_kernel_hash=$source_dir/kernel.blake2b
+source_signed=$source_dir/secure-boot-signed
+for path in "$source_loader" "$source_kernel" "$source_version" "$source_kernel_hash" "$source_signed"; do
     [ -f "$path" ] || {
         echo "narf-uefi: package payload is missing: $path" >&2
         exit 1
     }
 done
+if [ "$loader_kind" = limine ] && [ ! -f "$source_config" ]; then
+    echo "narf-uefi: package payload is missing: $source_config" >&2
+    exit 1
+fi
+
+kernel_hash=$(sed -n '1p' "$source_kernel_hash")
+case "$kernel_hash" in
+    *[!0-9a-f]*|'')
+        echo "narf-uefi: invalid packaged kernel digest" >&2
+        exit 1
+        ;;
+esac
+[ "${#kernel_hash}" -eq 128 ] || {
+    echo "narf-uefi: invalid packaged kernel digest length" >&2
+    exit 1
+}
+actual_kernel_hash=$(b2sum -l 512 "$source_kernel" | awk '{print $1}')
+[ "$actual_kernel_hash" = "$kernel_hash" ] || {
+    echo "narf-uefi: packaged kernel does not match its BLAKE2b digest" >&2
+    exit 1
+}
+if [ "$loader_kind" = limine ] &&
+    ! grep -Fqx "    path: boot():/EFI/NARF/narf-frame#$kernel_hash" "$source_config"; then
+    echo "narf-uefi: Limine configuration is not bound to the packaged kernel" >&2
+    exit 1
+fi
+
+case "$(sed -n '1p' "$source_signed")" in
+    yes) package_signed=1 ;;
+    no) package_signed=0 ;;
+    *)
+        echo "narf-uefi: invalid Secure Boot signing metadata" >&2
+        exit 1
+        ;;
+esac
+
+if [ "$sbctl_sign" = auto ]; then
+    if [ -f "$sbctl_state_file" ]; then
+        sbctl_sign=yes
+    else
+        sbctl_sign=no
+    fi
+fi
+if [ "$sbctl_sign" = yes ] && ! command -v sbctl >/dev/null 2>&1; then
+    echo "narf-uefi: --sign-with-sbctl requested but sbctl is unavailable" >&2
+    exit 1
+fi
+
+secure_boot_enabled=0
+for secure_boot_var in /sys/firmware/efi/efivars/SecureBoot-*; do
+    [ -f "$secure_boot_var" ] || continue
+    secure_boot_value=$(od -An -tu1 -j4 -N1 "$secure_boot_var" 2>/dev/null | tr -d ' \n')
+    [ "$secure_boot_value" = 1 ] && secure_boot_enabled=1
+    break
+done
+if [ "$secure_boot_enabled" -eq 1 ] && [ "$package_signed" -ne 1 ] &&
+    [ "$sbctl_sign" != yes ]; then
+    echo "narf-uefi: Secure Boot is enabled but the package loader is unsigned" >&2
+    echo "narf-uefi: rerun with --sign-with-sbctl or install a package signed by an enrolled key" >&2
+    exit 1
+fi
 
 magic=$(dd if="$source_loader" bs=2 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
 pe_offset=$(od -An -tu4 -j60 -N4 "$source_loader" | tr -d ' \n')
@@ -252,8 +378,8 @@ case "$pe_offset" in
         fi
         ;;
 esac
-[ "$magic" = 4d5a ] && [ "$pe_header" = 504500006486 ] || {
-    echo "narf-uefi: $source_loader is not an x86_64 PE/COFF EFI executable" >&2
+[ "$magic" = 4d5a ] && [ "$pe_header" = "50450000$pe_machine" ] || {
+    echo "narf-uefi: $source_loader is not a $payload_arch PE/COFF EFI executable" >&2
     exit 1
 }
 
@@ -267,64 +393,82 @@ esac
 
 umask 022
 mkdir -p "$efi_dir" "$esp/loader/entries" "$state_dir"
-manage_grub_fallback=1
-if [ -f "$grub_fallback_config" ] &&
-    ! grep -Fqx "$config_marker" "$grub_fallback_config"; then
-    manage_grub_fallback=0
-    warn "$grub_fallback_config is managed by another installation; UEFI GRUB must use that Limine configuration"
-elif has_other_limine; then
-    manage_grub_fallback=0
-    warn "an existing Limine EFI application owns boot policy; not replacing it with NARF's GRUB fallback config"
-else
-    mkdir -p "$grub_fallback_dir"
+manage_grub_fallback=0
+if [ "$loader_kind" = limine ]; then
+    manage_grub_fallback=1
+    if [ -f "$grub_fallback_config" ] &&
+        ! grep -Fqx "$config_marker" "$grub_fallback_config"; then
+        manage_grub_fallback=0
+        warn "$grub_fallback_config is managed by another installation; UEFI GRUB must use that Limine configuration"
+    elif has_other_limine; then
+        manage_grub_fallback=0
+        warn "an existing Limine EFI application owns boot policy; not replacing it with NARF's GRUB fallback config"
+    else
+        mkdir -p "$grub_fallback_dir"
+    fi
 fi
 tmp_loader=$efi_dir/.narf.efi.$$
 tmp_kernel=$efi_dir/.narf-frame.$$
 tmp_config=$efi_dir/.limine.conf.$$
 tmp_grub_fallback=
+tmp_signed_loader=
 if [ "$manage_grub_fallback" -eq 1 ]; then
     tmp_grub_fallback=$grub_fallback_dir/.limine.conf.$$
 fi
 tmp_bls=$esp/loader/entries/.narf.conf.$$
-trap 'rm -f "$tmp_loader" "$tmp_kernel" "$tmp_config" ${tmp_grub_fallback:+"$tmp_grub_fallback"} "$tmp_bls"' EXIT HUP INT TERM
+trap 'rm -f "$tmp_loader" "$tmp_kernel" "$tmp_config" ${tmp_grub_fallback:+"$tmp_grub_fallback"} ${tmp_signed_loader:+"$tmp_signed_loader"} "$tmp_bls"' EXIT HUP INT TERM
 
 install -m 0644 "$source_loader" "$tmp_loader"
 install -m 0644 "$source_kernel" "$tmp_kernel"
-cat >"$tmp_config" <<EOF
-$config_marker
-timeout: 5
-serial: yes
-verbose: yes
-quiet: no
-default_entry: 1
-
-/NARF $version
-    protocol: multiboot2
-    path: boot():/EFI/NARF/narf-frame
-EOF
-if [ "$manage_grub_fallback" -eq 1 ]; then
-    install -m 0644 "$tmp_config" "$tmp_grub_fallback"
+if [ "$sbctl_sign" = yes ]; then
+    tmp_signed_loader=$efi_dir/.narf.efi.signed.$$
+    if ! sbctl sign --output "$tmp_signed_loader" "$tmp_loader"; then
+        rm -f "$tmp_signed_loader"
+        echo "narf-uefi: sbctl could not sign the NARF EFI loader" >&2
+        exit 1
+    fi
+    if ! sbctl verify "$tmp_signed_loader" >/dev/null 2>&1; then
+        rm -f "$tmp_signed_loader"
+        echo "narf-uefi: sbctl could not verify the signed NARF EFI loader" >&2
+        exit 1
+    fi
+    mv -f "$tmp_signed_loader" "$tmp_loader"
+fi
+if [ "$loader_kind" = limine ]; then
+    install -m 0644 "$source_config" "$tmp_config"
+    if [ "$manage_grub_fallback" -eq 1 ]; then
+        install -m 0644 "$tmp_config" "$tmp_grub_fallback"
+    fi
 fi
 cat >"$tmp_bls" <<EOF
 title NARF
 version $version
 sort-key narf
-architecture x64
+architecture $bls_arch
 efi /EFI/NARF/narf.efi
 EOF
-chmod 0644 "$tmp_config" "$tmp_bls"
+chmod 0644 "$tmp_bls"
 
 # Publish the kernel and its config before the discoverable EFI/BLS entry
 # points. A power loss can leave harmless dot-temporaries, but no new entry
 # points at an absent kernel.
 mv -f "$tmp_kernel" "$kernel"
-mv -f "$tmp_config" "$config"
+if [ "$loader_kind" = limine ]; then
+    mv -f "$tmp_config" "$config"
+else
+    rm -f "$config"
+fi
 if [ "$manage_grub_fallback" -eq 1 ]; then
     mv -f "$tmp_grub_fallback" "$grub_fallback_config"
 fi
 mv -f "$tmp_loader" "$loader"
 mv -f "$tmp_bls" "$bls_entry"
 printf '%s\n' "$esp" >"$state_file"
+if [ "$sbctl_sign" = yes ]; then
+    sha256sum "$loader" | awk '{print $1}' >"$sbctl_state_file"
+else
+    rm -f "$sbctl_state_file"
+fi
 
 if [ "$manager_hooks" -eq 1 ] && command -v limine-entry-tool >/dev/null 2>&1 && [ -f /boot/limine.conf ]; then
     if ! limine-entry-tool --add-efi "NARF" "$loader" \
@@ -334,6 +478,11 @@ if [ "$manager_hooks" -eq 1 ] && command -v limine-entry-tool >/dev/null 2>&1 &&
 fi
 
 say "installed NARF $version UEFI payload on $esp"
+if [ "$sbctl_sign" = yes ]; then
+    say "Secure Boot: loader signed with the configured sbctl database key"
+elif [ "$package_signed" -eq 1 ]; then
+    say "Secure Boot: installed the package-signed loader"
+fi
 say "systemd-boot: $bls_entry"
 say "rEFInd: auto-discovers $loader"
 say "GRUB: regenerate grub.cfg so 42_narf can chainload $loader"

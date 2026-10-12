@@ -20,6 +20,10 @@ sudo apt-get install qemu-system-x86 qemu-system-arm qemu-efi-aarch64 \
   musl-tools clang lld linux-libc-dev
 ```
 
+The native-package Secure Boot gate additionally needs `sbsigntool`, OpenSSL,
+and `python3-virt-firmware`. It uses only ephemeral CI keys. Production signing
+keys must never be put in this checkout or a test fixture.
+
 Not every package is needed for a kernel-only build. The detailed purpose of
 each dependency is in [Running on Linux](RUNNING_ON_LINUX.md#1-prerequisites).
 
