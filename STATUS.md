@@ -345,8 +345,15 @@ firmware clears backend enable and clock-on witnesses, then clears training and
 panel state. Invalid routes, active packet/FEC work and independent HPO/FRL links
 reject before commands. Failure/cancellation retain display and transport
 ownership and block reuse; backend clocks independently block clock programming.
-This proves digital backend-off, not analog PHY power gating. HDMI, HPO, eDP,
-sink/MST/audio teardown and USB-C/ACPI PHY interlocks still need their sequences.
+This proves digital backend-off, not analog PHY power gating. Native HPO digital
+link retirement now resolves the board PHY mux, independent stream mappings and
+root-clock source, requires all mapped streams stopped, drains all six timeslot
+rows with ACT and waits for DPHY and link-clock shutdown acknowledgements.
+Ambiguous routes, active work and unsupported modes reject before writes;
+partial failures and cancellation quarantine the owner. PHY output and root
+clocks remain retained for firmware shutdown, and root clocks independently
+block global/pipe clock changes. HDMI, HPO PHY shutdown, eDP, sink/MST/audio
+teardown and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths
 have model tests, not silicon validation.

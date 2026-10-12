@@ -12,7 +12,7 @@ const MESSAGE: u32 = 0x8a; // MP1 C2PMSG74, base index 1
 const ARGUMENT: u32 = 0x73; // C2PMSG51
 const RESPONSE: u32 = 0x74; // C2PMSG52
 const LEVEL_COUNT: usize = 8;
-pub(crate) const IDLE_REG_COUNT: usize = 55;
+pub(crate) const IDLE_REG_COUNT: usize = 64;
 pub(crate) fn backend_clock_mask(instance: u8) -> u32 {
     // Only DIG0 exposes the HDCP clock-on witness in DCN4.1.0.
     0x2810 | if instance == 0 { 0x1000 } else { 0 }
@@ -124,6 +124,7 @@ pub struct Status {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Layout {
     mp1: u64,
+    dccg: u64,
     dio: u64,
     hpo: u64,
 }
@@ -142,11 +143,16 @@ impl Layout {
         }
         Ok(Self {
             mp1,
-            dio: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 2, 0x391b)
+            dccg: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 1, 0x66)
+                .map_err(|_| Error::Unsupported)?,
+            dio: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 2, 0x3931)
                 .map_err(|_| Error::Unsupported)?,
             hpo: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 3, 0x8df)
                 .map_err(|_| Error::Unsupported)?,
         })
+    }
+    pub(crate) fn hpo_link_clock(self) -> u64 {
+        self.dccg + 0x66 * 4
     }
     pub(crate) fn idle_registers(self) -> [(u64, u32); IDLE_REG_COUNT] {
         let mut regs = [(0, 0); IDLE_REG_COUNT];
@@ -158,24 +164,27 @@ impl Layout {
                 (0x2122, 0x124, 0x10001), // DP stream enable/status
                 (0x3685, 0xd4, 0x101),    // HPO DP video enable/status
                 (0x367b, 0xd4, 1),        // HPO DP SDP enable
-                (0x369f, 0xd4, 1),        // HPO DP link clock: no live training
+                (0x369f, 0xd4, 0x11),     // HPO DP link clock request/ON
                 (0x2094, 0x124, 0xc10),   // DIO frontend clock request/ON
                 (0x2095, 0x124, 1),       // DIO frontend enabled
                 (0x209b, 0x124, 1),       // DIO pixel FIFO enabled
                 (0x3623, 0xd4, 0x11111),  // HPO stream clock request/ON
                 (0x365d, 0xd4, 1),        // HPO SYM32 encoder enabled
                 (0x20bb, 0x124, backend_clock_mask(i as u8)), // backend clocks
+                (0x36b4, 0xd4, 3),        // HPO DPHY enable/reset
+                (0x36b5, 0xd4, 0x1f1003), // HPO DPHY status and pending transactions
             ]
             .into_iter()
             .enumerate()
             {
-                regs[i * 13 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
+                regs[i * 15 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
             }
         }
         // The single FRL stream lives in DCN bank 3, unlike HPO DP's bank 2.
         for (i, reg) in [0x8d3, 0x8d6, 0x8df].into_iter().enumerate() {
-            regs[52 + i] = (self.hpo + reg * 4, 1);
+            regs[60 + i] = (self.hpo + reg * 4, 1);
         }
+        regs[63] = (self.hpo_link_clock(), 0x8888);
         regs
     }
 }

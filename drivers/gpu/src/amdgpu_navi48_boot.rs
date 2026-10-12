@@ -959,6 +959,32 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Drain native HPO timeslots and retire the board-routed digital link.
+    /// # Safety
+    /// Retire sink/MST bookkeeping, audio/metadata/HDCP producers and associated
+    /// streams. Exclude CPU/firmware/FAMS and concurrent display/link/clock/power
+    /// writers; retain all memory/translations. PHY output and clocks stay owned.
+    pub async unsafe fn retire_display_hpo_link(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::HpoLinkRetired, otg::Error> {
+        if self.display_retirement_busy() || self.display_state() != Ok(display::State::Ready) {
+            return Err(otg::Error::Busy);
+        }
+        let path = *self
+            .display_paths()
+            .map_err(|_| otg::Error::Invalid)?
+            .get(port)
+            .ok_or(otg::Error::Invalid)?;
+        // SAFETY: retained validated board route; caller excludes producers and retains memory.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .retire_hpo_link(path)
+                .await
+        }
+    }
     fn display_retirement_busy(&self) -> bool {
         self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)

@@ -86,6 +86,7 @@ fn engine() -> Engine<Fake> {
         authority: Cap::bootstrap(),
         layout: Layout {
             mp1: MP1,
+            dccg: 0x20000,
             dio: DIO,
             hpo: HPO,
         },
@@ -233,18 +234,21 @@ fn dcn401_all_legacy_hpo_and_frl_consumers_block_power_and_clock_writes() -> Tes
             (0x2122, 0x124, 0x10001),
             (0x3685, 0xd4, 0x101),
             (0x367b, 0xd4, 1),
-            (0x369f, 0xd4, 1),
+            (0x369f, 0xd4, 0x11),
             (0x2094, 0x124, 0xc10),
             (0x2095, 0x124, 1),
             (0x209b, 0x124, 1),
             (0x3623, 0xd4, 0x11111),
             (0x365d, 0xd4, 1),
             (0x20bb, 0x124, if i == 0 { 0x3810 } else { 0x2810 }),
+            (0x36b4, 0xd4, 3),
+            (0x36b5, 0xd4, 0x1f1003),
         ] {
             golden.push((0x10000 + (reg + i * stride) * 4, mask));
         }
     }
     golden.extend([(0x3234c, 1), (0x32358, 1), (0x3237c, 1)]);
+    golden.push((0x20198, 0x8888));
     assert_eq!(engine().layout.idle_registers().as_slice(), golden);
     for (at, mask) in golden {
         for value in core::iter::once(u32::MAX)

@@ -155,9 +155,12 @@ impl Io for Fake {
                     ]
                     .iter()
                     .any(|r| at == BASE + (r + p * 0x124) * 4)
-                        || [0x3623, 0x3626, 0x365d, 0x365e, 0x367b, 0x3685]
-                            .iter()
-                            .any(|r| at == BASE + (r + p * 0xd4) * 4)
+                        || [
+                            0x3623, 0x3626, 0x365d, 0x365e, 0x367b, 0x3685, 0x369f, 0x36b4, 0x36b8,
+                            0x36bf, 0x36c0, 0x36c1, 0x36c2, 0x36c3, 0x36c4,
+                        ]
+                        .iter()
+                        .any(|r| at == BASE + (r + p * 0xd4) * 4)
                 })
         );
         self.writes.push((at, value));
@@ -315,6 +318,7 @@ fn engine() -> Engine<Fake> {
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,
+            hpo_link_retired: None,
             retired: 0,
         },
     }
@@ -1034,5 +1038,7 @@ mod stream;
 
 #[path = "amdgpu_dcn401_encoder_tests.rs"]
 mod encoder;
+#[path = "amdgpu_dcn401_hpo_link_tests.rs"]
+mod hpo_link;
 #[path = "amdgpu_dcn401_link_tests.rs"]
 mod link;

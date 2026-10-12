@@ -566,6 +566,38 @@ The mailbox independently quarantines incomplete transport. Global/pipe clock
 guards also reject requested or acknowledged backend clocks even if the backend
 enable bit is already clear. No outcome permits allocation reuse.
 
+`unsafe ColdBoot::retire_display_hpo_link(port: usize).await` and its platform
+wrapper retire one external DP HPO digital link before the separate firmware
+PHY shutdown. The port selects the retained validated board inventory. Native
+PHY mux, independent stream-to-link mapper and PHY-derived root clock fields
+must agree; neither the connector index nor its OTG implies a link instance.
+Shared PHY routes, training/test modes, eDP, incomplete resets, rate/allocation
+updates and mismatched shadow/live allocation rows reject before writes.
+Every mapped stream must have completed video, SDP, FIFO, SYM32 and stream-clock
+retirement. Unrelated active streams remain untouched. Callers independently
+retire sink/MST bookkeeping and audio/metadata/HDCP producers, exclude CPU,
+firmware/FAMS and concurrent display/link/clock/power/reset writers, and retain
+all allocations and translations. The same drained GC12/SDMA guards apply.
+
+The owner clears all six native allocation rows and sends ACT when slots are
+allocated, then requires empty live rows and no pending update within 20 ms.
+The self-clearing ACT request is not a completion witness. Only after drain may
+DPHY disable be requested; enable, reset, scheduler and pending-transaction
+status must clear within 100 ms before link-clock disable. Requested and
+acknowledged link clocks must then clear within 1 ms. Route and stream state
+are rechecked across transitions. An already stopped, empty link receives no
+writes. PHY muxes, stream mapping, PHY output and root clocks remain retained
+for the subsequent firmware PHY shutdown. Global and pipe clock changes reject
+enabled PHY-derived HPO root clocks and outstanding DPHY activity independently
+of the digital link-clock enable bit.
+
+Success enters `HpoLinkRetired`, recording `HpoLinkRetired::{path,link,streams,
+removed_slots}` in `Status::hpo_link_retired`. This is historical digital-link
+evidence only; it proves no PHY, sink, timing, plane or memory retirement.
+Errors after beginning the operation enter `Failed`; cancellation retains
+`RetiringHpoLink(link)`. Both block display/clock reuse and raw mailbox/scanner
+access until independent reset. No outcome permits allocation reuse.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

@@ -21,6 +21,9 @@ pub use stream::{DpBlanked, DpEncoderRetired, DpStream};
 #[path = "amdgpu_dcn401_link.rs"]
 mod link;
 pub use link::DpSstDisabled;
+#[path = "amdgpu_dcn401_hpo_link.rs"]
+mod hpo_link;
+pub use hpo_link::HpoLinkRetired;
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -75,6 +78,8 @@ pub enum State {
     DpEncoderRetired,
     DisablingDpSst(u8),
     DpSstDisabled,
+    RetiringHpoLink(u8),
+    HpoLinkRetired,
     RetiringPlanes,
     PlanesRetired,
     Retiring(u8),
@@ -93,6 +98,7 @@ impl State {
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
+                | Self::HpoLinkRetired
         )
     }
 }
@@ -157,6 +163,8 @@ pub struct Status {
     /// Historical legacy DP firmware-disable/backend-off evidence only.
     /// Does not prove analog PHY power gating, sink or memory retirement.
     pub dp_sst_disabled: Option<DpSstDisabled>,
+    /// Historical HPO digital-link stop only; PHY and its root clock remain owned.
+    pub hpo_link_retired: Option<HpoLinkRetired>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -268,6 +276,7 @@ impl Request {
 struct Layout {
     base: u64,
     mpc_base: u64,
+    link_clock: u64,
     idle: [(u64, u32); clocks::IDLE_REG_COUNT],
 }
 impl Layout {
@@ -278,17 +287,18 @@ impl Layout {
             ip::HW_ID_DCN,
             &[(4, 0, 1), (4, 1, 0)],
             2,
-            0x3931, // includes all four native HPO DPHY status registers
+            0x3947, // includes all six native SAT status rows on HPO link 3
         )
         .map_err(|_| Error::Unsupported)?;
         Ok(Self {
             base,
+            link_clock: display.hpo_link_clock(),
             mpc_base: crate::amdgpu_psp_ring::bank(
                 gpu,
                 ip::HW_ID_DCN,
                 &[(4, 0, 1), (4, 1, 0)],
                 3,
-                0x2fe,
+                0xe59, // MPC and four independent HPO stream-to-link mappers
             )
             .map_err(|_| Error::Unsupported)?,
             idle: display.idle_registers(),
@@ -497,6 +507,7 @@ impl Otg {
                 dp_blanked: None,
                 dp_encoder_retired: None,
                 dp_sst_disabled: None,
+                hpo_link_retired: None,
                 retired: 0,
             },
         }))
