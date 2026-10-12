@@ -59,6 +59,26 @@ pub struct Mode {
     pub bpp: u8,
 }
 
+/// Build the initial DRM view of VirtIO-GPU's boot scanout.
+///
+/// This is deliberately separate from the transport's boot resource: the
+/// latter has been attached to scanout so early console output is visible,
+/// but it has no corresponding DRM framebuffer object in this card.  The
+/// compositor must therefore own the first KMS modeset and primary plane.
+fn virtio_boot_crtc(mode: Mode) -> drm::card::Crtc {
+    drm::card::Crtc {
+        id: 1,
+        mode: Some(mode),
+        // The transport resource is not present in this card's framebuffer
+        // namespace, so reporting this CRTC active would claim a primary
+        // plane that does not exist.  The first DRM client installs both.
+        enabled: false,
+        primary_fb: None,
+        x: 0,
+        y: 0,
+    }
+}
+
 impl Mode {
     /// A common default for tests — 1920×1080 at 60 Hz, 32 bpp.
     pub const FHD_60: Mode = Mode {
@@ -312,7 +332,7 @@ pub fn register_initcalls() {
                 return InitResult::Error("virtio-gpu scanout initialisation failed");
             }
             use drm::card::{
-                Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType,
+                Card, Connector, ConnectorStatus, ConnectorType, Encoder, EncoderType,
             };
             let mode = virtio.mode();
             if mode.width == 0 || mode.height == 0 {
@@ -328,19 +348,12 @@ pub fn register_initcalls() {
             // "not a virtio_gpu it understands" and drop to llvmpipe instead of
             // taking the classic-VirGL path.
             let mut kms = Card::new("virtio_gpu", "NARF VirtIO GPU driver", (0, 1, 0));
-            kms.crtcs.push(Crtc {
-                id: 1,
-                mode: Some(Mode {
-                    width: mode.width,
-                    height: mode.height,
-                    refresh_hz: 60,
-                    bpp: 32,
-                }),
-                enabled: mode.enabled,
-                primary_fb: None,
-                x: 0,
-                y: 0,
-            });
+            kms.crtcs.push(virtio_boot_crtc(Mode {
+                width: mode.width,
+                height: mode.height,
+                refresh_hz: 60,
+                bpp: 32,
+            }));
             kms.encoders.push(Encoder {
                 id: 2,
                 encoder_type: EncoderType::Virtual,

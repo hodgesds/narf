@@ -1212,6 +1212,13 @@ The Phase-B VirtIO-GPU render path is layered over the existing DRM primary
 and render nodes. It is deliberately small but wire-compatible with Mesa's
 virtgpu userspace ABI:
 
+The early-console 2D resource is a transport-owned boot scanout, not a DRM
+framebuffer in the card's GEM namespace. Programming that resource keeps the
+console visible but does not expose an active DRM CRTC or primary plane. The
+first DRM client owns the initial modeset and installs the first primary
+framebuffer; advertising the CRTC active before then would describe a zero
+`FB_ID` as live to a compositor.
+
 - Render-node inbound: `GETPARAM`, `CONTEXT_INIT`, `RESOURCE_CREATE`,
   `RESOURCE_INFO`, `TRANSFER_{TO,FROM}_HOST`, bounded `EXECBUFFER`, and
   `GEM_CLOSE`. Handles are per-open, context creation is lazy, and opaque

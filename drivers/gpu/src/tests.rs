@@ -38,6 +38,25 @@ fn smoke_drivers_gpu_mode_and_family() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_drivers_gpu_mode_and_family);
 
+/// The transport-owned VirtIO boot resource is not a KMS framebuffer.  Do not
+/// advertise its CRTC as active until a DRM client installs a primary plane;
+/// otherwise a compositor takes a page-flip path whose advertised old FB is
+/// zero.
+fn smoke_virtio_boot_scanout_starts_with_inactive_crtc() -> TestResult {
+    let crtc = crate::virtio_boot_crtc(crate::Mode::XGA_60);
+    if crtc.enabled {
+        return TestResult::Fail("VirtIO boot CRTC advertised active without a DRM framebuffer");
+    }
+    if crtc.primary_fb.is_some() {
+        return TestResult::Fail("VirtIO boot CRTC unexpectedly owns a DRM framebuffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu",
+    smoke_virtio_boot_scanout_starts_with_inactive_crtc
+);
+
 /// A render-node GEM handle owns its coherent DMA backing only while it is in
 /// that open file's resource table (or while an in-flight operation holds an
 /// Arc). Removing the handle must drop the final owner and return the pages;
