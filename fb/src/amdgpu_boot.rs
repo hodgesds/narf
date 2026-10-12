@@ -89,11 +89,42 @@ pub(super) fn start() -> InitResult {
         "amdgpu: {generation} framebuffer {}",
         if paused() { "quarantined" } else { "available" }
     );
+    if ok && navi48 && narf_boot::args().has_flag("amdgpu.native_display") {
+        native_display();
+    }
     if ok {
         InitResult::Ok
     } else {
         InitResult::Error("AMD PCIe firmware startup (owner retained)")
     }
+}
+
+/// Opt-in (`amdgpu.native_display`) native Navi48 scanout: retire the GOP's
+/// DP SST output and light the first answering DP sink natively. Off by
+/// default until a board has validated the path. On success the published
+/// scanout moves the console through the external-scanout observer; on
+/// failure the owner stays where it stopped and the boot console remains on
+/// the GOP framebuffer, which stays excluded from GPU allocations.
+fn native_display() {
+    use core::fmt::Write;
+    // SAFETY: final synchronous boot initcall, before executor/user startup.
+    // Only the boot console writes the GOP framebuffer, whose memory the
+    // owner never allocates; retirement stops its scanout role only.
+    let retired = narf_scheduler::block_on_spin(unsafe { navi48::retire_inherited_display() });
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi48 inherited display {retired:?}"
+    );
+    if retired.is_err() {
+        return;
+    }
+    // SAFETY: as above; the inherited consumers are now retired.
+    let modeset =
+        narf_scheduler::block_on_spin(unsafe { navi48::modeset_display(0, |_, row| row.fill(0)) });
+    let _ = writeln!(
+        narf_console::Writer,
+        "amdgpu: navi48 native modeset {modeset:?}"
+    );
 }
 
 fn refused(generation: &str, error: impl core::fmt::Debug) {

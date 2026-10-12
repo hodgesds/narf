@@ -794,6 +794,10 @@ impl ColdBoot {
             .map_err(|e| *e)?
             .route_stream(clocks, route)
     }
+    /// Read-only: pipes whose timing generator runs, by bit.
+    pub fn display_running_timing(&mut self) -> Result<u8, otg::Error> {
+        self.otg.as_mut().map_err(|e| *e)?.running_timing()
+    }
     pub fn display_timing_status(&self) -> Result<otg::Status, otg::Error> {
         self.otg.as_ref().map(otg::Otg::status).map_err(|e| *e)
     }
@@ -1781,7 +1785,7 @@ impl ColdBoot {
 
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
-pub use modeset::{Modeset, ModesetError, Selection};
+pub use modeset::{InheritedRetired, Modeset, ModesetError, Selection};
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_boot_tests.rs"]
 mod tests;

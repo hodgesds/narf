@@ -407,6 +407,9 @@ published, non-blocking hook. Stop withdraws it before any teardown.
 Live pipes can now flip between two owned buffers: the back address is
 written under the OTG lock and the flip completes only when EARLIEST_INUSE
 reports it, after which every retained report moves to the new front.
+`amdgpu.native_display` opts the boot handoff into retiring the GOP's DP SST
+output and running the native modeset; it is off by default because no board
+has validated it.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

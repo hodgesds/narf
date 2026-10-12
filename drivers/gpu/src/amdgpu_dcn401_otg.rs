@@ -674,6 +674,15 @@ impl<I: Io> Engine<I> {
         self.wait(l.otg(pipe, CONTROL), 0x10001, 0, 150_000).await?;
         self.wait(l.otg(pipe, CLOCK), 0x10000, 0, 150_000).await
     }
+    fn running_timing(&mut self) -> Result<u8, Error> {
+        let mut running = 0;
+        for p in 0..4 {
+            if self.read(self.layout.otg(p, CONTROL))? & 0x10001 != 0 {
+                running |= 1 << p;
+            }
+        }
+        Ok(running)
+    }
     async fn retire(&mut self, pipe: u8) -> Result<(), Error> {
         self.preflight(pipe, true)?;
         self.status.state = State::Retiring(pipe);
@@ -789,6 +798,10 @@ impl Otg {
     /// fetch retirement and must never authorize freeing/reusing those resources.
     pub async unsafe fn retire(&mut self, pipe: u8) -> Result<(), Error> {
         self.0.retire(pipe).await
+    }
+    /// Read-only: pipes whose OTG master enable or its status is set, by bit.
+    pub fn running_timing(&mut self) -> Result<u8, Error> {
+        self.0.running_timing()
     }
 }
 #[cfg(feature = "kernel-test")]

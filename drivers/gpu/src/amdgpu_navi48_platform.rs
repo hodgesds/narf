@@ -540,6 +540,19 @@ fn flush_scanout() {
     }
 }
 
+/// Retire the legacy DP SST output the firmware left running.
+/// # Safety
+/// Stop CPU writers of the inherited scanout role and exclude firmware/FAMS
+/// and concurrent display/audio/link/clock/power writers.
+pub async unsafe fn retire_inherited_display(
+) -> Result<crate::amdgpu_navi48_boot::InheritedRetired, crate::amdgpu_navi48_boot::ModesetError> {
+    use crate::amdgpu_navi48_boot::{Error as BootError, ModesetError};
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.retire_inherited_display().await }
+}
+
 /// Light the first answering DP SST sink at its preferred mode on `pipe`,
 /// filling each visible row with `fill(y, row)` before fetch starts, then
 /// publish the live surface as the active external scanout.

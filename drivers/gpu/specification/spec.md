@@ -876,6 +876,23 @@ unknown. The platform `flip_display` moves a console that had adopted the old
 front onto the new one. There is no flip interrupt or event queue yet:
 completion is polled.
 
+`unsafe ColdBoot::retire_inherited_display` retires the legacy DP SST output
+the firmware left running. It runs in native dependency order:
+1. Blank every DIO stream (a no-op when already blank).
+2. Disable each board-routed DP backend with a single routed frontend. A port
+   without one is refused in planning before any write, and is skipped only if
+   the owner stays reusable.
+3. Require every active stream to have been found behind a backend, then
+   retire those encoders.
+4. Retire planes and every timing generator still running (`running_timing`,
+   read-only). Idle or soft-reset OTGs are left alone.
+
+HDMI, HPO and MST output are not retired by it; their live state makes it
+fail. The fb boot handoff runs it, followed by `modeset_display(0, black)`,
+only with the `amdgpu.native_display` kernel flag. If the modeset then
+fails, the GOP no longer scans out and the screen stays dark until a later
+modeset; the console's GOP framebuffer remains valid, excluded memory.
+
 `tests/dcn401_scanout.c` checks the native registers, including the MPC block's
 DCN bank 3. Physical presentation on the sink remains unverified.
 

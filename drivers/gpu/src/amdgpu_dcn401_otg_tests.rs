@@ -1170,3 +1170,19 @@ kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_admission_inputs_read_live_dchub_timer_and_capped_levels
 );
+
+fn dcn401_running_timing_reports_enable_or_status() -> TestResult {
+    let mut e = engine();
+    let l = e.layout;
+    e.io.regs.insert(l.otg(1, CONTROL), 1);
+    e.io.regs.insert(l.otg(3, CONTROL), 0x10000); // disabling, not yet off
+    e.io.regs.insert(l.otg(2, CONTROL), 0x100); // other fields only
+    if e.running_timing() != Ok(0b1010) {
+        return TestResult::Fail("running timing mask");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_running_timing_reports_enable_or_status
+);

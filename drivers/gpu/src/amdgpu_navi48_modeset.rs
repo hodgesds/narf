@@ -138,7 +138,98 @@ pub fn timing_request(pipe: u8, plan: &dml::Plan) -> otg::Request {
     }
 }
 
+/// What retiring the inherited (GOP) display found and stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InheritedRetired {
+    /// DIO streams whose video was active on entry.
+    pub active_streams: u8,
+    /// Timing generators found running after the streams were disabled.
+    pub running_timing: u8,
+    /// DIO frontends found routed to a DP SST backend, by bit.
+    pub routed_frontends: u8,
+    /// `display_paths()` indices whose transmitter firmware disable was sent.
+    pub disabled_ports: u8,
+}
+
 impl ColdBoot {
+    /// Retire whatever legacy DP SST output the firmware left running, in
+    /// native dependency order: blank every DIO stream (a no-op when already
+    /// blank), disable each board-routed DP backend that has a frontend
+    /// routed to it, retire those encoders, then the planes and all timing.
+    /// A port with no routed frontend is refused during planning, before any
+    /// write, and skipped; any other failure stops here and quarantines.
+    /// # Safety
+    /// Stop every CPU writer of the inherited framebuffer's scanout role (its
+    /// memory stays excluded from the pool), and exclude firmware/FAMS and
+    /// concurrent display/audio/link/clock/power writers. HDMI, HPO and MST
+    /// output are not retired here; their live state makes this fail.
+    pub async unsafe fn retire_inherited_display(
+        &mut self,
+    ) -> Result<InheritedRetired, ModesetError> {
+        let mut found = InheritedRetired {
+            active_streams: 0,
+            running_timing: 0,
+            routed_frontends: 0,
+            disabled_ports: 0,
+        };
+        // SAFETY: as documented; every step validates its own preconditions.
+        unsafe {
+            for i in 0..4 {
+                if self
+                    .blank_display_dp_stream(otg::DpStream::Dio(i))
+                    .await?
+                    .was_active
+                {
+                    found.active_streams |= 1 << i;
+                }
+            }
+            let ports = self
+                .display_paths()
+                .map_err(|_| ModesetError::NoSink)?
+                .len();
+            for port in 0..ports.min(8) {
+                let path = self.display_paths().map_err(|_| ModesetError::NoSink)?[port];
+                if path.connector != inventory::Connector::DisplayPort {
+                    continue;
+                }
+                match self.disable_display_dp_sst(port).await {
+                    Ok(d) => {
+                        found.routed_frontends |= 1 << d.frontend;
+                        if d.command_sent {
+                            found.disabled_ports |= 1 << port;
+                        }
+                    }
+                    // Planning refusals (no single routed frontend) write
+                    // nothing and leave the owner reusable.
+                    Err(otg::Error::Unsupported)
+                        if self
+                            .display_timing_status()
+                            .is_ok_and(|s| s.state.reusable()) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            // An active stream must have been found behind some backend.
+            if found.active_streams & !found.routed_frontends != 0 {
+                return Err(ModesetError::Display(otg::Error::Busy));
+            }
+            for i in 0..4 {
+                if found.routed_frontends & 1 << i != 0 {
+                    self.retire_display_dp_encoder(otg::DpStream::Dio(i))
+                        .await?;
+                }
+            }
+            self.retire_display_planes().await?;
+            // Only running generators: an idle (or soft-reset) OTG needs none.
+            let running = self.display_running_timing()?;
+            found.running_timing = running;
+            for pipe in 0..4 {
+                if running & 1 << pipe != 0 {
+                    self.retire_display_timing(pipe).await?;
+                }
+            }
+        }
+        Ok(found)
+    }
     /// Light the first answering DP SST sink at its preferred mode on `pipe`,
     /// with `fill(y, row)` supplying each visible row before fetch starts.
     /// # Safety
