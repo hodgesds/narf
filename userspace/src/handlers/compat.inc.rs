@@ -2652,6 +2652,7 @@ fn do_execve_resolved(
     // /proc/[pid]/exe: `cur_path` survived the shebang loop, so it names
     // the binary actually being mapped (the interpreter for scripts).
     set_proc_exe(task, &cur_path);
+    set_proc_image_mappings(task, &new_proc.loaded_mappings, &cur_path);
 
     // Tell the tracer the exec happened — the exec report AND the execve
     // syscall-exit stop, in whichever order this tracer's options ask for.
@@ -6940,6 +6941,112 @@ static PROC_EXE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::string::String>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// File-backed image ranges published by a successful exec. The address-space
+/// region table owns permissions and lifetime; this small side table preserves
+/// the loader's file identity and page offset for `/proc/<pid>/maps`.
+///
+/// `AddressSpace` deliberately does not retain VFS paths, so keeping this
+/// exec-scoped metadata here avoids making the generic VM depend on VFS names.
+/// Dynamic mappings created by a later mmap still have unknown backing until
+/// that syscall gains equivalent provenance.
+#[derive(Clone, Debug)]
+struct ProcImageMapping {
+    start: u64,
+    end: u64,
+    file_offset: u64,
+    device: u64,
+    inode: u64,
+    pathname: alloc::string::String,
+}
+
+static PROC_IMAGE_MAPPINGS: TaskMapTable<alloc::vec::Vec<ProcImageMapping>> =
+    [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
+
+fn proc_absolute_path(task: u64, path: &str) -> alloc::string::String {
+    if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else {
+        let mut absolute = cwd_of(task);
+        if !absolute.ends_with('/') {
+            absolute.push('/');
+        }
+        absolute.push_str(path);
+        absolute
+    }
+}
+
+fn set_proc_image_mappings(
+    task: u64,
+    mappings: &[crate::process::LoadedMapping],
+    main_program_path: &str,
+) {
+    let main_program_path = proc_absolute_path(task, main_program_path);
+    let mut image_mappings = alloc::vec::Vec::new();
+    if image_mappings.try_reserve(mappings.len()).is_err() {
+        // `/proc/maps` provenance is diagnostic metadata. A failure to retain
+        // it must not turn an otherwise successful exec into a kernel panic.
+        task_map_remove(&PROC_IMAGE_MAPPINGS, task);
+        return;
+    }
+    for mapping in mappings {
+        if mapping.len == 0 {
+            continue;
+        }
+        let Some(end) = mapping.addr.checked_add(mapping.len) else {
+            continue;
+        };
+        image_mappings.push(ProcImageMapping {
+            start: mapping.addr,
+            end,
+            file_offset: mapping.pgoff,
+            device: mapping.device,
+            inode: mapping.inode,
+            pathname: mapping
+                .filename
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| main_program_path.clone()),
+        });
+    }
+    task_map_set(&PROC_IMAGE_MAPPINGS, task, image_mappings);
+}
+
+/// Kernel-test seam for `/proc/maps` loader-provenance coverage.
+#[doc(hidden)]
+pub fn __test_set_proc_image_mappings(
+    task: u64,
+    mappings: &[crate::process::LoadedMapping],
+    main_program_path: &str,
+) {
+    set_proc_image_mappings(task, mappings, main_program_path);
+}
+
+/// Kernel-test cleanup for `/proc/maps` loader-provenance coverage.
+#[doc(hidden)]
+pub fn __test_clear_proc_image_mappings(task: u64) {
+    task_map_remove(&PROC_IMAGE_MAPPINGS, task);
+}
+
+fn proc_image_mapping_for_range(
+    mappings: &[ProcImageMapping],
+    start: u64,
+    end: u64,
+) -> Option<(u64, u64, u64, alloc::string::String)> {
+    mappings
+        .iter()
+        .find(|mapping| mapping.start <= start && end <= mapping.end)
+        .map(|mapping| {
+            (
+                mapping
+                    .file_offset
+                    .saturating_add(start.saturating_sub(mapping.start)),
+                mapping.device,
+                mapping.inode,
+                mapping.pathname.clone(),
+            )
+        })
+}
+
 fn proc_identity_fork(parent_task: u64, child_task: u64) {
     let inherited_comm = {
         let g = PROC_COMM.lock();
@@ -6961,22 +7068,14 @@ fn proc_identity_fork(parent_task: u64, child_task: u64) {
             .get_or_insert_with(alloc::collections::BTreeMap::new)
             .insert(child_task, exe);
     }
+    task_map_fork(&PROC_IMAGE_MAPPINGS, parent_task, child_task);
 }
 
 /// Record the exec'd binary path for `/proc/[pid]/exe`. A relative
 /// exec path is resolved against the caller's cwd so the link is
 /// always absolute (Linux renders a resolved path here, never `./x`).
 pub fn set_proc_exe(pid: u64, path: &str) {
-    let abs = if path.starts_with('/') {
-        alloc::string::String::from(path)
-    } else {
-        let mut s = cwd_of(pid);
-        if !s.ends_with('/') {
-            s.push('/');
-        }
-        s.push_str(path);
-        s
-    };
+    let abs = proc_absolute_path(pid, path);
     let mut g = PROC_EXE.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     map.insert(pid, abs);
@@ -7553,6 +7652,11 @@ pub fn proc_task_info(
         .as_ref()
         .map(|as_arc| as_arc.memory_stats())
         .unwrap_or_default();
+    // Loader image metadata is deliberately stored separately from the VM
+    // regions (the latter has no VFS-path dependency). Snapshot it once so
+    // maps rendering neither locks on every VMA nor exposes a half-updated
+    // exec image.
+    let image_mappings = task_map_get(&PROC_IMAGE_MAPPINGS, tid).unwrap_or_default();
     let stack_bytes = as_arc
         .as_ref()
         .and_then(|as_arc| {
@@ -7596,6 +7700,12 @@ pub fn proc_task_info(
                 } else {
                     ""
                 };
+                let (file_offset, device, inode, pathname) =
+                    proc_image_mapping_for_range(&image_mappings, base, end)
+                        .map(|(file_offset, device, inode, pathname)| {
+                            (file_offset, device, inode, Some(pathname))
+                        })
+                        .unwrap_or((0, 0, 0, None));
                 vmas.push(ProcVma {
                     start: base,
                     end,
@@ -7605,6 +7715,10 @@ pub fn proc_task_info(
                     // From the UN-stripped perms — prot_only() drops the
                     // SHARED bit. Feeds maps' s/p column + statm's shared.
                     shared: r.perms.contains(RegionPerms::SHARED),
+                    file_offset,
+                    device,
+                    inode,
+                    pathname,
                     label,
                     numa_policy: policy.mode,
                     numa_nodemask: effective_nodemask,

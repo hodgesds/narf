@@ -323,8 +323,8 @@ pub struct ProcFdSnapshot {
 }
 
 /// One virtual-memory area entry. Mirrors what `/proc/[pid]/maps`
-/// reports per line: range, protection bits, and an optional name.
-#[derive(Copy, Clone, Debug, Default)]
+/// reports per line: range, protection bits, and optional file backing.
+#[derive(Clone, Debug, Default)]
 pub struct ProcVma {
     pub start: u64,
     pub end: u64,
@@ -332,6 +332,17 @@ pub struct ProcVma {
     pub writable: bool,
     pub executable: bool,
     pub shared: bool,
+    /// Byte offset into the backing file. Zero for anonymous mappings.
+    pub file_offset: u64,
+    /// Linux `st_dev` encoding of the backing file's filesystem. Zero for an
+    /// anonymous mapping or when the mapping's backing identity is unknown.
+    pub device: u64,
+    /// Backing file's inode number. Zero for an anonymous mapping or when the
+    /// mapping's backing identity is unknown.
+    pub inode: u64,
+    /// Known file backing pathname. `None` for anonymous mappings or a
+    /// mapping whose backing identity is unavailable.
+    pub pathname: Option<String>,
     /// Optional Linux-style label (`[heap]`, `[stack]`, `[vdso]`).
     /// Empty for anonymous mappings.
     pub label: &'static str,
@@ -3331,10 +3342,9 @@ fn render_cpu_list(mask: u64) -> String {
 fn render_maps(info: &ProcTaskInfo) -> String {
     // Linux /proc/[pid]/maps shape:
     //   start-end perms offset dev inode pathname
-    // NARF does not yet retain per-VMA backing identity, so unknown
-    // backing uses `00:00 0`. The inode MUST still be followed by a space
-    // when the pathname is empty: Crashpad's DelimitedFileReader consumes
-    // the inode with `GetDelim(' ')`, exactly as it does on Linux.
+    // Unknown backing uses `00:00 0`. The inode MUST still be followed by a
+    // space when the pathname is empty: Crashpad's DelimitedFileReader
+    // consumes the inode with `GetDelim(' ')`, exactly as it does on Linux.
     let mut s = String::new();
     for v in info.vmas.iter() {
         write_maps_line(&mut s, v);
@@ -3350,14 +3360,21 @@ fn write_maps_line(s: &mut String, v: &ProcVma) {
     let w = if v.writable { 'w' } else { '-' };
     let x = if v.executable { 'x' } else { '-' };
     let p = if v.shared { 's' } else { 'p' };
+    // Linux's `new_encode_dev()` stores the low eight minor bits directly,
+    // the twelve-bit major at bit eight, and high minor bits above bit 20.
+    // `/proc/<pid>/maps` displays the decoded pair, not the packed `dev_t`.
+    let device_major = (v.device >> 8) & 0x0fff;
+    let device_minor = (v.device & 0x00ff) | ((v.device >> 12) & !0x00ff);
     let _ = core::fmt::Write::write_fmt(
         s,
         format_args!(
-            "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0 ",
-            v.start, v.end, r, w, x, p,
+            "{:016x}-{:016x} {}{}{}{} {:08x} {:02x}:{:02x} {} ",
+            v.start, v.end, r, w, x, p, v.file_offset, device_major, device_minor, v.inode,
         ),
     );
-    if !v.label.is_empty() {
+    if let Some(pathname) = &v.pathname {
+        let _ = core::fmt::Write::write_str(s, pathname);
+    } else if !v.label.is_empty() {
         let _ = core::fmt::Write::write_str(s, v.label);
     }
     s.push('\n');
@@ -3402,6 +3419,36 @@ fn smoke_maps_anonymous_inode_is_space_terminated() -> TestResult {
 kernel_test_in!(
     "filesystem/procfs",
     smoke_maps_anonymous_inode_is_space_terminated
+);
+
+/// File-backed mappings must preserve their file identity, original offset,
+/// and pathname. Crashpad groups a module by `(dev, ino)` and finds its
+/// offset-zero segment before reading its ELF header.
+fn smoke_maps_file_backing_preserves_identity_offset_and_pathname() -> TestResult {
+    let info = ProcTaskInfo {
+        vmas: alloc::vec![ProcVma {
+            start: 0x400000,
+            end: 0x401000,
+            readable: true,
+            executable: true,
+            file_offset: 0x1000,
+            device: (8 << 8) | 19,
+            inode: 42,
+            pathname: Some(String::from("/usr/bin/chromium")),
+            ..ProcVma::default()
+        }],
+        ..sample_task_info()
+    };
+    let maps = render_maps(&info);
+    if maps == "0000000000400000-0000000000401000 r-xp 00001000 08:13 42 /usr/bin/chromium\n" {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("file-backed maps entry lost its identity, ELF offset, or pathname")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_maps_file_backing_preserves_identity_offset_and_pathname
 );
 
 /// One `/proc/<pid>/smaps` VMA block, and the `smaps_rollup` summary, share
@@ -4126,6 +4173,10 @@ fn smoke_smaps_pss_is_sharer_weighted() -> TestResult {
         writable: true,
         executable: false,
         shared: false,
+        file_offset: 0,
+        device: 0,
+        inode: 0,
+        pathname: None,
         label: "",
         numa_policy: 0,
         numa_nodemask: 0,
@@ -4138,7 +4189,7 @@ fn smoke_smaps_pss_is_sharer_weighted() -> TestResult {
         private_pages: 2,
     };
     let info = ProcTaskInfo {
-        vmas: alloc::vec![vma],
+        vmas: alloc::vec![vma.clone()],
         ..sample_task_info()
     };
 
@@ -4166,7 +4217,7 @@ fn smoke_smaps_pss_is_sharer_weighted() -> TestResult {
     // The rollup sums the same numbers under one header, which is why
     // systemd reads it instead of walking every mapping.
     let two = ProcTaskInfo {
-        vmas: alloc::vec![vma, vma],
+        vmas: alloc::vec![vma.clone(), vma],
         ..sample_task_info()
     };
     let rollup = render_smaps_rollup(&two);
@@ -4203,6 +4254,10 @@ fn smoke_pid_stat_real_fields() -> TestResult {
             writable: false,
             executable: false,
             shared: false,
+            file_offset: 0,
+            device: 0,
+            inode: 0,
+            pathname: None,
             label: "",
             numa_policy: 2,
             numa_nodemask: 0b11,

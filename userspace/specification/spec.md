@@ -119,6 +119,13 @@ load. Thus procfs and the initial stack carry the same `AT_PHDR`, `AT_PHENT`,
 `AT_PHNUM`, interpreter, capability, and terminator entries. On x86_64,
 `PTRACE_GETREGSET` supports both `NT_PRSTATUS` and `NT_PRFPREG`; the latter is
 the 512-byte FXSAVE-compatible legacy prefix of the task's saved XSAVE image.
+The same exec commit publishes the loader's PT_LOAD ranges with their page
+offsets, backing `(st_dev, st_ino)` identities, and resolved paths for
+`/proc/<pid>/maps`; the main image uses the resolved `/proc/<pid>/exe` path
+and an interpreter range keeps its own path. Fork copies this snapshot, a
+later exec replaces it atomically, and task exit removes it. This keeps VM
+ownership free of VFS names while allowing ELF consumers to group file VMAs
+and compute an image base from the offset-zero maps entry.
 
 ELF `PT_LOAD` construction follows Linux's BSS split: file-image pages are
 materialized, the unused tail of the final file page is zero-filled, and every

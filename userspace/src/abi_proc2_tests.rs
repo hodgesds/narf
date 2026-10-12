@@ -2969,6 +2969,49 @@ fn smoke_abi_proc2_self_maps_from_sibling_thread() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_self_maps_from_sibling_thread);
 
+/// Chromium's Crashpad finds an ELF image by subtracting the `/proc/maps`
+/// file offset from a PT_LOAD VMA. A zero offset makes it read the first code
+/// bytes as an ELF header; no pathname leaves no way to recover the image.
+/// Exercise the production procfs hook rather than only its renderer.
+fn smoke_abi_proc2_maps_preserve_loader_image_provenance() -> TestResult {
+    with_thread_group(false, |v| {
+        let mapping = crate::process::LoadedMapping {
+            addr: v.region,
+            len: TG_REGION_LEN,
+            pgoff: 0x3000,
+            prot: 3,
+            device: (8 << 8) | 19,
+            inode: 42,
+            filename: None,
+        };
+        crate::handlers::__test_set_proc_image_mappings(
+            TG_LEADER_TASK,
+            core::slice::from_ref(&mapping),
+            "/usr/bin/narf-maps-test",
+        );
+        let result = (|| {
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
+            let expected = alloc::format!(
+                "{:016x}-{:016x} rw-p 00003000 08:13 42 /usr/bin/narf-maps-test",
+                v.region,
+                v.region + TG_REGION_LEN,
+            );
+            if maps.contains(&expected) {
+                Ok(())
+            } else {
+                Err("/proc/self/maps lost the loader image offset or pathname")
+            }
+        })();
+        crate::handlers::__test_clear_proc_image_mappings(TG_LEADER_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_preserve_loader_image_provenance
+);
+
 /// A per-pid file opened while its process lived and read after the process
 /// is gone answers -ESRCH (fs/proc/task_mmu.c m_start: `if (!priv->task)
 /// return ERR_PTR(-ESRCH)`; fs/proc/base.c proc_single_show: `if (!task)

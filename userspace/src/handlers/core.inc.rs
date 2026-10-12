@@ -14446,6 +14446,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = PROC_EXE.lock().as_mut() {
         m.remove(&tid);
     }
+    task_map_remove(&PROC_IMAGE_MAPPINGS, tid);
     if let Some(m) = TASK_START_NS.lock().as_mut() {
         m.remove(&tid);
     }
