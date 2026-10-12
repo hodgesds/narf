@@ -514,6 +514,29 @@ pub fn restore_boot_scanout() -> bool {
     };
     adopt(fb)
 }
+/// The adopted external scanout as a DRM blit target, through its kernel
+/// mapping. Only a driver-published scanout that the console actually adopted
+/// qualifies: the boot framebuffer keeps its existing fbdev-only behaviour,
+/// and nothing here is exposed to a userspace mmap.
+fn external_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
+    let published = narf_drivers_gpu::amdgpu_dcn_display::active_scanout()?;
+    if GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire) != published.addr {
+        return None;
+    }
+    let fb = (*GENERIC_FB.lock())?;
+    if fb.bpp != 32
+        || (fb.width, fb.height, fb.pitch) != (published.width, published.height, published.pitch)
+    {
+        return None;
+    }
+    Some(narf_drivers_gpu::drm_fb_hook::ScanoutGeom {
+        phys: published.addr,
+        width: fb.width,
+        height: fb.height,
+        stride_bytes: fb.pitch,
+        virt: fb.addr,
+    })
+}
 /// Observer for the AMD display pipeline's external scanout.
 ///
 /// Moving the console to a newly lit external display is this layer's policy
@@ -1144,12 +1167,15 @@ pub fn register_initcalls() {
     });
     narf_init::register(Stage::Late, "drm-fb-hook", || {
         fn query() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
-            let info = fbdev_info()?;
+            let Some(info) = fbdev_info() else {
+                return external_scanout_geom();
+            };
             Some(narf_drivers_gpu::drm_fb_hook::ScanoutGeom {
                 phys: info.phys,
                 width: info.width,
                 height: info.height,
                 stride_bytes: info.stride_bytes,
+                virt: 0,
             })
         }
         fn flush() {

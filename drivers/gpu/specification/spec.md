@@ -844,7 +844,11 @@ and byte pitch (`Otg::scanout_framebuffer`, which requires `ScanoutRunning`
 for that pipe and the owned surface). The fb layer's existing observer moves
 the console onto it. Adoption maps the published physical range
 (write-combining on x86_64, Device on aarch64) and installs that kernel
-mapping, cached per range and never unmapped. The fb layer previously stored
+mapping, cached per range and never unmapped. DRM presentation (the existing CPU copy of
+a dumb buffer into the live scanout) reaches an adopted external scanout
+through that mapping: the fb hook reports it with a kernel-virtual base only
+when the console adopted exactly the published surface. Nothing new is offered
+to userspace mmap, and the boot framebuffer keeps its fbdev-only behaviour. The fb layer previously stored
 the physical address itself, which `GenericFb::framebuffer` dereferences, for
 both AMD external scanouts and the boot framebuffer restore. The scanout
 carries a flush: CPU writes through the BAR

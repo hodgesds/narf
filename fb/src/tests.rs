@@ -1311,3 +1311,19 @@ kernel_test_in!(
     "fb",
     smoke_fb_adopted_scanout_is_installed_through_its_mapping
 );
+
+/// Without a driver-published external scanout, the DRM blit target stays
+/// exactly what fbdev exposes: the boot framebuffer gains no new route.
+fn smoke_fb_drm_external_geometry_requires_published_scanout() -> TestResult {
+    if narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some() {
+        return TestResult::Skip("an external scanout is live");
+    }
+    if crate::external_scanout_geom().is_some() {
+        return TestResult::Fail("blit target without a published scanout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "fb",
+    smoke_fb_drm_external_geometry_requires_published_scanout
+);

@@ -35,6 +35,10 @@ pub struct ScanoutGeom {
     pub height: u32,
     /// Bytes per scanline.
     pub stride_bytes: u32,
+    /// Kernel-virtual base of a device-memory scanout (an adopted external
+    /// display reached through its ioremap). Zero means `phys` is reachable
+    /// through the kernel's physical map, as for RAM-backed scanouts.
+    pub virt: u64,
 }
 
 type QueryFn = fn() -> Option<ScanoutGeom>;

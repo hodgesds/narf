@@ -413,6 +413,8 @@ has validated it.
 Adopting an external scanout (DCN314 or Navi48), or restoring the boot
 framebuffer, now installs a kernel mapping of the published physical range
 instead of dereferencing the physical address.
+DRM clients' presented frames now reach an adopted Navi48/DCN314 scanout
+through that mapping (CPU copy, then the published HDP flush).
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

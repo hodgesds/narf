@@ -4329,15 +4329,22 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
     let row_bytes = (dst_w as usize) * 4;
     for row in 0..dst_h as usize {
         let src_row = src_phys + (row * src_pitch as usize) as u64;
-        let dst_row = info.phys + (row * info.stride_bytes as usize) as u64;
-        // SAFETY: Both src and dst are identity-mapped physical addresses
-        // validated by their respective allocators; `row_bytes` is within
-        // the allocation bounds (row < dst_h <= src_h, dst_w <= src_w).
+        let offset = (row * info.stride_bytes as usize) as u64;
+        // A device-memory scanout is reached through its kernel mapping; a
+        // RAM-backed one through the physical map.
+        let dst = if info.virt != 0 {
+            (info.virt + offset) as *mut u8
+        } else {
+            narf_memory::PhysAddr::new(info.phys + offset).kernel_mut_ptr::<u8>()
+        };
+        // SAFETY: src is an identity-mapped dumb buffer validated by its
+        // allocator; dst is the scanout's mapping or physical-map address.
+        // `row_bytes` is within both (row < dst_h <= src_h, dst_w <= src_w).
         // SAFETY: Valid memory or trusted environment
         unsafe {
             core::ptr::copy_nonoverlapping(
                 narf_memory::PhysAddr::new(src_row).kernel_ptr::<u8>(),
-                narf_memory::PhysAddr::new(dst_row).kernel_mut_ptr::<u8>(),
+                dst,
                 row_bytes,
             );
         }
