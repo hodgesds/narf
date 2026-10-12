@@ -17,8 +17,7 @@ use super::*;
 /// and `crate::ptrace::sys_ptrace` — sees the syscall table import this
 /// one, reads "stub returning ENOSYS", and concludes ptrace is unwired. It
 /// is wired, and the real implementation handles TRACEME/ATTACH/SEIZE with
-/// pid-namespace translation. `docs/LINUX_COMPAT.md` carried that wrong
-/// conclusion as a "real gap" on the strength of this comment.
+/// pid-namespace translation.
 pub(crate) fn sys_ptrace(ctx: &mut dyn TrapContext) {
     crate::ptrace::sys_ptrace(ctx);
 }

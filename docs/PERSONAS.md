@@ -161,26 +161,6 @@ for an init system that manages resources via the cgroup hierarchy.
 
 ## Implementation status
 
-The three profiles are live. The historical landing sequence through Wave 77
-was:
-
-- Wave 62 established the feature flags and stub modules.
-- Wave 63 — dyn-linker aux vector (`AT_PHDR` / `AT_PHENT` / `AT_PHNUM`
-  / `AT_RANDOM`).
-- Wave 64 — `epoll` / `eventfd` / `timerfd_*`.
-- Wave 65 — `clone3` + per-thread TLS via `set_tid_address`.
-- Wave 66 — `mprotect` (region split) + `madvise(DONTNEED|FREE)`.
-- Wave 67 — `CLONE_NEWPID` + `CLONE_NEWNS`.
-- Wave 68 — `fcntl(2)` extensions.
-- Wave 69 — `statx(2)` + Linux ABI `struct stat`.
-- Wave 70 — `signalfd4` + `memfd_create` with seals.
-- Wave 71 — `mount` / `umount2` / `chroot` / `pivot_root`.
-- Wave 72 — `CLONE_NEWUTS` + `CLONE_NEWNET` + `CLONE_NEWIPC`.
-- Wave 73 — POSIX timers + `clock_nanosleep` ABSTIME.
-- Wave 74 — smoke coverage for statx + POSIX timer paths.
-- Wave 75 — real ld-musl interpreter loading + TLS relocations.
-- Wave 77 — narf-libc POSIX timer wrappers.
-
-Each wave landed on a feature branch and merged via PR.  Feature
-combinations (`linux-compat`, `container`, both, neither) all build
-clean in CI.
+The profiles above are live. CI builds the supported combinations of
+`linux-compat`, `container`, and cgroup features independently; consult the
+workspace manifests and current CI configuration for the exact matrix.

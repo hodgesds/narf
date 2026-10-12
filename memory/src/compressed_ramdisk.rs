@@ -3,14 +3,10 @@
 //! [`Zpool`] handle; an all-zero page is represented as the absence
 //! of a handle (reads see zeros, writes of all-zero free the slot).
 //!
-//! Stage-1 lives in `narf-memory` as a *struct only* — no
-//! `BlockDeviceSync` impl. Wiring it as a `narf-block` device
-//! requires the consumer crate to depend on both `narf-block` and
-//! `narf-memory`. The explicit `narf-block → narf-memory` dep edge
-//! currently triggers a layout-shift latent UB elsewhere in the
-//! kernel (see `docs/notes/2026-05-19-layout-shift-bug.md`); until
-//! that's chased, callers who need the block-device shape build a
-//! thin adapter in a new crate they own.
+//! This crate exposes the storage primitive rather than implementing
+//! `BlockDeviceSync`: `narf-memory` sits below the block layer. Consumers that
+//! need the block-device shape provide the thin adapter in `narf-block` or an
+//! integration crate.
 //!
 //! Eviction is bounded by `capacity_lba` — the page index is sized
 //! at construction. Heap usage scales with compressed payload total,

@@ -2924,11 +2924,8 @@ static NEXT_USER_AP: AtomicU32 = AtomicU32::new(0);
 /// REMAINING cores. Set by the virtio-net driver when it places one
 /// per-queue RX forwarder per core under multi-queue. 0 = no
 /// reservation (default; single-queue / nosmp), which keeps the prior
-/// "workers on any AP" behaviour. Partitioning forwarders and workers
-/// onto disjoint cores keeps multi-queue RX dispatch from contending the
-/// workers; it's throughput-neutral until the binding bottleneck (the
-/// workers don't yet scale — see `docs/redis-perf-plan.md`) is lifted,
-/// but is the correct MQ core layout, so it's kept.
+/// "workers on any AP" behaviour. Partitioning forwarders and workers onto
+/// disjoint cores keeps multi-queue RX dispatch from contending the workers.
 static RX_FORWARDER_CORES: AtomicU32 = AtomicU32::new(0);
 
 /// Convert the online AP candidate list into a user-task affinity.
@@ -2965,16 +2962,11 @@ pub fn reserve_rx_forwarder_cores(n: u32) {
 /// a two-CPU system), `allowed` left wide open** (every CPU). A soft
 /// initial-placement hint, not a pin.
 ///
-/// Rationale (redis SMP scaling — see `docs/redis-perf-plan.md`): the
-/// virtio RX forwarder and the other kernel housekeeping tasks are
-/// BSP-pinned. A user task spawned with `Affinity::any()` lands on the
-/// spawning CPU (the BSP) and, because the forwarder wakes it into
-/// `READY[bsp]` and the BSP re-polls it before an idle AP can steal it,
-/// effectively stays there — so the forwarder(BSP)↔app(AP) pipeline
-/// never forms across cores and the 2nd vCPU adds almost nothing.
-/// Steering the *initial* placement to an AP spawns the task off the
-/// BSP, where it is woken and re-enqueued, forming the pipeline —
-/// measured: SMP PING p99 254→222µs, p50 69→65µs (20k samples).
+/// The virtio RX forwarder and other kernel housekeeping tasks are BSP-pinned.
+/// A user task spawned with `Affinity::any()` lands on the spawning CPU (the
+/// BSP) and can be re-polled there before an idle AP steals it. Steering the
+/// initial placement to an AP establishes the intended forwarder(BSP) ↔
+/// application(AP) pipeline.
 ///
 /// `allowed` stays `CpuSet::ALL` deliberately. On a topology with only one
 /// AP, initial placement also alternates over the BSP: relying on later

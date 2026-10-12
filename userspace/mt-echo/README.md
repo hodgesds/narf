@@ -154,7 +154,7 @@ Off-box over a **real multi-queue NIC** (not SLIRP). 0 errors throughout.
 | tap q=4, after fix, SMP=5 | ~57–65k | ~800µs | ~1.8ms |
 | tap q=4, **SMP=8** | **~74k** | ~650µs | ~1.3ms |
 
-Findings (all in `docs/redis-perf-plan.md`):
+Findings pinned by the benchmark and regression tests:
 1. **RX poll-backoff was the tap killer**: poll-only queue forwarders
    slept `PUMP_CYCLES` (~22ms at the KVM TSC) when an RSS-fed queue
    briefly idled → 9× throughput / 25× tail once gated on NIC-wide
@@ -192,8 +192,8 @@ q=4, SMP=8, KVM, 50 conns / 5s, 0 errors both:
 stays flat at ~72k for any thread count** — NARF's RX dispatch is
 single-cored (the N per-queue forwarders time-share the BSP), so worker
 threads can't outrun what the one BSP forwarder feeds. Lifting this needs
-RX dispatch spread across cores with forwarders and workers on disjoint
-core sets (see `docs/redis-perf-plan.md`).
+RX dispatch spread across cores with forwarders and workers on disjoint core
+sets.
 
 ## Sample LOCAL result
 
