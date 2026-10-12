@@ -44,6 +44,15 @@ bring-up and passes carrier, negotiated Mbps, and duplex to the central net
 registry; sysfs and rtnetlink do not infer those values from the fact that an
 administrator opened the interface.
 
+E1000 uses a 256-entry legacy TX ring with one slot reserved to distinguish
+full from empty. Its zero-copy callback transfers DMA-buffer ownership into
+the descriptor slot and returns after publication; ordered DD reclaim returns
+completed buffers to the interface's shared pool. It honors `TxMeta::more` by
+deferring TDT until the burst boundary, while a nearly-full ring forces a
+doorbell. RX has one hardware-ring consumer path: both background and
+syscall-context drains run the same stack dispatch and optional raw-frame
+mirror, so the frame-ring observer cannot steal TCP packets.
+
 The e1000 crate supports two mutually exclusive ownership profiles from the
 same source. The default `e1000` facade feature registers the built-in probe at
 `Stage::Subsys`; `e1000-module-only` keeps the implementation linked for shared

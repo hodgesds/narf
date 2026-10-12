@@ -347,12 +347,13 @@ pub struct CachedEgress {
 /// checksum) when `tso_mss` is set and the device supports it, else L4 checksum
 /// alone when advertised, else none. Must agree with the `offload_csum`
 /// argument the frame was built with.
-fn offload_meta(dev: &iface::NetIfaceSnapshot, tso_mss: Option<u16>) -> crate::TxMeta {
-    match tso_mss {
+fn offload_meta(dev: &iface::NetIfaceSnapshot, tso_mss: Option<u16>, more: bool) -> crate::TxMeta {
+    let meta = match tso_mss {
         Some(mss) if dev.offloads.max_tso_bytes > 0 => crate::TxMeta::with_tso(mss),
         _ if dev.offloads.tx_checksum => crate::TxMeta::with_csum(crate::L4CsumKind::Tcp),
         _ => crate::TxMeta::plain(),
-    }
+    };
+    meta.with_more(more)
 }
 
 /// An egress frame the stack built, either as a plain `Vec` (classic copy TX)
@@ -571,13 +572,20 @@ impl Tcb {
             || self.drop_cause.is_some()
     }
 
-    /// `true` once data is "deliverable" or the peer is dead.
+    /// `true` when `send_errno` would complete immediately instead of
+    /// returning `EAGAIN`: there is queue space, or a terminal condition is
+    /// ready to report to the caller.
     pub fn user_can_write(&self) -> bool {
         match self.state {
             TcpState::Established | TcpState::CloseWait => {
-                self.send_buf.len() < self.send_buf.limit
+                self.sk_err != 0
+                    || self.fin_sent
+                    || (self.send_buf.len() < self.send_buf.limit
+                        && self.send_buf.unsent_len() < self.notsent_lowat as usize)
             }
-            _ => false,
+            TcpState::SynSent | TcpState::SynReceived => self.sk_err != 0,
+            // Every other state makes send_errno return EPIPE immediately.
+            _ => true,
         }
     }
 }
@@ -1640,6 +1648,17 @@ pub fn readable(id: u32) -> bool {
     }
 }
 
+/// `true` if a `send_errno` on this TCB would return immediately, either by
+/// accepting at least one byte or by reporting a pending/terminal error.
+/// An unknown id is writable in this readiness sense: the retry returns
+/// `EPIPE` instead of blocking forever on a TCB that has already been reaped.
+pub fn writable(id: u32) -> bool {
+    match lookup_tcb(id) {
+        Some(arc) => arc.lock().user_can_write(),
+        None => true,
+    }
+}
+
 // ── Public API: errno-returning socket calls ─────────────────────────
 //
 // These mirror what Linux's TCP returns to `send(2)` / `recv(2)` /
@@ -2357,7 +2376,7 @@ fn send_syn(arc: &Arc<IrqSafeSpinLock<Tcb>>, ack_too: bool) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
     // Track SYN in the retransmit queue so a missed SYN-ACK
     // re-triggers retransmit.
     let mut t = arc.lock();
@@ -2394,7 +2413,7 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
 }
 
 fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool) {
@@ -2419,7 +2438,7 @@ fn send_rst(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, ack: u32, ack_flag: bool)
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
 }
 
 /// Build & send one data segment carrying `payload` from sequence
@@ -2432,6 +2451,7 @@ fn send_data(
     extra_flags: u8,
     record_retx: bool,
     tso_mss: Option<u16>,
+    more: bool,
 ) {
     if !payload.is_empty() {
         rxtx_note_tx();
@@ -2484,7 +2504,12 @@ fn send_data(
         payload,
         csum_off,
     );
-    emit_tcb_frame(arc, &egress.dev, frame, offload_meta(&egress.dev, tso));
+    emit_tcb_frame(
+        arc,
+        &egress.dev,
+        frame,
+        offload_meta(&egress.dev, tso, more),
+    );
     if record_retx {
         let mut t = arc.lock();
         let payload_len = payload.len() as u32;
@@ -2712,7 +2737,7 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &payload,
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
     {
         let mut t = arc.lock();
         // The buffer was rewound to snd_una: advance past what we resent so
@@ -2782,7 +2807,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
 }
 
 fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -2845,7 +2870,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &[],
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
 }
 
 fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -2869,6 +2894,10 @@ fn tick_time_wait(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
 /// Drain the send buffer to the wire, honouring cwnd / receiver
 /// window / MSS. Called on each `tcp_send` and after each ACK.
 pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
+    let (id, writable_before) = {
+        let t = arc.lock();
+        (t.id, t.user_can_write())
+    };
     loop {
         let (chunks, seq, fin_flag, tso_arg, drained_all) = {
             let mut t = arc.lock();
@@ -2954,7 +2983,7 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         if chunks.is_empty() {
             if fin_flag != 0 {
                 // Pure FIN segment.
-                send_data(arc, seq, &[], FLAG_FIN, true, None);
+                send_data(arc, seq, &[], FLAG_FIN, true, None, false);
                 break;
             }
             break;
@@ -2972,13 +3001,17 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // for a TSO-capable egress, so a single-MSS chunk or a non-TSO
             // egress sends normally.
             let seg_tso = tso_arg.filter(|&m| c.len() > m as usize);
-            send_data(arc, cur_seq, c, extra, true, seg_tso);
+            send_data(arc, cur_seq, c, extra, true, seg_tso, !last);
             cur_seq = cur_seq.wrapping_add(c.len() as u32);
         }
         let _ = drained_all;
         if fin_flag != 0 {
             break;
         }
+    }
+    let writable_after = arc.lock().user_can_write();
+    if !writable_before && writable_after {
+        crate::readiness::notify(id as u64);
     }
 }
 
@@ -3777,6 +3810,8 @@ fn handle_ack(
     }
     let ack = hdr.acknowledgement;
     let mut t = arc.lock();
+    let id = t.id;
+    let writable_before = t.user_can_write();
     // RFC 5681 §2 "DUPLICATE ACKNOWLEDGMENT": only a segment that carries no
     // data, no SYN/FIN, and leaves the advertised window unchanged counts.
     // Without the payload / window conditions, reverse-direction data (which
@@ -3893,6 +3928,11 @@ fn handle_ack(
     if !sack_blocks.is_empty() {
         t.scoreboard.update_from(&sack_blocks);
     }
+    let writable_after = t.user_can_write();
+    drop(t);
+    if !writable_before && writable_after {
+        crate::readiness::notify(id as u64);
+    }
 }
 
 fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
@@ -3928,7 +3968,7 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         &payload,
         iface.offloads.tx_checksum,
     );
-    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None));
+    emit_tcb_frame(arc, &iface, frame, offload_meta(&iface, None, false));
     let mut t = arc.lock();
     // Karn: no RTT sample from any record covering the resent range.
     let end = seq.wrapping_add(payload.len() as u32);

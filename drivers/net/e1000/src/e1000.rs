@@ -57,12 +57,12 @@
 //! | 0x5400  | RAL  | Receive Address Low (MAC[0..4])   |
 //! | 0x5404  | RAH  | Receive Address High (MAC[4..6] + valid bit) |
 
-use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use narf_bus::{enable_msix, map_bar, BusDevice, BusDeviceCap, MmioRegion, MsixTable};
 use narf_capabilities::{Cap, Write};
-use narf_io::{alloc_coherent, DmaBuffer};
+use narf_io::{alloc_coherent, pool::DmaPool, DmaBuffer};
 use narf_ipc::{channel, Consumer, Producer};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_net::{Frame, RX_RING_N, TX_RING_N};
@@ -291,6 +291,7 @@ const REG_IMS: u64 = 0x00D0;
 const REG_IMC: u64 = 0x00D8;
 const REG_RCTL: u64 = 0x0100;
 const REG_TCTL: u64 = 0x0400;
+const REG_TIPG: u64 = 0x0410;
 /// Missed Packets Count — RX frames dropped for want of a descriptor
 /// (receive-FIFO overrun). Clears on read. 8254x SDM §13.
 const REG_MPC: u64 = 0x4010;
@@ -369,6 +370,11 @@ const CTRL_SLU: u32 = 1 << 6; // Set Link Up
 // TCTL bits.
 const TCTL_EN: u32 = 1 << 1;
 const TCTL_PSP: u32 = 1 << 3; // Pad Short Packets
+const TCTL_CT_15: u32 = 15 << 4;
+const TCTL_COLD_63: u32 = 63 << 12;
+const TCTL_RTLC: u32 = 1 << 24; // Re-transmit on late collision
+                                // Linux's 82543+ copper defaults: IPGT=8, IPGR1=8, IPGR2=6.
+const TIPG_COPPER_DEFAULT: u32 = 8 | (8 << 10) | (6 << 20);
 
 // TX descriptor flags.
 const TXD_CMD_EOP: u8 = 1 << 0;
@@ -449,7 +455,13 @@ pub const IMS_RXT0: u32 = 1 << 7;
 const IMS_DEFAULT: u32 =
     IMS_RXT0 | IMS_RXDMT0 | IMS_RXO | IMS_RXSEQ | IMS_TXDW | IMS_TXQE | IMS_LSC;
 
-const TX_RING_LEN: usize = 8;
+/// One page of 16-byte legacy TX descriptors. Keep one entry unused so TDT
+/// never catches TDH and makes a full ring indistinguishable from an empty
+/// one. The prior 8-entry ring plus a per-packet DD wait serialized QEMU's
+/// e1000 model to a few Mbit/s; a 256-entry ring gives the device a useful
+/// batch while retaining the legacy descriptor format.
+const TX_RING_LEN: usize = 256;
+const TX_RING_USABLE: usize = TX_RING_LEN - 1;
 /// RX descriptor ring depth. The ring page is 4096 bytes = 256 × 16-byte
 /// descriptors, so 256 is the most the existing allocation holds and matches
 /// the Linux e1000 default. An 8-deep ring overran (RXO) under any burst —
@@ -473,6 +485,79 @@ pub struct TxDesc {
 }
 
 const _: () = assert!(core::mem::size_of::<TxDesc>() == 16);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct TxTicket {
+    slot: usize,
+    generation: u64,
+}
+
+/// Pure producer/consumer bookkeeping for the legacy TX ring. Hardware owns
+/// `[next_to_clean, next_to_use)`; software leaves one descriptor unused.
+#[derive(Debug)]
+struct TxRingCursor {
+    next_to_use: usize,
+    next_to_clean: usize,
+    in_flight: usize,
+    generations: alloc::vec::Vec<u64>,
+}
+
+impl TxRingCursor {
+    fn new() -> Self {
+        Self {
+            next_to_use: 0,
+            next_to_clean: 0,
+            in_flight: 0,
+            generations: alloc::vec![0; TX_RING_LEN],
+        }
+    }
+
+    fn reserve(&mut self) -> Option<TxTicket> {
+        if self.in_flight >= TX_RING_USABLE {
+            return None;
+        }
+        let slot = self.next_to_use;
+        self.next_to_use = (slot + 1) % TX_RING_LEN;
+        self.in_flight += 1;
+        self.generations[slot] = self.generations[slot].wrapping_add(1);
+        Some(TxTicket {
+            slot,
+            generation: self.generations[slot],
+        })
+    }
+
+    fn complete_oldest(&mut self) -> Option<usize> {
+        if self.in_flight == 0 {
+            return None;
+        }
+        let slot = self.next_to_clean;
+        self.next_to_clean = (slot + 1) % TX_RING_LEN;
+        self.in_flight -= 1;
+        Some(slot)
+    }
+
+    fn ticket_was_reused(&self, ticket: TxTicket) -> bool {
+        self.generations[ticket.slot] != ticket.generation
+    }
+}
+
+#[derive(Debug)]
+struct TxQueueState {
+    cursor: TxRingCursor,
+    /// A zero-copy buffer remains here until hardware writes DD for its slot.
+    /// Copy-mode descriptors use the controller's persistent `tx_pool` and
+    /// leave their entry `None`.
+    owned: alloc::vec::Vec<Option<DmaBuffer>>,
+}
+
+impl TxQueueState {
+    fn new() -> Self {
+        Self {
+            cursor: TxRingCursor::new(),
+            owned: (0..TX_RING_LEN).map(|_| None).collect(),
+        }
+    }
+}
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
@@ -753,9 +838,7 @@ fn disable_eee_pchlan(mmio: &MmioRegion) {
     }
 }
 
-/// Live e1000 controller. Holds the MMIO mapping + the TX descriptor
-/// ring's DMA buffer. Each frame transmits through a per-call DMA
-/// scratch buffer that drops after completion.
+/// Live e1000 controller. Holds the MMIO mapping and descriptor/buffer rings.
 pub struct E1000 {
     mmio: MmioRegion,
     /// TX descriptor-ring DMA buffer.
@@ -769,8 +852,12 @@ pub struct E1000 {
     /// descriptor index, so `tx()` writes into `tx_pool[slot]`
     /// before pointing the descriptor's `addr` at it.
     tx_pool: alloc::vec::Vec<DmaBuffer>,
-    /// Driver-side TDT cursor (tail).
-    tx_tail: IrqSafeSpinLock<u32>,
+    /// Shared zero-copy TX pool. Stack acquisition and completion reclaim use
+    /// this same free-list, so the steady-state path allocates no pages.
+    tx_zc_pool: Arc<DmaPool>,
+    /// Driver-side TX producer/clean cursors plus buffers owned by hardware.
+    /// The IRQ handler never takes this lock; it only acknowledges ICR.
+    tx_state: IrqSafeSpinLock<TxQueueState>,
     /// RX descriptor-ring DMA buffer.
     rx_ring: DmaBuffer,
     /// RX buffer pool — one DMA page per descriptor (`RX_BUF_LEN`
@@ -805,7 +892,11 @@ pub struct E1000 {
     pub me_active: bool,
 
     // IPC integration
+    rx_ipc_prod: IrqSafeSpinLock<Option<Producer<Frame, RX_RING_N>>>,
     rx_ipc_ring: IrqSafeSpinLock<Option<Consumer<Frame, RX_RING_N>>>,
+    /// Raw-frame mirroring stays off until a registry consumer actually takes
+    /// `rx_ipc_ring`; the in-kernel TCP stack otherwise pays no copy/allocation.
+    rx_mirror_enabled: AtomicBool,
     tx_ipc_ring: IrqSafeSpinLock<Option<Producer<Frame, TX_RING_N>>>,
 }
 
@@ -816,7 +907,7 @@ pub struct E1000 {
 unsafe impl Send for E1000 {}
 // SAFETY: every field reachable through `&E1000` from multiple threads is
 // either immutable after bring-up (mac/link_up/mmio mapping) or guarded by
-// an `IrqSafeSpinLock` (tx/rx cursors and IPC rings); concurrent MMIO/DMA
+// an `IrqSafeSpinLock` (TX state, RX cursor and IPC rings); concurrent MMIO/DMA
 // register access via the shared pointers is serialized by those locks, so
 // shared access is sound.
 unsafe impl Sync for E1000 {}
@@ -983,13 +1074,19 @@ impl E1000 {
             mmio.write32(REG_TDH, 0);
             mmio.write32(REG_TDT, 0);
         }
-        // 5. Enable TX. PSP = pad short packets to 64 bytes (Ethernet
-        //    minimum frame size). Collision threshold + collision
-        //    distance are spec-default — bits 12..21 stay zero in our
-        //    minimal config.
+        // 5. Enable TX with Intel's 82543+ copper defaults. CT/COLD and TIPG
+        //    are software-programmed fields, not useful reset defaults; zeroing
+        //    them happened to move packets in QEMU but is not a valid physical
+        //    e1000 configuration. These values match Linux e1000's legacy-ring
+        //    setup (collision threshold 15, distance 63, IPGT/IPGR1/IPGR2
+        //    8/8/6).
         // SAFETY: same.
         unsafe {
-            mmio.write32(REG_TCTL, TCTL_EN | TCTL_PSP);
+            mmio.write32(REG_TIPG, TIPG_COPPER_DEFAULT);
+            mmio.write32(
+                REG_TCTL,
+                TCTL_EN | TCTL_PSP | TCTL_CT_15 | TCTL_COLD_63 | TCTL_RTLC,
+            );
         }
 
         // 5b. Allocate RX descriptor ring + buffer pool.
@@ -1103,12 +1200,14 @@ impl E1000 {
 
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
         let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
+        let tx_zc_pool = Arc::new(DmaPool::new(RX_BUF_LEN, crate::BUILTIN_DOMAIN, TX_RING_LEN));
 
         let e1000 = Self {
             mmio,
             tx_ring,
             tx_pool,
-            tx_tail: IrqSafeSpinLock::new(0),
+            tx_zc_pool,
+            tx_state: IrqSafeSpinLock::new(TxQueueState::new()),
             rx_ring,
             rx_pool,
             rx_head: IrqSafeSpinLock::new(0),
@@ -1118,7 +1217,9 @@ impl E1000 {
             irq_vector,
             pch_part,
             me_active,
+            rx_ipc_prod: IrqSafeSpinLock::new(None),
             rx_ipc_ring: IrqSafeSpinLock::new(Some(rx_cons)),
+            rx_mirror_enabled: AtomicBool::new(false),
             tx_ipc_ring: IrqSafeSpinLock::new(Some(tx_prod)),
         };
 
@@ -1215,58 +1316,9 @@ impl E1000 {
     /// path is what bring-up tests run, and it's also the synchronous
     /// fallback for callers that can't await.
     pub fn tx(&self, frame: &[u8]) -> Result<(), E1000Error> {
-        if frame.is_empty() || frame.len() > 1518 {
-            return Err(E1000Error::FrameTooLong);
-        }
-        // Pick the next TX descriptor slot, then reuse that
-        // slot's persistent DMA buffer (audit #4 — pre-fix this
-        // alloc_coherent'd a fresh page per frame and dropped it
-        // on return).
-        let mut tail_g = self.tx_tail.lock();
-        let slot = (*tail_g) as usize % TX_RING_LEN;
-        let phys = self.tx_pool[slot].dma_addr().raw();
-        // SAFETY: identity-mapped DMA buffer; bounds-checked by
-        // the FrameTooLong guard above (1518 < 4096).
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe {
-            for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
-            }
-        }
-        let ring_phys = self.tx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (slot * 16) as u64;
-        let desc = TxDesc {
-            addr: phys,
-            length: frame.len() as u16,
-            cso: 0,
-            cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
-            status: 0,
-            css: 0,
-            special: 0,
-        };
-        // SAFETY: identity-mapped DMA ring page.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
-                desc,
-            );
-        }
-        // Bump TDT.
-        let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_TDT, next_tail);
-        }
-        *tail_g = next_tail;
-        drop(tail_g);
-
-        // Poll for DD. responsive_spin_until ticks sleep_pumps.
-        // 250 ms wall-clock budget covers worst-case Tx-side
-        // congestion stall.
+        let ticket = self.tx_enqueue(frame, true)?;
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: coherent DMA via the kernel direct map.
-            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u8>()) } & TXD_STAT_DD != 0,
+            || self.tx_slot_done(ticket),
             narf_time::Deadline::after_ms(250),
         );
         if !done {
@@ -1275,84 +1327,45 @@ impl E1000 {
         Ok(())
     }
 
-    /// Inspect the TX descriptor most recently posted at `slot` and
-    /// return whether its DD bit is set. Used by `tx_async` to
-    /// detect completion after `wait_for_irq` returns.
-    fn tx_slot_done(&self, slot: usize) -> bool {
-        let ring_phys = self.tx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (slot * 16) as u64;
-        // SAFETY: identity-mapped DMA ring; slot < TX_RING_LEN.
-        let status = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u8>())
-        };
+    fn tx_desc_done(&self, slot: usize) -> bool {
+        let status_off = (slot * core::mem::size_of::<TxDesc>()) as u64 + 12;
+        // SAFETY: coherent DMA ring; `slot < TX_RING_LEN` at every caller.
+        let status = unsafe { core::ptr::read_volatile(self.tx_ring.cpu_ptr_at::<u8>(status_off)) };
         status & TXD_STAT_DD != 0
     }
 
-    /// Enqueue a frame and return the TX descriptor slot index. The
-    /// caller is responsible for awaiting completion (via the
-    /// `tx_async` wrapper, which holds the scratch buffer alive
-    /// until DD is observed).
-    fn tx_enqueue(&self, frame: &[u8]) -> Result<usize, E1000Error> {
-        if frame.is_empty() || frame.len() > 1518 {
-            return Err(E1000Error::FrameTooLong);
-        }
-        // Persistent per-slot buffer (audit #4); same change as the
-        // sync `tx()` path. Returns just the slot id now since the
-        // buffer is owned by the controller and doesn't need to
-        // be moved through the async future.
-        let mut tail_g = self.tx_tail.lock();
-        let slot = (*tail_g) as usize % TX_RING_LEN;
-        let phys = self.tx_pool[slot].dma_addr().raw();
-        // SAFETY: identity-mapped DMA buffer; bounds-checked above.
-        unsafe {
-            for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
+    /// Reclaim completed descriptors in producer order. The shared pool lock
+    /// is nested under `tx_state`; the reverse order never occurs because
+    /// `tx_acquire` drops the pool lock before entering the driver's callback.
+    fn reclaim_tx_locked(&self, state: &mut TxQueueState) {
+        while state.cursor.in_flight != 0 {
+            let slot = state.cursor.next_to_clean;
+            if !self.tx_desc_done(slot) {
+                break;
+            }
+            // Pair the device's DD write with the CPU's later buffer reuse.
+            compiler_fence(Ordering::SeqCst);
+            let completed = state.owned[slot].take();
+            let reclaimed = state.cursor.complete_oldest();
+            debug_assert_eq!(reclaimed, Some(slot));
+            if let Some(buf) = completed {
+                self.tx_zc_pool.release(buf);
             }
         }
-        let ring_phys = self.tx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (slot * 16) as u64;
-        let desc = TxDesc {
-            addr: phys,
-            length: frame.len() as u16,
-            cso: 0,
-            cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
-            status: 0,
-            css: 0,
-            special: 0,
-        };
-        // SAFETY: identity-mapped DMA ring page.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
-                desc,
-            );
-        }
-        let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_TDT, next_tail);
-        }
-        *tail_g = next_tail;
-        Ok(slot)
     }
 
-    /// Zero-copy transmit (P-F): post a TX descriptor pointing straight at
-    /// `buf_phys` (the DMA address of a buffer the stack built the frame into)
-    /// and poll DD, with NO copy into a per-slot buffer — unlike [`Self::tx`],
-    /// which copies the caller's slice. The caller owns the backing buffer and
-    /// must keep it alive until this returns (it does: the call is
-    /// synchronous). Same 250 ms DD budget and lock discipline as `tx`.
-    pub fn tx_dma_frame(&self, buf_phys: u64, len: usize) -> Result<(), E1000Error> {
-        if len == 0 || len > 1518 {
-            return Err(E1000Error::FrameTooLong);
-        }
-        let mut tail_g = self.tx_tail.lock();
-        let slot = (*tail_g) as usize % TX_RING_LEN;
-        let ring_phys = self.tx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (slot * 16) as u64;
+    /// Publish one descriptor after its ring slot and optional owned buffer
+    /// have been reserved under `tx_state`.
+    fn post_tx_locked(
+        &self,
+        state: &TxQueueState,
+        ticket: TxTicket,
+        dma_addr: u64,
+        len: usize,
+        kick: bool,
+    ) {
         let desc = TxDesc {
-            addr: buf_phys,
+            addr: dma_addr,
             length: len as u16,
             cso: 0,
             cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS,
@@ -1360,33 +1373,143 @@ impl E1000 {
             css: 0,
             special: 0,
         };
-        // SAFETY: identity-mapped DMA ring page; slot < TX_RING_LEN.
+        let desc_off = (ticket.slot * core::mem::size_of::<TxDesc>()) as u64;
+        // SAFETY: the cursor only reserves slots in `[0, TX_RING_LEN)` and the
+        // descriptor ring is exactly `TX_RING_LEN * size_of::<TxDesc>()` bytes.
         unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
-                desc,
-            );
+            core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<TxDesc>(desc_off), desc);
         }
-        let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
+        // The descriptor and retained buffer must be globally visible before
+        // a later MMIO doorbell lets hardware fetch them.
         compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_TDT, next_tail);
+        // Batch a TCP burst into one VM-exit/MMIO doorbell. Force a kick at the
+        // one-slot-empty limit so an interrupted producer cannot fill the
+        // software ring with descriptors hardware has never seen.
+        if kick || state.cursor.in_flight >= TX_RING_USABLE {
+            // SAFETY: identity-mapped MMIO; next_to_use is a ring index.
+            unsafe {
+                self.mmio.write32(REG_TDT, state.cursor.next_to_use as u32);
+            }
         }
-        *tail_g = next_tail;
-        drop(tail_g);
+    }
 
-        // Poll for DD (same budget as `tx`); the device reads `buf_phys`
-        // directly during this window.
+    /// Copy into a persistent per-slot buffer and enqueue. Ring-full waits are
+    /// exceptional and bounded; normal traffic publishes immediately.
+    fn tx_enqueue(&self, frame: &[u8], kick: bool) -> Result<TxTicket, E1000Error> {
+        if frame.is_empty() || frame.len() > 1518 {
+            return Err(E1000Error::FrameTooLong);
+        }
+        let mut ticket = None;
+        let posted = narf_scheduler::responsive_spin_until(
+            || {
+                let mut state = self.tx_state.lock();
+                self.reclaim_tx_locked(&mut state);
+                let Some(reserved) = state.cursor.reserve() else {
+                    return false;
+                };
+                let slot = reserved.slot;
+                debug_assert!(state.owned[slot].is_none());
+                // SAFETY: frame length is bounded above; the persistent DMA
+                // allocation is a page and therefore has ample capacity.
+                unsafe {
+                    for (i, b) in frame.iter().enumerate() {
+                        core::ptr::write_volatile(
+                            self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64),
+                            *b,
+                        );
+                    }
+                }
+                self.post_tx_locked(
+                    &state,
+                    reserved,
+                    self.tx_pool[slot].dma_addr().raw(),
+                    frame.len(),
+                    kick,
+                );
+                ticket = Some(reserved);
+                true
+            },
+            narf_time::Deadline::after_ms(250),
+        );
+        if !posted {
+            return Err(E1000Error::TxTimeout);
+        }
+        ticket.ok_or(E1000Error::Other("TX reservation lost"))
+    }
+
+    /// Enqueue a DMA address, optionally transferring ownership of its backing
+    /// buffer to the completion path. The zero-copy fast path uses `owned =
+    /// Some`; the public synchronous compatibility helper uses `None` and
+    /// keeps ownership at its caller until DD.
+    fn tx_enqueue_dma(
+        &self,
+        buf_phys: u64,
+        len: usize,
+        mut owned: Option<DmaBuffer>,
+        kick: bool,
+    ) -> Result<TxTicket, E1000Error> {
+        if len == 0 || len > 1518 {
+            if let Some(buf) = owned.take() {
+                self.tx_zc_pool.release(buf);
+            }
+            return Err(E1000Error::FrameTooLong);
+        }
+        let mut ticket = None;
+        let posted = narf_scheduler::responsive_spin_until(
+            || {
+                let mut state = self.tx_state.lock();
+                self.reclaim_tx_locked(&mut state);
+                let Some(reserved) = state.cursor.reserve() else {
+                    return false;
+                };
+                debug_assert!(state.owned[reserved.slot].is_none());
+                state.owned[reserved.slot] = owned.take();
+                self.post_tx_locked(&state, reserved, buf_phys, len, kick);
+                ticket = Some(reserved);
+                true
+            },
+            narf_time::Deadline::after_ms(250),
+        );
+        if !posted {
+            if let Some(buf) = owned.take() {
+                self.tx_zc_pool.release(buf);
+            }
+            return Err(E1000Error::TxTimeout);
+        }
+        ticket.ok_or(E1000Error::Other("TX reservation lost"))
+    }
+
+    /// Zero-copy synchronous compatibility path. The caller retains the DMA
+    /// buffer and must keep it alive until this method observes DD.
+    pub fn tx_dma_frame(&self, buf_phys: u64, len: usize) -> Result<(), E1000Error> {
+        let ticket = self.tx_enqueue_dma(buf_phys, len, None, true)?;
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: coherent DMA via the kernel direct map.
-            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u8>()) } & TXD_STAT_DD != 0,
+            || self.tx_slot_done(ticket),
             narf_time::Deadline::after_ms(250),
         );
         if !done {
             return Err(E1000Error::TxTimeout);
         }
         Ok(())
+    }
+
+    /// Fire-and-forget zero-copy submission. Ownership moves into the ring and
+    /// the buffer is returned to `tx_zc_pool` only after DD. This is the normal
+    /// stack path and deliberately does not wait for each packet.
+    fn tx_dma_owned(&self, buf: DmaBuffer, len: usize, kick: bool) -> Result<(), E1000Error> {
+        if len > buf.len() {
+            self.tx_zc_pool.release(buf);
+            return Err(E1000Error::FrameTooLong);
+        }
+        let phys = buf.dma_addr().raw();
+        self.tx_enqueue_dma(phys, len, Some(buf), kick).map(|_| ())
+    }
+
+    /// Completion check for sync/async callers. If the slot has already been
+    /// reclaimed and reused, the ticket's descriptor necessarily completed.
+    fn tx_slot_done(&self, ticket: TxTicket) -> bool {
+        let state = self.tx_state.lock();
+        state.cursor.ticket_was_reused(ticket) || self.tx_desc_done(ticket.slot)
     }
 
     /// Drain one received frame from the RX ring, copying it into
@@ -1575,9 +1698,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Ok(t) => t,
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
+    *dev_inner.rx_ipc_prod.lock() = Some(rx_prod);
     let dev = Arc::new(dev_inner);
     *CONTROLLER.lock() = Some(dev.clone());
-    spawn_pumps(dev.clone(), rx_prod, tx_cons);
+    spawn_pumps(dev.clone(), tx_cons);
 
     narf_drivers::record_bound(narf_drivers::BoundDriver {
         name: alloc::string::String::from(name_for(device.id.device)),
@@ -1619,7 +1743,12 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // a pooled DMA buffer and hands it to `e1000_send_frame_zc`, which DMAs it
     // without the per-frame slice copy `e1000_send_frame` does. 2 KiB buffers
     // (max Ethernet frame 1518 < 2048); a TX-ring-deep recycling pool.
-    narf_net::iface::enable_zero_copy_tx(e1000_ifname(), e1000_send_frame_zc, 2048, TX_RING_LEN);
+    narf_net::iface::enable_zero_copy_tx_pool(
+        e1000_ifname(),
+        e1000_send_frame_zc,
+        dev.tx_zc_pool.clone(),
+        0,
+    );
 
     // Stage-4 registry (cap-gated)
     let auth = match narf_net::trusted_net_authority() {
@@ -1633,14 +1762,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     Ok(())
 }
 
-fn spawn_pumps(
-    device: Arc<E1000>,
-    rx_prod: Producer<Frame, RX_RING_N>,
-    tx_cons: Consumer<Frame, TX_RING_N>,
-) {
+fn spawn_pumps(device: Arc<E1000>, tx_cons: Consumer<Frame, TX_RING_N>) {
     let d1 = device.clone();
     narf_scheduler::spawn(async move {
-        e1000_rx_pump(d1, rx_prod).await;
+        e1000_rx_pump(d1).await;
     });
 
     let d2 = device;
@@ -1649,7 +1774,7 @@ fn spawn_pumps(
     });
 }
 
-async fn e1000_rx_pump(device: Arc<E1000>, mut rx_prod: Producer<Frame, RX_RING_N>) {
+async fn e1000_rx_pump(device: Arc<E1000>) {
     // Adaptive RX poll. The old form `yield_now().await` every loop made
     // this task self-wake on EVERY executor round — a perpetually-runnable
     // task that kept the cooperative executor from ever halting
@@ -1664,17 +1789,10 @@ async fn e1000_rx_pump(device: Arc<E1000>, mut rx_prod: Producer<Frame, RX_RING_
     // while frames are actually flowing.
     const IDLE_BACKOFF_ROUNDS: u32 = 64;
     let idle_park_cycles = narf_time::ns_to_cycles(1_000_000);
-    let mut buf = [0u8; 2048];
     let mut idle_rounds: u32 = 0;
     loop {
-        let n = device.rx_recv(&mut buf);
-        if n > 0 {
+        if device.rx_recv_in_place(|frame| dispatch_rx_frame(&device, frame)) {
             idle_rounds = 0;
-            // Push to network stack.
-            let dma_buf = alloc_coherent(n, crate::BUILTIN_DOMAIN).expect("Frame alloc failed");
-            let mut frame = Frame::new(dma_buf, n as u32);
-            frame.payload_mut().copy_from_slice(&buf[..n]);
-            let _ = rx_prod.send(frame).await;
             continue;
         }
         idle_rounds = idle_rounds.saturating_add(1);
@@ -1701,9 +1819,31 @@ async fn e1000_tx_pump(device: Arc<E1000>, mut tx_cons: Consumer<Frame, TX_RING_
     }
 }
 
+/// Single RX fan-out used by both the async task and syscall-context drain.
+/// Previously the async task consumed frames into the raw frame ring while
+/// `rx_pump_step` independently consumed frames into TCP; whichever won the
+/// race stole the packet from the other path. In particular, lost TCP ACKs
+/// collapsed e1000 throughput into multi-second RTO gaps.
+fn dispatch_rx_frame(device: &E1000, frame: &mut [u8]) {
+    // Preserve the raw frame-ring contract only after a consumer attaches.
+    // The copy happens before stack/XDP dispatch because that path may mutate
+    // headers in place. A full or closed observer ring drops its mirror, never
+    // the packet destined for the live network stack.
+    if device.rx_mirror_enabled.load(Ordering::Acquire) {
+        if let Ok(dma_buf) = alloc_coherent(frame.len(), crate::BUILTIN_DOMAIN) {
+            let mut mirror = Frame::new(dma_buf, frame.len() as u32);
+            mirror.payload_mut().copy_from_slice(frame);
+            if let Some(prod) = device.rx_ipc_prod.lock().as_mut() {
+                let _ = prod.try_send(mirror);
+            }
+        }
+    }
+    narf_net::iface::on_rx_frame_from(e1000_ifname(), frame);
+}
+
 /// SendFn registered with `narf_net::iface` at probe time. Routes
 /// the kernel-side TCP stack's outbound frames through E1000::tx.
-fn e1000_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
+fn e1000_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     // Clone the Arc out rather than holding the IRQ-masking CONTROLLER
     // lock across `tx`, which busy-polls the DD bit for up to 250 ms.
     // Holding it here masked interrupts on this CPU for the whole
@@ -1711,26 +1851,26 @@ fn e1000_send_frame(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     // spin on the same lock, interrupts masked — a thundering herd that
     // starves timers and RCU. See `probed_controller`.
     let ctrl = probed_controller().ok_or(())?;
-    ctrl.tx(frame).map_err(|_| ())
+    ctrl.tx_enqueue(frame, !meta.more)
+        .map(|_| ())
+        .map_err(|_| ())
 }
 
 /// Zero-copy `SendFrameFn` (P-F): the stack built this frame directly into a
-/// DMA buffer from the iface TX pool, so DMA it straight from that buffer with
-/// no copy, then recycle the buffer back to the pool. e1000 TX is synchronous
-/// (`tx_dma_frame` polls DD before returning), so the device is done reading
-/// the buffer the moment the call returns — the recycle is safe immediately,
-/// on both success and failure.
-fn e1000_send_frame_zc(frame: narf_net::Frame, _meta: narf_net::TxMeta) -> Result<(), ()> {
-    // `Frame::new` built it at offset 0, so `into_parts` gives the payload at
-    // the buffer origin — exactly what the device DMAs.
-    let (buf, len) = frame.into_parts();
-    let phys = buf.dma_addr().raw();
-    let result = match probed_controller() {
-        Some(c) => c.tx_dma_frame(phys, len as usize).map_err(|_| ()),
+/// DMA buffer from the controller's shared TX pool. Transfer ownership to the
+/// descriptor ring and return after publication; completion reclaim recycles
+/// the buffer only after hardware writes DD.
+fn e1000_send_frame_zc(frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result<(), ()> {
+    let (buf, offset, len) = frame.into_parts_with_offset();
+    if offset != 0 {
+        return Err(());
+    }
+    match probed_controller() {
+        Some(c) => c
+            .tx_dma_owned(buf, len as usize, !meta.more)
+            .map_err(|_| ()),
         None => Err(()),
-    };
-    narf_net::iface::tx_release(e1000_ifname(), buf);
-    result
+    }
 }
 
 /// Drain one frame from the RX ring + dispatch it through the
@@ -1746,9 +1886,7 @@ pub fn rx_pump_step() -> bool {
     // program rewriting header bytes writes the DMA page directly, which the
     // driver owns until it re-arms the slot after dispatch returns.
     match probed_controller() {
-        Some(c) => c.rx_recv_in_place(|frame| {
-            narf_net::iface::on_rx_frame_from(e1000_ifname(), frame);
-        }),
+        Some(c) => c.rx_recv_in_place(|frame| dispatch_rx_frame(&c, frame)),
         None => false,
     }
 }
@@ -1988,6 +2126,9 @@ impl narf_net::Interface for E1000Nic {
             let mut r = RING.lock();
             if r.is_none() {
                 *r = c.rx_ipc_ring.lock().take();
+                if r.is_some() {
+                    c.rx_mirror_enabled.store(true, Ordering::Release);
+                }
             }
         });
         &RING
@@ -2049,7 +2190,7 @@ pub fn is_probed() -> bool {
 /// which starves timers and RCU exactly like the virtio-blk CONTROLLER
 /// herd. Cloning the `Arc` out instead keeps the device alive without
 /// any lock held; mutual exclusion on the rings is provided by the
-/// controller's own `tx_tail`/`rx_head` locks, which are held only
+/// controller's own `tx_state`/`rx_head` locks, which are held only
 /// across the bounded descriptor post/drain, never across the DD poll.
 pub fn probed_controller() -> Option<Arc<E1000>> {
     CONTROLLER.lock().clone()
@@ -2121,7 +2262,7 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     // normally; if it doesn't, the IRQ isn't wired right and we
     // should bail rather than stall.
     let waiter = narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(500));
-    let slot = match with_controller(|c| c.tx_enqueue(frame))
+    let ticket = match with_controller(|c| c.tx_enqueue(frame, true))
         .unwrap_or(Err(E1000Error::UnsupportedDevice))
     {
         Ok(s) => s,
@@ -2136,7 +2277,7 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
     // deadline; if we hit 5 spurious wakes the caller's higher-
     // level timeout (sys_send, etc.) will abort us.
     let _ = waiter.await;
-    while !with_controller(|c| c.tx_slot_done(slot)).unwrap_or(false) {
+    while !with_controller(|c| c.tx_slot_done(ticket)).unwrap_or(false) {
         let _ =
             narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(500)).await;
     }

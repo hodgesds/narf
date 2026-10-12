@@ -7514,7 +7514,7 @@ kernel_test_in!("net/tcp", smoke_tcp_setsockopt_maxseg_floor);
 
 fn smoke_tcp_transport_options_reach_live_tcb() -> TestResult {
     use crate::tcp::core::{
-        __install_test_tcb, __with_tcb_mut, getsockopt_int, send_errno, setsockopt_int,
+        __install_test_tcb, __with_tcb_mut, getsockopt_int, send_errno, setsockopt_int, writable,
         TCP_DEFER_ACCEPT, TCP_NOTSENT_LOWAT, TCP_SYNCNT, TCP_THIN_DUPACK, TCP_THIN_LINEAR_TIMEOUTS,
     };
     use crate::tcp::state_machine::TcpState;
@@ -7544,6 +7544,13 @@ fn smoke_tcp_transport_options_reach_live_tcb() -> TestResult {
         || send_errno(id, b"e") != Err(narf_lib::errno::EAGAIN as i32)
     {
         return TestResult::Fail("TCP_NOTSENT_LOWAT did not apply backpressure");
+    }
+    if writable(id) {
+        return TestResult::Fail("full TCP_NOTSENT_LOWAT queue still reported writable");
+    }
+    __with_tcb_mut(id, |t| t.notsent_lowat = 5).expect("installed TCB");
+    if !writable(id) {
+        return TestResult::Fail("TCP_NOTSENT_LOWAT space did not restore writable readiness");
     }
     TestResult::Pass
 }

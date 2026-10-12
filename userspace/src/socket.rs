@@ -4052,26 +4052,30 @@ impl SocketFile {
                 }
                 Some(ready)
             }
-            // Kernel-TCP: reconcile the durable cell to the live level (so a
-            // drained socket doesn't report a stale POLL_IN and a re-arm doesn't
-            // spuriously return Ready), then arm. POLL_OUT stays set — a
-            // kernel-TCP socket is always sendable. The RX wake path
-            // (`wake_io_waiters` → cell.set POLL_IN) drives the readable edge.
+            // Kernel-TCP: reconcile both directions to the live level before
+            // arming. RX/close events drive POLL_IN; ACKs that free send-buffer
+            // space drive POLL_OUT.
             Arm::Wired(tcb_id) => {
-                let readable = narf_net::tcp_stack::readable(tcb_id);
                 let cell = crate::handlers::tcb_cell(tcb_id);
-                cell.set(
-                    if readable {
+                let directions = narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT;
+                // Sample only after the cell exists, then verify once after
+                // publishing. An ACK can race the first sample: its notify
+                // sets POLL_OUT, and a stale "full" sample must not clear that
+                // edge immediately before `arm` registers the writer. The
+                // second sample closes that check/publish window; an event
+                // after it is serialized by Readiness::set vs arm.
+                for _ in 0..2 {
+                    let live = (if narf_net::tcp_stack::readable(tcb_id) {
                         narf_filesystem::POLL_IN
                     } else {
                         0
-                    },
-                    if readable {
-                        0
+                    }) | (if narf_net::tcp_stack::writable(tcb_id) {
+                        narf_filesystem::POLL_OUT
                     } else {
-                        narf_filesystem::POLL_IN
-                    },
-                );
+                        0
+                    });
+                    cell.set(live, directions & !live);
+                }
                 Some(arm_one(
                     &cell,
                     interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
@@ -4261,14 +4265,14 @@ impl SocketFile {
                 bits
             }
             SocketState::InetWired { tcb_id, .. } | SocketState::Inet6Wired { tcb_id, .. } => {
-                // Kernel-TCP-over-NIC: always writable (the stack
-                // queues + flow-controls send), and POLL_IN when the
-                // TCB has buffered RX data or the peer has closed
-                // (read returns EOF). This is what makes epoll/poll/
-                // select on a kernel-TCP socket wake on inbound data.
-                let mut bits = narf_filesystem::POLL_OUT;
+                // Kernel-TCP-over-NIC: POLL_OUT follows actual send-buffer
+                // capacity, and POLL_IN follows buffered RX data or closure.
+                let mut bits = 0;
                 if narf_net::tcp_stack::readable(*tcb_id) {
                     bits |= narf_filesystem::POLL_IN;
+                }
+                if narf_net::tcp_stack::writable(*tcb_id) {
+                    bits |= narf_filesystem::POLL_OUT;
                 }
                 // Reconcile the durable cell against this level so a socket the
                 // app just drained stops reporting readable in the cell (else a
@@ -4276,10 +4280,8 @@ impl SocketFile {
                 // RX wake set the rising edge. Only touch an existing cell — do
                 // not create one here (poll may run on a never-armed fd).
                 if let Some(cell) = crate::handlers::tcb_cell_lookup(*tcb_id) {
-                    cell.set(
-                        bits & narf_filesystem::POLL_IN,
-                        narf_filesystem::POLL_IN & !bits,
-                    );
+                    let directions = narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT;
+                    cell.set(bits & directions, directions & !bits);
                 }
                 bits
             }
@@ -10722,6 +10724,75 @@ fn smoke_wired_listener_readiness_shares_accept_cell() -> TestResult {
 kernel_test_in!(
     "userspace/socket",
     smoke_wired_listener_readiness_shares_accept_cell
+);
+
+/// A full kernel-TCP send queue must clear POLL_OUT so a blocking writer can
+/// actually park. When capacity returns, the TCB-keyed readiness notification
+/// must raise POLL_OUT and wake the writer's durable waiter.
+fn smoke_wired_tcp_send_backpressure_drives_readiness() -> TestResult {
+    use core::sync::atomic::Ordering;
+    use core::task::Poll;
+    use narf_net::tcp::core::{__install_test_tcb, __with_tcb_mut};
+    use narf_net::tcp_stack::{
+        release, remove_tcb, send_errno, setsockopt_int, TcpState, TCP_NOTSENT_LOWAT,
+    };
+
+    let id = __install_test_tcb(
+        [10, 0, 2, 15],
+        31_124,
+        [10, 0, 2, 2],
+        5201,
+        TcpState::Established,
+    );
+    __with_tcb_mut(id, |t| t.snd_wnd = 0).expect("installed TCB");
+    setsockopt_int(id, TCP_NOTSENT_LOWAT, 4).expect("set TCP_NOTSENT_LOWAT");
+    let socket = SocketFile::new(AF_INET, SOCK_STREAM);
+    *socket.state.lock() = SocketState::InetWired {
+        tcb_id: id,
+        peer_addr: u32::from_be_bytes([10, 0, 2, 2]),
+        peer_port: 5201,
+    };
+
+    let result = (|| {
+        if send_errno(id, b"full") != Ok(4) {
+            return Err("setup write did not fill TCP_NOTSENT_LOWAT queue");
+        }
+        if socket.poll_readiness() & narf_filesystem::POLL_OUT != 0 {
+            return Err("full kernel-TCP send queue still reported POLL_OUT");
+        }
+
+        let wakes = alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(0));
+        let waker = counting_waker(&wakes);
+        if !matches!(
+            socket.arm_readiness(0xacce_0003, narf_filesystem::POLL_OUT, &waker),
+            Some(Poll::Pending)
+        ) {
+            return Err("full kernel-TCP send queue did not park its writer");
+        }
+
+        __with_tcb_mut(id, |t| t.notsent_lowat = 5).expect("installed TCB");
+        crate::handlers::wake_io_waiters(id as u64);
+        if wakes.load(Ordering::Acquire) == 0 {
+            return Err("restored kernel-TCP send capacity did not wake writer");
+        }
+        if socket.poll_readiness() & narf_filesystem::POLL_OUT == 0 {
+            return Err("restored kernel-TCP send capacity did not publish POLL_OUT");
+        }
+        Ok(())
+    })();
+
+    socket.disarm_readiness(0xacce_0003);
+    crate::handlers::clear_tcb_owner(id);
+    remove_tcb(id);
+    release(id);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+kernel_test_in!(
+    "userspace/socket",
+    smoke_wired_tcp_send_backpressure_drives_readiness
 );
 
 /// The durable-wake migration: a group-2 broadcast must fire the subscriber's

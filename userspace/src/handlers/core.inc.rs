@@ -220,17 +220,20 @@ static TCB_CELL: [narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u32, alloc::sync::Arc<narf_lib::readiness::Readiness>>>,
 >; WAKE_SHARDS] = [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; WAKE_SHARDS];
 
-/// Get-or-create the durable readiness cell for `tcb_id`. A fresh cell starts
-/// `POLL_OUT` (a kernel-TCP socket is always sendable — the stack queues and
-/// flow-controls the send side), matching `poll_readiness`'s `InetWired` level.
+/// Get-or-create the durable readiness cell for `tcb_id`. Its initial
+/// `POLL_OUT` level follows the live TCP send-buffer capacity; a full buffer
+/// must let a blocking writer park until an ACK frees space.
 pub fn tcb_cell(tcb_id: u32) -> alloc::sync::Arc<narf_lib::readiness::Readiness> {
+    let initial = if narf_net::tcp_stack::writable(tcb_id) {
+        narf_filesystem::POLL_OUT
+    } else {
+        0
+    };
     let mut g = TCB_CELL[tcb_owner_shard(tcb_id)].lock();
     g.get_or_insert_with(alloc::collections::BTreeMap::new)
         .entry(tcb_id)
         .or_insert_with(|| {
-            alloc::sync::Arc::new(narf_lib::readiness::Readiness::new(
-                narf_filesystem::POLL_OUT,
-            ))
+            alloc::sync::Arc::new(narf_lib::readiness::Readiness::new(initial))
         })
         .clone()
 }
@@ -342,16 +345,31 @@ pub(crate) fn wake_one_urgent(task_id: u64, w: core::task::Waker) {
 /// covers the race). Untracked keys fall back to waking everyone.
 pub fn wake_io_waiters(key: u64) {
     if key != 0 {
-        // Event-driven edge: mark this socket's durable cell readable so a
-        // waiter armed on the cell (epoll's per-fd ready-list linkage) wakes
-        // carrying the fd, rather than rescanning the whole interest set. The
-        // cell's own `set` fires its armed wakers; the owner wake below remains
-        // for the legacy (non-cell-armed) path and is harmless otherwise.
+        // Reconcile both directions with the live TCP level. RX data and
+        // accept-queue events publish POLL_IN; ACKs that release send-buffer
+        // space publish POLL_OUT. Keeping POLL_OUT latched while the buffer is
+        // full makes a blocking write re-execute in a tight loop and prevents
+        // pthread cancellation from reaching userspace.
         if let Some(cell) = tcb_cell_lookup(key as u32) {
-            cell.set(narf_filesystem::POLL_IN, 0);
+            let readable = narf_net::tcp_stack::readable(key as u32)
+                || narf_net::tcp_stack::listen_has_pending(key as u32);
+            let writable = narf_net::tcp_stack::writable(key as u32);
+            let live = (if readable {
+                narf_filesystem::POLL_IN
+            } else {
+                0
+            }) | (if writable {
+                narf_filesystem::POLL_OUT
+            } else {
+                0
+            });
+            let directions = narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT;
+            cell.set(live, directions & !live);
             // Linux wait-queue: fire on every RX event, even more data at the
             // same readable level (the token used to cover this edge).
-            cell.notify(narf_filesystem::POLL_IN);
+            if readable {
+                cell.notify(narf_filesystem::POLL_IN);
+            }
         }
         if let Some(owner) = tcb_owner(key as u32) {
             // Owner known: targeted wake iff it's parked.

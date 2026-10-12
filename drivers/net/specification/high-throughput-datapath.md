@@ -161,8 +161,10 @@ progress toward line rate.
   in place from the DMA page (no scratch copy); and zero-copy TX is wired end to
   end for IPv4 — the stack builds egress frames straight into a pooled DMA
   buffer (`iface::tx_acquire`) and hands ownership to the driver
-  (`SendFrameFn`/`xmit_frame`), with e1000 DMAing it directly and recycling via
-  `tx_release`. virtio-net also does zero-copy TX, via the shared-pool +
+  (`SendFrameFn`/`xmit_frame`), with e1000 DMAing it directly, retaining it in
+  the descriptor slot through DD, and recycling through the shared pool. Its
+  256-entry ring batches `TxMeta::more` bursts into one TDT doorbell.
+  virtio-net also does zero-copy TX, via the shared-pool +
   head-room variant of the contract (`enable_zero_copy_tx_pool`): it shares its
   own `Arc<DmaPool>` so the stack's `tx_acquire` and its async TX reaper use one
   free-list, and reserves 12 bytes of head-room for the virtio-net header
