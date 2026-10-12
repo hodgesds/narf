@@ -29,21 +29,20 @@ per-byte work to hardware** (checksum), **amortize per-packet overhead**
   memmove, and move-semantics through the rings preserve single-owner. The
   copy-free RX path is already expressible.
 - **An offload model**: `OffloadCapabilities { tx_checksum, rx_checksum,
-  max_tso_bytes, vlan_insert }`, `TxMeta { csum_l4, tso_mss, vlan_tag }`,
+  max_tso_bytes, vlan_insert }`, `TxMeta { csum_l4, tso_mss, vlan_tag, more }`,
   `RxMeta { csum_l3, csum_l4 }`.
 - **Driver-side offload machinery**: `ixgbe` and `i40e` already build TSO
   context descriptors and checksum-offload TX descriptors and honor
-  `TxMeta::tso_mss`/`csum_l4`. `mlx5` has an RSS RQT. virtio-net has
-  multi-queue, NAPI (EVENT_IDX re-arm), RSS/RFS steering, and mergeable RX
-  buffers.
+  `TxMeta::tso_mss`/`csum_l4`. e1000 now consumes IPv4 TCP TSO requests with a
+  bounded 16 KiB super-frame. `mlx5` has an RSS RQT. virtio-net has multi-queue,
+  NAPI (EVENT_IDX re-arm), RSS/RFS steering, and mergeable RX buffers.
 
 ### What's missing (the gaps that cap throughput)
 
-1. **The stack never requests offloads.** Nothing in `net/src/tcp/` or
-   `net/src/stack.rs` ever calls `set_tx_meta`/`TxMeta::with_tso`/`csum_l4`.
-   The TCP TX path emits MSS-sized segments and computes software checksums,
-   so even the 10/40G drivers run their slow path. **This is the single
-   biggest lever.**
+1. **Offload coverage remains uneven.** TCP emits negotiated IPv4 TSO
+   super-frames and checksum requests, and e1000 consumes its bounded IPv4
+   profile. IPv6 TSO, UDP checksum-offload integration, and equivalent live
+   paths across every advertising driver remain open.
 2. **No RX coalescing (GRO/LRO).** Each received segment traverses the stack
    individually; `RxMeta` has no GRO/hash fields.
 3. **No batching across the driver↔stack boundary.** The handoff is one
@@ -53,9 +52,9 @@ per-byte work to hardware** (checksum), **amortize per-packet overhead**
 4. **Multi-queue isn't first-class.** `Interface` exposes a single
    `rx_ring()`/`tx_ring()`; virtio does mq internally but the stack sees one
    queue, so RX can't fan out across cores.
-5. **Per-driver copies / synchronous TX.** e1000 copies each frame byte-by-byte
-   and polls DD for up to 250 ms per frame (no pipelining). The zero-copy
-   `Frame` is not used on its TX path.
+5. **Per-driver adoption is incomplete.** e1000 now transfers pooled frame
+   ownership into a 256-entry pipelined TX ring and batches doorbells, but not
+   every driver uses the shared zero-copy/recycling contract yet.
 6. **Fixed shallow rings** and per-frame DMA allocation in some drivers
    (no recycling pool), causing allocator pressure at high pps.
 
@@ -124,7 +123,7 @@ progress toward line rate.
 
 | Driver  | Speed | Today | Target work |
 |---------|-------|-------|-------------|
-| e1000   | 1 G   | 8→256 RX ring (fixed); byte-copy, sync TX | zero-copy + batched RX; reference-simple, not a perf target |
+| e1000   | 1 G   | 256-entry pipelined zero-copy TX; 16 KiB IPv4 TSO; unified RX dispatch | multi-queue/GRO if justified; reference-simple, not a high-speed target |
 | igc     | 2.5 G | basic | batched datapath |
 | ixgbe   | 10 G  | TSO + csum descriptors present, unused by stack | drive TSO/csum from stack; mq/RSS; NAPI |
 | i40e    | 40 G  | caps advertise TSO/csum | same + deep rings |
@@ -138,7 +137,9 @@ progress toward line rate.
   counters (P-C, P-G). Biggest amortization win; no protocol changes.
 - **P2 — TX offloads driven by the stack.** TCP emits TSO super-frames +
   checksum-offload requests when the iface advertises them; drivers already
-  honor `TxMeta` (P-A). Validate with ixgbe/i40e/virtio.
+  honor `TxMeta` (P-A). _Partially landed:_ the IPv4 TCP stack emits bounded
+  TSO super-frames, and e1000's live path encodes 8254x context plus 4 KiB data
+  descriptors. IPv6 and broader driver validation remain.
 - **P3 — GRO on RX.** Software GRO stage + `RxMeta` flow-hash/seg-count
   extensions (P-B). _Landed:_ the `net::gro` engine plus live wiring into
   `tcp_stack::rx_handler` — per-CPU, iface-tagged, sitting after XDP/AF_PACKET
@@ -161,8 +162,11 @@ progress toward line rate.
   in place from the DMA page (no scratch copy); and zero-copy TX is wired end to
   end for IPv4 — the stack builds egress frames straight into a pooled DMA
   buffer (`iface::tx_acquire`) and hands ownership to the driver
-  (`SendFrameFn`/`xmit_frame`), with e1000 DMAing it directly and recycling via
-  `tx_release`. virtio-net also does zero-copy TX, via the shared-pool +
+  (`SendFrameFn`/`xmit_frame`), with e1000 DMAing it directly, retaining it in
+  the descriptor slot through DD, and recycling through the shared pool. Its
+  256-entry ring batches `TxMeta::more` bursts into one TDT doorbell and uses
+  the same pool for bounded 16 KiB IPv4 TSO super-frames.
+  virtio-net also does zero-copy TX, via the shared-pool +
   head-room variant of the contract (`enable_zero_copy_tx_pool`): it shares its
   own `Arc<DmaPool>` so the stack's `tx_acquire` and its async TX reaper use one
   free-list, and reserves 12 bytes of head-room for the virtio-net header

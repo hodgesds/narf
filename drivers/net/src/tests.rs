@@ -1049,20 +1049,35 @@ kernel_test_in!("drivers/net/vmxnet3", smoke_vmxnet3_reset_cmd_encode);
 
 fn smoke_e1000_tso_desc_encode() -> TestResult {
     use crate::e1000::{
-        TxDesc, TXD_CMD_DEXT, TXD_CMD_TSE, TXD_DTYP_D, TXD_OPTS_IXSM, TXD_OPTS_TXSM,
+        TxContextDesc, TxDesc, TXD_CMD_DEXT, TXD_CMD_TSE, TXD_DTYP_D, TXD_OPTS_IXSM, TXD_OPTS_TXSM,
     };
     let d = TxDesc::with_tso(0x1234_0000u64, 1448, 1448);
+    let c = TxContextDesc::ipv4_tso(20, 32, 12_000, 1448);
     if d.cmd & TXD_CMD_DEXT == 0 {
         return TestResult::Fail("e1000 TSO: TXD_CMD_DEXT not set");
     }
     if d.cmd & TXD_CMD_TSE == 0 {
         return TestResult::Fail("e1000 TSO: TXD_CMD_TSE not set");
     }
-    if d.cmd & TXD_DTYP_D == 0 {
-        return TestResult::Fail("e1000 TSO: TXD_DTYP_D not set");
+    if d.cso & TXD_DTYP_D == 0 || d.cmd & TXD_DTYP_D != 0 {
+        return TestResult::Fail("e1000 TSO: TXD_DTYP_D not in lower bit 20");
     }
     if d.css & TXD_OPTS_IXSM == 0 || d.css & TXD_OPTS_TXSM == 0 {
         return TestResult::Fail("e1000 TSO: IXSM/TXSM not set");
+    }
+    if c.ipcss != 14 || c.ipcso != 24 || c.ipcse != 33 {
+        return TestResult::Fail("e1000 TSO: IPv4 context offsets wrong");
+    }
+    if c.tucss != 34 || c.tucso != 50 || c.hdr_len != 66 {
+        return TestResult::Fail("e1000 TSO: TCP context offsets wrong");
+    }
+    if c.mss != 1448 || c.cmd_and_length & 0x000f_ffff != 12_000 {
+        return TestResult::Fail("e1000 TSO: MSS/payload length wrong");
+    }
+    if c.cmd_and_length & ((1 << 29) | (1 << 26) | (1 << 25) | (1 << 24))
+        != ((1 << 29) | (1 << 26) | (1 << 25) | (1 << 24))
+    {
+        return TestResult::Fail("e1000 TSO: context command bits wrong");
     }
     TestResult::Pass
 }
@@ -1074,8 +1089,8 @@ fn smoke_e1000_csum_offload_bits() -> TestResult {
     if d.cmd & TXD_CMD_DEXT == 0 {
         return TestResult::Fail("e1000 csum: TXD_CMD_DEXT not set");
     }
-    if d.cmd & TXD_DTYP_D == 0 {
-        return TestResult::Fail("e1000 csum: TXD_DTYP_D not set");
+    if d.cso & TXD_DTYP_D == 0 || d.cmd & TXD_DTYP_D != 0 {
+        return TestResult::Fail("e1000 csum: TXD_DTYP_D not in lower bit 20");
     }
     if d.css & TXD_OPTS_IXSM == 0 {
         return TestResult::Fail("e1000 csum: IXSM not set");
@@ -1546,6 +1561,9 @@ fn smoke_txmeta_default_is_plain() -> TestResult {
     if m.vlan_tag.is_some() {
         return TestResult::Fail("default TxMeta must not request VLAN");
     }
+    if m.more {
+        return TestResult::Fail("default TxMeta must flush its burst");
+    }
     TestResult::Pass
 }
 kernel_test_in!("narf-net", smoke_txmeta_default_is_plain);
@@ -1561,6 +1579,13 @@ fn smoke_txmeta_with_tso_sets_fields() -> TestResult {
     }
     if m.vlan_tag.is_some() {
         return TestResult::Fail("with_tso: vlan_tag must be None");
+    }
+    if m.more {
+        return TestResult::Fail("with_tso: more must default false");
+    }
+    let batched = m.with_more(true);
+    if !batched.more || batched.tso_mss != Some(1448) {
+        return TestResult::Fail("with_more must preserve TSO metadata");
     }
     TestResult::Pass
 }
@@ -1747,8 +1772,8 @@ fn smoke_e1000_txmeta_tso_selects_desc() -> TestResult {
     if d.cmd & TXD_CMD_DEXT == 0 {
         return TestResult::Fail("e1000 tx/meta: DEXT not set");
     }
-    if d.cmd & TXD_DTYP_D == 0 {
-        return TestResult::Fail("e1000 tx/meta: DTYP_D not set");
+    if d.cso & TXD_DTYP_D == 0 || d.cmd & TXD_DTYP_D != 0 {
+        return TestResult::Fail("e1000 tx/meta: DTYP_D not in lower bit 20");
     }
     TestResult::Pass
 }

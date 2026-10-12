@@ -42,9 +42,9 @@ pub use crate::tcp::core::{
     connect_in, endpoints6, getsockopt_cong, getsockopt_int, listen, listen6_in,
     listen_has_pending, listen_in, lookup_tcb, readable, recv, recv_errno, release, remove_tcb,
     send, send_errno, setsockopt_int, setsockopt_str, shutdown, shutdown_errno, take_sock_error,
-    tick_retransmit, Tcb, TCP_CONGESTION, TCP_CORK, TCP_DEFER_ACCEPT, TCP_KEEPALIVE, TCP_KEEPCNT,
-    TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_NOTSENT_LOWAT, TCP_QUICKACK,
-    TCP_SYNCNT, TCP_THIN_DUPACK, TCP_THIN_LINEAR_TIMEOUTS, TCP_USER_TIMEOUT,
+    tick_retransmit, writable, Tcb, TCP_CONGESTION, TCP_CORK, TCP_DEFER_ACCEPT, TCP_KEEPALIVE,
+    TCP_KEEPCNT, TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_MAXSEG, TCP_NODELAY, TCP_NOTSENT_LOWAT,
+    TCP_QUICKACK, TCP_SYNCNT, TCP_THIN_DUPACK, TCP_THIN_LINEAR_TIMEOUTS, TCP_USER_TIMEOUT,
 };
 pub use crate::tcp::state_machine::{DropCause, Shutdown, TcpState};
 

@@ -114,6 +114,9 @@ profile: TCP/UDP TX checksum, RX checksum reporting, maximum TSO frame bytes
 Producers must negotiate before setting `TxMeta`. Packets contain ordinary wire
 headers; drivers prepare hardware checksum seeds, validate lengths and reject
 unsupported requests rather than transmit partially checksummed packets.
+Until the capability contract grows protocol-specific TSO flags, the TCP stack
+consumes `max_tso_bytes` for IPv4 only; IPv6 remains software-segmented even
+when a device advertises the generic limit.
 `RxMeta::csum_l3` means a verified IPv4 header checksum; IPv6 never sets it.
 `csum_l4` means verified TCP/UDP. Consumers verify in software whenever a flag
 is false. These fields describe the in-kernel frame-ring contract; they do not
@@ -569,12 +572,20 @@ pub fn connect6_errno_in(ns: u64, addr: [u8; 16], port: u16) -> Result<u32, i32>
 pub fn listen6_in(ns: u64, addr: [u8; 16], port: u16, backlog: usize) -> Result<u32, ()>;
 pub fn send_errno(id: u32, buf: &[u8]) -> Result<usize, i32>;
 pub fn recv_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32>; // Ok(0) = EOF
+pub fn readable(id: u32) -> bool; // recv would not return EAGAIN
+pub fn writable(id: u32) -> bool; // send would not return EAGAIN
 pub fn shutdown_errno(id: u32, how: Shutdown) -> Result<(), i32>;
 pub fn take_sock_error(id: u32) -> i32;  // getsockopt(SO_ERROR); 0 = none
 pub fn release(id: u32);                 // socket closed: forget the TCB id
 pub fn signal_icmp_error_in(ns, local, lport, remote, rport,
                             icmp_type: u8, icmp_code: u8, seq: u32);
 ```
+
+`TxMeta::more` is the ordered-burst doorbell hint (Linux
+`netdev_xmit_more()` semantics): `true` permits a driver to defer its hardware
+queue notification because another frame follows immediately; `false` is a
+flush boundary. Drivers must force a notification before their software ring
+fills, so an interrupted producer cannot strand descriptors indefinitely.
 
 The legacy `connect_in` / `send` / `recv` / `shutdown` (`Result<_, ()>`)
 remain for in-kernel callers that do not report errors.

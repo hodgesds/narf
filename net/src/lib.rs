@@ -878,6 +878,11 @@ pub struct TxMeta {
     /// 802.1Q VLAN tag to insert (12-bit VID + 3-bit PCP + CFI).
     /// `None` = no VLAN insertion.
     pub vlan_tag: Option<u16>,
+    /// The producer will immediately submit another frame from the same
+    /// ordered burst. Drivers may defer a queue doorbell while this is true,
+    /// but must force one before their ring becomes full. `false` is a flush
+    /// boundary and preserves the ordinary single-frame latency path.
+    pub more: bool,
 }
 
 impl TxMeta {
@@ -887,6 +892,7 @@ impl TxMeta {
             csum_l4: None,
             tso_mss: None,
             vlan_tag: None,
+            more: false,
         }
     }
 
@@ -896,6 +902,7 @@ impl TxMeta {
             csum_l4: Some(kind),
             tso_mss: None,
             vlan_tag: None,
+            more: false,
         }
     }
 
@@ -905,7 +912,15 @@ impl TxMeta {
             csum_l4: Some(L4CsumKind::Tcp),
             tso_mss: Some(mss),
             vlan_tag: None,
+            more: false,
         }
+    }
+
+    /// Mark whether another ordered frame follows immediately. This mirrors
+    /// Linux's `netdev_xmit_more()` batching hint without changing offloads.
+    pub const fn with_more(mut self, more: bool) -> Self {
+        self.more = more;
+        self
     }
 }
 
