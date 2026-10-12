@@ -1924,6 +1924,10 @@ fn smoke_abi_proc2_ptrace_cont_bad_signal_is_eio() -> TestResult {
             if call(Syscall::Ptrace.raw(), a3(PTRACE_CONT, TRACEE_PID, 0, 0)) != Some(0) {
                 return Err("PTRACE_CONT with no signal must succeed");
             }
+            // The successful resume left the stop; `ptrace_check_attach`
+            // rejects a running tracee with -ESRCH, so re-enter the stop
+            // before exercising the boundary.
+            crate::ptrace::__test_set_tracee_stopped(TRACEE_PID, true);
             if call(Syscall::Ptrace.raw(), a3(PTRACE_CONT, TRACEE_PID, 0, 64)) != Some(0) {
                 return Err("PTRACE_CONT with signal 64 (_NSIG) must succeed");
             }
