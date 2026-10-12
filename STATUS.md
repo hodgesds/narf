@@ -384,7 +384,14 @@ Already-retired streams stay untouched; failures and cancellation quarantine
 ownership. Link/PHY/timing, general-control configuration and independent
 AFMT/VPG owners remain retained. Shared clock guards now include FRL clock-on
 and reset state plus digital-link enable/reset/clock activity.
-HDMI FRL digital-link/PHY shutdown, eDP, sink/MST/audio teardown
+Native FRL digital-link retirement now resolves the unique board PHY route,
+requires a stopped frontend and matching character/forced-clock routes, selects
+zero training patterns and disables the link with acknowledged clock-off before
+restoring compression. Partial inherited shutdown, shared routing and late
+producer/configuration changes reject; failure/cancellation quarantine ownership.
+PHY output, root clocks, timing and unrelated outputs stay retained. The FRL
+character-clock root independently blocks shared clock changes after link stop.
+HDMI FRL PHY shutdown, eDP, sink/MST/audio teardown
 and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths

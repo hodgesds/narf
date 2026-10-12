@@ -35,7 +35,7 @@ mod tmds_phy;
 pub use tmds_phy::TmdsDisabled;
 #[path = "amdgpu_dcn401_frl.rs"]
 mod frl;
-pub use frl::FrlEncoderRetired;
+pub use frl::{FrlEncoderRetired, FrlLinkRetired};
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -102,6 +102,8 @@ pub enum State {
     TmdsDisabled,
     RetiringHdmiFrl,
     HdmiFrlRetired,
+    RetiringFrlLink(u8),
+    FrlLinkRetired,
     RetiringPlanes,
     PlanesRetired,
     Retiring(u8),
@@ -126,6 +128,7 @@ impl State {
                 | Self::TmdsTimingRetired
                 | Self::TmdsDisabled
                 | Self::HdmiFrlRetired
+                | Self::FrlLinkRetired
         )
     }
 }
@@ -202,6 +205,8 @@ pub struct Status {
     pub tmds_disabled: Option<TmdsDisabled>,
     /// Historical FRL frontend stop only; link/PHY/timing and memory stay owned.
     pub frl_encoder_retired: Option<FrlEncoderRetired>,
+    /// Historical FRL digital-link stop only; PHY, root clocks and memory stay owned.
+    pub frl_link_retired: Option<FrlLinkRetired>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -560,6 +565,7 @@ impl Otg {
                 tmds_timing_retired: None,
                 tmds_disabled: None,
                 frl_encoder_retired: None,
+                frl_link_retired: None,
                 retired: 0,
             },
         }))

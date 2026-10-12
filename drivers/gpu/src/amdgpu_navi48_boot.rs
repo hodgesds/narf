@@ -1047,6 +1047,32 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Retire the board-routed FRL digital link, retaining its PHY/root clocks.
+    /// # Safety
+    /// Fulfil `Otg::retire_frl_link` frontend, sink/SCDC/retimer, audio/metadata/
+    /// HDCP and writer-exclusion obligations. Retain all allocations and
+    /// translations. Success is not PHY, root-clock or memory retirement.
+    pub async unsafe fn retire_display_frl_link(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::FrlLinkRetired, otg::Error> {
+        if self.display_retirement_busy() || self.display_state() != Ok(display::State::Ready) {
+            return Err(otg::Error::Busy);
+        }
+        let path = *self
+            .display_paths()
+            .map_err(|_| otg::Error::Invalid)?
+            .get(port)
+            .ok_or(otg::Error::Invalid)?;
+        // SAFETY: validated retained board path; caller excludes producers and retains memory.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .retire_frl_link(path)
+                .await
+        }
+    }
     /// Disable an HPO PHY after digital-link retirement, then park its root route.
     /// # Safety
     /// Signal matches the inherited link. Use a direct external DP port without

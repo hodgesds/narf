@@ -257,6 +257,7 @@ fn dcn401_all_legacy_hpo_and_frl_consumers_block_power_and_clock_writes() -> Tes
         (0x32570, 3),
     ]);
     golden.push((0x20198, 0x8888));
+    golden.push((0x10128, 1));
     assert_eq!(engine().layout.idle_registers().as_slice(), golden);
     for (at, mask) in golden {
         for value in core::iter::once(u32::MAX)

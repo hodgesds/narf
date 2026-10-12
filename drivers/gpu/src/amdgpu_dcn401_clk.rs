@@ -12,7 +12,7 @@ const MESSAGE: u32 = 0x8a; // MP1 C2PMSG74, base index 1
 const ARGUMENT: u32 = 0x73; // C2PMSG51
 const RESPONSE: u32 = 0x74; // C2PMSG52
 const LEVEL_COUNT: usize = 8;
-pub(crate) const IDLE_REG_COUNT: usize = 74;
+pub(crate) const IDLE_REG_COUNT: usize = 75;
 pub(crate) const FRL_IDLE: [(u64, u32); 5] = [
     (0x8d3, 0x1111),   // stream clock request and three clock-on witnesses
     (0x8d6, 0x100011), // ramp FIFO enable/reset request and reset-done
@@ -194,6 +194,7 @@ impl Layout {
             regs[68 + i] = (self.hpo + reg * 4, mask);
         }
         regs[73] = (self.hpo_link_clock(), 0x8888);
+        regs[74] = (self.dio + 0x4a * 4, 1); // PHY-derived FRL character-clock root
         regs
     }
 }

@@ -152,6 +152,7 @@ impl Io for Fake {
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
                 || (MPC_BASE + 0x8d3 * 4..=MPC_BASE + 0x8f0 * 4).contains(&at)
+                || [0x95b, 0x95c, 0x965, 0x966].iter().any(|&r| at == MPC_BASE + r * 4)
                 || (0..4).any(|p| {
                     [
                         0x2094, 0x2095, 0x209b, 0x209e, 0x20a5, 0x20a6, 0x20a9, 0x20aa, 0x20ab,
@@ -329,6 +330,7 @@ fn engine() -> Engine<Fake> {
             tmds_timing_retired: None,
             tmds_disabled: None,
             frl_encoder_retired: None,
+            frl_link_retired: None,
             retired: 0,
         },
     }
@@ -1064,3 +1066,6 @@ mod tmds_phy;
 
 #[path = "amdgpu_dcn401_frl_tests.rs"]
 mod frl;
+
+#[path = "amdgpu_dcn401_frl_link_tests.rs"]
+mod frl_link;

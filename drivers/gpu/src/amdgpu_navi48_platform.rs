@@ -425,6 +425,22 @@ pub async unsafe fn retire_display_dp_encoder(
     unsafe { boot.retire_display_dp_encoder(stream).await }
 }
 
+/// Retire the board-routed FRL digital link, retaining its PHY/root clocks.
+/// # Safety
+/// Fulfil `Otg::retire_frl_link` frontend, sink/SCDC/retimer, audio/metadata/
+/// HDCP and writer-exclusion obligations. Retain all allocations/translations;
+/// success is not PHY, root-clock or memory retirement.
+pub async unsafe fn retire_display_frl_link(
+    port: usize,
+) -> Result<crate::amdgpu_dcn401_otg::FrlLinkRetired, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: retained serialized owner; caller fulfils the documented obligations.
+    unsafe { boot.retire_display_frl_link(port).await }
+}
+
 /// Retire the native FRL frontend, preserving link/PHY and timing clocks.
 /// # Safety
 /// Fulfil `Otg::retire_hdmi_frl_encoder` sink/SCDC/retimer, audio/ACR/metadata/

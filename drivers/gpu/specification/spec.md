@@ -695,6 +695,29 @@ independent reset. Shared global/pipe clock guards and legacy DP shutdown now
 also reject outstanding FRL stream-clock acknowledgements, FIFO/tribyte resets
 and digital FRL link enable/reset or requested/acknowledged link clocks.
 
+`unsafe ColdBoot::retire_display_frl_link(port).await`, its serialized platform
+wrapper and `Otg::retire_frl_link` retire the board-routed native FRL digital
+link. Callers fulfil the frontend retirement, sink/SCDC/retimer,
+audio/metadata/HDCP and writer-exclusion obligations above and retain all memory
+and translations. Live preflight requires a fully stopped frontend, a unique
+PHY mux selecting HPO HDMI instance zero, a stopped selected legacy backend,
+and matching character-root and forced PHYD18CLK routes. Enabled links require
+clock-on; reset, calibration, reserved patterns, scrambler bypass and partial
+inherited transitions reject before writes.
+
+The native sequence selects zero training patterns, disables link enable,
+gates its clock request, waits up to 1 ms for clock-off, then restores RC
+compression. Fresh frontend, packet, routing and configuration checks precede
+clock gating, compression cleanup and completion. A fully stopped native link
+is a read-only no-op; incomplete shutdown never wakes or replays the encoder.
+Success enters `FrlLinkRetired` and records historical
+`FrlLinkRetired { path, lanes, was_enabled }` in `Status::frl_link_retired`.
+It preserves PHY output, forced input clocks, character/stream roots, timing
+and other outputs, and proves no PHY, sink or memory retirement. Failure enters
+`Failed`; cancellation retains `RetiringFrlLink(transmitter)`, blocking reuse
+until independent reset. Shared clock guards also reject an enabled FRL
+character-clock root after digital-link retirement.
+
 `unsafe ColdBoot::retire_display_tmds_timing(pipe).await` and its serialized
 platform wrapper break the TMDS timing/PHY-clock shutdown dependency. Unlike
 general timing retirement, this operation allows live TMDS backends and PHYs;
