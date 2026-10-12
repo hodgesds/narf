@@ -12,9 +12,26 @@
 use narf_kernel_test::{kernel_test_in, TestResult};
 
 use super::{
-    features_offer_virgl, CTRL_Q_DEPTH, CTRL_Q_INDEX, CURSOR_Q_DEPTH, CURSOR_Q_INDEX,
-    VIRTIO_GPU_F_VIRGL, VIRTIO_GPU_PCI_DEVICE, VIRTIO_GPU_PCI_DEVICE_LEGACY, VIRTIO_GPU_PCI_VENDOR,
+    features_offer_virgl, programmed_scanout_mode, CTRL_Q_DEPTH, CTRL_Q_INDEX, CURSOR_Q_DEPTH,
+    CURSOR_Q_INDEX, VIRTIO_GPU_F_VIRGL, VIRTIO_GPU_PCI_DEVICE, VIRTIO_GPU_PCI_DEVICE_LEGACY,
+    VIRTIO_GPU_PCI_VENDOR,
 };
+
+/// GET_DISPLAY_INFO is sampled before boot's SET_SCANOUT. Even if the host
+/// reports no old scanout, the successfully programmed boot resource is
+/// active and DRM must not reject KWin's first plane-only TEST_ONLY commit as
+/// an unflagged modeset.
+fn smoke_virtio_gpu_pci_programmed_scanout_is_active() -> TestResult {
+    let mode = programmed_scanout_mode(1280, 800);
+    if (mode.width, mode.height, mode.enabled) != (1280, 800, true) {
+        return TestResult::Fail("a programmed boot scanout was not cached as active");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_pci_programmed_scanout_is_active
+);
 
 fn smoke_virtio_gpu_virgl_offer_detection() -> TestResult {
     let virgl = 1u64 << VIRTIO_GPU_F_VIRGL;

@@ -234,6 +234,19 @@ pub struct DisplayMode {
     pub enabled: bool,
 }
 
+/// The cached state after this driver has successfully bound its boot
+/// resource to scanout 0. `GET_DISPLAY_INFO` precedes that operation and
+/// describes the host's *previous* scanout state, so its enabled bit must not
+/// be carried forward once `SET_SCANOUT` succeeds.
+#[inline]
+fn programmed_scanout_mode(width: u32, height: u32) -> DisplayMode {
+    DisplayMode {
+        width,
+        height,
+        enabled: true,
+    }
+}
+
 #[doc(hidden)]
 pub struct VirtioGpuPci {
     notify: VirtioRegion,
@@ -1425,12 +1438,6 @@ impl VirtioGpuPci {
         } else {
             (FALLBACK_SCANOUT_W, FALLBACK_SCANOUT_H)
         };
-        *self.mode.lock() = DisplayMode {
-            width,
-            height,
-            enabled: advertised.enabled,
-        };
-
         let scanout_bytes = (width * height * 4) as usize;
         // SAFETY: queues + buffers prepared.
         unsafe {
@@ -1443,6 +1450,11 @@ impl VirtioGpuPci {
             self.set_scanout(0, 1, width, height)?;
         }
 
+        // A successful SET_SCANOUT activates scanout 0 with this resource.
+        // Publish that fact only after the command completes: consumers such
+        // as DRM must not treat the old GET_DISPLAY_INFO enabled bit as the
+        // state of the scanout we have just programmed.
+        *self.mode.lock() = programmed_scanout_mode(width, height);
         self.ready.store(true, Ordering::Release);
         Ok(())
     }
