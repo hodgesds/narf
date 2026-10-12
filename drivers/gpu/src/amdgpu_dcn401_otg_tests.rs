@@ -148,6 +148,7 @@ impl Io for Fake {
     fn write(&mut self, at: u64, value: u32) {
         assert!(
             (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
+                || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
                 || (0..4).any(|p| {
                     [
@@ -319,6 +320,7 @@ fn engine() -> Engine<Fake> {
             dp_encoder_retired: None,
             dp_sst_disabled: None,
             hpo_link_retired: None,
+            hpo_dp_disabled: None,
             retired: 0,
         },
     }

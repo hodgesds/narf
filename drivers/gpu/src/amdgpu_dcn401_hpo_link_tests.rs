@@ -1,5 +1,7 @@
 use super::*;
 use crate::amdgpu_dcn_inventory::{Connector, Path};
+#[path = "amdgpu_dcn401_hpo_phy_tests.rs"]
+mod phy;
 
 fn at(link: u8, r: u64) -> u64 {
     BASE + (r + u64::from(link) * 0xd4) * 4

@@ -23,7 +23,7 @@ mod link;
 pub use link::DpSstDisabled;
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
-pub use hpo_link::HpoLinkRetired;
+pub use hpo_link::{HpoDpDisabled, HpoLinkRetired};
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -80,6 +80,8 @@ pub enum State {
     DpSstDisabled,
     RetiringHpoLink(u8),
     HpoLinkRetired,
+    DisablingHpoDp(u8),
+    HpoDpDisabled,
     RetiringPlanes,
     PlanesRetired,
     Retiring(u8),
@@ -99,6 +101,7 @@ impl State {
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
                 | Self::HpoLinkRetired
+                | Self::HpoDpDisabled
         )
     }
 }
@@ -165,6 +168,8 @@ pub struct Status {
     pub dp_sst_disabled: Option<DpSstDisabled>,
     /// Historical HPO digital-link stop only; PHY and its root clock remain owned.
     pub hpo_link_retired: Option<HpoLinkRetired>,
+    /// Historical lane-disable/TX-clock/root-route evidence, not analog power gating.
+    pub hpo_dp_disabled: Option<HpoDpDisabled>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -508,6 +513,7 @@ impl Otg {
                 dp_encoder_retired: None,
                 dp_sst_disabled: None,
                 hpo_link_retired: None,
+                hpo_dp_disabled: None,
                 retired: 0,
             },
         }))

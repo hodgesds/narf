@@ -985,6 +985,42 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Disable an HPO PHY after digital-link retirement, then park its root route.
+    /// # Safety
+    /// Signal matches the inherited link. Use a direct external DP port without
+    /// USB-C/ACPI PHY interlocks or SSC workarounds. Retire sink/MST bookkeeping,
+    /// audio/metadata/HDCP producers and associated streams/link. Exclude CPU,
+    /// firmware/FAMS and concurrent display/link/clock/power/reset writers;
+    /// retain all memory/translations. No analog power-gating or memory-reuse proof.
+    pub async unsafe fn disable_display_hpo_dp(
+        &mut self,
+        port: usize,
+        signal: dmub::DpSignal,
+    ) -> Result<otg::HpoDpDisabled, otg::Error> {
+        if self.display_retirement_busy()
+            || self.display_state() != Ok(display::State::Ready)
+            || self
+                .ddc
+                .as_ref()
+                .is_ok_and(|d| d.state() != ddc::State::Ready)
+        {
+            return Err(otg::Error::Busy);
+        }
+        let path = *self
+            .display_paths()
+            .map_err(|_| otg::Error::Invalid)?
+            .get(port)
+            .ok_or(otg::Error::Invalid)?;
+        // SAFETY: retained board route and matching owners; caller establishes
+        // link signal, platform interlocks, producer exclusion and memory lifetime.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .disable_hpo_dp(&mut self.sequence.backend.dmub, path, signal)
+                .await
+        }
+    }
     fn display_retirement_busy(&self) -> bool {
         self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)

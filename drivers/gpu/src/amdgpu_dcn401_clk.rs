@@ -12,7 +12,7 @@ const MESSAGE: u32 = 0x8a; // MP1 C2PMSG74, base index 1
 const ARGUMENT: u32 = 0x73; // C2PMSG51
 const RESPONSE: u32 = 0x74; // C2PMSG52
 const LEVEL_COUNT: usize = 8;
-pub(crate) const IDLE_REG_COUNT: usize = 64;
+pub(crate) const IDLE_REG_COUNT: usize = 72;
 pub(crate) fn backend_clock_mask(instance: u8) -> u32 {
     // Only DIG0 exposes the HDCP clock-on witness in DCN4.1.0.
     0x2810 | if instance == 0 { 0x1000 } else { 0 }
@@ -173,18 +173,20 @@ impl Layout {
                 (0x20bb, 0x124, backend_clock_mask(i as u8)), // backend clocks
                 (0x36b4, 0xd4, 3),        // HPO DPHY enable/reset
                 (0x36b5, 0xd4, 0x1f1003), // HPO DPHY status and pending transactions
+                (0x2943, 0xd8, 0x3c3c3c3c), // RDPCS lane clock/data/handshake activity
+                (0x2931, 0xd8, 0x6f0),    // RDPCS lane and TX clock request/ON
             ]
             .into_iter()
             .enumerate()
             {
-                regs[i * 15 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
+                regs[i * 17 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
             }
         }
         // The single FRL stream lives in DCN bank 3, unlike HPO DP's bank 2.
         for (i, reg) in [0x8d3, 0x8d6, 0x8df].into_iter().enumerate() {
-            regs[60 + i] = (self.hpo + reg * 4, 1);
+            regs[68 + i] = (self.hpo + reg * 4, 1);
         }
-        regs[63] = (self.hpo_link_clock(), 0x8888);
+        regs[71] = (self.hpo_link_clock(), 0x8888);
         regs
     }
 }

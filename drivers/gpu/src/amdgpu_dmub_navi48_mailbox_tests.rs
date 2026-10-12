@@ -36,6 +36,65 @@ fn dmub_navi48_native_transmitter_disable_uses_v17_board_fields() -> TestResult 
     }
     TestResult::Pass
 }
+fn dmub_navi48_hpo_disable_uses_native_zeroed_connector_and_explicit_signal() -> TestResult {
+    for phy in 0..4 {
+        for hpd in 1..=4 {
+            for (signal, mode) in [(DpSignal::Sst, 0), (DpSignal::Mst, 5)] {
+                let (_pool, mut e) = ready();
+                let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+                run(e.disable_hpo_dp(dp_path(phy, hpd), signal)).unwrap();
+                let mut golden = [0; 64];
+                golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+                golden[4] = phy;
+                golden[6] = mode;
+                golden[12] = hpd;
+                golden[15] = 244; // zero-initialized native DISABLE HPO id, not link instance
+                assert_eq!(e.io.slot(offset), golden);
+                assert_eq!(e.mailbox.state, MailboxState::Ready);
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_hpo_disable_uses_native_zeroed_connector_and_explicit_signal
+);
+
+fn dmub_navi48_hpo_disable_invalid_and_cancelled_requests_never_replay() -> TestResult {
+    for signal in [DpSignal::Sst, DpSignal::Mst] {
+        let (_pool, mut e) = ready();
+        let mut path = dp_path(4, 1);
+        let before = e.io.bytes.clone();
+        assert_eq!(run(e.disable_hpo_dp(path, signal)), Err(Error::Invalid));
+        path = dp_path(2, 0);
+        assert_eq!(run(e.disable_hpo_dp(path, signal)), Err(Error::Invalid));
+        path = dp_path(2, 1);
+        path.connector = crate::amdgpu_dcn_inventory::Connector::EmbeddedDisplayPort;
+        assert_eq!(run(e.disable_hpo_dp(path, signal)), Err(Error::Invalid));
+        assert_eq!(e.io.bytes, before);
+        assert_eq!(e.mailbox.state, MailboxState::Ready);
+        e.io.commands = false;
+        {
+            let mut f = core::pin::pin!(e.disable_hpo_dp(dp_path(2, 1), signal));
+            assert!(f
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert_eq!(e.mailbox.state, MailboxState::InFlight);
+        assert_eq!(
+            run(e.disable_hpo_dp(dp_path(2, 1), signal)),
+            Err(Error::Busy)
+        );
+        assert_eq!(run(e.disable_dp_sst(dp_path(2, 1))), Err(Error::Busy));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_hpo_disable_invalid_and_cancelled_requests_never_replay
+);
 kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_native_transmitter_disable_uses_v17_board_fields

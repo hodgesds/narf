@@ -2,6 +2,9 @@
 //! Linux dcn31_hpo_dp_link_encoder.c: empty SAT with ACT, disable DPHY, clock last.
 use super::*;
 use crate::amdgpu_dcn_inventory::{Connector, Path};
+#[path = "amdgpu_dcn401_hpo_phy.rs"]
+pub(super) mod phy;
+pub use phy::HpoDpDisabled;
 
 const CLOCK: u64 = 0x369f;
 const CONTROL: u64 = 0x36b4;
@@ -193,6 +196,11 @@ impl<I: Io> Engine<I> {
             self.update(at(CLOCK), 1, 0)?;
             self.wait(at(CLOCK), 0x11, 0, 1000).await?;
         }
+        self.hpo_stopped(plan)
+    }
+    fn hpo_stopped(&mut self, plan: &Plan) -> Result<(), Error> {
+        let layout = self.layout;
+        let at = |r| DpStream::Hpo(plan.result.link).at(layout, r);
         for (reg, bits) in [(CONTROL, 3), (STATUS, 0x1f1003), (CLOCK, 0x11)] {
             if self.read(at(reg))? & bits != 0 {
                 return Err(Error::Readback(at(reg)));

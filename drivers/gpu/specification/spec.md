@@ -598,6 +598,44 @@ Errors after beginning the operation enter `Failed`; cancellation retains
 `RetiringHpoLink(link)`. Both block display/clock reuse and raw mailbox/scanner
 access until independent reset. No outcome permits allocation reuse.
 
+`unsafe ColdBoot::disable_display_hpo_dp(port, DpSignal::{Sst,Mst}).await` and
+its platform wrapper complete the direct external HPO DP transmitter shutdown
+after digital-link retirement. `DpSignal` is exported by
+`amdgpu_dmub_navi48`; callers must supply the inherited link's actual signal,
+retire sink/MST bookkeeping and audio/metadata/HDCP producers, exclude concurrent
+CPU/firmware/FAMS/display/link/clock/power/reset writers, and retain all memory
+and translations. The port must need no USB-C/ACPI PHY interlocks or PHY SSC
+workarounds. eDP and HDMI remain separate. The matching DMUB, board inventory,
+timing and DDC owners must be ready and kernel GC12/SDMA interrupt proofs drained.
+
+Live checks require empty HPO timeslots, stopped digital link and mapped stream
+encoders, consistent PHY/root routing, no other root using this PHY, a disabled
+corresponding legacy backend and no pending PHY request/acknowledgement. The
+historical retirement snapshot is not authority to skip these checks. The native
+DMUB v1.7 HPO DISABLE packet uses the board PHY/HPD and explicit SST/MST mode.
+It preserves the native caller's zero connector-object field and zero-initialized
+HPO engine ID encoding; it never substitutes the selected link index into that
+DISABLE field.
+
+After mailbox consumption the owner waits up to 100 ms for all four RDPCS lanes
+to report DISABLE set and CLK_RDY/DATA_EN/REQ/ACK clear, then up to 100 ms for all
+lane-clock requests and the TX clock request/ON witness to clear. These are
+conservative shutdown acceptance conditions, requiring silicon validation.
+No software write targets PHY lane or TX-clock controls. With routing, digital
+retirement and PHY witnesses rechecked, only the selected SYMCLK32_LE source and
+enable nibble is cleared; other root routes and all PHY muxes remain unchanged.
+Already disabled lanes/clocks skip firmware, and an already parked root receives
+no write. Global and pipe clock guards independently reject native RDPCS lane,
+handshake and transmit-clock activity even when digital link/root enables are off.
+
+Success enters `HpoDpDisabled`, recording `HpoDpDisabled::{path,link,signal,
+command_sent}` in `Status::hpo_dp_disabled`. This historical evidence covers
+lane-disable, TX-clock and root-route readback only, not analog power gating,
+sink power-down or allocation reuse. Failure after starting enters `Failed`;
+cancellation retains `DisablingHpoDp(transmitter)`. Either blocks display/clock
+reuse and raw mailbox/scanner access until independent reset; the mailbox also
+retains its own incomplete-transport quarantine.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

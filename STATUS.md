@@ -350,10 +350,15 @@ link retirement now resolves the board PHY mux, independent stream mappings and
 root-clock source, requires all mapped streams stopped, drains all six timeslot
 rows with ACT and waits for DPHY and link-clock shutdown acknowledgements.
 Ambiguous routes, active work and unsupported modes reject before writes;
-partial failures and cancellation quarantine the owner. PHY output and root
-clocks remain retained for firmware shutdown, and root clocks independently
-block global/pipe clock changes. HDMI, HPO PHY shutdown, eDP, sink/MST/audio
-teardown and USB-C/ACPI PHY interlocks still need their sequences.
+partial failures and cancellation quarantine the owner. A separate direct HPO
+DP PHY shutdown now sends native DMUB v1.7 DISABLE with explicit SST/MST signal,
+requires all four lanes disabled with data/clock/handshake activity clear and
+TX-clock-off readback, then parks only the selected root-clock route. Shared
+PHY/root routes and live digital work reject before commands. Failure or
+cancellation retains ownership; lane/TX activity independently blocks global
+and pipe clock changes. These checks still require silicon validation and do
+not prove analog power gating. HDMI, eDP, sink/MST/audio teardown and USB-C/ACPI
+PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths
 have model tests, not silicon validation.

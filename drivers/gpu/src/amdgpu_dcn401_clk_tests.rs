@@ -243,6 +243,8 @@ fn dcn401_all_legacy_hpo_and_frl_consumers_block_power_and_clock_writes() -> Tes
             (0x20bb, 0x124, if i == 0 { 0x3810 } else { 0x2810 }),
             (0x36b4, 0xd4, 3),
             (0x36b5, 0xd4, 0x1f1003),
+            (0x2943, 0xd8, 0x3c3c3c3c),
+            (0x2931, 0xd8, 0x6f0),
         ] {
             golden.push((0x10000 + (reg + i * stride) * 4, mask));
         }

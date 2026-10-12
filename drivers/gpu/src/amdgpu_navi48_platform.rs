@@ -458,6 +458,25 @@ pub async unsafe fn retire_display_hpo_link(
     unsafe { boot.retire_display_hpo_link(port).await }
 }
 
+/// Disable an HPO PHY after digital-link retirement, then park its root route.
+/// # Safety
+/// Signal matches the inherited link. Direct external DP only, without USB-C/
+/// ACPI PHY interlocks or SSC workarounds. Retire sink/MST bookkeeping, audio/
+/// metadata/HDCP producers and associated streams/link. Exclude CPU/firmware/FAMS
+/// and concurrent display/link/clock/power/reset writers; retain memory/translations.
+/// Success does not prove analog power gating or permit memory reuse.
+pub async unsafe fn disable_display_hpo_dp(
+    port: usize,
+    signal: crate::amdgpu_dmub_navi48::DpSignal,
+) -> Result<crate::amdgpu_dcn401_otg::HpoDpDisabled, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: retained serialized owner; caller fulfils the shutdown obligations.
+    unsafe { boot.disable_display_hpo_dp(port, signal).await }
+}
+
 /// Consume bounded diagnostic history from the independent IH service.
 /// Hardware draining and CPU interrupt waits never hold the display-owner lock.
 pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> {
