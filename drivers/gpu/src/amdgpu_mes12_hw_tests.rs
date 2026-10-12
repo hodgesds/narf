@@ -144,16 +144,19 @@ impl Io for Fake {
         }
     }
     fn write(&mut self, address: u64, value: u32) {
+        // HDP flushes are not logged: the firmware-timeout case polls for the
+        // full 2.1 s deadline with a yielding delay, and a fast host would
+        // otherwise grow this log until the kernel heap is exhausted.
+        if address == 0x7f000 {
+            self.dirty = false;
+            return;
+        }
         self.writes.push((self.index, address, value));
         if self.refuse == Some(address) {
             return;
         }
         if address == INDEX {
             self.index = value;
-            return;
-        }
-        if address == 0x7f000 {
-            self.dirty = false;
             return;
         }
         assert!(
