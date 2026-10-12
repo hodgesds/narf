@@ -1232,6 +1232,49 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Show a premultiplied ARGB8888 cursor (at most 64x64) on a live pipe.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/HDP writers.
+    pub unsafe fn set_display_cursor(
+        &mut self,
+        pipe: u8,
+        image: (u32, u32, &[u32]),
+        position: (i32, i32),
+    ) -> Result<otg::CursorApplied, otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: this owner retains its pool and GMC; caller excludes writers.
+        unsafe {
+            self.otg.as_mut().map_err(|e| *e)?.set_cursor(
+                &self.sequence.backend.pool,
+                gmc,
+                pipe,
+                image,
+                position,
+            )
+        }
+    }
+    /// Move the live cursor; it hides itself when entirely off screen.
+    /// # Safety
+    /// As for `set_display_cursor`.
+    pub unsafe fn move_display_cursor(
+        &mut self,
+        pipe: u8,
+        position: (i32, i32),
+    ) -> Result<otg::CursorApplied, otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .move_cursor(pipe, position)
+        }
+    }
     /// HDP-flush CPU writes to the live scanout surface.
     pub fn flush_display_scanout(&mut self) -> Result<(), otg::Error> {
         if self.state() != State::MemoryReady {

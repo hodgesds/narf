@@ -10,8 +10,9 @@ pub use power::HubpPower;
 mod surface;
 pub(super) use surface::Surfaces;
 pub use surface::{
-    DeadlinesApplied, DppApplied, FlipDone, MemoryApplied, MpcApplied, RequestorApplied,
-    ScanoutRunning, ScanoutUnderflow, SurfaceApplied, SurfaceFormat, SurfaceRequest,
+    CursorApplied, DeadlinesApplied, DppApplied, FlipDone, MemoryApplied, MpcApplied,
+    RequestorApplied, ScanoutRunning, ScanoutUnderflow, SurfaceApplied, SurfaceFormat,
+    SurfaceRequest, CURSOR_MAX,
 };
 
 const HUBP_CONTROL: u64 = 0x5f4;

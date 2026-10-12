@@ -410,3 +410,55 @@ kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_flip_latches_new_address_under_the_lock
 );
+
+fn dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch() -> TestResult {
+    for pipe in 0..4 {
+        let mut e = staged(pipe);
+        let p = target(pipe);
+        if run(e.start_fetch(p)).is_err() {
+            return TestResult::Fail("start");
+        }
+        let a = super::cursor::CursorApplied {
+            pipe,
+            address: 0x8_00f0_0000,
+            width: 64,
+            height: 48,
+            x: 11, // odd: X starts at bit 15, right after Y
+            y: 20,
+            visible: true,
+        };
+        let at = super::cursor::placement(11, 20, (64, 48), (1920, 1080), (100_000, 148_500));
+        if e.program_cursor(a, at).is_err() || e.verify_cursor(a, at).is_err() {
+            return TestResult::Fail("program cursor");
+        }
+        let l = e.layout;
+        let lock = l.mpc_base + (0x2c5 + u64::from(pipe) * 5) * 4;
+        if e.io.get(lock) != 0
+            || e.io.get(l.hubp(pipe, 0x679)) != 3 << 24 | 2 << 8 | 4 | 1
+            || e.io.get(l.hubp(pipe, 0x67c)) != 64 << 16 | 48
+            || e.io.get(l.hubp(pipe, 0x67d)) != 11 << 15 | 20
+        {
+            return TestResult::Fail("cursor registers");
+        }
+        // The live witness now expects the owned, visible cursor.
+        if e.live_fetch(pipe, ADDR).is_ok() {
+            return TestResult::Fail("unreported cursor accepted");
+        }
+        e.status.cursor = Some(a);
+        if e.live_fetch(pipe, ADDR).is_err() {
+            return TestResult::Fail("owned cursor rejected");
+        }
+        // Stopping hides it with the fetch; the staged pipe is clean again.
+        if run(e.stop_fetch(p)).is_err() || e.staged(p).is_err() {
+            return TestResult::Fail("stop with cursor");
+        }
+        if e.io.get(l.hubp(pipe, 0x679)) & 1 != 0 || e.io.get(lock) != 0 {
+            return TestResult::Fail("cursor left enabled or locked");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_cursor_programs_under_its_lock_and_stops_with_fetch
+);

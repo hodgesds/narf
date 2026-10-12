@@ -885,6 +885,33 @@ unknown. The platform `flip_display` moves a console that had adopted the old
 front onto the new one. There is no flip interrupt or event queue yet:
 completion is polled.
 
+`unsafe Otg::set_cursor(pool, gmc, pipe, (w, h, pixels), (x, y))` (ColdBoot
+`set_display_cursor`) shows a premultiplied ARGB8888 cursor on a live pipe.
+The size is capped at 64x64, Linux's DCN401 `max_cursor_size`, which also
+keeps it out of MALL; DML21 already budgets a 256-wide ARGB cursor per plane,
+so admission is unchanged. The first call allocates a retained 16 KiB buffer
+inside the FB aperture. Each call rewrites the image there with transparent
+padding and HDP-flushes it; an image change is not tear-free, because the
+buffer is single.
+
+Programming follows dcn10_set_cursor_attribute and dcn401_set_cursor_position
+inside mpc1_cursor_lock (`CUR_VUPDATE_LOCK_SET` of the pipe's OPP, released
+on every path):
+- HUBP: address (high, then low), size, and `CURSOR_CONTROL` with mode 2,
+  pitch 64, lines per chunk by width and `CURSOR_REQ_MODE` 1.
+- `CURSOR_SETTINGS`: full write of 0x300.
+- CM_CUR: mode 2, no expansion or degamma ROM, FP16 1.0 scale, matrix bypass.
+- Position, hotspot and `CURSOR_DST_X_OFFSET`, the latter in DCHUB reference
+  clocks.
+
+Negative origins move into the hotspot. A cursor entirely off screen is
+disabled in both HUBP and CM, and `move_cursor` (or the non-blocking platform
+`try_move_display_cursor`, for pointer pumps) only repositions. The live-fetch
+witness expects exactly the reported cursor enable. Stopping scanout hides the
+cursor under its lock before the plane stops, and drops the report while the
+buffer stays retained. Any readback mismatch quarantines the pipe.
+`tests/dcn401_cursor.c` checks the registers, including the MPC lock bank.
+
 `unsafe ColdBoot::retire_inherited_display` retires the legacy DP SST output
 the firmware left running. It runs in native dependency order:
 1. Blank every DIO stream (a no-op when already blank).

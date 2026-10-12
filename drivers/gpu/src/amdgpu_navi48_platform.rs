@@ -615,6 +615,36 @@ pub async unsafe fn flip_display(
     Ok(done)
 }
 
+/// Show a premultiplied ARGB8888 cursor (at most 64x64) on a live pipe.
+/// # Safety
+/// Exclude firmware/FAMS and concurrent display/HDP writers.
+pub async unsafe fn set_display_cursor(
+    pipe: u8,
+    image: (u32, u32, &[u32]),
+    position: (i32, i32),
+) -> Result<crate::amdgpu_dcn401_otg::CursorApplied, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller excludes external writers.
+    unsafe { boot.set_display_cursor(pipe, image, position) }
+}
+
+/// Move the live cursor without waiting: a pointer pump must never block on
+/// a modeset or flip in progress, so a busy owner simply skips this move.
+/// # Safety
+/// As for `set_display_cursor`.
+pub unsafe fn try_move_display_cursor(
+    pipe: u8,
+    position: (i32, i32),
+) -> Option<Result<crate::amdgpu_dcn401_otg::CursorApplied, crate::amdgpu_dcn401_otg::Error>> {
+    let mut owner = OWNER.try_lock()?;
+    let boot = owner.as_mut()?;
+    // SAFETY: serialized retained owner; caller excludes external writers.
+    Some(unsafe { boot.move_display_cursor(pipe, position) })
+}
+
 /// Withdraw the published scanout, then reverse a successful modeset to a
 /// disabled PHY with timing and planes retired. The surface stays allocated,
 /// so a console write already in flight lands in retained memory.

@@ -327,6 +327,8 @@ impl<I: Io> Engine<I> {
     pub(super) async fn stop_fetch(&mut self, p: Pipe) -> Result<(), Error> {
         let l = self.layout;
         let pipe = p.pipe;
+        // The cursor is a fetch source too; it latches off with the black.
+        self.hide_cursor(pipe)?;
         self.lock(pipe).await?;
         self.update(l.opp(pipe, DPG), DPG_FIELDS, p.black)?;
         for (at, value) in self.routes(pipe, false) {
@@ -379,7 +381,15 @@ impl<I: Io> Engine<I> {
             (self.dpp_control(pipe), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE),
             (l.opp(pipe, DPG), DPG_FIELDS, 0),
             (l.mpcc(pipe, MPC_STATUS), 4, 0),
-            (l.hubp(pipe, CURSOR), 1, 0),
+            (
+                l.hubp(pipe, CURSOR),
+                1,
+                u32::from(
+                    self.status
+                        .cursor
+                        .is_some_and(|c| c.pipe == pipe && c.visible),
+                ),
+            ),
             (l.hubp(pipe, ADDRESS), u32::MAX, address as u32),
             (l.hubp(pipe, ADDRESS_HIGH), 0xffff, (address >> 32) as u32),
             (l.hubp(pipe, EARLIEST_INUSE), u32::MAX, address as u32),
@@ -570,6 +580,7 @@ impl Surfaces {
         e.status.state = match result {
             Ok(_) => {
                 e.status.scanout = None;
+                e.status.cursor = None;
                 State::DpVideoRunning(ctx.stream)
             }
             Err(failed) => State::Failed(failed),
@@ -640,6 +651,7 @@ impl Surfaces {
         match result {
             Ok(()) => {
                 e.status.scanout = None;
+                e.status.cursor = None;
                 e.status.state = State::DpVideoRunning(running.stream);
                 Ok(())
             }

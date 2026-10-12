@@ -19,6 +19,9 @@ pub use requestor::RequestorApplied;
 #[path = "amdgpu_dcn401_deadline.rs"]
 mod deadline;
 pub use deadline::DeadlinesApplied;
+#[path = "amdgpu_dcn401_cursor.rs"]
+mod cursor;
+pub use cursor::{CursorApplied, CURSOR_MAX};
 #[path = "amdgpu_dcn401_flip.rs"]
 mod flip;
 #[path = "amdgpu_dcn401_scanout.rs"]
@@ -102,6 +105,8 @@ struct Surface {
     applied: SurfaceApplied,
     /// Optional second buffer of the same geometry, swapped in by a flip.
     back: Option<Reservation>,
+    /// 64x64 ARGB cursor image, allocated on first use.
+    cursor: Option<Reservation>,
 }
 #[derive(Debug)]
 pub(in super::super) struct Surfaces([Option<Surface>; 4]);
@@ -140,6 +145,7 @@ impl Surfaces {
             memory,
             applied,
             back: None,
+            cursor: None,
         });
         engine.status.state = State::PreparingSurface(request.pipe);
         engine.status.surfaces[slot] = None;

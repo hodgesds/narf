@@ -349,6 +349,7 @@ pub(super) fn engine() -> Engine<Fake> {
             deadlines: None,
             scanout: None,
             underflow: None,
+            cursor: None,
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,

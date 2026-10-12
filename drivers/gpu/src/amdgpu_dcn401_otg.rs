@@ -17,9 +17,9 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{
-    DeadlinesApplied, DppApplied, FlipDone, HubpPower, MemoryApplied, MpcApplied, PlanesRetired,
-    RequestorApplied, ScanoutRunning, ScanoutUnderflow, SurfaceApplied, SurfaceFormat,
-    SurfaceRequest,
+    CursorApplied, DeadlinesApplied, DppApplied, FlipDone, HubpPower, MemoryApplied, MpcApplied,
+    PlanesRetired, RequestorApplied, ScanoutRunning, ScanoutUnderflow, SurfaceApplied,
+    SurfaceFormat, SurfaceRequest, CURSOR_MAX,
 };
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
@@ -158,6 +158,7 @@ pub enum State {
     ScanoutRunning(u8),
     StoppingScanout(u8),
     Flipping(u8),
+    Cursor(u8),
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -268,6 +269,8 @@ pub struct Status {
     /// Last underflow that returned a live scanout to black. Retained across
     /// later starts as a diagnostic until another underflow replaces it.
     pub underflow: Option<ScanoutUnderflow>,
+    /// The owned cursor on the live pipe; cleared when scanout stops.
+    pub cursor: Option<CursorApplied>,
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -737,6 +740,7 @@ impl Otg {
                     deadlines: None,
                     scanout: None,
                     underflow: None,
+                    cursor: None,
                     dp_blanked: None,
                     dp_encoder_retired: None,
                     dp_sst_disabled: None,
