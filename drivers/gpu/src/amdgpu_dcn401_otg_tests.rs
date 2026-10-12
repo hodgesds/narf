@@ -151,6 +151,7 @@ impl Io for Fake {
                 || (0x162a0 * 4..=0x162a3 * 4).contains(&at)
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
+                || (MPC_BASE + 0x8d3 * 4..=MPC_BASE + 0x8f0 * 4).contains(&at)
                 || (0..4).any(|p| {
                     [
                         0x2094, 0x2095, 0x209b, 0x209e, 0x20a5, 0x20a6, 0x20a9, 0x20aa, 0x20ab,
@@ -327,6 +328,7 @@ fn engine() -> Engine<Fake> {
             hdmi_tmds_retired: None,
             tmds_timing_retired: None,
             tmds_disabled: None,
+            frl_encoder_retired: None,
             retired: 0,
         },
     }
@@ -1059,3 +1061,6 @@ mod tmds_timing;
 
 #[path = "amdgpu_dcn401_tmds_phy_tests.rs"]
 mod tmds_phy;
+
+#[path = "amdgpu_dcn401_frl_tests.rs"]
+mod frl;

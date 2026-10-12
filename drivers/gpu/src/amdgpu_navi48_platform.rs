@@ -425,6 +425,21 @@ pub async unsafe fn retire_display_dp_encoder(
     unsafe { boot.retire_display_dp_encoder(stream).await }
 }
 
+/// Retire the native FRL frontend, preserving link/PHY and timing clocks.
+/// # Safety
+/// Fulfil `Otg::retire_hdmi_frl_encoder` sink/SCDC/retimer, audio/ACR/metadata/
+/// HDCP and writer-exclusion obligations. Retain all memory/translations;
+/// success is not link or memory retirement.
+pub async unsafe fn retire_display_hdmi_frl_encoder(
+) -> Result<crate::amdgpu_dcn401_otg::FrlEncoderRetired, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: retained serialized owner; caller fulfils the documented obligations.
+    unsafe { boot.retire_display_hdmi_frl_encoder().await }
+}
+
 /// Disable a direct TMDS HDMI transmitter after frontend/timing retirement.
 /// # Safety
 /// Fulfil `Otg::disable_tmds` direct-port, sink/SCDC/retimer, producer and

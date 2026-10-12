@@ -249,7 +249,13 @@ fn dcn401_all_legacy_hpo_and_frl_consumers_block_power_and_clock_writes() -> Tes
             golden.push((0x10000 + (reg + i * stride) * 4, mask));
         }
     }
-    golden.extend([(0x3234c, 1), (0x32358, 1), (0x3237c, 1)]);
+    golden.extend([
+        (0x3234c, 0x1111),
+        (0x32358, 0x100011),
+        (0x3237c, 0x111),
+        (0x3256c, 0x11),
+        (0x32570, 3),
+    ]);
     golden.push((0x20198, 0x8888));
     assert_eq!(engine().layout.idle_registers().as_slice(), golden);
     for (at, mask) in golden {

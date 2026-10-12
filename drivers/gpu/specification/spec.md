@@ -659,8 +659,41 @@ Success records historical `HdmiTmdsRetired { stream, detached_backends }` in
 `Otg::Status::hdmi_tmds_retired`; it proves neither link nor memory retirement.
 Failure after starting enters `Failed`; cancellation retains
 `RetiringHdmiTmds(stream)`. Both block owner/clock/mailbox reuse until an
-independent reset. HDMI FRL needs a separate sequence; TMDS backend/PHY
-shutdown follows timing-clock retirement through the operation below.
+independent reset. TMDS backend/PHY shutdown follows timing-clock retirement
+through the operation below.
+
+`unsafe ColdBoot::retire_display_hdmi_frl_encoder().await`, its serialized
+platform wrapper and `Otg::retire_hdmi_frl_encoder` retire the single native
+FRL frontend. The caller independently handles sink AVMUTE/SCDC/retimers and
+audio/ACR/metadata/HDCP teardown, excludes CPU/firmware/FAMS and concurrent
+display/packet/link/clock/power/reset writers, and retains all allocations and
+translations. Live preflight requires settled FIFO/tribyte reset state, no
+immediate packet or HDMI/VUPDATE transaction, quiet native DME4/metadata and
+audio/ACR scheduling, and a valid OTG selector. Active FIFO/tribyte inputs must
+match the enabled native HDMISTREAMCLK route. Enabled streams require all three
+stream-clock acknowledgements; incomplete inherited clock transitions reject.
+
+Native packet retirement clears both generic scheduling registers and all eight
+line/EMP registers, then waits up to 150 ms for HDMI/VUPDATE buffers to drain.
+Unlike TMDS, FRL's packet-14 line register contains no per-packet enable-pending
+status. After fresh packet, routing and producer checks, the FIFO is disabled
+before the tribyte encoder. Pending buffers must drain before disabling the
+stream-clock request and waiting up to 1 ms for DISPCLK, SOCCLK and
+HDMISTREAMCLK acknowledgements to clear. Completion rechecks packets, resets,
+routes and producer state. A fully retired stream is a read-only no-op;
+uncertain work on an already-disabled stream rejects without waking it.
+General-control/AVMUTE configuration, pixel format, clock routing, timing,
+link/PHY and independent AFMT/VPG owners remain untouched. The upstream FIFO
+video-active indication is not interpreted as a downstream clock-off witness.
+
+Success enters `HdmiFrlRetired` and records historical
+`FrlEncoderRetired { pipe, was_active }` in `Status::frl_encoder_retired`.
+The pipe is an OTG selector, never an inferred physical port. No result proves
+link, PHY, sink, timing, AFMT/VPG, HUBP or memory retirement. Failure enters
+`Failed`; cancellation retains `RetiringHdmiFrl`. Both block reuse until an
+independent reset. Shared global/pipe clock guards and legacy DP shutdown now
+also reject outstanding FRL stream-clock acknowledgements, FIFO/tribyte resets
+and digital FRL link enable/reset or requested/acknowledged link clocks.
 
 `unsafe ColdBoot::retire_display_tmds_timing(pipe).await` and its serialized
 platform wrapper break the TMDS timing/PHY-clock shutdown dependency. Unlike

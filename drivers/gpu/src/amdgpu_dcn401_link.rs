@@ -50,8 +50,8 @@ impl<I: Io> Engine<I> {
                 }
             }
         }
-        for reg in [0x8d3, 0x8d6, 0x8df] {
-            if self.read(self.layout.mpc_base + reg * 4)? & 1 != 0 {
+        for (reg, mask) in clocks::FRL_IDLE {
+            if self.read(self.layout.mpc_base + reg * 4)? & mask != 0 {
                 return Err(Error::Busy);
             }
         }

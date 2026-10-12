@@ -966,6 +966,26 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Retire the native FRL frontend, preserving link/PHY and timing clocks.
+    /// # Safety
+    /// Fulfil `Otg::retire_hdmi_frl_encoder` sink/SCDC/retimer, audio/ACR/metadata/
+    /// HDCP and writer-exclusion obligations. Retain all memory/translations;
+    /// success is not link or memory retirement.
+    pub async unsafe fn retire_display_hdmi_frl_encoder(
+        &mut self,
+    ) -> Result<otg::FrlEncoderRetired, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: retained matching owner; caller fulfils the documented obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .retire_hdmi_frl_encoder()
+                .await
+        }
+    }
     /// Disable a board-routed legacy DP SST transmitter before frontend retirement.
     /// # Safety
     /// Select a direct external DP port without USB-C/ACPI PHY interlocks or

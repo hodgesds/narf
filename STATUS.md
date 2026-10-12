@@ -376,7 +376,15 @@ consumption alone cannot complete shutdown. Already-disabled backends require
 complete off readback without replay. Other outputs stay retained, late route
 or consumer changes fail, and failure/cancellation block owner reuse. This
 proves digital/lane/clock shutdown, not analog power gating or memory retirement.
-HDMI FRL, eDP, sink/MST/audio teardown
+Native FRL frontend retirement now drains all generic packet schedules through
+the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and
+requires all three stream clocks off. Native DME4, immediate packets, audio/ACR,
+reset state and input/clock routes are checked before writes and across waits.
+Already-retired streams stay untouched; failures and cancellation quarantine
+ownership. Link/PHY/timing, general-control configuration and independent
+AFMT/VPG owners remain retained. Shared clock guards now include FRL clock-on
+and reset state plus digital-link enable/reset/clock activity.
+HDMI FRL digital-link/PHY shutdown, eDP, sink/MST/audio teardown
 and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths
