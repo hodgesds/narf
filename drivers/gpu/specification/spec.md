@@ -465,6 +465,35 @@ reset. `RunningBlank` must first retire its timing before plane retirement.
 serialize the operation after drained GC12/SDMA proofs. No automatic firmware
 display takeover or visible link output is introduced.
 
+`unsafe Otg::set_hubp_power(pipe, powered).await` owns native DOMAIN0–3
+power transitions. All four MPC trees must be detached and acknowledge idle
+or disabled; all timing and external consumers must be stopped. Powered HUBPs
+must freshly prove blank, drained, clock-disabled and free of pending flips,
+update/GSL locks, reset, cursor or auxiliary fetch activity. Off domains require
+matching gate request and PGFSM acknowledgement; their registers are inaccessible.
+The operation rejects uncertain inherited state before changing hardware.
+
+The native bank-2 `DC_IP_REQUEST_CNTL` request brackets the PG_CONFIG write and
+1 ms PGFSM wait, preserving its prior request state. The native full PG_CONFIG
+write clears FORCEON. Power-on first acknowledges accessibility, rejects
+unexpected active transactions, enables the fetch clock, waits for drain,
+asserts native blank with TTU-disable clear, clears MALL/GSL and disables the
+fetch clock again. Drain waits are bounded to 100 ms each; power-off requires
+fresh stopped-fetcher evidence before requesting gating. Final checks cover
+every route, consumer and domain. Repeating an acknowledged state is read-only.
+No hardware reset, surface, VM, bandwidth, DPP or scanout setup is implied.
+
+`HubpPower { pipe, powered }` is recorded in `Status::hubp_power[pipe]` as
+historical evidence only. Success enters reusable `HubpPowerChanged`; subsequent
+operations still check live state. A transition invalidates the old selected
+power report and plane-retirement snapshot. Cancellation retains
+`ChangingHubpPower(pipe)`; an error enters `Failed`, blocking replay and clock
+changes. Neither outcome attempts speculative rollback. Callers exclude
+firmware/FAMS and concurrent display/clock/power writers and retain all memory
+and translations even after successful power-off. The matching
+`unsafe ColdBoot::set_display_hubp_power` and platform wrapper serialize this
+under the retained owner after the kernel engine proofs.
+
 `unsafe Otg::blank_dp_stream(DpStream::{Dio,Hpo}(instance)).await` blanks one
 of the four native legacy or four HPO DisplayPort stream encoders. Stream
 instances are independent of OTG/transmitter routing; this operation never

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "amdgpu_dcn401_hubp_power_tests.rs"]
+mod power;
+
 fn planes(off: u8) -> Engine<Fake> {
     let mut e = engine();
     for p in 0..4 {

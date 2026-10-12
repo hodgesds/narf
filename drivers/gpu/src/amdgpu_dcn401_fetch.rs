@@ -3,6 +3,10 @@
 //! dcn401_disable_plane_sequence and dcn32_hubp_pg_control.
 use super::*;
 
+#[path = "amdgpu_dcn401_hubp_power.rs"]
+mod power;
+pub use power::HubpPower;
+
 const HUBP_CONTROL: u64 = 0x5f4;
 const HUBP_CLOCK: u64 = 0x5f5;
 const MALL: u64 = 0x5f7;

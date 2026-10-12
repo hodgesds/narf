@@ -903,6 +903,28 @@ impl ColdBoot {
         // and excludes writers, including firmware and inherited scanout users.
         unsafe { self.otg.as_mut().map_err(|e| *e)?.retire_planes().await }
     }
+    /// Power a disconnected HUBP on to blank readiness, or gate a drained HUBP.
+    /// # Safety
+    /// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,
+    /// auxiliary fetcher, clock and power writers, and retain every allocation
+    /// and translation on every outcome. Completion never permits memory reuse.
+    pub async unsafe fn set_display_hubp_power(
+        &mut self,
+        pipe: u8,
+        powered: bool,
+    ) -> Result<otg::HubpPower, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers and retains memory.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .set_hubp_power(pipe, powered)
+                .await
+        }
+    }
     /// Blank one native DP video stream before separate encoder/PHY retirement.
     /// # Safety
     /// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,

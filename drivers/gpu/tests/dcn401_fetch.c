@@ -6,6 +6,8 @@
 #include "asic_reg/dcn/dcn_4_1_0_sh_mask.h"
 #define EQ(a,b) _Static_assert((unsigned)(a) == (unsigned)(b), #a)
 #define REG(a,b,bank) EQ(reg##a,b); EQ(reg##a##_BASE_IDX,bank)
+REG(DC_IP_REQUEST_CNTL,0xa0,2);
+EQ(DC_IP_REQUEST_CNTL__IP_REQUEST_EN_MASK,1);
 #define PIPE(i) \
  REG(MPCC##i##_MPCC_TOP_SEL,0x15*(i),3); \
  REG(MPCC##i##_MPCC_BOT_SEL,1+0x15*(i),3); \
@@ -27,6 +29,13 @@
  EQ(DOMAIN##i##_PG_CONFIG__DOMAIN_POWER_FORCEON_MASK,1); \
  EQ(DOMAIN##i##_PG_CONFIG__DOMAIN_POWER_GATE_MASK,0x100); \
  EQ(DOMAIN##i##_PG_STATUS__DOMAIN_PGFSM_PWR_STATUS_MASK,0xc0000000); \
+ REG(HUBP##i##_DCHUBP_CNTL,0x5f4+0xdc*(i),2); \
+ REG(HUBP##i##_HUBP_CLK_CNTL,0x5f5+0xdc*(i),2); \
+ EQ(HUBP##i##_DCHUBP_CNTL__HUBP_BLANK_EN_MASK,1); \
+ EQ(HUBP##i##_DCHUBP_CNTL__HUBP_NO_OUTSTANDING_REQ_MASK,2); \
+ EQ(HUBP##i##_DCHUBP_CNTL__HUBP_SOFT_RESET_MASK,4); \
+ EQ(HUBP##i##_DCHUBP_CNTL__HUBP_TTU_DISABLE_MASK,0x1000); \
+ EQ(HUBP##i##_HUBP_CLK_CNTL__HUBP_CLOCK_ENABLE_MASK,1); \
  REG(HUBP##i##_DCHUBP_MALL_CONFIG,0x5f7+0xdc*(i),2); \
  REG(HUBPREQ##i##_DCSURF_FLIP_CONTROL,0x613+0xdc*(i),2); \
  REG(HUBPREQ##i##_DCSURF_FLIP_CONTROL2,0x614+0xdc*(i),2); \

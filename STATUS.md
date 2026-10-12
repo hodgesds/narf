@@ -329,6 +329,14 @@ Already-off HUBPs require native PGFSM acknowledgement and remain untouched.
 Blank startup accepts native TTU behavior and checks the independent 3D-LUT
 fetcher. Pending flips, synchronization, metadata/LUT loads and uncertain power
 states block retirement before writes; failure/cancellation retain resources.
+Native HUBP DOMAIN0–3 power transitions now require a fully stopped, detached
+display tree. The retained owner brackets each gate request with DC IP request
+ownership and waits for PGFSM acknowledgement before touching a powered-on
+HUBP. It initializes that HUBP to blank/drained readiness with its fetch clock
+disabled; power-off requires fresh drain evidence. Pending fetch transactions,
+uncertain power, lost writes and cancellation block reuse. All backing memory
+stays retained. Surface/VM/bandwidth preparation and framebuffer scanout remain
+open; these power transitions still require validation on the physical card.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

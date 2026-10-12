@@ -15,7 +15,7 @@ mod opp;
 pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
-pub use fetch::PlanesRetired;
+pub use fetch::{HubpPower, PlanesRetired};
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
 pub use stream::{DpBlanked, DpEncoderRetired, DpStream};
@@ -129,6 +129,8 @@ pub enum State {
     FrlDisabled,
     RetiringPlanes,
     PlanesRetired,
+    ChangingHubpPower(u8),
+    HubpPowerChanged,
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -142,6 +144,7 @@ impl State {
                 | Self::BlankPrepared
                 | Self::Retired
                 | Self::PlanesRetired
+                | Self::HubpPowerChanged
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
@@ -211,6 +214,8 @@ pub struct Status {
     /// Historical fetch-stop evidence. Never grants allocation reuse or proves
     /// retirement of GPUVM, writeback, or other GPU engines.
     pub planes_retired: Option<PlanesRetired>,
+    /// Historical domain power evidence, never memory-reuse or scanout authority.
+    pub hubp_power: [Option<HubpPower>; 4],
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -595,6 +600,7 @@ impl Otg {
                 blanks: [None; 4],
                 running_blank: None,
                 planes_retired: None,
+                hubp_power: [None; 4],
                 dp_blanked: None,
                 dp_encoder_retired: None,
                 dp_sst_disabled: None,

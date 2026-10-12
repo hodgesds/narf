@@ -393,6 +393,23 @@ pub async unsafe fn retire_display_planes(
     unsafe { boot.retire_display_planes().await }
 }
 
+/// Power a disconnected HUBP on to blank readiness, or gate a drained HUBP.
+/// # Safety
+/// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,
+/// auxiliary fetcher, clock and power writers, and retain every allocation and
+/// translation on every outcome. Completion never permits memory reuse.
+pub async unsafe fn set_display_hubp_power(
+    pipe: u8,
+    powered: bool,
+) -> Result<crate::amdgpu_dcn401_otg::HubpPower, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller excludes writers and retains memory.
+    unsafe { boot.set_display_hubp_power(pipe, powered).await }
+}
+
 /// Blank one legacy or HPO DisplayPort video stream, retaining timing/link clocks.
 /// # Safety
 /// Stop CPU scanout writers and exclude firmware/FAMS and concurrent display,

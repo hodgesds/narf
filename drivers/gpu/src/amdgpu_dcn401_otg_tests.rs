@@ -153,6 +153,8 @@ impl Io for Fake {
                 || (0x162a0 * 4..=0x162a3 * 4).contains(&at)
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || at == BASE + 0x4a * 4 // native FRL character-clock root
+                || at == BASE + 0xa0 * 4 // native DC_IP_REQUEST_CNTL, bank 2
+                || (0..4).any(|p| at == BASE + (0x80 + 2 * p) * 4)
                 || (BASE + 0x1f0d * 4..=BASE + 0x1f10 * 4).contains(&at)
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
                 || (MPC_BASE + 0x8d3 * 4..=MPC_BASE + 0x8f0 * 4).contains(&at)
@@ -327,6 +329,7 @@ fn engine() -> Engine<Fake> {
             blanks: [None; 4],
             running_blank: None,
             planes_retired: None,
+            hubp_power: [None; 4],
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,
