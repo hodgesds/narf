@@ -43,6 +43,8 @@ pub struct Diagnostics {
     pub sdma_interrupts:
         Option<Result<crate::amdgpu_sdma_navi48::InterruptProof, crate::amdgpu_sdma_navi48::Error>>,
     pub display_clocks: Result<crate::amdgpu_dcn401_clk::Status, crate::amdgpu_dcn401_clk::Error>,
+    pub display_pipe_clocks:
+        Result<crate::amdgpu_dcn401_dccg::Status, crate::amdgpu_dcn401_dccg::Error>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -58,6 +60,7 @@ pub fn status() -> Status {
                 sdma_state: boot.sdma_state(),
                 sdma_interrupts: boot.sdma_interrupts(),
                 display_clocks: boot.display_clock_status(),
+                display_pipe_clocks: boot.display_pipe_clock_status(),
             })
         }),
     }
@@ -291,6 +294,19 @@ pub async fn prepare_display_clocks(
         .as_mut()
         .ok_or(crate::amdgpu_dcn401_clk::Error::Busy)?
         .prepare_display_clocks(request)
+        .await
+}
+
+/// Divide native per-pipe clocks while holding the retained display/PM owner.
+pub async fn prepare_display_pipe_clocks(
+    request: crate::amdgpu_dcn401_dccg::Request,
+) -> Result<crate::amdgpu_dcn401_dccg::Applied, crate::amdgpu_dcn401_dccg::Error> {
+    OWNER
+        .lock()
+        .await
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_dccg::Error::Busy)?
+        .prepare_display_pipe_clocks(request)
         .await
 }
 

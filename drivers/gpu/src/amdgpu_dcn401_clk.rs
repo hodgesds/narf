@@ -117,13 +117,13 @@ pub struct Status {
     pub applied: Option<Applied>,
 }
 #[derive(Clone, Copy, Debug)]
-struct Layout {
+pub(crate) struct Layout {
     mp1: u64,
     dio: u64,
     hpo: u64,
 }
 impl Layout {
-    fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
+    pub(crate) fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
         if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI48 {
             return Err(Error::Unsupported);
         }
@@ -143,7 +143,7 @@ impl Layout {
                 .map_err(|_| Error::Unsupported)?,
         })
     }
-    fn idle_registers(self) -> [(u64, u32); 31] {
+    pub(crate) fn idle_registers(self) -> [(u64, u32); 31] {
         let mut regs = [(0, 0); 31];
         for i in 0..4 {
             for (j, (reg, stride, mask)) in [
@@ -463,6 +463,18 @@ impl ClockManager {
     }
     pub fn status(&self) -> Status {
         self.0.status
+    }
+    /// Only the matching retained DCCG owner may consume these references.
+    /// Historical success after a failed/in-flight transition is insufficient.
+    pub(crate) fn pipe_clocks(&mut self, regs: MmioRegion) -> Result<Applied, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        if self.0.status.state != State::Applied {
+            return Err(Error::Busy);
+        }
+        self.0.idle()?;
+        self.0.status.applied.ok_or(Error::Invalid)
     }
     /// # Safety
     /// Matching protected SMU power is ready; all GPU engines are idle and

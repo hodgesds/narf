@@ -286,8 +286,36 @@ remain diagnostic. `ColdBoot::prepare_display_clocks` and its platform wrapper
 serialize both MP1 owners after the three kernel queue proofs have drained;
 `display_clock_status`/platform `display_clocks` expose retained progress.
 The clocks are not changed automatically during firmware boot. Stream retirement,
-DCCG DTOs, mode bandwidth math, link and scanout setup remain prerequisites to
-native modesetting.
+mode bandwidth math, link and scanout setup remain prerequisites to native
+modesetting.
+
+`unsafe amdgpu_dcn401_dccg::Dccg::new` retains the native four-pipe DCCG owner
+without register writes. It checks the same display discovery and consumer
+bounds, DCN bank one through `DPPCLK_CTRL`, and the native read-only PLL/DPREF
+aperture. `prepare(&mut ClockManager, Request).await` requires a matching BAR,
+current acknowledged global clocks and all 31 display consumers retired.
+`Request` selects a pipe, DPP kHz and disabled, DisplayPort, FRL or TMDS clocks.
+Out-of-range pipes/rates, zero active clocks and oversized DTO ratios fail
+before writes. DPP uses ceil(255 × pipe/global) and the native enable field in
+`DPPCLK_CTRL` (three bits per pipe); the older DTO-enable layout is not used.
+
+DP pixel DTOs derive DPREFCLK from native PLL multiplier and DFS divider
+readback with no guessed fallback. FRL uses acknowledged DTBCLK. Both program
+an integer plus fractional Hz ratio, source mux and required clock gates,
+preserving neighboring fields. TMDS disables DP DTO and selects divide-by-two
+or four. Changed TMDS dividers retrigger DENTIST and await its completion with
+a 100 ms bound, following the native DIG FIFO workaround. This does not
+program an HDMI PLL, route a stream clock or turn on transmission.
+Disabled pipes park their DPP and pixel clocks; shared root gates remain on.
+
+Readback verifies every programmed field. Partial failure records a terminal
+`Failed(Error)`; cancellation leaves `Applying`. Neither can replay, and
+historical successful `Applied` entries remain tagged with their global clock
+snapshot. No stream may use a stale snapshot after global clocks change.
+`ColdBoot::prepare_display_pipe_clocks` and the platform wrapper serialize the
+matching owners after drained engine proofs. `display_pipe_clock_status` and
+platform diagnostics expose progress. An uncertain DCCG transition also blocks
+subsequent platform global-clock changes.
 
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,

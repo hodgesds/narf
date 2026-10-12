@@ -1,6 +1,7 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
 use crate::amdgpu_dcn401_clk as clocks;
+use crate::amdgpu_dcn401_dccg as dccg;
 use crate::amdgpu_ddc_navi48 as ddc;
 use crate::amdgpu_gfx12_queue as queues;
 use crate::amdgpu_gfx12_rs64 as rs64;
@@ -444,6 +445,7 @@ pub struct ColdBoot {
     display: Result<display::Probe, display::Error>,
     ddc: Result<ddc::Ddc, display::Error>,
     clocks: Result<clocks::ClockManager, clocks::Error>,
+    dccg: Result<dccg::Dccg, dccg::Error>,
 }
 impl ColdBoot {
     /// # Safety
@@ -520,6 +522,8 @@ impl ColdBoot {
         // SAFETY: same exclusive display/MP1 ownership, metadata validation
         // only. Optional display failures do not block non-display engines.
         let clocks = unsafe { clocks::ClockManager::new(gpu, authority) };
+        // SAFETY: matching retained display owner; metadata validation only.
+        let dccg = unsafe { dccg::Dccg::new(gpu, authority) };
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(gpu.ip_blocks.len())
@@ -553,6 +557,7 @@ impl ColdBoot {
             display,
             ddc,
             clocks,
+            dccg,
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -706,6 +711,15 @@ impl ColdBoot {
         {
             return Err(clocks::Error::Busy);
         }
+        // Never change the global reference under an uncertain per-pipe
+        // transaction (including a cancelled dentist completion wait).
+        if self
+            .dccg
+            .as_ref()
+            .is_ok_and(|d| !matches!(d.status().state, dccg::State::Ready | dccg::State::Applied))
+        {
+            return Err(clocks::Error::Busy);
+        }
         let clocks = self.clocks.as_mut().map_err(|e| *e)?;
         let smu = self
             .sequence
@@ -719,6 +733,28 @@ impl ColdBoot {
             unsafe { clocks.start(smu).await }?;
         }
         clocks.prepare(request).await
+    }
+    pub fn display_pipe_clock_status(&self) -> Result<dccg::Status, dccg::Error> {
+        self.dccg.as_ref().map(dccg::Dccg::status).map_err(|e| *e)
+    }
+    /// Divide acknowledged global clocks for a retired native display pipe.
+    /// The link/modeset owner must still program its PLL, PHY and scanout.
+    pub async fn prepare_display_pipe_clocks(
+        &mut self,
+        request: dccg::Request,
+    ) -> Result<dccg::Applied, dccg::Error> {
+        if self.state() != State::MemoryReady
+            || self.queue_state() != Some(queues::State::InterruptVerified)
+            || self.sdma_state() != Some(sdma::State::InterruptVerified)
+        {
+            return Err(dccg::Error::Busy);
+        }
+        let clocks = self.clocks.as_mut().map_err(|e| dccg::Error::Clocks(*e))?;
+        self.dccg
+            .as_mut()
+            .map_err(|e| *e)?
+            .prepare(clocks, request)
+            .await
     }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display

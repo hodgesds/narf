@@ -547,3 +547,45 @@ kernel_test_in!(
     "drivers/gpu/dcn401-clk",
     dcn401_fixed_clocks_do_not_issue_unsupported_dpm_commands
 );
+
+fn dcn401_pipe_references_require_current_matching_idle_authority() -> TestResult {
+    let mut words = vec![0; 0x80000 / 4];
+    let g = descriptor(&mut words);
+    let cap = Cap::bootstrap();
+    // SAFETY: retained RAM fixture with exclusive clock/consumer registers.
+    let mut c = unsafe { ClockManager::new(&g, cap) }.unwrap();
+    let mut fake = engine();
+    start(&mut fake);
+    let applied = run(fake.prepare(request())).unwrap();
+    c.0.status.applied = Some(applied);
+    for state in [
+        State::Prepared,
+        State::Starting,
+        State::Ready,
+        State::Applying,
+        State::Failed(Error::Timeout),
+    ] {
+        c.0.status.state = state;
+        assert_eq!(
+            c.pipe_clocks(g.regs),
+            Err(Error::Busy),
+            "historical clocks escaped"
+        );
+    }
+    c.0.status.state = State::Applied;
+    let mut other = g.regs;
+    other.phys = narf_memory::PhysAddr::new(g.regs.phys.raw() + 4096);
+    assert_eq!(c.pipe_clocks(other), Err(Error::Invalid));
+    assert_eq!(c.pipe_clocks(g.regs), Ok(applied));
+    let (at, mask) = c.0.layout.idle_registers()[0];
+    words[at as usize / 4] = mask;
+    assert_eq!(c.pipe_clocks(g.regs), Err(Error::Busy));
+    words[at as usize / 4] = 0;
+    cap.revoke();
+    assert_eq!(c.pipe_clocks(g.regs), Err(Error::Revoked));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-clk",
+    dcn401_pipe_references_require_current_matching_idle_authority
+);
