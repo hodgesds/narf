@@ -286,6 +286,9 @@ identities and bounds the four channels using DCN4 backend register geometry.
 The retained owner supports native DP/eDP DPCD/extended-capability and complete
 segmented EDID discovery, including bounded DEFER retries, per-port errors and
 cancellation quarantine. HDMI DDC and native link/scanout programming remain open.
+MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
+map/unmap packets and two-fence completion/error decoding, checked against Linux
+C layouts. Live MES12 queue ownership and doorbell submission remain open.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer

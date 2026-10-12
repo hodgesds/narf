@@ -267,6 +267,17 @@ capability invocation covers the finite indexed sequence, with write readback.
 Failure prevents replay. `Report::rs64` records completed configuration; this
 does not activate queues, unhalt command processors or prove graphics execution.
 
+`amdgpu_mes12` serializes MES12's 64-dword frames using its eight-byte C
+alignment, separately from MES11's four-byte alignment. It provides bounded
+SET_HW_RSRC/SET_HW_RSRC_1, query-status and native kernel queue map/unmap
+commands, typed completion binding and API-error decoding only after the
+trailing query fence drains. Native MQDs use `v12_compute_mqd`, including
+`DB_UPDATED_MSG_EN`, privileged VMID0 and the MES-owned read pointer. Descriptor,
+ring, EOP and pointer ranges must be aligned, disjoint and within 48 bits;
+resources never delegate VMID0 to the scheduler. `tests/mes12_layout.c` checks
+these offsets against installed Linux headers. This is the command/descriptor
+ABI; the MES12 hardware/doorbell owner must still initialize and run it.
+
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
 tables v1.4/v1.5 supply independently resolved transmitter, AUX and HPD
