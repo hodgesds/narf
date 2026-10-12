@@ -168,10 +168,14 @@ pub fn register_initcalls() {
 }
 ```
 
-The kernel's boot code must call `my_driver::register_initcalls()` once. A
-built-in external crate therefore needs a kernel-side retention/wiring line.
-A runtime-loaded driver avoids that line but can use only the stable module
-KABI; see [modules.md](modules.md).
+For an in-tree crate, the kernel's boot code may call
+`my_driver::register_initcalls()` directly. An external crate instead exposes
+a direct entry such as `register()` that publishes the bus match; xtask wraps
+that entry in the composition's init stage and supplies the retention
+dependency without changing the checkout. Do not nest a same-stage
+`register_initcalls()` call inside that wrapper because the stage registry is
+already snapshotted. A runtime-loaded driver uses only the stable module KABI;
+see [composition.md](composition.md) and [modules.md](modules.md).
 
 ---
 
@@ -484,8 +488,9 @@ kernel (implement a trait or call a public registration function):
 
 For a linked crate, these still require kernel integration or a core change:
 
-- **The initcall wiring line.** A kernel-side aggregator has to retain the
-  dependency and call the crate's `register_initcalls()` once.
+- **A public registration entry.** Composition supplies retention and the
+  staged call, but it cannot invent a subsystem registration seam. The entry
+  is `register()` by default and can be changed in the composition file.
 - **Platform (non-discoverable) devices** have no shared `platform_driver`
   trait — you fold discovery + subsystem-registration into a `Stage::Device`
   initcall instead (§3.4). Workable, but not a single seam.

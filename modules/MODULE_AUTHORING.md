@@ -10,7 +10,8 @@ architecture-comparison overview, see the workspace-root
 > **Status note.** Build your module with:
 >
 > ```sh
-> cargo xtask build-module --package <your-crate> --arch x86_64
+> cargo xtask build-module --manifest-path /path/to/Cargo.toml \
+>   --package <your-crate> --arch x86_64
 > ```
 >
 > which compiles the crate, takes its own object members out of the
@@ -385,6 +386,13 @@ kernel ABI and trust roots exist but before `Stage::Device`. The optional
 overrides each image's `target_domain=` author hint. Runtime-loaded text can
 never be placed in `FRAME`; normal signature, ABI-hash, and required-capability
 checks still apply.
+
+Use `modules_domains=lib/modules/a.ko=driver2,lib/modules/b.ko=driver3` for
+per-image placement; `modules_domain` remains the fallback. A distribution can
+put an external Cargo manifest, signing inputs, initramfs path, and placement
+in a source-neutral
+[`--composition` file](../docs/extending/composition.md), avoiding NARF
+workspace edits.
 
 To unload:
 

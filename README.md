@@ -184,6 +184,24 @@ cargo xtask image --arch=x86_64 --release
 cargo xtask grub-image --arch=x86_64
 ```
 
+External developers and distributions can compose crates without editing this
+checkout. Built-ins are linked into the frame Cargo graph; modules are
+ABI-stamped, staged, and optionally autoloaded:
+
+```sh
+cargo xtask build --composition ../my-kernel/narf.toml
+cargo xtask run --composition ../my-kernel/narf.toml
+
+# One-off local development
+cargo xtask build --builtin-crate ../my-driver/Cargo.toml
+cargo xtask run --module-crate ../my-module/Cargo.toml \
+  --allow-unsigned-modules
+```
+
+See [External kernel composition](docs/extending/composition.md) for the
+manifest, crate entry contract, static/load-time domain selection, signing,
+and image behavior.
+
 **Hardware profiles** isolate driver paths under `cargo xtask run`:
 
 ```sh
@@ -318,6 +336,7 @@ reading list), and `research/summaries/` (distilled primary sources).
 | [`COMPARISON.md`](COMPARISON.md) | Long-form comparison with Linux, the BSDs, and classical microkernels |
 | [`docs/PERSONAS.md`](docs/PERSONAS.md) | `linux-compat` + `container` feature surfaces |
 | [`docs/DOMAIN_BACKENDS.md`](docs/DOMAIN_BACKENDS.md) | Per-silicon enforcement matrix (PKS / MTE / PCID / VMPL / SFI) |
+| [`docs/extending/composition.md`](docs/extending/composition.md) | Link external crates as built-ins or build/stage them as modules without repository edits |
 | [`process/specification/spec.md`](process/specification/spec.md) | Contribution flow (binding on humans and AI agents) |
 | [`security-model/specification/spec.md`](security-model/specification/spec.md) | Threat model, cap × domain composition |
 | `<subsystem>/specification/spec.md` | Per-crate purpose, public interface, invariants |

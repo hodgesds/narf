@@ -22,6 +22,14 @@
 #[cfg(target_os = "none")]
 extern crate alloc;
 
+// The composition registrar is generated beneath target/ and supplied through
+// an environment variable by xtask. Keeping this single generic hook in-tree
+// lets distributions link built-ins without patching the NARF checkout.
+#[cfg(all(target_os = "none", feature = "external-composition"))]
+mod external_composition {
+    include!(env!("NARF_COMPOSITION_RS"));
+}
+
 #[cfg(target_os = "none")]
 #[path = "bare_main.rs"]
 mod bare;

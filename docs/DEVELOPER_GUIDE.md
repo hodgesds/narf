@@ -94,11 +94,32 @@ capabilities, syscalls, buses, and device classes. Use an existing small
 driver as the structural reference and add tests at the lowest useful layer,
 then an in-kernel smoke for cross-crate or hardware-facing behavior.
 
-Built-in drivers are ordinary workspace dependencies. They register their
-initcalls and bus matches during boot and may use the kernel's Rust crate APIs.
-The kernel-side aggregator still has to retain the crate so its registration
-code is linked. Runtime-loadable drivers instead use the deliberately small C
-module ABI described below; a loadable object cannot link Rust kernel crates.
+Built-in drivers register initcalls and bus matches during boot and may use the
+kernel's Rust crate APIs. In-tree crates can remain workspace dependencies;
+out-of-tree crates use an external composition so no NARF manifest or source
+file needs an integration edit. Runtime-loadable drivers instead use the
+deliberately small C module ABI described below; a loadable object cannot link
+Rust kernel crates.
+
+## Compose external crates without repository changes
+
+Keep the integrator's manifest beside the external crates and pass it to
+`build`, `run`, `test`, or `image`:
+
+```sh
+cargo xtask build --composition ../my-kernel/narf.toml
+cargo xtask run --composition ../my-kernel/narf.toml
+```
+
+A `mode = "builtin"` component joins the frame's Cargo graph through a
+generated overlay below `target/`; its `register` entry is invoked at the
+declared init stage. If it declares `domain`, `register` receives that
+compile-time `DomainId`. A `mode = "module"` component is built from its own
+manifest, ABI-stamped, signed/compressed as configured, placed in the
+initramfs, and assigned its domain when the loader admits it. Relative paths
+are resolved from the composition file. See
+[External kernel composition](extending/composition.md) for the complete
+schema and contracts.
 
 ## Build a runtime module
 
@@ -131,6 +152,11 @@ cargo xtask build-module --package narf-drivers-net-e1000 \
   --arch x86_64 --kernel-abi 0x1f3a90c2
 ```
 
+For an out-of-tree package, add
+`--manifest-path ../my-module/Cargo.toml`. For repeatable kernel and module
+selection, prefer `--composition` so the ABI stamp, initramfs path, autoload
+list, and per-module domain are generated together.
+
 `drivers/net/e1000/` is the current reference dual-build consumer. Its
 built-in path uses `DomainId::DRIVER_0`; its `.ko` manifest defaults to
 `target_domain=net`, which an authorized loader may override with, for
@@ -138,7 +164,9 @@ example, `domain=driver3`.
 
 For a driver that must own hardware during the ordinary boot probe, stage the
 ABI-stamped image in the initramfs and boot with, for example,
-`modules_load=lib/modules/e1000.ko modules_domain=driver2`. Autoload runs after
+`modules_load=lib/modules/e1000.ko modules_domain=driver2`. Compositions use
+`modules_domains=path=domain,...` when different modules need different
+placements. Autoload runs after
 KABI/trust initialization and before `Stage::Device`; the e1000 facade's
 `e1000-module-only` profile suppresses its built-in PCI registration for this
 fixture. `cargo xtask e1000-module-net-smoke --arch=x86_64` is the executable

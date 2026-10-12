@@ -30,6 +30,7 @@ mod bench_stats;
 /// The `bpf-bench` subcommand: boot the suite, harvest the samples, apply §8.
 mod bpf_bench;
 mod ci_clippy;
+mod composition;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
 mod passthrough;
@@ -419,6 +420,25 @@ struct BuildArgs {
     /// Forward-list of cargo features to enable. Comma-separated.
     #[arg(long, default_value = "")]
     features: String,
+
+    /// External kernel composition manifest. The file can live outside this
+    /// checkout and select crates as built-ins or loadable modules.
+    #[arg(long, value_name = "FILE")]
+    composition: Option<PathBuf>,
+
+    /// Add an external crate to the kernel as a built-in. Repeatable; the
+    /// manifest may be a Cargo.toml or a package directory.
+    #[arg(long = "builtin-crate", value_name = "MANIFEST")]
+    builtin_crates: Vec<PathBuf>,
+
+    /// Build and stage an external crate as a loadable module. Repeatable;
+    /// use a composition file for signing, domains, and other policy.
+    #[arg(long = "module-crate", value_name = "MANIFEST")]
+    module_crates: Vec<PathBuf>,
+
+    /// Permit unsigned modules selected by the external composition.
+    #[arg(long)]
+    allow_unsigned_modules: bool,
 
     /// QEMU display mode.
     #[arg(long, default_value = "none")]
@@ -938,6 +958,7 @@ impl Arch {
         display: &str,
         profile: HwProfile,
         gpu_backend: GpuBackend,
+        extra_bootargs: &str,
     ) -> Vec<String> {
         let kernel = kernel.display().to_string();
         let gpu_backend = resolve_gpu_backend(self, display, gpu_backend);
@@ -1301,11 +1322,17 @@ impl Arch {
                 // pass runtime knobs the kernel parses from
                 // `narf_boot::cmdline()` — e.g. `mt_echo_threads=N` for the
                 // mt-echo benchmark — without rebuilding the kernel.
-                if let Ok(append) = std::env::var("XTASK_QEMU_APPEND") {
-                    if !append.is_empty() {
-                        args.push("-append".into());
-                        args.push(append);
-                    }
+                let append = [
+                    std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
+                    extra_bootargs.to_string(),
+                ]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+                if !append.is_empty() {
+                    args.push("-append".into());
+                    args.push(append);
                 }
                 if let Some(ird) = TEST_INITRD.lock().ok().and_then(|g| g.clone()) {
                     // x86_64 needs no device-tree dance: the blob arrives as a
@@ -1492,7 +1519,14 @@ impl Arch {
                 // `qemu_virt_dtb_path_with_cmdline` therefore bakes the string
                 // into `/chosen/bootargs` when it generates the blob, which is
                 // where `boot/src/aarch64` already parses it from.
-                let append = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+                let append = [
+                    std::env::var("XTASK_QEMU_APPEND").unwrap_or_default(),
+                    extra_bootargs.to_string(),
+                ]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
                 let initrd = TEST_INITRD.lock().ok().and_then(|g| g.clone());
                 let dtb = qemu_virt_dtb_path_with_cmdline(&append, initrd.as_deref());
                 args.extend_from_slice(&[
@@ -2398,6 +2432,11 @@ struct BuildModuleArgs {
     #[arg(long, default_value = "narf-test-module")]
     package: String,
 
+    /// Cargo manifest containing the module package. May be outside the NARF
+    /// checkout; omitted for an in-tree workspace package.
+    #[arg(long, value_name = "MANIFEST")]
+    manifest_path: Option<PathBuf>,
+
     /// Cargo features to enable for the module build (comma-separated or
     /// repeated). A dual-build driver crate builds as a `.ko` with
     /// `--no-default-features --features module`.
@@ -2865,6 +2904,12 @@ fn module_linker(root: &Path) -> Result<(String, Vec<String>)> {
 
 fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
     let triple = args.arch.triple();
+    let package_manifest = args
+        .manifest_path
+        .clone()
+        .unwrap_or_else(|| root.join("Cargo.toml"));
+    let package = composition::resolve_package(&package_manifest, Some(&args.package))?;
+    let stem = package.lib_name.replace('-', "_");
     let mut cargo = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     // `cargo rustc … --crate-type staticlib`, not `cargo build`: a dual-build
     // driver crate declares `crate-type = ["rlib"]` so the built-in path and
@@ -2878,9 +2923,15 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         .current_dir(root)
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("RUSTFLAGS")
-        .arg("rustc")
+        .arg("rustc");
+    if let Some(manifest) = &args.manifest_path {
+        cargo.arg("--manifest-path").arg(manifest);
+    }
+    cargo
         .arg("-p")
         .arg(&args.package)
+        .arg("--target-dir")
+        .arg(root.join("target"))
         .arg("--release")
         .arg("--target")
         .arg(triple)
@@ -2903,7 +2954,6 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         bail!("cargo rustc -p {} failed", args.package);
     }
 
-    let stem = args.package.replace('-', "_");
     let out_dir = root.join("target").join(triple).join("release");
     let archive = out_dir.join(format!("lib{stem}.a"));
     if !archive.exists() {
@@ -2956,6 +3006,10 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         let suffix = if args.compress { ".ko.lz4" } else { ".ko" };
         out_dir.join(format!("{stem}{suffix}"))
     });
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating module output directory {}", parent.display()))?;
+    }
     let (linker, linker_args) = module_linker(root)?;
     let mut link = Command::new(&linker);
     link.args(&linker_args).arg("-r").arg("-o").arg(&out);
@@ -3027,6 +3081,7 @@ fn build_module_fixture_with_abi(
     let ko_args = BuildModuleArgs {
         arch,
         package: package.into(),
+        manifest_path: None,
         out: None,
         features: vec!["module".into()],
         no_default_features: true,
@@ -3225,59 +3280,122 @@ fn check_module_undefined_symbols(ko: &Path, root: &Path) -> Result<()> {
 ///
 /// Keep this in sync with `[build]` + `[target.<triple>]` in
 /// `.cargo/config.toml`.
-fn kernel_rustflags(arch: Arch) -> Vec<&'static str> {
-    let mut f = vec![
+fn kernel_rustflags(root: &Path, arch: Arch) -> Vec<String> {
+    let mut f = [
         "--remap-path-prefix",
         ".=.",
         "-C",
         "relocation-model=static",
         "-C",
         "link-arg=--emit-relocs",
-    ];
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
     match arch {
-        Arch::X86_64 => f.extend_from_slice(&[
-            "-C",
-            "code-model=kernel",
-            "-C",
-            "link-arg=-Tbuild/linker/x86_64.ld",
-            "-C",
-            "link-arg=--gc-sections",
-            "-C",
-            "link-arg=--build-id=sha1",
-            "-Z",
-            "plt=no",
-            "--cfg",
-            "curve25519_dalek_backend=\"serial\"",
-            "--cfg",
-            "poly1305_force_soft",
-            "--cfg",
-            "aes_force_soft",
-            "--cfg",
-            "polyval_force_soft",
+        Arch::X86_64 => f.extend([
+            "-C".into(),
+            "code-model=kernel".into(),
+            "-C".into(),
+            format!(
+                "link-arg=-T{}",
+                root.join("build/linker/x86_64.ld").display()
+            ),
+            "-C".into(),
+            "link-arg=--gc-sections".into(),
+            "-C".into(),
+            "link-arg=--build-id=sha1".into(),
+            "-Z".into(),
+            "plt=no".into(),
+            "--cfg".into(),
+            "curve25519_dalek_backend=\"serial\"".into(),
+            "--cfg".into(),
+            "poly1305_force_soft".into(),
+            "--cfg".into(),
+            "aes_force_soft".into(),
+            "--cfg".into(),
+            "polyval_force_soft".into(),
         ]),
-        Arch::Aarch64 => f.extend_from_slice(&[
-            "-C",
-            "code-model=small",
-            "-C",
-            "target-feature=+lse",
-            "-C",
-            "link-arg=-Tbuild/linker/aarch64.ld",
-            "-C",
-            "link-arg=--gc-sections",
-            "-C",
-            "link-arg=--build-id=sha1",
+        Arch::Aarch64 => f.extend([
+            "-C".into(),
+            "code-model=small".into(),
+            "-C".into(),
+            "target-feature=+lse".into(),
+            "-C".into(),
+            format!(
+                "link-arg=-T{}",
+                root.join("build/linker/aarch64.ld").display()
+            ),
+            "-C".into(),
+            "link-arg=--gc-sections".into(),
+            "-C".into(),
+            "link-arg=--build-id=sha1".into(),
         ]),
     }
     f
 }
 
+fn composition_plan(args: &BuildArgs, root: &Path) -> Result<composition::Plan> {
+    composition::load(
+        root,
+        args.composition.as_deref(),
+        &args.builtin_crates,
+        &args.module_crates,
+        args.allow_unsigned_modules,
+    )
+}
+
+fn build_composition_modules(
+    args: &BuildArgs,
+    root: &Path,
+    plan: &composition::Plan,
+) -> Result<()> {
+    let abi = kernel_abi_hash_from_source(root)?;
+    for component in plan.modules() {
+        let module_args = BuildModuleArgs {
+            arch: args.arch,
+            package: component.package.clone(),
+            manifest_path: Some(component.manifest.clone()),
+            features: component.features.clone(),
+            no_default_features: !component.default_features,
+            out: Some(composition::module_output_path(
+                root,
+                plan,
+                args.arch.triple(),
+                component,
+            )),
+            kernel_abi: Some(format!("0x{abi:08x}")),
+            compress: component.compress,
+            signature: component.signature.clone(),
+            public_key: component.public_key.clone(),
+        };
+        build_module(&module_args, root)
+            .with_context(|| format!("building composed module package {}", component.package))?;
+    }
+    Ok(())
+}
+
 fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
+    let plan = composition_plan(args, root)?;
+    let overlay = composition::prepare_overlay(root, &plan)?;
+    let trusted_keys = composition::prepare_trusted_keys(root, &plan)?;
+    if !plan.components.is_empty() && args.package != "narf-frame" {
+        bail!("external kernel composition requires --package narf-frame");
+    }
     let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
-    cmd.current_dir(root)
-        .env_remove("RUSTFLAGS")
-        .arg("build")
-        .arg("-p")
+    cmd.current_dir(root).env_remove("RUSTFLAGS").arg("build");
+    if let Some(overlay) = &overlay {
+        cmd.arg("--manifest-path")
+            .arg(&overlay.manifest)
+            .env("NARF_COMPOSITION_RS", &overlay.registrar);
+    }
+    if let Some(trusted_keys) = &trusted_keys {
+        cmd.env("NARF_MODULE_TRUSTED_KEYS", trusted_keys);
+    }
+    cmd.arg("-p")
         .arg(&args.package)
+        .arg("--target-dir")
+        .arg(root.join("target"))
         .arg("--target")
         .arg(args.arch.triple())
         .arg("-Z")
@@ -3292,29 +3410,10 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         if args.arch.triple() != "x86_64-unknown-none" {
             bail!("--kasan is x86_64-only (kernel-address sanitizer unsupported on aarch64-unknown-none)");
         }
-        let flags = [
-            "-C",
-            "relocation-model=static",
-            "-C",
-            "code-model=kernel",
-            "-C",
-            "link-arg=-Tbuild/linker/x86_64.ld",
-            "-C",
-            "link-arg=--gc-sections",
-            "-C",
-            "link-arg=--build-id=sha1",
-            "-Z",
-            "plt=no",
-            "--cfg",
-            "curve25519_dalek_backend=\"serial\"",
-            "--cfg",
-            "poly1305_force_soft",
-            "--cfg",
-            "aes_force_soft",
-            "--cfg",
-            "polyval_force_soft",
-            "-Z",
-            "sanitizer=kernel-address",
+        let mut flags = kernel_rustflags(root, args.arch);
+        flags.extend([
+            "-Z".into(),
+            "sanitizer=kernel-address".into(),
             // Force OUTLINE instrumentation: every access calls
             // `__asan_{load,store}N` with the raw address instead of an inline
             // `shr|OFFSET` shadow check. NARF accesses data through BOTH the low
@@ -3324,20 +3423,19 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
             // high-half addresses. The outline callback does the low/high→phys→
             // shadow lookup in software (see memory/src/kasan.rs), sidestepping
             // the mapping entirely.
-            "-C",
-            "llvm-args=-asan-instrumentation-with-call-threshold=0",
+            "-C".into(),
+            "llvm-args=-asan-instrumentation-with-call-threshold=0".into(),
             // Access checks only — no stack/global/alloca redzone poisoning
             // (those emit `__asan_set_shadow_*` and demand writable shadow over
             // every stack; the freed-block write we hunt is a heap store).
-            "-C",
-            "llvm-args=-asan-stack=0",
-            "-C",
-            "llvm-args=-asan-globals=0",
-            "-C",
-            "llvm-args=-asan-instrument-dynamic-allocas=0",
-        ]
-        .join("\u{1f}");
-        cmd.env("CARGO_ENCODED_RUSTFLAGS", flags);
+            "-C".into(),
+            "llvm-args=-asan-stack=0".into(),
+            "-C".into(),
+            "llvm-args=-asan-globals=0".into(),
+            "-C".into(),
+            "llvm-args=-asan-instrument-dynamic-allocas=0".into(),
+        ]);
+        cmd.env("CARGO_ENCODED_RUSTFLAGS", flags.join("\u{1f}"));
     } else {
         // Set the kernel rustflags explicitly rather than inheriting them from
         // `.cargo/config.toml`: cargo merges (concatenates) the config
@@ -3346,13 +3444,13 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
         // `-Tbuild/linker/<arch>.ld` and fail the link. See `kernel_rustflags`.
         cmd.env(
             "CARGO_ENCODED_RUSTFLAGS",
-            kernel_rustflags(args.arch).join("\u{1f}"),
+            kernel_rustflags(root, args.arch).join("\u{1f}"),
         );
     }
     if !args.debug {
         cmd.arg("--release");
     }
-    let features = if args.kasan {
+    let mut features = if args.kasan {
         if args.features.is_empty() {
             "kasan".to_string()
         } else {
@@ -3361,6 +3459,16 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
     } else {
         args.features.clone()
     };
+    if overlay.is_some() {
+        ensure_feature(&mut features, "external-composition");
+    }
+    if plan.allow_unsigned_modules
+        && plan
+            .modules()
+            .any(|component| component.signature.is_none())
+    {
+        ensure_feature(&mut features, "module-allow-unsigned");
+    }
     if !features.is_empty() {
         cmd.arg("--features").arg(&features);
     }
@@ -3395,6 +3503,8 @@ fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
             );
         }
     }
+
+    build_composition_modules(args, root, &plan)?;
 
     Ok(out)
 }
@@ -3467,9 +3577,16 @@ fn passthrough_qemu_args(args: &BuildArgs) -> Result<Vec<String>> {
 
 fn qemu_boot_args(args: &BuildArgs, kernel: &Path) -> Result<Vec<String>> {
     let vfio_args = passthrough_qemu_args(args)?;
-    let mut qemu_args =
-        args.arch
-            .qemu_args(kernel, &args.display, args.hw_profile, args.gpu_backend);
+    let root = workspace_root()?;
+    let composition = composition_plan(args, &root)?;
+    let composition_bootargs = composition::boot_arguments(&composition).join(" ");
+    let mut qemu_args = args.arch.qemu_args(
+        kernel,
+        &args.display,
+        args.hw_profile,
+        args.gpu_backend,
+        &composition_bootargs,
+    );
     qemu_args.extend(vfio_args);
     Ok(qemu_args)
 }
@@ -3515,6 +3632,18 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         args.features.contains("kernel-test"),
         std::sync::atomic::Ordering::Relaxed,
     );
+    if let Ok(mut initrd) = TEST_INITRD.lock() {
+        *initrd = None;
+    }
+
+    let plan = composition_plan(args, &root)?;
+    let mut fixtures: Vec<(String, Vec<u8>)> = Vec::new();
+    for component in plan.modules() {
+        let path = composition::module_output_path(&root, &plan, args.arch.triple(), component);
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading composed module {}", path.display()))?;
+        fixtures.push((composition::module_guest_path(component), bytes));
+    }
 
     // Ship the reference kernel module to the guest, so the in-kernel suite
     // can load a REAL rustc-built `.ko` instead of an ELF synthesized in
@@ -3530,6 +3659,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             let ko_args = BuildModuleArgs {
                 arch: args.arch,
                 package: "narf-test-module".into(),
+                manifest_path: None,
                 out: None,
                 features: Vec::new(),
                 no_default_features: false,
@@ -3540,43 +3670,49 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             };
             build_module(&ko_args, &root).and_then(|ko| Ok(std::fs::read(&ko)?))
         };
-        let mut fixtures: Vec<(&str, Vec<u8>)> = Vec::new();
         match build_fixture(false) {
-            Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko", bytes)),
+            Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko".into(), bytes)),
             Err(e) => println!("xtask: raw test module unavailable ({e})"),
         }
         match build_fixture(true) {
-            Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko.lz4", bytes)),
+            Ok(bytes) => fixtures.push(("lib/modules/narf_test_module.ko.lz4".into(), bytes)),
             Err(e) => println!("xtask: compressed test module unavailable ({e})"),
         }
         // A real dual-build driver `.ko` for the loadable-driver e2e smoke.
         match build_module_fixture("narf-drivers-net-e1000", args.arch, &root) {
-            Ok(bytes) => fixtures.push(("lib/modules/narf_drivers_net_e1000.ko", bytes)),
+            Ok(bytes)
+                if !fixtures
+                    .iter()
+                    .any(|(name, _)| name == "lib/modules/narf_drivers_net_e1000.ko") =>
+            {
+                fixtures.push(("lib/modules/narf_drivers_net_e1000.ko".into(), bytes));
+            }
+            Ok(_) => {}
             Err(e) => println!("xtask: e1000 driver module unavailable ({e})"),
         }
+    }
 
-        if !fixtures.is_empty() {
-            let entries: Vec<(&str, &[u8])> = fixtures
-                .iter()
-                .map(|(name, bytes)| (*name, bytes.as_slice()))
-                .collect();
-            let cpio = encode_cpio_newc(&entries);
-            let p = out_dir.join("initramfs-kernel-test.cpio");
-            match std::fs::write(&p, &cpio) {
-                Ok(()) => {
-                    for (name, bytes) in &fixtures {
-                        println!(
-                            "xtask: staged test module ({} bytes) -> guest /{}",
-                            bytes.len(),
-                            name
-                        );
-                    }
-                    if let Ok(mut g) = TEST_INITRD.lock() {
-                        *g = Some(p);
-                    }
+    if !fixtures.is_empty() {
+        let entries: Vec<(&str, &[u8])> = fixtures
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let cpio = encode_cpio_newc(&entries);
+        let p = out_dir.join("initramfs-modules.cpio");
+        match std::fs::write(&p, &cpio) {
+            Ok(()) => {
+                for (name, bytes) in &fixtures {
+                    println!(
+                        "xtask: staged module ({} bytes) -> guest /{}",
+                        bytes.len(),
+                        name
+                    );
                 }
-                Err(e) => println!("xtask: could not write test-module initramfs ({e})"),
+                if let Ok(mut initrd) = TEST_INITRD.lock() {
+                    *initrd = Some(p);
+                }
             }
+            Err(e) => println!("xtask: could not write module initramfs ({e})"),
         }
     }
 
@@ -8874,6 +9010,7 @@ mod kernel_test_feature_tests {
                     "none",
                     profile,
                     GpuBackend::Virtio2d,
+                    "",
                 );
                 let backends: Vec<_> = args
                     .windows(2)
@@ -8920,6 +9057,7 @@ mod kernel_test_feature_tests {
                 "gtk,gl=on",
                 profile,
                 GpuBackend::Virgl,
+                "",
             );
             assert!(
                 args.windows(2).any(|pair| pair == ["-vga", "none"]),
@@ -8933,6 +9071,7 @@ mod kernel_test_feature_tests {
                 "gtk,gl=on",
                 profile,
                 GpuBackend::Virgl,
+                "",
             );
             assert!(
                 !args.windows(2).any(|pair| pair == ["-vga", "none"]),
@@ -9450,6 +9589,7 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     }
     let root = workspace_root()?;
     let out_dir = cargo_build(args, &root)?;
+    let composition = composition_plan(args, &root)?;
     let kernel = out_dir.join(&args.package);
     if !kernel.exists() {
         bail!("expected kernel binary at {}", kernel.display());
@@ -9504,6 +9644,14 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         .with_context(|| format!("reading init ELF at {}", init_elf.display()))?;
     let shell_bytes = std::fs::read(&shell_elf)
         .with_context(|| format!("reading shell ELF at {}", shell_elf.display()))?;
+    let mut composition_modules = Vec::new();
+    for component in composition.modules() {
+        let path =
+            composition::module_output_path(&root, &composition, args.arch.triple(), component);
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading composed module {}", path.display()))?;
+        composition_modules.push((composition::module_guest_path(component), bytes));
+    }
 
     // Build the 5 coreutils and read their ELFs.
     // Each crate lives at userspace/coreutils/<name>/ and uses
@@ -9594,6 +9742,7 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         let ko_args = BuildModuleArgs {
             arch: args.arch,
             package: "narf-test-module".into(),
+            manifest_path: None,
             out: None,
             features: Vec::new(),
             no_default_features: false,
@@ -9628,6 +9777,9 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     cpio_entries.push(("shell", &shell_bytes));
     if let Some(ref b) = test_module_bytes {
         cpio_entries.push(("lib/modules/narf_test_module.ko", b.as_slice()));
+    }
+    for (path, bytes) in &composition_modules {
+        cpio_entries.push((path.as_str(), bytes.as_slice()));
     }
     // Stage coreutils at bin/<name> so the shell's /bin/<name>
     // PATH resolution resolves them after the initramfs is mounted.
@@ -9722,7 +9874,14 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
     // multiboot2 module; `module_string` sets the module's command-
     // line so `narf_boot::x86_64::multiboot2::initramfs_module`
     // matches it (case-insensitive equality with "initramfs").
-    let cfg = "\
+    let composition_bootargs = composition::boot_arguments(&composition).join(" ");
+    let kernel_cmdline = if composition_bootargs.is_empty() {
+        String::new()
+    } else {
+        format!("    kernel_cmdline: {composition_bootargs}\n")
+    };
+    let cfg = format!(
+        "\
 timeout: 5
 serial: yes
 verbose: yes
@@ -9733,9 +9892,11 @@ interface_resolution: 1024x768
 /NARF
     protocol: multiboot2
     path: boot():/boot/narf-frame
+{kernel_cmdline}\
     module_path: boot():/boot/initramfs.cpio
     module_string: initramfs
-";
+"
+    );
     std::fs::write(limine_stage.join("limine.conf"), cfg).context("writing limine.conf")?;
 
     let iso = root.join("target").join("narf-x86_64.iso");
@@ -9902,6 +10063,13 @@ fn grub_image_cmd(args: &BuildArgs) -> Result<()> {
     std::fs::copy(&limine_efi, esp_efi.join("BOOTX64.EFI"))
         .with_context(|| format!("copying Limine EFI app from {}", limine_efi.display()))?;
 
+    let composition = composition_plan(args, &root)?;
+    let composition_bootargs = composition::boot_arguments(&composition).join(" ");
+    let composition_bootargs = if composition_bootargs.is_empty() {
+        String::new()
+    } else {
+        format!(" {composition_bootargs}")
+    };
     let grub_cfg = r#"# Merge this stanza into the host's GRUB configuration.
 #
 # BIOS boots NARF directly through Multiboot2. For UEFI, first copy every file
@@ -9918,12 +10086,13 @@ menuentry "NARF" {
         search --no-floppy --file --set=narf_esp /EFI/NARF/BOOTX64.EFI
         chainloader ($narf_esp)/EFI/NARF/BOOTX64.EFI
     else
-        multiboot2 /boot/narf-frame-grub
+        multiboot2 /boot/narf-frame-grub@NARF_COMPOSITION_BOOTARGS@
         module2 /boot/initramfs.cpio initramfs
     fi
     boot
 }
-"#;
+"#
+    .replace("@NARF_COMPOSITION_BOOTARGS@", &composition_bootargs);
     std::fs::write(bundle.join("grub.cfg"), grub_cfg)
         .with_context(|| format!("writing GRUB stanza in {}", bundle.display()))?;
 
@@ -10198,6 +10367,12 @@ fn aavmf_code_path() -> PathBuf {
 /// Build a removable FAT image with the standard AA64 fallback loader.
 fn build_aarch64_uefi_image(args: &BuildArgs) -> Result<PathBuf> {
     let root = workspace_root()?;
+    let composition = composition_plan(args, &root)?;
+    if composition.modules().next().is_some() {
+        bail!(
+            "aarch64 UEFI images do not yet carry an initramfs; use built-in components or `cargo xtask run --arch aarch64 --composition ...`"
+        );
+    }
     let out_dir = cargo_build(args, &root)?;
     let kernel = out_dir.join(&args.package);
     if !kernel.is_file() {

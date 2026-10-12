@@ -73,14 +73,38 @@ fn canonical_initramfs_name(name: &str) -> &str {
     name.strip_prefix('/').unwrap_or(name)
 }
 
+fn autoload_params(requested_path: &str) -> Result<alloc::string::String, &'static str> {
+    let mut selected = None;
+    if let Some(mappings) = narf_boot::args().value("modules_domains") {
+        for mapping in mappings.split(',').filter(|mapping| !mapping.is_empty()) {
+            let Some((path, domain)) = mapping.split_once('=') else {
+                return Err("invalid modules_domains mapping");
+            };
+            if path.is_empty() || domain.is_empty() {
+                return Err("invalid modules_domains mapping");
+            }
+            if canonical_initramfs_name(path) == requested_path
+                && selected.replace(domain).is_some()
+            {
+                return Err("duplicate modules_domains mapping");
+            }
+        }
+    }
+    Ok(selected
+        .or_else(|| narf_boot::args().value("modules_domain"))
+        .map(|domain| alloc::format!("domain={domain}"))
+        .unwrap_or_default())
+}
+
 /// Load the comma-separated initramfs paths named by `modules_load=`.
 ///
 /// This runs after the KABI table is finalized but before `Stage::Device`, so
 /// a driver module can register its PCI match before the ordinary bus probe.
-/// `modules_domain=` is an operator-selected placement override applied to
-/// every module in the list; the loader still rejects `FRAME` and enforces the
-/// module signature, ABI hash, and capability manifest normally. Both values
-/// come from the bootloader-supplied command line.
+/// `modules_domains=path=domain,...` selects placement per module;
+/// `modules_domain=` remains the fallback applied to every unmatched module.
+/// The loader still rejects `FRAME` and enforces the module signature, ABI
+/// hash, and capability manifest normally. All values come from the
+/// bootloader-supplied command line.
 fn autoload_initramfs_modules() -> narf_init::InitResult {
     use core::fmt::Write as _;
 
@@ -90,14 +114,14 @@ fn autoload_initramfs_modules() -> narf_init::InitResult {
     let Some(initramfs) = narf_initramfs::staged() else {
         return narf_init::InitResult::Error("modules_load requires an initramfs");
     };
-    let params = narf_boot::args()
-        .value("modules_domain")
-        .map(|domain| alloc::format!("domain={domain}"))
-        .unwrap_or_default();
     let mut loaded = 0usize;
 
     for requested_path in requested.split(',').filter(|path| !path.is_empty()) {
         let requested_path = canonical_initramfs_name(requested_path);
+        let params = match autoload_params(requested_path) {
+            Ok(params) => params,
+            Err(error) => return narf_init::InitResult::Error(error),
+        };
         let Some((_, bytes)) = initramfs
             .iter_files()
             .find(|(name, _)| canonical_initramfs_name(name) == requested_path)

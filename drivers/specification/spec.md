@@ -158,6 +158,12 @@ to `DomainId::DRIVER_0`); no loader parameter can change them. For a runtime-loa
 `domain=<name>` to `init_module` / `finit_module` to choose the effective
 driver domain. The loader rejects `DomainId::FRAME` for every runtime module.
 
+An external composition may provide the built-in retention edge and invoke a
+crate entry at a declared init stage. With a `domain` field, that entry accepts
+the selected `DomainId`, making placement a build-time image property. Module
+components instead retain the C ABI and receive per-image load placement via
+`modules_domains=path=domain,...`; `modules_domain` is the global fallback.
+
 The current staged device ABI uses opaque `u64` handles. Kernel-owned contexts
 hold the real device capability, BAR mappings, and owner `ModuleId`; no
 `repr(Rust)` object crosses the module boundary. Kernel-to-module callbacks
@@ -368,66 +374,51 @@ build that even compiles the relaxation path.
 
 ## 6. Manifest format
 
-### 6.1 Workspace manifest
+### 6.1 External composition manifest
 
-A new top-level `narf.toml` (separate from any Cargo file) drives
-which drivers ship in which image. Multiple profiles allowed.
+`cargo xtask build|run|test|image --composition <file>` reads a versioned
+manifest that may live outside the checkout. Each `[[component]]` names a
+Cargo manifest (and optional package), selects `mode = "builtin"` or
+`"module"`, and may select features, default-feature policy, and a domain.
+Built-ins additionally select their Rust entry and init stage. Modules may
+select autoload, compression, and detached signature/public-key inputs.
 
 ```toml
-[image.production]
-sdk_minor = 4                                # min SDK; kernel will export ≥ this
-static = [
-    "narf-drivers-virtio-blk",
-    "narf-drivers-virtio-net",
-    "narf-drivers-nvme",
-    "narf-drivers-bochs-display",
-]
-modules = [
-    "narf-drivers-e1000",
-    "narf-drivers-xhci",
-    "narf-drivers-virtio-gpu",
-]
-disabled = [
-    "narf-drivers-i915",
-]
-sign_key = "build/keys/in-tree.pem"
+version = 1
 
-[image.minimal]
-sdk_minor = 4
-static = ["narf-drivers-virtio-blk", "narf-drivers-virtio-net"]
-modules = []
-disabled = "*"                               # everything else
-sign_key = "build/keys/in-tree.pem"
+[[component]]
+manifest = "../acme-net/Cargo.toml"
+mode = "builtin"
+entry = "register"
+stage = "subsys"
+domain = "driver2"
 
-[image.dev]
-inherits = "production"
-modules += ["narf-drivers-vendor-experimental"]   # additive override
-allow_unsigned = true
+[[component]]
+manifest = "../acme-storage/Cargo.toml"
+mode = "module"
+features = ["module"]
+default_features = false
+domain = "driver3"
+autoload = true
+signature = "keys/acme-storage.sig"
+public_key = "keys/acme-storage.pub"
 ```
 
-`xtask build --image production` reads the manifest, runs the
-selected crates with the right output type, and stitches the
-image. Adding a driver to the kernel = `git clone <crate>` +
-one line in the manifest. Removing a driver = remove the line.
+Relative paths resolve from the composition file. Unknown fields and
+unsigned modules without explicit development policy are rejected. Generated
+integration state lives under `target/narf-compositions/` and never rewrites
+the NARF or vendor workspace. Public keys selected for signed module entries
+are provisioned into the kernel's generated trust store.
 
 ### 6.2 Out-of-tree drivers
 
-A vendor driver lives in its own Cargo workspace and depends on
-`narf-driver-sdk` from crates.io (or a vendored path). To ship
-it in an image, the system integrator adds it to their `narf.toml`:
-
-```toml
-[image.custom]
-inherits = "production"
-modules += ["acme-storage-driver"]
-
-[crate.acme-storage-driver]
-git = "https://git.acme.example/narf-driver"
-rev = "v2.4.0"
-```
-
-Cargo resolves it like any other dep. Same SDK, same ABI check,
-same signature flow.
+A vendor driver lives in its own Cargo workspace. In built-in mode it tracks
+NARF's source-level Rust interfaces and exposes a callable registration entry;
+the composition overlay links it into the same frame Cargo graph. If a static
+domain is declared, the entry accepts that `DomainId`. In module mode it
+depends only on code-free macros or its own implementation and imports the
+curated C KABI. The module loader applies the same ABI, signature, capability,
+dependency, and non-`FRAME` checks regardless of where the crate lives.
 
 ### 6.3 Per-driver compile-time manifest
 

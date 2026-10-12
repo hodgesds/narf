@@ -83,6 +83,15 @@ Ed25519 trailer to a built module image. The e1000 module smoke derives the
 running kernel ABI hash from the canonical `kernel_abi!` declaration with
 Rust's own token stringification before staging the image.
 
+**External composition.** The common build arguments accept
+`--composition FILE`, repeatable `--builtin-crate MANIFEST`, and repeatable
+`--module-crate MANIFEST`. A composition resolves crates from any Cargo
+workspace, generates a frame manifest/registrar below `target/` for built-ins,
+and builds, ABI-stamps, stages, and autoloads `.ko` components. No external or
+NARF source manifest is rewritten. `build-module --manifest-path FILE`
+provides the lower-level out-of-tree module path. The full schema is in
+[`docs/extending/composition.md`](../../docs/extending/composition.md).
+
 **Firmware.** `pack-firmware` wraps a raw firmware payload in the NARF
 trailer (optionally with a detached Ed25519 signature), and
 `import-firmware` bulk-imports a firmware tree, decompressing Arch's
