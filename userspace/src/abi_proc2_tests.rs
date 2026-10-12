@@ -1713,6 +1713,8 @@ const PTRACE_SETOPTIONS: u64 = 0x4200;
 const PTRACE_GETREGSET: u64 = 0x4204;
 const PTRACE_O_TRACESYSGOOD: u64 = 1;
 const NT_PRSTATUS: u64 = 1;
+#[cfg(target_arch = "x86_64")]
+const NT_PRFPREG: u64 = 2;
 
 /// A registered task FAKE_TASK can legitimately trace. Distinct from the
 /// pid-namespace fixtures above so the two never collide.
@@ -1731,7 +1733,13 @@ fn ptrace_fixture() -> Result<(), &'static str> {
         Syscall::Ptrace.raw(),
         a3(PTRACE_ATTACH_REQ, TRACEE_PID, 0, 0),
     ) {
-        Some(0) if crate::ptrace::__test_tracee_count() == 1 => Ok(()),
+        Some(0) if crate::ptrace::__test_tracee_count() == 1 => {
+            // ABI tests do not run the synthetic tracee through the signal
+            // delivery path. Make the fixture match the post-SIGSTOP state a
+            // real PTRACE_ATTACH reaches before non-KILL ptrace requests.
+            crate::ptrace::__test_set_tracee_stopped(TRACEE_PID, true);
+            Ok(())
+        }
         Some(0) => Err("ptrace fixture: active-tracee count did not advance"),
         _ => Err("ptrace fixture: PTRACE_ATTACH did not succeed"),
     }
@@ -2072,6 +2080,47 @@ fn smoke_abi_proc2_ptrace_getregset_fault_beats_bad_regset() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_ptrace_getregset_fault_beats_bad_regset
+);
+
+// Crashpad obtains the legacy x86 FPU image after its general-register
+// snapshot. It only needs the standard FXSAVE-shaped 512-byte prefix, not the
+// optional XSAVE extensions, so that is the exact contract this regression
+// test fixes.
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc2_ptrace_getregset_returns_legacy_fpu_image() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            let mut fpregs = [0u8; 512];
+            let mut iov = [fpregs.as_mut_ptr() as u64, fpregs.len() as u64];
+            if call(
+                Syscall::Ptrace.raw(),
+                a3(
+                    PTRACE_GETREGSET,
+                    TRACEE_PID,
+                    (1u64 << 32) | NT_PRFPREG,
+                    iov.as_mut_ptr() as u64,
+                ),
+            ) != Some(0)
+            {
+                return Err("PTRACE_GETREGSET(NT_PRFPREG) must succeed on x86_64");
+            }
+            if iov[1] != fpregs.len() as u64 {
+                return Err("PTRACE_GETREGSET(NT_PRFPREG) returned the wrong regset size");
+            }
+            if fpregs[..2] != [0x7f, 0x03] || fpregs[24..28] != [0x80, 0x1f, 0, 0] {
+                return Err("NT_PRFPREG did not return canonical FXSAVE control words");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_getregset_returns_legacy_fpu_image
 );
 
 // PTRACE_KILL still runs ptrace_check_attach — `ignore_state` only

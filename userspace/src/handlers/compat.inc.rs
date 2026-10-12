@@ -7875,8 +7875,9 @@ pub fn proc_auxv_of(pid: u64) -> alloc::vec::Vec<u8> {
         .unwrap_or_else(|| alloc::vec![0u8; 16])
 }
 
-/// Record NUL-separated environ for a task at execve time.
-pub fn set_proc_environ(pid: u64, envp: &[&str]) {
+/// Record NUL-separated environ for a scheduler task at execve time. Procfs
+/// readers translate their visible process ID to this key before lookup.
+pub fn set_proc_environ(task: u64, envp: &[&str]) {
     let mut packed = alloc::vec::Vec::new();
     for s in envp {
         packed.extend_from_slice(s.as_bytes());
@@ -7884,12 +7885,13 @@ pub fn set_proc_environ(pid: u64, envp: &[&str]) {
     }
     let mut g = PROC_ENVIRON.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(pid, packed);
+    map.insert(task, packed);
 }
 
-/// Record packed auxv (key, value) pairs for a task at execve time.
+/// Record packed auxv (key, value) pairs for a scheduler task at execve time.
+/// Procfs readers translate their visible process ID to this key before lookup;
 /// AT_NULL is appended automatically.
-pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
+pub fn set_proc_auxv_pairs(task: u64, aux: &[(u64, u64)]) {
     let mut packed: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity((aux.len() + 1) * 16);
     for (key, val) in aux {
         packed.extend_from_slice(&key.to_le_bytes());
@@ -7899,7 +7901,7 @@ pub fn set_proc_auxv_pairs(pid: u64, aux: &[(u64, u64)]) {
     packed.extend_from_slice(&0u64.to_le_bytes());
     let mut g = PROC_AUXV.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-    map.insert(pid, packed);
+    map.insert(task, packed);
 }
 
 /// Return the backing description for fd `n` of `pid`.  Shaped like

@@ -113,6 +113,13 @@ through thread-local `errno`; it must not collapse path-resolution failures,
 permission failures, and malformed images into one `ENOEXEC`, because PATH
 search depends on distinguishing `ENOENT` and `ENOTDIR` from terminal errors.
 
+The loader publishes the finalized SysV auxiliary vector and environment to
+`/proc/<pid>/auxv` and `/proc/<pid>/environ` only after a successful image
+load. Thus procfs and the initial stack carry the same `AT_PHDR`, `AT_PHENT`,
+`AT_PHNUM`, interpreter, capability, and terminator entries. On x86_64,
+`PTRACE_GETREGSET` supports both `NT_PRSTATUS` and `NT_PRFPREG`; the latter is
+the 512-byte FXSAVE-compatible legacy prefix of the task's saved XSAVE image.
+
 ELF `PT_LOAD` construction follows Linux's BSS split: file-image pages are
 materialized, the unused tail of the final file page is zero-filled, and every
 following full page through `p_memsz` is private anonymous demand-zero memory.

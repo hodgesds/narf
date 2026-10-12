@@ -868,10 +868,11 @@ fn current_address_space_id() -> Option<u64> {
 /// allocate and take its own locks — a BPF arena installs a kernel page-table
 /// entry inside it — and holding an owner bucket across that would put this
 /// lock beneath every lock any demand-pageable file might take, on a path
-/// entered from the page-fault handler.
-pub(crate) fn demand_frame(vaddr: u64) -> Result<u64, FileFaultError> {
+/// entered from the page-fault handler. `address_space_id` comes from the
+/// owning `AddressSpace`, not the CPU's currently active user root: ptrace may
+/// fault a stopped tracee's file-backed page while the tracer's root is live.
+pub(crate) fn demand_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     let page = vaddr & !0xFFFu64;
-    let address_space_id = current_address_space_id().ok_or(FileFaultError::NoOwner)?;
     let owner_bucket = existing_mapping_owners(address_space_id).ok_or(FileFaultError::NoOwner)?;
     let (offset, ops, generic_fallback, private_copy, zero_from) = {
         let owners = owner_bucket.lock();

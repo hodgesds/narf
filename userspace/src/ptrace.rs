@@ -61,6 +61,11 @@ pub const PTRACE_SETREGSET: u64 = 0x4205;
 /// payload is a `user_regs_struct`.
 pub const NT_PRSTATUS: u64 = 1;
 
+/// x86 legacy floating-point regset used by Crashpad and other ptrace
+/// consumers. The payload is the 512-byte FXSAVE-compatible prefix of XSAVE.
+#[cfg(target_arch = "x86_64")]
+pub const NT_PRFPREG: u64 = 2;
+
 /// PTRACE_O_TRACESYSGOOD: OR 0x80 into the SIGTRAP stop signal at a
 /// syscall-stop so the tracer can distinguish it from an ordinary
 /// SIGTRAP.
@@ -352,6 +357,39 @@ pub fn is_task_ptrace_stopped(task_id: u64) -> bool {
     g.as_ref()
         .and_then(|r| r.stopped.get(&pid).copied())
         .unwrap_or(false)
+}
+
+/// Test-only counterpart to delivering a ptrace-stop signal.  The ABI-only
+/// tests intentionally do not run a tracee through the full signal-return
+/// path, but every request other than `PTRACE_KILL` still has to satisfy
+/// Linux's `ptrace_check_attach()` stopped-state rule.
+#[doc(hidden)]
+pub fn __test_set_tracee_stopped(tracee: u64, stopped: bool) {
+    let mut g = PTRACE_STATE.lock();
+    let r = g.get_or_insert_with(PtraceRegistry::default);
+    let pid = tid_to_pid(tracee);
+    if stopped {
+        r.stopped.insert(pid, true);
+    } else {
+        r.stopped.remove(&pid);
+    }
+}
+
+/// Linux's `ptrace_check_attach(child, ignore_state)`, after the caller's pid
+/// namespace has resolved `pid`.  Besides matching the observable errno
+/// ordering, the stopped-state half is the memory-safety boundary for remote
+/// demand paging below: an inactive tracee root may be changed only while its
+/// task cannot execute concurrently.
+fn ptrace_check_attach(pid: u64, caller_pid: u64, ignore_state: bool) -> bool {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let g = PTRACE_STATE.lock();
+    let Some(r) = g.as_ref() else {
+        return false;
+    };
+    r.tracers.get(&pid).copied() == Some(caller_pid)
+        && (ignore_state || r.stopped.get(&pid).copied().unwrap_or(false))
 }
 
 /// Does `tracer_task` trace anything a wait for `want` would select?
@@ -937,6 +975,70 @@ unsafe fn slice_from_ref_mut<T>(val: &mut T) -> &mut [u8] {
     unsafe { core::slice::from_raw_parts_mut(val as *mut T as *mut u8, core::mem::size_of::<T>()) }
 }
 
+/// Resolve a byte in a stopped tracee's address space for the `PEEK`/`POKE`
+/// family. Linux's `ptrace_access_vm(..., FOLL_FORCE)` faults a valid lazy
+/// tracee page in on behalf of the tracer; merely walking its page tables
+/// turns a sparse ELF text mapping into a spurious `EIO` for Crashpad.
+///
+/// The caller has already passed [`ptrace_check_attach`], so the tracee cannot
+/// run while this installs a leaf in its inactive address space.  The byte
+/// interface deliberately handles a machine word crossing a page boundary.
+fn ptrace_target_byte(target_as: &narf_memory::AddressSpace, addr: u64) -> Result<u8, ()> {
+    let vaddr = VirtAddr::new(addr);
+    // SAFETY: `target_as` is a live stopped tracee root and page-table walking
+    // only reads tables through NARF's direct physical mapping.
+    let mut phys = unsafe { translate(target_as.root, vaddr) };
+    if phys.is_none() {
+        // SAFETY: ptrace_check_attach has established that this is a stopped
+        // tracee, so no CPU can concurrently execute or mutate its user root.
+        unsafe { target_as.demand_alloc_page(vaddr) }.map_err(|_| ())?;
+        // SAFETY: the successful demand allocation installed this leaf; a
+        // second translation obtains its physical byte address.
+        phys = unsafe { translate(target_as.root, vaddr) };
+    }
+    let Some(phys) = phys else {
+        return Err(());
+    };
+    // SAFETY: `phys` is a translated byte in a live user mapping and the
+    // direct physical map covers RAM frames backing user leaves.
+    Ok(unsafe { phys.kernel_ptr::<u8>().read() })
+}
+
+fn ptrace_read_word(target_as: &narf_memory::AddressSpace, addr: u64) -> Result<u64, ()> {
+    let mut bytes = [0u8; core::mem::size_of::<u64>()];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        let byte_addr = addr.checked_add(offset as u64).ok_or(())?;
+        *byte = ptrace_target_byte(target_as, byte_addr)?;
+    }
+    Ok(u64::from_ne_bytes(bytes))
+}
+
+fn ptrace_write_word(
+    target_as: &narf_memory::AddressSpace,
+    addr: u64,
+    value: u64,
+) -> Result<(), ()> {
+    for (offset, byte) in value.to_ne_bytes().iter().copied().enumerate() {
+        let byte_addr = addr.checked_add(offset as u64).ok_or(())?;
+        let vaddr = VirtAddr::new(byte_addr);
+        // SAFETY: as in `ptrace_target_byte`.
+        let mut phys = unsafe { translate(target_as.root, vaddr) };
+        if phys.is_none() {
+            // SAFETY: the tracee is ptrace-stopped; see `ptrace_target_byte`.
+            unsafe { target_as.demand_alloc_page(vaddr) }.map_err(|_| ())?;
+            // SAFETY: as above.
+            phys = unsafe { translate(target_as.root, vaddr) };
+        }
+        let Some(phys) = phys else {
+            return Err(());
+        };
+        // SAFETY: ptrace's FOLL_FORCE semantics permit writes through the
+        // tracee mapping permissions; the direct map is writable for RAM.
+        unsafe { phys.kernel_mut_ptr::<u8>().write(byte) };
+    }
+    Ok(())
+}
+
 pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let request = args.arg0;
@@ -971,6 +1073,16 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             }
         }
     };
+
+    // `ptrace_check_attach()` runs before request-specific validation.  This
+    // is also what makes page-in of a sparse tracee VMA safe: only a stopped
+    // tracee can have its inactive page tables changed by the tracer.
+    if !matches!(request, PTRACE_TRACEME | PTRACE_ATTACH)
+        && !ptrace_check_attach(pid, caller_pid, request == PTRACE_KILL)
+    {
+        ctx.set_return(errno_ret(ESRCH));
+        return;
+    }
 
     match request {
         PTRACE_TRACEME => {
@@ -1112,16 +1224,6 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         PTRACE_PEEKTEXT | PTRACE_PEEKDATA => {
-            {
-                let g = PTRACE_STATE.lock();
-                if let Some(r) = g.as_ref() {
-                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
-                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
-                        return;
-                    }
-                }
-            }
             let tid = pid_to_tid(pid);
             let target_as = match address_space_of(narf_scheduler::TaskId(tid)) {
                 Some(a) => a,
@@ -1130,12 +1232,8 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            // SAFETY: paging is initialized and target_as has a valid root.
-            let phys = unsafe { translate(target_as.root, VirtAddr::new(addr)) };
-            match phys {
-                Some(p) => {
-                    // SAFETY: p is a valid physical address mapped in the kernel's virtual space.
-                    let val = unsafe { *p.kernel_ptr::<u64>() };
+            match ptrace_read_word(&target_as, addr) {
+                Ok(val) => {
                     // The write-back target is the TRACER's own pointer, so
                     // this one really is EFAULT: `generic_ptrace_peekdata`
                     // ends with `return put_user(tmp, ...)`.
@@ -1146,7 +1244,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     }
                     ctx.set_return(SyscallReturn::ok(val));
                 }
-                None => {
+                Err(()) => {
                     // `kernel/ptrace.c::generic_ptrace_peekdata`:
                     //
                     //     copied = ptrace_access_vm(tsk, addr, &tmp,
@@ -1166,16 +1264,6 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             }
         }
         PTRACE_POKETEXT | PTRACE_POKEDATA => {
-            {
-                let g = PTRACE_STATE.lock();
-                if let Some(r) = g.as_ref() {
-                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
-                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
-                        return;
-                    }
-                }
-            }
             let tid = pid_to_tid(pid);
             let target_as = match address_space_of(narf_scheduler::TaskId(tid)) {
                 Some(a) => a,
@@ -1184,17 +1272,11 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            // SAFETY: paging is initialized and target_as has a valid root.
-            let phys = unsafe { translate(target_as.root, VirtAddr::new(addr)) };
-            match phys {
-                Some(p) => {
-                    // SAFETY: p is a valid physical address mapped writeable in the kernel's virtual space.
-                    unsafe {
-                        *p.kernel_mut_ptr::<u64>() = data;
-                    }
+            match ptrace_write_word(&target_as, addr, data) {
+                Ok(()) => {
                     ctx.set_return(SyscallReturn::ok(0));
                 }
-                None => {
+                Err(()) => {
                     // `kernel/ptrace.c::generic_ptrace_pokedata`:
                     //
                     //     return (copied == sizeof(data)) ? 0 : -EIO;
@@ -1375,7 +1457,8 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         PTRACE_GETREGSET => {
-            // addr = regset id (NT_PRSTATUS); data = iovec* {base, len}.
+            // addr = regset id (NT_PRSTATUS / x86 NT_PRFPREG); data = iovec*
+            // {base, len}.
             {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
@@ -1413,30 +1496,53 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // WIDTH: `ptrace_regset(struct task_struct *task, int req,
             // unsigned int type, struct iovec *kiov)` takes the regset id
             // as `unsigned int`, so only the low 32 bits of `addr` select
-            // it — NT_PRSTATUS with junk in the high half still resolves.
+            // it — supported regsets with junk in the high half still resolve.
             // `ptrace_regset` returns EINVAL when `find_regset` misses.
-            if addr as u32 as u64 != NT_PRSTATUS {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-            let regs = match get_tracee_regs(pid) {
-                Some(r) => r,
-                None => {
-                    ctx.set_return(errno_ret(ESRCH));
+            match addr as u32 as u64 {
+                NT_PRSTATUS => {
+                    let regs = match get_tracee_regs(pid) {
+                        Some(r) => r,
+                        None => {
+                            ctx.set_return(errno_ret(ESRCH));
+                            return;
+                        }
+                    };
+                    let full = core::mem::size_of::<user_regs_struct>();
+                    let n = core::cmp::min(iov[1] as usize, full);
+                    // SAFETY: regs is a valid stack value; slice its first `n` bytes.
+                    let src = unsafe { slice_from_ref(&regs) };
+                    // SAFETY: iov[0] is a user pointer, range-checked by copy_to_user.
+                    if iov[0] != 0 && unsafe { copy_to_user(iov[0], &src[..n]) }.is_err() {
+                        ctx.set_return(errno_ret(EFAULT));
+                        return;
+                    }
+                    // Report the number of bytes actually written back in iov_len.
+                    iov[1] = n as u64;
+                }
+                #[cfg(target_arch = "x86_64")]
+                NT_PRFPREG => {
+                    // Keep the same liveness/error contract as PRSTATUS.
+                    // The process is ptrace-stopped at this point, so its
+                    // saved FPU image is authoritative rather than live CPU
+                    // register state.
+                    if get_tracee_regs(pid).is_none() {
+                        ctx.set_return(errno_ret(ESRCH));
+                        return;
+                    }
+                    let regs = crate::user_task::ptrace_legacy_fpu(pid_to_tid(pid));
+                    let n = core::cmp::min(iov[1] as usize, regs.len());
+                    // SAFETY: iov[0] is a user pointer, range-checked by copy_to_user.
+                    if iov[0] != 0 && unsafe { copy_to_user(iov[0], &regs[..n]) }.is_err() {
+                        ctx.set_return(errno_ret(EFAULT));
+                        return;
+                    }
+                    iov[1] = n as u64;
+                }
+                _ => {
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
-            };
-            let full = core::mem::size_of::<user_regs_struct>();
-            let n = core::cmp::min(iov[1] as usize, full);
-            // SAFETY: regs is a valid stack value; slice its first `n` bytes.
-            let src = unsafe { slice_from_ref(&regs) };
-            // SAFETY: iov[0] is a user pointer, range-checked by copy_to_user.
-            if iov[0] != 0 && unsafe { copy_to_user(iov[0], &src[..n]) }.is_err() {
-                ctx.set_return(errno_ret(EFAULT));
-                return;
             }
-            // Report the number of bytes actually written back in iov_len.
-            iov[1] = n as u64;
             // SAFETY: `data` is a user pointer, range-checked by copy_to_user.
             let _ = unsafe { copy_to_user(data, bytes_of(&iov)) };
             ctx.set_return(SyscallReturn::ok(0));

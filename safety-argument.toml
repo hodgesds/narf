@@ -1441,3 +1441,14 @@ argument = "The scheduler saves the outgoing task's PKRU on every user-task swit
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L115"
 argument = "The implementation keeps the user PKRU namespace disjoint from the 16 PKS supervisor-domain keys. Existing pkey compatibility syscalls still do not retag user PTEs; enabling the architectural register makes RDPKRU/WRPKRU safe and task-local without granting access to a kernel domain or consuming a PKS slot."
+
+# Ptrace may materialize a sparse FILE_DEMAND page in a stopped tracee. The
+# dedicated security-review skill was not available in this session; human
+# security review remains mandatory before merge.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The memory change adds an explicit opaque AddressSpace identity argument to the existing FILE_DEMAND callback; it does not add a TCB member, capability, domain, mapping type, or authority. A ptrace PEEK/POKE retains the existing ptrace relationship and is allowed to materialize an inactive root only after ptrace_check_attach verifies that the tracee is stopped, so no running task can observe a partially installed leaf. The normal active-root fault path is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The explicit target identity makes the file-mapping owner lookup select the tracee's VMA even while the tracer's root is active. The hook returns only an existing file-supplied frame through the established FILE_DEMAND validation and publication path; it neither grants a capability nor bypasses a domain check. Failed translation or page-in remains EIO to ptrace, and the byte-wise PEEK/POKE loops touch only translated tracee user pages after stopped-state validation."

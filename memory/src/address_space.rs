@@ -276,14 +276,15 @@ fn reserve_rmap_alias_slots(sorted_phys: &mut [PhysAddr]) -> Result<(), ()> {
 }
 
 /// Resolves a fault on an unbacked page of a `RegionPerms::FILE_DEMAND`
-/// mapping to the frame the backing file wants there. Takes the faulting
-/// (page-aligned) user VA, returns a page-aligned physical address.
+/// mapping to the frame the backing file wants there. Takes the stable
+/// address-space identity plus the faulting (page-aligned) user VA, and
+/// returns a page-aligned physical address.
 ///
 /// A `fn` pointer rather than a filesystem dependency: `narf-memory` sits
 /// below `narf-filesystem`, and the region table deliberately holds frames
 /// and no file objects (see `userspace/src/mapped_file.rs`). This is the same
 /// seam shape as [`install_shared_frame_hooks`] and `install_pager`.
-type FileFaultHook = fn(u64) -> Result<u64, FileFaultError>;
+type FileFaultHook = fn(u64, u64) -> Result<u64, FileFaultError>;
 
 /// Why the backing file could not supply a frame for a demand fault —
 /// Linux's `vm_fault_t` outcomes for a file-backed `->fault`.
@@ -317,13 +318,13 @@ pub fn install_file_fault_hook(hook: FileFaultHook) -> Option<FileFaultHook> {
     FILE_FAULT_HOOK.lock().replace(hook)
 }
 
-/// Ask the backing file for the frame at `vaddr`. Must be called with **no**
-/// address-space lock held — the hook re-enters the filesystem, which
-/// allocates, takes its own locks, and (for a BPF arena) installs a kernel
-/// page-table entry.
-fn file_fault_frame(vaddr: u64) -> Result<u64, FileFaultError> {
+/// Ask the backing file for the frame at `vaddr` in `address_space_id`. Must
+/// be called with **no** address-space lock held — the hook re-enters the
+/// filesystem, which allocates, takes its own locks, and (for a BPF arena)
+/// installs a kernel page-table entry.
+fn file_fault_frame(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     let hook = (*FILE_FAULT_HOOK.lock()).ok_or(FileFaultError::NoOwner)?;
-    let phys = hook(vaddr)?;
+    let phys = hook(address_space_id, vaddr)?;
     // A zero or misaligned answer would be stored in a `phys` slot where zero
     // *means* "unbacked" and every consumer assumes page alignment, so it is
     // rejected here rather than corrupting the region table.
@@ -8744,8 +8745,9 @@ impl AddressSpace {
     /// # Safety
     /// - Identity-map of low 4 GiB must be live (used to zero
     ///   the fresh frame and walk the page tables).
-    /// - `self.root` must be a valid page-table root for the AS
-    ///   currently active on this CPU (caller's CR3 / TTBR0).
+    /// - `self.root` must be a valid page-table root for the AS currently
+    ///   active on this CPU (the normal fault path), or for a ptrace-stopped
+    ///   tracee which cannot execute concurrently with this operation.
     /// - Frame allocator must be initialised.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
@@ -8925,7 +8927,7 @@ impl AddressSpace {
         // this page. Other pages in the same CLONE_VM address space can now
         // allocate/zero or enter their backing file in parallel.
         let phys = if file_backed {
-            match file_fault_frame(v) {
+            match file_fault_frame(self.identity(), v) {
                 Ok(phys) => PhysAddr::new(phys),
                 Err(error) => {
                     self.cancel_demand_page(v, ticket);
@@ -8988,7 +8990,8 @@ impl AddressSpace {
     /// - The low-memory identity map must be live (used to zero the fresh
     ///   frame and walk the translation tables).
     /// - `self.root` must be a valid `TTBR0_EL1` root for the AS currently
-    ///   active on this CPU.
+    ///   active on this CPU (the normal fault path), or for a ptrace-stopped
+    ///   tracee which cannot execute concurrently with this operation.
     /// - The frame allocator must be initialised.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
@@ -9032,7 +9035,7 @@ impl AddressSpace {
         };
 
         let phys = if file_backed {
-            match file_fault_frame(v) {
+            match file_fault_frame(self.identity(), v) {
                 Ok(phys) => PhysAddr::new(phys),
                 Err(error) => {
                     self.cancel_demand_page(v, ticket);
@@ -13475,15 +13478,21 @@ static FILE_FAULT_HOOK_UNDER_TEST: IrqSafeSpinLock<Option<FileFaultHook>> =
 static TEST_FAULT_PAGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TEST_FAULT_FRAME: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TEST_FAULT_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Identity supplied to the test fault hook. This makes the hook boundary's
+/// target-AS routing observable: a tracer must never resolve a FILE_DEMAND
+/// page through the tracer's currently active address space.
+static TEST_FAULT_ADDRESS_SPACE_ID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 /// Error the test hook answers `TEST_FAULT_PAGE` with instead of a frame:
 /// 0 = none (serve the frame), 1 = `Bus`, 2 = `NoMemory`.
 static TEST_FAULT_ERROR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn test_file_fault_hook(vaddr: u64) -> Result<u64, FileFaultError> {
+fn test_file_fault_hook(address_space_id: u64, vaddr: u64) -> Result<u64, FileFaultError> {
     use core::sync::atomic::Ordering;
     let page = TEST_FAULT_PAGE.load(Ordering::Relaxed);
     if page != 0 && vaddr == page {
         TEST_FAULT_CALLS.fetch_add(1, Ordering::Relaxed);
+        TEST_FAULT_ADDRESS_SPACE_ID.store(address_space_id, Ordering::Relaxed);
         match TEST_FAULT_ERROR.load(Ordering::Relaxed) {
             1 => return Err(FileFaultError::Bus),
             2 => return Err(FileFaultError::NoMemory),
@@ -13492,7 +13501,7 @@ fn test_file_fault_hook(vaddr: u64) -> Result<u64, FileFaultError> {
         return Ok(TEST_FAULT_FRAME.load(Ordering::Relaxed));
     }
     let chained = *FILE_FAULT_HOOK_UNDER_TEST.lock();
-    chained.map_or(Err(FileFaultError::NoOwner), |h| h(vaddr))
+    chained.map_or(Err(FileFaultError::NoOwner), |h| h(address_space_id, vaddr))
 }
 
 /// Put the test hook in front of whatever is installed, chaining to it.
@@ -14314,6 +14323,7 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
     TEST_FAULT_PAGE.store(fault_page, Ordering::Relaxed);
     TEST_FAULT_FRAME.store(phys.raw(), Ordering::Relaxed);
     TEST_FAULT_CALLS.store(0, Ordering::Relaxed);
+    TEST_FAULT_ADDRESS_SPACE_ID.store(0, Ordering::Relaxed);
     arm_test_file_fault_hook();
 
     // SAFETY: `a` is a live user root from `new_for_user`; the identity map is
@@ -14331,6 +14341,8 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
         TestResult::Fail("a FILE_DEMAND fault was not served by the hook")
     } else if TEST_FAULT_CALLS.load(Ordering::Relaxed) != 1 {
         TestResult::Fail("the fault did not reach the file-fault hook exactly once")
+    } else if TEST_FAULT_ADDRESS_SPACE_ID.load(Ordering::Relaxed) != a.identity() {
+        TestResult::Fail("the file-fault hook did not receive the faulting address-space identity")
     } else if slot != Some(phys) {
         TestResult::Fail("the region does not hold the frame the hook named")
     } else if !mapped {
@@ -14354,6 +14366,7 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
     // Disarm by address, not by uninstalling: the hook stays in front as a
     // pure delegate. See `arm_test_file_fault_hook`.
     TEST_FAULT_PAGE.store(0, Ordering::Relaxed);
+    TEST_FAULT_ADDRESS_SPACE_ID.store(0, Ordering::Relaxed);
     // The region is SHARED, so teardown clears PTEs and frees nothing: this
     // frame is ours to return, exactly as a file's would be its own.
     drop(a);

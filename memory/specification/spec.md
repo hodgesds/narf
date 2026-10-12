@@ -517,7 +517,8 @@ impl AddressSpace {
     /// `Unmapped` and `OutOfRange` retain their non-reclaim meanings.
     ///
     /// A FILE_DEMAND page comes from the hook installed with
-    /// `install_file_fault_hook(fn(u64) -> Result<u64, FileFaultError>)`,
+    /// `install_file_fault_hook(fn(address_space_id: u64, vaddr: u64)
+    ///     -> Result<u64, FileFaultError>)`,
     /// whose error keeps Linux's `vm_fault_t` meaning:
     /// `FileFaultError::NoOwner` → `Unmapped` (SIGSEGV);
     /// `FileFaultError::Bus` → `AddressSpaceError::Bus` — the file refused a
@@ -525,6 +526,12 @@ impl AddressSpace {
     /// delivered as SIGBUS/BUS_ADRERR; `FileFaultError::NoMemory` →
     /// `ReclaimPressure` (`VM_FAULT_OOM`: wait for reclaim, retry), or
     /// `OutOfRange` when no reclaim can be requested. No failure backs the page.
+    /// `address_space_id` is the stable [`AddressSpace::identity`] of the
+    /// faulting root, not an implicit "currently active" address space: a
+    /// ptrace tracer may materialize a stopped tracee's FILE_DEMAND page while
+    /// the tracer's root is active. The file hook must use this identity when
+    /// selecting the mapping owner, so page contents and accounting remain
+    /// scoped to the tracee.
     ///
     /// A page carrying an `MADV_GUARD_INSTALL` marker returns
     /// `AddressSpaceError::GuardPage` (`VM_FAULT_SIGSEGV`, delivered as

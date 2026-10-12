@@ -806,6 +806,26 @@ pub unsafe fn load_user_process_with_root_file<S: crate::elf::ExecBytes + ?Sized
         Some(unsafe { crate::tls::stage_tls(&synthetic_image, src, &address_space) }?)
     };
 
+    // `/proc/<pid>/auxv` and `/proc/<pid>/environ` describe the image that
+    // has just been committed, not merely an execve request.  Publish only
+    // after every fallible loader stage has completed, so a failed PT_TLS
+    // setup cannot make procfs expose an image that never became runnable.
+    // The proc tables are task-keyed while this loader is process-keyed; a
+    // boot-time process has no mapping yet and deliberately falls back to
+    // its PID, whereas execve resolves the already-running task id here.
+    let task = crate::handlers::proc_pid_to_tid(pid.raw());
+    crate::handlers::set_proc_environ(task, envp);
+    let proc_auxv: alloc::vec::Vec<(u64, u64)> = final_aux
+        .iter()
+        // init_sysv_stack stops at an explicit caller-supplied AT_NULL, so
+        // procfs must stop there too instead of exposing later internal
+        // defaults that userspace cannot reach through its startup stack.
+        .take_while(|entry| !matches!(entry, AuxEntry::Null))
+        .map(aux_pair)
+        .map(|(tag, value)| (u64::from(tag), value))
+        .collect();
+    crate::handlers::set_proc_auxv_pairs(task, &proc_auxv);
+
     Ok(UserProcess {
         pid,
         address_space,

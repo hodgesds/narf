@@ -2167,6 +2167,74 @@ impl FpuArea {
     }
 }
 
+/// Bytes returned by Linux x86_64 `PTRACE_GETREGSET(NT_PRFPREG)`: the legacy
+/// FXSAVE image at the head of every standard XSAVE area.
+#[cfg(target_arch = "x86_64")]
+const LEGACY_FXSAVE_BYTES: usize = 512;
+
+/// User-task futures own their FPU areas, whereas ptrace resolves a stopped
+/// tracee by task id.  This small registry bridges those identities.  Its lock
+/// protects area lifetime against a concurrent future drop; ptrace itself has
+/// already stopped the tracee before it reads the image, so the saved memory is
+/// stable instead of the CPU's live xstate.
+#[cfg(target_arch = "x86_64")]
+static TASK_FPU_AREAS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, usize>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[cfg(target_arch = "x86_64")]
+fn register_task_fpu(task: u64, area: &FpuArea) {
+    let mut registry = TASK_FPU_AREAS.lock();
+    registry
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(task, area as *const FpuArea as usize);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn unregister_task_fpu(task: u64, area: &FpuArea) {
+    let mut registry = TASK_FPU_AREAS.lock();
+    let expected = area as *const FpuArea as usize;
+    if let Some(entries) = registry.as_mut() {
+        if entries.get(&task).copied() == Some(expected) {
+            entries.remove(&task);
+        }
+    }
+}
+
+/// Snapshot the x86 legacy FPU regset for a ptrace-stopped task.  A task that
+/// has not reached its first user-mode entry has no published area yet; Linux
+/// reports architectural reset state for that case, which is the same state a
+/// newly-created NARF task will load on first use.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn ptrace_legacy_fpu(task: u64) -> [u8; LEGACY_FXSAVE_BYTES] {
+    let mut snapshot = [0u8; LEGACY_FXSAVE_BYTES];
+    snapshot[0] = 0x7f; // FCW = 0x037f
+    snapshot[1] = 0x03;
+    snapshot[24] = 0x80; // MXCSR = 0x1f80
+    snapshot[25] = 0x1f;
+
+    // Keep the registry lock through the copy. `UserTaskFuture::drop` removes
+    // this exact pointer under the same lock before the Box can be freed.
+    let registry = TASK_FPU_AREAS.lock();
+    if let Some(area) = registry
+        .as_ref()
+        .and_then(|entries| entries.get(&task).copied())
+    {
+        // SAFETY: registration stores the address of the future-owned,
+        // 64-byte-aligned FPU_AREA_SIZE allocation. The registry lock pins
+        // that allocation against Drop for this copy; the first 512 bytes of
+        // a standard XSAVE image are the FXSAVE-compatible legacy region.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                area as *const u8,
+                snapshot.as_mut_ptr(),
+                LEGACY_FXSAVE_BYTES,
+            );
+        }
+    }
+    snapshot
+}
+
 /// Complete Linux's CLONE_CHILD_SETTID contract after the scheduler has made
 /// the child's address space active but before its first userspace instruction.
 /// Linux does this in schedule_tail() and deliberately ignores put_user faults.
@@ -2268,6 +2336,8 @@ impl UserTaskFuture {
     /// any ready queue — hand it to `narf_scheduler::spawn_user`
     /// under the same reserved `TaskId`.
     pub fn new(process: crate::UserProcess, task: alloc::sync::Arc<crate::task::Task>) -> Self {
+        let fpu = FpuArea::reset_boxed();
+        register_task_fpu(task.tid, &fpu);
         Self {
             process,
             task,
@@ -2275,7 +2345,7 @@ impl UserTaskFuture {
             state: TaskState::Initial,
             saved_cr3: core::cell::Cell::new(None),
             sleep_handle: None,
-            fpu: FpuArea::reset_boxed(),
+            fpu,
             set_child_tid: None,
         }
     }
@@ -2318,6 +2388,7 @@ impl UserTaskFuture {
         unsafe {
             narf_arch::x86_64::xsave::fpu_save(&mut *fpu as *mut FpuArea as *mut u8);
         }
+        register_task_fpu(task.tid, &fpu);
         Self {
             process,
             task,
@@ -2345,6 +2416,13 @@ impl UserTaskFuture {
 
     fn set_child_tid(&mut self, uaddr: u64) {
         self.set_child_tid = Some(uaddr);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Drop for UserTaskFuture {
+    fn drop(&mut self) {
+        unregister_task_fpu(self.task.tid, &self.fpu);
     }
 }
 
