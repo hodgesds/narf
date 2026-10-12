@@ -282,8 +282,10 @@ PSP14 GPCOM/TMR, SMU14 lifecycle, GMC12/SDMA7 queues, DCN4 native modeset
 and physical-card validation remain open.
 The explicit PSP14 GPCOM/TMR transport and cancellation-safe GDDR6 long-training
 owner now support GMC12 address validation and HDP6 flush semantics. TOC setup
-rejects cross-revision firmware. Automatic Navi48 boot ownership, SMU14,
-GMC12/SDMA7, graphics queues and DCN4 modesetting remain in progress.
+rejects cross-revision firmware. The complete capability-backed Navi48 firmware set, RS64/MES/IMU/RLC payload
+selection, PSP autoload and GC12 readiness check are implemented. Automatic
+Navi48 boot ownership, SMU14 board-power control, GMC12/SDMA7 queues and DCN4
+modesetting remain in progress.
 
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total

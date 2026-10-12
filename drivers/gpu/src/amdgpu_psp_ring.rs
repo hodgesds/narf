@@ -142,7 +142,7 @@ impl Io for Mmio {
     }
     fn gfx_boot_status(&mut self) -> Result<GfxBootStatus, Error> {
         let (cp, rlc) = self.gfx_status_regs.ok_or(Error::Unsupported)?;
-        // SAFETY: Layout resolved/bounded both GC10.3.2 register banks. These
+        // SAFETY: Layout resolved/bounded the exact GC10/GC12 register banks. These
         // are read-only status samples, with reset/PM excluded by the owner.
         Ok(unsafe {
             GfxBootStatus {
@@ -322,6 +322,7 @@ impl<I: Io> Engine<I> {
 pub struct Psp {
     session: Session<Mmio>,
     kind: Kind,
+    navi48_target: Option<crate::amdgpu_navi48_firmware::Target>,
 }
 /// PSP-reported locations inside this session's retained trusted memory.
 /// These are GPU addresses, not CPU mappings; consumers must keep TMR alive.
@@ -416,6 +417,7 @@ impl Layout {
                 0,
             )?;
             let gc = bank(gpu, discovery::HW_ID_GC, &[(12, 0, 1)], 0, 0x1615)?;
+            let rlc = bank(gpu, discovery::HW_ID_GC, &[(12, 0, 1)], 1, 0x4e7c)?;
             return Ok(Self {
                 mp0,
                 nbio,
@@ -423,7 +425,7 @@ impl Layout {
                 fb_base: gc + 0x1614 * 4,
                 fb_top: gc + 0x1615 * 4,
                 fb_offset: gc + 0x15a7 * 4,
-                gfx_status_regs: None,
+                gfx_status_regs: Some((gc + 0xf40 * 4, rlc + 0x4e7c * 4)),
             });
         }
         let (mp0, nbio, fb_base, fb_top, fb_offset) = match kind {
@@ -688,6 +690,11 @@ impl Psp {
         let memory = pool.reserve(BUFFER_SIZE).map_err(|_| Error::Allocation)?;
         Ok(Self {
             kind,
+            navi48_target: if matches!(kind, Kind::Navi48(_)) {
+                crate::amdgpu_navi48_firmware::Target::resolve(gpu).ok()
+            } else {
+                None
+            },
             session: Session {
                 engine: Engine {
                     io: Mmio {
@@ -797,6 +804,43 @@ impl Psp {
         }
         let images = firmware.images().map_err(|_| Error::Invalid)?;
         self.session.load_gfx(&images).await
+    }
+    fn check_navi48_firmware(
+        &self,
+        firmware: &crate::amdgpu_navi48_firmware::Firmware,
+    ) -> Result<(), Error> {
+        if !matches!(self.kind, Kind::Navi48(_)) || self.navi48_target != Some(firmware.target()) {
+            return Err(Error::Unsupported);
+        }
+        Ok(())
+    }
+    /// Load SMU14 before the board-power handshake and graphics autoload.
+    pub async fn load_smc_navi48(
+        &mut self,
+        firmware: &crate::amdgpu_navi48_firmware::Firmware,
+    ) -> Result<(), Error> {
+        self.check_navi48_firmware(firmware)?;
+        let images = firmware.images().map_err(|_| Error::Invalid)?;
+        let smc = images[0].payloads().next().ok_or(Error::Invalid)?;
+        self.session.load_smc(smc.bytes()).await
+    }
+    /// Load GC12 RS64, MES12, IMU, RLC, SDMA7 and media payloads in UCODE_ID
+    /// order. Caller must have stopped DMUB and every replaced firmware consumer.
+    /// Completion acknowledges upload/autoload; it does not enable queues.
+    pub async fn load_gfx_navi48(
+        &mut self,
+        firmware: &crate::amdgpu_navi48_firmware::Firmware,
+    ) -> Result<(), Error> {
+        self.check_navi48_firmware(firmware)?;
+        let images = firmware.images().map_err(|_| Error::Invalid)?;
+        self.session.load_gfx12(&images).await
+    }
+    /// Check GC12's own RLC status register after the accepted autoload.
+    pub async fn wait_gfx_boot_navi48(&mut self) -> Result<GfxBootStatus, Error> {
+        if !matches!(self.kind, Kind::Navi48(_)) {
+            return Err(Error::Unsupported);
+        }
+        self.session.wait_gfx_boot().await
     }
     /// Graphics upload state; remains Absent for Phoenix sessions.
     pub fn gfx_load_state(&self) -> GfxLoadState {
@@ -985,6 +1029,75 @@ impl<I: Io> Session<I> {
         };
         result
     }
+    async fn load_gfx12(
+        &mut self,
+        images: &[crate::amdgpu_navi48_ucode::Image<'_>; 11],
+    ) -> Result<(), Error> {
+        use crate::amdgpu_navi48_ucode::{Source, UPLOAD_ORDER};
+        if self.gfx_state != GfxLoadState::Absent
+            || self.smc_state != SmcState::Loaded
+            || !self.tmr_ready
+            || self.engine.state != State::Ready
+            || self.payload.is_some()
+        {
+            return Err(Error::Busy);
+        }
+        if images
+            .iter()
+            .zip(Source::ALL)
+            .any(|(image, source)| image.source() != source)
+        {
+            return Err(Error::Invalid);
+        }
+        self.gfx_state = GfxLoadState::Loading;
+        let result = async {
+            for kind in UPLOAD_ORDER.into_iter().skip(1) {
+                // RLC restore-list payloads may be empty. The parsers require
+                // every other payload, and Source::ALL is checked above.
+                let payload = images
+                    .iter()
+                    .flat_map(|i| i.payloads())
+                    .find(|p| p.firmware_type() == kind);
+                let Some(payload) = payload else {
+                    if matches!(kind, 22 | 20 | 21 | 26 | 48) {
+                        continue;
+                    }
+                    return Err(Error::Invalid);
+                };
+                let reply = self.load_ip(payload.bytes(), kind).await?;
+                if matches!(kind, 13 | 51) {
+                    self.record_media(reply, kind)?;
+                }
+                if kind == 8 {
+                    self.engine.submit(&command(0x21, &[])).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        self.gfx_state = if result.is_ok() {
+            GfxLoadState::Accepted
+        } else {
+            GfxLoadState::Failed
+        };
+        result
+    }
+    fn record_media(&mut self, reply: Reply, kind: u32) -> Result<(), Error> {
+        let tmr = self.tmr.as_ref().ok_or(Error::Invalid)?;
+        let offset = reply
+            .address
+            .checked_sub(tmr.address())
+            .ok_or(Error::Invalid)?;
+        if reply.address % 4 != 0 || offset >= tmr.mapping().len {
+            return Err(Error::Invalid);
+        }
+        if kind == 13 {
+            self.media_firmware.vcn = Some(reply.address);
+        } else {
+            self.media_firmware.dmcub = Some(reply.address);
+        }
+        Ok(())
+    }
     async fn load_gfx_inner(
         &mut self,
         images: &[Option<crate::amdgpu_gfx_firmware::Image<'_>>;
@@ -1000,21 +1113,7 @@ impl<I: Io> Session<I> {
                     crate::amdgpu_gfx_firmware::Source::Vcn
                         | crate::amdgpu_gfx_firmware::Source::Dmcub
                 ) {
-                    let tmr = self.tmr.as_ref().ok_or(Error::Invalid)?;
-                    let offset = reply
-                        .address
-                        .checked_sub(tmr.address())
-                        .ok_or(Error::Invalid)?;
-                    // Bound the reported entry point, not a guessed unpacked
-                    // image size. PSP removes its signed container packaging.
-                    if reply.address % 4 != 0 || offset >= tmr.mapping().len {
-                        return Err(Error::Invalid);
-                    }
-                    if image.source() == crate::amdgpu_gfx_firmware::Source::Vcn {
-                        self.media_firmware.vcn = Some(reply.address);
-                    } else {
-                        self.media_firmware.dmcub = Some(reply.address);
-                    }
+                    self.record_media(reply, payload.firmware_type())?;
                 }
             }
             if image.source() == crate::amdgpu_gfx_firmware::Source::Rlc {

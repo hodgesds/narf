@@ -197,8 +197,10 @@ pub mod amdgpu_mqd;
 pub mod amdgpu_mst;
 pub mod amdgpu_navi22_boot;
 pub mod amdgpu_navi22_platform;
+pub mod amdgpu_navi48_firmware;
 #[cfg(feature = "kernel-test")]
 mod amdgpu_navi48_tests;
+pub mod amdgpu_navi48_ucode;
 pub mod amdgpu_offsets;
 pub mod amdgpu_pageflip;
 pub mod amdgpu_pcie_recovery;

@@ -585,6 +585,10 @@ fn navi48_gpu(regs: &mut [u32], revision: u8) -> AmdGpu {
         ip(discovery::HW_ID_NBIF, (7, 7, 0), 2, 0xd20),
         ip(discovery::HW_ID_HDP, (6, 1, 0), 0, 0xb00),
         ip(discovery::HW_ID_GC, (12, 0, 1), 0, 0x2000),
+        ip(discovery::HW_ID_MP1, (14, 0, 3), 1, 0x11000),
+        ip(discovery::HW_ID_SDMA0, (7, 0, 1), 0, 0x12000),
+        ip(discovery::HW_ID_VCN, (5, 0, 0), 0, 0x13000),
+        ip(discovery::HW_ID_DCN, (4, 1, 0), 0, 0x14000),
     ];
     gpu.vram.size = 16 << 30;
     regs[0x2000 + 0x1614] = 0x800;
@@ -614,6 +618,14 @@ fn psp_navi48_gmc12_hdp6_and_target_isolation() -> TestResult {
                 || run(psp.wait_gfx_boot_navi22()) != Err(Error::Unsupported)
             {
                 return TestResult::Fail("PSP14 used another generation's addresses or API");
+            }
+            let gfx = crate::amdgpu_navi48_firmware::fixture();
+            if run(psp.load_smc_navi48(&gfx)) != Err(Error::Busy)
+                || run(psp.load_gfx_navi48(&gfx)) != Err(Error::Busy)
+                || psp.session.engine.io.gfx_status_regs
+                    != Some(((0x2000 + 0xf40) * 4, (0x4000 + 0x4e7c) * 4))
+            {
+                return TestResult::Fail("GC12 firmware readiness or status register profile");
             }
             let firmware = crate::amdgpu_psp_boot::tests::firmware14();
             let expected = if revision == 3 {

@@ -23,10 +23,17 @@ fn word(bytes: &[u8], offset: usize) -> u32 {
 }
 impl<'a> Image<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_for_ip(bytes, 11)
+    }
+    /// SMU14.0.2/3 retain the v2.0 container; the board table stays separate.
+    pub fn parse_smu14(bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_for_ip(bytes, 14)
+    }
+    fn parse_for_ip(bytes: &'a [u8], ip: u8) -> Result<Self, Error> {
         if bytes.len() < 44 || bytes.len() > MAX_CONTAINER {
             return Err(Error::Invalid);
         }
-        if bytes[8..12] != [2, 0, 0, 0] || bytes[12..16] != [11, 0, 0, 0] {
+        if bytes[8..12] != [2, 0, 0, 0] || bytes[12..16] != [ip, 0, 0, 0] {
             return Err(Error::Unsupported);
         }
         let start = word(bytes, 24) as usize;

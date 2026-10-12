@@ -163,6 +163,35 @@ the preimage without racing a possibly active PSP writer or allowing replay.
 These are explicit ownership APIs; a Navi48 boot VRAM inventory/coordinator
 must supply the reservations before automatic cold boot is enabled.
 
+### Navi 48 graphics and media firmware
+
+`amdgpu_navi48_firmware::Firmware::open(gpu, registry, MesMode)` prepares the
+complete mandatory SMU14, SDMA7, GC12 PFP/ME/MEC, MES, IMU, RLC, VCN5 and DCN4
+set through live registry/blob invocations. MP1 14.0.2/3 and SDMA7.0.0/1 select
+revision-specific names. GC12.0.1, one VCN5.0.0 and DCN4.0.1 (including raw
+4.1.0 discovery encoding) are required. Separate and unified MES images are
+explicit choices; missing or invalid files never fall back to another GPU.
+
+`amdgpu_navi48_ucode::Image::parse` validates each IP/header version, complete
+container, aligned bounded nonoverlapping instruction/data regions, RLC
+metadata and entry points. RS64 instruction and stack images are separate;
+PFP/ME each upload two stack copies, MEC four. IMU offsets are payload-relative;
+CP/MES offsets are file-relative. VCN uploads its complete signed payload;
+DMCUB uploads only signed instructions. SMU's trailing PowerPlay metadata stays
+separate. `entry_points()` retains 64-bit CP/MES code/data addresses for queue
+bring-up. Structural parsing does not authenticate firmware.
+
+`Psp::load_smc_navi48` loads the prepared SMU once after TMR setup. The owner
+must complete the SMU board-power stages and stop DMUB before
+`load_gfx_navi48`. The ring captures the GPU's firmware IP target at construction
+and rejects mismatched sets before upload. Graphics uploads follow Linux's
+UCODE_ID order: SDMA, RS64 instructions/stacks, MES pipes, IMU, RLC lists and
+IRAM/DRAM, RLC_G, AUTOLOAD_RLC, then VCN/DMCUB. Media entry points must be aligned
+and within the retained TMR. `wait_gfx_boot_navi48` checks CP idle and GC12's
+bank-one RLC status at `0x4e7c`. Cancellation preserves the in-flight payload,
+ring and TMR and prevents replay. Successful autoload does not initialize
+VMs, interrupts or command queues and does not publish `fw_loaded`.
+
 ### Navi 22 PSP secure-OS bootstrap
 
 `amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects

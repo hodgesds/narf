@@ -111,6 +111,16 @@ fn record(ranges: &mut [Span; 17], count: &mut usize, next: Span) -> Result<(), 
 }
 impl<'a> Image<'a> {
     pub fn parse(source: Source, bytes: &'a [u8]) -> Result<Self, Error> {
+        Self::parse_for_gc(source, bytes, 0x3000a)
+    }
+    /// GC12 retains the RLC v2.2 layout, but carries a different IP identity.
+    pub(crate) fn parse_rlc12(bytes: &'a [u8]) -> Result<Self, Error> {
+        if bytes.len() < 32 || word(bytes, 8) != 0x20002 {
+            return Err(Error::Unsupported);
+        }
+        Self::parse_for_gc(Source::Rlc, bytes, 12)
+    }
+    fn parse_for_gc(source: Source, bytes: &'a [u8], gc: u32) -> Result<Self, Error> {
         if bytes.len() < 32 || bytes.len() > MAX_CONTAINER {
             return Err(Error::Invalid);
         }
@@ -121,14 +131,12 @@ impl<'a> Image<'a> {
             Source::Dmcub if version == 1 && word(bytes, 12) == 3 => 40,
             Source::Sdma if version == 1 && word(bytes, 12) == 0x20005 => 48,
             Source::Rlc
-                if version & 0xffff == 2
-                    && (2..=4).contains(&minor)
-                    && word(bytes, 12) == 0x3000a =>
+                if version & 0xffff == 2 && (2..=4).contains(&minor) && word(bytes, 12) == gc =>
             {
                 [172, 204, 244][minor - 2]
             }
             Source::Ce | Source::Pfp | Source::Me | Source::Mec | Source::Mec2
-                if version == 1 && word(bytes, 12) == 0x3000a =>
+                if version == 1 && word(bytes, 12) == gc =>
             {
                 44
             }
