@@ -53,6 +53,14 @@ doorbell. RX has one hardware-ring consumer path: both background and
 syscall-context drains run the same stack dispatch and optional raw-frame
 mirror, so the frame-ring observer cannot steal TCP packets.
 
+For Ethernet/IPv4/TCP, e1000 advertises a bounded 16 KiB TSO frame. The public
+`TxContextDesc::ipv4_tso` constructor encodes the 8254x context descriptor;
+the context is followed by extended data descriptors split at 4 KiB
+boundaries. `DTYP_D` occupies lower-dword bit 20 (`TxDesc::cso` bit 4), and all
+context/intermediate slots retain ownership through the final EOP/RS
+descriptor's DD completion. IPv6 remains software-segmented, and e1000 does
+not advertise standalone checksum offload.
+
 The e1000 crate supports two mutually exclusive ownership profiles from the
 same source. The default `e1000` facade feature registers the built-in probe at
 `Stage::Subsys`; `e1000-module-only` keeps the implementation linked for shared

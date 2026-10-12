@@ -114,6 +114,9 @@ profile: TCP/UDP TX checksum, RX checksum reporting, maximum TSO frame bytes
 Producers must negotiate before setting `TxMeta`. Packets contain ordinary wire
 headers; drivers prepare hardware checksum seeds, validate lengths and reject
 unsupported requests rather than transmit partially checksummed packets.
+Until the capability contract grows protocol-specific TSO flags, the TCP stack
+consumes `max_tso_bytes` for IPv4 only; IPv6 remains software-segmented even
+when a device advertises the generic limit.
 `RxMeta::csum_l3` means a verified IPv4 header checksum; IPv6 never sets it.
 `csum_l4` means verified TCP/UDP. Consumers verify in software whenever a flag
 is false. These fields describe the in-kernel frame-ring contract; they do not

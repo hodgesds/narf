@@ -2907,10 +2907,16 @@ pub fn pump_send(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
             // up to `max_tso_bytes` (less header headroom) per emit and let the
             // NIC cut it into MSS segments; otherwise emit MSS segments as
             // before. `tso_arg` carries the MSS down to `send_data`.
-            let tso_max = t
-                .egress
-                .as_ref()
-                .map_or(0u32, |e| e.dev.offloads.max_tso_bytes);
+            // `max_tso_bytes` currently describes the wired IPv4 path. Keep
+            // IPv6 segmented in software until drivers and the metadata
+            // contract carry an explicit IPv6 TSO capability.
+            let tso_max = if t.is_ipv6 {
+                0
+            } else {
+                t.egress
+                    .as_ref()
+                    .map_or(0u32, |e| e.dev.offloads.max_tso_bytes)
+            };
             let seg_cap = if tso_max > 0 {
                 tso_max.saturating_sub(128).max(mss)
             } else {

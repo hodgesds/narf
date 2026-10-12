@@ -389,12 +389,20 @@ const TXD_STAT_DD: u8 = 1 << 0; // Done
 pub const TXD_CMD_DEXT: u8 = 1 << 5;
 /// TSE — TCP Segmentation Enable. Combined with DEXT + DTYP_D.
 pub const TXD_CMD_TSE: u8 = 1 << 2;
-/// DTYP_D — Data descriptor type indicator.
+/// DTYP_D — data descriptor type indicator. This is bit 20 of the lower
+/// dword, therefore bit 4 of [`TxDesc::cso`], not of `cmd`.
 pub const TXD_DTYP_D: u8 = 1 << 4;
 /// IXSM — Insert IP Checksum. Placed in the `css` byte alongside DEXT.
 pub const TXD_OPTS_IXSM: u8 = 1 << 0;
 /// TXSM — Insert TCP/UDP Checksum.
 pub const TXD_OPTS_TXSM: u8 = 1 << 1;
+
+// Context-descriptor command bits occupy the high byte of cmd_and_length.
+const TXD_CTX_CMD_TCP: u32 = 1 << 24;
+const TXD_CTX_CMD_IP: u32 = 1 << 25;
+const TXD_CTX_CMD_TSE: u32 = 1 << 26;
+const TXD_CTX_CMD_DEXT: u32 = 1 << 29;
+const TXD_CTX_PAYLEN_MASK: u32 = (1 << 20) - 1;
 
 // RX descriptor checksum status bits (e1000_hw.h E1000_RXD_STAT_IPCS /
 // E1000_RXD_STAT_TCPCS and E1000_RXD_ERR_IPE / E1000_RXD_ERR_TCPE).
@@ -462,6 +470,13 @@ const IMS_DEFAULT: u32 =
 /// batch while retaining the legacy descriptor format.
 const TX_RING_LEN: usize = 256;
 const TX_RING_USABLE: usize = TX_RING_LEN - 1;
+/// The stack may hand the device one complete Ethernet/IPv4/TCP super-frame
+/// up to this size. Keeping it at 16 KiB gives a useful packet-rate reduction
+/// while bounding each pool buffer to four pages.
+const MAX_TSO_FRAME: usize = 16 * 1024;
+/// 8254x descriptors are deliberately split at 4 KiB, matching the legacy
+/// Linux driver's controller-errata-safe maximum data per descriptor.
+const MAX_DATA_PER_TXD: usize = 4096;
 /// RX descriptor ring depth. The ring page is 4096 bytes = 256 × 16-byte
 /// descriptors, so 256 is the most the existing allocation holds and matches
 /// the Linux e1000 default. An 8-deep ring overran (RXO) under any burst —
@@ -485,6 +500,25 @@ pub struct TxDesc {
 }
 
 const _: () = assert!(core::mem::size_of::<TxDesc>() == 16);
+
+/// 8254x extended transmit context descriptor. A TSO packet is described by
+/// one of these followed by one or more extended data descriptors.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TxContextDesc {
+    pub ipcss: u8,
+    pub ipcso: u8,
+    pub ipcse: u16,
+    pub tucss: u8,
+    pub tucso: u8,
+    pub tucse: u16,
+    pub cmd_and_length: u32,
+    pub status: u8,
+    pub hdr_len: u8,
+    pub mss: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<TxContextDesc>() == 16);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct TxTicket {
@@ -526,6 +560,10 @@ impl TxRingCursor {
         })
     }
 
+    fn available(&self) -> usize {
+        TX_RING_USABLE - self.in_flight
+    }
+
     fn complete_oldest(&mut self) -> Option<usize> {
         if self.in_flight == 0 {
             return None;
@@ -548,6 +586,10 @@ struct TxQueueState {
     /// Copy-mode descriptors use the controller's persistent `tx_pool` and
     /// leave their entry `None`.
     owned: alloc::vec::Vec<Option<DmaBuffer>>,
+    /// Descriptor whose DD bit completes the packet containing this slot.
+    /// Plain packets watch themselves; every context/data slot in a TSO packet
+    /// watches its final EOP/RS data descriptor.
+    completion_slot: alloc::vec::Vec<usize>,
 }
 
 impl TxQueueState {
@@ -555,6 +597,7 @@ impl TxQueueState {
         Self {
             cursor: TxRingCursor::new(),
             owned: (0..TX_RING_LEN).map(|_| None).collect(),
+            completion_slot: (0..TX_RING_LEN).collect(),
         }
     }
 }
@@ -582,15 +625,17 @@ impl TxDesc {
     #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
     pub fn new_with_csum(addr: u64, len: u16, csum_opts: u8) -> Self {
         let mut cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS;
+        let mut cso = 0u8;
         let mut css = 0u8;
         if csum_opts != 0 {
-            cmd |= TXD_CMD_DEXT | TXD_DTYP_D;
+            cmd |= TXD_CMD_DEXT;
+            cso |= TXD_DTYP_D;
             css = csum_opts;
         }
         TxDesc {
             addr,
             length: len,
-            cso: 0,
+            cso,
             cmd,
             status: 0,
             css,
@@ -599,22 +644,105 @@ impl TxDesc {
     }
 
     /// Build a TX descriptor with TSO enabled. The hardware will segment
-    /// the payload into MSS-sized chunks. DEXT | DTYP_D | TSE must all
-    /// be set; both IP and TCP csum-insert bits are also required.
-    #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
+    /// the payload into MSS-sized chunks using the preceding context
+    /// descriptor. DEXT | DTYP_D | TSE must all be set; both IP and TCP
+    /// checksum insertion bits are required. This public helper describes a
+    /// one-buffer packet, so it marks the descriptor EOP + RS.
     pub fn with_tso(addr: u64, len: u16, _mss: u16) -> Self {
-        let cmd = TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS | TXD_CMD_DEXT | TXD_DTYP_D | TXD_CMD_TSE;
+        Self::tso_data(addr, len, true)
+    }
+
+    fn tso_data(addr: u64, len: u16, last: bool) -> Self {
+        let mut cmd = TXD_CMD_IFCS | TXD_CMD_DEXT | TXD_CMD_TSE;
+        if last {
+            cmd |= TXD_CMD_EOP | TXD_CMD_RS;
+        }
         let css = TXD_OPTS_IXSM | TXD_OPTS_TXSM;
         TxDesc {
             addr,
             length: len,
-            cso: 0,
+            cso: TXD_DTYP_D,
             cmd,
             status: 0,
             css,
             special: 0,
         }
     }
+}
+
+impl TxContextDesc {
+    /// Build the context for one Ethernet/IPv4/TCP TSO super-frame. `ip_hlen`
+    /// and `tcp_hlen` include options; `payload_len` excludes every header.
+    pub fn ipv4_tso(ip_hlen: u8, tcp_hlen: u8, payload_len: u32, mss: u16) -> Self {
+        let ipcss = 14u8;
+        let tucss = ipcss.saturating_add(ip_hlen);
+        Self {
+            ipcss,
+            ipcso: ipcss + 10,
+            ipcse: u16::from(tucss).saturating_sub(1),
+            tucss,
+            tucso: tucss + 16,
+            tucse: 0,
+            cmd_and_length: TXD_CTX_CMD_DEXT
+                | TXD_CTX_CMD_TSE
+                | TXD_CTX_CMD_TCP
+                | TXD_CTX_CMD_IP
+                | (payload_len & TXD_CTX_PAYLEN_MASK),
+            status: 0,
+            hdr_len: tucss.saturating_add(tcp_hlen),
+            mss,
+        }
+    }
+}
+
+/// Validate and convert a complete Ethernet/IPv4/TCP frame to the header form
+/// the 8254x TSO engine consumes. The engine fills each segment's IPv4 length
+/// and checksum; the TCP checksum starts with the zero-length pseudo-header
+/// seed and is completed after segmentation.
+fn prepare_ipv4_tso(frame: &mut [u8], mss: u16) -> Result<TxContextDesc, E1000Error> {
+    const ETH_LEN: usize = 14;
+    const IPV4_MIN: usize = 20;
+    const TCP_MIN: usize = 20;
+    if mss == 0 || frame.len() > MAX_TSO_FRAME || frame.len() < ETH_LEN + IPV4_MIN + TCP_MIN {
+        return Err(E1000Error::FrameTooLong);
+    }
+    if u16::from_be_bytes([frame[12], frame[13]]) != 0x0800 || frame[14] >> 4 != 4 {
+        return Err(E1000Error::Other("TSO requires Ethernet/IPv4"));
+    }
+    let ip_hlen = usize::from(frame[14] & 0x0f) * 4;
+    if !(IPV4_MIN..=60).contains(&ip_hlen)
+        || frame.len() < ETH_LEN + ip_hlen + TCP_MIN
+        || frame[23] != 6
+    {
+        return Err(E1000Error::Other("invalid IPv4/TCP TSO header"));
+    }
+    let frag = u16::from_be_bytes([frame[20], frame[21]]);
+    if frag & 0x3fff != 0 {
+        return Err(E1000Error::Other("fragmented IPv4 TSO frame"));
+    }
+    let tcp_off = ETH_LEN + ip_hlen;
+    let tcp_hlen = usize::from(frame[tcp_off + 12] >> 4) * 4;
+    if !(TCP_MIN..=60).contains(&tcp_hlen) || frame.len() < tcp_off + tcp_hlen {
+        return Err(E1000Error::Other("invalid TCP TSO header"));
+    }
+    let payload_len = frame.len() - tcp_off - tcp_hlen;
+    if payload_len == 0 || payload_len > TXD_CTX_PAYLEN_MASK as usize {
+        return Err(E1000Error::FrameTooLong);
+    }
+
+    let src = [frame[26], frame[27], frame[28], frame[29]];
+    let dst = [frame[30], frame[31], frame[32], frame[33]];
+    frame[16..18].fill(0); // IPv4 total length: hardware writes each segment.
+    frame[24..26].fill(0); // IPv4 checksum: hardware recomputes each segment.
+    let seed = narf_net::pkt_tcp::ipv4_tcp_pseudo_seed(src, dst, 0);
+    frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&seed.to_be_bytes());
+
+    Ok(TxContextDesc::ipv4_tso(
+        ip_hlen as u8,
+        tcp_hlen as u8,
+        payload_len as u32,
+        mss,
+    ))
 }
 
 impl RxDesc {
@@ -1200,7 +1328,11 @@ impl E1000 {
 
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
         let (tx_prod, tx_cons) = channel::<Frame, TX_RING_N>();
-        let tx_zc_pool = Arc::new(DmaPool::new(RX_BUF_LEN, crate::BUILTIN_DOMAIN, TX_RING_LEN));
+        let tx_zc_pool = Arc::new(DmaPool::new(
+            MAX_TSO_FRAME,
+            crate::BUILTIN_DOMAIN,
+            TX_RING_LEN,
+        ));
 
         let e1000 = Self {
             mmio,
@@ -1340,12 +1472,14 @@ impl E1000 {
     fn reclaim_tx_locked(&self, state: &mut TxQueueState) {
         while state.cursor.in_flight != 0 {
             let slot = state.cursor.next_to_clean;
-            if !self.tx_desc_done(slot) {
+            let completion = state.completion_slot[slot];
+            if !self.tx_desc_done(completion) {
                 break;
             }
             // Pair the device's DD write with the CPU's later buffer reuse.
             compiler_fence(Ordering::SeqCst);
             let completed = state.owned[slot].take();
+            state.completion_slot[slot] = slot;
             let reclaimed = state.cursor.complete_oldest();
             debug_assert_eq!(reclaimed, Some(slot));
             if let Some(buf) = completed {
@@ -1358,7 +1492,7 @@ impl E1000 {
     /// have been reserved under `tx_state`.
     fn post_tx_locked(
         &self,
-        state: &TxQueueState,
+        state: &mut TxQueueState,
         ticket: TxTicket,
         dma_addr: u64,
         len: usize,
@@ -1379,6 +1513,7 @@ impl E1000 {
         unsafe {
             core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<TxDesc>(desc_off), desc);
         }
+        state.completion_slot[ticket.slot] = ticket.slot;
         // The descriptor and retained buffer must be globally visible before
         // a later MMIO doorbell lets hardware fetch them.
         compiler_fence(Ordering::SeqCst);
@@ -1391,6 +1526,70 @@ impl E1000 {
                 self.mmio.write32(REG_TDT, state.cursor.next_to_use as u32);
             }
         }
+    }
+
+    /// Publish one IPv4/TCP TSO packet as a context descriptor followed by
+    /// 4-KiB-bounded extended data descriptors. All slots watch the final
+    /// EOP/RS descriptor, since context and intermediate descriptors are not
+    /// independently written back with DD.
+    fn post_tso_locked(
+        &self,
+        state: &mut TxQueueState,
+        dma_addr: u64,
+        len: usize,
+        context: TxContextDesc,
+        owned: DmaBuffer,
+        kick: bool,
+    ) -> Option<TxTicket> {
+        let data_descs = len.div_ceil(MAX_DATA_PER_TXD);
+        let descriptor_count = 1 + data_descs;
+        if state.cursor.available() < descriptor_count {
+            return None;
+        }
+
+        let context_ticket = state.cursor.reserve().expect("capacity checked");
+        let context_off = (context_ticket.slot * core::mem::size_of::<TxDesc>()) as u64;
+        // SAFETY: capacity was checked and every reserved slot is inside the
+        // one-page descriptor ring.
+        unsafe {
+            core::ptr::write_volatile(
+                self.tx_ring.cpu_mut_ptr_at::<TxContextDesc>(context_off),
+                context,
+            );
+        }
+
+        let mut offset = 0usize;
+        let mut final_ticket = context_ticket;
+        while offset < len {
+            let chunk = (len - offset).min(MAX_DATA_PER_TXD);
+            let last = offset + chunk == len;
+            let ticket = state.cursor.reserve().expect("capacity checked");
+            let desc = TxDesc::tso_data(dma_addr + offset as u64, chunk as u16, last);
+            let desc_off = (ticket.slot * core::mem::size_of::<TxDesc>()) as u64;
+            // SAFETY: as above; `chunk <= MAX_DATA_PER_TXD <= u16::MAX`.
+            unsafe {
+                core::ptr::write_volatile(self.tx_ring.cpu_mut_ptr_at::<TxDesc>(desc_off), desc);
+            }
+            final_ticket = ticket;
+            offset += chunk;
+        }
+
+        let mut slot = context_ticket.slot;
+        for _ in 0..descriptor_count {
+            state.completion_slot[slot] = final_ticket.slot;
+            slot = (slot + 1) % TX_RING_LEN;
+        }
+        debug_assert!(state.owned[final_ticket.slot].is_none());
+        state.owned[final_ticket.slot] = Some(owned);
+
+        compiler_fence(Ordering::SeqCst);
+        if kick || state.cursor.in_flight >= TX_RING_USABLE {
+            // SAFETY: identity-mapped MMIO; next_to_use is a ring index.
+            unsafe {
+                self.mmio.write32(REG_TDT, state.cursor.next_to_use as u32);
+            }
+        }
+        Some(final_ticket)
     }
 
     /// Copy into a persistent per-slot buffer and enqueue. Ring-full waits are
@@ -1420,7 +1619,7 @@ impl E1000 {
                     }
                 }
                 self.post_tx_locked(
-                    &state,
+                    &mut state,
                     reserved,
                     self.tx_pool[slot].dma_addr().raw(),
                     frame.len(),
@@ -1464,7 +1663,7 @@ impl E1000 {
                 };
                 debug_assert!(state.owned[reserved.slot].is_none());
                 state.owned[reserved.slot] = owned.take();
-                self.post_tx_locked(&state, reserved, buf_phys, len, kick);
+                self.post_tx_locked(&mut state, reserved, buf_phys, len, kick);
                 ticket = Some(reserved);
                 true
             },
@@ -1503,6 +1702,47 @@ impl E1000 {
         }
         let phys = buf.dma_addr().raw();
         self.tx_enqueue_dma(phys, len, Some(buf), kick).map(|_| ())
+    }
+
+    /// Fire-and-forget TSO submission. The caller has already normalized the
+    /// packet headers and built `context`; ownership moves to the final data
+    /// descriptor and is recycled only after that descriptor reports DD.
+    fn tx_tso_owned(
+        &self,
+        buf: DmaBuffer,
+        len: usize,
+        context: TxContextDesc,
+        kick: bool,
+    ) -> Result<(), E1000Error> {
+        if len == 0 || len > MAX_TSO_FRAME || len > buf.len() {
+            self.tx_zc_pool.release(buf);
+            return Err(E1000Error::FrameTooLong);
+        }
+        let dma_addr = buf.dma_addr().raw();
+        let mut owned = Some(buf);
+        let posted = narf_scheduler::responsive_spin_until(
+            || {
+                let mut state = self.tx_state.lock();
+                self.reclaim_tx_locked(&mut state);
+                if state.cursor.available() < 1 + len.div_ceil(MAX_DATA_PER_TXD) {
+                    return false;
+                }
+                let buf = owned
+                    .take()
+                    .expect("buffer retained until ring reservation");
+                self.post_tso_locked(&mut state, dma_addr, len, context, buf, kick)
+                    .is_some()
+            },
+            narf_time::Deadline::after_ms(250),
+        );
+        if posted {
+            Ok(())
+        } else {
+            if let Some(buf) = owned.take() {
+                self.tx_zc_pool.release(buf);
+            }
+            Err(E1000Error::TxTimeout)
+        }
     }
 
     /// Completion check for sync/async callers. If the slot has already been
@@ -1737,12 +1977,23 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         narf_net::iface::LinkDuplex::Half
     });
     narf_net::iface::set_link_metadata(&name, carrier, speed_mbps, duplex);
+    narf_net::iface::set_offloads(
+        &name,
+        narf_net::OffloadCapabilities {
+            // The live path below implements 8254x IPv4/TCP context + data
+            // descriptors. The TCP stack currently limits this capability to
+            // IPv4 until the IPv6 context/header contract is wired too.
+            max_tso_bytes: MAX_TSO_FRAME as u32,
+            ..Default::default()
+        },
+    );
     *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
     narf_net::iface::install_rx_drain(rx_pump_step);
     // Opt into zero-copy TX (P-F): the stack builds egress frames straight into
     // a pooled DMA buffer and hands it to `e1000_send_frame_zc`, which DMAs it
-    // without the per-frame slice copy `e1000_send_frame` does. 2 KiB buffers
-    // (max Ethernet frame 1518 < 2048); a TX-ring-deep recycling pool.
+    // without the per-frame slice copy `e1000_send_frame` does. The 16 KiB
+    // buffers also hold a complete bounded TSO super-frame; completion returns
+    // them to the same TX-ring-deep recycling pool.
     narf_net::iface::enable_zero_copy_tx_pool(
         e1000_ifname(),
         e1000_send_frame_zc,
@@ -1851,6 +2102,24 @@ fn e1000_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
     // spin on the same lock, interrupts masked — a thundering herd that
     // starves timers and RCU. See `probed_controller`.
     let ctrl = probed_controller().ok_or(())?;
+    if let Some(mss) = meta.tso_mss {
+        let mut buf = ctrl.tx_zc_pool.acquire().ok_or(())?;
+        if frame.len() > buf.len() {
+            ctrl.tx_zc_pool.release(buf);
+            return Err(());
+        }
+        buf.as_mut_slice()[..frame.len()].copy_from_slice(frame);
+        let context = match prepare_ipv4_tso(&mut buf.as_mut_slice()[..frame.len()], mss) {
+            Ok(context) => context,
+            Err(_) => {
+                ctrl.tx_zc_pool.release(buf);
+                return Err(());
+            }
+        };
+        return ctrl
+            .tx_tso_owned(buf, frame.len(), context, !meta.more)
+            .map_err(|_| ());
+    }
     ctrl.tx_enqueue(frame, !meta.more)
         .map(|_| ())
         .map_err(|_| ())
@@ -1860,16 +2129,31 @@ fn e1000_send_frame(frame: &[u8], meta: narf_net::TxMeta) -> Result<(), ()> {
 /// DMA buffer from the controller's shared TX pool. Transfer ownership to the
 /// descriptor ring and return after publication; completion reclaim recycles
 /// the buffer only after hardware writes DD.
-fn e1000_send_frame_zc(frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result<(), ()> {
+fn e1000_send_frame_zc(mut frame: narf_net::Frame, meta: narf_net::TxMeta) -> Result<(), ()> {
+    let ctrl = probed_controller().ok_or(())?;
+    let context = match meta.tso_mss {
+        Some(mss) => match prepare_ipv4_tso(frame.payload_mut(), mss) {
+            Ok(context) => Some(context),
+            Err(_) => {
+                let (buf, _, _) = frame.into_parts_with_offset();
+                ctrl.tx_zc_pool.release(buf);
+                return Err(());
+            }
+        },
+        None => None,
+    };
     let (buf, offset, len) = frame.into_parts_with_offset();
     if offset != 0 {
+        ctrl.tx_zc_pool.release(buf);
         return Err(());
     }
-    match probed_controller() {
-        Some(c) => c
+    match context {
+        Some(context) => ctrl
+            .tx_tso_owned(buf, len as usize, context, !meta.more)
+            .map_err(|_| ()),
+        None => ctrl
             .tx_dma_owned(buf, len as usize, !meta.more)
             .map_err(|_| ()),
-        None => Err(()),
     }
 }
 
