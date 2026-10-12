@@ -158,4 +158,6 @@ report performance from a single run: use the sample size, confidence
 intervals, and statistical gates in
 [verification/specification/spec.md](../verification/specification/spec.md).
 For Linux ABI work, update the appropriate executable smoke and keep
-[Linux compatibility](LINUX_COMPAT.md) consistent with the implementation.
+the public interface in
+[userspace/specification/spec.md](../userspace/specification/spec.md)
+consistent with the implementation.

@@ -5,7 +5,7 @@
 //! [`TASKS`] ≙ the pid table (holds one ref while the task is
 //! findable); [`release_task`] ≙ `release_task()`.
 //!
-//! Lifetime rules (see `docs/TASK_LIFETIME_REDESIGN.md`):
+//! Lifetime rules:
 //!
 //! 1. `TASKS` holds exactly one `Arc` from spawn registration until
 //!    the task is reaped ([`release_task`]). Any holder that needs the

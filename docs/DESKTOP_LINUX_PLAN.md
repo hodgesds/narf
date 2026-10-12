@@ -222,7 +222,9 @@ never accumulate unverifiable work.
   DCN 3.1.4 pipeline (OTG, HUBP, DPP, MPC, OPP, DP stream encoder), trains the
   link, and publishes a scanout that `narf_fb` adopts — including tunnelled
   USB4 sinks and replay across suspend. **Nothing in this path has executed on
-  real hardware**; see `docs/notes/2026-10-07-amdgpu-status.md`.
+  real hardware**. The current interface and hardware invariants live in the
+  [GPU specification](../drivers/gpu/specification/spec.md); the remaining
+  silicon gate is tracked in [STATUS.md](../STATUS.md).
 
 ### Kernel-ABI fixes the Wayland stack surfaced (each helps all Linux software)
 

@@ -3,9 +3,8 @@
 //! Every syscall that takes a pid ARRIVING from userspace must resolve it in
 //! the CALLER's pid namespace (Linux `find_task_by_vpid`), i.e. through
 //! `accept_pid_from(current_task_id(), pid)` before it is used as an outer
-//! ProcessId / scheduler TaskId / table key. These tests pin the fixes for the
-//! `docs/pidns_translation_audit.md` findings whose handlers keyed on the RAW
-//! caller-namespace pid.
+//! ProcessId / scheduler TaskId / table key. These tests prevent handlers from
+//! regressing to indexing kernel tables with a raw caller-namespace pid.
 //!
 //! Each test builds a fresh PID namespace: a MANAGER task (`unshare(CLONE_NEWPID)`
 //! → inner pid 1) and a WORKER inherited into it (inner pid 2). It then drives

@@ -1391,8 +1391,7 @@ fn smoke_arch_mte_irg_stg_round_trip() -> TestResult {
 kernel_test_in!("ipc", smoke_arch_mte_irg_stg_round_trip);
 
 fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
-    // Canary against the layout-shift bug documented in
-    // docs/notes/2026-05-19-layout-shift-bug.md. The fault dump
+    // Canary against a prior allocator-aliasing failure. The fault dump
     // showed a SendFuture::poll dereferencing `r14 + 0x90` where
     // r14 was claimed to be a Context pointer but in fact held
     // 0x40000eb0 — past 1 GiB, in QEMU's reserved gap between
