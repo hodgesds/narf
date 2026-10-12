@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+use blake2::{Blake2b512, Digest};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::{ptr, slice};
@@ -32,6 +33,26 @@ const FDT_HEADER_SIZE: usize = 40;
 const MAX_DTB_SIZE: usize = 4 * 1024 * 1024;
 const MAX_KERNEL_LOAD_SPAN: u64 = 1024 * 1024 * 1024;
 const EFI_DTB_TABLE_GUID: uefi::Guid = guid!("b1b621d5-f19c-41a5-830b-d9152c69aae0");
+const KERNEL_HASH_MARKER: [u8; 20] = *b"NARF_KERNEL_BLAKE2B=";
+const KERNEL_HASH_PLACEHOLDER: [u8; 64] = [0xa5; 64];
+const KERNEL_HASH_BUFFER_SIZE: usize = 4096;
+
+#[repr(C)]
+struct KernelHashBinding {
+    marker: [u8; 20],
+    digest: [u8; 64],
+}
+
+// `packaging/bind-aarch64-uefi.py` replaces only `digest`, then the resulting
+// PE/COFF image is signed. The volatile read below is intentional: without it
+// the compiler may constant-fold the placeholder into code, making the binary
+// patch ineffective even though this retained section changed.
+#[used]
+#[link_section = ".narfhash"]
+static KERNEL_HASH_BINDING: KernelHashBinding = KernelHashBinding {
+    marker: KERNEL_HASH_MARKER,
+    digest: KERNEL_HASH_PLACEHOLDER,
+};
 
 #[derive(Clone, Copy)]
 struct LoadSegment {
@@ -79,6 +100,8 @@ impl ParsedElf {
 enum LoadError {
     FileSystem,
     MissingDtb,
+    MissingKernelTrust,
+    KernelIntegrity,
     InvalidElf,
     UnsupportedElf,
     InvalidDtb,
@@ -138,19 +161,28 @@ fn load_and_start() -> Result<(), LoadError> {
     let mut protocol =
         boot::get_image_file_system(boot::image_handle()).map_err(|_| LoadError::FileSystem)?;
     let mut root = protocol.open_volume().map_err(|_| LoadError::FileSystem)?;
-    let mut kernel = root
+    let opened_kernel = root
         .open(
-            cstr16!(r"\boot\narf-frame"),
+            cstr16!(r"\EFI\NARF\narf-frame"),
             FileMode::Read,
             FileAttribute::empty(),
         )
-        .map_err(|_| LoadError::FileSystem)?
+        .or_else(|_| {
+            root.open(
+                cstr16!(r"\boot\narf-frame"),
+                FileMode::Read,
+                FileAttribute::empty(),
+            )
+        })
+        .map_err(|_| LoadError::FileSystem)?;
+    let mut kernel = opened_kernel
         .into_regular_file()
         .ok_or(LoadError::FileSystem)?;
     kernel
         .set_position(RegularFile::END_OF_FILE)
         .map_err(|_| LoadError::FileSystem)?;
     let kernel_size = kernel.get_position().map_err(|_| LoadError::FileSystem)?;
+    verify_kernel_hash(&mut kernel, kernel_size)?;
 
     let mut elf_header = [0u8; ELF_HEADER_SIZE];
     read_exact_at(&mut kernel, 0, &mut elf_header)?;
@@ -477,6 +509,45 @@ fn read_exact_at(
     Ok(())
 }
 
+fn expected_kernel_hash() -> Result<[u8; 64], LoadError> {
+    // SAFETY: the binding is an aligned immutable static. A volatile read is
+    // required because its bytes are deliberately patched after linking.
+    let binding = unsafe { ptr::read_volatile(&raw const KERNEL_HASH_BINDING) };
+    if binding.marker != KERNEL_HASH_MARKER || binding.digest == KERNEL_HASH_PLACEHOLDER {
+        return Err(LoadError::MissingKernelTrust);
+    }
+    Ok(binding.digest)
+}
+
+fn verify_kernel_hash(file: &mut RegularFile, size: u64) -> Result<(), LoadError> {
+    let expected = expected_kernel_hash()?;
+    file.set_position(0).map_err(|_| LoadError::FileSystem)?;
+    let mut remaining = size;
+    let mut buffer = [0u8; KERNEL_HASH_BUFFER_SIZE];
+    let mut hasher = Blake2b512::new();
+    while remaining != 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .map_err(|_| LoadError::Arithmetic)?;
+        let read = file
+            .read(&mut buffer[..wanted])
+            .map_err(|_| LoadError::FileSystem)?;
+        if read == 0 {
+            return Err(LoadError::FileSystem);
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    let actual = hasher.finalize();
+    let mut different = 0u8;
+    for (actual, expected) in actual.iter().zip(expected) {
+        different |= actual ^ expected;
+    }
+    if different != 0 {
+        return Err(LoadError::KernelIntegrity);
+    }
+    Ok(())
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, LoadError> {
     read_array(bytes, offset).map(u16::from_le_bytes)
 }
@@ -623,6 +694,14 @@ mod tests {
         assert!(matches!(
             validate_dtb_header(&header),
             Err(LoadError::InvalidDtb)
+        ));
+    }
+
+    #[test]
+    fn unbound_loader_fails_closed() {
+        assert!(matches!(
+            expected_kernel_hash(),
+            Err(LoadError::MissingKernelTrust)
         ));
     }
 }

@@ -5,30 +5,73 @@ usage() {
     cat >&2 <<'EOF'
 usage: packaging/build-release.sh --version VERSION
        [--formats all|deb,rpm,arch,gentoo,tar] [--skip-build]
-       [--output DIR] [--source-date-epoch EPOCH] [--limine-efi FILE]
+       [--arch auto|x86_64|aarch64] [--output DIR] [--source-date-epoch EPOCH]
+       [--uefi-loader FILE] [--limine-efi FILE] [--limine-tool FILE]
+       [--secure-boot-key FILE --secure-boot-cert FILE]
 EOF
     exit 2
 }
 
 version=
+arch=auto
 formats=all
 skip_build=0
 output=
 source_epoch=${SOURCE_DATE_EPOCH:-}
 limine_efi=${NARF_LIMINE_EFI:-}
+uefi_loader=${NARF_UEFI_LOADER:-}
+limine_tool=${NARF_LIMINE_TOOL:-}
+secure_boot_key=${NARF_SECURE_BOOT_KEY:-}
+secure_boot_cert=${NARF_SECURE_BOOT_CERT:-}
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --version) [[ $# -ge 2 ]] || usage; version=${2#v}; shift 2 ;;
+        --arch) [[ $# -ge 2 ]] || usage; arch=$2; shift 2 ;;
         --formats) [[ $# -ge 2 ]] || usage; formats=$2; shift 2 ;;
         --skip-build) skip_build=1; shift ;;
         --output) [[ $# -ge 2 ]] || usage; output=$2; shift 2 ;;
         --source-date-epoch) [[ $# -ge 2 ]] || usage; source_epoch=$2; shift 2 ;;
         --limine-efi) [[ $# -ge 2 ]] || usage; limine_efi=$2; shift 2 ;;
+        --uefi-loader) [[ $# -ge 2 ]] || usage; uefi_loader=$2; shift 2 ;;
+        --limine-tool) [[ $# -ge 2 ]] || usage; limine_tool=$2; shift 2 ;;
+        --secure-boot-key) [[ $# -ge 2 ]] || usage; secure_boot_key=$2; shift 2 ;;
+        --secure-boot-cert) [[ $# -ge 2 ]] || usage; secure_boot_cert=$2; shift 2 ;;
         *) usage ;;
     esac
 done
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]] ||
     { echo "invalid or missing semantic version: ${version:-<empty>}" >&2; exit 1; }
+if [[ $arch == auto ]]; then
+    case "$(uname -m)" in
+        x86_64) arch=x86_64 ;;
+        aarch64|arm64) arch=aarch64 ;;
+        *)
+            echo "cannot infer NARF package architecture from $(uname -m); pass --arch" >&2
+            exit 1
+            ;;
+    esac
+fi
+[[ $arch == x86_64 || $arch == aarch64 ]] || {
+    echo "unsupported architecture: $arch" >&2
+    exit 1
+}
+if [[ -n $limine_efi ]]; then
+    [[ $arch == x86_64 ]] || {
+        echo "--limine-efi is x86_64-only; use --uefi-loader for aarch64" >&2
+        exit 1
+    }
+    [[ -z $uefi_loader ]] || {
+        echo "pass only one of --limine-efi and --uefi-loader" >&2
+        exit 1
+    }
+    uefi_loader=$limine_efi
+fi
+if [[ -n $secure_boot_key || -n $secure_boot_cert ]]; then
+    [[ -f $secure_boot_key && -f $secure_boot_cert ]] || {
+        echo "--secure-boot-key and --secure-boot-cert must name existing files and be used together" >&2
+        exit 1
+    }
+fi
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
@@ -38,63 +81,167 @@ source_epoch=${source_epoch:-$(git log -1 --format=%ct)}
 [[ $source_epoch =~ ^[0-9]+$ ]] ||
     { echo "SOURCE_DATE_EPOCH must be an integer" >&2; exit 1; }
 
-if [[ $skip_build -eq 0 ]]; then
-    SOURCE_DATE_EPOCH=$source_epoch cargo xtask build --arch=x86_64
-fi
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
 
-kernel=$root/target/x86_64-unknown-none/release/narf-frame
+case "$arch" in
+    x86_64)
+        target_triple=x86_64-unknown-none
+        loader_kind=limine
+        pe_machine=6486
+        deb_arch=amd64
+        rpm_arch=x86_64
+        arch_pkg_arch=x86_64
+        gentoo_keyword=amd64
+        rpm_license='GPL-2.0-or-later AND BSD-2-Clause'
+        arch_license="'GPL-2.0-or-later' 'BSD-2-Clause'"
+        gentoo_license='GPL-2+ BSD-2'
+        if [[ $skip_build -eq 0 ]]; then
+            SOURCE_DATE_EPOCH=$source_epoch cargo xtask build --arch=x86_64
+        fi
+        kernel=$root/target/$target_triple/release/narf-frame
+        ;;
+    aarch64)
+        target_triple=aarch64-unknown-none
+        loader_kind=narf
+        pe_machine=64aa
+        deb_arch=arm64
+        rpm_arch=aarch64
+        arch_pkg_arch=aarch64
+        gentoo_keyword=arm64
+        rpm_license='GPL-2.0-or-later'
+        arch_license="'GPL-2.0-or-later'"
+        gentoo_license='GPL-2+'
+        if [[ $skip_build -eq 0 ]]; then
+            SOURCE_DATE_EPOCH=$source_epoch cargo xtask image --arch=aarch64
+        fi
+        kernel=$root/target/narf-frame-aarch64.efi-elf
+        ;;
+esac
+
 [[ -f $kernel ]] || {
-    echo "missing canonical kernel artifact: $kernel" >&2
+    echo "missing canonical $arch kernel artifact: $kernel" >&2
     echo "run without --skip-build to build it" >&2
     exit 1
 }
-if [[ ${NARF_SKIP_GRUB_CHECK:-0} != 1 ]] && command -v grub-file >/dev/null 2>&1; then
+if [[ $arch == x86_64 && ${NARF_SKIP_GRUB_CHECK:-0} != 1 ]] &&
+    command -v grub-file >/dev/null 2>&1; then
     grub-file --is-x86-multiboot2 "$kernel" || {
         echo "kernel does not contain a valid Multiboot2 header" >&2
         exit 1
     }
 fi
 
-if [[ -z $limine_efi ]]; then
-    candidates=(
-        "$root/target/narf-uefi/BOOTX64.EFI"
-        "$root/target/iso-x86_64/EFI/BOOT/BOOTX64.EFI"
-    )
-    if [[ -n ${LIMINE_PATH:-} ]]; then
-        candidates+=("$LIMINE_PATH/BOOTX64.EFI")
+if [[ -z $uefi_loader ]]; then
+    if [[ $arch == x86_64 ]]; then
+        candidates=(
+            "$root/target/narf-uefi/BOOTX64.EFI"
+            "$root/target/iso-x86_64/EFI/BOOT/BOOTX64.EFI"
+        )
+        if [[ -n ${LIMINE_PATH:-} ]]; then
+            candidates+=("$LIMINE_PATH/BOOTX64.EFI")
+        fi
+        candidates+=(
+            /usr/share/limine/BOOTX64.EFI
+            /usr/local/share/limine/BOOTX64.EFI
+            "$root/vendor/limine/BOOTX64.EFI"
+        )
+    else
+        candidates=(
+            "$root/target/uefi-loader/aarch64-unknown-uefi/release/narf-uefi-loader.efi"
+            "$root/target/narf-uefi-aarch64/narf.efi"
+        )
     fi
-    candidates+=(
-        /usr/share/limine/BOOTX64.EFI
-        /usr/local/share/limine/BOOTX64.EFI
-        "$root/vendor/limine/BOOTX64.EFI"
-    )
     for candidate in "${candidates[@]}"; do
         if [[ -f $candidate ]]; then
-            limine_efi=$candidate
+            uefi_loader=$candidate
             break
         fi
     done
 fi
-[[ -f $limine_efi ]] || {
-    echo "missing Limine x86_64 EFI loader" >&2
-    echo "pass --limine-efi FILE, set NARF_LIMINE_EFI/LIMINE_PATH, or run cargo xtask image --arch=x86_64 first" >&2
-    exit 1
-}
-limine_magic=$(od -An -tx1 -N2 "$limine_efi" | tr -d ' \n')
-pe_offset=$(od -An -tu4 -j60 -N4 "$limine_efi" | tr -d ' \n')
-if [[ $pe_offset =~ ^[0-9]+$ ]] && ((pe_offset <= 1048576)); then
-    pe_header=$(dd if="$limine_efi" bs=1 skip="$pe_offset" count=6 2>/dev/null |
-        od -An -tx1 | tr -d ' \n')
-else
-    pe_header=
-fi
-[[ $limine_magic == 4d5a && $pe_header == 504500006486 ]] || {
-    echo "$limine_efi is not an x86_64 PE/COFF EFI executable" >&2
+[[ -f $uefi_loader ]] || {
+    echo "missing $arch UEFI loader" >&2
+    echo "pass --uefi-loader FILE or run without --skip-build" >&2
     exit 1
 }
 
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+validate_efi() {
+    local image=$1 magic pe_offset pe_header
+    magic=$(od -An -tx1 -N2 "$image" | tr -d ' \n')
+    pe_offset=$(od -An -tu4 -j60 -N4 "$image" | tr -d ' \n')
+    if [[ $pe_offset =~ ^[0-9]+$ ]] && ((pe_offset <= 1048576)); then
+        pe_header=$(dd if="$image" bs=1 skip="$pe_offset" count=6 2>/dev/null |
+            od -An -tx1 | tr -d ' \n')
+    else
+        pe_header=
+    fi
+    [[ $magic == 4d5a && $pe_header == "50450000$pe_machine" ]] || {
+        echo "$image is not a $arch PE/COFF EFI executable" >&2
+        return 1
+    }
+}
+validate_efi "$uefi_loader"
+
+kernel_b2sum=$(b2sum -l 512 "$kernel" | awk '{print $1}')
+bound_loader=$work/narf.efi
+if [[ $loader_kind == limine ]]; then
+    config=$work/limine.conf
+    cat >"$config" <<EOF
+# Managed by narf-uefi
+timeout: 5
+serial: yes
+verbose: yes
+quiet: no
+default_entry: 1
+
+/NARF $version
+    protocol: multiboot2
+    path: boot():/EFI/NARF/narf-frame#$kernel_b2sum
+EOF
+    if [[ -z $limine_tool ]]; then
+        if [[ -n ${LIMINE_PATH:-} && -x $LIMINE_PATH/limine ]]; then
+            limine_tool=$LIMINE_PATH/limine
+        elif command -v limine >/dev/null 2>&1; then
+            limine_tool=$(command -v limine)
+        fi
+    fi
+    if [[ -n $limine_tool ]]; then
+        [[ -x $limine_tool ]] || {
+            echo "Limine host tool is not executable: $limine_tool" >&2
+            exit 1
+        }
+        cp "$uefi_loader" "$bound_loader"
+        config_b2sum=$(b2sum -l 512 "$config" | awk '{print $1}')
+        "$limine_tool" enroll-config "$bound_loader" "$config_b2sum"
+    else
+        packaging/bind-limine-config.py "$uefi_loader" "$config" "$bound_loader"
+    fi
+    verified_loader=$work/narf.efi.verified
+    packaging/bind-limine-config.py "$bound_loader" "$config" "$verified_loader"
+    mv "$verified_loader" "$bound_loader"
+else
+    packaging/bind-aarch64-uefi.py "$uefi_loader" "$kernel" "$bound_loader"
+fi
+
+secure_boot_signed=no
+if [[ -n $secure_boot_key ]]; then
+    command -v sbsign >/dev/null 2>&1 || {
+        echo "Secure Boot signing requires sbsign" >&2
+        exit 1
+    }
+    command -v sbverify >/dev/null 2>&1 || {
+        echo "Secure Boot signing requires sbverify" >&2
+        exit 1
+    }
+    signed_loader=$work/narf.efi.signed
+    sbsign --key "$secure_boot_key" --cert "$secure_boot_cert" \
+        --output "$signed_loader" "$bound_loader"
+    sbverify --cert "$secure_boot_cert" "$signed_loader"
+    mv "$signed_loader" "$bound_loader"
+    secure_boot_signed=yes
+fi
+validate_efi "$bound_loader"
+
 stage=$work/stage
 mkdir -p "$stage/boot" "$stage/etc/grub.d" \
     "$stage/usr/bin" "$stage/usr/lib/narf/uefi" \
@@ -102,17 +249,26 @@ mkdir -p "$stage/boot" "$stage/etc/grub.d" \
 install -m 0644 "$kernel" "$stage/boot/narf-kernel-$version"
 install -m 0755 packaging/42_narf "$stage/etc/grub.d/42_narf"
 install -m 0755 packaging/narf-uefi "$stage/usr/bin/narf-uefi"
-install -m 0644 "$limine_efi" "$stage/usr/lib/narf/uefi/narf.efi"
+install -m 0644 "$bound_loader" "$stage/usr/lib/narf/uefi/narf.efi"
 install -m 0644 "$kernel" "$stage/usr/lib/narf/uefi/narf-frame"
 printf '%s\n' "$version" >"$stage/usr/lib/narf/uefi/version"
+printf '%s\n' "$arch" >"$stage/usr/lib/narf/uefi/arch"
+printf '%s\n' "$loader_kind" >"$stage/usr/lib/narf/uefi/loader-kind"
+printf '%s\n' "$kernel_b2sum" >"$stage/usr/lib/narf/uefi/kernel.blake2b"
+printf '%s\n' "$secure_boot_signed" >"$stage/usr/lib/narf/uefi/secure-boot-signed"
+if [[ $loader_kind == limine ]]; then
+    install -m 0644 "$config" "$stage/usr/lib/narf/uefi/limine.conf"
+fi
 install -m 0644 LICENSE README.md "$stage/usr/share/doc/narf/"
 install -m 0644 packaging/README.md "$stage/usr/share/doc/narf/PACKAGING.md"
-install -m 0644 packaging/LIMINE-LICENSE "$stage/usr/share/licenses/narf/LIMINE"
+if [[ $loader_kind == limine ]]; then
+    install -m 0644 packaging/LIMINE-LICENSE "$stage/usr/share/licenses/narf/LIMINE"
+fi
 find "$stage" -exec touch -h -d "@$source_epoch" {} +
 
 rm -rf "$output"
 mkdir -p "$output"
-payload="narf-${version}-x86_64"
+payload="narf-${version}-${arch}"
 tar --sort=name --mtime="@$source_epoch" --owner=0 --group=0 --numeric-owner \
     -C "$stage" -czf "$output/$payload.tar.gz" .
 
@@ -139,7 +295,7 @@ Package: narf-kernel
 Version: $version
 Section: kernel
 Priority: optional
-Architecture: amd64
+Architecture: $deb_arch
 Maintainer: NARF maintainers
 Depends: util-linux
 Suggests: grub-common
@@ -172,7 +328,7 @@ exit 0
 EOF
     chmod 0755 "$tree/DEBIAN/postinst" "$tree/DEBIAN/prerm" "$tree/DEBIAN/postrm"
     find "$tree" -exec touch -h -d "@$source_epoch" {} +
-    dpkg-deb --root-owner-group --build "$tree" "$output/narf-kernel_${version}_amd64.deb"
+    dpkg-deb --root-owner-group --build "$tree" "$output/narf-kernel_${version}_${deb_arch}.deb"
 }
 
 build_rpm() {
@@ -185,12 +341,12 @@ Name: narf-kernel
 Version: $version
 Release: 1%{?dist}
 Summary: NARF framekernel boot image
-License: GPL-2.0-or-later AND BSD-2-Clause
+License: $rpm_license
 URL: https://github.com/hodgesds/narf
 Source0: $payload.tar.gz
-BuildArch: x86_64
+BuildArch: $rpm_arch
 Requires: coreutils, grep, sed, util-linux
-Suggests: grub2-tools
+Suggests: grub2-tools, sbctl
 
 %description
 NARF is an async-first framekernel with hardware-isolated domains.
@@ -229,14 +385,15 @@ if command -v grub2-mkconfig >/dev/null 2>&1; then
   grub2-mkconfig -o /boot/grub2/grub.cfg
 fi
 EOF
-    rpmbuild --define "_topdir $top" --define "_source_date_epoch $source_epoch" \
-        -bb "$spec"
+    rpmbuild --target "$rpm_arch" --define "_topdir $top" \
+        --define "_source_date_epoch $source_epoch" -bb "$spec"
     find "$top/RPMS" -type f -name '*.rpm' -exec cp {} "$output/" \;
 }
 
 build_arch() {
     need makepkg arch || return
-    local dir=$work/arch
+    local dir=$work/arch makepkg_bin
+    makepkg_bin=$(command -v makepkg)
     mkdir -p "$dir"
     cp "$output/$payload.tar.gz" "$dir/"
     local sum
@@ -246,13 +403,14 @@ pkgname=narf-kernel
 pkgver=$version
 pkgrel=1
 pkgdesc='NARF framekernel boot image'
-arch=('x86_64')
+arch=('$arch_pkg_arch')
 url='https://github.com/hodgesds/narf'
-license=('GPL-2.0-or-later' 'BSD-2-Clause')
+license=($arch_license)
 depends=('coreutils' 'grep' 'sed' 'util-linux')
 optdepends=('grub: GRUB BIOS or UEFI menu integration'
             'limine-tool: CachyOS Limine menu integration'
-            'refind: automatic EFI loader discovery')
+            'refind: automatic EFI loader discovery'
+            'sbctl: local Secure Boot signing and key management')
 source=('$payload.tar.gz')
 sha256sums=('$sum')
 install=narf-kernel.install
@@ -279,7 +437,22 @@ post_remove() {
   fi
 }
 EOF
-    (cd "$dir" && SOURCE_DATE_EPOCH=$source_epoch makepkg --noconfirm --nodeps)
+    if [[ $(id -u) -eq 0 ]]; then
+        need runuser arch || return
+        id nobody >/dev/null 2>&1 || {
+            echo "cannot build Arch package as root: the nobody account is unavailable" >&2
+            exit 1
+        }
+        local nobody_group
+        nobody_group=$(id -gn nobody)
+        chmod 0711 "$work"
+        chown -R "nobody:$nobody_group" "$dir"
+        (cd "$dir" && runuser -u nobody -- env SOURCE_DATE_EPOCH="$source_epoch" \
+            "$makepkg_bin" --noconfirm --nodeps --ignorearch)
+    else
+        (cd "$dir" && SOURCE_DATE_EPOCH=$source_epoch \
+            "$makepkg_bin" --noconfirm --nodeps --ignorearch)
+    fi
     find "$dir" -maxdepth 1 -type f -name '*.pkg.tar.*' -exec cp {} "$output/" \;
 }
 
@@ -291,10 +464,10 @@ build_gentoo() {
 EAPI=8
 DESCRIPTION="NARF framekernel boot image"
 HOMEPAGE="https://github.com/hodgesds/narf"
-SRC_URI="$payload.tar.gz"
-LICENSE="GPL-2+ BSD-2"
+SRC_URI="https://github.com/hodgesds/narf/releases/download/v$version/$payload.tar.gz"
+LICENSE="$gentoo_license"
 SLOT="0"
-KEYWORDS="~amd64"
+KEYWORDS="~$gentoo_keyword"
 RDEPEND="sys-apps/coreutils sys-apps/grep sys-apps/sed sys-apps/util-linux"
 
 src_unpack() {
@@ -312,7 +485,9 @@ pkg_postinst() {
     fi
 }
 pkg_prerm() {
-    /usr/bin/narf-uefi remove || ewarn "NARF UEFI payload removal failed"
+    if [[ -z \${REPLACED_BY_VERSION} ]]; then
+        /usr/bin/narf-uefi remove || ewarn "NARF UEFI payload removal failed"
+    fi
 }
 EOF
 }

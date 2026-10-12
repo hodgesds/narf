@@ -16,7 +16,7 @@ additional boot target, not currently a drop-in replacement for
 | Boot the installed CachyOS root and its systemd/KDE session under NARF | Not yet a supported workflow |
 | Boot an encrypted CachyOS root | Not yet supported by the native-package workflow |
 | Use CachyOS Limine, systemd-boot, or rEFInd | Implemented through native registration, BLS, or EFI discovery |
-| Boot NARF with Secure Boot enabled | Not yet supported |
+| Boot a signed native package with Secure Boot enabled | Implemented; the enforced chain and tamper rejection are OVMF-gated, while physical firmware still needs validation |
 
 The distinction matters. NARF can run unmodified musl and glibc programs and
 has booted a generated Fedora image with systemd as PID 1 in QEMU. The native
@@ -46,8 +46,9 @@ Before a bare-metal test:
 2. Have a CachyOS live USB or another known-good recovery path.
 3. Back up important data. Do not use an experimental kernel boot as a backup
    test.
-4. Disable Secure Boot for the NARF attempt. NARF release media and native
-   packages do not yet participate in CachyOS's `sbctl` signing flow.
+4. For unsigned release media, disable Secure Boot for the NARF attempt. For a
+   native package, either do that or sign its bound loader with the machine's
+   existing enrolled `sbctl` policy as described below.
 5. Start with QEMU, then a dedicated NARF USB, and only then add a native boot
    entry.
 
@@ -61,10 +62,10 @@ test -f /boot/grub/grub.cfg && echo "GRUB configuration found"
 sbctl status 2>/dev/null || true
 ```
 
-The native package path currently requires `x86_64`. It supports the boot
+The CachyOS native package path uses `x86_64`. It supports the boot
 managers above but does not change UEFI NVRAM, replace the active manager, or
-make NARF the default. Native aarch64 package installation and Secure Boot are
-still outside this workflow.
+make NARF the default. The cross-distribution packager also emits native
+aarch64 UEFI packages, but CachyOS itself is an x86_64 distribution.
 
 ## Recommended first test: QEMU
 
@@ -359,6 +360,23 @@ grub-file --is-x86-multiboot2 /boot/narf-kernel-<version>
 sudo narf-uefi status
 ```
 
+If CachyOS already manages an enrolled Secure Boot policy with `sbctl`, sign
+the NARF loader after package installation. This explicit choice persists and
+future package upgrades re-sign the replacement loader:
+
+```sh
+sudo sbctl status
+sudo narf-uefi install --sign-with-sbctl
+sudo narf-uefi status
+sudo sbctl verify /boot/EFI/NARF/narf.efi
+```
+
+Adjust the final path to the actual ESP mount point. Do not create or enroll
+keys solely for this test without first accounting for CachyOS, Windows,
+firmware updates, and option ROM trust. NARF never changes PK, KEK, `db`, MOK,
+or the firmware Secure Boot setting. See
+[UEFI Secure Boot](SECURE_BOOT.md) for the trust-chain and recovery model.
+
 If `status` says no ESP is mounted, identify and mount the actual ESP, then
 install explicitly. Do not substitute the root or data partition:
 
@@ -425,8 +443,6 @@ Other blockers to a drop-in `linux-cachyos` replacement are:
   handed to NARF as a replacement driver environment;
 - Linux DKMS and prebuilt modules, including CachyOS's NVIDIA and ZFS modules,
   do not use NARF's module ABI;
-- Secure Boot signing and key enrollment are not implemented for native
-  packages;
 - the stock CachyOS rootfs has no dedicated NARF acceptance gate yet;
 - native GPU, Wi-Fi, input, NVMe, suspend/resume, and platform support still
   need machine-specific silicon validation.
@@ -445,7 +461,7 @@ The UEFI packaging path is now implemented, but these deployment items remain:
 | CachyOS root acceptance | Build a disposable CachyOS image and gate systemd PID 1, udev, networking, persistent writes, login, and clean shutdown in QEMU. |
 | Encrypted root boot | Build/stage a NARF initramfs, add credential policy and kernel arguments, and provide an interactive or distribution-managed unlock path. |
 | CachyOS Btrfs layout | Gate the default `@` subvolume layout, Zstd, fstab-generated mounts, snapshots, and shutdown/recovery behavior. |
-| Secure Boot | Sign the EFI loader and kernel artifacts and integrate with a documented key-enrollment policy. |
+| Secure Boot key lifecycle | A deploying distribution or administrator must own enrollment, rotation, revocation, recovery, and signing-key custody; NARF deliberately does not automate firmware key changes. |
 | Hardware support matrix | Run repeatable silicon tests keyed by PCI/USB/ACPI IDs, firmware versions, and machine models instead of inferring support from in-tree code. |
 
 Those changes should use focused follow-up branches because they change boot

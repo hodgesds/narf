@@ -114,7 +114,8 @@ sudo dnf install ./narf-kernel-${VERSION}-*.x86_64.rpm
 sudo pacman -U "./narf-kernel-${VERSION}-1-x86_64.pkg.tar.zst"
 ```
 
-The package installs a versioned kernel in `/boot` and an isolated UEFI
+Packages are produced for x86_64/amd64 and aarch64/arm64. Each installs a
+versioned kernel in `/boot` and an isolated UEFI
 payload on the mounted EFI System Partition. It integrates with UEFI GRUB,
 systemd-boot/BLS, rEFInd, and CachyOS Limine; the GRUB generator retains a
 direct Multiboot2 path for legacy BIOS. Run `sudo narf-uefi status` before
@@ -139,9 +140,14 @@ The packager reuses Limine from `LIMINE_PATH`, common system locations, or a
 previous x86_64 image build; otherwise pass
 `--limine-efi /path/to/BOOTX64.EFI` explicitly.
 
-Current native packages target x86_64 UEFI and legacy-BIOS machines. Native
-aarch64 installation and Secure Boot signing/key enrollment are not yet
-supported. See [packaging/README.md](packaging/README.md) for ESP detection,
+Native packages support x86_64 UEFI/legacy BIOS and aarch64 UEFI. Their loaders
+are cryptographically bound to the exact configuration and kernel. A
+distribution can sign during package construction, or an administrator can run
+`sudo narf-uefi install --sign-with-sbctl` with an existing enrolled `sbctl`
+policy. Published project artifacts remain unsigned because the project does
+not hold each machine's private key. See
+[UEFI Secure Boot](docs/SECURE_BOOT.md) and
+[packaging/README.md](packaging/README.md) for key-policy boundaries, ESP detection,
 boot-manager integration, package creation, removal, and recovery commands.
 CachyOS users should also read
 [Booting NARF from CachyOS](docs/BOOTING_ON_CACHYOS.md): it separates the
@@ -328,8 +334,8 @@ reading list), and `research/summaries/` (distilled primary sources).
 
 | Arch | Status |
 |---|---|
-| **x86_64** | First-class. Limine multiboot2 path; UEFI removable-media boot is tested through OVMF with Secure Boot disabled. |
-| **aarch64** | First-class. Linux-compatible FDT entry via direct boot or the removable-media `BOOTAA64.EFI` loader; AAVMF-gated in CI. Generic Timer + GICv3 + PSCI. |
+| **x86_64** | First-class. Limine Multiboot2 path; removable and installed UEFI boot is OVMF-gated, including a signed Secure Boot chain and tampered-kernel rejection. |
+| **aarch64** | First-class. Linux-compatible FDT entry via direct boot or the digest-bound `BOOTAA64.EFI` loader; removable media and native packages are AAVMF-gated. Generic Timer + GICv3 + PSCI. |
 
 ---
 
@@ -344,6 +350,7 @@ reading list), and `research/summaries/` (distilled primary sources).
 | [`COMPARISON.md`](COMPARISON.md) | Long-form comparison with Linux, the BSDs, and classical microkernels |
 | [`docs/PERSONAS.md`](docs/PERSONAS.md) | `linux-compat` + `container` feature surfaces |
 | [`docs/DOMAIN_BACKENDS.md`](docs/DOMAIN_BACKENDS.md) | Per-silicon enforcement matrix (PKS / MTE / PCID / VMPL / SFI) |
+| [`docs/SECURE_BOOT.md`](docs/SECURE_BOOT.md) | UEFI trust chain, signing/enrollment policy, and tamper-negative tests |
 | [`docs/extending/composition.md`](docs/extending/composition.md) | Link external crates as built-ins or build/stage them as modules without repository edits |
 | [`process/specification/spec.md`](process/specification/spec.md) | Contribution flow (binding on humans and AI agents) |
 | [`security-model/specification/spec.md`](security-model/specification/spec.md) | Threat model, cap × domain composition |

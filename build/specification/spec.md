@@ -122,11 +122,14 @@ and CI compiler-cache integration.
   already completed the production-init boot and host-side btrfs
   interoperability postflight; the default remains the full two-phase gate.
 - Successful kernel-test and boot-smoke QEMU phases keep serial output
-  captured and print concise summaries. A failure or timeout emits a bounded
-  64-KiB diagnostic tail. Abnormal emulator termination is reported with the
-  platform exit-status description (including the Unix signal when present),
-  not only the optional numeric exit code. Child timeouts use polling rather
-  than process-wide signal handlers, so sandboxed runners remain supported.
+  captured and print concise summaries by default. With
+  `XTASK_QEMU_SERIAL_TEE=1`, the captured stream is also flushed to stdout as
+  it arrives so CI exposes guest progress without changing result parsing. A
+  failure or timeout emits a bounded 64-KiB diagnostic tail. Abnormal emulator
+  termination is reported with the platform exit-status description
+  (including the Unix signal when present), not only the optional numeric exit
+  code. Child timeouts use polling rather than process-wide signal handlers,
+  so sandboxed runners remain supported.
 - `cargo xtask boot-smoke --arch=<arch>` accepts success only when the guest
   emits its clean-exit marker and QEMU then exits naturally with status zero
   through ACPI S5 on x86_64 or PSCI `SYSTEM_OFF` on aarch64. The x86
@@ -135,7 +138,8 @@ and CI compiler-cache integration.
 - `XTASK_QEMU_SERIAL_LOG=/path/to/serial.log` optionally copies the kernel-test
   QEMU stdout stream to a host file while tests run. The file is truncated at
   the start of that phase; normal concise summaries and timeout diagnostics
-  remain enabled. This adds no guest-side instrumentation.
+  remain enabled. It may be combined with `XTASK_QEMU_SERIAL_TEE=1`. Neither
+  option adds guest-side instrumentation.
 - The second, whole-kernel phase of `cargo xtask test` strips both
   `kernel-test` and features that transitively select that harness
   (`user-mode-e2e`, `user-mode-testbin`, and `narf-libc-validate`) so it
@@ -163,7 +167,8 @@ and CI compiler-cache integration.
 - `cargo xtask iso-boot --arch=aarch64` — build a FAT ESP containing
   `EFI/BOOT/BOOTAA64.EFI`, generate and attach QEMU's `virt` DTB with
   ACPI disabled so AAVMF publishes the EFI DTB table, and require the
-  same clean-exit marker.
+  same clean-exit marker. Before the image is published, the exact kernel's
+  BLAKE2b-512 digest is bound into the loader; an unbound loader fails closed.
 - `cargo xtask host-test` — run the fast host unit-test allowlist.
   Only hardware-independent crates belong here; privileged, linker-script,
   and device integration coverage remains under `xtask test`.
@@ -194,18 +199,29 @@ and CI compiler-cache integration.
   Limine EFI app from `target/grub-x86_64/esp/`, which also contains the
   canonical kernel, initramfs, and Limine configuration for installation to
   the ESP.
-- `packaging/build-release.sh --version X.Y.Z [--limine-efi FILE]` — wrap the
-  canonical Multiboot2 kernel ELF and reviewed Limine x86_64 EFI application
-  in native distribution packages, install an isolated `/EFI/NARF` payload,
-  the marked Limine GRUB fallback configuration, and a BLS Type #1 entry
-  through `narf-uefi`, retain direct legacy-BIOS GRUB boot, and emit a
-  checksummed release manifest. UEFI GRUB chainloads the payload; systemd-boot,
-  rEFInd, and CachyOS Limine consume their native discovery/registration paths.
+- `packaging/build-release.sh --version X.Y.Z [--arch x86_64|aarch64]
+  [--uefi-loader FILE] [--limine-efi FILE] [--limine-tool FILE]
+  [--secure-boot-key FILE
+  --secure-boot-cert FILE]` — wrap the canonical architecture-specific kernel
+  and bound EFI loader in native distribution packages, install an isolated
+  `/EFI/NARF` payload and BLS Type #1 entry through `narf-uefi`, and emit a
+  checksummed release manifest. x86_64 enrolls the exact Limine configuration
+  digest and places the kernel BLAKE2b-512 digest in its boot path; it retains
+  direct legacy-BIOS GRUB boot. aarch64 binds that digest into NARF's loader.
+  Optional signing uses administrator/distribution inputs through `sbsign` and
+  verifies the output with `sbverify`; private keys never enter package staging.
+  UEFI GRUB chainloads the payload; systemd-boot, rEFInd, and CachyOS Limine
+  consume their native discovery/registration paths.
 - `cargo install --path build/cargo-narf` installs the optional source-tree
   frontend. `cargo narf package` drives reproducible native package generation;
-  both package/install commands accept `--limine-efi FILE`; `cargo narf install`
-  delegates the resulting artifact to apt/dpkg, dnf/rpm, or pacman rather than
-  writing `/boot` or the ESP directly.
+  both package/install commands expose the architecture, loader, and optional
+  signing inputs; `cargo narf install` delegates the resulting artifact to
+  apt/dpkg, dnf/rpm, or pacman rather than writing `/boot` or the ESP directly.
+- `narf-uefi install --sign-with-sbctl` explicitly opts an installation into
+  the host's existing `sbctl` database key. That preference persists for
+  package upgrades; `--no-sbctl-sign` removes it. The helper never creates or
+  enrolls Secure Boot keys and refuses to publish an unsigned loader when
+  firmware reports active Secure Boot.
 - Kernel ELFs on both architectures carry a deterministic SHA-1 GNU build-ID;
   linker symbols `__build_id_note_start` and `__build_id_note_end` delimit the
   retained note for `/sys/kernel/notes`.

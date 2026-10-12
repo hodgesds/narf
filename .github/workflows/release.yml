@@ -41,22 +41,68 @@ jobs:
         include:
           - image: debian:stable
             format: deb
-            install: apt-get update && apt-get install -y dpkg-dev python3
+            arch: x86_64
+            publish: true
+            stage_tar: true
+            install: apt-get update && apt-get install -y dpkg-dev git python3
           - image: ubuntu:latest
             format: deb
-            install: apt-get update && apt-get install -y dpkg-dev python3
+            arch: x86_64
+            publish: false
+            stage_tar: false
+            install: apt-get update && apt-get install -y dpkg-dev git python3
           - image: fedora:latest
             format: rpm
-            install: dnf install -y rpm-build python3
+            arch: x86_64
+            publish: true
+            stage_tar: false
+            install: dnf install -y git rpm-build python3
           - image: archlinux:latest
             format: arch
-            install: pacman -Syu --noconfirm base-devel python
+            arch: x86_64
+            publish: true
+            stage_tar: false
+            install: pacman -Syu --noconfirm base-devel git python
           - image: gentoo/stage3:latest
             format: gentoo
-            install: emerge --sync && emerge dev-lang/python
+            arch: x86_64
+            publish: true
+            stage_tar: false
+            install: emerge --sync && emerge dev-lang/python dev-vcs/git
+          - image: debian:stable
+            format: deb
+            arch: aarch64
+            publish: true
+            stage_tar: true
+            install: apt-get update && apt-get install -y dpkg-dev git python3
+          - image: ubuntu:latest
+            format: deb
+            arch: aarch64
+            publish: false
+            stage_tar: false
+            install: apt-get update && apt-get install -y dpkg-dev git python3
+          - image: fedora:latest
+            format: rpm
+            arch: aarch64
+            publish: true
+            stage_tar: false
+            install: dnf install -y git rpm-build python3
+          - image: archlinux:latest
+            format: arch
+            arch: aarch64
+            publish: true
+            stage_tar: false
+            install: pacman -Syu --noconfirm base-devel git python
+          - image: gentoo/stage3:latest
+            format: gentoo
+            arch: aarch64
+            publish: true
+            stage_tar: false
+            install: emerge --sync && emerge dev-lang/python dev-vcs/git
     runs-on: ubuntu-latest
     container: ${{ matrix.image }}
     steps:
+      - run: ${{ matrix.install }}
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref_name }}
@@ -64,14 +110,38 @@ jobs:
         with:
           name: kernel
           path: target
-      - run: ${{ matrix.install }}
       - env:
           VERSION: ${{ needs.validate.outputs.version }}
-        run: packaging/build-release.sh --version "$VERSION" --skip-build --formats "${{ matrix.format }}"
+        run: packaging/build-release.sh --version "$VERSION" --arch "${{ matrix.arch }}" --skip-build --formats "${{ matrix.format }}"
+      - name: Stage canonical release assets
+        if: matrix.publish
+        env:
+          ARCH: ${{ matrix.arch }}
+          FORMAT: ${{ matrix.format }}
+          STAGE_TAR: ${{ matrix.stage_tar }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="target/release-assets/$VERSION"
+          upload=target/release-upload
+          mkdir -p "$upload"
+          case "$FORMAT" in
+            deb) cp "$out"/*.deb "$upload/" ;;
+            rpm) cp "$out"/*.rpm "$upload/" ;;
+            arch) cp "$out"/*.pkg.tar.* "$upload/" ;;
+            gentoo)
+              tar -C "$out/gentoo" -czf \
+                "$upload/narf-gentoo-overlay-$VERSION-$ARCH.tar.gz" .
+              ;;
+          esac
+          if [[ "$STAGE_TAR" == true ]]; then
+            cp "$out/narf-$VERSION-$ARCH.tar.gz" "$upload/"
+          fi
       - uses: actions/upload-artifact@v4
+        if: matrix.publish
         with:
-          name: package-${{ matrix.format }}-${{ strategy.job-index }}
-          path: target/release-assets/${{ needs.validate.outputs.version }}
+          name: package-${{ matrix.arch }}-${{ matrix.format }}-${{ strategy.job-index }}
+          path: target/release-upload
 
   kernel:
     needs: validate
@@ -88,6 +158,10 @@ jobs:
         uses: ./.github/actions/setup-limine
       - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask build --arch=x86_64
       - run: |
+          sudo apt-get update
+          sudo apt-get install -y mtools
+      - run: SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" cargo xtask image --arch=aarch64
+      - run: |
           mkdir -p target/narf-uefi
           cp "$LIMINE_PATH/BOOTX64.EFI" target/narf-uefi/BOOTX64.EFI
       - uses: actions/upload-artifact@v4
@@ -96,6 +170,8 @@ jobs:
           path: |
             target/x86_64-unknown-none/release/narf-frame
             target/narf-uefi/BOOTX64.EFI
+            target/narf-frame-aarch64.efi-elf
+            target/narf-uefi-aarch64/narf.efi
 
   iso-test:
     needs: validate
@@ -150,6 +226,11 @@ jobs:
         with:
           name: release-iso
           path: assets
+      - name: Write consolidated package checksums
+        run: |
+          cd assets
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' |
+            sort | xargs sha256sum >SHA256SUMS
       - env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}

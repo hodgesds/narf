@@ -44,7 +44,9 @@ serial output for panic and success markers, catching full-boot
 regressions that isolated smokes miss. `run-interactive` drives the
 serial port programmatically to prove the keystroke-to-UART interactive
 loop, and `musl-demo` verifies the linux-compat demo binaries boot and
-run through the real shell, execve, and ELF loader.
+run through the real shell, execve, and ELF loader. Set
+`XTASK_QEMU_SERIAL_TEE=1` to mirror captured kernel-test and boot-smoke serial
+to stdout in real time; CI enables it so long guest phases remain observable.
 
 **Change-based CI.** `affected` parses `cargo metadata` to build the
 workspace reverse-dependency closure and, from a git diff against a base
@@ -113,6 +115,12 @@ the root of the ESP as well: the generated stanza chainloads the bundled
 Limine EFI app, which loads the canonical kernel and initramfs from that ESP.
 The EFI app must be trusted by the active Secure Boot policy (or Secure Boot
 must be disabled); `grub-image` does not sign it.
+
+The aarch64 image path binds the exact stripped kernel's BLAKE2b-512 digest
+into `BOOTAA64.EFI`. The loader fails closed while that placeholder is unbound
+and verifies the full kernel before parsing any ELF header. Native package
+signing and local `sbctl` policy are documented in
+[`docs/SECURE_BOOT.md`](../../docs/SECURE_BOOT.md).
 
 ## Relationships
 

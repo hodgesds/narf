@@ -1,15 +1,17 @@
 # NARF release packaging
 
-`build-release.sh` turns the canonical kernel ELF and Limine's x86_64 EFI
-application into installable distribution packages. Packages own these source
-artifacts:
+`build-release.sh` turns a canonical x86_64 or aarch64 kernel ELF and its
+architecture-matching EFI loader into installable distribution packages.
+Packages own these source artifacts:
 
-- `/boot/narf-kernel-<version>` for legacy-BIOS GRUB;
-- `/usr/lib/narf/uefi/{narf.efi,narf-frame,version}` for UEFI installation;
+- `/boot/narf-kernel-<version>` as the versioned host-side copy, also used by
+  x86_64 legacy-BIOS GRUB;
+- `/usr/lib/narf/uefi/` with the bound loader, kernel, architecture, version,
+  integrity metadata, and the x86_64 Limine configuration;
 - `/usr/bin/narf-uefi` for ESP installation, verification, and removal; and
 - `/etc/grub.d/42_narf` for GRUB on both firmware types.
 
-The package hook copies the Limine/NARF payload to `/EFI/NARF` on the mounted
+The package hook copies the loader/NARF payload to `/EFI/NARF` on the mounted
 EFI System Partition and writes a Boot Loader Specification Type #1 entry at
 `/loader/entries/narf.conf`. When no existing Limine installation owns the
 ESP-wide policy, it also writes the same marked configuration at
@@ -23,15 +25,27 @@ registered through `limine-entry-tool` when it is present. Legacy-BIOS GRUB
 still loads the kernel directly through Multiboot2. These slash-prefixed EFI
 paths are relative to the ESP root, not necessarily the Linux host's `/`.
 
-The release workflow also publishes `narf-x86_64.iso` and its SHA-256
-sidecar after booting the same image layout through OVMF. Distribution
-packages do not embed that ISO or its external initramfs; the installed
-kernel uses its built-in userspace.
+On x86_64 the loader is Limine and the package binds both its configuration and
+kernel digest. On aarch64 it is NARF's EFI loader, with the exact kernel digest
+bound into the PE/COFF image. The aarch64 loader checks that digest before it
+parses the ELF. Signing either bound loader therefore authenticates the whole
+loader-to-kernel chain.
 
-The ISO uses the standard removable-media path
-`EFI/BOOT/BOOTX64.EFI` through Limine. It currently requires Secure
-Boot to be disabled; signed-loader/shim enrollment is not part of the
-release process yet. The installed UEFI payload has the same limitation.
+When Limine's host utility is available, the builder uses its `enroll-config`
+command and independently verifies the resulting embedded digest. Otherwise it
+applies the same upstream marker format directly. `--limine-tool FILE` selects
+a reviewed host utility explicitly.
+
+The release workflow also publishes `narf-x86_64.iso` and
+`narf-aarch64-uefi.img` plus SHA-256 sidecars after booting both through
+OVMF/AAVMF. Distribution packages do not embed those media images or their
+external initramfs; the installed kernel uses its built-in userspace.
+
+Published media and native release packages are integrity-bound but unsigned:
+the project does not possess an administrator's or distribution's private key.
+Native packages can be signed during their build, or the installed loader can
+be signed with an existing `sbctl` policy. See
+[UEFI Secure Boot](../docs/SECURE_BOOT.md).
 
 ## Install and verify the UEFI payload
 
@@ -49,6 +63,14 @@ configuration if GRUB is the active manager:
 ```sh
 sudo narf-uefi install --esp /path/to/esp
 sudo grub-mkconfig -o /boot/grub/grub.cfg
+```
+
+For a machine whose Secure Boot keys are already managed by `sbctl`, opt into
+local signing once. The helper remembers that policy and re-signs upgrades:
+
+```sh
+sudo narf-uefi install --sign-with-sbctl
+sudo narf-uefi status
 ```
 
 The helper never changes UEFI NVRAM or the firmware's default boot entry. It
@@ -114,17 +136,32 @@ cargo narf package --version 0.5.0 --formats all \
   --limine-efi /usr/share/limine/BOOTX64.EFI
 ```
 
-The script builds `target/x86_64-unknown-none/release/narf-frame` through
-`cargo xtask build --arch=x86_64` unless `--skip-build` is passed.
+For aarch64, `--arch aarch64` builds and binds NARF's own UEFI loader. An
+already-built loader can be supplied explicitly:
+
+```sh
+cargo xtask image --arch=aarch64
+cargo narf package --version 0.5.0 --arch aarch64 --formats all \
+  --uefi-loader target/narf-uefi-aarch64/narf.efi
+```
+
+The x86_64 path builds `target/x86_64-unknown-none/release/narf-frame`; the
+aarch64 path builds the canonical kernel, a stripped ESP copy, and the UEFI
+loader. `--skip-build` requires those architecture-specific artifacts to exist.
 Native package tools are intentionally used, so unavailable formats are
 reported and skipped for `--formats all`; an explicitly requested unavailable
 format is an error. Release outputs, `SHA256SUMS`, and `release-manifest.json`
 land in `target/release-assets/<version>/`.
 
-Native packages target x86_64. The UEFI payload deliberately uses a packaged
-Limine application rather than asking systemd-boot or UEFI GRUB to execute the
-Multiboot2 ELF directly. Native aarch64 packages and Secure Boot signing remain
-separate work; the release continues to provide tested aarch64 UEFI media.
+The x86_64 UEFI payload deliberately uses packaged Limine rather than asking
+systemd-boot or UEFI GRUB to execute the Multiboot2 ELF directly. aarch64 uses
+NARF's native UEFI loader because its kernel follows the Linux-compatible FDT
+entry ABI rather than Multiboot2.
+
+Distributions may pass `--secure-boot-key` and `--secure-boot-cert`; the builder
+signs with `sbsign` and verifies the result with `sbverify`. Both arguments are
+also available through `cargo narf package` and `cargo narf install`. Keys are
+inputs only and are never copied into staging or release assets.
 
 To test packaging without compiling the kernel, provide that canonical kernel
 artifact and use `--skip-build`:
@@ -148,9 +185,16 @@ and builds packages in distribution containers. It uploads the ISO,
 its checksum, and packages only after all jobs succeed.
 
 The ordinary package test verifies the isolated ESP layout and native package
-hooks. `packaging/test-uefi-boot.sh` adds the end-to-end x86_64 acceptance
+hooks on both architectures. `packaging/test-uefi-boot.sh` adds the end-to-end x86_64 acceptance
 path: OVMF launches an installed-style GRUB build, the generated NARF stanza
 chainloads the package's `/EFI/NARF/narf.efi`, Limine reads the adjacent
 configuration or the package-managed ESP fallback, and the packaged kernel
 must print its clean-exit marker with no panic. CI runs that gate after the
 removable-media UEFI boot.
+
+`packaging/test-aarch64-package-boot.sh` boots the native aarch64 package under
+AAVMF and requires a one-byte kernel modification to be rejected.
+`packaging/test-secure-boot.sh` enrolls an ephemeral certificate into a
+disposable OVMF variable store, boots the signed x86_64 chain with Secure Boot
+enforced, and likewise requires a tampered kernel to fail. CI retains none of
+the generated private-key material.

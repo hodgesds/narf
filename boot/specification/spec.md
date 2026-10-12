@@ -108,9 +108,11 @@ from turning into a kernel-side memory-corruption primitive.
 ### aarch64
 - Direct Linux/U-Boot FDT entry and the `BOOTAA64.EFI` removable-media
   loader are supported. The loader obtains the standard EFI DTB
-  configuration table, validates and loads the kernel ELF64 `PT_LOAD`
-  segments at their physical addresses, exits Boot Services, and enters
-  the same Linux-compatible ABI.
+  configuration table and verifies a build-time-bound BLAKE2b-512 digest of
+  the complete kernel before parsing its ELF header. A missing binding or
+  mismatch is fatal. It then validates and loads the kernel ELF64 `PT_LOAD`
+  segments at their physical addresses, exits Boot Services, and enters the
+  same Linux-compatible ABI.
 - Entry: physical address `0x4008_0000`, MMU off, X0 = DTB physical
   address (Linux/U-Boot ABI).
 - Memory map + reserved regions from the FDT `/memory` and
@@ -149,7 +151,10 @@ producing the same `RawBootInfo` shape that `frame/` consumes.
   fresh kernels in xtask without re-imaging.
 - **UEFI loader** on aarch64 is the SystemReady-compatible removable
   media path and is boot-gated with AAVMF; `-kernel` direct entry
-  remains the fast functional-test path.
+  remains the fast functional-test path. Native packages may place the kernel
+  beside the loader under `EFI/NARF`; removable media retains `boot/narf-frame`.
+  Both layouts use a loader bound to that exact kernel before any optional
+  Authenticode signing.
 
 The three loaders converge on `RawBootInfo` before any
 NARF-specific code runs; downstream subsystems see only the

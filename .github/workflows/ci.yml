@@ -32,6 +32,9 @@ env:
   # QEMU. 2 GiB (1 GiB per NUMA node) keeps it comfortably in range.
   # aarch64 + non-QEMU jobs ignore it. See qemu_args / NARF_QEMU_MEM_MB.
   NARF_QEMU_MEM_MB: "2048"
+  # Kernel-test and boot-smoke still capture serial for marker parsing, but
+  # relay it live so a long guest run has visible forward progress in Actions.
+  XTASK_QEMU_SERIAL_TEE: "1"
 
 jobs:
   # Change-based CI gate. Computes which jobs + kernel-test subsystems the
@@ -223,7 +226,10 @@ jobs:
             qemu-efi-aarch64 \
             xorriso \
             grub-common \
-            grub-efi-amd64-bin
+            grub-efi-amd64-bin \
+            openssl \
+            python3-virt-firmware \
+            sbsigntool
 
       # Ubuntu's QEMU 8.2 can silently terminate NARF under MTTCG during
       # device probing. The kernel-test and musl-demo jobs already use this
@@ -251,6 +257,18 @@ jobs:
         env:
           NARF_UEFI_SKIP_BASE_ISO_BOOT: "1"
         run: packaging/test-uefi-boot.sh
+
+      - name: Native-package UEFI boot (AAVMF -> NARF loader)
+        if: matrix.arch == 'aarch64'
+        env:
+          NARF_UEFI_SKIP_BASE_ISO_BOOT: "1"
+        run: packaging/test-aarch64-package-boot.sh
+
+      - name: Native-package Secure Boot (signed Limine -> bound kernel)
+        if: matrix.arch == 'x86_64'
+        env:
+          NARF_UEFI_SKIP_BASE_ISO_BOOT: "1"
+        run: packaging/test-secure-boot.sh
 
       # xAPIC fallback boot. With x2APIC masked off, every LAPIC access is
       # MMIO instead of an MSR — the path real Renoir/Phoenix firmware puts

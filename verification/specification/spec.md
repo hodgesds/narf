@@ -81,12 +81,21 @@ production boot and host interoperability postflight.
 - Three outcome channels: success (QEMU exit 0x10), failure (0x11),
   timeout (harness kill).
 - Runs on `x86_64` and `aarch64` targets on every PR.
+- Functional CI sets `XTASK_QEMU_SERIAL_TEE=1`: kernel-test and boot-smoke
+  serial is flushed into the live job log while the same captured bytes remain
+  authoritative for marker parsing, summaries, and bounded failure tails.
 - Driver-specific live acceptance can add a host harness to this boot. The
   x86_64 `e1000-module-net-smoke` gate requires pre-probe initramfs loading in
   an operator-selected driver frame, exclusive ownership of QEMU's 82540EM,
   and successful off-box TCP, UDP, and DNS traffic through the resulting
   module datapath. Synthetic descriptor injection is not sufficient for this
   gate.
+- Native UEFI package acceptance boots the installed x86_64 layout through
+  OVMF, GRUB, config-bound Limine, and the packaged kernel, and boots the
+  aarch64 layout through AAVMF and NARF's digest-bound loader. Secure Boot
+  acceptance uses an ephemeral enrolled OVMF certificate and a signed loader.
+  Both integrity chains include a negative boot in which one kernel byte is
+  changed and the NARF clean-exit marker must remain unreachable.
 - Each test declares:
   - Required features (e.g. PKS, MTE). Skipped on archs without them
     unless the test is specifically an arch check.

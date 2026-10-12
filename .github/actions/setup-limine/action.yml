@@ -28,4 +28,8 @@ runs:
           test -f "${limine_dir}/${file}"
         done
 
+        make -C "${limine_dir}" limine
+        test -x "${limine_dir}/limine"
+
         echo "LIMINE_PATH=${limine_dir}" >> "${GITHUB_ENV}"
+        echo "NARF_LIMINE_TOOL=${limine_dir}/limine" >> "${GITHUB_ENV}"

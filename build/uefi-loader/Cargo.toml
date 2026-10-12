@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+blake2 = { version = "0.10", default-features = false }
 uefi = { version = "0.39", features = ["alloc"] }
 
 [target.'cfg(target_os = "uefi")'.dependencies]

@@ -11,7 +11,32 @@ mkdir -p target/x86_64-unknown-none/release
     dd if=/dev/zero bs=1 count=58 2>/dev/null
     printf '\100\000\000\000PE\000\000\144\206'
 } >"$tmp/BOOTX64.EFI"
-for path in target/x86_64-unknown-none/release/narf-frame
+printf '%s' '++CONFIG_B2SUM_SIGNATURE++' >>"$tmp/BOOTX64.EFI"
+printf '%0128d' 0 >>"$tmp/BOOTX64.EFI"
+cat >"$tmp/limine-tool" <<'EOF'
+#!/bin/sh
+set -eu
+[ "$1" = enroll-config ]
+[ -f "$2" ]
+case "$3" in
+    *[!0-9a-f]*|'') exit 1 ;;
+esac
+[ "${#3}" -eq 128 ]
+printf '\nNARF_TEST_CONFIG_BLAKE2B=%s\n' "$3" >>"$2"
+EOF
+chmod +x "$tmp/limine-tool"
+
+python3 - "$tmp/BOOTAA64.EFI" <<'PY'
+import pathlib, sys
+image = bytearray(b'MZ' + bytes(58) + bytes((64, 0, 0, 0)) + b'PE\0\0' + bytes((0x64, 0xaa)))
+image += bytes(256)
+image += b'NARF_KERNEL_BLAKE2B=' + bytes([0xa5]) * 64
+pathlib.Path(sys.argv[1]).write_bytes(image)
+PY
+
+for path in \
+    target/x86_64-unknown-none/release/narf-frame \
+    target/narf-frame-aarch64.efi-elf
 do
     if [[ ! -e $path ]]; then
         printf 'packaging-test-fixture\n' >"$path"
@@ -27,7 +52,11 @@ NARF_SKIP_GRUB_CHECK=1 packaging/build-release.sh --version 0.0.0-test.1 --skip-
     --limine-efi "$tmp/BOOTX64.EFI" \
     --formats "$formats" --output "$tmp/out" --source-date-epoch 1700000000
 test -f "$tmp/out/narf-0.0.0-test.1-x86_64.tar.gz"
-test -f "$tmp/out/gentoo/sys-kernel/narf-kernel/narf-kernel-0.0.0-test.1.ebuild"
+gentoo_ebuild=$tmp/out/gentoo/sys-kernel/narf-kernel/narf-kernel-0.0.0-test.1.ebuild
+test -f "$gentoo_ebuild"
+grep -F 'releases/download/v0.0.0-test.1/narf-0.0.0-test.1-x86_64.tar.gz' \
+    "$gentoo_ebuild" >/dev/null
+grep -F '[[ -z ${REPLACED_BY_VERSION} ]]' "$gentoo_ebuild" >/dev/null
 test -f "$tmp/out/release-manifest.json"
 (cd "$tmp/out" && sha256sum -c SHA256SUMS)
 tar -tzf "$tmp/out/narf-0.0.0-test.1-x86_64.tar.gz" |
@@ -37,6 +66,11 @@ for packaged_path in \
     ./usr/lib/narf/uefi/narf.efi \
     ./usr/lib/narf/uefi/narf-frame \
     ./usr/lib/narf/uefi/version \
+    ./usr/lib/narf/uefi/arch \
+    ./usr/lib/narf/uefi/loader-kind \
+    ./usr/lib/narf/uefi/kernel.blake2b \
+    ./usr/lib/narf/uefi/limine.conf \
+    ./usr/lib/narf/uefi/secure-boot-signed \
     ./usr/share/licenses/narf/LIMINE
 do
     tar -tzf "$tmp/out/narf-0.0.0-test.1-x86_64.tar.gz" |
@@ -58,13 +92,28 @@ fi
 # boot-manager state.
 mkdir -p "$tmp/tree" "$tmp/esp"
 tar -xzf "$tmp/out/narf-0.0.0-test.1-x86_64.tar.gz" -C "$tmp/tree"
+packaging/bind-limine-config.py "$tmp/BOOTX64.EFI" \
+    "$tmp/tree/usr/lib/narf/uefi/limine.conf" "$tmp/expected-BOOTX64.EFI"
+cmp "$tmp/expected-BOOTX64.EFI" "$tmp/tree/usr/lib/narf/uefi/narf.efi"
+packaging/bind-limine-config.py "$tmp/expected-BOOTX64.EFI" \
+    "$tmp/tree/usr/lib/narf/uefi/limine.conf" "$tmp/rebound-BOOTX64.EFI"
+cmp "$tmp/expected-BOOTX64.EFI" "$tmp/rebound-BOOTX64.EFI"
+printf 'different config\n' >"$tmp/different-limine.conf"
+if packaging/bind-limine-config.py "$tmp/expected-BOOTX64.EFI" \
+    "$tmp/different-limine.conf" "$tmp/wrong-BOOTX64.EFI" >/dev/null 2>&1
+then
+    echo "Limine binder accepted a loader bound to a different configuration" >&2
+    exit 1
+fi
 NARF_UEFI_SOURCE_DIR="$tmp/tree/usr/lib/narf/uefi" \
 NARF_UEFI_STATE_DIR="$tmp/state" \
 NARF_UEFI_ALLOW_NON_ESP=1 \
     "$tmp/tree/usr/bin/narf-uefi" install --esp "$tmp/esp" --no-manager-hooks
-cmp "$tmp/BOOTX64.EFI" "$tmp/esp/EFI/NARF/narf.efi"
+cmp "$tmp/tree/usr/lib/narf/uefi/narf.efi" "$tmp/esp/EFI/NARF/narf.efi"
 cmp "$tmp/tree/boot/narf-kernel-0.0.0-test.1" "$tmp/esp/EFI/NARF/narf-frame"
 grep -F 'path: boot():/EFI/NARF/narf-frame' "$tmp/esp/EFI/NARF/limine.conf" >/dev/null
+grep -E 'path: boot\(\):/EFI/NARF/narf-frame#[0-9a-f]{128}$' \
+    "$tmp/esp/EFI/NARF/limine.conf" >/dev/null
 cmp "$tmp/esp/EFI/NARF/limine.conf" "$tmp/esp/boot/limine/limine.conf"
 grep -F 'efi /EFI/NARF/narf.efi' "$tmp/esp/loader/entries/narf.conf" >/dev/null
 if NARF_UEFI_SOURCE_DIR="$tmp/tree/usr/lib/narf/uefi" \
@@ -105,6 +154,81 @@ test ! -e "$tmp/esp/EFI/NARF/narf-frame"
 test ! -e "$tmp/esp/boot/limine/limine.conf"
 test ! -e "$tmp/esp/loader/entries/narf.conf"
 
+# An administrator can opt into sbctl signing once. The helper remembers that
+# local policy and re-signs future package upgrades before publishing the EFI
+# entry, without storing or reading private-key files itself.
+mkdir -p "$tmp/mock-bin" "$tmp/sbctl-esp"
+cat >"$tmp/mock-bin/sbctl" <<'EOF'
+#!/bin/sh
+set -eu
+case "$1" in
+    sign)
+        shift
+        [ "$1" = --output ]
+        output=$2
+        input=$3
+        cp "$input" "$output"
+        printf '\nNARF_TEST_SBCTL_SIGNATURE\n' >>"$output"
+        ;;
+    verify)
+        grep -aFq NARF_TEST_SBCTL_SIGNATURE "$2"
+        ;;
+    *) exit 2 ;;
+esac
+EOF
+chmod +x "$tmp/mock-bin/sbctl"
+PATH="$tmp/mock-bin:$PATH" \
+NARF_UEFI_SOURCE_DIR="$tmp/tree/usr/lib/narf/uefi" \
+NARF_UEFI_STATE_DIR="$tmp/sbctl-state" \
+NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/tree/usr/bin/narf-uefi" install --esp "$tmp/sbctl-esp" \
+    --sign-with-sbctl --no-manager-hooks --quiet
+grep -aFq NARF_TEST_SBCTL_SIGNATURE "$tmp/sbctl-esp/EFI/NARF/narf.efi"
+PATH="$tmp/mock-bin:$PATH" \
+NARF_UEFI_SOURCE_DIR="$tmp/tree/usr/lib/narf/uefi" \
+NARF_UEFI_STATE_DIR="$tmp/sbctl-state" \
+NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/tree/usr/bin/narf-uefi" status --esp "$tmp/sbctl-esp" \
+    --no-manager-hooks --quiet
+recorded_signed_hash=$(sed -n '1p' "$tmp/sbctl-state/sbctl-sign")
+installed_signed_hash=$(sha256sum "$tmp/sbctl-esp/EFI/NARF/narf.efi" | awk '{print $1}')
+test "${#recorded_signed_hash}" -eq 64
+test "$recorded_signed_hash" = "$installed_signed_hash"
+printf '\nNARF_TEST_TAMPER\n' >>"$tmp/sbctl-esp/EFI/NARF/narf.efi"
+if PATH="$tmp/mock-bin:$PATH" \
+    NARF_UEFI_SOURCE_DIR="$tmp/tree/usr/lib/narf/uefi" \
+    NARF_UEFI_STATE_DIR="$tmp/sbctl-state" \
+    NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/tree/usr/bin/narf-uefi" status --esp "$tmp/sbctl-esp" \
+        --no-manager-hooks --quiet >/dev/null 2>&1
+then
+    echo "narf-uefi status accepted a modified locally signed loader" >&2
+    exit 1
+fi
+# No flag on the second install: the saved administrator policy still signs.
+PATH="$tmp/mock-bin:$PATH" \
+NARF_UEFI_SOURCE_DIR="$tmp/tree/usr/lib/narf/uefi" \
+NARF_UEFI_STATE_DIR="$tmp/sbctl-state" \
+NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/tree/usr/bin/narf-uefi" install --esp "$tmp/sbctl-esp" \
+    --no-manager-hooks --quiet
+grep -aFq NARF_TEST_SBCTL_SIGNATURE "$tmp/sbctl-esp/EFI/NARF/narf.efi"
+# An explicit opt-out replaces the local signature with the package payload
+# and removes the persisted signing preference.
+PATH="$tmp/mock-bin:$PATH" \
+NARF_UEFI_SOURCE_DIR="$tmp/tree/usr/lib/narf/uefi" \
+NARF_UEFI_STATE_DIR="$tmp/sbctl-state" \
+NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/tree/usr/bin/narf-uefi" install --esp "$tmp/sbctl-esp" \
+    --no-sbctl-sign --no-manager-hooks --quiet
+cmp "$tmp/tree/usr/lib/narf/uefi/narf.efi" "$tmp/sbctl-esp/EFI/NARF/narf.efi"
+test ! -e "$tmp/sbctl-state/sbctl-sign"
+PATH="$tmp/mock-bin:$PATH" \
+NARF_UEFI_STATE_DIR="$tmp/sbctl-state" \
+NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/tree/usr/bin/narf-uefi" remove --esp "$tmp/sbctl-esp" \
+    --no-manager-hooks --quiet
+
 # An existing Limine installation owns its own config. NARF may install its
 # isolated payload and native menu registration, but must not shadow that
 # boot policy with the GRUB-only fallback.
@@ -126,13 +250,145 @@ sh -n "$tmp/tree/usr/bin/narf-uefi" "$tmp/tree/etc/grub.d/42_narf"
 # Exercise the source-installable Cargo frontend as well as the underlying
 # release builder. It must produce the same package layout without installing
 # anything on the host.
-NARF_LIMINE_EFI=/does/not/exist cargo run -q -p cargo-narf -- narf package --version 0.0.0-test.1 \
+NARF_LIMINE_EFI=/does/not/exist NARF_SKIP_GRUB_CHECK=1 \
+    cargo run -q -p cargo-narf -- narf package --version 0.0.0-test.1 \
     --limine-efi "$tmp/BOOTX64.EFI" \
+    --limine-tool "$tmp/limine-tool" \
     --formats tar --skip-build --output "$tmp/cargo-out" \
     --source-date-epoch 1700000000
 test -f "$tmp/cargo-out/narf-0.0.0-test.1-x86_64.tar.gz"
 tar -tzf "$tmp/cargo-out/narf-0.0.0-test.1-x86_64.tar.gz" |
     grep -F './boot/narf-kernel-0.0.0-test.1' >/dev/null
+
+# Exercise explicit distribution signing without requiring a real private key
+# in the ordinary layout test. test-secure-boot.sh covers real sbsign/sbverify
+# and firmware enforcement with an ephemeral certificate.
+mkdir -p "$tmp/mock-sign-bin"
+printf test-key >"$tmp/db.key"
+printf test-cert >"$tmp/db.crt"
+cat >"$tmp/mock-sign-bin/sbsign" <<'EOF'
+#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --key|--cert) shift 2 ;;
+        --output) output=$2; shift 2 ;;
+        *) input=$1; shift ;;
+    esac
+done
+cp "$input" "$output"
+printf '\nNARF_TEST_SBSIGN_SIGNATURE\n' >>"$output"
+EOF
+cat >"$tmp/mock-sign-bin/sbverify" <<'EOF'
+#!/bin/sh
+set -eu
+grep -aFq NARF_TEST_SBSIGN_SIGNATURE "$3"
+EOF
+chmod +x "$tmp/mock-sign-bin/sbsign" "$tmp/mock-sign-bin/sbverify"
+PATH="$tmp/mock-sign-bin:$PATH" NARF_SKIP_GRUB_CHECK=1 \
+    packaging/build-release.sh --version 0.0.0-signed-test --skip-build \
+    --limine-efi "$tmp/BOOTX64.EFI" --formats tar \
+    --secure-boot-key "$tmp/db.key" --secure-boot-cert "$tmp/db.crt" \
+    --output "$tmp/signed-out" --source-date-epoch 1700000000
+mkdir -p "$tmp/signed-tree"
+tar -xzf "$tmp/signed-out/narf-0.0.0-signed-test-x86_64.tar.gz" \
+    -C "$tmp/signed-tree"
+grep -Fx yes "$tmp/signed-tree/usr/lib/narf/uefi/secure-boot-signed" >/dev/null
+grep -aFq NARF_TEST_SBSIGN_SIGNATURE "$tmp/signed-tree/usr/lib/narf/uefi/narf.efi"
+
+# Native aarch64 packages use NARF's own EFI loader. The package builder binds
+# it to the exact stripped kernel, and the administrator helper emits an AA64
+# BLS entry without installing Limine configuration files. A mock rpmbuild
+# also checks that cross-generated RPMs select their declared target instead
+# of inheriting the x86_64 CI container architecture.
+cat >"$tmp/mock-bin/rpmbuild" <<'EOF'
+#!/bin/sh
+set -eu
+target=
+top=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --target) target=$2; shift 2 ;;
+        --define)
+            case "$2" in
+                '_topdir '*) top=${2#_topdir } ;;
+            esac
+            shift 2
+            ;;
+        *) shift ;;
+    esac
+done
+[ "$target" = aarch64 ]
+[ -n "$top" ]
+mkdir -p "$top/RPMS/$target"
+printf 'mock aarch64 rpm\n' >"$top/RPMS/$target/narf-kernel-test.$target.rpm"
+printf '%s\n' "$target" >"$NARF_TEST_RPM_LOG"
+EOF
+chmod +x "$tmp/mock-bin/rpmbuild"
+arm_formats=tar,rpm
+if command -v dpkg-deb >/dev/null 2>&1; then
+    arm_formats=tar,rpm,deb
+fi
+PATH="$tmp/mock-bin:$PATH" NARF_TEST_RPM_LOG="$tmp/rpm-target" \
+    packaging/build-release.sh --version 0.0.0-test.1 --arch aarch64 --skip-build \
+    --uefi-loader "$tmp/BOOTAA64.EFI" --formats "$arm_formats" \
+    --output "$tmp/arm-out" --source-date-epoch 1700000000
+test -f "$tmp/arm-out/narf-0.0.0-test.1-aarch64.tar.gz"
+grep -Fx aarch64 "$tmp/rpm-target" >/dev/null
+test -f "$tmp/arm-out/narf-kernel-test.aarch64.rpm"
+if command -v dpkg-deb >/dev/null 2>&1; then
+    test -f "$tmp/arm-out/narf-kernel_0.0.0-test.1_arm64.deb"
+    test "$(dpkg-deb --field "$tmp/arm-out/narf-kernel_0.0.0-test.1_arm64.deb" Architecture)" = arm64
+fi
+PATH="$tmp/mock-sign-bin:$PATH" \
+    packaging/build-release.sh --version 0.0.0-arm-signed-test \
+    --arch aarch64 --skip-build --uefi-loader "$tmp/BOOTAA64.EFI" \
+    --formats tar --secure-boot-key "$tmp/db.key" \
+    --secure-boot-cert "$tmp/db.crt" --output "$tmp/arm-signed-out" \
+    --source-date-epoch 1700000000
+mkdir -p "$tmp/arm-signed-tree"
+tar -xzf "$tmp/arm-signed-out/narf-0.0.0-arm-signed-test-aarch64.tar.gz" \
+    -C "$tmp/arm-signed-tree"
+grep -Fx yes \
+    "$tmp/arm-signed-tree/usr/lib/narf/uefi/secure-boot-signed" >/dev/null
+grep -aFq NARF_TEST_SBSIGN_SIGNATURE \
+    "$tmp/arm-signed-tree/usr/lib/narf/uefi/narf.efi"
+mkdir -p "$tmp/arm-tree" "$tmp/arm-esp"
+tar -xzf "$tmp/arm-out/narf-0.0.0-test.1-aarch64.tar.gz" -C "$tmp/arm-tree"
+grep -Fx aarch64 "$tmp/arm-tree/usr/lib/narf/uefi/arch" >/dev/null
+grep -Fx narf "$tmp/arm-tree/usr/lib/narf/uefi/loader-kind" >/dev/null
+test ! -e "$tmp/arm-tree/usr/lib/narf/uefi/limine.conf"
+packaging/bind-aarch64-uefi.py "$tmp/BOOTAA64.EFI" \
+    target/narf-frame-aarch64.efi-elf "$tmp/expected-BOOTAA64.EFI"
+cmp "$tmp/expected-BOOTAA64.EFI" "$tmp/arm-tree/usr/lib/narf/uefi/narf.efi"
+packaging/bind-aarch64-uefi.py "$tmp/expected-BOOTAA64.EFI" \
+    target/narf-frame-aarch64.efi-elf "$tmp/rebound-BOOTAA64.EFI"
+cmp "$tmp/expected-BOOTAA64.EFI" "$tmp/rebound-BOOTAA64.EFI"
+printf 'different kernel\n' >"$tmp/different-arm-kernel"
+if packaging/bind-aarch64-uefi.py "$tmp/expected-BOOTAA64.EFI" \
+    "$tmp/different-arm-kernel" "$tmp/wrong-BOOTAA64.EFI" >/dev/null 2>&1
+then
+    echo "aarch64 binder accepted a loader bound to a different kernel" >&2
+    exit 1
+fi
+NARF_UEFI_SOURCE_DIR="$tmp/arm-tree/usr/lib/narf/uefi" \
+NARF_UEFI_STATE_DIR="$tmp/arm-state" \
+NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/arm-tree/usr/bin/narf-uefi" install \
+    --esp "$tmp/arm-esp" --no-manager-hooks --quiet
+grep -F 'architecture aa64' "$tmp/arm-esp/loader/entries/narf.conf" >/dev/null
+test ! -e "$tmp/arm-esp/EFI/NARF/limine.conf"
+test ! -e "$tmp/arm-esp/boot/limine/limine.conf"
+NARF_UEFI_SOURCE_DIR="$tmp/arm-tree/usr/lib/narf/uefi" \
+NARF_UEFI_STATE_DIR="$tmp/arm-state" \
+NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/arm-tree/usr/bin/narf-uefi" status \
+    --esp "$tmp/arm-esp" --no-manager-hooks --quiet
+NARF_UEFI_SOURCE_DIR="$tmp/arm-tree/usr/lib/narf/uefi" \
+NARF_UEFI_STATE_DIR="$tmp/arm-state" \
+NARF_UEFI_ALLOW_NON_ESP=1 \
+    "$tmp/arm-tree/usr/bin/narf-uefi" remove \
+    --esp "$tmp/arm-esp" --no-manager-hooks --quiet
 
 if [[ -f $tmp/created ]]; then
     while IFS= read -r path; do rm -f "$path"; done <"$tmp/created"
