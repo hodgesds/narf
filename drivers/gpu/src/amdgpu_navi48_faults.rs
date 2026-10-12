@@ -136,12 +136,14 @@ impl Layout {
                 .map_err(|_| Error::Unsupported)?,
         })
     }
-    fn controls(self) -> [(u64, u32); 4] {
+    fn controls(self) -> [(u64, u32); 5] {
         [
             (self.gfx + 0x1624 * 4, VM_MASK),
             (self.mm + 0x564 * 4, VM_MASK),
             (self.gfx + 0x1e0a * 4, CP_MASKS[0]),
             (self.gfx + 0x1e25 * 4, CP_MASKS[1]),
+            // SDMA0_CNTL.TRAP_ENABLE; exclusively owned after cold start.
+            (self.gfx + 0x0d * 4, 1),
         ]
     }
     fn latch(self, hub: Hub) -> (u64, u64) {
@@ -215,7 +217,7 @@ impl<I: Io> Engine<I> {
     fn enable_inner(&mut self) -> Result<(), Error> {
         let controls = self.layout.controls();
         let values = self.access(|io| {
-            let mut values = [0; 4];
+            let mut values = [0; 5];
             for (i, (at, mask)) in controls.into_iter().enumerate() {
                 values[i] = checked(io.read(at))?;
                 if values[i] & mask != 0 {
@@ -241,7 +243,7 @@ impl<I: Io> Engine<I> {
                 // The service exclusively owns CP interrupt-control writes.
                 // Enable EOP here too, so a queue proof never races a fault
                 // mask with a competing read/modify/write of the same register.
-                let value = values[i] | mask | if i >= 2 { 0x84000000 } else { 0 };
+                let value = values[i] | mask | if (2..4).contains(&i) { 0x84000000 } else { 0 };
                 io.write(at, value);
                 if checked(io.read(at))? != value {
                     return Err(Error::Readback);
@@ -252,7 +254,8 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     // Try every owned mask even if one fails; never alter user VM contexts,
-    // default-page policy, CP EOP enables or other interrupt classes.
+    // default-page policy, CP EOP enables or other interrupt classes. Also
+    // disable the owned SDMA trap source after a fault or service failure.
     fn mask(&mut self) -> Result<(), Error> {
         let mut error = None;
         for (i, (at, mask)) in self.layout.controls().into_iter().enumerate() {
@@ -338,7 +341,7 @@ pub(crate) struct Monitor(Engine<Mmio>);
 impl Monitor {
     /// # Safety
     /// Own this physical GPU and permanent register mapping. After arming,
-    /// retain the monitor and exclude concurrent GMC/CP IRQ controls, reset/PM.
+    /// retain the monitor and exclude concurrent GMC/CP/SDMA IRQ controls, reset/PM.
     /// Construction validates layout/authority without device writes.
     pub(crate) unsafe fn new(
         gpu: &AmdGpu,

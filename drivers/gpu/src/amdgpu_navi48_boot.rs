@@ -653,6 +653,35 @@ impl ColdBoot {
         // the platform serializes all other accesses while this is pending.
         unsafe { queues.prove_interrupts(gmc).await }
     }
+    pub fn sdma_state(&self) -> Option<sdma::State> {
+        self.sequence.backend.sdma.as_ref().map(sdma::Sdma::state)
+    }
+    pub fn sdma_interrupts(&self) -> Option<Result<sdma::InterruptProof, sdma::Error>> {
+        self.sequence
+            .backend
+            .sdma
+            .as_ref()
+            .and_then(sdma::Sdma::interrupt_result)
+    }
+    /// # Safety
+    /// Same retained owners and executor context as `prove_queue_interrupts`.
+    /// Run after both GC12 proofs have drained the shared GMC test pages.
+    pub(crate) async unsafe fn prove_sdma_interrupts(
+        &mut self,
+    ) -> Result<sdma::InterruptProof, sdma::Error> {
+        if self.state() != State::MemoryReady
+            || self.sequence.backend.ih.is_some()
+            || self.queue_state() != Some(queues::State::InterruptVerified)
+        {
+            return Err(sdma::Error::Busy);
+        }
+        let hardware = &mut self.sequence.backend;
+        let sdma = hardware.sdma.as_mut().ok_or(sdma::Error::Invalid)?;
+        let gmc = hardware.gmc.as_mut().ok_or(sdma::Error::Invalid)?;
+        // SAFETY: matching retained owners, serialized shared test pages and
+        // independent IRQ service; the GC12 proofs have already drained.
+        unsafe { sdma.prove_interrupts(gmc).await }
+    }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display
             .as_ref()

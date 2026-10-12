@@ -1,9 +1,11 @@
 //! Navi48 SDMA0 cold-start and translated VRAM write/copy/fence proof.
 //! Register/packet sources: Linux sdma_v7_0.c, gc_12_0_0_{offset,sh_mask}.h,
-//! sdma_v6_0_0_pkt_open.h. No host DMA, user submissions, IRQs or recovery.
+//! sdma_v6_0_0_pkt_open.h. Retained kernel fence/TRAP interrupt proof; no host
+//! DMA, user submissions or recovery.
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc,
+    amdgpu_navi48_interrupts::{NativeObserver, Observer, Source},
     amdgpu_psp_ring::bank,
     amdgpu_vram::{Pool, Reservation},
 };
@@ -15,6 +17,8 @@ const RPTR: u64 = 4096;
 const WPTR: u64 = 4104;
 const FENCE: u64 = 8188; // last dword of GMC's destination page
 const SEQUENCE: u32 = 0x9070_0048;
+const IRQ_FENCE: u64 = 8180; // separate from GC12 and initial SDMA fences
+const IRQ_SEQUENCE: u32 = 0x9070_7a48;
 const RESET: u32 = 0x0da8;
 const MCU_CNTL: u32 = 0x588e; // GC bank one, unlike ring registers
 const RB_CNTL: u32 = 0x80;
@@ -34,6 +38,7 @@ pub enum Error {
     DeviceGone,
     Timeout,
     DataMismatch,
+    Interrupts(crate::amdgpu_ih7::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -42,6 +47,8 @@ pub enum State {
     Programming,
     Submitted,
     Verified,
+    InterruptSubmitted,
+    InterruptVerified,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +56,13 @@ pub struct Proof {
     pub copied_bytes: u32,
     pub fence: u32,
     pub read_pointer: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptProof {
+    pub fence: u32,
+    pub read_pointer: u64,
+    /// A matching IH trap also advanced the configured CPU MSI counter.
+    pub msi_verified: bool,
 }
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -171,6 +185,20 @@ fn packets(aperture: gmc::Aperture) -> [u32; 32] {
     // Single-dword NOP pads the submission to a sixteen-dword boundary.
     words
 }
+fn interrupt_packets(address: u64) -> [u32; 16] {
+    let mut words = [0; 16];
+    // Linux sdma_v7_0_ring_emit_fence: uncached 32-bit FENCE followed by
+    // TRAP with zero interrupt context. Single-dword NOPs pad to 64 bytes.
+    words[..6].copy_from_slice(&[
+        0x30005,
+        address as u32,
+        (address >> 32) as u32,
+        IRQ_SEQUENCE,
+        6,
+        0,
+    ]);
+    words
+}
 async fn delay(us: u64) {
     narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
 }
@@ -182,6 +210,7 @@ struct Engine<I: Io> {
     memory: Reservation,
     state: State,
     proof: Option<Proof>,
+    interrupt_result: Option<Result<InterruptProof, Error>>,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -339,6 +368,112 @@ impl<I: Io> Engine<I> {
             delay(1000).await;
         }
     }
+    async fn prove_interrupts(
+        &mut self,
+        observer: &mut impl Observer,
+        aperture: gmc::Aperture,
+        target: MmioRegion,
+    ) -> Result<InterruptProof, Error> {
+        if self.state != State::Verified {
+            return Err(Error::Busy);
+        }
+        // Mark before any await: cancellation must never permit replay.
+        self.state = State::InterruptSubmitted;
+        let result = self.interrupt_inner(observer, aperture, target).await;
+        self.interrupt_result = Some(result);
+        self.state = if result.is_ok() {
+            State::InterruptVerified
+        } else {
+            State::Failed
+        };
+        result
+    }
+    async fn interrupt_inner(
+        &mut self,
+        observer: &mut impl Observer,
+        aperture: gmc::Aperture,
+        target: MmioRegion,
+    ) -> Result<InterruptProof, Error> {
+        let l = self.layout;
+        let map = self.memory.mapping();
+        if aperture.start >= (1 << 48) - (2 << 20)
+            || aperture.start % (2 << 20) != 0
+            || aperture.source != aperture.start
+            || aperture.destination != aperture.start + 4096
+            || aperture.size != 2 << 20
+            || target.len != 8192
+        {
+            return Err(Error::Invalid);
+        }
+        let sample = observer
+            .sample(Source::Sdma0)
+            .await
+            .map_err(Error::Interrupts)?;
+        self.access(|io| {
+            invalidate(io, l);
+            let end = (u64::from(checked(io.read(l.gc + 0x1615 * 4))? & 0xffffff) + 1) << 24;
+            if end != aperture.start {
+                return Err(Error::Invalid);
+            }
+            for reg in [RB_RPTR, RB_WPTR] {
+                if checked(io.read(l.gc + u64::from(reg) * 4))? != 128
+                    || checked(io.read(l.gc + u64::from(reg + 1) * 4))? != 0
+                {
+                    return Err(Error::Busy);
+                }
+            }
+            for offset in [RPTR, WPTR] {
+                if io.read_memory(map, offset) != 128 || io.read_memory(map, offset + 4) != 0 {
+                    return Err(Error::Busy);
+                }
+            }
+            // The IH service is the sole writer of SDMA0_CNTL after startup.
+            if checked(io.read(l.gc + 0x0d * 4))? & 1 == 0
+                || checked(io.read(l.gc + u64::from(RB_CNTL) * 4))? & 1 == 0
+            {
+                return Err(Error::Busy);
+            }
+            io.write_memory(target, IRQ_FENCE, 0);
+            for (i, word) in interrupt_packets(aperture.source + IRQ_FENCE)
+                .into_iter()
+                .enumerate()
+            {
+                io.write_memory(map, 128 + i as u64 * 4, word);
+            }
+            io.write_memory(map, WPTR, 192);
+            flush(io, l);
+            io.write(l.gc + u64::from(RB_WPTR) * 4, 192);
+            io.write(l.gc + u64::from(RB_WPTR + 1) * 4, 0);
+            Ok(())
+        })?;
+        let deadline = narf_time::Deadline::after_ms(1000);
+        loop {
+            let memory_done = self.access(|io| {
+                invalidate(io, l);
+                let lo = checked(io.read(l.gc + u64::from(RB_RPTR) * 4))?;
+                let hi = checked(io.read(l.gc + u64::from(RB_RPTR + 1) * 4))?;
+                let rptr = u64::from(lo) | (u64::from(hi) << 32);
+                let wb = u64::from(io.read_memory(map, RPTR))
+                    | (u64::from(io.read_memory(map, RPTR + 4)) << 32);
+                if rptr > 192 || wb > 192 {
+                    return Err(Error::DataMismatch);
+                }
+                Ok(rptr == 192 && wb == 192 && io.read_memory(target, IRQ_FENCE) == IRQ_SEQUENCE)
+            })?;
+            let event_done = observer.observed(sample).await.map_err(Error::Interrupts)?;
+            if memory_done && event_done {
+                return Ok(InterruptProof {
+                    fence: IRQ_SEQUENCE,
+                    read_pointer: 192,
+                    msi_verified: sample.vector.is_some(),
+                });
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay(1000).await;
+        }
+    }
 }
 #[derive(Debug)]
 pub struct Sdma {
@@ -370,6 +505,7 @@ impl Sdma {
                 memory: pool.reserve(BYTES).map_err(|_| Error::Allocation)?,
                 state: State::Prepared,
                 proof: None,
+                interrupt_result: None,
             },
         })
     }
@@ -388,6 +524,25 @@ impl Sdma {
     }
     pub fn proof(&self) -> Option<Proof> {
         self.engine.proof
+    }
+    /// Prove one additional kernel fence and SDMA0 queue0 trap after boot.
+    /// # Safety
+    /// Retain the matching ready GMC and initialized independent IH service,
+    /// which exclusively owns SDMA0_CNTL writes. Run from an executor task
+    /// with CPU IRQs enabled for MSI. Serialize access to all test pages and
+    /// this ring, excluding reset/PM and replay after failure/cancellation.
+    pub async unsafe fn prove_interrupts(
+        &mut self,
+        gmc: &mut gmc::Gmc,
+    ) -> Result<InterruptProof, Error> {
+        let aperture = gmc.aperture().ok_or(Error::Invalid)?;
+        let target = gmc.test_mapping().ok_or(Error::Invalid)?;
+        self.engine
+            .prove_interrupts(&mut NativeObserver, aperture, target)
+            .await
+    }
+    pub fn interrupt_result(&self) -> Option<Result<InterruptProof, Error>> {
+        self.engine.interrupt_result
     }
 }
 #[cfg(feature = "kernel-test")]

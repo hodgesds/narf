@@ -2,6 +2,7 @@ use super::*;
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+const SDMA: u64 = 0x10034;
 const GCTX: u64 = 0x15890;
 const MCTX: u64 = 0x21590;
 const GCP: u64 = 0x17828;
@@ -47,6 +48,7 @@ fn fixture() -> Engine<Fake> {
         (MCTX, 0xaaa801),
         (GCP, 0x84000000),
         (CCP, 0x84000000),
+        (SDMA, 0x40),
         (GCTL, 0x1ffc),
         (MCTL, 0x1ffc),
         (GST, 0x785753),
@@ -104,7 +106,8 @@ fn navi48_fault_arming_preserves_defaults_eops_and_inactive_user_contexts() -> T
             (GCTX, 0xfffc01),
             (MCTX, 0xfffc01),
             (GCP, 0x85c00000),
-            (CCP, 0x85800000)
+            (CCP, 0x85800000),
+            (SDMA, 0x41)
         ]
     );
     assert_eq!(e.io.regs[&GCTL], 0x1ffc);
@@ -117,6 +120,7 @@ fn navi48_fault_arming_preserves_defaults_eops_and_inactive_user_contexts() -> T
         (MCTX, 0xaaa801),
         (GCP, 0x84000000),
         (CCP, 0x84000000),
+        (SDMA, 0x40),
     ] {
         assert_eq!(e.io.regs[&at], value);
     }
@@ -164,11 +168,11 @@ fn navi48_vm_faults_decode_48bit_addresses_capture_then_ack_and_contain() -> Tes
         );
         assert_eq!(e.io.writes[0], (control, 0x1ffd));
         assert_eq!(e.io.regs[&control], 0x1ffc);
-        assert_eq!(e.io.writes.len(), 5);
+        assert_eq!(e.io.writes.len(), 6);
         // Already queued faults still get captured/acknowledged after masking.
         e.handle(v).unwrap();
         assert_eq!(e.status.count, 2);
-        assert_eq!(e.io.writes.len(), 6);
+        assert_eq!(e.io.writes.len(), 7);
         assert_eq!(e.enable(), Err(Error::Busy));
     }
     let p = Protection::decode(0x785753);
@@ -214,7 +218,7 @@ fn navi48_command_faults_use_exact_client_source_and_preserve_queue_identity() -
         );
         assert_eq!(record.protection, None);
         assert!(!record.acknowledged);
-        assert_eq!(e.io.writes.len(), 4);
+        assert_eq!(e.io.writes.len(), 5);
         assert!(!e.io.reads.contains(&GST) && !e.io.reads.contains(&MST));
     }
     let mut e = fixture();
@@ -235,7 +239,7 @@ kernel_test_in!(
 );
 
 fn navi48_fault_preflight_and_partial_programming_fail_without_reuse() -> TestResult {
-    for case in 0..7 {
+    for case in 0..8 {
         let mut e = fixture();
         let expected = match case {
             0 => {
@@ -261,6 +265,10 @@ fn navi48_fault_preflight_and_partial_programming_fail_without_reuse() -> TestRe
             5 => {
                 e.authority.revoke();
                 Error::Revoked
+            }
+            6 => {
+                e.io.regs.insert(SDMA, 0x41);
+                Error::Busy
             }
             _ => {
                 e.io.regs.insert(MCTX + 4, 1);
@@ -331,7 +339,7 @@ fn navi48_fault_mmio_failures_preserve_raw_evidence_and_uncertain_masks() -> Tes
                 Some(Error::Revoked)
             }
         );
-        assert_eq!(e.io.writes.len(), [0, 4, 1][case]);
+        assert_eq!(e.io.writes.len(), [0, 5, 1][case]);
         assert_eq!(e.enable(), Err(Error::Busy));
     }
     TestResult::Pass

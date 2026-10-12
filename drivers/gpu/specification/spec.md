@@ -492,8 +492,9 @@ sources. It requires active, nonretrying VMID0 in both hubs, inactive user
 contexts and no inherited enables in its source masks. It enables the seven
 VM protection-fault classes only for VMID0, plus bad-opcode/privileged-register
 faults for the owned graphics and compute pipes and privileged-instruction
-faults for graphics. It also enables the graphics/compute EOP sources; queue
-proofs only read those controls, so their setup cannot race fault masking.
+faults for graphics. It also enables the graphics/compute EOP sources and
+SDMA0 traps after the cold-start copy has drained; queue proofs only read
+those controls, so their setup cannot race fault masking.
 Readback is checked after each write. Default-page policy, user contexts and
 unrelated control bits are preserved; containment leaves EOP enables intact.
 
@@ -508,7 +509,7 @@ process. GC sources 183/184/185 classify bad opcodes, privileged registers and
 privileged instructions using native ME/pipe/queue bits. Other sources remain
 raw diagnostic events; they cause no monitor MMIO.
 
-The first recognized fault masks all owned fault sources and makes the monitor
+The first recognized fault masks all owned fault sources and SDMA0 traps and makes the monitor
 `Contained`; this masks reporting and does not establish engine quiescence.
 Already-queued VM faults are still recorded and acknowledged.
 `Status::faults` exposes the count, last typed record, monitor state and any mask
@@ -520,10 +521,13 @@ fault replay, user-process termination or reuse of failed allocations. SDMA,
 shader, poison and media fault handling remain separate open work.
 
 `Status` exposes the IH state/report, MSI setup outcome, receive/eviction counts,
-sticky last VM-fault vector and two kernel EOP counters. EOP classification
+sticky last VM-fault vector, two kernel EOP counters and an SDMA0 trap counter. EOP classification
 requires SOC21 GC/source 181, VMID/PASID zero and exact ME/pipe/queue identity:
 0/0/0 for graphics or 1/0/0 for compute. Doorbell payload is not used to select
-kernel queues; reserved ring bit 7 is ignored as in Linux. The counters survive
+kernel queues; reserved ring bit 7 is ignored as in Linux. SDMA classification
+requires GC/source 49, VMID/PASID zero and exact instance 0 / queue 0 (ring ID
+zero, including bit 7). User SDMA fence source 70 cannot complete this proof.
+The counters survive
 history consumption/eviction. A 64-entry diagnostic history records complete
 raw events; overwrites increment `evicted` and do not erase sticky fault data.
 Platform `poll_interrupts` consumes up to 32 history entries, independently of
@@ -542,6 +546,26 @@ bytes, fence, hardware read pointer and read-pointer writeback. HDP6 uses
 generic posted-write flushing with no HDP5 invalidate access. A failed or
 cancelled attempt cannot replay and retains its published allocation.
 The cold-boot owner retains GMC and SDMA throughout their consumers' lives.
+
+After service handoff, `unsafe Sdma::prove_interrupts(gmc).await` appends an
+uncached 32-bit fence followed by a native SDMA7 TRAP with zero context, padding
+the second submission to 64 bytes. Preflight requires the original 128-byte
+hardware and writeback pointers, the matching flat aperture, an enabled ring
+and the service-owned trap enable. The separate fence slot is cleared before
+publication; it does not overwrite either GC12 proof. Success requires the
+fresh fence, both hardware and writeback RPTR at 192 bytes, exactly one new
+matching IH trap, and an advancing CPU IRQ count when MSI is configured.
+`InterruptProof::msi_verified` distinguishes actual CPU delivery from polled IH
+observation. Faults, duplicates, routing changes and a one-second timeout fail
+closed. `InterruptSubmitted` is set before the first await; cancellation and
+failure prevent replay and retain published storage. `interrupt_result()`
+retains success/error separately from the initial copy proof.
+
+The platform's post-boot task serializes this proof after both GC12 interrupt
+proofs succeed, with the independent IH consumer still running. Cold-boot
+accessors and platform diagnostics expose `sdma_state` and `sdma_interrupts`.
+This verifies only the owned bootstrap ring; application submissions, SDMA
+fault dispatch, reset and physical interrupt validation remain open.
 
 `amdgpu_dmub_firmware::Image::prepare_dcn401` requires a DCN4 combined image
 and allocates a separate, bounded shared-state region alongside the existing

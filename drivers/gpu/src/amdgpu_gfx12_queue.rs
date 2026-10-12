@@ -3,7 +3,7 @@
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip, amdgpu_gmc_navi48 as gmc, amdgpu_mes12 as api, amdgpu_mes12_hw as mes,
-    amdgpu_navi48_interrupts as interrupts,
+    amdgpu_navi48_interrupts::{NativeObserver, Observer, Source},
     amdgpu_psp_ring::bank,
     amdgpu_vram::{Pool, Reservation},
 };
@@ -73,29 +73,6 @@ fn interrupt_packets(address: u64, pipe: usize) -> [u32; 256] {
     ]);
     words[8] = 0xc0f61000; // 248-dword NOP aligns the new WPTR to 512.
     words
-}
-trait Observer {
-    async fn sample(&mut self, pipe: usize)
-        -> Result<interrupts::Sample, crate::amdgpu_ih7::Error>;
-    async fn observed(
-        &mut self,
-        sample: interrupts::Sample,
-    ) -> Result<bool, crate::amdgpu_ih7::Error>;
-}
-struct NativeObserver;
-impl Observer for NativeObserver {
-    async fn sample(
-        &mut self,
-        pipe: usize,
-    ) -> Result<interrupts::Sample, crate::amdgpu_ih7::Error> {
-        interrupts::sample(pipe).await
-    }
-    async fn observed(
-        &mut self,
-        sample: interrupts::Sample,
-    ) -> Result<bool, crate::amdgpu_ih7::Error> {
-        interrupts::observed(sample).await
-    }
 }
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -458,7 +435,12 @@ impl<I: Io> Engine<I> {
         let mut msi_verified = true;
         for pipe in 0..2 {
             self.state = State::InterruptSubmitted(pipe as u8);
-            let sample = observer.sample(pipe).await.map_err(Error::Interrupts)?;
+            let source = if pipe == 0 {
+                Source::Graphics
+            } else {
+                Source::Compute
+            };
+            let sample = observer.sample(source).await.map_err(Error::Interrupts)?;
             msi_verified &= sample.vector.is_some();
             let off = pipe as u64 * PIPE_BYTES;
             let control = l.gc + if pipe == 0 { 0x1e0a * 4 } else { 0x1e25 * 4 };

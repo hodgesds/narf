@@ -15,6 +15,7 @@ pub struct Status {
     pub vm_faults: u64,
     pub last_fault: Option<ih::Event>,
     pub kernel_eop: [u64; 2],
+    pub sdma0_traps: u64,
     pub faults: faults::Status,
 }
 #[derive(Debug)]
@@ -27,6 +28,7 @@ struct History {
     vm_faults: u64,
     last_fault: Option<ih::Event>,
     kernel_eop: [u64; 2],
+    sdma0_traps: u64,
 }
 impl History {
     fn new() -> Self {
@@ -39,6 +41,7 @@ impl History {
             vm_faults: 0,
             last_fault: None,
             kernel_eop: [0; 2],
+            sdma0_traps: 0,
         }
     }
     fn push(&mut self, event: ih::Event) {
@@ -60,6 +63,16 @@ impl History {
                 self.kernel_eop[pipe] = self.kernel_eop[pipe].saturating_add(1);
             }
         }
+        // SDMA7 encodes instance in the high nibble and queue in the low
+        // nibble. Unlike CP, bit 7 is not reserved. Only SDMA0 queue0 is owned.
+        if event.vector.client == 0x0a
+            && event.vector.source == 49
+            && event.vector.ring == 0
+            && event.vector.vmid == 0
+            && event.vector.pasid == 0
+        {
+            self.sdma0_traps = self.sdma0_traps.saturating_add(1);
+        }
         if matches!(event.vector.client, 0x0a | 0x12) && event.vector.source == 0 {
             self.vm_faults = self.vm_faults.saturating_add(1);
             self.last_fault = Some(event);
@@ -71,6 +84,13 @@ impl History {
         }
         self.entries[(self.head + self.len) % self.entries.len()] = Some(event);
         self.len += 1;
+    }
+    fn count(&self, source: Source) -> u64 {
+        match source {
+            Source::Graphics => self.kernel_eop[0],
+            Source::Compute => self.kernel_eop[1],
+            Source::Sdma0 => self.sdma0_traps,
+        }
     }
     fn pop(&mut self) -> ih::Batch {
         let mut entries = [None; 32];
@@ -101,6 +121,7 @@ impl Service {
             vm_faults: self.history.vm_faults,
             last_fault: self.history.last_fault,
             kernel_eop: self.history.kernel_eop,
+            sdma0_traps: self.history.sdma0_traps,
             faults: self.faults.status(),
         }
     }
@@ -238,9 +259,28 @@ pub async fn poll() -> Result<ih::Batch, ih::Error> {
         .ok_or(ih::Error::Busy)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    Graphics,
+    Compute,
+    Sdma0,
+}
+pub(crate) trait Observer {
+    async fn sample(&mut self, source: Source) -> Result<Sample, ih::Error>;
+    async fn observed(&mut self, sample: Sample) -> Result<bool, ih::Error>;
+}
+pub(crate) struct NativeObserver;
+impl Observer for NativeObserver {
+    async fn sample(&mut self, source: Source) -> Result<Sample, ih::Error> {
+        sample(source).await
+    }
+    async fn observed(&mut self, sample: Sample) -> Result<bool, ih::Error> {
+        observed(sample).await
+    }
+}
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Sample {
-    pub pipe: usize,
+    pub source: Source,
     pub count: u64,
     pub cpu: u64,
     pub vector: Option<u8>,
@@ -263,10 +303,7 @@ impl Sample {
         Ok(!pending && count == expected && (vector.is_none() || cpu != self.cpu))
     }
 }
-pub(crate) async fn sample(pipe: usize) -> Result<Sample, ih::Error> {
-    if pipe >= 2 {
-        return Err(ih::Error::Invalid);
-    }
+async fn sample(source: Source) -> Result<Sample, ih::Error> {
     let mut slot = SERVICE.lock().await;
     let service = slot.as_mut().ok_or(ih::Error::Busy)?;
     if service.drain()? {
@@ -279,16 +316,16 @@ pub(crate) async fn sample(pipe: usize) -> Result<Sample, ih::Error> {
     if vector.is_some() && !narf_arch::interrupts_enabled() {
         return Err(ih::Error::Busy);
     }
-    let count = service.history.kernel_eop[pipe];
+    let count = service.history.count(source);
     count.checked_add(1).ok_or(ih::Error::Invalid)?;
     Ok(Sample {
-        pipe,
+        source,
         count,
         cpu: vector.map_or(0, narf_interrupts::fire_count),
         vector,
     })
 }
-pub(crate) async fn observed(sample: Sample) -> Result<bool, ih::Error> {
+async fn observed(sample: Sample) -> Result<bool, ih::Error> {
     let mut slot = SERVICE.lock().await;
     let service = slot.as_mut().ok_or(ih::Error::Busy)?;
     let pending = service.drain()?;
@@ -297,7 +334,7 @@ pub(crate) async fn observed(sample: Sample) -> Result<bool, ih::Error> {
     }
     let vector = service.routing.ok().flatten();
     sample.observed(
-        service.history.kernel_eop[sample.pipe],
+        service.history.count(sample.source),
         vector,
         vector.map_or(0, narf_interrupts::fire_count),
         pending,

@@ -9,6 +9,14 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 const GC: u64 = 0x10000;
 const NBIO: u64 = 0x30000;
 const HYP: u64 = 0x50000;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    Fence,
+    HardwarePointer,
+    Writeback,
+    Trap,
+    Cpu,
+}
 struct Fake {
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
@@ -21,6 +29,9 @@ struct Fake {
     fence_only: bool,
     progress: Arc<AtomicU32>,
     revoke: Option<(u64, u32, Cap<BusDeviceCap, Write>)>,
+    signals: Arc<[AtomicU32; 2]>,
+    omit: Option<Missing>,
+    overshoot: bool,
 }
 impl Fake {
     // Minimal independent decoder of the public SDMA6/7 SDMA packet ABI.
@@ -36,7 +47,8 @@ impl Fake {
             assert_eq!(address % 4, 0);
             ((address - 0xc_0000_0000) / 4) as usize
         };
-        let mut cursor = 0;
+        let irq = end == 192;
+        let mut cursor = self.regs[&(GC + 0x83 * 4)] as usize / 4;
         while cursor < end as usize / 4 {
             let words = &self.memory[cursor..];
             cursor += match words[0] {
@@ -57,8 +69,22 @@ impl Fake {
                 }
                 0x30005 => {
                     let dst = index(words[1], words[2]);
-                    self.target[dst] = words[3];
+                    if !irq || self.omit != Some(Missing::Fence) {
+                        self.target[dst] = words[3];
+                    }
                     4
+                }
+                6 => {
+                    assert!(irq);
+                    assert_eq!(words[1], 0);
+                    assert_eq!(self.regs[&(GC + 0x0d * 4)], 0x41);
+                    if self.omit != Some(Missing::Trap) {
+                        self.signals[0].fetch_add(1, Ordering::SeqCst);
+                    }
+                    if self.omit != Some(Missing::Cpu) {
+                        self.signals[1].fetch_add(1, Ordering::SeqCst);
+                    }
+                    2
                 }
                 _ => panic!("incorrect SDMA header"),
             };
@@ -68,9 +94,13 @@ impl Fake {
             self.target[1025] ^= 1;
         }
         if !self.fence_only {
-            self.regs.insert(GC + 0x83 * 4, end);
-            self.regs.insert(GC + 0x84 * 4, 0);
-            self.memory[1024] = end;
+            if !irq || self.omit != Some(Missing::HardwarePointer) {
+                self.regs.insert(GC + 0x83 * 4, end);
+                self.regs.insert(GC + 0x84 * 4, u32::from(self.overshoot));
+            }
+            if !irq || self.omit != Some(Missing::Writeback) {
+                self.memory[1024] = end;
+            }
         }
     }
 }
@@ -156,6 +186,9 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
             fence_only: false,
             progress: Arc::new(AtomicU32::new(0)),
             revoke: None,
+            signals: Arc::new([AtomicU32::new(5), AtomicU32::new(7)]),
+            omit: None,
+            overshoot: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -166,6 +199,7 @@ fn fixture() -> (Pool, Engine<Fake>, gmc::Aperture, MmioRegion) {
         memory: pool.reserve(BYTES).unwrap(),
         state: State::Prepared,
         proof: None,
+        interrupt_result: None,
     };
     (
         pool,
@@ -422,4 +456,245 @@ fn sdma_navi48_layout_rejects_wrong_versions_and_bank_bounds() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/sdma-navi48",
     sdma_navi48_layout_rejects_wrong_versions_and_bank_bounds
+);
+
+struct FakeObserver {
+    signals: Arc<[AtomicU32; 2]>,
+    msi: bool,
+    stall: u8,
+    reject: u8,
+}
+impl FakeObserver {
+    fn new(e: &mut Engine<Fake>) -> Self {
+        // Independent service owns this write, outside the SDMA engine.
+        e.io.regs.insert(GC + 0x0d * 4, 0x41);
+        e.io.writes.clear();
+        Self {
+            signals: e.io.signals.clone(),
+            msi: true,
+            stall: 0,
+            reject: 0,
+        }
+    }
+}
+impl Observer for FakeObserver {
+    async fn sample(
+        &mut self,
+        source: Source,
+    ) -> Result<crate::amdgpu_navi48_interrupts::Sample, crate::amdgpu_ih7::Error> {
+        assert_eq!(source, Source::Sdma0);
+        if self.stall == 1 {
+            core::future::pending::<()>().await;
+        }
+        if self.reject == 1 {
+            return Err(crate::amdgpu_ih7::Error::Protocol);
+        }
+        Ok(crate::amdgpu_navi48_interrupts::Sample {
+            source,
+            count: self.signals[0].load(Ordering::SeqCst).into(),
+            cpu: self.signals[1].load(Ordering::SeqCst).into(),
+            vector: self.msi.then_some(0x60),
+        })
+    }
+    async fn observed(
+        &mut self,
+        s: crate::amdgpu_navi48_interrupts::Sample,
+    ) -> Result<bool, crate::amdgpu_ih7::Error> {
+        assert_eq!(s.source, Source::Sdma0);
+        if self.stall == 2 {
+            core::future::pending::<()>().await;
+        }
+        if self.reject == 2 {
+            return Err(crate::amdgpu_ih7::Error::Protocol);
+        }
+        Ok(
+            u64::from(self.signals[0].load(Ordering::SeqCst)) == s.count + 1
+                && (!self.msi || u64::from(self.signals[1].load(Ordering::SeqCst)) != s.cpu),
+        )
+    }
+}
+fn sdma_navi48_trap_proof_requires_fresh_fence_drain_and_interrupt() -> TestResult {
+    for msi in [false, true] {
+        let (pool, mut e, a, map) = fixture();
+        let initial = run(e.initialize(a, map)).unwrap();
+        let mut o = FakeObserver::new(&mut e);
+        o.msi = msi;
+        // Old success values cannot substitute for the new submission.
+        e.io.target[2045] = 0x90707a48;
+        let proof = run(e.prove_interrupts(&mut o, a, map)).unwrap();
+        assert_eq!(
+            proof,
+            InterruptProof {
+                fence: 0x90707a48,
+                read_pointer: 192,
+                msi_verified: msi
+            }
+        );
+        assert_eq!(e.state, State::InterruptVerified);
+        assert_eq!(e.interrupt_result, Some(Ok(proof)));
+        assert_eq!(e.proof, Some(initial));
+        assert_eq!(
+            &e.io.memory[32..48],
+            &[0x30005, 0x1ff4, 0xc, 0x90707a48, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(e.io.target[2047], 0x90700048);
+        assert_eq!(e.io.memory[1026], 192);
+        assert!(!e.io.writes.iter().any(|&(at, _)| at == GC + 0x0d * 4));
+        assert_eq!(run(e.prove_interrupts(&mut o, a, map)), Err(Error::Busy));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi48",
+    sdma_navi48_trap_proof_requires_fresh_fence_drain_and_interrupt
+);
+
+fn sdma_navi48_trap_missing_evidence_faults_and_revocation_prevent_success() -> TestResult {
+    for case in 0..10 {
+        let (pool, mut e, a, map) = fixture();
+        run(e.initialize(a, map)).unwrap();
+        let mut o = FakeObserver::new(&mut e);
+        // Fence omission must fail even when the page held the right value.
+        e.io.target[2045] = 0x90707a48;
+        let expected = match case {
+            0..=4 => {
+                e.io.omit = Some(
+                    [
+                        Missing::Fence,
+                        Missing::HardwarePointer,
+                        Missing::Writeback,
+                        Missing::Trap,
+                        Missing::Cpu,
+                    ][case],
+                );
+                Error::Timeout
+            }
+            5 => {
+                e.io.overshoot = true;
+                Error::DataMismatch
+            }
+            6 => {
+                e.io.revoke = Some((GC + 0x85 * 4, 192, e.authority));
+                Error::Revoked
+            }
+            7 => {
+                e.authority.revoke();
+                Error::Revoked
+            }
+            _ => {
+                o.reject = if case == 8 { 1 } else { 2 };
+                Error::Interrupts(crate::amdgpu_ih7::Error::Protocol)
+            }
+        };
+        assert_eq!(run(e.prove_interrupts(&mut o, a, map)), Err(expected));
+        assert_eq!(e.state, State::Failed);
+        assert_eq!(e.interrupt_result, Some(Err(expected)));
+        assert!(e.proof.is_some());
+        assert_eq!(run(e.prove_interrupts(&mut o, a, map)), Err(Error::Busy));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi48",
+    sdma_navi48_trap_missing_evidence_faults_and_revocation_prevent_success
+);
+
+fn sdma_navi48_trap_preflight_rejects_wrong_aperture_and_ring_state() -> TestResult {
+    for case in 0..11 {
+        let (_, mut e, mut a, mut map) = fixture();
+        run(e.initialize(a, map)).unwrap();
+        let mut o = FakeObserver::new(&mut e);
+        let expected = match case {
+            0 => {
+                a.start = u64::MAX;
+                Error::Invalid
+            }
+            1 => {
+                a.destination += 4096;
+                Error::Invalid
+            }
+            2 => {
+                a.size = 4096;
+                Error::Invalid
+            }
+            3 => {
+                map.len = 4096;
+                Error::Invalid
+            }
+            4 => {
+                a.start += 2 << 20;
+                a.source = a.start;
+                a.destination = a.start + 4096;
+                Error::Invalid
+            }
+            5 => {
+                e.io.regs.insert(GC + 0x0d * 4, 0x40);
+                Error::Busy
+            }
+            6 => {
+                e.io.regs.insert(GC + 0x80 * 4, 0);
+                Error::Busy
+            }
+            7 => {
+                e.io.regs.insert(GC + 0x85 * 4, 192);
+                Error::Busy
+            }
+            8 => {
+                e.io.regs.insert(GC + 0x84 * 4, 1);
+                Error::Busy
+            }
+            9 => {
+                e.io.memory[1025] = 1;
+                Error::Busy
+            }
+            _ => {
+                e.io.memory[1027] = 1;
+                Error::Busy
+            }
+        };
+        assert_eq!(run(e.prove_interrupts(&mut o, a, map)), Err(expected));
+        assert!(!e
+            .io
+            .writes
+            .iter()
+            .any(|&(at, v)| at == GC + 0x85 * 4 && v == 192));
+        assert_eq!(e.io.memory[32], 0);
+        assert_eq!(e.io.target[2045], 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi48",
+    sdma_navi48_trap_preflight_rejects_wrong_aperture_and_ring_state
+);
+
+fn sdma_navi48_trap_cancellation_quarantines_before_and_after_submission() -> TestResult {
+    for stall in [1, 2] {
+        let (pool, mut e, a, map) = fixture();
+        run(e.initialize(a, map)).unwrap();
+        let mut o = FakeObserver::new(&mut e);
+        o.stall = stall;
+        {
+            let mut f = core::pin::pin!(e.prove_interrupts(&mut o, a, map));
+            assert!(f
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert_eq!(e.state, State::InterruptSubmitted);
+        assert_eq!(e.interrupt_result, None);
+        assert_eq!(e.io.memory[1026], if stall == 1 { 128 } else { 192 });
+        assert_eq!(run(e.prove_interrupts(&mut o, a, map)), Err(Error::Busy));
+        drop(e);
+        assert_eq!(pool.available(), 0);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/sdma-navi48",
+    sdma_navi48_trap_cancellation_quarantines_before_and_after_submission
 );

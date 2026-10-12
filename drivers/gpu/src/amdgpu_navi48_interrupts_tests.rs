@@ -112,7 +112,7 @@ kernel_test_in!(
 fn navi48_eop_observation_rejects_partial_history_duplicates_faults_and_route_changes() -> TestResult
 {
     let s = Sample {
-        pipe: 0,
+        source: Source::Graphics,
         count: 5,
         cpu: 7,
         vector: Some(0x60),
@@ -151,4 +151,37 @@ fn navi48_eop_observation_rejects_partial_history_duplicates_faults_and_route_ch
 kernel_test_in!(
     "drivers/gpu/navi48-interrupts",
     navi48_eop_observation_rejects_partial_history_duplicates_faults_and_route_changes
+);
+
+fn navi48_sdma_traps_require_exact_instance_queue_vmid_pasid_and_source() -> TestResult {
+    let mut h = History::new();
+    for ring in 0..=255 {
+        let mut e = event(0);
+        e.vector.source = 49;
+        e.vector.ring = ring;
+        h.push(e);
+    }
+    assert_eq!(h.sdma0_traps, 1); // bit 7 is part of the SDMA instance.
+    assert_eq!(h.kernel_eop, [0, 0]);
+    for case in 0..5 {
+        let mut e = event(0);
+        e.vector.source = 49;
+        match case {
+            0 => e.vector.client = 0x12,
+            1 => e.vector.source = 70, // user queue fence is not a kernel trap
+            2 => e.vector.source = 48,
+            3 => e.vector.vmid = 1,
+            _ => e.vector.pasid = 1,
+        }
+        h.push(e);
+    }
+    while !h.pop().is_empty() {}
+    assert_eq!(h.count(Source::Sdma0), 1);
+    assert_eq!(h.count(Source::Graphics), 0);
+    assert_eq!(h.count(Source::Compute), 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_sdma_traps_require_exact_instance_queue_vmid_pasid_and_source
 );

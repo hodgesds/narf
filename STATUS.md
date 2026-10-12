@@ -320,6 +320,14 @@ kernel-context EOP vector per queue. Configured MSI additionally requires CPU
 delivery for each proof; polling is reported separately. Faults, cancellation
 and missing evidence leave retained diagnostic state and prevent replay.
 This path has software models; physical MSI delivery remains unverified.
+After both GC12 proofs drain, the same executor task now verifies SDMA0's native
+fence/TRAP path. It requires fresh fence memory, matching hardware/writeback
+RPTRs, exactly one kernel SDMA0/queue0 trap and CPU delivery for configured MSI.
+The service owns SDMA trap enables and masks them after recognized faults;
+raw-history eviction cannot erase the completion count. Diagnostics retain
+the separate SDMA interrupt result, including failure/cancellation state.
+Negative models cover missing evidence, wrong contexts, revoked authority and
+cancelled submissions; this adds no application submission or recovery API.
 The independent service now arms native VMID0 protection faults in both hubs
 and the owned graphics/compute command exception sources. It decodes VM fault
 addresses and queue identities, snapshots hub status before acknowledgement,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::amdgpu_navi48_interrupts as interrupts;
 use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::{
     future::Future,
@@ -399,7 +400,7 @@ impl FakeObserver {
 impl Observer for FakeObserver {
     async fn sample(
         &mut self,
-        pipe: usize,
+        source: Source,
     ) -> Result<interrupts::Sample, crate::amdgpu_ih7::Error> {
         if self.stall {
             core::future::pending::<()>().await;
@@ -407,8 +408,13 @@ impl Observer for FakeObserver {
         if self.reject {
             return Err(crate::amdgpu_ih7::Error::Protocol);
         }
+        let pipe = match source {
+            Source::Graphics => 0,
+            Source::Compute => 1,
+            Source::Sdma0 => panic!("unexpected SDMA sample"),
+        };
         Ok(interrupts::Sample {
-            pipe,
+            source,
             count: self.counters[pipe].load(Ordering::SeqCst).into(),
             cpu: self.counters[2].load(Ordering::SeqCst).into(),
             vector: self.msi.then_some(0x60),
@@ -418,10 +424,15 @@ impl Observer for FakeObserver {
         &mut self,
         sample: interrupts::Sample,
     ) -> Result<bool, crate::amdgpu_ih7::Error> {
-        Ok(
-            u64::from(self.counters[sample.pipe].load(Ordering::SeqCst)) == sample.count + 1
-                && (!self.msi || u64::from(self.counters[2].load(Ordering::SeqCst)) != sample.cpu),
-        )
+        Ok(u64::from(
+            self.counters[match sample.source {
+                Source::Graphics => 0,
+                Source::Compute => 1,
+                Source::Sdma0 => panic!("unexpected SDMA sample"),
+            }]
+            .load(Ordering::SeqCst),
+        ) == sample.count + 1
+            && (!self.msi || u64::from(self.counters[2].load(Ordering::SeqCst)) != sample.cpu))
     }
 }
 fn gfx12_eop_proof_requires_each_engine_fence_vector_and_cpu_delivery() -> TestResult {

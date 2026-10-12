@@ -39,6 +39,9 @@ pub struct Diagnostics {
     pub queue_state: Option<crate::amdgpu_gfx12_queue::State>,
     pub queue_interrupts:
         Option<Result<crate::amdgpu_gfx12_queue::InterruptProof, crate::amdgpu_gfx12_queue::Error>>,
+    pub sdma_state: Option<crate::amdgpu_sdma_navi48::State>,
+    pub sdma_interrupts:
+        Option<Result<crate::amdgpu_sdma_navi48::InterruptProof, crate::amdgpu_sdma_navi48::Error>>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -51,6 +54,8 @@ pub fn status() -> Status {
                 interrupts: crate::amdgpu_navi48_interrupts::status(),
                 queue_state: boot.queue_state(),
                 queue_interrupts: boot.queue_interrupts(),
+                sdma_state: boot.sdma_state(),
+                sdma_interrupts: boot.sdma_interrupts(),
             })
         }),
     }
@@ -202,7 +207,11 @@ async fn prove_queue_interrupts() {
         // SAFETY: the platform retains matching owners and excludes reset/PM.
         // The proof checks CPU IRQ state before submitting any command. Its
         // result/cancellation state remains visible in the retained queues.
-        let _ = unsafe { boot.prove_queue_interrupts().await };
+        if unsafe { boot.prove_queue_interrupts().await }.is_ok() {
+            // SAFETY: GC12 has drained; the same exclusive owner serializes
+            // SDMA against all other users of the retained GMC test pages.
+            let _ = unsafe { boot.prove_sdma_interrupts().await };
+        }
     }
 }
 
