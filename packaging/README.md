@@ -184,6 +184,50 @@ boots the ISO through OVMF, rebuilds the publishable non-smoke ISO,
 and builds packages in distribution containers. It uploads the ISO,
 its checksum, and packages only after all jobs succeed.
 
+## Crate version pull requests
+
+Crate versions are independent from the kernel/package release version. A
+crate opts into automated version preparation only when its manifest has both
+an explicit version and:
+
+```toml
+[package.metadata.narf]
+release-managed = true
+```
+
+Workspace-inherited versions are intentionally ignored. Prepare one or more
+point releases locally with:
+
+```sh
+cargo xtask crate-release bump --package narf-tpm --package narf-i3c
+cargo xtask crate-release check --package narf-tpm --package narf-i3c
+```
+
+Use `--set narf-tpm=0.2.0` when an exact non-patch version is required. The
+bump updates registry requirements for internal path dependencies and may add
+a release-managed dependent only if its existing requirement no longer accepts
+the new version. It does not commit, tag, push, or publish.
+
+The `Crate version pull request` workflow exposes the same package and exact
+version selections through manual dispatch. Its monthly run uses publication
+tags named `crate/NAME/vVERSION` and opens a PR only for crates with owned-file
+changes since that tag. A crate with no matching tag is skipped, which keeps
+unpublished crates held back while desktop support is still incomplete. Set
+the repository variable `NARF_MONTHLY_CRATE_BUMPS=true` only when periodic PRs
+should begin. The workflow deliberately has no crates.io token and cannot
+publish; publication will be a separate maintainer-approved gate. After it
+opens the PR, it explicitly dispatches the normal CI workflow on the new head
+because GitHub suppresses recursive pull-request events from `GITHUB_TOKEN`.
+
+The separate `Distribution packaging readiness` workflow builds both kernel
+architectures each week, then constructs packages in Debian, Ubuntu, Fedora,
+Arch, and Gentoo containers. Native x86_64 packages are installed, queried,
+and removed inside their disposable container; cross-architecture and Gentoo
+outputs receive structural checks. It uploads short-lived Actions artifacts,
+not release assets. Manual dispatch is always available. Scheduled runs remain
+dormant until `NARF_DISTRO_READINESS=true`, so the matrix can be enabled after
+the remaining distro fixes land without changing the workflow again.
+
 The ordinary package test verifies the isolated ESP layout and native package
 hooks on both architectures. `packaging/test-uefi-boot.sh` adds the end-to-end x86_64 acceptance
 path: OVMF launches an installed-style GRUB build, the generated NARF stanza

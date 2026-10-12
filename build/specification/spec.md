@@ -172,6 +172,20 @@ and CI compiler-cache integration.
 - `cargo xtask host-test` — run the fast host unit-test allowlist.
   Only hardware-independent crates belong here; privileged, linker-script,
   and device integration coverage remains under `xtask test`.
+- `cargo xtask crate-release list|bump|check` manages crates.io preparation
+  without uploading. A publishable package opts in with an explicit
+  `[package].version` and `package.metadata.narf.release-managed = true`;
+  workspace-inherited versions are never rewritten. `bump --package NAME`
+  advances only that crate's patch version, repeatable `--set NAME=VERSION`
+  supports an exact independent version, and `--changed-since-tags` selects
+  crates whose owned files changed after `crate/NAME/vCURRENT`. Missing
+  publication tags are reported and skipped. A bump adds or repairs registry
+  requirements on the selected crate's internal path dependencies and expands
+  to a release-managed dependent only when its existing requirement excludes
+  the new version. `check` verifies those requirements, constructs the crate
+  archive with checkout-local patches for not-yet-published internal crates,
+  enforces crates.io's archive-size limit, and never uploads, commits, tags,
+  or pushes.
 - `cargo xtask bpf-bench --arch=x86_64 --baseline <record.json>` — collect the
   BPF suite and compare each compatible metric with a previous green-main
   §8.8 record. `--release-baseline <record.json>` adds the cumulative

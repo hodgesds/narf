@@ -1,0 +1,122 @@
+name: Crate version pull request
+
+on:
+  schedule:
+    # First day of each month. Scheduled runs remain dormant until the
+    # repository variable NARF_MONTHLY_CRATE_BUMPS is set to true.
+    - cron: "23 9 1 * *"
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: Comma-separated release-managed crates to patch-bump
+        required: false
+        type: string
+      exact_versions:
+        description: Comma-separated NAME=VERSION overrides
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: crate-version-pr
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || vars.NARF_MONTHLY_CRATE_BUMPS == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Prepare independent crate versions
+        id: bump
+        env:
+          REQUESTED_PACKAGES: ${{ inputs.packages }}
+          EXACT_VERSIONS: ${{ inputs.exact_versions }}
+        run: |
+          args=(crate-release bump --output target/crate-release-selected.txt)
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]] ||
+             [[ -z "$REQUESTED_PACKAGES" && -z "$EXACT_VERSIONS" ]]; then
+            args+=(--changed-since-tags)
+          else
+            IFS=',' read -ra packages <<< "$REQUESTED_PACKAGES"
+            for package in "${packages[@]}"; do
+              package="${package//[[:space:]]/}"
+              [[ -z "$package" ]] && continue
+              [[ "$package" =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
+                echo "invalid crate name: $package" >&2
+                exit 2
+              }
+              args+=(--package "$package")
+            done
+            IFS=',' read -ra versions <<< "$EXACT_VERSIONS"
+            for assignment in "${versions[@]}"; do
+              assignment="${assignment//[[:space:]]/}"
+              [[ -z "$assignment" ]] && continue
+              [[ "$assignment" =~ ^[a-z0-9][a-z0-9-]*=[0-9A-Za-z.+-]+$ ]] || {
+                echo "invalid crate version assignment: $assignment" >&2
+                exit 2
+              }
+              args+=(--set "$assignment")
+            done
+          fi
+          cargo xtask "${args[@]}"
+          if [[ -s target/crate-release-selected.txt ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No release-managed crate changed since its publication tag." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Validate prepared crates
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          args=(crate-release check)
+          while IFS= read -r package; do
+            [[ -n "$package" ]] && args+=(--package "$package")
+          done < target/crate-release-selected.txt
+          cargo xtask "${args[@]}"
+          cargo test -p xtask crate_release::tests
+          cargo fmt --all --check
+          git diff --check
+
+      - name: Open version pull request
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          branch="automation/crate-bumps-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -u
+          git commit -m "chore(crates): prepare independent version bumps"
+          git push origin "HEAD:$branch"
+
+          body=target/crate-release-pr.md
+          {
+            printf '%s\n\n' 'This automated PR prepares independently versioned crates for a point release.'
+            printf '%s\n' 'Selected crates:'
+            while IFS= read -r package; do
+              [[ -n "$package" ]] && printf -- '- `%s`\n' "$package"
+            done < target/crate-release-selected.txt
+            printf '\n%s\n' 'The workflow added/updated registry requirements for local path dependencies, package-checked each selected crate, and did not publish anything.'
+          } > "$body"
+          gh pr create \
+            --base "$BASE_BRANCH" \
+            --head "$branch" \
+            --title "chore(crates): prepare independent version bumps" \
+            --body-file "$body"
+          # GITHUB_TOKEN-authored pushes intentionally do not recurse into
+          # pull_request workflows. Dispatch CI explicitly on the PR head.
+          gh workflow run ci.yml --ref "$branch"

@@ -31,6 +31,7 @@ mod bench_stats;
 mod bpf_bench;
 mod ci_clippy;
 mod composition;
+mod crate_release;
 /// The `affected` subcommand: crate reverse-dependency closure → the set
 /// of CI jobs/subsystems a diff can affect. Its pure core is unit-tested.
 mod passthrough;
@@ -72,6 +73,9 @@ enum Cmd {
 
     /// Lint changed packages, without linting their dependencies.
     ClippyChanged(ci_clippy::Args),
+    /// Plan, validate, or prepare independently versioned crates for release.
+    /// This never uploads a crate or creates a git commit.
+    CrateRelease(crate_release::Args),
     /// Check the host is set up to pass a PCIe device through to QEMU, and
     /// print the launch recipe.
     ///
@@ -11407,6 +11411,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::ClippyChanged(args) => ci_clippy::run(&args, &workspace_root()?),
+        Cmd::CrateRelease(args) => crate_release::run(&args, &workspace_root()?),
         Cmd::Affected(args) => {
             let root = workspace_root()?;
             affected::affected_cmd(&args, &root)

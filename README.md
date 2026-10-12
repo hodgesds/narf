@@ -216,6 +216,12 @@ See [External kernel composition](docs/extending/composition.md) for the
 manifest, crate entry contract, static/load-time domain selection, signing,
 and image behavior.
 
+Maintainers can prepare independently versioned crate releases without tying
+them to the kernel version. See the
+[developer guide](docs/DEVELOPER_GUIDE.md#prepare-an-independent-crate-point-release)
+for point bumps, local package preflight, and the review-only monthly PR
+workflow. Crates.io publication is not enabled yet.
+
 **Hardware profiles** isolate driver paths under `cargo xtask run`:
 
 ```sh

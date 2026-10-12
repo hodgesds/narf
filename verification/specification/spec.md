@@ -52,6 +52,24 @@ production boot and host interoperability postflight.
 | Stress / soak   | dedicated HW  | pre-release | leaks, drift, long-running correctness      |
 | Formal (opt-in) | host          | when claimed | proven invariants on small TCB cores      |
 
+Release-readiness automation is review-producing rather than self-releasing.
+The monthly crate-version workflow is dormant until the repository variable
+`NARF_MONTHLY_CRATE_BUMPS=true` is set. It selects only explicitly
+release-managed crates changed since their per-crate publication tags,
+package-checks the resulting archives, and opens a pull request. Manual runs
+may select independent patch or exact versions at any time. Neither path has a
+crates.io token or a publication step. The job explicitly dispatches the
+ordinary CI workflow on the created branch because GitHub suppresses recursive
+pull-request events from its own workflow token.
+
+The weekly distribution-readiness workflow is likewise dormant until
+`NARF_DISTRO_READINESS=true` (manual dispatch remains available). It builds
+both package architectures across Debian, Ubuntu, Fedora, Arch, and Gentoo;
+native x86_64 packages must survive install/query/remove in disposable
+containers, while cross-architecture and Gentoo artifacts receive structural
+validation. It uploads only short-lived CI artifacts and never creates a
+release.
+
 ## 4. Unit tests
 
 - Live in each crate as `#[cfg(test)]` modules or `tests/` dir.

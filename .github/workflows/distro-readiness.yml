@@ -1,0 +1,168 @@
+name: Distribution packaging readiness
+
+on:
+  schedule:
+    - cron: "41 6 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: distro-readiness
+  cancel-in-progress: false
+
+jobs:
+  kernel:
+    if: github.event_name == 'workflow_dispatch' || vars.NARF_DISTRO_READINESS == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          components: rust-src llvm-tools-preview
+      - name: Install Limine
+        uses: ./.github/actions/setup-limine
+      - name: Build x86_64 and aarch64 package payloads
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          cargo xtask build --arch=x86_64
+          sudo apt-get update
+          sudo apt-get install -y mtools
+          cargo xtask image --arch=aarch64
+          mkdir -p target/narf-uefi
+          cp "$LIMINE_PATH/BOOTX64.EFI" target/narf-uefi/BOOTX64.EFI
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distro-readiness-kernel
+          retention-days: 7
+          path: |
+            target/x86_64-unknown-none/release/narf-frame
+            target/narf-uefi/BOOTX64.EFI
+            target/narf-frame-aarch64.efi-elf
+            target/narf-uefi-aarch64/narf.efi
+
+  packages:
+    needs: kernel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:stable
+            distro: debian
+            format: deb
+            arch: x86_64
+            native: true
+            install: apt-get update && apt-get install -y dpkg-dev git python3
+          - image: ubuntu:latest
+            distro: ubuntu
+            format: deb
+            arch: x86_64
+            native: true
+            install: apt-get update && apt-get install -y dpkg-dev git python3
+          - image: fedora:latest
+            distro: fedora
+            format: rpm
+            arch: x86_64
+            native: true
+            install: dnf install -y git rpm-build python3
+          - image: archlinux:latest
+            distro: arch
+            format: arch
+            arch: x86_64
+            native: true
+            install: pacman -Syu --noconfirm base-devel git python
+          - image: gentoo/stage3:latest
+            distro: gentoo
+            format: gentoo
+            arch: x86_64
+            native: false
+            install: emerge --sync && emerge dev-lang/python dev-vcs/git
+          - image: debian:stable
+            distro: debian
+            format: deb
+            arch: aarch64
+            native: false
+            install: apt-get update && apt-get install -y dpkg-dev git python3
+          - image: ubuntu:latest
+            distro: ubuntu
+            format: deb
+            arch: aarch64
+            native: false
+            install: apt-get update && apt-get install -y dpkg-dev git python3
+          - image: fedora:latest
+            distro: fedora
+            format: rpm
+            arch: aarch64
+            native: false
+            install: dnf install -y git rpm-build python3
+          - image: archlinux:latest
+            distro: arch
+            format: arch
+            arch: aarch64
+            native: false
+            install: pacman -Syu --noconfirm base-devel git python
+          - image: gentoo/stage3:latest
+            distro: gentoo
+            format: gentoo
+            arch: aarch64
+            native: false
+            install: emerge --sync && emerge dev-lang/python dev-vcs/git
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    steps:
+      - run: ${{ matrix.install }}
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: distro-readiness-kernel
+          path: target
+      - name: Build native package
+        env:
+          VERSION: 0.0.0-readiness.${{ github.run_number }}
+        run: packaging/build-release.sh --version "$VERSION" --arch "${{ matrix.arch }}" --skip-build --formats "${{ matrix.format }}"
+      - name: Inspect package contents
+        env:
+          FORMAT: ${{ matrix.format }}
+          VERSION: 0.0.0-readiness.${{ github.run_number }}
+        run: |
+          out="target/release-assets/$VERSION"
+          case "$FORMAT" in
+            deb) dpkg-deb --info "$out"/*.deb && dpkg-deb --contents "$out"/*.deb >/dev/null ;;
+            rpm) rpm -qpl "$out"/*.rpm >/dev/null ;;
+            arch) tar -tf "$out"/*.pkg.tar.* >/dev/null ;;
+            gentoo)
+              test -s "$out/gentoo/sys-kernel/narf-kernel/narf-$VERSION-${{ matrix.arch }}.tar.gz"
+              test -s "$out/gentoo/sys-kernel/narf-kernel/narf-kernel-$VERSION.ebuild"
+              ;;
+          esac
+      - name: Install, query, and remove native package
+        if: matrix.native
+        env:
+          FORMAT: ${{ matrix.format }}
+          VERSION: 0.0.0-readiness.${{ github.run_number }}
+        run: |
+          out="target/release-assets/$VERSION"
+          case "$FORMAT" in
+            deb)
+              dpkg -i "$out"/*.deb
+              dpkg-query -W narf-kernel
+              dpkg -r narf-kernel
+              ;;
+            rpm)
+              rpm -ivh --nodeps "$out"/*.rpm
+              rpm -q narf-kernel
+              rpm -e narf-kernel
+              ;;
+            arch)
+              pacman -U --noconfirm "$out"/*.pkg.tar.*
+              pacman -Q narf-kernel
+              pacman -R --noconfirm narf-kernel
+              ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distro-${{ matrix.distro }}-${{ matrix.arch }}-${{ strategy.job-index }}
+          retention-days: 7
+          path: target/release-assets/0.0.0-readiness.${{ github.run_number }}
