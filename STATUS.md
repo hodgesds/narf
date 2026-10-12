@@ -425,7 +425,16 @@ frontend/FIFO reset acknowledgements. It checks retained live clock references,
 source/OPP state and fresh sink lock before reporting readiness. Matching
 frontend shutdown waits for clocks off before detaching routes and returning
 to the trained link; cancellation/failure retain ownership and block replay.
-Video enable, M/N generation, running timing and surface scanout are still open.
+Native legacy DP black video now starts the matching staged OTG/OPP pattern,
+requires fresh frame progress, seeds M/N and follows steering/video/resync FIFO
+startup with native priming delays and independent acknowledgements. Fresh sink
+lock, source/route/clock checks and subsequent frame progress precede completion.
+All memory fetchers stay stopped. Matching shutdown waits for video-off before
+steering reset and native timing retirement, then returns to the prepared
+frontend for restart or link shutdown. Failure/cancellation quarantine the
+owner and retain resources. Model coverage includes all independent routes,
+lost acknowledgements, stalled frames, late changes and every async phase.
+Physical output remains unvalidated; native surface scanout remains open.
 eDP, remaining sink/MST/audio teardown and USB-C/ACPI PHY interlocks still need
 their sequences. Remaining PHY/link and plane programming, surface scanout
 enable, active-stream transitions, bandwidth/watermarks and complete native

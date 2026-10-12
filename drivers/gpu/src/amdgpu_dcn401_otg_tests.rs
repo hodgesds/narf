@@ -163,6 +163,7 @@ impl Io for Fake {
                         0x20ac, 0x20ad, 0x20ae, 0x20af, 0x20b0, 0x20bc, 0x211e, 0x2122, 0x2123,
                         0x2125, 0x212e, 0x20bb, 0x20bd, 0x2121, 0x2134, 0x212d, 0x2133, 0x2129,
                         0x2093, 0x211f, 0x2120, 0x2124, 0x2162, 0x2163, 0x2164, 0x2165, 0x2146,
+                        0x2126, 0x2127, 0x2128,
                     ]
                     .iter()
                     .any(|r| at == BASE + (r + p * 0x124) * 4)
@@ -332,6 +333,7 @@ fn engine() -> Engine<Fake> {
             dp_phy_ready: None,
             dp_link_trained: None,
             dp_frontend_ready: None,
+            dp_video_running: None,
             hpo_link_retired: None,
             hpo_dp_disabled: None,
             hdmi_tmds_retired: None,

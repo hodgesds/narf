@@ -6,7 +6,7 @@ use crate::dp_link_training::{LinkRate, TrainingPattern};
 pub use dmub::DpDriveSettings;
 #[path = "amdgpu_dcn401_dp_frontend.rs"]
 mod frontend;
-pub use frontend::{DpFrontendReady, DpFrontendRequest};
+pub use frontend::{DpFrontendReady, DpFrontendRequest, DpVideoRunning};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpTrainingError {
@@ -206,14 +206,15 @@ async fn sink_config(io: &mut impl Transport, plan: DpLinkTrained) -> Result<(),
 }
 impl<I: Io> Engine<I> {
     fn dp_training_verify(&mut self, plan: DpLinkTrained) -> Result<(), Error> {
-        self.dp_training_verify_owned(plan, None)
+        self.dp_training_verify_owned(plan, None, None)
     }
     fn dp_training_verify_owned(
         &mut self,
         plan: DpLinkTrained,
         frontend: Option<u8>,
+        timing: Option<u8>,
     ) -> Result<(), Error> {
-        self.dp_phy_configuration_owned(plan.phy, frontend)?;
+        self.dp_phy_configuration_owned(plan.phy, frontend, timing)?;
         self.dp_phy_witnesses(plan.phy)?;
         for ((at, mask), expected) in plan.registers(self.layout).into_iter().zip(plan.controls) {
             if self.read(at)? & mask != expected {

@@ -64,10 +64,12 @@ struct Link {
     defer: u8,
     ignore: Option<u32>,
     step: usize,
+    progress: Arc<AtomicU32>,
 }
 impl Link {
     async fn step(&mut self) -> Result<(), dmub::Error> {
         self.step += 1;
+        self.progress.store(self.step as u32, Ordering::SeqCst);
         if let Some((n, at, value)) = self.sink_change {
             if self.step == n {
                 self.bytes.insert(at, value);
@@ -217,6 +219,7 @@ fn fixture(p: u8, lanes: u8, rate: LinkRate, pattern: TrainingPattern) -> (Engin
         defer: 0,
         ignore: None,
         step: 0,
+        progress: Arc::new(AtomicU32::new(0)),
     };
     link.set(
         0,

@@ -11,6 +11,7 @@ pub use dmub::DpPhySettings;
 pub(super) mod training;
 pub use training::{
     DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkTrained, DpTrainingError,
+    DpVideoRunning,
 };
 
 const LANES_MASK: u32 = 0x3e3e3e3e;
@@ -80,13 +81,19 @@ fn active_lanes(value: u32, count: u8) -> Option<u8> {
 }
 impl<I: Io> Engine<I> {
     fn dp_phy_consumers(&mut self, phy: u8) -> Result<(), Error> {
-        self.dp_phy_consumers_owned(phy, None)
+        self.dp_phy_consumers_owned(phy, None, None)
     }
-    fn dp_phy_consumers_owned(&mut self, phy: u8, frontend: Option<u8>) -> Result<(), Error> {
+    fn dp_phy_consumers_owned(
+        &mut self,
+        phy: u8,
+        frontend: Option<u8>,
+        timing: Option<u8>,
+    ) -> Result<(), Error> {
         let l = self.layout;
         let at = |r| DpStream::Dio(phy).at(l, r);
-        // All outputs must be stopped, except the selected backend/PHY whose
-        // transitions have their own witnesses. No inherited active-link adoption.
+        // The selected backend/PHY and any retained frontend/timing have their
+        // own configuration and transition witnesses. All unrelated consumers
+        // must be stopped. No inherited active-link adoption.
         for (reg, mask) in l.idle {
             if [
                 at(0x20bb),
@@ -96,10 +103,11 @@ impl<I: Io> Engine<I> {
             ]
             .contains(&reg)
                 || frontend.is_some_and(|f| {
-                    [0x2094, 0x2095, 0x209b]
+                    [0x2094, 0x2095, 0x209b, 0x2122]
                         .iter()
                         .any(|&r| reg == DpStream::Dio(f).at(l, r))
                 })
+                || timing.is_some_and(|p| reg == l.otg(p, CONTROL) || reg == l.otg(p, CLOCK))
             {
                 continue;
             }
@@ -157,14 +165,15 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     fn dp_phy_configuration(&mut self, plan: DpPhyReady) -> Result<(), Error> {
-        self.dp_phy_configuration_owned(plan, None)
+        self.dp_phy_configuration_owned(plan, None, None)
     }
     fn dp_phy_configuration_owned(
         &mut self,
         plan: DpPhyReady,
         frontend: Option<u8>,
+        timing: Option<u8>,
     ) -> Result<(), Error> {
-        self.dp_phy_consumers_owned(plan.path.transmitter, frontend)?;
+        self.dp_phy_consumers_owned(plan.path.transmitter, frontend, timing)?;
         for ((at, mask), expected) in plan.registers(self.layout).into_iter().zip(plan.controls) {
             if self.read(at)? & mask != expected {
                 return Err(Error::Readback(at));

@@ -13,6 +13,21 @@ pub struct BlankRunning {
     pub frame_before: u32,
     pub frame_after: u32,
 }
+impl BlankApplied {
+    pub(in crate::amdgpu_dcn401_otg) fn timeout_us(self) -> Result<u64, Error> {
+        let t = self.timing.request.timing;
+        if t.pixel_clock_khz == 0 {
+            return Err(Error::Invalid);
+        }
+        let frame_us = (u64::from(t.h_total) * u64::from(t.v_total) * 1000)
+            .div_ceil(u64::from(t.pixel_clock_khz));
+        let timeout_us = frame_us * 3 + 5000;
+        if timeout_us > 1_000_000 {
+            return Err(Error::Invalid);
+        }
+        Ok(timeout_us)
+    }
+}
 impl<I: Io> Engine<I> {
     fn expect(&mut self, at: u64, mask: u32, value: u32) -> Result<(), Error> {
         if self.read(at)? & mask != value {
@@ -25,6 +40,15 @@ impl<I: Io> Engine<I> {
         blank: BlankApplied,
         plan: Plan,
         running: bool,
+    ) -> Result<(), Error> {
+        self.verify_blank_route(blank, plan, running, true)
+    }
+    pub(in crate::amdgpu_dcn401_otg) fn verify_blank_route(
+        &mut self,
+        blank: BlankApplied,
+        plan: Plan,
+        running: bool,
+        connected: bool,
     ) -> Result<(), Error> {
         let l = self.layout;
         let p = blank.request.pipe;
@@ -39,7 +63,12 @@ impl<I: Io> Engine<I> {
             (
                 l.odm(p, SOURCE),
                 0xffff0003,
-                0xfff00000 | u32::from(p) << 16,
+                0xfff00000
+                    | if connected {
+                        u32::from(p) << 16
+                    } else {
+                        0xf0000
+                    },
             ),
             (l.odm(p, MEMORY), 0xffff, 0),
             (l.odm(p, FORMAT), 0x33, 0),
@@ -53,7 +82,20 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    async fn enable_blank(
+    pub(in crate::amdgpu_dcn401_otg) async fn enable_blank(
+        &mut self,
+        blank: BlankApplied,
+        timeout_us: u64,
+    ) -> Result<BlankRunning, Error> {
+        let l = self.layout;
+        let p = blank.request.pipe;
+        // Native DCN401 workaround requires VTG before master enable.
+        self.update(l.odm(p, SOURCE), 0xf0000, u32::from(p) << 16)?;
+        self.update(l.vtg(p), 0x80000000, 0x80000000)?;
+        self.update(l.otg(p, CONTROL), 0x301, 0x201)?;
+        self.wait_blank_frames(blank, timeout_us).await
+    }
+    pub(in crate::amdgpu_dcn401_otg) async fn wait_blank_frames(
         &mut self,
         blank: BlankApplied,
         timeout_us: u64,
@@ -61,10 +103,6 @@ impl<I: Io> Engine<I> {
         let l = self.layout;
         let p = blank.request.pipe;
         let deadline = narf_time::Deadline::after_us(timeout_us);
-        // Native DCN401 workaround requires VTG before master enable.
-        self.update(l.odm(p, SOURCE), 0xf0000, u32::from(p) << 16)?;
-        self.update(l.vtg(p), 0x80000000, 0x80000000)?;
-        self.update(l.otg(p, CONTROL), 0x301, 0x201)?;
         let mut before = None;
         loop {
             // Recheck each witness together. A cleared pending bit without a
@@ -87,14 +125,6 @@ impl<I: Io> Engine<I> {
                         self.fetchers_stopped()?;
                         self.verify_blank(blank, blank.timing.request.plan()?, true)?;
                         self.expect(l.otg(p, CONTROL), 0x10301, 0x10201)?;
-                        for (at, mask) in l.idle {
-                            if at != l.otg(p, CONTROL)
-                                && at != l.otg(p, CLOCK)
-                                && self.read(at)? & mask != 0
-                            {
-                                return Err(Error::Busy);
-                            }
-                        }
                         return Ok(BlankRunning {
                             blank,
                             frame_before: first,
@@ -128,19 +158,27 @@ impl<I: Io> Engine<I> {
         }
         request.validate_clock(clock)?;
         let plan = request.plan()?;
-        let t = request.timing;
-        let frame_us = (u64::from(t.h_total) * u64::from(t.v_total) * 1000)
-            .div_ceil(u64::from(t.pixel_clock_khz));
-        let timeout_us = frame_us * 3 + 5000;
-        if timeout_us > 1_000_000 {
-            return Err(Error::Invalid);
-        }
+        let timeout_us = blank.timeout_us()?;
         self.fetchers_stopped()?;
         self.verify_blank(blank, plan, false)?;
         // Set before the first write/await. Dropping this future quarantines
         // timing and prevents ordinary retirement or any clock reprogramming.
         self.status.state = State::StartingBlank(pipe);
-        match self.enable_blank(blank, timeout_us).await {
+        let result = async {
+            let running = self.enable_blank(blank, timeout_us).await?;
+            let l = self.layout;
+            for (at, mask) in l.idle {
+                if at != l.otg(pipe, CONTROL)
+                    && at != l.otg(pipe, CLOCK)
+                    && self.read(at)? & mask != 0
+                {
+                    return Err(Error::Busy);
+                }
+            }
+            Ok(running)
+        }
+        .await;
+        match result {
             Ok(running) => {
                 self.status.running_blank = Some(running);
                 self.status.state = State::RunningBlank(pipe);

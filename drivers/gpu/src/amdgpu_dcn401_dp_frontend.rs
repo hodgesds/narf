@@ -3,6 +3,10 @@
 //! dccg401_enable_symclk_se. The frontend, OTG and PHY are independent indices.
 use super::*;
 
+#[path = "amdgpu_dcn401_dp_video.rs"]
+mod video;
+pub use video::DpVideoRunning;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DpFrontendRequest {
     pub stream: u8,
@@ -43,20 +47,37 @@ impl DpFrontendReady {
 }
 impl<I: Io> Engine<I> {
     fn dp_frontend_verify(&mut self, plan: DpFrontendReady) -> Result<(), Error> {
+        self.dp_frontend_verify_source(plan, None, false)?;
         let l = self.layout;
         let r = plan.request;
-        self.dp_training_verify_owned(plan.link, Some(r.stream))?;
         self.verify_blank(plan.blank, plan.blank.timing.request.plan()?, false)?;
-        for (at, mask) in [
-            (l.otg(r.pipe, LOCK), 0x101),
-            (l.otg(r.pipe, CONTROL), 0x10001),
-        ] {
-            if self.read(at)? & mask != 0 {
-                return Err(Error::Busy);
-            }
+        if self.read(l.otg(r.pipe, CONTROL))? & 0x10001 != 0 {
+            return Err(Error::Busy);
         }
-        for ((at, mask), expected) in plan.registers(l).into_iter().zip(plan.controls) {
-            if self.read(at)? & mask != expected {
+        Ok(())
+    }
+    // Only the video owner may exempt its timing and a pending video status
+    // from idle checks. It validates timing/OPP/fetchers and the video request
+    // independently; every other stream, route and PHY remains checked here.
+    fn dp_frontend_verify_source(
+        &mut self,
+        plan: DpFrontendReady,
+        timing: Option<u8>,
+        video_pending: bool,
+    ) -> Result<(), Error> {
+        let l = self.layout;
+        let r = plan.request;
+        self.dp_training_verify_owned(plan.link, Some(r.stream), timing)?;
+        if self.read(l.otg(r.pipe, LOCK))? & 0x101 != 0 {
+            return Err(Error::Busy);
+        }
+        for (i, ((at, mut mask), expected)) in
+            plan.registers(l).into_iter().zip(plan.controls).enumerate()
+        {
+            if i == 14 && video_pending {
+                mask &= !0x10000;
+            }
+            if self.read(at)? & mask != expected & mask {
                 return Err(Error::Readback(at));
             }
         }

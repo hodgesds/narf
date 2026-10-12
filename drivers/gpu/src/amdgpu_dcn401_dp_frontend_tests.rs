@@ -1,4 +1,6 @@
 use super::*;
+#[path = "amdgpu_dcn401_dp_video_tests.rs"]
+mod video;
 
 struct FrontendIo {
     inner: LinkIo,

@@ -851,8 +851,59 @@ route parking. Fresh restored streamless-link evidence returns the owner to
 `DpLinkTrained`, permitting its existing sink-D3/PHY shutdown. Historical
 frontend records remain, without granting memory reuse. Failure enters `Failed`;
 cancellation retains `PreparingDpFrontend` or `StoppingDpFrontend`. Both prevent
-replay and retain resources until independent recovery. Silicon validation and
-native video/scanout startup remain separate work.
+replay and retain resources until independent recovery.
+
+`unsafe ColdBoot::start_display_dp_video(port).await`, its serialized platform
+wrapper and `Otg::start_dp_video` start native legacy SST RGB black video from
+the matching `DpFrontendReady`. Callers retain the direct-port, exclusive
+clock/timing/OPP/PHY ownership and external-writer exclusion obligations for
+the entire running lifetime. All surfaces, translations and inherited resources
+remain retained. This operation enables no memory fetcher, audio, metadata,
+DSC, MST, UHBR or surface scanout.
+
+Preflight checks current retained clocks, unchanged frontend/link/OPP state,
+stopped HUBPs/cursors/metadata/LUT fetchers and settled power-gating witnesses.
+Powered-off HUBPs remain inaccessible. Non-default M/N dividers or
+double-buffer programming reject before writes. The prepared, stopped
+frontend owns any retained measurement generator and disables it before
+reseeding. `StartingDpVideo(stream)` is
+set before the first AUX wait; live sink configuration, D0 and per-lane/alignment
+checks precede timing startup. Native VTG-before-OTG enable must acknowledge
+master enable, latched OPP/FMT black and fresh frame progress before video setup.
+All unrelated display consumers remain stopped and checked.
+
+Native M/N programming seeds N=32768 and M=floor(N*pixel_kHz/link_symbol_kHz),
+sets N interval for the retained 1/2/4/8-pixel packing and enables automatic
+measurement. M is a seed, not a fixed live completion witness. Video-off
+acknowledgement precedes steering reset; both reset directions acknowledge and
+the native 10 us reset hold is preserved. Steering enable, video enable/defer=2,
+200 us priming, read-start level=7, both resync FIFO reset acknowledgements,
+FIFO enable and 100 us priming precede the final video-enable request. Fresh
+video status, sink revalidation and subsequent frame progress are required.
+Timing/video/frame waits use three mode-derived frame periods plus 5 ms,
+bounded at 1 s; steering and resync reset waits are bounded at 1 ms and 50 ms.
+All waits yield through the existing scheduler/time/transport primitives.
+
+Success enters `DpVideoRunning(stream)` and records historical
+`Status::dp_video_running: Option<DpVideoRunning>` with frontend/link/blank
+identity, initial M/N and two distinct post-enable frame counters (wrap allowed).
+The source and sink witnesses do not prove that the physical display presents
+black. This state blocks ordinary timing retirement, clock programming,
+frontend/link teardown and replay.
+
+`unsafe ColdBoot::stop_display_dp_video(port).await`, its wrapper and
+`Otg::stop_dp_video` accept only that matching live owner. Video disables at
+vertical blank and must acknowledge off while timing/clocks remain available.
+Only then may steering reset/disable and M/N generation stop. Native timing
+shutdown disconnects ODM, clears memory selection and disables master/VTG,
+requiring both master-off and busy-off acknowledgements. Fresh stopped source,
+timing, blank and fetcher checks precede restaging the single OPP route with
+timing still disabled. Success updates the prepared frontend snapshot and
+returns to `DpFrontendReady`, permitting black-video restart or existing
+frontend/link shutdown. No memory or PHY is released. Failure enters `Failed`;
+cancellation retains `StartingDpVideo` or `StoppingDpVideo`. Both quarantine the
+owner, retain completion history and block replay until independent recovery.
+Physical video operation and native surface scanout remain separate work.
 
 `unsafe ColdBoot::disable_display_frl(port).await`, its serialized platform
 wrapper and `Otg::disable_frl` disable a validated direct external HDMI FRL PHY

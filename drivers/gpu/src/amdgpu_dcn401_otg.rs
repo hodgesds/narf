@@ -1,7 +1,8 @@
 //! Native DCN401 timing preparation and retirement. Register layout comes
 //! from dcn_4_1_0; sequencing from Linux dcn401_optc.c/dcn10_optc.c.
 //! Progressive RGB, fixed refresh and one OPP per OTG only. Internal black
-//! timing can run with fetchers stopped; surface/link scanout needs its owners.
+//! timing and owned legacy DP black video can run with fetchers stopped;
+//! surface scanout still needs its owners.
 use crate::{
     amdgpu::AmdGpu, amdgpu_dcn401_clk as clocks, amdgpu_dcn401_dccg as dccg,
     amdgpu_discovery as ip, amdgpu_dml::Timing,
@@ -25,7 +26,7 @@ pub use link::DpSstDisabled;
 mod dp_phy;
 pub use dp_phy::{
     DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkTrained, DpPhyReady, DpPhySettings,
-    DpTrainingError,
+    DpTrainingError, DpVideoRunning,
 };
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
@@ -107,6 +108,9 @@ pub enum State {
     PreparingDpFrontend(u8),
     DpFrontendReady(u8),
     StoppingDpFrontend(u8),
+    StartingDpVideo(u8),
+    DpVideoRunning(u8),
+    StoppingDpVideo(u8),
     RetiringHpoLink(u8),
     HpoLinkRetired,
     DisablingHpoDp(u8),
@@ -223,6 +227,9 @@ pub struct Status {
     /// Historical blank frontend setup; current only in DpFrontendReady.
     /// Timing, video and scanout remain stopped.
     pub dp_frontend_ready: Option<DpFrontendReady>,
+    /// Historical external RGB black video. Current only in DpVideoRunning;
+    /// never proves surface scanout, sink presentation or memory retirement.
+    pub dp_video_running: Option<DpVideoRunning>,
     /// Historical HPO digital-link stop only; PHY and its root clock remain owned.
     pub hpo_link_retired: Option<HpoLinkRetired>,
     /// Historical lane-disable/TX-clock/root-route evidence, not analog power gating.
@@ -594,6 +601,7 @@ impl Otg {
                 dp_phy_ready: None,
                 dp_link_trained: None,
                 dp_frontend_ready: None,
+                dp_video_running: None,
                 hpo_link_retired: None,
                 hpo_dp_disabled: None,
                 hdmi_tmds_retired: None,

@@ -1089,6 +1089,47 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Start RGB black video on the prepared, trained legacy DP frontend.
+    /// # Safety
+    /// Fulfil `Otg::start_dp_video` exclusive writer and resource obligations
+    /// for the whole running lifetime. This does not enable surface scanout.
+    pub async unsafe fn start_display_dp_video(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::DpVideoRunning, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_dp_video(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    &mut self.sequence.backend.dmub,
+                    path,
+                )
+                .await
+        }
+    }
+    /// Blank video and stop timing, retaining the prepared frontend and link.
+    /// # Safety
+    /// Fulfil `Otg::stop_dp_video` writer/resource lifetime obligations.
+    pub async unsafe fn stop_display_dp_video(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; caller fulfils the lifetime contract.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_dp_video(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    path,
+                )
+                .await
+        }
+    }
     /// Stop the matching blank frontend and return to the trained DP link.
     /// # Safety
     /// Fulfil `Otg::stop_dp_frontend` writer/resource and stopped-video obligations.

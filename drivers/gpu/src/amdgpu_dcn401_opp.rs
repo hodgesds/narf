@@ -93,7 +93,7 @@ pub struct BlankApplied {
     pub pending: bool,
 }
 impl Layout {
-    fn opp(self, pipe: u8, reg: u64) -> u64 {
+    pub(super) fn opp(self, pipe: u8, reg: u64) -> u64 {
         self.base + (reg + u64::from(pipe) * 0x5a) * 4
     }
 }

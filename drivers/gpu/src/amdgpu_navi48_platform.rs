@@ -499,6 +499,33 @@ pub async unsafe fn prepare_display_dp_frontend(
     // SAFETY: serialized retained owner; caller fulfils documented obligations.
     unsafe { boot.prepare_display_dp_frontend(port, request).await }
 }
+/// Start native legacy SST RGB black video from the retained frontend/timing.
+/// # Safety
+/// Fulfil `Otg::start_dp_video` writer-exclusion and resource-lifetime contract
+/// throughout the running lifetime. No memory fetcher is enabled.
+pub async unsafe fn start_display_dp_video(
+    port: usize,
+) -> Result<crate::amdgpu_dcn401_otg::DpVideoRunning, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller fulfils lifetime obligations.
+    unsafe { boot.start_display_dp_video(port).await }
+}
+/// Blank the owned video and stop timing, retaining the prepared frontend.
+/// # Safety
+/// Fulfil `Otg::stop_dp_video` writer/resource lifetime obligations.
+pub async unsafe fn stop_display_dp_video(
+    port: usize,
+) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller fulfils lifetime obligations.
+    unsafe { boot.stop_display_dp_video(port).await }
+}
 /// Stop the matching blank frontend while retaining its trained DP PHY.
 /// # Safety
 /// Fulfil `Otg::stop_dp_frontend` writer/resource and stopped-video obligations.
