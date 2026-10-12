@@ -218,6 +218,47 @@ impl<I: Io> Engine<I> {
         .await?;
         Ok((before, last))
     }
+    /// No flip pending and EARLIEST_INUSE reporting `address`, or the
+    /// register still waiting.
+    fn in_use(&mut self, pipe: u8, address: u64) -> Result<Option<u64>, Error> {
+        let l = self.layout;
+        let flip = self.read(l.hubp(pipe, FLIP))?;
+        let low = self.read(l.hubp(pipe, EARLIEST_INUSE))?;
+        let high = self.read(l.hubp(pipe, EARLIEST_INUSE_HIGH))? & 0xffff;
+        Ok(
+            (flip & FLIP_PENDING != 0 || u64::from(high) << 32 | u64::from(low) != address)
+                .then_some(l.hubp(pipe, EARLIEST_INUSE)),
+        )
+    }
+    /// A live pipe may flip only with no transaction of its own outstanding.
+    pub(super) fn flip_quiet(&mut self, pipe: u8) -> Result<(), Error> {
+        let l = self.layout;
+        for (at, mask) in [
+            (l.otg(pipe, LOCK), LOCK_REQUEST | LOCK_STATUS),
+            (l.otg(pipe, DOUBLE_BUFFER), OTG_UPDATE_PENDING),
+            (l.otg(pipe, PIPE_UPDATE), PIPE_PENDING),
+            (l.hubp(pipe, FLIP), FLIP_PENDING),
+            (l.mpcc(pipe, UPDATE_LOCK), 0x70),
+        ] {
+            if self.read(at)? & mask != 0 {
+                return Err(Error::Busy);
+            }
+        }
+        self.underflow(pipe)
+    }
+    /// Re-address the live fetch under the master-update lock (a VSYNC flip:
+    /// the staged flip type is 0) and wait for the HUBP to report the new
+    /// surface in use, without underflow. Returns the frame count then.
+    pub(super) async fn flip_to(&mut self, p: Pipe) -> Result<u32, Error> {
+        let l = self.layout;
+        let pipe = p.pipe;
+        self.lock(pipe).await?;
+        self.update(l.hubp(pipe, ADDRESS_HIGH), 0xffff, (p.address >> 32) as u32)?;
+        self.update(l.hubp(pipe, ADDRESS), u32::MAX, p.address as u32)?;
+        self.update(l.otg(pipe, LOCK), LOCK_REQUEST, 0)?;
+        self.latched(p, |e| e.in_use(pipe, p.address)).await?;
+        Ok(self.read(l.otg(pipe, FRAME_COUNT))? & FRAME_MASK)
+    }
     /// Connect and unblank under one OTG master-update lock so DPG release,
     /// MPCC insertion, address and HUBP unblank latch at the same VUPDATE.
     pub(super) async fn start_fetch(&mut self, p: Pipe) -> Result<(u32, u32), Error> {
@@ -253,11 +294,8 @@ impl<I: Io> Engine<I> {
         // when no flip is pending and EARLIEST_INUSE reports its address. A
         // requested-address readback is not that evidence.
         self.latched(p, |e| {
-            let flip = e.read(l.hubp(pipe, FLIP))?;
-            let low = e.read(l.hubp(pipe, EARLIEST_INUSE))?;
-            let high = e.read(l.hubp(pipe, EARLIEST_INUSE_HIGH))? & 0xffff;
-            if flip & FLIP_PENDING != 0 || u64::from(high) << 32 | u64::from(low) != p.address {
-                return Ok(Some(l.hubp(pipe, EARLIEST_INUSE)));
+            if let Some(at) = e.in_use(pipe, p.address)? {
+                return Ok(Some(at));
             }
             for (at, mask, value) in [
                 (l.opp(pipe, DPG_PENDING), 1, 0),
@@ -407,7 +445,7 @@ struct Context {
 impl Surfaces {
     /// Current owners must still be exactly the ones the deadlines were
     /// programmed for, and every staged register must still hold its value.
-    fn scanout_bound<I: Io>(
+    pub(super) fn scanout_bound<I: Io>(
         &self,
         e: &mut Engine<I>,
         d: DeadlinesApplied,

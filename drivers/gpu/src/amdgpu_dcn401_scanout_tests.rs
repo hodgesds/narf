@@ -355,3 +355,58 @@ kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_framebuffer_requires_live_owned_scanout
 );
+
+fn dcn401_scanout_flip_latches_new_address_under_the_lock() -> TestResult {
+    const BACK: u64 = 0x8_0090_0000;
+    for pipe in 0..4 {
+        let mut e = staged(pipe);
+        let p = target(pipe);
+        if run(e.start_fetch(p)).is_err() || e.flip_quiet(pipe).is_err() {
+            return TestResult::Fail("start");
+        }
+        let next = Pipe { address: BACK, ..p };
+        if run(e.flip_to(next)).is_err()
+            || e.live_fetch(pipe, BACK).is_err()
+            || e.live_fetch(pipe, ADDR).is_ok()
+            || e.io.get(e.layout.otg(pipe, LOCK)) & (LOCK_REQUEST | LOCK_STATUS) != 0
+        {
+            return TestResult::Fail("flip to back buffer");
+        }
+        // And back again; the retained staged state still stops cleanly.
+        if run(e.flip_to(p)).is_err() || run(e.stop_fetch(p)).is_err() || e.staged(p).is_err() {
+            return TestResult::Fail("flip back and stop");
+        }
+    }
+    let p = target(2);
+    let next = Pipe { address: BACK, ..p };
+    // Requested is not presented: an unlatched flip times out.
+    let mut e = staged(2);
+    if run(e.start_fetch(p)).is_err() {
+        return TestResult::Fail("start");
+    }
+    e.io.latch = false;
+    if run(e.flip_to(next)) != Err(Error::Timeout(e.layout.hubp(2, EARLIEST_INUSE))) {
+        return TestResult::Fail("unlatched flip accepted");
+    }
+    // Pending transactions, a held lock or underflow refuse the flip.
+    for (at, value) in [
+        (e.layout.hubp(2, FLIP), FLIP_PENDING),
+        (e.layout.otg(2, LOCK), LOCK_STATUS),
+        (e.layout.otg(2, PIPE_UPDATE), 1),
+        (e.layout.hubp(2, HUBP_CONTROL), 0x1000_0000),
+    ] {
+        let mut e = staged(2);
+        if run(e.start_fetch(p)).is_err() {
+            return TestResult::Fail("start");
+        }
+        *e.io.regs.entry(at).or_default() |= value;
+        if e.flip_quiet(2).is_ok() {
+            return TestResult::Fail("busy pipe flipped");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_flip_latches_new_address_under_the_lock
+);

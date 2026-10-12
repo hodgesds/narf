@@ -563,6 +563,45 @@ pub async unsafe fn modeset_display(
     Ok(modeset)
 }
 
+/// Allocate the back buffer of a staged or live pipe and return its CPU view.
+/// # Safety
+/// Exclude firmware/FAMS and concurrent display/HDP writers.
+pub async unsafe fn prepare_display_back_buffer(
+    pipe: u8,
+) -> Result<GenericFb, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owner; caller excludes external writers.
+    unsafe { boot.prepare_display_back_buffer(pipe).await }?;
+    boot.display_back_framebuffer(pipe)
+}
+
+/// Flip a live scanout to its back buffer. If the console had adopted the old
+/// front, it follows the new one, so it keeps drawing to the visible buffer.
+/// # Safety
+/// The back buffer must hold the complete next frame with no CPU writer until
+/// the next flip. Exclude firmware/FAMS and concurrent display writers.
+pub async unsafe fn flip_display(
+    pipe: u8,
+) -> Result<crate::amdgpu_dcn401_otg::FlipDone, crate::amdgpu_dcn401_otg::Error> {
+    let (done, before, after) = {
+        let mut owner = OWNER.lock().await;
+        let boot = owner
+            .as_mut()
+            .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+        let before = boot.display_scanout_framebuffer(pipe)?;
+        // SAFETY: serialized retained owners; caller excludes external writers.
+        let done = unsafe { boot.flip_display(pipe).await }?;
+        (done, before, boot.display_scanout_framebuffer(pipe)?)
+    };
+    if crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| fb.addr == before.addr) {
+        crate::amdgpu_dcn_display::publish_external(Some(after), Some(flush_scanout));
+    }
+    Ok(done)
+}
+
 /// Withdraw the published scanout, then reverse a successful modeset to a
 /// disabled PHY with timing and planes retired. The surface stays allocated,
 /// so a console write already in flight lands in retained memory.

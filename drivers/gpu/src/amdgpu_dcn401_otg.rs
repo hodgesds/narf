@@ -17,7 +17,7 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{
-    DeadlinesApplied, DppApplied, HubpPower, MemoryApplied, MpcApplied, PlanesRetired,
+    DeadlinesApplied, DppApplied, FlipDone, HubpPower, MemoryApplied, MpcApplied, PlanesRetired,
     RequestorApplied, ScanoutRunning, ScanoutUnderflow, SurfaceApplied, SurfaceFormat,
     SurfaceRequest,
 };
@@ -157,6 +157,7 @@ pub enum State {
     StartingScanout(u8),
     ScanoutRunning(u8),
     StoppingScanout(u8),
+    Flipping(u8),
     Retiring(u8),
     Retired,
     Failed(Error),

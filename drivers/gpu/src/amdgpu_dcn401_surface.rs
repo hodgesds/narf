@@ -19,8 +19,11 @@ pub use requestor::RequestorApplied;
 #[path = "amdgpu_dcn401_deadline.rs"]
 mod deadline;
 pub use deadline::DeadlinesApplied;
+#[path = "amdgpu_dcn401_flip.rs"]
+mod flip;
 #[path = "amdgpu_dcn401_scanout.rs"]
 mod scanout;
+pub use flip::FlipDone;
 pub use scanout::{ScanoutRunning, ScanoutUnderflow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,8 +97,11 @@ impl SurfaceApplied {
 
 #[derive(Debug)]
 struct Surface {
+    /// The front buffer: the one `applied` and every report name.
     memory: Reservation,
     applied: SurfaceApplied,
+    /// Optional second buffer of the same geometry, swapped in by a flip.
+    back: Option<Reservation>,
 }
 #[derive(Debug)]
 pub(in super::super) struct Surfaces([Option<Surface>; 4]);
@@ -130,7 +136,11 @@ impl Surfaces {
             pitch_bytes,
             bytes,
         };
-        self.0[slot] = Some(Surface { memory, applied });
+        self.0[slot] = Some(Surface {
+            memory,
+            applied,
+            back: None,
+        });
         engine.status.state = State::PreparingSurface(request.pipe);
         engine.status.surfaces[slot] = None;
         let result = self.initialize(engine, slot).await;

@@ -404,6 +404,9 @@ the chain itself still needs a board, and inherited GOP retirement is separate.
 A successful platform modeset publishes the live surface as the external
 scanout; the console adopts it and flushes CPU writes through HDP via a
 published, non-blocking hook. Stop withdraws it before any teardown.
+Live pipes can now flip between two owned buffers: the back address is
+written under the OTG lock and the flip completes only when EARLIEST_INUSE
+reports it, after which every retained report moves to the new front.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

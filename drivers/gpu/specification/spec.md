@@ -853,6 +853,29 @@ console returns to the boot framebuffer. That range stays excluded from the
 VRAM pool for its lifetime and therefore remains valid memory. The surface is
 retained, so a console write already in flight lands in owned memory.
 
+Page flips are double-buffered on one pipe. `unsafe Otg::prepare_back_buffer`
+(ColdBoot `prepare_display_back_buffer`) reserves a second allocation of the
+front's geometry, staged or live. It must translate through the FB aperture,
+is cleared and HDP-flushed, and is retained by the pipe for the owner's
+lifetime. `back_framebuffer` exposes its CPU view.
+
+`unsafe Otg::flip` (ColdBoot `flip_display`) requires `ScanoutRunning`. It
+rebinds the deadlines and verifies the live fetch at the current front. It also
+requires no held OTG lock, no OTG, pipe-update or flip pending, no MPCC update
+lock and no underflow. It HDP-flushes the producer's writes and enters
+`Flipping`. Following hubp401_program_surface_flip_and_addr, it writes the back
+address (high, then the publishing low; the staged flip type is VSYNC) under the
+master-update lock. Completion is no flip pending and `SURFACE_EARLIEST_INUSE`
+equal to the new address within the frame-bound timeout, with underflow
+watched. The owners must be unchanged. Then every retained report (surfaces,
+DPP, MPC, requestor, scanout) is retargeted together, the buffers swap, and the
+binding and live fetch are re-verified at the new front. `FlipDone` names the
+new front, the now-reusable back and the frame count. Any failure leaves
+`Failed`, with both buffers retained because which one is still fetched is
+unknown. The platform `flip_display` moves a console that had adopted the old
+front onto the new one. There is no flip interrupt or event queue yet:
+completion is polled.
+
 `tests/dcn401_scanout.c` checks the native registers, including the MPC block's
 DCN bank 3. Physical presentation on the sink remains unverified.
 

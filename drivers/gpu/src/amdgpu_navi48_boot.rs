@@ -1178,6 +1178,56 @@ impl ColdBoot {
     ) -> Result<narf_graphics_driver::generic::GenericFb, otg::Error> {
         self.otg.as_ref().map_err(|e| *e)?.scanout_framebuffer(pipe)
     }
+    /// Allocate, clear and retain a back buffer for a staged or live pipe.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/HDP writers.
+    pub async unsafe fn prepare_display_back_buffer(
+        &mut self,
+        pipe: u8,
+    ) -> Result<u64, otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: this owner retains its pool and GMC; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_back_buffer(&self.sequence.backend.pool, gmc, pipe)
+                .await
+        }
+    }
+    /// The back buffer as a CPU framebuffer (bus-physical BAR address).
+    pub fn display_back_framebuffer(
+        &self,
+        pipe: u8,
+    ) -> Result<narf_graphics_driver::generic::GenericFb, otg::Error> {
+        self.otg.as_ref().map_err(|e| *e)?.back_framebuffer(pipe)
+    }
+    /// Flip a live scanout to its back buffer at the next VUPDATE.
+    /// # Safety
+    /// The back buffer must hold the complete next frame with no CPU writer
+    /// until the next flip. Exclude firmware/FAMS and concurrent display/hub/
+    /// VM/IRQ/clock/reset/power writers; a failure quarantines the pipe.
+    pub async unsafe fn flip_display(&mut self, pipe: u8) -> Result<otg::FlipDone, otg::Error> {
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .flip(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    crystal,
+                )
+                .await
+        }
+    }
     /// HDP-flush CPU writes to the live scanout surface.
     pub fn flush_display_scanout(&mut self) -> Result<(), otg::Error> {
         if self.state() != State::MemoryReady {
