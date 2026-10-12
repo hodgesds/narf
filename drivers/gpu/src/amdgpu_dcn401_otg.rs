@@ -9,6 +9,10 @@ use crate::{
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
+#[path = "amdgpu_dcn401_opp.rs"]
+mod opp;
+pub use opp::{BlankApplied, BlankRequest, ColorDepth};
+
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
 const H_SYNC: u64 = 0x1b2c;
@@ -51,13 +55,18 @@ pub enum State {
     Ready,
     Preparing(u8),
     Prepared,
+    PreparingBlank(u8),
+    BlankPrepared,
     Retiring(u8),
     Retired,
     Failed(Error),
 }
 impl State {
     pub(crate) fn reusable(self) -> bool {
-        matches!(self, Self::Ready | Self::Prepared | Self::Retired)
+        matches!(
+            self,
+            Self::Ready | Self::Prepared | Self::BlankPrepared | Self::Retired
+        )
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +115,8 @@ pub struct Status {
     /// Historical programming, not permission to start scanout. A clock
     /// change invalidates the recorded snapshot; failure/cancellation is sticky.
     pub pipes: [Option<Applied>; 4],
+    /// Staged OPP/FMT programming; never a proof of active blanking.
+    pub blanks: [Option<BlankApplied>; 4],
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -359,6 +370,7 @@ impl<I: Io> Engine<I> {
             Ok(()) => {
                 let applied = Applied { request, clock };
                 self.status.pipes[usize::from(request.pipe)] = Some(applied);
+                self.status.blanks[usize::from(request.pipe)] = None;
                 self.status.retired &= !(1 << request.pipe);
                 self.status.state = State::Prepared;
                 Ok(applied)
@@ -384,6 +396,7 @@ impl<I: Io> Engine<I> {
         match self.disable(pipe).await {
             Ok(()) => {
                 self.status.pipes[usize::from(pipe)] = None;
+                self.status.blanks[usize::from(pipe)] = None;
                 self.status.retired |= 1 << pipe;
                 self.status.state = State::Retired;
                 Ok(())
@@ -413,6 +426,7 @@ impl Otg {
             status: Status {
                 state: State::Ready,
                 pipes: [None; 4],
+                blanks: [None; 4],
                 retired: 0,
             },
         }))

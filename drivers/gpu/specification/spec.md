@@ -374,6 +374,28 @@ platform wrappers serialize these operations after the drained kernel proofs.
 these operations runs automatically during boot. Plane/OPP setup, bandwidth and
 watermarks, link/PHY programming and scanout enable remain required.
 
+The same timing owner also exposes
+`prepare_blank(&mut ClockManager, &mut Dccg, BlankRequest).await` for native
+OPP/FMT/DPG preparation. `BlankRequest` selects a prepared pipe and RGB
+`ColorDepth::{Bpc8,Bpc10,Bpc12}`; output is full range. The recorded timing must
+match current readback-checked pipe clocks and fit the DPG's 14-bit active
+dimensions. All consumers remain retired. Inherited digital bypass, pending
+FMT/DPG updates and timing locks reject the request before writes.
+
+Native OPP clock-on acknowledgement is bounded to 1 ms. The formatter disables
+chroma subsampling and dithering, sets 8-bit truncation or native rounded 10-bit
+reduction (none at 12 bits), clears inherited RGB/YUV offsets in the shared
+dither-seed registers, and programs full-range clamping and dynamic expansion.
+DPG stages equal black color values with the prepared active dimensions,
+zero offset and the selected component depth. Every field is read back.
+`BlankApplied::pending` captures DPG's double-buffer state; it is diagnostic,
+not proof that blanking is active. Native blank completion must be checked
+after future timing enable. `PreparingBlank(pipe)`/failure block replay and
+platform clock changes; `BlankPrepared` records only successful staging in
+`Status::blanks`. Reprogramming or retiring a pipe clears its staged record.
+`ColdBoot::prepare_display_blank` and the matching platform wrapper retain the
+same clock/PM/timing ownership. They do not enable timing, a plane or a link.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

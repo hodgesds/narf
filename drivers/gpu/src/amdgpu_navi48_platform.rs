@@ -337,6 +337,19 @@ pub async fn prepare_display_timing(
         .await
 }
 
+/// Stage native OPP RGB formatting and black pattern; timing remains disabled.
+pub async fn prepare_display_blank(
+    request: crate::amdgpu_dcn401_otg::BlankRequest,
+) -> Result<crate::amdgpu_dcn401_otg::BlankApplied, crate::amdgpu_dcn401_otg::Error> {
+    OWNER
+        .lock()
+        .await
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?
+        .prepare_display_blank(request)
+        .await
+}
+
 /// # Safety
 /// Stop scanout CPU writers and retain every associated surface, page table,
 /// HUBP and OPP resource. Completion proves timing retirement only.

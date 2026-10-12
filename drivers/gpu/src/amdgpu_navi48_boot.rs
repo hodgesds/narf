@@ -813,6 +813,25 @@ impl ColdBoot {
             .prepare(clocks, dccg, request)
             .await
     }
+    /// Stage the native OPP RGB formatter and black pattern for disabled timing.
+    pub async fn prepare_display_blank(
+        &mut self,
+        request: otg::BlankRequest,
+    ) -> Result<otg::BlankApplied, otg::Error> {
+        if self.state() != State::MemoryReady
+            || self.queue_state() != Some(queues::State::InterruptVerified)
+            || self.sdma_state() != Some(sdma::State::InterruptVerified)
+        {
+            return Err(otg::Error::Busy);
+        }
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        self.otg
+            .as_mut()
+            .map_err(|e| *e)?
+            .prepare_blank(clocks, dccg, request)
+            .await
+    }
     /// # Safety
     /// All associated scanout resources remain retained and CPU writers have
     /// stopped. This retires timing only, never HUBP fetches or surface memory.

@@ -10,7 +10,7 @@ const BASE: u64 = 0x10000;
 struct Fake {
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
-    stall: u8, // input clock, OTG clock, current master, busy
+    stall: u8, // input clock, OTG clock, current master, busy, OPP clock
     retiring: [bool; 4],
     delay: [u8; 4],
     reject: Option<usize>,
@@ -26,12 +26,16 @@ impl Io for Fake {
             let ctrl = BASE + (0x1b43 + 0x80 * p) * 4;
             let clock = BASE + (0x1b84 + 0x80 * p) * 4;
             let input = BASE + (0x1ad0 + 0x10 * p) * 4;
+            let opp = BASE + (0x188c + 0x5a * p) * 4;
             let old = *self.regs.get(&at).unwrap_or(&0);
             if at == input && old & 3 == 3 && self.stall & 1 == 0 {
                 self.regs.insert(at, old | 4);
             }
             if at == clock && old & 3 == 3 && self.stall & 2 == 0 {
                 self.regs.insert(at, old | 0x100);
+            }
+            if at == opp && old & 1 == 1 && self.stall & 16 == 0 {
+                self.regs.insert(at, old | 2);
             }
             if self.retiring[p as usize] && (at == ctrl || at == clock) {
                 if self.delay[p as usize] != 0 {
@@ -53,6 +57,9 @@ impl Io for Fake {
         }
         self.regs.insert(at, value);
         for p in 0..4 {
+            if at == BASE + (0x1854 + 0x5a * p) * 4 {
+                self.regs.insert(BASE + (0x185b + 0x5a * p) * 4, 1);
+            }
             if at == BASE + (0x1b43 + 0x80 * p) * 4 && value & 1 == 0 {
                 self.retiring[p as usize] = true;
             }
@@ -99,6 +106,7 @@ fn engine() -> Engine<Fake> {
         status: Status {
             state: State::Ready,
             pipes: [None; 4],
+            blanks: [None; 4],
             retired: 0,
         },
     }
@@ -618,4 +626,191 @@ fn dcn401_otg_constructor_checks_native_discovery_without_writes() -> TestResult
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_otg_constructor_checks_native_discovery_without_writes
+);
+
+fn blank_engine(pipe: u8) -> Engine<Fake> {
+    let mut e = engine();
+    run(e.prepare(request(pipe), clock(request(pipe)))).unwrap();
+    // Complete the fixture's prior disable event before injecting a new live
+    // consumer; otherwise the simulator would retire that injected event too.
+    e.io.retiring = [false; 4];
+    e.io.writes.clear();
+    e
+}
+fn blank_request(pipe: u8) -> BlankRequest {
+    BlankRequest {
+        pipe,
+        depth: ColorDepth::Bpc8,
+    }
+}
+
+fn dcn401_opp_stages_native_rgb_black_without_claiming_blank_completion() -> TestResult {
+    for pipe in 0..4 {
+        for (depth, trunc, expand, dpg) in [
+            (ColorDepth::Bpc8, 0x11, 0x11, 0x1041),
+            (ColorDepth::Bpc10, 0x23, 1, 0x2041),
+            (ColorDepth::Bpc12, 0, 1, 0x3041),
+        ] {
+            let mut e = blank_engine(pipe);
+            let at = |r| BASE + (r + 0x5a * u64::from(pipe)) * 4;
+            e.io.regs.insert(at(0x1841), 0x0061ff33);
+            for r in [0x1842, 0x1843, 0x1844] {
+                e.io.regs.insert(at(r), 0x80000055);
+            }
+            e.io.regs.insert(at(0x1840), 0x102f3f00);
+            e.io.regs.insert(at(0x1854), 0x41ff3170);
+            let req = BlankRequest { pipe, depth };
+            let a = run(e.prepare_blank(req, clock(request(pipe)))).unwrap();
+            assert!(a.pending, "OPP double-buffer still awaits timing enable");
+            assert_eq!(e.status.state, State::BlankPrepared);
+            assert_eq!(e.status.blanks[usize::from(pipe)], Some(a));
+            assert_eq!(
+                e.io.writes,
+                [
+                    (at(0x188c), 1),
+                    (at(0x1849), 0),
+                    (at(0x1841), 0x00600000 | trunc),
+                    (at(0x1842), 0),
+                    (at(0x1843), 0),
+                    (at(0x1844), 0),
+                    (at(0x1840), 0x10000000),
+                    (at(0x1845), 1),
+                    (at(0x183f), expand),
+                    (at(0x1856), 1920 << 16 | 1080),
+                    (at(0x185a), 0),
+                    (at(0x1859), 0),
+                    (at(0x1858), 0),
+                    (at(0x1857), 0),
+                    (at(0x1854), 0x40000000 | dpg),
+                ]
+            );
+            assert_eq!(reg(&e, 0x1b43 + 0x80 * u64::from(pipe)) & 0x10001, 0);
+            assert_eq!(reg(&e, 0x530 + u64::from(pipe)) & 0x80000000, 0);
+            e.io.writes.clear();
+            assert_eq!(
+                run(e.prepare_blank(req, clock(request(pipe)))),
+                Err(Error::Busy)
+            );
+            assert!(e.io.writes.is_empty(), "unlatched pattern overwritten");
+            run(e.retire(pipe)).unwrap();
+            assert_eq!(e.status.blanks[usize::from(pipe)], None);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-opp",
+    dcn401_opp_stages_native_rgb_black_without_claiming_blank_completion
+);
+
+fn dcn401_opp_rejects_stale_timing_pending_transactions_and_live_consumers() -> TestResult {
+    let mut e = engine();
+    assert_eq!(
+        run(e.prepare_blank(blank_request(0), clock(request(0)))),
+        Err(Error::Invalid)
+    );
+    assert!(e.io.writes.is_empty());
+    let mut e = blank_engine(0);
+    for pipe in [1, 4, 255] {
+        assert_eq!(
+            run(e.prepare_blank(blank_request(pipe), clock(request(0)))),
+            Err(Error::Invalid)
+        );
+    }
+    let mut stale = clock(request(0));
+    stale.global.dpp_khz += 1;
+    assert_eq!(
+        run(e.prepare_blank(blank_request(0), stale)),
+        Err(Error::Invalid)
+    );
+    assert!(e.io.writes.is_empty());
+    for (r, v) in [
+        (0x1840, 0x1000000),
+        (0x185b, 1),
+        (0x188c, 0x10),
+        (0x1b89, 1),
+    ] {
+        let mut e = blank_engine(0);
+        e.io.regs.insert(BASE + r * 4, v);
+        assert_eq!(
+            run(e.prepare_blank(blank_request(0), clock(request(0)))),
+            Err(Error::Busy)
+        );
+        assert!(e.io.writes.is_empty());
+        assert_eq!(e.status.state, State::Prepared);
+    }
+    for (at, mask) in engine().layout.idle {
+        let mut e = blank_engine(0);
+        e.io.regs.insert(at, mask);
+        assert_eq!(
+            run(e.prepare_blank(blank_request(0), clock(request(0)))),
+            Err(Error::Busy)
+        );
+        assert!(e.io.writes.is_empty());
+    }
+    let mut e = blank_engine(0);
+    e.status.pipes[0].as_mut().unwrap().request.timing.h_active = 0x4000;
+    assert_eq!(
+        run(e.prepare_blank(blank_request(0), clock(request(0)))),
+        Err(Error::Invalid)
+    );
+    assert!(e.io.writes.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-opp",
+    dcn401_opp_rejects_stale_timing_pending_transactions_and_live_consumers
+);
+
+fn dcn401_opp_partial_failures_and_cancellation_block_clock_reuse() -> TestResult {
+    for n in 1..=15 {
+        let mut e = blank_engine(0);
+        e.io.gone = Some(n);
+        assert_eq!(
+            run(e.prepare_blank(blank_request(0), clock(request(0)))),
+            Err(Error::DeviceGone)
+        );
+        assert_eq!(e.io.writes.len(), n);
+        assert_eq!(e.status.state, State::Failed(Error::DeviceGone));
+        assert!(e.status.blanks[0].is_none());
+        assert_eq!(
+            run(e.prepare(request(0), clock(request(0)))),
+            Err(Error::Busy)
+        );
+        let mut e = blank_engine(0);
+        e.io.revoke = Some((n, e.authority));
+        assert_eq!(
+            run(e.prepare_blank(blank_request(0), clock(request(0)))),
+            Err(Error::Revoked)
+        );
+        assert_eq!(e.io.writes.len(), n);
+        assert_eq!(e.status.state, State::Failed(Error::Revoked));
+    }
+    let mut e = blank_engine(0);
+    e.io.stall = 16;
+    let err = Error::Timeout(BASE + 0x188c * 4);
+    assert_eq!(
+        run(e.prepare_blank(blank_request(0), clock(request(0)))),
+        Err(err)
+    );
+    assert_eq!(e.status.state, State::Failed(err));
+    assert_eq!(e.io.writes.len(), 1);
+    let mut e = blank_engine(0);
+    e.io.stall = 16;
+    {
+        let mut f = core::pin::pin!(e.prepare_blank(blank_request(0), clock(request(0))));
+        assert!(f
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.status.state, State::PreparingBlank(0));
+    assert!(!e.status.state.reusable());
+    assert!(e.status.blanks[0].is_none());
+    assert_eq!(run(e.retire(0)), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-opp",
+    dcn401_opp_partial_failures_and_cancellation_block_clock_reuse
 );

@@ -313,7 +313,11 @@ clock-on acknowledgements, native HPO routing, odd-timing divider handling and
 PSTATE/global-sync fields. Timing retirement disconnects ODM and requires both
 current-master and busy acknowledgements. Partial/cancelled transitions retain
 ownership and block clock changes; timing retirement never releases scanout
-memory. PHY/link and plane/OPP programming, scanout enable, active-stream
+memory. The retained timing owner also stages native OPP full-range RGB
+formatting at 8/10/12 bpc and a black DPG pattern, clears inherited color offsets,
+and requires OPP clock acknowledgement. It records pending double-buffer state
+without claiming active blanking while timing is disabled. PHY/link and plane
+programming, timing/blank completion and scanout enable, active-stream
 transitions, bandwidth/watermarks and complete native modesetting remain open.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
