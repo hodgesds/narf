@@ -293,6 +293,14 @@ native I2C arbitrator/FIFO with board-resolved DDC pins, 100 kHz clock setup,
 fresh completion checks and bounded waits. Terminal sink errors restore pins
 and release ownership; uncertain failure/cancellation blocks reuse and raw AUX.
 Native link/scanout programming remains open.
+The retained DCN4 clock owner now validates its separate DAL mailbox, queries
+native clock ranges and applies checked DISP/DPP/DTB floors with both mailbox
+and per-clock completion acknowledgements. It pins DCF/UCLK conservatively,
+disables UCLK switching, preserves thermal protection and rejects every live
+legacy/HPO/FRL display consumer before changing DPM. Partial transitions and
+cancellation retain state without replay. Platform clock preparation is
+serialized after the kernel engine proofs; active-stream transitions, DCCG
+DTOs, bandwidth/watermarks and complete native modesetting remain open.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
 C layouts. Its retained unified-firmware owner starts both pipes, configures

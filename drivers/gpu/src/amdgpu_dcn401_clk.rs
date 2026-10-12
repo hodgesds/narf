@@ -1,0 +1,487 @@
+//! Navi48 DAL display clocks, following Linux dcn401_clk_mgr{,_smu_msg}.c,
+//! dcn401_smu14_driver_if.h and dalsmc.h. This mailbox is separate from PPSMC.
+//! Requires retired display consumers; no active-mode clock transitions yet.
+use crate::{
+    amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_psp_ring::bank, amdgpu_smu_navi48 as smu,
+};
+use core::future::Future;
+use narf_bus::{BusDeviceCap, MmioRegion};
+use narf_capabilities::{Cap, CapError, CapOp, Write};
+
+const MESSAGE: u32 = 0x8a; // MP1 C2PMSG74, base index 1
+const ARGUMENT: u32 = 0x73; // C2PMSG51
+const RESPONSE: u32 = 0x74; // C2PMSG52
+const LEVEL_COUNT: usize = 8;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    Unsupported,
+    Invalid,
+    Busy,
+    Revoked,
+    DeviceGone,
+    Timeout,
+    Rejected(u32),
+    Interface(u32),
+    HardMinTimeout(Clock),
+    Frequency(Clock, u32),
+    Power(smu::Error),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Prepared,
+    Starting,
+    Ready,
+    Applying,
+    Applied,
+    Failed(Error),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum Clock {
+    Soc = 1,
+    Memory = 2,
+    Fabric = 3,
+    Display = 6,
+    Dpp = 7,
+    Dcf = 9,
+    Dtb = 10,
+}
+const CLOCKS: [Clock; 7] = [
+    Clock::Soc,
+    Clock::Memory,
+    Clock::Fabric,
+    Clock::Display,
+    Clock::Dpp,
+    Clock::Dcf,
+    Clock::Dtb,
+];
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Range {
+    mhz: [u16; LEVEL_COUNT],
+    count: u8,
+    pub fine_grained: bool,
+    /// Original DPM feature word, including auto/sweep/forced flags.
+    pub flags: u32,
+}
+impl Range {
+    pub fn mhz(&self) -> &[u16] {
+        &self.mhz[..usize::from(self.count)]
+    }
+    pub fn min_khz(&self) -> u32 {
+        u32::from(*self.mhz().first().unwrap_or(&0)) * 1000
+    }
+    pub fn max_khz(&self) -> u32 {
+        u32::from(*self.mhz().last().unwrap_or(&0)) * 1000
+    }
+    fn request(&self, khz: u32) -> Result<u32, Error> {
+        if khz == 0 || khz > self.max_khz() {
+            return Err(Error::Invalid);
+        }
+        Ok(khz.max(self.min_khz()))
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Levels {
+    ranges: [Range; 7],
+    pub firmware: u32,
+    pub interface: u32,
+    pub header: u32,
+}
+impl Levels {
+    pub fn range(&self, clock: Clock) -> &Range {
+        &self.ranges[CLOCKS.iter().position(|&c| c == clock).unwrap()]
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Request {
+    pub displays: u8,
+    pub display_khz: u32,
+    pub dpp_khz: u32,
+    pub dtb_khz: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Applied {
+    pub request: Request,
+    /// Actual DISP/DPP/DTB rates returned by PMFW, in kHz (not MHz).
+    pub display_khz: u32,
+    pub dpp_khz: u32,
+    pub dtb_khz: u32,
+    /// Acknowledged requested floors, not measurements of instantaneous clocks.
+    pub dcf_floor_khz: u32,
+    pub memory_floor_khz: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Status {
+    pub state: State,
+    pub levels: Option<Levels>,
+    pub applied: Option<Applied>,
+}
+#[derive(Clone, Copy, Debug)]
+struct Layout {
+    mp1: u64,
+    dio: u64,
+    hpo: u64,
+}
+impl Layout {
+    fn resolve(gpu: &AmdGpu) -> Result<Self, Error> {
+        if gpu.chip.vid != crate::amdgpu::AMD_VENDOR || gpu.chip.did != crate::amdgpu::NAVI48 {
+            return Err(Error::Unsupported);
+        }
+        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0).map_err(|_| Error::Unsupported)?;
+        let mp1 = bank(gpu, ip::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, MESSAGE)
+            .map_err(|_| Error::Unsupported)?;
+        // Linux DAL uses absolute DWORD addresses 0x1628a/0x16273/0x16274.
+        // Require discovery to agree rather than borrowing another MP1 bank.
+        if mp1 != 0x16200 * 4 {
+            return Err(Error::Unsupported);
+        }
+        Ok(Self {
+            mp1,
+            dio: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 2, 0x391b)
+                .map_err(|_| Error::Unsupported)?,
+            hpo: bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 3, 0x8df)
+                .map_err(|_| Error::Unsupported)?,
+        })
+    }
+    fn idle_registers(self) -> [(u64, u32); 31] {
+        let mut regs = [(0, 0); 31];
+        for i in 0..4 {
+            for (j, (reg, stride, mask)) in [
+                (0x1b43, 0x80, 1),        // OTG_MASTER_EN
+                (0x1b84, 0x80, 0x10000),  // OTG_BUSY
+                (0x20bd, 0x124, 1),       // DIG_BE_ENABLE (HDMI and legacy DP)
+                (0x2122, 0x124, 0x10001), // DP stream enable/status
+                (0x3685, 0xd4, 0x101),    // HPO DP video enable/status
+                (0x367b, 0xd4, 1),        // HPO DP SDP enable
+                (0x369f, 0xd4, 1),        // HPO DP link clock: no live training
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                regs[i * 7 + j] = (self.dio + (reg + i as u64 * stride) * 4, mask);
+            }
+        }
+        // The single FRL stream lives in DCN bank 3, unlike HPO DP's bank 2.
+        for (i, reg) in [0x8d3, 0x8d6, 0x8df].into_iter().enumerate() {
+            regs[28 + i] = (self.hpo + reg * 4, 1);
+        }
+        regs
+    }
+}
+trait Io {
+    fn read(&mut self, at: u64) -> u32;
+    fn write(&mut self, at: u64, value: u32);
+}
+#[derive(Debug)]
+struct Mmio(MmioRegion);
+impl Io for Mmio {
+    fn read(&mut self, at: u64) -> u32 {
+        // SAFETY: discovery bounds every register; each batch invokes current
+        // PCI authority and the retained owner excludes other clock/reset users.
+        unsafe { self.0.read32(at) }
+    }
+    fn write(&mut self, at: u64, value: u32) {
+        // SAFETY: only the three bounded, exclusively owned DAL registers.
+        unsafe { self.0.write32(at, value) };
+    }
+}
+struct Op<F>(F);
+impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
+    type Output = T;
+    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
+        Ok((self.0)())
+    }
+}
+fn checked(v: u32) -> Result<u32, Error> {
+    if v == u32::MAX {
+        Err(Error::DeviceGone)
+    } else {
+        Ok(v)
+    }
+}
+async fn delay() {
+    narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
+}
+#[derive(Debug)]
+struct Engine<I: Io> {
+    io: I,
+    authority: Cap<BusDeviceCap, Write>,
+    layout: Layout,
+    status: Status,
+}
+impl<I: Io> Engine<I> {
+    fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
+        let io = &mut self.io;
+        self.authority
+            .invoke(Op(|| f(io)))
+            .map_err(|_| Error::Revoked)?
+    }
+    fn idle(&mut self) -> Result<(), Error> {
+        let regs = self.layout.idle_registers();
+        self.access(|io| {
+            for (at, mask) in regs {
+                if checked(io.read(at))? & mask != 0 {
+                    return Err(Error::Busy);
+                }
+            }
+            Ok(())
+        })
+    }
+    async fn settled(&mut self, deadline: narf_time::Deadline) -> Result<u32, Error> {
+        let at = self.layout.mp1 + u64::from(RESPONSE) * 4;
+        loop {
+            let value = self.access(|io| checked(io.read(at)))?;
+            if value != 0 {
+                return Ok(value);
+            }
+            if deadline.expired() {
+                return Err(Error::Timeout);
+            }
+            delay().await;
+        }
+    }
+    async fn command_until(
+        &mut self,
+        message: u32,
+        parameter: u32,
+        deadline: narf_time::Deadline,
+    ) -> Result<u32, Error> {
+        let ready = self.settled(deadline).await?;
+        if ready != 1 {
+            return Err(Error::Rejected(ready));
+        }
+        if deadline.expired() {
+            return Err(Error::Timeout);
+        }
+        let base = self.layout.mp1;
+        self.access(|io| {
+            io.write(base + u64::from(RESPONSE) * 4, 0);
+            io.write(base + u64::from(ARGUMENT) * 4, parameter);
+            io.write(base + u64::from(MESSAGE) * 4, message);
+            Ok(())
+        })?;
+        let result = self.settled(deadline).await?;
+        if result != 1 {
+            return Err(Error::Rejected(result));
+        }
+        self.access(|io| checked(io.read(base + u64::from(ARGUMENT) * 4)))
+    }
+    async fn command(&mut self, message: u32, parameter: u32) -> Result<u32, Error> {
+        self.command_until(message, parameter, narf_time::Deadline::after_ms(2000))
+            .await
+    }
+    async fn start(
+        &mut self,
+        power: impl Future<Output = Result<smu::PowerStatus, smu::Error>>,
+    ) -> Result<Levels, Error> {
+        if self.status.state != State::Prepared {
+            return Err(Error::Busy);
+        }
+        self.idle()?; // Do not even poll the power future while inherited scanout lives.
+        self.status.state = State::Starting;
+        let result = async {
+            power.await.map_err(Error::Power)?;
+            self.query().await
+        }
+        .await;
+        match result {
+            Ok(levels) => {
+                self.status.state = State::Ready;
+                self.status.levels = Some(levels);
+            }
+            Err(e) => self.status.state = State::Failed(e),
+        }
+        result
+    }
+    async fn query(&mut self) -> Result<Levels, Error> {
+        let firmware = self.command(2, 0).await?;
+        if firmware == 0 {
+            return Err(Error::Invalid);
+        }
+        let interface = self.command(3, 0).await?;
+        if interface != 1 {
+            return Err(Error::Interface(interface));
+        }
+        let header = self.command(4, 0).await?;
+        if header != 1 {
+            return Err(Error::Interface(header));
+        }
+        let mut ranges = [Range::default(); 7];
+        for (i, clock) in CLOCKS.into_iter().enumerate() {
+            let flags = self.command(0xb, (clock as u32) << 16 | 0xff).await?;
+            let fine_grained = flags & (1 << 31) != 0;
+            let count = if fine_grained {
+                2
+            } else {
+                (flags & 0xff) as usize
+            };
+            if count == 0
+                || count
+                    > if clock == Clock::Memory {
+                        6
+                    } else {
+                        LEVEL_COUNT
+                    }
+            {
+                return Err(Error::Invalid);
+            }
+            let mut range = Range {
+                count: count as u8,
+                fine_grained,
+                flags,
+                ..Range::default()
+            };
+            for index in 0..count {
+                let mhz = self
+                    .command(0xb, (clock as u32) << 16 | index as u32)
+                    .await?
+                    & 0xffff;
+                if mhz == 0 || (index > 0 && mhz < u32::from(range.mhz[index - 1])) {
+                    return Err(Error::Invalid);
+                }
+                range.mhz[index] = mhz as u16;
+            }
+            ranges[i] = range;
+        }
+        Ok(Levels {
+            ranges,
+            firmware,
+            interface,
+            header,
+        })
+    }
+    async fn hard_min(&mut self, clock: Clock, khz: u32) -> Result<u32, Error> {
+        let range = *self.status.levels.ok_or(Error::Invalid)?.range(clock);
+        // Linux treats a single level as a fixed clock, with no DPM request.
+        // The advertised fixed rate already satisfies every admitted request.
+        if range.count == 1 {
+            return if khz <= range.min_khz() {
+                Ok(range.min_khz())
+            } else {
+                Err(Error::Invalid)
+            };
+        }
+        let mhz = khz.div_ceil(1000);
+        if mhz == 0 || mhz > u32::from(u16::MAX) {
+            return Err(Error::Invalid);
+        }
+        let actual = self.command(9, (clock as u32) << 16 | mhz).await?;
+        // Mailbox OK only accepts the request. ReturnHardMinStatus acknowledges
+        // that this specific PPCLK floor has actually taken effect.
+        let deadline = narf_time::Deadline::after_ms(1000);
+        loop {
+            let bits = self.command_until(0x15, 0, deadline).await.map_err(|e| {
+                if e == Error::Timeout {
+                    Error::HardMinTimeout(clock)
+                } else {
+                    e
+                }
+            })?;
+            if bits & (1 << clock as u32) != 0 {
+                break;
+            }
+            if deadline.expired() {
+                return Err(Error::HardMinTimeout(clock));
+            }
+            delay().await;
+        }
+        if matches!(clock, Clock::Display | Clock::Dpp | Clock::Dtb) {
+            let max = range.max_khz();
+            if actual < khz || actual > max {
+                return Err(Error::Frequency(clock, actual));
+            }
+        }
+        Ok(actual)
+    }
+    async fn prepare(&mut self, request: Request) -> Result<Applied, Error> {
+        if !matches!(self.status.state, State::Ready | State::Applied) {
+            return Err(Error::Busy);
+        }
+        let levels = self.status.levels.ok_or(Error::Invalid)?;
+        if !(1..=4).contains(&request.displays) {
+            return Err(Error::Invalid);
+        }
+        let display = levels.range(Clock::Display).request(request.display_khz)?;
+        let dpp = levels.range(Clock::Dpp).request(request.dpp_khz)?;
+        let dtb = levels.range(Clock::Dtb).request(request.dtb_khz)?;
+        self.idle()?;
+        self.status.state = State::Applying;
+        let result = async {
+            self.command(0xe, u32::from(request.displays)).await?;
+            let dcf = levels.range(Clock::Dcf).max_khz();
+            let memory = levels.range(Clock::Memory).max_khz();
+            self.hard_min(Clock::Dcf, dcf).await?;
+            self.hard_min(Clock::Memory, memory).await?;
+            if levels.range(Clock::Memory).count > 1 {
+                self.command(0x1a, 0).await?; // no UCLK switching during scanout
+            }
+            // FCLK follows DCFCLK on DCN401; Linux explicitly avoids issuing
+            // SetFclkSwitchAllow or an independent FCLK floor on this ASIC.
+            let display_khz = self.hard_min(Clock::Display, display).await?;
+            let dpp_khz = self.hard_min(Clock::Dpp, dpp).await?;
+            let dtb_khz = self.hard_min(Clock::Dtb, dtb).await?;
+            Ok(Applied {
+                request,
+                display_khz,
+                dpp_khz,
+                dtb_khz,
+                dcf_floor_khz: dcf,
+                memory_floor_khz: memory,
+            })
+        }
+        .await;
+        match result {
+            Ok(applied) => {
+                self.status.applied = Some(applied);
+                self.status.state = State::Applied;
+            }
+            Err(e) => self.status.state = State::Failed(e),
+        }
+        result
+    }
+}
+#[derive(Debug)]
+pub struct ClockManager(Engine<Mmio>);
+impl ClockManager {
+    /// # Safety
+    /// Own this physical Navi48's DAL mailbox, all display streams/pipes, SMU
+    /// and reset/PM transitions exclusively, with permanent register mappings.
+    /// Retain this owner after any in-flight failure or cancelled operation.
+    pub unsafe fn new(gpu: &AmdGpu, authority: Cap<BusDeviceCap, Write>) -> Result<Self, Error> {
+        let layout = Layout::resolve(gpu)?;
+        authority.invoke(Op(|| ())).map_err(|_| Error::Revoked)?;
+        Ok(Self(Engine {
+            io: Mmio(gpu.regs),
+            authority,
+            layout,
+            status: Status {
+                state: State::Prepared,
+                levels: None,
+                applied: None,
+            },
+        }))
+    }
+    pub fn status(&self) -> Status {
+        self.0.status
+    }
+    /// # Safety
+    /// Matching protected SMU power is ready; all GPU engines are idle and
+    /// display consumers retired. Install floors before enabling any stream.
+    pub async unsafe fn start(&mut self, smu: &mut smu::Smu) -> Result<Levels, Error> {
+        self.0
+            .start(async {
+                // SAFETY: same physical owner; Engine::start checked all display
+                // consumers before polling, and caller excludes live engine work.
+                unsafe { smu.enable_display_power().await }
+            })
+            .await
+    }
+    /// Set floors with every stream/pipe retired. Refuses inherited display
+    /// activity before writes; failures retain partial floors without rollback.
+    pub async fn prepare(&mut self, request: Request) -> Result<Applied, Error> {
+        self.0.prepare(request).await
+    }
+}
+#[cfg(feature = "kernel-test")]
+#[path = "amdgpu_dcn401_clk_tests.rs"]
+mod tests;

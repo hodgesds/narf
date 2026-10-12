@@ -240,6 +240,55 @@ DMA retains its published buffer. Acknowledged transfer completion alone
 permits reclaiming that buffer. All waits use scheduler time futures, with
 capability revalidation at every command/read/copy chunk.
 
+The internal `Smu::enable_display_power` transition extends the verified mask
+only with UCLK/FCLK/SOCCLK/DCN DPM (bits 3/4/5/7). The board must support all
+four; SCPM is checked again and required autonomous protections must remain
+enabled. Voltage scaling, deep sleep, link DPM, DF C-states and GFXOFF stay
+excluded. It requires retired display consumers and idle engines. Success
+publishes the new `PowerStatus`; partial failure/cancellation retains the
+owner and prevents replay. Only the retained DCN4 clock owner initiates this
+transition, after checking every display consumer.
+
+`unsafe amdgpu_dcn401_clk::ClockManager::new` prepares a separate DAL mailbox
+owner without hardware writes. Exact Navi48/GC12/MP1 14.0.2/3/DCN4.0.1 discovery
+is required (the native DCN4.1.0 discovery spelling is also accepted). MP1 bank
+one must agree with Linux's absolute DAL registers `0x1628a/0x16273/0x16274`;
+PPSMC registers and message IDs are never reused. DCN banks two and three bound
+all four OTGs, legacy streams, HPO DP streams/link clocks and the single FRL
+stream. An active or disappearing consumer rejects startup/clock programming
+before any power future is polled or DAL command written.
+
+`unsafe start(&mut Smu).await` enables the restricted display power policy,
+checks nonzero firmware and DAL driver/header versions 1, and queries native
+SOCCLK/UCLK/FCLK/DISPCLK/DPPCLK/DCFCLK/DTBCLK levels. Fine-grained clocks read two
+endpoints; discrete tables are bounded to eight entries (six for UCLK), with
+nonzero ordered MHz values. These become immutable `Levels` only after the
+entire handshake succeeds. DPREFCLK remains firmware-owned.
+One-level ranges describe fixed clocks; they satisfy admitted requests without
+issuing unsupported DPM-floor or UCLK-switch commands.
+
+`prepare(Request).await` accepts 1–4 displays and bounded, nonzero DISP/DPP/DTB
+rates in kHz. Every consumer must remain retired. It reports the display count,
+pins DCFCLK and UCLK to the reported maxima, disables UCLK switching, and sets
+the requested display clocks, rounding mailbox requests up to MHz. Each floor
+requires both mailbox acceptance and the corresponding bit from
+`ReturnHardMinStatus`; its one-second deadline includes nested mailbox waits.
+DISP/DPP/DTB replies are actual kHz, checked against the requested floor and
+firmware ceiling. `Applied` distinguishes those actual rates from acknowledged
+DCF/UCLK floor requests. FCLK follows DCFCLK on this ASIC; the unsupported
+FCLK-switch message is not sent. This is a conservative pre-modeset policy,
+not active-stream clock scaling or a bandwidth/watermark solution.
+
+`Starting`/`Applying` are set before awaits. Failure records `Failed(Error)`;
+cancellation leaves the in-flight state. Both prevent mailbox replay, and
+partial floors are not rolled back. Historical successful levels/applied state
+remain diagnostic. `ColdBoot::prepare_display_clocks` and its platform wrapper
+serialize both MP1 owners after the three kernel queue proofs have drained;
+`display_clock_status`/platform `display_clocks` expose retained progress.
+The clocks are not changed automatically during firmware boot. Stream retirement,
+DCCG DTOs, mode bandwidth math, link and scanout setup remain prerequisites to
+native modesetting.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

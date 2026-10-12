@@ -42,6 +42,7 @@ pub struct Diagnostics {
     pub sdma_state: Option<crate::amdgpu_sdma_navi48::State>,
     pub sdma_interrupts:
         Option<Result<crate::amdgpu_sdma_navi48::InterruptProof, crate::amdgpu_sdma_navi48::Error>>,
+    pub display_clocks: Result<crate::amdgpu_dcn401_clk::Status, crate::amdgpu_dcn401_clk::Error>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -56,6 +57,7 @@ pub fn status() -> Status {
                 queue_interrupts: boot.queue_interrupts(),
                 sdma_state: boot.sdma_state(),
                 sdma_interrupts: boot.sdma_interrupts(),
+                display_clocks: boot.display_clock_status(),
             })
         }),
     }
@@ -275,6 +277,20 @@ pub async fn scan_display() -> Result<Vec<display::Port>, boot::Error> {
         .as_mut()
         .ok_or(boot::Error::Invalid)?
         .scan_display()
+        .await
+}
+
+/// Establish native DCN4 clock floors with all display consumers retired.
+/// Serializes both MP1 mailboxes against every other retained hardware owner.
+pub async fn prepare_display_clocks(
+    request: crate::amdgpu_dcn401_clk::Request,
+) -> Result<crate::amdgpu_dcn401_clk::Applied, crate::amdgpu_dcn401_clk::Error> {
+    OWNER
+        .lock()
+        .await
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_clk::Error::Busy)?
+        .prepare_display_clocks(request)
         .await
 }
 

@@ -19,6 +19,7 @@ const COMBO_BYTES: usize = 5812;
 const DRIVER_BYTES: usize = 1344;
 const POWER_BYTES: usize = 4468;
 const REQUIRED: u64 = (1 << 1) | (1 << 23) | (1 << 28) | (1 << 36);
+const DISPLAY: u64 = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 7);
 // Keep boot display/memory/link clocks fixed until DCN owns their constraints.
 // SMU throttlers, fan/thermal shutdown and electrical protections stay enabled.
 const ALLOWED: u64 = REQUIRED
@@ -64,6 +65,8 @@ pub enum State {
     BoardApplied,
     ConfiguringPower,
     PowerReady,
+    EnablingDisplayPower,
+    DisplayPowerReady,
     Failed,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,12 +392,61 @@ impl<I: Io> Engine<I> {
         }
         result
     }
+    async fn enable_display_power(&mut self) -> Result<PowerStatus, Error> {
+        if self.state == State::DisplayPowerReady {
+            self.access(|_| ())?;
+            return self.power.ok_or(Error::Invalid);
+        }
+        if self.state != State::PowerReady {
+            return Err(Error::Busy);
+        }
+        let previous = self.power.ok_or(Error::Invalid)?;
+        if self.features & DISPLAY != DISPLAY {
+            return Err(Error::Features(self.features));
+        }
+        self.state = State::EnablingDisplayPower;
+        let result = async {
+            self.access(|io| io.check_policy())??;
+            let allowed = previous.allowed | DISPLAY;
+            self.command(5, (allowed >> 32) as u32).await?;
+            self.command(4, allowed as u32).await?;
+            self.command(6, 0).await?;
+            let low = u64::from(self.command(0xc, 0).await?);
+            let enabled = low | (u64::from(self.command(0xd, 0).await?) << 32);
+            if enabled & (REQUIRED | DISPLAY) != REQUIRED | DISPLAY || enabled & !allowed != 0 {
+                return Err(Error::Features(enabled));
+            }
+            Ok(PowerStatus {
+                allowed,
+                enabled,
+                ..previous
+            })
+        }
+        .await;
+        self.state = if result.is_ok() {
+            State::DisplayPowerReady
+        } else {
+            State::Failed
+        };
+        if let Ok(power) = result {
+            self.power = Some(power);
+        }
+        result
+    }
 }
 #[derive(Debug)]
 pub struct Smu {
     engine: Engine<Mmio>,
 }
 impl Smu {
+    /// # Safety
+    /// Every display pipe/stream is retired and all kernel engines are idle.
+    /// The exclusive DCN owner must install clock floors before enabling a
+    /// stream. Keep deep sleep, voltage scaling, link DPM and GFXOFF disabled.
+    /// Failure/cancellation retains this owner and forbids replay.
+    pub(crate) async unsafe fn enable_display_power(&mut self) -> Result<PowerStatus, Error> {
+        self.engine.enable_display_power().await
+    }
     /// # Safety
     /// Caller owns this physical Navi48's MP1/index/HDP/reset/PM controls and
     /// trained, exclusively free VRAM pool. PSP has loaded SMU14 with no command

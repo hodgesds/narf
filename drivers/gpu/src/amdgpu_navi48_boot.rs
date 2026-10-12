@@ -1,5 +1,6 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
+use crate::amdgpu_dcn401_clk as clocks;
 use crate::amdgpu_ddc_navi48 as ddc;
 use crate::amdgpu_gfx12_queue as queues;
 use crate::amdgpu_gfx12_rs64 as rs64;
@@ -442,6 +443,7 @@ pub struct ColdBoot {
     sequence: Sequence<Hardware>,
     display: Result<display::Probe, display::Error>,
     ddc: Result<ddc::Ddc, display::Error>,
+    clocks: Result<clocks::ClockManager, clocks::Error>,
 }
 impl ColdBoot {
     /// # Safety
@@ -515,6 +517,9 @@ impl ColdBoot {
                 // only. All subsequent DDC and DMUB access shares this owner.
                 unsafe { ddc::Ddc::new(gpu, authority, clock) }.map_err(display::Error::Ddc)
             });
+        // SAFETY: same exclusive display/MP1 ownership, metadata validation
+        // only. Optional display failures do not block non-display engines.
+        let clocks = unsafe { clocks::ClockManager::new(gpu, authority) };
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(gpu.ip_blocks.len())
@@ -547,6 +552,7 @@ impl ColdBoot {
         Ok(Self {
             display,
             ddc,
+            clocks,
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -681,6 +687,38 @@ impl ColdBoot {
         // SAFETY: matching retained owners, serialized shared test pages and
         // independent IRQ service; the GC12 proofs have already drained.
         unsafe { sdma.prove_interrupts(gmc).await }
+    }
+    pub fn display_clock_status(&self) -> Result<clocks::Status, clocks::Error> {
+        self.clocks
+            .as_ref()
+            .map(clocks::ClockManager::status)
+            .map_err(|e| *e)
+    }
+    /// Prepare DCN4 clocks after kernel queue work drains. All inherited
+    /// display consumers must already be retired; clock preflight enforces it.
+    pub async fn prepare_display_clocks(
+        &mut self,
+        request: clocks::Request,
+    ) -> Result<clocks::Applied, clocks::Error> {
+        if self.state() != State::MemoryReady
+            || self.queue_state() != Some(queues::State::InterruptVerified)
+            || self.sdma_state() != Some(sdma::State::InterruptVerified)
+        {
+            return Err(clocks::Error::Busy);
+        }
+        let clocks = self.clocks.as_mut().map_err(|e| *e)?;
+        let smu = self
+            .sequence
+            .backend
+            .smu
+            .as_mut()
+            .ok_or(clocks::Error::Invalid)?;
+        if clocks.status().state == clocks::State::Prepared {
+            // SAFETY: retained matching SMU and drained owned engines. The
+            // clock owner checks every display consumer before changing DPM.
+            unsafe { clocks.start(smu).await }?;
+        }
+        clocks.prepare(request).await
     }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display

@@ -38,6 +38,8 @@ struct Fake {
     reject: Option<u32>,
     interface: u32,
     enabled: u64,
+    reported: Option<u64>,
+    revoke: Option<(u32, Cap<BusDeviceCap, Write>)>,
     dirty: bool,
     violation: bool,
     address: u64,
@@ -92,13 +94,18 @@ impl Io for Fake {
                 self.enabled |= p as u64;
                 0
             }
-            0xc => self.enabled as u32,
-            0xd => (self.enabled >> 32) as u32,
+            0xc => self.reported.unwrap_or(self.enabled) as u32,
+            0xd => (self.reported.unwrap_or(self.enabled) >> 32) as u32,
             0x1d => 500,
             0x1e => 3100,
             0x36 | 6 => 0,
             _ => panic!("unknown SMU14 message"),
         };
+        if let Some((message, cap)) = self.revoke {
+            if message == value {
+                cap.revoke();
+            }
+        }
     }
     fn check_policy(&mut self) -> Result<(), Error> {
         if self.policy == 0 {
@@ -141,6 +148,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
                 reject: None,
                 interface: DRIVER_INTERFACE,
                 enabled: 0,
+                reported: None,
+                revoke: None,
                 dirty: false,
                 violation: false,
                 address: 0,
@@ -414,4 +423,125 @@ fn smu14_timeout_and_rejection_prevent_later_power_commands() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/smu14",
     smu14_timeout_and_rejection_prevent_later_power_commands
+);
+
+fn display_engine() -> (Pool, Engine<Fake>) {
+    let (pool, mut e) = fixture();
+    e.state = State::PowerReady;
+    e.features = ALLOWED | DISPLAY;
+    e.power = Some(PowerStatus {
+        allowed: ALLOWED,
+        enabled: ALLOWED,
+        gfx_min_mhz: 500,
+        gfx_max_mhz: 3100,
+    });
+    (pool, e)
+}
+fn smu14_display_policy_enables_only_required_clocks_and_preserves_protection() -> TestResult {
+    let (_, mut e) = display_engine();
+    let old = e.power.unwrap();
+    let power = run(e.enable_display_power()).unwrap();
+    assert_eq!(power.allowed, old.allowed | 0xb8);
+    assert_eq!(power.enabled, power.allowed);
+    assert_eq!(power.enabled & 0xb8, 0xb8);
+    assert_eq!(
+        power.enabled & ((1 << 6) | (0xff << 8) | (1 << 18) | (1 << 40)),
+        0
+    );
+    assert_eq!((power.gfx_min_mhz, power.gfx_max_mhz), (500, 3100));
+    assert_eq!(
+        e.io.commands,
+        [
+            (5, (power.allowed >> 32) as u32),
+            (4, power.allowed as u32),
+            (6, 0),
+            (12, 0),
+            (13, 0)
+        ]
+    );
+    assert_eq!(e.state, State::DisplayPowerReady);
+    assert_eq!(e.power, Some(power));
+    assert_eq!(run(e.enable_display_power()), Ok(power));
+    assert_eq!(e.io.commands.len(), 5);
+    e.authority.revoke();
+    assert_eq!(run(e.enable_display_power()), Err(Error::Revoked));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_display_policy_enables_only_required_clocks_and_preserves_protection
+);
+
+fn smu14_display_power_rejects_missing_or_unprotected_features() -> TestResult {
+    for case in 0..5 {
+        let (_, mut e) = display_engine();
+        let old = e.power;
+        match case {
+            0 => e.features &= !(1 << 7),
+            1 => e.io.policy = 1,
+            2 => e.io.reported = Some((ALLOWED | DISPLAY) & !(1 << 36)),
+            3 => e.io.reported = Some(ALLOWED),
+            _ => e.io.reported = Some(ALLOWED | DISPLAY | (1 << 18)),
+        }
+        assert!(run(e.enable_display_power()).is_err());
+        assert_eq!(e.power, old);
+        if case < 2 {
+            assert!(e.io.commands.is_empty());
+        }
+        if case != 0 {
+            assert_eq!(run(e.enable_display_power()), Err(Error::Busy));
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_display_power_rejects_missing_or_unprotected_features
+);
+
+fn smu14_display_power_partial_failures_cancellation_and_revocation_are_terminal() -> TestResult {
+    for (i, message) in [5, 4, 6, 12, 13].into_iter().enumerate() {
+        for case in 0..3 {
+            let (_, mut e) = display_engine();
+            let old = e.power;
+            match case {
+                0 => e.io.reject = Some(message),
+                1 => e.io.stall = Some(message),
+                _ => e.io.revoke = Some((message, e.authority)),
+            }
+            if case == 1 {
+                let mut f = core::pin::pin!(e.enable_display_power());
+                assert!(f
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending());
+            } else {
+                assert_eq!(
+                    run(e.enable_display_power()),
+                    Err(if case == 0 {
+                        Error::Rejected(0xfd)
+                    } else {
+                        Error::Revoked
+                    })
+                );
+            }
+            assert_eq!(
+                e.state,
+                if case == 1 {
+                    State::EnablingDisplayPower
+                } else {
+                    State::Failed
+                }
+            );
+            assert_eq!(e.power, old);
+            assert_eq!(e.io.commands.len(), i + 1);
+            assert_eq!(run(e.enable_display_power()), Err(Error::Busy));
+            assert_eq!(e.io.commands.len(), i + 1);
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_display_power_partial_failures_cancellation_and_revocation_are_terminal
 );
