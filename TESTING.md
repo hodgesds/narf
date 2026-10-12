@@ -151,6 +151,11 @@ The runner prints `── summary: <pass> pass, <fail> fail, <skip> skip ──`
 on the way out. Skips are tests that need a device QEMU doesn't
 emulate (e.g. Intel 82599); they exit cleanly without failing the run.
 
+By default xtask captures the guest serial stream and prints the concise
+summary at the end. Set `XTASK_QEMU_SERIAL_TEE=1` to see each kernel-test and
+boot-smoke line live while retaining the same final parsing and diagnostics.
+CI enables this so a long QEMU phase always shows forward progress.
+
 ### Just the boot-smoke phase
 
 ```sh

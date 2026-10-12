@@ -3606,6 +3606,49 @@ fn emit_serial_tail(serial: &[u8]) {
     }
 }
 
+/// Capture a QEMU serial stream for result parsing, optionally mirroring it
+/// to a file and/or the invoking terminal as bytes arrive.
+fn capture_serial_stream(
+    mut serial: impl Read,
+    mut log: Option<std::fs::File>,
+    tee_stdout: bool,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut live = tee_stdout.then(std::io::stdout);
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        match serial.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(length) => {
+                let chunk = &chunk[..length];
+                bytes.extend_from_slice(chunk);
+                if let Some(file) = log.as_mut() {
+                    if let Err(error) = file.write_all(chunk) {
+                        eprintln!("xtask: serial log write failed: {error}");
+                        log = None;
+                    }
+                }
+                if let Some(stdout) = live.as_mut() {
+                    if let Err(error) = stdout.write_all(chunk).and_then(|()| stdout.flush()) {
+                        eprintln!("xtask: live serial output failed: {error}");
+                        live = None;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                eprintln!("xtask: serial read failed: {error}");
+                break;
+            }
+        }
+    }
+    bytes
+}
+
+fn serial_tee_enabled() -> bool {
+    std::env::var("XTASK_QEMU_SERIAL_TEE").is_ok_and(|value| value == "1")
+}
+
 /// Boot the kernel under QEMU. When `gate_exit` is set (the `test`
 /// subcommand's kernel-test phase), the QEMU exit status is checked
 /// against the all-pass status: the kernel-test runner calls
@@ -3743,29 +3786,9 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
     let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
-    let serial_reader = child.stdout.take().map(|mut stdout| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let mut log = serial_log;
-            let mut chunk = [0; 16 * 1024];
-            loop {
-                match stdout.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(length) => {
-                        bytes.extend_from_slice(&chunk[..length]);
-                        if let Some(file) = log.as_mut() {
-                            if let Err(error) = file.write_all(&chunk[..length]) {
-                                eprintln!("xtask: serial log write failed: {error}");
-                                log = None;
-                            }
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            bytes
-        })
+    let tee_stdout = serial_tee_enabled();
+    let serial_reader = child.stdout.take().map(|stdout| {
+        std::thread::spawn(move || capture_serial_stream(stdout, serial_log, tee_stdout))
     });
 
     let secs = kernel_test_timeout_secs();
@@ -4049,18 +4072,14 @@ fn wait_for_boot_smoke(
         "unsafe precondition",
     ];
 
-    // Capture stdout. Successful gates stay concise; failures print a bounded
-    // tail through the common diagnostic helper.
+    // Capture stdout. Successful gates stay concise by default; CI can tee the
+    // stream live while retaining the same marker parsing and failure tail.
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| anyhow!("qemu child has no stdout"))?;
-    let reader_handle = std::thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut transcript = Vec::new();
-        let _ = stdout.read_to_end(&mut transcript);
-        transcript
-    });
+    let tee_stdout = serial_tee_enabled();
+    let reader_handle = std::thread::spawn(move || capture_serial_stream(stdout, None, tee_stdout));
 
     // Wait for QEMU to exit naturally after the guest powers itself off,
     // OR force-kill on timeout.

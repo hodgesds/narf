@@ -81,6 +81,9 @@ production boot and host interoperability postflight.
 - Three outcome channels: success (QEMU exit 0x10), failure (0x11),
   timeout (harness kill).
 - Runs on `x86_64` and `aarch64` targets on every PR.
+- Functional CI sets `XTASK_QEMU_SERIAL_TEE=1`: kernel-test and boot-smoke
+  serial is flushed into the live job log while the same captured bytes remain
+  authoritative for marker parsing, summaries, and bounded failure tails.
 - Driver-specific live acceptance can add a host harness to this boot. The
   x86_64 `e1000-module-net-smoke` gate requires pre-probe initramfs loading in
   an operator-selected driver frame, exclusive ownership of QEMU's 82540EM,

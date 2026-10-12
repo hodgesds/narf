@@ -44,7 +44,9 @@ serial output for panic and success markers, catching full-boot
 regressions that isolated smokes miss. `run-interactive` drives the
 serial port programmatically to prove the keystroke-to-UART interactive
 loop, and `musl-demo` verifies the linux-compat demo binaries boot and
-run through the real shell, execve, and ELF loader.
+run through the real shell, execve, and ELF loader. Set
+`XTASK_QEMU_SERIAL_TEE=1` to mirror captured kernel-test and boot-smoke serial
+to stdout in real time; CI enables it so long guest phases remain observable.
 
 **Change-based CI.** `affected` parses `cargo metadata` to build the
 workspace reverse-dependency closure and, from a git diff against a base

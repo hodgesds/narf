@@ -32,6 +32,9 @@ env:
   # QEMU. 2 GiB (1 GiB per NUMA node) keeps it comfortably in range.
   # aarch64 + non-QEMU jobs ignore it. See qemu_args / NARF_QEMU_MEM_MB.
   NARF_QEMU_MEM_MB: "2048"
+  # Kernel-test and boot-smoke still capture serial for marker parsing, but
+  # relay it live so a long guest run has visible forward progress in Actions.
+  XTASK_QEMU_SERIAL_TEE: "1"
 
 jobs:
   # Change-based CI gate. Computes which jobs + kernel-test subsystems the

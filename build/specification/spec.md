@@ -122,11 +122,14 @@ and CI compiler-cache integration.
   already completed the production-init boot and host-side btrfs
   interoperability postflight; the default remains the full two-phase gate.
 - Successful kernel-test and boot-smoke QEMU phases keep serial output
-  captured and print concise summaries. A failure or timeout emits a bounded
-  64-KiB diagnostic tail. Abnormal emulator termination is reported with the
-  platform exit-status description (including the Unix signal when present),
-  not only the optional numeric exit code. Child timeouts use polling rather
-  than process-wide signal handlers, so sandboxed runners remain supported.
+  captured and print concise summaries by default. With
+  `XTASK_QEMU_SERIAL_TEE=1`, the captured stream is also flushed to stdout as
+  it arrives so CI exposes guest progress without changing result parsing. A
+  failure or timeout emits a bounded 64-KiB diagnostic tail. Abnormal emulator
+  termination is reported with the platform exit-status description
+  (including the Unix signal when present), not only the optional numeric exit
+  code. Child timeouts use polling rather than process-wide signal handlers,
+  so sandboxed runners remain supported.
 - `cargo xtask boot-smoke --arch=<arch>` accepts success only when the guest
   emits its clean-exit marker and QEMU then exits naturally with status zero
   through ACPI S5 on x86_64 or PSCI `SYSTEM_OFF` on aarch64. The x86
@@ -135,7 +138,8 @@ and CI compiler-cache integration.
 - `XTASK_QEMU_SERIAL_LOG=/path/to/serial.log` optionally copies the kernel-test
   QEMU stdout stream to a host file while tests run. The file is truncated at
   the start of that phase; normal concise summaries and timeout diagnostics
-  remain enabled. This adds no guest-side instrumentation.
+  remain enabled. It may be combined with `XTASK_QEMU_SERIAL_TEE=1`. Neither
+  option adds guest-side instrumentation.
 - The second, whole-kernel phase of `cargo xtask test` strips both
   `kernel-test` and features that transitively select that harness
   (`user-mode-e2e`, `user-mode-testbin`, and `narf-libc-validate`) so it
