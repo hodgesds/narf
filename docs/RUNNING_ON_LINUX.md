@@ -459,7 +459,11 @@ For higher-fidelity / multi-queue networking, `XTASK_QEMU_TAP=<ifname>`
 switches to a real host tap backend (the guest is reachable directly at
 its static IP; you pre-create + bring up the tap), and
 `XTASK_QEMU_QUEUES=N` requests N virtio-net queue pairs on a
-`multi_queue` tap. `XTASK_QEMU_NETDUMP=<path>` pcaps the wire.
+`multi_queue` tap. With `--hw-profile=legacy-only`, the same
+`XTASK_QEMU_TAP` setting attaches the e1000 NIC instead. In the full hardware
+profile, set `XTASK_QEMU_LEGACY_TAP=<ifname>` to give e1000 its own distinct
+TAP while `XTASK_QEMU_TAP` remains assigned to virtio-net.
+`XTASK_QEMU_NETDUMP=<path>` pcaps the virtio-net wire.
 
 ---
 
@@ -476,6 +480,8 @@ handlers in `build/xtask/src/main.rs`:
 | `NARF_QEMU_MEM_MB` | total guest RAM in MiB (must be even; split across 2 NUMA nodes) | `1024` |
 | `NARF_QEMU_CPU` | QEMU CPU model, e.g. `max,-x2apic,-tsc-deadline` | `max` |
 | `NARF_QEMU_EXTRA` | extra whitespace-separated QEMU args (e.g. `-gdb tcp::1234`) | unset |
+| `XTASK_QEMU_TAP` | virtio-net TAP; e1000 TAP under `--hw-profile=legacy-only` | unset (SLIRP) |
+| `XTASK_QEMU_LEGACY_TAP` | dedicated e1000 TAP in any hardware profile | unset (SLIRP) |
 | `XTASK_QEMU_APPEND` | kernel cmdline via multiboot2 `-append` | unset |
 | `XTASK_QEMU_TIMEOUT_SECS` | `run` watchdog | `600` |
 | `XTASK_BOOT_SMOKE_TIMEOUT_SECS` | `boot-smoke` timeout | `300` |

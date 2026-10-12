@@ -1159,10 +1159,7 @@ impl Arch {
                         "-device".into(),
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
-                    let n1 = match std::env::var("XTASK_QEMU_LEGACY_HOSTFWD") {
-                        Ok(fwd) if !fwd.is_empty() => format!("user,id=n1,hostfwd={fwd}"),
-                        _ => "user,id=n1".into(),
-                    };
+                    let n1 = legacy_qemu_netdev(profile);
                     args.extend_from_slice(&[
                         "-netdev".into(),
                         n1,
@@ -1392,10 +1389,7 @@ impl Arch {
                         "-device".into(),
                         "nvme,drive=nvm0,serial=narf".into(),
                     ]);
-                    let n1 = match std::env::var("XTASK_QEMU_LEGACY_HOSTFWD") {
-                        Ok(fwd) if !fwd.is_empty() => format!("user,id=n1,hostfwd={fwd}"),
-                        _ => "user,id=n1".into(),
-                    };
+                    let n1 = legacy_qemu_netdev(profile);
                     args.extend_from_slice(&[
                         "-netdev".into(),
                         n1,
@@ -2482,6 +2476,41 @@ fn tap_is_multi_queue(tap: &str) -> bool {
         .and_then(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
         .map(|flags| flags & 0x0100 != 0)
         .unwrap_or(false)
+}
+
+/// Select the backend for the legacy/e1000 netdev (`n1`). A dedicated
+/// `XTASK_QEMU_LEGACY_TAP` always wins. In a `legacy-only` fixture the generic
+/// `XTASK_QEMU_TAP` is unambiguous and is accepted as a convenient fallback;
+/// in the full fixture it remains owned by virtio-net (`n0`) so two emulated
+/// NICs never accidentally open the same single-queue tap.
+fn legacy_qemu_netdev(profile: HwProfile) -> String {
+    let dedicated_tap = std::env::var("XTASK_QEMU_LEGACY_TAP")
+        .ok()
+        .filter(|tap| !tap.is_empty());
+    let generic_tap = if matches!(profile, HwProfile::LegacyOnly) {
+        std::env::var("XTASK_QEMU_TAP")
+            .ok()
+            .filter(|tap| !tap.is_empty())
+    } else {
+        None
+    };
+    let hostfwd = std::env::var("XTASK_QEMU_LEGACY_HOSTFWD")
+        .ok()
+        .filter(|fwd| !fwd.is_empty());
+    legacy_qemu_netdev_from(
+        dedicated_tap.as_deref().or(generic_tap.as_deref()),
+        hostfwd.as_deref(),
+    )
+}
+
+fn legacy_qemu_netdev_from(tap: Option<&str>, hostfwd: Option<&str>) -> String {
+    match tap {
+        Some(tap) => format!("tap,id=n1,ifname={tap},script=no,downscript=no"),
+        None => match hostfwd {
+            Some(fwd) => format!("user,id=n1,hostfwd={fwd}"),
+            None => "user,id=n1".into(),
+        },
+    }
 }
 
 /// Effective virtio-net queue-pair count for the current netdev config.
@@ -9070,7 +9099,9 @@ fn without_kernel_test_features(features: &str) -> String {
 
 #[cfg(test)]
 mod kernel_test_feature_tests {
-    use super::{validate_test_subsystems, without_kernel_test_features, Cli, Cmd};
+    use super::{
+        legacy_qemu_netdev_from, validate_test_subsystems, without_kernel_test_features, Cli, Cmd,
+    };
     use clap::Parser;
 
     #[test]
@@ -9101,6 +9132,19 @@ mod kernel_test_feature_tests {
             panic!("test subcommand parsed as another variant");
         };
         assert!(args.kernel_tests_only);
+    }
+
+    #[test]
+    fn legacy_netdev_prefers_tap_and_preserves_slirp_fallbacks() {
+        assert_eq!(
+            legacy_qemu_netdev_from(Some("narf-e1k-tap"), Some("tcp::17777-:7777")),
+            "tap,id=n1,ifname=narf-e1k-tap,script=no,downscript=no"
+        );
+        assert_eq!(
+            legacy_qemu_netdev_from(None, Some("tcp::17777-:7777")),
+            "user,id=n1,hostfwd=tcp::17777-:7777"
+        );
+        assert_eq!(legacy_qemu_netdev_from(None, None), "user,id=n1");
     }
 
     #[test]

@@ -285,6 +285,12 @@ const REG_EERD: u64 = 0x0014;
 /// reads ICR exactly once per IRQ to acknowledge the device and
 /// deassert legacy INTx.
 const REG_ICR: u64 = 0x00C0;
+/// Interrupt Throttling Rate. The interval is expressed in 256-ns units on
+/// 82540-class hardware; zero disables moderation.
+const REG_ITR: u64 = 0x00C4;
+/// 82574/e1000e MSI-X interrupt-throttle register for vector 0. This driver
+/// binds one shared vector, so only entry zero is programmed.
+const REG_EITR0_82574: u64 = 0x00E8;
 const REG_IMS: u64 = 0x00D0;
 /// Interrupt Mask Clear — writing 1 to a bit disables that cause's
 /// IRQ delivery (8254x SDM §13.4.22).
@@ -462,6 +468,9 @@ pub const IMS_RXT0: u32 = 1 << 7;
 /// link-side framing errors.
 const IMS_DEFAULT: u32 =
     IMS_RXT0 | IMS_RXDMT0 | IMS_RXO | IMS_RXSEQ | IMS_TXDW | IMS_TXQE | IMS_LSC;
+/// Linux's initial conservative e1000 rate is 20,000 interrupts/second. The
+/// register stores the interval in 256-ns units: 1e9 / (20_000 * 256) = 195.
+const ITR_20K_INTERRUPTS_PER_SEC: u32 = 195;
 
 /// One page of 16-byte legacy TX descriptors. Keep one entry unused so TDT
 /// never catches TDH and makes a full ring indistinguishable from an empty
@@ -471,9 +480,10 @@ const IMS_DEFAULT: u32 =
 const TX_RING_LEN: usize = 256;
 const TX_RING_USABLE: usize = TX_RING_LEN - 1;
 /// The stack may hand the device one complete Ethernet/IPv4/TCP super-frame
-/// up to this size. Keeping it at 16 KiB gives a useful packet-rate reduction
-/// while bounding each pool buffer to four pages.
-const MAX_TSO_FRAME: usize = 16 * 1024;
+/// up to this size. A 64-KiB coherent buffer remains within the allocator's
+/// single-segment contract and lets the 8254x TSO engine amortize stack and
+/// doorbell work across a full TCP send-buffer chunk.
+const MAX_TSO_FRAME: usize = 64 * 1024;
 /// 8254x descriptors are deliberately split at 4 KiB, matching the legacy
 /// Linux driver's controller-errata-safe maximum data per descriptor.
 const MAX_DATA_PER_TXD: usize = 4096;
@@ -486,6 +496,11 @@ const MAX_DATA_PER_TXD: usize = 4096;
 const RX_RING_LEN: usize = 256;
 /// Buffer size for each RX entry — must match RCTL.BSIZE.
 const RX_BUF_LEN: usize = 2048;
+/// Maximum descriptors returned to hardware by one RX-pump pass. Batching the
+/// RDT doorbell avoids one MMIO write (and one QEMU VM exit) per Ethernet
+/// frame, while the finite budget prevents sustained RX from monopolising the
+/// cooperative executor.
+const RX_DRAIN_BUDGET: usize = 64;
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default)]
@@ -590,6 +605,11 @@ struct TxQueueState {
     /// Plain packets watch themselves; every context/data slot in a TSO packet
     /// watches its final EOP/RS data descriptor.
     completion_slot: alloc::vec::Vec<usize>,
+    /// Last producer tail published to TDT. This distinguishes descriptors
+    /// queued behind `TxMeta::more` from descriptors hardware can already
+    /// consume, which matters when the next multi-descriptor TSO packet does
+    /// not fit in the remaining ring space.
+    doorbell_tail: usize,
 }
 
 impl TxQueueState {
@@ -598,7 +618,12 @@ impl TxQueueState {
             cursor: TxRingCursor::new(),
             owned: (0..TX_RING_LEN).map(|_| None).collect(),
             completion_slot: (0..TX_RING_LEN).collect(),
+            doorbell_tail: 0,
         }
+    }
+
+    fn needs_flush_for(&self, descriptor_count: usize) -> bool {
+        self.cursor.available() < descriptor_count && self.doorbell_tail != self.cursor.next_to_use
     }
 }
 
@@ -1313,6 +1338,20 @@ impl E1000 {
         if irq_vector.is_some() {
             // SAFETY: identity-mapped MMIO.
             unsafe {
+                // Moderate the shared completion vector before unmasking its
+                // causes. Per-frame RX interrupts dominate a virtual 82540 at
+                // gigabit packet rates; this matches Linux's initial e1000
+                // setting while keeping the worst-case added latency near
+                // 50 microseconds. MSI-X parts use their per-vector EITR0;
+                // legacy INTx/MSI parts use the shared ITR.
+                mmio.write32(
+                    if msix.is_some() {
+                        REG_EITR0_82574
+                    } else {
+                        REG_ITR
+                    },
+                    ITR_20K_INTERRUPTS_PER_SEC,
+                );
                 mmio.write32(REG_IMS, IMS_DEFAULT);
             }
         }
@@ -1488,6 +1527,22 @@ impl E1000 {
         }
     }
 
+    /// Publish every descriptor queued since the previous TDT write. Repeated
+    /// calls are cheap: no MMIO write occurs when hardware already knows the
+    /// current producer tail.
+    fn kick_tx_locked(&self, state: &mut TxQueueState) {
+        let tail = state.cursor.next_to_use;
+        if state.doorbell_tail == tail {
+            return;
+        }
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: identity-mapped MMIO; `tail` is a descriptor-ring index.
+        unsafe {
+            self.mmio.write32(REG_TDT, tail as u32);
+        }
+        state.doorbell_tail = tail;
+    }
+
     /// Publish one descriptor after its ring slot and optional owned buffer
     /// have been reserved under `tx_state`.
     fn post_tx_locked(
@@ -1521,10 +1576,7 @@ impl E1000 {
         // one-slot-empty limit so an interrupted producer cannot fill the
         // software ring with descriptors hardware has never seen.
         if kick || state.cursor.in_flight >= TX_RING_USABLE {
-            // SAFETY: identity-mapped MMIO; next_to_use is a ring index.
-            unsafe {
-                self.mmio.write32(REG_TDT, state.cursor.next_to_use as u32);
-            }
+            self.kick_tx_locked(state);
         }
     }
 
@@ -1544,6 +1596,14 @@ impl E1000 {
         let data_descs = len.div_ceil(MAX_DATA_PER_TXD);
         let descriptor_count = 1 + data_descs;
         if state.cursor.available() < descriptor_count {
+            // `TxMeta::more` may have deliberately deferred the doorbell for
+            // the preceding packet. A multi-descriptor packet can run out of
+            // room before the one-slot-empty threshold, so flush that partial
+            // batch before waiting for completions. Otherwise hardware never
+            // sees the descriptors whose DD bits the retry loop needs.
+            if state.needs_flush_for(descriptor_count) {
+                self.kick_tx_locked(state);
+            }
             return None;
         }
 
@@ -1584,10 +1644,7 @@ impl E1000 {
 
         compiler_fence(Ordering::SeqCst);
         if kick || state.cursor.in_flight >= TX_RING_USABLE {
-            // SAFETY: identity-mapped MMIO; next_to_use is a ring index.
-            unsafe {
-                self.mmio.write32(REG_TDT, state.cursor.next_to_use as u32);
-            }
+            self.kick_tx_locked(state);
         }
         Some(final_ticket)
     }
@@ -1813,63 +1870,84 @@ impl E1000 {
         len
     }
 
-    /// Process one received frame **in place** from its RX DMA page — zero
-    /// copy — then re-arm the descriptor. The device has set DD (it is done
-    /// writing the page) and we re-arm the slot only after `f` returns, so
-    /// processing can never race a device write: because e1000's RX is
-    /// synchronous no replacement buffer is needed (unlike virtio, which must
-    /// swap in a fresh buffer before handing the filled one upward). This is
-    /// the P-F zero-copy RX path; it replaces the per-frame byte copy `rx_recv`
-    /// does into a scratch buffer. Returns `true` iff a frame was processed.
-    pub fn rx_recv_in_place<F: FnMut(&mut [u8])>(&self, mut f: F) -> bool {
+    /// Process up to `budget` received frames **in place** from their RX DMA
+    /// pages, then return all consumed descriptors to hardware with one RDT
+    /// doorbell. The device has set DD before each callback and a descriptor is
+    /// re-armed only after its callback returns, so processing cannot race a
+    /// device write. A bounded batch also keeps the cooperative executor fair.
+    fn rx_drain_in_place<F: FnMut(&mut [u8])>(&self, budget: usize, mut f: F) -> usize {
+        if budget == 0 {
+            return 0;
+        }
         let mut head_g = self.rx_head.lock();
-        let head = (*head_g) as usize;
+        let mut head = (*head_g) as usize;
         let ring_phys = self.rx_ring.dma_addr().raw();
-        let desc_addr = ring_phys + (head * 16) as u64;
-        // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
-        let desc = unsafe {
-            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
-        };
-        if desc.status & RXD_STAT_DD == 0 {
-            return false;
+        let mut drained = 0;
+        let limit = budget.min(RX_RING_LEN);
+        while drained < limit {
+            let desc_addr = ring_phys + (head * 16) as u64;
+            // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
+            let desc = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>(),
+                )
+            };
+            if desc.status & RXD_STAT_DD == 0 {
+                break;
+            }
+            let len = (desc.length as usize).min(RX_BUF_LEN);
+            // Descriptor `head` is backed by `rx_pool[head]` at probe and
+            // re-armed in place (the buffer address never changes), so the
+            // pairing is stable for the device's lifetime. Hand the stack a
+            // mutable slice straight into that identity-mapped page.
+            // SAFETY: the page is device-filled (DD set) and not concurrently
+            // written (we re-arm only after `f` returns); it is identity-mapped
+            // and `len <= RX_BUF_LEN <= page size`, so the slice stays within
+            // the buffer. An XDP rewrite in `f` writes the DMA page we own.
+            let frame = unsafe {
+                core::slice::from_raw_parts_mut(self.rx_pool[head].cpu_mut_ptr_at::<u8>(0), len)
+            };
+            f(frame);
+            // Re-arm the descriptor: clear status, keep the same buffer
+            // address. The final compiler fence orders every descriptor write
+            // before the single tail doorbell below.
+            let new_desc = RxDesc {
+                addr: desc.addr,
+                length: 0,
+                csum: 0,
+                status: 0,
+                errors: 0,
+                special: 0,
+            };
+            // SAFETY: identity-mapped DMA ring.
+            unsafe {
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                    new_desc,
+                );
+            }
+            head = (head + 1) % RX_RING_LEN;
+            drained += 1;
         }
-        let len = (desc.length as usize).min(RX_BUF_LEN);
-        // Descriptor `head` is backed by `rx_pool[head]` at probe and re-armed
-        // in place (the buffer address never changes), so the pairing is stable
-        // for the device's lifetime. Hand the stack a mutable slice straight
-        // into that identity-mapped page.
-        // SAFETY: the page is device-filled (DD set) and not concurrently
-        // written (we re-arm only after `f` returns); it is identity-mapped and
-        // `len <= RX_BUF_LEN <= page size`, so the slice stays within the
-        // buffer. An XDP rewrite in `f` writes the page we own until re-arm.
-        let frame = unsafe {
-            core::slice::from_raw_parts_mut(self.rx_pool[head].cpu_mut_ptr_at::<u8>(0), len)
-        };
-        f(frame);
-        // Re-arm the descriptor: clear status, keep the same buffer address.
-        let new_desc = RxDesc {
-            addr: desc.addr,
-            length: 0,
-            csum: 0,
-            status: 0,
-            errors: 0,
-            special: 0,
-        };
-        // SAFETY: identity-mapped DMA ring.
-        unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
-                new_desc,
-            );
+        if drained != 0 {
+            let last_rearmed = (head + RX_RING_LEN - 1) % RX_RING_LEN;
+            compiler_fence(Ordering::SeqCst);
+            // SAFETY: identity-mapped MMIO; `last_rearmed` is the final RX
+            // descriptor made available in this batch.
+            unsafe {
+                self.mmio.write32(REG_RDT, last_rearmed as u32);
+            }
+            *head_g = head as u32;
         }
-        let new_head = ((head + 1) % RX_RING_LEN) as u32;
-        compiler_fence(Ordering::SeqCst);
-        // SAFETY: identity-mapped MMIO.
-        unsafe {
-            self.mmio.write32(REG_RDT, head as u32);
-        }
-        *head_g = new_head;
-        true
+        drained
+    }
+
+    /// Process one received frame **in place** from its RX DMA page — zero
+    /// copy — then re-arm the descriptor. This is the single-frame public API;
+    /// the asynchronous pump uses `rx_drain_in_place` to amortize its RDT
+    /// doorbell across a burst. Returns `true` iff a frame was processed.
+    pub fn rx_recv_in_place<F: FnMut(&mut [u8])>(&self, f: F) -> bool {
+        self.rx_drain_in_place(1, f) != 0
     }
 
     /// `true` if at least one RX descriptor has its DD bit set.
@@ -1989,9 +2067,15 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     );
     *E1000_IFNAME.lock() = Some(alloc::boxed::Box::leak(name.into_boxed_str()));
     narf_net::iface::install_rx_drain(rx_pump_step);
+    // The legacy e1000 has one RX queue and delivers ordinary MTU-sized
+    // descriptors, so software GRO is what amortizes the shared stack work at
+    // gigabit packet rates. The coalescer excludes loopback and preserves
+    // control/options boundaries; the RX pump flushes it whenever the ring is
+    // drained to empty.
+    narf_net::tcp_stack::set_gro(true);
     // Opt into zero-copy TX (P-F): the stack builds egress frames straight into
     // a pooled DMA buffer and hands it to `e1000_send_frame_zc`, which DMAs it
-    // without the per-frame slice copy `e1000_send_frame` does. The 16 KiB
+    // without the per-frame slice copy `e1000_send_frame` does. The 64 KiB
     // buffers also hold a complete bounded TSO super-frame; completion returns
     // them to the same TX-ring-deep recycling pool.
     narf_net::iface::enable_zero_copy_tx_pool(
@@ -2026,40 +2110,43 @@ fn spawn_pumps(device: Arc<E1000>, tx_cons: Consumer<Frame, TX_RING_N>) {
 }
 
 async fn e1000_rx_pump(device: Arc<E1000>) {
-    // Adaptive RX poll. The old form `yield_now().await` every loop made
-    // this task self-wake on EVERY executor round — a perpetually-runnable
-    // task that kept the cooperative executor from ever halting
-    // (nr_running never hit 0), pinned the CPU at 100%, and paced every
-    // scheduler round at the spin rate. With a second idle NIC attached
-    // (e1000 alongside virtio-net, the standard off-box-redis QEMU
-    // config), that spin paced the WHOLE system: a freshly-woken peer
-    // (the epoll-parked server task on the *other* NIC) waited a full
-    // ~230 µs spinning round to be re-polled, turning a sub-100 µs wake
-    // into a ~0.5 ms request latency. Fix: after a run of empty polls,
-    // PARK on the timer wheel so the executor can halt; stay tight-poll
-    // while frames are actually flowing.
-    const IDLE_BACKOFF_ROUNDS: u32 = 64;
-    let idle_park_cycles = narf_time::ns_to_cycles(1_000_000);
-    let mut idle_rounds: u32 = 0;
+    // Build the IRQ waiter BEFORE checking DD. WaitForIrq snapshots the
+    // vector's fire count, so an interrupt racing the empty-ring check either
+    // makes the waiter immediately ready or invokes its registered waker. The
+    // old 1-ms timer poll capped a receiver to roughly one ACK opportunity per
+    // millisecond (~17 Mbit/s in the TAP iperf diagnostic).
+    //
+    // Once awake, drain without yielding until the ring is empty. This is the
+    // same shape as an interrupt-driven NAPI poll: the device interrupt starts
+    // a burst, then descriptor DD bits drive the hot path without one wake per
+    // packet. A short deadline remains as a lost-interrupt safety net; devices
+    // without a wired vector retain the 1-ms polling fallback.
+    const IRQ_FALLBACK_MS: u64 = 10;
+    let poll_fallback_cycles = narf_time::ns_to_cycles(1_000_000);
     loop {
-        if device.rx_recv_in_place(|frame| dispatch_rx_frame(&device, frame)) {
-            idle_rounds = 0;
+        let irq_waiter = device.irq_vector.map(|vector| {
+            narf_interrupts::wait_for_irq_until(
+                vector,
+                narf_time::Deadline::after_ms(IRQ_FALLBACK_MS),
+            )
+        });
+        if device.rx_drain_in_place(RX_DRAIN_BUDGET, |frame| dispatch_rx_frame(&device, frame)) != 0
+        {
             continue;
         }
-        idle_rounds = idle_rounds.saturating_add(1);
-        if idle_rounds < IDLE_BACKOFF_ROUNDS {
-            // Recently active: tight re-poll for low RX latency.
-            narf_scheduler::yield_now().await;
-        } else {
-            // Idle: fold any receive-FIFO overruns accumulated during the
-            // prior burst into the interface counters (MPC is clear-on-read)
-            // so the loss is observable, then park ~1 ms on the timer wheel
-            // so the executor can halt instead of spinning this empty poll.
-            let missed = device.read_mpc();
-            if missed > 0 {
-                narf_net::iface::note_rx_overrun(e1000_ifname(), missed as u64);
+
+        // Empty ring is the NAPI-complete point for software GRO. This is a
+        // no-op while GRO remains disabled.
+        narf_net::tcp_stack::gro_flush();
+        let missed = device.read_mpc();
+        if missed > 0 {
+            narf_net::iface::note_rx_overrun(e1000_ifname(), missed as u64);
+        }
+        match irq_waiter {
+            Some(waiter) => {
+                let _ = waiter.await;
             }
-            narf_time::sleep_cycles(idle_park_cycles).await;
+            None => narf_time::sleep_cycles(poll_fallback_cycles).await,
         }
     }
 }
@@ -2566,4 +2653,35 @@ pub async fn tx_async(frame: &[u8]) -> Result<(), E1000Error> {
             narf_interrupts::wait_for_irq_until(vector, narf_time::Deadline::after_ms(500)).await;
     }
     Ok(())
+}
+
+mod tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::{TxQueueState, TX_RING_USABLE};
+
+    fn smoke_partial_tso_ring_requires_deferred_batch_flush() -> TestResult {
+        let mut state = TxQueueState::new();
+        for _ in 0..(TX_RING_USABLE - 3) {
+            if state.cursor.reserve().is_none() {
+                return TestResult::Fail("e1000 TX ring exhausted before expected");
+            }
+        }
+        if state.cursor.available() != 3 {
+            return TestResult::Fail("e1000 TX ring availability accounting drifted");
+        }
+        if !state.needs_flush_for(5) {
+            return TestResult::Fail("deferred TX batch was not flushed before TSO wait");
+        }
+
+        state.doorbell_tail = state.cursor.next_to_use;
+        if state.needs_flush_for(5) {
+            return TestResult::Fail("published TX batch requested a redundant flush");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/net/e1000",
+        smoke_partial_tso_ring_requires_deferred_batch_flush
+    );
 }

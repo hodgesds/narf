@@ -47,6 +47,7 @@ builtin = [
     "dep:narf-scheduler",
     "dep:narf-drivers",
     "dep:narf-interrupts",
+    "dep:narf-kernel-test",
     "dep:narf-memory",
     "dep:narf-arch",
     "dep:narf-acpi",
@@ -73,6 +74,7 @@ narf-net          = { path = "../../../net", optional = true }
 narf-scheduler    = { path = "../../../scheduler", optional = true }
 narf-drivers      = { path = "../..", optional = true }
 narf-interrupts   = { path = "../../../interrupts", optional = true }
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
 narf-memory       = { path = "../../../memory", optional = true }
 narf-arch         = { path = "../../../arch", optional = true }
 narf-acpi         = { path = "../../../acpi", optional = true }

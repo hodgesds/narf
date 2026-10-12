@@ -89,6 +89,12 @@ and CI compiler-cache integration.
   exclusively module-owned QEMU 82540EM: xtask builds and ABI-stamps
   `e1000.ko`, stages it in an initramfs, selects `driver2` at boot load, and
   suppresses the built-in e1000 registration for that fixture.
+- QEMU network backends are selectable without source changes.
+  `XTASK_QEMU_TAP=<ifname>` attaches virtio-net to a pre-created TAP, or e1000
+  when `--hw-profile=legacy-only` makes that selection unambiguous.
+  `XTASK_QEMU_LEGACY_TAP=<ifname>` explicitly selects the e1000 TAP in any
+  hardware profile. TAP selection takes precedence over the corresponding
+  `XTASK_QEMU_HOSTFWD` / `XTASK_QEMU_LEGACY_HOSTFWD` SLIRP configuration.
 - `cargo xtask affected --base REF --head REF --event EVENT` computes CI jobs,
   directly changed packages, reverse-dependent packages, and kernel subsystem
   filters from Cargo metadata and Rust registration tokens. PRs use their head

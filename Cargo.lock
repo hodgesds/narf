@@ -1459,6 +1459,7 @@ dependencies = [
  "narf-interrupts",
  "narf-io",
  "narf-ipc",
+ "narf-kernel-test",
  "narf-lib",
  "narf-memory",
  "narf-net",

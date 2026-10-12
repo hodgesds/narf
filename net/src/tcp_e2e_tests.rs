@@ -1616,9 +1616,22 @@ fn tcp_e2e_zero_window() -> Result<(), &'static str> {
         return Err("receiver accepted data beyond its buffer");
     }
 
-    // Phase 2: application drains; transfer finishes.
-    let mut got = Vec::new();
+    // Phase 2: the first application read must immediately advertise the
+    // reopened window. Waiting for a persist probe here limits a real receiver
+    // to roughly one receive-buffer window per probe interval.
+    clear_log();
     let mut buf = vec![0u8; 16 * 1024];
+    let first = recv(c.server, &mut buf).map_err(|_| "initial window-opening recv failed")?;
+    if first == 0 {
+        return Err("initial window-opening recv returned no data");
+    }
+    if !wire_log()
+        .iter()
+        .any(|s| s.dir() == Dir::ToClient && s.payload_len == 0 && s.has(FLAG_ACK) && !s.dropped)
+    {
+        return Err("recv did not emit an immediate TCP window update");
+    }
+    let mut got = buf[..first].to_vec();
     let done = run_until(BUDGET_BULK, || {
         if sent < data.len() {
             if let Ok(n) = send(c.client, &data[sent..]) {

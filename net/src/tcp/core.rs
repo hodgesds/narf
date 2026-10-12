@@ -1630,8 +1630,15 @@ pub fn send(id: u32, buf: &[u8]) -> Result<usize, ()> {
 
 pub fn recv(id: u32, buf: &mut [u8]) -> Result<usize, ()> {
     let arc = lookup_tcb(id).ok_or(())?;
-    let mut t = arc.lock();
-    Ok(t.recv_buf.read(buf))
+    let (n, window_update) = {
+        let mut t = arc.lock();
+        let n = t.recv_buf.read(buf);
+        (n, n > 0 && receive_window_update_due(&t))
+    };
+    if window_update {
+        send_ack(&arc, 0);
+    }
+    Ok(n)
 }
 
 /// `true` if a `recv` on this TCB would return immediately — either
@@ -1742,6 +1749,11 @@ pub fn recv_errno(id: u32, buf: &mut [u8]) -> Result<usize, i32> {
     }
     let n = t.recv_buf.read(buf);
     if n > 0 {
+        let window_update = receive_window_update_due(&t);
+        drop(t);
+        if window_update {
+            send_ack(&arc, 0);
+        }
         return Ok(n);
     }
     if t.fin_received {
@@ -2393,7 +2405,7 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
     };
     let (seq, ack, window, opt_bytes) = {
         let mut t = arc.lock();
-        let window = effective_advertised_window(&t);
+        let window = effective_advertised_window(&mut t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         // Clear pending delayed-ACK + count.
@@ -2480,7 +2492,7 @@ fn send_data(
     };
     let (ack, window, opt_bytes) = {
         let mut t = arc.lock();
-        let window = effective_advertised_window(&t);
+        let window = effective_advertised_window(&mut t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         t.delayed_ack_deadline_cycles = 0;
@@ -2522,9 +2534,21 @@ fn send_data(
     }
 }
 
-fn effective_advertised_window(t: &Tcb) -> u16 {
+fn effective_advertised_window(t: &mut Tcb) -> u16 {
     let raw = t.recv_buf.window();
+    t.rcv_wnd = raw;
     t.opts.encode_our_window(raw)
+}
+
+/// Whether userspace has freed enough receive-buffer space to justify an
+/// immediate pure ACK/window update. `rcv_wnd` records the raw window carried
+/// by the most recent outbound segment. Waiting until at least one peer MSS
+/// has reopened avoids silly-window updates while still accumulating a series
+/// of small reads until forward progress can resume.
+fn receive_window_update_due(t: &Tcb) -> bool {
+    let current = t.recv_buf.window();
+    let threshold = u32::from(t.opts.peer_mss.max(MIN_MSS));
+    current >= t.rcv_wnd.saturating_add(threshold)
 }
 
 fn tsval_now() -> u32 {
@@ -2711,11 +2735,11 @@ fn fire_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // Otherwise it's data (possibly with FIN): resend the head of the
     // unacknowledged range.
     let (seq, payload, fin, ack, window, opt_bytes) = {
-        let t = arc.lock();
+        let mut t = arc.lock();
         let (seq, payload, fin) = retransmit_head(&t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
-        let window = effective_advertised_window(&t);
+        let window = effective_advertised_window(&mut t);
         (seq, payload, fin, t.rcv_nxt, window, opts)
     };
     if payload.is_empty() && fin == 0 {
@@ -2779,7 +2803,7 @@ fn send_persist_probe(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     };
     let (seq, window, opt_bytes, ack) = {
         let mut t = arc.lock();
-        let window = effective_advertised_window(&t);
+        let window = effective_advertised_window(&mut t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         // Zero-length probe at snd_una - 1 (Linux `tcp_xmit_probe_skb`): an
@@ -2855,7 +2879,7 @@ fn tick_keepalive(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
         t.keepalive_probes_sent = t.keepalive_probes_sent.saturating_add(1);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
-        let window = effective_advertised_window(&t);
+        let window = effective_advertised_window(&mut t);
         (t.snd_una.wrapping_sub(1), window, opts, t.rcv_nxt)
     };
     let frame = build_tcb_frame(
@@ -3945,14 +3969,14 @@ fn fast_retransmit(arc: &Arc<IrqSafeSpinLock<Tcb>>) {
     // Retransmit the head of the unacknowledged range unless the peer
     // already SACKed it. This is the RFC 6675 selective-retx path.
     let (seq, payload, fin, window, ack, opt_bytes) = {
-        let t = arc.lock();
+        let mut t = arc.lock();
         if t.retx_queue.is_empty() || t.scoreboard.is_sacked(t.snd_una) {
             return;
         }
         let (seq, payload, fin) = retransmit_head(&t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
-        let window = effective_advertised_window(&t);
+        let window = effective_advertised_window(&mut t);
         (seq, payload, fin, window, t.rcv_nxt, opts)
     };
     if payload.is_empty() && fin == 0 {
