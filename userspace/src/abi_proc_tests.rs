@@ -2954,6 +2954,34 @@ fn smoke_abi_proc_namespace_open_mints_setns_fd() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_namespace_open_mints_setns_fd);
 
+// ── Namespace magic links are usable by pathname capability probes ─────
+//
+// systemd's namespace feature probe is deliberately smaller than an open:
+// `namespace_type_supported()` asks `access("/proc/self/ns/net", F_OK)`
+// before an executor attempts CLONE_NEWNET.  The final proc link is a magic
+// link, not a normal symlink whose rendered `net:[inum]` text is a pathname.
+// Following it must therefore reach the retained nsfs object; otherwise
+// systemd disables PrivateNetwork= without trying to create the namespace.
+#[cfg(feature = "container")]
+fn smoke_abi_proc_namespace_access_follows_magic_link() -> TestResult {
+    with_setup(|| {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let path = b"/proc/self/ns/net\0";
+        match call(
+            Syscall::Faccessat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("faccessat(F_OK) did not follow /proc/self/ns/net"),
+        }
+    })
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_namespace_access_follows_magic_link
+);
+
 // ── read(2) must not hold the fd-table lock across FileOps ────────
 //
 // `sys_read` used to call `FileOps::read` while holding the caller's

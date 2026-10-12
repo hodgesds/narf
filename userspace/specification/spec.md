@@ -215,7 +215,12 @@ The native mmap entry validates a page-aligned byte offset before descriptor
 lookup, resolves non-anonymous descriptors before `do_mmap`-style validation,
 rejects an exact zero length with `EINVAL`, and distinguishes fixed-address
 misalignment (`EINVAL`), range exhaustion (`ENOMEM`), and the protected
-low-address floor (`EPERM`) in Linux order.
+low-address floor (`EPERM`) in Linux order. The retained open-file description
+is the sole admission authority for a file-backed VMA: every such mapping
+requires a readable description, and `MAP_SHARED` with `PROT_WRITE` also
+requires a writable one (`EACCES` otherwise). Once admitted, the VMA retains
+that exact `FileOps` reference across descriptor close/reuse; lazy demand
+faults load its pages without re-running path DAC or substituting a reused fd.
 
 File/device mapping publication holds the address-space transaction and that
 address space's owner bucket while it atomically retires overlapping owners
@@ -1339,6 +1344,13 @@ keep the namespace live; kernel network teardown runs only after the final
 reference closes. Per-namespace IPv4 loopback TCP/UDP delivery uses
 namespace-keyed endpoint tables, so identical loopback endpoints coexist and
 cannot exchange traffic across namespaces.
+
+A followed pathname permission probe of `/proc/<pid>/ns/<flavour>` resolves
+the retained nsfs object, rather than treating its rendered
+`<flavour>:[inode]` text as an ordinary symlink target. `AT_SYMLINK_NOFOLLOW`
+continues to operate on the procfs symlink itself. This lets service managers
+use `access("/proc/self/ns/net", F_OK)` as the Linux namespace-support probe
+before creating a private network namespace.
 
 The TCP socket-option compatibility surface validates and round-trips Linux
 `TCP_SYNCNT`, `TCP_LINGER2`, `TCP_DEFER_ACCEPT`, `TCP_WINDOW_CLAMP`,
