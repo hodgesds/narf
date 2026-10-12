@@ -3330,9 +3330,11 @@ fn render_cpu_list(mask: u64) -> String {
 
 fn render_maps(info: &ProcTaskInfo) -> String {
     // Linux /proc/[pid]/maps shape:
-    //   start-end perms offset dev:major:minor inode pathname
-    // We omit dev:major:minor (NARF doesn't yet model per-VMA
-    // backing files); pathname slot carries our label or empty.
+    //   start-end perms offset dev inode pathname
+    // NARF does not yet retain per-VMA backing identity, so unknown
+    // backing uses `00:00 0`. The inode MUST still be followed by a space
+    // when the pathname is empty: Crashpad's DelimitedFileReader consumes
+    // the inode with `GetDelim(' ')`, exactly as it does on Linux.
     let mut s = String::new();
     for v in info.vmas.iter() {
         write_maps_line(&mut s, v);
@@ -3351,15 +3353,56 @@ fn write_maps_line(s: &mut String, v: &ProcVma) {
     let _ = core::fmt::Write::write_fmt(
         s,
         format_args!(
-            "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0",
+            "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0 ",
             v.start, v.end, r, w, x, p,
         ),
     );
     if !v.label.is_empty() {
-        let _ = core::fmt::Write::write_fmt(s, format_args!("          {}", v.label));
+        let _ = core::fmt::Write::write_str(s, v.label);
     }
     s.push('\n');
 }
+
+/// Crashpad parses `/proc/<pid>/maps` with `GetDelim(' ')` for the inode,
+/// including anonymous mappings. Linux therefore leaves a separator after an
+/// otherwise pathless inode; ending the line immediately after `0` makes
+/// Chromium's crash handler reject the whole map as malformed.
+fn smoke_maps_anonymous_inode_is_space_terminated() -> TestResult {
+    let info = ProcTaskInfo {
+        vmas: alloc::vec![ProcVma {
+            start: 0x1000,
+            end: 0x2000,
+            readable: true,
+            writable: false,
+            executable: false,
+            shared: false,
+            ..ProcVma::default()
+        }],
+        ..sample_task_info()
+    };
+    let maps = render_maps(&info);
+    let Some(line) = maps.strip_suffix('\n') else {
+        return TestResult::Fail("maps line lacked a trailing newline");
+    };
+    let mut fields = line.splitn(6, ' ');
+    let valid = fields.next() == Some("0000000000001000-0000000000002000")
+        && fields.next() == Some("r--p")
+        && fields.next() == Some("00000000")
+        && fields.next() == Some("00:00")
+        && fields.next() == Some("0")
+        // This final empty field exists only when the inode was followed by
+        // the required delimiter; it is the exact Crashpad line-162 check.
+        && fields.next() == Some("");
+    if valid {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("anonymous maps inode is not space-delimited for Crashpad")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_maps_anonymous_inode_is_space_terminated
+);
 
 /// One `/proc/<pid>/smaps` VMA block, and the `smaps_rollup` summary, share
 /// this field list.
