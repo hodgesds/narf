@@ -253,11 +253,28 @@ pub fn flush_active_scanout() {
         flush();
     }
 }
+/// Shows the pointer image at a screen position (None hides it) on the
+/// active scanout's hardware cursor. Returns false only when the owner has no
+/// hardware cursor for it; a busy owner skips the update and returns true, so
+/// the caller never paints a software sprite into a hardware-cursor surface.
+pub type ScanoutCursor = fn(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool;
+static CURSOR: IrqSafeSpinLock<Option<ScanoutCursor>> = IrqSafeSpinLock::new(None);
+/// The active scanout's hardware cursor, if its owner published one.
+pub fn active_scanout_cursor() -> Option<ScanoutCursor> {
+    *CURSOR.lock()
+}
+/// Attach a hardware cursor to the currently published external scanout.
+pub(crate) fn publish_external_cursor(cursor: Option<ScanoutCursor>) {
+    if ACTIVE.lock().is_some() {
+        *CURSOR.lock() = cursor;
+    }
+}
 /// Publish a scanout owned outside this module, with its flush. Clearing the
-/// flush first means no writer is told to flush a surface being withdrawn.
+/// flush (and cursor) first means no writer reaches a surface being withdrawn.
 pub(crate) fn publish_external(scanout: Option<GenericFb>, flush: Option<ScanoutFlush>) {
     if scanout.is_none() {
         *FLUSH.lock() = None;
+        *CURSOR.lock() = None;
         publish(None);
     } else {
         publish(scanout);

@@ -514,13 +514,19 @@ pub fn restore_boot_scanout() -> bool {
     };
     adopt(fb)
 }
+/// The console draws to exactly the scanout a driver published.
+pub(crate) fn adopted_external_scanout() -> bool {
+    narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_some_and(|published| {
+        GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire) == published.addr
+    })
+}
 /// The adopted external scanout as a DRM blit target, through its kernel
 /// mapping. Only a driver-published scanout that the console actually adopted
 /// qualifies: the boot framebuffer keeps its existing fbdev-only behaviour,
 /// and nothing here is exposed to a userspace mmap.
 fn external_scanout_geom() -> Option<narf_drivers_gpu::drm_fb_hook::ScanoutGeom> {
     let published = narf_drivers_gpu::amdgpu_dcn_display::active_scanout()?;
-    if GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire) != published.addr {
+    if !adopted_external_scanout() {
         return None;
     }
     let fb = (*GENERIC_FB.lock())?;

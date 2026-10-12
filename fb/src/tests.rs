@@ -1327,3 +1327,21 @@ kernel_test_in!(
     "fb",
     smoke_fb_drm_external_geometry_requires_published_scanout
 );
+
+/// The hardware-cursor arrow matches the software sprite's bitmap, and no
+/// hardware path is taken unless the console adopted a published scanout.
+fn smoke_fb_hardware_cursor_arrow_and_gating() -> TestResult {
+    let image = crate::cursor::arrow_image();
+    let set = image.iter().filter(|&&p| p == 0xffff_ffff).count();
+    let clear = image.iter().filter(|&&p| p == 0).count();
+    if set == 0 || set + clear != image.len() {
+        return TestResult::Fail("arrow is not opaque white over transparent");
+    }
+    if narf_drivers_gpu::amdgpu_dcn_display::active_scanout().is_none()
+        && crate::cursor::hardware_cursor(Some((10, 10)))
+    {
+        return TestResult::Fail("hardware cursor without an adopted scanout");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("fb", smoke_fb_hardware_cursor_arrow_and_gating);

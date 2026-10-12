@@ -553,6 +553,38 @@ pub async unsafe fn retire_inherited_display(
     unsafe { boot.retire_inherited_display().await }
 }
 
+/// Pipe of the published scanout, for the cursor hook.
+static CURSOR_PIPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Cursor hook published with the live scanout: upload once, then move;
+/// hide with an off-screen move. Never waits for the owner.
+fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool {
+    let pipe = CURSOR_PIPE.load(core::sync::atomic::Ordering::Acquire);
+    let Some(mut owner) = OWNER.try_lock() else {
+        return true;
+    };
+    let Some(boot) = owner.as_mut() else {
+        return true;
+    };
+    let (w, h, _) = image;
+    let shown = boot
+        .display_timing_status()
+        .ok()
+        .and_then(|s| s.cursor)
+        .is_some_and(|c| c.pipe == pipe && (c.width, c.height) == (w, h));
+    // A failure quarantines the pipe in the owner; the pointer just stops.
+    let _ = match (shown, position) {
+        (false, None) => return true, // never shown: nothing to hide
+        // SAFETY: serialized retained owner; the platform excludes writers.
+        (true, at) => unsafe {
+            boot.move_display_cursor(pipe, at.unwrap_or((-(w as i32), -(h as i32))))
+        },
+        // SAFETY: as above.
+        (false, Some(at)) => unsafe { boot.set_display_cursor(pipe, image, at) },
+    };
+    true
+}
+
 /// Light the first answering DP SST sink at its preferred mode on `pipe`,
 /// filling each visible row with `fill(y, row)` before fetch starts, then
 /// publish the live surface as the active external scanout.
@@ -572,7 +604,9 @@ pub async unsafe fn modeset_display(
         (modeset, boot.display_scanout_framebuffer(pipe)?)
     };
     // Outside the owner lock: the observer may move the console here at once.
+    CURSOR_PIPE.store(pipe, core::sync::atomic::Ordering::Release);
     crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
+    crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
     Ok(modeset)
 }
 
@@ -611,6 +645,7 @@ pub async unsafe fn flip_display(
     };
     if crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| fb.addr == before.addr) {
         crate::amdgpu_dcn_display::publish_external(Some(after), Some(flush_scanout));
+        crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
     }
     Ok(done)
 }

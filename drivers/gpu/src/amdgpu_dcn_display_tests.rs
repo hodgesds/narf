@@ -372,6 +372,50 @@ kernel_test_in!(
     display_external_scanout_flush_follows_publication
 );
 
+/// A hardware cursor attaches only to a published scanout and goes away
+/// with it, before observers move writers elsewhere.
+fn display_external_cursor_follows_publication() -> TestResult {
+    fn cursor(_: (u32, u32, &[u32]), _: Option<(i32, i32)>) -> bool {
+        true
+    }
+    fn observer(scanout: Option<GenericFb>) {
+        if scanout.is_none() && active_scanout_cursor().is_some() {
+            CURSOR_AT_WITHDRAW.store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+    static CURSOR_AT_WITHDRAW: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    let previous = swap_scanout_observer_for_test(Some(observer));
+    let restore = |result: TestResult| {
+        publish_external(None, None);
+        swap_scanout_observer_for_test(previous);
+        result
+    };
+    publish_external_cursor(Some(cursor));
+    if active_scanout_cursor().is_some() {
+        return restore(TestResult::Fail("cursor without a published scanout"));
+    }
+    publish_external(
+        Some(GenericFb::new(0x40_0000_0000, 640, 480, 2560, 32)),
+        None,
+    );
+    publish_external_cursor(Some(cursor));
+    if active_scanout_cursor().is_none() {
+        return restore(TestResult::Fail("published cursor missing"));
+    }
+    publish_external(None, None);
+    if active_scanout_cursor().is_some()
+        || CURSOR_AT_WITHDRAW.load(core::sync::atomic::Ordering::Acquire)
+    {
+        return restore(TestResult::Fail("cursor outlived its scanout"));
+    }
+    restore(TestResult::Pass)
+}
+kernel_test_in!(
+    "drivers/gpu/dcn-display",
+    display_external_cursor_follows_publication
+);
+
 /// The widest mode this path accepts must be exactly the widest the timing
 /// generator will program — not one column more, which is what an independent
 /// `8192` here gave.

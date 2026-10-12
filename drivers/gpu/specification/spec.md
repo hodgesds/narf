@@ -911,6 +911,14 @@ witness expects exactly the reported cursor enable. Stopping scanout hides the
 cursor under its lock before the plane stops, and drops the report while the
 buffer stays retained. Any readback mismatch quarantines the pipe.
 `tests/dcn401_cursor.c` checks the registers, including the MPC lock bank.
+The platform publishes a cursor hook with the scanout
+(`amdgpu_dcn_display::publish_external_cursor`, cleared on withdrawal before
+observers run). It try-locks the owner, uploads the image once, moves it
+afterwards, and hides it with an off-screen move. When the owner is busy it
+skips the update but still reports the cursor as handled, so the fb layer
+never paints a software sprite into a hardware-cursor surface. The fb cursor
+pump uses it for both the console pointer and a compositor's DRM cursor
+whenever the console adopted exactly the published scanout.
 
 `unsafe ColdBoot::retire_inherited_display` retires the legacy DP SST output
 the firmware left running. It runs in native dependency order:
