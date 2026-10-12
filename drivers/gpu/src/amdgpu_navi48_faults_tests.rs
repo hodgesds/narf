@@ -1,0 +1,374 @@
+use super::*;
+use alloc::{collections::BTreeMap, vec, vec::Vec};
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+const GCTX: u64 = 0x15890;
+const MCTX: u64 = 0x21590;
+const GCP: u64 = 0x17828;
+const CCP: u64 = 0x17894;
+const GST: u64 = 0x15740;
+const MST: u64 = 0x213c0;
+const GCTL: u64 = 0x15730;
+const MCTL: u64 = 0x213b0;
+struct Fake {
+    regs: BTreeMap<u64, u32>,
+    reads: Vec<u64>,
+    writes: Vec<(u64, u32)>,
+    stale_gfx: bool,
+    ignored: Option<u64>,
+    revoke: Option<(u64, Cap<BusDeviceCap, Write>)>,
+}
+impl Io for Fake {
+    fn read(&mut self, at: u64) -> u32 {
+        self.reads.push(at);
+        if at == GST && self.stale_gfx {
+            self.stale_gfx = false;
+            return 0;
+        }
+        *self.regs.get(&at).unwrap_or(&0)
+    }
+    fn write(&mut self, at: u64, v: u32) {
+        self.writes.push((at, v));
+        if self.ignored != Some(at) {
+            self.regs
+                .insert(at, if at == GCTL || at == MCTL { v & !1 } else { v });
+        }
+        if let Some((when, cap)) = self.revoke {
+            if at == when {
+                cap.revoke();
+            }
+        }
+    }
+}
+fn fixture() -> Engine<Fake> {
+    let mut regs = BTreeMap::new();
+    for (at, v) in [
+        (GCTX, 0xaaa801),
+        (MCTX, 0xaaa801),
+        (GCP, 0x84000000),
+        (CCP, 0x84000000),
+        (GCTL, 0x1ffc),
+        (MCTL, 0x1ffc),
+        (GST, 0x785753),
+        (MST, 0x342026),
+    ] {
+        regs.insert(at, v);
+    }
+    Engine {
+        io: Fake {
+            regs,
+            reads: Vec::new(),
+            writes: Vec::new(),
+            stale_gfx: false,
+            ignored: None,
+            revoke: None,
+        },
+        authority: Cap::bootstrap(),
+        layout: Layout {
+            gfx: 0x10000,
+            mm: 0x20000,
+        },
+        status: Status {
+            state: State::Prepared,
+            count: 0,
+            last: None,
+            mask_error: None,
+        },
+        published: 0,
+    }
+}
+fn event(client: u8, source: u8, ring: u8) -> ih::Event {
+    ih::Event {
+        ih_ring: 1,
+        vector: ih::Vector::decode([
+            u32::from(client) | (u32::from(source) << 8) | (u32::from(ring) << 16) | (7 << 24),
+            0x1234,
+            0,
+            0x425678,
+            0xdeadbeef,
+            0xab,
+            0,
+            0,
+        ]),
+    }
+}
+fn navi48_fault_arming_preserves_defaults_eops_and_inactive_user_contexts() -> TestResult {
+    let mut e = fixture();
+    e.io.regs.insert(GCP, 0);
+    e.io.regs.insert(CCP, 0);
+    e.enable().unwrap();
+    assert_eq!(e.status.state, State::Armed);
+    assert_eq!(
+        e.io.writes,
+        [
+            (GCTX, 0xfffc01),
+            (MCTX, 0xfffc01),
+            (GCP, 0x85c00000),
+            (CCP, 0x85800000)
+        ]
+    );
+    assert_eq!(e.io.regs[&GCTL], 0x1ffc);
+    assert_eq!(e.io.regs[&MCTL], 0x1ffc);
+    assert_eq!(e.enable(), Err(Error::Busy));
+    e.stop();
+    assert_eq!(e.status.state, State::Contained);
+    for (at, value) in [
+        (GCTX, 0xaaa801),
+        (MCTX, 0xaaa801),
+        (GCP, 0x84000000),
+        (CCP, 0x84000000),
+    ] {
+        assert_eq!(e.io.regs[&at], value);
+    }
+    assert_eq!(e.enable(), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_fault_arming_preserves_defaults_eops_and_inactive_user_contexts
+);
+
+fn navi48_vm_faults_decode_48bit_addresses_capture_then_ack_and_contain() -> TestResult {
+    for client in [0x0a, 0x12] {
+        let mut e = fixture();
+        e.enable().unwrap();
+        e.io.reads.clear();
+        e.io.writes.clear();
+        e.io.stale_gfx = true;
+        let mut v = event(client, 0, 0xff);
+        v.vector.vmid_source = client == 0x12;
+        let (hub, status, control) = if client == 0x0a {
+            (Hub::Gfx, GST, GCTL)
+        } else {
+            (Hub::Mm, MST, MCTL)
+        };
+        e.handle(v).unwrap();
+        assert_eq!(e.status.count, 1);
+        assert_eq!(e.status.state, State::Contained);
+        let record = e.status.last.unwrap();
+        assert_eq!(record.event, v);
+        assert_eq!(
+            record.kind,
+            Kind::Vm {
+                hub,
+                page: 0xbdeadbeef000,
+                write: true,
+                retry: true
+            }
+        );
+        assert!(record.acknowledged);
+        assert_eq!(record.protection.unwrap().raw, e.io.regs[&status]);
+        assert_eq!(
+            e.io.reads.iter().filter(|&&at| at == status).count(),
+            if client == 0x0a { 2 } else { 1 }
+        );
+        assert_eq!(e.io.writes[0], (control, 0x1ffd));
+        assert_eq!(e.io.regs[&control], 0x1ffc);
+        assert_eq!(e.io.writes.len(), 5);
+        // Already queued faults still get captured/acknowledged after masking.
+        e.handle(v).unwrap();
+        assert_eq!(e.status.count, 2);
+        assert_eq!(e.io.writes.len(), 6);
+        assert_eq!(e.enable(), Err(Error::Busy));
+    }
+    let p = Protection::decode(0x785753);
+    assert_eq!(
+        (
+            p.more_faults,
+            p.walker_error,
+            p.permission_faults,
+            p.mapping_error
+        ),
+        (true, 1, 5, true)
+    );
+    assert_eq!((p.client, p.write, p.vmid), (43, false, 7));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_vm_faults_decode_48bit_addresses_capture_then_ack_and_contain
+);
+
+fn navi48_command_faults_use_exact_client_source_and_preserve_queue_identity() -> TestResult {
+    for (source, fault) in [
+        (183, CommandFault::BadOpcode),
+        (184, CommandFault::PrivilegedRegister),
+        (185, CommandFault::PrivilegedInstruction),
+    ] {
+        let mut e = fixture();
+        e.enable().unwrap();
+        e.io.writes.clear();
+        e.io.reads.clear();
+        let v = event(0x0a, source, 0xda);
+        e.handle(v).unwrap();
+        assert_eq!(e.status.state, State::Contained);
+        let record = e.status.last.unwrap();
+        assert_eq!(
+            record.kind,
+            Kind::Command {
+                fault,
+                me: 2,
+                pipe: 2,
+                queue: 5
+            }
+        );
+        assert_eq!(record.protection, None);
+        assert!(!record.acknowledged);
+        assert_eq!(e.io.writes.len(), 4);
+        assert!(!e.io.reads.contains(&GST) && !e.io.reads.contains(&MST));
+    }
+    let mut e = fixture();
+    e.enable().unwrap();
+    e.io.writes.clear();
+    e.io.reads.clear();
+    for (client, source) in [(0x0a, 181), (0x0a, 49), (0x04, 0), (0x12, 183), (0x12, 185)] {
+        e.handle(event(client, source, 0)).unwrap();
+    }
+    assert_eq!(e.status.state, State::Armed);
+    assert_eq!(e.status.count, 0);
+    assert!(e.io.writes.is_empty() && e.io.reads.is_empty());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_command_faults_use_exact_client_source_and_preserve_queue_identity
+);
+
+fn navi48_fault_preflight_and_partial_programming_fail_without_reuse() -> TestResult {
+    for case in 0..7 {
+        let mut e = fixture();
+        let expected = match case {
+            0 => {
+                e.io.regs.insert(GCTX, 0);
+                Error::Busy
+            }
+            1 => {
+                e.io.regs.insert(MCTX, 0xaaa901);
+                Error::Busy
+            }
+            2 => {
+                e.io.regs.insert(GCTX + 15 * 4, 1);
+                Error::Busy
+            }
+            3 => {
+                e.io.regs.insert(CCP, u32::MAX);
+                Error::DeviceGone
+            }
+            4 => {
+                e.io.regs.insert(GCP, 0x01800000);
+                Error::Busy
+            }
+            5 => {
+                e.authority.revoke();
+                Error::Revoked
+            }
+            _ => {
+                e.io.regs.insert(MCTX + 4, 1);
+                Error::Busy
+            }
+        };
+        assert_eq!(e.enable(), Err(expected));
+        assert_eq!(e.status.state, State::Failed(expected));
+        assert!(e.io.writes.is_empty());
+        assert_eq!(e.enable(), Err(Error::Busy));
+    }
+    let mut e = fixture();
+    e.io.ignored = Some(MCTX);
+    assert_eq!(e.enable(), Err(Error::Readback));
+    assert_eq!(e.status.mask_error, None);
+    assert_eq!(
+        e.io.writes,
+        [
+            (GCTX, 0xfffc01),
+            (MCTX, 0xfffc01),
+            (GCTX, 0xaaa801),
+            (MCTX, 0xaaa801)
+        ]
+    );
+    let mut e = fixture();
+    e.io.revoke = Some((GCTX, e.authority));
+    assert_eq!(e.enable(), Err(Error::Revoked));
+    assert_eq!(e.status.mask_error, Some(Error::Revoked));
+    assert_eq!(e.io.writes, [(GCTX, 0xfffc01)]);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_fault_preflight_and_partial_programming_fail_without_reuse
+);
+
+fn navi48_fault_mmio_failures_preserve_raw_evidence_and_uncertain_masks() -> TestResult {
+    for case in 0..3 {
+        let mut e = fixture();
+        e.enable().unwrap();
+        e.io.writes.clear();
+        let v = event(0x0a, 0, 4);
+        let expected = match case {
+            0 => {
+                e.authority.revoke();
+                Error::Revoked
+            }
+            1 => {
+                e.io.regs.insert(GST, u32::MAX);
+                Error::DeviceGone
+            }
+            _ => {
+                e.io.revoke = Some((GCTL, e.authority));
+                Error::Revoked
+            }
+        };
+        assert_eq!(e.handle(v), Err(expected));
+        assert_eq!(e.status.state, State::Failed(expected));
+        let record = e.status.last.unwrap();
+        assert_eq!(record.event, v);
+        assert_eq!(record.protection.is_some(), case == 2);
+        assert_eq!(record.acknowledged, case == 2);
+        assert_eq!(
+            e.status.mask_error,
+            if case == 1 {
+                None
+            } else {
+                Some(Error::Revoked)
+            }
+        );
+        assert_eq!(e.io.writes.len(), [0, 4, 1][case]);
+        assert_eq!(e.enable(), Err(Error::Busy));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_fault_mmio_failures_preserve_raw_evidence_and_uncertain_masks
+);
+
+fn navi48_fault_monitor_constructor_checks_discovery_and_live_authority() -> TestResult {
+    let mut words = vec![0; 0x80000 / 4];
+    let gpu = crate::amdgpu_gmc_navi48::tests::descriptor(&mut words);
+    let cap = Cap::bootstrap();
+    // SAFETY: owned register fixture; construction does not access hardware.
+    let monitor = unsafe { Monitor::new(&gpu, cap) }.unwrap();
+    assert_eq!(monitor.status().state, State::Prepared);
+    for case in 0..6 {
+        let mut bad = crate::amdgpu_gmc_navi48::tests::descriptor(&mut words);
+        match case {
+            0 => bad.chip.did = crate::amdgpu::NAVI22,
+            1 => bad.ip_blocks[0].revision = 0,
+            2 => bad.ip_blocks[1].minor = 0,
+            3 => bad.ip_blocks[0].base_addrs[0] = 0x20000 - 0x1e25,
+            4 => bad.ip_blocks.push(bad.ip_blocks[1]),
+            _ => bad.ip_blocks[1].num_bases = 0,
+        }
+        // SAFETY: only discovery validation on owned descriptors.
+        let result = unsafe { Monitor::new(&bad, cap) };
+        assert!(matches!(result, Err(Error::Unsupported)));
+    }
+    cap.revoke();
+    // SAFETY: revoked authority must fail before any register use.
+    let result = unsafe { Monitor::new(&gpu, cap) };
+    assert!(matches!(result, Err(Error::Revoked)));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_fault_monitor_constructor_checks_discovery_and_live_authority
+);

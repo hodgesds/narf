@@ -341,9 +341,9 @@ pages, recording the proof before DMUB startup. This proves kernel command
 transport and translated writes, not rendering, shader dispatch or user IBs.
 
 After IH service handoff, `unsafe Queues::prove_interrupts(gmc).await` submits
-one native RELEASE_MEM EOP per retained kernel queue. It enables the native
-graphics/compute timestamp and generic interrupt sources, preserving other
-control bits, and advances each ring from 256 to 512 dwords. Success requires
+one native RELEASE_MEM EOP per retained kernel queue. It verifies that the
+interrupt service enabled the native timestamp/generic sources, then advances
+each ring from 256 to 512 dwords. Success requires
 the fresh confirmed fence, full RPTR drain and exactly one matching IH EOP
 since the pre-submission snapshot. With MSI configured, both submissions must
 also advance the CPU vector's fire count; polling alone returns an
@@ -473,7 +473,8 @@ ring1 self-IV updates and ring0 rearm/delivery are enabled only after PCI setup.
 Every config/register batch invokes current PCI authority. Failed/published
 routes retain their vector/handler until independent quiescence.
 
-`amdgpu_navi48_interrupts` owns the transferred rings and route behind a separate
+`amdgpu_navi48_interrupts` owns the transferred rings, route and native fault
+monitor behind a separate
 async mutex. The final framebuffer handoff starts its executor task; HDMI scans
 and firmware/display owner locks cannot delay its draining. The worker snapshots
 the IRQ counter before draining, releases its lock before all waits/yields, and
@@ -483,6 +484,40 @@ an IH arming error fails the handoff with its owners retained. ARM hardware MSI
 is explicitly refused until ITS has real ITT backing; register models still
 run on both architectures. Fatal draining disables/masks CPU delivery without
 recycling a possibly in-flight vector.
+
+`amdgpu_navi48_faults` describes VM and command fault diagnostics. The internal
+retained monitor validates exact GC12.0.1/MMHUB4.1 banks without writes during
+boot preparation. Service handoff retains all three owners before enabling
+sources. It requires active, nonretrying VMID0 in both hubs, inactive user
+contexts and no inherited enables in its source masks. It enables the seven
+VM protection-fault classes only for VMID0, plus bad-opcode/privileged-register
+faults for the owned graphics and compute pipes and privileged-instruction
+faults for graphics. It also enables the graphics/compute EOP sources; queue
+proofs only read those controls, so their setup cannot race fault masking.
+Readback is checked after each write. Default-page policy, user contexts and
+unrelated control bits are preserved; containment leaves EOP enables intact.
+
+GC/client 0x0a and VMC/client 0x12 source zero select their respective VM hub.
+The monitor decodes the IV's 48-bit page address, write/retry flags and retains
+the full VMID/PASID/node/queue payload. It snapshots the selected hub's protection
+latch, including its separate VMID and client, before posting its self-clearing
+acknowledgement. An IV indicating GFX VMID source performs Linux's fast-GRBM
+dummy-read sequence.
+The latch can refer to a concurrent fault, so it is not attributed to the IV's
+process. GC sources 183/184/185 classify bad opcodes, privileged registers and
+privileged instructions using native ME/pipe/queue bits. Other sources remain
+raw diagnostic events; they cause no monitor MMIO.
+
+The first recognized fault masks all owned fault sources and makes the monitor
+`Contained`; this masks reporting and does not establish engine quiescence.
+Already-queued VM faults are still recorded and acknowledged.
+`Status::faults` exposes the count, last typed record, monitor state and any mask
+failure. These survive history consumption and eviction. MMIO/revocation errors
+retain the raw vector, stop owned sources where possible, disable CPU delivery,
+and leave uncertain hardware/storage retained. EOP proofs reject any recognized
+fault or a monitor that is not armed. There is no automatic reset, PTE repair,
+fault replay, user-process termination or reuse of failed allocations. SDMA,
+shader, poison and media fault handling remain separate open work.
 
 `Status` exposes the IH state/report, MSI setup outcome, receive/eviction counts,
 sticky last VM-fault vector and two kernel EOP counters. EOP classification

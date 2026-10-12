@@ -320,12 +320,20 @@ kernel-context EOP vector per queue. Configured MSI additionally requires CPU
 delivery for each proof; polling is reported separately. Faults, cancellation
 and missing evidence leave retained diagnostic state and prevent replay.
 This path has software models; physical MSI delivery remains unverified.
+The independent service now arms native VMID0 protection faults in both hubs
+and the owned graphics/compute command exception sources. It decodes VM fault
+addresses and queue identities, snapshots hub status before acknowledgement,
+and masks owned sources after a fault. Typed diagnostics survive raw-history
+eviction, and VM or command faults prevent the EOP proof from succeeding.
+Setup/MMIO/revocation failures retain uncertain owners and mask CPU delivery
+where possible. No fault replay, automatic reset or allocation reuse is implied.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
 on incomplete startup. Read-only preparation failures restore CPU writers.
 
-Still open: physical MSI delivery verification/full fault-source dispatch, GC12 rendering and shader
+Still open: physical MSI delivery verification, remaining SDMA/shader/media/poison
+fault-source dispatch, GC12 rendering and shader
 dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, reset/suspend/resume, and physical RX 9070 XT testing.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver

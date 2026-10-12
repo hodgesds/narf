@@ -6,6 +6,7 @@ use crate::amdgpu_gfx12_rs64 as rs64;
 use crate::amdgpu_gfx12_setup as setup;
 use crate::amdgpu_ih7 as ih;
 use crate::amdgpu_mes12_hw as mes;
+use crate::amdgpu_navi48_faults as faults;
 use crate::amdgpu_navi48_msi as msi;
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_dmub_navi48 as dmub, amdgpu_gddr6 as training,
@@ -87,6 +88,7 @@ pub enum Error {
     Setup(setup::Error),
     Queues(queues::Error),
     Interrupts(ih::Error),
+    Faults(faults::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -188,6 +190,7 @@ struct Hardware {
     ih: Option<ih::Rings>,
     interrupt_report: Option<ih::Report>,
     interrupt_route: Option<Result<msi::Route, msi::Error>>,
+    faults: Option<faults::Monitor>,
     gmc: Option<gmc::Gmc>,
     sdma: Option<sdma::Sdma>,
     mes: Option<mes::Mes>,
@@ -485,6 +488,8 @@ impl ColdBoot {
         // ownership. MSI preparation errors remain visible to the later service;
         // they do not prevent retained polled IH operation.
         let interrupt_route = unsafe { msi::Route::new(gpu, &pci, authority) };
+        // SAFETY: exact same retained GPU; this only validates layout/authority.
+        let faults = unsafe { faults::Monitor::new(gpu, authority) }.map_err(Error::Faults)?;
         let mp0 = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
         if target != firmware.gfx.target() || !firmware.sos.is_psp14(mp0.revision) {
             return Err(Error::Unsupported);
@@ -563,6 +568,7 @@ impl ColdBoot {
                     ih: Some(ih),
                     interrupt_report: None,
                     interrupt_route: Some(interrupt_route),
+                    faults: Some(faults),
                     gmc: None,
                     sdma: None,
                     mes: None,
@@ -607,6 +613,7 @@ impl ColdBoot {
             crate::amdgpu_navi48_interrupts::install(
                 &mut hardware.ih,
                 &mut hardware.interrupt_route,
+                &mut hardware.faults,
             )
         }
         .map_err(|e| {

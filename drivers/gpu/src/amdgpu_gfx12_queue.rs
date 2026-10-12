@@ -470,10 +470,10 @@ impl<I: Io> Engine<I> {
                 {
                     return Err(Error::Busy);
                 }
-                let value = checked(io.read(control))? | 0x84000000;
-                io.write(control, value);
-                if checked(io.read(control))? != value {
-                    return Err(Error::Readback);
+                // The independent IH service owns all writes to CP interrupt
+                // controls, including EOP enables and fault masking.
+                if checked(io.read(control))? & 0x84000000 != 0x84000000 {
+                    return Err(Error::Busy);
                 }
                 io.memory_write(target, pipe as u64 * 4096 + 4088, 0);
                 let address = aperture.source + pipe as u64 * 4096 + 4088;

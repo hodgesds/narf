@@ -115,9 +115,6 @@ impl Io for Fake {
         match at {
             0x42400 => self.index = v,
             0x7f000 => self.dirty = false,
-            0x17828 | 0x17894 => {
-                self.regs.insert(at, v);
-            }
             _ => panic!("unexpected CP register write"),
         }
     }
@@ -211,7 +208,7 @@ fn fixture() -> (Pool, Engine<Fake>, FakeMes, gmc::Aperture, MmioRegion) {
             rptr_stuck: false,
             busy: false,
             revoked: None,
-            regs: BTreeMap::new(),
+            regs: BTreeMap::from([(0x17828, 0x84000000), (0x17894, 0x84000000)]),
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -434,8 +431,8 @@ fn gfx12_eop_proof_requires_each_engine_fence_vector_and_cpu_delivery() -> TestR
         let mut observer = FakeObserver::new(&e);
         observer.msi = msi;
         e.io.emit_cpu = msi;
-        e.io.regs.insert(0x17828, 0x00100000);
-        e.io.regs.insert(0x17894, 0x00200000);
+        e.io.regs.insert(0x17828, 0x84100000);
+        e.io.regs.insert(0x17894, 0x84200000);
         let expected = Ok(InterruptProof {
             fences: [0x90701234, 0x90705678],
             msi_verified: msi,
@@ -464,7 +461,7 @@ kernel_test_in!(
 );
 
 fn gfx12_eop_missing_evidence_faults_and_revocation_never_report_success() -> TestResult {
-    for case in 0..7 {
+    for case in 0..8 {
         let (pool, mut e, mut mes, mut aperture, target) = fixture();
         run(e.initialize(&mut mes, aperture, target)).unwrap();
         let mut observer = FakeObserver::new(&e);
@@ -493,10 +490,14 @@ fn gfx12_eop_missing_evidence_faults_and_revocation_never_report_success() -> Te
                 observer.reject = true;
                 Error::Interrupts(crate::amdgpu_ih7::Error::Protocol)
             }
-            _ => {
+            6 => {
                 aperture.start = u64::MAX;
                 aperture.source = u64::MAX;
                 Error::Invalid
+            }
+            _ => {
+                e.io.regs.insert(0x17828, 0);
+                Error::Busy
             }
         };
         assert_eq!(
