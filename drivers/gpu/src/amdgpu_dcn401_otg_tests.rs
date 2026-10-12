@@ -38,7 +38,7 @@ impl Io for Fake {
         }
         for p in 0..4 {
             for (slot, reg, stride, enable, on) in [
-                (p, 0x2094, 0x124, 0x10, 0xc00),
+                (p, 0x2094, 0x124, 0x10, 0x2c00),
                 (p + 4, 0x3623, 0xd4, 1, 0x11110),
             ] {
                 if at == BASE + (reg + p * stride) * 4
@@ -152,7 +152,9 @@ impl Io for Fake {
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
                 || (0..4).any(|p| {
                     [
-                        0x2094, 0x2095, 0x209b, 0x20bc, 0x211e, 0x2122, 0x2123, 0x2125, 0x212e,
+                        0x2094, 0x2095, 0x209b, 0x209e, 0x20a5, 0x20a6, 0x20a9, 0x20aa, 0x20ab,
+                        0x20ac, 0x20ad, 0x20ae, 0x20af, 0x20b0, 0x20bc, 0x211e, 0x2122, 0x2123,
+                        0x2125, 0x212e,
                     ]
                     .iter()
                     .any(|r| at == BASE + (r + p * 0x124) * 4)
@@ -321,6 +323,7 @@ fn engine() -> Engine<Fake> {
             dp_sst_disabled: None,
             hpo_link_retired: None,
             hpo_dp_disabled: None,
+            hdmi_tmds_retired: None,
             retired: 0,
         },
     }
@@ -1044,3 +1047,6 @@ mod encoder;
 mod hpo_link;
 #[path = "amdgpu_dcn401_link_tests.rs"]
 mod link;
+
+#[path = "amdgpu_dcn401_hdmi_tests.rs"]
+mod hdmi;

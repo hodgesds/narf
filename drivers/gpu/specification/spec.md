@@ -636,6 +636,31 @@ cancellation retains `DisablingHpoDp(transmitter)`. Either blocks display/clock
 reuse and raw mailbox/scanner access until independent reset; the mailbox also
 retains its own incomplete-transport quarantine.
 
+`unsafe ColdBoot::retire_display_hdmi_tmds_encoder(stream).await` and the
+serialized platform wrapper retire one of four native TMDS HDMI frontends.
+The caller independently handles sink AVMUTE/blanking quirks, SCDC reset,
+external retimers and audio/metadata/HDCP teardown, excludes CPU/firmware/FAMS
+and concurrent display/link/clock/power writers, and retains all memory and
+translations. Live mode must be HDMI (3), with no frontend/FIFO reset, audio
+clocks, metadata, immediate-packet transaction, DP video or pending/locked HDMI
+buffer. Selected backend routes must be single-frontend TMDS, without reset,
+dual-link or HPO muxing. Unrelated live outputs remain untouched.
+The native sequence clears all 15 generic packet schedules and their line
+fields, waits for every packet-enable buffer and HDMI/VUPDATE buffer to drain,
+resets deep-color/scrambler/clock-rate attributes, and waits for that update.
+It then disables the pixel FIFO, frontend enable and clock request, waits for
+DISPCLK/SYMCLK/TMDS frontend clock-off, clears the input pixel mode and detaches
+only this frontend's routes. Routes, metadata and packet activity are checked
+again after asynchronous waits and at completion. Global/pipe clock guards
+also reject outstanding TMDS frontend clock-on, even after its request clears.
+Backend, PHY and timing clocks are preserved: a TMDS OTG may still consume the
+PHY symclk. No DMUB transmitter-disable command or PHY power transition occurs.
+Success records historical `HdmiTmdsRetired { stream, detached_backends }` in
+`Otg::Status::hdmi_tmds_retired`; it proves neither link nor memory retirement.
+Failure after starting enters `Failed`; cancellation retains
+`RetiringHdmiTmds(stream)`. Both block owner/clock/mailbox reuse until an
+independent reset. HDMI FRL and complete TMDS backend/PHY shutdown remain open.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

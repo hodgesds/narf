@@ -924,6 +924,27 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Retire a TMDS HDMI frontend, preserving backend/PHY/OTG clocks.
+    /// # Safety
+    /// Fulfil `Otg::retire_hdmi_tmds_encoder` sink/SCDC/retimer, audio/metadata/
+    /// HDCP and writer-exclusion obligations. Retain all memory/translations;
+    /// success is not link or memory retirement.
+    pub async unsafe fn retire_display_hdmi_tmds_encoder(
+        &mut self,
+        stream: u8,
+    ) -> Result<otg::HdmiTmdsRetired, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: retained matching owner; caller fulfils the documented obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .retire_hdmi_tmds_encoder(stream)
+                .await
+        }
+    }
     /// Disable a board-routed legacy DP SST transmitter before frontend retirement.
     /// # Safety
     /// Select a direct external DP port without USB-C/ACPI PHY interlocks or

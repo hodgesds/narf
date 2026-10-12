@@ -357,8 +357,14 @@ TX-clock-off readback, then parks only the selected root-clock route. Shared
 PHY/root routes and live digital work reject before commands. Failure or
 cancellation retains ownership; lane/TX activity independently blocks global
 and pipe clock changes. These checks still require silicon validation and do
-not prove analog power gating. HDMI, eDP, sink/MST/audio teardown and USB-C/ACPI
-PHY interlocks still need their sequences.
+not prove analog power gating. Native TMDS HDMI frontend retirement now clears
+all 15 generic packet schedules, acknowledges their buffered updates, resets
+stream attributes and stops the FIFO/frontend with DISPCLK/SYMCLK/TMDS clock-off
+witnesses before disconnecting selected routes. Live audio/metadata, ambiguous
+routing and pending transactions reject before writes; failures and cancellation
+quarantine the owner. Backend/PHY/OTG clocks stay retained for the TMDS timing
+symclk dependency. HDMI FRL, TMDS backend/PHY shutdown, eDP, sink/MST/audio teardown
+and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths
 have model tests, not silicon validation.

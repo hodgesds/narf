@@ -425,6 +425,22 @@ pub async unsafe fn retire_display_dp_encoder(
     unsafe { boot.retire_display_dp_encoder(stream).await }
 }
 
+/// Retire a native TMDS HDMI frontend while retaining backend/PHY/OTG clocks.
+/// # Safety
+/// Fulfil `Otg::retire_hdmi_tmds_encoder` sink/SCDC/retimer, audio/metadata/HDCP
+/// and writer-exclusion obligations; retain every allocation and translation.
+/// Success never proves link or memory retirement.
+pub async unsafe fn retire_display_hdmi_tmds_encoder(
+    stream: u8,
+) -> Result<crate::amdgpu_dcn401_otg::HdmiTmdsRetired, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: retained serialized owner; caller fulfils the documented obligations.
+    unsafe { boot.retire_display_hdmi_tmds_encoder(stream).await }
+}
+
 /// Disable a board-routed legacy DP SST transmitter before retiring its frontend.
 /// # Safety
 /// Select a direct external DP port without USB-C/ACPI PHY interlocks or SSC

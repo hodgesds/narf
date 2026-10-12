@@ -24,6 +24,9 @@ pub use link::DpSstDisabled;
 #[path = "amdgpu_dcn401_hpo_link.rs"]
 mod hpo_link;
 pub use hpo_link::{HpoDpDisabled, HpoLinkRetired};
+#[path = "amdgpu_dcn401_hdmi.rs"]
+mod hdmi;
+pub use hdmi::HdmiTmdsRetired;
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -82,6 +85,8 @@ pub enum State {
     HpoLinkRetired,
     DisablingHpoDp(u8),
     HpoDpDisabled,
+    RetiringHdmiTmds(u8),
+    HdmiTmdsRetired,
     RetiringPlanes,
     PlanesRetired,
     Retiring(u8),
@@ -102,6 +107,7 @@ impl State {
                 | Self::DpSstDisabled
                 | Self::HpoLinkRetired
                 | Self::HpoDpDisabled
+                | Self::HdmiTmdsRetired
         )
     }
 }
@@ -170,6 +176,8 @@ pub struct Status {
     pub hpo_link_retired: Option<HpoLinkRetired>,
     /// Historical lane-disable/TX-clock/root-route evidence, not analog power gating.
     pub hpo_dp_disabled: Option<HpoDpDisabled>,
+    /// Historical TMDS frontend stop only; backend/PHY/OTG remain owned.
+    pub hdmi_tmds_retired: Option<HdmiTmdsRetired>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -514,6 +522,7 @@ impl Otg {
                 dp_sst_disabled: None,
                 hpo_link_retired: None,
                 hpo_dp_disabled: None,
+                hdmi_tmds_retired: None,
                 retired: 0,
             },
         }))

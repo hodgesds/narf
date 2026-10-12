@@ -165,7 +165,7 @@ impl Layout {
                 (0x3685, 0xd4, 0x101),    // HPO DP video enable/status
                 (0x367b, 0xd4, 1),        // HPO DP SDP enable
                 (0x369f, 0xd4, 0x11),     // HPO DP link clock request/ON
-                (0x2094, 0x124, 0xc10),   // DIO frontend clock request/ON
+                (0x2094, 0x124, 0x2c10),  // DIO frontend clock request/ON
                 (0x2095, 0x124, 1),       // DIO frontend enabled
                 (0x209b, 0x124, 1),       // DIO pixel FIFO enabled
                 (0x3623, 0xd4, 0x11111),  // HPO stream clock request/ON
