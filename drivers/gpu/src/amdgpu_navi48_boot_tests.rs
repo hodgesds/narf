@@ -10,6 +10,12 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 }
 fn report() -> Report {
     Report {
+        topology: topology::Topology {
+            active_cus: 64,
+            active_arrays: 0xff,
+            cu_bitmap: [[0xff, 0xff, 0, 0]; 4],
+            enabled_rb_mask: 0xffff,
+        },
         smu: smu::Versions {
             firmware: 0x684c00,
             interface: 0x2e,

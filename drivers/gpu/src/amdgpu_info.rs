@@ -167,7 +167,22 @@ fn heap_info(total: u64) -> uapi::DrmAmdgpuHeapInfo {
 /// A field this driver cannot source is left at its zero rather than filled
 /// with a plausible number, because Mesa makes code-generation decisions from
 /// several of them and a wrong value is worse than an absent one.
+static NAVI48_TOPOLOGY: narf_lib::sync::IrqSafeSpinLock<
+    Option<crate::amdgpu_gfx12_topology::Topology>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+pub(crate) fn publish_navi48_topology(topology: crate::amdgpu_gfx12_topology::Topology) {
+    *NAVI48_TOPOLOGY.lock() = Some(topology);
+}
 fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
+    let topology = *NAVI48_TOPOLOGY.lock();
+    dev_info_topology(snap, topology)
+}
+fn dev_info_topology(
+    snap: &Snapshot,
+    topology: Option<crate::amdgpu_gfx12_topology::Topology>,
+) -> Result<Vec<u8>, FsError> {
+    let topology = topology
+        .filter(|_| snap.family == Family::Navi4 && snap.did == u32::from(crate::amdgpu::NAVI48));
     let family = family_id(snap).ok_or(FsError::InvalidData)?;
     // The shader geometry is not guessable. Refusing is better than reporting
     // a topology that would mis-compile shaders.
@@ -185,13 +200,14 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
         num_shader_arrays_per_engine: gc.num_sa_per_se,
         // Navi48 shares a PCI ID across harvested SKUs. Discovery provides
         // maxima; gfx_v12_0_get_cu_info reads INACTIVE_WGPS to count enabled
-        // CUs. Until that owner runs, report unknown (zero), as for the empty
-        // CU bitmap, instead of presenting the maximum as a fused-on count.
+        // CUs. Until that owner runs, report unknown rather than the maxima.
         cu_active_number: if snap.family == Family::Navi4 {
-            0
+            topology.map_or(0, |t| t.active_cus)
         } else {
             gc.total_cus()
         },
+        cu_bitmap: topology.map_or([[0; 4]; 4], |t| t.cu_bitmap),
+        enabled_rb_pipes_mask: topology.map_or(0, |t| t.enabled_rb_mask),
         num_rb_pipes: gc.num_rb_per_se.saturating_mul(gc.num_se),
         num_hw_gfx_contexts: GFX_HW_CONTEXTS,
         // FUSION means the GPU shares the CPU's memory — an APU. It used to
@@ -370,4 +386,65 @@ pub fn dispatch(cmd: u32, arg: usize) -> Result<u64, FsError> {
     // advertised. `copy_out` SMAP-brackets the write.
     unsafe { crate::drm_ioctl_bridge::copy_out(return_pointer as usize, &reply[..n])? };
     Ok(0)
+}
+
+#[cfg(feature = "kernel-test")]
+mod topology_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn decode(bytes: &[u8]) -> uapi::DrmAmdgpuInfoDevice {
+        assert_eq!(
+            bytes.len(),
+            core::mem::size_of::<uapi::DrmAmdgpuInfoDevice>()
+        );
+        // SAFETY: exact-sized POD reply; byte vectors need not be aligned.
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast()) }
+    }
+    fn gfx12_dev_info_uses_harvesting_without_claiming_acceleration() -> TestResult {
+        let mut gpu = crate::amdgpu_navi48_firmware::tests::gpu();
+        gpu.gc_info = Some(GcInfo {
+            num_se: 4,
+            num_sa_per_se: 2,
+            num_cu_per_sa: 8,
+            num_rb_per_se: 4,
+            ..Default::default()
+        });
+        let snap = Snapshot::from_gpu(&gpu);
+        let unknown = decode(&dev_info_topology(&snap, None).unwrap());
+        let topology = crate::amdgpu_gfx12_topology::Topology {
+            active_cus: 56,
+            active_arrays: 0x7f,
+            cu_bitmap: [
+                [0xff, 0xff, 0, 0],
+                [0xff, 0xff, 0, 0],
+                [0xff, 0xff, 0, 0],
+                [0xff, 0, 0, 0],
+            ],
+            enabled_rb_mask: 0x3fff,
+        };
+        let known = decode(&dev_info_topology(&snap, Some(topology)).unwrap());
+        if unknown.cu_active_number != 0
+            || unknown.cu_bitmap != [[0; 4]; 4]
+            || unknown.enabled_rb_pipes_mask != 0
+            || known.cu_active_number != 56
+            || known.cu_bitmap != topology.cu_bitmap
+            || known.enabled_rb_pipes_mask != 0x3fff
+            || known.num_rb_pipes != 16
+            || query_against(&snap, uapi::AMDGPU_INFO_ACCEL_WORKING, [0; 4]).unwrap() != [0; 4]
+        {
+            return TestResult::Fail("DEV_INFO lost harvesting or advertised acceleration");
+        }
+        let mut apu = snap;
+        apu.family = Family::Phoenix;
+        let apu_info = decode(&dev_info_topology(&apu, Some(topology)).unwrap());
+        if apu_info.cu_active_number != 64 || apu_info.enabled_rb_pipes_mask != 0 {
+            return TestResult::Fail("discrete topology leaked into an APU query");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/gfx12",
+        gfx12_dev_info_uses_harvesting_without_claiming_acceleration
+    );
 }

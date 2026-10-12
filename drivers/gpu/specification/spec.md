@@ -90,9 +90,18 @@ RX 9070/GRE; neither SKU nor enabled CU count is inferred from it. Probe uses
 the existing bounded PCIe discovery reader and total/visible VRAM accounting.
 `DEV_INFO` requires exactly one GC0 12.0.1 discovery record and a GC topology
 table, then reports `AMDGPU_FAMILY_GC_12_0_0` (152), eight hardware contexts,
-and GMC12's 48-bit VA geometry. Topology fields describe discovered maxima;
-the active CU count and bitmap remain zero until the GFX12 harvested-WGP
-inventory exists. `ACCEL_WORKING` remains zero.
+and GMC12's 48-bit VA geometry. Shader geometry describes discovered maxima;
+the active CU count, CU bitmap and enabled render-backend mask remain zero
+until the cold-boot owner samples harvesting. `ACCEL_WORKING` remains zero.
+
+`unsafe amdgpu_gfx12_topology::read` requires exclusive GRBM selector ownership
+and ready firmware/power. It validates GC12.0.1 banks and discovery dimensions,
+combines fused and inherited software SA/WGP/RB disable masks, and restores
+the previous GRBM selector on success and failure within one capability
+invocation. It never changes harvesting masks. `Topology` reports active CUs,
+shader arrays, enabled RBs and Linux's 4×4 CU bitmap packing (SE4–7 in columns
+2/3). Cold boot publishes this inventory to `DEV_INFO` after initial power
+setup; it does not advertise queues or acceleration.
 
 When VFCT has no image, VBIOS acquisition supports the SMUIO14.0.2 ROM read
 ports (`0xe4/0xe5`, base index zero) only with matching GC12.0.1 and NBIO7.7.0
@@ -237,7 +246,7 @@ the inventoried pool, trained VRAM or an owned training exchange, and all
 training quiescence obligations. `run().await` retains the trainer, SOS,
 PSP/TMR and SMU owners and executes training → SOS → ring/TMR → SMC → SMU
 version/board transfer → DMUB stop → graphics autoload → RLC readiness →
-initial power policy. DCN4 stop requires STOP_FW acknowledgement and PWAIT,
+initial power policy → harvested GC12 topology. DCN4 stop requires STOP_FW acknowledgement and PWAIT,
 uses CNTL2 reset, verifies disabled/reset readback and leaves PSP's secure
 windows untouched. Every stage is observable through `State`; failure or
 cancellation prevents replay. The sequence then initializes GMC12 and SDMA7

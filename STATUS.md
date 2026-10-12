@@ -276,7 +276,8 @@ APU/engine/display paths refuse this generation before touching hardware.
 
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
 firmware parsing, upload and autoload; SMU14 board-table transfer and initial
-GFX/thermal policy; GMC12/MMHUB4.1 owned VMID0 translations; SDMA7 translated
+GFX/thermal policy; GC12 harvested CU/SA/RB inventory and device-query reporting;
+GMC12/MMHUB4.1 owned VMID0 translations; SDMA7 translated
 VRAM write/copy/fence verification; and DCN4 DMUB shared state, authenticated
 window validation, startup and version/capability/HPD/AUX mailbox support.
 The boot coordinator retains all hardware owners through failures and

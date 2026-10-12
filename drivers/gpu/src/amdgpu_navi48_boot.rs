@@ -2,9 +2,9 @@
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_dmub_navi48 as dmub, amdgpu_gddr6 as training,
-    amdgpu_gmc_navi48 as gmc, amdgpu_navi48_firmware as gfx, amdgpu_psp_boot as sos,
-    amdgpu_psp_ring as psp, amdgpu_sdma_navi48 as sdma, amdgpu_smu_navi48 as smu,
-    amdgpu_vram::Pool, amdgpu_vram_boot::Training,
+    amdgpu_gfx12_topology as topology, amdgpu_gmc_navi48 as gmc, amdgpu_navi48_firmware as gfx,
+    amdgpu_psp_boot as sos, amdgpu_psp_ring as psp, amdgpu_sdma_navi48 as sdma,
+    amdgpu_smu_navi48 as smu, amdgpu_vram::Pool, amdgpu_vram_boot::Training,
 };
 use alloc::vec::Vec;
 use narf_bus::BusDeviceCap;
@@ -23,11 +23,12 @@ pub enum Stage {
     Graphics,
     RlcBoot,
     PowerSetup,
+    ReadTopology,
     MemoryTranslation,
     DmaProof,
     StartDmub,
 }
-const STAGES: [Stage; 15] = [
+const STAGES: [Stage; 16] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -40,6 +41,7 @@ const STAGES: [Stage; 15] = [
     Stage::Graphics,
     Stage::RlcBoot,
     Stage::PowerSetup,
+    Stage::ReadTopology,
     Stage::MemoryTranslation,
     Stage::DmaProof,
     Stage::StartDmub,
@@ -60,6 +62,7 @@ pub enum Error {
     Gmc(gmc::Error),
     Sdma(sdma::Error),
     Dmub(dmub::Error),
+    Topology(topology::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -77,6 +80,7 @@ pub struct Report {
     pub aperture: gmc::Aperture,
     pub dma: sdma::Proof,
     pub dmub: dmub::Status,
+    pub topology: topology::Topology,
 }
 #[derive(Debug)]
 pub struct Firmware {
@@ -148,6 +152,7 @@ struct Hardware {
     versions: Option<smu::Versions>,
     graphics: Option<psp::GfxBootStatus>,
     power: Option<smu::PowerStatus>,
+    topology: Option<topology::Topology>,
     gmc: Option<gmc::Gmc>,
     sdma: Option<sdma::Sdma>,
 }
@@ -266,6 +271,14 @@ impl Backend for Hardware {
                 // SAFETY: same retained owners and exclusive hub access.
                 unsafe { self.gmc.as_mut().unwrap().initialize().await }.map_err(Error::Gmc)?;
             }
+            Stage::ReadTopology => {
+                // SAFETY: firmware/power are ready; no concurrent index user,
+                // queues or automatic gating exist under this retained owner.
+                let topology = unsafe { topology::read(&self.gpu, &self.authority) }
+                    .map_err(Error::Topology)?;
+                self.topology = Some(topology);
+                crate::amdgpu_info::publish_navi48_topology(topology);
+            }
             Stage::DmaProof => {
                 // SAFETY: prior stages retain firmware, memory and both hubs.
                 self.sdma = Some(
@@ -293,6 +306,7 @@ impl Backend for Hardware {
             power: self.power.ok_or(Error::Invalid)?,
             media: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
             dmub: self.dmub.status().ok_or(Error::Invalid)?,
+            topology: self.topology.ok_or(Error::Invalid)?,
             aperture: self
                 .gmc
                 .as_ref()
@@ -332,6 +346,7 @@ impl ColdBoot {
             .validate_pool(gpu, &authority, pool)
             .map_err(Error::Psp)?;
         let target = gfx::Target::resolve(gpu).map_err(Error::Firmware)?;
+        topology::validate(gpu).map_err(Error::Topology)?;
         let mp0 = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
         if target != firmware.gfx.target() || !firmware.sos.is_psp14(mp0.revision) {
             return Err(Error::Unsupported);
@@ -348,7 +363,7 @@ impl ColdBoot {
             chip: gpu.chip,
             vram: gpu.vram,
             ip_blocks: blocks,
-            gc_info: None,
+            gc_info: gpu.gc_info,
             vbios: None,
             mode: None,
             fw_loaded: false,
@@ -381,6 +396,7 @@ impl ColdBoot {
                     versions: None,
                     graphics: None,
                     power: None,
+                    topology: None,
                     gmc: None,
                     sdma: None,
                 },
