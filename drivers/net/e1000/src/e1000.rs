@@ -2072,7 +2072,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
     // gigabit packet rates. The coalescer excludes loopback and preserves
     // control/options boundaries; the RX pump flushes it whenever the ring is
     // drained to empty.
-    narf_net::tcp_stack::set_gro(true);
+    let _ = narf_net::iface::set_software_gro(e1000_ifname(), true);
     // Opt into zero-copy TX (P-F): the stack builds egress frames straight into
     // a pooled DMA buffer and hands it to `e1000_send_frame_zc`, which DMAs it
     // without the per-frame slice copy `e1000_send_frame` does. The 64 KiB
@@ -2136,7 +2136,7 @@ async fn e1000_rx_pump(device: Arc<E1000>) {
         }
 
         // Empty ring is the NAPI-complete point for software GRO. This is a
-        // no-op while GRO remains disabled.
+        // no-op when this CPU holds no GRO flows.
         narf_net::tcp_stack::gro_flush();
         let missed = device.read_mpc();
         if missed > 0 {

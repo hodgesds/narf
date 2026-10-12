@@ -123,12 +123,12 @@ progress toward line rate.
 
 | Driver  | Speed | Today | Target work |
 |---------|-------|-------|-------------|
-| e1000   | 1 G   | 256-entry pipelined zero-copy TX; 16 KiB IPv4 TSO; unified RX dispatch | multi-queue/GRO if justified; reference-simple, not a high-speed target |
-| igc     | 2.5 G | basic | batched datapath |
+| e1000   | 1 G   | 256-entry pipelined zero-copy TX; 64 KiB IPv4 TSO; batched RX + software GRO | reference-simple, not a high-speed target |
+| igc     | 2.5 G | 256-entry, IRQ-driven, 64-frame batched RX | async/batched TX; multi-queue/RSS |
 | ixgbe   | 10 G  | TSO + csum descriptors present, unused by stack | drive TSO/csum from stack; mq/RSS; NAPI |
 | i40e    | 40 G  | caps advertise TSO/csum | same + deep rings |
 | mlx5    | 100 G | RSS RQT present | full mq/RSS + TSO/GRO + moderation; the 100G reference |
-| virtio-net | host-bound | mq, NAPI, RSS, mergeable bufs | batched drain + GRO; the in-VM high-throughput path |
+| virtio-net | host-bound | mq, NAPI, RSS, mergeable bufs, per-interface GRO | the in-VM high-throughput path |
 
 ## 4. Phased implementation (each phase lands and is testable on its own)
 
@@ -144,7 +144,9 @@ progress toward line rate.
   extensions (P-B). _Landed:_ the `net::gro` engine plus live wiring into
   `tcp_stack::rx_handler` — per-CPU, iface-tagged, sitting after XDP/AF_PACKET
   and before L3, flushed at NAPI-complete (`drain_pump` idle, virtio park).
-  Opt-in (`set_gro`) and loopback-bypassed, so the default path is unchanged.
+  Opt-in per interface (`iface::set_software_gro`) and loopback-bypassed, so
+  enabling one driver's poll loop cannot change another interface's receive
+  semantics.
 - **P4 — Multi-queue + RSS + NAPI/moderation.** Per-queue contract, per-core
   pollers, RSS steering, shared NAPI helper, ITR (P-D, P-E). _Landed:_ the
   first-class contract (`Interface`/`HwNic` `num_rx_queues`/`num_tx_queues`/

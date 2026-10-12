@@ -39,6 +39,10 @@ blk/net/console/rng.
   native parallelism the moment we touch real hardware. `class_blk`
   and `class_net` modules consume the per-queue rings and present
   the unified block/net subsystem interfaces.
+- The primary virtio-net interface opts into the kernel stack's
+  per-interface software GRO stage. Every RX forwarder flushes the current
+  CPU's held flows after its queue drains and before it parks; secondary
+  frame-ring-only interfaces do not alter the kernel-stack setting.
 - virtio-gpu exposes `offered_features()`, `host_offers_virgl()`, and
   `virgl_enabled()`. The first two report the pre-negotiation host offer;
   `virgl_enabled()` is true only after immutable negotiation accepts

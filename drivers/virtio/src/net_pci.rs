@@ -1587,6 +1587,10 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
         let name = narf_net::iface::register_static("eth%d", mac, vnet0_send_fn);
         // `virtnet_get_drvinfo`: driver "virtio_net", VIRTNET_DRIVER_VERSION.
         narf_net::iface::set_driver_info(name, "virtio_net", Some("1.0.0"), bus_info);
+        // The primary RX forwarder drains complete bursts and calls
+        // `gro_flush` before it parks, so this interface can safely opt into
+        // the stack's per-interface software GRO path.
+        let _ = narf_net::iface::set_software_gro(name, true);
         *PRIMARY_IFNAME.lock() = Some(name);
         // Opt into zero-copy TX (P-F), sharing this controller's own TX pool so
         // the stack's `tx_acquire` and the TX reaper use one free-list. 12-byte
@@ -1803,7 +1807,8 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                     // delivered. Only pair/idx 0 feeds GRO (it owns the synchronous
                     // tap into the stack), so only it needs draining. This runs on
                     // the forwarder's own CPU — the same CPU the offers ran on — so
-                    // it drains that CPU's per-CPU coalescer. No-op when GRO is off.
+                    // it drains that CPU's per-CPU coalescer. No-op when that CPU
+                    // holds no GRO flows.
                     if idx == 0 {
                         narf_net::tcp_stack::gro_flush();
                     }

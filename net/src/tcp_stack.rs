@@ -287,11 +287,10 @@ pub fn rx_handler(iface_name: &str, frame: &mut [u8]) {
     // state across frames, so two paths bypass it and dispatch inline — a
     // byte-for-byte match for the pre-GRO code:
     //   * loopback, which has no poll loop to flush held flows; and
-    //   * the disabled default (GRO stays opt-in until exercised on real
-    //     multi-queue hardware).
+    //   * interfaces that have not opted in (GRO stays disabled by default).
     // Linux ref: `napi_gro_receive` sits exactly here — after the `packet_rcv`
     // AF_PACKET taps and before the protocol handlers.
-    if gro_rx::enabled() && iface_name != "lo" {
+    if ingress.as_ref().is_some_and(|dev| dev.software_gro) && iface_name != "lo" {
         gro_rx::offer(iface_name, net_ns_id, frame);
     } else {
         dispatch_l3(_iface_name, net_ns_id, frame);
@@ -323,23 +322,13 @@ fn dispatch_l3(iface_name: Option<&str>, net_ns_id: u64, frame: &[u8]) {
 mod gro_rx {
     use super::{dispatch_l3, iface, IrqSafeSpinLock};
     use crate::gro::Gro;
-    use core::sync::atomic::{AtomicBool, Ordering};
 
     const MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
     static TABLES: [IrqSafeSpinLock<Gro>; MAX_CPUS] =
         [const { IrqSafeSpinLock::new(Gro::new()) }; MAX_CPUS];
-    static ENABLED: AtomicBool = AtomicBool::new(false);
 
     fn cpu() -> usize {
         narf_lib::percpu::current_cpu().min(MAX_CPUS - 1)
-    }
-
-    pub fn set_enabled(on: bool) {
-        ENABLED.store(on, Ordering::Relaxed);
-    }
-
-    pub fn enabled() -> bool {
-        ENABLED.load(Ordering::Relaxed)
     }
 
     /// Offer one received frame to this CPU's coalescer and dispatch whatever
@@ -364,16 +353,6 @@ mod gro_rx {
             dispatch_l3(Some(&tag), net_ns_id, &f);
         }
     }
-}
-
-/// Enable or disable software GRO (receive coalescing). Off by default.
-pub fn set_gro(on: bool) {
-    gro_rx::set_enabled(on);
-}
-
-/// Whether software GRO is currently enabled.
-pub fn gro_enabled() -> bool {
-    gro_rx::enabled()
 }
 
 /// Flush this CPU's held GRO flows. Drivers call this at NAPI-complete / when

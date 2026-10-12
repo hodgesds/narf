@@ -127,6 +127,10 @@ pub struct NetIfaceEntry {
     /// checksum/TSO offload via [`crate::TxMeta`] instead of doing the work
     /// in software.
     pub offloads: crate::OffloadCapabilities,
+    /// Whether this interface opts into the kernel stack's software GRO stage.
+    /// This is deliberately per-interface: one GRO-capable driver must not
+    /// change receive semantics for another driver's poll loop.
+    pub software_gro: bool,
     /// Zero-copy TX hook (P-F): `Some` once the driver opts in via
     /// [`enable_zero_copy_tx`]. When set, the stack builds egress frames
     /// directly into a buffer from `tx_pool` and hands ownership here instead
@@ -185,6 +189,22 @@ pub fn set_offloads(name: &str, offloads: crate::OffloadCapabilities) {
     {
         entry.offloads = offloads;
     }
+}
+
+/// Enable or disable software GRO for one registered interface.
+///
+/// Drivers opt in only when their RX path flushes GRO at poll completion.
+/// Returns `false` when `name` is not registered.
+pub fn set_software_gro(name: &str, enabled: bool) -> bool {
+    let mut g = IFACES.lock();
+    let Some(entry) = g
+        .as_mut()
+        .and_then(|ifaces| ifaces.iter_mut().find(|entry| entry.name == name))
+    else {
+        return false;
+    };
+    entry.software_gro = enabled;
+    true
 }
 
 /// Opt an interface into zero-copy TX (P-F) with an iface-owned recycling pool
@@ -562,6 +582,7 @@ fn register_inner(
         offloads: old
             .as_ref()
             .map_or_else(Default::default, |old| old.offloads),
+        software_gro: old.as_ref().is_some_and(|old| old.software_gro),
         // A re-probe preserves any zero-copy TX opt-in (hook + pool + headroom)
         // so the stack keeps the same recycling pool across a driver reset.
         send_frame: old.as_ref().and_then(|old| old.send_frame),
@@ -1014,6 +1035,8 @@ pub struct NetIfaceSnapshot {
     /// Offloads this interface's send path honors; the stack requests them
     /// via [`crate::TxMeta`] rather than computing in software.
     pub offloads: crate::OffloadCapabilities,
+    /// Whether ingress on this interface uses software GRO.
+    pub software_gro: bool,
     /// Zero-copy TX hook, mirrored from the entry. `Some` ⇒ the stack may hand
     /// an owned [`crate::Frame`] to [`Self::xmit_frame`]; private so every
     /// transmit still passes through the snapshot's tap-aware methods.
@@ -1136,6 +1159,7 @@ fn snapshot(entry: &NetIfaceEntry) -> NetIfaceSnapshot {
         duplex: entry.duplex,
         stats: entry.stats.clone(),
         offloads: entry.offloads,
+        software_gro: entry.software_gro,
         send_frame: entry.send_frame,
     }
 }
@@ -1628,7 +1652,7 @@ pub fn drain_pump() -> bool {
     // A round that drained nothing is the end of a receive burst (the
     // NAPI-complete point): flush any TCP segments GRO is still holding so
     // coalesced data is never stranded waiting for a next segment that may not
-    // come. A no-op when GRO is disabled or this CPU holds nothing.
+    // come. A no-op when this CPU holds no GRO flows.
     if !any {
         crate::tcp_stack::gro_flush();
     }
@@ -1680,4 +1704,23 @@ mod zc_tx_tests {
         TestResult::Pass
     }
     kernel_test_in!("net/iface", smoke_iface_zero_copy_tx_acquire);
+
+    fn smoke_iface_software_gro_is_per_device() -> TestResult {
+        let enabled = register("gro-enabled-selftest", [2, 0, 0, 0, 0, 2], dummy_send);
+        let disabled = register("gro-disabled-selftest", [2, 0, 0, 0, 0, 3], dummy_send);
+        if !set_software_gro(&enabled, true) {
+            return TestResult::Fail("software GRO opt-in rejected a registered interface");
+        }
+        if lookup(&enabled).is_none_or(|iface| !iface.software_gro) {
+            return TestResult::Fail("software GRO opt-in was not recorded");
+        }
+        if lookup(&disabled).is_none_or(|iface| iface.software_gro) {
+            return TestResult::Fail("software GRO leaked to another interface");
+        }
+        if set_software_gro("missing-gro-selftest", true) {
+            return TestResult::Fail("software GRO accepted an unknown interface");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/iface", smoke_iface_software_gro_is_per_device);
 }

@@ -122,6 +122,17 @@ when a device advertises the generic limit.
 is false. These fields describe the in-kernel frame-ring contract; they do not
 change the stack-daemon attach wire ABI.
 
+Software GRO is an explicit per-interface receive property:
+
+```rust
+pub fn iface::set_software_gro(name: &str, enabled: bool) -> bool;
+```
+
+New interfaces default to disabled. A driver opts in only when every RX path
+feeding that interface flushes the current CPU's GRO table at poll completion.
+Enabling one interface never changes receive semantics for another interface;
+`NetIfaceSnapshot::software_gro` records the selected state.
+
 ### 3.3 Control-plane operations
 
 ```rust
