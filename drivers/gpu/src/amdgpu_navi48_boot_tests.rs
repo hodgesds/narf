@@ -24,6 +24,13 @@ fn report() -> Report {
             gfx_min_mhz: 500,
             gfx_max_mhz: 3100,
         },
+        dmub: dmub::Status {
+            firmware_version: 0x0a000c00,
+            boot_status: 3,
+            inbox: 0x800400000,
+            outbox: 0x800402000,
+            capabilities: None,
+        },
         media: psp::MediaFirmware {
             vcn: Some(0x800100000),
             dmcub: Some(0x800200000),
@@ -111,138 +118,4 @@ fn navi48_boot_order_failure_and_cancellation() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48_boot",
     navi48_boot_order_failure_and_cancellation
-);
-
-struct Display {
-    regs: [u32; 0x201],
-    writes: Vec<(u32, u32)>,
-    ack: bool,
-    pwait: bool,
-    ignore_reset: bool,
-}
-impl Display {
-    fn new(running: bool) -> Self {
-        let mut regs = [0; 0x201];
-        regs[0x1f6] = if running { 1 << 16 } else { 0 };
-        regs[0x1af..=0x1b4].fill(0x80003456);
-        Self {
-            regs,
-            writes: Vec::new(),
-            ack: true,
-            pwait: true,
-            ignore_reset: false,
-        }
-    }
-}
-impl DisplayIo for Display {
-    fn read(&mut self, r: u32) -> u32 {
-        self.regs[r as usize]
-    }
-    fn write(&mut self, r: u32, v: u32) {
-        self.writes.push((r, v));
-        if r == 0x200 && self.ignore_reset {
-            return;
-        }
-        self.regs[r as usize] = v;
-        if r == 0x1f8 && v == 0x10020000 {
-            self.regs[0x1ea] = 0xdeaddead;
-            if self.ack {
-                self.regs[0x1f8] = 0x20000;
-            }
-            if self.pwait {
-                self.regs[0x1f6] |= 1 << 20;
-            }
-        }
-    }
-}
-fn navi48_dmub_stop_preserves_secure_windows_and_uses_cntl2() -> TestResult {
-    for running in [false, true] {
-        let mut d = Display::new(running);
-        if run(stop_dmub(&mut d, &Cap::bootstrap())).is_err() {
-            return TestResult::Fail("DCN4 stop/reset failed");
-        }
-        if d.regs[0x200] & 1 == 0
-            || d.regs[0x1f6] & ((1 << 16) | (1 << 17)) != 0
-            || d.regs[0x1af..=0x1b4] != [0x3456; 6]
-            || d.writes.iter().any(|(r, _)| {
-                !matches!(
-                    *r,
-                    0x1af
-                        ..=0x1b4
-                            | 0x1d6
-                            | 0x1d7
-                            | 0x1da
-                            | 0x1db
-                            | 0x1de
-                            | 0x1df
-                            | 0x1e3
-                            | 0x1f6
-                            | 0x1f8
-                            | 0x200
-                )
-            })
-        {
-            return TestResult::Fail("DCN4 reset touched secure/unrelated registers");
-        }
-        let reset = d.writes.iter().position(|(r, _)| *r == 0x200).unwrap();
-        let disable = d.writes.iter().position(|(r, _)| *r == 0x1f6).unwrap();
-        let windows = d.writes.iter().position(|(r, _)| *r == 0x1af).unwrap();
-        if reset >= disable || disable >= windows {
-            return TestResult::Fail("DCN4 reset/disable/window order");
-        }
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu/navi48_boot",
-    navi48_dmub_stop_preserves_secure_windows_and_uses_cntl2
-);
-
-fn navi48_dmub_stop_requires_ack_idle_authority_and_readback() -> TestResult {
-    for (ack, pwait) in [(false, true), (true, false)] {
-        let mut d = Display::new(true);
-        d.ack = ack;
-        d.pwait = pwait;
-        if run(stop_dmub(&mut d, &Cap::bootstrap())) != Err(Error::DmubTimeout)
-            || d.writes != [(0x1f8, 0x10020000)]
-        {
-            return TestResult::Fail("unacknowledged or non-idle DMUB reset");
-        }
-    }
-    let mut d = Display::new(true);
-    d.ack = false;
-    let cap = Cap::bootstrap();
-    {
-        let mut f = core::pin::pin!(stop_dmub(&mut d, &cap));
-        if f.as_mut()
-            .poll(&mut Context::from_waker(Waker::noop()))
-            .is_ready()
-        {
-            return TestResult::Fail("stop wait did not yield");
-        }
-        cap.revoke();
-        if run(f) != Err(Error::Revoked) {
-            return TestResult::Fail("revoked DMUB wait continued");
-        }
-    }
-    if d.writes != [(0x1f8, 0x10020000)] {
-        return TestResult::Fail("writes after revocation");
-    }
-    let mut d = Display::new(false);
-    d.ignore_reset = true;
-    if run(stop_dmub(&mut d, &Cap::bootstrap())) != Err(Error::DmubReadback)
-        || d.writes.iter().any(|(r, _)| *r == 0x1af)
-    {
-        return TestResult::Fail("windows changed before reset readback");
-    }
-    let mut d = Display::new(false);
-    d.regs[0x1f6] = u32::MAX;
-    if run(stop_dmub(&mut d, &Cap::bootstrap())) != Err(Error::DeviceGone) || !d.writes.is_empty() {
-        return TestResult::Fail("missing device wrote registers");
-    }
-    TestResult::Pass
-}
-kernel_test_in!(
-    "drivers/gpu/navi48_boot",
-    navi48_dmub_stop_requires_ack_idle_authority_and_readback
 );

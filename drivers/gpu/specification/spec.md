@@ -242,8 +242,9 @@ uses CNTL2 reset, verifies disabled/reset readback and leaves PSP's secure
 windows untouched. Every stage is observable through `State`; failure or
 cancellation prevents replay. The sequence then initializes GMC12 and SDMA7
 as described below; `MemoryReady` reports firmware/media/power status, the
-VMID0 aperture and verified DMA proof. User queues, DMUB restart, native
-display, probe integration and physical validation are separate gates;
+VMID0 aperture and verified DMA proof. It then starts DMUB and validates its
+version/capability mailbox handshake. User queues, native display, probe
+integration and physical validation are separate gates;
 `fw_loaded` is not set by this API.
 
 `unsafe amdgpu_gmc_navi48::Gmc::new` validates GC12.0.1/MMHUB4.1/NBIO banks
@@ -268,6 +269,30 @@ bytes, fence, hardware read pointer and read-pointer writeback. HDP6 uses
 generic posted-write flushing with no HDP5 invalidate access. A failed or
 cancelled attempt cannot replay and retains its published allocation.
 The cold-boot owner retains GMC and SDMA throughout their consumers' lives.
+
+`amdgpu_dmub_firmware::Image::prepare_dcn401` requires a DCN4 combined image
+and allocates a separate, bounded shared-state region alongside the existing
+instruction/stack/VBIOS/mailbox/trace/state regions. Shared feature counts must
+fit their advertised storage; allocation is at least six 256-byte blocks.
+Older layouts continue rejecting images that require shared state.
+`amdgpu_dmub_navi48::Prepared::new` prepares immutable ordinary RAM with this
+GPU's VBIOS before any hardware write. `unsafe Dmub::new` validates the pool
+mapping and retains all nonsecure storage. `quiesce` requires STOP response,
+GPINT acknowledgement and PWAIT, then holds CNTL2 and DMUIF reset with readback.
+`unsafe start(psp)` verifies both authenticated CW0/CW1 windows lie inside
+this GPU's retained TMR, preserves those windows, uploads nonsecure data and
+programs Region6 shared state plus the cached windows and mailbox registers.
+It requires fresh boot status followed by matching GPINT firmware version and
+feature-capability acknowledgement. Initial boot options disable automatic
+clock/IPS power transitions and skip the inherited panel initialization.
+
+DCN4 reuses the bounded inbox/outbox protocol for `hpd`, `aux` and
+`poll_notification`, with CNTL2 liveness and HDP6 coherency. Timeout, malformed
+reply, cancellation, reset or capability revocation stops further commands;
+published storage remains quarantined until independent recovery. The
+cold-boot firmware bundle includes DMUB preparation, and `ColdBoot::dmub`
+exposes the mailbox only after the complete boot sequence succeeds while
+retaining PSP/TMR. This proves firmware communication, not native scanout.
 
 ### Navi 22 PSP secure-OS bootstrap
 

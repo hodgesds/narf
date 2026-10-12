@@ -1,5 +1,5 @@
-//! Owned DCN30 inbox1/outbox1 transport. ABI: Linux dmub_cmd.h,
-//! dmub_srv.c, dmub_dcn20.c; PCIe coherency: amdgpu/hdp_v5_0.c.
+//! Owned DCN inbox1/outbox1 transport. ABI: Linux dmub_cmd.h and dmub_srv.c.
+//! The enclosing controller supplies generation-specific reset/coherency.
 use super::*;
 
 const SIZE: u32 = 8192;
@@ -84,11 +84,7 @@ fn valid_header(command: &[u8; 64]) -> bool {
     command[2] & !1 == 0 && command[3] <= 60
 }
 fn alive(io: &mut impl Io, l: Layout) -> Result<(), Error> {
-    if read(io, l.dcn, CNTL)? & (RESET | ENABLE) != ENABLE
-        || read(io, l.dcn, HUB)? & 0x100 != 0
-        || read(io, l.dcn, STATUS)? & 3 != 3
-        || read(io, l.nbio, 0x12d)? != 0x7f000
-    {
+    if !is_running(io, l)? || read(io, l.nbio, 0x12d)? != 0x7f000 {
         return Err(Error::Protocol);
     }
     Ok(())
@@ -101,9 +97,7 @@ fn flush(io: &mut impl Io, l: Layout) -> Result<(), Error> {
     Ok(())
 }
 fn download(io: &mut impl Io, l: Layout, map: MmioRegion, offset: u64) -> [u8; 64] {
-    io.write(l.hdp + 0xd1 * 4, 1);
-    io.read(l.hdp + 0xd1 * 4);
-    fence(Ordering::SeqCst);
+    invalidate(io, l);
     let mut reply = [0; 64];
     for (i, word) in reply.chunks_exact_mut(4).enumerate() {
         word.copy_from_slice(&io.download(map, offset + (i * 4) as u64).to_le_bytes());

@@ -1,14 +1,14 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
 use crate::{
-    amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_gddr6 as training, amdgpu_gmc_navi48 as gmc,
-    amdgpu_navi48_firmware as gfx, amdgpu_psp_boot as sos, amdgpu_psp_ring as psp,
-    amdgpu_sdma_navi48 as sdma, amdgpu_smu_navi48 as smu, amdgpu_vram::Pool,
-    amdgpu_vram_boot::Training,
+    amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_dmub_navi48 as dmub, amdgpu_gddr6 as training,
+    amdgpu_gmc_navi48 as gmc, amdgpu_navi48_firmware as gfx, amdgpu_psp_boot as sos,
+    amdgpu_psp_ring as psp, amdgpu_sdma_navi48 as sdma, amdgpu_smu_navi48 as smu,
+    amdgpu_vram::Pool, amdgpu_vram_boot::Training,
 };
 use alloc::vec::Vec;
-use narf_bus::{BusDeviceCap, MmioRegion};
-use narf_capabilities::{Cap, CapError, CapOp, Read, Write};
+use narf_bus::BusDeviceCap;
+use narf_capabilities::{Cap, Read, Write};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     MemoryTraining,
@@ -25,8 +25,9 @@ pub enum Stage {
     PowerSetup,
     MemoryTranslation,
     DmaProof,
+    StartDmub,
 }
-const STAGES: [Stage; 14] = [
+const STAGES: [Stage; 15] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -41,6 +42,7 @@ const STAGES: [Stage; 14] = [
     Stage::PowerSetup,
     Stage::MemoryTranslation,
     Stage::DmaProof,
+    Stage::StartDmub,
 ];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -50,8 +52,6 @@ pub enum Error {
     Allocation,
     Revoked,
     DeviceGone,
-    DmubTimeout,
-    DmubReadback,
     Training(training::Error),
     Sos(sos::Error),
     Psp(psp::Error),
@@ -59,6 +59,7 @@ pub enum Error {
     Firmware(gfx::Error),
     Gmc(gmc::Error),
     Sdma(sdma::Error),
+    Dmub(dmub::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -75,11 +76,13 @@ pub struct Report {
     pub media: psp::MediaFirmware,
     pub aperture: gmc::Aperture,
     pub dma: sdma::Proof,
+    pub dmub: dmub::Status,
 }
 #[derive(Debug)]
 pub struct Firmware {
     sos: sos::Firmware,
     gfx: gfx::Firmware,
+    dmub: Option<dmub::Prepared>,
 }
 impl Firmware {
     pub fn open(
@@ -87,9 +90,19 @@ impl Firmware {
         registry: &Cap<narf_firmware::FirmwareRegistry, Read>,
         mes: gfx::MesMode,
     ) -> Result<Self, Error> {
+        let sos = sos::Firmware::open(gpu, registry).map_err(Error::Sos)?;
+        let gfx = gfx::Firmware::open(gpu, registry, mes).map_err(Error::Firmware)?;
+        let bios = gpu.vbios.as_ref().ok_or(Error::Invalid)?;
+        let prepared = dmub::Prepared::new(
+            gfx.dmcub_bytes(),
+            bios.bytes(),
+            sos.image().map_err(Error::Sos)?.version(),
+        )
+        .map_err(Error::Dmub)?;
         Ok(Self {
-            sos: sos::Firmware::open(gpu, registry).map_err(Error::Sos)?,
-            gfx: gfx::Firmware::open(gpu, registry, mes).map_err(Error::Firmware)?,
+            sos,
+            gfx,
+            dmub: Some(prepared),
         })
     }
 }
@@ -115,95 +128,11 @@ impl<B: Backend> Sequence<B> {
             }
         }
         let report = self.backend.report().inspect_err(|&e| {
-            self.state = State::Failed(Stage::DmaProof, e);
+            self.state = State::Failed(Stage::StartDmub, e);
         })?;
         self.state = State::MemoryReady;
         Ok(report)
     }
-}
-struct Op<F>(F);
-impl<F: FnOnce() -> T, T> CapOp<BusDeviceCap, Write> for Op<F> {
-    type Output = T;
-    fn execute(self, _: &Cap<BusDeviceCap, Write>) -> Result<T, CapError> {
-        Ok((self.0)())
-    }
-}
-trait DisplayIo {
-    fn read(&mut self, reg: u32) -> u32;
-    fn write(&mut self, reg: u32, value: u32);
-}
-struct DisplayMmio {
-    regs: MmioRegion,
-    base: u64,
-}
-impl DisplayIo for DisplayMmio {
-    fn read(&mut self, reg: u32) -> u32 {
-        // SAFETY: the constructor bounds DCN4 bank two through 0x200.
-        unsafe { self.regs.read32(self.base + reg as u64 * 4) }
-    }
-    fn write(&mut self, reg: u32, value: u32) {
-        // SAFETY: same bounded bank under live authority and exclusive ownership.
-        unsafe { self.regs.write32(self.base + reg as u64 * 4, value) };
-    }
-}
-fn access<T>(
-    io: &mut impl DisplayIo,
-    cap: &Cap<BusDeviceCap, Write>,
-    f: impl FnOnce(&mut dyn DisplayIo) -> Result<T, Error>,
-) -> Result<T, Error> {
-    cap.invoke(Op(|| f(io))).map_err(|_| Error::Revoked)?
-}
-fn checked(io: &mut dyn DisplayIo, r: u32) -> Result<u32, Error> {
-    match io.read(r) {
-        u32::MAX => Err(Error::DeviceGone),
-        v => Ok(v),
-    }
-}
-async fn stop_dmub(io: &mut impl DisplayIo, cap: &Cap<BusDeviceCap, Write>) -> Result<(), Error> {
-    // dmub_dcn401_reset: CNTL2 bit zero, not DCN30's CNTL bit seventeen.
-    let (control, reset) = access(io, cap, |io| Ok((checked(io, 0x1f6)?, checked(io, 0x200)?)))?;
-    if control & (1 << 16) != 0 && reset & 1 == 0 {
-        access(io, cap, |io| {
-            io.write(0x1f8, 0x10020000);
-            Ok(())
-        })?;
-        let deadline = narf_time::Deadline::after_ms(1000);
-        loop {
-            if access(io, cap, |io| {
-                Ok(checked(io, 0x1ea)? == 0xdeaddead
-                    && checked(io, 0x1f6)? & (1 << 20) != 0
-                    && checked(io, 0x1f8)? == 0x00020000)
-            })? {
-                break;
-            }
-            if deadline.expired() {
-                return Err(Error::DmubTimeout);
-            }
-            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
-        }
-    }
-    access(io, cap, |io| {
-        let reset = checked(io, 0x200)?;
-        io.write(0x200, reset | 1);
-        Ok(())
-    })?;
-    narf_time::SleepUntil::new(narf_time::Deadline::after_us(1).as_instant()).await;
-    access(io, cap, |io| {
-        let control = checked(io, 0x1f6)?;
-        io.write(0x1f6, control & !(1 << 16));
-        if checked(io, 0x200)? & 1 == 0 || checked(io, 0x1f6)? & (1 << 16) != 0 {
-            return Err(Error::DmubReadback);
-        }
-        // No SEC_CNTL/CW0/CW1 writes: authenticated windows belong to PSP.
-        for reg in [0x1af, 0x1b0, 0x1b1, 0x1b2, 0x1b3, 0x1b4] {
-            let value = checked(io, reg)?;
-            io.write(reg, value & !(1 << 31));
-        }
-        for reg in [0x1d6, 0x1d7, 0x1da, 0x1db, 0x1de, 0x1df, 0x1e3, 0x1f8] {
-            io.write(reg, 0);
-        }
-        Ok(())
-    })
 }
 #[derive(Debug)]
 struct Hardware {
@@ -211,7 +140,7 @@ struct Hardware {
     authority: Cap<BusDeviceCap, Write>,
     pool: Pool,
     firmware: Firmware,
-    dcn: u64,
+    dmub: dmub::Dmub,
     trainer: Option<training::Trainer>,
     sos: Option<sos::Bootloader>,
     psp: Option<psp::Psp>,
@@ -299,16 +228,7 @@ impl Backend for Hardware {
                 .upload_board()
                 .await
                 .map_err(Error::Smu)?,
-            Stage::StopDmub => {
-                stop_dmub(
-                    &mut DisplayMmio {
-                        regs: self.gpu.regs,
-                        base: self.dcn,
-                    },
-                    &self.authority,
-                )
-                .await?
-            }
+            Stage::StopDmub => self.dmub.quiesce().await.map_err(Error::Dmub)?,
             Stage::Graphics => self
                 .psp
                 .as_mut()
@@ -357,6 +277,12 @@ impl Backend for Hardware {
                 unsafe { self.sdma.as_mut().unwrap().initialize(gmc).await }
                     .map_err(Error::Sdma)?;
             }
+            Stage::StartDmub => {
+                let psp = self.psp.as_ref().ok_or(Error::Invalid)?;
+                // SAFETY: this GPU's PSP/TMR and GMC remain retained, with
+                // protected boot clocks and exclusively owned DCN/VRAM.
+                unsafe { self.dmub.start(psp).await }.map_err(Error::Dmub)?;
+            }
         }
         Ok(())
     }
@@ -366,6 +292,7 @@ impl Backend for Hardware {
             graphics: self.graphics.ok_or(Error::Invalid)?,
             power: self.power.ok_or(Error::Invalid)?,
             media: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
+            dmub: self.dmub.status().ok_or(Error::Invalid)?,
             aperture: self
                 .gmc
                 .as_ref()
@@ -397,7 +324,7 @@ impl ColdBoot {
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
-        firmware: Firmware,
+        mut firmware: Firmware,
         exchange: Option<Training>,
     ) -> Result<Self, Error> {
         let layout = psp::navi48_layout(gpu).map_err(Error::Psp)?;
@@ -410,8 +337,6 @@ impl ColdBoot {
             return Err(Error::Unsupported);
         }
         psp::bank(gpu, ip::HW_ID_MP1, &[(14, 0, 2), (14, 0, 3)], 1, 0x9a).map_err(Error::Psp)?;
-        let dcn =
-            psp::bank(gpu, ip::HW_ID_DCN, &[(4, 0, 1), (4, 1, 0)], 2, 0x200).map_err(Error::Psp)?;
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(gpu.ip_blocks.len())
@@ -437,6 +362,10 @@ impl ColdBoot {
         } else {
             None
         };
+        let prepared = firmware.dmub.take().ok_or(Error::Invalid)?;
+        // SAFETY: caller grants DCN and pool ownership for this GPU and board.
+        let dmub =
+            unsafe { dmub::Dmub::new(&saved, authority, pool, prepared) }.map_err(Error::Dmub)?;
         Ok(Self {
             sequence: Sequence {
                 backend: Hardware {
@@ -444,7 +373,7 @@ impl ColdBoot {
                     authority,
                     pool: pool.clone(),
                     firmware,
-                    dcn,
+                    dmub,
                     trainer,
                     sos: None,
                     psp: None,
@@ -462,10 +391,18 @@ impl ColdBoot {
     pub fn state(&self) -> State {
         self.sequence.state
     }
-    /// MemoryReady proves firmware, power and an owned VMID0 SDMA write/copy.
+    /// MemoryReady proves firmware, power, an owned VMID0 SDMA write/copy
+    /// and the DMUB version/capability mailbox handshake.
     /// It does not establish userspace queues or a native display mode.
     pub async fn run(&mut self) -> Result<Report, Error> {
         self.sequence.run().await
+    }
+    /// Access the live display mailbox while retaining this session's PSP/TMR.
+    pub fn dmub(&mut self) -> Result<&mut dmub::Dmub, Error> {
+        if self.state() != State::MemoryReady {
+            return Err(Error::Busy);
+        }
+        Ok(&mut self.sequence.backend.dmub)
     }
 }
 

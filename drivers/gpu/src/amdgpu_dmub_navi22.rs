@@ -22,6 +22,7 @@ const GPINT: u32 = 0x1f8;
 const STOP: u32 = 0x10020000;
 const STATUS: u32 = 0x1e3;
 const MASK: u32 = 0x1fffffff;
+#[allow(clippy::duplicate_mod, reason = "instantiate the shared protocol against each generation's private Engine and register accessors")]
 #[path = "amdgpu_dmub_navi22_mailbox.rs"]
 mod mailbox;
 pub use mailbox::{FeatureCaps, MailboxState};
@@ -186,6 +187,16 @@ fn update(io: &mut impl Io, base: u64, reg: u32, mask: u32, value: u32) -> Resul
 }
 fn is_reset(io: &mut impl Io, base: u64) -> Result<bool, Error> {
     Ok(read(io, base, CNTL)? & (RESET | ENABLE) == RESET && read(io, base, HUB)? & 0x100 != 0)
+}
+fn is_running(io: &mut impl Io, l: Layout) -> Result<bool, Error> {
+    Ok(read(io, l.dcn, CNTL)? & (RESET | ENABLE) == ENABLE
+        && read(io, l.dcn, HUB)? & 0x100 == 0
+        && read(io, l.dcn, STATUS)? & 3 == 3)
+}
+fn invalidate(io: &mut impl Io, l: Layout) {
+    io.write(l.hdp + 0xd1 * 4, 1);
+    io.read(l.hdp + 0xd1 * 4);
+    fence(Ordering::SeqCst);
 }
 async fn tick() {
     narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;

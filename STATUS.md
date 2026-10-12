@@ -293,6 +293,10 @@ GMC12/MMHUB4.1 VMID0 translation and the SDMA7 owned-VRAM write/copy/fence
 path now form the last two explicit cold-boot stages. The returned proof
 covers those kernel-owned pages only; userspace graphics/compute queues,
 native display and real-card validation remain open.
+DCN4 DMUB shared-state allocation, CNTL2/DMUIF reset, authenticated-window
+validation, startup and version/capability/HPD/AUX mailbox support are now
+implemented and included in cold boot. Native scanout/link programming,
+graphics/compute/media queues and automatic platform ownership remain open.
 
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
