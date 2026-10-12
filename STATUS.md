@@ -294,15 +294,18 @@ map/unmap packets and two-fence completion/error decoding, checked against Linux
 C layouts. Its retained unified-firmware owner starts both pipes, configures
 PCIe BAR2 doorbells, maps the scheduler through KIQ and verifies native command
 completion plus full ring drain. The boot sequence includes this firmware-queue
-handshake; it grants no application queues or user VMIDs yet. Cancellation and
-failure retain all published queue memory and prevent replay.
+handshake; it grants no application queues or user VMIDs yet. Native kernel
+graphics and compute MQDs now map through the scheduler and execute bounded
+WRITE_DATA proofs into the two owned translated VRAM pages, requiring confirmed
+fences, complete 32-bit RPTR drain and all expected data words. Cancellation
+and failure retain all published queue memory and prevent replay.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
 on incomplete startup. Read-only preparation failures restore CPU writers.
 
-Still open: GC12/MES12 graphics and compute queue execution, production GPU VM
-and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
+Still open: GC12 rendering and shader dispatch, production GPU VM and
+userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, reset/suspend/resume, and physical RX 9070 XT testing.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver
 continues to report acceleration unavailable; model/QEMU tests do not prove

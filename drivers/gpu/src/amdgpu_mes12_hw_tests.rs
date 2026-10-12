@@ -78,12 +78,19 @@ impl Fake {
                     2
                 }
                 2 => {
-                    assert_eq!(pipe, 1);
-                    assert_eq!(words[18], 22);
+                    assert_eq!(pipe, usize::from(words[28] == 3));
+                    assert_eq!(
+                        words[18],
+                        match words[28] {
+                            0 => 0x116,
+                            1 => 6,
+                            3 => 22,
+                            _ => panic!("unknown kernel queue"),
+                        }
+                    );
                     assert_eq!(words[19], 0);
                     assert_eq!(ptr(20), GPU + 4096);
                     assert_eq!(ptr(22), GPU + 12296);
-                    assert_eq!(words[28], 3);
                     assert_eq!(words[37], 1 << 13);
                     assert_eq!(&words[50..52], &[0, 0]);
                     self.active[0] = true;
@@ -440,4 +447,40 @@ fn mes12_hw_validates_discovery_and_refuses_separate_kiq_firmware() -> TestResul
 kernel_test_in!(
     "drivers/gpu/mes12",
     mes12_hw_validates_discovery_and_refuses_separate_kiq_firmware
+);
+
+fn mes12_hw_maps_bootstrap_kernel_queues_on_scheduler_pipe() -> TestResult {
+    let (_, mut e) = fixture();
+    let mut q = api::KernelQueue {
+        kind: api::QueueType::Graphics,
+        pipe: 0,
+        queue: 0,
+        doorbell: 0x116,
+        mqd: GPU + 4096,
+        write_pointer: GPU + 12296,
+    };
+    assert_eq!(run(e.map_bootstrap_queue(q)), Err(Error::Busy));
+    run(e.start()).unwrap();
+    assert_eq!(run(e.map_bootstrap_queue(q)), Ok(()));
+    q.kind = api::QueueType::Compute;
+    q.doorbell = 6;
+    assert_eq!(run(e.map_bootstrap_queue(q)), Ok(()));
+    assert_eq!(e.completed, [5, 3]);
+    assert_eq!(&e.io.frames[6..], &[(0, 2), (0, 2)]);
+    q.doorbell = 0x116;
+    assert_eq!(run(e.map_bootstrap_queue(q)), Err(Error::Invalid));
+    assert_eq!(e.state, State::Ready);
+    q.doorbell = 6;
+    e.io.reject = true;
+    assert!(matches!(
+        run(e.map_bootstrap_queue(q)),
+        Err(Error::FirmwareRejected(_))
+    ));
+    assert!(matches!(e.state, State::Failed(_)));
+    assert_eq!(run(e.map_bootstrap_queue(q)), Err(Error::Busy));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/mes12",
+    mes12_hw_maps_bootstrap_kernel_queues_on_scheduler_pipe
 );

@@ -511,6 +511,28 @@ impl<I: Io> Engine<I> {
         }
     }
 }
+impl<I: Io> Engine<I> {
+    async fn map_bootstrap_queue(&mut self, queue: api::KernelQueue) -> Result<(), Error> {
+        if self.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        let doorbell = match queue.kind {
+            api::QueueType::Graphics => 0x116,
+            api::QueueType::Compute => 6,
+            _ => return Err(Error::Invalid),
+        };
+        if queue.pipe != 0 || queue.queue != 0 || queue.doorbell != doorbell {
+            return Err(Error::Invalid);
+        }
+        let packet = api::map_kernel_queue(queue).map_err(|_| Error::Invalid)?;
+        let result = self.submit(0, packet).await;
+        self.state = match result {
+            Ok(()) => State::Ready,
+            Err(e) => State::Failed(e),
+        };
+        result
+    }
+}
 #[derive(Debug)]
 pub struct Mes(Engine<Mmio>);
 
@@ -628,6 +650,24 @@ impl Mes {
             versions: self.0.versions,
             completed: self.0.completed,
         })
+    }
+    pub(crate) fn doorbells(&self) -> Result<MmioRegion, Error> {
+        if self.state() != State::Ready {
+            return Err(Error::Busy);
+        }
+        Ok(self.0.doorbells)
+    }
+    /// Map one of the two bootstrap kernel rings. MES12 maps the scheduler
+    /// through KIQ, but maps ordinary kernel queues through scheduler pipe 0.
+    /// # Safety
+    /// Caller exclusively owns the specified inactive HQD, its doorbell and all
+    /// addresses in the descriptor. Publish/retain all storage before this call,
+    /// including on cancellation or firmware rejection. No user command buffers.
+    pub(crate) async unsafe fn map_bootstrap_queue(
+        &mut self,
+        queue: api::KernelQueue,
+    ) -> Result<(), Error> {
+        self.0.map_bootstrap_queue(queue).await
     }
 }
 

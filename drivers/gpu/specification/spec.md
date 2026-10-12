@@ -314,7 +314,31 @@ GRBM before awaiting. Version/command waits have 2.1-second deadlines using
 scheduler timers. Publication quarantines every firmware-visible allocation
 through cancellation or failure and prevents replay. `State`/`Report` expose
 firmware progress, live versions and completed commands, **not** application
-acceleration. No graphics/compute/SDMA queue or user VMID is delegated yet.
+acceleration. No application queue or user VMID is delegated yet. The private
+bootstrap mapping path maps the two owned graphics/compute HQDs through
+**scheduler pipe 0**, following MES12's distinct routing for ordinary kernel
+queues. A mapping failure/cancellation stops further MES commands.
+
+`unsafe amdgpu_gfx12_queue::Queues::new` reserves 24 KiB for native graphics
+and compute MQDs, two 4-KiB command rings, EOP storage and pointer writebacks.
+It requires ownership of gfx/compute pipe 0 queue 0 and doorbells 0x116/6;
+the completed MES owner supplies the same uncached BAR2 mapping. `unsafe
+initialize(mes, gmc).await` requires successful RS64/RLC setup and the matching
+GMC/MES owners. It rejects active inherited HQDs, validates the owned two-page
+VMID0 test aperture, flushes descriptors and commands, then publishes storage
+before asking MES to map either queue. Graphics and compute use their native
+MQD fields: the compute ring enables hardware RPTR writeback and its own
+quantum, rather than inheriting the MES firmware's pointer policy.
+
+Each queue submits a 256-dword-aligned, driver-generated WRITE_DATA sequence
+to one translated test page, followed by a confirmed fence and bounded NOP
+padding. `Proof` requires the fresh engine-specific fence, the full **32-bit**
+GC12 read-pointer drain and every expected data word. No caller command or
+address is accepted. The 2.1-second wait uses scheduler timers and current
+capability checks; cancellation or any failure retains mapped storage and
+prevents replay. The cold-boot coordinator retains these queues and both GMC
+pages, recording the proof before DMUB startup. This proves kernel command
+transport and translated writes, not rendering, shader dispatch or user IBs.
 
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object

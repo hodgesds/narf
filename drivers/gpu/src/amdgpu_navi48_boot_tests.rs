@@ -10,6 +10,11 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 }
 fn report() -> Report {
     Report {
+        queues: queues::Proof {
+            graphics_fence: 0x9070cafe,
+            compute_fence: 0x9070beef,
+            written_bytes: 128,
+        },
         setup: setup::Report {
             revision: 0,
             clear_state_address: 0x800300000,
@@ -17,7 +22,7 @@ fn report() -> Report {
         },
         mes: mes::Report {
             versions: [0x308b; 2],
-            completed: [3, 3],
+            completed: [5, 3],
         },
         rs64: rs64::Starts {
             pfp: 0x1000,

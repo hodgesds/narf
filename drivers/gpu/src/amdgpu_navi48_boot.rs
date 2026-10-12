@@ -1,5 +1,6 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
+use crate::amdgpu_gfx12_queue as queues;
 use crate::amdgpu_gfx12_rs64 as rs64;
 use crate::amdgpu_gfx12_setup as setup;
 use crate::amdgpu_mes12_hw as mes;
@@ -33,9 +34,10 @@ pub enum Stage {
     DmaProof,
     SetupGraphics,
     StartMes,
+    KernelQueueProof,
     StartDmub,
 }
-const STAGES: [Stage; 19] = [
+const STAGES: [Stage; 20] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -54,6 +56,7 @@ const STAGES: [Stage; 19] = [
     Stage::DmaProof,
     Stage::SetupGraphics,
     Stage::StartMes,
+    Stage::KernelQueueProof,
     Stage::StartDmub,
 ];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +80,7 @@ pub enum Error {
     Rs64(rs64::Error),
     Mes(mes::Error),
     Setup(setup::Error),
+    Queues(queues::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -98,6 +102,7 @@ pub struct Report {
     pub rs64: rs64::Starts,
     pub mes: mes::Report,
     pub setup: setup::Report,
+    pub queues: queues::Proof,
 }
 #[derive(Debug)]
 pub struct Firmware {
@@ -176,6 +181,7 @@ struct Hardware {
     gmc: Option<gmc::Gmc>,
     sdma: Option<sdma::Sdma>,
     mes: Option<mes::Mes>,
+    queues: Option<queues::Queues>,
 }
 impl Backend for Hardware {
     async fn step(&mut self, stage: Stage) -> Result<(), Error> {
@@ -347,6 +353,20 @@ impl Backend for Hardware {
                     .await
                     .map_err(Error::Mes)?;
             }
+            Stage::KernelQueueProof => {
+                let mes = self.mes.as_mut().ok_or(Error::Invalid)?;
+                // SAFETY: retained GC12/RLC/MES setup, exclusively owned HQDs,
+                // doorbells and inventory pool; no application command buffers.
+                self.queues = Some(
+                    unsafe { queues::Queues::new(&self.gpu, self.authority, &self.pool, mes) }
+                        .map_err(Error::Queues)?,
+                );
+                let gmc = self.gmc.as_mut().ok_or(Error::Invalid)?;
+                // SAFETY: same GPU's live MES/GMC and no other proof-page user.
+                unsafe { self.queues.as_mut().unwrap().initialize(mes, gmc) }
+                    .await
+                    .map_err(Error::Queues)?;
+            }
             Stage::StartDmub => {
                 let psp = self.psp.as_ref().ok_or(Error::Invalid)?;
                 // SAFETY: this GPU's PSP/TMR and GMC remain retained, with
@@ -366,6 +386,11 @@ impl Backend for Hardware {
             topology: self.topology.ok_or(Error::Invalid)?,
             rs64: self.rs64.starts().ok_or(Error::Invalid)?,
             setup: self.setup.report().ok_or(Error::Invalid)?,
+            queues: self
+                .queues
+                .as_ref()
+                .and_then(queues::Queues::proof)
+                .ok_or(Error::Invalid)?,
             mes: self
                 .mes
                 .as_ref()
@@ -493,6 +518,7 @@ impl ColdBoot {
                     gmc: None,
                     sdma: None,
                     mes: None,
+                    queues: None,
                 },
                 state: State::Prepared,
             },

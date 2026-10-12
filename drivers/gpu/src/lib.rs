@@ -183,6 +183,7 @@ pub mod amdgpu_dpm;
 pub mod amdgpu_gddr6;
 pub mod amdgpu_gem;
 pub mod amdgpu_gfx;
+pub mod amdgpu_gfx12_queue;
 pub mod amdgpu_gfx12_rs64;
 pub mod amdgpu_gfx12_setup;
 pub mod amdgpu_gfx12_topology;

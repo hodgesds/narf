@@ -15,6 +15,7 @@ _Static_assert(sizeof(union MESAPI_SET_HW_RESOURCES) == 256, "resource frame");
 _Static_assert(sizeof(union MESAPI__ADD_QUEUE) == 256, "add frame");
 _Static_assert(sizeof(union MESAPI__REMOVE_QUEUE) == 256, "remove frame");
 _Static_assert(sizeof(struct v12_compute_mqd) == 2048, "MES descriptor");
+_Static_assert(sizeof(struct v12_gfx_mqd) == 2048, "graphics descriptor");
 WORD(union MESAPI_SET_HW_RESOURCES, api_status, 50);
 WORD(union MESAPI_SET_HW_RESOURCES, uint32_all, 54);
 WORD(union MESAPI_SET_HW_RESOURCES, oversubscription_timer, 55);
@@ -36,6 +37,15 @@ WORD(struct v12_compute_mqd, cp_hqd_pq_control, 145);
 WORD(struct v12_compute_mqd, cp_mqd_control, 162);
 WORD(struct v12_compute_mqd, cp_hqd_eop_base_addr_lo, 165);
 WORD(struct v12_compute_mqd, reserved_184, 184);
+WORD(struct v12_gfx_mqd, cp_mqd_base_addr, 128);
+WORD(struct v12_gfx_mqd, cp_gfx_hqd_active, 130);
+WORD(struct v12_gfx_mqd, cp_gfx_hqd_quantum, 135);
+WORD(struct v12_gfx_mqd, cp_gfx_hqd_base, 136);
+WORD(struct v12_gfx_mqd, cp_gfx_hqd_rptr_addr, 139);
+WORD(struct v12_gfx_mqd, cp_rb_wptr_poll_addr_lo, 141);
+WORD(struct v12_gfx_mqd, cp_rb_doorbell_control, 143);
+WORD(struct v12_gfx_mqd, cp_gfx_hqd_cntl, 145);
+WORD(struct v12_gfx_mqd, cp_gfx_mqd_control, 162);
 
 int main(void)
 {
