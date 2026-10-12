@@ -307,9 +307,14 @@ retired consumers and readback are required; partial failures retain ownership
 and block global-clock changes. Native HPO DP/FRL stream-clock routing now
 requires matching current pipe clocks and divider readback, preserving each
 DTO's reference. Reprogramming a pipe first parks all actual routes feeding
-from it, including inherited routes. PHY/link and scanout programming,
-active-stream transitions, bandwidth/watermarks and complete native modesetting
-remain open.
+from it, including inherited routes. Native OTG now prepares disabled fixed
+progressive RGB timing on all four pipes, with matching live pipe clocks,
+clock-on acknowledgements, native HPO routing, odd-timing divider handling and
+PSTATE/global-sync fields. Timing retirement disconnects ODM and requires both
+current-master and busy acknowledgements. Partial/cancelled transitions retain
+ownership and block clock changes; timing retirement never releases scanout
+memory. PHY/link and plane/OPP programming, scanout enable, active-stream
+transitions, bandwidth/watermarks and complete native modesetting remain open.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
 C layouts. Its retained unified-firmware owner starts both pipes, configures

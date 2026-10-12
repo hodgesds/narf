@@ -123,6 +123,78 @@ fn reg(e: &Engine<Fake>, r: u64) -> u32 {
     *e.io.regs.get(&(BASE + r * 4)).unwrap_or(&0)
 }
 
+fn dcn401_dccg_timing_references_check_live_dividers_and_state() -> TestResult {
+    for pixel in [
+        PixelClock::DisplayPort {
+            pixel_hz: 148_500_000,
+        },
+        PixelClock::HdmiFrl {
+            pixel_hz: 148_500_000,
+        },
+        PixelClock::Tmds {
+            divider: TmdsDivider::By2,
+        },
+        PixelClock::Tmds {
+            divider: TmdsDivider::By4,
+        },
+    ] {
+        let mut e = engine();
+        let mut req = request(2);
+        req.pixel = pixel;
+        let a = run(e.prepare(req, clocks())).unwrap();
+        e.io.writes.clear();
+        assert_eq!(e.current_pipe(2, clocks()), Ok(a));
+        assert!(e.io.writes.is_empty());
+        let mut stale = clocks();
+        stale.display_khz += 1;
+        assert_eq!(e.current_pipe(2, stale), Err(Error::Invalid));
+        for state in [
+            State::Ready,
+            State::Applied,
+            State::Applying,
+            State::Failed(Error::Timeout),
+        ] {
+            e.status.state = state;
+            assert_eq!(
+                e.current_pipe(2, clocks()).is_ok(),
+                matches!(state, State::Ready | State::Applied)
+            );
+        }
+        e.status.state = State::Applied;
+        *e.io.regs.entry(BASE + 0xa8 * 4).or_default() ^= 1 << 6;
+        assert_eq!(
+            e.current_pipe(2, clocks()),
+            Err(Error::Readback(BASE + 0xa8 * 4))
+        );
+        assert!(matches!(e.status.state, State::Failed(_)));
+    }
+    // TMDS has no DP DTO modulus proof: verify the native disable and divider.
+    for (r, bit) in [(0x80, 0x10), (0x6f, 1)] {
+        let mut e = engine();
+        let mut req = request(0);
+        req.pixel = PixelClock::Tmds {
+            divider: TmdsDivider::By2,
+        };
+        run(e.prepare(req, clocks())).unwrap();
+        *e.io.regs.entry(BASE + r * 4).or_default() ^= bit;
+        assert_eq!(
+            e.current_pipe(0, clocks()),
+            Err(Error::Readback(BASE + r * 4))
+        );
+    }
+    let mut e = engine();
+    let mut req = request(0);
+    req.pixel = PixelClock::Disabled;
+    req.dpp_khz = 0;
+    run(e.prepare(req, clocks())).unwrap();
+    assert_eq!(e.current_pipe(0, clocks()), Err(Error::Invalid));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_dccg_timing_references_check_live_dividers_and_state
+);
+
 fn dcn401_dccg_native_dp_dpp_layout_and_preservation() -> TestResult {
     for pipe in 0..4 {
         let mut e = engine();

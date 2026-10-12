@@ -335,6 +335,45 @@ is retained in `Status::routes`; partial failures share the terminal DCCG state.
 `ColdBoot::route_display_stream_clock` and the platform async wrapper serialize
 this operation with clock and engine owners after drained kernel proofs.
 
+`unsafe amdgpu_dcn401_otg::Otg::new` prepares the four native timing generators
+without MMIO writes. It requires the same native discovery, permanent mappings
+and exclusive display/PM/reset ownership; firmware/FAMS timing writers must be
+excluded. `prepare(&mut ClockManager, &mut Dccg, Request).await` programs disabled
+progressive RGB timing with fixed refresh and one OPP per OTG. Interlace, DSC,
+ODM combining and VRR are not represented by this request. `GlobalSync` supplies
+validated DLG field values (startup/keepout in lines; update/ready in pixels),
+not a bandwidth proof. Totals, porches, sync widths, blanking minima and every
+native field width are checked before writes. Zero vertical front porch is
+rejected instead of silently changing the sink's timing.
+
+Preparation requires matching BAR owners, current acknowledged global clocks,
+the prepared pipe's signal/frequency, and live divider readback. TMDS verifies
+its DPP/DTO-disable/divider state; its PHY PLL remains a separate prerequisite.
+All display consumers must be retired, and the target must have no outstanding
+master-update lock or soft reset. Native ODM/OTG clocks each require hardware
+acknowledgement within 1 ms. Programming establishes ODM bypass, equal fixed
+vertical totals, sync polarity, global-sync/PSTATE keepout and VTG parameters;
+VTG and OTG stay disabled. Odd horizontal boundaries select manual no-divide.
+Both HPO DP and FRL use native output mux 2; mux 1 is reserved. No legacy ODM
+segment-width registers are programmed. Every changed field is read back.
+
+`unsafe retire(pipe).await` requires stopped CPU writers and retained scanout
+surfaces, page tables, HUBP and OPP resources. It first checks that all legacy,
+HPO DP and FRL streams/link clocks are retired. It disconnects all ODM segments,
+clears combining-memory selection, requests OTG disable and disables VTG, then
+waits independently for current master state and busy to clear (150 ms each).
+Clocks remain on. This proves timing retirement only; it cannot authorize memory
+reuse or replace HUBP fetch retirement. Uncertain writes, timeouts or revocation
+record `Failed`; cancellation retains `Preparing(pipe)`/`Retiring(pipe)`. Those
+states block replay and platform clock changes. `Status::pipes` is historical
+programming tagged with its clock snapshot; changing clocks invalidates it.
+
+`ColdBoot::prepare_display_timing`/`unsafe retire_display_timing` and matching
+platform wrappers serialize these operations after the drained kernel proofs.
+`display_timing_status`/platform `display_timing` report retained state. None of
+these operations runs automatically during boot. Plane/OPP setup, bandwidth and
+watermarks, link/PHY programming and scanout enable remain required.
+
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
 the inventoried pool, trained VRAM or an owned training exchange, and all

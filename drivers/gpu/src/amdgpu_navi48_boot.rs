@@ -2,6 +2,7 @@
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
 use crate::amdgpu_dcn401_clk as clocks;
 use crate::amdgpu_dcn401_dccg as dccg;
+use crate::amdgpu_dcn401_otg as otg;
 use crate::amdgpu_ddc_navi48 as ddc;
 use crate::amdgpu_gfx12_queue as queues;
 use crate::amdgpu_gfx12_rs64 as rs64;
@@ -446,6 +447,7 @@ pub struct ColdBoot {
     ddc: Result<ddc::Ddc, display::Error>,
     clocks: Result<clocks::ClockManager, clocks::Error>,
     dccg: Result<dccg::Dccg, dccg::Error>,
+    otg: Result<otg::Otg, otg::Error>,
 }
 impl ColdBoot {
     /// # Safety
@@ -524,6 +526,8 @@ impl ColdBoot {
         let clocks = unsafe { clocks::ClockManager::new(gpu, authority) };
         // SAFETY: matching retained display owner; metadata validation only.
         let dccg = unsafe { dccg::Dccg::new(gpu, authority) };
+        // SAFETY: matching display/PM owner; no timing or firmware writers.
+        let otg = unsafe { otg::Otg::new(gpu, authority) };
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(gpu.ip_blocks.len())
@@ -558,6 +562,7 @@ impl ColdBoot {
             ddc,
             clocks,
             dccg,
+            otg,
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -717,6 +722,10 @@ impl ColdBoot {
             .dccg
             .as_ref()
             .is_ok_and(|d| !matches!(d.status().state, dccg::State::Ready | dccg::State::Applied))
+            || self
+                .otg
+                .as_ref()
+                .is_ok_and(|o| !o.status().state.reusable())
         {
             return Err(clocks::Error::Busy);
         }
@@ -746,6 +755,10 @@ impl ColdBoot {
         if self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)
             || self.sdma_state() != Some(sdma::State::InterruptVerified)
+            || self
+                .otg
+                .as_ref()
+                .is_ok_and(|o| !o.status().state.reusable())
         {
             return Err(dccg::Error::Busy);
         }
@@ -764,6 +777,10 @@ impl ColdBoot {
         if self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)
             || self.sdma_state() != Some(sdma::State::InterruptVerified)
+            || self
+                .otg
+                .as_ref()
+                .is_ok_and(|o| !o.status().state.reusable())
         {
             return Err(dccg::Error::Busy);
         }
@@ -772,6 +789,51 @@ impl ColdBoot {
             .as_mut()
             .map_err(|e| *e)?
             .route_stream(clocks, route)
+    }
+    pub fn display_timing_status(&self) -> Result<otg::Status, otg::Error> {
+        self.otg.as_ref().map(otg::Otg::status).map_err(|e| *e)
+    }
+    /// Prepare native timing while retaining its matching clock owners.
+    /// The generator remains disabled; this does not establish scanout readiness.
+    pub async fn prepare_display_timing(
+        &mut self,
+        request: otg::Request,
+    ) -> Result<otg::Applied, otg::Error> {
+        if self.state() != State::MemoryReady
+            || self.queue_state() != Some(queues::State::InterruptVerified)
+            || self.sdma_state() != Some(sdma::State::InterruptVerified)
+        {
+            return Err(otg::Error::Busy);
+        }
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        self.otg
+            .as_mut()
+            .map_err(|e| *e)?
+            .prepare(clocks, dccg, request)
+            .await
+    }
+    /// # Safety
+    /// All associated scanout resources remain retained and CPU writers have
+    /// stopped. This retires timing only, never HUBP fetches or surface memory.
+    pub async unsafe fn retire_display_timing(&mut self, pipe: u8) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady
+            || self.queue_state() != Some(queues::State::InterruptVerified)
+            || self.sdma_state() != Some(sdma::State::InterruptVerified)
+            || self.dccg.as_ref().is_ok_and(|d| {
+                !matches!(d.status().state, dccg::State::Ready | dccg::State::Applied)
+            })
+            || self.clocks.as_ref().is_ok_and(|c| {
+                !matches!(
+                    c.status().state,
+                    clocks::State::Prepared | clocks::State::Ready | clocks::State::Applied
+                )
+            })
+        {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: caller retains scanout memory; matching exclusive display owner.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.retire(pipe).await }
     }
     pub fn display_state(&self) -> Result<display::State, display::Error> {
         self.display

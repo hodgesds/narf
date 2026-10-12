@@ -45,6 +45,7 @@ pub struct Diagnostics {
     pub display_clocks: Result<crate::amdgpu_dcn401_clk::Status, crate::amdgpu_dcn401_clk::Error>,
     pub display_pipe_clocks:
         Result<crate::amdgpu_dcn401_dccg::Status, crate::amdgpu_dcn401_dccg::Error>,
+    pub display_timing: Result<crate::amdgpu_dcn401_otg::Status, crate::amdgpu_dcn401_otg::Error>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -61,6 +62,7 @@ pub fn status() -> Status {
                 sdma_interrupts: boot.sdma_interrupts(),
                 display_clocks: boot.display_clock_status(),
                 display_pipe_clocks: boot.display_pipe_clock_status(),
+                display_timing: boot.display_timing_status(),
             })
         }),
     }
@@ -320,6 +322,31 @@ pub async fn route_display_stream_clock(
         .as_mut()
         .ok_or(crate::amdgpu_dcn401_dccg::Error::Busy)?
         .route_display_stream_clock(route)
+}
+
+/// Prepare disabled native timing against current, matching pipe clocks.
+pub async fn prepare_display_timing(
+    request: crate::amdgpu_dcn401_otg::Request,
+) -> Result<crate::amdgpu_dcn401_otg::Applied, crate::amdgpu_dcn401_otg::Error> {
+    OWNER
+        .lock()
+        .await
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?
+        .prepare_display_timing(request)
+        .await
+}
+
+/// # Safety
+/// Stop scanout CPU writers and retain every associated surface, page table,
+/// HUBP and OPP resource. Completion proves timing retirement only.
+pub async unsafe fn retire_display_timing(pipe: u8) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: retained owner serializes display/PM; caller retains scanout memory.
+    unsafe { boot.retire_display_timing(pipe).await }
 }
 
 /// Consume bounded diagnostic history from the independent IH service.

@@ -338,6 +338,19 @@ impl<I: Io> Engine<I> {
                 u32::from(plan.dpp_phase) | 0xff << 16,
             ),
             (DPP_ENABLE, 1 << (3 * pipe), 1 << (3 * pipe)),
+        ] {
+            self.verify(index, mask, value)?;
+        }
+        if let PixelClock::Tmds { divider } = plan.request.pixel {
+            self.verify(pixel, 0x1010, 0)?;
+            let mask = 1 << (5 * pipe);
+            return self.verify(
+                PIXEL_DIV,
+                mask,
+                if divider == TmdsDivider::By4 { mask } else { 0 },
+            );
+        }
+        for (index, mask, value) in [
             (DTB_P, 7 << (3 * pipe), source << (3 * pipe)),
             (pixel + 1, u32::MAX, plan.phase),
             (pixel + 2, u32::MAX, plan.reference_hz),
@@ -348,10 +361,7 @@ impl<I: Io> Engine<I> {
             ),
             (pixel, 0x1010, 0x1010),
         ] {
-            let at = self.layout.reg(index);
-            if self.read(at)? & mask != value {
-                return Err(Error::Readback(at));
-            }
+            self.verify(index, mask, value)?;
         }
         if matches!(plan.request.pixel, PixelClock::DisplayPort { .. })
             && dpref_hz(self.read(PLL)?, self.read(DPREF)?)? != plan.reference_hz
@@ -359,6 +369,34 @@ impl<I: Io> Engine<I> {
             return Err(Error::Readback(DPREF));
         }
         Ok(())
+    }
+    fn verify(&mut self, index: u64, mask: u32, value: u32) -> Result<(), Error> {
+        let at = self.layout.reg(index);
+        if self.read(at)? & mask != value {
+            return Err(Error::Readback(at));
+        }
+        Ok(())
+    }
+    fn current_pipe(&mut self, pipe: u8, global: clocks::Applied) -> Result<Applied, Error> {
+        if !matches!(self.status.state, State::Ready | State::Applied) {
+            return Err(Error::Busy);
+        }
+        let plan = self
+            .status
+            .pipes
+            .get(usize::from(pipe))
+            .copied()
+            .flatten()
+            .ok_or(Error::Invalid)?;
+        if plan.global != global || plan.request.pixel == PixelClock::Disabled {
+            return Err(Error::Invalid);
+        }
+        self.idle()?;
+        if let Err(e) = self.verify_pipe(plan) {
+            self.status.state = State::Failed(e);
+            return Err(e);
+        }
+        Ok(plan)
     }
     fn route(&mut self, route: StreamRoute, global: clocks::Applied) -> Result<(), Error> {
         if !matches!(self.status.state, State::Ready | State::Applied) {
@@ -527,6 +565,20 @@ impl Dccg {
     }
     pub fn status(&self) -> Status {
         self.0.status
+    }
+    /// Current, readback-checked clock snapshot for the matching timing owner.
+    /// TMDS still requires a separately programmed PHY PLL before transmission.
+    pub(crate) fn timing_clock(
+        &mut self,
+        regs: MmioRegion,
+        clocks: &mut clocks::ClockManager,
+        pipe: u8,
+    ) -> Result<Applied, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        let global = clocks.pipe_clocks(regs).map_err(Error::Clocks)?;
+        self.0.current_pipe(pipe, global)
     }
     /// Program a retired pipe against current acknowledged global clocks.
     /// Every consumer must be idle; partial failure/cancellation blocks replay.
