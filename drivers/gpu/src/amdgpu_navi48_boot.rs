@@ -1,5 +1,6 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
+use crate::amdgpu_gfx12_rs64 as rs64;
 use crate::{
     amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_dmub_navi48 as dmub, amdgpu_gddr6 as training,
     amdgpu_gfx12_topology as topology, amdgpu_gmc_navi48 as gmc, amdgpu_navi48_firmware as gfx,
@@ -23,13 +24,14 @@ pub enum Stage {
     StopDmub,
     Graphics,
     RlcBoot,
+    ConfigureRs64,
     PowerSetup,
     ReadTopology,
     MemoryTranslation,
     DmaProof,
     StartDmub,
 }
-const STAGES: [Stage; 16] = [
+const STAGES: [Stage; 17] = [
     Stage::MemoryTraining,
     Stage::Sos,
     Stage::Ring,
@@ -41,6 +43,7 @@ const STAGES: [Stage; 16] = [
     Stage::StopDmub,
     Stage::Graphics,
     Stage::RlcBoot,
+    Stage::ConfigureRs64,
     Stage::PowerSetup,
     Stage::ReadTopology,
     Stage::MemoryTranslation,
@@ -65,6 +68,7 @@ pub enum Error {
     Dmub(dmub::Error),
     Topology(topology::Error),
     Display(display::Error),
+    Rs64(rs64::Error),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -83,6 +87,7 @@ pub struct Report {
     pub dma: sdma::Proof,
     pub dmub: dmub::Status,
     pub topology: topology::Topology,
+    pub rs64: rs64::Starts,
 }
 #[derive(Debug)]
 pub struct Firmware {
@@ -155,6 +160,7 @@ struct Hardware {
     graphics: Option<psp::GfxBootStatus>,
     power: Option<smu::PowerStatus>,
     topology: Option<topology::Topology>,
+    rs64: rs64::Rs64,
     gmc: Option<gmc::Gmc>,
     sdma: Option<sdma::Sdma>,
 }
@@ -281,6 +287,11 @@ impl Backend for Hardware {
                 self.topology = Some(topology);
                 crate::amdgpu_info::publish_navi48_topology(topology);
             }
+            Stage::ConfigureRs64 => {
+                // SAFETY: PSP authenticated this exact retained set and RLC
+                // completed; this boot owns GRBM and all inactive CP queues.
+                unsafe { self.rs64.configure() }.map_err(Error::Rs64)?;
+            }
             Stage::DmaProof => {
                 // SAFETY: prior stages retain firmware, memory and both hubs.
                 self.sdma = Some(
@@ -309,6 +320,7 @@ impl Backend for Hardware {
             media: self.psp.as_ref().ok_or(Error::Invalid)?.media_firmware(),
             dmub: self.dmub.status().ok_or(Error::Invalid)?,
             topology: self.topology.ok_or(Error::Invalid)?,
+            rs64: self.rs64.starts().ok_or(Error::Invalid)?,
             aperture: self
                 .gmc
                 .as_ref()
@@ -350,6 +362,9 @@ impl ColdBoot {
             .map_err(Error::Psp)?;
         let target = gfx::Target::resolve(gpu).map_err(Error::Firmware)?;
         topology::validate(gpu).map_err(Error::Topology)?;
+        // SAFETY: same exclusive GPU/register ownership; this only prepares.
+        let rs64 =
+            unsafe { rs64::Rs64::new(gpu, authority, &firmware.gfx) }.map_err(Error::Rs64)?;
         let mp0 = ip::find_ip(&gpu.ip_blocks, ip::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
         if target != firmware.gfx.target() || !firmware.sos.is_psp14(mp0.revision) {
             return Err(Error::Unsupported);
@@ -410,6 +425,7 @@ impl ColdBoot {
                     graphics: None,
                     power: None,
                     topology: None,
+                    rs64,
                     gmc: None,
                     sdma: None,
                 },

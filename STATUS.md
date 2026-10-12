@@ -275,7 +275,8 @@ separate physical/CPU-visible VRAM accounting and SMUIO14 ROM access. Legacy
 APU/engine/display paths refuse this generation before touching hardware.
 
 Implemented: GDDR6 training; PSP14 SOS/GPCOM/TMR; mandatory graphics/media
-firmware parsing, upload and autoload; SMU14 board-table transfer and initial
+firmware parsing, upload and autoload; GC12 RS64 counter programming and pipe
+reset with inherited-queue exclusion; SMU14 board-table transfer and initial
 GFX/thermal policy; GC12 harvested CU/SA/RB inventory and device-query reporting;
 GMC12/MMHUB4.1 owned VMID0 translations; SDMA7 translated
 VRAM write/copy/fence verification; and DCN4 DMUB shared state, authenticated

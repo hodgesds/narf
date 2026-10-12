@@ -10,6 +10,11 @@ fn run<T>(f: impl Future<Output = T>) -> T {
 }
 fn report() -> Report {
     Report {
+        rs64: rs64::Starts {
+            pfp: 0x1000,
+            me: 0x2000,
+            mec: 0x3000,
+        },
         topology: topology::Topology {
             active_cus: 64,
             active_arrays: 0xff,

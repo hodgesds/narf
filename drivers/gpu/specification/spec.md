@@ -246,7 +246,8 @@ the inventoried pool, trained VRAM or an owned training exchange, and all
 training quiescence obligations. `run().await` retains the trainer, SOS,
 PSP/TMR and SMU owners and executes training → SOS → ring/TMR → SMC → SMU
 version/board transfer → DMUB stop → graphics autoload → RLC readiness →
-initial power policy → harvested GC12 topology. DCN4 stop requires STOP_FW acknowledgement and PWAIT,
+RS64 program counters → initial power policy → harvested GC12 topology.
+DCN4 stop requires STOP_FW acknowledgement and PWAIT,
 uses CNTL2 reset, verifies disabled/reset readback and leaves PSP's secure
 windows untouched. Every stage is observable through `State`; failure or
 cancellation prevents replay. The sequence then initializes GMC12 and SDMA7
@@ -255,6 +256,16 @@ VMID0 aperture and verified DMA proof. It then starts DMUB and validates its
 version/capability mailbox handshake. User queues, native display, probe
 integration and physical validation are separate gates;
 `fw_loaded` is not set by this API.
+
+`amdgpu_gfx12_rs64::Rs64` prepares immutable PFP/ME/MEC entry points from the
+exact GC12 firmware set. After PSP authentication and RLC autoload, its one-shot
+`unsafe configure` programs two PFP/ME and four MEC counter banks using dword
+addresses and pulses only the corresponding pipe-reset bits. It first refuses
+busy CP/MES or inherited graphics/compute queues, preserves unrelated controls
+and restores the GRBM selector on errors as well as success. A single live
+capability invocation covers the finite indexed sequence, with write readback.
+Failure prevents replay. `Report::rs64` records completed configuration; this
+does not activate queues, unhalt command processors or prove graphics execution.
 
 The read-only `amdgpu_dcn_inventory` routing functions support Navi48 with
 GC12.0.1 and DCN4.0.1 (including raw discovery 4.1.0). ATOM display-object
