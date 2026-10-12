@@ -148,6 +148,7 @@ impl Io for Fake {
     fn write(&mut self, at: u64, value: u32) {
         assert!(
             (BASE + 0x530 * 4..=BASE + 0x1d1f * 4).contains(&at)
+                || (0x162a0 * 4..=0x162a3 * 4).contains(&at)
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || (MPC_BASE..=MPC_BASE + 0x2fe * 4).contains(&at)
                 || (0..4).any(|p| {
@@ -325,6 +326,7 @@ fn engine() -> Engine<Fake> {
             hpo_dp_disabled: None,
             hdmi_tmds_retired: None,
             tmds_timing_retired: None,
+            tmds_disabled: None,
             retired: 0,
         },
     }
@@ -1054,3 +1056,6 @@ mod hdmi;
 
 #[path = "amdgpu_dcn401_tmds_timing_tests.rs"]
 mod tmds_timing;
+
+#[path = "amdgpu_dcn401_tmds_phy_tests.rs"]
+mod tmds_phy;

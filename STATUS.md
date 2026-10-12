@@ -368,7 +368,15 @@ all frontends detached, validates stable TMDS backend/PHY state, stops one OTG,
 clears latched underflow and acknowledges its OTG/input clocks off. It preserves
 other timing generators and every PHY; fresh consumer checks remain mandatory
 before transmitter shutdown. Failure/cancellation retain and quarantine the owner.
-HDMI FRL, TMDS backend/PHY shutdown, eDP, sink/MST/audio teardown
+Direct external TMDS transmitter shutdown now checks all timing and frontend
+consumers stopped, parks only frontend symclk routes using the selected PHY,
+and sends the native HDMI DMUB DISABLE command. Independent hardware witnesses
+must acknowledge backend, all four lanes and TX clocks stopped; mailbox
+consumption alone cannot complete shutdown. Already-disabled backends require
+complete off readback without replay. Other outputs stay retained, late route
+or consumer changes fail, and failure/cancellation block owner reuse. This
+proves digital/lane/clock shutdown, not analog power gating or memory retirement.
+HDMI FRL, eDP, sink/MST/audio teardown
 and USB-C/ACPI PHY interlocks still need their sequences.
 PHY/link and plane programming, surface scanout enable, active-stream transitions,
 bandwidth/watermarks and complete native modesetting remain open. These paths

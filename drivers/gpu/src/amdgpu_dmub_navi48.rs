@@ -482,6 +482,12 @@ impl Dmub {
     ) -> Result<(), Error> {
         self.engine.disable_hpo_dp(path, signal).await
     }
+    pub(crate) async fn disable_tmds(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+    ) -> Result<(), Error> {
+        self.engine.disable_tmds(path).await
+    }
     /// Validate the VRAM pool and reserve nonsecure DMUB storage without writes.
     /// # Safety
     /// Caller exclusively owns this physical Navi48 GPU, DCN/PSP/PM/reset,
@@ -564,28 +570,44 @@ impl<I: Io> Engine<I> {
         signal: DpSignal,
         connector: u8,
     ) -> Result<(), Error> {
-        use crate::amdgpu_dcn_inventory::Connector;
-        if path.connector != Connector::DisplayPort
-            || path.transmitter >= 4
-            || !(1..=4).contains(&path.hpd)
-        {
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::DisplayPort {
+            return Err(Error::Invalid);
+        }
+        let mode = match signal {
+            DpSignal::Sst => 0,
+            DpSignal::Mst => 5,
+        };
+        self.disable_transmitter(path, mode, connector, 244).await
+    }
+    async fn disable_tmds(&mut self, path: crate::amdgpu_dcn_inventory::Path) -> Result<(), Error> {
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::HdmiTypeA {
+            return Err(Error::Invalid);
+        }
+        self.disable_transmitter(path, 3, 12, 246).await
+    }
+    async fn disable_transmitter(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        mode: u8,
+        connector: u8,
+        hpo_instance: u8,
+    ) -> Result<(), Error> {
+        if path.transmitter >= 4 || !(1..=4).contains(&path.hpd) {
             return Err(Error::Invalid);
         }
         // Linux command_table2.c, transmitter_control_v1_7. DISABLE has no
         // clock/lane arguments. DCE112+ always leaves digfe_sel zero: routing
-        // belongs to the driver. Both native DISABLE callers leave HPO id
-        // zero, giving DIGA(0) - HPO_DP_0(12) encoded as u8. Do not substitute
-        // the selected link index; DISABLE resolves the physical transmitter.
+        // belongs to the driver. Native DISABLE callers leave HPO id zero:
+        // DIGA(0) - HPO_DP_0(12) for DP, or - HPO_0(10) for HDMI, as u8.
+        // Do not substitute the selected link index; DISABLE resolves the
+        // physical transmitter.
         let mut request = [0; 64];
         request[..4].copy_from_slice(&[128, 1, 0, 60]);
         request[4] = path.transmitter;
-        request[6] = match signal {
-            DpSignal::Sst => 0,
-            DpSignal::Mst => 5,
-        };
+        request[6] = mode;
         request[12] = path.hpd;
         request[14] = connector;
-        request[15] = 244;
+        request[15] = hpo_instance;
         self.begin_mailbox()?;
         let result = self.command(request).await.map(|_| ());
         self.finish_mailbox(result)

@@ -659,7 +659,8 @@ Success records historical `HdmiTmdsRetired { stream, detached_backends }` in
 `Otg::Status::hdmi_tmds_retired`; it proves neither link nor memory retirement.
 Failure after starting enters `Failed`; cancellation retains
 `RetiringHdmiTmds(stream)`. Both block owner/clock/mailbox reuse until an
-independent reset. HDMI FRL and complete TMDS backend/PHY shutdown remain open.
+independent reset. HDMI FRL needs a separate sequence; TMDS backend/PHY
+shutdown follows timing-clock retirement through the operation below.
 
 `unsafe ColdBoot::retire_display_tmds_timing(pipe).await` and its serialized
 platform wrapper break the TMDS timing/PHY-clock shutdown dependency. Unlike
@@ -682,6 +683,35 @@ never HUBP fetches, PHYs or memory. Failure enters `Failed`; cancellation retain
 must retain all allocations/translations and exclude CPU/firmware/FAMS and
 concurrent display/link/clock/power writers. Future PHY shutdown must check all
 live timing and clock users independently of this historical result.
+
+`unsafe ColdBoot::disable_display_tmds(port).await` and its serialized platform
+wrapper disable a validated direct external HDMI Type-A transmitter through
+native DMUB v1.7 DISABLE. The caller must fulfil the same sink AVMUTE/SCDC,
+retimer, audio/metadata/HDCP and writer-exclusion obligations, without ACPI PHY
+interlocks or SSC workarounds, and retain every allocation and translation.
+Live preflight requires all timing generators, OTG/input clocks and frontend
+producers stopped, all backend frontend routes detached, no HPO/FRL activity,
+no forced PHY input clock, stable TMDS retained outputs and a matching board
+HPD selector. No historical retirement snapshot substitutes for these checks.
+The selected enabled backend must have HDMI mode and a clock request. An
+already-disabled backend is accepted only with clocks off and all lanes
+disabled without data/clock/handshake activity; partial inherited shutdown
+rejects without replaying the native command.
+
+Only frontend symclk routes selecting this PHY are parked, clearing FE enable
+and source while preserving unrelated clock bits and routes. Fresh consumer
+and route checks precede firmware submission. The HDMI command carries native
+HDMI mode, connector ID and the zero-initialized caller's HPO engine encoding.
+After mailbox consumption, four separate waits of up to 100 ms require backend
+disable, backend clock/reset-off, all four RDPCS lanes disabled with
+CLK_RDY/DATA_EN/REQ/ACK clear, and all lane/TX clock requests and TX clock-on
+clear. The host never writes these firmware-owned completion witnesses.
+Completion rechecks consumers, routes, other outputs and the selected hardware
+acknowledgements. Success records historical
+`TmdsDisabled { path, parked_frontends, command_sent }` in
+`Otg::Status::tmds_disabled`; this proves neither analog power gating nor memory
+retirement. Failure enters `Failed`; cancellation retains
+`DisablingTmds(transmitter)`. Both quarantine ownership until independent reset.
 
 `amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
 before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,

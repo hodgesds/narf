@@ -10,8 +10,8 @@ pub struct TmdsTimingRetired {
     pub retained_transmitters: u8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Links {
-    registers: [[u32; 6]; 4],
+pub(super) struct Links {
+    pub(super) registers: [[u32; 6]; 4],
     active: u8,
 }
 impl<I: Io> Engine<I> {
@@ -25,7 +25,7 @@ impl<I: Io> Engine<I> {
                     .any(|&r| at == self.layout.base + (r + u64::from(p) * 0xd8) * 4)
         })
     }
-    fn tmds_timing_links(&mut self) -> Result<Links, Error> {
+    pub(super) fn tmds_timing_links(&mut self) -> Result<Links, Error> {
         let l = self.layout;
         for (at, mask) in l.idle {
             let timing = (0..4).any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));

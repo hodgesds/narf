@@ -1063,6 +1063,39 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Disable direct TMDS HDMI after frontend and timing-clock retirement.
+    /// # Safety
+    /// Fulfil `Otg::disable_tmds` direct-port, sink/SCDC/retimer, producer and
+    /// writer-exclusion obligations. Retain every allocation and translation;
+    /// completion proves backend/lane/TX-clock stop, not analog power gating.
+    pub async unsafe fn disable_display_tmds(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::TmdsDisabled, otg::Error> {
+        if self.display_retirement_busy()
+            || self.display_state() != Ok(display::State::Ready)
+            || self
+                .ddc
+                .as_ref()
+                .is_ok_and(|d| d.state() != ddc::State::Ready)
+        {
+            return Err(otg::Error::Busy);
+        }
+        let path = *self
+            .display_paths()
+            .map_err(|_| otg::Error::Invalid)?
+            .get(port)
+            .ok_or(otg::Error::Invalid)?;
+        // SAFETY: validated board path and retained matching owners; caller fulfils
+        // platform interlocks, producer exclusion and memory lifetime obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .disable_tmds(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
     fn display_retirement_busy(&self) -> bool {
         self.state() != State::MemoryReady
             || self.queue_state() != Some(queues::State::InterruptVerified)

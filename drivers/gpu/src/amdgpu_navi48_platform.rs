@@ -425,6 +425,22 @@ pub async unsafe fn retire_display_dp_encoder(
     unsafe { boot.retire_display_dp_encoder(stream).await }
 }
 
+/// Disable a direct TMDS HDMI transmitter after frontend/timing retirement.
+/// # Safety
+/// Fulfil `Otg::disable_tmds` direct-port, sink/SCDC/retimer, producer and
+/// writer-exclusion obligations. Retain all allocations and translations;
+/// completion proves backend/lane/TX-clock stop, not analog power gating.
+pub async unsafe fn disable_display_tmds(
+    port: usize,
+) -> Result<crate::amdgpu_dcn401_otg::TmdsDisabled, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: retained serialized owner; caller fulfils the documented obligations.
+    unsafe { boot.disable_display_tmds(port).await }
+}
+
 /// Retire one OTG and its clocks while retaining TMDS transmitters.
 /// # Safety
 /// Fulfil `Otg::retire_tmds_timing` frontend/audio/metadata/HDCP retirement

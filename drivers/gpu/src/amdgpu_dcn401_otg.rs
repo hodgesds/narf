@@ -30,6 +30,9 @@ pub use hdmi::HdmiTmdsRetired;
 #[path = "amdgpu_dcn401_tmds_timing.rs"]
 mod tmds_timing;
 pub use tmds_timing::TmdsTimingRetired;
+#[path = "amdgpu_dcn401_tmds_phy.rs"]
+mod tmds_phy;
+pub use tmds_phy::TmdsDisabled;
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -92,6 +95,8 @@ pub enum State {
     HdmiTmdsRetired,
     RetiringTmdsTiming(u8),
     TmdsTimingRetired,
+    DisablingTmds(u8),
+    TmdsDisabled,
     RetiringPlanes,
     PlanesRetired,
     Retiring(u8),
@@ -114,6 +119,7 @@ impl State {
                 | Self::HpoDpDisabled
                 | Self::HdmiTmdsRetired
                 | Self::TmdsTimingRetired
+                | Self::TmdsDisabled
         )
     }
 }
@@ -186,6 +192,8 @@ pub struct Status {
     pub hdmi_tmds_retired: Option<HdmiTmdsRetired>,
     /// Historical timing/input clock-off only; all PHYs and memory stay retained.
     pub tmds_timing_retired: Option<TmdsTimingRetired>,
+    /// Historical TMDS backend/lane/TX-clock stop, never memory retirement.
+    pub tmds_disabled: Option<TmdsDisabled>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
 }
@@ -298,6 +306,7 @@ struct Layout {
     base: u64,
     mpc_base: u64,
     link_clock: u64,
+    dio_clock: u64,
     idle: [(u64, u32); clocks::IDLE_REG_COUNT],
 }
 impl Layout {
@@ -314,6 +323,15 @@ impl Layout {
         Ok(Self {
             base,
             link_clock: display.hpo_link_clock(),
+            dio_clock: crate::amdgpu_psp_ring::bank(
+                gpu,
+                ip::HW_ID_DCN,
+                &[(4, 0, 1), (4, 1, 0)],
+                1,
+                0xa3,
+            )
+            .map_err(|_| Error::Unsupported)?
+                + 0xa0 * 4,
             mpc_base: crate::amdgpu_psp_ring::bank(
                 gpu,
                 ip::HW_ID_DCN,
@@ -532,6 +550,7 @@ impl Otg {
                 hpo_dp_disabled: None,
                 hdmi_tmds_retired: None,
                 tmds_timing_retired: None,
+                tmds_disabled: None,
                 retired: 0,
             },
         }))
