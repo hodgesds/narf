@@ -239,6 +239,9 @@ and CI compiler-cache integration.
 - Kernel ELFs on both architectures carry a deterministic SHA-1 GNU build-ID;
   linker symbols `__build_id_note_start` and `__build_id_note_end` delimit the
   retained note for `/sys/kernel/notes`.
+- The x86_64 ELF uses a 32 MiB physical load base for both PVH and
+  Multiboot2. This keeps its fixed load span above the low-memory ACPI NVS and
+  SMM communication reservations exposed by Secure Boot OVMF.
 - Workspace: single Cargo workspace so Global LTO spans everything.
 
 ## 4. Invariants & safety properties

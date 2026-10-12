@@ -4,15 +4,16 @@
 
 ENTRY(_start)
 
-/* 16 MiB. Modern UEFI firmware on x86_64 (OVMF on QEMU, real-world
- * EDK2 builds, Lenovo / Dell / HP firmware) typically reserves the
- * 0–16 MiB range for its own code, ACPI tables, and BootServices
- * data. Loading the kernel above that line keeps the .data + .bss
+/* 32 MiB. Modern UEFI firmware on x86_64 (OVMF on QEMU, real-world
+ * EDK2 builds, Lenovo / Dell / HP firmware) can reserve low memory for
+ * code, ACPI tables, BootServices data, and SMM communication buffers.
+ * Secure Boot OVMF with SMM reserves through 26 MiB. Loading the kernel
+ * above that line keeps the .data + .bss
  * LOAD segment (~38 MiB once the 32-MiB static heap arena is
  * accounted for) inside contiguous EfiConventionalMemory. The PVH
  * direct-boot path (QEMU `-kernel`) honours the same ELF p_paddr,
  * so this works for both protocols. */
-KERNEL_LOAD_BASE = 0x1000000;
+KERNEL_LOAD_BASE = 0x2000000;
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
 /* VA span reserved for the kernel image. The module text window begins
