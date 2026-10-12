@@ -32,6 +32,34 @@ physical-hardware target is the AMD Renoir/HawkPoint laptop set in
 [STATUS.md](../STATUS.md); Secure Boot and a general installer/upgrade service
 are not finished administration features.
 
+## Install beside an existing x86_64 system
+
+Native packages install NARF as an additional target. On UEFI they place an
+isolated loader and kernel under `/EFI/NARF` on the mounted EFI System
+Partition. UEFI GRUB chainloads it, systemd-boot reads the generated BLS entry,
+rEFInd discovers it, and CachyOS Limine is registered when
+`limine-entry-tool` is available. Legacy-BIOS GRUB continues to load the
+Multiboot2 kernel directly.
+
+Verify the payload before rebooting:
+
+```sh
+sudo narf-uefi status
+```
+
+If the ESP was not mounted during package installation, mount it and run:
+
+```sh
+sudo narf-uefi install --esp /boot/efi
+```
+
+Use the machine's actual ESP mount point. The command does not change UEFI
+NVRAM or make NARF the default. Keep the distribution kernel as the default
+and recovery target. Secure Boot must remain disabled for NARF until the
+release process provides signed artifacts and a documented enrollment policy.
+See [release packaging](../packaging/README.md) and the
+[CachyOS guide](BOOTING_ON_CACHYOS.md) for manager-specific checks.
+
 ## Choose a boot profile
 
 Commands that accept build arguments support

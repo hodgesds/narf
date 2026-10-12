@@ -24,7 +24,7 @@ runs:
           git -C "${limine_dir}" checkout --quiet --detach FETCH_HEAD
         fi
 
-        for file in BOOTX64.EFI limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin; do
+        for file in BOOTX64.EFI LICENSE limine-bios.sys limine-bios-cd.bin limine-uefi-cd.bin; do
           test -f "${limine_dir}/${file}"
         done
 

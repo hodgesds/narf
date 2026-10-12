@@ -241,6 +241,14 @@ interfaces and limits.
 - **Boot media:** `cargo xtask image` builds boot media and `iso-boot`
   checks UEFI boot in QEMU. These are distinct from a successful USB boot
   on the target laptops.
+- **Native x86_64 UEFI installation:** native packages carry a reviewed
+  Limine EFI application and install an isolated `/EFI/NARF` payload plus a
+  Boot Loader Specification entry. CI boots the exact package layout through
+  OVMF, installed-style GRUB, Limine, and the packaged NARF kernel. GRUB,
+  systemd-boot, rEFInd, and CachyOS Limine integration is implemented without
+  changing UEFI NVRAM or the host's default entry. Secure Boot signing/key
+  enrollment and native aarch64 packages remain open; aarch64 release media
+  continues to use the existing tested UEFI path.
 
 ## Isolation and hardware limits
 

@@ -117,6 +117,18 @@ jobs:
       - name: Host unit-test gate
         run: cargo xtask host-test
 
+  packaging:
+    name: native package and UEFI layout tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust + shared compiler cache
+        uses: ./.github/actions/setup-rust-cache
+
+      - name: Package, install, verify, and remove an isolated UEFI payload
+        run: packaging/test-packaging.sh
+
   clippy-kernel:
     name: clippy-kernel / ${{ matrix.arch }}
     needs: changes
@@ -209,7 +221,9 @@ jobs:
             e2fsprogs \
             ovmf \
             qemu-efi-aarch64 \
-            xorriso
+            xorriso \
+            grub-common \
+            grub-efi-amd64-bin
 
       # Ubuntu's QEMU 8.2 can silently terminate NARF under MTTCG during
       # device probing. The kernel-test and musl-demo jobs already use this
@@ -231,6 +245,12 @@ jobs:
 
       - name: cargo xtask iso-boot (firmware UEFI)
         run: cargo xtask iso-boot --arch=${{ matrix.arch }}
+
+      - name: Native-package UEFI boot (GRUB -> Limine)
+        if: matrix.arch == 'x86_64'
+        env:
+          NARF_UEFI_SKIP_BASE_ISO_BOOT: "1"
+        run: packaging/test-uefi-boot.sh
 
       # xAPIC fallback boot. With x2APIC masked off, every LAPIC access is
       # MMIO instead of an MSR — the path real Renoir/Phoenix firmware puts

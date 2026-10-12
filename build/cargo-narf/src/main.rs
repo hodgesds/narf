@@ -54,6 +54,10 @@ struct PackageArgs {
     /// Reproducible build timestamp.
     #[arg(long)]
     source_date_epoch: Option<u64>,
+
+    /// Limine BOOTX64.EFI to embed in native packages.
+    #[arg(long)]
+    limine_efi: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -77,6 +81,10 @@ struct InstallArgs {
     /// Reproducible build timestamp.
     #[arg(long)]
     source_date_epoch: Option<u64>,
+
+    /// Limine BOOTX64.EFI to embed in the native package.
+    #[arg(long)]
+    limine_efi: Option<PathBuf>,
 
     /// Pass the native package manager's non-interactive confirmation flag.
     #[arg(long)]
@@ -154,6 +162,7 @@ fn run() -> Result<()> {
                 args.output.as_deref(),
                 args.skip_build,
                 args.source_date_epoch,
+                args.limine_efi.as_deref(),
             )
         }
         NarfCommand::Install(args) => {
@@ -173,6 +182,7 @@ fn run() -> Result<()> {
                 Some(&output),
                 args.skip_build,
                 args.source_date_epoch,
+                args.limine_efi.as_deref(),
             )?;
             let artifact = find_artifact(&output, format, &args.version)?;
             let command = native_install_command(format, &artifact, args.yes)?;
@@ -307,6 +317,7 @@ fn run_packager(
     output: Option<&Path>,
     skip_build: bool,
     source_date_epoch: Option<u64>,
+    limine_efi: Option<&Path>,
 ) -> Result<()> {
     let mut command = Command::new(root.join("packaging/build-release.sh"));
     command
@@ -320,6 +331,9 @@ fn run_packager(
     }
     if let Some(epoch) = source_date_epoch {
         command.arg("--source-date-epoch").arg(epoch.to_string());
+    }
+    if let Some(limine_efi) = limine_efi {
+        command.arg("--limine-efi").arg(limine_efi);
     }
     let status = command.status().context("launching native package build")?;
     if !status.success() {
