@@ -140,6 +140,12 @@ fn mp0_bank(gpu: &AmdGpu) -> Result<u64, Error> {
     profile(gpu).map(|(_, base)| base)
 }
 impl Firmware {
+    pub(crate) fn is_psp14(&self, revision: u8) -> bool {
+        matches!(
+            (self.target, revision),
+            (Target::Psp14_0_2, 2) | (Target::Psp14_0_3, 3)
+        )
+    }
     pub(crate) fn is_navi22(&self) -> bool {
         self.target == Target::Navi22
     }

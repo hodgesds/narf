@@ -135,6 +135,34 @@ the Navi22 VRAM planner is not valid for this GPU. This explicit API does not
 automatically claim the GPU, initialize its GPCOM/TMR, set `fw_loaded`, or
 enable graphics/display engines. Those remain separate bring-up stages.
 
+### Navi 48 PSP ring and GDDR6 training
+
+`unsafe amdgpu_psp_ring::Psp::new_navi48` claims the physical GPU's PSP14
+GPCOM ring after SOS and VRAM training. It requires GC12.0.1, MP0 14.0.2/3,
+NBIO7.7.0/7.7.1 or NBIF6.3.1 and HDP6.0.0/6.0.1/6.1.0/6.1.1/6.4.0.
+Every bank is unique and bounded before device access. GMC12's bank-zero
+`0x1614/0x1615/0x15a7` fields validate GPU addresses against the BAR0-backed
+pool. HDP uses the verified NBIO bank-two flush remap and MEMSIZE posting read;
+HDP6 never receives HDP5's obsolete invalidate-register write.
+
+`setup_tmr_navi48(&Firmware).await` requires the matching PSP14 revision's
+validated SOS container and an embedded TOC. It submits LOAD_TOC, bounds the
+returned size, reserves MiB-aligned trusted memory and submits SETUP_TMR with
+separate GPU and physical addresses. Existing capability checks, fence matching,
+bounded waits and quarantine on cancellation apply. Cross-generation firmware,
+Phoenix DMUB loading and Navi22 graphics operations are rejected. The caller
+must retain TMR and stop all firmware consumers before unsafe teardown.
+
+`unsafe amdgpu_gddr6::Trainer::new_navi48` uses this same exact layout and
+PSP14's C2PMSG35/36 long-training protocol. The exclusive-client and exchange-
+reservation contract of the Navi22 trainer applies. Before sending the command,
+it retains the bottom 32 MiB preimage in system memory; only acknowledged
+completion permits restoration and HDP flush. Runtime policy can disable
+training, and resident SOS skips it. Timeout, cancellation or revocation retains
+the preimage without racing a possibly active PSP writer or allowing replay.
+These are explicit ownership APIs; a Navi48 boot VRAM inventory/coordinator
+must supply the reservations before automatic cold boot is enabled.
+
 ### Navi 22 PSP secure-OS bootstrap
 
 `amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects

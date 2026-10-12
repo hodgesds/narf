@@ -576,3 +576,149 @@ kernel_test_in!(
     "drivers/gpu/psp-ring",
     psp_navi22_constructor_rejects_unmapped_vram
 );
+
+fn navi48_gpu(regs: &mut [u32], revision: u8) -> AmdGpu {
+    let mut gpu = gpu(regs);
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, 0x7550).unwrap();
+    gpu.ip_blocks = vec![
+        ip(discovery::HW_ID_MP0, (14, 0, revision), 0, 0x10000),
+        ip(discovery::HW_ID_NBIF, (7, 7, 0), 2, 0xd20),
+        ip(discovery::HW_ID_HDP, (6, 1, 0), 0, 0xb00),
+        ip(discovery::HW_ID_GC, (12, 0, 1), 0, 0x2000),
+    ];
+    gpu.vram.size = 16 << 30;
+    regs[0x2000 + 0x1614] = 0x800;
+    regs[0x2000 + 0x1615] = 0xbff;
+    regs[0x2000 + 0x15a7] = 0x100;
+    gpu
+}
+
+fn psp_navi48_gmc12_hdp6_and_target_isolation() -> TestResult {
+    for revision in [2, 3] {
+        let mut regs = vec![0; 0x80000 / 4];
+        let mut gpu = navi48_gpu(&mut regs, revision);
+        let (pool, s) = session();
+        drop(s);
+        for nbio in [(7, 7, 0), (7, 7, 1), (6, 3, 1)] {
+            gpu.ip_blocks[1] = ip(discovery::HW_ID_NBIF, nbio, 2, 0xd20);
+            let before = regs.clone();
+            // SAFETY: array-backed registers; no device receives the unused pool.
+            let mut psp = unsafe { Psp::new_navi48(&gpu, Cap::bootstrap(), &pool) }.unwrap();
+            if psp.kind != Kind::Navi48(revision)
+                || psp.session.fb_base != 0x8_0000_0000
+                || psp.session.fb_offset != 0x1_0000_0000
+                || psp.session.engine.io.invalidate_reg.is_some()
+                || regs != before
+                || run(psp.setup_tmr(&[])) != Err(Error::Unsupported)
+                || run(psp.load_dmub(&[0; 4])) != Err(Error::Unsupported)
+                || run(psp.wait_gfx_boot_navi22()) != Err(Error::Unsupported)
+            {
+                return TestResult::Fail("PSP14 used another generation's addresses or API");
+            }
+            let firmware = crate::amdgpu_psp_boot::tests::firmware14();
+            let expected = if revision == 3 {
+                Error::Busy
+            } else {
+                Error::Unsupported
+            };
+            if run(psp.setup_tmr_navi48(&firmware)) != Err(expected)
+                || run(psp.setup_tmr_navi22(&crate::amdgpu_psp_boot::tests::firmware()))
+                    != Err(Error::Unsupported)
+            {
+                return TestResult::Fail("PSP14 TOC ignored target or ring readiness");
+            }
+            let io = &mut psp.session.engine.io;
+            if !io.setup_hdp() {
+                return TestResult::Fail("Navi48 HDP remap failed");
+            }
+            io.invalidate();
+            if regs[0xd20 + 0x12d] != HDP_HOLE as u32 || regs[0xb00 + 0xd1] != 0 {
+                return TestResult::Fail("HDP6 used obsolete HDP5 invalidate register");
+            }
+            regs[0xd20 + 0x12d] = 0;
+        }
+        let authority = Cap::bootstrap();
+        authority.revoke();
+        // SAFETY: revoked constructor cannot access even the array-backed MMIO.
+        if !matches!(
+            // SAFETY: revoked construction cannot touch registers.
+            unsafe { Psp::new_navi48(&gpu, authority, &pool) },
+            Err(Error::Revoked)
+        ) {
+            return TestResult::Fail("Navi48 ring ignored revocation");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi48_gmc12_hdp6_and_target_isolation
+);
+
+fn psp_navi48_rejects_incompatible_or_ambiguous_discovery() -> TestResult {
+    for bad in 0..9 {
+        let mut regs = vec![0; 0x80000 / 4];
+        let mut gpu = navi48_gpu(&mut regs, 3);
+        match bad {
+            0 => gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(0x1002, 0x73df).unwrap(),
+            1 => gpu.ip_blocks[0].major = 11,
+            2 => gpu.ip_blocks[0].revision = 5,
+            3 => gpu.ip_blocks[1].major = 3,
+            4 => gpu.ip_blocks[2].major = 5,
+            5 => gpu.ip_blocks[3].revision = 0,
+            6 => gpu.ip_blocks.push(gpu.ip_blocks[0]),
+            7 => gpu.ip_blocks[1].num_bases = 2,
+            _ => gpu.regs.len = 0x70000,
+        }
+        let (pool, s) = session();
+        drop(s);
+        let available = pool.available();
+        let before = regs.clone();
+        // SAFETY: unsupported profiles must fail before MMIO or allocations.
+        if unsafe { Psp::new_navi48(&gpu, Cap::bootstrap(), &pool) }.is_ok()
+            || pool.available() != available
+            || regs != before
+        {
+            return TestResult::Fail("Navi48 accepted wrong/ambiguous/out-of-bounds IP layout");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-ring",
+    psp_navi48_rejects_incompatible_or_ambiguous_discovery
+);
+
+fn gddr6_navi48_constructor_keeps_vram_unmodified() -> TestResult {
+    let mut regs = vec![0; 0x80000 / 4];
+    let gpu = navi48_gpu(&mut regs, 3);
+    let before = regs.clone();
+    let exchange = crate::amdgpu_vram_boot::Training {
+        c2p: (16 << 30) - (9 << 20),
+        p2c: (16 << 30) - 0x8000,
+        size: 4096,
+    };
+    // SAFETY: constructor only validates/allocates; run is never called.
+    let trainer =
+        unsafe { crate::amdgpu_gddr6::Trainer::new_navi48(&gpu, Cap::bootstrap(), exchange) }
+            .unwrap();
+    if trainer.state() != crate::amdgpu_gddr6::State::Prepared || regs != before {
+        return TestResult::Fail("PSP14 training touched VRAM before run");
+    }
+    drop(trainer);
+    let cap = Cap::bootstrap();
+    cap.revoke();
+    // SAFETY: revoked construction fails before touching mappings.
+    if !matches!(
+        // SAFETY: revoked construction cannot touch registers.
+        unsafe { crate::amdgpu_gddr6::Trainer::new_navi48(&gpu, cap, exchange) },
+        Err(crate::amdgpu_gddr6::Error::Revoked)
+    ) {
+        return TestResult::Fail("PSP14 training constructor ignored authority");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/gddr6",
+    gddr6_navi48_constructor_keeps_vram_unmodified
+);

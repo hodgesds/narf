@@ -1,5 +1,5 @@
-//! Phoenix PSP 13.0.4 and Navi22 PSP 11.0.11 GPCOM rings. Wire layouts and
-//! sequencing follow Linux psp_gfx_if.h, psp_v{11_0,13_0_4}.c, amdgpu_psp.c,
+//! Phoenix PSP13, Navi22 PSP11 and Navi48 PSP14 GPCOM rings. Wire layouts and
+//! sequencing follow Linux psp_gfx_if.h, psp_v{11_0,13_0_4,14_0}.c, amdgpu_psp.c,
 //! nbio_v2_3.c, gfxhub_v2_1.c and hdp_v5_0.c.
 //! All addresses on the ring are GPU addresses, not host physical addresses.
 use crate::{
@@ -226,7 +226,7 @@ impl<I: Io> Engine<I> {
             io.write(RING_SIZE, 4096);
             io.write(CTRL, CREATE);
         })?;
-        // Both PSP11 and PSP13 require this delay, even for a fast response.
+        // PSP11/13/14 require this delay, even for a fast response.
         delay(20).await;
         let result = self.response(false).await;
         self.state = if result.is_ok() {
@@ -334,6 +334,7 @@ pub struct MediaFirmware {
 enum Kind {
     Phoenix,
     Navi22,
+    Navi48(u8),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmcState {
@@ -376,10 +377,10 @@ struct Session<I: Io> {
 
 /// Absolute BAR5 byte addresses, resolved before any MMIO or allocation.
 #[derive(Debug)]
-struct Layout {
-    mp0: u64,
-    nbio: u64,
-    invalidate_reg: Option<u64>,
+pub(crate) struct Layout {
+    pub(crate) mp0: u64,
+    pub(crate) nbio: u64,
+    pub(crate) invalidate_reg: Option<u64>,
     fb_base: u64,
     fb_top: u64,
     fb_offset: u64,
@@ -390,7 +391,43 @@ impl Layout {
         if gpu.regs.len < HDP_HOLE + 4096 {
             return Err(Error::Invalid);
         }
+        if let Kind::Navi48(revision) = kind {
+            if gpu.chip.vid != crate::amdgpu::AMD_VENDOR
+                || gpu.chip.did != crate::amdgpu::NAVI48
+                || !matches!(revision, 2 | 3)
+            {
+                return Err(Error::Unsupported);
+            }
+            let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(14, 0, revision)], 0, SOS)?;
+            let nbio = bank(
+                gpu,
+                discovery::HW_ID_NBIF,
+                &[(7, 7, 0), (7, 7, 1), (6, 3, 1)],
+                2,
+                0x12d,
+            )?;
+            // HDP6 uses amdgpu_hdp_generic_flush, with no invalidate callback.
+            // In particular HDP5's 0xd1 must never be written on this profile.
+            bank(
+                gpu,
+                discovery::HW_ID_HDP,
+                &[(6, 0, 0), (6, 0, 1), (6, 1, 0), (6, 1, 1), (6, 4, 0)],
+                0,
+                0,
+            )?;
+            let gc = bank(gpu, discovery::HW_ID_GC, &[(12, 0, 1)], 0, 0x1615)?;
+            return Ok(Self {
+                mp0,
+                nbio,
+                invalidate_reg: None,
+                fb_base: gc + 0x1614 * 4,
+                fb_top: gc + 0x1615 * 4,
+                fb_offset: gc + 0x15a7 * 4,
+                gfx_status_regs: None,
+            });
+        }
         let (mp0, nbio, fb_base, fb_top, fb_offset) = match kind {
+            Kind::Navi48(_) => unreachable!(),
             Kind::Phoenix => {
                 let mp0 = bank(gpu, discovery::HW_ID_MP0, &[(13, 0, 4)], 1, SOS)?;
                 let nbio = bank(
@@ -480,6 +517,12 @@ impl Layout {
 /// Resolves all banks without MMIO or allocating device-owned memory.
 pub(crate) fn validate_navi22_layout(gpu: &AmdGpu) -> Result<(), Error> {
     Layout::resolve(gpu, Kind::Navi22).map(|_| ())
+}
+/// Resolve the PSP14/GMC12/HDP6 transport without touching hardware.
+pub(crate) fn navi48_layout(gpu: &AmdGpu) -> Result<Layout, Error> {
+    let ip =
+        discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
+    Layout::resolve(gpu, Kind::Navi48(ip.revision))
 }
 /// One IP version's register window, for a caller whose register ids are only
 /// valid on some of the versions an IP reports.
@@ -585,6 +628,23 @@ impl Psp {
         // SAFETY: same exclusive ownership and initialized VRAM contract.
         unsafe { Self::with_kind(gpu, authority, pool, Kind::Navi22) }
     }
+    /// Claim Navi48's PSP14 ring using discovered MP0 and GMC12 addresses.
+    ///
+    /// # Safety
+    /// Same exclusive physical GPU, PSP/HDP/reset ownership and trained-VRAM
+    /// pool contract as `new_navi22`. SOS must already be running.
+    pub unsafe fn new_navi48(
+        gpu: &AmdGpu,
+        authority: Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<Self, Error> {
+        navi48_layout(gpu)?;
+        let revision = discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_MP0, 0)
+            .ok_or(Error::Unsupported)?
+            .revision;
+        // SAFETY: caller supplies permanent mappings and exclusive ownership.
+        unsafe { Self::with_kind(gpu, authority, pool, Kind::Navi48(revision)) }
+    }
     unsafe fn with_kind(
         gpu: &AmdGpu,
         authority: Cap<BusDeviceCap, Write>,
@@ -683,6 +743,22 @@ impl Psp {
         }
         let image = firmware.image().map_err(|_| Error::Invalid)?;
         self.session.setup_tmr_payload(image.toc()).await
+    }
+    /// Install the trusted region described by this PSP14 target's embedded
+    /// TOC. A missing TOC is rejected; no size from another GPU is substituted.
+    pub async fn setup_tmr_navi48(
+        &mut self,
+        firmware: &crate::amdgpu_psp_boot::Firmware,
+    ) -> Result<(), Error> {
+        let Kind::Navi48(revision) = self.kind else {
+            return Err(Error::Unsupported);
+        };
+        if !firmware.is_psp14(revision) {
+            return Err(Error::Unsupported);
+        }
+        let image = firmware.image().map_err(|_| Error::Invalid)?;
+        let toc = image.toc().ok_or(Error::Invalid)?;
+        self.session.setup_tmr_payload(Some(toc)).await
     }
     /// Load signed DMUB instructions through PSP (GFX_FW_TYPE_DMUB = 51).
     /// The DCN314 loader is the currently audited consumer of this operation.
