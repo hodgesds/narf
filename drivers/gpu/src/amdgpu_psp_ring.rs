@@ -388,6 +388,48 @@ pub(crate) struct Layout {
     gfx_status_regs: Option<(u64, u64)>,
 }
 impl Layout {
+    pub(crate) fn validate_pool(
+        &self,
+        gpu: &AmdGpu,
+        authority: &Cap<BusDeviceCap, Write>,
+        pool: &Pool,
+    ) -> Result<(u64, u64), Error> {
+        let (base, top, offset) = authority
+            .invoke(Op(|| {
+                // SAFETY: constructor bounds the selected DCN/GMC register bank.
+                unsafe {
+                    (
+                        gpu.regs.read32(self.fb_base),
+                        gpu.regs.read32(self.fb_top),
+                        gpu.regs.read32(self.fb_offset),
+                    )
+                }
+            }))
+            .map_err(|_| Error::Revoked)?;
+        if [base, top, offset].contains(&u32::MAX) {
+            return Err(Error::DeviceGone);
+        }
+        let fb_base = (base as u64 & 0xffffff) << 24;
+        let fb_end = ((top as u64 & 0xffffff) + 1) << 24;
+        let fb_offset = (offset as u64 & 0xffffff) << 24;
+        let pool_offset = pool.address().checked_sub(fb_base).ok_or(Error::Invalid)?;
+        let mapping = pool.mapping();
+        if fb_base >= fb_end
+            || pool
+                .address()
+                .checked_add(mapping.len)
+                .is_none_or(|end| end > fb_end)
+            || pool_offset
+                .checked_add(mapping.len)
+                .is_none_or(|end| end > gpu.fb_bar.len.min(gpu.vram.visible_size))
+            || gpu.fb_bar.virt.checked_add(pool_offset) != Some(mapping.virt)
+            || gpu.fb_bar.phys.raw().checked_add(pool_offset) != Some(mapping.phys.raw())
+        {
+            return Err(Error::Invalid);
+        }
+        Ok((fb_base, fb_offset))
+    }
+
     fn resolve(gpu: &AmdGpu, kind: Kind) -> Result<Self, Error> {
         if gpu.regs.len < HDP_HOLE + 4096 {
             return Err(Error::Invalid);
@@ -654,39 +696,7 @@ impl Psp {
         kind: Kind,
     ) -> Result<Self, Error> {
         let layout = Layout::resolve(gpu, kind)?;
-        let (base, top, offset) = authority
-            .invoke(Op(|| {
-                // SAFETY: constructor bounds the selected DCN/GMC register bank.
-                unsafe {
-                    (
-                        gpu.regs.read32(layout.fb_base),
-                        gpu.regs.read32(layout.fb_top),
-                        gpu.regs.read32(layout.fb_offset),
-                    )
-                }
-            }))
-            .map_err(|_| Error::Revoked)?;
-        if [base, top, offset].contains(&u32::MAX) {
-            return Err(Error::DeviceGone);
-        }
-        let fb_base = (base as u64 & 0xffffff) << 24;
-        let fb_end = ((top as u64 & 0xffffff) + 1) << 24;
-        let fb_offset = (offset as u64 & 0xffffff) << 24;
-        let pool_offset = pool.address().checked_sub(fb_base).ok_or(Error::Invalid)?;
-        let mapping = pool.mapping();
-        if fb_base >= fb_end
-            || pool
-                .address()
-                .checked_add(mapping.len)
-                .is_none_or(|end| end > fb_end)
-            || pool_offset
-                .checked_add(mapping.len)
-                .is_none_or(|end| end > gpu.fb_bar.len.min(gpu.vram.visible_size))
-            || gpu.fb_bar.virt.checked_add(pool_offset) != Some(mapping.virt)
-            || gpu.fb_bar.phys.raw().checked_add(pool_offset) != Some(mapping.phys.raw())
-        {
-            return Err(Error::Invalid);
-        }
+        let (fb_base, fb_offset) = layout.validate_pool(gpu, &authority, pool)?;
         let memory = pool.reserve(BUFFER_SIZE).map_err(|_| Error::Allocation)?;
         Ok(Self {
             kind,

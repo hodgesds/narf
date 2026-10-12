@@ -197,6 +197,7 @@ pub mod amdgpu_mqd;
 pub mod amdgpu_mst;
 pub mod amdgpu_navi22_boot;
 pub mod amdgpu_navi22_platform;
+pub mod amdgpu_navi48_boot;
 pub mod amdgpu_navi48_firmware;
 #[cfg(feature = "kernel-test")]
 mod amdgpu_navi48_tests;
@@ -220,6 +221,7 @@ pub mod amdgpu_sdma_navi22;
 pub mod amdgpu_smc_firmware;
 pub mod amdgpu_smu;
 pub mod amdgpu_smu_navi22;
+pub mod amdgpu_smu_navi48;
 pub mod amdgpu_smu_v12;
 pub mod amdgpu_smu_v13;
 pub mod amdgpu_uapi;

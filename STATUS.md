@@ -277,15 +277,18 @@ APU power paths reject this generation before accessing hardware. An explicit
 PSP14 SOS bootstrap now validates the descriptor-based signed containers,
 pins firmware to the discovered PSP revision, uploads all boot components
 in Linux's order and retains published staging memory on cancellation or
-failure. It requires caller-owned, trained VRAM. Production VRAM planning,
-PSP14 GPCOM/TMR, SMU14 lifecycle, GMC12/SDMA7 queues, DCN4 native modeset
-and physical-card validation remain open.
+failure. It requires caller-owned, trained VRAM.
 The explicit PSP14 GPCOM/TMR transport and cancellation-safe GDDR6 long-training
 owner now support GMC12 address validation and HDP6 flush semantics. TOC setup
 rejects cross-revision firmware. The complete capability-backed Navi48 firmware set, RS64/MES/IMU/RLC payload
 selection, PSP autoload and GC12 readiness check are implemented. Automatic
-Navi48 boot ownership, SMU14 board-power control, GMC12/SDMA7 queues and DCN4
-modesetting remain in progress.
+Navi48 boot ownership, GMC12/SDMA7 queues and DCN4 modesetting remain in
+progress. GMC12/DCN4 boot VRAM inventory and the SMU14 handshake, firmware-owned
+board-table transfer and bounded initial GFX/protection policy are implemented.
+An explicit cold-boot coordinator retains all firmware owners and sequences
+training, PSP/SMU, DCN4 DMUB stop, graphics autoload and initial power setup.
+Native memory/queue/display integration and physical-card validation remain
+open; firmware readiness does not advertise working acceleration.
 
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total

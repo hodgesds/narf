@@ -131,7 +131,7 @@ address in MiB, bounded asynchronous waits, and changing SOS heartbeat proof.
 Failure and cancellation prevent replay and quarantine published memory.
 An already running SOS is checked without upload. The caller must supply
 exclusively owned, trained VRAM with correct GMC12 addresses and exclusions;
-the Navi22 VRAM planner is not valid for this GPU. This explicit API does not
+use `Plan::read_navi48` for this GPU's inventory. This explicit API does not
 automatically claim the GPU, initialize its GPCOM/TMR, set `fw_loaded`, or
 enable graphics/display engines. Those remain separate bring-up stages.
 
@@ -160,8 +160,8 @@ it retains the bottom 32 MiB preimage in system memory; only acknowledged
 completion permits restoration and HDP flush. Runtime policy can disable
 training, and resident SOS skips it. Timeout, cancellation or revocation retains
 the preimage without racing a possibly active PSP writer or allowing replay.
-These are explicit ownership APIs; a Navi48 boot VRAM inventory/coordinator
-must supply the reservations before automatic cold boot is enabled.
+These are explicit ownership APIs; the Navi48 boot inventory below supplies
+reservations, while automatic cold boot still requires a coordinated owner.
 
 ### Navi 48 graphics and media firmware
 
@@ -191,6 +191,58 @@ and within the retained TMR. `wait_gfx_boot_navi48` checks CP idle and GC12's
 bank-one RLC status at `0x4e7c`. Cancellation preserves the in-flight payload,
 ring and TMR and prevents replay. Successful autoload does not initialize
 VMs, interrupts or command queues and does not publish `fw_loaded`.
+
+### Navi 48 boot memory and SMU14 power control
+
+`unsafe amdgpu_vram_boot::Plan::read_navi48` inventories the complete GMC12
+VRAM aperture against DCN4's address translation and the reported physical
+size. It uses four DCN4 scanout/cursor register windows, including 16-bit pitch
+and viewport-start fields, and rejects enabled contexts in GC12/MMHUB4.1.
+Packed linear RGB surfaces are supported; tiled, compressed, protected, YUV or
+VM surfaces reject the inventory. Firmware/ATOM, discovery tail, runtime DB,
+training exchanges, inherited DMUB windows (including DCN4 Region6 shared
+state), boot framebuffer and explicit other clients remain protected before
+CPU-visible BAR clipping. `into_pool` retains the existing unsafe exclusive-
+client contract. The inventory performs no hardware writes.
+
+`unsafe amdgpu_smu_navi48::Smu::after_upload(gpu, pci_cap, pool)` requires
+successfully loaded SMU14 firmware, trained VRAM, retained PSP/TMR and exclusive
+MP1/index/HDP/reset/power ownership. It validates the exact MP1 14.0.2/3 bank-one
+mailbox (`0x82/0x92/0x9a`) and the GMC12/BAR0 pool mapping, then reserves a
+16 KiB transfer buffer without publishing it. `verify().await` requires driver
+interface `0x2e` and a nonzero firmware version.
+
+`read_board().await` obtains TABLE_COMBO_PPTABLE from the running SMU. It checks
+SCPM policy, zeroes/flushed staging, publishes the GPU address, awaits transfer
+completion and validates the 5812-byte format-23 combo's subtable bounds.
+`upload_board().await` sends only its unmodified 4468-byte PPTable to
+TABLE_PPTABLE. The combined driver's 1344-byte prefix is never sent as power
+settings. Board information comes from this GPU's running firmware; no
+Navi22 table layout, reference-board replacement or overdrive is used.
+
+After graphics/RLC boot, `configure_power().await` runs DC BTC, installs a
+board-supported mask for GFX DPM and autonomous thermal/fan/electrical
+protection, enables it and verifies the running mask and GFX frequency range.
+Boot display/memory/link clocks and automatic gating remain excluded until
+native DCN owns their constraints. The owner publishes `PowerStatus` only
+after the whole sequence succeeds. Each operation is single-attempt; timeout,
+cancellation, revocation or an unknown reply prevents reuse. Incomplete SMU
+DMA retains its published buffer. Acknowledged transfer completion alone
+permits reclaiming that buffer. All waits use scheduler time futures, with
+capability revalidation at every command/read/copy chunk.
+
+`amdgpu_navi48_boot::Firmware::open` prepares both mandatory firmware sets
+before cold boot. `unsafe ColdBoot::new` requires exclusive GPU ownership,
+the inventoried pool, trained VRAM or an owned training exchange, and all
+training quiescence obligations. `run().await` retains the trainer, SOS,
+PSP/TMR and SMU owners and executes training → SOS → ring/TMR → SMC → SMU
+version/board transfer → DMUB stop → graphics autoload → RLC readiness →
+initial power policy. DCN4 stop requires STOP_FW acknowledgement and PWAIT,
+uses CNTL2 reset, verifies disabled/reset readback and leaves PSP's secure
+windows untouched. Every stage is observable through `State`; failure or
+cancellation prevents replay. `FirmwareReady` reports firmware/media/power
+status only. GMC, queues, DMUB restart, native display, probe integration and
+physical validation are separate gates; `fw_loaded` is not set by this API.
 
 ### Navi 22 PSP secure-OS bootstrap
 

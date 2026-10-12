@@ -1,0 +1,417 @@
+use super::*;
+use alloc::vec;
+use core::{
+    future::Future,
+    task::{Context, Waker},
+};
+use narf_kernel_test::{kernel_test_in, TestResult};
+fn put(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn board() -> Vec<u8> {
+    let mut b = vec![0; COMBO_BYTES];
+    b[..2].copy_from_slice(&(COMBO_BYTES as u16).to_le_bytes());
+    b[2] = 23;
+    for (f, v) in [
+        (6, 1344u16),
+        (8, 4468),
+        (10, 1372),
+        (12, 3552),
+        (14, 5284),
+        (16, 528),
+        (18, 4924),
+        (20, 360),
+    ] {
+        b[f..f + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    put(&mut b, DRIVER_BYTES + 4, u32::MAX);
+    put(&mut b, DRIVER_BYTES + 8, u32::MAX);
+    b
+}
+#[derive(Debug)]
+struct Fake {
+    regs: [u32; 0x9b],
+    memory: Vec<u8>,
+    board: Vec<u8>,
+    commands: Vec<(u32, u32)>,
+    stall: Option<u32>,
+    reject: Option<u32>,
+    interface: u32,
+    enabled: u64,
+    dirty: bool,
+    violation: bool,
+    address: u64,
+    policy: u32,
+    uploaded: Vec<u8>,
+}
+impl Io for Fake {
+    fn read(&mut self, reg: u32) -> u32 {
+        self.regs[reg as usize]
+    }
+    fn write(&mut self, reg: u32, value: u32) {
+        self.regs[reg as usize] = value;
+        if reg != MESSAGE {
+            return;
+        }
+        let p = self.regs[ARGUMENT as usize];
+        self.commands.push((value, p));
+        if self.stall == Some(value) {
+            return;
+        }
+        if self.reject == Some(value) {
+            self.regs[RESPONSE as usize] = 0xfd;
+            return;
+        }
+        self.regs[RESPONSE as usize] = 1;
+        self.regs[ARGUMENT as usize] = match value {
+            3 => self.interface,
+            2 => 0x684c00,
+            0xe => {
+                self.address = (p as u64) << 32;
+                0
+            }
+            0xf => {
+                self.address |= p as u64;
+                0
+            }
+            0x12 => {
+                self.violation |= p != 1 || self.dirty || self.address != 0x8_00003000;
+                self.memory[..COMBO_BYTES].copy_from_slice(&self.board);
+                0
+            }
+            0x13 => {
+                self.violation |= p != 0 || self.dirty;
+                self.uploaded = self.memory[..POWER_BYTES].to_vec();
+                0
+            }
+            5 => {
+                self.enabled = (p as u64) << 32;
+                0
+            }
+            4 => {
+                self.enabled |= p as u64;
+                0
+            }
+            0xc => self.enabled as u32,
+            0xd => (self.enabled >> 32) as u32,
+            0x1d => 500,
+            0x1e => 3100,
+            0x36 | 6 => 0,
+            _ => panic!("unknown SMU14 message"),
+        };
+    }
+    fn check_policy(&mut self) -> Result<(), Error> {
+        if self.policy == 0 {
+            Ok(())
+        } else {
+            Err(Error::PowerPolicy(self.policy))
+        }
+    }
+    fn write_buffer(&mut self, offset: usize, b: &[u8]) {
+        self.memory[offset..offset + b.len()].copy_from_slice(b);
+        self.dirty = true;
+    }
+    fn read_buffer(&mut self, offset: usize, b: &mut [u8]) {
+        b.copy_from_slice(&self.memory[offset..offset + b.len()]);
+    }
+    fn flush(&mut self) -> Result<(), Error> {
+        self.dirty = false;
+        Ok(())
+    }
+}
+fn fixture() -> (Pool, Engine<Fake>) {
+    let mapping = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0x90003000),
+        virt: 0x3000,
+        len: 1 << 20,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    // SAFETY: Fake implements every VRAM access; bookkeeping only.
+    let pool = unsafe { Pool::from_owned_range(mapping, 0x8_00003000) }.unwrap();
+    let memory = pool.reserve(TRANSFER_BYTES as u64).unwrap();
+    (
+        pool,
+        Engine {
+            io: Fake {
+                regs: [0; 0x9b],
+                memory: vec![0; TRANSFER_BYTES],
+                board: board(),
+                commands: Vec::new(),
+                stall: None,
+                reject: None,
+                interface: DRIVER_INTERFACE,
+                enabled: 0,
+                dirty: false,
+                violation: false,
+                address: 0,
+                policy: 0,
+                uploaded: Vec::new(),
+            },
+            authority: Cap::bootstrap(),
+            memory,
+            state: State::Prepared,
+            versions: None,
+            board: vec![0; COMBO_BYTES],
+            features: 0,
+            power: None,
+        },
+    )
+}
+fn run<T>(f: impl Future<Output = T>) -> T {
+    narf_scheduler::block_on_spin(f)
+}
+fn smu14_board_roundtrip_and_protection_policy() -> TestResult {
+    let (pool, mut e) = fixture();
+    if run(e.verify())
+        != Ok(Versions {
+            firmware: 0x684c00,
+            interface: 0x2e,
+        })
+        || run(e.read_board()).is_err()
+        || run(e.upload_board()).is_err()
+    {
+        return TestResult::Fail("SMU14 handshake/board transfer failed");
+    }
+    let p = run(e.configure_power()).unwrap();
+    if e.io.violation
+        || e.io.uploaded != e.io.board[DRIVER_BYTES..]
+        || e.state != State::PowerReady
+        || p.allowed != ALLOWED
+        || p.enabled != ALLOWED
+        || p.gfx_min_mhz != 500
+        || p.gfx_max_mhz != 3100
+        || e.io.commands
+            != [
+                (3, 0),
+                (2, 0),
+                (0xe, 8),
+                (0xf, 0x3000),
+                (0x12, 1),
+                (0xe, 8),
+                (0xf, 0x3000),
+                (0x13, 0),
+                (0x36, 0),
+                (5, (ALLOWED >> 32) as u32),
+                (4, ALLOWED as u32),
+                (6, 0),
+                (0xc, 0),
+                (0xd, 0),
+                (0x1d, 0),
+                (0x1e, 0),
+            ]
+        || run(e.configure_power()) != Err(Error::Busy)
+    {
+        return TestResult::Fail("SMU14 table address/order or boot policy");
+    }
+    drop(e);
+    if pool.available() != 1 << 20 {
+        return TestResult::Fail("completed SMU transfer memory leaked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu14",
+    smu14_board_roundtrip_and_protection_policy
+);
+fn smu14_rejects_malformed_board_and_foreign_interface() -> TestResult {
+    let valid = board();
+    for end in 0..valid.len() {
+        if board_features(&valid[..end]).is_ok() {
+            return TestResult::Fail("truncated SMU14 combo accepted");
+        }
+    }
+    for f in [0, 2, 6, 8, 10, 12, 14, 16, 18, 20, DRIVER_BYTES] {
+        let mut b = valid.clone();
+        b[f] ^= 1;
+        if board_features(&b).is_ok() {
+            return TestResult::Fail("invalid combo format or relative subtable offset");
+        }
+    }
+    let (_, mut e) = fixture();
+    e.io.interface = 0xe;
+    if run(e.verify()) != Err(Error::InterfaceMismatch(0xe))
+        || e.io.commands != [(3, 0)]
+        || run(e.read_board()) != Err(Error::Busy)
+    {
+        return TestResult::Fail("SMU11 interface accepted or used after rejection");
+    }
+    let (_, mut e) = fixture();
+    run(e.verify()).unwrap();
+    e.io.policy = 2;
+    if run(e.read_board()) != Err(Error::PowerPolicy(2)) || e.io.commands.len() != 2 {
+        return TestResult::Fail("SCPM policy ignored before board transfer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu14",
+    smu14_rejects_malformed_board_and_foreign_interface
+);
+fn smu14_cancelled_dma_and_revocation_do_not_recycle_or_retry() -> TestResult {
+    for message in [0xe, 0xf, 0x12, 0x13] {
+        let (pool, mut e) = fixture();
+        run(e.verify()).unwrap();
+        if message == 0x13 {
+            run(e.read_board()).unwrap();
+        }
+        e.io.stall = Some(message);
+        {
+            let f = async {
+                if message == 0x13 {
+                    e.upload_board().await
+                } else {
+                    e.read_board().await
+                }
+            };
+            let mut f = core::pin::pin!(f);
+            for _ in 0..8 {
+                if f.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+                {
+                    return TestResult::Fail("stalled SMU DMA completed");
+                }
+            }
+        }
+        if run(e.read_board()) != Err(Error::Busy) || run(e.upload_board()) != Err(Error::Busy) {
+            return TestResult::Fail("cancelled SMU transaction replayed");
+        }
+        drop(e);
+        if pool.available() != (1 << 20) - TRANSFER_BYTES as u64 {
+            return TestResult::Fail("SMU-owned DMA buffer recycled");
+        }
+    }
+    let (pool, mut e) = fixture();
+    run(e.verify()).unwrap();
+    let authority = e.authority;
+    {
+        let mut f = core::pin::pin!(e.read_board());
+        if f.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+        {
+            return TestResult::Fail("board staging failed to yield");
+        }
+        authority.revoke();
+        if run(f) != Err(Error::Revoked) {
+            return TestResult::Fail("revoked SMU staging continued");
+        }
+    }
+    if e.io.commands.len() != 2 {
+        return TestResult::Fail("revoked SMU staging published address");
+    }
+    drop(e);
+    if pool.available() != 1 << 20 {
+        return TestResult::Fail("unpublished SMU staging leaked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu14",
+    smu14_cancelled_dma_and_revocation_do_not_recycle_or_retry
+);
+
+fn smu14_constructor_resolves_bank_one_and_validates_pool() -> TestResult {
+    let (pool, e) = fixture();
+    drop(e);
+    let mut g = crate::amdgpu_navi48_firmware::tests::gpu();
+    let mut regs = vec![0; 0x80000 / 4];
+    g.regs.virt = regs.as_mut_ptr() as u64;
+    g.regs.len = 0x80000;
+    g.fb_bar = MmioRegion {
+        phys: narf_memory::PhysAddr::new(0x90000000),
+        virt: 0,
+        len: 256 << 20,
+        kind: narf_bus::BarKind::Mmio64 { prefetchable: true },
+    };
+    g.vram.visible_size = 256 << 20;
+    g.vram.size = 16 << 30;
+    g.ip_blocks[0].num_bases = 2;
+    g.ip_blocks[1].base_addrs[0] = 0x20000; // Unused bank is outside BAR5.
+    g.ip_blocks[1].base_addrs[1] = 0x11000;
+    let ip = |id, v: (u8, u8, u8), bank, base| {
+        let mut bases = [0; crate::amdgpu_discovery::MAX_BASE_ADDRS];
+        bases[bank] = base;
+        crate::amdgpu_discovery::IpBlock {
+            hw_id: id,
+            instance: 0,
+            major: v.0,
+            minor: v.1,
+            revision: v.2,
+            sub_revision: 0,
+            variant: 0,
+            base_addrs: bases,
+            num_bases: 3,
+        }
+    };
+    g.ip_blocks.extend([
+        ip(ip::HW_ID_MP0, (14, 0, 3), 0, 0x10000),
+        ip(ip::HW_ID_NBIF, (7, 7, 0), 2, 0xd20),
+        ip(ip::HW_ID_HDP, (6, 1, 0), 0, 0),
+    ]);
+    regs[0x1614] = 0x800;
+    regs[0x1615] = 0xbff;
+    regs[0x15a7] = 0x100;
+    let before = regs.clone();
+    // SAFETY: constructor reads only modeled GMC registers; no run calls occur.
+    let smu = unsafe { Smu::after_upload(&g, Cap::bootstrap(), &pool) }.unwrap();
+    if smu.engine.io.base != 0x44000 || smu.state() != State::Prepared || regs != before {
+        return TestResult::Fail("SMU14 used MP1 bank zero or wrote hardware at construction");
+    }
+    drop(smu);
+    let cap = Cap::bootstrap();
+    cap.revoke();
+    if !matches!(
+        // SAFETY: revoked constructor cannot access MMIO.
+        unsafe { Smu::after_upload(&g, cap, &pool) },
+        Err(Error::Revoked)
+    ) {
+        return TestResult::Fail("SMU14 constructor ignored current PCI authority");
+    }
+    g.fb_bar.phys = narf_memory::PhysAddr::new(0xa0000000);
+    if !matches!(
+        // SAFETY: wrong mapping must be rejected before any buffer use.
+        unsafe { Smu::after_upload(&g, Cap::bootstrap(), &pool) },
+        Err(Error::Invalid)
+    ) {
+        return TestResult::Fail("SMU14 accepted another GPU's pool");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu14",
+    smu14_constructor_resolves_bank_one_and_validates_pool
+);
+
+fn smu14_timeout_and_rejection_prevent_later_power_commands() -> TestResult {
+    let (pool, mut e) = fixture();
+    run(e.verify()).unwrap();
+    e.io.stall = Some(0x12);
+    if run(e.read_board()) != Err(Error::Timeout)
+        || e.state != State::Failed
+        || run(e.upload_board()) != Err(Error::Busy)
+    {
+        return TestResult::Fail("SMU DMA timeout published board readiness");
+    }
+    drop(e);
+    if pool.available() != (1 << 20) - TRANSFER_BYTES as u64 {
+        return TestResult::Fail("timed out SMU DMA buffer recycled");
+    }
+    let (_, mut e) = fixture();
+    run(e.verify()).unwrap();
+    run(e.read_board()).unwrap();
+    run(e.upload_board()).unwrap();
+    e.io.reject = Some(0x36);
+    if run(e.configure_power()) != Err(Error::Rejected(0xfd))
+        || e.power.is_some()
+        || e.io.commands.iter().any(|(m, _)| matches!(m, 4..=6))
+        || run(e.configure_power()) != Err(Error::Busy)
+    {
+        return TestResult::Fail("failed BTC enabled features or allowed retry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu14",
+    smu14_timeout_and_rejection_prevent_later_power_commands
+);
