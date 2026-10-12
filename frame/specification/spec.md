@@ -146,6 +146,12 @@ plus fatal-trap sinks remain unconditional.
   restore only the currently published own-stack task image and returns to
   retry the faulting instruction. Vector 7 from CPL0, or without a matching
   published task/image, remains on the fatal exception path.
+- **PKRU is eager per-task x86 state.** If CPUID.PKU is advertised, BSP and
+  every AP set CR4.PKE before userspace runs. The scheduler saves PKRU on every
+  user-task switch and restores it before return to CPL3; this is separate from
+  lazy FP/SIMD handling because `WRPKRU` does not require an FP trap. PKRU is
+  user-mode state and never replaces the trap entry PKRS save/restore used for
+  supervisor domain enforcement.
 - **x86 signal-frame FP capture and restore materialize scheduler-owned lazy
   state before FXSAVE/FXRSTOR.** Frame asks the scheduler to restore a deferred
   current-task image, clear CR0.TS, and mark the register file live before

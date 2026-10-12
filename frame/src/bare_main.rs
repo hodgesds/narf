@@ -950,6 +950,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             feats.hybrid
         );
 
+        // PKU is separate from PKS: it exposes the user-mode PKRU register,
+        // while PKS keeps enforcing framekernel domains through IA32_PKRS.
+        // Modern Linux userspace (notably Chromium) legitimately executes
+        // RDPKRU, so advertising CPUID.PKU without CR4.PKE would make a valid
+        // instruction #UD. CR4 is per-CPU; AP bring-up mirrors this below.
+        if feats.pku {
+            // SAFETY: CPUID confirmed PKE support and no userspace has run.
+            unsafe {
+                narf_arch::x86_64::pku::enable_current_cpu();
+            }
+            let _ = writeln!(console::Writer, "  pku: enabled (CR4.PKE=1, PKRU=0)");
+        }
+
         // Record the BSP's hybrid CPU type. CPUID leaf 0x1A
         // EAX[31:24] is per-LP — APs populate their own slots
         // during _ap_start_rust. Gated on the Hybrid feature bit so
@@ -3581,6 +3594,42 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_init::register(narf_init::Stage::Late, "mnt-mount-ext2", || {
                 use narf_block::fs_detect::{detect_filesystem, FsType};
                 let auth = narf_filesystem::bootstrap_mount_authority();
+
+                // A systemd PID-1 boot with an explicit root selector must
+                // stage that exact filesystem at /mnt. In particular, a
+                // removable-media boot must not pick the first ext volume
+                // observed after the selected root has mounted at /: on real
+                // laptops that is commonly the internal disk. A bind mount
+                // captures the selected session root before boot-init overlays
+                // native fallback filesystems at /bin, /etc, /lib and
+                // /usr/lib; systemd then sees the selected distro tree through
+                // its existing /mnt root.
+                if narf_boot::args().has_flag("systemd_pid1")
+                    && narf_filesystem::root_selector::RootSelector::from_cmdline(
+                        narf_boot::cmdline(),
+                    )
+                    .is_some()
+                {
+                    return match narf_filesystem::registry().bind_mount(&auth, "/", "/mnt") {
+                        Ok(_) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  mnt-mount-ext2: bound cmdline-selected root at \"/mnt\""
+                            );
+                            narf_init::InitResult::Ok
+                        }
+                        Err(error) => {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  mnt-mount-ext2: selected-root bind at \"/mnt\" failed: {:?}",
+                                error
+                            );
+                            narf_init::InitResult::Error("selected root staging failed")
+                        }
+                    };
+                }
+
+                let session_writable_root = narf_boot::args().has_flag("systemd_pid1");
                 let devices = narf_block::block_devices();
                 let mut mounted = false;
                 for entry in &devices {
@@ -3605,12 +3654,43 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             continue;
                         }
                     };
+                    // Without an explicit root= selector the installed distro
+                    // is staged here, at /mnt, rather than by root-mount-auto.
+                    // Its ext root is presently immutable, so construct the
+                    // same lower-ext + tmpfs-upper OverlayFS view that the
+                    // selected-root path uses. This must happen before PID 1's
+                    // rooted task is published; mounting a plain tmpfs later
+                    // would hide the installed files instead of copy-on-write
+                    // layering them.
+                    let fs = if session_writable_root {
+                        match narf_filesystem::root_mount::tmpfs_overlay_root(fs) {
+                            Ok(fs) => fs,
+                            Err(e) => {
+                                let _ = writeln!(
+                                    console::Writer,
+                                    "  mnt-mount-ext2: tmpfs overlay construction failed on {}: {:?}",
+                                    entry.name,
+                                    e
+                                );
+                                return narf_init::InitResult::Error(
+                                    "installed root tmpfs overlay setup failed",
+                                );
+                            }
+                        }
+                    } else {
+                        fs
+                    };
                     match narf_filesystem::registry().mount_arc(&auth, "/mnt", fs) {
                         Ok(_) => {
                             let _ = writeln!(
                                 console::Writer,
-                                "  mnt-mount-ext2: ext on {} mounted at \"/mnt\"",
-                                entry.name
+                                "  mnt-mount-ext2: ext on {} mounted at \"/mnt\"{}",
+                                entry.name,
+                                if session_writable_root {
+                                    " with tmpfs overlay"
+                                } else {
+                                    ""
+                                },
                             );
                             mounted = true;
                             break;
@@ -6091,14 +6171,14 @@ BUG_REPORT_URL=\"https://github.com/dhodges-daniel/narf/issues\"\n";
 
     // `systemd_pid1` cmdline flag: boot the mounted /mnt rootfs's
     // `/usr/lib/systemd/systemd` directly as PID 1 instead of the NARF
-    // init/getty/shell stack. The mounted Fedora filesystem is installed as
-    // the task's root before scheduler publication; there is no launcher,
-    // shell, chroot helper, or exec chain ahead of systemd.
-    // The Stage::Late `mnt-dev-bind`/`root-mount-auto` initcalls have
-    // already run synchronously above (see the run_stage loop in
-    // `_start_rust`), so /mnt + /mnt/{dev,run,tmp,sys,proc} + the chroot
-    // cgroup2 mount are live before this task ever runs. init/getty are
-    // skipped: there is no NARF login shell in this mode.
+    // init/getty/shell stack. When an explicit root= selector was present,
+    // mnt-mount-ext2 bound that exact root at /mnt before native boot-init
+    // overlays /bin, /etc, /lib and /usr/lib. The mounted distro filesystem
+    // is installed as the task's root before scheduler publication; there is
+    // no launcher, shell, chroot helper, or exec chain ahead of systemd.
+    // The Stage::Late root/dev/proc/sys/cgroup initcalls have already run
+    // synchronously above (see the run_stage loop in `_start_rust`) before
+    // this task is published. init/getty are skipped in this mode.
     let systemd_pid1 = narf_boot::args().has_flag("systemd_pid1");
     if systemd_pid1 {
         let systemd_path = "/mnt/usr/lib/systemd/systemd";

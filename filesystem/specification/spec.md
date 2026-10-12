@@ -108,6 +108,16 @@ adapter is registered as `cryptroot`. Missing credentials and authenticated
 unlock failures surface as `RootMountError::LuksUnlock`; they never fall
 through to an unrelated disk.
 
+`try_mount_root_with_options` additionally accepts
+`RootMountOptions::tmpfs_overlay`. When set (the explicit-`root=`
+`systemd_pid1` installed-distro boot path), the selected filesystem is the
+immutable OverlayFS lower and a Linux-compatible `TmpFs` upper becomes the
+visible `/` before PID 1 starts. The selector-free installed-root fallback
+uses the same wrapper at `/mnt` before PID 1 is rooted there.
+The upper inherits the lower root's owner and mode, is limited by the normal
+tmpfs policy (half of managed RAM by default), and is discarded at shutdown.
+`RootMountError::TmpfsOverlay` reports failure to construct that session view.
+
 ### 3.1 Path and node types
 
 ```rust

@@ -8473,8 +8473,9 @@ pub(crate) fn utimes_read_timeval(tv_ptr: u64) -> Result<UtimesSpec, i64> {
 // Memory-protection keys. NARF tracks an allocation bitmap per task
 // (keys 1..=15; key 0 is the always-present default) so alloc/free
 // round-trip and pkey_mprotect can validate its key argument, but the
-// keys are not enforced in hardware (no PKRU wiring yet) — pkey_mprotect
-// applies the requested prot exactly like mprotect.
+// PKRU instruction state is saved/restored by the scheduler, but these
+// compatibility syscalls do not yet encode the selected key into user PTEs;
+// pkey_mprotect therefore applies the requested prot exactly like mprotect.
 
 /// Per-task allocated-pkey bitmap (bit k set ⇒ key k is allocated).
 static PKEY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<alloc::collections::BTreeMap<u64, u16>>> =

@@ -291,6 +291,12 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
         narf_arch::x86_64::cr::write_cr4(cr4);
         // TODO: MTE and other domains.
         narf_arch::x86_64::xsave::enable_default();
+        // CR4 is per-logical-processor. Keep PKU parity with the BSP before
+        // this AP can receive a migrated user task that executes RDPKRU or
+        // WRPKRU; PKS/PKRS remains separately configured below.
+        if narf_arch::x86_64::pku::supported() {
+            narf_arch::x86_64::pku::enable_current_cpu();
+        }
     }
 
     // 3. Per-CPU LAPIC bring-up: enable x2APIC + spurious vector +

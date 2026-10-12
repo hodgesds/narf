@@ -512,6 +512,14 @@ pub fn reset_current_user_fpu() -> bool {
         // operation. A zero XSAVE header requests architectural initial state;
         // the seeded legacy controls also make the FXSAVE fallback valid.
         let task = unsafe { &*task };
+        // PKRU is eager task state, not part of CR0.TS-governed lazy FPU
+        // state. Reset it even for an unusually early exec before a user FPU
+        // area has been published.
+        task.user_pkru.store(0, Ordering::Release);
+        if narf_arch::x86_64::pku::enabled() {
+            // SAFETY: this is the current task in CPL0; CR4.PKE is set.
+            unsafe { narf_arch::x86_64::pku::write(0) };
+        }
         let area = task.user_fpu.load(Ordering::Acquire);
         if area.is_null() {
             return false;
@@ -552,6 +560,15 @@ fn materialize_user_fpu(cpu: usize, task: &KernelTask) -> bool {
         narf_arch::x86_64::cr::clear_task_switched();
         if !live {
             narf_arch::x86_64::xsave::fpu_restore(area);
+            // XRSTOR can restore the PKRU component from an older FPU image.
+            // The dedicated task slot is authoritative because WRPKRU does
+            // not require an FPU-unavailable trap and is saved independently
+            // at every task switch.
+            if narf_arch::x86_64::pku::enabled() {
+                let pkru = task.user_pkru.load(Ordering::Acquire);
+                // SAFETY: CPL0 and CR4.PKE were checked above.
+                narf_arch::x86_64::pku::write(pkru);
+            }
             task.user_fpu_live.store(true, Ordering::Release);
         }
     }
@@ -712,6 +729,14 @@ fn user_fpu_save_task(cpu: usize, task: &KernelTask) {
     // SAFETY: CPL0 on a scheduler path, so the kernel GS is the live one.
     let gs_base = unsafe { narf_arch::x86_64::user_mode::user_gs_base() };
     task.user_gs_base.store(gs_base, Ordering::Relaxed);
+    // PKRU is user task state but is not guarded by CR0.TS: a task can execute
+    // WRPKRU before it uses FP/SIMD. Save it even when the lazy FPU image was
+    // never materialized, otherwise its rights would leak to the next task.
+    if narf_arch::x86_64::pku::enabled() {
+        // SAFETY: scheduler switch-out runs in CPL0 and CR4.PKE is set.
+        let pkru = unsafe { narf_arch::x86_64::pku::read() };
+        task.user_pkru.store(pkru, Ordering::Release);
+    }
     let area = task.user_fpu.load(Ordering::Acquire);
     let live = task.user_fpu_live.load(Ordering::Acquire);
     // A task that never consumed FP/SIMD after its last deferred resume has no
@@ -774,6 +799,16 @@ fn user_fpu_save() {}
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn user_fpu_restore_task(cpu: usize, task: &KernelTask) {
+    // Restore PKRU eagerly, before the user task can execute RDPKRU/WRPKRU.
+    // Deferred XSAVE restore below may subsequently load an older component,
+    // and materialize_user_fpu rewrites this authoritative per-task value
+    // immediately after XRSTOR. This happens before the FPU-area check:
+    // WRPKRU does not require a lazily allocated SIMD image.
+    if narf_arch::x86_64::pku::enabled() {
+        let pkru = task.user_pkru.load(Ordering::Acquire);
+        // SAFETY: scheduler switch-in runs in CPL0 and CR4.PKE is set.
+        unsafe { narf_arch::x86_64::pku::write(pkru) };
+    }
     if task.user_fpu.load(Ordering::Acquire).is_null() {
         return;
     }
@@ -1683,6 +1718,10 @@ pub struct KernelTask {
     /// possible. A false value means the task-owned memory image is current.
     #[cfg(target_arch = "x86_64")]
     user_fpu_live: AtomicBool,
+    /// User PKRU is eager task state, separate from the lazy FP/SIMD image:
+    /// WRPKRU may execute before any instruction that observes CR0.TS.
+    #[cfg(target_arch = "x86_64")]
+    user_pkru: AtomicU32,
     /// Opaque owner-defined context for the current stackful task. Userspace
     /// publishes its refcounted `Task` here so syscall paths can recover their
     /// task-local state without consulting a process-wide registry lock.
@@ -1831,6 +1870,8 @@ impl KernelTask {
             user_fpu: AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(target_arch = "x86_64")]
             user_fpu_live: AtomicBool::new(false),
+            #[cfg(target_arch = "x86_64")]
+            user_pkru: AtomicU32::new(0),
             user_context: AtomicPtr::new(core::ptr::null_mut()),
             user_cr3: AtomicU64::new(0),
             user_fs_base: AtomicU64::new(0),
@@ -4950,6 +4991,41 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// PKRU is eager user state, not a component conditional on allocating a
+    /// lazy XSAVE area. A task can execute WRPKRU before its first FP/SIMD
+    /// instruction, so switching back to such a task must still restore its
+    /// value rather than inheriting the previous task's register.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_user_pkru_restores_without_fpu_area() -> TestResult {
+        use narf_arch::x86_64::pku;
+
+        if !pku::enabled() {
+            return TestResult::Skip("PKU is not enabled on this CPU");
+        }
+        let task = KernelTask::new(core::future::ready(()));
+        // Key 1 is not assigned to any kernel mapping. Flip both of its PKRU
+        // access-disable bits so the expected value differs from the live
+        // register without affecting the kernel's key-0 mappings.
+        // SAFETY: this test runs only after CPUID/CR4 enablement confirms that
+        // RDPKRU is available on the boot CPU.
+        let before = unsafe { pku::read() };
+        let expected = before ^ 0x0c;
+        task.user_pkru.store(expected, Ordering::Release);
+        // SAFETY: `before` was read from this CPU's PKRU immediately above.
+        unsafe { pku::write(before) };
+
+        user_fpu_restore_task(this_cpu(), &task);
+        // SAFETY: the same PKU availability check guards this RDPKRU.
+        let observed = unsafe { pku::read() };
+        // SAFETY: restore this CPU's original PKRU before leaving the test.
+        unsafe { pku::write(before) };
+
+        if observed != expected {
+            return TestResult::Fail("PKRU restore was skipped without an FPU area");
+        }
+        TestResult::Pass
+    }
+
     /// Under own-stack, `poll_to_yield` must write the task's own user GS base
     /// back before switching it in: the task sets GS and yields, a peer
     /// clobbers the MSR, and on resume the task must see ITS value. A second,
@@ -7970,6 +8046,8 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_user_fpu_lazy_restore_round_trip);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/pku", smoke_user_pkru_restores_without_fpu_area);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",

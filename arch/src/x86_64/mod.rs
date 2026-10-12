@@ -44,6 +44,7 @@ pub mod pcid;
 pub mod pebs;
 pub mod pit;
 pub mod pks;
+pub mod pku;
 pub mod pmi;
 pub mod pmu;
 pub mod probe;

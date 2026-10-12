@@ -1423,3 +1423,21 @@ argument = "A composed built-in receives only a validated DomainId value selecte
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The generated registrar and per-module boot argument add no isolation exception. Unknown stages, entry syntax, domains, duplicate components, malformed per-path domain mappings, and unsigned modules without explicit development policy fail closed. For signed entries, xtask verifies the detached signature and provisions the selected public key through the existing build-time trust-store interface; module bytes are still authenticated before decompression or execution. Built-in crates are deliberately part of the signed kernel image rather than dynamically admitted code."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame boot change wraps an already-created installed-root FsInstance in the existing filesystem OverlayFs before mounting it at /mnt for PID 1. It neither creates a capability nor changes a domain, mapping, scheduler decision, task security state, or TCB membership; failed overlay construction aborts the installed-root stage before PID 1 is published."
+
+# x86 PKU instruction support. The dedicated security-review skill was not
+# available in this session; human security review remains mandatory.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "CPUID-gated CR4.PKE setup and the scheduler PKRU slot remain inside the existing Frame/arch/scheduler TCB. They add no new TCB member, capability, mapping authority, or domain ID. Every CPU enables PKE only when it advertises PKU, before untrusted CPL3 code runs; the user register is separate from PKS/PKRS and frame trap-domain state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The scheduler saves the outgoing task's PKRU on every user-task switch and restores the incoming task value before CPL3 return. A lazy XRSTOR cannot leak stale rights because it is immediately overwritten from that authoritative slot. PKS domain rights continue to use IA32_PKRS and the existing trap/domain pairing, so this change neither bypasses a capability check nor changes a kernel-side domain tag."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L115"
+argument = "The implementation keeps the user PKRU namespace disjoint from the 16 PKS supervisor-domain keys. Existing pkey compatibility syscalls still do not retag user PTEs; enabling the architectural register makes RDPKRU/WRPKRU safe and task-local without granting access to a kernel domain or consuming a PKS slot."
