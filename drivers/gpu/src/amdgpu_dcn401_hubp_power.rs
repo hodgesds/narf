@@ -139,6 +139,7 @@ impl<I: Io> Engine<I> {
             self.status.hubp_power[usize::from(pipe)] = None;
             self.status.surfaces[usize::from(pipe)] = None;
             self.status.memory[usize::from(pipe)] = None;
+            self.status.dpps[usize::from(pipe)] = None;
             if let Err(e) = self.change_hubp_power(request).await {
                 self.status.state = State::Failed(e);
                 return Err(e);

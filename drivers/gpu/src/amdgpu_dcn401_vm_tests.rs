@@ -1,5 +1,7 @@
 use super::*;
 use crate::amdgpu_gmc_navi48::DisplayContext;
+#[path = "amdgpu_dcn401_dpp_tests.rs"]
+mod dpp;
 
 const ROOT: u64 = BASE + 0x55b * 4;
 fn config() -> DisplayContext {

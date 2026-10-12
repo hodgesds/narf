@@ -458,6 +458,21 @@ pub async unsafe fn prepare_display_memory(
     unsafe { boot.prepare_display_memory(pipe).await }
 }
 
+/// Stage native RGB processing for the retained full-frame surface.
+/// # Safety
+/// Exclude firmware/FAMS and concurrent display/hub/VM/clock/reset/power writers;
+/// retain the owner and all inherited resources on every outcome.
+pub async unsafe fn prepare_display_dpp(
+    pipe: u8,
+) -> Result<crate::amdgpu_dcn401_otg::DppApplied, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.prepare_display_dpp(pipe).await }
+}
+
 /// Blank one legacy or HPO DisplayPort video stream, retaining timing/link clocks.
 /// # Safety
 /// Stop CPU scanout writers and exclude firmware/FAMS and concurrent display,

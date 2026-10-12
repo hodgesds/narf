@@ -7,6 +7,9 @@ use core::sync::atomic::{fence, Ordering};
 #[path = "amdgpu_dcn401_vm.rs"]
 mod vm;
 pub use vm::MemoryApplied;
+#[path = "amdgpu_dcn401_dpp.rs"]
+mod dpp;
+pub use dpp::DppApplied;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFormat {

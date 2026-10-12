@@ -988,6 +988,32 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Prepare native unscaled RGB processing for the retained full-frame surface.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/hub/VM/clock/reset/power
+    /// writers; retain every owner and inherited resource on every outcome.
+    pub async unsafe fn prepare_display_dpp(
+        &mut self,
+        pipe: u8,
+    ) -> Result<otg::DppApplied, otg::Error> {
+        if self.display_retirement_busy() {
+            return Err(otg::Error::Busy);
+        }
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_dpp(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                )
+                .await
+        }
+    }
     /// Blank one native DP video stream before separate encoder/PHY retirement.
     /// # Safety
     /// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,

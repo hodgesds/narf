@@ -7,6 +7,7 @@ use crate::{
     amdgpu::AmdGpu, amdgpu_dcn401_clk as clocks, amdgpu_dcn401_dccg as dccg,
     amdgpu_discovery as ip, amdgpu_dml::Timing,
 };
+use alloc::boxed::Box;
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
@@ -16,7 +17,8 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 #[path = "amdgpu_dcn401_fetch.rs"]
 mod fetch;
 pub use fetch::{
-    HubpPower, MemoryApplied, PlanesRetired, SurfaceApplied, SurfaceFormat, SurfaceRequest,
+    DppApplied, HubpPower, MemoryApplied, PlanesRetired, SurfaceApplied, SurfaceFormat,
+    SurfaceRequest,
 };
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
@@ -139,6 +141,8 @@ pub enum State {
     SurfacePrepared,
     PreparingMemory(u8),
     MemoryPrepared,
+    PreparingDpp(u8),
+    DppPrepared,
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -155,6 +159,7 @@ impl State {
                 | Self::HubpPowerChanged
                 | Self::SurfacePrepared
                 | Self::MemoryPrepared
+                | Self::DppPrepared
                 | Self::DpBlanked
                 | Self::DpEncoderRetired
                 | Self::DpSstDisabled
@@ -230,6 +235,8 @@ pub struct Status {
     pub surfaces: [Option<SurfaceApplied>; 4],
     /// Historical aperture/VMID0 setup, never fetch or flip completion evidence.
     pub memory: [Option<MemoryApplied>; 4],
+    /// Staged RGB conversion/scaler state, never a latch or scanout proof.
+    pub dpps: [Option<DppApplied>; 4],
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -471,7 +478,9 @@ struct Engine<I: Io> {
     io: I,
     authority: Cap<BusDeviceCap, Write>,
     layout: Layout,
-    status: Status,
+    // Per-pipe historical reports are large. Keep them out of async owner
+    // moves and nested call frames, including the 64 KiB aarch64 boot stack.
+    status: Box<Status>,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -562,6 +571,7 @@ impl<I: Io> Engine<I> {
         request.validate_clock(clock)?;
         self.preflight(request.pipe, false)?;
         self.status.state = State::Preparing(request.pipe);
+        self.status.dpps[usize::from(request.pipe)] = None;
         match self.program(plan).await {
             Ok(()) => {
                 let applied = Applied { request, clock };
@@ -589,6 +599,7 @@ impl<I: Io> Engine<I> {
     async fn retire(&mut self, pipe: u8) -> Result<(), Error> {
         self.preflight(pipe, true)?;
         self.status.state = State::Retiring(pipe);
+        self.status.dpps[usize::from(pipe)] = None;
         match self.disable(pipe).await {
             Ok(()) => {
                 self.status.pipes[usize::from(pipe)] = None;
@@ -621,7 +632,7 @@ impl Otg {
                 io: Mmio(gpu.regs),
                 authority,
                 layout,
-                status: Status {
+                status: Box::new(Status {
                     state: State::Ready,
                     pipes: [None; 4],
                     blanks: [None; 4],
@@ -630,6 +641,7 @@ impl Otg {
                     hubp_power: [None; 4],
                     surfaces: [None; 4],
                     memory: [None; 4],
+                    dpps: [None; 4],
                     dp_blanked: None,
                     dp_encoder_retired: None,
                     dp_sst_disabled: None,
@@ -646,13 +658,13 @@ impl Otg {
                     frl_link_retired: None,
                     frl_disabled: None,
                     retired: 0,
-                },
+                }),
             },
             fetch::Surfaces::new(),
         ))
     }
     pub fn status(&self) -> Status {
-        self.0.status
+        *self.0.status
     }
     /// Prepare disabled fixed-refresh RGB timing against matching current
     /// clocks. No OPP/plane/PHY setup, bandwidth proof or scanout enable.

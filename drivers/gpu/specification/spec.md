@@ -535,7 +535,7 @@ blanking and consumers and issuing the HDP flush. No CPU pointer escapes.
 Bounds errors or stale configuration reject before memory writes; errors after
 writes invalidate the report and quarantine the owner. All operations exclude
 firmware/FAMS and concurrent display/HDP/clock/power writers and retain inherited
-resources. DML2 request/deadline/watermark calculation, DPP/MPC setup, live flips
+resources. DML2 request/deadline/watermark calculation, MPC setup, live flips
 and visible scanout activation remain separate work.
 
 `unsafe Otg::prepare_memory(&mut Gmc, pipe).await` configures DCN's physical
@@ -572,6 +572,50 @@ the display owner without speculative rollback or releasing either allocation.
 Callers retain GMC, the display owner and every inherited resource and exclude
 firmware/FAMS and concurrent hub/VM/display/clock/reset/power writers. Native
 header checks live in `tests/dcn401_vm.c`; physical card validation remains open.
+
+`unsafe Otg::prepare_dpp(&mut ClockManager, &mut Dccg, &mut Gmc, pipe).await`
+stages native DCN401 processing for the retained full-frame XRGB/XBGR8888
+surface. ColdBoot/platform `prepare_display_dpp(pipe)` wrappers borrow the
+matching retained owners after the kernel engine proofs. It requires the same
+surface and DCN VM setup, current readback-checked clocks, matching stopped
+timing and prepared RGB black OPP, and a disconnected, blank, drained HUBP.
+Source and timing active dimensions must match; no scaling, crop, alpha blend
+or multi-pipe composition is accepted. The selected DPP clock must be disabled,
+resets clear, its cursor disabled with no pending update, and inherited CNVC,
+scaler and CM updates complete. Test clocks and forced/manual line-buffer
+power policy are rejected before writes. Other DPP instances stay untouched.
+
+Preparation temporarily enables the native DPP clock (bit 4, no obsolete rate
+divider), wakes scaler LUT and iSHARP memories with bounded asynchronous waits,
+and rechecks stopped consumers after each wait. Native RGB8888 conversion uses
+zero expansion and an identity CNVC crossbar; red/blue selection remains in the
+HUBP. FCNV bias/scale and HDR multiplication are identity, pre-degamma/post-CSC/
+gamma/keying/de-alpha are bypassed, and the encoded RGB values pass through.
+The unused source alpha is not used by the line buffer; future MPC composition
+must select opaque blending. Scaler autocal is disabled, recout begins at zero,
+and recout/MPC dimensions match the surface. Native `SCALING_444_BYPASS` (mode 0)
+still configures a floating-point line buffer; mode 6 full bypass is not used.
+Line-buffer configurations 1, 2, then 0 are selected using native capacities
+970, 1290, 3430 and `ceil(width/6)` entries per row, requiring two rows for unity
+scaling. Widths above 10290 reject as unsupported on this single-pipe path.
+Adaptive filtering and iSHARP are disabled without programming coefficient RAM.
+
+Final checks require DPP clock-off, unchanged live owners/surface/timing/VM,
+stopped consumers and full DPP register readback. `DppApplied` records the
+surface, timing, line-buffer configuration and CNVC/scaler/CM pending bits in
+`Status::dpps[pipe]`; success enters reusable `DppPrepared`. Double-buffered
+changes can remain pending while timing is stopped, and no latch/presentation
+completion is inferred. The owner heap-allocates its accumulated status to keep
+per-pipe reports out of nested driver and async owner-move stack frames; the
+public status accessor still returns a historical snapshot by value.
+Repeated preparation rejects while its report exists;
+timing preparation/retirement, HUBP power transitions and global VM preparation
+invalidate dependent reports. Errors enter `Failed`; cancellation retains
+`PreparingDpp(pipe)`, blocking replay/clock changes without speculative rollback.
+All owners and allocations remain retained. Callers exclude firmware/FAMS and
+concurrent display/hub/VM/clock/reset/power writers. `tests/dcn401_dpp.c` checks
+the native header contract. MPC composition, bandwidth/request/deadline setup,
+scanout activation and physical-card validation remain required.
 
 `unsafe Otg::blank_dp_stream(DpStream::{Dio,Hpo}(instance)).await` blanks one
 of the four native legacy or four HPO DisplayPort stream encoders. Stream

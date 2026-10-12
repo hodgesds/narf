@@ -350,8 +350,15 @@ It uses the owned physical VRAM page-table root, disables AGP, waits for native
 context readiness, and configures the selected blank HUBP's system aperture
 and L1 translation. All scanout backing stays owned; lost writes, revocation,
 timeouts, changed geometry and cancellation cannot report readiness. Fetch
-remains stopped. Bandwidth/deadline/watermark programming, DPP/MPC composition,
-visible framebuffer activation and physical-card validation remain open.
+remains stopped.
+Native DCN4 DPP preparation now stages unscaled full-frame RGB conversion,
+identity color processing and the unity-scaling line buffer against retained
+surface, VM, clock and timing owners. Scaler/iSHARP memory wake waits are bounded;
+pending double-buffer updates are recorded without claiming a latch. DPP clock
+and HUBP fetch remain disabled and MPC stays detached. Lost writes, revoked
+authority, stale configuration and cancellation quarantine the owner. Native
+bandwidth/deadline/watermark programming, MPC composition, visible framebuffer
+activation and physical-card validation remain open.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

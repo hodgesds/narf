@@ -46,6 +46,7 @@ impl Surfaces {
         }
         engine.status.state = State::PreparingMemory(pipe);
         engine.status.memory = [None; 4]; // global aperture/context will change
+        engine.status.dpps = [None; 4];
         let result = engine.program_memory(pipe, config).await;
         let result = result.and_then(|()| {
             if context()? != config {
@@ -149,7 +150,7 @@ impl<I: Io> Engine<I> {
         self.update(l.hubp(pipe, HUBP_CLOCK), 1, 0)?;
         Ok(())
     }
-    fn verify_memory(&mut self, pipe: u8, config: DisplayContext) -> Result<(), Error> {
+    pub(super) fn verify_memory(&mut self, pipe: u8, config: DisplayContext) -> Result<(), Error> {
         let l = self.layout;
         for (at, mask, value) in global_registers(config)
             .map(|(r, m, v)| (l.base + r * 4, m, v))

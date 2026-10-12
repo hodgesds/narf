@@ -325,7 +325,7 @@ fn engine() -> Engine<Fake> {
         },
         authority: Cap::bootstrap(),
         layout: Layout::resolve(&gpu).unwrap(),
-        status: Status {
+        status: Box::new(Status {
             state: State::Ready,
             pipes: [None; 4],
             blanks: [None; 4],
@@ -334,6 +334,7 @@ fn engine() -> Engine<Fake> {
             hubp_power: [None; 4],
             surfaces: [None; 4],
             memory: [None; 4],
+            dpps: [None; 4],
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,
@@ -350,7 +351,7 @@ fn engine() -> Engine<Fake> {
             frl_link_retired: None,
             frl_disabled: None,
             retired: 0,
-        },
+        }),
     }
 }
 fn request(pipe: u8) -> Request {
