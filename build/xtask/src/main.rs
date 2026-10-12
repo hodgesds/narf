@@ -437,6 +437,13 @@ struct BuildArgs {
     #[arg(long, value_enum, default_value_t = HwProfile::Full)]
     hw_profile: HwProfile,
 
+    /// Host PCI functions to attach to an x86_64 QEMU guest through VFIO.
+    /// Repeat for every function in the device's IOMMU group (for example,
+    /// a GPU and its HDMI-audio function). The host must already have bound
+    /// each function to vfio-pci; xtask checks but never rebinds hardware.
+    #[arg(long = "passthrough-device", value_name = "BDF")]
+    passthrough_devices: Vec<passthrough::Bdf>,
+
     /// Glob patterns (relative to target/firmware/) for blobs to pack
     /// into the initramfs CPIO. Only firmware matching at least one
     /// glob goes into the initramfs; everything else stages onto the
@@ -582,7 +589,7 @@ pub enum GpuBackend {
     Virgl,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
 enum Arch {
     #[value(name = "x86_64")]
     X86_64,
@@ -712,6 +719,33 @@ mod gpu_backend_tests {
         assert_eq!(
             qemu_display_arg("gtk,grab-on-hover=off", GpuBackend::Virtio2d),
             "gtk,grab-on-hover=off"
+        );
+    }
+
+    #[test]
+    fn passthrough_devices_are_repeatable_typed_boot_options() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "run",
+            "--passthrough-device",
+            "03:00.0",
+            "--passthrough-device",
+            "0000:03:00.1",
+        ])
+        .expect("valid PCI functions must parse");
+        let Cmd::Run(args) = cli.cmd else {
+            panic!("run subcommand parsed as another variant");
+        };
+        assert_eq!(
+            args.passthrough_devices,
+            [
+                passthrough::Bdf("0000:03:00.0".into()),
+                passthrough::Bdf("0000:03:00.1".into()),
+            ]
+        );
+
+        assert!(
+            Cli::try_parse_from(["xtask", "run", "--passthrough-device", "not-a-bdf"]).is_err()
         );
     }
 }
@@ -3371,6 +3405,75 @@ fn run_cmd(args: &BuildArgs) -> Result<()> {
     run_cmd_inner(args, false)
 }
 
+/// Validate a requested VFIO assignment and return the exact QEMU argv
+/// entries used to attach it. Host-driver rebinding is deliberately outside
+/// xtask: detaching a live display adapter is an administrator decision.
+fn passthrough_qemu_args(args: &BuildArgs) -> Result<Vec<String>> {
+    use passthrough::{explain, note, preflight};
+
+    let devices = &args.passthrough_devices;
+    if devices.is_empty() {
+        return Ok(Vec::new());
+    }
+    if args.arch != Arch::X86_64 {
+        bail!("--passthrough-device is currently supported only for x86_64 QEMU boots");
+    }
+    if let Some(duplicate) = devices
+        .iter()
+        .enumerate()
+        .find_map(|(index, device)| devices[..index].contains(device).then_some(device))
+    {
+        bail!(
+            "--passthrough-device {} was supplied more than once",
+            duplicate.0
+        );
+    }
+    if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
+        if accel.split(',').next() != Some("kvm") {
+            bail!(
+                "--passthrough-device requires KVM, but XTASK_QEMU_ACCEL={accel:?}; use `kvm` or unset the override"
+            );
+        }
+    }
+
+    let pf = preflight(devices);
+    print!("{}", pf.report);
+    std::io::stdout()
+        .flush()
+        .context("flushing PCI passthrough preflight report")?;
+    for advisory in &pf.advisories {
+        println!("\nnote: {}", note(advisory));
+    }
+    if !pf.blockers.is_empty() {
+        for blocker in &pf.blockers {
+            eprintln!("\nblocked: {}", explain(blocker));
+        }
+        bail!(
+            "{} PCI passthrough blocker(s) — QEMU was not started",
+            pf.blockers.len()
+        );
+    }
+
+    println!(
+        "xtask: PCI passthrough preflight passed; attaching {}",
+        devices
+            .iter()
+            .map(|device| device.0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(passthrough::qemu_args(devices))
+}
+
+fn qemu_boot_args(args: &BuildArgs, kernel: &Path) -> Result<Vec<String>> {
+    let vfio_args = passthrough_qemu_args(args)?;
+    let mut qemu_args =
+        args.arch
+            .qemu_args(kernel, &args.display, args.hw_profile, args.gpu_backend);
+    qemu_args.extend(vfio_args);
+    Ok(qemu_args)
+}
+
 /// Emit enough serial context to diagnose a failed gate without flooding the
 /// terminal with an entire multi-thousand-line boot transcript.
 fn emit_serial_tail(serial: &[u8]) {
@@ -3479,10 +3582,7 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        args.arch
-            .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
-    );
+    cmd.args(qemu_boot_args(args, &kernel)?);
     // Kernel-test boots are extremely verbose. Capture their serial stream so
     // a passing gate prints only its summary; retain a bounded diagnostic tail
     // for failures and timeouts. Interactive `run` keeps streaming normally.
@@ -3576,8 +3676,8 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             emit_serial_tail(&serial);
             bail!(
                 "xtask test: kernel-test suite reported failures — QEMU exited \
-                 {:?} (all-pass is {:?} on {}). See the `── summary` / `── failing \
-                 tests ──` lines above.",
+                 with {status} (status code {:?}; all-pass is {:?} on {}). See the \
+                 `── summary` / `── failing tests ──` lines above.",
                 status.code(),
                 expected,
                 args.arch.triple(),
@@ -3724,10 +3824,7 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        args.arch
-            .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
-    );
+    cmd.args(qemu_boot_args(&args, &kernel)?);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
 
@@ -3945,10 +4042,7 @@ fn systemd_pid1_cmd(args: &BuildArgs) -> Result<()> {
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        args.arch
-            .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
-    );
+    cmd.args(qemu_boot_args(&args, &kernel)?);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
 
@@ -5005,10 +5099,7 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
         match run_interactive_boot(
             &kernel,
             cpio_path.as_ref(),
-            args.build.arch,
-            &args.build.display,
-            args.build.hw_profile,
-            args.build.gpu_backend,
+            &args.build,
             &args.cmd,
             &args.expect,
         ) {
@@ -5026,14 +5117,10 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 /// `expect` appears on the serial console. One attempt; the caller retries.
 /// Returns the full captured serial transcript so callers that measure
 /// (stress-bench) can parse guest-printed metrics out of it.
-#[allow(clippy::too_many_arguments)]
 fn run_interactive_boot(
     kernel: &Path,
     cpio_path: Option<&PathBuf>,
-    arch: Arch,
-    display: &str,
-    hw_profile: HwProfile,
-    gpu_backend: GpuBackend,
+    build: &BuildArgs,
     typed_cmd: &str,
     expect: &str,
 ) -> Result<String> {
@@ -5041,9 +5128,9 @@ fn run_interactive_boot(
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
 
-    let qemu = arch.qemu_bin();
+    let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    let mut qemu_args = arch.qemu_args(kernel, display, hw_profile, gpu_backend);
+    let mut qemu_args = qemu_boot_args(build, kernel)?;
     if let Some(cpio) = cpio_path {
         qemu_args.push("-initrd".into());
         qemu_args.push(cpio.display().to_string());
@@ -5636,11 +5723,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        build
-            .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
-    );
+    cmd.args(qemu_boot_args(&build, &kernel)?);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -6010,11 +6093,7 @@ fn redis_smoke_cmd(args: &BuildArgs) -> Result<()> {
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        build
-            .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
-    );
+    cmd.args(qemu_boot_args(&build, &kernel)?);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -6633,11 +6712,7 @@ fn boot_narf_redis(
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        build
-            .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
-    );
+    cmd.args(qemu_boot_args(&build, &kernel)?);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -7460,11 +7535,7 @@ fn boot_narf_mt_echo(
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        build
-            .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
-    );
+    cmd.args(qemu_boot_args(&build, &kernel)?);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -8195,16 +8266,8 @@ fn stress_bench_cmd(args: &BuildArgs) -> Result<()> {
     } else {
         format!("chroot_run /bin/busybox sh /sweep.sh {dur} {workers} {list}")
     };
-    let narf_serial = run_interactive_boot(
-        &kernel,
-        cpio_path.as_ref(),
-        build.arch,
-        &build.display,
-        build.hw_profile,
-        build.gpu_backend,
-        &typed,
-        "SWEEP-DONE",
-    )?;
+    let narf_serial =
+        run_interactive_boot(&kernel, cpio_path.as_ref(), &build, &typed, "SWEEP-DONE")?;
     let narf = parse_stress_metrics(&narf_serial);
     if narf.is_empty() {
         bail!(
@@ -8370,11 +8433,7 @@ fn run_interactive_multi(
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        build
-            .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
-    );
+    cmd.args(qemu_boot_args(&build, &kernel)?);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -9899,6 +9958,8 @@ menuentry "NARF" {
 /// that lets the kernel exercise the UEFI handoff path end-to-end
 /// (the same path real consumer hardware takes).
 fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
+    let vfio_args = passthrough_qemu_args(args)?;
+    let have_vfio = !vfio_args.is_empty();
     if matches!(args.arch, Arch::Aarch64) {
         return aarch64_uefi_boot_cmd(args);
     }
@@ -9978,7 +10039,19 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
     // on real silicon" bugs (missing NXE / Invariant TSC / SMEP
     // enable etc.) without the burn-and-pray loop.
     let cpu = std::env::var("XTASK_CPU").unwrap_or_else(|_| "max".into());
+    let cpu = if have_vfio {
+        Arch::clamp_cpu_phys_bits(cpu)
+    } else {
+        cpu
+    };
     cmd.arg("-cpu").arg(&cpu);
+    if have_vfio {
+        // Unlike the normal `-kernel` path, this hand-built OVMF command
+        // historically relied on QEMU's TCG default. VFIO cannot run under
+        // TCG, so an assigned device makes KVM explicit.
+        cmd.arg("-accel")
+            .arg(std::env::var("XTASK_QEMU_ACCEL").unwrap_or_else(|_| "kvm".into()));
+    }
     // Default -smp 8 so iso-boot exercises the multi-core AP
     // bring-up path; bumping past 2 catches AP-side bugs that
     // single-socket-dual-core misses (APIC-id gaps, init-order
@@ -10028,6 +10101,7 @@ fn iso_boot_cmd(args: &BuildArgs) -> Result<()> {
             .arg("-device")
             .arg("virtio-blk-pci,drive=vblk0,disable-legacy=on,disable-modern=off");
     }
+    cmd.args(vfio_args);
 
     println!(
         "xtask iso-boot: launching qemu-system-x86_64 with ISO {}",
@@ -11515,23 +11589,18 @@ struct PassthroughArgs {
     /// each function — an AMD GPU is normally two, the GPU and its HD-audio
     /// function.
     #[arg(long = "device", short = 'd', required = true)]
-    devices: Vec<String>,
+    devices: Vec<passthrough::Bdf>,
 }
 
 /// `cargo xtask passthrough -d 03:00.0 -d 03:00.1`
 fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
-    use passthrough::{explain, note, preflight, qemu_fragment, Bdf};
+    use passthrough::{explain, note, preflight, qemu_fragment};
 
-    let mut devices = Vec::new();
-    for raw in &args.devices {
-        match Bdf::parse(raw) {
-            Some(b) => devices.push(b),
-            None => bail!("{raw:?} is not a PCI address; expected 03:00.0 or 0000:03:00.0"),
-        }
-    }
-
-    let pf = preflight(&devices);
+    let pf = preflight(&args.devices);
     print!("{}", pf.report);
+    std::io::stdout()
+        .flush()
+        .context("flushing PCI passthrough preflight report")?;
 
     for a in &pf.advisories {
         println!("\nnote: {}", note(a));
@@ -11546,21 +11615,20 @@ fn passthrough_cmd(args: &PassthroughArgs) -> Result<()> {
         );
     }
 
-    // The launch. `XTASK_QEMU_ACCEL` and `NARF_QEMU_EXTRA` are the existing
-    // hooks in `Arch::qemu_args`; passthrough needs no new plumbing, only
-    // the right values, so the recipe uses them rather than adding a third
-    // way to reach the same arguments.
-    //
     // `phys-bits=40` is already applied to `-cpu max` by
     // `Arch::clamp_cpu_phys_bits`, and it is what keeps the q35 64-bit PCI
     // hole — and so the card's BARs — inside the window NARF maps. Do not
     // override `NARF_QEMU_CPU` with a wider width here.
+    let cli_devices = args
+        .devices
+        .iter()
+        .map(|device| format!("--passthrough-device {}", device.0))
+        .collect::<Vec<_>>()
+        .join(" ");
     println!(
-        "\nhost is ready. Launch with:\n\n  \
-         XTASK_QEMU_ACCEL=kvm \\\n    \
-         NARF_QEMU_EXTRA={:?} \\\n    \
-         cargo xtask run\n",
-        qemu_fragment(&devices)
+        "\nhost is ready. Launch with:\n\n  cargo xtask run --arch=x86_64 {cli_devices}\n\n\
+         Equivalent QEMU arguments: {}\n",
+        qemu_fragment(&args.devices)
     );
     println!(
         "Leave NARF_QEMU_CPU unset: the default `max` is clamped to phys-bits=40,\n\

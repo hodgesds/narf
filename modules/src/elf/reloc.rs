@@ -67,6 +67,7 @@ pub const R_AARCH64_PREL64: u32 = 260;
 pub const R_AARCH64_PREL32: u32 = 261;
 pub const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
 pub const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+pub const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
 pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 pub const R_AARCH64_JUMP26: u32 = 282;
 pub const R_AARCH64_CALL26: u32 = 283;
@@ -311,11 +312,21 @@ pub fn apply_aarch64(
             let new = (cur & !(0xFFFF << 5)) | (imm << 5);
             write_u32(dest, loc, new)
         }
+        R_AARCH64_LDST32_ABS_LO12_NC => {
+            // 12-bit low slot, scaled by 4 for LDR/STR (32-bit).
+            // LLVM emits this for accesses to AtomicU32-backed module
+            // globals; the e1000 module is the first real fixture to carry
+            // the form. `_NC` deliberately discards the low alignment bits.
+            let imm = ((val & 0xFFF) >> 2) as u32;
+            let cur = read_u32_in(dest, loc)?;
+            let new = (cur & !(0xFFF << 10)) | (imm << 10);
+            write_u32(dest, loc, new)
+        }
         R_AARCH64_LDST64_ABS_LO12_NC => {
             // 12-bit low slot, scaled by 8 for LDR/STR (64-bit).
             let imm = ((val & 0xFFF) >> 3) as u32;
             let cur = read_u32_in(dest, loc)?;
-            let new = (cur & !(0x1FF << 10)) | (imm << 10);
+            let new = (cur & !(0xFFF << 10)) | (imm << 10);
             write_u32(dest, loc, new)
         }
         other => Err(RelocError::UnsupportedType(other)),

@@ -33,6 +33,14 @@ and CI compiler-cache integration.
 - `cargo xtask run --arch=x86_64 [--release]` — build + QEMU boot. Optimized
   builds strip debug-only ELF sections by default while retaining ordinary
   symbols; `--debug` retains full debuginfo for GDB and crash diagnosis.
+- `cargo xtask run --arch=x86_64 --passthrough-device 03:00.0
+  --passthrough-device 03:00.1` — attach host PCI functions to the guest with
+  QEMU `vfio-pci`. The repeatable option is an xtask/QEMU boot option, not a
+  guest kernel command-line parameter. Before launch, xtask requires KVM,
+  active host IOMMU groups, every requested endpoint bound to `vfio-pci`,
+  complete IOMMU-group assignment, and BAR sizes compatible with NARF's mapped
+  physical windows. It never unbinds or rebinds host hardware. PCI passthrough
+  is currently x86_64-only.
 - `cargo xtask run --arch=x86_64 --gpu-backend=virgl --display=gtk,gl=on`
   — opt into QEMU's OpenGL-backed virtio-gpu device. The default remains
   `--gpu-backend=auto`: graphical runs prefer VirGL when QEMU advertises the
@@ -98,8 +106,10 @@ and CI compiler-cache integration.
   interoperability postflight; the default remains the full two-phase gate.
 - Successful kernel-test and boot-smoke QEMU phases keep serial output
   captured and print concise summaries. A failure or timeout emits a bounded
-  64-KiB diagnostic tail. Child timeouts use polling rather than process-wide
-  signal handlers, so sandboxed runners remain supported.
+  64-KiB diagnostic tail. Abnormal emulator termination is reported with the
+  platform exit-status description (including the Unix signal when present),
+  not only the optional numeric exit code. Child timeouts use polling rather
+  than process-wide signal handlers, so sandboxed runners remain supported.
 - `cargo xtask boot-smoke --arch=<arch>` accepts success only when the guest
   emits its clean-exit marker and QEMU then exits naturally with status zero
   through ACPI S5 on x86_64 or PSCI `SYSTEM_OFF` on aarch64. The x86
