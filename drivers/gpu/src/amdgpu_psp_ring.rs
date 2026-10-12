@@ -678,7 +678,7 @@ impl Psp {
         &mut self,
         firmware: &crate::amdgpu_psp_boot::Firmware,
     ) -> Result<(), Error> {
-        if self.kind != Kind::Navi22 {
+        if self.kind != Kind::Navi22 || !firmware.is_navi22() {
             return Err(Error::Unsupported);
         }
         let image = firmware.image().map_err(|_| Error::Invalid)?;

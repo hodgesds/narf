@@ -268,6 +268,19 @@ interfaces and limits.
 
 ## Current work
 
+The `feat/amdgpu-navi48-bringup` branch starts RX 9070 XT / Navi48 support
+from the Navi22 work below. The September 2026 Steam PC survey identifies it
+as the leading named AMD card (1.42%). PCI ID `1002:7550` now has a distinct
+RDNA4 family, discovery-checked DRM identity, bounded PCIe VRAM accounting
+and an SMUIO14.0.2 ROM snapshot path. Legacy firmware/engine/display and
+APU power paths reject this generation before accessing hardware. An explicit
+PSP14 SOS bootstrap now validates the descriptor-based signed containers,
+pins firmware to the discovered PSP revision, uploads all boot components
+in Linux's order and retains published staging memory on cancellation or
+failure. It requires caller-owned, trained VRAM. Production VRAM planning,
+PSP14 GPCOM/TMR, SMU14 lifecycle, GMC12/SDMA7 queues, DCN4 native modeset
+and physical-card validation remain open.
+
 Current main includes discrete PCIe probe support
 for RX 6750 XT / Navi 22: bounded discovery reads beyond BAR0, separate total
 and CPU-visible VRAM sizes, Resizable BAR-independent APU identity, and the

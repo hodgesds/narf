@@ -495,6 +495,8 @@ fn psp_navi22_constructor_uses_gmc10_and_exact_ip_banks() -> TestResult {
         return TestResult::Fail("GC status used the wrong discovery base index");
     }
     if run(psp.setup_tmr(&[])) != Err(Error::Unsupported)
+        || run(psp.setup_tmr_navi22(&crate::amdgpu_psp_boot::tests::firmware14()))
+            != Err(Error::Unsupported)
         || run(psp.load_dmub(&[1])) != Err(Error::Unsupported)
         || regs != before
     {

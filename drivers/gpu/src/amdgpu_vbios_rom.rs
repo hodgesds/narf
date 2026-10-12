@@ -1,5 +1,5 @@
-//! Navi22 ROM-register fallback, following amdgpu_soc15_read_bios_from_rom
-//! and smuio_v11_0.c. Reads leave the ROM_INDEX latch unchanged; no PCI ROM
+//! Navi22/Navi48 ROM-register fallback, following amdgpu_soc15_read_bios_from_rom
+//! and smuio_v11_0.c / smuio_v14_0_2.c. Reads leave the ROM_INDEX latch unchanged; no PCI ROM
 //! decode, reset, flash programming or ATOM execution is involved.
 use super::*;
 
@@ -17,7 +17,7 @@ struct Mmio {
 }
 impl Io for Mmio {
     fn read_index(&mut self) -> u32 {
-        // SAFETY: exact SMUIO11 bank bounded through DATA at construction.
+        // SAFETY: exact SMUIO bank bounded through DATA at construction.
         unsafe { self.regs.read32(self.base + INDEX as u64 * 4) }
     }
     fn write_index(&mut self, value: u32) {
@@ -86,11 +86,21 @@ fn read(
 fn bank(gpu: &AmdGpu, device: &BusDevice) -> Result<u64, Error> {
     use crate::{amdgpu, amdgpu_discovery as ip, amdgpu_psp_ring::bank};
     if gpu.chip.vid != amdgpu::AMD_VENDOR
-        || gpu.chip.did != amdgpu::NAVI22
         || device.id.vendor != gpu.chip.vid
         || device.id.device != gpu.chip.did
         || !matches!(device.addr, BusAddr::Pcie(_))
     {
+        return Err(Error::Unsupported);
+    }
+    if gpu.chip.did == amdgpu::NAVI48 {
+        bank(gpu, ip::HW_ID_GC, &[(12, 0, 1)], 0, 0).map_err(|_| Error::Unsupported)?;
+        // nbio_v7_7 has no get_rom_offset override. SMUIO14.0.2 uses the
+        // same two port offsets, at base index zero; no other SMUIO14
+        // revision is admitted by this profile.
+        bank(gpu, ip::HW_ID_NBIF, &[(7, 7, 0), (7, 7, 1)], 0, 0).map_err(|_| Error::Unsupported)?;
+        return bank(gpu, ip::HW_ID_SMUIO, &[(14, 0, 2)], 0, DATA).map_err(|_| Error::Unsupported);
+    }
+    if gpu.chip.did != amdgpu::NAVI22 {
         return Err(Error::Unsupported);
     }
     bank(gpu, ip::HW_ID_GC, &[(10, 3, 2)], 0, 0).map_err(|_| Error::Unsupported)?;
@@ -130,7 +140,7 @@ fn bank(gpu: &AmdGpu, device: &BusDevice) -> Result<u64, Error> {
 /// # Safety
 /// Caller owns this physical GPU's permanent register mapping and ROM index
 /// latch exclusively throughout the read; no reset, power or flash operations.
-pub(super) unsafe fn read_navi22(
+pub(super) unsafe fn read_discrete(
     gpu: &AmdGpu,
     device: &BusDevice,
     cap: &Cap<BusDeviceCap, Write>,

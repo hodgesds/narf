@@ -75,6 +75,15 @@ fn family_id(snap: &Snapshot) -> Option<u32> {
             let gc = amdgpu_discovery::find_ip(&snap.ip_blocks, amdgpu_discovery::HW_ID_GC, 0)?;
             ((gc.major, gc.minor, gc.revision) == (10, 3, 2)).then_some(uapi::AMDGPU_FAMILY_NV)
         }
+        Family::Navi4 if snap.did == u32::from(crate::amdgpu::NAVI48) => {
+            let mut blocks = snap
+                .ip_blocks
+                .iter()
+                .filter(|b| b.hw_id == amdgpu_discovery::HW_ID_GC && b.instance == 0);
+            let gc = blocks.next()?;
+            (blocks.next().is_none() && (gc.major, gc.minor, gc.revision) == (12, 0, 1))
+                .then_some(uapi::AMDGPU_FAMILY_GC_12_0_0)
+        }
         // Anything else has had no bring-up; refusing is better than naming a
         // family whose userspace path we have not exercised.
         _ => None,
@@ -163,7 +172,8 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
     // The shader geometry is not guessable. Refusing is better than reporting
     // a topology that would mis-compile shaders.
     let gc = snap.gc.ok_or(FsError::InvalidData)?;
-    // Navi 22's gmc_v10_0_sw_init and gmc_v11_0_sw_init use the same
+    // Navi 22's gmc_v10_0_sw_init, gmc_v11_0_sw_init and Navi48's
+    // gmc_v12_0_sw_init (GC 12.0.1) use the same
     // amdgpu_vm_adjust_size(256 * 1024, 9, 3, 48) geometry. Reusing these
     // address limits does not enable the GMC11 hardware programming path.
     let va = crate::amdgpu_vm::Geometry::GMC11.va_info();
@@ -173,7 +183,15 @@ fn dev_info(snap: &Snapshot) -> Result<Vec<u8>, FsError> {
         family,
         num_shader_engines: gc.num_se,
         num_shader_arrays_per_engine: gc.num_sa_per_se,
-        cu_active_number: gc.total_cus(),
+        // Navi48 shares a PCI ID across harvested SKUs. Discovery provides
+        // maxima; gfx_v12_0_get_cu_info reads INACTIVE_WGPS to count enabled
+        // CUs. Until that owner runs, report unknown (zero), as for the empty
+        // CU bitmap, instead of presenting the maximum as a fused-on count.
+        cu_active_number: if snap.family == Family::Navi4 {
+            0
+        } else {
+            gc.total_cus()
+        },
         num_rb_pipes: gc.num_rb_per_se.saturating_mul(gc.num_se),
         num_hw_gfx_contexts: GFX_HW_CONTEXTS,
         // FUSION means the GPU shares the CPU's memory — an APU. It used to

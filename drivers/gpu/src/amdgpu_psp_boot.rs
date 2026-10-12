@@ -1,10 +1,10 @@
-//! Navi 22 / PSP 11.0.11 secure-OS bootstrap. Protocol follows Linux
-//! `psp_v11_0.c`: C2PMSG35 command/status, C2PMSG36 GPU address in MiB,
+//! Navi22/PSP11 and Navi48/PSP14 secure-OS bootstrap. Protocol follows Linux
+//! `psp_v11_0.c` and `psp_v14_0.c`: C2PMSG35 command/status, C2PMSG36 GPU address in MiB,
 //! C2PMSG81 SOS heartbeat, all at MP0 base index **0** (not PSP13's index 1).
 //! This requires initialized VRAM; it does not perform memory training,
 //! create a GPCOM ring, allocate a TMR, or load graphics/SMC firmware.
 use crate::{
-    amdgpu::{AmdGpu, AMD_VENDOR, NAVI22},
+    amdgpu::{AmdGpu, AMD_VENDOR, NAVI22, NAVI48},
     amdgpu_discovery as discovery,
     amdgpu_psp_firmware::{self as firmware, Component, Image, STAGING_SIZE},
     amdgpu_vram::{Pool, Reservation},
@@ -44,22 +44,45 @@ pub enum State {
 #[derive(Debug)]
 pub struct Firmware {
     bytes: Vec<u8>,
+    target: Target,
 }
-struct OpenFirmware;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Target {
+    Navi22,
+    Psp14_0_2,
+    Psp14_0_3,
+}
+impl Target {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Navi22 => firmware::NAVI22_SOS,
+            Self::Psp14_0_2 => firmware::PSP14_0_2_SOS,
+            Self::Psp14_0_3 => firmware::PSP14_0_3_SOS,
+        }
+    }
+    fn parse(self, bytes: &[u8]) -> Result<Image<'_>, Error> {
+        match self {
+            Self::Navi22 => Image::parse(bytes),
+            Self::Psp14_0_2 | Self::Psp14_0_3 => Image::parse_psp14(bytes),
+        }
+        .map_err(Error::Image)
+    }
+}
+struct OpenFirmware(Target);
 impl CapOp<narf_firmware::FirmwareRegistry, Read> for OpenFirmware {
     type Output = Result<Vec<u8>, Error>;
     fn execute(
         self,
         cap: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self::Output, CapError> {
-        let blob = match narf_firmware::open(firmware::NAVI22_SOS, cap) {
+        let blob = match narf_firmware::open(self.0.name(), cap) {
             Ok(blob) => blob,
             Err(error) => return Ok(Err(Error::Registry(error))),
         };
-        blob.invoke(CopyFirmware)
+        blob.invoke(CopyFirmware(self.0))
     }
 }
-struct CopyFirmware;
+struct CopyFirmware(Target);
 impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyFirmware {
     type Output = Result<Vec<u8>, Error>;
     fn execute(
@@ -68,7 +91,7 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyFirmware {
     ) -> Result<Self::Output, CapError> {
         Ok((|| {
             let view = narf_firmware::view_of(cap).map_err(Error::Registry)?;
-            Image::parse(view.bytes).map_err(Error::Image)?;
+            self.0.parse(view.bytes)?;
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(view.bytes.len())
@@ -78,8 +101,8 @@ impl CapOp<narf_firmware::FirmwareBlob, Read> for CopyFirmware {
         })())
     }
 }
-fn mp0_bank(gpu: &AmdGpu) -> Result<u64, Error> {
-    if gpu.chip.vid != AMD_VENDOR || gpu.chip.did != NAVI22 {
+fn profile(gpu: &AmdGpu) -> Result<(Target, u64), Error> {
+    if gpu.chip.vid != AMD_VENDOR {
         return Err(Error::Unsupported);
     }
     let mut gc = gpu
@@ -87,30 +110,53 @@ fn mp0_bank(gpu: &AmdGpu) -> Result<u64, Error> {
         .iter()
         .filter(|ip| ip.hw_id == discovery::HW_ID_GC && ip.instance == 0);
     let ip = gc.next().ok_or(Error::Unsupported)?;
-    if gc.next().is_some() || (ip.major, ip.minor, ip.revision) != (10, 3, 2) {
+    if gc.next().is_some() {
         return Err(Error::Unsupported);
     }
-    crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_MP0, &[(11, 0, 11)], 0, SOS).map_err(
+    let versions: &[(u8, u8, u8)] = match (gpu.chip.did, ip.major, ip.minor, ip.revision) {
+        (NAVI22, 10, 3, 2) => &[(11, 0, 11)],
+        (NAVI48, 12, 0, 1) => &[(14, 0, 2), (14, 0, 3)],
+        _ => return Err(Error::Unsupported),
+    };
+    // bank rejects duplicate MP0 instances and checks the entire mailbox span.
+    let base = crate::amdgpu_psp_ring::bank(gpu, discovery::HW_ID_MP0, versions, 0, SOS).map_err(
         |error| match error {
             crate::amdgpu_psp_ring::Error::Invalid => Error::Invalid,
             _ => Error::Unsupported,
         },
-    )
+    )?;
+    let mp0 =
+        discovery::find_ip(&gpu.ip_blocks, discovery::HW_ID_MP0, 0).ok_or(Error::Unsupported)?;
+    let target = match (mp0.major, mp0.minor, mp0.revision) {
+        (11, 0, 11) => Target::Navi22,
+        (14, 0, 2) => Target::Psp14_0_2,
+        (14, 0, 3) => Target::Psp14_0_3,
+        _ => return Err(Error::Unsupported),
+    };
+    Ok((target, base))
+}
+#[cfg(feature = "kernel-test")]
+fn mp0_bank(gpu: &AmdGpu) -> Result<u64, Error> {
+    profile(gpu).map(|(_, base)| base)
 }
 impl Firmware {
+    pub(crate) fn is_navi22(&self) -> bool {
+        self.target == Target::Navi22
+    }
     pub fn open(
         gpu: &AmdGpu,
         authority: &Cap<narf_firmware::FirmwareRegistry, Read>,
     ) -> Result<Self, Error> {
-        mp0_bank(gpu)?;
+        let (target, _) = profile(gpu)?;
         Ok(Self {
+            target,
             bytes: authority
-                .invoke(OpenFirmware)
+                .invoke(OpenFirmware(target))
                 .map_err(|_| Error::Revoked)??,
         })
     }
     pub fn image(&self) -> Result<Image<'_>, Error> {
-        Image::parse(&self.bytes).map_err(Error::Image)
+        self.target.parse(&self.bytes)
     }
 }
 
@@ -135,7 +181,7 @@ struct Mmio {
 }
 impl Io for Mmio {
     fn read(&mut self, reg: u32) -> u32 {
-        // SAFETY: constructor bounds the exact PSP11 MP0 window.
+        // SAFETY: constructor bounds the exact PSP11/PSP14 MP0 window.
         unsafe { self.regs.read32(self.base + u64::from(reg) * 4) }
     }
     fn write(&mut self, reg: u32, value: u32) {
@@ -276,6 +322,7 @@ impl<I: Io> Engine<I> {
 #[derive(Debug)]
 pub struct Bootloader {
     engine: Engine<Mmio>,
+    target: Target,
 }
 impl Bootloader {
     /// Reserve a 1 MiB staging BO at a 1 MiB-aligned **GPU** address. No hardware
@@ -294,7 +341,7 @@ impl Bootloader {
         authority: Cap<BusDeviceCap, Write>,
         pool: &Pool,
     ) -> Result<Self, Error> {
-        let base = mp0_bank(gpu)?;
+        let (target, base) = profile(gpu)?;
         let map = pool.mapping();
         let offset = map
             .phys
@@ -312,6 +359,7 @@ impl Bootloader {
             .reserve_aligned(STAGING_SIZE as u64, STAGING_SIZE as u64)
             .map_err(|_| Error::Allocation)?;
         Ok(Self {
+            target,
             engine: Engine {
                 io: Mmio {
                     regs: gpu.regs,
@@ -331,6 +379,9 @@ impl Bootloader {
     /// A dropped future leaves Loading and cannot be retried through this object.
     /// Success proves SOS liveness only; it does not set `AmdGpu::fw_loaded`.
     pub async fn load(&mut self, firmware: &Firmware) -> Result<(), Error> {
+        if firmware.target != self.target {
+            return Err(Error::Unsupported);
+        }
         self.engine.load(&firmware.image()?).await
     }
 }

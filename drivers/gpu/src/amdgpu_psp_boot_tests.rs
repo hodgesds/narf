@@ -12,6 +12,7 @@ fn put(bytes: &mut [u8], offset: usize, value: u32) {
 pub(crate) fn firmware() -> Firmware {
     Firmware {
         bytes: container(3),
+        target: Target::Navi22,
     }
 }
 fn container(minor: u16) -> Vec<u8> {
@@ -53,6 +54,271 @@ fn container(minor: u16) -> Vec<u8> {
     }
     bytes
 }
+fn container14() -> Vec<u8> {
+    // Intentionally in packaging order rather than boot order. Odd lengths
+    // exercise partial final dwords and clearing the staging tail.
+    let descriptors = [
+        (3, 7),
+        (2, 9),
+        (1, 11),
+        (7, 13),
+        (8, 15),
+        (9, 17),
+        (4, 4),
+        (11, 19),
+        (5, 6),
+        (10, 21),
+        (6, 3),
+    ];
+    let size: usize = descriptors.iter().map(|(_, len)| len).sum();
+    let mut bytes = vec![0u8; 256 + size];
+    put(&mut bytes, 0, (256 + size) as u32);
+    put(&mut bytes, 4, 36);
+    put(&mut bytes, 8, 2);
+    put(&mut bytes, 12, 14);
+    put(&mut bytes, 16, 0x3a1014);
+    put(&mut bytes, 20, size as u32);
+    put(&mut bytes, 24, 256);
+    put(&mut bytes, 32, descriptors.len() as u32);
+    let mut offset = 0;
+    for (i, (kind, len)) in descriptors.into_iter().enumerate() {
+        let at = 36 + 16 * i;
+        put(&mut bytes, at, kind);
+        put(&mut bytes, at + 4, 0x3a1014);
+        put(&mut bytes, at + 8, offset as u32);
+        put(&mut bytes, at + 12, len as u32);
+        bytes[256 + offset..256 + offset + len].fill(kind as u8);
+        offset += len;
+    }
+    bytes
+}
+pub(crate) fn firmware14() -> Firmware {
+    Firmware {
+        target: Target::Psp14_0_3,
+        bytes: container14(),
+    }
+}
+
+fn psp14_container_descriptors_and_boot_order_are_bounded() -> TestResult {
+    let bytes = container14();
+    let image = Image::parse_psp14(&bytes).unwrap();
+    let expected = [
+        (Component::KeyDatabase, 3, 7),
+        (Component::Spl, 5, 6),
+        (Component::SystemDriver, 2, 9),
+        (Component::SocDriver, 7, 13),
+        (Component::InterfaceDriver, 8, 15),
+        (Component::HardwareDebugDriver, 9, 17),
+        (Component::RasDriver, 10, 21),
+        (Component::IpKeyManager, 11, 19),
+        (Component::SecureOs, 1, 11),
+    ];
+    let parts: Vec<_> = image.components().collect();
+    if parts.len() != expected.len()
+        || image.version() != 0x3a1014
+        || image.toc() != Some(&[4u8; 4][..])
+        || Image::parse(&bytes).is_ok()
+    {
+        return TestResult::Fail("PSP14 identity, TOC or separation from PSP11");
+    }
+    for ((kind, data), (want_kind, marker, len)) in parts.into_iter().zip(expected) {
+        if kind != want_kind || data.len() != len || data.iter().any(|&b| b != marker) {
+            return TestResult::Fail("PSP14 payload offsets or Linux boot order");
+        }
+    }
+    for end in 0..bytes.len() {
+        if Image::parse_psp14(&bytes[..end]).is_ok() {
+            return TestResult::Fail("truncated PSP14 container admitted");
+        }
+    }
+    for (offset, value) in [
+        (0, 0),
+        (4, 212),
+        (8, 0x10002),
+        (12, 11),
+        (20, u32::MAX),
+        (24, 36),
+        (24, u32::MAX),
+        (32, 0),
+        (32, 12),
+        (32, u32::MAX),
+        (36, 12),
+        (36, 0),
+        (52, 3), // unknown and duplicate descriptor ids
+        (44, u32::MAX),
+        (48, 0),
+        (48, STAGING_SIZE as u32 + 1),
+        (60, 0),              // system overlaps KDB
+        (36 + 6 * 16 + 8, 0), // even non-boot TOC overlap must be rejected
+    ] {
+        let mut bad = bytes.clone();
+        put(&mut bad, offset, value);
+        if Image::parse_psp14(&bad).is_ok() {
+            return TestResult::Fail("malformed/unsupported PSP14 descriptor accepted");
+        }
+    }
+    // A well-formed table without its system driver or SOS is not bootable.
+    for (at, kind) in [(52, 10), (68, 10)] {
+        let mut bad = bytes.clone();
+        put(&mut bad, 32, 9); // excludes RAS/RL so substituting RAS is unique
+        put(&mut bad, at, kind);
+        if Image::parse_psp14(&bad).is_ok() {
+            return TestResult::Fail("PSP14 accepted missing system/SOS");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-boot",
+    psp14_container_descriptors_and_boot_order_are_bounded
+);
+
+fn psp14_boot_uploads_all_components_and_quarantines_cancellation() -> TestResult {
+    let bytes = container14();
+    let image = Image::parse_psp14(&bytes).unwrap();
+    let (pool, mut engine) = fixture();
+    if run(engine.load(&image)).is_err() || engine.state != State::Ready || engine.io.violation {
+        return TestResult::Fail("PSP14 boot failed or published dirty VRAM");
+    }
+    let commands = [
+        0x80000, 0x10000000, 0x10000, 0xb0000, 0xd0000, 0xc0000, 0xe0000, 0xf0000, 0x20000,
+    ];
+    let expected: Vec<_> = commands
+        .into_iter()
+        .flat_map(|cmd| [(0x64, 0x2000), (0x63, cmd)])
+        .collect();
+    if engine.io.writes != expected || engine.io.images.len() != 9 {
+        return TestResult::Fail("PSP14 command encoding, GPU address or component count");
+    }
+    for (uploaded, (_, expected)) in engine.io.images.iter().zip(image.components()) {
+        if &uploaded[..expected.len()] != expected
+            || uploaded[expected.len()..].iter().any(|b| *b != 0)
+        {
+            return TestResult::Fail("PSP14 staged header, stale tail or wrong payload");
+        }
+    }
+    drop(engine);
+    if pool.available() != map().len {
+        return TestResult::Fail("consumed PSP14 staging leaked");
+    }
+    for polls in [1, 260] {
+        let (pool, mut engine) = fixture();
+        engine.io.complete = false;
+        {
+            let mut future = core::pin::pin!(engine.load(&image));
+            for _ in 0..polls {
+                if future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_ready()
+                {
+                    return TestResult::Fail("incomplete PSP14 operation completed");
+                }
+            }
+        }
+        if engine.state != State::Loading || run(engine.load(&image)) != Err(Error::Busy) {
+            return TestResult::Fail("cancelled PSP14 bootstrap replayed");
+        }
+        drop(engine);
+        if pool.available()
+            != if polls == 1 {
+                map().len
+            } else {
+                STAGING_SIZE as u64
+            }
+        {
+            return TestResult::Fail("PSP14 publication/quarantine mismatch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-boot",
+    psp14_boot_uploads_all_components_and_quarantines_cancellation
+);
+
+fn psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads() -> TestResult {
+    use crate::amdgpu_discovery as ip;
+    let mut gpu = crate::amdgpu_navi22_boot::tests::gpu();
+    gpu.chip = crate::amdgpu::__test_chip_info_for_pci_id(AMD_VENDOR, NAVI48).unwrap();
+    for b in &mut gpu.ip_blocks {
+        if b.hw_id == ip::HW_ID_GC {
+            b.major = 12;
+            b.minor = 0;
+            b.revision = 1;
+        }
+        if b.hw_id == ip::HW_ID_MP0 {
+            b.major = 14;
+            b.minor = 0;
+            b.revision = 3;
+        }
+    }
+    let (target, base) = profile(&gpu).unwrap();
+    if target != Target::Psp14_0_3 || base != 0 || target.name() != "amdgpu/psp_14_0_3_sos.bin" {
+        return TestResult::Fail("PSP14 firmware selection or mailbox base index");
+    }
+    let mp0 = gpu
+        .ip_blocks
+        .iter()
+        .position(|b| b.hw_id == ip::HW_ID_MP0)
+        .unwrap();
+    gpu.ip_blocks[mp0].revision = 2;
+    if profile(&gpu).unwrap().0.name() != "amdgpu/psp_14_0_2_sos.bin" {
+        return TestResult::Fail("PSP14.0.2 inherited 14.0.3 container");
+    }
+    gpu.ip_blocks[mp0].revision = 3;
+    gpu.fb_bar = map();
+    gpu.vram.visible_size = map().len;
+    // SAFETY: bookkeeping only; profile and firmware mismatch reject all MMIO.
+    let pool = unsafe { Pool::from_owned_range(map(), 0x2_0000_0000) }.unwrap();
+    let cap = Cap::bootstrap();
+    cap.revoke();
+    // SAFETY: permanent inert maps; revoked cap prevents device accesses.
+    let mut boot = unsafe { Bootloader::new(&gpu, cap, &pool) }.unwrap();
+    for target in [Target::Navi22, Target::Psp14_0_2] {
+        let other = Firmware {
+            target,
+            bytes: container14(),
+        };
+        if run(boot.load(&other)) != Err(Error::Unsupported) || boot.state() != State::Prepared {
+            return TestResult::Fail(
+                "PSP14 accepted different-target firmware or started on mismatch",
+            );
+        }
+    }
+    let correct = Firmware {
+        target,
+        bytes: container14(),
+    };
+    if run(boot.load(&correct)) != Err(Error::Revoked) || boot.state() != State::Failed {
+        return TestResult::Fail("PSP14 bootstrap ignored revocation");
+    }
+    let (_, firmware) = narf_firmware::bootstrap_authority();
+    firmware.revoke();
+    if Firmware::open(&gpu, &firmware).err() != Some(Error::Revoked) {
+        return TestResult::Fail("PSP14 registry capability bypassed");
+    }
+    let good = gpu.ip_blocks.clone();
+    for case in 0..5 {
+        gpu.ip_blocks = good.clone();
+        gpu.regs.len = 0x80000;
+        match case {
+            0 => gpu.ip_blocks[mp0].revision = 1,
+            1 => gpu.ip_blocks.push(gpu.ip_blocks[mp0]),
+            2 => gpu.ip_blocks[mp0].num_bases = 0,
+            3 => gpu.regs.len = 0x91 * 4 + 3,
+            _ => gpu.chip.did = NAVI22,
+        }
+        if profile(&gpu).is_ok() || Firmware::open(&gpu, &firmware).err() == Some(Error::Revoked) {
+            return TestResult::Fail("unsupported PSP14 profile reached the registry");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/psp-boot",
+    psp14_profile_pins_firmware_revision_and_refuses_cross_target_loads
+);
 fn psp_sos_container_versions_and_boundaries() -> TestResult {
     for minor in 0..=3 {
         let bytes = container(minor);

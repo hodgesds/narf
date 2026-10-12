@@ -77,6 +77,64 @@ GC version rejects its `DEV_INFO`. This identifies the device; acceleration
 continues to report unavailable. Navi 22 firmware, GMC/GFX10 execution and
 DCN3.0 display bring-up are not enabled by this probe path.
 
+### Navi 48 PCIe probe (RX 9070 XT)
+
+The next discrete target is Navi48, selected from the September 2026
+[Steam PC video-card survey](https://store.steampowered.com/hwsurvey/videocard/):
+RX 9070 XT is the leading named AMD card at 1.42%. The larger generic
+"AMD Radeon Graphics" entry does not identify a chip. This selection is a
+dated snapshot, not a permanent popularity claim.
+
+`1002:7550` binds as `Family::Navi4`, `asic="navi48"`. This ID also covers
+RX 9070/GRE; neither SKU nor enabled CU count is inferred from it. Probe uses
+the existing bounded PCIe discovery reader and total/visible VRAM accounting.
+`DEV_INFO` requires exactly one GC0 12.0.1 discovery record and a GC topology
+table, then reports `AMDGPU_FAMILY_GC_12_0_0` (152), eight hardware contexts,
+and GMC12's 48-bit VA geometry. Topology fields describe discovered maxima;
+the active CU count and bitmap remain zero until the GFX12 harvested-WGP
+inventory exists. `ACCEL_WORKING` remains zero.
+
+When VFCT has no image, VBIOS acquisition supports the SMUIO14.0.2 ROM read
+ports (`0xe4/0xe5`, base index zero) only with matching GC12.0.1 and NBIO7.7.0
+or 7.7.1 discovery. The read preserves ROM_INDEX, checks PCI authority per
+chunk and validates the image's PCI identity and ATOM directory. Duplicate,
+unsupported or truncated banks are rejected before MMIO. Probe does not enable
+PCI ROM decoding or use the legacy ROM-version-only fallback for Navi48.
+
+Navi4 has no legacy single firmware image (`ChipInfo::fw_name` is empty).
+Both legacy firmware loaders reject it before registry access. Existing GFX9/11,
+MES11, GMC9/11, DCN2/3, backlight, APU SMU and VCN2–4 entry points refuse Navi4;
+discrete suspend returns `NotImplemented` before changing power state. The
+explicit PSP14 bootstrap below is the first firmware stage; SMU14,
+GMC12/SDMA7 and DCN4 owners are still required for engine startup/modesetting.
+
+### Navi 48 PSP14 secure-OS bootstrap
+
+`amdgpu_psp_boot::Firmware::open` and `unsafe Bootloader::new` also accept
+Navi48 with exactly one GC0 12.0.1 and MP0 14.0.2 or 14.0.3. Discovery selects
+`amdgpu/psp_14_0_2_sos.bin` or `amdgpu/psp_14_0_3_sos.bin`; no revision fallback
+or professional-SKU kicker firmware is used. `Firmware` and `Bootloader`
+retain that target, rejecting a cross-target load before MMIO or state changes.
+
+`amdgpu_psp_firmware::Image::parse_psp14` accepts the PSP14 v2.0 container:
+36-byte header, bounded 16-byte descriptors before the payload, and payload-
+relative component ranges. Duplicate/unknown IDs, overlap, truncation, empty
+components, missing system/SOS and components beyond the 1 MiB staging limit
+are rejected. TOC/RL ranges are validated but are not boot commands. v2.1
+auxiliary-image selection and SPDM remain unsupported. Registry access and
+the retained validated copy use the same capability checks as Navi22.
+
+The owner uploads KDB → SPL → system → SoC → interface → hardware-debug →
+RAS → IP-key-manager → SOS, omitting absent optional components. It uses
+MPASP C2PMSG35/36/81 (`0x63/0x64/0x91`, MP0 bank zero), the aligned GPU staging
+address in MiB, bounded asynchronous waits, and changing SOS heartbeat proof.
+Failure and cancellation prevent replay and quarantine published memory.
+An already running SOS is checked without upload. The caller must supply
+exclusively owned, trained VRAM with correct GMC12 addresses and exclusions;
+the Navi22 VRAM planner is not valid for this GPU. This explicit API does not
+automatically claim the GPU, initialize its GPCOM/TMR, set `fw_loaded`, or
+enable graphics/display engines. Those remain separate bring-up stages.
+
 ### Navi 22 PSP secure-OS bootstrap
 
 `amdgpu_psp_boot::Firmware::open(gpu, registry_cap)` selects

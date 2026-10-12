@@ -194,6 +194,7 @@ fn smoke_amdgpu_pci_matches_registered() -> TestResult {
         (amdgpu::AMD_VENDOR, amdgpu::RENOIR),
         (amdgpu::AMD_VENDOR, amdgpu::NAVI22),
         (amdgpu::AMD_VENDOR, amdgpu::NAVI31),
+        (amdgpu::AMD_VENDOR, amdgpu::NAVI48),
     ];
     for (v, d) in want.iter().copied() {
         let found = regs.iter().any(|m| {
