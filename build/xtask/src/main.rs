@@ -708,6 +708,29 @@ fn qemu_display_arg(display: &str, backend: GpuBackend) -> String {
     options
 }
 
+/// The default audio sink deliberately discards samples so automated QEMU
+/// tests remain hermetic. Interactive desktop runs can opt into the host's
+/// PipeWire session with `XTASK_QEMU_AUDIO=pipewire`.
+///
+/// Keep this a closed set rather than passing arbitrary QEMU fragments from
+/// the environment: both HDA and virtio-sound consume the same selected
+/// backend, and an invalid value must not turn into an injection path in the
+/// machine command line.
+fn qemu_audio_backend_from(value: Option<&str>) -> &'static str {
+    match value {
+        Some("pipewire") => "pipewire",
+        _ => "none",
+    }
+}
+
+fn qemu_audio_backend() -> &'static str {
+    qemu_audio_backend_from(std::env::var("XTASK_QEMU_AUDIO").ok().as_deref())
+}
+
+fn qemu_audio_device_arg(id: &str) -> String {
+    format!("{},id={id}", qemu_audio_backend())
+}
+
 #[cfg(test)]
 mod gpu_backend_tests {
     use super::*;
@@ -749,6 +772,14 @@ mod gpu_backend_tests {
             qemu_display_arg("gtk,grab-on-hover=off", GpuBackend::Virtio2d),
             "gtk,grab-on-hover=off"
         );
+    }
+
+    #[test]
+    fn qemu_audio_is_hermetic_unless_pipewire_is_explicitly_requested() {
+        assert_eq!(qemu_audio_backend_from(None), "none");
+        assert_eq!(qemu_audio_backend_from(Some("none")), "none");
+        assert_eq!(qemu_audio_backend_from(Some("unexpected")), "none");
+        assert_eq!(qemu_audio_backend_from(Some("pipewire")), "pipewire");
     }
 
     #[test]
@@ -1210,7 +1241,7 @@ impl Arch {
                     // VirtIO playback test, making audio tests order-dependent.
                     args.extend_from_slice(&[
                         "-audiodev".into(),
-                        "none,id=hda0".into(),
+                        qemu_audio_device_arg("hda0"),
                         "-device".into(),
                         "intel-hda".into(),
                         "-device".into(),
@@ -1331,7 +1362,7 @@ impl Arch {
                         ]);
                     }
                     args.extend_from_slice(&["-device".into(), virtio_gpu_device_arg(gpu_backend)]);
-                    args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
+                    args.extend_from_slice(&["-audiodev".into(), qemu_audio_device_arg("snd0")]);
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off"
@@ -1530,7 +1561,7 @@ impl Arch {
                         ]);
                     }
                     args.extend_from_slice(&["-device".into(), virtio_gpu_device_arg(gpu_backend)]);
-                    args.extend_from_slice(&["-audiodev".into(), "none,id=snd0".into()]);
+                    args.extend_from_slice(&["-audiodev".into(), qemu_audio_device_arg("snd0")]);
                     args.extend_from_slice(&[
                         "-device".into(),
                         "virtio-sound-pci,audiodev=snd0,disable-legacy=on,disable-modern=off"
