@@ -168,6 +168,7 @@ pub mod amdgpu_dcn_plane;
 mod amdgpu_dcn_profile;
 pub mod amdgpu_dcn_stream;
 pub mod amdgpu_ddc;
+pub mod amdgpu_ddc_navi48;
 pub mod amdgpu_dio;
 pub mod amdgpu_discovery;
 pub mod amdgpu_dml;

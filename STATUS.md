@@ -288,7 +288,11 @@ DCN4 board routing reads ATOM v1.4/v1.5, preserves distinct AUX/HPD/transmitter
 identities and bounds the four channels using DCN4 backend register geometry.
 The retained owner supports native DP/eDP DPCD/extended-capability and complete
 segmented EDID discovery, including bounded DEFER retries, per-port errors and
-cancellation quarantine. HDMI DDC and native link/scanout programming remain open.
+cancellation quarantine. HDMI now reads complete segmented EDID through DCN4's
+native I2C arbitrator/FIFO with board-resolved DDC pins, 100 kHz clock setup,
+fresh completion checks and bounded waits. Terminal sink errors restore pins
+and release ownership; uncertain failure/cancellation blocks reuse and raw AUX.
+Native link/scanout programming remains open.
 MES12 now has separate eight-byte-aligned command and MQD builders, kernel queue
 map/unmap packets and two-fence completion/error decoding, checked against Linux
 C layouts. Its retained unified-firmware owner starts both pipes, configures

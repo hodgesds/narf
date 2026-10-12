@@ -1,5 +1,6 @@
 //! Ordered, retained Navi48 cold-boot firmware ownership. No automatic probe
 //! writes: callers must establish exclusive GPU/VRAM ownership first.
+use crate::amdgpu_ddc_navi48 as ddc;
 use crate::amdgpu_gfx12_queue as queues;
 use crate::amdgpu_gfx12_rs64 as rs64;
 use crate::amdgpu_gfx12_setup as setup;
@@ -413,6 +414,7 @@ impl Backend for Hardware {
 pub struct ColdBoot {
     sequence: Sequence<Hardware>,
     display: Result<display::Probe, display::Error>,
+    ddc: Result<ddc::Ddc, display::Error>,
 }
 impl ColdBoot {
     /// # Safety
@@ -466,6 +468,17 @@ impl ColdBoot {
             .and_then(|bios| inventory::display_paths(gpu, bios.bytes()))
             .map_err(display::Error::Inventory)
             .and_then(display::Probe::new);
+        let ddc = gpu
+            .vbios
+            .as_ref()
+            .ok_or(inventory::Error::Missing)
+            .and_then(|bios| inventory::dchub_refclk_khz(bios.bytes()))
+            .map_err(display::Error::Inventory)
+            .and_then(|clock| {
+                // SAFETY: same exclusive DCN/pin/reset ownership; preparation
+                // only. All subsequent DDC and DMUB access shares this owner.
+                unsafe { ddc::Ddc::new(gpu, authority, clock) }.map_err(display::Error::Ddc)
+            });
         let mut blocks = Vec::new();
         blocks
             .try_reserve_exact(gpu.ip_blocks.len())
@@ -497,6 +510,7 @@ impl ColdBoot {
             unsafe { dmub::Dmub::new(&saved, authority, pool, prepared) }.map_err(Error::Dmub)?;
         Ok(Self {
             display,
+            ddc,
             sequence: Sequence {
                 backend: Hardware {
                     gpu: saved,
@@ -544,16 +558,22 @@ impl ColdBoot {
             .map(display::Probe::paths)
             .map_err(|e| *e)
     }
-    /// Read routed native DisplayPort sinks while retaining the DMUB and any
+    /// Read routed native DP/eDP/HDMI sinks while retaining the DMUB/DDC and any
     /// incomplete I2C transaction. Cancellation prevents this scanner's reuse.
     pub async fn scan_display(&mut self) -> Result<Vec<display::Port>, Error> {
         if self.state() != State::MemoryReady {
             return Err(Error::Busy);
         }
-        self.display
-            .as_mut()
-            .map_err(|e| Error::Display(*e))?
-            .scan(&mut self.sequence.backend.dmub)
+        let display = self.display.as_mut().map_err(|e| Error::Display(*e))?;
+        if display
+            .paths()
+            .iter()
+            .any(|p| p.connector == inventory::Connector::HdmiTypeA)
+        {
+            self.ddc.as_ref().map_err(|e| Error::Display(*e))?;
+        }
+        display
+            .scan(&mut self.sequence.backend.dmub, self.ddc.as_mut().ok())
             .await
             .map_err(Error::Display)
     }
@@ -565,7 +585,16 @@ impl ColdBoot {
     }
     /// Access the live display mailbox while retaining this session's PSP/TMR.
     pub fn dmub(&mut self) -> Result<&mut dmub::Dmub, Error> {
-        if self.state() != State::MemoryReady {
+        if self.state() != State::MemoryReady
+            || self
+                .display
+                .as_ref()
+                .is_ok_and(|p| p.state() != display::State::Ready)
+            || self
+                .ddc
+                .as_ref()
+                .is_ok_and(|d| d.state() != ddc::State::Ready)
+        {
             return Err(Error::Busy);
         }
         Ok(&mut self.sequence.backend.dmub)

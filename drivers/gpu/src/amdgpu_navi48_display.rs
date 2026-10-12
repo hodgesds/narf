@@ -1,6 +1,8 @@
-//! Board-routed native DisplayPort sink discovery through the retained DCN4
-//! DMUB. No encoder/clock/timing writes or implied modesetting readiness.
-use crate::{amdgpu_dcn_inventory as inventory, amdgpu_dmub_navi48 as dmub};
+//! Board-routed DP/eDP and HDMI sink discovery through retained DCN4 owners.
+//! No encoder/clock/timing writes or implied modesetting readiness.
+use crate::{
+    amdgpu_dcn_inventory as inventory, amdgpu_ddc_navi48 as ddc, amdgpu_dmub_navi48 as dmub,
+};
 use alloc::vec::Vec;
 use core::future::Future;
 
@@ -12,19 +14,21 @@ pub enum Error {
     Allocation,
     Inventory(inventory::Error),
     Transport(dmub::Error),
+    Ddc(ddc::Error),
     InvalidDpcd,
     InvalidEdid,
     EdidTooLarge,
 }
 impl Error {
     fn local(self) -> bool {
-        matches!(
-            self,
-            Self::InvalidDpcd
-                | Self::InvalidEdid
-                | Self::EdidTooLarge
-                | Self::Transport(dmub::Error::Aux(_) | dmub::Error::CommandRejected(_))
-        )
+        matches!(self, Self::Ddc(e) if e.local())
+            || matches!(
+                self,
+                Self::InvalidDpcd
+                    | Self::InvalidEdid
+                    | Self::EdidTooLarge
+                    | Self::Transport(dmub::Error::Aux(_) | dmub::Error::CommandRejected(_))
+            )
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,7 +40,8 @@ pub enum State {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sink {
     /// Receiver capabilities, replaced by extended caps when advertised and newer.
-    pub dpcd: [u8; 16],
+    /// None for HDMI, which has no DisplayPort receiver capabilities.
+    pub dpcd: Option<[u8; 16]>,
     /// All advertised EDID blocks, with header/checksum validation; never truncated.
     pub edid: Vec<u8>,
 }
@@ -56,6 +61,14 @@ trait Aux {
         data: &mut [u8],
     ) -> impl Future<Output = Result<(), dmub::Error>> + Send;
     fn delay(&mut self) -> impl Future<Output = ()> + Send;
+}
+trait Hdmi {
+    fn edid(&mut self, channel: u8) -> impl Future<Output = Result<Vec<u8>, ddc::Error>> + Send;
+}
+impl Hdmi for ddc::Ddc {
+    async fn edid(&mut self, channel: u8) -> Result<Vec<u8>, ddc::Error> {
+        self.edid(channel).await
+    }
 }
 impl Aux for dmub::Dmub {
     async fn transfer(
@@ -170,7 +183,7 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
         }
     }
     Ok(Sink {
-        dpcd,
+        dpcd: Some(dpcd),
         edid: read_edid(io, instance).await?,
     })
 }
@@ -185,12 +198,14 @@ pub struct Probe {
 }
 impl Probe {
     /// Accept board paths from `display_paths`; reject ambiguous native wires
-    /// before issuing any AUX command. HDMI is retained but not probed by AUX.
+    /// before issuing any AUX or DDC command.
     pub fn new(paths: Vec<inventory::Path>) -> Result<Self, Error> {
         for path in &paths {
             if !matches!(
                 path.connector,
-                inventory::Connector::DisplayPort | inventory::Connector::EmbeddedDisplayPort
+                inventory::Connector::DisplayPort
+                    | inventory::Connector::EmbeddedDisplayPort
+                    | inventory::Connector::HdmiTypeA
             ) {
                 continue;
             }
@@ -223,10 +238,18 @@ impl Probe {
     }
     /// Does not query HPD by transmitter number: AUX, HPD and connector ids
     /// need not coincide. DPCD response establishes a responsive DP sink.
-    pub async fn scan(&mut self, dmub: &mut dmub::Dmub) -> Result<Vec<Port>, Error> {
-        self.scan_with(dmub).await
+    pub async fn scan(
+        &mut self,
+        dmub: &mut dmub::Dmub,
+        ddc: Option<&mut ddc::Ddc>,
+    ) -> Result<Vec<Port>, Error> {
+        self.scan_with(dmub, ddc).await
     }
-    async fn scan_with(&mut self, io: &mut impl Aux) -> Result<Vec<Port>, Error> {
+    async fn scan_with(
+        &mut self,
+        io: &mut impl Aux,
+        mut ddc: Option<&mut impl Hdmi>,
+    ) -> Result<Vec<Port>, Error> {
         if self.state != State::Ready {
             return Err(Error::Busy);
         }
@@ -235,13 +258,20 @@ impl Probe {
             let mut ports = Vec::new();
             ports.try_reserve_exact(4).map_err(|_| Error::Allocation)?;
             for path in &self.paths {
-                if !matches!(
-                    path.connector,
-                    inventory::Connector::DisplayPort | inventory::Connector::EmbeddedDisplayPort
-                ) {
-                    continue;
-                }
-                let sink = read_sink(io, path.aux.unwrap()).await;
+                let sink = match path.connector {
+                    inventory::Connector::DisplayPort
+                    | inventory::Connector::EmbeddedDisplayPort => {
+                        read_sink(io, path.aux.unwrap()).await
+                    }
+                    inventory::Connector::HdmiTypeA => {
+                        let ddc = ddc.as_mut().ok_or(Error::Ddc(ddc::Error::Unsupported))?;
+                        ddc.edid(path.aux.unwrap())
+                            .await
+                            .map(|edid| Sink { dpcd: None, edid })
+                            .map_err(Error::Ddc)
+                    }
+                    _ => continue,
+                };
                 if let Err(e) = sink {
                     if !e.local() {
                         return Err(e);

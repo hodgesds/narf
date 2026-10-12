@@ -126,11 +126,11 @@ fn navi48_display_reads_extended_caps_segmented_edid_and_distinct_wires() -> Tes
     let mut p = probe();
     let mut io = fake(3);
     io.defers = 2;
-    let ports = run(p.scan_with(&mut io)).unwrap();
+    let ports = run(p.scan_with(&mut io, None::<&mut ddc::Ddc>)).unwrap();
     let connected = ports[0].sink.as_ref().unwrap();
     if ports.len() != 2
         || ports[0].path.transmitter != 3
-        || connected.dpcd[0] != 0x21
+        || connected.dpcd.unwrap()[0] != 0x21
         || connected.edid != io.edid
         || ports[1].sink != Err(Error::Transport(dmub::Error::Aux(1)))
         || p.state() != State::Ready
@@ -160,11 +160,12 @@ fn navi48_display_reads_extended_caps_segmented_edid_and_distinct_wires() -> Tes
         return TestResult::Fail("E-EDID segment/offset/STOP sequence");
     }
     io.extended[0] = 0x12;
-    if run(p.scan_with(&mut io)).unwrap()[0]
+    if run(p.scan_with(&mut io, None::<&mut ddc::Ddc>)).unwrap()[0]
         .sink
         .as_ref()
         .unwrap()
-        .dpcd[0]
+        .dpcd
+        .unwrap()[0]
         != 0x14
     {
         return TestResult::Fail("older extended caps replaced base capabilities");
@@ -200,7 +201,7 @@ fn navi48_display_bounds_edid_defers_and_preserves_other_ports() -> TestResult {
                 Error::InvalidDpcd
             }
         };
-        let ports = run(p.scan_with(&mut io)).unwrap();
+        let ports = run(p.scan_with(&mut io, None::<&mut ddc::Ddc>)).unwrap();
         if ports[0].sink != Err(expected) || ports.len() != 2 || io.mot || p.state() != State::Ready
         {
             return TestResult::Fail("malformed sink poisoned scan or EDID left I2C open");
@@ -209,7 +210,7 @@ fn navi48_display_bounds_edid_defers_and_preserves_other_ports() -> TestResult {
     let mut p = Probe::new(vec![path(1, 3)]).unwrap();
     let mut io = fake(1);
     io.defers = 10;
-    let ports = run(p.scan_with(&mut io)).unwrap();
+    let ports = run(p.scan_with(&mut io, None::<&mut ddc::Ddc>)).unwrap();
     if io.commands.len() != 7
         || io.delays != 6
         || ports[0].sink != Err(Error::Transport(dmub::Error::Aux(8)))
@@ -228,7 +229,7 @@ fn navi48_display_cancellation_and_transport_failure_block_reuse() -> TestResult
     let mut io = fake(1);
     io.stall = Some(5);
     {
-        let mut future = core::pin::pin!(p.scan_with(&mut io));
+        let mut future = core::pin::pin!(p.scan_with(&mut io, None::<&mut ddc::Ddc>));
         if !future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
@@ -241,7 +242,7 @@ fn navi48_display_cancellation_and_transport_failure_block_reuse() -> TestResult
     let commands = io.commands.len();
     if p.state() != State::Scanning
         || !io.mot
-        || run(p.scan_with(&mut io)) != Err(Error::Busy)
+        || run(p.scan_with(&mut io, None::<&mut ddc::Ddc>)) != Err(Error::Busy)
         || commands != io.commands.len()
     {
         return TestResult::Fail("cancelled I2C MOT sequence silently reused");
@@ -255,9 +256,9 @@ fn navi48_display_cancellation_and_transport_failure_block_reuse() -> TestResult
         let mut p = probe();
         let mut io = fake(1);
         io.fail = Some(error);
-        if run(p.scan_with(&mut io)) != Err(Error::Transport(error))
+        if run(p.scan_with(&mut io, None::<&mut ddc::Ddc>)) != Err(Error::Transport(error))
             || p.state() != State::Failed(Error::Transport(error))
-            || run(p.scan_with(&mut io)) != Err(Error::Busy)
+            || run(p.scan_with(&mut io, None::<&mut ddc::Ddc>)) != Err(Error::Busy)
             || io.commands.len() != 1
         {
             return TestResult::Fail("failed transport reused or other ports accessed");
@@ -290,4 +291,113 @@ fn navi48_display_refuses_ambiguous_or_unroutable_board_paths() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-display",
     navi48_display_refuses_ambiguous_or_unroutable_board_paths
+);
+
+struct FakeHdmi {
+    result: Result<Vec<u8>, ddc::Error>,
+    channels: Vec<u8>,
+    stall: bool,
+}
+impl Hdmi for FakeHdmi {
+    async fn edid(&mut self, channel: u8) -> Result<Vec<u8>, ddc::Error> {
+        self.channels.push(channel);
+        if self.stall {
+            core::future::pending::<()>().await;
+        }
+        self.result.clone()
+    }
+}
+fn mixed_probe() -> Probe {
+    let mut hdmi = path(0, 2);
+    hdmi.connector = inventory::Connector::HdmiTypeA;
+    Probe::new(vec![hdmi, path(1, 3)]).unwrap()
+}
+fn navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux() -> TestResult {
+    for result in [
+        Ok(fake(3).edid),
+        Err(ddc::Error::Nack),
+        Err(ddc::Error::InvalidEdid),
+    ] {
+        let mut p = mixed_probe();
+        let mut aux = fake(1);
+        let mut hdmi = FakeHdmi {
+            result: result.clone(),
+            channels: Vec::new(),
+            stall: false,
+        };
+        let ports = run(p.scan_with(&mut aux, Some(&mut hdmi))).unwrap();
+        assert_eq!(ports.len(), 2);
+        assert_eq!(
+            ports[0].sink,
+            result
+                .map(|edid| Sink { dpcd: None, edid })
+                .map_err(Error::Ddc)
+        );
+        assert!(ports[1].sink.as_ref().unwrap().dpcd.is_some());
+        assert_eq!(hdmi.channels, [0]);
+        assert!(aux.commands.iter().all(|c| c.0 == 1));
+        assert_eq!(p.state(), State::Ready);
+    }
+    let mut hdmi = path(0, 2);
+    hdmi.connector = inventory::Connector::HdmiTypeA;
+    assert!(Probe::new(vec![hdmi, path(0, 3)]).is_err());
+    hdmi.aux = None;
+    assert!(Probe::new(vec![hdmi]).is_err());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-display",
+    navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux
+);
+
+fn navi48_display_ddc_fatal_error_or_cancellation_blocks_aux_and_reuse() -> TestResult {
+    for error in [
+        ddc::Error::Timeout,
+        ddc::Error::Revoked,
+        ddc::Error::Protocol,
+    ] {
+        let mut p = mixed_probe();
+        let mut aux = fake(1);
+        let mut hdmi = FakeHdmi {
+            result: Err(error),
+            channels: Vec::new(),
+            stall: false,
+        };
+        assert_eq!(
+            run(p.scan_with(&mut aux, Some(&mut hdmi))),
+            Err(Error::Ddc(error))
+        );
+        assert_eq!(p.state(), State::Failed(Error::Ddc(error)));
+        assert!(aux.commands.is_empty());
+        assert_eq!(
+            run(p.scan_with(&mut aux, Some(&mut hdmi))),
+            Err(Error::Busy)
+        );
+        assert_eq!(hdmi.channels, [0]);
+    }
+    let mut p = mixed_probe();
+    let mut aux = fake(1);
+    let mut hdmi = FakeHdmi {
+        result: Ok(fake(1).edid),
+        channels: Vec::new(),
+        stall: true,
+    };
+    {
+        let mut f = core::pin::pin!(p.scan_with(&mut aux, Some(&mut hdmi)));
+        assert!(f
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(p.state(), State::Scanning);
+    assert!(aux.commands.is_empty());
+    assert_eq!(
+        run(p.scan_with(&mut aux, Some(&mut hdmi))),
+        Err(Error::Busy)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-display",
+    navi48_display_ddc_fatal_error_or_cancellation_blocks_aux_and_reuse
 );

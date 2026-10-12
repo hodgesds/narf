@@ -230,7 +230,7 @@ pub async fn display_paths() -> Result<Vec<crate::amdgpu_dcn_inventory::Path>, b
     result.extend_from_slice(paths);
     Ok(result)
 }
-/// Serialized DPCD/EDID discovery on board-routed native DisplayPort ports.
+/// Serialized DPCD/EDID discovery on board-routed native DP/eDP/HDMI ports.
 /// Includes per-port failures; fatal transport failures stop the scan.
 pub async fn scan_display() -> Result<Vec<display::Port>, boot::Error> {
     let mut owner = OWNER.lock().await;

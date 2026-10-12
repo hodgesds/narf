@@ -351,8 +351,8 @@ inventory functions do not enable any DCN3 timing/plane/link programming.
 DCE-info v4.5 supplies the unchanged reference-clock field. The DCN4 DMUB
 mailbox likewise refuses native AUX/HPD channel indices outside `0..4`.
 
-`amdgpu_navi48_display::Probe` retains board routing and the native DP/eDP
-scan transaction. `scan(&mut Dmub)` reads DPCD, uses advertised extended receiver
+`amdgpu_navi48_display::Probe` retains board routing and the native DP/eDP/HDMI
+scan transaction. `scan(&mut Dmub, Option<&mut Ddc>)` reads DP DPCD, uses advertised extended receiver
 caps at `0x2200` when at least as new, then reads complete E-EDID with segment
 pointer writes, 16-byte transfers and STOP at each block. It validates the
 base header and every checksum, bounds EDID at 32 blocks and DEFER at seven
@@ -360,12 +360,39 @@ attempts with scheduler delays, and terminates I2C MOT after recoverable sink
 errors. `Port` preserves independent board identities and per-port errors;
 a NACK is not reported as an HPD disconnect. Fatal transport errors stop the
 scan. Cancellation leaves `State::Scanning` and forbids reuse until reset.
-HDMI paths are retained but require a separate DDC path.
+HDMI paths use the native DDC owner; `Sink::dpcd` is `Some` for DP/eDP and
+`None` for HDMI. A physical channel, transmitter or HPD identifier is never
+substituted for another. Both DP and HDMI routes participate in ambiguity checks.
+
+`unsafe amdgpu_ddc_navi48::Ddc::new(gpu, authority, crystal_khz)` prepares a
+retained owner of DCN4's shared native-I2C arbitrator/buffer and all four DDC
+pin pairs. Exact GC12.0.1 and DCN4.0.1/raw-4.1.0 banks are required; the
+crystal comes from ATOM DCE-info. Preparation performs no device writes.
+`edid(channel).await` refuses inherited SW/DMCU ownership, active hardware
+transactions and autonomous EDID polling before writing. It wakes I2C SRAM,
+enables the selected channel clock, acquires SW arbitration and configures
+100 kHz from the live microsecond/XTAL divider. It saves selected GPIO,
+pad-mux, speed/setup and control fields before altering them. Segment writes
+and 128-byte offset-write/repeated-START/read transactions use the hardware
+FIFO, not AUX. Fresh status reset, SW ownership, idle and DONE are required;
+zero status alone never completes a transfer. Reads validate all EDID blocks
+with the same 32-block limit. Segment-zero NACK is tolerated for older sinks.
+Every hardware wait uses scheduler timers and a 50 ms bound.
+
+Known-terminal NACK and EDID validation errors restore selected pin/config
+fields and release arbitration, including the DCN4 second-DONE workaround.
+SRAM and the selected channel clock remain awake. Timeout, unexpected status,
+revocation and cancellation retain the claim/state and forbid replay until
+independent reset. All MMIO batches invoke the PCI capability. There is no
+Drop-time MMIO, bit-banging fallback, forced takeover or hardware reset.
 
 `ColdBoot` keeps this scanner and any routing-preparation error independently
 of engine startup. `display_paths` and `display_state` expose its inventory
 and diagnostics; `scan_display` requires completed firmware/DMUB startup.
 `amdgpu_navi48_platform` serializes these operations through the retained owner.
+DDC preparation errors are independent of non-display startup. Raw DMUB access
+is refused while a scan/DDC transaction is incomplete or failed, including
+after cancellation, so AUX cannot reuse pins owned by a partial HDMI read.
 This discovery API does not train a link or program a scanout mode.
 
 `unsafe amdgpu_gmc_navi48::Gmc::new` validates GC12.0.1/MMHUB4.1/NBIO banks

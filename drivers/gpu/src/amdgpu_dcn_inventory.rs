@@ -186,8 +186,8 @@ pub struct Path {
     /// One-based instance from the object's enum id, as the table encodes it.
     pub connector_instance: u8,
     pub transmitter: u8,
-    /// Hardware AUX channel resolved from the I2C record and GPIO LUT.
-    /// None means the board supplies no usable native AUX route.
+    /// Physical DDC/AUX channel resolved from the I2C record and GPIO LUT.
+    /// DP uses AUX, HDMI uses native I2C on these pins. None means no usable route.
     pub aux: Option<u8>,
     /// One-based ATOM HPD selector from the connector's record list, or zero
     /// when the board declares none for this connector.
