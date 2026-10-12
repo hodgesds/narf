@@ -301,12 +301,18 @@ kernel_test_in!(
 fn dcn401_dccg_all_live_consumers_block_programming() -> TestResult {
     let idle = engine().layout.idle;
     for (at, mask) in idle {
-        for gone in [false, true] {
+        for value in core::iter::once(u32::MAX)
+            .chain((0..32).map(|bit| 1u32 << bit).filter(|v| mask & v != 0))
+        {
             let mut e = engine();
-            e.io.regs.insert(at, if gone { u32::MAX } else { mask });
+            e.io.regs.insert(at, value);
             assert_eq!(
                 run(e.prepare(request(0), clocks())),
-                Err(if gone { Error::DeviceGone } else { Error::Busy })
+                Err(if value == u32::MAX {
+                    Error::DeviceGone
+                } else {
+                    Error::Busy
+                })
             );
             assert!(e.io.writes.is_empty());
             assert_eq!(e.status.state, State::Ready);

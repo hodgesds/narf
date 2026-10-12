@@ -227,7 +227,7 @@ fn dcn401_all_legacy_hpo_and_frl_consumers_block_power_and_clock_writes() -> Tes
     let mut golden = Vec::new();
     for i in 0..4 {
         for (reg, stride, mask) in [
-            (0x1b43, 0x80, 1),
+            (0x1b43, 0x80, 0x10001),
             (0x1b84, 0x80, 0x10000),
             (0x20bd, 0x124, 1),
             (0x2122, 0x124, 0x10001),
@@ -241,7 +241,9 @@ fn dcn401_all_legacy_hpo_and_frl_consumers_block_power_and_clock_writes() -> Tes
     golden.extend([(0x3234c, 1), (0x32358, 1), (0x3237c, 1)]);
     assert_eq!(engine().layout.idle_registers().as_slice(), golden);
     for (at, mask) in golden {
-        for value in [mask, u32::MAX] {
+        for value in core::iter::once(u32::MAX)
+            .chain((0..32).map(|bit| 1u32 << bit).filter(|v| mask & v != 0))
+        {
             let expected = if value == u32::MAX {
                 Error::DeviceGone
             } else {

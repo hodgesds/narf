@@ -147,7 +147,7 @@ impl Layout {
         let mut regs = [(0, 0); 31];
         for i in 0..4 {
             for (j, (reg, stride, mask)) in [
-                (0x1b43, 0x80, 1),        // OTG_MASTER_EN
+                (0x1b43, 0x80, 0x10001),  // OTG_MASTER_EN/current master state
                 (0x1b84, 0x80, 0x10000),  // OTG_BUSY
                 (0x20bd, 0x124, 1),       // DIG_BE_ENABLE (HDMI and legacy DP)
                 (0x2122, 0x124, 0x10001), // DP stream enable/status

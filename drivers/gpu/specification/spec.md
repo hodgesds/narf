@@ -256,7 +256,9 @@ one must agree with Linux's absolute DAL registers `0x1628a/0x16273/0x16274`;
 PPSMC registers and message IDs are never reused. DCN banks two and three bound
 all four OTGs, legacy streams, HPO DP streams/link clocks and the single FRL
 stream. An active or disappearing consumer rejects startup/clock programming
-before any power future is polled or DAL command written.
+before any power future is polled or DAL command written. OTG retirement
+requires both the requested and current master-enable bits clear, as well as
+`OTG_BUSY`; an unacknowledged disable is still a live consumer.
 
 `unsafe start(&mut Smu).await` enables the restricted display power policy,
 checks nonzero firmware and DAL driver/header versions 1, and queries native

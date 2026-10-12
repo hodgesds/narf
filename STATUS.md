@@ -297,7 +297,8 @@ The retained DCN4 clock owner now validates its separate DAL mailbox, queries
 native clock ranges and applies checked DISP/DPP/DTB floors with both mailbox
 and per-clock completion acknowledgements. It pins DCF/UCLK conservatively,
 disables UCLK switching, preserves thermal protection and rejects every live
-legacy/HPO/FRL display consumer before changing DPM. Partial transitions and
+legacy/HPO/FRL display consumer before changing DPM, including timing generators
+whose disable request is not yet acknowledged. Partial transitions and
 cancellation retain state without replay. Platform clock preparation is
 serialized after the kernel engine proofs. Native DCCG now prepares all four
 DPP dividers, DPREF-derived DP pixel DTOs, DTB-derived FRL DTOs, and TMDS
