@@ -22,6 +22,23 @@ and CI compiler-cache integration.
 
 ## 3. Public interface
 
+- Commands with common kernel build arguments accept
+  `--composition FILE`, repeatable `--builtin-crate MANIFEST`, and repeatable
+  `--module-crate MANIFEST`. The versioned composition selects Cargo packages
+  outside the NARF workspace as linked built-ins or ABI-stamped modules. All
+  generated Cargo manifests, registrars, lockfiles, and artifacts live below
+  `target/narf-compositions/`; source manifests are never rewritten.
+- Built-ins are dependencies of a generated standalone copy of the frame
+  manifest and compile in the same Cargo graph. A generated registrar calls
+  the selected direct entry as the body of its declared init stage (the entry
+  must not register another call into that same stage), with a compile-time
+  `DomainId` argument when requested. Modules build through the relocatable
+  `.ko` pipeline, are staged for QEMU/x86_64 media, and produce
+  `modules_load` plus per-path `modules_domains` boot arguments. Public keys
+  selected by signed module entries augment the build-time module trust store.
+- `cargo xtask build-module --manifest-path PATH --package NAME ...` builds an
+  out-of-tree module without adding it to the repository workspace.
+
 - `NARF_FIRMWARE_TRUSTED_KEYS=/absolute/path/keys.txt` embeds firmware
   verification public keys (one 64-digit hex Ed25519 key per line).
   Firmware bootstrap installs them before signed-blob discovery.

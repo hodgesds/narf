@@ -53,6 +53,14 @@ pub unsafe fn exit_domain();
 pub fn panic(msg: &PanicInfo) -> !;
 ```
 
+When the build enables `external-composition`, frame includes the registrar at
+the build-supplied `NARF_COMPOSITION_RS` path and calls its
+`register_initcalls()` after the module KABI registrar and before initcall
+execution. This is one generic hook: composition-specific source and Cargo
+dependencies are generated below `target/`, not added to frame. A composed
+built-in entry receives its static `DomainId` only when its manifest declares
+one; runtime modules never use this path.
+
 Trap entry is written in arch assembly and materialises the architecture-owned
 `narf_arch::{x86_64,aarch64}::trap_frame::TrapFrame`. `frame` re-exports the
 selected type and fans out to a Rust dispatcher. On aarch64 the former padding

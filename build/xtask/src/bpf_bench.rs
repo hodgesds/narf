@@ -739,11 +739,13 @@ fn run_and_report(args: &BpfBenchArgs, build: &BuildArgs, accel: &str) -> Result
 
     let qemu = build.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
-    cmd.args(
-        build
-            .arch
-            .qemu_args(&kernel, &build.display, build.hw_profile, build.gpu_backend),
-    );
+    cmd.args(build.arch.qemu_args(
+        &kernel,
+        &build.display,
+        build.hw_profile,
+        build.gpu_backend,
+        "",
+    ));
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
     println!("xtask bpf-bench: launching {qemu} {}", kernel.display());

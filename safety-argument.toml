@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "c11541a900954ca689c6153a21d1be15c789edc0f5d84425a61565ee5ef29fb1"
+prompt_hash = "42db698dcd4c06a93a740337591706deb4215a48b95c3fdf21cc461675b3397f"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1408,3 +1408,18 @@ argument = "frame/src/aarch64/trap.rs: a synchronous exception taken from EL0 (S
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "frame/src/x86_64/trap.rs and frame/src/aarch64/trap.rs: when demand paging of a user-half address returns AddressSpaceError::GuardPage (the page carries an MADV_GUARD_INSTALL marker), the fault handler skips the stack-growth attempt, exactly as it already does for Bus. The fault then reaches the existing SIGSEGV delivery, whose si_code is SEGV_MAPERR for a guard page (Linux: VM_FAULT_SIGSEGV -> bad_area_nosemaphore). A kernel-mode fault with a guarded uaccess armed still falls through to the probe fixup (EFAULT). The handler maps nothing and removes no checks; it declines one recovery path. The user-mode gates (CS RPL == 3 / EL0, user-half address), authority, domains and the entry/exit paths are unchanged."
+
+# External kernel composition. The dedicated security-review skill was not
+# available in this session; two-maintainer review including a security
+# reviewer remains mandatory.
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "frame gains one feature-gated call to a generated initcall registrar. The hook adds no runtime loader, parser, authority, or new TCB subsystem: xtask resolves and validates the build-time manifest on the host, and the generated file is compiled as ordinary kernel source. Selecting a built-in is therefore an explicit kernel build input subject to the same image review as an in-tree linked crate; module components remain outside the TCB and use the existing loader."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A composed built-in receives only a validated DomainId value selected at build time and must use the existing capability-checked Rust registration surfaces; composition does not mint capabilities or expose memory. Runtime module placement continues through the existing module loader and call gate, which reject FRAME and retain signature, KABI, declared-capability, dependency, W^X, and domain enforcement. Per-path boot mappings change only which validated domain name is supplied to that loader."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The generated registrar and per-module boot argument add no isolation exception. Unknown stages, entry syntax, domains, duplicate components, malformed per-path domain mappings, and unsigned modules without explicit development policy fail closed. For signed entries, xtask verifies the detached signature and provisions the selected public key through the existing build-time trust-store interface; module bytes are still authenticated before decompression or execution. Built-in crates are deliberately part of the signed kernel image rather than dynamically admitted code."

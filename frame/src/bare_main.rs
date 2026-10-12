@@ -2952,6 +2952,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // ABI hash from the surface. Until this runs KSYMTAB is empty,
             // so a module can be relocated but cannot call anything.
             narf_modules::register_initcalls();
+            #[cfg(feature = "external-composition")]
+            crate::external_composition::register_initcalls();
 
             // BPF: collect and validate the `narf.kfuncs` link section.
             // `Subsys` because collection allocates; the boot-order
