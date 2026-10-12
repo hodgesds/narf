@@ -72,9 +72,12 @@ Boot integration: `frame/src/bare_main.rs` calls
   * `modules-initramfs-autoload` immediately after `modules-abi` — when the
     bootloader-supplied command line contains `modules_load=`, loads those
     comma-separated initramfs paths before `Stage::Device` probes hardware.
-    `modules_domain=<name>` applies the operator's placement override to every
-    listed module. Signature, ABI, capability, and non-`FRAME` checks are the
-    same as for `init_module(2)`; without `modules_load=` this is a no-op.
+    `modules_domains=path=domain,...` applies per-image placement;
+    `modules_domain=<name>` is the fallback for unmatched images. Signature,
+    ABI, capability, and non-`FRAME` checks are the same as for
+    `init_module(2)`; without `modules_load=` this is a no-op. `cargo xtask
+    run --composition FILE` generates and stages this list for external module
+    crates.
   * `modules-sysfs` at `Stage::Fs` — installs `/proc/modules` and
     `/sys/kernel/abi_hash`.
 

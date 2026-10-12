@@ -43,6 +43,29 @@ passed as a comma-separated `--features` list. Do not enable development-only
 features such as `firmware-allow-unsigned` or `module-allow-unsigned` on a
 production image.
 
+## Build a distribution composition
+
+Keep distribution or site-specific crate selection outside the NARF checkout
+and pass it to every build/media command:
+
+```sh
+cargo xtask build --arch=x86_64 --composition /etc/narf/site.toml
+cargo xtask image --arch=x86_64 --composition /etc/narf/site.toml
+```
+
+Built-in entries are fixed into the image, including any declared protection
+domain. Module entries are ABI-stamped for that kernel, staged in the
+initramfs, and autoloaded in their per-module domains. Production compositions
+must provide a detached signature and public key for every module; do not use
+`allow_unsigned_modules` or `--allow-unsigned-modules` in a shipping profile.
+Those public keys are added to the kernel's build-time module trust store;
+an existing absolute `NARF_MODULE_TRUSTED_KEYS` store is retained and merged.
+Paths are relative to the composition file, which makes the file relocatable
+with its packaging inputs. Generated overlays and artifacts are under
+`target/narf-compositions/`; neither source checkout is edited. See
+[External kernel composition](extending/composition.md) for the schema and the
+current aarch64 UEFI module-image limitation.
+
 ## Assign a host PCIe device to QEMU
 
 On x86_64, `--passthrough-device BDF` assigns a Linux host PCI function through
@@ -106,6 +129,11 @@ cargo xtask build-module --package narf-drivers-net-e1000 \
   --arch x86_64 --kernel-abi 0x1f3a90c2
 ```
 
+For an out-of-tree crate, pass
+`--manifest-path /path/to/crate/Cargo.toml`. A composition normally replaces
+this manual sequence for an image build and derives the ABI stamp directly
+from the selected kernel.
+
 Add `--compress` for the bounded LZ4 envelope. Production kernels embed raw
 Ed25519 trust roots from the absolute build-time path in
 `NARF_MODULE_TRUSTED_KEYS`. Sign `BLAKE3(the exact final .ko or .ko.lz4
@@ -140,9 +168,13 @@ bootloader-supplied kernel command line:
 modules_load=lib/modules/e1000.ko modules_domain=driver2
 ```
 
+For independent placement, use
+`modules_domains=lib/modules/e1000.ko=driver2,lib/modules/acme.ko=driver3`.
+`modules_domain` remains the fallback for paths without a mapping.
+
 The comma-separated `modules_load=` list is processed before PCI device
-probing. `modules_domain=` is the administrator's placement override for those
-images. It does not bypass signatures, ABI matching, declared capability
+probing. `modules_domains=` is the per-image administrator override and
+`modules_domain=` is its fallback. Neither bypasses signatures, ABI matching, declared capability
 checks, or the rule that runtime-loaded text cannot enter `FRAME`.
 
 The manifest's `target_domain=` is the author's default. The authorized caller

@@ -54,6 +54,18 @@ links them into one relocatable object. It works for x86_64 and aarch64. The
 ABI hash is derived from the target kernel's export table, so it must come from
 that kernel rather than being guessed when the crate is written.
 
+An out-of-tree crate is accepted directly:
+
+```sh
+cargo xtask build-module --manifest-path ../acme/Cargo.toml \
+  --package acme-driver --no-default-features --features module \
+  --arch x86_64 --kernel-abi 0x1f3a90c2
+```
+
+For a complete image, [external composition](composition.md) performs the
+kernel build, ABI stamp, module build, initramfs staging, and boot arguments as
+one operation without adding either crate to the NARF workspace.
+
 ## Manifest, parameters, and dependencies
 
 The `.modinfo` manifest names the module and may declare `version`, `license`,
@@ -128,3 +140,7 @@ Paths are comma-separated. The optional domain is an operator override applied
 to each listed image; normal signature, ABI, dependency, capability, and
 non-`FRAME` placement checks still run. This is an explicit image list, not a
 dependency or PCI-alias autoloader.
+
+When listed modules need different placements, use
+`modules_domains=path=domain,...`; a matching path overrides the global
+`modules_domain` fallback.

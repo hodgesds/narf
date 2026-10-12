@@ -10,10 +10,11 @@ many core subsystems separate mechanism from replaceable policy. This reference
 goes one level deeper: it identifies the real trait surfaces, registration
 entry points, and minimal worked skeletons for an extension crate.
 
-Where the "extend via custom crate" story is not cleanly possible today (for
-example, because the built-in crate still needs link-time wiring), the relevant
-doc says so plainly. Paths and symbol names are navigation aids; the current
-source and subsystem specification remain authoritative.
+External built-ins and modules can be selected without editing this repository;
+start with [composition.md](composition.md). Individual subsystem docs still
+flag places where no public registration seam exists. Paths and symbol names
+are navigation aids; the current source and subsystem specification remain
+authoritative.
 
 ## Workspace layout
 
@@ -29,6 +30,7 @@ crate. The subsystems this reference covers:
 | `narf-capabilities` / `narf-security` | `capabilities/`, `security/` | [capabilities.md](capabilities.md) |
 | syscall table         | `userspace/`    | [syscalls.md](syscalls.md) |
 | runtime modules       | `modules/`      | [modules.md](modules.md) |
+| external composition  | `build/xtask/`  | [composition.md](composition.md) |
 
 > `security-model/` is a spec-only crate (README + `specification/` +
 > `research/`; no `src/`). The runtime security code lives in `security/`
@@ -53,8 +55,8 @@ model, and [modules.md](modules.md) for the runtime path.
 | Char devices   | [chardev.md](chardev.md)  | `FileOps` + devfs publication hooks |
 
 Places where clean extension is **not** possible today are flagged in the
-relevant doc. A built-in crate still needs link-time retention/wiring. A
-runtime module avoids that line but is limited to the symbols actually exported
+relevant doc. The composition overlay provides link-time retention for an
+external built-in. A runtime module is limited to the symbols actually exported
 by `modules/src/kabi.rs`; most internal Rust traits are deliberately not a
 binary ABI. Platform-device discovery, crypto algorithms, and several backend
 pickers also remain closed sets. See [drivers.md](drivers.md) and
