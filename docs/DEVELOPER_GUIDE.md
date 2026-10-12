@@ -193,3 +193,26 @@ For Linux ABI work, update the appropriate executable smoke and keep
 the public interface in
 [userspace/specification/spec.md](../userspace/specification/spec.md)
 consistent with the implementation.
+
+## Prepare an independent crate point release
+
+Crates.io versions are not tied to the NARF kernel release. Only manifests
+with an explicit `package.version` and
+`package.metadata.narf.release-managed = true` participate in release
+automation; crates that inherit `workspace.package.version` are left alone.
+
+```sh
+# Show the current opt-in set and its publication-tag names.
+cargo xtask crate-release list
+
+# Prepare and locally package-check one crate. Repeat --package as needed.
+cargo xtask crate-release bump --package narf-tpm
+cargo xtask crate-release check --package narf-tpm
+```
+
+The bump command also supplies registry versions for local path dependencies.
+It never publishes or commits. For a reviewed major/minor change, use
+`--set NAME=VERSION`. The GitHub `Crate version pull request` workflow can run
+the same operation on demand and can open monthly changed-crate PRs once the
+`NARF_MONTHLY_CRATE_BUMPS` repository variable is enabled. Publication remains
+disabled until the desktop-support release gate is approved.

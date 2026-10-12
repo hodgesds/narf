@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
+[package.metadata.narf]
+release-managed = true
+
 [dependencies]
 narf-lib = { path = "../lib" }
 narf-net = { path = "../net" }

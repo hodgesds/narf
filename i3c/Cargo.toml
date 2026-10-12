@@ -3,6 +3,9 @@ name = "narf-i3c"
 version = "0.1.0"
 edition = "2021"
 
+[package.metadata.narf]
+release-managed = true
+
 [dependencies]
 narf-lib = { path = "../lib" }
 narf-capabilities = { path = "../capabilities" }
