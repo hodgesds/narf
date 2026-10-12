@@ -1122,6 +1122,76 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Make the staged surface the visible source of the pipe's running black
+    /// DP video, after re-binding its programmed deadlines.
+    /// # Safety
+    /// The surface must hold the intended image and stay allocated until a
+    /// successful stop. Exclude firmware/FAMS and concurrent display/hub/VM/IRQ/
+    /// clock/reset/power writers; retain everything on failure or cancellation.
+    pub async unsafe fn start_display_scanout(
+        &mut self,
+        pipe: u8,
+    ) -> Result<otg::ScanoutRunning, otg::Error> {
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_scanout(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    crystal,
+                )
+                .await
+        }
+    }
+    /// Re-verify a live scanout and return its frame count; an underflow
+    /// returns the pipe to black and is retained in the OTG status.
+    /// # Safety
+    /// As for `start_display_scanout`.
+    pub async unsafe fn check_display_scanout(&mut self, pipe: u8) -> Result<u32, otg::Error> {
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .check_scanout(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    crystal,
+                )
+                .await
+        }
+    }
+    /// Return a live pipe to black video with fetch drained and clocks gated.
+    /// # Safety
+    /// As for `start_display_scanout`; on failure the surface stays allocated.
+    pub async unsafe fn stop_display_scanout(&mut self, pipe: u8) -> Result<(), otg::Error> {
+        let crystal = *self.crystal.as_ref().map_err(|_| otg::Error::Unsupported)?;
+        let gmc = self.sequence.backend.gmc.as_mut().ok_or(otg::Error::Busy)?;
+        // SAFETY: matching retained owners are serialized; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_scanout(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    gmc,
+                    pipe,
+                    crystal,
+                )
+                .await
+        }
+    }
     /// Blank one native DP video stream before separate encoder/PHY retirement.
     /// # Safety
     /// Stop CPU scanout writers, exclude firmware/FAMS and concurrent display,

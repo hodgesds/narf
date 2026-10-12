@@ -765,6 +765,62 @@ sticky as for the other preparation steps. `tests/dcn401_deadline.c` checks
 the native offsets and masks. Route connection, fetch enable and activation
 remain separate and must rebind the plan.
 
+`unsafe Otg::start_scanout(&mut clocks, &mut dccg, &mut gmc, pipe,
+crystal_khz).await` (ColdBoot/platform `start_display_scanout`) makes the staged
+surface the visible source of a pipe whose legacy DP SST stream is in
+`DpVideoRunning` with the OPP DPG producing black. It rebinds the programmed
+deadlines with DCCG's read-only `retained_timing_clock` (the link is live),
+re-reads the surface, memory, MPC, requestor and DLG/TTU/watermark registers,
+and requires: the matching OTG running with no held lock, GSL or MPCC update
+lock; no OTG, pipe-update, OPTC or DPG transaction pending; no HUBP or OPTC
+underflow; and a blank, drained, clock-gated HUBP with DPP clock gated,
+detached routes and the DPG still black.
+
+Following Linux's plane-enable path, it then ungates the HUBP and DPP clocks,
+takes the OTG master-update lock (selected via `OTG_MASTER_UPDATE_LOCK_SEL`;
+the lock status must assert, where Linux proceeds after 10 us), and forces
+P-state change off for the transition. Under the lock it returns the DPG to
+video mode, inserts MPCC n (bottom none, top DPP n, OPP n, update-lock OPP n,
+output mux), re-arms the surface address (high, then the publishing low) and
+clears `HUBP_BLANK_EN`/`HUBP_TTU_DISABLE`. Releasing the lock latches all of
+it at one VUPDATE. Within a bound of three frames plus 5 ms it waits for
+`dcn401_post_unlock_program_front_end`'s evidence: no flip pending and
+`SURFACE_EARLIEST_INUSE` equal to the owned address (a requested-address
+readback is not presentation), with DPG disabled and its pending bit, the OTG
+update and pipe-update pending bits clear, and the MPCC no longer disabled.
+The P-state force is then released, the routes and unblank are read back, and
+two fresh frame counts must pass without underflow. `ScanoutRunning` records
+the plan, address and frames in `ScanoutRunning(pipe)`.
+
+`unsafe Otg::stop_scanout(...)` reverses it: under the lock the DPG returns to
+the staged black value and every MPCC route detaches; after unlock it waits
+for the black latch and an idle or disabled MPCC, then for
+`HUBP_NO_OUTSTANDING_REQ` before blanking the HUBP, and gates the HUBP and DPP
+clocks only after that. Linux's DET release and power gating are not
+performed: the staged state is re-verified and the owner returns to
+`DpVideoRunning`, so the pipe can start again. Any timeout, underflow,
+readback mismatch, owner change or cancellation after the first write leaves
+`Failed` or the transitional state; nothing is replayed or released, and the
+surface must stay allocated because fetch retirement was not proven.
+`unsafe Otg::check_scanout(...)` is the read-only health check of a live pipe.
+It rebinds the deadlines as above and re-verifies the running DP stream with
+`fetchers_stopped_except`: the owned pipe must show exactly its live fetch
+(HUBP unblanked with TTU enabled and clock on, DPP clock on, DPG fields zero,
+MPCC not disabled, all routes connected, cursor off, requested and
+EARLIEST_INUSE addresses equal to the owned surface), while every other powered
+HUBP must still be stopped and every auxiliary fetcher disabled. The black-video
+OPP verification accepts the DPG in video mode only for that pipe. Mismatches
+are reported without writes. A HUBP or OPTC underflow (on check, or during
+start) records `ScanoutUnderflow` (pipe, address, HUBP status, OPTC bit, frame)
+in `Status::underflow`, runs the stop sequence without failing on the sticky
+status, strobes `HUBP_UNDERFLOW_CLEAR`/`OPTC_UNDERFLOW_CLEAR`, requires the
+status to stay clear with fetch blanked, rebinds the owners and returns to
+`DpVideoRunning`. If that cannot be proven, the pipe is `Failed`. Other start
+failures quarantine without recovery.
+
+`tests/dcn401_scanout.c` checks the native registers, including the MPC block's
+DCN bank 3. Physical presentation on the sink remains unverified.
+
 The port deliberately diverges from Linux where Linux would program something
 the hardware cannot honour: it enforces the Tpre > max(Turg, Ttrip) + Tex
 prefetch check Linux compiles out (`#if 0`), which matters precisely because

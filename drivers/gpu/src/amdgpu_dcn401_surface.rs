@@ -19,6 +19,9 @@ pub use requestor::RequestorApplied;
 #[path = "amdgpu_dcn401_deadline.rs"]
 mod deadline;
 pub use deadline::DeadlinesApplied;
+#[path = "amdgpu_dcn401_scanout.rs"]
+mod scanout;
+pub use scanout::{ScanoutRunning, ScanoutUnderflow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFormat {

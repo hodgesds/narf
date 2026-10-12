@@ -35,15 +35,43 @@ impl<I: Io> Engine<I> {
         self.dp_video_verify_route(w, true)
     }
     fn dp_video_verify_route(&mut self, w: Work, connected: bool) -> Result<(), Error> {
+        self.dp_video_verify_source(w, connected, None)
+    }
+    /// The running DP video stream with the owned surface as its live source.
+    pub(in crate::amdgpu_dcn401_otg) fn dp_video_verify_scanout(
+        &mut self,
+        live: ScanoutRunning,
+    ) -> Result<(), Error> {
+        let running = self.status.dp_video_running.ok_or(Error::Invalid)?;
+        if running.frontend.request.pipe != live.pipe
+            || running.frontend.request.stream != live.stream
+        {
+            return Err(Error::Invalid);
+        }
+        let w = Work {
+            frontend: running.frontend,
+            timing: true,
+            pending: false,
+            mn: running.mn,
+        };
+        self.dp_video_verify_source(w, true, Some(live))
+    }
+    fn dp_video_verify_source(
+        &mut self,
+        w: Work,
+        connected: bool,
+        live: Option<ScanoutRunning>,
+    ) -> Result<(), Error> {
         let l = self.layout;
         let p = w.frontend.request.pipe;
         self.dp_frontend_verify_source(w.frontend, w.timing.then_some(p), w.pending)?;
-        self.fetchers_stopped()?;
-        self.verify_blank_route(
+        self.fetchers_stopped_except(live)?;
+        self.verify_blank_source(
             w.frontend.blank,
             w.frontend.blank.timing.request.plan()?,
             w.timing,
             connected,
+            live.is_some(),
         )?;
         for (at, mask, expected) in [
             (

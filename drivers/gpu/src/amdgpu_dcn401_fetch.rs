@@ -10,8 +10,8 @@ pub use power::HubpPower;
 mod surface;
 pub(super) use surface::Surfaces;
 pub use surface::{
-    DeadlinesApplied, DppApplied, MemoryApplied, MpcApplied, RequestorApplied, SurfaceApplied,
-    SurfaceFormat, SurfaceRequest,
+    DeadlinesApplied, DppApplied, MemoryApplied, MpcApplied, RequestorApplied, ScanoutRunning,
+    ScanoutUnderflow, SurfaceApplied, SurfaceFormat, SurfaceRequest,
 };
 
 const HUBP_CONTROL: u64 = 0x5f4;
@@ -72,8 +72,24 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     pub(super) fn fetchers_stopped(&mut self) -> Result<(), Error> {
+        self.fetchers_stopped_except(None)
+    }
+    /// As `fetchers_stopped`, except that the one owned live scanout must show
+    /// exactly its connected, unblanked fetch of the owned surface.
+    pub(in crate::amdgpu_dcn401_otg) fn fetchers_stopped_except(
+        &mut self,
+        live: Option<ScanoutRunning>,
+    ) -> Result<(), Error> {
         let l = self.layout;
         for pipe in 0..4 {
+            if let Some(s) = live.filter(|s| s.pipe == pipe) {
+                if !self.hubp_powered(pipe)? {
+                    return Err(Error::Busy);
+                }
+                self.live_fetch(pipe, s.address)?;
+                self.auxiliary_fetchers_stopped(pipe)?;
+                continue;
+            }
             if !self.hubp_powered(pipe)? {
                 continue;
             }

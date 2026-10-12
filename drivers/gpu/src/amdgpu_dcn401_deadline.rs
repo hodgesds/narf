@@ -193,7 +193,12 @@ fn arbiter(plan: &dml::Plan) -> [(u64, u32, u32); 5] {
 }
 
 impl<I: Io> Engine<I> {
-    fn deadline_writes(&mut self, pipe: u8, plan: &dml::Plan, verify: bool) -> Result<(), Error> {
+    pub(super) fn deadline_writes(
+        &mut self,
+        pipe: u8,
+        plan: &dml::Plan,
+        verify: bool,
+    ) -> Result<(), Error> {
         let l = self.layout;
         let hubbub = |reg| l.base + reg * 4;
         let each = |e: &mut Self, at: u64, mask: u32, value: u32| {
@@ -244,7 +249,7 @@ impl<I: Io> Engine<I> {
 /// full-frame surface, DET and DCHUB reference, and for at least its clocks
 /// with the pinned UCLK/DCFCLK floors it assumed. The plan is also
 /// re-admitted, so a value built or edited outside admission is refused.
-fn bound(
+pub(super) fn bound(
     plan: &dml::Plan,
     timing: Request,
     a: RequestorApplied,

@@ -387,6 +387,16 @@ clocks and reference, then programs and reads back HUBP DLG/TTU fields, both
 DCHUBBUB watermark sets and arbiter state with fetch stopped. Self-refresh is
 force-disallowed; UCLK switching stays disabled in PMFW. Route connection,
 fetch enable and visible activation remain open.
+Native single-pipe scanout start/stop now runs on the black DP SST stream:
+under one OTG master-update lock it releases the DPG, connects the MPCC route,
+re-arms the address and unblanks the HUBP, then requires EARLIEST_INUSE to
+report the owned surface, cleared pending bits and two fresh frames without
+underflow. Stop returns to black, detaches, waits for MPCC idle and drained
+requests before blanking and gating clocks, and re-verifies the staged pipe so
+it can restart. A read-only health check recognises exactly the owned live
+fetch while every other HUBP stays stopped; underflow is recorded and returns
+the pipe to black through the same drain, or quarantines it if that cannot be
+proven. These paths are model-tested only; no sink has shown the image.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

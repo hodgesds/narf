@@ -18,7 +18,8 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 mod fetch;
 pub use fetch::{
     DeadlinesApplied, DppApplied, HubpPower, MemoryApplied, MpcApplied, PlanesRetired,
-    RequestorApplied, SurfaceApplied, SurfaceFormat, SurfaceRequest,
+    RequestorApplied, ScanoutRunning, ScanoutUnderflow, SurfaceApplied, SurfaceFormat,
+    SurfaceRequest,
 };
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;
@@ -90,6 +91,8 @@ pub enum Error {
     DpTraining(DpTrainingError),
     Memory(crate::amdgpu_gmc_navi48::Error),
     Admission(dml::Error),
+    /// HUBP or OPTC underflow observed at this register during scanout.
+    Underflow(u64),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -151,6 +154,9 @@ pub enum State {
     RequestorPrepared,
     PreparingDeadlines(u8),
     DeadlinesPrepared,
+    StartingScanout(u8),
+    ScanoutRunning(u8),
+    StoppingScanout(u8),
     Retiring(u8),
     Retired,
     Failed(Error),
@@ -255,6 +261,12 @@ pub struct Status {
     /// Admitted DLG/TTU/watermark programming for the staged requestor.
     /// Fetch stays stopped; never evidence of activation or presentation.
     pub deadlines: Option<DeadlinesApplied>,
+    /// Current only in ScanoutRunning: the owned surface is the live source.
+    /// Stopping returns to black video with fetch drained and clocks gated.
+    pub scanout: Option<ScanoutRunning>,
+    /// Last underflow that returned a live scanout to black. Retained across
+    /// later starts as a diagnostic until another underflow replaces it.
+    pub underflow: Option<ScanoutUnderflow>,
     /// Historical DP video blanking only; never PHY, timing or memory retirement.
     pub dp_blanked: Option<DpBlanked>,
     /// Historical stream-encoder shutdown only; PHYs and memory stay retained.
@@ -713,6 +725,8 @@ impl Otg {
                     mpcs: [None; 4],
                     requestor: None,
                     deadlines: None,
+                    scanout: None,
+                    underflow: None,
                     dp_blanked: None,
                     dp_encoder_retired: None,
                     dp_sst_disabled: None,

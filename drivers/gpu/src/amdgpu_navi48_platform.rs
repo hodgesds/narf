@@ -530,6 +530,47 @@ pub async unsafe fn prepare_display_deadlines(
     unsafe { boot.prepare_display_deadlines(pipe, &plan).await }
 }
 
+/// Make the staged surface the visible source of the pipe's running black video.
+/// # Safety
+/// The surface must stay allocated until a successful stop. Exclude firmware/FAMS
+/// and concurrent display/hub/VM/IRQ/clock/reset/power writers.
+pub async unsafe fn start_display_scanout(
+    pipe: u8,
+) -> Result<crate::amdgpu_dcn401_otg::ScanoutRunning, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.start_display_scanout(pipe).await }
+}
+
+/// Re-verify a live scanout; an underflow returns the pipe to black.
+/// # Safety
+/// As for `start_display_scanout`.
+pub async unsafe fn check_display_scanout(
+    pipe: u8,
+) -> Result<u32, crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.check_display_scanout(pipe).await }
+}
+
+/// Return a live pipe to black video with fetch drained and clocks gated.
+/// # Safety
+/// As for `start_display_scanout`.
+pub async unsafe fn stop_display_scanout(pipe: u8) -> Result<(), crate::amdgpu_dcn401_otg::Error> {
+    let mut owner = OWNER.lock().await;
+    let boot = owner
+        .as_mut()
+        .ok_or(crate::amdgpu_dcn401_otg::Error::Busy)?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    unsafe { boot.stop_display_scanout(pipe).await }
+}
+
 /// Blank one legacy or HPO DisplayPort video stream, retaining timing/link clocks.
 /// # Safety
 /// Stop CPU scanout writers and exclude firmware/FAMS and concurrent display,

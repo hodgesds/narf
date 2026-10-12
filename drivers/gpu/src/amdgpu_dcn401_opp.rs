@@ -30,7 +30,7 @@ pub enum ColorDepth {
     Bpc12,
 }
 impl ColorDepth {
-    fn dpg(self) -> u32 {
+    pub(in crate::amdgpu_dcn401_otg) fn dpg(self) -> u32 {
         match self {
             Self::Bpc8 => 1,
             Self::Bpc10 => 2,

@@ -347,6 +347,8 @@ pub(super) fn engine() -> Engine<Fake> {
             mpcs: [None; 4],
             requestor: None,
             deadlines: None,
+            scanout: None,
+            underflow: None,
             dp_blanked: None,
             dp_encoder_retired: None,
             dp_sst_disabled: None,

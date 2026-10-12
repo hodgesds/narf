@@ -50,6 +50,18 @@ impl<I: Io> Engine<I> {
         running: bool,
         connected: bool,
     ) -> Result<(), Error> {
+        self.verify_blank_source(blank, plan, running, connected, false)
+    }
+    /// `video`: the owned scanout has released the DPG into video mode; every
+    /// other OPP/FMT field must still hold its staged value.
+    pub(in crate::amdgpu_dcn401_otg) fn verify_blank_source(
+        &mut self,
+        blank: BlankApplied,
+        plan: Plan,
+        running: bool,
+        connected: bool,
+        video: bool,
+    ) -> Result<(), Error> {
         let l = self.layout;
         let p = blank.request.pipe;
         for (r, mask, value) in plan.registers() {
@@ -78,6 +90,7 @@ impl<I: Io> Engine<I> {
             self.expect(at, mask, value)?;
         }
         for (r, mask, value) in blank.request.registers(plan.request.timing) {
+            let value = if video && r == DPG { 0 } else { value };
             self.expect(l.opp(p, r), mask, value)?;
         }
         Ok(())
