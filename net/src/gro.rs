@@ -45,6 +45,8 @@ struct Held {
     key: FlowKey,
     frame: Vec<u8>,
     tcp_off: usize,
+    tcp_header_len: usize,
+    timestamp_offset: Option<usize>,
     next_seq: u32,
     segs: u16,
 }
@@ -60,10 +62,25 @@ pub struct Gro {
 struct Parsed {
     key: FlowKey,
     tcp_off: usize,
+    tcp_header_len: usize,
+    timestamp_offset: Option<usize>,
     seq: u32,
     flags: u8,
     psh: bool,
     payload_len: usize,
+}
+
+/// Return the TCP-relative TSval offset for the one options layout Linux uses
+/// on established timestamped flows. Other option sets stay on the ordinary
+/// per-segment path until their merge semantics are specified.
+fn timestamp_offset(options: &[u8]) -> Option<Option<usize>> {
+    if options.is_empty() {
+        return Some(None);
+    }
+    if options.len() == 12 && options[..4] == [1, 1, 8, 10] {
+        return Some(Some(24));
+    }
+    None
 }
 
 fn parse_ipv4_tcp(frame: &[u8]) -> Option<Parsed> {
@@ -82,13 +99,14 @@ fn parse_ipv4_tcp(frame: &[u8]) -> Option<Parsed> {
     }
     let ip_total = u16::from_be_bytes([frame[eth + 2], frame[eth + 3]]) as usize;
     let tcp_off = eth + ihl;
-    if frame.len() < tcp_off + 20 || ip_total < ihl + 20 {
+    if frame.len() < tcp_off + 20 || ip_total < ihl + 20 || eth + ip_total > frame.len() {
         return None;
     }
     let data_off = (frame[tcp_off + 12] >> 4) as usize * 4;
-    if data_off != 20 {
-        return None; // TCP options (timestamps, etc.): not coalesced.
+    if !(20..=60).contains(&data_off) || ip_total < ihl + data_off {
+        return None;
     }
+    let timestamp_offset = timestamp_offset(&frame[tcp_off + 20..tcp_off + data_off])?;
     let flags = frame[tcp_off + 13];
     let payload_len = (ip_total - ihl - data_off).min(frame.len() - tcp_off - data_off);
     Some(Parsed {
@@ -99,6 +117,8 @@ fn parse_ipv4_tcp(frame: &[u8]) -> Option<Parsed> {
             dst_port: u16::from_be_bytes([frame[tcp_off + 2], frame[tcp_off + 3]]),
         },
         tcp_off,
+        tcp_header_len: data_off,
+        timestamp_offset,
         seq: u32::from_be_bytes(frame[tcp_off + 4..tcp_off + 8].try_into().ok()?),
         flags,
         psh: flags & FLAG_PSH != 0,
@@ -160,11 +180,28 @@ impl Gro {
         {
             let h = &self.held[i];
             let contiguous = p.seq == h.next_seq;
-            let fits = h.frame.len() - h.tcp_off - 20 + p.payload_len <= MAX_GRO_BYTES;
-            if contiguous && fits {
+            let compatible = p.tcp_header_len == h.tcp_header_len
+                && p.timestamp_offset == h.timestamp_offset
+                && p.flags & !FLAG_PSH == h.frame[h.tcp_off + 13] & !FLAG_PSH;
+            let fits =
+                h.frame.len() - h.tcp_off - h.tcp_header_len + p.payload_len <= MAX_GRO_BYTES;
+            if contiguous && compatible && fits {
                 // Merge: append this segment's payload to the held frame.
-                let data_start = p.tcp_off + 20;
+                let data_start = p.tcp_off + p.tcp_header_len;
                 let h = &mut self.held[i];
+                // The coalesced segment begins at the first sequence number,
+                // but its ACK/window and timestamp state must reflect the
+                // newest wire segment in the batch. Preserve PSH when the
+                // newest segment uses it to terminate the burst.
+                h.frame[h.tcp_off + 8..h.tcp_off + 12]
+                    .copy_from_slice(&frame[p.tcp_off + 8..p.tcp_off + 12]);
+                h.frame[h.tcp_off + 13] = p.flags;
+                h.frame[h.tcp_off + 14..h.tcp_off + 16]
+                    .copy_from_slice(&frame[p.tcp_off + 14..p.tcp_off + 16]);
+                if h.timestamp_offset.is_some() {
+                    h.frame[h.tcp_off + 20..h.tcp_off + h.tcp_header_len]
+                        .copy_from_slice(&frame[p.tcp_off + 20..p.tcp_off + p.tcp_header_len]);
+                }
                 h.frame
                     .extend_from_slice(&frame[data_start..data_start + p.payload_len]);
                 h.next_seq = h.next_seq.wrapping_add(p.payload_len as u32);
@@ -202,6 +239,8 @@ impl Gro {
             key: p.key,
             frame,
             tcp_off: p.tcp_off,
+            tcp_header_len: p.tcp_header_len,
+            timestamp_offset: p.timestamp_offset,
             next_seq,
             segs: 1,
         });
@@ -248,6 +287,45 @@ mod gro_tests {
         let cs = ipv4_pseudo_checksum(src, dst, &f[tcp_off..]);
         f[tcp_off + 16..tcp_off + 18].copy_from_slice(&cs.to_be_bytes());
         f
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn timestamped_seg(
+        src: [u8; 4],
+        dst: [u8; 4],
+        seq: u32,
+        ack: u32,
+        window: u16,
+        flags: u8,
+        tsval: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        const TCP_TS_HEADER_LEN: usize = TCP_HDR_MIN + 12;
+        let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
+        let total = tcp_off + TCP_TS_HEADER_LEN + payload.len();
+        let mut frame = alloc::vec![0u8; total];
+        frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+        frame[ETH_HDR_LEN] = 0x45;
+        let ip_total = (IPV4_HDR_LEN + TCP_TS_HEADER_LEN + payload.len()) as u16;
+        frame[ETH_HDR_LEN + 2..ETH_HDR_LEN + 4].copy_from_slice(&ip_total.to_be_bytes());
+        frame[ETH_HDR_LEN + 9] = IP_PROTO_TCP;
+        frame[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src);
+        frame[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst);
+        set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
+        frame[tcp_off..tcp_off + 2].copy_from_slice(&1111u16.to_be_bytes());
+        frame[tcp_off + 2..tcp_off + 4].copy_from_slice(&80u16.to_be_bytes());
+        frame[tcp_off + 4..tcp_off + 8].copy_from_slice(&seq.to_be_bytes());
+        frame[tcp_off + 8..tcp_off + 12].copy_from_slice(&ack.to_be_bytes());
+        frame[tcp_off + 12] = (TCP_TS_HEADER_LEN as u8 / 4) << 4;
+        frame[tcp_off + 13] = flags;
+        frame[tcp_off + 14..tcp_off + 16].copy_from_slice(&window.to_be_bytes());
+        frame[tcp_off + 20..tcp_off + 24].copy_from_slice(&[1, 1, 8, 10]);
+        frame[tcp_off + 24..tcp_off + 28].copy_from_slice(&tsval.to_be_bytes());
+        frame[tcp_off + 28..tcp_off + 32].copy_from_slice(&77u32.to_be_bytes());
+        frame[tcp_off + TCP_TS_HEADER_LEN..].copy_from_slice(payload);
+        let checksum = ipv4_pseudo_checksum(src, dst, &frame[tcp_off..]);
+        frame[tcp_off + 16..tcp_off + 18].copy_from_slice(&checksum.to_be_bytes());
+        frame
     }
 
     fn smoke_gro_ipv4_coalesce() -> TestResult {
@@ -302,6 +380,71 @@ mod gro_tests {
         TestResult::Pass
     }
     kernel_test_in!("net/gro", smoke_gro_ipv4_coalesce);
+
+    fn smoke_gro_timestamped_ipv4_coalesce() -> TestResult {
+        let src = [10, 0, 0, 5];
+        let dst = [10, 0, 0, 9];
+        let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
+        let mut gro = Gro::new();
+        if !gro
+            .offer(
+                "eth0",
+                timestamped_seg(src, dst, 1000, 50, 4096, FLAG_ACK, 10, &[1u8; 100]),
+            )
+            .is_empty()
+        {
+            return TestResult::Fail("first timestamped segment was not held");
+        }
+        let out = gro.offer(
+            "eth0",
+            timestamped_seg(
+                src,
+                dst,
+                1100,
+                60,
+                8192,
+                FLAG_ACK | FLAG_PSH,
+                11,
+                &[2u8; 50],
+            ),
+        );
+        if out.len() != 1 || gro.pending() {
+            return TestResult::Fail("timestamped PSH did not flush one coalesced frame");
+        }
+        let frame = &out[0].1;
+        if frame[tcp_off + 12] >> 4 != 8
+            || frame[tcp_off + 13] & FLAG_PSH == 0
+            || u32::from_be_bytes(frame[tcp_off + 8..tcp_off + 12].try_into().unwrap()) != 60
+            || u16::from_be_bytes(frame[tcp_off + 14..tcp_off + 16].try_into().unwrap()) != 8192
+            || u32::from_be_bytes(frame[tcp_off + 24..tcp_off + 28].try_into().unwrap()) != 11
+        {
+            return TestResult::Fail("coalesced frame did not retain newest TCP metadata");
+        }
+        if frame.len() - tcp_off - 32 != 150 {
+            return TestResult::Fail("timestamped coalesced payload length wrong");
+        }
+        if ipv4_pseudo_checksum(src, dst, &frame[tcp_off..]) != 0 {
+            return TestResult::Fail("timestamped coalesced TCP checksum invalid");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/gro", smoke_gro_timestamped_ipv4_coalesce);
+
+    fn smoke_gro_malformed_tcp_data_offset_bypasses() -> TestResult {
+        let src = [10, 0, 0, 5];
+        let dst = [10, 0, 0, 9];
+        let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
+        for words in [1u8, 15] {
+            let mut frame = seg(src, dst, 1, FLAG_ACK, &[7u8; 20]);
+            frame[tcp_off + 12] = words << 4;
+            let mut gro = Gro::new();
+            if gro.offer("eth0", frame).len() != 1 || gro.pending() {
+                return TestResult::Fail("malformed TCP data offset did not bypass GRO");
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/gro", smoke_gro_malformed_tcp_data_offset_bypasses);
 
     fn smoke_gro_flush_conditions() -> TestResult {
         let src = [10, 0, 0, 5];

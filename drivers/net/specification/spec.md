@@ -49,11 +49,22 @@ full from empty. Its zero-copy callback transfers DMA-buffer ownership into
 the descriptor slot and returns after publication; ordered DD reclaim returns
 completed buffers to the interface's shared pool. It honors `TxMeta::more` by
 deferring TDT until the burst boundary, while a nearly-full ring forces a
-doorbell. RX has one hardware-ring consumer path: both background and
-syscall-context drains run the same stack dispatch and optional raw-frame
-mirror, so the frame-ring observer cannot steal TCP packets.
+doorbell. If the next multi-descriptor TSO packet cannot fit, e1000 publishes
+the deferred partial batch before waiting for DD completions; it never waits
+on descriptors hidden behind an unwritten TDT. RX has one hardware-ring
+consumer path: both background and syscall-context drains run the same stack
+dispatch and optional raw-frame mirror, so the frame-ring observer cannot
+steal TCP packets. The background pump arms its IRQ waiter before the final DD
+check, drains ready descriptors in bounded 64-frame batches without timer
+pacing, and publishes all re-armed descriptors with one RDT doorbell per
+batch. It retains a bounded polling fallback for lost or unavailable
+interrupts. The shared completion vector starts with the legacy e1000 Linux
+policy of 20,000 interrupts/second (ITR/EITR0 interval 195, about 50
+microseconds) instead of generating an interrupt for every received frame.
+Registering an e1000 enables the stack's bounded software GRO path; the driver
+flushes held flows at RX-ring quiescence.
 
-For Ethernet/IPv4/TCP, e1000 advertises a bounded 16 KiB TSO frame. The public
+For Ethernet/IPv4/TCP, e1000 advertises a bounded 64 KiB TSO frame. The public
 `TxContextDesc::ipv4_tso` constructor encodes the 8254x context descriptor;
 the context is followed by extended data descriptors split at 4 KiB
 boundaries. `DTYP_D` occupies lower-dword bit 20 (`TxDesc::cso` bit 4), and all

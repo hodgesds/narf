@@ -590,6 +590,18 @@ fills, so an interrupted producer cannot strand descriptors indefinitely.
 The legacy `connect_in` / `send` / `recv` / `shutdown` (`Result<_, ()>`)
 remain for in-kernel callers that do not report errors.
 
+Successful `recv` / `recv_errno` calls track the last raw receive window sent
+on the connection. Once application reads cumulatively reopen at least one
+peer MSS, the stack emits an immediate pure ACK/window update; a sender is not
+left waiting for its persist timer after userspace has drained a full buffer.
+
+The opt-in software GRO path coalesces contiguous Ethernet/IPv4/TCP data up to
+65,000 payload bytes per flow and flushes at a driver's RX-poll completion.
+Plain 20-byte TCP headers and Linux's established-flow NOP/NOP/timestamp
+layout are eligible. A timestamped merge retains the first sequence number
+and newest ACK, window, flags, TSval, and TSecr; other option layouts and all
+control, urgent, fragmented, out-of-order, or non-IPv4 traffic bypass GRO.
+
 IPv4 and IPv6 share one TCB state machine, congestion/retransmit machinery,
 socket buffers, and errno path. Family-specific connected and listener
 indexes retain full-width addresses and include the network-namespace ID.
