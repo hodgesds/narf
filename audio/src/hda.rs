@@ -1,6 +1,7 @@
 //! Native HDA controllers and PCM. Register definitions follow the HDA spec;
 //! sequencing and AMD quirks follow /usr/src/linux/sound/hda/{core,controllers}.
 
+mod hdmi;
 mod routing;
 mod runtime;
 mod stream;

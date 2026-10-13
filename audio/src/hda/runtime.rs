@@ -6,7 +6,7 @@ use crate::{
 use alloc::{sync::Arc, vec::Vec};
 use core::{
     mem::ManuallyDrop,
-    sync::atomic::{fence, AtomicBool, Ordering},
+    sync::atomic::{fence, AtomicBool, AtomicU32, Ordering},
 };
 use narf_bus::{bar, BusDevice, BusDeviceCap};
 use narf_capabilities::{Cap, Write};
@@ -60,6 +60,11 @@ pub struct IntelHda {
     /// AMD GPU HD-Audio does not snoop (Linux AZX_DCAPS_SNOOP_OFF): CORB,
     /// RIRB, BDL and sample buffers need explicit cache maintenance.
     pub(crate) noncoherent: bool,
+    /// HDMI/DP port pins on GPU codecs and their last sensed sink.
+    pub(super) hdmi: IrqSafeSpinLock<Vec<super::hdmi::Port>>,
+    /// Sound card index once registered (`u32::MAX` before), for control
+    /// change notifications.
+    pub(super) card: AtomicU32,
 }
 impl core::fmt::Debug for IntelHda {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -196,6 +201,8 @@ impl IntelHda {
             }),
             ready: false,
             noncoherent,
+            hdmi: IrqSafeSpinLock::new(Vec::new()),
+            card: AtomicU32::new(u32::MAX),
         };
         if noncoherent {
             // The CPU zeroed both rings; write that back before the
@@ -285,6 +292,7 @@ impl IntelHda {
             return Err(HdaError::NoCodecs);
         }
         dev.discover_paths();
+        dev.hdmi = IrqSafeSpinLock::new(dev.hdmi_ports());
         dev.supported_formats = [
             dev.query_supported_formats(false),
             dev.query_supported_formats(true),
@@ -643,6 +651,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Arc::new(super::stream::Card(dev.clone())),
         Some(device.addr),
     );
+    dev.card.store(card, Ordering::Release);
     CONTROLLERS.lock().push((device.addr, dev.clone(), card));
     let weak = Arc::downgrade(&dev);
     narf_scheduler::spawn(async move {

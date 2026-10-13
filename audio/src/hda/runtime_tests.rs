@@ -22,6 +22,13 @@ struct Model {
     supports_32: bool,
     /// Answer as an AMD GPU HDMI codec instead of the Realtek analog one.
     ati: bool,
+    /// ATI: a surround monitor is on pin 3 (presence and ELD valid).
+    sink: bool,
+    /// ATI: pin 5 is a connected (but empty) second port.
+    second_port: bool,
+    /// ATI ELD emulation indices last written by 0x780 / 0x776.
+    sink_index: u32,
+    descriptor: u32,
 }
 impl Model {
     fn step(&mut self) {
@@ -51,7 +58,7 @@ impl Model {
                 // Interleave an unsolicited jack event with every reply. The
                 // completion ring must not be indexed with the CORB pointer.
                 let mut reply = if self.ati {
-                    ati_response(command)
+                    self.ati_response(command)
                 } else {
                     response(command)
                 };
@@ -106,30 +113,62 @@ fn response(command: u32) -> u32 {
         _ => 0,
     }
 }
-/// AMD GPU HDMI codec 0x1002aa01, revision 0x0700 (rev3+): AFG 1, ports as
-/// converter/pin pairs 2/3 and 4/5; pin 5 has no physical connection.
-fn ati_response(command: u32) -> u32 {
-    let nid = (command >> 20) as u8;
-    let verb = (command >> 8) & 0xfff;
-    let param = command as u8;
-    match (nid, verb, param) {
-        (0, 0xf00, 0) => 0x1002aa01,
-        (0, 0xf00, 2) => 0x0010_0700,
-        (0, 0xf00, 4) => 0x00010001,
-        (1, 0xf00, 5) => 1,
-        (1, 0xf00, 4) => 0x00020004,
-        (2 | 4, 0xf00, 9) => 0x201, // digital stereo Audio Output
-        (3 | 5, 0xf00, 9) => (4 << 20) | 0x301 | 4, // digital pin, out amp
-        (3 | 5, 0xf00, 0xc) => 0x94, // HDMI, output, presence detect
-        (3 | 5, 0xf00, 0xe) => 1,
-        (3, 0xf02, _) => 2,
-        (5, 0xf02, _) => 4,
-        (_, 0xf00, 0x12) => 0x80000000,    // mute-only output amp
-        (3, 0xf1c, _) => (5 << 20) | 0x10, // Digital Other Out, jack
-        (5, 0xf1c, _) => (1 << 30) | (5 << 20) | 0x20, // no physical connection
-        (3, 0xf7c, _) => 0x11,             // HBR capable, left enabled
-        (2, 0xf0d, _) => 0x0200,
-        _ => 0,
+impl Model {
+    /// AMD GPU HDMI codec 0x1002aa01, revision 0x0700 (rev3+): AFG 1, ports
+    /// as converter/pin pairs 2/3 and 4/5; pin 5 has no physical connection
+    /// unless `second_port`. With `sink`, pin 3 carries a monitor whose
+    /// Azalia endpoint the display driver filled: 7.1 LPCM (16/20/24-bit,
+    /// stereo at more rates), 5.1 AC-3, FL/FR LFE FC RL/RR RLC/RRC, named
+    /// "DELL", video 40 ms behind audio.
+    fn ati_response(&mut self, command: u32) -> u32 {
+        let nid = (command >> 20) as u8;
+        let verb = (command >> 8) & 0xfff;
+        let param = command as u8;
+        match (nid, verb, param) {
+            (0, 0xf00, 0) => 0x1002aa01,
+            (0, 0xf00, 2) => 0x0010_0700,
+            (0, 0xf00, 4) => 0x00010001,
+            (1, 0xf00, 5) => 1,
+            (1, 0xf00, 4) => 0x00020004,
+            (2 | 4, 0xf00, 9) => 0x201, // digital stereo Audio Output
+            (3 | 5, 0xf00, 9) => (4 << 20) | 0x301 | 4, // digital pin, out amp
+            (3 | 5, 0xf00, 0xc) => 0x94, // HDMI, output, presence detect
+            (3 | 5, 0xf00, 0xe) => 1,
+            (3, 0xf02, _) => 2,
+            (5, 0xf02, _) => 4,
+            (_, 0xf00, 0x12) => 0x80000000,    // mute-only output amp
+            (3, 0xf1c, _) => (5 << 20) | 0x10, // Digital Other Out, jack
+            (5, 0xf1c, _) if self.second_port => (5 << 20) | 0x20,
+            (5, 0xf1c, _) => (1 << 30) | (5 << 20) | 0x20, // no physical connection
+            (3, 0xf7c, _) => 0x11,                         // HBR capable, left enabled
+            (2, 0xf0d, _) => 0x0200,
+            (3, 0xf09, _) if self.sink => 0xc000_0000,
+            (3, 0xf70, _) if self.sink => 0x100 | 0x4f,
+            (3, 0x780, index) => {
+                self.sink_index = u32::from(index);
+                0
+            }
+            (3, 0xf81, _) if self.sink => match self.sink_index {
+                0 => 0x10ac,
+                1 => 0x4321,
+                2 => 4,
+                3 => 0x1122_3344,
+                4 => 0x5566_7788,
+                i @ 5..=8 => u32::from(b"DELL"[i as usize - 5]),
+                _ => 0,
+            },
+            (3, 0x776, coding) => {
+                self.descriptor = u32::from(coding >> 3);
+                0
+            }
+            (3, 0xf76, _) if self.sink => match self.descriptor {
+                1 => 0x7f07_070f,
+                2 => 0x0050_0715,
+                _ => 0,
+            },
+            (3, 0xf7b, _) if self.sink => 0x0b15,
+            _ => 0,
+        }
     }
 }
 fn pump() {
@@ -155,6 +194,13 @@ impl Fixture {
         Self::with(noncoherent, false)
     }
     fn with(noncoherent: bool, ati: bool) -> Result<Self, &'static str> {
+        Self::build(noncoherent, ati, false)
+    }
+    /// The AMD codec with both ports physically connected.
+    fn two_ports() -> Result<Self, &'static str> {
+        Self::build(true, true, true)
+    }
+    fn build(noncoherent: bool, ati: bool, second_port: bool) -> Result<Self, &'static str> {
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
             phys: memory.phys_addr(),
@@ -184,6 +230,10 @@ impl Fixture {
                 stall: false,
                 supports_32: true,
                 ati,
+                sink: false,
+                second_port,
+                sink_index: 0,
+                descriptor: 0,
             }),
         };
         *MODEL.lock() = &mut *fixture.model as *mut Model as usize;
@@ -420,4 +470,199 @@ fn native_hda_ati_hdmi_port_streams_stereo_like_atihdmi() -> TestResult {
 kernel_test_in!(
     "audio/hda",
     native_hda_ati_hdmi_port_streams_stereo_like_atihdmi
+);
+
+/// The ELD a 7.1 "DELL" sink's Azalia endpoint produces through the ATI
+/// emulation (get_eld_ati layout): 20 fixed bytes, the name, then the LPCM
+/// SAD, its stereo-rate companion and the AC-3 SAD, padded to 4 bytes.
+const DELL_ELD: [u8; 36] = [
+    0x10, 0, 8, 0, 4, 0x30, 0x0a, 0x4f, //
+    0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55, //
+    0xac, 0x10, 0x21, 0x43, b'D', b'E', b'L', b'L', //
+    0x0f, 0x07, 0x07, 0x09, 0x7f, 0x07, 0x15, 0x07, 0x50, 0, 0, 0,
+];
+
+fn native_hda_hdmi_eld_and_channel_allocation_match_linux() -> TestResult {
+    use super::super::hdmi::{
+        active_channels, ati_slot_verb, channel_allocation, channel_mapping, parse_eld,
+    };
+    let Some(sink) = parse_eld(&DELL_ELD) else {
+        return TestResult::Fail("parse a valid ELD");
+    };
+    if sink.spk_alloc != 0x4f || sink.channels_max != 8 || !sink.s32 {
+        return TestResult::Fail("ELD speaker allocation, channels and sample size");
+    }
+    let mut eld = DELL_ELD;
+    eld[7] = 0;
+    if parse_eld(&eld).map(|s| s.spk_alloc) != Some(0xffff) {
+        return TestResult::Fail("missing speaker allocation assumes every speaker");
+    }
+    for (byte, value) in [(0, 3 << 3), (4, 17), (5, 0)] {
+        let mut eld = DELL_ELD;
+        eld[byte] = value;
+        if parse_eld(&eld).is_some() {
+            return TestResult::Fail("bad version, name length or no SAD is invalid");
+        }
+    }
+    if parse_eld(&DELL_ELD[..30]).is_some() {
+        return TestResult::Fail("SAD past the buffer is invalid");
+    }
+    // hdmi_channel_allocation_spk_alloc_blk picks.
+    for (spk, channels, ca) in [
+        (0x4f, 2, 0x00),
+        (0x09, 4, 0x08), // FL/FR RL/RR: surround40
+        (0x07, 4, 0x03), // FL/FR LFE FC
+        (0x0f, 6, 0x0b), // surround51
+        (0x00, 6, 0x0b), // nothing matches: first 6-channel layout
+        (0x4f, 8, 0x13), // surround71
+        (0x2f, 8, 0x1f), // front-centre pair instead of rear-centre
+    ] {
+        if channel_allocation(spk, channels) != ca || active_channels(ca) != channels.max(2) {
+            return TestResult::Fail("CEA channel allocation");
+        }
+    }
+    // Linux's fixed table, and the generated map for a CA outside it.
+    if channel_mapping(0x13) != [0x00, 0x11, 0x26, 0x37, 0x43, 0x52, 0x64, 0x75]
+        || channel_mapping(0x04) != [0x00, 0x11, 0x24, 0xf2, 0xf3, 0xf5, 0xf6, 0xf7]
+        || channel_mapping(0x1f) != [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]
+    {
+        return TestResult::Fail("slot mapping");
+    }
+    // atihdmi_pin_set_slot_channel, per-slot and paired.
+    if ati_slot_verb(0x24, true) != Some((0x779, 0x21))
+        || ati_slot_verb(0x37, true) != Some((0x788, 0x31))
+        || ati_slot_verb(0xf5, true) != Some((0x787, 0))
+        || ati_slot_verb(0x52, false) != Some((0x778, 0x41))
+        || ati_slot_verb(0xf3, false) != Some((0x778, 0))
+        || ati_slot_verb(0xf5, false).is_some()
+    {
+        return TestResult::Fail("ATI slot verbs");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_hdmi_eld_and_channel_allocation_match_linux
+);
+
+fn native_hda_hdmi_sink_drives_eld_routing_and_surround() -> TestResult {
+    use narf_drivers_sound::{
+        format::{ChannelCount, SampleFormat},
+        mixer::{ControlId, ControlKind, ControlValue},
+    };
+    let mut fixture = match Fixture::two_ports() {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    if dev.outputs.len() != 2 || dev.hdmi.lock().len() != 2 {
+        return TestResult::Fail("two HDMI ports");
+    }
+    let card = super::super::stream::Card(dev.clone());
+    let jack = ControlId {
+        index: 3,
+        kind: ControlKind::HdmiJack,
+    };
+    let eld = ControlId {
+        index: 4,
+        kind: ControlKind::Eld,
+    };
+    if !card.controls().contains(&jack) || !card.controls().contains(&eld) {
+        return TestResult::Fail("HDMI jack and ELD controls");
+    }
+    // No monitor yet: the converter's own limits.
+    let Ok(playback) = card.open(false, 0) else {
+        return TestResult::Fail("open without a sink");
+    };
+    if card.get_control(jack) != Ok(ControlValue::boolean(false))
+        || card.get_control(eld) != Ok(ControlValue::bytes(&[]))
+        || card.capabilities(false).channels.len() != 4
+    {
+        return TestResult::Fail("no sink: jack off, empty ELD, 8 channels");
+    }
+    drop(playback);
+    fixture.model.sink = true;
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open with a sink");
+    };
+    if card.get_control(jack) != Ok(ControlValue::boolean(true))
+        || card.get_control(eld) != Ok(ControlValue::bytes(&DELL_ELD))
+        || card.control_info(eld).map(|i| i.channels) != Ok(DELL_ELD.len() as u8)
+    {
+        return TestResult::Fail("sink: jack on and the emulated ELD");
+    }
+    let caps = card.capabilities(false);
+    if caps.channels
+        != [
+            ChannelCount::Stereo,
+            ChannelCount::Quad,
+            ChannelCount::Surround51,
+            ChannelCount::Surround71,
+        ]
+        || !caps.formats.contains(&SampleFormat::S32LE)
+    {
+        return TestResult::Fail("7.1 sink capabilities");
+    }
+    // A steady sense does not re-read the ELD every poll.
+    let reads = |m: &Model| {
+        m.verbs
+            .iter()
+            .filter(|v| (*v >> 8) & 0xfff == 0xf70)
+            .count()
+    };
+    let before = reads(&fixture.model);
+    if dev.refresh_jacks().is_err() || reads(&fixture.model) != before {
+        return TestResult::Fail("steady sense re-read the ELD");
+    }
+    let first = fixture.model.verbs.len();
+    let mut params = super::super::stream::default_params();
+    params.channels = ChannelCount::Surround71;
+    if playback.configure(params).is_err() || playback.prepare().is_err() {
+        return TestResult::Fail("configure 7.1");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    let expected = [
+        make_verb(0, 2, 0x72d07), // eight channels
+        // ALSA's 7.1 order FL FR RL RR FC LFE SL SR into CEA CA 0x13.
+        make_verb(0, 3, 0x77701), // ch 0 -> slot 0
+        make_verb(0, 3, 0x78511), // ch 1 -> slot 1
+        make_verb(0, 3, 0x77a21), // ch 2 -> slot 6
+        make_verb(0, 3, 0x78831), // ch 3 -> slot 7
+        make_verb(0, 3, 0x78641), // ch 4 -> slot 3
+        make_verb(0, 3, 0x77851), // ch 5 -> slot 2
+        make_verb(0, 3, 0x77961), // ch 6 -> slot 4
+        make_verb(0, 3, 0x78771), // ch 7 -> slot 5
+        make_verb(0, 3, 0x77113), // CA 0x13
+    ];
+    let positions: Vec<Option<usize>> = expected
+        .iter()
+        .map(|v| verbs.iter().position(|x| x == v))
+        .collect();
+    if positions.iter().any(Option::is_none) || !positions.is_sorted() {
+        return TestResult::Fail("7.1 channel count, slot map and allocation");
+    }
+    // The format carries eight channels; only the live port takes the
+    // stream, the empty one is detached.
+    if !verbs
+        .iter()
+        .any(|v| *v >> 20 == 2 && (*v >> 16) & 0xf == 2 && v & 0xf == 7)
+        || !verbs.contains(&make_verb(0, 2, VERB_SET_CONVERTER_STREAM | 0x10))
+        || !verbs.contains(&make_verb(0, 4, VERB_SET_CONVERTER_STREAM))
+        || verbs.contains(&make_verb(0, 4, VERB_SET_CONVERTER_STREAM | 0x10))
+    {
+        return TestResult::Fail("7.1 format on the plugged port only");
+    }
+    // Unplug clears the jack and the ELD.
+    fixture.model.sink = false;
+    if dev.refresh_jacks().is_err()
+        || card.get_control(jack) != Ok(ControlValue::boolean(false))
+        || card.get_control(eld) != Ok(ControlValue::bytes(&[]))
+    {
+        return TestResult::Fail("unplug");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_hdmi_sink_drives_eld_routing_and_surround
 );

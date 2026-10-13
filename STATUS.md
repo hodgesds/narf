@@ -57,7 +57,7 @@ An unmodified alsa-lib probe exercises HDA/VirtIO playback and HDA capture
 through those syscalls, including linked pause, boundary-mode playback and
 user controls with TLV/events. The implemented ALSA contract is listed in
 [sound §3.1](drivers/sound/specification/spec.md#31-linux-alsa-pcm-and-control-abi).
-SoundWire, HDMI/DP audio, vendor smart-amplifier quirks and system power-transition
+SoundWire, HDMI/DP compressed passthrough, vendor smart-amplifier quirks and system power-transition
 reinitialization remain open. See
 [audio's implemented contract](audio/specification/spec.md).
 
@@ -498,11 +498,14 @@ status, Azalia endpoint/ELD, Audio InfoFrame) is programmed after scanout for
 sinks declaring audio. The native HD-Audio runtime now binds Linux's ATI
 HDMI NS controller IDs (through 0xab40) with snooping off: CORB, RIRB, BDL
 and sample rings get explicit cache maintenance. The ATI HDMI codec
-(0x1002aa01) is driven like Linux's atihdmi for stereo LPCM: every connected
-HDMI/DP port pin becomes an output, with zero downmix, per-channel remap
-(rev3+), channel count, the CA 0 slot map and channel allocation (which feeds
-the hardware Audio InfoFrame), ramp rate, HBR off and converter DIGEN.
-Multichannel layouts, ELD reporting and jack-driven port selection remain.
+(0x1002aa01) is driven like Linux's atihdmi for LPCM up to 7.1: zero downmix,
+per-channel remap (rev3+), the CEA channel allocation for the sink's speakers,
+channel count, slot map and allocation (which feeds the hardware Audio
+InfoFrame), ramp rate, HBR off and converter DIGEN. The codec's ELD is
+rebuilt as Linux's get_eld_ati does and exposed as the `ELD` control with an
+`HDMI/DP,pcm=0 Jack`; pin sense is polled, playback routes to the ports with
+a valid ELD and is limited to their channels/sample sizes, and a port that
+gains a sink mid-stream is set up again.
 Not yet: YCbCr/4:2:0. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and

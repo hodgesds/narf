@@ -58,7 +58,8 @@ impl Stream {
     fn configure(&mut self, dev: &IntelHda, params: HwParams) -> Result<(), SoundError> {
         if !matches!(params.format, SampleFormat::S16LE | SampleFormat::S32LE)
             || params.rate != SampleRate::R48000
-            || params.channels != ChannelCount::Stereo
+            || !(self.capture && params.channels == ChannelCount::Stereo
+                || !self.capture && dev.playback_channels().contains(&params.channels))
         {
             return Err(SoundError::InvalidParams);
         }
@@ -219,13 +220,21 @@ impl PcmDevice for Card {
         // `query_supported_formats`. An empty query result falls back to the
         // driver's own default format rather than offering nothing at all.
         let mut formats = self.0.supported_formats[usize::from(capture)].clone();
+        // An HDMI sink without 20/24-bit LPCM takes S16_LE only.
+        if !capture && self.0.hdmi_limits().is_some_and(|(_, s32)| !s32) {
+            formats.retain(|f| *f != SampleFormat::S32LE);
+        }
         if formats.is_empty() {
             formats.push(default_params().format);
         }
         PcmCapabilities {
             formats,
             rates: alloc::vec![SampleRate::R48000],
-            channels: alloc::vec![ChannelCount::Stereo],
+            channels: if capture {
+                alloc::vec![ChannelCount::Stereo]
+            } else {
+                self.0.playback_channels()
+            },
             period_frames: (16, 32768),
             periods: (2, 256),
             buffer_bytes: (4096, 256 * 1024),
@@ -255,6 +264,13 @@ impl PcmDevice for Card {
             || (!capture && self.0.outputs.is_empty())
         {
             return Err(SoundError::NoSuchDevice);
+        }
+        // Constraints come from the sinks attached now (Linux hdmi_pcm_open
+        // reads the pin's ELD at open).
+        if !capture {
+            self.0
+                .refresh_hdmi(false)
+                .map_err(|_| SoundError::BadState)?;
         }
         let mut state = self.0.streams[usize::from(capture)].lock();
         if state.claimed {
