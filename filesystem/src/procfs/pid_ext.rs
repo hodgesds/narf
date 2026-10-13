@@ -1336,15 +1336,24 @@ impl DirOps for ProcTaskDir {
     fn ino(&self) -> u64 {
         pid_entry_ino(self.pid, "task")
     }
+    /// `fs/proc/base.c`: the directory inode starts at two links
+    /// (`proc_pident_instantiate`: "set_nlink(inode, 2)") and
+    /// `proc_task_getattr` adds `get_nr_threads(p)`. Chromium's sandbox
+    /// counts threads this way (`IsSingleThreaded`: `CHECK_LE(3, st_nlink)`,
+    /// single-threaded iff `st_nlink == 3`) and aborts when the count is
+    /// missing.
     fn inode_attrs(&self) -> crate::InodeAttrs {
-        super::proc_attrs()
+        let threads = u32::try_from(self.tids().len()).unwrap_or(u32::MAX);
+        crate::InodeAttrs {
+            nlink: threads.saturating_add(2),
+            tracked: true,
+            ..super::proc_attrs()
+        }
     }
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let tid: u64 = name.parse().ok()?;
         if self.tids().contains(&tid) {
-            Some(Arc::new(ProcDirMarker {
-                ino: self.tid_dir_ino(tid),
-            }))
+            Some(Arc::new(ProcDirMarker::new(self.tid_dir_ino(tid))))
         } else {
             None
         }

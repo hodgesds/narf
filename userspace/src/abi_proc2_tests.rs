@@ -3016,6 +3016,49 @@ kernel_test_in!(
     smoke_abi_proc2_maps_preserve_loader_image_provenance
 );
 
+/// `stat(path)` → `Ok(st_nlink)`. x86_64 `struct stat` has a 64-bit
+/// `st_nlink` third; the generic (aarch64) layout has a 32-bit one after
+/// `st_mode`.
+fn tg_stat_nlink(path: &str) -> Result<u64, Option<i64>> {
+    let p = alloc::format!("{}\0", path);
+    let mut sb = [0u64; 32];
+    match call_stat(p.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+        #[cfg(target_arch = "x86_64")]
+        Some(0) => Ok(sb[2]),
+        #[cfg(not(target_arch = "x86_64"))]
+        Some(0) => Ok(sb[2] >> 32),
+        other => Err(other),
+    }
+}
+
+/// `/proc/<pid>/task` reports `2 + nr_threads` links (`fs/proc/base.c`:
+/// `proc_pident_instantiate` sets 2, `proc_task_getattr` adds
+/// `get_nr_threads`). Chromium's sandbox `IsSingleThreaded` does
+/// `CHECK_LE(3, st_nlink)` on `/proc/self/task` and treats exactly 3 as
+/// single-threaded; the old untracked `st_nlink = 1` crashed every launch.
+fn smoke_abi_proc2_task_dir_nlink_counts_threads() -> TestResult {
+    with_thread_group(false, |v| {
+        set_task(TG_LEADER_TASK);
+        let group = tg_stat_nlink(&alloc::format!("{}/{}/task", v.base, v.pid))
+            .map_err(|_| "stat /proc/<tgid>/task failed")?;
+        if group != 4 {
+            return Err("two-thread group: /proc/<tgid>/task st_nlink != 2 + 2");
+        }
+        let via_self = tg_stat_nlink(&alloc::format!("{}/self/task", v.base))
+            .map_err(|_| "stat /proc/self/task failed")?;
+        if via_self != 4 {
+            return Err("two-thread group: /proc/self/task st_nlink != 2 + 2");
+        }
+        let single = tg_stat_nlink(&alloc::format!("{}/{}/task", v.base, TG_OTHER_PID))
+            .map_err(|_| "stat /proc/<single-threaded pid>/task failed")?;
+        if single != 3 {
+            return Err("single-threaded process: /proc/<pid>/task st_nlink != 3");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_task_dir_nlink_counts_threads);
+
 /// A per-pid file opened while its process lived and read after the process
 /// is gone answers -ESRCH (fs/proc/task_mmu.c m_start: `if (!priv->task)
 /// return ERR_PTR(-ESRCH)`; fs/proc/base.c proc_single_show: `if (!task)

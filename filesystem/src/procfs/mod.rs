@@ -1819,6 +1819,19 @@ pub(crate) struct ProcDirMarker {
     /// sees the marker) and `fstat` of an open fd (which sees the DirOps)
     /// agree.
     pub(crate) ino: u64,
+    /// The directory's attributes, for the same `stat`/`fstat` agreement.
+    /// Most procfs directories report the untracked defaults; `task` reports
+    /// its live `2 + nr_threads` link count.
+    pub(crate) attrs: crate::InodeAttrs,
+}
+
+impl ProcDirMarker {
+    pub(crate) fn new(ino: u64) -> Self {
+        Self {
+            ino,
+            attrs: proc_attrs(),
+        }
+    }
 }
 
 impl FileOps for ProcDirMarker {
@@ -1826,7 +1839,7 @@ impl FileOps for ProcDirMarker {
         self.ino
     }
     fn inode_attrs(&self) -> crate::InodeAttrs {
-        proc_attrs()
+        self.attrs
     }
     fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { Err(FsError::Unsupported) })
@@ -1861,10 +1874,15 @@ impl DirOps for ProcPidDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         // Subdirectory markers — resolve_async calls lookup_dir next.
         match name {
-            "fd" | "fdinfo" | "task" | "ns" | "attr" => {
+            "task" => {
+                let dir = pid_ext::ProcTaskDir { pid: self.pid };
                 return Some(Arc::new(ProcDirMarker {
                     ino: pid_entry_ino(self.pid, name),
-                }))
+                    attrs: crate::DirOps::inode_attrs(&dir),
+                }));
+            }
+            "fd" | "fdinfo" | "ns" | "attr" => {
+                return Some(Arc::new(ProcDirMarker::new(pid_entry_ino(self.pid, name))))
             }
             _ => {}
         }
@@ -2374,9 +2392,10 @@ impl DirOps for ProcRoot {
             // via lookup_dir("pressure"). Static (no feature gate) so
             // it is always present, like meminfo — systemd's
             // memory-pressure event source needs it to exist.
-            "pressure" => Some(Arc::new(ProcDirMarker {
-                ino: proc_static_ino(PROC_ROOT_INO, "pressure"),
-            })),
+            "pressure" => Some(Arc::new(ProcDirMarker::new(proc_static_ino(
+                PROC_ROOT_INO,
+                "pressure",
+            )))),
             "self" => Some(Arc::new(ProcSelfSymlink)),
             // /proc/thread-self is a magic symlink (like /proc/self) that
             // resolves to `<tgid>/task/<tid>` of the CALLING thread.
@@ -2395,9 +2414,9 @@ impl DirOps for ProcRoot {
                             file: f,
                             ino: registry_ino(&[name]),
                         }) as Arc<dyn FileOps>,
-                        ProcNodeSnapshot::Dir(_) => Arc::new(ProcDirMarker {
-                            ino: registry_ino(&[name]),
-                        }) as Arc<dyn FileOps>,
+                        ProcNodeSnapshot::Dir(_) => {
+                            Arc::new(ProcDirMarker::new(registry_ino(&[name]))) as Arc<dyn FileOps>
+                        }
                     });
                 }
                 // Numeric pid → directory marker (lookup-as-file).
@@ -2409,9 +2428,7 @@ impl DirOps for ProcRoot {
                 if let Ok(n) = name.parse::<u64>() {
                     if let Some(pid) = pid_resolve(n) {
                         if task_info(pid, TaskInfoQuery::Basic).is_some() {
-                            return Some(Arc::new(ProcDirMarker {
-                                ino: pid_dir_ino(pid),
-                            }));
+                            return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(pid))));
                         }
                     }
                 }
@@ -2585,7 +2602,7 @@ impl DirOps for ProcDynamicDir {
         let ino = registry_ino(&path);
         match lookup_registry(&path) {
             Some(ProcNodeSnapshot::File(f)) => Some(Arc::new(ProcDynFile { file: f, ino })),
-            Some(ProcNodeSnapshot::Dir(_)) => Some(Arc::new(ProcDirMarker { ino })),
+            Some(ProcNodeSnapshot::Dir(_)) => Some(Arc::new(ProcDirMarker::new(ino))),
             None => None,
         }
     }
