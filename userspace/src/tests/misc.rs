@@ -3710,6 +3710,47 @@ fn smoke_proc_fd_hook_resolves_processid_to_taskid() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_proc_fd_hook_resolves_processid_to_taskid);
 
+/// `execve("/proc/self/exe")` follows the magic link to the process's own
+/// executable (`proc_exe_link` -> `mm->exe_file`). Chromium launches every
+/// child process this way; resolving it as an ordinary procfs path made each
+/// launch fail ("LaunchProcess: failed to execvp: /proc/self/exe").
+fn smoke_execve_proc_self_exe_resolves_to_the_executable() -> TestResult {
+    let tid = 0x0E5E_C001u64;
+    let pid = 0x0E5E_C0DEu64;
+    crate::handlers::register_pid_task_mapping(pid, tid);
+    crate::handlers::set_proc_exe(tid, "/usr/lib/chromium/chromium");
+    let target = |path: &str| crate::handlers::proc_exe_magic_target(tid, path);
+    let want = Some(alloc::string::String::from("/usr/lib/chromium/chromium"));
+    let result = (|| {
+        if target("/proc/self/exe") != want {
+            return Err("/proc/self/exe did not resolve to the executable");
+        }
+        if target("/proc/thread-self/exe") != want {
+            return Err("/proc/thread-self/exe did not resolve to the executable");
+        }
+        if target(&alloc::format!("/proc/{pid}/exe")) != want {
+            return Err("/proc/<pid>/exe did not resolve to the executable");
+        }
+        // Negative: other magic links and sub-paths are not the exe link.
+        if target("/proc/self/cwd").is_some()
+            || target("/proc/self/exe/x").is_some()
+            || target("/usr/bin/exe").is_some()
+        {
+            return Err("a non-exe path was treated as /proc/<pid>/exe");
+        }
+        Ok(())
+    })();
+    crate::handlers::__test_forget_task_pid(tid);
+    match result {
+        Ok(()) => TestResult::Pass,
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "userspace",
+    smoke_execve_proc_self_exe_resolves_to_the_executable
+);
+
 // Linux `task_current_syscall()` / SysRq-T: a blocked task's syscall is
 // decoded from the register frame its entry path left at the top of its
 // kernel stack (`task_pt_regs()`), never recorded per syscall. One case per

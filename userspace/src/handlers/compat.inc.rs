@@ -2428,6 +2428,17 @@ fn do_execve_resolved(
         return;
     }
 
+    // `/proc/<pid>/exe` is a magic link to the process's executable
+    // (`proc_exe_link` -> `mm->exe_file`); following it does not re-walk link
+    // text. Chromium launches every child (network service, renderers, GPU)
+    // with `execvp("/proc/self/exe", ...)`, so exec'ing the procfs node itself
+    // failed every launch.
+    if image_override.is_none() {
+        if let Some(exe) = proc_exe_magic_target(current_task_id(), &path_owned) {
+            path_owned = exe;
+        }
+    }
+
     // fexecve via the /proc/self/fd/N (or /proc/<pid>/fd/N) magic symlink:
     // glibc's fexecve and systemd 257's sd-executor spawn open the binary
     // O_PATH then execve("/proc/self/fd/<N>"). Resolve N to the fd's real
@@ -3033,6 +3044,26 @@ fn do_execve_resolved(
     // for the same reason as the no-user-ctx arm above: 0 from execve is
     // "you are now the new program".
     ctx.set_return(errno_ret(ENOSYS)); // -ENOSYS
+}
+
+/// The executable `/proc/self/exe`, `/proc/thread-self/exe` or
+/// `/proc/<pid>/exe` names for a caller `task`, as the caller-view path exec
+/// recorded. `None` for any other path, or a task that has not exec'd.
+pub(crate) fn proc_exe_magic_target(task: u64, path: &str) -> Option<alloc::string::String> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (who, tail) = rest.split_once('/')?;
+    if tail != "exe" {
+        return None;
+    }
+    let owner = match who {
+        "self" | "thread-self" => task,
+        pid => proc_pid_to_tid(accept_pid_from(task, pid.parse::<u64>().ok()?)?),
+    };
+    let g = PROC_EXE.lock();
+    let map = g.as_ref()?;
+    map.get(&owner)
+        .or_else(|| map.get(&proc_pid_to_tid(task_to_pid_raw(owner)?)))
+        .cloned()
 }
 
 /// Parse `/proc/self/fd/<N>` or `/proc/<pid>/fd/<N>` → the fd number `N`.
