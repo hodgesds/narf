@@ -128,6 +128,10 @@ impl Io for TmdsIo {
     fn write(&mut self, at: u64, value: u32) {
         self.writes.fetch_add(1, Ordering::SeqCst);
         self.inner.write(at, value);
+        // VPG GSP memory leaves light sleep once sleep is disabled.
+        if at == dio(self.stream, 0x206d) && value & 1 != 0 {
+            self.set(at, 0x100, 0);
+        }
         if at == dio(self.stream, 0x2094) {
             if value & 0x10 != 0 {
                 let symclk = if self.on { 0x800 } else { 0 };
@@ -254,6 +258,24 @@ fn dcn401_hdmi_link_programs_native_order_registers_and_commands() -> TestResult
             if r(at) & mask != value {
                 return TestResult::Fail("register");
             }
+        }
+        // The AVI InfoFrame went to VPG packet 0 as nine data words, then
+        // packet 0 is sent every frame on line 2 with double buffering off.
+        let words: Vec<u32> =
+            e.io.inner
+                .writes
+                .iter()
+                .filter(|w| w.0 == dio(stream, 0x2069))
+                .map(|w| w.1)
+                .collect();
+        if words != [0x000d0282, 0x80081ebe, 0, 0x466, 0x899, 0, 0, 0, 0]
+            || r(dio(stream, 0x20a5)) != 3
+            || r(dio(stream, 0x20a9)) & 0xffff != 2
+            || r(dio(stream, 0x20b1)) & 0x1000 == 0
+            || r(dio(stream, 0x206b)) & 1 != 1
+            || r(dio(stream, 0x2068)) & 0xff != 0
+        {
+            return TestResult::Fail("AVI InfoFrame");
         }
         // Linux leaves the DCCG frontend symclk route alone for TMDS.
         if r(e.layout.dio_clock + u64::from(stream) * 4) != 0 {
@@ -391,6 +413,8 @@ fn dcn401_hdmi_video_mutes_stops_and_the_link_stops_and_restarts() -> TestResult
         || r(&e, dio(stream, 0x2095)) & 1 != 0
         || r(&e, dio(stream, 0x209b)) & 0x301 != 0
         || r(&e, dio(stream, 0x209e)) & 0x0100001f != 0x11
+        || r(&e, dio(stream, 0x20a5)) != 0
+        || r(&e, dio(stream, 0x20a9)) & 0xffff != 0
     {
         return TestResult::Fail("link stopped");
     }
@@ -437,4 +461,39 @@ fn dcn401_hdmi_link_failures_quarantine_the_owner() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_link_failures_quarantine_the_owner
+);
+
+fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
+    let t = request(0).timing;
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t);
+    // CTA-861: the header and payload sum to zero.
+    let sum = p[..3]
+        .iter()
+        .chain(&p[4..18])
+        .fold(0u8, |s, b| s.wrapping_add(*b));
+    if p[..4] != [0x82, 2, 13, 0]
+        || sum != 0
+        || p[4] != 0xbe
+        || p[5..9] != [0x1e, 0x08, 0x80, 0]
+        || p[9] != 0
+        || p[12..14] != 1126u16.to_le_bytes()
+        || p[16..18] != 2201u16.to_le_bytes()
+        || p[18..].iter().any(|b| *b != 0)
+    {
+        return TestResult::Fail("AVI bytes");
+    }
+    // A powered-down VPG memory is woken before the packet write.
+    let (mut e, mut fw, c) = fixture(1, 1, 1);
+    e.io.inner.regs.insert(dio(1, 0x206d), 0x100);
+    run(e.prepare_hdmi_link(&mut fw, path(1), link(1, 1), c)).unwrap();
+    let wake = e.io.inner.writes.iter().position(|w| w.0 == dio(1, 0x206d));
+    let data = e.io.inner.writes.iter().position(|w| w.0 == dio(1, 0x2069));
+    if !matches!((wake, data), (Some(a), Some(b)) if a < b) {
+        return TestResult::Fail("VPG power-on order");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum
 );

@@ -483,8 +483,8 @@ DMUB SET_PIXEL_CLOCK for the transmitter's PHY PLL, link-encoder setup, the
 DIGX stream setup and HDMI stream attributes, frontend routing and FIFO, then
 the DMUB transmitter ENABLE with lane, TX-clock and clock-on witnesses. Black
 video starts and stops with AVMUTE handling, scanout runs on HDMI video, and the
-link stops back to a reusable owner. Not yet: modeset/hot-plug integration, the
-AVI InfoFrame, SCDC scrambling above 340 MHz, deep colour and audio. None of it
+link stops back to a reusable owner. The AVI InfoFrame (Linux's RGB fields,
+VIC 0) is sent as VPG generic packet 0. Not yet: modeset/hot-plug integration, SCDC scrambling above 340 MHz, deep colour and audio. None of it
 has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and

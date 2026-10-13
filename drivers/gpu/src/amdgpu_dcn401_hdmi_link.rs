@@ -40,7 +40,7 @@ pub struct HdmiLinkReady {
     pub request: HdmiLinkRequest,
     pub blank: BlankApplied,
     pub pixel_khz: u32,
-    controls: [u32; 14],
+    controls: [u32; 17],
     /// Every backend's frontend selection, so no other route moves.
     backend_routes: [u32; 4],
     /// The stream's DCCG symclk route, which TMDS leaves untouched.
@@ -49,7 +49,7 @@ pub struct HdmiLinkReady {
     on: bool,
 }
 impl HdmiLinkReady {
-    fn registers(self, l: Layout) -> [(u64, u32); 14] {
+    fn registers(self, l: Layout) -> [(u64, u32); 17] {
         let phy = self.path.transmitter;
         let s = self.request.stream;
         let be = |r| DpStream::Dio(phy).at(l, r);
@@ -71,6 +71,9 @@ impl HdmiLinkReady {
             (fe(0x209e), 0x3100701f), // HDMI_CONTROL (not error/metadata status)
             (fe(0x20a2), 0x1031),     // GC/NULL send, ACP off
             (fe(0x20a8), 1),          // GC AVMUTE
+            (fe(0x20a5), u32::MAX),   // generic packets 0..7: only AVI (0)
+            (fe(0x20a9), 0xffff),     // generic packet 0 line
+            (fe(0x20b1), 0x1000),     // HDMI_DB_DISABLE
         ]
     }
 }
@@ -118,6 +121,29 @@ fn phy_at(l: Layout, phy: u8, reg: u64) -> u64 {
 /// handshake (DATA_EN is not a witness), as the DP PHY owner reads them.
 fn lanes_active(value: u32) -> bool {
     (0..4).all(|lane| (value >> (8 * lane)) & 0x37 == 4)
+}
+/// The AVI InfoFrame Linux's set_avi_info_frame builds for this stream: RGB,
+/// active format valid with both bars, underscan, uniform scaling, picture
+/// aspect, IT content. VIC stays 0 and RGB quantization at its default: narf
+/// matches no CTA mode, and CTA-861 gives a VIC-0 (IT) format full-range RGB,
+/// which is what this owner sends. Returns HB0..HB3 then SB0..SB27, as the
+/// nine VPG_GENERIC_PACKET_DATA words carry them (HB3 and SB28.. stay zero).
+pub(in crate::amdgpu_dcn401_otg) fn avi_infoframe(t: &crate::amdgpu_dml::Timing) -> [u8; 36] {
+    let mut p = [0u8; 36];
+    p[..3].copy_from_slice(&[0x82, 2, 13]);
+    let sb = &mut p[4..];
+    sb[1] = 2 | 3 << 2 | 1 << 4; // S underscan, B both bars, A0 valid, Y RGB
+    sb[2] = 8; // R same as picture, M no data, C no data
+    sb[3] = 1 << 7; // SC uniform, Q default, EC 0, ITC
+                    // Linux's bar fields: borders are zero, so bottom/right are total + 1.
+    sb[8..10].copy_from_slice(&((t.v_total + 1) as u16).to_le_bytes());
+    sb[12..14].copy_from_slice(&((t.h_total + 1) as u16).to_le_bytes());
+    let sum = p[..3]
+        .iter()
+        .chain(&p[5..18])
+        .fold(0u8, |s, b| s.wrapping_add(*b));
+    p[4] = 0u8.wrapping_sub(sum);
+    p
 }
 impl<I: Io> Engine<I> {
     /// Every consumer outside this link must be idle. The owned backend/PHY,
@@ -170,7 +196,6 @@ impl<I: Io> Engine<I> {
         for (reg, mask) in [
             (0x2091, 0x1010),     // dynamic metadata enable/pending
             (0x209d, 1),          // HDMI metadata
-            (0x20a5, u32::MAX),   // generic packets 0..7
             (0x20a6, u32::MAX),   // generic packets 8..14
             (0x20a7, 0x3fffffff), // immediate generic send/pending
             (0x2122, 0x10001),    // DP video
@@ -295,6 +320,41 @@ impl<I: Io> Engine<I> {
         plan.controls[9] |= 1;
         Ok(())
     }
+    /// enc3_update_hdmi_info_packet(0, AVI): DB disable, VPG power-on if
+    /// gated, conflict clear, nine data words, immediate update, then send
+    /// every frame on line 2. No AFMT audio clock: this owner has no audio.
+    async fn hdmi_avi(&mut self, plan: &mut HdmiLinkReady) -> Result<(), Error> {
+        let l = self.layout;
+        let stream = plan.request.stream;
+        let vpg = move |r| DpStream::Dio(stream).at(l, r);
+        self.hdmi_update(plan, 16, 0x1000, 0x1000)?;
+        self.hdmi_link_verify(*plan, false)?;
+        if self.read(vpg(0x206d))? & 0x100 != 0 {
+            self.update(vpg(0x206d), 0x11, 1)?;
+            self.wait(vpg(0x206d), 0x100, 0, 1000).await?;
+        }
+        self.wait(vpg(0x206c), 2, 0, 500).await?;
+        let packet = avi_infoframe(&plan.blank.timing.request.timing);
+        self.access(|io| {
+            // CONFLICT_CLR and the data port are commands, not stored state.
+            let status = checked(io.read(vpg(0x206c)))?;
+            io.write(vpg(0x206c), status | 0x10);
+            let access = checked(io.read(vpg(0x2068)))?;
+            io.write(vpg(0x2068), access & !0xff);
+            for word in packet.chunks_exact(4) {
+                io.write(
+                    vpg(0x2069),
+                    u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                );
+            }
+            // Self-clearing: latch the double-buffered packet immediately.
+            let immediate = checked(io.read(vpg(0x206b)))?;
+            io.write(vpg(0x206b), immediate | 1);
+            Ok(())
+        })?;
+        self.hdmi_update(plan, 14, 3, 3)?;
+        self.hdmi_update(plan, 15, 0xffff, 2)
+    }
     fn hdmi_link_plan(
         &mut self,
         path: Path,
@@ -344,7 +404,7 @@ impl<I: Io> Engine<I> {
             request,
             blank,
             pixel_khz,
-            controls: [0; 14],
+            controls: [0; 17],
             backend_routes: [0; 4],
             clock_route: 0,
             on: false,
@@ -371,6 +431,7 @@ impl<I: Io> Engine<I> {
             || plan.controls[8] != 0
             || self.read(fe(0x209b))? & 0x100083 != 0
             || plan.clock_route & 0x10 != 0
+            || plan.controls[14] != 0
         {
             return Err(Error::Busy);
         }
@@ -421,6 +482,7 @@ impl<I: Io> Engine<I> {
         ] {
             self.hdmi_update(plan, slot, mask, value)?;
         }
+        self.hdmi_avi(plan).await?;
         // setup_dio_stream_encoder: BE<-FE, TMDS-HDMI frontend, stream mapper,
         // one pixel per cycle, then enc35_enable_fifo.
         self.hdmi_route(plan, true)?;
@@ -522,6 +584,9 @@ impl<I: Io> Engine<I> {
         self.wait(fe_clock, 0x2c10, 0, 1000).await?;
         self.hdmi_update(plan, 9, 0x300, 0)?;
         self.hdmi_route(plan, false)?;
+        // enc3_stream_encoder_stop_hdmi_info_packets for the AVI packet.
+        self.hdmi_update(plan, 14, 3, 0)?;
+        self.hdmi_update(plan, 15, 0xffff, 0)?;
         self.hdmi_update(plan, 11, 0x0100001f, 0x11)?;
         self.hdmi_link_verify(*plan, false)
     }
