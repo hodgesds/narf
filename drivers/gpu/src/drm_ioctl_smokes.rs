@@ -560,6 +560,88 @@ kernel_test_in!(
     smoke_drm_ioctl_atomic_empty_commit_succeeds
 );
 
+/// KWin validates its initial CRTC enable with TEST_ONLY | ALLOW_MODESET
+/// before it submits the real commit.  The CRTC starts inactive because the
+/// boot scanout resource is transport-owned, so this request necessarily
+/// changes ACTIVE.  The UAPI bridge must carry ALLOW_MODESET into
+/// `AtomicState::allow_modeset`; otherwise a valid `0x500` probe is rejected
+/// as an unflagged modeset.
+#[allow(dead_code)]
+fn smoke_drm_atomic_test_only_allow_modeset_accepts_initial_crtc_enable() -> TestResult {
+    let idx = register_test_virtio_card();
+    let objects = [11u32];
+    let prop_counts = [1u32];
+    let props = [0x52u32]; // CRTC ACTIVE
+    let values = [1u64];
+    let mut req = DrmModeAtomicUapi {
+        flags: 0x0500, // DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET
+        count_objs: objects.len() as u32,
+        objs_ptr: objects.as_ptr() as u64,
+        count_props_ptr: prop_counts.as_ptr() as u64,
+        props_ptr: props.as_ptr() as u64,
+        prop_values_ptr: values.as_ptr() as u64,
+        ..Default::default()
+    };
+    match dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_ATOMIC,
+        &mut req as *mut _ as usize,
+        /*render*/ false,
+    ) {
+        Ok(0) => TestResult::Pass,
+        _ => TestResult::Fail("TEST_ONLY | ALLOW_MODESET rejected initial CRTC enable"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_atomic_test_only_allow_modeset_accepts_initial_crtc_enable
+);
+
+/// The VirtIO transport has already completed SET_SCANOUT before the DRM card
+/// is registered.  KWin follows its initial allowed probe with a TEST_ONLY |
+/// NONBLOCK check that deliberately omits ALLOW_MODESET.  As in Linux, an
+/// unchanged ACTIVE property must remain a page-flip check, rather than being
+/// turned into a false modeset because NARF forgot the live boot scanout.
+#[allow(dead_code)]
+fn smoke_drm_atomic_test_only_keeps_active_boot_scanout_no_modeset() -> TestResult {
+    let idx = register_test_virtio_card();
+    {
+        let mode_state = match crate::drm_registry::mode_state(idx) {
+            Some(mode_state) => mode_state,
+            None => return TestResult::Fail("test VirtIO card had no mode state"),
+        };
+        let mut card = mode_state.lock();
+        card.crtcs[0].enabled = true;
+        card.crtcs[0].mode = Some(crate::Mode::XGA_60);
+    }
+    let objects = [11u32];
+    let prop_counts = [1u32];
+    let props = [0x52u32]; // CRTC ACTIVE
+    let values = [1u64];
+    let mut req = DrmModeAtomicUapi {
+        flags: 0x0300, // DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_NONBLOCK
+        count_objs: objects.len() as u32,
+        objs_ptr: objects.as_ptr() as u64,
+        count_props_ptr: prop_counts.as_ptr() as u64,
+        props_ptr: props.as_ptr() as u64,
+        prop_values_ptr: values.as_ptr() as u64,
+        ..Default::default()
+    };
+    match dispatch_card(
+        idx,
+        DRM_IOCTL_MODE_ATOMIC,
+        &mut req as *mut _ as usize,
+        /*render*/ false,
+    ) {
+        Ok(0) => TestResult::Pass,
+        _ => TestResult::Fail("unchanged active boot scanout was treated as a modeset"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_atomic_test_only_keeps_active_boot_scanout_no_modeset
+);
+
 /// KWin performs a plane-only TEST_ONLY commit, then submits the same plane
 /// update with NONBLOCK | PAGE_FLIP_EVENT. Linux implicitly adds both the
 /// plane's old and new CRTC states while decoding CRTC_ID, so the real commit

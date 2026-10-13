@@ -38,14 +38,14 @@ fn smoke_drivers_gpu_mode_and_family() -> TestResult {
 }
 kernel_test_in!("drivers/gpu", smoke_drivers_gpu_mode_and_family);
 
-/// The transport-owned VirtIO boot resource is not a KMS framebuffer.  Do not
-/// advertise its CRTC as active until a DRM client installs a primary plane;
-/// otherwise a compositor takes a page-flip path whose advertised old FB is
-/// zero.
-fn smoke_virtio_boot_scanout_starts_with_inactive_crtc() -> TestResult {
+/// The transport-owned VirtIO boot resource is not a KMS framebuffer, but
+/// SET_SCANOUT has already enabled the physical scanout.  Keep the CRTC active
+/// so KWin's no-modeset TEST_ONLY page-flip sees the same state the hardware
+/// has, while reserving primary-plane ownership for the first DRM client.
+fn smoke_virtio_boot_scanout_is_active_without_drm_framebuffer() -> TestResult {
     let crtc = crate::virtio_boot_crtc(crate::Mode::XGA_60);
-    if crtc.enabled {
-        return TestResult::Fail("VirtIO boot CRTC advertised active without a DRM framebuffer");
+    if !crtc.enabled {
+        return TestResult::Fail("VirtIO boot CRTC did not expose active hardware scanout");
     }
     if crtc.primary_fb.is_some() {
         return TestResult::Fail("VirtIO boot CRTC unexpectedly owns a DRM framebuffer");
@@ -54,7 +54,7 @@ fn smoke_virtio_boot_scanout_starts_with_inactive_crtc() -> TestResult {
 }
 kernel_test_in!(
     "drivers/gpu",
-    smoke_virtio_boot_scanout_starts_with_inactive_crtc
+    smoke_virtio_boot_scanout_is_active_without_drm_framebuffer
 );
 
 /// A render-node GEM handle owns its coherent DMA backing only while it is in

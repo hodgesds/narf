@@ -63,16 +63,20 @@ pub struct Mode {
 ///
 /// This is deliberately separate from the transport's boot resource: the
 /// latter has been attached to scanout so early console output is visible,
-/// but it has no corresponding DRM framebuffer object in this card.  The
-/// compositor must therefore own the first KMS modeset and primary plane.
+/// but it has no corresponding DRM framebuffer object in this card.  Its
+/// scanout is nevertheless already live: KWin validates an unchanged
+/// page-flip with no ALLOW_MODESET, and therefore needs to observe an active
+/// CRTC.  The compositor still owns the first DRM primary plane.
 fn virtio_boot_crtc(mode: Mode) -> drm::card::Crtc {
     drm::card::Crtc {
         id: 1,
         mode: Some(mode),
-        // The transport resource is not present in this card's framebuffer
-        // namespace, so reporting this CRTC active would claim a primary
-        // plane that does not exist.  The first DRM client installs both.
-        enabled: false,
+        // The transport has completed SET_SCANOUT before this card is
+        // registered.  This is an active *hardware* CRTC, even though its
+        // boot resource is deliberately absent from the DRM FB namespace.
+        // Keeping those facts distinct prevents a compositor's no-modeset
+        // TEST_ONLY page-flip from becoming a synthetic ACTIVE transition.
+        enabled: true,
         primary_fb: None,
         x: 0,
         y: 0,

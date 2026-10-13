@@ -1213,11 +1213,12 @@ and render nodes. It is deliberately small but wire-compatible with Mesa's
 virtgpu userspace ABI:
 
 The early-console 2D resource is a transport-owned boot scanout, not a DRM
-framebuffer in the card's GEM namespace. Programming that resource keeps the
-console visible but does not expose an active DRM CRTC or primary plane. The
-first DRM client owns the initial modeset and installs the first primary
-framebuffer; advertising the CRTC active before then would describe a zero
-`FB_ID` as live to a compositor.
+framebuffer in the card's GEM namespace. Programming it completes
+`SET_SCANOUT`, so the initial DRM CRTC accurately reports an active hardware
+scanout while leaving its DRM primary plane unbound (`FB_ID = 0`). This lets a
+compositor validate an unchanged no-modeset page flip without synthesising an
+`ACTIVE` transition. The first DRM client still owns the first DRM framebuffer
+and primary-plane binding; the boot resource is never exposed as a GEM object.
 
 - Render-node inbound: `GETPARAM`, `CONTEXT_INIT`, `RESOURCE_CREATE`,
   `RESOURCE_INFO`, `TRANSFER_{TO,FROM}_HOST`, bounded `EXECBUFFER`, and
