@@ -12,11 +12,11 @@ pub(crate) fn sys_pkey_mprotect(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EINVAL));
             return;
         }
-        let task = current_task_id();
+        let mm = pkey_mm_key();
         let allocated = PKEY_TABLE
             .lock()
             .as_ref()
-            .and_then(|m| m.get(&task).copied())
+            .and_then(|m| m.get(&mm).copied())
             .map(|bits| bits & (1 << pkey) != 0)
             .unwrap_or(false);
         if !allocated {

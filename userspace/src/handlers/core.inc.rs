@@ -8483,14 +8483,23 @@ pub(crate) fn utimes_read_timeval(tv_ptr: u64) -> Result<UtimesSpec, i64> {
 
 // ── pkey_alloc / pkey_free / pkey_mprotect ───────────────────────────
 //
-// Memory-protection keys. NARF tracks an allocation bitmap per task
-// (keys 1..=15; key 0 is the always-present default) so alloc/free
-// round-trip and pkey_mprotect can validate its key argument, but the
-// PKRU instruction state is saved/restored by the scheduler, but these
-// compatibility syscalls do not yet encode the selected key into user PTEs;
-// pkey_mprotect therefore applies the requested prot exactly like mprotect.
+// Memory-protection keys. The allocation bitmap (keys 1..=15; key 0 is the
+// always-present default) belongs to the address space, as Linux's
+// `mm->context.pkey_allocation_map` does: every thread of a process sees the
+// keys any of them allocated, fork copies the map (`arch_dup_pkeys`), and
+// exec starts a new address space with only key 0. Keyed per thread, a key
+// allocated on one thread was EINVAL to `pkey_mprotect` on another, which
+// aborted every Chromium child process (PartitionAlloc / V8 thread
+// isolation allocate on one thread and tag pages on another).
+//
+// LINUX-GAP: the PKRU instruction state is saved/restored by the scheduler,
+// but these syscalls do not yet encode the selected key into user PTEs;
+// pkey_mprotect therefore applies the requested prot exactly like mprotect,
+// and an allocated key restricts nothing.
 
-/// Per-task allocated-pkey bitmap (bit k set ⇒ key k is allocated).
+/// Allocated-pkey bitmap per address space (bit k set ⇒ key k allocated).
+/// Keys are `AddressSpace::identity()`, or `PKEY_NO_MM | task` for a task
+/// with no address space installed (kernel-test fixtures only).
 static PKEY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<alloc::collections::BTreeMap<u64, u16>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -8502,6 +8511,47 @@ static PKEY_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<alloc::collections::BT
 /// per-task global.
 pub fn pkey_init() {
     *PKEY_TABLE.lock() = None;
+}
+
+/// Disjoint key space for a task with no address space installed.
+const PKEY_NO_MM: u64 = 1 << 63;
+
+/// The `PKEY_TABLE` key the calling task's pkey syscalls use: its mm.
+pub(crate) fn pkey_mm_key() -> u64 {
+    current_address_space().map_or(PKEY_NO_MM | current_task_id(), |a| a.identity())
+}
+
+/// `arch_dup_pkeys`: a forked address space inherits its parent's allocated
+/// keys.
+pub fn fork_address_space_pkeys(parent_id: u64, child_id: u64) {
+    let mut g = PKEY_TABLE.lock();
+    if let Some(m) = g.as_mut() {
+        if let Some(bits) = m.get(&parent_id).copied() {
+            m.insert(child_id, bits);
+        }
+    }
+}
+
+/// Kernel-test seam: set the pkey bitmap of an address-space key.
+#[doc(hidden)]
+pub fn __test_pkey_set(mm: u64, bits: u16) {
+    PKEY_TABLE
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(mm, bits);
+}
+
+/// Kernel-test seam: read the pkey bitmap of an address-space key.
+#[doc(hidden)]
+pub fn __test_pkey_get(mm: u64) -> Option<u16> {
+    PKEY_TABLE.lock().as_ref().and_then(|m| m.get(&mm).copied())
+}
+
+/// The allocation map dies with its address space.
+pub fn drop_address_space_pkeys(address_space_id: u64) {
+    if let Some(m) = PKEY_TABLE.lock().as_mut() {
+        m.remove(&address_space_id);
+    }
 }
 
 // ── process_vm_readv / process_vm_writev ─────────────────────────────
@@ -11772,6 +11822,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // owner reference keyed to a process that has already been reaped.
     if !share_vm {
         crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
+        fork_address_space_pkeys(parent_as.identity(), child_as.identity());
         // A child with its OWN mm carries copies of the parent's mbind range
         // policies (`dup_mmap` -> `vma_dup_policy`). A CLONE_VM child shares
         // the address space, and therefore the ranges, already.
@@ -14444,7 +14495,7 @@ fn release_task_tables(tid: u64) {
     }
     narf_scheduler::clear_task_mems_allowed(tid);
     if let Some(m) = PKEY_TABLE.lock().as_mut() {
-        m.remove(&tid);
+        m.remove(&(PKEY_NO_MM | tid));
     }
 
     // /proc mirrors.

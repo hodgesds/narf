@@ -188,6 +188,8 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     // reason: they belong to the mm, so they are retired when it dies rather
     // than when whichever thread called `mbind` exits.
     handlers::drop_address_space_mbind_ranges(address_space_id);
+    // The pkey allocation map is per mm too.
+    handlers::drop_address_space_pkeys(address_space_id);
     // The NUMA scan cursor is address-space state for the same reason the
     // range policies are, so it dies with the address space too.
     handlers::drop_address_space_numa_cursor(address_space_id);

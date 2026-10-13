@@ -3710,3 +3710,62 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo
 );
+
+/// Protection keys belong to the address space
+/// (`mm->context.pkey_allocation_map`): a key one thread allocates is valid
+/// for every thread sharing the mm. Keyed per thread, a sibling's
+/// `pkey_mprotect` with that key was -EINVAL, which aborted every Chromium
+/// child process (PartitionAlloc allocates the key on one thread and tags
+/// pages from another).
+fn smoke_abi_proc2_pkey_shared_across_threads() -> TestResult {
+    with_thread_group(false, |v| {
+        set_task(TG_LEADER_TASK);
+        let key = match call(Syscall::PkeyAlloc.raw(), a1(0, 0)) {
+            Some(k) if (1..16).contains(&k) => k as u64,
+            _ => return Err("pkey_alloc on the leader failed"),
+        };
+        set_task(TG_THREAD_TASK);
+        let tagged = call(
+            Syscall::PkeyMprotect.raw(),
+            a3(v.region, TG_REGION_LEN, 3, key),
+        );
+        let freed = call(Syscall::PkeyFree.raw(), a0(key));
+        set_task(TG_LEADER_TASK);
+        let refree = call(Syscall::PkeyFree.raw(), a0(key));
+        if tagged != Some(0) {
+            return Err("a sibling thread could not use the leader's pkey");
+        }
+        if freed != Some(0) {
+            return Err("a sibling thread could not free the leader's pkey");
+        }
+        if refree != Some(EINVAL) {
+            return Err("a key freed by one thread stayed allocated for another");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_pkey_shared_across_threads);
+
+/// `arch_dup_pkeys`: a forked address space starts with its parent's keys,
+/// independently afterwards; the map is retired with its address space.
+fn smoke_abi_proc2_pkey_fork_copies_and_drop_retires() -> TestResult {
+    const PARENT: u64 = 0x5EED_0001;
+    const CHILD: u64 = 0x5EED_0002;
+    crate::handlers::__test_pkey_set(PARENT, 0b1010);
+    crate::handlers::fork_address_space_pkeys(PARENT, CHILD);
+    let copied = crate::handlers::__test_pkey_get(CHILD);
+    crate::handlers::drop_address_space_pkeys(PARENT);
+    crate::handlers::drop_address_space_pkeys(CHILD);
+    let retired = crate::handlers::__test_pkey_get(PARENT);
+    if copied != Some(0b1010) {
+        return TestResult::Fail("fork did not copy the parent's pkey allocation map");
+    }
+    if retired.is_some() {
+        return TestResult::Fail("the pkey map outlived its address space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_pkey_fork_copies_and_drop_retires
+);

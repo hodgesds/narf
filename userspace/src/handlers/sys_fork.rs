@@ -222,6 +222,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // key here must be ProcessId, not TaskId.
     parent_of_set(child_pid.raw(), parent_pid);
     crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
+    fork_address_space_pkeys(parent_as.identity(), child_as.identity());
     // The child's mm carries COPIES of the parent's mbind range policies,
     // the way `dup_mmap` calls `vma_dup_policy` for every duplicated VMA.
     crate::handlers::fork_address_space_mbind_ranges(

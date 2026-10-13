@@ -8,11 +8,11 @@ pub(crate) fn sys_pkey_free(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EINVAL));
         return;
     }
-    let task = current_task_id();
+    let mm = pkey_mm_key();
     let mut g = PKEY_TABLE.lock();
     let allocated = g
         .as_mut()
-        .and_then(|m| m.get_mut(&task))
+        .and_then(|m| m.get_mut(&mm))
         .map(|bits| {
             if *bits & (1 << key) != 0 {
                 *bits &= !(1u16 << key);
