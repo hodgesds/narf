@@ -46,6 +46,22 @@ pub struct Selection {
     pub hdmi: bool,
     /// The HDMI sink declared SCDC (HF-VSDB/HF-SCDB SCDC_Present).
     pub scdc: bool,
+    /// RGB output depth: 8 bpc for DP; for HDMI the deepest the sink, the
+    /// TMDS rate and the requested maximum allow.
+    pub depth: otg::ColorDepth,
+}
+
+/// Highest output depth modesets may pick, like DRM's max_requested_bpc,
+/// which amdgpu_dm initialises to 8. Raised by `amdgpu.max_bpc`.
+static MAX_BPC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(8);
+/// Set the highest output depth (8, 10 or 12; others leave it unchanged).
+pub fn set_max_bpc(bpc: u8) {
+    if matches!(bpc, 8 | 10 | 12) {
+        MAX_BPC.store(bpc, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+pub fn max_bpc() -> u8 {
+    MAX_BPC.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// The result of a successful modeset, retained by the caller for teardown.
@@ -100,6 +116,9 @@ pub struct HdmiCaps {
     pub forum_max_khz: u32,
     /// HF SCDC_Present.
     pub scdc: bool,
+    /// VSDB DC_30bit / DC_36bit: RGB 4:4:4 at 10 / 12 bpc.
+    pub dc30: bool,
+    pub dc36: bool,
 }
 pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
     use narf_edid::cta861::{CtaExtension, DataBlock};
@@ -115,6 +134,10 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
                 // DRM's minimum lengths: VSDB 5, HF-VSDB 7, HF-SCDB 7 with its tag.
                 DataBlock::Vendor(v) if v.is_hdmi_licensing() && v.payload.len() >= 5 => {
                     caps.hdmi = true;
+                    if let Some(&flags) = v.payload.get(5) {
+                        caps.dc30 = flags & 0x10 != 0;
+                        caps.dc36 = flags & 0x20 != 0;
+                    }
                     if let Some(&rate) = v.payload.get(6) {
                         caps.vsdb_max_khz = u32::from(rate) * 5000;
                     }
@@ -159,12 +182,31 @@ fn preferred(edid: &[u8]) -> Option<Timing> {
         .and_then(|d| crate::amdgpu_dcn_display::timing_from_edid(&d).ok())
 }
 
+/// The deepest RGB depth up to `max_bpc` the sink declares and whose TMDS
+/// character clock it can take, stepping down by 2 bpc like amdgpu_dm's
+/// stream validation; None if not even 8 bpc fits.
+pub fn hdmi_depth(caps: HdmiCaps, pixel_khz: u32, max_bpc: u8) -> Option<otg::ColorDepth> {
+    use crate::amdgpu_dmub_navi48::TmdsDepth;
+    [
+        (12, caps.dc36, otg::ColorDepth::Bpc12, TmdsDepth::Bpc12),
+        (10, caps.dc30, otg::ColorDepth::Bpc10, TmdsDepth::Bpc10),
+        (8, true, otg::ColorDepth::Bpc8, TmdsDepth::Bpc8),
+    ]
+    .into_iter()
+    .find(|&(bpc, declared, _, tmds)| {
+        bpc <= max_bpc && declared && hdmi_fits(caps, tmds.character_khz(pixel_khz))
+    })
+    .map(|(_, _, depth, _)| depth)
+}
+
 /// First routed DP port whose sink answered with DPCD and an EDID preferred
 /// mode the DCN timing model accepts, at the sink's maximum link; failing
-/// that, the first HDMI sink whose preferred mode fits unscrambled TMDS.
+/// that, the first HDMI sink whose preferred mode fits TMDS, at the deepest
+/// depth up to `max_bpc` that fits.
 pub fn select(
     paths: &[inventory::Path],
     ports: &[display::Port],
+    max_bpc: u8,
 ) -> Result<Selection, ModesetError> {
     let mut link_short = false;
     for port in ports {
@@ -196,6 +238,7 @@ pub fn select(
             edid,
             hdmi: false,
             scdc: false,
+            depth: otg::ColorDepth::Bpc8,
         });
     }
     for port in ports {
@@ -216,10 +259,10 @@ pub fn select(
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        if !hdmi_fits(caps, timing.pixel_clock_khz) {
+        let Some(depth) = hdmi_depth(caps, timing.pixel_clock_khz, max_bpc) else {
             link_short = true;
             continue;
-        }
+        };
         return Ok(Selection {
             port: index,
             timing,
@@ -228,6 +271,7 @@ pub fn select(
             edid,
             hdmi: true,
             scdc: caps.scdc,
+            depth,
         });
     }
     Err(if link_short {
@@ -415,7 +459,7 @@ impl ColdBoot {
         }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self.display_paths().map_err(|_| ModesetError::NoSink)?;
-        let selection = select(paths, &ports)?;
+        let selection = select(paths, &ports, max_bpc())?;
         let mode = mode(selection.timing);
         // The first clock request starts PMFW and publishes the DPM levels
         // admission needs; requests are clamped up to each clock's minimum.
@@ -458,7 +502,7 @@ impl ColdBoot {
                 .await?;
             self.prepare_display_blank(otg::BlankRequest {
                 pipe,
-                depth: otg::ColorDepth::Bpc8,
+                depth: selection.depth,
             })
             .await?;
             self.prepare_display_dpp(pipe).await?;
@@ -635,7 +679,13 @@ impl ColdBoot {
         if !s.scdc {
             return Ok(());
         }
-        let scrambled = s.timing.pixel_clock_khz > otg::TMDS_SCRAMBLE_KHZ;
+        let tmds = match s.depth {
+            otg::ColorDepth::Bpc8 => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc8,
+            otg::ColorDepth::Bpc10 => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc10,
+            otg::ColorDepth::Bpc12 => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc12,
+        };
+        // Linux decides on phy_pix_clk, the deep-colour character clock.
+        let scrambled = tmds.character_khz(s.timing.pixel_clock_khz) > otg::TMDS_SCRAMBLE_KHZ;
         let result = async {
             if self.display_scdc_read(s.port, SINK_VERSION).await? == 1 {
                 self.display_scdc_write(s.port, SOURCE_VERSION, 1).await?;

@@ -830,7 +830,12 @@ such DP sink, the first HDMI port whose EDID carries the HDMI Licensing VSDB
 `hdmi_fits` is selected (`Selection::hdmi`, zero lanes). `hdmi_caps` reads, as
 DRM does, the VSDB Max_TMDS_Clock and the HF-VSDB or HF-SCDB (extended tag
 0x79) Max_TMDS_Character_Rate and SCDC_Present, honouring DRM's minimum block
-lengths. A mode fits at or below 340 MHz within any declared VSDB maximum, and
+lengths, and the VSDB DC_30bit/DC_36bit deep-colour flags. `hdmi_depth` picks
+the deepest declared depth up to `max_bpc()` whose character clock fits,
+stepping down 2 bpc like amdgpu_dm's stream validation; `max_bpc` defaults to
+8 (amdgpu_dm's `max_requested_bpc`) and the `amdgpu.max_bpc=10|12` boot option
+raises it. The blank is staged at that depth. A character clock fits at or
+below 340 MHz within any declared VSDB maximum, and
 above it (to `TMDS_MAX_KHZ`, 600 MHz) only with SCDC and an HF rate covering
 it. Before the link starts an SCDC sink is configured as Linux's
 `write_scdc_data` does: sink version read, source version 1 written when the
@@ -1248,19 +1253,23 @@ through the operation below.
 
 `unsafe ColdBoot::prepare_display_hdmi_link(port, HdmiLinkRequest { stream,
 pipe })` and `Otg::prepare_hdmi_link` light one direct TMDS HDMI port for the
-staged black timing of `pipe`, with that timing still stopped. Scope: 8-bpc RGB,
-25–340 MHz (`TMDS_MAX_KHZ`; no SCDC scrambling or deep colour), the TMDS
-divide-by-four pixel divider and the DP DTO off. Planning requires a reusable
+staged black timing of `pipe`, with that timing still stopped. Scope: RGB at
+the blank's 8, 10 or 12 bpc, a pixel clock of at least 25 MHz and a TMDS
+character clock (`HdmiLinkReady::character_khz`, Linux's `phy_pix_clk`: the
+pixel clock ×5/4 or ×6/4, truncated in 100 Hz as `get_norm_pix_clk`) of at most
+`TMDS_MAX_KHZ`, the TMDS divide-by-four pixel divider and the DP DTO off. Planning requires a reusable
 owner, a `Signal::Tmds` blank on `pipe` bound to the retained clock, a stopped
 backend with no frontend, dual link or reset, an idle frontend and FIFO, no
 backend already routed to the stream, no DCCG frontend symclk route, and every
 unrelated consumer, packet/metadata producer and HPO root idle; refusals write
-nothing. The native order is Linux's: DMUB `SET_PIXEL_CLOCK` v1.7 (COMBO PHY PLL
-of the transmitter, UNIPHY object id, HDMI mode, CRTC `pipe`, XTALIN, no deep
-colour) and a zero PHYPLL deep-colour resync; `TMDS_CTL0`; link-encoder setup
+nothing. The native order is Linux's: DMUB `SET_PIXEL_CLOCK` v1.7 (the
+`dcn3_get_pix_clk_dividers`-scaled clock, COMBO PHY PLL of the transmitter,
+UNIPHY object id, HDMI mode, CRTC `pipe`, XTALIN, deep-colour ratio 0/1/2) and
+the matching PHYPLL `DCCG_DEEP_COLOR_CNTL`; `TMDS_CTL0`; link-encoder setup
 (DIO mux, HPD select, backend mode 3, clock, enable); DMUB `DIGX_ENCODER_CONTROL`
 `STREAM_SETUP` v1.5; HDMI stream attributes (RGB, generic-packet v1, keepout, no
-extra NULL, no scrambling, 24 bpp; GC every frame with NULL packets; no ACP;
+extra NULL, no scrambling; for 10/12 bpc `HDMI_DEEP_COLOR_DEPTH` 1/2 with
+`HDMI_DEEP_COLOR_ENABLE`; GC every frame with NULL packets; no ACP;
 AVMUTE off) with the frontend's OTG and stereo sources; the AVI InfoFrame as
 Linux's `enc3_update_hdmi_info_packet(0)` writes it (HDMI double buffering
 off, VPG GSP memory woken if gated, conflict clear, nine data words, immediate

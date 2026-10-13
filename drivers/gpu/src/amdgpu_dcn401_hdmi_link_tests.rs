@@ -30,7 +30,7 @@ fn path(p: u8) -> Path {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
-    Clock(Path, u8, u32),
+    Clock(Path, u8, u32, dmub::TmdsDepth),
     Setup(u8, u32),
     Enable(Path, u32),
     Disable(Path),
@@ -61,8 +61,14 @@ impl crate::amdgpu_dcn401_otg::hdmi_link::Firmware for Firmware {
     fn ready(&self) -> bool {
         self.ready
     }
-    async fn pixel_clock(&mut self, path: Path, pipe: u8, khz: u32) -> Result<(), dmub::Error> {
-        self.issue(Command::Clock(path, pipe, khz), 0)
+    async fn pixel_clock(
+        &mut self,
+        path: Path,
+        pipe: u8,
+        khz: u32,
+        depth: dmub::TmdsDepth,
+    ) -> Result<(), dmub::Error> {
+        self.issue(Command::Clock(path, pipe, khz, depth), 0)
     }
     async fn stream_setup(&mut self, stream: u8, khz: u32) -> Result<(), dmub::Error> {
         self.issue(Command::Setup(stream, khz), 0)
@@ -222,7 +228,7 @@ fn dcn401_hdmi_link_programs_native_order_registers_and_commands() -> TestResult
         let cmds: Vec<Command> = fw.commands.iter().map(|c| c.0).collect();
         if cmds
             != [
-                Command::Clock(path(p), pipe, 148_500),
+                Command::Clock(path(p), pipe, 148_500, dmub::TmdsDepth::Bpc8),
                 Command::Setup(stream, 148_500),
                 Command::Enable(path(p), 148_500),
             ]
@@ -353,7 +359,7 @@ fn dcn401_hdmi_link_refuses_unsupported_or_busy_requests_without_writes() -> Tes
     // Deep colour, a YCbCr 4:2:0 divider and sub-25 MHz modes are refused
     // before any write.
     for (khz, depth, divider) in [
-        (148_500, ColorDepth::Bpc10, dccg::TmdsDivider::By4),
+        (594_000, ColorDepth::Bpc10, dccg::TmdsDivider::By4), // 742.5 MHz TMDS
         (148_500, ColorDepth::Bpc8, dccg::TmdsDivider::By2),
         (20_000, ColorDepth::Bpc8, dccg::TmdsDivider::By4),
     ] {
@@ -508,7 +514,7 @@ fn dcn401_hdmi_link_scrambles_above_340_mhz_and_stops_unscrambled() -> TestResul
         }
         // The PHY PLL and transmitter take the full pixel rate; firmware
         // applies the 1/4 clock channel, as for Linux's callers.
-        if fw.commands[0].0 != Command::Clock(path(0), 1, khz)
+        if fw.commands[0].0 != Command::Clock(path(0), 1, khz, dmub::TmdsDepth::Bpc8)
             || fw.commands[2].0 != Command::Enable(path(0), khz)
         {
             return TestResult::Fail("scrambled clocks");
@@ -523,4 +529,51 @@ fn dcn401_hdmi_link_scrambles_above_340_mhz_and_stops_unscrambled() -> TestResul
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_link_scrambles_above_340_mhz_and_stops_unscrambled
+);
+
+fn dcn401_hdmi_link_deep_colour_scales_the_character_clock() -> TestResult {
+    use dmub::TmdsDepth::{Bpc10, Bpc12};
+    for (depth, tmds, code, khz) in [
+        (ColorDepth::Bpc10, Bpc10, 1, 185_625),
+        (ColorDepth::Bpc12, Bpc12, 2, 222_750),
+    ] {
+        let (mut e, mut fw, c) = fixture_with(3, 0, 2, 148_500, depth, dccg::TmdsDivider::By4);
+        let ready = run(e.prepare_hdmi_link(&mut fw, path(3), link(0, 2), c)).unwrap();
+        let cmds: Vec<Command> = fw.commands.iter().map(|c| c.0).collect();
+        // SET_PIXEL_CLOCK takes the pixel clock and ratio; the DIG setup and
+        // transmitter take Linux's phy_pix_clk.
+        if ready.character_khz != khz
+            || ready.scrambled
+            || cmds
+                != [
+                    Command::Clock(path(3), 2, 148_500, tmds),
+                    Command::Setup(0, khz),
+                    Command::Enable(path(3), khz),
+                ]
+        {
+            return TestResult::Fail("deep-colour clocks");
+        }
+        let r = |at| e.io.inner.regs.get(&at).copied().unwrap_or(0);
+        if r(dio(0, 0x209e)) & 0x3100001f != code << 28 | 0x0100_0000 | 0x19
+            || r(resync(3)) & 0x30 != code << 4
+        {
+            return TestResult::Fail("deep-colour registers");
+        }
+        run(e.stop_hdmi_link(&mut fw, path(3))).unwrap();
+        if e.io.inner.regs[&dio(0, 0x209e)] & 0x0100001f != 0x11 {
+            return TestResult::Fail("deep colour left enabled");
+        }
+    }
+    // 297 MHz at 12 bpc is 445.5 MHz TMDS: scrambled.
+    let (mut e, mut fw, c) =
+        fixture_with(0, 0, 0, 297_000, ColorDepth::Bpc12, dccg::TmdsDivider::By4);
+    let ready = run(e.prepare_hdmi_link(&mut fw, path(0), link(0, 0), c)).unwrap();
+    if !ready.scrambled || ready.character_khz != 445_500 {
+        return TestResult::Fail("deep-colour scrambling");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_link_deep_colour_scales_the_character_clock
 );

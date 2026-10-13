@@ -1,6 +1,7 @@
 //! Native DCN401 TMDS HDMI link bring-up and teardown for one 8-bpc RGB
-//! stream up to 600 MHz, scrambled with a 1/4-rate clock channel above
-//! 340 MHz (the sink's SCDC is the caller's; no deep colour). Linux order:
+//! stream at 8, 10 or 12 bpc, up to a 600 MHz TMDS character clock, scrambled
+//! with a 1/4-rate clock channel above 340 MHz (the sink's SCDC is the
+//! caller's). Linux order:
 //! dcn401_program_pix_clk (SET_PIXEL_CLOCK, deep-colour resync),
 //! link_set_dpms_on_pre_enable_link (dcn401_link_encoder_setup,
 //! enc401_stream_encoder_hdmi_set_stream_attribute) and enable_link_hdmi
@@ -46,6 +47,10 @@ pub struct HdmiLinkReady {
     pub request: HdmiLinkRequest,
     pub blank: BlankApplied,
     pub pixel_khz: u32,
+    pub depth: dmub::TmdsDepth,
+    /// The TMDS character clock (Linux's phy_pix_clk): the pixel clock scaled
+    /// by 5/4 or 3/2 for 10 or 12 bpc.
+    pub character_khz: u32,
     /// Above TMDS_SCRAMBLE_KHZ: scrambled, 1/4-rate clock channel.
     pub scrambled: bool,
     controls: [u32; 17],
@@ -92,6 +97,7 @@ pub(super) trait Firmware {
         path: Path,
         pipe: u8,
         khz: u32,
+        depth: dmub::TmdsDepth,
     ) -> impl Future<Output = Result<(), dmub::Error>> + Send;
     fn stream_setup(
         &mut self,
@@ -109,8 +115,14 @@ impl Firmware for dmub::Dmub {
     fn ready(&self) -> bool {
         self.state() == dmub::State::Running && self.mailbox_state() == dmub::MailboxState::Ready
     }
-    async fn pixel_clock(&mut self, path: Path, pipe: u8, khz: u32) -> Result<(), dmub::Error> {
-        self.set_tmds_pixel_clock(path, pipe, khz).await
+    async fn pixel_clock(
+        &mut self,
+        path: Path,
+        pipe: u8,
+        khz: u32,
+        depth: dmub::TmdsDepth,
+    ) -> Result<(), dmub::Error> {
+        self.set_tmds_pixel_clock(path, pipe, khz, depth).await
     }
     async fn stream_setup(&mut self, stream: u8, khz: u32) -> Result<(), dmub::Error> {
         self.setup_hdmi_stream(stream, khz).await
@@ -389,9 +401,14 @@ impl<I: Io> Engine<I> {
             return Err(Error::Invalid);
         }
         let timing = blank.timing.request;
-        if timing.signal != Signal::Tmds || blank.request.depth != ColorDepth::Bpc8 {
+        if timing.signal != Signal::Tmds {
             return Err(Error::Unsupported);
         }
+        let depth = match blank.request.depth {
+            ColorDepth::Bpc8 => dmub::TmdsDepth::Bpc8,
+            ColorDepth::Bpc10 => dmub::TmdsDepth::Bpc10,
+            ColorDepth::Bpc12 => dmub::TmdsDepth::Bpc12,
+        };
         // RGB: Linux's dcn401_calculate_dccg_tmds_div_value picks divide-by-4.
         if clock.request.pixel
             != (dccg::PixelClock::Tmds {
@@ -403,7 +420,8 @@ impl<I: Io> Engine<I> {
         timing.validate_clock(clock)?;
         timing.plan()?;
         let pixel_khz = timing.timing.pixel_clock_khz;
-        if !(TMDS_MIN_KHZ..=TMDS_MAX_KHZ).contains(&pixel_khz) {
+        let character_khz = depth.character_khz(pixel_khz);
+        if pixel_khz < TMDS_MIN_KHZ || !(1..=TMDS_MAX_KHZ).contains(&character_khz) {
             return Err(Error::Unsupported);
         }
         let l = self.layout;
@@ -412,7 +430,9 @@ impl<I: Io> Engine<I> {
             request,
             blank,
             pixel_khz,
-            scrambled: pixel_khz > TMDS_SCRAMBLE_KHZ,
+            depth,
+            character_khz,
+            scrambled: character_khz > TMDS_SCRAMBLE_KHZ,
             controls: [0; 17],
             backend_routes: [0; 4],
             clock_route: 0,
@@ -452,15 +472,18 @@ impl<I: Io> Engine<I> {
         firmware: &mut impl Firmware,
         plan: &mut HdmiLinkReady,
     ) -> Result<(), Error> {
-        let (path, khz) = (plan.path, plan.pixel_khz);
+        // The encoder, DIG setup and transmitter take the character clock.
+        let (path, khz) = (plan.path, plan.character_khz);
         let (stream, pipe) = (plan.request.stream, plan.request.pipe);
-        // dcn401_program_pix_clk: PHY PLL, then the deep-colour resync (24 bpp).
+        let deep = u32::from(plan.depth.code());
+        // dcn401_program_pix_clk: PHY PLL from the pixel clock and depth,
+        // then dce112_program_pixel_clk_resync's DCCG_DEEP_COLOR_CNTL.
         self.hdmi_link_verify(*plan, false)?;
         firmware
-            .pixel_clock(path, pipe, khz)
+            .pixel_clock(path, pipe, plan.pixel_khz, plan.depth)
             .await
             .map_err(Error::Firmware)?;
-        self.hdmi_update(plan, 5, 0x30, 0)?;
+        self.hdmi_update(plan, 5, 0x30, deep << 4)?;
         self.hdmi_update(plan, 4, 1, 1)?;
         // dcn401_link_encoder_setup(HDMI), with the HPD source and DIO mux.
         for (slot, mask, value) in [
@@ -486,10 +509,15 @@ impl<I: Io> Engine<I> {
             // GEN v1, keepout, no extra NULL; above 340 MHz the data
             // scrambler and the 1/4-rate clock channel (HDMI_CLOCK_CHANNEL_RATE).
             (11, 0x0100001f, 0x19 | if plan.scrambled { 0x6 } else { 0 }),
-            (11, 0x30000000, 0), // 24-bit depth
-            (12, 0x31, 0x31),    // GC every frame, NULL packets
-            (12, 0x1000, 0),     // no ACP
-            (13, 1, 0),          // AVMUTE off
+            // RGB deep colour: depth and HDMI_DEEP_COLOR_ENABLE.
+            (
+                11,
+                0x31000000,
+                deep << 28 | if deep != 0 { 0x0100_0000 } else { 0 },
+            ),
+            (12, 0x31, 0x31), // GC every frame, NULL packets
+            (12, 0x1000, 0),  // no ACP
+            (13, 1, 0),       // AVMUTE off
         ] {
             self.hdmi_update(plan, slot, mask, value)?;
         }

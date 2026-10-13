@@ -493,6 +493,40 @@ const SET_PIXEL_CLOCK: [u8; 4] = [128, 2, 0, 16];
 /// Linux rejects TMDS pixel clocks above 600 MHz (dcn401_program_pix_clk).
 const TMDS_MAX_KHZ: u32 = 600_000;
 
+/// RGB colour depth of a TMDS HDMI stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TmdsDepth {
+    Bpc8,
+    Bpc10,
+    Bpc12,
+}
+impl TmdsDepth {
+    /// SET_PIXEL_CLOCK v1.7 deep_color_ratio, PHYPLL DCCG_DEEP_COLOR_CNTL and
+    /// HDMI_DEEP_COLOR_DEPTH: disabled, 5:4 or 3:2.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Bpc8 => 0,
+            Self::Bpc10 => 1,
+            Self::Bpc12 => 2,
+        }
+    }
+    /// The TMDS character clock in 100 Hz: dcn3_get_pix_clk_dividers'
+    /// HDMI deep-colour scaling of the pixel clock (x5/4, x6/4, truncated).
+    pub fn character_100hz(self, pixel_khz: u32) -> u64 {
+        let p = u64::from(pixel_khz) * 10;
+        match self {
+            Self::Bpc8 => p,
+            Self::Bpc10 => (p * 5) >> 2,
+            Self::Bpc12 => (p * 6) >> 2,
+        }
+    }
+    /// The TMDS character clock in kHz, as Linux's phy_pix_clk
+    /// (get_norm_pix_clk / 10), or 0 if it does not fit.
+    pub fn character_khz(self, pixel_khz: u32) -> u32 {
+        u32::try_from(self.character_100hz(pixel_khz) / 10).unwrap_or(0)
+    }
+}
+
 #[derive(Debug)]
 pub struct Dmub {
     engine: Engine<Mmio>,
@@ -553,9 +587,10 @@ impl Dmub {
         path: crate::amdgpu_dcn_inventory::Path,
         pipe: u8,
         pixel_khz: u32,
+        depth: TmdsDepth,
     ) -> Result<(), Error> {
         self.engine
-            .set_tmds_pixel_clock(path, pipe, pixel_khz)
+            .set_tmds_pixel_clock(path, pipe, pixel_khz, depth)
             .await
     }
     pub(crate) async fn setup_hdmi_stream(
@@ -757,29 +792,33 @@ impl<I: Io> Engine<I> {
         let result = self.command(request).await.map(|_| ());
         self.finish_mailbox(result)
     }
-    /// Program the transmitter's PHY PLL for an 8-bpc RGB TMDS stream timed by
+    /// Program the transmitter's PHY PLL for an RGB TMDS stream timed by
     /// `pipe`. Linux dcn401_program_pix_clk -> set_pixel_clock_v7, after the
-    /// DP DTO is disabled: PLL from find_matching_pll (COMBO_PHY_PLL0 + PHY),
-    /// the UNIPHY pair's encoder object id, HDMI encoder mode, XTALIN reference
-    /// (miscinfo 0) and no deep-colour ratio.
+    /// DP DTO is disabled: the deep-colour-scaled clock, PLL from
+    /// find_matching_pll (COMBO_PHY_PLL0 + PHY), the UNIPHY pair's encoder
+    /// object id, HDMI encoder mode, XTALIN reference (miscinfo 0) and the
+    /// deep-colour ratio.
     async fn set_tmds_pixel_clock(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
         pipe: u8,
         pixel_khz: u32,
+        depth: TmdsDepth,
     ) -> Result<(), Error> {
         Self::hdmi_path(path)?;
-        if pipe >= 4 || pixel_khz == 0 || pixel_khz > TMDS_MAX_KHZ {
+        let clock = depth.character_100hz(pixel_khz);
+        if pipe >= 4 || clock == 0 || clock > u64::from(TMDS_MAX_KHZ) * 10 {
             return Err(Error::Invalid);
         }
         let mut request = [0; 64];
         request[..4].copy_from_slice(&SET_PIXEL_CLOCK);
-        request[4..8].copy_from_slice(&(pixel_khz * 10).to_le_bytes());
+        request[4..8].copy_from_slice(&(clock as u32).to_le_bytes());
         request[8] = 20 + path.transmitter; // ATOM_COMBOPHY_PLL0
                                             // ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY / UNIPHY1.
         request[9] = [0x1e, 0x20][usize::from(path.transmitter / 2)];
         request[10] = 3; // ATOM_ENCODER_MODE_HDMI
         request[12] = pipe; // ATOM_CRTC1 + controller
+        request[13] = depth.code(); // PIXEL_CLOCK_V7_DEEPCOLOR_RATIO_*
         self.send(request).await
     }
     /// DIG stream setup for TMDS HDMI. Linux

@@ -825,7 +825,7 @@ fn dmub_navi48_tmds_bringup_commands_match_native_v15_v17_encodings() -> TestRes
                 let (_pool, mut e) = ready();
                 let path = hdmi_path(phy, hpd);
                 let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
-                run(e.set_tmds_pixel_clock(path, pipe, 148_500)).unwrap();
+                run(e.set_tmds_pixel_clock(path, pipe, 148_500, TmdsDepth::Bpc8)).unwrap();
                 let mut golden = [0; 64];
                 golden[..4].copy_from_slice(&[128, 2, 0, 16]);
                 golden[4..8].copy_from_slice(&1_485_000u32.to_le_bytes()); // 100 Hz
@@ -880,7 +880,7 @@ fn dmub_navi48_tmds_bringup_commands_reject_invalid_requests_without_submission(
         dp_path(1, 1),
     ] {
         assert_eq!(
-            run(e.set_tmds_pixel_clock(path, 0, 148_500)),
+            run(e.set_tmds_pixel_clock(path, 0, 148_500, TmdsDepth::Bpc8)),
             Err(Error::Invalid)
         );
         assert_eq!(run(e.enable_tmds(path, 148_500)), Err(Error::Invalid));
@@ -888,14 +888,14 @@ fn dmub_navi48_tmds_bringup_commands_reject_invalid_requests_without_submission(
     let path = hdmi_path(1, 2);
     for khz in [0, 600_001] {
         assert_eq!(
-            run(e.set_tmds_pixel_clock(path, 0, khz)),
+            run(e.set_tmds_pixel_clock(path, 0, khz, TmdsDepth::Bpc8)),
             Err(Error::Invalid)
         );
         assert_eq!(run(e.enable_tmds(path, khz)), Err(Error::Invalid));
         assert_eq!(run(e.setup_hdmi_stream(0, khz)), Err(Error::Invalid));
     }
     assert_eq!(
-        run(e.set_tmds_pixel_clock(path, 4, 148_500)),
+        run(e.set_tmds_pixel_clock(path, 4, 148_500, TmdsDepth::Bpc8)),
         Err(Error::Invalid)
     );
     assert_eq!(run(e.setup_hdmi_stream(4, 148_500)), Err(Error::Invalid));
@@ -906,4 +906,35 @@ fn dmub_navi48_tmds_bringup_commands_reject_invalid_requests_without_submission(
 kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_tmds_bringup_commands_reject_invalid_requests_without_submission
+);
+
+fn dmub_navi48_tmds_pixel_clock_scales_deep_colour_like_linux() -> TestResult {
+    let path = hdmi_path(2, 3);
+    for (depth, clock, ratio) in [
+        (TmdsDepth::Bpc8, 2_970_000u32, 0),
+        (TmdsDepth::Bpc10, 3_712_500, 1),
+        (TmdsDepth::Bpc12, 4_455_000, 2),
+    ] {
+        let (_pool, mut e) = ready();
+        let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+        run(e.set_tmds_pixel_clock(path, 1, 297_000, depth)).unwrap();
+        let slot = e.io.slot(offset);
+        if slot[4..8] != clock.to_le_bytes() || slot[13] != ratio {
+            return TestResult::Fail("deep-colour pixel clock");
+        }
+    }
+    // 594 MHz at 10 bpc is a 742.5 MHz character clock: above TMDS.
+    let (_pool, mut e) = ready();
+    assert_eq!(
+        run(e.set_tmds_pixel_clock(path, 0, 594_000, TmdsDepth::Bpc10)),
+        Err(Error::Invalid)
+    );
+    // phy_pix_clk truncation matches get_norm_pix_clk.
+    assert_eq!(TmdsDepth::Bpc10.character_khz(148_351), 185_438);
+    assert_eq!(TmdsDepth::Bpc12.character_khz(148_351), 222_526);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_tmds_pixel_clock_scales_deep_colour_like_linux
 );

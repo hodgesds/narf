@@ -491,8 +491,9 @@ the whole multi-block EDID as one base block, so a monitor with any extension
 (nearly all) was never selected; it now parses the base block. HDMI 2.0
 modes above 340 MHz (e.g. 4K60) now run scrambled when the EDID declares SCDC
 and a covering HF rate: native DDC gained SCDC register reads/writes, the sink
-is configured before the link starts and returned to legacy on stop. Not yet:
-deep colour, YCbCr/4:2:0 and audio. None of it has run on hardware.
+is configured before the link starts and returned to legacy on stop. HDMI deep
+colour (10/12 bpc RGB, opt-in with `amdgpu.max_bpc`) scales the TMDS character
+clock as Linux does. Not yet: YCbCr/4:2:0 and audio. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and
 requires all three stream clocks off. Native DME4, immediate packets, audio/ACR,

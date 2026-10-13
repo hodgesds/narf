@@ -48,7 +48,7 @@ fn navi48_modeset_selects_first_answering_dp_sink_by_board_path() -> TestResult 
         port(paths[2], None, edid_1080p()),
         port(paths[3], dpcd(0x14, 4), edid_1080p()),
     ];
-    let Ok(s) = select(&paths, &ports) else {
+    let Ok(s) = select(&paths, &ports, 8) else {
         return TestResult::Fail("no selection");
     };
     let t = s.timing;
@@ -75,12 +75,12 @@ fn navi48_modeset_selects_first_answering_dp_sink_by_board_path() -> TestResult 
         port(paths[2], dpcd(0x15, 4), edid_1080p()),
         port(paths[1], dpcd(0x14, 3), edid_1080p()),
     ];
-    if select(&paths, &ports) != Err(ModesetError::NoSink) {
+    if select(&paths, &ports, 8) != Err(ModesetError::NoSink) {
         return TestResult::Fail("unusable sinks selected");
     }
     // A port missing from the board inventory is never addressed.
     let stray = path(Dp, 4);
-    if select(&paths, &[port(stray, dpcd(0x14, 4), edid_1080p())]) != Err(ModesetError::NoSink) {
+    if select(&paths, &[port(stray, dpcd(0x14, 4), edid_1080p())], 8) != Err(ModesetError::NoSink) {
         return TestResult::Fail("unrouted port selected");
     }
     TestResult::Pass
@@ -96,14 +96,14 @@ fn navi48_modeset_requires_link_payload_and_aligns_pitch() -> TestResult {
     // 148.5 MHz * 24 bpp needs 3.564 Gb/s of payload: 1-lane RBR is short,
     // 2-lane HBR (4.32) suffices. A short first sink falls through.
     let short = [port(paths[0], dpcd(0x06, 1), edid_1080p())];
-    if select(&paths, &short) != Err(ModesetError::Link) {
+    if select(&paths, &short, 8) != Err(ModesetError::Link) {
         return TestResult::Fail("short link accepted");
     }
     let ports = [
         port(paths[0], dpcd(0x06, 1), edid_1080p()),
         port(paths[1], dpcd(0x0a, 2), edid_1080p()),
     ];
-    let Ok(s) = select(&paths, &ports) else {
+    let Ok(s) = select(&paths, &ports, 8) else {
         return TestResult::Fail("fitting sink rejected");
     };
     if s.port != 1
@@ -127,7 +127,7 @@ kernel_test_in!(
 fn navi48_modeset_link_fallback_ladder_skips_short_links() -> TestResult {
     use inventory::Connector::DisplayPort as Dp;
     let paths = [path(Dp, 0)];
-    let Ok(s) = select(&paths, &[port(paths[0], dpcd(0x14, 4), edid_1080p())]) else {
+    let Ok(s) = select(&paths, &[port(paths[0], dpcd(0x14, 4), edid_1080p())], 8) else {
         return TestResult::Fail("selection");
     };
     use LinkRate::{Hbr, Hbr2, Rbr};
@@ -206,7 +206,7 @@ fn navi48_modeset_selects_hdmi_sinks_only_without_dp_and_below_340_mhz() -> Test
             sink: Err(display::Error::InvalidDpcd),
         },
     ];
-    match select(&paths, &ports) {
+    match select(&paths, &ports, 8) {
         Ok(s) if s.port == 1 && s.hdmi && s.lanes == 0 && s.timing.pixel_clock_khz == 148_500 => {}
         _ => return TestResult::Fail("HDMI selection"),
     }
@@ -216,12 +216,12 @@ fn navi48_modeset_selects_hdmi_sinks_only_without_dp_and_below_340_mhz() -> Test
         port(paths[1], None, with_cta(edid_1080p(), true)),
         port(paths[2], dpcd(0x14, 4), with_cta(edid_1080p(), false)),
     ];
-    if !matches!(select(&paths, &ports), Ok(s) if s.port == 2 && !s.hdmi) {
+    if !matches!(select(&paths, &ports, 8), Ok(s) if s.port == 2 && !s.hdmi) {
         return TestResult::Fail("DP preferred");
     }
     // 594 MHz needs SCDC scrambling, which this path does not do.
     let ports = [port(paths[1], None, with_cta(edid_2160p(), true))];
-    if select(&paths, &ports) != Err(ModesetError::Link) {
+    if select(&paths, &ports, 8) != Err(ModesetError::Link) {
         return TestResult::Fail("over 340 MHz");
     }
     TestResult::Pass
@@ -265,6 +265,8 @@ fn navi48_modeset_reads_hdmi_caps_and_admits_scrambled_modes_only_with_scdc() ->
         vsdb_max_khz: 0,
         forum_max_khz: 600_000,
         scdc: true,
+        dc30: false,
+        dc36: false,
     };
     if caps(&[VSDB, HF_VSDB]) != full
         || caps(&[VSDB, HF_SCDB]) != full
@@ -303,7 +305,7 @@ fn navi48_modeset_reads_hdmi_caps_and_admits_scrambled_modes_only_with_scdc() ->
         None,
         with_blocks(edid_2160p(), &[VSDB, HF_VSDB]),
     )];
-    match select(&paths, &ports) {
+    match select(&paths, &ports, 8) {
         Ok(s) if s.hdmi && s.scdc && s.timing.pixel_clock_khz == 594_000 => {}
         _ => return TestResult::Fail("4K60 HDMI 2.0 selection"),
     }
@@ -317,3 +319,48 @@ kernel_test_in!(
 fn hdmi_caps_hdmi(edid: &[u8]) -> bool {
     hdmi_caps(edid).hdmi
 }
+
+/// HDMI VSDB with DC_30bit | DC_36bit and Max_TMDS_Clock 300 MHz (60 * 5).
+const VSDB_DC: &[u8] = &[3 << 5 | 7, 0x03, 0x0c, 0x00, 0x10, 0x00, 0x30, 60];
+
+fn navi48_modeset_picks_the_deepest_hdmi_depth_that_fits() -> TestResult {
+    use otg::ColorDepth::{Bpc10, Bpc12, Bpc8};
+    let caps = hdmi_caps(&with_blocks(edid_1080p(), &[VSDB_DC]));
+    if !(caps.dc30 && caps.dc36 && caps.vsdb_max_khz == 300_000) {
+        return TestResult::Fail("DC bits");
+    }
+    for (pixel, max, depth) in [
+        (148_500, 8, Some(Bpc8)),   // DRM's default max bpc
+        (148_500, 12, Some(Bpc12)), // 222.75 MHz TMDS
+        (148_500, 10, Some(Bpc10)), // 185.625 MHz
+        (220_000, 12, Some(Bpc10)), // 12 bpc 330 MHz > 300: step down
+        (297_000, 12, Some(Bpc8)),  // 10 bpc 371.25 MHz > 300
+        (310_000, 12, None),        // past the VSDB maximum even at 8
+    ] {
+        if hdmi_depth(caps, pixel, max) != depth {
+            return TestResult::Fail("depth choice");
+        }
+    }
+    // Undeclared depths are never used.
+    let plain = hdmi_caps(&with_blocks(edid_1080p(), &[VSDB]));
+    if hdmi_depth(plain, 148_500, 12) != Some(Bpc8) {
+        return TestResult::Fail("undeclared deep colour");
+    }
+    use inventory::Connector::HdmiTypeA as Hdmi;
+    let paths = [path(Hdmi, 0)];
+    let ports = [port(paths[0], None, with_blocks(edid_1080p(), &[VSDB_DC]))];
+    if !matches!(select(&paths, &ports, 12), Ok(s) if s.depth == Bpc12)
+        || !matches!(select(&paths, &ports, 8), Ok(s) if s.depth == Bpc8)
+    {
+        return TestResult::Fail("selected depth");
+    }
+    set_max_bpc(11);
+    if max_bpc() != 8 {
+        return TestResult::Fail("invalid max bpc accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_picks_the_deepest_hdmi_depth_that_fits
+);

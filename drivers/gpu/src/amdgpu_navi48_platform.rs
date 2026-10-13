@@ -707,6 +707,12 @@ pub async unsafe fn stop_modeset(
     unsafe { boot.stop_modeset(modeset).await }
 }
 
+/// Highest HDMI output depth native modesets may pick (8, 10 or 12 bpc;
+/// default 8 as DRM's max_requested_bpc). Other values are ignored.
+pub fn set_max_bpc(bpc: u8) {
+    crate::amdgpu_navi48_boot::set_max_bpc(bpc);
+}
+
 /// Poll period of the native display monitor. HPD interrupts are not yet
 /// dispatched to the display owner, so hot-plug and link loss are polled.
 const MONITOR_MS: u64 = 1000;

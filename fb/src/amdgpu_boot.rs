@@ -89,6 +89,13 @@ pub(super) fn start() -> InitResult {
         "amdgpu: {generation} framebuffer {}",
         if paused() { "quarantined" } else { "available" }
     );
+    // `amdgpu.max_bpc=10|12`: allow HDMI deep colour, as DRM's max bpc.
+    if let Some(bpc) = narf_boot::args()
+        .value("amdgpu.max_bpc")
+        .and_then(|v| v.parse::<u8>().ok())
+    {
+        navi48::set_max_bpc(bpc);
+    }
     if ok && navi48 && narf_boot::args().has_flag("amdgpu.native_display") {
         native_display();
     }
