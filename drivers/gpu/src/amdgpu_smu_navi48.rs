@@ -1,9 +1,11 @@
 //! Navi48 SMU14 cold boot: version handshake, firmware-owned board table and
 //! bounded GFX DPM/protection policy. Linux smu_v14_0{,_2_ppt}.c,
 //! smu14_driver_if_v14_0.h and smu_v14_0_2_pptable.h define this wire format.
+pub use crate::amdgpu_smu_navi48_telemetry::{Limits, Metrics, Telemetry};
 use crate::{
     amdgpu::AmdGpu,
     amdgpu_discovery as ip,
+    amdgpu_smu_navi48_telemetry::{METRICS_BYTES, METRICS_TABLE},
     amdgpu_vram::{Pool, Reservation},
 };
 use alloc::vec::Vec;
@@ -40,6 +42,17 @@ const ALLOWED: u64 = REQUIRED
     | (1 << 56)
     | (1 << 57)
     | (1 << 58);
+// Autonomous protection PMFW must keep running once boot enabled it:
+// THROTTLERS (PPT/TDC/thermal), GTHR, ACDC, VR0HOT, FW_CTF, FAN_CONTROL and
+// FAN_ABNORMAL. Linux never disables these at runtime; neither does narf.
+const PROTECTION: u64 =
+    (1 << 23) | (1 << 25) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 29) | (1 << 57);
+// Linux smu_v14_0_deep_sleep_control/gfx_ulv_control feature groups:
+// DS_GFXCLK and GFX_ULV, then DS_SOCCLK/FCLK/LCLK/DCFCLK/UCLK, which feed or
+// follow display memory bandwidth.
+const DEEP_SLEEP_GRAPHICS: u64 = (1 << 10) | (1 << 16);
+const DEEP_SLEEP_MEMORY_FABRIC: u64 = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+const PPCLK_GFXCLK: u32 = 0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Unsupported,
@@ -67,7 +80,27 @@ pub enum State {
     PowerReady,
     EnablingDisplayPower,
     DisplayPowerReady,
+    /// A runtime telemetry/DPM command is in flight; cancellation leaves it.
+    Runtime,
     Failed,
+}
+/// GFXCLK soft limits, Linux `smu_v14_0_set_performance_level` restricted to
+/// the graphics clock: display never depends on it, so no admission reruns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GfxLevel {
+    /// PMFW chooses within its whole DPM range (0xffff/0 automatic bounds).
+    Auto,
+    /// Pinned to the minimum or maximum DPM frequency.
+    Low,
+    High,
+}
+/// Runtime deep-sleep groups PMFW may enter once enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepSleep {
+    /// GFXCLK deep sleep and GFX ULV; graphics core only.
+    Graphics,
+    /// SOCCLK/FCLK/LCLK/DCFCLK/UCLK deep sleep. Changes display bandwidth.
+    MemoryFabric,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Versions {
@@ -219,6 +252,10 @@ struct Engine<I: Io> {
     board: Vec<u8>,
     features: u64,
     power: Option<PowerStatus>,
+    limits: Option<Limits>,
+    /// PROTECTION bits running when boot power configuration completed.
+    protection: u64,
+    gfx_level: GfxLevel,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> T) -> Result<T, Error> {
@@ -315,6 +352,8 @@ impl<I: Io> Engine<I> {
                 narf_scheduler::yield_now().await;
             }
             self.features = board_features(&self.board)?;
+            // Telemetry limits are optional diagnostics; boot does not need them.
+            self.limits = Limits::from_board(&self.board, self.features);
             Ok(())
         }
         .await;
@@ -389,6 +428,7 @@ impl<I: Io> Engine<I> {
         };
         if let Ok(p) = result {
             self.power = Some(p);
+            self.protection = p.enabled & PROTECTION;
         }
         result
     }
@@ -425,6 +465,126 @@ impl<I: Io> Engine<I> {
         .await;
         self.state = if result.is_ok() {
             State::DisplayPowerReady
+        } else {
+            State::Failed
+        };
+        if let Ok(power) = result {
+            self.power = Some(power);
+        }
+        result
+    }
+    /// Runtime commands start from a powered state and leave `Runtime` set
+    /// while in flight, so cancellation forbids reuse.
+    fn begin_runtime(&mut self) -> Result<State, Error> {
+        let resume = self.state;
+        if !matches!(resume, State::PowerReady | State::DisplayPowerReady) {
+            return Err(Error::Busy);
+        }
+        self.state = State::Runtime;
+        Ok(resume)
+    }
+    /// A clean PMFW rejection leaves the mailbox idle and the owner reusable,
+    /// as in Linux; timeout, revocation and device loss are terminal.
+    fn end_runtime<T>(&mut self, resume: State, result: &Result<T, Error>) {
+        self.state = match result {
+            Ok(_) | Err(Error::Rejected(_)) => resume,
+            Err(_) => State::Failed,
+        };
+    }
+    fn protected(&self, enabled: u64) -> bool {
+        self.power.is_some() && enabled & self.protection == self.protection
+    }
+    async fn running(&mut self) -> Result<u64, Error> {
+        let low = u64::from(self.command(0xc, 0).await?);
+        Ok(low | (u64::from(self.command(0xd, 0).await?) << 32))
+    }
+    /// Linux `smu_cmn_get_metrics_table` (TABLE_SMU_METRICS, SMU -> VRAM),
+    /// the running feature mask and `smu_v14_0_get_ppt_limit` (AC source).
+    async fn read_telemetry(&mut self) -> Result<Telemetry, Error> {
+        let resume = self.begin_runtime()?;
+        let result = async {
+            // Zeroed staging: an acknowledged but unwritten table reads as
+            // zeros, never as the stale board table that shared this buffer.
+            self.access(|io| io.write_buffer(0, &[0; METRICS_BYTES]))?;
+            self.access(|io| io.flush())??;
+            self.transfer(0x12, METRICS_TABLE).await?;
+            let mut bytes = [0; METRICS_BYTES];
+            self.access(|io| io.read_buffer(0, &mut bytes))?;
+            let enabled = self.running().await?;
+            let ppt_limit_w = self.command(0x33, 0).await?;
+            Ok(Telemetry {
+                metrics: Metrics::decode(&bytes),
+                enabled,
+                ppt_limit_w,
+            })
+        }
+        .await;
+        self.end_runtime(resume, &result);
+        result
+    }
+    /// SetSoftMaxByFreq then SetSoftMinByFreq on GFXCLK, with Linux's
+    /// `SMU_V14_SOFT_FREQ_ROUND` on manual maxima.
+    async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
+        let power = self.power.ok_or(Error::Invalid)?;
+        let (min, max) = (u32::from(power.gfx_min_mhz), u32::from(power.gfx_max_mhz));
+        let (soft_max, soft_min) = match level {
+            GfxLevel::Auto => (0xffff, 0),
+            GfxLevel::Low => (min + 1, min),
+            GfxLevel::High => ((max + 1).min(0xffff), max),
+        };
+        let resume = self.begin_runtime()?;
+        let result = async {
+            self.command(0x1a, PPCLK_GFXCLK << 16 | soft_max).await?;
+            self.command(0x19, PPCLK_GFXCLK << 16 | soft_min).await?;
+            Ok(())
+        }
+        .await;
+        if result.is_ok() {
+            self.gfx_level = level;
+        }
+        self.end_runtime(resume, &result);
+        result
+    }
+    /// Linux `smu_v14_0_deep_sleep_control(true)` for one board-supported
+    /// group: extend the allowed mask, EnableSmuFeaturesLow/High and verify
+    /// that every protection and display DPM feature is still running.
+    async fn allow_deep_sleep(&mut self, group: DeepSleep) -> Result<PowerStatus, Error> {
+        let previous = self.power.ok_or(Error::Invalid)?;
+        let bits = match group {
+            DeepSleep::Graphics => DEEP_SLEEP_GRAPHICS,
+            DeepSleep::MemoryFabric if self.state == State::DisplayPowerReady => {
+                DEEP_SLEEP_MEMORY_FABRIC
+            }
+            DeepSleep::MemoryFabric => return Err(Error::Busy),
+        } & self.features;
+        if bits & !previous.enabled == 0 {
+            self.access(|_| ())?;
+            return Ok(previous);
+        }
+        let required = REQUIRED | self.protection | (previous.enabled & DISPLAY);
+        let resume = self.begin_runtime()?;
+        let result = async {
+            self.access(|io| io.check_policy())??;
+            let allowed = previous.allowed | bits;
+            self.command(5, (allowed >> 32) as u32).await?;
+            self.command(4, allowed as u32).await?;
+            self.command(8, bits as u32).await?;
+            self.command(9, (bits >> 32) as u32).await?;
+            let enabled = self.running().await?;
+            if enabled & (required | bits) != required | bits || enabled & !allowed != 0 {
+                return Err(Error::Features(enabled));
+            }
+            Ok(PowerStatus {
+                allowed,
+                enabled,
+                ..previous
+            })
+        }
+        .await;
+        // A rejected feature-mask command may have partially applied, so
+        // every failure here is terminal rather than a clean rejection.
+        self.state = if result.is_ok() {
+            resume
         } else {
             State::Failed
         };
@@ -499,6 +659,9 @@ impl Smu {
                 board,
                 features: 0,
                 power: None,
+                limits: None,
+                protection: 0,
+                gfx_level: GfxLevel::Auto,
             },
         })
     }
@@ -522,6 +685,43 @@ impl Smu {
     }
     pub async fn configure_power(&mut self) -> Result<PowerStatus, Error> {
         self.engine.configure_power().await
+    }
+    /// Board thermal/fan/power limits, when the firmware table provides them.
+    pub fn limits(&self) -> Option<Limits> {
+        self.engine.limits
+    }
+    /// Whether every autonomous protection running after boot configuration
+    /// (throttlers, firmware CTF, fan control, ...) is still enabled.
+    pub fn protected(&self, enabled: u64) -> bool {
+        self.engine.protected(enabled)
+    }
+    pub fn gfx_level(&self) -> GfxLevel {
+        self.engine.gfx_level
+    }
+    /// One PMFW metrics/feature/PPT refresh. Requires configured power.
+    pub async fn read_telemetry(&mut self) -> Result<Telemetry, Error> {
+        self.engine.read_telemetry().await
+    }
+    /// Apply GFXCLK soft limits. Display clocks, UCLK/FCLK pinning and every
+    /// protection are untouched; a clean rejection leaves the owner usable.
+    pub async fn set_gfx_level(&mut self, level: GfxLevel) -> Result<(), Error> {
+        self.engine.set_gfx_level(level).await
+    }
+    /// Let PMFW enter one deep-sleep group. Disabled policy: nothing in narf
+    /// calls this yet. Every failure is terminal.
+    ///
+    /// # Safety
+    /// All kernel engines are idle and their owners tolerate GFXCLK deep sleep
+    /// and ULV. For `MemoryFabric`, the exclusive display owner has already
+    /// recalculated admission and watermarks for deep-sleep clock floors and
+    /// exit latencies and installed PMFW watermark ranges; the pinned DCN401
+    /// floors alone do not account for deep-sleep exit latency.
+    #[allow(dead_code, reason = "disabled-by-default policy hook")]
+    pub(crate) async unsafe fn allow_deep_sleep(
+        &mut self,
+        group: DeepSleep,
+    ) -> Result<PowerStatus, Error> {
+        self.engine.allow_deep_sleep(group).await
     }
 }
 

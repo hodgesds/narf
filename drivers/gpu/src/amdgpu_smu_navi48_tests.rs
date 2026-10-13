@@ -45,6 +45,7 @@ struct Fake {
     address: u64,
     policy: u32,
     uploaded: Vec<u8>,
+    metrics: Vec<u8>,
 }
 impl Io for Fake {
     fn read(&mut self, reg: u32) -> u32 {
@@ -77,8 +78,14 @@ impl Io for Fake {
                 0
             }
             0x12 => {
-                self.violation |= p != 1 || self.dirty || self.address != 0x8_00003000;
-                self.memory[..COMBO_BYTES].copy_from_slice(&self.board);
+                self.violation |= !matches!(p, 1 | 5) || self.dirty || self.address != 0x8_00003000;
+                if p == 5 {
+                    // Stale staging must have been cleared before PMFW writes.
+                    self.violation |= self.memory[..METRICS_BYTES].iter().any(|&b| b != 0);
+                    self.memory[..METRICS_BYTES].copy_from_slice(&self.metrics);
+                } else {
+                    self.memory[..COMBO_BYTES].copy_from_slice(&self.board);
+                }
                 0
             }
             0x13 => {
@@ -98,7 +105,19 @@ impl Io for Fake {
             0xd => (self.reported.unwrap_or(self.enabled) >> 32) as u32,
             0x1d => 500,
             0x1e => 3100,
-            0x36 | 6 => 0,
+            0x36 | 6 | 0x19 | 0x1a => 0,
+            8 => {
+                self.enabled |= p as u64;
+                0
+            }
+            9 => {
+                self.enabled |= (p as u64) << 32;
+                0
+            }
+            0x33 => {
+                self.violation |= p != 0; // AC power source
+                304
+            }
             _ => panic!("unknown SMU14 message"),
         };
         if let Some((message, cap)) = self.revoke {
@@ -155,6 +174,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
                 address: 0,
                 policy: 0,
                 uploaded: Vec::new(),
+                metrics: vec![0; METRICS_BYTES],
             },
             authority: Cap::bootstrap(),
             memory,
@@ -163,6 +183,9 @@ fn fixture() -> (Pool, Engine<Fake>) {
             board: vec![0; COMBO_BYTES],
             features: 0,
             power: None,
+            limits: None,
+            protection: 0,
+            gfx_level: GfxLevel::Auto,
         },
     )
 }
@@ -544,4 +567,311 @@ fn smu14_display_power_partial_failures_cancellation_and_revocation_are_terminal
 kernel_test_in!(
     "drivers/gpu/smu-navi48",
     smu14_display_power_partial_failures_cancellation_and_revocation_are_terminal
+);
+
+fn put16(b: &mut [u8], at: usize, v: u16) {
+    b[at..at + 2].copy_from_slice(&v.to_le_bytes());
+}
+/// SmuMetrics_t sample at the offsets checked by tests/smu14_metrics.c.
+fn metrics(gfx_activity: u16, uclk_activity: u16) -> Vec<u8> {
+    let mut m = vec![0; METRICS_BYTES];
+    for (i, mhz) in [2400u32, 1200, 1258, 2000, 0, 0, 0, 0, 0, 1500, 0]
+        .into_iter()
+        .enumerate()
+    {
+        put(&mut m, i * 4, mhz); // CurrClock[PPCLK_e]
+    }
+    for (at, v) in [
+        (46, 2450u16), // gfx pre-DS
+        (48, 120),     // gfx post-DS
+        (50, 1900),    // fclk pre-DS
+        (52, 400),     // fclk post-DS
+        (54, 1250),    // mem pre-DS
+        (56, 96),      // mem post-DS
+        (108, 1050),   // AvgVoltage[VDD_GFX]
+        (124, gfx_activity),
+        (126, uclk_activity),
+        (136, 287), // AverageSocketPower
+        (138, 301), // AverageTotalBoardPower
+        (140, 61),  // edge
+        (142, 77),  // hotspot
+        (148, 70),  // mem
+        (150, 58),  // VR GFX
+        (152, 55),  // VR SOC
+        (170, 1620),
+    ] {
+        put16(&mut m, at, v);
+    }
+    put(&mut m, 104, 0x1234);
+    m[166] = 4; // PCIe gen
+    m[167] = 16;
+    m[168] = 50; // fan percent
+    m[172 + 1] = 10; // hotspot throttling
+    m[172 + 14] = 3; // PPT0 throttling
+    m
+}
+fn limits_board() -> Vec<u8> {
+    let mut b = board();
+    put16(&mut b, 43, 118); // software_shutdown_temp
+    put16(&mut b, 4924, 304); // SocketPowerLimitAc[PPT0]
+    for (i, c) in [(0, 100u16), (1, 110), (4, 108)] {
+        put16(&mut b, 4944 + 2 * i, c); // TemperatureLimit
+    }
+    put16(&mut b, 5046, 3300); // FanMaximumRpm
+    put16(&mut b, 5126, (-10i16) as u16); // FanAbnormalTempLimitOffset
+    b
+}
+fn powered() -> (Pool, Engine<Fake>) {
+    let (pool, mut e) = fixture();
+    e.io.board = limits_board();
+    run(e.verify()).unwrap();
+    run(e.read_board()).unwrap();
+    run(e.upload_board()).unwrap();
+    run(e.configure_power()).unwrap();
+    e.io.commands.clear();
+    (pool, e)
+}
+/// After the display power transition, with boot's protection recorded.
+fn displayed() -> (Pool, Engine<Fake>) {
+    let (pool, mut e) = display_engine();
+    e.protection = ALLOWED & PROTECTION;
+    run(e.enable_display_power()).unwrap();
+    e.features |= DEEP_SLEEP_GRAPHICS | DEEP_SLEEP_MEMORY_FABRIC;
+    e.io.commands.clear();
+    (pool, e)
+}
+fn smu14_telemetry_decodes_metrics_limits_and_protection() -> TestResult {
+    let (pool, mut e) = powered();
+    let limits = e.limits.unwrap();
+    assert_eq!(
+        limits,
+        Limits {
+            edge_crit_milli: 100_000,
+            edge_emergency_milli: 105_000,
+            hotspot_crit_milli: 110_000,
+            hotspot_emergency_milli: 115_000,
+            mem_crit_milli: 108_000,
+            mem_emergency_milli: 113_000,
+            software_shutdown_c: 118,
+            software_shutdown_offset_c: -10,
+            fan_max_rpm: Some(3300),
+            ppt_default_w: 304,
+        }
+    );
+    e.io.metrics = metrics(40, 30);
+    let t = run(e.read_telemetry()).unwrap();
+    assert_eq!(
+        e.io.commands,
+        [
+            (0xe, 8),
+            (0xf, 0x3000),
+            (0x12, 5),
+            (0xc, 0),
+            (0xd, 0),
+            (0x33, 0)
+        ]
+    );
+    assert!(!e.io.violation);
+    assert_eq!(e.state, State::PowerReady);
+    let m = t.metrics;
+    assert_eq!(
+        (m.counter, t.ppt_limit_w, t.enabled),
+        (0x1234, 304, ALLOWED)
+    );
+    assert_eq!(
+        (m.edge_milli, m.hotspot_milli, m.mem_milli),
+        (61_000, 77_000, 70_000)
+    );
+    assert_eq!((m.vr_gfx_milli, m.vr_soc_milli), (58_000, 55_000));
+    assert_eq!((m.fan_rpm, m.fan_pwm, m.vddgfx_mv), (1620, 127, 1050));
+    assert_eq!((m.socket_power_w, m.board_power_w), (287, 301));
+    // Busy: Linux reports pre-deep-sleep averages.
+    assert_eq!((m.gfx_mhz, m.fclk_mhz, m.mem_mhz), (2450, 1900, 1250));
+    assert_eq!(
+        (m.uclk_mhz, m.fclk_current_mhz, m.socclk_mhz, m.dcfclk_mhz),
+        (1258, 2000, 1200, 1500)
+    );
+    assert_eq!(m.throttlers, (1 << 1) | (1 << 14));
+    assert_eq!((m.pcie_rate, m.pcie_width), (4, 16));
+    // Idle (at the busy threshold) selects post-deep-sleep averages, and a
+    // negative-overflow UCLK activity reads as zero (smu_safe_u16_nn).
+    e.io.metrics = metrics(5, 0xfff0);
+    e.io.metrics[168] = 100;
+    let m = run(e.read_telemetry()).unwrap().metrics;
+    assert_eq!((m.gfx_mhz, m.fclk_mhz, m.mem_mhz), (120, 400, 96));
+    assert_eq!((m.mem_activity, m.fan_pwm), (0, 255));
+    assert!(!limits.software_shutdown(&m));
+    let mut hot = m;
+    hot.hotspot_milli = 118_000;
+    assert!(limits.software_shutdown(&hot));
+    // Protection is the running autonomous set recorded at boot.
+    assert!(e.protected(ALLOWED));
+    assert!(!e.protected(ALLOWED & !(1 << 28)));
+    assert!(!e.protected(ALLOWED & !(1 << 29)));
+    drop(e);
+    if pool.available() != 1 << 20 {
+        return TestResult::Fail("completed metrics transfer leaked its buffer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_telemetry_decodes_metrics_limits_and_protection
+);
+
+fn smu14_missing_board_limits_and_fanless_boards() -> TestResult {
+    let mut b = limits_board();
+    assert!(Limits::from_board(&b, 0).unwrap().fan_max_rpm.is_none());
+    put16(&mut b, 4944 + 8, 0); // no memory temperature limit
+    assert!(Limits::from_board(&b, u64::MAX).is_none());
+    assert!(Limits::from_board(&b[..4000], u64::MAX).is_none());
+    // Absent limits never block the board stage.
+    let (_, mut e) = fixture();
+    run(e.verify()).unwrap();
+    run(e.read_board()).unwrap();
+    assert_eq!((e.limits, e.state), (None, State::BoardReady));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_missing_board_limits_and_fanless_boards
+);
+
+fn smu14_telemetry_rejection_is_recoverable_but_timeout_is_terminal() -> TestResult {
+    let (_, mut e) = fixture();
+    assert_eq!(run(e.read_telemetry()), Err(Error::Busy));
+    assert!(e.io.commands.is_empty());
+    for message in [0x12, 0xc, 0x33] {
+        let (_, mut e) = powered();
+        e.io.reject = Some(message);
+        assert_eq!(run(e.read_telemetry()), Err(Error::Rejected(0xfd)));
+        assert_eq!(e.state, State::PowerReady);
+        e.io.reject = None;
+        assert!(run(e.read_telemetry()).is_ok());
+    }
+    let (pool, mut e) = powered();
+    e.io.stall = Some(0x12);
+    assert_eq!(run(e.read_telemetry()), Err(Error::Timeout));
+    assert_eq!(e.state, State::Failed);
+    let n = e.io.commands.len();
+    assert_eq!(run(e.read_telemetry()), Err(Error::Busy));
+    assert_eq!(run(e.set_gfx_level(GfxLevel::High)), Err(Error::Busy));
+    assert_eq!(e.io.commands.len(), n);
+    drop(e);
+    if pool.available() != (1 << 20) - TRANSFER_BYTES as u64 {
+        return TestResult::Fail("timed out metrics DMA buffer recycled");
+    }
+    let (_, mut e) = powered();
+    e.io.stall = Some(0xd);
+    {
+        let mut f = core::pin::pin!(e.read_telemetry());
+        assert!(f
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(e.state, State::Runtime);
+    assert_eq!(run(e.read_telemetry()), Err(Error::Busy));
+    let (_, mut e) = powered();
+    e.io.revoke = Some((0x33, e.authority));
+    assert_eq!(run(e.read_telemetry()), Err(Error::Revoked));
+    assert_eq!(e.state, State::Failed);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_telemetry_rejection_is_recoverable_but_timeout_is_terminal
+);
+
+fn smu14_gfx_levels_use_soft_limits_only() -> TestResult {
+    let (_, mut e) = powered();
+    for (level, max, min) in [
+        (GfxLevel::Low, 501, 500),
+        (GfxLevel::High, 3101, 3100),
+        (GfxLevel::Auto, 0xffff, 0),
+    ] {
+        e.io.commands.clear();
+        run(e.set_gfx_level(level)).unwrap();
+        assert_eq!(e.io.commands, [(0x1a, max), (0x19, min)]);
+        assert_eq!((e.gfx_level, e.state), (level, State::PowerReady));
+    }
+    e.io.reject = Some(0x19);
+    assert_eq!(
+        run(e.set_gfx_level(GfxLevel::High)),
+        Err(Error::Rejected(0xfd))
+    );
+    assert_eq!((e.gfx_level, e.state), (GfxLevel::Auto, State::PowerReady));
+    let (_, mut e) = displayed();
+    run(e.set_gfx_level(GfxLevel::Low)).unwrap();
+    assert_eq!(e.state, State::DisplayPowerReady);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_gfx_levels_use_soft_limits_only
+);
+
+fn smu14_deep_sleep_is_gated_and_keeps_protection() -> TestResult {
+    let (_, mut e) = powered();
+    assert_eq!(
+        run(e.allow_deep_sleep(DeepSleep::MemoryFabric)),
+        Err(Error::Busy)
+    );
+    assert!(e.io.commands.is_empty());
+    let p = run(e.allow_deep_sleep(DeepSleep::Graphics)).unwrap();
+    let allowed = ALLOWED | DEEP_SLEEP_GRAPHICS;
+    assert_eq!(
+        e.io.commands,
+        [
+            (5, (allowed >> 32) as u32),
+            (4, allowed as u32),
+            (8, DEEP_SLEEP_GRAPHICS as u32),
+            (9, 0),
+            (0xc, 0),
+            (0xd, 0)
+        ]
+    );
+    assert_eq!((p.allowed, p.enabled), (allowed, allowed));
+    assert_eq!((e.state, e.power), (State::PowerReady, Some(p)));
+    // Already running: no commands.
+    e.io.commands.clear();
+    assert_eq!(run(e.allow_deep_sleep(DeepSleep::Graphics)), Ok(p));
+    assert!(e.io.commands.is_empty());
+    // Memory/fabric deep sleep only after the display power transition.
+    let (_, mut e) = displayed();
+    let p = run(e.allow_deep_sleep(DeepSleep::MemoryFabric)).unwrap();
+    assert_eq!(
+        p.enabled & DEEP_SLEEP_MEMORY_FABRIC,
+        DEEP_SLEEP_MEMORY_FABRIC
+    );
+    assert_eq!(e.state, State::DisplayPowerReady);
+    // Unsupported board bits send nothing.
+    let (_, mut e) = powered();
+    e.features &= !DEEP_SLEEP_GRAPHICS;
+    assert!(run(e.allow_deep_sleep(DeepSleep::Graphics)).is_ok());
+    assert!(e.io.commands.is_empty());
+    // Losing any protection or display DPM bit is terminal.
+    for lost in [1u64 << 28, 1 << 29, 1 << 3] {
+        let (_, mut e) = displayed();
+        e.io.reported = Some((ALLOWED | DISPLAY | DEEP_SLEEP_GRAPHICS) & !lost);
+        assert!(matches!(
+            run(e.allow_deep_sleep(DeepSleep::Graphics)),
+            Err(Error::Features(_))
+        ));
+        assert_eq!(e.state, State::Failed);
+        assert_eq!(run(e.read_telemetry()), Err(Error::Busy));
+    }
+    // A rejected feature command may have partially applied: terminal too.
+    let (_, mut e) = powered();
+    e.io.reject = Some(9);
+    assert_eq!(
+        run(e.allow_deep_sleep(DeepSleep::Graphics)),
+        Err(Error::Rejected(0xfd))
+    );
+    assert_eq!(e.state, State::Failed);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/smu-navi48",
+    smu14_deep_sleep_is_gated_and_keeps_protection
 );

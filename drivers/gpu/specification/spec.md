@@ -249,6 +249,45 @@ publishes the new `PowerStatus`; partial failure/cancellation retains the
 owner and prevents replay. Only the retained DCN4 clock owner initiates this
 transition, after checking every display consumer.
 
+`read_board` also decodes optional board `Limits` from the combo, following
+Linux `smu_v14_0_2_get_thermal_temperature_range`: CustomSkuTable
+`TemperatureLimit` for edge/hotspot/memory (critical) and that limit plus
+`CTF_OFFSET` 5 °C (emergency), powerplay `software_shutdown_temp` with the
+fan-abnormal offset, `FanMaximumRpm` when `FeaturesToRun` has FAN_CONTROL,
+and the AC PPT0 default. A zero or implausible temperature limit yields no
+limits instead of failing boot. `configure_power` records which autonomous
+protections (THROTTLERS, GTHR, ACDC, VR0HOT, FW_CTF, FAN_CONTROL,
+FAN_ABNORMAL) are running; `protected(enabled)` checks a later mask still
+contains all of them. No narf path disables a protection feature.
+
+`read_telemetry().await` requires configured power and mirrors Linux
+`smu_cmn_get_metrics_table`: it zeroes and flushes the staging buffer,
+transfers TABLE_SMU_METRICS (5) to VRAM, decodes `SmuMetrics_t`
+(`get_smu_metrics_data`: temperatures in millidegrees, busy-threshold GFX/FCLK/
+UCLK averages, `smu_safe_u16_nn` activity, fan PWM percent scaled to 0–255,
+socket/board watts, VDDGFX mV, current clocks, and a throttler bit per nonzero
+`ThrottlingPercentage`), then reads the running feature mask and
+`GetPptLimit` for the AC source. `set_gfx_level(Auto|Low|High)` issues only
+GFXCLK `SetSoftMaxByFreq` then `SetSoftMinByFreq`, as Linux
+`smu_v14_0_set_performance_level` does for GFXCLK (automatic `0xffff`/0
+bounds, `SMU_V14_SOFT_FREQ_ROUND` on manual maxima); display, memory and
+fabric clocks keep their pinned floors. Runtime commands run from
+`PowerReady`/`DisplayPowerReady` through a transient `Runtime` state: a clean
+PMFW rejection restores the previous state as in Linux, while timeout,
+revocation, device loss or cancellation leave the owner unusable.
+
+`unsafe allow_deep_sleep(DeepSleep)` is the SMU side of relaxing the pinned
+policy, following `smu_v14_0_deep_sleep_control`: it extends the allowed mask
+with one board-supported group (DS_GFXCLK+GFX_ULV, or SOCCLK/FCLK/LCLK/DCFCLK/
+UCLK deep sleep after the display power transition), sends
+`EnableSmuFeaturesLow/High` and requires every recorded protection and display
+DPM bit to stay running. Every failure is terminal. It is disabled policy:
+nothing calls it. Memory/fabric deep sleep first needs the display owner to
+recalculate DML admission and watermarks for deep-sleep floors and exit
+latency and to install PMFW watermark ranges through the DAL mailbox; none of
+that exists yet. Layout and message constants are checked against the Linux
+headers by `tests/smu14_metrics.c`; everything is model-tested only.
+
 `unsafe amdgpu_dcn401_clk::ClockManager::new` prepares a separate DAL mailbox
 owner without hardware writes. Exact Navi48/GC12/MP1 14.0.2/3/DCN4.0.1 discovery
 is required (the native DCN4.1.0 discovery spelling is also accepted). MP1 bank

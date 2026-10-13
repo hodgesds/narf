@@ -632,6 +632,15 @@ hot-plug, flip, VUPDATE, vblank, VLINE and DMUB vectors are counted per
 instance for the display owner, and the native display monitor now waits on
 hot-plug vectors with its 1 s poll as fallback; DCN HPD interrupts are not
 armed or acknowledged yet, so behaviour is unchanged until they are.
+The retained SMU14 owner now reads PMFW telemetry (Linux's SMU14.0.2 metrics
+table: edge/hotspot/memory/VR temperatures, fan RPM/PWM, socket/board power,
+VDDGFX, current clocks, activity and throttler status), the running feature
+mask and PPT limit, and decodes board thermal/fan/power limits. Throttlers,
+firmware CTF and fan control stay PMFW-owned; protection loss is detectable.
+GFXCLK performance levels use PMFW soft limits only, leaving display clocks
+pinned. Deep sleep has an SMU-side, disabled-by-default hook: memory/fabric
+low power still needs display admission/watermark recalculation first.
+Model-tested only; nothing here has run on an RX 9070 XT.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer

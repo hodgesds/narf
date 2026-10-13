@@ -245,6 +245,7 @@ pub mod amdgpu_smc_firmware;
 pub mod amdgpu_smu;
 pub mod amdgpu_smu_navi22;
 pub mod amdgpu_smu_navi48;
+pub mod amdgpu_smu_navi48_telemetry;
 pub mod amdgpu_smu_v12;
 pub mod amdgpu_smu_v13;
 pub mod amdgpu_uapi;
