@@ -489,3 +489,41 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_offers_edid_modes_and_selects_a_wanted_one
 );
+
+fn navi48_modeset_lists_standard_established_and_vic_modes_like_linux() -> TestResult {
+    let mut e = edid_1080p();
+    e[35] = 0x20; // established 640x480@60
+    e[38..40].copy_from_slice(&[0x81, 0x80]); // standard 1280x1024@60
+    for slot in (40..54).step_by(2) {
+        e[slot..slot + 2].copy_from_slice(&[1, 1]);
+    }
+    e[127] = 0;
+    e[127] = narf_edid::compute_checksum(&e);
+    let mut e = with_cta(e, false);
+    // A video data block: VIC 16 (1080p60, a duplicate of the DTD), VIC 4
+    // (720p60), VIC 5 (1080i, interlaced) and VIC 6 (pixel-repeated 480i).
+    e[132..137].copy_from_slice(&[2 << 5 | 4, 0x80 | 16, 4, 5, 6]);
+    e[130] = 9;
+    e[255] = 0;
+    let sum = e[128..255].iter().fold(0u8, |s, b| s.wrapping_add(*b));
+    e[255] = 0u8.wrapping_sub(sum);
+    let sizes: Vec<(u32, u32, u32)> = edid_timings(&e)
+        .iter()
+        .map(|t| (t.h_active, t.v_active, t.pixel_clock_khz))
+        .collect();
+    if sizes
+        != [
+            (1920, 1080, 148_500),
+            (1280, 1024, 108_000),
+            (640, 480, 25_175),
+            (1280, 720, 74_250),
+        ]
+    {
+        return TestResult::Fail("mode list order and filtering");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_lists_standard_established_and_vic_modes_like_linux
+);

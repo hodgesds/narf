@@ -146,29 +146,60 @@ pub struct Modeset {
     pub modes: [Option<Timing>; MAX_MODES],
 }
 
-/// Modes offered per sink: the base block's four detailed timings plus
-/// room for CTA extension ones.
-pub const MAX_MODES: usize = 8;
+/// Modes offered per sink.
+pub const MAX_MODES: usize = 16;
 
-/// The sink's detailed timings the DCN timing model accepts, in EDID order
-/// (the base block's first, which EDID 1.3+ makes the preferred mode,
-/// then each CTA-861 extension's), without duplicates. Standard, established
-/// and CTA VIC timings need their own tables and are not offered.
+/// The sink's modes the DCN timing model accepts, in Linux's
+/// drm_edid_connector_add_modes order without duplicates: detailed timings
+/// (base block first, which EDID 1.3+ makes the preferred mode, then each
+/// CTA-861 extension's), standard timings DMT covers, established timings,
+/// then the CTA extensions' short video descriptors. Interlaced and
+/// pixel-repeated modes are left out (the pipeline drives neither), as are
+/// standard timings needing CVT/GTF synthesis.
 pub fn edid_timings(edid: &[u8]) -> Vec<Timing> {
-    let mut detailed = Vec::new();
-    if let Some(base) = edid
+    use narf_edid::modes;
+    let base = edid
         .get(..128)
-        .and_then(|b| narf_edid::Block::parse(b).ok())
-    {
-        detailed.extend(base.detailed_timings);
+        .and_then(|b| narf_edid::Block::parse(b).ok());
+    let ctas: Vec<narf_edid::cta861::CtaExtension> = edid
+        .chunks_exact(128)
+        .skip(1)
+        .filter(|b| b[0] == 0x02)
+        .filter_map(|b| narf_edid::cta861::CtaExtension::parse(b).ok())
+        .collect();
+    let mut detailed: Vec<narf_edid::DetailedTiming> = Vec::new();
+    if let Some(base) = &base {
+        detailed.extend(base.detailed_timings.iter().copied());
     }
-    for block in edid.chunks_exact(128).skip(1) {
-        if block[0] == 0x02 {
-            if let Ok(cta) = narf_edid::cta861::CtaExtension::parse(block) {
-                detailed.extend(cta.detailed_timings);
+    for cta in &ctas {
+        detailed.extend(cta.detailed_timings.iter().copied());
+    }
+    let mut fixed: Vec<modes::FixedMode> = Vec::new();
+    if let Some(base) = &base {
+        fixed.extend(
+            base.standard_timings
+                .iter()
+                .filter_map(|&(b0, b1)| modes::standard_mode(b0, b1, base.edid_revision)),
+        );
+        fixed.extend(modes::established_modes(
+            base.established_timings_1,
+            base.established_timings_2,
+            edid[37],
+        ));
+    }
+    for cta in &ctas {
+        for block in &cta.data_blocks {
+            if let narf_edid::cta861::DataBlock::Video(svds) = block {
+                fixed.extend(svds.iter().filter_map(|svd| modes::cea_mode(svd.vic)));
             }
         }
     }
+    detailed.extend(
+        fixed
+            .into_iter()
+            .filter(|m| !m.pixel_repeated())
+            .map(modes::FixedMode::detailed),
+    );
     let mut timings: Vec<Timing> = Vec::new();
     for d in detailed {
         if let Ok(t) = crate::amdgpu_dcn_display::timing_from_edid(&d) {

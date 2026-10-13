@@ -931,10 +931,16 @@ GETPROPBLOB returns verbatim, and the exact DRM timing from the DCN
 `Timing`. That timing has the porches and sync widths, rounded refresh, sync
 polarity flags, and type PREFERRED|DRIVER. GETCONNECTOR and GETCRTC report
 it instead of the synthesized timing. The connector also offers every other
-timing in `Modeset::modes`: the sink's EDID detailed timings (`edid_timings`:
-base block, then CTA-861 extensions; standard, established and VIC timings
-need tables narf does not have) that fit the trained DP link or a TMDS depth
-and that DML admits at the current clock levels, at most eight. Only the
+timing in `Modeset::modes`: the sink's EDID modes in Linux's
+drm_edid_connector_add_modes order (`edid_timings`: detailed timings of the
+base block then the CTA-861 extensions, standard timings that VESA DMT
+covers, established timings, then CTA short video descriptors through the
+VIC table; `narf_edid::modes` carries Linux's tables) that fit the trained DP
+link or a TMDS depth and that DML admits at the current clock levels, at
+most sixteen. Interlaced and pixel-repeated modes are left out, as are
+standard timings that need CVT/GTF synthesis. The HDMI AVI InfoFrame still
+sends VIC 0: a CE VIC would make the sink expect limited-range RGB, which the
+pipeline does not output. Only the
 EDID's first timing carries PREFERRED; the running timing is listed first and
 is the CRTC's mode. SETCRTC with a mode is refused (EINVAL) unless the mode's
 clock and geometry equal an offered timing.
