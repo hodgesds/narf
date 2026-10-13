@@ -974,9 +974,13 @@ updates above), and flip events stay software-paced at the real refresh
 rate.
 
 `platform::spawn_display_monitor` runs after the boot-time native modeset
-(`amdgpu.native_display`). It enables HPD on every routed DP port, then polls
-once a second, because HPD interrupts are not yet dispatched to the display
-owner. Each pass is `monitor_display`: with a modeset running it calls
+(`amdgpu.native_display`). It enables HPD on every routed DP port, then runs
+a pass at least once a second. Between passes it waits in
+`amdgpu_navi48_dispatch::wait_hotplug`, which returns early on a DCN HPD or
+HPD-RX vector or lost IH vectors, never sooner than 50 ms after the previous
+pass. The display owner does not yet arm DC_HPD_INT_EN or acknowledge
+(DC_HPD_INT_ACK, as Linux's hpd0_ack does), so today the once-a-second poll
+still finds every change. Each pass is `monitor_display`: with a modeset running it calls
 `check_modeset`. A lost link is retrained with the surface still published.
 On unplug the scanout is withdrawn (the console returns to the boot
 framebuffer) and the modeset is torn down. With no modeset, any routed port
@@ -2106,6 +2110,22 @@ queue reset and fault-source re-arming after containment remain open, and
 after the first fault other owners see later faults only as timeouts.
 Everything here is model-tested (fake vectors and a local table driven
 through pending waits); none of it has run on the card.
+
+Display events are counted per DCN401 instance in `DisplayEvents` and are
+never acknowledged by the dispatcher, because the DCN registers belong to the
+display owner (amdgpu_dm acknowledges in `dc_interrupt_ack`). `wait_display`
+takes an interest mask (hot-plug, flip, VUPDATE, vblank, VLINE0, DMUB outbox)
+and the consumer's last-seen version, so an event between two waits is
+reported at once. Overflows and terminal errors wake every display waiter.
+No DCN interrupt source is enabled yet; the flip and vblank paths are still
+polled by their owners.
+
+The worker's `Status::wakes` separates drains after a CPU MSI, MSI wakes
+that found nothing, drains after the 100 ms MSI watchdog, watchdog drains
+that found vectors (a lost or unrearmed MSI) and timer polls without a
+route. On the card, a working MSI route shows `irq` advancing with
+`watchdog_found` staying zero; these counters and the dispatch per-owner
+watchdog completions are the evidence the physical test must collect.
 
 `unsafe amdgpu_sdma_navi48::Sdma::new` selects SDMA7.0.0/1 on GC12.0.1,
 with queue registers in GC bank zero and MCU control in bank one. Its owned

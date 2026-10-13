@@ -27,6 +27,52 @@ pub struct Status {
     pub dispatch: dispatch::Summary,
     /// Recovered IH ring0 overflows (vectors were lost).
     pub overflows: u64,
+    pub wakes: Wakes,
+}
+/// Why the worker drained. Kept so MSI delivery on the card is observable
+/// rather than inferred from the watchdog quietly doing the work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    Start,
+    Pending,
+    Irq,
+    Watchdog,
+    Poll,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wakes {
+    /// Drains after a CPU MSI on the routed vector.
+    pub irq: u64,
+    /// MSI wakes that found no vector: spurious, or already drained by a
+    /// proof's own synchronous drain.
+    pub irq_empty: u64,
+    /// Drains after the 100 ms MSI watchdog expired.
+    pub watchdog: u64,
+    /// Watchdog drains that found vectors: an MSI was lost or not rearmed.
+    pub watchdog_found: u64,
+    /// Timer-polled drains without an MSI route.
+    pub polls: u64,
+}
+impl Wakes {
+    fn record(&mut self, cause: Cause, drained: usize) {
+        let add = |n: &mut u64| *n = n.saturating_add(1);
+        match cause {
+            Cause::Irq => {
+                add(&mut self.irq);
+                if drained == 0 {
+                    add(&mut self.irq_empty);
+                }
+            }
+            Cause::Watchdog => {
+                add(&mut self.watchdog);
+                if drained != 0 {
+                    add(&mut self.watchdog_found);
+                }
+            }
+            Cause::Poll => add(&mut self.polls),
+            Cause::Start | Cause::Pending => {}
+        }
+    }
 }
 /// The kernel queues the cold boot owns, registered as dispatch owners so
 /// their completions and faults are attributed like any other owner's.
@@ -138,6 +184,8 @@ struct Service {
     history: History,
     faults: faults::Monitor,
     kernel: [Option<dispatch::Handle>; 3],
+    wakes: Wakes,
+    drained: usize,
 }
 impl Service {
     fn status(&self) -> Status {
@@ -157,11 +205,14 @@ impl Service {
                 .map(|h| h.and_then(|h| dispatch::endpoint(h).ok())),
             dispatch: dispatch::summary(),
             overflows: self.rings.overflows(),
+            wakes: self.wakes,
         }
     }
     fn drain(&mut self) -> Result<bool, ih::Error> {
+        self.drained = 0;
         match self.rings.drain() {
             Ok(batch) => {
+                self.drained = batch.events().count();
                 for event in batch.events() {
                     self.history.push(*event);
                 }
@@ -262,6 +313,8 @@ pub(crate) unsafe fn install(
         history: History::new(),
         faults: faults.take().unwrap(),
         kernel: [None; 3],
+        wakes: Wakes::default(),
+        drained: 0,
     });
     let service = slot.as_mut().unwrap();
     for (handle, key) in service.kernel.iter_mut().zip(KERNEL) {
@@ -302,6 +355,7 @@ pub(crate) unsafe fn install(
     Ok(())
 }
 async fn worker() {
+    let mut cause = Cause::Start;
     loop {
         let vector = {
             let slot = SERVICE.lock().await;
@@ -319,20 +373,28 @@ async fn worker() {
                 return;
             };
             match service.drain() {
-                Ok(pending) => pending,
+                Ok(pending) => {
+                    service.wakes.record(cause, service.drained);
+                    pending
+                }
                 Err(_) => return,
             }
         };
         if pending {
             narf_scheduler::yield_now().await;
+            cause = Cause::Pending;
             continue;
         }
-        if let Some(wait) = wait {
+        cause = if let Some(wait) = wait {
             // A watchdog drain also covers an unexpectedly lost device MSI.
-            let _ = narf_time::timeout(narf_time::Deadline::after_ms(100), wait).await;
+            match narf_time::timeout(narf_time::Deadline::after_ms(100), wait).await {
+                Ok(_) => Cause::Irq,
+                Err(_) => Cause::Watchdog,
+            }
         } else {
             narf_time::SleepUntil::new(narf_time::Deadline::after_ms(1).as_instant()).await;
-        }
+            Cause::Poll
+        };
     }
 }
 /// None means absent or currently draining. Diagnostic history is bounded and

@@ -719,6 +719,37 @@ pub async fn wait_display(
 ) -> Result<u64, WaitError> {
     wait_display_in(&TABLE, mask, since, deadline).await
 }
+/// Hot-plug consumers are never re-run sooner than this after a wake, so an
+/// unacknowledged level source cannot spin them.
+pub const HOTPLUG_MIN_MS: u64 = 50;
+/// Sleep for `period_ms`, returning early (but not before `HOTPLUG_MIN_MS`)
+/// when an HPD/HPD-RX vector or lost vectors arrive after the version kept in
+/// `since`. A terminal interrupt error degrades to the plain period, so a
+/// polling consumer keeps working. Returns whether an event woke it.
+pub async fn wait_hotplug_in(
+    table: &IrqSafeSpinLock<Table>,
+    since: &mut Option<u64>,
+    period_ms: u64,
+) -> bool {
+    let floor = Deadline::after_ms(HOTPLUG_MIN_MS.min(period_ms));
+    let deadline = Deadline::after_ms(period_ms);
+    let woke = match wait_display_in(table, HOTPLUG, *since, deadline).await {
+        Ok(version) => {
+            *since = Some(version);
+            true
+        }
+        Err(WaitError::Timeout) => false,
+        Err(_) => {
+            narf_time::SleepUntil::new(deadline.as_instant()).await;
+            false
+        }
+    };
+    narf_time::SleepUntil::new(floor.as_instant()).await;
+    woke
+}
+pub async fn wait_hotplug(since: &mut Option<u64>, period_ms: u64) -> bool {
+    wait_hotplug_in(&TABLE, since, period_ms).await
+}
 
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_dispatch_tests.rs"]

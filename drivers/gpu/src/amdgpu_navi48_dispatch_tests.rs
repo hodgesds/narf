@@ -397,6 +397,49 @@ kernel_test_in!(
     navi48_dispatch_display_events_wake_only_matching_interest
 );
 
+fn navi48_dispatch_hotplug_wait_wakes_early_rate_limits_and_survives_terminal() -> TestResult {
+    let t = IrqSafeSpinLock::new(Table::new());
+    let mut since = None;
+    // Quiet: the plain period elapses.
+    assert!(!narf_scheduler::block_on_spin(wait_hotplug_in(
+        &t, &mut since, 5
+    )));
+    assert_eq!(since, None);
+    // An HPD vector wakes the consumer early, but not before the floor.
+    let floor = Deadline::after_ms(HOTPLUG_MIN_MS);
+    {
+        let mut w = core::pin::pin!(wait_hotplug_in(&t, &mut since, 10_000));
+        assert!(poll(w.as_mut()).is_pending());
+        route(&t, iv(CLIENT_DCN, 9, 0, 0, 0, 3));
+        assert!(narf_scheduler::block_on_spin(w));
+    }
+    assert!(floor.expired());
+    assert_eq!(since, Some(1));
+    // One delivered between passes is reported by the next call.
+    route(&t, iv(CLIENT_DCN, 9, 0, 0, 0, 3));
+    assert!(narf_scheduler::block_on_spin(wait_hotplug_in(
+        &t, &mut since, 10_000
+    )));
+    assert_eq!(since, Some(2));
+    // A flip is not a hot-plug event.
+    route(&t, iv(CLIENT_DCN, 0x4f, 0, 0, 0, 0));
+    assert!(!narf_scheduler::block_on_spin(wait_hotplug_in(
+        &t, &mut since, 5
+    )));
+    // After a terminal error the consumer still gets its period, not a spin.
+    t.lock().fail_all(Terminal::DeviceGone);
+    let period = Deadline::after_ms(20);
+    assert!(!narf_scheduler::block_on_spin(wait_hotplug_in(
+        &t, &mut since, 20
+    )));
+    assert!(period.expired());
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_dispatch_hotplug_wait_wakes_early_rate_limits_and_survives_terminal
+);
+
 fn navi48_dispatch_registration_is_unique_bounded_and_generation_checked() -> TestResult {
     let t = IrqSafeSpinLock::new(Table::new());
     assert_eq!(t.lock().register(user(0)), Err(RegisterError::Invalid));

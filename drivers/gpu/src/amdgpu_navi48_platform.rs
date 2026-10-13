@@ -869,8 +869,9 @@ pub fn set_max_bpc(bpc: u8) {
     crate::amdgpu_navi48_boot::set_max_bpc(bpc);
 }
 
-/// Poll period of the native display monitor. HPD interrupts are not yet
-/// dispatched to the display owner, so hot-plug and link loss are polled.
+/// Poll period of the native display monitor. DCN HPD/HPD-RX vectors (and
+/// lost IH vectors) wake it early through the interrupt dispatcher once HPD
+/// interrupts are armed; until then hot-plug and link loss are polled.
 const MONITOR_MS: u64 = 1000;
 
 /// What one native display monitor pass did.
@@ -1073,9 +1074,9 @@ pub unsafe fn spawn_display_monitor(modeset: crate::amdgpu_navi48_boot::Modeset)
                 }
             }
         }
+        let mut hotplug = None;
         loop {
-            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(MONITOR_MS).as_instant())
-                .await;
+            crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, MONITOR_MS).await;
             // SAFETY: the spawner's obligations hold for the task's lifetime.
             match unsafe { monitor_display(&mut current, pipe) }.await {
                 Ok(MonitorStep::Running(_) | MonitorStep::Waiting | MonitorStep::Off) => {}

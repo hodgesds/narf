@@ -153,6 +153,33 @@ kernel_test_in!(
     navi48_eop_observation_rejects_partial_history_duplicates_faults_and_route_changes
 );
 
+fn navi48_worker_wakes_distinguish_msi_watchdog_and_polling() -> TestResult {
+    let mut w = Wakes::default();
+    w.record(Cause::Start, 3);
+    w.record(Cause::Pending, 16);
+    assert_eq!(w, Wakes::default());
+    w.record(Cause::Irq, 2);
+    w.record(Cause::Irq, 0);
+    w.record(Cause::Watchdog, 0);
+    w.record(Cause::Watchdog, 1);
+    w.record(Cause::Poll, 0);
+    assert_eq!(
+        w,
+        Wakes {
+            irq: 2,
+            irq_empty: 1,
+            watchdog: 2,
+            watchdog_found: 1,
+            polls: 1,
+        }
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-interrupts",
+    navi48_worker_wakes_distinguish_msi_watchdog_and_polling
+);
+
 fn navi48_sdma_traps_require_exact_instance_queue_vmid_pasid_and_source() -> TestResult {
     let mut h = History::new();
     for ring in 0..=255 {

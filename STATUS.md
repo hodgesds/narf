@@ -626,6 +626,12 @@ the overflow clear). A batch racing an overflow is discarded, all owners are
 woken to re-check their fences, and both VM fault latches are swept so a
 fault whose vector was overwritten is still captured and attributed.
 Overflow storms and ring1 overflow still fail closed.
+The interrupt worker now counts MSI, empty-MSI, watchdog, watchdog-with-work
+and polled drains separately, the evidence a physical MSI test needs. DCN401
+hot-plug, flip, VUPDATE, vblank, VLINE and DMUB vectors are counted per
+instance for the display owner, and the native display monitor now waits on
+hot-plug vectors with its 1 s poll as fallback; DCN HPD interrupts are not
+armed or acknowledged yet, so behaviour is unchanged until they are.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
