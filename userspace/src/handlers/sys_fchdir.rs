@@ -70,6 +70,6 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
         ctx.set_return(errno_ret(EACCES));
         return;
     }
-    task_map_set(&CWD_TABLE, task, user_abs);
+    task_map_set(&CWD_TABLE, fs_key(task), user_abs);
     ctx.set_return(SyscallReturn::ok(0));
 }

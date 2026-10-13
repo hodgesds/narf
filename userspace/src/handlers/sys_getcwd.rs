@@ -32,7 +32,7 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
     // Linux takes `unsigned long size`; a "negative" size is simply huge.
     let len = args.arg1 as usize;
     let task = current_task_id();
-    let cwd = task_map_get(&CWD_TABLE, task).unwrap_or_else(|| alloc::string::String::from("/"));
+    let cwd = task_map_get(&CWD_TABLE, fs_key(task)).unwrap_or_else(|| alloc::string::String::from("/"));
     // `if (unlikely(d_unlinked(pwd.dentry))) { error = -ENOENT; }` — and it
     // is the FIRST thing decided, ahead of the length and copy checks, so a
     // task whose working directory was removed gets -ENOENT even when its

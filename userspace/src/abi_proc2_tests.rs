@@ -3135,3 +3135,174 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_self_links_from_sibling_thread_pidns
 );
+
+// ── fs_struct sharing (CLONE_FS) ────────────────────────────────────
+
+const FS_PARENT: u64 = 0x7F51;
+const FS_SHARER: u64 = 0x7F52;
+const FS_FORKED: u64 = 0x7F53;
+const FS_DIR: &[u8] = b"/abi-fsshare\0";
+
+fn fs_getcwd() -> Result<alloc::string::String, &'static str> {
+    let mut buf = [0u8; 128];
+    match call(
+        Syscall::Getcwd.raw(),
+        a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+    ) {
+        Some(n) if n > 0 => {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(n as usize);
+            core::str::from_utf8(&buf[..end])
+                .map(alloc::string::String::from)
+                .map_err(|_| "getcwd not utf-8")
+        }
+        _ => Err("getcwd failed"),
+    }
+}
+
+fn fs_dir_visible() -> bool {
+    let mut st = [0u8; 144];
+    call(
+        Syscall::Stat.raw(),
+        a1(FS_DIR.as_ptr() as u64, st.as_mut_ptr() as u64),
+    ) == Some(0)
+}
+
+/// Run `body` with three registered tasks and a scratch tmpfs mount, then put
+/// every root, cwd and fs_struct share back.
+fn with_fs_tasks(body: impl FnOnce() -> Result<(), &'static str>) -> TestResult {
+    with_setup(|| {
+        let margs = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: FS_DIR.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("fixture: mounting the scratch tmpfs failed");
+        }
+        for task in [FS_PARENT, FS_SHARER, FS_FORKED] {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, task);
+        }
+        let r = body();
+        for task in [FS_PARENT, FS_SHARER, FS_FORKED] {
+            crate::handlers::__test_fs_release(task);
+            crate::task::release_task(task);
+        }
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        set_task(FAKE_TASK);
+        const MNT_DETACH: u64 = 1 << 1;
+        let _ = call(
+            Syscall::Umount2.raw(),
+            a1(FS_DIR.as_ptr() as u64, MNT_DETACH),
+        );
+        r
+    })
+}
+
+/// `copy_fs` under CLONE_FS: the child shares the parent's `fs_struct`, so a
+/// chdir or chroot by either is seen by both. Chromium's sandbox relies on it
+/// (`ChrootToSafeEmptyDir`: a CLONE_FS|CLONE_VFORK child chroots and the
+/// parent then CHECKs that "/proc" is gone). A child forked without CLONE_FS
+/// keeps its own copy.
+fn smoke_abi_proc2_clone_fs_shares_root_and_cwd() -> TestResult {
+    with_fs_tasks(|| {
+        set_task(FS_PARENT);
+        if !fs_dir_visible() {
+            return Err("fixture: the scratch directory is not visible");
+        }
+        crate::handlers::fs_fork(FS_PARENT, FS_SHARER, true);
+        crate::handlers::fs_fork(FS_PARENT, FS_FORKED, false);
+        if crate::handlers::__test_fs_users(FS_PARENT) != 2 {
+            return Err("CLONE_FS did not count the child as a second fs_struct user");
+        }
+
+        set_task(FS_SHARER);
+        if call(Syscall::Chdir.raw(), a0(FS_DIR.as_ptr() as u64)) != Some(0) {
+            return Err("chdir in the CLONE_FS child failed");
+        }
+        set_task(FS_PARENT);
+        if fs_getcwd()? != "/abi-fsshare" {
+            return Err("CLONE_FS child's chdir did not move the parent's cwd");
+        }
+        set_task(FS_FORKED);
+        if fs_getcwd()? != "/" {
+            return Err("chdir leaked into a child forked without CLONE_FS");
+        }
+
+        set_task(FS_SHARER);
+        if call(Syscall::Chroot.raw(), a0(FS_DIR.as_ptr() as u64)) != Some(0) {
+            return Err("chroot in the CLONE_FS child failed");
+        }
+        set_task(FS_PARENT);
+        if fs_dir_visible() {
+            return Err("CLONE_FS child's chroot did not move the parent's root");
+        }
+        set_task(FS_FORKED);
+        if !fs_dir_visible() {
+            return Err("chroot leaked into a child forked without CLONE_FS");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_clone_fs_shares_root_and_cwd);
+
+/// `unshare(CLONE_FS)` (`unshare_fs`) gives a shared `fs_struct` a private
+/// copy: the caller keeps its cwd, and its later chdir no longer moves the
+/// task it was sharing with.
+fn smoke_abi_proc2_unshare_fs_privatizes_cwd() -> TestResult {
+    const CLONE_FS: u64 = 0x200;
+    with_fs_tasks(|| {
+        set_task(FS_PARENT);
+        if call(Syscall::Chdir.raw(), a0(FS_DIR.as_ptr() as u64)) != Some(0) {
+            return Err("fixture chdir failed");
+        }
+        crate::handlers::fs_fork(FS_PARENT, FS_SHARER, true);
+
+        set_task(FS_SHARER);
+        if call(Syscall::Unshare.raw(), a0(CLONE_FS)) != Some(0) {
+            return Err("unshare(CLONE_FS) failed");
+        }
+        if crate::handlers::__test_fs_users(FS_PARENT) != 1
+            || crate::handlers::__test_fs_users(FS_SHARER) != 1
+        {
+            return Err("unshare(CLONE_FS) left the fs_struct shared");
+        }
+        if fs_getcwd()? != "/abi-fsshare" {
+            return Err("unshare(CLONE_FS) lost the inherited cwd");
+        }
+        let root = b"/\0";
+        if call(Syscall::Chdir.raw(), a0(root.as_ptr() as u64)) != Some(0) {
+            return Err("chdir after unshare failed");
+        }
+        set_task(FS_PARENT);
+        if fs_getcwd()? != "/abi-fsshare" {
+            return Err("chdir after unshare(CLONE_FS) still moved the other task");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_unshare_fs_privatizes_cwd);
+
+/// The shared `fs_struct` lives until its last user exits: the task that
+/// created it exiting must not take the cwd away from a CLONE_FS sibling.
+fn smoke_abi_proc2_clone_fs_outlives_creator() -> TestResult {
+    with_fs_tasks(|| {
+        set_task(FS_PARENT);
+        if call(Syscall::Chdir.raw(), a0(FS_DIR.as_ptr() as u64)) != Some(0) {
+            return Err("fixture chdir failed");
+        }
+        crate::handlers::fs_fork(FS_PARENT, FS_SHARER, true);
+        crate::handlers::__test_fs_release(FS_PARENT);
+        set_task(FS_SHARER);
+        if fs_getcwd()? != "/abi-fsshare" {
+            return Err("the creator's exit dropped the shared cwd");
+        }
+        if crate::handlers::__test_fs_users(FS_SHARER) != 1 {
+            return Err("the creator's exit was not counted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_clone_fs_outlives_creator);

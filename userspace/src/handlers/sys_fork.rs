@@ -323,10 +323,9 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
     crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
-    cwd_fork(parent_pid, child_tid.raw());
+    // fork(2) is clone without CLONE_FS: a private copy of root + cwd.
+    fs_fork(parent_pid, child_tid.raw(), false);
     personality_fork(parent_pid, child_tid.raw());
-    // chroot inheritance (see do_clone3) — child inherits the parent's root.
-    root_dir_fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
     // `copy_process` duplicates the task mempolicy for every child.
     crate::handlers::mempolicy_fork(parent_pid, child_tid.raw());

@@ -187,26 +187,145 @@ pub fn cwd_init() {
 #[doc(hidden)]
 pub fn __test_cwd_reset() {
     task_map_init(&CWD_TABLE);
+    task_map_init(&FS_KEY_TABLE);
+    *FS_USERS.lock() = None;
 }
 
-/// fork(2) inheritance: copy `parent`'s cwd to `child`. No-op
-/// if the parent has no entry (child inherits the default `/`).
-pub fn cwd_fork(parent: u64, child: u64) {
-    task_map_fork(&CWD_TABLE, parent, child);
+// ── fs_struct sharing (CLONE_FS) ────────────────────────────────────
+//
+// Linux keeps a task's root and cwd in `struct fs_struct`, which
+// `copy_fs` SHARES under CLONE_FS (`fs->users++`) and copies otherwise.
+// Every pthread shares it, and Chromium's sandbox depends on it:
+// `ChrootToSafeEmptyDir` has a CLONE_FS|CLONE_VFORK child chroot into
+// `/proc/self/fdinfo/` so the PARENT's root moves, then CHECKs that
+// "/proc" no longer resolves.
+//
+// `CWD_TABLE` and `ROOT_DIR_TABLE` are keyed by an fs key rather than by
+// task. A task's key is its own id until it shares another task's
+// fs_struct (CLONE_FS) or re-keys a private copy (unshare). Ids allocated
+// for re-keyed copies live above every scheduler task id.
+//
+// LINUX-GAP: `fs->umask` is part of the same struct but `UMASK_TABLE` is
+// still per task.
+
+/// Task → fs key, for tasks whose key is not their own id.
+static FS_KEY_TABLE: TaskMapTable<u64> = [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
+
+/// fs key → `fs->users`, recorded only above one: an absent key has exactly
+/// one user. Changes only at clone, unshare and exit, so a single lock is
+/// enough and keeps share/release counts consistent with each other.
+static FS_USERS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Next key for a re-keyed private fs_struct (`unshare(CLONE_FS)` of a
+/// shared one). Disjoint from scheduler task ids, which never reach 2^62.
+static FS_KEY_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1 << 62);
+
+/// The fs_struct key `task` resolves its root and cwd through.
+#[inline]
+fn fs_key(task: u64) -> u64 {
+    task_map_get(&FS_KEY_TABLE, task).unwrap_or(task)
+}
+
+fn fs_users(users: &BTreeMap<u64, u64>, key: u64) -> u64 {
+    users.get(&key).copied().unwrap_or(1)
+}
+
+/// Copy the root and cwd behind `from` into the fs_struct keyed `to`.
+fn fs_copy_entries(from: u64, to: u64) {
+    task_map_fork(&CWD_TABLE, from, to);
+    if let Some(root) = root_dir_key_prefix(from) {
+        set_root_dir_key(to, root);
+    }
+}
+
+/// Drop the root and cwd of an fs_struct nobody uses any more.
+fn fs_drop_entries(key: u64) {
+    task_map_remove(&CWD_TABLE, key);
+    remove_root_dir_key(key);
+}
+
+/// `copy_fs`: under CLONE_FS the child shares the parent's fs_struct;
+/// otherwise it gets a copy of the parent's root and cwd.
+pub fn fs_fork(parent: u64, child: u64, share: bool) {
+    let key = fs_key(parent);
+    if share {
+        let mut guard = FS_USERS.lock();
+        let users = guard.get_or_insert_with(BTreeMap::new);
+        let n = fs_users(users, key);
+        users.insert(key, n + 1);
+        task_map_set(&FS_KEY_TABLE, child, key);
+    } else {
+        fs_copy_entries(key, child);
+    }
+}
+
+/// `unshare_fs`: give `task` a private copy of a shared fs_struct. A task
+/// that is already the only user keeps the one it has.
+pub(crate) fn fs_unshare(task: u64) {
+    let key = fs_key(task);
+    let mut guard = FS_USERS.lock();
+    let users = guard.get_or_insert_with(BTreeMap::new);
+    let n = fs_users(users, key);
+    if n <= 1 {
+        return;
+    }
+    let fresh = FS_KEY_NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    fs_copy_entries(key, fresh);
+    task_map_set(&FS_KEY_TABLE, task, fresh);
+    if n == 2 {
+        users.remove(&key);
+    } else {
+        users.insert(key, n - 1);
+    }
+}
+
+/// Task exit: drop `task`'s use of its fs_struct, and its root/cwd with the
+/// last user (`exit_fs` → `free_fs_struct`).
+fn fs_release(task: u64) {
+    let key = fs_key(task);
+    task_map_remove(&FS_KEY_TABLE, task);
+    let mut guard = FS_USERS.lock();
+    let users = guard.get_or_insert_with(BTreeMap::new);
+    match fs_users(users, key) {
+        0 | 1 => {
+            users.remove(&key);
+            drop(guard);
+            fs_drop_entries(key);
+        }
+        2 => {
+            users.remove(&key);
+        }
+        n => {
+            users.insert(key, n - 1);
+        }
+    }
+}
+
+/// Number of tasks sharing `task`'s fs_struct (`fs->users`).
+#[doc(hidden)]
+pub fn __test_fs_users(task: u64) -> u64 {
+    let key = fs_key(task);
+    let mut guard = FS_USERS.lock();
+    fs_users(guard.get_or_insert_with(BTreeMap::new), key)
+}
+
+/// Kernel-test teardown for a task created by a fs_struct test.
+#[doc(hidden)]
+pub fn __test_fs_release(task: u64) {
+    fs_release(task);
 }
 
 /// Diagnostic: peek the recorded cwd for `task`. Returns the
 /// default `"/"` if `task` has never called Chdir.
 pub fn cwd_of(task: u64) -> alloc::string::String {
-    task_map_get(&CWD_TABLE, task).unwrap_or_else(|| alloc::string::String::from("/"))
+    task_map_get(&CWD_TABLE, fs_key(task)).unwrap_or_else(|| alloc::string::String::from("/"))
 }
 
 /// Set `task`'s cwd (USER-view, chroot-relative — the same frame chdir stores).
-/// Used by `sys_pivot_root` to recompute the cwd in the new root's frame after
-/// the root swap, so a following relative resolution doesn't double-apply the
-/// new chroot prefix.
+/// Every task sharing its fs_struct sees the change.
 pub(crate) fn set_cwd(task: u64, path: &str) {
-    task_map_set(&CWD_TABLE, task, alloc::string::String::from(path));
+    task_map_set(&CWD_TABLE, fs_key(task), alloc::string::String::from(path));
 }
 
 /// Collapse `.`/`..`/empty segments into a clean absolute path.
@@ -4805,29 +4924,42 @@ fn root_dir_prefix(task: u64) -> Option<alloc::string::String> {
     if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
         return None;
     }
-    task_map_get(&ROOT_DIR_TABLE, task)
+    task_map_get(&ROOT_DIR_TABLE, fs_key(task))
 }
 
+/// Root of the fs_struct keyed `key` (see [`fs_key`]).
+fn root_dir_key_prefix(key: u64) -> Option<alloc::string::String> {
+    if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    task_map_get(&ROOT_DIR_TABLE, key)
+}
+
+/// Set `task`'s root. Every task sharing its fs_struct sees the change.
 fn set_root_dir(task: u64, root: alloc::string::String) {
-    let mut shard = ROOT_DIR_TABLE[task_map_shard(task)].map.lock();
+    set_root_dir_key(fs_key(task), root);
+}
+
+fn set_root_dir_key(key: u64, root: alloc::string::String) {
+    let mut shard = ROOT_DIR_TABLE[task_map_shard(key)].map.lock();
     let roots = shard.get_or_insert_with(BTreeMap::new);
-    if !roots.contains_key(&task) {
+    if !roots.contains_key(&key) {
         // Publish the non-empty hint before the row. A racing reader that sees
         // it blocks on this shard lock until the insertion completes.
         ROOT_DIR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
     }
-    roots.insert(task, root);
+    roots.insert(key, root);
 }
 
-fn remove_root_dir(task: u64) {
+fn remove_root_dir_key(key: u64) {
     if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
         return;
     }
-    let removed = ROOT_DIR_TABLE[task_map_shard(task)]
+    let removed = ROOT_DIR_TABLE[task_map_shard(key)]
         .map
         .lock()
         .as_mut()
-        .and_then(|roots| roots.remove(&task));
+        .and_then(|roots| roots.remove(&key));
     if removed.is_some() {
         ROOT_DIR_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
@@ -4855,13 +4987,6 @@ pub fn install_root_dir(task: u64, root: &str) -> bool {
     true
 }
 
-
-/// fork(2) inheritance — child inherits parent's chroot.
-pub fn root_dir_fork(parent: u64, child: u64) {
-    if let Some(root) = root_dir_prefix(parent) {
-        set_root_dir(child, root);
-    }
-}
 
 /// Test hook — drop every per-task entry.
 #[doc(hidden)]

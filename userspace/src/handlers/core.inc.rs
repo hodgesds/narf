@@ -10716,7 +10716,7 @@ fn maybe_deliver_signal_before_yield(ctx: &mut dyn TrapContext, syscall_no: u32)
 //                    TID is a fresh scheduler TaskId. Without this
 //                    bit the child is treated as a process (fresh
 //                    ProcessId allocation).
-//   - CLONE_FS       cwd table shared (skip cwd_fork).
+//   - CLONE_FS       root + cwd shared (`fs_fork`).
 //   - CLONE_FILES    fd table shared (skip fd::fork).
 //   - CLONE_SIGHAND  sigaction table shared (skip sigaction_fork).
 //   - CLONE_SETTLS   args.tls programmed into the architecture's user TLS
@@ -11997,15 +11997,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     sid_fork(parent_pid, child_tid.raw());
     ctty_fork(parent_pid, child_tid.raw());
 
-    if !share_fs {
-        cwd_fork(parent_pid, child_tid.raw());
-        personality_fork(parent_pid, child_tid.raw());
-    }
-    // chroot: a child inherits the parent's root directory (Linux copies
-    // fs->root on fork). Without this, a process exec'd inside a chroot
-    // can't fork+exec further binaries from the chrooted rootfs — the
-    // child resolves the host root instead, breaking containers.
-    root_dir_fork(parent_pid, child_tid.raw());
+    // `copy_fs`: CLONE_FS shares the parent's root + cwd (a chdir or chroot
+    // by either is seen by both); otherwise the child gets a copy. Without
+    // the copy, a process exec'd inside a chroot couldn't fork+exec further
+    // binaries from the chrooted rootfs.
+    fs_fork(parent_pid, child_tid.raw(), share_fs);
+    // `personality` lives in task_struct, which `copy_process` duplicates for
+    // every child regardless of CLONE_FS.
+    personality_fork(parent_pid, child_tid.raw());
     // Credentials (uid/gid/euid/...) are copied to the child so a parent
     // that dropped privilege stays dropped across fork/clone; a root
     // parent stays root. Keyed by task id, so copy unconditionally.
@@ -14403,9 +14402,8 @@ fn release_task_tables(tid: u64) {
     }
 
     // Filesystem view.
-    task_map_remove(&CWD_TABLE, tid);
+    fs_release(tid);
     task_map_remove(&PERSONALITY_TABLE, tid);
-    remove_root_dir(tid);
     remove_mount_namespace(tid);
     crate::mqueue::release_task_fd_paths(tid);
 
