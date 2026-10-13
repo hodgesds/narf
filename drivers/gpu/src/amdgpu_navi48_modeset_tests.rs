@@ -62,6 +62,7 @@ fn navi48_modeset_selects_first_answering_dp_sink_by_board_path() -> TestResult 
             t.v_total,
         ) != (148_500, 1920, 2200, 1080, 1125)
         || !(t.h_sync_positive && t.v_sync_positive)
+        || s.edid[..] != edid_1080p()[..]
     {
         return TestResult::Fail("selection");
     }

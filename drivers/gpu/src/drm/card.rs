@@ -430,6 +430,21 @@ pub struct Card {
     /// Next magic to hand out. Starts at 1: magic 0 is never valid, matching
     /// `idr_init_base(&master->magic_map, 1)`.
     next_magic: u32,
+    /// Real sink data for native-driver connectors (see [`NativeOutput`]).
+    pub native: Vec<NativeOutput>,
+}
+
+/// A connector whose modes and EDID come from a real sink, published by a
+/// native display driver. GETCONNECTOR reports these timings and this EDID
+/// instead of synthesizing them from `Connector::modes`.
+#[derive(Clone, Debug)]
+pub struct NativeOutput {
+    /// The connector (id) this describes.
+    pub connector: u32,
+    /// The sink's base EDID block, reported verbatim; None when unplugged.
+    pub edid: Option<[u8; 128]>,
+    /// Exact timings, parallel to the connector's `modes`.
+    pub timings: Vec<crate::drm::ioctl::DrmModeModeInfo>,
 }
 
 /// System-wide vblank "slack" offset in nanoseconds. A flip-complete event is
@@ -494,7 +509,43 @@ impl Card {
             current_master: None,
             magics: Vec::new(),
             next_magic: 1,
+            native: Vec::new(),
         }
+    }
+    /// Wire form of a CRTC mode: the exact native timing when a published
+    /// connector carries this mode, otherwise the synthesized one.
+    pub fn mode_wire(&self, mode: &crate::Mode) -> crate::drm::ioctl::DrmModeModeInfo {
+        self.native
+            .iter()
+            .flat_map(|n| n.timings.iter())
+            .find(|t| {
+                (u32::from(t.hdisplay), u32::from(t.vdisplay), t.vrefresh)
+                    == (mode.width, mode.height, u32::from(mode.refresh_hz))
+            })
+            .copied()
+            .unwrap_or_else(|| crate::drm::ioctl::mode_to_wire(mode))
+    }
+    /// Whether a SETCRTC mode may be applied. A card with native outputs can
+    /// only show the exact timings its driver published (it cannot program
+    /// an arbitrary mode yet); other cards accept any mode as before.
+    pub fn accepts_mode(&self, m: &crate::drm::ioctl::DrmModeModeInfo) -> bool {
+        let geometry = |t: &crate::drm::ioctl::DrmModeModeInfo| {
+            (
+                t.clock,
+                [t.hdisplay, t.hsync_start, t.hsync_end, t.htotal],
+                [t.vdisplay, t.vsync_start, t.vsync_end, t.vtotal],
+            )
+        };
+        self.native.is_empty()
+            || self
+                .native
+                .iter()
+                .flat_map(|n| n.timings.iter())
+                .any(|t| geometry(t) == geometry(m))
+    }
+    /// The native sink data of a connector, if a driver published it.
+    pub fn native_output(&self, connector: u32) -> Option<&NativeOutput> {
+        self.native.iter().find(|n| n.connector == connector)
     }
 
     // ── DRM master arbitration ────────────────────────────────────────

@@ -607,6 +607,8 @@ pub async unsafe fn modeset_display(
     CURSOR_PIPE.store(pipe, core::sync::atomic::Ordering::Release);
     crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
     crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
+    let s = &modeset.selection;
+    crate::amdgpu_navi48_kms::publish(Some((&s.edid, &s.timing)));
     Ok(modeset)
 }
 
@@ -690,6 +692,7 @@ pub async unsafe fn stop_modeset(
 ) -> Result<(), crate::amdgpu_navi48_boot::ModesetError> {
     use crate::amdgpu_navi48_boot::{Error as BootError, ModesetError};
     crate::amdgpu_dcn_display::publish_external(None, None);
+    crate::amdgpu_navi48_kms::publish(None);
     let mut owner = OWNER.lock().await;
     let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
     // SAFETY: serialized retained owners; caller excludes external writers.
@@ -748,10 +751,12 @@ pub async unsafe fn monitor_display(
             // during the retrain land in it and show once scanout resumes.
             // SAFETY: as above.
             unsafe { boot.retrain_modeset(m).await }?;
+            // The fallback may have changed the link, never the timing.
             Ok(MonitorStep::Retrained)
         }
         Health::Unplugged => {
             crate::amdgpu_dcn_display::publish_external(None, None);
+            crate::amdgpu_navi48_kms::publish(None);
             // SAFETY: as above; the scanout is withdrawn first.
             unsafe { boot.unplug_modeset(m).await }?;
             *current = None;

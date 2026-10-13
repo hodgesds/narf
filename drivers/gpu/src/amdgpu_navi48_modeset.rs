@@ -35,6 +35,8 @@ pub struct Selection {
     pub timing: Timing,
     pub lanes: u8,
     pub rate: LinkRate,
+    /// The sink's base EDID block, reported to DRM verbatim.
+    pub edid: [u8; 128],
 }
 
 /// The result of a successful modeset, retained by the caller for teardown.
@@ -94,6 +96,9 @@ pub fn select(
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
             continue;
         };
+        let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
+            continue;
+        };
         if !link_fits(&timing, lanes, rate) {
             link_short = true;
             continue;
@@ -103,6 +108,7 @@ pub fn select(
             timing,
             lanes,
             rate,
+            edid,
         });
     }
     Err(if link_short {

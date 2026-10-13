@@ -881,6 +881,26 @@ freeing them could let a late write corrupt a later allocation. Each mode
 change after a replug therefore retires one surface's VRAM for the owner's
 lifetime.
 
+`amdgpu_navi48_kms` publishes the lit sink as KMS state on the registered
+amdgpu card. KMS state is attached on first publication; until then every
+amdgpu DRM ioctl fails as before. The state is one CRTC (1), one encoder
+(2, TMDS type, as amdgpu_dm reports DP) and one DisplayPort connector (3).
+The card's `NativeOutput` carries the sink's base EDID block, which
+GETPROPBLOB returns verbatim, and the exact DRM timing from the DCN
+`Timing`. That timing has the porches and sync widths, rounded refresh, sync
+polarity flags, and type PREFERRED|DRIVER. GETCONNECTOR and GETCRTC report
+it instead of the synthesized timing. SETCRTC with a mode is refused
+(EINVAL) unless the mode's clock and geometry equal a published timing: the
+driver cannot reprogram a live display, and Linux would otherwise modeset.
+Cards without native outputs are unaffected. Unplug (and `stop_modeset`)
+publish the connector disconnected, with no modes, no EDID, and no mode
+accepted. The CRTC is disabled with its framebuffer cleared, and open
+clients keep their GEM and framebuffer objects. DRM_IOCTL_VERSION reports
+amdgpu 3.0.0, the base ABI with no render feature level. This keeps Mesa's
+radeonsi from driving render ioctls the native driver does not implement.
+Presentation is the existing CPU copy, and flip events stay software-paced
+at the real refresh rate.
+
 `platform::spawn_display_monitor` runs after the boot-time native modeset
 (`amdgpu.native_display`). It enables HPD on every routed DP port, then polls
 once a second, because HPD interrupts are not yet dispatched to the display

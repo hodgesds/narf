@@ -481,7 +481,11 @@ fn handle_getconnector(card: &Card, arg: &[u8]) -> Result<DrmIoctlResult, DrmIoc
         .connector(connector_id)
         .map_err(|_| DrmIoctlError::UnknownConnector)?;
 
-    let modes: alloc::vec::Vec<DrmModeModeInfo> = conn.modes.iter().map(mode_to_wire).collect();
+    // A native driver's real sink timings replace the synthesized ones.
+    let modes: alloc::vec::Vec<DrmModeModeInfo> = match card.native_output(connector_id) {
+        Some(n) if n.timings.len() == conn.modes.len() => n.timings.clone(),
+        _ => conn.modes.iter().map(mode_to_wire).collect(),
+    };
 
     let info = DrmModeGetConnector {
         count_modes: modes.len() as u32,

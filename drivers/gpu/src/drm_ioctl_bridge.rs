@@ -2496,7 +2496,7 @@ fn handle_getcrtc(
         out[32..36].copy_from_slice(&mode_valid.to_le_bytes());
         match &crtc.mode {
             Some(m) => {
-                let wire = crate::drm::ioctl::mode_to_wire(m);
+                let wire = card.mode_wire(m);
                 out[36..104].copy_from_slice(&mode_to_bytes(&wire));
             }
             None => out[36..104].fill(0),
@@ -2657,6 +2657,9 @@ fn connector_id_from_edid_blob(blob_id: u32) -> Option<u32> {
 /// `None` if the connector has no id / no modes.
 fn connector_edid(card: &crate::drm::card::Card, connector_id: u32) -> Option<[u8; 128]> {
     let conn = card.connector(connector_id).ok()?;
+    if let Some(native) = card.native_output(connector_id) {
+        return native.edid;
+    }
     let m = conn.modes.first()?;
     Some(crate::drm::edid_gen::synth_edid(
         m.width,
@@ -3996,6 +3999,30 @@ fn handle_setcrtc(
     let src_h: u32;
     {
         let mut card = mode_state.lock();
+
+        if req.mode_valid != 0 {
+            let m = req.mode;
+            let wire = crate::drm::ioctl::DrmModeModeInfo {
+                clock: m.clock,
+                hdisplay: m.hdisplay,
+                hsync_start: m.hsync_start,
+                hsync_end: m.hsync_end,
+                htotal: m.htotal,
+                hskew: m.hskew,
+                vdisplay: m.vdisplay,
+                vsync_start: m.vsync_start,
+                vsync_end: m.vsync_end,
+                vtotal: m.vtotal,
+                vscan: m.vscan,
+                vrefresh: m.vrefresh,
+                flags: m.flags,
+                r#type: m.r#type,
+                name: m.name,
+            };
+            if !card.accepts_mode(&wire) {
+                return Err(FsError::InvalidData);
+            }
+        }
 
         // Record the mode and active fb on the crtc.
         if let Ok(crtc) = card.crtc_mut(req.crtc_id) {

@@ -427,6 +427,10 @@ and an unplugged sink is torn down without AUX to it. With the opt-in native
 display, a 1 s monitor retrains, tears down and relights on replug. Replug
 reuses the pipe's surface for the same geometry; a new geometry permanently
 retires the old buffers' VRAM, since no fb writer-quiescence barrier exists.
+The lit Navi48 display is published as DRM KMS state on the amdgpu card, with
+the sink's real EDID and exact timing (disconnected on unplug). SETCRTC
+accepts only that timing, and the base amdgpu DRM version 3.0.0 claims no
+render ABI. Flip events remain software-paced.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY
