@@ -1452,3 +1452,7 @@ argument = "The memory change adds an explicit opaque AddressSpace identity argu
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The explicit target identity makes the file-mapping owner lookup select the tracee's VMA even while the tracer's root is active. The hook returns only an existing file-supplied frame through the established FILE_DEMAND validation and publication path; it neither grants a capability nor bypasses a domain check. Failed translation or page-in remains EIO to ptrace, and the byte-wise PEEK/POKE loops touch only translated tracee user pages after stopped-state validation."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame change raises the #BP (vector 3) IDT gate from DPL=0 to DPL=3, matching Linux's SYSG(X86_TRAP_BP). It lets CPL 3 execute int3 to enter the same vector-3 stub a hardware #BP already uses; that stub and the common trap path already handle user-origin entry (swapgs, PKRS save, switch to DomainId::FRAME) for every user exception. The handler only delivers SIGTRAP to the current task through the existing sync-signal hook. No new TCB member, capability, domain transition, or authority is introduced, and every other exception gate stays DPL=0 (pinned by smoke_x86_64_idt_user_gates_match_linux)."
