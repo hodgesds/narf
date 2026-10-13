@@ -20,6 +20,8 @@ struct Model {
     verbs: Vec<u32>,
     stall: bool,
     supports_32: bool,
+    /// Answer as an AMD GPU HDMI codec instead of the Realtek analog one.
+    ati: bool,
 }
 impl Model {
     fn step(&mut self) {
@@ -48,7 +50,11 @@ impl Model {
                 self.verbs.push(command);
                 // Interleave an unsolicited jack event with every reply. The
                 // completion ring must not be indexed with the CORB pointer.
-                let mut reply = response(command);
+                let mut reply = if self.ati {
+                    ati_response(command)
+                } else {
+                    response(command)
+                };
                 if command == make_verb(0, 1, VERB_GET_PARAMETER | 0xa) && !self.supports_32 {
                     reply &= !(1 << 20);
                 }
@@ -100,6 +106,32 @@ fn response(command: u32) -> u32 {
         _ => 0,
     }
 }
+/// AMD GPU HDMI codec 0x1002aa01, revision 0x0700 (rev3+): AFG 1, ports as
+/// converter/pin pairs 2/3 and 4/5; pin 5 has no physical connection.
+fn ati_response(command: u32) -> u32 {
+    let nid = (command >> 20) as u8;
+    let verb = (command >> 8) & 0xfff;
+    let param = command as u8;
+    match (nid, verb, param) {
+        (0, 0xf00, 0) => 0x1002aa01,
+        (0, 0xf00, 2) => 0x0010_0700,
+        (0, 0xf00, 4) => 0x00010001,
+        (1, 0xf00, 5) => 1,
+        (1, 0xf00, 4) => 0x00020004,
+        (2 | 4, 0xf00, 9) => 0x201, // digital stereo Audio Output
+        (3 | 5, 0xf00, 9) => (4 << 20) | 0x301 | 4, // digital pin, out amp
+        (3 | 5, 0xf00, 0xc) => 0x94, // HDMI, output, presence detect
+        (3 | 5, 0xf00, 0xe) => 1,
+        (3, 0xf02, _) => 2,
+        (5, 0xf02, _) => 4,
+        (_, 0xf00, 0x12) => 0x80000000,    // mute-only output amp
+        (3, 0xf1c, _) => (5 << 20) | 0x10, // Digital Other Out, jack
+        (5, 0xf1c, _) => (1 << 30) | (5 << 20) | 0x20, // no physical connection
+        (3, 0xf7c, _) => 0x11,             // HBR capable, left enabled
+        (2, 0xf0d, _) => 0x0200,
+        _ => 0,
+    }
+}
 fn pump() {
     let model = MODEL.lock();
     if *model != 0 {
@@ -120,6 +152,9 @@ impl Fixture {
         Self::new_with(false)
     }
     fn new_with(noncoherent: bool) -> Result<Self, &'static str> {
+        Self::with(noncoherent, false)
+    }
+    fn with(noncoherent: bool, ati: bool) -> Result<Self, &'static str> {
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
             phys: memory.phys_addr(),
@@ -148,6 +183,7 @@ impl Fixture {
                 verbs: Vec::new(),
                 stall: false,
                 supports_32: true,
+                ati,
             }),
         };
         *MODEL.lock() = &mut *fixture.model as *mut Model as usize;
@@ -318,4 +354,70 @@ fn native_hda_ati_hdmi_controllers_run_without_snoop() -> TestResult {
 kernel_test_in!(
     "audio/hda",
     native_hda_ati_hdmi_controllers_run_without_snoop
+);
+
+fn native_hda_ati_hdmi_port_streams_stereo_like_atihdmi() -> TestResult {
+    let fixture = match Fixture::with(true, true) {
+        Ok(f) => f,
+        Err(e) => return TestResult::Fail(e),
+    };
+    let dev = fixture.controller.as_ref().unwrap().clone();
+    // One connected HDMI port (pin 3 via converter 2); no analog paths.
+    if dev.codecs()[0].vendor_id != 0x1002aa01
+        || dev.outputs.len() != 1
+        || dev.outputs[0].nodes.pin_nid != 3
+        || dev.outputs[0].nodes.converter_nid != 2
+        || dev.input.is_some()
+    {
+        return TestResult::Fail("HDMI port discovery");
+    }
+    let card = super::super::stream::Card(dev.clone());
+    let Ok(mut playback) = card.open(false, 0) else {
+        return TestResult::Fail("open");
+    };
+    let first = fixture.model.verbs.len();
+    if playback
+        .configure(super::super::stream::default_params())
+        .is_err()
+        || playback.prepare().is_err()
+    {
+        return TestResult::Fail("configure HDMI playback");
+    }
+    let verbs = &fixture.model.verbs[first..];
+    let at = |v: u32| verbs.iter().position(|x| *x == v);
+    let expected = [
+        make_verb(0, 3, 0x77200), // downmix info 0
+        make_verb(0, 3, 0x78901), // per-channel remap mode
+        make_verb(0, 2, 0x72d01), // two channels
+        make_verb(0, 3, 0x77701), // slot 0 <- channel 0
+        make_verb(0, 3, 0x78511), // slot 1 <- channel 1
+        make_verb(0, 3, 0x77800), // slot 2 off
+        make_verb(0, 3, 0x78800), // slot 7 off
+        make_verb(0, 3, 0x77100), // channel allocation 0 (FL FR)
+        make_verb(0, 2, 0x770b4), // ramp rate 180
+        make_verb(0, 3, 0x77c01), // HBR off, capability kept
+        make_verb(0, 2, 0x70d01), // DIGEN
+    ];
+    let positions: Vec<Option<usize>> = expected.iter().map(|v| at(*v)).collect();
+    if positions.iter().any(Option::is_none)
+        || at(make_verb(0, 3, VERB_SET_PIN_WIDGET_CONTROL | 0x40)).is_none()
+    {
+        return TestResult::Fail("atihdmi prepare verbs");
+    }
+    // Channel allocation precedes the stream format and tag, as Linux's
+    // prepare runs the infoframe setup before setup_stream.
+    let format = verbs
+        .iter()
+        .position(|v| *v >> 20 == 2 && (*v >> 16) & 0xf == 2);
+    if format.is_none_or(|f| positions[7].is_some_and(|ca| ca > f)) {
+        return TestResult::Fail("allocation before format");
+    }
+    if dev.streams[0].lock().ring.as_ref().map(|r| r.noncoherent) != Some(true) {
+        return TestResult::Fail("ATI ring is non-snooping");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_ati_hdmi_port_streams_stereo_like_atihdmi
 );

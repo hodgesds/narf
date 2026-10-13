@@ -11,8 +11,8 @@ The sound-card registry, PCM lifecycle, mixer and file bridge live in
 [drivers/sound](../../drivers/sound/specification/spec.md).
 Mixing, resampling and policy belong to a future userspace audio service.
 
-The implemented native profile is analog HDA plus ACP PDM. HDMI/DisplayPort
-audio, SoundWire codecs, vendor smart-amplifier fixups and DSP firmware
+The implemented native profile is analog HDA, stereo HDMI/DisplayPort audio
+on AMD GPU HD-Audio, and ACP PDM. Multichannel HDMI layouts, SoundWire codecs, vendor smart-amplifier fixups and DSP firmware
 execution are outside this profile. PCI identity alone does not establish
 which codec or amplifier a laptop contains.
 
@@ -71,6 +71,22 @@ Headphone presence disables speaker pins. Mixer controls expose master volume
 when the routed converters have output amplifiers, output enable/mute through
 pin controls, and headphone presence where supported. Gain never exceeds the
 codec's advertised 0 dB offset.
+
+AMD GPU HD-Audio functions (Linux's ATI HDMI NS IDs, `HDA_ATI_HDMI_NS_DEVICES`,
+through 0xab40) run without snoop as Linux's `AZX_DCAPS_SNOOP_OFF`: narf DMA
+memory is write-back, so the CPU-zeroed CORB/RIRB are written back before the
+controller owns them, CORB entries after queueing, RIRB entries invalidated
+before reading, and PCM rings write back their BDL/data at reset and after
+each playback write or retired-byte clear and invalidate before capture reads
+(`DmaBuffer::sync`). Their ATI HDMI codec (0x1002aa01) contributes every
+connected digital output pin as an output path; Linux's converter capability
+override (any rate, S16/S32, eight channels) replaces the PCM capability
+query. Preparing stereo LPCM follows atihdmi: zero downmix, per-channel remap
+mode (revision 3+), converter channel count, CEA allocation 0 slot map (pairs
+before revision 3), `SET_CHANNEL_ALLOCATION` (the hardware's Audio InfoFrame
+source), ramp rate 180 (revision 3+), HBR off and converter DIGEN, then the
+stream format and tag. The display side (DCN Azalia endpoint, ACR, AFMT) is
+programmed by the amdgpu modeset.
 
 `hda::probe`, `register_pci_driver`, `controller`, `capture_card`,
 `play_buffer`, and the legacy codec/period helpers share this runtime.

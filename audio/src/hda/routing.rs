@@ -13,6 +13,18 @@ pub(super) struct Path {
 impl IntelHda {
     pub(super) fn discover_paths(&mut self) {
         for (index, graph) in self.graphs.iter().enumerate() {
+            // GPU HDMI/DP audio: every connected digital port, no analog.
+            if hda_codec::is_ati_hdmi(graph) {
+                if self.stream_counts().1 != 0 {
+                    for nodes in hda_codec::find_digital_output_paths(graph) {
+                        self.outputs.push(Path {
+                            codec: index,
+                            nodes,
+                        });
+                    }
+                }
+                continue;
+            }
             if self.stream_counts().1 != 0 {
                 for pin in &graph.widgets {
                     if pin.ty() != WidgetType::PinComplex
@@ -92,6 +104,11 @@ impl IntelHda {
             } else {
                 graph.afg_nid
             };
+            // atihdmi_probe: ATI converters under-advertise; Linux grants
+            // every rate, S16/S32 and eight channels regardless.
+            if hda_codec::is_ati_hdmi(graph) {
+                continue;
+            }
             let (Ok(pcm), Ok(formats)) = (
                 self.verb(graph.addr, caps_nid, VERB_GET_PARAMETER | 0x0a),
                 self.verb(graph.addr, caps_nid, VERB_GET_PARAMETER | 0x0b),
@@ -129,7 +146,8 @@ impl IntelHda {
             let converter = graph
                 .widget(path.nodes.converter_nid)
                 .ok_or(HdaError::NoCodecs)?;
-            if converter.caps.channels() < params.channels.count() {
+            let ati = hda_codec::is_ati_hdmi(graph);
+            if !ati && converter.caps.channels() < params.channels.count() {
                 return Err(HdaError::NoOutputStream);
             }
             let caps_nid = if converter.caps.format_override() {
@@ -137,13 +155,15 @@ impl IntelHda {
             } else {
                 graph.afg_nid
             };
-            let pcm = self.verb(cad, caps_nid, VERB_GET_PARAMETER | 0x0a)?;
-            let formats = self.verb(cad, caps_nid, VERB_GET_PARAMETER | 0x0b)?;
             let Some(bits) = Self::pcm_size_bit(params.format) else {
                 return Err(HdaError::NoOutputStream);
             };
-            if pcm & (1 << 6) == 0 || pcm & bits == 0 || formats & 1 == 0 {
-                return Err(HdaError::NoOutputStream);
+            if !ati {
+                let pcm = self.verb(cad, caps_nid, VERB_GET_PARAMETER | 0x0a)?;
+                let formats = self.verb(cad, caps_nid, VERB_GET_PARAMETER | 0x0b)?;
+                if pcm & (1 << 6) == 0 || pcm & bits == 0 || formats & 1 == 0 {
+                    return Err(HdaError::NoOutputStream);
+                }
             }
             self.verb(cad, graph.afg_nid, 0x705 << 8)?;
             super::runtime::delay_us(1000);
@@ -218,6 +238,9 @@ impl IntelHda {
                 0x40
             };
             self.verb(cad, pin.nid, VERB_SET_PIN_WIDGET_CONTROL | ctl)?;
+            if ati {
+                self.ati_hdmi_prepare(graph, &path.nodes, params.channels.count())?;
+            }
             self.verb(
                 cad,
                 converter.nid,
@@ -234,6 +257,65 @@ impl IntelHda {
             self.apply_volume(&self.volume.lock())?;
             self.refresh_jacks()?;
         }
+        Ok(())
+    }
+    /// Linux atihdmi_init plus snd_hda_hdmi_generic_pcm_prepare and
+    /// atihdmi_setup_stream for one HDMI/DP port carrying LPCM: zero downmix,
+    /// per-channel remap mode (rev3+), converter channel count, the CEA slot
+    /// map and channel allocation (CA 0, FL/FR for stereo), ramp rate
+    /// (rev3+), HBR off, then the converter's digital enable (Linux leaves
+    /// DIGEN to the IEC958 switch userspace turns on; narf has no such
+    /// control, so the PCM path enables it).
+    fn ati_hdmi_prepare(
+        &self,
+        graph: &hda_codec::Codec,
+        nodes: &AudioPath,
+        channels: u8,
+    ) -> Result<(), HdaError> {
+        const SET_CHANNEL_ALLOCATION: u32 = 0x771;
+        const SET_DOWNMIX_INFO: u32 = 0x772;
+        const SET_MULTICHANNEL_01: u32 = 0x777;
+        const GET_HBR_CONTROL: u32 = 0xf7c;
+        const SET_HBR_CONTROL: u32 = 0x77c;
+        const SET_MULTICHANNEL_MODE: u32 = 0x789;
+        const SET_RAMP_RATE: u32 = 0x770;
+        if channels != 2 {
+            return Err(HdaError::NoOutputStream);
+        }
+        let (cad, pin, cvt) = (graph.addr, nodes.pin_nid, nodes.converter_nid);
+        let rev3 = hda_codec::ati_hdmi_rev3(graph);
+        self.verb(cad, pin, SET_DOWNMIX_INFO << 8)?;
+        if rev3 {
+            self.verb(cad, pin, (SET_MULTICHANNEL_MODE << 8) | 1)?;
+        }
+        if self.verb(cad, cvt, 0xf2d << 8)? & 0xf != u32::from(channels - 1) {
+            self.verb(cad, cvt, (0x72d << 8) | u32::from(channels - 1))?;
+        }
+        // CA 0 (FL FR): stream channels 0 and 1 in slots 0 and 1, the rest
+        // off. Pre-rev3 codecs map slot pairs, so only even slots are written.
+        for slot in 0..8u32 {
+            let channel = (slot < 2).then_some(slot);
+            let (slot, channel) = if rev3 {
+                (slot, channel)
+            } else if slot % 2 == 1 {
+                continue;
+            } else {
+                (slot, channel.map(|c| c - c % 2))
+            };
+            let verb = SET_MULTICHANNEL_01 + slot / 2 + (slot % 2) * 0xe;
+            let setup = channel.map_or(0, |c| (c << 4) | 1);
+            self.verb(cad, pin, (verb << 8) | setup)?;
+        }
+        self.verb(cad, pin, SET_CHANNEL_ALLOCATION << 8)?;
+        if rev3 {
+            self.verb(cad, cvt, (SET_RAMP_RATE << 8) | 180)?;
+        }
+        let hbr = self.verb(cad, pin, GET_HBR_CONTROL << 8)?;
+        if hbr & 1 != 0 && hbr & 0x10 != 0 {
+            self.verb(cad, pin, (SET_HBR_CONTROL << 8) | (hbr & 0xef))?;
+        }
+        let dig = self.verb(cad, cvt, 0xf0d << 8)?;
+        self.verb(cad, cvt, (0x70d << 8) | (dig & 0xff) | 1)?;
         Ok(())
     }
     pub(super) fn refresh_jacks(&self) -> Result<(), HdaError> {
