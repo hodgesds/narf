@@ -344,6 +344,15 @@ fn navi48_dispatch_overflow_rechecks_all_waiters_and_display_consumers() -> Test
     let s = t.lock().summary();
     assert_eq!((s.counters.lost, s.display.lost), (1, 1));
     assert_eq!(t.lock().endpoint(h).unwrap().stats.watchdog_completions, 0);
+    // A latch found by the post-overflow sweep faults its VMID's owners.
+    let uq = t.lock().register(user(0x20)).unwrap();
+    assert_eq!(t.lock().latched(3, true), Delivery::Faulted(1));
+    assert_eq!(t.lock().latched(9, false), Delivery::Unattributed);
+    assert_eq!(
+        t.lock().endpoint(uq).unwrap().fault,
+        Some(src::Fault::Vm { mm_hub: true })
+    );
+    assert_eq!(t.lock().endpoint(h).unwrap().fault, None);
     TestResult::Pass
 }
 kernel_test_in!(

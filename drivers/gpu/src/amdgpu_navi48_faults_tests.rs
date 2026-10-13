@@ -150,7 +150,7 @@ fn navi48_vm_faults_decode_48bit_addresses_capture_then_ack_and_contain() -> Tes
         assert_eq!(e.status.count, 1);
         assert_eq!(e.status.state, State::Contained);
         let record = e.status.last.unwrap();
-        assert_eq!(record.event, v);
+        assert_eq!(record.event, Some(v));
         assert_eq!(
             record.kind,
             Kind::Vm {
@@ -295,7 +295,7 @@ fn navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io() -> T
         e.handle(v).unwrap();
         assert_eq!(e.status.state, State::Contained);
         let record = e.status.last.unwrap();
-        assert_eq!((record.event, record.kind), (v, kind));
+        assert_eq!((record.event, record.kind), (Some(v), kind));
         assert_eq!((record.protection, record.acknowledged), (None, false));
         assert!(!e.io.reads.contains(&GST) && !e.io.reads.contains(&MST));
         assert_eq!(e.io.writes.len(), 5);
@@ -313,6 +313,41 @@ fn navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io() -> T
 kernel_test_in!(
     "drivers/gpu/navi48-faults",
     navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io
+);
+
+fn navi48_fault_sweep_after_lost_vectors_captures_then_acks_set_latches() -> TestResult {
+    let mut e = fixture();
+    assert_eq!(e.sweep(), Err(Error::Busy));
+    e.enable().unwrap();
+    e.io.writes.clear();
+    e.io.reads.clear();
+    // Nothing latched: reads only, no acknowledgement or containment.
+    e.io.regs.insert(GST, 0);
+    e.io.regs.insert(MST, 0);
+    assert_eq!(e.sweep(), Ok([None, None]));
+    assert_eq!(e.io.reads, [GST, GST, MST]);
+    assert!(e.io.writes.is_empty());
+    assert_eq!((e.status.state, e.status.count), (State::Armed, 0));
+    // An MMHUB latch whose IV was overwritten.
+    e.io.regs.insert(MST, 0x342026);
+    assert_eq!(e.sweep(), Ok([None, Some(3)]));
+    assert_eq!(e.status.state, State::Contained);
+    let record = e.status.last.unwrap();
+    assert_eq!(record.event, None);
+    assert_eq!(record.kind, Kind::Latched { hub: Hub::Mm });
+    assert_eq!(record.protection.unwrap().raw, 0x342026);
+    assert!(record.acknowledged);
+    assert_eq!(e.io.writes[0], (MCTL, 0x1ffd));
+    // A device that vanished fails the sweep and attempts the masks.
+    e.io.regs.insert(GST, u32::MAX);
+    assert_eq!(e.sweep(), Err(Error::DeviceGone));
+    assert_eq!(e.status.state, State::Failed(Error::DeviceGone));
+    assert_eq!(e.sweep(), Err(Error::DeviceGone));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_fault_sweep_after_lost_vectors_captures_then_acks_set_latches
 );
 
 fn navi48_fault_preflight_and_partial_programming_fail_without_reuse() -> TestResult {
@@ -405,7 +440,7 @@ fn navi48_fault_mmio_failures_preserve_raw_evidence_and_uncertain_masks() -> Tes
         assert_eq!(e.handle(v), Err(expected));
         assert_eq!(e.status.state, State::Failed(expected));
         let record = e.status.last.unwrap();
-        assert_eq!(record.event, v);
+        assert_eq!(record.event, Some(v));
         assert_eq!(record.protection.is_some(), case == 2);
         assert_eq!(record.acknowledged, case == 2);
         assert_eq!(

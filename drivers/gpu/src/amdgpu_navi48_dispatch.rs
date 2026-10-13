@@ -497,6 +497,24 @@ impl Table {
             }
         }
     }
+    /// A VM protection latch found after lost vectors. Only its VMID is
+    /// known, so every owner in that VMID is faulted.
+    pub fn latched(&mut self, vmid: u8, mm_hub: bool) -> Delivery {
+        let fault = src::Fault::Vm { mm_hub };
+        let mut hit = 0;
+        for slot in self.slots.iter_mut() {
+            if slot.owner.is_some_and(|o| o.vmid == vmid) {
+                slot.fault.get_or_insert(fault);
+                slot.bump();
+                hit += 1;
+            }
+        }
+        if hit == 0 {
+            self.counters.unattributed = self.counters.unattributed.saturating_add(1);
+            return Delivery::Unattributed;
+        }
+        Delivery::Faulted(hit)
+    }
     /// Vectors were lost (IH overflow): wake everyone to re-check hardware.
     pub fn lost(&mut self) {
         self.counters.lost = self.counters.lost.saturating_add(1);

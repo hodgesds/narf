@@ -621,6 +621,11 @@ context, `recover` starts a new generation after the owner resets its queue,
 and poison or service failure (including device removal) releases every
 waiter with a terminal error. Kernel queues are registered; there are no
 application owners yet. Model-tested only.
+IH ring0 overflow is now recovered as Linux does (resume after WPTR, pulse
+the overflow clear). A batch racing an overflow is discarded, all owners are
+woken to re-check their fences, and both VM fault latches are swept so a
+fault whose vector was overwritten is still captured and attributed.
+Overflow storms and ring1 overflow still fail closed.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer

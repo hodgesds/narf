@@ -20,6 +20,10 @@ const RPTR: [u64; 2] = [0x81, 0x8d];
 const WPTR: [u64; 2] = [0x82, 0x8e];
 const BASE: [u64; 2] = [0x83, 0x8f];
 const DOORBELL: [u64; 2] = [0x87, 0x93];
+/// IH_RB_CNTL.WPTR_OVERFLOW_CLEAR.
+const OVERFLOW_CLEAR: u32 = 1 << 31;
+/// Consecutive overflowed drains tolerated before the ring is declared lost.
+const OVERFLOW_STREAK: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -78,14 +82,21 @@ pub struct Event {
 }
 /// At most sixteen vectors per ring per call: no allocation or unbounded ISR
 /// work. A pending batch must be drained again after yielding to the scheduler.
+/// `lost` reports a recovered ring0 overflow: vectors were overwritten, so
+/// every consumer must re-check its hardware state instead of waiting.
 #[derive(Debug)]
 pub struct Batch {
     entries: [Option<Event>; 32],
     pub pending: bool,
+    pub lost: bool,
 }
 impl Batch {
     pub(crate) fn from_entries(entries: [Option<Event>; 32], pending: bool) -> Self {
-        Self { entries, pending }
+        Self {
+            entries,
+            pending,
+            lost: false,
+        }
     }
     pub fn events(&self) -> impl Iterator<Item = &Event> {
         self.entries.iter().flatten()
@@ -203,9 +214,11 @@ fn preflight(io: &mut impl Io, l: Layout) -> Result<(), Error> {
     }
     Ok(())
 }
-fn pointer(io: &mut impl Io, l: Layout, ring: usize) -> Result<u32, Error> {
+/// The write offset and RB_OVERFLOW. Only ring0 enables WPTR_OVERFLOW; ring1
+/// drains full (RB_FULL_DRAIN), so an overflow there is a protocol failure.
+fn pointer(io: &mut impl Io, l: Layout, ring: usize) -> Result<(u32, bool), Error> {
     let raw = read(io, l.at(WPTR[ring]))?;
-    if raw & 1 != 0 {
+    if raw & 1 != 0 && ring != 0 {
         return Err(Error::Overflow(ring as u8));
     }
     // RB_LEFT_NONE/RB_MAY_OVERFLOW are hints, not address bits. Reject all
@@ -214,7 +227,20 @@ fn pointer(io: &mut impl Io, l: Layout, ring: usize) -> Result<u32, Error> {
     if raw & !0xffffd != 0 || offset >= SIZES[ring] || offset & 31 != 0 {
         return Err(Error::Protocol);
     }
-    Ok(offset)
+    Ok((offset, raw & 1 != 0))
+}
+/// ih_v7_0_get_wptr's overflow recovery: resume at the oldest vector not yet
+/// overwritten (WPTR + 32) and pulse WPTR_OVERFLOW_CLEAR so the next overflow
+/// is detected. Returns the new ring0 read offset and write offset.
+fn recover(io: &mut impl Io, l: Layout, end: u32) -> Result<(u32, u32), Error> {
+    let cntl = read(io, l.at(CNTL[0]))?;
+    io.write(l.at(CNTL[0]), cntl | OVERFLOW_CLEAR);
+    write(io, l.at(CNTL[0]), cntl & !OVERFLOW_CLEAR)?;
+    // Still overflowing right after the clear is a storm: fail closed.
+    match pointer(io, l, 0)? {
+        (_, true) => Err(Error::Overflow(0)),
+        (now, false) => Ok(((end + 32) & (SIZES[0] - 1), now)),
+    }
 }
 fn host_control(io: &mut impl Io, l: Layout, enabled: bool) -> Result<(), Error> {
     if enabled {
@@ -240,6 +266,8 @@ struct Engine<I: Io> {
     rptr: [u32; 2],
     consumed: [u64; 2],
     host_interrupts: bool,
+    overflows: u64,
+    streak: u8,
 }
 impl<I: Io> Engine<I> {
     fn access<T>(&mut self, f: impl FnOnce(&mut I) -> Result<T, Error>) -> Result<T, Error> {
@@ -334,19 +362,32 @@ impl<I: Io> Engine<I> {
         let map = self.memory.mapping();
         let mut next = self.rptr;
         let mut counts = [0u64; 2];
+        let (start, streak) = (self.rptr, self.streak);
         let result = self.access(|io| {
             let mut batch = Batch {
                 entries: [None; 32],
                 pending: false,
+                lost: false,
             };
-            let ends = [pointer(io, l, 0)?, pointer(io, l, 1)?];
-            flush(io, l);
-            let mut count = 0;
+            let (mut end0, overflow) = pointer(io, l, 0)?;
+            let mut ends = [end0, pointer(io, l, 1)?.0];
             for ring in 0..2 {
                 if read(io, l.at(CNTL[ring]))? & 1 == 0 || read(io, l.at(RPTR[ring]))? != next[ring]
                 {
                     return Err(Error::Protocol);
                 }
+            }
+            if overflow {
+                if streak >= OVERFLOW_STREAK {
+                    return Err(Error::Overflow(0));
+                }
+                (next[0], end0) = recover(io, l, end0)?;
+                ends[0] = end0;
+                batch.lost = true;
+            }
+            flush(io, l);
+            let mut count = 0;
+            for ring in 0..2 {
                 for _ in 0..16 {
                     if next[ring] == ends[ring] {
                         break;
@@ -366,10 +407,22 @@ impl<I: Io> Engine<I> {
                 }
             }
             // An overflow racing the copy invalidates the entire batch. Never
-            // consume a torn/overwritten vector and report a spurious fence.
-            for (ring, next) in next.iter().enumerate() {
-                batch.pending |= pointer(io, l, ring)? != *next;
+            // consume a torn/overwritten vector; ring1 entries stay unread.
+            let (now, raced) = pointer(io, l, 0)?;
+            if raced {
+                if streak + u8::from(batch.lost) >= OVERFLOW_STREAK {
+                    return Err(Error::Overflow(0));
+                }
+                batch.entries = [None; 32];
+                counts = [0; 2];
+                (next[0], _) = recover(io, l, now)?;
+                next[1] = start[1];
+                batch.lost = true;
+                batch.pending = true;
+            } else {
+                batch.pending |= now != next[0];
             }
+            batch.pending |= pointer(io, l, 1)?.0 != next[1];
             fence(Ordering::SeqCst);
             for ring in 0..2 {
                 write(io, l.at(RPTR[ring]), next[ring])?;
@@ -381,6 +434,12 @@ impl<I: Io> Engine<I> {
                 self.rptr = next;
                 for (total, count) in self.consumed.iter_mut().zip(counts) {
                     *total = total.saturating_add(count);
+                }
+                if batch.lost {
+                    self.overflows = self.overflows.saturating_add(1);
+                    self.streak = self.streak.saturating_add(1);
+                } else {
+                    self.streak = 0;
                 }
                 Ok(batch)
             }
@@ -425,6 +484,8 @@ impl Rings {
             rptr: [0; 2],
             consumed: [0; 2],
             host_interrupts: false,
+            overflows: 0,
+            streak: 0,
         }))
     }
     /// # Safety
@@ -458,9 +519,15 @@ impl Rings {
         (self.0.state == State::Ready).then(|| self.0.report())
     }
     /// Drain both rings with a bounded budget; no source is treated as a fence
-    /// without separate validation by its owning engine. Overflow fails closed.
+    /// without separate validation by its owning engine. A ring0 overflow is
+    /// recovered as Linux does and reported through `Batch::lost`; repeated
+    /// overflow, ring1 overflow and every other inconsistency fail closed.
     pub fn drain(&mut self) -> Result<Batch, Error> {
         self.0.drain()
+    }
+    /// Recovered ring0 overflows since initialization.
+    pub fn overflows(&self) -> u64 {
+        self.0.overflows
     }
 }
 #[cfg(feature = "kernel-test")]

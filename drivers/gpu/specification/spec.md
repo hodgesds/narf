@@ -1941,7 +1941,14 @@ Pointers are byte offsets; partial vectors, out-of-range/undefined bits and
 unexpected read pointers are errors. The consumer checks overflow both before
 and after copying, flushes HDP visibility, and acknowledges only complete
 vectors. `Batch::pending` requires another bounded drain after yielding.
-Overflow is a fatal event-loss condition, not silently discarded history.
+A ring0 overflow (the only ring with WPTR_OVERFLOW_ENABLE) is recovered as
+ih_v7_0_get_wptr does: reading resumes at WPTR + 32, the oldest vector not
+overwritten, and WPTR_OVERFLOW_CLEAR is pulsed (set, then cleared with
+readback) so the next overflow is seen. An overflow that races the copy
+discards the whole batch, leaving ring1 unread, and recovers the same way.
+Either case sets `Batch::lost` and counts `overflows()`. Still overflowing
+right after the clear, four consecutive overflowed drains, or any ring1
+overflow (ring1 drains full instead) fail closed as before.
 Failed draining stops owned writers if authority is still live, retains all
 published memory, and forbids replay; revoked authority performs no MMIO.
 `Report` records addresses, sizes and consumed counts without implying MSI.
@@ -2028,6 +2035,17 @@ so the full IV is the retained evidence; they contain reporting like the
 existing faults. Only VM, CP privileged/opcode and SDMA0 trap sources are
 actually enabled by the service; the rest are classified if the IP raises
 them.
+
+After a lost batch the service wakes every dispatch owner to re-check its
+fence and runs `sweep`: both hub protection latches are read (GC first
+with its dummy read) and a set latch is recorded as `Kind::Latched` with
+no IV, acknowledged after capture, and contained like an IV-reported fault.
+Its latch VMID is the only context evidence, so the dispatcher faults every
+owner in that VMID. A latch that is non-zero without any fault (for example
+inherited from firmware) would therefore contain the monitor after an
+overflow; this errs towards fault reporting. Vectors in the resumed backlog
+can predate a recovery, but they can only wake owners or fault the current
+generation of the same queue key.
 
 `Status` exposes the IH state/report, MSI setup outcome, receive/eviction counts,
 sticky last VM-fault vector, two kernel EOP counters and an SDMA0 trap counter. EOP classification

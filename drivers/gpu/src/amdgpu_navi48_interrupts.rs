@@ -25,6 +25,8 @@ pub struct Status {
     /// Kernel graphics, compute and SDMA0 owners registered by the service.
     pub kernel: [Option<dispatch::Endpoint>; 3],
     pub dispatch: dispatch::Summary,
+    /// Recovered IH ring0 overflows (vectors were lost).
+    pub overflows: u64,
 }
 /// The kernel queues the cold boot owns, registered as dispatch owners so
 /// their completions and faults are attributed like any other owner's.
@@ -154,6 +156,7 @@ impl Service {
                 .kernel
                 .map(|h| h.and_then(|h| dispatch::endpoint(h).ok())),
             dispatch: dispatch::summary(),
+            overflows: self.rings.overflows(),
         }
     }
     fn drain(&mut self) -> Result<bool, ih::Error> {
@@ -176,6 +179,25 @@ impl Service {
                     let mut table = dispatch::TABLE.lock();
                     for event in batch.events() {
                         table.route(event, src::classify(event));
+                    }
+                }
+                if batch.lost {
+                    // Overwritten vectors may have held completions, display
+                    // events or faults: wake every owner to re-check, and
+                    // read the VM latches whose IVs may be gone.
+                    dispatch::TABLE.lock().lost();
+                    match self.faults.sweep() {
+                        Ok(found) => {
+                            let mut table = dispatch::TABLE.lock();
+                            for (mm_hub, vmid) in [false, true].into_iter().zip(found) {
+                                if let Some(vmid) = vmid {
+                                    table.latched(vmid, mm_hub);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            failed.get_or_insert(e);
+                        }
                     }
                 }
                 if let Some(e) = failed {

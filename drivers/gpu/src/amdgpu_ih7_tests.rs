@@ -14,6 +14,7 @@ struct Fake {
     refuse: Option<u64>,
     overflow_on_copy: bool,
     copies: usize,
+    sticky: bool,
 }
 impl Io for Fake {
     fn read(&mut self, at: u64) -> u32 {
@@ -30,6 +31,10 @@ impl Io for Fake {
             return;
         }
         assert!(!self.dirty, "published IH addresses before VRAM flush");
+        // WPTR_OVERFLOW_CLEAR clears ring0's latched RB_OVERFLOW.
+        if at == OSS + 0x80 * 4 && value & OVERFLOW_CLEAR != 0 && !self.sticky {
+            *self.regs.entry(OSS + 0x82 * 4).or_default() &= !1;
+        }
         match (at - OSS) / 4 {
             0x80..=0x87 | 0x8c..=0x90 | 0x93 | 0xc1 | 0x183 | 0x184 | 0xaa | 0xd5 | 0xf1 => {}
             _ => panic!("wrong native IH7 register {at:x}"),
@@ -75,6 +80,7 @@ fn fixture() -> (Pool, Engine<Fake>) {
             refuse: None,
             overflow_on_copy: false,
             copies: 0,
+            sticky: false,
         },
         authority: Cap::bootstrap(),
         layout: Layout {
@@ -87,6 +93,8 @@ fn fixture() -> (Pool, Engine<Fake>) {
         rptr: [0; 2],
         consumed: [0; 2],
         host_interrupts: false,
+        overflows: 0,
+        streak: 0,
     };
     (pool, e)
 }
@@ -211,6 +219,8 @@ fn ih7_overflow_invalid_pointer_and_lost_ownership_fail_closed() -> TestResult {
         push(&mut e, 0, 1);
         let error = match case {
             0 => {
+                // Overflow at the streak bound is a storm, not a recovery.
+                e.streak = OVERFLOW_STREAK;
                 e.io.regs.insert(OSS + 0x82 * 4, 33);
                 Error::Overflow(0)
             }
@@ -231,7 +241,9 @@ fn ih7_overflow_invalid_pointer_and_lost_ownership_fail_closed() -> TestResult {
                 Error::Protocol
             }
             _ => {
-                e.io.overflow_on_copy = true;
+                // The clear does not take: still overflowing after the pulse.
+                e.io.sticky = true;
+                e.io.regs.insert(OSS + 0x82 * 4, 33);
                 Error::Overflow(0)
             }
         };
@@ -250,6 +262,70 @@ fn ih7_overflow_invalid_pointer_and_lost_ownership_fail_closed() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/ih7",
     ih7_overflow_invalid_pointer_and_lost_ownership_fail_closed
+);
+
+fn ih7_ring0_overflow_resumes_after_wptr_like_linux_and_reports_loss() -> TestResult {
+    let (_pool, mut e) = fixture();
+    e.initialize().unwrap();
+    // The writer wrapped past the reader: WPTR is at 96 with RB_OVERFLOW,
+    // and the oldest surviving vector is the one after it.
+    for seq in 0..3 {
+        push(&mut e, 0, seq);
+    }
+    let survivor = 128 / 4;
+    e.io.data[survivor..survivor + 8].copy_from_slice(&words(77));
+    e.io.regs.insert(OSS + 0x82 * 4, 96 | 1);
+    push(&mut e, 1, 5);
+    e.io.writes.clear();
+    let cntl = e.io.regs[&(OSS + 0x80 * 4)];
+    let batch = e.drain().unwrap();
+    assert!(batch.lost && batch.pending);
+    // ih_v7_0_get_wptr pulses WPTR_OVERFLOW_CLEAR, set then cleared.
+    assert_eq!(e.io.writes[0], (OSS + 0x80 * 4, cntl | OVERFLOW_CLEAR));
+    assert_eq!(e.io.writes[1], (OSS + 0x80 * 4, cntl));
+    assert_eq!(e.io.regs[&(OSS + 0x82 * 4)], 96);
+    let events: Vec<_> = batch.events().collect();
+    assert_eq!(events.len(), 17);
+    assert_eq!(events[0].vector, Vector::decode(words(77)));
+    assert_eq!(events[16].ih_ring, 1);
+    assert_eq!(e.rptr, [128 + 16 * 32, 32]);
+    assert_eq!(e.io.regs[&(OSS + 0x81 * 4)], 128 + 16 * 32);
+    assert_eq!((e.overflows, e.streak), (1, 1));
+    // The backlog drains normally; a clean drain ends the streak.
+    let next = e.drain().unwrap();
+    assert!(!next.lost && next.pending);
+    assert_eq!(e.streak, 0);
+    assert_eq!(e.state, State::Ready);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/ih7",
+    ih7_ring0_overflow_resumes_after_wptr_like_linux_and_reports_loss
+);
+
+fn ih7_overflow_racing_the_copy_discards_the_batch_then_storms_fail_closed() -> TestResult {
+    let (_pool, mut e) = fixture();
+    e.initialize().unwrap();
+    push(&mut e, 0, 1);
+    push(&mut e, 1, 2);
+    e.io.overflow_on_copy = true;
+    for round in 1..=OVERFLOW_STREAK {
+        let batch = e.drain().unwrap();
+        // Possibly torn vectors are never handed out; ring1 stays unread.
+        assert!(batch.lost && batch.pending && batch.is_empty());
+        assert_eq!(e.consumed, [0, 0]);
+        assert_eq!(e.rptr[1], 0);
+        assert_eq!(e.io.regs[&(OSS + 0x8d * 4)], 0);
+        assert_eq!((e.overflows, e.streak), (u64::from(round), round));
+    }
+    assert_eq!(e.drain().unwrap_err(), Error::Overflow(0));
+    assert_eq!(e.state, State::Failed(Error::Overflow(0)));
+    assert_eq!(e.io.regs[&(OSS + 0x80 * 4)] & 0x20001, 0);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/ih7",
+    ih7_overflow_racing_the_copy_discards_the_batch_then_storms_fail_closed
 );
 
 fn ih7_refuses_inherited_hardware_before_any_write() -> TestResult {

@@ -61,6 +61,9 @@ pub enum Kind {
     Shader { error: ShaderError, detail: u32 },
     /// Poison/RAS consumption. Terminal for every owner.
     Poison(Poison),
+    /// A hub protection latch found set by `sweep` after IH vectors were
+    /// lost; the latch's own VMID is the only context evidence.
+    Latched { hub: Hub },
 }
 fn classify(event: ih::Event) -> Option<Kind> {
     let v = event.vector;
@@ -120,7 +123,8 @@ impl Protection {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Record {
-    pub event: ih::Event,
+    /// The IV, or `None` for a latch found by `sweep`.
+    pub event: Option<ih::Event>,
     pub kind: Kind,
     pub protection: Option<Protection>,
     /// The VM latch-clear write was posted. CP faults have no VM latch to clear.
@@ -297,7 +301,7 @@ impl<I: Io> Engine<I> {
         self.status.count = self.status.count.saturating_add(1);
         // Preserve the IV even if the capability was revoked before MMIO.
         self.status.last = Some(Record {
-            event,
+            event: Some(event),
             kind,
             protection: None,
             acknowledged: false,
@@ -326,21 +330,72 @@ impl<I: Io> Engine<I> {
                 checked(io.read(status))
             })?;
             self.status.last.as_mut().unwrap().protection = Some(Protection::decode(raw));
-            // Retain the latch before acknowledging it. Do not retry a fault,
-            // fill a PTE or redirect any failed access into host memory.
-            self.access(|io| {
-                let value = checked(io.read(control))?;
-                io.write(control, value | 1);
-                checked(io.read(control))?; // post the self-clearing write
-                Ok(())
-            })?;
-            self.status.last.as_mut().unwrap().acknowledged = true;
+            self.acknowledge(control)?;
         }
+        self.contain()
+    }
+    // Retain the latch before acknowledging it. Do not retry a fault, fill a
+    // PTE or redirect any failed access into host memory.
+    fn acknowledge(&mut self, control: u64) -> Result<(), Error> {
+        self.access(|io| {
+            let value = checked(io.read(control))?;
+            io.write(control, value | 1);
+            checked(io.read(control))?; // post the self-clearing write
+            Ok(())
+        })?;
+        self.status.last.as_mut().unwrap().acknowledged = true;
+        Ok(())
+    }
+    fn contain(&mut self) -> Result<(), Error> {
         if self.status.state == State::Armed {
             self.mask()?;
             self.status.state = State::Contained;
         }
         Ok(())
+    }
+    /// After lost vectors a VM fault IV may have been overwritten. Read both
+    /// hub latches (with GC's fast-GRBM dummy read); a set latch is recorded,
+    /// acknowledged and contained like an IV-reported fault. Returns the
+    /// latched VMID per hub, `[gfx, mm]`.
+    fn sweep(&mut self) -> Result<[Option<u8>; 2], Error> {
+        match self.status.state {
+            State::Armed | State::Contained => {}
+            State::Failed(e) => return Err(e),
+            _ => return Err(Error::Busy),
+        }
+        let result = self.sweep_inner();
+        if let Err(e) = result {
+            self.status.state = State::Failed(e);
+            self.status.mask_error = self.mask().err();
+        }
+        result
+    }
+    fn sweep_inner(&mut self) -> Result<[Option<u8>; 2], Error> {
+        let mut found = [None; 2];
+        for (i, hub) in [Hub::Gfx, Hub::Mm].into_iter().enumerate() {
+            let (status, control) = self.layout.latch(hub);
+            let raw = self.access(|io| {
+                if hub == Hub::Gfx {
+                    checked(io.read(status))?;
+                }
+                checked(io.read(status))
+            })?;
+            if raw == 0 {
+                continue;
+            }
+            let protection = Protection::decode(raw);
+            self.status.count = self.status.count.saturating_add(1);
+            self.status.last = Some(Record {
+                event: None,
+                kind: Kind::Latched { hub },
+                protection: Some(protection),
+                acknowledged: false,
+            });
+            self.acknowledge(control)?;
+            self.contain()?;
+            found[i] = Some(protection.vmid);
+        }
+        Ok(found)
     }
     fn stop(&mut self) {
         if let Err(e) = self.mask() {
@@ -385,6 +440,9 @@ impl Monitor {
     }
     pub(crate) fn handle(&mut self, event: ih::Event) -> Result<(), Error> {
         self.0.handle(event)
+    }
+    pub(crate) fn sweep(&mut self) -> Result<[Option<u8>; 2], Error> {
+        self.0.sweep()
     }
     pub(crate) fn stop(&mut self) {
         self.0.stop();
