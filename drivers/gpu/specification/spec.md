@@ -2013,8 +2013,21 @@ failure. These survive history consumption and eviction. MMIO/revocation errors
 retain the raw vector, stop owned sources where possible, disable CPU delivery,
 and leave uncertain hardware/storage retained. EOP proofs reject any recognized
 fault or a monitor that is not armed. There is no automatic reset, PTE repair,
-fault replay, user-process termination or reuse of failed allocations. SDMA,
-shader, poison and media fault handling remain separate open work.
+fault replay, user-process termination or reuse of failed allocations.
+
+The monitor also records the remaining GC-client fault sources Linux defines
+for GC12 (irqsrcs_gfx_12_0_0.h): CP reserved-bit, semaphore-wait and general
+protection faults, the twelve SDMA7 error sources (SRBM write, invalid
+doorbell, queue hang, atomic/poll/page timeouts, null page, page fault, VM
+hole, frozen engine and both semaphore timeouts, with SDMA instance and queue
+from the IV ring ID), SQ error words (illegal instruction and memory
+violation with their 21-bit detail) and poison: UTCL2 data poisoning,
+RLC_GC_FED, CP ECC/FUE, SDMA ECC/SRAM ECC, SQ EDC FUE/FED, VCN5 UVD/JPEG
+poison, DF/UMC ECC and NBIF ATHUB error events. These have no latch to read,
+so the full IV is the retained evidence; they contain reporting like the
+existing faults. Only VM, CP privileged/opcode and SDMA0 trap sources are
+actually enabled by the service; the rest are classified if the IP raises
+them.
 
 `Status` exposes the IH state/report, MSI setup outcome, receive/eviction counts,
 sticky last VM-fault vector, two kernel EOP counters and an SDMA0 trap counter. EOP classification
@@ -2030,6 +2043,51 @@ Platform `poll_interrupts` consumes up to 32 history entries, independently of
 hardware draining. This history is not an application completion queue.
 Platform diagnostics include this live service state separately from boot's
 startup report. Hardware MSI delivery still requires a physical-card test.
+
+`amdgpu_navi48_sources::classify` is the single, MMIO-free decoder of SOC21
+vectors into typed classes: CP EOP (exact ME/pipe/queue slot plus the
+user-queue doorbell in source data 0), SDMA traps (instance/queue) and SDMA
+user fences (doorbell >> 2), faults, poison, DCN401 display events, SQ
+messages, VCN5 media traps, SMU-owned thermal/SMUIO/MP1 sources, the IH
+self-IV and `Unknown`. Display decoding follows `to_dal_irq_source_dcn401`:
+source 9 with context 0–5 is HPD and 6–11 HPD-RX, plus OTG VSTARTUP (vblank),
+vertical interrupt 0, HUBP flip, VUPDATE-no-lock and the DMCUB outbox.
+
+`amdgpu_navi48_dispatch` delivers classified vectors to registered owners,
+following amdgpu_fence.c. An owner registers a `Key` (CP slot, SDMA
+instance/queue or non-zero user doorbell) with its VMID and PASID and gets a
+`Handle` carrying the slot generation. A vector only wakes the owner: `wait`
+snapshots the endpoint, calls the owner's own memory-fence check, and parks
+until the endpoint changes or a 100 ms watchdog fires (Linux's fallback timer
+role); every wait also takes a mandatory deadline. Completion vectors match
+the exact slot first and then the doorbell, as gfx_v12_0_eop_irq does, and
+must carry the owner's VMID/PASID. Vectors for unregistered, retired or
+mismatched owners, unknown sources, media, power and SQ messages are only
+counted. Per-endpoint statistics separate signal and watchdog wakes and
+count completions first seen by the watchdog, the lost-interrupt evidence
+Linux warns about. Waiter storage is bounded (eight per endpoint); an
+overflowing waiter still completes through the watchdog and is counted.
+
+Faults are delivered to their owners: CP faults by slot and then the
+context-ID doorbell (amdgpu_gfx_handle_priv_fault), SDMA faults by
+instance/queue, and VM and shader faults to every owner of the faulting
+VMID/PASID. The first fault is kept; waiters on a faulted endpoint return
+`Faulted` unless their fence already completed. `unsafe recover` is the
+controlled-recovery step: once the owner has reset or unmapped its queue it
+gets a new generation, and every handle of the faulted generation is `Stale`
+forever. Faults without an owner are counted as unattributed. Poison is
+terminal, as Linux's poison consumption ends in a GPU reset. The interrupt
+service delivers its own failures (all-ones MMIO as `DeviceGone`, overflow,
+protocol, revocation, fault-monitor errors) with `fail_all`: every current
+waiter wakes with `Terminal`, new waits return it without reading memory, and
+registration is refused. The service registers the kernel graphics
+(ME/pipe/queue 0/0/0), compute (1/0/0) and SDMA0 queue-0 owners for VMID0, and
+`Status` exposes them with the dispatch summary. There are no application
+queues yet, so no client registers user doorbells; MES-scheduled user queues,
+queue reset and fault-source re-arming after containment remain open, and
+after the first fault other owners see later faults only as timeouts.
+Everything here is model-tested (fake vectors and a local table driven
+through pending waits); none of it has run on the card.
 
 `unsafe amdgpu_sdma_navi48::Sdma::new` selects SDMA7.0.0/1 on GC12.0.1,
 with queue registers in GC bank zero and MCU control in bank one. Its owned

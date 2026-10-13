@@ -212,6 +212,7 @@ pub mod amdgpu_mst;
 pub mod amdgpu_navi22_boot;
 pub mod amdgpu_navi22_platform;
 pub mod amdgpu_navi48_boot;
+pub mod amdgpu_navi48_dispatch;
 pub mod amdgpu_navi48_display;
 pub mod amdgpu_navi48_faults;
 pub mod amdgpu_navi48_firmware;
@@ -219,6 +220,7 @@ pub mod amdgpu_navi48_interrupts;
 pub mod amdgpu_navi48_kms;
 pub mod amdgpu_navi48_msi;
 pub mod amdgpu_navi48_platform;
+pub mod amdgpu_navi48_sources;
 #[cfg(feature = "kernel-test")]
 mod amdgpu_navi48_tests;
 pub mod amdgpu_navi48_ucode;

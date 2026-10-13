@@ -1,6 +1,12 @@
 //! Native GC12/MMHUB4.1 fault sources owned by the independent IH service.
-//! Faults are terminal for this bootstrap; this is not VM replay or recovery.
-use crate::{amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_ih7 as ih, amdgpu_psp_ring::bank};
+//! The monitor preserves evidence and contains reporting; per-owner delivery
+//! and recovery generations live in amdgpu_navi48_dispatch. There is no VM
+//! replay, PTE repair or GPU reset.
+pub use crate::amdgpu_navi48_sources::{CommandFault, Poison, SdmaFault, ShaderError};
+use crate::{
+    amdgpu::AmdGpu, amdgpu_discovery as ip, amdgpu_ih7 as ih, amdgpu_navi48_sources as src,
+    amdgpu_psp_ring::bank,
+};
 use narf_bus::{BusDeviceCap, MmioRegion};
 use narf_capabilities::{Cap, CapError, CapOp, Write};
 
@@ -30,12 +36,6 @@ pub enum Hub {
     Mm,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommandFault {
-    BadOpcode,
-    PrivilegedRegister,
-    PrivilegedInstruction,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Vm {
         hub: Hub,
@@ -49,31 +49,46 @@ pub enum Kind {
         pipe: u8,
         queue: u8,
     },
+    /// SDMA7 error sources (sdma_v7_0 registers none of them; the IV is the
+    /// only evidence). Instance and queue come from the IV ring ID.
+    Sdma {
+        fault: SdmaFault,
+        instance: u8,
+        queue: u8,
+    },
+    /// SQ error word: illegal instruction or memory violation, with the
+    /// 21-bit detail field and the IV's VMID/PASID naming the context.
+    Shader { error: ShaderError, detail: u32 },
+    /// Poison/RAS consumption. Terminal for every owner.
+    Poison(Poison),
 }
 fn classify(event: ih::Event) -> Option<Kind> {
     let v = event.vector;
-    if matches!(v.client, 0x0a | 0x12) && v.source == 0 {
-        return Some(Kind::Vm {
-            hub: if v.client == 0x12 { Hub::Mm } else { Hub::Gfx },
+    Some(match src::classify(&event) {
+        src::Class::Fault(src::Fault::Vm { mm_hub }) => Kind::Vm {
+            hub: if mm_hub { Hub::Mm } else { Hub::Gfx },
             page: (u64::from(v.data[0]) << 12) | (u64::from(v.data[1] & 15) << 44),
             write: v.data[1] & 0x20 != 0,
             retry: v.data[1] & 0x80 != 0,
-        });
-    }
-    if v.client != 0x0a {
-        return None;
-    }
-    let fault = match v.source {
-        183 => CommandFault::BadOpcode,
-        184 => CommandFault::PrivilegedRegister,
-        185 => CommandFault::PrivilegedInstruction,
+        },
+        src::Class::Fault(src::Fault::Command { fault, queue }) => Kind::Command {
+            fault,
+            me: queue.me,
+            pipe: queue.pipe,
+            queue: queue.queue,
+        },
+        src::Class::Fault(src::Fault::Sdma {
+            fault,
+            instance,
+            queue,
+        }) => Kind::Sdma {
+            fault,
+            instance,
+            queue,
+        },
+        src::Class::Fault(src::Fault::Shader { error, detail }) => Kind::Shader { error, detail },
+        src::Class::Poison(p) => Kind::Poison(p),
         _ => return None,
-    };
-    Some(Kind::Command {
-        fault,
-        me: (v.ring >> 2) & 3,
-        pipe: v.ring & 3,
-        queue: (v.ring >> 4) & 7,
     })
 }
 /// A hub latch snapshot, which can describe a different concurrent fault than

@@ -1,7 +1,12 @@
 //! Retained interrupt service, independent of the firmware/display owner lock.
-//! Raw events remain diagnostic until their engine provides a validated fence
-//! or fault consumer. No user fence is completed from an unchecked IV payload.
-use crate::{amdgpu_ih7 as ih, amdgpu_navi48_faults as faults, amdgpu_navi48_msi as msi};
+//! Every drained vector is recorded, given to the fault monitor (evidence
+//! before acknowledgement) and then routed by amdgpu_navi48_dispatch to its
+//! registered owner. Vectors only wake owners; no fence is completed from an
+//! IV payload. A service failure is delivered to every waiter as terminal.
+use crate::{
+    amdgpu_ih7 as ih, amdgpu_navi48_dispatch as dispatch, amdgpu_navi48_faults as faults,
+    amdgpu_navi48_msi as msi, amdgpu_navi48_sources as src,
+};
 use narf_lib::mutex::Mutex;
 
 static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
@@ -17,7 +22,28 @@ pub struct Status {
     pub kernel_eop: [u64; 2],
     pub sdma0_traps: u64,
     pub faults: faults::Status,
+    /// Kernel graphics, compute and SDMA0 owners registered by the service.
+    pub kernel: [Option<dispatch::Endpoint>; 3],
+    pub dispatch: dispatch::Summary,
 }
+/// The kernel queues the cold boot owns, registered as dispatch owners so
+/// their completions and faults are attributed like any other owner's.
+const KERNEL: [dispatch::Key; 3] = [
+    dispatch::Key::Cp(src::Queue {
+        me: 0,
+        pipe: 0,
+        queue: 0,
+    }),
+    dispatch::Key::Cp(src::Queue {
+        me: 1,
+        pipe: 0,
+        queue: 0,
+    }),
+    dispatch::Key::Sdma {
+        instance: 0,
+        queue: 0,
+    },
+];
 #[derive(Debug)]
 struct History {
     entries: [Option<ih::Event>; 64],
@@ -109,6 +135,7 @@ struct Service {
     routing: Result<Option<u8>, msi::Error>,
     history: History,
     faults: faults::Monitor,
+    kernel: [Option<dispatch::Handle>; 3],
 }
 impl Service {
     fn status(&self) -> Status {
@@ -123,6 +150,10 @@ impl Service {
             kernel_eop: self.history.kernel_eop,
             sdma0_traps: self.history.sdma0_traps,
             faults: self.faults.status(),
+            kernel: self
+                .kernel
+                .map(|h| h.and_then(|h| dispatch::endpoint(h).ok())),
+            dispatch: dispatch::summary(),
         }
     }
     fn drain(&mut self) -> Result<bool, ih::Error> {
@@ -133,27 +164,49 @@ impl Service {
                 }
                 // Retain the whole batch first: a register/capability failure
                 // while decoding one fault must not discard already-drained IVs.
-                let mut failed = false;
+                let mut failed = None;
                 for event in batch.events() {
-                    failed |= self.faults.handle(*event).is_err();
+                    if let Err(e) = self.faults.handle(*event) {
+                        failed.get_or_insert(e);
+                    }
                 }
-                if failed {
-                    self.stop();
+                // Deliver after the monitor captured and acknowledged its
+                // evidence, so a woken owner never races the latch.
+                {
+                    let mut table = dispatch::TABLE.lock();
+                    for event in batch.events() {
+                        table.route(event, src::classify(event));
+                    }
+                }
+                if let Some(e) = failed {
+                    self.stop(match e {
+                        faults::Error::DeviceGone => dispatch::Terminal::DeviceGone,
+                        _ => dispatch::Terminal::Interrupts(ih::Error::Protocol),
+                    });
                     return Err(ih::Error::Protocol);
                 }
                 Ok(batch.pending)
             }
             Err(e) => {
-                self.stop();
+                self.stop(terminal(e));
                 Err(e)
             }
         }
     }
-    fn stop(&mut self) {
+    /// Stop draining for good: mask sources and CPU delivery where authority
+    /// permits, then release every waiter with the terminal cause.
+    fn stop(&mut self, cause: dispatch::Terminal) {
         self.faults.stop();
         if let Some(route) = &mut self.route {
             self.routing = route.disable().map(|()| None);
         }
+        dispatch::TABLE.lock().fail_all(cause);
+    }
+}
+fn terminal(e: ih::Error) -> dispatch::Terminal {
+    match e {
+        ih::Error::DeviceGone => dispatch::Terminal::DeviceGone,
+        e => dispatch::Terminal::Interrupts(e),
     }
 }
 /// # Safety
@@ -186,11 +239,28 @@ pub(crate) unsafe fn install(
         routing,
         history: History::new(),
         faults: faults.take().unwrap(),
+        kernel: [None; 3],
     });
     let service = slot.as_mut().unwrap();
+    for (handle, key) in service.kernel.iter_mut().zip(KERNEL) {
+        // VMID0/PASID0 kernel context. A refused registration only loses
+        // attribution: its vectors stay counted as unowned.
+        *handle = dispatch::register(dispatch::Owner {
+            key,
+            vmid: 0,
+            pasid: 0,
+        })
+        .ok();
+    }
     // SAFETY: matching initialized hubs/queues/IH; the permanent service now
     // retains the monitor before the first source enable or CPU MSI delivery.
-    unsafe { service.faults.enable() }.map_err(|_| ih::Error::Protocol)?;
+    if unsafe { service.faults.enable() }.is_err() {
+        // No consumer will run: release the owners registered above.
+        dispatch::TABLE
+            .lock()
+            .fail_all(dispatch::Terminal::Interrupts(ih::Error::Protocol));
+        return Err(ih::Error::Protocol);
+    }
     if let Some(route) = &mut service.route {
         // SAFETY: service slot already retains both owners and the consumer is
         // spawned below. It drains first, so an early IRQ is not lost.
@@ -202,7 +272,7 @@ pub(crate) unsafe fn install(
         }
     }
     if let ih::State::Failed(e) = service.rings.state() {
-        service.stop();
+        service.stop(terminal(e));
         return Err(e);
     }
     drop(slot);

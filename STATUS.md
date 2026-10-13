@@ -612,13 +612,22 @@ and masks owned sources after a fault. Typed diagnostics survive raw-history
 eviction, and VM or command faults prevent the EOP proof from succeeding.
 Setup/MMIO/revocation failures retain uncertain owners and mask CPU delivery
 where possible. No fault replay, automatic reset or allocation reuse is implied.
+A typed SOC21 decoder now covers every GC12 completion, fault and poison
+source, DCN401 display events, VCN5 media and SMU sources. A dispatch table
+wakes registered owners (CP slot, SDMA queue or user doorbell, with VMID/PASID
+and a generation) so they re-check their own fences; a 100 ms watchdog bounds
+lost interrupts and is counted separately. Faults go to the owning queue or
+context, `recover` starts a new generation after the owner resets its queue,
+and poison or service failure (including device removal) releases every
+waiter with a terminal error. Kernel queues are registered; there are no
+application owners yet. Model-tested only.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
 controller/PM access after preparation and quarantines the primary framebuffer
 on incomplete startup. Read-only preparation failures restore CPU writers.
 
-Still open: physical MSI delivery verification, remaining SDMA/shader/media/poison
-fault-source dispatch, GC12 rendering and shader
+Still open: physical MSI delivery verification, queue reset and fault-source
+re-arming after containment, GC12 rendering and shader
 dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
 and scanout programming, reset/suspend/resume, and physical RX 9070 XT testing.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver

@@ -238,6 +238,83 @@ kernel_test_in!(
     navi48_command_faults_use_exact_client_source_and_preserve_queue_identity
 );
 
+fn navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io() -> TestResult {
+    let sq = |kind: u32| {
+        let mut v = event(0x0a, 239, 0);
+        v.vector.data = [(kind << 21) | 0x55, 2 << 6, 0, 0];
+        v
+    };
+    for (v, kind) in [
+        (
+            event(0x0a, 55, 0x10),
+            Kind::Sdma {
+                fault: SdmaFault::QueueHang,
+                instance: 1,
+                queue: 0,
+            },
+        ),
+        (
+            event(0x0a, 60, 0x01),
+            Kind::Sdma {
+                fault: SdmaFault::PageFault,
+                instance: 0,
+                queue: 1,
+            },
+        ),
+        (
+            event(0x0a, 195, 0x04),
+            Kind::Command {
+                fault: CommandFault::ProtectionFault,
+                me: 1,
+                pipe: 0,
+                queue: 0,
+            },
+        ),
+        (
+            sq(2),
+            Kind::Shader {
+                error: ShaderError::MemoryViolation,
+                detail: 0x55,
+            },
+        ),
+        (sq(0), Kind::Poison(Poison::Shader { fatal: true })),
+        (event(0x0a, 201, 0), Kind::Poison(Poison::CpFue)),
+        (event(0x17, 0, 0), Kind::Poison(Poison::Umc)),
+        (
+            event(0x10, 160, 0),
+            Kind::Poison(Poison::Media {
+                instance: 0,
+                source: 160,
+            }),
+        ),
+    ] {
+        let mut e = fixture();
+        e.enable().unwrap();
+        e.io.writes.clear();
+        e.io.reads.clear();
+        e.handle(v).unwrap();
+        assert_eq!(e.status.state, State::Contained);
+        let record = e.status.last.unwrap();
+        assert_eq!((record.event, record.kind), (v, kind));
+        assert_eq!((record.protection, record.acknowledged), (None, false));
+        assert!(!e.io.reads.contains(&GST) && !e.io.reads.contains(&MST));
+        assert_eq!(e.io.writes.len(), 5);
+    }
+    // Shader wave messages and media traps are not faults.
+    let mut e = fixture();
+    e.enable().unwrap();
+    let mut wave = event(0x0a, 239, 0);
+    wave.vector.data = [1 << 21, 1 << 6, 0, 0];
+    e.handle(wave).unwrap();
+    e.handle(event(0x10, 119, 0)).unwrap();
+    assert_eq!((e.status.state, e.status.count), (State::Armed, 0));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-faults",
+    navi48_sdma_shader_and_poison_faults_keep_iv_evidence_without_latch_io
+);
+
 fn navi48_fault_preflight_and_partial_programming_fail_without_reuse() -> TestResult {
     for case in 0..8 {
         let mut e = fixture();
