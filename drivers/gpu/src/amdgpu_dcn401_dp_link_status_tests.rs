@@ -40,6 +40,67 @@ kernel_test_in!(
     dcn401_hpd_routes_pin_enables_block_and_reads_debounced_sense
 );
 
+fn dcn401_hpd_interrupts_arm_and_acknowledge_like_hpd0_ack() -> TestResult {
+    let (mut e, _) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
+    // Not before the pin is routed and the block enabled.
+    e.io.inner.inner.regs.insert(PAD, 0x1_0000);
+    if e.enable_hpd_irq(path(1), true) != Err(Error::Busy) {
+        return TestResult::Fail("armed before routing");
+    }
+    e.enable_hpd(path(1)).unwrap();
+    // Connected: arm for the unplug edge (polarity 0), HPD and HPD-RX on,
+    // stale events acknowledged.
+    e.io.inner.inner.regs.insert(hpd(2, 0x175a), 0x11);
+    e.io.inner.inner.writes.clear();
+    if e.enable_hpd_irq(path(1), true).is_err() {
+        return TestResult::Fail("arm");
+    }
+    let control = e.io.inner.inner.regs[&hpd(2, 0x175b)];
+    let writes: Vec<u32> =
+        e.io.inner
+            .inner
+            .writes
+            .iter()
+            .filter(|(at, _)| *at == hpd(2, 0x175b))
+            .map(|(_, v)| *v)
+            .collect();
+    if control & 0x101_0100 != 0x101_0000
+        || !writes.iter().any(|v| v & 1 != 0)
+        || !writes.iter().any(|v| v & 0x10_0000 != 0)
+    {
+        return TestResult::Fail("armed state");
+    }
+    // An unplug edge: acknowledged, re-armed for the plug edge.
+    e.io.inner.inner.regs.insert(hpd(2, 0x175a), 0x01);
+    if e.ack_hpd_irq(path(1)) != Ok(false) || e.io.inner.inner.regs[&hpd(2, 0x175b)] & 0x100 == 0 {
+        return TestResult::Fail("unplug ack");
+    }
+    // A plug edge flips it back; a short pulse alone keeps the polarity.
+    e.io.inner.inner.regs.insert(hpd(2, 0x175a), 0x11);
+    if e.ack_hpd_irq(path(1)) != Ok(true) || e.io.inner.inner.regs[&hpd(2, 0x175b)] & 0x100 != 0 {
+        return TestResult::Fail("plug ack");
+    }
+    e.io.inner.inner.writes.clear();
+    e.io.inner.inner.regs.insert(hpd(2, 0x175a), 0x110);
+    if e.ack_hpd_irq(path(1)) != Ok(true)
+        || e.io.inner.inner.regs[&hpd(2, 0x175b)] & 0x100 != 0
+        || !e
+            .io
+            .inner
+            .inner
+            .writes
+            .iter()
+            .any(|(at, v)| *at == hpd(2, 0x175b) && v & 0x10_0000 != 0)
+    {
+        return TestResult::Fail("short pulse ack");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hpd_interrupts_arm_and_acknowledge_like_hpd0_ack
+);
+
 fn dcn401_dp_link_status_reads_sink_lock_without_touching_the_owner() -> TestResult {
     let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
     // Only a trained (or later) link has a status to read.

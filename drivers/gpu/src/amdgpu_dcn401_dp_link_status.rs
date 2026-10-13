@@ -7,7 +7,15 @@
 use super::*;
 
 const HPD_INT_STATUS: u64 = 0x175a;
+const HPD_INT_CONTROL: u64 = 0x175b;
 const HPD_CONTROL: u64 = 0x175c;
+const HPD_INT_PENDING: u32 = 1;
+const HPD_RX_INT_PENDING: u32 = 0x100;
+const HPD_INT_ACK: u32 = 1;
+const HPD_INT_POLARITY: u32 = 0x100;
+const HPD_INT_EN: u32 = 0x1_0000;
+const HPD_RX_INT_ACK: u32 = 0x10_0000;
+const HPD_RX_INT_EN: u32 = 0x100_0000;
 const HPD_STRIDE: u64 = 8;
 const HPD_SENSE_DELAYED: u32 = 0x10;
 const HPD_EN: u32 = 0x1000_0000;
@@ -63,6 +71,67 @@ impl<I: Io> Engine<I> {
             return Err(Error::Readback(control));
         }
         Ok(())
+    }
+    /// Linux hpd0_ack: strobe the acknowledgement, then point the interrupt
+    /// polarity away from the current debounced sense so the next edge (an
+    /// unplug while connected, a plug while not) raises it again.
+    fn hpd_ack(&mut self, n: usize) -> Result<bool, Error> {
+        let control = self.hpd_at(n, HPD_INT_CONTROL);
+        let sense = self.read(self.hpd_at(n, HPD_INT_STATUS))? & HPD_SENSE_DELAYED != 0;
+        let value = self.read(control)?;
+        // The acknowledgement is a strobe, not state: no readback.
+        self.access(|io| {
+            io.write(control, value | HPD_INT_ACK);
+            Ok(())
+        })?;
+        self.update(
+            control,
+            HPD_INT_POLARITY,
+            if sense { 0 } else { HPD_INT_POLARITY },
+        )?;
+        Ok(sense)
+    }
+    /// Arm the HPD interrupt of a routed, enabled block (and the HPD-RX
+    /// short-pulse one for DP), as amdgpu_dm_hpd_init does through
+    /// dc_interrupt_set: a stale event is acknowledged and the polarity set
+    /// from the current sense first, so the first vector is a real change.
+    pub(in crate::amdgpu_dcn401_otg) fn enable_hpd_irq(
+        &mut self,
+        path: Path,
+        rx: bool,
+    ) -> Result<(), Error> {
+        self.hpd_sense(path)?;
+        let n = hpd_block(path)?;
+        self.hpd_ack(n)?;
+        let enable = HPD_INT_EN | if rx { HPD_RX_INT_EN } else { 0 };
+        if rx {
+            let control = self.hpd_at(n, HPD_INT_CONTROL);
+            let value = self.read(control)?;
+            self.access(|io| {
+                io.write(control, value | HPD_RX_INT_ACK);
+                Ok(())
+            })?;
+        }
+        self.update(self.hpd_at(n, HPD_INT_CONTROL), enable, enable)
+    }
+    /// Acknowledge whatever the block raised: a plug/unplug edge (re-arming
+    /// the opposite polarity) and/or a DP short pulse. Returns the debounced
+    /// sense after the acknowledgement.
+    pub(in crate::amdgpu_dcn401_otg) fn ack_hpd_irq(&mut self, path: Path) -> Result<bool, Error> {
+        let n = hpd_block(path)?;
+        let status = self.read(self.hpd_at(n, HPD_INT_STATUS))?;
+        if status & HPD_RX_INT_PENDING != 0 {
+            let control = self.hpd_at(n, HPD_INT_CONTROL);
+            let value = self.read(control)?;
+            self.access(|io| {
+                io.write(control, value | HPD_RX_INT_ACK);
+                Ok(())
+            })?;
+        }
+        if status & HPD_INT_PENDING != 0 {
+            return self.hpd_ack(n);
+        }
+        Ok(status & HPD_SENSE_DELAYED != 0)
     }
     /// Debounced hot-plug sense. Busy until `enable_hpd` routed the pin: a
     /// GPIO-owned or disabled block reports nothing about the sink.
@@ -134,6 +203,16 @@ impl Otg {
     /// Debounced hot-plug sense of a routed, enabled HPD block.
     pub fn hpd_sense(&mut self, path: Path) -> Result<bool, Error> {
         self.0.hpd_sense(path)
+    }
+    /// Arm the HPD (and for DP the HPD-RX) interrupt of a routed block.
+    /// # Safety
+    /// The interrupt service must be ready to receive and route DCN vectors.
+    pub unsafe fn enable_hpd_irq(&mut self, path: Path, rx: bool) -> Result<(), Error> {
+        self.0.enable_hpd_irq(path, rx)
+    }
+    /// Acknowledge a raised HPD/HPD-RX interrupt and re-arm the opposite edge.
+    pub fn ack_hpd_irq(&mut self, path: Path) -> Result<bool, Error> {
+        self.0.ack_hpd_irq(path)
     }
     /// Sink-reported status of this owner's live DP link.
     /// # Safety

@@ -630,8 +630,9 @@ The interrupt worker now counts MSI, empty-MSI, watchdog, watchdog-with-work
 and polled drains separately, the evidence a physical MSI test needs. DCN401
 hot-plug, flip, VUPDATE, vblank, VLINE and DMUB vectors are counted per
 instance for the display owner, and the native display monitor now waits on
-hot-plug vectors with its 1 s poll as fallback; DCN HPD interrupts are not
-armed or acknowledged yet, so behaviour is unchanged until they are.
+hot-plug vectors with its 1 s poll as fallback; it arms each lightable
+port's DCN HPD (and DP HPD-RX) interrupt and acknowledges raised ones like
+Linux's hpd0_ack.
 The retained SMU14 owner now reads PMFW telemetry (Linux's SMU14.0.2 metrics
 table: edge/hotspot/memory/VR temperatures, fan RPM/PWM, socket/board power,
 VDDGFX, current clocks, activity and throttler status), the running feature

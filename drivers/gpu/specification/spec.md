@@ -1038,9 +1038,15 @@ rate.
 a pass at least once a second. Between passes it waits in
 `amdgpu_navi48_dispatch::wait_hotplug`, which returns early on a DCN HPD or
 HPD-RX vector or lost IH vectors, never sooner than 50 ms after the previous
-pass. The display owner does not yet arm DC_HPD_INT_EN or acknowledge
-(DC_HPD_INT_ACK, as Linux's hpd0_ack does), so today the once-a-second poll
-still finds every change. Each pass is `monitor_display`: with a modeset running it calls
+pass. After enabling a port's HPD block the monitor arms its interrupt
+(`Otg::enable_hpd_irq`: a stale event acknowledged, DC_HPD_INT_POLARITY set
+away from the current debounced sense, DC_HPD_INT_EN, plus DC_HPD_RX_INT_EN
+for DP, as amdgpu_dm_hpd_init does). On an early wake it acknowledges every
+port's raised event (`ack_hpd_irq`: a plug/unplug edge as Linux's hpd0_ack,
+strobing DC_HPD_INT_ACK and re-arming the opposite polarity; a short pulse
+with DC_HPD_RX_INT_ACK) before the pass reads the sense. The arm/acknowledge
+register sequences are model-tested; delivery of DCN vectors through the IH
+is not proven on hardware, and the once-a-second poll stays the fallback. Each pass is `monitor_display`: with a modeset running it calls
 `check_modeset`. A lost link is retrained with the surface still published.
 On unplug the scanout is withdrawn (the console returns to the boot
 framebuffer) and the modeset is torn down. With no modeset, any routed port

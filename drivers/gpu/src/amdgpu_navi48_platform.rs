@@ -895,8 +895,9 @@ pub fn set_max_bpc(bpc: u8) {
 }
 
 /// Poll period of the native display monitor. DCN HPD/HPD-RX vectors (and
-/// lost IH vectors) wake it early through the interrupt dispatcher once HPD
-/// interrupts are armed; until then hot-plug and link loss are polled.
+/// lost IH vectors) wake it early through the interrupt dispatcher: the
+/// monitor arms each lightable port's HPD interrupt and acknowledges raised
+/// ones on wake; the period remains the fallback.
 const MONITOR_MS: u64 = 1000;
 
 /// What one native display monitor pass did.
@@ -1094,14 +1095,28 @@ pub unsafe fn spawn_display_monitor(modeset: crate::amdgpu_navi48_boot::Modeset)
                     });
                     if lightable {
                         // SAFETY: board-routed selectors; no GPIO user of HPD pins.
-                        let _ = unsafe { boot.enable_display_hpd(port) };
+                        if unsafe { boot.enable_display_hpd(port) }.is_ok() {
+                            // SAFETY: the interrupt worker routes DCN vectors to
+                            // the dispatcher this monitor waits on.
+                            let _ = unsafe { boot.enable_display_hpd_irq(port) };
+                        }
                     }
                 }
             }
         }
         let mut hotplug = None;
         loop {
-            crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, MONITOR_MS).await;
+            if crate::amdgpu_navi48_dispatch::wait_hotplug(&mut hotplug, MONITOR_MS).await {
+                // Acknowledge (and re-arm the opposite edge of) every port's
+                // raised HPD/HPD-RX before the pass reads the sense.
+                let mut owner = OWNER.lock().await;
+                if let Some(boot) = owner.as_mut() {
+                    let ports = boot.display_paths().map_or(0, <[_]>::len);
+                    for port in 0..ports {
+                        let _ = boot.ack_display_hpd(port);
+                    }
+                }
+            }
             // SAFETY: the spawner's obligations hold for the task's lifetime.
             match unsafe { monitor_display(&mut current, pipe) }.await {
                 Ok(MonitorStep::Running(_) | MonitorStep::Waiting | MonitorStep::Off) => {}

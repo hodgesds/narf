@@ -1800,6 +1800,20 @@ impl ColdBoot {
         // SAFETY: board-routed selector; the caller excludes GPIO users.
         unsafe { self.otg.as_mut().map_err(|e| *e)?.enable_hpd(path) }
     }
+    /// Arm the HPD interrupt of an enabled port (and HPD-RX for DP).
+    /// # Safety
+    /// The interrupt service must be ready to route DCN vectors.
+    pub unsafe fn enable_display_hpd_irq(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        let rx = path.connector == inventory::Connector::DisplayPort;
+        // SAFETY: the caller's routing obligation.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.enable_hpd_irq(path, rx) }
+    }
+    /// Acknowledge a raised HPD/HPD-RX interrupt of a port; its sense after.
+    pub fn ack_display_hpd(&mut self, port: usize) -> Result<bool, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        self.otg.as_mut().map_err(|e| *e)?.ack_hpd_irq(path)
+    }
     /// Debounced hot-plug sense of an enabled port.
     pub fn display_hpd(&mut self, port: usize) -> Result<bool, otg::Error> {
         let path = self.dp_phy_path(port)?;
