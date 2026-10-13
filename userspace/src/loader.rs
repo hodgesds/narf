@@ -470,6 +470,9 @@ unsafe fn load_image_into_at<S: crate::elf::ExecBytes + ?Sized>(
                                 // reproduced.
                                 zero_from: (seg.mem_size > seg.file_size)
                                     .then(|| seg.file_off.wrapping_add(seg.file_size)),
+                                // Exec provenance lives in the exec image table
+                                // (`/proc/<pid>/maps` consults it after owners).
+                                provenance: None,
                             },
                             || {
                                 // SAFETY: the VMA transaction and the owner

@@ -126,6 +126,12 @@ and an interpreter range keeps its own path. Fork copies this snapshot, a
 later exec replaces it atomically, and task exit removes it. This keeps VM
 ownership free of VFS names while allowing ELF consumers to group file VMAs
 and compute an image base from the offset-zero maps entry.
+`mmap(2)` of a file records the same identity on the mapping's file-owner row
+(`mapped_file::MappingProvenance`: `st_dev`, `st_ino`, and the fd's recorded
+open path), so it follows munmap/MAP_FIXED splits, mremap and fork exactly as
+the owner does; procfs consults owner rows before the exec image table. The
+eager private-file copy (`MAP_POPULATE`/`MAP_LOCKED` without `MAP_NONBLOCK`)
+registers no owner and still renders as unknown backing (`LINUX-GAP`).
 
 ELF `PT_LOAD` construction follows Linux's BSS split: file-image pages are
 materialized, the unused tail of the final file page is zero-filled, and every

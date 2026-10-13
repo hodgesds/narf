@@ -3390,7 +3390,14 @@ fn write_maps_line(s: &mut String, v: &ProcVma) {
         ),
     );
     if let Some(pathname) = &v.pathname {
-        let _ = core::fmt::Write::write_str(s, pathname);
+        // `seq_path(m, path, "\n")` (`mangle_path`): a newline in the path
+        // becomes the octal escape `\012`, so one VMA stays one line.
+        for (i, part) in pathname.split('\n').enumerate() {
+            if i != 0 {
+                s.push_str("\\012");
+            }
+            s.push_str(part);
+        }
     } else if !v.label.is_empty() {
         let _ = core::fmt::Write::write_str(s, v.label);
     }
@@ -3466,6 +3473,34 @@ fn smoke_maps_file_backing_preserves_identity_offset_and_pathname() -> TestResul
 kernel_test_in!(
     "filesystem/procfs",
     smoke_maps_file_backing_preserves_identity_offset_and_pathname
+);
+
+/// `show_map_vma` prints the path through `seq_path(m, path, "\n")`, whose
+/// `mangle_path` octal-escapes a newline: one VMA must stay one line.
+fn smoke_maps_pathname_newline_is_octal_escaped() -> TestResult {
+    let info = ProcTaskInfo {
+        vmas: alloc::vec![ProcVma {
+            start: 0x400000,
+            end: 0x401000,
+            readable: true,
+            device: (8 << 8) | 19,
+            inode: 42,
+            pathname: Some(String::from("/tmp/a\nb")),
+            ..ProcVma::default()
+        }],
+        ..sample_task_info()
+    };
+    if render_maps(&info)
+        == "0000000000400000-0000000000401000 r--p 00000000 08:13 42 /tmp/a\\012b\n"
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("a newline in a mapped file's path was not rendered as \\012")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_maps_pathname_newline_is_octal_escaped
 );
 
 /// One `/proc/<pid>/smaps` VMA block, and the `smaps_rollup` summary, share

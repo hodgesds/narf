@@ -3016,6 +3016,213 @@ kernel_test_in!(
     smoke_abi_proc2_maps_preserve_loader_image_provenance
 );
 
+const MAPS_FILE_DIR: &[u8] = b"/abi-mapsfile\0";
+const MAPS_FILE: &[u8] = b"/abi-mapsfile/libmaps.so\0";
+const MAPS_FILE_PATH: &str = "/abi-mapsfile/libmaps.so";
+
+/// The `MAJOR:MINOR` text `show_vma_header_prefix` prints for a Linux
+/// `st_dev` (`new_decode_dev`: twelve-bit major at bit 8, minor split around
+/// it), each half `%02x`.
+fn maps_dev_text(st_dev: u64) -> alloc::string::String {
+    let major = (st_dev >> 8) & 0x0fff;
+    let minor = (st_dev & 0xff) | ((st_dev >> 12) & !0xff);
+    alloc::format!("{:02x}:{:02x}", major, minor)
+}
+
+/// Inside the thread-group procfs fixture, create a four-page file on a
+/// scratch tmpfs, keep it open read-write, and hand `body` its fd plus the
+/// `(st_dev, st_ino)` `fstat` reports for that fd.
+fn with_maps_file(
+    body: impl FnOnce(&TgView, u64, u64, u64) -> Result<(), &'static str>,
+) -> TestResult {
+    const O_RDWR: u64 = 2;
+    const O_CREAT: u64 = 0o100;
+    const AT_FDCWD: u64 = -100i64 as u64;
+    with_thread_group(false, |v| {
+        let margs = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: MAPS_FILE_DIR.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("fixture: mounting the scratch tmpfs failed");
+        }
+        let result = (|| {
+            let fd = match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, MAPS_FILE.as_ptr() as u64, O_CREAT | O_RDWR, 0o644),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("fixture: creating the mapped file failed"),
+            };
+            let inner = (|| {
+                let page = [0x5au8; 4096];
+                for _ in 0..4 {
+                    if call(
+                        Syscall::Write.raw(),
+                        a2(fd, page.as_ptr() as u64, page.len() as u64),
+                    ) != Some(4096)
+                    {
+                        return Err("fixture: filling the mapped file failed");
+                    }
+                }
+                let mut sb = [0u8; 144];
+                if call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64)) != Some(0) {
+                    return Err("fixture: fstat of the mapped file failed");
+                }
+                let dev = u64::from_ne_bytes(sb[0..8].try_into().unwrap());
+                let ino = u64::from_ne_bytes(sb[8..16].try_into().unwrap());
+                if ino == 0 {
+                    return Err("fixture: the tmpfs file has no inode number");
+                }
+                body(v, fd, dev, ino)
+            })();
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            inner
+        })();
+        const MNT_DETACH: u64 = 1 << 1;
+        let _ = call(
+            Syscall::Umount2.raw(),
+            a1(MAPS_FILE_DIR.as_ptr() as u64, MNT_DETACH),
+        );
+        result
+    })
+}
+
+/// `mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, offset)` — the shape ld.so
+/// uses for a DSO's read-only segments.
+fn maps_map_private(fd: u64, len: u64, offset: u64) -> Result<u64, &'static str> {
+    match call(
+        Syscall::Mmap.raw(),
+        SyscallArgs {
+            arg0: 0,
+            arg1: len,
+            arg2: 1,
+            arg3: 0x02,
+            arg4: fd,
+            arg5: offset,
+        },
+    ) {
+        Some(addr) if addr > 0 => Ok(addr as u64),
+        _ => Err("MAP_PRIVATE mmap of the tmpfs file failed"),
+    }
+}
+
+/// An ordinary file `mmap` at a nonzero offset renders in `/proc/<pid>/maps`
+/// exactly as `show_map_vma` does: `vm_pgoff << PAGE_SHIFT`, the backing
+/// inode's `MAJOR:MINOR` and `i_ino` (both agreeing with `fstat` of the fd),
+/// and the file's path. Crashpad groups a DSO's VMAs by `(dev, ino)` and
+/// reads the ELF header at the offset-0 one; an anonymous-looking
+/// `00000000 00:00 0` DSO mapping is "Incorrect ELF magic number".
+fn smoke_abi_proc2_maps_file_mmap_reports_provenance() -> TestResult {
+    with_maps_file(|v, fd, dev, ino| {
+        let base = maps_map_private(fd, 0x3000, 0x1000)?;
+        let result = (|| {
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
+            let expected = alloc::format!(
+                "{:016x}-{:016x} r--p 00001000 {} {} {}\n",
+                base,
+                base + 0x3000,
+                maps_dev_text(dev),
+                ino,
+                MAPS_FILE_PATH,
+            );
+            if maps.contains(&expected) {
+                Ok(())
+            } else {
+                Err("/proc/self/maps lost a file mmap's offset, dev, inode or pathname")
+            }
+        })();
+        set_task(FAKE_TASK);
+        let _ = call(Syscall::Munmap.raw(), a1(base, 0x3000));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_file_mmap_reports_provenance
+);
+
+/// Punching the middle page out of a file mapping leaves two VMAs; Linux's
+/// `__split_vma` advances the tail's `vm_pgoff`, so each half reports the
+/// file offset of its own first byte, with the same dev/inode/pathname.
+fn smoke_abi_proc2_maps_file_mmap_split_keeps_offsets() -> TestResult {
+    with_maps_file(|v, fd, dev, ino| {
+        let base = maps_map_private(fd, 0x3000, 0x1000)?;
+        let result = (|| {
+            if call(Syscall::Munmap.raw(), a1(base + 0x1000, 0x1000)) != Some(0) {
+                return Err("munmap of the middle page failed");
+            }
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
+            let head = alloc::format!(
+                "{:016x}-{:016x} r--p 00001000 {} {} {}\n",
+                base,
+                base + 0x1000,
+                maps_dev_text(dev),
+                ino,
+                MAPS_FILE_PATH,
+            );
+            let tail = alloc::format!(
+                "{:016x}-{:016x} r--p 00003000 {} {} {}\n",
+                base + 0x2000,
+                base + 0x3000,
+                maps_dev_text(dev),
+                ino,
+                MAPS_FILE_PATH,
+            );
+            if !maps.contains(&head) {
+                return Err("the head of a split file mapping lost its provenance");
+            }
+            if !maps.contains(&tail) {
+                return Err("the tail of a split file mapping did not advance its offset");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        let _ = call(Syscall::Munmap.raw(), a1(base, 0x3000));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_file_mmap_split_keeps_offsets
+);
+
+/// Negative: a private anonymous mapping has no `vm_file`, so `show_map_vma`
+/// leaves offset, dev and inode zero and prints no pathname — even while a
+/// file mapping sits in the same mm.
+fn smoke_abi_proc2_maps_anonymous_mmap_has_no_provenance() -> TestResult {
+    with_maps_file(|v, fd, _dev, _ino| {
+        let base = maps_map_private(fd, 0x1000, 0)?;
+        let result = (|| {
+            set_task(TG_THREAD_TASK);
+            let maps = tg_read(&alloc::format!("{}/self/maps", v.base))?;
+            let anonymous = alloc::format!(
+                "{:016x}-{:016x} rw-p 00000000 00:00 0 \n",
+                v.region,
+                v.region + TG_REGION_LEN,
+            );
+            if !maps.contains(&anonymous) {
+                return Err("an anonymous mapping acquired a file offset, dev, inode or path");
+            }
+            if maps.matches(MAPS_FILE_PATH).count() != 1 {
+                return Err("the file's pathname was not rendered on exactly its own VMA");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        let _ = call(Syscall::Munmap.raw(), a1(base, 0x1000));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_maps_anonymous_mmap_has_no_provenance
+);
+
 /// `stat(path)` → `Ok(st_nlink)`. x86_64 `struct stat` has a 64-bit
 /// `st_nlink` third; the generic (aarch64) layout has a 32-bit one after
 /// `st_mode`.

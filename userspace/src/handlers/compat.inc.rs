@@ -7884,6 +7884,18 @@ pub fn proc_task_info(
     let mut vmas = alloc::vec::Vec::new();
     if query == TaskInfoQuery::Vmas {
         if let Some(as_arc) = as_arc {
+            // Per-mmap file identity, carried by the file-owner rows so it
+            // follows munmap splits, mremap and fork exactly as the mapping
+            // does. Consulted before the exec image table: an owner row is
+            // authoritative for its range, while the exec table is never
+            // retired by a later munmap.
+            let file_mappings = crate::mapped_file::file_provenance_snapshot(as_arc.identity());
+            // `d_path` renders relative to the READER's root
+            // (`current->fs->root`); a path outside it stays absolute.
+            // LINUX-GAP: `d_path` appends " (deleted)" once the dentry is
+            // unlinked; NARF keeps no dentry state here, so an unlinked
+            // mapped file still renders its original path.
+            let reader = current_task_id();
             let mut snapshot = as_arc.numa_regions_snapshot();
             // Fallible: this runs on the fatal-fault diagnostic path, where the
             // kernel heap may be exhausted. If the output can't be reserved, drop
@@ -7911,12 +7923,30 @@ pub fn proc_task_info(
                 } else {
                     ""
                 };
-                let (file_offset, device, inode, pathname) =
+                // `show_map_vma`: `pgoff = vm_pgoff << PAGE_SHIFT` of the VMA's
+                // own start, so a VMA split off an owner row (mprotect) reports
+                // the offset of its first byte.
+                let owned = file_mappings
+                    .iter()
+                    .find(|m| m.base <= base && base - m.base < m.len)
+                    .map(|m| {
+                        (
+                            m.file_offset.saturating_add(base - m.base),
+                            m.provenance.device,
+                            m.provenance.inode,
+                            m.provenance
+                                .pathname
+                                .as_deref()
+                                .map(|path| strip_chroot_prefix(reader, path)),
+                        )
+                    });
+                let (file_offset, device, inode, pathname) = owned.unwrap_or_else(|| {
                     proc_image_mapping_for_range(&image_mappings, base, end)
                         .map(|(file_offset, device, inode, pathname)| {
                             (file_offset, device, inode, Some(pathname))
                         })
-                        .unwrap_or((0, 0, 0, None));
+                        .unwrap_or((0, 0, 0, None))
+                });
                 vmas.push(ProcVma {
                     start: base,
                     end,

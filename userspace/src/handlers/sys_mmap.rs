@@ -443,6 +443,26 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
     }
 
+    // `fs/proc/task_mmu.c::show_map_vma` prints, for every VMA with a
+    // `vm_file`, the inode's `i_sb->s_dev` and `i_ino` and the file's path.
+    // Capture that identity here, outside every VMA/owner lock, and let the
+    // file-owner row carry it through splits, mremap and fork. Crashpad groups
+    // a DSO's VMAs by `(dev, ino)` and reads the ELF header at the offset-0
+    // one, so ld.so's mappings must not look anonymous.
+    //
+    // LINUX-GAP: the eager private-file copy (MAP_POPULATE / MAP_LOCKED
+    // without MAP_NONBLOCK) registers no file owner and therefore still
+    // renders as `00:00 0` with no path; Linux keeps `vm_file` there too.
+    // LINUX-GAP: an fd with no recorded open path (memfd, anon inodes) gets
+    // dev/inode but no pathname; Linux prints `/memfd:<name> (deleted)`.
+    let provenance = file.as_ref().map(|(ops, _)| {
+        Arc::new(crate::mapped_file::MappingProvenance {
+            device: ops.inode_attrs().dev,
+            inode: ops.ino(),
+            pathname: crate::mqueue::fd_path(current_task_id(), fd as u32),
+        })
+    });
+
     // `mm/mmap.c::do_mmap`:
     //
     // ```text
@@ -693,6 +713,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     private_copy: false,
                                     replace: destructive_fixed,
                                     zero_from: None,
+                                    provenance: provenance.clone(),
                                 },
                                 || {
                                     // SAFETY: VMA -> shared transactions are held;
@@ -805,6 +826,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     private_copy: false,
                                     replace: destructive_fixed,
                                     zero_from: None,
+                                    provenance: provenance.clone(),
                                 },
                                 || {
                                     // SAFETY: VMA -> shared transactions are held
@@ -1176,6 +1198,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         private_copy: false,
                         replace: destructive_fixed,
                         zero_from: None,
+                        provenance: provenance.clone(),
                     },
                     || {
                         // SAFETY: VMA -> shared transactions are held and the
@@ -1242,6 +1265,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         private_copy: true,
                         replace: destructive_fixed,
                         zero_from: None,
+                        provenance: provenance.clone(),
                     },
                     || {
                         // SAFETY: the VMA transaction and owner bucket remain

@@ -747,8 +747,12 @@ Every `/proc/<pid>/maps` and `smaps` header follows Linux's token grammar
 `start-end perms offset dev inode [pathname]`. Exec-published loader image
 VMAs retain their original file offset, `st_dev`/`st_ino`, and resolved
 pathname, so consumers such as Crashpad can group every segment of an ELF
-image and reconstruct its image base from the offset-zero segment. Unknown
-backing identity remains `00:00 0`, and the inode is always followed by
+image and reconstruct its image base from the offset-zero segment. A VMA
+created by `mmap(2)` of a file renders the file offset of the VMA's own first
+byte (`vm_pgoff << PAGE_SHIFT`, advanced across splits), the backing
+`st_dev` as `MAJOR:MINOR` and `st_ino`, and the fd's open path as the reader's
+root sees it; a newline in a pathname is escaped as `\012` (`seq_path`).
+Unknown backing identity remains `00:00 0`, and the inode is always followed by
 whitespace even for an anonymous mapping; Crashpad parses that field with a
 space delimiter.
 This per-task mountinfo projection is wired for every Linux-compat build,
