@@ -970,3 +970,89 @@ test!(alsa_cross_card_suspend_reset_and_xrun_group, {
     );
     assert_eq!(state(p.as_ref(), &m), 2);
 });
+
+/// An HDMI sink's controls the way Linux exposes them: the jack on the CARD
+/// interface, the ELD as volatile read-only bytes on the PCM interface.
+#[derive(Debug)]
+struct HdmiDevice;
+impl PcmDevice for HdmiDevice {
+    fn open(&self, _: bool, _: u32) -> Result<Box<dyn PcmHardware>, SoundError> {
+        Err(SoundError::NoSuchDevice)
+    }
+    fn controls(&self) -> Vec<ControlId> {
+        alloc::vec![
+            ControlId {
+                index: 0,
+                kind: ControlKind::HdmiJack,
+            },
+            ControlId {
+                index: 1,
+                kind: ControlKind::Eld,
+            },
+        ]
+    }
+    fn get_control(&self, id: ControlId) -> Result<ControlValue, SoundError> {
+        Ok(match id.kind {
+            ControlKind::HdmiJack => ControlValue::boolean(true),
+            _ => ControlValue::bytes(&[0x10, 0, 2, 0, 0, 0x10, 0, 1, 9, 7, 7, 0]),
+        })
+    }
+}
+test!(alsa_hdmi_jack_and_eld_controls, {
+    let card = crate::register_hardware_card(
+        crate::CardInfo {
+            index: 0,
+            driver: "alsa-test",
+            id: "HDMI",
+            name: "HDMI ABI test",
+            playback_count: 1,
+            capture_count: 0,
+        },
+        Arc::new(HdmiDevice),
+    );
+    let f = crate::devfs_bridge::SoundControlFile::new(card)
+        .open_instance_checked(true)
+        .unwrap()
+        .unwrap();
+    let m = Memory::new();
+    // Looked up by name and interface, as alsa-lib's hctl does.
+    let mut id = [0u8; 64];
+    put32(&mut id, 4, 3);
+    id[16..19].copy_from_slice(b"ELD");
+    let mut info = alloc::vec![0; 272];
+    info[..64].copy_from_slice(&id);
+    m.put(128, &info);
+    ctl(f.as_ref(), &m, 0x11, 272, 128).unwrap();
+    let bytes = m.bytes.lock()[128..400].to_vec();
+    assert_eq!(get32(&bytes, 0), 2); // numid
+    assert_eq!(get32(&bytes, 64), 4); // SNDRV_CTL_ELEM_TYPE_BYTES
+    assert_eq!(get32(&bytes, 68) & 7, 1 | 4); // READ | VOLATILE
+    assert_eq!(get32(&bytes, 72), 12); // the ELD's length
+    let mut value = alloc::vec![0; 1224];
+    value[..64].copy_from_slice(&id);
+    m.put(2048, &value);
+    ctl(f.as_ref(), &m, 0x12, 1224, 2048).unwrap();
+    assert_eq!(
+        m.bytes.lock()[2048 + 72..2048 + 84],
+        [0x10, 0, 2, 0, 0, 0x10, 0, 1, 9, 7, 7, 0]
+    );
+    assert_eq!(
+        ctl(f.as_ref(), &m, 0x13, 1224, 2048),
+        Err(FsError::OperationNotPermitted)
+    );
+    // The jack is a boolean on CARD; MIXER does not find it.
+    let mut id = [0u8; 64];
+    put32(&mut id, 4, 2);
+    let name = b"HDMI/DP,pcm=0 Jack";
+    id[16..16 + name.len()].copy_from_slice(name);
+    let mut info = alloc::vec![0; 272];
+    info[..64].copy_from_slice(&id);
+    m.put(128, &info);
+    assert_eq!(ctl(f.as_ref(), &m, 0x11, 272, 128), Err(FsError::NotFound));
+    put32(&mut info, 4, 1);
+    m.put(128, &info);
+    ctl(f.as_ref(), &m, 0x11, 272, 128).unwrap();
+    assert_eq!(get32(&m.bytes.lock(), 128 + 64), 1);
+    drop(f);
+    crate::unregister_hardware_card(card);
+});

@@ -125,6 +125,13 @@ the backend. An unowned unlock is EINVAL, another file's lock is EPERM, and a
 duplicate lock is EBUSY. Unknown controls return ENOENT. Native controls without
 TLV metadata return ENXIO for TLV requests.
 
+Native controls live on the interface Linux uses for them: HDMI/DP jacks
+(`HDMI/DP,pcm=N Jack`) on CARD, `ELD` on PCM as a read-only volatile BYTES
+element whose count is the current ELD length (at most 128 bytes), everything
+else on MIXER; name lookups match the interface. A backend reports values it
+changed on its own (jack sense, ELD) through `control_changed`; byte controls
+notify VALUE|INFO.
+
 ELEM_ADD/REPLACE/REMOVE support Boolean, integer, integer64, enumerated, bytes
 and IEC958 user controls, including multiple indexed elements and nested enum
 names. Controls persist until removed or the card is unregistered; closing an

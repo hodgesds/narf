@@ -38,7 +38,9 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static CLIENTS: IrqSafeSpinLock<Vec<Weak<Control>>> = IrqSafeSpinLock::new(Vec::new());
 static LOCKS: IrqSafeSpinLock<Vec<(u32, u32, u64, u32)>> = IrqSafeSpinLock::new(Vec::new());
 pub(crate) fn changed(card: u32, id: ControlId) {
-    notify(card, wire_id(id), 1);
+    // A byte control's size changes with its value: VALUE | INFO, as Linux
+    // update_eld notifies the ELD control.
+    notify(card, wire_id(id), if id.kind.is_bytes() { 3 } else { 1 });
 }
 fn notify(card: u32, id: [u8; 64], mask: u32) {
     let clients = {
@@ -69,7 +71,7 @@ fn notify(card: u32, id: [u8; 64], mask: u32) {
 fn wire_id(id: ControlId) -> [u8; 64] {
     let mut b = [0; 64];
     put32(&mut b, 0, id.index + 1);
-    put32(&mut b, 4, 2);
+    put32(&mut b, 4, id.kind.iface());
     string(&mut b, 16, 44, id.kind.name());
     b
 }
@@ -81,7 +83,7 @@ fn resolve(ids: &[ControlId], b: &[u8]) -> Result<ControlId, FsError> {
             if num != 0 {
                 num == id.index + 1
             } else {
-                get32(b, 4) == 2
+                get32(b, 4) == id.kind.iface()
                     && get32(b, 8) == 0
                     && get32(b, 12) == 0
                     && get32(b, 60) == 0
@@ -251,7 +253,15 @@ impl Control {
                         0x11 => {
                             let metadata = mx.control_info(id).map_err(sound_error)?;
                             b[64..].fill(0);
-                            put32(&mut b, 64, if metadata.is_boolean { 1 } else { 2 });
+                            // SNDRV_CTL_ELEM_TYPE_{BOOLEAN, INTEGER, BYTES}
+                            let ty = if id.kind.is_bytes() {
+                                4
+                            } else if metadata.is_boolean {
+                                1
+                            } else {
+                                2
+                            };
+                            put32(&mut b, 64, ty);
                             let lock = LOCKS
                                 .lock()
                                 .iter()
@@ -270,9 +280,11 @@ impl Control {
                             );
                             put32(&mut b, 76, lock.map_or(0, |(_, _, _, pid)| pid));
                             put32(&mut b, 72, metadata.channels as u32);
-                            put64(&mut b, 80, metadata.value_min as i64 as u64);
-                            put64(&mut b, 88, metadata.value_max as i64 as u64);
-                            put64(&mut b, 96, metadata.step as i64 as u64);
+                            if !id.kind.is_bytes() {
+                                put64(&mut b, 80, metadata.value_min as i64 as u64);
+                                put64(&mut b, 88, metadata.value_max as i64 as u64);
+                                put64(&mut b, 96, metadata.step as i64 as u64);
+                            }
                             ctx.write(arg, &b)?;
                         }
                         0x12 => {
@@ -282,6 +294,10 @@ impl Control {
                                 ControlValue::Integer { left, right } => {
                                     put64(&mut b, 72, left as i64 as u64);
                                     put64(&mut b, 80, right as i64 as u64);
+                                }
+                                ControlValue::Bytes { len, data } => {
+                                    let len = usize::from(len);
+                                    b[72..72 + len].copy_from_slice(&data[..len]);
                                 }
                             }
                             ctx.write(arg, &b)?;

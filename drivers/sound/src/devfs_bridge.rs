@@ -238,6 +238,13 @@ impl SoundControlFile {
                         if b { "on" } else { "off" }
                     ));
                 }
+                Ok(ControlValue::Bytes { len, data }) => {
+                    out.push_str(&format!("{} {} ", id.index, id.kind.name()));
+                    for byte in &data[..usize::from(len)] {
+                        out.push_str(&format!("{byte:02x}"));
+                    }
+                    out.push('\n');
+                }
                 Err(_) => {}
             }
         }

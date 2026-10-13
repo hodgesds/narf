@@ -13,13 +13,31 @@ pub trait PcmDevice: Send + Sync + core::fmt::Debug {
         if !self.controls().contains(&id) {
             return Err(SoundError::NoSuchControl);
         }
+        // A byte control's element count is its current length (Linux
+        // hdmi_eld_ctl_info reports the live ELD size).
+        let channels = if id.kind.is_bytes() {
+            match self.get_control(id)? {
+                crate::mixer::ControlValue::Bytes { len, .. } => len,
+                _ => 0,
+            }
+        } else if id.kind.is_boolean() {
+            1
+        } else {
+            2
+        };
         Ok(crate::mixer::ControlInfo {
             id,
             name: id.kind.name(),
             value_min: 0,
-            value_max: if id.kind.is_boolean() { 1 } else { 87 },
-            step: 1,
-            channels: if id.kind.is_boolean() { 1 } else { 2 },
+            value_max: if id.kind.is_bytes() {
+                0
+            } else if id.kind.is_boolean() {
+                1
+            } else {
+                87
+            },
+            step: if id.kind.is_bytes() { 0 } else { 1 },
+            channels,
             is_boolean: id.kind.is_boolean(),
             is_read_only: id.kind.is_read_only(),
         })

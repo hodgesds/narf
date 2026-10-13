@@ -50,6 +50,12 @@ pub enum ControlKind {
     CaptureVolume,
     /// Jack-Sense — read-only, 1 = plugged.
     JackSense,
+    /// HDMI/DP sink jack — read-only, 1 = a monitor with valid ELD is
+    /// attached (Linux `snd_jack_report(SND_JACK_AVOUT)`).
+    HdmiJack,
+    /// The sink's EDID-Like Data — read-only, volatile bytes on the PCM
+    /// interface (Linux `hdmi_create_eld_ctl`). Empty when no sink.
+    Eld,
 }
 
 impl ControlKind {
@@ -62,19 +68,49 @@ impl ControlKind {
             ControlKind::MicBoost => "Mic Boost",
             ControlKind::CaptureVolume => "Capture Volume",
             ControlKind::JackSense => "Headphone Jack",
+            // PCM device 0 is the only playback PCM a native card has.
+            ControlKind::HdmiJack => "HDMI/DP,pcm=0 Jack",
+            ControlKind::Eld => "ELD",
         }
     }
 
     /// True if the control is a boolean (mute or sense).
     pub const fn is_boolean(self) -> bool {
-        matches!(self, ControlKind::MasterMute | ControlKind::JackSense)
+        matches!(
+            self,
+            ControlKind::MasterMute | ControlKind::JackSense | ControlKind::HdmiJack
+        )
+    }
+
+    /// True if the control is a byte array.
+    pub const fn is_bytes(self) -> bool {
+        matches!(self, ControlKind::Eld)
     }
 
     /// True if the control is read-only.
     pub const fn is_read_only(self) -> bool {
-        matches!(self, ControlKind::JackSense)
+        matches!(
+            self,
+            ControlKind::JackSense | ControlKind::HdmiJack | ControlKind::Eld
+        )
+    }
+
+    /// The ALSA `snd_ctl_elem_iface_t` the control lives on. Linux creates
+    /// jack controls on CARD and ELD on PCM; PulseAudio and PipeWire look
+    /// them up there. The older headphone sense control stays on MIXER.
+    pub const fn iface(self) -> u32 {
+        match self {
+            ControlKind::HdmiJack => 1,
+            ControlKind::Eld => 3,
+            _ => 2,
+        }
     }
 }
+
+/// Largest byte control payload. ELD is at most 256 bytes in the HDA
+/// specification, but every producer narf has (the AMD codec's emulated
+/// ELD) stays under 84; 128 keeps the count within a `u8`.
+pub const BYTES_MAX: usize = 128;
 
 /// A current control value.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -83,9 +119,21 @@ pub enum ControlValue {
     Integer { left: i32, right: i32 },
     /// Boolean (mute / jack-sense).
     Boolean(bool),
+    /// Byte array (ELD); `len` bytes of `data` are meaningful.
+    Bytes { len: u8, data: [u8; BYTES_MAX] },
 }
 
 impl ControlValue {
+    /// `bytes` truncated to `BYTES_MAX`.
+    pub fn bytes(bytes: &[u8]) -> Self {
+        let len = bytes.len().min(BYTES_MAX);
+        let mut data = [0; BYTES_MAX];
+        data[..len].copy_from_slice(&bytes[..len]);
+        ControlValue::Bytes {
+            len: len as u8,
+            data,
+        }
+    }
     pub const fn integer(left: i32, right: i32) -> Self {
         ControlValue::Integer { left, right }
     }
@@ -169,6 +217,7 @@ impl Control {
                 self.value_packed.store(b as i32, Ordering::Release);
                 Ok(())
             }
+            ControlValue::Bytes { .. } => Err(MixerError::OutOfRange),
         }
     }
 }
@@ -201,6 +250,7 @@ pub fn register_standard_realtek(
                 ((left as u16 as u32) << 16) | (right as u16 as u32)
             }
             ControlValue::Boolean(b) => b as u32,
+            ControlValue::Bytes { .. } => 0,
         };
         controls.push(Control {
             info,

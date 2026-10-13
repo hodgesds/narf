@@ -558,6 +558,12 @@ impl Mixer {
     }
 }
 
+/// Tell control-device subscribers that a control a backend owns changed
+/// on its own (jack sense, ELD), not through `set_control_value`.
+pub fn control_changed(card: u32, id: ControlId) {
+    crate::alsa::control_changed(card, id);
+}
+
 /// Format helper re-export so callers don't have to import the
 /// `format` submodule directly for the common case.
 pub use crate::format::{ChannelCount, SampleRate};
