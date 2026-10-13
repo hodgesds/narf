@@ -1655,6 +1655,41 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Read one SCDC register of an HDMI port's sink over native DDC.
+    pub async fn display_scdc_read(&mut self, port: usize, offset: u8) -> Result<u8, ddc::Error> {
+        let channel = self.scdc_channel(port)?;
+        self.ddc
+            .as_mut()
+            .map_err(|_| ddc::Error::Unsupported)?
+            .scdc_read(channel, offset)
+            .await
+    }
+    /// Write one SCDC register of an HDMI port's sink over native DDC.
+    pub async fn display_scdc_write(
+        &mut self,
+        port: usize,
+        offset: u8,
+        value: u8,
+    ) -> Result<(), ddc::Error> {
+        let channel = self.scdc_channel(port)?;
+        self.ddc
+            .as_mut()
+            .map_err(|_| ddc::Error::Unsupported)?
+            .scdc_write(channel, offset, value)
+            .await
+    }
+    fn scdc_channel(&self, port: usize) -> Result<u8, ddc::Error> {
+        let path = self
+            .display_paths()
+            .map_err(|_| ddc::Error::Invalid)?
+            .get(port)
+            .copied()
+            .ok_or(ddc::Error::Invalid)?;
+        if path.connector != inventory::Connector::HdmiTypeA {
+            return Err(ddc::Error::Unsupported);
+        }
+        path.aux.ok_or(ddc::Error::Unsupported)
+    }
     /// Give a board connector's HPD pin to its HPD block and enable it.
     /// # Safety
     /// The board's HPD selector must name this connector's pin, and nothing

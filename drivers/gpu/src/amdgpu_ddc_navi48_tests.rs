@@ -12,6 +12,7 @@ struct Fake {
     regs: BTreeMap<u64, u32>,
     writes: Vec<(u64, u32)>,
     edid: Vec<u8>,
+    scdc: [u8; 256],
     fifo: Vec<u8>,
     cursor: usize,
     segment: usize,
@@ -104,6 +105,17 @@ impl Io for Fake {
                             self.segment = usize::from(*segment);
                             nack |= self.segment_nack && self.segment == 0;
                         }
+                        [0xa8, offset, 0xa9] if self.regs[&0x1eae] == 0x11100 => {
+                            assert_eq!(self.regs[&0x1eaf], 0x13101);
+                            assert_eq!(v & 0x00300000, 0x00100000);
+                            let byte = self.scdc[usize::from(*offset)];
+                            self.fifo.push(byte);
+                        }
+                        [0xa8, offset, value] => {
+                            assert_eq!(self.regs[&0x1eae], 0x23100);
+                            assert_eq!(v & 0x00300000, 0);
+                            self.scdc[usize::from(*offset)] = *value;
+                        }
                         [0xa0, offset, 0xa1] => {
                             assert_eq!(self.regs[&0x1eae], 0x11100);
                             assert_eq!(self.regs[&0x1eaf], 0x803101);
@@ -182,6 +194,7 @@ fn fixture(blocks: usize) -> Engine<Fake> {
             regs,
             writes: Vec::new(),
             edid,
+            scdc: [0; 256],
             fifo: Vec::new(),
             cursor: 0,
             segment: 7,
@@ -374,4 +387,37 @@ fn dcn4_ddc_cancellation_retains_arbitration_and_pins() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-ddc",
     dcn4_ddc_cancellation_retains_arbitration_and_pins
+);
+
+fn dcn4_ddc_scdc_reads_and_writes_single_registers_at_0x54() -> TestResult {
+    for channel in 0..4 {
+        let mut e = fixture(1);
+        e.io.scdc[1] = 1; // sink version
+        if run(e.scdc(channel, 1, None)) != Ok(1) || e.state != State::Ready {
+            return TestResult::Fail("SCDC read");
+        }
+        if run(e.scdc(channel, 0x20, Some(3))) != Ok(3) || e.io.scdc[0x20] != 3 {
+            return TestResult::Fail("SCDC write");
+        }
+        // Each access is its own claim: both released, pins restored.
+        if e.io.releases != 2 || e.saved.is_some() {
+            return TestResult::Fail("SCDC release");
+        }
+        // EDID reads are unchanged by the generalized transfer.
+        if run(e.edid(channel)).as_ref() != Ok(&e.io.edid) {
+            return TestResult::Fail("EDID after SCDC");
+        }
+    }
+    // A sink without SCDC NACKs: a local error, the owner stays usable.
+    let mut e = fixture(1);
+    e.io.nack = true;
+    if run(e.scdc(0, 0x21, None)) != Err(Error::Nack) || e.state != State::Ready {
+        return TestResult::Fail("SCDC NACK");
+    }
+    assert_eq!(run(e.scdc(4, 1, None)), Err(Error::Invalid));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-ddc",
+    dcn4_ddc_scdc_reads_and_writes_single_registers_at_0x54
 );

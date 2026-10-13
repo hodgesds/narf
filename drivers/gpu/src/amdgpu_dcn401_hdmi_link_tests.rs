@@ -350,10 +350,9 @@ fn dcn401_hdmi_link_refuses_unsupported_or_busy_requests_without_writes() -> Tes
             return TestResult::Fail("refusal wrote");
         }
     }
-    // Deep colour, a YCbCr 4:2:0 divider and modes beyond 340 MHz (which
-    // need SCDC scrambling) are refused before any write.
+    // Deep colour, a YCbCr 4:2:0 divider and sub-25 MHz modes are refused
+    // before any write.
     for (khz, depth, divider) in [
-        (594_000, ColorDepth::Bpc8, dccg::TmdsDivider::By4),
         (148_500, ColorDepth::Bpc10, dccg::TmdsDivider::By4),
         (148_500, ColorDepth::Bpc8, dccg::TmdsDivider::By2),
         (20_000, ColorDepth::Bpc8, dccg::TmdsDivider::By4),
@@ -496,4 +495,32 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum
+);
+
+fn dcn401_hdmi_link_scrambles_above_340_mhz_and_stops_unscrambled() -> TestResult {
+    for (khz, bits) in [(340_000, 0), (340_001, 6), (594_000, 6)] {
+        let (mut e, mut fw, c) =
+            fixture_with(0, 2, 1, khz, ColorDepth::Bpc8, dccg::TmdsDivider::By4);
+        let ready = run(e.prepare_hdmi_link(&mut fw, path(0), link(2, 1), c)).unwrap();
+        let control = e.io.inner.regs[&dio(2, 0x209e)];
+        if ready.scrambled != (bits != 0) || control & 0x0100001f != 0x19 | bits {
+            return TestResult::Fail("scrambler and clock-channel rate");
+        }
+        // The PHY PLL and transmitter take the full pixel rate; firmware
+        // applies the 1/4 clock channel, as for Linux's callers.
+        if fw.commands[0].0 != Command::Clock(path(0), 1, khz)
+            || fw.commands[2].0 != Command::Enable(path(0), khz)
+        {
+            return TestResult::Fail("scrambled clocks");
+        }
+        run(e.stop_hdmi_link(&mut fw, path(0))).unwrap();
+        if e.io.inner.regs[&dio(2, 0x209e)] & 0x0100001f != 0x11 {
+            return TestResult::Fail("scrambler left on");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_link_scrambles_above_340_mhz_and_stops_unscrambled
 );

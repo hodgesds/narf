@@ -826,8 +826,19 @@ accepts (from the 128-byte base block; extension blocks follow it), and links
 it at the sink's maximum lanes and rate. A sink that cannot carry the mode's
 8-bpc payload is skipped (`ModesetError::Link` if nothing else fits). With no
 such DP sink, the first HDMI port whose EDID carries the HDMI Licensing VSDB
-(`hdmi_sink`; a DVI sink never receives HDMI packets) and whose preferred mode
-is at most `TMDS_MAX_KHZ` is selected (`Selection::hdmi`, zero lanes): its pipe
+(`hdmi_caps`; a DVI sink never receives HDMI packets) and whose preferred mode
+`hdmi_fits` is selected (`Selection::hdmi`, zero lanes). `hdmi_caps` reads, as
+DRM does, the VSDB Max_TMDS_Clock and the HF-VSDB or HF-SCDB (extended tag
+0x79) Max_TMDS_Character_Rate and SCDC_Present, honouring DRM's minimum block
+lengths. A mode fits at or below 340 MHz within any declared VSDB maximum, and
+above it (to `TMDS_MAX_KHZ`, 600 MHz) only with SCDC and an HF rate covering
+it. Before the link starts an SCDC sink is configured as Linux's
+`write_scdc_data` does: sink version read, source version 1 written when the
+sink reports 1, then TMDS_Config 3 (scrambling, 1/40 clock) above 340 MHz or 0.
+A scrambled mode's SCDC failure fails the modeset (`ModesetError::Scdc`); the
+legacy write's result is ignored, as in Linux. A normal stop writes
+TMDS_Config 0 after the video stops and before the link stops; an unplug does
+not address the departed sink. Its pipe
 clock is the TMDS divide-by-four rate and its timing `Signal::Tmds`, and the
 link starts with `prepare_hdmi_link` (stream = pipe), `start_hdmi_video` and
 scanout. HDMI has no link status: `check_modeset` reports HPD and scanout
@@ -1257,7 +1268,12 @@ update, generic packet 0 sent every frame on line 2); then the BE←FE route,
 frontend mode 3, clock and enable, stream mapper, one pixel per cycle and the
 native FIFO reset (a RESET_DONE handshake only while the frontend symclk runs,
 else a 10 us settle); finally DMUB transmitter `ENABLE` (HDMI mode, four lanes,
-symclk in 10 kHz). Success needs all four lanes ready, TX clocks on, backend
+symclk in 10 kHz). Above `TMDS_SCRAMBLE_KHZ` (340 MHz) HDMI_CONTROL also sets the data scrambler
+and the 1/4-rate clock channel (`HdmiLinkReady::scrambled`); the PHY PLL and
+transmitter still take the full pixel rate. Linux's encoder switches at
+`>= 340 MHz` while its SCDC write switches at `> 340 MHz`; both use `>` here so
+source and sink never disagree. Success needs all four lanes ready, TX clocks
+on, backend
 SYMCLK on and frontend DISPCLK/SYMCLK on: `HdmiLinkReady(transmitter)`. Every
 write first re-verifies the owned registers, routes and consumers. The AVI
 frame carries Linux's fields for RGB (active format valid, both bars, underscan,

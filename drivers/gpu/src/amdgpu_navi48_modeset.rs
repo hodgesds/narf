@@ -19,6 +19,8 @@ pub enum ModesetError {
     /// The preferred mode cannot be carried by the sink's maximum link.
     Link,
     Boot(Error),
+    /// The sink's SCDC could not be configured for a scrambled mode.
+    Scdc(crate::amdgpu_ddc_navi48::Error),
     Clocks(clocks::Error),
     PipeClocks(dccg::Error),
     Display(otg::Error),
@@ -42,6 +44,8 @@ pub struct Selection {
     pub edid: [u8; 128],
     /// A TMDS HDMI sink rather than DP SST.
     pub hdmi: bool,
+    /// The HDMI sink declared SCDC (HF-VSDB/HF-SCDB SCDC_Present).
+    pub scdc: bool,
 }
 
 /// The result of a successful modeset, retained by the caller for teardown.
@@ -76,15 +80,74 @@ pub fn link_fits(timing: &Timing, lanes: u8, rate: LinkRate) -> bool {
     u64::from(timing.pixel_clock_khz) * 3 * 8 <= rate as u64 * 27_000 * 8 * u64::from(lanes)
 }
 
-/// An HDMI sink, not DVI: some CTA-861 extension carries the HDMI Licensing
-/// VSDB. HDMI data islands (GC and AVI packets) must not reach a DVI sink.
-pub fn hdmi_sink(edid: &[u8]) -> bool {
-    edid.chunks_exact(128).skip(1).any(|block| {
-        narf_edid::cta861::CtaExtension::parse(block)
-            .ok()
-            .and_then(|c| c.hdmi_vsdb())
-            .is_some()
-    })
+/// HDMI 2.0 SCDC registers (Linux dc_hdmi_types.h).
+pub mod scdc {
+    pub const SINK_VERSION: u8 = 0x01;
+    pub const SOURCE_VERSION: u8 = 0x02;
+    pub const TMDS_CONFIG: u8 = 0x20;
+}
+
+/// What an HDMI sink's EDID declares, as DRM's HDMI VSDB and HF-VSDB/HF-SCDB
+/// parsers read it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HdmiCaps {
+    /// HDMI Licensing VSDB present: an HDMI sink, not DVI. HDMI data islands
+    /// (GC and AVI packets) must not reach a DVI sink.
+    pub hdmi: bool,
+    /// VSDB Max_TMDS_Clock in kHz, zero when not declared.
+    pub vsdb_max_khz: u32,
+    /// HF Max_TMDS_Character_Rate in kHz, zero when not declared.
+    pub forum_max_khz: u32,
+    /// HF SCDC_Present.
+    pub scdc: bool,
+}
+pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
+    use narf_edid::cta861::{CtaExtension, DataBlock};
+    let mut caps = HdmiCaps::default();
+    for block in edid.chunks_exact(128).skip(1) {
+        let Ok(cta) = CtaExtension::parse(block) else {
+            continue;
+        };
+        for db in &cta.data_blocks {
+            // HF fields from the version byte on: HF-VSDB after its OUI,
+            // HF-SCDB (extended tag 0x79) after two reserved bytes.
+            let forum = match db {
+                // DRM's minimum lengths: VSDB 5, HF-VSDB 7, HF-SCDB 7 with its tag.
+                DataBlock::Vendor(v) if v.is_hdmi_licensing() && v.payload.len() >= 5 => {
+                    caps.hdmi = true;
+                    if let Some(&rate) = v.payload.get(6) {
+                        caps.vsdb_max_khz = u32::from(rate) * 5000;
+                    }
+                    None
+                }
+                DataBlock::Vendor(v) if v.is_hdmi_forum() && v.payload.len() >= 7 => {
+                    v.payload.get(3..)
+                }
+                DataBlock::Extended {
+                    ext_tag: 0x79,
+                    payload,
+                } if payload.len() >= 6 => payload.get(2..),
+                _ => None,
+            };
+            if let Some(&[_version, rate, flags, ..]) = forum {
+                caps.forum_max_khz = u32::from(rate) * 5000;
+                caps.scdc = flags & 0x80 != 0;
+            }
+        }
+    }
+    caps
+}
+/// Whether an HDMI sink can take `khz` as 8-bpc RGB TMDS: within a declared
+/// VSDB Max_TMDS_Clock, and above 340 MHz only with SCDC and an HF rate that
+/// covers it (DRM's scrambling-support rule).
+pub fn hdmi_fits(caps: HdmiCaps, khz: u32) -> bool {
+    if khz > otg::TMDS_MAX_KHZ {
+        return false;
+    }
+    if khz <= otg::TMDS_SCRAMBLE_KHZ {
+        return caps.vsdb_max_khz == 0 || khz <= caps.vsdb_max_khz;
+    }
+    caps.scdc && khz <= caps.forum_max_khz
 }
 
 /// The base block's preferred mode. Extension blocks follow the base block in
@@ -132,6 +195,7 @@ pub fn select(
             rate,
             edid,
             hdmi: false,
+            scdc: false,
         });
     }
     for port in ports {
@@ -139,7 +203,8 @@ pub fn select(
             continue;
         }
         let Ok(sink) = &port.sink else { continue };
-        if !hdmi_sink(&sink.edid) {
+        let caps = hdmi_caps(&sink.edid);
+        if !caps.hdmi {
             continue;
         }
         let Some(timing) = preferred(&sink.edid) else {
@@ -151,7 +216,7 @@ pub fn select(
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        if timing.pixel_clock_khz > otg::TMDS_MAX_KHZ {
+        if !hdmi_fits(caps, timing.pixel_clock_khz) {
             link_short = true;
             continue;
         }
@@ -162,6 +227,7 @@ pub fn select(
             rate: LinkRate::Rbr,
             edid,
             hdmi: true,
+            scdc: caps.scdc,
         });
     }
     Err(if link_short {
@@ -428,6 +494,7 @@ impl ColdBoot {
         unsafe {
             let port = selection.port;
             if selection.hdmi {
+                self.configure_scdc(&selection).await?;
                 let request = otg::HdmiLinkRequest { stream: pipe, pipe };
                 self.prepare_display_hdmi_link(port, request).await?;
                 self.start_display_hdmi_video(port).await?;
@@ -524,8 +591,8 @@ impl ColdBoot {
         unsafe {
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {
-                // TMDS addresses no sink: the ordinary stop applies.
-                self.stop_hdmi(port).await?;
+                // The departed sink's SCDC is not addressed.
+                self.stop_hdmi(port, false).await?;
             } else {
                 self.stop_display_dp_video(port).await?;
                 self.stop_display_dp_frontend(port).await?;
@@ -546,7 +613,7 @@ impl ColdBoot {
         unsafe {
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {
-                self.stop_hdmi(port).await?;
+                self.stop_hdmi(port, m.selection.scdc).await?;
             } else {
                 self.stop_display_dp_video(port).await?;
                 self.stop_display_dp_frontend(port).await?;
@@ -557,13 +624,42 @@ impl ColdBoot {
         }
         Ok(())
     }
-    /// Mute and stop HDMI video, then the transmitter and frontend.
+    /// Linux's write_scdc_data before the TMDS link starts: with SCDC, read
+    /// the sink version, answer version 1 with source version 1, then set
+    /// TMDS_Config to scrambling plus the 1/40 clock ratio above 340 MHz, or
+    /// to legacy HDMI. A scrambled mode the sink was not told about cannot
+    /// display, so its SCDC failures fail the modeset; Linux ignores the
+    /// legacy write's result, and so does this.
+    async fn configure_scdc(&mut self, s: &Selection) -> Result<(), ModesetError> {
+        use scdc::*;
+        if !s.scdc {
+            return Ok(());
+        }
+        let scrambled = s.timing.pixel_clock_khz > otg::TMDS_SCRAMBLE_KHZ;
+        let result = async {
+            if self.display_scdc_read(s.port, SINK_VERSION).await? == 1 {
+                self.display_scdc_write(s.port, SOURCE_VERSION, 1).await?;
+            }
+            let config = if scrambled { 3 } else { 0 };
+            self.display_scdc_write(s.port, TMDS_CONFIG, config).await
+        }
+        .await;
+        match result {
+            Err(e) if scrambled => Err(ModesetError::Scdc(e)),
+            _ => Ok(()),
+        }
+    }
+    /// Mute and stop HDMI video, tell an SCDC sink it returns to legacy HDMI
+    /// (Linux's link_set_dpms_off), then stop the transmitter and frontend.
     /// # Safety
     /// As for `stop_modeset`, with scanout stopped.
-    async unsafe fn stop_hdmi(&mut self, port: usize) -> Result<(), ModesetError> {
+    async unsafe fn stop_hdmi(&mut self, port: usize, scdc: bool) -> Result<(), ModesetError> {
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             self.stop_display_hdmi_video(port).await?;
+            if scdc {
+                let _ = self.display_scdc_write(port, scdc::TMDS_CONFIG, 0).await;
+            }
             self.stop_display_hdmi_link(port).await?;
         }
         Ok(())

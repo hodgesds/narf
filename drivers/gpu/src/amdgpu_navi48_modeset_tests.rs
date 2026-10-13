@@ -190,9 +190,9 @@ fn edid_2160p() -> Vec<u8> {
 
 fn navi48_modeset_selects_hdmi_sinks_only_without_dp_and_below_340_mhz() -> TestResult {
     use inventory::Connector::{DisplayPort as Dp, HdmiTypeA as Hdmi};
-    if !hdmi_sink(&with_cta(edid_1080p(), true))
-        || hdmi_sink(&with_cta(edid_1080p(), false))
-        || hdmi_sink(&edid_1080p())
+    if !hdmi_caps_hdmi(&with_cta(edid_1080p(), true))
+        || hdmi_caps_hdmi(&with_cta(edid_1080p(), false))
+        || hdmi_caps_hdmi(&edid_1080p())
     {
         return TestResult::Fail("HDMI VSDB detection");
     }
@@ -230,3 +230,90 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_selects_hdmi_sinks_only_without_dp_and_below_340_mhz
 );
+
+/// `base` with one CTA extension holding the given data blocks (each with its
+/// header byte).
+fn with_blocks(mut base: Vec<u8>, blocks: &[&[u8]]) -> Vec<u8> {
+    base[126] = 1;
+    base[127] = 0;
+    base[127] = narf_edid::compute_checksum(&base);
+    let mut ext = alloc::vec![0u8; 128];
+    (ext[0], ext[1]) = (0x02, 3);
+    let mut at = 4;
+    for b in blocks {
+        ext[at..at + b.len()].copy_from_slice(b);
+        at += b.len();
+    }
+    ext[2] = at as u8;
+    let sum = ext[..127].iter().fold(0u8, |s, b| s.wrapping_add(*b));
+    ext[127] = 0u8.wrapping_sub(sum);
+    base.extend_from_slice(&ext);
+    base
+}
+const VSDB: &[u8] = &[3 << 5 | 5, 0x03, 0x0c, 0x00, 0x10, 0x00];
+/// HDMI VSDB declaring Max_TMDS_Clock 225 MHz (45 * 5).
+const VSDB_225: &[u8] = &[3 << 5 | 7, 0x03, 0x0c, 0x00, 0x10, 0x00, 0, 45];
+/// HF-VSDB: version 1, 600 MHz, SCDC_Present.
+const HF_VSDB: &[u8] = &[3 << 5 | 7, 0xd8, 0x5d, 0xc4, 1, 120, 0x80, 0];
+/// HF-SCDB (extended tag 0x79): reserved x2, version 1, 600 MHz, SCDC_Present.
+const HF_SCDB: &[u8] = &[7 << 5 | 7, 0x79, 0, 0, 1, 120, 0x80, 0];
+
+fn navi48_modeset_reads_hdmi_caps_and_admits_scrambled_modes_only_with_scdc() -> TestResult {
+    let caps = |blocks: &[&[u8]]| hdmi_caps(&with_blocks(edid_1080p(), blocks));
+    let full = HdmiCaps {
+        hdmi: true,
+        vsdb_max_khz: 0,
+        forum_max_khz: 600_000,
+        scdc: true,
+    };
+    if caps(&[VSDB, HF_VSDB]) != full
+        || caps(&[VSDB, HF_SCDB]) != full
+        || caps(&[VSDB_225]).vsdb_max_khz != 225_000
+        || caps(&[HF_VSDB]).hdmi
+        // DRM ignores truncated HF blocks.
+        || caps(&[VSDB, &[3 << 5 | 6, 0xd8, 0x5d, 0xc4, 1, 120, 0x80]]).scdc
+        || caps(&[VSDB, &[7 << 5 | 6, 0x79, 0, 0, 1, 120, 0x80]]).scdc
+    {
+        return TestResult::Fail("caps parse");
+    }
+    for (c, khz, fits) in [
+        (full, 340_000, true),
+        (full, 594_000, true),
+        (full, 600_001, false),
+        (caps(&[VSDB]), 594_000, false), // no SCDC: never scrambled
+        (caps(&[VSDB_225]), 148_500, true),
+        (caps(&[VSDB_225]), 240_000, false),
+        (
+            HdmiCaps {
+                forum_max_khz: 340_000,
+                ..full
+            },
+            594_000,
+            false,
+        ),
+    ] {
+        if hdmi_fits(c, khz) != fits {
+            return TestResult::Fail("fits rule");
+        }
+    }
+    use inventory::Connector::HdmiTypeA as Hdmi;
+    let paths = [path(Hdmi, 0)];
+    let ports = [port(
+        paths[0],
+        None,
+        with_blocks(edid_2160p(), &[VSDB, HF_VSDB]),
+    )];
+    match select(&paths, &ports) {
+        Ok(s) if s.hdmi && s.scdc && s.timing.pixel_clock_khz == 594_000 => {}
+        _ => return TestResult::Fail("4K60 HDMI 2.0 selection"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_reads_hdmi_caps_and_admits_scrambled_modes_only_with_scdc
+);
+
+fn hdmi_caps_hdmi(edid: &[u8]) -> bool {
+    hdmi_caps(edid).hdmi
+}

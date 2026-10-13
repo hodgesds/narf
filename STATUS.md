@@ -488,8 +488,11 @@ VIC 0) is sent as VPG generic packet 0. Modeset now lights an HDMI sink (HDMI
 VSDB required, at most 340 MHz) when no DP sink answers, with HPD polling,
 unplug teardown, replug and an HDMI-A KMS connector. Sink selection also parsed
 the whole multi-block EDID as one base block, so a monitor with any extension
-(nearly all) was never selected; it now parses the base block. Not yet: SCDC scrambling above 340 MHz, deep colour and audio. None of it
-has run on hardware.
+(nearly all) was never selected; it now parses the base block. HDMI 2.0
+modes above 340 MHz (e.g. 4K60) now run scrambled when the EDID declares SCDC
+and a covering HF rate: native DDC gained SCDC register reads/writes, the sink
+is configured before the link starts and returned to legacy on stop. Not yet:
+deep colour, YCbCr/4:2:0 and audio. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and
 requires all three stream clocks off. Native DME4, immediate packets, audio/ACR,

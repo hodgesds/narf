@@ -113,6 +113,15 @@ fn prescale(div: u32, crystal_khz: u32) -> Result<u32, Error> {
     }
     Ok((value << 16) | 0x202)
 }
+/// E-DDC EDID and HDMI SCDC 7-bit addresses.
+const EDID: u8 = 0x50;
+pub const SCDC: u8 = 0x54;
+#[derive(Clone, Copy, Debug)]
+enum Op2 {
+    Segment(u8),
+    Read(u8),
+    Write(u8, u8),
+}
 #[derive(Clone, Copy, Debug)]
 struct Saved {
     index: u64,
@@ -223,12 +232,11 @@ impl<I: Io> Engine<I> {
         self.state = State::Reading;
         Ok(())
     }
-    async fn transfer(
-        &mut self,
-        channel: u8,
-        segment: Option<u8>,
-        block: &mut [u8],
-    ) -> Result<(), Error> {
+    /// One DDC operation on the claimed channel. `Segment` writes the E-DDC
+    /// segment pointer; `Read` writes `block[0]` as the offset to 7-bit
+    /// `address` then reads `block.len()` bytes into `block` (repeated START);
+    /// `Write` sends the offset and one data byte in a single transaction.
+    async fn transfer(&mut self, channel: u8, op: Op2, block: &mut [u8]) -> Result<(), Error> {
         let l = self.layout;
         self.access(|io| {
             if read(io, l.at(0x1e99))? & 12 != 4 || read(io, l.at(0x1e9b))? & 3 != 0 {
@@ -238,18 +246,29 @@ impl<I: Io> Engine<I> {
             if read(io, l.at(0x1e9b))? & 0xf1f7 != 0 {
                 return Err(Error::Protocol);
             }
-            let count = if let Some(segment) = segment {
-                io.write(l.at(0x1eae), 0x00013100); // one byte, START+STOP
-                io.write(l.at(0x1eb2), 0x80006000); // segment address 0x30 write
-                io.write(l.at(0x1eb2), u32::from(segment) << 8);
-                0
-            } else {
-                io.write(l.at(0x1eae), 0x00011100); // offset write, repeated START
-                io.write(l.at(0x1eaf), 0x00803101); // 128 bytes read + STOP
-                io.write(l.at(0x1eb2), 0x8000a000);
-                io.write(l.at(0x1eb2), u32::from(block[0]) << 8);
-                io.write(l.at(0x1eb2), 0x0000a100);
-                1
+            let count = match op {
+                Op2::Segment(segment) => {
+                    io.write(l.at(0x1eae), 0x00013100); // one byte, START+STOP
+                    io.write(l.at(0x1eb2), 0x80006000); // segment address 0x30 write
+                    io.write(l.at(0x1eb2), u32::from(segment) << 8);
+                    0
+                }
+                Op2::Read(address) => {
+                    let len = u32::try_from(block.len()).map_err(|_| Error::Invalid)?;
+                    io.write(l.at(0x1eae), 0x00011100); // offset write, repeated START
+                    io.write(l.at(0x1eaf), len << 16 | 0x3101); // read + STOP
+                    io.write(l.at(0x1eb2), 0x80000000 | u32::from(address) << 9);
+                    io.write(l.at(0x1eb2), u32::from(block[0]) << 8);
+                    io.write(l.at(0x1eb2), (u32::from(address) << 1 | 1) << 8);
+                    1
+                }
+                Op2::Write(address, value) => {
+                    io.write(l.at(0x1eae), 0x00023100); // offset + data, START+STOP
+                    io.write(l.at(0x1eb2), 0x80000000 | u32::from(address) << 9);
+                    io.write(l.at(0x1eb2), u32::from(block[0]) << 8);
+                    io.write(l.at(0x1eb2), u32::from(value) << 8);
+                    0
+                }
             };
             command(
                 io,
@@ -285,7 +304,7 @@ impl<I: Io> Engine<I> {
             }
             self.io.delay(100).await;
         }
-        if segment.is_none() {
+        if matches!(op, Op2::Read(_)) {
             self.access(|io| {
                 // Three address/write bytes precede the read result in SRAM.
                 io.write(l.at(0x1eb2), 0x80030001);
@@ -324,6 +343,45 @@ impl<I: Io> Engine<I> {
         self.saved = None;
         Ok(())
     }
+    /// One SCDC register read (`write` None) or write, in its own claim with
+    /// the same release rule as EDID reads: only known-terminal bus results
+    /// restore the pins and release arbitration.
+    async fn scdc(&mut self, channel: u8, offset: u8, write: Option<u8>) -> Result<u8, Error> {
+        if self.state != State::Ready {
+            return Err(Error::Busy);
+        }
+        if channel >= 4 {
+            return Err(Error::Invalid);
+        }
+        self.state = State::Acquiring;
+        let result: Result<u8, Error> = async {
+            self.acquire(channel).await?;
+            let mut byte = [offset];
+            match write {
+                Some(value) => {
+                    self.transfer(channel, Op2::Write(SCDC, value), &mut byte)
+                        .await?;
+                    Ok(value)
+                }
+                None => {
+                    self.transfer(channel, Op2::Read(SCDC), &mut byte).await?;
+                    Ok(byte[0])
+                }
+            }
+        }
+        .await;
+        let result = if !result.as_ref().is_err_and(|e| !e.local()) {
+            self.release().await.and(result)
+        } else {
+            result
+        };
+        self.state = match &result {
+            Ok(_) => State::Ready,
+            Err(e) if e.local() => State::Ready,
+            Err(e) => State::Failed(*e),
+        };
+        result
+    }
     async fn edid(&mut self, channel: u8) -> Result<Vec<u8>, Error> {
         if self.state != State::Ready {
             return Err(Error::Busy);
@@ -340,7 +398,7 @@ impl<I: Io> Engine<I> {
             self.acquire(channel).await?;
             // Old EDID-only sinks can NACK segment zero; any nonzero segment
             // must be accepted or the advertised extension is unreadable.
-            match self.transfer(channel, Some(0), &mut []).await {
+            match self.transfer(channel, Op2::Segment(0), &mut []).await {
                 Ok(()) | Err(Error::Nack) => {}
                 Err(e) => return Err(e),
             }
@@ -348,12 +406,12 @@ impl<I: Io> Engine<I> {
             let mut index = 0;
             while index < blocks {
                 if index >= 2 && index % 2 == 0 {
-                    self.transfer(channel, Some((index / 2) as u8), &mut [])
+                    self.transfer(channel, Op2::Segment((index / 2) as u8), &mut [])
                         .await?;
                 }
                 let mut block = [0; 128];
                 block[0] = ((index % 2) * 128) as u8;
-                self.transfer(channel, None, &mut block).await?;
+                self.transfer(channel, Op2::Read(EDID), &mut block).await?;
                 if index == 0 {
                     narf_edid::Block::parse(&block).map_err(|_| Error::InvalidEdid)?;
                     blocks = usize::from(block[126]) + 1;
@@ -414,6 +472,15 @@ impl Ddc {
     /// I2C SRAM and the selected channel clock remain awake for later accesses.
     pub async fn edid(&mut self, channel: u8) -> Result<Vec<u8>, Error> {
         self.0.edid(channel).await
+    }
+    /// Read one HDMI SCDC register (I2C 0x54) on a board-resolved channel.
+    /// A sink without SCDC NACKs: a local error that leaves the owner Ready.
+    pub async fn scdc_read(&mut self, channel: u8, offset: u8) -> Result<u8, Error> {
+        self.0.scdc(channel, offset, None).await
+    }
+    /// Write one HDMI SCDC register (I2C 0x54).
+    pub async fn scdc_write(&mut self, channel: u8, offset: u8, value: u8) -> Result<(), Error> {
+        self.0.scdc(channel, offset, Some(value)).await.map(|_| ())
     }
 }
 #[cfg(feature = "kernel-test")]

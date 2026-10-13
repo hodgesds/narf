@@ -1,5 +1,6 @@
 //! Native DCN401 TMDS HDMI link bring-up and teardown for one 8-bpc RGB
-//! stream up to 340 MHz (no scrambling, SCDC or deep colour). Linux order:
+//! stream up to 600 MHz, scrambled with a 1/4-rate clock channel above
+//! 340 MHz (the sink's SCDC is the caller's; no deep colour). Linux order:
 //! dcn401_program_pix_clk (SET_PIXEL_CLOCK, deep-colour resync),
 //! link_set_dpms_on_pre_enable_link (dcn401_link_encoder_setup,
 //! enc401_stream_encoder_hdmi_set_stream_attribute) and enable_link_hdmi
@@ -17,8 +18,13 @@ use core::future::Future;
 mod video;
 pub use video::HdmiVideoRunning;
 
-/// TMDS character rate without scrambling (HDMI 1.4); 25 MHz is HDMI's floor.
-pub const TMDS_MAX_KHZ: u32 = 340_000;
+/// Highest TMDS character rate without scrambling (HDMI 1.4). Above it the
+/// stream scrambles and the clock channel runs at 1/4 rate. Linux's encoder
+/// switches at >= 340 MHz but tells the sink only at > 340 MHz; both use > here
+/// so source and sink can never disagree.
+pub const TMDS_SCRAMBLE_KHZ: u32 = 340_000;
+/// Linux's TMDS ceiling (dcn401_program_pix_clk); 25 MHz is HDMI's floor.
+pub const TMDS_MAX_KHZ: u32 = 600_000;
 const TMDS_MIN_KHZ: u32 = 25_000;
 const LANES_MASK: u32 = 0x3e3e3e3e;
 const LANES_OFF: u32 = 0x02020202;
@@ -40,6 +46,8 @@ pub struct HdmiLinkReady {
     pub request: HdmiLinkRequest,
     pub blank: BlankApplied,
     pub pixel_khz: u32,
+    /// Above TMDS_SCRAMBLE_KHZ: scrambled, 1/4-rate clock channel.
+    pub scrambled: bool,
     controls: [u32; 17],
     /// Every backend's frontend selection, so no other route moves.
     backend_routes: [u32; 4],
@@ -404,6 +412,7 @@ impl<I: Io> Engine<I> {
             request,
             blank,
             pixel_khz,
+            scrambled: pixel_khz > TMDS_SCRAMBLE_KHZ,
             controls: [0; 17],
             backend_routes: [0; 4],
             clock_route: 0,
@@ -474,11 +483,13 @@ impl<I: Io> Engine<I> {
             (6, 0x70, u32::from(pipe) << 4), // stereo sync source
             (6, 0x100, 0x100),               // stereo sync gate (stereo off)
             (11, 0x7000, 0),                 // RGB pixel encoding and colour format
-            (11, 0x0100001f, 0x19),          // GEN v1, keepout, no extra NULL, no scramble
-            (11, 0x30000000, 0),             // 24-bit depth
-            (12, 0x31, 0x31),                // GC every frame, NULL packets
-            (12, 0x1000, 0),                 // no ACP
-            (13, 1, 0),                      // AVMUTE off
+            // GEN v1, keepout, no extra NULL; above 340 MHz the data
+            // scrambler and the 1/4-rate clock channel (HDMI_CLOCK_CHANNEL_RATE).
+            (11, 0x0100001f, 0x19 | if plan.scrambled { 0x6 } else { 0 }),
+            (11, 0x30000000, 0), // 24-bit depth
+            (12, 0x31, 0x31),    // GC every frame, NULL packets
+            (12, 0x1000, 0),     // no ACP
+            (13, 1, 0),          // AVMUTE off
         ] {
             self.hdmi_update(plan, slot, mask, value)?;
         }
@@ -623,8 +634,9 @@ impl Otg {
     /// still stopped.
     /// # Safety
     /// Validated direct HDMI path without retimers, ACPI interlocks or SSC
-    /// workarounds, and a sink that accepts this mode without SCDC
-    /// scrambling. Exclude CPU/firmware/FAMS and display/link/clock/power/reset
+    /// workarounds. The sink accepts this mode, and its SCDC TMDS
+    /// configuration (scrambling and 1/40 clock ratio above 340 MHz, neither
+    /// at or below) was written first, as Linux's write_scdc_data does. Exclude CPU/firmware/FAMS and display/link/clock/power/reset
     /// writers and audio/metadata/HDCP producers; retain every allocation and
     /// translation. Success proves transmitter and clock witnesses only, not
     /// sink presentation; failure or cancellation needs independent recovery.
