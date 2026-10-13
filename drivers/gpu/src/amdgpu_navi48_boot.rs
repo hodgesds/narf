@@ -1559,6 +1559,55 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Stop the trained link of a departed sink (debounced HPD low) without
+    /// addressing the sink.
+    /// # Safety
+    /// As for `stop_display_dp_link`; the port's HPD must have been enabled.
+    pub async unsafe fn stop_unplugged_display_dp_link(
+        &mut self,
+        port: usize,
+    ) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained board path/owners; caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_unplugged_dp_link(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
+    /// Give a board connector's HPD pin to its HPD block and enable it.
+    /// # Safety
+    /// The board's HPD selector must name this connector's pin, and nothing
+    /// else may drive or sample that pin as a GPIO.
+    pub unsafe fn enable_display_hpd(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: board-routed selector; the caller excludes GPIO users.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.enable_hpd(path) }
+    }
+    /// Debounced hot-plug sense of an enabled port.
+    pub fn display_hpd(&mut self, port: usize) -> Result<bool, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        self.otg.as_mut().map_err(|e| *e)?.hpd_sense(path)
+    }
+    /// The sink's lane lock on this owner's live DP link, read over AUX.
+    /// # Safety
+    /// Exclude other AUX users of the port.
+    pub async unsafe fn display_dp_link_status(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::DpLinkStatus, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained owner; AUX only.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .dp_link_status(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
     /// Disable a board-routed legacy DP SST transmitter before frontend retirement.
     /// # Safety
     /// Select a direct external DP port without USB-C/ACPI PHY interlocks or

@@ -7,6 +7,9 @@ pub use dmub::DpDriveSettings;
 #[path = "amdgpu_dcn401_dp_frontend.rs"]
 mod frontend;
 pub use frontend::{DpFrontendReady, DpFrontendRequest, DpVideoRunning};
+#[path = "amdgpu_dcn401_dp_link_status.rs"]
+mod link_status;
+pub use link_status::DpLinkStatus;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpTrainingError {
@@ -563,6 +566,26 @@ impl<I: Io> Engine<I> {
         io: &mut impl Transport,
         path: Path,
     ) -> Result<(), Error> {
+        self.stop_dp_link_with(io, path, true).await
+    }
+    /// The sink is gone (debounced HPD low): stop without the sink D3 write,
+    /// which could only time out. Linux ignores that write's failure.
+    pub(in super::super) async fn stop_unplugged_dp_link(
+        &mut self,
+        io: &mut impl Transport,
+        path: Path,
+    ) -> Result<(), Error> {
+        if self.hpd_sense(path)? {
+            return Err(Error::Busy);
+        }
+        self.stop_dp_link_with(io, path, false).await
+    }
+    async fn stop_dp_link_with(
+        &mut self,
+        io: &mut impl Transport,
+        path: Path,
+        sink: bool,
+    ) -> Result<(), Error> {
         let t = path.transmitter;
         if !matches!(self.status.state, State::DpLinkTrained(x) | State::DpLinkRefused(x) if x == t)
             || !io.ready()
@@ -576,8 +599,10 @@ impl<I: Io> Engine<I> {
         self.dp_training_verify(plan)?;
         self.status.state = State::StoppingDpLink(path.transmitter);
         let result = async {
-            write(io, path, 0x600, &mut [2]).await?; // native sink D3 before PHY disable
-            self.dp_training_verify(plan)?;
+            if sink {
+                write(io, path, 0x600, &mut [2]).await?; // native sink D3 before PHY disable
+                self.dp_training_verify(plan)?;
+            }
             self.dp_phy_stop(io, plan.phy, plan.controls[0], 0x10)
                 .await?;
             if self.read(plan.registers(self.layout)[3].0)? & 0x1113ffff != plan.controls[3] {
@@ -628,5 +653,18 @@ impl Otg {
             return Err(Error::Invalid);
         }
         self.0.stop_dp_link(io, path).await
+    }
+    /// Stop the link of a departed sink: no AUX, refused while HPD is high.
+    /// # Safety
+    /// As for `stop_dp_link`; the path's HPD block must sense this connector.
+    pub(crate) async unsafe fn stop_unplugged_dp_link(
+        &mut self,
+        io: &mut dmub::Dmub,
+        path: Path,
+    ) -> Result<(), Error> {
+        if !io.matches_display(self.0.io.0, self.0.layout.base) {
+            return Err(Error::Invalid);
+        }
+        self.0.stop_unplugged_dp_link(io, path).await
     }
 }

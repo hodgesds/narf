@@ -5,6 +5,8 @@ use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU32, AtomicU64};
 #[path = "amdgpu_dcn401_dp_frontend_tests.rs"]
 mod frontend;
+#[path = "amdgpu_dcn401_dp_link_status_tests.rs"]
+mod link_status;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Event {
@@ -63,6 +65,8 @@ struct Link {
     revoke: Option<(usize, Cap<BusDeviceCap, Write>)>,
     defer: u8,
     ignore: Option<u32>,
+    /// The sink departed: the PHY may stop without its D3.
+    unplugged: bool,
     step: usize,
     progress: Arc<AtomicU32>,
 }
@@ -114,7 +118,8 @@ impl super::super::super::dp_phy::Firmware for Link {
         self.fw.command(path, Some(settings)).await
     }
     async fn disable(&mut self, path: inventory::Path) -> Result<(), dmub::Error> {
-        assert_eq!(self.bytes[&0x600], 2); // sink D3 before native transmitter disable
+        // Sink D3 before native transmitter disable, unless the sink left.
+        assert!(self.unplugged || self.bytes[&0x600] == 2);
         self.fw.command(path, None).await
     }
 }
@@ -218,6 +223,7 @@ fn fixture(p: u8, lanes: u8, rate: LinkRate, pattern: TrainingPattern) -> (Engin
         revoke: None,
         defer: 0,
         ignore: None,
+        unplugged: false,
         step: 0,
         progress: Arc::new(AtomicU32::new(0)),
     };

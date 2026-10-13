@@ -844,6 +844,31 @@ otherwise. Failures leave every owner where it stopped. `stop_modeset`
 reverses a success down to a disabled PHY with timing and planes retired; the
 surface allocation remains bound to its pipe.
 
+Before training, the modeset enables the connector's HPD block, as Linux's
+interrupt-mode HPD GPIO and `enable_hpd` do: the pad's DC_GPIO_HPD_MASK bit is
+cleared and DC_HPD_EN set. The board path's one-based selector names
+GPIO_HPD_n, served by block n-1 of DCN401's four. A path without a selector
+still lights. `hpd_sense` reads DC_HPD_SENSE_DELAYED, the debounced bit
+Linux's `dal_hw_hpd_get_value` reads. It is Busy while the pad is GPIO-owned
+or the block disabled. `dp_link_status` reads DPCD 0x202..0x207 over AUX for
+the link the owner carries (trained, frontend, video or scanout state). No
+register is written and the owner state does not change on failure. Following
+`dp_parse_link_loss_status`, a link is locked when every trained lane holds
+CR, EQ and symbol lock with interlane alignment. It counts as lost only when
+it is unlocked and SET_POWER reads D0. `stop_unplugged_dp_link` stops a link
+without the sink D3 write, and only while the debounced HPD is low.
+
+`check_modeset` checks hot-plug first, so an absent sink gets no AUX traffic,
+then lane lock, then the scanout. It reports `Running(frame)`, `Unplugged` or
+`LinkLost`. `retrain_modeset` follows `dp_handle_link_loss`: it stops scanout,
+video, frontend and link (sink D3), then trains again down the fallback ladder
+from the current setting and restarts video and scanout of the retained
+surface. `unplug_modeset` is `stop_modeset` with the unplugged link stop. The
+check/retrain/unplug sequencing is composed from owner operations tested
+individually; no fake covers the composition and no hardware has run it.
+Replug currently needs a new modeset, which the retained surface blocks
+(open).
+
 The platform `modeset_display` publishes the live surface only after
 activation succeeds, through `amdgpu_dcn_display::publish_external`. The
 published `GenericFb` is the surface's bus-physical BAR address, visible size

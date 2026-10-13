@@ -159,6 +159,7 @@ impl Io for Fake {
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || at == BASE + 0x4a * 4 // native FRL character-clock root
                 || at == BASE + 0xa0 * 4 // native DC_IP_REQUEST_CNTL, bank 2
+                || at == BASE + 0x28f4 * 4 // DC_GPIO_HPD_MASK, bank 2
                 || at == 0x7f000 // native HDP flush remap
                 || (0..4).any(|p| at == BASE + (0x80 + 2 * p) * 4)
                 || (BASE + 0x1f0d * 4..=BASE + 0x1f10 * 4).contains(&at)

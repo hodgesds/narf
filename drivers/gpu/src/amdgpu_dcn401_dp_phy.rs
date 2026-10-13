@@ -10,8 +10,8 @@ pub use dmub::DpPhySettings;
 #[path = "amdgpu_dcn401_dp_training.rs"]
 pub(super) mod training;
 pub use training::{
-    DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkTrained, DpTrainingError,
-    DpVideoRunning,
+    DpDriveSettings, DpFrontendReady, DpFrontendRequest, DpLinkStatus, DpLinkTrained,
+    DpTrainingError, DpVideoRunning,
 };
 
 const LANES_MASK: u32 = 0x3e3e3e3e;

@@ -46,6 +46,17 @@ pub struct Modeset {
     pub scanout: otg::ScanoutRunning,
 }
 
+/// What a periodic check of a running modeset found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Health {
+    /// Sink present, link locked, scanout fetching; the fresh frame count.
+    Running(u32),
+    /// Debounced HPD low: tear down with `unplug_modeset`.
+    Unplugged,
+    /// The D0 sink lost lane lock: `retrain_modeset` (Linux's link loss).
+    LinkLost(otg::DpLinkStatus),
+}
+
 /// Maximum DPCD link of a DP receiver: MAX_LINK_RATE and MAX_LANE_COUNT.
 fn max_link(dpcd: &[u8; 16]) -> Option<(u8, LinkRate)> {
     let lanes = dpcd[2] & 0x1f;
@@ -317,6 +328,33 @@ impl ColdBoot {
             self.prepare_display_mpc(pipe)?;
             self.prepare_display_requestor(pipe).await?;
             self.prepare_display_deadlines(pipe, &plan).await?;
+            match self.enable_display_hpd(selection.port) {
+                // A board without an HPD selector still lights; monitoring
+                // then reports Unsupported.
+                Ok(()) | Err(otg::Error::Unsupported) => {}
+                Err(e) => return Err(e.into()),
+            }
+            let (selection, scanout) = self.start_link(selection, pipe).await?;
+            Ok(Modeset {
+                selection,
+                pipe,
+                plan,
+                scanout,
+            })
+        }
+    }
+    /// Train the selected sink down the fallback ladder from its selection,
+    /// then start the frontend, video and scanout of the staged `pipe`.
+    /// # Safety
+    /// As for `modeset_display`, with the pipe's timing, surface and
+    /// deadlines prepared and the port's PHY disabled.
+    async unsafe fn start_link(
+        &mut self,
+        selection: Selection,
+        pipe: u8,
+    ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
+        // SAFETY: the caller's obligations; each step checks its predecessor.
+        unsafe {
             let port = selection.port;
             let mut selection = selection;
             let mut trained = false;
@@ -354,13 +392,60 @@ impl ColdBoot {
                 .await?;
             self.start_display_dp_video(port).await?;
             let scanout = self.start_display_scanout(pipe).await?;
-            Ok(Modeset {
-                selection,
-                pipe,
-                plan,
-                scanout,
-            })
+            Ok((selection, scanout))
         }
+    }
+    /// Check a running modeset: hot-plug first (no AUX to an absent sink),
+    /// then the sink's lane lock, then the scanout itself.
+    /// # Safety
+    /// As for `modeset_display`; exclude other AUX users of the port.
+    pub async unsafe fn check_modeset(&mut self, m: &Modeset) -> Result<Health, ModesetError> {
+        let port = m.selection.port;
+        if !self.display_hpd(port)? {
+            return Ok(Health::Unplugged);
+        }
+        // SAFETY: as documented above.
+        unsafe {
+            let link = self.display_dp_link_status(port).await?;
+            if link.lost() {
+                return Ok(Health::LinkLost(link));
+            }
+            Ok(Health::Running(self.check_display_scanout(m.pipe).await?))
+        }
+    }
+    /// Linux's dp_handle_link_loss: stop the stream and link, then train
+    /// again from the current setting (falling back as needed) and restart
+    /// video and scanout of the retained surface.
+    /// # Safety
+    /// As for `modeset_display`; stop every CPU writer of the surface first.
+    pub async unsafe fn retrain_modeset(&mut self, m: &mut Modeset) -> Result<(), ModesetError> {
+        let port = m.selection.port;
+        // SAFETY: as documented above; each step checks its predecessor state.
+        unsafe {
+            self.stop_display_scanout(m.pipe).await?;
+            self.stop_display_dp_video(port).await?;
+            self.stop_display_dp_frontend(port).await?;
+            self.stop_display_dp_link(port).await?;
+            (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;
+        }
+        Ok(())
+    }
+    /// Tear down a modeset whose sink left: as `stop_modeset`, but the link
+    /// stops without addressing the sink, and only while HPD stays low.
+    /// # Safety
+    /// As for `stop_modeset`.
+    pub async unsafe fn unplug_modeset(&mut self, m: &Modeset) -> Result<(), ModesetError> {
+        let port = m.selection.port;
+        // SAFETY: as documented above; each step checks its predecessor state.
+        unsafe {
+            self.stop_display_scanout(m.pipe).await?;
+            self.stop_display_dp_video(port).await?;
+            self.stop_display_dp_frontend(port).await?;
+            self.stop_unplugged_display_dp_link(port).await?;
+            self.retire_display_timing(m.pipe).await?;
+            self.retire_display_planes().await?;
+        }
+        Ok(())
     }
     /// Reverse a successful modeset down to a disabled PHY with timing and
     /// planes retired. The surface allocation is retained by its pipe.
