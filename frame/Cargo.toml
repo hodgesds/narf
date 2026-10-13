@@ -97,6 +97,7 @@ narf-power           = { path = "../power" }
 narf-observability   = { path = "../observability" }
 narf-rcu             = { path = "../rcu" }
 narf-filesystem      = { path = "../filesystem" }
+narf-filesystem-bench = { path = "../filesystem/bench", optional = true }
 narf-modules         = { path = "../modules" }
 narf-userspace       = { path = "../userspace" }
 narf-user-runtime    = { path = "../user-runtime" }
@@ -176,6 +177,7 @@ qemu-net = []
 # Implies qemu-net (needs the off-box virtio NIC config). Thread count comes
 # from the kernel cmdline `mt_echo_threads=N` (default = CPU count).
 mt-echo = ["qemu-net"]
+bench = ["dep:narf-filesystem-bench"]
 
 # cgroup-v2 unified hierarchy. Forwarded from narf-userspace; the
 # boot path also places init/shell into the root cgroup. Mounts

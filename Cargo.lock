@@ -2299,6 +2299,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-filesystem-bench"
+version = "0.0.0"
+dependencies = [
+ "narf-bpf-bench",
+ "narf-filesystem",
+ "narf-init",
+ "narf-lib",
+]
+
+[[package]]
 name = "narf-firmware"
 version = "0.0.0"
 dependencies = [
@@ -2398,6 +2408,7 @@ dependencies = [
  "narf-event-bus",
  "narf-fb",
  "narf-filesystem",
+ "narf-filesystem-bench",
  "narf-firmware",
  "narf-firmware-fdt",
  "narf-firmware-fw-cfg",
