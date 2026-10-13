@@ -696,6 +696,116 @@ pub async unsafe fn stop_modeset(
     unsafe { boot.stop_modeset(modeset).await }
 }
 
+/// Poll period of the native display monitor. HPD interrupts are not yet
+/// dispatched to the display owner, so hot-plug and link loss are polled.
+const MONITOR_MS: u64 = 1000;
+
+/// What one native display monitor pass did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MonitorStep {
+    /// Sink present, link locked, scanout fetching; the fresh frame count.
+    Running(u32),
+    /// The link lost lock and was retrained; scanout resumed.
+    Retrained,
+    /// HPD fell: the scanout was withdrawn and the modeset torn down.
+    Unplugged,
+    /// A sink appeared with no modeset running, and was lit.
+    Replugged,
+    /// No modeset and no sink.
+    Waiting,
+}
+
+/// One monitor pass: check a running modeset and retrain or tear it down,
+/// or light a newly plugged sink when none runs.
+/// # Safety
+/// As for `modeset_display`.
+pub async unsafe fn monitor_display(
+    current: &mut Option<crate::amdgpu_navi48_boot::Modeset>,
+    pipe: u8,
+) -> Result<MonitorStep, crate::amdgpu_navi48_boot::ModesetError> {
+    use crate::amdgpu_navi48_boot::{Error as BootError, Health, ModesetError};
+    let Some(m) = current.as_mut() else {
+        let plugged = {
+            let mut owner = OWNER.lock().await;
+            let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+            let ports = boot.display_paths().map_or(0, <[_]>::len);
+            (0..ports).any(|port| boot.display_hpd(port) == Ok(true))
+        };
+        if !plugged {
+            return Ok(MonitorStep::Waiting);
+        }
+        // SAFETY: the caller's obligations.
+        *current = Some(unsafe { modeset_display(pipe, |_, row| row.fill(0)) }.await?);
+        return Ok(MonitorStep::Replugged);
+    };
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+    // SAFETY: serialized retained owners; caller excludes external writers.
+    match unsafe { boot.check_modeset(m).await }? {
+        Health::Running(frame) => Ok(MonitorStep::Running(frame)),
+        Health::LinkLost(_) => {
+            // The surface stays allocated and published: console writes
+            // during the retrain land in it and show once scanout resumes.
+            // SAFETY: as above.
+            unsafe { boot.retrain_modeset(m).await }?;
+            Ok(MonitorStep::Retrained)
+        }
+        Health::Unplugged => {
+            crate::amdgpu_dcn_display::publish_external(None, None);
+            // SAFETY: as above; the scanout is withdrawn first.
+            unsafe { boot.unplug_modeset(m).await }?;
+            *current = None;
+            Ok(MonitorStep::Unplugged)
+        }
+    }
+}
+
+/// Poll a lit modeset for hot-plug and link loss until the owner fails.
+/// HPD is enabled on every routed port so a sink on another port is seen.
+/// # Safety
+/// As for `modeset_display`, for the lifetime of the spawned task.
+pub unsafe fn spawn_display_monitor(modeset: crate::amdgpu_navi48_boot::Modeset) {
+    narf_scheduler::spawn(async move {
+        use core::fmt::Write;
+        let pipe = modeset.pipe;
+        let mut current = Some(modeset);
+        {
+            let mut owner = OWNER.lock().await;
+            if let Some(boot) = owner.as_mut() {
+                let ports = boot.display_paths().map_or(0, <[_]>::len);
+                for port in 0..ports {
+                    let dp = boot.display_paths().is_ok_and(|p| {
+                        p[port].connector == crate::amdgpu_dcn_inventory::Connector::DisplayPort
+                    });
+                    if dp {
+                        // SAFETY: board-routed selectors; no GPIO user of HPD pins.
+                        let _ = unsafe { boot.enable_display_hpd(port) };
+                    }
+                }
+            }
+        }
+        loop {
+            narf_time::SleepUntil::new(narf_time::Deadline::after_ms(MONITOR_MS).as_instant())
+                .await;
+            // SAFETY: the spawner's obligations hold for the task's lifetime.
+            match unsafe { monitor_display(&mut current, pipe) }.await {
+                Ok(MonitorStep::Running(_) | MonitorStep::Waiting) => {}
+                Ok(step) => {
+                    let _ = writeln!(narf_console::Writer, "amdgpu: navi48 display {step:?}");
+                }
+                Err(e) => {
+                    // The failed owner stays quarantined where it stopped.
+                    let _ = writeln!(
+                        narf_console::Writer,
+                        "amdgpu: navi48 display monitor stopped: {e:?}"
+                    );
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// Make the staged surface the visible source of the pipe's running black video.
 /// # Safety
 /// The surface must stay allocated until a successful stop. Exclude firmware/FAMS

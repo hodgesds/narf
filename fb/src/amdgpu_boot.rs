@@ -125,6 +125,11 @@ fn native_display() {
         narf_console::Writer,
         "amdgpu: navi48 native modeset {modeset:?}"
     );
+    if let Ok(modeset) = modeset {
+        // SAFETY: the retained owner is serialized by the platform; only the
+        // monitor and the published hooks drive the display from here on.
+        unsafe { navi48::spawn_display_monitor(modeset) };
+    }
 }
 
 fn refused(generation: &str, error: impl core::fmt::Debug) {

@@ -438,3 +438,64 @@ kernel_test_in!(
     "drivers/gpu/dcn401-surface",
     dcn401_surface_cancellation_before_and_after_publication_is_retained
 );
+
+fn dcn401_surface_restages_a_retired_pipe_reusing_only_the_same_geometry() -> TestResult {
+    let (_backing, pool, mut e, mut surfaces) = fixture(1, 16384);
+    let first = run(surfaces.prepare(&mut e, &pool, req(1))).unwrap();
+    let left = pool.available();
+    // Occupied and not freshly retired: refused before any write.
+    let count = e.io.inner.writes.len();
+    assert_eq!(
+        run(surfaces.prepare(&mut e, &pool, req(1))),
+        Err(Error::Busy)
+    );
+    assert_eq!(e.io.inner.writes.len(), count);
+    // Retired, but a HUBP fetches again: no fresh evidence, no restage.
+    e.status.state = State::PlanesRetired;
+    let control = e.io.inner.regs[&h(1, 0x5f4)];
+    e.io.inner.regs.insert(h(1, 0x5f4), control & !7);
+    assert_eq!(
+        run(surfaces.prepare(&mut e, &pool, req(1))),
+        Err(Error::Busy)
+    );
+    assert_eq!(e.io.inner.writes.len(), count);
+    e.io.inner.regs.insert(h(1, 0x5f4), control);
+    // The same geometry reuses (and re-clears) the buffer after teardown,
+    // including after the modeset's HUBP power-up.
+    // SAFETY: the fixture's heap-backed model VRAM.
+    unsafe { e.io.map.write32(0, 0x1234) };
+    for state in [State::PlanesRetired, State::HubpPowerChanged] {
+        e.status.state = state;
+        e.io.flushed = false;
+        let again = run(surfaces.prepare(&mut e, &pool, req(1))).unwrap();
+        if again != first || pool.available() != left {
+            return TestResult::Fail("same geometry not reused");
+        }
+        // SAFETY: as above.
+        if unsafe { e.io.map.read32(0) } != 0 {
+            return TestResult::Fail("reused buffer not cleared");
+        }
+    }
+    // A new geometry gets a new buffer; the published old range is never
+    // returned to the pool, even when the surfaces are dropped.
+    e.status.state = State::PlanesRetired;
+    e.io.flushed = false;
+    e.io.address = first.address + 4096;
+    let taller = SurfaceRequest {
+        height: 4,
+        ..req(1)
+    };
+    let moved = run(surfaces.prepare(&mut e, &pool, taller)).unwrap();
+    if moved.address != first.address + 4096 || pool.available() != left - 4096 {
+        return TestResult::Fail("new geometry");
+    }
+    drop(surfaces);
+    if pool.available() != left - 4096 {
+        return TestResult::Fail("published ranges returned to the pool");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-surface",
+    dcn401_surface_restages_a_retired_pipe_reusing_only_the_same_geometry
+);

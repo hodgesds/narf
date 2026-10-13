@@ -866,8 +866,31 @@ from the current setting and restarts video and scanout of the retained
 surface. `unplug_modeset` is `stop_modeset` with the unplugged link stop. The
 check/retrain/unplug sequencing is composed from owner operations tested
 individually; no fake covers the composition and no hardware has run it.
-Replug currently needs a new modeset, which the retained surface blocks
-(open).
+
+A replug is a new `modeset_display` on the torn-down pipe. Surface
+preparation may restage an occupied pipe only right after plane retirement
+(or the HUBP power-up that follows it), with fresh evidence that no HUBP
+fetches. Its own previous staged address may still be pending, because those
+buffers stay owned either way. The same geometry reuses the front, back and
+cursor buffers, re-cleared.
+A console write still in flight to the withdrawn scanout can then only land
+on that same surface. A new geometry allocates fresh buffers. The old ones are
+dropped, and a published reservation is never returned to the pool. There is
+no writer-quiescence barrier between the fb layer and a withdrawn scanout, so
+freeing them could let a late write corrupt a later allocation. Each mode
+change after a replug therefore retires one surface's VRAM for the owner's
+lifetime.
+
+`platform::spawn_display_monitor` runs after the boot-time native modeset
+(`amdgpu.native_display`). It enables HPD on every routed DP port, then polls
+once a second, because HPD interrupts are not yet dispatched to the display
+owner. Each pass is `monitor_display`: with a modeset running it calls
+`check_modeset`. A lost link is retrained with the surface still published.
+On unplug the scanout is withdrawn (the console returns to the boot
+framebuffer) and the modeset is torn down. With no modeset, any routed port
+sensing HPD high is lit by a new `modeset_display`, which publishes the
+surface again. An owner error stops the monitor, leaving the owner where it
+stopped.
 
 The platform `modeset_display` publishes the live surface only after
 activation succeeds, through `amdgpu_dcn_display::publish_external`. The

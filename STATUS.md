@@ -423,8 +423,10 @@ DP link training now falls back: a cleanly refused link is stopped (sink D3,
 PHY off), and the modeset retries lower rates, then fewer lanes.
 A running Navi48 modeset can now be checked. HPD comes from the debounced
 DCN401 HPD block, and lane lock is read from the sink. A lost link retrains,
-and an unplugged sink is torn down without AUX to it. Replug (which needs the
-retained surface released) and a periodic monitor are open.
+and an unplugged sink is torn down without AUX to it. With the opt-in native
+display, a 1 s monitor retrains, tears down and relights on replug. Replug
+reuses the pipe's surface for the same geometry; a new geometry permanently
+retires the old buffers' VRAM, since no fb writer-quiescence barrier exists.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

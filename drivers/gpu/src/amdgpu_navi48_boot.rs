@@ -1877,7 +1877,7 @@ impl ColdBoot {
 
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
-pub use modeset::{InheritedRetired, Modeset, ModesetError, Selection};
+pub use modeset::{Health, InheritedRetired, Modeset, ModesetError, Selection};
 #[cfg(feature = "kernel-test")]
 #[path = "amdgpu_navi48_boot_tests.rs"]
 mod tests;

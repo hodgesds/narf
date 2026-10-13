@@ -122,11 +122,35 @@ impl Surfaces {
     ) -> Result<SurfaceApplied, Error> {
         let (pitch_bytes, bytes) = request.geometry()?;
         let slot = usize::from(request.pipe);
-        if self.0[slot].is_some() || !engine.status.state.reusable() {
+        // Restaging a torn-down pipe (a replug) is allowed only right after
+        // plane retirement (and the HUBP power-up that follows it in a
+        // modeset), with fresh evidence that no HUBP fetches.
+        let restage = self.0[slot].is_some();
+        if restage {
+            if !matches!(
+                engine.status.state,
+                State::PlanesRetired | State::HubpPowerChanged
+            ) {
+                return Err(Error::Busy);
+            }
+            engine.fetchers_stopped()?;
+        }
+        if !engine.status.state.reusable() {
             return Err(Error::Busy);
         }
-        engine.surface_preflight(request.pipe)?;
-        let memory = pool.reserve(bytes).map_err(|_| Error::Allocation)?;
+        engine.surface_preflight(request.pipe, restage)?;
+        // The same geometry reuses the buffers: a console write still in
+        // flight to the old scanout can only land on this same surface. A new
+        // geometry drops them; published ranges then stay excluded from the
+        // pool forever (no writer-quiescence barrier exists to free them).
+        let (memory, back, cursor) = match self.0[slot].take() {
+            Some(old) if old.applied.request == request => (old.memory, old.back, old.cursor),
+            _ => (
+                pool.reserve(bytes).map_err(|_| Error::Allocation)?,
+                None,
+                None,
+            ),
+        };
         if memory.address() == 0
             || memory
                 .address()
@@ -144,12 +168,12 @@ impl Surfaces {
         self.0[slot] = Some(Surface {
             memory,
             applied,
-            back: None,
-            cursor: None,
+            back,
+            cursor,
         });
         engine.status.state = State::PreparingSurface(request.pipe);
         engine.status.surfaces[slot] = None;
-        let result = self.initialize(engine, slot).await;
+        let result = self.initialize(engine, slot, restage).await;
         match result {
             Ok(()) => {
                 engine.status.surfaces[slot] = Some(applied);
@@ -166,6 +190,7 @@ impl Surfaces {
         &mut self,
         engine: &mut Engine<I>,
         slot: usize,
+        restage: bool,
     ) -> Result<(), Error> {
         let surface = self.0[slot].as_mut().ok_or(Error::Invalid)?;
         let map = surface.memory.mapping();
@@ -185,7 +210,7 @@ impl Surfaces {
         }
         engine.flush_surface_writes()?;
         // Recheck after cooperative clearing, before any surface register changes.
-        engine.surface_preflight(surface.applied.request.pipe)?;
+        engine.surface_preflight(surface.applied.request.pipe, restage)?;
         surface.memory.publish();
         engine.program_surface(surface.applied).await
     }
@@ -239,8 +264,14 @@ impl Surfaces {
     }
 }
 impl<I: Io> Engine<I> {
-    fn surface_preflight(&mut self, pipe: u8) -> Result<(), Error> {
-        self.hubp_power_tree_stopped()?;
+    /// A restaged pipe may still show its previous staged address pending:
+    /// those buffers stay owned (reused or permanently retired) either way.
+    fn surface_preflight(&mut self, pipe: u8, restage: bool) -> Result<(), Error> {
+        if restage {
+            self.hubp_tree_stopped(Some(pipe))?;
+        } else {
+            self.hubp_power_tree_stopped()?;
+        }
         if !self.hubp_powered(pipe)? {
             return Err(Error::Busy);
         }
@@ -305,8 +336,9 @@ impl<I: Io> Engine<I> {
 impl Otg {
     /// Allocate, clear and stage a linear RGB framebuffer while fetch is blank.
     /// A staged address may remain pending; VM, bandwidth, DPP/MPC and output
-    /// activation are separate prerequisites. Each pipe retains one allocation;
-    /// replacement/release requires a future explicit retirement protocol.
+    /// activation are separate prerequisites. Each pipe retains its allocation;
+    /// after plane retirement the pipe may be restaged, reusing the buffers
+    /// for the same geometry and permanently retiring them otherwise.
     /// # Safety
     /// `pool` must exclusively own this GPU's correctly mapped VRAM. Exclude
     /// firmware/FAMS and concurrent display/HDP/clock/power writers. Retain all
