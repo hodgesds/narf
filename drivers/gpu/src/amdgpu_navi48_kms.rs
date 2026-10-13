@@ -1,9 +1,9 @@
 //! The native Navi48 display as DRM KMS state on the amdgpu card: one CRTC,
-//! one encoder (TMDS type, as amdgpu_dm reports DP) and one DisplayPort
-//! connector carrying the sink's EDID and the exact timing being scanned out.
-//! Presentation stays the existing CPU copy onto the adopted scanout; only
-//! the published timing is accepted by SETCRTC, since the driver cannot yet
-//! reprogram a live display to another mode.
+//! one encoder (TMDS type, as amdgpu_dm reports DP) and one DisplayPort or
+//! HDMI connector carrying the sink's EDID, the exact timing being scanned
+//! out and every other EDID timing the driver can switch the sink to. Only
+//! those timings are accepted by SETCRTC/atomic; switching to another of them
+//! is a full native modeset run by the display monitor.
 use crate::amdgpu_dml::Timing;
 use crate::drm::card::{
     Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType, NativeOutput,
@@ -20,6 +20,7 @@ const NHSYNC: u32 = 2;
 const PVSYNC: u32 = 4;
 const NVSYNC: u32 = 8;
 const PREFERRED_DRIVER: u32 = 0x8 | 0x40;
+const DRIVER: u32 = 0x40;
 
 /// The exact DRM wire form of a DCN timing.
 pub fn timing_wire(t: &Timing) -> DrmModeModeInfo {
@@ -53,7 +54,7 @@ pub fn timing_wire(t: &Timing) -> DrmModeModeInfo {
 
 /// Set the card's single output to the lit sink (with its connector type), or
 /// to disconnected, keeping the last connector type.
-pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, ConnectorType)>) {
+pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, &[Timing], ConnectorType)>) {
     if card.crtcs.is_empty() {
         card.crtcs.push(Crtc {
             id: CRTC,
@@ -79,13 +80,43 @@ pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, ConnectorType)>)
             modes: alloc::vec::Vec::new(),
         });
     }
-    let wire = lit.map(|(_, t, _)| timing_wire(t));
-    let mode = wire.map(|w| Mode {
+    let to_mode = |w: &DrmModeModeInfo| Mode {
         width: u32::from(w.hdisplay),
         height: u32::from(w.vdisplay),
         refresh_hz: w.vrefresh as u16,
         bpp: 32,
-    });
+    };
+    let wire = lit.map(|(_, t, _, _)| timing_wire(t));
+    let mode = wire.as_ref().map(to_mode);
+    // The running timing first, so a mode that two timings round to the same
+    // size and refresh reports the one being scanned out.
+    let mut timings: alloc::vec::Vec<DrmModeModeInfo> = wire.into_iter().collect();
+    if let Some((_, active, offered, _)) = lit {
+        for t in offered.iter().filter(|t| *t != active) {
+            let w = timing_wire(t);
+            // PREFERRED marks only the EDID's first (preferred) timing.
+            let w = DrmModeModeInfo {
+                r#type: if Some(t) == offered.first() {
+                    PREFERRED_DRIVER
+                } else {
+                    DRIVER
+                },
+                ..w
+            };
+            timings.push(w);
+        }
+        if let Some(first) = timings.first_mut() {
+            if offered.first().is_some_and(|p| p != active) {
+                first.r#type = DRIVER;
+            }
+        }
+    }
+    let mut modes: alloc::vec::Vec<Mode> = alloc::vec::Vec::new();
+    for m in timings.iter().map(to_mode) {
+        if !modes.contains(&m) {
+            modes.push(m);
+        }
+    }
     if let Ok(crtc) = card.crtc_mut(CRTC) {
         crtc.mode = mode;
         crtc.enabled = mode.is_some();
@@ -99,15 +130,15 @@ pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, ConnectorType)>)
         } else {
             ConnectorStatus::Disconnected
         };
-        c.modes = mode.into_iter().collect();
-        if let Some((_, _, kind)) = lit {
+        c.modes = modes;
+        if let Some((_, _, _, kind)) = lit {
             c.connector_type = kind;
         }
     }
     card.native = alloc::vec![NativeOutput {
         connector: CONNECTOR,
-        edid: lit.map(|(edid, _, _)| *edid),
-        timings: wire.into_iter().collect(),
+        edid: lit.map(|(edid, _, _, _)| *edid),
+        timings,
     }];
 }
 
@@ -134,7 +165,7 @@ pub fn set_active(active: bool) {
 
 /// Publish the lit sink (or its absence) on the registered amdgpu card,
 /// attaching KMS state on first use. Open clients keep their framebuffers.
-pub fn publish(lit: Option<(&[u8; 128], &Timing, ConnectorType)>) {
+pub fn publish(lit: Option<(&[u8; 128], &Timing, &[Timing], ConnectorType)>) {
     let Some(index) = (0..crate::drm_registry::count() as u32)
         .find(|&i| crate::drm_registry::driver_name(i) == Some("amdgpu"))
     else {

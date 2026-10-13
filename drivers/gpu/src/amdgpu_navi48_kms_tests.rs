@@ -71,8 +71,14 @@ fn navi48_kms_publishes_connector_edid_and_refuses_other_modes() -> TestResult {
     let t = cea_1080p();
     let wire = timing_wire(&t);
     let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
-    apply(&mut card, Some((&edid, &t, ConnectorType::DisplayPort)));
-    apply(&mut card, Some((&edid, &t, ConnectorType::DisplayPort))); // idempotent topology
+    apply(
+        &mut card,
+        Some((&edid, &t, &[t], ConnectorType::DisplayPort)),
+    );
+    apply(
+        &mut card,
+        Some((&edid, &t, &[t], ConnectorType::DisplayPort)),
+    ); // idempotent topology
     if (card.crtcs.len(), card.encoders.len(), card.connectors.len()) != (1, 1, 1) {
         return TestResult::Fail("topology duplicated");
     }
@@ -179,11 +185,61 @@ kernel_test_in!(
     navi48_kms_publishes_connector_edid_and_refuses_other_modes
 );
 
+fn navi48_kms_offers_every_switchable_mode_with_the_running_one_current() -> TestResult {
+    let edid = [0u8; 128];
+    let p = cea_1080p();
+    let small = Timing {
+        pixel_clock_khz: 74_250,
+        h_active: 1280,
+        h_total: 1650,
+        h_front_porch: 110,
+        h_sync_width: 40,
+        v_active: 720,
+        v_total: 750,
+        v_front_porch: 5,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    // Running 720p, the EDID preferring 1080p.
+    apply(
+        &mut card,
+        Some((&edid, &small, &[p, small], ConnectorType::DisplayPort)),
+    );
+    let m = |t: &Timing| Mode {
+        width: t.h_active,
+        height: t.v_active,
+        refresh_hz: 60,
+        bpp: 32,
+    };
+    if card.connectors[0].modes != [m(&small), m(&p)] || card.crtcs[0].mode != Some(m(&small)) {
+        return TestResult::Fail("offered modes");
+    }
+    let timings = &card.native_output(CONNECTOR).unwrap().timings;
+    // PREFERRED marks the EDID's preferred timing only.
+    if timings.len() != 2
+        || geometry(&timings[0])[..11] != geometry(&timing_wire(&small))[..11]
+        || timings[0].r#type & 0x8 != 0
+        || timings[1].r#type & 0x8 == 0
+    {
+        return TestResult::Fail("native timings and preferred flag");
+    }
+    if !card.accepts_mode(&timing_wire(&p)) || !card.accepts_mode(&timing_wire(&small)) {
+        return TestResult::Fail("every offered timing accepted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_offers_every_switchable_mode_with_the_running_one_current
+);
+
 fn navi48_kms_reports_hdmi_connectors_and_keeps_the_type_when_unplugged() -> TestResult {
     let edid = [0u8; 128];
     let t = cea_1080p();
     let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
-    apply(&mut card, Some((&edid, &t, ConnectorType::HdmiA)));
+    apply(&mut card, Some((&edid, &t, &[t], ConnectorType::HdmiA)));
     if card.connectors[0].connector_type != ConnectorType::HdmiA
         || card.connectors[0].status != ConnectorStatus::Connected
     {

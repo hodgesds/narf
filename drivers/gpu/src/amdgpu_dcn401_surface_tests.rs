@@ -489,6 +489,17 @@ fn dcn401_surface_restages_a_retired_pipe_reusing_only_the_same_geometry() -> Te
     if moved.address != first.address + 4096 || pool.available() != left - 4096 {
         return TestResult::Fail("new geometry");
     }
+    // Switching back and forth between the two geometries reuses the
+    // parked surfaces: no further VRAM is retired.
+    for (request, expected) in [(req(1), first), (taller, moved), (req(1), first)] {
+        e.status.state = State::PlanesRetired;
+        e.io.flushed = false;
+        e.io.address = expected.address;
+        let again = run(surfaces.prepare(&mut e, &pool, request)).unwrap();
+        if again != expected || pool.available() != left - 4096 {
+            return TestResult::Fail("parked geometry not reused");
+        }
+    }
     drop(surfaces);
     if pool.available() != left - 4096 {
         return TestResult::Fail("published ranges returned to the pool");

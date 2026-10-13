@@ -595,12 +595,25 @@ pub async unsafe fn modeset_display(
     pipe: u8,
     fill: impl FnMut(u32, &mut [u32]),
 ) -> Result<crate::amdgpu_navi48_boot::Modeset, crate::amdgpu_navi48_boot::ModesetError> {
+    // SAFETY: the caller's obligations.
+    unsafe { modeset_display_mode(pipe, fill, None) }.await
+}
+
+/// `modeset_display` in `want` when the sink lists and fits it, else in its
+/// preferred mode.
+/// # Safety
+/// As for `modeset_display`.
+pub async unsafe fn modeset_display_mode(
+    pipe: u8,
+    fill: impl FnMut(u32, &mut [u32]),
+    want: Option<crate::amdgpu_dml::Timing>,
+) -> Result<crate::amdgpu_navi48_boot::Modeset, crate::amdgpu_navi48_boot::ModesetError> {
     use crate::amdgpu_navi48_boot::{Error as BootError, ModesetError};
     let (modeset, fb) = {
         let mut owner = OWNER.lock().await;
         let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
         // SAFETY: serialized retained owners; caller excludes external writers.
-        let modeset = unsafe { boot.modeset_display(pipe, fill).await }?;
+        let modeset = unsafe { boot.modeset_display_mode(pipe, fill, want).await }?;
         // DRM frames present tear-free through a back buffer and a latched
         // flip. Without one (allocation failed), they fall back to copies
         // onto the visible front. A back buffer retained by an earlier
@@ -618,9 +631,12 @@ pub async unsafe fn modeset_display(
     crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
     crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
     let s = &modeset.selection;
+    let offered: Vec<crate::amdgpu_dml::Timing> = modeset.modes.iter().flatten().copied().collect();
+    *OFFERED.lock() = offered.clone();
     crate::amdgpu_navi48_kms::publish(Some((
         &s.edid,
         &s.timing,
+        &offered,
         if s.hdmi {
             crate::drm::card::ConnectorType::HdmiA
         } else {
@@ -875,6 +891,8 @@ pub enum MonitorStep {
     Disabled,
     /// The CRTC is off by DRM request; plugged sinks are not lit.
     Off,
+    /// DRM set another offered mode: the sink was relit in it.
+    Switched,
 }
 
 /// Whether DRM wants the native CRTC on (SETCRTC with a framebuffer, or
@@ -886,6 +904,44 @@ static DRM_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// Record DRM's CRTC on/off request for the native display.
 pub fn request_display_active(active: bool) {
     DRM_ACTIVE.store(active, core::sync::atomic::Ordering::Release);
+}
+
+/// The timings KMS offers for the lit sink (`Modeset::modes`).
+static OFFERED: narf_lib::sync::IrqSafeSpinLock<Vec<crate::amdgpu_dml::Timing>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+/// The mode DRM last set, or None for the sink's preferred mode. Like
+/// `DRM_ACTIVE` it is a level the display monitor converges to.
+static REQUESTED_MODE: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_dml::Timing>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Record the mode a DRM client set (SETCRTC or an atomic MODE_ID), which
+/// must be one of the offered timings; `None` returns to the preferred mode
+/// (the console's, after the last client closes). Returns false for a mode
+/// that is not offered.
+pub fn request_display_mode(mode: Option<&crate::drm::ioctl::DrmModeModeInfo>) -> bool {
+    let Some(m) = mode else {
+        *REQUESTED_MODE.lock() = None;
+        return true;
+    };
+    let geometry = |w: &crate::drm::ioctl::DrmModeModeInfo| {
+        (
+            w.clock,
+            [w.hdisplay, w.hsync_start, w.hsync_end, w.htotal],
+            [w.vdisplay, w.vsync_start, w.vsync_end, w.vtotal],
+        )
+    };
+    let found = OFFERED
+        .lock()
+        .iter()
+        .copied()
+        .find(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(m));
+    match found {
+        Some(t) => {
+            *REQUESTED_MODE.lock() = Some(t);
+            true
+        }
+        None => false,
+    }
 }
 
 /// One monitor pass: check a running modeset and retrain or tear it down,
@@ -913,6 +969,41 @@ pub async unsafe fn monitor_display(
         unsafe { boot.stop_modeset(m).await }?;
         *current = None;
         return Ok(MonitorStep::Disabled);
+    }
+    if let Some(m) = current.as_ref() {
+        let preferred = m.modes.iter().flatten().next().copied();
+        let desired = REQUESTED_MODE.lock().or(preferred);
+        if desired.is_some_and(|d| d != m.selection.timing) {
+            // A mode switch is a full modeset: withdraw writers, stop, then
+            // light the sink in the new timing.
+            NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
+            crate::amdgpu_dcn_display::publish_external(None, None);
+            {
+                let mut owner = OWNER.lock().await;
+                let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+                // SAFETY: the caller's obligations; writers withdrawn first.
+                unsafe { boot.stop_modeset(m).await }?;
+            }
+            *current = None;
+            let fill = |_: u32, row: &mut [u32]| row.fill(0);
+            // SAFETY: as above.
+            let lit = match unsafe { modeset_display_mode(pipe, fill, desired) }.await {
+                Ok(lit) => lit,
+                Err(e) => {
+                    // The requested mode did not light: go back to the
+                    // preferred one rather than leave the sink dark.
+                    *REQUESTED_MODE.lock() = None;
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut narf_console::Writer,
+                        format_args!("amdgpu: navi48 mode switch failed: {e:?}\n"),
+                    );
+                    // SAFETY: as above.
+                    unsafe { modeset_display(pipe, fill) }.await?
+                }
+            };
+            *current = Some(lit);
+            return Ok(MonitorStep::Switched);
+        }
     }
     let Some(m) = current.as_mut() else {
         let plugged = {

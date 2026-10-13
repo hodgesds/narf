@@ -913,12 +913,13 @@ fetches. Its own previous staged address may still be pending, because those
 buffers stay owned either way. The same geometry reuses the front, back and
 cursor buffers, re-cleared.
 A console write still in flight to the withdrawn scanout can then only land
-on that same surface. A new geometry allocates fresh buffers. The old ones are
-dropped, and a published reservation is never returned to the pool. There is
-no writer-quiescence barrier between the fb layer and a withdrawn scanout, so
-freeing them could let a late write corrupt a later allocation. Each mode
-change after a replug therefore retires one surface's VRAM for the owner's
-lifetime.
+on that same surface. A new geometry allocates fresh buffers and parks the
+old surface (front, back, cursor); a published reservation is never returned
+to the pool. There is no writer-quiescence barrier between the fb layer and a
+withdrawn scanout, so freeing them could let a late write corrupt a later
+allocation. A later request for a parked geometry on the same pipe reuses
+that surface, so switching among a sink's offered modes retains at most one
+surface per distinct geometry rather than one per switch.
 
 `amdgpu_navi48_kms` publishes the lit sink as KMS state on the registered
 amdgpu card. KMS state is attached on first publication; until then every
@@ -929,9 +930,14 @@ The card's `NativeOutput` carries the sink's base EDID block, which
 GETPROPBLOB returns verbatim, and the exact DRM timing from the DCN
 `Timing`. That timing has the porches and sync widths, rounded refresh, sync
 polarity flags, and type PREFERRED|DRIVER. GETCONNECTOR and GETCRTC report
-it instead of the synthesized timing. SETCRTC with a mode is refused
-(EINVAL) unless the mode's clock and geometry equal a published timing: the
-driver cannot reprogram a live display, and Linux would otherwise modeset.
+it instead of the synthesized timing. The connector also offers every other
+timing in `Modeset::modes`: the sink's EDID detailed timings (`edid_timings`:
+base block, then CTA-861 extensions; standard, established and VIC timings
+need tables narf does not have) that fit the trained DP link or a TMDS depth
+and that DML admits at the current clock levels, at most eight. Only the
+EDID's first timing carries PREFERRED; the running timing is listed first and
+is the CRTC's mode. SETCRTC with a mode is refused (EINVAL) unless the mode's
+clock and geometry equal an offered timing.
 An atomic MODE_ID blob is held to the same gate (`accepts_mode_blob`, at
 check time, so TEST_ONLY probes see it). Cards without native outputs are
 unaffected. A DRM client switching the CRTC off (SETCRTC without a
@@ -942,7 +948,16 @@ withdraws the scanout and native presentation and runs `stop_modeset`, and
 no plugged sink is lit while off; on (SETCRTC with a framebuffer, ACTIVE=1,
 or the last DRM file closing, as drm_fb_helper restores the console) lights
 the sink again through the normal modeset. The request is level-triggered,
-so an off/on pair between passes does nothing. Unplug (and `stop_modeset`)
+so an off/on pair between passes does nothing. Setting another offered mode
+(SETCRTC, or an atomic commit changing MODE_ID) records it with
+`platform::request_display_mode`. The monitor then withdraws the scanout,
+runs `stop_modeset` and relights through `modeset_display_mode`, which
+selects that timing when the sink lists it and it fits, else the preferred
+one. If the requested mode fails to light, the preferred mode is lit and
+the request cleared. The last DRM file closing returns to the preferred
+mode. Mode changes are therefore asynchronous to the ioctl (the next monitor
+pass, up to a second), and the switch path itself is composed from tested
+owner operations without a model of its own. Unplug (and `stop_modeset`)
 publish the connector disconnected, with no modes, no EDID, and no mode
 accepted. The CRTC is disabled with its framebuffer cleared, and open
 clients keep their GEM and framebuffer objects. DRM_IOCTL_VERSION reports

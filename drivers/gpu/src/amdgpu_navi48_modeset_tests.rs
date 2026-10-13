@@ -48,7 +48,7 @@ fn navi48_modeset_selects_first_answering_dp_sink_by_board_path() -> TestResult 
         port(paths[2], None, edid_1080p()),
         port(paths[3], dpcd(0x14, 4), edid_1080p()),
     ];
-    let Ok(s) = select(&paths, &ports, 8) else {
+    let Ok(s) = select(&paths, &ports, 8, None) else {
         return TestResult::Fail("no selection");
     };
     let t = s.timing;
@@ -75,12 +75,14 @@ fn navi48_modeset_selects_first_answering_dp_sink_by_board_path() -> TestResult 
         port(paths[2], dpcd(0x15, 4), edid_1080p()),
         port(paths[1], dpcd(0x14, 3), edid_1080p()),
     ];
-    if select(&paths, &ports, 8) != Err(ModesetError::NoSink) {
+    if select(&paths, &ports, 8, None) != Err(ModesetError::NoSink) {
         return TestResult::Fail("unusable sinks selected");
     }
     // A port missing from the board inventory is never addressed.
     let stray = path(Dp, 4);
-    if select(&paths, &[port(stray, dpcd(0x14, 4), edid_1080p())], 8) != Err(ModesetError::NoSink) {
+    if select(&paths, &[port(stray, dpcd(0x14, 4), edid_1080p())], 8, None)
+        != Err(ModesetError::NoSink)
+    {
         return TestResult::Fail("unrouted port selected");
     }
     TestResult::Pass
@@ -96,14 +98,14 @@ fn navi48_modeset_requires_link_payload_and_aligns_pitch() -> TestResult {
     // 148.5 MHz * 24 bpp needs 3.564 Gb/s of payload: 1-lane RBR is short,
     // 2-lane HBR (4.32) suffices. A short first sink falls through.
     let short = [port(paths[0], dpcd(0x06, 1), edid_1080p())];
-    if select(&paths, &short, 8) != Err(ModesetError::Link) {
+    if select(&paths, &short, 8, None) != Err(ModesetError::Link) {
         return TestResult::Fail("short link accepted");
     }
     let ports = [
         port(paths[0], dpcd(0x06, 1), edid_1080p()),
         port(paths[1], dpcd(0x0a, 2), edid_1080p()),
     ];
-    let Ok(s) = select(&paths, &ports, 8) else {
+    let Ok(s) = select(&paths, &ports, 8, None) else {
         return TestResult::Fail("fitting sink rejected");
     };
     if s.port != 1
@@ -127,7 +129,12 @@ kernel_test_in!(
 fn navi48_modeset_link_fallback_ladder_skips_short_links() -> TestResult {
     use inventory::Connector::DisplayPort as Dp;
     let paths = [path(Dp, 0)];
-    let Ok(s) = select(&paths, &[port(paths[0], dpcd(0x14, 4), edid_1080p())], 8) else {
+    let Ok(s) = select(
+        &paths,
+        &[port(paths[0], dpcd(0x14, 4), edid_1080p())],
+        8,
+        None,
+    ) else {
         return TestResult::Fail("selection");
     };
     use LinkRate::{Hbr, Hbr2, Rbr};
@@ -206,7 +213,7 @@ fn navi48_modeset_selects_hdmi_sinks_only_without_dp_and_below_340_mhz() -> Test
             sink: Err(display::Error::InvalidDpcd),
         },
     ];
-    match select(&paths, &ports, 8) {
+    match select(&paths, &ports, 8, None) {
         Ok(s) if s.port == 1 && s.hdmi && s.lanes == 0 && s.timing.pixel_clock_khz == 148_500 => {}
         _ => return TestResult::Fail("HDMI selection"),
     }
@@ -216,12 +223,12 @@ fn navi48_modeset_selects_hdmi_sinks_only_without_dp_and_below_340_mhz() -> Test
         port(paths[1], None, with_cta(edid_1080p(), true)),
         port(paths[2], dpcd(0x14, 4), with_cta(edid_1080p(), false)),
     ];
-    if !matches!(select(&paths, &ports, 8), Ok(s) if s.port == 2 && !s.hdmi) {
+    if !matches!(select(&paths, &ports, 8, None), Ok(s) if s.port == 2 && !s.hdmi) {
         return TestResult::Fail("DP preferred");
     }
     // 594 MHz needs SCDC scrambling, which this path does not do.
     let ports = [port(paths[1], None, with_cta(edid_2160p(), true))];
-    if select(&paths, &ports, 8) != Err(ModesetError::Link) {
+    if select(&paths, &ports, 8, None) != Err(ModesetError::Link) {
         return TestResult::Fail("over 340 MHz");
     }
     TestResult::Pass
@@ -305,7 +312,7 @@ fn navi48_modeset_reads_hdmi_caps_and_admits_scrambled_modes_only_with_scdc() ->
         None,
         with_blocks(edid_2160p(), &[VSDB, HF_VSDB]),
     )];
-    match select(&paths, &ports, 8) {
+    match select(&paths, &ports, 8, None) {
         Ok(s) if s.hdmi && s.scdc && s.timing.pixel_clock_khz == 594_000 => {}
         _ => return TestResult::Fail("4K60 HDMI 2.0 selection"),
     }
@@ -349,8 +356,8 @@ fn navi48_modeset_picks_the_deepest_hdmi_depth_that_fits() -> TestResult {
     use inventory::Connector::HdmiTypeA as Hdmi;
     let paths = [path(Hdmi, 0)];
     let ports = [port(paths[0], None, with_blocks(edid_1080p(), &[VSDB_DC]))];
-    if !matches!(select(&paths, &ports, 12), Ok(s) if s.depth == Bpc12)
-        || !matches!(select(&paths, &ports, 8), Ok(s) if s.depth == Bpc8)
+    if !matches!(select(&paths, &ports, 12, None), Ok(s) if s.depth == Bpc12)
+        || !matches!(select(&paths, &ports, 8, None), Ok(s) if s.depth == Bpc8)
     {
         return TestResult::Fail("selected depth");
     }
@@ -427,4 +434,58 @@ fn navi48_modeset_reads_hdmi_audio_like_amdgpu_dm() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_reads_hdmi_audio_like_amdgpu_dm
+);
+
+/// 1080p preferred, 2160p as the second base-block descriptor and 720p as a
+/// CTA extension DTD.
+fn edid_three_modes(hdmi: bool) -> Vec<u8> {
+    let mut e = edid_1080p();
+    e[72..90].copy_from_slice(&[
+        0x08, 0xe8, 0x00, 0x30, 0xf2, 0x70, 0x5a, 0x80, 0xb0, 0x58, 0x8a, 0, 0, 0, 0, 0, 0, 0x1e,
+    ]);
+    let mut e = with_cta(e, hdmi);
+    let at = 128 + usize::from(e[130]);
+    e[at..at + 18].copy_from_slice(&[
+        0x01, 0x1d, 0x00, 0x72, 0x51, 0xd0, 0x1e, 0x20, 0x6e, 0x28, 0x55, 0, 0, 0, 0, 0, 0, 0x1e,
+    ]);
+    e[255] = 0;
+    let sum = e[128..255].iter().fold(0u8, |s, b| s.wrapping_add(*b));
+    e[255] = 0u8.wrapping_sub(sum);
+    e
+}
+
+fn navi48_modeset_offers_edid_modes_and_selects_a_wanted_one() -> TestResult {
+    use inventory::Connector::{DisplayPort as Dp, HdmiTypeA as Hdmi};
+    let edid = edid_three_modes(false);
+    let modes = edid_timings(&edid);
+    if modes.iter().map(|t| t.h_active).collect::<Vec<_>>() != [1920, 3840, 1280] {
+        return TestResult::Fail("EDID detailed timings in order");
+    }
+    let (p1080, p2160, p720) = (modes[0], modes[1], modes[2]);
+    // Four HBR lanes carry 1080p and 720p, not 2160p.
+    let paths = [path(Dp, 0)];
+    let ports = [port(paths[0], dpcd(0x0a, 4), edid.clone())];
+    let pick = |want| select(&paths, &ports, 8, want).map(|s| s.timing);
+    let mut unlisted = p720;
+    unlisted.h_front_porch += 2;
+    if pick(Some(p720)) != Ok(p720)
+        || pick(None) != Ok(p1080)
+        || pick(Some(p2160)) != Ok(p1080)
+        || pick(Some(unlisted)) != Ok(p1080)
+    {
+        return TestResult::Fail("DP wanted mode");
+    }
+    // HDMI without SCDC: 2160p (594 MHz) does not fit, 720p does.
+    let edid = edid_three_modes(true);
+    let paths = [path(Hdmi, 0)];
+    let ports = [port(paths[0], None, edid)];
+    let pick = |want| select(&paths, &ports, 8, want).map(|s| s.timing);
+    if pick(Some(p720)) != Ok(p720) || pick(Some(p2160)) != Ok(p1080) {
+        return TestResult::Fail("HDMI wanted mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_offers_edid_modes_and_selects_a_wanted_one
 );

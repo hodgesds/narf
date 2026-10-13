@@ -230,8 +230,10 @@ impl Drop for DriCardFile {
         if LIVE_CARD_FILES.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
             narf_console::fb_release_from_user();
             // As drm_fb_helper restores the console on lastclose: a native
-            // display a client switched off lights again for the console.
+            // display a client switched off lights again for the console,
+            // in the sink's preferred mode.
             crate::amdgpu_navi48_platform::request_display_active(true);
+            crate::amdgpu_navi48_platform::request_display_mode(None);
         }
     }
 }

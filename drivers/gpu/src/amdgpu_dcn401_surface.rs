@@ -108,11 +108,13 @@ struct Surface {
     /// 64x64 ARGB cursor image, allocated on first use.
     cursor: Option<Reservation>,
 }
+/// The staged surface of each pipe, and the parked ones a geometry change
+/// left behind.
 #[derive(Debug)]
-pub(in super::super) struct Surfaces([Option<Surface>; 4]);
+pub(in super::super) struct Surfaces([Option<Surface>; 4], alloc::vec::Vec<Surface>);
 impl Surfaces {
     pub(in super::super) fn new() -> Self {
-        Self(core::array::from_fn(|_| None))
+        Self(core::array::from_fn(|_| None), alloc::vec::Vec::new())
     }
     pub(in super::super) async fn prepare<I: Io>(
         &mut self,
@@ -141,11 +143,26 @@ impl Surfaces {
         engine.surface_preflight(request.pipe, restage)?;
         // The same geometry reuses the buffers: a console write still in
         // flight to the old scanout can only land on this same surface. A new
-        // geometry drops them; published ranges then stay excluded from the
-        // pool forever (no writer-quiescence barrier exists to free them).
+        // geometry parks them instead: published ranges are never returned to
+        // the pool (no writer-quiescence barrier exists to free them), but a
+        // later request for a parked geometry on this pipe reuses that
+        // surface. Mode switches between the sink's few offered modes then
+        // retain at most one surface (front, back, cursor) per geometry.
+        if let Some(old) = self.0[slot].take() {
+            if old.applied.request == request {
+                self.0[slot] = Some(old);
+            } else {
+                self.1.push(old);
+            }
+        }
+        if self.0[slot].is_none() {
+            if let Some(i) = self.1.iter().position(|p| p.applied.request == request) {
+                self.0[slot] = Some(self.1.swap_remove(i));
+            }
+        }
         let (memory, back, cursor) = match self.0[slot].take() {
-            Some(old) if old.applied.request == request => (old.memory, old.back, old.cursor),
-            _ => (
+            Some(old) => (old.memory, old.back, old.cursor),
+            None => (
                 pool.reserve(bytes).map_err(|_| Error::Allocation)?,
                 None,
                 None,

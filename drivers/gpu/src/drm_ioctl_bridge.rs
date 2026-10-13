@@ -3385,6 +3385,8 @@ fn handle_atomic(
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .collect();
 
+    // The exact timing an atomic MODE_ID set, for the native display.
+    let mut native_mode: Option<crate::drm::ioctl::DrmModeModeInfo> = None;
     let mut state = crate::drm::atomic::AtomicState {
         allow_modeset: req.flags & ALLOW_MODESET != 0,
         ..Default::default()
@@ -3515,6 +3517,7 @@ fn handle_atomic(
                                 if !card.accepts_mode_blob(mode) {
                                     return Err(FsError::InvalidData);
                                 }
+                                native_mode = crate::drm::ioctl::DrmModeModeInfo::from_bytes(mode);
                                 Some(crate::Mode {
                                     width: u16::from_le_bytes(mode[4..6].try_into().unwrap())
                                         as u32,
@@ -3624,6 +3627,10 @@ fn handle_atomic(
             if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
                 for crtc in state.crtcs.iter().filter(|c| c.active_changed) {
                     crate::amdgpu_navi48_platform::request_display_active(crtc.active);
+                }
+                // A new mode is a native modeset the display monitor runs.
+                if state.crtcs.iter().any(|c| c.mode_changed) {
+                    crate::amdgpu_navi48_platform::request_display_mode(native_mode.as_ref());
                 }
             }
             let active_plane = state
@@ -4031,6 +4038,11 @@ fn handle_setcrtc(
             };
             if !card.accepts_mode(&wire) {
                 return Err(FsError::InvalidData);
+            }
+            if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+                // Another offered timing is a native modeset the display
+                // monitor runs; the current one leaves it as it is.
+                crate::amdgpu_navi48_platform::request_display_mode(Some(&wire));
             }
         }
 

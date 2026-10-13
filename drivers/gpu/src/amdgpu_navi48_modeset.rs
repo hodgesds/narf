@@ -141,6 +141,43 @@ pub struct Modeset {
     pub pipe: u8,
     pub plan: dml::Plan,
     pub scanout: otg::ScanoutRunning,
+    /// Every EDID timing this sink can be switched to on this link and
+    /// pipe (the running one included), in EDID order: what KMS offers.
+    pub modes: [Option<Timing>; MAX_MODES],
+}
+
+/// Modes offered per sink: the base block's four detailed timings plus
+/// room for CTA extension ones.
+pub const MAX_MODES: usize = 8;
+
+/// The sink's detailed timings the DCN timing model accepts, in EDID order
+/// (the base block's first, which EDID 1.3+ makes the preferred mode,
+/// then each CTA-861 extension's), without duplicates. Standard, established
+/// and CTA VIC timings need their own tables and are not offered.
+pub fn edid_timings(edid: &[u8]) -> Vec<Timing> {
+    let mut detailed = Vec::new();
+    if let Some(base) = edid
+        .get(..128)
+        .and_then(|b| narf_edid::Block::parse(b).ok())
+    {
+        detailed.extend(base.detailed_timings);
+    }
+    for block in edid.chunks_exact(128).skip(1) {
+        if block[0] == 0x02 {
+            if let Ok(cta) = narf_edid::cta861::CtaExtension::parse(block) {
+                detailed.extend(cta.detailed_timings);
+            }
+        }
+    }
+    let mut timings: Vec<Timing> = Vec::new();
+    for d in detailed {
+        if let Ok(t) = crate::amdgpu_dcn_display::timing_from_edid(&d) {
+            if !timings.contains(&t) {
+                timings.push(t);
+            }
+        }
+    }
+    timings
 }
 
 /// What a periodic check of a running modeset found.
@@ -277,7 +314,14 @@ pub fn select(
     paths: &[inventory::Path],
     ports: &[display::Port],
     max_bpc: u8,
+    want: Option<Timing>,
 ) -> Result<Selection, ModesetError> {
+    // The requested mode where the sink lists it and it fits, else the
+    // preferred one.
+    let pick = |edid: &[u8], fits: &dyn Fn(&Timing) -> bool| {
+        want.filter(|w| edid_timings(edid).contains(w) && fits(w))
+            .or_else(|| preferred(edid))
+    };
     let mut link_short = false;
     for port in ports {
         if port.path.connector != inventory::Connector::DisplayPort {
@@ -287,7 +331,7 @@ pub fn select(
         let Some((lanes, rate)) = sink.dpcd.as_ref().and_then(max_link) else {
             continue;
         };
-        let Some(timing) = preferred(&sink.edid) else {
+        let Some(timing) = pick(&sink.edid, &|t| link_fits(t, lanes, rate)) else {
             continue;
         };
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
@@ -321,7 +365,9 @@ pub fn select(
         if !caps.hdmi {
             continue;
         }
-        let Some(timing) = preferred(&sink.edid) else {
+        let Some(timing) = pick(&sink.edid, &|t| {
+            hdmi_depth(caps, t.pixel_clock_khz, max_bpc).is_some()
+        }) else {
             continue;
         };
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
@@ -524,14 +570,34 @@ impl ColdBoot {
     pub async unsafe fn modeset_display(
         &mut self,
         pipe: u8,
+        fill: impl FnMut(u32, &mut [u32]),
+    ) -> Result<Modeset, ModesetError> {
+        // SAFETY: the caller's obligations.
+        unsafe { self.modeset_display_mode(pipe, fill, None) }.await
+    }
+    /// `modeset_display` in `want` when the selected sink lists that timing
+    /// and it fits (one of a previous `Modeset::modes`), else the preferred
+    /// mode.
+    /// # Safety
+    /// As for `modeset_display`.
+    pub async unsafe fn modeset_display_mode(
+        &mut self,
+        pipe: u8,
         mut fill: impl FnMut(u32, &mut [u32]),
+        want: Option<Timing>,
     ) -> Result<Modeset, ModesetError> {
         if pipe >= 4 {
             return Err(ModesetError::Display(otg::Error::Invalid));
         }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self.display_paths().map_err(|_| ModesetError::NoSink)?;
-        let selection = select(paths, &ports, max_bpc())?;
+        let selection = select(paths, &ports, max_bpc(), want)?;
+        let full_edid = ports
+            .iter()
+            .find(|p| paths.get(selection.port) == Some(&p.path))
+            .and_then(|p| p.sink.as_ref().ok())
+            .map(|sink| sink.edid.clone())
+            .unwrap_or_default();
         let mode = mode(selection.timing);
         // The first clock request starts PMFW and publishes the DPM levels
         // admission needs; requests are clamped up to each clock's minimum.
@@ -588,13 +654,41 @@ impl ColdBoot {
                 Err(e) => return Err(e.into()),
             }
             let (selection, scanout) = self.start_link(selection, pipe).await?;
+            let modes = self.offered_modes(&selection, &full_edid);
             Ok(Modeset {
                 selection,
                 pipe,
                 plan,
                 scanout,
+                modes,
             })
         }
+    }
+    /// The sink's timings a later modeset could switch to: they fit the link
+    /// the selection trained (DP) or a TMDS depth (HDMI) and DML admits them
+    /// at the current clock levels. The running timing is always included.
+    fn offered_modes(&mut self, s: &Selection, edid: &[u8]) -> [Option<Timing>; MAX_MODES] {
+        let caps = hdmi_caps(edid);
+        let mut modes = [None; MAX_MODES];
+        let mut n = 0;
+        for t in edid_timings(edid) {
+            if n == MAX_MODES {
+                break;
+            }
+            let fits = if s.hdmi {
+                hdmi_depth(caps, t.pixel_clock_khz, max_bpc()).is_some()
+            } else {
+                link_fits(&t, s.lanes, s.rate)
+            };
+            if t == s.timing || (fits && self.display_admission(&mode(t)).is_ok()) {
+                modes[n] = Some(t);
+                n += 1;
+            }
+        }
+        if !modes.contains(&Some(s.timing)) {
+            modes[MAX_MODES - 1] = Some(s.timing);
+        }
+        modes
     }
     /// Train the selected sink down the fallback ladder from its selection,
     /// then start the frontend, video and scanout of the staged `pipe`.
