@@ -57,9 +57,25 @@ impl Io for MemoryIo {
         }
     }
 }
+/// What a plane-chain fixture stages: the surface (and its pool size), and
+/// the timing and pixel clock the pipe runs.
+#[derive(Clone, Copy)]
+struct Mode {
+    surface: SurfaceRequest,
+    bytes: usize,
+    timing: Request,
+    clock: dccg::Applied,
+}
 fn staged(p: u8) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces) {
-    let (backing, pool, mut e, mut surfaces) = fixture(p, 8192);
-    run(surfaces.prepare(&mut e, &pool, req(p))).unwrap();
+    staged_with(p, req(p), 8192)
+}
+fn staged_with(
+    p: u8,
+    request: SurfaceRequest,
+    bytes: usize,
+) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces) {
+    let (backing, pool, mut e, mut surfaces) = fixture(p, bytes);
+    run(surfaces.prepare(&mut e, &pool, request)).unwrap();
     e.io.inner.writes.clear();
     // Poison every programmable field, including valid inherited root, so a
     // dropped write cannot accidentally look like the intended configuration.

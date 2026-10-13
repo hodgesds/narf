@@ -6,6 +6,8 @@
 use super::*;
 use crate::amdgpu_gmc_navi48::{DisplayContext, Gmc};
 
+/// HUBP_UNDERFLOW_STATUS (HUBP_CNTL bits 30:28).
+const HUBP_UNDERFLOW_STATUS: u32 = 0x7000_0000;
 const SEGMENTS: u8 = 21; // DCN4_01_CRB_SIZE_KB / DCN4_01_CRB_SEGMENT_SIZE_KB
 const DET_SEGMENTS: u8 = 5; // DCN4_01_DEFAULT_DET_SIZE = 320 KiB
 const SEGMENT_BYTES: u32 = 65536;
@@ -88,14 +90,28 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     pub(super) fn requestor_errors(&mut self, pipe: u8) -> Result<(), Error> {
+        self.requestor_faults(pipe, 0)
+    }
+    /// Error/status bits of HUBP_CONTROL other than `tolerated`.
+    fn requestor_faults(&mut self, pipe: u8, tolerated: u32) -> Result<(), Error> {
         // Keep error/status acknowledgements and timeout IRQ ownership out of
         // the setup RMWs. A pre-existing error requires explicit recovery.
-        if self.read(self.layout.hubp(pipe, HUBP_CONTROL))? & 0xfcf00800 != 0 {
+        if self.read(self.layout.hubp(pipe, HUBP_CONTROL))? & 0xfcf00800 & !tolerated != 0 {
             return Err(Error::Busy);
         }
         Ok(())
     }
     pub(super) fn verify_requestor(&mut self, pipe: u8) -> Result<(), Error> {
+        self.verify_requestor_with(pipe, 0)
+    }
+    /// The requestor of a pipe whose fetch may be live: an underflow there
+    /// is the scanout's to detect and recover (back to black), so its
+    /// status bits must not make the owners look foreign. Without this an
+    /// underflowed live scanout could be neither checked nor stopped.
+    pub(super) fn verify_live_requestor(&mut self, pipe: u8) -> Result<(), Error> {
+        self.verify_requestor_with(pipe, HUBP_UNDERFLOW_STATUS)
+    }
+    fn verify_requestor_with(&mut self, pipe: u8, tolerated: u32) -> Result<(), Error> {
         if self.crb_stable()? != allocation(pipe) {
             return Err(Error::Busy);
         }
@@ -109,7 +125,7 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at));
             }
         }
-        self.requestor_errors(pipe)
+        self.requestor_faults(pipe, tolerated)
     }
 }
 impl Surfaces {

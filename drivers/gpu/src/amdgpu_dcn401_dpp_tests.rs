@@ -121,16 +121,32 @@ impl Io for DppIo {
 fn ready(p: u8) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
     ready_depth(p, ColorDepth::Bpc8)
 }
+/// The small default plane mode: a 65x3 surface on a 65x3-active timing.
+fn small(p: u8) -> Mode {
+    let mut t = request(p);
+    t.timing.h_active = 65;
+    t.timing.v_active = 3;
+    Mode {
+        surface: req(p),
+        bytes: 8192,
+        timing: t,
+        clock: clock(t),
+    }
+}
 fn ready_depth(
     p: u8,
     depth: ColorDepth,
 ) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
-    let (backing, pool, mut e, mut surfaces) = staged(p);
+    ready_with(p, depth, small(p))
+}
+fn ready_with(
+    p: u8,
+    depth: ColorDepth,
+    mode: Mode,
+) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
+    let (backing, pool, mut e, mut surfaces) = staged_with(p, mode.surface, mode.bytes);
     run(surfaces.prepare_memory(&mut e, p, || Ok(config()))).unwrap();
-    let mut t = request(p);
-    t.timing.h_active = 65;
-    t.timing.v_active = 3;
-    let clock = clock(t);
+    let (t, clock) = (mode.timing, mode.clock);
     run(e.prepare(t, clock)).unwrap();
     run(e.prepare_blank(BlankRequest { pipe: p, depth }, clock)).unwrap();
     for (r, value) in RGB {

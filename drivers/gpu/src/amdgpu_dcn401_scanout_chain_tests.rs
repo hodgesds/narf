@@ -1,0 +1,555 @@
+//! Owner-level scanout over the whole staged chain: a DML plan drives the
+//! surface, VMID context, timing, black DPG, DPP, MPC, requestor and
+//! deadlines through their real `prepare_*` steps, a TMDS HDMI link and its
+//! black video run on that pipe, and only then does `Surfaces::start_scanout`
+//! re-bind every owner and connect fetch. The OTG lock/VUPDATE latch model
+//! below wraps the HDMI transmitter model, so route, latch, write-loss,
+//! cancellation, link-loss and owner-change cases run against the same
+//! retained state the modeset builds, on every pipe with independent
+//! PHY/stream/pipe routing.
+use super::*;
+use crate::amdgpu_dcn401_dml as dml;
+use crate::amdgpu_dcn401_otg::tests::hdmi_link::{dio, path, phy, resync, Firmware, TmdsIo};
+use alloc::sync::Arc;
+use core::future::Future;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+
+// Native register offsets (dword index, per-pipe stride), written out here
+// rather than borrowed from the driver so the model checks the driver.
+fn otg(p: u8, r: u64) -> u64 {
+    BASE + (r + u64::from(p) * 0x80) * 4
+}
+fn opp(p: u8, r: u64) -> u64 {
+    BASE + (r + u64::from(p) * 0x5a) * 4
+}
+fn mpcc(p: u8, r: u64) -> u64 {
+    MPC_BASE + (r + u64::from(p) * 0x15) * 4
+}
+fn optc_input(p: u8) -> u64 {
+    BASE + (0x1aca + u64::from(p) * 0x10) * 4
+}
+const LOCK: u64 = 0x1b89;
+const LOCK_REQUEST: u32 = 1;
+const LOCK_STATUS: u32 = 0x100;
+const FRAME_COUNT: u64 = 0x1b4d;
+const HUBP_CONTROL: u64 = 0x5f4;
+const BLANK_EN: u32 = 1;
+const NO_OUTSTANDING: u32 = 2;
+const HUBP_UNDERFLOW: u32 = 0x1000_0000;
+const HUBP_UNDERFLOW_CLEAR: u32 = 0x8000_0000;
+const OPTC_UNDERFLOW: u32 = 0x400;
+const OPTC_UNDERFLOW_CLEAR: u32 = 0x1000;
+const ADDRESS: u64 = 0x60a;
+const ADDRESS_HIGH: u64 = 0x60b;
+const FLIP: u64 = 0x613;
+const FLIP_PENDING: u32 = 0x100;
+const EARLIEST_INUSE: u64 = 0x61c;
+const EARLIEST_INUSE_HIGH: u64 = 0x61d;
+const DPG: u64 = 0x1854;
+const DPG_PENDING: u64 = 0x185b;
+const MPC_STATUS: u64 = 0xe;
+const TOP: u64 = 0;
+const GLOBAL_TIMER: u64 = 0x527;
+const TX_CLOCKS: u64 = 0x2931;
+const CRYSTAL_KHZ: u32 = 100_000;
+
+/// The OTG master-update lock and the VUPDATE that follows its release:
+/// the lock is granted on request (unless withheld), and `latch_delay`
+/// register reads after the release the double-buffered state latches. The frame counter advances on every read unless frozen.
+struct ScanIo {
+    inner: TmdsIo,
+    pipe: u8,
+    armed: bool,
+    grant: bool,
+    latch_delay: u32,
+    pending_latch: Option<u32>,
+    frozen: bool,
+    frame: u32,
+    /// A write to this address is lost (the register keeps its value).
+    drop: Option<u64>,
+    /// Raise HUBP underflow after this many armed writes.
+    underflow_after: Option<usize>,
+    writes: usize,
+    /// Set once the lock has been requested (a cancellation point).
+    lock_requested: Arc<AtomicBool>,
+}
+impl ScanIo {
+    fn get(&mut self, at: u64) -> u32 {
+        self.inner.inner.regs.get(&at).copied().unwrap_or(0)
+    }
+    fn put(&mut self, at: u64, value: u32) {
+        self.inner.inner.regs.insert(at, value);
+    }
+    fn latch(&mut self) {
+        let p = self.pipe;
+        let low = self.get(h(p, ADDRESS));
+        let high = self.get(h(p, ADDRESS_HIGH));
+        self.put(h(p, EARLIEST_INUSE), low);
+        self.put(h(p, EARLIEST_INUSE_HIGH), high);
+        let flip = self.get(h(p, FLIP)) & !FLIP_PENDING;
+        self.put(h(p, FLIP), flip);
+        self.put(opp(p, DPG_PENDING), 0);
+        let connected = self.get(mpcc(p, TOP)) & 0xf != 0xf;
+        self.put(mpcc(p, MPC_STATUS), if connected { 2 } else { 5 });
+        let control = self.get(h(p, HUBP_CONTROL));
+        self.put(
+            h(p, HUBP_CONTROL),
+            if connected {
+                control & !NO_OUTSTANDING
+            } else {
+                control | NO_OUTSTANDING
+            },
+        );
+    }
+}
+impl Io for ScanIo {
+    fn read(&mut self, at: u64) -> u32 {
+        if !self.armed {
+            return self.inner.read(at);
+        }
+        let p = self.pipe;
+        if at == otg(p, FRAME_COUNT) {
+            if !self.frozen {
+                self.frame = self.frame.wrapping_add(1);
+            }
+            return self.frame & 0xff_ffff;
+        }
+        // VUPDATE arrives `latch_delay` register reads after the release.
+        match self.pending_latch {
+            Some(0) => {
+                self.pending_latch = None;
+                self.latch();
+            }
+            Some(n) => self.pending_latch = Some(n - 1),
+            None => {}
+        }
+        self.inner.read(at)
+    }
+    fn write(&mut self, at: u64, value: u32) {
+        if !self.armed {
+            return self.inner.write(at, value);
+        }
+        self.writes += 1;
+        if self.drop == Some(at) {
+            self.drop = None;
+            return;
+        }
+        let p = self.pipe;
+        let mut value = value;
+        if at == otg(p, LOCK) {
+            if value & LOCK_REQUEST != 0 {
+                self.lock_requested.store(true, Ordering::SeqCst);
+                if self.grant {
+                    value |= LOCK_STATUS;
+                }
+            } else {
+                value &= !LOCK_STATUS;
+                self.pending_latch = Some(self.latch_delay);
+            }
+        }
+        if at == opp(p, DPG) {
+            self.put(opp(p, DPG_PENDING), 1);
+        }
+        if at == h(p, ADDRESS) {
+            let flip = self.get(h(p, FLIP)) | FLIP_PENDING;
+            self.put(h(p, FLIP), flip);
+        }
+        if at == h(p, HUBP_CONTROL) {
+            if value & BLANK_EN != 0 {
+                value |= NO_OUTSTANDING;
+            }
+            if value & HUBP_UNDERFLOW_CLEAR != 0 {
+                value &= !(0x7000_0000 | HUBP_UNDERFLOW_CLEAR);
+            }
+        }
+        if at == optc_input(p) && value & OPTC_UNDERFLOW_CLEAR != 0 {
+            value &= !(OPTC_UNDERFLOW | OPTC_UNDERFLOW_CLEAR);
+        }
+        self.inner.write(at, value);
+        if self.underflow_after == Some(self.writes) {
+            let control = self.get(h(p, HUBP_CONTROL)) | HUBP_UNDERFLOW;
+            self.put(h(p, HUBP_CONTROL), control);
+        }
+    }
+}
+
+fn soc() -> dml::Soc {
+    dml::Soc {
+        umc_channels: 16,
+        uclk_khz: 1_250_000,
+        fclk_khz: [300_000, 2_500_000],
+        dcfclk_khz: [200_000, 1_564_000],
+        socclk_khz: 300_000,
+        dispclk_max_khz: 2_000_000,
+        dppclk_max_khz: 2_000_000,
+        dentist_vco_khz: 4_500_000,
+        dchub_refclk_khz: 50_000,
+    }
+}
+/// CEA 640x480p60, the plan every owner below is derived from.
+fn plan() -> dml::Plan {
+    let timing = Timing {
+        pixel_clock_khz: 25_175,
+        h_active: 640,
+        h_total: 800,
+        h_front_porch: 16,
+        h_sync_width: 96,
+        v_active: 480,
+        v_total: 525,
+        v_front_porch: 10,
+        v_sync_width: 2,
+        h_sync_positive: false,
+        v_sync_positive: false,
+    };
+    dml::admit(&soc(), &dml::Mode { timing, pitch: 640 }).unwrap()
+}
+/// The plane mode and pixel clock the modeset derives from `plan` for TMDS.
+fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
+    let t = Request {
+        pipe,
+        signal: Signal::Tmds,
+        timing: plan.mode.timing,
+        sync: plan.sync,
+    };
+    let mut c = clock(t);
+    c.request.dpp_khz = plan.clocks.dppclk_khz;
+    c.request.pixel = dccg::PixelClock::Tmds {
+        divider: dccg::TmdsDivider::By4,
+    };
+    c.global.request.display_khz = plan.clocks.dispclk_khz;
+    c.global.request.dpp_khz = plan.clocks.dpprefclk_khz;
+    c.global.display_khz = plan.clocks.dispclk_khz;
+    c.global.dpp_khz = plan.clocks.dpprefclk_khz;
+    c.global.dcf_floor_khz = plan.soc.dcfclk_khz[1];
+    c.global.memory_floor_khz = plan.soc.uclk_khz;
+    Mode {
+        surface: SurfaceRequest {
+            pipe,
+            width: 640,
+            height: 480,
+            format: SurfaceFormat::Xrgb8888,
+        },
+        bytes: 640 * 4 * 480,
+        timing: t,
+        clock: c,
+    }
+}
+
+/// Everything a live scanout retains, staged and with HDMI black video
+/// running: (transmitter, stream, pipe) are independent.
+struct Chain {
+    _backing: Vec<u32>,
+    _pool: Pool,
+    e: Engine<ScanIo>,
+    surfaces: Surfaces,
+    clock: dccg::Applied,
+    address: u64,
+    pipe: u8,
+}
+fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
+    let plan = plan();
+    let mode = hdmi_mode(pipe, &plan);
+    let (backing, pool, mut e, mut surfaces, clock) =
+        ready_requests_with(pipe, [21, 0, 0, 0, 0], mode);
+    e.io.delay = [0; 5];
+    run(surfaces.prepare_requestor(&mut e, pipe, || Ok((clock, config())))).unwrap();
+    e.io.fake().regs.insert(BASE + GLOBAL_TIMER * 4, 0x1002);
+    let deadlines =
+        run(surfaces.prepare_deadlines(&mut e, pipe, &plan, CRYSTAL_KHZ, || Ok((clock, config()))));
+    assert_eq!(deadlines.map(|d| d.plan), Ok(plan), "deadlines");
+    let address = e.status.surfaces[usize::from(pipe)].unwrap().address;
+    // The plane wrappers' staging handshakes are done; keep their register
+    // file under the HDMI transmitter model, as fixture_with arranges it.
+    let mut fake = e.io.inner.surface.inner;
+    for i in 0..4 {
+        fake.regs.insert(phy(i, 0x2943), 0x03030303);
+    }
+    fake.regs.insert(dio(phy_index, 0x20bc), 3 << 28);
+    fake.regs.insert(resync(phy_index), 0x30);
+    fake.encoder_stall = 1 << stream;
+    // Plane retirement is over: MPCC status is the lock/latch model's now.
+    fake.disconnecting = false;
+    fake.writes.clear();
+    let event = Arc::new(AtomicU8::new(0));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let mut fw = Firmware {
+        ready: true,
+        commands: Vec::new(),
+        event: event.clone(),
+        writes: writes.clone(),
+        fail: None,
+    };
+    let mut e = Engine {
+        io: ScanIo {
+            inner: TmdsIo {
+                inner: fake,
+                phy: phy_index,
+                stream,
+                event,
+                writes,
+                on: false,
+                dead: false,
+                az: alloc::collections::BTreeMap::new(),
+                az_index: [0; 4],
+            },
+            pipe,
+            armed: false,
+            grant: true,
+            latch_delay: 0,
+            pending_latch: None,
+            frozen: false,
+            frame: 7,
+            drop: None,
+            underflow_after: None,
+            writes: 0,
+            lock_requested: Arc::new(AtomicBool::new(false)),
+        },
+        authority: e.authority,
+        layout: e.layout,
+        status: e.status,
+    };
+    let request = crate::amdgpu_dcn401_otg::HdmiLinkRequest { stream, pipe };
+    run(e.prepare_hdmi_link(&mut fw, path(phy_index), request, clock)).unwrap();
+    run(e.start_hdmi_video(path(phy_index), clock)).unwrap();
+    assert_eq!(e.status.state, State::HdmiVideoRunning(stream));
+    e.io.armed = true;
+    Chain {
+        _backing: backing,
+        _pool: pool,
+        e,
+        surfaces,
+        clock,
+        address,
+        pipe,
+    }
+}
+impl Chain {
+    async fn start(&mut self) -> Result<ScanoutRunning, Error> {
+        let c = self.clock;
+        self.surfaces
+            .start_scanout(&mut self.e, self.pipe, CRYSTAL_KHZ, || Ok((c, config())))
+            .await
+    }
+    async fn check(&mut self) -> Result<u32, Error> {
+        let c = self.clock;
+        self.surfaces
+            .check_scanout(&mut self.e, self.pipe, CRYSTAL_KHZ, || Ok((c, config())))
+            .await
+    }
+    async fn stop(&mut self) -> Result<(), Error> {
+        let c = self.clock;
+        self.surfaces
+            .stop_scanout(&mut self.e, self.pipe, CRYSTAL_KHZ, || Ok((c, config())))
+            .await
+    }
+}
+/// Poll `f` until `reached`, then drop it: cancellation at that point.
+fn cancel_at(f: impl Future, mut reached: impl FnMut() -> bool) {
+    let mut f = core::pin::pin!(f);
+    let deadline = narf_time::Deadline::after_us(1_000_000);
+    run(core::future::poll_fn(|cx| {
+        if f.as_mut().poll(cx).is_ready() {
+            panic!("finished before the cancellation point");
+        }
+        if reached() {
+            core::task::Poll::Ready(())
+        } else {
+            assert!(!deadline.expired(), "cancellation point not reached");
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    }));
+}
+
+const ROUTES: [(u8, u8, u8); 4] = [(0, 0, 0), (1, 3, 2), (2, 1, 3), (3, 2, 1)];
+
+fn dcn401_scanout_chain_runs_on_every_pipe_over_hdmi_video() -> TestResult {
+    for (t, s, p) in ROUTES {
+        let mut c = chain(t, s, p);
+        let Ok(live) = run(c.start()) else {
+            return TestResult::Fail("start over the staged chain");
+        };
+        if live.pipe != p
+            || live.stream != s
+            || live.address != c.address
+            || c.e.status.state != State::ScanoutRunning(p)
+            || c.e.status.scanout != Some(live)
+        {
+            return TestResult::Fail("running record");
+        }
+        // Routes are this pipe's own; no other pipe's MPCC was touched.
+        for other in (0..4).filter(|o| *o != p) {
+            if c.e.io.get(mpcc(other, TOP)) & 0xf != 0xf {
+                return TestResult::Fail("another pipe's MPCC");
+            }
+        }
+        if run(c.check()).is_err() {
+            return TestResult::Fail("health check of a live scanout");
+        }
+        if run(c.stop()).is_err() || c.e.status.state != State::HdmiVideoRunning(s) {
+            return TestResult::Fail("stop back to black video");
+        }
+        // Black video stays running and the pipe restarts from it.
+        if run(c.start()).is_err() || run(c.stop()).is_err() {
+            return TestResult::Fail("restart");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_runs_on_every_pipe_over_hdmi_video
+);
+
+fn dcn401_scanout_chain_waits_for_delayed_latches_and_fails_lost_writes() -> TestResult {
+    // The release latches several VUPDATE polls later; start still waits.
+    let mut c = chain(1, 3, 2);
+    c.e.io.latch_delay = 200;
+    if run(c.start()).is_err() {
+        return TestResult::Fail("delayed latch");
+    }
+    c.e.io.latch_delay = 200;
+    if run(c.stop()).is_err() {
+        return TestResult::Fail("delayed latch on stop");
+    }
+    // A lost write is caught by its readback at once; the pipe is
+    // quarantined rather than reported running, and is not restartable.
+    for (t, st, p, lost) in [(2, 1, 3, mpcc(3, TOP)), (0, 0, 0, opp(0, DPG))] {
+        let mut c = chain(t, st, p);
+        c.e.io.drop = Some(lost);
+        if run(c.start()) != Err(Error::Readback(lost))
+            || c.e.status.state != State::Failed(Error::Readback(lost))
+            || run(c.start()) != Err(Error::Busy)
+        {
+            return TestResult::Fail("lost write");
+        }
+    }
+    // A requested address is not presentation: with no VUPDATE latch the
+    // start times out on EARLIEST_INUSE.
+    let mut c = chain(1, 3, 2);
+    c.e.io.latch_delay = u32::MAX;
+    if run(c.start()) != Err(Error::Timeout(h(2, EARLIEST_INUSE))) {
+        return TestResult::Fail("unlatched address accepted");
+    }
+    // A lock that is never granted fails before any route moves.
+    let mut c = chain(3, 2, 1);
+    c.e.io.grant = false;
+    if run(c.start()).is_ok() || c.e.io.get(mpcc(1, TOP)) & 0xf != 0xf {
+        return TestResult::Fail("ungranted lock");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_waits_for_delayed_latches_and_fails_lost_writes
+);
+
+fn dcn401_scanout_chain_owner_changes_and_cancellation_quarantine() -> TestResult {
+    // The clock owner changes while start waits for the latch.
+    let mut c = chain(1, 3, 2);
+    let first = c.clock;
+    let mut changed = first;
+    changed.request.dpp_khz += 1;
+    let mut calls = 0;
+    let result = run(c.surfaces.start_scanout(&mut c.e, 2, CRYSTAL_KHZ, || {
+        calls += 1;
+        Ok((if calls == 1 { first } else { changed }, config()))
+    }));
+    if result != Err(Error::Busy) || c.e.status.state != State::Failed(Error::Busy) {
+        return TestResult::Fail("owner change during start");
+    }
+    // ... and while stop drains.
+    let mut c = chain(0, 0, 0);
+    let mine = c.clock;
+    let mut other = mine;
+    other.request.dpp_khz += 1;
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let mut calls = 0;
+    let result = run(c.surfaces.stop_scanout(&mut c.e, 0, CRYSTAL_KHZ, || {
+        calls += 1;
+        Ok((if calls == 1 { mine } else { other }, config()))
+    }));
+    if result != Err(Error::Busy) || c.e.status.state != State::Failed(Error::Busy) {
+        return TestResult::Fail("owner change during stop");
+    }
+    // Cancelled while waiting for the lock: retained, quarantined, and not
+    // replayable.
+    let mut c = chain(3, 2, 1);
+    c.e.io.grant = false;
+    let requested = c.e.io.lock_requested.clone();
+    let clock = c.clock;
+    cancel_at(
+        c.surfaces
+            .start_scanout(&mut c.e, 1, CRYSTAL_KHZ, || Ok((clock, config()))),
+        || requested.load(Ordering::SeqCst),
+    );
+    if c.e.status.state != State::StartingScanout(1)
+        || run(c.start()) != Err(Error::Busy)
+        || run(c.check()) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("cancelled start");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_owner_changes_and_cancellation_quarantine
+);
+
+fn dcn401_scanout_chain_link_loss_and_underflow_while_running() -> TestResult {
+    // The transmitter loses its clocks under a live scanout: the check
+    // reports it without writing, and the pipe can still go back to black.
+    let mut c = chain(2, 1, 3);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let tx = phy(2, TX_CLOCKS);
+    let lost = c.e.io.get(tx) & !0x6f0;
+    c.e.io.put(tx, lost);
+    let before = c.e.io.writes;
+    if run(c.check()).is_ok() || c.e.io.writes != before {
+        return TestResult::Fail("link loss not reported, or written");
+    }
+    if c.e.status.state != State::ScanoutRunning(3) || run(c.stop()).is_err() {
+        return TestResult::Fail("stop after link loss");
+    }
+    // Frames stop advancing: start never reports fresh frames.
+    let mut c = chain(0, 0, 0);
+    c.e.io.frozen = true;
+    if !matches!(run(c.start()), Err(Error::Timeout(at)) if at == otg(0, FRAME_COUNT)) {
+        return TestResult::Fail("frozen timing");
+    }
+    // Underflow under a live scanout returns to black video and retains the
+    // diagnostics; the pipe starts again afterwards.
+    let mut c = chain(1, 3, 2);
+    if run(c.start()).is_err() {
+        return TestResult::Fail("start");
+    }
+    let control = c.e.io.get(h(2, HUBP_CONTROL)) | HUBP_UNDERFLOW;
+    c.e.io.put(h(2, HUBP_CONTROL), control);
+    if !matches!(run(c.check()), Err(Error::Underflow(_)))
+        || c.e.status.state != State::HdmiVideoRunning(3)
+        || c.e.status.scanout.is_some()
+        || c.e.status.underflow.map(|u| (u.pipe, u.address)) != Some((2, c.address))
+    {
+        return TestResult::Fail("underflow recovery");
+    }
+    if run(c.start()).is_err() || run(c.stop()).is_err() {
+        return TestResult::Fail("restart after underflow");
+    }
+    // Underflow during start itself is recovered the same way.
+    let mut c = chain(3, 2, 1);
+    c.e.io.underflow_after = Some(12);
+    if !matches!(run(c.start()), Err(Error::Underflow(_)))
+        || c.e.status.state != State::HdmiVideoRunning(2)
+    {
+        return TestResult::Fail("underflow during start");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_link_loss_and_underflow_while_running
+);

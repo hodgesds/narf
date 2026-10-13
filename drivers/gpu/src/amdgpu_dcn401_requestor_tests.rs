@@ -1,4 +1,6 @@
 use super::*;
+#[path = "amdgpu_dcn401_scanout_chain_tests.rs"]
+mod scanout_chain;
 
 fn crb(index: usize) -> u64 {
     BASE + (0x4ba + index as u64) * 4
@@ -80,7 +82,14 @@ fn ready_requests(
     p: u8,
     sizes: [u8; 5],
 ) -> (Vec<u32>, Pool, Engine<RequestIo>, Surfaces, dccg::Applied) {
-    let (backing, pool, mut e, mut surfaces, clock) = ready_mpc(p, ColorDepth::Bpc8);
+    ready_requests_with(p, sizes, small(p))
+}
+fn ready_requests_with(
+    p: u8,
+    sizes: [u8; 5],
+    mode: Mode,
+) -> (Vec<u32>, Pool, Engine<RequestIo>, Surfaces, dccg::Applied) {
+    let (backing, pool, mut e, mut surfaces, clock) = ready_mpc_with(p, ColorDepth::Bpc8, mode);
     surfaces
         .prepare_mpc(&mut e, p, || Ok((clock, config())))
         .unwrap();

@@ -485,7 +485,7 @@ impl Surfaces {
         e.verify_surface(surface)?;
         e.verify_memory(d.pipe, config)?;
         e.verify_mpc(mpc)?;
-        e.verify_requestor(d.pipe)?;
+        e.verify_live_requestor(d.pipe)?;
         e.deadline_writes(d.pipe, &d.plan, true)?;
         let refclk = e.dchub_refclk_khz(crystal_khz)?;
         if !deadline::bound(&d.plan, blank.timing.request, a, clock, refclk) {

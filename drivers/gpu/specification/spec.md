@@ -816,7 +816,20 @@ in `Status::underflow`, runs the stop sequence without failing on the sticky
 status, strobes `HUBP_UNDERFLOW_CLEAR`/`OPTC_UNDERFLOW_CLEAR`, requires the
 status to stay clear with fetch blanked, rebinds the owners and returns to
 `DpVideoRunning`. If that cannot be proven, the pipe is `Failed`. Other start
-failures quarantine without recovery.
+failures quarantine without recovery. Rebinding a live pipe tolerates the
+HUBP underflow status bits in the requestor check (they are the scanout's to
+detect and recover); every other requestor error, and an underflow inherited
+by setup, still fails it. Without that, an underflowed live pipe could be
+neither checked nor stopped.
+
+Model coverage runs owner-level start/check/stop over a chain staged by the
+real steps from a DML plan (surface, VMID context, timing, black DPG, DPP, MPC,
+requestor, deadlines, TMDS link and black video) on every pipe with
+independent PHY/stream/pipe routing: delayed VUPDATE latches, lost writes
+(caught by readback), an ungranted lock, a never-latching address, owner
+changes during start and stop, cancellation at the lock wait, transmitter
+clock loss and frozen timing under scanout, and underflow during start and
+while running.
 
 `unsafe ColdBoot::modeset_display(pipe, fill).await` (platform
 `modeset_display`) orchestrates the above on one legacy DP SST or TMDS HDMI

@@ -40,7 +40,14 @@ fn ready_mpc(
     p: u8,
     depth: ColorDepth,
 ) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces, dccg::Applied) {
-    let (backing, pool, mut e, mut surfaces, clock) = ready_depth(p, depth);
+    ready_mpc_with(p, depth, small(p))
+}
+fn ready_mpc_with(
+    p: u8,
+    depth: ColorDepth,
+    mode: Mode,
+) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces, dccg::Applied) {
+    let (backing, pool, mut e, mut surfaces, clock) = ready_with(p, depth, mode);
     e.io.delay = [0; 2]; // DPP acknowledgement timing is covered by its own tests.
     run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).unwrap();
     let mut e = Engine {

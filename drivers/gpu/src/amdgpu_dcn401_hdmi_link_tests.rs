@@ -9,16 +9,16 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 const ENABLED: u8 = 1;
 const DISABLED: u8 = 2;
 
-fn dio(p: u8, reg: u64) -> u64 {
+pub(in crate::amdgpu_dcn401_otg::tests) fn dio(p: u8, reg: u64) -> u64 {
     BASE + (reg + u64::from(p) * 0x124) * 4
 }
-fn phy(p: u8, reg: u64) -> u64 {
+pub(in crate::amdgpu_dcn401_otg::tests) fn phy(p: u8, reg: u64) -> u64 {
     BASE + (reg + u64::from(p) * 0xd8) * 4
 }
-fn resync(p: u8) -> u64 {
+pub(in crate::amdgpu_dcn401_otg::tests) fn resync(p: u8) -> u64 {
     (0x16240 + u64::from(p)) * 4
 }
-fn path(p: u8) -> Path {
+pub(in crate::amdgpu_dcn401_otg::tests) fn path(p: u8) -> Path {
     Path {
         connector: Connector::HdmiTypeA,
         connector_instance: 1,
@@ -29,19 +29,19 @@ fn path(p: u8) -> Path {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Command {
+pub(in crate::amdgpu_dcn401_otg::tests) enum Command {
     Clock(Path, u8, u32, dmub::TmdsDepth),
     Setup(u8, u32),
     Enable(Path, u32),
     Disable(Path),
 }
-struct Firmware {
-    ready: bool,
+pub(in crate::amdgpu_dcn401_otg::tests) struct Firmware {
+    pub(in crate::amdgpu_dcn401_otg::tests) ready: bool,
     /// Each command with the number of register writes before it.
-    commands: Vec<(Command, usize)>,
-    event: Arc<AtomicU8>,
-    writes: Arc<AtomicUsize>,
-    fail: Option<(usize, dmub::Error)>,
+    pub(in crate::amdgpu_dcn401_otg::tests) commands: Vec<(Command, usize)>,
+    pub(in crate::amdgpu_dcn401_otg::tests) event: Arc<AtomicU8>,
+    pub(in crate::amdgpu_dcn401_otg::tests) writes: Arc<AtomicUsize>,
+    pub(in crate::amdgpu_dcn401_otg::tests) fail: Option<(usize, dmub::Error)>,
 }
 impl Firmware {
     fn issue(&mut self, c: Command, event: u8) -> Result<(), dmub::Error> {
@@ -81,18 +81,18 @@ impl crate::amdgpu_dcn401_otg::hdmi_link::Firmware for Firmware {
     }
 }
 /// Firmware-owned transmitter effects and the frontend clock/FIFO handshakes.
-struct TmdsIo {
-    inner: Fake,
-    phy: u8,
-    stream: u8,
-    event: Arc<AtomicU8>,
-    writes: Arc<AtomicUsize>,
-    on: bool,
+pub(in crate::amdgpu_dcn401_otg::tests) struct TmdsIo {
+    pub(in crate::amdgpu_dcn401_otg::tests) inner: Fake,
+    pub(in crate::amdgpu_dcn401_otg::tests) phy: u8,
+    pub(in crate::amdgpu_dcn401_otg::tests) stream: u8,
+    pub(in crate::amdgpu_dcn401_otg::tests) event: Arc<AtomicU8>,
+    pub(in crate::amdgpu_dcn401_otg::tests) writes: Arc<AtomicUsize>,
+    pub(in crate::amdgpu_dcn401_otg::tests) on: bool,
     /// The transmitter never reports its lanes.
-    dead: bool,
+    pub(in crate::amdgpu_dcn401_otg::tests) dead: bool,
     /// Azalia endpoint index/data windows: (endpoint, index) -> value.
-    az: alloc::collections::BTreeMap<(u8, u32), u32>,
-    az_index: [u32; 4],
+    pub(in crate::amdgpu_dcn401_otg::tests) az: alloc::collections::BTreeMap<(u8, u32), u32>,
+    pub(in crate::amdgpu_dcn401_otg::tests) az_index: [u32; 4],
 }
 impl TmdsIo {
     fn reg(&self, at: u64) -> u32 {
