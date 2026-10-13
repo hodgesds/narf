@@ -11,7 +11,9 @@
 //!
 //! Table layouts follow `atomfirmware.h`
 //! (`atom_display_controller_info_v4_*`, `atom_integrated_system_info_v2_*`,
-//! `display_object_info_table_v1_4`) and `displayobject.h`; the transmitter
+//! `display_object_info_table_v1_4`). Object ids use `ObjectID.h`, the values
+//! Linux's `bios_parser_common.c` decodes these tables with (never the
+//! unused `displayobject.h` numbering); the transmitter
 //! mapping follows Linux `link_factory.c::translate_encoder_to_transmitter` and
 //! the VCO read follows `dcn314_clk_mgr.c::get_vco_frequency_from_reg`.
 use crate::{
@@ -36,7 +38,7 @@ const TABLE_INTEGRATED_SYSTEM_INFO: u16 = 30;
 /// four-byte common header plus `supporteddevices` and `number_of_path`.
 const PATH_SIZE: usize = 16;
 const PATHS_OFFSET: usize = 8;
-/// `displayobject.h` object-id encoding.
+/// `ObjectID.h` object-id encoding.
 const OBJECT_ID_MASK: u16 = 0x00ff;
 const ENUM_ID_SHIFT: u32 = 8;
 const ENUM_ID_MASK: u16 = 0x0f00;
@@ -237,17 +239,19 @@ fn transmitter(encoder_objid: u16) -> Result<u8, Error> {
         return Err(Error::Unsupported);
     }
     let enum_id = (encoder_objid & ENUM_ID_MASK) >> ENUM_ID_SHIFT;
-    // UNIPHY is 1, UNIPHY1 is 2, UNIPHY2 is 3; each pairs two transmitters.
-    let pair = match encoder_objid & OBJECT_ID_MASK {
-        1 => 0,
-        2 => 1,
-        3 => 2,
+    // UNIPHY (0x1e), UNIPHY1 (0x20) and UNIPHY2 (0x21) each pair two
+    // transmitters; UNIPHY3 (0x25) carries only G.
+    let (pair, enums) = match encoder_objid & OBJECT_ID_MASK {
+        0x1e => (0, 2),
+        0x20 => (1, 2),
+        0x21 => (2, 2),
+        0x25 => (3, 1),
         _ => return Err(Error::Unsupported),
     };
-    match enum_id {
-        1 | 2 => Ok(pair * 2 + (enum_id as u8 - 1)),
-        _ => Err(Error::Unsupported),
+    if !(1..=enums).contains(&enum_id) {
+        return Err(Error::Unsupported);
     }
+    Ok(pair * 2 + (enum_id as u8 - 1))
 }
 fn connector(objid: u16) -> Result<(Connector, u8), Error> {
     if (objid & OBJECT_TYPE_MASK) >> OBJECT_TYPE_SHIFT != TYPE_CONNECTOR {
@@ -258,9 +262,9 @@ fn connector(objid: u16) -> Result<(Connector, u8), Error> {
         return Err(Error::Invalid);
     }
     let kind = match (objid & OBJECT_ID_MASK) as u8 {
-        0x03 => Connector::HdmiTypeA,
-        0x05 => Connector::DisplayPort,
-        0x06 => Connector::EmbeddedDisplayPort,
+        0x0c => Connector::HdmiTypeA,
+        0x13 => Connector::DisplayPort,
+        0x14 => Connector::EmbeddedDisplayPort,
         other => Connector::Other(other),
     };
     Ok((kind, instance))

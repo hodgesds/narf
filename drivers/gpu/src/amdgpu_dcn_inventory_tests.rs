@@ -35,7 +35,7 @@ impl Image {
         this.point(TABLE_INTEGRATED_SYSTEM_INFO, INTEGRATED);
         this.dce(2_700);
         this.integrated(MEM_TYPE_DDR5, 4);
-        this.paths(&[(0x3505, 0x2101), (0x3606, 0x2202)]);
+        this.paths(&[(0x3513, 0x211e), (0x3614, 0x2220)]);
         this
     }
     fn gpios(&mut self) {
@@ -149,8 +149,9 @@ fn inventory_display_paths_decode_their_transmitters() -> TestResult {
         Ok(paths) => paths,
         Err(_) => return TestResult::Fail("synthetic display object table rejected"),
     };
-    // 0x3505 is a connector (type 3), kind 5 (DisplayPort), enum 5; its encoder
-    // 0x2101 is an encoder (type 2), UNIPHY (id 1), enum 1 — transmitter A.
+    // 0x3513 is a connector (type 3), kind 0x13 (DisplayPort), enum 5; its
+    // encoder 0x211e is an encoder (type 2), UNIPHY (0x1e), enum 1 — transmitter
+    // A. These are ObjectID.h ids, as Linux's bios_parser_common decodes them.
     if paths.len() != 2 {
         return TestResult::Fail("path count");
     }
@@ -166,7 +167,7 @@ fn inventory_display_paths_decode_their_transmitters() -> TestResult {
     {
         return TestResult::Fail("first path");
     }
-    // 0x3606 is eDP enum 6; encoder 0x2202 is UNIPHY1 enum 2 — transmitter D.
+    // 0x3614 is eDP enum 6; encoder 0x2220 is UNIPHY1 enum 2 — transmitter D.
     if paths[1].connector != Connector::EmbeddedDisplayPort
         || paths[1].connector_instance != 6
         || paths[1].transmitter != 3
@@ -177,12 +178,13 @@ fn inventory_display_paths_decode_their_transmitters() -> TestResult {
     // The full pairing: UNIPHY, UNIPHY1 and UNIPHY2 each carry two
     // transmitters, selected by the enum id.
     for (objid, expected) in [
-        (0x2101u16, 0u8),
-        (0x2201, 1),
-        (0x2102, 2),
-        (0x2202, 3),
-        (0x2103, 4),
-        (0x2203, 5),
+        (0x211eu16, 0u8),
+        (0x221e, 1),
+        (0x2120, 2),
+        (0x2220, 3),
+        (0x2121, 4),
+        (0x2221, 5),
+        (0x2125, 6),
     ] {
         if transmitter(objid) != Ok(expected) {
             return TestResult::Fail("transmitter mapping");
@@ -190,7 +192,9 @@ fn inventory_display_paths_decode_their_transmitters() -> TestResult {
     }
     // A connector is not an encoder, an unknown encoder has no transmitter,
     // and enum zero is not an instance.
-    for objid in [0x3505u16, 0x2109, 0x2001, 0x2104] {
+    // UNIPHY3 has no second transmitter, and displayobject.h's UNIPHY (1) is
+    // ObjectID.h's LVDS, never a transmitter.
+    for objid in [0x3513u16, 0x2109, 0x201e, 0x2122, 0x2225, 0x2101] {
         if transmitter(objid).is_ok() {
             return TestResult::Fail("non-encoder accepted as a transmitter");
         }
@@ -199,7 +203,11 @@ fn inventory_display_paths_decode_their_transmitters() -> TestResult {
     if connector(0x3509) != Ok((Connector::Other(9), 5)) {
         return TestResult::Fail("unnamed connector kind");
     }
-    if connector(0x3005).is_ok() {
+    // displayobject.h's DisplayPort id (5) is ObjectID.h's VGA.
+    if connector(0x3505) != Ok((Connector::Other(5), 5)) {
+        return TestResult::Fail("displayobject.h id decoded as DisplayPort");
+    }
+    if connector(0x3013).is_ok() {
         return TestResult::Fail("connector with enum zero accepted");
     }
     TestResult::Pass
@@ -213,7 +221,7 @@ fn inventory_skips_paths_it_cannot_read_but_refuses_empty() -> TestResult {
     // A board may wire something alongside the DisplayPort connectors; an
     // unreadable path is skipped rather than failing the whole table.
     let mut image = Image::new();
-    image.paths(&[(0x3505, 0x2101), (0x3505, 0x2109), (0x1005, 0x2101)]);
+    image.paths(&[(0x3513, 0x211e), (0x3513, 0x2109), (0x1013, 0x211e)]);
     let paths = match display_paths(image.bytes()) {
         Ok(paths) => paths,
         Err(_) => return TestResult::Fail("table with one readable path rejected"),
@@ -223,13 +231,13 @@ fn inventory_skips_paths_it_cannot_read_but_refuses_empty() -> TestResult {
     }
     // A table with nothing readable is not a topology we can use.
     let mut none = Image::new();
-    none.paths(&[(0x3505, 0x2109)]);
+    none.paths(&[(0x3513, 0x2109)]);
     if display_paths(none.bytes()) != Err(Error::Unsupported) {
         return TestResult::Fail("table with no readable path accepted");
     }
     // A path array that runs past the table's own declared size is malformed.
     let mut lying = Image::new();
-    lying.paths(&[(0x3505, 0x2101)]);
+    lying.paths(&[(0x3513, 0x211e)]);
     lying.0[DISPLAY_OBJECT + 6] = 8;
     if display_paths(lying.bytes()) != Err(Error::Invalid) {
         return TestResult::Fail("path count past the declared size accepted");
@@ -451,7 +459,7 @@ fn inventory_route_is_validated_against_the_board() -> TestResult {
     }
     // A board whose connector is neither DisplayPort nor eDP is not this path.
     let mut hdmi = Image::new();
-    hdmi.paths(&[(0x3503, 0x2101)]);
+    hdmi.paths(&[(0x350c, 0x211e)]);
     let hdmi_paths = display_paths(hdmi.bytes()).unwrap();
     if routes_for_sink(
         &hdmi_paths,
@@ -505,7 +513,7 @@ fn inventory_tunnelled_sinks_borrow_an_unwired_transmitter_first() -> TestResult
     }
     // A board that wires nothing leaves every transmitter spare.
     let mut bare = Image::new();
-    bare.paths(&[(0x3505, 0x2103)]);
+    bare.paths(&[(0x3513, 0x2121)]);
     let bare_paths = display_paths(bare.bytes()).unwrap();
     let bare_order: Vec<u8> = routes_for_sink(&bare_paths, &sink, 0)
         .unwrap()
@@ -533,7 +541,7 @@ kernel_test_in!(
 fn inventory_native_route_keeps_aux_hpd_and_transmitter_separate() -> TestResult {
     let mut image = Image::new();
     // Transmitter F, AUX3, HPD5; frontend B chosen independently by the caller.
-    image.paths(&[(0x3505, 0x2203)]);
+    image.paths(&[(0x3513, 0x2221)]);
     image.0[RECORDS + 2] = 0x44;
     image.0[RECORDS + 6] = 0x83;
     // A decoy list at the old absolute address must never influence routing.
@@ -590,7 +598,7 @@ fn inventory_routes_follow_discovery_and_generation_specific_dig() -> TestResult
     dcn.base_addrs[2] = DCN_BASE;
     gpu.ip_blocks.push(dcn);
     let mut image = Image::new();
-    image.paths(&[(0x3505, 0x2203)]);
+    image.paths(&[(0x3513, 0x2221)]);
     image.0[RECORDS + 6] = 0x83;
     let paths = super::display_paths(&gpu, image.bytes()).unwrap();
     let sink = crate::amdgpu_usbc::Sink {
@@ -656,7 +664,7 @@ fn inventory_routing_rejects_ambiguous_pins_bridges_and_truncation() -> TestResu
         return TestResult::Fail("duplicate GPIO uid accepted");
     }
     let mut image = Image::new();
-    image.paths(&[(0x3505, 0x2101)]);
+    image.paths(&[(0x3513, 0x211e)]);
     image.0[DISPLAY_OBJECT + PATHS_OFFSET + 6] = 1;
     if display_paths(image.bytes()) != Err(Error::Unsupported) {
         return TestResult::Fail("external encoder silently bypassed");
@@ -697,7 +705,7 @@ fn inventory_navi48_v15_routes_and_backend_stride() -> TestResult {
     gpu.regs.virt = regs.as_mut_ptr() as u64;
     gpu.regs.len = regs.len() as u64 * 4;
     let mut image = Image::new();
-    image.paths(&[(0x3105, 0x2202)]);
+    image.paths(&[(0x3113, 0x2220)]);
     image.0[DISPLAY_OBJECT + 3] = 5;
     // v1.5's reserved USB-C word must not become a v1.4 external encoder.
     image.0[DISPLAY_OBJECT + PATHS_OFFSET + 6] = 1;

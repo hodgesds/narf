@@ -2934,6 +2934,10 @@ revision or self-inconsistent fails closed.
 `display_paths(gpu, vbios)` walks `display_object_info_table_v1_4/v1_5`, resolving
 DCN314, Navi22/DCN3.0 or Navi48/DCN4.0.1 from discovery. It decodes each path's
 connector and UNIPHY transmitter separately from its hardware AUX and HPD lines.
+Object ids are `ObjectID.h` values, as Linux's `bios_parser_common.c` decodes
+them: connectors HDMI-A `0x0c`, DisplayPort `0x13`, eDP `0x14`; encoders UNIPHY
+`0x1e`, UNIPHY1 `0x20`, UNIPHY2 `0x21` (two transmitters each, by enum id) and
+UNIPHY3 `0x25` (transmitter G only). `displayobject.h` numbering is not used.
 Connector record offsets are relative to the display-object table. The I2C and
 HPD record IDs are keys into `atom_gpio_pin_lut_v2_1`; the GPIO register and bit
 are matched against the discovered DCN bank to obtain the AUX channel and
