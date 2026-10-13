@@ -544,6 +544,7 @@ fn spawn_supervisor_task() {
             hid::mouse::pump_all(c);
             hid::touchpad::pump_all(c);
             cdc_acm::pump_all(c);
+            xpad::pump_all(c);
             SUPERVISOR_PHASE.store(8, core::sync::atomic::Ordering::Relaxed);
             // Power management: suspend any downstream port whose
             // last activity is older than IDLE_SUSPEND_NS. Pumps

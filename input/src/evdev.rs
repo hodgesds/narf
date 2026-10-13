@@ -959,6 +959,20 @@ pub fn dispatch_key_to_node(node: &DeviceNode, code: u16, pressed: bool) {
     node.dispatch(EvdevEvent::syn_report(now));
 }
 
+pub fn dispatch_abs_to_node(node: &DeviceNode, code: u16, value: i32) {
+    let now = narf_time::monotonic_ns();
+    node.dispatch(EvdevEvent {
+        time: now,
+        type_: EventType::Abs,
+        code,
+        value,
+    });
+}
+
+pub fn dispatch_syn_report_to_node(node: &DeviceNode) {
+    node.dispatch(EvdevEvent::syn_report(narf_time::monotonic_ns()));
+}
+
 // ── Procfs snapshot API ───────────────────────────────────────────────────────
 
 /// A point-in-time snapshot of one registered input device, suitable for
