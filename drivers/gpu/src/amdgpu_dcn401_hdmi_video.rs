@@ -119,7 +119,10 @@ impl<I: Io> Engine<I> {
         path: Path,
     ) -> Result<(), Error> {
         let running = self.status.hdmi_video_running.ok_or(Error::Invalid)?;
-        if self.status.state != State::HdmiVideoRunning(running.link.request.stream) {
+        // Linux's link_set_dpms_off disables audio before the stream.
+        if self.status.state != State::HdmiVideoRunning(running.link.request.stream)
+            || self.status.hdmi_audio.is_some()
+        {
             return Err(Error::Busy);
         }
         if running.link.path != path {

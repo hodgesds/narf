@@ -42,7 +42,8 @@ pub use hdmi::HdmiTmdsRetired;
 #[path = "amdgpu_dcn401_hdmi_link.rs"]
 mod hdmi_link;
 pub use hdmi_link::{
-    HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning, TMDS_MAX_KHZ, TMDS_SCRAMBLE_KHZ,
+    AudioMode, HdmiAudio, HdmiAudioInfo, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,
+    TMDS_MAX_KHZ, TMDS_SCRAMBLE_KHZ,
 };
 #[path = "amdgpu_dcn401_tmds_timing.rs"]
 mod tmds_timing;
@@ -320,6 +321,8 @@ pub struct Status {
     /// External RGB black video on the owned HDMI link. Current only in
     /// HdmiVideoRunning (or beneath a live scanout); never memory retirement.
     pub hdmi_video_running: Option<HdmiVideoRunning>,
+    /// Audio on the running HDMI video; must stop before the video does.
+    pub hdmi_audio: Option<HdmiAudio>,
     /// Historical timing/input clock-off only; all PHYs and memory stay retained.
     pub tmds_timing_retired: Option<TmdsTimingRetired>,
     /// Historical TMDS backend/lane/TX-clock stop, never memory retirement.
@@ -476,7 +479,7 @@ impl Layout {
                 ip::HW_ID_DCN,
                 &[(4, 0, 1), (4, 1, 0)],
                 1,
-                0xa3,
+                0xad, // through DCCG_AUDIO_DTO0_MODULE
             )
             .map_err(|_| Error::Unsupported)?
                 + 0xa0 * 4,
@@ -777,6 +780,7 @@ impl Otg {
                     hdmi_tmds_retired: None,
                     hdmi_link_ready: None,
                     hdmi_video_running: None,
+                    hdmi_audio: None,
                     tmds_timing_retired: None,
                     tmds_disabled: None,
                     frl_encoder_retired: None,

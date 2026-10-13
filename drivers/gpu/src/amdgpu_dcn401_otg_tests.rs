@@ -157,6 +157,8 @@ impl Io for Fake {
                 || (BASE + 0x4fc * 4..=BASE + 0x523 * 4).contains(&at) // arbiter/watermarks
                 || (0x162a0 * 4..=0x162a3 * 4).contains(&at)
                 || (0x16240 * 4..=0x16243 * 4).contains(&at) // PHYPLL deep-colour resync
+                || (0x162ab * 4..=0x162ad * 4).contains(&at) // audio DTO0
+                || at == BASE + 0x40c * 4 // Azalia stream formats
                 || at == 0x16266 * 4 // descriptor's DCN bank 1 + SYMCLK32_LE_CNTL
                 || at == BASE + 0x4a * 4 // native FRL character-clock root
                 || at == BASE + 0xa0 * 4 // native DC_IP_REQUEST_CNTL, bank 2
@@ -179,7 +181,9 @@ impl Io for Fake {
                         0x2125, 0x212e, 0x20bb, 0x20bd, 0x2121, 0x2134, 0x212d, 0x2133, 0x2129,
                         0x2093, 0x211f, 0x2120, 0x2124, 0x2162, 0x2163, 0x2164, 0x2165, 0x2146,
                         0x2126, 0x2127, 0x2128, 0x20a2, 0x20a8, 0x20eb, 0x20b1, 0x2068, 0x2069,
-                        0x206b, 0x206c, 0x206d,
+                        0x206b, 0x206c, 0x206d, 0x20a0, 0x20a1, 0x20a3, 0x20a4, 0x20b2,
+                        0x20b3, 0x20b4, 0x20b5, 0x20b6, 0x20b7, 0x20ba, 0x2075, 0x2078, 0x2079,
+                        0x207f, 0x2082, 0x2083, 0x2085, 0x2087,
                     ]
                     .iter()
                     .any(|r| at == BASE + (r + p * 0x124) * 4)
@@ -365,6 +369,7 @@ pub(super) fn engine() -> Engine<Fake> {
             hdmi_tmds_retired: None,
             hdmi_link_ready: None,
             hdmi_video_running: None,
+            hdmi_audio: None,
             tmds_timing_retired: None,
             tmds_disabled: None,
             frl_encoder_retired: None,

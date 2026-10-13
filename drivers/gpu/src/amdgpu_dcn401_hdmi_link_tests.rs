@@ -90,6 +90,9 @@ struct TmdsIo {
     on: bool,
     /// The transmitter never reports its lanes.
     dead: bool,
+    /// Azalia endpoint index/data windows: (endpoint, index) -> value.
+    az: alloc::collections::BTreeMap<(u8, u32), u32>,
+    az_index: [u32; 4],
 }
 impl TmdsIo {
     fn reg(&self, at: u64) -> u32 {
@@ -100,8 +103,17 @@ impl TmdsIo {
         self.inner.regs.insert(at, v);
     }
 }
+fn az(e: u8) -> u64 {
+    BASE + (0x386 + 6 * u64::from(e)) * 4
+}
 impl Io for TmdsIo {
     fn read(&mut self, at: u64) -> u32 {
+        for e in 0..4u8 {
+            if at == az(e) + 4 {
+                let i = self.az_index[usize::from(e)];
+                return self.az.get(&(e, i)).copied().unwrap_or(0);
+            }
+        }
         let (p, s) = (self.phy, self.stream);
         match self.event.swap(0, Ordering::SeqCst) {
             ENABLED if !self.dead => {
@@ -133,6 +145,16 @@ impl Io for TmdsIo {
     }
     fn write(&mut self, at: u64, value: u32) {
         self.writes.fetch_add(1, Ordering::SeqCst);
+        for e in 0..4u8 {
+            if at == az(e) {
+                self.az_index[usize::from(e)] = value;
+                return;
+            }
+            if at == az(e) + 4 {
+                self.az.insert((e, self.az_index[usize::from(e)]), value);
+                return;
+            }
+        }
         self.inner.write(at, value);
         // VPG GSP memory leaves light sleep once sleep is disabled.
         if at == dio(self.stream, 0x206d) && value & 1 != 0 {
@@ -207,6 +229,8 @@ fn fixture_with(
             writes,
             on: false,
             dead: false,
+            az: alloc::collections::BTreeMap::new(),
+            az_index: [0; 4],
         },
         authority: e.authority,
         layout: e.layout,
@@ -576,4 +600,185 @@ fn dcn401_hdmi_link_deep_colour_scales_the_character_clock() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_link_deep_colour_scales_the_character_clock
+);
+
+fn audio_info() -> HdmiAudioInfo {
+    let mut info = HdmiAudioInfo {
+        manufacturer_id: 0x4c2d,
+        product_id: 0x0f99,
+        name: [0; 18],
+        speakers: 0x0b, // FL/FR, LFE, RL/RR
+        modes: [AudioMode::default(); 16],
+        mode_count: 2,
+        video_latency: 0,
+        audio_latency: 0,
+    };
+    info.name[..2].copy_from_slice(b"TV");
+    info.modes[0] = AudioMode {
+        format: 1,
+        channels: 2,
+        rates: 0x07,
+        byte2: 0x07,
+    };
+    info.modes[1] = AudioMode {
+        format: 2,
+        channels: 6,
+        rates: 0x07,
+        byte2: 0x50,
+    };
+    info
+}
+
+fn dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux() -> TestResult {
+    let (p, stream, pipe) = (1, 2, 3);
+    let (mut e, mut fw, c) = fixture(p, stream, pipe);
+    run(e.prepare_hdmi_link(&mut fw, path(p), link(stream, pipe), c)).unwrap();
+    // Audio follows running video, as Linux's post-enable does.
+    assert_eq!(
+        run(e.start_hdmi_audio(path(p), audio_info())),
+        Err(Error::Busy)
+    );
+    run(e.start_hdmi_video(path(p), c)).unwrap();
+    let a = run(e.start_hdmi_audio(path(p), audio_info())).unwrap();
+    let r = |e: &Engine<TmdsIo>, at| e.io.inner.regs.get(&at).copied().unwrap_or(0);
+    let bank1 = |reg: u64| (0x16200 + reg) * 4;
+    // DTO0 from the pixel clock, phase 24 MHz, sourced by this OTG.
+    if r(&e, bank1(0xab)) & 0x37 != u32::from(pipe)
+        || r(&e, bank1(0xad)) != 1_485_000
+        || r(&e, bank1(0xac)) != 240_000
+    {
+        return TestResult::Fail("audio DTO");
+    }
+    // ACR: 148.5 MHz table row, automatic send, hardware CTS.
+    for (reg, value) in [
+        (0x20b2, 148_500 << 12),
+        (0x20b3, 4096),
+        (0x20b4, 165_000 << 12),
+        (0x20b5, 6272),
+        (0x20b6, 148_500 << 12),
+        (0x20b7, 6144),
+    ] {
+        if r(&e, dio(stream, reg)) != value {
+            return TestResult::Fail("ACR N/CTS");
+        }
+    }
+    for (reg, mask, value) in [
+        (0x20ba, 1, 1),                        // AFMT audio clock
+        (0x20a1, 0x8000_1100, 0x1000),         // ACR auto, HW CTS
+        (0x20a0, 0x30, 0x10),                  // audio delay
+        (0x2085, u32::MAX, u32::from(stream)), // endpoint = stream
+        (0x2075, 0x1000_ff01, 0x3700),         // FL FR LFE RL RR enabled
+        (0x2078, 0x30f0_0000, 0x0010_0000),
+        (0x2079, 0x00f0_0000, 0x0020_0000),
+        (0x207f, 0x00ff_ffff, 0x0087_6543),
+        (0x2082, 0x0400_0001, 0x0400_0001), // CS update, samples sent
+        (0x20a3, 0x30, 0x10),               // Audio InfoFrame
+        (0x20a4, 0x3f00, 0x200),            // on line 2
+        (0x2087, 0x30, 0),
+    ] {
+        if r(&e, dio(stream, reg)) & mask != value {
+            return TestResult::Fail("encoder audio");
+        }
+    }
+    let az = |e: &Engine<TmdsIo>, i: u32| e.io.az.get(&(stream, i)).copied();
+    if az(&e, 0x54) != Some(0x8000_0000)
+        || az(&e, 0x25).map(|v| v & 0x37f7f) != Some(0x1_000b)
+        || az(&e, 0x28) != Some(1 | 0x700 | 0x7 << 16 | 0x07 << 24)
+        || az(&e, 0x29) != Some(5 | 0x700 | 0x50 << 16)
+        || az(&e, 0x30).is_some() // one-bit audio (9) is never written
+        || az(&e, 0x2a) != Some(0)
+        || az(&e, 0x38).map(|v| v & 1) != Some(1)
+        || az(&e, 0x3a) != Some(0x0f99_4c2d)
+        || az(&e, 0x3b) != Some(3)
+        || az(&e, 0x3c) != Some(0x5558_859e)
+        || az(&e, 0x3e) != Some(u32::from_le_bytes(*b"TV\0\0"))
+        || r(&e, BASE + 0x40c * 4) != 5 // AC-3 present
+        || a.endpoint != stream
+    {
+        return TestResult::Fail("Azalia endpoint");
+    }
+    // AFMT clock-on witnesses are this owner's while audio runs.
+    let fe = dio(stream, 0x2094);
+    let v = r(&e, fe);
+    e.io.inner.regs.insert(fe, v | 0x5000);
+    let live = e.status.hdmi_video_running.unwrap().link;
+    if e.hdmi_link_verify(live, true).is_err() {
+        return TestResult::Fail("audio clocks refused");
+    }
+    e.io.inner.regs.insert(fe, v);
+    assert_eq!(
+        run(e.start_hdmi_audio(path(p), audio_info())),
+        Err(Error::Busy)
+    );
+    assert_eq!(run(e.stop_hdmi_video(path(p))), Err(Error::Busy));
+    run(e.stop_hdmi_audio(path(p))).unwrap();
+    if r(&e, dio(stream, 0x2082)) & 1 != 0
+        || r(&e, dio(stream, 0x20ba)) & 1 != 0
+        || r(&e, dio(stream, 0x20a3)) & 0x30 != 0
+        || az(&e, 0x54) != Some(0)
+        || e.status.hdmi_audio.is_some()
+    {
+        return TestResult::Fail("audio stop");
+    }
+    run(e.stop_hdmi_video(path(p))).unwrap();
+    run(e.stop_hdmi_link(&mut fw, path(p))).unwrap();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_audio_programs_dto_acr_afmt_and_the_endpoint_like_linux
+);
+
+fn dcn401_hdmi_audio_tables_bandwidth_and_refusals() -> TestResult {
+    use crate::amdgpu_dcn401_otg::hdmi_link::audio::{acr, channels, hdmi_rates};
+    use dmub::TmdsDepth::{Bpc10, Bpc12, Bpc8};
+    if acr(Bpc8, 148_500) != [4096, 148_500, 6272, 165_000, 6144, 148_500]
+        || acr(Bpc10, 148_500) != acr(Bpc8, 148_500) // Linux: 30 bpc uses 24
+        || acr(Bpc12, 148_500) != [4096, 222_750, 6272, 247_500, 6144, 222_750]
+        || acr(Bpc8, 241_500) != [4096, 241_500, 6272, 241_500, 6144, 241_500]
+    {
+        return TestResult::Fail("ACR tables");
+    }
+    // 5.1 with rear centre: RC moves to channel 5 without RL/RR.
+    if channels(0x01) != 0x03 || channels(0x0f) != 0x3f || channels(0x17) != 0x1f {
+        return TestResult::Fail("channel enables");
+    }
+    // 480p blanking carries at most 48 kHz (56,640 samples/s by Linux's
+    // estimate) for any channel count; 1080p carries up to 192 kHz.
+    let hd = request(0).timing;
+    if hdmi_rates(&hd, Bpc8, 8, 0x7f) != 0x7f {
+        return TestResult::Fail("1080p audio bandwidth");
+    }
+    let mut t = hd;
+    (
+        t.pixel_clock_khz,
+        t.h_active,
+        t.h_total,
+        t.v_active,
+        t.v_total,
+    ) = (27_000, 720, 858, 480, 525);
+    if hdmi_rates(&t, Bpc8, 8, 0x7f) != 0x07 || hdmi_rates(&t, Bpc8, 2, 0x7f) != 0x07 {
+        return TestResult::Fail("audio bandwidth");
+    }
+    // No LPCM mode: nothing for the codec to stream.
+    let (mut e, mut fw, c) = fixture(0, 0, 0);
+    run(e.prepare_hdmi_link(&mut fw, path(0), link(0, 0), c)).unwrap();
+    run(e.start_hdmi_video(path(0), c)).unwrap();
+    let mut info = audio_info();
+    info.modes[0] = info.modes[1];
+    info.mode_count = 1;
+    assert_eq!(
+        run(e.start_hdmi_audio(path(0), info)),
+        Err(Error::Unsupported)
+    );
+    info.mode_count = 0;
+    assert_eq!(run(e.start_hdmi_audio(path(0), info)), Err(Error::Invalid));
+    if e.status.hdmi_audio.is_some() || e.status.state != State::HdmiVideoRunning(0) {
+        return TestResult::Fail("refusal changed state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_audio_tables_bandwidth_and_refusals
 );

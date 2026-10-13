@@ -1655,6 +1655,38 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Start audio on the port's running HDMI video.
+    /// # Safety
+    /// Fulfil `Otg::start_hdmi_audio` obligations.
+    pub async unsafe fn start_display_hdmi_audio(
+        &mut self,
+        port: usize,
+        info: otg::HdmiAudioInfo,
+    ) -> Result<otg::HdmiAudio, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained board path/owners; caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_hdmi_audio(path, info)
+                .await
+        }
+    }
+    /// Mute and stop the port's HDMI audio.
+    /// # Safety
+    /// Fulfil `Otg::stop_hdmi_audio` obligations.
+    pub async unsafe fn stop_display_hdmi_audio(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained board path/owners; caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_hdmi_audio(path)
+                .await
+        }
+    }
     /// Read one SCDC register of an HDMI port's sink over native DDC.
     pub async fn display_scdc_read(&mut self, port: usize, offset: u8) -> Result<u8, ddc::Error> {
         let channel = self.scdc_channel(port)?;

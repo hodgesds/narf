@@ -493,7 +493,10 @@ modes above 340 MHz (e.g. 4K60) now run scrambled when the EDID declares SCDC
 and a covering HF rate: native DDC gained SCDC register reads/writes, the sink
 is configured before the link starts and returned to legacy on stop. HDMI deep
 colour (10/12 bpc RGB, opt-in with `amdgpu.max_bpc`) scales the TMDS character
-clock as Linux does. Not yet: YCbCr/4:2:0 and audio. None of it has run on hardware.
+clock as Linux does. HDMI audio's display half (audio DTO, ACR, AFMT channel
+status, Azalia endpoint/ELD, Audio InfoFrame) is programmed after scanout for
+sinks declaring audio; the HD-Audio controller/codec side is not yet driven.
+Not yet: YCbCr/4:2:0. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and
 requires all three stream clocks off. Native DME4, immediate packets, audio/ACR,

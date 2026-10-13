@@ -18,6 +18,9 @@ use core::future::Future;
 #[path = "amdgpu_dcn401_hdmi_video.rs"]
 mod video;
 pub use video::HdmiVideoRunning;
+#[path = "amdgpu_dcn401_hdmi_audio.rs"]
+pub(super) mod audio;
+pub use audio::{AudioMode, HdmiAudio, HdmiAudioInfo};
 
 /// Highest TMDS character rate without scrambling (HDMI 1.4). Above it the
 /// stream scrambles and the clock channel runs at 1/4 rate. Linux's encoder
@@ -224,7 +227,13 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
-        if self.read(fe(0x2094))? & 0x5020 != 0 || self.read(fe(0x209e))? & 0x400 != 0 {
+        // AFMT clocks run only for this owner's audio.
+        let afmt = if self.status.hdmi_audio.is_some() {
+            0x20
+        } else {
+            0x5020
+        };
+        if self.read(fe(0x2094))? & afmt != 0 || self.read(fe(0x209e))? & 0x400 != 0 {
             return Err(Error::Busy);
         }
         Ok(())

@@ -364,3 +364,67 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_picks_the_deepest_hdmi_depth_that_fits
 );
+
+fn navi48_modeset_reads_hdmi_audio_like_amdgpu_dm() -> TestResult {
+    let mut base = edid_1080p();
+    base[8..12].copy_from_slice(&[0x2d, 0x4c, 0x99, 0x0f]);
+    // Monitor name descriptor "Living TV\n".
+    base[72..90].copy_from_slice(&[
+        0, 0, 0, 0xfc, 0, b'L', b'i', b'v', b'i', b'n', b'g', b' ', b'T', b'V', 0x0a, 0x20, 0x20,
+        0x20,
+    ]);
+    // LPCM 2ch 32/44.1/48 kHz 16/20/24-bit, AC-3 6ch; speakers FL/FR LFE FC;
+    // HDMI VSDB with progressive latencies 40/20.
+    const AUDIO: &[u8] = &[1 << 5 | 6, 0x09, 0x07, 0x07, 0x15, 0x07, 0x50];
+    const SPEAKERS: &[u8] = &[4 << 5 | 3, 0x07, 0, 0];
+    const VSDB_LAT: &[u8] = &[
+        3 << 5 | 10,
+        0x03,
+        0x0c,
+        0x00,
+        0x10,
+        0x00,
+        0,
+        0,
+        0x80,
+        40,
+        20,
+    ];
+    let edid = with_blocks(base.clone(), &[AUDIO, SPEAKERS, VSDB_LAT]);
+    let Some(info) = hdmi_audio_info(&edid) else {
+        return TestResult::Fail("no audio");
+    };
+    if info.manufacturer_id != 0x4c2d
+        || info.product_id != 0x0f99
+        || &info.name[..10] != b"Living TV\0"
+        || info.speakers != 0x07
+        || info.mode_count != 2
+        || info.modes[0]
+            != (otg::AudioMode {
+                format: 1,
+                channels: 2,
+                rates: 0x07,
+                byte2: 0x07,
+            })
+        || info.modes[1]
+            != (otg::AudioMode {
+                format: 2,
+                channels: 6,
+                rates: 0x07,
+                byte2: 0x50,
+            })
+        || (info.video_latency, info.audio_latency) != (40, 20)
+    {
+        return TestResult::Fail("audio info");
+    }
+    // No speaker block: FL/FR + FC. No SADs: no audio endpoint at all.
+    let plain = hdmi_audio_info(&with_blocks(base.clone(), &[AUDIO])).unwrap();
+    if plain.speakers != 5 || hdmi_audio_info(&with_blocks(base, &[VSDB])).is_some() {
+        return TestResult::Fail("defaults");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_reads_hdmi_audio_like_amdgpu_dm
+);

@@ -1292,6 +1292,28 @@ format full-range RGB, which is what is sent. No Audio InfoFrame or AFMT audio
 clock is enabled and no DCCG frontend symclk route is programmed, as
 `dcn401_enable_stream` does for TMDS.
 
+`start_display_hdmi_audio(port, HdmiAudioInfo)` (`Otg::start_hdmi_audio`)
+programs the display half of HDMI audio on a running HDMI video or live scanout,
+in Linux's order: the DCCG audio DTO0 (source = OTG, module = pixel clock in
+100 Hz, phase 24 MHz; DCN401 has no audio DTBCLK DTO), the stream's AFMT audio
+clock, IEC 60958 channel status (channels 1..8, update request), audio delay,
+automatic ACR with hardware CTS and Linux's N/CTS tables (the 36-bpc table at
+12 bpc, the 24-bpc table otherwise, HDMI's "Other" N for unlisted clocks), the
+endpoint→DIG source and channel enables (`speakers_to_channels`), then the
+Azalia endpoint the codec reports as ELD (`dce_aud_az_configure`: speaker
+allocation, HDMI connection, SUPPORTS_AI, per-format descriptors with LPCM
+rates limited by `check_audio_bandwidth_hdmi`, AC-3 stream formats, HBR
+capability, lipsync, vendor/product, Linux's default port ids, the monitor
+name), the Audio InfoFrame on line 2 (built by hardware from the codec's
+channel allocation), `az_enable` and unmuted samples. The endpoint is the
+stream's own; a sink without LPCM is `Unsupported`. `stop_display_hdmi_audio`
+mutes, stops the AFMT clock and Audio InfoFrame and disables the endpoint; HDMI
+video cannot stop while audio runs. Modeset builds `HdmiAudioInfo` as
+amdgpu_dm does (`hdmi_audio_info`: SADs at CTA revision 3+, the first 3-byte
+speaker block or FL/FR+FC, the 0xFC name, VSDB latencies), starts audio after
+scanout when the sink declares any mode, and stops it first on stop or unplug.
+The HD-Audio controller and codec that stream samples are separate.
+
 `start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset
 under live symclk, clears AVMUTE and waits for a fresh frame
 (`HdmiVideoRunning(stream)`); scanout may start from it exactly as from DP video

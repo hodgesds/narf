@@ -49,6 +49,76 @@ pub struct Selection {
     /// RGB output depth: 8 bpc for DP; for HDMI the deepest the sink, the
     /// TMDS rate and the requested maximum allow.
     pub depth: otg::ColorDepth,
+    /// The HDMI sink's audio, when it declares any.
+    pub audio: Option<otg::HdmiAudioInfo>,
+}
+
+/// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
+/// the EDID: vendor and product codes, the 0xFC monitor name (up to 13
+/// characters, ended by LF), all Short Audio Descriptors when the CTA
+/// revision is at least 3, the first 3-byte Speaker Allocation block (else
+/// FL/FR + FC), and the HDMI VSDB progressive latencies. None when the sink
+/// declares no audio mode: Linux then assigns no audio endpoint.
+pub fn hdmi_audio_info(edid: &[u8]) -> Option<otg::HdmiAudioInfo> {
+    use narf_edid::cta861::{CtaExtension, DataBlock};
+    let base = edid.get(..128)?;
+    let mut info = otg::HdmiAudioInfo {
+        manufacturer_id: u16::from_le_bytes([base[8], base[9]]),
+        product_id: u16::from_le_bytes([base[10], base[11]]),
+        name: [0; 18],
+        speakers: 5,
+        modes: [otg::AudioMode::default(); 16],
+        mode_count: 0,
+        video_latency: 0,
+        audio_latency: 0,
+    };
+    for d in base[54..126].chunks_exact(18) {
+        if d[..5] == [0, 0, 0, 0xfc, 0] {
+            info.name = [0; 18];
+            for (i, &c) in d[5..18].iter().enumerate() {
+                if c == 0x0a {
+                    break;
+                }
+                info.name[i] = c;
+            }
+        }
+    }
+    let mut speakers = None;
+    for block in edid.chunks_exact(128).skip(1) {
+        let Ok(cta) = CtaExtension::parse(block) else {
+            continue;
+        };
+        for db in &cta.data_blocks {
+            match db {
+                DataBlock::Audio(sads) if cta.revision >= 3 => {
+                    for sad in sads {
+                        if usize::from(info.mode_count) < info.modes.len() {
+                            info.modes[usize::from(info.mode_count)] = otg::AudioMode {
+                                format: sad.format,
+                                channels: sad.max_channels,
+                                rates: sad.sample_rates & 0x7f,
+                                byte2: sad.format_dep,
+                            };
+                            info.mode_count += 1;
+                        }
+                    }
+                }
+                DataBlock::Speaker(alloc) if speakers.is_none() => speakers = Some(alloc.0),
+                DataBlock::Vendor(v) if v.is_hdmi_licensing() => {
+                    // HDMI VSDB byte 8 bit 7: progressive latencies follow.
+                    if v.payload.len() >= 9 && v.payload[7] & 0x80 != 0 {
+                        info.video_latency = v.payload[8];
+                        info.audio_latency = v.payload.get(9).copied().unwrap_or(0);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(s) = speakers {
+        info.speakers = s;
+    }
+    (info.mode_count > 0).then_some(info)
 }
 
 /// Highest output depth modesets may pick, like DRM's max_requested_bpc,
@@ -239,6 +309,7 @@ pub fn select(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
+            audio: None,
         });
     }
     for port in ports {
@@ -272,6 +343,7 @@ pub fn select(
             hdmi: true,
             scdc: caps.scdc,
             depth,
+            audio: hdmi_audio_info(&sink.edid),
         });
     }
     Err(if link_short {
@@ -543,6 +615,10 @@ impl ColdBoot {
                 self.prepare_display_hdmi_link(port, request).await?;
                 self.start_display_hdmi_video(port).await?;
                 let scanout = self.start_display_scanout(pipe).await?;
+                // As Linux's post-enable: audio after the stream runs.
+                if let Some(info) = selection.audio {
+                    self.start_display_hdmi_audio(port, info).await?;
+                }
                 return Ok((selection, scanout));
             }
             let mut selection = selection;
@@ -633,6 +709,9 @@ impl ColdBoot {
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
+            if m.selection.hdmi && m.selection.audio.is_some() {
+                self.stop_display_hdmi_audio(port).await?;
+            }
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {
                 // The departed sink's SCDC is not addressed.
@@ -655,6 +734,9 @@ impl ColdBoot {
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
+            if m.selection.hdmi && m.selection.audio.is_some() {
+                self.stop_display_hdmi_audio(port).await?;
+            }
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {
                 self.stop_hdmi(port, m.selection.scdc).await?;
