@@ -1224,6 +1224,43 @@ Failure after starting enters `Failed`; cancellation retains
 independent reset. TMDS backend/PHY shutdown follows timing-clock retirement
 through the operation below.
 
+`unsafe ColdBoot::prepare_display_hdmi_link(port, HdmiLinkRequest { stream,
+pipe })` and `Otg::prepare_hdmi_link` light one direct TMDS HDMI port for the
+staged black timing of `pipe`, with that timing still stopped. Scope: 8-bpc RGB,
+25–340 MHz (`TMDS_MAX_KHZ`; no SCDC scrambling or deep colour), the TMDS
+divide-by-four pixel divider and the DP DTO off. Planning requires a reusable
+owner, a `Signal::Tmds` blank on `pipe` bound to the retained clock, a stopped
+backend with no frontend, dual link or reset, an idle frontend and FIFO, no
+backend already routed to the stream, no DCCG frontend symclk route, and every
+unrelated consumer, packet/metadata producer and HPO root idle; refusals write
+nothing. The native order is Linux's: DMUB `SET_PIXEL_CLOCK` v1.7 (COMBO PHY PLL
+of the transmitter, UNIPHY object id, HDMI mode, CRTC `pipe`, XTALIN, no deep
+colour) and a zero PHYPLL deep-colour resync; `TMDS_CTL0`; link-encoder setup
+(DIO mux, HPD select, backend mode 3, clock, enable); DMUB `DIGX_ENCODER_CONTROL`
+`STREAM_SETUP` v1.5; HDMI stream attributes (RGB, generic-packet v1, keepout, no
+extra NULL, no scrambling, 24 bpp; GC every frame with NULL packets; no ACP;
+AVMUTE off) with the frontend's OTG and stereo sources; then the BE←FE route,
+frontend mode 3, clock and enable, stream mapper, one pixel per cycle and the
+native FIFO reset (a RESET_DONE handshake only while the frontend symclk runs,
+else a 10 us settle); finally DMUB transmitter `ENABLE` (HDMI mode, four lanes,
+symclk in 10 kHz). Success needs all four lanes ready, TX clocks on, backend
+SYMCLK on and frontend DISPCLK/SYMCLK on: `HdmiLinkReady(transmitter)`. Every
+write first re-verifies the owned registers, routes and consumers. No Audio
+InfoFrame is sent and no DCCG frontend symclk route is programmed, as
+`dcn401_enable_stream` does for TMDS.
+
+`start_display_hdmi_video(port)` starts the blank timing, repeats the FIFO reset
+under live symclk, clears AVMUTE and waits for a fresh frame
+(`HdmiVideoRunning(stream)`); scanout may start from it exactly as from DP video
+and returns to it when stopped. `stop_display_hdmi_video` sets AVMUTE, holds
+three frames (dcn30_set_avmute), stops the timing and restages the OPP route
+(`HdmiLinkReady`). `stop_display_hdmi_link` sends DMUB `DISABLE`, observes the
+backend, lanes and TX clocks off, then stops the FIFO, frontend and its clock,
+detaches the route and restores the HDMI attribute defaults: `HdmiLinkStopped`,
+a reusable state. Failure enters `Failed`. The DMUB VBIOS commands carry Linux's
+`payload_bytes` (12 for DIGX, 16 for transmitter control and SET_PIXEL_CLOCK);
+`drivers/gpu/tests/navi48_vbios_commands.c` pins those layouts.
+
 `unsafe ColdBoot::retire_display_hdmi_frl_encoder().await`, its serialized
 platform wrapper and `Otg::retire_hdmi_frl_encoder` retire the single native
 FRL frontend. The caller independently handles sink AVMUTE/SCDC/retimers and

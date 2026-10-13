@@ -1577,6 +1577,84 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Program the PHY PLL, encoders and transmitter of an HDMI port for the
+    /// staged black timing of `request.pipe`, with that timing still stopped.
+    /// # Safety
+    /// Fulfil `Otg::prepare_hdmi_link` direct-port, sink and writer obligations.
+    pub async unsafe fn prepare_display_hdmi_link(
+        &mut self,
+        port: usize,
+        request: otg::HdmiLinkRequest,
+    ) -> Result<otg::HdmiLinkReady, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained board path/owners; caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .prepare_hdmi_link(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    &mut self.sequence.backend.dmub,
+                    path,
+                    request,
+                )
+                .await
+        }
+    }
+    /// Start black video on the prepared HDMI link and release AVMUTE.
+    /// # Safety
+    /// Fulfil `Otg::start_hdmi_video` obligations for the running lifetime.
+    pub async unsafe fn start_display_hdmi_video(
+        &mut self,
+        port: usize,
+    ) -> Result<otg::HdmiVideoRunning, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; caller excludes external writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_hdmi_video(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    path,
+                )
+                .await
+        }
+    }
+    /// Mute and stop the HDMI timing, keeping the link transmitting.
+    /// # Safety
+    /// Fulfil `Otg::stop_hdmi_video` obligations; scanout already stopped.
+    pub async unsafe fn stop_display_hdmi_video(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; caller fulfils the lifetime contract.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_hdmi_video(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    path,
+                )
+                .await
+        }
+    }
+    /// Disable the owned HDMI transmitter and frontend; timing is stopped.
+    /// # Safety
+    /// Fulfil `Otg::stop_hdmi_link` obligations.
+    pub async unsafe fn stop_display_hdmi_link(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: matching retained board path/owners; caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_hdmi_link(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
     /// Give a board connector's HPD pin to its HPD block and enable it.
     /// # Safety
     /// The board's HPD selector must name this connector's pin, and nothing

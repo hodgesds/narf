@@ -482,6 +482,17 @@ impl<I: Io> Engine<I> {
         }
     }
 }
+/// DMUB_CMD__VBIOS headers: type 128, sub_type, then `payload_bytes` as Linux
+/// sets it, `sizeof(cmd) - sizeof(header)` of the atomfirmware.h payload.
+/// DIGX_ENCODER_CONTROL (0) carries a 12-byte dig_encoder_control_parameters_v1_5;
+/// DIG1_TRANSMITTER_CONTROL (1) a 16-byte dmub_dig_transmitter_control_data_v1_7;
+/// SET_PIXEL_CLOCK (2) a 16-byte set_pixel_clock_parameter_v1_7.
+const DIGX_ENCODER_CONTROL: [u8; 4] = [128, 0, 0, 12];
+const TRANSMITTER_CONTROL: [u8; 4] = [128, 1, 0, 16];
+const SET_PIXEL_CLOCK: [u8; 4] = [128, 2, 0, 16];
+/// Linux rejects TMDS pixel clocks above 600 MHz (dcn401_program_pix_clk).
+const TMDS_MAX_KHZ: u32 = 600_000;
+
 #[derive(Debug)]
 pub struct Dmub {
     engine: Engine<Mmio>,
@@ -536,6 +547,30 @@ impl Dmub {
         path: crate::amdgpu_dcn_inventory::Path,
     ) -> Result<(), Error> {
         self.engine.disable_frl(path).await
+    }
+    pub(crate) async fn set_tmds_pixel_clock(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        pipe: u8,
+        pixel_khz: u32,
+    ) -> Result<(), Error> {
+        self.engine
+            .set_tmds_pixel_clock(path, pipe, pixel_khz)
+            .await
+    }
+    pub(crate) async fn setup_hdmi_stream(
+        &mut self,
+        stream: u8,
+        pixel_khz: u32,
+    ) -> Result<(), Error> {
+        self.engine.setup_hdmi_stream(stream, pixel_khz).await
+    }
+    pub(crate) async fn enable_tmds(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        pixel_khz: u32,
+    ) -> Result<(), Error> {
+        self.engine.enable_tmds(path, pixel_khz).await
     }
     /// Validate the VRAM pool and reserve nonsecure DMUB storage without writes.
     /// # Safety
@@ -618,7 +653,7 @@ impl<I: Io> Engine<I> {
         // v1.7 has no legacy lane_select field. Native DC maximizes VS/PE across
         // lanes and issues the same native packet once per active lane.
         let mut request = [0; 64];
-        request[..4].copy_from_slice(&[128, 1, 0, 60]);
+        request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
         request[4] = path.transmitter;
         request[5] = 11; // SET_VOLTAGE_AND_PREEMPASIS
         request[6] = drive.swing | drive.pre_emphasis << 3;
@@ -653,7 +688,7 @@ impl<I: Io> Engine<I> {
         // Unlike DISABLE, this zero-initialized caller leaves connector_obj_id
         // zero. DCE112+ digfe_sel is also zero; host programming owns routing.
         let mut request = [0; 64];
-        request[..4].copy_from_slice(&[128, 1, 0, 60]);
+        request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
         request[4] = path.transmitter;
         request[5] = 1; // TRANSMITTER_CONTROL_ENABLE
         request[7] = settings.lanes;
@@ -708,6 +743,86 @@ impl<I: Io> Engine<I> {
         // dcn10_link_encoder_disable_output leaves the HPO engine id zero.
         self.disable_transmitter(path, 4, 12, 246).await
     }
+    fn hdmi_path(path: crate::amdgpu_dcn_inventory::Path) -> Result<(), Error> {
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::HdmiTypeA
+            || path.transmitter >= 4
+            || !(1..=4).contains(&path.hpd)
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+    async fn send(&mut self, request: [u8; 64]) -> Result<(), Error> {
+        self.begin_mailbox()?;
+        let result = self.command(request).await.map(|_| ());
+        self.finish_mailbox(result)
+    }
+    /// Program the transmitter's PHY PLL for an 8-bpc RGB TMDS stream timed by
+    /// `pipe`. Linux dcn401_program_pix_clk -> set_pixel_clock_v7, after the
+    /// DP DTO is disabled: PLL from find_matching_pll (COMBO_PHY_PLL0 + PHY),
+    /// the UNIPHY pair's encoder object id, HDMI encoder mode, XTALIN reference
+    /// (miscinfo 0) and no deep-colour ratio.
+    async fn set_tmds_pixel_clock(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        pipe: u8,
+        pixel_khz: u32,
+    ) -> Result<(), Error> {
+        Self::hdmi_path(path)?;
+        if pipe >= 4 || pixel_khz == 0 || pixel_khz > TMDS_MAX_KHZ {
+            return Err(Error::Invalid);
+        }
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&SET_PIXEL_CLOCK);
+        request[4..8].copy_from_slice(&(pixel_khz * 10).to_le_bytes());
+        request[8] = 20 + path.transmitter; // ATOM_COMBOPHY_PLL0
+                                            // ObjectID.h ENCODER_OBJECT_ID_INTERNAL_UNIPHY / UNIPHY1.
+        request[9] = [0x1e, 0x20][usize::from(path.transmitter / 2)];
+        request[10] = 3; // ATOM_ENCODER_MODE_HDMI
+        request[12] = pipe; // ATOM_CRTC1 + controller
+        self.send(request).await
+    }
+    /// DIG stream setup for TMDS HDMI. Linux
+    /// enc401_stream_encoder_hdmi_set_stream_attribute -> encoder_control_digx_v1_5:
+    /// DIG engine = stream, STREAM_SETUP, HDMI mode, four lanes, the PHY pixel
+    /// clock in 10 kHz and an unset colour depth (the caller leaves it zero).
+    async fn setup_hdmi_stream(&mut self, stream: u8, pixel_khz: u32) -> Result<(), Error> {
+        if stream >= 4 || pixel_khz == 0 || pixel_khz > TMDS_MAX_KHZ {
+            return Err(Error::Invalid);
+        }
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&DIGX_ENCODER_CONTROL);
+        request[4] = stream; // ENGINE_ID_DIGA + stream
+        request[5] = 0x0f; // ATOM_ENCODER_CMD_STREAM_SETUP
+        request[6] = 3; // ATOM_ENCODER_MODE_HDMI
+        request[7] = 4;
+        request[8..12].copy_from_slice(&(pixel_khz / 10).to_le_bytes());
+        self.send(request).await
+    }
+    /// Enable the TMDS transmitter. Linux dcn10_link_encoder_enable_tmds_output
+    /// -> transmitter_control_v1_7: HDMI dig mode, four lanes, symclk in 10 kHz.
+    /// The zero-initialized caller leaves connector and engine ids zero, so
+    /// HPO_instance encodes DIGA minus HPO_0 (246), as for DISABLE.
+    async fn enable_tmds(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        pixel_khz: u32,
+    ) -> Result<(), Error> {
+        Self::hdmi_path(path)?;
+        if pixel_khz == 0 || pixel_khz > TMDS_MAX_KHZ {
+            return Err(Error::Invalid);
+        }
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
+        request[4] = path.transmitter;
+        request[5] = 1; // TRANSMITTER_CONTROL_ENABLE
+        request[6] = 3; // ATOM_TRANSMITTER_DIGMODE_V6_HDMI
+        request[7] = 4;
+        request[8..12].copy_from_slice(&(pixel_khz / 10).to_le_bytes());
+        request[12] = path.hpd;
+        request[15] = 246;
+        self.send(request).await
+    }
     async fn disable_transmitter(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
@@ -725,7 +840,7 @@ impl<I: Io> Engine<I> {
         // Do not substitute the selected link index; DISABLE resolves the
         // physical transmitter.
         let mut request = [0; 64];
-        request[..4].copy_from_slice(&[128, 1, 0, 60]);
+        request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
         request[4] = path.transmitter;
         request[6] = mode;
         request[12] = path.hpd;

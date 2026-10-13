@@ -43,7 +43,7 @@ fn dmub_navi48_dp_drive_preserves_native_v17_zero_signal_encoding() -> TestResul
                         ))
                         .unwrap();
                         let mut golden = [0; 64];
-                        golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+                        golden[..4].copy_from_slice(&[128, 1, 0, 16]);
                         golden[4] = phy;
                         golden[5] = 11;
                         golden[6] = swing | pre_emphasis << 3; // no MAX flags in VBIOS packet
@@ -132,7 +132,7 @@ fn dmub_navi48_dp_enable_uses_native_lane_rate_and_zero_connector_fields() -> Te
                     let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
                     run(e.enable_dp_sst(dp_path(phy, hpd), DpPhySettings { lanes, rate })).unwrap();
                     let mut golden = [0; 64];
-                    golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+                    golden[..4].copy_from_slice(&[128, 1, 0, 16]);
                     golden[4] = phy;
                     golden[5] = 1;
                     golden[7] = lanes;
@@ -215,7 +215,7 @@ fn dmub_navi48_tmds_disable_uses_native_hdmi_mode_connector_and_hpo_default() ->
             let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
             run(e.disable_tmds(path)).unwrap();
             let mut golden = [0; 64];
-            golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+            golden[..4].copy_from_slice(&[128, 1, 0, 16]);
             golden[4] = phy;
             golden[6] = 3;
             golden[12] = hpd;
@@ -236,7 +236,7 @@ fn dmub_navi48_frl_disable_uses_native_frl_mode_and_zero_engine_encoding() -> Te
             let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
             run(e.disable_frl(path)).unwrap();
             let mut golden = [0; 64];
-            golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+            golden[..4].copy_from_slice(&[128, 1, 0, 16]);
             golden[4] = phy;
             golden[6] = 4; // DCE112 HDMI_FRL, distinct from TMDS mode 3
             golden[12] = hpd;
@@ -330,7 +330,7 @@ fn dmub_navi48_native_transmitter_disable_uses_v17_board_fields() -> TestResult 
             let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
             run(e.disable_dp_sst(dp_path(phy, hpd))).unwrap();
             let mut golden = [0; 64];
-            golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+            golden[..4].copy_from_slice(&[128, 1, 0, 16]);
             golden[4] = phy;
             golden[12] = hpd;
             golden[14] = 19;
@@ -349,7 +349,7 @@ fn dmub_navi48_hpo_disable_uses_native_zeroed_connector_and_explicit_signal() ->
                 let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
                 run(e.disable_hpo_dp(dp_path(phy, hpd), signal)).unwrap();
                 let mut golden = [0; 64];
-                golden[..4].copy_from_slice(&[128, 1, 0, 60]);
+                golden[..4].copy_from_slice(&[128, 1, 0, 16]);
                 golden[4] = phy;
                 golden[6] = mode;
                 golden[12] = hpd;
@@ -811,4 +811,99 @@ fn dmub_navi48_mailbox_cancellation_timeout_and_revocation_quarantine() -> TestR
 kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_mailbox_cancellation_timeout_and_revocation_quarantine
+);
+
+fn hdmi_path(phy: u8, hpd: u8) -> crate::amdgpu_dcn_inventory::Path {
+    let mut path = dp_path(phy, hpd);
+    path.connector = crate::amdgpu_dcn_inventory::Connector::HdmiTypeA;
+    path
+}
+fn dmub_navi48_tmds_bringup_commands_match_native_v15_v17_encodings() -> TestResult {
+    for phy in 0..4 {
+        for hpd in 1..=4 {
+            for pipe in 0..4 {
+                let (_pool, mut e) = ready();
+                let path = hdmi_path(phy, hpd);
+                let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+                run(e.set_tmds_pixel_clock(path, pipe, 148_500)).unwrap();
+                let mut golden = [0; 64];
+                golden[..4].copy_from_slice(&[128, 2, 0, 16]);
+                golden[4..8].copy_from_slice(&1_485_000u32.to_le_bytes()); // 100 Hz
+                golden[8] = 20 + phy; // COMBOPHY_PLL0 + matching PHY
+                golden[9] = if phy < 2 { 0x1e } else { 0x20 }; // UNIPHY, UNIPHY1
+                golden[10] = 3;
+                golden[12] = pipe;
+                assert_eq!(e.io.slot(offset), golden);
+                assert_eq!(e.mailbox.state, MailboxState::Ready);
+            }
+            let (_pool, mut e) = ready();
+            let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+            run(e.enable_tmds(hdmi_path(phy, hpd), 148_500)).unwrap();
+            let mut golden = [0; 64];
+            golden[..4].copy_from_slice(&[128, 1, 0, 16]);
+            golden[4] = phy;
+            golden[5] = 1;
+            golden[6] = 3;
+            golden[7] = 4;
+            golden[8..12].copy_from_slice(&14_850u32.to_le_bytes());
+            golden[12] = hpd;
+            golden[15] = 246;
+            assert_eq!(e.io.slot(offset), golden);
+        }
+    }
+    for stream in 0..4 {
+        let (_pool, mut e) = ready();
+        let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+        run(e.setup_hdmi_stream(stream, 297_000)).unwrap();
+        let mut golden = [0; 64];
+        golden[..4].copy_from_slice(&[128, 0, 0, 12]);
+        golden[4] = stream;
+        golden[5] = 0x0f;
+        golden[6] = 3;
+        golden[7] = 4;
+        golden[8..12].copy_from_slice(&29_700u32.to_le_bytes());
+        assert_eq!(e.io.slot(offset), golden);
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_tmds_bringup_commands_match_native_v15_v17_encodings
+);
+fn dmub_navi48_tmds_bringup_commands_reject_invalid_requests_without_submission() -> TestResult {
+    let (_pool, mut e) = ready();
+    let before = e.io.bytes.clone();
+    for path in [
+        hdmi_path(4, 1),
+        hdmi_path(1, 0),
+        hdmi_path(1, 5),
+        dp_path(1, 1),
+    ] {
+        assert_eq!(
+            run(e.set_tmds_pixel_clock(path, 0, 148_500)),
+            Err(Error::Invalid)
+        );
+        assert_eq!(run(e.enable_tmds(path, 148_500)), Err(Error::Invalid));
+    }
+    let path = hdmi_path(1, 2);
+    for khz in [0, 600_001] {
+        assert_eq!(
+            run(e.set_tmds_pixel_clock(path, 0, khz)),
+            Err(Error::Invalid)
+        );
+        assert_eq!(run(e.enable_tmds(path, khz)), Err(Error::Invalid));
+        assert_eq!(run(e.setup_hdmi_stream(0, khz)), Err(Error::Invalid));
+    }
+    assert_eq!(
+        run(e.set_tmds_pixel_clock(path, 4, 148_500)),
+        Err(Error::Invalid)
+    );
+    assert_eq!(run(e.setup_hdmi_stream(4, 148_500)), Err(Error::Invalid));
+    assert_eq!(e.io.bytes, before);
+    assert_eq!(e.mailbox.state, MailboxState::Ready);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_tmds_bringup_commands_reject_invalid_requests_without_submission
 );

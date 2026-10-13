@@ -506,13 +506,9 @@ impl Surfaces {
         crystal_khz: u32,
         mut owners: impl FnMut() -> Result<(dccg::Applied, DisplayContext), Error>,
     ) -> Result<ScanoutRunning, Error> {
-        let video = e.status.dp_video_running.ok_or(Error::Invalid)?;
-        let stream = video.frontend.request.stream;
-        if e.status.state != State::DpVideoRunning(stream) {
-            return Err(Error::Busy);
-        }
+        let (stream, video_pipe) = e.running_video()?;
         let d = e.status.deadlines.ok_or(Error::Invalid)?;
-        if d.pipe != pipe || video.timing.blank.request.pipe != pipe {
+        if d.pipe != pipe || video_pipe != pipe {
             return Err(Error::Invalid);
         }
         let current = owners()?;
@@ -581,7 +577,7 @@ impl Surfaces {
             Ok(_) => {
                 e.status.scanout = None;
                 e.status.cursor = None;
-                State::DpVideoRunning(ctx.stream)
+                e.video_state(ctx.stream)
             }
             Err(failed) => State::Failed(failed),
         };
@@ -619,7 +615,7 @@ impl Surfaces {
             }
             other => other?,
         }
-        e.dp_video_verify_scanout(running)?;
+        e.video_verify_scanout(running)?;
         Ok(e.read(e.layout.otg(pipe, FRAME_COUNT))? & FRAME_MASK)
     }
     pub(in crate::amdgpu_dcn401_otg) async fn stop_scanout<I: Io>(
@@ -652,13 +648,60 @@ impl Surfaces {
             Ok(()) => {
                 e.status.scanout = None;
                 e.status.cursor = None;
-                e.status.state = State::DpVideoRunning(running.stream);
+                e.status.state = e.video_state(running.stream);
                 Ok(())
             }
             Err(err) => {
                 e.status.state = State::Failed(err);
                 Err(err)
             }
+        }
+    }
+}
+impl<I: Io> Engine<I> {
+    /// The stream and pipe of the black video a scanout may start on: DP SST
+    /// or TMDS HDMI, whichever owner is current.
+    pub(in crate::amdgpu_dcn401_otg) fn running_video(&self) -> Result<(u8, u8), Error> {
+        let s = &self.status;
+        match s.state {
+            State::DpVideoRunning(stream) => {
+                let v = s.dp_video_running.ok_or(Error::Invalid)?;
+                if v.frontend.request.stream != stream {
+                    return Err(Error::Invalid);
+                }
+                Ok((stream, v.timing.blank.request.pipe))
+            }
+            State::HdmiVideoRunning(stream) => {
+                let v = s.hdmi_video_running.ok_or(Error::Invalid)?;
+                if v.link.request.stream != stream {
+                    return Err(Error::Invalid);
+                }
+                Ok((stream, v.timing.blank.request.pipe))
+            }
+            // No video record at all is a missing predecessor, not contention.
+            _ if s.dp_video_running.is_none() && s.hdmi_video_running.is_none() => {
+                Err(Error::Invalid)
+            }
+            _ => Err(Error::Busy),
+        }
+    }
+    /// The video state a stopped (or underflow-recovered) scanout returns to.
+    fn video_state(&self, stream: u8) -> State {
+        if self
+            .status
+            .hdmi_video_running
+            .is_some_and(|v| v.link.request.stream == stream)
+        {
+            State::HdmiVideoRunning(stream)
+        } else {
+            State::DpVideoRunning(stream)
+        }
+    }
+    fn video_verify_scanout(&mut self, live: ScanoutRunning) -> Result<(), Error> {
+        if self.status.hdmi_video_running.is_some() {
+            self.hdmi_video_verify_scanout(live)
+        } else {
+            self.dp_video_verify_scanout(live)
         }
     }
 }

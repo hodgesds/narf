@@ -245,7 +245,7 @@ impl<I: Io> Engine<I> {
     }
 }
 /// Every owner the plan was admitted against must still be the one in place:
-/// a plan is only valid for exactly this timing, sync, DP SST signal,
+/// a plan is only valid for exactly this timing, sync, DP SST or TMDS signal,
 /// full-frame surface, DET and DCHUB reference, and for at least its clocks
 /// with the pinned UCLK/DCFCLK floors it assumed. The plan is also
 /// re-admitted, so a value built or edited outside admission is refused.
@@ -262,7 +262,7 @@ pub(super) fn bound(
         && timing.pipe == a.pipe
         && timing.timing == t
         && timing.sync == plan.sync
-        && timing.signal == Signal::DisplayPort
+        && matches!(timing.signal, Signal::DisplayPort | Signal::Tmds)
         && surface.request.width == t.h_active
         && surface.request.height == t.v_active
         && u64::from(surface.pitch_bytes) == u64::from(plan.mode.pitch) * 4

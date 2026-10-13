@@ -478,6 +478,14 @@ consumption alone cannot complete shutdown. Already-disabled backends require
 complete off readback without replay. Other outputs stay retained, late route
 or consumer changes fail, and failure/cancellation block owner reuse. This
 proves digital/lane/clock shutdown, not analog power gating or memory retirement.
+Native TMDS HDMI startup now exists for one 8-bpc RGB stream up to 340 MHz:
+DMUB SET_PIXEL_CLOCK for the transmitter's PHY PLL, link-encoder setup, the
+DIGX stream setup and HDMI stream attributes, frontend routing and FIFO, then
+the DMUB transmitter ENABLE with lane, TX-clock and clock-on witnesses. Black
+video starts and stops with AVMUTE handling, scanout runs on HDMI video, and the
+link stops back to a reusable owner. Not yet: modeset/hot-plug integration, the
+AVI InfoFrame, SCDC scrambling above 340 MHz, deep colour and audio. None of it
+has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and
 requires all three stream clocks off. Native DME4, immediate packets, audio/ACR,
