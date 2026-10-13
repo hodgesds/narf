@@ -397,6 +397,21 @@ const HDA_PCI_IDS: &[(&str, u16, u16)] = &[
     ),
 ];
 
+/// ATI/AMD GPU HD-Audio functions Linux binds with
+/// `AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS`
+/// (sound/hda/controllers/intel.c): HDMI/DP audio beside a Radeon GPU, with
+/// snooping off and LPIB positions. 0xab40 is the newest (RDNA4-era) entry.
+pub const HDA_ATI_HDMI_NS_DEVICES: &[u16] = &[
+    0x0002, 0x1308, 0x157a, 0x15b3, 0x9840, 0x9902, 0xaaa0, 0xaaa8, 0xaab0, 0xaac0, 0xaac8, 0xaad8,
+    0xaae0, 0xaae8, 0xaaf0, 0xaaf8, 0xab00, 0xab08, 0xab10, 0xab18, 0xab20, 0xab28, 0xab30, 0xab38,
+    0xab40,
+];
+/// Whether this controller needs explicit cache maintenance (Linux's
+/// `AZX_DCAPS_SNOOP_OFF` for the ATI HDMI NS preset).
+pub fn ati_hdmi_noncoherent(vendor: u16, device: u16) -> bool {
+    vendor == HDA_AMD_RADEON_VENDOR && HDA_ATI_HDMI_NS_DEVICES.contains(&device)
+}
+
 /// Register every supported HDA controller PCI id with the bus match
 /// table. Every entry binds the same `probe` function — the HDA
 /// programming model is vendor-agnostic.
@@ -405,6 +420,16 @@ pub fn register_pci_driver() {
         narf_bus::register_pci_driver(narf_bus::PciMatch {
             name,
             kind: narf_bus::MatchKind::VendorDevice { vendor, device },
+            probe,
+        });
+    }
+    for &device in HDA_ATI_HDMI_NS_DEVICES {
+        narf_bus::register_pci_driver(narf_bus::PciMatch {
+            name: "hda-ati-hdmi",
+            kind: narf_bus::MatchKind::VendorDevice {
+                vendor: HDA_AMD_RADEON_VENDOR,
+                device,
+            },
             probe,
         });
     }

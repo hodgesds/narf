@@ -117,6 +117,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Result<Self, &'static str> {
+        Self::new_with(false)
+    }
+    fn new_with(noncoherent: bool) -> Result<Self, &'static str> {
         let memory = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| "mmio alloc")?;
         let mmio = bar::MmioRegion {
             phys: memory.phys_addr(),
@@ -153,7 +156,7 @@ impl Fixture {
         }
         fixture.controller = Some(Arc::new(
             // SAFETY: Fixture owns the fake MMIO/DMA allocations until all test leases are dropped.
-            unsafe { IntelHda::initialize(mmio) }.map_err(|_| "controller init")?,
+            unsafe { IntelHda::initialize(mmio, noncoherent) }.map_err(|_| "controller init")?,
         ));
         Ok(fixture)
     }
@@ -165,7 +168,17 @@ impl Drop for Fixture {
     }
 }
 fn native_hda_pcm_and_unsolicited() -> TestResult {
-    let mut fixture = match Fixture::new() {
+    pcm_case(false)
+}
+kernel_test_in!("audio/hda", native_hda_pcm_and_unsolicited);
+/// AMD GPU HD-Audio does not snoop: the same command, playback and capture
+/// paths with explicit cache maintenance must behave identically.
+fn native_hda_noncoherent_pcm_matches_coherent() -> TestResult {
+    pcm_case(true)
+}
+kernel_test_in!("audio/hda", native_hda_noncoherent_pcm_matches_coherent);
+fn pcm_case(noncoherent: bool) -> TestResult {
+    let mut fixture = match Fixture::new_with(noncoherent) {
         Ok(f) => f,
         Err(e) => return TestResult::Fail(e),
     };
@@ -196,6 +209,9 @@ fn native_hda_pcm_and_unsolicited() -> TestResult {
         || playback.prepare().is_err()
     {
         return TestResult::Fail("configure playback");
+    }
+    if dev.streams[0].lock().ring.as_ref().map(|r| r.noncoherent) != Some(noncoherent) {
+        return TestResult::Fail("ring coherency follows the controller");
     }
     use narf_drivers_sound::mixer::{ControlId, ControlKind, ControlValue};
     let mute = ControlId {
@@ -260,7 +276,6 @@ fn native_hda_pcm_and_unsolicited() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("audio/hda", native_hda_pcm_and_unsolicited);
 
 fn native_hda_command_cancellation() -> TestResult {
     let mut fixture = match Fixture::new() {
@@ -286,3 +301,21 @@ fn native_hda_command_cancellation() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("audio/hda", native_hda_command_cancellation);
+
+fn native_hda_ati_hdmi_controllers_run_without_snoop() -> TestResult {
+    use super::super::ati_hdmi_noncoherent;
+    // Linux's ATI HDMI NS preset; the generic-class Radeon 0x1640 and Intel
+    // controllers keep snooping.
+    if !ati_hdmi_noncoherent(0x1002, 0xab40)
+        || !ati_hdmi_noncoherent(0x1002, 0xaaa0)
+        || ati_hdmi_noncoherent(0x1002, 0x1640)
+        || ati_hdmi_noncoherent(0x8086, 0xab40)
+    {
+        return TestResult::Fail("ATI HDMI NS table");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "audio/hda",
+    native_hda_ati_hdmi_controllers_run_without_snoop
+);

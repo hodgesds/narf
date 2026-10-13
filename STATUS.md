@@ -495,7 +495,10 @@ is configured before the link starts and returned to legacy on stop. HDMI deep
 colour (10/12 bpc RGB, opt-in with `amdgpu.max_bpc`) scales the TMDS character
 clock as Linux does. HDMI audio's display half (audio DTO, ACR, AFMT channel
 status, Azalia endpoint/ELD, Audio InfoFrame) is programmed after scanout for
-sinks declaring audio; the HD-Audio controller/codec side is not yet driven.
+sinks declaring audio. The native HD-Audio runtime now binds Linux's ATI
+HDMI NS controller IDs (through 0xab40) with snooping off: CORB, RIRB, BDL
+and sample rings get explicit cache maintenance. The ATI HDMI codec path
+(digital pins, channel allocation) is not yet driven.
 Not yet: YCbCr/4:2:0. None of it has run on hardware.
 Native FRL frontend retirement now drains all generic packet schedules through
 the actual HDMI/VUPDATE buffer status, disables FIFO then tribyte encoding and

@@ -63,7 +63,8 @@ impl Stream {
             return Err(SoundError::InvalidParams);
         }
         self.stop(dev)?;
-        let ring = Ring::new(params)?;
+        let mut ring = Ring::new(params)?;
+        ring.noncoherent = dev.noncoherent;
         // SAFETY: Controller owns this live BAR; fixed register offsets are inside the validated window.
         if unsafe { dev.bar0.read16(REG_GCAP) } & 1 == 0
             && (ring.data.dma_addr().raw() >> 32 != 0 || ring.bdl.dma_addr().raw() >> 32 != 0)
@@ -192,6 +193,10 @@ impl Stream {
                         .write_volatile(0);
                 }
             }
+            ring.sync(
+                (ring.hardware.saturating_sub(delta) % ring.bytes as u64) as usize,
+                delta.min(ring.bytes as u64) as usize,
+            );
         }
         if (self.capture && ring.hardware.saturating_sub(ring.application) > ring.bytes as u64)
             || (!self.capture && !ring.free_running && ring.hardware >= ring.application)
