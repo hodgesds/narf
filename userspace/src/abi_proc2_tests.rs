@@ -3306,3 +3306,88 @@ fn smoke_abi_proc2_clone_fs_outlives_creator() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_clone_fs_outlives_creator);
+
+/// A walk from a directory fd starts at that directory, wherever the caller's
+/// root has since moved (`path_init` anchors on `f.file->f_path`). Chromium's
+/// sandbox opens `/proc`, chroots into an empty directory, then
+/// `openat(proc_fd, "self/fd/")` / `fstatat(proc_fd, "self/task/")`; NARF
+/// re-rooted the fd's path under the new root and answered -ENOENT
+/// (`proc_util.cc:80`). Absolute paths stay bounded by the new root.
+fn smoke_abi_proc2_dirfd_outside_root_resolves_from_the_fd() -> TestResult {
+    const O_RDONLY: u64 = 0;
+    const O_CREAT: u64 = 0o100;
+    const O_DIRECTORY: u64 = 0o200000;
+    const AT_FDCWD: u64 = -100i64 as u64;
+    const JAIL: &[u8] = b"/abi-fsjail\0";
+    with_fs_tasks(|| {
+        set_task(FS_PARENT);
+        let file = b"/abi-fsshare/marker\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, O_CREAT | O_RDONLY, 0o644),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("fixture: creating the marker file failed"),
+        }
+        let dirfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, FS_DIR.as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fixture: opening the directory fd failed"),
+        };
+        let jail = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: JAIL.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), jail) != Some(0) {
+            let _ = call(Syscall::Close.raw(), a0(dirfd));
+            return Err("fixture: mounting the jail failed");
+        }
+        let result = (|| {
+            if call(Syscall::Chroot.raw(), a0(JAIL.as_ptr() as u64)) != Some(0) {
+                return Err("fixture: chroot into the jail failed");
+            }
+            let rel = b"marker\0";
+            let mut st = [0u8; 144];
+            if call(
+                Syscall::Newfstatat.raw(),
+                a3(dirfd, rel.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+            ) != Some(0)
+            {
+                return Err("fstatat(dirfd) re-rooted the fd's directory under the new root");
+            }
+            match call(
+                Syscall::Openat.raw(),
+                a3(dirfd, rel.as_ptr() as u64, O_RDONLY, 0),
+            ) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("openat(dirfd) re-rooted the fd's directory under the new root"),
+            }
+            // Negative: the absolute spelling is bounded by the new root.
+            if call(
+                Syscall::Newfstatat.raw(),
+                a3(AT_FDCWD, file.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+            ) == Some(0)
+            {
+                return Err("an absolute path escaped the new root");
+            }
+            Ok(())
+        })();
+        let _ = call(Syscall::Close.raw(), a0(dirfd));
+        crate::handlers::__test_root_dir_reset();
+        const MNT_DETACH: u64 = 1 << 1;
+        let _ = call(Syscall::Umount2.raw(), a1(JAIL.as_ptr() as u64, MNT_DETACH));
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_dirfd_outside_root_resolves_from_the_fd
+);

@@ -368,6 +368,9 @@ fn is_normalized_abs(path: &str) -> bool {
 /// an un-chrooted task is returned in place, avoiding the normalizer's
 /// component vector and two replacement `String` allocations.
 fn resolve_cwd_path_owned(task: u64, path: alloc::string::String) -> alloc::string::String {
+    if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
+        return normalize_abs(host);
+    }
     let normalized = if is_normalized_abs(&path) {
         path
     } else {
@@ -462,6 +465,9 @@ fn chroot_path_matches(task: u64, path: &str, visible: &str, descendants: bool) 
 /// into a normalized absolute path. Relative paths are joined onto the
 /// task's current working directory; `.`/`..` are collapsed.
 pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
+    if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
+        return normalize_abs(host);
+    }
     let normalized = resolve_cwd_path_user(task, path);
     // Re-root under the task's chroot (if any) so a chrooted process —
     // e.g. a container — resolves paths against the chrooted rootfs, not
@@ -1282,9 +1288,34 @@ pub(crate) fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc:
     if !is_directory {
         return Err(-ENOTDIR); // -ENOTDIR
     }
+    // A walk from a directory fd starts at that directory, whatever the
+    // caller's root is now (`path_init` takes `f.file->f_path`). The fd path
+    // is recorded host-absolute; inside the current root it is expressed in
+    // the caller's view as before. Outside it — an fd opened before a later
+    // chroot, which is how Chromium's sandbox keeps `/proc` after chrooting
+    // into an empty directory — no view path names it, so the joined host
+    // path is marked to bypass re-rooting.
+    if let Some(host) = crate::mqueue::fd_path(task, dirfd as u32) {
+        if let Some(root) = root_dir_prefix(task).filter(|root| root != "/") {
+            if !path_at_or_under(&host, &root) {
+                return Ok(alloc::format!(
+                    "{}{}/{}",
+                    HOST_ANCHORED,
+                    host.trim_end_matches('/'),
+                    raw
+                ));
+            }
+        }
+    }
     let base = fd_path_for_task(task, dirfd as u32).ok_or(-EBADF)?;
     Ok(alloc::format!("{}/{}", base.trim_end_matches('/'), raw))
 }
+
+/// Marks a path [`resolve_at_path`] already anchored host-absolute, outside
+/// the caller's root: the user-path to host-path conversions
+/// ([`resolve_cwd_path`], [`apply_chroot`]) pass it through un-rooted. A
+/// leading NUL cannot come from userspace, whose pathnames are C strings.
+const HOST_ANCHORED: &str = "\0";
 
 /// Stat an absolute path, handling both files and directories.
 /// Files come from the FileOps `stat()`; directories (mount roots and
@@ -5000,6 +5031,9 @@ pub fn __test_root_dir_reset() {
 /// through unchanged. Joining strips a leading `/` from `path` so
 /// the result has no double-slash.
 pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
+    if let Some(host) = path.strip_prefix(HOST_ANCHORED) {
+        return alloc::string::String::from(host);
+    }
     let task = current_task_id();
     let prefix = match root_dir_prefix(task) {
         Some(p) => p,
@@ -7262,7 +7296,7 @@ fn d_path_from_root(target: &str, reader_root: &str) -> alloc::string::String {
 /// PipeWire client in the container hangs at connect.
 pub fn proc_root_path(pid: u64) -> Option<alloc::string::String> {
     let tid = proc_pid_to_tid(pid);
-    let target = task_map_get(&ROOT_DIR_TABLE, tid)
+    let target = task_map_get(&ROOT_DIR_TABLE, fs_key(tid))
         .unwrap_or_else(|| alloc::string::String::from("/"));
     let reader =
         root_dir_prefix(current_task_id()).unwrap_or_else(|| alloc::string::String::from("/"));
@@ -8239,7 +8273,7 @@ pub(crate) fn fd_path_for_task(task: u64, n: u32) -> Option<alloc::string::Strin
 /// tasks. Used so `/proc/<pid>/fd/<n>` and similar surfaces report paths a
 /// chrooted process can actually re-open.
 fn strip_chroot_prefix(task: u64, path: &str) -> alloc::string::String {
-    if let Some(prefix) = task_map_get(&ROOT_DIR_TABLE, task) {
+    if let Some(prefix) = task_map_get(&ROOT_DIR_TABLE, fs_key(task)) {
         if prefix != "/" {
             if let Some(rest) = path.strip_prefix(prefix.as_str()) {
                 if rest.is_empty() {
