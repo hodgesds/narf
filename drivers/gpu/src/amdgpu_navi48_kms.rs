@@ -111,6 +111,27 @@ pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, ConnectorType)>)
     }];
 }
 
+/// Switch the CRTC on or off without touching the connector: a DRM-driven
+/// disable leaves the sink connected with its modes. On only while a mode is
+/// set.
+pub fn set_crtc_active(card: &mut Card, active: bool) {
+    if let Ok(crtc) = card.crtc_mut(CRTC) {
+        crtc.enabled = active && crtc.mode.is_some();
+    }
+}
+
+/// `set_crtc_active` on the registered amdgpu card.
+pub fn set_active(active: bool) {
+    let Some(index) = (0..crate::drm_registry::count() as u32)
+        .find(|&i| crate::drm_registry::driver_name(i) == Some("amdgpu"))
+    else {
+        return;
+    };
+    if let Some(state) = crate::drm_registry::mode_state(index) {
+        set_crtc_active(&mut state.lock(), active);
+    }
+}
+
 /// Publish the lit sink (or its absence) on the registered amdgpu card,
 /// attaching KMS state on first use. Open clients keep their framebuffers.
 pub fn publish(lit: Option<(&[u8; 128], &Timing, ConnectorType)>) {

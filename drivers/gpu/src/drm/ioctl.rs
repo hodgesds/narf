@@ -251,6 +251,36 @@ pub struct DrmModeModeInfo {
     pub name: [u8; 32],
 }
 
+impl DrmModeModeInfo {
+    /// The 68-byte native-endian wire form (a MODE_ID property blob).
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() != 68 {
+            return None;
+        }
+        let u16_at = |at: usize| u16::from_ne_bytes([b[at], b[at + 1]]);
+        let u32_at = |at: usize| u32::from_ne_bytes(b[at..at + 4].try_into().unwrap());
+        let mut name = [0; 32];
+        name.copy_from_slice(&b[36..68]);
+        Some(Self {
+            clock: u32_at(0),
+            hdisplay: u16_at(4),
+            hsync_start: u16_at(6),
+            hsync_end: u16_at(8),
+            htotal: u16_at(10),
+            hskew: u16_at(12),
+            vdisplay: u16_at(14),
+            vsync_start: u16_at(16),
+            vsync_end: u16_at(18),
+            vtotal: u16_at(20),
+            vscan: u16_at(22),
+            vrefresh: u32_at(24),
+            flags: u32_at(28),
+            r#type: u32_at(32),
+            name,
+        })
+    }
+}
+
 /// `struct drm_mode_get_connector` — DRM_IOCTL_MODE_GETCONNECTOR.
 ///
 /// Linux: `include/uapi/drm/drm_mode.h`.

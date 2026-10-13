@@ -932,14 +932,25 @@ polarity flags, and type PREFERRED|DRIVER. GETCONNECTOR and GETCRTC report
 it instead of the synthesized timing. SETCRTC with a mode is refused
 (EINVAL) unless the mode's clock and geometry equal a published timing: the
 driver cannot reprogram a live display, and Linux would otherwise modeset.
-Cards without native outputs are unaffected. Unplug (and `stop_modeset`)
+An atomic MODE_ID blob is held to the same gate (`accepts_mode_blob`, at
+check time, so TEST_ONLY probes see it). Cards without native outputs are
+unaffected. A DRM client switching the CRTC off (SETCRTC without a
+framebuffer, or an atomic commit changing ACTIVE) records the request with
+`platform::request_display_active`; KMS shows the CRTC disabled with the sink
+still connected. The display monitor converges on its next pass: off
+withdraws the scanout and native presentation and runs `stop_modeset`, and
+no plugged sink is lit while off; on (SETCRTC with a framebuffer, ACTIVE=1,
+or the last DRM file closing, as drm_fb_helper restores the console) lights
+the sink again through the normal modeset. The request is level-triggered,
+so an off/on pair between passes does nothing. Unplug (and `stop_modeset`)
 publish the connector disconnected, with no modes, no EDID, and no mode
 accepted. The CRTC is disabled with its framebuffer cleared, and open
 clients keep their GEM and framebuffer objects. DRM_IOCTL_VERSION reports
 amdgpu 3.0.0, the base ABI with no render feature level. This keeps Mesa's
 radeonsi from driving render ioctls the native driver does not implement.
-Presentation is the existing CPU copy, and flip events stay software-paced
-at the real refresh rate.
+Presentation goes through the back buffer and a latched flip (see live
+updates above), and flip events stay software-paced at the real refresh
+rate.
 
 `platform::spawn_display_monitor` runs after the boot-time native modeset
 (`amdgpu.native_display`). It enables HPD on every routed DP port, then polls

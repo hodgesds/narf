@@ -104,6 +104,49 @@ fn navi48_kms_publishes_connector_edid_and_refuses_other_modes() -> TestResult {
     if !card.accepts_mode(&wire) || card.accepts_mode(&mode_to_wire(&mode)) {
         return TestResult::Fail("SETCRTC mode gate");
     }
+    // Atomic MODE_ID blobs get the same gate as SETCRTC.
+    let blob = |m: &DrmModeModeInfo| {
+        let mut b = alloc::vec::Vec::with_capacity(68);
+        b.extend_from_slice(&m.clock.to_ne_bytes());
+        for v in [
+            m.hdisplay,
+            m.hsync_start,
+            m.hsync_end,
+            m.htotal,
+            m.hskew,
+            m.vdisplay,
+            m.vsync_start,
+            m.vsync_end,
+            m.vtotal,
+            m.vscan,
+        ] {
+            b.extend_from_slice(&v.to_ne_bytes());
+        }
+        for v in [m.vrefresh, m.flags, m.r#type] {
+            b.extend_from_slice(&v.to_ne_bytes());
+        }
+        b.extend_from_slice(&m.name);
+        b
+    };
+    if !card.accepts_mode_blob(&blob(&wire))
+        || card.accepts_mode_blob(&blob(&mode_to_wire(&mode)))
+        || card.accepts_mode_blob(&blob(&wire)[..67])
+    {
+        return TestResult::Fail("atomic MODE_ID gate");
+    }
+    // A DRM-driven disable switches the CRTC off and keeps the sink.
+    set_crtc_active(&mut card, false);
+    if card.crtcs[0].enabled
+        || card.crtcs[0].mode != Some(mode)
+        || card.connectors[0].status != ConnectorStatus::Connected
+        || card.connectors[0].modes != [mode]
+    {
+        return TestResult::Fail("DRM disable");
+    }
+    set_crtc_active(&mut card, true);
+    if !card.crtcs[0].enabled {
+        return TestResult::Fail("DRM re-enable");
+    }
     // Unplugged: disconnected, no modes or EDID, and no mode accepted.
     card.crtcs[0].primary_fb = Some(7);
     apply(&mut card, None);
@@ -119,6 +162,11 @@ fn navi48_kms_publishes_connector_edid_and_refuses_other_modes() -> TestResult {
         || card.accepts_mode(&wire)
     {
         return TestResult::Fail("unplugged connector");
+    }
+    // Nothing to switch on without a mode.
+    set_crtc_active(&mut card, true);
+    if card.crtcs[0].enabled {
+        return TestResult::Fail("enabled without a mode");
     }
     // Cards without native outputs keep accepting any mode.
     if !Card::new("bochs", "", (1, 0, 0)).accepts_mode(&mode_to_wire(&mode)) {

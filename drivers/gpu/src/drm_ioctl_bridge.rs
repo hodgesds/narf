@@ -3510,6 +3510,11 @@ fn handle_atomic(
                                     .property_blob(value as u32)
                                     .filter(|blob| blob.len() == 68)
                                     .ok_or(FsError::InvalidData)?;
+                                // A native display runs only its published
+                                // timing; any other is refused at check time.
+                                if !card.accepts_mode_blob(mode) {
+                                    return Err(FsError::InvalidData);
+                                }
                                 Some(crate::Mode {
                                     width: u16::from_le_bytes(mode[4..6].try_into().unwrap())
                                         as u32,
@@ -3615,6 +3620,11 @@ fn handle_atomic(
                     "  drm: ATOMIC commit failed: {error:?}"
                 );
                 return Err(FsError::InvalidData);
+            }
+            if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+                for crtc in state.crtcs.iter().filter(|c| c.active_changed) {
+                    crate::amdgpu_navi48_platform::request_display_active(crtc.active);
+                }
             }
             let active_plane = state
                 .planes
@@ -4032,6 +4042,10 @@ fn handle_setcrtc(
                 None
             };
             crtc.enabled = req.fb_id != 0;
+        }
+        // The native display follows the CRTC's on/off state.
+        if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+            crate::amdgpu_navi48_platform::request_display_active(req.fb_id != 0);
         }
 
         if req.fb_id == 0 {

@@ -543,6 +543,12 @@ impl Card {
                 .flat_map(|n| n.timings.iter())
                 .any(|t| geometry(t) == geometry(m))
     }
+    /// `accepts_mode` for an atomic MODE_ID blob: on a card with native
+    /// outputs only a published timing (the driver cannot switch a live
+    /// display to another), as SETCRTC already enforces.
+    pub fn accepts_mode_blob(&self, blob: &[u8]) -> bool {
+        crate::drm::ioctl::DrmModeModeInfo::from_bytes(blob).is_some_and(|m| self.accepts_mode(&m))
+    }
     /// The native sink data of a connector, if a driver published it.
     pub fn native_output(&self, connector: u32) -> Option<&NativeOutput> {
         self.native.iter().find(|n| n.connector == connector)

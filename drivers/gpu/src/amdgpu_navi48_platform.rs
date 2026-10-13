@@ -870,6 +870,22 @@ pub enum MonitorStep {
     Replugged,
     /// No modeset and no sink.
     Waiting,
+    /// A DRM client switched the CRTC off: the scanout was withdrawn and the
+    /// modeset torn down, the connector staying connected.
+    Disabled,
+    /// The CRTC is off by DRM request; plugged sinks are not lit.
+    Off,
+}
+
+/// Whether DRM wants the native CRTC on (SETCRTC with a framebuffer, or
+/// atomic ACTIVE=1) or off (SETCRTC with none, or ACTIVE=0). Level-triggered:
+/// the display monitor converges the hardware to it on its next pass, so a
+/// quick off/on pair does nothing.
+static DRM_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Record DRM's CRTC on/off request for the native display.
+pub fn request_display_active(active: bool) {
+    DRM_ACTIVE.store(active, core::sync::atomic::Ordering::Release);
 }
 
 /// One monitor pass: check a running modeset and retrain or tear it down,
@@ -881,6 +897,23 @@ pub async unsafe fn monitor_display(
     pipe: u8,
 ) -> Result<MonitorStep, crate::amdgpu_navi48_boot::ModesetError> {
     use crate::amdgpu_navi48_boot::{Error as BootError, Health, ModesetError};
+    let active = DRM_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
+    if !active {
+        let Some(m) = current.as_ref() else {
+            return Ok(MonitorStep::Off);
+        };
+        // Withdraw writers first, as for stop_modeset, but keep the sink
+        // published: the CRTC is off, the connector still connected.
+        NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
+        crate::amdgpu_dcn_display::publish_external(None, None);
+        crate::amdgpu_navi48_kms::set_active(false);
+        let mut owner = OWNER.lock().await;
+        let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+        // SAFETY: the caller's obligations; the scanout is withdrawn first.
+        unsafe { boot.stop_modeset(m).await }?;
+        *current = None;
+        return Ok(MonitorStep::Disabled);
+    }
     let Some(m) = current.as_mut() else {
         let plugged = {
             let mut owner = OWNER.lock().await;
@@ -954,7 +987,7 @@ pub unsafe fn spawn_display_monitor(modeset: crate::amdgpu_navi48_boot::Modeset)
                 .await;
             // SAFETY: the spawner's obligations hold for the task's lifetime.
             match unsafe { monitor_display(&mut current, pipe) }.await {
-                Ok(MonitorStep::Running(_) | MonitorStep::Waiting) => {}
+                Ok(MonitorStep::Running(_) | MonitorStep::Waiting | MonitorStep::Off) => {}
                 Ok(step) => {
                     let _ = writeln!(narf_console::Writer, "amdgpu: navi48 display {step:?}");
                 }
