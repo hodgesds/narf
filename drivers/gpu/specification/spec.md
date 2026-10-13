@@ -819,11 +819,21 @@ status to stay clear with fetch blanked, rebinds the owners and returns to
 failures quarantine without recovery.
 
 `unsafe ColdBoot::modeset_display(pipe, fill).await` (platform
-`modeset_display`) orchestrates the above on one legacy DP SST connector. It
-scans the routed sinks, selects the first DisplayPort port whose sink answered
-with DPCD and an EDID preferred mode that `timing_from_edid` accepts, and links
+`modeset_display`) orchestrates the above on one legacy DP SST or TMDS HDMI
+connector. It scans the routed sinks, selects the first DisplayPort port whose
+sink answered with DPCD and an EDID preferred mode that `timing_from_edid`
+accepts (from the 128-byte base block; extension blocks follow it), and links
 it at the sink's maximum lanes and rate. A sink that cannot carry the mode's
-8-bpc payload is skipped (`ModesetError::Link` if nothing else fits).
+8-bpc payload is skipped (`ModesetError::Link` if nothing else fits). With no
+such DP sink, the first HDMI port whose EDID carries the HDMI Licensing VSDB
+(`hdmi_sink`; a DVI sink never receives HDMI packets) and whose preferred mode
+is at most `TMDS_MAX_KHZ` is selected (`Selection::hdmi`, zero lanes): its pipe
+clock is the TMDS divide-by-four rate and its timing `Signal::Tmds`, and the
+link starts with `prepare_hdmi_link` (stream = pipe), `start_hdmi_video` and
+scanout. HDMI has no link status: `check_modeset` reports HPD and scanout
+only, `retrain_modeset` is `Unsupported`, and stop/unplug use
+`stop_hdmi_video` then `stop_hdmi_link`. The monitor enables HPD on every DP
+and HDMI port.
 Training then walks narf's fallback ladder (`link_candidates`), trying only
 settings that carry the mode: the link rate drops first; below RBR the lanes
 halve and the rate restarts at the sink's maximum. A confirmed CR, EQ or
@@ -884,7 +894,8 @@ lifetime.
 `amdgpu_navi48_kms` publishes the lit sink as KMS state on the registered
 amdgpu card. KMS state is attached on first publication; until then every
 amdgpu DRM ioctl fails as before. The state is one CRTC (1), one encoder
-(2, TMDS type, as amdgpu_dm reports DP) and one DisplayPort connector (3).
+(2, TMDS type, as amdgpu_dm reports DP) and one connector (3) whose type is
+the lit sink's (DisplayPort or HDMI-A); an unplug keeps the last type.
 The card's `NativeOutput` carries the sink's base EDID block, which
 GETPROPBLOB returns verbatim, and the exact DRM timing from the DCN
 `Timing`. That timing has the porches and sync widths, rounded refresh, sync

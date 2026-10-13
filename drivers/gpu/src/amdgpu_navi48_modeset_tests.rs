@@ -157,3 +157,76 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_link_fallback_ladder_skips_short_links
 );
+
+/// `base` with one CTA-861 extension, carrying the HDMI Licensing VSDB when
+/// `hdmi` (else a DVI sink with a bare extension).
+fn with_cta(mut base: Vec<u8>, hdmi: bool) -> Vec<u8> {
+    base[126] = 1;
+    base[127] = 0;
+    base[127] = narf_edid::compute_checksum(&base);
+    let mut ext = alloc::vec![0u8; 128];
+    (ext[0], ext[1], ext[3]) = (0x02, 3, 0);
+    if hdmi {
+        ext[4..10].copy_from_slice(&[3 << 5 | 5, 0x03, 0x0c, 0x00, 0x10, 0x00]);
+        ext[2] = 10;
+    } else {
+        ext[2] = 4;
+    }
+    let sum = ext[..127].iter().fold(0u8, |s, b| s.wrapping_add(*b));
+    ext[127] = 0u8.wrapping_sub(sum);
+    base.extend_from_slice(&ext);
+    base
+}
+/// CEA 3840x2160@60 (594 MHz) as the preferred mode.
+fn edid_2160p() -> Vec<u8> {
+    let mut e = edid_1080p();
+    e[54..72].copy_from_slice(&[
+        0x08, 0xe8, 0x00, 0x30, 0xf2, 0x70, 0x5a, 0x80, 0xb0, 0x58, 0x8a, 0, 0, 0, 0, 0, 0, 0x1e,
+    ]);
+    e[127] = 0;
+    e[127] = narf_edid::compute_checksum(&e);
+    e
+}
+
+fn navi48_modeset_selects_hdmi_sinks_only_without_dp_and_below_340_mhz() -> TestResult {
+    use inventory::Connector::{DisplayPort as Dp, HdmiTypeA as Hdmi};
+    if !hdmi_sink(&with_cta(edid_1080p(), true))
+        || hdmi_sink(&with_cta(edid_1080p(), false))
+        || hdmi_sink(&edid_1080p())
+    {
+        return TestResult::Fail("HDMI VSDB detection");
+    }
+    let paths = [path(Hdmi, 0), path(Hdmi, 1), path(Dp, 2)];
+    // A DVI sink on an HDMI connector is never driven with HDMI packets.
+    let ports = [
+        port(paths[0], None, with_cta(edid_1080p(), false)),
+        port(paths[1], None, with_cta(edid_1080p(), true)),
+        display::Port {
+            path: paths[2],
+            sink: Err(display::Error::InvalidDpcd),
+        },
+    ];
+    match select(&paths, &ports) {
+        Ok(s) if s.port == 1 && s.hdmi && s.lanes == 0 && s.timing.pixel_clock_khz == 148_500 => {}
+        _ => return TestResult::Fail("HDMI selection"),
+    }
+    // An answering DP sink wins over HDMI, as before; like nearly every real
+    // monitor it carries an extension block after its base block.
+    let ports = [
+        port(paths[1], None, with_cta(edid_1080p(), true)),
+        port(paths[2], dpcd(0x14, 4), with_cta(edid_1080p(), false)),
+    ];
+    if !matches!(select(&paths, &ports), Ok(s) if s.port == 2 && !s.hdmi) {
+        return TestResult::Fail("DP preferred");
+    }
+    // 594 MHz needs SCDC scrambling, which this path does not do.
+    let ports = [port(paths[1], None, with_cta(edid_2160p(), true))];
+    if select(&paths, &ports) != Err(ModesetError::Link) {
+        return TestResult::Fail("over 340 MHz");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_selects_hdmi_sinks_only_without_dp_and_below_340_mhz
+);

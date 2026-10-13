@@ -1,5 +1,6 @@
-//! Orchestrated native Navi48 modeset on one legacy DP SST connector: choose
-//! the first answering DisplayPort sink and its EDID preferred mode, admit it,
+//! Orchestrated native Navi48 modeset on one legacy DP SST or TMDS HDMI
+//! connector: choose the first answering DisplayPort sink (else the first HDMI
+//! sink) and its EDID preferred mode, admit it,
 //! then run the retained owners' preparations in their dependency order and
 //! make the uploaded surface visible. Inherited (GOP) consumers must already
 //! be retired; the clock owners refuse otherwise.
@@ -12,7 +13,8 @@ use crate::dp_link_training::LinkRate;
 /// scanout uses one index for both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModesetError {
-    /// No routed DP connector answered with DPCD and an EDID preferred mode.
+    /// No routed DP connector answered with DPCD and an EDID preferred mode,
+    /// and no HDMI connector with an HDMI (not DVI) sink.
     NoSink,
     /// The preferred mode cannot be carried by the sink's maximum link.
     Link,
@@ -33,10 +35,13 @@ pub struct Selection {
     /// Index into `display_paths()`, the `port` of every DP operation.
     pub port: usize,
     pub timing: Timing,
+    /// DP link settings; unused (zero lanes) for HDMI.
     pub lanes: u8,
     pub rate: LinkRate,
     /// The sink's base EDID block, reported to DRM verbatim.
     pub edid: [u8; 128],
+    /// A TMDS HDMI sink rather than DP SST.
+    pub hdmi: bool,
 }
 
 /// The result of a successful modeset, retained by the caller for teardown.
@@ -71,8 +76,29 @@ pub fn link_fits(timing: &Timing, lanes: u8, rate: LinkRate) -> bool {
     u64::from(timing.pixel_clock_khz) * 3 * 8 <= rate as u64 * 27_000 * 8 * u64::from(lanes)
 }
 
+/// An HDMI sink, not DVI: some CTA-861 extension carries the HDMI Licensing
+/// VSDB. HDMI data islands (GC and AVI packets) must not reach a DVI sink.
+pub fn hdmi_sink(edid: &[u8]) -> bool {
+    edid.chunks_exact(128).skip(1).any(|block| {
+        narf_edid::cta861::CtaExtension::parse(block)
+            .ok()
+            .and_then(|c| c.hdmi_vsdb())
+            .is_some()
+    })
+}
+
+/// The base block's preferred mode. Extension blocks follow the base block in
+/// the scanned EDID; the base parser takes exactly one 128-byte block.
+fn preferred(edid: &[u8]) -> Option<Timing> {
+    narf_edid::Block::parse(edid.get(..128)?)
+        .ok()
+        .and_then(|b| b.preferred_mode())
+        .and_then(|d| crate::amdgpu_dcn_display::timing_from_edid(&d).ok())
+}
+
 /// First routed DP port whose sink answered with DPCD and an EDID preferred
-/// mode the DCN timing model accepts, at the sink's maximum link.
+/// mode the DCN timing model accepts, at the sink's maximum link; failing
+/// that, the first HDMI sink whose preferred mode fits unscrambled TMDS.
 pub fn select(
     paths: &[inventory::Path],
     ports: &[display::Port],
@@ -86,11 +112,7 @@ pub fn select(
         let Some((lanes, rate)) = sink.dpcd.as_ref().and_then(max_link) else {
             continue;
         };
-        let Some(timing) = narf_edid::Block::parse(&sink.edid)
-            .ok()
-            .and_then(|b| b.preferred_mode())
-            .and_then(|d| crate::amdgpu_dcn_display::timing_from_edid(&d).ok())
-        else {
+        let Some(timing) = preferred(&sink.edid) else {
             continue;
         };
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
@@ -109,6 +131,37 @@ pub fn select(
             lanes,
             rate,
             edid,
+            hdmi: false,
+        });
+    }
+    for port in ports {
+        if port.path.connector != inventory::Connector::HdmiTypeA {
+            continue;
+        }
+        let Ok(sink) = &port.sink else { continue };
+        if !hdmi_sink(&sink.edid) {
+            continue;
+        }
+        let Some(timing) = preferred(&sink.edid) else {
+            continue;
+        };
+        let Some(index) = paths.iter().position(|p| *p == port.path) else {
+            continue;
+        };
+        let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
+            continue;
+        };
+        if timing.pixel_clock_khz > otg::TMDS_MAX_KHZ {
+            link_short = true;
+            continue;
+        }
+        return Ok(Selection {
+            port: index,
+            timing,
+            lanes: 0,
+            rate: LinkRate::Rbr,
+            edid,
+            hdmi: true,
         });
     }
     Err(if link_short {
@@ -156,22 +209,34 @@ pub fn clock_request(plan: &dml::Plan) -> clocks::Request {
     }
 }
 
-pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan) -> dccg::Request {
+/// DP's DPREF DTO, or for RGB TMDS the divide-by-four pixel rate (Linux's
+/// dcn401_calculate_dccg_tmds_div_value) from the PHY PLL.
+pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan, hdmi: bool) -> dccg::Request {
     dccg::Request {
         pipe,
         dpp_khz: plan.clocks.dppclk_khz,
-        pixel: dccg::PixelClock::DisplayPort {
-            pixel_hz: u64::from(plan.mode.timing.pixel_clock_khz) * 1000,
+        pixel: if hdmi {
+            dccg::PixelClock::Tmds {
+                divider: dccg::TmdsDivider::By4,
+            }
+        } else {
+            dccg::PixelClock::DisplayPort {
+                pixel_hz: u64::from(plan.mode.timing.pixel_clock_khz) * 1000,
+            }
         },
     }
 }
 
-pub fn timing_request(pipe: u8, plan: &dml::Plan) -> otg::Request {
+pub fn timing_request(pipe: u8, plan: &dml::Plan, hdmi: bool) -> otg::Request {
     otg::Request {
         pipe,
         timing: plan.mode.timing,
         sync: plan.sync,
-        signal: otg::Signal::DisplayPort,
+        signal: if hdmi {
+            otg::Signal::Tmds
+        } else {
+            otg::Signal::DisplayPort
+        },
     }
 }
 
@@ -301,7 +366,7 @@ impl ColdBoot {
         self.prepare_display_clocks(clock_request(&plan))
             .await
             .map_err(ModesetError::Clocks)?;
-        self.prepare_display_pipe_clocks(pipe_clock_request(pipe, &plan))
+        self.prepare_display_pipe_clocks(pipe_clock_request(pipe, &plan, selection.hdmi))
             .await
             .map_err(ModesetError::PipeClocks)?;
         let (width, height) = (selection.timing.h_active, selection.timing.v_active);
@@ -323,7 +388,7 @@ impl ColdBoot {
                 self.upload_display_surface(pipe, 0, y, &row)?;
             }
             self.prepare_display_memory(pipe).await?;
-            self.prepare_display_timing(timing_request(pipe, &plan))
+            self.prepare_display_timing(timing_request(pipe, &plan, selection.hdmi))
                 .await?;
             self.prepare_display_blank(otg::BlankRequest {
                 pipe,
@@ -362,6 +427,13 @@ impl ColdBoot {
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
             let port = selection.port;
+            if selection.hdmi {
+                let request = otg::HdmiLinkRequest { stream: pipe, pipe };
+                self.prepare_display_hdmi_link(port, request).await?;
+                self.start_display_hdmi_video(port).await?;
+                let scanout = self.start_display_scanout(pipe).await?;
+                return Ok((selection, scanout));
+            }
             let mut selection = selection;
             let mut trained = false;
             let mut refused = ModesetError::Link;
@@ -412,9 +484,12 @@ impl ColdBoot {
         }
         // SAFETY: as documented above.
         unsafe {
-            let link = self.display_dp_link_status(port).await?;
-            if link.lost() {
-                return Ok(Health::LinkLost(link));
+            // TMDS has no sink-side lock status to read.
+            if !m.selection.hdmi {
+                let link = self.display_dp_link_status(port).await?;
+                if link.lost() {
+                    return Ok(Health::LinkLost(link));
+                }
             }
             Ok(Health::Running(self.check_display_scanout(m.pipe).await?))
         }
@@ -426,6 +501,9 @@ impl ColdBoot {
     /// As for `modeset_display`; stop every CPU writer of the surface first.
     pub async unsafe fn retrain_modeset(&mut self, m: &mut Modeset) -> Result<(), ModesetError> {
         let port = m.selection.port;
+        if m.selection.hdmi {
+            return Err(ModesetError::Display(otg::Error::Unsupported));
+        }
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             self.stop_display_scanout(m.pipe).await?;
@@ -445,9 +523,14 @@ impl ColdBoot {
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             self.stop_display_scanout(m.pipe).await?;
-            self.stop_display_dp_video(port).await?;
-            self.stop_display_dp_frontend(port).await?;
-            self.stop_unplugged_display_dp_link(port).await?;
+            if m.selection.hdmi {
+                // TMDS addresses no sink: the ordinary stop applies.
+                self.stop_hdmi(port).await?;
+            } else {
+                self.stop_display_dp_video(port).await?;
+                self.stop_display_dp_frontend(port).await?;
+                self.stop_unplugged_display_dp_link(port).await?;
+            }
             self.retire_display_timing(m.pipe).await?;
             self.retire_display_planes().await?;
         }
@@ -462,11 +545,26 @@ impl ColdBoot {
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
             self.stop_display_scanout(m.pipe).await?;
-            self.stop_display_dp_video(port).await?;
-            self.stop_display_dp_frontend(port).await?;
-            self.stop_display_dp_link(port).await?;
+            if m.selection.hdmi {
+                self.stop_hdmi(port).await?;
+            } else {
+                self.stop_display_dp_video(port).await?;
+                self.stop_display_dp_frontend(port).await?;
+                self.stop_display_dp_link(port).await?;
+            }
             self.retire_display_timing(m.pipe).await?;
             self.retire_display_planes().await?;
+        }
+        Ok(())
+    }
+    /// Mute and stop HDMI video, then the transmitter and frontend.
+    /// # Safety
+    /// As for `stop_modeset`, with scanout stopped.
+    async unsafe fn stop_hdmi(&mut self, port: usize) -> Result<(), ModesetError> {
+        // SAFETY: the caller's obligations; each step checks its predecessor.
+        unsafe {
+            self.stop_display_hdmi_video(port).await?;
+            self.stop_display_hdmi_link(port).await?;
         }
         Ok(())
     }

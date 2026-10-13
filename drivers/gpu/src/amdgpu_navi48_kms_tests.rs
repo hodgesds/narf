@@ -71,8 +71,8 @@ fn navi48_kms_publishes_connector_edid_and_refuses_other_modes() -> TestResult {
     let t = cea_1080p();
     let wire = timing_wire(&t);
     let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
-    apply(&mut card, Some((&edid, &t)));
-    apply(&mut card, Some((&edid, &t))); // idempotent topology
+    apply(&mut card, Some((&edid, &t, ConnectorType::DisplayPort)));
+    apply(&mut card, Some((&edid, &t, ConnectorType::DisplayPort))); // idempotent topology
     if (card.crtcs.len(), card.encoders.len(), card.connectors.len()) != (1, 1, 1) {
         return TestResult::Fail("topology duplicated");
     }
@@ -129,4 +129,27 @@ fn navi48_kms_publishes_connector_edid_and_refuses_other_modes() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-kms",
     navi48_kms_publishes_connector_edid_and_refuses_other_modes
+);
+
+fn navi48_kms_reports_hdmi_connectors_and_keeps_the_type_when_unplugged() -> TestResult {
+    let edid = [0u8; 128];
+    let t = cea_1080p();
+    let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
+    apply(&mut card, Some((&edid, &t, ConnectorType::HdmiA)));
+    if card.connectors[0].connector_type != ConnectorType::HdmiA
+        || card.connectors[0].status != ConnectorStatus::Connected
+    {
+        return TestResult::Fail("HDMI connector");
+    }
+    apply(&mut card, None);
+    if card.connectors[0].connector_type != ConnectorType::HdmiA
+        || card.connectors[0].status != ConnectorStatus::Disconnected
+    {
+        return TestResult::Fail("unplugged HDMI connector");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-kms",
+    navi48_kms_reports_hdmi_connectors_and_keeps_the_type_when_unplugged
 );

@@ -608,7 +608,15 @@ pub async unsafe fn modeset_display(
     crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
     crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
     let s = &modeset.selection;
-    crate::amdgpu_navi48_kms::publish(Some((&s.edid, &s.timing)));
+    crate::amdgpu_navi48_kms::publish(Some((
+        &s.edid,
+        &s.timing,
+        if s.hdmi {
+            crate::drm::card::ConnectorType::HdmiA
+        } else {
+            crate::drm::card::ConnectorType::DisplayPort
+        },
+    )));
     Ok(modeset)
 }
 
@@ -706,9 +714,9 @@ const MONITOR_MS: u64 = 1000;
 /// What one native display monitor pass did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MonitorStep {
-    /// Sink present, link locked, scanout fetching; the fresh frame count.
+    /// Sink present, link locked (DP), scanout fetching; the fresh frame count.
     Running(u32),
-    /// The link lost lock and was retrained; scanout resumed.
+    /// The DP link lost lock and was retrained; scanout resumed.
     Retrained,
     /// HPD fell: the scanout was withdrawn and the modeset torn down.
     Unplugged,
@@ -766,7 +774,8 @@ pub async unsafe fn monitor_display(
 }
 
 /// Poll a lit modeset for hot-plug and link loss until the owner fails.
-/// HPD is enabled on every routed port so a sink on another port is seen.
+/// HPD is enabled on every routed DP and HDMI port so a sink on another port
+/// is seen.
 /// # Safety
 /// As for `modeset_display`, for the lifetime of the spawned task.
 pub unsafe fn spawn_display_monitor(modeset: crate::amdgpu_navi48_boot::Modeset) {
@@ -779,10 +788,14 @@ pub unsafe fn spawn_display_monitor(modeset: crate::amdgpu_navi48_boot::Modeset)
             if let Some(boot) = owner.as_mut() {
                 let ports = boot.display_paths().map_or(0, <[_]>::len);
                 for port in 0..ports {
-                    let dp = boot.display_paths().is_ok_and(|p| {
-                        p[port].connector == crate::amdgpu_dcn_inventory::Connector::DisplayPort
+                    use crate::amdgpu_dcn_inventory::Connector;
+                    let lightable = boot.display_paths().is_ok_and(|p| {
+                        matches!(
+                            p[port].connector,
+                            Connector::DisplayPort | Connector::HdmiTypeA
+                        )
                     });
-                    if dp {
+                    if lightable {
                         // SAFETY: board-routed selectors; no GPIO user of HPD pins.
                         let _ = unsafe { boot.enable_display_hpd(port) };
                     }

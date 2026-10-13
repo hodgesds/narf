@@ -51,8 +51,9 @@ pub fn timing_wire(t: &Timing) -> DrmModeModeInfo {
     info
 }
 
-/// Set the card's single output to the lit sink, or to disconnected.
-pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing)>) {
+/// Set the card's single output to the lit sink (with its connector type), or
+/// to disconnected, keeping the last connector type.
+pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, ConnectorType)>) {
     if card.crtcs.is_empty() {
         card.crtcs.push(Crtc {
             id: CRTC,
@@ -78,7 +79,7 @@ pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing)>) {
             modes: alloc::vec::Vec::new(),
         });
     }
-    let wire = lit.map(|(_, t)| timing_wire(t));
+    let wire = lit.map(|(_, t, _)| timing_wire(t));
     let mode = wire.map(|w| Mode {
         width: u32::from(w.hdisplay),
         height: u32::from(w.vdisplay),
@@ -99,17 +100,20 @@ pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing)>) {
             ConnectorStatus::Disconnected
         };
         c.modes = mode.into_iter().collect();
+        if let Some((_, _, kind)) = lit {
+            c.connector_type = kind;
+        }
     }
     card.native = alloc::vec![NativeOutput {
         connector: CONNECTOR,
-        edid: lit.map(|(edid, _)| *edid),
+        edid: lit.map(|(edid, _, _)| *edid),
         timings: wire.into_iter().collect(),
     }];
 }
 
 /// Publish the lit sink (or its absence) on the registered amdgpu card,
 /// attaching KMS state on first use. Open clients keep their framebuffers.
-pub fn publish(lit: Option<(&[u8; 128], &Timing)>) {
+pub fn publish(lit: Option<(&[u8; 128], &Timing, ConnectorType)>) {
     let Some(index) = (0..crate::drm_registry::count() as u32)
         .find(|&i| crate::drm_registry::driver_name(i) == Some("amdgpu"))
     else {
