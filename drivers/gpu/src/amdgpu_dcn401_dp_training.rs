@@ -516,6 +516,7 @@ impl<I: Io> Engine<I> {
         .await;
         // A confirmed CR/EQ failure still exits training, as native DC does.
         // Uncertain transport/MMIO failures must not issue speculative cleanup.
+        let mut idle = false;
         if matches!(
             result,
             Err(Error::DpTraining(
@@ -523,10 +524,17 @@ impl<I: Io> Engine<I> {
                     | DpTrainingError::Equalization
                     | DpTrainingError::LinkLost
             ))
-        ) && plan.controls[1] == 0
-        {
-            if let Err(e) = self.dp_training_idle(io, &mut plan).await {
-                result = Err(e);
+        ) {
+            // A link lost after the finish already ran the idle exit (the only
+            // writer of the complete bit); re-verify it instead of replaying.
+            let exit = if plan.controls[1] == 0 {
+                self.dp_training_idle(io, &mut plan).await
+            } else {
+                self.dp_training_verify(plan)
+            };
+            match exit {
+                Ok(()) => idle = true,
+                Err(e) => result = Err(e),
             }
         }
         match result {
@@ -534,6 +542,15 @@ impl<I: Io> Engine<I> {
                 self.status.dp_link_trained = Some(plan);
                 self.status.state = State::DpLinkTrained(path.transmitter);
                 Ok(plan)
+            }
+            // The sink refused this link and the source is proven back at
+            // idle (idle pattern still enabled). As Linux's fallback does, the
+            // link is then disabled (sink D3, PHY off) before a lower setting
+            // re-enables the PHY: stop_dp_link accepts the retained plan.
+            Err(e) if idle => {
+                self.status.dp_link_trained = Some(plan);
+                self.status.state = State::DpLinkRefused(path.transmitter);
+                Err(e)
             }
             Err(e) => {
                 self.status.state = State::Failed(e);
@@ -546,7 +563,10 @@ impl<I: Io> Engine<I> {
         io: &mut impl Transport,
         path: Path,
     ) -> Result<(), Error> {
-        if self.status.state != State::DpLinkTrained(path.transmitter) || !io.ready() {
+        let t = path.transmitter;
+        if !matches!(self.status.state, State::DpLinkTrained(x) | State::DpLinkRefused(x) if x == t)
+            || !io.ready()
+        {
             return Err(Error::Busy);
         }
         let plan = self.status.dp_link_trained.ok_or(Error::Invalid)?;

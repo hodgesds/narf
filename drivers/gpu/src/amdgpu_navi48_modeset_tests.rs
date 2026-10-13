@@ -122,3 +122,37 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_requires_link_payload_and_aligns_pitch
 );
+
+fn navi48_modeset_link_fallback_ladder_skips_short_links() -> TestResult {
+    use inventory::Connector::DisplayPort as Dp;
+    let paths = [path(Dp, 0)];
+    let Ok(s) = select(&paths, &[port(paths[0], dpcd(0x14, 4), edid_1080p())]) else {
+        return TestResult::Fail("selection");
+    };
+    use LinkRate::{Hbr, Hbr2, Rbr};
+    let ladder = link_candidates(&s.timing, 4, Hbr2);
+    if ladder
+        != [
+            (4, Hbr2),
+            (4, Hbr),
+            (4, Rbr),
+            (2, Hbr2),
+            (2, Hbr),
+            (1, Hbr2),
+        ]
+    {
+        return TestResult::Fail("fallback order");
+    }
+    // The maximum link always leads; a sink that only carries the mode at
+    // its maximum has a single candidate.
+    if link_candidates(&s.timing, 1, Hbr2) != [(1, Hbr2)]
+        || !link_candidates(&s.timing, 1, Hbr).is_empty()
+    {
+        return TestResult::Fail("short ladders");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_link_fallback_ladder_skips_short_links
+);

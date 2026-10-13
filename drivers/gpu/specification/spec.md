@@ -823,8 +823,15 @@ failures quarantine without recovery.
 scans the routed sinks, selects the first DisplayPort port whose sink answered
 with DPCD and an EDID preferred mode that `timing_from_edid` accepts, and links
 it at the sink's maximum lanes and rate. A sink that cannot carry the mode's
-8-bpc payload is skipped (`ModesetError::Link` if nothing else fits). There is
-no rate fallback or alternative mode yet. The first clock request (clamped to
+8-bpc payload is skipped (`ModesetError::Link` if nothing else fits).
+Training then walks narf's fallback ladder (`link_candidates`), trying only
+settings that carry the mode: the link rate drops first; below RBR the lanes
+halve and the rate restarts at the sink's maximum. A confirmed CR, EQ or
+link-loss failure whose idle exit is proven leaves the owner in
+`DpLinkRefused`, retaining the plan. Only `stop_dp_link` may follow: as in
+Linux's retries, the sink is put in D3 and the PHY disabled before the next
+setting re-enables it. Any other training failure still quarantines. There is no
+alternative-mode fallback yet. The first clock request (clamped to
 each minimum) starts PMFW so admission can read live levels. The admitted
 plan's DISPCLK/DPPREFCLK are then requested, and the pipe DTO gets its DPPCLK
 and pixel clock. Planes are retired, the HUBP is powered and the surface is

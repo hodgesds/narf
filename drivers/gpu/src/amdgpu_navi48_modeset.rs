@@ -101,6 +101,26 @@ pub fn select(
     })
 }
 
+/// Link settings to try, best first: drop the rate; below RBR halve the lanes
+/// and restart from the sink's maximum rate (narf's documented DP fallback
+/// ladder, as in `dp_link_training`). Settings that cannot carry the mode are
+/// never tried.
+pub fn link_candidates(timing: &Timing, lanes: u8, rate: LinkRate) -> Vec<(u8, LinkRate)> {
+    let mut out = Vec::new();
+    let mut l = lanes;
+    while l >= 1 {
+        let mut r = Some(rate);
+        while let Some(current) = r {
+            if link_fits(timing, l, current) {
+                out.push((l, current));
+            }
+            r = current.next_lower();
+        }
+        l /= 2;
+    }
+    out
+}
+
 /// Linear XRGB8888 pitch in pixels: 64-pixel (256-byte) aligned.
 pub fn mode(timing: Timing) -> dml::Mode {
     dml::Mode {
@@ -298,15 +318,38 @@ impl ColdBoot {
             self.prepare_display_requestor(pipe).await?;
             self.prepare_display_deadlines(pipe, &plan).await?;
             let port = selection.port;
-            self.enable_display_dp_phy(
-                port,
-                otg::DpPhySettings {
-                    lanes: selection.lanes,
-                    rate: selection.rate,
-                },
-            )
-            .await?;
-            self.train_display_dp_link(port, false).await?;
+            let mut selection = selection;
+            let mut trained = false;
+            let mut refused = ModesetError::Link;
+            let transmitter =
+                self.display_paths().map_err(|_| ModesetError::NoSink)?[port].transmitter;
+            for (lanes, rate) in link_candidates(&selection.timing, selection.lanes, selection.rate)
+            {
+                self.enable_display_dp_phy(port, otg::DpPhySettings { lanes, rate })
+                    .await?;
+                match self.train_display_dp_link(port, false).await {
+                    Ok(_) => {
+                        (selection.lanes, selection.rate) = (lanes, rate);
+                        trained = true;
+                        break;
+                    }
+                    // The sink refused this link and training proved its idle
+                    // exit: stop the link (sink D3, PHY off) and try the next
+                    // setting, as Linux's training retries do.
+                    Err(e @ otg::Error::DpTraining(_))
+                        if self
+                            .display_timing_status()
+                            .is_ok_and(|s| s.state == otg::State::DpLinkRefused(transmitter)) =>
+                    {
+                        refused = e.into();
+                        self.stop_display_dp_link(port).await?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !trained {
+                return Err(refused);
+            }
             self.prepare_display_dp_frontend(port, otg::DpFrontendRequest { stream: pipe, pipe })
                 .await?;
             self.start_display_dp_video(port).await?;

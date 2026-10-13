@@ -115,6 +115,9 @@ pub enum State {
     DpPhyDisabled,
     TrainingDp(u8),
     DpLinkTrained(u8),
+    /// The sink refused training and the source is proven back at idle;
+    /// only stop_dp_link may follow, before a fallback re-enables the PHY.
+    DpLinkRefused(u8),
     StoppingDpLink(u8),
     PreparingDpFrontend(u8),
     DpFrontendReady(u8),
@@ -281,7 +284,8 @@ pub struct Status {
     /// Historical untrained PHY evidence; valid only in DpPhyReady. No sink,
     /// training, stream or scanout completion is implied.
     pub dp_phy_ready: Option<DpPhyReady>,
-    /// Historical source/sink training evidence; current only in DpLinkTrained.
+    /// Historical source/sink training evidence; current only in DpLinkTrained
+    /// (or, for a refused link awaiting stop_dp_link, DpLinkRefused).
     /// Video, timing and scanout remain stopped.
     pub dp_link_trained: Option<DpLinkTrained>,
     /// Historical blank frontend setup; current only in DpFrontendReady.

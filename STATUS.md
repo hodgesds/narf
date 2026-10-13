@@ -419,6 +419,8 @@ A native 64x64 premultiplied ARGB hardware cursor can be shown and moved on a
 live Navi48 pipe, programmed under the cursor VUPDATE lock as Linux does.
 The fb pointer (console and compositor) uses it on an adopted Navi48 scanout
 instead of compositing a sprite.
+DP link training now falls back: a cleanly refused link is stopped (sink D3,
+PHY off), and the modeset retries lower rates, then fewer lanes.
 Native legacy/HPO DisplayPort stream blanking now waits for actual video-stop
 acknowledgement before resetting or disabling FIFOs. It handles inherited
 disable-in-progress state, keeps timing and link clocks available for PHY

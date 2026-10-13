@@ -507,13 +507,19 @@ fn dcn401_dp_training_bounds_cr_eq_and_detects_link_loss_after_idle() -> TestRes
                 .count(),
             rounds
         );
-        assert_eq!(io.bytes[&0x102], 0); // confirmed training failures exit to idle
-        assert_eq!(e.status.state, State::Failed(Error::DpTraining(error)));
-        assert!(e.status.dp_link_trained.is_none());
+        // Confirmed training failures exit to idle; the refused link is
+        // retained for stop_dp_link only (Linux disables before fallback).
+        assert_eq!(io.bytes[&0x102], 0);
+        assert_eq!(e.status.state, State::DpLinkRefused(3));
+        assert!(e.status.dp_link_trained.is_some());
         assert_eq!(
             run(e.train_dp_link(&mut io, path(3), false)),
             Err(Error::Busy)
         );
+        assert_eq!(e.status.state, State::DpLinkRefused(3));
+        assert_eq!(run(e.stop_dp_link(&mut io, path(3))), Ok(()));
+        assert_eq!(e.status.state, State::DpPhyDisabled);
+        assert_eq!(io.bytes[&0x600], 2); // sink D3 before PHY disable
     }
     TestResult::Pass
 }
@@ -678,7 +684,8 @@ fn dcn401_dp_training_final_completion_requires_unchanged_sink_and_no_post_lt_wo
             run(e.train_dp_link(&mut io, path(1), false)),
             Err(Error::DpTraining(DpTrainingError::LinkLost))
         );
-        assert!(e.status.dp_link_trained.is_none());
+        // The finish's idle exit stands: refused, retained only for stop.
+        assert_eq!(e.status.state, State::DpLinkRefused(1));
     }
     TestResult::Pass
 }
