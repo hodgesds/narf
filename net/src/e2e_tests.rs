@@ -1865,6 +1865,149 @@ kernel_test_in!(
 //
 // Linux ref: `ip_rcv_finish()` → `ip_route_input_noref()`, net/ipv4/route.c.
 
+// ── Receive checksum verification ───────────────────────────────────────────
+//
+// `ip_rcv_core` drops a bad IPv4 header checksum, `tcp_v4_rcv` a bad TCP
+// checksum, and `__udp4_lib_rcv` a bad nonzero UDP checksum. NARF verified
+// none of them, so a corrupted segment was accepted as data — and software GRO
+// passing such a segment through unmerged relied on the stack to drop it.
+
+const CSUM_IFACE: &str = "e2e-cs8";
+const CSUM_LOCAL_IP: [u8; 4] = [10, 0, 8, 1];
+
+fn csum_syn(port: u16) -> Vec<u8> {
+    build_tcp_frame(TcpFrameSpec {
+        src_mac: [0x02, 0, 0, 0, 0, 0x08],
+        dst_mac: [0x02, 0, 0, 0, 0, 0x08],
+        src_ip: CSUM_LOCAL_IP,
+        dst_ip: CSUM_LOCAL_IP,
+        src_port: 55801,
+        dst_port: port,
+        seq: 0x1234_0000,
+        ack: 0,
+        flags: FLAG_SYN,
+        window: 65535,
+        payload: &[],
+    })
+}
+
+fn saw_synack(port: u16) -> bool {
+    let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
+    drain_captured().iter().any(|f| {
+        f.len() >= tcp_off + TCP_HDR_MIN
+            && u16::from_be_bytes([f[tcp_off], f[tcp_off + 1]]) == port
+            && f[tcp_off + 13] & (FLAG_SYN | FLAG_ACK) == (FLAG_SYN | FLAG_ACK)
+    })
+}
+
+fn smoke_rx_tcp_and_ip_bad_checksum_dropped() -> TestResult {
+    use crate::tcp_stack::rx_csum::{IP_HDR_ERRORS, TCP_CSUM_ERRORS};
+    use ::core::sync::atomic::Ordering::Relaxed;
+    const PORT: u16 = 24081;
+    full_reset(CSUM_IFACE, CSUM_LOCAL_IP, CSUM_LOCAL_IP);
+    crate::netfilter::__reset_all_for_test();
+    if listen(CSUM_LOCAL_IP, PORT, 4).is_err() {
+        return TestResult::Fail("listen failed");
+    }
+    crate::tcp_stack::init();
+    let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
+    let _ = drain_captured();
+
+    // Bad TCP checksum: dropped before the listener sees it.
+    let tcp_errs = TCP_CSUM_ERRORS.load(Relaxed);
+    let mut bad_tcp = csum_syn(PORT);
+    bad_tcp[tcp_off + 16] ^= 0x5a;
+    crate::tcp_stack::rx_handler(CSUM_IFACE, &mut bad_tcp);
+    if saw_synack(PORT) {
+        return TestResult::Fail("a SYN with a bad TCP checksum was answered");
+    }
+    if TCP_CSUM_ERRORS.load(Relaxed) != tcp_errs + 1 {
+        return TestResult::Fail("a bad TCP checksum was not counted");
+    }
+
+    // Bad IPv4 header checksum: dropped before any L4 processing.
+    let ip_errs = IP_HDR_ERRORS.load(Relaxed);
+    let mut bad_ip = csum_syn(PORT);
+    bad_ip[ETH_HDR_LEN + 10] ^= 0x5a;
+    crate::tcp_stack::rx_handler(CSUM_IFACE, &mut bad_ip);
+    if saw_synack(PORT) {
+        return TestResult::Fail("a SYN with a bad IPv4 header checksum was answered");
+    }
+    if IP_HDR_ERRORS.load(Relaxed) != ip_errs + 1 {
+        return TestResult::Fail("a bad IPv4 header checksum was not counted");
+    }
+
+    // Positive control: the intact SYN is answered and counts nothing.
+    let mut good = csum_syn(PORT);
+    crate::tcp_stack::rx_handler(CSUM_IFACE, &mut good);
+    if !saw_synack(PORT) {
+        return TestResult::Fail("a SYN with valid checksums was not answered");
+    }
+    if TCP_CSUM_ERRORS.load(Relaxed) != tcp_errs + 1 || IP_HDR_ERRORS.load(Relaxed) != ip_errs + 1 {
+        return TestResult::Fail("a valid SYN was counted as a checksum error");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_rx_tcp_and_ip_bad_checksum_dropped);
+
+fn smoke_rx_udp_bad_checksum_dropped() -> TestResult {
+    use crate::tcp_stack::rx_csum::UDP_CSUM_ERRORS;
+    use ::core::sync::atomic::Ordering::Relaxed;
+    const PORT: u16 = 17801;
+    full_reset(CSUM_IFACE, CSUM_LOCAL_IP, CSUM_LOCAL_IP);
+    crate::netfilter::__reset_all_for_test();
+    let udp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
+    let deliver = |frame: &mut Vec<u8>| -> Result<bool, &'static str> {
+        let sock = udp_bind(SocketAddrV4::new([0, 0, 0, 0], PORT), UdpOptions::default())
+            .map_err(|_| "udp_bind failed")?;
+        crate::tcp_stack::rx_handler(CSUM_IFACE, frame);
+        let mut buf = [0u8; 64];
+        let got = udp_recv(&sock, &mut buf).is_ok();
+        udp_close(&sock);
+        Ok(got)
+    };
+    let with_checksum = || {
+        let mut f = build_udp_frame(CSUM_LOCAL_IP, CSUM_LOCAL_IP, 40001, PORT, b"udp-csum");
+        let cs = crate::pkt_tcp::ipv4_pseudo_checksum_proto(
+            CSUM_LOCAL_IP,
+            CSUM_LOCAL_IP,
+            IP_PROTO_UDP,
+            &f[udp_off..],
+        );
+        let cs = if cs == 0 { 0xffff } else { cs };
+        f[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
+        f
+    };
+    // Zero = "no checksum" (RFC 768): delivered.
+    let mut none = build_udp_frame(CSUM_LOCAL_IP, CSUM_LOCAL_IP, 40001, PORT, b"udp-csum");
+    match deliver(&mut none) {
+        Ok(true) => {}
+        Ok(false) => return TestResult::Fail("a UDP datagram without a checksum was dropped"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    // A correct checksum: delivered.
+    match deliver(&mut with_checksum()) {
+        Ok(true) => {}
+        Ok(false) => return TestResult::Fail("a UDP datagram with a valid checksum was dropped"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    // A wrong nonzero checksum: dropped and counted.
+    let errs = UDP_CSUM_ERRORS.load(Relaxed);
+    let mut bad = with_checksum();
+    let last = bad.len() - 1;
+    bad[last] ^= 0x5a;
+    match deliver(&mut bad) {
+        Ok(false) => {}
+        Ok(true) => return TestResult::Fail("a UDP datagram with a bad checksum was delivered"),
+        Err(e) => return TestResult::Fail(e),
+    }
+    if UDP_CSUM_ERRORS.load(Relaxed) != errs + 1 {
+        return TestResult::Fail("a bad UDP checksum was not counted");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_rx_udp_bad_checksum_dropped);
+
 const RT_IFACE: &str = "e2e-rt7";
 const RT_LOCAL_IP: [u8; 4] = [10, 0, 7, 15];
 const RT_GW: [u8; 4] = [10, 0, 7, 2];

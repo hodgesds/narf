@@ -445,6 +445,19 @@ fn is_dhcp_client_datagram(body: &[u8]) -> bool {
     u16::from_be_bytes([body[ihl + 2], body[ihl + 3]]) == DHCP_CLIENT_PORT
 }
 
+/// Receive-side checksum failures, Linux's `Ip InHdrErrors`,
+/// `Tcp InCsumErrors` and `Udp InCsumErrors`.
+pub mod rx_csum {
+    use core::sync::atomic::AtomicU64;
+
+    /// IPv4 headers dropped for a bad header checksum.
+    pub static IP_HDR_ERRORS: AtomicU64 = AtomicU64::new(0);
+    /// TCP segments dropped for a bad checksum.
+    pub static TCP_CSUM_ERRORS: AtomicU64 = AtomicU64::new(0);
+    /// UDP datagrams dropped for a bad (nonzero) checksum.
+    pub static UDP_CSUM_ERRORS: AtomicU64 = AtomicU64::new(0);
+}
+
 fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     // ── Netfilter PRE_ROUTING + LOCAL_IN dispatch ──
     //
@@ -460,6 +473,13 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     // Matches Linux's NF_HOOK call from `ip_rcv_core()` →
     // `ip_rcv_finish()` in `net/ipv4/ip_input.c`.
     if body.len() < crate::netfilter::IPV4_MIN_HDR_LEN {
+        return;
+    }
+    // `ip_rcv_core`: `if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
+    // goto csum_error;` — before any hook sees the packet.
+    let ihl = (body[0] & 0x0f) as usize * 4;
+    if ihl < pkt::IPV4_HDR_LEN || body.len() < ihl || pkt::ip_checksum(&body[..ihl]) != 0 {
+        rx_csum::IP_HDR_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return;
     }
     let mut ctx = crate::netfilter::PktCtx::new_ipv4_ref(
@@ -511,6 +531,12 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
     let tos = if body.len() >= 2 { body[1] } else { 0 };
     match ip.protocol {
         IP_PROTO_TCP => {
+            // `tcp_v4_rcv` → `skb_checksum_init`: a segment whose checksum
+            // fails is dropped (TCP_MIB_CSUMERRORS) and the peer retransmits.
+            if crate::pkt_tcp::ipv4_pseudo_checksum(ip.src_ip, ip.dst_ip, payload) != 0 {
+                rx_csum::TCP_CSUM_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             crate::tcp::core::handle_segment_in(net_ns_id, ip.src_ip, ip.dst_ip, payload)
         }
         IP_PROTO_UDP => handle_udp(
@@ -548,6 +574,19 @@ fn handle_udp(
         return;
     }
     let payload = &datagram[8..end];
+    // `udp4_csum_init`: a zero checksum means the sender computed none
+    // (RFC 768); any other value must verify over the whole datagram.
+    if datagram[6..8] != [0, 0]
+        && crate::pkt_tcp::ipv4_pseudo_checksum_proto(
+            src_ip,
+            dst_ip,
+            IP_PROTO_UDP,
+            &datagram[..end],
+        ) != 0
+    {
+        rx_csum::UDP_CSUM_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     // Deliver to registered UDP sockets (udp_sock layer).
     // `in_ifindex` is Linux's `dif`: SO_BINDTODEVICE is enforced against
     // the interface the datagram ARRIVED on.

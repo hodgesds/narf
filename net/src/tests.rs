@@ -521,6 +521,35 @@ fn smoke_udp_build_and_verify_ipv4() -> TestResult {
 }
 kernel_test_in!("net/udp", smoke_udp_build_and_verify_ipv4);
 
+/// The in-place pseudo-header checksum must equal RFC 1071 over the literal
+/// `pseudo_header ++ segment` buffer for every length (odd, and each 4-byte
+/// remainder) and for both TCP and UDP.
+fn smoke_ipv4_pseudo_checksum_matches_reference() -> TestResult {
+    use crate::pkt::{ip_checksum, IP_PROTO_TCP, IP_PROTO_UDP};
+    use crate::pkt_tcp::ipv4_pseudo_checksum_proto;
+    let src = [192, 168, 7, 1];
+    let dst = [10, 255, 0, 254];
+    let mut seg = alloc::vec::Vec::new();
+    for len in 0..300usize {
+        seg.clear();
+        seg.extend((0..len).map(|i| (i as u8).wrapping_mul(37).wrapping_add(0xa5)));
+        for proto in [IP_PROTO_TCP, IP_PROTO_UDP] {
+            let mut reference = alloc::vec::Vec::new();
+            reference.extend_from_slice(&src);
+            reference.extend_from_slice(&dst);
+            reference.push(0);
+            reference.push(proto);
+            reference.extend_from_slice(&(len as u16).to_be_bytes());
+            reference.extend_from_slice(&seg);
+            if ipv4_pseudo_checksum_proto(src, dst, proto, &seg) != ip_checksum(&reference) {
+                return TestResult::Fail("in-place pseudo-header checksum diverged from RFC 1071");
+            }
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/udp", smoke_ipv4_pseudo_checksum_matches_reference);
+
 fn smoke_udp_disabled_checksum_accepted() -> TestResult {
     use crate::pkt_udp::verify_ipv4;
     // 8-byte header with checksum field = 0 (disabled).
