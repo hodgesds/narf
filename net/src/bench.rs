@@ -75,6 +75,10 @@ fn v4_tcp_frame(seq: u32, flags: u8, payload_len: usize) -> Vec<u8> {
     f[tcp_off + 4..tcp_off + 8].copy_from_slice(&seq.to_be_bytes());
     f[tcp_off + 12] = (TCP_HDR_MIN as u8 / 4) << 4;
     f[tcp_off + 13] = flags;
+    // A valid checksum: GRO only coalesces segments whose TCP checksum
+    // verifies, so an unset one would benchmark the pass-through path.
+    let cs = ipv4_pseudo_checksum([10, 0, 0, 1], [10, 0, 0, 2], &f[tcp_off..]);
+    f[tcp_off + 16..tcp_off + 18].copy_from_slice(&cs.to_be_bytes());
     f
 }
 
@@ -123,17 +127,20 @@ kernel_test_in!("net/bench", bench_gso_ipv4);
 fn bench_gro_ipv4() -> TestResult {
     const ROUNDS: u64 = 4_000;
     const BATCH: u32 = 16;
-    // Pre-build the segment templates once; `offer` takes an owned Vec, so the
-    // clone per offer is part of the realistic (driver-hands-a-frame) cost.
+    // Pre-build the segment templates once; `offer` borrows the driver's frame
+    // and copies only what it holds, as on the real receive path.
     let templates: Vec<Vec<u8>> = (0..BATCH)
         .map(|i| v4_tcp_frame(1 + i * MSS as u32, FLAG_ACK, MSS))
         .collect();
     let start = now_cycles();
     for _ in 0..ROUNDS {
         let mut gro = crate::gro::Gro::new();
+        let mut out = Vec::new();
         for t in &templates {
-            let out = gro.offer("bench0", t.clone());
+            let disposition = gro.offer("bench0", t, &mut out);
+            core::hint::black_box(&disposition);
             core::hint::black_box(&out);
+            out.clear();
         }
         let flushed = gro.flush();
         core::hint::black_box(&flushed);

@@ -72,6 +72,22 @@ struct Held {
     fixed_id: Option<bool>,
 }
 
+/// What became of a frame passed to [`Gro::offer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// GRO kept (a copy of) the frame; a later offer or `flush` releases it.
+    Held,
+    /// The caller delivers the frame it offered, unchanged, after the frames
+    /// `offer` flushed. `verified` is true when GRO already validated its IPv4
+    /// header and TCP checksums (Linux's `CHECKSUM_UNNECESSARY`), so the stack
+    /// need not sum it again.
+    Deliver { verified: bool },
+}
+
+/// A frame GRO releases from its table: `(ingress iface, frame)`. Every
+/// released frame passed GRO's IPv4 and TCP checksum validation.
+pub type Released = (String, Vec<u8>);
+
 /// Per-RX-queue GRO coalescer. Create one per RX pump; `offer` each frame and
 /// `flush` at poll-complete.
 #[derive(Debug, Default)]
@@ -205,7 +221,7 @@ fn can_merge(h: &Held, frame: &[u8], p: &Parsed) -> bool {
 
 /// Recompute the coalesced frame's IPv4 total-length / header checksum and the
 /// TCP checksum, and return `(ingress iface, frame)` for delivery to the stack.
-fn finalize(mut h: Held) -> (String, Vec<u8>) {
+fn finalize(mut h: Held) -> Released {
     if h.segs == 1 {
         // Nothing was merged: deliver the segment exactly as received.
         return (h.iface, h.frame);
@@ -230,26 +246,27 @@ impl Gro {
         Self { held: Vec::new() }
     }
 
-    /// Offer one received frame from ingress interface `iface`. Returns the
-    /// `(iface, frame)` pairs the stack should process now (empty when the
-    /// frame was merged/held, 1–2 when a held flow is flushed). The caller
-    /// dispatches each returned frame to its tagged iface.
-    pub fn offer(&mut self, iface: &str, frame: Vec<u8>) -> Vec<(String, Vec<u8>)> {
-        let Some(p) = parse_ipv4_tcp(&frame) else {
+    /// Offer one received frame from ingress interface `iface`.
+    ///
+    /// Flows this frame forces out are appended to `flushed`, which the caller
+    /// delivers first. The frame itself is either held (GRO copies it) or
+    /// returned to the caller to deliver as-is — so a frame GRO does not hold,
+    /// the common case for anything but bulk TCP data, is never copied and
+    /// allocates nothing.
+    pub fn offer(&mut self, iface: &str, frame: &[u8], flushed: &mut Vec<Released>) -> Disposition {
+        let Some(p) = parse_ipv4_tcp(frame) else {
             // Not an eligible segment: deliver as-is, after any segments held
             // for its flow so the stack still sees the flow in order.
-            let mut out = Vec::new();
-            if let Some(key) = flow_key_of(&frame) {
+            if let Some(key) = flow_key_of(frame) {
                 if let Some(i) = self
                     .held
                     .iter()
                     .position(|h| h.key == key && h.iface == iface)
                 {
-                    out.push(finalize(self.held.remove(i)));
+                    flushed.push(finalize(self.held.remove(i)));
                 }
             }
-            out.push((String::from(iface), frame));
-            return out;
+            return Disposition::Deliver { verified: false };
         };
         let held_idx = self
             .held
@@ -259,16 +276,14 @@ impl Gro {
         // coalesced: it flushes any held flow for its key, then is delivered
         // itself, in order.
         if p.flags & NON_COALESCE_FLAGS != 0 || p.payload_len == 0 || p.flags & FLAG_ACK == 0 {
-            let mut out = Vec::new();
             if let Some(i) = held_idx {
-                out.push(finalize(self.held.remove(i)));
+                flushed.push(finalize(self.held.remove(i)));
             }
-            out.push((String::from(iface), frame));
-            return out;
+            return Disposition::Deliver { verified: true };
         }
 
         if let Some(i) = held_idx {
-            if can_merge(&self.held[i], &frame, &p) {
+            if can_merge(&self.held[i], frame, &p) {
                 let data_start = p.tcp_off + p.tcp_header_len;
                 let h = &mut self.held[i];
                 // `tcp_flag_word(th2) |= flags & (FIN | PSH)`.
@@ -283,36 +298,38 @@ impl Gro {
                 // as does reaching the size ceiling.
                 let full = h.frame.len() - h.tcp_off - h.tcp_header_len >= MAX_GRO_BYTES;
                 if p.flags & FLAG_PSH != 0 || p.payload_len < h.mss || full {
-                    return alloc::vec![finalize(self.held.remove(i))];
+                    flushed.push(finalize(self.held.remove(i)));
                 }
-                return Vec::new();
+                return Disposition::Held;
             }
             // Mismatch: flush the held flow, then handle this frame as a fresh
             // offer (hold it, unless it is pushed).
-            let flushed = finalize(self.held.remove(i));
-            let mut out = alloc::vec![flushed];
-            out.extend(self.start(iface, frame, p));
-            return out;
+            flushed.push(finalize(self.held.remove(i)));
         }
 
-        self.start(iface, frame, p)
+        self.start(iface, frame, p, flushed)
     }
 
     /// Begin holding a new flow, or deliver immediately when pushed. Evicts the
     /// oldest held flow if the table is full.
-    fn start(&mut self, iface: &str, frame: Vec<u8>, p: Parsed) -> Vec<(String, Vec<u8>)> {
+    fn start(
+        &mut self,
+        iface: &str,
+        frame: &[u8],
+        p: Parsed,
+        flushed: &mut Vec<Released>,
+    ) -> Disposition {
         if p.flags & FLAG_PSH != 0 {
-            return alloc::vec![(String::from(iface), frame)];
+            return Disposition::Deliver { verified: true };
         }
-        let mut out = Vec::new();
         if self.held.len() >= MAX_FLOWS {
-            out.push(finalize(self.held.remove(0)));
+            flushed.push(finalize(self.held.remove(0)));
         }
         let next_seq = p.seq.wrapping_add(p.payload_len as u32);
         self.held.push(Held {
             iface: String::from(iface),
             key: p.key,
-            frame,
+            frame: frame.to_vec(),
             tcp_off: p.tcp_off,
             tcp_header_len: p.tcp_header_len,
             next_seq,
@@ -321,12 +338,12 @@ impl Gro {
             ip_id: p.ip_id,
             fixed_id: None,
         });
-        out
+        Disposition::Held
     }
 
     /// Flush every held flow (call at NAPI-complete / end of a poll burst).
     /// Each returned frame is tagged with the iface it arrived on.
-    pub fn flush(&mut self) -> Vec<(String, Vec<u8>)> {
+    pub fn flush(&mut self) -> Vec<Released> {
         self.held.drain(..).map(finalize).collect()
     }
 
@@ -342,6 +359,16 @@ mod gro_tests {
     use crate::pkt::ip_checksum;
     use crate::pkt_tcp::TCP_HDR_MIN;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// Offer `frame` and return everything the caller would now deliver, in
+    /// order: flushed flows first, then the frame itself unless it was held.
+    fn offer_all(gro: &mut Gro, iface: &str, frame: Vec<u8>) -> Vec<Released> {
+        let mut out = Vec::new();
+        if let Disposition::Deliver { .. } = gro.offer(iface, &frame, &mut out) {
+            out.push((String::from(iface), frame));
+        }
+        out
+    }
 
     fn seg(src: [u8; 4], dst: [u8; 4], seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
         let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
@@ -412,12 +439,8 @@ mod gro_tests {
         let mut gro = Gro::new();
         // Two full-size contiguous ACK segments, no PSH: held, nothing
         // delivered.
-        if !gro
-            .offer("eth0", seg(src, dst, 1000, FLAG_ACK, &[1u8; 100]))
-            .is_empty()
-            || !gro
-                .offer("eth0", seg(src, dst, 1100, FLAG_ACK, &[2u8; 100]))
-                .is_empty()
+        if !offer_all(&mut gro, "eth0", seg(src, dst, 1000, FLAG_ACK, &[1u8; 100])).is_empty()
+            || !offer_all(&mut gro, "eth0", seg(src, dst, 1100, FLAG_ACK, &[2u8; 100])).is_empty()
         {
             return TestResult::Fail("coalescable segments were not held");
         }
@@ -426,7 +449,7 @@ mod gro_tests {
         }
         // A short segment (below the flow's MSS) joins and ends the batch
         // (`tcp_gro_receive`: `flush = len < mss`).
-        let flushed = gro.offer("eth0", seg(src, dst, 1200, FLAG_ACK, &[3u8; 50]));
+        let flushed = offer_all(&mut gro, "eth0", seg(src, dst, 1200, FLAG_ACK, &[3u8; 50]));
         if flushed.len() != 1 || gro.pending() {
             return TestResult::Fail("short segment did not flush one merged frame");
         }
@@ -463,18 +486,19 @@ mod gro_tests {
         let dst = [10, 0, 0, 9];
         let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
         let mut gro = Gro::new();
-        if !gro
-            .offer(
-                "eth0",
-                timestamped_seg(src, dst, 1000, 50, 4096, FLAG_ACK, 10, &[1u8; 100]),
-            )
-            .is_empty()
+        if !offer_all(
+            &mut gro,
+            "eth0",
+            timestamped_seg(src, dst, 1000, 50, 4096, FLAG_ACK, 10, &[1u8; 100]),
+        )
+        .is_empty()
         {
             return TestResult::Fail("first timestamped segment was not held");
         }
         // Same ACK, window and timestamps: mergeable. PSH joins, then ends
         // the batch, and is carried on the coalesced header.
-        let out = gro.offer(
+        let out = offer_all(
+            &mut gro,
             "eth0",
             timestamped_seg(
                 src,
@@ -517,7 +541,7 @@ mod gro_tests {
             let mut frame = seg(src, dst, 1, FLAG_ACK, &[7u8; 20]);
             frame[tcp_off + 12] = words << 4;
             let mut gro = Gro::new();
-            if gro.offer("eth0", frame).len() != 1 || gro.pending() {
+            if offer_all(&mut gro, "eth0", frame).len() != 1 || gro.pending() {
                 return TestResult::Fail("malformed TCP data offset did not bypass GRO");
             }
         }
@@ -530,18 +554,26 @@ mod gro_tests {
         let dst = [10, 0, 0, 9];
         let mut gro = Gro::new();
         // PSH delivers immediately (not held).
-        let out = gro.offer("eth0", seg(src, dst, 1, FLAG_ACK | FLAG_PSH, &[7u8; 20]));
+        let out = offer_all(
+            &mut gro,
+            "eth0",
+            seg(src, dst, 1, FLAG_ACK | FLAG_PSH, &[7u8; 20]),
+        );
         if out.len() != 1 || gro.pending() {
             return TestResult::Fail("pushed segment should pass straight through");
         }
         // A sequence gap flushes the held flow and starts a new one.
-        let _ = gro.offer("eth0", seg(src, dst, 100, FLAG_ACK, &[1u8; 50])); // held
-        let gap = gro.offer("eth0", seg(src, dst, 500, FLAG_ACK, &[2u8; 50])); // non-contiguous
+        let _ = offer_all(&mut gro, "eth0", seg(src, dst, 100, FLAG_ACK, &[1u8; 50])); // held
+        let gap = offer_all(&mut gro, "eth0", seg(src, dst, 500, FLAG_ACK, &[2u8; 50])); // non-contiguous
         if gap.len() != 1 {
             return TestResult::Fail("sequence gap did not flush the held flow");
         }
         // SYN/FIN/RST are never coalesced and flush any held flow.
-        let fin = gro.offer("eth0", seg(src, dst, 550, FLAG_ACK | FLAG_FIN, &[3u8; 10]));
+        let fin = offer_all(
+            &mut gro,
+            "eth0",
+            seg(src, dst, 550, FLAG_ACK | FLAG_FIN, &[3u8; 10]),
+        );
         if fin.len() != 2 {
             return TestResult::Fail("FIN should flush held + deliver itself");
         }
@@ -575,8 +607,8 @@ mod gro_tests {
             ("TSval", base(50, 4096, 11, &[2u8; 100], 1100)),
         ] {
             let mut gro = Gro::new();
-            let _ = gro.offer("eth0", base(50, 4096, 10, &[1u8; 100], 1000));
-            let out = gro.offer("eth0", second);
+            let _ = offer_all(&mut gro, "eth0", base(50, 4096, 10, &[1u8; 100], 1000));
+            let out = offer_all(&mut gro, "eth0", second);
             if out.len() != 1 || !gro.pending() {
                 return TestResult::Fail(match what {
                     "ACK" => "segments with different ACKs were merged",
@@ -591,11 +623,8 @@ mod gro_tests {
         }
         // Identical header fields do merge.
         let mut gro = Gro::new();
-        let _ = gro.offer("eth0", base(50, 4096, 10, &[1u8; 100], 1000));
-        if !gro
-            .offer("eth0", base(50, 4096, 10, &[2u8; 100], 1100))
-            .is_empty()
-        {
+        let _ = offer_all(&mut gro, "eth0", base(50, 4096, 10, &[1u8; 100], 1000));
+        if !offer_all(&mut gro, "eth0", base(50, 4096, 10, &[2u8; 100], 1100)).is_empty() {
             return TestResult::Fail("identical timestamped segments were not merged");
         }
         let flushed = gro.flush();
@@ -615,11 +644,11 @@ mod gro_tests {
         let src = [10, 0, 0, 5];
         let dst = [10, 0, 0, 9];
         let mut gro = Gro::new();
-        let _ = gro.offer("eth0", seg(src, dst, 1000, FLAG_ACK, &[1u8; 100]));
+        let _ = offer_all(&mut gro, "eth0", seg(src, dst, 1000, FLAG_ACK, &[1u8; 100]));
         let mut corrupt = seg(src, dst, 1100, FLAG_ACK, &[2u8; 100]);
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xff;
-        let out = gro.offer("eth0", corrupt.clone());
+        let out = offer_all(&mut gro, "eth0", corrupt.clone());
         // The held segment goes first (flow order), then the corrupted one
         // exactly as received.
         if out.len() != 2
@@ -642,7 +671,7 @@ mod gro_tests {
         let mut padded = seg(src, dst, 1000, FLAG_ACK, &[1u8; 4]);
         padded.extend_from_slice(&[0u8; 6]);
         let mut gro = Gro::new();
-        let out = gro.offer("eth0", padded.clone());
+        let out = offer_all(&mut gro, "eth0", padded.clone());
         if out.len() != 1 || out[0].1 != padded || gro.pending() {
             return TestResult::Fail("a padded frame was held for coalescing");
         }
@@ -656,14 +685,14 @@ mod gro_tests {
         let src = [10, 0, 0, 5];
         let dst = [10, 0, 0, 9];
         let mut gro = Gro::new();
-        let _ = gro.offer("eth0", seg(src, dst, 1000, FLAG_ACK, &[1u8; 50]));
-        let out = gro.offer("eth0", seg(src, dst, 1050, FLAG_ACK, &[2u8; 100]));
+        let _ = offer_all(&mut gro, "eth0", seg(src, dst, 1000, FLAG_ACK, &[1u8; 50]));
+        let out = offer_all(&mut gro, "eth0", seg(src, dst, 1050, FLAG_ACK, &[2u8; 100]));
         if out.len() != 1 || !gro.pending() {
             return TestResult::Fail("a segment larger than the flow MSS was merged");
         }
         let _ = gro.flush();
-        let _ = gro.offer("eth0", seg(src, dst, 2000, FLAG_ACK, &[1u8; 100]));
-        let out = gro.offer("eth0", seg(src, dst, 2100, FLAG_ACK, &[2u8; 40]));
+        let _ = offer_all(&mut gro, "eth0", seg(src, dst, 2000, FLAG_ACK, &[1u8; 100]));
+        let out = offer_all(&mut gro, "eth0", seg(src, dst, 2100, FLAG_ACK, &[2u8; 40]));
         if out.len() != 1 || gro.pending() {
             return TestResult::Fail("a short segment did not end the batch");
         }
@@ -682,21 +711,48 @@ mod gro_tests {
         let dst = [10, 0, 0, 9];
         let s = |seq, ttl, id| with_ip(seg(src, dst, seq, FLAG_ACK, &[1u8; 100]), ttl, id);
         let mut gro = Gro::new();
-        let _ = gro.offer("eth0", s(1000, 64, 7));
-        if !gro.offer("eth0", s(1100, 64, 8)).is_empty()
-            || !gro.offer("eth0", s(1200, 64, 9)).is_empty()
+        let _ = offer_all(&mut gro, "eth0", s(1000, 64, 7));
+        if !offer_all(&mut gro, "eth0", s(1100, 64, 8)).is_empty()
+            || !offer_all(&mut gro, "eth0", s(1200, 64, 9)).is_empty()
         {
             return TestResult::Fail("incrementing IP IDs did not merge");
         }
-        if gro.offer("eth0", s(1300, 64, 42)).len() != 1 {
+        if offer_all(&mut gro, "eth0", s(1300, 64, 42)).len() != 1 {
             return TestResult::Fail("an out-of-pattern IP ID was merged");
         }
         let _ = gro.flush();
-        let _ = gro.offer("eth0", s(2000, 64, 7));
-        if gro.offer("eth0", s(2100, 63, 8)).len() != 1 {
+        let _ = offer_all(&mut gro, "eth0", s(2000, 64, 7));
+        if offer_all(&mut gro, "eth0", s(2100, 63, 8)).len() != 1 {
             return TestResult::Fail("segments with different TTLs were merged");
         }
         TestResult::Pass
     }
     kernel_test_in!("net/gro", smoke_gro_ipv4_header_rules);
+
+    /// `offer` borrows the frame: it reports `Held` only for a frame it kept,
+    /// and hands everything else back to deliver as-is, flagged verified only
+    /// when GRO itself validated the checksums. A frame GRO did not validate
+    /// must never be vouched for, or the stack would skip its own check.
+    fn smoke_gro_disposition_reports_verification() -> TestResult {
+        let src = [10, 0, 0, 5];
+        let dst = [10, 0, 0, 9];
+        let mut gro = Gro::new();
+        let mut out = Vec::new();
+        let held = seg(src, dst, 1000, FLAG_ACK, &[1u8; 100]);
+        if gro.offer("eth0", &held, &mut out) != Disposition::Held || !out.is_empty() {
+            return TestResult::Fail("a coalescable segment was not held");
+        }
+        let pushed = seg(src, dst, 5000, FLAG_ACK | FLAG_PSH, &[2u8; 10]);
+        if gro.offer("eth0", &pushed, &mut out) != (Disposition::Deliver { verified: true }) {
+            return TestResult::Fail("a validated pushed segment was not delivered as verified");
+        }
+        let mut corrupt = seg(src, dst, 9000, FLAG_ACK, &[3u8; 10]);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        if gro.offer("eth0", &corrupt, &mut out) != (Disposition::Deliver { verified: false }) {
+            return TestResult::Fail("an unvalidated segment was vouched for");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("net/gro", smoke_gro_disposition_reports_verification);
 }

@@ -1950,6 +1950,46 @@ fn smoke_rx_tcp_and_ip_bad_checksum_dropped() -> TestResult {
 }
 kernel_test_in!("net/e2e", smoke_rx_tcp_and_ip_bad_checksum_dropped);
 
+/// With software GRO on the ingress interface, frames reach the stack through
+/// `gro_rx`, which marks GRO-validated frames so the stack skips a second
+/// checksum pass. A frame GRO could not validate must still be checked: a
+/// corrupted SYN is dropped, the intact one answered.
+fn smoke_rx_gro_path_still_drops_bad_checksum() -> TestResult {
+    use crate::tcp_stack::rx_csum::TCP_CSUM_ERRORS;
+    use ::core::sync::atomic::Ordering::Relaxed;
+    const PORT: u16 = 24082;
+    full_reset(CSUM_IFACE, CSUM_LOCAL_IP, CSUM_LOCAL_IP);
+    crate::netfilter::__reset_all_for_test();
+    if !crate::iface::set_software_gro(CSUM_IFACE, true) {
+        return TestResult::Fail("could not enable software GRO on the test iface");
+    }
+    if listen(CSUM_LOCAL_IP, PORT, 4).is_err() {
+        return TestResult::Fail("listen failed");
+    }
+    crate::tcp_stack::init();
+    let tcp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
+    let _ = drain_captured();
+    let errs = TCP_CSUM_ERRORS.load(Relaxed);
+    let mut bad = csum_syn(PORT);
+    bad[tcp_off + 16] ^= 0x5a;
+    crate::tcp_stack::rx_handler(CSUM_IFACE, &mut bad);
+    crate::tcp_stack::gro_flush();
+    let answered_bad = saw_synack(PORT);
+    let mut good = csum_syn(PORT);
+    crate::tcp_stack::rx_handler(CSUM_IFACE, &mut good);
+    crate::tcp_stack::gro_flush();
+    let answered_good = saw_synack(PORT);
+    let _ = crate::iface::set_software_gro(CSUM_IFACE, false);
+    if answered_bad || TCP_CSUM_ERRORS.load(Relaxed) != errs + 1 {
+        return TestResult::Fail("a bad-checksum SYN slipped through the GRO path");
+    }
+    if !answered_good {
+        return TestResult::Fail("a valid SYN through the GRO path was not answered");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/e2e", smoke_rx_gro_path_still_drops_bad_checksum);
+
 fn smoke_rx_udp_bad_checksum_dropped() -> TestResult {
     use crate::tcp_stack::rx_csum::UDP_CSUM_ERRORS;
     use ::core::sync::atomic::Ordering::Relaxed;
