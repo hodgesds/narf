@@ -3391,3 +3391,98 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_dirfd_outside_root_resolves_from_the_fd
 );
+
+/// Chromium's exact sequence (`sandbox::Credentials::DropFileSystemAccess`
+/// then `ProcUtil::HasOpenDirectory` / `ThreadHelpers::IsSingleThreaded`):
+/// keep a `/proc` fd, chroot somewhere `/proc` is not, then walk
+/// `self/fd/` and `self/task/` from that fd. The `self` magic link and the
+/// procfs routing must still apply to a walk that starts outside the root.
+fn proc_dirfd_survives_chroot_into(target: &[u8]) -> TestResult {
+    const O_RDONLY: u64 = 0;
+    const O_DIRECTORY: u64 = 0o200000;
+    const AT_FDCWD: u64 = -100i64 as u64;
+    const JAIL: &[u8] = b"/abi-procjail\0";
+    with_setup(|| {
+        let proc_path = b"/proc\0";
+        let proc_fd = match call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                proc_path.as_ptr() as u64,
+                O_RDONLY | O_DIRECTORY,
+                0,
+            ),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fixture: opening /proc failed"),
+        };
+        let jail = SyscallArgs {
+            arg0: c"none".as_ptr() as u64,
+            arg1: JAIL.as_ptr() as u64,
+            arg2: c"tmpfs".as_ptr() as u64,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), jail) != Some(0) {
+            let _ = call(Syscall::Close.raw(), a0(proc_fd));
+            return Err("fixture: mounting the jail failed");
+        }
+        let result = (|| {
+            if call(Syscall::Chroot.raw(), a0(target.as_ptr() as u64)) != Some(0) {
+                return Err("fixture: chroot into the jail failed");
+            }
+            let mut st = [0u8; 144];
+            let task_dir = b"self/task/\0";
+            if call(
+                Syscall::Newfstatat.raw(),
+                a3(proc_fd, task_dir.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+            ) != Some(0)
+            {
+                return Err("fstatat(proc_fd, \"self/task/\") failed after chroot");
+            }
+            let fd_dir = b"self/fd/\0";
+            match call(
+                Syscall::Openat.raw(),
+                a3(proc_fd, fd_dir.as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
+            ) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("openat(proc_fd, \"self/fd/\") failed after chroot"),
+            }
+            // Negative: "/proc" itself is gone from the new root.
+            if call(
+                Syscall::Newfstatat.raw(),
+                a3(
+                    AT_FDCWD,
+                    proc_path.as_ptr() as u64,
+                    st.as_mut_ptr() as u64,
+                    0,
+                ),
+            ) == Some(0)
+            {
+                return Err("absolute /proc still resolves inside the new root");
+            }
+            Ok(())
+        })();
+        let _ = call(Syscall::Close.raw(), a0(proc_fd));
+        crate::handlers::__test_root_dir_reset();
+        const MNT_DETACH: u64 = 1 << 1;
+        let _ = call(Syscall::Umount2.raw(), a1(JAIL.as_ptr() as u64, MNT_DETACH));
+        result
+    })
+}
+fn smoke_abi_proc2_proc_dirfd_survives_chroot() -> TestResult {
+    proc_dirfd_survives_chroot_into(b"/abi-procjail\0")
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_proc_dirfd_survives_chroot);
+
+/// The root Chromium actually picks: `ChrootToSelfFdinfo` chroots into
+/// `/proc/self/fdinfo/`, an empty procfs directory, so the root is itself
+/// inside the filesystem the dirfd walk has to reach.
+fn smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo() -> TestResult {
+    proc_dirfd_survives_chroot_into(b"/proc/self/fdinfo/\0")
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_proc_dirfd_survives_chroot_into_fdinfo
+);
