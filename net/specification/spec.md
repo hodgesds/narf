@@ -133,6 +133,18 @@ feeding that interface flushes the current CPU's GRO table at poll completion.
 Enabling one interface never changes receive semantics for another interface;
 `NetIfaceSnapshot::software_gro` records the selected state.
 
+The coalescer follows Linux's merge rules (`inet_gro_receive`,
+`tcp4_gro_receive`, `tcp_gro_receive`). Only an unfragmented IPv4 segment
+without IP options, whose total length matches the frame (no Ethernet
+padding) and whose IPv4 and TCP checksums verify, is eligible; anything else
+is delivered unchanged, after any segments held for its flow. A segment joins
+a held flow only when it continues the sequence, is no larger than the flow's
+first segment (its MSS), and matches the held header in every other field:
+TCP flags except PSH, ACK, window, all option bytes (timestamps included),
+TTL, TOS, DF, and a fixed or per-segment-incrementing IP ID. PSH, a short
+segment, or the size ceiling ends the batch. SYN/FIN/RST/URG, pure ACKs and
+segments without ACK are never held; they flush their flow first.
+
 ### 3.3 Control-plane operations
 
 ```rust
