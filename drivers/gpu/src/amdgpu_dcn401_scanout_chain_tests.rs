@@ -229,7 +229,8 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
             height: 480,
             format: SurfaceFormat::Xrgb8888,
         },
-        bytes: 640 * 4 * 480,
+        // Room for a back buffer of the same geometry.
+        bytes: 2 * 640 * 4 * 480,
         timing: t,
         clock: c,
     }
@@ -238,8 +239,8 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
 /// Everything a live scanout retains, staged and with HDMI black video
 /// running: (transmitter, stream, pipe) are independent.
 struct Chain {
-    _backing: Vec<u32>,
-    _pool: Pool,
+    backing: Vec<u32>,
+    pool: Pool,
     e: Engine<ScanIo>,
     surfaces: Surfaces,
     clock: dccg::Applied,
@@ -314,8 +315,8 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
     assert_eq!(e.status.state, State::HdmiVideoRunning(stream));
     e.io.armed = true;
     Chain {
-        _backing: backing,
-        _pool: pool,
+        backing,
+        pool,
         e,
         surfaces,
         clock,
@@ -552,4 +553,95 @@ fn dcn401_scanout_chain_link_loss_and_underflow_while_running() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_chain_link_loss_and_underflow_while_running
+);
+
+impl Chain {
+    /// The CPU word of the surface at GPU address `address` in the
+    /// fixture's VRAM backing (the pool maps 0x8_0010_2000 at offset 0).
+    fn vram(&self, address: u64, offset: u64) -> u32 {
+        let base = (self.backing.as_ptr() as u64 + 4095) & !4095;
+        let at = base + (address - 0x8_0010_2000) + offset;
+        // SAFETY: inside the fixture-owned backing the pool maps.
+        unsafe { (at as *const u32).read_volatile() }
+    }
+    async fn flip(&mut self) -> Result<FlipDone, Error> {
+        let c = self.clock;
+        self.surfaces
+            .flip(&mut self.e, self.pipe, CRYSTAL_KHZ, || Ok((c, config())))
+            .await
+    }
+}
+
+fn dcn401_scanout_chain_live_updates_go_through_the_back_buffer() -> TestResult {
+    for (t, s, p) in ROUTES {
+        let mut c = chain(t, s, p);
+        if run(c.start()).is_err() {
+            return TestResult::Fail("start");
+        }
+        let row = [0x00ff_8040u32; 640];
+        // No back buffer yet: nothing to write.
+        if c.surfaces.upload_back(&mut c.e, p, 0, 0, &row) != Err(Error::Invalid) {
+            return TestResult::Fail("upload without a back buffer");
+        }
+        let Ok(back) = run(c.surfaces.prepare_back(&mut c.e, &c.pool, p, config())) else {
+            return TestResult::Fail("back buffer under live scanout");
+        };
+        let front = c.address;
+        if back == front || c.e.status.state != State::ScanoutRunning(p) {
+            return TestResult::Fail("back buffer allocation");
+        }
+        for (x, y, n) in [(0, 480, 1), (639, 0, 2), (0, 0, 0)] {
+            if c.surfaces.upload_back(&mut c.e, p, x, y, &row[..n]) != Err(Error::Invalid) {
+                return TestResult::Fail("out-of-bounds upload");
+            }
+        }
+        // The live front is never written: the frame goes to the back.
+        let front_before = c.vram(front, 0);
+        for y in 0..480 {
+            if c.surfaces.upload_back(&mut c.e, p, 0, y, &row).is_err() {
+                return TestResult::Fail("live back-buffer upload");
+            }
+        }
+        if c.vram(front, 0) != front_before || c.vram(back, 2560 * 479 + 4 * 639) != 0x00ff_8040 {
+            return TestResult::Fail("frame landed in the wrong buffer");
+        }
+        let Ok(done) = run(c.flip()) else {
+            return TestResult::Fail("flip to the uploaded frame");
+        };
+        if done.front != back || done.back != front {
+            return TestResult::Fail("flip swapped the wrong buffers");
+        }
+        // The previous front is now the back buffer and takes the next frame.
+        if c.surfaces.upload_back(&mut c.e, p, 0, 0, &[1]).is_err() || c.vram(front, 0) != 1 {
+            return TestResult::Fail("next frame into the old front");
+        }
+        // Not while a flip is in transition, nor after the pipe stopped.
+        c.e.io.grant = false;
+        let requested = c.e.io.lock_requested.clone();
+        requested.store(false, Ordering::SeqCst);
+        let clock = c.clock;
+        cancel_at(
+            c.surfaces
+                .flip(&mut c.e, p, CRYSTAL_KHZ, || Ok((clock, config()))),
+            || requested.load(Ordering::SeqCst),
+        );
+        if c.e.status.state != State::Flipping(p)
+            || c.surfaces.upload_back(&mut c.e, p, 0, 0, &row) != Err(Error::Busy)
+        {
+            return TestResult::Fail("upload during a flip");
+        }
+    }
+    let mut c = chain(0, 0, 0);
+    if run(c.start()).is_err()
+        || run(c.surfaces.prepare_back(&mut c.e, &c.pool, 0, config())).is_err()
+        || run(c.stop()).is_err()
+        || c.surfaces.upload_back(&mut c.e, 0, 0, 0, &[1]) != Err(Error::Busy)
+    {
+        return TestResult::Fail("upload after stop");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_scanout_chain_live_updates_go_through_the_back_buffer
 );

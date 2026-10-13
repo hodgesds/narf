@@ -601,6 +601,16 @@ pub async unsafe fn modeset_display(
         let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
         // SAFETY: serialized retained owners; caller excludes external writers.
         let modeset = unsafe { boot.modeset_display(pipe, fill).await }?;
+        // DRM frames present tear-free through a back buffer and a latched
+        // flip. Without one (allocation failed), they fall back to copies
+        // onto the visible front. A back buffer retained by an earlier
+        // modeset of this pipe is reused.
+        // SAFETY: as above; touches only owned VRAM and the HDP flush.
+        let _ = unsafe { boot.prepare_display_back_buffer(pipe).await };
+        NATIVE_PRESENT.store(
+            boot.display_back_framebuffer(pipe).is_ok(),
+            core::sync::atomic::Ordering::Release,
+        );
         (modeset, boot.display_scanout_framebuffer(pipe)?)
     };
     // Outside the owner lock: the observer may move the console here at once.
@@ -653,11 +663,140 @@ pub async unsafe fn flip_display(
         let done = unsafe { boot.flip_display(pipe).await }?;
         (done, before, boot.display_scanout_framebuffer(pipe)?)
     };
+    follow_flip(before, after);
+    Ok(done)
+}
+
+/// A published scanout that was the old front follows the new one, so the
+/// console (or DRM's fallback copy) keeps writing the visible buffer.
+fn follow_flip(before: GenericFb, after: GenericFb) {
     if crate::amdgpu_dcn_display::active_scanout().is_some_and(|fb| fb.addr == before.addr) {
         crate::amdgpu_dcn_display::publish_external(Some(after), Some(flush_scanout));
         crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
     }
-    Ok(done)
+}
+
+/// Whether DRM frames go through the back buffer and a latched flip.
+static NATIVE_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Whether a presenter task is draining `NEXT_FRAME`.
+static PRESENTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The newest DRM frame not yet copied: a newer one replaces it (mailbox).
+static NEXT_FRAME: narf_lib::sync::IrqSafeSpinLock<Option<Frame>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// A DRM client's XRGB8888 frame in a kernel-mapped dumb buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Frame {
+    phys: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+}
+
+/// Queue a DRM client's frame for tear-free presentation on the native
+/// scanout: the presenter copies it into the back buffer (which no fetch
+/// reads) and flips at the next VUPDATE, so scanout never shows a partly
+/// copied frame. Frames arriving while a copy or flip is in progress
+/// replace any frame still waiting (mailbox); the latest always shows.
+/// Returns false when native presentation is not available, and the
+/// caller then copies onto the visible front as before.
+///
+/// DRM's buffer rules make the deferred read safe: a client leaves a
+/// submitted framebuffer untouched until a later flip completes.
+pub fn present_frame(phys: u64, pitch: u32, width: u32, height: u32) -> bool {
+    use core::sync::atomic::Ordering;
+    if !NATIVE_PRESENT.load(Ordering::Acquire)
+        || width == 0
+        || height == 0
+        || pitch < width.saturating_mul(4)
+    {
+        return false;
+    }
+    *NEXT_FRAME.lock() = Some(Frame {
+        phys,
+        pitch,
+        width,
+        height,
+    });
+    if !PRESENTING.swap(true, Ordering::AcqRel) {
+        narf_scheduler::spawn(presenter());
+    }
+    true
+}
+
+async fn presenter() {
+    use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    loop {
+        let Some(frame) = NEXT_FRAME.lock().take() else {
+            PRESENTING.store(false, Ordering::Release);
+            // A frame queued between the take and the store found the flag
+            // still set and spawned nothing: keep draining.
+            if NEXT_FRAME.lock().is_some() && !PRESENTING.swap(true, Ordering::AcqRel) {
+                continue;
+            }
+            return;
+        };
+        if !NATIVE_PRESENT.load(Ordering::Acquire) {
+            continue;
+        }
+        let pipe = CURSOR_PIPE.load(Ordering::Acquire);
+        let result = {
+            let mut owner = OWNER.lock().await;
+            match owner.as_mut() {
+                // SAFETY: the owner lock serializes display writers; the
+                // frame's dumb buffer stays valid under DRM's buffer rules.
+                Some(boot) => unsafe { present_native(boot, pipe, frame).await },
+                None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
+            }
+        };
+        match result {
+            Ok((before, after)) => follow_flip(before, after),
+            Err(e) => {
+                // A failed flip quarantines the pipe; later frames use the
+                // fallback copy, which a stopped pipe simply does not show.
+                NATIVE_PRESENT.store(false, Ordering::Release);
+                let _ = writeln!(
+                    narf_console::Writer,
+                    "amdgpu: navi48 native present disabled: {e:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Copy `frame` into the back buffer of the live pipe, then flip to it.
+/// Returns the published front before and after.
+/// # Safety
+/// The caller holds the owner lock; `frame` names a mapped dumb buffer.
+async unsafe fn present_native(
+    boot: &mut boot::ColdBoot,
+    pipe: u8,
+    frame: Frame,
+) -> Result<(GenericFb, GenericFb), crate::amdgpu_dcn401_otg::Error> {
+    let back = boot.display_back_framebuffer(pipe)?;
+    let width = frame.width.min(back.width);
+    for y in 0..frame.height.min(back.height) {
+        let at = frame.phys + u64::from(y) * u64::from(frame.pitch);
+        // SAFETY: a kernel-mapped dumb buffer row of at least `width` pixels
+        // (pitch >= 4 * width was checked when queued).
+        let row = unsafe {
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(at).kernel_ptr::<u32>(),
+                width as usize,
+            )
+        };
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe { boot.upload_display_back(pipe, 0, y, row) }?;
+        if y % 64 == 63 {
+            narf_scheduler::yield_now().await;
+        }
+    }
+    let before = boot.display_scanout_framebuffer(pipe)?;
+    // SAFETY: the back buffer holds the complete frame; no other writer
+    // touches it until the next flip (the owner lock is held).
+    unsafe { boot.flip_display(pipe).await }?;
+    Ok((before, boot.display_scanout_framebuffer(pipe)?))
 }
 
 /// Show a premultiplied ARGB8888 cursor (at most 64x64) on a live pipe.
@@ -699,6 +838,7 @@ pub async unsafe fn stop_modeset(
     modeset: &crate::amdgpu_navi48_boot::Modeset,
 ) -> Result<(), crate::amdgpu_navi48_boot::ModesetError> {
     use crate::amdgpu_navi48_boot::{Error as BootError, ModesetError};
+    NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
     crate::amdgpu_dcn_display::publish_external(None, None);
     crate::amdgpu_navi48_kms::publish(None);
     let mut owner = OWNER.lock().await;
@@ -769,6 +909,7 @@ pub async unsafe fn monitor_display(
             Ok(MonitorStep::Retrained)
         }
         Health::Unplugged => {
+            NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
             crate::amdgpu_dcn_display::publish_external(None, None);
             crate::amdgpu_navi48_kms::publish(None);
             // SAFETY: as above; the scanout is withdrawn first.

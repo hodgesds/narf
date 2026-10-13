@@ -1000,6 +1000,28 @@ unknown. The platform `flip_display` moves a console that had adopted the old
 front onto the new one. There is no flip interrupt or event queue yet:
 completion is polled.
 
+Live updates have one synchronization policy per writer. The front's
+`upload_surface` stays stopped-only. `unsafe Otg::upload_back_buffer(pipe,
+x, y, pixels)` (ColdBoot `upload_display_back`) writes part of one row of the
+next frame into the back buffer only while the pipe is `ScanoutRunning` on
+its front with a back buffer distinct from it; during `Flipping`, after a
+failure or once stopped it is `Busy`, and bounds are checked per row. No CPU
+pointer escapes, and the writes reach display through `flip`'s HDP flush. The
+kernel console keeps drawing the published front with an HDP flush per
+update (a text console may tear). DRM clients own presentation while they
+hold the display (`fb_take_for_user`). The platform modeset allocates (or
+reuses) the pipe's back buffer. DRM frames for the amdgpu card are handed to
+`amdgpu_navi48_platform::present_frame`, a one-slot mailbox drained by a
+presenter task that copies the newest frame into the back buffer under the
+owner lock and flips. A frame arriving during a copy or flip replaces any
+frame still waiting, and the latest always shows. DRM's rule that a client
+leaves a submitted framebuffer untouched until a later flip completes covers
+the deferred read. A failed flip quarantines the pipe and disables native
+presentation. Without a back buffer, frames fall back to copies onto the
+visible front. Flip-complete events stay software-paced at the refresh
+rate (milestone 5). The presenter glue has no model test; `upload_back` and
+flips over a fully staged chain do.
+
 `unsafe Otg::set_cursor(pool, gmc, pipe, (w, h, pixels), (x, y))` (ColdBoot
 `set_display_cursor`) shows a premultiplied ARGB8888 cursor on a live pipe.
 The size is capped at 64x64, Linux's DCN401 `max_cursor_size`, which also

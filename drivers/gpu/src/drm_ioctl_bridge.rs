@@ -4237,7 +4237,16 @@ fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> R
 /// bochs instead.  Select the owning card here so the primary DRM node and
 /// the visible scanout always agree.
 fn present_frame(card_index: u32, src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
-    if crate::drm_registry::driver_name(card_index) == Some("virtio_gpu") {
+    let driver = crate::drm_registry::driver_name(card_index);
+    // The native amdgpu display presents tear-free through its back buffer
+    // and a VUPDATE-latched flip instead of copying onto the visible front.
+    if driver == Some("amdgpu")
+        && crate::amdgpu_navi48_platform::present_frame(src_phys, src_pitch, src_w, src_h)
+    {
+        narf_console::fb_take_for_user();
+        return;
+    }
+    if driver == Some("virtio_gpu") {
         blit_to_virtio_scanout(src_phys, src_pitch, src_w, src_h);
     } else {
         blit_to_scanout(src_phys, src_pitch, src_w, src_h);

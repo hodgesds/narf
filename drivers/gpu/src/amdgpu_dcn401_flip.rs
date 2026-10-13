@@ -139,6 +139,55 @@ impl Surfaces {
             32,
         ))
     }
+    /// Write part of one row of the next frame into the back buffer of a live
+    /// pipe. The back buffer is the one surface no HUBP fetches while the
+    /// pipe scans out and no flip is in progress, so this is the live update
+    /// path that never races scanout; the front's `upload` stays
+    /// stopped-only. No raw CPU pointer escapes. The writes become visible to
+    /// display when the next `flip` HDP-flushes them before latching.
+    pub(in crate::amdgpu_dcn401_otg) fn upload_back<I: Io>(
+        &mut self,
+        e: &mut Engine<I>,
+        pipe: u8,
+        x: u32,
+        y: u32,
+        pixels: &[u32],
+    ) -> Result<(), Error> {
+        let surface = self
+            .0
+            .get(usize::from(pipe))
+            .and_then(Option::as_ref)
+            .ok_or(Error::Invalid)?;
+        let back = surface.back.as_ref().ok_or(Error::Invalid)?;
+        let a = surface.applied;
+        let count = u32::try_from(pixels.len()).map_err(|_| Error::Invalid)?;
+        if count == 0
+            || y >= a.request.height
+            || x.checked_add(count).is_none_or(|end| end > a.request.width)
+        {
+            return Err(Error::Invalid);
+        }
+        // Only while this pipe scans out its front: during a flip which buffer
+        // is fetched is in transition, and after a failure it is unknown.
+        let running = e.status.scanout.ok_or(Error::Busy)?;
+        if e.status.state != State::ScanoutRunning(pipe)
+            || running.pipe != pipe
+            || running.address != a.address
+            || back.address() == a.address
+        {
+            return Err(Error::Busy);
+        }
+        let map = back.mapping();
+        let start = u64::from(y) * u64::from(a.pitch_bytes) + u64::from(x) * 4;
+        e.access(|_| {
+            for (index, &pixel) in pixels.iter().enumerate() {
+                // SAFETY: checked row bounds within the retained back buffer,
+                // which no display fetch reads until the next flip.
+                unsafe { map.write32(start + index as u64 * 4, pixel) };
+            }
+            Ok(())
+        })
+    }
     /// Present the back buffer at the next VUPDATE and wait for the HUBP to
     /// report it in use. Any failure quarantines the pipe; both buffers stay
     /// allocated because which one is still fetched is then unknown.
@@ -223,6 +272,19 @@ impl Otg {
     /// The back buffer as a CPU framebuffer (bus-physical BAR address).
     pub fn back_framebuffer(&self, pipe: u8) -> Result<GenericFb, Error> {
         self.1.back_framebuffer(pipe)
+    }
+    /// Write part of one row of the next frame into a live pipe's back
+    /// buffer; `flip` publishes it.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/HDP writers.
+    pub unsafe fn upload_back_buffer(
+        &mut self,
+        pipe: u8,
+        x: u32,
+        y: u32,
+        pixels: &[u32],
+    ) -> Result<(), Error> {
+        self.1.upload_back(&mut self.0, pipe, x, y, pixels)
     }
     /// Flip a live scanout to its back buffer at the next VUPDATE.
     /// # Safety

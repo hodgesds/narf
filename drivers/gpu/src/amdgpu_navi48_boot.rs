@@ -1209,6 +1209,28 @@ impl ColdBoot {
     ) -> Result<narf_graphics_driver::generic::GenericFb, otg::Error> {
         self.otg.as_ref().map_err(|e| *e)?.back_framebuffer(pipe)
     }
+    /// Write part of one row of the next frame into a live pipe's back
+    /// buffer; the next `flip_display` publishes it.
+    /// # Safety
+    /// Exclude firmware/FAMS and concurrent display/HDP writers.
+    pub unsafe fn upload_display_back(
+        &mut self,
+        pipe: u8,
+        x: u32,
+        y: u32,
+        pixels: &[u32],
+    ) -> Result<(), otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        // SAFETY: serialized retained owner; caller excludes writers.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .upload_back_buffer(pipe, x, y, pixels)
+        }
+    }
     /// Flip a live scanout to its back buffer at the next VUPDATE.
     /// # Safety
     /// The back buffer must hold the complete next frame with no CPU writer
