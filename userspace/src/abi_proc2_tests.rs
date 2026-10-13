@@ -3440,14 +3440,31 @@ fn proc_dirfd_survives_chroot_into(target: &[u8]) -> TestResult {
                 return Err("fstatat(proc_fd, \"self/task/\") failed after chroot");
             }
             let fd_dir = b"self/fd/\0";
-            match call(
+            let fd_dir_fd = match call(
                 Syscall::Openat.raw(),
                 a3(proc_fd, fd_dir.as_ptr() as u64, O_RDONLY | O_DIRECTORY, 0),
             ) {
-                Some(fd) if fd >= 0 => {
-                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
-                }
+                Some(fd) if fd >= 0 => fd as u64,
                 _ => return Err("openat(proc_fd, \"self/fd/\") failed after chroot"),
+            };
+            // `HasOpenDirectory`'s loop body (proc_util.cc:115): follow the
+            // `/proc/self/fd/<N>` magic link for a descriptor opened before the
+            // chroot. It lands on the open file — here the `/proc` directory —
+            // which the new root can no longer reach by path.
+            let name = alloc::format!("{}\0", proc_fd);
+            let followed = call(
+                Syscall::Newfstatat.raw(),
+                a3(fd_dir_fd, name.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd_dir_fd));
+            if followed != Some(0) {
+                return Err("fstatat(self/fd dirfd, \"<N>\") failed after chroot");
+            }
+            const S_IFMT: u32 = 0o170000;
+            const S_IFDIR: u32 = 0o040000;
+            let mode = u32::from_ne_bytes(st[24..28].try_into().unwrap_or_default());
+            if mode & S_IFMT != S_IFDIR {
+                return Err("the followed fd link did not describe the open directory");
             }
             // Negative: "/proc" itself is gone from the new root.
             if call(

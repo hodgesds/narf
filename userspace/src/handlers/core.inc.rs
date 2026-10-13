@@ -3512,8 +3512,21 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // further (`nd_jump_link`): an O_PATH|O_NOFOLLOW fd on a symlink stats as
     // that symlink. Following on from the jump chased /etc/localtime to its
     // target and missed with ENOENT.
+    //
+    // A walk anchored outside the caller's root (a dirfd opened before a later
+    // chroot, e.g. Chromium's `/proc` fd) has no caller-view spelling, so its
+    // magic-link form is read from where it lies inside the covering procfs
+    // mount. A descriptor whose file the root no longer reaches cannot be
+    // re-walked by path either; `nd_jump_link` lands on the open file, so
+    // stat the descriptor itself.
+    let anchored_proc_view = anchored_procfs_view(raw);
+    let magic_src = anchored_proc_view.as_deref().unwrap_or(raw);
     let magic_owned;
-    let raw: &str = if let Some(n) = parse_proc_self_fd(raw).filter(|_| follow_final) {
+    let raw: &str = if let Some(n) = parse_proc_self_fd(magic_src).filter(|_| follow_final) {
+        if anchored_proc_view.is_some() || !fd_file_within_root(task, n) {
+            stat_linux_fd(ctx, n, out_ptr);
+            return;
+        }
         match fd_path_for_task(task, n).filter(|p| p.starts_with('/')) {
             // A descriptor with a real filesystem path: stat that node. The
             // path is the fd's view (chroot-stripped), so it goes back through

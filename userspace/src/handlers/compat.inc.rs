@@ -1311,6 +1311,27 @@ pub(crate) fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc:
     Ok(alloc::format!("{}/{}", base.trim_end_matches('/'), raw))
 }
 
+/// For a path [`resolve_at_path`] anchored outside the caller's root: its
+/// spelling as a `/proc/...` path when it lies in a procfs mount (`self/fd/5`
+/// in a procfs mounted at `/mnt/proc` reads as `/proc/self/fd/5`), so the proc
+/// magic-link parsers apply to it. `None` for any other path.
+pub(crate) fn anchored_procfs_view(path: &str) -> Option<alloc::string::String> {
+    let host = path.strip_prefix(HOST_ANCHORED)?;
+    current_resolve_absolute(host, |fs, _root, rel| {
+        (fs.name() == "proc").then(|| alloc::format!("/proc/{}", rel.trim_start_matches('/')))
+    })
+    .flatten()
+}
+
+/// Whether fd `n`'s file is reachable by path from `task`'s current root.
+/// A descriptor opened before a later chroot can name a file outside it.
+pub(crate) fn fd_file_within_root(task: u64, n: u32) -> bool {
+    let Some(root) = root_dir_prefix(task).filter(|root| root != "/") else {
+        return true;
+    };
+    crate::mqueue::fd_path(task, n).is_none_or(|host| path_at_or_under(&host, &root))
+}
+
 /// Marks a path [`resolve_at_path`] already anchored host-absolute, outside
 /// the caller's root: the user-path to host-path conversions
 /// ([`resolve_cwd_path`], [`apply_chroot`]) pass it through un-rooted. A
