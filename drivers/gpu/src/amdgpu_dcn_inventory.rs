@@ -142,6 +142,8 @@ const LPDDR5_CHANNEL_WIDTH_BYTES: u32 = 4;
 /// `atom_display_controller_info_v4_*` places `dce_refclk_10khz` here, in every
 /// content revision from 4.1 to 4.5.
 const DCE_REFCLK_OFFSET: usize = 12;
+const DCE_DISPLAY_CAPS_OFFSET: usize = 4;
+const DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: u32 = 0x20;
 /// `atom_integrated_system_info_v2_*` field offsets, the same in v2.1 and v2.2.
 const MEMORY_TYPE_OFFSET: usize = 26;
 const CHANNEL_COUNT_OFFSET: usize = 27;
@@ -442,6 +444,23 @@ pub fn dchub_refclk_khz(vbios: &[u8]) -> Result<u32, Error> {
     }
     let refclk = u16_at(info, DCE_REFCLK_OFFSET) as u32 * 10;
     Ok(if refclk == 0 { 27_000 } else { refclk })
+}
+
+/// `atom_display_controller_info_v4_*.display_caps`
+/// DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: the board wants DP repeaters
+/// (LTTPRs) trained hop by hop (non-transparent mode). Linux's DCN401 is
+/// always VBIOS-LTTPR-aware, so without the bit a present repeater is used
+/// in transparent mode (dp_decide_8b_10b_lttpr_mode); a missing or unknown
+/// table reads as the bit clear, as bios_get_lttpr_caps' failure does.
+pub fn lttpr_non_transparent(vbios: &[u8]) -> Result<bool, Error> {
+    let info = table(vbios, TABLE_DCE_INFO)?;
+    header(info, 4, &[1, 2, 3, 4, 5])?;
+    if (u16_at(info, 0) as usize) < DCE_DISPLAY_CAPS_OFFSET + 4 {
+        return Err(Error::Invalid);
+    }
+    let caps = u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET))
+        | u32::from(u16_at(info, DCE_DISPLAY_CAPS_OFFSET + 2)) << 16;
+    Ok(caps & DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE != 0)
 }
 
 /// The memory configuration, from `atom_integrated_system_info_v2_*` for the

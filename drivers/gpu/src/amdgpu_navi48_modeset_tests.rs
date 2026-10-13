@@ -32,7 +32,11 @@ fn dpcd(rate: u8, lanes: u8) -> Option<[u8; 16]> {
 fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display::Port {
     display::Port {
         path,
-        sink: Ok(display::Sink { dpcd, edid }),
+        sink: Ok(display::Sink {
+            dpcd,
+            edid,
+            lttpr: None,
+        }),
     }
 }
 
@@ -526,4 +530,21 @@ fn navi48_modeset_lists_standard_established_and_vic_modes_like_linux() -> TestR
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_lists_standard_established_and_vic_modes_like_linux
+);
+
+fn navi48_modeset_bounds_the_link_by_a_repeater_chain() -> TestResult {
+    use inventory::Connector::DisplayPort as Dp;
+    let paths = [path(Dp, 0)];
+    let mut p = port(paths[0], dpcd(0x14, 4), edid_1080p());
+    if let Ok(sink) = p.sink.as_mut() {
+        sink.lttpr = Some((0x0a, 4)); // the repeater stops at HBR
+    }
+    match select(&paths, &[p], 8, None) {
+        Ok(s) if (s.lanes, s.rate) == (4, LinkRate::Hbr) => TestResult::Pass,
+        _ => TestResult::Fail("LTTPR-bounded link"),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_bounds_the_link_by_a_repeater_chain
 );

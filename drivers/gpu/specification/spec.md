@@ -1494,7 +1494,7 @@ recovery; unfinished firmware commands additionally quarantine the mailbox.
 platform wrapper and `Otg::train_dp_link` train only the matching retained
 `DpPhyReady` legacy SST link at its current lane count and rate. The caller
 fulfils the PHY operation's direct-port, writer-exclusion and memory-retention
-obligations, excludes fixed-drive retimers/LTTPRs, eDP, USB-C and MST/FEC work,
+obligations, excludes fixed-drive retimers, eDP, USB-C and MST/FEC work,
 and supplies the actual board/firmware PHY downspread setting. This boolean
 describes existing SSC; training does not reprogram its source. No automatic
 rate/lane fallback, stream enable or scanout is implied.
@@ -1503,9 +1503,27 @@ Training enters `TrainingDp(transmitter)` before the first AUX transaction.
 It requires DPCD 1.1 or later, requests sink D0, waits at least 1 ms and checks
 power readback, then reads live base/extended capabilities on the board AUX
 channel. Malformed/insufficient lane/rate/coding/framing capabilities, branches,
-advertised repeaters, enabled MST or FEC-ready sinks reject. An optional LTTPR
-capability-block NACK is absence; timeout, protocol failure and exhausted DEFER
-are errors. Native AUX retries DEFER at most six times with 1 ms delays.
+enabled MST or FEC-ready sinks reject, before any register write. DP
+repeaters (LTTPRs) are handled as Linux's DCN401 (always VBIOS-LTTPR-aware):
+the AUX engine's reply timeout is set to 3.2 ms (AUX_DPHY_RX_CONTROL1, as
+dce_aux_configure_timeout) before the 10-byte capability block at 0xF0000 is
+read. A NACK is absence and restores the 552-us default; timeout, protocol
+failure and exhausted DEFER are errors. A repeater is present when its count
+is a single bit and its lane count is 1..=4 (the revision is not checked).
+Its maximum rate and lanes bound the link like the sink's. The owner echoes
+TOTAL_LTTPR_CNT and sets transparent mode (0x55). When the VBIOS display caps
+carry DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE (`inventory::lttpr_non_transparent`)
+it switches to non-transparent mode (0xAA), reads each repeater's EQ
+AUX_RD_INTERVAL, and trains each repeater before the sink, farthest first:
+TPS1 CR at the sink's CR interval, TPS4 EQ at the repeater's own interval,
+status and adjust requests from the repeater's 0xF0030/0xF0033 block, and
+"training done" (0) written to its pattern register on success or failure,
+the drive restarting at level 0 for the next hop. The CR interval follows
+get_cr_training_aux_rd_interval: 100 us in non-transparent mode without a
+DPCD interval, and an LTTPR implies the 16-ms interval for pre-1.2 sinks. The
+port scan reads the same capability block (with the boot owner setting the
+long timeout on DP ports beforehand and restoring the default where none
+answered), and the modeset bounds its maximum link by it. Native AUX retries DEFER at most six times with 1 ms delays.
 The owner sets and checks 8b/10b coding, enhanced framing, lane count, link rate
 and sink downspread, without granting post-training adjustment requests.
 

@@ -79,6 +79,8 @@ impl Aux for Fake {
         }
         assert_eq!(instance, 1, "connector/transmitter mistaken for AUX");
         match (action, address, data.len()) {
+            // No repeater: the LTTPR capability block is NACKed.
+            (0x90, 0xf0000, 10) => return Err(dmub::Error::Aux(1)),
             (0x90, 0, 16) => data.copy_from_slice(&self.dpcd),
             (0x90, 0x2200, 16) => data.copy_from_slice(&self.extended),
             (0, 0x30, 1) => {
@@ -330,7 +332,11 @@ fn navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux() -> TestResult {
         assert_eq!(
             ports[0].sink,
             result
-                .map(|edid| Sink { dpcd: None, edid })
+                .map(|edid| Sink {
+                    dpcd: None,
+                    edid,
+                    lttpr: None,
+                })
                 .map_err(Error::Ddc)
         );
         assert!(ports[1].sink.as_ref().unwrap().dpcd.is_some());

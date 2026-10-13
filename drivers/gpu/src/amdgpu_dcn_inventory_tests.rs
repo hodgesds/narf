@@ -348,6 +348,23 @@ fn inventory_reference_clock_and_vco_are_range_checked() -> TestResult {
     if dchub_refclk_khz(gone.bytes()) != Err(Error::Missing) {
         return TestResult::Fail("absent DCE info accepted");
     }
+    // DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE (0x20) in display_caps; the
+    // transparent-enable bit (0x40) is a different capability.
+    let mut caps = Image::new();
+    caps.dce(10_000);
+    if lttpr_non_transparent(caps.bytes()) != Ok(false) {
+        return TestResult::Fail("LTTPR bit clear");
+    }
+    caps.0[DCE + 4] = 0x40;
+    if lttpr_non_transparent(caps.bytes()) != Ok(false) {
+        return TestResult::Fail("transparent-enable bit is not non-transparent");
+    }
+    caps.0[DCE + 4] = 0x60;
+    if lttpr_non_transparent(caps.bytes()) != Ok(true)
+        || lttpr_non_transparent(gone.bytes()) != Err(Error::Missing)
+    {
+        return TestResult::Fail("LTTPR support bit");
+    }
     // The feedback multiplier is 8.16 fixed point against a 48 MHz reference:
     // 75 whole steps is the 3.6 GHz default, and the fraction must not be lost.
     if vco_from_pll_request(75) != Some(3_600_000) {

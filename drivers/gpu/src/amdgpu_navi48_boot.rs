@@ -446,6 +446,8 @@ pub struct ColdBoot {
     display: Result<display::Probe, display::Error>,
     ddc: Result<ddc::Ddc, display::Error>,
     crystal: Result<u32, display::Error>,
+    /// VBIOS DCE_INFO_CAPS_LTTPR_SUPPORT_ENABLE: train DP repeaters hop by hop.
+    lttpr_non_transparent: bool,
     clocks: Result<clocks::ClockManager, clocks::Error>,
     dccg: Result<dccg::Dccg, dccg::Error>,
     otg: Result<otg::Otg, otg::Error>,
@@ -519,6 +521,12 @@ impl ColdBoot {
             .ok_or(inventory::Error::Missing)
             .and_then(|bios| inventory::dchub_refclk_khz(bios.bytes()))
             .map_err(display::Error::Inventory);
+        // DCN401 is always VBIOS-LTTPR-aware; the VBIOS chooses between
+        // transparent and hop-by-hop repeater training.
+        let lttpr_non_transparent = gpu
+            .vbios
+            .as_ref()
+            .is_some_and(|bios| inventory::lttpr_non_transparent(bios.bytes()) == Ok(true));
         let ddc = crystal.and_then(|clock| {
             // SAFETY: same exclusive DCN/pin/reset ownership; preparation
             // only. All subsequent DDC and DMUB access shares this owner.
@@ -564,6 +572,7 @@ impl ColdBoot {
             display,
             ddc,
             crystal,
+            lttpr_non_transparent,
             clocks,
             dccg,
             otg,
@@ -1481,7 +1490,12 @@ impl ColdBoot {
             self.otg
                 .as_mut()
                 .map_err(|e| *e)?
-                .train_dp_link(&mut self.sequence.backend.dmub, path, downspread)
+                .train_dp_link(
+                    &mut self.sequence.backend.dmub,
+                    path,
+                    downspread,
+                    self.lttpr_non_transparent,
+                )
                 .await
         }
     }
@@ -2009,10 +2023,35 @@ impl ColdBoot {
         {
             self.ddc.as_ref().map_err(|e| Error::Display(*e))?;
         }
-        display
+        // retrieve_link_cap: the LTTPR AUX timeout before probing a DP port,
+        // the default again where no repeater answered.
+        let dp: Vec<inventory::Path> = display
+            .paths()
+            .iter()
+            .filter(|p| p.connector == inventory::Connector::DisplayPort && p.aux.is_some())
+            .copied()
+            .collect();
+        if let Ok(otg) = self.otg.as_mut() {
+            for path in &dp {
+                // SAFETY: the scan below is this engine's only AUX user.
+                let _ = unsafe { otg.set_aux_timeout(*path, otg::Otg::AUX_TIMEOUT_LTTPR_US) };
+            }
+        }
+        let ports = display
             .scan(&mut self.sequence.backend.dmub, self.ddc.as_mut().ok())
             .await
-            .map_err(Error::Display)
+            .map_err(Error::Display)?;
+        if let Ok(otg) = self.otg.as_mut() {
+            for port in &ports {
+                let repeater = port.sink.as_ref().is_ok_and(|s| s.lttpr.is_some());
+                if dp.contains(&port.path) && !repeater {
+                    // SAFETY: as above.
+                    let _ =
+                        unsafe { otg.set_aux_timeout(port.path, otg::Otg::AUX_TIMEOUT_DEFAULT_US) };
+                }
+            }
+        }
+        Ok(ports)
     }
     /// MemoryReady proves firmware, power, an owned VMID0 SDMA write/copy,
     /// the unified MES12 firmware queues and the DMUB capability handshake.

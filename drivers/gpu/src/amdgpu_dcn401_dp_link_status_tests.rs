@@ -44,7 +44,7 @@ fn dcn401_dp_link_status_reads_sink_lock_without_touching_the_owner() -> TestRes
     let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
     // Only a trained (or later) link has a status to read.
     assert_eq!(run(e.dp_link_status(&mut io, path(1))), Err(Error::Busy));
-    run(e.train_dp_link(&mut io, path(1), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(1), false, false)).unwrap();
     let writes = e.io.inner.inner.writes.len();
     let locked = run(e.dp_link_status(&mut io, path(1))).unwrap();
     if !locked.locked || locked.power.is_some() || locked.lost() {
@@ -95,7 +95,7 @@ kernel_test_in!(
 
 fn dcn401_unplugged_dp_link_stop_skips_sink_d3_only_with_hpd_low() -> TestResult {
     let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
-    run(e.train_dp_link(&mut io, path(1), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(1), false, false)).unwrap();
     // HPD not routed, then sensed high: the sink may still be there.
     assert_eq!(
         run(e.stop_unplugged_dp_link(&mut io, path(1))),

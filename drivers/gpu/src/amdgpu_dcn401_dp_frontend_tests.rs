@@ -72,7 +72,7 @@ fn fixture(
         .regs
         .insert(bank1 + 0x68 * 4, 4 << (pipe * 3));
     run(e.enable_dp_phy(&mut io, path(p), io_settings())).unwrap();
-    run(e.train_dp_link(&mut io, path(p), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(p), false, false)).unwrap();
     let source = dio(stream, 0x2093);
     e.io.inner.inner.regs.insert(source, 0x80000176); // clear only native routing fields
     e.io.inner
@@ -436,7 +436,7 @@ fn dcn401_dp_frontend_derives_pixel_packing_and_rejects_insufficient_capacity() 
     };
     e.io.inner.inner.lanes = 8;
     run(e.enable_dp_phy(&mut io, path(0), io_settings_low())).unwrap();
-    run(e.train_dp_link(&mut io, path(0), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(0), false, false)).unwrap();
     let writes = e.io.fake().writes.len();
     assert_eq!(
         run(e.prepare_dp_frontend(&mut io, path(0), req(1, 2), c)),

@@ -223,9 +223,15 @@ pub enum Health {
 }
 
 /// Maximum DPCD link of a DP receiver: MAX_LINK_RATE and MAX_LANE_COUNT.
-fn max_link(dpcd: &[u8; 16]) -> Option<(u8, LinkRate)> {
-    let lanes = dpcd[2] & 0x1f;
-    let rate = LinkRate::from_dpcd_byte(dpcd[1])?;
+/// The sink's maximum link, bounded by a repeater chain's (Linux
+/// dp_get_max_link_cap takes the minimum with the LTTPR caps).
+fn max_link(dpcd: &[u8; 16], lttpr: Option<(u8, u8)>) -> Option<(u8, LinkRate)> {
+    let (mut lanes, mut rate) = (dpcd[2] & 0x1f, dpcd[1]);
+    if let Some((max_rate, max_lanes)) = lttpr {
+        lanes = lanes.min(max_lanes);
+        rate = rate.min(max_rate);
+    }
+    let rate = LinkRate::from_dpcd_byte(rate)?;
     matches!(lanes, 1 | 2 | 4).then_some((lanes, rate))
 }
 
@@ -359,7 +365,7 @@ pub fn select(
             continue;
         }
         let Ok(sink) = &port.sink else { continue };
-        let Some((lanes, rate)) = sink.dpcd.as_ref().and_then(max_link) else {
+        let Some((lanes, rate)) = sink.dpcd.as_ref().and_then(|d| max_link(d, sink.lttpr)) else {
             continue;
         };
         let Some(timing) = pick(&sink.edid, &|t| link_fits(t, lanes, rate)) else {

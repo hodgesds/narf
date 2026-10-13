@@ -272,7 +272,7 @@ fn dcn401_dp_training_handles_native_patterns_phys_rates_lanes_and_sink_shutdown
                 (LinkRate::Hbr3, TrainingPattern::Tps4),
             ] {
                 let (mut e, mut io) = fixture(p, lanes, rate, pattern);
-                let trained = run(e.train_dp_link(&mut io, path(p), true)).unwrap();
+                let trained = run(e.train_dp_link(&mut io, path(p), true, false)).unwrap();
                 assert_eq!(e.status.state, State::DpLinkTrained(p));
                 assert_eq!(trained.equalization, pattern);
                 assert_eq!((trained.cr_attempts, trained.eq_attempts), (1, 1));
@@ -294,7 +294,7 @@ fn dcn401_dp_training_handles_native_patterns_phys_rates_lanes_and_sink_shutdown
                 assert!(io.events.contains(&Event::Delay(400)));
                 assert!(io.events.contains(&Event::Delay(5000)));
                 assert_eq!(
-                    run(e.train_dp_link(&mut io, path(p), true)),
+                    run(e.train_dp_link(&mut io, path(p), true, false)),
                     Err(Error::Busy)
                 );
                 assert_eq!(run(e.disable_dp_phy(&mut io, path(p))), Err(Error::Busy));
@@ -323,7 +323,7 @@ fn dcn401_dp_training_uses_maximum_requested_drive_with_native_clamping_and_limi
         [0x11, 0x11, 0, 0, 0xcc, 0xcc], // VS=0 PE=3 -> MAX_PRE flag
         [0x77, 0x77, 1, 0, 0, 0],
     ]);
-    let trained = run(e.train_dp_link(&mut io, path(2), false)).unwrap();
+    let trained = run(e.train_dp_link(&mut io, path(2), false, false)).unwrap();
     let drives: Vec<_> = io
         .events
         .iter()
@@ -359,7 +359,7 @@ fn dcn401_dp_training_uses_maximum_requested_drive_with_native_clamping_and_limi
     assert_eq!(io.bytes[&0x107], 0);
     let (mut e, mut io) = fixture(0, 1, LinkRate::Rbr, TrainingPattern::Tps2);
     io.status = VecDeque::from([[0, 0, 0, 0, 3, 0], [1, 0, 0, 0, 0, 0]]);
-    run(e.train_dp_link(&mut io, path(0), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(0), false, false)).unwrap();
     assert!(io.events.contains(&Event::Aux(0x80, 0x103, vec![7]))); // MAX_SWING, no PE
     TestResult::Pass
 }
@@ -374,7 +374,7 @@ fn dcn401_dp_training_honors_extended_caps_intervals_and_defer_limits() -> TestR
         io.set(14, &[0x80 | interval]);
         io.set(0x2200, &[0x14, 0x14, 0xc2, 1, 0, 0, 1]);
         io.defer = 2;
-        let result = run(e.train_dp_link(&mut io, path(1), false)).unwrap();
+        let result = run(e.train_dp_link(&mut io, path(1), false, false)).unwrap();
         assert_eq!(result.equalization, TrainingPattern::Tps3);
         assert!(io.events.contains(&Event::Delay(if interval == 0 {
             400
@@ -388,7 +388,7 @@ fn dcn401_dp_training_honors_extended_caps_intervals_and_defer_limits() -> TestR
     let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
     io.defer = 7;
     assert_eq!(
-        run(e.train_dp_link(&mut io, path(1), false)),
+        run(e.train_dp_link(&mut io, path(1), false, false)),
         Err(Error::Firmware(dmub::Error::Aux(2)))
     );
     assert_eq!(
@@ -419,14 +419,13 @@ fn dcn401_dp_training_rejects_unsupported_topologies_caps_and_unacknowledged_sin
         (5, vec![1]),
         (6, vec![0]),
         (14, vec![7]),
-        (0xf0000, vec![0x14, 0x1e, 0x80]),
         (0x111, vec![1]),
     ] {
         let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
         io.set(address, &bytes);
         let writes = e.io.inner.inner.writes.len();
         assert!(
-            run(e.train_dp_link(&mut io, path(1), true)).is_err(),
+            run(e.train_dp_link(&mut io, path(1), true, false)).is_err(),
             "{address:x}"
         );
         assert_eq!(e.io.inner.inner.writes.len(), writes);
@@ -434,14 +433,14 @@ fn dcn401_dp_training_rejects_unsupported_topologies_caps_and_unacknowledged_sin
     }
     let (mut e, mut io) = fixture(0, 4, LinkRate::Hbr3, TrainingPattern::Tps3);
     assert_eq!(
-        run(e.train_dp_link(&mut io, path(0), false)),
+        run(e.train_dp_link(&mut io, path(0), false, false)),
         Err(Error::Unsupported)
     );
     let (mut e, mut io) = fixture(0, 4, LinkRate::Hbr3, TrainingPattern::Tps4);
     io.set(0x90, &[1]);
     io.set(0x120, &[1]);
     assert_eq!(
-        run(e.train_dp_link(&mut io, path(0), false)),
+        run(e.train_dp_link(&mut io, path(0), false, false)),
         Err(Error::Busy)
     );
     for address in [0x600, 0x100, 0x101, 0x102, 0x107, 0x108] {
@@ -449,7 +448,7 @@ fn dcn401_dp_training_rejects_unsupported_topologies_caps_and_unacknowledged_sin
         io.ignore = Some(address);
         io.set(address, &[0xff]);
         assert!(matches!(
-            run(e.train_dp_link(&mut io, path(0), true)),
+            run(e.train_dp_link(&mut io, path(0), true, false)),
             Err(Error::DpTraining(DpTrainingError::SinkReadback(_)))
         ));
         assert!(!io.events.iter().any(|e| matches!(e, Event::Drive(_))));
@@ -503,7 +502,7 @@ fn dcn401_dp_training_bounds_cr_eq_and_detects_link_loss_after_idle() -> TestRes
         let (mut e, mut io) = fixture(3, 1, LinkRate::Hbr, TrainingPattern::Tps2);
         io.status = statuses.into();
         assert_eq!(
-            run(e.train_dp_link(&mut io, path(3), false)),
+            run(e.train_dp_link(&mut io, path(3), false, false)),
             Err(Error::DpTraining(error))
         );
         assert_eq!(
@@ -519,7 +518,7 @@ fn dcn401_dp_training_bounds_cr_eq_and_detects_link_loss_after_idle() -> TestRes
         assert_eq!(e.status.state, State::DpLinkRefused(3));
         assert!(e.status.dp_link_trained.is_some());
         assert_eq!(
-            run(e.train_dp_link(&mut io, path(3), false)),
+            run(e.train_dp_link(&mut io, path(3), false, false)),
             Err(Error::Busy)
         );
         assert_eq!(e.status.state, State::DpLinkRefused(3));
@@ -537,13 +536,13 @@ kernel_test_in!(
 fn dcn401_dp_training_cancellation_at_each_await_retains_ownership_and_blocks_replay() -> TestResult
 {
     let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
-    run(e.train_dp_link(&mut io, path(1), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(1), false, false)).unwrap();
     let count = io.step;
     for step in 1..=count {
         let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
         io.pending = Some(step);
         {
-            let mut f = core::pin::pin!(e.train_dp_link(&mut io, path(1), false));
+            let mut f = core::pin::pin!(e.train_dp_link(&mut io, path(1), false, false));
             assert!(f
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
@@ -552,7 +551,7 @@ fn dcn401_dp_training_cancellation_at_each_await_retains_ownership_and_blocks_re
         assert_eq!(e.status.state, State::TrainingDp(1));
         assert!(e.status.dp_link_trained.is_none());
         assert_eq!(
-            run(e.train_dp_link(&mut io, path(1), false)),
+            run(e.train_dp_link(&mut io, path(1), false, false)),
             Err(Error::Busy)
         );
         assert_eq!(run(e.disable_dp_phy(&mut io, path(1))), Err(Error::Busy));
@@ -568,7 +567,7 @@ kernel_test_in!(
 
 fn dcn401_dp_training_rejects_late_routes_revocation_and_transport_failures() -> TestResult {
     let (mut e, mut io) = fixture(2, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
-    run(e.train_dp_link(&mut io, path(2), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(2), false, false)).unwrap();
     let events = io.events;
     for (index, event) in events.iter().enumerate() {
         let step = index + 1;
@@ -583,7 +582,7 @@ fn dcn401_dp_training_rejects_late_routes_revocation_and_transport_failures() ->
                 io.fail = Some((step, dmub::Error::CommandTimeout));
             }
             assert_eq!(
-                run(e.train_dp_link(&mut io, path(2), false)),
+                run(e.train_dp_link(&mut io, path(2), false, false)),
                 Err(if revoked {
                     Error::Revoked
                 } else {
@@ -603,7 +602,7 @@ fn dcn401_dp_training_rejects_late_routes_revocation_and_transport_failures() ->
     ] {
         let (mut e, mut io) = fixture(2, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
         io.change_at = Some((events.len(), at, value)); // after final sink read
-        assert!(run(e.train_dp_link(&mut io, path(2), false)).is_err());
+        assert!(run(e.train_dp_link(&mut io, path(2), false, false)).is_err());
         assert!(matches!(e.status.state, State::Failed(_)));
         assert!(e.status.dp_link_trained.is_none());
     }
@@ -617,7 +616,7 @@ kernel_test_in!(
 fn dcn401_dp_training_shutdown_rejects_sink_failure_and_cancellation() -> TestResult {
     for cancel in [false, true] {
         let (mut e, mut io) = fixture(2, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
-        run(e.train_dp_link(&mut io, path(2), false)).unwrap();
+        run(e.train_dp_link(&mut io, path(2), false, false)).unwrap();
         let commands = io.fw.commands.len();
         if cancel {
             io.pending = Some(io.step + 1);
@@ -641,7 +640,7 @@ fn dcn401_dp_training_shutdown_rejects_sink_failure_and_cancellation() -> TestRe
         assert_eq!(run(e.stop_dp_link(&mut io, path(2))), Err(Error::Busy));
     }
     let (mut e, mut io) = fixture(2, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
-    run(e.train_dp_link(&mut io, path(2), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(2), false, false)).unwrap();
     io.fw.pending = true;
     {
         let mut f = core::pin::pin!(e.stop_dp_link(&mut io, path(2)));
@@ -660,7 +659,7 @@ kernel_test_in!(
 
 fn dcn401_dp_training_final_completion_requires_unchanged_sink_and_no_post_lt_work() -> TestResult {
     let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
-    run(e.train_dp_link(&mut io, path(1), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(1), false, false)).unwrap();
     let idle_delay = io
         .events
         .iter()
@@ -678,7 +677,7 @@ fn dcn401_dp_training_final_completion_requires_unchanged_sink_and_no_post_lt_wo
         let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
         io.sink_change = Some((idle_delay, at, value));
         assert!(matches!(
-            run(e.train_dp_link(&mut io, path(1), false)),
+            run(e.train_dp_link(&mut io, path(1), false, false)),
             Err(Error::DpTraining(DpTrainingError::SinkReadback(_)))
         ));
         assert!(e.status.dp_link_trained.is_none());
@@ -687,7 +686,7 @@ fn dcn401_dp_training_final_completion_requires_unchanged_sink_and_no_post_lt_wo
         let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
         io.status = VecDeque::from([[0x11, 0x11, 0, 0, 0, 0], [0x77, 0x77, 1, 0, 0, 0], status]);
         assert_eq!(
-            run(e.train_dp_link(&mut io, path(1), false)),
+            run(e.train_dp_link(&mut io, path(1), false, false)),
             Err(Error::DpTraining(DpTrainingError::LinkLost))
         );
         // The finish's idle exit stands: refused, retained only for stop.
@@ -704,14 +703,14 @@ fn dcn401_dp_training_checks_source_writes_and_drive_handshake_completion() -> T
     let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
     let first = e.io.inner.inner.writes.len();
     let mut registers = e.io.inner.inner.regs.clone();
-    run(e.train_dp_link(&mut io, path(1), false)).unwrap();
+    run(e.train_dp_link(&mut io, path(1), false, false)).unwrap();
     let writes = e.io.inner.inner.writes;
     for (index, &(at, value)) in writes.iter().enumerate().skip(first) {
         if registers.get(&at).copied().unwrap_or(0) != value {
             let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
             e.io.inner.inner.reject = Some(index + 1);
             assert!(matches!(
-                run(e.train_dp_link(&mut io, path(1), false)),
+                run(e.train_dp_link(&mut io, path(1), false, false)),
                 Err(Error::Readback(_))
             ));
             assert!(matches!(e.status.state, State::Failed(_)));
@@ -726,7 +725,7 @@ fn dcn401_dp_training_checks_source_writes_and_drive_handshake_completion() -> T
                 e.io.inner.inner.revoke = Some((index + 1, e.authority));
             }
             assert_eq!(
-                run(e.train_dp_link(&mut io, path(1), false)),
+                run(e.train_dp_link(&mut io, path(1), false, false)),
                 Err(if gone {
                     Error::DeviceGone
                 } else {
@@ -745,7 +744,7 @@ fn dcn401_dp_training_checks_source_writes_and_drive_handshake_completion() -> T
     let (mut e, mut io) = fixture(1, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
     io.change_at = Some((drive_step, phy(1, 0x2943), 0x0c030c13)); // unused lane stuck REQ
     assert_eq!(
-        run(e.train_dp_link(&mut io, path(1), false)),
+        run(e.train_dp_link(&mut io, path(1), false, false)),
         Err(Error::Timeout(phy(1, 0x2943)))
     );
     assert!(e.status.dp_link_trained.is_none());
@@ -754,4 +753,120 @@ fn dcn401_dp_training_checks_source_writes_and_drive_handshake_completion() -> T
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_training_checks_source_writes_and_drive_handshake_completion
+);
+
+/// The AUX engine's AUX_DPHY_RX_CONTROL1 timeout fields (length, multiplier).
+fn aux_timeout(e: &Engine<LinkIo>, p: u8) -> (u32, u32) {
+    let aux = u64::from(path(p).aux.unwrap());
+    let v =
+        e.io.inner
+            .inner
+            .regs
+            .get(&(BASE + (0x16bd + 0x1c * aux) * 4))
+            .copied()
+            .unwrap_or(0);
+    ((v >> 8) & 0x7f, (v >> 15) & 3)
+}
+
+fn dcn401_dp_training_uses_lttprs_like_linux_dcn401() -> TestResult {
+    // No repeater: the default 552-us AUX timeout (69 x 8 us) after the probe.
+    let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3);
+    run(e.train_dp_link(&mut io, path(1), true, false)).unwrap();
+    if aux_timeout(&e, 1) != (69, 0) || io.bytes.contains_key(&0xf0003) {
+        return TestResult::Fail("no LTTPR");
+    }
+    // One repeater, VBIOS without the non-transparent bit: transparent mode,
+    // the 3.2-ms timeout (100 x 32 us), count echoed, no hop training.
+    let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3);
+    io.set(0xf0000, &[0x14, 0x1e, 0x80, 0, 4]);
+    run(e.train_dp_link(&mut io, path(1), true, false)).unwrap();
+    if aux_timeout(&e, 1) != (100, 2)
+        || io.bytes[&0xf0003] != 0x55
+        || io.bytes[&0xf000a] != 0x80
+        || io.bytes.contains_key(&0xf0010)
+    {
+        return TestResult::Fail("transparent LTTPR");
+    }
+    // The repeater bounds the link like the sink does.
+    for caps in [[0x14, 0x1e, 0x80, 0, 2], [0x14, 0x0a, 0x80, 0, 4]] {
+        let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3);
+        io.set(0xf0000, &caps);
+        if run(e.train_dp_link(&mut io, path(1), true, false)) != Err(Error::Unsupported) {
+            return TestResult::Fail("LTTPR link limits");
+        }
+    }
+    // An invalid lane count means no repeater (dp_is_lttpr_present).
+    let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3);
+    io.set(0xf0000, &[0x14, 0x1e, 0x80, 0, 0]);
+    if run(e.train_dp_link(&mut io, path(1), true, false)).is_err() || io.bytes[&0xf0003] != 0 {
+        return TestResult::Fail("invalid LTTPR ignored");
+    }
+    // Two repeaters, non-transparent: repeater 2 (farthest from the sink)
+    // trains first, each CR on TPS1 then EQ on TPS4 at its own interval,
+    // then "training done"; the sink last.
+    let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3);
+    io.set(0xf0000, &[0x14, 0x1e, 0x40, 0, 4]);
+    io.set(0xf0020, &[0x81]); // repeater 1: 4 ms (bit 7 masked)
+    io.set(0xf0070, &[2]); // repeater 2: 8 ms
+    for hop in [0xf0030, 0xf0080] {
+        io.set(hop, &[0x77, 0x77, 1, 0, 0]);
+    }
+    run(e.train_dp_link(&mut io, path(1), true, true)).unwrap();
+    let writes: Vec<(u32, u8)> = io
+        .events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Aux(0x80, at, data) if (0xf0010..0xf0100).contains(at) || *at == 0x102 => {
+                Some((*at, data[0]))
+            }
+            _ => None,
+        })
+        .collect();
+    let expected = [
+        (0x102, 0),      // sink link configuration (training off) first
+        (0xf0060, 0x21), // repeater 2 CR: TPS1, scrambling off
+        (0xf0060, 0x07), // repeater 2 EQ: TPS4
+        (0xf0060, 0),    // repeater 2 done
+        (0xf0010, 0x21),
+        (0xf0010, 0x07),
+        (0xf0010, 0),
+        (0x102, 0x21), // sink CR
+        (0x102, 0x23), // sink EQ: TPS3
+        (0x102, 0),    // idle
+    ];
+    if writes != expected || io.bytes[&0xf0003] != 0xaa {
+        return TestResult::Fail("non-transparent hop order");
+    }
+    let delays: Vec<u64> = io
+        .events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Delay(us) if [4000, 8000].contains(us) => Some(*us),
+            _ => None,
+        })
+        .collect();
+    if delays != [8000, 4000] {
+        return TestResult::Fail("per-repeater EQ intervals");
+    }
+    // A repeater that never locks fails CR, is told training is done, and
+    // the source returns to idle.
+    let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3);
+    io.set(0xf0000, &[0x14, 0x1e, 0x80, 0, 4]);
+    io.set(0xf0030, &[0, 0, 0, 0, 0]);
+    if run(e.train_dp_link(&mut io, path(1), true, true))
+        != Err(Error::DpTraining(DpTrainingError::ClockRecovery))
+        || io.bytes[&0xf0010] != 0
+        || e.status.state != State::DpLinkRefused(1)
+        || io
+            .events
+            .iter()
+            .any(|ev| matches!(ev, Event::Aux(0x80, 0x102, d) if d[0] != 0))
+    {
+        return TestResult::Fail("repeater CR failure");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_training_uses_lttprs_like_linux_dcn401
 );

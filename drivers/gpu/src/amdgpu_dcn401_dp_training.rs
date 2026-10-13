@@ -1,6 +1,8 @@
 //! Direct legacy DP SST training: native DC source patterns/drive programming,
-//! board-routed DPCD transactions and fresh CR/EQ/link-loss checks. No repeaters,
-//! MST, FEC, automated rate fallback, stream output or scanout allocation reuse.
+//! board-routed DPCD transactions and fresh CR/EQ/link-loss checks. LTTPRs are
+//! used as Linux's DCN401 does (always VBIOS-aware): transparent unless the
+//! VBIOS asks for non-transparent hop-by-hop training. No MST, FEC, automated
+//! rate fallback, stream output or scanout allocation reuse.
 use super::*;
 use crate::dp_link_training::{LinkRate, TrainingPattern};
 pub use dmub::DpDriveSettings;
@@ -112,10 +114,97 @@ fn invalid_caps() -> Error {
 fn sink_readback(at: u32) -> Error {
     Error::DpTraining(DpTrainingError::SinkReadback(at))
 }
+/// LTTPR (DP repeater) AUX reply timeout and the default one, in us
+/// (Linux LINK_AUX_DEFAULT_LTTPR_TIMEOUT_PERIOD / LINK_AUX_DEFAULT_TIMEOUT_PERIOD).
+pub(in crate::amdgpu_dcn401_otg) const AUX_TIMEOUT_LTTPR_US: u32 = 3200;
+pub(in crate::amdgpu_dcn401_otg) const AUX_TIMEOUT_DEFAULT_US: u32 = 552;
+const LTTPR_CAPS: u32 = 0xf0000;
+const LTTPR_MODE: u32 = 0xf0003;
+const LTTPR_TOTAL_COUNT: u32 = 0xf000a;
+const LTTPR_MODE_TRANSPARENT: u8 = 0x55;
+const LTTPR_MODE_NON_TRANSPARENT: u8 = 0xaa;
+/// Per-repeater DPCD block stride and its registers (repeater 1's addresses).
+const LTTPR_STRIDE: u32 = 0x50;
+const LTTPR_PATTERN_SET: u32 = 0xf0010;
+const LTTPR_AUX_RD_INTERVAL: u32 = 0xf0020;
+const LTTPR_LANE_STATUS: u32 = 0xf0030;
+const LTTPR_ADJUST_REQUEST: u32 = 0xf0033;
+
+/// Repeaters between the source and the sink, from the LTTPR capability
+/// block (dp_retrieve_lttpr_cap / dp_is_lttpr_present).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Lttpr {
+    count: u8,
+    raw_count: u8,
+    max_rate: u8,
+    max_lanes: u8,
+    non_transparent: bool,
+    /// Each repeater's EQ AUX_RD_INTERVAL (non-transparent only).
+    intervals: [u8; 8],
+}
+impl Lttpr {
+    /// None unless the count is valid and the lane count is 1..=4, as Linux
+    /// (revision is not checked: some repeaters report a bad one).
+    fn parse(caps: [u8; 10], non_transparent: bool) -> Option<Self> {
+        let count = match caps[2] {
+            0x80 => 1,
+            0x40 => 2,
+            0x20 => 3,
+            0x10 => 4,
+            0x08 => 5,
+            0x04 => 6,
+            0x02 => 7,
+            0x01 => 8,
+            _ => 0,
+        };
+        (count > 0 && (1..=4).contains(&caps[4])).then_some(Self {
+            count,
+            raw_count: caps[2],
+            max_rate: caps[1],
+            max_lanes: caps[4],
+            non_transparent,
+            intervals: [0; 8],
+        })
+    }
+}
+/// DPCD addresses of one training hop: the sink, or repeater `id` (1 is the
+/// one nearest the sink, trained last before it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hop {
+    Sink,
+    Repeater(u8),
+}
+impl Hop {
+    fn offset(self) -> u32 {
+        match self {
+            Hop::Sink => 0,
+            Hop::Repeater(id) => LTTPR_STRIDE * u32::from(id - 1),
+        }
+    }
+    fn pattern_set(self) -> u32 {
+        match self {
+            Hop::Sink => 0x102,
+            Hop::Repeater(_) => LTTPR_PATTERN_SET + self.offset(),
+        }
+    }
+}
+/// dp_translate_training_aux_read_interval.
+fn aux_rd_interval_us(interval: u8) -> u64 {
+    match interval {
+        1 => 4000,
+        2 => 8000,
+        3 => 12000,
+        4 => 16000,
+        5 => 32000,
+        6 => 64000,
+        _ => 400,
+    }
+}
 struct Caps {
     pattern: TrainingPattern,
     cr_us: u64,
     eq_us: u64,
+    lttpr: Option<Lttpr>,
 }
 impl Caps {
     fn parse(
@@ -123,6 +212,7 @@ impl Caps {
         interval: u8,
         settings: DpPhySettings,
         downspread: bool,
+        lttpr: Option<Lttpr>,
     ) -> Result<Self, Error> {
         if !matches!(dpcd[0], 0x11..=0x14 | 0x20 | 0x21)
             || !matches!(dpcd[2] & 0x1f, 1 | 2 | 4)
@@ -152,20 +242,37 @@ impl Caps {
         if settings.rate == LinkRate::Hbr3 && pattern != TrainingPattern::Tps4 {
             return Err(Error::Unsupported);
         }
-        let interval_us =
-            [400, 4000, 8000, 12000, 16000, 32000, 64000][usize::from(interval & 0x7f)];
+        // A repeater carries the link: it bounds rate and lanes too.
+        if let Some(r) = lttpr {
+            if settings.lanes > r.max_lanes || settings.rate as u8 > r.max_rate {
+                return Err(Error::Unsupported);
+            }
+        }
+        // get_cr/eq_training_aux_rd_interval: the base DPCD 0xE byte (its
+        // extended-capability bit included) from DPCD 1.2; before that an
+        // LTTPR is required to report 0x4 (16 ms).
+        let raw = if dpcd[0] >= 0x12 {
+            interval
+        } else if lttpr.is_some() {
+            4
+        } else {
+            0
+        };
+        let non_transparent = lttpr.is_some_and(|r| r.non_transparent);
+        let mut cr_us = 100;
+        if raw != 0 {
+            if !non_transparent {
+                cr_us = 400;
+            }
+            if raw & 0x7f != 0 {
+                cr_us = u64::from(raw & 0x7f) * 4000;
+            }
+        }
         Ok(Self {
             pattern,
-            // AMD's native CR interval uses the base DPCD 0xE byte, including
-            // its extended-capability bit for the 100/400-us default choice.
-            cr_us: if dpcd[0] < 0x12 || interval == 0 {
-                100
-            } else if interval & 0x7f == 0 {
-                400
-            } else {
-                u64::from(interval & 0x7f) * 4000
-            },
-            eq_us: if dpcd[0] < 0x12 { 400 } else { interval_us },
+            cr_us,
+            eq_us: aux_rd_interval_us(raw & 0x7f),
+            lttpr,
         })
     }
 }
@@ -178,6 +285,11 @@ fn cr_done(status: [u8; 6], lanes: u8) -> bool {
 fn eq_done(status: [u8; 6], lanes: u8) -> bool {
     // No post-LT adjustment grant is issued by this owner.
     (0..lanes).all(|l| lane_bits(status, l) & 7 == 7) && status[2] & 3 == 1
+}
+/// A repeater hop's EQ: channel EQ and symbol lock on every lane and the
+/// interlane alignment bit of its own status register.
+fn hop_eq_done(status: [u8; 6], lanes: u8) -> bool {
+    (0..lanes).all(|l| lane_bits(status, l) & 7 == 7) && status[2] & 1 == 1
 }
 fn requested_drive(status: [u8; 6], lanes: u8) -> DpDriveSettings {
     let mut drive = DpDriveSettings::default();
@@ -292,6 +404,7 @@ impl<I: Io> Engine<I> {
         &mut self,
         io: &mut impl Transport,
         plan: DpLinkTrained,
+        non_transparent: bool,
     ) -> Result<Caps, Error> {
         let path = plan.phy.path;
         let rev = read::<1>(io, path, 0).await?[0];
@@ -312,15 +425,8 @@ impl<I: Io> Engine<I> {
                 dpcd = extended;
             }
         }
-        let caps = Caps::parse(dpcd, interval, plan.phy.settings, plan.downspread)?;
-        // NACK of the optional repeater capability block means no advertised
-        // LTTPR. DEFER/timeout/protocol failures must not be mistaken for absence.
-        match read::<8>(io, path, 0xf0000).await {
-            Ok(r) if r == [0; 8] || matches!(r[0], 0x14 | 0x20) && r[2] == 0 => {}
-            Err(Error::Firmware(dmub::Error::Aux(1))) => {}
-            Ok(_) => return Err(Error::Unsupported),
-            Err(e) => return Err(e),
-        }
+        // The sink's own caps refuse before any register write.
+        Caps::parse(dpcd, interval, plan.phy.settings, plan.downspread, None)?;
         if dpcd[0] >= 0x12 && read::<1>(io, path, 0x111).await?[0] & 7 != 0 {
             return Err(Error::Busy); // active MST/up-request owner
         }
@@ -330,6 +436,34 @@ impl<I: Io> Engine<I> {
         {
             return Err(Error::Busy);
         }
+        self.dp_training_verify(plan)?;
+        // retrieve_link_cap: the LTTPR AUX timeout before reading the repeater
+        // capabilities, kept only while one is present. A NACK of the block
+        // means no LTTPR; DEFER/timeout/protocol failures are not absence.
+        self.aux_timeout(path, AUX_TIMEOUT_LTTPR_US)?;
+        let mut lttpr = match read::<10>(io, path, LTTPR_CAPS).await {
+            Ok(r) => Lttpr::parse(r, non_transparent),
+            Err(Error::Firmware(dmub::Error::Aux(1))) => None,
+            Err(e) => return Err(e),
+        };
+        if lttpr.is_none() {
+            self.aux_timeout(path, AUX_TIMEOUT_DEFAULT_US)?;
+        }
+        if let Some(r) = lttpr.as_mut() {
+            // Echo TOTAL_LTTPR_CNT downstream, then dpcd_configure_lttpr_mode:
+            // transparent first; non-transparent also reads each repeater's
+            // EQ interval.
+            write(io, path, LTTPR_TOTAL_COUNT, &mut [r.raw_count]).await?;
+            write(io, path, LTTPR_MODE, &mut [LTTPR_MODE_TRANSPARENT]).await?;
+            if r.non_transparent {
+                write(io, path, LTTPR_MODE, &mut [LTTPR_MODE_NON_TRANSPARENT]).await?;
+                for id in (1..=r.count).rev() {
+                    let at = LTTPR_AUX_RD_INTERVAL + Hop::Repeater(id).offset();
+                    r.intervals[usize::from(id - 1)] = read::<1>(io, path, at).await?[0] & 0x7f;
+                }
+            }
+        }
+        let caps = Caps::parse(dpcd, interval, plan.phy.settings, plan.downspread, lttpr)?;
         self.dp_training_verify(plan)?;
         write(io, path, 0x102, &mut [0]).await?;
         write(io, path, 0x108, &mut [1]).await?;
@@ -355,9 +489,11 @@ impl<I: Io> Engine<I> {
         pattern: TrainingPattern,
         first: bool,
         delay: u64,
+        hop: Hop,
     ) -> Result<[u8; 6], Error> {
         self.dp_training_drive(io, plan).await?;
         let mut data = [dpcd_drive(plan.drive); 5];
+        let set = hop.pattern_set();
         if first {
             data[0] = pattern as u8
                 | if pattern == TrainingPattern::Tps4 {
@@ -368,7 +504,7 @@ impl<I: Io> Engine<I> {
             write(
                 io,
                 plan.phy.path,
-                0x102,
+                set,
                 &mut data[..usize::from(plan.phy.settings.lanes) + 1],
             )
             .await?;
@@ -376,14 +512,24 @@ impl<I: Io> Engine<I> {
             write(
                 io,
                 plan.phy.path,
-                0x103,
+                set + 1,
                 &mut data[..usize::from(plan.phy.settings.lanes)],
             )
             .await?;
         }
         io.delay(delay).await;
         self.dp_training_verify(plan)?;
-        let status = read::<6>(io, plan.phy.path, 0x202).await?;
+        let status = match hop {
+            Hop::Sink => read::<6>(io, plan.phy.path, 0x202).await?,
+            Hop::Repeater(_) => {
+                // dp_get_lane_status_and_lane_adjust: lane status and
+                // alignment, then the adjust requests, in the sink's layout.
+                let lanes = read::<3>(io, plan.phy.path, LTTPR_LANE_STATUS + hop.offset()).await?;
+                let adjust =
+                    read::<2>(io, plan.phy.path, LTTPR_ADJUST_REQUEST + hop.offset()).await?;
+                [lanes[0], lanes[1], lanes[2], 0, adjust[0], adjust[1]]
+            }
+        };
         self.dp_training_verify(plan)?;
         Ok(status)
     }
@@ -392,13 +538,21 @@ impl<I: Io> Engine<I> {
         io: &mut impl Transport,
         plan: &mut DpLinkTrained,
         caps: &Caps,
+        hop: Hop,
     ) -> Result<(), Error> {
         self.dp_training_pattern(plan, TrainingPattern::Tps1)?;
         let mut same_swing = 0;
         for attempt in 0..100 {
             plan.cr_attempts = attempt + 1;
             let status = self
-                .dp_training_round(io, *plan, TrainingPattern::Tps1, attempt == 0, caps.cr_us)
+                .dp_training_round(
+                    io,
+                    *plan,
+                    TrainingPattern::Tps1,
+                    attempt == 0,
+                    caps.cr_us,
+                    hop,
+                )
                 .await?;
             if cr_done(status, plan.phy.settings.lanes) {
                 return Ok(());
@@ -424,17 +578,31 @@ impl<I: Io> Engine<I> {
         io: &mut impl Transport,
         plan: &mut DpLinkTrained,
         caps: &Caps,
+        hop: Hop,
     ) -> Result<(), Error> {
-        self.dp_training_pattern(plan, caps.pattern)?;
+        // Repeaters always equalize on TPS4 over 8b/10b, each at its own
+        // AUX_RD_INTERVAL (perform_8b_10b_channel_equalization_sequence).
+        let (pattern, delay) = match hop {
+            Hop::Sink => (caps.pattern, caps.eq_us),
+            Hop::Repeater(id) => (
+                TrainingPattern::Tps4,
+                aux_rd_interval_us(caps.lttpr.map_or(0, |r| r.intervals[usize::from(id - 1)])),
+            ),
+        };
+        self.dp_training_pattern(plan, pattern)?;
         for attempt in 0..6 {
             plan.eq_attempts = attempt + 1;
             let status = self
-                .dp_training_round(io, *plan, caps.pattern, attempt == 0, caps.eq_us)
+                .dp_training_round(io, *plan, pattern, attempt == 0, delay, hop)
                 .await?;
             if !cr_done(status, plan.phy.settings.lanes) {
                 return Err(Error::DpTraining(DpTrainingError::LinkLost));
             }
-            if eq_done(status, plan.phy.settings.lanes) {
+            let done = match hop {
+                Hop::Sink => eq_done(status, plan.phy.settings.lanes),
+                Hop::Repeater(_) => hop_eq_done(status, plan.phy.settings.lanes),
+            };
+            if done {
                 return Ok(());
             }
             plan.drive = requested_drive(status, plan.phy.settings.lanes);
@@ -482,11 +650,34 @@ impl<I: Io> Engine<I> {
         }
         self.dp_training_verify(*plan)
     }
+    /// The AUX reply timeout of `path`'s AUX engine (dce_aux_configure_timeout:
+    /// AUX_RX_TIMEOUT_LEN in 8/16/32/64-us units by multiplier, capped at 127).
+    pub(in crate::amdgpu_dcn401_otg) fn aux_timeout(
+        &mut self,
+        path: Path,
+        us: u32,
+    ) -> Result<(), Error> {
+        const INCREMENT: u32 = 1016;
+        let aux = path.aux.filter(|&a| a < 4).ok_or(Error::Invalid)?;
+        let (mul, unit) = if us <= INCREMENT {
+            (0, 8)
+        } else if us <= 2 * INCREMENT {
+            (1, 16)
+        } else if us <= 4 * INCREMENT {
+            (2, 32)
+        } else {
+            (3, 64)
+        };
+        let len = us.div_ceil(unit).min(127);
+        let at = self.layout.base + (0x16bd + 0x1c * u64::from(aux)) * 4;
+        self.update(at, 0x1_ff00, len << 8 | mul << 15)
+    }
     pub(in super::super) async fn train_dp_link(
         &mut self,
         io: &mut impl Transport,
         path: Path,
         downspread: bool,
+        non_transparent: bool,
     ) -> Result<DpLinkTrained, Error> {
         if self.status.state != State::DpPhyReady(path.transmitter) || !io.ready() {
             return Err(Error::Busy);
@@ -510,10 +701,27 @@ impl<I: Io> Engine<I> {
         }
         self.status.state = State::TrainingDp(path.transmitter);
         let mut result = async {
-            let caps = self.dp_training_sink(io, plan).await?;
+            let caps = self.dp_training_sink(io, plan, non_transparent).await?;
             plan.equalization = caps.pattern;
-            self.dp_training_cr(io, &mut plan, &caps).await?;
-            self.dp_training_eq(io, &mut plan, &caps).await?;
+            // dp_perform_8b_10b_link_training: in non-transparent mode each
+            // repeater, farthest from the sink first, is trained and then
+            // told training is done (also on failure); the drive restarts at
+            // level 0 for the next hop and for the sink.
+            if let Some(r) = caps.lttpr.filter(|r| r.non_transparent) {
+                for id in (1..=r.count).rev() {
+                    let hop = Hop::Repeater(id);
+                    let trained = async {
+                        self.dp_training_cr(io, &mut plan, &caps, hop).await?;
+                        self.dp_training_eq(io, &mut plan, &caps, hop).await
+                    }
+                    .await;
+                    write(io, path, hop.pattern_set(), &mut [0]).await?;
+                    trained?;
+                    plan.drive = DpDriveSettings::default();
+                }
+            }
+            self.dp_training_cr(io, &mut plan, &caps, Hop::Sink).await?;
+            self.dp_training_eq(io, &mut plan, &caps, Hop::Sink).await?;
             self.dp_training_finish(io, &mut plan).await
         }
         .await;
@@ -626,19 +834,33 @@ impl<I: Io> Engine<I> {
 impl Otg {
     /// # Safety
     /// Same retained direct-port and writer/resource obligations as enable_dp_phy.
-    /// No LTTPR, fixed-drive retimers, USB-C, eDP, MST or FEC. `downspread` matches
+    /// No fixed-drive retimers, USB-C, eDP, MST or FEC. `downspread` matches
     /// the PHY's board/firmware SSC setting; this operation does not change SSC.
-    /// No rate fallback or scanout. Retain owners after errors/cancellation.
+    /// `non_transparent` is the VBIOS LTTPR choice. No rate fallback or
+    /// scanout. Retain owners after errors/cancellation.
+    /// Set the AUX reply timeout of `path`'s AUX engine (us).
+    /// # Safety
+    /// Exclude concurrent AUX transactions on that engine.
+    pub(crate) unsafe fn set_aux_timeout(&mut self, path: Path, us: u32) -> Result<(), Error> {
+        self.0.aux_timeout(path, us)
+    }
+    /// The extended AUX timeout an LTTPR needs (Linux sets it before probing).
+    pub const AUX_TIMEOUT_LTTPR_US: u32 = AUX_TIMEOUT_LTTPR_US;
+    /// The default AUX timeout without one.
+    pub const AUX_TIMEOUT_DEFAULT_US: u32 = AUX_TIMEOUT_DEFAULT_US;
     pub(crate) async unsafe fn train_dp_link(
         &mut self,
         io: &mut dmub::Dmub,
         path: Path,
         downspread: bool,
+        non_transparent: bool,
     ) -> Result<DpLinkTrained, Error> {
         if !io.matches_display(self.0.io.0, self.0.layout.base) {
             return Err(Error::Invalid);
         }
-        self.0.train_dp_link(io, path, downspread).await
+        self.0
+            .train_dp_link(io, path, downspread, non_transparent)
+            .await
     }
     /// # Safety
     /// Same direct-port, writer-exclusion and memory-retention obligations. Only

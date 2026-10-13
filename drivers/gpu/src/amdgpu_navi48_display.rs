@@ -44,6 +44,9 @@ pub struct Sink {
     pub dpcd: Option<[u8; 16]>,
     /// All advertised EDID blocks, with header/checksum validation; never truncated.
     pub edid: Vec<u8>,
+    /// A DP repeater (LTTPR) chain's maximum link rate code and lane count,
+    /// which bound the link like the sink's own (dp_is_lttpr_present).
+    pub lttpr: Option<(u8, u8)>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
@@ -166,6 +169,16 @@ async fn read_edid(io: &mut impl Aux, instance: u8) -> Result<Vec<u8>, Error> {
     result
 }
 async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
+    // retrieve_link_cap reads the repeater block first; a NACK means none.
+    let mut caps = [0; 10];
+    let lttpr = match transfer(io, instance, 0x90, 0xf0000, &mut caps).await {
+        Ok(()) => {
+            let count = caps[2].count_ones() == 1;
+            (count && (1..=4).contains(&caps[4])).then_some((caps[1], caps[4]))
+        }
+        Err(Error::Transport(dmub::Error::Aux(1))) => None,
+        Err(e) => return Err(e),
+    };
     let mut dpcd = [0; 16];
     transfer(io, instance, 0x90, 0, &mut dpcd).await?;
     if !valid_dpcd(&dpcd) {
@@ -185,6 +198,7 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
     Ok(Sink {
         dpcd: Some(dpcd),
         edid: read_edid(io, instance).await?,
+        lttpr,
     })
 }
 
@@ -267,7 +281,11 @@ impl Probe {
                         let ddc = ddc.as_mut().ok_or(Error::Ddc(ddc::Error::Unsupported))?;
                         ddc.edid(path.aux.unwrap())
                             .await
-                            .map(|edid| Sink { dpcd: None, edid })
+                            .map(|edid| Sink {
+                                dpcd: None,
+                                edid,
+                                lttpr: None,
+                            })
                             .map_err(Error::Ddc)
                     }
                     _ => continue,
