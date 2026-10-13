@@ -711,6 +711,39 @@ impl ColdBoot {
         // independent IRQ service; the GC12 proofs have already drained.
         unsafe { sdma.prove_interrupts(gmc).await }
     }
+    /// Board power limits and GFX level of the configured SMU, after boot.
+    pub(crate) fn power_info(&self) -> Option<(Option<smu::Limits>, smu::GfxLevel)> {
+        let smu = self.sequence.backend.smu.as_ref()?;
+        (self.state() == State::MemoryReady && smu.power_status().is_some())
+            .then(|| (smu.limits(), smu.gfx_level()))
+    }
+    fn power_owner(&mut self) -> Result<&mut smu::Smu, Error> {
+        if self.state() != State::MemoryReady {
+            return Err(Error::Busy);
+        }
+        self.sequence.backend.smu.as_mut().ok_or(Error::Invalid)
+    }
+    /// One PMFW telemetry refresh. It shares only the PPSMC mailbox, which
+    /// this owner serializes with the display power transition.
+    pub(crate) async fn power_sample(
+        &mut self,
+    ) -> Result<crate::amdgpu_navi48_power::Sample, Error> {
+        let smu = self.power_owner()?;
+        let telemetry = smu.read_telemetry().await;
+        Ok(crate::amdgpu_navi48_power::Sample {
+            protected: telemetry.is_ok_and(|t| smu.protected(t.enabled)),
+            telemetry,
+            limits: smu.limits(),
+            gfx_level: smu.gfx_level(),
+        })
+    }
+    /// GFXCLK soft limits only; display/memory clocks stay pinned.
+    pub async fn set_gfx_level(&mut self, level: smu::GfxLevel) -> Result<(), Error> {
+        self.power_owner()?
+            .set_gfx_level(level)
+            .await
+            .map_err(Error::Smu)
+    }
     pub fn display_clock_status(&self) -> Result<clocks::Status, clocks::Error> {
         self.clocks
             .as_ref()

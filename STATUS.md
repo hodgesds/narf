@@ -640,6 +640,10 @@ firmware CTF and fan control stay PMFW-owned; protection loss is detectable.
 GFXCLK performance levels use PMFW soft limits only, leaving display clocks
 pinned. Deep sleep has an SMU-side, disabled-by-default hook: memory/fabric
 low power still needs display admission/watermark recalculation first.
+After boot, a 1 s monitor publishes this as a Linux-shaped `amdgpu` hwmon
+device (temperatures with critical/emergency limits, read-only automatic fan
+PWM/RPM, VDDGFX, power and PPT cap, sclk/mclk) and logs throttling, lost
+protection and software-shutdown temperatures. Narf reports, not powers off.
 Model-tested only; nothing here has run on an RX 9070 XT.
 The boot coordinator retains all hardware owners through failures and
 cancellation. The final framebuffer handoff selects Navi48, blocks legacy
@@ -649,7 +653,9 @@ on incomplete startup. Read-only preparation failures restore CPU writers.
 Still open: physical MSI delivery verification, queue reset and fault-source
 re-arming after containment, GC12 rendering and shader
 dispatch, production GPU VM and userspace submission, VCN5 video queues, native DCN4 clock/bandwidth/link
-and scanout programming, reset/suspend/resume, and physical RX 9070 XT testing.
+and scanout programming, THM/SMU thermal interrupts and software-CTF shutdown,
+memory/fabric DPM relaxation (display admission/watermark rework first),
+reset/suspend/resume, and physical RX 9070 XT testing.
 The verified DMA proof covers only two kernel-owned VRAM pages. The driver
 continues to report acceleration unavailable; model/QEMU tests do not prove
 working silicon, native modesetting or Mesa/Vulkan support.

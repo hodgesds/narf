@@ -288,6 +288,27 @@ latency and to install PMFW watermark ranges through the DAL mailbox; none of
 that exists yet. Layout and message constants are checked against the Linux
 headers by `tests/smu14_metrics.c`; everything is model-tested only.
 
+After a successful retained boot, `amdgpu_navi48_platform::run` starts
+`amdgpu_navi48_power`. It publishes `/sys/class/hwmon/hwmon<N>` (first free N)
+named `amdgpu` and spawns a monitor that refreshes telemetry every second,
+holding the platform owner only for each refresh, like Linux's cached metrics
+table. Attributes follow Linux amdgpu_pm.c for an SMU14.0.2 dGPU: `temp1..3`
+(edge/junction/mem) `_input/_label/_crit/_crit_hyst` (-273150)/`_emergency`;
+with PMFW fan control, read-only `pwm1` (0–255), `pwm1_enable` 2 (automatic),
+`pwm1_min/max`, `fan1_input/min/max`; `in0` (vddgfx, mV); `power1_average`,
+`power1_cap` and `power1_cap_default` in µW labelled PPT; `freq1` (sclk) and
+`freq2` (mclk) in Hz. Linux's smu_v14_0_2 provides no fan-mode or PWM setter,
+so fan control stays automatic. `power1_cap` is read-only, and `power1_input`
+and the overdrive-dependent `power1_cap_min/max` are absent. Values read empty
+until a sample or board limit exists, never as a fake zero. The monitor logs
+throttlers starting and ending, loss of a recorded protection, the first
+failed refresh, and hotspot reaching `software_shutdown_temp`. Linux powers
+off from its THM interrupt at that point; narf only reports it, and PMFW
+hardware CTF remains the protection. A clean PMFW rejection keeps polling; a
+terminal SMU failure stops the monitor. Platform diagnostics carry the latest
+snapshot, and `amdgpu_navi48_platform::set_gfx_level` applies GFX levels under
+the owner lock; no sysfs writer is wired to it yet.
+
 `unsafe amdgpu_dcn401_clk::ClockManager::new` prepares a separate DAL mailbox
 owner without hardware writes. Exact Navi48/GC12/MP1 14.0.2/3/DCN4.0.1 discovery
 is required (the native DCN4.1.0 discovery spelling is also accepted). MP1 bank

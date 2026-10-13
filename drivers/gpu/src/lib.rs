@@ -220,6 +220,7 @@ pub mod amdgpu_navi48_interrupts;
 pub mod amdgpu_navi48_kms;
 pub mod amdgpu_navi48_msi;
 pub mod amdgpu_navi48_platform;
+pub mod amdgpu_navi48_power;
 pub mod amdgpu_navi48_sources;
 #[cfg(feature = "kernel-test")]
 mod amdgpu_navi48_tests;

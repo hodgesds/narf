@@ -46,6 +46,7 @@ pub struct Diagnostics {
     pub display_pipe_clocks:
         Result<crate::amdgpu_dcn401_dccg::Status, crate::amdgpu_dcn401_dccg::Error>,
     pub display_timing: Result<crate::amdgpu_dcn401_otg::Status, crate::amdgpu_dcn401_otg::Error>,
+    pub power: Option<crate::amdgpu_navi48_power::Snapshot>,
 }
 pub fn status() -> Status {
     match OWNER.try_lock() {
@@ -63,6 +64,7 @@ pub fn status() -> Status {
                 display_clocks: boot.display_clock_status(),
                 display_pipe_clocks: boot.display_pipe_clock_status(),
                 display_timing: boot.display_timing_status(),
+                power: crate::amdgpu_navi48_power::snapshot(),
             })
         }),
     }
@@ -205,7 +207,30 @@ pub async unsafe fn run() -> Result<boot::Report, boot::Error> {
     // Boot's block_on_spin may have IF=0. Defer the CPU-delivery proof to the
     // executor; the IRQ service keeps running independently of OWNER.
     narf_scheduler::spawn(prove_queue_interrupts());
+    if let Some((limits, level)) = boot.power_info() {
+        crate::amdgpu_navi48_power::start(limits, level);
+    }
     Ok(report)
+}
+
+/// One PMFW telemetry refresh, serialized with every retained owner user.
+pub(crate) async fn power_sample() -> Result<crate::amdgpu_navi48_power::Sample, boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .power_sample()
+        .await
+}
+/// Linux `power_dpm_force_performance_level` restricted to GFXCLK soft
+/// limits. Display, memory and fabric clocks stay pinned by their owner.
+pub async fn set_gfx_level(level: crate::amdgpu_smu_navi48::GfxLevel) -> Result<(), boot::Error> {
+    let mut owner = OWNER.lock().await;
+    owner
+        .as_mut()
+        .ok_or(boot::Error::Invalid)?
+        .set_gfx_level(level)
+        .await
 }
 
 async fn prove_queue_interrupts() {
