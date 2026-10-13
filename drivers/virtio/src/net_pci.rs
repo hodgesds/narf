@@ -52,9 +52,34 @@ pub fn tx_always_kick() -> bool {
 /// (and, under SLIRP, an irqfd crossing on the single-threaded host iothread).
 static RX_NAPI: AtomicBool = AtomicBool::new(false);
 
+/// Maximum number of consecutive fast RX polls before letting another
+/// runnable task make progress. A fast poll is still immediate; this only
+/// bounds how long a CPU-pinned forwarder can occupy one executor poll when a
+/// device continuously has completions ready.
+pub(crate) const FAST_POLL_QUANTUM: u32 = 32;
+
 /// Enable NAPI RX interrupt suppression (boot param `rx_napi`).
 pub fn set_rx_napi(on: bool) {
     RX_NAPI.store(on, Ordering::Relaxed);
+}
+
+/// Account one RX polling round and report whether the fast-poll quantum has
+/// been consumed. An idle round resets the budget so the next burst gets a
+/// full immediate-poll quantum.
+#[inline]
+pub(crate) fn fast_poll_quantum_expired(rounds: &mut u32, fast: bool) -> bool {
+    if !fast {
+        *rounds = 0;
+        return false;
+    }
+
+    *rounds = rounds.saturating_add(1);
+    if *rounds >= FAST_POLL_QUANTUM {
+        *rounds = 0;
+        true
+    } else {
+        false
+    }
 }
 
 use alloc::sync::Arc;
@@ -1686,6 +1711,7 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                 // counts consecutive empty wakes.
                 const FAST_ROUNDS: u32 = 64;
                 let mut idle_rounds: u32 = FAST_ROUNDS;
+                let mut fast_rounds: u32 = 0;
                 // `wake_race` diagnostic: register the primary RX forwarder as the
                 // separately-tracked task so its own wake→dispatch tail (the
                 // RX-side blind spot io_next/rxtx_hist can't see) is isolated.
@@ -1846,26 +1872,24 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                     // re-wakes on its own RX IRQ; a poll-only pair re-checks on
                     // the 2 ms slow-poll — both per-queue, not NIC-wide.
                     let fast = idle_rounds < FAST_ROUNDS;
+                    let yield_fast = fast_poll_quantum_expired(&mut fast_rounds, fast);
                     match irq_waiter {
                         Some(w) => {
                             if fast {
                                 // NAPI sustained-poll: while frames are flowing
                                 // (recent non-empty drain), do NOT park waiting for
-                                // an RX IRQ. Under concurrent load the device
-                                // COALESCES interrupts — frames pile into the ring
-                                // faster than IRQs fire — so parking on the IRQ
-                                // leaves the vcpu HLT'd between batches (measured:
-                                // concurrent redis throughput ran ~96% vcpu-idle,
-                                // capped ~0.43x Linux despite IPC 2.08 and ~4.9M-
-                                // ops/s of CPU headroom). Instead re-queue and
-                                // re-poll the ring next round, keeping the executor
-                                // hot and the ring drained like Linux NAPI. `w` is
-                                // dropped (never polled → no waker installed);
-                                // `idle_rounds` climbs once the burst ends so we
-                                // fall to the IRQ-park below and an idle NIC still
-                                // HLTs and saves power.
+                                // an RX IRQ. Re-poll immediately while the used
+                                // ring has a burst pending, but yield once per
+                                // bounded quantum: an unbounded `continue` here
+                                // keeps this CPU-pinned stackful task inside one
+                                // executor poll and starves system services.
+                                // `yield_now` self-wakes, so the forwarder resumes
+                                // without relying on a new RX interrupt.
                                 drop(w);
-                                narf_scheduler::yield_now().await;
+                                if yield_fast {
+                                    narf_scheduler::yield_now().await;
+                                }
+                                continue;
                             } else {
                                 // Register-then-recheck (Linux
                                 // virtqueue_enable_cb): arm the used-ring
@@ -1903,7 +1927,13 @@ fn register_net_interface(idx: usize, bus_info: alloc::string::String) {
                         }
                         None => {
                             if fast {
-                                narf_scheduler::yield_now().await;
+                                // Same bounded immediate poll for a queue without
+                                // an IRQ vector. Its periodic cooperative yield
+                                // requeues the forwarder without needing an IRQ.
+                                if yield_fast {
+                                    narf_scheduler::yield_now().await;
+                                }
+                                continue;
                             } else {
                                 narf_time::sleep_cycles(slow_poll_cycles).await;
                             }
