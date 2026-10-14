@@ -90,6 +90,13 @@ impl<I: Io> Engine<I> {
         timing: Option<u8>,
     ) -> Result<(), Error> {
         let l = self.layout;
+        let s = self.displays.siblings;
+        if s.transmitters & bit(phy) != 0
+            || frontend.is_some_and(|f| s.streams & bit(f) != 0)
+            || timing.is_some_and(|p| s.pipes & bit(p) != 0)
+        {
+            return Err(Error::Busy); // another display's
+        }
         let at = |r| DpStream::Dio(phy).at(l, r);
         // The selected backend/PHY and any retained frontend/timing have their
         // own configuration and transition witnesses. All unrelated consumers
@@ -108,6 +115,7 @@ impl<I: Io> Engine<I> {
                         .any(|&r| reg == DpStream::Dio(f).at(l, r))
                 })
                 || timing.is_some_and(|p| reg == l.otg(p, CONTROL) || reg == l.otg(p, CLOCK))
+                || self.sibling_register(reg)
             {
                 continue;
             }
@@ -127,16 +135,26 @@ impl<I: Io> Engine<I> {
         }
         let bank1 = l.link_clock - 0x66 * 4;
         let sources = self.read(bank1 + 0x68 * 4)?;
+        let siblings = self.displays.siblings;
         for p in 0..4 {
-            if frontend != Some(p) {
+            // Another display's stream and clock route are its own.
+            let other = |mask: u8| mask & 1 << p != 0;
+            if frontend != Some(p) && !other(siblings.streams) {
                 self.dp_encoder_quiet(DpStream::Dio(p))?;
             }
             self.dp_encoder_quiet(DpStream::Hpo(p))?;
-            if (frontend != Some(p) && self.read(l.dio_clock + u64::from(p) * 4)? & 0x10 != 0)
+            if (frontend != Some(p)
+                && !other(siblings.streams)
+                && self.read(l.dio_clock + u64::from(p) * 4)? & 0x10 != 0)
                 || self.read(l.otg(p, LOCK))? & 0x101 != 0
                 || self.read(l.otg(p, CLOCK))? & 0x10 != 0
             {
                 return Err(Error::Busy);
+            }
+            // Another display's running timing has its own pixel source
+            // (its PHY, for TMDS); it never feeds from this PHY.
+            if other(siblings.pipes) {
+                continue;
             }
             // Prepared, stopped timing may retain clocks only from a live
             // DPREF/DTB DTO. Never start or stop a PHY feeding TMDS timing.
@@ -431,7 +449,10 @@ impl Otg {
         if !firmware.matches_display(self.0.io.0, self.0.layout.base) {
             return Err(Error::Invalid);
         }
-        clocks.pipe_clocks(self.0.io.0).map_err(Error::Clocks)?;
+        let (held, layout) = self.0.held();
+        clocks
+            .pipe_clocks_except(self.0.io.0, &|at| held_by_sibling(held, layout, at))
+            .map_err(Error::Clocks)?;
         self.0.enable_dp_phy(firmware, path, settings).await
     }
     /// # Safety

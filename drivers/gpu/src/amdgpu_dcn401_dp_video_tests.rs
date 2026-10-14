@@ -165,6 +165,7 @@ fn fixture_reference(
             authority: e.authority,
             layout: e.layout,
             status: e.status,
+            displays: e.displays,
         },
         io,
         c,

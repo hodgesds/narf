@@ -118,6 +118,7 @@ fn fixture_range(
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     };
     (engine, io, c)
 }

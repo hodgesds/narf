@@ -110,6 +110,7 @@ fn ready(off: u8) -> Engine<PowerIo> {
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     }
 }
 

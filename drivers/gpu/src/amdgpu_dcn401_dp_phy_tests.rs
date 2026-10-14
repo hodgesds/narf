@@ -202,6 +202,7 @@ fn fixture(p: u8, lanes: u8) -> (Engine<PhyIo>, Firmware) {
             authority: e.authority,
             layout: e.layout,
             status: e.status,
+            displays: e.displays,
         },
         firmware,
     )
@@ -558,4 +559,65 @@ fn dcn401_dp_phy_disable_checks_ownership_and_all_off_witnesses() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_phy_disable_checks_ownership_and_all_off_witnesses
+);
+
+/// Another display's running pipe, transmitter and stream are its own:
+/// their consumer registers do not block this PHY, the same registers are
+/// still foreign without that display, and its transmitter is never taken.
+fn dcn401_dp_phy_leaves_other_displays_consumers_to_them() -> TestResult {
+    let theirs = Siblings {
+        pipes: 1 << 0,
+        det: 1 << 0,
+        transmitters: 1 << 1,
+        streams: 1 << 3,
+        live: [None; 4],
+    };
+    let running = |e: &mut Engine<PhyIo>| {
+        let l = e.layout;
+        for (at, value) in [
+            (l.otg(0, CONTROL), 0x10001),
+            (l.otg(0, CLOCK), 0x10103),
+            (l.odm(0, INPUT_CLOCK), 7),
+            (l.vtg(0), 0x80000000),
+            // TMDS timing: the pixel clock comes from its PHY, not a DTO.
+            (0x16200 * 4 + 0x80 * 4, 0),
+            (dio(1, 0x20bb), 0x2810),
+            (dio(1, 0x20bd), 1),
+            (phy(1, 0x2943), 0x03030303),
+            (phy(1, 0x2931), 0x6f0),
+            (dio(3, 0x2094), 0x2c10),
+            (dio(3, 0x2095), 1),
+            (dio(3, 0x209b), 1),
+            (dio(3, 0x2122), 0x10001),
+            (dio(3, 0x2141), 0x1ff11111),
+            (e.layout.dio_clock + 3 * 4, 0x10),
+        ] {
+            e.io.inner.regs.insert(at, value);
+        }
+    };
+    let (mut e, mut f) = fixture(2, 3);
+    running(&mut e);
+    if run(e.enable_dp_phy(&mut f, path(2), settings(2))).is_ok() {
+        return TestResult::Fail("foreign running consumers ignored");
+    }
+    let (mut e, mut f) = fixture(2, 3);
+    running(&mut e);
+    e.displays.siblings = theirs;
+    if run(e.enable_dp_phy(&mut f, path(2), settings(2))).is_err()
+        || run(e.disable_dp_phy(&mut f, path(2))).is_err()
+    {
+        return TestResult::Fail("another display's consumers blocked this PHY");
+    }
+    let (mut e, mut f) = fixture(1, 3);
+    e.displays.siblings = theirs;
+    if run(e.enable_dp_phy(&mut f, path(1), settings(2))) != Err(Error::Busy)
+        || !f.commands.is_empty()
+    {
+        return TestResult::Fail("another display's transmitter taken");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_phy_leaves_other_displays_consumers_to_them
 );

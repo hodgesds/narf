@@ -279,8 +279,11 @@ impl<I: Io> Engine<I> {
         Ok(())
     }
     fn idle(&mut self) -> Result<(), Error> {
+        self.idle_except(&|_| false)
+    }
+    fn idle_except(&mut self, held: &dyn Fn(u64) -> bool) -> Result<(), Error> {
         for (at, mask) in self.layout.idle {
-            if self.read(at)? & mask != 0 {
+            if !held(at) && self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
         }
@@ -385,8 +388,17 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
+    #[cfg(feature = "kernel-test")]
     fn current_pipe(&mut self, pipe: u8, global: clocks::Applied) -> Result<Applied, Error> {
-        self.idle()?;
+        self.current_pipe_except(pipe, global, &|_| false)
+    }
+    fn current_pipe_except(
+        &mut self,
+        pipe: u8,
+        global: clocks::Applied,
+        held: &dyn Fn(u64) -> bool,
+    ) -> Result<Applied, Error> {
+        self.idle_except(held)?;
         self.retained_pipe(pipe, global)
     }
     fn retained_pipe(&mut self, pipe: u8, global: clocks::Applied) -> Result<Applied, Error> {
@@ -584,17 +596,23 @@ impl Dccg {
     }
     /// Current, readback-checked clock snapshot for the matching timing owner.
     /// TMDS still requires a separately programmed PHY PLL before transmission.
-    pub(crate) fn timing_clock(
+    /// The pipe's acknowledged clocks with every consumer idle, except the
+    /// registers `held` names: the display owner's other running displays,
+    /// which that owner verifies itself.
+    pub(crate) fn timing_clock_except(
         &mut self,
         regs: MmioRegion,
         clocks: &mut clocks::ClockManager,
         pipe: u8,
+        held: &dyn Fn(u64) -> bool,
     ) -> Result<Applied, Error> {
         if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
             return Err(Error::Invalid);
         }
-        let global = clocks.pipe_clocks(regs).map_err(Error::Clocks)?;
-        self.0.current_pipe(pipe, global)
+        let global = clocks
+            .pipe_clocks_except(regs, held)
+            .map_err(Error::Clocks)?;
+        self.0.current_pipe_except(pipe, global, held)
     }
     /// Read-only clock validation while the matching display owner retains a
     /// live PHY/frontend. All programming paths still require idle consumers.

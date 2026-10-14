@@ -132,6 +132,7 @@ fn ready(phy: u8, link: u8) -> (Engine<PhyIo>, Firmware) {
             authority: e.authority,
             layout: e.layout,
             status: e.status,
+            displays: e.displays,
         },
         fw,
     )

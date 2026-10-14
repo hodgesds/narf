@@ -132,6 +132,7 @@ fn fixture(p: u8, routes: u8) -> (Engine<Model>, Firmware) {
             authority: e.authority,
             layout: e.layout,
             status: e.status,
+            displays: e.displays,
         },
         fw,
     )

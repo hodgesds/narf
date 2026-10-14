@@ -277,10 +277,14 @@ impl<I: Io> Engine<I> {
             .map_err(|_| Error::Revoked)?
     }
     fn idle(&mut self) -> Result<(), Error> {
+        self.idle_except(&|_| false)
+    }
+    /// `idle`, leaving the registers `held` claims to their display owner.
+    fn idle_except(&mut self, held: &dyn Fn(u64) -> bool) -> Result<(), Error> {
         let regs = self.layout.idle_registers();
         self.access(|io| {
             for (at, mask) in regs {
-                if checked(io.read(at))? & mask != 0 {
+                if !held(at) && checked(io.read(at))? & mask != 0 {
                     return Err(Error::Busy);
                 }
             }
@@ -549,8 +553,17 @@ impl ClockManager {
     /// Only the matching retained DCCG owner may consume these references.
     /// Historical success after a failed/in-flight transition is insufficient.
     pub(crate) fn pipe_clocks(&mut self, regs: MmioRegion) -> Result<Applied, Error> {
+        self.pipe_clocks_except(regs, &|_| false)
+    }
+    /// `pipe_clocks` while other displays of the same display owner run:
+    /// `held` names their consumer registers, which that owner verifies.
+    pub(crate) fn pipe_clocks_except(
+        &mut self,
+        regs: MmioRegion,
+        held: &dyn Fn(u64) -> bool,
+    ) -> Result<Applied, Error> {
         let applied = self.retained_pipe_clocks(regs)?;
-        self.0.idle()?;
+        self.0.idle_except(held)?;
         Ok(applied)
     }
     /// Read-only reference for an exclusive display owner with live consumers.

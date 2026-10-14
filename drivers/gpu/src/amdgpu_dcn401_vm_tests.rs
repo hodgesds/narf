@@ -99,6 +99,7 @@ fn staged_with(
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     };
     (backing, pool, engine, surfaces)
 }

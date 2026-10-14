@@ -843,6 +843,26 @@ impl ColdBoot {
     pub fn display_timing_status(&self) -> Result<otg::Status, otg::Error> {
         self.otg.as_ref().map(otg::Otg::status).map_err(|e| *e)
     }
+    /// Make `display` (0-3) the one following display operations address;
+    /// see `Otg::select_display`. Global and pipe clocks are programmed with
+    /// every display idle, so a configuration's clocks precede its first
+    /// display.
+    pub fn select_display(&mut self, display: u8) -> Result<(), otg::Error> {
+        self.otg.as_mut().map_err(|e| *e)?.select_display(display)
+    }
+    pub fn selected_display(&self) -> Result<u8, otg::Error> {
+        self.otg
+            .as_ref()
+            .map(otg::Otg::selected_display)
+            .map_err(|e| *e)
+    }
+    /// Any display's records.
+    pub fn display_status(&self, display: u8) -> Result<Option<otg::Status>, otg::Error> {
+        self.otg
+            .as_ref()
+            .map(|o| o.display_status(display))
+            .map_err(|e| *e)
+    }
     /// Prepare native timing while retaining its matching clock owners.
     /// The generator remains disabled; this does not establish scanout readiness.
     pub async fn prepare_display_timing(

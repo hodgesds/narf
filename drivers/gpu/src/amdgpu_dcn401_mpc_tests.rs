@@ -63,6 +63,7 @@ fn ready_mpc_range(
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     };
     let f = &mut e.io.surface.inner;
     for (at, mask, value) in rgb(p, depth) {

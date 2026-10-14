@@ -36,11 +36,13 @@ impl<I: Io> Engine<I> {
     pub(super) fn hubp_tree_stopped(&mut self, staged: Option<u8>) -> Result<(), Error> {
         let l = self.layout;
         for (at, mask) in l.idle {
-            if self.read(at)? & mask != 0 {
+            if !self.sibling_register(at) && self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
         }
-        for p in 0..4 {
+        // Other displays' pipes run; fetchers_stopped checks their fetch.
+        let kept = self.displays.siblings.pipes;
+        for p in (0..4).filter(|p| kept & 1 << p == 0) {
             if self.read(l.otg(p, LOCK))? & 0x101 != 0
                 || self.read(l.otg(p, CLOCK))? & 0x10 != 0
                 || self.read(l.otg(p, GSL))? & 0x8000000f != 0

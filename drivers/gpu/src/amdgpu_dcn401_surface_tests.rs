@@ -98,6 +98,7 @@ fn fixture(p: u8, bytes: usize) -> (Vec<u32>, Pool, Engine<SurfaceIo>, Surfaces)
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     };
     (backing, pool, engine, Surfaces::new())
 }

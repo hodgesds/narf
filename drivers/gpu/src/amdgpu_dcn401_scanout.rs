@@ -374,6 +374,20 @@ impl<I: Io> Engine<I> {
         pipe: u8,
         address: u64,
     ) -> Result<(), Error> {
+        let cursor = self
+            .status
+            .cursor
+            .is_some_and(|c| c.pipe == pipe && c.visible);
+        self.live_fetch_with(pipe, address, cursor)
+    }
+    /// `live_fetch` with the cursor's visibility given: another display's
+    /// live pipe is checked against that display's records.
+    pub(in crate::amdgpu_dcn401_otg) fn live_fetch_with(
+        &mut self,
+        pipe: u8,
+        address: u64,
+        cursor: bool,
+    ) -> Result<(), Error> {
         let l = self.layout;
         for (at, mask, value) in [
             (l.hubp(pipe, HUBP_CONTROL), BLANK_EN | 4 | TTU_DISABLE, 0),
@@ -381,15 +395,7 @@ impl<I: Io> Engine<I> {
             (self.dpp_control(pipe), DPP_CLOCK_ENABLE, DPP_CLOCK_ENABLE),
             (l.opp(pipe, DPG), DPG_FIELDS, 0),
             (l.mpcc(pipe, MPC_STATUS), 4, 0),
-            (
-                l.hubp(pipe, CURSOR),
-                1,
-                u32::from(
-                    self.status
-                        .cursor
-                        .is_some_and(|c| c.pipe == pipe && c.visible),
-                ),
-            ),
+            (l.hubp(pipe, CURSOR), 1, u32::from(cursor)),
             (l.hubp(pipe, ADDRESS), u32::MAX, address as u32),
             (l.hubp(pipe, ADDRESS_HIGH), 0xffff, (address >> 32) as u32),
             (l.hubp(pipe, EARLIEST_INUSE), u32::MAX, address as u32),

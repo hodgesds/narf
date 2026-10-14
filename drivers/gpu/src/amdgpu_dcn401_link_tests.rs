@@ -124,6 +124,7 @@ fn fixture(p: u8, fe: u8) -> (Engine<LinkIo>, Firmware) {
             authority: e.authority,
             layout: e.layout,
             status: e.status,
+            displays: e.displays,
         },
         firmware,
     )

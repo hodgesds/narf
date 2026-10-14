@@ -258,6 +258,7 @@ fn fixture(p: u8, lanes: u8, rate: LinkRate, pattern: TrainingPattern) -> (Engin
             authority: e.authority,
             layout: e.layout,
             status: e.status,
+            displays: e.displays,
         },
         link,
     )

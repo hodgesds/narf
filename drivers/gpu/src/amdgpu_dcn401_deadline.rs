@@ -367,11 +367,14 @@ impl Otg {
         crystal_khz: u32,
     ) -> Result<DeadlinesApplied, Error> {
         let regs = self.0.io.0;
+        let (held, layout) = self.0.held();
         self.1
             .prepare_deadlines(&mut self.0, pipe, plan, crystal_khz, || {
                 Ok((
-                    dccg.timing_clock(regs, clocks, pipe)
-                        .map_err(Error::PipeClocks)?,
+                    dccg.timing_clock_except(regs, clocks, pipe, &|at| {
+                        held_by_sibling(held, layout, at)
+                    })
+                    .map_err(Error::PipeClocks)?,
                     gmc.display_context(regs).map_err(Error::Memory)?,
                 ))
             })

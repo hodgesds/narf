@@ -212,6 +212,18 @@ impl State {
         )
     }
 }
+impl State {
+    /// A state another display may be selected from: idle, or video
+    /// running with or without scanout. Anything mid-operation or failed
+    /// keeps the selection (a failure quarantines every display).
+    pub(crate) fn settled(self) -> bool {
+        self.reusable()
+            || matches!(
+                self,
+                Self::ScanoutRunning(_) | Self::DpVideoRunning(_) | Self::HdmiVideoRunning(_)
+            )
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     DisplayPort,
@@ -335,6 +347,46 @@ pub struct Status {
     pub frl_disabled: Option<FrlDisabled>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
     pub retired: u8,
+}
+impl Status {
+    fn new() -> Self {
+        Self {
+            state: State::Ready,
+            pipes: [None; 4],
+            blanks: [None; 4],
+            running_blank: None,
+            planes_retired: None,
+            hubp_power: [None; 4],
+            surfaces: [None; 4],
+            memory: [None; 4],
+            dpps: [None; 4],
+            mpcs: [None; 4],
+            requestor: None,
+            deadlines: None,
+            scanout: None,
+            underflow: None,
+            cursor: None,
+            dp_blanked: None,
+            dp_encoder_retired: None,
+            dp_sst_disabled: None,
+            dp_phy_ready: None,
+            dp_link_trained: None,
+            dp_frontend_ready: None,
+            dp_video_running: None,
+            hpo_link_retired: None,
+            hpo_dp_disabled: None,
+            hdmi_tmds_retired: None,
+            hdmi_link_ready: None,
+            hdmi_video_running: None,
+            hdmi_audio: None,
+            tmds_timing_retired: None,
+            tmds_disabled: None,
+            frl_encoder_retired: None,
+            frl_link_retired: None,
+            frl_disabled: None,
+            retired: 0,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug)]
 struct Plan {
@@ -534,6 +586,129 @@ fn checked(v: u32) -> Result<u32, Error> {
         Ok(v)
     }
 }
+/// What the displays other than the selected one hold, by instance bit:
+/// the registers each idle check must leave to them, and their live
+/// scanouts (pipe-indexed: surface address and cursor visibility), which are
+/// verified as live rather than stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Siblings {
+    pub pipes: u8,
+    /// Pipes holding a DET allocation (a staged requestor).
+    pub det: u8,
+    pub transmitters: u8,
+    pub streams: u8,
+    pub live: [Option<(u64, bool)>; 4],
+}
+/// An instance's bit in a `Siblings` mask; none for an instance past 7.
+pub(crate) fn bit(instance: u8) -> u8 {
+    1u8.checked_shl(u32::from(instance)).unwrap_or(0)
+}
+impl Siblings {
+    /// The resources one display's records hold. Pipes count from the first
+    /// staged record until retirement; a link only while its video runs
+    /// (with or without scanout), the one state a display may be left in
+    /// while another is selected besides an idle one.
+    fn of(s: &Status) -> Self {
+        let mut out = Self::default();
+        for p in 0..4u8 {
+            let i = usize::from(p);
+            let staged = s.pipes[i].is_some()
+                || s.blanks[i].is_some()
+                || s.surfaces[i].is_some()
+                || s.dpps[i].is_some()
+                || s.mpcs[i].is_some()
+                || s.requestor.is_some_and(|r| r.pipe == p)
+                || s.deadlines.is_some_and(|d| d.pipe == p);
+            if staged {
+                out.pipes |= 1 << p;
+            }
+        }
+        if let Some(r) = s.requestor {
+            out.det |= bit(r.pipe);
+        }
+        let (stream, link) = match s.state {
+            State::HdmiVideoRunning(stream) => (stream, s.hdmi_video_running.map(|v| v.link.path)),
+            State::DpVideoRunning(stream) => {
+                (stream, s.dp_video_running.map(|v| v.frontend.link.phy.path))
+            }
+            State::ScanoutRunning(p) => {
+                let Some(live) = s.scanout else {
+                    return out;
+                };
+                out.pipes |= bit(p);
+                if let Some(slot) = out.live.get_mut(usize::from(p)) {
+                    *slot = Some((
+                        live.address,
+                        s.cursor.is_some_and(|c| c.pipe == p && c.visible),
+                    ));
+                }
+                let hdmi = s
+                    .hdmi_video_running
+                    .filter(|v| v.link.request.stream == live.stream)
+                    .map(|v| v.link.path);
+                let dp = s
+                    .dp_video_running
+                    .filter(|v| v.frontend.request.stream == live.stream)
+                    .map(|v| v.frontend.link.phy.path);
+                (live.stream, hdmi.or(dp))
+            }
+            _ => return out,
+        };
+        if let Some(path) = link {
+            out.transmitters |= bit(path.transmitter);
+            out.streams |= bit(stream);
+        }
+        out
+    }
+    fn union(self, other: Self) -> Self {
+        let mut live = self.live;
+        for (slot, other) in live.iter_mut().zip(other.live) {
+            *slot = slot.or(other);
+        }
+        Self {
+            pipes: self.pipes | other.pipes,
+            det: self.det | other.det,
+            transmitters: self.transmitters | other.transmitters,
+            streams: self.streams | other.streams,
+            live,
+        }
+    }
+}
+/// Whether an idle-check register belongs to another display: its pipe's
+/// timing generator, its transmitter's backend and PHY, or its DIO
+/// frontend. Those are that display's to verify, not foreign.
+fn held_by_sibling(s: Siblings, l: Layout, at: u64) -> bool {
+    let phy = |i: u8, r: u64| l.base + (r + u64::from(i) * 0xd8) * 4;
+    (0..4u8).any(|i| {
+        let b = bit(i);
+        let dio = |r| stream::DpStream::Dio(i).at(l, r);
+        (s.pipes & b != 0 && (at == l.otg(i, CONTROL) || at == l.otg(i, CLOCK)))
+            || (s.transmitters & b != 0
+                && [dio(0x20bb), dio(0x20bd), phy(i, 0x2943), phy(i, 0x2931)].contains(&at))
+            || (s.streams & b != 0
+                && [0x2094, 0x2095, 0x209b, 0x2122]
+                    .iter()
+                    .any(|&r| at == dio(r)))
+    })
+}
+/// The records of every display this owner drives. The selected display's
+/// are `Engine::status`; `parked[selected]` is stale while it is selected.
+#[derive(Debug)]
+struct Displays {
+    selected: u8,
+    parked: [Status; 4],
+    /// The other displays' resources, fixed while this one is selected.
+    siblings: Siblings,
+}
+impl Displays {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            selected: 0,
+            parked: [Status::new(); 4],
+            siblings: Siblings::default(),
+        })
+    }
+}
 #[derive(Debug)]
 struct Engine<I: Io> {
     io: I,
@@ -542,8 +717,41 @@ struct Engine<I: Io> {
     // Per-pipe historical reports are large. Keep them out of async owner
     // moves and nested call frames, including the 64 KiB aarch64 boot stack.
     status: Box<Status>,
+    displays: Box<Displays>,
 }
 impl<I: Io> Engine<I> {
+    /// Make `display`'s records current, parking the selected display's,
+    /// and recompute what the others hold. Only between operations, from a
+    /// settled state.
+    fn select_display(&mut self, display: u8) -> Result<(), Error> {
+        if display >= 4 {
+            return Err(Error::Invalid);
+        }
+        if display == self.displays.selected {
+            return Ok(());
+        }
+        if !self.status.state.settled() {
+            return Err(Error::Busy);
+        }
+        let d = &mut *self.displays;
+        d.parked[usize::from(d.selected)] = *self.status;
+        *self.status = d.parked[usize::from(display)];
+        d.selected = display;
+        d.siblings = (0..4u8)
+            .filter(|&k| k != display)
+            .fold(Siblings::default(), |acc, k| {
+                acc.union(Siblings::of(&d.parked[usize::from(k)]))
+            });
+        Ok(())
+    }
+    /// Whether an idle-check register belongs to another display.
+    fn sibling_register(&self, at: u64) -> bool {
+        held_by_sibling(self.displays.siblings, self.layout, at)
+    }
+    /// What `held_by_sibling` needs, for the clock owners' idle checks.
+    fn held(&self) -> (Siblings, Layout) {
+        (self.displays.siblings, self.layout)
+    }
     /// `hubbub2_get_dchub_ref_freq`: the DCHUB global timer divides the DCCG
     /// reference (the VBIOS crystal on DCN401) by its REFDIV. Firmware set it
     /// up; this owner never reprograms it. Linux treats a stopped timer or a
@@ -617,10 +825,15 @@ impl<I: Io> Engine<I> {
         if pipe >= 4 {
             return Err(Error::Invalid);
         }
+        // Another display's pipe is never this operation's to retire or
+        // program, and its consumers are its own.
+        if self.displays.siblings.pipes & 1 << pipe != 0 {
+            return Err(Error::Busy);
+        }
         let l = self.layout;
         for (at, mask) in l.idle {
             let timing = (0..4).any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));
-            if !(retire && timing) && self.read(at)? & mask != 0 {
+            if !(self.sibling_register(at) || retire && timing) && self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
         }
@@ -752,48 +965,37 @@ impl Otg {
                 io: Mmio(gpu.regs),
                 authority,
                 layout,
-                status: Box::new(Status {
-                    state: State::Ready,
-                    pipes: [None; 4],
-                    blanks: [None; 4],
-                    running_blank: None,
-                    planes_retired: None,
-                    hubp_power: [None; 4],
-                    surfaces: [None; 4],
-                    memory: [None; 4],
-                    dpps: [None; 4],
-                    mpcs: [None; 4],
-                    requestor: None,
-                    deadlines: None,
-                    scanout: None,
-                    underflow: None,
-                    cursor: None,
-                    dp_blanked: None,
-                    dp_encoder_retired: None,
-                    dp_sst_disabled: None,
-                    dp_phy_ready: None,
-                    dp_link_trained: None,
-                    dp_frontend_ready: None,
-                    dp_video_running: None,
-                    hpo_link_retired: None,
-                    hpo_dp_disabled: None,
-                    hdmi_tmds_retired: None,
-                    hdmi_link_ready: None,
-                    hdmi_video_running: None,
-                    hdmi_audio: None,
-                    tmds_timing_retired: None,
-                    tmds_disabled: None,
-                    frl_encoder_retired: None,
-                    frl_link_retired: None,
-                    frl_disabled: None,
-                    retired: 0,
-                }),
+                status: Box::new(Status::new()),
+                displays: Displays::new(),
             },
             fetch::Surfaces::new(),
         ))
     }
     pub fn status(&self) -> Status {
         *self.0.status
+    }
+    /// Make `display` (0-3) the one every following operation addresses.
+    /// Each display keeps its own records; the other displays' pipes,
+    /// links and live scanouts are left to them by every idle check. Refused
+    /// while the selected display is mid-operation or failed.
+    pub fn select_display(&mut self, display: u8) -> Result<(), Error> {
+        self.0.select_display(display)
+    }
+    pub fn selected_display(&self) -> u8 {
+        self.0.displays.selected
+    }
+    /// Any display's records, the selected one's current.
+    pub fn display_status(&self, display: u8) -> Option<Status> {
+        let d = &self.0.displays;
+        if display == d.selected {
+            Some(*self.0.status)
+        } else {
+            d.parked.get(usize::from(display)).copied()
+        }
+    }
+    /// What the displays other than the selected one hold.
+    pub fn siblings(&self) -> Siblings {
+        self.0.displays.siblings
     }
     /// Prepare disabled fixed-refresh RGB timing against matching current
     /// clocks. No OPP/plane/PHY setup, bandwidth proof or scanout enable.
@@ -807,8 +1009,11 @@ impl Otg {
         if !self.0.status.state.reusable() {
             return Err(Error::Busy);
         }
+        let (held, layout) = self.0.held();
         let clock = dccg
-            .timing_clock(self.0.io.0, clocks, request.pipe)
+            .timing_clock_except(self.0.io.0, clocks, request.pipe, &|at| {
+                held_by_sibling(held, layout, at)
+            })
             .map_err(Error::PipeClocks)?;
         self.0.prepare(request, clock).await
     }

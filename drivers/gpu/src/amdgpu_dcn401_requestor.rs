@@ -21,9 +21,15 @@ pub struct RequestorApplied {
     pub pixel_chunk_bytes: u32,
     pub minimum_chunk_bytes: u32,
 }
-fn allocation(pipe: u8) -> [u8; 5] {
-    let mut sizes = [SEGMENTS - DET_SEGMENTS, 0, 0, 0, 0];
-    sizes[usize::from(pipe) + 1] = DET_SEGMENTS;
+/// dcn401_program_det_segments/compbuf_segments for the pipes in `det`:
+/// each the default DET, the rest of the CRB compressed buffer (with four
+/// pipes, DML's one-segment minimum).
+fn allocation(det: u8) -> [u8; 5] {
+    let mut sizes = [SEGMENTS, 0, 0, 0, 0];
+    for p in (0..4).filter(|p| det & 1 << p != 0) {
+        sizes[p + 1] = DET_SEGMENTS;
+        sizes[0] -= DET_SEGMENTS;
+    }
     sizes
 }
 fn requestor(pipe: u8) -> [(u64, u32, u32); 7] {
@@ -101,7 +107,7 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
-    pub(super) fn verify_requestor(&mut self, pipe: u8) -> Result<(), Error> {
+    pub(in crate::amdgpu_dcn401_otg) fn verify_requestor(&mut self, pipe: u8) -> Result<(), Error> {
         self.verify_requestor_with(pipe, 0)
     }
     /// The requestor of a pipe whose fetch may be live: an underflow there
@@ -111,8 +117,12 @@ impl<I: Io> Engine<I> {
     pub(super) fn verify_live_requestor(&mut self, pipe: u8) -> Result<(), Error> {
         self.verify_requestor_with(pipe, HUBP_UNDERFLOW_STATUS)
     }
+    /// This pipe's DET with every other display's.
+    fn det_pipes(&self, pipe: u8) -> u8 {
+        bit(pipe) | self.displays.siblings.det
+    }
     fn verify_requestor_with(&mut self, pipe: u8, tolerated: u32) -> Result<(), Error> {
-        if self.crb_stable()? != allocation(pipe) {
+        if self.crb_stable()? != allocation(self.det_pipes(pipe)) {
             return Err(Error::Busy);
         }
         let reserved = self.layout.base + 0x4c4 * 4;
@@ -153,7 +163,7 @@ impl Surfaces {
         e.verify_mpc(a)?;
         e.requestor_errors(pipe)?;
         let mut sizes = e.crb_stable()?;
-        let target = allocation(pipe);
+        let target = allocation(e.det_pipes(pipe));
         let surface = a.dpp.surface;
         // Linear RGB stores one row per swath; leave room for at least two.
         if u64::from(surface.pitch_bytes) * 2 > u64::from(DET_SEGMENTS) * u64::from(SEGMENT_BYTES) {
@@ -201,7 +211,7 @@ impl Surfaces {
                     pipe,
                     surface,
                     det_bytes: u32::from(DET_SEGMENTS) * SEGMENT_BYTES,
-                    compbuf_bytes: u32::from(SEGMENTS - DET_SEGMENTS) * SEGMENT_BYTES,
+                    compbuf_bytes: u32::from(target[0]) * SEGMENT_BYTES,
                     pixel_chunk_bytes: 8192,
                     minimum_chunk_bytes: 1024,
                 };
@@ -230,11 +240,14 @@ impl Otg {
         pipe: u8,
     ) -> Result<RequestorApplied, Error> {
         let regs = self.0.io.0;
+        let (held, layout) = self.0.held();
         self.1
             .prepare_requestor(&mut self.0, pipe, || {
                 Ok((
-                    dccg.timing_clock(regs, clocks, pipe)
-                        .map_err(Error::PipeClocks)?,
+                    dccg.timing_clock_except(regs, clocks, pipe, &|at| {
+                        held_by_sibling(held, layout, at)
+                    })
+                    .map_err(Error::PipeClocks)?,
                     gmc.display_context(regs).map_err(Error::Memory)?,
                 ))
             })

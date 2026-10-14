@@ -183,6 +183,7 @@ impl<I: Io> Engine<I> {
             for (at, mask) in l.idle {
                 if at != l.otg(pipe, CONTROL)
                     && at != l.otg(pipe, CLOCK)
+                    && !self.sibling_register(at)
                     && self.read(at)? & mask != 0
                 {
                     return Err(Error::Busy);
@@ -226,8 +227,11 @@ impl Otg {
         if pipe >= 4 {
             return Err(Error::Invalid);
         }
+        let (held, layout) = self.0.held();
         let clock = dccg
-            .timing_clock(self.0.io.0, clocks, pipe)
+            .timing_clock_except(self.0.io.0, clocks, pipe, &|at| {
+                held_by_sibling(held, layout, at)
+            })
             .map_err(Error::PipeClocks)?;
         self.0.start_blank(pipe, clock).await
     }

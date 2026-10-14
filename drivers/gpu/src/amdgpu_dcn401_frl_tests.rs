@@ -117,6 +117,7 @@ fn fixture(pipe: u8) -> Engine<Model> {
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     }
 }
 

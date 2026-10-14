@@ -124,6 +124,7 @@ fn ready_requests_with(
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     };
     (backing, pool, e, surfaces, clock)
 }
@@ -345,4 +346,39 @@ fn dcn401_requestor_rechecks_resources_after_buffer_acknowledgement() -> TestRes
 kernel_test_in!(
     "drivers/gpu/dcn401-requestor",
     dcn401_requestor_rechecks_resources_after_buffer_acknowledgement
+);
+
+/// With other displays holding DET, a pipe's requestor adds its own default
+/// DET beside theirs and the compressed buffer keeps the rest of the CRB.
+fn dcn401_requestor_shares_the_crb_with_other_displays() -> TestResult {
+    let p = 2;
+    for (others, sizes, want) in [
+        (0b0001u8, [16, 5, 0, 0, 0], [11u8, 5, 0, 5, 0]),
+        (0b1011, [6, 5, 5, 0, 5], [1, 5, 5, 5, 5]),
+        (0b1000, [21, 0, 0, 0, 0], [11, 0, 0, 5, 5]),
+    ] {
+        let (_backing, _pool, mut e, mut surfaces, clock) = ready_requests(p, sizes);
+        e.displays.siblings.det = others;
+        let Ok(a) = run(surfaces.prepare_requestor(&mut e, p, || Ok((clock, config())))) else {
+            return TestResult::Fail("requestor beside other displays' DET");
+        };
+        for (index, n) in want.into_iter().enumerate() {
+            if e.io.fake().regs[&crb(index)] & 0x1f1f != u32::from(n) * 0x101 {
+                return TestResult::Fail("CRB partition");
+            }
+        }
+        if a.compbuf_bytes != u32::from(want[0]) * 65536 || e.verify_requestor(p).is_err() {
+            return TestResult::Fail("compressed buffer record");
+        }
+        // The partition is the displays' together: forgetting one is a mismatch.
+        e.displays.siblings.det = 0;
+        if e.verify_requestor(p) != Err(Error::Busy) {
+            return TestResult::Fail("partition verified without its displays");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-requestor",
+    dcn401_requestor_shares_the_crb_with_other_displays
 );

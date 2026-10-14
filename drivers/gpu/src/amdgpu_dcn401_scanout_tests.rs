@@ -125,6 +125,7 @@ fn staged(pipe: u8) -> Engine<Hw> {
         authority: e.authority,
         layout: l,
         status: e.status,
+        displays: e.displays,
     }
 }
 fn target(pipe: u8) -> Pipe {

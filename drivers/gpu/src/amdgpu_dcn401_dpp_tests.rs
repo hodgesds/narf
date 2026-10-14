@@ -187,6 +187,7 @@ fn ready_range(
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     };
     (backing, pool, engine, surfaces, clock)
 }

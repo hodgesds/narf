@@ -308,6 +308,7 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     };
     let request = crate::amdgpu_dcn401_otg::HdmiLinkRequest {
         stream,
@@ -648,4 +649,77 @@ fn dcn401_scanout_chain_live_updates_go_through_the_back_buffer() -> TestResult 
 kernel_test_in!(
     "drivers/gpu/dcn401-scanout",
     dcn401_scanout_chain_live_updates_go_through_the_back_buffer
+);
+
+/// A second display selected next to a live one sees exactly the first
+/// one's resources as siblings, may retire planes and stage timing on its
+/// own pipes without disturbing the live scanout, and may not take the
+/// live display's pipe; the first display then checks and stops as before.
+fn dcn401_second_display_leaves_the_live_one_alone() -> TestResult {
+    let (t, s, p) = (1, 3, 2);
+    let mut c = chain(t, s, p);
+    let Ok(live) = run(c.start()) else {
+        return TestResult::Fail("first display start");
+    };
+    // Records of display 0 stay put; display 1 starts empty.
+    if c.e.select_display(1).is_err() || c.e.status.state != State::Ready {
+        return TestResult::Fail("select an idle second display");
+    }
+    let held = c.e.displays.siblings;
+    let mut want = Siblings {
+        pipes: 1 << p,
+        det: 1 << p,
+        transmitters: 1 << t,
+        streams: 1 << s,
+        live: [None; 4],
+    };
+    want.live[usize::from(p)] = Some((live.address, false));
+    if held != want {
+        return TestResult::Fail("siblings derived from the live display");
+    }
+    // The other pipes' MPCCs and HUBPs drain at once in this model.
+    for q in (0..4).filter(|&q| q != p) {
+        c.e.io.put(mpcc(q, MPC_STATUS), 5);
+        c.e.io.put(h(q, HUBP_CONTROL), BLANK_EN | NO_OUTSTANDING);
+    }
+    let Ok(retired) = run(c.e.retire_planes()) else {
+        return TestResult::Fail("plane retirement next to a live display");
+    };
+    if retired.blanked & 1 << p != 0
+        || retired.powered_off & 1 << p != 0
+        || c.e.io.get(mpcc(p, TOP)) & 0xf != u32::from(p)
+        || c.e.live_fetch_with(p, live.address, false).is_err()
+    {
+        return TestResult::Fail("live display's planes touched");
+    }
+    let plan = plan();
+    // The live display's pipe belongs to it.
+    let own = hdmi_mode(p, &plan);
+    if run(c.e.prepare(own.timing, own.clock)) != Err(Error::Busy) {
+        return TestResult::Fail("timing staged on another display's pipe");
+    }
+    let q = 0;
+    let other = hdmi_mode(q, &plan);
+    if run(c.e.prepare(other.timing, other.clock)).is_err() {
+        return TestResult::Fail("timing staged next to a live display");
+    }
+    if c.e.select_display(0).is_err() || c.e.status.scanout != Some(live) {
+        return TestResult::Fail("first display's records restored");
+    }
+    if c.e.displays.siblings.pipes != 1 << q || c.e.displays.siblings.live != [None; 4] {
+        return TestResult::Fail("second display's staged pipe as sibling");
+    }
+    if run(c.check()).is_err() || run(c.stop()).is_err() {
+        return TestResult::Fail("live display checked and stopped afterwards");
+    }
+    // A failed display keeps the selection: nothing else may run.
+    c.e.status.state = State::Failed(Error::Busy);
+    if c.e.select_display(1) != Err(Error::Busy) {
+        return TestResult::Fail("selection away from a failed display");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-scanout",
+    dcn401_second_display_leaves_the_live_one_alone
 );

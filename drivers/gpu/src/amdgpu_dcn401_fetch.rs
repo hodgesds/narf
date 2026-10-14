@@ -91,6 +91,15 @@ impl<I: Io> Engine<I> {
                 self.auxiliary_fetchers_stopped(pipe)?;
                 continue;
             }
+            // Another display's live scanout must be exactly that.
+            if let Some((address, cursor)) = self.displays.siblings.live[usize::from(pipe)] {
+                if !self.hubp_powered(pipe)? {
+                    return Err(Error::Busy);
+                }
+                self.live_fetch_with(pipe, address, cursor)?;
+                self.auxiliary_fetchers_stopped(pipe)?;
+                continue;
+            }
             if !self.hubp_powered(pipe)? {
                 continue;
             }
@@ -112,7 +121,12 @@ impl<I: Io> Engine<I> {
         }
         let l = self.layout;
         let mut powered_off = 0;
+        let kept = self.displays.siblings.pipes;
         for p in 0..4 {
+            // Other displays' planes are theirs: neither checked nor retired.
+            if kept & 1 << p != 0 {
+                continue;
+            }
             // Timing may run to latch the MPC disconnect; external streams
             // must already be stopped. Do not steal an inherited transaction.
             self.preflight(p, true)?;
@@ -146,7 +160,7 @@ impl<I: Io> Engine<I> {
             }
         }
         Ok(PlanesRetired {
-            blanked: 0xf & !powered_off,
+            blanked: 0xf & !powered_off & !kept,
             powered_off,
         })
     }
@@ -157,9 +171,10 @@ impl<I: Io> Engine<I> {
         deadline: narf_time::Deadline,
     ) -> Result<(), Error> {
         let l = self.layout;
+        let kept = self.displays.siblings.pipes;
         loop {
             let mut blocked = None;
-            for p in 0..4 {
+            for p in (0..4).filter(|p| kept & 1 << p == 0) {
                 let at = l.mpcc(p, MPC_STATUS);
                 let status = self.read(at)?;
                 // Native Linux accepts DISABLED, or waits for IDLE. Also
@@ -194,12 +209,15 @@ impl<I: Io> Engine<I> {
     async fn disconnect_planes(&mut self, plan: PlanesRetired) -> Result<(), Error> {
         let l = self.layout;
         let deadline = narf_time::Deadline::after_us(100_000);
-        // Retire the whole display tree, including inherited cross-routes.
-        // Disconnect outputs before each MPCC's top/bottom/OPP/update-lock mux.
-        for p in 0..4 {
+        let kept = self.displays.siblings.pipes;
+        let ours: alloc::vec::Vec<u8> = (0..4u8).filter(|p| kept & 1 << p == 0).collect();
+        // Retire the whole display tree but other displays' pipes, including
+        // inherited cross-routes. Disconnect outputs before each MPCC's
+        // top/bottom/OPP/update-lock mux.
+        for &p in &ours {
             self.update(l.out_mux(p), 0xf, 0xf)?;
         }
-        for p in 0..4 {
+        for &p in &ours {
             for r in [TOP, BOTTOM, OPP_ID, UPDATE_LOCK] {
                 self.update(l.mpcc(p, r), 0xf, 0xf)?;
             }
@@ -226,7 +244,7 @@ impl<I: Io> Engine<I> {
         }
         self.wait_plane_drain(plan, true, deadline).await?;
         self.fetchers_stopped()?;
-        for p in 0..4 {
+        for &p in &ours {
             for at in [
                 l.out_mux(p),
                 l.mpcc(p, TOP),
@@ -247,7 +265,7 @@ impl<I: Io> Engine<I> {
         }
         for (at, mask) in l.idle {
             let timing = (0..4).any(|p| at == l.otg(p, CONTROL) || at == l.otg(p, CLOCK));
-            if !timing && self.read(at)? & mask != 0 {
+            if !timing && !self.sibling_register(at) && self.read(at)? & mask != 0 {
                 return Err(Error::Busy);
             }
         }

@@ -204,6 +204,13 @@ impl<I: Io> Engine<I> {
             plan.request.stream,
             plan.request.pipe,
         );
+        let siblings = self.displays.siblings;
+        if siblings.transmitters & bit(phy) != 0
+            || siblings.streams & bit(s) != 0
+            || siblings.pipes & bit(pipe) != 0
+        {
+            return Err(Error::Busy); // another display's
+        }
         let be = |r| DpStream::Dio(phy).at(l, r);
         let fe = |r| DpStream::Dio(s).at(l, r);
         let owned = [
@@ -218,6 +225,7 @@ impl<I: Io> Engine<I> {
         for (reg, mask) in l.idle {
             if owned.contains(&reg)
                 || timing && (reg == l.otg(pipe, CONTROL) || reg == l.otg(pipe, CLOCK))
+                || self.sibling_register(reg)
             {
                 continue;
             }
@@ -232,7 +240,7 @@ impl<I: Io> Engine<I> {
             return Err(Error::Busy);
         }
         for p in 0..4 {
-            if p != s {
+            if p != s && siblings.streams & bit(p) == 0 {
                 self.dp_encoder_quiet(DpStream::Dio(p))?;
             }
             self.dp_encoder_quiet(DpStream::Hpo(p))?;
@@ -278,7 +286,9 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at));
             }
         }
-        for b in 0..4 {
+        // Other displays route their own backends after this snapshot.
+        let others = self.displays.siblings.transmitters;
+        for b in (0..4).filter(|&b| others & bit(b) == 0) {
             let at = DpStream::Dio(b).at(l, 0x20bc);
             if self.read(at)? & 0x7f00 != plan.backend_routes[usize::from(b)] {
                 return Err(Error::Readback(at));

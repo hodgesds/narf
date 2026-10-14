@@ -112,6 +112,7 @@ fn live(s: u8, routes: u8) -> Engine<Model> {
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     }
 }
 

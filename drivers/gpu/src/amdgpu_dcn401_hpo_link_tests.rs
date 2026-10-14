@@ -140,6 +140,7 @@ fn fixture(phy: u8, link: u8, streams: u8) -> Engine<Model> {
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     }
 }
 

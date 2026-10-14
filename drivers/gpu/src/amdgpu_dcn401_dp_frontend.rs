@@ -81,20 +81,25 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Readback(at));
             }
         }
+        // Other displays route their own streams and backends after this
+        // snapshot; every other route must stay as it was.
+        let others = self.displays.siblings;
         for b in 0..4 {
-            for (at, mask, value) in [
+            for (at, mask, value, theirs) in [
                 (
                     l.dio_clock + u64::from(b) * 4,
                     0x711,
                     plan.clock_routes[usize::from(b)],
+                    others.streams & bit(b) != 0,
                 ),
                 (
                     DpStream::Dio(b).at(l, 0x20bc),
                     0x7f00,
                     plan.backend_routes[usize::from(b)],
+                    others.transmitters & bit(b) != 0,
                 ),
             ] {
-                if self.read(at)? & mask != value {
+                if !theirs && self.read(at)? & mask != value {
                     return Err(Error::Readback(at));
                 }
             }

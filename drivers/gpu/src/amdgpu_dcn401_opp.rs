@@ -201,8 +201,11 @@ impl Otg {
         if request.pipe >= 4 {
             return Err(Error::Invalid);
         }
+        let (held, layout) = self.0.held();
         let clock = dccg
-            .timing_clock(self.0.io.0, clocks, request.pipe)
+            .timing_clock_except(self.0.io.0, clocks, request.pipe, &|at| {
+                held_by_sibling(held, layout, at)
+            })
             .map_err(Error::PipeClocks)?;
         self.0.prepare_blank(request, clock).await
     }

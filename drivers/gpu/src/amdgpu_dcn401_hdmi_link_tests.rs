@@ -243,6 +243,7 @@ fn fixture_with(
         authority: e.authority,
         layout: e.layout,
         status: e.status,
+        displays: e.displays,
     };
     (engine, fw, c)
 }
@@ -829,4 +830,61 @@ fn dcn401_hdmi_audio_tables_bandwidth_and_refusals() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_audio_tables_bandwidth_and_refusals
+);
+
+/// An HDMI link starts next to another display's running link and timing
+/// (transmitter 0, stream 0, pipe 1), which are refused as foreign without
+/// that display; the other display's stream is never taken.
+fn dcn401_hdmi_link_starts_beside_another_display() -> TestResult {
+    let theirs = Siblings {
+        pipes: 1 << 1,
+        det: 1 << 1,
+        transmitters: 1 << 0,
+        streams: 1 << 0,
+        live: [None; 4],
+    };
+    let running = |e: &mut Engine<TmdsIo>| {
+        let l = e.layout;
+        for (at, value) in [
+            (l.otg(1, CONTROL), 0x10001),
+            (l.otg(1, CLOCK), 0x10103),
+            (dio(0, 0x20bb), 0x2810),
+            (dio(0, 0x20bc), 0x100), // backend 0 carries stream 0
+            (dio(0, 0x20bd), 1),
+            (phy(0, 0x2943), 0x03030303),
+            (phy(0, 0x2931), 0x6f0),
+            (dio(0, 0x2094), 0x2c10),
+            (dio(0, 0x2095), 1),
+            (dio(0, 0x209b), 1),
+            (l.dio_clock, 0x10),
+        ] {
+            e.io.inner.regs.insert(at, value);
+        }
+    };
+    let (mut e, mut fw, c) = fixture(1, 2, 3);
+    running(&mut e);
+    if run(e.prepare_hdmi_link(&mut fw, path(1), link(2, 3), c)) != Err(Error::Busy) {
+        return TestResult::Fail("foreign running link ignored");
+    }
+    let (mut e, mut fw, c) = fixture(1, 2, 3);
+    running(&mut e);
+    e.displays.siblings = theirs;
+    if run(e.prepare_hdmi_link(&mut fw, path(1), link(2, 3), c)).is_err()
+        || run(e.start_hdmi_video(path(1), c)).is_err()
+        || e.status.state != State::HdmiVideoRunning(2)
+    {
+        return TestResult::Fail("link beside another display");
+    }
+    let (mut e, mut fw, c) = fixture(1, 0, 3);
+    e.displays.siblings = theirs;
+    if run(e.prepare_hdmi_link(&mut fw, path(1), link(0, 3), c)) != Err(Error::Busy)
+        || !fw.commands.is_empty()
+    {
+        return TestResult::Fail("another display's stream taken");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_link_starts_beside_another_display
 );
