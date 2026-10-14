@@ -857,6 +857,39 @@ fn task_wake_cell(task: &KernelTask) -> Option<&crate::WakeCell> {
     Some(unsafe { &*ptr })
 }
 
+/// Restore the wake a preemption swallowed, on the preempted continuation's
+/// resume.
+///
+/// A tick preemption marks the task runnable by setting its slot's wake bit,
+/// and the dispatch that resumes the continuation consumes that bit. The bit is
+/// a single flag, so it also absorbed every wake that landed while the task ran
+/// or sat preempted: the inner future's own `yield_now` self-wake, or a waker it
+/// registered just before the tick fired. The resumed code then finishes that
+/// poll with `Pending` and parks with the bit clear, and nothing re-polls the
+/// future although it asked to be. The virtio-net RX forwarder parked this way
+/// inside its `yield_now`, with completions waiting in its ring, and the guest
+/// network stopped for good.
+///
+/// Linux never loses a wakeup to preemption: a preempted task stays
+/// `TASK_RUNNING`, and a `try_to_wake_up` that raced it is still in effect when
+/// it next calls `schedule()`. Setting the bit again on resume gives the same
+/// guarantee: the next voluntary `Pending` is followed by a re-poll. The cost
+/// is at most one extra poll per preemption, which a future must tolerate.
+///
+/// The task runs on this CPU, so it needs no kick: the executor checks the bit
+/// when the task yields, exactly as for a self-wake during a poll.
+pub(crate) fn rearm_wake_after_preempt(task: &KernelTask) {
+    if let Some(cell) = task_wake_cell(task) {
+        cell.flag.store(true, Ordering::Release);
+        return;
+    }
+    // Not bound to an executor slot yet: go through the installed waker.
+    let waker = task.current_waker.lock();
+    if let Some(w) = waker.as_ref() {
+        w.wake_by_ref();
+    }
+}
+
 /// Ask the currently-running direct-eligible task to requeue on `target_cpu`
 /// after its normal poll/yield boundary. This is the off-queue half of Linux's
 /// synchronous wake-affinity shape: the raw wake path cannot move the running
@@ -2928,6 +2961,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
         CURRENT_STACKFUL_TASK.inner[cpu].store(task_ptr, Ordering::Release);
         stamp_slice_start(&*task_ptr, cpu);
     }
+    // The dispatch that resumed us consumed the wake bit; give back any wake it
+    // absorbed before the interrupted poll can return `Pending`.
+    // SAFETY: same live task as the re-publication above.
+    rearm_wake_after_preempt(unsafe { &*task_ptr });
     if kernel_span_paused {
         resume_user_kernel_span();
     }
@@ -3055,6 +3092,11 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     // SAFETY: the task is still owned by the in-flight poll_to_yield.
     unsafe {
         stamp_slice_start(&*task_ptr, cpu);
+    }
+    if !from_user {
+        // An EL1 preemption interrupted a poll in progress: give back any wake
+        // the resuming dispatch consumed (see `rearm_wake_after_preempt`).
+        rearm_wake_after_preempt(task);
     }
     if kernel_span_paused {
         resume_user_kernel_span();
@@ -4737,6 +4779,104 @@ pub mod tests {
         // yield of the same task isn't mis-attributed as a preemption.
         if task.preempted.load(Ordering::Acquire) {
             return TestResult::Fail("poll_to_yield did not consume the preempted flag");
+        }
+        TestResult::Pass
+    }
+
+    /// A wake that a preemption absorbs must still re-poll the task.
+    ///
+    /// The task wakes itself the way `yield_now` does, and a tick then
+    /// preempts it before its poll returns `Pending`. The preemption sets the
+    /// same wake bit, and the dispatch that resumes the continuation consumes
+    /// it, so without `rearm_wake_after_preempt` the poll ends with the bit
+    /// clear and the task never runs again. The virtio-net RX forwarder hung
+    /// exactly this way inside its periodic `yield_now`.
+    ///
+    /// The preemption is real: `try_preempt` runs on the task's own stack with
+    /// a timer-vector CPL0 frame, a one-cycle slice and a runnable companion
+    /// on this CPU, so it switches to the executor and is resumed by it.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_preempt_keeps_a_pending_self_wake() -> TestResult {
+        static PREEMPTED: AtomicBool = AtomicBool::new(false);
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static STOP: AtomicBool = AtomicBool::new(false);
+        // Lets a failing run wake the stranded task so it completes instead of
+        // pinning the run queue for every later test.
+        static RESCUE: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
+            narf_lib::sync::IrqSafeSpinLock::new(None);
+        PREEMPTED.store(false, Ordering::Release);
+        DONE.store(false, Ordering::Release);
+        STOP.store(false, Ordering::Release);
+
+        // Keeps `has_other_runnable_work` true so the tick may preempt.
+        struct Companion;
+        impl Future for Companion {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if STOP.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        struct WakeThenPreempt {
+            woke: bool,
+        }
+        impl Future for WakeThenPreempt {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.woke {
+                    DONE.store(true, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                self.woke = true;
+                *RESCUE.lock() = Some(cx.waker().clone());
+                // `yield_now`: ask to be polled again...
+                cx.waker().wake_by_ref();
+                // ...and take the timer tick before returning `Pending`.
+                let mut frame = zero_trap_frame();
+                frame.vector = current_preempt_vector();
+                frame.cs = 0x08;
+                // SAFETY: `frame` lives on this task's own stack, as a CPL0
+                // timer frame does, and this task is the CPU's current
+                // stackful task inside its executor poll. Interrupts stay
+                // masked across the switch as they are in the timer trap.
+                let preempted =
+                    narf_lib::sync::without_interrupts(|| unsafe { try_preempt(&mut frame) });
+                PREEMPTED.store(preempted, Ordering::Release);
+                Poll::Pending
+            }
+        }
+
+        crate::spawn_stackful(Companion);
+        crate::spawn_stackful_with_options(
+            WakeThenPreempt { woke: false },
+            crate::StackfulOptions {
+                slice_cycles: 1,
+                ..Default::default()
+            },
+        );
+        for _ in 0..64 {
+            crate::poll_one_round();
+            if DONE.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        let lost = !DONE.load(Ordering::Acquire);
+        STOP.store(true, Ordering::Release);
+        if let Some(w) = RESCUE.lock().take() {
+            w.wake_by_ref();
+        }
+        for _ in 0..8 {
+            crate::poll_one_round();
+        }
+        if !PREEMPTED.load(Ordering::Acquire) {
+            return TestResult::Fail("the synthetic timer tick did not preempt the task");
+        }
+        if lost {
+            return TestResult::Fail("a self-wake absorbed by a preemption never re-polled");
         }
         TestResult::Pass
     }
@@ -8120,6 +8260,8 @@ pub mod tests {
         "scheduler/stackful",
         smoke_preempted_return_gate_reflects_preemption
     );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/preempt", smoke_preempt_keeps_a_pending_self_wake);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_stackful_runs_on_dedicated_stack);
     #[cfg(target_arch = "x86_64")]

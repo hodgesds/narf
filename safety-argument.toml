@@ -1480,3 +1480,7 @@ argument = "Memory (address_space.rs, remote_access.rs): AddressSpace::access_re
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame change in cross_crate_init.rs installs narf_userspace::handlers::proc_mem_open as procfs's /proc/<pid>/mem open hook, a plain function pointer set once at init in the same way as the existing procfs hooks. The hook enforces Linux proc_mem_open's mm_access (PTRACE_MODE_ATTACH|FSCREDS: same-mm, matching credentials plus dumpable, or CAP_SYS_PTRACE) before binding a weak reference to the target address space. No TCB code path, capability, or domain transition changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The executor change (scheduler/src/stackful.rs rearm_wake_after_preempt) sets the preempted task's own WakeCell wake bit again when its CPL0/EL1-preempted continuation resumes, so a wake that the preemption and the resuming dispatch coalesced (the task's own yield_now self-wake, or a waker it registered just before the tick) still re-polls it, as Linux keeps a preempted task TASK_RUNNING. It writes only the bit of the task that is running on this CPU, the same store a self-wake during a poll makes; it moves no slot between run queues, touches no address space, domain state, PKRS/TCF, capability or frame, and the worst case is one extra poll of that task per preemption. User-mode (CPL3/EL0) preemption is unchanged."
