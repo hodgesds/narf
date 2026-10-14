@@ -1242,6 +1242,17 @@ impl ColdBoot {
         }
     }
     /// The live scanout as a CPU framebuffer (bus-physical BAR address).
+    /// Read-only: display `pipe`'s running timing generator frame count and
+    /// scanout position (display k scans out on pipe k).
+    pub fn display_scanout_position(
+        &mut self,
+        pipe: u8,
+    ) -> Result<otg::ScanoutPosition, otg::Error> {
+        if self.state() != State::MemoryReady {
+            return Err(otg::Error::Busy);
+        }
+        self.otg.as_mut().map_err(|e| *e)?.scanout_position(pipe)
+    }
     pub fn display_scanout_framebuffer(
         &self,
         pipe: u8,

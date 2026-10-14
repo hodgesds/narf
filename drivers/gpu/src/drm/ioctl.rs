@@ -44,6 +44,9 @@ pub enum IoctlCmd {
     DropMaster = 0x1F,
     PrimeHandleToFd = 0x2D,
     PrimeFdToHandle = 0x2E,
+    WaitVblank = 0x3A,
+    CrtcGetSequence = 0x3B,
+    CrtcQueueSequence = 0x3C,
     ModeGetResources = 0xA0,
     ModeGetCrtc = 0xA1,
     ModeSetCrtc = 0xA2,
@@ -91,6 +94,9 @@ impl IoctlCmd {
             0x1F => IoctlCmd::DropMaster,
             0x2D => IoctlCmd::PrimeHandleToFd,
             0x2E => IoctlCmd::PrimeFdToHandle,
+            0x3A => IoctlCmd::WaitVblank,
+            0x3B => IoctlCmd::CrtcGetSequence,
+            0x3C => IoctlCmd::CrtcQueueSequence,
             0xA0 => IoctlCmd::ModeGetResources,
             0xA1 => IoctlCmd::ModeGetCrtc,
             0xA2 => IoctlCmd::ModeSetCrtc,
@@ -408,7 +414,11 @@ pub fn dispatch(
         | IoctlCmd::SyncobjWait
         | IoctlCmd::SyncobjSignal
         | IoctlCmd::PrimeHandleToFd
-        | IoctlCmd::PrimeFdToHandle => Err(DrmIoctlError::UnknownCmd),
+        | IoctlCmd::PrimeFdToHandle
+        // The vblank ioctls need the open's event queue: bridge-dispatched.
+        | IoctlCmd::WaitVblank
+        | IoctlCmd::CrtcGetSequence
+        | IoctlCmd::CrtcQueueSequence => Err(DrmIoctlError::UnknownCmd),
         // Dumb-buffer / modeset ioctls — handled in the bridge with
         // full serialisation of the in/out structs.
         // GET_MAGIC / AUTH_MAGIC are handled in the bridge (primary-node fd is

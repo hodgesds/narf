@@ -43,6 +43,8 @@ const LOCK_REQUEST: u32 = 1;
 const LOCK_STATUS: u32 = 0x100;
 const FRAME_COUNT: u64 = 0x1b4d;
 const FRAME_MASK: u32 = 0xff_ffff;
+const STATUS_POSITION: u64 = 0x1b4a;
+const V_BLANK_START_END: u64 = 0x1b38;
 const MPC_STATUS: u64 = 0xe;
 const MPCC_CONTROL: u64 = 3;
 const MPCC_MODE_TOP_ONLY: u32 = 2;
@@ -62,6 +64,61 @@ pub struct ScanoutRunning {
     /// Two distinct frame counts sampled after the latch with no underflow.
     pub frame_before: u32,
     pub frame_after: u32,
+}
+
+/// A running timing generator's position, as Linux's get_crtc_scanoutpos
+/// and get_vblank_counter read it: the 24-bit frame count (which the
+/// hardware increments at the start of vsync, line 0), the scanout position
+/// and the vertical blank (from `vblank_start` through the wrap to
+/// `vblank_end`), with the timing it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanoutPosition {
+    pub frame: u32,
+    pub vpos: u32,
+    pub hpos: u32,
+    pub vblank_start: u32,
+    pub vblank_end: u32,
+    pub timing: crate::amdgpu_dml::Timing,
+}
+
+/// The vblank clock at the moment a position was read, in DRM's terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VblankPhase {
+    /// Vblanks begun (frame count, 24-bit), counted at the start of vblank
+    /// as DRM requires: amdgpu_get_vblank_counter_kms bumps the hardware
+    /// count between vblank start and vsync.
+    pub count: u32,
+    /// When that vblank began and ends (scanout of the next frame starts,
+    /// DRM's vblank timestamp), in ns relative to the read: start <= 0.
+    pub start_ns: i64,
+    pub end_ns: i64,
+    pub period_ns: u64,
+}
+
+impl ScanoutPosition {
+    pub fn phase(&self) -> Option<VblankPhase> {
+        let t = self.timing;
+        let (vt, vs, ve) = (t.v_total, self.vblank_start, self.vblank_end);
+        if t.pixel_clock_khz == 0 || vt == 0 || vs > vt || ve > vs || self.vpos >= vt {
+            return None;
+        }
+        let upper = self.vpos >= vs;
+        let since = if upper {
+            self.vpos - vs
+        } else {
+            vt - vs + self.vpos
+        };
+        let ns = |pixels: i64| pixels * 1_000_000 / i64::from(t.pixel_clock_khz);
+        let ht = i64::from(t.h_total);
+        let start = -ns(i64::from(since) * ht + i64::from(self.hpos));
+        let blank = i64::from(vt - vs + ve);
+        Some(VblankPhase {
+            count: (self.frame + u32::from(upper)) & FRAME_MASK,
+            start_ns: start,
+            end_ns: start + ns(blank * ht),
+            period_ns: ns(i64::from(vt) * ht) as u64,
+        })
+    }
 }
 
 /// What an activation or stop works on, gathered from the retained reports.
@@ -797,6 +854,37 @@ impl Otg {
                 ))
             })
             .await
+    }
+    /// Read-only: the running timing generator's frame count and position
+    /// on `pipe`, the pipe of display `pipe`, read until the frame count is
+    /// stable across the position read (as amdgpu_get_vblank_counter_kms).
+    pub fn scanout_position(&mut self, pipe: u8) -> Result<ScanoutPosition, Error> {
+        let status = self.display_status(pipe).ok_or(Error::Invalid)?;
+        let timing = status.pipes[usize::from(pipe)]
+            .ok_or(Error::Invalid)?
+            .request
+            .timing;
+        let e = &mut self.0;
+        let l = e.layout;
+        if e.read(l.otg(pipe, CONTROL))? & 0x10001 != 0x10001 {
+            return Err(Error::Busy); // not running
+        }
+        let blank = e.read(l.otg(pipe, V_BLANK_START_END))?;
+        for _ in 0..3 {
+            let frame = e.read(l.otg(pipe, FRAME_COUNT))? & FRAME_MASK;
+            let position = e.read(l.otg(pipe, STATUS_POSITION))?;
+            if e.read(l.otg(pipe, FRAME_COUNT))? & FRAME_MASK == frame {
+                return Ok(ScanoutPosition {
+                    frame,
+                    vpos: position & 0x7fff,
+                    hpos: (position >> 16) & 0x7fff,
+                    vblank_start: blank & 0x7fff,
+                    vblank_end: (blank >> 16) & 0x7fff,
+                    timing,
+                });
+            }
+        }
+        Err(Error::Busy)
     }
     /// The live scanout as a CPU framebuffer for console adoption.
     pub fn scanout_framebuffer(&self, pipe: u8) -> Result<GenericFb, Error> {

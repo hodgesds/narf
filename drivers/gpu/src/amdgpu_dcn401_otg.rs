@@ -18,8 +18,8 @@ pub use opp::{BlankApplied, BlankRequest, BlankRunning, ColorDepth};
 mod fetch;
 pub use fetch::{
     CursorApplied, DeadlinesApplied, DppApplied, FlipDone, HubpPower, MemoryApplied, MpcApplied,
-    PlanesRetired, RequestorApplied, ScanoutRunning, ScanoutUnderflow, SurfaceApplied,
-    SurfaceFormat, SurfaceRequest, CURSOR_MAX,
+    PlanesRetired, RequestorApplied, ScanoutPosition, ScanoutRunning, ScanoutUnderflow,
+    SurfaceApplied, SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX,
 };
 #[path = "amdgpu_dcn401_stream.rs"]
 mod stream;

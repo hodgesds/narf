@@ -478,6 +478,15 @@ impl FileOps for DriCardFile {
             {
                 crate::drm_ioctl_bridge::wait_atomic_in_fences(arg, context)?;
             }
+            // A blocking vblank wait sleeps until its vblank.
+            if crate::drm_ioctl_bridge::is_wait_vblank_ioctl(cmd) {
+                return crate::drm_ioctl_bridge::wait_vblank_for_file(
+                    self.index,
+                    arg as usize,
+                    &self.events,
+                )
+                .await;
+            }
             self.ioctl(cmd, arg as usize)
         })
     }

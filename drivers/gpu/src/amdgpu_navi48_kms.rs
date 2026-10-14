@@ -22,6 +22,14 @@ const NVSYNC: u32 = 8;
 const PREFERRED_DRIVER: u32 = 0x8 | 0x40;
 const DRIVER: u32 = 0x40;
 
+/// DRM_FORMAT_XRGB8888 and ARGB8888: what the native scanout presents.
+const PLANE_FORMATS: [u32; 2] = [0x3432_5258, 0x3432_5241];
+
+/// The display (and pipe) behind a native CRTC id.
+pub fn crtc_display(crtc_id: u32) -> Option<u8> {
+    (crtc_id == CRTC).then(crate::amdgpu_navi48_platform::lit_pipe)
+}
+
 /// The exact DRM wire form of a DCN timing.
 pub fn timing_wire(t: &Timing) -> DrmModeModeInfo {
     let total = u64::from(t.h_total) * u64::from(t.v_total);
@@ -135,6 +143,10 @@ pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, &[Timing], Conne
             c.connector_type = kind;
         }
     }
+    // The CRTC's vblanks are the display's hardware ones, and its plane
+    // scans 32-bit RGB (alpha unused: nothing lies below the primary).
+    card.vblank_source = Some(crate::amdgpu_navi48_platform::crtc_vblank);
+    card.plane_formats = Some(&PLANE_FORMATS);
     card.native = alloc::vec![NativeOutput {
         connector: CONNECTOR,
         edid: lit.map(|(edid, _, _, _)| *edid),

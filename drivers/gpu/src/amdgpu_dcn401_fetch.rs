@@ -11,8 +11,8 @@ mod surface;
 pub(super) use surface::Surfaces;
 pub use surface::{
     CursorApplied, DeadlinesApplied, DppApplied, FlipDone, MemoryApplied, MpcApplied,
-    RequestorApplied, ScanoutRunning, ScanoutUnderflow, SurfaceApplied, SurfaceFormat,
-    SurfaceRequest, CURSOR_MAX,
+    RequestorApplied, ScanoutPosition, ScanoutRunning, ScanoutUnderflow, SurfaceApplied,
+    SurfaceFormat, SurfaceRequest, VblankPhase, CURSOR_MAX,
 };
 
 const HUBP_CONTROL: u64 = 0x5f4;

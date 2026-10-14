@@ -262,38 +262,124 @@ pub(crate) struct DrmEventQueue {
     event_space: usize,
 }
 
-/// One queued `drm_event`. `flip` holds a hardware flip's event until that
-/// flip completes: (ticket, refresh period in ns). Otherwise the event is
-/// deliverable at `deliver_at_ns`.
+/// One queued `drm_event`, deliverable at `deliver_at_ns` or when what it
+/// waits for has happened.
 #[derive(Debug)]
 struct QueuedEvent {
     deliver_at_ns: u64,
-    flip: Option<(u64, u64)>,
+    wait: Wait,
     bytes: [u8; 32],
 }
+
+/// What a queued event waits for besides its delivery time.
+#[derive(Debug)]
+enum Wait {
+    /// Only `deliver_at_ns` (a simulated vblank).
+    Time,
+    /// A hardware flip: (ticket, refresh period in ns).
+    Flip(u64, u64),
+    /// A hardware vblank count on a CRTC (WAIT_VBLANK with an event, or
+    /// CRTC_QUEUE_SEQUENCE when `sequence` is set).
+    Vblank {
+        source: VblankSource,
+        crtc_id: u32,
+        target: u64,
+        sequence: bool,
+    },
+}
+
+/// One CRTC's hardware vblank clock: `count` vblanks have begun, the last
+/// at `start_ns`; it ends at `ns`, when the next frame's first pixel goes
+/// out (DRM's vblank timestamp). CLOCK_MONOTONIC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VblankTime {
+    pub count: u64,
+    pub start_ns: u64,
+    pub ns: u64,
+    pub period_ns: u64,
+}
+
+/// A driver's hardware vblank clock for a CRTC id; `None` while that CRTC
+/// has no running timing. Cards without one have no vblank support, as
+/// Linux drivers that never call drm_vblank_init.
+pub type VblankSource = fn(u32) -> Option<VblankTime>;
+
+/// `drm_vblank_passed`: whether vblank `seq` is at or past `target`.
+pub fn vblank_passed(seq: u64, target: u64) -> bool {
+    seq.wrapping_sub(target) <= 1 << 23
+}
+
+/// Look again this soon while a vblank count is about to be reached.
+const VBLANK_RECHECK_NS: u64 = 250_000;
 
 impl QueuedEvent {
     /// The event as `read` returns it at `now`, or `None` while it is not
     /// yet due. A hardware flip's event carries that flip's time and count.
     fn due(&self, now: u64) -> Option<[u8; 32]> {
-        let Some((ticket, _)) = self.flip else {
-            return (self.deliver_at_ns <= now).then_some(self.bytes);
-        };
-        let stamp = FLIPS.lock().stamp(ticket)?;
         let mut bytes = self.bytes;
-        bytes[16..20].copy_from_slice(&((stamp.ns / 1_000_000_000) as u32).to_le_bytes());
-        bytes[20..24].copy_from_slice(&(((stamp.ns % 1_000_000_000) / 1_000) as u32).to_le_bytes());
-        bytes[24..28].copy_from_slice(&stamp.sequence.to_le_bytes());
+        match self.wait {
+            Wait::Time => return (self.deliver_at_ns <= now).then_some(bytes),
+            Wait::Flip(ticket, _) => {
+                let stamp = FLIPS.lock().stamp(ticket)?;
+                patch_vblank_event(&mut bytes, stamp.ns, stamp.sequence);
+            }
+            Wait::Vblank {
+                source,
+                crtc_id,
+                target,
+                sequence,
+            } => {
+                // A CRTC turned off sends its pending events at once in the
+                // vblank they asked for (drm_crtc_vblank_off).
+                let t = match source(crtc_id) {
+                    Some(t) if vblank_passed(t.count, target) => t,
+                    Some(_) => return None,
+                    None => VblankTime {
+                        count: target,
+                        start_ns: now,
+                        ns: now,
+                        period_ns: 0,
+                    },
+                };
+                if sequence {
+                    bytes[16..24].copy_from_slice(&t.ns.to_le_bytes());
+                    bytes[24..32].copy_from_slice(&t.count.to_le_bytes());
+                } else {
+                    patch_vblank_event(&mut bytes, t.ns, t.count as u32);
+                }
+            }
+        }
         Some(bytes)
     }
 
     /// When a poller should look at this event again.
     fn deadline(&self, now: u64) -> u64 {
-        match self.flip {
-            None => self.deliver_at_ns,
-            Some((ticket, period_ns)) => FLIPS.lock().recheck_at(ticket, now, period_ns),
+        match self.wait {
+            Wait::Time => self.deliver_at_ns,
+            Wait::Flip(ticket, period_ns) => FLIPS.lock().recheck_at(ticket, now, period_ns),
+            Wait::Vblank {
+                source,
+                crtc_id,
+                target,
+                ..
+            } => match source(crtc_id) {
+                Some(t) if !vblank_passed(t.count, target) => {
+                    // When vblank `target` begins, predicted from the last.
+                    let ahead = target.wrapping_sub(t.count).min(1 << 23);
+                    let at = t.start_ns.saturating_add(ahead.saturating_mul(t.period_ns));
+                    at.max(now.saturating_add(VBLANK_RECHECK_NS))
+                }
+                _ => now,
+            },
         }
     }
+}
+
+/// `drm_event_vblank`'s time and sequence.
+fn patch_vblank_event(bytes: &mut [u8; 32], ns: u64, sequence: u32) {
+    bytes[16..20].copy_from_slice(&((ns / 1_000_000_000) as u32).to_le_bytes());
+    bytes[20..24].copy_from_slice(&(((ns % 1_000_000_000) / 1_000) as u32).to_le_bytes());
+    bytes[24..28].copy_from_slice(&sequence.to_le_bytes());
 }
 
 impl DrmEventQueue {
@@ -574,6 +660,15 @@ pub struct Card {
     next_magic: u32,
     /// Real sink data for native-driver connectors (see [`NativeOutput`]).
     pub native: Vec<NativeOutput>,
+    /// The hardware vblank clock of a driver that scans out natively;
+    /// without one the vblank ioctls are unsupported.
+    pub vblank_source: Option<VblankSource>,
+    /// The fourccs a natively scanned-out card's primary planes take. With
+    /// them, ADDFB2 refuses any other format (Linux's
+    /// `drm_any_plane_has_format`) and its planes are checked against what
+    /// the hardware scans (see `NativePlane`). `None` keeps the CPU-copy
+    /// cards' formats.
+    pub plane_formats: Option<&'static [u32]>,
 }
 
 /// A connector whose modes and EDID come from a real sink, published by a
@@ -655,6 +750,8 @@ impl Card {
             magics: Vec::new(),
             next_magic: 1,
             native: Vec::new(),
+            vblank_source: None,
+            plane_formats: None,
         }
     }
     /// Wire form of a CRTC mode: the exact native timing when a published
@@ -881,7 +978,7 @@ impl Card {
         e[28..32].copy_from_slice(&crtc_id.to_le_bytes());
         events.push(QueuedEvent {
             deliver_at_ns: deliver_at,
-            flip: None,
+            wait: Wait::Time,
             bytes: e,
         })
     }
@@ -907,7 +1004,61 @@ impl Card {
         e[28..32].copy_from_slice(&crtc_id.to_le_bytes());
         events.push(QueuedEvent {
             deliver_at_ns: 0,
-            flip: Some((ticket, period_ns)),
+            wait: Wait::Flip(ticket, period_ns),
+            bytes: e,
+        })
+    }
+
+    /// The hardware vblank clock of `crtc_id`: `Err(None)` when this card
+    /// has no vblank support, `Err(Some(()))` when the CRTC is unknown or
+    /// off (its vblank cannot be enabled).
+    pub fn vblank_time(&self, crtc_id: u32) -> Result<VblankTime, Option<()>> {
+        let source = self.vblank_source.ok_or(None)?;
+        let crtc = self.crtc(crtc_id).map_err(|_| Some(()))?;
+        if !crtc.enabled {
+            return Err(Some(()));
+        }
+        source(crtc_id).ok_or(Some(()))
+    }
+
+    /// Queue a vblank event for vblank `target` on `crtc_id`: a
+    /// `drm_event_vblank` (WAIT_VBLANK) or, with `sequence`, a
+    /// `drm_event_crtc_sequence` (CRTC_QUEUE_SEQUENCE). It is delivered once
+    /// the CRTC's count reaches `target`, with that vblank's time and count.
+    /// The card must have a vblank source.
+    pub(crate) fn queue_vblank_event(
+        &self,
+        events: &mut DrmEventQueue,
+        user_data: u64,
+        crtc_id: u32,
+        target: u64,
+        sequence: bool,
+    ) -> Result<(), DrmEventQueueFull> {
+        const DRM_EVENT_VBLANK: u32 = 1;
+        const DRM_EVENT_CRTC_SEQUENCE: u32 = 3;
+        let Some(source) = self.vblank_source else {
+            return Err(DrmEventQueueFull);
+        };
+        let mut e = [0u8; 32];
+        let kind = if sequence {
+            DRM_EVENT_CRTC_SEQUENCE
+        } else {
+            DRM_EVENT_VBLANK
+        };
+        e[0..4].copy_from_slice(&kind.to_le_bytes());
+        e[4..8].copy_from_slice(&32u32.to_le_bytes());
+        e[8..16].copy_from_slice(&user_data.to_le_bytes());
+        if !sequence {
+            e[28..32].copy_from_slice(&crtc_id.to_le_bytes());
+        }
+        events.push(QueuedEvent {
+            deliver_at_ns: 0,
+            wait: Wait::Vblank {
+                source,
+                crtc_id,
+                target,
+                sequence,
+            },
             bytes: e,
         })
     }
@@ -1177,7 +1328,13 @@ impl Card {
         if self.gem.lookup(gem_handle).is_none() {
             return Err(CardError::BadGemHandle);
         }
-        // Validate pixel format.
+        // Validate pixel format: a format no plane takes is refused.
+        if self
+            .plane_formats
+            .is_some_and(|formats| !formats.contains(&format))
+        {
+            return Err(CardError::UnknownFormat);
+        }
         let format = match format {
             0x3432_5258 => PixelFormat::Xrgb8888,
             0x3432_5241 => PixelFormat::Argb8888,
@@ -1216,7 +1373,8 @@ impl Card {
         Ok(id)
     }
 
-    /// Remove a previously registered framebuffer (RMFB). Drops the
+    /// Remove a previously registered framebuffer (RMFB), turning off any
+    /// CRTC that still shows it. Drops the
     /// framebuffer's reference on its backing buffer; returns
     /// `Some((phys, order))` for the caller to buddy-free if that was the
     /// buffer's last reference.
@@ -1229,6 +1387,18 @@ impl Card {
             .position(|fb| fb.id == fb_id)
             .ok_or(CardError::UnknownFb)?;
         let fb = self.framebuffers.swap_remove(pos);
+        // drm_framebuffer_remove: a plane still scanning this framebuffer is
+        // disabled, and with the primary plane its CRTC (atomic_remove_fb
+        // also clears the CRTC's mode).
+        for crtc in self
+            .crtcs
+            .iter_mut()
+            .filter(|c| c.primary_fb == Some(fb_id))
+        {
+            crtc.primary_fb = None;
+            crtc.enabled = false;
+            crtc.mode = None;
+        }
         let freed = self.remove_dumb_backing(fb.gem_handle);
         if freed.is_none() {
             self.remove_virtgpu_import(fb.gem_handle);

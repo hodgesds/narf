@@ -27,7 +27,7 @@ mod flip;
 #[path = "amdgpu_dcn401_scanout.rs"]
 mod scanout;
 pub use flip::FlipDone;
-pub use scanout::{ScanoutRunning, ScanoutUnderflow};
+pub use scanout::{ScanoutPosition, ScanoutRunning, ScanoutUnderflow, VblankPhase};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfaceFormat {

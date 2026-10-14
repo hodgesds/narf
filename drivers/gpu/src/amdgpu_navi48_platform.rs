@@ -581,6 +581,11 @@ pub async unsafe fn retire_inherited_display(
 /// Pipe of the published scanout, for the cursor hook.
 static CURSOR_PIPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
+/// The pipe of the lit native display (its display slot too).
+pub fn lit_pipe() -> u8 {
+    CURSOR_PIPE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Cursor hook published with the live scanout: upload once, then move;
 /// hide with an off-screen move. Never waits for the owner.
 fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool {
@@ -651,6 +656,8 @@ pub async unsafe fn modeset_display_mode(
         );
         (modeset, boot.display_scanout_framebuffer(pipe)?)
     };
+    // Its timing generator restarted: the vblank count continues.
+    restart_vblank(pipe);
     // Outside the owner lock: the observer may move the console here at once.
     CURSOR_PIPE.store(pipe, core::sync::atomic::Ordering::Release);
     crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
@@ -742,34 +749,128 @@ pub fn native_present_ready() -> bool {
     NATIVE_PRESENT.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// The pipe's 24-bit OTG frame count extended to DRM's 32-bit vblank count:
-/// (last raw count, extended count).
-static VBLANKS: narf_lib::sync::IrqSafeSpinLock<Option<(u32, u32)>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// One display's hardware vblank clock: the last reading (24-bit cooked
+/// count, its extension to DRM's 64-bit count, the clock then) and when it
+/// was read. After a relight the count continues from the last one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VblankClock {
+    raw: Option<u32>,
+    time: crate::drm::card::VblankTime,
+    read_ns: u64,
+}
 
-fn vblank_count(frame: u32) -> u32 {
+static VBLANK_CLOCKS: [narf_lib::sync::IrqSafeSpinLock<Option<VblankClock>>; 4] = [
+    narf_lib::sync::IrqSafeSpinLock::new(None),
+    narf_lib::sync::IrqSafeSpinLock::new(None),
+    narf_lib::sync::IrqSafeSpinLock::new(None),
+    narf_lib::sync::IrqSafeSpinLock::new(None),
+];
+
+/// Fold a reading into the clock: the 24-bit count advances the 64-bit
+/// one by its wrapped difference; the first reading after a (re)light
+/// counts one past the last known vblank.
+fn extend_vblank(
+    clock: Option<VblankClock>,
+    phase: crate::amdgpu_dcn401_otg::VblankPhase,
+    read_ns: u64,
+) -> VblankClock {
     const FRAME_MASK: u32 = 0xff_ffff;
-    let mut vblanks = VBLANKS.lock();
-    let count = match *vblanks {
-        Some((last, count)) => count.wrapping_add(frame.wrapping_sub(last) & FRAME_MASK),
-        None => frame,
+    let count = match clock {
+        Some(VblankClock {
+            raw: Some(raw),
+            time,
+            ..
+        }) => time.count + u64::from(phase.count.wrapping_sub(raw) & FRAME_MASK),
+        Some(VblankClock {
+            raw: None, time, ..
+        }) => time.count + 1,
+        None => u64::from(phase.count),
     };
-    *vblanks = Some((frame, count));
-    count
+    let at = |offset: i64| read_ns.saturating_add_signed(offset);
+    VblankClock {
+        raw: Some(phase.count),
+        time: crate::drm::card::VblankTime {
+            count,
+            start_ns: at(phase.start_ns),
+            ns: at(phase.end_ns),
+            period_ns: phase.period_ns,
+        },
+        read_ns,
+    }
+}
+
+/// A clock reading carried forward whole periods to `now`, while the
+/// owner is busy; none once the reading is a second old.
+fn extrapolate_vblank(clock: VblankClock, now: u64) -> Option<crate::drm::card::VblankTime> {
+    let t = clock.time;
+    if now.saturating_sub(clock.read_ns) > 1_000_000_000 || t.period_ns == 0 {
+        return None;
+    }
+    let periods = now.saturating_sub(t.start_ns) / t.period_ns;
+    Some(crate::drm::card::VblankTime {
+        count: t.count + periods,
+        start_ns: t.start_ns + periods * t.period_ns,
+        ns: t.ns + periods * t.period_ns,
+        period_ns: t.period_ns,
+    })
+}
+
+/// Read display `display`'s vblank clock from the hardware (display k
+/// scans out on pipe k). None while its timing does not run.
+fn read_vblank(boot: &mut boot::ColdBoot, display: u8) -> Option<crate::drm::card::VblankTime> {
+    let slot = VBLANK_CLOCKS.get(usize::from(display))?;
+    let position = boot.display_scanout_position(display).ok()?;
+    let read_ns = narf_time::wall::monotonic_ns();
+    let phase = position.phase()?;
+    let mut clock = slot.lock();
+    let next = extend_vblank(*clock, phase, read_ns);
+    *clock = Some(next);
+    Some(next.time)
+}
+
+/// Start display `display`'s count again from its last vblank: its timing
+/// generator was relit and its frame count restarted.
+fn restart_vblank(display: u8) {
+    if let Some(slot) = VBLANK_CLOCKS.get(usize::from(display)) {
+        if let Some(clock) = slot.lock().as_mut() {
+            clock.raw = None;
+        }
+    }
+}
+
+/// The hardware vblank clock of display `display`, read now, or carried
+/// forward from a recent reading while the display owner is busy.
+pub fn vblank_time(display: u8) -> Option<crate::drm::card::VblankTime> {
+    if let Some(mut owner) = OWNER.try_lock() {
+        let boot = owner.as_mut()?;
+        return read_vblank(boot, display);
+    }
+    let clock = (*VBLANK_CLOCKS.get(usize::from(display))?.lock())?;
+    extrapolate_vblank(clock, narf_time::wall::monotonic_ns())
+}
+
+/// `drm::card::VblankSource` for the native CRTC.
+pub fn crtc_vblank(crtc_id: u32) -> Option<crate::drm::card::VblankTime> {
+    let display = crate::amdgpu_navi48_kms::crtc_display(crtc_id)?;
+    vblank_time(display)
 }
 
 /// Complete the flip-complete events up to `ticket`: at the latched flip,
-/// or now in the last known vblank when the frame will not be flipped.
-fn complete_flip(ticket: Option<u64>, frame: Option<u32>) {
+/// in the vblank it latched in, or now in the last known vblank when the
+/// frame will not be flipped.
+fn complete_flip(ticket: Option<u64>, latched: Option<crate::drm::card::VblankTime>) {
     use crate::drm::card::{FlipStamp, FLIPS};
     let Some(ticket) = ticket else {
         return;
     };
     let ns = narf_time::wall::monotonic_ns();
-    match frame {
-        Some(frame) => {
-            let sequence = vblank_count(frame);
-            FLIPS.lock().complete(ticket, FlipStamp { ns, sequence });
+    match latched {
+        Some(t) => {
+            let stamp = FlipStamp {
+                ns: t.ns,
+                sequence: t.count as u32,
+            };
+            FLIPS.lock().complete(ticket, stamp);
         }
         None => {
             let mut flips = FLIPS.lock();
@@ -844,13 +945,17 @@ async fn presenter() {
             match owner.as_mut() {
                 // SAFETY: the owner lock serializes display writers; the
                 // frame's dumb buffer stays valid under DRM's buffer rules.
-                Some(boot) => unsafe { present_native(boot, pipe, frame).await },
+                Some(boot) => match unsafe { present_native(boot, pipe, frame).await } {
+                    // The vblank the flip latched in, as DRM counts it.
+                    Ok((before, after, _)) => Ok((before, after, read_vblank(boot, pipe))),
+                    Err(e) => Err(e),
+                },
                 None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
             }
         };
         match result {
-            Ok((before, after, done)) => {
-                complete_flip(frame.ticket, Some(done.frame));
+            Ok((before, after, latched)) => {
+                complete_flip(frame.ticket, latched);
                 follow_flip(before, after);
             }
             Err(e) => {
@@ -1558,7 +1663,7 @@ mod tests {
 
     /// A frame the native display cannot take still completes its
     /// flip-complete event, and the 24-bit OTG frame count extends across
-    /// its wrap into DRM's vblank count.
+    /// its wrap and a relight into DRM's vblank count.
     fn navi48_present_completes_refused_flip_and_extends_vblanks() -> TestResult {
         use crate::drm::card::FLIPS;
         let ticket = FLIPS.lock().reserve();
@@ -1571,10 +1676,40 @@ mod tests {
         if FLIPS.lock().stamp(ticket).is_none() {
             return TestResult::Fail("refused frame left its event waiting");
         }
-        let before = vblank_count(0xff_fff0);
-        let after = vblank_count(0x10);
-        if after.wrapping_sub(before) != 0x20 || vblank_count(0x10) != after {
+        use crate::amdgpu_dcn401_otg::VblankPhase;
+        let phase = |count| VblankPhase {
+            count,
+            start_ns: -1_000,
+            end_ns: 500_000,
+            period_ns: 16_000_000,
+        };
+        let first = extend_vblank(None, phase(0xff_fff0), 10_000_000);
+        let wrapped = extend_vblank(Some(first), phase(0x10), 20_000_000);
+        if first.time.count != 0xff_fff0
+            || wrapped.time.count - first.time.count != 0x20
+            || wrapped.time.start_ns != 20_000_000 - 1_000
+            || wrapped.time.ns != 20_500_000
+        {
             return TestResult::Fail("frame count wrap not extended");
+        }
+        // A relit display's restarted frame count continues the count.
+        let relit = extend_vblank(
+            Some(VblankClock {
+                raw: None,
+                ..wrapped
+            }),
+            phase(3),
+            30_000_000,
+        );
+        if relit.time.count != wrapped.time.count + 1 {
+            return TestResult::Fail("relight did not continue the count");
+        }
+        // Carried forward while the owner is busy, a second at most.
+        let t = extrapolate_vblank(relit, 30_000_000 + 2 * 16_000_000);
+        if t.map(|t| t.count) != Some(relit.time.count + 2)
+            || extrapolate_vblank(relit, 30_000_000 + 1_100_000_000).is_some()
+        {
+            return TestResult::Fail("extrapolation");
         }
         TestResult::Pass
     }

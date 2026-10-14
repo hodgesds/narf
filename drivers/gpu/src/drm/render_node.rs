@@ -306,6 +306,9 @@ pub fn ioctl_flags(cmd: u32) -> Option<IoctlFlags> {
         0xB2..=0xB4 => Some(IoctlFlags::render_allow()),
         // PRIME handle ↔ fd — RENDER_ALLOW (no display authority needed).
         0x2D | 0x2E => Some(IoctlFlags::render_allow()),
+        // WAIT_VBLANK, CRTC_GET_SEQUENCE, CRTC_QUEUE_SEQUENCE: Linux flags 0
+        // (primary opens are authenticated in NARF, render opens are denied).
+        0x3A..=0x3C => Some(IoctlFlags::auth_only()),
         // SYNCOBJ create/destroy/wait/signal — RENDER_ALLOW.
         0xBF | 0xC0 | 0xC3 | 0xC5 => Some(IoctlFlags::render_allow()),
         _ => None,
