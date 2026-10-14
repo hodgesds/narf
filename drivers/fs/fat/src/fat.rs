@@ -40,12 +40,21 @@ impl FatVersion {
     }
 }
 
-pub fn parse_entry(version: FatVersion, offset: usize, buffer: &[u8]) -> FatEntry {
+/// Decode the FAT entry for `cluster`, whose bytes start at `offset` in
+/// `buffer`.
+///
+/// FAT12 packs entry N into the 12 bits starting at byte `N + N/2`: the low
+/// 12 bits of that little-endian byte pair for an EVEN N, the high 12 for an
+/// odd one (`fs/fat/fatent.c::fat12_ent_get` tests `entry & 1`). The parity
+/// is the cluster's, not the offset's — `offset` is relative to whatever
+/// sector the caller read, and 512 is not a multiple of 3, so in every FAT
+/// sector after the first the two disagree.
+pub fn parse_entry(version: FatVersion, cluster: u32, offset: usize, buffer: &[u8]) -> FatEntry {
     let val = match version {
         FatVersion::Fat12 => {
             let b1 = buffer[offset] as u32;
             let b2 = buffer[offset + 1] as u32;
-            if offset % 3 == 0 {
+            if cluster & 1 == 0 {
                 b1 | ((b2 & 0x0F) << 8)
             } else {
                 (b1 >> 4) | (b2 << 4)
@@ -73,14 +82,23 @@ pub fn parse_entry(version: FatVersion, offset: usize, buffer: &[u8]) -> FatEntr
     }
 }
 
-/// Helper to write a FAT entry to raw bytes.
-pub fn write_entry(version: FatVersion, offset: usize, buffer: &mut [u8], value: u32) {
+/// Encode `value` as the FAT entry for `cluster` at `offset` in `buffer`,
+/// preserving the bits that belong to the neighbouring FAT12 entry (or the
+/// reserved FAT32 nibble). FAT12 parity follows the cluster, as in
+/// [`parse_entry`] (`fat12_ent_put` tests `entry & 1`).
+pub fn write_entry(
+    version: FatVersion,
+    cluster: u32,
+    offset: usize,
+    buffer: &mut [u8],
+    value: u32,
+) {
     match version {
         FatVersion::Fat12 => {
             let val = value & 0x0FFF;
             let b1 = buffer[offset] as u32;
             let b2 = buffer[offset + 1] as u32;
-            if offset % 3 == 0 {
+            if cluster & 1 == 0 {
                 buffer[offset] = (val & 0xFF) as u8;
                 buffer[offset + 1] = ((b2 & 0xF0) | ((val >> 8) & 0x0F)) as u8;
             } else {
