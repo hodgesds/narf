@@ -823,27 +823,29 @@ impl ColdBoot {
         self.select_display(pipe)?;
         let soc = self.prepare_configuration(&[selection]).await?;
         let plans = admit_displays(&soc, &[selection]).map_err(otg::Error::Admission)?;
-        self.prepare_pipes(&[selection], &plans, pipe).await?;
+        self.prepare_pipes(&[selection], &plans, &[pipe]).await?;
         // SAFETY: the caller's obligations.
         let mut lit =
             unsafe { self.light(pipe, selection, plans[0], &mut |_, y, row| fill(y, row)) }.await?;
         lit.modes = self.offered_modes(&soc, &[lit], 0, &edid_of(&ports, &paths, &selection));
         Ok(lit)
     }
-    /// Light every lightable sink (`select_all`), display k on pipe k, as
-    /// one configuration: the largest leading set the pipeline admits
-    /// together (`admit_displays`), its clocks programmed once for all of
-    /// them, then each display through the same steps as one display alone,
-    /// next to the ones already lit. `fill(display, y, row)` supplies each
-    /// visible row before that display's fetch starts. Displays left over
-    /// stay dark. If a display fails to light, the ones before it stay lit
-    /// and are returned with the failure.
+    /// Light every lightable sink (`select_all`) as one configuration, each
+    /// on the pipe `pipe_of` gives its port (its display slot too): sinks on
+    /// ports without a pipe stay dark. The largest leading set the pipeline
+    /// admits together (`admit_displays`) is lit, its clocks programmed once
+    /// for all of them, then each display through the same steps as one
+    /// display alone, next to the ones already lit. `want(port)` is the
+    /// timing asked of that port's sink; `fill(pipe, y, row)` supplies each
+    /// visible row before that display's fetch starts. If a display fails to
+    /// light, the ones before it stay lit and are returned with the failure.
     /// # Safety
     /// As for `modeset_display`: every display of this owner stopped.
     pub async unsafe fn modeset_displays(
         &mut self,
         mut fill: impl FnMut(u8, u32, &mut [u32]),
         want: impl Fn(usize) -> Option<Timing>,
+        pipe_of: impl Fn(usize) -> Option<u8>,
     ) -> Result<Configuration, ModesetError> {
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self
@@ -851,21 +853,26 @@ impl ColdBoot {
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
         let mut selections = select_all(&paths, &ports, max_bpc(), &want)?;
+        selections.retain(|s| pipe_of(s.port).is_some_and(|p| p < 4));
+        if selections.is_empty() {
+            return Err(ModesetError::NoSink);
+        }
         let limited = limited_range(broadcast_rgb());
         for s in &mut selections {
             s.limited = limited;
         }
-        self.select_display(0)?;
+        let pipes: Vec<u8> = selections.iter().filter_map(|s| pipe_of(s.port)).collect();
+        self.select_display(pipes[0])?;
         let soc = self.prepare_configuration(&selections).await?;
         let plans = admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
         selections.truncate(plans.len());
-        self.prepare_pipes(&selections, &plans, 0).await?;
+        self.prepare_pipes(&selections, &plans, &pipes).await?;
         let mut lit = Vec::with_capacity(selections.len());
         let mut failed = None;
-        for (k, (selection, plan)) in selections.iter().zip(&plans).enumerate() {
+        for ((selection, plan), &pipe) in selections.iter().zip(&plans).zip(&pipes) {
             // SAFETY: the caller's obligations; every earlier display is lit
             // in its own slot and left to it by each step.
-            match unsafe { self.light(k as u8, *selection, *plan, &mut fill) }.await {
+            match unsafe { self.light(pipe, *selection, *plan, &mut fill) }.await {
                 Ok(m) => lit.push(m),
                 Err(e) if lit.is_empty() => return Err(e),
                 Err(e) => {
@@ -902,21 +909,21 @@ impl ColdBoot {
         Ok(self.display_soc()?)
     }
     /// The configuration's global clocks (one DISPCLK/DPPREFCLK for every
-    /// plan), then each display's pipe clocks, display k on pipe `first + k`,
-    /// all while every display is stopped.
+    /// plan), then each display's pipe clocks on `pipes`, all while every
+    /// display is stopped.
     async fn prepare_pipes(
         &mut self,
         selections: &[Selection],
         plans: &[dml::Plan],
-        first: u8,
+        pipes: &[u8],
     ) -> Result<(), ModesetError> {
         let mut request = clock_request(&plans[0]);
         request.displays = plans.len() as u8;
         self.prepare_display_clocks(request)
             .await
             .map_err(ModesetError::Clocks)?;
-        for (k, (s, plan)) in selections.iter().zip(plans).enumerate() {
-            self.prepare_display_pipe_clocks(pipe_clock_request(first + k as u8, plan, s.hdmi))
+        for ((s, plan), &pipe) in selections.iter().zip(plans).zip(pipes) {
+            self.prepare_display_pipe_clocks(pipe_clock_request(pipe, plan, s.hdmi))
                 .await
                 .map_err(ModesetError::PipeClocks)?;
         }

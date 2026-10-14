@@ -1,9 +1,11 @@
-//! The native Navi48 display as DRM KMS state on the amdgpu card: one CRTC,
-//! one encoder (TMDS type, as amdgpu_dm reports DP) and one DisplayPort or
-//! HDMI connector carrying the sink's EDID, the exact timing being scanned
-//! out and every other EDID timing the driver can switch the sink to. Only
-//! those timings are accepted by SETCRTC/atomic; switching to another of them
-//! is a full native modeset run by the display monitor.
+//! The native Navi48 displays as DRM KMS state on the amdgpu card: one
+//! output per lightable board port (the first four), output k being CRTC k
+//! (pipe k), encoder k (TMDS type, as amdgpu_dm reports DP, driving only
+//! CRTC k) and a DisplayPort or HDMI connector carrying its sink's EDID, the
+//! exact timing being scanned out and every other EDID timing the driver
+//! can switch the sink to. Only those timings are accepted by SETCRTC/atomic;
+//! switching to another of them is a native modeset run by the display
+//! monitor. Output 0's objects are ids 1, 2 and 3; output k's add 3k.
 use crate::amdgpu_dml::Timing;
 use crate::drm::card::{
     Card, Connector, ConnectorStatus, ConnectorType, Crtc, Encoder, EncoderType, NativeOutput,
@@ -14,6 +16,17 @@ use crate::Mode;
 const CRTC: u32 = 1;
 const ENCODER: u32 = 2;
 const CONNECTOR: u32 = 3;
+/// Outputs at most: one per pipe.
+pub const MAX_OUTPUTS: usize = 4;
+pub fn crtc_id(output: usize) -> u32 {
+    CRTC + 3 * output as u32
+}
+pub fn encoder_id(output: usize) -> u32 {
+    ENCODER + 3 * output as u32
+}
+pub fn connector_id(output: usize) -> u32 {
+    CONNECTOR + 3 * output as u32
+}
 /// DRM_MODE_FLAG_{P,N}{H,V}SYNC and DRM_MODE_TYPE_{PREFERRED,DRIVER}.
 const PHSYNC: u32 = 1;
 const NHSYNC: u32 = 2;
@@ -27,7 +40,25 @@ const PLANE_FORMATS: [u32; 2] = [0x3432_5258, 0x3432_5241];
 
 /// The display (and pipe) behind a native CRTC id.
 pub fn crtc_display(crtc_id: u32) -> Option<u8> {
-    (crtc_id == CRTC).then(crate::amdgpu_navi48_platform::lit_pipe)
+    let k = crtc_id.checked_sub(CRTC)?;
+    (k % 3 == 0 && ((k / 3) as usize) < MAX_OUTPUTS).then_some((k / 3) as u8)
+}
+
+/// A lit sink as KMS shows it: its EDID, the timing scanned out and every
+/// timing it can be switched to.
+#[derive(Clone, Copy, Debug)]
+pub struct Sink<'a> {
+    pub edid: &'a [u8; 128],
+    pub timing: &'a Timing,
+    pub offered: &'a [Timing],
+}
+
+/// One output: its connector type and its sink, while one is lit (or
+/// switched off by DRM, still connected).
+#[derive(Clone, Copy, Debug)]
+pub struct Output<'a> {
+    pub kind: ConnectorType,
+    pub sink: Option<Sink<'a>>,
 }
 
 /// The exact DRM wire form of a DCN timing.
@@ -60,33 +91,42 @@ pub fn timing_wire(t: &Timing) -> DrmModeModeInfo {
     info
 }
 
-/// Set the card's single output to the lit sink (with its connector type), or
-/// to disconnected, keeping the last connector type.
-pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, &[Timing], ConnectorType)>) {
-    if card.crtcs.is_empty() {
-        card.crtcs.push(Crtc {
-            id: CRTC,
-            mode: None,
-            enabled: false,
-            primary_fb: None,
-            x: 0,
-            y: 0,
-        });
-        card.encoders.push(Encoder {
-            id: ENCODER,
-            encoder_type: EncoderType::Tmds,
-            possible_crtcs: 1,
-            possible_clones: 0,
-            crtc_id: Some(CRTC),
-        });
-        card.connectors.push(Connector {
-            id: CONNECTOR,
-            connector_type: ConnectorType::DisplayPort,
-            connector_type_id: 1,
-            status: ConnectorStatus::Disconnected,
-            encoder_id: Some(ENCODER),
-            modes: alloc::vec::Vec::new(),
-        });
+/// Set the card's outputs to `outputs` (at most `MAX_OUTPUTS`): output k
+/// connected to its lit sink, or disconnected. The topology is built for
+/// the outputs' count and kept while it stays the same.
+pub fn apply(card: &mut Card, outputs: &[Output]) {
+    let outputs = &outputs[..outputs.len().min(MAX_OUTPUTS)];
+    if card.connectors.len() != outputs.len() {
+        card.crtcs.clear();
+        card.encoders.clear();
+        card.connectors.clear();
+        for (k, o) in outputs.iter().enumerate() {
+            card.crtcs.push(Crtc {
+                id: crtc_id(k),
+                mode: None,
+                enabled: false,
+                primary_fb: None,
+                x: 0,
+                y: 0,
+            });
+            card.encoders.push(Encoder {
+                id: encoder_id(k),
+                encoder_type: EncoderType::Tmds,
+                // Each port has its pipe: its encoder drives that CRTC only.
+                possible_crtcs: 1 << k,
+                possible_clones: 0,
+                crtc_id: Some(crtc_id(k)),
+            });
+            card.connectors.push(Connector {
+                id: connector_id(k),
+                connector_type: o.kind,
+                connector_type_id: 1 + outputs[..k].iter().filter(|p| p.kind == o.kind).count()
+                    as u32,
+                status: ConnectorStatus::Disconnected,
+                encoder_id: Some(encoder_id(k)),
+                modes: alloc::vec::Vec::new(),
+            });
+        }
     }
     let to_mode = |w: &DrmModeModeInfo| Mode {
         width: u32::from(w.hdisplay),
@@ -94,106 +134,109 @@ pub fn apply(card: &mut Card, lit: Option<(&[u8; 128], &Timing, &[Timing], Conne
         refresh_hz: w.vrefresh as u16,
         bpp: 32,
     };
-    let wire = lit.map(|(_, t, _, _)| timing_wire(t));
-    let mode = wire.as_ref().map(to_mode);
-    // The running timing first, so a mode that two timings round to the same
-    // size and refresh reports the one being scanned out.
-    let mut timings: alloc::vec::Vec<DrmModeModeInfo> = wire.into_iter().collect();
-    if let Some((_, active, offered, _)) = lit {
-        for t in offered.iter().filter(|t| *t != active) {
-            let w = timing_wire(t);
-            // PREFERRED marks only the EDID's first (preferred) timing.
-            let w = DrmModeModeInfo {
-                r#type: if Some(t) == offered.first() {
-                    PREFERRED_DRIVER
-                } else {
-                    DRIVER
-                },
-                ..w
-            };
-            timings.push(w);
-        }
-        if let Some(first) = timings.first_mut() {
-            if offered.first().is_some_and(|p| p != active) {
-                first.r#type = DRIVER;
+    let mut native = alloc::vec::Vec::with_capacity(outputs.len());
+    for (k, o) in outputs.iter().enumerate() {
+        let wire = o.sink.map(|s| timing_wire(s.timing));
+        let mode = wire.as_ref().map(to_mode);
+        // The running timing first, so a mode that two timings round to the
+        // same size and refresh reports the one being scanned out.
+        let mut timings: alloc::vec::Vec<DrmModeModeInfo> = wire.into_iter().collect();
+        if let Some(sink) = o.sink {
+            for t in sink.offered.iter().filter(|t| *t != sink.timing) {
+                let w = timing_wire(t);
+                // PREFERRED marks only the EDID's first (preferred) timing.
+                let w = DrmModeModeInfo {
+                    r#type: if Some(t) == sink.offered.first() {
+                        PREFERRED_DRIVER
+                    } else {
+                        DRIVER
+                    },
+                    ..w
+                };
+                timings.push(w);
+            }
+            if let Some(first) = timings.first_mut() {
+                if sink.offered.first().is_some_and(|p| p != sink.timing) {
+                    first.r#type = DRIVER;
+                }
             }
         }
-    }
-    let mut modes: alloc::vec::Vec<Mode> = alloc::vec::Vec::new();
-    for m in timings.iter().map(to_mode) {
-        if !modes.contains(&m) {
-            modes.push(m);
+        let mut modes: alloc::vec::Vec<Mode> = alloc::vec::Vec::new();
+        for m in timings.iter().map(to_mode) {
+            if !modes.contains(&m) {
+                modes.push(m);
+            }
         }
-    }
-    if let Ok(crtc) = card.crtc_mut(CRTC) {
-        crtc.mode = mode;
-        crtc.enabled = mode.is_some();
-        if mode.is_none() {
-            crtc.primary_fb = None;
+        if let Ok(crtc) = card.crtc_mut(crtc_id(k)) {
+            crtc.mode = mode;
+            crtc.enabled = mode.is_some();
+            if mode.is_none() {
+                crtc.primary_fb = None;
+            }
         }
-    }
-    if let Some(c) = card.connectors.iter_mut().find(|c| c.id == CONNECTOR) {
-        c.status = if lit.is_some() {
-            ConnectorStatus::Connected
-        } else {
-            ConnectorStatus::Disconnected
-        };
-        c.modes = modes;
-        if let Some((_, _, _, kind)) = lit {
-            c.connector_type = kind;
+        if let Some(c) = card.connectors.iter_mut().find(|c| c.id == connector_id(k)) {
+            c.status = if o.sink.is_some() {
+                ConnectorStatus::Connected
+            } else {
+                ConnectorStatus::Disconnected
+            };
+            c.modes = modes;
+            c.connector_type = o.kind;
         }
+        native.push(NativeOutput {
+            connector: connector_id(k),
+            edid: o.sink.map(|s| *s.edid),
+            timings,
+            // amdgpu_dm attaches it to HDMI and SST DP connectors, which is
+            // all these ever are.
+            broadcast_rgb: Some(crate::amdgpu_navi48_boot::broadcast_rgb()),
+        });
     }
-    // The CRTC's vblanks are the display's hardware ones, and its plane
-    // scans 32-bit RGB (alpha unused: nothing lies below the primary).
+    // The CRTCs' vblanks are the displays' hardware ones, and their planes
+    // scan 32-bit RGB (alpha unused: nothing lies below the primary).
     card.vblank_source = Some(crate::amdgpu_navi48_platform::crtc_vblank);
     card.plane_formats = Some(&PLANE_FORMATS);
-    card.native = alloc::vec![NativeOutput {
-        connector: CONNECTOR,
-        edid: lit.map(|(edid, _, _, _)| *edid),
-        timings,
-        // amdgpu_dm attaches it to HDMI and SST DP connectors, which is all
-        // this one ever is.
-        broadcast_rgb: Some(crate::amdgpu_navi48_boot::broadcast_rgb()),
-    }];
+    card.native = native;
 }
 
-/// Switch the CRTC on or off without touching the connector: a DRM-driven
-/// disable leaves the sink connected with its modes. On only while a mode is
-/// set.
-pub fn set_crtc_active(card: &mut Card, active: bool) {
-    if let Ok(crtc) = card.crtc_mut(CRTC) {
+/// Switch output k's CRTC on or off without touching its connector: a
+/// DRM-driven disable leaves the sink connected with its modes. On only
+/// while a mode is set.
+pub fn set_crtc_active(card: &mut Card, output: usize, active: bool) {
+    if let Ok(crtc) = card.crtc_mut(crtc_id(output)) {
         crtc.enabled = active && crtc.mode.is_some();
     }
 }
 
+/// The registered amdgpu card's KMS state, if any.
+type CardState = alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<Card>>;
+fn amdgpu_card() -> Option<(u32, Option<CardState>)> {
+    let index = (0..crate::drm_registry::count() as u32)
+        .find(|&i| crate::drm_registry::driver_name(i) == Some("amdgpu"))?;
+    Some((index, crate::drm_registry::mode_state(index)))
+}
+
 /// `set_crtc_active` on the registered amdgpu card.
-pub fn set_active(active: bool) {
-    let Some(index) = (0..crate::drm_registry::count() as u32)
-        .find(|&i| crate::drm_registry::driver_name(i) == Some("amdgpu"))
-    else {
-        return;
-    };
-    if let Some(state) = crate::drm_registry::mode_state(index) {
-        set_crtc_active(&mut state.lock(), active);
+pub fn set_active(output: usize, active: bool) {
+    if let Some((_, Some(state))) = amdgpu_card() {
+        set_crtc_active(&mut state.lock(), output, active);
     }
 }
 
-/// Publish the lit sink (or its absence) on the registered amdgpu card,
-/// attaching KMS state on first use. Open clients keep their framebuffers.
-pub fn publish(lit: Option<(&[u8; 128], &Timing, &[Timing], ConnectorType)>) {
-    let Some(index) = (0..crate::drm_registry::count() as u32)
-        .find(|&i| crate::drm_registry::driver_name(i) == Some("amdgpu"))
-    else {
+/// Publish the outputs on the registered amdgpu card, attaching KMS state
+/// on first use. Open clients keep their framebuffers.
+pub fn publish(outputs: &[Output]) {
+    let Some((index, state)) = amdgpu_card() else {
         return;
     };
-    match crate::drm_registry::mode_state(index) {
-        Some(state) => apply(&mut state.lock(), lit),
+    match state {
+        Some(state) => apply(&mut state.lock(), outputs),
         None => {
             // The base amdgpu KMS ABI only: no render feature level is
             // claimed, so Mesa's radeonsi declines this device rather than
             // issuing render ioctls the native driver does not implement.
             let mut card = Card::new("amdgpu", "AMD GPU", (3, 0, 0));
-            apply(&mut card, lit);
+            apply(&mut card, outputs);
             crate::drm_registry::attach_mode_state(index, card);
         }
     }

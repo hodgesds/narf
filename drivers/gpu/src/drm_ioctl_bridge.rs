@@ -2153,17 +2153,20 @@ pub(crate) fn dispatch_card_for_file(
         IoctlCmd::ModeRmFb => {
             // SAFETY: `arg` is the user drm_mode_rmfb pointer (a u32 fb id).
             let fb_id = u32::from_le_bytes(unsafe { copy_in(arg, 4)? }[..4].try_into().unwrap());
-            let shown = mode_state
+            let shown: Vec<u32> = mode_state
                 .lock()
                 .crtcs
                 .iter()
-                .any(|c| c.primary_fb == Some(fb_id));
+                .filter(|c| c.primary_fb == Some(fb_id))
+                .map(|c| c.id)
+                .collect();
             let result = handle_generic(&mode_state, cmd, arg, &ctx);
-            if result.is_ok()
-                && shown
-                && crate::drm_registry::driver_name(card_index) == Some("amdgpu")
-            {
-                crate::amdgpu_navi48_platform::request_display_active(false);
+            if result.is_ok() && crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
+                for crtc_id in shown {
+                    if let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc_id) {
+                        crate::amdgpu_navi48_platform::request_display_active(display, false);
+                    }
+                }
             }
             result
         }
@@ -3762,7 +3765,7 @@ fn handle_atomic(
         .collect();
 
     // The exact timing an atomic MODE_ID set, for the native display.
-    let mut native_mode: Option<crate::drm::ioctl::DrmModeModeInfo> = None;
+    let mut native_modes: Vec<(u32, crate::drm::ioctl::DrmModeModeInfo)> = Vec::new();
     let mut state = crate::drm::atomic::AtomicState {
         allow_modeset: req.flags & ALLOW_MODESET != 0,
         ..Default::default()
@@ -3895,7 +3898,25 @@ fn handle_atomic(
                                 if !card.accepts_mode_blob(mode) {
                                     return Err(FsError::InvalidData);
                                 }
-                                native_mode = crate::drm::ioctl::DrmModeModeInfo::from_bytes(mode);
+                                if let Some(wire) =
+                                    crate::drm::ioctl::DrmModeModeInfo::from_bytes(mode)
+                                {
+                                    // On the native card, a timing this
+                                    // CRTC's own display offers.
+                                    if crate::drm_registry::driver_name(card_index)
+                                        == Some("amdgpu")
+                                        && !crate::amdgpu_navi48_kms::crtc_display(object_id)
+                                            .is_some_and(|d| {
+                                                crate::amdgpu_navi48_platform::display_offers(
+                                                    d, &wire,
+                                                )
+                                            })
+                                    {
+                                        return Err(FsError::InvalidData);
+                                    }
+                                    native_modes.retain(|(id, _)| *id != object_id);
+                                    native_modes.push((object_id, wire));
+                                }
                                 Some(crate::Mode {
                                     width: u16::from_le_bytes(mode[4..6].try_into().unwrap())
                                         as u32,
@@ -4008,19 +4029,33 @@ fn handle_atomic(
             for &(connector, value) in &broadcast_rgb {
                 apply_broadcast_rgb(card_index, &mut card, connector, value);
             }
-            if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
-                for crtc in state.crtcs.iter().filter(|c| c.active_changed) {
-                    crate::amdgpu_navi48_platform::request_display_active(crtc.active);
-                }
-                // A new mode is a native modeset the display monitor runs.
-                if state.crtcs.iter().any(|c| c.mode_changed) {
-                    crate::amdgpu_navi48_platform::request_display_mode(native_mode.as_ref());
+            let amdgpu = crate::drm_registry::driver_name(card_index) == Some("amdgpu");
+            if amdgpu {
+                for crtc in &state.crtcs {
+                    let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc.id) else {
+                        continue;
+                    };
+                    if crtc.active_changed {
+                        crate::amdgpu_navi48_platform::request_display_active(display, crtc.active);
+                    }
+                    // A new mode is a native modeset the display monitor runs.
+                    if crtc.mode_changed {
+                        let wire = native_modes
+                            .iter()
+                            .find(|(id, _)| *id == crtc.id)
+                            .map(|(_, w)| w);
+                        crate::amdgpu_navi48_platform::request_display_mode(display, wire);
+                    }
                 }
             }
-            let active_plane = state
+            // Every enabled plane presents on the native card (each on its
+            // own display); the CPU-copy cards show one scanout.
+            let active_planes: Vec<(u32, u32)> = state
                 .planes
                 .iter()
-                .find_map(|plane| Some((plane.crtc_id?, plane.fb_id?)));
+                .filter_map(|plane| Some((plane.crtc_id?, plane.fb_id?)))
+                .take(if amdgpu { usize::MAX } else { 1 })
+                .collect();
             // Advance the simulated vblank exactly once per affected CRTC;
             // the PAGE_FLIP_EVENT and any OUT_FENCE_PTR on the same CRTC
             // observe the same present instant.
@@ -4037,24 +4072,27 @@ fn handle_atomic(
                 at
             }
             let mut presented: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
-            // The CRTC whose plane's dumb buffer goes through a hardware flip:
-            // its event waits for that flip.
-            let hardware_crtc = active_plane
-                .filter(|_| hardware_flips(card_index))
-                .and_then(|(crtc_id, fb_id)| {
+            // CRTCs whose plane's dumb buffer goes through a hardware flip:
+            // their events wait for that flip.
+            let hardware_crtcs: Vec<u32> = active_planes
+                .iter()
+                .filter(|&&(crtc_id, _)| hardware_flips(card_index, crtc_id))
+                .filter_map(|&(crtc_id, fb_id)| {
                     let gem_handle = card.framebuffer(fb_id).ok()?.gem_handle;
                     (card.virtgpu_import(gem_handle).is_none()
                         && card.dumb_backing(gem_handle).is_some())
                     .then_some(crtc_id)
-                });
-            let mut flip_ticket = None;
+                })
+                .collect();
+            let mut flip_tickets: Vec<(u32, u64)> = Vec::new();
             if let (Some(queue), Some(crtc_ids)) = (event_queue.as_mut(), event_crtc_ids) {
                 for crtc_id in crtc_ids {
-                    if Some(crtc_id) == hardware_crtc {
-                        let ticket = crate::drm::card::FLIPS.lock().reserve();
-                        card.queue_hw_flip_event(queue, req.user_data, crtc_id, ticket)
+                    let display = crate::amdgpu_navi48_kms::crtc_display(crtc_id);
+                    if let (true, Some(display)) = (hardware_crtcs.contains(&crtc_id), display) {
+                        let ticket = crate::drm::card::flips(display).lock().reserve();
+                        card.queue_hw_flip_event(queue, req.user_data, crtc_id, display, ticket)
                             .map_err(|_| FsError::OutOfMemory)?;
-                        flip_ticket = Some(ticket);
+                        flip_tickets.push((crtc_id, ticket));
                         continue;
                     }
                     let at = present_at_for(&mut card, &mut presented, crtc_id);
@@ -4074,19 +4112,27 @@ fn handle_atomic(
                     }
                 }
             }
-            active_plane.and_then(|(_, fb_id)| {
-                let fb = card.framebuffer(fb_id).ok()?;
-                let gem_handle = fb.gem_handle;
-                Some((
-                    card.virtgpu_import(gem_handle).cloned(),
-                    card.dumb_backing(gem_handle).map(|backing| backing.phys),
-                    fb.pitch,
-                    fb.width,
-                    fb.height,
-                    fb_id,
-                    flip_ticket,
-                ))
-            })
+            let presentations: Vec<_> = active_planes
+                .iter()
+                .filter_map(|&(crtc_id, fb_id)| {
+                    let fb = card.framebuffer(fb_id).ok()?;
+                    let gem_handle = fb.gem_handle;
+                    Some((
+                        crtc_id,
+                        card.virtgpu_import(gem_handle).cloned(),
+                        card.dumb_backing(gem_handle).map(|backing| backing.phys),
+                        fb.pitch,
+                        fb.width,
+                        fb.height,
+                        fb_id,
+                        flip_tickets
+                            .iter()
+                            .find(|(id, _)| *id == crtc_id)
+                            .map(|(_, t)| *t),
+                    ))
+                })
+                .collect();
+            Some(presentations)
         }
     };
 
@@ -4098,14 +4144,24 @@ fn handle_atomic(
             req.count_objs,
             total_props,
             req.flags,
-            presentation.is_some(),
+            presentation.as_ref().is_some_and(|p| !p.is_empty()),
         );
     }
-    if let Some((resource, src_phys, pitch, width, height, fb_id, flip_ticket)) = presentation {
+    for (crtc_id, resource, src_phys, pitch, width, height, fb_id, flip_ticket) in
+        presentation.into_iter().flatten()
+    {
         if let Some(resource) = resource {
             present_virgl_frame(&resource, width, height)?;
         } else if let Some(src_phys) = src_phys {
-            present_frame(card_index, src_phys, pitch, width, height, flip_ticket);
+            present_frame(
+                card_index,
+                crtc_id,
+                src_phys,
+                pitch,
+                width,
+                height,
+                flip_ticket,
+            );
         } else {
             note_missing_backing("ATOMIC", fb_id);
         }
@@ -4488,6 +4544,11 @@ fn handle_setcrtc(
     {
         let mut card = mode_state.lock();
 
+        // The native display behind this CRTC, on the amdgpu card.
+        let native_display = (crate::drm_registry::driver_name(card_index) == Some("amdgpu"))
+            .then(|| crate::amdgpu_navi48_kms::crtc_display(req.crtc_id))
+            .flatten();
+        let mut native_wire = None;
         if req.mode_valid != 0 {
             let m = req.mode;
             let wire = crate::drm::ioctl::DrmModeModeInfo {
@@ -4510,11 +4571,15 @@ fn handle_setcrtc(
             if !card.accepts_mode(&wire) {
                 return Err(FsError::InvalidData);
             }
-            if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
-                // Another offered timing is a native modeset the display
-                // monitor runs; the current one leaves it as it is.
-                crate::amdgpu_navi48_platform::request_display_mode(Some(&wire));
+            // On the native card, a timing this CRTC's own display offers.
+            if native_display
+                .is_some_and(|d| !crate::amdgpu_navi48_platform::display_offers(d, &wire))
+                || (crate::drm_registry::driver_name(card_index) == Some("amdgpu")
+                    && native_display.is_none())
+            {
+                return Err(FsError::InvalidData);
             }
+            native_wire = Some(wire);
         }
 
         let requested = (req.mode_valid != 0).then(|| crate::Mode {
@@ -4542,9 +4607,14 @@ fn handle_setcrtc(
                 crtc.mode = requested;
             }
         }
-        // The native display follows the CRTC's on/off state.
-        if crate::drm_registry::driver_name(card_index) == Some("amdgpu") {
-            crate::amdgpu_navi48_platform::request_display_active(req.fb_id != 0);
+        // The native display follows the CRTC's on/off state, and another
+        // offered timing is a native modeset the display monitor runs (the
+        // current one leaves it as it is).
+        if let Some(display) = native_display {
+            if let Some(wire) = native_wire.as_ref() {
+                crate::amdgpu_navi48_platform::request_display_mode(display, Some(wire));
+            }
+            crate::amdgpu_navi48_platform::request_display_active(display, req.fb_id != 0);
         }
 
         if req.fb_id == 0 {
@@ -4580,7 +4650,7 @@ fn handle_setcrtc(
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
-        present_frame(card_index, src, src_pitch, src_w, src_h, None);
+        present_frame(card_index, req.crtc_id, src, src_pitch, src_w, src_h, None);
     } else {
         note_missing_backing("SETCRTC", req.fb_id);
     }
@@ -4687,10 +4757,15 @@ fn handle_page_flip(
             .primary_fb = Some(req.fb_id);
 
         if let Some(queue) = event_queue.as_mut() {
-            if virgl_resource.is_none() && src_phys.is_some() && hardware_flips(card_index) {
+            let hardware = (virgl_resource.is_none()
+                && src_phys.is_some()
+                && hardware_flips(card_index, req.crtc_id))
+            .then(|| crate::amdgpu_navi48_kms::crtc_display(req.crtc_id))
+            .flatten();
+            if let Some(display) = hardware {
                 // The event waits for the hardware flip of this frame.
-                let ticket = crate::drm::card::FLIPS.lock().reserve();
-                card.queue_hw_flip_event(queue, req.user_data, req.crtc_id, ticket)
+                let ticket = crate::drm::card::flips(display).lock().reserve();
+                card.queue_hw_flip_event(queue, req.user_data, req.crtc_id, display, ticket)
                     .map_err(|_| FsError::OutOfMemory)?;
                 flip_ticket = Some(ticket);
             } else {
@@ -4719,7 +4794,15 @@ fn handle_page_flip(
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
-        present_frame(card_index, src, src_pitch, src_w, src_h, flip_ticket);
+        present_frame(
+            card_index,
+            req.crtc_id,
+            src,
+            src_pitch,
+            src_w,
+            src_h,
+            flip_ticket,
+        );
     } else {
         note_missing_backing("PAGE_FLIP", req.fb_id);
     }
@@ -4767,15 +4850,17 @@ fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> R
 /// the visible scanout always agree.
 /// Whether `card_index` presents dumb-buffer frames through a hardware flip,
 /// so their flip-complete events wait for that flip (see `drm::card::FlipLog`).
-fn hardware_flips(card_index: u32) -> bool {
+fn hardware_flips(card_index: u32, crtc_id: u32) -> bool {
     crate::drm_registry::driver_name(card_index) == Some("amdgpu")
-        && crate::amdgpu_navi48_platform::native_present_ready()
+        && crate::amdgpu_navi48_kms::crtc_display(crtc_id)
+            .is_some_and(crate::amdgpu_navi48_platform::native_present_ready)
 }
 
 /// `flip_ticket` is the ticket of a flip-complete event waiting for this
 /// frame's hardware flip; it is completed whichever way the frame goes.
 fn present_frame(
     card_index: u32,
+    crtc_id: u32,
     src_phys: u64,
     src_pitch: u32,
     src_w: u32,
@@ -4783,20 +4868,27 @@ fn present_frame(
     flip_ticket: Option<u64>,
 ) {
     let driver = crate::drm_registry::driver_name(card_index);
-    // The native amdgpu display presents tear-free through its back buffer
+    // A native amdgpu display presents tear-free through its back buffer
     // and a VUPDATE-latched flip instead of copying onto the visible front.
     if driver == Some("amdgpu") {
-        // A refused frame completes its ticket at once.
-        let native = crate::amdgpu_navi48_platform::present_frame(
-            src_phys,
-            src_pitch,
-            src_w,
-            src_h,
-            flip_ticket,
-        );
-        if native {
-            narf_console::fb_take_for_user();
-            return;
+        if let Some(display) = crate::amdgpu_navi48_kms::crtc_display(crtc_id) {
+            // A refused frame completes its ticket at once.
+            let native = crate::amdgpu_navi48_platform::present_frame(
+                display,
+                src_phys,
+                src_pitch,
+                src_w,
+                src_h,
+                flip_ticket,
+            );
+            if native {
+                narf_console::fb_take_for_user();
+                return;
+            }
+            // Only the console's display has a CPU front to copy onto.
+            if display != crate::amdgpu_navi48_platform::console_pipe() {
+                return;
+            }
         }
     }
     if driver == Some("virtio_gpu") {

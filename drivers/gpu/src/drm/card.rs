@@ -276,8 +276,8 @@ struct QueuedEvent {
 enum Wait {
     /// Only `deliver_at_ns` (a simulated vblank).
     Time,
-    /// A hardware flip: (ticket, refresh period in ns).
-    Flip(u64, u64),
+    /// A hardware flip of a display: (display, ticket, refresh period in ns).
+    Flip(u8, u64, u64),
     /// A hardware vblank count on a CRTC (WAIT_VBLANK with an event, or
     /// CRTC_QUEUE_SEQUENCE when `sequence` is set).
     Vblank {
@@ -319,8 +319,8 @@ impl QueuedEvent {
         let mut bytes = self.bytes;
         match self.wait {
             Wait::Time => return (self.deliver_at_ns <= now).then_some(bytes),
-            Wait::Flip(ticket, _) => {
-                let stamp = FLIPS.lock().stamp(ticket)?;
+            Wait::Flip(display, ticket, _) => {
+                let stamp = flips(display).lock().stamp(ticket)?;
                 patch_vblank_event(&mut bytes, stamp.ns, stamp.sequence);
             }
             Wait::Vblank {
@@ -356,7 +356,9 @@ impl QueuedEvent {
     fn deadline(&self, now: u64) -> u64 {
         match self.wait {
             Wait::Time => self.deliver_at_ns,
-            Wait::Flip(ticket, period_ns) => FLIPS.lock().recheck_at(ticket, now, period_ns),
+            Wait::Flip(display, ticket, period_ns) => {
+                flips(display).lock().recheck_at(ticket, now, period_ns)
+            }
             Wait::Vblank {
                 source,
                 crtc_id,
@@ -592,9 +594,18 @@ impl FlipLog {
     }
 }
 
-/// Hardware flips of the native display.
-pub static FLIPS: narf_lib::sync::IrqSafeSpinLock<FlipLog> =
-    narf_lib::sync::IrqSafeSpinLock::new(FlipLog::new());
+/// Hardware flips of the native displays, one log per display (pipe).
+pub static FLIPS: [narf_lib::sync::IrqSafeSpinLock<FlipLog>; 4] = [
+    narf_lib::sync::IrqSafeSpinLock::new(FlipLog::new()),
+    narf_lib::sync::IrqSafeSpinLock::new(FlipLog::new()),
+    narf_lib::sync::IrqSafeSpinLock::new(FlipLog::new()),
+    narf_lib::sync::IrqSafeSpinLock::new(FlipLog::new()),
+];
+
+/// Display `display`'s flip log (the last one for an out-of-range index).
+pub fn flips(display: u8) -> &'static narf_lib::sync::IrqSafeSpinLock<FlipLog> {
+    &FLIPS[usize::from(display).min(FLIPS.len() - 1)]
+}
 
 /// A single GPU presented to userspace as `/dev/dri/card0` (or cardN).
 ///
@@ -983,7 +994,7 @@ impl Card {
         })
     }
 
-    /// Queue the flip-complete event of a frame a display flips in hardware
+    /// Queue the flip-complete event of a frame `display` flips in hardware
     /// under `ticket` (see [`FlipLog`]): it becomes readable when that flip
     /// completes and carries the flip's time and vblank count, as Linux's
     /// pageflip interrupt handler sends it.
@@ -992,6 +1003,7 @@ impl Card {
         events: &mut DrmEventQueue,
         user_data: u64,
         crtc_id: u32,
+        display: u8,
         ticket: u64,
     ) -> Result<(), DrmEventQueueFull> {
         const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
@@ -1004,7 +1016,7 @@ impl Card {
         e[28..32].copy_from_slice(&crtc_id.to_le_bytes());
         events.push(QueuedEvent {
             deliver_at_ns: 0,
-            wait: Wait::Flip(ticket, period_ns),
+            wait: Wait::Flip(display, ticket, period_ns),
             bytes: e,
         })
     }

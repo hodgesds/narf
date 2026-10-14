@@ -578,18 +578,114 @@ pub async unsafe fn retire_inherited_display(
     unsafe { boot.retire_inherited_display().await }
 }
 
-/// Pipe of the published scanout, for the cursor hook.
-static CURSOR_PIPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+// ── Native displays ──────────────────────────────────────────────────
+//
+// Output k is the k-th lightable board port (DisplayPort or HDMI, the
+// first four); it is always lit on pipe k, which is also its display slot
+// in the owner and its CRTC in KMS. The console runs on the first display
+// of the configuration (DP before HDMI); DRM clients present per display.
 
-/// The pipe of the lit native display (its display slot too).
-pub fn lit_pipe() -> u8 {
-    CURSOR_PIPE.load(core::sync::atomic::Ordering::Acquire)
+type Timing = crate::amdgpu_dml::Timing;
+type Modeset = crate::amdgpu_navi48_boot::Modeset;
+type ModesetError = crate::amdgpu_navi48_boot::ModesetError;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+/// Pipe of the console's display, for the cursor hook.
+static CURSOR_PIPE: AtomicU8 = AtomicU8::new(0);
+
+/// The pipe (display) the console runs on.
+pub fn console_pipe() -> u8 {
+    CURSOR_PIPE.load(Ordering::Acquire)
 }
 
-/// Cursor hook published with the live scanout: upload once, then move;
-/// hide with an off-screen move. Never waits for the owner.
+/// The lightable board ports in output order: (display-path index,
+/// connector type). Fixed for the board once the monitor starts.
+static OUTPUTS: narf_lib::sync::IrqSafeSpinLock<Vec<(usize, crate::drm::card::ConnectorType)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
+
+fn lightable_outputs(boot: &boot::ColdBoot) -> Vec<(usize, crate::drm::card::ConnectorType)> {
+    use crate::amdgpu_dcn_inventory::Connector;
+    use crate::drm::card::ConnectorType;
+    let Ok(paths) = boot.display_paths() else {
+        return Vec::new();
+    };
+    paths
+        .iter()
+        .enumerate()
+        .filter_map(|(port, p)| match p.connector {
+            Connector::DisplayPort => Some((port, ConnectorType::DisplayPort)),
+            Connector::HdmiTypeA => Some((port, ConnectorType::HdmiA)),
+            _ => None,
+        })
+        .take(crate::amdgpu_navi48_kms::MAX_OUTPUTS)
+        .collect()
+}
+
+/// The pipe (output) of board port `port`.
+fn pipe_of(port: usize) -> Option<u8> {
+    OUTPUTS
+        .lock()
+        .iter()
+        .position(|&(p, _)| p == port)
+        .map(|k| k as u8)
+}
+
+/// What DRM asked of one output and what it shows: a CRTC switched off
+/// keeps its sink published (connected), as Linux keeps a disabled
+/// connector's modes.
+struct OutputState {
+    /// DRM wants the CRTC on (SETCRTC with a framebuffer, atomic ACTIVE=1).
+    active: bool,
+    /// The mode DRM last set, or None for the sink's preferred mode.
+    requested: Option<Timing>,
+    /// The lit sink: EDID, running timing and every offered timing.
+    shown: Option<([u8; 128], Timing, Vec<Timing>)>,
+}
+impl OutputState {
+    const fn new() -> Self {
+        Self {
+            active: true,
+            requested: None,
+            shown: None,
+        }
+    }
+}
+static OUTPUT_STATE: narf_lib::sync::IrqSafeSpinLock<[OutputState; 4]> =
+    narf_lib::sync::IrqSafeSpinLock::new([const { OutputState::new() }; 4]);
+
+/// Publish every output on the amdgpu card's KMS state; a shown sink whose
+/// CRTC DRM switched off stays connected with its CRTC off.
+fn publish_outputs() {
+    let outputs = OUTPUTS.lock().clone();
+    let state = OUTPUT_STATE.lock();
+    let sinks: Vec<_> = outputs
+        .iter()
+        .enumerate()
+        .map(|(k, &(_, kind))| (kind, state[k].shown.as_ref(), state[k].active))
+        .collect();
+    let kms: Vec<crate::amdgpu_navi48_kms::Output> = sinks
+        .iter()
+        .map(|&(kind, shown, _)| crate::amdgpu_navi48_kms::Output {
+            kind,
+            sink: shown.map(|(edid, timing, offered)| crate::amdgpu_navi48_kms::Sink {
+                edid,
+                timing,
+                offered,
+            }),
+        })
+        .collect();
+    crate::amdgpu_navi48_kms::publish(&kms);
+    for (k, &(_, shown, active)) in sinks.iter().enumerate() {
+        if shown.is_some() && !active {
+            crate::amdgpu_navi48_kms::set_active(k, false);
+        }
+    }
+}
+
+/// Cursor hook published with the console's scanout: upload once, then
+/// move; hide with an off-screen move. Never waits for the owner.
 fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bool {
-    let pipe = CURSOR_PIPE.load(core::sync::atomic::Ordering::Acquire);
+    let pipe = CURSOR_PIPE.load(Ordering::Acquire);
     let Some(mut owner) = OWNER.try_lock() else {
         return true;
     };
@@ -598,8 +694,9 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
     };
     let (w, h, _) = image;
     let shown = boot
-        .display_timing_status()
+        .display_status(pipe)
         .ok()
+        .flatten()
         .and_then(|s| s.cursor)
         .is_some_and(|c| c.pipe == pipe && (c.width, c.height) == (w, h));
     // A failure quarantines the pipe in the owner; the pointer just stops.
@@ -615,67 +712,102 @@ fn scanout_cursor(image: (u32, u32, &[u32]), position: Option<(i32, i32)>) -> bo
     true
 }
 
-/// Light the first answering DP SST sink at its preferred mode on `pipe`,
-/// filling each visible row with `fill(y, row)` before fetch starts, then
-/// publish the live surface as the active external scanout.
+/// Put the console on `pipe`'s live scanout, or withdraw it.
+fn publish_console(boot: &boot::ColdBoot, pipe: Option<u8>) {
+    match pipe.and_then(|p| boot.display_scanout_framebuffer(p).ok().map(|fb| (p, fb))) {
+        Some((p, fb)) => {
+            CURSOR_PIPE.store(p, Ordering::Release);
+            crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
+            crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
+        }
+        None => crate::amdgpu_dcn_display::publish_external(None, None),
+    }
+}
+
+/// Make `m` presentable: its back buffer (reused across relights of the
+/// same geometry) for tear-free DRM frames, its vblank count continued, its
+/// sink published as shown.
+/// # Safety
+/// As for `modeset_displays`.
+async unsafe fn adopt(boot: &mut boot::ColdBoot, m: &Modeset) {
+    let pipe = m.pipe;
+    // Without a back buffer (allocation failed) DRM frames fall back to
+    // copies onto the visible front.
+    // SAFETY: the caller's obligations; touches only owned VRAM and HDP.
+    let _ = unsafe { boot.prepare_display_back_buffer(pipe).await };
+    present_slot(pipe).native.store(
+        boot.display_back_framebuffer(pipe).is_ok(),
+        Ordering::Release,
+    );
+    // Its timing generator restarted: the vblank count continues.
+    restart_vblank(pipe);
+    let s = &m.selection;
+    let offered: Vec<Timing> = m.modes.iter().flatten().copied().collect();
+    if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(pipe)) {
+        o.shown = Some((s.edid, s.timing, offered));
+    }
+}
+
+/// Stop presenting on `pipe` and, when it carried the console, move the
+/// console to another lit display (or withdraw it).
+fn withdraw(boot: &boot::ColdBoot, pipe: u8, lit: &[Option<Modeset>; 4]) {
+    present_slot(pipe).native.store(false, Ordering::Release);
+    if CURSOR_PIPE.load(Ordering::Acquire) == pipe {
+        let next = lit.iter().flatten().map(|m| m.pipe).find(|&p| p != pipe);
+        publish_console(boot, next);
+    }
+}
+
+/// Light every plugged sink whose CRTC DRM has not switched off, as one
+/// configuration (output k on pipe k), filling rows with `fill(pipe, y,
+/// row)` before each fetch starts, then publish them: the console on the
+/// first display, every output on KMS. Every display must be stopped.
 /// # Safety
 /// Inherited display consumers must be retired. Exclude firmware/FAMS and
 /// concurrent display/hub/VM/IRQ/clock/reset/power/link writers.
-pub async unsafe fn modeset_display(
-    pipe: u8,
-    fill: impl FnMut(u32, &mut [u32]),
-) -> Result<crate::amdgpu_navi48_boot::Modeset, crate::amdgpu_navi48_boot::ModesetError> {
+pub async unsafe fn modeset_displays(
+    fill: impl FnMut(u8, u32, &mut [u32]),
+) -> Result<crate::amdgpu_navi48_boot::Configuration, ModesetError> {
+    use crate::amdgpu_navi48_boot::Error as BootError;
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
     // SAFETY: the caller's obligations.
-    unsafe { modeset_display_mode(pipe, fill, None) }.await
+    unsafe { light_displays(boot, fill) }.await
 }
 
-/// `modeset_display` in `want` when the sink lists and fits it, else in its
-/// preferred mode.
+/// `modeset_displays` with the owner held.
 /// # Safety
-/// As for `modeset_display`.
-pub async unsafe fn modeset_display_mode(
-    pipe: u8,
-    fill: impl FnMut(u32, &mut [u32]),
-    want: Option<crate::amdgpu_dml::Timing>,
-) -> Result<crate::amdgpu_navi48_boot::Modeset, crate::amdgpu_navi48_boot::ModesetError> {
-    use crate::amdgpu_navi48_boot::{Error as BootError, ModesetError};
-    let (modeset, fb) = {
-        let mut owner = OWNER.lock().await;
-        let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
-        // SAFETY: serialized retained owners; caller excludes external writers.
-        let modeset = unsafe { boot.modeset_display_mode(pipe, fill, want).await }?;
-        // DRM frames present tear-free through a back buffer and a latched
-        // flip. Without one (allocation failed), they fall back to copies
-        // onto the visible front. A back buffer retained by an earlier
-        // modeset of this pipe is reused.
-        // SAFETY: as above; touches only owned VRAM and the HDP flush.
-        let _ = unsafe { boot.prepare_display_back_buffer(pipe).await };
-        NATIVE_PRESENT.store(
-            boot.display_back_framebuffer(pipe).is_ok(),
-            core::sync::atomic::Ordering::Release,
-        );
-        (modeset, boot.display_scanout_framebuffer(pipe)?)
+/// As for `modeset_displays`.
+async unsafe fn light_displays(
+    boot: &mut boot::ColdBoot,
+    fill: impl FnMut(u8, u32, &mut [u32]),
+) -> Result<crate::amdgpu_navi48_boot::Configuration, ModesetError> {
+    {
+        let mut outputs = OUTPUTS.lock();
+        if outputs.is_empty() {
+            *outputs = lightable_outputs(boot);
+        }
+    }
+    let wants: Vec<(bool, Option<Timing>)> = {
+        let mut state = OUTPUT_STATE.lock();
+        // What this lighting lights is shown afresh; an output DRM switched
+        // off keeps its sink published.
+        for o in state.iter_mut().filter(|o| o.active) {
+            o.shown = None;
+        }
+        state.iter().map(|o| (o.active, o.requested)).collect()
     };
-    // Its timing generator restarted: the vblank count continues.
-    restart_vblank(pipe);
-    // Outside the owner lock: the observer may move the console here at once.
-    CURSOR_PIPE.store(pipe, core::sync::atomic::Ordering::Release);
-    crate::amdgpu_dcn_display::publish_external(Some(fb), Some(flush_scanout));
-    crate::amdgpu_dcn_display::publish_external_cursor(Some(scanout_cursor));
-    let s = &modeset.selection;
-    let offered: Vec<crate::amdgpu_dml::Timing> = modeset.modes.iter().flatten().copied().collect();
-    *OFFERED.lock() = offered.clone();
-    crate::amdgpu_navi48_kms::publish(Some((
-        &s.edid,
-        &s.timing,
-        &offered,
-        if s.hdmi {
-            crate::drm::card::ConnectorType::HdmiA
-        } else {
-            crate::drm::card::ConnectorType::DisplayPort
-        },
-    )));
-    Ok(modeset)
+    let want = |port: usize| pipe_of(port).and_then(|k| wants[usize::from(k)].1);
+    let pipe = |port: usize| pipe_of(port).filter(|&k| wants[usize::from(k)].0);
+    // SAFETY: the caller's obligations.
+    let config = unsafe { boot.modeset_displays(fill, want, pipe) }.await?;
+    for m in &config.displays {
+        // SAFETY: as above.
+        unsafe { adopt(boot, m) }.await;
+    }
+    publish_console(boot, config.displays.first().map(|m| m.pipe));
+    publish_outputs();
+    Ok(config)
 }
 
 /// Allocate the back buffer of a staged or live pipe and return its CPU view.
@@ -724,13 +856,27 @@ fn follow_flip(before: GenericFb, after: GenericFb) {
     }
 }
 
-/// Whether DRM frames go through the back buffer and a latched flip.
-static NATIVE_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// Whether a presenter task is draining `NEXT_FRAME`.
-static PRESENTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// The newest DRM frame not yet copied: a newer one replaces it (mailbox).
-static NEXT_FRAME: narf_lib::sync::IrqSafeSpinLock<Option<Frame>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// One display's DRM presentation: whether frames go through its back
+/// buffer and a latched flip, whether a presenter task drains it, and the
+/// newest frame not yet copied (a newer one replaces it: mailbox).
+struct PresentSlot {
+    native: AtomicBool,
+    presenting: AtomicBool,
+    next: narf_lib::sync::IrqSafeSpinLock<Option<Frame>>,
+}
+impl PresentSlot {
+    const fn new() -> Self {
+        Self {
+            native: AtomicBool::new(false),
+            presenting: AtomicBool::new(false),
+            next: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+static PRESENT: [PresentSlot; 4] = [const { PresentSlot::new() }; 4];
+fn present_slot(display: u8) -> &'static PresentSlot {
+    &PRESENT[usize::from(display).min(PRESENT.len() - 1)]
+}
 
 /// A DRM client's XRGB8888 frame in a kernel-mapped dumb buffer, and the
 /// flip-complete ticket (see `drm::card::FlipLog`) its flip completes.
@@ -743,10 +889,10 @@ struct Frame {
     ticket: Option<u64>,
 }
 
-/// Whether `present_frame` would present through a hardware flip now, so a
-/// DRM flip-complete event should wait for that flip.
-pub fn native_present_ready() -> bool {
-    NATIVE_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+/// Whether `present_frame` on `display` would present through a hardware
+/// flip now, so a DRM flip-complete event should wait for that flip.
+pub fn native_present_ready(display: u8) -> bool {
+    usize::from(display) < PRESENT.len() && present_slot(display).native.load(Ordering::Acquire)
 }
 
 /// One display's hardware vblank clock: the last reading (24-bit cooked
@@ -855,57 +1001,65 @@ pub fn crtc_vblank(crtc_id: u32) -> Option<crate::drm::card::VblankTime> {
     vblank_time(display)
 }
 
-/// Complete the flip-complete events up to `ticket`: at the latched flip,
-/// in the vblank it latched in, or now in the last known vblank when the
-/// frame will not be flipped.
-fn complete_flip(ticket: Option<u64>, latched: Option<crate::drm::card::VblankTime>) {
-    use crate::drm::card::{FlipStamp, FLIPS};
+/// Complete display `display`'s flip-complete events up to `ticket`: at
+/// the latched flip, in the vblank it latched in, or now in the last known
+/// vblank when the frame will not be flipped.
+fn complete_flip(display: u8, ticket: Option<u64>, latched: Option<crate::drm::card::VblankTime>) {
+    use crate::drm::card::{flips, FlipStamp};
     let Some(ticket) = ticket else {
         return;
     };
     let ns = narf_time::wall::monotonic_ns();
+    let mut log = flips(display).lock();
     match latched {
-        Some(t) => {
-            let stamp = FlipStamp {
+        Some(t) => log.complete(
+            ticket,
+            FlipStamp {
                 ns: t.ns,
                 sequence: t.count as u32,
-            };
-            FLIPS.lock().complete(ticket, stamp);
-        }
+            },
+        ),
         None => {
-            let mut flips = FLIPS.lock();
-            let sequence = flips.last().map_or(0, |s| s.sequence);
-            flips.complete(ticket, FlipStamp { ns, sequence });
+            let sequence = log.last().map_or(0, |s| s.sequence);
+            log.complete(ticket, FlipStamp { ns, sequence });
         }
     }
 }
 
-/// Queue a DRM client's frame for tear-free presentation on the native
-/// scanout: the presenter copies it into the back buffer (which no fetch
-/// reads) and flips at the next VUPDATE, so scanout never shows a partly
-/// copied frame. Frames arriving while a copy or flip is in progress
+/// Queue a DRM client's frame for tear-free presentation on display
+/// `display`'s scanout: its presenter copies it into the back buffer (which
+/// no fetch reads) and flips at the next VUPDATE, so scanout never shows a
+/// partly copied frame. Frames arriving while a copy or flip is in progress
 /// replace any frame still waiting (mailbox); the latest always shows.
-/// Returns false when native presentation is not available, and the
+/// Returns false when native presentation is not available there, and the
 /// caller then copies onto the visible front as before.
 ///
-/// `ticket` completes when the frame's flip latches, or when the frame is
-/// replaced, refused or fails to present: no event waits forever.
+/// `ticket` (of the display's flip log) completes when the frame's flip
+/// latches, or when the frame is replaced, refused or fails to present: no
+/// event waits forever.
 ///
 /// DRM's buffer rules make the deferred read safe: a client leaves a
 /// submitted framebuffer untouched until its flip-complete event, which
 /// is not sent before the copy is done.
-pub fn present_frame(phys: u64, pitch: u32, width: u32, height: u32, ticket: Option<u64>) -> bool {
-    use core::sync::atomic::Ordering;
-    if !NATIVE_PRESENT.load(Ordering::Acquire)
+pub fn present_frame(
+    display: u8,
+    phys: u64,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    ticket: Option<u64>,
+) -> bool {
+    if !native_present_ready(display)
         || width == 0
         || height == 0
         || pitch < width.saturating_mul(4)
     {
-        complete_flip(ticket, None);
+        complete_flip(display, ticket, None);
         return false;
     }
+    let slot = present_slot(display);
     {
-        let mut next = NEXT_FRAME.lock();
+        let mut next = slot.next.lock();
         // A replaced frame's event completes with the frame replacing it.
         let ticket = ticket.max(next.and_then(|f| f.ticket));
         *next = Some(Frame {
@@ -916,38 +1070,37 @@ pub fn present_frame(phys: u64, pitch: u32, width: u32, height: u32, ticket: Opt
             ticket,
         });
     }
-    if !PRESENTING.swap(true, Ordering::AcqRel) {
-        narf_scheduler::spawn(presenter());
+    if !slot.presenting.swap(true, Ordering::AcqRel) {
+        narf_scheduler::spawn(presenter(display));
     }
     true
 }
 
-async fn presenter() {
+async fn presenter(display: u8) {
     use core::fmt::Write;
-    use core::sync::atomic::Ordering;
+    let slot = present_slot(display);
     loop {
-        let Some(frame) = NEXT_FRAME.lock().take() else {
-            PRESENTING.store(false, Ordering::Release);
+        let Some(frame) = slot.next.lock().take() else {
+            slot.presenting.store(false, Ordering::Release);
             // A frame queued between the take and the store found the flag
             // still set and spawned nothing: keep draining.
-            if NEXT_FRAME.lock().is_some() && !PRESENTING.swap(true, Ordering::AcqRel) {
+            if slot.next.lock().is_some() && !slot.presenting.swap(true, Ordering::AcqRel) {
                 continue;
             }
             return;
         };
-        if !NATIVE_PRESENT.load(Ordering::Acquire) {
-            complete_flip(frame.ticket, None);
+        if !slot.native.load(Ordering::Acquire) {
+            complete_flip(display, frame.ticket, None);
             continue;
         }
-        let pipe = CURSOR_PIPE.load(Ordering::Acquire);
         let result = {
             let mut owner = OWNER.lock().await;
             match owner.as_mut() {
                 // SAFETY: the owner lock serializes display writers; the
                 // frame's dumb buffer stays valid under DRM's buffer rules.
-                Some(boot) => match unsafe { present_native(boot, pipe, frame).await } {
+                Some(boot) => match unsafe { present_native(boot, display, frame).await } {
                     // The vblank the flip latched in, as DRM counts it.
-                    Ok((before, after, _)) => Ok((before, after, read_vblank(boot, pipe))),
+                    Ok((before, after, _)) => Ok((before, after, read_vblank(boot, display))),
                     Err(e) => Err(e),
                 },
                 None => Err(crate::amdgpu_dcn401_otg::Error::Busy),
@@ -955,17 +1108,17 @@ async fn presenter() {
         };
         match result {
             Ok((before, after, latched)) => {
-                complete_flip(frame.ticket, latched);
+                complete_flip(display, frame.ticket, latched);
                 follow_flip(before, after);
             }
             Err(e) => {
-                complete_flip(frame.ticket, None);
+                complete_flip(display, frame.ticket, None);
                 // A failed flip quarantines the pipe; later frames use the
                 // fallback copy, which a stopped pipe simply does not show.
-                NATIVE_PRESENT.store(false, Ordering::Release);
+                slot.native.store(false, Ordering::Release);
                 let _ = writeln!(
                     narf_console::Writer,
-                    "amdgpu: navi48 native present disabled: {e:?}"
+                    "amdgpu: navi48 native present on display {display} disabled: {e:?}"
                 );
             }
         }
@@ -1039,24 +1192,6 @@ pub unsafe fn try_move_display_cursor(
     Some(unsafe { boot.move_display_cursor(pipe, position) })
 }
 
-/// Withdraw the published scanout, then reverse a successful modeset to a
-/// disabled PHY with timing and planes retired. The surface stays allocated,
-/// so a console write already in flight lands in retained memory.
-/// # Safety
-/// As for `modeset_display`.
-pub async unsafe fn stop_modeset(
-    modeset: &crate::amdgpu_navi48_boot::Modeset,
-) -> Result<(), crate::amdgpu_navi48_boot::ModesetError> {
-    use crate::amdgpu_navi48_boot::{Error as BootError, ModesetError};
-    NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
-    crate::amdgpu_dcn_display::publish_external(None, None);
-    crate::amdgpu_navi48_kms::publish(None);
-    let mut owner = OWNER.lock().await;
-    let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
-    // SAFETY: serialized retained owners; caller excludes external writers.
-    unsafe { boot.stop_modeset(modeset).await }
-}
-
 /// Highest HDMI output depth native modesets may pick (8, 10 or 12 bpc;
 /// default 8 as DRM's max_requested_bpc). Other values are ignored.
 pub fn set_max_bpc(bpc: u8) {
@@ -1069,61 +1204,72 @@ pub fn set_max_bpc(bpc: u8) {
 /// ones on wake; the period remains the fallback.
 const MONITOR_MS: u64 = 1000;
 
-/// What one native display monitor pass did.
+/// What one native display monitor pass did to an output (pipe).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MonitorStep {
-    /// Sink present, link locked (DP), scanout fetching; the fresh frame count.
-    Running(u32),
     /// The DP link lost lock and was retrained; scanout resumed.
-    Retrained,
-    /// HPD fell: the scanout was withdrawn and the modeset torn down.
-    Unplugged,
-    /// A sink appeared with no modeset running, and was lit.
-    Replugged,
-    /// No modeset and no sink.
-    Waiting,
-    /// A DRM client switched the CRTC off: the scanout was withdrawn and the
-    /// modeset torn down, the connector staying connected.
-    Disabled,
-    /// The CRTC is off by DRM request; plugged sinks are not lit.
-    Off,
-    /// DRM set another offered mode: the sink was relit in it.
-    Switched,
+    Retrained(u8),
+    /// HPD fell: the display's scanout was withdrawn and its modeset torn
+    /// down; the others run on.
+    Unplugged(u8),
+    /// A DRM client switched the CRTC off: the display was torn down, its
+    /// connector staying connected.
+    Disabled(u8),
+    /// The configuration was lit again (a new sink, a CRTC switched back on,
+    /// another mode or output range): this many displays now run.
+    Relit(u8),
 }
 
-/// Whether DRM wants the native CRTC on (SETCRTC with a framebuffer, or
-/// atomic ACTIVE=1) or off (SETCRTC with none, or ACTIVE=0). Level-triggered:
+/// Record DRM's CRTC on/off request for display `display`. Level-triggered:
 /// the display monitor converges the hardware to it on its next pass, so a
 /// quick off/on pair does nothing.
-static DRM_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
-
-/// Record DRM's CRTC on/off request for the native display.
-pub fn request_display_active(active: bool) {
-    DRM_ACTIVE.store(active, core::sync::atomic::Ordering::Release);
+pub fn request_display_active(display: u8, active: bool) {
+    if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(display)) {
+        o.active = active;
+    }
 }
 
-/// The timings KMS offers for the lit sink (`Modeset::modes`).
-static OFFERED: narf_lib::sync::IrqSafeSpinLock<Vec<crate::amdgpu_dml::Timing>> =
-    narf_lib::sync::IrqSafeSpinLock::new(Vec::new());
-/// The mode DRM last set, or None for the sink's preferred mode. Like
-/// `DRM_ACTIVE` it is a level the display monitor converges to.
-static REQUESTED_MODE: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_dml::Timing>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-
 /// Record a DRM "Broadcast RGB" value (0 Automatic, 1 Full, 2 Limited
-/// 16:235) for the native display. Like a mode request, the display monitor
-/// relights a running display whose output range no longer matches.
+/// 16:235) for the native displays. Like a mode request, the display
+/// monitor relights running displays whose output range no longer matches.
 pub fn request_broadcast_rgb(value: u8) {
     crate::amdgpu_navi48_boot::set_broadcast_rgb(value);
 }
 
-/// Record the mode a DRM client set (SETCRTC or an atomic MODE_ID), which
-/// must be one of the offered timings; `None` returns to the preferred mode
-/// (the console's, after the last client closes). Returns false for a mode
-/// that is not offered.
-pub fn request_display_mode(mode: Option<&crate::drm::ioctl::DrmModeModeInfo>) -> bool {
+/// Whether display `display` offers `mode` (one of its published timings).
+pub fn display_offers(display: u8, mode: &crate::drm::ioctl::DrmModeModeInfo) -> bool {
+    let geometry = |w: &crate::drm::ioctl::DrmModeModeInfo| {
+        (
+            w.clock,
+            [w.hdisplay, w.hsync_start, w.hsync_end, w.htotal],
+            [w.vdisplay, w.vsync_start, w.vsync_end, w.vtotal],
+        )
+    };
+    OUTPUT_STATE
+        .lock()
+        .get(usize::from(display))
+        .and_then(|o| o.shown.as_ref())
+        .is_some_and(|(_, _, offered)| {
+            offered
+                .iter()
+                .any(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(mode))
+        })
+}
+
+/// Record the mode a DRM client set on display `display` (SETCRTC or an
+/// atomic MODE_ID), which must be one of that display's offered timings;
+/// `None` returns it to its preferred mode. Returns false for a mode the
+/// display does not offer.
+pub fn request_display_mode(
+    display: u8,
+    mode: Option<&crate::drm::ioctl::DrmModeModeInfo>,
+) -> bool {
+    let mut state = OUTPUT_STATE.lock();
+    let Some(o) = state.get_mut(usize::from(display)) else {
+        return false;
+    };
     let Some(m) = mode else {
-        *REQUESTED_MODE.lock() = None;
+        o.requested = None;
         return true;
     };
     let geometry = |w: &crate::drm::ioctl::DrmModeModeInfo| {
@@ -1133,151 +1279,220 @@ pub fn request_display_mode(mode: Option<&crate::drm::ioctl::DrmModeModeInfo>) -
             [w.vdisplay, w.vsync_start, w.vsync_end, w.vtotal],
         )
     };
-    let found = OFFERED
-        .lock()
-        .iter()
-        .copied()
-        .find(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(m));
+    let found = o.shown.as_ref().and_then(|(_, _, offered)| {
+        offered
+            .iter()
+            .copied()
+            .find(|t| geometry(&crate::amdgpu_navi48_kms::timing_wire(t)) == geometry(m))
+    });
     match found {
         Some(t) => {
-            *REQUESTED_MODE.lock() = Some(t);
+            o.requested = Some(t);
             true
         }
         None => false,
     }
 }
 
-/// One monitor pass: check a running modeset and retrain or tear it down,
-/// or light a newly plugged sink when none runs.
-/// # Safety
-/// As for `modeset_display`.
-pub async unsafe fn monitor_display(
-    current: &mut Option<crate::amdgpu_navi48_boot::Modeset>,
-    pipe: u8,
-) -> Result<MonitorStep, crate::amdgpu_navi48_boot::ModesetError> {
-    use crate::amdgpu_navi48_boot::{Error as BootError, Health, ModesetError};
-    let active = DRM_ACTIVE.load(core::sync::atomic::Ordering::Acquire);
-    if !active {
-        let Some(m) = current.as_ref() else {
-            return Ok(MonitorStep::Off);
-        };
-        // Withdraw writers first, as for stop_modeset, but keep the sink
-        // published: the CRTC is off, the connector still connected.
-        NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
-        crate::amdgpu_dcn_display::publish_external(None, None);
-        crate::amdgpu_navi48_kms::set_active(false);
-        let mut owner = OWNER.lock().await;
-        let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
-        // SAFETY: the caller's obligations; the scanout is withdrawn first.
-        unsafe { boot.stop_modeset(m).await }?;
-        *current = None;
-        return Ok(MonitorStep::Disabled);
-    }
-    if let Some(m) = current.as_ref() {
-        let preferred = m.modes.iter().flatten().next().copied();
-        let desired = REQUESTED_MODE.lock().or(preferred);
-        let limited =
-            crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
-        if desired.is_some_and(|d| d != m.selection.timing) || limited != m.selection.limited {
-            // A mode or output-range switch is a full modeset: withdraw
-            // writers, stop, then light the sink in the new timing.
-            NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
-            crate::amdgpu_dcn_display::publish_external(None, None);
-            {
-                let mut owner = OWNER.lock().await;
-                let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
-                // SAFETY: the caller's obligations; writers withdrawn first.
-                unsafe { boot.stop_modeset(m).await }?;
-            }
-            *current = None;
-            let fill = |_: u32, row: &mut [u32]| row.fill(0);
-            // SAFETY: as above.
-            let lit = match unsafe { modeset_display_mode(pipe, fill, desired) }.await {
-                Ok(lit) => lit,
-                Err(e) => {
-                    // The requested mode did not light: go back to the
-                    // preferred one rather than leave the sink dark.
-                    *REQUESTED_MODE.lock() = None;
-                    let _ = core::fmt::Write::write_fmt(
-                        &mut narf_console::Writer,
-                        format_args!("amdgpu: navi48 mode switch failed: {e:?}\n"),
-                    );
-                    // SAFETY: as above.
-                    unsafe { modeset_display(pipe, fill) }.await?
-                }
-            };
-            *current = Some(lit);
-            return Ok(MonitorStep::Switched);
-        }
-    }
-    let Some(m) = current.as_mut() else {
-        let plugged = {
-            let mut owner = OWNER.lock().await;
-            let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
-            let ports = boot.display_paths().map_or(0, <[_]>::len);
-            (0..ports).any(|port| boot.display_hpd(port) == Ok(true))
-        };
-        if !plugged {
-            return Ok(MonitorStep::Waiting);
-        }
-        // SAFETY: the caller's obligations.
-        *current = Some(unsafe { modeset_display(pipe, |_, row| row.fill(0)) }.await?);
-        return Ok(MonitorStep::Replugged);
-    };
-    let mut owner = OWNER.lock().await;
-    let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
-    // SAFETY: serialized retained owners; caller excludes external writers.
-    match unsafe { boot.check_modeset(m).await }? {
-        Health::Running(frame) => Ok(MonitorStep::Running(frame)),
-        Health::LinkLost(_) => {
-            // The surface stays allocated and published: console writes
-            // during the retrain land in it and show once scanout resumes.
-            // SAFETY: as above.
-            unsafe { boot.retrain_modeset(m).await }?;
-            // The fallback may have changed the link, never the timing.
-            Ok(MonitorStep::Retrained)
-        }
-        Health::Unplugged => {
-            NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
-            crate::amdgpu_dcn_display::publish_external(None, None);
-            crate::amdgpu_navi48_kms::publish(None);
-            // SAFETY: as above; the scanout is withdrawn first.
-            unsafe { boot.unplug_modeset(m).await }?;
-            *current = None;
-            Ok(MonitorStep::Unplugged)
-        }
+/// Every display back to the console's defaults (on, preferred mode), as
+/// drm_fb_helper restores the console on lastclose.
+pub fn restore_displays() {
+    for o in OUTPUT_STATE.lock().iter_mut() {
+        o.active = true;
+        o.requested = None;
     }
 }
 
-/// Poll a lit modeset for hot-plug and link loss until the owner fails.
-/// HPD is enabled on every routed DP and HDMI port so a sink on another port
-/// is seen.
+/// The monitor's view of the configuration: each pipe's running modeset,
+/// and the outputs whose plugged sinks the last lighting already considered
+/// (lit or left dark), so only a new sink or a returned CRTC relights.
+#[derive(Debug)]
+pub struct Displays {
+    lit: [Option<Modeset>; 4],
+    considered: u8,
+}
+
+/// Whether the configuration must be lit again: a running display asked
+/// for another mode or output range (`changed`), or a plugged sink on an
+/// output DRM has not switched off (`wanted`) that is neither lit nor was
+/// considered by the last lighting (which may have left it dark: it did
+/// not fit). A sink that left (lit or not), or whose CRTC DRM switched off,
+/// is new again when it returns.
+fn needs_relight(changed: bool, wanted: u8, lit: u8, considered: &mut u8) -> bool {
+    *considered &= wanted | lit;
+    changed || wanted & !*considered & !lit != 0
+}
+
+/// One monitor pass over every output: tear down displays DRM switched
+/// off or whose sink left, retrain lost links, and relight the whole
+/// configuration when a sink appears (or a CRTC returns) or a running
+/// display's requested mode or output range changed.
 /// # Safety
-/// As for `modeset_display`, for the lifetime of the spawned task.
-pub unsafe fn spawn_display_monitor(modeset: crate::amdgpu_navi48_boot::Modeset) {
+/// As for `modeset_displays`.
+pub async unsafe fn monitor_displays(
+    displays: &mut Displays,
+) -> Result<Vec<MonitorStep>, ModesetError> {
+    use crate::amdgpu_navi48_boot::{Error as BootError, Health};
+    let mut steps = Vec::new();
+    let mut owner = OWNER.lock().await;
+    let boot = owner.as_mut().ok_or(ModesetError::Boot(BootError::Busy))?;
+    let outputs = OUTPUTS.lock().clone();
+    let wants: Vec<(bool, Option<Timing>)> = OUTPUT_STATE
+        .lock()
+        .iter()
+        .map(|o| (o.active, o.requested))
+        .collect();
+    let limited =
+        crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
+    let mut relight = false;
+    for k in 0..4u8 {
+        let Some(m) = displays.lit[usize::from(k)] else {
+            continue;
+        };
+        if !wants[usize::from(k)].0 {
+            // Withdraw writers first, then stop: the CRTC is off, the
+            // connector still connected.
+            withdraw(boot, k, &displays.lit);
+            displays.lit[usize::from(k)] = None;
+            // SAFETY: the caller's obligations; the scanout is withdrawn.
+            unsafe { boot.stop_modeset(&m) }.await?;
+            steps.push(MonitorStep::Disabled(k));
+            continue;
+        }
+        let preferred = m.modes.iter().flatten().next().copied();
+        let desired = wants[usize::from(k)].1.or(preferred);
+        if desired.is_some_and(|d| d != m.selection.timing) || limited != m.selection.limited {
+            relight = true;
+            continue;
+        }
+        // SAFETY: serialized retained owners; writers stay excluded.
+        match unsafe { boot.check_modeset(&m) }.await? {
+            Health::Running(_) => {}
+            Health::LinkLost(_) => {
+                // The surface stays allocated and published: writes during
+                // the retrain land in it and show once scanout resumes.
+                let mut m = m;
+                // SAFETY: as above.
+                unsafe { boot.retrain_modeset(&mut m) }.await?;
+                displays.lit[usize::from(k)] = Some(m);
+                steps.push(MonitorStep::Retrained(k));
+            }
+            Health::Unplugged => {
+                withdraw(boot, k, &displays.lit);
+                displays.lit[usize::from(k)] = None;
+                if let Some(o) = OUTPUT_STATE.lock().get_mut(usize::from(k)) {
+                    o.shown = None;
+                }
+                // SAFETY: as above; the scanout is withdrawn first.
+                unsafe { boot.unplug_modeset(&m) }.await?;
+                steps.push(MonitorStep::Unplugged(k));
+            }
+        }
+    }
+    // Sinks to light: plugged on an output DRM has not switched off.
+    let mut wanted = 0u8;
+    for (k, &(port, _)) in outputs.iter().enumerate() {
+        if wants[k].0 && boot.display_hpd(port) == Ok(true) {
+            wanted |= 1 << k;
+        }
+    }
+    let lit_mask = displays
+        .lit
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.is_some())
+        .fold(0u8, |acc, (k, _)| acc | 1 << k);
+    if needs_relight(relight, wanted, lit_mask, &mut displays.considered) {
+        // Withdraw every writer, stop every display, light them again.
+        for k in (0..4u8).rev() {
+            let Some(m) = displays.lit[usize::from(k)] else {
+                continue;
+            };
+            withdraw(boot, k, &displays.lit);
+            displays.lit[usize::from(k)] = None;
+            // SAFETY: the caller's obligations; writers withdrawn first.
+            unsafe { boot.stop_modeset(&m) }.await?;
+        }
+        let fill = |_: u8, _: u32, row: &mut [u32]| row.fill(0);
+        // SAFETY: as above; every display is stopped.
+        let lit = match unsafe { light_displays(boot, fill) }.await {
+            Err(e @ (ModesetError::NoSink | ModesetError::Link)) => {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!("amdgpu: navi48 displays not lit: {e:?}\n"),
+                );
+                None
+            }
+            Err(e) if wants.iter().any(|w| w.1.is_some()) => {
+                // A requested mode did not light: go back to the preferred
+                // modes rather than leave the sinks dark.
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!("amdgpu: navi48 mode switch failed: {e:?}\n"),
+                );
+                for o in OUTPUT_STATE.lock().iter_mut() {
+                    o.requested = None;
+                }
+                // SAFETY: as above.
+                Some(unsafe { light_displays(boot, fill) }.await?)
+            }
+            Err(e) => return Err(e),
+            Ok(config) => Some(config),
+        };
+        let mut count = 0;
+        if let Some(config) = lit {
+            if let Some(e) = config.failed {
+                let _ = core::fmt::Write::write_fmt(
+                    &mut narf_console::Writer,
+                    format_args!("amdgpu: navi48 display failed to light: {e:?}\n"),
+                );
+            }
+            for m in config.displays {
+                displays.lit[usize::from(m.pipe)] = Some(m);
+                count += 1;
+            }
+        }
+        displays.considered = wanted;
+        steps.push(MonitorStep::Relit(count));
+    }
+    if !steps.is_empty() {
+        publish_outputs();
+    }
+    Ok(steps)
+}
+
+/// Watch the lit configuration for hot-plug, link loss and DRM requests
+/// until the owner fails. HPD is enabled on every routed DP and HDMI port so
+/// a sink on another port is seen.
+/// # Safety
+/// As for `modeset_displays`, for the lifetime of the spawned task.
+pub unsafe fn spawn_display_monitor(config: crate::amdgpu_navi48_boot::Configuration) {
     narf_scheduler::spawn(async move {
         use core::fmt::Write;
-        let pipe = modeset.pipe;
-        let mut current = Some(modeset);
+        let mut displays = Displays {
+            lit: [None; 4],
+            considered: 0,
+        };
+        for m in config.displays {
+            if let Some(slot) = displays.lit.get_mut(usize::from(m.pipe)) {
+                displays.considered |= 1 << m.pipe;
+                *slot = Some(m);
+            }
+        }
         {
             let mut owner = OWNER.lock().await;
             if let Some(boot) = owner.as_mut() {
-                let ports = boot.display_paths().map_or(0, <[_]>::len);
-                for port in 0..ports {
-                    use crate::amdgpu_dcn_inventory::Connector;
-                    let lightable = boot.display_paths().is_ok_and(|p| {
-                        matches!(
-                            p[port].connector,
-                            Connector::DisplayPort | Connector::HdmiTypeA
-                        )
-                    });
-                    if lightable {
-                        // SAFETY: board-routed selectors; no GPIO user of HPD pins.
-                        if unsafe { boot.enable_display_hpd(port) }.is_ok() {
-                            // SAFETY: the interrupt worker routes DCN vectors to
-                            // the dispatcher this monitor waits on.
-                            let _ = unsafe { boot.enable_display_hpd_irq(port) };
-                        }
+                let ports: Vec<usize> = OUTPUTS.lock().iter().map(|&(p, _)| p).collect();
+                for (k, port) in ports.into_iter().enumerate() {
+                    // A sink plugged but not lit at boot was considered too.
+                    if boot.display_hpd(port) == Ok(true) {
+                        displays.considered |= 1 << k;
+                    }
+                    // SAFETY: board-routed selectors; no GPIO user of HPD pins.
+                    if unsafe { boot.enable_display_hpd(port) }.is_ok() {
+                        // SAFETY: the interrupt worker routes DCN vectors to
+                        // the dispatcher this monitor waits on.
+                        let _ = unsafe { boot.enable_display_hpd_irq(port) };
                     }
                 }
             }
@@ -1296,10 +1511,11 @@ pub unsafe fn spawn_display_monitor(modeset: crate::amdgpu_navi48_boot::Modeset)
                 }
             }
             // SAFETY: the spawner's obligations hold for the task's lifetime.
-            match unsafe { monitor_display(&mut current, pipe) }.await {
-                Ok(MonitorStep::Running(_) | MonitorStep::Waiting | MonitorStep::Off) => {}
-                Ok(step) => {
-                    let _ = writeln!(narf_console::Writer, "amdgpu: navi48 display {step:?}");
+            match unsafe { monitor_displays(&mut displays) }.await {
+                Ok(steps) => {
+                    for step in steps {
+                        let _ = writeln!(narf_console::Writer, "amdgpu: navi48 display {step:?}");
+                    }
                 }
                 Err(e) => {
                     // The failed owner stays quarantined where it stopped.
@@ -1665,16 +1881,22 @@ mod tests {
     /// flip-complete event, and the 24-bit OTG frame count extends across
     /// its wrap and a relight into DRM's vblank count.
     fn navi48_present_completes_refused_flip_and_extends_vblanks() -> TestResult {
-        use crate::drm::card::FLIPS;
-        let ticket = FLIPS.lock().reserve();
-        if native_present_ready() {
-            return TestResult::Fail("test kernel unexpectedly presents natively");
+        use crate::drm::card::flips;
+        // On every display: its own flip log, its own refusal.
+        for display in 0..4 {
+            let ticket = flips(display).lock().reserve();
+            if native_present_ready(display) {
+                return TestResult::Fail("test kernel unexpectedly presents natively");
+            }
+            if present_frame(display, 0x1000, 64, 16, 16, Some(ticket)) {
+                return TestResult::Fail("frame taken without a native display");
+            }
+            if flips(display).lock().stamp(ticket).is_none() {
+                return TestResult::Fail("refused frame left its event waiting");
+            }
         }
-        if present_frame(0x1000, 64, 16, 16, Some(ticket)) {
-            return TestResult::Fail("frame taken without a native display");
-        }
-        if FLIPS.lock().stamp(ticket).is_none() {
-            return TestResult::Fail("refused frame left its event waiting");
+        if native_present_ready(4) || present_frame(9, 0x1000, 64, 16, 16, None) {
+            return TestResult::Fail("display out of range presents");
         }
         use crate::amdgpu_dcn401_otg::VblankPhase;
         let phase = |count| VblankPhase {
@@ -1716,6 +1938,47 @@ mod tests {
     kernel_test_in!(
         "drivers/gpu/amdgpu/navi48",
         navi48_present_completes_refused_flip_and_extends_vblanks
+    );
+
+    /// The monitor relights for a new sink, a returning sink or CRTC, or a
+    /// requested change, and never again for a sink the last lighting left
+    /// dark (it did not fit).
+    fn navi48_monitor_relights_only_for_new_sinks_and_changes() -> TestResult {
+        // Boot lit outputs 0 and 2; output 1 was plugged but did not fit.
+        let mut considered = 0b111;
+        // (requested change, plugged and wanted, lit, relight expected).
+        let steps: [(bool, u8, u8, bool); 8] = [
+            // Nothing changed: outputs 0, 2 run, 1 stays dark.
+            (false, 0b111, 0b101, false),
+            // Output 2's sink left (and was torn down): no relight.
+            (false, 0b011, 0b001, false),
+            // It returns: new again.
+            (false, 0b111, 0b001, true),
+            // Lit again with 0 and 2; DRM switches output 0 off (torn down).
+            (false, 0b110, 0b100, false),
+            // DRM switches it back on.
+            (false, 0b111, 0b100, true),
+            // Relit; nothing changes.
+            (false, 0b111, 0b101, false),
+            // A requested mode on a running display.
+            (true, 0b111, 0b101, true),
+            // A fourth sink appears.
+            (false, 0b1111, 0b101, true),
+        ];
+        for (changed, wanted, lit, want) in steps {
+            if needs_relight(changed, wanted, lit, &mut considered) != want {
+                return TestResult::Fail("relight decision");
+            }
+            if want {
+                // The relighting considers every wanted sink.
+                considered = wanted;
+            }
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_monitor_relights_only_for_new_sinks_and_changes
     );
 
     fn navi48_handoff_distinguishes_primary_and_secondary_apertures() -> TestResult {

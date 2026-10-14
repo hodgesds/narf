@@ -107,7 +107,8 @@ pub(super) fn start() -> InitResult {
 }
 
 /// Opt-in (`amdgpu.native_display`) native Navi48 scanout: retire the GOP's
-/// DP SST output and light the first answering DP sink natively. Off by
+/// DP SST output and light every connected sink natively, the console on
+/// the first (DP before HDMI). Off by
 /// default until a board has validated the path. On success the published
 /// scanout moves the console through the external-scanout observer; on
 /// failure the owner stays where it stopped and the boot console remains on
@@ -126,17 +127,25 @@ fn native_display() {
         return;
     }
     // SAFETY: as above; the inherited consumers are now retired.
-    let modeset =
-        narf_scheduler::block_on_spin(unsafe { navi48::modeset_display(0, |_, row| row.fill(0)) });
+    let lit =
+        narf_scheduler::block_on_spin(unsafe { navi48::modeset_displays(|_, _, row| row.fill(0)) });
     let _ = writeln!(
         narf_console::Writer,
-        "amdgpu: navi48 native modeset {modeset:?}"
+        "amdgpu: navi48 native modeset {lit:?}"
     );
-    if let Ok(modeset) = modeset {
-        // SAFETY: the retained owner is serialized by the platform; only the
-        // monitor and the published hooks drive the display from here on.
-        unsafe { navi48::spawn_display_monitor(modeset) };
-    }
+    use narf_drivers_gpu::amdgpu_navi48_boot::{Configuration, ModesetError};
+    let config = match lit {
+        Ok(config) => config,
+        // Nothing lightable yet: the monitor lights a sink plugged later.
+        Err(ModesetError::NoSink | ModesetError::Link) => Configuration {
+            displays: alloc::vec::Vec::new(),
+            failed: None,
+        },
+        Err(_) => return,
+    };
+    // SAFETY: the retained owner is serialized by the platform; only the
+    // monitor and the published hooks drive the displays from here on.
+    unsafe { navi48::spawn_display_monitor(config) };
 }
 
 fn refused(generation: &str, error: impl core::fmt::Debug) {

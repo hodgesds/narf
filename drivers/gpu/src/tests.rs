@@ -6088,12 +6088,17 @@ kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_log_recheck_tracks_vblank);
 /// it is until its flip completes, then carries that flip's CLOCK_MONOTONIC
 /// time and vblank count, as amdgpu_dm's pageflip handler sends it.
 fn smoke_drm_hw_flip_event_waits_for_flip() -> TestResult {
-    use crate::drm::card::{DrmEventQueue, FlipStamp, FLIPS};
+    use crate::drm::card::{flips, DrmEventQueue, FlipStamp};
     let mut card = make_test_card_for_ioctl();
     let mut events = DrmEventQueue::new();
-    let ticket = FLIPS.lock().reserve();
+    // Display 3's log: another display's completions leave it waiting.
+    let ticket = flips(3).lock().reserve();
+    let other = flips(1).lock().reserve();
+    flips(1)
+        .lock()
+        .complete(other, FlipStamp { ns: 1, sequence: 1 });
     if card
-        .queue_hw_flip_event(&mut events, 0xFEED_0000_0000_0042, 9, ticket)
+        .queue_hw_flip_event(&mut events, 0xFEED_0000_0000_0042, 9, 3, ticket)
         .is_err()
     {
         return TestResult::Fail("hardware flip event not queued");
@@ -6108,7 +6113,7 @@ fn smoke_drm_hw_flip_event_waits_for_flip() -> TestResult {
     if events.next_event_deadline_ns(now).is_none_or(|d| d <= now) {
         return TestResult::Fail("pending flip gave a poller no future deadline");
     }
-    FLIPS.lock().complete(
+    flips(3).lock().complete(
         ticket,
         FlipStamp {
             ns: 5_000_123_456,
