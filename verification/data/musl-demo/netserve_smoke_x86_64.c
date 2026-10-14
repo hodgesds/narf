@@ -1,8 +1,18 @@
 // Off-box network-stack smoke. The guest half of the live TCP/UDP/DNS test:
 //
 //   1. bind 0.0.0.0:7777, accept one host-forwarded TCP connection, echo it;
-//   2. bind 0.0.0.0:7778, echo one host-forwarded UDP datagram;
-//   3. send a DNS A query to QEMU SLIRP's resolver at 10.0.2.3 and validate
+//   2. bind 0.0.0.0:7779, accept a host-forwarded bulk stream, verify every
+//      byte of a known pattern and echo it all back (the host verifies the
+//      echo) — GRO merging, receive windows and ACK pacing both ways;
+//   3. as a CLIENT, non-blocking connect() to the host (10.0.2.2:17780) and
+//      download a large patterned stream to EOF through poll() — the browser
+//      shape (Firefox/Chromium sockets are non-blocking + poll/epoll);
+//   4. bind 0.0.0.0:7778 and echo host datagrams of many sizes, including
+//      ones above the MTU that arrive and leave as IPv4 fragments, then a
+//      back-to-back burst;
+//   5. as a CLIENT, a connect()ed UDP socket round-trips datagrams with the
+//      host (10.0.2.2:17781) via send()/recv() — the QUIC socket shape;
+//   6. send a DNS A query to QEMU SLIRP's resolver at 10.0.2.3 and validate
 //      the reply header.
 //
 // These exercise the full socket -> route/ARP -> virtio-net paths against
@@ -12,7 +22,11 @@
 //   * "netserve: listening" — emitted after TCP listen(), BEFORE accept().
 //     The host-side harness waits for this before opening its socket.
 //   * "netserve-tcp-ok"     — after the TCP echo round-trip.
-//   * "netserve-udp-ok"     — after the UDP echo round-trip.
+//   * "netserve: bulk listening" / "netserve-bulk-ok" — bulk echo (2).
+//   * "netserve-download-ok" — client download (3).
+//   * "netserve: udp listening" / "netserve-udp-ok" — UDP echo (4).
+//   * "netserve-udp-client-ok" — connected UDP client (5).
+// Sizes and the pattern MUST match `net_smoke_cmd_with_nic` in xtask.
 //   * "netserve-dns-ok"     — after a valid DNS response.
 //   * "netserve-ok"         — all three paths passed.
 //
@@ -21,12 +35,172 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#define BULK_LEN (4u << 20)
+#define BULK_SEED 0x5a
+#define DOWNLOAD_LEN (8u << 20)
+#define DOWNLOAD_SEED 0xc3
+#define UDP_BURST 64
+#define UDP_BURST_LEN 1200
+#define UDP_CLIENT_ROUNDS 16
+#define UDP_CLIENT_LEN 1200
+
 static void w(const char *m) { write(1, m, strlen(m)); }
+
+static int failf(const char *what, unsigned long a, unsigned long b) {
+    char buf[160];
+    snprintf(buf, sizeof buf, "netserve-fail: %s (%lu, %lu, errno %d)\n", what, a, b, errno);
+    w(buf);
+    return 1;
+}
+
+// The stream pattern: byte i of a stream seeded `seed`. A multiplicative hash
+// so a dropped, duplicated or reordered segment shows up at its offset.
+static uint8_t pat(uint64_t i, uint8_t seed) {
+    return (uint8_t)((i * 2654435761u) >> 13) ^ (uint8_t)(i >> 20) ^ seed;
+}
+
+static long first_mismatch(const uint8_t *p, size_t n, uint64_t off, uint8_t seed) {
+    for (size_t k = 0; k < n; k++)
+        if (p[k] != pat(off + k, seed)) return (long)k;
+    return -1;
+}
+
+static int write_all(int fd, const uint8_t *p, size_t n) {
+    while (n) {
+        long m = write(fd, p, n);
+        if (m <= 0) return -1;
+        p += m;
+        n -= (size_t)m;
+    }
+    return 0;
+}
+
+static int listen_on(int port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    int opt = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(s, (struct sockaddr *)&a, sizeof a) < 0 || listen(s, 4) < 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+static void host_addr(struct sockaddr_in *a, int port) {
+    memset(a, 0, sizeof *a);
+    a->sin_family = AF_INET;
+    a->sin_port = htons(port);
+    inet_pton(AF_INET, "10.0.2.2", &a->sin_addr); // SLIRP's alias for the host
+}
+
+// (2) Verify a BULK_LEN patterned stream and echo every byte back.
+static int bulk_echo(void) {
+    int s = listen_on(7779);
+    if (s < 0) return failf("bulk listen", 0, 0);
+    w("netserve: bulk listening on 0.0.0.0:7779\n");
+    int c = accept(s, 0, 0);
+    if (c < 0) return failf("bulk accept", 0, 0);
+    static uint8_t buf[65536];
+    uint64_t got = 0;
+    for (;;) {
+        long n = read(c, buf, sizeof buf);
+        if (n < 0) return failf("bulk read", got, 0);
+        if (n == 0) break;
+        long bad = first_mismatch(buf, (size_t)n, got, BULK_SEED);
+        if (bad >= 0) return failf("bulk byte mismatch at offset", got + (uint64_t)bad, buf[bad]);
+        if (write_all(c, buf, (size_t)n) < 0) return failf("bulk echo write", got, 0);
+        got += (uint64_t)n;
+    }
+    if (got != BULK_LEN) return failf("bulk length", got, BULK_LEN);
+    // Half-close so the host's read sees EOF after the full echo.
+    if (shutdown(c, SHUT_WR) < 0) return failf("bulk shutdown", 0, 0);
+    // Drain until the host closes, so our close() cannot RST unread data.
+    while (read(c, buf, sizeof buf) > 0) {
+    }
+    close(c);
+    close(s);
+    w("netserve-bulk-ok\n");
+    return 0;
+}
+
+// (3) Non-blocking client download to EOF, driven by poll().
+static int download(void) {
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (c < 0) return failf("download socket", 0, 0);
+    struct sockaddr_in a;
+    host_addr(&a, 17780);
+    if (connect(c, (struct sockaddr *)&a, sizeof a) == 0) {
+        // Linux may complete a loopback-fast connect at once; fine.
+    } else if (errno != EINPROGRESS) {
+        return failf("download connect", 0, 0);
+    }
+    struct pollfd p = {.fd = c, .events = POLLOUT};
+    if (poll(&p, 1, 20000) != 1 || !(p.revents & POLLOUT))
+        return failf("download connect poll", p.revents, 0);
+    int err = -1;
+    socklen_t el = sizeof err;
+    if (getsockopt(c, SOL_SOCKET, SO_ERROR, &err, &el) < 0 || err != 0)
+        return failf("download SO_ERROR", (unsigned long)err, 0);
+    static uint8_t buf[65536];
+    uint64_t got = 0;
+    for (;;) {
+        long n = read(c, buf, sizeof buf);
+        if (n > 0) {
+            long bad = first_mismatch(buf, (size_t)n, got, DOWNLOAD_SEED);
+            if (bad >= 0)
+                return failf("download byte mismatch at offset", got + (uint64_t)bad, buf[bad]);
+            got += (uint64_t)n;
+            continue;
+        }
+        if (n == 0) break;
+        if (errno != EAGAIN) return failf("download read", got, 0);
+        p.events = POLLIN;
+        p.revents = 0;
+        // A parked reader must be woken by arriving data: a lost wake hangs here.
+        if (poll(&p, 1, 20000) != 1) return failf("download stalled (poll timeout) at", got, 0);
+    }
+    close(c);
+    if (got != DOWNLOAD_LEN) return failf("download length", got, DOWNLOAD_LEN);
+    w("netserve-download-ok\n");
+    return 0;
+}
+
+// (5) connect()ed UDP client: send()/recv() round-trips with the host.
+static int udp_client(void) {
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u < 0) return failf("udp client socket", 0, 0);
+    struct timeval t = {.tv_sec = 20};
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof t);
+    struct sockaddr_in a;
+    host_addr(&a, 17781);
+    if (connect(u, (struct sockaddr *)&a, sizeof a) < 0) return failf("udp client connect", 0, 0);
+    uint8_t out[UDP_CLIENT_LEN], in[UDP_CLIENT_LEN + 64];
+    for (unsigned r = 0; r < UDP_CLIENT_ROUNDS; r++) {
+        for (unsigned k = 0; k < sizeof out; k++) out[k] = pat(k, (uint8_t)(0x40 + r));
+        if (send(u, out, sizeof out, 0) != (long)sizeof out) return failf("udp client send", r, 0);
+        long n = recv(u, in, sizeof in, 0);
+        if (n != (long)sizeof out || memcmp(in, out, sizeof out) != 0)
+            return failf("udp client echo", r, (unsigned long)n);
+    }
+    close(u);
+    w("netserve-udp-client-ok\n");
+    return 0;
+}
 
 int main(void) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -80,6 +254,8 @@ int main(void) {
     close(s);
     w("netserve-tcp-ok\n");
 
+    if (bulk_echo() || download()) return 1;
+
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     if (u < 0) {
         w("netserve-fail: udp socket\n");
@@ -100,22 +276,27 @@ int main(void) {
     }
     w("netserve: udp listening on 0.0.0.0:7778\n");
 
-    struct sockaddr_in peer;
-    socklen_t peer_len = sizeof peer;
-    char udp_buf[512];
-    long udp_n = recvfrom(u, udp_buf, sizeof udp_buf, 0,
-                          (struct sockaddr *)&peer, &peer_len);
-    if (udp_n <= 0) {
-        w("netserve-fail: udp recvfrom\n");
-        return 1;
-    }
-    if (sendto(u, udp_buf, (size_t)udp_n, 0,
-               (struct sockaddr *)&peer, peer_len) != udp_n) {
-        w("netserve-fail: udp sendto\n");
-        return 1;
+    // Echo every datagram the host sends: the single hello, the sized set
+    // (1..8000 bytes; 4000 and 8000 exceed the 1500-byte MTU, so they arrive
+    // and are sent back as IPv4 fragments), then the back-to-back burst.
+    // Message boundaries must survive: each echo is exactly what arrived.
+    static const unsigned udp_sizes[] = {1, 100, 512, 1400, 1472, 4000, 8000};
+    unsigned udp_total = 1 + sizeof udp_sizes / sizeof udp_sizes[0] + UDP_BURST;
+    for (unsigned i = 0; i < udp_total; i++) {
+        static char udp_buf[65536];
+        struct sockaddr_in peer;
+        socklen_t peer_len = sizeof peer;
+        long udp_n = recvfrom(u, udp_buf, sizeof udp_buf, 0,
+                              (struct sockaddr *)&peer, &peer_len);
+        if (udp_n <= 0) return failf("udp recvfrom datagram", i, 0);
+        if (sendto(u, udp_buf, (size_t)udp_n, 0,
+                   (struct sockaddr *)&peer, peer_len) != udp_n)
+            return failf("udp sendto datagram", i, (unsigned long)udp_n);
     }
     close(u);
     w("netserve-udp-ok\n");
+
+    if (udp_client()) return 1;
 
     // A minimal RFC 1035 query for example.com IN A. We issue it directly
     // instead of consulting /etc/resolv.conf so the smoke is independent of

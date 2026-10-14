@@ -6001,6 +6001,29 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     let tcp_guest_port: u16 = 7777;
     let udp_host_port: u16 = 17778;
     let udp_guest_port: u16 = 7778;
+    let bulk_host_port: u16 = 17779;
+    let bulk_guest_port: u16 = 7779;
+    // Host-side servers the GUEST dials (via SLIRP's 10.0.2.2 host alias).
+    // Ports and every size/seed below must match netserve_smoke_x86_64.c.
+    let download_port: u16 = 17780;
+    let udp_client_port: u16 = 17781;
+    const BULK_LEN: u64 = 4 << 20;
+    const BULK_SEED: u8 = 0x5a;
+    const DOWNLOAD_LEN: u64 = 8 << 20;
+    const DOWNLOAD_SEED: u8 = 0xc3;
+    const UDP_SIZES: [usize; 7] = [1, 100, 512, 1400, 1472, 4000, 8000];
+    const UDP_BURST: usize = 64;
+    const UDP_BURST_LEN: usize = 1200;
+    const UDP_CLIENT_ROUNDS: usize = 16;
+    // netserve's stream pattern: byte `i` of a stream seeded `seed`.
+    fn pat(i: u64, seed: u8) -> u8 {
+        ((i.wrapping_mul(2_654_435_761) >> 13) as u8) ^ ((i >> 20) as u8) ^ seed
+    }
+    fn fill(buf: &mut [u8], off: u64, seed: u8) {
+        for (k, b) in buf.iter_mut().enumerate() {
+            *b = pat(off + k as u64, seed);
+        }
+    }
 
     let mut build = args.clone();
     ensure_feature(&mut build.features, "boot-init");
@@ -6054,8 +6077,49 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     // on the child Command would be too late — the arg list is built here.
     let forwards = format!(
         "tcp:127.0.0.1:{tcp_host_port}-:{tcp_guest_port},\
-         hostfwd=udp:127.0.0.1:{udp_host_port}-:{udp_guest_port}"
+         hostfwd=udp:127.0.0.1:{udp_host_port}-:{udp_guest_port},\
+         hostfwd=tcp:127.0.0.1:{bulk_host_port}-:{bulk_guest_port}"
     );
+
+    // The servers the guest dials must exist before it boots. The download
+    // server streams DOWNLOAD_LEN patterned bytes then closes; the UDP server
+    // echoes every datagram until the smoke ends.
+    let download_listener = std::net::TcpListener::bind(("127.0.0.1", download_port))
+        .with_context(|| format!("xtask {smoke_name}: binding download server :{download_port}"))?;
+    let download_server = std::thread::spawn(move || -> Result<u64, String> {
+        let (mut conn, _) = download_listener
+            .accept()
+            .map_err(|e| format!("accept: {e}"))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut off = 0u64;
+        while off < DOWNLOAD_LEN {
+            let n = buf.len().min((DOWNLOAD_LEN - off) as usize);
+            fill(&mut buf[..n], off, DOWNLOAD_SEED);
+            conn.write_all(&buf[..n])
+                .map_err(|e| format!("write at offset {off}: {e}"))?;
+            off += n as u64;
+        }
+        Ok(off)
+    });
+    let udp_client_server = UdpSocket::bind(("127.0.0.1", udp_client_port))
+        .with_context(|| format!("xtask {smoke_name}: binding UDP server :{udp_client_port}"))?;
+    udp_client_server.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let udp_server_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let udp_server_echoed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    {
+        let stop = udp_server_stop.clone();
+        let echoed = udp_server_echoed.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok((n, peer)) = udp_client_server.recv_from(&mut buf) {
+                    if udp_client_server.send_to(&buf[..n], peer).is_ok() {
+                        echoed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
     match nic {
         NetSmokeNic::Virtio => std::env::set_var("XTASK_QEMU_HOSTFWD", forwards),
         NetSmokeNic::E1000Module | NetSmokeNic::Igb => {
@@ -6324,12 +6388,105 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         String::from_utf8_lossy(&got)
     );
 
-    // 4. Wait until the guest has completed TCP and is ready for UDP.
-    if !wait_for(b"netserve-tcp-ok", timeout_secs) {
-        let _ = child.kill();
-        let _ = child.wait();
-        bail!("xtask {smoke_name}: guest did not confirm the TCP round-trip");
+    // Every failure below must stop QEMU and the host UDP server.
+    macro_rules! abort {
+        ($($t:tt)*) => {{
+            udp_server_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!($($t)*);
+        }};
     }
+
+    // 4. Wait until the guest has completed the TCP echo.
+    if !wait_for(b"netserve-tcp-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest did not confirm the TCP round-trip");
+    }
+
+    // 4a. Bulk echo: stream BULK_LEN patterned bytes in while reading the
+    //     guest's echo out, then verify every echoed byte and the EOF.
+    if !wait_for(b"netserve: bulk listening", timeout_secs) {
+        abort!("xtask {smoke_name}: guest bulk server did not become ready");
+    }
+    let bulk_start = Instant::now();
+    let mut bulk = None;
+    while bulk_start.elapsed() < Duration::from_secs(20) {
+        match TcpStream::connect(("127.0.0.1", bulk_host_port)) {
+            Ok(s) => {
+                bulk = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let Some(bulk) = bulk else {
+        abort!("xtask {smoke_name}: could not connect to the bulk port within 20s");
+    };
+    let _ = bulk.set_read_timeout(Some(Duration::from_secs(30)));
+    let mut bulk_writer = match bulk.try_clone() {
+        Ok(w) => w,
+        Err(e) => abort!("xtask {smoke_name}: cloning the bulk stream: {e}"),
+    };
+    let bulk_tx = std::thread::spawn(move || -> Result<(), String> {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut off = 0u64;
+        while off < BULK_LEN {
+            let n = buf.len().min((BULK_LEN - off) as usize);
+            fill(&mut buf[..n], off, BULK_SEED);
+            bulk_writer
+                .write_all(&buf[..n])
+                .map_err(|e| format!("write at offset {off}: {e}"))?;
+            off += n as u64;
+        }
+        bulk_writer
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(|e| format!("shutdown: {e}"))
+    });
+    let mut bulk_reader = bulk;
+    let mut echoed = 0u64;
+    let mut rbuf = vec![0u8; 64 * 1024];
+    loop {
+        match bulk_reader.read(&mut rbuf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(k) = (0..n).find(|&k| rbuf[k] != pat(echoed + k as u64, BULK_SEED)) {
+                    abort!(
+                        "xtask {smoke_name}: bulk echo byte mismatch at offset {}",
+                        echoed + k as u64
+                    );
+                }
+                echoed += n as u64;
+            }
+            Err(e) => abort!("xtask {smoke_name}: bulk echo stalled after {echoed} bytes: {e}"),
+        }
+    }
+    match bulk_tx.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => abort!("xtask {smoke_name}: bulk send failed: {e}"),
+        Err(_) => abort!("xtask {smoke_name}: bulk sender panicked"),
+    }
+    if echoed != BULK_LEN {
+        abort!("xtask {smoke_name}: bulk echo returned {echoed} of {BULK_LEN} bytes");
+    }
+    drop(bulk_reader);
+    println!(
+        "xtask {smoke_name}: bulk echo verified ({BULK_LEN} bytes each way in {:.2?})",
+        bulk_start.elapsed()
+    );
+    if !wait_for(b"netserve-bulk-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest did not confirm the bulk echo");
+    }
+
+    // 4b. The guest now downloads from the host server as a client.
+    if !wait_for(b"netserve-download-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest did not verify the {DOWNLOAD_LEN}-byte download");
+    }
+    match download_server.join() {
+        Ok(Ok(n)) => println!("xtask {smoke_name}: guest downloaded and verified {n} bytes"),
+        Ok(Err(e)) => abort!("xtask {smoke_name}: download server: {e}"),
+        Err(_) => abort!("xtask {smoke_name}: download server panicked"),
+    }
+
     if !wait_for(b"netserve: udp listening", timeout_secs) {
         let _ = child.kill();
         let _ = child.wait();
@@ -6379,10 +6536,68 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         "xtask {smoke_name}: host received the UDP echo ({:?})",
         String::from_utf8_lossy(&udp_buf[..udp_len])
     );
+
+    // 5a. Datagrams of many sizes, each echoed exactly. 4000 and 8000 exceed
+    //     the 1500-byte MTU: they reach the guest as IPv4 fragments and the
+    //     echo leaves it fragmented, so both reassembly and fragmentation run.
+    let mut big = vec![0u8; 65536];
+    for (i, &len) in UDP_SIZES.iter().enumerate() {
+        let mut out = vec![0u8; len];
+        fill(&mut out, 0, 0x10 + i as u8);
+        if let Err(e) = udp.send_to(&out, ("127.0.0.1", udp_host_port)) {
+            abort!("xtask {smoke_name}: host UDP send of {len} bytes failed: {e}");
+        }
+        match udp.recv_from(&mut big) {
+            Ok((n, _)) if n == len && big[..n] == out[..] => {}
+            Ok((n, _)) => {
+                abort!("xtask {smoke_name}: UDP {len}-byte echo came back as {n} wrong bytes")
+            }
+            Err(e) => abort!("xtask {smoke_name}: no echo for the {len}-byte UDP datagram: {e}"),
+        }
+    }
+    // 5b. A back-to-back burst; the echoes may reorder but none may be lost
+    //     or altered (SLIRP on loopback does not drop).
+    for i in 0..UDP_BURST {
+        let mut out = vec![0u8; UDP_BURST_LEN];
+        fill(&mut out, 0, 0x80);
+        out[..2].copy_from_slice(&(i as u16).to_be_bytes());
+        if let Err(e) = udp.send_to(&out, ("127.0.0.1", udp_host_port)) {
+            abort!("xtask {smoke_name}: host UDP burst send {i} failed: {e}");
+        }
+    }
+    let mut seen = [false; UDP_BURST];
+    for _ in 0..UDP_BURST {
+        let n = match udp.recv_from(&mut big) {
+            Ok((n, _)) => n,
+            Err(e) => abort!(
+                "xtask {smoke_name}: UDP burst lost datagrams ({} of {UDP_BURST} echoed): {e}",
+                seen.iter().filter(|s| **s).count()
+            ),
+        };
+        let idx = u16::from_be_bytes([big[0], big[1]]) as usize;
+        let mut want = vec![0u8; UDP_BURST_LEN];
+        fill(&mut want, 0, 0x80);
+        if n != UDP_BURST_LEN || idx >= UDP_BURST || seen[idx] || big[2..n] != want[2..] {
+            abort!(
+                "xtask {smoke_name}: UDP burst echo corrupt or duplicated (len {n}, index {idx})"
+            );
+        }
+        seen[idx] = true;
+    }
+    println!(
+        "xtask {smoke_name}: UDP sizes {UDP_SIZES:?} and a {UDP_BURST}-datagram burst echoed intact"
+    );
     if !wait_for(b"netserve-udp-ok", timeout_secs) {
-        let _ = child.kill();
-        let _ = child.wait();
-        bail!("xtask {smoke_name}: guest did not confirm the UDP round-trip");
+        abort!("xtask {smoke_name}: guest did not confirm the UDP round-trip");
+    }
+
+    // 5c. The guest's connect()ed UDP client round-trips with our server.
+    if !wait_for(b"netserve-udp-client-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest connected-UDP client did not complete");
+    }
+    let echoed_client = udp_server_echoed.load(std::sync::atomic::Ordering::Relaxed);
+    if echoed_client < UDP_CLIENT_ROUNDS {
+        abort!("xtask {smoke_name}: host UDP server echoed {echoed_client} of {UDP_CLIENT_ROUNDS}");
     }
 
     // 6. The guest now issues a real DNS query to SLIRP's 10.0.2.3 proxy.
@@ -6399,6 +6614,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         bail!("xtask {smoke_name}: guest did not print `netserve-ok` within {timeout_secs}s");
     }
 
+    udp_server_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = child.kill();
     let _ = child.wait();
     let _ = reader.join();
@@ -6407,7 +6623,9 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         NetSmokeNic::E1000Module => "module-owned e1000",
         NetSmokeNic::Igb => "built-in igb (QEMU 82576)",
     };
-    println!("xtask {smoke_name}: ok — live TCP, UDP, and DNS passed over {transport}");
+    println!(
+        "xtask {smoke_name}: ok — live TCP (echo, {BULK_LEN}-byte bulk echo, {DOWNLOAD_LEN}-byte client download), UDP (sizes incl. fragmented, burst, connected client) and DNS passed over {transport}"
+    );
     Ok(())
 }
 
