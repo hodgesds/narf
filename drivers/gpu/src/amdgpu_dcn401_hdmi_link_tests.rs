@@ -239,7 +239,11 @@ fn fixture_with(
     (engine, fw, c)
 }
 fn link(stream: u8, pipe: u8) -> HdmiLinkRequest {
-    HdmiLinkRequest { stream, pipe }
+    HdmiLinkRequest {
+        stream,
+        pipe,
+        avi: Default::default(),
+    }
 }
 
 fn dcn401_hdmi_link_programs_native_order_registers_and_commands() -> TestResult {
@@ -494,7 +498,7 @@ kernel_test_in!(
 
 fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
     let t = request(0).timing;
-    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t);
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, Default::default());
     // CTA-861: the header and payload sum to zero.
     let sum = p[..3]
         .iter()
@@ -510,6 +514,30 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
         || p[18..].iter().any(|b| *b != 0)
     {
         return TestResult::Fail("AVI bytes");
+    }
+    // VIC 16, 16:9, full range: SB2 M, SB3 Q and SB4 VIC, still summing to zero.
+    let avi = crate::amdgpu_dcn401_otg::Avi {
+        vic: 16,
+        aspect: 2,
+        full_range: true,
+    };
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi);
+    let sum = |p: &[u8; 36]| {
+        p[..3]
+            .iter()
+            .chain(&p[4..18])
+            .fold(0u8, |s, b| s.wrapping_add(*b))
+    };
+    if p[..4] != [0x82, 2, 13, 0] || p[5..9] != [0x1e, 0x28, 0x88, 16] || sum(&p) != 0 {
+        return TestResult::Fail("AVI VIC, aspect and range");
+    }
+    // VICs from 128 need version 3.
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(
+        &t,
+        crate::amdgpu_dcn401_otg::Avi { vic: 200, ..avi },
+    );
+    if p[1] != 3 || p[8] != 200 || sum(&p) != 0 {
+        return TestResult::Fail("AVI version 3");
     }
     // A powered-down VPG memory is woken before the packet write.
     let (mut e, mut fw, c) = fixture(1, 1, 1);

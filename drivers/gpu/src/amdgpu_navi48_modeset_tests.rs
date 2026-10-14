@@ -278,6 +278,7 @@ fn navi48_modeset_reads_hdmi_caps_and_admits_scrambled_modes_only_with_scdc() ->
         scdc: true,
         dc30: false,
         dc36: false,
+        ..Default::default()
     };
     if caps(&[VSDB, HF_VSDB]) != full
         || caps(&[VSDB, HF_SCDB]) != full
@@ -325,6 +326,90 @@ fn navi48_modeset_reads_hdmi_caps_and_admits_scrambled_modes_only_with_scdc() ->
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_reads_hdmi_caps_and_admits_scrambled_modes_only_with_scdc
+);
+
+/// The AVI fields drm_hdmi_avi_infoframe_from_display_mode and amdgpu's
+/// set_avi_info_frame derive: the CTA VIC at 60 or 59.94 Hz with its aspect,
+/// HDMI 1.4b 4K VICs left to the vendor InfoFrame on HDMI sinks, VICs above
+/// 64 only for HDMI 2.0 sinks or ones listing them, full range only with QS.
+fn navi48_modeset_derives_hdmi_avi_like_linux() -> TestResult {
+    let t = |khz, h: [u32; 4], v: [u32; 4], positive| Timing {
+        pixel_clock_khz: khz,
+        h_active: h[0],
+        h_front_porch: h[1] - h[0],
+        h_sync_width: h[2] - h[1],
+        h_total: h[3],
+        v_active: v[0],
+        v_front_porch: v[1] - v[0],
+        v_sync_width: v[2] - v[1],
+        v_total: v[3],
+        h_sync_positive: positive,
+        v_sync_positive: positive,
+    };
+    let p1080 = |khz| {
+        t(
+            khz,
+            [1920, 2008, 2052, 2200],
+            [1080, 1084, 1089, 1125],
+            true,
+        )
+    };
+    let uhd30 = t(
+        297_000,
+        [3840, 4016, 4104, 4400],
+        [2160, 2168, 2178, 2250],
+        true,
+    );
+    let vga = t(25_175, [640, 656, 752, 800], [480, 490, 492, 525], false);
+    let caps = |blocks: &[&[u8]]| hdmi_caps(&with_blocks(edid_1080p(), blocks));
+    let plain = caps(&[VSDB]);
+    let avi = |vic, aspect, full_range| otg::Avi {
+        vic,
+        aspect,
+        full_range,
+    };
+    if hdmi_avi(plain, &p1080(148_500)) != avi(16, 2, false)
+        || hdmi_avi(plain, &p1080(148_352)) != avi(16, 2, false)
+        || hdmi_avi(plain, &p1080(148_000)) != avi(0, 0, false)
+        || hdmi_avi(plain, &vga) != avi(1, 1, false)
+        // Inverted sync polarity is not the CTA mode.
+        || hdmi_avi(plain, &t(25_175, [640, 656, 752, 800], [480, 490, 492, 525], true))
+            != avi(0, 0, false)
+    {
+        return TestResult::Fail("CTA VIC match");
+    }
+    // HDMI 1.4b VIC 1 on an HDMI sink: no AVI VIC, its 16:9 aspect kept.
+    if hdmi_avi(plain, &uhd30) != avi(0, 2, false) {
+        return TestResult::Fail("HDMI VIC in AVI");
+    }
+    // VIC 95 without a VSDB: dropped for an HDMI 1.4 sink unless listed.
+    let no_vsdb = HdmiCaps::default();
+    let listed = caps(&[&[2 << 5 | 1, 95]]);
+    let hdmi2 = HdmiCaps {
+        scdc: true,
+        ..no_vsdb
+    };
+    let y420 = caps(&[&[7 << 5 | 1, 15]]);
+    if hdmi_avi(no_vsdb, &uhd30) != avi(0, 2, false)
+        || hdmi_avi(listed, &uhd30) != avi(95, 2, false)
+        || hdmi_avi(hdmi2, &uhd30) != avi(95, 2, false)
+        || !y420.ycbcr420
+        || hdmi_avi(y420, &uhd30) != avi(95, 2, false)
+    {
+        return TestResult::Fail("HDMI 2.0 VIC range");
+    }
+    let qs = caps(&[VSDB, &[7 << 5 | 2, 0, 0x40]]);
+    if !qs.qs || caps(&[VSDB, &[7 << 5 | 2, 0, 0x80]]).qs {
+        return TestResult::Fail("VCDB QS");
+    }
+    if hdmi_avi(qs, &p1080(148_500)) != avi(16, 2, true) {
+        return TestResult::Fail("full range with QS");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi48",
+    navi48_modeset_derives_hdmi_avi_like_linux
 );
 
 fn hdmi_caps_hdmi(edid: &[u8]) -> bool {

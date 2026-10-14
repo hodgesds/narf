@@ -43,6 +43,21 @@ const BE_ON: u32 = 0x810;
 pub struct HdmiLinkRequest {
     pub stream: u8,
     pub pipe: u8,
+    pub avi: Avi,
+}
+/// What the AVI InfoFrame says beyond the timing, as amdgpu_dm derives it
+/// from the mode and the sink (drm_hdmi_avi_infoframe_from_display_mode).
+/// The default is an IT format: VIC 0, no aspect, default range.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Avi {
+    /// CTA-861 VIC; 128 and up need InfoFrame version 3.
+    pub vic: u8,
+    /// Picture aspect M: 0 no data, 1 4:3, 2 16:9.
+    pub aspect: u8,
+    /// The sink declares RGB quantization selectable (VCDB QS): the full
+    /// range this owner outputs is then signalled as such (Q = 2) rather
+    /// than left to the format's default.
+    pub full_range: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HdmiLinkReady {
@@ -145,20 +160,24 @@ fn phy_at(l: Layout, phy: u8, reg: u64) -> u64 {
 fn lanes_active(value: u32) -> bool {
     (0..4).all(|lane| (value >> (8 * lane)) & 0x37 == 4)
 }
-/// The AVI InfoFrame Linux's set_avi_info_frame builds for this stream: RGB,
-/// active format valid with both bars, underscan, uniform scaling, picture
-/// aspect, IT content. VIC stays 0 and RGB quantization at its default: narf
-/// matches no CTA mode, and CTA-861 gives a VIC-0 (IT) format full-range RGB,
-/// which is what this owner sends. Returns HB0..HB3 then SB0..SB27, as the
-/// nine VPG_GENERIC_PACKET_DATA words carry them (HB3 and SB28.. stay zero).
-pub(in crate::amdgpu_dcn401_otg) fn avi_infoframe(t: &crate::amdgpu_dml::Timing) -> [u8; 36] {
+/// The AVI InfoFrame Linux's set_avi_info_frame builds for this stream: RGB
+/// (sRGB, so C no data), active format valid with both bars, underscan,
+/// uniform scaling, IT content, and `avi`'s VIC, picture aspect and range
+/// (full when the sink can select it, else default). Version 3 for VICs of
+/// 128 and up. Returns HB0..HB3 then SB0..SB27, as the nine
+/// VPG_GENERIC_PACKET_DATA words carry them (HB3 and SB28.. stay zero).
+pub(in crate::amdgpu_dcn401_otg) fn avi_infoframe(
+    t: &crate::amdgpu_dml::Timing,
+    avi: Avi,
+) -> [u8; 36] {
     let mut p = [0u8; 36];
-    p[..3].copy_from_slice(&[0x82, 2, 13]);
+    p[..3].copy_from_slice(&[0x82, if avi.vic >= 128 { 3 } else { 2 }, 13]);
     let sb = &mut p[4..];
     sb[1] = 2 | 3 << 2 | 1 << 4; // S underscan, B both bars, A0 valid, Y RGB
-    sb[2] = 8; // R same as picture, M no data, C no data
-    sb[3] = 1 << 7; // SC uniform, Q default, EC 0, ITC
-                    // Linux's bar fields: borders are zero, so bottom/right are total + 1.
+    sb[2] = 8 | (avi.aspect & 3) << 4; // R same as picture, M, C no data
+    sb[3] = 1 << 7 | u8::from(avi.full_range) << 3; // SC uniform, Q, EC 0, ITC
+    sb[4] = avi.vic;
+    // Linux's bar fields: borders are zero, so bottom/right are total + 1.
     sb[8..10].copy_from_slice(&((t.v_total + 1) as u16).to_le_bytes());
     sb[12..14].copy_from_slice(&((t.h_total + 1) as u16).to_le_bytes());
     let sum = p[..3]
@@ -363,7 +382,7 @@ impl<I: Io> Engine<I> {
             self.wait(vpg(0x206d), 0x100, 0, 1000).await?;
         }
         self.wait(vpg(0x206c), 2, 0, 500).await?;
-        let packet = avi_infoframe(&plan.blank.timing.request.timing);
+        let packet = avi_infoframe(&plan.blank.timing.request.timing, plan.request.avi);
         self.access(|io| {
             // CONFLICT_CLR and the data port are commands, not stored state.
             let status = checked(io.read(vpg(0x206c)))?;

@@ -309,7 +309,11 @@ fn chain(phy_index: u8, stream: u8, pipe: u8) -> Chain {
         layout: e.layout,
         status: e.status,
     };
-    let request = crate::amdgpu_dcn401_otg::HdmiLinkRequest { stream, pipe };
+    let request = crate::amdgpu_dcn401_otg::HdmiLinkRequest {
+        stream,
+        pipe,
+        avi: Default::default(),
+    };
     run(e.prepare_hdmi_link(&mut fw, path(phy_index), request, clock)).unwrap();
     run(e.start_hdmi_video(path(phy_index), clock)).unwrap();
     assert_eq!(e.status.state, State::HdmiVideoRunning(stream));

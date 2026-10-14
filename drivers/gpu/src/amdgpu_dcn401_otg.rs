@@ -42,7 +42,7 @@ pub use hdmi::HdmiTmdsRetired;
 #[path = "amdgpu_dcn401_hdmi_link.rs"]
 mod hdmi_link;
 pub use hdmi_link::{
-    AudioMode, HdmiAudio, HdmiAudioInfo, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,
+    AudioMode, Avi, HdmiAudio, HdmiAudioInfo, HdmiLinkReady, HdmiLinkRequest, HdmiVideoRunning,
     TMDS_MAX_KHZ, TMDS_SCRAMBLE_KHZ,
 };
 #[path = "amdgpu_dcn401_tmds_timing.rs"]

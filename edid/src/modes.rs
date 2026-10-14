@@ -142,6 +142,132 @@ pub fn find_dmt(h: u32, v: u32, refresh: u32, rb: bool) -> Option<FixedMode> {
     })
 }
 
+/// A progressive mode with the given sync polarities, to match against the
+/// tables.
+pub const fn progressive(
+    clock_khz: u32,
+    h: [u16; 4],
+    v: [u16; 4],
+    h_sync_positive: bool,
+    v_sync_positive: bool,
+) -> FixedMode {
+    let mut flags = 0;
+    if h_sync_positive {
+        flags |= PHSYNC;
+    }
+    if v_sync_positive {
+        flags |= PVSYNC;
+    }
+    FixedMode::new(clock_khz, h, v, flags)
+}
+
+/// HDMI `hdmi_picture_aspect` of a CTA mode: 0 none, 1 4:3, 2 16:9,
+/// 3 64:27, 4 256:135.
+pub fn cea_aspect(vic: u8) -> u8 {
+    match vic {
+        1..=127 => CEA_ASPECT_1[usize::from(vic) - 1],
+        193.. => CEA_ASPECT_193
+            .get(usize::from(vic) - 193)
+            .copied()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// `cea_mode_alternate_clock`: the 59.94 Hz clock of a 60 Hz-family mode, or
+/// the 60 Hz clock of a 240/480-line one (stored at 59.94 Hz).
+fn alternate_clock(m: FixedMode) -> u32 {
+    if m.refresh_hz() % 6 != 0 {
+        return m.clock_khz;
+    }
+    let (num, den) = if m.v[0] == 240 || m.v[0] == 480 {
+        (1001, 1000)
+    } else {
+        (1000, 1001)
+    };
+    ((u64::from(m.clock_khz) * num + den / 2) / den) as u32
+}
+
+/// `KHZ2PICOS` equality with the mode's 60 Hz or 59.94 Hz clock, then
+/// `drm_mode_match` on timings and flags (no aspect: narf modes carry none).
+fn matches(to: FixedMode, m: FixedMode) -> bool {
+    let picos = |khz: u32| 1_000_000_000 / khz.max(1);
+    to.clock_khz != 0
+        && (picos(to.clock_khz) == picos(m.clock_khz)
+            || picos(to.clock_khz) == picos(alternate_clock(m)))
+        && to.h == m.h
+        && to.v == m.v
+        && to.flags == m.flags
+}
+
+/// `drm_match_cea_mode` for a mode without a picture aspect: the lowest VIC
+/// whose timing it is, else 0. (The alternate front porches Linux also tries
+/// exist only for double-clocked 240p/288p modes, which never match a
+/// progressive mode.)
+pub fn match_cea_mode(to: FixedMode) -> u8 {
+    (1..=127u8)
+        .chain(193..=219)
+        .find(|&vic| cea_mode(vic).is_some_and(|m| matches(to, m)))
+        .unwrap_or(0)
+}
+
+/// `drm_match_hdmi_mode`: the HDMI 1.4b VIC (1..=4) of a 4K mode, else 0.
+pub fn match_hdmi_mode(to: FixedMode) -> u8 {
+    HDMI_MODES
+        .iter()
+        .position(|&m| matches(to, m))
+        .map_or(0, |i| i as u8 + 1)
+}
+
+/// The picture aspect of an HDMI 1.4b VIC, as `cea_aspect`.
+pub fn hdmi_aspect(vic: u8) -> u8 {
+    match vic {
+        1..=3 => 2,
+        4 => 4,
+        _ => 0,
+    }
+}
+
+/// HDMI 1.4b VICs 1..=4 (Linux `edid_4k_modes`), index VIC - 1.
+pub const HDMI_MODES: [FixedMode; 4] = [
+    FixedMode::new(
+        297000,
+        [3840, 4016, 4104, 4400],
+        [2160, 2168, 2178, 2250],
+        0x3,
+    ),
+    FixedMode::new(
+        297000,
+        [3840, 4896, 4984, 5280],
+        [2160, 2168, 2178, 2250],
+        0x3,
+    ),
+    FixedMode::new(
+        297000,
+        [3840, 5116, 5204, 5500],
+        [2160, 2168, 2178, 2250],
+        0x3,
+    ),
+    FixedMode::new(
+        297000,
+        [4096, 5116, 5204, 5500],
+        [2160, 2168, 2178, 2250],
+        0x3,
+    ),
+];
+
+/// Picture aspects of VICs 1..=127 (Linux `edid_cea_modes_1`).
+const CEA_ASPECT_1: [u8; 127] = [
+    1, 1, 2, 2, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 2, 1, 2, 2, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 2, 2,
+    2, 2, 1, 2, 1, 2, 2, 2, 2, 1, 2, 1, 2, 2, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2,
+    2, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 2, 3, 3, 2, 3, 3, 2, 4, 3, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+];
+/// Picture aspects of VICs 193..=219 (Linux `edid_cea_modes_193`).
+const CEA_ASPECT_193: [u8; 27] = [
+    3, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4,
+];
+
 /// CTA-861 VICs 1..=127 (Linux `edid_cea_modes_1`), index VIC - 1.
 pub const CEA_MODES_1: [FixedMode; 127] = [
     // 1 - 640x480@60Hz 4:3

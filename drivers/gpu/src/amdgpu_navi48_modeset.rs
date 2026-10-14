@@ -51,6 +51,8 @@ pub struct Selection {
     pub depth: otg::ColorDepth,
     /// The HDMI sink's audio, when it declares any.
     pub audio: Option<otg::HdmiAudioInfo>,
+    /// The HDMI AVI InfoFrame's VIC, aspect and range for this timing.
+    pub avi: otg::Avi,
 }
 
 /// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
@@ -260,6 +262,14 @@ pub struct HdmiCaps {
     pub forum_max_khz: u32,
     /// HF SCDC_Present.
     pub scdc: bool,
+    /// VCDB QS: the sink takes the RGB quantization range the AVI
+    /// InfoFrame names.
+    pub qs: bool,
+    /// A Y420 video or capability-map block declares 4:2:0: with SCDC,
+    /// what makes Linux's is_hdmi2_sink.
+    pub ycbcr420: bool,
+    /// VICs the Video Data Blocks list, as a bitmap.
+    pub vics: [u64; 4],
     /// VSDB DC_30bit / DC_36bit: RGB 4:4:4 at 10 / 12 bpc.
     pub dc30: bool,
     pub dc36: bool,
@@ -296,6 +306,36 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
                 } if payload.len() >= 6 => payload.get(2..),
                 _ => None,
             };
+            match db {
+                DataBlock::Video(svds) => {
+                    for d in svds {
+                        caps.vics[usize::from(d.vic / 64)] |= 1 << (d.vic % 64);
+                    }
+                }
+                DataBlock::Extended {
+                    ext_tag: 0,
+                    payload,
+                } => {
+                    caps.qs |= payload.first().is_some_and(|b| b & 0x40 != 0);
+                }
+                // Y420VDB: any known VIC; Y420CMDB: an empty map covers all
+                // SVDs, else any set bit.
+                DataBlock::Extended {
+                    ext_tag: 14,
+                    payload,
+                } => {
+                    caps.ycbcr420 |= payload
+                        .iter()
+                        .any(|&b| narf_edid::modes::cea_mode(svd_vic(b)).is_some());
+                }
+                DataBlock::Extended {
+                    ext_tag: 15,
+                    payload,
+                } => {
+                    caps.ycbcr420 |= payload.is_empty() || payload.iter().take(8).any(|&b| b != 0);
+                }
+                _ => {}
+            }
             if let Some(&[_version, rate, flags, ..]) = forum {
                 caps.forum_max_khz = u32::from(rate) * 5000;
                 caps.scdc = flags & 0x80 != 0;
@@ -304,6 +344,61 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
     }
     caps
 }
+/// Linux `svd_to_vic`.
+fn svd_vic(svd: u8) -> u8 {
+    narf_edid::cta861::ShortVideoDescriptor::parse(svd).vic
+}
+
+/// The AVI InfoFrame fields of `t` on this sink, as
+/// drm_hdmi_avi_infoframe_from_display_mode and amdgpu's set_avi_info_frame
+/// derive them: the CTA VIC (none for an HDMI 1.4b 4K mode on an HDMI sink,
+/// whose VIC belongs in the vendor InfoFrame, which narf does not send; and
+/// none above 64 for an HDMI 1.4 sink that does not list it), the VIC's
+/// picture aspect when 4:3 or 16:9, and full range when the sink can select
+/// it. The aspect of a mode is taken from its VIC alone: narf modes carry
+/// none of their own.
+pub fn hdmi_avi(caps: HdmiCaps, t: &Timing) -> otg::Avi {
+    use narf_edid::modes::{cea_aspect, hdmi_aspect, match_cea_mode, match_hdmi_mode};
+    let field = |active: u32, front: u32, sync: u32, total: u32| {
+        let at = |x: u32| u16::try_from(x).unwrap_or(u16::MAX);
+        [
+            at(active),
+            at(active + front),
+            at(active + front + sync),
+            at(total),
+        ]
+    };
+    let mode = narf_edid::modes::progressive(
+        t.pixel_clock_khz,
+        field(t.h_active, t.h_front_porch, t.h_sync_width, t.h_total),
+        field(t.v_active, t.v_front_porch, t.v_sync_width, t.v_total),
+        t.h_sync_positive,
+        t.v_sync_positive,
+    );
+    let hdmi_vic = if caps.hdmi { match_hdmi_mode(mode) } else { 0 };
+    let vic = if hdmi_vic != 0 {
+        0
+    } else {
+        match_cea_mode(mode)
+    };
+    let aspect = match (vic, hdmi_vic) {
+        (0, 0) => 0,
+        (0, h) => hdmi_aspect(h),
+        (v, _) => cea_aspect(v),
+    };
+    let hdmi2 = caps.scdc || caps.ycbcr420;
+    let listed = caps.vics[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
+    otg::Avi {
+        vic: if !hdmi2 && vic > 64 && !listed {
+            0
+        } else {
+            vic
+        },
+        aspect: if aspect <= 2 { aspect } else { 0 },
+        full_range: caps.qs,
+    }
+}
+
 /// Whether an HDMI sink can take `khz` as 8-bpc RGB TMDS: within a declared
 /// VSDB Max_TMDS_Clock, and above 340 MHz only with SCDC and an HF rate that
 /// covers it (DRM's scrambling-support rule).
@@ -391,6 +486,7 @@ pub fn select(
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
             audio: None,
+            avi: otg::Avi::default(),
         });
     }
     for port in ports {
@@ -427,6 +523,7 @@ pub fn select(
             scdc: caps.scdc,
             depth,
             audio: hdmi_audio_info(&sink.edid),
+            avi: hdmi_avi(caps, &timing),
         });
     }
     Err(if link_short {
@@ -742,7 +839,11 @@ impl ColdBoot {
             let port = selection.port;
             if selection.hdmi {
                 self.configure_scdc(&selection).await?;
-                let request = otg::HdmiLinkRequest { stream: pipe, pipe };
+                let request = otg::HdmiLinkRequest {
+                    stream: pipe,
+                    pipe,
+                    avi: selection.avi,
+                };
                 self.prepare_display_hdmi_link(port, request).await?;
                 self.start_display_hdmi_video(port).await?;
                 let scanout = self.start_display_scanout(pipe).await?;
