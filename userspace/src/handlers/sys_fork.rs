@@ -314,6 +314,10 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
     rlimit_fork(parent_pid, child_tid.raw());
     cap_fork(parent_pid, child_tid.raw());
+    // comm, exe, image mappings, argv, environ and auxv: the same identity
+    // the clone path inherits. A fork(2) child (musl issues SYS_fork) used to
+    // read an empty /proc/self/{comm,exe,cmdline,environ,auxv}.
+    crate::handlers::proc_identity_fork(parent_pid, child_tid.raw());
     // fork(2) copies (never shares) a pre-existing io_context.
     ioprio_fork(parent_pid, child_tid.raw(), false);
     // `sched_fork`: policy, RT priority and nice are inherited, subject to

@@ -7258,7 +7258,7 @@ fn proc_image_mapping_for_range(
         })
 }
 
-fn proc_identity_fork(parent_task: u64, child_task: u64) {
+pub(crate) fn proc_identity_fork(parent_task: u64, child_task: u64) {
     let inherited_comm = {
         let g = PROC_COMM.lock();
         g.as_ref().and_then(|m| m.get(&parent_task).cloned())
@@ -7280,6 +7280,20 @@ fn proc_identity_fork(parent_task: u64, child_task: u64) {
             .insert(child_task, exe);
     }
     task_map_fork(&PROC_IMAGE_MAPPINGS, parent_task, child_task);
+    // argv, environ and the auxiliary vector live in the mm on Linux
+    // (`mm->arg_start..env_end`, `mm->saved_auxv`), which `dup_mm` copies: a
+    // forked child that has not exec'd reports its parent's
+    // /proc/self/{cmdline,environ,auxv}. Chromium's zygote-forked renderers
+    // never exec, and crashpad reads their auxv for AT_PHDR / AT_BASE.
+    for table in [&PROC_ARGV, &PROC_ENVIRON, &PROC_AUXV] {
+        let inherited = table.lock().as_ref().and_then(|m| m.get(&parent_task).cloned());
+        if let Some(bytes) = inherited {
+            table
+                .lock()
+                .get_or_insert_with(alloc::collections::BTreeMap::new)
+                .insert(child_task, bytes);
+        }
+    }
 }
 
 /// Record the exec'd binary path for `/proc/[pid]/exe`. A relative
@@ -8143,11 +8157,17 @@ fn sig_disposition_masks(task: u64) -> (u64, u64) {
     let table = sighand.lock();
     let mut ignored = 0u64;
     let mut caught = 0u64;
-    for (index, slot) in table.iter().enumerate() {
+    // The table is indexed BY signal number (slot 0 unused), exactly as
+    // `sigaction_lookup_full` reads it; bit N-1 of each mask is signal N
+    // (`render_sigset_t`). Reading slot `index` as signal `index + 1` moved
+    // every disposition up one bit — a SIGHUP handler read as SIGINT, so
+    // systemd refused Type=notify-reload services ("lacks handler for reload
+    // signal") — and pushed signal 64 off the end of the mask.
+    for (signum, slot) in table.iter().enumerate() {
         let Some(action) = slot else { continue };
-        let bit = match u32::try_from(index + 1) {
-            Ok(signum) => sig_bit(signum),
-            Err(_) => continue,
+        let bit = match u32::try_from(signum) {
+            Ok(signum @ 1..=64) => sig_bit(signum),
+            _ => continue,
         };
         match action.handler {
             SIG_IGN => ignored |= bit,
