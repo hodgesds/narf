@@ -38,6 +38,7 @@ fn inputs(f: &[u32]) -> (Soc, Mode) {
         Mode {
             timing,
             pitch: f[18],
+            ycbcr420: false,
         },
     )
 }
@@ -317,29 +318,35 @@ kernel_test_in!(
 /// Shared with tests/dcn401_dml21/check.sh (harness_multi.c).
 const MULTI_VECTORS: &str = include_str!("../tests/dcn401_dml21/multi_vectors.txt");
 
-fn dcn401_dml_matches_linux_dml21_multi_stream_vectors() -> TestResult {
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c, FMT420).
+const YCBCR420_VECTORS: &str = include_str!("../tests/dcn401_dml21/ycbcr420_vectors.txt");
+
+/// Check `vectors` (multi_vectors.txt format) with every stream's 4:2:0
+/// output set to `ycbcr420`; the plan and rejection counts seen.
+fn check_multi_vectors(vectors: &str, ycbcr420: bool) -> Result<(u32, u32), &'static str> {
     let (mut plans, mut rejects) = (0, 0);
-    for line in MULTI_VECTORS.lines() {
+    for line in vectors.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let mut words = line.split_whitespace();
         let mut s = [0u32; 10];
         if !parse(&mut words, &mut s) || !(1..=4).contains(&s[9]) {
-            return TestResult::Fail("malformed multi-stream SoC inputs");
+            return Err("malformed multi-stream SoC inputs");
         }
         let mut modes = Vec::new();
         for _ in 0..s[9] {
             let mut t = [0u32; 10];
             if !parse(&mut words, &mut t) {
-                return TestResult::Fail("malformed multi-stream mode");
+                return Err("malformed multi-stream mode");
             }
             // The single-stream layout: timing, SoC, then the pitch.
             let mut f = [0u32; 19];
             f[..9].copy_from_slice(&t[..9]);
             f[9..18].copy_from_slice(&s[..9]);
             f[18] = t[9];
-            let (_, mode) = inputs(&f);
+            let (_, mut mode) = inputs(&f);
+            mode.ycbcr420 = ycbcr420;
             modes.push(mode);
         }
         let mut f = [0u32; 19];
@@ -349,50 +356,69 @@ fn dcn401_dml_matches_linux_dml21_multi_stream_vectors() -> TestResult {
         match words.next() {
             Some("=") => {
                 let Ok(got) = &result else {
-                    return TestResult::Fail("Linux-admitted configuration rejected");
+                    return Err("Linux-admitted configuration rejected");
                 };
                 for (k, plan) in got.iter().enumerate() {
                     if k > 0 && words.next() != Some("|") {
-                        return TestResult::Fail("malformed multi-stream plan separator");
+                        return Err("malformed multi-stream plan separator");
                     }
                     let mut want = [0u32; 62];
                     if !parse(&mut words, &mut want) {
-                        return TestResult::Fail("malformed multi-stream plan");
+                        return Err("malformed multi-stream plan");
                     }
                     for (i, (&g, &w)) in values(plan).iter().zip(want.iter()).enumerate() {
                         if g != w && !(TOLERATED.contains(&i) && g.abs_diff(w) == 1) {
-                            return TestResult::Fail("joint plan value differs from Linux DML21");
+                            return Err("joint plan value differs from Linux DML21");
                         }
                     }
                     if !plan.readmits() || plan.mode != modes[k] || usize::from(plan.stream) != k {
-                        return TestResult::Fail("joint plan not reproducible or not bound");
+                        return Err("joint plan not reproducible or not bound");
                     }
                 }
                 if got.len() != modes.len() || words.next().is_some() {
-                    return TestResult::Fail("joint plan count");
+                    return Err("joint plan count");
                 }
                 plans += 1;
             }
             Some("!") => {
                 let (Some(name), Err(e)) = (words.next(), result) else {
-                    return TestResult::Fail("rejected configuration admitted");
+                    return Err("rejected configuration admitted");
                 };
                 if error_name(e) != name {
-                    return TestResult::Fail("configuration rejected for a different reason");
+                    return Err("configuration rejected for a different reason");
                 }
                 rejects += 1;
             }
-            _ => return TestResult::Fail("malformed multi-stream vector kind"),
+            _ => return Err("malformed multi-stream vector kind"),
         }
     }
-    if plans < 150 || rejects < 20 {
-        return TestResult::Fail("multi-stream vector file lost coverage");
+    Ok((plans, rejects))
+}
+
+fn dcn401_dml_matches_linux_dml21_multi_stream_vectors() -> TestResult {
+    match check_multi_vectors(MULTI_VECTORS, false) {
+        Ok((plans, rejects)) if plans >= 150 && rejects >= 20 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("multi-stream vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
     }
-    TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_matches_linux_dml21_multi_stream_vectors
+);
+
+/// HDMI YCbCr 4:2:0 outputs: one more line after the scaler, and at most
+/// 4096 even pixels per line without ODM, as DML21 plans them.
+fn dcn401_dml_matches_linux_dml21_ycbcr420_vectors() -> TestResult {
+    match check_multi_vectors(YCBCR420_VECTORS, true) {
+        Ok((plans, rejects)) if plans >= 40 && rejects >= 8 => TestResult::Pass,
+        Ok(_) => TestResult::Fail("4:2:0 vector file lost coverage"),
+        Err(e) => TestResult::Fail(e),
+    }
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_ycbcr420_vectors
 );
 
 fn dcn401_dml_joint_plans_share_global_state() -> TestResult {

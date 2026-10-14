@@ -80,6 +80,9 @@ pub struct Mode {
     pub timing: Timing,
     /// Surface pitch in pixels.
     pub pitch: u32,
+    /// The stream leaves as YCbCr 4:2:0 (HDMI): two pixels per OTG
+    /// container, which adds a line of delay after the scaler.
+    pub ycbcr420: bool,
 }
 
 /// Clocks the plan was computed for. DISPCLK, DPPREFCLK and the pipe's DPPCLK
@@ -273,6 +276,8 @@ const REQUEST_BYTES: i64 = 256;
 const PREFETCH_SOURCE_LINES: i64 = 2;
 /// Upper bound for any clock input: 10 GHz.
 const MAX_CLOCK_KHZ: u32 = 10_000_000;
+/// `DML2_MAX_FMT_420_BUFFER_WIDTH`: widest 4:2:0 output line per OPP.
+const FMT_420_BUFFER_WIDTH: u32 = 4096;
 /// PMO only budgets stutter when the nominal blank is three times its cost.
 const MIN_BLANK_STUTTER_FACTOR: i64 = 3;
 
@@ -397,6 +402,7 @@ struct Shape {
     det_bytes: u32,
     vactive_bw: Fx,
     vblank: u32,
+    ycbcr420: bool,
 }
 
 /// DPPCLK, DISPCLK and deep-sleep DCFCLK one evaluation runs the pipe at.
@@ -468,6 +474,11 @@ impl Shape {
         {
             return Err(Error::Unsupported);
         }
+        // ValidateODMMode without ODM: a 4:2:0 output passes two pixels per
+        // clock and fits the formatter's 4:2:0 line buffer.
+        if mode.ycbcr420 && (t.h_active % 2 != 0 || t.h_active > FMT_420_BUFFER_WIDTH) {
+            return Err(Error::Unsupported);
+        }
         let w = u64::from(t.h_active);
         let r = u64::from(REQUEST_PIXELS);
         let swath_ub = ceil_to(w, r).min(ceil_to(w - 1, r) + r) as u32;
@@ -483,6 +494,7 @@ impl Shape {
                 i64::from(t.h_total) * 1000,
             ),
             vblank: t.v_total - t.v_active,
+            ycbcr420: mode.ycbcr420,
         })
     }
     /// `CalculateSwathAndDETConfiguration` support and `PitchSupport`.
@@ -601,6 +613,9 @@ impl Shape {
                 .over(dppclk)
                 .plus(fx(DISPCLK_DELAY_CYCLES).times(self.pclk).over(dispclk)),
         ) as u32;
+        // CalculatePrefetchSchedule: one line after the scaler for a 4:2:0
+        // output, then the pixel delay folded into lines.
+        let dst_x = dst_x + if self.ycbcr420 { t.h_total } else { 0 };
         s.dst_y = dst_x / t.h_total;
         s.dst_x = dst_x - s.dst_y * t.h_total;
 

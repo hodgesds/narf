@@ -5,7 +5,8 @@
  * Arguments: dcfclk_min dcfclk_max fclk_min fclk_max uclk dispclk_max
  * dppclk_max socclk umc_channels, then per stream: pclk hact htotal hfp hsync
  * vact vtotal vfp vsync pitch_px. Prints "PLAN <62 values>" per plane on one
- * line, planes separated by " |", or "REJECT".
+ * line, planes separated by " |", or "REJECT". With FMT420 set in the
+ * environment every stream leaves as HDMI YCbCr 4:2:0 instead of DP RGB.
  *
  * Original single-stream notes follow.
  *
@@ -116,8 +117,8 @@ int main(int argc, char **argv)
 		t->bpc = 8;
 		t->vblank_nom = a[6] - a[5];
 		t->drr_config.disallowed = true;
-		s->output.output_format = dml2_444;
-		s->output.output_encoder = dml2_dp;
+		s->output.output_format = getenv("FMT420") ? dml2_420 : dml2_444;
+		s->output.output_encoder = getenv("FMT420") ? dml2_hdmi : dml2_dp;
 		s->output.output_dp_lane_count = 4;
 		s->output.output_disabled = true;
 		s->overrides.odm_mode = dml2_odm_mode_bypass;

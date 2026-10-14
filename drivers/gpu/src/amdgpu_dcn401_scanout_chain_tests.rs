@@ -201,7 +201,15 @@ fn plan() -> dml::Plan {
         h_sync_positive: false,
         v_sync_positive: false,
     };
-    dml::admit(&soc(), &dml::Mode { timing, pitch: 640 }).unwrap()
+    dml::admit(
+        &soc(),
+        &dml::Mode {
+            timing,
+            pitch: 640,
+            ycbcr420: false,
+        },
+    )
+    .unwrap()
 }
 /// The plane mode and pixel clock the modeset derives from `plan` for TMDS.
 fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {

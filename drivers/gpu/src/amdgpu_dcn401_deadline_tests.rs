@@ -36,6 +36,7 @@ fn plan() -> dml::Plan {
         &dml::Mode {
             timing: timing(),
             pitch: 1920,
+            ycbcr420: false,
         },
     )
     .unwrap()
