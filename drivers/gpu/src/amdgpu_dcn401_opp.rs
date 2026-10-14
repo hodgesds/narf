@@ -45,15 +45,21 @@ impl ColorDepth {
         }
     }
 }
-/// Full-range RGB black pattern. Timing dimensions come from the matching
-/// prepared pipe; no independent size can accidentally disagree with it.
+/// RGB black pattern. Timing dimensions come from the matching prepared
+/// pipe; no independent size can accidentally disagree with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlankRequest {
     pub pipe: u8,
     pub depth: ColorDepth,
+    /// Limited-range (16-235) RGB output, Linux's COLOR_SPACE_SRGB_LIMITED:
+    /// the MPC output CSC compresses the range, the blank pattern is limited
+    /// black and the stream signals it. Full range (COLOR_SPACE_SRGB)
+    /// otherwise.
+    pub limited: bool,
 }
 impl BlankRequest {
     fn registers(self, t: Timing) -> [(u64, u32, u32); 14] {
+        let black = if self.limited { 0x1000_1000 } else { 0 };
         [
             (EDGE, 1, 0), // no chroma filter extra pixel for RGB
             // Explicit truncation, no spatial/temporal dithering or randomization.
@@ -75,9 +81,11 @@ impl BlankRequest {
             ),
             (DIMENSIONS, 0x3fff3fff, t.h_active << 16 | t.v_active),
             (OFFSET, 0x3fff3fff, 0),
-            (BLUE, u32::MAX, 0),
-            (GREEN, u32::MAX, 0),
-            (RED, u32::MAX, 0),
+            // black_color_format: RGB limited black is 0x40 of 10 bits, MSB
+            // aligned in both 16-bit colour fields.
+            (BLUE, u32::MAX, black),
+            (GREEN, u32::MAX, black),
+            (RED, u32::MAX, black),
             // Equal black bars; clear range/resolution/field-polarity.
             (DPG, 0x01ff3171, 0x41 | self.depth.dpg() << 12),
         ]

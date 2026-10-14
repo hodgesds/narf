@@ -285,8 +285,14 @@ impl<I: Io> Engine<I> {
             (0, 0x70, u32::from(plan.request.pipe) << 4),
             (0, 0x100, 0x100),
             (5, 0x10731, depth << 8),
-            (6, u32::MAX, depth << 29),
-            (7, 0xc0, 0), // full-range RGB, MSA colorimetry (no VSC SDP)
+            // MSA MISC0: component depth, and bit 3 (CEA dynamic range) for
+            // limited-range RGB as dcn10 stream encoders set it.
+            (
+                6,
+                u32::MAX,
+                (depth << 5 | u32::from(plan.blank.request.limited) << 3) << 24,
+            ),
+            (7, 0xc0, 0), // RGB, MSA colorimetry (no VSC SDP)
             (8, u32::MAX, t.h_total << 16 | t.v_total),
             (
                 9,

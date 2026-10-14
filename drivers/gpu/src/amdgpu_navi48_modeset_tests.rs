@@ -363,11 +363,7 @@ fn navi48_modeset_derives_hdmi_avi_like_linux() -> TestResult {
     let vga = t(25_175, [640, 656, 752, 800], [480, 490, 492, 525], false);
     let caps = |blocks: &[&[u8]]| hdmi_caps(&with_blocks(edid_1080p(), blocks));
     let plain = caps(&[VSDB]);
-    let avi = |vic, aspect, full_range| otg::Avi {
-        vic,
-        aspect,
-        full_range,
-    };
+    let avi = |vic, aspect, qs| otg::Avi { vic, aspect, qs };
     if hdmi_avi(plain, &p1080(148_500)) != avi(16, 2, false)
         || hdmi_avi(plain, &p1080(148_352)) != avi(16, 2, false)
         || hdmi_avi(plain, &p1080(148_000)) != avi(0, 0, false)
@@ -403,13 +399,38 @@ fn navi48_modeset_derives_hdmi_avi_like_linux() -> TestResult {
         return TestResult::Fail("VCDB QS");
     }
     if hdmi_avi(qs, &p1080(148_500)) != avi(16, 2, true) {
-        return TestResult::Fail("full range with QS");
+        return TestResult::Fail("QS not carried");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/amdgpu/navi48",
     navi48_modeset_derives_hdmi_avi_like_linux
+);
+
+/// "Broadcast RGB" as amdgpu_dm_get_output_color_space reads it for RGB:
+/// only Limited selects limited range; Automatic stays full.
+fn navi48_modeset_broadcast_rgb_selects_limited_only_when_asked() -> TestResult {
+    if limited_range(BROADCAST_RGB_AUTO)
+        || limited_range(BROADCAST_RGB_FULL)
+        || !limited_range(BROADCAST_RGB_LIMITED)
+    {
+        return TestResult::Fail("output range");
+    }
+    let before = broadcast_rgb();
+    set_broadcast_rgb(7);
+    let ignored = broadcast_rgb() == before;
+    set_broadcast_rgb(BROADCAST_RGB_LIMITED);
+    let set = broadcast_rgb() == BROADCAST_RGB_LIMITED;
+    set_broadcast_rgb(before);
+    if !ignored || !set {
+        return TestResult::Fail("setting");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/amdgpu/navi48",
+    navi48_modeset_broadcast_rgb_selects_limited_only_when_asked
 );
 
 fn hdmi_caps_hdmi(edid: &[u8]) -> bool {

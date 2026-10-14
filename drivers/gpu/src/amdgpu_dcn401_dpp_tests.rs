@@ -144,11 +144,28 @@ fn ready_with(
     depth: ColorDepth,
     mode: Mode,
 ) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
+    ready_range(p, depth, mode, false)
+}
+/// `ready_with` for a full- or limited-range blank request.
+fn ready_range(
+    p: u8,
+    depth: ColorDepth,
+    mode: Mode,
+    limited: bool,
+) -> (Vec<u32>, Pool, Engine<DppIo>, Surfaces, dccg::Applied) {
     let (backing, pool, mut e, mut surfaces) = staged_with(p, mode.surface, mode.bytes);
     run(surfaces.prepare_memory(&mut e, p, || Ok(config()))).unwrap();
     let (t, clock) = (mode.timing, mode.clock);
     run(e.prepare(t, clock)).unwrap();
-    run(e.prepare_blank(BlankRequest { pipe: p, depth }, clock)).unwrap();
+    run(e.prepare_blank(
+        BlankRequest {
+            pipe: p,
+            depth,
+            limited,
+        },
+        clock,
+    ))
+    .unwrap();
     for (r, value) in RGB {
         e.io.surface
             .inner

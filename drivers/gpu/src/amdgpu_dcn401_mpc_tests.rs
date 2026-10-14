@@ -47,7 +47,15 @@ fn ready_mpc_with(
     depth: ColorDepth,
     mode: Mode,
 ) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces, dccg::Applied) {
-    let (backing, pool, mut e, mut surfaces, clock) = ready_with(p, depth, mode);
+    ready_mpc_range(p, depth, mode, false)
+}
+fn ready_mpc_range(
+    p: u8,
+    depth: ColorDepth,
+    mode: Mode,
+    limited: bool,
+) -> (Vec<u32>, Pool, Engine<MemoryIo>, Surfaces, dccg::Applied) {
+    let (backing, pool, mut e, mut surfaces, clock) = ready_range(p, depth, mode, limited);
     e.io.delay = [0; 2]; // DPP acknowledgement timing is covered by its own tests.
     run(surfaces.prepare_dpp(&mut e, p, || Ok((clock, config())))).unwrap();
     let mut e = Engine {
@@ -115,6 +123,57 @@ fn dcn401_mpc_stages_opaque_rgb_all_depths_and_pipes_without_connecting() -> Tes
     }
     TestResult::Pass
 }
+/// A limited-range stream loads mpc3_set_ocsc_default's
+/// COLOR_SPACE_SRGB_LIMITED matrix into set A in S2.13 format and selects
+/// it, replacing the bypass write; set A in use is not pending.
+fn dcn401_mpc_loads_limited_range_output_csc_like_linux() -> TestResult {
+    for p in 0..4u8 {
+        let (_backing, _pool, mut e, mut surfaces, clock) =
+            ready_mpc_range(p, ColorDepth::Bpc10, small(p), true);
+        let csc = |r: u64| MPC_BASE + (0x30b + u64::from(p) * 0xd + r) * 4;
+        let format = MPC_BASE + 0x30a * 4;
+        let f = &mut e.io.surface.inner;
+        f.regs.insert(format, 0xf);
+        for r in 1..=6 {
+            f.regs.insert(csc(r), 0xdead_beef);
+        }
+        // Set A already in use: only the eight other selectors are pending.
+        *f.regs.get_mut(&csc(0)).unwrap() &= !0x100;
+        let a = surfaces
+            .prepare_mpc(&mut e, p, || Ok((clock, config())))
+            .unwrap();
+        if !a.limited || a.pending != 0xff {
+            return TestResult::Fail("limited MPC report");
+        }
+        let f = &e.io.surface.inner;
+        let want = [
+            (csc(1), 0x1b67),
+            (csc(2), 0x201 << 16),
+            (csc(3), 0x1b67 << 16),
+            (csc(4), 0x201 << 16),
+            (csc(5), 0),
+            (csc(6), 0x201 << 16 | 0x1b67),
+        ];
+        if want.iter().any(|&(at, v)| f.regs[&at] != v)
+            || f.regs[&format] != 0xf & !(1 << p)
+            || f.regs[&csc(0)] & 3 != 1
+            || f.writes.len() != 27
+        {
+            return TestResult::Fail("limited-range output CSC");
+        }
+        // Coefficients are loaded before set A is selected.
+        let select = f.writes.iter().rposition(|w| w.0 == csc(0));
+        let last_coef = f.writes.iter().rposition(|w| w.0 == csc(6));
+        if !matches!((last_coef, select), (Some(c), Some(s)) if c < s) {
+            return TestResult::Fail("OCSC select before coefficients");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-mpc",
+    dcn401_mpc_loads_limited_range_output_csc_like_linux
+);
 kernel_test_in!(
     "drivers/gpu/dcn401-mpc",
     dcn401_mpc_stages_opaque_rgb_all_depths_and_pipes_without_connecting
@@ -265,6 +324,7 @@ fn dcn401_mpc_late_changes_fail_closed_and_reprepare_invalidates_reports() -> Te
                     BlankRequest {
                         pipe: 0,
                         depth: ColorDepth::Bpc12,
+                        limited: false,
                     },
                     clock,
                 ))

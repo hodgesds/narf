@@ -8,8 +8,11 @@ use crate::amdgpu_gmc_navi48::{DisplayContext, Gmc};
 pub struct MpcApplied {
     pub dpp: DppApplied,
     pub depth: ColorDepth,
-    /// Historical non-bypass CURRENT selectors: location, OGAM, OGAM gamut,
-    /// shaper, 3D LUT, post-1D LUT, first/second MCM gamut and output CSC.
+    /// The output CSC compresses to limited range (the blank request's).
+    pub limited: bool,
+    /// CURRENT selectors not yet at the request: location, OGAM, OGAM gamut,
+    /// shaper, 3D LUT, post-1D LUT, first/second MCM gamut (all bypass) and
+    /// output CSC (bypass, or set A when limited).
     /// Timing is stopped; writing a bypass request does not prove its latch.
     pub pending: u16,
 }
@@ -26,6 +29,25 @@ impl Layout {
     fn ocsc(self, pipe: u8) -> u64 {
         self.mpc_base + (0x30b + u64::from(pipe) * 0xd) * 4
     }
+    /// The output CSC of a limited-range stream, as mpc3_set_ocsc_default
+    /// loads COLOR_SPACE_SRGB_LIMITED: fixed-point S2.13 coefficients (this
+    /// pipe's MPC_OUT_CSC_COEF_FORMAT bit clear), set A, then mode A. Linux's
+    /// output_csc_matrix scales each channel by 0x1B67 and adds 0x201.
+    fn ocsc_limited(self, pipe: u8) -> [(u64, u32, u32); 8] {
+        let coef = |r: u64| self.ocsc(pipe) + r * 4;
+        const SCALE: u32 = 0x1b67;
+        const OFFSET: u32 = 0x201 << 16;
+        [
+            (self.mpc_base + 0x30a * 4, 1 << pipe, 0),
+            (coef(1), u32::MAX, SCALE),          // C11, C12
+            (coef(2), u32::MAX, OFFSET),         // C13, C14
+            (coef(3), u32::MAX, SCALE << 16),    // C21, C22
+            (coef(4), u32::MAX, OFFSET),         // C23, C24
+            (coef(5), u32::MAX, 0),              // C31, C32
+            (coef(6), u32::MAX, SCALE | OFFSET), // C33, C34
+            (self.ocsc(pipe), 3, 1),
+        ]
+    }
     fn mpc_bypass(self, p: u8) -> [(u64, u32); 9] {
         [
             (self.mpcc(p, 9), 0x10),
@@ -39,7 +61,17 @@ impl Layout {
             (self.ocsc(p), 0x180),
         ]
     }
-    fn mpc_rgb(self, a: MpcApplied) -> [(u64, u32, u32); 20] {
+    /// The composition registers, then for a limited-range stream the output
+    /// CSC load (after the bypass write of its mode, which it replaces).
+    fn mpc_rgb(self, a: MpcApplied) -> impl Iterator<Item = (u64, u32, u32)> {
+        let p = a.dpp.surface.request.pipe;
+        let limited = a.limited.then(|| self.ocsc_limited(p));
+        self.mpc_full(a)
+            .into_iter()
+            .filter(move |&(at, _, _)| !(a.limited && at == self.ocsc(p)))
+            .chain(limited.into_iter().flatten())
+    }
+    fn mpc_full(self, a: MpcApplied) -> [(u64, u32, u32); 20] {
         let p = a.dpp.surface.request.pipe;
         let denorm = match a.depth {
             ColorDepth::Bpc8 => 2,
@@ -66,8 +98,9 @@ impl Layout {
             (self.mcm(p, 0x4de), 3, 0),
             (self.mcm(p, 0x4ec), 3, 0),
             (self.ocsc(p), 3, 0),
-            // Full 12-bit clamp domain, no limited-range conversion. The
-            // denormalizer selects the output depth, matching the owned FMT.
+            // Full 12-bit clamp domain, as Linux leaves it for limited range
+            // too. The denormalizer selects the output depth, matching the
+            // owned FMT.
             (self.mpc_out(p, 0x2f3), 0x7ffffff, denorm << 24 | 0xfff000),
             (self.mpc_out(p, 0x2f4), 0xffffff, 0xfff000),
             (self.mpc_out(p, 0x2f5), 0xffffff, 0xfff000),
@@ -88,7 +121,9 @@ impl<I: Io> Engine<I> {
             .into_iter()
             .enumerate()
         {
-            if self.read(at)? & mask != 0 {
+            let ocsc = at == self.layout.ocsc(a.dpp.surface.request.pipe);
+            let want = if ocsc && a.limited { 1 << 7 } else { 0 };
+            if self.read(at)? & mask != want {
                 pending |= 1 << bit;
             }
         }
@@ -116,6 +151,7 @@ impl Surfaces {
             || dpp.surface != surface.applied
             || dpp.timing != blank.timing
             || a.depth != blank.request.depth
+            || a.limited != blank.request.limited
             || e.blank_timing(blank.request, clock)? != dpp.timing
             || e.status.memory[slot]
                 != Some(MemoryApplied {
@@ -154,6 +190,7 @@ impl Surfaces {
         let mut a = MpcApplied {
             dpp,
             depth: blank.request.depth,
+            limited: blank.request.limited,
             pending: 0,
         };
         self.verify_mpc_source(e, a, (clock, config))?;

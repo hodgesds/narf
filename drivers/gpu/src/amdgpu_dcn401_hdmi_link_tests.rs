@@ -199,7 +199,15 @@ fn fixture_with(
     let mut e = engine();
     let (req, c) = tmds_clock(pipe, khz, divider);
     run(e.prepare(req, c)).unwrap();
-    run(e.prepare_blank(BlankRequest { pipe, depth }, c)).unwrap();
+    run(e.prepare_blank(
+        BlankRequest {
+            pipe,
+            depth,
+            limited: false,
+        },
+        c,
+    ))
+    .unwrap();
     for i in 0..4 {
         e.io.regs.insert(phy(i, 0x2943), 0x03030303);
     }
@@ -498,7 +506,7 @@ kernel_test_in!(
 
 fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
     let t = request(0).timing;
-    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, Default::default());
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, Default::default(), false);
     // CTA-861: the header and payload sum to zero.
     let sum = p[..3]
         .iter()
@@ -515,13 +523,14 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
     {
         return TestResult::Fail("AVI bytes");
     }
-    // VIC 16, 16:9, full range: SB2 M, SB3 Q and SB4 VIC, still summing to zero.
+    // VIC 16, 16:9, range selectable: SB2 M, SB3 Q and SB4 VIC, still
+    // summing to zero. Q is full for full range and limited for limited.
     let avi = crate::amdgpu_dcn401_otg::Avi {
         vic: 16,
         aspect: 2,
-        full_range: true,
+        qs: true,
     };
-    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi);
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, false);
     let sum = |p: &[u8; 36]| {
         p[..3]
             .iter()
@@ -531,10 +540,21 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
     if p[..4] != [0x82, 2, 13, 0] || p[5..9] != [0x1e, 0x28, 0x88, 16] || sum(&p) != 0 {
         return TestResult::Fail("AVI VIC, aspect and range");
     }
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, true);
+    if p[7] != 0x84 || sum(&p) != 0 {
+        return TestResult::Fail("AVI limited range");
+    }
+    // Without QS the range stays at the format's default either way.
+    let no_qs = crate::amdgpu_dcn401_otg::Avi { qs: false, ..avi };
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, no_qs, true);
+    if p[7] != 0x80 || sum(&p) != 0 {
+        return TestResult::Fail("AVI default range");
+    }
     // VICs from 128 need version 3.
     let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(
         &t,
         crate::amdgpu_dcn401_otg::Avi { vic: 200, ..avi },
+        false,
     );
     if p[1] != 3 || p[8] != 200 || sum(&p) != 0 {
         return TestResult::Fail("AVI version 3");

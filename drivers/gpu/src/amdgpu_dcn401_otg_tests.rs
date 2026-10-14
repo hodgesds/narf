@@ -167,8 +167,11 @@ impl Io for Fake {
                 || (0..4).any(|p| at == BASE + (0x80 + 2 * p) * 4)
                 || (BASE + 0x1f0d * 4..=BASE + 0x1f10 * 4).contains(&at)
                 || (MPC_BASE..=MPC_BASE + 0x301 * 4).contains(&at)
+                || at == MPC_BASE + 0x30a * 4 // MPC_OUT_CSC_COEF_FORMAT
                 || (0..4).any(|p| {
-                    at == MPC_BASE + (0x30b + p * 0xd) * 4
+                    // Output CSC mode and its set-A coefficients.
+                    (MPC_BASE + (0x30b + p * 0xd) * 4..=MPC_BASE + (0x311 + p * 0xd) * 4)
+                        .contains(&at)
                         || [0x453, 0x48a, 0x493, 0x4de, 0x4ec].iter()
                             .any(|r| at == MPC_BASE + (r + p * 0xb0) * 4)
                 })
@@ -909,6 +912,7 @@ fn blank_request(pipe: u8) -> BlankRequest {
     BlankRequest {
         pipe,
         depth: ColorDepth::Bpc8,
+        limited: false,
     }
 }
 
@@ -927,7 +931,11 @@ fn dcn401_opp_stages_native_rgb_black_without_claiming_blank_completion() -> Tes
             }
             e.io.regs.insert(at(0x1840), 0x102f3f00);
             e.io.regs.insert(at(0x1854), 0x41ff3170);
-            let req = BlankRequest { pipe, depth };
+            let req = BlankRequest {
+                pipe,
+                depth,
+                limited: false,
+            };
             let a = run(e.prepare_blank(req, clock(request(pipe)))).unwrap();
             assert!(a.pending, "OPP double-buffer still awaits timing enable");
             assert_eq!(e.status.state, State::BlankPrepared);

@@ -1005,6 +1005,13 @@ static OFFERED: narf_lib::sync::IrqSafeSpinLock<Vec<crate::amdgpu_dml::Timing>> 
 static REQUESTED_MODE: narf_lib::sync::IrqSafeSpinLock<Option<crate::amdgpu_dml::Timing>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Record a DRM "Broadcast RGB" value (0 Automatic, 1 Full, 2 Limited
+/// 16:235) for the native display. Like a mode request, the display monitor
+/// relights a running display whose output range no longer matches.
+pub fn request_broadcast_rgb(value: u8) {
+    crate::amdgpu_navi48_boot::set_broadcast_rgb(value);
+}
+
 /// Record the mode a DRM client set (SETCRTC or an atomic MODE_ID), which
 /// must be one of the offered timings; `None` returns to the preferred mode
 /// (the console's, after the last client closes). Returns false for a mode
@@ -1064,9 +1071,11 @@ pub async unsafe fn monitor_display(
     if let Some(m) = current.as_ref() {
         let preferred = m.modes.iter().flatten().next().copied();
         let desired = REQUESTED_MODE.lock().or(preferred);
-        if desired.is_some_and(|d| d != m.selection.timing) {
-            // A mode switch is a full modeset: withdraw writers, stop, then
-            // light the sink in the new timing.
+        let limited =
+            crate::amdgpu_navi48_boot::limited_range(crate::amdgpu_navi48_boot::broadcast_rgb());
+        if desired.is_some_and(|d| d != m.selection.timing) || limited != m.selection.limited {
+            // A mode or output-range switch is a full modeset: withdraw
+            // writers, stop, then light the sink in the new timing.
             NATIVE_PRESENT.store(false, core::sync::atomic::Ordering::Release);
             crate::amdgpu_dcn_display::publish_external(None, None);
             {

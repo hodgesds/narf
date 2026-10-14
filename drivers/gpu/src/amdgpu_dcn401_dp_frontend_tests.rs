@@ -53,6 +53,15 @@ fn fixture(
     pipe: u8,
     depth: ColorDepth,
 ) -> (Engine<FrontendIo>, Link, dccg::Applied) {
+    fixture_range(p, stream, pipe, depth, false)
+}
+fn fixture_range(
+    p: u8,
+    stream: u8,
+    pipe: u8,
+    depth: ColorDepth,
+    limited: bool,
+) -> (Engine<FrontendIo>, Link, dccg::Applied) {
     let (mut e, mut io) = super::fixture(p, 4, LinkRate::Hbr3, TrainingPattern::Tps4);
     // Exercise the public engine sequence, including prepared timing before PHY
     // enable/training. No forged completion records or hand-built ready state.
@@ -61,7 +70,15 @@ fn fixture(
     req.signal = Signal::DisplayPort;
     let c = clock(req);
     run(e.prepare(req, c)).unwrap();
-    run(e.prepare_blank(BlankRequest { pipe, depth }, c)).unwrap();
+    run(e.prepare_blank(
+        BlankRequest {
+            pipe,
+            depth,
+            limited,
+        },
+        c,
+    ))
+    .unwrap();
     let bank1 = e.layout.dio_clock - 0xa0 * 4;
     e.io.inner
         .inner
@@ -113,6 +130,20 @@ fn io_settings() -> DpPhySettings {
 fn req(stream: u8, pipe: u8) -> DpFrontendRequest {
     DpFrontendRequest { stream, pipe }
 }
+/// Limited-range RGB sets MSA MISC0 bit 3 (CEA dynamic range) beside the
+/// component depth, as dcn10 stream encoders do for COLOR_SPACE_SRGB_LIMITED.
+fn dcn401_dp_frontend_signals_limited_range_in_msa_misc0() -> TestResult {
+    let (mut e, mut io, c) = fixture_range(1, 2, 3, ColorDepth::Bpc10, true);
+    run(e.prepare_dp_frontend(&mut io, path(1), req(2, 3), c)).unwrap();
+    if e.io.fake().regs[&dio(2, 0x2120)] != (2 << 5 | 8) << 24 {
+        return TestResult::Fail("MSA MISC0 dynamic range");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_frontend_signals_limited_range_in_msa_misc0
+);
 fn dcn401_dp_frontend_programs_independent_routes_rgb_depth_and_native_msa() -> TestResult {
     for p in 0..4 {
         for stream in 0..4 {

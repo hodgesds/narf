@@ -53,6 +53,8 @@ pub struct Selection {
     pub audio: Option<otg::HdmiAudioInfo>,
     /// The HDMI AVI InfoFrame's VIC, aspect and range for this timing.
     pub avi: otg::Avi,
+    /// Limited-range RGB output (COLOR_SPACE_SRGB_LIMITED).
+    pub limited: bool,
 }
 
 /// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
@@ -134,6 +136,28 @@ pub fn set_max_bpc(bpc: u8) {
 }
 pub fn max_bpc() -> u8 {
     MAX_BPC.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// DRM's "Broadcast RGB" connector property values.
+pub const BROADCAST_RGB_AUTO: u8 = 0;
+pub const BROADCAST_RGB_FULL: u8 = 1;
+pub const BROADCAST_RGB_LIMITED: u8 = 2;
+static BROADCAST_RGB: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(BROADCAST_RGB_AUTO);
+/// Set "Broadcast RGB" for later modesets (other values are ignored).
+pub fn set_broadcast_rgb(value: u8) {
+    if value <= BROADCAST_RGB_LIMITED {
+        BROADCAST_RGB.store(value, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+pub fn broadcast_rgb() -> u8 {
+    BROADCAST_RGB.load(core::sync::atomic::Ordering::Relaxed)
+}
+/// amdgpu_dm_get_output_color_space for RGB: COLOR_SPACE_SRGB_LIMITED only
+/// when "Broadcast RGB" is Limited; Automatic outputs full range, as Linux
+/// amdgpu does (it does not follow drm_default_rgb_quant_range).
+pub fn limited_range(broadcast_rgb: u8) -> bool {
+    broadcast_rgb == BROADCAST_RGB_LIMITED
 }
 
 /// The result of a successful modeset, retained by the caller for teardown.
@@ -354,8 +378,8 @@ fn svd_vic(svd: u8) -> u8 {
 /// derive them: the CTA VIC (none for an HDMI 1.4b 4K mode on an HDMI sink,
 /// whose VIC belongs in the vendor InfoFrame, which narf does not send; and
 /// none above 64 for an HDMI 1.4 sink that does not list it), the VIC's
-/// picture aspect when 4:3 or 16:9, and full range when the sink can select
-/// it. The aspect of a mode is taken from its VIC alone: narf modes carry
+/// picture aspect when 4:3 or 16:9, and whether the sink can select the
+/// range. The aspect of a mode is taken from its VIC alone: narf modes carry
 /// none of their own.
 pub fn hdmi_avi(caps: HdmiCaps, t: &Timing) -> otg::Avi {
     use narf_edid::modes::{cea_aspect, hdmi_aspect, match_cea_mode, match_hdmi_mode};
@@ -395,7 +419,7 @@ pub fn hdmi_avi(caps: HdmiCaps, t: &Timing) -> otg::Avi {
             vic
         },
         aspect: if aspect <= 2 { aspect } else { 0 },
-        full_range: caps.qs,
+        qs: caps.qs,
     }
 }
 
@@ -487,6 +511,7 @@ pub fn select(
             depth: otg::ColorDepth::Bpc8,
             audio: None,
             avi: otg::Avi::default(),
+            limited: false,
         });
     }
     for port in ports {
@@ -524,6 +549,7 @@ pub fn select(
             depth,
             audio: hdmi_audio_info(&sink.edid),
             avi: hdmi_avi(caps, &timing),
+            limited: false,
         });
     }
     Err(if link_short {
@@ -725,7 +751,8 @@ impl ColdBoot {
         }
         let ports = self.scan_display().await.map_err(ModesetError::Boot)?;
         let paths = self.display_paths().map_err(|_| ModesetError::NoSink)?;
-        let selection = select(paths, &ports, max_bpc(), want)?;
+        let mut selection = select(paths, &ports, max_bpc(), want)?;
+        selection.limited = limited_range(broadcast_rgb());
         let full_edid = ports
             .iter()
             .find(|p| paths.get(selection.port) == Some(&p.path))
@@ -775,6 +802,7 @@ impl ColdBoot {
             self.prepare_display_blank(otg::BlankRequest {
                 pipe,
                 depth: selection.depth,
+                limited: selection.limited,
             })
             .await?;
             self.prepare_display_dpp(pipe).await?;
