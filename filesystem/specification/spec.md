@@ -315,6 +315,30 @@ pub trait DrmFence: Send + Sync {
     fn is_signalled(&self) -> bool;
     fn wait(&self, timeout_ms: u64) -> bool;
     fn context(&self) -> Option<u64>;
+    fn seqno(&self) -> u64;            // default 0
+    fn driver_name(&self) -> &str;     // default "narf"
+    fn timeline_name(&self) -> &str;   // default "narf"
+    fn timestamp_ns(&self) -> Option<u64>; // default None
+}
+
+pub enum InstallFdError { NoDescriptor /* EMFILE */, Report(FsError) }
+
+// IoctlContext additions (defaults: None / Err / false):
+fn sync_file_fences(&self, fd: i32) -> Option<Vec<Arc<dyn DrmFence>>>;
+fn install_sync_file(
+    &self,
+    fences: Vec<Arc<dyn DrmFence>>,
+    report: &mut dyn FnMut(i32) -> Result<(), FsError>,
+) -> Result<i32, InstallFdError>;
+fn signal_pending(&self) -> bool;
+
+pub mod dma_buf {
+    pub enum DmaResvUsage { Kernel, Write, Read, Bookkeep }
+    pub fn dma_resv_usage_rw(write: bool) -> DmaResvUsage;
+    pub struct DmaResv;        // add_fence(fence, usage), fences(usage)
+    pub struct DmaBufObject { pub resv: DmaResv, /* name */ }
+    pub fn dma_buf_ioctl(obj: &DmaBufObject, cmd: u32, arg: u64,
+                         ctx: &dyn IoctlContext) -> Result<u64, FsError>;
 }
 
 pub enum FileType {
@@ -1134,7 +1158,28 @@ EXECBUFFER. `DrmFence` supplies readiness, bounded wait, and an optional
 ordered-context key; `drm_execbuf_context(ring_idx)` supplies the matching key
 for a new submission so a same-ring input fence can rely on queue ordering
 without a synchronous wait. Drivers that do not produce device fences return
-`None` and retain the pre-signalled compatibility behavior.
+`None` and retain the pre-signalled compatibility behavior. `DrmFence` also
+carries Linux `dma_fence` identity for `SYNC_IOC_FILE_INFO` and merging:
+`seqno` (ordering within `context`), `driver_name`/`timeline_name`, and the
+signal `timestamp_ns` when the driver records one.
+
+`dma_buf` is the generic dma-buf core, mirroring Linux `drivers/dma-buf/`.
+An exporter owns one `DmaBufObject` per underlying buffer, shared by every fd
+and handle naming that buffer, and forwards `FileOps::ioctl_user` to
+`dma_buf_ioctl`, which implements `DMA_BUF_IOCTL_SYNC` (START waits,
+interruptibly, on the fences of `dma_resv_usage_rw(write)`; END is a no-op
+for NARF's coherent exporters), `DMA_BUF_SET_NAME_A/_B` (`strndup_user` with
+`DMA_BUF_NAME_LEN`), `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` and
+`DMA_BUF_IOCTL_IMPORT_SYNC_FILE` with Linux's flag checks and errno order;
+anything else is `ENOTTY`. `DmaResv` follows `dma_resv_add_fence`
+(same-context replacement, signalled-fence reuse) and `dma_resv_get_fences`
+(unsignalled fences with usage ≤ the query). sync_file fds belong to the
+syscall layer: `IoctlContext::sync_file_fences` is `sync_file_get_fence` +
+`dma_fence_unwrap` (`None` for a bad fd or a non-sync_file), and
+`install_sync_file` reserves an `O_CLOEXEC` descriptor (`NoDescriptor` =
+`EMFILE`), builds `dma_resv_get_singleton`'s result (stub, the fence, or a
+`dma_fence_array`), lets `report` copy the number out, and installs only on
+success. `signal_pending` lets an interruptible wait end with `EINTR`.
 
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that

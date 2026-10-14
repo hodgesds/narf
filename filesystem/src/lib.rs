@@ -77,6 +77,7 @@ pub mod devfs_misc;
 pub mod devfs_pty;
 pub mod devfs_rtc;
 pub(crate) mod devfs_vt;
+pub mod dma_buf;
 pub mod efivarfs;
 pub mod fifo;
 pub mod fs_registry;
@@ -928,6 +929,47 @@ pub trait IoctlContext: Sync {
     fn install_file(&self, _file: Arc<dyn FileOps>, _cloexec: bool) -> Result<i32, FsError> {
         Err(FsError::Unsupported)
     }
+    /// Linux `sync_file_get_fence(fd)` followed by `dma_fence_unwrap`: the
+    /// leaf fences of the sync_file open at `fd`, or `None` when `fd` is not
+    /// an open descriptor or names a file of another type (Linux folds both
+    /// into one `NULL`). The sync_file type belongs to the syscall layer;
+    /// drivers reach it only through this context.
+    fn sync_file_fences(&self, _fd: i32) -> Option<Vec<Arc<dyn DrmFence>>> {
+        None
+    }
+    /// Mint and install an `O_CLOEXEC` sync_file holding `fences`, exactly as
+    /// Linux `dma_buf_export_sync_file` composes `get_unused_fd_flags`,
+    /// `dma_resv_get_singleton`, `sync_file_create`, `copy_to_user` and
+    /// `fd_install`:
+    ///
+    /// * the descriptor is reserved first ([`InstallFdError::NoDescriptor`]
+    ///   is `EMFILE`);
+    /// * no fence is Linux's signalled `dma_fence_get_stub()`, one fence is
+    ///   that fence, several become one `dma_fence_array` container;
+    /// * `report` receives the reserved number and copies it out to the
+    ///   caller; its failure releases the reservation and nothing is
+    ///   installed ([`InstallFdError::Report`]).
+    fn install_sync_file(
+        &self,
+        _fences: Vec<Arc<dyn DrmFence>>,
+        _report: &mut dyn FnMut(i32) -> Result<(), FsError>,
+    ) -> Result<i32, InstallFdError> {
+        Err(InstallFdError::Report(FsError::Unsupported))
+    }
+    /// Whether the calling task has a signal pending: the condition that ends
+    /// a Linux `TASK_INTERRUPTIBLE` wait with `-ERESTARTSYS`.
+    fn signal_pending(&self) -> bool {
+        false
+    }
+}
+
+/// Failure of [`IoctlContext::install_sync_file`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallFdError {
+    /// `get_unused_fd_flags` failed: the table is at `RLIMIT_NOFILE` (`EMFILE`).
+    NoDescriptor,
+    /// The `report` callback failed (normally `EFAULT`); nothing was installed.
+    Report(FsError),
 }
 
 /// Filesystem-native quota inheritance requested while creating a snapshot.
@@ -1012,7 +1054,33 @@ pub trait DrmFence: Send + Sync {
     /// Driver-private execution context used to elide a self-dependency wait:
     /// work submitted later to the same ordered ring already depends on this
     /// fence. Foreign contexts return a different key (or `None`) and wait.
+    /// It is also Linux `dma_fence.context`: fences of one context are
+    /// ordered by [`DrmFence::seqno`], which `dma_fence_unwrap_merge` and
+    /// `dma_resv_add_fence` use to keep only the latest per context.
     fn context(&self) -> Option<u64> {
+        None
+    }
+
+    /// Linux `dma_fence.seqno` within [`DrmFence::context`].
+    fn seqno(&self) -> u64 {
+        0
+    }
+
+    /// Linux `dma_fence_ops.get_driver_name`, which `SYNC_IOC_FILE_INFO`
+    /// reports while the fence is unsignalled.
+    fn driver_name(&self) -> &str {
+        "narf"
+    }
+
+    /// Linux `dma_fence_ops.get_timeline_name`.
+    fn timeline_name(&self) -> &str {
+        "narf"
+    }
+
+    /// Linux `dma_fence.timestamp`: the `CLOCK_MONOTONIC` ns at which the
+    /// fence signalled, when the driver recorded it. `None` lets a sync_file
+    /// report the first instant it observed the signalled state instead.
+    fn timestamp_ns(&self) -> Option<u64> {
         None
     }
 }

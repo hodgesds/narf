@@ -27,7 +27,20 @@ applications above NARF.
 
 Device ioctl dispatch passes an `IoctlContext` with guarded process-memory
 copies, the open description's O_NONBLOCK state, retained descriptor lookup
-and the caller's thread-group ID to FileOps. The shared sound
+and the caller's thread-group ID to FileOps. The syscall layer also owns the
+Linux sync_file type and serves its `IoctlContext` seam
+(`sync_file_fences`, `install_sync_file`, `signal_pending`) to drivers.
+sync_file fds hold a set of leaf fences (Linux `dma_fence_unwrap`; a merge
+or a multi-fence export is a `dma_fence_array`) and answer
+`SYNC_IOC_MERGE` (fd reserved first, so EMFILE precedes EFAULT/EINVAL;
+`flags`/`pad` EINVAL; non-sync_file `fd2` ENOENT; `__dma_fence_unwrap_merge`
+semantics), `SYNC_IOC_FILE_INFO` (the two-call protocol of
+`sync_file_ioctl_fence_info`, `sync_file_get_name` naming) and
+`SYNC_IOC_SET_DEADLINE` (`pad` EINVAL, otherwise an accepted hint); others are
+ENOTTY. A file is readable once every leaf signalled. Fence names: VirtIO-GPU
+`virtio_gpu`/`controlq`; atomic `OUT_FENCE_PTR` fences `narf_kms`/`vblank`
+(one context each, timestamp = the simulated vblank); stubs `stub`/`stub`;
+signalled fences report Linux's `detached-driver`/`signaled-timeline`. The shared sound
 registry's PCM/control files implement the ALSA ABI; syscall handlers contain
 no sound-card lookup or driver-specific request branches. Device mmap validation
 runs before VMA replacement, and direct mappings atomically retain their backing

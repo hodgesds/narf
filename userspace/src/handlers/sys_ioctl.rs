@@ -1,6 +1,7 @@
 #[allow(unused_imports)]
 use super::*;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 struct DeviceIoctlContext {
     nonblocking: bool,
@@ -52,28 +53,546 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
         .map(|n| n as i32)
         .ok_or(narf_filesystem::FsError::OutOfMemory)
     }
+
+    fn sync_file_fences(&self, fd: i32) -> Option<Vec<Arc<dyn narf_filesystem::DrmFence>>> {
+        sync_file_leaves(current_task_id(), fd)
+    }
+
+    fn install_sync_file(
+        &self,
+        fences: Vec<Arc<dyn narf_filesystem::DrmFence>>,
+        report: &mut dyn FnMut(i32) -> Result<(), narf_filesystem::FsError>,
+    ) -> Result<i32, narf_filesystem::InstallFdError> {
+        // get_unused_fd_flags(O_CLOEXEC) first, then dma_resv_get_singleton
+        // + sync_file_create, then copy_to_user, and fd_install only once the
+        // number reached the caller (put_unused_fd otherwise).
+        let reservation = fd::reserve(current_task_id())
+            .ok_or(narf_filesystem::InstallFdError::NoDescriptor)?;
+        let file = DrmSyncFile::from_singleton(fences);
+        report(reservation.fd() as i32).map_err(narf_filesystem::InstallFdError::Report)?;
+        reservation
+            .install(fd::FdEntry {
+                ops: Arc::new(file),
+                offset: 0,
+                flags: fd::FD_CLOEXEC,
+                status_flags: 0,
+            })
+            .map(|n| n as i32)
+            .ok_or(narf_filesystem::InstallFdError::Report(
+                narf_filesystem::FsError::OutOfMemory,
+            ))
+    }
+
+    fn signal_pending(&self) -> bool {
+        has_interrupting_signal(current_task_id())
+    }
 }
 
-/// A dma-fence exposed through Linux's `sync_file` fd ABI.
-///
-/// Two producers exist today. `VIRTGPU_EXECBUF_FENCE_FD_OUT` fences are
-/// DEVICE fences: `fence` holds the exact driver-owned completion object for
-/// the asynchronous submission (a driver that produced no fence falls back
-/// to the pre-signalled `deadline_ns == 0` form). `OUT_FENCE_PTR` fences from an
-/// atomic commit signal at the commit's SIMULATED VBLANK: the deadline is a
-/// `CLOCK_MONOTONIC` instant, `poll` reports readable once it passes, and
-/// `poll_deadline` clamps a parked poll's wake-up to it — the same
-/// time-based pacing the DRM card fd's flip events use. It is a distinct
-/// file type so `VIRTGPU_EXECBUF_FENCE_FD_IN` (and the atomic `IN_FENCE_FD`
-/// property) can reject arbitrary descriptors exactly like
-/// `sync_file_get_fence()` does on Linux.
-struct DrmSyncFile {
-    /// Fence signal time (CLOCK_MONOTONIC ns); 0 = signalled at creation.
-    /// Consulted only when `fence` is `None`.
+/// `sync_file_fdget(fd)` + `dma_fence_unwrap`: the leaf fences of the
+/// sync_file at `fd` in `task`'s table, or `None` for a bad descriptor or a
+/// file of another type.
+fn sync_file_leaves(task: u64, fd: i32) -> Option<Vec<Arc<dyn narf_filesystem::DrmFence>>> {
+    let ops = fd::with_table(task, |table| {
+        table.get(u32::try_from(fd).ok()?).map(|entry| entry.ops.clone())
+    })
+    .flatten()?;
+    ops.as_any()
+        .and_then(|any| any.downcast_ref::<DrmSyncFile>())
+        .map(DrmSyncFile::leaves)
+}
+
+/// Source of `dma_fence.context` values for the fences this layer creates
+/// (atomic vblank fences, `dma_fence_array` containers). Linux draws every
+/// context from one `dma_fence_context_alloc` counter. NARF driver fences
+/// carry driver-chosen keys (virtio-gpu: `ctx_id << 32 | ring_idx`), so the
+/// syscall layer allocates from the top half of the u64 space, which no
+/// driver key reaches.
+static NEXT_FENCE_CONTEXT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(1 << 63);
+
+fn fence_context_alloc() -> u64 {
+    NEXT_FENCE_CONTEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Linux's stub fence (`dma_fence_get_stub` / `dma_fence_allocate_private_stub`):
+/// signalled from birth, context 0, seqno 0, driver and timeline `"stub"`.
+struct StubFence {
+    timestamp_ns: u64,
+}
+
+impl narf_filesystem::DrmFence for StubFence {
+    fn is_signalled(&self) -> bool {
+        true
+    }
+
+    fn wait(&self, _timeout_ms: u64) -> bool {
+        true
+    }
+
+    fn context(&self) -> Option<u64> {
+        Some(0)
+    }
+
+    fn driver_name(&self) -> &str {
+        "stub"
+    }
+
+    fn timeline_name(&self) -> &str {
+        "stub"
+    }
+
+    fn timestamp_ns(&self) -> Option<u64> {
+        Some(self.timestamp_ns)
+    }
+}
+
+/// Signal time of the global stub. Linux signals `dma_fence_stub` from a
+/// `subsys_initcall`, so its timestamp is boot time; NARF stamps it the
+/// first time the stub is handed out.
+static STUB_TIMESTAMP_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `dma_fence_get_stub()`.
+fn global_stub_fence() -> Arc<dyn narf_filesystem::DrmFence> {
+    use core::sync::atomic::Ordering;
+    let now = narf_time::wall::monotonic_ns().max(1);
+    let _ = STUB_TIMESTAMP_NS.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+    Arc::new(StubFence {
+        timestamp_ns: STUB_TIMESTAMP_NS.load(Ordering::Acquire),
+    })
+}
+
+/// An atomic commit's `OUT_FENCE_PTR` fence. It signals at the commit's
+/// SIMULATED VBLANK, a `CLOCK_MONOTONIC` instant, and is reported with driver
+/// name `"narf_kms"` and timeline `"vblank"`. (Linux names a CRTC fence
+/// after the DRM driver and `"CRTC:<id>-<name>"`; the out-fence hand-off
+/// from the DRM bridge carries no CRTC identity, so the names are fixed.)
+/// Each fence is its own context: commits on different CRTCs carry no
+/// ordering that would let a merge keep only the later one.
+struct VblankFence {
     deadline_ns: u64,
-    /// Device-fence mode. The completion object is shared with BO WAIT and
-    /// syncobj consumers, so every ABI observes the same submission state.
-    fence: Option<Arc<dyn narf_filesystem::DrmFence>>,
+    context: u64,
+}
+
+impl narf_filesystem::DrmFence for VblankFence {
+    fn is_signalled(&self) -> bool {
+        narf_time::wall::monotonic_ns() >= self.deadline_ns
+    }
+
+    fn wait(&self, timeout_ms: u64) -> bool {
+        narf_scheduler::responsive_spin_until(
+            || narf_time::wall::monotonic_ns() >= self.deadline_ns,
+            narf_time::Deadline::after_ms(timeout_ms),
+        )
+    }
+
+    fn context(&self) -> Option<u64> {
+        Some(self.context)
+    }
+
+    fn seqno(&self) -> u64 {
+        1
+    }
+
+    fn driver_name(&self) -> &str {
+        "narf_kms"
+    }
+
+    fn timeline_name(&self) -> &str {
+        "vblank"
+    }
+
+    fn timestamp_ns(&self) -> Option<u64> {
+        Some(self.deadline_ns)
+    }
+}
+
+/// How a leaf fence's completion is discovered, which decides the file's
+/// `poll_deadline`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointKind {
+    /// Driver completion object: no interrupt waker yet, re-polled every 1 ms.
+    Device,
+    /// Time-based fence signalling at this `CLOCK_MONOTONIC` instant.
+    Vblank(u64),
+    /// Signalled from birth.
+    Stub,
+}
+
+/// One leaf of a sync_file's fence (Linux `dma_fence_unwrap` yields these).
+struct SyncPoint {
+    fence: Arc<dyn narf_filesystem::DrmFence>,
+    kind: PointKind,
+    /// First `CLOCK_MONOTONIC` instant this file saw the fence signalled; the
+    /// reported timestamp for fences whose driver records none.
+    observed_ns: core::sync::atomic::AtomicU64,
+}
+
+impl SyncPoint {
+    fn new(fence: Arc<dyn narf_filesystem::DrmFence>, kind: PointKind) -> Self {
+        Self {
+            fence,
+            kind,
+            observed_ns: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The same leaf in another file, keeping its observed signal time.
+    fn fork(&self) -> Self {
+        let point = Self::new(self.fence.clone(), self.kind);
+        point.observed_ns.store(
+            self.observed_ns.load(core::sync::atomic::Ordering::Acquire),
+            core::sync::atomic::Ordering::Release,
+        );
+        point
+    }
+
+    fn signalled(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        let signalled = self.fence.is_signalled();
+        if signalled && self.observed_ns.load(Ordering::Acquire) == 0 {
+            let now = narf_time::wall::monotonic_ns().max(1);
+            let _ = self
+                .observed_ns
+                .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        }
+        signalled
+    }
+
+    /// Linux `dma_fence_timestamp`, for a signalled fence.
+    fn timestamp_ns(&self) -> u64 {
+        self.fence
+            .timestamp_ns()
+            .unwrap_or_else(|| self.observed_ns.load(core::sync::atomic::Ordering::Acquire))
+    }
+}
+
+/// `strscpy(dst, src, dst.len())` over byte strings: copy up to the first
+/// NUL of `src`, truncate to leave room for one, NUL-terminate, and leave the
+/// rest of `dst` untouched (strscpy does not pad).
+fn strscpy(dst: &mut [u8], src: &[u8]) {
+    let len = src
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(src.len())
+        .min(dst.len().saturating_sub(1));
+    dst[..len].copy_from_slice(&src[..len]);
+    if len < dst.len() {
+        dst[len] = 0;
+    }
+}
+
+/// A dma-fence exposed through Linux's `sync_file` fd ABI
+/// (`drivers/dma-buf/sync_file.c`).
+///
+/// Linux's sync_file holds ONE `dma_fence`, which may be a
+/// `dma_fence_array` container; `dma_fence_unwrap` iterates its leaves. NARF
+/// stores the unwrapped leaves directly plus whether they sit in a container
+/// (`array_context`), which is all the ABI can observe: FILE_INFO lists the
+/// leaves, the file is readable once every leaf has signalled (an array
+/// built with `signal_on_any = false`), and the generated name describes
+/// the container.
+///
+/// Producers: `VIRTGPU_EXECBUF_FENCE_FD_OUT` device fences (a driver that
+/// produced no fence falls back to the signalled stub); atomic
+/// `OUT_FENCE_PTR` [`VblankFence`]s; `SYNC_IOC_MERGE`; and
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` through
+/// [`narf_filesystem::IoctlContext::install_sync_file`]. It is a distinct
+/// file type so `VIRTGPU_EXECBUF_FENCE_FD_IN`, `SYNC_IOC_MERGE` and
+/// `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` reject arbitrary descriptors exactly
+/// like `sync_file_fdget()` does on Linux.
+struct DrmSyncFile {
+    /// `dma_fence_unwrap` leaves; never empty.
+    points: Vec<SyncPoint>,
+    /// `Some(context)` when the file's fence is a `dma_fence_array`.
+    array_context: Option<u64>,
+    /// `sync_file->user_name`: the SYNC_IOC_MERGE name, all-zero otherwise.
+    user_name: [u8; 32],
+}
+
+/// `struct sync_merge_data`: name[32] fd2@32 fence@36 flags@40 pad@44.
+const SYNC_MERGE_DATA_SIZE: usize = 48;
+/// `struct sync_file_info`: name[32] status@32 flags@36 num_fences@40
+/// pad@44 sync_fence_info@48.
+const SYNC_FILE_INFO_SIZE: usize = 56;
+/// `struct sync_fence_info`: obj_name[32] driver_name[32] status@64
+/// flags@68 timestamp_ns@72.
+const SYNC_FENCE_INFO_SIZE: usize = 80;
+/// `_IOWR('>', 3, struct sync_merge_data)`.
+const SYNC_IOC_MERGE: u32 = 0xc030_3e03;
+/// `_IOWR('>', 4, struct sync_file_info)`.
+const SYNC_IOC_FILE_INFO: u32 = 0xc038_3e04;
+/// `_IOW('>', 5, struct sync_set_deadline)` — `{ __u64 deadline_ns; __u64 pad; }`.
+const SYNC_IOC_SET_DEADLINE: u32 = 0x4010_3e05;
+
+fn sync_neg(errno: i64) -> Result<u64, narf_filesystem::FsError> {
+    Ok((-errno) as u64)
+}
+
+impl DrmSyncFile {
+    fn single(fence: Arc<dyn narf_filesystem::DrmFence>, kind: PointKind) -> Self {
+        Self {
+            points: alloc::vec![SyncPoint::new(fence, kind)],
+            array_context: None,
+            user_name: [0; 32],
+        }
+    }
+
+    /// `sync_file_create(dma_fence_get_stub())`: signalled from birth.
+    fn signalled_stub() -> Self {
+        Self::single(global_stub_fence(), PointKind::Stub)
+    }
+
+    /// An atomic `OUT_FENCE_PTR` fence signalling at `deadline_ns`.
+    fn vblank(deadline_ns: u64) -> Self {
+        Self::single(
+            Arc::new(VblankFence {
+                deadline_ns,
+                context: fence_context_alloc(),
+            }),
+            PointKind::Vblank(deadline_ns),
+        )
+    }
+
+    /// `sync_file_create(fence)` for a driver device fence.
+    fn device(fence: Arc<dyn narf_filesystem::DrmFence>) -> Self {
+        Self::single(fence, PointKind::Device)
+    }
+
+    /// `dma_resv_get_singleton` + stub fallback, as
+    /// `dma_buf_export_sync_file` composes them: no fence is the stub, one
+    /// fence is itself, several become one `dma_fence_array` (context from
+    /// `dma_fence_context_alloc(1)`, seqno 1, no de-duplication).
+    fn from_singleton(fences: Vec<Arc<dyn narf_filesystem::DrmFence>>) -> Self {
+        match fences.len() {
+            0 => Self::signalled_stub(),
+            1 => Self::device(fences.into_iter().next().unwrap()),
+            _ => Self {
+                points: fences
+                    .into_iter()
+                    .map(|fence| SyncPoint::new(fence, PointKind::Device))
+                    .collect(),
+                array_context: Some(fence_context_alloc()),
+                user_name: [0; 32],
+            },
+        }
+    }
+
+    fn leaves(&self) -> Vec<Arc<dyn narf_filesystem::DrmFence>> {
+        self.points.iter().map(|point| point.fence.clone()).collect()
+    }
+
+    /// `dma_fence_is_signaled(sync_file->fence)`. Every leaf is sampled so
+    /// each records its observed signal time.
+    fn signalled(&self) -> bool {
+        self.points
+            .iter()
+            .fold(true, |all, point| point.signalled() && all)
+    }
+
+    /// `sync_file_merge` → `dma_fence_unwrap_merge(a, b)`
+    /// (`drivers/dma-buf/dma-fence-unwrap.c::__dma_fence_unwrap_merge`):
+    /// signalled leaves are dropped; none left is a private signalled stub
+    /// stamped with the latest signal time; one left is that fence; more are
+    /// sorted by context, de-duplicated to the latest fence per context
+    /// (`dma_fence_dedup_array`), and wrapped in a new `dma_fence_array`
+    /// unless only one survives. The new file takes `name`
+    /// (`strscpy(user_name, name)`).
+    fn merge(a: &Self, b: &Self, name: &[u8]) -> Self {
+        let mut pending: Vec<&SyncPoint> = Vec::new();
+        let mut timestamp = 0u64;
+        for point in a.points.iter().chain(b.points.iter()) {
+            if point.signalled() {
+                timestamp = timestamp.max(point.timestamp_ns());
+            } else {
+                pending.push(point);
+            }
+        }
+        let mut user_name = [0u8; 32];
+        strscpy(&mut user_name, name);
+        if pending.is_empty() {
+            let mut file = Self::single(
+                Arc::new(StubFence {
+                    timestamp_ns: timestamp,
+                }),
+                PointKind::Stub,
+            );
+            file.user_name = user_name;
+            return file;
+        }
+        // fence_cmp: ascending context, later seqno first within a context.
+        pending.sort_by(|x, y| {
+            let (xc, yc) = (x.fence.context().unwrap_or(0), y.fence.context().unwrap_or(0));
+            xc.cmp(&yc).then(y.fence.seqno().cmp(&x.fence.seqno()))
+        });
+        let mut points: Vec<SyncPoint> = Vec::with_capacity(pending.len());
+        for point in pending {
+            let duplicate = points.last().is_some_and(|kept: &SyncPoint| {
+                Arc::ptr_eq(&kept.fence, &point.fence)
+                    || (kept.fence.context().is_some()
+                        && kept.fence.context() == point.fence.context())
+            });
+            if !duplicate {
+                points.push(point.fork());
+            }
+        }
+        let array_context = (points.len() > 1).then(fence_context_alloc);
+        Self {
+            points,
+            array_context,
+            user_name,
+        }
+    }
+
+    /// `sync_file_get_name`: the merge name if one was given, else
+    /// `"%s-%s%llu-%lld"` of the file's fence (driver, timeline, context,
+    /// seqno). `dma_fence_driver_name`/`_timeline_name` answer
+    /// `"detached-driver"`/`"signaled-timeline"` once the fence signalled; a
+    /// `dma_fence_array` is `"dma_fence_array"`/`"unbound"` with seqno 1.
+    fn get_name(&self, buf: &mut [u8]) {
+        if self.user_name[0] != 0 {
+            strscpy(buf, &self.user_name);
+            return;
+        }
+        let signalled = self.signalled();
+        let (driver, timeline, context, seqno) = match self.array_context {
+            Some(context) => ("dma_fence_array", "unbound", context, 1u64),
+            None => {
+                let fence = &self.points[0].fence;
+                (
+                    fence.driver_name(),
+                    fence.timeline_name(),
+                    fence.context().unwrap_or(0),
+                    fence.seqno(),
+                )
+            }
+        };
+        let (driver, timeline) = if signalled {
+            ("detached-driver", "signaled-timeline")
+        } else {
+            (driver, timeline)
+        };
+        let name = alloc::format!("{driver}-{timeline}{context}-{}", seqno as i64);
+        strscpy(buf, name.as_bytes());
+    }
+
+    /// `sync_file_ioctl_merge`. The descriptor is reserved before anything
+    /// is read, so a full table is -EMFILE ahead of every other error.
+    fn ioctl_merge(
+        &self,
+        arg: u64,
+        ctx: &dyn narf_filesystem::IoctlContext,
+    ) -> Result<u64, narf_filesystem::FsError> {
+        let task = current_task_id();
+        let Some(reservation) = fd::reserve(task) else {
+            return sync_neg(EMFILE);
+        };
+        let mut data = [0u8; SYNC_MERGE_DATA_SIZE];
+        ctx.read(arg, &mut data)?;
+        let flags = u32::from_ne_bytes(data[40..44].try_into().unwrap());
+        let pad = u32::from_ne_bytes(data[44..48].try_into().unwrap());
+        if flags != 0 || pad != 0 {
+            return sync_neg(EINVAL);
+        }
+        let fd2 = i32::from_ne_bytes(data[32..36].try_into().unwrap());
+        let other_ops = u32::try_from(fd2).ok().and_then(|fd2| {
+            fd::with_table(task, |table| table.get(fd2).map(|entry| entry.ops.clone())).flatten()
+        });
+        let Some(other) = other_ops
+            .as_ref()
+            .and_then(|ops| ops.as_any())
+            .and_then(|any| any.downcast_ref::<DrmSyncFile>())
+        else {
+            return sync_neg(ENOENT);
+        };
+        data[31] = 0;
+        let merged = Self::merge(self, other, &data[..32]);
+        data[36..40].copy_from_slice(&(reservation.fd() as i32).to_ne_bytes());
+        ctx.write(arg, &data)?;
+        reservation
+            .install(fd::FdEntry {
+                ops: Arc::new(merged),
+                offset: 0,
+                flags: fd::FD_CLOEXEC,
+                status_flags: 0,
+            })
+            .ok_or(narf_filesystem::FsError::OutOfMemory)?;
+        Ok(0)
+    }
+
+    /// `sync_file_ioctl_fence_info`: `num_fences == 0` asks only for the
+    /// count and the overall status; otherwise the array at
+    /// `sync_fence_info` must hold every leaf (-EINVAL if smaller), and
+    /// `status` becomes the first non-positive leaf status, else 1.
+    fn ioctl_fence_info(
+        &self,
+        arg: u64,
+        ctx: &dyn narf_filesystem::IoctlContext,
+    ) -> Result<u64, narf_filesystem::FsError> {
+        let mut info = [0u8; SYNC_FILE_INFO_SIZE];
+        ctx.read(arg, &mut info)?;
+        let flags = u32::from_ne_bytes(info[36..40].try_into().unwrap());
+        let pad = u32::from_ne_bytes(info[44..48].try_into().unwrap());
+        if flags != 0 || pad != 0 {
+            return sync_neg(EINVAL);
+        }
+        let num_fences = self.points.len() as u32;
+        let requested = u32::from_ne_bytes(info[40..44].try_into().unwrap());
+        let status: i32 = if requested == 0 {
+            // dma_fence_get_status(sync_file->fence); NARF fences carry no
+            // error, so it is 1 or 0.
+            i32::from(self.signalled())
+        } else {
+            if requested < num_fences {
+                return sync_neg(EINVAL);
+            }
+            let mut status = 1i32;
+            let mut array = alloc::vec![0u8; self.points.len() * SYNC_FENCE_INFO_SIZE];
+            for (point, entry) in self
+                .points
+                .iter()
+                .zip(array.chunks_exact_mut(SYNC_FENCE_INFO_SIZE))
+            {
+                // sync_fill_fence_info.
+                let signalled = point.signalled();
+                let (timeline, driver) = if signalled {
+                    ("signaled-timeline", "detached-driver")
+                } else {
+                    (point.fence.timeline_name(), point.fence.driver_name())
+                };
+                strscpy(&mut entry[0..32], timeline.as_bytes());
+                strscpy(&mut entry[32..64], driver.as_bytes());
+                let fence_status = i32::from(signalled);
+                entry[64..68].copy_from_slice(&fence_status.to_ne_bytes());
+                let timestamp = if signalled { point.timestamp_ns() } else { 0 };
+                entry[72..80].copy_from_slice(&timestamp.to_ne_bytes());
+                status = if status <= 0 { status } else { fence_status };
+            }
+            let user_array = u64::from_ne_bytes(info[48..56].try_into().unwrap());
+            ctx.write(user_array, &array)?;
+            status
+        };
+        self.get_name(&mut info[0..32]);
+        info[32..36].copy_from_slice(&status.to_ne_bytes());
+        info[40..44].copy_from_slice(&num_fences.to_ne_bytes());
+        ctx.write(arg, &info)?;
+        Ok(0)
+    }
+
+    /// `sync_file_ioctl_set_deadline`: `pad` must be zero; the deadline is
+    /// a hint (`dma_fence_set_deadline` is a no-op for fences without a
+    /// `set_deadline` op, which no NARF fence has).
+    fn ioctl_set_deadline(
+        &self,
+        arg: u64,
+        ctx: &dyn narf_filesystem::IoctlContext,
+    ) -> Result<u64, narf_filesystem::FsError> {
+        let mut deadline = [0u8; 16];
+        ctx.read(arg, &mut deadline)?;
+        if u64::from_ne_bytes(deadline[8..16].try_into().unwrap()) != 0 {
+            return sync_neg(EINVAL);
+        }
+        Ok(0)
+    }
 }
 
 impl narf_filesystem::FileOps for DrmSyncFile {
@@ -116,32 +635,65 @@ impl narf_filesystem::FileOps for DrmSyncFile {
         }
     }
 
+    /// `sync_file_ioctl`: MERGE, FILE_INFO and SET_DEADLINE; everything else
+    /// is -ENOTTY, answered here rather than through the generic relay so an
+    /// unknown command never touches its argument pointer.
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn narf_filesystem::IoctlContext,
+    ) -> narf_filesystem::FsFuture<'a, u64> {
+        Box::pin(async move {
+            match cmd {
+                SYNC_IOC_MERGE => self.ioctl_merge(arg, context),
+                SYNC_IOC_FILE_INFO => self.ioctl_fence_info(arg, context),
+                SYNC_IOC_SET_DEADLINE => self.ioctl_set_deadline(arg, context),
+                _ => sync_neg(ENOTTY),
+            }
+        })
+    }
+
+    /// `sync_file_poll`: EPOLLIN once the file's fence (every leaf) signalled.
     fn poll_readiness(&self) -> u32 {
-        let signalled = match &self.fence {
-            Some(fence) => fence.is_signalled(),
-            None => narf_time::wall::monotonic_ns() >= self.deadline_ns,
-        };
-        if signalled {
+        if self.signalled() {
             narf_filesystem::POLL_IN
         } else {
             0
         }
     }
 
-    /// Unsignalled TIME-BASED fence: a parked poll clamps its wake-up to the
-    /// signal time (see `poll.rs::poll_nearest_deadline`), so a compositor
-    /// sleeping on an atomic out-fence wakes at the vblank. Device completion
-    /// has no interrupt-waker yet, so publish a short re-poll deadline that
-    /// drives the control-queue completion reap without busy-spinning.
+    /// The earliest instant an unsignalled leaf needs re-examining: a
+    /// time-based leaf's signal time (`poll.rs::poll_nearest_deadline`
+    /// clamps a parked poll to it, so a compositor sleeping on an atomic
+    /// out-fence wakes at the vblank), or a 1 ms re-poll for a device leaf,
+    /// whose completion has no interrupt waker yet and is reaped on the
+    /// re-poll without busy-spinning.
+    ///
+    /// Once everything has signalled the file keeps publishing an (expired)
+    /// deadline until poll observes the level: expiry between poll's
+    /// readiness scan and this lookup would otherwise produce `None` and
+    /// park the caller forever with no future edge to wake it. Only a file
+    /// made solely of born-signalled stubs, which no scan can see pending,
+    /// publishes none.
     fn poll_deadline(&self) -> Option<u64> {
-        if self.fence.is_some() {
-            return Some(narf_time::wall::monotonic_ns().saturating_add(1_000_000));
+        let now = narf_time::wall::monotonic_ns();
+        let mut pending = None::<u64>;
+        let mut settled = None::<u64>;
+        for point in &self.points {
+            let deadline = match point.kind {
+                PointKind::Stub => continue,
+                PointKind::Vblank(deadline) => deadline,
+                PointKind::Device => now.saturating_add(1_000_000),
+            };
+            let slot = if point.signalled() {
+                &mut settled
+            } else {
+                &mut pending
+            };
+            *slot = Some(slot.map_or(deadline, |current| current.min(deadline)));
         }
-        // Keep publishing an expired non-zero deadline until poll observes the
-        // signalled level. Otherwise expiry between poll's readiness scan and
-        // this lookup produces `None`, and the caller can park forever with no
-        // future edge to wake it. Zero is the permanently pre-signalled form.
-        (self.deadline_ns != 0).then_some(self.deadline_ns)
+        pending.or(settled)
     }
 
     /// Parkable readiness source. Device-fence completion is discovered by
@@ -179,10 +731,7 @@ mod tests {
     }
 
     fn smoke_drm_sync_file_poll_deadlines_close_lost_wake_races() -> TestResult {
-        let device = DrmSyncFile {
-            deadline_ns: 0,
-            fence: Some(Arc::new(PendingFence)),
-        };
+        let device = DrmSyncFile::device(Arc::new(PendingFence));
         let before = narf_time::wall::monotonic_ns();
         let Some(repoll) = FileOps::poll_deadline(&device) else {
             return TestResult::Fail("device fence has no completion re-poll deadline");
@@ -194,20 +743,22 @@ mod tests {
         // An expired non-zero time fence must retain its deadline until the
         // readiness scan observes it. Returning None here strands a poll when
         // expiry races the scan-to-park window.
-        let expired = DrmSyncFile {
-            deadline_ns: 1,
-            fence: None,
-        };
+        let expired = DrmSyncFile::vblank(1);
         if FileOps::poll_deadline(&expired) != Some(1) {
             return TestResult::Fail("expired time fence stopped publishing its deadline");
         }
 
-        let signalled = DrmSyncFile {
-            deadline_ns: 0,
-            fence: None,
-        };
+        let signalled = DrmSyncFile::signalled_stub();
         if FileOps::poll_deadline(&signalled).is_some() {
             return TestResult::Fail("pre-signalled time fence published a deadline");
+        }
+
+        // A multi-leaf file waits on its earliest pending leaf: the pending
+        // vblank, not the already-expired one.
+        let far = narf_time::wall::monotonic_ns().saturating_add(60_000_000_000);
+        let mixed = DrmSyncFile::merge(&DrmSyncFile::vblank(far), &expired, &[0; 32]);
+        if FileOps::poll_deadline(&mixed) != Some(far) {
+            return TestResult::Fail("merged file did not publish its pending leaf deadline");
         }
         TestResult::Pass
     }
@@ -215,6 +766,51 @@ mod tests {
         "syscall_abi",
         smoke_drm_sync_file_poll_deadlines_close_lost_wake_races
     );
+
+    // __dma_fence_unwrap_merge drops signalled leaves, keeps one fence per
+    // context (the later seqno), and only wraps survivors in a
+    // dma_fence_array when more than one remains.
+    fn smoke_drm_sync_file_merge_unwrap_rules() -> TestResult {
+        struct Seq(u64, u64);
+        impl DrmFence for Seq {
+            fn is_signalled(&self) -> bool {
+                false
+            }
+            fn wait(&self, _timeout_ms: u64) -> bool {
+                false
+            }
+            fn context(&self) -> Option<u64> {
+                Some(self.0)
+            }
+            fn seqno(&self) -> u64 {
+                self.1
+            }
+        }
+        let early = DrmSyncFile::device(Arc::new(Seq(7, 1)));
+        let late = DrmSyncFile::device(Arc::new(Seq(7, 9)));
+        let same = DrmSyncFile::merge(&early, &late, &[0; 32]);
+        if same.points.len() != 1 || same.array_context.is_some() || same.points[0].fence.seqno() != 9
+        {
+            return TestResult::Fail("same-context merge must keep only the later fence");
+        }
+        let other = DrmSyncFile::device(Arc::new(Seq(3, 1)));
+        let both = DrmSyncFile::merge(&late, &other, &[0; 32]);
+        if both.points.len() != 2
+            || both.array_context.is_none()
+            || both.points[0].fence.context() != Some(3)
+        {
+            return TestResult::Fail("cross-context merge must be a context-sorted array");
+        }
+        let stub = DrmSyncFile::merge(&DrmSyncFile::vblank(2), &DrmSyncFile::vblank(1), &[0; 32]);
+        if stub.points.len() != 1
+            || stub.points[0].kind != PointKind::Stub
+            || stub.points[0].timestamp_ns() != 2
+        {
+            return TestResult::Fail("all-signalled merge must be a stub at the latest timestamp");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("syscall_abi", smoke_drm_sync_file_merge_unwrap_rules);
 }
 
 // `drivers/tty/pty.c::ptm_open_peer` ends in `FD_ADD`, which is
@@ -1022,21 +1618,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         }
         if flags & VIRTGPU_EXECBUF_FENCE_FD_IN != 0 {
             let in_fence = i32::from_ne_bytes(execbuf[28..32].try_into().unwrap());
-            let sync_file = u32::try_from(in_fence)
-                .ok()
-                .and_then(|fence_fd| {
-                    fd::with_table(task, |table| {
-                        table.get(fence_fd).map(|entry| entry.ops.clone())
-                    })
-                    .flatten()
-                })
-                .and_then(|fence_ops| {
-                    fence_ops
-                        .as_any()
-                        .and_then(|any| any.downcast_ref::<DrmSyncFile>())
-                        .map(|sync_file| (sync_file.deadline_ns, sync_file.fence.clone()))
-                });
-            let Some((deadline_ns, device_fence)) = sync_file else {
+            let Some(leaves) = sync_file_leaves(task, in_fence) else {
                 // Linux's sync_file_get_fence() deliberately folds both a bad
                 // fd and a non-sync-file fd into EINVAL for this ioctl.
                 ctx.set_return(errno_ret(EINVAL));
@@ -1047,22 +1629,19 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             } else {
                 0
             };
-            let same_context = device_fence.as_ref().is_some_and(|fence| {
-                fence.context().is_some()
-                    && fence.context() == ops.drm_execbuf_context(ring_idx)
+            let submission_context = ops.drm_execbuf_context(ring_idx);
+            // A merged sync_file is a dma_fence_array: the dependency is
+            // every leaf.
+            let signalled = leaves.iter().all(|fence| {
+                if fence.context().is_some() && fence.context() == submission_context {
+                    // This ring is ordered: queueing the later EXECBUFFER
+                    // carries the dependency without serializing the async
+                    // pipeline.
+                    true
+                } else {
+                    fence.wait(15_000)
+                }
             });
-            let signalled = if same_context {
-                // This ring is ordered: queueing the later EXECBUFFER carries
-                // the dependency without serializing the async pipeline.
-                true
-            } else if let Some(fence) = device_fence {
-                fence.wait(15_000)
-            } else {
-                narf_scheduler::responsive_spin_until(
-                    || narf_time::wall::monotonic_ns() >= deadline_ns,
-                    narf_time::Deadline::after_ms(15_000),
-                )
-            };
             if !signalled {
                 // Bound a wedged/foreign GPU wait so an ioctl cannot hang the
                 // kernel indefinitely. This matches VIRTGPU_WAIT's busy
@@ -1096,10 +1675,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 };
                 let fence_fd = reservation
                     .install(fd::FdEntry {
-                        ops: Arc::new(DrmSyncFile {
-                            deadline_ns,
-                            fence: None,
-                        }),
+                        ops: Arc::new(DrmSyncFile::vblank(deadline_ns)),
                         offset: 0,
                         flags: fd::FD_CLOEXEC,
                         status_flags: 0,
@@ -1118,14 +1694,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         if let Some(reservation) = out_fence {
             // Back the sync_file with the EXECBUFFER's device fence when the
             // driver produced one; a driver without fenced submission keeps
-            // the pre-signalled fallback (deadline 0).
-            let fence = ops.drm_execbuf_fence();
+            // the pre-signalled fallback (the stub fence).
+            let file = match ops.drm_execbuf_fence() {
+                Some(fence) => DrmSyncFile::device(fence),
+                None => DrmSyncFile::signalled_stub(),
+            };
             let fence_fd = reservation
                 .install(fd::FdEntry {
-                    ops: Arc::new(DrmSyncFile {
-                        deadline_ns: 0,
-                        fence,
-                    }),
+                    ops: Arc::new(file),
                     offset: 0,
                     flags: fd::FD_CLOEXEC,
                     status_flags: 0,
