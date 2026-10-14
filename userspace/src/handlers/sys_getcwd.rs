@@ -46,7 +46,18 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
     // task holds stays unlinked, while this resolves the new directory and
     // succeeds. That is a smaller divergence than answering a valid path for
     // a directory that no longer exists.
-    if stat_ino_path_dir_aware_ext(&cwd, true).is_none() {
+    //
+    // The cwd is stored in the caller's view (relative to its root, the
+    // frame chdir records), while the stat resolver walks host paths, so the
+    // probe must be re-rooted first — `resolve_cwd_path`, the same rewrite
+    // chdir validated the directory through. Probing the bare cwd tested the
+    // root-relative spelling against the HOST root: under a root other than
+    // "/" (every task below a directly rooted PID 1; any chroot) a live
+    // directory that has no twin at that spelling outside the root read as
+    // removed. That was the `getcwd: cannot access parent directories`
+    // every SSH login printed from its home directory, while a cwd like
+    // /tmp, which happens to exist on both sides, kept working.
+    if stat_ino_path_dir_aware_ext(&resolve_cwd_path(task, &cwd), true).is_none() {
         ctx.set_return(errno_ret(ENOENT));
         return;
     }
