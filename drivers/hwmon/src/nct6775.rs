@@ -87,6 +87,63 @@ pub const NCT6796D_ID: u16 = 0xD423;
 pub const NCT6797D_ID: u16 = 0xD451;
 pub const NCT6798D_ID: u16 = 0xD42B;
 
+// ── HWM I/O window / EC register access constants ─────────────────────
+//
+// Linux ref: nct6775-platform.c.
+//
+// The HWM logical device (LDN 0x0B) exposes a 2-byte ADDR/DATA window.
+// Linux reads the LDN base from SIO offset 0x60/0x61, masks it with
+// `IOREGION_ALIGNMENT` (~7), then accesses the EC window at
+// `base + IOREGION_OFFSET`.  Within that window the ADDR port is at
+// +ADDR_REG_OFFSET and the DATA port at +DATA_REG_OFFSET.
+//
+//   nct6775-platform.c L57-61:
+//     #define IOREGION_ALIGNMENT  (~7)
+//     #define IOREGION_OFFSET     5
+//     #define ADDR_REG_OFFSET     0
+//     #define DATA_REG_OFFSET     1
+
+/// Mask applied to the raw HWM base address (nct6775-platform.c
+/// `IOREGION_ALIGNMENT`). The low 3 bits are not part of the address.
+pub const IOREGION_ALIGNMENT: u16 = !7u16;
+/// Offset from the LDN base to the start of the EC ADDR/DATA window
+/// (nct6775-platform.c `IOREGION_OFFSET`).
+pub const IOREGION_OFFSET: u16 = 5;
+/// ADDR register offset within the EC window (nct6775-platform.c).
+pub const ADDR_REG_OFFSET: u16 = 0;
+/// DATA register offset within the EC window (nct6775-platform.c).
+pub const DATA_REG_OFFSET: u16 = 1;
+
+/// Bank-select pseudo-register written to the ADDR port to switch the
+/// active 256-byte register bank (nct6775.h `NCT6775_REG_BANK` = 0x4E).
+pub const NCT6775_REG_BANK: u8 = 0x4E;
+
+/// SIO logical-device base-address register (high byte); low byte is at
+/// `SIO_REG_ADDR + 1`. nct6775-platform.c `SIO_REG_ADDR` = 0x60.
+pub const SIO_REG_ADDR: u8 = 0x60;
+
+// ── HWM register map (NCT6775/6776 common layout) ─────────────────────
+//
+// Linux ref: nct6775-core.c. These are 16-bit "banked" register
+// addresses: the high byte selects the bank, the low byte the offset.
+
+/// Voltage input registers in0..in6 (nct6775-core.c `NCT6775_REG_IN`
+/// L94; first seven entries 0x20-0x26 are the directly-readable inputs).
+pub const NCT6775_REG_IN: [u16; 7] = [0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26];
+
+/// Fan tachometer registers (nct6775-core.c `NCT6775_REG_FAN` L150).
+/// These are word-sized (16-bit) — one read yields the full count.
+pub const NCT6775_REG_FAN: [u16; 5] = [0x630, 0x632, 0x634, 0x636, 0x638];
+
+/// Temperature source registers temp1..temp6 (nct6775-core.c
+/// `NCT6775_REG_TEMP` L156). 0x150/0x250 are word-sized (hi:integer °C,
+/// lo:fraction); the rest are byte-sized (integer °C only).
+pub const NCT6775_REG_TEMP: [u16; 6] = [0x27, 0x150, 0x250, 0x62b, 0x62c, 0x62d];
+
+/// PWM duty-cycle output registers (nct6775-core.c `NCT6775_REG_PWM`
+/// L145). Byte-sized, 0..255 duty.
+pub const NCT6775_REG_PWM: [u16; 5] = [0x109, 0x209, 0x309, 0x809, 0x909];
+
 // ── SIO access ports ──────────────────────────────────────────────────
 
 /// Standard Super-I/O index/data port pair.
@@ -200,6 +257,80 @@ pub fn fan_count_to_rpm(count: u16) -> Option<u32> {
     Some(1_350_000 / count as u32)
 }
 
+// ── Pure conversion free functions (host-testable) ────────────────────
+
+/// Convert a raw voltage register value to millivolts.
+///
+/// Linux ref: nct6775-core.c `in_from_reg` (L1002) with the common
+/// `scale_in` entry of 800: `result_mV = reg * 800 / 100 = reg * 8`.
+/// This is the 8 mV/LSB ADC scaling used for the non-divided inputs
+/// (CPUVC, IN0/IN4/IN5/IN6, 3VSB with a board divider handled by the
+/// input's `scale_in[nr]` which is not modelled here). Inputs with a
+/// 2:1 divider (3VCC, AVSB, VBAT; `scale_in` entry 1600) read at
+/// 16 mV/LSB — use [`in_from_reg_scaled`] for those.
+#[inline]
+pub fn in_from_reg(raw: u8) -> i32 {
+    // 8 mV per LSB. nct6775-core.c scale_in[] default entry == 800,
+    // i.e. (8 mV * 100), and in_from_reg divides the product by 100.
+    raw as i32 * 8
+}
+
+/// Convert a raw voltage register value to millivolts using an explicit
+/// per-input scale factor (`scale_in` units: 8 mV-per-LSB * 100).
+///
+/// Linux ref: nct6775-core.c `in_from_reg` (L1002):
+///   `DIV_ROUND_CLOSEST(reg * scale, 100)`.
+/// Common scales are 800 (8 mV/LSB) and 1600 (16 mV/LSB).
+#[inline]
+pub fn in_from_reg_scaled(raw: u8, scale: u16) -> i32 {
+    // DIV_ROUND_CLOSEST(a, b) == (a + b/2) / b for non-negative a.
+    let num = raw as i32 * scale as i32;
+    (num + 50) / 100
+}
+
+/// Convert a raw temperature register word to millidegrees Celsius.
+///
+/// Linux ref: lm75.h `LM75_TEMP_FROM_REG`:
+///   `((s16)reg / 128) * 500`
+/// The register word packs temperature as (0.5 °C/bit, two's complement)
+/// shifted left by 7. For byte-sized temp registers (integer °C only),
+/// the raw byte is first shifted into the high byte (see
+/// nct6775-core.c `nct6775_read_temp` L1220: `*val <<= 8` when the reg
+/// is not word-sized); pass that shifted word here.
+#[inline]
+pub fn temp_from_reg_word(reg: u16) -> i32 {
+    // Integer division (not >>) to guarantee arithmetic/sign behaviour,
+    // matching the kernel comment in lm75.h.
+    ((reg as i16) / 128) as i32 * 500
+}
+
+/// Convert a byte-sized temperature register (integer °C) to
+/// millidegrees. Equivalent to `temp_from_reg_word((raw as u16) << 8)`.
+///
+/// Linux ref: nct6775-core.c `nct6775_read_temp` + lm75.h.
+/// For a byte value `t` (0..127): `((t<<8) as i16)/128 == t*2`, and
+/// `t*2*500 == t*1000` millidegrees. Values 128..255 decode as negative
+/// temperatures via two's complement, matching the kernel.
+#[inline]
+pub fn temp_from_reg(raw: u8) -> i32 {
+    temp_from_reg_word((raw as u16) << 8)
+}
+
+/// True if a 16-bit HWM register is accessed as a 16-bit word on the
+/// NCT6775/6776 family (the only families this driver reads).
+///
+/// Linux ref: nct6775-core.c `nct6775_reg_is_word_sized` L1151 (the
+/// `nct6775`/`nct6776` arms; common subset). We only need the cases the
+/// register maps above can produce: the banked temp regs 0x150/0x250
+/// (`(reg&0xff00)==0x100||0x200 && (reg&0xff)==0x50`) and the fan
+/// tach regs 0x630-0x638 (`(reg&0xfff0)==0x630`).
+#[inline]
+pub fn reg_is_word_sized(reg: u16) -> bool {
+    (((reg & 0xff00) == 0x100 || (reg & 0xff00) == 0x200)
+        && ((reg & 0x00ff) == 0x50 || (reg & 0x00ff) == 0x53 || (reg & 0x00ff) == 0x55))
+        || (reg & 0xfff0) == 0x630
+}
+
 // ── SIO access primitives ─────────────────────────────────────────────
 
 /// Enter Extended Function Mode.
@@ -269,6 +400,145 @@ pub unsafe fn sio_write(index_port: u16, data_port: u16, reg: u8, val: u8) {
     }
 }
 
+// ── HWM EC register access ────────────────────────────────────────────
+//
+// Linux ref: nct6775-platform.c `nct6775_set_bank` (L316),
+// `nct6775_reg_read` (L327), `nct6775_reg_write` (L343).
+//
+// Access uses a two-register ADDR/DATA window at `ec = hwm_base +
+// IOREGION_OFFSET`. To read a 16-bit banked register `reg`:
+//   1. Select the bank `reg >> 8`: write NCT6775_REG_BANK (0x4E) to
+//      ADDR, then the bank byte to DATA.
+//   2. Write the low byte `reg & 0xff` to ADDR, read DATA (high/first
+//      byte). For word-sized regs, write `(reg & 0xff) + 1` to ADDR and
+//      read DATA again; the 16-bit value is `(first << 8) | second`.
+//
+// Unlike Linux we do not cache the active bank (no persistent device
+// state in the read path), so every access re-selects the bank. This is
+// always correct, just slightly more port traffic.
+
+/// Compute the EC ADDR port for a HWM base.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn ec_addr_port(hwm_base: u16) -> u16 {
+    hwm_base + IOREGION_OFFSET + ADDR_REG_OFFSET
+}
+
+/// Compute the EC DATA port for a HWM base.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn ec_data_port(hwm_base: u16) -> u16 {
+    hwm_base + IOREGION_OFFSET + DATA_REG_OFFSET
+}
+
+/// Select the register bank `reg >> 8` on the EC window.
+/// Linux nct6775-platform.c `nct6775_set_bank` L316.
+///
+/// # Safety
+///
+/// `hwm_base` must be a validated, nonzero HWM I/O base and we must be
+/// at CPL-0. Caller must serialise EC access (no concurrent bank state).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn ec_set_bank(hwm_base: u16, reg: u16) {
+    let addr = ec_addr_port(hwm_base);
+    let data = ec_data_port(hwm_base);
+    // SAFETY: CPL-0 port I/O to the driver-owned EC window; ports are
+    // derived from a validated nonzero base.
+    unsafe {
+        narf_arch::x86_64::io_port::outb(addr, NCT6775_REG_BANK);
+        narf_arch::x86_64::io_port::outb(data, (reg >> 8) as u8);
+    }
+}
+
+/// Read a (possibly word-sized) HWM register.
+/// Linux nct6775-platform.c `nct6775_reg_read` L327.
+///
+/// Returns the raw register value: 8 bits for byte-sized registers,
+/// 16 bits (big-endian: first byte is the high byte) for word-sized.
+///
+/// # Safety
+///
+/// Same requirements as [`ec_set_bank`].
+#[cfg(target_arch = "x86_64")]
+unsafe fn ec_read16(hwm_base: u16, reg: u16) -> u16 {
+    let addr = ec_addr_port(hwm_base);
+    let data = ec_data_port(hwm_base);
+    // SAFETY: CPL-0 port I/O to the driver-owned EC window.
+    unsafe {
+        ec_set_bank(hwm_base, reg);
+        narf_arch::x86_64::io_port::outb(addr, (reg & 0xff) as u8);
+        let mut val = narf_arch::x86_64::io_port::inb(data) as u16;
+        if reg_is_word_sized(reg) {
+            narf_arch::x86_64::io_port::outb(addr, ((reg & 0xff) + 1) as u8);
+            val = (val << 8) | narf_arch::x86_64::io_port::inb(data) as u16;
+        }
+        val
+    }
+}
+
+/// Read a single byte-sized HWM register.
+/// Linux nct6775-platform.c `nct6775_reg_read` L327 (byte path).
+///
+/// # Safety
+///
+/// Same requirements as [`ec_set_bank`]. `reg` must be a byte-sized
+/// register (see [`reg_is_word_sized`]).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn ec_read(hwm_base: u16, reg: u16) -> u8 {
+    // SAFETY: delegated to ec_read16; byte-sized reg yields low 8 bits.
+    unsafe { ec_read16(hwm_base, reg) as u8 }
+}
+
+/// Write a byte-sized HWM register.
+/// Linux nct6775-platform.c `nct6775_reg_write` L343 (byte path).
+///
+/// # Safety
+///
+/// Same requirements as [`ec_set_bank`]. Only byte-sized registers are
+/// written here (PWM duty).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn ec_write(hwm_base: u16, reg: u16, val: u8) {
+    let addr = ec_addr_port(hwm_base);
+    let data = ec_data_port(hwm_base);
+    // SAFETY: CPL-0 port I/O to the driver-owned EC window.
+    unsafe {
+        ec_set_bank(hwm_base, reg);
+        narf_arch::x86_64::io_port::outb(addr, (reg & 0xff) as u8);
+        narf_arch::x86_64::io_port::outb(data, val);
+    }
+}
+
+/// Read the HWM logical-device I/O base address from the SIO config
+/// space. Returns `None` if the base is zero (disabled / invalid).
+/// Linux nct6775-platform.c `nct6775_find` L1051-1060.
+///
+/// Selects LDN 0x0B, reads SIO 0x60 (high) / 0x61 (low), masks with
+/// `IOREGION_ALIGNMENT`. Must be called inside an EFM block.
+///
+/// # Safety
+///
+/// CPL-0, called within `sio_enter`/`sio_exit`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn read_hwm_base(index_port: u16, data_port: u16) -> Option<u16> {
+    // SAFETY: CPL-0 SIO access within an EFM block.
+    let base = unsafe {
+        // Select the Hardware Monitor logical device.
+        sio_write(index_port, data_port, SIO_LDN_SELECT, LDN_HWM);
+        let hi = sio_read(index_port, data_port, SIO_REG_ADDR) as u16;
+        let lo = sio_read(index_port, data_port, SIO_REG_ADDR + 1) as u16;
+        (hi << 8) | lo
+    };
+    let base = base & IOREGION_ALIGNMENT;
+    if base == 0 {
+        None
+    } else {
+        Some(base)
+    }
+}
+
 /// Read the chip ID from the Super-I/O at `index_port`.
 /// Returns `None` if the chip ID is not a known NCT value.
 ///
@@ -316,14 +586,24 @@ pub struct Nct6775 {
 }
 
 impl Nct6775 {
+    /// Construct a device with the HWM I/O base unset (`hwm_base = 0`).
+    /// Use [`Nct6775::with_hwm_base`] to attach a discovered base; until
+    /// then all HWM register reads return `None`.
     pub fn new(chip: NctChip, chip_id: u16, index_port: u16, data_port: u16) -> Self {
         Self {
             chip,
             chip_id,
             index_port,
             data_port,
-            hwm_base: 0, // populated during full probe
+            hwm_base: 0,
         }
+    }
+
+    /// Builder: attach the (already masked, nonzero) HWM logical-device
+    /// I/O base read from SIO 0x60/0x61. See `read_hwm_base`.
+    pub fn with_hwm_base(mut self, hwm_base: u16) -> Self {
+        self.hwm_base = hwm_base;
+        self
     }
 }
 
@@ -333,42 +613,106 @@ impl crate::HwmonDevice for Nct6775 {
     }
 
     fn read_temp(&self, label: &str) -> Option<i32> {
-        // Temperature reads require HWM I/O port access; deferred until
-        // the full ISA I/O permission map is wired in NARF's arch layer.
         let idx = TEMP_LABELS.iter().position(|&l| l == label)?;
-        if idx >= self.chip.num_temps() as usize {
+        if idx >= self.chip.num_temps() as usize || idx >= NCT6775_REG_TEMP.len() {
             return None;
         }
-        // Deferred: real read would be:
-        //   outb(hwm_base + 0x4E, bank_select)
-        //   inb(hwm_base + TEMP_REG[idx])
-        None
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.hwm_base == 0 {
+                return None;
+            }
+            let reg = NCT6775_REG_TEMP[idx];
+            // SAFETY: hwm_base is a validated nonzero HWM I/O base; EC
+            // access is a sequence of CPL-0 port I/Os on the driver's
+            // own window. nct6775-platform.c nct6775_reg_read.
+            let word = unsafe {
+                if reg_is_word_sized(reg) {
+                    // Word-sized temp reg: hi:integer °C, lo:fraction.
+                    ec_read16(self.hwm_base, reg)
+                } else {
+                    // Byte-sized: shift integer °C into the high byte,
+                    // matching nct6775_read_temp (`*val <<= 8`).
+                    (ec_read(self.hwm_base, reg) as u16) << 8
+                }
+            };
+            Some(temp_from_reg_word(word))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
     }
 
     fn read_fan(&self, label: &str) -> Option<u32> {
         let idx = FAN_LABELS.iter().position(|&l| l == label)?;
-        if idx >= self.chip.num_fans() as usize {
+        if idx >= self.chip.num_fans() as usize || idx >= NCT6775_REG_FAN.len() {
             return None;
         }
-        // Deferred: real read would be:
-        //   high = inb(hwm_base + FAN_TACH_HIGH[idx])
-        //   low  = inb(hwm_base + FAN_TACH_LOW[idx])
-        //   fan_count_to_rpm((high << 8) | low)
-        None
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.hwm_base == 0 {
+                return None;
+            }
+            // Fan tach regs are word-sized; one read yields the 16-bit
+            // count (nct6775-core.c NCT6775_REG_FAN, word-sized per
+            // nct6775_reg_is_word_sized `(reg & 0xfff0) == 0x630`).
+            // SAFETY: validated nonzero hwm_base; CPL-0 EC window I/O.
+            let count = unsafe { ec_read16(self.hwm_base, NCT6775_REG_FAN[idx]) };
+            fan_count_to_rpm(count)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
     }
 
     fn read_voltage(&self, label: &str) -> Option<i32> {
-        let _idx = VOLT_LABELS.iter().position(|&l| l == label)?;
-        None
+        let idx = VOLT_LABELS.iter().position(|&l| l == label)?;
+        if idx >= NCT6775_REG_IN.len() {
+            return None;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.hwm_base == 0 {
+                return None;
+            }
+            // 8-bit ADC reading; 8 mV/LSB for the undivided inputs.
+            // nct6775-core.c in_from_reg / scale_in.
+            // SAFETY: validated nonzero hwm_base; CPL-0 EC window I/O.
+            let raw = unsafe { ec_read(self.hwm_base, NCT6775_REG_IN[idx]) };
+            Some(in_from_reg(raw))
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
     }
 
     fn set_fan(&self, label: &str, level: u8) -> bool {
-        let _idx = match PWM_LABELS.iter().position(|&l| l == label) {
+        let idx = match PWM_LABELS.iter().position(|&l| l == label) {
             Some(i) => i,
             None => return false,
         };
-        let _ = level; // deferred: outb(hwm_base + PWM_REG[idx], level)
-        false
+        if idx >= self.chip.num_fans() as usize || idx >= NCT6775_REG_PWM.len() {
+            return false;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.hwm_base == 0 {
+                return false;
+            }
+            // Write the raw PWM duty (0..255) to the fan's PWM register.
+            // nct6775-core.c NCT6775_REG_PWM.
+            // SAFETY: validated nonzero hwm_base; CPL-0 EC window I/O.
+            unsafe { ec_write(self.hwm_base, NCT6775_REG_PWM[idx], level) };
+            true
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = level;
+            false
+        }
     }
 
     fn list_labels(&self) -> Vec<&str> {
@@ -398,12 +742,24 @@ pub fn register_isa_driver() {
         let candidates = [(SIO_INDEX_STD, SIO_DATA_STD), (SIO_INDEX_ALT, SIO_DATA_ALT)];
         for (idx, dat) in candidates {
             if let Some((chip, chip_id)) = detect_chip(idx, dat) {
+                // Re-enter EFM to read the HWM logical-device I/O base
+                // (SIO 0x60/0x61 after selecting LDN 0x0B). See
+                // nct6775-platform.c nct6775_find L1051.
+                // SAFETY: EFM enter/exit are paired; read_hwm_base only
+                // selects the HWM LDN and reads its base registers.
+                let hwm_base = unsafe {
+                    sio_enter(idx);
+                    let b = read_hwm_base(idx, dat);
+                    sio_exit(idx);
+                    b
+                };
                 let _ = writeln!(
                     narf_console::Writer,
-                    "  nct6775: {} (id=0x{:04X}) at 0x{:02X}",
+                    "  nct6775: {} (id=0x{:04X}) at 0x{:02X}, hwm_base=0x{:04X}",
                     chip.name(),
                     chip_id,
-                    idx
+                    idx,
+                    hwm_base.unwrap_or(0)
                 );
                 registry::register(registry::RegisteredSensor {
                     name: "nct6775",
@@ -411,7 +767,9 @@ pub fn register_isa_driver() {
                     bus_loc: "isa",
                 });
                 use alloc::sync::Arc;
-                registry::register_device(Arc::new(Nct6775::new(chip, chip_id, idx, dat)));
+                registry::register_device(Arc::new(
+                    Nct6775::new(chip, chip_id, idx, dat).with_hwm_base(hwm_base.unwrap_or(0)),
+                ));
                 return;
             }
         }

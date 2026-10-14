@@ -43,8 +43,17 @@ extern crate alloc;
 use alloc::vec::Vec;
 use narf_bus::{BusDeviceCap, MatchKind, PciMatch, ProbeError};
 use narf_capabilities::{Cap, Write};
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::PhysAddr;
 
 use crate::registry;
+
+/// Serializes SMN mailbox transactions. The index/data register pair
+/// (PCI cfg 0x60/0x64) is stateful — a concurrent reader could observe
+/// another reader's index write. One lock for the whole crate is fine:
+/// there is effectively a single D18F3 mailbox per socket and reads are
+/// cold-path. Linux k10temp.c uses `nb_smu_ind_mutex` for the same reason.
+static SMN_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 // ── AMD vendor ────────────────────────────────────────────────────────
 
@@ -183,40 +192,66 @@ pub const LABELS: &[&str] = &["Tctl", "Tdie", "Tccd1", "Tccd2"];
 
 // ── k10temp device ────────────────────────────────────────────────────
 
-/// A bound k10temp device. Holds the PCI bus/slot/func triple needed
-/// for future SMN access (NARF's PCI config-space accessor will be
-/// wired here once the bus crate exposes per-device config R/W).
+/// A bound k10temp device. Holds the PCI bus/slot/func triple for
+/// diagnostics plus the physical base of the function's 4-KiB config
+/// window, through which the SMN mailbox (cfg offsets 0x60/0x64) is
+/// reached via the bus crate's ECAM mapping.
 #[derive(Debug)]
 pub struct K10temp {
     pub pci_bus: u8,
     pub pci_slot: u8,
     pub pci_func: u8,
     pub chip: &'static K10tempChip,
+    /// Physical address of this PCI function's config window, or `None`
+    /// when the device was constructed without one (unit tests). SMN
+    /// reads return `None` in that case.
+    pub cfg_phys: Option<PhysAddr>,
 }
 
 impl K10temp {
-    /// Construct from PCI address + chip table entry.
+    /// Construct from PCI address + chip table entry, without a config
+    /// window. SMN reads return `None` until [`K10temp::with_cfg_phys`]
+    /// attaches one. Used by unit tests and the non-live probe path.
     pub fn new(bus: u8, slot: u8, func: u8, chip: &'static K10tempChip) -> Self {
         Self {
             pci_bus: bus,
             pci_slot: slot,
             pci_func: func,
             chip,
+            cfg_phys: None,
         }
     }
 
-    /// Read a raw 32-bit value from the SMN by writing the index
-    /// register and reading the data register via PCI config space.
+    /// Attach the PCI config-window physical base so SMN reads can reach
+    /// the D18F3 mailbox. Chainable builder used by the live probe path.
+    pub fn with_cfg_phys(mut self, cfg_phys: PhysAddr) -> Self {
+        self.cfg_phys = Some(cfg_phys);
+        self
+    }
+
+    /// Read a raw 32-bit value from the SMN by writing the 32-bit SMN
+    /// address to PCI config offset `SMN_INDEX_ADDR` (0x60) and reading
+    /// the 32-bit result back from `SMN_DATA_ADDR` (0x64).
     ///
-    /// On real hardware this requires CPL-0 `outl`/`inl` to the PCI
-    /// legacy port pair (0xCF8/0xCFC) or MMIO ECAM access. The arch
-    /// crate wires those once the PCI driver framework supports
-    /// config-space R/W per-device. For now this returns `None` so
-    /// the device registers successfully without live reads.
-    pub fn smn_read(&self, _smn_addr: u32) -> Option<u32> {
-        // Deferred: requires PCI config-space write to offset 0x60
-        // then read from 0x64. Returns None until ECAM R/W lands.
-        None
+    /// Config space is MMIO: the bus crate maps each ECAM segment and
+    /// `ecam::ptr_for` rebases a `(cfg_phys, offset)` pair onto the
+    /// mapped window. Returns `None` if no config window is attached or
+    /// no mapped segment covers it (treated as "device absent").
+    ///
+    /// Linux k10temp.c `amd_smn_read` / `read_smn_temp` (~L388).
+    pub fn smn_read(&self, smn_addr: u32) -> Option<u32> {
+        let cfg = self.cfg_phys?;
+        let index = narf_bus::ecam::ptr_for(cfg, SMN_INDEX_ADDR as u64)? as *mut u32;
+        let data = narf_bus::ecam::ptr_for(cfg, SMN_DATA_ADDR as u64)? as *const u32;
+        let _guard = SMN_LOCK.lock();
+        // SAFETY: `index`/`data` come from `ecam::ptr_for`, which only
+        // returns pointers inside a live, mapped ECAM window (Device
+        // memory). Config offsets 0x60/0x64 are 4-byte aligned. The
+        // lock serializes the index-then-data transaction.
+        unsafe {
+            core::ptr::write_volatile(index, smn_addr);
+            Some(core::ptr::read_volatile(data))
+        }
     }
 }
 
@@ -261,8 +296,10 @@ fn probe_k10temp(
     _cap: Cap<BusDeviceCap, Write>,
 ) -> Result<(), ProbeError> {
     use core::fmt::Write as _;
-    let (bus, slot, func) = match dev.kind {
-        narf_bus::BusKind::Pcie { addr, .. } => (addr.bus, addr.device, addr.function),
+    let (bus, slot, func, cfg_phys) = match dev.kind {
+        narf_bus::BusKind::Pcie { addr, cfg_phys } => {
+            (addr.bus, addr.device, addr.function, cfg_phys)
+        }
         _ => return Err(ProbeError::Other("not a PCIe device")),
     };
     let chip = chip_info(dev.id.device).ok_or(ProbeError::Other("unknown k10temp device"))?;
@@ -280,7 +317,9 @@ fn probe_k10temp(
         bus_loc: "pci",
     });
     use alloc::sync::Arc;
-    registry::register_device(Arc::new(K10temp::new(bus, slot, func, chip)));
+    registry::register_device(Arc::new(
+        K10temp::new(bus, slot, func, chip).with_cfg_phys(cfg_phys),
+    ));
     Ok(())
 }
 
