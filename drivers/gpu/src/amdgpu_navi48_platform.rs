@@ -725,13 +725,58 @@ static PRESENTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 static NEXT_FRAME: narf_lib::sync::IrqSafeSpinLock<Option<Frame>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// A DRM client's XRGB8888 frame in a kernel-mapped dumb buffer.
+/// A DRM client's XRGB8888 frame in a kernel-mapped dumb buffer, and the
+/// flip-complete ticket (see `drm::card::FlipLog`) its flip completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Frame {
     phys: u64,
     pitch: u32,
     width: u32,
     height: u32,
+    ticket: Option<u64>,
+}
+
+/// Whether `present_frame` would present through a hardware flip now, so a
+/// DRM flip-complete event should wait for that flip.
+pub fn native_present_ready() -> bool {
+    NATIVE_PRESENT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The pipe's 24-bit OTG frame count extended to DRM's 32-bit vblank count:
+/// (last raw count, extended count).
+static VBLANKS: narf_lib::sync::IrqSafeSpinLock<Option<(u32, u32)>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn vblank_count(frame: u32) -> u32 {
+    const FRAME_MASK: u32 = 0xff_ffff;
+    let mut vblanks = VBLANKS.lock();
+    let count = match *vblanks {
+        Some((last, count)) => count.wrapping_add(frame.wrapping_sub(last) & FRAME_MASK),
+        None => frame,
+    };
+    *vblanks = Some((frame, count));
+    count
+}
+
+/// Complete the flip-complete events up to `ticket`: at the latched flip,
+/// or now in the last known vblank when the frame will not be flipped.
+fn complete_flip(ticket: Option<u64>, frame: Option<u32>) {
+    use crate::drm::card::{FlipStamp, FLIPS};
+    let Some(ticket) = ticket else {
+        return;
+    };
+    let ns = narf_time::wall::monotonic_ns();
+    match frame {
+        Some(frame) => {
+            let sequence = vblank_count(frame);
+            FLIPS.lock().complete(ticket, FlipStamp { ns, sequence });
+        }
+        None => {
+            let mut flips = FLIPS.lock();
+            let sequence = flips.last().map_or(0, |s| s.sequence);
+            flips.complete(ticket, FlipStamp { ns, sequence });
+        }
+    }
 }
 
 /// Queue a DRM client's frame for tear-free presentation on the native
@@ -742,23 +787,34 @@ struct Frame {
 /// Returns false when native presentation is not available, and the
 /// caller then copies onto the visible front as before.
 ///
+/// `ticket` completes when the frame's flip latches, or when the frame is
+/// replaced, refused or fails to present: no event waits forever.
+///
 /// DRM's buffer rules make the deferred read safe: a client leaves a
-/// submitted framebuffer untouched until a later flip completes.
-pub fn present_frame(phys: u64, pitch: u32, width: u32, height: u32) -> bool {
+/// submitted framebuffer untouched until its flip-complete event, which
+/// is not sent before the copy is done.
+pub fn present_frame(phys: u64, pitch: u32, width: u32, height: u32, ticket: Option<u64>) -> bool {
     use core::sync::atomic::Ordering;
     if !NATIVE_PRESENT.load(Ordering::Acquire)
         || width == 0
         || height == 0
         || pitch < width.saturating_mul(4)
     {
+        complete_flip(ticket, None);
         return false;
     }
-    *NEXT_FRAME.lock() = Some(Frame {
-        phys,
-        pitch,
-        width,
-        height,
-    });
+    {
+        let mut next = NEXT_FRAME.lock();
+        // A replaced frame's event completes with the frame replacing it.
+        let ticket = ticket.max(next.and_then(|f| f.ticket));
+        *next = Some(Frame {
+            phys,
+            pitch,
+            width,
+            height,
+            ticket,
+        });
+    }
     if !PRESENTING.swap(true, Ordering::AcqRel) {
         narf_scheduler::spawn(presenter());
     }
@@ -779,6 +835,7 @@ async fn presenter() {
             return;
         };
         if !NATIVE_PRESENT.load(Ordering::Acquire) {
+            complete_flip(frame.ticket, None);
             continue;
         }
         let pipe = CURSOR_PIPE.load(Ordering::Acquire);
@@ -792,8 +849,12 @@ async fn presenter() {
             }
         };
         match result {
-            Ok((before, after)) => follow_flip(before, after),
+            Ok((before, after, done)) => {
+                complete_flip(frame.ticket, Some(done.frame));
+                follow_flip(before, after);
+            }
             Err(e) => {
+                complete_flip(frame.ticket, None);
                 // A failed flip quarantines the pipe; later frames use the
                 // fallback copy, which a stopped pipe simply does not show.
                 NATIVE_PRESENT.store(false, Ordering::Release);
@@ -807,14 +868,17 @@ async fn presenter() {
 }
 
 /// Copy `frame` into the back buffer of the live pipe, then flip to it.
-/// Returns the published front before and after.
+/// Returns the published front before and after, and the flip.
 /// # Safety
 /// The caller holds the owner lock; `frame` names a mapped dumb buffer.
 async unsafe fn present_native(
     boot: &mut boot::ColdBoot,
     pipe: u8,
     frame: Frame,
-) -> Result<(GenericFb, GenericFb), crate::amdgpu_dcn401_otg::Error> {
+) -> Result<
+    (GenericFb, GenericFb, crate::amdgpu_dcn401_otg::FlipDone),
+    crate::amdgpu_dcn401_otg::Error,
+> {
     let back = boot.display_back_framebuffer(pipe)?;
     let width = frame.width.min(back.width);
     for y in 0..frame.height.min(back.height) {
@@ -836,8 +900,8 @@ async unsafe fn present_native(
     let before = boot.display_scanout_framebuffer(pipe)?;
     // SAFETY: the back buffer holds the complete frame; no other writer
     // touches it until the next flip (the owner lock is held).
-    unsafe { boot.flip_display(pipe).await }?;
-    Ok((before, boot.display_scanout_framebuffer(pipe)?))
+    let done = unsafe { boot.flip_display(pipe).await }?;
+    Ok((before, boot.display_scanout_framebuffer(pipe)?, done))
 }
 
 /// Show a premultiplied ARGB8888 cursor (at most 64x64) on a live pipe.
@@ -1482,6 +1546,33 @@ pub async fn poll_interrupts() -> Result<crate::amdgpu_ih7::Batch, boot::Error> 
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// A frame the native display cannot take still completes its
+    /// flip-complete event, and the 24-bit OTG frame count extends across
+    /// its wrap into DRM's vblank count.
+    fn navi48_present_completes_refused_flip_and_extends_vblanks() -> TestResult {
+        use crate::drm::card::FLIPS;
+        let ticket = FLIPS.lock().reserve();
+        if native_present_ready() {
+            return TestResult::Fail("test kernel unexpectedly presents natively");
+        }
+        if present_frame(0x1000, 64, 16, 16, Some(ticket)) {
+            return TestResult::Fail("frame taken without a native display");
+        }
+        if FLIPS.lock().stamp(ticket).is_none() {
+            return TestResult::Fail("refused frame left its event waiting");
+        }
+        let before = vblank_count(0xff_fff0);
+        let after = vblank_count(0x10);
+        if after.wrapping_sub(before) != 0x20 || vblank_count(0x10) != after {
+            return TestResult::Fail("frame count wrap not extended");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/gpu/amdgpu/navi48",
+        navi48_present_completes_refused_flip_and_extends_vblanks
+    );
 
     fn navi48_handoff_distinguishes_primary_and_secondary_apertures() -> TestResult {
         let fb = GenericFb::new(0x1100, 16, 4, 64, 32);

@@ -5997,6 +5997,144 @@ fn smoke_drm_flip_event_slack_offset() -> TestResult {
 }
 kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_event_slack_offset);
 
+/// Hardware flips complete their tickets in order: a later flip completes
+/// any frame it replaced, a ticket never runs ahead of its flip, and history
+/// beyond the retained window reports the oldest retained flip.
+fn smoke_drm_flip_log_completes_in_order() -> TestResult {
+    use crate::drm::card::{FlipLog, FlipStamp};
+    let stamp = |ns, sequence| FlipStamp { ns, sequence };
+    let mut log = FlipLog::new();
+    let (a, b, c) = (log.reserve(), log.reserve(), log.reserve());
+    if log.stamp(a).is_some() || log.last().is_some() {
+        return TestResult::Fail("ticket complete before any flip");
+    }
+    log.complete(b, stamp(1_000, 10));
+    if log.stamp(a) != Some(stamp(1_000, 10)) || log.stamp(b) != Some(stamp(1_000, 10)) {
+        return TestResult::Fail("replaced frame not completed with its replacement");
+    }
+    if log.stamp(c).is_some() {
+        return TestResult::Fail("later ticket completed early");
+    }
+    // A stale completion changes nothing; one past the reservations clamps.
+    log.complete(a, stamp(2_000, 11));
+    log.complete(99, stamp(3_000, 12));
+    if log.stamp(b) != Some(stamp(1_000, 10)) || log.stamp(c) != Some(stamp(3_000, 12)) {
+        return TestResult::Fail("completion order not kept");
+    }
+    if log.stamp(c + 1).is_some() {
+        return TestResult::Fail("unreserved ticket completed");
+    }
+    let d = log.reserve();
+    log.complete_all(4_000);
+    if log.stamp(d) != Some(stamp(4_000, 12)) {
+        return TestResult::Fail("complete_all did not keep the last vblank count");
+    }
+    for n in 0..20u64 {
+        let t = log.reserve();
+        log.complete(t, stamp(10_000 + n, 100 + n as u32));
+    }
+    if log.stamp(a) != Some(stamp(10_004, 104)) {
+        return TestResult::Fail("expired history not reported as the oldest retained flip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_log_completes_in_order);
+
+/// A poller waiting for a hardware flip looks again just after the next
+/// vblank (phase-locked to the last flip), or shortly while one may be
+/// landing; a completed flip is due at once.
+fn smoke_drm_flip_log_recheck_tracks_vblank() -> TestResult {
+    use crate::drm::card::{FlipLog, FlipStamp};
+    const PERIOD: u64 = 16_666_666;
+    let mut log = FlipLog::new();
+    let t = log.reserve();
+    if log.recheck_at(t, 5_000_000, PERIOD) != 5_250_000 {
+        return TestResult::Fail("no flip to lock to: recheck shortly");
+    }
+    let last = log.reserve();
+    log.complete(
+        last,
+        FlipStamp {
+            ns: 100_000_000,
+            sequence: 1,
+        },
+    );
+    let t = log.reserve();
+    // 1 ms after a vblank: the flip may be landing.
+    if log.recheck_at(t, 100_000_000 + PERIOD + 1_000_000, PERIOD)
+        != 100_000_000 + PERIOD + 1_250_000
+    {
+        return TestResult::Fail("landing window not rechecked shortly");
+    }
+    // 6 ms after a vblank: sleep to just after the next one.
+    if log.recheck_at(t, 100_000_000 + 6_000_000, PERIOD) != 100_000_000 + PERIOD + 250_000 {
+        return TestResult::Fail("not parked until the next vblank");
+    }
+    log.complete(
+        t,
+        FlipStamp {
+            ns: 140_000_000,
+            sequence: 3,
+        },
+    );
+    if log.recheck_at(t, 150_000_000, PERIOD) != 140_000_000 {
+        return TestResult::Fail("completed flip not due at once");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_flip_log_recheck_tracks_vblank);
+
+/// The flip-complete event of a hardware flip stays unreadable however late
+/// it is until its flip completes, then carries that flip's CLOCK_MONOTONIC
+/// time and vblank count, as amdgpu_dm's pageflip handler sends it.
+fn smoke_drm_hw_flip_event_waits_for_flip() -> TestResult {
+    use crate::drm::card::{DrmEventQueue, FlipStamp, FLIPS};
+    let mut card = make_test_card_for_ioctl();
+    let mut events = DrmEventQueue::new();
+    let ticket = FLIPS.lock().reserve();
+    if card
+        .queue_hw_flip_event(&mut events, 0xFEED_0000_0000_0042, 9, ticket)
+        .is_err()
+    {
+        return TestResult::Fail("hardware flip event not queued");
+    }
+    let mut buf = [0u8; 32];
+    if events.has_deliverable_event(u64::MAX)
+        || events.read_deliverable_event(u64::MAX, &mut buf).is_some()
+    {
+        return TestResult::Fail("event readable before its flip");
+    }
+    let now = narf_time::wall::monotonic_ns();
+    if events.next_event_deadline_ns(now).is_none_or(|d| d <= now) {
+        return TestResult::Fail("pending flip gave a poller no future deadline");
+    }
+    FLIPS.lock().complete(
+        ticket,
+        FlipStamp {
+            ns: 5_000_123_456,
+            sequence: 0x0100_0007,
+        },
+    );
+    if !events.has_deliverable_event(0) {
+        return TestResult::Fail("completed flip's event not readable");
+    }
+    if events.read_deliverable_event(0, &mut buf) != Some(32) {
+        return TestResult::Fail("event not read whole");
+    }
+    let rd32 = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
+    if rd32(0) != 2 || rd32(4) != 32 || buf[8..16] != 0xFEED_0000_0000_0042u64.to_le_bytes() {
+        return TestResult::Fail("event header or user_data wrong");
+    }
+    if rd32(16) != 5 || rd32(20) != 123 || rd32(24) != 0x0100_0007 || rd32(28) != 9 {
+        return TestResult::Fail("event not stamped with the flip");
+    }
+    if events.ensure_flip_event_space(128).is_err() {
+        return TestResult::Fail("event space not returned");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/drm", smoke_drm_hw_flip_event_waits_for_flip);
+
 /// The flip event as a COMPOSITOR sees it: through `poll`/`read` on the
 /// card node, not by reaching into `Card::events`.
 ///

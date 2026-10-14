@@ -3653,8 +3653,26 @@ fn handle_atomic(
                 at
             }
             let mut presented: alloc::vec::Vec<(u32, u64)> = alloc::vec::Vec::new();
+            // The CRTC whose plane's dumb buffer goes through a hardware flip:
+            // its event waits for that flip.
+            let hardware_crtc = active_plane
+                .filter(|_| hardware_flips(card_index))
+                .and_then(|(crtc_id, fb_id)| {
+                    let gem_handle = card.framebuffer(fb_id).ok()?.gem_handle;
+                    (card.virtgpu_import(gem_handle).is_none()
+                        && card.dumb_backing(gem_handle).is_some())
+                    .then_some(crtc_id)
+                });
+            let mut flip_ticket = None;
             if let (Some(queue), Some(crtc_ids)) = (event_queue.as_mut(), event_crtc_ids) {
                 for crtc_id in crtc_ids {
+                    if Some(crtc_id) == hardware_crtc {
+                        let ticket = crate::drm::card::FLIPS.lock().reserve();
+                        card.queue_hw_flip_event(queue, req.user_data, crtc_id, ticket)
+                            .map_err(|_| FsError::OutOfMemory)?;
+                        flip_ticket = Some(ticket);
+                        continue;
+                    }
                     let at = present_at_for(&mut card, &mut presented, crtc_id);
                     card.queue_flip_event_at(queue, req.user_data, crtc_id, at)
                         .map_err(|_| FsError::OutOfMemory)?;
@@ -3682,6 +3700,7 @@ fn handle_atomic(
                     fb.width,
                     fb.height,
                     fb_id,
+                    flip_ticket,
                 ))
             })
         }
@@ -3698,11 +3717,11 @@ fn handle_atomic(
             presentation.is_some(),
         );
     }
-    if let Some((resource, src_phys, pitch, width, height, fb_id)) = presentation {
+    if let Some((resource, src_phys, pitch, width, height, fb_id, flip_ticket)) = presentation {
         if let Some(resource) = resource {
             present_virgl_frame(&resource, width, height)?;
         } else if let Some(src_phys) = src_phys {
-            present_frame(card_index, src_phys, pitch, width, height);
+            present_frame(card_index, src_phys, pitch, width, height, flip_ticket);
         } else {
             note_missing_backing("ATOMIC", fb_id);
         }
@@ -4093,7 +4112,7 @@ fn handle_setcrtc(
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
-        present_frame(card_index, src, src_pitch, src_w, src_h);
+        present_frame(card_index, src, src_pitch, src_w, src_h, None);
     } else {
         note_missing_backing("SETCRTC", req.fb_id);
     }
@@ -4151,6 +4170,7 @@ fn handle_page_flip(
     let src_pitch: u32;
     let src_w: u32;
     let src_h: u32;
+    let mut flip_ticket = None;
     {
         let mut card = mode_state.lock();
         // Linux resolves an unknown CRTC/fb as ENOENT and refuses a flip from
@@ -4192,10 +4212,18 @@ fn handle_page_flip(
             .primary_fb = Some(req.fb_id);
 
         if let Some(queue) = event_queue.as_mut() {
-            // The blit is synchronous; completion is then exposed at the
-            // simulated-vblank deadline recorded by queue_flip_event.
-            card.queue_flip_event(queue, req.user_data, req.crtc_id)
-                .map_err(|_| FsError::OutOfMemory)?;
+            if virgl_resource.is_none() && src_phys.is_some() && hardware_flips(card_index) {
+                // The event waits for the hardware flip of this frame.
+                let ticket = crate::drm::card::FLIPS.lock().reserve();
+                card.queue_hw_flip_event(queue, req.user_data, req.crtc_id, ticket)
+                    .map_err(|_| FsError::OutOfMemory)?;
+                flip_ticket = Some(ticket);
+            } else {
+                // The blit is synchronous; completion is then exposed at the
+                // simulated-vblank deadline recorded by queue_flip_event.
+                card.queue_flip_event(queue, req.user_data, req.crtc_id)
+                    .map_err(|_| FsError::OutOfMemory)?;
+            }
         }
     }
 
@@ -4216,7 +4244,7 @@ fn handle_page_flip(
     if let Some(resource) = virgl_resource {
         present_virgl_frame(&resource, src_w, src_h)?;
     } else if let Some(src) = src_phys {
-        present_frame(card_index, src, src_pitch, src_w, src_h);
+        present_frame(card_index, src, src_pitch, src_w, src_h, flip_ticket);
     } else {
         note_missing_backing("PAGE_FLIP", req.fb_id);
     }
@@ -4262,15 +4290,39 @@ fn present_virgl_frame(resource: &VirtGpuResource, width: u32, height: u32) -> R
 /// virtio card's pixels through the global fbdev hook would silently draw on
 /// bochs instead.  Select the owning card here so the primary DRM node and
 /// the visible scanout always agree.
-fn present_frame(card_index: u32, src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
+/// Whether `card_index` presents dumb-buffer frames through a hardware flip,
+/// so their flip-complete events wait for that flip (see `drm::card::FlipLog`).
+fn hardware_flips(card_index: u32) -> bool {
+    crate::drm_registry::driver_name(card_index) == Some("amdgpu")
+        && crate::amdgpu_navi48_platform::native_present_ready()
+}
+
+/// `flip_ticket` is the ticket of a flip-complete event waiting for this
+/// frame's hardware flip; it is completed whichever way the frame goes.
+fn present_frame(
+    card_index: u32,
+    src_phys: u64,
+    src_pitch: u32,
+    src_w: u32,
+    src_h: u32,
+    flip_ticket: Option<u64>,
+) {
     let driver = crate::drm_registry::driver_name(card_index);
     // The native amdgpu display presents tear-free through its back buffer
     // and a VUPDATE-latched flip instead of copying onto the visible front.
-    if driver == Some("amdgpu")
-        && crate::amdgpu_navi48_platform::present_frame(src_phys, src_pitch, src_w, src_h)
-    {
-        narf_console::fb_take_for_user();
-        return;
+    if driver == Some("amdgpu") {
+        // A refused frame completes its ticket at once.
+        let native = crate::amdgpu_navi48_platform::present_frame(
+            src_phys,
+            src_pitch,
+            src_w,
+            src_h,
+            flip_ticket,
+        );
+        if native {
+            narf_console::fb_take_for_user();
+            return;
+        }
     }
     if driver == Some("virtio_gpu") {
         blit_to_virtio_scanout(src_phys, src_pitch, src_w, src_h);
