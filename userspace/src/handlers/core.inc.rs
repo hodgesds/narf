@@ -13363,11 +13363,22 @@ pub fn deliver_pending_stop(ctx: &mut dyn TrapContext, _syscall_no: u32) -> bool
 /// pushes the encoded status into PENDING_EXITS so wait4 sees
 /// `WIFSIGNALED + WTERMSIG(signum)`.
 ///
-/// Absent entry → on_child_exit records `0` (normal exit), which is
-/// what sys_exit_task callers want today (exit-code threading is a
-/// separate follow-on).
-static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Absent entry → on_child_exit records `0` (normal exit).
+///
+/// Each entry also records whether it is a GROUP status. Linux
+/// `wait_task_zombie` reports `signal->group_exit_code` once the group exited
+/// as a whole (`SIGNAL_GROUP_EXIT`: exit_group, a fatal signal) and otherwise
+/// the leader's own `exit_code`; a non-leader thread's exit(2) code is never
+/// reported.
+static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, PendingTermination>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+#[derive(Clone, Copy)]
+struct PendingTermination {
+    status: i32,
+    group: bool,
+}
 
 pub fn wait_init() {
     // Once per boot: wait_init runs again on every test reset, and the pump
@@ -13527,12 +13538,13 @@ pub fn encode_signaled_status(signum: u32, core_dumped: bool) -> i32 {
     lo | core
 }
 
-/// Stage a signal-induced termination status for `task`. The exit
-/// observer drains this when the task transitions to Exited and
-/// uses it as the wstatus reported to wait4. Idempotent: if a
-/// status is already staged (e.g. SIGSEGV racing SIGTERM), the
-/// first one wins — that's the signal that actually killed the
-/// task.
+/// Stage the GROUP termination status for process `task` (exit_group, a
+/// fatal signal, a scheduler kill) — Linux `do_group_exit`'s
+/// `group_exit_code`. The exit observer drains it when the last thread exits
+/// and reports it to wait4. The first group exit wins (SIGSEGV racing
+/// SIGTERM: the signal that actually killed the task; a second exit_group
+/// while one is in flight reuses the first code), and it replaces any status
+/// a thread's plain exit(2) staged earlier.
 pub fn stage_pending_termination(task: u64, status: i32) {
     // A CLONE_VFORK child that exits WITHOUT exec'ing (e.g. posix_spawn's child
     // _exit on exec failure, or a kill) must still release the parent suspended
@@ -13543,13 +13555,34 @@ pub fn stage_pending_termination(task: u64, status: i32) {
     vfork_child_release(task);
     let mut g = PENDING_TERMINATION.lock();
     if let Some(m) = g.as_mut() {
-        m.entry(task).or_insert(status);
+        let slot = m.entry(task).or_insert(PendingTermination { status, group: true });
+        if !slot.group {
+            *slot = PendingTermination { status, group: true };
+        }
+    }
+}
+
+/// Stage a thread's plain exit(2) code for process `pid`. Only the group
+/// leader's code can become the process status (`wait_task_zombie` reads the
+/// leader's `exit_code` when no group exit happened), and never over a group
+/// status. Recording every thread's code — first one wins — reported a
+/// worker thread's `exit(0)` as the status of a process that then called
+/// `_exit(1)`.
+pub(crate) fn stage_thread_exit_termination(pid: u64, tid: u64, status: i32) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    vfork_child_release(pid);
+    if pid_to_task_raw(pid).is_some_and(|leader| leader != tid) {
+        return;
+    }
+    let mut g = PENDING_TERMINATION.lock();
+    if let Some(m) = g.as_mut() {
+        m.entry(pid).or_insert(PendingTermination { status, group: false });
     }
 }
 
 fn take_pending_termination(task: u64) -> Option<i32> {
     let mut g = PENDING_TERMINATION.lock();
-    g.as_mut().and_then(|m| m.remove(&task))
+    g.as_mut().and_then(|m| m.remove(&task)).map(|t| t.status)
 }
 
 /// Stage a SIGKILL wstatus for a task the SCHEDULER destroyed without

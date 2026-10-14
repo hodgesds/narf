@@ -548,8 +548,62 @@ static int run(const char *name, int (*fn)(void)) {
     return 1;
 }
 
+static void *exit_zero(void *arg) {
+    (void)arg;
+    return NULL;
+}
+
+// A thread's own exit code is not the process's status: once a worker has
+// exited 0, the process's _exit(3) (exit_group) must still report 3, and a
+// leader that pthread_exit()s leaves the group exit code to whoever calls
+// exit_group later (Linux wait_task_zombie: group_exit_code, else the
+// leader's exit_code).
+static int exit_status_check(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        pthread_t t;
+        pthread_create(&t, NULL, exit_zero, NULL);
+        pthread_join(t, NULL);
+        _exit(3);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 3) {
+        cur_case = "exit-status";
+        char buf[64];
+        snprintf(buf, sizeof buf, "worker exit then _exit(3) reported status %#x", status);
+        return fail(buf);
+    }
+    return 0;
+}
+
+static void *exit_five_later(void *arg) {
+    (void)arg;
+    usleep(20000);
+    _exit(5);
+}
+
+static int exit_status_leader_first(void) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        pthread_t t;
+        pthread_create(&t, NULL, exit_five_later, NULL);
+        pthread_exit(NULL);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 5) {
+        cur_case = "exit-status-leader-first";
+        char buf[64];
+        snprintf(buf, sizeof buf, "leader pthread_exit then _exit(5) reported %#x", status);
+        return fail(buf);
+    }
+    return 0;
+}
+
 int main(void) {
     int failed = 0;
+    // The harness below trusts each case's exit status; check that first.
+    failed |= exit_status_check();
+    failed |= exit_status_leader_first();
     failed |= run("sigchld-worker-fork", case_sigchld_worker_fork);
     failed |= run("kill-from-worker", case_kill_from_worker);
     failed |= run("main-blocks", case_main_blocks);

@@ -20,7 +20,7 @@ pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
             wstatus
         );
     }
-    stage_pending_termination(pid, wstatus as i32);
+    stage_thread_exit_termination(pid, tid, wstatus as i32);
     // Robust-futex owner-died walk — in-task context, before teardown
     // (see terminate_current_task).
     robust_list_exit_walk(tid);

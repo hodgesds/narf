@@ -28,6 +28,9 @@ pub(crate) fn sys_exit_group(ctx: &mut dyn TrapContext) {
             );
         }
     }
+    // `do_group_exit`: the group exit code is fixed before the siblings are
+    // zapped, so it is what wait4 reports however the threads die.
+    stage_pending_termination(pid, ((ctx.args().arg0 as u32 & 0xff) << 8) as i32);
     zap_thread_group(tid, pid);
     sys_exit_task(ctx);
 }
