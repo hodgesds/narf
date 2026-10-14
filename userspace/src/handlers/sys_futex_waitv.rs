@@ -104,50 +104,68 @@ pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // Only now look at the words themselves. `get_futex_key` rejects a
-    // skewed address with -EINVAL before anything is read.
+    // `futex_wait_multiple_setup`: key EVERY entry, in order, before any
+    // word is read — a skewed entry is -EINVAL and an inaccessible one
+    // -EFAULT (`get_futex_key`), and the first failing entry decides. Each
+    // entry carries its own flags, so each has its own natural alignment:
+    // a FUTEX2_NUMA entry is a value+node pair and must be 8-byte aligned.
+    let mut words = alloc::vec::Vec::with_capacity(entries.len());
     for e in &entries {
-        // Each entry carries its own flags, so each has its own natural
-        // alignment: a FUTEX2_NUMA entry is a value+node pair and must be
-        // 8-byte aligned.
-        if e.uaddr % futex2_word_span(e.flags) != 0 {
-            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-            return;
-        }
-    }
-    for (i, e) in entries.iter().enumerate() {
-        let Some(current) = futex_read_user_word(e.uaddr) else {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-            return;
+        let key = match get_futex_key_flags(e.flags & FUTEX_PRIVATE != 0, e.uaddr, e.flags) {
+            Ok(k) => k,
+            Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                return;
+            }
         };
-        if current as u64 != e.val {
-            // This word already moved — report it as the woken futex.
-            ctx.set_return(SyscallReturn::ok(i as u64));
-            return;
+        // "futex_wait_multiple_setup queues every entry with
+        // FUTEX_BITSET_MATCH_ANY".
+        words.push(FutexWaitWord {
+            key,
+            uaddr: e.uaddr,
+            val: e.val as u32,
+            bitset: FUTEX_BITSET_MATCH_ANY,
+        });
+    }
+    // `futex_wait_multiple`: queue on EVERY word and return the index of
+    // the one a wake dequeued. A word that already moved is -EAGAIN
+    // (`futex_wait_multiple_setup` → -EWOULDBLOCK), not "woken" — unless an
+    // entry queued before it was woken meanwhile, whose index then wins.
+    // A deadline is -ETIMEDOUT from the wait itself; a signal is
+    // -ERESTARTSYS, timed or not (no restart_block here).
+    match futex_block(ctx, &words, deadline) {
+        FutexBlock::Woken(idx) => ctx.set_return(SyscallReturn::ok(idx as u64)),
+        FutexBlock::Errno(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
+        FutexBlock::Interrupted => {
+            futex_wait_restart(ctx, crate::user_task::SYSCALL_RESTART_SYS)
+        }
+        FutexBlock::NoExecutor => {
+            // The legacy re-check park can follow only one word: every word
+            // is re-validated (-EAGAIN on a moved one) and the park on the
+            // first resumes as a spurious wake of index 0, which the
+            // caller's futex loop re-checks.
+            for w in &words {
+                match futex_read_user_word(w.uaddr) {
+                    None => {
+                        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                        return;
+                    }
+                    Some(v) if v != w.val => {
+                        ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
+                        return;
+                    }
+                    Some(_) => {}
+                }
+            }
+            let first = &words[0];
+            futex_wait_legacy(
+                ctx,
+                first.uaddr,
+                first.key,
+                first.val,
+                deadline,
+                first.bitset,
+            );
         }
     }
-    // Every word still matches: park on the first word (bounded, like
-    // futex_wait), then resume as a spurious wake of index 0 (the caller
-    // re-checks all of them).
-    let first = &entries[0];
-    let now = narf_scheduler::narf_time::monotonic_ns();
-    let park_cap = match deadline {
-        Some(d) if d <= now => {
-            ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
-            return;
-        }
-        // Never park past the caller's deadline; see `sys_futex_wait.rs`.
-        Some(d) => (d - now).min(FUTEX2_PARK_CAP_NS),
-        None => FUTEX2_PARK_CAP_NS,
-    };
-    // `futex_wait_multiple_setup` queues every entry with
-    // `FUTEX_BITSET_MATCH_ANY`.
-    futex_wait_core(
-        ctx,
-        first.uaddr,
-        first.val as u32,
-        park_cap,
-        first.flags,
-        FUTEX_BITSET_MATCH_ANY,
-    );
 }

@@ -2507,6 +2507,15 @@ pub(crate) fn abort_restart_pending_park_state(task: u64) {
             (*uctx)
                 .syscall_parked_restarting
                 .store(false, core::sync::atomic::Ordering::Release);
+            (*uctx).syscall_restart_kind.store(
+                crate::user_task::SYSCALL_RESTART_SYS,
+                core::sync::atomic::Ordering::Release,
+            );
+            // A timed FUTEX_WAIT completed as -EINTR: its restart_block
+            // (`futex_wait_restart`) will never run.
+            (*uctx)
+                .futex_restart_uaddr
+                .store(0, core::sync::atomic::Ordering::Release);
             (*uctx)
                 .fifo_open_pending_fd
                 .swap(0, core::sync::atomic::Ordering::AcqRel)
@@ -13860,6 +13869,12 @@ pub(crate) fn own_stack_block(ctx: &mut dyn TrapContext) {
             (*uctx)
                 .syscall_parked_restarting
                 .store(true, core::sync::atomic::Ordering::Release);
+            // A fresh park is `-ERESTARTSYS` until its handler says
+            // otherwise (after this returns), so no kind outlives one park.
+            (*uctx).syscall_restart_kind.store(
+                crate::user_task::SYSCALL_RESTART_SYS,
+                core::sync::atomic::Ordering::Release,
+            );
             (*uctx)
                 .wait_child_pending
                 .load(core::sync::atomic::Ordering::Acquire)

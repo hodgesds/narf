@@ -9636,7 +9636,7 @@ pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
 /// This exists to make one class of bug unrepresentable rather than merely
 /// tested-against. Every futex entry point used to validate its own
 /// address, and three of them independently grew a "null address is fine"
-/// shortcut — the classic FUTEX_WAIT arm, the shared `futex_wait_core`
+/// shortcut — the classic FUTEX_WAIT arm, the shared `futex_block`
 /// that the FUTEX2 path uses, and `futex_wake`'s zero-count arm. Each had
 /// its own justification, and fixing one left the others, because nothing
 /// connected them.
@@ -10074,7 +10074,44 @@ pub fn __test_futex_bump_counter(uaddr: u64) {
 /// loop otherwise re-parks every ~1ms (no early wake), so a contended pthread
 /// lock handoff cost ~1ms. Keyed by task id so a re-registering waiter
 /// overwrites its own slot (bounded) and `futex_drop_waiter` can remove it.
-type FutexWaiterSet = alloc::collections::BTreeMap<u64, FutexWaiter>;
+///
+/// The map key is `(task id, slot)`. Slot [`FUTEX_PARK_SLOT`] (0) is the one
+/// entry the park loop maintains for the re-execute parks (FUTEX_LOCK_PI and
+/// the legacy longjmp model); slots `1..` are the handler-driven waits of
+/// [`futex_block`], one per `futex_waitv` entry (`i + 1`), whose queue state
+/// a [`FutexQ`] tracks.
+type FutexWaiterSet = alloc::collections::BTreeMap<(u64, u32), FutexWaiter>;
+
+/// The waiter slot the park loop's re-execute futex park registers under.
+const FUTEX_PARK_SLOT: u32 = 0;
+
+/// Linux `struct futex_q` for one handler-driven wait (`futex_block`): where
+/// each of the task's queue entries currently sits. Entry `i` is queued as
+/// `(tid, i + 1)` under `keys[i]`.
+///
+/// `keys[i]` is written only while holding the bucket locks of both the key
+/// the entry is LEAVING and the one it is entering (`futex_requeue` moving
+/// it), so a reader that takes the bucket lock of the key it read and then
+/// re-reads the key has a stable view: `futex_unqueue`'s `lock_ptr` re-check.
+/// Shared with the queue entries (`Arc`), so a queue entry can never outlive
+/// the state a requeue writes through.
+pub struct FutexQ {
+    keys: alloc::vec::Vec<narf_lib::sync::IrqSafeSpinLock<FutexKey>>,
+}
+
+impl core::fmt::Debug for FutexQ {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FutexQ")
+            .field("entries", &self.keys.len())
+            .finish()
+    }
+}
+
+impl FutexQ {
+    fn key(&self, idx: usize) -> FutexKey {
+        *self.keys[idx].lock()
+    }
+}
 
 /// `FUTEX_BITSET_MATCH_ANY` — the bitset of every plain FUTEX_WAIT/WAKE.
 pub(crate) const FUTEX_BITSET_MATCH_ANY: u32 = 0xffff_ffff;
@@ -10085,6 +10122,9 @@ struct FutexWaiter {
     /// `futex_wake` takes this waiter only when `bitset & wake_bitset != 0`
     /// (`kernel/futex/waitwake.c`); requeue and wake_op ignore it.
     bitset: u32,
+    /// The handler-driven wait this entry belongs to (`None` for the park
+    /// loop's [`FUTEX_PARK_SLOT`] entry). A requeue updates its key here.
+    q: Option<alloc::sync::Arc<FutexQ>>,
 }
 type FutexWaiterMap = alloc::collections::BTreeMap<FutexKey, FutexWaiterSet>;
 
@@ -10117,7 +10157,24 @@ fn futex_drop_task_waiters(task_id: u64) {
     // registration this task can own sits under its CURRENT park key. The
     // old shape swept all 256 bucket locks per task exit; a 1000-thread
     // exit storm hammered those global locks from every CPU at once.
-    let key = crate::user_task::with_user_task_ctx(task_id, futex_park_key);
+    let key = crate::user_task::with_user_task_ctx(task_id, |uc| {
+        (
+            futex_park_key(uc),
+            uc.futex_block_active.load(Ordering::Acquire),
+        )
+    });
+    // A task torn down while queued by `futex_block` (its own handler never
+    // got to unqueue): its entries can sit under any key a requeue moved
+    // them to, so sweep them all.
+    if matches!(key, Some((_, true))) {
+        for bucket in &FUTEX_WAITERS {
+            bucket.values.lock().retain(|_, waiters| {
+                waiters.retain(|&(tid, slot), _| tid != task_id || slot == FUTEX_PARK_SLOT);
+                !waiters.is_empty()
+            });
+        }
+    }
+    let key = key.map(|(k, _)| k);
     match key {
         Some(Some(key)) => futex_drop_waiter_key(key, task_id),
         // Not parked: nothing registered, nothing to sweep.
@@ -10126,7 +10183,7 @@ fn futex_drop_task_waiters(task_id: u64) {
         None => {
             for bucket in &FUTEX_WAITERS {
                 bucket.values.lock().retain(|_, waiters| {
-                    waiters.remove(&task_id);
+                    waiters.retain(|&(tid, _), _| tid != task_id);
                     !waiters.is_empty()
                 });
             }
@@ -10140,7 +10197,7 @@ fn futex_has_task_waiter(task_id: u64) -> bool {
             .values
             .lock()
             .values()
-            .any(|waiters| waiters.contains_key(&task_id))
+            .any(|waiters| waiters.keys().any(|&(tid, _)| tid == task_id))
     })
 }
 
@@ -10166,7 +10223,14 @@ pub(crate) fn futex_register_waiter_key_bitset(
         .lock()
         .entry(key)
         .or_default()
-        .insert(task_id, FutexWaiter { waker, bitset });
+        .insert(
+            (task_id, FUTEX_PARK_SLOT),
+            FutexWaiter {
+                waker,
+                bitset,
+                q: None,
+            },
+        );
 }
 
 /// Remove `task_id`'s futex waker on `uaddr` without firing it (the task
@@ -10178,7 +10242,7 @@ pub fn futex_drop_waiter(uaddr: u64, task_id: u64) {
 pub(crate) fn futex_drop_waiter_key(key: FutexKey, task_id: u64) {
     let mut values = futex_wait_bucket(key).values.lock();
     if let Some(set) = values.get_mut(&key) {
-        set.remove(&task_id);
+        set.remove(&(task_id, FUTEX_PARK_SLOT));
         if set.is_empty() {
             values.remove(&key);
         }
@@ -10221,11 +10285,13 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
         let waiter = {
             let mut values = futex_wait_bucket(key).values.lock();
             let waiter = values.get_mut(&key).and_then(|set| {
-                let tid = set
+                let slot = set
                     .iter()
                     .find(|(_, w)| w.bitset & bitset != 0)
-                    .map(|(tid, _)| *tid)?;
-                set.remove(&tid).map(|w| (tid, w.waker))
+                    .map(|(slot, _)| *slot)?;
+                // Removal IS the wake for a `futex_block` waiter: its
+                // `futex_unqueue` then finds the entry gone (woken).
+                set.remove(&slot).map(|w| (slot.0, w.waker))
             });
             if values.get(&key).is_some_and(|set| set.is_empty()) {
                 values.remove(&key);
@@ -10246,16 +10312,16 @@ pub(crate) fn futex_wake_waiters_key_bitset(key: FutexKey, n: u32, bitset: u32) 
         };
         // BTreeMap has no pop; collect the first `n` matching keys then
         // remove them.
-        let take: alloc::vec::Vec<u64> = set
+        let take: alloc::vec::Vec<(u64, u32)> = set
             .iter()
             .filter(|(_, w)| w.bitset & bitset != 0)
-            .map(|(tid, _)| *tid)
+            .map(|(slot, _)| *slot)
             .take(n as usize)
             .collect();
         let mut out = alloc::vec::Vec::with_capacity(take.len());
-        for tid in take {
-            if let Some(w) = set.remove(&tid) {
-                out.push((tid, w.waker));
+        for slot in take {
+            if let Some(w) = set.remove(&slot) {
+                out.push((slot.0, w.waker));
             }
         }
         if set.is_empty() {
@@ -10292,8 +10358,8 @@ pub(crate) fn futex_wake_one_key_spread(key: FutexKey) -> usize {
     let waiter = {
         let mut values = futex_wait_bucket(key).values.lock();
         let waiter = values.get_mut(&key).and_then(|set| {
-            let tid = set.keys().next().copied()?;
-            set.remove(&tid).map(|w| (tid, w.waker))
+            let slot = set.keys().next().copied()?;
+            set.remove(&slot).map(|w| (slot.0, w.waker))
         });
         if values.get(&key).is_some_and(|set| set.is_empty()) {
             values.remove(&key);
@@ -10346,15 +10412,15 @@ fn futex_take_waiters(
     values: &mut FutexWaiterMap,
     key: FutexKey,
     n: u32,
-) -> alloc::vec::Vec<(u64, FutexWaiter)> {
+) -> alloc::vec::Vec<((u64, u32), FutexWaiter)> {
     let Some(set) = values.get_mut(&key) else {
         return alloc::vec::Vec::new();
     };
-    let take: alloc::vec::Vec<u64> = set.keys().take(n as usize).copied().collect();
+    let take: alloc::vec::Vec<(u64, u32)> = set.keys().take(n as usize).copied().collect();
     let mut movers = alloc::vec::Vec::with_capacity(take.len());
-    for tid in take {
-        if let Some(waker) = set.remove(&tid) {
-            movers.push((tid, waker));
+    for slot in take {
+        if let Some(waker) = set.remove(&slot) {
+            movers.push((slot, waker));
         }
     }
     if set.is_empty() {
@@ -10363,22 +10429,34 @@ fn futex_take_waiters(
     movers
 }
 
+/// Insert requeue `movers` under `key`. Returns `(moved, retarget)`: the
+/// number moved, and the park-loop movers whose park state must be
+/// retargeted outside the bucket locks. A `futex_block` mover's [`FutexQ`]
+/// is retargeted HERE, under the locks of both keys, which is what keeps
+/// its `futex_unqueue` from ever looking under a key it already left.
 fn futex_insert_waiters(
     values: &mut FutexWaiterMap,
     key: FutexKey,
-    movers: alloc::vec::Vec<(u64, FutexWaiter)>,
-) -> alloc::vec::Vec<u64> {
-    let mut tids = alloc::vec::Vec::with_capacity(movers.len());
-    let dst = values.entry(key).or_default();
-    for (tid, waiter) in movers {
-        // `requeue_futex` moves the futex_q, bitset and all.
-        dst.insert(tid, waiter);
-        tids.push(tid);
+    movers: alloc::vec::Vec<((u64, u32), FutexWaiter)>,
+) -> (usize, alloc::vec::Vec<u64>) {
+    let moved = movers.len();
+    if moved == 0 {
+        return (0, alloc::vec::Vec::new());
     }
-    tids
+    let mut retarget = alloc::vec::Vec::with_capacity(movers.len());
+    let dst = values.entry(key).or_default();
+    for (slot, waiter) in movers {
+        // `requeue_futex` moves the futex_q, bitset and all.
+        match &waiter.q {
+            Some(q) => *q.keys[(slot.1 - 1) as usize].lock() = key,
+            None => retarget.push(slot.0),
+        }
+        dst.insert(slot, waiter);
+    }
+    (moved, retarget)
 }
 
-fn futex_requeue_waiters_keyed(
+pub(crate) fn futex_requeue_waiters_keyed(
     key: FutexKey,
     key2: FutexKey,
     uaddr2: u64,
@@ -10397,7 +10475,7 @@ fn futex_requeue_waiters_keyed(
     let gen2 = futex_wake_counter_key(key2);
     let source_bucket = futex_bucket_index(key);
     let destination_bucket = futex_bucket_index(key2);
-    let moved: alloc::vec::Vec<u64> = if source_bucket == destination_bucket {
+    let (moved, retarget): (usize, alloc::vec::Vec<u64>) = if source_bucket == destination_bucket {
         let mut values = FUTEX_WAITERS[source_bucket].values.lock();
         let movers = futex_take_waiters(&mut values, key, n_move);
         futex_insert_waiters(&mut values, key2, movers)
@@ -10425,7 +10503,7 @@ fn futex_requeue_waiters_keyed(
     // from strand to backstop instead of chaining wakes). The park loop
     // re-validates the sequence after registering and turns any movement
     // into a spurious return; musl re-checks the word in userspace.
-    for tid in &moved {
+    for tid in &retarget {
         crate::user_task::with_user_task_ctx(*tid, |uc| {
             uc.futex_park_seq.fetch_add(1, Ordering::AcqRel);
             uc.futex_park_gen.store(gen2, Ordering::Release);
@@ -10444,7 +10522,7 @@ fn futex_requeue_waiters_keyed(
             uc.futex_park_seq.fetch_add(1, Ordering::Release);
         });
     }
-    (woken, moved.len())
+    (woken, moved)
 }
 
 /// Read the 4-byte futex word at user address `uaddr` in the CURRENT
@@ -10652,7 +10730,7 @@ pub fn dbg_futex_waiter_registered(namespace: u64, uaddr: u64, tid: u64) -> bool
         .values
         .lock()
         .get(&key)
-        .map(|set| set.contains_key(&tid))
+        .map(|set| set.keys().any(|&(t, _)| t == tid))
         .unwrap_or(false)
 }
 
@@ -10681,76 +10759,329 @@ pub fn futex_wake_waiters_for_test(uaddr: u64, n: u32) -> usize {
     futex_wake_waiters(uaddr, n)
 }
 
-/// Shared FUTEX_WAIT core for both the classic `futex(2)` FUTEX_WAIT op
-/// and the futex2 `futex_wait(2)` syscall. Implements the same real
-/// cooperative wait NARF's pthreads already rely on:
+/// One futex word of a [`futex_block`] wait: its key, its user address,
+/// the value the caller expects there, and the waiter's bitset.
+pub(crate) struct FutexWaitWord {
+    pub(crate) key: FutexKey,
+    pub(crate) uaddr: u64,
+    pub(crate) val: u32,
+    pub(crate) bitset: u32,
+}
+
+/// How a [`futex_block`] wait ended.
+pub(crate) enum FutexBlock {
+    /// A wake dequeued entry `i` — the highest such index, as
+    /// `futex_unqueue_multiple` reports it. A plain wait returns 0.
+    Woken(usize),
+    /// The wait did not happen or ran out: `EAGAIN` (a word moved before it
+    /// could be queued), `EFAULT`, or `ETIMEDOUT` (the deadline passed with
+    /// no wake). Positive errno.
+    Errno(i64),
+    /// A signal is pending (`-ERESTARTSYS` in `__futex_wait`). The caller
+    /// picks the restart semantics and rewinds via [`futex_wait_restart`].
+    Interrupted,
+    /// No own-stack executor to park on (the in-kernel test harness, or the
+    /// legacy longjmp model): the caller falls back to its re-check park.
+    NoExecutor,
+}
+
+/// Linux `futex_queue`: queue entry `idx` of `q` under `key` as
+/// `(tid, idx + 1)`.
+fn futex_queue(
+    key: FutexKey,
+    tid: u64,
+    idx: usize,
+    waker: core::task::Waker,
+    bitset: u32,
+    q: &alloc::sync::Arc<FutexQ>,
+) {
+    futex_wait_bucket(key)
+        .values
+        .lock()
+        .entry(key)
+        .or_default()
+        .insert(
+            (tid, idx as u32 + 1),
+            FutexWaiter {
+                waker,
+                bitset,
+                q: Some(q.clone()),
+            },
+        );
+}
+
+/// Linux `futex_unqueue`: remove entry `idx` of `q`. Returns `true` when the
+/// entry was still queued (so nobody woke it) and `false` when a wake had
+/// already dequeued it — the waker removes the entry under the same bucket
+/// lock, so "absent" is exactly "woken". A requeue may move the entry while
+/// we look for it; it writes `q.keys[idx]` under the locks of both keys, so
+/// the key re-read under the bucket lock either confirms the bucket or sends
+/// us after the entry (the `lock_ptr` retry in Linux).
+fn futex_unqueue(q: &FutexQ, idx: usize, tid: u64) -> bool {
+    let slot = (tid, idx as u32 + 1);
+    loop {
+        let key = q.key(idx);
+        let mut values = futex_wait_bucket(key).values.lock();
+        if q.key(idx) != key {
+            continue;
+        }
+        let Some(set) = values.get_mut(&key) else {
+            return false;
+        };
+        let queued = set.remove(&slot).is_some();
+        if set.is_empty() {
+            values.remove(&key);
+        }
+        return queued;
+    }
+}
+
+/// Test-only: a [`futex_block`] queue state over the mm-scoped (namespace 0)
+/// words `uaddrs`, so the kernel-test suite can drive `futex_queue` /
+/// `futex_unqueue` against real wakes and requeues without a user task.
+#[doc(hidden)]
+pub fn __test_futex_q_new(uaddrs: &[u64]) -> alloc::sync::Arc<FutexQ> {
+    alloc::sync::Arc::new(FutexQ {
+        keys: uaddrs
+            .iter()
+            .map(|&u| narf_lib::sync::IrqSafeSpinLock::new(futex_key(0, u)))
+            .collect(),
+    })
+}
+
+/// Test-only [`futex_queue`] of entry `idx` of `q` under its current key.
+#[doc(hidden)]
+pub fn __test_futex_q_queue(
+    q: &alloc::sync::Arc<FutexQ>,
+    idx: usize,
+    tid: u64,
+    waker: core::task::Waker,
+) {
+    futex_queue(q.key(idx), tid, idx, waker, FUTEX_BITSET_MATCH_ANY, q);
+}
+
+/// Test-only [`futex_unqueue_multiple`]: `Some(i)` = entry `i` was woken.
+#[doc(hidden)]
+pub fn __test_futex_q_unqueue(q: &FutexQ, n: usize, tid: u64) -> Option<usize> {
+    futex_unqueue_multiple(q, n, tid)
+}
+
+/// Test-only: does `q`'s entry `idx` now name the mm-scoped word `uaddr`?
+#[doc(hidden)]
+pub fn __test_futex_q_names(q: &FutexQ, idx: usize, uaddr: u64) -> bool {
+    q.key(idx) == futex_key(0, uaddr)
+}
+
+/// Linux `futex_unqueue_multiple`: unqueue entries `0..n`, returning the
+/// highest index a wake had already dequeued.
+fn futex_unqueue_multiple(q: &FutexQ, n: usize, tid: u64) -> Option<usize> {
+    let mut woken = None;
+    for idx in 0..n {
+        if !futex_unqueue(q, idx, tid) {
+            woken = Some(idx);
+        }
+    }
+    woken
+}
+
+/// The shared wait of FUTEX_WAIT / FUTEX_WAIT_BITSET, futex2 `futex_wait`
+/// and `futex_waitv`: Linux `__futex_wait` / `futex_wait_multiple`, driven
+/// from the syscall handler on the task's own kernel stack.
 ///
-///  - `*uaddr != val` ⇒ the wait condition no longer holds; return
-///    `-EAGAIN` (Linux's contract — the caller's fast path observes the
-///    change and proceeds without sleeping).
-///  - `*uaddr == val` ⇒ park the caller via a bounded yield back to the
-///    executor (the deadline branch of `UserTaskFuture::poll` keeps it
-///    off-CPU until the park expires or a wake bumps the per-uaddr
-///    counter), then resume with `0`. The libc-side recheck loop re-arms
-///    the wait until the condition is satisfied, so a `futex_wake` on the
-///    same word makes the waiter progress.
+///   setup     — for each word in order (`futex_wait_multiple_setup`): read
+///               it, `-EAGAIN` if it is not the expected value, queue it.
+///               A failure unqueues what was queued; if one of those had
+///               already been woken, that wake wins and its index returns.
+///   wait      — park until a wake, the deadline, or a signal. A deadline
+///               already passed does not park (`futex_do_wait` skips
+///               `schedule()`), but the setup above still ran first, so a
+///               moved word is `-EAGAIN`, never `-ETIMEDOUT`.
+///   unqueue   — woken ⇒ `Woken`, however the wait ended; else deadline
+///               passed ⇒ `ETIMEDOUT`; else a signal ⇒ `Interrupted`; else a
+///               spurious wakeup ⇒ the whole wait again from setup, exactly
+///               as `__futex_wait`'s `goto retry`.
 ///
-/// `uaddr == 0` is -EFAULT (`get_futex_key`'s access_ok arm). It used to
-/// be an immediate "POSIX-permitted spurious wake" so that wake-path
-/// smokes could run without a backing mapping — production behaviour bent
-/// to suit a fixture, which then pinned it in place.
-fn futex_wait_core(
+/// No bounded park and no "spurious 0": an untimed wait blocks until one of
+/// those three things happens, as on Linux.
+///
+/// Lost wakes. Linux makes `futex_wait_setup`'s read-and-queue atomic with
+/// the hash-bucket lock. Here the read cannot be under a spinlock (a user
+/// read may fault), so the per-key wake generation stands in for it:
+///
+///   waiter: g = gen(K); v = *uaddr; v == val ⇒ queue(K); gen(K) != g ⇒
+///           re-read *uaddr, and a moved word is a setup failure.
+///   waker:  *uaddr = new (userspace); bump gen(K); dequeue under the bucket
+///           lock; `wake_one` clears `sleep_deadline_ns` and fires the waker.
+///
+/// A waker whose dequeue runs after our queue (bucket-lock order) finds the
+/// entry. One whose dequeue ran before our queue bumped `gen(K)` before it,
+/// so our post-queue generation read (which follows our queue, which follows
+/// its dequeue) sees the bump — and its word store, which preceded the bump,
+/// is visible to the re-read: a changed word fails the setup, an unchanged
+/// one means the wake simply preceded our wait. `sleep_deadline_ns` is
+/// stored before the first queue, so the waker's clear always lands after it
+/// and a wake that beats the park makes the park loop return at once; one
+/// that lands after the park fires the parked task's own waker.
+pub(crate) fn futex_block(
+    ctx: &mut dyn TrapContext,
+    words: &[FutexWaitWord],
+    deadline: Option<u64>,
+) -> FutexBlock {
+    if !narf_scheduler::stackful::user_own_stack_enabled() {
+        return FutexBlock::NoExecutor;
+    }
+    let Some(uctx) = crate::user_task::current_user_task() else {
+        return FutexBlock::NoExecutor;
+    };
+    if narf_scheduler::stackful::current_stackful_waker().is_none() {
+        return FutexBlock::NoExecutor;
+    }
+    // SAFETY: the in-flight task's poller-pinned ctx, live for this trap.
+    let uc = unsafe { &*uctx };
+    let tid = current_task_id();
+    let q = alloc::sync::Arc::new(FutexQ {
+        keys: words
+            .iter()
+            .map(|w| narf_lib::sync::IrqSafeSpinLock::new(w.key))
+            .collect(),
+    });
+    let finish = |uc: &crate::user_task::UserTaskCtx| {
+        uc.sleep_deadline_ns.store(0, Ordering::Release);
+        uc.futex_block_active.store(false, Ordering::Release);
+    };
+    loop {
+        let Some(waker) = narf_scheduler::stackful::current_stackful_waker() else {
+            finish(uc);
+            return FutexBlock::NoExecutor;
+        };
+        // None of the park loop's own futex bookkeeping: this wait queues
+        // and unqueues its entries itself.
+        uc.futex_uaddr.store(0, Ordering::Release);
+        uc.futex_namespace.store(0, Ordering::Release);
+        // Before the first queue — see "Lost wakes" above.
+        uc.sleep_deadline_ns
+            .store(deadline.unwrap_or(u64::MAX), Ordering::Release);
+        uc.futex_block_active.store(true, Ordering::Release);
+        let mut queued = 0;
+        let mut setup_errno = 0;
+        for (idx, w) in words.iter().enumerate() {
+            // A requeue during an earlier pass may have moved this entry.
+            *q.keys[idx].lock() = w.key;
+            let Some((gen, current)) =
+                futex_wait_seqlock_read_key(w.key, || futex_read_user_word(w.uaddr))
+            else {
+                setup_errno = EFAULT;
+                break;
+            };
+            if current != w.val {
+                setup_errno = EAGAIN;
+                break;
+            }
+            futex_queue(w.key, tid, idx, waker.clone(), w.bitset, &q);
+            queued = idx + 1;
+            if futex_gen_key(w.key) != gen {
+                match futex_read_user_word(w.uaddr) {
+                    None => {
+                        setup_errno = EFAULT;
+                        break;
+                    }
+                    Some(v) if v != w.val => {
+                        setup_errno = EAGAIN;
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        if setup_errno != 0 {
+            let woken = futex_unqueue_multiple(&q, queued, tid);
+            finish(uc);
+            return woken.map_or(FutexBlock::Errno(setup_errno), FutexBlock::Woken);
+        }
+        let expired =
+            |d: Option<u64>| d.is_some_and(|d| narf_scheduler::narf_time::monotonic_ns() >= d);
+        if !expired(deadline) {
+            // SAFETY: uctx is live for the trap round-trip; the own-stack
+            // park returns here when the wait ends.
+            unsafe {
+                ctx.save_user_state(uc.state.get() as *mut u8);
+                *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+            }
+            own_stack_block(ctx);
+        }
+        let woken = futex_unqueue_multiple(&q, words.len(), tid);
+        finish(uc);
+        if let Some(idx) = woken {
+            return FutexBlock::Woken(idx);
+        }
+        if expired(deadline) {
+            return FutexBlock::Errno(ETIMEDOUT);
+        }
+        // `signal_pending(current)`. The raw pending set, not just the
+        // signals that need a handler or a default action: the park loop
+        // ends on any of them, and only the return to user consumes an
+        // ignored one, so re-parking would spin. Its restart is invisible.
+        if is_signal_pending(tid) {
+            return FutexBlock::Interrupted;
+        }
+        // Spurious wakeup: `goto retry`.
+    }
+}
+
+/// End a [`futex_block`] that reported [`FutexBlock::Interrupted`]: rewind
+/// the syscall so signal delivery sees a restart-pending frame, and record
+/// which Linux restart errno the wait stands for (`kind`, one of the
+/// `SYSCALL_RESTART_*` constants). With a handler, delivery then completes
+/// the syscall as -EINTR or keeps the rewind; with none, it re-executes.
+pub(crate) fn futex_wait_restart(ctx: &mut dyn TrapContext, kind: u32) {
+    #[cfg(target_arch = "x86_64")]
+    const SYSCALL_INSN_LEN: u64 = 2;
+    #[cfg(target_arch = "aarch64")]
+    const SYSCALL_INSN_LEN: u64 = 4;
+    ctx.set_rip(ctx.rip().wrapping_sub(SYSCALL_INSN_LEN));
+    if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: the in-flight task's poller-pinned ctx; atomic stores.
+        unsafe {
+            (*uctx)
+                .syscall_parked_restarting
+                .store(true, Ordering::Release);
+            (*uctx).syscall_restart_kind.store(kind, Ordering::Release);
+        }
+    }
+}
+
+/// The re-check park the futex waits fall back to when [`futex_block`] has
+/// no own-stack executor ([`FutexBlock::NoExecutor`]): the legacy longjmp
+/// model, whose resumed task cannot return into this handler. It publishes
+/// the word to the park loop (which re-registers it on every poll and
+/// re-validates the word) and resumes userspace with 0 when the park ends —
+/// a spurious wake the caller's futex loop re-checks. Without a yield hook
+/// (the in-kernel test harness) it is a synchronous 0.
+pub(crate) fn futex_wait_legacy(
     ctx: &mut dyn TrapContext,
     uaddr: u64,
+    key: FutexKey,
     val: u32,
-    park_cap_ns: u64,
-    flags: u64,
+    deadline: Option<u64>,
     bitset: u32,
 ) {
-    // The address is validated ONLY here, by the shared funnel. This helper
-    // used to carry its own `uaddr == 0` shortcut, so the FUTEX2 wait path
-    // kept reporting a spurious wake for a null word after the classic
-    // FUTEX_WAIT arm was corrected — the same bug in a second place, which
-    // is what a duplicated special case buys.
-    let key = match get_futex_key_flags(flags & FUTEX_PRIVATE != 0, uaddr, flags) {
-        Ok(k) => k,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
-            return;
-        }
-    };
     // Seqlock read: sample the wake generation BEFORE reading `*uaddr` (see
     // `futex_wait_seqlock_read` — sampling after the read loses a racing
     // FUTEX_WAKE and deadlocks a contended mutex/condvar under SMP).
-    let (gen, current) = match futex_wait_seqlock_read_key(key, || {
-        let mut buf4 = [0u8; 4];
-        // SAFETY: copy_from_user range-validates `uaddr` + SMAP-brackets the read.
-        if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
-            Some(u32::from_ne_bytes(buf4))
-        } else {
-            None
-        }
-    }) {
-        Some(x) => x,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-            return;
-        }
+    let Some((gen, current)) = futex_wait_seqlock_read_key(key, || futex_read_user_word(uaddr))
+    else {
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        return;
     };
     if current != val {
         ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
         return;
     }
-    // REAL blocking park, same wait queue + per-uaddr wake counter as the
-    // classic `sys_futex` FUTEX_WAIT (Linux futex2 and classic futex operate
-    // on the SAME words — a FUTEX_WAKE must wake either). Register happens in
-    // the poll routine; here we publish the uaddr + counter snapshot + an
-    // infinite (or timeout-bounded) deadline and yield.
-    let deadline = if park_cap_ns == 0 {
-        u64::MAX
-    } else {
-        narf_scheduler::narf_time::monotonic_ns().saturating_add(park_cap_ns)
-    };
+    let deadline = deadline.unwrap_or(u64::MAX);
+    if deadline <= narf_scheduler::narf_time::monotonic_ns() {
+        ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
+        return;
+    }
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
@@ -10760,7 +11091,8 @@ fn futex_wait_core(
         unsafe {
             let uc = &*uctx;
             uc.futex_park_gen.store(gen, Ordering::Release);
-            // Park-loop word re-validation snapshot (see sys_futex).
+            // Expected word value — the park loop re-validates the word
+            // against this on every re-check.
             uc.futex_val.store(val, Ordering::Release);
             futex_park_publish(uc, uaddr, key, bitset);
             uc.sleep_deadline_ns.store(deadline, Ordering::Release);
@@ -10778,17 +11110,33 @@ fn futex_wait_core(
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// Bounded cooperative-park cap for the futex2 wait ops. Unlike the classic
-/// `sys_futex` FUTEX_WAIT — whose no-timeout park is infinite (`u64::MAX`) and
-/// only ever resumed by a FUTEX_WAKE waker (matching Linux block-until-woken) —
-/// the futex2 `futex_wait`/`futex_waitv` are documented (and smoke-tested) to
-/// park via a *bounded* yield and resume with 0, letting the caller's recheck
-/// loop re-arm. Passing 0 here would map to an infinite deadline that the poll
-/// routine's one-tick fallback re-parks forever (never resuming to user mode),
-/// so a self-directed wait with no concurrent waker hangs. A finite cap makes
-/// the park expire → resume 0 (POSIX-permitted spurious wake); a real waker
-/// still fires promptly through the per-uaddr wait queue well before the cap.
-const FUTEX2_PARK_CAP_NS: u64 = 50_000_000; // 50 ms
+/// Single-word wait of FUTEX_WAIT / FUTEX_WAIT_BITSET / futex2 `futex_wait`:
+/// [`futex_block`] with the result written back. `Interrupted` is returned
+/// to the caller, which owns the restart decision; every other outcome is
+/// final and already set.
+pub(crate) fn futex_wait_one(
+    ctx: &mut dyn TrapContext,
+    uaddr: u64,
+    key: FutexKey,
+    val: u32,
+    deadline: Option<u64>,
+    bitset: u32,
+) -> bool {
+    let word = FutexWaitWord {
+        key,
+        uaddr,
+        val,
+        bitset,
+    };
+    match futex_block(ctx, core::slice::from_ref(&word), deadline) {
+        // "If we were woken (and unqueued), we succeeded, whatever."
+        FutexBlock::Woken(_) => ctx.set_return(SyscallReturn::ok(0)),
+        FutexBlock::Errno(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
+        FutexBlock::Interrupted => return true,
+        FutexBlock::NoExecutor => futex_wait_legacy(ctx, uaddr, key, val, deadline, bitset),
+    }
+    false
+}
 
 const SIG_BLOCK: u32 = 0;
 const SIG_UNBLOCK: u32 = 1;
@@ -11228,6 +11576,28 @@ fn default_signal_delivery_restricted_active(
         task, action, signum, syscall_no, si_code, si_addr, si_value, si_pid,
     );
     params.prerewound_syscall = prerewound;
+    if prerewound {
+        // The park's own restart errno refines the syscall-number table
+        // (`handle_signal`): -ERESTARTNOINTR restarts whatever the handler's
+        // SA_RESTART says, -ERESTART_RESTARTBLOCK never restarts across a
+        // handler. The arch frame writers restart a prerewound frame iff
+        // `SA_RESTART && restartable_syscall`, so express both that way.
+        let kind = crate::user_task::current_user_task().map_or(
+            crate::user_task::SYSCALL_RESTART_SYS,
+            // SAFETY: the in-flight task's poller-pinned ctx; atomic load.
+            |u| unsafe { (*u).syscall_restart_kind.load(Ordering::Acquire) },
+        );
+        match kind {
+            crate::user_task::SYSCALL_RESTART_NOINTR => {
+                params.flags |= SA_RESTART;
+                params.restartable_syscall = true;
+            }
+            crate::user_task::SYSCALL_RESTART_RESTARTBLOCK => {
+                params.restartable_syscall = false;
+            }
+            _ => {}
+        }
+    }
     let interrupted_rsp = ctx.user_rsp();
     if !ctx.deliver_signal(&params) {
         return false;

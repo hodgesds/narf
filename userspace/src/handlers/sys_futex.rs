@@ -71,7 +71,30 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
         cmd,
         FUTEX_WAIT | FUTEX_WAIT_BITSET | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 | FUTEX_WAIT_REQUEUE_PI
     );
-    let deadline = if has_timeout && args.arg3 != 0 {
+    // The restart of a timed FUTEX_WAIT / FUTEX_WAIT_BITSET a signal
+    // interrupted without running a handler: Linux re-enters through
+    // `restart_syscall` → `futex_wait_restart`, which reuses the ABSOLUTE
+    // expiry stored in the restart_block and never re-reads `utime`. The
+    // re-executed syscall consumes that stored deadline the same way, so a
+    // stop/continue does not stretch a relative timeout.
+    let restart_deadline = if matches!(cmd, FUTEX_WAIT | FUTEX_WAIT_BITSET) {
+        crate::user_task::current_user_task().and_then(|u| {
+            // SAFETY: uctx is live for this trap; atomic fields.
+            unsafe {
+                if (*u).futex_restart_uaddr.load(Ordering::Acquire) == uaddr {
+                    (*u).futex_restart_uaddr.store(0, Ordering::Release);
+                    Some((*u).futex_restart_deadline_ns.load(Ordering::Acquire))
+                } else {
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
+    let deadline = if restart_deadline.is_some() {
+        restart_deadline
+    } else if has_timeout && args.arg3 != 0 {
         // FUTEX_LOCK_PI's deadline is always CLOCK_REALTIME (`do_futex`
         // sets FLAGS_CLOCKRT for it); FUTEX_LOCK_PI2 follows the flag.
         match futex_timeout_deadline(args.arg3, cmd != FUTEX_WAIT, realtime || cmd == FUTEX_LOCK_PI) {
@@ -159,111 +182,40 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(r as u64));
         }
         FUTEX_WAIT => {
-            // REAL blocking futex. Sample *uaddr; if it already differs from
-            // `val`, the wait condition no longer holds — return -EAGAIN
-            // (Linux `futex_wait_setup`: `if (uval != val) return
-            // -EWOULDBLOCK;`). Else register on the per-uaddr wait queue and
-            // PARK until a `FUTEX_WAKE` on this word fires our waker (or,
-            // with a timeout, until it expires) — NOT a fixed nanosleep. The
-            // poll routine (`UserTaskFuture::poll`) does the actual waker
-            // registration (it owns `cx.waker()`); here we just publish the
-            // uaddr + a wake-counter snapshot for its lost-wakeup guard and
-            // hand control back via the yield hook. On resume the user reads
-            // RAX=0 and musl's recheck loop re-evaluates the word.
-            // `kernel/futex/core.c::get_futex_key`:
+            // `futex_wait()` → `__futex_wait()`: a REAL blocking wait. The
+            // setup reads `*uaddr` — a stale expected value is -EAGAIN
+            // (`futex_wait_setup`: `if (uval != val) return -EWOULDBLOCK;`),
+            // an unreadable word -EFAULT — and otherwise queues the caller on
+            // the word and parks it until a FUTEX_WAKE dequeues it (0), the
+            // deadline passes (-ETIMEDOUT, from the wait itself), or a signal
+            // arrives. Never a bounded park that "times out" into 0.
             //
-            //     if (unlikely((address % sizeof(u32)) != 0)) return -EINVAL;
-            //     if (unlikely(!access_ok(uaddr, size)))      return -EFAULT;
+            // The address was validated once, above, by `get_futex_key` for
+            // every op — a null word is -EFAULT, never a "POSIX-permitted
+            // spurious wake" (which turned a caller's bad pointer into a
+            // condvar loop that spins forever instead of reporting EFAULT).
             //
-            // so a null word is -EFAULT (it is aligned, and fails access_ok).
-            //
-            // This used to report success — a "POSIX-permitted spurious
-            // wake" — with the stated reason being "so wake-path smokes run
-            // without a backing mapping". That is production behaviour bent
-            // to suit a test, and it turns a caller's bad pointer into a
-            // HANG rather than an error: musl's and glibc's condvar loops
-            // treat a spurious wake as "re-check the predicate and wait
-            // again", so a null futex word spins forever instead of
-            // reporting EFAULT.
-            //
-            // One kernel test DID depend on the old behaviour
-            // (`smoke_userspace_futex_wait_and_wake_no_op` passed arg0 = 0
-            // and asserted 0), which is the concrete cost of bending a
-            // syscall to suit a fixture: the fixture then pins the bend in
-            // place. It now supplies a real word and asserts the genuine
-            // outcomes instead.
-            //
-            // No address check here any more — `get_futex_key` above ran it
-            // for every op, so this arm cannot disagree with the others.
-            // Seqlock read: sample the wake generation BEFORE reading `*uaddr`
-            // (see `futex_wait_seqlock_read` — sampling after the read loses a
-            // racing FUTEX_WAKE and deadlocks a contended mutex/condvar on SMP).
-            let (gen, current) = match futex_wait_seqlock_read_key(key, || {
-                let mut buf4 = [0u8; 4];
-                // SAFETY: `uaddr` is the user futex word pointer (non-zero, checked
-                // above); copy_from_user range-validates it + SMAP-brackets the read.
-                if unsafe { copy_from_user(&mut buf4, uaddr) }.is_ok() {
-                    Some(u32::from_ne_bytes(buf4))
-                } else {
-                    None
-                }
-            }) {
-                Some(x) => x,
-                None => {
-                    // `futex_wait_setup` retries the read outside the hash
-                    // bucket via `get_user`, and reports its failure as
-                    // -EFAULT. A caller whose lock page was reclaimed can
-                    // fault it back in and retry; -EPERM told it to give up.
-                    ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-                    return;
-                }
-            };
-            if current != val {
-                // Linux FUTEX_WAIT rejects a stale expected value with
-                // EAGAIN. Returning success here makes pthread state machines
-                // treat a wait that never happened as an actual wake, which
-                // can lose the subsequent handoff.
-                ctx.set_return(SyscallReturn::ok((-EAGAIN) as u64));
-                return;
-            }
-            // Deadline: a real timeout when one was supplied (wakes at the
-            // timeout OR on a FUTEX_WAKE, whichever first), else infinite
-            // (`u64::MAX`) — the poll routine parks on the timer wheel with a
-            // one-tick fallback as a lost-wake safety net, but the primary
-            // wake is the registered futex waker.
-            let deadline = deadline.unwrap_or(u64::MAX);
-            if deadline <= narf_scheduler::narf_time::monotonic_ns() {
-                ctx.set_return(SyscallReturn::ok((-ETIMEDOUT) as u64));
-                return;
-            }
-            if let (Some(uctx), Some(hook)) = (
-                crate::user_task::current_user_task(),
-                crate::user_task::yield_hook(),
-            ) {
-                ctx.set_return(SyscallReturn::ok(0));
-                // SAFETY: uctx is live for the trap round-trip.
-                unsafe {
-                    let uc = &*uctx;
-                    uc.futex_park_gen.store(gen, Ordering::Release);
-                    // Expected word value — the park loop re-validates the
-                    // word against this on every backstop re-check, so a
-                    // word rewritten WITHOUT a wake (requeue handoffs,
-                    // robust-owner death) unparks instead of stranding.
-                    uc.futex_val.store(val, Ordering::Release);
-                    futex_park_publish(uc, uaddr, key, bitset);
-                    uc.sleep_deadline_ns.store(deadline, Ordering::Release);
-                    ctx.save_user_state(uc.state.get() as *mut u8);
-                    *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                    if narf_scheduler::stackful::user_own_stack_enabled() {
-                        own_stack_block(ctx);
-                        return;
+            // A signal: `futex_wait()` turns `__futex_wait`'s -ERESTARTSYS
+            // into -ERESTART_RESTARTBLOCK when the wait has a timeout,
+            // storing the absolute expiry for `futex_wait_restart`. So an
+            // untimed wait restarts under SA_RESTART and is -EINTR to any
+            // other handler, while a timed one is -EINTR to EVERY handler and
+            // restarts — with the remaining time — only when none runs.
+            if futex_wait_one(ctx, uaddr, key, val, deadline, bitset) {
+                match deadline {
+                    None => futex_wait_restart(ctx, crate::user_task::SYSCALL_RESTART_SYS),
+                    Some(d) => {
+                        if let Some(u) = crate::user_task::current_user_task() {
+                            // SAFETY: uctx is live for this trap; atomics.
+                            unsafe {
+                                (*u).futex_restart_deadline_ns.store(d, Ordering::Release);
+                                (*u).futex_restart_uaddr.store(uaddr, Ordering::Release);
+                            }
+                        }
+                        futex_wait_restart(ctx, crate::user_task::SYSCALL_RESTART_RESTARTBLOCK);
                     }
-                    hook(uctx);
                 }
-                // unreachable
             }
-            // Test/no-future fallback: synchronous success.
-            ctx.set_return(SyscallReturn::ok(0));
         }
         FUTEX_WAKE => {
             // Bump the per-uaddr generation FIRST (the poll routine's
@@ -465,6 +417,11 @@ fn futex_lock_pi(
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 own_stack_block(ctx);
+                // `futex_lock_pi` turns an interrupted lock into
+                // -ERESTARTNOINTR: a handler runs and the lock attempt
+                // resumes, SA_RESTART or not — never -EINTR.
+                uc.syscall_restart_kind
+                    .store(crate::user_task::SYSCALL_RESTART_NOINTR, Ordering::Release);
                 return;
             }
             hook(uctx);

@@ -62,6 +62,17 @@ pub enum UserExit {
     Exited,
 }
 
+/// `UserTaskCtx::syscall_restart_kind`: the restart-pending park returns
+/// `-ERESTARTSYS` — restarted after a handler only with `SA_RESTART`, and
+/// only when the syscall-number table (`is_restartable_syscall`) allows it.
+pub const SYSCALL_RESTART_SYS: u32 = 0;
+/// `-ERESTARTNOINTR`: always restarted, a handler never turns it into EINTR
+/// (`arch/x86/kernel/signal.c::handle_signal`).
+pub const SYSCALL_RESTART_NOINTR: u32 = 1;
+/// `-ERESTART_RESTARTBLOCK`: -EINTR to any handler, SA_RESTART or not;
+/// restarted (through `restart_block`) only when no handler runs.
+pub const SYSCALL_RESTART_RESTARTBLOCK: u32 = 2;
+
 /// Per-task context the polling routine installs in
 /// [`current_user_task`] before transitioning to user mode. The
 /// trap handler picks up the pointer, populates `state` from the
@@ -407,6 +418,24 @@ pub struct UserTaskCtx {
     /// leave exit-RIP ≠ entry-RIP. Cleared when the syscall completes
     /// (exit-trap sees RIP == entry) or when a delivery converts it.
     pub syscall_parked_restarting: AtomicBool,
+    /// Which Linux restart errno a restart-pending park stands for, as one of
+    /// the `SYSCALL_RESTART_*` constants. `SYSCALL_RESTART_SYS` (0) is the
+    /// `-ERESTARTSYS` default the syscall-number table refines; a park that
+    /// means `-ERESTARTNOINTR` (FUTEX_LOCK_PI) or `-ERESTART_RESTARTBLOCK`
+    /// (a timed FUTEX_WAIT) stores its kind after `own_stack_block`, which
+    /// resets it to the default on entry so it never outlives one park.
+    pub syscall_restart_kind: AtomicU32,
+    /// `restart_block` of a timed FUTEX_WAIT interrupted by a signal: the
+    /// word it waited on and its ABSOLUTE monotonic deadline. Linux restarts
+    /// such a wait through `futex_wait_restart` with the stored expiry, so
+    /// the re-executed FUTEX_WAIT on the same word reuses it rather than
+    /// re-reading a relative timeout. Zero uaddr = no restart pending.
+    pub futex_restart_uaddr: AtomicU64,
+    pub futex_restart_deadline_ns: AtomicU64,
+    /// True while a handler-driven futex wait (`futex_block`) has entries
+    /// queued, so a teardown that never lets the handler unqueue them
+    /// sweeps them instead (`futex_drop_task_waiters`).
+    pub futex_block_active: AtomicBool,
 
     // ── stall-watchdog diagnostics ──────────────────────────────────
     /// Monotonic count of park-condition re-checks: bumped on every
@@ -704,6 +733,10 @@ impl UserTaskCtx {
             sock_timeo_key: AtomicU64::new(0),
             fifo_open_pending_fd: AtomicU64::new(0),
             syscall_parked_restarting: AtomicBool::new(false),
+            syscall_restart_kind: AtomicU32::new(SYSCALL_RESTART_SYS),
+            futex_restart_uaddr: AtomicU64::new(0),
+            futex_restart_deadline_ns: AtomicU64::new(0),
+            futex_block_active: AtomicBool::new(false),
             kern_span_start_ns: AtomicU64::new(0),
             kern_account_ready: AtomicU64::new(0),
             dbg_park_checks: AtomicU64::new(0),

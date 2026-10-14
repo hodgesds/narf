@@ -1432,12 +1432,25 @@ fn smoke_abi_async_futex_requeue_pos() -> TestResult {
             FUTEX2_SIZE_U32,
             FUTEX2_SIZE_U32,
         );
-        // futex_requeue(waiters, flags=0, nr_wake=1, nr_requeue=0) → 1.
+        // futex_requeue(waiters, flags=0, nr_wake=1, nr_requeue=0) with
+        // nobody waiting → 0: `futex_requeue` returns `task_count`, the
+        // waiters actually woken plus requeued, never the requested count.
         let args = a3(waitv.as_ptr() as u64, 0, 1, 0);
-        match call(Syscall::FutexRequeue.raw(), args) {
-            Some(1) => Ok(()),
-            _ => Err("futex_requeue(nr_wake=1) should return 1"),
+        if call(Syscall::FutexRequeue.raw(), args) != Some(0) {
+            return Err("futex_requeue with no waiters should return 0");
         }
+        // `cmpval = futexes[0].w.val`: a source word that moved since the
+        // caller read it (val 1, *uaddr1 0) is -EAGAIN.
+        let mut stale = waitv;
+        stale[0..8].copy_from_slice(&1u64.to_ne_bytes());
+        if call(
+            Syscall::FutexRequeue.raw(),
+            a3(stale.as_ptr() as u64, 0, 1, 0),
+        ) != Some(EAGAIN)
+        {
+            return Err("futex_requeue with a moved source word should return -EAGAIN");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_requeue_pos);
@@ -1543,12 +1556,13 @@ fn waitv_one(val: u64, uaddr: u64, flags: u64) -> [u8; 24] {
 fn smoke_abi_async_futex_waitv_pos() -> TestResult {
     with_setup(|| {
         // One futex_waitv entry whose expected val(1) != live *uaddr(0):
-        // futex_waitv reports index 0 (this word is "already woken").
+        // `futex_wait_multiple_setup` returns -EWOULDBLOCK (a moved word is
+        // not a woken one; only an entry a wake dequeued has an index).
         let word: u32 = 0;
         let p = &word as *const u32 as u64;
         let waitv = waitv_one(1, p, FUTEX2_SIZE_U32);
-        if call(Syscall::FutexWaitv.raw(), a2(waitv.as_ptr() as u64, 1, 0)) != Some(0) {
-            return Err("futex_waitv with a moved word should return index 0");
+        if call(Syscall::FutexWaitv.raw(), a2(waitv.as_ptr() as u64, 1, 0)) != Some(EAGAIN) {
+            return Err("futex_waitv with a moved word should return -EAGAIN");
         }
         // Every word matching parks (0 in the harness) — the positive
         // control for the validation gates below.
@@ -2604,7 +2618,7 @@ kernel_test_in!(
 // "empty wait queue" or "spurious wake" shortcut anywhere in Linux.
 //
 // NARF had that shortcut in THREE places (the classic FUTEX_WAIT arm, the
-// shared `futex_wait_core` the FUTEX2 path uses, and `futex_wake`'s
+// shared `futex_block` the FUTEX2 path uses, and `futex_wake`'s
 // zero-count arm), each added separately and each justified by its own
 // comment. Fixing one left the others, because nothing tied them together.
 //
@@ -2667,7 +2681,7 @@ fn smoke_abi_async_futex_null_word_is_always_efault() -> TestResult {
         }
 
         // The futex2 syscalls reach a different code path (the shared
-        // `futex_wait_core`), which is precisely why fixing the classic arm
+        // `futex_block`), which is precisely why fixing the classic arm
         // alone left this half broken.
         if futex2_wait(0, 0, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32, 0, 0) != Some(EFAULT) {
             return Err("futex_wait(NULL) must be -EFAULT");
