@@ -5523,6 +5523,10 @@ fn boot_userspace_init() {
                 ("pipeblk_smoke", narf_verification::NARF_PIPEBLK_SMOKE_ELF),
                 ("sigrt_smoke", narf_verification::NARF_SIGRT_SMOKE_ELF),
                 ("strace_smoke", narf_verification::NARF_STRACE_SMOKE_ELF),
+                // Remote memory access from ring 3: PEEK/POKE, process_vm_*
+                // and /proc/<pid>/mem against a forked COW tracee.
+                // Success: `remotevm-ok`.
+                ("remotevm_smoke", narf_verification::NARF_REMOTEVM_SMOKE_ELF),
                 ("fs_smoke", narf_verification::NARF_FS_SMOKE_ELF),
                 // Linux-compat round: eventfd2 / getrandom / socketpair
                 // / accept4 exercised end-to-end by real musl binaries.

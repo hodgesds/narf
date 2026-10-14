@@ -1464,3 +1464,7 @@ argument = "The frame changes for IPv4 fragmentation are boot-time wiring in cro
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The frame change in bare_main.rs adds one entry (dmabuf_sync_smoke and its embedded ELF) to the boot-init musl-demo smoke table, the same registration every ring-3 smoke uses. It runs only when that command is requested and grants the smoke nothing beyond an ordinary user process. No TCB code path, capability, or domain transition changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The frame change in bare_main.rs adds one entry (remotevm_smoke and its embedded ELF) to the boot-init musl-demo smoke table, the same registration every ring-3 smoke uses. It runs only when that command is requested and grants the smoke nothing beyond an ordinary user process. No TCB code path, capability, or domain transition changes."

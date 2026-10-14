@@ -4910,6 +4910,12 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("sigrt_smoke", "sigrt-ok"),
         // Live PTRACE_SYSCALL strace loop (TRACEME + syscall-stops + GETREGS).
         ("strace_smoke", "strace-ok"),
+        // Remote process-memory access against a forked, COW-sharing tracee:
+        // PTRACE_PEEK*/POKE* (FOLL_FORCE: PROT_NONE, read-only text, lazy and
+        // unfaulted file pages; COW isolation), process_vm_readv/writev
+        // (multi-iovec, partial transfer, EFAULT/ESRCH/EPERM) and
+        // /proc/<pid>/mem pread/pwrite/lseek. See remotevm_smoke_x86_64.c.
+        ("remotevm_smoke", "remotevm-ok"),
         // OCI container end-to-end: the `oci_smoke` runtime reads the
         // /oci bundle, unshares namespaces, sets the container hostname,
         // chroots into the bundle rootfs, and execs the contained

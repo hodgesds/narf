@@ -678,6 +678,7 @@ fn main() {
         "shmfork_smoke",
         "sigrt_smoke",
         "strace_smoke",
+        "remotevm_smoke",
         "remount_smoke",
         "utmp_smoke",
         "thp_smoke",
