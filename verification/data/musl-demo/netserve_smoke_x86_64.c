@@ -41,6 +41,8 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
+#include <netinet/ip_icmp.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -177,6 +179,65 @@ static int download(void) {
     close(c);
     if (got != DOWNLOAD_LEN) return failf("download length", got, DOWNLOAD_LEN);
     w("netserve-download-ok\n");
+    return 0;
+}
+
+// (7) ICMP echo through a ping socket, the way `ping` sends it. Returns the
+// number of replies (matching id/seq) out of `count`, spaced 100 ms apart,
+// each awaited up to 1 s; reports the mean RTT in microseconds.
+static int icmp_probe(const char *dst, int count, long *mean_rtt_us) {
+    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (s < 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    inet_pton(AF_INET, dst, &a.sin_addr);
+    int got = 0;
+    long total_us = 0;
+    for (int seq = 1; seq <= count; seq++) {
+        uint8_t pkt[64];
+        memset(pkt, 0, sizeof pkt);
+        pkt[0] = 8; // ICMP_ECHO; the kernel fills id and checksum
+        pkt[6] = (uint8_t)(seq >> 8);
+        pkt[7] = (uint8_t)seq;
+        for (int k = 8; k < (int)sizeof pkt; k++) pkt[k] = (uint8_t)(k ^ seq);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (sendto(s, pkt, sizeof pkt, 0, (struct sockaddr *)&a, sizeof a) != (long)sizeof pkt) break;
+        for (;;) {
+            struct pollfd p = {.fd = s, .events = POLLIN};
+            if (poll(&p, 1, 1000) != 1) break;
+            uint8_t r[256];
+            long n = recv(s, r, sizeof r, 0);
+            if (n >= 8 && r[0] == 0 && ((r[6] << 8) | r[7]) == seq) {
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                total_us += (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
+                got++;
+                break;
+            }
+        }
+        struct timespec gap = {0, 100 * 1000 * 1000};
+        nanosleep(&gap, NULL);
+    }
+    close(s);
+    *mean_rtt_us = got ? total_us / got : -1;
+    return got;
+}
+
+static int icmp_checks(void) {
+    char m[128];
+    long rtt;
+    int gw = icmp_probe("10.0.2.2", 20, &rtt);
+    snprintf(m, sizeof m, "netserve: icmp 10.0.2.2 recv=%d/20 mean_rtt_us=%ld\n", gw, rtt);
+    w(m);
+    if (gw != 20) return failf("icmp to the gateway lost replies", (unsigned long)gw, 20);
+    int ext = icmp_probe("8.8.8.8", 20, &rtt);
+    snprintf(m, sizeof m, "netserve: icmp 8.8.8.8 recv=%d/20 mean_rtt_us=%ld\n", ext, rtt);
+    w(m);
+    // No reply at all: the host has no external ICMP (CI); nothing to judge.
+    // Otherwise the host's own path is lossless, so dropped replies are ours.
+    if (ext > 0 && ext < 19) return failf("icmp to 8.8.8.8 lost replies", (unsigned long)ext, 20);
+    w("netserve-icmp-ok\n");
     return 0;
 }
 
@@ -348,6 +409,7 @@ int main(void) {
         return 1;
     }
     w("netserve-dns-ok\n");
+    if (icmp_checks()) return 1;
     w("netserve-ok\n");
     return 0;
 }
