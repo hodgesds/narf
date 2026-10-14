@@ -826,6 +826,91 @@ impl FileOps for DevFb0Proxy {
     }
 }
 
+// ── /dev/nvme0 ───────────────────────────────────────────────────────
+
+/// Optional `FileOps` delegate for `/dev/nvme0` — the NVMe controller
+/// character device. Installed by the NVMe driver after `bring_up`, it
+/// serves the `NVME_IOCTL_ADMIN_CMD` passthrough interface so `smartctl
+/// -d nvme` / `nvme-cli` can read SMART/Health logs, Identify, etc.
+///
+/// Stored as a global so the NVMe crate registers the node without devfs
+/// depending on the driver (same pattern as `FB0_NODE` / `TPM0_NODE`).
+static NVME0_NODE: IrqSafeSpinLock<Option<Arc<dyn FileOps>>> = IrqSafeSpinLock::new(None);
+
+/// Register (or replace) the `/dev/nvme0` controller node. Called by the
+/// NVMe driver once a controller is probed and brought up.
+pub fn register_nvme0(node: Arc<dyn FileOps>) {
+    *NVME0_NODE.lock() = Some(node);
+}
+
+/// Unregister the `/dev/nvme0` node (controller removed).
+pub fn unregister_nvme0() {
+    *NVME0_NODE.lock() = None;
+}
+
+/// `/dev/nvme0` — proxy to the installed NVMe controller FileOps.
+struct DevNvme0Proxy;
+
+impl FileOps for DevNvme0Proxy {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        let node = NVME0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.read(offset, buf).await,
+                None => Ok(0),
+            }
+        })
+    }
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+        let node = NVME0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.write(offset, buf).await,
+                None => Ok(0),
+            }
+        })
+    }
+    fn stat(&self) -> Stat {
+        NVME0_NODE
+            .lock()
+            .as_ref()
+            .map(|n| n.stat())
+            .unwrap_or_else(|| Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode {
+                    file_type: FileType::Special,
+                    perms: 0o600,
+                },
+                mtime_cycles: 0,
+            })
+    }
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn crate::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        let node = NVME0_NODE.lock().clone();
+        Box::pin(async move {
+            match node {
+                Some(n) => n.ioctl_user(cmd, arg, context).await,
+                None => Err(FsError::NoDevice),
+            }
+        })
+    }
+    fn rdev(&self) -> u64 {
+        NVME0_NODE
+            .lock()
+            .as_ref()
+            .map(|node| node.rdev())
+            .unwrap_or(0)
+    }
+    fn ino(&self) -> u64 {
+        named_inode("nvme0", 1)
+    }
+}
+
 // ── /dev/tpm0 + /dev/tpmrm0 ──────────────────────────────────────────
 
 /// Optional `FileOps` delegate for `/dev/tpm0`.  Installed by the TPM

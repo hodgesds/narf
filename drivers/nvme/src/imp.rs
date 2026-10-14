@@ -26,6 +26,7 @@
 //! (`lib.rs`) carries the dual-build wiring and re-exports this module's API.
 
 pub mod admin;
+pub mod chardev;
 pub mod mi;
 
 mod tests;
@@ -404,14 +405,21 @@ impl Queue {
         REG_DOORBELL_BASE + (2 * (self.qid as u64) + 1) * self.db_stride
     }
 
-    /// Submit `sqe` and synchronously poll for its completion.
-    /// Auto-assigns the CID (overwrites the upper 16 bits of cdw0).
+    /// Submit `sqe`, synchronously poll for its completion, and return
+    /// the raw CQE **without** treating a nonzero NVMe status as an
+    /// error. Auto-assigns the CID (overwrites the upper 16 bits of
+    /// cdw0).
+    ///
+    /// Admin passthrough (`Controller::admin_passthrough`) needs the raw
+    /// status word reported back to userspace even when the command
+    /// failed, so it calls this directly; [`Queue::submit`] layers the
+    /// status check on top for the driver's own internal callers.
     ///
     /// # Safety
     /// The DMA buffers `sq_buf` / `cq_buf` are still mapped and the
     /// controller is enabled. The caller owns the queue (no other
     /// task posting concurrently — Stage-3 single-threaded).
-    unsafe fn submit(&mut self, bar0: &MmioRegion, mut sqe: Sqe) -> Result<Cqe, NvmeError> {
+    unsafe fn submit_raw(&mut self, bar0: &MmioRegion, mut sqe: Sqe) -> Result<Cqe, NvmeError> {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         // Preserve opcode (low 8 bits) + FUSE/PSDT (bits 8..15) and
@@ -440,10 +448,22 @@ impl Queue {
             bar0.write32(self.cq_db_off(), self.cq_head as u32);
         }
 
+        Ok(cqe)
+    }
+
+    /// Submit `sqe` and synchronously poll for its completion, mapping a
+    /// nonzero NVMe status to [`NvmeError::CommandFailed`].
+    ///
+    /// # Safety
+    /// Same invariants as [`Queue::submit_raw`].
+    unsafe fn submit(&mut self, bar0: &MmioRegion, sqe: Sqe) -> Result<Cqe, NvmeError> {
+        let opcode = (sqe.cdw0 & 0xFF) as u8;
+        // SAFETY: forwarded under the caller's `submit` contract.
+        let cqe = unsafe { self.submit_raw(bar0, sqe)? };
         let nvme_status = cqe.status >> 1;
         if nvme_status != 0 {
             return Err(NvmeError::CommandFailed {
-                cmd: (sqe.cdw0 & 0xFF) as u8,
+                cmd: opcode,
                 status: nvme_status,
             });
         }
@@ -1155,6 +1175,135 @@ impl Controller {
         // SAFETY: admin queue + BAR live; no host-DMA buffer required.
         let cqe = unsafe { admin.submit(bar0, sqe)? };
         Ok(cqe.cmd_specific)
+    }
+
+    // ── Admin: arbitrary passthrough (NVME_IOCTL_ADMIN_CMD) ───────────
+
+    /// Execute an arbitrary admin command on behalf of userspace
+    /// (`NVME_IOCTL_ADMIN_CMD`). This is the kernel side of smartctl /
+    /// `nvme-cli` passthrough.
+    ///
+    /// `data` is the host transfer buffer named by the passthrough
+    /// struct's `addr`/`data_len`. The transfer direction is taken from
+    /// the opcode's data-transfer field (bits `[1:0]`, NVMe Base Spec
+    /// §3.1.3.4): controller-to-host (`0b10`) fills `data` on return;
+    /// host-to-controller (`0b01`) sends `data` as-is; bidirectional
+    /// (`0b11`) does both. When `data` is empty no PRP is programmed.
+    ///
+    /// Unlike the driver's internal callers, a nonzero NVMe completion
+    /// status is **not** an error here: it is returned in
+    /// [`PassthruResult::status`] so the status word reaches userspace,
+    /// matching Linux `nvme_submit_user_cmd`
+    /// (drivers/nvme/host/ioctl.c).
+    pub fn admin_passthrough(
+        &mut self,
+        cmd: &admin::AdminSqe,
+        data: &mut [u8],
+    ) -> Result<PassthruResult, NvmeError> {
+        let admin_q = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
+        let bar0 = self.bar0_region.as_ref().ok_or(NvmeError::NotReady)?;
+
+        // Data-transfer direction from the opcode's low two bits.
+        let dir = cmd.opcode & 0x3;
+        let to_host = dir == 0b10 || dir == 0b11; // controller -> host
+        let to_dev = dir == 0b01 || dir == 0b11; // host -> controller
+
+        let mut sqe = Sqe::zero();
+        sqe.cdw0 = cmd.opcode as u32;
+        sqe.nsid = cmd.nsid;
+        sqe.cdw10 = cmd.cdw10;
+        sqe.cdw11 = cmd.cdw11;
+        sqe.cdw12 = cmd.cdw12;
+        sqe.cdw13 = cmd.cdw13;
+        sqe.cdw14 = cmd.cdw14;
+        sqe.cdw15 = cmd.cdw15;
+
+        // Allocate and map the transfer buffer as whole 4-KiB DMA pages;
+        // hold them (and any PRP-list page) alive across the submit.
+        let mut _data_pages: Vec<DmaBuffer> = Vec::new();
+        let mut _prp_list_keepalive: Option<DmaBuffer> = None;
+
+        if !data.is_empty() {
+            let page = PAGE_SIZE as usize;
+            let n_pages = data.len().div_ceil(page);
+            const MAX_PASSTHRU_PAGES: usize = 512; // 2 MiB ceiling.
+            if n_pages > MAX_PASSTHRU_PAGES {
+                return Err(NvmeError::TooManyPages);
+            }
+            for _ in 0..n_pages {
+                _data_pages.push(
+                    alloc_coherent(page, DomainId::DRIVER_0)
+                        .map_err(|_| NvmeError::OutOfDmaMemory)?,
+                );
+            }
+            // Host -> controller: stage the user payload into the pages.
+            if to_dev {
+                let mut off = 0usize;
+                for buf in &mut _data_pages {
+                    let take = core::cmp::min(page, data.len() - off);
+                    buf.as_mut_slice()[..take].copy_from_slice(&data[off..off + take]);
+                    off += take;
+                    if off == data.len() {
+                        break;
+                    }
+                }
+            }
+
+            sqe.prp1 = _data_pages[0].dma_addr().raw();
+            match n_pages {
+                1 => {}
+                2 => sqe.prp2 = _data_pages[1].dma_addr().raw(),
+                _ => {
+                    // PRP list: a single 4-KiB page holds up to 512 8-byte
+                    // entries; the first data page is in PRP1, the remaining
+                    // `n_pages - 1` go in the list. Capped at
+                    // MAX_PASSTHRU_PAGES so the list never needs chaining.
+                    let list = alloc_coherent(page, DomainId::DRIVER_0)
+                        .map_err(|_| NvmeError::OutOfDmaMemory)?;
+                    // SAFETY: alloc_coherent zero-fills + page-aligns the
+                    // buffer; the kernel-mapped pointer stays valid for the
+                    // buffer's lifetime, extended across the submit by
+                    // `_prp_list_keepalive`. NVMe expects LE 8-byte phys
+                    // addresses; a plain `write_volatile<u64>` on an LE
+                    // target produces that layout.
+                    // SAFETY: Valid MMIO bounds or trusted driver environment
+                    unsafe {
+                        let entries = list.as_mut_ptr() as *mut u64;
+                        for (i, buf) in _data_pages[1..].iter().enumerate() {
+                            core::ptr::write_volatile(entries.add(i), buf.dma_addr().raw());
+                        }
+                    }
+                    sqe.prp2 = list.dma_addr().raw();
+                    _prp_list_keepalive = Some(list);
+                }
+            }
+        }
+
+        // SAFETY: admin queue + BAR live; the DMA pages (and optional PRP
+        // list) stay mapped until after `submit_raw` returns — it polls
+        // the CQ synchronously, so the controller is done with them here.
+        let cqe = unsafe { admin_q.submit_raw(bar0, sqe)? };
+        let status = cqe.status >> 1;
+
+        // Controller -> host: copy the device's reply back out, only on a
+        // successful transfer; a failed command leaves `data` untouched.
+        if to_host && status == 0 {
+            let page = PAGE_SIZE as usize;
+            let mut off = 0usize;
+            for buf in &_data_pages {
+                let take = core::cmp::min(page, data.len() - off);
+                data[off..off + take].copy_from_slice(&buf.as_slice()[..take]);
+                off += take;
+                if off == data.len() {
+                    break;
+                }
+            }
+        }
+
+        Ok(PassthruResult {
+            status,
+            result: cqe.cmd_specific,
+        })
     }
 
     // ── Admin: Set Features (power management, async event config) ────
@@ -2652,6 +2801,10 @@ pub fn probe(
     // the controller via CC.EN=0 (admin + I/O queues quiesce);
     // resume re-enables CC.EN and waits for CSTS.RDY=1.
     narf_power::device_pm::register_device_pm("nvme0", nvme_suspend_handler, nvme_resume_handler);
+    // Expose the controller character device `/dev/nvme0` so userspace
+    // admin passthrough (smartctl / nvme-cli) can reach the admin queue
+    // via NVME_IOCTL_ADMIN_CMD.
+    narf_filesystem::devfs::register_nvme0(alloc::sync::Arc::new(chardev::NvmeCharDev::new(0)));
     Ok(())
 }
 
@@ -2710,6 +2863,31 @@ pub fn is_probed() -> bool {
 pub fn with_controller<R>(f: impl FnOnce(&Controller) -> R) -> Option<R> {
     let g = probed_controller()?;
     Some(f(&g))
+}
+
+/// Outcome of an admin passthrough command.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct PassthruResult {
+    /// NVMe completion status field (`SCT << 8 | SC`), 0 on success.
+    pub status: u16,
+    /// Command-specific completion dword 0 (CQE DW0) — e.g. the result
+    /// of a Get Features, echoed back into the passthrough struct.
+    pub result: u32,
+}
+
+/// Run an admin passthrough command against the probed controller.
+///
+/// Acquires exclusive controller access via the slot's `req_gate` (so it
+/// serialises against I/O, exactly like `with_controller`), runs the
+/// command, and returns the raw status + CQE DW0. `None` if no controller
+/// is probed. This is the entry point the `/dev/nvme0` char device's
+/// `ioctl_user` handler calls for `NVME_IOCTL_ADMIN_CMD`.
+pub fn admin_passthrough(
+    cmd: &admin::AdminSqe,
+    data: &mut [u8],
+) -> Option<Result<PassthruResult, NvmeError>> {
+    let mut g = probed_controller()?;
+    Some(g.admin_passthrough(cmd, data))
 }
 
 // ── Typed parameter surface ───────────────────────────────────────────

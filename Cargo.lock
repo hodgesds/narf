@@ -1746,6 +1746,7 @@ dependencies = [
  "narf-capabilities",
  "narf-driver-macros",
  "narf-drivers",
+ "narf-filesystem",
  "narf-init",
  "narf-interrupts",
  "narf-io",
