@@ -1304,27 +1304,23 @@ fn smoke_udp_reuseport_load_balance() -> TestResult {
 }
 kernel_test_in!("net/udp", smoke_udp_reuseport_load_balance);
 
-/// Fragmentation reassembly: simulate the IP layer reassembling two
-/// fragments and handing the complete datagram to `deliver`.  In the
-/// NARF stack the IP layer calls `deliver` with the fully reassembled
-/// UDP segment (header + payload); this test verifies that path
-/// accepts a large payload produced by stitching two 500-byte chunks.
+/// `deliver` accepts a 1000-byte datagram — the size a reassembled
+/// datagram typically arrives at — and queues it intact.
 ///
-/// Linux ref: `ip_defrag` → `ip_frag_queue` reassembles fragments
-/// then calls `ip_local_deliver_finish` → UDP `udp_rcv` with the
-/// complete segment (net/ipv4/reassembly.c, net/ipv4/udp.c:2069).
-fn smoke_udp_fragment_reassembly_via_deliver() -> TestResult {
+/// This exercises the UDP layer only: the segment is built whole and handed
+/// straight to `deliver`, so nothing here touches IP fragments. IPv4
+/// reassembly itself (`ip_defrag`, reached from `handle_ipv4`) is covered by
+/// `ip_fragment_tests.rs`, which injects real fragments through the RX path.
+fn smoke_udp_deliver_accepts_large_datagram() -> TestResult {
     let port = 59016u16;
     let sock = match udp_bind(SocketAddrV4::new([0, 0, 0, 0], port), UdpOptions::default()) {
         Ok(s) => s,
         Err(_) => return TestResult::Fail("bind failed"),
     };
 
-    // Build a 1000-byte payload split across two 500-byte IP fragments
-    // that the IP layer would reassemble into one UDP segment.
+    // A 1000-byte payload, delivered as one whole segment.
     let payload: alloc::vec::Vec<u8> = (0u8..200).cycle().take(1000).collect();
 
-    // After IP-level reassembly, deliver() receives the full UDP segment.
     let total_udp = UDP_HDR_LEN + payload.len();
     let mut seg = alloc::vec![0u8; total_udp];
     seg[0..2].copy_from_slice(&9001u16.to_be_bytes()); // src port
@@ -1346,17 +1342,17 @@ fn smoke_udp_fragment_reassembly_via_deliver() -> TestResult {
     match result {
         Ok((n, _src)) => {
             if n != payload.len() {
-                return TestResult::Fail("reassembled datagram length mismatch");
+                return TestResult::Fail("datagram length mismatch");
             }
             if buf[..n] != payload[..] {
-                return TestResult::Fail("reassembled datagram payload mismatch");
+                return TestResult::Fail("datagram payload mismatch");
             }
             TestResult::Pass
         }
-        Err(_) => TestResult::Fail("recv failed after reassembled deliver"),
+        Err(_) => TestResult::Fail("recv failed after deliver"),
     }
 }
-kernel_test_in!("net/udp", smoke_udp_fragment_reassembly_via_deliver);
+kernel_test_in!("net/udp", smoke_udp_deliver_accepts_large_datagram);
 
 /// IP_TTL setsockopt: verify the option field is stored correctly.
 /// (Wire verification requires a real iface; this tests the option state.)
