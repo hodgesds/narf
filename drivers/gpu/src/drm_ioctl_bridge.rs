@@ -178,6 +178,12 @@ pub(crate) struct VirtGpuResource {
     /// Fence of the last EXECBUFFER that referenced this BO. VIRTGPU_WAIT
     /// consults it the way Linux waits on the GEM object's reservation.
     pub(crate) last_fence: narf_lib::sync::IrqSafeSpinLock<Option<Arc<VirtGpuFence>>>,
+    /// The buffer's dma-buf reservation and name, shared by every PRIME fd
+    /// and imported handle naming this resource (they share this `Arc`'d
+    /// resource). EXECBUFFER adds its fence as a WRITE fence, as Linux
+    /// `virtio_gpu_array_add_fence` does; `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`
+    /// adds userspace fences.
+    pub(crate) dma_buf: narf_filesystem::dma_buf::DmaBufObject,
 }
 
 /// One driver-level fence shared by BO reservations, sync files, and binary
@@ -187,6 +193,11 @@ pub(crate) struct VirtGpuResource {
 pub(crate) struct VirtGpuFence {
     transport: Arc<narf_drivers_virtio::gpu_pci::SubmittedFence>,
     context: u64,
+    /// `CLOCK_MONOTONIC` ns at which this fence was first seen complete
+    /// (Linux `dma_fence.timestamp`); 0 while pending. Completion is reaped
+    /// by whichever query observes it, so the reap instant is the signal
+    /// time NARF can report.
+    signalled_at_ns: AtomicU64,
 }
 
 impl VirtGpuFence {
@@ -194,30 +205,50 @@ impl VirtGpuFence {
         transport: Arc<narf_drivers_virtio::gpu_pci::SubmittedFence>,
         context: u64,
     ) -> Arc<Self> {
-        Arc::new(Self { transport, context })
+        Arc::new(Self {
+            transport,
+            context,
+            signalled_at_ns: AtomicU64::new(0),
+        })
+    }
+
+    /// Record the first observation of completion.
+    fn note_signalled(&self, signalled: bool) -> bool {
+        if signalled && self.signalled_at_ns.load(Ordering::Acquire) == 0 {
+            let now = narf_time::wall::monotonic_ns().max(1);
+            let _ =
+                self.signalled_at_ns
+                    .compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        }
+        signalled
     }
 
     fn is_device_signalled(&self) -> bool {
-        narf_drivers_virtio::gpu_pci::probed_device()
-            .map(|dev| dev.fence_signalled(&self.transport))
-            // A removed device cannot make further progress. Treat its
-            // abandoned fences as done so pollers do not wedge forever.
-            .unwrap_or(true)
+        self.note_signalled(
+            narf_drivers_virtio::gpu_pci::probed_device()
+                .map(|dev| dev.fence_signalled(&self.transport))
+                // A removed device cannot make further progress. Treat its
+                // abandoned fences as done so pollers do not wedge forever.
+                .unwrap_or(true),
+        )
     }
 
     fn wait_device(&self, timeout_ms: u64) -> bool {
-        narf_drivers_virtio::gpu_pci::probed_device()
-            .map(|dev| dev.wait_fence(&self.transport, timeout_ms))
-            .unwrap_or(true)
+        self.note_signalled(
+            narf_drivers_virtio::gpu_pci::probed_device()
+                .map(|dev| dev.wait_fence(&self.transport, timeout_ms))
+                .unwrap_or(true),
+        )
     }
 
     async fn wait_device_async(&self, timeout_ms: u64) -> bool {
-        match narf_drivers_virtio::gpu_pci::probed_device() {
+        let signalled = match narf_drivers_virtio::gpu_pci::probed_device() {
             Some(dev) => dev.wait_fence_async(&self.transport, timeout_ms).await,
             // A removed device cannot make further progress. Treat its
             // abandoned fences as done so userspace cannot wedge forever.
             None => true,
-        }
+        };
+        self.note_signalled(signalled)
     }
 }
 
@@ -242,6 +273,9 @@ impl crate::drm::syncobj::DmaFence for VirtGpuFence {
     }
 }
 
+/// Names follow Linux `virtgpu_fence.c`: driver `"virtio_gpu"`, timeline
+/// `"controlq"`; the seqno is the virtqueue fence id
+/// (`virtio_gpu_fence_emit`).
 impl narf_filesystem::DrmFence for VirtGpuFence {
     fn is_signalled(&self) -> bool {
         self.is_device_signalled()
@@ -253,6 +287,25 @@ impl narf_filesystem::DrmFence for VirtGpuFence {
 
     fn context(&self) -> Option<u64> {
         Some(self.context)
+    }
+
+    fn seqno(&self) -> u64 {
+        self.transport.id()
+    }
+
+    fn driver_name(&self) -> &str {
+        "virtio_gpu"
+    }
+
+    fn timeline_name(&self) -> &str {
+        "controlq"
+    }
+
+    fn timestamp_ns(&self) -> Option<u64> {
+        match self.signalled_at_ns.load(Ordering::Acquire) {
+            0 => None,
+            at => Some(at),
+        }
     }
 }
 
@@ -350,6 +403,7 @@ fn smoke_virtgpu_drop_defers_host_unref() -> narf_kernel_test::TestResult {
         host3d_blob: false,
         host_owned: true,
         last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
+        dma_buf: narf_filesystem::dma_buf::DmaBufObject::new(),
     });
     let inline_calls = CALLS.load(Ordering::Relaxed);
     narf_scheduler::run_until_empty();
@@ -418,6 +472,7 @@ pub(crate) fn test_virtgpu_resource(resource_id: u32, size: usize) -> Arc<VirtGp
         host3d_blob: false,
         host_owned: false,
         last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
+        dma_buf: narf_filesystem::dma_buf::DmaBufObject::new(),
     })
 }
 
@@ -613,6 +668,7 @@ impl VirtGpuRenderState {
                 host3d_blob: false,
                 host_owned: false,
                 last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
+                dma_buf: narf_filesystem::dma_buf::DmaBufObject::new(),
             }),
             true,
         );
@@ -628,6 +684,7 @@ impl VirtGpuRenderState {
                 host3d_blob: false,
                 host_owned: true,
                 last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
+                dma_buf: narf_filesystem::dma_buf::DmaBufObject::new(),
             }),
             true,
         );
@@ -651,6 +708,7 @@ impl VirtGpuRenderState {
                 host3d_blob,
                 host_owned: true,
                 last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
+                dma_buf: narf_filesystem::dma_buf::DmaBufObject::new(),
             }),
             attached,
         );
@@ -680,6 +738,7 @@ impl VirtGpuRenderState {
                 host3d_blob: true,
                 host_owned: true,
                 last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
+                dma_buf: narf_filesystem::dma_buf::DmaBufObject::new(),
             }),
             attached,
         );
@@ -702,6 +761,7 @@ impl VirtGpuRenderState {
                 host3d_blob: true,
                 host_owned: true,
                 last_fence: narf_lib::sync::IrqSafeSpinLock::new(None),
+                dma_buf: narf_filesystem::dma_buf::DmaBufObject::new(),
             }),
             attached,
         );
@@ -1696,6 +1756,10 @@ fn dispatch_virtgpu_render_inner(
             // it) and on the open (FENCE_FD_OUT's sync_file reads it).
             for resource in referenced.iter().flatten() {
                 *resource.last_fence.lock() = Some(fence.clone());
+                resource.dma_buf.resv.add_fence(
+                    fence.clone() as Arc<dyn narf_filesystem::DrmFence>,
+                    narf_filesystem::dma_buf::DmaResvUsage::Write,
+                );
             }
             if req.flags & EXECBUF_FENCE_FD_OUT != 0 {
                 state

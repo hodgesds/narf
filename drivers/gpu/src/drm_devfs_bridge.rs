@@ -578,6 +578,9 @@ pub struct PrimeDmaBufFile {
     gem_handle: u32,
     /// Pins the backing from PRIME export through final fd/mapping teardown.
     backing: Arc<DumbBackingLease>,
+    /// The dumb buffer's reservation and name, shared with every other
+    /// export of the same handle (it lives on the card's `DumbBacking`).
+    dma_buf: Arc<narf_filesystem::dma_buf::DmaBufObject>,
     /// This dma-buf's inode. See [`dma_buf_inode`].
     inode: narf_filesystem::inode_id::InodeId,
 }
@@ -672,6 +675,18 @@ impl FileOps for PrimeDmaBufFile {
         Some(Arc::clone(&self.backing) as Arc<dyn MmapLifetime>)
     }
 
+    /// Linux `dma_buf_ioctl` against the buffer's shared reservation.
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn narf_filesystem::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            narf_filesystem::dma_buf::dma_buf_ioctl(&self.dma_buf, cmd, arg, context)
+        })
+    }
+
     /// This fd is an exported DRM buffer — hand back the GEM handle it
     /// wraps so `PRIME_FD_TO_HANDLE` can re-import it.
     fn as_prime_gem_handle(&self) -> Option<u32> {
@@ -738,9 +753,34 @@ impl FileOps for VirtGpuPrimeDmaBufFile {
         Some(Arc::clone(&self.resource) as Arc<dyn MmapLifetime>)
     }
 
+    /// Linux `dma_buf_ioctl` against the resource's shared reservation, which
+    /// also holds the WRITE fence of every EXECBUFFER that referenced it.
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn narf_filesystem::IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        Box::pin(async move {
+            narf_filesystem::dma_buf::dma_buf_ioctl(&self.resource.dma_buf, cmd, arg, context)
+        })
+    }
+
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
+}
+
+/// A PRIME dma-buf file for `resource`, as `drm_prime_export_file` mints
+/// one, for tests that have no live render-node open.
+#[cfg(all(feature = "kernel-test", target_arch = "x86_64"))]
+pub(crate) fn test_virtgpu_dma_buf_file(
+    resource: Arc<crate::drm_ioctl_bridge::VirtGpuResource>,
+) -> Arc<dyn FileOps> {
+    Arc::new(VirtGpuPrimeDmaBufFile {
+        resource,
+        inode: dma_buf_inode(),
+    })
 }
 
 /// Export the dumb buffer named by `gem_handle` on card `card_index` as an
@@ -750,7 +790,7 @@ impl FileOps for VirtGpuPrimeDmaBufFile {
 /// `None` if the handle has no dumb backing on that card.
 pub fn prime_export_fileops(card_index: u32, gem_handle: u32) -> Option<Arc<dyn FileOps>> {
     let ms = crate::drm_registry::mode_state(card_index)?;
-    let (phys, byte_len) = ms.lock().retain_dumb_backing(gem_handle)?;
+    let (phys, byte_len, dma_buf) = ms.lock().retain_dumb_backing(gem_handle)?;
     let backing = Arc::new(DumbBackingLease {
         card_index,
         gem_handle,
@@ -760,6 +800,7 @@ pub fn prime_export_fileops(card_index: u32, gem_handle: u32) -> Option<Arc<dyn 
         byte_len,
         gem_handle,
         backing,
+        dma_buf,
         inode: dma_buf_inode(),
     }))
 }

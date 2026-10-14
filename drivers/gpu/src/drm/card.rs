@@ -226,6 +226,10 @@ pub struct DumbBacking {
     /// right after ADDFB2 (kwin via Mesa GBM) loses its scanout buffer
     /// mid-flight and SETCRTC finds no source to blit.
     pub refcount: u32,
+    /// The buffer's dma-buf reservation and name. Every PRIME export of
+    /// this handle (and the handle an import resolves back to) shares it,
+    /// as Linux shares one `dma_resv` per GEM object.
+    pub dma_buf: Arc<narf_filesystem::dma_buf::DmaBufObject>,
 }
 
 /// A VirGL object imported through PRIME into the primary node's GEM
@@ -823,13 +827,16 @@ impl Card {
     /// Retain the dumb backing named by `gem_handle` and return the physical
     /// snapshot needed to build a dma-buf file. The reference must later be
     /// balanced with [`Self::remove_dumb_backing`].
-    pub fn retain_dumb_backing(&mut self, gem_handle: u32) -> Option<(u64, usize)> {
+    pub fn retain_dumb_backing(
+        &mut self,
+        gem_handle: u32,
+    ) -> Option<(u64, usize, Arc<narf_filesystem::dma_buf::DmaBufObject>)> {
         let backing = self
             .dumb_backings
             .iter_mut()
             .find(|b| b.gem_handle == gem_handle)?;
         backing.refcount = backing.refcount.checked_add(1)?;
-        Some((backing.phys, backing.byte_len))
+        Some((backing.phys, backing.byte_len, Arc::clone(&backing.dma_buf)))
     }
 
     /// Retain the dumb backing selected by a `MAP_DUMB` offset. This is the
@@ -868,6 +875,7 @@ impl Card {
             order,
             mmap_offset,
             refcount: 1,
+            dma_buf: Default::default(),
         });
         Ok(handle)
     }

@@ -1264,6 +1264,23 @@ and primary-plane binding; the boot resource is never exposed as a GEM object.
   `EMFILE` before GPU work is queued. EXECBUFFER syncobj records accept binary
   point zero and the input
   RESET flag; non-zero timeline points remain unsupported.
+- PRIME dma-buf fds (dumb-buffer and VirGL exports) answer Linux
+  `dma_buf_ioctl` through the generic
+  [`filesystem` dma-buf core](../../../filesystem/specification/spec.md#33-file-operations-async):
+  `DMA_BUF_IOCTL_SYNC`, `DMA_BUF_SET_NAME_A/_B`, and
+  `DMA_BUF_IOCTL_{EXPORT,IMPORT}_SYNC_FILE`. The reservation is per buffer,
+  not per fd: a dumb buffer's lives on its card `DumbBacking` (every export of
+  the handle, and the handle a re-import resolves to, share it); a VirGL
+  resource's lives on the shared `VirtGpuResource`, so every export and every
+  importing open see the same fences. EXECBUFFER adds its device fence to each
+  referenced resource's reservation as a WRITE fence, as Linux
+  `virtio_gpu_array_add_fence` does, so `EXPORT_SYNC_FILE` reports in-flight
+  GPU writes. VirtIO-GPU fences report driver `virtio_gpu`, timeline
+  `controlq`, the virtqueue fence id as seqno, and the first observed
+  completion instant as their timestamp. `VIRTGPU_WAIT` still waits on the
+  BO's last EXECBUFFER fence only; fences imported with `IMPORT_SYNC_FILE`
+  are not waited by `VIRTGPU_WAIT` or by a later EXECBUFFER (implicit sync of
+  imported fences into GPU submissions is not implemented).
 - A queued page-flip deadline remains advertised to poll until its event is
   consumed, even after the deadline expires. This closes the readiness-scan
   to park race: an event that becomes due in that interval forces an immediate
