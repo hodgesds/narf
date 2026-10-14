@@ -246,6 +246,21 @@ fn clear_snapshot(task_id: u64) {
     }
 }
 
+/// A parked select/pselect6 that signal delivery just completed as -EINTR
+/// (`abort_restart_pending_park_state`): it never re-executes, so finish it
+/// here. Drop the staged snapshot — left behind, the task's NEXT select took
+/// it as its own and waited on the old call's sets and timeout — and write
+/// back the time left before `deadline_ns`, which Linux's
+/// `poll_select_finish` does for -ERESTARTNOHAND too. The temporary pselect
+/// mask is not touched: delivery took it over for sigreturn.
+pub(crate) fn abort_interrupted(task_id: u64, deadline_ns: Option<u64>) {
+    let snapshot =
+        crate::task::task_get_local(task_id).and_then(|task| task.select_park.lock().take());
+    if let Some(snapshot) = snapshot {
+        write_remaining_timeout(snapshot.timeout, deadline_ns);
+    }
+}
+
 fn execute_snapshot(
     ctx: &mut dyn TrapContext,
     mut snapshot: SelectParkSnapshot,

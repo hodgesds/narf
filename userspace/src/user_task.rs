@@ -432,6 +432,19 @@ pub struct UserTaskCtx {
     /// re-reading a relative timeout. Zero uaddr = no restart pending.
     pub futex_restart_uaddr: AtomicU64,
     pub futex_restart_deadline_ns: AtomicU64,
+    /// `restart_block` of a RELATIVE nanosleep / clock_nanosleep a signal
+    /// interrupted (`hrtimer_nanosleep_restart`): the request pointer that
+    /// identifies the call and its ABSOLUTE monotonic expiry. When no handler
+    /// runs, the re-executed sleep resumes to that expiry instead of
+    /// re-reading the relative request and sleeping it again in full. Zero
+    /// request = no restart pending.
+    pub nanosleep_restart_req: AtomicU64,
+    pub nanosleep_restart_deadline_ns: AtomicU64,
+    /// The `timespec *` of an in-flight ppoll with a non-zero timeout, kept
+    /// across its re-executions so whichever path completes the call can
+    /// write the remaining time back (`poll_select_finish`), including a
+    /// signal delivery that turns the parked call into -EINTR. Zero = none.
+    pub ppoll_timeout_ptr: AtomicU64,
     /// True while a handler-driven futex wait (`futex_block`) has entries
     /// queued, so a teardown that never lets the handler unqueue them
     /// sweeps them instead (`futex_drop_task_waiters`).
@@ -736,6 +749,9 @@ impl UserTaskCtx {
             syscall_restart_kind: AtomicU32::new(SYSCALL_RESTART_SYS),
             futex_restart_uaddr: AtomicU64::new(0),
             futex_restart_deadline_ns: AtomicU64::new(0),
+            nanosleep_restart_req: AtomicU64::new(0),
+            nanosleep_restart_deadline_ns: AtomicU64::new(0),
+            ppoll_timeout_ptr: AtomicU64::new(0),
             futex_block_active: AtomicBool::new(false),
             kern_span_start_ns: AtomicU64::new(0),
             kern_account_ready: AtomicU64::new(0),

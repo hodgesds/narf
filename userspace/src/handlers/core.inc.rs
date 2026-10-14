@@ -43,23 +43,50 @@ pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
     }
 }
 
+/// Does a signal wake end a park with this `deadline` / `sigwait_set` now?
+/// A deliverable signal ends any interruptible sleep. Any wake ends an
+/// infinite wait (its park re-checks and re-parks if nothing is due) and a
+/// sigwait park (a just-queued in-set signal completes rt_sigtimedwait
+/// whatever its timeout). A non-deliverable wake leaves a timed sleep to
+/// run to its deadline.
+#[inline]
+fn signal_wake_cuts_deadline(deadline: u64, sigwait_set: u64, deliverable: bool) -> bool {
+    deliverable || deadline == u64::MAX || sigwait_set != 0
+}
+
+#[doc(hidden)]
+pub fn __test_signal_wake_cuts_deadline(deadline: u64, sigwait_set: u64, deliverable: bool) -> bool {
+    signal_wake_cuts_deadline(deadline, sigwait_set, deliverable)
+}
+
+/// Wake `task_id` for a signal-state change that is NOT known to be a signal
+/// it can take: a thread-directed raise it blocks, a job-control stop or
+/// continue, a ptrace resume, a vfork release. See [`signal_wake_up`].
 pub fn wake_signal(task_id: u64) {
+    signal_wake_up(task_id, false);
+}
+
+/// Linux `signal_wake_up`: fire `task_id`'s signal waker so its park loop
+/// re-checks its wait condition now.
+///
+/// `deliverable` says the wake is for a signal the thread can take
+/// (`wants_signal`: not blocked, or in its sigwait set; an ignored signal was
+/// already discarded at generation). Only such a wake reaches Linux's
+/// `signal_wake_up`, and it ends ANY `TASK_INTERRUPTIBLE` sleep, a timed
+/// one included — the syscall then returns its -EINTR / -ERESTART* as it
+/// defines. So it clears the park deadline outright, as the io-waiter wake
+/// `wake_one` does. Every other wake leaves a finite deadline alone: the
+/// park loop re-parks on a blocked signal, and a timed sleep runs to its
+/// deadline. Every sleeper keeps its absolute deadline outside
+/// `sleep_deadline_ns` (`blocking_deadline_ns`, its own restart record, a
+/// local), so a cleared deadline never re-arms a fresh full timeout.
+pub(crate) fn signal_wake_up(task_id: u64, deliverable: bool) {
     // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
     // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
     let sem_wait = crate::user_task::with_user_task_ctx(task_id, |uctx| {
-        // Clear the park deadline so the woken task re-executes its syscall (and
-        // re-checks the signal) NOW instead of sleeping to the ~1-tick wheel
-        // backstop. Two cases, mirroring the io-waiter wake `wake_one`:
-        //   * an infinite wait (pause / sigwaitinfo(NULL) / epoll_wait) — always;
-        //   * a task parked in sigwait with a FINITE timeout (rt_sigtimedwait,
-        //     sigwait_set != 0) — a just-queued in-set signal must complete the
-        //     wait immediately (Linux signal_wake_up), not at the timeout.
-        // A finite deadline on a NON-sigwait sleeper (nanosleep) is left intact:
-        // a blocked/ignored signal must not cut a timed sleep short (Linux only
-        // interrupts on a *deliverable* signal, handled on the re-executed
-        // syscall's return, not here).
         let deadline = uctx.sleep_deadline_ns.load(Ordering::Acquire);
-        if deadline == u64::MAX || uctx.sigwait_set.load(Ordering::Acquire) != 0 {
+        let sigwait_set = uctx.sigwait_set.load(Ordering::Acquire);
+        if signal_wake_cuts_deadline(deadline, sigwait_set, deliverable) {
             uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
         uctx.sem_wait_pending.load(Ordering::Acquire).then(|| {
@@ -2495,13 +2522,22 @@ fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
 /// Release the cross-execution park state of a restart-pending syscall
 /// whose signal delivery just completed it as -EINTR (see
 /// `default_signal_delivery_restart_pending`): the re-execution that would
-/// normally re-check/unwind that state never happens. Today the only park
-/// state that deliberately persists across re-executions is the FIFO
-/// open's pre-installed fd — remove it so its open count stops
-/// advertising a phantom endpoint to the peer rendezvous. Also drops the
-/// restart marker: the syscall is complete.
+/// normally re-check/unwind that state never happens, so everything a park
+/// keeps across its re-executions goes here: the FIFO open's pre-installed
+/// fd (whose open count would otherwise advertise a phantom endpoint to the
+/// peer rendezvous), the timed waits' persisted deadline and restart
+/// records, and poll/select's entry-time state — select also writes back
+/// its remaining time, as `poll_select_finish` does for -ERESTARTNOHAND.
+/// Also drops the restart marker: the syscall is complete.
 pub(crate) fn abort_restart_pending_park_state(task: u64) {
     if let Some(uctx) = crate::user_task::current_user_task() {
+        // SAFETY: the in-flight task's poller-pinned ctx, live for this trap.
+        let uc = unsafe { &*uctx };
+        let deadline = uc
+            .blocking_deadline_ns
+            .load(core::sync::atomic::Ordering::Acquire);
+        crate::select::abort_interrupted(task, (deadline != 0).then_some(deadline));
+        crate::poll::abort_interrupted(task, uc);
         // SAFETY: the in-flight task's poller-pinned ctx; atomics only.
         let pending = unsafe {
             (*uctx)
@@ -2515,6 +2551,22 @@ pub(crate) fn abort_restart_pending_park_state(task: u64) {
             // (`futex_wait_restart`) will never run.
             (*uctx)
                 .futex_restart_uaddr
+                .store(0, core::sync::atomic::Ordering::Release);
+            // Likewise a relative nanosleep's (`hrtimer_nanosleep_restart`).
+            (*uctx)
+                .nanosleep_restart_req
+                .store(0, core::sync::atomic::Ordering::Release);
+            // The call is over, so the deadline poll/select/epoll_wait (and
+            // the other timed waits) keep across their re-executions in
+            // `blocking_deadline_ns` must go with it. Left behind, the NEXT
+            // timed call took it as its own: a fresh 300 ms poll after an
+            // interrupted 5 s one slept the old call's remaining ~4.7 s, and
+            // a fresh 2 s poll after an interrupted one timed out early.
+            (*uctx)
+                .blocking_deadline_ns
+                .store(0, core::sync::atomic::Ordering::Release);
+            (*uctx)
+                .sleep_deadline_ns
                 .store(0, core::sync::atomic::Ordering::Release);
             (*uctx)
                 .fifo_open_pending_fd
@@ -10710,7 +10762,7 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
         .collect();
     for s in siblings {
         raise_signal_pending(s, 9); // SIGKILL
-        wake_signal(s);
+        signal_wake_up(s, true);
     }
 }
 
@@ -13245,7 +13297,7 @@ pub(crate) fn complete_group_signal(target: u64, signum: u32) {
         found
     };
     if let Some(t) = chosen {
-        wake_signal(t);
+        signal_wake_up(t, true);
         narf_scheduler::kick_task(t);
     }
 }
@@ -13268,7 +13320,7 @@ pub(crate) fn retarget_shared_pending(task: u64, newly_unwanted: u64) {
             .copied()
             .find(|&t| t != task && wants_signal(t, signum))
         {
-            wake_signal(t);
+            signal_wake_up(t, true);
             narf_scheduler::kick_task(t);
         }
     }

@@ -203,7 +203,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // restarts — with the remaining time — only when none runs.
             if futex_wait_one(ctx, uaddr, key, val, deadline, bitset) {
                 match deadline {
-                    None => futex_wait_restart(ctx, crate::user_task::SYSCALL_RESTART_SYS),
+                    None => restart_interrupted_syscall(ctx, crate::user_task::SYSCALL_RESTART_SYS),
                     Some(d) => {
                         if let Some(u) = crate::user_task::current_user_task() {
                             // SAFETY: uctx is live for this trap; atomics.
@@ -212,7 +212,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
                                 (*u).futex_restart_uaddr.store(uaddr, Ordering::Release);
                             }
                         }
-                        futex_wait_restart(ctx, crate::user_task::SYSCALL_RESTART_RESTARTBLOCK);
+                        restart_interrupted_syscall(ctx, crate::user_task::SYSCALL_RESTART_RESTARTBLOCK);
                     }
                 }
             }

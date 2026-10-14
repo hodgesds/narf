@@ -168,6 +168,6 @@ pub(crate) fn sys_futex_wait(ctx: &mut dyn TrapContext) {
         deadline,
         args.arg2 as u32,
     ) {
-        futex_wait_restart(ctx, crate::user_task::SYSCALL_RESTART_SYS);
+        restart_interrupted_syscall(ctx, crate::user_task::SYSCALL_RESTART_SYS);
     }
 }

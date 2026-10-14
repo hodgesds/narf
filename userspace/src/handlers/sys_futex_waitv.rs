@@ -137,7 +137,7 @@ pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
         FutexBlock::Woken(idx) => ctx.set_return(SyscallReturn::ok(idx as u64)),
         FutexBlock::Errno(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
         FutexBlock::Interrupted => {
-            futex_wait_restart(ctx, crate::user_task::SYSCALL_RESTART_SYS)
+            restart_interrupted_syscall(ctx, crate::user_task::SYSCALL_RESTART_SYS)
         }
         FutexBlock::NoExecutor => {
             // The legacy re-check park can follow only one word: every word

@@ -8536,7 +8536,7 @@ fn raise_signal_pending_inner(
     }) else {
         return;
     };
-    signal_raise_notify(task, was_empty);
+    signal_raise_notify(task, signum, was_empty);
     // On SMP the parent consuming CLD_CONTINUED and the resumed child can run
     // concurrently, so prefer the child on the sender's CPU when it is local.
     // On UP this would overwrite push_stopcont_report's waiter-first hint and
@@ -8707,7 +8707,7 @@ fn set_pending_signal_bit(slot: &mut u64, signum: u32) {
 /// path ([`sigqueue_store_and_raise_bit`]) can set the pending bit UNDER the
 /// sigqueue bucket lock and then run this notify OUTSIDE that lock (wakes and
 /// generation shards must not nest beneath it).
-fn signal_raise_notify(task: u64, was_empty: bool) {
+fn signal_raise_notify(task: u64, signum: u32, was_empty: bool) {
     if was_empty {
         signal_bits_update_or_init(&SIGNAL_READABLE_GEN, task, |generation| {
             *generation = generation.wrapping_add(1);
@@ -8720,7 +8720,12 @@ fn signal_raise_notify(task: u64, was_empty: bool) {
     // queue on delivery) so an EPOLLET consumer re-fires on a drain→re-raise
     // refill; the fd's poll_readiness still gates delivery on its mask.
     crate::io_mux::wake_signalfds(task);
-    wake_signal(task);
+    // `complete_signal` on a thread-directed send: only a thread that
+    // `wants_signal` gets `signal_wake_up`, which interrupts its sleep. One
+    // that blocks the signal just has it queued — the wake still fires (its
+    // park re-checks; a sigwait/signalfd may want it) but must not cut a
+    // timed sleep short.
+    signal_wake_up(task, wants_signal(task, signum));
     // `signal_wake_up` -> `kick_process`: a target running user code on
     // another CPU must pass through a kernel exit to take the signal now.
     narf_scheduler::kick_task(task);
@@ -8860,7 +8865,7 @@ pub(crate) fn raise_sigio_pending(
         if let Some((_depth, was_empty)) =
             sigqueue_store_and_raise_bit(task, SIGIO, 0x80, 0, 0)
         {
-            signal_raise_notify(task, was_empty);
+            signal_raise_notify(task, SIGIO, was_empty);
         }
         return;
     }
@@ -8880,7 +8885,7 @@ pub(crate) fn raise_sigio_pending(
         configured_signal,
         QueuedSiginfo::sigpoll(si_code, fd, poll_band),
     ) {
-        Some((_depth, was_empty)) => signal_raise_notify(task, was_empty),
+        Some((_depth, was_empty)) => signal_raise_notify(task, configured_signal, was_empty),
         None => {
             // Linux falls through to do_send_sig_info(SIGIO, SEND_SIG_PRIV)
             // when the configured realtime signal cannot be queued.
@@ -8888,7 +8893,7 @@ pub(crate) fn raise_sigio_pending(
             if let Some((_depth, was_empty)) =
                 sigqueue_store_and_raise_bit(task, SIGIO, 0x80, 0, 0)
             {
-                signal_raise_notify(task, was_empty);
+                signal_raise_notify(task, SIGIO, was_empty);
             }
         }
     }
@@ -9355,7 +9360,7 @@ fn sigqueue_deliver_imported(target: u64, sig: u32, info: ImportedSiginfo) -> Op
     let resumed_stopped_task = signal_stopcont_interaction(target, sig);
     let (depth, was_empty) =
         sigqueue_store_and_raise_bit(target, sig, info.code, info.value, info.pid)?;
-    signal_raise_notify(target, was_empty);
+    signal_raise_notify(target, sig, was_empty);
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if resumed_stopped_task
         && prefer_resumed_child_handoff(narf_scheduler::online_cpu_set().bits())
@@ -10798,7 +10803,7 @@ pub(crate) enum FutexBlock {
     /// no wake). Positive errno.
     Errno(i64),
     /// A signal is pending (`-ERESTARTSYS` in `__futex_wait`). The caller
-    /// picks the restart semantics and rewinds via [`futex_wait_restart`].
+    /// picks the restart semantics and rewinds via [`restart_interrupted_syscall`].
     Interrupted,
     /// No own-stack executor to park on (the in-kernel test harness, or the
     /// legacy longjmp model): the caller falls back to its re-check park.
@@ -11048,12 +11053,13 @@ pub(crate) fn futex_block(
     }
 }
 
-/// End a [`futex_block`] that reported [`FutexBlock::Interrupted`]: rewind
+/// End a blocking wait a signal interrupted — a [`futex_block`] that
+/// reported [`FutexBlock::Interrupted`], an interrupted nanosleep: rewind
 /// the syscall so signal delivery sees a restart-pending frame, and record
 /// which Linux restart errno the wait stands for (`kind`, one of the
 /// `SYSCALL_RESTART_*` constants). With a handler, delivery then completes
 /// the syscall as -EINTR or keeps the rewind; with none, it re-executes.
-pub(crate) fn futex_wait_restart(ctx: &mut dyn TrapContext, kind: u32) {
+pub(crate) fn restart_interrupted_syscall(ctx: &mut dyn TrapContext, kind: u32) {
     #[cfg(target_arch = "x86_64")]
     const SYSCALL_INSN_LEN: u64 = 2;
     #[cfg(target_arch = "aarch64")]

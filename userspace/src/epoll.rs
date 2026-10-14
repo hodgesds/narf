@@ -1556,7 +1556,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     // size — so a caller passing the wrong sigset width had its mask quietly
     // not applied and still got its events, which is the worst outcome: the
     // signal it was blocking could be delivered inside the wait.
-    let mut old_mask = None;
+    let mut mask_active = false;
     if is_pwait && sigmask_ptr != 0 {
         if sigsetsize != 8 {
             ctx.set_return(to_ret(EINVAL));
@@ -1566,8 +1566,13 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
         // SAFETY: sigsetsize == 8 checked above; copy_from_user range-validates
         // `sigmask_ptr` and SMAP-brackets the read into `buf`.
         if unsafe { crate::handlers::copy_from_user(&mut buf, sigmask_ptr) }.is_ok() {
+            // `set_user_sigmask`: the caller's mask is saved for the return
+            // (`restore_saved_sigmask_unless`), and the wait — park included —
+            // runs under this one. A re-execution after a park finds it
+            // installed and keeps the saved original.
             let mask = u64::from_ne_bytes(buf); // user sigset_t == NARF N-1 layout
-            old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
+            crate::handlers::install_temporary_signal_mask(task, mask);
+            mask_active = true;
         } else {
             ctx.set_return(to_ret(EFAULT));
             return;
@@ -1588,9 +1593,12 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     // ahead of the fd lookup and collapsed all four into one `-1`, so an event
     // loop that closed its epfd saw "Operation not permitted" rather than the
     // EBADF that tells it to rebuild the loop.
-    let restore = |task: u64, old_mask: Option<u64>| {
-        if let Some(old) = old_mask {
-            crate::handlers::set_signal_mask_for_task(task, old);
+    // Put the caller's mask back on a return that delivers no signal; when
+    // one was delivered, the handler frame took the saved mask over and
+    // sigreturn restores it (`restore_saved_sigmask_unless(error == -EINTR)`).
+    let restore = |task: u64, mask_active: bool| {
+        if mask_active {
+            crate::handlers::restore_temporary_signal_mask(task);
         }
     };
 
@@ -1600,28 +1608,28 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
     let ops = match epoll_ops(task, epfd) {
         Some(o) => o,
         None => {
-            restore(task, old_mask);
+            restore(task, mask_active);
             ctx.set_return(to_ret(EBADF));
             return;
         }
     };
     // `maxevents` is an `int`; the register's upper half is not part of it.
     if maxevents <= 0 || maxevents > EP_MAX_EVENTS {
-        restore(task, old_mask);
+        restore(task, mask_active);
         ctx.set_return(to_ret(EINVAL));
         return;
     }
     // access_ok over the WHOLE output array, before any of it is written.
     let span = (maxevents as usize).saturating_mul(EPOLL_EVENT_SIZE);
     if crate::handlers::validate_user_range(events_ptr as u64, span).is_err() {
-        restore(task, old_mask);
+        restore(task, mask_active);
         ctx.set_return(to_ret(EFAULT));
         return;
     }
     let instance = match as_epoll(&ops) {
         Some(i) => i,
         None => {
-            restore(task, old_mask);
+            restore(task, mask_active);
             ctx.set_return(to_ret(EINVAL)); // not an epoll fd
             return;
         }
@@ -1718,16 +1726,14 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                 )
                 .is_err()
                 {
-                    restore(task, old_mask);
+                    restore(task, mask_active);
                     // The array was access_ok'd above; a fault here is a
                     // racing unmap, and `ep_send_events` reports it as -EFAULT.
                     ctx.set_return(to_ret(EFAULT));
                     return;
                 }
             }
-            if let Some(old) = old_mask {
-                crate::handlers::set_signal_mask_for_task(task, old);
-            }
+            restore(task, mask_active);
             instance.disarm_readiness_cells(task);
             ctx.set_return(SyscallReturn::ok(n as u64));
             return;
@@ -1735,9 +1741,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
 
         match deadline_ns {
             Some(0) => {
-                if let Some(old) = old_mask {
-                    crate::handlers::set_signal_mask_for_task(task, old);
-                }
+                restore(task, mask_active);
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
@@ -1753,9 +1757,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
                     };
                 }
-                if let Some(old) = old_mask {
-                    crate::handlers::set_signal_mask_for_task(task, old);
-                }
+                restore(task, mask_active);
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
@@ -1768,39 +1770,31 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         // route back to an executor. Fall through to the
                         // non-blocking fallback below rather than spinning.
                     } else {
-                        // Check for signals. If delivered, return -EINTR.
-                        if let Some(h) = crate::signal_delivery_hook() {
-                            if h(ctx, crate::Syscall::EpollWait.raw()) {
-                                // Signal delivered. Interrupt syscall with EINTR.
-                                instance.disarm_readiness_cells(task);
-                                if let Some(old) = old_mask {
-                                    crate::handlers::set_signal_mask_for_task(task, old);
-                                }
-                                ctx.set_return(to_ret(EINTR));
-                                // SAFETY: `uctx_ptr` is the in-flight task's
-                                // `UserTaskCtx` from `CURRENT`, live for this trap;
-                                // `sleep_deadline_ns` is an atomic field, so the
-                                // store needs only a valid pointer.
-                                // SAFETY: Valid memory or trusted environment
-                                unsafe {
-                                    (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
-                                    (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
-                                };
-                                return;
+                        // A pending signal ends the wait with -EINTR. The
+                        // return value goes in BEFORE delivery: the handler
+                        // frame saves the registers as they are now and
+                        // sigreturn restores exactly those — set after, the
+                        // caller got the syscall number back instead.
+                        if crate::handlers::has_interrupting_signal(task) {
+                            ctx.set_return(to_ret(EINTR));
+                            if let Some(h) = crate::signal_delivery_hook() {
+                                let _ = h(ctx, crate::Syscall::EpollWait.raw());
                             }
+                            instance.disarm_readiness_cells(task);
+                            restore(task, mask_active);
+                            // SAFETY: `uctx_ptr` is the in-flight task's
+                            // `UserTaskCtx` from `CURRENT`, live for this trap;
+                            // `sleep_deadline_ns` is an atomic field, so the
+                            // store needs only a valid pointer.
+                            unsafe {
+                                (*uctx_ptr).sleep_deadline_ns.store(0, Ordering::Release);
+                                (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
+                            };
+                            return;
                         }
 
-                        // epoll_pwait: restore the caller's signal mask before we
-                        // park. This syscall re-executes from the top on resume
-                        // (RIP rewind below), which re-applies the pwait sigmask and
-                        // re-snapshots the "old" mask. If we left the pwait mask
-                        // applied across the park, that re-snapshot would capture
-                        // the ALREADY-modified mask and the caller's original would
-                        // be lost permanently. (The pre-park signal check above
-                        // already ran with the pwait mask applied.)
-                        if let Some(old) = old_mask {
-                            crate::handlers::set_signal_mask_for_task(task, old);
-                        }
+                        // epoll_pwait parks under its own mask, as Linux sleeps
+                        // with it: a signal it unblocks ends the wait.
                         // Debug-feature only: what the interest set looked
                         // like at the instant we committed to a park. Covers
                         // BOTH finite and infinite timeouts — systemd/PID 1's
@@ -1973,6 +1967,19 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
                             if own_stack {
                                 crate::handlers::own_stack_block(ctx);
+                                // `ep_poll`: a signal ends the wait with a
+                                // plain -EINTR — not a restart code, so a
+                                // stop/continue or a SA_RESTART handler still
+                                // sees EINTR (signal(7)) — after one more
+                                // look for events and the timeout, which
+                                // win over it. Run that pass now rather than
+                                // handing the exit trap a restart-pending
+                                // frame, which would restart the wait.
+                                if crate::handlers::has_interrupting_signal(task) {
+                                    ctx.set_rip(ctx.rip().wrapping_add(2));
+                                    uc.syscall_parked_restarting.store(false, Ordering::Release);
+                                    continue;
+                                }
                                 return;
                             }
                             // `can_park_with_task_context` above established that
@@ -1987,6 +1994,7 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                 // there is no cooperative way to block, so report no
                 // events ready rather than spinning forever. A real
                 // task always took the park path above.
+                restore(task, mask_active);
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }

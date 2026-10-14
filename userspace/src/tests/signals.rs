@@ -597,6 +597,35 @@ kernel_test_in!(
     smoke_userspace_signal_wakers_are_sharded_and_isolated
 );
 
+/// Linux `complete_signal` -> `signal_wake_up` only for a thread that
+/// `wants_signal`, and that wake ends ANY interruptible sleep, a timed one
+/// included. A wake for a signal the thread blocks (a thread-directed raise
+/// just queues it) must leave a timed sleep's deadline alone. The ring-3
+/// side is `sigwake_wait_smoke`'s `timed/*` cases.
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_signal_wake_cuts_deadline_only_when_deliverable() -> TestResult {
+    use crate::handlers::__test_signal_wake_cuts_deadline as cuts;
+    const FINITE: u64 = 123_456_789;
+    if !cuts(FINITE, 0, true) {
+        return TestResult::Fail("a deliverable signal left a timed sleep parked to its deadline");
+    }
+    if cuts(FINITE, 0, false) {
+        return TestResult::Fail("a blocked signal's wake cut a timed sleep short");
+    }
+    if !cuts(u64::MAX, 0, false) {
+        return TestResult::Fail("a signal wake left an infinite wait parked");
+    }
+    if !cuts(FINITE, 1 << 9, false) {
+        return TestResult::Fail("a signal wake left a timed rt_sigtimedwait parked");
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_signal_wake_cuts_deadline_only_when_deliverable
+);
+
 #[cfg(not(feature = "user-mode-e2e"))]
 fn smoke_userspace_sigqueue_is_sharded_fifo_and_isolated() -> TestResult {
     use crate::handlers::{
