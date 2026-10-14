@@ -32,6 +32,28 @@ pub struct DmaBuffer<T> { pa: PhysAddr, va: VirtAddr, size: usize, _m: PhantomDa
 
 pub fn alloc_dma<T>(n: usize, dev: &BusDevice) -> DmaBuffer<T>;
 
+/// Bounded recycler for one hardware RX or TX queue. Construct, `prepare`,
+/// and `prefill` it before the queue is made live. `try_acquire` and
+/// `release` are the packet/completion-path API: neither may allocate.
+pub struct DmaPool { /* fixed-length coherent-buffer recycler */ }
+pub struct DmaPoolStats {
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub recycle_drops: u64,
+}
+impl DmaPool {
+    pub const fn new(buf_len: usize, domain: DomainId, cap: usize) -> Self;
+    pub fn prepare(&self) -> bool;
+    pub fn prefill(&self, n: usize) -> usize;
+    pub fn try_acquire(&self) -> Option<DmaBuffer>;
+    pub fn try_acquire_batch(&self, out: &mut [Option<DmaBuffer>]) -> usize;
+    pub fn release(&self, buf: DmaBuffer);
+    pub fn release_batch(&self, bufs: &mut [Option<DmaBuffer>]) -> usize;
+    /// Setup/recovery only: may allocate when the recycler is empty.
+    pub fn acquire(&self) -> Option<DmaBuffer>;
+    pub fn stats(&self) -> DmaPoolStats;
+}
+
 pub fn map_p2p(src: &BusDevice, dst: &BusDevice, buf: &DmaBuffer<T>)
     -> Result<P2pBinding, IoError>;
 
@@ -59,6 +81,12 @@ pub fn register_fault_handler(dev: &BusDevice, h: IoFaultHandler);
 
 IOMMU: each driver gets its own IOMMU context so a malicious device
 cannot DMA outside the buffers its driver explicitly mapped.
+
+`DmaPool` is deliberately per queue, rather than a global allocator cache:
+that maintains NUMA/device affinity and prevents unrelated RX/TX completion
+cores from contending on a shared recycler. The hot path treats an empty pool
+as bounded backpressure; only queue setup or a refill/recovery worker may call
+the allocating APIs.
 
 ## 4. Invariants & safety properties
 
@@ -94,6 +122,15 @@ cannot DMA outside the buffers its driver explicitly mapped.
   Freeing a `DmaBuffer` whose device has not yielded a terminal
   completion is a UAF — the spec forbids it and debug builds
   assert. See `abi/` §3.1.
+- A `DmaPool` receives a buffer only after that buffer's device ownership has
+  ended at a validated RX/TX terminal completion. A driver never recycles a
+  buffer still described by a live hardware descriptor.
+- Queue setup calls `prepare` before enabling IRQ/NAPI-like poll work. The
+  packet and completion path uses only `try_acquire` / `release` (or their
+  batch forms): they do not allocate, resize metadata, or fall back to the
+  buddy/slab allocator. A full or unprepared recycler drops its returned
+  buffer only after releasing its queue-local lock; an empty recycler reports
+  backpressure.
 
 ## 5. Architecture notes
 

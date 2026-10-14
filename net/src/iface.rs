@@ -215,6 +215,10 @@ pub fn set_software_gro(name: &str, enabled: bool) -> bool {
 pub fn enable_zero_copy_tx(name: &str, send_frame: SendFrameFn, buf_len: usize, cap: usize) {
     use narf_lib::id::DomainId;
     let pool = Arc::new(DmaPool::new(buf_len, DomainId::DRIVER_0, cap));
+    // Queue setup is the only place this generic pool may allocate. The
+    // packet path below uses `try_acquire`, so an empty pool falls back to the
+    // driver's regular send path instead of allocating in a hot poll.
+    let _ = pool.prefill(cap);
     enable_zero_copy_tx_pool(name, send_frame, pool, 0);
 }
 
@@ -248,8 +252,9 @@ pub fn enable_zero_copy_tx_pool(
 /// head-room, for the stack to build into. Returns `None` — so the caller
 /// falls back to the classic copy path — when the iface has not opted into
 /// zero-copy TX, when `headroom + len` exceeds the pool's buffer size (e.g. a
-/// TSO super-frame larger than the pool buffer), or when the allocator is out
-/// of memory.
+/// TSO super-frame larger than the pool buffer), or when no prefilled buffer
+/// is available. The packet path deliberately does not allocate a replacement;
+/// queue setup/refill owns that slow path.
 pub fn tx_acquire(name: &str, len: usize) -> Option<crate::Frame> {
     let (pool, headroom) = {
         let g = IFACES.lock();
@@ -263,7 +268,7 @@ pub fn tx_acquire(name: &str, len: usize) -> Option<crate::Frame> {
         return None;
     }
     Some(crate::Frame::with_offset(
-        pool.acquire()?,
+        pool.try_acquire()?,
         headroom as u32,
         len as u32,
     ))

@@ -319,19 +319,17 @@ pub struct VirtioNetPci {
     /// driver-match registry + re-walk PCI) is idempotent — we
     /// recognise the device and don't push a duplicate controller.
     cfg_phys: u64,
-    /// Recycled TX DMA buffers (Linux `page_pool`-style). A completed
-    /// transmit returns its 4 KiB buffer here instead of freeing it, and
-    /// `tx_buf_acquire` pops from here instead of `alloc_coherent` — keeping
-    /// the coherent/buddy allocator off the per-frame TX hot path. Capped at
-    /// `TX_POOL_CAP`; overflow drops (frees) the buffer. `Arc` so zero-copy TX
-    /// (P-F) can share this exact pool with the iface layer: the stack's
-    /// `tx_acquire` draws from it and this driver's TX reaper recycles into it.
+    /// Recycled TX DMA buffers (Linux `page_pool`-style). Queue setup pre-fills
+    /// this pool; `tx_buf_acquire` consumes only those prepared buffers, so an
+    /// empty pool applies backpressure instead of reaching the buddy allocator.
+    /// A completed transmit returns its 4 KiB buffer here. `Arc` lets zero-copy
+    /// TX share the same lifecycle with the iface layer.
     tx_pool: Arc<DmaPool>,
     /// Recycled RX DMA buffers (the RX frame/`skb` pool). The forwarder returns
     /// each fully-consumed RX buffer here instead of freeing it, and
-    /// `rx_take_on` pops from here for the replacement it posts back to the
-    /// device — keeping the buddy allocator off the per-frame RX hot path.
-    /// Capped at `RX_POOL_CAP`. Shared `DmaPool`.
+    /// `rx_take_on` pops a prepared replacement to post back to the device.
+    /// Empty means backpressure; it must not allocate while polling. Capped at
+    /// `RX_POOL_CAP`. Shared `DmaPool` for this compatibility driver.
     rx_pool: DmaPool,
 }
 
@@ -748,6 +746,12 @@ impl VirtioNetPci {
             rx_pool: DmaPool::new(4096, DomainId::DRIVER_0, RX_POOL_CAP),
         };
 
+        // Preparation is deliberately outside all packet/IRQ paths. A failed
+        // prefill leaves the corresponding hot path empty/backpressured rather
+        // than smuggling a buddy allocation into the poll loop.
+        let _ = this.tx_pool.prefill(TX_POOL_CAP);
+        let _ = this.rx_pool.prefill(RX_POOL_CAP);
+
         // VirtIO 1.2 §5.1.6.5.5: after DRIVER_OK, tell the device
         // how many queue pairs to actually use. Without this command
         // the device defaults to a single pair even though we
@@ -950,10 +954,10 @@ impl VirtioNetPci {
     /// VIRTIO_NET_F_MQ negotiated and >1 pairs active, parallel
     /// callers fan out across the device's TX virtqueues; with a
     /// single pair the round-robin degenerates to "always pair 0".
-    /// Take a 4 KiB TX DMA buffer — recycled from `tx_pool` if available,
-    /// else a fresh coherent allocation. Pairs with `tx_buf_release`.
+    /// Take a prepared 4 KiB TX DMA buffer, or return `None` for backpressure.
+    /// Pairs with `tx_buf_release`; never allocates in the packet path.
     fn tx_buf_acquire(&self) -> Option<DmaBuffer> {
-        self.tx_pool.acquire()
+        self.tx_pool.try_acquire()
     }
 
     /// Return a completed TX DMA buffer to `tx_pool` for reuse, or drop it
@@ -962,12 +966,12 @@ impl VirtioNetPci {
         self.tx_pool.release(buf);
     }
 
-    /// Take a 4 KiB RX DMA buffer — recycled from the RX frame pool if
-    /// available, else a fresh coherent allocation. The device overwrites the
-    /// whole buffer on receive, so a recycled (un-zeroed) buffer is fine.
-    /// Pairs with [`Self::rx_buf_release`].
+    /// Take a prepared 4 KiB RX DMA buffer. The device overwrites the whole
+    /// buffer on receive, so recycled (un-zeroed) storage is safe. `None`
+    /// applies backpressure; it never falls back to allocation. Pairs with
+    /// [`Self::rx_buf_release`].
     pub fn rx_buf_acquire(&self) -> Option<DmaBuffer> {
-        self.rx_pool.acquire()
+        self.rx_pool.try_acquire()
     }
 
     /// Return a fully-consumed RX DMA buffer to the RX frame pool for reuse,
@@ -2001,8 +2005,8 @@ fn vnet0_send_fn(frame: &[u8], _meta: narf_net::TxMeta) -> Result<(), ()> {
     if frame.is_empty() || frame.len() > MAX_FRAME - 12 {
         return Err(());
     }
-    // Take a recycled TX buffer (or a fresh coherent alloc) from the pool,
-    // keeping the page allocator off the per-frame TX hot path.
+    // Take a prepared TX buffer. An empty pool is backpressure; the send fails
+    // rather than allocating from the page allocator on the frame path.
     let mut buf = with_controller(|c| c.tx_buf_acquire())
         .flatten()
         .ok_or(())?;
