@@ -57,6 +57,8 @@ pub struct Sink {
     pub lttpr_uhbr: Option<u8>,
     /// DP_FEC_CAPABILITY's FEC_CAPABLE (0x090 bit 0), read from DPCD 1.4 on.
     pub fec: bool,
+    /// DSC decoder caps (DPCD 0x060-0x06F), read from DPCD 1.4 on.
+    pub dsc: Option<[u8; 16]>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
@@ -212,8 +214,12 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
         transfer(io, instance, 0x90, 0x2215, &mut uhbr).await?;
     }
     let mut fec = [0; 1];
+    let mut dsc = None;
     if dpcd[0] >= 0x14 {
         transfer(io, instance, 0x90, 0x90, &mut fec).await?;
+        let mut caps = [0; 16];
+        transfer(io, instance, 0x90, 0x60, &mut caps).await?;
+        dsc = Some(caps);
     }
     Ok(Sink {
         dpcd: Some(dpcd),
@@ -222,6 +228,7 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
         uhbr: uhbr[0] & 7,
         lttpr_uhbr,
         fec: fec[0] & 1 != 0,
+        dsc,
     })
 }
 
@@ -311,6 +318,7 @@ impl Probe {
                                 uhbr: 0,
                                 lttpr_uhbr: None,
                                 fec: false,
+                                dsc: None,
                             })
                             .map_err(Error::Ddc)
                     }

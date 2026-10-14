@@ -64,6 +64,8 @@ pub struct Selection {
     pub ycbcr420: bool,
     /// HDMI over FRL at this rate rather than TMDS.
     pub frl: Option<FrlRate>,
+    /// DP compressed by the pipe's DSC on this link.
+    pub dsc: Option<crate::amdgpu_dsc::DscConfig>,
 }
 
 /// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
@@ -488,6 +490,8 @@ pub struct DpCaps {
     /// 8b/10b trains with FEC (dp_should_enable_fec), costing 3% of the
     /// link.
     pub fec: bool,
+    /// The sink's DSC decoder (no dongle, so no branch caps).
+    pub dsc: Option<crate::amdgpu_dsc::DscSinkCaps>,
 }
 impl DpCaps {
     /// No DP link: an HDMI selection's.
@@ -496,6 +500,7 @@ impl DpCaps {
         rate: LinkRate::Rbr,
         uhbr: 0,
         fec: false,
+        dsc: None,
     };
     /// The usable UHBR rates, ascending.
     pub fn uhbr_rates(self) -> impl Iterator<Item = otg::UhbrRate> {
@@ -548,6 +553,9 @@ pub fn dp_caps(path: &inventory::Path, sink: &display::Sink) -> Option<DpCaps> {
         rate,
         uhbr,
         fec: sink.fec,
+        dsc: sink
+            .dsc
+            .and_then(|b| crate::amdgpu_dsc::DscSinkCaps::parse(&b, &[0; 3])),
     })
 }
 
@@ -605,11 +613,65 @@ pub fn dp_link(timing: &Timing, caps: DpCaps) -> Option<(u8, DpRate)> {
 /// selected offers what its caps carry (Linux's verified link cap); one that
 /// fell back offers only what the trained link carries.
 fn dp_offer_fits(timing: &Timing, s: &Selection) -> bool {
-    if dp_link(&s.timing, s.caps) == Some((s.lanes, s.rate)) {
-        dp_link(timing, s.caps).is_some()
+    if dp_link(&s.timing, s.caps) == Some((s.lanes, s.rate)) || s.dsc.is_some() {
+        dp_link(timing, s.caps).is_some() || dp_dsc(timing, s.caps, NOMINAL_DISPCLK_KHZ).is_some()
     } else {
         dp_fits(timing, s.caps, s.lanes, s.rate)
     }
+}
+
+/// dcn4_soc_bb's DISPCLK maximum: DSC decisions before the board's levels
+/// are known use it, and are redone with the board's (`refine_dsc`).
+const NOMINAL_DISPCLK_KHZ: u32 = 2_000_000;
+
+/// The DSC view of an 8-bit RGB DP stream.
+fn dsc_timing(t: &Timing) -> crate::amdgpu_dsc::DscTiming {
+    crate::amdgpu_dsc::DscTiming {
+        pix_clk_100hz: t.pixel_clock_khz * 10,
+        h_active: t.h_active,
+        h_total: t.h_total,
+        v_active: t.v_active,
+        v_total: t.v_total,
+        bpc: 8,
+        encoding: crate::amdgpu_dsc::Encoding::Rgb,
+    }
+}
+
+/// amdgpu_dm's SST DSC policy (apply_dsc_policy_for_stream) where this
+/// driver can carry DSC: a FEC-capable DSC sink without 128b/132b, whose
+/// uncompressed stream exceeds its maximum 8b/10b link (FEC included) is
+/// compressed to the highest bpp that link carries, on one DSC (at most
+/// four slices). DSC over 128b/132b (HPO) is not implemented.
+pub fn dp_dsc(
+    timing: &Timing,
+    caps: DpCaps,
+    max_dispclk_khz: u32,
+) -> Option<crate::amdgpu_dsc::DscConfig> {
+    use crate::amdgpu_dsc::{compute_config, LinkEncoding};
+    let sink = caps.dsc?;
+    if !caps.fec || caps.uhbr != 0 {
+        return None;
+    }
+    let target = u32::try_from(legacy_kbps(caps.lanes, caps.rate, true)).ok()?;
+    let cfg = compute_config(
+        &sink,
+        max_dispclk_khz,
+        target,
+        &dsc_timing(timing),
+        LinkEncoding::Dp8b10b,
+        false,
+    )?;
+    (cfg.slices_h <= 4 && timing.h_active <= 5184).then_some(cfg)
+}
+
+/// Redo every DSC decision with the board's highest DISPCLK, as Linux's
+/// clock manager reports it to dc_dsc_compute_config. A stream that no
+/// longer fits one DSC is a link failure.
+pub fn refine_dsc(soc: &dml::Soc, selections: &mut [Selection]) -> Result<(), ModesetError> {
+    for s in selections.iter_mut().filter(|s| s.dsc.is_some()) {
+        s.dsc = Some(dp_dsc(&s.timing, s.caps, soc.dispclk_max_khz).ok_or(ModesetError::Link)?);
+    }
+    Ok(())
 }
 
 /// LINK_TRAINING_ATTEMPTS and LINK_TRAINING_RETRY_DELAY.
@@ -993,15 +1055,25 @@ pub fn select_all(
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
             continue;
         };
-        let Some(timing) = pick(index, &sink.edid, &|t| dp_link(t, caps).is_some()) else {
+        let Some(timing) = pick(index, &sink.edid, &|t| {
+            dp_link(t, caps).is_some() || dp_dsc(t, caps, NOMINAL_DISPCLK_KHZ).is_some()
+        }) else {
             continue;
         };
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        let Some((lanes, rate)) = dp_link(&timing, caps) else {
-            link_short = true;
-            continue;
+        // Uncompressed whenever a link carries the mode, as Linux enables
+        // DSC only when needed; otherwise DSC on the maximum 8b/10b link.
+        let (lanes, rate, dsc) = match dp_link(&timing, caps) {
+            Some((lanes, rate)) => (lanes, rate, None),
+            None => match dp_dsc(&timing, caps, NOMINAL_DISPCLK_KHZ) {
+                Some(cfg) => (caps.lanes, DpRate::Legacy(caps.rate), Some(cfg)),
+                None => {
+                    link_short = true;
+                    continue;
+                }
+            },
         };
         out.push(Selection {
             port: index,
@@ -1013,8 +1085,9 @@ pub fn select_all(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            // HPO (128b/132b) audio is not implemented.
-            audio: if matches!(rate, DpRate::Uhbr(_)) {
+            // HPO (128b/132b) audio is not implemented, nor audio beside a
+            // DSC stream's PPS.
+            audio: if matches!(rate, DpRate::Uhbr(_)) || dsc.is_some() {
                 None
             } else {
                 sink_audio_info(&sink.edid)
@@ -1023,6 +1096,7 @@ pub fn select_all(
             limited: false,
             ycbcr420: false,
             frl: None,
+            dsc,
         });
     }
     let mut frl_free = true;
@@ -1070,6 +1144,7 @@ pub fn select_all(
             limited: false,
             ycbcr420,
             frl,
+            dsc: None,
         });
     }
     out.truncate(MAX_DISPLAYS);
@@ -1176,6 +1251,10 @@ impl Selection {
 pub fn selection_mode(s: &Selection) -> dml::Mode {
     dml::Mode {
         ycbcr420: s.ycbcr420,
+        dsc: s.dsc.map(|c| dml::Dsc {
+            slices: c.slices_h,
+            bpp_x16: c.bpp_x16,
+        }),
         ..mode(s.timing)
     }
 }
@@ -1234,7 +1313,7 @@ pub fn timing_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> otg:
             otg::Signal::DisplayPort
         },
         ycbcr420: plan.mode.ycbcr420,
-        dsc: None,
+        dsc: selection.dsc,
     }
 }
 
@@ -1369,6 +1448,7 @@ impl ColdBoot {
         selection.limited = limited_range(broadcast_rgb()) && !selection.ycbcr420;
         self.select_display(pipe)?;
         let soc = self.prepare_configuration(&[selection]).await?;
+        refine_dsc(&soc, core::slice::from_mut(&mut selection))?;
         let plans = admit_displays(&soc, &[selection]).map_err(otg::Error::Admission)?;
         self.prepare_pipes(&[selection], &plans, &[pipe]).await?;
         // SAFETY: the caller's obligations.
@@ -1412,6 +1492,7 @@ impl ColdBoot {
         let pipes: Vec<u8> = selections.iter().filter_map(|s| pipe_of(s.port)).collect();
         self.select_display(pipes[0])?;
         let soc = self.prepare_configuration(&selections).await?;
+        refine_dsc(&soc, &mut selections)?;
         let plans = admit_displays(&soc, &selections).map_err(otg::Error::Admission)?;
         selections.truncate(plans.len());
         self.prepare_pipes(&selections, &plans, &pipes).await?;
@@ -1479,6 +1560,9 @@ impl ColdBoot {
             self.prepare_display_pipe_clocks(pipe_clock_request(pipe, plan, s))
                 .await
                 .map_err(ModesetError::PipeClocks)?;
+            if s.dsc.is_some() {
+                self.start_display_dscclk(pipe)?;
+            }
         }
         Ok(())
     }
@@ -1634,12 +1718,17 @@ impl ColdBoot {
             let mut refused = ModesetError::Link;
             let transmitter =
                 self.display_paths().map_err(|_| ModesetError::NoSink)?[port].transmitter;
-            let candidates = dp_candidates(
-                &selection.timing,
-                selection.caps,
-                selection.lanes,
-                selection.rate,
-            );
+            // A DSC stream's bpp was chosen for this link: no fallback.
+            let candidates = if selection.dsc.is_some() {
+                alloc::vec![(selection.lanes, selection.rate)]
+            } else {
+                dp_candidates(
+                    &selection.timing,
+                    selection.caps,
+                    selection.lanes,
+                    selection.rate,
+                )
+            };
             for (lanes, link) in candidates {
                 let DpRate::Legacy(rate) = link else {
                     continue;
@@ -1964,6 +2053,9 @@ impl ColdBoot {
                 self.stop_unplugged_display_dp_link(port).await?;
             }
             self.retire_display_timing(m.pipe).await?;
+            if m.selection.dsc.is_some() {
+                self.stop_display_dscclk(m.pipe)?;
+            }
             self.retire_display_planes().await?;
         }
         Ok(())
@@ -1994,6 +2086,9 @@ impl ColdBoot {
                 self.stop_display_dp_link(port).await?;
             }
             self.retire_display_timing(m.pipe).await?;
+            if m.selection.dsc.is_some() {
+                self.stop_display_dscclk(m.pipe)?;
+            }
             self.retire_display_planes().await?;
         }
         Ok(())

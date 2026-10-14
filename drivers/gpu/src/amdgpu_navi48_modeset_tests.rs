@@ -40,6 +40,7 @@ fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display
             uhbr: 0,
             lttpr_uhbr: None,
             fec: false,
+            dsc: None,
         }),
     }
 }
@@ -873,6 +874,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
             uhbr,
             lttpr_uhbr,
             fec: false,
+            dsc: None,
         };
         dp_caps(&p, &sink).unwrap().uhbr
     };
@@ -923,6 +925,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         rate: LinkRate::Hbr3,
         uhbr,
         fec: false,
+        dsc: None,
     };
     let uhd120 = timing(1_188_000, 3840);
     let uhd8k = timing(2_376_000, 7680);
@@ -949,6 +952,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
     let fec = DpCaps {
         rate: LinkRate::Hbr2,
         fec: true,
+        dsc: None,
         ..caps(0)
     };
     if dp_link(&edge, DpCaps { fec: false, ..fec }) != Some((4, Legacy(LinkRate::Hbr2)))
@@ -984,6 +988,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         uhbr: 7,
         lttpr_uhbr: None,
         fec: false,
+        dsc: None,
     };
     let port = display::Port {
         path: p,
@@ -1135,4 +1140,80 @@ fn navi48_modeset_decides_frl_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_decides_frl_like_linux
+);
+
+/// DSC as amdgpu_dm's SST policy uses it here: a 4K60 sink on two HBR2
+/// lanes (8,380,800 kbps with FEC) cannot take the 14,256,000 kbps stream,
+/// so it is compressed to the highest bpp that link carries, on the
+/// maximum 8b/10b link, without audio; a sink without DSC, without FEC or
+/// with 128b/132b gets no DSC here, and a stream that fits needs none.
+fn navi48_modeset_decides_dsc_like_linux() -> TestResult {
+    use crate::amdgpu_dsc::{compute_config, DscSinkCaps, DscTiming, Encoding, LinkEncoding};
+    let p = path(inventory::Connector::DisplayPort, 0);
+    // DSC 1.2, slices 1/2/4, 13-bit line buffer, RGB, 8/10/12 bpc,
+    // 1000 MP/s per slice, 5120-pixel slices, 1/16 bpp.
+    const DSC: [u8; 16] = [
+        1, 0x21, 0, 0x0b, 0x0b, 4, 1, 0, 0, 0x13, 0x0e, 0xee, 16, 0, 0, 0,
+    ];
+    let sink = |dsc: Option<[u8; 16]>, fec: bool, lanes: u8| display::Sink {
+        dpcd: dpcd(0x14, lanes),
+        edid: edid_uhbr(),
+        lttpr: None,
+        uhbr: 0,
+        lttpr_uhbr: None,
+        fec,
+        dsc,
+    };
+    let pick = |s: display::Sink| {
+        select(
+            &[p],
+            &[display::Port {
+                path: p,
+                sink: Ok(s),
+            }],
+            8,
+            None,
+        )
+    };
+    let Ok(s) = pick(sink(Some(DSC), true, 2)) else {
+        return TestResult::Fail("DSC sink not selected");
+    };
+    let t = DscTiming {
+        pix_clk_100hz: s.timing.pixel_clock_khz * 10,
+        h_active: s.timing.h_active,
+        h_total: s.timing.h_total,
+        v_active: s.timing.v_active,
+        v_total: s.timing.v_total,
+        bpc: 8,
+        encoding: Encoding::Rgb,
+    };
+    let want = compute_config(
+        &DscSinkCaps::parse(&DSC, &[0; 3]).unwrap(),
+        2_000_000,
+        8_380_800,
+        &t,
+        LinkEncoding::Dp8b10b,
+        false,
+    );
+    if want.is_none()
+        || s.dsc != want
+        || (s.lanes, s.rate) != (2, DpRate::Legacy(LinkRate::Hbr2))
+        || s.audio.is_some()
+        || selection_mode(&s).dsc.map(|d| (d.slices, d.bpp_x16))
+            != want.map(|c| (c.slices_h, c.bpp_x16))
+    {
+        return TestResult::Fail("DSC selection");
+    }
+    // Four lanes carry 4K60 uncompressed; no DSC sink, no FEC: no mode.
+    if pick(sink(Some(DSC), true, 4)).map(|s| s.dsc.is_none()) != Ok(true)
+        || pick(sink(None, true, 2)).is_ok()
+        || pick(sink(Some(DSC), false, 2)).is_ok()
+    {
+        return TestResult::Fail("DSC only when needed and possible");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_decides_dsc_like_linux
 );
