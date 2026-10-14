@@ -7092,9 +7092,46 @@ pub(crate) fn next_deliverable(task: u64, allowed: u64) -> Option<(u32, u64)> {
 /// a #GP (stress-ng then reports "unexpected SIGSEGV" instead of the
 /// OOM kill). Dying AT the fault is Linux's `VM_FAULT_SIGKILL` shape.
 pub fn current_task_fatal_signal_pending() -> bool {
-    // Bit N == signal N in the pending mask (see SIGNAL_PENDING).
-    signal_pending_of(current_task_id()) & (1 << 9) != 0
+    task_fatal_signal_pending(current_task_id())
 }
+
+/// [`current_task_fatal_signal_pending`] for an explicit task. The pending
+/// mask keeps signal N at bit N-1 (`sig_bit`), so SIGKILL is bit 8; testing
+/// bit 9 asked about SIGUSR1 instead — every task with a SIGUSR1 queued looked
+/// condemned (a page fault ran signal delivery before servicing the fault,
+/// and a ptrace PTRACE_EVENT_EXIT stop was skipped), while a task the OOM
+/// killer had actually SIGKILLed kept faulting in fresh pages.
+pub(crate) fn task_fatal_signal_pending(task: u64) -> bool {
+    signal_pending_of(task) & sig_bit(9) != 0
+}
+
+#[cfg(feature = "kernel-test")]
+fn smoke_fatal_signal_pending_is_sigkill() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    const TASK: u64 = 0x5f_a7a1;
+    // The registries are only live once `signal_init` ran; in the kernel-test
+    // image this case can run before any ABI fixture installed them, and an
+    // uninstalled table drops every raise.
+    __test_signal_reset();
+    raise_signal_pending(TASK, 10); // SIGUSR1
+    if signal_pending_of(TASK) & sig_bit(10) == 0 {
+        __test_signal_reset();
+        return TestResult::Fail("the SIGUSR1 raise did not land");
+    }
+    if task_fatal_signal_pending(TASK) {
+        __test_signal_reset();
+        return TestResult::Fail("a pending SIGUSR1 read as a fatal signal");
+    }
+    raise_signal_pending(TASK, 9); // SIGKILL
+    let fatal = task_fatal_signal_pending(TASK);
+    __test_signal_reset();
+    if !fatal {
+        return TestResult::Fail("a pending SIGKILL did not read as fatal");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!("userspace", smoke_fatal_signal_pending_is_sigkill);
 
 /// Test hook for the exact empty/non-empty task count that gates syscall-return
 /// signal delivery.
