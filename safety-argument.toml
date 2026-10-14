@@ -1484,3 +1484,7 @@ argument = "The frame change in cross_crate_init.rs installs narf_userspace::han
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The executor change (scheduler/src/stackful.rs rearm_wake_after_preempt) sets the preempted task's own WakeCell wake bit again when its CPL0/EL1-preempted continuation resumes, so a wake that the preemption and the resuming dispatch coalesced (the task's own yield_now self-wake, or a waker it registered just before the tick) still re-polls it, as Linux keeps a preempted task TASK_RUNNING. It writes only the bit of the task that is running on this CPU, the same store a self-wake during a poll makes; it moves no slot between run queues, touches no address space, domain state, PKRS/TCF, capability or frame, and the worst case is one extra poll of that task per preemption. User-mode (CPL3/EL0) preemption is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) adds jitrwx_smoke to the table of embedded musl-demo test binaries, next to remotevm_smoke. It is test registration data compiled into verification kernels; no production code path, authority, mapping, domain transition, or capability changes. The W^X policy change it tests lives in memory/src/wx.rs and the userspace mprotect handler, outside the memory domain manager."

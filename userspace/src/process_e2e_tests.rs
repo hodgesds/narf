@@ -6510,24 +6510,39 @@ fn smoke_process_mprotect_deny_wx() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    // Try to set W|X using mprotect
+    // W|X is JIT memory: it takes the JIT capability. A task whose JIT
+    // capability was denied gets EACCES, as Linux's MDWE refusal does; a task
+    // holding it (the default grant) gets the RWX mapping, as on Linux.
+    let rwx = |ctx: &mut StubCtx| {
+        *ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: 0x2000_0000,
+                arg1: 0x1000,
+                arg2: 0b111, // PROT_READ | PROT_WRITE | PROT_EXEC
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::MProtect.raw(), ctx);
+        ctx.ret
+    };
     let mut ctx = StubCtx {
-        args: SyscallArgs {
-            arg0: 0x2000_0000,
-            arg1: 0x1000,
-            arg2: 0b111, // PROT_READ | PROT_WRITE | PROT_EXEC
-            ..Default::default()
-        },
+        args: SyscallArgs::default(),
         ret: None,
     };
-    kernel_syscall_entry(Syscall::MProtect.raw(), &mut ctx);
+    narf_memory::wx::__reset_jit_grants_for_test();
+    narf_memory::wx::deny_jit(crate::handlers::current_task_id());
+    let denied = rwx(&mut ctx);
+    narf_memory::wx::__reset_jit_grants_for_test();
+    let granted = rwx(&mut ctx);
+    narf_memory::wx::__reset_jit_grants_for_test();
 
-    let outcome = match ctx.ret {
-        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) == EACCES => TestResult::Pass,
-        Some(r) if r.status == SyscallReturn::OK => {
-            TestResult::Fail("mprotect setting WX must return -EACCES")
+    let outcome = match (denied, granted) {
+        (Some(d), _) if d.status != SyscallReturn::OK || (d.value as i64) != EACCES => {
+            TestResult::Fail("mprotect W|X without the JIT capability must return -EACCES")
         }
-        _ => TestResult::Fail("mprotect setting WX must return -EACCES (got non-Ok)"),
+        (_, Some(g)) if g.status == SyscallReturn::OK && g.value == 0 => TestResult::Pass,
+        _ => TestResult::Fail("mprotect W|X holding the JIT capability must succeed"),
     };
 
     teardown_process_state();

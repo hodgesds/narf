@@ -10374,8 +10374,8 @@ fn mprotect_errno(error: narf_memory::AddressSpaceError) -> i64 {
 /// userspace (Linux parity, so glibc/malloc can branch on the exact code):
 ///   - **ENOMEM (12)** — the request covers an empty or gapped range
 ///     (`mprotect_range`/`jit_mprotect`/`change_perms_range`'s error).
-///   - **EACCES (13)** — a W^X denial (`DenyWX`/`DenyXtoWX`) or a
-///     JIT-gated RW→RX flip the caller has no JIT capability for.
+///   - **EACCES (13)** — an MDWE refusal, or a JIT-gated transition (the
+///     RW→RX flip or a W|X end state) the caller has no JIT capability for.
 ///   - **EINVAL (22)** — a split off a huge-page boundary
 ///     (`mprotect_errno`).
 fn mprotect_core(
@@ -10401,17 +10401,13 @@ fn mprotect_core(
     // region cleanly when the request covers only a slice; the legacy
     // `change_perms_range` is whole-region only.
     {
-        // W^X. `CapKind::Jit` gates the **RW → RX flip** — the transition
-        // `wx.rs` has described as the JIT exception since it was written —
-        // and *nothing* grants a W|X end state.
-        //
-        // This used to be the other way round: the cap was demanded only when
-        // the request contained W|X, which made `CAP_JIT` a licence to create
-        // a genuinely RWX mapping (something NARF had previously made
-        // impossible) while leaving the flip it exists for ungated. Since a
-        // task that can write a page and then make it executable has the same
-        // power as one holding RWX, gating the flip is what actually buys
-        // anything.
+        // W^X. `CapKind::Jit` gates both JIT shapes: the **RW → RX flip**
+        // (SpiderMonkey) and a **W|X end state** (V8 makes its whole code
+        // range RWX with one `pkey_mprotect` and CHECK-fails on anything but
+        // ENOMEM). A task that can write a page and then make it executable
+        // has the same power as one holding RWX, so the two take the same
+        // capability. Linux grants both unless MDWE is set, which is checked
+        // first below.
         //
         // Classified before any mutation so a capability-gated request is
         // never partially applied by the ungated path first.
@@ -10437,15 +10433,11 @@ fn mprotect_core(
         //             break;
         //     }
         //
-        // MDWE sits ABOVE the W^X policy below rather than duplicating it.
-        // NARF already refuses a W|X end state outright, which is stricter
-        // than Linux, so the only thing MDWE adds here is the second denial
-        // arm: a mapping that is not currently executable may not BECOME
-        // executable, even via the CAP_JIT-gated RW->RX flip that policy
-        // otherwise permits. That is the arm the feature exists for — a
-        // process that can write a page and then mark it executable has the
-        // same power as one holding RWX, so a sandbox that asked for MDWE and
-        // still got the flip was told it was protected when it was not.
+        // MDWE sits ABOVE the W^X policy below and refuses both JIT shapes
+        // the JIT capability would otherwise permit: a W|X end state, and a
+        // mapping that is not currently executable BECOMING executable (the
+        // RW->RX flip). A sandbox that asked for MDWE and still got either
+        // was told it was protected when it was not.
         //
         // Checked over every intersecting region, like the classification
         // below, so a range crossing one already-executable and one

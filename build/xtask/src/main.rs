@@ -4766,7 +4766,7 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "lsm",
     ]) {
         "fs"
-    } else if has(&["mremap", "mcore", "mem2", "mempolicy", "pkey", "pvm"]) {
+    } else if has(&["mremap", "mcore", "mem2", "mempolicy", "pkey", "pvm", "jitrwx"]) {
         "mem"
     } else if has(&[
         "hello",
@@ -4916,6 +4916,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // (multi-iovec, partial transfer, EFAULT/ESRCH/EPERM) and
         // /proc/<pid>/mem pread/pwrite/lseek. See remotevm_smoke_x86_64.c.
         ("remotevm_smoke", "remotevm-ok"),
+        // W|X JIT memory (V8's pkey_mprotect RWX code range) and its MDWE refusal.
+        ("jitrwx_smoke", "jitrwx-ok"),
         // OCI container end-to-end: the `oci_smoke` runtime reads the
         // /oci bundle, unshares namespaces, sets the container hostname,
         // chroots into the bundle rootfs, and execs the contained

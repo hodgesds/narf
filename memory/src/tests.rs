@@ -10354,11 +10354,11 @@ fn smoke_wx_mprotect_rw_to_rx_needs_cap() -> TestResult {
     if classify_mprotect(rx, rw) != WxTransition::Allow {
         return TestResult::Fail("RX->RW unexpectedly required cap");
     }
-    // RX -> RWX is absolutely refused (the "self-modifying live code"
-    // shape PaX rejects).
+    // RX -> RWX makes JIT memory writable again (V8 does this to a code
+    // range it already executes from); like the flip, it needs CAP_JIT.
     let rwx = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC;
-    if classify_mprotect(rx, rwx) != WxTransition::DenyXtoWX {
-        return TestResult::Fail("RX->RWX was not absolutely refused");
+    if classify_mprotect(rx, rwx) != WxTransition::NeedsCapJit {
+        return TestResult::Fail("RX->RWX did not require CAP_JIT");
     }
     TestResult::Pass
 }
