@@ -324,8 +324,16 @@ impl SigDeliveryParams {
         info[0..4].copy_from_slice(&(self.signum as i32).to_ne_bytes());
         info[8..12].copy_from_slice(&self.si_code.to_ne_bytes());
         match siginfo_layout(self.signum, self.si_code) {
-            SiginfoLayout::Fault | SiginfoLayout::Sys => {
+            SiginfoLayout::Fault => {
                 info[16..24].copy_from_slice(&self.si_addr.to_ne_bytes());
+            }
+            // SIL_SYS: si_call_addr @16, si_syscall (int) @24, si_arch @28,
+            // and the filter's data in si_errno @4. The delivery hook carries
+            // syscall | arch << 32 in `si_value` and si_errno in `si_pid`.
+            SiginfoLayout::Sys => {
+                info[4..8].copy_from_slice(&self.si_pid.to_ne_bytes());
+                info[16..24].copy_from_slice(&self.si_addr.to_ne_bytes());
+                info[24..32].copy_from_slice(&self.si_value.to_ne_bytes());
             }
             // si_band (long) @16, si_fd (int) @24. The delivery hook carries
             // the band in `si_addr` and the fd in `si_value`.
@@ -394,7 +402,13 @@ impl SigDeliveryParams {
                 ssi[ADDR..ADDR + 8].copy_from_slice(&self.si_addr.to_ne_bytes());
             }
             SiginfoLayout::Sys => {
+                const SYSCALL: usize = 84;
+                const ARCH: usize = 96;
+                ssi[4..8].copy_from_slice(&self.si_pid.to_ne_bytes());
+                ssi[SYSCALL..SYSCALL + 4].copy_from_slice(&(self.si_value as u32).to_ne_bytes());
                 ssi[CALL_ADDR..CALL_ADDR + 8].copy_from_slice(&self.si_addr.to_ne_bytes());
+                ssi[ARCH..ARCH + 4]
+                    .copy_from_slice(&((self.si_value >> 32) as u32).to_ne_bytes());
             }
         }
         ssi
@@ -3575,6 +3589,14 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     let table = unsafe { &*p };
     let version = syscall_version(num);
     let raw_n = syscall_number(num);
+    // `__secure_computing` — before the table lookup, so a filter decides
+    // unknown numbers too (see `kernel_syscall_entry_plain_with_state`). Only
+    // for a syscall trapped from user mode: the kernel's own dispatches
+    // through here (the async file-op ring bridge) are not syscalls the task
+    // made, as io_uring's work is not filtered on Linux.
+    if ctx.returning_to_user() && crate::seccomp::secure_computing(ctx, raw_n) {
+        return;
+    }
     if let Some(variant) = Syscall::from_raw(raw_n) {
         #[cfg(feature = "syscall-trace")]
         syscall_trace_account(variant);
@@ -4379,6 +4401,16 @@ pub fn kernel_syscall_entry_plain_with_state(
     let n = match Syscall::from_raw(num) {
         Some(v) => v,
         None => {
+            // seccomp filters see every syscall number, including ones this
+            // kernel does not implement: Linux runs `secure_computing` before
+            // the table lookup turns an unknown number into -ENOSYS, so a
+            // filter's TRAP/ERRNO/KILL answer wins over ENOSYS.
+            if !user_state.is_null() {
+                let mut ctx = ArgsOnlyCtx::new(*args, user_state);
+                if crate::seccomp::secure_computing(&mut ctx, num) {
+                    return ctx.ret;
+                }
+            }
             #[cfg(feature = "syscall-trace")]
             {
                 use core::fmt::Write as _;
@@ -4459,7 +4491,14 @@ pub fn kernel_syscall_entry_plain_with_state(
     // by the 2-byte `syscall` width). Such a syscall has not completed, so it
     // must NOT fire an exit-stop — the re-issued syscall will trace again.
     let entry_rip = ctx.rip();
-    table.dispatch(n, &mut ctx);
+    // `__secure_computing`, after the ptrace entry stop as in Linux's
+    // `syscall_trace_enter`. A skipped syscall has its return value (or the
+    // SIGSYS frame) already set and still takes the exit path below.
+    let seccomp_skipped =
+        !user_state.is_null() && crate::seccomp::secure_computing(&mut ctx, num);
+    if !seccomp_skipped {
+        table.dispatch(n, &mut ctx);
+    }
     // Return-value half of the trace. Without it the log shows what was
     // ASKED but not what was ANSWERED, which is exactly what you need when
     // userspace takes a different branch than it does on Linux (an epoll

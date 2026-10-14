@@ -12041,6 +12041,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     personality_fork(parent_pid, child_tid.raw());
     // no_new_privs, securebits and dumpable: see `prctl_fork`.
     prctl_fork(parent_pid, child_tid.raw());
+    // `copy_seccomp`: every child shares its parent's filter chain.
+    crate::seccomp::fork(parent_pid, child_tid.raw());
     // Credentials (uid/gid/euid/...) are copied to the child so a parent
     // that dropped privilege stays dropped across fork/clone; a root
     // parent stays root. Keyed by task id, so copy unconditionally.
@@ -14547,6 +14549,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = PRCTL_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
+    crate::seccomp::release_task(tid);
     if let Some(m) = NICE_TABLE.lock().as_mut() {
         if m.remove(&tid).is_some() {
             NICE_CUSTOM_ROWS.fetch_sub(1, Ordering::Release);
@@ -18101,7 +18104,6 @@ struct PrctlState {
     /// unimplemented GET returned -1, forcing a doomed SET on every
     /// service start (exit 213/EXIT_SECUREBITS).
     securebits: u64,
-    seccomp_mode: u32,
 }
 
 impl Default for PrctlState {
@@ -18113,7 +18115,6 @@ impl Default for PrctlState {
             pdeathsig: 0,
             child_subreaper: false,
             securebits: 0,   // SECBIT_* all clear, per Linux default
-            seccomp_mode: 0,
         }
     }
 }
@@ -18135,6 +18136,16 @@ fn read_prctl(task: u64) -> PrctlState {
     g.as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or_default()
+}
+
+/// `task_no_new_privs(task)`.
+pub(crate) fn task_no_new_privs(task: u64) -> bool {
+    read_prctl(task).no_new_privs
+}
+
+/// `task_set_no_new_privs(task)` — one-way, as everywhere else it is set.
+pub(crate) fn task_set_no_new_privs(task: u64) {
+    modify_prctl(task, |s| s.no_new_privs = true);
 }
 
 /// The `PrctlState` a child of any `clone` starts with (`copy_process`):

@@ -237,6 +237,12 @@ pub fn teardown() {
     // CAP_SYS_ADMIN, and only the aarch64 link order happened to put a
     // capability-dropping case before it.
     crate::handlers::__test_caps_reset();
+    // Seccomp state is per task and outlives the case the same way: a case
+    // that enters strict mode or installs a filter would hand the next case
+    // a confined subject (PR_GET_SECCOMP != 0, and EINVAL/EBUSY on any mode
+    // change).
+    crate::seccomp::__test_reset_task(FAKE_TASK);
+    crate::seccomp::__test_reset_task(TASK_SLOT.load(Ordering::Acquire));
     // `install_task_id_lookup` is process-global. Leave bare kernel tests on
     // the documented task-0 fallback instead of leaking FAKE_TASK into them;
     // otherwise an unrelated later test observes whatever namespaces and

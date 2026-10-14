@@ -2361,17 +2361,36 @@ fn smoke_abi_proc2_prctl_closed_value_sets_are_einval() -> TestResult {
         if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 3)) != Some(EINVAL) {
             return Err("PR_SET_SECCOMP(3) must be -EINVAL");
         }
-        // Positive paths: PR_GET_SECCOMP must report the mode actually
-        // requested, not a folded-to-FILTER stand-in.
-        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 1)) != Some(0)
-            || call(Syscall::Prctl.raw(), a0(PR_GET_SECCOMP)) != Some(1)
-        {
-            return Err("PR_SET_SECCOMP(STRICT) must be readable back as mode 1");
+        // `seccomp_set_mode_filter` copies the program in before anything
+        // else (`seccomp_prepare_user_filter`): a NULL `sock_fprog` is
+        // -EFAULT.
+        if call(Syscall::Prctl.raw(), a2(PR_SET_SECCOMP, 2, 0)) != Some(EFAULT) {
+            return Err("PR_SET_SECCOMP(FILTER, NULL) must be -EFAULT");
         }
-        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 2)) != Some(0)
+        // Positive path: PR_GET_SECCOMP must report the mode actually
+        // requested, not a folded stand-in. The program is one `RET ALLOW`.
+        let mut insn = [0u8; 8];
+        insn[0..2].copy_from_slice(&0x06u16.to_ne_bytes()); // BPF_RET | BPF_K
+        insn[4..8].copy_from_slice(&0x7fff_0000u32.to_ne_bytes()); // SECCOMP_RET_ALLOW
+        let mut fprog = [0u8; 16];
+        fprog[0..2].copy_from_slice(&1u16.to_ne_bytes());
+        fprog[8..16].copy_from_slice(&(insn.as_ptr() as u64).to_ne_bytes());
+        if call(
+            Syscall::Prctl.raw(),
+            a2(PR_SET_SECCOMP, 2, fprog.as_ptr() as u64),
+        ) != Some(0)
             || call(Syscall::Prctl.raw(), a0(PR_GET_SECCOMP)) != Some(2)
         {
             return Err("PR_SET_SECCOMP(FILTER) must be readable back as mode 2");
+        }
+        // `seccomp_may_assign_mode`: a filtered task cannot switch to strict
+        // mode (`seccomp_set_mode_strict` keeps its `ret = -EINVAL`). Strict
+        // mode's own positive path is the seccomp musl smoke: entering it
+        // here would leave the fixture task strict.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECCOMP, 1)) != Some(EINVAL)
+            || call(Syscall::Prctl.raw(), a0(PR_GET_SECCOMP)) != Some(2)
+        {
+            return Err("PR_SET_SECCOMP(STRICT) on a filtered task must be -EINVAL");
         }
         Ok(())
     })

@@ -14,6 +14,14 @@ pub(crate) fn exit_group_current_thread(ctx: &mut dyn TrapContext) {
     exit_current_thread_status(ctx, exit_code, ((exit_code & 0xff) << 8) as i32, false);
 }
 
+/// `do_exit(signum)` for a thread killed by a signal that only ends IT, not
+/// its group — a seccomp `RET_KILL_THREAD` (SIGSYS) or a strict-mode
+/// violation (SIGKILL). The status is the killed-by-signal one, so if this is
+/// the group's last thread its parent's `wait` sees `WIFSIGNALED`.
+pub(crate) fn exit_current_thread(ctx: &mut dyn TrapContext, signum: u32) {
+    exit_current_thread_status(ctx, signum, encode_signaled_status(signum, false), true);
+}
+
 fn exit_current_thread_status(
     ctx: &mut dyn TrapContext,
     exit_code: u32,

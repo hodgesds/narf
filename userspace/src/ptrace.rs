@@ -88,6 +88,18 @@ pub const PTRACE_O_TRACEVFORK: u64 = 0x04;
 pub const PTRACE_O_TRACECLONE: u64 = 0x08;
 pub const PTRACE_O_TRACEVFORKDONE: u64 = 0x20;
 pub const PTRACE_O_TRACEEXIT: u64 = 0x40;
+pub const PTRACE_O_SUSPEND_SECCOMP: u64 = 1 << 21;
+
+/// `PT_SUSPEND_SECCOMP`: the task's tracer suspended its seccomp filters
+/// (CRIU checkpointing a sandboxed process). `__secure_computing` returns 0
+/// for such a task without running any filter.
+pub fn seccomp_suspended(task: u64) -> bool {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let pid = tid_to_pid(task);
+    get_task_tracer(pid).is_some() && ptrace_options(pid) & PTRACE_O_SUSPEND_SECCOMP != 0
+}
 pub const PTRACE_EVENT_EXIT: u32 = 6;
 pub const PTRACE_O_EXITKILL: u64 = 1 << 20;
 pub const PTRACE_EVENT_FORK: u32 = 1;
@@ -843,6 +855,44 @@ pub fn ptrace_report_exec(ctx: &mut dyn TrapContext) {
         set_last_siginfo(pid, crate::handlers::ptrace_signal_siginfo(task, SIGTRAP));
         enter_ptrace_stopped(ctx, task, tracer_tid, SIGTRAP);
     }
+}
+
+/// `PTRACE_O_TRACESECCOMP` and its event (`PTRACE_EVENT_SECCOMP`).
+pub const PTRACE_O_TRACESECCOMP: u64 = 0x80;
+pub const PTRACE_EVENT_SECCOMP: u32 = 7;
+
+/// `ptrace_event_enabled(task, PTRACE_EVENT_SECCOMP)`: traced, and the tracer
+/// asked for seccomp events. A seccomp `RET_TRACE` with nobody listening is
+/// `-ENOSYS`.
+pub fn seccomp_event_enabled(task: u64) -> bool {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let pid = tid_to_pid(task);
+    get_task_tracer(pid).is_some() && ptrace_options(pid) & PTRACE_O_TRACESECCOMP != 0
+}
+
+/// `ptrace_event(PTRACE_EVENT_SECCOMP, data)` from `__seccomp_filter`'s
+/// `RET_TRACE` arm: stop with `SIGTRAP | PTRACE_EVENT_SECCOMP << 8`, the
+/// filter's data as the event message. Returns the syscall number to
+/// recheck, or `None` when the syscall must be skipped because a fatal
+/// signal arrived during the stop.
+///
+/// The tracer cannot change the syscall number here: NARF's PTRACE_SETREGS
+/// does not reach `orig_rax` of a stopped syscall entry, so the number the
+/// recheck runs is the one the filter saw.
+pub fn ptrace_report_seccomp(ctx: &mut dyn TrapContext, nr: u32, data: u64) -> Option<i64> {
+    let task = current_task_id();
+    let pid = tid_to_pid(task);
+    let tracer = get_task_tracer(pid)?;
+    set_event_msg(pid, data);
+    let code = SIGTRAP_EVENT_BASE | (PTRACE_EVENT_SECCOMP << 8);
+    set_last_siginfo(pid, crate::handlers::ptrace_notify_siginfo(task, code));
+    enter_ptrace_stopped(ctx, task, pid_to_tid(tracer), code);
+    if crate::handlers::current_task_fatal_signal_pending() {
+        return None;
+    }
+    Some(i64::from(nr))
 }
 
 const SIGTRAP_EVENT_BASE: u32 = 5;
@@ -1615,6 +1665,24 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         PTRACE_SETOPTIONS => {
+            // `check_ptrace_options`, PTRACE_O_SUSPEND_SECCOMP arm (after the
+            // mask test below): CAP_SYS_ADMIN, and a tracer that is neither
+            // under seccomp itself nor suspended-from-it by its own tracer —
+            // otherwise a sandboxed task could lift its children's filters.
+            // Evaluated before PTRACE_STATE is taken: it reads other tables.
+            let suspend_seccomp_refusal = if data & PTRACE_O_SUSPEND_SECCOMP != 0 {
+                const CAP_SYS_ADMIN: u32 = 21;
+                if !crate::handlers::capable(CAP_SYS_ADMIN)
+                    || crate::seccomp::mode_of(caller) != 0
+                    || ptrace_options(caller_pid) & PTRACE_O_SUSPEND_SECCOMP != 0
+                {
+                    Some(EPERM)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             {
                 let mut g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_mut() {
@@ -1639,17 +1707,16 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // answer a real kernel too old for that option gives —
                     // keeps the probe honest.
                     //
-                    // Of the bits inside the mask, NARF acts on TRACESYSGOOD,
+                    // Every bit inside the mask is acted on: TRACESYSGOOD,
                     // TRACEEXEC, TRACEFORK/VFORK/CLONE (auto-attach plus the
                     // event stop — `attach_new_child`), TRACEVFORKDONE,
-                    // TRACEEXIT and EXITKILL.
-                    //
-                    // LINUX-GAP: TRACESECCOMP and SUSPEND_SECCOMP are stored
-                    // and ignored — NARF runs no seccomp filters for them to
-                    // report on or suspend. Rejecting them would be the
-                    // larger divergence, so they stay accepted here.
+                    // TRACEEXIT, TRACESECCOMP, EXITKILL and SUSPEND_SECCOMP.
                     if data & !PTRACE_O_MASK != 0 {
                         ctx.set_return(errno_ret(EINVAL));
+                        return;
+                    }
+                    if let Some(e) = suspend_seccomp_refusal {
+                        ctx.set_return(errno_ret(e));
                         return;
                     }
                     r.options.insert(pid, data);
@@ -1663,8 +1730,8 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             //     case PTRACE_GETEVENTMSG:
             //             ret = put_user(child->ptrace_message, datalp);
             //
-            // The message of the last event stop (a new child's pid, an
-            // exit status); 0 if there never was one.
+            // The message of the last event stop (a new child's pid, an exit
+            // status, a seccomp filter's data); 0 if there never was one.
             let msg = PTRACE_STATE
                 .lock()
                 .as_ref()

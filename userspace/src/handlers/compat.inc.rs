@@ -8187,6 +8187,8 @@ pub fn proc_task_info(
             ]
         },
         no_new_privs: read_prctl(tid).no_new_privs,
+        seccomp_mode: crate::seccomp::mode_of(tid),
+        seccomp_filters: crate::seccomp::filter_count_of(tid) as u32,
         // `get_task_tracer` is pid-keyed and returns the tracer's pid, so
         // it goes back out through the reader's namespace like every other
         // pid in this file. A tracer the reader cannot see reports 0 —
@@ -12373,6 +12375,107 @@ pub(crate) fn ptrace_fault_siginfo(signum: u32, si_code: i32, si_addr: u64, si_v
         prerewound_syscall: false,
     }
     .siginfo_bytes()
+}
+
+/// `PF_EXITING`: the thread has started exiting (a zombie, or its group is
+/// being torn down). Seccomp's TSYNC skips such threads.
+pub(crate) fn task_is_exiting(task: u64) -> bool {
+    crate::task::task_get(task).is_none_or(|t| {
+        t.state.load(Ordering::Acquire) == crate::task::TASK_ZOMBIE
+            || t.group_exiting.load(Ordering::Acquire)
+    })
+}
+
+/// `force_sig_seccomp(syscall, reason, force_coredump)` — raise SIGSYS for a
+/// seccomp `RET_TRAP` (`force_coredump == false`) or `RET_KILL_*`
+/// (`true`) on the current task, synchronously, from the syscall it skipped.
+///
+/// `seccomp_init_siginfo` fills `si_code = SYS_SECCOMP`, `si_call_addr` (the
+/// user PC, past the syscall instruction), `si_syscall`, `si_arch` and
+/// `si_errno = reason` (the filter's 16-bit data); Chromium's SIGSYS handler
+/// rejects the signal unless all of them, and the syscall number in the
+/// frame's return register, agree.
+///
+/// `force_sig_info_to_task` is what makes it *forced*: with
+/// `HANDLER_CURRENT`, a blocked or ignored SIGSYS is reset to SIG_DFL and
+/// unblocked, so a task cannot dodge a TRAP by masking the signal — it dies
+/// instead. `HANDLER_EXIT` (the kill actions) resets it unconditionally.
+/// SIGSYS's default action dumps core and takes the whole thread group.
+///
+/// The caller has already set the syscall's return value to its number
+/// (`syscall_rollback`).
+pub(crate) fn force_sigsys_seccomp(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    nr: u32,
+    arch: u32,
+    data: u16,
+    force_coredump: bool,
+) {
+    const SIGSYS: u32 = 31;
+    let bit = sig_bit(SIGSYS);
+    let action = sigaction_lookup_full(task, SIGSYS as usize);
+    let blocked = signal_mask_of(task) & bit != 0;
+    let usable = action.filter(|a| a.handler > 1 && !blocked && !force_coredump);
+    let Some(action) = usable else {
+        if action.is_some() {
+            if let Some(h) = task_map_get(&SIGACTION_TABLE, task) {
+                h.lock()[SIGSYS as usize] = None;
+            }
+        }
+        if blocked {
+            let _ = set_signal_mask_for_task(task, signal_mask_of(task) & !bit);
+        }
+        if crate::ptrace::ptrace_intercept_signal(ctx, SIGSYS) {
+            return;
+        }
+        terminate_current_task(ctx, task, SIGSYS, true);
+        return;
+    };
+    if crate::ptrace::ptrace_intercept_signal(ctx, SIGSYS) {
+        return;
+    }
+    const SYS_SECCOMP: i32 = 1;
+    // SiginfoLayout::Sys carries `si_syscall` / `si_arch` in `si_value` (the
+    // two ints at offsets 24 and 28) and `si_errno` in `si_pid`.
+    let mut params = build_delivery_params(
+        task,
+        action,
+        SIGSYS,
+        SYSCALL_NUM_NONE,
+        SYS_SECCOMP,
+        ctx.rip(),
+        u64::from(nr) | (u64::from(arch) << 32),
+        u32::from(data),
+    );
+    params.restartable_syscall = false;
+    let interrupted_rsp = ctx.user_rsp();
+    if !ctx.deliver_signal(&params) {
+        // The frame could not be placed (overflowed stack): `force_sigsegv`'s
+        // shape, the task dies rather than running on without its handler.
+        terminate_current_task(ctx, task, SIGSYS, true);
+        return;
+    }
+    push_sigreturn_record(
+        task,
+        params.restorer != 0,
+        (params.flags & 0x4) != 0 || params.restorer != 0,
+        interrupted_rsp,
+        params.altstack_sp != 0,
+    );
+    {
+        let cur = take_suspend_saved_mask(task).unwrap_or_else(|| signal_mask_of(task));
+        set_sigreturn_saved_mask(task, cur);
+    }
+    if (action.flags & SA_NODEFER) == 0 {
+        let _ = signal_bits_update(&SIGNAL_MASK, task, |slot| *slot |= bit);
+        note_mask_change(task, 0, bit);
+    }
+    if (action.flags & SA_RESETHAND) != 0 {
+        if let Some(h) = task_map_get(&SIGACTION_TABLE, task) {
+            h.lock()[SIGSYS as usize] = None;
+        }
+    }
 }
 
 // ── Sigaction — record a per-task handler vaddr ────────────────────
@@ -16723,7 +16826,7 @@ pub(crate) use {
     handler_sys_execve::sys_execve,
     handler_sys_execveat::sys_execveat,
     handler_sys_exit_group::sys_exit_group,
-    handler_sys_exit_task::{exit_group_current_thread, sys_exit_task},
+    handler_sys_exit_task::{exit_current_thread, exit_group_current_thread, sys_exit_task},
     handler_sys_fadvise64::sys_fadvise64,
     handler_sys_fallocate::sys_fallocate,
     handler_sys_fb_connect::sys_fb_connect,

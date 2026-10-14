@@ -292,6 +292,10 @@ pub struct ProcTaskInfo {
     /// decide whether a unit is already sandboxed, so reporting 0 for a
     /// task that had set it understated the confinement in place.
     pub no_new_privs: bool,
+    /// `Seccomp:` — the task's seccomp mode (0 disabled, 1 strict, 2 filter).
+    pub seccomp_mode: u8,
+    /// `Seccomp_filters:` — the number of filters attached to the task.
+    pub seccomp_filters: u32,
 }
 
 /// A key-value pair from the ELF auxiliary vector.  Used by
@@ -3316,14 +3320,20 @@ fn render_status(info: &ProcTaskInfo) -> String {
     {
         let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{label}:\t{set:016x}\n"));
     }
-    // Seccomp: 0 = disabled (SECCOMP_MODE_DISABLED). systemd reads this to
-    // decide whether a unit is already sandboxed. NoNewPrivs mirrors it.
+    // `fs/proc/array.c::task_seccomp`: NoNewPrivs, then the mode and the
+    // attached-filter count. systemd reads these to decide whether a unit is
+    // already sandboxed.
     let _ = core::fmt::Write::write_fmt(
         &mut s,
         format_args!("NoNewPrivs:\t{}\n", u32::from(info.no_new_privs)),
     );
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp:\t0\n"));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp_filters:\t0\n"));
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!(
+            "Seccomp:\t{}\nSeccomp_filters:\t{}\n",
+            info.seccomp_mode, info.seccomp_filters
+        ),
+    );
     // Linux prints `%*pb` over `nr_cpu_ids` bits (not the mask's value), so
     // every process on one machine renders the same width — libnuma sizes
     // its CPU bitmap from it and then parses the node cpumaps against it.
@@ -4035,6 +4045,8 @@ fn sample_task_info() -> ProcTaskInfo {
         tracer_pid: 0,
         fd_table_size: 64,
         no_new_privs: false,
+        seccomp_mode: 0,
+        seccomp_filters: 0,
     }
 }
 
@@ -4108,6 +4120,8 @@ fn smoke_status_reports_real_capabilities() -> TestResult {
         // that is not the full mask.
         caps: [0, 1 << 10, 1 << 10, 0x3ff, 0],
         no_new_privs: true,
+        seccomp_mode: 2,
+        seccomp_filters: 3,
         ..sample_task_info()
     };
     let body = render_status(&info);
@@ -4129,6 +4143,10 @@ fn smoke_status_reports_real_capabilities() -> TestResult {
     // NoNewPrivs was a hardcoded 0 beside them.
     if !body.contains("NoNewPrivs:\t1") {
         return TestResult::Fail("status did not report the real no_new_privs flag");
+    }
+    // And Seccomp/Seccomp_filters were hardcoded 0 below it.
+    if !body.contains("NoNewPrivs:\t1\nSeccomp:\t2\nSeccomp_filters:\t3\n") {
+        return TestResult::Fail("status did not report the real seccomp mode and filter count");
     }
     TestResult::Pass
 }
@@ -4360,6 +4378,8 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         tracer_pid: 0,
         fd_table_size: 64,
         no_new_privs: false,
+        seccomp_mode: 0,
+        seccomp_filters: 0,
     };
     let line = render_stat(&info);
     let f: Vec<&str> = line.split_whitespace().collect();
@@ -4470,6 +4490,8 @@ fn sample_info() -> ProcTaskInfo {
         tracer_pid: 0,
         fd_table_size: 64,
         no_new_privs: false,
+        seccomp_mode: 0,
+        seccomp_filters: 0,
     }
 }
 

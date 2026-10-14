@@ -341,8 +341,10 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             }
         }
         21 /* PR_GET_SECCOMP */ => {
-            let mode = read_prctl(task).seccomp_mode;
-            ctx.set_return(SyscallReturn::ok(mode as u64));
+            // `prctl_get_seccomp`: `current->seccomp.mode`. (A strict-mode
+            // task never gets here — prctl is not one of its four syscalls.)
+            let mode = crate::seccomp::mode_of(task);
+            ctx.set_return(SyscallReturn::ok(u64::from(mode)));
         }
         22 /* PR_SET_SECCOMP */ => {
             // `kernel/seccomp.c::prctl_set_seccomp`, reached from
@@ -357,21 +359,10 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             //
             // Only STRICT (1) and FILTER (2) exist; DISABLED (0) is a
             // state, not a request, and there is no way back out of
-            // seccomp. Folding every non-zero value to FILTER also lied to
-            // PR_GET_SECCOMP, which must report the mode actually in
-            // force, so store what was asked for.
-            //
-            // LINUX-GAP: NARF records the mode but does not ENFORCE it —
-            // SECCOMP_MODE_STRICT does not kill the task on its first
-            // syscall outside {read, write, _exit, sigreturn}, and no
-            // filter program is evaluated. See sys_seccomp.rs.
-            if arg_a != 1 && arg_a != 2 {
-                ctx.set_return(errno_ret(EINVAL));
-                return;
-            }
-            let mode = arg_a as u32;
-            modify_prctl(task, |s| s.seccomp_mode = mode);
-            ctx.set_return(SyscallReturn::ok(0));
+            // seccomp. STRICT ignores arg3 ("Setting strict mode through
+            // prctl always ignored filter"); FILTER reads its sock_fprog.
+            // prctl has no flags, so TSYNC & co. are seccomp(2)-only.
+            ctx.set_return(crate::seccomp::prctl_set_seccomp(arg_a, arg_b));
         }
         52 /* PR_GET_SPECULATION_CTRL */ | 53 /* PR_SET_SPECULATION_CTRL */ | 0x53564d41 /* PR_SET_VMA */ => {
             ctx.set_return(SyscallReturn::ok(0));

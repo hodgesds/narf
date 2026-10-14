@@ -3112,9 +3112,29 @@ fn smoke_abi_proc_seccomp_new_listener_is_einval() -> TestResult {
     with_setup(|| {
         const SECCOMP_SET_MODE_FILTER: u64 = 1;
         const SECCOMP_FILTER_FLAG_NEW_LISTENER: u64 = 1 << 3;
-        match call(
+        // `seccomp_set_mode_filter` prepares the program before it looks at
+        // the listener: a NULL program is -EFAULT even with NEW_LISTENER.
+        if call(
             Syscall::Seccomp.raw(),
             a2(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("seccomp NEW_LISTENER with a NULL program must be -EFAULT");
+        }
+        // A valid program reaches the listener step, which NARF refuses.
+        let mut insn = [0u8; 8];
+        insn[0..2].copy_from_slice(&0x06u16.to_ne_bytes()); // BPF_RET | BPF_K
+        insn[4..8].copy_from_slice(&0x7fff_0000u32.to_ne_bytes()); // SECCOMP_RET_ALLOW
+        let mut fprog = [0u8; 16];
+        fprog[0..2].copy_from_slice(&1u16.to_ne_bytes());
+        fprog[8..16].copy_from_slice(&(insn.as_ptr() as u64).to_ne_bytes());
+        match call(
+            Syscall::Seccomp.raw(),
+            a2(
+                SECCOMP_SET_MODE_FILTER,
+                SECCOMP_FILTER_FLAG_NEW_LISTENER,
+                fprog.as_ptr() as u64,
+            ),
         ) {
             Some(EINVAL) => Ok(()),
             _ => Err("seccomp NEW_LISTENER must return -EINVAL when notifications are unsupported"),

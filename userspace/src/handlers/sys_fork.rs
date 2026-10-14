@@ -345,6 +345,7 @@ fn do_fork(ctx: &mut dyn TrapContext, vfork: bool) {
     fs_fork(parent_pid, child_tid.raw(), false);
     personality_fork(parent_pid, child_tid.raw());
     prctl_fork(parent_pid, child_tid.raw());
+    crate::seccomp::fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
     // `copy_process` duplicates the task mempolicy for every child.
     crate::handlers::mempolicy_fork(parent_pid, child_tid.raw());
