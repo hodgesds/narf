@@ -1968,6 +1968,46 @@ impl ColdBoot {
                 .await
         }
     }
+    /// Start black FRL video on the port's active FRL link.
+    /// # Safety
+    /// Fulfil `Otg::start_frl_video` obligations.
+    pub async unsafe fn start_display_frl_video(
+        &mut self,
+        port: usize,
+        request: otg::FrlVideoRequest,
+    ) -> Result<otg::FrlVideoRunning, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_frl_video(
+                    self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    path,
+                    request,
+                )
+                .await
+        }
+    }
+    /// Stop the port's FRL video, keeping the link active.
+    /// # Safety
+    /// Fulfil `Otg::stop_frl_video` obligations.
+    pub async unsafe fn stop_display_frl_video(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: retained matching owners; the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_frl_video(
+                    self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    path,
+                )
+                .await
+        }
+    }
     /// Read one SCDC register of an HDMI port's sink over native DDC.
     pub async fn display_scdc_read(&mut self, port: usize, offset: u8) -> Result<u8, ddc::Error> {
         let channel = self.scdc_channel(port)?;

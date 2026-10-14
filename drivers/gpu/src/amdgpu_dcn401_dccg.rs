@@ -497,6 +497,34 @@ impl<I: Io> Engine<I> {
         });
         Ok(())
     }
+    /// dccg401_set_hdmistreamclk(DTBCLK0, otg): HDMISTREAMCLK0 from the
+    /// pipe's DTBCLK_P (its DTO bypassed), on the pipe's retained FRL pixel
+    /// clock.
+    fn route_frl_stream(&mut self, pipe: u8, global: clocks::Applied) -> Result<(), Error> {
+        let plan = self.retained_pipe(pipe, global)?;
+        if !matches!(plan.request.pixel, PixelClock::HdmiFrl { .. }) {
+            return Err(Error::Invalid);
+        }
+        let at = self.layout.dio + HDMI_STREAM * 4;
+        if self.read(at)? & 8 != 0 {
+            return Err(Error::Busy);
+        }
+        self.update_at(at, 15, 8 | u32::from(pipe))?;
+        self.status.routes[4] = Some(StreamRoute {
+            stream: Stream::HdmiFrl,
+            pipe: Some(pipe),
+        });
+        Ok(())
+    }
+    /// dccg401_set_hdmistreamclk(REFCLK): HDMISTREAMCLK0 off.
+    fn unroute_frl_stream(&mut self) -> Result<(), Error> {
+        self.update_at(self.layout.dio + HDMI_STREAM * 4, 8, 0)?;
+        self.status.routes[4] = Some(StreamRoute {
+            stream: Stream::HdmiFrl,
+            pipe: None,
+        });
+        Ok(())
+    }
     /// dce110_disable_stream's clock half: SYMCLK32_SE to REFCLK (source
     /// 0, off; dccg31_disable_symclk32_se), then DPSTREAMCLK off
     /// (dccg401_disable_dpstreamclk).
@@ -713,6 +741,27 @@ impl Dccg {
             return Err(Error::Invalid);
         }
         self.0.unroute_hpo_stream(stream)
+    }
+    /// Clock the HPO FRL stream encoder from `pipe`'s retained FRL pixel
+    /// clock while the display owner's FRL link runs.
+    pub(crate) fn route_frl_stream(
+        &mut self,
+        regs: MmioRegion,
+        clocks: &mut clocks::ClockManager,
+        pipe: u8,
+    ) -> Result<(), Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        let global = clocks.retained_pipe_clocks(regs).map_err(Error::Clocks)?;
+        self.0.route_frl_stream(pipe, global)
+    }
+    /// Stop the HPO FRL stream encoder's clock once the stream is blanked.
+    pub(crate) fn unroute_frl_stream(&mut self, regs: MmioRegion) -> Result<(), Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0.unroute_frl_stream()
     }
     /// Route a prepared pixel clock to a retired HPO DP or FRL stream. Refuses
     /// stale global clocks, wrong signal types and changed divider readback.

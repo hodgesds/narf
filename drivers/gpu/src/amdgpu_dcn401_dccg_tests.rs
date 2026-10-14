@@ -855,3 +855,35 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dccg",
     dcn401_hpo_stream_clocks_follow_linux
 );
+
+/// dccg401_set_hdmistreamclk: HDMISTREAMCLK0 from the pipe's retained FRL
+/// pixel clock (enable and source in one update, no gate writes), refused
+/// while on or for a non-FRL pipe; REFCLK turns it off, keeping the source.
+fn dcn401_frl_stream_clock_follows_linux() -> TestResult {
+    let pipe = 3u8;
+    let mut e = engine();
+    let mut req = request(pipe);
+    req.pixel = PixelClock::HdmiFrl {
+        pixel_hz: 148_500_000,
+    };
+    run(e.prepare(req, clocks())).unwrap();
+    e.io.writes.clear();
+    e.route_frl_stream(pipe, clocks()).unwrap();
+    if e.io.writes != [(0x10000 + 0x59 * 4, 8 | u32::from(pipe))] {
+        return TestResult::Fail("HDMISTREAMCLK route");
+    }
+    assert_eq!(e.route_frl_stream(pipe, clocks()), Err(Error::Busy));
+    e.io.writes.clear();
+    e.unroute_frl_stream().unwrap();
+    if e.io.writes != [(0x10000 + 0x59 * 4, u32::from(pipe))] {
+        return TestResult::Fail("HDMISTREAMCLK off");
+    }
+    let mut e = engine();
+    run(e.prepare(request(pipe), clocks())).unwrap();
+    assert_eq!(e.route_frl_stream(pipe, clocks()), Err(Error::Invalid));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dccg",
+    dcn401_frl_stream_clock_follows_linux
+);

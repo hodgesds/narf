@@ -177,6 +177,11 @@ impl Io for Fake {
                 })
                 || (MPC_BASE + 0x8d3 * 4..=MPC_BASE + 0x8f0 * 4).contains(&at)
                 || [0x95b, 0x95c, 0x965, 0x966].iter().any(|&r| at == MPC_BASE + r * 4)
+                // HPO FRL stream attributes, CRC, borrow mode, AFMT4 audio
+                // InfoFrame latch, VPG4.
+                || [0x8f1, 0x900, 0x901, 0x903, 0x908, 0x92b, 0x931, 0x932, 0x934, 0x935, 0x936]
+                    .iter()
+                    .any(|&r| at == MPC_BASE + r * 4)
                 || (0..4).any(|p| {
                     [
                         0x2094, 0x2095, 0x209b, 0x209e, 0x20a5, 0x20a6, 0x20a9, 0x20aa, 0x20ab,

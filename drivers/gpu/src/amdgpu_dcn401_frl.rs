@@ -4,6 +4,9 @@ use super::*;
 #[path = "amdgpu_dcn401_frl_link.rs"]
 pub(super) mod link;
 pub use link::{FrlDisabled, FrlLinkRetired, FrlLinkUp};
+#[path = "amdgpu_dcn401_frl_video.rs"]
+pub(super) mod video;
+pub use video::{FrlVideoRequest, FrlVideoRunning};
 
 const CLOCK: u64 = 0x8d3;
 const SOURCE: u64 = 0x8d5;
@@ -35,12 +38,19 @@ impl<I: Io> Engine<I> {
     fn frl_quiet(&mut self) -> Result<(), Error> {
         // Audio/ACR, metadata and immediate packets have independent owners.
         // Leave general-control/AVMUTE packets and all AFMT/VPG registers alone.
+        // The owner's own FRL stream leaves AUDIO_INFO_SEND set, as
+        // Linux's stream attribute does and its stop never clears.
+        let own = if self.status.frl_link.is_some() {
+            0x1000
+        } else {
+            0
+        };
         for (reg, mask) in [
             (FIFO, 0x100010),
             (CONTROL, 0x110),
-            (0x8e2, 0x1003),     // ACR SEND/CONT/AUTO_SEND
-            (0x8e3, 0x3130),     // ISRC, ACP and audio infoframes
-            (0x8e8, 0x3fffffff), // all 15 immediate SEND/PENDING pairs
+            (0x8e2, 0x1003),        // ACR SEND/CONT/AUTO_SEND
+            (0x8e3, 0x3130 & !own), // ISRC, ACP and audio infoframes
+            (0x8e8, 0x3fffffff),    // all 15 immediate SEND/PENDING pairs
             (DB, 0x8001),
             (0x8ff, 1),      // HDMI metadata enable
             (0x93c, 0x1010), // native FRL DME4, not DIO DME0

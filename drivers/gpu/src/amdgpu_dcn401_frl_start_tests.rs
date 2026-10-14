@@ -55,6 +55,14 @@ impl Io for FrlIo {
         if at == frl(0x95c) && value & 1 == 0 {
             self.inner.regs.insert(at, 0);
         }
+        // Tribyte encoder and ramp FIFO reset-done follow their requests.
+        for (reg, from, to) in [(0x8df, 0x10, 0x100), (0x8d6, 0x10, 0x10_0000)] {
+            if at == frl(reg) {
+                let v = self.inner.regs[&at];
+                let done = if v & from != 0 { to } else { 0 };
+                self.inner.regs.insert(at, (v & !to) | done);
+            }
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,4 +195,116 @@ fn dcn401_frl_link_starts_trains_and_stops_like_linux() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-frl-link",
     dcn401_frl_link_starts_trains_and_stops_like_linux
+);
+
+/// FRL video as Linux brings it up on an active FRL link: the stream
+/// attribute (RGB 8 bpc, active/blank, borrow from blank, packets per
+/// line, general control and audio InfoFrame on line 2, AVMUTE off), the
+/// AVI InfoFrame in VPG4 generic packet 0 on line 2, the encoder's reset
+/// handshake, CRC, double-buffer disable and OTG input, the timing, then
+/// the FIFO reset and enables. Stop: AVMUTE, blank, packets off, timing
+/// off, the link left active for its own stop.
+fn dcn401_frl_video_starts_and_stops_like_linux() -> TestResult {
+    let (phy, pipe) = (2u8, 1u8);
+    let event = Arc::new(AtomicU8::new(0));
+    let mut e = engine();
+    for p in 0..4 {
+        e.io.regs.insert(phy_reg(p, 0x2943), 0x0303_0303);
+    }
+    let mut e = Engine {
+        io: FrlIo {
+            inner: e.io,
+            phy,
+            lanes: 4,
+            event: event.clone(),
+        },
+        authority: e.authority,
+        layout: e.layout,
+        status: e.status,
+        displays: e.displays,
+    };
+    let mut fw = Fw {
+        steps: alloc::vec::Vec::new(),
+        event,
+    };
+    let mut req = request(pipe);
+    req.signal = Signal::HdmiFrl;
+    let c = clock(req);
+    run(e.prepare(req, c)).unwrap();
+    e.io.inner.retiring = [false; 4];
+    run(e.prepare_blank(blank_request(pipe), c)).unwrap();
+    // The clock owner's DTBCLK-fed DTO, and every fetcher stopped.
+    let bank1 = e.layout.dio_clock - 0xa0 * 4;
+    e.io.inner
+        .regs
+        .insert(bank1 + (0x80 + 4 * u64::from(pipe)) * 4, 0x1090);
+    e.io.inner.regs.insert(bank1 + 0x68 * 4, 6 << (pipe * 3));
+    for h in 0..4 {
+        e.io.inner.regs.insert(BASE + (0x5f4 + h * 0xdc) * 4, 3);
+    }
+    run(e.start_frl_link(&mut fw, path(phy), 4, 666_667)).unwrap();
+    e.frl_link_output(path(phy)).unwrap();
+    let request = FrlVideoRequest {
+        pipe,
+        audio_packets_line: 1,
+        borrow_from_blank: true,
+        avi: Avi {
+            vic: 16,
+            ..Avi::default()
+        },
+    };
+    // HDMISTREAMCLK not routed yet.
+    assert!(matches!(
+        run(e.start_frl_video(path(phy), request, c)),
+        Err(Error::Readback(_))
+    ));
+    e.status.state = State::FrlLinkActive(phy);
+    e.io.inner.regs.insert(BASE + 0x59 * 4, 8 | u32::from(pipe));
+    if let Err(err) = run(e.start_frl_video(path(phy), request, c)) {
+        panic!("FRL video: {err:?}");
+    }
+    let r = |e: &Engine<FrlIo>, reg: u64| e.io.inner.regs.get(&frl(reg)).copied().unwrap_or(0);
+    let checks = [
+        (0x8e0, 0x3_0301, 0),
+        (0x900, u32::MAX, 1920 | 280 << 16),
+        (0x908, 3, 2),
+        (0x8e1, 0x1f, 1),
+        (0x8e3, 0x7fff_1103, 2 << 16 | 0x1003),
+        (0x8e5, 1, 0),
+        (0x8e6, 0x33, 3),
+        (0x8e9, 0x7fff_7fff, 2),
+        (0x8d3, 1, 1),
+        (0x8df, 0x111, 1),
+        (0x8d6, 0x10_0011, 1),
+        (0x8d5, 7, u32::from(pipe)),
+        (0x8f1, 0x1000, 0x1000),
+        (0x903, 3, 3),
+    ];
+    if let Some(bad) = checks
+        .iter()
+        .find(|&&(reg, mask, value)| r(&e, reg) & mask != value)
+    {
+        panic!("FRL stream register {:#x}: {:#x}", bad.0, r(&e, bad.0));
+    }
+    if e.status.state != State::FrlVideoRunning(pipe) {
+        return TestResult::Fail("FRL video state");
+    }
+    run(e.stop_frl_video(path(phy))).unwrap();
+    if r(&e, 0x8e5) & 1 != 1
+        || r(&e, 0x8d6) & 1 != 0
+        || r(&e, 0x8df) & 1 != 0
+        || r(&e, 0x8d3) & 1 != 0
+        || r(&e, 0x8e6) != 0
+        || r(&e, 0x8e9) != 0
+        || e.status.state != State::FrlLinkActive(phy)
+    {
+        return TestResult::Fail("FRL video stop");
+    }
+    // The link stops with the stream's audio InfoFrame enable left set.
+    run(e.stop_frl_link(&mut fw, path(phy))).unwrap();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-frl-link",
+    dcn401_frl_video_starts_and_stops_like_linux
 );

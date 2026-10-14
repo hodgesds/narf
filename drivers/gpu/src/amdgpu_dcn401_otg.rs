@@ -54,7 +54,9 @@ mod tmds_phy;
 pub use tmds_phy::TmdsDisabled;
 #[path = "amdgpu_dcn401_frl.rs"]
 mod frl;
-pub use frl::{FrlDisabled, FrlEncoderRetired, FrlLinkRetired, FrlLinkUp};
+pub use frl::{
+    FrlDisabled, FrlEncoderRetired, FrlLinkRetired, FrlLinkUp, FrlVideoRequest, FrlVideoRunning,
+};
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -169,6 +171,10 @@ pub enum State {
     /// sending training patterns, or trained and sending FRL output.
     FrlLinkTraining(u8),
     FrlLinkActive(u8),
+    /// FRL video from pipe n: starting, running, stopping.
+    StartingFrlVideo(u8),
+    FrlVideoRunning(u8),
+    StoppingFrlVideo(u8),
     DisablingFrl(u8),
     FrlDisabled,
     RetiringPlanes,
@@ -240,6 +246,7 @@ impl State {
                     | Self::DpVideoRunning(_)
                     | Self::HdmiVideoRunning(_)
                     | Self::UhbrVideoRunning(_)
+                    | Self::FrlVideoRunning(_)
             )
     }
 }
@@ -374,6 +381,9 @@ pub struct Status {
     pub frl_link_retired: Option<FrlLinkRetired>,
     /// This owner's FRL link; current in FrlLinkTraining/FrlLinkActive.
     pub frl_link: Option<FrlLinkUp>,
+    /// Black FRL video; current only in FrlVideoRunning (or beneath a live
+    /// scanout).
+    pub frl_video_running: Option<FrlVideoRunning>,
     /// Historical lane/TX-clock/character-root stop; forced input clocks stay owned.
     pub frl_disabled: Option<FrlDisabled>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
@@ -418,6 +428,7 @@ impl Status {
             frl_encoder_retired: None,
             frl_link_retired: None,
             frl_link: None,
+            frl_video_running: None,
             frl_disabled: None,
             retired: 0,
         }
@@ -649,6 +660,8 @@ pub struct Siblings {
     /// Displays running 128b/132b: their HPO link and stream encoders (the
     /// display's own index, like its pipe) and SYMCLK32 routes.
     pub hpo: u8,
+    /// A display running FRL: the single HPO FRL encoder and its clocks.
+    pub frl: bool,
     pub live: [Option<(u64, bool)>; 4],
 }
 /// An instance's bit in a `Siblings` mask; none for an instance past 7.
@@ -683,9 +696,15 @@ impl Siblings {
                 .filter(|v| v.stream == stream)
                 .map(|v| v.link.path)
         };
+        let frl = |pipe: u8| {
+            s.frl_video_running
+                .filter(|v| v.request.pipe == pipe)
+                .map(|v| v.link.path)
+        };
         let (stream, link) = match s.state {
             State::HdmiVideoRunning(stream) => (stream, s.hdmi_video_running.map(|v| v.link.path)),
             State::UhbrVideoRunning(stream) => (stream, uhbr(stream)),
+            State::FrlVideoRunning(pipe) => (pipe, frl(pipe)),
             State::DpVideoRunning(stream) => {
                 (stream, s.dp_video_running.map(|v| v.frontend.link.phy.path))
             }
@@ -708,7 +727,10 @@ impl Siblings {
                     .dp_video_running
                     .filter(|v| v.frontend.request.stream == live.stream)
                     .map(|v| v.frontend.link.phy.path);
-                (live.stream, hdmi.or(dp).or(uhbr(live.stream)))
+                (
+                    live.stream,
+                    hdmi.or(dp).or(uhbr(live.stream)).or(frl(live.pipe)),
+                )
             }
             _ => return out,
         };
@@ -718,6 +740,7 @@ impl Siblings {
             if uhbr(stream).is_some() {
                 out.hpo |= bit(stream);
             }
+            out.frl |= s.frl_video_running.is_some();
         }
         out
     }
@@ -732,6 +755,7 @@ impl Siblings {
             transmitters: self.transmitters | other.transmitters,
             streams: self.streams | other.streams,
             hpo: self.hpo | other.hpo,
+            frl: self.frl || other.frl,
             live,
         }
     }
@@ -741,6 +765,16 @@ impl Siblings {
 /// frontend. Those are that display's to verify, not foreign.
 fn held_by_sibling(s: Siblings, l: Layout, at: u64) -> bool {
     let phy = |i: u8, r: u64| l.base + (r + u64::from(i) * 0xd8) * 4;
+    // The FRL display's HPO FRL stream and link encoders and its
+    // character-clock root.
+    if s.frl
+        && (clocks::FRL_IDLE
+            .iter()
+            .any(|&(r, _)| at == l.mpc_base + r * 4)
+            || at == l.base + 0x4a * 4)
+    {
+        return true;
+    }
     (0..4u8).any(|i| {
         let b = bit(i);
         let dio = |r| stream::DpStream::Dio(i).at(l, r);

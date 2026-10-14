@@ -748,10 +748,19 @@ impl<I: Io> Engine<I> {
                 }
                 Ok((stream, v.timing.blank.request.pipe))
             }
+            // The single HPO FRL stream is named by its pipe.
+            State::FrlVideoRunning(pipe) => {
+                let v = s.frl_video_running.ok_or(Error::Invalid)?;
+                if v.request.pipe != pipe {
+                    return Err(Error::Invalid);
+                }
+                Ok((pipe, pipe))
+            }
             // No video record at all is a missing predecessor, not contention.
             _ if s.dp_video_running.is_none()
                 && s.hdmi_video_running.is_none()
-                && s.uhbr_video_running.is_none() =>
+                && s.uhbr_video_running.is_none()
+                && s.frl_video_running.is_none() =>
             {
                 Err(Error::Invalid)
             }
@@ -772,6 +781,12 @@ impl<I: Io> Engine<I> {
             .is_some_and(|v| v.stream == stream)
         {
             State::UhbrVideoRunning(stream)
+        } else if self
+            .status
+            .frl_video_running
+            .is_some_and(|v| v.request.pipe == stream)
+        {
+            State::FrlVideoRunning(stream)
         } else {
             State::DpVideoRunning(stream)
         }
@@ -779,6 +794,11 @@ impl<I: Io> Engine<I> {
     fn video_verify_scanout(&mut self, live: ScanoutRunning) -> Result<(), Error> {
         if self.status.hdmi_video_running.is_some() {
             self.hdmi_video_verify_scanout(live)
+        } else if let Some(v) = self.status.frl_video_running {
+            if v.request.pipe != live.pipe || live.stream != live.pipe {
+                return Err(Error::Invalid);
+            }
+            self.frl_video_verify_running(&v)
         } else if let Some(v) = self.status.uhbr_video_running {
             if v.stream != live.stream || v.timing.blank.request.pipe != live.pipe {
                 return Err(Error::Invalid);
