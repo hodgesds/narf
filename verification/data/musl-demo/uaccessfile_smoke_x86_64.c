@@ -77,6 +77,7 @@ int main(int argc, char **argv) {
         printf("uaccessfile-fail: %d of %d\n", bad, n * 2);
         return 1;
     }
-    printf("uaccessfile-ok pages=%d file=%s\n", n, path);
+    printf("uaccessfile: %d pages of %s\n", n, path);
+    printf("uaccessfile-ok\n");
     return 0;
 }
