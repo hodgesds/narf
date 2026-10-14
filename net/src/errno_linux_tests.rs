@@ -966,15 +966,21 @@ kernel_test_in!(
     smoke_icmp_parameter_problem_reaches_udp_as_eproto
 );
 
-/// Linux `ping_v4_sendmsg` → `ip_append_data`: a datagram over 0xFFFF bytes
-/// is -EMSGSIZE; NARF's echo payload limit is 0xFFFF - 20 - 8.
+/// Linux `ping_v4_sendmsg`: an ICMP message over 0xFFFF bytes (echo header
+/// included) is -EMSGSIZE before any route lookup, so it holds even with no
+/// route to the target.
 fn smoke_icmp_echo_oversize_is_msg_too_long() -> TestResult {
-    use crate::icmp_sock::{
-        icmp_echo_close, icmp_echo_open, icmp_echo_send, IcmpError2, ICMP_ECHO_MAX_PAYLOAD,
-    };
+    use crate::icmp_sock::{icmp_echo_close, icmp_echo_open, icmp_echo_send, IcmpError2};
     let sock = icmp_echo_open();
-    let payload = alloc::vec![0u8; ICMP_ECHO_MAX_PAYLOAD + 1];
-    let result = icmp_echo_send(&sock, [192, 0, 2, 1], 1, &payload);
+    let payload = alloc::vec![0u8; 0xFFFF - 8 + 1];
+    let result = icmp_echo_send(
+        &sock,
+        [192, 0, 2, 1],
+        1,
+        &payload,
+        crate::ip_output::IP_PMTUDISC_WANT,
+        None,
+    );
     icmp_echo_close(&sock);
     if result != Err(IcmpError2::MsgTooLong) {
         return TestResult::Fail("oversize echo payload must fail MsgTooLong (-EMSGSIZE)");

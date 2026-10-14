@@ -286,20 +286,40 @@ pub fn icmp_echo_close(sock: &Arc<IcmpEchoSocket>) {
 /// Returns the assigned `seq` number. Call `icmp_echo_recv_reply` to
 /// collect the matching Echo Reply.
 ///
-/// Mirrors Linux `ping_sendmsg` (net/ipv4/ping.c:762).
+/// `pmtudisc` is the socket's IP_MTU_DISCOVER mode and `inet_id` its
+/// `inet_id` counter when it is connected (see
+/// [`crate::ip_output::select_ident`]). A request larger than the MTU is
+/// fragmented as `ip_append_data` + `ip_do_fragment` would.
+///
+/// Mirrors Linux `ping_v4_sendmsg` (net/ipv4/ping.c).
 pub fn icmp_echo_send(
     sock: &Arc<IcmpEchoSocket>,
     target: [u8; 4],
     seq: u16,
     payload: &[u8],
+    pmtudisc: i32,
+    inet_id: Option<&core::sync::atomic::AtomicU16>,
 ) -> Result<(), IcmpError2> {
-    // -EMSGSIZE before any routing work, as in `ping_v4_sendmsg`; beyond
-    // this `ip_total as u16` would wrap and emit a malformed datagram.
-    if payload.len() > ICMP_ECHO_MAX_PAYLOAD {
+    // `ping_v4_sendmsg`: `len > 0xFFFF` → -EMSGSIZE before any routing work;
+    // `len` is the whole ICMP message, echo header included.
+    let icmp_len = 8 + payload.len(); // 8-byte ICMP echo header
+    if icmp_len > 0xFFFF {
         return Err(IcmpError2::MsgTooLong);
     }
     // Wave-47: route by destination, not boot-time primary.
     let iface = iface::for_dst_in(sock.net_ns_id, target).ok_or(IcmpError2::NoInterface)?;
+    // `ip_append_data` (`ip_setup_cork` + `__ip_append_data`), before the
+    // neighbour is resolved.
+    let mtu = crate::ip_output::fragsize(pmtudisc, iface.mtu);
+    match crate::ip_output::append_check(pmtudisc, mtu, icmp_len) {
+        Ok(()) => {}
+        Err(crate::ip_output::AppendError::NetUnreach) => {
+            return Err(IcmpError2::NetworkUnreachable)
+        }
+        Err(crate::ip_output::AppendError::MsgSize { info }) => {
+            return Err(IcmpError2::LocalMsgSize { info })
+        }
+    }
     let dst_mac = if target == [255, 255, 255, 255] {
         [0xFF; 6]
     } else {
@@ -313,7 +333,6 @@ pub fn icmp_echo_send(
     };
 
     // Build: Eth + IPv4 + ICMP echo request.
-    let icmp_len = 8 + payload.len(); // 8-byte ICMP echo header
     let ip_total = IPV4_HDR_LEN + icmp_len;
     let frame_len = ETH_HDR_LEN + ip_total;
     let mut frame = alloc::vec![0u8; frame_len];
@@ -325,6 +344,14 @@ pub fn icmp_echo_send(
         IP_PROTO_ICMP,
         iface.ipv4,
         target,
+    );
+    // `__ip_make_skb`: DF from IP_MTU_DISCOVER, then `ip_select_ident`.
+    crate::ip_output::make_header(
+        sock.net_ns_id,
+        &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN],
+        pmtudisc,
+        mtu,
+        inet_id,
     );
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
 
@@ -364,7 +391,16 @@ pub fn icmp_echo_send(
         sock.sync_readiness(&pending);
     }
 
-    if iface.xmit(&frame).is_err() {
+    // `ip_finish_output`: fragments a request larger than the MTU.
+    let sent = crate::ip_output::ip_finish_output(
+        sock.net_ns_id,
+        &frame,
+        ETH_HDR_LEN,
+        mtu,
+        crate::ip_output::ip_sk_ignore_df(pmtudisc),
+        |f| iface.xmit(f),
+    );
+    if let Err(e) = sent {
         // Keep a reply if hardware reported failure after transmitting; only
         // retract this still-pending request.  We do not hold this queue lock
         // across the driver call above.
@@ -376,7 +412,10 @@ pub fn icmp_echo_send(
             pending.remove(index);
             sock.sync_readiness(&pending);
         }
-        return Err(IcmpError2::NoInterface);
+        return Err(match e {
+            crate::ip_output::OutputError::MsgSize => IcmpError2::MsgTooLong,
+            crate::ip_output::OutputError::Output => IcmpError2::NoInterface,
+        });
     }
 
     Ok(())
@@ -486,9 +525,15 @@ pub enum IcmpError2 {
     NoInterface,
     NetworkUnreachable,
     BufferTooSmall,
-    /// Echo payload does not fit one IPv4 datagram (`ping_common_sendmsg` /
-    /// `__ip_append_data` → -EMSGSIZE).
+    /// The echo message is over 0xFFFF bytes (`ping_v4_sendmsg` → -EMSGSIZE
+    /// before routing; no error-queue record).
     MsgTooLong,
+    /// `__ip_append_data` → -EMSGSIZE: larger than the socket's
+    /// IP_MTU_DISCOVER mode may send. `info` is `ip_local_error`'s `ee_info`
+    /// (the MTU).
+    LocalMsgSize {
+        info: u32,
+    },
 }
 
 /// Largest ICMP echo payload one IPv4 datagram carries: `0xFFFF` minus
@@ -588,6 +633,21 @@ fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_bo
         iface.ipv4,
         src_ip,
     );
+    // `icmp_reply` sends through the per-CPU ICMP control socket, which
+    // `icmp_sk_init` sets to IP_PMTUDISC_DONT: no DF, an ID from
+    // `__ip_select_ident`, and fragmented when the echoed payload exceeds
+    // the MTU (a reassembled large request).
+    let mtu = crate::ip_output::fragsize(crate::ip_output::IP_PMTUDISC_DONT, iface.mtu);
+    if crate::ip_output::append_check(crate::ip_output::IP_PMTUDISC_DONT, mtu, icmp_len).is_err() {
+        return;
+    }
+    crate::ip_output::make_header(
+        net_ns_id,
+        &mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN],
+        crate::ip_output::IP_PMTUDISC_DONT,
+        mtu,
+        None,
+    );
     set_ipv4_checksum(&mut frame[ETH_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN]);
 
     let icmp_off = ETH_HDR_LEN + IPV4_HDR_LEN;
@@ -606,7 +666,10 @@ fn handle_echo_request(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], icmp_bo
     if nf_tx_filter_in(net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
         == crate::netfilter::Verdict::Accept
     {
-        let _ = iface.xmit(&frame);
+        let _ =
+            crate::ip_output::ip_finish_output(net_ns_id, &frame, ETH_HDR_LEN, mtu, true, |f| {
+                iface.xmit(f)
+            });
     }
 }
 

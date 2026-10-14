@@ -709,6 +709,146 @@ fn smoke_abi_udp_sendto_size_limits() -> TestResult {
 }
 kernel_test_in!("syscall_abi/udp", smoke_abi_udp_sendto_size_limits);
 
+const IPPROTO_IP: u64 = 0;
+const IP_MTU_DISCOVER: u64 = 10;
+const IP_RECVERR: u64 = 11;
+const IP_PMTUDISC_DO: u32 = 2;
+const SO_EE_ORIGIN_LOCAL: u8 = 1;
+
+/// What `recvmsg(MSG_ERRQUEUE)` returned: (return, name, msg_flags, control
+/// bytes).
+type ErrQueueRecv = (i64, [u8; 16], u32, [u8; 64]);
+
+/// `recvmsg(MSG_ERRQUEUE)` with a 16-byte name and a 64-byte control buffer.
+fn recv_errqueue(fd: &Fd) -> Result<ErrQueueRecv, &'static str> {
+    let mut data = [0u8; 8];
+    let mut from = [0xAAu8; 16];
+    let mut control = [0u8; 64];
+    let iov: [u64; 2] = [data.as_mut_ptr() as u64, data.len() as u64];
+    let mut msg = [0u8; 56];
+    msg[0..8].copy_from_slice(&(from.as_mut_ptr() as u64).to_ne_bytes());
+    msg[8..12].copy_from_slice(&16u32.to_ne_bytes());
+    msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+    msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+    msg[32..40].copy_from_slice(&(control.as_mut_ptr() as u64).to_ne_bytes());
+    msg[40..48].copy_from_slice(&(control.len() as u64).to_ne_bytes());
+    let r = call(
+        Syscall::SocketRecvMsg.raw(),
+        a2(fd.0, msg.as_mut_ptr() as u64, MSG_ERRQUEUE),
+    )
+    .ok_or("recvmsg status")?;
+    let flags = u32::from_ne_bytes([msg[48], msg[49], msg[50], msg[51]]);
+    Ok((r, from, flags, control))
+}
+
+/// `__ip_append_data`'s EMSGSIZE is also an `ip_local_error`: with
+/// IP_RECVERR the socket's error queue gets a `sock_extended_err` with
+/// `ee_errno` EMSGSIZE, origin SO_EE_ORIGIN_LOCAL, `ee_info` the path MTU
+/// (lo's 65536 clamped to IP_MAX_MTU), an all-zero offender, and the
+/// datagram's destination with `inet_dport` (0 unconnected) as msg_name
+/// (`net/ipv4/ip_sockglue.c` `ip_local_error`, `ip_recv_error`). Without
+/// IP_RECVERR nothing is queued; `len > 0xFFFF` fails before
+/// `__ip_append_data` and queues nothing either.
+fn smoke_abi_udp_emsgsize_queues_local_error() -> TestResult {
+    with_setup(|| {
+        let big = alloc::vec![0x5Au8; 65536];
+        // No IP_RECVERR: EMSGSIZE, empty error queue.
+        let plain = udp()?;
+        if sendto(&plain, &big[..65508], LO, 41090)? != EMSGSIZE {
+            return Err("a 65508-byte datagram is not EMSGSIZE");
+        }
+        if recv_errqueue(&plain)?.0 != EAGAIN {
+            return Err("EMSGSIZE queued an error without IP_RECVERR");
+        }
+        let tx = udp()?;
+        if setsockopt_int(&tx, IPPROTO_IP, IP_RECVERR, 1)? != 0 {
+            return Err("setsockopt(IP_RECVERR) failed");
+        }
+        if sendto(&tx, &big[..65536], LO, 41090)? != EMSGSIZE {
+            return Err("a 65536-byte datagram is not EMSGSIZE");
+        }
+        if recv_errqueue(&tx)?.0 != EAGAIN {
+            return Err("the len > 0xFFFF check queued an ip_local_error");
+        }
+        if sendto(&tx, &big[..65508], LO, 41090)? != EMSGSIZE {
+            return Err("a 65508-byte datagram is not EMSGSIZE");
+        }
+        if revents(&tx, POLLIN)? & POLLERR == 0 {
+            return Err("a queued local error does not raise POLLERR");
+        }
+        let (r, from, flags, control) = recv_errqueue(&tx)?;
+        if r != 0 || flags & MSG_ERRQUEUE as u32 == 0 {
+            return Err("recvmsg(MSG_ERRQUEUE) did not return the queued error");
+        }
+        if ip_of(&from) != LO || port_of(&from) != 0 {
+            return Err("msg_name is not the destination with inet_dport 0");
+        }
+        let cmsg_len = u64::from_ne_bytes(control[0..8].try_into().unwrap_or([0; 8]));
+        let level = i32::from_ne_bytes(control[8..12].try_into().unwrap_or([0; 4]));
+        let kind = i32::from_ne_bytes(control[12..16].try_into().unwrap_or([0; 4]));
+        if cmsg_len != 48 || level != 0 || kind != IP_RECVERR as i32 {
+            return Err("no SOL_IP/IP_RECVERR control message of 48 bytes");
+        }
+        let ee = &control[16..48];
+        let errno = u32::from_ne_bytes([ee[0], ee[1], ee[2], ee[3]]);
+        let info = u32::from_ne_bytes([ee[8], ee[9], ee[10], ee[11]]);
+        if errno as i64 != -EMSGSIZE || ee[4] != SO_EE_ORIGIN_LOCAL || ee[5] != 0 || ee[6] != 0 {
+            return Err("sock_extended_err is not EMSGSIZE / SO_EE_ORIGIN_LOCAL / type 0 code 0");
+        }
+        if info != 65535 {
+            return Err("ee_info is not lo's MTU clamped to IP_MAX_MTU");
+        }
+        if ee[16..32].iter().any(|b| *b != 0) {
+            return Err("a local error carried an offender address");
+        }
+        if recv_errqueue(&tx)?.0 != EAGAIN {
+            return Err("the error queue held more than one record");
+        }
+        // Connected: msg_name carries the connected port (`inet_dport`).
+        let conn = udp()?;
+        setsockopt_int(&conn, IPPROTO_IP, IP_RECVERR, 1)?;
+        if connect(&conn, LO, 41091)? != 0 {
+            return Err("connect failed");
+        }
+        if send(&conn, &big[..65508])? != EMSGSIZE {
+            return Err("connected 65508-byte send is not EMSGSIZE");
+        }
+        let (r, from, _, _) = recv_errqueue(&conn)?;
+        if r != 0 || ip_of(&from) != LO || port_of(&from) != 41091 {
+            return Err("a connected socket's local error does not name its peer port");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/udp", smoke_abi_udp_emsgsize_queues_local_error);
+
+/// IP_PMTUDISC_DO limits a datagram to the path MTU. To a local address
+/// that path is lo (MTU 65536), so even the largest UDP datagram is
+/// delivered whole (`__ip_append_data`'s `maxnonfragsize = mtu`).
+fn smoke_abi_udp_pmtudisc_do_over_loopback() -> TestResult {
+    with_setup(|| {
+        let rx = receiver(41092)?;
+        setsockopt_int(&rx, SOL_SOCKET, SO_RCVBUF, 1 << 20)?;
+        let tx = udp()?;
+        if setsockopt_int(&tx, IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)? != 0 {
+            return Err("setsockopt(IP_MTU_DISCOVER, DO) failed");
+        }
+        let big = alloc::vec![0x3Cu8; 65507];
+        if sendto(&tx, &big[..4000], LO, 41092)? != 4000 {
+            return Err("a 4000-byte DO datagram to lo was refused");
+        }
+        if sendto(&tx, &big, LO, 41092)? != 65507 {
+            return Err("a 65507-byte DO datagram to lo was refused");
+        }
+        let mut out = alloc::vec![0u8; 70000];
+        if recv(&rx, &mut out)? != 4000 || recv(&rx, &mut out)? != 65507 {
+            return Err("DO datagrams over lo did not arrive whole");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/udp", smoke_abi_udp_pmtudisc_do_over_loopback);
+
 /// MSG_OOB → EOPNOTSUPP (`net/ipv4/udp.c:1088-1089`).
 fn smoke_abi_udp_sendto_msg_oob_eopnotsupp() -> TestResult {
     with_setup(|| {

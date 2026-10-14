@@ -335,6 +335,14 @@ impl SocketFile {
         if let SocketState::Inet6Dgram { peer: slot, .. } = &mut *self.state.lock() {
             *slot = Some(peer);
         }
+        // `__ip6_datagram_connect` hands a v4-mapped peer to
+        // `__ip4_datagram_connect`, which seeds `inet_id` randomly.
+        if mapped_v4(&peer.0).is_some() {
+            self.inet_id.store(
+                narf_net::ip_output::get_random_u16(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
         SocketOpResult::Ok(0)
     }
 
@@ -437,10 +445,15 @@ impl SocketFile {
                 bind_to_device: options.bindtodevice_index,
                 ip_ttl: options.ip_ttl.min(255) as u8,
                 ip_tos: options.ip_tos.min(255) as u8,
+                ip_pmtudisc: options.ext.ip_pmtudisc,
                 sndbuf: narf_net::udp_sock::UDP_MAX_PAYLOAD,
                 ..Default::default()
             };
             let destination = narf_net::udp_sock::SocketAddrV4::new(v4, dest.1);
+            // Any connected AF_INET6 socket has a nonzero `inet_daddr` (the
+            // mapped peer, or LOOPBACK4_IPV6 for a native one), so
+            // `ip_select_ident_segs` takes `inet_id`.
+            let inet_id = connected.map(|_| &self.inet_id);
             return match narf_net::udp_sock::udp_send_from(
                 self.net_ns_id(),
                 local_port,
@@ -448,9 +461,11 @@ impl SocketFile {
                 buf,
                 &udp_options,
                 0,
+                inet_id,
             ) {
                 Ok(n) => SocketOpResult::Ok(n as u64),
-                Err(narf_net::udp_sock::UdpError::MsgTooLong) => {
+                Err(narf_net::udp_sock::UdpError::MsgTooLong)
+                | Err(narf_net::udp_sock::UdpError::LocalMsgSize { .. }) => {
                     SocketOpResult::Err(SockError::MsgSize)
                 }
                 Err(narf_net::udp_sock::UdpError::NoBroadcastPermission) => {

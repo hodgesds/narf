@@ -12716,17 +12716,23 @@ fn install_ipv4_errqueue(msg_ptr: u64, ext: crate::socket::ExtSockError) -> bool
     const IP_RECVERR: i32 = 11;
     let mut data = alloc::vec::Vec::with_capacity(32);
     data.extend_from_slice(&ext.errno.to_ne_bytes()); // ee_errno
-    data.push(ext.origin); // ee_origin (SO_EE_ORIGIN_ICMP)
+    data.push(ext.origin); // ee_origin
     data.push(ext.icmp_type); // ee_type
     data.push(ext.icmp_code); // ee_code
     data.push(0); // ee_pad
-    data.extend_from_slice(&ext.info.to_ne_bytes()); // ee_info (next-hop MTU)
+    data.extend_from_slice(&ext.info.to_ne_bytes()); // ee_info (MTU)
     data.extend_from_slice(&0u32.to_ne_bytes()); // ee_data
-    // Offender sockaddr_in (family, port 0, addr, sin_zero).
-    data.extend_from_slice(&2u16.to_ne_bytes());
-    data.extend_from_slice(&0u16.to_be_bytes());
-    data.extend_from_slice(&ext.offender_ip);
-    data.extend_from_slice(&[0u8; 8]);
+    // Offender sockaddr_in. `ip_recv_error` zeroes it and fills family +
+    // address only when `ipv4_datagram_support_cmsg` holds — true for an
+    // ICMP-origin error, false for SO_EE_ORIGIN_LOCAL.
+    if ext.origin == crate::socket::SO_EE_ORIGIN_ICMP {
+        data.extend_from_slice(&2u16.to_ne_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes());
+        data.extend_from_slice(&ext.offender_ip);
+        data.extend_from_slice(&[0u8; 8]);
+    } else {
+        data.extend_from_slice(&[0u8; 16]);
+    }
     put_cmsgs(msg_ptr, &[(SOL_IP, IP_RECVERR, data)])
 }
 

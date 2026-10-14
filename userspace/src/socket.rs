@@ -815,22 +815,35 @@ impl SockError {
 
 /// A queued extended socket error for `MSG_ERRQUEUE` / `IP_RECVERR` — the
 /// `sock_extended_err` a datagram socket reports after an ICMP error (QUIC
-/// PMTU discovery reads these to learn the path MTU). Delivered by the
-/// `net`-layer ICMP hook; drained by `recvmsg(MSG_ERRQUEUE)`.
+/// PMTU discovery reads these to learn the path MTU) or a local send failure
+/// (`ip_local_error`). Delivered by the `net`-layer ICMP hook or the send
+/// path; drained by `recvmsg(MSG_ERRQUEUE)`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ExtSockError {
     /// `ee_errno` (e.g. EMSGSIZE for fragmentation-needed).
     pub errno: u32,
-    /// `ee_origin` — SO_EE_ORIGIN_ICMP (2).
+    /// `ee_origin` — [`SO_EE_ORIGIN_LOCAL`] or [`SO_EE_ORIGIN_ICMP`].
     pub origin: u8,
-    /// `ee_type` / `ee_code` — the ICMP type/code.
+    /// `ee_type` / `ee_code` — the ICMP type/code (0 for a local error).
     pub icmp_type: u8,
     pub icmp_code: u8,
-    /// `ee_info` — the discovered next-hop MTU for a frag-needed error.
+    /// `ee_info` — the next-hop MTU for a frag-needed error, the path MTU
+    /// for a local EMSGSIZE.
     pub info: u32,
     /// The router/host that sent the ICMP error (cmsg offender address).
+    /// `ip_recv_error` reports an offender only for ICMP-origin errors
+    /// (`ipv4_datagram_support_cmsg`); a local error's is all-zero.
     pub offender_ip: [u8; 4],
+    /// `msg_name`: the address `serr->addr_offset` points at and
+    /// `serr->port` — the errored datagram's destination address and port.
+    pub name_ip: [u8; 4],
+    pub name_port: u16,
 }
+
+/// `SO_EE_ORIGIN_LOCAL` (`include/uapi/linux/errqueue.h`).
+pub(crate) const SO_EE_ORIGIN_LOCAL: u8 = 1;
+/// `SO_EE_ORIGIN_ICMP` (`include/uapi/linux/errqueue.h`).
+pub(crate) const SO_EE_ORIGIN_ICMP: u8 = 2;
 
 /// A source-address override supplied by an `IP_PKTINFO` / `IPV6_PKTINFO`
 /// send control message (`sendmsg`). QUIC uses it to pin a reply's source
@@ -879,6 +892,10 @@ pub struct SocketFile {
     /// to the `recvmsg` cmsg builder (keyed by task, like the RX ancillary
     /// stash).
     inet_err_ancillary: IrqSafeSpinLock<BTreeMap<u64, ExtSockError>>,
+    /// `inet->inet_id`: the IP ID counter a connected AF_INET datagram
+    /// socket's packets take (`ip_select_ident_segs`); seeded randomly at
+    /// connect (`__ip4_datagram_connect`).
+    pub(crate) inet_id: core::sync::atomic::AtomicU16,
     /// Per-send handoff of an `IP_PKTINFO`/`IPV6_PKTINFO` source override from
     /// the `sendmsg` cmsg parser to the datagram send path (keyed by task).
     send_pktinfo: IrqSafeSpinLock<BTreeMap<u64, SendPktInfo>>,
@@ -1904,6 +1921,7 @@ impl SocketFile {
             pending_error: IrqSafeSpinLock::new(None),
             inet_err_queue: IrqSafeSpinLock::new(VecDeque::new()),
             inet_err_ancillary: IrqSafeSpinLock::new(BTreeMap::new()),
+            inet_id: core::sync::atomic::AtomicU16::new(0),
             send_pktinfo: IrqSafeSpinLock::new(BTreeMap::new()),
             sk_shutdown: AtomicU8::new(0),
             net_ns_id: core::sync::atomic::AtomicU64::new(0),
@@ -2940,6 +2958,30 @@ impl SocketFile {
         if q.len() < MAX_ERRQ {
             q.push_back(e);
         }
+    }
+
+    /// `ip_local_error`: queue a locally detected send error for
+    /// `MSG_ERRQUEUE` when IP_RECVERR is set (otherwise nothing is queued —
+    /// the send's own return value is the only report), and wake pollers
+    /// with POLLERR as `sock_queue_err_skb` → `sk_error_report` does.
+    /// `daddr` / `port` are the datagram's destination and the socket's
+    /// connected port (`inet->inet_dport`, 0 when unconnected).
+    pub(crate) fn ip_local_error(&self, errno: u32, daddr: u32, port: u16, info: u32) {
+        if !self.options.lock().ext.ip_recverr {
+            return;
+        }
+        self.push_inet_err(ExtSockError {
+            errno,
+            origin: SO_EE_ORIGIN_LOCAL,
+            icmp_type: 0,
+            icmp_code: 0,
+            info,
+            offender_ip: [0; 4],
+            name_ip: daddr.to_be_bytes(),
+            name_port: port,
+        });
+        self.dgram_readiness.notify(narf_filesystem::POLL_ERR);
+        narf_net::readiness::notify(0);
     }
 
     /// Dequeue the oldest extended error (the errqueue recv path).
@@ -4156,9 +4198,16 @@ impl SocketFile {
     /// lock.
     fn readiness_bits_for_state(&self, state: &SocketState) -> u32 {
         if self.is_inet_icmp_echo() {
+            // `datagram_poll`: a non-empty error queue is EPOLLERR.
+            let err = if self.has_inet_err() {
+                narf_filesystem::POLL_ERR
+            } else {
+                0
+            };
             return self
                 .icmp_echo_socket()
-                .map_or(narf_filesystem::POLL_OUT, |echo| echo.poll_mask());
+                .map_or(narf_filesystem::POLL_OUT, |echo| echo.poll_mask())
+                | err;
         }
         match state {
             // A fresh UDP socket is already writable (`datagram_poll`,
@@ -6634,6 +6683,12 @@ impl SocketFile {
                     return SocketOpResult::Err(SockError::Access);
                 }
                 self.icmp_echo.lock().peer = Some(ip);
+                // `ip4_datagram_connect` → `__ip4_datagram_connect`:
+                // `atomic_set(&inet->inet_id, get_random_u16())`.
+                self.inet_id.store(
+                    narf_net::ip_output::get_random_u16(),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
                 SocketOpResult::Ok(0)
             }
             SocketOp::Send { buf, flags, addr } => {
@@ -6671,15 +6726,29 @@ impl SocketFile {
                 }
                 let sequence = u16::from_be_bytes([buf[6], buf[7]]);
                 let echo = self.ensure_icmp_echo_socket();
+                let pmtudisc = self.options.lock().ext.ip_pmtudisc;
+                // A connected ping socket numbers its datagrams from
+                // `inet_id` (`ip_select_ident_segs` keys on `inet_daddr`).
+                let connected = self.icmp_echo.lock().peer.is_some();
                 match narf_net::icmp_sock::icmp_echo_send(
                     &echo,
                     target.to_be_bytes(),
                     sequence,
                     &buf[8..],
+                    pmtudisc,
+                    connected.then_some(&self.inet_id),
                 ) {
                     Ok(()) => SocketOpResult::Ok(buf.len() as u64),
                     Err(narf_net::icmp_sock::IcmpError2::MsgTooLong)
                     | Err(narf_net::icmp_sock::IcmpError2::BufferTooSmall) => {
+                        SocketOpResult::Err(SockError::MsgSize)
+                    }
+                    // `__ip_append_data` → `ip_local_error(sk, EMSGSIZE,
+                    // daddr, inet_dport, mtu)`. A ping socket's `inet_dport`
+                    // is 0: `ping_v4_sendmsg` routes with dport 0 and NARF's
+                    // connect keeps no port.
+                    Err(narf_net::icmp_sock::IcmpError2::LocalMsgSize { info }) => {
+                        self.ip_local_error(errno::EMSGSIZE as u32, target, 0, info);
                         SocketOpResult::Err(SockError::MsgSize)
                     }
                     Err(narf_net::icmp_sock::IcmpError2::NoInterface)
@@ -6689,8 +6758,18 @@ impl SocketFile {
                 }
             }
             SocketOp::Recv { buf, flags } => {
+                // `ping_recvmsg` → `inet_recv_error` → `ip_recv_error`: pop
+                // the oldest queued extended error; EAGAIN when empty.
                 if flags & MSG_ERRQUEUE != 0 {
-                    return SocketOpResult::Err(SockError::WouldBlock);
+                    let Some(ext) = self.pop_inet_err() else {
+                        return SocketOpResult::Err(SockError::WouldBlock);
+                    };
+                    self.stash_inet_err_ancillary(ext);
+                    let peer = Some(make_sockaddr_in(
+                        u32::from_be_bytes(ext.name_ip),
+                        ext.name_port,
+                    ));
+                    return SocketOpResult::Received { n: 0, peer };
                 }
                 let peek = flags & MSG_PEEK != 0;
                 if let Some(echo) = self.icmp_echo_socket() {

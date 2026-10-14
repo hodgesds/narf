@@ -1615,7 +1615,14 @@ fn smoke_wave47_icmp_echo_routes_via_for_dst() -> TestResult {
 
     let sock = crate::icmp_sock::icmp_echo_open();
     let payload = b"wave47-icmp";
-    match crate::icmp_sock::icmp_echo_send(&sock, DST_IP, 1, payload) {
+    match crate::icmp_sock::icmp_echo_send(
+        &sock,
+        DST_IP,
+        1,
+        payload,
+        crate::ip_output::IP_PMTUDISC_WANT,
+        None,
+    ) {
         Ok(()) => {}
         Err(_) => return TestResult::Fail("icmp_echo_send failed"),
     }
@@ -2782,6 +2789,7 @@ fn smoke_udp_first_datagram_flushes_after_arp_reply() -> TestResult {
         payload,
         &UdpOptions::default(),
         0,
+        None,
     );
     if sent != Ok(payload.len()) {
         return TestResult::Fail("non-blocking UDP send did not accept the queued datagram");
@@ -2845,6 +2853,7 @@ fn smoke_udp_pending_datagram_dropped_on_iface_namespace_move() -> TestResult {
         b"pending-before-move",
         &UdpOptions::default(),
         0,
+        None,
     );
     if sent != Ok(19) || crate::udp_sock::__pending_udp4_test_count(0) != 1 {
         return TestResult::Fail("UDP datagram was not pending before namespace move");

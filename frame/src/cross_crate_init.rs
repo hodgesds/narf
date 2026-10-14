@@ -308,6 +308,10 @@ fn install_net_stack() {
     // wait; this background task picks up frames between syscalls.
     narf_net::tcp_stack::init();
 
+    // The IPv4 ID generator (`__ip_select_ident`) and the `inet_id` seed
+    // draw from the kernel CSPRNG, which lives in narf-filesystem.
+    narf_net::ip_output::install_random_hook(narf_filesystem::csprng::fill);
+
     // Loopback. `register_loopback` had NO caller outside the tests, so a
     // real boot had no "lo" interface at all — and nothing assigned
     // 127.0.0.1/8, so `install_connected_route` never ran either and the FIB
@@ -654,13 +658,18 @@ fn snmp_adapter() -> narf_filesystem::procfs::net::SnmpMib {
     // SNMP counters live in atomic globals across the net stack;
     // until those land in narf_net, surface a baseline MIB with
     // the static defaults RFC 1213 specifies as well-known. The reassembly
-    // counters are real (`IPSTATS_MIB_REASM*`, per network namespace).
+    // counters are real (`IPSTATS_MIB_REASM*`, per network namespace), as
+    // are the output fragmentation counters (`IPSTATS_MIB_FRAG*`).
     let reasm = narf_net::ip_fragment::stats_in(current_net_ns_id());
+    let frag = narf_net::ip_output::frag_stats_in(current_net_ns_id());
     narf_filesystem::procfs::net::SnmpMib {
         ip_reasm_timeout: reasm.timeout,
         ip_reasm_reqds: reasm.reqds,
         ip_reasm_oks: reasm.oks,
         ip_reasm_fails: reasm.fails,
+        ip_frag_oks: frag.oks,
+        ip_frag_fails: frag.fails,
+        ip_frag_creates: frag.creates,
         ip_forwarding: 2, // 1=router, 2=host (NARF: host today)
         ip_default_ttl: 64,
         tcp_rto_algorithm: 1, // 1=other, 2=constant, 3=mil-std-1778, 4=van-jacobson
