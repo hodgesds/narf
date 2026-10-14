@@ -2428,6 +2428,42 @@ fn do_execve_resolved(
         return;
     }
 
+    // The name exactly as the caller spelled it. `do_execveat_common` copies
+    // `bprm->filename` to the new stack as-is and points `AT_EXECFN` at that
+    // copy (`bprm->exec`), and `binfmt_script` hands the same string to the
+    // interpreter as its script argument — a relative `./prog` stays
+    // `./prog` in both, it is never rewritten to an absolute path.
+    let exec_name = path_owned.clone();
+
+    // `fs/exec.c::do_open_execat` opens the image with
+    // `do_file_open(fd, name, ...)`, and for execve that fd is AT_FDCWD: a
+    // relative name walks from `current->fs->pwd`, exactly as
+    // `openat(AT_FDCWD, ...)` does. This body used to hand a relative name
+    // straight to the absolute-path resolver, which has no cwd and looked it
+    // up beneath "/" instead — `cd /tmp; ./prog` was ENOENT ("required file
+    // not found") while `/tmp/prog` ran. Join it onto the cwd the same way
+    // the open path does (`resolve_cwd_path_user`; the chroot prefix is
+    // applied once, at lookup), so every later step — the magic-link checks,
+    // the noexec test, the lookup, `/proc/<pid>/exe` — sees one absolute
+    // name in the caller's view. A HOST_ANCHORED name from execveat is
+    // already absolute on the host side and an `image_override` has no name
+    // to resolve.
+    //
+    // The walk is literal first (`link_path_walk`): `prog/../prog` is
+    // ENOTDIR and `missing/../prog` ENOENT, though both normalise to a name
+    // that exists. Linux opens the file before it counts argv, so these
+    // errnos come ahead of an argv/envp EFAULT.
+    if image_override.is_none() && !path_owned.starts_with(HOST_ANCHORED) {
+        let task = current_task_id();
+        if let Err(errno) = literal_walk_check(task, &path_owned) {
+            ctx.set_return(errno_ret(errno));
+            return;
+        }
+        if !path_owned.starts_with('/') {
+            path_owned = resolve_cwd_path_user(task, &path_owned);
+        }
+    }
+
     // `/proc/<pid>/exe` is a magic link to the process's executable
     // (`proc_exe_link` -> `mm->exe_file`); following it does not re-walk link
     // text. Chromium launches every child (network service, renderers, GPU)
@@ -2472,7 +2508,7 @@ fn do_execve_resolved(
     // mount to test there.
     if image_override.is_none()
         && narf_filesystem::any_restricted_mounts()
-        && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOEXEC != 0
+        && current_mount_flags_at(&apply_chroot(path)) & narf_filesystem::mnt_flags::NOEXEC != 0
     {
         ctx.set_return(errno_ret(EACCES)); // -EACCES
         return;
@@ -2638,6 +2674,11 @@ fn do_execve_resolved(
     // Follow nested shebangs up to a small depth so a script interpreting a
     // script still terminates. Without this, every `#!`-script execve EINVALs.
     let mut cur_path = alloc::string::String::from(path);
+    // `bprm->interp`: the name of the image being loaded as the caller (or
+    // the `#!` line) spelled it. It is what a script interpreter receives as
+    // its script argument and what AT_EXECFN carries; `cur_path` is its
+    // resolved form, used for the lookups and `/proc/<pid>/exe`.
+    let mut cur_name = exec_name;
     let mut cur_argv: alloc::vec::Vec<alloc::string::String> = argv_strs.clone();
     let exec_src;
     // The resolved binary, when the image came from a filesystem path. Handing
@@ -2695,9 +2736,12 @@ fn do_execve_resolved(
                 if let Some(a) = optarg {
                     new_argv.push(a.into());
                 }
-                new_argv.push(cur_path.clone());
+                new_argv.push(cur_name.clone());
                 new_argv.extend(cur_argv.iter().skip(1).cloned());
-                cur_path = interp.into();
+                // `open_exec(i_name)` walks from AT_FDCWD too, so a relative
+                // interpreter (`#!./interp`) resolves against the cwd.
+                cur_name = interp.into();
+                cur_path = resolve_cwd_path_user(current_task_id(), interp);
                 cur_argv = new_argv;
                 continue;
             }
@@ -2754,11 +2798,12 @@ fn do_execve_resolved(
             None,
             crate::ProcessId(task_to_pid_raw(task).unwrap_or(task)),
             exec_file.as_ref(),
-            // AT_EXECFN — the path this exec resolved, which is what glibc
-            // expands `$ORIGIN` against. `cur_path` and not `argv_refs[0]`:
-            // after a `#!` line it names the interpreter actually being mapped,
-            // and a caller's argv[0] may be anything at all.
-            Some(cur_path.as_str()),
+            // AT_EXECFN — the name of the image being mapped as it was
+            // spelled (relative stays relative, as `bprm->exec` does), and
+            // not `argv_refs[0]`, which a caller may set to anything at all.
+            // After a `#!` line it names the interpreter actually being
+            // mapped.
+            Some(cur_name.as_str()),
         )
     } {
         Ok(p) => p,
@@ -2883,6 +2928,7 @@ fn do_execve_resolved(
         drop(exec_src);
         drop(cur_argv);
         drop(cur_path);
+        drop(cur_name);
         drop(argv_strs);
         drop(envp_strs);
         drop(path_owned);
@@ -3023,6 +3069,7 @@ fn do_execve_resolved(
         drop(exec_src);
         drop(cur_argv);
         drop(cur_path);
+        drop(cur_name);
         drop(argv_strs);
         drop(envp_strs);
         drop(path_owned);
