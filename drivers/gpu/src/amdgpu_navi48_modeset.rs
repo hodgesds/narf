@@ -435,6 +435,10 @@ fn dp_offer_fits(timing: &Timing, s: &Selection) -> bool {
     }
 }
 
+/// LINK_TRAINING_ATTEMPTS and LINK_TRAINING_RETRY_DELAY.
+const UHBR_TRAINING_ATTEMPTS: u8 = 4;
+const UHBR_RETRY_DELAY_MS: u64 = 50;
+
 /// Linux's dp_lt_fallbacks, best bandwidth first, which its maximum
 /// bandwidth fallback policy walks once a link can code 128b/132b.
 const FALLBACKS: [(u8, DpRate); 21] = {
@@ -1433,9 +1437,10 @@ impl ColdBoot {
     /// The 128b/132b half of `start_link`: train down Linux's fallback
     /// table on HPO link encoder `pipe` (one display per pipe, as Linux's
     /// first-free assignment gives in display order), then 128b/132b video
-    /// on HPO stream encoder `pipe` and scanout. One attempt per setting,
-    /// where Linux's modeset retries the same setting four times. No audio:
-    /// the HPO audio path (APG) is not implemented.
+    /// on HPO stream encoder `pipe` and scanout. Each setting gets
+    /// perform_link_training_with_retries' four attempts, the link stopped
+    /// after each refusal and 50 ms more waited before each retry. No
+    /// audio: the HPO audio path (APG) is not implemented.
     /// # Safety
     /// As for `start_link`.
     async unsafe fn start_uhbr_link(
@@ -1456,28 +1461,35 @@ impl ColdBoot {
         let mut trained = false;
         // SAFETY: the caller's obligations; each step checks its predecessor.
         unsafe {
-            for (lanes, link) in candidates {
+            'settings: for (lanes, link) in candidates {
                 let DpRate::Uhbr(rate) = link else {
                     continue;
                 };
                 let settings = otg::UhbrSettings { lanes, rate };
-                match self.train_display_uhbr_link(port, settings, pipe).await {
-                    Ok(_) => {
-                        (selection.lanes, selection.rate) = (lanes, link);
-                        trained = true;
-                        break;
+                for attempt in 0..UHBR_TRAINING_ATTEMPTS {
+                    if attempt != 0 {
+                        let ms = UHBR_RETRY_DELAY_MS * u64::from(attempt);
+                        narf_time::SleepUntil::new(narf_time::Deadline::after_ms(ms).as_instant())
+                            .await;
                     }
-                    // The sink refused this setting and training exited:
-                    // stop the link and try the next.
-                    Err(e @ otg::Error::DpTraining(_))
-                        if self
-                            .display_timing_status()
-                            .is_ok_and(|s| s.state == otg::State::UhbrLinkRefused(transmitter)) =>
-                    {
-                        refused = e.into();
-                        self.stop_display_uhbr_link(port, false).await?;
+                    match self.train_display_uhbr_link(port, settings, pipe).await {
+                        Ok(_) => {
+                            (selection.lanes, selection.rate) = (lanes, link);
+                            trained = true;
+                            break 'settings;
+                        }
+                        // The sink refused this setting and training
+                        // exited: stop the link before the next attempt.
+                        Err(e @ otg::Error::DpTraining(_))
+                            if self.display_timing_status().is_ok_and(|s| {
+                                s.state == otg::State::UhbrLinkRefused(transmitter)
+                            }) =>
+                        {
+                            refused = e.into();
+                            self.stop_display_uhbr_link(port, false).await?;
+                        }
+                        Err(e) => return Err(e.into()),
                     }
-                    Err(e) => return Err(e.into()),
                 }
             }
             if !trained {
