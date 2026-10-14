@@ -14668,15 +14668,23 @@ pub fn __test_orphanize_children_of(parent_tid: u64) {
 /// reparent target. Linux find_new_reaper does this before consulting
 /// subreapers or namespace init.
 fn find_thread_group_reaper(dying: u64) -> Option<u64> {
+    // `find_alive_thread`: the first thread not yet exiting (`PF_EXITING`,
+    // NARF's TASK_ZOMBIE flip at the top of the exit path). A sibling that is
+    // itself exiting has run, or is about to run, its own reparenting; handing
+    // it children would strand them under a thread that never looks again.
+    let alive = |task: u64| {
+        crate::task::task_get(task)
+            .is_some_and(|t| t.state.load(Ordering::Acquire) == crate::task::TASK_RUNNING)
+    };
     let tgid = task_to_pid_raw(dying)?;
     if let Some(leader) = pid_to_task_raw(tgid) {
-        if leader != dying && signal_target_exists(leader) {
+        if leader != dying && alive(leader) {
             return Some(leader);
         }
     }
     thread_group_members(tgid)
         .into_iter()
-        .find(|&task| task != dying && signal_target_exists(task))
+        .find(|&task| task != dying && alive(task))
 }
 
 fn orphanize_children_of(parent_tid: u64) {
@@ -14686,6 +14694,11 @@ fn orphanize_children_of(parent_tid: u64) {
     if parent_child_count(parent_tid) == 0 {
         return;
     }
+    // Releases of auto-reaped zombies run after the lock is dropped: dropping
+    // a Task can re-enter the exit observers, which take this lock.
+    let mut release_after: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    {
+    let _tasklist = TASKLIST.lock();
     let thread_reaper = find_thread_group_reaper(parent_tid);
     let reaper = thread_reaper.or_else(|| find_child_subreaper(parent_tid));
     let reset_exit_signal = thread_reaper.is_none();
@@ -14729,9 +14742,8 @@ fn orphanize_children_of(parent_tid: u64) {
         }
         _ => {
             for entry in stale {
-                release_reaped_task(entry.child_pid);
-                crate::release_pid(crate::ProcessId(entry.child_pid));
                 parent_of_remove(entry.child_pid);
+                release_after.push(entry.child_pid);
             }
         }
     }
@@ -14796,6 +14808,11 @@ fn orphanize_children_of(parent_tid: u64) {
             }
         }
     }
+    }
+    for child_pid in release_after {
+        release_reaped_task(child_pid);
+        crate::release_pid(crate::ProcessId(child_pid));
+    }
 }
 
 /// Run a pending Magic SysRq command (`narf_input::evdev::take_sysrq_request`)
@@ -14849,8 +14866,14 @@ pub fn sysrq_show_tasks() {
 /// must see the dying task's pgid/sid intact): the master per-task
 /// teardown. `_pid` is the visible pid; all swept tables key on tid.
 fn task_tables_exit_observer(_pid: u64, tid: u64) {
-    release_task_tables(tid);
+    // `exit_notify` -> `forget_original_parent` reparents the children while
+    // the dying thread is still whole; its signal state goes later, in
+    // `release_task`. The other order left a window in which a child that
+    // exited still resolved its parent to this thread, whose sigaction rows
+    // were already gone: SIGCHLD then took the SIG_DFL generation-time
+    // discard and never reached the surviving threads.
     orphanize_children_of(tid);
+    release_task_tables(tid);
 }
 
 /// Exit observer for the LAST thread of a group: release the group's shared
@@ -15593,6 +15616,16 @@ pub(crate) fn proc_pid_to_tid(pid: u64) -> u64 {
 /// (wait4 reap entry + SIGCHLD + waker) — or, if orphaned, releases the
 /// task and returns the PID. Running this per thread double-freed the
 /// PID pool and the parent's reap queue (the OCI teardown #UD).
+/// Linux `tasklist_lock`, for the one pair of paths that must not interleave:
+/// a dying thread reparenting its children (`forget_original_parent`, held for
+/// write) and a child's exit resolving its parent, publishing its zombie and
+/// signalling that parent (`exit_notify` -> `do_notify_parent`, held too).
+/// Without it a child could resolve the dying thread, then publish its reap
+/// entry after the dying thread had already moved its list to the new
+/// reaper — a zombie no surviving thread can wait for. Nothing that can
+/// re-enter either path (a task or pid release) runs under it.
+static TASKLIST: narf_lib::sync::IrqSafeSpinLock<()> = narf_lib::sync::IrqSafeSpinLock::new(());
+
 fn on_child_exit(child_pid: u64, child_tid: u64) {
     // `child_tid` is consumed only by the cgroup-gated PIDFD-EXIT probe
     // below; keep it live for the no-cgroup build.
@@ -15601,6 +15634,10 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // Capture ptrace routing before release_process removes the tracee row.
     // Linux reports a traced zombie to its tracer first, irrespective of its
     // clone-child exit-signal class.
+    // Held from resolving the parent to signalling it (`exit_notify` holds
+    // tasklist_lock across `do_notify_parent`), so the parent cannot reparent
+    // this child or vanish in between.
+    let tasklist = TASKLIST.lock();
     let wait_recipient = get_wait_recipient(child_pid);
     // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
@@ -15627,6 +15664,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
             // pidfd_open()'d watchers now, drain the staged status so a re-used
             // pid doesn't see stale state, release the refcounted Task, and
             // return the PID to the pool immediately since no one will reap it.
+            drop(tasklist);
             let _ = crate::pidfd::notify_exit(child_pid);
             let _ = take_pending_termination(child_pid);
             release_reaped_task(child_pid);
