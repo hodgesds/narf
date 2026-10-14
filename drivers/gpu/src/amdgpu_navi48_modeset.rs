@@ -767,8 +767,6 @@ pub fn select_all(
         let Some(caps) = dp_caps(&port.path, sink) else {
             continue;
         };
-        // The HPO (128b/132b) stream path is not yet lit: UHBR stays unused.
-        let caps = DpCaps { uhbr: 0, ..caps };
         let Some(index) = paths.iter().position(|p| *p == port.path) else {
             continue;
         };
@@ -792,7 +790,12 @@ pub fn select_all(
             hdmi: false,
             scdc: false,
             depth: otg::ColorDepth::Bpc8,
-            audio: sink_audio_info(&sink.edid),
+            // HPO (128b/132b) audio is not implemented.
+            audio: if matches!(rate, DpRate::Uhbr(_)) {
+                None
+            } else {
+                sink_audio_info(&sink.edid)
+            },
             avi: otg::Avi::default(),
             limited: false,
             ycbcr420: false,
@@ -871,10 +874,12 @@ pub fn admit_displays(
 
 /// Link settings to try for `timing` from (`lanes`, `rate`), best first. A
 /// 128b/132b link walks Linux's bandwidth-ordered fallback table from that
-/// setting, through 8b/10b settings too, as decide_fallback_link_setting's
-/// maximum bandwidth policy does; an 8b/10b one keeps narf's ladder
-/// (`link_candidates`). Settings beyond `caps` or that cannot carry the
-/// mode are never tried.
+/// setting, as decide_fallback_link_setting's maximum bandwidth policy
+/// does, but only through its 128b/132b settings: the timing (and its HPO
+/// output mux) is staged for the encoding before the link trains, so a
+/// mode that needs 8b/10b instead is a new selection. An 8b/10b link keeps
+/// narf's ladder (`link_candidates`). Settings beyond `caps` or that cannot
+/// carry the mode are never tried.
 pub fn dp_candidates(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> Vec<(u8, DpRate)> {
     if let DpRate::Legacy(r) = rate {
         return link_candidates(timing, lanes, r)
@@ -886,7 +891,7 @@ pub fn dp_candidates(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> 
     let usable = |(l, r): (u8, DpRate)| {
         l <= caps.lanes
             && match r {
-                DpRate::Legacy(r) => r as u8 <= caps.rate as u8,
+                DpRate::Legacy(_) => false,
                 DpRate::Uhbr(r) => caps.uhbr_rates().any(|u| u == r),
             }
             && dp_fits(timing, caps, l, r)
@@ -924,6 +929,13 @@ pub fn mode(timing: Timing) -> dml::Mode {
         timing,
         pitch: (timing.h_active + 63) & !63,
         ycbcr420: false,
+    }
+}
+
+impl Selection {
+    /// A 128b/132b (UHBR) DP link.
+    pub fn uhbr(&self) -> bool {
+        matches!(self.rate, DpRate::Uhbr(_))
     }
 }
 
@@ -969,13 +981,17 @@ pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan, hdmi: bool) -> dccg::Reque
     }
 }
 
-pub fn timing_request(pipe: u8, plan: &dml::Plan, hdmi: bool) -> otg::Request {
+/// The timing a selection's link needs: TMDS, DP through the DIO
+/// encoders, or (for a 128b/132b link) DP through the HPO encoders.
+pub fn timing_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> otg::Request {
     otg::Request {
         pipe,
         timing: plan.mode.timing,
         sync: plan.sync,
-        signal: if hdmi {
+        signal: if selection.hdmi {
             otg::Signal::Tmds
+        } else if selection.uhbr() {
+            otg::Signal::HpoDisplayPort
         } else {
             otg::Signal::DisplayPort
         },
@@ -1255,7 +1271,7 @@ impl ColdBoot {
                 self.upload_display_surface(pipe, 0, y, &row)?;
             }
             self.prepare_display_memory(pipe).await?;
-            self.prepare_display_timing(timing_request(pipe, &plan, selection.hdmi))
+            self.prepare_display_timing(timing_request(pipe, &plan, &selection))
                 .await?;
             self.prepare_display_blank(otg::BlankRequest {
                 pipe,
@@ -1361,6 +1377,9 @@ impl ColdBoot {
                 }
                 return Ok((selection, scanout));
             }
+            if selection.uhbr() {
+                return self.start_uhbr_link(selection, pipe).await;
+            }
             let mut selection = selection;
             let mut trained = false;
             let mut refused = ModesetError::Link;
@@ -1373,9 +1392,7 @@ impl ColdBoot {
                 selection.rate,
             );
             for (lanes, link) in candidates {
-                // The HPO (128b/132b) path does not start yet.
                 let DpRate::Legacy(rate) = link else {
-                    refused = ModesetError::Display(otg::Error::Unsupported);
                     continue;
                 };
                 self.enable_display_dp_phy(port, otg::DpPhySettings { lanes, rate })
@@ -1412,6 +1429,75 @@ impl ColdBoot {
             }
             Ok((selection, scanout))
         }
+    }
+    /// The 128b/132b half of `start_link`: train down Linux's fallback
+    /// table on HPO link encoder `pipe` (one display per pipe, as Linux's
+    /// first-free assignment gives in display order), then 128b/132b video
+    /// on HPO stream encoder `pipe` and scanout. One attempt per setting,
+    /// where Linux's modeset retries the same setting four times. No audio:
+    /// the HPO audio path (APG) is not implemented.
+    /// # Safety
+    /// As for `start_link`.
+    async unsafe fn start_uhbr_link(
+        &mut self,
+        selection: Selection,
+        pipe: u8,
+    ) -> Result<(Selection, otg::ScanoutRunning), ModesetError> {
+        let port = selection.port;
+        let mut selection = selection;
+        let mut refused = ModesetError::Link;
+        let transmitter = self.display_paths().map_err(|_| ModesetError::NoSink)?[port].transmitter;
+        let candidates = dp_candidates(
+            &selection.timing,
+            selection.caps,
+            selection.lanes,
+            selection.rate,
+        );
+        let mut trained = false;
+        // SAFETY: the caller's obligations; each step checks its predecessor.
+        unsafe {
+            for (lanes, link) in candidates {
+                let DpRate::Uhbr(rate) = link else {
+                    continue;
+                };
+                let settings = otg::UhbrSettings { lanes, rate };
+                match self.train_display_uhbr_link(port, settings, pipe).await {
+                    Ok(_) => {
+                        (selection.lanes, selection.rate) = (lanes, link);
+                        trained = true;
+                        break;
+                    }
+                    // The sink refused this setting and training exited:
+                    // stop the link and try the next.
+                    Err(e @ otg::Error::DpTraining(_))
+                        if self
+                            .display_timing_status()
+                            .is_ok_and(|s| s.state == otg::State::UhbrLinkRefused(transmitter)) =>
+                    {
+                        refused = e.into();
+                        self.stop_display_uhbr_link(port, false).await?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            if !trained {
+                return Err(refused);
+            }
+            self.start_display_uhbr_video(port, pipe, pipe).await?;
+            let scanout = self.start_display_scanout(pipe).await?;
+            Ok((selection, scanout))
+        }
+    }
+    /// Stop a running 128b/132b display's video and link (scanout stopped).
+    /// # Safety
+    /// As for `stop_modeset`.
+    async unsafe fn stop_uhbr(&mut self, port: usize, unplugged: bool) -> Result<(), ModesetError> {
+        // SAFETY: the caller's obligations; each step checks its predecessor.
+        unsafe {
+            self.stop_display_uhbr_video(port).await?;
+            self.stop_display_uhbr_link(port, unplugged).await?;
+        }
+        Ok(())
     }
     /// Check a running modeset: hot-plug first (no AUX to an absent sink),
     /// then the sink's lane lock, then the scanout itself.
@@ -1450,6 +1536,12 @@ impl ColdBoot {
         }
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
+            if m.selection.uhbr() {
+                self.stop_display_scanout(m.pipe).await?;
+                self.stop_uhbr(port, false).await?;
+                (m.selection, m.scanout) = self.start_link(m.selection, m.pipe).await?;
+                return Ok(());
+            }
             if m.selection.audio.is_some() {
                 self.stop_display_audio(port, false).await?;
             }
@@ -1474,12 +1566,14 @@ impl ColdBoot {
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
-            if m.selection.audio.is_some() {
+            if m.selection.audio.is_some() && !m.selection.uhbr() {
                 self.stop_display_audio(port, m.selection.hdmi).await?;
             }
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {
                 self.stop_hdmi(port, m.selection.scdc).await?;
+            } else if m.selection.uhbr() {
+                self.stop_uhbr(port, true).await?;
             } else {
                 self.stop_display_dp_video(port).await?;
                 self.stop_display_dp_frontend(port).await?;
@@ -1500,12 +1594,14 @@ impl ColdBoot {
         let port = m.selection.port;
         // SAFETY: as documented above; each step checks its predecessor state.
         unsafe {
-            if m.selection.audio.is_some() {
+            if m.selection.audio.is_some() && !m.selection.uhbr() {
                 self.stop_display_audio(port, m.selection.hdmi).await?;
             }
             self.stop_display_scanout(m.pipe).await?;
             if m.selection.hdmi {
                 self.stop_hdmi(port, m.selection.scdc).await?;
+            } else if m.selection.uhbr() {
+                self.stop_uhbr(port, false).await?;
             } else {
                 self.stop_display_dp_video(port).await?;
                 self.stop_display_dp_frontend(port).await?;

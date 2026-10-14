@@ -166,6 +166,20 @@ impl<I: Io> Engine<I> {
         }
         Ok(plan)
     }
+    /// The trained 128b/132b link `path` carries, from training through a
+    /// running scanout.
+    fn live_uhbr_link(&self, path: Path) -> Option<UhbrLinkTrained> {
+        let s = &self.status;
+        let link = s.uhbr_link.filter(|l| l.path == path)?;
+        let live = match s.state {
+            State::UhbrLinkTrained(t) => t == path.transmitter,
+            State::UhbrVideoRunning(_) | State::ScanoutRunning(_) => {
+                s.uhbr_video_running.is_some_and(|v| v.link.path == path)
+            }
+            _ => false,
+        };
+        live.then_some(link)
+    }
     /// Read the sink's view of a live link. AUX only: no register is written
     /// and a transport failure leaves the owner's state unchanged.
     pub(in crate::amdgpu_dcn401_otg) async fn dp_link_status(
@@ -173,12 +187,16 @@ impl<I: Io> Engine<I> {
         io: &mut impl Transport,
         path: Path,
     ) -> Result<DpLinkStatus, Error> {
-        let plan = self.live_dp_link(path)?;
+        let count = match self.live_dp_link(path) {
+            Ok(plan) => plan.phy.settings.lanes,
+            Err(e) => self.live_uhbr_link(path).ok_or(e)?.settings.lanes,
+        };
         if !io.ready() {
             return Err(Error::Busy);
         }
         let lanes = read::<6>(io, path, 0x202).await?;
-        let locked = link_locked(lanes, plan.phy.settings.lanes);
+        // dp_check_link_loss_status checks 128b/132b links the same way.
+        let locked = link_locked(lanes, count);
         let power = if locked {
             None
         } else {

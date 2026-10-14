@@ -1268,3 +1268,30 @@ kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_ycbcr420_divides_horizontal_timing_and_subsamples
 );
+
+/// A 128b/132b sibling holds its HPO link and stream encoders and the
+/// shared SYMCLK32 route registers; another index's HPO encoders stay
+/// foreign.
+fn dcn401_hpo_siblings_hold_their_encoders() -> TestResult {
+    let l = engine().layout;
+    let s = Siblings {
+        hpo: 1 << 2,
+        ..Siblings::default()
+    };
+    let hpo = |i: u8, r: u64| super::stream::DpStream::Hpo(i).at(l, r);
+    let held = |at| held_by_sibling(s, l, at);
+    if [0x3623, 0x365d, 0x367b, 0x3685, 0x369f, 0x36b4, 0x36b5]
+        .iter()
+        .any(|&r| !held(hpo(2, r)) || held(hpo(1, r)))
+        || !held(l.link_clock)
+        || !held(l.link_clock - 4)
+        || held_by_sibling(Siblings::default(), l, l.link_clock)
+    {
+        return TestResult::Fail("HPO sibling registers");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hpo_siblings_hold_their_encoders
+);

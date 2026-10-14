@@ -945,17 +945,45 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         return TestResult::Fail("fallback that cannot carry the mode");
     }
     let ladder = dp_candidates(&uhd60, caps(0b101), 4, Uhbr(U20));
+    // 128b/132b settings only: the timing is staged for HPO output.
     let want = [
         (4, Uhbr(U20)),
         (2, Uhbr(U20)),
         (4, Uhbr(U10)),
-        (4, Legacy(LinkRate::Hbr3)),
         (1, Uhbr(U20)),
         (2, Uhbr(U10)),
-        (4, Legacy(LinkRate::Hbr2)),
     ];
     if ladder != want {
         return TestResult::Fail("bandwidth-ordered fallback");
+    }
+    // 4K60 on a one-lane sink needs 128b/132b (1 x UHBR20), without audio.
+    let mut p = path(inventory::Connector::DisplayPort, 0);
+    p.max_speed_mhz = 20_000;
+    let paths = [p];
+    let mut sink = display::Sink {
+        dpcd: dpcd(0x1e, 1),
+        edid: edid_uhbr(),
+        lttpr: None,
+        uhbr: 7,
+        lttpr_uhbr: None,
+    };
+    let port = display::Port {
+        path: p,
+        sink: Ok(sink.clone()),
+    };
+    match select(&paths, &[port], 8, None) {
+        Ok(s) if s.uhbr() && s.rate == Uhbr(U20) && s.lanes == 1 && s.audio.is_none() => {}
+        other => panic!("UHBR selection {other:?}"),
+    }
+    // Without a board connector-speed record it does not light at all.
+    sink.uhbr = 7;
+    let bare = path(inventory::Connector::DisplayPort, 0);
+    let port = display::Port {
+        path: bare,
+        sink: Ok(sink),
+    };
+    if select(&[bare], &[port], 8, None).is_ok() {
+        return TestResult::Fail("UHBR without the board's speed");
     }
     TestResult::Pass
 }
@@ -963,3 +991,15 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_decides_uhbr_like_linux
 );
+
+/// A sink whose preferred mode is 3840x2160@60 (594 MHz), with audio.
+fn edid_uhbr() -> Vec<u8> {
+    let mut e = edid_1080p();
+    e[54..72].copy_from_slice(&[
+        0x08, 0xe8, 0x00, 0x30, 0xf2, 0x70, 0x5a, 0x80, 0xb0, 0x58, 0x8a, 0, 0, 0, 0, 0, 0, 0x1e,
+    ]);
+    e[127] = 0;
+    e[127] = narf_edid::compute_checksum(&e);
+    const AUDIO: &[u8] = &[1 << 5 | 3, 0x09, 0x07, 0x07];
+    with_blocks(e, &[AUDIO])
+}

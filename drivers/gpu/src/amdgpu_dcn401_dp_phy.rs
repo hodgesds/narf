@@ -147,20 +147,25 @@ impl<I: Io> Engine<I> {
                 return Err(Error::Busy);
             }
         }
-        // The other HPO link encoders' SYMCLK32_LE routes stay off.
-        if let Some(k) = hpo {
-            let routes = self.read(l.link_clock)?;
-            if (0..4u8).any(|i| i != k && routes >> (4 * i) & 8 != 0) {
-                return Err(Error::Busy);
-            }
+        // The HPO link encoders' SYMCLK32_LE routes stay off but for this
+        // display's and 128b/132b siblings'.
+        let routes = self.read(l.link_clock)?;
+        if (0..4u8).any(|i| {
+            hpo != Some(i) && self.displays.siblings.hpo & bit(i) == 0 && routes >> (4 * i) & 8 != 0
+        }) {
+            return Err(Error::Busy);
         }
         for (reg, mask) in [(0x2125, 0x11), (0x212d, 0x010101ff)] {
             if self.read(at(reg))? & mask != 0 {
                 return Err(Error::Busy);
             }
         }
-        let own = stream.map_or(0, |k| 8 << (4 * k));
-        if self.read(l.link_clock - 4)? & 0x8888 & !own != 0
+        // SYMCLK32_SE routes: this display's stream and 128b/132b siblings'
+        // are theirs.
+        let held = (0..4u8)
+            .filter(|&k| stream == Some(k) || self.displays.siblings.hpo & bit(k) != 0)
+            .fold(0, |m, k| m | 8 << (4 * k));
+        if self.read(l.link_clock - 4)? & 0x8888 & !held != 0
             || self.read(l.base + (0x52 + u64::from(phy)) * 4)? & 1 != 0
         {
             return Err(Error::Busy);
@@ -174,7 +179,7 @@ impl<I: Io> Engine<I> {
             if frontend != Some(p) && !other(siblings.streams) {
                 self.dp_encoder_quiet(DpStream::Dio(p))?;
             }
-            if stream != Some(p) {
+            if stream != Some(p) && !other(siblings.hpo) {
                 self.dp_encoder_quiet(DpStream::Hpo(p))?;
             }
             if (frontend != Some(p)
