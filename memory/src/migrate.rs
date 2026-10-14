@@ -84,21 +84,34 @@ pub enum MigrateError {
 pub fn migrate_frame(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
     match crate::rmap::owner_count(src) {
         0 => Err(MigrateError::NotMapped),
-        1 => {
-            let mut owner = None;
-            crate::rmap::for_each_owner(src, |o| owner = Some(o));
-            let owner = owner.ok_or(MigrateError::NotMapped)?;
-            let aspace = resolve_address_space(owner.root).ok_or(MigrateError::NoAddressSpace)?;
-            // SAFETY: `aspace` is a live, Arc-pinned root; `relocate_frame_at`
-            // re-validates the page under the region lock and only moves it if it
-            // still maps `src`.
-            match unsafe { aspace.relocate_frame_at(owner.va, src) } {
-                Ok(new) => Ok(new),
-                Err(crate::address_space::AddressSpaceError::Unmapped) => Err(MigrateError::Raced),
-                Err(_) => Err(MigrateError::Failed),
-            }
-        }
+        1 => migrate_frame_single(src),
         _ => migrate_frame_multi(src),
+    }
+}
+
+/// Migrate only a single-owner frame, without allocating an owner snapshot.
+///
+/// Direct compaction runs on the allocator-failure path and may call this with
+/// free frames from its candidate block held aside.  It must therefore reject
+/// a COW-shared frame instead of falling through to [`migrate_frame_multi`],
+/// whose ownership snapshot deliberately uses a `Vec` for the ordinary,
+/// non-compaction migration API.
+#[cfg(target_arch = "x86_64")]
+fn migrate_frame_single(src: PhysAddr) -> Result<PhysAddr, MigrateError> {
+    match crate::rmap::owner_count(src) {
+        0 => return Err(MigrateError::NotMapped),
+        1 => {}
+        _ => return Err(MigrateError::MultiOwner),
+    }
+    let owner = crate::rmap::sole_owner(src).ok_or(MigrateError::Raced)?;
+    let aspace = resolve_address_space(owner.root).ok_or(MigrateError::NoAddressSpace)?;
+    // SAFETY: `aspace` is a live, Arc-pinned root; `relocate_frame_at`
+    // re-validates the page under the region lock and only moves it if it
+    // still maps `src`.
+    match unsafe { aspace.relocate_frame_at(owner.va, src) } {
+        Ok(new) => Ok(new),
+        Err(crate::address_space::AddressSpaceError::Unmapped) => Err(MigrateError::Raced),
+        Err(_) => Err(MigrateError::Failed),
     }
 }
 
@@ -213,6 +226,46 @@ pub enum CompactError {
     Raced,
 }
 
+/// Frames in the largest buddy block compaction can be asked to free.
+#[cfg(target_arch = "x86_64")]
+const COMPACT_MAX_BLOCK_FRAMES: usize = 1usize << crate::buddy::MAX_ORDER;
+
+/// One bit per frame of a block under compaction: set ⇔ the frame is currently
+/// held out of the free lists by this compaction attempt.
+///
+/// A fixed-size stack bitmap rather than a `Vec`: compaction is the
+/// allocation-failure slow path (`alloc_pages_on_ctx` → `direct_compact`), so
+/// it must not itself allocate. The old `Vec<PhysAddr>` grew to `8 << order`
+/// bytes while pass 1 was pulling the block's free frames out of the pool, and
+/// that nested heap allocation ran with IRQs masked (inside
+/// [`crate::frame::with_node_cache_bypassed`]) where it could neither compact
+/// nor reclaim — under memory pressure it returned null and the kernel panicked
+/// in `handle_alloc_error`. Linux's compactor likewise works off fixed
+/// per-`compact_control` lists, never the slab, for exactly this reason.
+#[cfg(target_arch = "x86_64")]
+struct BlockFrameSet([u64; COMPACT_MAX_BLOCK_FRAMES / 64]);
+
+#[cfg(target_arch = "x86_64")]
+impl BlockFrameSet {
+    const fn new() -> Self {
+        Self([0; COMPACT_MAX_BLOCK_FRAMES / 64])
+    }
+    fn insert(&mut self, i: usize) {
+        self.0[i / 64] |= 1u64 << (i % 64);
+    }
+    fn contains(&self, i: usize) -> bool {
+        self.0[i / 64] & (1u64 << (i % 64)) != 0
+    }
+    /// Return every held frame of the block based at `base` to the buddy.
+    fn release(&self, base: PhysAddr, count: usize) {
+        for i in 0..count {
+            if self.contains(i) {
+                crate::frame::free_movable_range(PhysAddr::new(base.raw() + (i as u64) * 4096), 1);
+            }
+        }
+    }
+}
+
 /// Compact the naturally-aligned order-`order` physical block based at `base` (a
 /// run of `2^order` frames): migrate every movable user page out of it so the
 /// whole block becomes free and the buddy coalesces it back to order `order`.
@@ -225,16 +278,18 @@ pub enum CompactError {
 /// frees, so every migration destination lands OUTSIDE the block. On any failure
 /// the reservations are released, leaving the block as it was found; on success
 /// the whole run is released as one coalescing free.
+///
+/// Allocation-free: bookkeeping is a fixed stack bitmap ([`BlockFrameSet`]).
+/// An order above the buddy's `MAX_ORDER` is not a block the buddy can
+/// coalesce, so it is refused as [`CompactError::Unmovable`].
 #[cfg(target_arch = "x86_64")]
 pub fn compact_block(base: PhysAddr, order: usize) -> Result<usize, CompactError> {
-    let count = 1u64 << order;
-    let node = crate::frame::node_for_phys(base.raw());
-
-    fn release(reserved: &[PhysAddr]) {
-        for r in reserved {
-            crate::frame::free_movable_range(*r, 1);
-        }
+    if order > crate::buddy::MAX_ORDER as usize {
+        return Err(CompactError::Unmovable);
     }
+    let count = 1usize << order;
+    let node = crate::frame::node_for_phys(base.raw());
+    let frame_at = |i: usize| PhysAddr::new(base.raw() + (i as u64) * 4096);
 
     // Under a cache drain + bypass so the block's currently-free frames are
     // visible in the zone free lists (reservable), and every alloc/free below
@@ -243,20 +298,19 @@ pub fn compact_block(base: PhysAddr, order: usize) -> Result<usize, CompactError
     // comes from the block.
     crate::frame::with_node_cache_bypassed(node, || {
         // Frames pulled out of the free lists (released at the end / on failure).
-        let mut reserved: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
-        // Allocated user pages to evacuate.
-        let mut movable: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
+        // Every frame NOT in this set after pass 1 is an rmap-owned movable page.
+        let mut reserved = BlockFrameSet::new();
 
         // Pass 1: classify each frame; reserve the free ones.
         for i in 0..count {
-            let phys = PhysAddr::new(base.raw() + i * 4096);
+            let phys = frame_at(i);
             if crate::rmap::owner_count(phys) >= 1 {
-                movable.push(phys);
+                // Movable: evacuated in pass 2.
             } else if crate::frame::reserve_frame_range(phys, 1) {
-                reserved.push(phys); // was free, now held
+                reserved.insert(i); // was free, now held
             } else {
                 // Allocated but not an rmap-owned user page → unmovable.
-                release(&reserved);
+                reserved.release(base, count);
                 return Err(CompactError::Unmovable);
             }
         }
@@ -266,19 +320,23 @@ pub fn compact_block(base: PhysAddr, order: usize) -> Result<usize, CompactError
         // movable frames (still allocated), so they land outside the block.
         // Re-reserve each frame the instant migration frees it.
         let mut migrated = 0usize;
-        for phys in &movable {
-            match migrate_frame(*phys) {
+        for i in 0..count {
+            if reserved.contains(i) {
+                continue;
+            }
+            let phys = frame_at(i);
+            match migrate_frame_single(phys) {
                 Ok(_new) => {
-                    if crate::frame::reserve_frame_range(*phys, 1) {
-                        reserved.push(*phys);
+                    if crate::frame::reserve_frame_range(phys, 1) {
+                        reserved.insert(i);
                         migrated += 1;
                     } else {
-                        release(&reserved);
+                        reserved.release(base, count);
                         return Err(CompactError::Raced);
                     }
                 }
                 Err(_) => {
-                    release(&reserved);
+                    reserved.release(base, count);
                     return Err(CompactError::MigrateFailed);
                 }
             }
@@ -286,7 +344,7 @@ pub fn compact_block(base: PhysAddr, order: usize) -> Result<usize, CompactError
 
         // Pass 3: the whole block is now reserved → release it, coalescing to
         // order.
-        release(&reserved);
+        reserved.release(base, count);
         Ok(migrated)
     })
 }
@@ -317,35 +375,51 @@ pub fn compact_scan_node(node: usize, order: usize, max_blocks: usize) -> usize 
     compact_scan_filtered(order, max_blocks, Some(node))
 }
 
+/// Most candidate blocks one scan collects. A caller's `max_blocks` is clamped
+/// to this so the candidate list can live on the stack.
+#[cfg(target_arch = "x86_64")]
+const COMPACT_SCAN_MAX_BLOCKS: usize = 64;
+
 /// Shared candidate-collect + compact loop for [`compact_scan`] /
 /// [`compact_scan_node`]. `node_filter` restricts candidates to one node.
+///
+/// Allocation-free (a fixed candidate array, `max_blocks` clamped to
+/// [`COMPACT_SCAN_MAX_BLOCKS`]): direct compaction reaches here from a failed
+/// allocation, so a heap allocation here could recurse into the allocator
+/// that just failed.
 #[cfg(target_arch = "x86_64")]
 fn compact_scan_filtered(order: usize, max_blocks: usize, node_filter: Option<usize>) -> usize {
-    if order == 0 || max_blocks == 0 {
+    if order == 0 || max_blocks == 0 || order > crate::buddy::MAX_ORDER as usize {
         return 0;
     }
+    let max_blocks = max_blocks.min(COMPACT_SCAN_MAX_BLOCKS);
     let block_bytes = (1u64 << order) << 12;
     let block_mask = !(block_bytes - 1);
     // Distinct order-`order` block bases covering the tracked (movable) frames.
-    let mut candidates: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    crate::rmap::for_each_tracked_frame(|phys| {
-        if candidates.len() >= max_blocks {
-            return;
-        }
+    let mut candidates = [0u64; COMPACT_SCAN_MAX_BLOCKS];
+    let mut n = 0usize;
+    crate::rmap::try_for_each_tracked_frame(|phys| {
+        use core::ops::ControlFlow;
         if let Some(node) = node_filter {
             if crate::frame::node_for_phys(phys.raw()) != node {
-                return;
+                return ControlFlow::Continue(());
             }
         }
         let base = phys.raw() & block_mask;
-        if !candidates.contains(&base) {
-            candidates.push(base);
+        if !candidates[..n].contains(&base) {
+            candidates[n] = base;
+            n += 1;
+        }
+        if n >= max_blocks {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
     });
     let mut migrated = 0usize;
-    for base in candidates {
-        if let Ok(n) = compact_block(PhysAddr::new(base), order) {
-            migrated = migrated.saturating_add(n);
+    for &base in &candidates[..n] {
+        if let Ok(k) = compact_block(PhysAddr::new(base), order) {
+            migrated = migrated.saturating_add(k);
         }
     }
     migrated
@@ -371,6 +445,47 @@ pub fn direct_compact_pages() -> u64 {
     DIRECT_COMPACT_PAGES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Orders above this are "costly" (Linux `PAGE_ALLOC_COSTLY_ORDER`).
+#[cfg(target_arch = "x86_64")]
+const PAGE_ALLOC_COSTLY_ORDER: usize = 3;
+
+/// Free order-0 headroom compaction needs for an order-`order` request — Linux
+/// `compact_gap()`: the block being evacuated holds up to `1 << order` free
+/// frames out of the pool while every migration destination is allocated
+/// elsewhere, so twice the block size is required.
+#[cfg(target_arch = "x86_64")]
+const fn compact_gap(order: usize) -> u64 {
+    2u64 << order
+}
+
+/// Linux `__compaction_suitable()`: compaction is only worth running when the
+/// node has enough free base pages to stay above its watermark while the
+/// target block's free frames are held out of the pool and its movable pages
+/// are copied elsewhere — `free > min + compact_gap(order)`, and for costly
+/// orders additionally the `low - min` band. Below that the failure is real
+/// memory shortage, not fragmentation: compacting would only drain the
+/// reserve the caller's own fallback (and every other kernel allocation)
+/// depends on, so the allocation is left to fail.
+#[cfg(target_arch = "x86_64")]
+pub fn compaction_suitable(node: usize, order: usize) -> bool {
+    compaction_suitable_for(
+        crate::frame::node_free(node) as u64,
+        crate::reclaim::watermark_min_node(node),
+        crate::reclaim::watermark_low_node(node),
+        order,
+    )
+}
+
+/// Pure core of [`compaction_suitable`] over explicit free/min/low page counts.
+#[cfg(target_arch = "x86_64")]
+fn compaction_suitable_for(free: u64, min: u64, low: u64, order: usize) -> bool {
+    let mut watermark = min.saturating_add(compact_gap(order));
+    if order > PAGE_ALLOC_COSTLY_ORDER {
+        watermark = watermark.saturating_add(low.saturating_sub(min));
+    }
+    free > watermark
+}
+
 /// Synchronous "direct" compaction for a higher-order allocation that just
 /// failed on `node`: compact up to [`DIRECT_COMPACT_MAX_BLOCKS`] of that node's
 /// movable blocks and return the pages migrated. The frame allocator calls this
@@ -382,10 +497,16 @@ pub fn direct_compact_pages() -> u64 {
 /// is the allocator's GFP_ATOMIC-style boundary: an IRQ-safe lock may protect
 /// metadata whose growth reaches the higher-order allocator, and compaction
 /// must not synchronously re-enter that metadata while its lock is held.
+/// It is also skipped when [`compaction_suitable`] finds too little free
+/// headroom (a real shortage rather than fragmentation). The scan itself is
+/// allocation-free: it runs on the failure path of an allocation.
 #[cfg(target_arch = "x86_64")]
 pub fn direct_compact(node: usize, order: usize) -> usize {
     use core::sync::atomic::Ordering;
     if order == 0 || !crate::context::irqs_enabled() {
+        return 0;
+    }
+    if !compaction_suitable(node, order) {
         return 0;
     }
     DIRECT_COMPACT_EVENTS.fetch_add(1, Ordering::Relaxed);
@@ -407,9 +528,7 @@ pub fn migrate_frame_to(src: PhysAddr, dst: PhysAddr) -> Result<(), MigrateError
         1 => {}
         _ => return Err(MigrateError::MultiOwner),
     }
-    let mut owner = None;
-    crate::rmap::for_each_owner(src, |o| owner = Some(o));
-    let owner = owner.ok_or(MigrateError::NotMapped)?;
+    let owner = crate::rmap::sole_owner(src).ok_or(MigrateError::Raced)?;
     let aspace = resolve_address_space(owner.root).ok_or(MigrateError::NoAddressSpace)?;
     // SAFETY: `aspace` is a live, Arc-pinned root; `relocate_frame_to` re-validates
     // the page under the region lock and only moves it if it still maps `src`.
@@ -1148,6 +1267,181 @@ mod tests {
     }
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_compact_scan_guards_and_runs);
+
+    /// Heap backend that delegates to the slab and counts `alloc` calls made
+    /// on one armed CPU, so a test can prove a code path never enters
+    /// `GlobalAlloc` (allocations racing in from other CPUs are not counted).
+    #[cfg(target_arch = "x86_64")]
+    struct CpuCountingHeap {
+        armed_cpu: core::sync::atomic::AtomicUsize,
+        allocs: AtomicU64,
+    }
+    #[cfg(target_arch = "x86_64")]
+    const COUNTING_DISARMED: usize = usize::MAX;
+    #[cfg(target_arch = "x86_64")]
+    impl crate::HeapBackend for CpuCountingHeap {
+        fn name(&self) -> &'static str {
+            "migrate-alloc-counting-test"
+        }
+        unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+            if self.armed_cpu.load(Ordering::Relaxed) == narf_lib::percpu::current_cpu() {
+                self.allocs.fetch_add(1, Ordering::Relaxed);
+            }
+            match crate::slab::alloc(layout) {
+                Ok(p) => p.as_ptr(),
+                Err(_) => core::ptr::null_mut(),
+            }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+            if let Some(p) = core::ptr::NonNull::new(ptr) {
+                // SAFETY: every pointer this backend hands out came from
+                // `slab::alloc` with the same layout.
+                unsafe { crate::slab::dealloc(p, layout) };
+            }
+        }
+        fn try_alloc_atomic(&self, layout: core::alloc::Layout) -> Option<core::ptr::NonNull<u8>> {
+            crate::slab::try_alloc_atomic(layout)
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    static COUNTING_HEAP: CpuCountingHeap = CpuCountingHeap {
+        armed_cpu: core::sync::atomic::AtomicUsize::new(COUNTING_DISARMED),
+        allocs: AtomicU64::new(0),
+    };
+
+    /// Run `f` with the counting heap installed and armed on this CPU; return
+    /// `f`'s result and the number of heap allocations it made here. `None`
+    /// if the backend could not be installed or restored.
+    #[cfg(target_arch = "x86_64")]
+    fn count_heap_allocs<R>(f: impl FnOnce() -> R) -> Option<(R, u64)> {
+        use crate::{install_heap_backend, HeapAuthority, SLAB_BACKEND};
+        use narf_capabilities::{Cap, Grant};
+        let cap: Cap<HeapAuthority, Grant> = Cap::<HeapAuthority, Grant>::bootstrap();
+        install_heap_backend(&cap, &COUNTING_HEAP).ok()?;
+        // IRQs masked for the window so this task stays on the armed CPU.
+        let (r, n) = narf_lib::sync::without_interrupts(|| {
+            let before = COUNTING_HEAP.allocs.load(Ordering::Relaxed);
+            COUNTING_HEAP
+                .armed_cpu
+                .store(narf_lib::percpu::current_cpu(), Ordering::Relaxed);
+            let r = f();
+            COUNTING_HEAP
+                .armed_cpu
+                .store(COUNTING_DISARMED, Ordering::Relaxed);
+            (r, COUNTING_HEAP.allocs.load(Ordering::Relaxed) - before)
+        });
+        install_heap_backend(&cap, &SLAB_BACKEND).ok()?;
+        Some((r, n))
+    }
+
+    /// Regression for the YouTube-playback kernel panic: a failed higher-order
+    /// allocation runs direct compaction, and compaction used to grow `Vec`s
+    /// (the rmap tracked-frame snapshot, the block's reserved/movable lists, the
+    /// owner snapshot) on the heap — with IRQs masked, while the block's free
+    /// frames were held out of the pool. Under memory pressure that nested
+    /// allocation failed and `handle_alloc_error` panicked the kernel
+    /// ("memory allocation of 8192 bytes failed" from `compact_scan_filtered`).
+    /// The whole compaction slow path must not touch the heap.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_compaction_slow_path_is_allocation_free() -> TestResult {
+        use super::{compact_block, compact_scan_node, CompactError};
+        use crate::VirtAddr;
+
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        // An order-2 block: frame 0 is COW-shared by two tracked owners. Direct
+        // compaction must reject it without falling through to the ordinary
+        // multi-owner migration (which takes a Vec snapshot). Frames 1..=3 are
+        // free so pass 1 must reserve them.
+        let blk = match crate::frame::alloc_pages_on(0, 2) {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("could not allocate an order-2 block"),
+        };
+        for i in 1..4u64 {
+            crate::frame::free_movable_range(PhysAddr::new(blk.raw() + i * 4096), 1);
+        }
+        let root = PhysAddr::new(0x7_7000);
+        let va = VirtAddr::new(0x0000_0080_00E0_0000);
+        let other_root = PhysAddr::new(0x7_8000);
+        let other_va = VirtAddr::new(0x0000_0080_00F0_0000);
+        crate::rmap::add(blk, root, va);
+        crate::rmap::add(blk, other_root, other_va);
+        let node = crate::frame::node_for_phys(blk.raw());
+
+        let block = count_heap_allocs(|| compact_block(blk, 2));
+        let scan = count_heap_allocs(|| compact_scan_node(node, 2, 8));
+
+        crate::rmap::remove(blk, root, va);
+        crate::rmap::remove(blk, other_root, other_va);
+        crate::rmap::__reset_for_test();
+        crate::frame::free_movable_range(blk, 1);
+
+        let Some((verdict, block_allocs)) = block else {
+            return TestResult::Fail("could not install/restore the counting heap");
+        };
+        let Some((migrated, scan_allocs)) = scan else {
+            return TestResult::Fail("could not install/restore the counting heap");
+        };
+        if verdict != Err(CompactError::MigrateFailed) {
+            return TestResult::Fail("a COW-shared page must fail direct compaction");
+        }
+        if migrated != 0 {
+            return TestResult::Fail("a scan with no resolver must migrate nothing");
+        }
+        if block_allocs != 0 {
+            return TestResult::Fail("compact_block entered GlobalAlloc");
+        }
+        if scan_allocs != 0 {
+            return TestResult::Fail("compact_scan entered GlobalAlloc");
+        }
+        // The failed attempt must have returned the reserved frames: the
+        // block's free frames are allocatable again.
+        if !crate::frame::reserve_frame_range(PhysAddr::new(blk.raw() + 4096), 3) {
+            return TestResult::Fail("failed compaction leaked its reserved frames");
+        }
+        crate::frame::free_movable_range(PhysAddr::new(blk.raw() + 4096), 3);
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "memory/migrate",
+        smoke_compaction_slow_path_is_allocation_free
+    );
+
+    /// Linux `__compaction_suitable`: direct compaction only runs with enough
+    /// free headroom (`min + compact_gap(order)`, plus `low - min` for costly
+    /// orders) — otherwise the failure is a real shortage and compacting would
+    /// only drain the reserve the fallback path needs.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_compaction_suitable_requires_headroom() -> TestResult {
+        use super::compaction_suitable_for;
+        // order 1: gap = 4.
+        if compaction_suitable_for(104, 100, 150, 1) {
+            return TestResult::Fail("free == min + gap must not compact");
+        }
+        if !compaction_suitable_for(105, 100, 150, 1) {
+            return TestResult::Fail("free > min + gap must compact");
+        }
+        // order 4 is costly: needs low + gap = 150 + 32.
+        if compaction_suitable_for(182, 100, 150, 4) {
+            return TestResult::Fail("costly order must also clear the low band");
+        }
+        if !compaction_suitable_for(183, 100, 150, 4) {
+            return TestResult::Fail("costly order above low + gap must compact");
+        }
+        // Unset watermarks: only the gap applies.
+        if compaction_suitable_for(1 << 11, 0, 0, 10)
+            || !compaction_suitable_for((1 << 11) + 1, 0, 0, 10)
+        {
+            return TestResult::Fail("unset watermarks must still require compact_gap");
+        }
+        TestResult::Pass
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "memory/migrate",
+        smoke_compaction_suitable_requires_headroom
+    );
 
     /// Direct compaction: a higher-order block holding one movable page and one
     /// free frame must be consolidated — `direct_compact` migrates the page out

@@ -253,6 +253,16 @@ fn node_share_of(global: u64, node: usize) -> u64 {
     )
 }
 
+/// NUMA `node`'s share of the `min` watermark (`0` when unset).
+pub fn watermark_min_node(node: usize) -> u64 {
+    node_share_of(WMARK_MIN.load(Ordering::Relaxed), node)
+}
+
+/// NUMA `node`'s share of the `low` watermark (`0` when unset).
+pub fn watermark_low_node(node: usize) -> u64 {
+    node_share_of(WMARK_LOW.load(Ordering::Relaxed), node)
+}
+
 /// True when NUMA `node`'s free pages have fallen below its share of the `low`
 /// watermark — the per-node signal that its `kswapd<node>` should reclaim.
 /// `false` when watermarks are unset.
