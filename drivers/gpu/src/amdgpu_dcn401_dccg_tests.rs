@@ -89,6 +89,7 @@ fn engine() -> Engine<Fake> {
             state: State::Ready,
             pipes: [None; 4],
             routes: [None; 5],
+            dscclk: 0,
         },
     }
 }
@@ -887,3 +888,38 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dccg",
     dcn401_frl_stream_clock_follows_linux
 );
+
+/// dccg401_set_dto_dscclk / set_ref_dscclk: the DTO (phase 1, modulo 1)
+/// then its enable, only above a 48 MHz pixel clock; REFCLK clears both.
+fn dcn401_dscclk_follows_linux() -> TestResult {
+    let pipe = 3u8;
+    let mut e = engine();
+    run(e.prepare(request(pipe), clocks())).unwrap();
+    if e.start_dscclk(pipe, clocks()) != Ok(true)
+        || e.io.regs[&(BASE + 0x45 * 4)] & 0xff_00ff != 0x1_0001
+        || e.io.regs[&(BASE + 0xa7 * 4)] & 0xf != 1 << pipe
+        || e.status.dscclk != 1 << pipe
+    {
+        return TestResult::Fail("DSCCLK DTO");
+    }
+    assert_eq!(e.start_dscclk(pipe, clocks()), Err(Error::Busy));
+    e.stop_dscclk(pipe).unwrap();
+    if e.io.regs[&(BASE + 0x45 * 4)] & 0xff_00ff != 0
+        || e.io.regs[&(BASE + 0xa7 * 4)] & 0xf != 0
+        || e.status.dscclk != 0
+    {
+        return TestResult::Fail("DSCCLK REFCLK");
+    }
+    // A 25 MHz stream keeps DSCCLK on REFCLK.
+    let mut e = engine();
+    let mut slow = request(pipe);
+    slow.pixel = PixelClock::DisplayPort {
+        pixel_hz: 25_175_000,
+    };
+    run(e.prepare(slow, clocks())).unwrap();
+    if e.start_dscclk(pipe, clocks()) != Ok(false) || e.status.dscclk != 0 {
+        return TestResult::Fail("slow DSCCLK");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/gpu/dcn401-dccg", dcn401_dscclk_follows_linux);

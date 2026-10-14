@@ -1234,6 +1234,7 @@ pub fn timing_request(pipe: u8, plan: &dml::Plan, selection: &Selection) -> otg:
             otg::Signal::DisplayPort
         },
         ycbcr420: plan.mode.ycbcr420,
+        dsc: None,
     }
 }
 

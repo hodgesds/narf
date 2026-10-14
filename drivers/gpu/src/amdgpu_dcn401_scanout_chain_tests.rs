@@ -218,6 +218,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
         pipe,
         signal: Signal::Tmds,
         ycbcr420: false,
+        dsc: None,
         timing: plan.mode.timing,
         sync: plan.sync,
     };

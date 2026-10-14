@@ -86,7 +86,8 @@ impl<I: Io> Engine<I> {
             (
                 l.odm(p, FORMAT),
                 0x33,
-                if plan.request.ycbcr420 { 2 } else { 0 },
+                if plan.request.ycbcr420 { 2 } else { 0 }
+                    | if plan.request.dsc.is_some() { 0x10 } else { 0 },
             ),
             (l.vtg(p), 0xffff7fff, plan.vtg | u32::from(running) << 31),
             (l.opp(p, PIPE), 0x13, 3),
@@ -96,6 +97,9 @@ impl<I: Io> Engine<I> {
         for (r, mask, value) in blank.request.registers(plan.request.timing) {
             let value = if video && r == DPG { 0 } else { value };
             self.expect(l.opp(p, r), mask, value)?;
+        }
+        if let Some(cfg) = plan.request.dsc {
+            self.dsc_running(&plan.request, &cfg)?;
         }
         Ok(())
     }

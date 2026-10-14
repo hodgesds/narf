@@ -38,6 +38,18 @@ impl Io for Fake {
         if self.gone == Some(self.writes.len()) {
             return u32::MAX;
         }
+        // DSC domains' PGFSM follows DOMAIN_POWER_GATE at once.
+        for k in 0..4u64 {
+            if at == BASE + (0x8a + 2 * k) * 4 {
+                let gated = self
+                    .regs
+                    .get(&(BASE + (0x89 + 2 * k) * 4))
+                    .copied()
+                    .unwrap_or(0)
+                    & 1;
+                return if gated != 0 { 0x8000_0000 } else { 0 };
+            }
+        }
         for p in 0..4 {
             for (slot, reg, stride, enable, on) in [
                 (p, 0x2094, 0x124, 0x10, 0x2c00),
@@ -165,6 +177,9 @@ impl Io for Fake {
                 || at == BASE + 0x28f4 * 4 // DC_GPIO_HPD_MASK, bank 2
                 || at == 0x7f000 // native HDP flush remap
                 || (0..4).any(|p| at == BASE + (0x80 + 2 * p) * 4)
+                // DSC0-3 and their power domains (DOMAIN16-19).
+                || (BASE + 0x3000 * 4..BASE + (0x3000 + 4 * 0x5c) * 4).contains(&at)
+                || (0..4).any(|k| at == BASE + (0x89 + 2 * k) * 4)
                 || (BASE + 0x1f0d * 4..=BASE + 0x1f10 * 4).contains(&at)
                 || (MPC_BASE..=MPC_BASE + 0x301 * 4).contains(&at)
                 || at == MPC_BASE + 0x30a * 4 // MPC_OUT_CSC_COEF_FORMAT
@@ -370,6 +385,7 @@ fn request(pipe: u8) -> Request {
         pipe,
         signal: Signal::HpoDisplayPort,
         ycbcr420: false,
+        dsc: None,
         timing: Timing {
             pixel_clock_khz: 148_500,
             h_active: 1920,
@@ -1300,4 +1316,98 @@ fn dcn401_hpo_siblings_hold_their_encoders() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hpo_siblings_hold_their_encoders
+);
+
+/// DSC on the pipe's own DSC, as link_set_dsc_on_stream programs it: the
+/// gated domain powered, every DSC register written whole from
+/// dsc_prepare_config's values, the DSC clocked and fed from OPP n, then
+/// the OPTC's DSC mode, bytes per pixel and slice width. Retirement turns
+/// the OPTC's DSC off, disconnects and disables the DSC, and gates it.
+/// Only one DSC on 8b/10b DP RGB is taken.
+fn dcn401_dsc_follows_link_set_dsc_on_stream() -> TestResult {
+    use crate::amdgpu_dsc::DscConfig;
+    let pipe = 2u8;
+    let cfg = DscConfig {
+        slices_h: 2,
+        slices_v: 10,
+        bpp_x16: 128,
+        block_pred: true,
+        linebuf_depth: 11,
+        version_minor: 2,
+        ycbcr422_simple: false,
+    };
+    let req = Request {
+        signal: Signal::DisplayPort,
+        dsc: Some(cfg),
+        ..request(pipe)
+    };
+    let mut e = engine();
+    e.io.regs.insert(BASE + 0x8d * 4, 1); // DSC2 gated
+    if let Err(err) = run(e.prepare(req, clock(req))) {
+        panic!("DSC prepare: {err:?}");
+    }
+    let regs = dsc_hw::dsc_registers(&req, &cfg).unwrap();
+    let dsc = |r: u64| {
+        e.io.regs
+            .get(&(BASE + (0x3000 + 2 * 0x5c + r) * 4))
+            .copied()
+            .unwrap_or(0)
+    };
+    let odm = |r: u64| {
+        e.io.regs
+            .get(&(BASE + (r + 2 * 0x10) * 4))
+            .copied()
+            .unwrap_or(0)
+    };
+    if e.io.regs[&(BASE + 0x8d * 4)] & 1 != 0
+        || dsc(0xa) != (0xf | 1 << 4 | 1 << 8 | 9 << 16)
+        || dsc(0x14) != (1920 | 1080 << 16)
+        || dsc(0x15) != (960 | 108 << 16)
+        || dsc(0x13) & 0x3ff != 128
+        || dsc(0x13) >> 16 != u32::from(regs.pps.slice_chunk_size)
+        || dsc(5) != 8 << 16 // RGB (0), 8 bpc
+        || dsc(0) & 1 != 1
+        || e.io.regs[&(BASE + (0x1a64 + 2) * 4)] & 0x71 != (1 | 2 << 4)
+        || odm(0x1acc) & 0x30 != 0x10
+        || odm(0x1acd) != regs.bytes_per_pixel
+        || odm(0x1ace) >> 16 != 960
+    {
+        return TestResult::Fail("DSC programming");
+    }
+    e.dsc_running(&req, &cfg).unwrap();
+    // Retirement: DSC off before the timing, then gated.
+    e.io.retiring = [true; 4];
+    run(e.retire(pipe)).unwrap();
+    let dsc = |r: u64| {
+        e.io.regs
+            .get(&(BASE + (0x3000 + 2 * 0x5c + r) * 4))
+            .copied()
+            .unwrap_or(0)
+    };
+    if e.io.regs[&(BASE + (0x1a64 + 2) * 4)] & 1 != 0
+        || dsc(0) & 1 != 0
+        || e.io.regs[&(BASE + 0x8d * 4)] & 1 != 1
+        || e.io.regs[&(BASE + (0x1acc + 0x20) * 4)] & 0x30 != 0
+    {
+        return TestResult::Fail("DSC retirement");
+    }
+    // One DSC on 8b/10b DP only.
+    let mut e = engine();
+    for bad in [
+        Request {
+            signal: Signal::HpoDisplayPort,
+            ..req
+        },
+        Request {
+            dsc: Some(DscConfig { slices_h: 8, ..cfg }),
+            ..req
+        },
+    ] {
+        assert_eq!(run(e.prepare(bad, clock(bad))), Err(Error::Unsupported));
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dsc_follows_link_set_dsc_on_stream
 );

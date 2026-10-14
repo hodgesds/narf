@@ -794,6 +794,22 @@ impl ColdBoot {
     }
     /// Divide acknowledged global clocks for a retired native display pipe.
     /// The link/modeset owner must still program its PLL, PHY and scanout.
+    /// Run DSC `pipe`'s DSCCLK from its DTO for the stream on `pipe`'s
+    /// prepared pixel clock (above 48 MHz, as Linux does). Returns whether
+    /// the DTO runs.
+    pub fn start_display_dscclk(&mut self, pipe: u8) -> Result<bool, otg::Error> {
+        let clocks = self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?;
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        self.otg
+            .as_mut()
+            .map_err(|e| *e)?
+            .start_dscclk(clocks, dccg, pipe)
+    }
+    /// Return DSC `pipe`'s DSCCLK to REFCLK after its DSC stopped.
+    pub fn stop_display_dscclk(&mut self, pipe: u8) -> Result<(), otg::Error> {
+        let dccg = self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?;
+        self.otg.as_mut().map_err(|e| *e)?.stop_dscclk(dccg, pipe)
+    }
     pub async fn prepare_display_pipe_clocks(
         &mut self,
         request: dccg::Request,

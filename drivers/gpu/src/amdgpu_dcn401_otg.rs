@@ -52,6 +52,8 @@ pub use tmds_timing::TmdsTimingRetired;
 #[path = "amdgpu_dcn401_tmds_phy.rs"]
 mod tmds_phy;
 pub use tmds_phy::TmdsDisabled;
+#[path = "amdgpu_dcn401_dsc_hw.rs"]
+mod dsc_hw;
 #[path = "amdgpu_dcn401_frl.rs"]
 mod frl;
 pub use frl::{
@@ -287,6 +289,8 @@ pub struct Request {
     /// HDMI YCbCr 4:2:0 output: two pixels per container, so the OTG
     /// divides its horizontal timing by two and formats 4:2:0 data.
     pub ycbcr420: bool,
+    /// Compressed by the pipe's own DSC (8-bit RGB 8b/10b DP only).
+    pub dsc: Option<crate::amdgpu_dsc::DscConfig>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Applied {
@@ -524,6 +528,9 @@ impl Request {
             && (self.signal != Signal::Tmds || (t.h_total | t.h_sync_width | hs | he) & 1 != 0)
         {
             return Err(Error::Unsupported);
+        }
+        if let Some(cfg) = &self.dsc {
+            dsc_hw::dsc_registers(&self, cfg)?;
         }
         Ok(Plan {
             request: self,
@@ -991,6 +998,12 @@ impl<I: Io> Engine<I> {
         // OPTC_DATA_FORMAT: RGB/4:4:4, or 4:2:0; DSC disabled.
         let format = if plan.request.ycbcr420 { 2 } else { 0 };
         self.update(odm(FORMAT), 0x33, format)?;
+        // link_set_dsc_on_stream: the pipe's DSC, then the OPTC's DSC mode.
+        if let Some(cfg) = plan.request.dsc {
+            self.start_dsc(&plan.request, &cfg).await?;
+        } else {
+            self.dsc_idle(pipe)?;
+        }
         Ok(())
     }
     async fn prepare(&mut self, request: Request, clock: dccg::Applied) -> Result<Applied, Error> {
@@ -1019,6 +1032,8 @@ impl<I: Io> Engine<I> {
     }
     async fn disable(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
+        // link_set_dsc_on_stream(false) precedes the timing's disable.
+        self.stop_dsc(pipe).await?;
         self.update(l.odm(pipe, SOURCE), 0xffff0003, 0xffff0000)?;
         self.update(l.odm(pipe, MEMORY), 0xffff, 0)?;
         self.update(l.otg(pipe, CONTROL), 1, 0)?;

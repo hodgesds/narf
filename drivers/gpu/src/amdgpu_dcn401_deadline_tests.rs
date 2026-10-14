@@ -63,6 +63,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         sync: plan.sync,
         signal: Signal::DisplayPort,
         ycbcr420: false,
+        dsc: None,
     };
     let requestor = RequestorApplied {
         pipe,

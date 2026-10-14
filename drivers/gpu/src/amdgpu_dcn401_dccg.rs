@@ -7,6 +7,9 @@ use narf_capabilities::{Cap, CapError, CapOp, Write};
 
 const DP_STREAM: u64 = 0x4a; // DCN bank 1
 const HDMI_STREAM: u64 = 0x59; // DCN bank 2
+/// DSCCLK_DTO_CTRL and DSCCLK0-3_DTO_PARAM (DCN bank 1).
+const DSCCLK_CTRL: u64 = 0xa7;
+const DSCCLK_PARAM: [u64; 4] = [0x6c, 0x6d, 0x6e, 0x45];
 const GATE3: u64 = 0x5a;
 const DENTIST: u64 = 0x64;
 const SYMCLK32_SE: u64 = 0x65;
@@ -103,6 +106,8 @@ pub struct Status {
     pub pipes: [Option<Applied>; 4],
     /// Last successful routing operations. None means no routing proof.
     pub routes: [Option<StreamRoute>; 5],
+    /// DSC n's DSCCLK runs from its DTO (bit n); clear means REFCLK.
+    pub dscclk: u8,
 }
 #[derive(Clone, Copy, Debug)]
 struct Layout {
@@ -497,6 +502,37 @@ impl<I: Io> Engine<I> {
         });
         Ok(())
     }
+    /// dccg401_set_dto_dscclk for DSC `pipe` (the pipe's own DSC), as
+    /// link_set_dsc_on_stream uses it: only above a 48 MHz pixel clock (a
+    /// DTO-derived DSCCLK below 16 MHz hangs register access); slower
+    /// streams keep DSCCLK on REFCLK. Returns whether the DTO runs.
+    fn start_dscclk(&mut self, pipe: u8, global: clocks::Applied) -> Result<bool, Error> {
+        let plan = self.retained_pipe(pipe, global)?;
+        let pixel_hz = match plan.request.pixel {
+            PixelClock::DisplayPort { pixel_hz } | PixelClock::HdmiFrl { pixel_hz } => pixel_hz,
+            _ => return Err(Error::Invalid),
+        };
+        if self.read(self.layout.reg(DSCCLK_CTRL))? & 1 << pipe != 0 {
+            return Err(Error::Busy);
+        }
+        if pixel_hz <= 48_000_000 {
+            return Ok(false);
+        }
+        self.update(DSCCLK_PARAM[usize::from(pipe)], 0xff_00ff, 1 | 1 << 16)?;
+        self.update(DSCCLK_CTRL, 1 << pipe, 1 << pipe)?;
+        self.status.dscclk |= 1 << pipe;
+        Ok(true)
+    }
+    /// dccg401_set_ref_dscclk: DSC `pipe` back on REFCLK.
+    fn stop_dscclk(&mut self, pipe: u8) -> Result<(), Error> {
+        if pipe >= 4 {
+            return Err(Error::Invalid);
+        }
+        self.update(DSCCLK_CTRL, 1 << pipe, 0)?;
+        self.update(DSCCLK_PARAM[usize::from(pipe)], 0xff_00ff, 0)?;
+        self.status.dscclk &= !(1 << pipe);
+        Ok(())
+    }
     /// dccg401_set_hdmistreamclk(DTBCLK0, otg): HDMISTREAMCLK0 from the
     /// pipe's DTBCLK_P (its DTO bypassed), on the pipe's retained FRL pixel
     /// clock.
@@ -662,6 +698,7 @@ impl Dccg {
                 state: State::Ready,
                 pipes: [None; 4],
                 routes: [None; 5],
+                dscclk: 0,
             },
         }))
     }
@@ -741,6 +778,28 @@ impl Dccg {
             return Err(Error::Invalid);
         }
         self.0.unroute_hpo_stream(stream)
+    }
+    /// Run DSC `pipe`'s DSCCLK from its DTO (above 48 MHz pixel clock, as
+    /// Linux does) for a stream on `pipe`'s retained pixel clock. Returns
+    /// whether the DTO runs.
+    pub(crate) fn start_dscclk(
+        &mut self,
+        regs: MmioRegion,
+        clocks: &mut clocks::ClockManager,
+        pipe: u8,
+    ) -> Result<bool, Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        let global = clocks.retained_pipe_clocks(regs).map_err(Error::Clocks)?;
+        self.0.start_dscclk(pipe, global)
+    }
+    /// Return DSC `pipe`'s DSCCLK to REFCLK once the DSC is disabled.
+    pub(crate) fn stop_dscclk(&mut self, regs: MmioRegion, pipe: u8) -> Result<(), Error> {
+        if regs.phys != self.0.io.0.phys || regs.len != self.0.io.0.len {
+            return Err(Error::Invalid);
+        }
+        self.0.stop_dscclk(pipe)
     }
     /// Clock the HPO FRL stream encoder from `pipe`'s retained FRL pixel
     /// clock while the display owner's FRL link runs.
