@@ -11,7 +11,11 @@
 //      ones above the MTU that arrive and leave as IPv4 fragments, then a
 //      back-to-back burst;
 //   5. as a CLIENT, a connect()ed UDP socket round-trips datagrams with the
-//      host (10.0.2.2:17781) via send()/recv() — the QUIC socket shape;
+//      host (10.0.2.2:17781) via send()/recv() — the QUIC socket shape —
+//      then sends UDP_GSO_SEGS datagrams in ONE sendmsg with a UDP_SEGMENT
+//      cmsg (UDP GSO, as ngtcp2 / Chromium / Firefox QUIC batch their
+//      packets) under IP_PMTUDISC_DO and reads each one's echo back with
+//      UDP_GRO enabled;
 //   6. send a DNS A query to QEMU SLIRP's resolver at 10.0.2.3 and validate
 //      the reply header.
 //
@@ -26,6 +30,7 @@
 //   * "netserve-download-ok" — client download (3).
 //   * "netserve: udp listening" / "netserve-udp-ok" — UDP echo (4).
 //   * "netserve-udp-client-ok" — connected UDP client (5).
+//   * "netserve-udp-gso-ok" — UDP GSO send + UDP_GRO receive (5).
 // Sizes and the pattern MUST match `net_smoke_cmd_with_nic` in xtask.
 //   * "netserve-dns-ok"     — after a valid DNS response.
 //   * "netserve-ok"         — all three paths passed.
@@ -45,6 +50,24 @@
 #include <netinet/ip_icmp.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/uio.h>
+
+// `include/uapi/linux/udp.h`; musl's <netinet/udp.h> may predate them.
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
+
+// The host as the guest reaches it. SLIRP's alias by default; a host-Linux
+// run of these phases against a local server overrides it.
+#ifndef NETSERVE_HOST
+#define NETSERVE_HOST "10.0.2.2"
+#endif
 
 #define BULK_LEN (4u << 20)
 #define BULK_SEED 0x5a
@@ -54,6 +77,9 @@
 #define UDP_BURST_LEN 1200
 #define UDP_CLIENT_ROUNDS 16
 #define UDP_CLIENT_LEN 1200
+#define UDP_GSO_SEGS 5
+#define UDP_GSO_LEN 1200
+#define UDP_GSO_SEED 0x90
 
 static void w(const char *m) { write(1, m, strlen(m)); }
 
@@ -107,7 +133,7 @@ static void host_addr(struct sockaddr_in *a, int port) {
     memset(a, 0, sizeof *a);
     a->sin_family = AF_INET;
     a->sin_port = htons(port);
-    inet_pton(AF_INET, "10.0.2.2", &a->sin_addr); // SLIRP's alias for the host
+    inet_pton(AF_INET, NETSERVE_HOST, &a->sin_addr); // SLIRP's alias for the host
 }
 
 // (2) Verify a BULK_LEN patterned stream and echo every byte back.
@@ -263,6 +289,96 @@ static int udp_client(void) {
     return 0;
 }
 
+// (5b) UDP GSO: UDP_GSO_SEGS x UDP_GSO_LEN bytes leave in ONE sendmsg with a
+// SOL_UDP/UDP_SEGMENT cmsg on a connected IP_PMTUDISC_DO socket, so the
+// kernel must split them into separate datagrams (one 6000-byte datagram
+// would be EMSGSIZE under DO). The host echoes each datagram it gets and
+// checks it saw UDP_GSO_SEGS separate UDP_GSO_LEN-byte ones; here every echo
+// must come back as its own segment. With UDP_GRO on, a stack that coalesces
+// the echoes reports the segment size in a UDP_GRO cmsg — accept either.
+static int udp_gso_client(void) {
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    if (u < 0) return failf("udp gso socket", 0, 0);
+    struct timeval t = {.tv_sec = 20};
+    setsockopt(u, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof t);
+    int pmtu = IP_PMTUDISC_DO;
+    if (setsockopt(u, IPPROTO_IP, IP_MTU_DISCOVER, &pmtu, sizeof pmtu) < 0)
+        return failf("udp gso IP_MTU_DISCOVER", 0, 0);
+    struct sockaddr_in a;
+    host_addr(&a, 17781);
+    if (connect(u, (struct sockaddr *)&a, sizeof a) < 0) return failf("udp gso connect", 0, 0);
+    int one = 1;
+    if (setsockopt(u, SOL_UDP, UDP_GRO, &one, sizeof one) < 0)
+        return failf("udp gso setsockopt UDP_GRO", 0, 0);
+    int val = -1;
+    socklen_t vlen = sizeof val;
+    if (getsockopt(u, SOL_UDP, UDP_GRO, &val, &vlen) < 0 || val != 1)
+        return failf("udp gso getsockopt UDP_GRO", (unsigned long)val, 0);
+    vlen = sizeof val;
+    if (getsockopt(u, SOL_UDP, UDP_SEGMENT, &val, &vlen) < 0 || val != 0)
+        return failf("udp gso getsockopt UDP_SEGMENT", (unsigned long)val, 0);
+
+    static uint8_t out[UDP_GSO_SEGS * UDP_GSO_LEN];
+    for (unsigned i = 0; i < UDP_GSO_SEGS; i++)
+        for (unsigned k = 0; k < UDP_GSO_LEN; k++)
+            out[i * UDP_GSO_LEN + k] = pat(k, (uint8_t)(UDP_GSO_SEED + i));
+    struct iovec iov = {.iov_base = out, .iov_len = sizeof out};
+    union {
+        char buf[CMSG_SPACE(sizeof(uint16_t))];
+        struct cmsghdr align;
+    } ctl;
+    memset(&ctl, 0, sizeof ctl);
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = ctl.buf;
+    m.msg_controllen = sizeof ctl.buf;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_UDP;
+    c->cmsg_type = UDP_SEGMENT;
+    c->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    uint16_t gso = UDP_GSO_LEN;
+    memcpy(CMSG_DATA(c), &gso, sizeof gso);
+    long sent = sendmsg(u, &m, 0);
+    if (sent != (long)sizeof out) return failf("udp gso sendmsg", (unsigned long)sent, 0);
+
+    unsigned got = 0;
+    while (got < UDP_GSO_SEGS) {
+        static uint8_t in[65536];
+        union {
+            char buf[256];
+            struct cmsghdr align;
+        } rctl;
+        struct iovec riov = {.iov_base = in, .iov_len = sizeof in};
+        struct msghdr r;
+        memset(&r, 0, sizeof r);
+        r.msg_iov = &riov;
+        r.msg_iovlen = 1;
+        r.msg_control = rctl.buf;
+        r.msg_controllen = sizeof rctl.buf;
+        long n = recvmsg(u, &r, 0);
+        if (n <= 0) return failf("udp gso recvmsg", got, 0);
+        long seg = n;
+        for (struct cmsghdr *h = CMSG_FIRSTHDR(&r); h; h = CMSG_NXTHDR(&r, h))
+            if (h->cmsg_level == SOL_UDP && h->cmsg_type == UDP_GRO) {
+                int g;
+                memcpy(&g, CMSG_DATA(h), sizeof g);
+                seg = g;
+            }
+        for (long off = 0; off < n; off += seg) {
+            long len = n - off < seg ? n - off : seg;
+            if (len != UDP_GSO_LEN || got >= UDP_GSO_SEGS ||
+                memcmp(in + off, out + got * UDP_GSO_LEN, UDP_GSO_LEN) != 0)
+                return failf("udp gso echo", got, (unsigned long)len);
+            got++;
+        }
+    }
+    close(u);
+    w("netserve-udp-gso-ok\n");
+    return 0;
+}
+
 int main(void) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) {
@@ -357,7 +473,7 @@ int main(void) {
     close(u);
     w("netserve-udp-ok\n");
 
-    if (udp_client()) return 1;
+    if (udp_client() || udp_gso_client()) return 1;
 
     // A minimal RFC 1035 query for example.com IN A. We issue it directly
     // instead of consulting /etc/resolv.conf so the smoke is independent of

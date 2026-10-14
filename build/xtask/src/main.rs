@@ -6021,6 +6021,11 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     const UDP_BURST: usize = 64;
     const UDP_BURST_LEN: usize = 1200;
     const UDP_CLIENT_ROUNDS: usize = 16;
+    // The UDP GSO phase: UDP_GSO_SEGS datagrams of UDP_GSO_LEN bytes, segment
+    // `i` filled with `pat(k, UDP_GSO_SEED + i)`, sent in one sendmsg.
+    const UDP_GSO_SEGS: usize = 5;
+    const UDP_GSO_LEN: usize = 1200;
+    const UDP_GSO_SEED: u8 = 0x90;
     // netserve's stream pattern: byte `i` of a stream seeded `seed`.
     fn pat(i: u64, seed: u8) -> u8 {
         ((i.wrapping_mul(2_654_435_761) >> 13) as u8) ^ ((i >> 20) as u8) ^ seed
@@ -6112,13 +6117,20 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
     udp_client_server.set_read_timeout(Some(Duration::from_millis(200)))?;
     let udp_server_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let udp_server_echoed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Every datagram the server received, as it arrived: the GSO phase is
+    // judged by what reached this host, not only by the guest's echoes.
+    let udp_server_seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let stop = udp_server_stop.clone();
         let echoed = udp_server_echoed.clone();
+        let seen = udp_server_seen.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Ok((n, peer)) = udp_client_server.recv_from(&mut buf) {
+                    if let Ok(mut seen) = seen.lock() {
+                        seen.push(buf[..n].to_vec());
+                    }
                     if udp_client_server.send_to(&buf[..n], peer).is_ok() {
                         echoed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -6606,6 +6618,43 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         abort!("xtask {smoke_name}: host UDP server echoed {echoed_client} of {UDP_CLIENT_ROUNDS}");
     }
 
+    // 5d. UDP GSO: the guest sent UDP_GSO_SEGS x UDP_GSO_LEN bytes in ONE
+    // sendmsg with a UDP_SEGMENT cmsg; this host must have received them as
+    // UDP_GSO_SEGS separate UDP_GSO_LEN-byte datagrams, each exactly once.
+    if !wait_for(b"netserve-udp-gso-ok", timeout_secs) {
+        abort!("xtask {smoke_name}: guest UDP GSO phase did not complete");
+    }
+    let gso_seen: Vec<Vec<u8>> = udp_server_seen
+        .lock()
+        .map(|seen| seen.clone())
+        .unwrap_or_default();
+    if gso_seen
+        .iter()
+        .any(|d| d.len() == UDP_GSO_SEGS * UDP_GSO_LEN)
+    {
+        abort!(
+            "xtask {smoke_name}: host received the GSO batch as one {}-byte datagram",
+            UDP_GSO_SEGS * UDP_GSO_LEN
+        );
+    }
+    let mut gso_sizes = Vec::new();
+    for i in 0..UDP_GSO_SEGS {
+        let mut want = vec![0u8; UDP_GSO_LEN];
+        fill(&mut want, 0, UDP_GSO_SEED + i as u8);
+        let copies = gso_seen.iter().filter(|d| **d == want).count();
+        if copies != 1 {
+            abort!(
+                "xtask {smoke_name}: host received GSO segment {i} {copies} times (want exactly 1)"
+            );
+        }
+        gso_sizes.push(want.len());
+    }
+    println!(
+        "xtask {smoke_name}: UDP GSO sendmsg arrived as {} separate datagrams of {:?} bytes",
+        gso_sizes.len(),
+        gso_sizes
+    );
+
     // 6. The guest now issues a real DNS query to SLIRP's 10.0.2.3 proxy.
     if !wait_for(b"netserve-dns-ok", timeout_secs) {
         let _ = child.kill();
@@ -6630,7 +6679,7 @@ fn net_smoke_cmd_with_nic(args: &BuildArgs, nic: NetSmokeNic) -> Result<()> {
         NetSmokeNic::Igb => "built-in igb (QEMU 82576)",
     };
     println!(
-        "xtask {smoke_name}: ok — live TCP (echo, {BULK_LEN}-byte bulk echo, {DOWNLOAD_LEN}-byte client download), UDP (sizes incl. fragmented, burst, connected client) and DNS passed over {transport}"
+        "xtask {smoke_name}: ok — live TCP (echo, {BULK_LEN}-byte bulk echo, {DOWNLOAD_LEN}-byte client download), UDP (sizes incl. fragmented, burst, connected client, GSO) and DNS passed over {transport}"
     );
     Ok(())
 }
