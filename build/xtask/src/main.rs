@@ -2171,11 +2171,21 @@ fn nvme_image_path() -> PathBuf {
     path
 }
 
-/// Minimal FAT12 image — single-FAT, single-root-dir-sector, one
+/// Minimal FAT12 image — two FAT copies, single-root-dir-sector, one
 /// file (`NARF.TXT`) at cluster 2. Layout per Microsoft FATGEN §3.
+///
+/// Each FAT copy is sized to map every data cluster the volume has
+/// (FATGEN §3.5: 1.5 bytes per FAT12 entry, two reserved entries). A
+/// one-sector FAT maps only 341 entries, while this 1 MiB volume has ~2000
+/// clusters, so a file allocated past cluster 340 had its chain written over
+/// the second FAT copy and then the root directory. Linux refuses to mount
+/// such a volume at all (`fat_fill_super`: "count of clusters too big").
 fn build_fat12_nvme_image(total_sectors: u32, data: &[u8]) -> Vec<u8> {
     const LBS: usize = 512;
     let mut img = vec![0u8; LBS * total_sectors as usize];
+    // Upper bound: every sector a data cluster, plus the two reserved
+    // entries, at 3 bytes per pair of entries.
+    let fat_sz = ((total_sectors as usize + 2) * 3).div_ceil(2).div_ceil(LBS);
 
     // BPB
     img[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
@@ -2187,12 +2197,12 @@ fn build_fat12_nvme_image(total_sectors: u32, data: &[u8]) -> Vec<u8> {
     img[17..19].copy_from_slice(&16u16.to_le_bytes());
     img[19..21].copy_from_slice(&(total_sectors as u16).to_le_bytes());
     img[21] = 0xF8;
-    img[22..24].copy_from_slice(&1u16.to_le_bytes());
+    img[22..24].copy_from_slice(&(fat_sz as u16).to_le_bytes());
     img[510] = 0x55;
     img[511] = 0xAA;
 
     // FAT 1 + FAT 2 — entry 0 media, entry 1 EOC, entry 2 EOC.
-    for &lba in &[1usize, 2usize] {
+    for lba in [1usize, 1 + fat_sz] {
         let fat = &mut img[lba * LBS..lba * LBS + LBS];
         fat12_set(fat, 0, 0xFF8);
         fat12_set(fat, 1, 0xFFF);
@@ -2202,16 +2212,43 @@ fn build_fat12_nvme_image(total_sectors: u32, data: &[u8]) -> Vec<u8> {
     }
 
     if !data.is_empty() {
-        let root_lba = 3usize;
+        let root_lba = 1 + 2 * fat_sz;
         let entry = &mut img[root_lba * LBS..root_lba * LBS + 32];
         entry[0..11].copy_from_slice(b"NARF    TXT");
         entry[11] = 0x20;
         entry[26..28].copy_from_slice(&2u16.to_le_bytes());
         entry[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        let data_lba = 4usize;
+        let data_lba = root_lba + 1;
         img[data_lba * LBS..data_lba * LBS + data.len()].copy_from_slice(data);
     }
     img
+}
+
+#[cfg(test)]
+mod fat12_nvme_image_tests {
+    use super::*;
+
+    /// The FAT must map every data cluster: `fat_fill_super` rejects a
+    /// volume whose cluster count exceeds what its FAT can address, and a
+    /// driver that mounts it anyway chains clusters into whatever follows
+    /// the FAT.
+    #[test]
+    fn fat_covers_every_data_cluster() {
+        let img = build_fat12_nvme_image(2048, b"narf\n");
+        let u16_at = |o: usize| u16::from_le_bytes([img[o], img[o + 1]]) as usize;
+        let (bps, rsvd, nfats) = (u16_at(11), u16_at(14), img[16] as usize);
+        let (root_ents, total, fat_sz) = (u16_at(17), u16_at(19), u16_at(22));
+        let root_secs = (root_ents * 32).div_ceil(bps);
+        let clusters = total - rsvd - nfats * fat_sz - root_secs;
+        assert!(clusters < 4085, "must stay FAT12");
+        assert!(
+            fat_sz * bps * 2 / 3 >= clusters + 2,
+            "FAT maps too few clusters"
+        );
+        // NARF.TXT sits right after the root directory and is readable there.
+        let data = (rsvd + nfats * fat_sz + root_secs) * bps;
+        assert_eq!(&img[data..data + 5], b"narf\n");
+    }
 }
 
 /// Build a FAT16 disk image at `out_path` populated with `/init`
