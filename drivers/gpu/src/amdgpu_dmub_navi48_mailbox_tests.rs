@@ -986,3 +986,45 @@ kernel_test_in!(
     "drivers/gpu/dmub-navi48",
     dmub_navi48_uhbr_enable_and_ffe_use_hpo_v17_fields
 );
+
+/// FRL enable and TxFFE as Linux's HPO FRL path sends them: digmode 4,
+/// the character clock in 10 kHz (100 kHz units on FFE, divided twice),
+/// HPO 0 with no connector on ENABLE, the HDMI-A connector and HPO 0xF6
+/// on FFE.
+fn dmub_navi48_frl_enable_and_ffe_use_linux_v17_fields() -> TestResult {
+    let hdmi = |phy, hpd| crate::amdgpu_dcn_inventory::Path {
+        connector: crate::amdgpu_dcn_inventory::Connector::HdmiTypeA,
+        ..dp_path(phy, hpd)
+    };
+    let (_pool, mut e) = ready();
+    let offset = e.io.mailbox + e.io.regs[&(DCN + 0x1d6 * 4)] as usize;
+    run(e.enable_frl(hdmi(1, 2), 4, 666_667)).unwrap();
+    let mut golden = [0; 64];
+    golden[..4].copy_from_slice(&[128, 1, 0, 16]);
+    (golden[4], golden[5], golden[6], golden[7], golden[12]) = (1, 1, 4, 4, 2);
+    golden[8..12].copy_from_slice(&66_666u32.to_le_bytes());
+    assert_eq!(e.io.slot(offset), golden);
+    run(e.set_frl_ffe(hdmi(1, 2), 3, 333_333, 0x22)).unwrap();
+    let mut ffe = [0; 64];
+    ffe[..4].copy_from_slice(&[128, 1, 0, 16]);
+    (ffe[4], ffe[5], ffe[6], ffe[7], ffe[12], ffe[14], ffe[15]) = (1, 11, 0x22, 3, 2, 12, 0xf6);
+    ffe[8..12].copy_from_slice(&3_333u32.to_le_bytes());
+    assert_eq!(e.io.slot(offset + 64), ffe);
+    assert_eq!(
+        run(e.enable_frl(dp_path(1, 2), 4, 666_667)),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        run(e.enable_frl(hdmi(1, 2), 2, 666_667)),
+        Err(Error::Invalid)
+    );
+    assert_eq!(
+        run(e.set_frl_ffe(hdmi(1, 2), 4, 666_667, 0x80)),
+        Err(Error::Invalid)
+    );
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dmub-navi48",
+    dmub_navi48_frl_enable_and_ffe_use_linux_v17_fields
+);

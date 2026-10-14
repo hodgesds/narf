@@ -3,7 +3,7 @@
 use super::*;
 #[path = "amdgpu_dcn401_frl_link.rs"]
 pub(super) mod link;
-pub use link::{FrlDisabled, FrlLinkRetired};
+pub use link::{FrlDisabled, FrlLinkRetired, FrlLinkUp};
 
 const CLOCK: u64 = 0x8d3;
 const SOURCE: u64 = 0x8d5;

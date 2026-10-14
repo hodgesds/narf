@@ -2,6 +2,8 @@ use super::*;
 use crate::amdgpu_dcn_inventory::{Connector, Path};
 #[path = "amdgpu_dcn401_frl_phy_tests.rs"]
 mod phy;
+#[path = "amdgpu_dcn401_frl_start_tests.rs"]
+mod start;
 
 fn frl(reg: u64) -> u64 {
     MPC_BASE + reg * 4

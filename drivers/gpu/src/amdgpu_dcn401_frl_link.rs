@@ -5,6 +5,9 @@ use crate::amdgpu_dcn_inventory::{Connector, Path};
 #[path = "amdgpu_dcn401_frl_phy.rs"]
 pub(in super::super) mod phy;
 pub use phy::FrlDisabled;
+#[path = "amdgpu_dcn401_frl_start.rs"]
+pub(in super::super) mod start;
+pub use start::FrlLinkUp;
 
 const LINK_CONTROL: u64 = 0x95b;
 const LINK_CLOCK: u64 = 0x95c;
@@ -66,7 +69,7 @@ impl<I: Io> Engine<I> {
         Ok([clock & 7, self.read(at(0x20bc))? & 0x70007f01])
     }
     fn frl_link_plan(&mut self, path: Path) -> Result<Plan, Error> {
-        if !self.status.state.reusable() {
+        if !self.status.state.reusable() && !self.own_frl_link(path) {
             return Err(Error::Busy);
         }
         if path.transmitter >= 4 || !(1..=4).contains(&path.hpd) {

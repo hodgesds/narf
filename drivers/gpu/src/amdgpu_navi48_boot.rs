@@ -1890,6 +1890,84 @@ impl ColdBoot {
             }
         }
     }
+    /// Enable an HDMI port's PHY for FRL on `lanes` lanes at the character
+    /// clock, the link left training.
+    /// # Safety
+    /// Fulfil `Otg::start_frl_link` obligations.
+    pub async unsafe fn start_display_frl_link(
+        &mut self,
+        port: usize,
+        lanes: u8,
+        character_khz: u32,
+    ) -> Result<otg::FrlLinkUp, otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: validated board route and retained owners; caller's
+        // obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .start_frl_link(&mut self.sequence.backend.dmub, path, lanes, character_khz)
+                .await
+        }
+    }
+    /// Set the port's FRL training patterns (LTP - 1 per lane).
+    /// # Safety
+    /// Fulfil `Otg::frl_training_pattern` obligations.
+    pub unsafe fn display_frl_pattern(
+        &mut self,
+        port: usize,
+        patterns: [u8; 4],
+    ) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .frl_training_pattern(path, patterns)
+        }
+    }
+    /// Program the port's FRL TxFFE lane set.
+    /// # Safety
+    /// Fulfil `Otg::frl_ffe` obligations.
+    pub async unsafe fn display_frl_ffe(
+        &mut self,
+        port: usize,
+        lane_set: u8,
+    ) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .frl_ffe(&mut self.sequence.backend.dmub, path, lane_set)
+                .await
+        }
+    }
+    /// End FRL training: FRL output on the port's trained link.
+    /// # Safety
+    /// Fulfil `Otg::frl_link_output` obligations.
+    pub unsafe fn display_frl_output(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe { self.otg.as_mut().map_err(|e| *e)?.frl_link_output(path) }
+    }
+    /// Stop the port's FRL link.
+    /// # Safety
+    /// Fulfil `Otg::stop_frl_link` obligations.
+    pub async unsafe fn stop_display_frl_link(&mut self, port: usize) -> Result<(), otg::Error> {
+        let path = self.dp_phy_path(port)?;
+        // SAFETY: the caller's obligations.
+        unsafe {
+            self.otg
+                .as_mut()
+                .map_err(|e| *e)?
+                .stop_frl_link(&mut self.sequence.backend.dmub, path)
+                .await
+        }
+    }
     /// Read one SCDC register of an HDMI port's sink over native DDC.
     pub async fn display_scdc_read(&mut self, port: usize, offset: u8) -> Result<u8, ddc::Error> {
         let channel = self.scdc_channel(port)?;

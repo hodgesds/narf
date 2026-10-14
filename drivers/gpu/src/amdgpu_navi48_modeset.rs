@@ -248,6 +248,54 @@ pub fn frl_link(
         .find(|&r| frl_carries(t, bpc, r, audio).is_some())
 }
 
+/// FRL training on a ColdBoot port: SCDC over native DDC, the HPO FRL
+/// encoder's patterns and the transmitter's TxFFE through the display
+/// owner.
+pub struct FrlPort<'a> {
+    pub boot: &'a mut ColdBoot,
+    pub port: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrlPortError {
+    Scdc(crate::amdgpu_ddc_navi48::Error),
+    Display(otg::Error),
+}
+impl crate::amdgpu_frl_training::FrlTrainer for FrlPort<'_> {
+    type Error = FrlPortError;
+    async fn scdc_read(&mut self, offset: u8) -> Result<u8, FrlPortError> {
+        self.boot
+            .display_scdc_read(self.port, offset)
+            .await
+            .map_err(FrlPortError::Scdc)
+    }
+    async fn scdc_write(&mut self, offset: u8, value: u8) -> Result<(), FrlPortError> {
+        self.boot
+            .display_scdc_write(self.port, offset, value)
+            .await
+            .map_err(FrlPortError::Scdc)
+    }
+    fn pattern(&mut self, patterns: [u8; 4]) -> Result<(), FrlPortError> {
+        // SAFETY: the FRL link this trainer drives is the port's own.
+        unsafe { self.boot.display_frl_pattern(self.port, patterns) }.map_err(FrlPortError::Display)
+    }
+    async fn ffe(&mut self, lane_set: u8) -> Result<(), FrlPortError> {
+        // SAFETY: as for `pattern`.
+        unsafe { self.boot.display_frl_ffe(self.port, lane_set).await }
+            .map_err(FrlPortError::Display)
+    }
+    async fn delay(&mut self, us: u64) {
+        narf_time::SleepUntil::new(narf_time::Deadline::after_us(us).as_instant()).await;
+    }
+}
+impl From<FrlPortError> for ModesetError {
+    fn from(e: FrlPortError) -> Self {
+        match e {
+            FrlPortError::Scdc(e) => ModesetError::Scdc(e),
+            FrlPortError::Display(e) => ModesetError::Display(e),
+        }
+    }
+}
+
 /// Highest output depth modesets may pick, like DRM's max_requested_bpc,
 /// which amdgpu_dm initialises to 8. Raised by `amdgpu.max_bpc`.
 static MAX_BPC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(8);
@@ -1632,6 +1680,53 @@ impl ColdBoot {
             self.stop_display_uhbr_link(port, unplugged).await?;
         }
         Ok(())
+    }
+    /// Enable and train an FRL link for `timing` at `bpc` on HDMI port
+    /// `port`, from `rate` down: hdmi_frl_perform_link_training_with_retries
+    /// at each rate, stepping one rate code down when the sink asks for a
+    /// lower rate (as Linux's verification walk does), never below one that
+    /// still carries the mode. A timeout or Sink_Version 0 ends it. On
+    /// success the link sends FRL output and FRL_Start was awaited.
+    /// # Safety
+    /// As for `start_link`; the port's sink declared FRL and SCDC.
+    pub async unsafe fn start_frl(
+        &mut self,
+        port: usize,
+        timing: &Timing,
+        bpc: u8,
+        rate: FrlRate,
+        audio: crate::amdgpu_frl_cap::FrlAudio,
+    ) -> Result<FrlRate, ModesetError> {
+        use crate::amdgpu_frl_training::{poll_start, train_with_retries, FrlTraining};
+        let mut code = rate.code();
+        // SAFETY: the caller's obligations; each step checks its predecessor.
+        unsafe {
+            loop {
+                let r = FrlRate::new(code).ok_or(ModesetError::Link)?;
+                if frl_carries(timing, bpc, r, audio).is_none() {
+                    return Err(ModesetError::Link);
+                }
+                self.start_display_frl_link(port, r.lanes(), r.character_khz())
+                    .await?;
+                let outcome =
+                    train_with_retries(&mut FrlPort { boot: self, port }, code, r.lanes()).await?;
+                match outcome {
+                    FrlTraining::Success => {
+                        self.display_frl_output(port)?;
+                        poll_start(&mut FrlPort { boot: self, port }).await?;
+                        return Ok(r);
+                    }
+                    FrlTraining::LowerRate => {
+                        self.stop_display_frl_link(port).await?;
+                        code -= 1;
+                    }
+                    FrlTraining::Timeout | FrlTraining::Fallback => {
+                        self.stop_display_frl_link(port).await?;
+                        return Err(ModesetError::Link);
+                    }
+                }
+            }
+        }
     }
     /// Check a running modeset: hot-plug first (no AUX to an absent sink),
     /// then the sink's lane lock, then the scanout itself.

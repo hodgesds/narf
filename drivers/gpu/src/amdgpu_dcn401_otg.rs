@@ -54,7 +54,7 @@ mod tmds_phy;
 pub use tmds_phy::TmdsDisabled;
 #[path = "amdgpu_dcn401_frl.rs"]
 mod frl;
-pub use frl::{FrlDisabled, FrlEncoderRetired, FrlLinkRetired};
+pub use frl::{FrlDisabled, FrlEncoderRetired, FrlLinkRetired, FrlLinkUp};
 
 const H_TOTAL: u64 = 0x1b2a;
 const H_BLANK: u64 = 0x1b2b;
@@ -165,6 +165,10 @@ pub enum State {
     HdmiFrlRetired,
     RetiringFrlLink(u8),
     FrlLinkRetired,
+    /// This owner's FRL link on this transmitter: firmware-enabled and
+    /// sending training patterns, or trained and sending FRL output.
+    FrlLinkTraining(u8),
+    FrlLinkActive(u8),
     DisablingFrl(u8),
     FrlDisabled,
     RetiringPlanes,
@@ -368,6 +372,8 @@ pub struct Status {
     pub frl_encoder_retired: Option<FrlEncoderRetired>,
     /// Historical FRL digital-link stop only; PHY, root clocks and memory stay owned.
     pub frl_link_retired: Option<FrlLinkRetired>,
+    /// This owner's FRL link; current in FrlLinkTraining/FrlLinkActive.
+    pub frl_link: Option<FrlLinkUp>,
     /// Historical lane/TX-clock/character-root stop; forced input clocks stay owned.
     pub frl_disabled: Option<FrlDisabled>,
     /// Timing retirement only. Does not prove HUBP/VM or surface retirement.
@@ -411,6 +417,7 @@ impl Status {
             tmds_disabled: None,
             frl_encoder_retired: None,
             frl_link_retired: None,
+            frl_link: None,
             frl_disabled: None,
             retired: 0,
         }
@@ -760,7 +767,9 @@ fn held_by_sibling(s: Siblings, l: Layout, at: u64) -> bool {
 #[derive(Debug)]
 struct Displays {
     selected: u8,
-    parked: [Status; 4],
+    /// Four records, built on the heap: together they would fill much of
+    /// a 64 KiB aarch64 stack.
+    parked: Box<[Status]>,
     /// The other displays' resources, fixed while this one is selected.
     siblings: Siblings,
 }
@@ -768,7 +777,7 @@ impl Displays {
     fn new() -> Box<Self> {
         Box::new(Self {
             selected: 0,
-            parked: [Status::new(); 4],
+            parked: alloc::vec![Status::new(); 4].into_boxed_slice(),
             siblings: Siblings::default(),
         })
     }

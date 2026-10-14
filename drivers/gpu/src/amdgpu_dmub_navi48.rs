@@ -595,6 +595,25 @@ impl Dmub {
     ) -> Result<(), Error> {
         self.engine.disable_dp_sst(path).await
     }
+    pub(crate) async fn enable_frl(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        lanes: u8,
+        character_khz: u32,
+    ) -> Result<(), Error> {
+        self.engine.enable_frl(path, lanes, character_khz).await
+    }
+    pub(crate) async fn set_frl_ffe(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        lanes: u8,
+        character_khz: u32,
+        lane_set: u8,
+    ) -> Result<(), Error> {
+        self.engine
+            .set_frl_ffe(path, lanes, character_khz, lane_set)
+            .await
+    }
     pub(crate) async fn enable_uhbr(
         &mut self,
         path: crate::amdgpu_dcn_inventory::Path,
@@ -790,6 +809,71 @@ impl<I: Io> Engine<I> {
         path: crate::amdgpu_dcn_inventory::Path,
     ) -> Result<(), Error> {
         self.disable_dp_transmitter(path, DpSignal::Sst, 19).await
+    }
+    /// hpo_frl_link_enc3_enable_phy_output -> transmitter_control_v1_7:
+    /// ENABLE in HDMI FRL mode (digmode 4) on 3 or 4 lanes, the FRL
+    /// character clock in 10 kHz, the port's HPD, HPO instance 0, no
+    /// connector object. The firmware brings up the PHY, HDMICHARCLK and
+    /// the HPO FRL link encoder; DC writes none of them.
+    async fn enable_frl(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        lanes: u8,
+        character_khz: u32,
+    ) -> Result<(), Error> {
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::HdmiTypeA
+            || path.transmitter >= 4
+            || !(1..=4).contains(&path.hpd)
+            || !matches!(lanes, 3 | 4)
+            || character_khz == 0
+        {
+            return Err(Error::Invalid);
+        }
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
+        request[4] = path.transmitter;
+        request[5] = 1; // TRANSMITTER_CONTROL_ENABLE
+        request[6] = 4; // ATOM_TRANSMITTER_DIGMODE_V6_HDMI_FRL
+        request[7] = lanes;
+        request[8..12].copy_from_slice(&(character_khz / 10).to_le_bytes());
+        request[12] = path.hpd;
+        request[15] = 0;
+        self.begin_mailbox()?;
+        let result = self.command(request).await.map(|_| ());
+        self.finish_mailbox(result)
+    }
+    /// dpcs401_program_eq_setting: SET_VOLTAGE_AND_PREEMPASIS with the
+    /// TxFFE lane set (FFE level, de-emphasis/pre-shoot only bits), as
+    /// Linux sends it: the character clock divided by ten twice, the HDMI-A
+    /// connector object, HPO engine DIGA - HPO_0 (0xF6).
+    async fn set_frl_ffe(
+        &mut self,
+        path: crate::amdgpu_dcn_inventory::Path,
+        lanes: u8,
+        character_khz: u32,
+        lane_set: u8,
+    ) -> Result<(), Error> {
+        if path.connector != crate::amdgpu_dcn_inventory::Connector::HdmiTypeA
+            || path.transmitter >= 4
+            || !(1..=4).contains(&path.hpd)
+            || !matches!(lanes, 3 | 4)
+            || lane_set & !0x63 != 0
+        {
+            return Err(Error::Invalid);
+        }
+        let mut request = [0; 64];
+        request[..4].copy_from_slice(&TRANSMITTER_CONTROL);
+        request[4] = path.transmitter;
+        request[5] = 11; // SET_VOLTAGE_AND_PREEMPASIS
+        request[6] = lane_set;
+        request[7] = lanes;
+        request[8..12].copy_from_slice(&(character_khz / 10 / 10).to_le_bytes());
+        request[12] = path.hpd;
+        request[14] = 12; // CONNECTOR_OBJECT_ID_HDMI_TYPE_A
+        request[15] = 0xf6;
+        self.begin_mailbox()?;
+        let result = self.command(request).await.map(|_| ());
+        self.finish_mailbox(result)
     }
     /// dcn31_hpo_dp_link_enc_enable_dp_output -> transmitter_control_v1_7:
     /// ENABLE as DP_MST (digmode 5, even for SST), the 128b/132b symbol
