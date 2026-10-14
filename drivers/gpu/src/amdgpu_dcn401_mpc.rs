@@ -10,9 +10,12 @@ pub struct MpcApplied {
     pub depth: ColorDepth,
     /// The output CSC compresses to limited range (the blank request's).
     pub limited: bool,
+    /// The output CSC converts to BT.709 YCbCr for a 4:2:0 stream (the
+    /// blank request's).
+    pub ycbcr420: bool,
     /// CURRENT selectors not yet at the request: location, OGAM, OGAM gamut,
     /// shaper, 3D LUT, post-1D LUT, first/second MCM gamut (all bypass) and
-    /// output CSC (bypass, or set A when limited).
+    /// output CSC (bypass, or set A when limited or YCbCr).
     /// Timing is stopped; writing a bypass request does not prove its latch.
     pub pending: u16,
 }
@@ -29,24 +32,43 @@ impl Layout {
     fn ocsc(self, pipe: u8) -> u64 {
         self.mpc_base + (0x30b + u64::from(pipe) * 0xd) * 4
     }
-    /// The output CSC of a limited-range stream, as mpc3_set_ocsc_default
-    /// loads COLOR_SPACE_SRGB_LIMITED: fixed-point S2.13 coefficients (this
-    /// pipe's MPC_OUT_CSC_COEF_FORMAT bit clear), set A, then mode A. Linux's
-    /// output_csc_matrix scales each channel by 0x1B67 and adds 0x201.
-    fn ocsc_limited(self, pipe: u8) -> [(u64, u32, u32); 8] {
+    /// The output CSC load of a converting stream, as mpc3_set_ocsc_default
+    /// does it: fixed-point S2.13 coefficients (this pipe's
+    /// MPC_OUT_CSC_COEF_FORMAT bit clear), set A, then mode A. `m` is a
+    /// row of Linux's output_csc_matrix: C11..C14, C21..C24, C31..C34.
+    fn ocsc_load(self, pipe: u8, m: [u32; 12]) -> [(u64, u32, u32); 8] {
         let coef = |r: u64| self.ocsc(pipe) + r * 4;
-        const SCALE: u32 = 0x1b67;
-        const OFFSET: u32 = 0x201 << 16;
+        let pair = |i: usize| m[i] | m[i + 1] << 16;
         [
             (self.mpc_base + 0x30a * 4, 1 << pipe, 0),
-            (coef(1), u32::MAX, SCALE),          // C11, C12
-            (coef(2), u32::MAX, OFFSET),         // C13, C14
-            (coef(3), u32::MAX, SCALE << 16),    // C21, C22
-            (coef(4), u32::MAX, OFFSET),         // C23, C24
-            (coef(5), u32::MAX, 0),              // C31, C32
-            (coef(6), u32::MAX, SCALE | OFFSET), // C33, C34
+            (coef(1), u32::MAX, pair(0)),  // C11, C12
+            (coef(2), u32::MAX, pair(2)),  // C13, C14
+            (coef(3), u32::MAX, pair(4)),  // C21, C22
+            (coef(4), u32::MAX, pair(6)),  // C23, C24
+            (coef(5), u32::MAX, pair(8)),  // C31, C32
+            (coef(6), u32::MAX, pair(10)), // C33, C34
             (self.ocsc(pipe), 3, 1),
         ]
+    }
+    /// The output CSC a stream needs: COLOR_SPACE_YCBCR709 for 4:2:0
+    /// (YCBCR709_TYPE), COLOR_SPACE_SRGB_LIMITED for limited RGB (each
+    /// channel scaled by 0x1B67 plus 0x201), none (bypass) for full RGB.
+    fn ocsc_matrix(a: &MpcApplied) -> Option<[u32; 12]> {
+        if a.ycbcr420 {
+            Some([
+                0xe04, 0xf345, 0xfeb7, 0x1004, // Cr
+                0x5d3, 0x1399, 0x1fa, 0x201, // Y
+                0xfcca, 0xf533, 0xe04, 0x1004, // Cb
+            ])
+        } else if a.limited {
+            Some([
+                0x1b67, 0, 0, 0x201, //
+                0, 0x1b67, 0, 0x201, //
+                0, 0, 0x1b67, 0x201,
+            ])
+        } else {
+            None
+        }
     }
     fn mpc_bypass(self, p: u8) -> [(u64, u32); 9] {
         [
@@ -61,15 +83,16 @@ impl Layout {
             (self.ocsc(p), 0x180),
         ]
     }
-    /// The composition registers, then for a limited-range stream the output
+    /// The composition registers, then for a converting stream the output
     /// CSC load (after the bypass write of its mode, which it replaces).
     fn mpc_rgb(self, a: MpcApplied) -> impl Iterator<Item = (u64, u32, u32)> {
         let p = a.dpp.surface.request.pipe;
-        let limited = a.limited.then(|| self.ocsc_limited(p));
+        let load = Self::ocsc_matrix(&a).map(|m| self.ocsc_load(p, m));
+        let converting = load.is_some();
         self.mpc_full(a)
             .into_iter()
-            .filter(move |&(at, _, _)| !(a.limited && at == self.ocsc(p)))
-            .chain(limited.into_iter().flatten())
+            .filter(move |&(at, _, _)| !(converting && at == self.ocsc(p)))
+            .chain(load.into_iter().flatten())
     }
     fn mpc_full(self, a: MpcApplied) -> [(u64, u32, u32); 20] {
         let p = a.dpp.surface.request.pipe;
@@ -122,7 +145,8 @@ impl<I: Io> Engine<I> {
             .enumerate()
         {
             let ocsc = at == self.layout.ocsc(a.dpp.surface.request.pipe);
-            let want = if ocsc && a.limited { 1 << 7 } else { 0 };
+            let converting = Layout::ocsc_matrix(&a).is_some();
+            let want = if ocsc && converting { 1 << 7 } else { 0 };
             if self.read(at)? & mask != want {
                 pending |= 1 << bit;
             }
@@ -152,6 +176,7 @@ impl Surfaces {
             || dpp.timing != blank.timing
             || a.depth != blank.request.depth
             || a.limited != blank.request.limited
+            || a.ycbcr420 != blank.request.ycbcr420
             || e.blank_timing(blank.request, clock)? != dpp.timing
             || e.status.memory[slot]
                 != Some(MemoryApplied {
@@ -191,6 +216,7 @@ impl Surfaces {
             dpp,
             depth: blank.request.depth,
             limited: blank.request.limited,
+            ycbcr420: blank.request.ycbcr420,
             pending: 0,
         };
         self.verify_mpc_source(e, a, (clock, config))?;

@@ -215,6 +215,7 @@ fn fixture_req(
             pipe,
             depth,
             limited: false,
+            ycbcr420: req.ycbcr420,
         },
         c,
     ))
@@ -518,7 +519,8 @@ kernel_test_in!(
 
 fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
     let t = request(0).timing;
-    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, Default::default(), false);
+    let p =
+        crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, Default::default(), false, false);
     // CTA-861: the header and payload sum to zero.
     let sum = p[..3]
         .iter()
@@ -543,7 +545,7 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
         qs: true,
         hdmi_vic: 0,
     };
-    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, false);
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, false, false);
     let sum = |p: &[u8; 36]| {
         p[..3]
             .iter()
@@ -553,13 +555,13 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
     if p[..4] != [0x82, 2, 13, 0] || p[5..9] != [0x1e, 0x28, 0x88, 16] || sum(&p) != 0 {
         return TestResult::Fail("AVI VIC, aspect and range");
     }
-    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, true);
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, true, false);
     if p[7] != 0x84 || sum(&p) != 0 {
         return TestResult::Fail("AVI limited range");
     }
     // Without QS the range stays at the format's default either way.
     let no_qs = crate::amdgpu_dcn401_otg::Avi { qs: false, ..avi };
-    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, no_qs, true);
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, no_qs, true, false);
     if p[7] != 0x80 || sum(&p) != 0 {
         return TestResult::Fail("AVI default range");
     }
@@ -568,9 +570,16 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
         &t,
         crate::amdgpu_dcn401_otg::Avi { vic: 200, ..avi },
         false,
+        false,
     );
     if p[1] != 3 || p[8] != 200 || sum(&p) != 0 {
         return TestResult::Fail("AVI version 3");
+    }
+    // YCbCr 4:2:0 (COLOR_SPACE_YCBCR709): Y 3, C BT.709, Q default even
+    // with QS (an RGB range), YQ limited.
+    let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, false, true);
+    if p[5..10] != [0x7e, 0xa8, 0x80, 16, 0] || sum(&p) != 0 {
+        return TestResult::Fail("AVI YCbCr 4:2:0");
     }
     // A powered-down VPG memory is woken before the packet write.
     let (mut e, mut fw, c) = fixture(1, 1, 1);
@@ -988,4 +997,72 @@ fn dcn401_hdmi_link_starts_beside_another_display() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_link_starts_beside_another_display
+);
+
+/// YCbCr 4:2:0 over TMDS: the DCCG divides by two, the link runs at half
+/// the pixel clock (PHY PLL, stream setup and transmitter, as dcn401's
+/// requested_pix_clk), so 4K60 needs no scrambling; the DIG FIFO takes two
+/// pixels per cycle and the AVI InfoFrame says Y 4:2:0, C BT.709. A
+/// divide-by-four clock for 4:2:0 is refused.
+fn dcn401_hdmi_link_carries_ycbcr420_at_half_rate() -> TestResult {
+    let mut req = request(1);
+    req.signal = Signal::Tmds;
+    req.ycbcr420 = true;
+    (
+        req.timing.pixel_clock_khz,
+        req.timing.h_active,
+        req.timing.h_total,
+    ) = (594_000, 3840, 4400);
+    (req.timing.h_front_porch, req.timing.h_sync_width) = (176, 88);
+    (req.timing.v_active, req.timing.v_total) = (2160, 2250);
+    (req.timing.v_front_porch, req.timing.v_sync_width) = (8, 10);
+    let by = |divider| {
+        let mut c = clock(req);
+        c.request.pixel = dccg::PixelClock::Tmds { divider };
+        c
+    };
+    // RGB's divide-by-four on 4:2:0 timing.
+    let (mut e, mut fw, c) =
+        fixture_req(1, 1, 1, req, by(dccg::TmdsDivider::By2), ColorDepth::Bpc8);
+    let mut wrong = c;
+    wrong.request.pixel = dccg::PixelClock::Tmds {
+        divider: dccg::TmdsDivider::By4,
+    };
+    if run(e.prepare_hdmi_link(&mut fw, path(1), link(1, 1), wrong)).is_ok() {
+        return TestResult::Fail("divide-by-four 4:2:0 link");
+    }
+    let (mut e, mut fw, c) =
+        fixture_req(1, 1, 1, req, by(dccg::TmdsDivider::By2), ColorDepth::Bpc8);
+    let Ok(ready) = run(e.prepare_hdmi_link(&mut fw, path(1), link(1, 1), c)) else {
+        return TestResult::Fail("4:2:0 link");
+    };
+    let commands: Vec<_> = fw.commands.iter().map(|c| c.0).collect();
+    if (ready.pixel_khz, ready.character_khz, ready.scrambled) != (297_000, 297_000, false)
+        || commands[..3]
+            != [
+                Command::Clock(path(1), 1, 297_000, dmub::TmdsDepth::Bpc8),
+                Command::Setup(1, 297_000),
+                Command::Enable(path(1), 297_000),
+            ]
+    {
+        return TestResult::Fail("half-rate TMDS link");
+    }
+    let regs = &e.io.inner.regs;
+    let avi_words: Vec<u32> =
+        e.io.inner
+            .writes
+            .iter()
+            .filter(|w| w.0 == dio(1, 0x2069))
+            .map(|w| w.1)
+            .take(3)
+            .collect();
+    // SB1 Y = 3 (0x60 over 0x1e), SB2 C = BT.709 (0x80 over 0x08).
+    if regs[&dio(1, 0x209b)] & 0x300 != 0x100 || avi_words[1] >> 8 & 0xffff != 0x887e {
+        return TestResult::Fail("two pixels per cycle and 4:2:0 AVI");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_link_carries_ycbcr420_at_half_rate
 );

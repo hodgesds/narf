@@ -75,6 +75,7 @@ fn fixture_range(
             pipe,
             depth,
             limited,
+            ycbcr420: false,
         },
         c,
     ))

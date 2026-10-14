@@ -58,6 +58,8 @@ pub struct Selection {
     pub avi: otg::Avi,
     /// Limited-range RGB output (COLOR_SPACE_SRGB_LIMITED).
     pub limited: bool,
+    /// HDMI YCbCr 4:2:0 output (COLOR_SPACE_YCBCR709, 8 bpc).
+    pub ycbcr420: bool,
 }
 
 /// The sink's audio description as amdgpu_dm_fill_audio_info builds it from
@@ -234,10 +236,19 @@ pub fn edid_timings(edid: &[u8]) -> Vec<Timing> {
             edid[37],
         ));
     }
+    // add_cea_modes: in data-block order, each Video Data Block's SVD
+    // modes and each YCbCr 4:2:0 Video Data Block's 4:2:0-only modes.
     for cta in &ctas {
         for block in &cta.data_blocks {
-            if let narf_edid::cta861::DataBlock::Video(svds) = block {
-                fixed.extend(svds.iter().filter_map(|svd| modes::cea_mode(svd.vic)));
+            match block {
+                narf_edid::cta861::DataBlock::Video(svds) => {
+                    fixed.extend(svds.iter().filter_map(|svd| modes::cea_mode(svd.vic)));
+                }
+                narf_edid::cta861::DataBlock::Extended {
+                    ext_tag: 14,
+                    payload,
+                } => fixed.extend(payload.iter().filter_map(|&b| modes::cea_mode(svd_vic(b)))),
+                _ => {}
             }
         }
     }
@@ -315,6 +326,11 @@ pub struct HdmiCaps {
     pub ycbcr420: bool,
     /// VICs the Video Data Blocks list, as a bitmap.
     pub vics: [u64; 4],
+    /// VICs the sink takes only as YCbCr 4:2:0 (Y420VDB), and VICs it
+    /// takes as 4:2:0 too (the SVDs a Y420CMDB maps), as bitmaps:
+    /// drm_mode_is_420_only and drm_mode_is_420_also.
+    pub y420_only: [u64; 4],
+    pub y420_also: [u64; 4],
     /// VSDB DC_30bit / DC_36bit: RGB 4:4:4 at 10 / 12 bpc.
     pub dc30: bool,
     pub dc36: bool,
@@ -322,6 +338,11 @@ pub struct HdmiCaps {
 pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
     use narf_edid::cta861::{CtaExtension, DataBlock};
     let mut caps = HdmiCaps::default();
+    // Every SVD's VIC in order (DRM's display_info vics), which a Y420CMDB
+    // indexes; the map, or None for one that covers every SVD.
+    let mut svd_vics: Vec<u8> = Vec::new();
+    let mut cmdb: Option<Option<u64>> = None;
+    let set = |map: &mut [u64; 4], vic: u8| map[usize::from(vic / 64)] |= 1 << (vic % 64);
     for block in edid.chunks_exact(128).skip(1) {
         let Ok(cta) = CtaExtension::parse(block) else {
             continue;
@@ -354,7 +375,8 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
             match db {
                 DataBlock::Video(svds) => {
                     for d in svds {
-                        caps.vics[usize::from(d.vic / 64)] |= 1 << (d.vic % 64);
+                        set(&mut caps.vics, d.vic);
+                        svd_vics.push(d.vic);
                     }
                 }
                 DataBlock::Extended {
@@ -369,21 +391,45 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
                     ext_tag: 14,
                     payload,
                 } => {
-                    caps.ycbcr420 |= payload
-                        .iter()
-                        .any(|&b| narf_edid::modes::cea_mode(svd_vic(b)).is_some());
+                    for &b in payload.iter() {
+                        let vic = svd_vic(b);
+                        if narf_edid::modes::cea_mode(vic).is_some() {
+                            caps.ycbcr420 = true;
+                            set(&mut caps.y420_only, vic);
+                        }
+                    }
                 }
                 DataBlock::Extended {
                     ext_tag: 15,
                     payload,
                 } => {
                     caps.ycbcr420 |= payload.is_empty() || payload.iter().take(8).any(|&b| b != 0);
+                    // parse_cta_y420cmdb: an empty map covers every SVD;
+                    // at most 64 SVDs are mapped.
+                    let map = payload
+                        .iter()
+                        .take(8)
+                        .enumerate()
+                        .fold(0u64, |m, (i, &b)| m | u64::from(b) << (8 * i));
+                    let all = cmdb.get_or_insert(Some(0));
+                    *all = if payload.is_empty() {
+                        None
+                    } else {
+                        all.map(|m| m | map)
+                    };
                 }
                 _ => {}
             }
             if let Some(&[_version, rate, flags, ..]) = forum {
                 caps.forum_max_khz = u32::from(rate) * 5000;
                 caps.scdc = flags & 0x80 != 0;
+            }
+        }
+    }
+    if let Some(map) = cmdb {
+        for (i, &vic) in svd_vics.iter().enumerate().take(64) {
+            if map.is_none_or(|m| m & 1 << i != 0) {
+                set(&mut caps.y420_also, vic);
             }
         }
     }
@@ -403,8 +449,8 @@ fn svd_vic(svd: u8) -> u8 {
 /// picture aspect when 4:3 or 16:9, and whether the sink can select the
 /// range. The aspect of a mode is taken from its VIC alone: narf modes carry
 /// none of their own.
-pub fn hdmi_avi(caps: HdmiCaps, t: &Timing) -> otg::Avi {
-    use narf_edid::modes::{cea_aspect, hdmi_aspect, match_cea_mode, match_hdmi_mode};
+/// `t` as DRM's mode matchers take it.
+fn edid_mode(t: &Timing) -> narf_edid::modes::FixedMode {
     let field = |active: u32, front: u32, sync: u32, total: u32| {
         let at = |x: u32| u16::try_from(x).unwrap_or(u16::MAX);
         [
@@ -414,13 +460,38 @@ pub fn hdmi_avi(caps: HdmiCaps, t: &Timing) -> otg::Avi {
             at(total),
         ]
     };
-    let mode = narf_edid::modes::progressive(
+    narf_edid::modes::progressive(
         t.pixel_clock_khz,
         field(t.h_active, t.h_front_porch, t.h_sync_width, t.h_total),
         field(t.v_active, t.v_front_porch, t.v_sync_width, t.v_total),
         t.h_sync_positive,
         t.v_sync_positive,
-    );
+    )
+}
+
+/// How an HDMI sink carries `t`, in amdgpu's encoding order with 4:2:2 and
+/// 4:4:4 YCbCr left out: a mode the sink takes only as YCbCr 4:2:0
+/// (drm_mode_is_420_only) as 4:2:0; otherwise RGB at the deepest depth up
+/// to `max_bpc` that fits, and failing that 4:2:0 where the sink takes the
+/// mode as 4:2:0 too (drm_mode_is_420_also). 4:2:0 is 8 bpc, half the
+/// pixel rate per TMDS character. The depth and whether it is 4:2:0; None
+/// when nothing fits.
+pub fn hdmi_format(caps: HdmiCaps, t: &Timing, max_bpc: u8) -> Option<(otg::ColorDepth, bool)> {
+    let vic = narf_edid::modes::match_cea_mode(edid_mode(t));
+    let listed = |map: [u64; 4]| vic != 0 && map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
+    let fits_420 = || hdmi_fits(caps, t.pixel_clock_khz / 2);
+    if listed(caps.y420_only) {
+        return fits_420().then_some((otg::ColorDepth::Bpc8, true));
+    }
+    if let Some(depth) = hdmi_depth(caps, t.pixel_clock_khz, max_bpc) {
+        return Some((depth, false));
+    }
+    (listed(caps.y420_also) && fits_420()).then_some((otg::ColorDepth::Bpc8, true))
+}
+
+pub fn hdmi_avi(caps: HdmiCaps, t: &Timing) -> otg::Avi {
+    use narf_edid::modes::{cea_aspect, hdmi_aspect, match_cea_mode, match_hdmi_mode};
+    let mode = edid_mode(t);
     let hdmi_vic = if caps.hdmi { match_hdmi_mode(mode) } else { 0 };
     let vic = if hdmi_vic != 0 {
         0
@@ -553,6 +624,7 @@ pub fn select_all(
             audio: None,
             avi: otg::Avi::default(),
             limited: false,
+            ycbcr420: false,
         });
     }
     for port in ports {
@@ -568,14 +640,14 @@ pub fn select_all(
             continue;
         };
         let Some(timing) = pick(index, &sink.edid, &|t| {
-            hdmi_depth(caps, t.pixel_clock_khz, max_bpc).is_some()
+            hdmi_format(caps, t, max_bpc).is_some()
         }) else {
             continue;
         };
         let Some(edid) = sink.edid.get(..128).and_then(|b| b.try_into().ok()) else {
             continue;
         };
-        let Some(depth) = hdmi_depth(caps, timing.pixel_clock_khz, max_bpc) else {
+        let Some((depth, ycbcr420)) = hdmi_format(caps, &timing, max_bpc) else {
             link_short = true;
             continue;
         };
@@ -591,6 +663,7 @@ pub fn select_all(
             audio: hdmi_audio_info(&sink.edid),
             avi: hdmi_avi(caps, &timing),
             limited: false,
+            ycbcr420,
         });
     }
     out.truncate(MAX_DISPLAYS);
@@ -613,7 +686,7 @@ pub fn admit_displays(
     soc: &dml::Soc,
     selections: &[Selection],
 ) -> Result<Vec<dml::Plan>, dml::Error> {
-    let modes: Vec<dml::Mode> = selections.iter().map(|s| mode(s.timing)).collect();
+    let modes: Vec<dml::Mode> = selections.iter().map(selection_mode).collect();
     let mut n = modes.len().min(MAX_DISPLAYS);
     loop {
         match dml::admit_all(soc, &modes[..n]) {
@@ -653,6 +726,15 @@ pub fn mode(timing: Timing) -> dml::Mode {
     }
 }
 
+/// The admission mode of a selected sink: its timing, as 4:2:0 output
+/// when it leaves so.
+pub fn selection_mode(s: &Selection) -> dml::Mode {
+    dml::Mode {
+        ycbcr420: s.ycbcr420,
+        ..mode(s.timing)
+    }
+}
+
 /// Global clocks at least as fast as the plan's DISPCLK and DPPREFCLK.
 pub fn clock_request(plan: &dml::Plan) -> clocks::Request {
     clocks::Request {
@@ -669,9 +751,14 @@ pub fn pipe_clock_request(pipe: u8, plan: &dml::Plan, hdmi: bool) -> dccg::Reque
     dccg::Request {
         pipe,
         dpp_khz: plan.clocks.dppclk_khz,
+        // dcn401_calculate_dccg_tmds_div_value: 4:2:0 divides by two.
         pixel: if hdmi {
             dccg::PixelClock::Tmds {
-                divider: dccg::TmdsDivider::By4,
+                divider: if plan.mode.ycbcr420 {
+                    dccg::TmdsDivider::By2
+                } else {
+                    dccg::TmdsDivider::By4
+                },
             }
         } else {
             dccg::PixelClock::DisplayPort {
@@ -691,6 +778,7 @@ pub fn timing_request(pipe: u8, plan: &dml::Plan, hdmi: bool) -> otg::Request {
         } else {
             otg::Signal::DisplayPort
         },
+        ycbcr420: plan.mode.ycbcr420,
     }
 }
 
@@ -822,7 +910,7 @@ impl ColdBoot {
             .map_err(|_| ModesetError::NoSink)?
             .to_vec();
         let mut selection = select(&paths, &ports, max_bpc(), want)?;
-        selection.limited = limited_range(broadcast_rgb());
+        selection.limited = limited_range(broadcast_rgb()) && !selection.ycbcr420;
         self.select_display(pipe)?;
         let soc = self.prepare_configuration(&[selection]).await?;
         let plans = admit_displays(&soc, &[selection]).map_err(otg::Error::Admission)?;
@@ -860,9 +948,10 @@ impl ColdBoot {
         if selections.is_empty() {
             return Err(ModesetError::NoSink);
         }
+        // "Broadcast RGB" is RGB's: YCbCr is limited range by itself.
         let limited = limited_range(broadcast_rgb());
         for s in &mut selections {
-            s.limited = limited;
+            s.limited = limited && !s.ycbcr420;
         }
         let pipes: Vec<u8> = selections.iter().filter_map(|s| pipe_of(s.port)).collect();
         self.select_display(pipes[0])?;
@@ -971,6 +1060,7 @@ impl ColdBoot {
                 pipe,
                 depth: selection.depth,
                 limited: selection.limited,
+                ycbcr420: selection.ycbcr420,
             })
             .await?;
             self.prepare_display_dpp(pipe).await?;
@@ -1008,18 +1098,30 @@ impl ColdBoot {
         let caps = hdmi_caps(edid);
         let mut modes = [None; MAX_MODES];
         let mut n = 0;
-        let mut joint: Vec<dml::Mode> = lit.iter().map(|m| mode(m.selection.timing)).collect();
+        let mut joint: Vec<dml::Mode> = lit.iter().map(|m| selection_mode(&m.selection)).collect();
         for t in edid_timings(edid) {
             if n == MAX_MODES {
                 break;
             }
-            let fits = if s.hdmi {
-                hdmi_depth(caps, t.pixel_clock_khz, max_bpc()).is_some()
+            // How the link would carry it: HDMI may need 4:2:0.
+            let format = if s.hdmi {
+                hdmi_format(caps, &t, max_bpc()).map(|(_, ycbcr420)| ycbcr420)
             } else {
-                link_fits(&t, s.lanes, s.rate)
+                link_fits(&t, s.lanes, s.rate).then_some(false)
             };
-            joint[k] = mode(t);
-            if t == s.timing || (fits && dml::admit_all(soc, &joint).is_ok()) {
+            if t == s.timing {
+                modes[n] = Some(t);
+                n += 1;
+                continue;
+            }
+            let Some(ycbcr420) = format else {
+                continue;
+            };
+            joint[k] = dml::Mode {
+                ycbcr420,
+                ..mode(t)
+            };
+            if dml::admit_all(soc, &joint).is_ok() {
                 modes[n] = Some(t);
                 n += 1;
             }
@@ -1211,8 +1313,10 @@ impl ColdBoot {
             otg::ColorDepth::Bpc10 => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc10,
             otg::ColorDepth::Bpc12 => crate::amdgpu_dmub_navi48::TmdsDepth::Bpc12,
         };
-        // Linux decides on phy_pix_clk, the deep-colour character clock.
-        let scrambled = tmds.character_khz(s.timing.pixel_clock_khz) > otg::TMDS_SCRAMBLE_KHZ;
+        // Linux decides on phy_pix_clk, the deep-colour character clock of
+        // the TMDS pixel clock (halved for 4:2:0).
+        let pixel_khz = s.timing.pixel_clock_khz >> u32::from(s.ycbcr420);
+        let scrambled = tmds.character_khz(pixel_khz) > otg::TMDS_SCRAMBLE_KHZ;
         let result = async {
             if self.display_scdc_read(s.port, SINK_VERSION).await? == 1 {
                 self.display_scdc_write(s.port, SOURCE_VERSION, 1).await?;

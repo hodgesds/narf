@@ -258,6 +258,9 @@ pub struct Request {
     pub timing: Timing,
     pub sync: GlobalSync,
     pub signal: Signal,
+    /// HDMI YCbCr 4:2:0 output: two pixels per container, so the OTG
+    /// divides its horizontal timing by two and formats 4:2:0 data.
+    pub ycbcr420: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Applied {
@@ -422,7 +425,14 @@ impl Plan {
             (PSTATE, 0x7fff, s.pstate_keepout),
         ]
     }
+    /// OTG_H_TIMING_CNTL: optc401_set_odm_bypass divides by two for two
+    /// pixels per container (4:2:0, whose horizontal timing `plan` requires
+    /// even); otherwise no divide, the hardware's automatic choice unless
+    /// a horizontal boundary is odd, when the manual no-divide mode is set.
     fn h_divider(self) -> u32 {
+        if self.request.ycbcr420 {
+            return 1;
+        }
         ((self.request.timing.h_total
             | self.request.timing.h_sync_width
             | self.h_blank
@@ -465,6 +475,13 @@ impl Request {
         };
         let (hs, he) = blank(t.h_total, t.h_active, t.h_front_porch, t.h_sync_width, 32)?;
         let (vs, ve) = blank(t.v_total, t.v_active, t.v_front_porch, t.v_sync_width, 3)?;
+        // 4:2:0 is HDMI only, and every horizontal boundary must divide by
+        // two (Linux would switch to the manual mode; this owner refuses).
+        if self.ycbcr420
+            && (self.signal != Signal::Tmds || (t.h_total | t.h_sync_width | hs | he) & 1 != 0)
+        {
+            return Err(Error::Unsupported);
+        }
         Ok(Plan {
             request: self,
             h_blank: hs | he << 16,
@@ -881,7 +898,9 @@ impl<I: Io> Engine<I> {
             self.update(otg(r), mask, value)?;
         }
         self.update(l.vtg(pipe), 0x7fff7fff, plan.vtg)?;
-        self.update(odm(FORMAT), 0x33, 0)?; // RGB, DSC disabled
+        // OPTC_DATA_FORMAT: RGB/4:4:4, or 4:2:0; DSC disabled.
+        let format = if plan.request.ycbcr420 { 2 } else { 0 };
+        self.update(odm(FORMAT), 0x33, format)?;
         Ok(())
     }
     async fn prepare(&mut self, request: Request, clock: dccg::Applied) -> Result<Applied, Error> {

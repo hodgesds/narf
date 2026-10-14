@@ -352,6 +352,7 @@ fn request(pipe: u8) -> Request {
     Request {
         pipe,
         signal: Signal::HpoDisplayPort,
+        ycbcr420: false,
         timing: Timing {
             pixel_clock_khz: 148_500,
             h_active: 1920,
@@ -879,6 +880,7 @@ fn blank_request(pipe: u8) -> BlankRequest {
         pipe,
         depth: ColorDepth::Bpc8,
         limited: false,
+        ycbcr420: false,
     }
 }
 
@@ -901,6 +903,7 @@ fn dcn401_opp_stages_native_rgb_black_without_claiming_blank_completion() -> Tes
                 pipe,
                 depth,
                 limited: false,
+                ycbcr420: false,
             };
             let a = run(e.prepare_blank(req, clock(request(pipe)))).unwrap();
             assert!(a.pending, "OPP double-buffer still awaits timing enable");
@@ -1173,4 +1176,83 @@ fn dcn401_running_timing_reports_enable_or_status() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_running_timing_reports_enable_or_status
+);
+
+/// HDMI YCbCr 4:2:0 timing divides the horizontal timing by two and
+/// formats 4:2:0 data (optc401_set_odm_bypass, optc1 OPTC_DATA_FORMAT 2);
+/// its OPP subsamples with the Cb/Cr bit reduction bypassed, releases the
+/// 4:2:0 memory's forced power state and blanks to YCbCr black. Odd
+/// horizontal timing, DP 4:2:0 and an OPP request that disagrees with its
+/// timing are refused.
+fn dcn401_ycbcr420_divides_horizontal_timing_and_subsamples() -> TestResult {
+    let pipe = 2;
+    let mut req = request(pipe);
+    (req.signal, req.ycbcr420) = (Signal::Tmds, true);
+    let mut e = engine();
+    if run(e.prepare(req, clock(req))).is_err() {
+        return TestResult::Fail("4:2:0 timing");
+    }
+    let l = e.layout;
+    if e.io.regs[&l.otg(pipe, H_TIMING)] & 0x103 != 1 || e.io.regs[&l.odm(pipe, FORMAT)] & 0x33 != 2
+    {
+        return TestResult::Fail("H divide-by-2 and 4:2:0 data format");
+    }
+    // Odd horizontal timing, and 4:2:0 on DP.
+    let mut odd = req;
+    odd.timing.h_sync_width = 45;
+    let mut dp = req;
+    dp.signal = Signal::DisplayPort;
+    if run(engine().prepare(odd, clock(odd))) != Err(Error::Unsupported)
+        || run(engine().prepare(dp, clock(dp))) != Err(Error::Unsupported)
+    {
+        return TestResult::Fail("odd or DP 4:2:0 timing");
+    }
+    let opp = |r: u64| BASE + (r + 0x5a * u64::from(pipe)) * 4;
+    e.io.regs.insert(opp(0x1847), 3); // 4:2:0 memory power forced
+    e.io.retiring = [false; 4];
+    let blank = BlankRequest {
+        ycbcr420: true,
+        ..blank_request(pipe)
+    };
+    for bad in [
+        BlankRequest {
+            ycbcr420: false,
+            ..blank
+        },
+        BlankRequest {
+            limited: true,
+            ..blank
+        },
+    ] {
+        if run(e.prepare_blank(bad, clock(req))) != Err(Error::Invalid) {
+            return TestResult::Fail("OPP request disagreeing with 4:2:0 timing");
+        }
+    }
+    if run(e.prepare_blank(blank, clock(req))).is_err() {
+        return TestResult::Fail("4:2:0 OPP");
+    }
+    let regs = &e.io.regs;
+    if regs[&opp(0x1840)] & 0x2f3f00 != 0x2a_0000
+        || regs[&opp(0x1847)] & 3 != 0
+        || regs[&opp(0x1857)] != 0x8000_8000 // Cr
+        || regs[&opp(0x1858)] != 0x1000_1000 // Y
+        || regs[&opp(0x1859)] != 0x8000_8000 // Cb
+        || regs[&opp(0x1849)] & 1 != 0
+    {
+        return TestResult::Fail("4:2:0 formatter and YCbCr black");
+    }
+    // RGB leaves the 4:2:0 memory alone.
+    let mut e = blank_engine(pipe);
+    e.io.regs.insert(opp(0x1847), 3);
+    if run(e.prepare_blank(blank_request(pipe), clock(request(pipe)))).is_err()
+        || e.io.regs[&opp(0x1847)] != 3
+        || e.io.regs[&opp(0x1840)] & 0x2f3f00 != 0
+    {
+        return TestResult::Fail("RGB OPP touched 4:2:0 state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_ycbcr420_divides_horizontal_timing_and_subsamples
 );

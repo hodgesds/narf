@@ -187,7 +187,8 @@ pub(in crate::amdgpu_dcn401_otg) fn vendor_infoframe(
 }
 
 /// The AVI InfoFrame Linux's set_avi_info_frame builds for this stream: RGB
-/// (sRGB, so C no data), active format valid with both bars, underscan,
+/// (sRGB, so C no data) or YCbCr 4:2:0 (BT.709, YQ limited), active
+/// format valid with both bars, underscan,
 /// uniform scaling, IT content, and `avi`'s VIC and picture aspect. Q names
 /// the output range (`limited` or full) when the sink can select it, else
 /// stays default. Version 3 for VICs of 128 and up. Returns HB0..HB3 then SB0..SB27, as the nine
@@ -196,17 +197,21 @@ pub(in crate::amdgpu_dcn401_otg) fn avi_infoframe(
     t: &crate::amdgpu_dml::Timing,
     avi: Avi,
     limited: bool,
+    ycbcr420: bool,
 ) -> [u8; 36] {
-    let q = match (avi.qs, limited) {
+    // Q names an RGB range only; YCbCr's YQ stays limited (0).
+    let q = match (avi.qs && !ycbcr420, limited) {
         (false, _) => 0,
         (true, true) => 1,
         (true, false) => 2,
     };
+    // Y: 4:2:0 (3) or RGB (0); C: BT.709 (2) for COLOR_SPACE_YCBCR709.
+    let (y, c) = if ycbcr420 { (3, 2) } else { (0, 0) };
     let mut p = [0u8; 36];
     p[..3].copy_from_slice(&[0x82, if avi.vic >= 128 { 3 } else { 2 }, 13]);
     let sb = &mut p[4..];
-    sb[1] = 2 | 3 << 2 | 1 << 4; // S underscan, B both bars, A0 valid, Y RGB
-    sb[2] = 8 | (avi.aspect & 3) << 4; // R same as picture, M, C no data
+    sb[1] = 2 | 3 << 2 | 1 << 4 | y << 5; // S underscan, B both bars, A0 valid, Y
+    sb[2] = 8 | (avi.aspect & 3) << 4 | c << 6; // R same as picture, M, C
     sb[3] = 1 << 7 | q << 2; // SC uniform, Q, EC 0, ITC
     sb[4] = avi.vic;
     // Linux's bar fields: borders are zero, so bottom/right are total + 1.
@@ -425,7 +430,12 @@ impl<I: Io> Engine<I> {
             self.wait(vpg(0x206d), 0x100, 0, 1000).await?;
         }
         let timing = plan.blank.timing.request.timing;
-        let avi = avi_infoframe(&timing, plan.request.avi, plan.blank.request.limited);
+        let avi = avi_infoframe(
+            &timing,
+            plan.request.avi,
+            plan.blank.request.limited,
+            plan.blank.request.ycbcr420,
+        );
         let vendor = vendor_infoframe(&timing, plan.request.avi);
         for (index, packet) in [(0u32, Some(avi)), (1, vendor)] {
             let Some(packet) = packet else {
@@ -489,17 +499,21 @@ impl<I: Io> Engine<I> {
             ColorDepth::Bpc10 => dmub::TmdsDepth::Bpc10,
             ColorDepth::Bpc12 => dmub::TmdsDepth::Bpc12,
         };
-        // RGB: Linux's dcn401_calculate_dccg_tmds_div_value picks divide-by-4.
-        if clock.request.pixel
-            != (dccg::PixelClock::Tmds {
-                divider: dccg::TmdsDivider::By4,
-            })
-        {
+        // dcn401_calculate_dccg_tmds_div_value: divide-by-2 for 4:2:0,
+        // divide-by-4 otherwise.
+        let divider = if timing.ycbcr420 {
+            dccg::TmdsDivider::By2
+        } else {
+            dccg::TmdsDivider::By4
+        };
+        if clock.request.pixel != (dccg::PixelClock::Tmds { divider }) {
             return Err(Error::Unsupported);
         }
         timing.validate_clock(clock)?;
         timing.plan()?;
-        let pixel_khz = timing.timing.pixel_clock_khz;
+        // The TMDS link's pixel clock: halved for 4:2:0's two pixels per
+        // container, as dcn401 build_pipe's requested_pix_clk.
+        let pixel_khz = timing.timing.pixel_clock_khz >> u32::from(timing.ycbcr420);
         let character_khz = depth.character_khz(pixel_khz);
         if pixel_khz < TMDS_MIN_KHZ || !(1..=TMDS_MAX_KHZ).contains(&character_khz) {
             return Err(Error::Unsupported);
@@ -610,7 +624,9 @@ impl<I: Io> Engine<I> {
             (7, 0x10, 0x10),
             (8, 1, 1),
             (10, 7, u32::from(path.transmitter)),
-            (9, 0x300, 0),
+            // DIG_FIFO_OUTPUT_PIXEL_PER_CYCLE: two for 4:2:0
+            // (enc401_set_dig_input_mode), else one.
+            (9, 0x300, u32::from(plan.blank.request.ycbcr420) << 8),
             (9, 0x7c, 7 << 2),
         ] {
             self.hdmi_update(plan, slot, mask, value)?;

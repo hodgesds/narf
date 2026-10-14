@@ -754,3 +754,93 @@ kernel_test_in!(
     "drivers/gpu/navi48-modeset",
     navi48_modeset_selects_every_sink_and_admits_what_fits
 );
+
+/// An HDMI 2.0 sink limited to 300 MHz TMDS: VICs 16 (1080p60), 97 (2160p60)
+/// and 95 (2160p30) in its Video Data Block, 97 also as 4:2:0 (Y420CMDB),
+/// and 96 (2160p50) only as 4:2:0 (Y420VDB).
+fn edid_y420() -> Vec<u8> {
+    const VSDB_300: &[u8] = &[3 << 5 | 7, 0x03, 0x0c, 0x00, 0x10, 0x00, 0, 60];
+    with_blocks(
+        edid_1080p(),
+        &[
+            &[2 << 5 | 3, 16, 97, 95],
+            VSDB_300,
+            &[7 << 5 | 2, 15, 0b010],
+            &[7 << 5 | 2, 14, 96],
+        ],
+    )
+}
+
+/// amdgpu's encoding choice on HDMI: RGB where it fits, 4:2:0 for a mode
+/// the sink takes only so, and 4:2:0 for one RGB cannot carry that the
+/// sink also takes so; 4:2:0-only modes join the mode list.
+fn navi48_modeset_picks_ycbcr420_like_amdgpu() -> TestResult {
+    let edid = edid_y420();
+    let caps = hdmi_caps(&edid);
+    let bit = |map: [u64; 4], vic: u8| map[usize::from(vic / 64)] & 1 << (vic % 64) != 0;
+    if !caps.ycbcr420
+        || !bit(caps.y420_only, 96)
+        || bit(caps.y420_only, 97)
+        || !bit(caps.y420_also, 97)
+        || bit(caps.y420_also, 16)
+        || bit(caps.y420_also, 95)
+    {
+        return TestResult::Fail("Y420VDB / Y420CMDB parsing");
+    }
+    // An empty map covers every SVD.
+    let all = hdmi_caps(&with_blocks(
+        edid_1080p(),
+        &[&[2 << 5 | 2, 16, 97], &[7 << 5 | 1, 15]],
+    ));
+    if !bit(all.y420_also, 16) || !bit(all.y420_also, 97) {
+        return TestResult::Fail("empty Y420CMDB map");
+    }
+    let timings = edid_timings(&edid);
+    let by = |khz: u32, w: u32, total: u32| {
+        timings
+            .iter()
+            .copied()
+            .find(|t| (t.pixel_clock_khz, t.h_active, t.h_total) == (khz, w, total))
+    };
+    let (Some(p1080), Some(p2160_60), Some(p2160_30), Some(p2160_50)) = (
+        by(148_500, 1920, 2200),
+        by(594_000, 3840, 4400),
+        by(297_000, 3840, 4400),
+        by(594_000, 3840, 5280),
+    ) else {
+        return TestResult::Fail("4:2:0-only mode missing from the mode list");
+    };
+    use otg::ColorDepth::Bpc8;
+    if hdmi_format(caps, &p1080, 8) != Some((Bpc8, false))
+        || hdmi_format(caps, &p2160_30, 8) != Some((Bpc8, false))
+        || hdmi_format(caps, &p2160_60, 8) != Some((Bpc8, true))
+        || hdmi_format(caps, &p2160_50, 8) != Some((Bpc8, true))
+    {
+        return TestResult::Fail("encoding choice");
+    }
+    // Without the CMDB, 2160p60 does not fit at all.
+    let rgb_only = HdmiCaps {
+        y420_also: [0; 4],
+        ..caps
+    };
+    if hdmi_format(rgb_only, &p2160_60, 8).is_some() {
+        return TestResult::Fail("4:2:0 without the sink taking it");
+    }
+    // A wanted 2160p60 lights as 4:2:0, with its CTA VIC.
+    let paths = [path(inventory::Connector::HdmiTypeA, 0)];
+    let ports = [port(paths[0], None, edid.clone())];
+    match select(&paths, &ports, 8, Some(p2160_60)) {
+        Ok(s) if s.ycbcr420 && s.hdmi && s.depth == Bpc8 && s.avi.vic == 97 => {}
+        _ => return TestResult::Fail("4:2:0 selection"),
+    }
+    if !selection_mode(&select(&paths, &ports, 8, Some(p2160_60)).unwrap()).ycbcr420
+        || select(&paths, &ports, 8, None).is_ok_and(|s| s.ycbcr420)
+    {
+        return TestResult::Fail("4:2:0 admission mode");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_picks_ycbcr420_like_amdgpu
+);

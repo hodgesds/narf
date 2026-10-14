@@ -216,6 +216,7 @@ fn hdmi_mode(pipe: u8, plan: &dml::Plan) -> Mode {
     let t = Request {
         pipe,
         signal: Signal::Tmds,
+        ycbcr420: false,
         timing: plan.mode.timing,
         sync: plan.sync,
     };

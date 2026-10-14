@@ -13,6 +13,7 @@ const SEED_R: u64 = 0x1842;
 const SEED_G: u64 = 0x1843;
 const SEED_B: u64 = 0x1844;
 const CLAMP: u64 = 0x1845;
+const MAP420: u64 = 0x1847; // FMT_MAP420_MEMORY_CONTROL
 const EDGE: u64 = 0x1849;
 const DPG: u64 = 0x1854;
 const DIMENSIONS: u64 = 0x1856;
@@ -56,20 +57,50 @@ pub struct BlankRequest {
     /// black and the stream signals it. Full range (COLOR_SPACE_SRGB)
     /// otherwise.
     pub limited: bool,
+    /// HDMI YCbCr 4:2:0 output (COLOR_SPACE_YCBCR709): the formatter
+    /// subsamples, the MPC output CSC converts to BT.709 YCbCr (always
+    /// limited range: `limited` is for RGB) and the blank pattern is YCbCr
+    /// black. Requires 4:2:0 timing.
+    pub ycbcr420: bool,
 }
 impl BlankRequest {
-    fn registers(self, t: Timing) -> [(u64, u32, u32); 14] {
-        let black = if self.limited { 0x1000_1000 } else { 0 };
+    /// The OPP registers, then for 4:2:0 the 4:2:0 memory's power control
+    /// (opp1_program_fmt releases its forced state; RGB leaves it alone).
+    pub(in crate::amdgpu_dcn401_otg) fn registers(
+        self,
+        t: Timing,
+    ) -> impl Iterator<Item = (u64, u32, u32)> {
+        self.common_registers(t)
+            .into_iter()
+            .chain(self.ycbcr420.then_some((MAP420, 3, 0)))
+    }
+    fn common_registers(self, t: Timing) -> [(u64, u32, u32); 14] {
+        // black_color_format: limited black is 0x40 of 10 bits, a YCbCr
+        // chroma midpoint 0x200, MSB aligned in both 16-bit colour fields.
+        let (red, green, blue) = match (self.ycbcr420, self.limited) {
+            (true, _) => (0x8000_8000, 0x1000_1000, 0x8000_8000), // Cr, Y, Cb
+            (false, true) => (0x1000_1000, 0x1000_1000, 0x1000_1000),
+            (false, false) => (0, 0, 0),
+        };
+        // FMT_PIXEL_ENCODING 4:2:0, subsampling mode 2, Cb/Cr bit
+        // reduction bypassed (opp1_set_pixel_encoding); RGB otherwise.
+        let format = if self.ycbcr420 {
+            2 << 16 | 2 << 18 | 1 << 21
+        } else {
+            0
+        };
         [
-            (EDGE, 1, 0), // no chroma filter extra pixel for RGB
+            // No 4:2:2/4:2:0 chroma filter extra left pixel on the primary
+            // OPP (opp2_get_left_edge_extra_pixel_count).
+            (EDGE, 1, 0),
             // Explicit truncation, no spatial/temporal dithering or randomization.
             (DEPTH, 0x1ff33, self.depth.truncate()),
             // Clear RGB/YUV offsets as well as the inactive dither seeds.
             (SEED_R, 0xffff00ff, 0),
             (SEED_G, 0xffff00ff, 0),
             (SEED_B, 0xffff00ff, 0),
-            (FMT, 0x2f3f00, 0),  // RGB, frame counter/randomization off
-            (CLAMP, 0x70001, 1), // full range
+            (FMT, 0x2f3f00, format), // frame counter/randomization off
+            (CLAMP, 0x70001, 1),     // full range
             (
                 EXPANSION,
                 0x11,
@@ -81,11 +112,9 @@ impl BlankRequest {
             ),
             (DIMENSIONS, 0x3fff3fff, t.h_active << 16 | t.v_active),
             (OFFSET, 0x3fff3fff, 0),
-            // black_color_format: RGB limited black is 0x40 of 10 bits, MSB
-            // aligned in both 16-bit colour fields.
-            (BLUE, u32::MAX, black),
-            (GREEN, u32::MAX, black),
-            (RED, u32::MAX, black),
+            (BLUE, u32::MAX, blue),
+            (GREEN, u32::MAX, green),
+            (RED, u32::MAX, red),
             // Equal black bars; clear range/resolution/field-polarity.
             (DPG, 0x01ff3171, 0x41 | self.depth.dpg() << 12),
         ]
@@ -122,6 +151,10 @@ impl<I: Io> Engine<I> {
             || timing.request.pipe != request.pipe
             || timing.request.timing.h_active > 0x3fff
             || timing.request.timing.v_active > 0x3fff
+            // 4:2:0 formatting on 4:2:0 timing only, and always YCbCr's
+            // own (limited) range.
+            || request.ycbcr420 != timing.request.ycbcr420
+            || request.ycbcr420 && request.limited
         {
             return Err(Error::Invalid);
         }

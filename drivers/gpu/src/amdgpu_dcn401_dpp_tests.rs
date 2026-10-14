@@ -162,6 +162,7 @@ fn ready_range(
             pipe: p,
             depth,
             limited,
+            ycbcr420: mode.timing.ycbcr420,
         },
         clock,
     ))

@@ -83,7 +83,11 @@ impl<I: Io> Engine<I> {
                     },
             ),
             (l.odm(p, MEMORY), 0xffff, 0),
-            (l.odm(p, FORMAT), 0x33, 0),
+            (
+                l.odm(p, FORMAT),
+                0x33,
+                if plan.request.ycbcr420 { 2 } else { 0 },
+            ),
             (l.vtg(p), 0xffff7fff, plan.vtg | u32::from(running) << 31),
             (l.opp(p, PIPE), 0x13, 3),
         ] {

@@ -61,6 +61,7 @@ fn owners(plan: &dml::Plan, pipe: u8) -> (Request, RequestorApplied, dccg::Appli
         timing: plan.mode.timing,
         sync: plan.sync,
         signal: Signal::DisplayPort,
+        ycbcr420: false,
     };
     let requestor = RequestorApplied {
         pipe,
@@ -202,6 +203,7 @@ fn dcn401_deadlines_bind_only_the_admitted_owners() -> TestResult {
             plan,
             Request {
                 signal: Signal::HpoDisplayPort,
+                ycbcr420: false,
                 ..timing
             },
             requestor,
