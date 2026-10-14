@@ -132,6 +132,52 @@ static int case_sigchld_worker_fork(void) {
     return 0;
 }
 
+// The same shape, repeated: the worker thread forks and exits at once, so its
+// child's exit races the worker's own exit-time reparenting of that child to
+// the surviving thread (Linux `forget_original_parent`, serialized with the
+// child's `do_notify_parent` by tasklist_lock). Every round the SIGCHLD must
+// reach the main thread and the zombie must be reapable from it.
+static int case_sigchld_worker_fork_stress(void) {
+    install(SIGCHLD);
+    alarm(120);
+    for (int round = 0; round < 200; round++) {
+        pthread_t t;
+        void *ret;
+        if (pthread_create(&t, NULL, fork_worker, NULL) != 0)
+            return fail("pthread_create");
+        pthread_join(t, &ret);
+        pid_t pid = (pid_t)(long)ret;
+        if (pid <= 0)
+            return fail("fork failed");
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (!await_handler(SIGCHLD, 2000)) {
+            // Tell a lost signal from a lost wake: was SIGCHLD left pending,
+            // is the zombie there to reap, and does the handler run late
+            // (the signal arrived but did not interrupt the parked poll)?
+            // And did the 2 s poll really wait 2 s?
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long waited = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+            sigset_t pend;
+            sigemptyset(&pend);
+            sigpending(&pend);
+            int late = await_handler(SIGCHLD, 3000);
+            int zombie = waitpid(pid, NULL, WNOHANG) == pid;
+            char buf[112];
+            snprintf(buf, sizeof buf,
+                     "round %d: no SIGCHLD in 2s (pending=%d late=%d zombie=%d waited=%ldms)",
+                     round, sigismember(&pend, SIGCHLD), late, zombie, waited);
+            return fail(buf);
+        }
+        if (waitpid(pid, NULL, 0) != pid) {
+            char buf[64];
+            snprintf(buf, sizeof buf, "round %d: waitpid errno %d", round, errno);
+            return fail(buf);
+        }
+    }
+    return 0;
+}
+
 static void *kill_worker(void *arg) {
     (void)arg;
     block_all();
@@ -617,6 +663,7 @@ int main(void) {
     failed |= run("group-stop", case_group_stop);
     failed |= run("siginfo-spinning", case_siginfo_spinning);
     failed |= run("sigchld-siginfo", case_sigchld_siginfo);
+    failed |= run("sigchld-worker-fork-stress", case_sigchld_worker_fork_stress);
     if (failed)
         return 1;
     w("procsig-thread-ok\n");
