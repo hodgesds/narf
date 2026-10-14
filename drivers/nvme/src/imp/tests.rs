@@ -133,6 +133,56 @@ fn smoke_nvme_admin_identify_controller() -> TestResult {
 }
 kernel_test_in!("drivers/nvme", smoke_nvme_admin_identify_controller);
 
+/// End-to-end admin passthrough: run Identify Controller through
+/// `Controller::admin_passthrough` (the path `/dev/nvme0`'s
+/// `NVME_IOCTL_ADMIN_CMD` handler drives) and confirm the controller
+/// DMAs the 4-KiB identify page into the caller's buffer with status 0.
+/// This proves the smartctl / nvme-cli datapath, not just the internal
+/// identify snapshot.
+fn smoke_nvme_admin_passthrough_identify() -> TestResult {
+    use super::{admin, Controller};
+    use narf_bus::x86_64::ECAM_DEFAULT_BASE;
+    use narf_bus::{bootstrap_registry_authority, claim_device_cap, devices, BusKind};
+    // SAFETY: ECAM is identity-mapped; bus::init is idempotent.
+    let _ = unsafe { narf_bus::init(ECAM_DEFAULT_BASE) };
+    let devs = devices();
+    let nvme_dev = devs.iter().find(|d| {
+        matches!(d.kind, BusKind::Pcie { .. }) && d.id.vendor == 0x1B36 && d.id.device == 0x0010
+    });
+    let Some(dev) = nvme_dev.copied() else {
+        return TestResult::Skip("no QEMU NVMe controller in this flavour");
+    };
+    let authority = bootstrap_registry_authority();
+    let (_handle, dev_cap) = match claim_device_cap(&authority, dev.addr) {
+        Ok(ok) => ok,
+        Err(_) => return TestResult::Fail("claim_device_cap failed for NVMe"),
+    };
+    let mut ctrl = Controller::from_device(dev);
+    if ctrl.bring_up(&dev_cap).is_err() {
+        return TestResult::Fail("Controller::bring_up failed");
+    }
+
+    // Identify Controller (opcode 0x06, CNS=1) — a 4-KiB controller→host
+    // transfer. Build it the way the char-device handler does: fields
+    // only; PRPs are programmed by admin_passthrough from its own buffer.
+    let cmd = admin::identify_controller(0, 0);
+    let mut buf = alloc::vec![0u8; 4096];
+    let outcome = match ctrl.admin_passthrough(&cmd, &mut buf) {
+        Ok(o) => o,
+        Err(_) => return TestResult::Fail("admin_passthrough returned a driver error"),
+    };
+    if outcome.status != 0 {
+        return TestResult::Fail("Identify passthrough completed with nonzero NVMe status");
+    }
+    // Model Number lives at offset 24 (40 bytes) of Identify Controller;
+    // QEMU reports "QEMU NVMe Ctrl".
+    if &buf[24..28] != b"QEMU" {
+        return TestResult::Fail("passthrough identify page MN does not start with 'QEMU'");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/nvme", smoke_nvme_admin_passthrough_identify);
+
 fn smoke_nvme_io_round_trip() -> TestResult {
     // End-to-end NVMe I/O: bring up, create one I/O queue pair,
     // write a 512-byte pattern at LBA 0, read it back, compare.

@@ -211,6 +211,19 @@ pub(super) const ENTRIES: &[Entry] = &[
         visible: || FB0_NODE.lock().is_some(),
     },
     Entry {
+        name: "nvme0",
+        file_type: FileType::Special,
+        file: || {
+            if NVME0_NODE.lock().is_some() {
+                Some(Arc::new(DevNvme0Proxy))
+            } else {
+                None
+            }
+        },
+        directory: || None,
+        visible: || NVME0_NODE.lock().is_some(),
+    },
+    Entry {
         name: "tpm0",
         file_type: FileType::Special,
         file: || {

@@ -41,7 +41,7 @@ use alloc::vec::Vec;
 use narf_block::{registry::BlockDeviceSync, BlockError};
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::{FileOps, FileType, FsError, FsFuture, Mode, Stat};
+use crate::{FileOps, FileType, FsError, FsFuture, IoctlContext, Mode, Stat};
 
 // ── persistent owner/mode overlay ─────────────────────────────────────
 //
@@ -171,6 +171,61 @@ impl BlockFile {
     #[inline]
     fn byte_capacity(&self) -> u64 {
         self.lba_count.saturating_mul(self.block_size as u64)
+    }
+
+    /// Handle the standard block-device size/geometry ioctls that
+    /// util-linux (`blockdev`), smartctl, and friends expect. These are
+    /// the `_IO(0x12, …)` "BLK*" commands; several are historically
+    /// encoded with no `_IOC` size, so the generic ioctl relay can't copy
+    /// their result — we write it through the fault-contained context.
+    ///
+    /// Linux ref: `block/ioctl.c::blkdev_common_ioctl`.
+    fn blk_ioctl(&self, cmd: u32, arg: u64, ctx: &dyn IoctlContext) -> Result<u64, FsError> {
+        // Command numbers from `include/uapi/linux/fs.h`.
+        const BLKGETSIZE: u32 = 0x1260; // _IO(0x12,96)  -> long, 512-byte sectors
+        const BLKFLSBUF: u32 = 0x1261; // _IO(0x12,97)  -> flush, no arg
+        const BLKSSZGET: u32 = 0x1268; // _IO(0x12,104) -> int, logical sector size
+        const BLKBSZGET: u32 = 0x8008_1270; // _IOR(0x12,112,size_t) -> u64 soft block size
+        const BLKGETSIZE64: u32 = 0x8008_1272; // _IOR(0x12,114,size_t) -> u64 byte capacity
+        const BLKPBSZGET: u32 = 0x127B; // _IO(0x12,123) -> int, physical block size
+
+        let capacity = self.byte_capacity();
+        match cmd {
+            BLKGETSIZE64 => {
+                ctx.write(arg, &capacity.to_le_bytes())?;
+                Ok(0)
+            }
+            BLKGETSIZE => {
+                // Size in 512-byte sectors, written as a C `long` (8 bytes
+                // on this 64-bit target).
+                let sectors: u64 = capacity / 512;
+                ctx.write(arg, &sectors.to_le_bytes())?;
+                Ok(0)
+            }
+            BLKSSZGET => {
+                // Logical sector size, written as a C `int` (4 bytes).
+                ctx.write(arg, &self.block_size.to_le_bytes())?;
+                Ok(0)
+            }
+            BLKPBSZGET => {
+                // Physical block size. We don't track a separate physical
+                // size, so report the logical size (correct for 512n/4Kn;
+                // conservative for 512e).
+                ctx.write(arg, &self.block_size.to_le_bytes())?;
+                Ok(0)
+            }
+            BLKBSZGET => {
+                // Soft block size (size_t). Default to the logical size.
+                ctx.write(arg, &(self.block_size as u64).to_le_bytes())?;
+                Ok(0)
+            }
+            BLKFLSBUF => {
+                // No buffer cache below us to flush; the write path is
+                // synchronous straight to the driver. Succeed as a no-op.
+                Ok(0)
+            }
+            _ => Err(FsError::Unsupported),
+        }
     }
 
     /// Map `BlockIoError` → `FsError`.
@@ -370,6 +425,16 @@ impl FileOps for BlockFile {
         // the VFS perspective; the underlying driver may block
         // internally but that happens inside read_sync/write_sync.
         crate::POLL_IN | crate::POLL_OUT
+    }
+
+    fn ioctl_user<'a>(
+        &'a self,
+        cmd: u32,
+        arg: u64,
+        context: &'a dyn IoctlContext,
+    ) -> FsFuture<'a, u64> {
+        let result = self.blk_ioctl(cmd, arg, context);
+        Box::pin(async move { result })
     }
 }
 
@@ -764,3 +829,106 @@ impl DevDiskByPartUuid {
         })
     }
 }
+
+// ── Block-device ioctl smokes ─────────────────────────────────────────
+
+use narf_kernel_test::{kernel_test_in, TestResult};
+
+/// Poll a ready future once with a no-op waker (block ioctls resolve
+/// synchronously).
+fn poll_ready<F: core::future::Future>(fut: F) -> Option<F::Output> {
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    static VTABLE: RawWakerVTable =
+        RawWakerVTable::new(|d| RawWaker::new(d, &VTABLE), |_| {}, |_| {}, |_| {});
+    let raw = RawWaker::new(core::ptr::null(), &VTABLE);
+    // SAFETY: VTABLE is a valid no-op vtable; the waker never escapes this frame.
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    let mut pinned = core::pin::pin!(fut);
+    match pinned.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => Some(v),
+        Poll::Pending => None,
+    }
+}
+
+/// 1 MiB mock disk: 2048 LBAs × 512 bytes. I/O is a no-op — the ioctls
+/// only read geometry (`lba_size` / `capacity`).
+struct MockBlk;
+impl BlockDeviceSync for MockBlk {
+    fn lba_size(&self) -> u32 {
+        512
+    }
+    fn capacity(&self) -> u64 {
+        2048
+    }
+    fn read(&self, _lba: u64, _n: u16, _out: &mut [u8]) -> Result<(), narf_block::registry::BlockIoError> {
+        Ok(())
+    }
+    fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), narf_block::registry::BlockIoError> {
+        Ok(())
+    }
+}
+
+/// Captures the bytes a device ioctl writes back to "user" memory.
+struct CaptureCtx {
+    buf: IrqSafeSpinLock<Vec<u8>>,
+}
+impl IoctlContext for CaptureCtx {
+    fn read(&self, _address: u64, destination: &mut [u8]) -> Result<(), FsError> {
+        destination.fill(0);
+        Ok(())
+    }
+    fn write(&self, _address: u64, source: &[u8]) -> Result<(), FsError> {
+        *self.buf.lock() = source.to_vec();
+        Ok(())
+    }
+    fn nonblocking(&self) -> bool {
+        false
+    }
+}
+
+fn smoke_block_ioctl_sizes() -> TestResult {
+    const BLKGETSIZE: u32 = 0x1260;
+    const BLKSSZGET: u32 = 0x1268;
+    const BLKGETSIZE64: u32 = 0x8008_1272;
+
+    let file = BlockFile::from_dev(Arc::new(MockBlk));
+
+    // BLKGETSIZE64 → byte capacity (u64) = 2048 * 512 = 1 MiB.
+    let ctx = CaptureCtx { buf: IrqSafeSpinLock::new(Vec::new()) };
+    match poll_ready(file.ioctl_user(BLKGETSIZE64, 0x1000, &ctx)) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("BLKGETSIZE64 did not succeed"),
+    }
+    let g = ctx.buf.lock();
+    if g.len() != 8 || u64::from_le_bytes(g[..8].try_into().unwrap()) != 1_048_576 {
+        return TestResult::Fail("BLKGETSIZE64 returned wrong byte capacity");
+    }
+    drop(g);
+
+    // BLKSSZGET → logical sector size (int) = 512.
+    let ctx = CaptureCtx { buf: IrqSafeSpinLock::new(Vec::new()) };
+    match poll_ready(file.ioctl_user(BLKSSZGET, 0x1000, &ctx)) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("BLKSSZGET did not succeed"),
+    }
+    let g = ctx.buf.lock();
+    if g.len() != 4 || u32::from_le_bytes(g[..4].try_into().unwrap()) != 512 {
+        return TestResult::Fail("BLKSSZGET returned wrong sector size");
+    }
+    drop(g);
+
+    // BLKGETSIZE → 512-byte sector count (long) = 2048.
+    let ctx = CaptureCtx { buf: IrqSafeSpinLock::new(Vec::new()) };
+    match poll_ready(file.ioctl_user(BLKGETSIZE, 0x1000, &ctx)) {
+        Some(Ok(0)) => {}
+        _ => return TestResult::Fail("BLKGETSIZE did not succeed"),
+    }
+    let g = ctx.buf.lock();
+    if g.len() != 8 || u64::from_le_bytes(g[..8].try_into().unwrap()) != 2048 {
+        return TestResult::Fail("BLKGETSIZE returned wrong sector count");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_block_ioctl_sizes);
