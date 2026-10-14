@@ -363,7 +363,12 @@ fn navi48_modeset_derives_hdmi_avi_like_linux() -> TestResult {
     let vga = t(25_175, [640, 656, 752, 800], [480, 490, 492, 525], false);
     let caps = |blocks: &[&[u8]]| hdmi_caps(&with_blocks(edid_1080p(), blocks));
     let plain = caps(&[VSDB]);
-    let avi = |vic, aspect, qs| otg::Avi { vic, aspect, qs };
+    let avi = |vic, aspect, qs| otg::Avi {
+        vic,
+        aspect,
+        qs,
+        hdmi_vic: 0,
+    };
     if hdmi_avi(plain, &p1080(148_500)) != avi(16, 2, false)
         || hdmi_avi(plain, &p1080(148_352)) != avi(16, 2, false)
         || hdmi_avi(plain, &p1080(148_000)) != avi(0, 0, false)
@@ -374,8 +379,14 @@ fn navi48_modeset_derives_hdmi_avi_like_linux() -> TestResult {
     {
         return TestResult::Fail("CTA VIC match");
     }
-    // HDMI 1.4b VIC 1 on an HDMI sink: no AVI VIC, its 16:9 aspect kept.
-    if hdmi_avi(plain, &uhd30) != avi(0, 2, false) {
+    // HDMI 1.4b VIC 1 on an HDMI sink: no AVI VIC, its 16:9 aspect kept,
+    // and the HDMI VIC for the vendor InfoFrame.
+    if hdmi_avi(plain, &uhd30)
+        != (otg::Avi {
+            hdmi_vic: 1,
+            ..avi(0, 2, false)
+        })
+    {
         return TestResult::Fail("HDMI VIC in AVI");
     }
     // VIC 95 without a VSDB: dropped for an HDMI 1.4 sink unless listed.

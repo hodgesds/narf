@@ -397,8 +397,9 @@ fn svd_vic(svd: u8) -> u8 {
 /// The AVI InfoFrame fields of `t` on this sink, as
 /// drm_hdmi_avi_infoframe_from_display_mode and amdgpu's set_avi_info_frame
 /// derive them: the CTA VIC (none for an HDMI 1.4b 4K mode on an HDMI sink,
-/// whose VIC belongs in the vendor InfoFrame, which narf does not send; and
-/// none above 64 for an HDMI 1.4 sink that does not list it), the VIC's
+/// whose HDMI VIC goes in the vendor InfoFrame, as drm_mode_hdmi_vic
+/// gives it; and none above 64 for an HDMI 1.4 sink that does not list
+/// it), the VIC's
 /// picture aspect when 4:3 or 16:9, and whether the sink can select the
 /// range. The aspect of a mode is taken from its VIC alone: narf modes carry
 /// none of their own.
@@ -441,6 +442,7 @@ pub fn hdmi_avi(caps: HdmiCaps, t: &Timing) -> otg::Avi {
         },
         aspect: if aspect <= 2 { aspect } else { 0 },
         qs: caps.qs,
+        hdmi_vic,
     }
 }
 

@@ -196,8 +196,19 @@ fn fixture_with(
     depth: ColorDepth,
     divider: dccg::TmdsDivider,
 ) -> (Engine<TmdsIo>, Firmware, dccg::Applied) {
-    let mut e = engine();
     let (req, c) = tmds_clock(pipe, khz, divider);
+    fixture_req(p, stream, pipe, req, c, depth)
+}
+/// The fixture on a given timing request and its TMDS clock.
+fn fixture_req(
+    p: u8,
+    stream: u8,
+    pipe: u8,
+    req: Request,
+    c: dccg::Applied,
+    depth: ColorDepth,
+) -> (Engine<TmdsIo>, Firmware, dccg::Applied) {
+    let mut e = engine();
     run(e.prepare(req, c)).unwrap();
     run(e.prepare_blank(
         BlankRequest {
@@ -530,6 +541,7 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
         vic: 16,
         aspect: 2,
         qs: true,
+        hdmi_vic: 0,
     };
     let p = crate::amdgpu_dcn401_otg::hdmi_link::avi_infoframe(&t, avi, false);
     let sum = |p: &[u8; 36]| {
@@ -574,6 +586,95 @@ fn dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_hdmi_avi_infoframe_matches_linux_fields_and_checksum
+);
+
+/// A 4K mode with an HDMI 1.4b VIC sends the HDMI vendor InfoFrame
+/// (mod_build_hf_vsif_infopacket) in generic packet 1 beside the AVI in 0,
+/// every frame on line 2; without an HDMI VIC none is sent, and stopping
+/// the video stops both.
+fn dcn401_hdmi_vendor_infoframe_carries_the_hdmi_vic() -> TestResult {
+    use crate::amdgpu_dcn401_otg::{hdmi_link::vendor_infoframe, Avi};
+    let mut uhd = request(1).timing;
+    (uhd.pixel_clock_khz, uhd.h_active, uhd.h_total) = (297_000, 3840, 4400);
+    (uhd.h_front_porch, uhd.h_sync_width) = (176, 88);
+    (
+        uhd.v_active,
+        uhd.v_total,
+        uhd.v_front_porch,
+        uhd.v_sync_width,
+    ) = (2160, 2250, 8, 10);
+    let avi = Avi {
+        aspect: 2,
+        hdmi_vic: 1,
+        ..Default::default()
+    };
+    // HB0-2, checksum, IEEE OUI 00-0C-03 (LSB first), HDMI_Video_Format 1.
+    let Some(p) = vendor_infoframe(&uhd, avi) else {
+        return TestResult::Fail("no vendor InfoFrame for an HDMI VIC");
+    };
+    if p[..10] != [0x81, 1, 5, 0, 0x49, 0x03, 0x0c, 0x00, 0x20, 1]
+        || p[10..].iter().any(|b| *b != 0)
+    {
+        return TestResult::Fail("vendor InfoFrame bytes");
+    }
+    if vendor_infoframe(&uhd, Avi::default()).is_some()
+        || vendor_infoframe(&request(1).timing, avi).is_some()
+    {
+        return TestResult::Fail("vendor InfoFrame without a 4K HDMI VIC");
+    }
+    // On the link: packet 1 at data index 9, latched, sent on line 2.
+    let mut req = request(1);
+    req.signal = Signal::Tmds;
+    req.timing = uhd;
+    let mut c = clock(req);
+    c.request.pixel = dccg::PixelClock::Tmds {
+        divider: dccg::TmdsDivider::By4,
+    };
+    let (mut e, mut fw, c) = fixture_req(1, 1, 1, req, c, ColorDepth::Bpc8);
+    let mut request = link(1, 1);
+    request.avi = avi;
+    if run(e.prepare_hdmi_link(&mut fw, path(1), request, c)).is_err() {
+        return TestResult::Fail("4K HDMI link");
+    }
+    let writes = &e.io.inner.writes;
+    let index = writes
+        .iter()
+        .filter(|w| w.0 == dio(1, 0x2068))
+        .map(|w| w.1 & 0xff)
+        .collect::<Vec<_>>();
+    let latched = writes
+        .iter()
+        .filter(|w| w.0 == dio(1, 0x206b))
+        .fold(0, |acc, w| acc | w.1);
+    let vendor_words: Vec<u32> = {
+        let at = writes.iter().rposition(|w| w.0 == dio(1, 0x2068)).unwrap();
+        writes[at..]
+            .iter()
+            .filter(|w| w.0 == dio(1, 0x2069))
+            .map(|w| w.1)
+            .take(3)
+            .collect()
+    };
+    let regs = &e.io.inner.regs;
+    if index != [0, 9]
+        || latched & 3 != 3
+        || vendor_words != [0x0005_0181, 0x000c_0349, 0x0000_0120]
+        || regs[&dio(1, 0x20a5)] & 0x33 != 0x33
+        || regs[&dio(1, 0x20a9)] != 0x0002_0002
+    {
+        return TestResult::Fail("vendor packet on the link");
+    }
+    // A link without an HDMI VIC writes only the AVI.
+    let (mut e, mut fw, c) = fixture(1, 1, 1);
+    run(e.prepare_hdmi_link(&mut fw, path(1), link(1, 1), c)).unwrap();
+    if e.io.inner.regs[&dio(1, 0x20a5)] & 0x30 != 0 || e.io.inner.regs[&dio(1, 0x20a9)] >> 16 != 0 {
+        return TestResult::Fail("vendor packet without an HDMI VIC");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_hdmi_vendor_infoframe_carries_the_hdmi_vic
 );
 
 fn dcn401_hdmi_link_scrambles_above_340_mhz_and_stops_unscrambled() -> TestResult {

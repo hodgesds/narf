@@ -58,6 +58,9 @@ pub struct Avi {
     /// range is then signalled (Q full or limited) rather than left to the
     /// format's default.
     pub qs: bool,
+    /// HDMI 1.4b VIC (1-4: the 4K modes with no CTA VIC on an HDMI sink),
+    /// carried by the HDMI vendor-specific InfoFrame; 0 sends none.
+    pub hdmi_vic: u8,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HdmiLinkReady {
@@ -103,7 +106,7 @@ impl HdmiLinkReady {
             (fe(0x20a2), 0x1031),     // GC/NULL send, ACP off
             (fe(0x20a8), 1),          // GC AVMUTE
             (fe(0x20a5), u32::MAX),   // generic packets 0..7: only AVI (0)
-            (fe(0x20a9), 0xffff),     // generic packet 0 line
+            (fe(0x20a9), u32::MAX),   // generic packets 0 (AVI) and 1 (vendor) line
             (fe(0x20b1), 0x1000),     // HDMI_DB_DISABLE
         ]
     }
@@ -160,6 +163,29 @@ fn phy_at(l: Layout, phy: u8, reg: u64) -> u64 {
 fn lanes_active(value: u32) -> bool {
     (0..4).all(|lane| (value >> (8 * lane)) & 0x37 == 4)
 }
+/// The HDMI vendor-specific InfoFrame mod_build_hf_vsif_infopacket builds
+/// for a 4K timing with an HDMI VIC (no 3D, no ALLM): the HDMI Licensing
+/// OUI, HDMI_Video_Format 1 (extended resolution) and the VIC. None without
+/// an HDMI VIC: Linux then sends no vendor packet. HB0..HB3 then SB0..SB27,
+/// as for `avi_infoframe`.
+pub(in crate::amdgpu_dcn401_otg) fn vendor_infoframe(
+    t: &crate::amdgpu_dml::Timing,
+    avi: Avi,
+) -> Option<[u8; 36]> {
+    if avi.hdmi_vic == 0 || t.h_total < 3840 || t.v_total < 2160 {
+        return None;
+    }
+    let mut p = [0u8; 36];
+    p[..3].copy_from_slice(&[0x81, 1, 5]);
+    p[5..10].copy_from_slice(&[0x03, 0x0c, 0x00, 1 << 5, avi.hdmi_vic]);
+    let sum = p[..3]
+        .iter()
+        .chain(&p[5..10])
+        .fold(0u8, |s, b| s.wrapping_add(*b));
+    p[4] = 0u8.wrapping_sub(sum);
+    Some(p)
+}
+
 /// The AVI InfoFrame Linux's set_avi_info_frame builds for this stream: RGB
 /// (sRGB, so C no data), active format valid with both bars, underscan,
 /// uniform scaling, IT content, and `avi`'s VIC and picture aspect. Q names
@@ -384,9 +410,10 @@ impl<I: Io> Engine<I> {
         plan.controls[9] |= 1;
         Ok(())
     }
-    /// enc3_update_hdmi_info_packet(0, AVI): DB disable, VPG power-on if
-    /// gated, conflict clear, nine data words, immediate update, then send
-    /// every frame on line 2. No AFMT audio clock: this owner has no audio.
+    /// enc3_update_hdmi_info_packet(0, AVI), then (1, vendor) when the
+    /// timing has an HDMI VIC: DB disable, VPG power-on if gated, then per
+    /// packet a conflict clear, nine data words at its index, an immediate
+    /// update, and sending every frame on line 2. No AFMT audio clock.
     async fn hdmi_avi(&mut self, plan: &mut HdmiLinkReady) -> Result<(), Error> {
         let l = self.layout;
         let stream = plan.request.stream;
@@ -397,31 +424,36 @@ impl<I: Io> Engine<I> {
             self.update(vpg(0x206d), 0x11, 1)?;
             self.wait(vpg(0x206d), 0x100, 0, 1000).await?;
         }
-        self.wait(vpg(0x206c), 2, 0, 500).await?;
-        let packet = avi_infoframe(
-            &plan.blank.timing.request.timing,
-            plan.request.avi,
-            plan.blank.request.limited,
-        );
-        self.access(|io| {
-            // CONFLICT_CLR and the data port are commands, not stored state.
-            let status = checked(io.read(vpg(0x206c)))?;
-            io.write(vpg(0x206c), status | 0x10);
-            let access = checked(io.read(vpg(0x2068)))?;
-            io.write(vpg(0x2068), access & !0xff);
-            for word in packet.chunks_exact(4) {
-                io.write(
-                    vpg(0x2069),
-                    u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
-                );
-            }
-            // Self-clearing: latch the double-buffered packet immediately.
-            let immediate = checked(io.read(vpg(0x206b)))?;
-            io.write(vpg(0x206b), immediate | 1);
-            Ok(())
-        })?;
-        self.hdmi_update(plan, 14, 3, 3)?;
-        self.hdmi_update(plan, 15, 0xffff, 2)
+        let timing = plan.blank.timing.request.timing;
+        let avi = avi_infoframe(&timing, plan.request.avi, plan.blank.request.limited);
+        let vendor = vendor_infoframe(&timing, plan.request.avi);
+        for (index, packet) in [(0u32, Some(avi)), (1, vendor)] {
+            let Some(packet) = packet else {
+                continue;
+            };
+            self.wait(vpg(0x206c), 2, 0, 500).await?;
+            self.access(|io| {
+                // CONFLICT_CLR and the data port are commands, not state.
+                let status = checked(io.read(vpg(0x206c)))?;
+                io.write(vpg(0x206c), status | 0x10);
+                let access = checked(io.read(vpg(0x2068)))?;
+                io.write(vpg(0x2068), (access & !0xff) | (index * 9));
+                for word in packet.chunks_exact(4) {
+                    io.write(
+                        vpg(0x2069),
+                        u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                    );
+                }
+                // Self-clearing: latch the double-buffered packet now.
+                let immediate = checked(io.read(vpg(0x206b)))?;
+                io.write(vpg(0x206b), immediate | 1 << index);
+                Ok(())
+            })?;
+            // GENERICn_SEND and _CONT, then its line (2).
+            self.hdmi_update(plan, 14, 3 << (4 * index), 3 << (4 * index))?;
+            self.hdmi_update(plan, 15, 0xffff << (16 * index), 2 << (16 * index))?;
+        }
+        Ok(())
     }
     fn hdmi_link_plan(
         &mut self,
@@ -671,9 +703,9 @@ impl<I: Io> Engine<I> {
         self.wait(fe_clock, 0x2c10, 0, 1000).await?;
         self.hdmi_update(plan, 9, 0x300, 0)?;
         self.hdmi_route(plan, false)?;
-        // enc3_stream_encoder_stop_hdmi_info_packets for the AVI packet.
-        self.hdmi_update(plan, 14, 3, 0)?;
-        self.hdmi_update(plan, 15, 0xffff, 0)?;
+        // enc3_stream_encoder_stop_hdmi_info_packets: AVI and vendor.
+        self.hdmi_update(plan, 14, 0x33, 0)?;
+        self.hdmi_update(plan, 15, u32::MAX, 0)?;
         self.hdmi_update(plan, 11, 0x0100001f, 0x11)?;
         self.hdmi_link_verify(*plan, false)
     }
