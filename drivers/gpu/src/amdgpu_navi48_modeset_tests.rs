@@ -1003,3 +1003,99 @@ fn edid_uhbr() -> Vec<u8> {
     const AUDIO: &[u8] = &[1 << 5 | 3, 0x09, 0x07, 0x07];
     with_blocks(e, &[AUDIO])
 }
+
+/// HDMI FRL as amdgpu decides it: off unless enabled (dcfeaturemask
+/// 0x400); the sink's HF Max_FRL_Rate bounded by DCN401's forced 4 x 12G
+/// and requiring SCDC; get_audio_check's packet type and layout; the
+/// lowest rate code carrying the mode by Linux's capacity check, if the
+/// cap carries it at all.
+fn navi48_modeset_decides_frl_like_linux() -> TestResult {
+    // HF-VSDB: version 1, 600 MHz, SCDC_Present, Max_FRL_Rate 6 (4 x 12G).
+    const HF_FRL: &[u8] = &[3 << 5 | 7, 0xd8, 0x5d, 0xc4, 1, 120, 0x80, 0x60];
+    let caps = hdmi_caps(&with_blocks(edid_1080p(), &[VSDB, HF_FRL]));
+    if caps.max_frl_rate != 6 || !caps.scdc {
+        return TestResult::Fail("Max_FRL_Rate");
+    }
+    set_frl(false);
+    if frl_cap(caps).is_some() {
+        return TestResult::Fail("FRL used while disabled");
+    }
+    set_frl(true);
+    let cap = frl_cap(caps);
+    let three = frl_cap(HdmiCaps {
+        max_frl_rate: 2,
+        ..caps
+    });
+    let no_scdc = frl_cap(HdmiCaps {
+        scdc: false,
+        ..caps
+    });
+    set_frl(false);
+    if cap.map(|r| (r.code(), r.lanes(), r.gbps())) != Some((6, 4, 12))
+        || three.map(|r| (r.lanes(), r.character_khz())) != Some((3, 333_333))
+        || no_scdc.is_some()
+    {
+        return TestResult::Fail("FRL cap");
+    }
+    let mut info = otg::AudioInfo {
+        manufacturer_id: 0,
+        product_id: 0,
+        name: [0; 18],
+        speakers: 5,
+        modes: [otg::AudioMode::default(); 16],
+        mode_count: 2,
+        video_latency: 0,
+        audio_latency: 0,
+    };
+    info.modes[0] = otg::AudioMode {
+        format: 1,
+        channels: 2,
+        rates: 0x07,
+        byte2: 7,
+    };
+    info.modes[1] = otg::AudioMode {
+        format: 1,
+        channels: 8,
+        rates: 0x7f,
+        byte2: 7,
+    };
+    let a = |i: Option<otg::AudioInfo>, v| {
+        let a = frl_audio(i, v);
+        (a.packet_type, a.max_rate_hz, a.layout)
+    };
+    if a(None, 2160) != (2, 0, 0)
+        || a(Some(info), 2160) != (2, 192_000, 1)
+        || a(Some(info), 480) != (2, 192_000, 0)
+    {
+        return TestResult::Fail("FRL audio check");
+    }
+    let t = |khz: u32, w: u32, total: u32| Timing {
+        pixel_clock_khz: khz,
+        h_active: w,
+        h_total: total,
+        h_front_porch: 176,
+        h_sync_width: 88,
+        v_active: 2160,
+        v_total: 2250,
+        v_front_porch: 8,
+        v_sync_width: 10,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    let quiet = frl_audio(None, 2160);
+    let cap = FrlRate::new(6).unwrap();
+    let uhd120 = t(1_188_000, 3840, 4400);
+    let uhd8k = t(2_376_000, 7680, 9000);
+    if frl_link(&uhd120, 8, cap, quiet).map(FrlRate::code) != Some(4)
+        || frl_link(&uhd120, 10, cap, quiet).map(FrlRate::code) != Some(5)
+        || frl_link(&uhd8k, 8, cap, quiet).is_some()
+        || frl_link(&uhd120, 8, FrlRate::new(3).unwrap(), quiet).is_some()
+    {
+        return TestResult::Fail("FRL rate decision");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/navi48-modeset",
+    navi48_modeset_decides_frl_like_linux
+);

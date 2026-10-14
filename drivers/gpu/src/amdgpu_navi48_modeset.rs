@@ -132,6 +132,122 @@ pub fn sink_audio_info(edid: &[u8]) -> Option<otg::AudioInfo> {
     (info.mode_count > 0).then_some(info)
 }
 
+/// HDMI FRL, off by default as amdgpu keeps it (dcfeaturemask's
+/// DC_FRL_MASK, 0x400): only then does a sink's Max_FRL_Rate count.
+static FRL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Allow HDMI FRL (`amdgpu.dcfeaturemask` bit 0x400).
+pub fn set_frl(enabled: bool) {
+    FRL.store(enabled, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn frl_enabled() -> bool {
+    FRL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// An HDMI FRL link: Linux's hdmi_frl_link_rate, the SCDC FRL_Rate code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FrlRate(u8);
+impl FrlRate {
+    /// The code, 1 (3 lanes x 3G) to 6 (4 lanes x 12G).
+    pub fn new(code: u8) -> Option<Self> {
+        (1..=6).contains(&code).then_some(Self(code))
+    }
+    pub fn code(self) -> u8 {
+        self.0
+    }
+    /// Three lanes below 4 x 6G.
+    pub fn lanes(self) -> u8 {
+        if self.0 < 3 {
+            3
+        } else {
+            4
+        }
+    }
+    pub fn gbps(self) -> u8 {
+        [3, 6, 6, 8, 10, 12][usize::from(self.0 - 1)]
+    }
+    /// The FRL character clock per lane, kHz (Gbps / 18 bits x 1e6).
+    pub fn character_khz(self) -> u32 {
+        [166_667, 333_333, 333_333, 444_444, 555_555, 666_667][usize::from(self.0 - 1)]
+    }
+    /// frl_link_bandwidth_kbps: lanes x the raw rate.
+    pub fn kbps(self) -> u64 {
+        u64::from(self.lanes()) * u64::from(self.gbps()) * 1_000_000
+    }
+}
+
+/// hdmi_frl_retrieve_link_cap on DCN401: the encoder's 4 x 12G (forced on
+/// while the VBIOS cannot say) bounded by the sink's Max_FRL_Rate; none
+/// with FRL disabled or no SCDC.
+pub fn frl_cap(caps: HdmiCaps) -> Option<FrlRate> {
+    if !frl_enabled() || !caps.scdc {
+        return None;
+    }
+    FrlRate::new(caps.max_frl_rate.min(6))
+}
+
+/// get_audio_check of the sink's audio modes with the timing's layout
+/// (hpo_enc3_validate_hdmi_frl_output): audio sample packets, or 3D/HBR
+/// packets above 192 kHz; layout 1 for more than two channels above 576
+/// lines. A sink without audio still reserves ACR bandwidth.
+pub fn frl_audio(audio: Option<otg::AudioInfo>, v_active: u32) -> crate::amdgpu_frl_cap::FrlAudio {
+    const RATES: [u32; 7] = [32_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+    let (mut rate, mut channels) = (0, 0);
+    if let Some(info) = audio {
+        for m in &info.modes[..usize::from(info.mode_count.min(16))] {
+            let best = (0..7).rev().find(|&i| m.rates & 1 << i != 0);
+            rate = rate.max(best.map_or(0, |i| RATES[i]));
+            channels = channels.max(m.channels);
+        }
+    }
+    crate::amdgpu_frl_cap::FrlAudio {
+        packet_type: if rate > 192_000 { 9 } else { 2 },
+        max_rate_hz: rate,
+        layout: u8::from(channels > 2 && v_active > 576),
+    }
+}
+
+/// frl_validate_mode_timing for RGB at `bpc`: the stream within the raw
+/// link rate, and Linux's capacity check passing.
+pub fn frl_carries(
+    t: &Timing,
+    bpc: u8,
+    rate: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+) -> Option<crate::amdgpu_frl_cap::FrlCap> {
+    use crate::amdgpu_frl_cap::{frl_cap_check, FrlCap, FrlCapInput, FrlEncoding};
+    if u64::from(t.pixel_clock_khz) * u64::from(bpc) * 3 > rate.kbps() {
+        return None;
+    }
+    let check = frl_cap_check(&FrlCapInput {
+        lanes: rate.lanes(),
+        gbps: rate.gbps(),
+        pixel_clock_100hz: t.pixel_clock_khz * 10,
+        h_active: t.h_active,
+        h_blank: t.h_total - t.h_active,
+        bpc,
+        encoding: FrlEncoding::Rgb444,
+        audio,
+    });
+    matches!(check, FrlCap::Ok { .. }).then_some(check)
+}
+
+/// hdmi_frl_decide_link_settings: the lowest rate code from 3 x 3G up
+/// that carries the mode, provided the sink's cap does (Linux validates the
+/// mode at the cap, then searches upward).
+pub fn frl_link(
+    t: &Timing,
+    bpc: u8,
+    cap: FrlRate,
+    audio: crate::amdgpu_frl_cap::FrlAudio,
+) -> Option<FrlRate> {
+    frl_carries(t, bpc, cap, audio)?;
+    (1..=cap.code())
+        .filter_map(FrlRate::new)
+        .find(|&r| frl_carries(t, bpc, r, audio).is_some())
+}
+
 /// Highest output depth modesets may pick, like DRM's max_requested_bpc,
 /// which amdgpu_dm initialises to 8. Raised by `amdgpu.max_bpc`.
 static MAX_BPC: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(8);
@@ -506,6 +622,9 @@ pub struct HdmiCaps {
     /// VSDB DC_30bit / DC_36bit: RGB 4:4:4 at 10 / 12 bpc.
     pub dc30: bool,
     pub dc36: bool,
+    /// HF Max_FRL_Rate (drm_get_max_frl_rate's code: 1 = 3 x 3G ... 6 =
+    /// 4 x 12G), zero for none or an unknown code.
+    pub max_frl_rate: u8,
 }
 pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
     use narf_edid::cta861::{CtaExtension, DataBlock};
@@ -595,6 +714,9 @@ pub fn hdmi_caps(edid: &[u8]) -> HdmiCaps {
             if let Some(&[_version, rate, flags, ..]) = forum {
                 caps.forum_max_khz = u32::from(rate) * 5000;
                 caps.scdc = flags & 0x80 != 0;
+            }
+            if let Some(&frl) = forum.and_then(|f| f.get(3)) {
+                caps.max_frl_rate = Some(frl >> 4).filter(|r| (1..=6).contains(r)).unwrap_or(0);
             }
         }
     }

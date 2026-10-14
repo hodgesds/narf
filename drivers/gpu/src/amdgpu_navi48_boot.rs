@@ -2265,8 +2265,9 @@ impl ColdBoot {
 #[path = "amdgpu_navi48_modeset.rs"]
 mod modeset;
 pub use modeset::{
-    broadcast_rgb, limited_range, max_bpc, set_broadcast_rgb, set_max_bpc, Configuration, Health,
-    InheritedRetired, Modeset, ModesetError, Selection, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL,
+    broadcast_rgb, frl_audio, frl_cap, frl_carries, frl_enabled, frl_link, limited_range, max_bpc,
+    set_broadcast_rgb, set_frl, set_max_bpc, Configuration, FrlRate, Health, InheritedRetired,
+    Modeset, ModesetError, Selection, BROADCAST_RGB_AUTO, BROADCAST_RGB_FULL,
     BROADCAST_RGB_LIMITED,
 };
 #[cfg(feature = "kernel-test")]
