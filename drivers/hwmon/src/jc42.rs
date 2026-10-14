@@ -102,11 +102,7 @@ pub fn temp_from_reg(reg: u16) -> i32 {
     // Mask off the three alarm/flag bits, keep the 13-bit magnitude+sign.
     let raw = (reg & 0x1fff) as i32;
     // Sign-extend bit 12 (the 13-bit two's-complement sign bit).
-    let signed = if raw & 0x1000 != 0 {
-        raw - 0x2000
-    } else {
-        raw
-    };
+    let signed = if raw & 0x1000 != 0 { raw - 0x2000 } else { raw };
     // 0.0625 °C per LSB → millidegrees: value * 62.5 == value * 125 / 2.
     signed * 125 / 2
 }
@@ -119,8 +115,7 @@ pub fn temp_from_reg(reg: u16) -> i32 {
 /// Returns `None` if the SMBus controller is unavailable or the transfer
 /// fails.
 fn read_reg(addr: u8, reg: u8) -> Option<u16> {
-    let r: Result<u16, SmbusError> =
-        smbus::with_controller(|c| c.read_word_data(addr, reg))?;
+    let r: Result<u16, SmbusError> = smbus::with_controller(|c| c.read_word_data(addr, reg))?;
     // Platform returns the word little-endian-assembled; JC42 is
     // big-endian on the wire, so swap to get the true register value.
     r.ok().map(|v| v.swap_bytes())

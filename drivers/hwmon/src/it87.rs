@@ -326,7 +326,11 @@ pub fn discover_ec_base(index_port: u16, data_port: u16) -> Option<u16> {
         }
         (((hi as u16) << 8) | (lo as u16)) & !(IT87_EXTENT - 1)
     };
-    if base == 0 { None } else { Some(base) }
+    if base == 0 {
+        None
+    } else {
+        Some(base)
+    }
 }
 
 pub const TEMP_LABELS: &[&str] = &["temp1", "temp2", "temp3", "temp4", "temp5", "temp6"];
@@ -345,7 +349,13 @@ pub struct It87Hwmon {
 }
 
 impl It87Hwmon {
-    pub fn new(chip: It87Chip, chip_id: u16, index_port: u16, data_port: u16, ec_base: u16) -> Self {
+    pub fn new(
+        chip: It87Chip,
+        chip_id: u16,
+        index_port: u16,
+        data_port: u16,
+        ec_base: u16,
+    ) -> Self {
         Self {
             chip,
             chip_id,
@@ -447,7 +457,9 @@ impl crate::HwmonDevice for It87Hwmon {
         };
         #[cfg(target_arch = "x86_64")]
         {
-            if self.ec_base == 0 || idx >= IT87_REG_PWM.len() || idx >= self.chip.num_fans() as usize
+            if self.ec_base == 0
+                || idx >= IT87_REG_PWM.len()
+                || idx >= self.chip.num_fans() as usize
             {
                 return false;
             }
@@ -504,7 +516,9 @@ pub fn register_isa_driver() {
                     bus_loc: "isa",
                 });
                 use alloc::sync::Arc;
-                registry::register_device(Arc::new(It87Hwmon::new(chip, chip_id, idx, dat, ec_base)));
+                registry::register_device(Arc::new(It87Hwmon::new(
+                    chip, chip_id, idx, dat, ec_base,
+                )));
                 return;
             }
         }

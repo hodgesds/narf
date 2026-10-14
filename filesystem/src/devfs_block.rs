@@ -861,10 +861,20 @@ impl BlockDeviceSync for MockBlk {
     fn capacity(&self) -> u64 {
         2048
     }
-    fn read(&self, _lba: u64, _n: u16, _out: &mut [u8]) -> Result<(), narf_block::registry::BlockIoError> {
+    fn read(
+        &self,
+        _lba: u64,
+        _n: u16,
+        _out: &mut [u8],
+    ) -> Result<(), narf_block::registry::BlockIoError> {
         Ok(())
     }
-    fn write(&self, _lba: u64, _n: u16, _data: &[u8]) -> Result<(), narf_block::registry::BlockIoError> {
+    fn write(
+        &self,
+        _lba: u64,
+        _n: u16,
+        _data: &[u8],
+    ) -> Result<(), narf_block::registry::BlockIoError> {
         Ok(())
     }
 }
@@ -895,7 +905,9 @@ fn smoke_block_ioctl_sizes() -> TestResult {
     let file = BlockFile::from_dev(Arc::new(MockBlk));
 
     // BLKGETSIZE64 → byte capacity (u64) = 2048 * 512 = 1 MiB.
-    let ctx = CaptureCtx { buf: IrqSafeSpinLock::new(Vec::new()) };
+    let ctx = CaptureCtx {
+        buf: IrqSafeSpinLock::new(Vec::new()),
+    };
     match poll_ready(file.ioctl_user(BLKGETSIZE64, 0x1000, &ctx)) {
         Some(Ok(0)) => {}
         _ => return TestResult::Fail("BLKGETSIZE64 did not succeed"),
@@ -907,7 +919,9 @@ fn smoke_block_ioctl_sizes() -> TestResult {
     drop(g);
 
     // BLKSSZGET → logical sector size (int) = 512.
-    let ctx = CaptureCtx { buf: IrqSafeSpinLock::new(Vec::new()) };
+    let ctx = CaptureCtx {
+        buf: IrqSafeSpinLock::new(Vec::new()),
+    };
     match poll_ready(file.ioctl_user(BLKSSZGET, 0x1000, &ctx)) {
         Some(Ok(0)) => {}
         _ => return TestResult::Fail("BLKSSZGET did not succeed"),
@@ -919,7 +933,9 @@ fn smoke_block_ioctl_sizes() -> TestResult {
     drop(g);
 
     // BLKGETSIZE → 512-byte sector count (long) = 2048.
-    let ctx = CaptureCtx { buf: IrqSafeSpinLock::new(Vec::new()) };
+    let ctx = CaptureCtx {
+        buf: IrqSafeSpinLock::new(Vec::new()),
+    };
     match poll_ready(file.ioctl_user(BLKGETSIZE, 0x1000, &ctx)) {
         Some(Ok(0)) => {}
         _ => return TestResult::Fail("BLKGETSIZE did not succeed"),

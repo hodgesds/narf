@@ -500,7 +500,7 @@ kernel_test_in!("drivers/hwmon/nct6775", smoke_nct6775_voltage_decode);
 /// byte-register helper. 0x3200 → 50.0 °C, 0x3280 → 50.5 °C, and a
 /// negative two's-complement value 0xCE00 → -50.0 °C.
 fn smoke_nct6775_temp_decode() -> TestResult {
-    use crate::nct6775::{temp_from_reg, temp_from_reg_word, reg_is_word_sized};
+    use crate::nct6775::{reg_is_word_sized, temp_from_reg, temp_from_reg_word};
     if temp_from_reg_word(0x3200) != 50_000
         || temp_from_reg_word(0x3280) != 50_500
         || temp_from_reg_word(0xCE00) != -50_000
