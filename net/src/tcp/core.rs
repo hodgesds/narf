@@ -257,9 +257,12 @@ pub struct Tcb {
     /// Cycles at which the pending delayed ACK should fire. 0 if
     /// none pending.
     pub delayed_ack_deadline_cycles: u64,
-    /// Number of un-ACK'd data segments arrived since last ACK
-    /// we sent. ≥2 triggers immediate ACK.
-    pub unacked_data_segments: u8,
+    /// `tp->rcv_wup`: `rcv_nxt` when the last window was advertised (every
+    /// outbound ACK). In-order bytes since then decide an immediate ACK.
+    pub rcv_wup: u32,
+    /// `icsk_ack.rcv_mss`: the peer's segment size as measured on receive
+    /// (`tcp_measure_rcv_mss`), 0 until the first data segment arrives.
+    pub rcv_mss_seen: u32,
 
     // ── Persist (zero-window probe) ──
     pub persist_deadline_cycles: u64,
@@ -474,7 +477,8 @@ impl Tcb {
             sack_book: SackBook::new(),
             opts: OptionsState::new(),
             delayed_ack_deadline_cycles: 0,
-            unacked_data_segments: 0,
+            rcv_wup: 0,
+            rcv_mss_seen: 0,
             persist_deadline_cycles: 0,
             persist_backoff_ns: PERSIST_INITIAL_NS,
             keepalive_enabled: false,
@@ -2408,9 +2412,8 @@ fn send_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, extra_flags: u8) {
         let window = effective_advertised_window(&mut t);
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
-        // Clear pending delayed-ACK + count.
+        // Clear the pending delayed ACK.
         t.delayed_ack_deadline_cycles = 0;
-        t.unacked_data_segments = 0;
         (t.snd_nxt, t.rcv_nxt, window, opts)
     };
     let frame = build_tcb_frame(
@@ -2496,7 +2499,6 @@ fn send_data(
         let blocks: Vec<SackBlock> = t.sack_book.blocks().to_vec();
         let opts = encode_data_options(&t.opts, tsval_now(), &blocks);
         t.delayed_ack_deadline_cycles = 0;
-        t.unacked_data_segments = 0;
         (t.rcv_nxt, window, opts)
     };
     // TSO super-frame: only when this is a multi-MSS payload AND the egress
@@ -2537,6 +2539,9 @@ fn send_data(
 fn effective_advertised_window(t: &mut Tcb) -> u16 {
     let raw = t.recv_buf.window();
     t.rcv_wnd = raw;
+    // `tcp_select_window`: `tp->rcv_wup = tp->rcv_nxt` with every advertised
+    // window, which is every outbound ACK.
+    t.rcv_wup = t.rcv_nxt;
     t.opts.encode_our_window(raw)
 }
 
@@ -3267,6 +3272,8 @@ fn accept_into_listen(
     child.state = TcpState::SynReceived;
     child.irs = hdr.sequence;
     child.rcv_nxt = hdr.sequence.wrapping_add(1);
+    // The handshake advertises the first window at this rcv_nxt.
+    child.rcv_wup = child.rcv_nxt;
     child.snd_wnd = parsed
         .wscale
         .map(|s| (hdr.window as u32) << s as u32)
@@ -3328,6 +3335,8 @@ fn accept_into_listen6(
     child.state = TcpState::SynReceived;
     child.irs = hdr.sequence;
     child.rcv_nxt = hdr.sequence.wrapping_add(1);
+    // The handshake advertises the first window at this rcv_nxt.
+    child.rcv_wup = child.rcv_nxt;
     child.snd_wnd = parsed
         .wscale
         .map(|shift| (hdr.window as u32) << shift as u32)
@@ -3455,6 +3464,8 @@ fn handle_in_syn_sent(
             let mut t = arc.lock();
             t.irs = hdr.sequence;
             t.rcv_nxt = hdr.sequence.wrapping_add(1);
+            // The handshake advertises the first window at this rcv_nxt.
+            t.rcv_wup = t.rcv_nxt;
             t.snd_wnd = parsed
                 .wscale
                 .map(|s| (hdr.window as u32) << s as u32)
@@ -3474,6 +3485,8 @@ fn handle_in_syn_sent(
         t.snd_una = hdr.acknowledgement;
         t.irs = hdr.sequence;
         t.rcv_nxt = hdr.sequence.wrapping_add(1);
+        // The handshake advertises the first window at this rcv_nxt.
+        t.rcv_wup = t.rcv_nxt;
         t.snd_wnd = parsed
             .wscale
             .map(|s| (hdr.window as u32) << s as u32)
@@ -4027,7 +4040,14 @@ fn enqueue_recv(arc: &Arc<IrqSafeSpinLock<Tcb>>, seq: u32, payload: &[u8]) -> bo
             .add_range(seq, seq.wrapping_add(payload.len() as u32));
     }
     t.rcv_nxt = new_rcv;
-    t.unacked_data_segments = t.unacked_data_segments.saturating_add(1);
+    // `tcp_measure_rcv_mss`: `rcv_mss` grows to the largest segment seen,
+    // capped at our advertised MSS. A GRO-merged segment carries many wire
+    // segments; Linux reads its `gso_size`, and the cap gives the same answer
+    // for a flow of full-sized segments.
+    let len = payload.len() as u32;
+    if len >= rcv_mss(&t) {
+        t.rcv_mss_seen = len.min(u32::from(t.opts.our_mss.max(MIN_MSS)));
+    }
     new_rcv != before
 }
 
@@ -4109,20 +4129,48 @@ fn ack_need(hdr: &TcpHeader, payload_len: usize, advanced: bool, win: (u32, u32)
     }
 }
 
-/// Emit or schedule the ACK an arrived segment calls for. In-order data is
-/// ACKed immediately on the 2nd un-ACKed segment or while quickack credit
-/// remains, else after [`DELAYED_ACK_NS`].
+/// `icsk_ack.rcv_mss`: the measured peer segment size, or before any data
+/// `tcp_initialize_rcv_mss`'s `min(advmss, rcv_wnd / 2, TCP_MSS_DEFAULT)`
+/// floored at `TCP_MIN_MSS`.
+fn rcv_mss(t: &Tcb) -> u32 {
+    if t.rcv_mss_seen != 0 {
+        return t.rcv_mss_seen;
+    }
+    const TCP_MSS_DEFAULT: u32 = 536;
+    const TCP_MIN_MSS: u32 = 88;
+    u32::from(t.opts.our_mss.max(MIN_MSS))
+        .min(t.recv_buf.window() / 2)
+        .clamp(TCP_MIN_MSS, TCP_MSS_DEFAULT)
+}
+
+/// Emit or schedule the ACK an arrived segment calls for —
+/// `__tcp_ack_snd_check`: ACK now when more than one full segment has
+/// arrived since the last advertised window, or while quickack credit
+/// remains; otherwise after [`DELAYED_ACK_NS`]. Counting bytes rather than
+/// segments is what keeps a GRO-merged burst from waiting out the
+/// delayed-ACK timer.
+///
+/// Linux additionally requires `__tcp_select_window(sk) >= tp->rcv_wnd`
+/// (the right edge advanced by the bytes received). Its advertised window is
+/// clamped by `rcv_ssthresh` well below free buffer space, so in a bulk
+/// transfer that holds and the full-frame ACK goes out every two segments.
+/// NARF advertises the raw free space, where the same comparison is true
+/// only after the application reads — it would suppress exactly those ACKs.
+/// Omitting it reproduces Linux's behaviour rather than its formula.
 fn schedule_ack(arc: &Arc<IrqSafeSpinLock<Tcb>>, need: AckNeed) {
     let immediate = match need {
         AckNeed::None => return,
         AckNeed::Now => true,
         AckNeed::Data => {
             let mut t = arc.lock();
-            if t.quickack_left > 0 {
+            let full_frame = t.rcv_nxt.wrapping_sub(t.rcv_wup) > rcv_mss(&t);
+            if full_frame {
+                true
+            } else if t.quickack_left > 0 {
                 t.quickack_left = t.quickack_left.saturating_sub(1);
                 true
             } else {
-                t.unacked_data_segments >= 2
+                false
             }
         }
     };

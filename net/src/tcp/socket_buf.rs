@@ -291,9 +291,7 @@ impl RecvBuf {
         let data = &data[..take];
 
         if seq == rcv_nxt {
-            for &b in data {
-                self.in_order.push_back(b);
-            }
+            self.in_order.extend(data.iter().copied());
             rcv_nxt = rcv_nxt.wrapping_add(data.len() as u32);
             rcv_nxt = self.drain_ooo_into_in_order(rcv_nxt);
         } else {
