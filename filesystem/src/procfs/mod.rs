@@ -539,14 +539,11 @@ fn thread_status(body: String, tid: u64) -> String {
 
 /// `/proc/<n>` where `n` names a thread that is not its group's leader:
 /// readdir lists only leaders, but `proc_pid_lookup` resolves any tid.
-/// Returns the thread group's outer pid. `n` is in the reader's namespace.
+/// Returns the thread group's outer pid, or `None` when `n` is a group
+/// leader (or names no thread). `n` is in the reader's namespace.
 fn thread_group_of_visible_tid(n: u64) -> Option<u64> {
-    list_pids().into_iter().find_map(|visible| {
-        let outer = pid_resolve(visible)?;
-        hook_thread_list(outer)
-            .is_some_and(|tids| tids.contains(&n))
-            .then_some(outer)
-    })
+    let tgid = hook_thread_stat(n)?.tgid?;
+    (pid_resolve(n) != Some(tgid)).then_some(tgid)
 }
 
 fn list_pids() -> Vec<u64> {
@@ -647,6 +644,9 @@ pub struct ThreadStat {
     /// tid at a time — so a per-thread `stat` that borrowed the process's
     /// letter reported a parked thread as running.
     pub state: char,
+    /// The outer pid of the thread's group (`task->tgid`), when the thread
+    /// belongs to a process. Lets `/proc/<tid>` resolve a non-leader thread.
+    pub tgid: Option<u64>,
 }
 type ThreadStatFn = fn(u64) -> Option<ThreadStat>;
 
@@ -2504,14 +2504,16 @@ impl DirOps for ProcRoot {
                 // READER's namespace; resolve it to the outer ProcessId (None →
                 // not visible in the reader's namespace → no such entry).
                 if let Ok(n) = name.parse::<u64>() {
+                    // A non-leader thread's id (see `thread_group_of_visible_tid`).
+                    // First: the process lookup's raw-task fallback would
+                    // otherwise answer for it as a one-thread process.
+                    if thread_group_of_visible_tid(n).is_some() {
+                        return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(n))));
+                    }
                     if let Some(pid) = pid_resolve(n) {
                         if task_info(pid, TaskInfoQuery::Basic).is_some() {
                             return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(pid))));
                         }
-                    }
-                    // A non-leader thread's id (see `thread_group_of_visible_tid`).
-                    if thread_group_of_visible_tid(n).is_some() {
-                        return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(n))));
                     }
                 }
                 None
@@ -2551,16 +2553,16 @@ impl DirOps for ProcRoot {
         // namespace; translate to the outer ProcessId (None → not visible) and
         // validate liveness before materialising the dir keyed on the outer id.
         if let Ok(n) = name.parse::<u64>() {
-            if let Some(pid) = pid_resolve(n) {
-                if task_info(pid, TaskInfoQuery::Basic).is_some() {
-                    return Some(Arc::new(ProcPidDir { pid, thread: None }));
-                }
-            }
             if let Some(tgid) = thread_group_of_visible_tid(n) {
                 return Some(Arc::new(ProcPidDir {
                     pid: tgid,
                     thread: Some(n),
                 }));
+            }
+            if let Some(pid) = pid_resolve(n) {
+                if task_info(pid, TaskInfoQuery::Basic).is_some() {
+                    return Some(Arc::new(ProcPidDir { pid, thread: None }));
+                }
             }
         }
         None
@@ -4864,7 +4866,10 @@ fn smoke_procfs_inode_identity_is_stable_and_distinct() -> TestResult {
     if a.inode_attrs().dev != root.inode_attrs().dev {
         return TestResult::Fail("a procfs file is not on the procfs st_dev");
     }
-    let pid = ProcPidDir { pid: 7, thread: None };
+    let pid = ProcPidDir {
+        pid: 7,
+        thread: None,
+    };
     let (Some(stat), Some(status), Some(marker), Some(fd_dir)) = (
         pid.lookup("stat"),
         pid.lookup("status"),
@@ -4879,7 +4884,10 @@ fn smoke_procfs_inode_identity_is_stable_and_distinct() -> TestResult {
     if marker.ino() != fd_dir.ino() || marker.ino() == 0 {
         return TestResult::Fail("/proc/<pid>/fd: stat marker and DirOps inodes differ");
     }
-    let other = ProcPidDir { pid: 8, thread: None };
+    let other = ProcPidDir {
+        pid: 8,
+        thread: None,
+    };
     if pid.ino() == 0 || pid.ino() == other.ino() || pid.ino() == root.ino() {
         return TestResult::Fail("/proc/<pid> inode is not keyed on the pid");
     }

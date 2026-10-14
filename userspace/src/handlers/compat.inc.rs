@@ -7561,6 +7561,7 @@ pub fn proc_thread_stat(tid: u64) -> Option<narf_filesystem::procfs::ThreadStat>
         // Same precedence as the process-level report, minus 'Z': a zombie
         // thread has no row in `/proc/<pid>/task` to read.
         state: live_task_state(task),
+        tgid: task_to_pid_raw(task),
     })
 }
 
