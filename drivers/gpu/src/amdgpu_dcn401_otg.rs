@@ -998,7 +998,9 @@ impl<I: Io> Engine<I> {
         // OPTC_DATA_FORMAT: RGB/4:4:4, or 4:2:0; DSC disabled.
         let format = if plan.request.ycbcr420 { 2 } else { 0 };
         self.update(odm(FORMAT), 0x33, format)?;
-        // link_set_dsc_on_stream: the pipe's DSC, then the OPTC's DSC mode.
+        // link_set_dsc_on_stream: the pipe's DSC (any earlier one on this
+        // stopped pipe turned off first), then the OPTC's DSC mode.
+        self.stop_dsc(pipe).await?;
         if let Some(cfg) = plan.request.dsc {
             self.start_dsc(&plan.request, &cfg).await?;
         } else {
@@ -1032,8 +1034,6 @@ impl<I: Io> Engine<I> {
     }
     async fn disable(&mut self, pipe: u8) -> Result<(), Error> {
         let l = self.layout;
-        // link_set_dsc_on_stream(false) precedes the timing's disable.
-        self.stop_dsc(pipe).await?;
         self.update(l.odm(pipe, SOURCE), 0xffff0003, 0xffff0000)?;
         self.update(l.odm(pipe, MEMORY), 0xffff, 0)?;
         self.update(l.otg(pipe, CONTROL), 1, 0)?;
@@ -1057,7 +1057,15 @@ impl<I: Io> Engine<I> {
         self.status.mpcs[usize::from(pipe)] = None;
         self.status.requestor = None;
         self.status.deadlines = None;
-        match self.disable(pipe).await {
+        // A stopped stream keeps its DSC for a restart; retiring the timing
+        // turns it off first, as link_set_dsc_on_stream(false) precedes the
+        // timing's disable.
+        let result = async {
+            self.stop_dsc(pipe).await?;
+            self.disable(pipe).await
+        }
+        .await;
+        match result {
             Ok(()) => {
                 self.status.pipes[usize::from(pipe)] = None;
                 self.status.blanks[usize::from(pipe)] = None;

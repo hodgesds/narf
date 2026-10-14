@@ -62,12 +62,24 @@ fn fixture_range(
     depth: ColorDepth,
     limited: bool,
 ) -> (Engine<FrontendIo>, Link, dccg::Applied) {
+    fixture_with(p, stream, pipe, depth, limited, None)
+}
+/// As `fixture_range`, the timing compressed by the pipe's DSC.
+fn fixture_with(
+    p: u8,
+    stream: u8,
+    pipe: u8,
+    depth: ColorDepth,
+    limited: bool,
+    dsc: Option<crate::amdgpu_dsc::DscConfig>,
+) -> (Engine<FrontendIo>, Link, dccg::Applied) {
     let (mut e, mut io) = super::fixture(p, 4, LinkRate::Hbr3, TrainingPattern::Tps4);
     // Exercise the public engine sequence, including prepared timing before PHY
     // enable/training. No forged completion records or hand-built ready state.
     run(e.disable_dp_phy(&mut io, path(p))).unwrap();
     let mut req = request(pipe);
     req.signal = Signal::DisplayPort;
+    req.dsc = dsc;
     let c = clock(req);
     run(e.prepare(req, c)).unwrap();
     run(e.prepare_blank(

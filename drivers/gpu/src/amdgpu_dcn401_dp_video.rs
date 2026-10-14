@@ -7,6 +7,14 @@ const VID_N: u64 = 0x2127;
 const VID_M: u64 = 0x2128;
 const MN_MASK: u32 = 0xff00f110;
 const NVID: u32 = 0x8000;
+// Secondary data for a DSC stream's PPS SDP (DIG stride).
+const SEC_CNTL: u64 = 0x2141;
+const SEC_CNTL2: u64 = 0x2169;
+const VBID_MISC: u64 = 0x2170;
+const GSP11: u64 = 0x2177;
+const AFMT_CNTL: u64 = 0x20ba;
+/// DP_DSC_ENABLE.
+const DSC_ENABLE: u32 = 0x160;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DpVideoRunning {
@@ -191,6 +199,59 @@ impl<I: Io> Engine<I> {
         }
         Ok(())
     }
+    /// enc3_dp_set_dsc_pps_info_packet(true, immediate): the PPS in VPG
+    /// generic packets 11-14 (type 0x10, 127 bytes), sent every frame on
+    /// line 2 with VBID[6] updated on line 3.
+    async fn dp_video_pps(&mut self, w: &Work) -> Result<(), Error> {
+        let request = w.frontend.blank.timing.request;
+        let Some(cfg) = request.dsc else {
+            return Ok(());
+        };
+        let regs = super::dsc_hw::dsc_registers(&request, &cfg)?;
+        let pps = crate::amdgpu_dsc::pack_pps(&regs.pps);
+        let l = self.layout;
+        let at = |r| w.at(l, r);
+        self.update(at(SEC_CNTL2), 0x1000_0000, 0x1000_0000)?;
+        self.update(at(AFMT_CNTL), 1, 1)?;
+        if self.read(at(0x206d))? & 0x100 != 0 {
+            self.update(at(0x206d), 0x11, 1)?;
+            self.wait(at(0x206d), 0x100, 0, 1000).await?;
+        }
+        for (i, chunk) in pps.chunks_exact(32).enumerate() {
+            let index = 11 + i as u32;
+            self.wait(at(0x206c), 2, 0, 500).await?;
+            self.access(|io| {
+                // CONFLICT_CLR and the data port are commands, not state.
+                let status = checked(io.read(at(0x206c)))?;
+                io.write(at(0x206c), status | 0x10);
+                let access = checked(io.read(at(0x2068)))?;
+                io.write(at(0x2068), (access & !0xff) | (index * 9));
+                io.write(at(0x2069), u32::from_le_bytes([0, 0x10, 127, 0]));
+                for word in chunk.chunks_exact(4) {
+                    io.write(
+                        at(0x2069),
+                        u32::from_le_bytes([word[0], word[1], word[2], word[3]]),
+                    );
+                }
+                let immediate = checked(io.read(at(0x206b)))?;
+                io.write(at(0x206b), immediate | 1 << index);
+                Ok(())
+            })?;
+        }
+        self.update(at(GSP11), 0xffff_0000, 2 << 16)?;
+        self.update(at(VBID_MISC), 0xffff_8000, 3 << 16)?;
+        self.update(at(GSP11), 0x10, 0x10)?;
+        self.update(at(SEC_CNTL), 1, 1)
+    }
+    /// enc3_dp_set_dsc_pps_info_packet(false).
+    fn dp_video_pps_off(&mut self, w: &Work) -> Result<(), Error> {
+        if w.frontend.blank.timing.request.dsc.is_none() {
+            return Ok(());
+        }
+        let l = self.layout;
+        self.update(w.at(l, GSP11), 0x10, 0)?;
+        self.update(w.at(l, SEC_CNTL2), 0x1000_0000, 0)
+    }
     async fn dp_video_start(
         &mut self,
         io: &mut impl Transport,
@@ -202,6 +263,17 @@ impl<I: Io> Engine<I> {
         self.enable_blank(w.frontend.blank, timeout).await?;
         w.timing = true;
         self.dp_video_verify(w)?;
+        // link_set_dpms_on after enable_stream: the sink decodes DSC
+        // (dp_set_dsc_on_rx), then the PPS SDP, before unblanking.
+        if w.frontend.blank.timing.request.dsc.is_some() {
+            let path = w.frontend.link.phy.path;
+            write(io, path, DSC_ENABLE, &mut [1]).await?;
+            if read::<1>(io, path, DSC_ENABLE).await?[0] & 1 != 1 {
+                return Err(sink_readback(DSC_ENABLE));
+            }
+            self.dp_video_pps(&w).await?;
+            self.dp_video_verify(w)?;
+        }
         // Native RGB stream/link ratio: no component-depth or lane multiplier.
         self.dp_video_mn(&mut w, 0, 0x100, 0)?;
         self.dp_video_mn(&mut w, 1, 0xffffff, NVID)?;
@@ -291,6 +363,7 @@ impl<I: Io> Engine<I> {
     }
     pub(in crate::amdgpu_dcn401_otg) async fn stop_dp_video(
         &mut self,
+        io: &mut impl Transport,
         path: Path,
     ) -> Result<(), Error> {
         let running = self.status.dp_video_running.ok_or(Error::Invalid)?;
@@ -321,6 +394,13 @@ impl<I: Io> Engine<I> {
             self.dp_video_update(&mut w, 13, 1, 0)?;
             self.dp_video_mn(&mut w, 0, 0x100, 0)?;
             self.dp_video_fifo_ready(w)?;
+            // link_set_dsc_enable(false): the sink stops decoding (unchecked,
+            // as Linux ignores it), then the PPS SDP; disable() turns the
+            // OPTC's DSC and the DSC off before the timing.
+            if frontend.blank.timing.request.dsc.is_some() {
+                let _ = write(io, path, DSC_ENABLE, &mut [0]).await;
+                self.dp_video_pps_off(&w)?;
+            }
             self.disable(frontend.request.pipe).await?;
             w.timing = false;
             self.dp_video_verify_route(w, false)?;
@@ -407,6 +487,7 @@ impl Otg {
         &mut self,
         clocks: &mut clocks::ClockManager,
         dccg: &mut dccg::Dccg,
+        firmware: &mut dmub::Dmub,
         path: Path,
     ) -> Result<(), Error> {
         let fe = self
@@ -420,7 +501,7 @@ impl Otg {
         }
         self.dp_video_clock(clocks, dccg, fe)?;
         let history = self.0.status.dp_frontend_ready;
-        self.0.stop_dp_video(path).await?;
+        self.0.stop_dp_video(firmware, path).await?;
         if let Err(e) = self.dp_video_clock(clocks, dccg, fe) {
             self.0.status.dp_frontend_ready = history;
             return Err(e);

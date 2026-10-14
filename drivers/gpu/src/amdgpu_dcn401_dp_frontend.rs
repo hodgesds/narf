@@ -113,8 +113,12 @@ impl<I: Io> Engine<I> {
         } else {
             0
         };
+        // A DSC stream's PPS SDP (GSP11 and the secondary stream) is the
+        // video owner's.
+        let dsc = plan.blank.timing.request.dsc.is_some();
+        let pps = if dsc { 1 } else { 0 };
         for (reg, mask) in [
-            (0x2141, 0x1ff11111 & !audio),
+            (0x2141, 0x1ff11111 & !audio & !pps),
             (0x2091, 0x1010),
             (0x213d, 0x11),
             (0x2170, 0x3010),
@@ -124,7 +128,8 @@ impl<I: Io> Engine<I> {
             }
         }
         for reg in 0x2174..=0x2177 {
-            if self.read(at(reg))? & 0x309f != 0 {
+            let mask = if dsc && reg == 0x2177 { 0x308f } else { 0x309f };
+            if self.read(at(reg))? & mask != 0 {
                 return Err(Error::Busy);
             }
         }
@@ -295,7 +300,13 @@ impl<I: Io> Engine<I> {
             (0, 7, u32::from(plan.request.pipe)),
             (0, 0x70, u32::from(plan.request.pipe) << 4),
             (0, 0x100, 0x100),
-            (5, 0x10731, depth << 8),
+            // PIXEL_ENCODING_TYPE: compressed for a DSC stream (RGB, so
+            // COMPRESSED_PIXEL_FORMAT 0), as enc401's stream attribute sets.
+            (
+                5,
+                0x10731,
+                depth << 8 | u32::from(plan.blank.timing.request.dsc.is_some()),
+            ),
             // MSA MISC0: component depth, and bit 3 (CEA dynamic range) for
             // limited-range RGB as dcn10 stream encoders set it.
             (

@@ -126,7 +126,17 @@ fn fixture_reference(
     depth: ColorDepth,
     reference: Option<u32>,
 ) -> (Engine<VideoIo>, Link, dccg::Applied) {
-    let (mut e, mut io, mut c) = super::fixture(p, stream, pipe, depth);
+    fixture_dsc(p, stream, pipe, depth, reference, None)
+}
+fn fixture_dsc(
+    p: u8,
+    stream: u8,
+    pipe: u8,
+    depth: ColorDepth,
+    reference: Option<u32>,
+    dsc: Option<crate::amdgpu_dsc::DscConfig>,
+) -> (Engine<VideoIo>, Link, dccg::Applied) {
+    let (mut e, mut io, mut c) = super::fixture_with(p, stream, pipe, depth, false, dsc);
     if let Some(reference) = reference {
         // Inject the clock owner's result; its native DTO checks have separate
         // DCCG models. Never forge a frontend/video completion in this fixture.
@@ -230,7 +240,7 @@ fn dcn401_dp_video_black_roundtrip_keeps_independent_routes_and_native_sequence(
                 assert_eq!(run(e.stop_dp_frontend(path(p))), Err(Error::Busy));
                 assert_eq!(run(e.stop_dp_link(&mut io, path(p))), Err(Error::Busy));
                 assert_eq!(run(e.start_dp_video(&mut io, path(p), c)), Err(Error::Busy));
-                run(e.stop_dp_video(path(p))).unwrap();
+                run(e.stop_dp_video(&mut io, path(p))).unwrap();
                 assert_eq!(e.status.state, State::DpFrontendReady(s));
                 assert_eq!(e.status.dp_video_running, Some(running));
                 assert_eq!(e.io.fake().regs[&dio(s, 0x2122)] & 0x10301, 0x200);
@@ -251,7 +261,7 @@ fn dcn401_dp_video_black_roundtrip_keeps_independent_routes_and_native_sequence(
                     );
                 }
                 start(&mut e, &mut io, c);
-                run(e.stop_dp_video(path(p))).unwrap();
+                run(e.stop_dp_video(&mut io, path(p))).unwrap();
                 run(e.stop_dp_frontend(path(p))).unwrap();
                 run(e.stop_dp_link(&mut io, path(p))).unwrap();
                 assert_eq!(e.status.state, State::DpPhyDisabled);
@@ -421,11 +431,14 @@ fn dcn401_dp_video_stop_never_cuts_timing_before_video_off() -> TestResult {
             if cancel {
                 e.io.watch = Some(at);
                 let waited = e.io.waited.clone();
-                cancel_at(e.stop_dp_video(path(2)), || {
+                cancel_at(e.stop_dp_video(&mut io, path(2)), || {
                     waited.load(Ordering::SeqCst) != 0
                 });
             } else {
-                assert_eq!(run(e.stop_dp_video(path(2))), Err(Error::Timeout(at)));
+                assert_eq!(
+                    run(e.stop_dp_video(&mut io, path(2))),
+                    Err(Error::Timeout(at))
+                );
             }
             assert_eq!(
                 e.status.state,
@@ -441,7 +454,7 @@ fn dcn401_dp_video_stop_never_cuts_timing_before_video_off() -> TestResult {
                     .iter()
                     .all(|&(at, _)| at == dio(1, 0x2122)));
             }
-            assert_eq!(run(e.stop_dp_video(path(2))), Err(Error::Busy));
+            assert_eq!(run(e.stop_dp_video(&mut io, path(2))), Err(Error::Busy));
             assert_eq!(run(e.stop_dp_frontend(path(2))), Err(Error::Busy));
         }
     }
@@ -602,7 +615,7 @@ fn dcn401_dp_video_mmio_failures_never_reuse_uncertain_start_or_stop() -> TestRe
         let first = e.io.fake().writes.len();
         let mut regs = e.io.fake().regs.clone();
         if stop {
-            run(e.stop_dp_video(path(2))).unwrap();
+            run(e.stop_dp_video(&mut io, path(2))).unwrap();
         } else {
             start(&mut e, &mut io, c);
         }
@@ -626,7 +639,7 @@ fn dcn401_dp_video_mmio_failures_never_reuse_uncertain_start_or_stop() -> TestRe
                     _ => e.io.fake().gone = Some(index + 1),
                 }
                 let result = if stop {
-                    run(e.stop_dp_video(path(2)))
+                    run(e.stop_dp_video(&mut io, path(2)))
                 } else {
                     run(e.start_dp_video(&mut io, path(2), c)).map(|_| ())
                 };
@@ -669,7 +682,7 @@ fn dcn401_dp_video_skips_powered_off_hubps_and_accepts_frame_wrap() -> TestResul
     );
     // M is an auto-measured value, not a constant completion witness.
     e.io.fake().regs.insert(dio(1, 0x2128), 6010);
-    run(e.stop_dp_video(path(2))).unwrap();
+    run(e.stop_dp_video(&mut io, path(2))).unwrap();
     run(e.stop_dp_frontend(path(2))).unwrap();
     run(e.stop_dp_link(&mut io, path(2))).unwrap();
     TestResult::Pass
@@ -698,7 +711,7 @@ fn dcn401_dp_video_mn_interval_tracks_pixel_packing_not_component_depth() -> Tes
                 e.io.fake().regs[&dio(1, 0x2126)] & 0xff00f110,
                 0x100 | interval << 14
             );
-            run(e.stop_dp_video(path(2))).unwrap();
+            run(e.stop_dp_video(&mut io, path(2))).unwrap();
             run(e.stop_dp_frontend(path(2))).unwrap();
             run(e.stop_dp_link(&mut io, path(2))).unwrap();
         }
@@ -890,9 +903,9 @@ fn dcn401_dp_video_stops_only_after_its_audio() -> TestResult {
         hbr: true,
     };
     e.status.dp_audio = Some(a);
-    assert_eq!(run(e.stop_dp_video(path(p))), Err(Error::Busy));
+    assert_eq!(run(e.stop_dp_video(&mut io, path(p))), Err(Error::Busy));
     e.status.dp_audio = None;
-    run(e.stop_dp_video(path(p))).unwrap();
+    run(e.stop_dp_video(&mut io, path(p))).unwrap();
     assert_eq!(run(e.start_dp_audio(path(p), info)), Err(Error::Busy));
     TestResult::Pass
 }
@@ -964,4 +977,69 @@ fn dcn401_dp_audio_leaves_the_wall_clock_to_hdmi_audio() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_audio_leaves_the_wall_clock_to_hdmi_audio
+);
+
+/// A DSC stream as link_set_dpms_on runs it: the frontend marks the stream
+/// compressed; after the timing starts and before video, the sink is told
+/// to decode DSC and the PPS goes out in VPG generic packets 11-14 (type
+/// 0x10, 127 bytes) on line 2 with VBID[6] on line 3. Stop clears the
+/// sink's DSC_ENABLE and the PPS; the DSC stays for a restart (timing
+/// retirement turns it off).
+fn dcn401_dp_video_sends_dsc_pps_like_linux() -> TestResult {
+    use crate::amdgpu_dsc::DscConfig;
+    let (stream, pipe) = (1u8, 2u8);
+    let cfg = DscConfig {
+        slices_h: 2,
+        slices_v: 10,
+        bpp_x16: 128,
+        block_pred: true,
+        linebuf_depth: 11,
+        version_minor: 2,
+        ycbcr422_simple: false,
+    };
+    let (mut e, mut io, c) = fixture_dsc(2, stream, pipe, ColorDepth::Bpc8, None, Some(cfg));
+    if e.io.fake().regs[&dio(stream, 0x211f)] & 1 != 1 {
+        return TestResult::Fail("compressed pixel encoding");
+    }
+    e.io.fake().writes.clear();
+    start(&mut e, &mut io, c);
+    let headers =
+        e.io.fake()
+            .writes
+            .iter()
+            .filter(|&&(at, v)| at == dio(stream, 0x2069) && v == 0x007f_1000)
+            .count();
+    let reg = |e: &mut Engine<VideoIo>, r: u64| {
+        e.io.fake().regs.get(&dio(stream, r)).copied().unwrap_or(0)
+    };
+    if io.bytes.get(&0x160) != Some(&1)
+        || headers != 4
+        || reg(&mut e, 0x2177) & 0xffff_0010 != (2 << 16 | 0x10)
+        || reg(&mut e, 0x2170) >> 16 != 3
+        || reg(&mut e, 0x2169) & 0x1000_0000 == 0
+        || reg(&mut e, 0x2141) & 1 != 1
+    {
+        return TestResult::Fail("DSC PPS SDP");
+    }
+    run(e.stop_dp_video(&mut io, path(2))).unwrap();
+    if io.bytes.get(&0x160) != Some(&0)
+        || reg(&mut e, 0x2177) & 0x10 != 0
+        || reg(&mut e, 0x2169) & 0x1000_0000 != 0
+    {
+        return TestResult::Fail("DSC stop");
+    }
+    // The DSC stays configured for a restart, which sends the PPS again.
+    let at = BASE + (0x1a64 + u64::from(pipe)) * 4;
+    if e.io.fake().regs[&at] & 1 != 1 {
+        return TestResult::Fail("DSC kept for restart");
+    }
+    start(&mut e, &mut io, c);
+    if io.bytes.get(&0x160) != Some(&1) || reg(&mut e, 0x2177) & 0x10 == 0 {
+        return TestResult::Fail("DSC restart");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_video_sends_dsc_pps_like_linux
 );

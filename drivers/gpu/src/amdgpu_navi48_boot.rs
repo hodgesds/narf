@@ -1750,6 +1750,7 @@ impl ColdBoot {
                 .stop_dp_video(
                     self.clocks.as_mut().map_err(|e| otg::Error::Clocks(*e))?,
                     self.dccg.as_mut().map_err(|e| otg::Error::PipeClocks(*e))?,
+                    &mut self.sequence.backend.dmub,
                     path,
                 )
                 .await
