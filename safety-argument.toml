@@ -1500,3 +1500,7 @@ argument = "The only frame/ change (bare_main.rs) registers the ptracefork_smoke
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The only frame/ change (bare_main.rs) registers the seccomp_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. seccomp filtering itself lives in userspace/ (seccomp.rs and the syscall-entry hook), outside the TCB, and only ever narrows what a task may do."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the killstopped_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes."

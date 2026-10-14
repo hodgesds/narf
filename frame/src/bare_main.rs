@@ -5527,6 +5527,7 @@ fn boot_userspace_init() {
                 // and /proc/<pid>/mem against a forked COW tracee.
                 // Success: `remotevm-ok`.
                 ("remotevm_smoke", narf_verification::NARF_REMOTEVM_SMOKE_ELF),
+                ("killstopped_smoke", narf_verification::NARF_KILLSTOPPED_SMOKE_ELF),
                 ("seccomp_smoke", narf_verification::NARF_SECCOMP_SMOKE_ELF),
                 ("ptracefork_smoke", narf_verification::NARF_PTRACEFORK_SMOKE_ELF),
                 ("prctlinherit_smoke", narf_verification::NARF_PRCTLINHERIT_SMOKE_ELF),

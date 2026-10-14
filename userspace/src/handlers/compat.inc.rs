@@ -11544,10 +11544,20 @@ fn default_signal_delivery_restricted_active(
     // A group stop (`do_signal_stop`) marked this thread stopped while it was
     // running: stop here, at its exit to user mode, and count it toward the
     // group's CLD_STOPPED report.
-    if task_job_stopped(task) {
+    //
+    // Not when SIGKILL is pending: a fatal signal ends a stop (`get_signal`
+    // tests `fatal_signal_pending` before `do_signal_stop`), and it must be
+    // delivered here. Parking first and returning made a SIGSTOPped task
+    // that was blocked in a syscall immortal: SIGKILL woke it, its syscall
+    // re-executed, and every exit to user mode stopped it again before the
+    // SIGKILL could be taken — `kill -9` of a stopped process hung its
+    // parent's waitpid.
+    if task_job_stopped(task) && !task_fatal_signal_pending(task) {
         group_stop_participate(task);
         park_current_stopped(ctx);
-        return true;
+        if !task_fatal_signal_pending(task) {
+            return true;
+        }
     }
 
     // Private and group-shared pending together (`dequeue_signal` reads
