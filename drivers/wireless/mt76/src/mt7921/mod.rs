@@ -40,8 +40,6 @@
 
 #![allow(dead_code)]
 
-extern crate alloc;
-
 pub mod bringup;
 pub mod cmd;
 pub mod dma;
@@ -66,5 +64,8 @@ pub fn register() {
     register_pci_driver();
 }
 
-#[cfg(any(test, feature = "kernel-test"))]
+// Co-located smokes. The whole `mt7921` module compiles only under the
+// crate's `builtin` feature, which pulls `narf-kernel-test`, so the smokes are
+// always available here — they register into `narf.tests` via `kernel_test_in!`
+// (same shape as `drivers/net/i40e/src/i40e/tests.rs`).
 pub mod tests;

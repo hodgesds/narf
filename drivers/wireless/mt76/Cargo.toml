@@ -1,0 +1,77 @@
+# mt76 — MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920), dual-build.
+#
+# Promoted from the former `drivers/wireless/src/mt7921/` module into a proper
+# per-driver crate. Builds two ways from one source, selected by cargo feature,
+# exactly like `drivers/net/i40e/` (the locked dual-build template):
+#
+#   * `builtin` (default): an rlib dependency of the `narf-drivers-wireless`
+#     facade, registered from the kernel's Stage::Subsys initcall. The real
+#     driver (L1 remap, MCU framing, WFDMA rings, firmware download, the
+#     WirelessNetIface scaffold) lives here.
+#   * `module`: built to a relocatable `.ko` via
+#     `cargo xtask build-module -p narf-drivers-wireless-mt76 \
+#        --no-default-features --features module`. The kernel crates drop from
+#     the graph; the driver registers through the `narf_register_pci_driver`
+#     KSYMTAB export (registration-only until the wireless datapath ABI lands).
+#
+# Named `mt76` (the upstream mt76-*family* driver) rather than `mt7921`, so the
+# sibling CONNAC2/CONNAC3 parts (MT7925/MT7996) can land in the same crate. The
+# inner module path stays `mt7921` to preserve existing `super::`/`crate::`
+# references and the `drivers/wireless/mt7921` kernel-test tags.
+
+[package]
+name         = "narf-drivers-wireless-mt76"
+description  = "MediaTek CONNAC2 Wi-Fi (MT7921/MT7922/MT7961/MT7920) — built-in or loadable module."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "narf_drivers_wireless_mt76"
+path = "src/lib.rs"
+# rlib for the built-in facade dependency and the kernel link. The `.ko` build
+# overrides this to `staticlib` via `cargo xtask build-module`.
+
+[features]
+default = ["builtin"]
+# Built-in: pull the real kernel crates. The driver body only compiles here.
+builtin = [
+    "dep:narf-arch", "dep:narf-bus", "dep:narf-capabilities",
+    "dep:narf-console", "dep:narf-driver-runtime", "dep:narf-drivers",
+    "dep:narf-firmware", "dep:narf-interrupts", "dep:narf-io", "dep:narf-ipc",
+    "dep:narf-kernel-test", "dep:narf-lib", "dep:narf-memory", "dep:narf-net",
+    "dep:narf-scheduler", "dep:narf-time", "dep:narf-wireless",
+]
+# Module: NO kernel crates. The only undefined symbols in the `.ko` are the
+# C-ABI KSYMTAB exports; `xtask build-module`'s `nm -u` gate enforces that.
+module = []
+
+[dependencies]
+# Always present: a decl-macro crate with no object code of its own, so it is
+# safe to link into the `.ko`.
+narf-driver-macros = { path = "../../../driver-macros" }
+
+# Real kernel crates — present for `builtin`, absent for `module`.
+narf-arch         = { path = "../../../arch", optional = true }
+narf-bus          = { path = "../../../bus", optional = true }
+narf-capabilities = { path = "../../../capabilities", optional = true }
+narf-console      = { path = "../../../console", optional = true }
+narf-driver-runtime = { path = "../../runtime", optional = true, default-features = false, features = ["kernel"] }
+narf-drivers      = { path = "../..", optional = true }
+narf-firmware     = { path = "../../../firmware", optional = true }
+narf-interrupts   = { path = "../../../interrupts", optional = true }
+narf-io           = { path = "../../../io", optional = true }
+narf-ipc          = { path = "../../../ipc", optional = true }
+narf-kernel-test  = { path = "../../../verification/kernel-test", optional = true }
+narf-lib          = { path = "../../../lib", optional = true }
+narf-memory       = { path = "../../../memory", optional = true }
+narf-net          = { path = "../../../net", optional = true }
+narf-scheduler    = { path = "../../../scheduler", optional = true }
+narf-time         = { path = "../../../time", optional = true }
+narf-wireless     = { path = "../../../wireless", optional = true }
+async-trait       = "0.1"
+
+[lints]
+workspace = true

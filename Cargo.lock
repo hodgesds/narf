@@ -2201,6 +2201,7 @@ dependencies = [
  "narf-drivers",
  "narf-drivers-sdio",
  "narf-drivers-usb",
+ "narf-drivers-wireless-mt76",
  "narf-firmware",
  "narf-init",
  "narf-interrupts",
@@ -2214,6 +2215,31 @@ dependencies = [
  "narf-time",
  "narf-wireless",
  "zeroize",
+]
+
+[[package]]
+name = "narf-drivers-wireless-mt76"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "narf-arch",
+ "narf-bus",
+ "narf-capabilities",
+ "narf-console",
+ "narf-driver-macros",
+ "narf-driver-runtime",
+ "narf-drivers",
+ "narf-firmware",
+ "narf-interrupts",
+ "narf-io",
+ "narf-ipc",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-net",
+ "narf-scheduler",
+ "narf-time",
+ "narf-wireless",
 ]
 
 [[package]]

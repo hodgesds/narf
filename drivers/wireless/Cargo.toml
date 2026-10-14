@@ -32,6 +32,10 @@ narf-crypto       = { path = "../../crypto" }
 narf-init         = { path = "../../init" }
 narf-drivers-sdio = { path = "../sdio" }
 narf-drivers-usb  = { path = "../usb" }
+# Per-driver crate (promoted from the former src/mt7921/ module). Built-in
+# here; the same crate also builds to a loadable `.ko` via `cargo xtask
+# build-module`. See drivers/wireless/mt76/ and drivers/net/i40e/ (template).
+narf-drivers-wireless-mt76 = { path = "mt76", default-features = false, features = ["builtin"] }
 async-trait = "0.1"
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 

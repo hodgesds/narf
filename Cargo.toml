@@ -75,6 +75,7 @@ members = [
     "drivers/net/tg3",
     "drivers/net/vmxnet3",
     "drivers/wireless",
+    "drivers/wireless/mt76",
     "drivers/i2c",
     "drivers/gpio",
     "drivers/i3c",
