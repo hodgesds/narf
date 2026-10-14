@@ -680,6 +680,7 @@ fn main() {
         "sigrt_smoke",
         "strace_smoke",
         "remotevm_smoke",
+        "proctid_smoke",
         "procstate_smoke",
         "killstopped_smoke",
         "seccomp_smoke",

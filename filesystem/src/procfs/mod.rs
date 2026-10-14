@@ -519,6 +519,36 @@ pub(crate) fn pid_report(n: u64) -> Option<u64> {
     f(n)
 }
 
+/// A `/proc/<pid>/status` body rendered for the thread group, with the
+/// `Pid:` and `NSpid:` lines naming thread `tid` instead — what Linux's
+/// `proc_pid_status` prints for `/proc/<tid>/status` (`Tgid:` and `NStgid:`
+/// keep the group id).
+fn thread_status(body: String, tid: u64) -> String {
+    body.lines()
+        .map(|l| {
+            if l.starts_with("Pid:\t") {
+                format!("Pid:\t{tid}\n")
+            } else if l.starts_with("NSpid:\t") {
+                format!("NSpid:\t{tid}\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect()
+}
+
+/// `/proc/<n>` where `n` names a thread that is not its group's leader:
+/// readdir lists only leaders, but `proc_pid_lookup` resolves any tid.
+/// Returns the thread group's outer pid. `n` is in the reader's namespace.
+fn thread_group_of_visible_tid(n: u64) -> Option<u64> {
+    list_pids().into_iter().find_map(|visible| {
+        let outer = pid_resolve(visible)?;
+        hook_thread_list(outer)
+            .is_some_and(|tids| tids.contains(&n))
+            .then_some(outer)
+    })
+}
+
 fn list_pids() -> Vec<u64> {
     let v = LIST_PIDS_HOOK.load(Ordering::Acquire);
     if v == 0 {
@@ -1654,6 +1684,11 @@ pub(crate) fn task_file_owners(pid: u64) -> (u32, u32) {
 
 struct ProcPidFile {
     pid: u64,
+    /// `Some(tid)` for `/proc/<tid>` opened by a non-leader thread's id: the
+    /// thread group's file, but stat/status describe that thread (its pid
+    /// field and state), as `proc_pid_lookup` hands Linux's `/proc/<tid>`
+    /// the thread's own task. The tid is the one the reader named.
+    thread: Option<u64>,
     field: PidField,
     /// `/proc/<pid>/<name>`'s inode (see `pid_entry_ino`).
     ino: u64,
@@ -1731,9 +1766,32 @@ impl FileOps for ProcPidFile {
                     return Err(FsError::NoSuchProcess);
                 }
             };
+            // `/proc/<tid>`: the thread's own pid field and state.
+            let thread_view = self.thread.map(|tid| {
+                let state = hook_thread_stat(tid).map(|t| t.state);
+                (tid, state)
+            });
             let body = match field {
-                PidField::Stat => render_stat(&info),
-                PidField::Status => render_status(&info),
+                PidField::Stat => match thread_view {
+                    Some((tid, state)) => render_stat(&ProcTaskInfo {
+                        pid: tid,
+                        state: state.unwrap_or(info.state),
+                        ..info
+                    }),
+                    None => render_stat(&info),
+                },
+                PidField::Status => match thread_view {
+                    // Tgid stays the group's; Pid/NSpid and State are the
+                    // thread's (`proc_pid_status`).
+                    Some((tid, state)) => thread_status(
+                        render_status(&ProcTaskInfo {
+                            state: state.unwrap_or(info.state),
+                            ..info
+                        }),
+                        tid,
+                    ),
+                    None => render_status(&info),
+                },
                 PidField::Cmdline => return slice_read(&info.cmdline, offset, buf),
                 PidField::Maps => render_maps(&info),
                 PidField::NumaMaps => render_numa_maps(&info),
@@ -1868,6 +1926,8 @@ impl FileOps for ProcDirMarker {
 #[derive(Debug)]
 struct ProcPidDir {
     pid: u64,
+    /// See [`ProcPidFile::thread`].
+    thread: Option<u64>,
 }
 
 impl DirOps for ProcPidDir {
@@ -1940,6 +2000,7 @@ impl DirOps for ProcPidDir {
             pid: self.pid,
             field,
             ino: pid_entry_ino(self.pid, name),
+            thread: self.thread,
             rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
         }))
     }
@@ -2448,6 +2509,10 @@ impl DirOps for ProcRoot {
                             return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(pid))));
                         }
                     }
+                    // A non-leader thread's id (see `thread_group_of_visible_tid`).
+                    if thread_group_of_visible_tid(n).is_some() {
+                        return Some(Arc::new(ProcDirMarker::new(pid_dir_ino(n))));
+                    }
                 }
                 None
             }
@@ -2462,6 +2527,7 @@ impl DirOps for ProcRoot {
             // /proc/self resolves to the calling task's in-namespace pid translated to outer pid.
             return Some(Arc::new(ProcPidDir {
                 pid: self_outer_pid(),
+                thread: None,
             }));
         }
         if name == "thread-self" {
@@ -2487,8 +2553,14 @@ impl DirOps for ProcRoot {
         if let Ok(n) = name.parse::<u64>() {
             if let Some(pid) = pid_resolve(n) {
                 if task_info(pid, TaskInfoQuery::Basic).is_some() {
-                    return Some(Arc::new(ProcPidDir { pid }));
+                    return Some(Arc::new(ProcPidDir { pid, thread: None }));
                 }
+            }
+            if let Some(tgid) = thread_group_of_visible_tid(n) {
+                return Some(Arc::new(ProcPidDir {
+                    pid: tgid,
+                    thread: Some(n),
+                }));
             }
         }
         None
@@ -3837,6 +3909,7 @@ fn smoke_comm_file_is_owner_write_only() -> TestResult {
         pid: 1,
         field: PidField::Comm,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     let perms = f.stat().mode.perms;
@@ -3852,6 +3925,7 @@ fn smoke_comm_file_is_owner_write_only() -> TestResult {
         pid: 1,
         field: PidField::Stat,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     if ro.stat().mode.perms != 0o444 {
@@ -3869,6 +3943,7 @@ fn smoke_comm_write_updates_read() -> TestResult {
         pid: PID,
         field: PidField::Comm,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     // Write with a trailing newline (Linux userspace shape).
@@ -3888,6 +3963,7 @@ fn smoke_comm_write_truncates_to_15() -> TestResult {
         pid: PID,
         field: PidField::Comm,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     // 30 ASCII 'a' chars + newline — handler must accept and truncate.
@@ -3908,6 +3984,7 @@ fn smoke_non_comm_write_returns_readonly() -> TestResult {
         pid: 1,
         field: PidField::Stat,
         ino: 0,
+        thread: None,
         rendered: narf_lib::sync::IrqSafeSpinLock::new(None),
     };
     let wr = poll_once(f.write(0, b"ignored\n"));
@@ -4787,7 +4864,7 @@ fn smoke_procfs_inode_identity_is_stable_and_distinct() -> TestResult {
     if a.inode_attrs().dev != root.inode_attrs().dev {
         return TestResult::Fail("a procfs file is not on the procfs st_dev");
     }
-    let pid = ProcPidDir { pid: 7 };
+    let pid = ProcPidDir { pid: 7, thread: None };
     let (Some(stat), Some(status), Some(marker), Some(fd_dir)) = (
         pid.lookup("stat"),
         pid.lookup("status"),
@@ -4802,7 +4879,7 @@ fn smoke_procfs_inode_identity_is_stable_and_distinct() -> TestResult {
     if marker.ino() != fd_dir.ino() || marker.ino() == 0 {
         return TestResult::Fail("/proc/<pid>/fd: stat marker and DirOps inodes differ");
     }
-    let other = ProcPidDir { pid: 8 };
+    let other = ProcPidDir { pid: 8, thread: None };
     if pid.ino() == 0 || pid.ino() == other.ino() || pid.ino() == root.ino() {
         return TestResult::Fail("/proc/<pid> inode is not keyed on the pid");
     }

@@ -4916,6 +4916,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // (multi-iovec, partial transfer, EFAULT/ESRCH/EPERM) and
         // /proc/<pid>/mem pread/pwrite/lseek. See remotevm_smoke_x86_64.c.
         ("remotevm_smoke", "remotevm-ok"),
+        // /proc/<tid> resolves a non-leader thread (Linux proc_pid_lookup).
+        ("proctid_smoke", "proctid-ok"),
         // /proc state letters: S for a task asleep in a syscall, T stopped, R for the reader.
         ("procstate_smoke", "procstate-ok"),
         // SIGKILL ends a job-control stop (paused and running children).
