@@ -29,7 +29,9 @@ Device ioctl dispatch passes an `IoctlContext` with guarded process-memory
 copies, the open description's O_NONBLOCK state, retained descriptor lookup
 and the caller's thread-group ID to FileOps. The syscall layer also owns the
 Linux sync_file type and serves its `IoctlContext` seam
-(`sync_file_fences`, `install_sync_file`, `signal_pending`) to drivers.
+(`sync_file_fences`, `install_sync_file`, `restart_after`) to drivers; `restart_after`
+parks the ioctl with `park_reexecute_on_io_until` and re-executes it, which is
+Linux's `-ERESTARTSYS` under `handle_signal`.
 sync_file fds hold a set of leaf fences (Linux `dma_fence_unwrap`; a merge
 or a multi-fence export is a `dma_fence_array`) and answer
 `SYNC_IOC_MERGE` (fd reserved first, so EMFILE precedes EFAULT/EINVAL;

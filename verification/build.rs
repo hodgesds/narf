@@ -670,6 +670,7 @@ fn main() {
         "fb_smoke",
         "scm_smoke",
         "drm_smoke",
+        "dmabuf_sync_smoke",
         "tfd_epoll_smoke",
         "polltmo_hammer",
         "unix_epoll_smoke",

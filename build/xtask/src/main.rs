@@ -4668,6 +4668,7 @@ fn musl_case_group(cmd: &str) -> &'static str {
         "wl_",
         "mini_compositor",
         "drm_smoke",
+        "dmabuf_sync",
         "modetest",
         "fb_smoke",
         "kms",
@@ -4924,6 +4925,11 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // mmap MAP_SHARED, ADDFB2, SETCRTC. Proves Rung-3 modeset
         // path end-to-end from stock musl.
         ("drm_smoke", "drm-ok"),
+        // dma-buf implicit sync from ring 3: an atomic OUT_FENCE_PTR fence
+        // imported into a PRIME dma-buf; DMA_BUF_IOCTL_SYNC(START) over it
+        // restarts under SA_RESTART (-ERESTARTSYS) and EINTRs without it;
+        // EXPORT_SYNC_FILE polls; SYNC_IOC_MERGE + FILE_INFO.
+        ("dmabuf_sync_smoke", "dmabuf-sync-ok"),
         // VirGL 3D smoke — hand-rolled virgl command stream (clear + a
         // TGSI-shaded triangle) through renderD128, rendered by the HOST
         // GPU and pixel-verified after TRANSFER_FROM_HOST_3D. The token

@@ -51,7 +51,6 @@ pub const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: u32 = 0x4008_6203;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
-const EINTR: i64 = 4;
 
 /// Linux `enum dma_resv_usage`, in its documented total order: querying a
 /// usage returns every fence whose usage is less than or equal to it. NARF
@@ -189,17 +188,17 @@ fn neg(errno: i64) -> Result<u64, FsError> {
     Ok((-errno) as u64)
 }
 
-/// Bounded slice of an interruptible implicit-sync wait. Linux waits with
-/// `MAX_SCHEDULE_TIMEOUT` until signal or completion; NARF fences expose a
-/// timed wait only, so the wait is a loop of slices with a signal check
-/// between them.
+/// Re-poll interval of a parked implicit-sync wait.
+const WAIT_REPOLL_NS: u64 = 1_000_000;
+/// Slice of the synchronous in-kernel fallback wait.
 const WAIT_SLICE_MS: u64 = 50;
 
 /// Linux `dma_buf_ioctl` for any dma-buf `obj`.
 ///
 /// Errors Linux reports with an errno that has no [`FsError`] mapping in the
-/// syscall layer (`EMFILE`, `ENOTTY`, `EINTR`) are returned in the
-/// `Ok(-errno)` wire form, as other device ioctls in NARF do.
+/// syscall layer (`EMFILE`, `ENOTTY`) are returned in the `Ok(-errno)` wire
+/// form, as other device ioctls in NARF do. `Err(WouldBlock)` follows a
+/// successful [`IoctlContext::restart_after`].
 pub fn dma_buf_ioctl(
     obj: &DmaBufObject,
     cmd: u32,
@@ -231,15 +230,25 @@ pub fn dma_buf_ioctl(
             // `dma_resv_usage_rw(write)`. (The DRM PRIME exporters,
             // `drm_gem_prime_dmabuf_ops`, have no `begin_cpu_access`, and
             // coherent memory needs no cache maintenance.)
+            //
+            // The wait is `dma_resv_wait_timeout(.., intr = true, ..)`: a
+            // user task parks and re-executes this ioctl (everything above is
+            // validation only, so re-execution is idempotent), and a signal
+            // over the parked ioctl restarts it under SA_RESTART or completes
+            // it with -EINTR, exactly as -ERESTARTSYS does. Fence completion
+            // has no task waker, so the park re-polls every millisecond (the
+            // same policy as a sync_file's device-fence `poll_deadline`).
             for fence in obj.resv.fences(dma_resv_usage_rw(write)) {
-                while !fence.wait(WAIT_SLICE_MS) {
-                    if ctx.signal_pending() {
-                        // LINUX-GAP: Linux returns -ERESTARTSYS, which an
-                        // SA_RESTART handler turns into a transparent
-                        // restart; NARF completes the ioctl with -EINTR.
-                        return neg(EINTR);
-                    }
+                if fence.is_signalled() {
+                    continue;
                 }
+                if ctx.restart_after(WAIT_REPOLL_NS) {
+                    return Err(FsError::WouldBlock);
+                }
+                // No executor to park on: only an in-kernel caller (the
+                // kernel-test harness) reaches this, never a user task, so
+                // there is no signal to be interrupted by.
+                while !fence.wait(WAIT_SLICE_MS) {}
             }
             Ok(0)
         }

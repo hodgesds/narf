@@ -956,9 +956,17 @@ pub trait IoctlContext: Sync {
     ) -> Result<i32, InstallFdError> {
         Err(InstallFdError::Report(FsError::Unsupported))
     }
-    /// Whether the calling task has a signal pending: the condition that ends
-    /// a Linux `TASK_INTERRUPTIBLE` wait with `-ERESTARTSYS`.
-    fn signal_pending(&self) -> bool {
+    /// Linux's interruptible wait returning `-ERESTARTSYS`: arrange for the
+    /// calling syscall to park (waking on any wake, or after `repoll_ns`)
+    /// and then re-execute from its original arguments. A signal delivered
+    /// over the parked syscall restarts it under `SA_RESTART` and completes
+    /// it with `-EINTR` otherwise (`handle_signal`).
+    ///
+    /// `true` means the restart is arranged: the driver must return
+    /// `Err(FsError::WouldBlock)` having caused no side effect, so the
+    /// re-execution is idempotent. `false` means there is no executor to
+    /// park on (a kernel-test caller) and the driver waits synchronously.
+    fn restart_after(&self, _repoll_ns: u64) -> bool {
         false
     }
 }

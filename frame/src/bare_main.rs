@@ -5456,6 +5456,13 @@ fn boot_userspace_init() {
                 // GET_CAP(DUMB_BUFFER), CREATE_DUMB, MAP_DUMB, mmap
                 // MAP_SHARED, ADDFB2, SETCRTC. Success: `drm-ok`.
                 ("drm_smoke", narf_verification::NARF_DRM_SMOKE_ELF),
+                // dma-buf implicit sync from ring 3: SYNC(START) over a
+                // pending vblank fence restarts under SA_RESTART and EINTRs
+                // without it. Success: `dmabuf-sync-ok`.
+                (
+                    "dmabuf_sync_smoke",
+                    narf_verification::NARF_DMABUF_SYNC_SMOKE_ELF,
+                ),
                 (
                     "tfd_epoll_smoke",
                     narf_verification::NARF_TFD_EPOLL_SMOKE_ELF,

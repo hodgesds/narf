@@ -5,6 +5,10 @@ use alloc::vec::Vec;
 
 struct DeviceIoctlContext {
     nonblocking: bool,
+    /// Non-zero once the driver asked for an interruptible restart
+    /// ([`narf_filesystem::IoctlContext::restart_after`]): the
+    /// `CLOCK_MONOTONIC` re-poll deadline of the park.
+    restart_deadline_ns: core::sync::atomic::AtomicU64,
 }
 
 impl narf_filesystem::IoctlContext for DeviceIoctlContext {
@@ -83,8 +87,22 @@ impl narf_filesystem::IoctlContext for DeviceIoctlContext {
             ))
     }
 
-    fn signal_pending(&self) -> bool {
-        has_interrupting_signal(current_task_id())
+    /// Records the re-poll deadline; `sys_ioctl` parks with
+    /// `park_reexecute_on_io_until` once the driver returns. Possible only
+    /// for a user task with an executor to yield to, the same condition the
+    /// park itself requires.
+    fn restart_after(&self, repoll_ns: u64) -> bool {
+        if crate::user_task::current_user_task().is_none()
+            || crate::user_task::yield_hook().is_none()
+        {
+            return false;
+        }
+        let deadline = narf_time::wall::monotonic_ns()
+            .saturating_add(repoll_ns)
+            .max(1);
+        self.restart_deadline_ns
+            .store(deadline, core::sync::atomic::Ordering::Release);
+        true
     }
 }
 
@@ -1654,9 +1672,26 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
 
     let ioctl_context = DeviceIoctlContext {
         nonblocking: status_flags & crate::fd::O_NONBLOCK != 0,
+        restart_deadline_ns: core::sync::atomic::AtomicU64::new(0),
     };
     let ioctl_result = poll_blocking(ops.ioctl_user(cmd, arg as u64, &ioctl_context))
         .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+    // An interruptible driver wait (-ERESTARTSYS): park, then re-execute the
+    // ioctl from its original arguments. Nothing above this point has a side
+    // effect on such a path: every earlier arm is gated on its own command
+    // number, and the one that reserves a descriptor (EXECBUFFER's
+    // FENCE_FD_OUT) never asks for a restart; its reservation would be
+    // dropped, not leaked, by the early return.
+    let restart_deadline = ioctl_context
+        .restart_deadline_ns
+        .load(core::sync::atomic::Ordering::Acquire);
+    if restart_deadline != 0
+        && matches!(ioctl_result, Err(narf_filesystem::FsError::WouldBlock))
+        && out_fence.is_none()
+        && park_reexecute_on_io_until(ctx, restart_deadline, false)
+    {
+        return;
+    }
     if ioctl_result.is_ok() {
         // Atomic OUT_FENCE_PTR: the DRM bridge recorded one (user pointer,
         // vblank deadline) pair per requesting CRTC; mint the sync_file fds

@@ -330,7 +330,7 @@ fn install_sync_file(
     fences: Vec<Arc<dyn DrmFence>>,
     report: &mut dyn FnMut(i32) -> Result<(), FsError>,
 ) -> Result<i32, InstallFdError>;
-fn signal_pending(&self) -> bool;
+fn restart_after(&self, repoll_ns: u64) -> bool; // default false
 
 pub mod dma_buf {
     pub enum DmaResvUsage { Kernel, Write, Read, Bookkeep }
@@ -1179,7 +1179,11 @@ syscall layer: `IoctlContext::sync_file_fences` is `sync_file_get_fence` +
 `install_sync_file` reserves an `O_CLOEXEC` descriptor (`NoDescriptor` =
 `EMFILE`), builds `dma_resv_get_singleton`'s result (stub, the fence, or a
 `dma_fence_array`), lets `report` copy the number out, and installs only on
-success. `signal_pending` lets an interruptible wait end with `EINTR`.
+success. `restart_after(repoll_ns)` is `-ERESTARTSYS`: for a user task it
+arranges a park and re-execution of the ioctl (the driver then returns
+`WouldBlock` with no side effect), so a signal over the wait restarts it
+under `SA_RESTART` and completes it with `EINTR` otherwise; it returns
+`false` only without an executor (kernel tests), which wait synchronously.
 
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that

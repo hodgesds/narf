@@ -61,6 +61,7 @@ mountapi_smoke_x86_64
 jobctl_smoke_x86_64
 procfs2_smoke_x86_64
 fifoeintr_smoke_x86_64
+dmabuf_sync_smoke_x86_64
 profloop_smoke_x86_64
 
 # Host-derived / downloaded binaries used by the busybox + off-box redis
