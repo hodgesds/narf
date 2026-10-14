@@ -477,6 +477,22 @@ headers with one identification and eight-byte-aligned non-final payloads.
 Packets retained during neighbor discovery preserve the MTU decision and are
 fragmented only after resolution, before device transmission.
 
+Received IPv4 fragments addressed to this host are reassembled by
+`ip_fragment::ip_defrag` at Linux's `ip_local_deliver` point: after the input
+routing decision (forwarded fragments are never reassembled) and before
+netfilter LOCAL_IN, which sees the whole datagram. Queues are keyed by
+(namespace, saddr, daddr, id, protocol) and follow `ip_frag_queue` /
+`inet_frag_queue_insert`: an overlapping fragment discards the whole queue,
+one wholly inside an existing run is a dropped duplicate, a non-final
+fragment's length is truncated to a multiple of 8, and a datagram longer
+than 65535 bytes fails. Over `IPFRAG_HIGH_THRESH` (4 MiB per namespace) every
+fragment is refused. A queue older than `IPFRAG_TIME_NS` (30 s) is freed by
+`ip_fragment::tick` from the net timer pump, sending ICMP Time Exceeded code 1
+quoting the first fragment when offset 0 had arrived. The reassembled
+datagram's transport checksum is verified in software over the whole
+payload. `ip_fragment::stats_in(ns)` returns the ReasmReqds / ReasmOKs /
+ReasmFails / ReasmTimeout counters `/proc/net/snmp` reports.
+
 Linux `/proc/net/{tcp,tcp6,udp,udp6,raw,arp,route,dev,nf_conntrack}` snapshots resolve
 the calling task's network namespace and exclude objects owned by every other
 namespace.

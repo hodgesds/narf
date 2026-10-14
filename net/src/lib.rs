@@ -55,6 +55,7 @@ pub fn release_network_namespace(net_ns_id: u64) {
     raw_sock::remove_namespace(net_ns_id);
     icmp_sock::remove_namespace(net_ns_id);
     tcp_stack::remove_namespace(net_ns_id);
+    ip_fragment::remove_namespace(net_ns_id);
     dhcp::remove_namespace(net_ns_id);
     route::remove_namespace(net_ns_id);
     ipv6::addrs::remove_namespace(net_ns_id);
@@ -81,6 +82,7 @@ pub mod icmp_sock;
 pub mod iface;
 pub mod ifaddr;
 pub mod ip_forward;
+pub mod ip_fragment;
 pub mod ip_local;
 pub mod ipv4;
 pub mod ipv6;
@@ -135,6 +137,8 @@ mod dhcp_dns_e2e_tests;
 mod e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod errno_linux_tests;
+#[cfg(any(test, feature = "kernel-test"))]
+mod ip_fragment_tests;
 #[cfg(any(test, feature = "kernel-test"))]
 mod ipv6_e2e_tests;
 #[cfg(any(test, feature = "kernel-test"))]

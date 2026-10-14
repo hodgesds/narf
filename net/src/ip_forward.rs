@@ -255,7 +255,7 @@ pub fn try_forward(net_ns_id: u64, iface_in: &str, packet: &[u8]) -> bool {
 /// per fragment of a single datagram; the last, an error aimed at an address
 /// that is either nobody or everybody. Linux's `__icmp_send` applies the same
 /// set.
-fn icmp_error_permitted(packet: &[u8], ihl: usize) -> bool {
+pub(crate) fn icmp_error_permitted(packet: &[u8], ihl: usize) -> bool {
     let frag = u16::from_be_bytes([packet[FRAG_OFF], packet[FRAG_OFF + 1]]);
     if frag & FRAG_OFF_MASK != 0 {
         return false;
@@ -362,6 +362,42 @@ fn emit(egress: &iface::NetIfaceSnapshot, dst_mac: [u8; 6], packet: &[u8]) {
 /// by definition somewhere else, and for an off-link one its own address has
 /// no MAC on this segment to find.
 fn send_icmp_error(net_ns_id: u64, dst: Ipv4Addr, icmp_body: Vec<u8>) {
+    send_icmp_error_with(net_ns_id, dst, None, icmp_body, |nexthop| {
+        arp_resolve_in(net_ns_id, nexthop, ARP_TIMEOUT_MS).ok()
+    });
+}
+
+/// [`send_icmp_error`] for callers that must never spin on ARP — the
+/// fragment-reassembly expiry runs from the net timer pump, where a 1 s
+/// busy-wait for a neighbour would stall every other pump. An unresolved
+/// next hop gets an ARP request and the error is dropped, the way it would
+/// be once a neighbour's queue overflows.
+///
+/// `src` overrides the source address: an error about a datagram that was
+/// addressed to this host is sourced from that destination address
+/// (`__icmp_send`: `saddr = iph->daddr` when the route is `RTCF_LOCAL`).
+pub(crate) fn send_icmp_error_nonblocking(
+    net_ns_id: u64,
+    dst: Ipv4Addr,
+    src: Option<[u8; 4]>,
+    icmp_body: Vec<u8>,
+) {
+    send_icmp_error_with(net_ns_id, dst, src, icmp_body, |nexthop| {
+        let mac = crate::tcp_stack::arp_cached_in(net_ns_id, nexthop);
+        if mac.is_none() {
+            let _ = crate::tcp_stack::send_arp_request_in(net_ns_id, nexthop);
+        }
+        mac
+    });
+}
+
+fn send_icmp_error_with(
+    net_ns_id: u64,
+    dst: Ipv4Addr,
+    src_override: Option<[u8; 4]>,
+    icmp_body: Vec<u8>,
+    resolve: impl FnOnce([u8; 4]) -> Option<[u8; 6]>,
+) {
     let (egress, nexthop, src) = match route::route_lookup_in(net_ns_id, dst) {
         Some(r) => match iface::lookup_in(net_ns_id, &r.iface) {
             Some(e) => {
@@ -384,9 +420,10 @@ fn send_icmp_error(net_ns_id: u64, dst: Ipv4Addr, icmp_body: Vec<u8>) {
             None => return,
         },
     };
-    let dst_mac = match arp_resolve_in(net_ns_id, nexthop.0, ARP_TIMEOUT_MS) {
-        Ok(m) => m,
-        Err(_) => return,
+    let src = src_override.unwrap_or(src);
+    let dst_mac = match resolve(nexthop.0) {
+        Some(m) => m,
+        None => return,
     };
     let ip_total = MIN_HDR + icmp_body.len();
     let mut frame = alloc::vec![0u8; ETH_HDR_LEN + ip_total];

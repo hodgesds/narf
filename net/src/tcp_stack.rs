@@ -527,12 +527,47 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str, csum_verified: bool)
         }
     }
 
+    // ── ip_local_deliver: reassembly ──
+    //
+    // `ip_local_deliver` calls `ip_defrag(..., IP_DEFRAG_LOCAL_DELIVER)` when
+    // `ip_is_fragment()`, after the routing decision (so forwarded fragments
+    // above are never reassembled) and before NF LOCAL_IN, which sees the
+    // whole datagram. A non-fragment pays one branch on the frag_off word.
+    if crate::ip_fragment::is_fragment(ctx.packet()) {
+        let Some(mut whole) = crate::ip_fragment::ip_defrag(net_ns_id, iface_in, ctx.packet())
+        else {
+            return;
+        };
+        drop(ctx);
+        let mut ctx = crate::netfilter::PktCtx::new_ipv4(
+            crate::netfilter::HookPoint::LocalIn,
+            iface_in,
+            "",
+            &mut whole,
+        )
+        .with_net_ns(net_ns_id);
+        if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
+            return;
+        }
+        // No receive checksum offload covers a datagram stitched from
+        // several frames: `ip_frag_reasm` leaves `CHECKSUM_NONE`, so the
+        // transport verifies its checksum over the whole payload.
+        local_deliver_finish(net_ns_id, iface_in, ctx.packet(), false);
+        return;
+    }
+
     ctx.hook = crate::netfilter::HookPoint::LocalIn;
     ctx.conntrack_id = None;
     if crate::netfilter::nf_dispatch(&mut ctx) == crate::netfilter::Verdict::Drop {
         return;
     }
-    let body = ctx.packet();
+    local_deliver_finish(net_ns_id, iface_in, ctx.packet(), csum_verified);
+}
+
+/// `ip_local_deliver_finish`: hand a whole, LOCAL_IN-accepted datagram to
+/// its transport protocol. `csum_verified` is the driver/GRO
+/// `CHECKSUM_UNNECESSARY` verdict; it never covers a reassembled datagram.
+fn local_deliver_finish(net_ns_id: u64, iface_in: &str, body: &[u8], csum_verified: bool) {
     let (ip, payload) = match parse_ipv4(body) {
         Some(t) => t,
         None => return,
@@ -670,6 +705,7 @@ static TIMER_PUMP_INSTALLED: AtomicUsize = AtomicUsize::new(0);
 
 fn timer_tick_pump() {
     crate::tcp::core::tick_all();
+    crate::ip_fragment::tick();
 }
 
 // ── Init ────────────────────────────────────────────────────────
