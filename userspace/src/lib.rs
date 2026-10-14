@@ -165,6 +165,7 @@ mod abi_uaccess_tests;
 mod abi_udev_protocol_tests;
 mod abi_udp_gso_tests;
 mod abi_udp_tests;
+mod abi_unix_stream_tests;
 mod abi_vconsole_tests;
 mod mount_e2e_tests;
 mod process_e2e_tests;

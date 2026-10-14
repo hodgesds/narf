@@ -122,7 +122,10 @@ impl SocketFile {
                     (val as u32).min(WMEM_MAX)
                 };
                 let v = requested.min((i32::MAX / 2) as u32);
-                self.options.lock().sndbuf = (v * 2).max(SOCK_MIN_SNDBUF);
+                let sndbuf = (v * 2).max(SOCK_MIN_SNDBUF);
+                self.options.lock().sndbuf = sndbuf;
+                // `sk->sk_write_space(sk)`: a raised limit wakes writers.
+                self.unix_stream_sndbuf_changed(sndbuf as usize);
                 OK
             }
             SO_RCVBUF | SO_RCVBUFFORCE => {

@@ -2626,8 +2626,12 @@ fn smoke_epoll_epollet_write_retriggers_readable() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_epoll_epollet_write_retriggers_readable);
 
-/// A full stream is not writable; consuming one byte must publish exactly one
-/// EPOLLOUT edge for the full-to-space transition.
+/// A full stream is not writable; consuming the first skb must publish
+/// exactly one EPOLLOUT edge for the full-to-space transition. As on Linux
+/// (`unix_writable`: `sk_wmem_alloc << 2 <= sk_sndbuf`), the 64 KiB send
+/// queues a 36544-byte skb and a 28992-byte one; reading part of an skb
+/// frees nothing, reading the whole first skb drops the sender back under
+/// a quarter of its sndbuf.
 fn smoke_epoll_epollet_full_to_space_writable_edge() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2705,20 +2709,27 @@ fn smoke_epoll_epollet_full_to_space_writable_edge() -> TestResult {
         return TestResult::Fail("full stream was reported writable");
     }
 
-    let mut byte = 0u8;
-    if call(
-        Syscall::SocketRecv,
-        SyscallArgs {
-            arg0: sv[1] as u64,
-            arg1: (&mut byte as *mut u8) as u64,
-            arg2: 1,
-            ..SyscallArgs::default()
-        },
-    )
-    .value
-        != 1
-    {
-        return TestResult::Fail("failed to make stream writable");
+    let mut first_skb = alloc::vec![0u8; 36544];
+    let recv_into = |buf: &mut [u8]| {
+        call(
+            Syscall::SocketRecv,
+            SyscallArgs {
+                arg0: sv[1] as u64,
+                arg1: buf.as_mut_ptr() as u64,
+                arg2: buf.len() as u64,
+                ..SyscallArgs::default()
+            },
+        )
+        .value
+    };
+    if recv_into(&mut first_skb[..1]) != 1 {
+        return TestResult::Fail("failed to read the first byte");
+    }
+    if wait(&mut out_ev).value != 0 {
+        return TestResult::Fail("reading part of an skb made the sender writable");
+    }
+    if recv_into(&mut first_skb[1..]) != 36543 {
+        return TestResult::Fail("failed to consume the rest of the first skb");
     }
     if wait(&mut out_ev).value != 1 || wait(&mut out_ev).value != 0 {
         return TestResult::Fail("full-to-space transition did not publish one edge");
