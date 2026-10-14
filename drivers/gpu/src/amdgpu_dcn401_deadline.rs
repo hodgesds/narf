@@ -258,7 +258,7 @@ pub(super) fn bound(
 ) -> bool {
     let t = plan.mode.timing;
     let surface = a.surface;
-    dml::admit(&plan.soc, &plan.mode) == Ok(*plan)
+    plan.readmits()
         && timing.pipe == a.pipe
         && timing.timing == t
         && timing.sync == plan.sync

@@ -1,15 +1,15 @@
-//! Native DCN4.0.1 single-pipe scanout admission: the DML21 mode-support and
+//! Native DCN4.0.1 scanout admission for up to four pipes: the DML21 mode-support and
 //! mode-programming path that Linux runs for Navi48 (`dml2_core_dcn4_calcs.c`,
 //! `dml2_dpmm_dcn4.c`, `dml2_mcg_dcn4.c`, `dml2_pmo_dcn4_fams2.c` stutter
 //! reservation), reduced to the one configuration the native scanout path
 //! implements and evaluated in fixed point.
 //!
-//! The admitted shape is one DP SST stream with progressive fixed timing and
-//! one unscaled, unrotated, full-frame linear XRGB/XBGR8888 plane in physical
-//! VRAM on one pipe: GPUVM/HostVM, DCC, MALL/SubVP, cursor, tdlut, dynamic
+//! The admitted shape is up to four streams with progressive fixed timing,
+//! each with one unscaled, unrotated, full-frame linear XRGB/XBGR8888 plane
+//! in physical VRAM on its own pipe: GPUVM/HostVM, DCC, MALL/SubVP, cursor, tdlut, dynamic
 //! metadata, writeback, ODM/MPC combine, DSC and immediate flip are all off.
-//! The default 320-KiB DET from the staged requestor is a fixed input rather
-//! than DML's own allocation. Anything else is rejected, not approximated.
+//! The default 320-KiB DET from the staged requestor is a fixed input for
+//! every pipe rather than DML's own allocation (four pipes fit the CRB). Anything else is rejected, not approximated.
 //!
 //! Policy mirrors the native clock owner: memory clock switching is disabled
 //! for the whole scanout, so DML's UCLK pstate strategies are never searched
@@ -24,6 +24,7 @@
 //! bound to any owner until a caller binds it.
 use crate::amdgpu_dcn401_otg::GlobalSync;
 use crate::amdgpu_dml::{Fx, Timing};
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -181,7 +182,14 @@ pub struct Plan {
     pub det_bytes: u32,
     /// Vertical blank budgeted for self-refresh entry and exit, if any.
     pub stutter_reserved_us: u32,
+    /// Every mode admitted together with this one, in admission order; this
+    /// plan is `streams[stream]`. A plan is only valid in that configuration.
+    pub streams: [Option<Mode>; MAX_STREAMS],
+    pub stream: u8,
 }
+
+/// Streams admitted together at most: one per pipe.
+pub const MAX_STREAMS: usize = 4;
 
 // ── dml2_socbb_dcn401 / dml_dcn4_variant_a_soc_qos_params ──────────────────
 const CHANNEL_BYTES: u64 = 2;
@@ -420,7 +428,8 @@ struct Schedule {
 /// Everything one evaluation at one clock state produces.
 #[derive(Clone, Copy)]
 struct Evaluation {
-    pre: Schedule,
+    /// Each surface's prefetch schedule, in admission order.
+    planes: [Schedule; MAX_STREAMS],
     extra: Fx,
     extra_sr: Fx,
     t_calc: Fx,
@@ -498,28 +507,52 @@ impl Shape {
         }
         Some(time.over(time.minus(urgent)))
     }
-    /// `CalculateDCFCLKDeepSleep` with VRatio 1 and no tdlut.
-    fn deep_sleep(&self) -> Fx {
+    /// `CalculateDCFCLKDeepSleep`'s per-surface term with VRatio 1 and no
+    /// tdlut.
+    fn deep_sleep_surface(&self) -> Fx {
         let factor = q(DCFCLK_FACTOR_HUNDREDTHS, 100);
-        let per_surface = factor
+        factor
             .times(fx(i64::from(BYTES_PER_PIXEL)))
             .over(fx(64))
             .times(self.pclk)
-            .max(self.pclk.over(fx(16)));
-        fx(8)
-            .max(factor.times(self.vactive_bw).over(fx(RETURN_BUS_BYTES)))
-            .max(per_surface)
+            .max(self.pclk.over(fx(16)))
     }
-    /// [`Self::deep_sleep`] as DPMM passes it on: truncated to kHz, computed
-    /// exactly so a whole-kHz result does not lose a unit to rounding.
-    fn deep_sleep_khz(&self) -> u32 {
-        let pclk = u64::from(self.t.pixel_clock_khz);
-        let f = DCFCLK_FACTOR_HUNDREDTHS as u64;
-        let bw = f * u64::from(self.swath * BYTES_PER_PIXEL) * pclk
-            / (100 * RETURN_BUS_BYTES as u64 * u64::from(self.t.h_total));
-        let surface = (f * u64::from(BYTES_PER_PIXEL) * pclk / (100 * 64)).max(pclk / 16);
-        8000.max(bw).max(surface) as u32
-    }
+}
+
+/// `CalculateDCFCLKDeepSleep` over every admitted surface: the total read
+/// bandwidth's term against each surface's own.
+fn deep_sleep(shapes: &[Shape]) -> Fx {
+    let factor = q(DCFCLK_FACTOR_HUNDREDTHS, 100);
+    let read = shapes
+        .iter()
+        .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw));
+    shapes.iter().fold(
+        fx(8).max(factor.times(read).over(fx(RETURN_BUS_BYTES))),
+        |ds, s| ds.max(s.deep_sleep_surface()),
+    )
+}
+/// [`deep_sleep`] as DPMM passes it on: truncated to kHz, computed exactly
+/// (over the product of the line totals) so a whole-kHz result does not lose
+/// a unit to rounding.
+fn deep_sleep_khz(shapes: &[Shape]) -> u32 {
+    let f = DCFCLK_FACTOR_HUNDREDTHS as u128;
+    let den: u128 = shapes.iter().map(|s| u128::from(s.t.h_total)).product();
+    let num: u128 = shapes
+        .iter()
+        .map(|s| {
+            u128::from(s.swath * BYTES_PER_PIXEL) * u128::from(s.t.pixel_clock_khz) * den
+                / u128::from(s.t.h_total)
+        })
+        .sum();
+    let bw = f * num / (100 * RETURN_BUS_BYTES as u128 * den);
+    shapes.iter().fold(8000.max(bw) as u32, |ds, s| {
+        let pclk = u64::from(s.t.pixel_clock_khz);
+        let surface = (f as u64 * u64::from(BYTES_PER_PIXEL) * pclk / (100 * 64)).max(pclk / 16);
+        ds.max(surface as u32)
+    })
+}
+
+impl Shape {
     /// `CalculatePrefetchSchedule` with no VM, rows, meta, tdlut, cursor or
     /// dynamic metadata: VM and row stages take their quarter-line minimum.
     fn prefetch(
@@ -628,32 +661,39 @@ impl Shape {
             .over(l);
         s
     }
-    /// The shared mode-support/mode-programming evaluation at one state.
-    /// Latency and extra latency come from `lat_state`; urgent bandwidth is
-    /// checked against `bw_state` (mode support uses the maximum clocks).
-    fn evaluate(
-        &self,
-        lat_state: State,
-        bw_state: State,
-        uclk_khz: u64,
-        clk: PipeClocks,
-        reserved_us: i64,
-    ) -> Result<Evaluation, Error> {
-        let lat = latency(lat_state, uclk_khz);
-        // CalculateExtraLatency: dcn4x, max outstanding when urgent expected.
-        let return_bw = {
-            let a = available(lat_state).urgent[0];
-            a[0].min(a[1])
-        };
-        let t_arb = fx(PIXEL_CHUNK_KBYTES * 1024).over(return_bw);
-        let outstanding =
-            fx(ROB_KBYTES * 1024 - MAX_OUTSTANDING_REQS * REQUEST_BYTES).over(return_bw);
-        let extra = outstanding.plus(t_arb);
-        let t_calc = fx(24).over(clk.deep_sleep);
-        let t_wait = fx(reserved_us).plus(lat.urgent.max(lat.trip));
-        let pre = self.prefetch(clk, &lat, t_wait, extra, t_calc);
+}
+
+/// The shared mode-support/mode-programming evaluation of every surface at
+/// one state, each on its own pipe clocks. Latency and extra latency come
+/// from `lat_state`; urgent bandwidth, summed over the surfaces, is checked
+/// against `bw_state` (mode support uses the maximum clocks).
+fn evaluate(
+    shapes: &[Shape],
+    lat_state: State,
+    bw_state: State,
+    uclk_khz: u64,
+    clk: &[PipeClocks],
+    reserved_us: i64,
+) -> Result<Evaluation, Error> {
+    let lat = latency(lat_state, uclk_khz);
+    // CalculateExtraLatency: dcn4x, max outstanding when urgent expected;
+    // CalculateTarb: one pixel chunk per DPP.
+    let return_bw = {
+        let a = available(lat_state).urgent[0];
+        a[0].min(a[1])
+    };
+    let t_arb = fx(shapes.len() as i64 * PIXEL_CHUNK_KBYTES * 1024).over(return_bw);
+    let outstanding = fx(ROB_KBYTES * 1024 - MAX_OUTSTANDING_REQS * REQUEST_BYTES).over(return_bw);
+    let extra = outstanding.plus(t_arb);
+    // Deep-sleep DCFCLK is global: every pipe carries the same value.
+    let t_calc = fx(24).over(clk[0].deep_sleep);
+    let t_wait = fx(reserved_us).plus(lat.urgent.max(lat.trip));
+    let mut planes = [Schedule::default(); MAX_STREAMS];
+    let (mut urgent, mut non_urgent) = (Fx::ZERO, Fx::ZERO);
+    for (k, shape) in shapes.iter().enumerate() {
+        let pre = shape.prefetch(clk[k], &lat, t_wait, extra, t_calc);
         // NotEnoughUrgentLatencyHiding for active fetch, then the schedule.
-        let burst = self
+        let burst = shape
             .burst(lat.urgent, Fx::ONE)
             .ok_or(Error::UrgentLatencyHiding)?;
         if pre.no_time
@@ -663,55 +703,62 @@ impl Shape {
         {
             return Err(Error::Prefetch);
         }
-        let pre_burst = self
+        let pre_burst = shape
             .burst(lat.urgent, pre.vratio_pre)
             .ok_or(Error::UrgentLatencyHiding)?;
         // calculate_peak_bandwidth_required: no flip, VM, cursor or excess
         // vactive fill, and unity DCC/MALL factors for both SDP and DRAM.
-        let urgent = self
-            .vactive_bw
-            .times(burst)
-            .max(pre.prefetch_bw.times(pre_burst))
-            .max(pre.prefetch_bw_max.times(pre_burst))
-            .max(self.vactive_bw);
-        let non_urgent = self
-            .vactive_bw
-            .max(pre.prefetch_bw)
-            .max(pre.prefetch_bw_max);
-        // check_urgent_bandwidth_support for sys-active and, with a MALL,
-        // SVP-prefetch derates.
-        let avail = available(bw_state);
-        let mut frac = [Fx::ZERO; 2];
-        for (state, a) in avail.urgent.iter().enumerate() {
-            frac[state] = non_urgent.over(a[0]).max(non_urgent.over(a[1]));
-            if (state == 0 || MALL_PRESENT)
-                && (urgent > a[0] || urgent > a[1] || frac[state] > Fx::ONE)
-            {
-                return Err(Error::Bandwidth);
-            }
-        }
-        Ok(Evaluation {
-            pre,
-            extra,
-            extra_sr: t_arb,
-            t_calc,
-            t_wait,
-            lat,
-            frac_nom: frac[0],
-            frac_mall: frac[1],
-            non_urgent_sdp: non_urgent,
-        })
+        urgent = urgent.plus(
+            shape
+                .vactive_bw
+                .times(burst)
+                .max(pre.prefetch_bw.times(pre_burst))
+                .max(pre.prefetch_bw_max.times(pre_burst))
+                .max(shape.vactive_bw),
+        );
+        non_urgent = non_urgent.plus(
+            shape
+                .vactive_bw
+                .max(pre.prefetch_bw)
+                .max(pre.prefetch_bw_max),
+        );
+        planes[k] = pre;
     }
+    // check_urgent_bandwidth_support for sys-active and, with a MALL,
+    // SVP-prefetch derates.
+    let avail = available(bw_state);
+    let mut frac = [Fx::ZERO; 2];
+    for (state, a) in avail.urgent.iter().enumerate() {
+        frac[state] = non_urgent.over(a[0]).max(non_urgent.over(a[1]));
+        if (state == 0 || MALL_PRESENT) && (urgent > a[0] || urgent > a[1] || frac[state] > Fx::ONE)
+        {
+            return Err(Error::Bandwidth);
+        }
+    }
+    Ok(Evaluation {
+        planes,
+        extra,
+        extra_sr: t_arb,
+        t_calc,
+        t_wait,
+        lat,
+        frac_nom: frac[0],
+        frac_mall: frac[1],
+        non_urgent_sdp: non_urgent,
+    })
+}
+
+impl Shape {
     /// CalculateWatermarksMALLUseAndDRAMSpeedChangeSupport: active latency
     /// hiding against the GDDR6 temperature-read watermark.
-    fn temp_read_ok(&self, e: &Evaluation) -> bool {
+    fn temp_read_ok(&self, e: &Evaluation, pre: &Schedule) -> bool {
         let lb_lines = (LINE_BUFFER_BITS / LB_BITS_PER_PIXEL / i64::from(self.swath))
             .min(MAX_LINE_BUFFER_LINES);
         let det_lines = self.det_bytes / BYTES_PER_PIXEL / self.swath;
         let hiding = fx(lb_lines + i64::from(det_lines)).times(self.line).minus(
-            fx(i64::from(e.pre.dst_x))
+            fx(i64::from(pre.dst_x))
                 .over(fx(i64::from(self.t.h_total)))
-                .plus(fx(i64::from(e.pre.dst_y)))
+                .plus(fx(i64::from(pre.dst_y)))
                 .times(self.line),
         );
         let urgent_wm = e.lat.urgent.plus(e.extra);
@@ -793,12 +840,28 @@ impl Soc {
 /// Admit `mode` on `soc`, returning its programming plan or the first DML
 /// check it fails. Pure and deterministic: the same inputs give the same plan.
 pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
+    Ok(admit_all(soc, &[*mode])?[0])
+}
+
+/// Admit `modes` together, one stream and one pipe each, returning their
+/// plans in order or the first DML check the configuration fails. Every
+/// pipe keeps the fixed DET, and the shared quantities are joint as in DML21:
+/// read and urgent bandwidth sum over the surfaces, extra latency takes one
+/// pixel chunk per DPP, deep-sleep DCFCLK, DISPCLK and DPPREFCLK cover every
+/// pipe, and stutter is budgeted only if every stream's blank allows it.
+/// The global watermarks and arbiter are therefore the same in every plan.
+pub fn admit_all(soc: &Soc, modes: &[Mode]) -> Result<Vec<Plan>, Error> {
     soc.validate()?;
-    let shape = Shape::new(mode)?;
-    let t = shape.t;
-    shape.buffers()?;
+    if modes.is_empty() || modes.len() > MAX_STREAMS {
+        return Err(Error::Invalid);
+    }
+    let mut shapes = Vec::with_capacity(modes.len());
+    for mode in modes {
+        let shape = Shape::new(mode)?;
+        shape.buffers()?;
+        shapes.push(shape);
+    }
     let (dcfclk_khz, fclk_khz, bw_kbps) = clock_state(soc)?;
-    let pclk_khz = u64::from(t.pixel_clock_khz);
     let state = State {
         dcfclk: mhz(dcfclk_khz),
         fclk: mhz(fclk_khz),
@@ -811,13 +874,21 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
         ..state
     };
     let uclk_khz = u64::from(soc.uclk_khz);
-    // Mode support: ODM bypass, one DPP, DISPCLK = DPPCLK = pixel clock,
-    // checked against the downspread-limited maximums.
+    // Mode support: ODM bypass, one DPP, DISPCLK = DPPCLK = pixel clock per
+    // surface, checked against the downspread-limited maximums. DISPCLK is
+    // the fastest surface's.
     let ss = |khz: u32| u64::from(khz) * 10_000 / DOWNSPREAD_TENTHOUSANDTHS as u64;
-    if pclk_khz > ss(soc.dispclk_max_khz) || pclk_khz > ss(soc.dppclk_max_khz) {
+    let max_pclk_khz = modes
+        .iter()
+        .map(|m| m.timing.pixel_clock_khz)
+        .max()
+        .unwrap_or(0);
+    if u64::from(max_pclk_khz) > ss(soc.dispclk_max_khz)
+        || u64::from(max_pclk_khz) > ss(soc.dppclk_max_khz)
+    {
         return Err(Error::PixelClock);
     }
-    let deep_sleep = shape.deep_sleep();
+    let ds = deep_sleep(&shapes);
     // Outstanding-request coverage at DML's DCF state.
     let lat = latency(state, uclk_khz);
     let outstanding_us =
@@ -826,45 +897,56 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
         return Err(Error::Latency);
     }
     // Average bandwidth at maximum clocks.
-    let avg = available(max_state).average;
-    for a in avg {
-        if shape.vactive_bw > a[0] || shape.vactive_bw > a[1] {
+    let read = shapes
+        .iter()
+        .fold(Fx::ZERO, |sum, s| sum.plus(s.vactive_bw));
+    for a in available(max_state).average {
+        if read > a[0] || read > a[1] {
             return Err(Error::Bandwidth);
         }
     }
+    let max_pclk = mhz(u64::from(max_pclk_khz));
     let support = |reserved_us: i64| -> Result<(), Error> {
-        let clk = PipeClocks {
-            dpp: shape.pclk,
-            disp: shape.pclk,
-            deep_sleep,
-        };
-        let e = shape.evaluate(state, max_state, uclk_khz, clk, reserved_us)?;
+        let clk: Vec<PipeClocks> = shapes
+            .iter()
+            .map(|s| PipeClocks {
+                dpp: s.pclk,
+                disp: max_pclk,
+                deep_sleep: ds,
+            })
+            .collect();
+        let e = evaluate(&shapes, state, max_state, uclk_khz, &clk, reserved_us)?;
         let rob = fx((ROB_KBYTES - PIXEL_CHUNK_KBYTES) * 1024).over(e.non_urgent_sdp);
         if rob < e.lat.max_urgent {
             return Err(Error::Latency);
         }
-        if !shape.temp_read_ok(&e) {
-            return Err(Error::TempRead);
+        for (shape, pre) in shapes.iter().zip(e.planes.iter()) {
+            if !shape.temp_read_ok(&e, pre) {
+                return Err(Error::TempRead);
+            }
         }
         Ok(())
     };
     support(0)?;
-    // dml2_pmo_dcn4_fams2 stutter candidate (no Z8 on DCN401).
-    let vblank_us_x1000 =
-        i64::from(t.h_total) * i64::from(shape.vblank) * 1_000_000 / pclk_khz as i64;
-    let reserved_us = if vblank_us_x1000 >= SR_ENTER_PLUS_EXIT_US * MIN_BLANK_STUTTER_FACTOR * 1000
-        && support(SR_ENTER_PLUS_EXIT_US).is_ok()
-    {
+    // dml2_pmo_dcn4_fams2 stutter candidate (no Z8 on DCN401): every
+    // stream's nominal blank must be three times its cost.
+    let blank_allows = shapes.iter().all(|s| {
+        let vblank_us_x1000 = i64::from(s.t.h_total) * i64::from(s.vblank) * 1_000_000
+            / i64::from(s.t.pixel_clock_khz);
+        vblank_us_x1000 >= SR_ENTER_PLUS_EXIT_US * MIN_BLANK_STUTTER_FACTOR * 1000
+    });
+    let reserved_us = if blank_allows && support(SR_ENTER_PLUS_EXIT_US).is_ok() {
         SR_ENTER_PLUS_EXIT_US
     } else {
         0
     };
 
     // dml2_dpmm_dcn4: DISPCLK gets downspread and ramp margin, DPPREFCLK
-    // downspread only; both land on DFS steps, the pipe DPPCLK on 1/255ths.
+    // downspread only; both land on DFS steps, each pipe's DPPCLK on 1/255ths
+    // of the shared DPPREFCLK.
     let (sp, sp_den) = (DOWNSPREAD_TENTHOUSANDTHS as u128, 10_000u128);
     let (ramp, ramp_den) = ((100 + DISPCLK_RAMP_MARGIN_PERCENT) as u128, 100u128);
-    let req = u128::from(t.pixel_clock_khz);
+    let req = u128::from(max_pclk_khz);
     let disp_max = u128::from(soc.dispclk_max_khz);
     let (mut num, mut den) = (req * sp * ramp, sp_den * ramp_den);
     if num > disp_max * den {
@@ -879,34 +961,31 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
     if dispclk_khz > soc.dispclk_max_khz || dpprefclk_khz > soc.dppclk_max_khz {
         return Err(Error::PixelClock);
     }
-    let steps = (req * sp * 255).div_ceil(sp_den * u128::from(dpprefclk_khz));
-    let dppclk_khz = (u128::from(dpprefclk_khz) * steps / 255) as u32;
-    let deep_sleep_khz = shape.deep_sleep_khz();
+    let dppclk_khz: Vec<u32> = modes
+        .iter()
+        .map(|m| {
+            let own = u128::from(m.timing.pixel_clock_khz);
+            let steps = (own * sp * 255).div_ceil(sp_den * u128::from(dpprefclk_khz));
+            (u128::from(dpprefclk_khz) * steps / 255) as u32
+        })
+        .collect();
+    let deep_sleep_khz = deep_sleep_khz(&shapes);
 
     // Mode programming at the chosen clocks.
-    let dppclk = mhz(u64::from(dppclk_khz));
     let dispclk = mhz(u64::from(dispclk_khz));
     let ds = mhz(u64::from(deep_sleep_khz));
     // Linux fails mode programming as a whole; keep the specific reason.
-    let clk = PipeClocks {
-        dpp: dppclk,
-        disp: dispclk,
-        deep_sleep: ds,
-    };
-    let e = shape.evaluate(state, state, uclk_khz, clk, reserved_us)?;
-    let pre = e.pre;
-    let l = shape.line;
-    let min_ttu = e.t_wait.plus(e.extra).plus(e.t_calc);
-    let vstartup = pre.vstartup;
-    let blank_after = shape.vblank - vstartup;
-    let vblank_start = t.v_total - t.v_front_porch;
-    let l_setup = floor_quarter(pre.t_setup.over(l));
-    let min_next = fx(i64::from(vblank_start + blank_after)).plus(l_setup);
-    let vready_lines = i64::from(t.v_total - t.v_active - t.v_front_porch) - i64::from(vstartup);
-    let vready_after = i64::from(pre.vupdate_offset + pre.vupdate_width + pre.vready_offset)
-        <= vready_lines * i64::from(t.h_total);
+    let clk: Vec<PipeClocks> = dppclk_khz
+        .iter()
+        .map(|&khz| PipeClocks {
+            dpp: mhz(u64::from(khz)),
+            disp: dispclk,
+            deep_sleep: ds,
+        })
+        .collect();
+    let e = evaluate(&shapes, state, state, uclk_khz, &clk, reserved_us)?;
 
-    // Watermarks.
+    // Global watermarks and arbiter.
     let urgent_wm = e.lat.urgent.plus(e.extra);
     let sr_tail = e
         .extra_sr
@@ -914,16 +993,9 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
         .plus(e.lat.max_urgent)
         .plus(e.lat.df_response);
     let dram_wm = fx(DRAM_CLK_CHANGE_US).plus(urgent_wm);
-    let keepout = (dram_wm.over(l).ceil() as u32).min(t.v_total - 1);
-
     let refclk = mhz(u64::from(soc.dchub_refclk_khz));
     let ref_khz = i64::from(soc.dchub_refclk_khz);
-    let pclk_i = pclk_khz as i64;
     let refcyc = |us: Fx| reg(us.times(refclk));
-    // Delivery times are whole pixel counts over the pixel clock: exact.
-    let line_delivery = (i64::from(shape.swath_ub) * ref_khz / pclk_i) as u32;
-    let refcyc_req = (i64::from(REQUEST_PIXELS) * 1024 * ref_khz / pclk_i) as u32;
-
     // min_return_latency_in_DCFCLK uses the table maxima and DML's DCF state.
     let max_uclk = mhz(uclk_khz);
     let max_fclk = mhz(u64::from(soc.fclk_khz[1]));
@@ -935,90 +1007,132 @@ pub fn admit(soc: &Soc, mode: &Mode) -> Result<Plan, Error> {
         .minus(min_return)
         .max(fx(32));
     let min_det = CONFIG_RETURN_KBYTES - SEGMENT_KBYTES;
-
-    let plan = Plan {
-        mode: *mode,
-        soc: *soc,
-        clocks: Clocks {
-            dispclk_khz,
-            dpprefclk_khz,
-            dppclk_khz,
-            deep_sleep_dcfclk_khz: deep_sleep_khz,
-            dcfclk_khz: dcfclk_khz as u32,
-            fclk_khz: fclk_khz as u32,
-            uclk_khz: soc.uclk_khz,
-            socclk_khz: soc.socclk_khz,
-        },
-        sync: GlobalSync {
-            vstartup,
-            vupdate_offset: pre.vupdate_offset,
-            vupdate_width: pre.vupdate_width,
-            vready_offset: pre.vready_offset,
-            pstate_keepout: keepout,
-        },
-        dlg: Dlg {
-            refcyc_h_blank_end: (i64::from(t.h_blank_end()) * ref_khz / pclk_i) as u32,
-            dlg_vblank_end: t.v_blank_end(),
-            min_dst_y_next_start: (min_next.floor() as u32) * 4,
-            refcyc_per_htotal: (i64::from(t.h_total) * ref_khz * 256 / pclk_i) as u32,
-            refcyc_x_after_scaler: (i64::from(pre.dst_x) * ref_khz / pclk_i) as u32,
-            dst_y_after_scaler: pre.dst_y,
-            dst_y_prefetch: reg(pre.dst_y_prefetch.times(fx(4))),
-            dst_y_per_vm_vblank: 1,
-            dst_y_per_row_vblank: 1,
-            ref_freq_to_pix_freq: ((ref_khz << 19) / pclk_i) as u32,
-            vratio_prefetch: reg(pre.vratio_pre.times(fx(1 << 19))),
-            vratio_prefetch_c: 1 << 19,
-            refcyc_per_line_delivery_pre_l: line_delivery,
-            refcyc_per_line_delivery_l: line_delivery,
-            vready_after_vcount0: vready_after,
-            dst_y_delta_drq_limit: 0x7fff,
-            dmdata_dl_delta: refcyc(pre.t_dmdl),
-        },
-        ttu: Ttu {
-            qos_level_low_wm: 0,
-            qos_level_high_wm: (4 * i64::from(t.h_total) * ref_khz / pclk_i) as u32,
-            min_ttu_vblank: refcyc(min_ttu),
-            qos_level_flip: 14,
-            refcyc_per_req_delivery_l: refcyc_req,
-            refcyc_per_req_delivery_pre_l: refcyc_req,
-            qos_level_fixed_l: 8,
-            qos_level_fixed_c: 8,
-        },
-        watermarks: Watermarks {
-            urgent: refcyc(urgent_wm),
-            sr_enter: refcyc(fx(SR_ENTER_PLUS_EXIT_US).plus(sr_tail)),
-            sr_exit: refcyc(fx(SR_EXIT_US).plus(sr_tail)),
-            uclk_pstate: refcyc(dram_wm),
-            fclk_pstate: refcyc(urgent_wm),
-            temp_read: refcyc(e.lat.g6_temp_read.plus(urgent_wm)),
-            usr: refcyc(urgent_wm),
-            refcyc_per_trip_to_mem: refcyc(urgent_wm),
-            refcyc_per_meta_trip_to_mem: refcyc(urgent_wm),
-            frac_urg_bw_flip: reg(e.frac_nom.times(fx(1000))),
-            frac_urg_bw_nom: reg(e.frac_nom.times(fx(1000))),
-            frac_urg_bw_mall: reg(e.frac_mall.times(fx(1000))),
-        },
-        arbiter: Arbiter {
-            max_req_outstanding: MAX_OUTSTANDING_REQS as u32,
-            min_req_outstanding: MAX_OUTSTANDING_REQS as u32,
-            sat_level_us: 60,
-            compbuf_reserved_space_kbytes: (2 * PIXEL_CHUNK_KBYTES * 1024 / 64 * 64 / 1024) as u32,
-            compbuf_segments: (CONFIG_RETURN_KBYTES - min_det) / SEGMENT_KBYTES,
-            sdpif_request_rate_limit: (3 * WORDS_PER_CHANNEL * soc.umc_channels / 4).max(96),
-            dcfclk_deep_sleep_hysteresis: hysteresis.floor() as u32,
-            pstate_stall_threshold: (MAX_ALLOW_DELAY_US * ref_khz / 1000) as u32,
-            hvm_max_qos_commit_threshold: 0xf,
-            hvm_min_req_outstand_commit_threshold: 0xa,
-        },
-        det_bytes: shape.det_bytes,
-        stutter_reserved_us: reserved_us as u32,
+    let watermarks = Watermarks {
+        urgent: refcyc(urgent_wm),
+        sr_enter: refcyc(fx(SR_ENTER_PLUS_EXIT_US).plus(sr_tail)),
+        sr_exit: refcyc(fx(SR_EXIT_US).plus(sr_tail)),
+        uclk_pstate: refcyc(dram_wm),
+        fclk_pstate: refcyc(urgent_wm),
+        temp_read: refcyc(e.lat.g6_temp_read.plus(urgent_wm)),
+        usr: refcyc(urgent_wm),
+        refcyc_per_trip_to_mem: refcyc(urgent_wm),
+        refcyc_per_meta_trip_to_mem: refcyc(urgent_wm),
+        frac_urg_bw_flip: reg(e.frac_nom.times(fx(1000))),
+        frac_urg_bw_nom: reg(e.frac_nom.times(fx(1000))),
+        frac_urg_bw_mall: reg(e.frac_mall.times(fx(1000))),
     };
-    plan.check_ranges()?;
-    Ok(plan)
+    let arbiter = Arbiter {
+        max_req_outstanding: MAX_OUTSTANDING_REQS as u32,
+        min_req_outstanding: MAX_OUTSTANDING_REQS as u32,
+        sat_level_us: 60,
+        compbuf_reserved_space_kbytes: (2 * PIXEL_CHUNK_KBYTES * 1024 / 64 * 64 / 1024) as u32,
+        compbuf_segments: (CONFIG_RETURN_KBYTES - min_det) / SEGMENT_KBYTES,
+        sdpif_request_rate_limit: (3 * WORDS_PER_CHANNEL * soc.umc_channels / 4).max(96),
+        dcfclk_deep_sleep_hysteresis: hysteresis.floor() as u32,
+        pstate_stall_threshold: (MAX_ALLOW_DELAY_US * ref_khz / 1000) as u32,
+        hvm_max_qos_commit_threshold: 0xf,
+        hvm_min_req_outstand_commit_threshold: 0xa,
+    };
+    let mut streams = [None; MAX_STREAMS];
+    for (slot, mode) in streams.iter_mut().zip(modes) {
+        *slot = Some(*mode);
+    }
+
+    let mut plans = Vec::with_capacity(modes.len());
+    for (k, shape) in shapes.iter().enumerate() {
+        let t = shape.t;
+        let pre = e.planes[k];
+        let l = shape.line;
+        let pclk_i = i64::from(t.pixel_clock_khz);
+        let min_ttu = e.t_wait.plus(e.extra).plus(e.t_calc);
+        let vstartup = pre.vstartup;
+        let blank_after = shape.vblank - vstartup;
+        let vblank_start = t.v_total - t.v_front_porch;
+        let l_setup = floor_quarter(pre.t_setup.over(l));
+        let min_next = fx(i64::from(vblank_start + blank_after)).plus(l_setup);
+        let vready_lines =
+            i64::from(t.v_total - t.v_active - t.v_front_porch) - i64::from(vstartup);
+        let vready_after = i64::from(pre.vupdate_offset + pre.vupdate_width + pre.vready_offset)
+            <= vready_lines * i64::from(t.h_total);
+        let keepout = (dram_wm.over(l).ceil() as u32).min(t.v_total - 1);
+        // Delivery times are whole pixel counts over the pixel clock: exact.
+        let line_delivery = (i64::from(shape.swath_ub) * ref_khz / pclk_i) as u32;
+        let refcyc_req = (i64::from(REQUEST_PIXELS) * 1024 * ref_khz / pclk_i) as u32;
+        let plan = Plan {
+            mode: modes[k],
+            soc: *soc,
+            clocks: Clocks {
+                dispclk_khz,
+                dpprefclk_khz,
+                dppclk_khz: dppclk_khz[k],
+                deep_sleep_dcfclk_khz: deep_sleep_khz,
+                dcfclk_khz: dcfclk_khz as u32,
+                fclk_khz: fclk_khz as u32,
+                uclk_khz: soc.uclk_khz,
+                socclk_khz: soc.socclk_khz,
+            },
+            sync: GlobalSync {
+                vstartup,
+                vupdate_offset: pre.vupdate_offset,
+                vupdate_width: pre.vupdate_width,
+                vready_offset: pre.vready_offset,
+                pstate_keepout: keepout,
+            },
+            dlg: Dlg {
+                refcyc_h_blank_end: (i64::from(t.h_blank_end()) * ref_khz / pclk_i) as u32,
+                dlg_vblank_end: t.v_blank_end(),
+                min_dst_y_next_start: (min_next.floor() as u32) * 4,
+                refcyc_per_htotal: (i64::from(t.h_total) * ref_khz * 256 / pclk_i) as u32,
+                refcyc_x_after_scaler: (i64::from(pre.dst_x) * ref_khz / pclk_i) as u32,
+                dst_y_after_scaler: pre.dst_y,
+                dst_y_prefetch: reg(pre.dst_y_prefetch.times(fx(4))),
+                dst_y_per_vm_vblank: 1,
+                dst_y_per_row_vblank: 1,
+                ref_freq_to_pix_freq: ((ref_khz << 19) / pclk_i) as u32,
+                vratio_prefetch: reg(pre.vratio_pre.times(fx(1 << 19))),
+                vratio_prefetch_c: 1 << 19,
+                refcyc_per_line_delivery_pre_l: line_delivery,
+                refcyc_per_line_delivery_l: line_delivery,
+                vready_after_vcount0: vready_after,
+                dst_y_delta_drq_limit: 0x7fff,
+                dmdata_dl_delta: refcyc(pre.t_dmdl),
+            },
+            ttu: Ttu {
+                qos_level_low_wm: 0,
+                qos_level_high_wm: (4 * i64::from(t.h_total) * ref_khz / pclk_i) as u32,
+                min_ttu_vblank: refcyc(min_ttu),
+                qos_level_flip: 14,
+                refcyc_per_req_delivery_l: refcyc_req,
+                refcyc_per_req_delivery_pre_l: refcyc_req,
+                qos_level_fixed_l: 8,
+                qos_level_fixed_c: 8,
+            },
+            watermarks,
+            arbiter,
+            det_bytes: shape.det_bytes,
+            stutter_reserved_us: reserved_us as u32,
+            streams,
+            stream: k as u8,
+        };
+        plan.check_ranges()?;
+        plans.push(plan);
+    }
+    Ok(plans)
 }
 
 impl Plan {
+    /// The configuration this plan was admitted in.
+    pub fn joint_modes(&self) -> Vec<Mode> {
+        self.streams.iter().flatten().copied().collect()
+    }
+    /// Whether admitting this plan's configuration again yields this plan:
+    /// it was produced by [`admit_all`] from its recorded inputs.
+    pub fn readmits(&self) -> bool {
+        admit_all(&self.soc, &self.joint_modes())
+            .ok()
+            .and_then(|plans| plans.get(usize::from(self.stream)).copied())
+            == Some(*self)
+    }
     /// Every programmed value must fit its dcn_4_1_0 register field. Linux
     /// only asserts these; a plan that cannot be programmed exactly is
     /// rejected here instead of being silently truncated.

@@ -313,3 +313,147 @@ kernel_test_in!(
     "drivers/gpu/dcn401-dml",
     dcn401_dml_rejects_invalid_and_unmodeled_inputs
 );
+
+/// Shared with tests/dcn401_dml21/check.sh (harness_multi.c).
+const MULTI_VECTORS: &str = include_str!("../tests/dcn401_dml21/multi_vectors.txt");
+
+fn dcn401_dml_matches_linux_dml21_multi_stream_vectors() -> TestResult {
+    let (mut plans, mut rejects) = (0, 0);
+    for line in MULTI_VECTORS.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let mut s = [0u32; 10];
+        if !parse(&mut words, &mut s) || !(1..=4).contains(&s[9]) {
+            return TestResult::Fail("malformed multi-stream SoC inputs");
+        }
+        let mut modes = Vec::new();
+        for _ in 0..s[9] {
+            let mut t = [0u32; 10];
+            if !parse(&mut words, &mut t) {
+                return TestResult::Fail("malformed multi-stream mode");
+            }
+            // The single-stream layout: timing, SoC, then the pitch.
+            let mut f = [0u32; 19];
+            f[..9].copy_from_slice(&t[..9]);
+            f[9..18].copy_from_slice(&s[..9]);
+            f[18] = t[9];
+            let (_, mode) = inputs(&f);
+            modes.push(mode);
+        }
+        let mut f = [0u32; 19];
+        f[9..18].copy_from_slice(&s[..9]);
+        let (soc, _) = inputs(&f);
+        let result = admit_all(&soc, &modes);
+        match words.next() {
+            Some("=") => {
+                let Ok(got) = &result else {
+                    return TestResult::Fail("Linux-admitted configuration rejected");
+                };
+                for (k, plan) in got.iter().enumerate() {
+                    if k > 0 && words.next() != Some("|") {
+                        return TestResult::Fail("malformed multi-stream plan separator");
+                    }
+                    let mut want = [0u32; 62];
+                    if !parse(&mut words, &mut want) {
+                        return TestResult::Fail("malformed multi-stream plan");
+                    }
+                    for (i, (&g, &w)) in values(plan).iter().zip(want.iter()).enumerate() {
+                        if g != w && !(TOLERATED.contains(&i) && g.abs_diff(w) == 1) {
+                            return TestResult::Fail("joint plan value differs from Linux DML21");
+                        }
+                    }
+                    if !plan.readmits() || plan.mode != modes[k] || usize::from(plan.stream) != k {
+                        return TestResult::Fail("joint plan not reproducible or not bound");
+                    }
+                }
+                if got.len() != modes.len() || words.next().is_some() {
+                    return TestResult::Fail("joint plan count");
+                }
+                plans += 1;
+            }
+            Some("!") => {
+                let (Some(name), Err(e)) = (words.next(), result) else {
+                    return TestResult::Fail("rejected configuration admitted");
+                };
+                if error_name(e) != name {
+                    return TestResult::Fail("configuration rejected for a different reason");
+                }
+                rejects += 1;
+            }
+            _ => return TestResult::Fail("malformed multi-stream vector kind"),
+        }
+    }
+    if plans < 150 || rejects < 20 {
+        return TestResult::Fail("multi-stream vector file lost coverage");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_matches_linux_dml21_multi_stream_vectors
+);
+
+fn dcn401_dml_joint_plans_share_global_state() -> TestResult {
+    let (soc, hd) = reference_1080p();
+    let mut uhd = hd;
+    uhd.timing = Timing {
+        pixel_clock_khz: 533_250,
+        h_active: 3840,
+        h_total: 4000,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 2160,
+        v_total: 2222,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_positive: true,
+        v_sync_positive: true,
+    };
+    uhd.pitch = 3840;
+    let Ok(alone) = admit(&soc, &hd) else {
+        return TestResult::Fail("1080p60 rejected");
+    };
+    if admit_all(&soc, &[hd]).ok().and_then(|p| p.first().copied()) != Some(alone) {
+        return TestResult::Fail("admit is not admit_all of one mode");
+    }
+    let Ok(joint) = admit_all(&soc, &[hd, uhd]) else {
+        return TestResult::Fail("1080p60 + 2160p60 rejected");
+    };
+    let (a, b) = (joint[0], joint[1]);
+    // One DISPCLK/DPPREFCLK for the faster pipe, each DPPCLK its own.
+    if a.clocks.dispclk_khz != b.clocks.dispclk_khz
+        || a.clocks.dpprefclk_khz != b.clocks.dpprefclk_khz
+        || a.clocks.dispclk_khz < 533_250
+        || a.clocks.dppclk_khz >= b.clocks.dppclk_khz
+        || a.watermarks != b.watermarks
+        || a.arbiter != b.arbiter
+        || a.clocks.deep_sleep_dcfclk_khz != b.clocks.deep_sleep_dcfclk_khz
+    {
+        return TestResult::Fail("global clocks/watermarks not shared");
+    }
+    // A second pipe's pixel chunk lengthens the urgent watermark.
+    if a.watermarks.urgent <= alone.watermarks.urgent {
+        return TestResult::Fail("extra latency ignores the second pipe");
+    }
+    // A plan is bound to its configuration: alone it is not this plan.
+    if !a.readmits() || a == alone || a.joint_modes() != [hd, uhd] {
+        return TestResult::Fail("joint plan not bound to its configuration");
+    }
+    let mut edited = a;
+    edited.streams[1] = None;
+    if edited.readmits() {
+        return TestResult::Fail("plan re-admitted outside its configuration");
+    }
+    if admit_all(&soc, &[]) != Err(Error::Invalid)
+        || admit_all(&soc, &[hd; 5]) != Err(Error::Invalid)
+    {
+        return TestResult::Fail("stream count unchecked");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-dml",
+    dcn401_dml_joint_plans_share_global_state
+);

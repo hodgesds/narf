@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Verify drivers/gpu/tests/dcn401_dml21/vectors.txt against Linux DML21.
 #   drivers/gpu/tests/dcn401_dml21/check.sh [linux-tree]   (default /usr/src/linux)
+# multi_vectors.txt is checked the same way with harness_multi.c.
 #
 # Builds the DCN4 DML21 sources twice on the host: as shipped ("plain"), and
 # "strict" with the Tpre > max(Turg, Ttrip) + Tex check that Linux compiles
@@ -16,7 +17,7 @@
 #   <19 inputs> ! <Error> range      Linux plans a DLG/TTU value outside the
 #                                    field width it asserts (asserts are off)
 set -euo pipefail
-here=$(cd "$(dirname "$0")" && pwd)
+here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 linux=${1:-/usr/src/linux}
 dml=$linux/drivers/gpu/drm/amd/display/dc/dml2_0/dml21
 work=$(mktemp -d)
@@ -41,6 +42,7 @@ cc -c -O1 -w "${inc[@]}" -I"$dml/src/dml2_core" "$work/strict_calcs.c" -o "$work
 others=$(ls "$work"/obj/*.o | grep -v '/dml2_core_dcn4_calcs\.o$')
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/obj/dml2_core_dcn4_calcs.o" $others -lm -o "$work/plain"
 cc -O1 -w "${inc[@]}" "$here/harness.c" "$work/strict_calcs.o" $others -lm -o "$work/strict"
+cc -O1 -w "${inc[@]}" "$here/harness_multi.c" "$work/strict_calcs.o" $others -lm -o "$work/strict_multi"
 
 tolerated=" 3 47 48 49 "
 pass=0 fail=0
@@ -80,4 +82,39 @@ while read -r line; do
 	fi
 done < "$here/vectors.txt"
 echo "dcn401 DML21 vectors: $pass passed, $fail failed"
-[ $fail -eq 0 ]
+
+mpass=0 mfail=0
+while read -r line; do
+	case $line in ''|'#'*) continue ;; esac
+	read -ra f <<< "$line"
+	n=${f[9]} count=$((10 + 10 * f[9]))
+	inputs=("${f[@]:0:count}") kind=${f[count]} rest=("${f[@]:count+1}")
+	strict=$("$work/strict_multi" "${inputs[@]:0:9}" "${inputs[@]:10}")
+	ok=1
+	if [ "$kind" = "=" ]; then
+		read -ra got <<< "${strict#PLAN }"
+		got=("${got[@]/|}") want=("${rest[@]/|}")
+		got=(${got[@]}) want=(${want[@]})
+		if [ "${strict%% *}" != PLAN ] || [ ${#got[@]} -ne ${#want[@]} ] || [ ${#got[@]} -ne $((62 * n)) ]; then
+			ok=0
+		else
+			for i in "${!want[@]}"; do
+				d=$(( got[i] - want[i] ))
+				if [ $d -ne 0 ] && ! { [[ $tolerated == *" $((i % 62)) "* ]] && [ ${d#-} -eq 1 ]; }; then
+					ok=0
+				fi
+			done
+		fi
+	else
+		[ "$strict" = REJECT ] || ok=0
+	fi
+	if [ $ok -eq 1 ]; then
+		mpass=$((mpass + 1))
+	else
+		mfail=$((mfail + 1))
+		echo "MISMATCH: $line" >&2
+		echo "  strict: $strict" >&2
+	fi
+done < "$here/multi_vectors.txt"
+echo "dcn401 DML21 multi-stream vectors: $mpass passed, $mfail failed"
+[ $fail -eq 0 ] && [ $mfail -eq 0 ]
