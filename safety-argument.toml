@@ -1492,3 +1492,7 @@ argument = "The only frame/ change (bare_main.rs) adds jitrwx_smoke to the table
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The only frame/ change (bare_main.rs) registers the prctlinherit_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The prctl inheritance fix itself lives in userspace/ (copy of no_new_privs, securebits and dumpable into a clone child)."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the ptracefork_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The ptrace follow-fork work lives in userspace/ (ptrace registry, clone/fork/exit paths, wait reaping)."

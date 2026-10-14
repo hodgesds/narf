@@ -53,6 +53,8 @@ pub const PTRACE_ATTACH: u64 = 16;
 pub const PTRACE_DETACH: u64 = 17;
 pub const PTRACE_SYSCALL: u64 = 24;
 pub const PTRACE_SETOPTIONS: u64 = 0x4200;
+pub const PTRACE_GETEVENTMSG: u64 = 0x4201;
+pub const PTRACE_GETSIGINFO: u64 = 0x4202;
 pub const PTRACE_GETREGSET: u64 = 0x4204;
 pub const PTRACE_SETREGSET: u64 = 0x4205;
 
@@ -79,6 +81,25 @@ pub const PTRACE_O_TRACEEXEC: u64 = 0x10;
 /// `SIGTRAP | (PTRACE_EVENT_EXEC << 8)`, so a tracer reads the event back as
 /// `status >> 16`.
 pub const PTRACE_EVENT_EXEC: u32 = 4;
+
+/// Follow-the-children options and their events (`include/uapi/linux/ptrace.h`).
+pub const PTRACE_O_TRACEFORK: u64 = 0x02;
+pub const PTRACE_O_TRACEVFORK: u64 = 0x04;
+pub const PTRACE_O_TRACECLONE: u64 = 0x08;
+pub const PTRACE_O_TRACEVFORKDONE: u64 = 0x20;
+pub const PTRACE_O_TRACEEXIT: u64 = 0x40;
+pub const PTRACE_EVENT_EXIT: u32 = 6;
+pub const PTRACE_O_EXITKILL: u64 = 1 << 20;
+pub const PTRACE_EVENT_FORK: u32 = 1;
+pub const PTRACE_EVENT_VFORK: u32 = 2;
+pub const PTRACE_EVENT_CLONE: u32 = 3;
+pub const PTRACE_EVENT_VFORK_DONE: u32 = 5;
+
+const CLONE_VFORK: u64 = 0x0000_4000;
+const CLONE_PTRACE: u64 = 0x0000_2000;
+const CLONE_UNTRACED: u64 = 0x0080_0000;
+const SIGCHLD: u64 = 17;
+const SIGSTOP: u32 = 19;
 
 /// The set of PTRACE_SETOPTIONS bits Linux will accept, from
 /// `include/uapi/linux/ptrace.h`:
@@ -189,6 +210,9 @@ pub struct user_regs_struct {
     pub pstate: u64,
 }
 
+/// A dequeued signal's queued payload: `(si_code, si_value, si_pid)`.
+pub type StopPayload = (i32, u64, u32);
+
 #[derive(Debug, Default)]
 pub struct PtraceRegistry {
     /// Maps tracee Process ID -> tracer Process ID
@@ -198,7 +222,11 @@ pub struct PtraceRegistry {
     /// Maps tracee Process ID -> signal that stopped the tracee
     pub stop_signal: BTreeMap<u64, u32>,
     /// Maps tracee Process ID -> signal bypass mask (signal number -> bypass)
-    pub signal_bypass: BTreeMap<u64, u32>,
+    pub signal_bypass: BTreeMap<u64, u64>,
+    /// Maps tracee Process ID -> the queued payload `(si_code, si_value,
+    /// si_pid)` of the signal its current signal-delivery stop dequeued,
+    /// redelivered with it if the tracer resumes with the same signal.
+    pub stop_payload: BTreeMap<u64, StopPayload>,
     /// Maps tracee Process ID -> next syscall-stop phase (PTRACE_SYSCALL).
     pub syscall_stop: BTreeMap<u64, SyscallStopPhase>,
     /// Maps tracee Process ID -> PTRACE_SETOPTIONS bitset (TRACESYSGOOD, ...).
@@ -226,6 +254,12 @@ pub struct PtraceRegistry {
     /// by a signal-stop and by every resume, so a tracer never reads a stale
     /// one.
     pub stop_rax: BTreeMap<u64, u64>,
+    /// Maps tracee Process ID -> `ptrace_message`, the PTRACE_GETEVENTMSG
+    /// value of its last event stop.
+    pub event_msg: BTreeMap<u64, u64>,
+    /// Maps tracee Process ID -> `last_siginfo` of its current stop, what
+    /// PTRACE_GETSIGINFO copies out. Absent while running.
+    pub last_siginfo: BTreeMap<u64, [u8; 128]>,
 }
 
 pub static PTRACE_STATE: IrqSafeSpinLock<Option<PtraceRegistry>> = IrqSafeSpinLock::new(None);
@@ -257,12 +291,28 @@ pub fn ptrace_init() {
     PTRACE_TRACEES.store(0, Ordering::Release);
 }
 
+/// Drop every per-tracee row of `pid` (not the `tracers` link itself).
+fn forget_tracee_state(r: &mut PtraceRegistry, pid: u64) {
+    r.stopped.remove(&pid);
+    r.stop_signal.remove(&pid);
+    r.signal_bypass.remove(&pid);
+    r.syscall_stop.remove(&pid);
+    r.options.remove(&pid);
+    r.orig_rax.remove(&pid);
+    r.stop_rax.remove(&pid);
+    r.event_msg.remove(&pid);
+    r.last_siginfo.remove(&pid);
+    r.stop_payload.remove(&pid);
+}
+
 /// Retire every ptrace row owned by an exiting process.
 ///
 /// PIDs are recycled, so leaving a dead tracee in `tracers` makes the next
 /// owner of that PID look already traced and turns PTRACE_TRACEME into EPERM.
 /// If the exiting process was itself a tracer, detach and wake its tracees so
-/// they do not remain parked forever.
+/// they do not remain parked forever — or, for a tracee whose tracer set
+/// `PTRACE_O_EXITKILL`, kill it (`exit_ptrace` → `__ptrace_detach` sends
+/// SIGKILL when `PT_EXITKILL` is set).
 pub(crate) fn release_process(pid: u64) {
     let detached = {
         let mut g = PTRACE_STATE.lock();
@@ -272,28 +322,20 @@ pub(crate) fn release_process(pid: u64) {
         let tracees_before = r.tracers.len();
 
         r.tracers.remove(&pid);
-        r.stopped.remove(&pid);
-        r.stop_signal.remove(&pid);
-        r.signal_bypass.remove(&pid);
-        r.syscall_stop.remove(&pid);
-        r.options.remove(&pid);
-        r.orig_rax.remove(&pid);
-        r.stop_rax.remove(&pid);
+        forget_tracee_state(r, pid);
 
-        let tracees: alloc::vec::Vec<u64> = r
+        let tracees: alloc::vec::Vec<(u64, bool)> = r
             .tracers
             .iter()
             .filter_map(|(&tracee, &tracer)| (tracer == pid).then_some(tracee))
+            .map(|tracee| {
+                let kill = r.options.get(&tracee).copied().unwrap_or(0) & PTRACE_O_EXITKILL != 0;
+                (tracee, kill)
+            })
             .collect();
-        for tracee in &tracees {
+        for (tracee, _) in &tracees {
             r.tracers.remove(tracee);
-            r.stopped.remove(tracee);
-            r.stop_signal.remove(tracee);
-            r.signal_bypass.remove(tracee);
-            r.syscall_stop.remove(tracee);
-            r.options.remove(tracee);
-            r.orig_rax.remove(tracee);
-            r.stop_rax.remove(tracee);
+            forget_tracee_state(r, *tracee);
         }
         let removed = tracees_before - r.tracers.len();
         if removed != 0 {
@@ -302,8 +344,15 @@ pub(crate) fn release_process(pid: u64) {
         tracees
     };
 
-    for tracee in detached {
-        crate::handlers::wake_signal(pid_to_tid(tracee));
+    for (tracee, kill) in detached {
+        let tid = pid_to_tid(tracee);
+        if kill {
+            raise_signal_pending(tid, 9);
+        }
+        crate::user_task::with_user_task_ctx(tid, |uc| {
+            uc.sleep_deadline_ns.store(0, Ordering::Release);
+        });
+        crate::handlers::wake_signal(tid);
     }
 }
 
@@ -438,15 +487,20 @@ pub fn is_ptrace_stop_recipient(parent_task: u64, child_pid: u64) -> bool {
     get_task_tracer(child_pid).map(pid_to_tid) == Some(parent_task)
 }
 
+/// Bit for `signum` (1..=64) in a 64-bit signal mask, or 0 for an invalid one.
+fn bypass_bit(signum: u32) -> u64 {
+    if (1..=64).contains(&signum) {
+        1u64 << (signum - 1)
+    } else {
+        0
+    }
+}
+
 pub fn is_ptrace_signal_bypass(child_pid: u64, signum: u32) -> bool {
     let g = PTRACE_STATE.lock();
     if let Some(r) = g.as_ref() {
         if let Some(&mask) = r.signal_bypass.get(&child_pid) {
-            // The bypass map is a u32; the setter only stores standard
-            // signals (data < 32), so a >= 32 signum can never have an
-            // entry — return false instead of a `1u32 << 64` shift UB
-            // (now reachable since RT signals raise signum up to 64).
-            return signum < 32 && (mask & (1u32 << signum)) != 0;
+            return mask & bypass_bit(signum) != 0;
         }
     }
     false
@@ -456,18 +510,19 @@ pub fn clear_ptrace_signal_bypass(child_pid: u64, signum: u32) {
     let mut g = PTRACE_STATE.lock();
     if let Some(r) = g.as_mut() {
         if let Some(mask) = r.signal_bypass.get_mut(&child_pid) {
-            if signum < 32 {
-                *mask &= !(1u32 << signum);
-            }
+            *mask &= !bypass_bit(signum);
         }
     }
 }
 
+/// Mark `signum` — injected by the tracer at a resume — to be delivered
+/// without a second signal-delivery stop. Any signal 1..=64 may be injected
+/// (`ptrace_resume`: `valid_signal(data)`), realtime ones included.
 pub fn set_ptrace_signal_bypass(child_pid: u64, signum: u32) {
     let mut g = PTRACE_STATE.lock();
     if let Some(r) = g.as_mut() {
         let mask = r.signal_bypass.entry(child_pid).or_insert(0);
-        *mask |= 1 << signum;
+        *mask |= bypass_bit(signum);
     }
 }
 
@@ -617,6 +672,7 @@ fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_ra
         set_syscall_stop_phase(pid, SyscallStopPhase::None);
     }
     let sig = syscall_stop_signal(pid);
+    set_last_siginfo(pid, crate::handlers::ptrace_notify_siginfo(task, sig));
     let tracer_tid = pid_to_tid(get_task_tracer(pid).unwrap_or(pid));
     // At the exit-stop the dispatcher already mirrored the syscall's real
     // return value into the live user-state's rax slot; capture it so the
@@ -650,6 +706,17 @@ fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_ra
 }
 
 pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
+    ptrace_intercept_signal_info(ctx, signum, None)
+}
+
+/// [`ptrace_intercept_signal`] for a signal whose siginfo the caller already
+/// built (a synchronous fault: `si_code` and `si_addr` come from the trap,
+/// not from a queue). `None` takes the signal's queued payload.
+pub fn ptrace_intercept_signal_info(
+    ctx: &mut dyn TrapContext,
+    signum: u32,
+    info: Option<[u8; 128]>,
+) -> bool {
     // SIGKILL (9) is never interceptable — it must always terminate, even a
     // traced (and ptrace-stopped, just-woken) tracee. Letting it be turned
     // into a ptrace signal-delivery-stop would make a tracee unkillable and
@@ -675,6 +742,32 @@ pub fn ptrace_intercept_signal(ctx: &mut dyn TrapContext, signum: u32) -> bool {
         // every single syscall. `kill(getpid(), SIGSTOP)` is the ordinary way
         // to raise one — it is how strace's own startup handshake works — so
         // this hit the most common case there is.
+        //
+        // The siginfo is captured first: PTRACE_GETSIGINFO at this stop must
+        // describe the signal being delivered.
+        let info = info.unwrap_or_else(|| crate::handlers::ptrace_signal_siginfo(task, signum));
+        set_last_siginfo(pid, info);
+        // `dequeue_signal` takes the siginfo with the signal; it travels with
+        // the stop and comes back if the tracer resumes with the same signal
+        // (`ptrace_signal` delivers `current->last_siginfo`). Left queued, a
+        // re-injected sigqueue() signal reached its handler without its value.
+        let src = if crate::handlers::signal_pending_private(task) & crate::handlers::sig_bit(signum)
+            != 0
+        {
+            task
+        } else {
+            crate::handlers::shared_pending_key(task)
+        };
+        let payload = crate::handlers::take_sigqueue_info(src, signum);
+        {
+            let mut g = PTRACE_STATE.lock();
+            if let Some(r) = g.as_mut() {
+                match payload {
+                    Some(p) => r.stop_payload.insert(pid, p),
+                    None => r.stop_payload.remove(&pid),
+                };
+            }
+        }
         clear_pending_signal_bits(task, crate::handlers::sig_bit(signum));
         clear_pending_signal_bits(
             crate::handlers::shared_pending_key(task),
@@ -738,14 +831,179 @@ pub fn ptrace_report_exec(ctx: &mut dyn TrapContext) {
 
     const SIGTRAP: u32 = 5;
     if trace_exec {
-        enter_ptrace_stopped(ctx, task, tracer_tid, SIGTRAP | (PTRACE_EVENT_EXEC << 8));
+        let code = SIGTRAP | (PTRACE_EVENT_EXEC << 8);
+        set_last_siginfo(pid, crate::handlers::ptrace_notify_siginfo(task, code));
+        enter_ptrace_stopped(ctx, task, tracer_tid, code);
     }
     // The exec succeeded, so the syscall-exit stop must report 0 — the value
     // userspace would have seen had this syscall returned normally.
     ctx.set_return(SyscallReturn::ok(0));
     ptrace_syscall_stop(ctx, false, u64::from(crate::syscall::Syscall::Execve.raw()));
     if !trace_exec {
+        set_last_siginfo(pid, crate::handlers::ptrace_signal_siginfo(task, SIGTRAP));
         enter_ptrace_stopped(ctx, task, tracer_tid, SIGTRAP);
+    }
+}
+
+const SIGTRAP_EVENT_BASE: u32 = 5;
+
+/// What `kernel_clone` decided for a new child of a traced task.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CloneTrace {
+    /// `PTRACE_EVENT_{FORK,VFORK,CLONE}` to report to the tracer, or 0.
+    event: u32,
+}
+
+impl CloneTrace {
+    pub const NONE: CloneTrace = CloneTrace { event: 0 };
+}
+
+/// `kernel_clone` + `copy_process` + `ptrace_init_task`, run BEFORE the child
+/// can execute: pick the event a traced parent reports, and auto-attach the
+/// child to the parent's tracer when that event is enabled (or the caller
+/// passed CLONE_PTRACE).
+///
+/// ```text
+/// if (!(clone_flags & CLONE_UNTRACED)) {
+///         if (clone_flags & CLONE_VFORK)          trace = PTRACE_EVENT_VFORK;
+///         else if (args->exit_signal != SIGCHLD)  trace = PTRACE_EVENT_CLONE;
+///         else                                    trace = PTRACE_EVENT_FORK;
+///         if (likely(!ptrace_event_enabled(current, trace)))
+///                 trace = 0;
+/// }
+/// ...
+/// ptrace_init_task(p, (clone_flags & CLONE_PTRACE) || trace);
+/// ```
+///
+/// An attached child shares its parent's tracer and options and starts in a
+/// SIGSTOP signal-delivery stop (`sigaddset(&child->pending.signal,
+/// SIGSTOP)`), reported to the tracer like any stop. NARF parks the child in
+/// that stop before its first instruction rather than queueing the signal,
+/// which is the same thing the tracer can observe: the child's first stop is
+/// SIGSTOP, and nothing it does happens before the tracer resumes it.
+pub fn attach_new_child(parent_task: u64, child_task: u64, clone_flags: u64, exit_signal: u64) -> CloneTrace {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return CloneTrace::NONE;
+    }
+    let parent = tid_to_pid(parent_task);
+    let Some(tracer) = get_task_tracer(parent) else {
+        return CloneTrace::NONE;
+    };
+    let options = ptrace_options(parent);
+    let mut event = 0;
+    if clone_flags & CLONE_UNTRACED == 0 {
+        let (ev, opt) = if clone_flags & CLONE_VFORK != 0 {
+            (PTRACE_EVENT_VFORK, PTRACE_O_TRACEVFORK)
+        } else if exit_signal != SIGCHLD {
+            (PTRACE_EVENT_CLONE, PTRACE_O_TRACECLONE)
+        } else {
+            (PTRACE_EVENT_FORK, PTRACE_O_TRACEFORK)
+        };
+        if options & opt != 0 {
+            event = ev;
+        }
+    }
+    if clone_flags & CLONE_PTRACE == 0 && event == 0 {
+        return CloneTrace::NONE;
+    }
+    let child = tid_to_pid(child_task);
+    {
+        let mut g = PTRACE_STATE.lock();
+        let Some(r) = g.as_mut() else {
+            return CloneTrace::NONE;
+        };
+        if r.tracers.insert(child, tracer).is_none() {
+            PTRACE_TRACEES.fetch_add(1, Ordering::Release);
+        }
+        r.options.insert(child, options);
+        r.stopped.insert(child, true);
+        r.stop_signal.insert(child, SIGSTOP);
+    }
+    let info = crate::handlers::ptrace_signal_siginfo(child_task, SIGSTOP);
+    set_last_siginfo(child, info);
+    // `(SIGSTOP << 8) | 0x7f`: the stop the tracer's wait4 sees first.
+    push_stopcont_report(child_task, ((SIGSTOP as i32) << 8) | 0x7f, false);
+    CloneTrace { event }
+}
+
+/// `ptrace_event_pid(trace, pid)` after the child is running: stop the
+/// parent with `SIGTRAP | event << 8`, the child's pid in the TRACER's pid
+/// namespace as the event message. `ret` is the clone syscall's return value,
+/// which the parent still returns once the tracer resumes it.
+pub fn report_clone_event(ctx: &mut dyn TrapContext, trace: CloneTrace, child_task: u64, ret: u64) {
+    if trace.event == 0 {
+        return;
+    }
+    report_child_event(ctx, trace.event, child_task, ret);
+}
+
+/// `ptrace_event_pid(PTRACE_EVENT_VFORK_DONE, pid)`, after a vfork parent's
+/// wait for its child ended, when the tracer asked for it.
+pub fn report_vfork_done(ctx: &mut dyn TrapContext, child_task: u64, ret: u64) {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let parent = tid_to_pid(current_task_id());
+    if get_task_tracer(parent).is_none() || ptrace_options(parent) & PTRACE_O_TRACEVFORKDONE == 0 {
+        return;
+    }
+    report_child_event(ctx, PTRACE_EVENT_VFORK_DONE, child_task, ret);
+}
+
+fn report_child_event(ctx: &mut dyn TrapContext, event: u32, child_task: u64, ret: u64) {
+    let task = current_task_id();
+    let parent = tid_to_pid(task);
+    let Some(tracer) = get_task_tracer(parent) else {
+        return;
+    };
+    let tracer_task = pid_to_tid(tracer);
+    let child_tid = tid_to_pid(child_task);
+    set_event_msg(parent, crate::handlers::report_pid_to(tracer_task, child_tid));
+    let code = SIGTRAP_EVENT_BASE | (event << 8);
+    set_last_siginfo(parent, crate::handlers::ptrace_notify_siginfo(task, code));
+    clear_stop_rax(parent);
+    enter_ptrace_stopped_inner(ctx, task, tracer_task, code, Some(ret));
+    ctx.set_return(SyscallReturn::ok(ret));
+}
+
+/// `ptrace_event(PTRACE_EVENT_EXIT, code)` at the top of `do_exit`, before
+/// any teardown: a tracee whose tracer set PTRACE_O_TRACEEXIT stops with
+/// `SIGTRAP | PTRACE_EVENT_EXIT << 8`, its pending exit status (the wait
+/// status it is about to leave) as the event message, while its registers
+/// and memory are still there to inspect. Not when SIGKILL is pending:
+/// `ptrace_stop` refuses to stop a task with a fatal signal queued.
+pub fn ptrace_report_exit(ctx: &mut dyn TrapContext, wstatus: i32) {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let task = current_task_id();
+    let pid = tid_to_pid(task);
+    let Some(tracer) = get_task_tracer(pid) else {
+        return;
+    };
+    if ptrace_options(pid) & PTRACE_O_TRACEEXIT == 0
+        || crate::handlers::current_task_fatal_signal_pending()
+    {
+        return;
+    }
+    set_event_msg(pid, wstatus as u32 as u64);
+    let code = SIGTRAP_EVENT_BASE | (PTRACE_EVENT_EXIT << 8);
+    set_last_siginfo(pid, crate::handlers::ptrace_notify_siginfo(task, code));
+    enter_ptrace_stopped(ctx, task, pid_to_tid(tracer), code);
+}
+
+fn set_last_siginfo(pid: u64, info: [u8; 128]) {
+    let mut g = PTRACE_STATE.lock();
+    if let Some(r) = g.as_mut() {
+        r.last_siginfo.insert(pid, info);
+    }
+}
+
+/// `child->ptrace_message`, read back with PTRACE_GETEVENTMSG.
+fn set_event_msg(pid: u64, msg: u64) {
+    let mut g = PTRACE_STATE.lock();
+    if let Some(r) = g.as_mut() {
+        r.event_msg.insert(pid, msg);
     }
 }
 
@@ -1146,15 +1404,14 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 if r.tracers.remove(&pid).is_some() {
                     PTRACE_TRACEES.fetch_sub(1, Ordering::Release);
                 }
-                r.stopped.remove(&pid);
-                r.stop_signal.remove(&pid);
-                r.signal_bypass.remove(&pid);
-                r.syscall_stop.remove(&pid);
-                r.options.remove(&pid);
-                r.orig_rax.remove(&pid);
-                r.stop_rax.remove(&pid);
+                forget_tracee_state(r, pid);
             }
             let tid = pid_to_tid(pid);
+            // As for a resume: a tracee parked on the stop's infinite
+            // deadline (or born stopped and never run) must not stay parked.
+            crate::user_task::with_user_task_ctx(tid, |uc| {
+                uc.sleep_deadline_ns.store(0, Ordering::Release);
+            });
             crate::handlers::wake_signal(tid);
             ctx.set_return(SyscallReturn::ok(0));
         }
@@ -1266,6 +1523,9 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             }
         }
         PTRACE_CONT | PTRACE_SINGLESTEP | PTRACE_SYSCALL => {
+            // The stop's own signal and its dequeued payload, for an injection
+            // of that same signal below.
+            let mut stopped_with: Option<(u32, Option<StopPayload>)> = None;
             {
                 let mut g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_mut() {
@@ -1291,12 +1551,15 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                         return;
                     }
                     r.stopped.remove(&pid);
-                    r.stop_signal.remove(&pid);
+                    if let Some(sig) = r.stop_signal.remove(&pid) {
+                        stopped_with = Some((sig, r.stop_payload.remove(&pid)));
+                    }
                     // The tracee is leaving the stop: the exit-stop's pinned
                     // orig_rax was there only for the tracer's GETREGS while
                     // stopped, so drop it now (state.rax resumes as truth).
                     r.orig_rax.remove(&pid);
                     r.stop_rax.remove(&pid);
+                    r.last_siginfo.remove(&pid);
                     // PTRACE_SYSCALL arms a stop at the next syscall boundary.
                     // The syscall-stop hook (ptrace_syscall_stop) toggles this
                     // Entry → Exit → None; whichever phase is pending now is
@@ -1325,7 +1588,16 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 enable_tracee_singlestep(pid);
             }
             let tid = pid_to_tid(pid);
-            if data != 0 && data < 32 {
+            if data != 0 {
+                // `ptrace_signal`: resuming with the stop's own signal delivers
+                // it with its original siginfo (a sigqueue value, SIGCHLD's
+                // status); any other signal is a new one from the tracer.
+                if let Some((sig, Some((code, value, sender)))) = stopped_with {
+                    if sig == data as u32 {
+                        let _ =
+                            crate::handlers::store_sigqueue_info(tid, sig, code, value, sender);
+                    }
+                }
                 set_ptrace_signal_bypass(pid, data as u32);
                 raise_signal_pending(tid, data as u32);
             }
@@ -1367,13 +1639,15 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // answer a real kernel too old for that option gives —
                     // keeps the probe honest.
                     //
-                    // LINUX-GAP: of the bits INSIDE the mask, NARF only
-                    // acts on PTRACE_O_TRACESYSGOOD. The rest (EXITKILL,
-                    // TRACEFORK, TRACEEXIT, …) are stored and ignored;
-                    // Linux stores them too, but it also generates the
-                    // PTRACE_EVENT_* stops they ask for, and NARF does
-                    // not. Rejecting them would be the larger divergence
-                    // — Linux accepts them — so they stay accepted here.
+                    // Of the bits inside the mask, NARF acts on TRACESYSGOOD,
+                    // TRACEEXEC, TRACEFORK/VFORK/CLONE (auto-attach plus the
+                    // event stop — `attach_new_child`), TRACEVFORKDONE,
+                    // TRACEEXIT and EXITKILL.
+                    //
+                    // LINUX-GAP: TRACESECCOMP and SUSPEND_SECCOMP are stored
+                    // and ignored — NARF runs no seccomp filters for them to
+                    // report on or suspend. Rejecting them would be the
+                    // larger divergence, so they stay accepted here.
                     if data & !PTRACE_O_MASK != 0 {
                         ctx.set_return(errno_ret(EINVAL));
                         return;
@@ -1382,6 +1656,45 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 }
             }
             ctx.set_return(SyscallReturn::ok(0));
+        }
+        PTRACE_GETEVENTMSG => {
+            // `ptrace_request`:
+            //
+            //     case PTRACE_GETEVENTMSG:
+            //             ret = put_user(child->ptrace_message, datalp);
+            //
+            // The message of the last event stop (a new child's pid, an
+            // exit status); 0 if there never was one.
+            let msg = PTRACE_STATE
+                .lock()
+                .as_ref()
+                .and_then(|r| r.event_msg.get(&pid).copied())
+                .unwrap_or(0);
+            // SAFETY: `data` is the tracer's user pointer; copy_to_user
+            // range-checks it and contains a fault.
+            if unsafe { copy_to_user(data, &msg.to_ne_bytes()) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+            } else {
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+        }
+        PTRACE_GETSIGINFO => {
+            // `ptrace_getsiginfo`: EINVAL when the stop has no siginfo (a
+            // group-stop), then `copy_siginfo_to_user` → EFAULT.
+            let info = PTRACE_STATE
+                .lock()
+                .as_ref()
+                .and_then(|r| r.last_siginfo.get(&pid).copied());
+            let Some(info) = info else {
+                ctx.set_return(errno_ret(EINVAL));
+                return;
+            };
+            // SAFETY: as above.
+            if unsafe { copy_to_user(data, &info) }.is_err() {
+                ctx.set_return(errno_ret(EFAULT));
+            } else {
+                ctx.set_return(SyscallReturn::ok(0));
+            }
         }
         PTRACE_GETREGSET => {
             // addr = regset id (NT_PRSTATUS / x86 NT_PRFPREG); data = iovec*
@@ -1653,7 +1966,8 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     r.stopped.remove(&pid);
                     r.stop_signal.remove(&pid);
                     r.syscall_stop.remove(&pid);
-                    r.orig_rax.remove(&pid);
+                    r.stop_rax.remove(&pid);
+                    r.last_siginfo.remove(&pid);
                     r.stop_rax.remove(&pid);
                 }
             }

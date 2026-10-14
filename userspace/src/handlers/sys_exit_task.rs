@@ -3,8 +3,30 @@ use super::*;
 
 pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
     let exit_code = ctx.args().arg0 as u32;
-    let wstatus = (exit_code & 0xff) << 8;
+    exit_current_thread_status(ctx, exit_code, ((exit_code & 0xff) << 8) as i32, true);
+}
+
+/// The tail of `exit_group(2)`: the calling thread's own exit, after
+/// `sys_exit_group` already made the group's PTRACE_EVENT_EXIT report (one
+/// `do_exit` per thread, so one report).
+pub(crate) fn exit_group_current_thread(ctx: &mut dyn TrapContext) {
+    let exit_code = ctx.args().arg0 as u32;
+    exit_current_thread_status(ctx, exit_code, ((exit_code & 0xff) << 8) as i32, false);
+}
+
+fn exit_current_thread_status(
+    ctx: &mut dyn TrapContext,
+    exit_code: u32,
+    wstatus: i32,
+    report_ptrace_exit: bool,
+) {
+    // Only the syscall-trace report reads the raw code.
+    let _ = exit_code;
+    if report_ptrace_exit {
+        crate::ptrace::ptrace_report_exit(ctx, wstatus);
+    }
     let tid = current_task_id();
+    note_traced_thread_exit(tid, wstatus);
     let pid = task_to_pid_raw(tid).unwrap_or(tid);
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
@@ -20,7 +42,7 @@ pub(crate) fn sys_exit_task(ctx: &mut dyn TrapContext) {
             wstatus
         );
     }
-    stage_thread_exit_termination(pid, tid, wstatus as i32);
+    stage_thread_exit_termination(pid, tid, wstatus);
     // Robust-futex owner-died walk — in-task context, before teardown
     // (see terminate_current_task).
     robust_list_exit_walk(tid);

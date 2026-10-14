@@ -2,6 +2,10 @@
 use super::*;
 
 pub(crate) fn sys_exit_group(ctx: &mut dyn TrapContext) {
+    // `do_group_exit((error_code & 0xff) << 8)` → `do_exit` →
+    // `ptrace_event(PTRACE_EVENT_EXIT, code)` before anything is torn down.
+    let exit_status = ((ctx.args().arg0 as u32 & 0xff) << 8) as i32;
+    crate::ptrace::ptrace_report_exit(ctx, exit_status);
     let tid = current_task_id();
     let pid = task_to_pid_raw(tid).unwrap_or(tid);
     // [PROBE] A `systemd --user` instance (comm "systemd", not PID1) or one of
@@ -32,5 +36,5 @@ pub(crate) fn sys_exit_group(ctx: &mut dyn TrapContext) {
     // zapped, so it is what wait4 reports however the threads die.
     stage_pending_termination(pid, ((ctx.args().arg0 as u32 & 0xff) << 8) as i32);
     zap_thread_group(tid, pid);
-    sys_exit_task(ctx);
+    exit_group_current_thread(ctx);
 }

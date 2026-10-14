@@ -11605,6 +11605,13 @@ fn default_signal_delivery_restricted_active(
         return false;
     };
     if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
+        // The tracer has resumed us from the signal-delivery stop. `get_signal`
+        // loops: a signal it injected on that resume (`ptrace_signal`'s
+        // return value) is delivered now, before the return to user mode —
+        // not at whatever kernel exit comes next. Delivered late, a re-
+        // injected signal a program raised at itself arrived only after the
+        // program had already moved past the point that depended on it.
+        let _ = default_signal_delivery_restricted_active(ctx, syscall_no, restrict, prerewound);
         return true;
     }
 
@@ -12046,6 +12053,28 @@ impl Drop for FatalDiagnosticGuard {
     }
 }
 
+/// `(si_code, si_addr)` of the signal a user CPU exception raises (see the
+/// table above `dump_fatal_x86_address_space`).
+fn sync_fault_si(vector: u64, info: &SyncFaultInfo) -> (i32, u64) {
+    match vector {
+        1 => (2 /* TRAP_TRACE */, info.addr),
+        // BUS_ADRERR (2): "nonexistent physical address" — the page is
+        // mapped, but the file behind it could not supply it.
+        14 if info.bus => (2, info.addr),
+        14 => (page_fault_si_code(info.addr), info.addr),
+        13 => (0x80 /* SI_KERNEL */, info.addr),
+        6 => (1 /* ILL_ILLOPC */, info.addr),
+        17 => (1 /* BUS_ADRALN */, info.addr),
+        0 => (1 /* FPE_INTDIV */, info.addr),
+        4 => (2 /* FPE_INTOVF */, info.addr),
+        3 => (1 /* TRAP_BRKPT */, info.addr),
+        // SI_KERNEL (0x80), not 0: a fault must keep a POSITIVE si_code so the
+        // arch siginfo builder writes `si_addr` at the union offset 16 (a
+        // non-positive code there means "user/queue-origin" → si_pid instead).
+        _ => (0x80, info.addr),
+    }
+}
+
 pub fn default_sync_signal_delivery(
     ctx: &mut dyn TrapContext,
     vector: u64,
@@ -12059,7 +12088,14 @@ pub fn default_sync_signal_delivery(
             None => return false,
         }
     };
-    if crate::ptrace::ptrace_intercept_signal(ctx, signum) {
+    // A tracer sees the fault's own siginfo at the signal-delivery stop
+    // (PTRACE_GETSIGINFO): strace prints `--- SIGSEGV {si_code=SEGV_MAPERR,
+    // si_addr=...} ---` from it.
+    let ptrace_info = {
+        let (code, addr) = sync_fault_si(vector, &info);
+        crate::handlers::ptrace_fault_siginfo(signum, code, addr, 0)
+    };
+    if crate::ptrace::ptrace_intercept_signal_info(ctx, signum, Some(ptrace_info)) {
         return true;
     }
     let task = current_task_id();
@@ -12228,23 +12264,7 @@ pub fn default_sync_signal_delivery(
     // via `info.addr`. For #PF that becomes si_addr verbatim. For
     // RIP-flavoured vectors (#UD/#DE/#OF/#BP/#AC) the arch passes
     // RIP through the same field.
-    let (si_code, si_addr) = match vector {
-        1 => (2 /* TRAP_TRACE */, info.addr),
-        // BUS_ADRERR (2): "nonexistent physical address" — the page is
-        // mapped, but the file behind it could not supply it.
-        14 if info.bus => (2, info.addr),
-        14 => (page_fault_si_code(info.addr), info.addr),
-        13 => (0x80 /* SI_KERNEL */, info.addr),
-        6 => (1 /* ILL_ILLOPC */, info.addr),
-        17 => (1 /* BUS_ADRALN */, info.addr),
-        0 => (1 /* FPE_INTDIV */, info.addr),
-        4 => (2 /* FPE_INTOVF */, info.addr),
-        3 => (1 /* TRAP_BRKPT */, info.addr),
-        // SI_KERNEL (0x80), not 0: a fault must keep a POSITIVE si_code so the
-        // arch siginfo builder writes `si_addr` at the union offset 16 (a
-        // non-positive code there means "user/queue-origin" → si_pid instead).
-        _ => (0x80, info.addr),
-    };
+    let (si_code, si_addr) = sync_fault_si(vector, &info);
     // Synchronous: not a syscall trap, so restartable_syscall =
     // false (passed via SYSCALL_NUM_NONE to is_restartable_syscall).
     // Synchronous faults carry si_addr, not a sigqueue sigval.
@@ -12284,6 +12304,75 @@ pub fn default_sync_signal_delivery(
     // the kernel survives.
     terminate_current_task(ctx, task, signum, false);
     true
+}
+
+/// The `last_siginfo` of a ptrace notification stop (`ptrace_do_notify`):
+/// `si_signo = SIGTRAP`, `si_code = exit_code` (`SIGTRAP | 0x80` for a
+/// TRACESYSGOOD syscall stop, `SIGTRAP | event << 8` for an event), `si_pid`
+/// and `si_uid` the stopping task's own, in its own namespaces.
+pub(crate) fn ptrace_notify_siginfo(task: u64, exit_code: u32) -> [u8; 128] {
+    let mut info = [0u8; 128];
+    info[0..4].copy_from_slice(&5i32.to_ne_bytes());
+    info[8..12].copy_from_slice(&(exit_code as i32).to_ne_bytes());
+    let tid = task_to_linux_tid_raw(task).unwrap_or(task);
+    let pid = report_pid_to(task, tid) as u32;
+    let uid = uid_to_user(task, read_uidgid(task).uid);
+    info[16..20].copy_from_slice(&pid.to_ne_bytes());
+    info[20..24].copy_from_slice(&uid.to_ne_bytes());
+    info
+}
+
+/// The `last_siginfo` of a signal-delivery stop for `signum`: the siginfo the
+/// signal would have been delivered with — its queued payload when it has one
+/// (sigqueue, SIGCHLD, a kernel-generated code), else `SI_USER` from an
+/// unknown sender.
+pub(crate) fn ptrace_signal_siginfo(task: u64, signum: u32) -> [u8; 128] {
+    let src = if signal_pending_private(task) & sig_bit(signum) != 0 {
+        task
+    } else {
+        shared_pending_key(task)
+    };
+    let (si_code, si_value, si_pid, si_addr) = match peek_sigqueue_info(src, signum) {
+        Some(info) => match info.poll_band {
+            Some(band) => (info.code, info.value, band, u64::from(band)),
+            None => (info.code, info.value, info.pid, 0),
+        },
+        None => (0, 0, 0, 0),
+    };
+    SigDeliveryParams {
+        handler: 0,
+        restorer: 0,
+        signum,
+        flags: 0,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        si_code,
+        si_addr,
+        si_value,
+        si_pid,
+        prerewound_syscall: false,
+    }
+    .siginfo_bytes()
+}
+
+/// The `last_siginfo` of a synchronous fault's signal-delivery stop.
+pub(crate) fn ptrace_fault_siginfo(signum: u32, si_code: i32, si_addr: u64, si_value: u64) -> [u8; 128] {
+    SigDeliveryParams {
+        handler: 0,
+        restorer: 0,
+        signum,
+        flags: 0,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        si_code,
+        si_addr,
+        si_value,
+        si_pid: 0,
+        prerewound_syscall: false,
+    }
+    .siginfo_bytes()
 }
 
 // ── Sigaction — record a per-task handler vaddr ────────────────────
@@ -14089,7 +14178,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Execve, "execve", RawFnHandler(sys_execve));
     // Batch 19: process & scheduling.
-    table.install_raw(Syscall::Vfork, "vfork", RawFnHandler(sys_fork));
+    table.install_raw(Syscall::Vfork, "vfork", RawFnHandler(sys_vfork));
     table.install_raw(Syscall::Execveat, "execveat", RawFnHandler(sys_execveat));
     table.install_raw(Syscall::Rseq, "rseq", RawFnHandler(sys_rseq));
     table.install_raw(
@@ -16634,7 +16723,7 @@ pub(crate) use {
     handler_sys_execve::sys_execve,
     handler_sys_execveat::sys_execveat,
     handler_sys_exit_group::sys_exit_group,
-    handler_sys_exit_task::sys_exit_task,
+    handler_sys_exit_task::{exit_group_current_thread, sys_exit_task},
     handler_sys_fadvise64::sys_fadvise64,
     handler_sys_fallocate::sys_fallocate,
     handler_sys_fb_connect::sys_fb_connect,
@@ -16652,7 +16741,7 @@ pub(crate) use {
     handler_sys_firmware_install::sys_firmware_install,
     handler_sys_flistxattr::sys_flistxattr,
     handler_sys_flock::sys_flock,
-    handler_sys_fork::sys_fork,
+    handler_sys_fork::{sys_fork, sys_vfork},
     handler_sys_fremovexattr::sys_fremovexattr,
     handler_sys_fsetxattr::sys_fsetxattr,
     handler_sys_fstatfs::sys_fstatfs,

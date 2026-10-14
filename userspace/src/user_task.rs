@@ -1069,6 +1069,27 @@ mod current_user_task_source_tests {
 /// Register `waker` with the park condition's event source and report whether
 /// the task should actually block (`true`) or proceed/re-execute now (`false`,
 /// condition already satisfied or a wake raced us). Mirrors the poll dispatch.
+/// Keep a stopped task off the CPU at the top of its poll: a job-control stop
+/// until SIGCONT, a ptrace stop until the tracer resumes it — including a
+/// child auto-attached by PTRACE_O_TRACEFORK/CLONE, which is born in its
+/// SIGSTOP stop and must not run a single user instruction before its tracer
+/// lets it. A pending SIGKILL always breaks through.
+///
+/// Arm-then-recheck: the waker is registered before the second look, so a
+/// resume that lands between the two is not lost.
+fn park_while_stopped(waker: &core::task::Waker) -> bool {
+    let tp = crate::handlers::current_task_id();
+    let stopped = || {
+        (crate::handlers::is_task_stopped(tp) || crate::ptrace::is_task_ptrace_stopped(tp))
+            && (crate::handlers::signal_pending_bits(tp) & crate::handlers::sig_bit(9)) == 0
+    };
+    if !stopped() {
+        return false;
+    }
+    crate::handlers::register_signal_waker(tp, waker.clone());
+    stopped()
+}
+
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn park_should_block(
     uc: &UserTaskCtx,
@@ -2515,14 +2536,8 @@ impl core::future::Future for UserTaskFuture {
         // un-killable. We register the signal waker (consumed +
         // fired by `wake_signal`) and return Pending without a
         // wake_by_ref, so the task truly idles until woken.
-        {
-            let tp = crate::handlers::current_task_id();
-            if crate::handlers::is_task_stopped(tp)
-                && (crate::handlers::signal_pending_bits(tp) & crate::handlers::sig_bit(9)) == 0
-            {
-                crate::handlers::register_signal_waker(tp, cx.waker().clone());
-                return core::task::Poll::Pending;
-            }
+        if park_while_stopped(cx.waker()) {
+            return core::task::Poll::Pending;
         }
 
         // sys_sleep parks the task by stashing an absolute deadline
@@ -3471,14 +3486,8 @@ impl core::future::Future for UserTaskFuture {
 
         // Job-control stop: keep a stopped task parked until SIGCONT
         // (or SIGKILL) — see the x86_64 sibling body for rationale.
-        {
-            let tp = crate::handlers::current_task_id();
-            if crate::handlers::is_task_stopped(tp)
-                && (crate::handlers::signal_pending_bits(tp) & crate::handlers::sig_bit(9)) == 0
-            {
-                crate::handlers::register_signal_waker(tp, cx.waker().clone());
-                return core::task::Poll::Pending;
-            }
+        if park_while_stopped(cx.waker()) {
+            return core::task::Poll::Pending;
         }
 
         // sys_sleep park-via-deadline + throttle (mirrors x86_64 —

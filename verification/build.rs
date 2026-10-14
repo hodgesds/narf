@@ -680,6 +680,7 @@ fn main() {
         "sigrt_smoke",
         "strace_smoke",
         "remotevm_smoke",
+        "ptracefork_smoke",
         "prctlinherit_smoke",
         "jitrwx_smoke",
         "remount_smoke",

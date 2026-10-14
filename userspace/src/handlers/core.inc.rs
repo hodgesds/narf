@@ -10531,6 +10531,10 @@ pub(crate) fn terminate_current_task(
     signum: u32,
     core_dumped: bool,
 ) {
+    // A fatal signal is `do_group_exit(signum)` → `do_exit`: the tracer's
+    // PTRACE_EVENT_EXIT stop comes first (skipped for SIGKILL, see
+    // `ptrace_report_exit`).
+    crate::ptrace::ptrace_report_exit(ctx, encode_signaled_status(signum, core_dumped));
     let pid = task_to_pid_raw(task).unwrap_or(task);
     #[cfg(feature = "syscall-trace")]
     if crate::syscall::syscall_trace_target_task() {
@@ -12196,8 +12200,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     if !share_thread {
         shm_fork_process(&parent_as, &child_as, child_visible_pid, share_vm);
     }
+    // ptrace auto-attach (TRACEFORK/VFORK/CLONE or CLONE_PTRACE) before the
+    // child can run; the parent's event stop after it is running.
+    let ptrace_trace =
+        crate::ptrace::attach_new_child(parent_pid, child_tid.raw(), flags, ca.exit_signal);
     pending_child.spawn();
     ctx.set_return(SyscallReturn::ok(ret_val));
+    crate::ptrace::report_clone_event(ctx, ptrace_trace, child_tid.raw(), ret_val);
 
     // CLONE_VFORK: suspend the parent here until the child execs or exits
     // (Linux TASK_KILLABLE). The child holds the shared address space; letting
@@ -12268,6 +12277,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
                 }
             }
         }
+        // `if (!wait_for_vfork_done(p, &vfork)) ptrace_event_pid(
+        // PTRACE_EVENT_VFORK_DONE, pid);` — a no-op unless traced with
+        // PTRACE_O_TRACEVFORKDONE.
+        crate::ptrace::report_vfork_done(ctx, child_tid.raw(), ret_val);
     }
 }
 
@@ -12920,9 +12933,81 @@ fn reap_pending_exit(
         }) else {
             continue;
         };
-        return if peek { Some(q[idx]) } else { Some(q.remove(idx)) };
+        if peek {
+            return Some(q[idx]);
+        }
+        let entry = q.remove(idx);
+        drop(shard);
+        if entry.ptraced {
+            hand_back_traced_zombie(parents, entry);
+        }
+        return Some(entry);
     }
     None
+}
+
+/// Zombies a tracer reaped on behalf of a real parent that still has to see
+/// them: their pid, task and parent link stay alive for that second wait.
+static HANDED_BACK: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, ()>> =
+    narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new());
+
+/// `wait_task_zombie`, a tracer reaping a traced zombie it did not create:
+///
+/// ```text
+/// if (ptrace) {
+///         ...
+///         __ptrace_unlink(p);
+///         /* If parent wants a zombie, don't release it now. */
+///         state = EXIT_ZOMBIE;
+///         if (do_notify_parent(p, p->exit_signal))
+///                 state = EXIT_DEAD;
+/// }
+/// ```
+///
+/// The tracer's wait returns the status, and the zombie goes back to its real
+/// parent with a fresh exit notification. Without this a traced child's exit
+/// was consumed by the tracer alone: `strace -f` of a program that waits for
+/// its own children hung that program in waitpid forever.
+///
+/// A CLONE_THREAD tracee has no real parent link and is released as before;
+/// a tracer that is also the real parent (in the waiting thread group) gets
+/// the single notification it already had.
+fn hand_back_traced_zombie(reaper: &WaitParentIds, entry: PendingExit) {
+    let child = entry.child_pid;
+    let Some(link) = child_link_get(child) else {
+        return;
+    };
+    if reaper.contains(link.parent) {
+        return;
+    }
+    HANDED_BACK.lock().insert(child, ());
+    {
+        let mut g = PENDING_EXITS[pending_exit_shard(link.parent)].map.lock();
+        if let Some(m) = g.as_mut() {
+            m.entry(link.parent).or_default().push(PendingExit {
+                child_pid: child,
+                status: entry.status,
+                exit_signal: link.exit_signal,
+                ptraced: false,
+            });
+        }
+    }
+    if link.exit_signal != 0 {
+        let _ = raise_group_signal(
+            link.parent,
+            u32::from(link.exit_signal),
+            GroupSigInfo::Queued(sigchld_exit_info(link.parent, child, entry.status)),
+        );
+        narf_net::readiness::notify(0);
+    }
+    wake_wait_child_group(link.parent);
+}
+
+/// After a reap: was this zombie handed back to its real parent by
+/// [`hand_back_traced_zombie`]? Then the tracer's reap must not release its
+/// pid, task or parent link — the real parent's wait will.
+pub(crate) fn take_handed_back(child_pid: u64) -> bool {
+    HANDED_BACK.lock().remove(&child_pid).is_some()
 }
 
 fn reap_stopcont(
@@ -13711,7 +13796,7 @@ pub(crate) fn finish_wait_child(
             reaped_visible as u64
         }
     };
-    if is_terminal && !peek {
+    if is_terminal && !peek && !take_handed_back(child_pid) {
         // The exit was consumed before the user copies. Always finish the reap,
         // including on EFAULT, but only after namespace-visible PID reporting.
         release_reaped_task(child_pid);
@@ -15324,6 +15409,67 @@ pub(crate) fn linux_tid_to_task_raw(tid_raw: u64) -> Option<u64> {
         .as_ref()
         .and_then(|m| m.get(&tid_raw).copied())
 }
+/// Exit status of traced non-leader threads that left through `exit(2)`,
+/// keyed by TaskId, for [`notify_tracer_of_thread_exit`]. A thread taken down
+/// by its group's exit reports the group's status instead.
+static TRACED_THREAD_EXIT: narf_lib::sync::IrqSafeSpinLock<BTreeMap<u64, i32>> =
+    narf_lib::sync::IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Record a traced thread's own exit status (`exit(2)` of one thread).
+pub(crate) fn note_traced_thread_exit(tid: u64, wstatus: i32) {
+    let linux_tid = task_to_linux_tid_raw(tid).unwrap_or(tid);
+    if crate::ptrace::is_task_traced(linux_tid) {
+        TRACED_THREAD_EXIT.lock().insert(tid, wstatus);
+    }
+}
+
+/// `exit_notify` → `do_notify_parent` for a traced CLONE_THREAD tracee: its
+/// tracer sees the thread's exit through `wait(__WALL)` (strace's
+/// `+++ exited with N +++` per thread) and gets SIGCHLD. Linux then
+/// releases the thread when the tracer reaps it; NARF releases it now, so the
+/// queued entry is marked handed-back and the tracer's reap releases nothing.
+/// The thread's ptrace rows go with it, or a tracer would keep waiting for a
+/// tracee that no longer exists instead of getting ECHILD.
+fn notify_tracer_of_thread_exit(pid: u64, tid: u64) {
+    let Some(linux_tid) = task_to_linux_tid_raw(tid) else {
+        return;
+    };
+    let Some(tracer) = crate::ptrace::get_task_tracer(linux_tid) else {
+        TRACED_THREAD_EXIT.lock().remove(&tid);
+        return;
+    };
+    let tracer_task = linux_tid_to_task_raw(tracer)
+        .or_else(|| pid_to_task_raw(tracer))
+        .unwrap_or(tracer);
+    let status = TRACED_THREAD_EXIT.lock().remove(&tid).unwrap_or_else(|| {
+        PENDING_TERMINATION
+            .lock()
+            .as_ref()
+            .and_then(|m| m.get(&pid).map(|t| t.status))
+            .unwrap_or(0)
+    });
+    crate::ptrace::release_process(linux_tid);
+    HANDED_BACK.lock().insert(linux_tid, ());
+    {
+        let mut g = PENDING_EXITS[pending_exit_shard(tracer_task)].map.lock();
+        if let Some(m) = g.as_mut() {
+            m.entry(tracer_task).or_default().push(PendingExit {
+                child_pid: linux_tid,
+                status,
+                exit_signal: SIGCHLD,
+                ptraced: true,
+            });
+        }
+    }
+    let _ = raise_group_signal(
+        tracer_task,
+        u32::from(SIGCHLD),
+        GroupSigInfo::Queued(sigchld_exit_info(tracer_task, linux_tid, status)),
+    );
+    narf_net::readiness::notify(0);
+    wake_wait_child_group(tracer_task);
+}
+
 /// Release a finished non-leader thread from the task registry. Linux does
 /// not expose CLONE_THREAD siblings as wait4-reapable zombies; retaining them
 /// until the process exits leaks one Task/TCB allocation per pthread and makes
@@ -15335,6 +15481,7 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
     if leader_tid == tid {
         return;
     }
+    notify_tracer_of_thread_exit(pid, tid);
     crate::task::release_task(tid);
     let _mutation = PID_TASK_MUTATION.lock();
     let linux_tid = TASK_TO_LINUX_TID[pid_task_shard(tid)]
