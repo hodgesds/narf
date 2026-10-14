@@ -19,15 +19,16 @@ fn sync_poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
         RawWaker::new(core::ptr::null(), &VT)
     }
     static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: No-op waker with a null pointer
     let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
     let mut cx = Context::from_waker(&waker);
+    // SAFETY: `fut` is local to this function and will not be moved before it is dropped
     let pinned = unsafe { core::pin::Pin::new_unchecked(&mut fut) };
     match pinned.poll(&mut cx) {
         Poll::Ready(val) => Some(val),
         Poll::Pending => None,
     }
 }
-
 
 fn sample_memfs_lookup_hit(iters: u32) -> Option<Sample> {
     let fs = MemFs::new("bench");
