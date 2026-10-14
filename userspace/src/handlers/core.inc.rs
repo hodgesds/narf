@@ -12035,6 +12035,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // `personality` lives in task_struct, which `copy_process` duplicates for
     // every child regardless of CLONE_FS.
     personality_fork(parent_pid, child_tid.raw());
+    // no_new_privs, securebits and dumpable: see `prctl_fork`.
+    prctl_fork(parent_pid, child_tid.raw());
     // Credentials (uid/gid/euid/...) are copied to the child so a parent
     // that dropped privilege stays dropped across fork/clone; a root
     // parent stays root. Keyed by task id, so copy unconditionally.
@@ -17986,6 +17988,28 @@ fn read_prctl(task: u64) -> PrctlState {
     g.as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or_default()
+}
+
+/// The `PrctlState` a child of any `clone` starts with (`copy_process`):
+///
+/// - `no_new_privs` lives in `task_struct.atomic_flags`, which
+///   `dup_task_struct` copies — a sandbox that set it before forking its
+///   workers would otherwise hand them the right to gain privilege again.
+/// - `securebits` is part of `struct cred`, which `copy_creds` copies (or
+///   shares, for CLONE_THREAD).
+/// - dumpable is an `mm->flags` bit: `mm_init` copies the parent's
+///   (`mmf_init_flags(current->mm->flags)`), and a CLONE_VM child shares it.
+///
+/// Not inherited: `pdeath_signal` (`p->pdeath_signal = 0`) and the
+/// `is_child_subreaper` bit of a new `signal_struct`; the name travels with
+/// `proc_identity_fork`.
+pub(crate) fn prctl_fork(parent: u64, child: u64) {
+    let p = read_prctl(parent);
+    modify_prctl(child, |c| {
+        c.no_new_privs = p.no_new_privs;
+        c.securebits = p.securebits;
+        c.dumpable = p.dumpable;
+    });
 }
 
 fn modify_prctl<F: FnOnce(&mut PrctlState)>(task: u64, f: F) -> bool {

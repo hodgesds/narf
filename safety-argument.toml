@@ -1488,3 +1488,7 @@ argument = "The executor change (scheduler/src/stackful.rs rearm_wake_after_pree
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The only frame/ change (bare_main.rs) adds jitrwx_smoke to the table of embedded musl-demo test binaries, next to remotevm_smoke. It is test registration data compiled into verification kernels; no production code path, authority, mapping, domain transition, or capability changes. The W^X policy change it tests lives in memory/src/wx.rs and the userspace mprotect handler, outside the memory domain manager."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The only frame/ change (bare_main.rs) registers the prctlinherit_smoke test binary in the embedded musl-demo table. Test registration data for verification kernels; no production path, authority, mapping, domain transition or capability changes. The prctl inheritance fix itself lives in userspace/ (copy of no_new_privs, securebits and dumpable into a clone child)."

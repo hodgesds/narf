@@ -331,6 +331,7 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // fork(2) is clone without CLONE_FS: a private copy of root + cwd.
     fs_fork(parent_pid, child_tid.raw(), false);
     personality_fork(parent_pid, child_tid.raw());
+    prctl_fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
     // `copy_process` duplicates the task mempolicy for every child.
     crate::handlers::mempolicy_fork(parent_pid, child_tid.raw());

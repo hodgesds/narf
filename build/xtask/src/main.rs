@@ -4916,6 +4916,8 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // (multi-iovec, partial transfer, EFAULT/ESRCH/EPERM) and
         // /proc/<pid>/mem pread/pwrite/lseek. See remotevm_smoke_x86_64.c.
         ("remotevm_smoke", "remotevm-ok"),
+        // no_new_privs / securebits / dumpable inherited by fork and threads; pdeathsig not.
+        ("prctlinherit_smoke", "prctlinherit-ok"),
         // W|X JIT memory (V8's pkey_mprotect RWX code range) and its MDWE refusal.
         ("jitrwx_smoke", "jitrwx-ok"),
         // OCI container end-to-end: the `oci_smoke` runtime reads the
