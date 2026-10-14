@@ -1,8 +1,10 @@
 //! Direct legacy DP SST training: native DC source patterns/drive programming,
 //! board-routed DPCD transactions and fresh CR/EQ/link-loss checks. LTTPRs are
 //! used as Linux's DCN401 does (always VBIOS-aware): transparent unless the
-//! VBIOS asks for non-transparent hop-by-hop training. No MST, FEC, automated
-//! rate fallback, stream output or scanout allocation reuse.
+//! VBIOS asks for non-transparent hop-by-hop training. FEC as Linux keeps it:
+//! a FEC-capable DP 1.4 sink trains FEC-ready and has FEC enabled once
+//! trained (dp_set_fec_ready/dp_set_fec_enable). No MST, automated rate
+//! fallback, stream output or scanout allocation reuse.
 use super::*;
 use crate::dp_link_training::{LinkRate, TrainingPattern};
 pub use dmub::DpDriveSettings;
@@ -35,7 +37,11 @@ pub struct DpLinkTrained {
     pub downspread: bool,
     pub cr_attempts: u8,
     pub eq_attempts: u8,
+    /// Trained FEC-ready (sink FEC_CAPABLE, DPCD 1.4 or later).
+    pub fec: bool,
     controls: [u32; 4],
+    /// DPHY_FEC_EN | DPHY_FEC_READY_SHADOW as this owner set them.
+    fec_bits: u32,
 }
 impl DpLinkTrained {
     fn registers(self, l: Layout) -> [(u64, u32); 4] {
@@ -313,6 +319,11 @@ fn dpcd_drive(drive: DpDriveSettings) -> u8 {
         | if drive.swing == 3 { 4 } else { 0 }
         | if drive.pre_emphasis == 3 { 0x20 } else { 0 }
 }
+/// DP_FEC_CONFIGURATION.
+const FEC_CONFIGURATION: u32 = 0x120;
+/// DP_DPHY_CNTL's DPHY_FEC_EN and DPHY_FEC_READY_SHADOW.
+const FEC_EN: u32 = 0x10;
+const FEC_READY: u32 = 0x20;
 async fn sink_config(io: &mut impl Transport, plan: DpLinkTrained) -> Result<(), Error> {
     let config = read::<9>(io, plan.phy.path, 0x100).await?;
     if config[0] != plan.phy.settings.rate as u8
@@ -322,6 +333,9 @@ async fn sink_config(io: &mut impl Transport, plan: DpLinkTrained) -> Result<(),
         || config[8] != 1
     {
         return Err(sink_readback(0x100));
+    }
+    if plan.fec && read::<1>(io, plan.phy.path, FEC_CONFIGURATION).await?[0] & 1 != 1 {
+        return Err(sink_readback(FEC_CONFIGURATION));
     }
     Ok(())
 }
@@ -341,6 +355,10 @@ impl<I: Io> Engine<I> {
             if self.read(at)? & mask != expected {
                 return Err(Error::Readback(at));
             }
+        }
+        let at = DpStream::Dio(plan.phy.path.transmitter).at(self.layout, 0x212d);
+        if self.read(at)? & (FEC_EN | FEC_READY) != plan.fec_bits {
+            return Err(Error::Readback(at));
         }
         Ok(())
     }
@@ -409,7 +427,7 @@ impl<I: Io> Engine<I> {
     async fn dp_training_sink(
         &mut self,
         io: &mut impl Transport,
-        plan: DpLinkTrained,
+        plan: &mut DpLinkTrained,
         non_transparent: bool,
     ) -> Result<Caps, Error> {
         let path = plan.phy.path;
@@ -417,7 +435,7 @@ impl<I: Io> Engine<I> {
         if !matches!(rev, 0x11..=0x14 | 0x20 | 0x21) {
             return Err(invalid_caps());
         }
-        self.dp_training_verify(plan)?;
+        self.dp_training_verify(*plan)?;
         write(io, path, 0x600, &mut [1]).await?;
         io.delay(1000).await;
         if read::<1>(io, path, 0x600).await?[0] & 7 != 1 {
@@ -436,13 +454,10 @@ impl<I: Io> Engine<I> {
         if dpcd[0] >= 0x12 && read::<1>(io, path, 0x111).await?[0] & 7 != 0 {
             return Err(Error::Busy); // active MST/up-request owner
         }
-        if dpcd[0] >= 0x14
-            && read::<1>(io, path, 0x90).await?[0] & 1 != 0
-            && read::<1>(io, path, 0x120).await?[0] & 1 != 0
-        {
-            return Err(Error::Busy);
-        }
-        self.dp_training_verify(plan)?;
+        // retrieve_link_cap reads DP_FEC_CAPABILITY from DPCD 1.4 on;
+        // dp_should_enable_fec then holds for every FEC-capable sink.
+        let fec = dpcd[0] >= 0x14 && read::<1>(io, path, 0x90).await?[0] & 1 != 0;
+        self.dp_training_verify(*plan)?;
         // retrieve_link_cap: the LTTPR AUX timeout before reading the repeater
         // capabilities, kept only while one is present. A NACK of the block
         // means no LTTPR; DEFER/timeout/protocol failures are not absence.
@@ -470,8 +485,20 @@ impl<I: Io> Engine<I> {
             }
         }
         let caps = Caps::parse(dpcd, interval, plan.phy.settings, plan.downspread, lttpr)?;
-        self.dp_training_verify(plan)?;
+        self.dp_training_verify(*plan)?;
         write(io, path, 0x102, &mut [0]).await?;
+        // dp_set_fec_ready before channel coding: the sink, then the source.
+        if fec {
+            write(io, path, FEC_CONFIGURATION, &mut [1]).await?;
+            self.update(
+                DpStream::Dio(path.transmitter).at(self.layout, 0x212d),
+                FEC_READY,
+                FEC_READY,
+            )?;
+            plan.fec = true;
+            plan.fec_bits = FEC_READY;
+            self.dp_training_verify(*plan)?;
+        }
         write(io, path, 0x108, &mut [1]).await?;
         write(
             io,
@@ -484,8 +511,8 @@ impl<I: Io> Engine<I> {
         write(io, path, 0x100, &mut [plan.phy.settings.rate as u8]).await?;
         // Confirm negotiated configuration before entering training. During
         // training, issue only training-related AUX transactions.
-        sink_config(io, plan).await?;
-        self.dp_training_verify(plan)?;
+        sink_config(io, *plan).await?;
+        self.dp_training_verify(*plan)?;
         Ok(caps)
     }
     async fn dp_training_round(
@@ -700,14 +727,18 @@ impl<I: Io> Engine<I> {
             downspread,
             cr_attempts: 0,
             eq_attempts: 0,
+            fec: false,
             controls: [0; 4],
+            fec_bits: 0,
         };
         for (i, (at, mask)) in plan.registers(self.layout).into_iter().enumerate() {
             plan.controls[i] = self.read(at)? & mask;
         }
         self.status.state = State::TrainingDp(path.transmitter);
         let mut result = async {
-            let caps = self.dp_training_sink(io, plan, non_transparent).await?;
+            let caps = self
+                .dp_training_sink(io, &mut plan, non_transparent)
+                .await?;
             plan.equalization = caps.pattern;
             // dp_perform_8b_10b_link_training: in non-transparent mode each
             // repeater, farthest from the sink first, is trained and then
@@ -728,7 +759,21 @@ impl<I: Io> Engine<I> {
             }
             self.dp_training_cr(io, &mut plan, &caps, Hop::Sink).await?;
             self.dp_training_eq(io, &mut plan, &caps, Hop::Sink).await?;
-            self.dp_training_finish(io, &mut plan).await
+            self.dp_training_finish(io, &mut plan).await?;
+            // dp_set_fec_enable: 1000 LL codes after training (6.173 us at
+            // one RBR lane), then FEC on.
+            if plan.fec {
+                io.delay(7).await;
+                self.dp_training_verify(plan)?;
+                self.update(
+                    DpStream::Dio(path.transmitter).at(self.layout, 0x212d),
+                    FEC_EN,
+                    FEC_EN,
+                )?;
+                plan.fec_bits |= FEC_EN;
+                self.dp_training_verify(plan)?;
+            }
+            Ok(())
         }
         .await;
         // A confirmed CR/EQ failure still exits training, as native DC does.
@@ -819,6 +864,12 @@ impl<I: Io> Engine<I> {
             }
             self.dp_phy_stop(io, plan.phy, plan.controls[0], 0x10)
                 .await?;
+            // dp_set_fec_ready(false) after the PHY: the sink's FEC
+            // configuration cleared while it is connected (unchecked, as
+            // Linux ignores it); dp_phy_stop cleared the source's.
+            if sink && plan.fec {
+                let _ = write(io, path, FEC_CONFIGURATION, &mut [0]).await;
+            }
             if self.read(plan.registers(self.layout)[3].0)? & 0x1113ffff != plan.controls[3] {
                 return Err(Error::Readback(plan.registers(self.layout)[3].0));
             }
@@ -840,7 +891,7 @@ impl<I: Io> Engine<I> {
 impl Otg {
     /// # Safety
     /// Same retained direct-port and writer/resource obligations as enable_dp_phy.
-    /// No fixed-drive retimers, USB-C, eDP, MST or FEC. `downspread` matches
+    /// No fixed-drive retimers, USB-C, eDP or MST; FEC as Linux keeps it. `downspread` matches
     /// the PHY's board/firmware SSC setting; this operation does not change SSC.
     /// `non_transparent` is the VBIOS LTTPR choice. No rate fallback or
     /// scanout. Retain owners after errors/cancellation.

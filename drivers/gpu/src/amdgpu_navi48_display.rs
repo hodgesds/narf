@@ -55,6 +55,8 @@ pub struct Sink {
     /// (0xF0007, same bits), which bound the sink's as Linux's
     /// get_lttpr_max_link_rate does. None when no such chain bounds them.
     pub lttpr_uhbr: Option<u8>,
+    /// DP_FEC_CAPABILITY's FEC_CAPABLE (0x090 bit 0), read from DPCD 1.4 on.
+    pub fec: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Port {
@@ -209,12 +211,17 @@ async fn read_sink(io: &mut impl Aux, instance: u8) -> Result<Sink, Error> {
     if dpcd[6] & 2 != 0 {
         transfer(io, instance, 0x90, 0x2215, &mut uhbr).await?;
     }
+    let mut fec = [0; 1];
+    if dpcd[0] >= 0x14 {
+        transfer(io, instance, 0x90, 0x90, &mut fec).await?;
+    }
     Ok(Sink {
         dpcd: Some(dpcd),
         edid: read_edid(io, instance).await?,
         lttpr,
         uhbr: uhbr[0] & 7,
         lttpr_uhbr,
+        fec: fec[0] & 1 != 0,
     })
 }
 
@@ -303,6 +310,7 @@ impl Probe {
                                 lttpr: None,
                                 uhbr: 0,
                                 lttpr_uhbr: None,
+                                fec: false,
                             })
                             .map_err(Error::Ddc)
                     }

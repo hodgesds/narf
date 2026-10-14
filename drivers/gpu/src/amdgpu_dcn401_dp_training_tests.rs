@@ -439,12 +439,13 @@ fn dcn401_dp_training_rejects_unsupported_topologies_caps_and_unacknowledged_sin
         run(e.train_dp_link(&mut io, path(0), false, false)),
         Err(Error::Unsupported)
     );
+    // A sink's FEC configuration ignored: training sets it FEC-ready.
     let (mut e, mut io) = fixture(0, 4, LinkRate::Hbr3, TrainingPattern::Tps4);
     io.set(0x90, &[1]);
-    io.set(0x120, &[1]);
+    io.ignore = Some(0x120);
     assert_eq!(
         run(e.train_dp_link(&mut io, path(0), false, false)),
-        Err(Error::Busy)
+        Err(Error::DpTraining(DpTrainingError::SinkReadback(0x120)))
     );
     for address in [0x600, 0x100, 0x101, 0x102, 0x107, 0x108] {
         let (mut e, mut io) = fixture(0, 2, LinkRate::Hbr2, TrainingPattern::Tps3);
@@ -872,4 +873,62 @@ fn dcn401_dp_training_uses_lttprs_like_linux_dcn401() -> TestResult {
 kernel_test_in!(
     "drivers/gpu/dcn401-otg",
     dcn401_dp_training_uses_lttprs_like_linux_dcn401
+);
+
+/// FEC as Linux keeps it on 8b/10b: a FEC-capable DPCD 1.4 sink gets
+/// DP_FEC_CONFIGURATION 1 after the training exit and before channel
+/// coding, the source DPHY_FEC_READY_SHADOW, and once trained, 7 us later,
+/// DPHY_FEC_EN. Stop clears the source's enable, then ready, once the PHY
+/// is down, then the sink's configuration. A DPCD 1.2 sink never gets it.
+fn dcn401_dp_training_sets_fec_ready_and_enable_like_linux() -> TestResult {
+    let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr3, TrainingPattern::Tps4);
+    io.set(0x90, &[1]);
+    let trained = run(e.train_dp_link(&mut io, path(1), true, false)).unwrap();
+    let writes: Vec<u32> = io
+        .events
+        .iter()
+        .filter_map(|ev| match ev {
+            Event::Aux(0x80, at, _) => Some(*at),
+            _ => None,
+        })
+        .collect();
+    let fec_at = writes.iter().position(|&a| a == 0x120);
+    let coding_at = writes.iter().position(|&a| a == 0x108);
+    if !trained.fec
+        || io.bytes[&0x120] != 1
+        || fec_at.is_none()
+        || fec_at > coding_at
+        || e.io.inner.inner.regs[&dio(1, 0x212d)] & 0x30 != 0x30
+    {
+        return TestResult::Fail("FEC ready/enable");
+    }
+    let delay7 = io.events.iter().rposition(|ev| *ev == Event::Delay(7));
+    let finish = io.events.iter().rposition(|ev| *ev == Event::Delay(5000));
+    if delay7.is_none() || delay7 < finish {
+        return TestResult::Fail("FEC enable delay");
+    }
+    run(e.stop_dp_link(&mut io, path(1))).unwrap();
+    if io.bytes[&0x120] != 0 || e.io.inner.inner.regs[&dio(1, 0x212d)] & 0x70 != 0 {
+        return TestResult::Fail("FEC stop");
+    }
+    // DPCD 1.2: FEC_CAPABILITY is not read, FEC stays off.
+    let (mut e, mut io) = fixture(1, 4, LinkRate::Hbr2, TrainingPattern::Tps3);
+    io.set(0, &[0x12]);
+    io.set(0x90, &[1]);
+    let trained = run(e.train_dp_link(&mut io, path(1), true, false)).unwrap();
+    if trained.fec
+        || io.bytes.contains_key(&0x120)
+        || e.io.inner.inner.regs[&dio(1, 0x212d)] & 0x30 != 0
+        || io
+            .events
+            .iter()
+            .any(|ev| matches!(ev, Event::Aux(0x90, 0x90, _)))
+    {
+        return TestResult::Fail("FEC on DPCD 1.2");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/dcn401-otg",
+    dcn401_dp_training_sets_fec_ready_and_enable_like_linux
 );

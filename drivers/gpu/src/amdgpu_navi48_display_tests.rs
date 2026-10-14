@@ -22,6 +22,7 @@ struct Fake {
     lttpr: Option<[u8; 10]>,
     /// DP_128B132B_SUPPORTED_LINK_RATES.
     uhbr: u8,
+    fec: u8,
 }
 fn checksum(block: &mut [u8]) {
     block[127] = 0u8.wrapping_sub(block[..127].iter().fold(0u8, |s, b| s.wrapping_add(*b)));
@@ -58,6 +59,7 @@ fn fake(blocks: usize) -> Fake {
         stall: None,
         lttpr: None,
         uhbr: 0,
+        fec: 0,
     }
 }
 impl Aux for Fake {
@@ -91,6 +93,7 @@ impl Aux for Fake {
                 None => return Err(dmub::Error::Aux(1)),
             },
             (0x90, 0x2215, 1) => data[0] = self.uhbr,
+            (0x90, 0x90, 1) => data[0] = self.fec,
             (0x90, 0, 16) => data.copy_from_slice(&self.dpcd),
             (0x90, 0x2200, 16) => data.copy_from_slice(&self.extended),
             (0, 0x30, 1) => {
@@ -240,7 +243,7 @@ kernel_test_in!(
 fn navi48_display_cancellation_and_transport_failure_block_reuse() -> TestResult {
     let mut p = probe();
     let mut io = fake(1);
-    io.stall = Some(5);
+    io.stall = Some(6); // inside the EDID MOT sequence, after the DPCD reads
     {
         let mut future = core::pin::pin!(p.scan_with(&mut io, None::<&mut ddc::Ddc>));
         if !future
@@ -349,6 +352,7 @@ fn navi48_display_scans_hdmi_with_native_ddc_and_dp_with_aux() -> TestResult {
                     lttpr: None,
                     uhbr: 0,
                     lttpr_uhbr: None,
+                    fec: false,
                 })
                 .map_err(Error::Ddc)
         );
@@ -454,6 +458,18 @@ fn navi48_display_reads_128b_132b_rates() -> TestResult {
     io.lttpr = Some(caps);
     if scan(&mut io).lttpr_uhbr.is_some() {
         return TestResult::Fail("old repeater bounds UHBR");
+    }
+    // DP_FEC_CAPABILITY from DPCD 1.4 on only.
+    let mut io = fake(1);
+    io.fec = 1;
+    io.dpcd[0] = 0x12;
+    io.extended[0] = 0x12;
+    let old = scan(&mut io);
+    let read = io.commands.iter().any(|c| c.2 == 0x90 && c.1 == 0x90);
+    let mut io = fake(1);
+    io.fec = 1;
+    if old.fec || read || !scan(&mut io).fec {
+        return TestResult::Fail("FEC capability");
     }
     TestResult::Pass
 }

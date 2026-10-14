@@ -461,9 +461,9 @@ fn max_link(dpcd: &[u8; 16], lttpr: Option<(u8, u8)>) -> Option<(u8, LinkRate)> 
     matches!(lanes, 1 | 2 | 4).then_some((lanes, rate))
 }
 
-/// The frontend's 8b/10b payload ceiling for 8-bpc RGB.
+/// The frontend's 8b/10b payload ceiling for 8-bpc RGB, without FEC.
 pub fn link_fits(timing: &Timing, lanes: u8, rate: LinkRate) -> bool {
-    stream_kbps(timing, false) <= legacy_kbps(lanes, rate)
+    stream_kbps(timing, false) <= legacy_kbps(lanes, rate, false)
 }
 
 /// A DP main link's per-lane rate: 8b/10b through the DIO encoders, or
@@ -485,6 +485,9 @@ pub struct DpCaps {
     pub lanes: u8,
     pub rate: LinkRate,
     pub uhbr: u8,
+    /// 8b/10b trains with FEC (dp_should_enable_fec), costing 3% of the
+    /// link.
+    pub fec: bool,
 }
 impl DpCaps {
     /// No DP link: an HDMI selection's.
@@ -492,6 +495,7 @@ impl DpCaps {
         lanes: 0,
         rate: LinkRate::Rbr,
         uhbr: 0,
+        fec: false,
     };
     /// The usable UHBR rates, ascending.
     pub fn uhbr_rates(self) -> impl Iterator<Item = otg::UhbrRate> {
@@ -539,12 +543,19 @@ pub fn dp_caps(path: &inventory::Path, sink: &display::Sink) -> Option<DpCaps> {
         .filter(|&(_, r)| max.is_some_and(|m| r <= m))
         .filter(|&(_, r)| r != otg::UhbrRate::Uhbr13_5 || uhbr13_5)
         .fold(0, |bits, (i, _)| bits | 1 << i);
-    Some(DpCaps { lanes, rate, uhbr })
+    Some(DpCaps {
+        lanes,
+        rate,
+        uhbr,
+        fec: sink.fec,
+    })
 }
 
-/// dp_link_bandwidth_kbps for 8b/10b without FEC.
-fn legacy_kbps(lanes: u8, rate: LinkRate) -> u64 {
-    rate as u64 * 27_000 * 8 * u64::from(lanes)
+/// dp_link_bandwidth_kbps for 8b/10b: 80% coding efficiency
+/// (DATA_EFFICIENCY_8b_10b_x10000), times 97% with FEC.
+fn legacy_kbps(lanes: u8, rate: LinkRate, fec: bool) -> u64 {
+    let efficiency = if fec { 8000 / 100 * 97 } else { 8000 };
+    rate as u64 * 27_000 * 10 * u64::from(lanes) / 10_000 * efficiency
 }
 
 /// dp_link_bandwidth_kbps for 128b/132b: 96.71% coding efficiency less
@@ -570,7 +581,7 @@ pub fn stream_kbps(timing: &Timing, uhbr: bool) -> u64 {
 /// Whether `lanes` at `rate` carries `timing` on a link with `caps`.
 pub fn dp_fits(timing: &Timing, caps: DpCaps, lanes: u8, rate: DpRate) -> bool {
     let have = match rate {
-        DpRate::Legacy(r) => legacy_kbps(lanes, r),
+        DpRate::Legacy(r) => legacy_kbps(lanes, r, caps.fec),
         DpRate::Uhbr(r) => uhbr_kbps(lanes, r),
     };
     stream_kbps(timing, caps.uhbr != 0) <= have

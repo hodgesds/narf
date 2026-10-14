@@ -39,6 +39,7 @@ fn port(path: inventory::Path, dpcd: Option<[u8; 16]>, edid: Vec<u8>) -> display
             lttpr: None,
             uhbr: 0,
             lttpr_uhbr: None,
+            fec: false,
         }),
     }
 }
@@ -871,6 +872,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
             lttpr: None,
             uhbr,
             lttpr_uhbr,
+            fec: false,
         };
         dp_caps(&p, &sink).unwrap().uhbr
     };
@@ -920,6 +922,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         lanes: 4,
         rate: LinkRate::Hbr3,
         uhbr,
+        fec: false,
     };
     let uhd120 = timing(1_188_000, 3840);
     let uhd8k = timing(2_376_000, 7680);
@@ -940,6 +943,20 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
     };
     if dp_link(&uhd120, two) != Some((2, Uhbr(U20))) {
         return TestResult::Fail("lanes before rate");
+    }
+    // FEC: 4 x HBR2 carries 17,280,000 kbps, 16,761,600 with FEC's 3%.
+    let edge = timing(710_000, 3840);
+    let fec = DpCaps {
+        rate: LinkRate::Hbr2,
+        fec: true,
+        ..caps(0)
+    };
+    if dp_link(&edge, DpCaps { fec: false, ..fec }) != Some((4, Legacy(LinkRate::Hbr2)))
+        || dp_link(&edge, fec).is_some()
+        || !dp_fits(&timing(698_400, 3840), fec, 4, Legacy(LinkRate::Hbr2))
+        || dp_fits(&timing(698_401, 3840), fec, 4, Legacy(LinkRate::Hbr2))
+    {
+        return TestResult::Fail("8b/10b FEC bandwidth");
     }
     if dp_candidates(&uhd120, caps(7), 4, Uhbr(U10)) != [(4, Uhbr(U10))] {
         return TestResult::Fail("fallback that cannot carry the mode");
@@ -966,6 +983,7 @@ fn navi48_modeset_decides_uhbr_like_linux() -> TestResult {
         lttpr: None,
         uhbr: 7,
         lttpr_uhbr: None,
+        fec: false,
     };
     let port = display::Port {
         path: p,

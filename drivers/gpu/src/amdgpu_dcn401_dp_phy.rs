@@ -155,7 +155,9 @@ impl<I: Io> Engine<I> {
         }) {
             return Err(Error::Busy);
         }
-        for (reg, mask) in [(0x2125, 0x11), (0x212d, 0x010101ff)] {
+        // DP_DPHY_CNTL's FEC bits belong to the trained link (see
+        // dp_phy_untrained).
+        for (reg, mask) in [(0x2125, 0x11), (0x212d, 0x0101018f)] {
             if self.read(at(reg))? & mask != 0 {
                 return Err(Error::Busy);
             }
@@ -214,7 +216,8 @@ impl<I: Io> Engine<I> {
         self.dp_phy_configuration(plan)
     }
     fn dp_phy_untrained(&mut self, phy: u8) -> Result<(), Error> {
-        for (reg, mask) in [(0x211e, 0x10), (0x212e, 3), (0x2133, 1)] {
+        // Training complete, pattern, scrambler; FEC enable, ready, active.
+        for (reg, mask) in [(0x211e, 0x10), (0x212e, 3), (0x2133, 1), (0x212d, 0x70)] {
             if self.read(DpStream::Dio(phy).at(self.layout, reg))? & mask != 0 {
                 return Err(Error::Busy);
             }
@@ -438,6 +441,15 @@ impl<I: Io> Engine<I> {
             }
         }
         self.dp_phy_off(phy)?;
+        // disable_link_dp: FEC off, then not ready, once the PHY is down.
+        let fec = self.read(at(0x212d))? & 0x30;
+        if fec & 0x10 != 0 {
+            self.update(at(0x212d), 0x10, 0)?;
+        }
+        if fec != 0 {
+            self.update(at(0x212d), 0x20, 0)?;
+        }
+        self.wait(at(0x212d), 0x40, 0, 1000).await?;
         // Native disable_output cleanup after the backend stops.
         for (r, mask) in [(0x212e, 3), (0x211e, 0x10), (0x2125, 0x11)] {
             self.update(at(r), mask, 0)?;
