@@ -81,7 +81,10 @@ fn classify_label(dev: &dyn HwmonDevice, label: &str) -> Option<LabelKind> {
     if label.starts_with("fan") {
         return Some(LabelKind::Fan);
     }
-    if label.starts_with("in") || label.starts_with("pwm") {
+    // `pwm<n>` is a fan-control output, not a voltage input — it is
+    // driven through `HwmonDevice::set_fan`, not read as an `in<n>`
+    // attribute, so it is deliberately not classified here.
+    if label.starts_with("in") {
         return Some(LabelKind::Voltage);
     }
     // Fall back to probing — `None` return from read_* still classifies

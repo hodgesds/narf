@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 narf-lib          = { path = "../../lib" }
 narf-bus          = { path = "../../bus" }
+narf-memory       = { path = "../../memory" }
 narf-arch         = { path = "../../arch" }
 narf-capabilities = { path = "../../capabilities" }
 narf-console      = { path = "../../console" }
@@ -22,6 +23,7 @@ narf-init         = { path = "../../init" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 narf-firmware-smbios = { path = "../../firmware/smbios" }
 narf-aml          = { path = "../../aml" }
+narf-drivers-platform = { path = "../platform" }
 
 [features]
 kernel-test = []

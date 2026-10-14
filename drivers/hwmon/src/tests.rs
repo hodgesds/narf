@@ -482,6 +482,122 @@ fn smoke_bridge_update_interval_attr() -> TestResult {
 }
 kernel_test_in!("drivers/hwmon/bridge", smoke_bridge_update_interval_attr);
 
+/// nct6775 voltage decode: 8 mV/LSB for the undivided inputs, and the
+/// per-input scaled form `DIV_ROUND_CLOSEST(raw * scale, 100)`.
+fn smoke_nct6775_voltage_decode() -> TestResult {
+    use crate::nct6775::{in_from_reg, in_from_reg_scaled};
+    if in_from_reg(0) != 0 || in_from_reg(100) != 800 || in_from_reg(255) != 2040 {
+        return TestResult::Fail("nct6775 in_from_reg (8 mV/LSB) wrong");
+    }
+    if in_from_reg_scaled(100, 800) != 800 || in_from_reg_scaled(255, 1600) != 4080 {
+        return TestResult::Fail("nct6775 in_from_reg_scaled wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/nct6775", smoke_nct6775_voltage_decode);
+
+/// nct6775 temperature decode: lm75-style 16-bit (1/128 °C) and the
+/// byte-register helper. 0x3200 → 50.0 °C, 0x3280 → 50.5 °C, and a
+/// negative two's-complement value 0xCE00 → -50.0 °C.
+fn smoke_nct6775_temp_decode() -> TestResult {
+    use crate::nct6775::{temp_from_reg, temp_from_reg_word, reg_is_word_sized};
+    if temp_from_reg_word(0x3200) != 50_000
+        || temp_from_reg_word(0x3280) != 50_500
+        || temp_from_reg_word(0xCE00) != -50_000
+    {
+        return TestResult::Fail("nct6775 temp_from_reg_word wrong");
+    }
+    if temp_from_reg(50) != 50_000 || temp_from_reg(0) != 0 || temp_from_reg(206) != -50_000 {
+        return TestResult::Fail("nct6775 temp_from_reg (byte) wrong");
+    }
+    if !reg_is_word_sized(0x150) || !reg_is_word_sized(0x630) || reg_is_word_sized(0x27) {
+        return TestResult::Fail("nct6775 reg_is_word_sized classification wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/nct6775", smoke_nct6775_temp_decode);
+
+// ── it87 ──────────────────────────────────────────────────────────────
+
+/// it87 fan tach decode: 16-bit `1350000/(count*2)` and 8-bit with a
+/// divisor. count 0 / 0xffff → None (stopped / disconnected).
+fn smoke_it87_fan_decode() -> TestResult {
+    use crate::it87::{fan16_to_rpm, fan8_to_rpm};
+    if fan16_to_rpm(0).is_some() || fan16_to_rpm(0xffff).is_some() {
+        return TestResult::Fail("it87 fan16 count 0/0xffff should be None");
+    }
+    if fan16_to_rpm(675) != Some(1000) || fan16_to_rpm(1350) != Some(500) {
+        return TestResult::Fail("it87 fan16_to_rpm wrong");
+    }
+    if fan8_to_rpm(0, 2).is_some() || fan8_to_rpm(255, 2).is_some() {
+        return TestResult::Fail("it87 fan8 count 0/255 should be None");
+    }
+    if fan8_to_rpm(54, 2) != Some(12_500) {
+        return TestResult::Fail("it87 fan8_to_rpm wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/it87", smoke_it87_fan_decode);
+
+/// it87 voltage (16 mV/LSB) and signed-byte temperature decode.
+fn smoke_it87_voltage_temp_decode() -> TestResult {
+    use crate::it87::{temp_from_reg, vin_from_reg};
+    if vin_from_reg(0) != 0 || vin_from_reg(75) != 1200 || vin_from_reg(255) != 4080 {
+        return TestResult::Fail("it87 vin_from_reg wrong");
+    }
+    if temp_from_reg(0) != 0 || temp_from_reg(40) != 40_000 || temp_from_reg(0xFF) != -1000 {
+        return TestResult::Fail("it87 temp_from_reg (signed byte) wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/it87", smoke_it87_voltage_temp_decode);
+
+// ── applesmc ──────────────────────────────────────────────────────────
+
+/// applesmc SMC value decode: sp78 (signed 8.8) → millidegrees, and
+/// fpe2 (14.2 unsigned) → RPM.
+fn smoke_applesmc_value_decode() -> TestResult {
+    use crate::applesmc::{fpe2_to_rpm, sp78_to_mc};
+    if sp78_to_mc(0x1E, 0x00) != 30_000
+        || sp78_to_mc(0x32, 0x80) != 50_500
+        || sp78_to_mc(0xFF, 0x00) != -1000
+    {
+        return TestResult::Fail("applesmc sp78_to_mc wrong");
+    }
+    if fpe2_to_rpm(0x0B, 0xB8) != 750
+        || fpe2_to_rpm(0x4E, 0x20) != 5000
+        || fpe2_to_rpm(0x00, 0x00) != 0
+    {
+        return TestResult::Fail("applesmc fpe2_to_rpm wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/applesmc", smoke_applesmc_value_decode);
+
+// ── jc42 ──────────────────────────────────────────────────────────────
+
+/// jc42 temperature decode: 13-bit two's-complement, 0.0625 °C/LSB,
+/// with the top three alarm-flag bits masked off. 0x0190 → 25 °C;
+/// 0x1FFF → one LSB below zero; 0x1C00 → -64 °C.
+fn smoke_jc42_temp_decode() -> TestResult {
+    use crate::jc42::temp_from_reg;
+    if temp_from_reg(0x0190) != 25_000 {
+        return TestResult::Fail("jc42 temp_from_reg(0x0190) should be 25000");
+    }
+    if temp_from_reg(0x1FFF) != -62 {
+        return TestResult::Fail("jc42 temp_from_reg(0x1FFF) should be -62");
+    }
+    if temp_from_reg(0x1C00) != -64_000 {
+        return TestResult::Fail("jc42 temp_from_reg(0x1C00) should be -64000");
+    }
+    // Alarm flag bits [15:13] must not affect the decoded value.
+    if temp_from_reg(0xE190) != temp_from_reg(0x0190) {
+        return TestResult::Fail("jc42 alarm flag bits leaked into temperature");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/hwmon/jc42", smoke_jc42_temp_decode);
+
 // ── dell_smm ──────────────────────────────────────────────────────────
 
 #[cfg(any(test, feature = "kernel-test"))]
